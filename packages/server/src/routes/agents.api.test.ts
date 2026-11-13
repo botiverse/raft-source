@@ -1,3 +1,4 @@
+import { handlerTraceEvents } from "../test/handlerTraceEvents";
 import { PROVIDER_CONNECTIONS_FEATURE_FLAG_KEY, type TrajectoryEntry } from "@botiverse/raft-shared";
 import { tokenForHuman, fixturePasswordHash } from "../test/integration/credentials";
 import { createApiTest } from "../test/integration/apiTest";
@@ -12,6 +13,7 @@ import {
   AGENT_MIGRATION_COMMIT_MARKER_PATH,
   AGENT_MIGRATION_CONTROL_SCHEMA_VERSION,
   AGENT_MIGRATION_CAPABILITY,
+  AGENT_MIGRATION_SOURCE_DRAIN_CAPABILITY,
   AGENT_MIGRATION_MAX_ARCHIVE_ENTRIES,
   AGENT_MIGRATION_RESUMABLE_PROTOCOL,
   EXTERNAL_AGENT_RUNTIME_ID,
@@ -23,20 +25,20 @@ import {
   type RuntimeConfig,
 } from "@botiverse/raft-shared";
 import { RouteFailureError } from "../tracing/routeFailure";
-import { appendAgentActivityEvent, listRecentAgentTrajectory } from "../services/agentActivityLogService";
+import { appendAgentActivityEvent, listRecentAgentTrajectory, upsertAgentTurnSummaries } from "../services/agentActivityLogService";
 import { rewriteDaemonActivityEntries } from "../services/agentLifecycleReducer";
 import { openTestApp } from "../test/integration/app";
 import { createHangingStorageTestHarness } from "../test/hangingStorageTestHarness";
 import { beginArrivingTestAgentMigration, beginTestAgentMigration } from "../test/agentMigrationFixture";
 import { getDb } from "../db/index";
-import { agentMigrations, agents, featureFlagRules, inboxTargetMuteStates, machines, messages, users, serverMembers, servers, subscriptions } from "../db/schema";
+import { agentActivitySummaryV2, agentBootstrapTokens, agentConfigChangeEvents, agentMigrations, agents, featureFlagRules, featureFlags, inboxTargetMuteStates, jointChannels, jointChannelServers, machines, messages, users, serverMembers, servers, subscriptions, thirdPartyAgentEvents } from "../db/schema";
+import { createOAuthClient } from "../services/oauthService";
 import {
   AgentOrchestrator,
   KimiReasoningEffortUpgradeRequiredError,
 } from "../services/agentOrchestrator";
-import { createServer, getAgentMemberRole, getServer, updateServerOnboardingAgent, removeMember } from "../services/serverService";
+import { addMember, createServer, getAgentMemberRole, getServer, updateServerOnboardingAgent, removeMember } from "../services/serverService";
 import {
-  assignMachine as assignAgentMachine,
   createAgent,
   deleteAgent,
   getAgent,
@@ -44,13 +46,10 @@ import {
   updateAgent,
   updateAgentStatus,
 } from "../services/agentService";
+import { placeAgentOnMachine } from "../test/agentMachineFixture";
 import { createMessage } from "../services/messageService";
 import { addAgent, addHuman, createChannel, findOrCreateAgentDM, findOrCreateDM } from "../services/channelService";
-import { mintAgentCredential, recordAgentCredentialUse } from "../services/agentCredentialService";
-import {
-  AGENT_MIGRATION_FEATURE_FLAG_KEY,
-  GROK_RUNTIME_FEATURE_FLAG_KEY,
-} from "../services/featureFlagService";
+import { issueAgentBootstrapToken, mintAgentCredential, recordAgentCredentialUse, revokeAgentCredential } from "../services/agentCredentialService";
 import { MAX_PROFILE_AVATAR_BYTES, PROFILE_AVATAR_TOO_LARGE_MESSAGE } from "../services/avatarService";
 import sharp from "sharp";
 import {
@@ -60,10 +59,10 @@ import {
   type StorageBackend,
 } from "../services/storageService";
 import * as agentMigrationService from "../services/agentMigrationService";
-import { BuiltInModelCatalogError } from "../services/builtinModelCatalogCompatibility";
+import { BuiltInModelCatalogError, assertBuiltInPresetSupportedByCatalog } from "../services/builtinModelCatalogCompatibility";
 import { registerRuntimeFormV2EntryForTests } from "../services/runtimeFormV2Registry";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 
 
@@ -98,7 +97,7 @@ test("GET /agents/:id answers 404, not 500, for an id that is not a uuid (task #
   assert.deepEqual(await res.json(), { error: "Agent not found" });
 });
 
-test("human members can control agent runtime but cannot fully reset its workspace", async ({ app }) => {
+test("human members can restart and reset session but cannot stop or fully reset someone else's agent", async ({ app }) => {
     const db = getDb();
     const owner = await seedUser("runtime-member-owner@slock.test", "runtime-member-owner");
     const member = await seedUser("runtime-member@slock.test", "runtime-member");
@@ -111,11 +110,13 @@ test("human members can control agent runtime but cannot fully reset its workspa
     });
   const memberToken = await tokenForHuman(member.email);
 
+    // Stopping an agent is an owner/admin's or its creator's (cindyz, 2026-10-29).
     const stop = await fetch(`${app.baseUrl}/api/agents/${agent.id}/stop`, {
       method: "POST",
       headers: authHeaders(memberToken, server.id),
     });
-    assert.equal(stop.status, 200);
+    assert.equal(stop.status, 403);
+    assert.match((await stop.json() as { error: string }).error, /stopAgents/);
 
     for (const mode of ["restart", "session"] as const) {
       const reset = await fetch(`${app.baseUrl}/api/agents/${agent.id}/reset`, {
@@ -222,28 +223,6 @@ async function waitForWorkspaceTimeout(clock: WorkspaceTestClock): Promise<void>
     await new Promise<void>((resolve) => setImmediate(resolve));
   }
   assert.equal(clock.pendingTimeouts, 1, "expected workspace request to schedule its real timeout");
-}
-
-async function enableMigrationFlag(serverId: string) {
-  await getDb().insert(featureFlagRules).values({
-    id: randomUUID(),
-    flagKey: AGENT_MIGRATION_FEATURE_FLAG_KEY,
-    stage: "server",
-    priority: 0,
-    decision: "allow",
-    values: [serverId],
-  });
-}
-
-async function enableGrokRuntimeFlag(serverId: string) {
-  await getDb().insert(featureFlagRules).values({
-    id: randomUUID(),
-    flagKey: GROK_RUNTIME_FEATURE_FLAG_KEY,
-    stage: "server",
-    priority: 0,
-    decision: "allow",
-    values: [serverId],
-  });
 }
 
 function signReplicaReplayForTest(method: string, pathWithSearch: string, machineId: string, timestamp: string) {
@@ -369,6 +348,17 @@ test("agent create persists structured runtimeConfig and strips it from non-admi
       ANTHROPIC_API_KEY: "sk-ant-test",
       ANTHROPIC_CUSTOM_MODEL_OPTION: "claude-opus-4-6",
     });
+    // Create recorded the initial configuration; an env-only PATCH (runtime_config
+    // changed, runtime/model/effort did not) adds nothing, and no secret is copied.
+    const configEvents = await db.select().from(agentConfigChangeEvents).where(eq(agentConfigChangeEvents.agentId, created.id));
+    assert.equal(configEvents.length, 1);
+    assert.equal(configEvents[0].source, "agents_route_create");
+    assert.equal(configEvents[0].actorKind, "user");
+    assert.equal(configEvents[0].actorId, owner.id);
+    assert.equal(configEvents[0].beforeModel, null);
+    assert.equal(configEvents[0].afterRuntime, "claude");
+    assert.equal(configEvents[0].afterModel, "claude-opus-4-6");
+    assert.ok(!JSON.stringify(configEvents).includes("sk-ant-test"));
 
     const creatorAgent = await createAgent(server.id, "member-created-agent", {
       runtime: "codex",
@@ -388,6 +378,44 @@ test("agent create persists structured runtimeConfig and strips it from non-admi
     assert.equal("runtimeConfig" in visibleAgent, false);
     const creatorVisibleAgent = memberList.find((agent) => agent.id === creatorAgent.id);
     assert.deepEqual(creatorVisibleAgent?.envVars, { CREATOR_VISIBLE: "true" });
+});
+
+// xxchan (#proj-raft-computer:bbea62a0): env vars that can make the agent's
+// computer run other code are refused when a save adds or changes them; an
+// agent that already has one keeps saving its other settings.
+test("agent settings refuse adding or changing PATH / NODE_OPTIONS, but keep an existing unchanged value", async ({ app }) => {
+  const owner = await seedUser("risky-env-owner@slock.test", "risky-env-owner");
+  const server = await createServer("Risky Env Server", "risky-env-server", owner.id);
+  const token = await tokenForHuman(owner.email);
+  const send = (method: string, path: string, body: unknown) => fetch(`${app.baseUrl}${path}`, {
+    method,
+    headers: { ...authHeaders(token, server.id), "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+
+  const create = await send("POST", "/api/agents", { name: "risky-env-new", runtime: "codex", envVars: { NODE_OPTIONS: "--require /tmp/x.js", TEAM_FLAG: "1" } });
+  assert.equal(create.status, 400);
+  const createBody = await create.json() as { code?: string; names?: string[]; error?: string };
+  assert.equal(createBody.code, "env_var_not_allowed");
+  assert.deepEqual(createBody.names, ["NODE_OPTIONS"]);
+  assert.doesNotMatch(createBody.error ?? "", /x\.js/);
+
+  const existing = await createAgent(server.id, "risky-env-existing", { runtime: "codex", envVars: { PATH: "/opt/bin:/usr/bin", TEAM_FLAG: "1" } });
+  // The same PATH, unchanged, beside an edit of another variable: saves.
+  const keep = await send("PATCH", `/api/agents/${existing.id}`, { envVars: { PATH: "/opt/bin:/usr/bin", TEAM_FLAG: "2" } });
+  assert.equal(keep.status, 200);
+  // Changing PATH, or adding Path in another case, is refused.
+  const change = await send("PATCH", `/api/agents/${existing.id}`, { envVars: { PATH: "/evil:/usr/bin", TEAM_FLAG: "2" } });
+  assert.equal(change.status, 400);
+  const changeBody = await change.json() as { names?: string[]; error?: string };
+  assert.deepEqual(changeBody.names, ["PATH"]);
+  assert.match(changeBody.error ?? "", /login shell/);
+  const add = await send("PATCH", `/api/agents/${existing.id}`, { envVars: { PATH: "/opt/bin:/usr/bin", Ld_Preload: "/tmp/x.so" } });
+  assert.equal(add.status, 400);
+  assert.deepEqual((await add.json() as { names?: string[] }).names, ["Ld_Preload"]);
+  // Removing it is always allowed.
+  const remove = await send("PATCH", `/api/agents/${existing.id}`, { envVars: { TEAM_FLAG: "2" } });
+  assert.equal(remove.status, 200);
 });
 
 // The bug this closes: the onboarding modal was the ONLY writer of `setup_status`. A user
@@ -598,7 +626,14 @@ test("agent create respects Pro universal seat capacity", async ({ app }) => {
     });
 
     assert.equal(createRes.status, 400);
-    assert.match((await createRes.json() as { error: string }).error, /Seat limit reached \(1\/1 on Pro plan\)/);
+    const refusal = await createRes.json() as { error: string; code?: string; capacityLimit?: Record<string, unknown> };
+    assert.match(refusal.error, /Seat limit reached \(1\/1 on Pro plan\)/);
+    // The code and the numbers, so the web can offer to add seats in place.
+    assert.equal(refusal.code, "agent_limit_reached");
+    assert.equal(refusal.capacityLimit?.limitType, "universal");
+    assert.equal(refusal.capacityLimit?.limit, 1);
+    assert.equal(refusal.capacityLimit?.usage, 1);
+    assert.equal(refusal.capacityLimit?.nextUsage, 1.1);
 });
 
 test("agent create rejects runtime command outside Claude runtime", async ({ app }) => {
@@ -664,6 +699,15 @@ test("PATCH /agents/:id preserves host-discovered Codex preset model in runtime 
 
     const updated = await getAgent(agent.id);
     assert.equal(updated?.model, "gpt-5.6-sol");
+    const configEvents = await getDb().select().from(agentConfigChangeEvents)
+      .where(and(eq(agentConfigChangeEvents.agentId, agent.id), eq(agentConfigChangeEvents.source, "agents_route_update")));
+    assert.equal(configEvents.length, 1);
+    assert.equal(configEvents[0].actorKind, "user");
+    assert.equal(configEvents[0].actorId, owner.id);
+    assert.equal(configEvents[0].beforeModel, "gpt-5.5");
+    assert.equal(configEvents[0].afterModel, "gpt-5.6-sol");
+    assert.equal(configEvents[0].beforeRuntime, "codex");
+    assert.equal(configEvents[0].afterRuntime, "codex");
 });
 
 test("external agent create pins sentinel runtime, avoids machine assignment, and projects external", async ({ app }) => {
@@ -792,6 +836,7 @@ test("external agent setup status follows active credential state", async ({ app
     assert.deepEqual(await waitingRes.json(), {
       setupState: "waiting_for_login",
       credentialLastUsedAt: null,
+      externalSetupMethod: null,
       lastActivityAt: null,
     });
 
@@ -799,6 +844,7 @@ test("external agent setup status follows active credential state", async ({ app
       agentId: created.id,
       scopes: ["send"],
       name: "status-test",
+      issuedVia: "human",
       createdByUserId: owner.id,
     });
 
@@ -809,6 +855,7 @@ test("external agent setup status follows active credential state", async ({ app
     assert.deepEqual(await mintedRes.json(), {
       setupState: "credential_minted",
       credentialLastUsedAt: null,
+      externalSetupMethod: null,
       lastActivityAt: null,
     });
 
@@ -838,6 +885,81 @@ test("external agent setup status follows active credential state", async ({ app
     assert.equal(managedRes.status, 400);
     const managedBody = await managedRes.json() as { error: string };
     assert.equal(managedBody.error, "Agent is not external");
+});
+
+test("external agent setup status: connected by any credential; disconnected once every used one is revoked; a login token that expired unused", async ({ app }) => {
+  const owner = await seedUser("external-states-owner@slock.test", "external-states-owner");
+  const server = await createServer("External States Server", "external-states-server", owner.id);
+  const ownerToken = await tokenForHuman(owner.email);
+  const create = async (name: string) => {
+    const res = await fetch(`${app.baseUrl}/api/agents`, {
+      method: "POST",
+      headers: { ...authHeaders(ownerToken, server.id), "Content-Type": "application/json" },
+      body: JSON.stringify({ name, external: true }),
+    });
+    assert.equal(res.status, 200);
+    return (await res.json() as { id: string }).id;
+  };
+  const stateOf = async (agentId: string) => {
+    const res = await fetch(`${app.baseUrl}/api/agents/${agentId}/external-status`, { headers: authHeaders(ownerToken, server.id) });
+    assert.equal(res.status, 200);
+    return (await res.json() as { setupState: string }).setupState;
+  };
+
+  // The CLI login's credential is used; a new one made on the agent page isn't yet: still connected.
+  const agentId = await create("external-states-agent");
+  const cli = await mintAgentCredential({ agentId, scopes: ["send"], name: null, issuedVia: "human", createdByUserId: owner.id });
+  await recordAgentCredentialUse({ credentialId: cli.credentialId, ip: null, userAgent: null });
+  const page = await mintAgentCredential({ agentId, scopes: ["send"], name: "page", issuedVia: "human", createdByUserId: owner.id });
+  assert.equal(await stateOf(agentId), "connected");
+  // Both revoked: it had connected, so disconnected (not "waiting"), until a new one is made.
+  for (const credentialId of [cli.credentialId, page.credentialId]) await revokeAgentCredential({ credentialId, agentId, reason: "test" });
+  assert.equal(await stateOf(agentId), "disconnected");
+  await mintAgentCredential({ agentId, scopes: ["send"], name: "page", issuedVia: "human", createdByUserId: owner.id });
+  assert.equal(await stateOf(agentId), "credential_minted");
+
+  // Never connected: a login token waiting is still waiting; once it expired unused, login_token_expired.
+  const fresh = await create("external-states-fresh");
+  vi.stubEnv("AGENT_BOOTSTRAP_TOKEN_PEPPER", "external-states-test-pepper-0123456789abcdef");
+  try {
+    await issueAgentBootstrapToken({ agentId: fresh, serverId: server.id, issuedByUserId: owner.id, scopes: ["send"] });
+  } finally {
+    vi.unstubAllEnvs();
+  }
+  assert.equal(await stateOf(fresh), "waiting_for_login");
+  await getDb().update(agentBootstrapTokens).set({ ttlExpiresAt: new Date(Date.now() - 1000) }).where(eq(agentBootstrapTokens.targetAgentId, fresh));
+  assert.equal(await stateOf(fresh), "login_token_expired");
+});
+
+test("external agent setup method: set by its manager, existing_agent or sdk only, external agents only", async ({ app }) => {
+  const owner = await seedUser("external-method-owner@slock.test", "external-method-owner");
+  const other = await seedUser("external-method-other@slock.test", "external-method-other");
+  const server = await createServer("External Method Server", "external-method-server", owner.id);
+  await addMember(server.id, other.id, "member");
+  const ownerToken = await tokenForHuman(owner.email);
+  const otherToken = await tokenForHuman(other.email);
+  const createRes = await fetch(`${app.baseUrl}/api/agents`, {
+    method: "POST",
+    headers: { ...authHeaders(ownerToken, server.id), "Content-Type": "application/json" },
+    body: JSON.stringify({ name: "external-method-agent", external: true }),
+  });
+  const { id } = await createRes.json() as { id: string };
+  const put = (token: string, agentId: string, method: unknown) => fetch(`${app.baseUrl}/api/agents/${agentId}/external-setup-method`, {
+    method: "PUT",
+    headers: { ...authHeaders(token, server.id), "Content-Type": "application/json" },
+    body: JSON.stringify({ method }),
+  });
+  assert.equal((await put(ownerToken, id, "sdk")).status, 200);
+  const status = await fetch(`${app.baseUrl}/api/agents/${id}/external-status`, { headers: authHeaders(ownerToken, server.id) });
+  assert.equal((await status.json() as { externalSetupMethod: string }).externalSetupMethod, "sdk");
+  assert.equal((await put(ownerToken, id, "cloud")).status, 400);
+  assert.equal((await put(otherToken, id, "existing_agent")).status, 403);
+  const managed = await createAgent(server.id, "external-method-managed", { runtime: "codex" });
+  assert.equal((await put(ownerToken, managed.id, "sdk")).status, 400);
+  // Another server's agent: the one not-found, as for an unknown id.
+  const elsewhere = await createServer("External Method Elsewhere", "external-method-elsewhere", other.id);
+  const theirs = await createAgent(elsewhere.id, "external-method-theirs", { runtime: "codex" });
+  assert.equal((await put(ownerToken, theirs.id, "sdk")).status, 404);
 });
 
 test("agent server membership rows default to member for new agents", async ({ app }) => {
@@ -980,6 +1102,35 @@ test("GET /api/avatars serves avatars from the configured CDN storage", async ({
   }
 });
 
+test("GET /api/avatars answers 404 for a stored avatar that is missing, 500 for other storage errors", async ({ app }) => {
+  const url = `${app.baseUrl}/api/avatars/users/0123456789abcdef0123456789abcdef.webp`;
+  const failingWith = (error: Error): StorageBackend => ({
+    async put() {},
+    async get() { throw error; },
+    async delete() {},
+  });
+  const noSuchKey = Object.assign(new Error("The specified key does not exist."), { name: "NoSuchKey" });
+  try {
+    // The test app's own local storage has no such file.
+    const local = await fetch(url);
+    assert.equal(local.status, 404);
+    assert.equal((await local.json() as { code: string }).code, "avatar_not_found");
+    assert.notEqual(local.headers.get("cache-control"), "public, max-age=31536000, immutable");
+
+    __setCdnStorageForTests(failingWith(noSuchKey));
+    const s3 = await fetch(url);
+    assert.equal(s3.status, 404, "an S3 NoSuchKey");
+    assert.equal((await s3.json() as { code: string }).code, "avatar_not_found");
+
+    __setCdnStorageForTests(failingWith(new Error("connect ECONNREFUSED")));
+    const broken = await fetch(url);
+    assert.equal(broken.status, 500, "a storage outage is not a missing avatar");
+    assert.equal((await broken.json() as { error: string }).error, "Failed to serve avatar");
+  } finally {
+    resetStorageForTests();
+  }
+});
+
 test("GET /api/avatars releases its real upstream Agent socket when the client aborts", async ({ app }) => {
   const harness = await createHangingStorageTestHarness();
   try {
@@ -1051,16 +1202,6 @@ test("agent profile PATCH updates agent server role with human role-transition p
     assert.equal(ownerPromoteBody.serverRole, "admin");
     assert.equal(await getAgentMemberRole(server.id, ownerManagedAgent.id), "admin");
 
-    const adminDemoteDenied = await fetch(`${app.baseUrl}/api/agents/${ownerManagedAgent.id}`, {
-      method: "PATCH",
-      headers: {
-        ...authHeaders(adminToken, server.id),
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ serverRole: "member" }),
-    });
-    assert.equal(adminDemoteDenied.status, 403);
-    assert.equal(await getAgentMemberRole(server.id, ownerManagedAgent.id), "admin");
 
     const adminPromote = await fetch(`${app.baseUrl}/api/agents/${adminManagedAgent.id}`, {
       method: "PATCH",
@@ -1074,6 +1215,31 @@ test("agent profile PATCH updates agent server role with human role-transition p
     const adminPromoteBody = await adminPromote.json() as { serverRole: string | null };
     assert.equal(adminPromoteBody.serverRole, "admin");
     assert.equal(await getAgentMemberRole(server.id, adminManagedAgent.id), "admin");
+
+    // An admin may demote an admin agent back to member (#triage:#290): an
+    // agent is not a peer admin, and a promotion must be undoable by whoever
+    // could make it. A member still may not.
+    const memberDemoteDenied = await fetch(`${app.baseUrl}/api/agents/${adminManagedAgent.id}`, {
+      method: "PATCH",
+      headers: {
+        ...authHeaders(memberToken, server.id),
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ serverRole: "member" }),
+    });
+    assert.equal(memberDemoteDenied.status, 403);
+    assert.equal(await getAgentMemberRole(server.id, adminManagedAgent.id), "admin");
+    const adminDemote = await fetch(`${app.baseUrl}/api/agents/${adminManagedAgent.id}`, {
+      method: "PATCH",
+      headers: {
+        ...authHeaders(adminToken, server.id),
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ serverRole: "member" }),
+    });
+    assert.equal(adminDemote.status, 200);
+    assert.equal((await adminDemote.json() as { serverRole: string | null }).serverRole, "member");
+    assert.equal(await getAgentMemberRole(server.id, adminManagedAgent.id), "member");
 
     const ownerDemote = await fetch(`${app.baseUrl}/api/agents/${ownerManagedAgent.id}`, {
       method: "PATCH",
@@ -1197,18 +1363,6 @@ test("external agent rejects managed runtime mutation, lifecycle, and machine as
     assert.equal(stopCalled, false);
     assert.equal(resetCalled, false);
 
-    const assignRes = await fetch(`${app.baseUrl}/api/agents/${created.id}/assign-machine`, {
-      method: "POST",
-      headers: {
-        ...authHeaders(ownerToken, server.id),
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ machineId: machine.id }),
-    });
-    assert.equal(assignRes.status, 400);
-    const assignBody = await assignRes.json() as { error: string };
-    assert.equal(assignBody.error, "External agents cannot be assigned to a Computer");
-
     const deleteRes = await fetch(`${app.baseUrl}/api/agents/${created.id}`, {
       method: "DELETE",
       headers: authHeaders(ownerToken, server.id),
@@ -1220,198 +1374,9 @@ test("external agent rejects managed runtime mutation, lifecycle, and machine as
     assert.ok(deleted?.deletedAt, "external agent should be soft-deleted");
 });
 
-// #proj-daemon task #322 (@artin's ruling): a model id the target catalog does not list must not by
-// itself refuse the write. This test previously asserted the opposite (409 +
-// builtin_model_unsupported_by_target, machine not persisted); that expectation is the behaviour the
-// ruling removed, so it is inverted here rather than deleted -- keeping the same stub and the same
-// two-agent shape makes the change visible as a behaviour flip, not as a lost test.
-test("Built-in preset assignment still persists when the target catalog does not list the model (task #322)", async ({ app }) => {
-    const owner = await seedUser(
-      "builtin-assignment-owner@slock.test",
-      "builtin-assignment-owner",
-    );
-    const server = await createServer(
-      "Built-in Assignment",
-      "builtin-assignment",
-      owner.id,
-    );
-    const [machine] = await getDb()
-      .insert(machines)
-      .values({
-        serverId: server.id,
-        userId: owner.id,
-        name: "builtin-assignment-machine",
-        apiKeyHash: "unused-builtin-assignment-machine-hash",
-        runtimes: ["builtin"],
-      })
-      .returning();
-    const runtimeConfig = {
-      version: 1 as const,
-      runtime: "builtin" as const,
-      provider: {
-        kind: "preset" as const,
-        providerId: "openai" as const,
-        apiKey: "secret",
-      },
-      model: { kind: "preset" as const, id: "openai/gpt-5.4" },
-      mode: { kind: "default" as const },
-      hostUserState: "forbidden" as const,
-    };
-    const accepted = await createAgent(
-      server.id,
-      "builtin-assignment-accepted",
-      {
-        runtime: "builtin",
-        model: runtimeConfig.model.id,
-        runtimeConfig,
-      },
-    );
-    const rejected = await createAgent(
-      server.id,
-      "builtin-assignment-rejected",
-      {
-        runtime: "builtin",
-        model: runtimeConfig.model.id,
-        runtimeConfig,
-      },
-    );
-    await assignAgentMachine(accepted.id, null);
-    await assignAgentMachine(rejected.id, null);
-    let rejectCatalog = false;
-    let validationCalls = 0;
-    Object.assign(app.app.get("agentOrchestrator"), {
-      hasMachineLocally: () => true,
-      validateBuiltInPresetForMachine: async () => {
-        validationCalls += 1;
-        if (rejectCatalog) {
-          throw new BuiltInModelCatalogError(
-            "builtin_model_unsupported_by_target",
-            "The selected model is not supported by the target Computer. Upgrade the Computer or explicitly choose a supported model.",
-            {
-              requestedModel: runtimeConfig.model.id,
-              daemonVersion: "1.0.23",
-              computerVersion: "1.0.23",
-              catalogRuntimeVersion: "0.84.3",
-              recovery: "upgrade_or_reselect",
-            },
-          );
-        }
-        return {
-          authority: {
-            connectionEpochId: "epoch-a",
-            replicaGeneration: "generation-a",
-          },
-        };
-      },
-      acquireBuiltInCatalogAuthority: () => () => undefined,
-    });
-    const token = await tokenForHuman(owner.email);
-    const assign = (agentId: string) =>
-      fetch(`${app.baseUrl}/api/agents/${agentId}/assign-machine`, {
-        method: "POST",
-        headers: {
-          ...authHeaders(token, server.id),
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ machineId: machine.id }),
-      });
-
-    const acceptedRes = await assign(accepted.id);
-    assert.equal(acceptedRes.status, 200, await acceptedRes.clone().text());
-    assert.equal((await getAgent(accepted.id))?.machineId, machine.id);
-
-    // Catalog reports the model as absent. Before task #322 this returned 409 and left machineId
-    // null; the ruling makes catalog absence a diagnostic, so the assignment must now go through.
-    rejectCatalog = true;
-    const rejectedRes = await assign(rejected.id);
-    assert.equal(rejectedRes.status, 200, await rejectedRes.clone().text());
-    assert.equal((await getAgent(rejected.id))?.machineId, machine.id);
-    // The catalog is still consulted -- it was demoted, not skipped. A skipped check would also
-    // produce a 200, so without this the test could pass for the wrong reason.
-    assert.equal(validationCalls, 2);
-});
-
-// Control for the change above: the demotion is narrow. `builtin_catalog_unavailable` means the
-// catalog could not be read AT ALL (unknown), not that the model is known-absent, so it must still
-// reject on a write path. This test passes both before and after task #322 -- it fails only if the
-// demotion is written too broadly (e.g. catching BuiltInModelCatalogError as a class).
-test("Built-in preset assignment still rejects when the target catalog cannot be read (task #322 scope control)", async ({ app }) => {
-    const owner = await seedUser(
-      "builtin-unavailable-owner@slock.test",
-      "builtin-unavailable-owner",
-    );
-    const server = await createServer(
-      "Built-in Unavailable",
-      "builtin-unavailable",
-      owner.id,
-    );
-    const [machine] = await getDb()
-      .insert(machines)
-      .values({
-        serverId: server.id,
-        userId: owner.id,
-        name: "builtin-unavailable-machine",
-        apiKeyHash: "unused-builtin-unavailable-machine-hash",
-        runtimes: ["builtin"],
-      })
-      .returning();
-    const runtimeConfig = {
-      version: 1 as const,
-      runtime: "builtin" as const,
-      provider: {
-        kind: "preset" as const,
-        providerId: "openai" as const,
-        apiKey: "secret",
-      },
-      model: { kind: "preset" as const, id: "openai/gpt-5.4" },
-      mode: { kind: "default" as const },
-      hostUserState: "forbidden" as const,
-    };
-    const agent = await createAgent(server.id, "builtin-unavailable-agent", {
-      runtime: "builtin",
-      model: runtimeConfig.model.id,
-      runtimeConfig,
-    });
-    await assignAgentMachine(agent.id, null);
-    Object.assign(app.app.get("agentOrchestrator"), {
-      hasMachineLocally: () => true,
-      validateBuiltInPresetForMachine: async () => {
-        throw new BuiltInModelCatalogError(
-          "builtin_catalog_unavailable",
-          "The target Computer's Built-in model catalog is unavailable. Retry after the Computer reconnects.",
-          {
-            requestedModel: runtimeConfig.model.id,
-            daemonVersion: "1.0.23",
-            computerVersion: "1.0.23",
-            recovery: "retry",
-          },
-        );
-      },
-      acquireBuiltInCatalogAuthority: () => () => undefined,
-    });
-    const token = await tokenForHuman(owner.email);
-    const res = await fetch(
-      `${app.baseUrl}/api/agents/${agent.id}/assign-machine`,
-      {
-        method: "POST",
-        headers: {
-          ...authHeaders(token, server.id),
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ machineId: machine.id }),
-      },
-    );
-    assert.notEqual(res.status, 200, await res.clone().text());
-    assert.equal(
-      ((await res.json()) as { code: string }).code,
-      "builtin_catalog_unavailable",
-    );
-    assert.equal((await getAgent(agent.id))?.machineId, null);
-});
-
-// The four write paths share one helper, but a shared helper is not evidence that each route's
-// own downstream write actually completes (@Huaihuai). assign-machine is covered above; these
-// cover create and the model change, asserting what was PERSISTED rather than just the status.
+// The write paths share one helper, but a shared helper is not evidence that each route's
+// own downstream write actually completes (@Huaihuai). These cover create, the model change and
+// migrate, asserting what was PERSISTED rather than just the status.
 const catalogMissingRuntimeConfig = (modelId: string) => ({
   version: 1 as const,
   runtime: "builtin" as const,
@@ -1521,7 +1486,7 @@ test("Built-in preset model change persists when the target catalog does not lis
       model: "openai/gpt-5.3",
       runtimeConfig: catalogMissingRuntimeConfig("openai/gpt-5.3"),
     });
-    await assignAgentMachine(agent.id, machine.id);
+    await placeAgentOnMachine(agent.id, machine.id);
     // Stub AFTER the setup assignment so the counter only sees the PATCH.
     const counter = stubCatalogMissing(app, "openai/gpt-5.4");
     const token = await tokenForHuman(owner.email);
@@ -1583,9 +1548,8 @@ test("Built-in preset migrate enqueues the migration when the target catalog doe
       model: "openai/gpt-5.4",
       runtimeConfig: catalogMissingRuntimeConfig("openai/gpt-5.4"),
     });
-    await assignAgentMachine(agent.id, sourceMachine.id);
+    await placeAgentOnMachine(agent.id, sourceMachine.id);
     await db.update(servers).set({ plan: "founder" }).where(eq(servers.id, server.id));
-    await enableMigrationFlag(server.id);
 
     const originalOrchestrator = app.app.get("agentOrchestrator");
     let catalogCalls = 0;
@@ -1643,11 +1607,102 @@ test("Built-in preset migrate enqueues the migration when the target catalog doe
     assert.equal(catalogCalls, 1);
 });
 
+// Reconciler step 14 (Q-H): a source that advertises
+// AGENT_MIGRATION_SOURCE_DRAIN_CAPABILITY waits for its agent to be quiet
+// before it stops it; the migration gets that wait's prep window and the
+// source lease says so. A source without it gets neither (as before). RED
+// proof: drop `sourceDrainsBeforeStop` in the route and the draining source
+// gets a 10 min prep window and no `sourceDrainUntil`.
+test("POST /api/agents/:id/migrate gives a draining source the wait's prep window and sourceDrainUntil; another source neither", async ({ app }) => {
+    const db = getDb();
+    const owner = await seedUser("drain-migrate-owner@slock.test", "drain-migrate-owner");
+    const server = await createServer("Drain Migrate", "drain-migrate", owner.id);
+    await db.update(servers).set({ plan: "founder" }).where(eq(servers.id, server.id));
+    const now = new Date();
+    const machine = async (name: string) => (await db.insert(machines).values({
+      id: randomUUID(),
+      serverId: server.id,
+      userId: owner.id,
+      name,
+      apiKeyHash: `${name}-hash`,
+      runtimes: ["codex"],
+      daemonVersion: "0.72.7",
+      lastHeartbeat: now,
+    }).returning())[0]!;
+    const drainingSource = await machine("drain-source");
+    const plainSource = await machine("plain-source");
+    const target = await machine("drain-target");
+    const capabilities = new Map<string, string[]>([
+      [drainingSource.id, [AGENT_MIGRATION_CAPABILITY, AGENT_MIGRATION_SOURCE_DRAIN_CAPABILITY]],
+      [plainSource.id, [AGENT_MIGRATION_CAPABILITY]],
+      [target.id, [AGENT_MIGRATION_CAPABILITY]],
+    ]);
+    const sentLeases: Array<{ machineId: string; message: { role: string; sourceDrainUntil?: string } }> = [];
+    const originalOrchestrator = app.app.get("agentOrchestrator") as Record<string, unknown>;
+    app.app.set("agentOrchestrator", {
+      ...originalOrchestrator,
+      getMachineStatus: async () => "online",
+      getMachineMigrationTransport: async (machineId: string) => ({ capabilities: capabilities.get(machineId) ?? [] }),
+      getMachineRuntimeDetection: async () => null,
+      sendAgentMigrationTransportLease: async (machineId: string, message: { role: string; sourceDrainUntil?: string }) => {
+        sentLeases.push({ machineId, message });
+      },
+    });
+    app.app.set("agentMigrationObjectStoreTransferProvisioner", async () => ({
+      provider: "object_store" as const,
+      sessionId: `drain-session-${randomUUID()}`,
+      leaseMs: 60 * 60 * 1000,
+      maxBytes: 123_456,
+    }));
+    const token = await tokenForHuman(owner.email);
+    const migrate = async (sourceMachineId: string, name: string) => {
+      const agent = await createAgent(server.id, name, { runtime: "codex", machineId: sourceMachineId });
+      const res = await fetch(`${app.baseUrl}/api/agents/${agent.id}/migrate`, {
+        method: "POST",
+        headers: { ...authHeaders(token, server.id), "Content-Type": "application/json" },
+        body: JSON.stringify({ targetComputer: target.id }),
+      });
+      assert.equal(res.status, 200, await res.clone().text());
+      const [row] = await db.select().from(agentMigrations).where(eq(agentMigrations.agentId, agent.id));
+      const sourceLease = sentLeases.find((lease) => lease.machineId === sourceMachineId && lease.message.role === "source");
+      assert.ok(row && sourceLease);
+      return { prepWindowMs: row.prepDeadlineAt.getTime() - row.createdAt.getTime(), row, sourceLease };
+    };
+
+    const draining = await migrate(drainingSource.id, "drain-migrate-agent");
+    assert.equal(draining.prepWindowMs, 20 * 60 * 1000, "the ordinary 10 min plus the wait's 10 min");
+    assert.equal(draining.sourceLease.message.sourceDrainUntil, new Date(draining.row.createdAt.getTime() + 10 * 60 * 1000).toISOString());
+
+    const plain = await migrate(plainSource.id, "plain-migrate-agent");
+    assert.equal(plain.prepWindowMs, 10 * 60 * 1000);
+    assert.equal(plain.sourceLease.message.sourceDrainUntil, undefined, "an older source stops at once, as before");
+
+    // The owner status the web reads carries the same deadline while the
+    // source waits, and null once it quiesced or for a source without the wait.
+    const ownerStatus = async (agentId: string) => {
+      const res = await fetch(`${app.baseUrl}/api/agents/${agentId}/migration`, { headers: authHeaders(token, server.id) });
+      assert.equal(res.status, 200, await res.clone().text());
+      return (await res.json() as { migration: { sourceDrainUntil?: string | null; sourceDrain?: unknown; sourceBuildProgress?: unknown } }).migration;
+    };
+    assert.equal((await ownerStatus(draining.row.agentId)).sourceDrainUntil, draining.sourceLease.message.sourceDrainUntil);
+    assert.equal((await ownerStatus(plain.row.agentId)).sourceDrainUntil, null);
+    // task #62: the source's drain report reaches the owner as `sourceDrain`,
+    // never as `sourceBuildProgress`.
+    assert.equal((await ownerStatus(draining.row.agentId)).sourceDrain, null, "no drain report yet");
+    const drainRecord = { phase: "draining" as const, drainUntil: draining.sourceLease.message.sourceDrainUntil!, waitingFor: "turn" as const, reportedAt: new Date().toISOString() };
+    await db.update(agentMigrations).set({ sourceBuildProgress: drainRecord }).where(eq(agentMigrations.id, draining.row.id));
+    const whileDraining = await ownerStatus(draining.row.agentId);
+    assert.deepEqual(whileDraining.sourceDrain, { until: drainRecord.drainUntil, waitingFor: "turn", reportedAt: drainRecord.reportedAt });
+    assert.equal(whileDraining.sourceBuildProgress, null);
+    await db.update(agentMigrations).set({ sourceQuiescedAt: new Date() }).where(eq(agentMigrations.id, draining.row.id));
+    assert.equal((await ownerStatus(draining.row.agentId)).sourceDrainUntil, null, "no wait once the source quiesced");
+    assert.equal((await ownerStatus(draining.row.agentId)).sourceDrain, null, "no drain once the source quiesced");
+});
+
 // Scope controls for the SAVE routes. task #322 demoted only builtin_model_unsupported_by_target;
 // builtin_catalog_unavailable means the catalog could not be READ (unknown, not known-absent) and
-// must still reject. The existing control covers assign-machine only, and the user-facing copy that
-// PR #8065 ships describes exactly these two routes -- so the behaviour it promises had code backing
-// it but no test. These pass before and after task #322; they go red only if the demotion is ever
+// must still reject. The user-facing copy that PR #8065 ships describes exactly these two routes,
+// so these tests back the behaviour it promises. These pass before and after task #322; they go red only if the demotion is ever
 // widened to catch BuiltInModelCatalogError as a class.
 const stubCatalogUnavailable = (app: { app: { get: (k: string) => unknown } }, modelId: string) => {
   const counter = { calls: 0 };
@@ -1752,7 +1807,7 @@ test("Built-in preset model change still rejects when the target catalog cannot 
       model: "openai/gpt-5.3",
       runtimeConfig: catalogMissingRuntimeConfig("openai/gpt-5.3"),
     });
-    await assignAgentMachine(agent.id, machine.id);
+    await placeAgentOnMachine(agent.id, machine.id);
     const counter = stubCatalogUnavailable(app, "openai/gpt-5.4");
     const token = await tokenForHuman(owner.email);
     const res = await fetch(`${app.baseUrl}/api/agents/${agent.id}`, {
@@ -1775,6 +1830,290 @@ test("Built-in preset model change still rejects when the target catalog cannot 
     // The stored selection must be untouched, not merely the response non-200.
     assert.equal((await getAgent(agent.id))?.model, "openai/gpt-5.3");
     assert.equal(counter.calls, 1);
+});
+
+// task #10: a typed OpenRouter model goes through the same catalog check as a
+// preset one. A Computer whose catalog does not advertise OpenRouter in
+// customModelProviderIds (an older one, whose parser would refuse the config
+// at start) gets a 409 builtin_custom_model_upgrade_required on create and on
+// a model change, and nothing is written. The stub runs the real catalog check.
+const typedOpenRouterRuntimeConfig = (name: string) => ({
+  version: 1 as const,
+  runtime: "builtin" as const,
+  provider: { kind: "preset" as const, providerId: "openrouter" as const, apiKey: "secret" },
+  model: { kind: "custom" as const, name },
+  mode: { kind: "default" as const },
+  hostUserState: "forbidden" as const,
+});
+
+const stubCatalogWithoutCustomModels = (app: { app: { get: (k: string) => unknown } }) => {
+  const counter = { calls: 0 };
+  Object.assign(app.app.get("agentOrchestrator") as object, {
+    hasMachineLocally: () => true,
+    validateBuiltInPresetForMachine: async (machineId: string, config: Parameters<typeof assertBuiltInPresetSupportedByCatalog>[0]) => {
+      counter.calls += 1;
+      const validation = assertBuiltInPresetSupportedByCatalog(
+        config,
+        {
+          kind: "live",
+          value: {
+            models: [{ id: "openrouter/moonshotai/kimi-k2.6", label: "Kimi" }],
+            catalog: { protocolVersion: 1, runtime: "builtin", runtimeVersion: "1.5.0" },
+          },
+        },
+        { machineId, daemonVersion: "1.0.67", computerVersion: "1.0.67" },
+      );
+      return validation ? { ...validation, authority: { connectionEpochId: "e", replicaGeneration: "g" } } : null;
+    },
+    acquireBuiltInCatalogAuthority: () => () => undefined,
+  });
+  return counter;
+};
+
+test("a typed OpenRouter model is refused on create and on a model change when the Computer cannot run one (task #10)", async ({ app }) => {
+    const db = getDb();
+    const owner = await seedUser("builtin-or-custom-owner@slock.test", "builtin-or-custom-owner");
+    const server = await createServer("Built-in OpenRouter Custom", "builtin-or-custom", owner.id);
+    const [machine] = await db
+      .insert(machines)
+      .values({
+        serverId: server.id,
+        userId: owner.id,
+        name: "builtin-or-custom-machine",
+        apiKeyHash: "unused-builtin-or-custom-machine-hash",
+        runtimes: ["builtin"],
+      })
+      .returning();
+    const before = (await db.select().from(agents).where(eq(agents.serverId, server.id))).length;
+    const counter = stubCatalogWithoutCustomModels(app);
+    const token = await tokenForHuman(owner.email);
+    const create = await fetch(`${app.baseUrl}/api/agents`, {
+      method: "POST",
+      headers: { ...authHeaders(token, server.id), "Content-Type": "application/json" },
+      body: JSON.stringify({
+        name: "builtin-or-custom-agent",
+        machineId: machine.id,
+        formDefinitionRef: { protocolVersion: 1, runtimeId: "builtin", schemaVersion: "builtin-pi.create.v3" },
+        runtimeConfig: typedOpenRouterRuntimeConfig("vendor/unlisted-2099"),
+      }),
+    });
+    assert.equal(create.status, 409, await create.clone().text());
+    assert.equal(((await create.json()) as { code: string }).code, "builtin_custom_model_upgrade_required");
+    assert.equal((await db.select().from(agents).where(eq(agents.serverId, server.id))).length, before, "nothing created");
+
+    const agent = await createAgent(server.id, "builtin-or-custom-existing", {
+      runtime: "builtin",
+      model: "openrouter/moonshotai/kimi-k2.6",
+      runtimeConfig: { ...typedOpenRouterRuntimeConfig("unused"), model: { kind: "preset", id: "openrouter/moonshotai/kimi-k2.6" } },
+    });
+    await placeAgentOnMachine(agent.id, machine.id);
+    const patch = await fetch(`${app.baseUrl}/api/agents/${agent.id}`, {
+      method: "PATCH",
+      headers: { ...authHeaders(token, server.id), "Content-Type": "application/json" },
+      body: JSON.stringify({
+        runtime: "builtin",
+        model: "vendor/unlisted-2099",
+        runtimeConfig: typedOpenRouterRuntimeConfig("vendor/unlisted-2099"),
+      }),
+    });
+    assert.equal(patch.status, 409, await patch.clone().text());
+    assert.equal(((await patch.json()) as { code: string }).code, "builtin_custom_model_upgrade_required");
+    assert.equal((await getAgent(agent.id))?.model, "openrouter/moonshotai/kimi-k2.6", "the stored selection is untouched");
+    assert.equal(counter.calls, 2);
+});
+
+// Huaihuai's review of #13950: a LISTED OpenRouter model with an explicit
+// limit is saved as a custom model (its OpenRouter id), so the same gate
+// applies: an older Computer gets 409 builtin_custom_model_upgrade_required on
+// create, on edit and on migrate, and nothing is written.
+test("a listed OpenRouter model with a limit is refused on create, edit and migrate when the Computer cannot run one (task #10)", async ({ app }) => {
+    const db = getDb();
+    const owner = await seedUser("builtin-or-listed-owner@slock.test", "builtin-or-listed-owner");
+    const server = await createServer("Built-in OpenRouter Listed", "builtin-or-listed", owner.id);
+    const now = new Date();
+    const [sourceMachine] = await db.insert(machines).values({
+      id: randomUUID(),
+      serverId: server.id,
+      userId: owner.id,
+      name: "builtin-or-listed-source",
+      apiKeyHash: "builtin-or-listed-source-hash",
+      runtimes: ["builtin"],
+      daemonVersion: "0.72.7",
+      lastHeartbeat: now,
+    }).returning();
+    const [targetMachine] = await db.insert(machines).values({
+      id: randomUUID(),
+      serverId: server.id,
+      userId: owner.id,
+      name: "builtin-or-listed-target",
+      apiKeyHash: "builtin-or-listed-target-hash",
+      runtimes: ["builtin"],
+      daemonVersion: "0.72.7",
+      lastHeartbeat: now,
+    }).returning();
+    const listedWithLimit = { ...typedOpenRouterRuntimeConfig("openrouter/moonshotai/kimi-k2.6"), model: { kind: "custom" as const, name: "openrouter/moonshotai/kimi-k2.6", contextWindow: 131_072 } };
+    const before = (await db.select().from(agents).where(eq(agents.serverId, server.id))).length;
+    const counter = stubCatalogWithoutCustomModels(app);
+    const token = await tokenForHuman(owner.email);
+    const create = await fetch(`${app.baseUrl}/api/agents`, {
+      method: "POST",
+      headers: { ...authHeaders(token, server.id), "Content-Type": "application/json" },
+      body: JSON.stringify({
+        name: "builtin-or-listed-agent",
+        machineId: targetMachine.id,
+        formDefinitionRef: { protocolVersion: 1, runtimeId: "builtin", schemaVersion: "builtin-pi.create.v3" },
+        runtimeConfig: listedWithLimit,
+      }),
+    });
+    assert.equal(create.status, 409, await create.clone().text());
+    assert.equal(((await create.json()) as { code: string }).code, "builtin_custom_model_upgrade_required");
+    assert.equal((await db.select().from(agents).where(eq(agents.serverId, server.id))).length, before, "nothing created");
+
+    // An existing agent on the listed preset: adding a limit is refused.
+    const listedPreset = { ...typedOpenRouterRuntimeConfig("unused"), model: { kind: "preset" as const, id: "openrouter/moonshotai/kimi-k2.6" } };
+    const agent = await createAgent(server.id, "builtin-or-listed-existing", {
+      runtime: "builtin",
+      model: "openrouter/moonshotai/kimi-k2.6",
+      runtimeConfig: listedPreset,
+    });
+    await placeAgentOnMachine(agent.id, sourceMachine.id);
+    const patch = await fetch(`${app.baseUrl}/api/agents/${agent.id}`, {
+      method: "PATCH",
+      headers: { ...authHeaders(token, server.id), "Content-Type": "application/json" },
+      body: JSON.stringify({ runtime: "builtin", model: "moonshotai/kimi-k2.6", runtimeConfig: listedWithLimit }),
+    });
+    assert.equal(patch.status, 409, await patch.clone().text());
+    assert.equal(((await patch.json()) as { code: string }).code, "builtin_custom_model_upgrade_required");
+    assert.deepEqual((await getAgent(agent.id))?.runtimeConfig?.model, listedPreset.model, "the stored selection is untouched");
+
+    // An agent already saved this way (on a Computer that runs it) cannot move to an older one.
+    const overridden = await createAgent(server.id, "builtin-or-listed-overridden", {
+      runtime: "builtin",
+      model: "moonshotai/kimi-k2.6",
+      runtimeConfig: { ...listedWithLimit, model: { kind: "custom", name: "moonshotai/kimi-k2.6", contextWindow: 131_072 } },
+    });
+    await placeAgentOnMachine(overridden.id, sourceMachine.id);
+    await db.update(servers).set({ plan: "founder" }).where(eq(servers.id, server.id));
+    Object.assign(app.app.get("agentOrchestrator") as object, {
+      getMachineStatus: async () => "online",
+      getMachineDaemonVersion: () => "0.72.7",
+      getMachineMigrationTransport: async () => ({ capabilities: [AGENT_MIGRATION_CAPABILITY] }),
+      sendAgentMigrationTransportLease: async () => undefined,
+    });
+    app.app.set("agentMigrationObjectStoreTransferProvisioner", async () => ({
+      provider: "object_store" as const,
+      sessionId: "builtin-or-listed-session",
+      leaseMs: 60 * 60 * 1000,
+      maxBytes: 123_456,
+    }));
+    const migrate = await fetch(`${app.baseUrl}/api/agents/${overridden.id}/migrate`, {
+      method: "POST",
+      headers: { ...authHeaders(token, server.id), "Content-Type": "application/json" },
+      body: JSON.stringify({ targetComputer: targetMachine.id }),
+    });
+    assert.equal(migrate.status, 409, await migrate.clone().text());
+    assert.equal(((await migrate.json()) as { code: string }).code, "builtin_custom_model_upgrade_required");
+    assert.equal((await db.select().from(agentMigrations).where(eq(agentMigrations.agentId, overridden.id))).length, 0, "no migration granted");
+    assert.equal(counter.calls, 3);
+});
+
+// task #10: the v2 edit form and save for a client WITHOUT
+// dependent_select.custom_value_with_options (a shipped app). Its limit fields
+// show only where a stored limit would otherwise be lost; its save keeps what
+// a newer client stored, and a change of model or provider is refused.
+test("v2 edit for an old client: stored limits stay visible and survive, a provider change is refused (task #10)", async ({ app }) => {
+    const owner = await seedUser("builtin-or-oldclient-owner@slock.test", "builtin-or-oldclient-owner");
+    const server = await createServer("Built-in OpenRouter Old Client", "builtin-or-oldclient", owner.id);
+    const [machine] = await getDb().insert(machines).values({
+      serverId: server.id,
+      userId: owner.id,
+      name: "builtin-or-oldclient-machine",
+      apiKeyHash: "unused-builtin-or-oldclient-machine-hash",
+      runtimes: ["builtin"],
+    }).returning();
+    const token = await tokenForHuman(owner.email);
+    const withLimits = await createAgent(server.id, "builtin-or-oldclient-limits", {
+      runtime: "builtin",
+      model: "moonshotai/kimi-k2.6",
+      runtimeConfig: { ...typedOpenRouterRuntimeConfig("moonshotai/kimi-k2.6"), model: { kind: "custom", name: "moonshotai/kimi-k2.6", contextWindow: 131_072 } },
+    });
+    const preset = await createAgent(server.id, "builtin-or-oldclient-preset", {
+      runtime: "builtin",
+      model: "openrouter/moonshotai/kimi-k2.6",
+      runtimeConfig: { ...typedOpenRouterRuntimeConfig("unused"), model: { kind: "preset", id: "openrouter/moonshotai/kimi-k2.6" } },
+    });
+    for (const agent of [withLimits, preset]) await placeAgentOnMachine(agent.id, machine.id);
+    const limitRule = async (agentId: string) => {
+      const res = await fetch(`${app.baseUrl}/api/agents/${agentId}/runtime-form`, { headers: authHeaders(token, server.id) });
+      assert.equal(res.status, 200, await res.clone().text());
+      const body = await res.json() as { values: Record<string, unknown>; uiSchema: { visibility: Array<{ pointer: string; when: { in: string[] } }> } };
+      return { values: body.values, in: body.uiSchema.visibility.find((rule) => rule.pointer === "/contextWindow")?.when.in ?? [] };
+    };
+    const stored = await limitRule(withLimits.id);
+    assert.ok(stored.in.includes("openrouter"), "a stored limit keeps its field visible");
+    assert.equal(stored.values.model, "openrouter/moonshotai/kimi-k2.6");
+    assert.equal(stored.values.contextWindow, "131072");
+    assert.equal((await limitRule(preset.id)).in.includes("openrouter"), false, "nothing stored: hidden");
+
+    const patch = (formValues: Record<string, unknown>) => fetch(`${app.baseUrl}/api/agents/${withLimits.id}`, {
+      method: "PATCH",
+      headers: { ...authHeaders(token, server.id), "Content-Type": "application/json" },
+      body: JSON.stringify({ formDefinitionRef: { protocolVersion: 2, runtimeId: "builtin" }, formValues }),
+    });
+    const switched = await patch({ providerId: "deepseek", apiKey: "sk-ds", model: "deepseek/deepseek-v4-pro" });
+    assert.equal(switched.status, 409, await switched.clone().text());
+    assert.equal(((await switched.json()) as { code: string }).code, "runtime_form_client_upgrade_required");
+    assert.deepEqual((await getAgent(withLimits.id))?.runtimeConfig?.model, { kind: "custom", name: "moonshotai/kimi-k2.6", contextWindow: 131_072 }, "untouched");
+});
+
+// task #10: the old-client success path through the real route. A PATCH
+// without clientCapabilities that leaves the model alone (omitted where its
+// field was hidden, unchanged where it was shown) and changes another field
+// keeps the stored custom model, its limits and the stored API key.
+test("v2 edit save from an old client keeps a newer client's typed OpenRouter id / listed override, limits and key (task #10)", async ({ app }) => {
+    const owner = await seedUser("builtin-or-oldsave-owner@slock.test", "builtin-or-oldsave-owner");
+    const server = await createServer("Built-in OpenRouter Old Save", "builtin-or-oldsave", owner.id);
+    const [machine] = await getDb().insert(machines).values({
+      serverId: server.id,
+      userId: owner.id,
+      name: "builtin-or-oldsave-machine",
+      apiKeyHash: "unused-builtin-or-oldsave-machine-hash",
+      runtimes: ["builtin"],
+    }).returning();
+    stubCatalogWithoutCustomModels(app);
+    const token = await tokenForHuman(owner.email);
+    const cases = [
+      {
+        name: "builtin-or-oldsave-typed",
+        model: { kind: "custom" as const, name: "vendor/unlisted-2099", contextWindow: 4096 },
+        // The old client's Model field was hidden: left out of the save.
+        formValues: { providerId: "openrouter", contextWindow: "4096", reasoningEffort: "high" },
+      },
+      {
+        name: "builtin-or-oldsave-listed",
+        model: { kind: "custom" as const, name: "moonshotai/kimi-k2.6", contextWindow: 131_072, maxOutputTokens: 16_384 },
+        // Shown as the listed model with its limits, sent back unchanged.
+        formValues: { providerId: "openrouter", model: "openrouter/moonshotai/kimi-k2.6", contextWindow: "131072", maxOutputTokens: "16384", reasoningEffort: "high" },
+      },
+    ];
+    for (const entry of cases) {
+      const agent = await createAgent(server.id, entry.name, {
+        runtime: "builtin",
+        model: entry.model.name,
+        runtimeConfig: { ...typedOpenRouterRuntimeConfig(entry.model.name), provider: { kind: "preset", providerId: "openrouter", apiKey: "sk-or-stored-key" }, model: entry.model },
+      });
+      await placeAgentOnMachine(agent.id, machine.id);
+      const res = await fetch(`${app.baseUrl}/api/agents/${agent.id}`, {
+        method: "PATCH",
+        headers: { ...authHeaders(token, server.id), "Content-Type": "application/json" },
+        body: JSON.stringify({ formDefinitionRef: { protocolVersion: 2, runtimeId: "builtin" }, formValues: entry.formValues }),
+      });
+      assert.equal(res.status, 200, `${entry.name}: ${await res.clone().text()}`);
+      const saved = (await getAgent(agent.id))?.runtimeConfig;
+      assert.deepEqual(saved?.model, entry.model, `${entry.name}: model and limits unchanged`);
+      assert.deepEqual(saved?.provider, { kind: "preset", providerId: "openrouter", apiKey: "sk-or-stored-key" }, `${entry.name}: provider and key retained`);
+      assert.equal(saved?.reasoningEffort, "high", `${entry.name}: the other field changed`);
+    }
 });
 
 test("POST /api/agents/:id/migrate starts owner migration without target workspace preflight", async ({ app }) => {
@@ -1898,16 +2237,6 @@ test("POST /api/agents/:id/migrate starts owner migration without target workspa
         maxBytes: 123_456,
       };
     });
-
-    const flagDenied = await fetch(`${app.baseUrl}/api/agents/${agent.id}/migrate`, {
-      method: "POST",
-      headers: { ...authHeaders(ownerToken, server.id), "Content-Type": "application/json" },
-      body: JSON.stringify({ targetComputer: targetMachine.id }),
-    });
-    assert.equal(flagDenied.status, 403);
-    assert.equal((await flagDenied.json() as { code?: string }).code, "agent_migration_ui_disabled");
-    assert.equal(provisionerCalls, 0, "feature flag must retain precedence over the paywall");
-    await enableMigrationFlag(server.id);
 
     const memberDenied = await fetch(`${app.baseUrl}/api/agents/${agent.id}/migrate`, {
       method: "POST",
@@ -2202,6 +2531,7 @@ test("POST /api/agents/:id/migrate starts owner migration without target workspa
     assert.ok(Number.isInteger(startedStatusBody.migration?.revision));
     assert.ok(Number(startedStatusBody.migration?.revision) > 0);
     assert.equal(startedStatusBody.migration?.targetMachineId, targetMachine.id);
+    assert.deepEqual(startedStatusBody.migration?.initiatedBy, { id: owner.id, name: owner.name, displayName: owner.displayName ?? null });
     assert.equal(startedStatusBody.migration?.transportErrorCode, null);
     assert.equal("transferSummary" in (startedStatusBody.migration ?? {}), false);
     assert.equal("grantKey" in (startedStatusBody.migration ?? {}), false);
@@ -2243,6 +2573,15 @@ test("POST /api/agents/:id/migrate starts owner migration without target workspa
     assert.ok(failedStatusBody.migration?.transportLostAt);
     assert.ok(failedStatusBody.migration?.transportTeardownAt);
     assert.equal("transferSummary" in (failedStatusBody.migration ?? {}), false);
+
+    // Someone who has since left the server is not named.
+    await db.update(agentMigrations).set({ initiatedByUserId: member.id }).where(eq(agentMigrations.id, internalMigrationId));
+    await db.delete(serverMembers).where(and(eq(serverMembers.serverId, server.id), eq(serverMembers.userId, member.id)));
+    const leftStatus = await fetch(`${app.baseUrl}/api/agents/${agent.id}/migration`, {
+      headers: authHeaders(ownerToken, server.id),
+    });
+    assert.equal(leftStatus.status, 200, await leftStatus.clone().text());
+    assert.equal((await leftStatus.json() as { migration: { initiatedBy?: unknown } | null }).migration?.initiatedBy, null);
 });
 
 test("POST /api/agents/:id/migration/cancel is owner-gated and dispatches the frozen generation to both Computers", async ({ app }) => {
@@ -2288,7 +2627,6 @@ test("POST /api/agents/:id/migration/cancel is owner-gated and dispatches the fr
     assert.ok(migration);
   const ownerToken = await tokenForHuman(owner.email);
   const memberToken = await tokenForHuman(member.email);
-    await enableMigrationFlag(server.id);
     const deliveries: Array<{ machineId: string; message: Record<string, unknown> }> = [];
     const originalOrchestrator = app.app.get("agentOrchestrator") as Record<string, unknown>;
     app.app.set("agentOrchestrator", {
@@ -2512,68 +2850,10 @@ test("manual agent start completes a retryable migration only after a dispatched
     assert.equal(stillStarting.completedAt, null);
 });
 
-test("POST /api/agents/:id/assign-machine refuses while the agent has an active migration", async ({ app }) => {
-    const db = getDb();
-    const owner = await seedUser("migration-assign-owner@slock.test", "migration-assign-owner");
-    const server = await createServer("Migration Assign", "migration-assign", owner.id);
-    const now = new Date();
-    const [sourceMachine, targetMachine] = await db.insert(machines).values([
-      {
-        serverId: server.id,
-        userId: owner.id,
-        name: "migration-assign-source",
-        apiKeyHash: "migration-assign-source-hash",
-        runtimes: ["codex"],
-        lastHeartbeat: now,
-      },
-      {
-        serverId: server.id,
-        userId: owner.id,
-        name: "migration-assign-target",
-        apiKeyHash: "migration-assign-target-hash",
-        runtimes: ["codex"],
-        lastHeartbeat: now,
-      },
-    ]).returning();
-    const agent = await createAgent(server.id, "migration-assign-agent", {
-      runtime: "codex",
-      machineId: sourceMachine!.id,
-    });
-    const { migration } = await beginTestAgentMigration({
-      agentId: agent.id,
-      targetMachineId: targetMachine!.id,
-      initiatedByUserId: owner.id,
-      now,
-    });
-    const token = await tokenForHuman(owner.email);
-    const assign = (machineId: string | null) =>
-      fetch(`${app.baseUrl}/api/agents/${agent.id}/assign-machine`, {
-        method: "POST",
-        headers: {
-          ...authHeaders(token, server.id),
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ machineId }),
-      });
-
-    for (const machineId of [targetMachine!.id, null]) {
-      const res = await assign(machineId);
-      assert.equal(res.status, 409, await res.clone().text());
-      assert.equal(((await res.json()) as { code: string }).code, "MIGRATION_ALREADY_IN_PROGRESS");
-      assert.equal((await getAgent(agent.id))?.machineId, sourceMachine!.id);
-    }
-
-    // Once the migration is terminal the Computer can be changed again.
-    await db.update(agentMigrations).set({ state: "aborted", abortedAt: now }).where(eq(agentMigrations.id, migration.id));
-    const res = await assign(targetMachine!.id);
-    assert.equal(res.status, 200, await res.clone().text());
-    assert.equal((await getAgent(agent.id))?.machineId, targetMachine!.id);
-});
-
 test("DELETE /api/agents/:id soft-deletes even if runtime stop hangs", async () => {
   const previousTimeout = process.env.SLOCK_AGENT_DELETE_STOP_TIMEOUT_MS;
   process.env.SLOCK_AGENT_DELETE_STOP_TIMEOUT_MS = "5";
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const owner = await seedUser("delete-hanging-stop-owner@slock.test", "delete-hanging-stop-owner");
     const server = await createServer("Delete Hanging Stop", "delete-hanging-stop", owner.id);
@@ -2616,6 +2896,43 @@ test("DELETE /api/agents/:id soft-deletes even if runtime stop hangs", async () 
     }
     await app.close();
   }
+});
+
+test("the owner's Stop tells the daemon owner_stop and delete tells it deleted (raft proc step 2)", async ({ app }) => {
+    const owner = await seedUser("stop-reason-owner@slock.test", "stop-reason-owner");
+    const server = await createServer("Stop Reason Server", "stop-reason-server", owner.id);
+    const agent = await createAgent(server.id, "stop-reason-agent", { runtime: "codex" });
+    const ownerToken = await tokenForHuman(owner.email);
+
+    const stops: unknown[][] = [];
+    const originalOrchestrator = app.app.get("agentOrchestrator") as Record<string, unknown>;
+    app.app.set("agentOrchestrator", {
+      ...originalOrchestrator,
+      stopAgent: async (...args: unknown[]) => {
+        stops.push(args);
+        return { delivered: true };
+      },
+      evictCache: () => {},
+    });
+    try {
+      const stop = await fetch(`${app.baseUrl}/api/agents/${agent.id}/stop`, {
+        method: "POST",
+        headers: authHeaders(ownerToken, server.id),
+      });
+      assert.equal(stop.status, 200, await stop.clone().text());
+      const del = await fetch(`${app.baseUrl}/api/agents/${agent.id}`, {
+        method: "DELETE",
+        headers: authHeaders(ownerToken, server.id),
+      });
+      assert.equal(del.status, 200, await del.clone().text());
+    } finally {
+      app.app.set("agentOrchestrator", originalOrchestrator);
+    }
+
+    assert.deepEqual(stops, [
+      [agent.id, "manual", { daemonReason: "owner_stop" }],
+      [agent.id, "internal", { daemonReason: "deleted" }],
+    ]);
 });
 
 test("PATCH /agents/:id clears persisted runtime session when runtime changes", async ({ app }) => {
@@ -2743,6 +3060,67 @@ test("PATCH /agents/:id codex model switch forces session reset even when caller
     assert.equal(res.status, 200);
     // codex model switch must force session reset, not the caller-requested restart.
     assert.deepEqual(resetCall, { agentId: agent.id, mode: "session", options: { restartIfStopped: false, terminalControl: "runtime_config_changed" } });
+});
+
+test("PATCH /agents/:id codex model switch without restartMode clears the stored session; other edits and runtimes keep it", async ({ app }) => {
+  // #proj-raft-computer:#48: the session clear used to ride on restartMode, and
+  // the web sends none for a stopped agent, so its next start resumed the old
+  // Codex thread on the old model.
+  const owner = await seedUser("codex-model-no-restart@slock.test", "codex-model-no-restart");
+  const server = await createServer("Codex Model No Restart", "codex-model-no-restart", owner.id);
+  const token = await tokenForHuman(owner.email);
+  const headers = { ...authHeaders(token, server.id), "Content-Type": "application/json" };
+  const patch = (agentId: string, body: Record<string, unknown>) =>
+    fetch(`${app.baseUrl}/api/agents/${agentId}`, { method: "PATCH", headers, body: JSON.stringify(body) });
+
+  const codex = await createAgent(server.id, "codex-no-restart-agent", { runtime: "codex", model: "gpt-5.3-codex" });
+  await updateAgentStatus(codex.id, "inactive", "codex-session-id");
+  const described = await patch(codex.id, { description: "only the description" });
+  assert.equal(described.status, 200, await described.clone().text());
+  assert.equal((await getAgent(codex.id))?.sessionId, "codex-session-id", "a description edit keeps the session");
+
+  const switched = await patch(codex.id, { model: "gpt-5.6-sol" });
+  assert.equal(switched.status, 200, await switched.clone().text());
+  const after = await getAgent(codex.id);
+  assert.equal(after?.model, "gpt-5.6-sol");
+  assert.equal(after?.sessionId, null, "a Codex model switch clears the session without restartMode");
+
+  const claude = await createAgent(server.id, "claude-no-restart-agent", { runtime: "claude", model: "sonnet" });
+  await updateAgentStatus(claude.id, "inactive", "claude-session-id");
+  const claudeSwitched = await patch(claude.id, { model: "opus" });
+  assert.equal(claudeSwitched.status, 200, await claudeSwitched.clone().text());
+  assert.equal((await getAgent(claude.id))?.sessionId, "claude-session-id", "other runtimes keep their session");
+});
+
+test("PATCH /agents/:id: a Pi agent saved again with its stored off is not a runtime change (#9775)", async ({ app }) => {
+  // off lives in runtimeConfig only, never in the legacy column, so the change
+  // check must compare against runtimeConfig; otherwise every save counts as a
+  // runtime change (lifting the failure breaker, queueing a profile migration).
+  const owner = await seedUser("pi-off-unchanged@slock.test", "pi-off-unchanged");
+  const server = await createServer("Pi Off Unchanged", "pi-off-unchanged", owner.id);
+  const token = await tokenForHuman(owner.email);
+  const agent = await createAgent(server.id, "pi-off-agent", { runtime: "pi", model: "default" });
+  const headers = { ...authHeaders(token, server.id), "Content-Type": "application/json" };
+  const resets: Array<{ terminalControl?: unknown }> = [];
+  const originalOrchestrator = app.app.get("agentOrchestrator") as Record<string, unknown>;
+  app.app.set("agentOrchestrator", {
+    ...originalOrchestrator,
+    evictCache: () => {},
+    resetAgent: async (_agentId: string, _mode: string, options?: { terminalControl?: unknown }) => {
+      resets.push({ terminalControl: options?.terminalControl });
+    },
+  });
+  const patch = (body: Record<string, unknown>) => fetch(`${app.baseUrl}/api/agents/${agent.id}`, { method: "PATCH", headers, body: JSON.stringify(body) });
+
+  const first = await patch({ reasoningEffort: "off", restartMode: "restart" });
+  assert.equal(first.status, 200, await first.clone().text());
+  assert.equal(((await getAgent(agent.id))?.runtimeConfig as { reasoningEffort?: unknown } | null)?.reasoningEffort, "off");
+  assert.equal(resets[0]?.terminalControl, "runtime_config_changed", "setting off is a runtime change");
+
+  const again = await patch({ reasoningEffort: "off", restartMode: "restart" });
+  assert.equal(again.status, 200, await again.clone().text());
+  assert.equal(resets.length, 2);
+  assert.equal(resets[1]?.terminalControl, undefined, "the same off again is not");
 });
 
 test("PATCH /agents/:id codex reasoning-only change honors the caller's restart mode", async ({ app }) => {
@@ -3826,223 +4204,119 @@ test("schema-backed Kimi create and edit use the same live per-model effort auth
     );
 });
 
-test("grok_runtime_v0 gates new Grok selections while preserving existing Grok agent management", async ({ app }) => {
-    const owner = await seedUser("grok-runtime-flag-owner@slock.test", "grok-runtime-flag-owner");
-    const server = await createServer("Grok Runtime Flag Server", "grok-runtime-flag-server", owner.id);
+test("Grok is admitted for new use without a feature flag; computer capability still gates it", async ({ app }) => {
+  const owner = await seedUser("grok-runtime-owner@slock.test", "grok-runtime-owner");
+  const server = await createServer("Grok Runtime Server", "grok-runtime-server", owner.id);
   const ownerToken = await tokenForHuman(owner.email);
-    const [machine] = await getDb().insert(machines).values({
-      serverId: server.id,
-      userId: owner.id,
-      name: "grok-runtime-flag-machine",
-      apiKeyHash: "unused-grok-runtime-flag-machine-hash",
-      runtimes: ["codex", "grok"],
-    }).returning();
-    const codexAgent = await createAgent(server.id, "flagged-codex-agent", {
-      runtime: "codex",
-      model: "gpt-5",
-      machineId: machine.id,
-    });
-    const existingGrokAgent = await createAgent(server.id, "existing-grok-agent", {
-      runtime: "grok",
-      model: "grok-4.5",
-      machineId: machine.id,
-    });
+  const [machine] = await getDb().insert(machines).values({
+    serverId: server.id,
+    userId: owner.id,
+    name: "grok-runtime-machine",
+    apiKeyHash: "unused-grok-runtime-machine-hash",
+    runtimes: ["codex", "grok"],
+  }).returning();
+  const codexAgent = await createAgent(server.id, "grok-candidate-codex-agent", {
+    runtime: "codex",
+    model: "gpt-5",
+    machineId: machine.id,
+  });
+  // A leftover rule from the retired grok_runtime_v0 rollout is ignored.
+  await getDb().insert(featureFlagRules).values({
+    id: randomUUID(),
+    flagKey: "grok_runtime_v0",
+    stage: "server",
+    priority: 0,
+    decision: "deny",
+    values: [server.id],
+  });
 
-    const getRuntimeOptions = async (agentId: string) => {
-      const res = await fetch(`${app.baseUrl}/api/agents/${agentId}/runtime-options`, {
-        headers: { ...authHeaders(ownerToken, server.id), "X-Raft-Runtime-Form-V2": "1" },
-      });
-      assert.equal(res.status, 200);
-      return await res.json() as {
-        context: string;
-        machineId: string | null;
-        options: Array<{
-          runtimeId: string;
-          capabilityStatus: string;
-          admissionStatus: string;
-          admissionReason: string | null;
-          current: boolean;
-          availableForNew: boolean;
-          manageableForCurrentAgent: boolean;
-          canSelectInThisContext: boolean;
-        }>;
-      };
-    };
+  const optionsRes = await fetch(`${app.baseUrl}/api/agents/${codexAgent.id}/runtime-options`, {
+    headers: { ...authHeaders(ownerToken, server.id), "X-Raft-Runtime-Form-V2": "1" },
+  });
+  assert.equal(optionsRes.status, 200);
+  const options = (await optionsRes.json() as { options: Array<Record<string, unknown>> }).options;
+  assert.deepEqual(options.find((option) => option.runtimeId === "grok"), {
+    runtimeId: "grok",
+    capabilityStatus: "available",
+    admissionStatus: "available_for_new",
+    admissionReason: null,
+    current: false,
+    availableForNew: true,
+    manageableForCurrentAgent: false,
+    canSelectInThisContext: true,
+    runtimeFormV2: { protocolVersion: 2 },
+  });
 
-    const disabledCodexOptions = await getRuntimeOptions(codexAgent.id);
-    assert.equal(disabledCodexOptions.options.some((option) => option.runtimeId === "grok"), false);
-    const disabledExistingGrokOptions = await getRuntimeOptions(existingGrokAgent.id);
-    assert.equal(disabledExistingGrokOptions.context, "existing_agent");
-    assert.equal(disabledExistingGrokOptions.machineId, machine.id);
-    assert.deepEqual(disabledExistingGrokOptions.options.find((option) => option.runtimeId === "grok"), {
-      runtimeId: "grok",
-      capabilityStatus: "available",
-      admissionStatus: "grandfathered_current",
-      admissionReason: "feature_flag_off",
-      current: true,
-      availableForNew: false,
-      manageableForCurrentAgent: true,
-      canSelectInThisContext: true,
-      // Additive (batch 3a): an existing Grok agent stays editable with its v2 form.
-      runtimeFormV2: { protocolVersion: 2 },
-    });
+  const transitionRes = await fetch(`${app.baseUrl}/api/agents/${codexAgent.id}`, {
+    method: "PATCH",
+    headers: { ...authHeaders(ownerToken, server.id), "Content-Type": "application/json" },
+    body: JSON.stringify({ runtime: "grok", model: "grok-4.5" }),
+  });
+  assert.equal(transitionRes.status, 200);
+  assert.equal((await getAgent(codexAgent.id))?.runtime, "grok");
 
-    const createDisabledRes = await fetch(`${app.baseUrl}/api/agents`, {
-      method: "POST",
-      headers: {
-        ...authHeaders(ownerToken, server.id),
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        name: "disabled-grok-agent",
-        runtime: "grok",
-        model: "grok-4.5",
-      }),
-    });
-    assert.equal(createDisabledRes.status, 403);
-    assert.deepEqual(await createDisabledRes.json(), {
-      error: "Grok Build is not enabled on this server",
-      code: "grok_runtime_disabled",
-    });
+  await getDb().update(machines).set({ runtimes: ["codex"] }).where(eq(machines.id, machine.id));
+  const unavailableCreateRes = await fetch(`${app.baseUrl}/api/agents`, {
+    method: "POST",
+    headers: { ...authHeaders(ownerToken, server.id), "Content-Type": "application/json" },
+    body: JSON.stringify({ name: "unavailable-grok-agent", runtime: "grok", model: "grok-4.5", machineId: machine.id }),
+  });
+  assert.equal(unavailableCreateRes.status, 409);
+  assert.deepEqual(await unavailableCreateRes.json(), {
+    error: "Grok Build is not available on this computer",
+    code: "runtime_capability_unavailable",
+  });
+  assert.equal((await listAgents(server.id)).some((agent) => agent.name === "unavailable-grok-agent"), false);
 
-    const transitionDisabledRes = await fetch(`${app.baseUrl}/api/agents/${codexAgent.id}`, {
-      method: "PATCH",
-      headers: {
-        ...authHeaders(ownerToken, server.id),
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        runtime: "grok",
-        model: "grok-4.5",
-      }),
-    });
-    assert.equal(transitionDisabledRes.status, 403);
-    assert.equal(((await transitionDisabledRes.json()) as { code: string }).code, "grok_runtime_disabled");
-    assert.equal((await getAgent(codexAgent.id))?.runtime, "codex");
+  await getDb().update(machines).set({ runtimes: ["codex", "grok"] }).where(eq(machines.id, machine.id));
+  const createRes = await fetch(`${app.baseUrl}/api/agents`, {
+    method: "POST",
+    headers: { ...authHeaders(ownerToken, server.id), "Content-Type": "application/json" },
+    body: JSON.stringify({ name: "new-grok-agent", runtime: "grok", model: "grok-4.5", machineId: machine.id }),
+  });
+  assert.equal(createRes.status, 200);
+  assert.equal((await createRes.json() as { runtime: string }).runtime, "grok");
+});
 
-    const existingManagementRes = await fetch(`${app.baseUrl}/api/agents/${existingGrokAgent.id}`, {
-      method: "PATCH",
-      headers: {
-        ...authHeaders(ownerToken, server.id),
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        description: "existing Grok remains manageable while rollout is off",
-        runtime: "grok",
-        model: "grok-composer-2.5-fast",
-      }),
-    });
-    assert.equal(existingManagementRes.status, 200);
-    const existingManagementBody = await existingManagementRes.json() as {
-      description: string;
-      runtime: string;
-      model: string;
-    };
-    assert.equal(existingManagementBody.description, "existing Grok remains manageable while rollout is off");
-    assert.equal(existingManagementBody.runtime, "grok");
-    assert.equal(existingManagementBody.model, "grok-composer-2.5-fast");
+test("an OAR-only runtime (Qwen Code) needs only a Computer that reports it, no server flag", async ({ app }) => {
+  const owner = await seedUser("qwen-runtime-owner@slock.test", "qwen-runtime-owner");
+  const server = await createServer("Qwen Runtime Server", "qwen-runtime-server", owner.id);
+  const ownerToken = await tokenForHuman(owner.email);
+  const headers = { ...authHeaders(ownerToken, server.id), "Content-Type": "application/json" };
+  const [machine] = await getDb().insert(machines).values({
+    serverId: server.id,
+    userId: owner.id,
+    name: "qwen-runtime-machine",
+    apiKeyHash: "unused-qwen-runtime-machine-hash",
+    runtimes: ["codex", "qwen"],
+  }).returning();
+  const codexAgent = await createAgent(server.id, "qwen-candidate-codex-agent", { runtime: "codex", model: "gpt-5", machineId: machine.id });
+  const create = (name: string) => fetch(`${app.baseUrl}/api/agents`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ name, runtime: "qwen", model: "qwen3-coder-plus", machineId: machine.id }),
+  });
 
-    await getDb().update(machines).set({ runtimes: ["codex"] }).where(eq(machines.id, machine.id));
-    const unavailableExistingGrokOptions = await getRuntimeOptions(existingGrokAgent.id);
-    assert.deepEqual(unavailableExistingGrokOptions.options.find((option) => option.runtimeId === "grok"), {
-      runtimeId: "grok",
-      capabilityStatus: "not_installed",
-      admissionStatus: "grandfathered_current",
-      admissionReason: "feature_flag_off",
-      current: true,
-      availableForNew: false,
-      manageableForCurrentAgent: false,
-      canSelectInThisContext: false,
-      runtimeFormV2: { protocolVersion: 2 },
-    });
-    const unavailableManagementRes = await fetch(`${app.baseUrl}/api/agents/${existingGrokAgent.id}`, {
-      method: "PATCH",
-      headers: {
-        ...authHeaders(ownerToken, server.id),
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ model: "grok-4.5" }),
-    });
-    assert.equal(unavailableManagementRes.status, 409);
-    assert.deepEqual(await unavailableManagementRes.json(), {
-      error: "Grok Build is not available on this computer",
-      code: "runtime_capability_unavailable",
-    });
+  // No server flag: offered as soon as the Computer reports it.
+  const options = await fetch(`${app.baseUrl}/api/agents/${codexAgent.id}/runtime-options`, { headers: authHeaders(ownerToken, server.id) });
+  assert.equal((await options.json() as { options: Array<{ runtimeId: string }> }).options.some((option) => option.runtimeId === "qwen"), true);
 
-    const unavailableProfileEditRes = await fetch(`${app.baseUrl}/api/agents/${existingGrokAgent.id}`, {
-      method: "PATCH",
-      headers: {
-        ...authHeaders(ownerToken, server.id),
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ description: "profile edits do not require runtime capability" }),
-    });
-    assert.equal(unavailableProfileEditRes.status, 200);
-    assert.equal(
-      ((await unavailableProfileEditRes.json()) as { description: string }).description,
-      "profile edits do not require runtime capability",
-    );
+  // A Computer that does not report it: refused with the way out.
+  await getDb().update(machines).set({ runtimes: ["codex"] }).where(eq(machines.id, machine.id));
+  const unreported = await create("qwen-unreported-agent");
+  assert.equal(unreported.status, 409);
+  assert.deepEqual(await unreported.json(), {
+    error: "Qwen Code is not available on this computer: install its CLI there, and update the Computer if it does not list Qwen Code yet",
+    code: "runtime_capability_unavailable",
+  });
 
-    const leaveGrokRes = await fetch(`${app.baseUrl}/api/agents/${existingGrokAgent.id}`, {
-      method: "PATCH",
-      headers: {
-        ...authHeaders(ownerToken, server.id),
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        runtimeConfig: {
-          version: 1,
-          runtime: "codex",
-          model: { kind: "custom", name: "gpt-5" },
-        },
-      }),
-    });
-    assert.equal(leaveGrokRes.status, 200);
-    assert.equal((await getAgent(existingGrokAgent.id))?.runtime, "codex");
-    const afterLeavingGrokOptions = await getRuntimeOptions(existingGrokAgent.id);
-    assert.equal(afterLeavingGrokOptions.options.some((option) => option.runtimeId === "grok"), false);
-
-    await enableGrokRuntimeFlag(server.id);
-
-    const unavailableCreateRes = await fetch(`${app.baseUrl}/api/agents`, {
-      method: "POST",
-      headers: {
-        ...authHeaders(ownerToken, server.id),
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        name: "unavailable-grok-agent",
-        runtime: "grok",
-        model: "grok-4.5",
-        machineId: machine.id,
-      }),
-    });
-    assert.equal(unavailableCreateRes.status, 409);
-    assert.deepEqual(await unavailableCreateRes.json(), {
-      error: "Grok Build is not available on this computer",
-      code: "runtime_capability_unavailable",
-    });
-    assert.equal((await listAgents(server.id)).some((agent) => agent.name === "unavailable-grok-agent"), false);
-
-    await getDb().update(machines).set({ runtimes: ["codex", "grok"] }).where(eq(machines.id, machine.id));
-    const createEnabledRes = await fetch(`${app.baseUrl}/api/agents`, {
-      method: "POST",
-      headers: {
-        ...authHeaders(ownerToken, server.id),
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        name: "enabled-grok-agent",
-        runtime: "grok",
-        model: "grok-4.5",
-        machineId: machine.id,
-      }),
-    });
-    assert.equal(createEnabledRes.status, 200);
-    const createEnabledBody = await createEnabledRes.json() as { runtime: string; model: string; machineId: string | null };
-    assert.equal(createEnabledBody.runtime, "grok");
-    assert.equal(createEnabledBody.model, "grok-4.5");
-    assert.equal(createEnabledBody.machineId, machine.id);
+  await getDb().update(machines).set({ runtimes: ["codex", "qwen"] }).where(eq(machines.id, machine.id));
+  const created = await create("qwen-agent");
+  assert.equal(created.status, 200);
+  assert.equal((await created.json() as { runtime: string }).runtime, "qwen");
+  const switched = await fetch(`${app.baseUrl}/api/agents/${codexAgent.id}`, { method: "PATCH", headers, body: JSON.stringify({ runtime: "qwen", model: "qwen3-coder-plus" }) });
+  assert.equal(switched.status, 200);
+  assert.equal((await getAgent(codexAgent.id))?.runtime, "qwen");
 });
 
 test("POST /agents onboarding Cindy can recover after other agents already exist", async ({ app }) => {
@@ -4314,7 +4588,7 @@ test("POST /agents rejects unsupported runtimeConfig launch axes", async ({ app 
 
     const providerUnsupportedRuntimes = ["codex", "grok", "antigravity", "kimi", "copilot", "cursor", "gemini", "opencode"];
     const fastUnsupportedRuntimes = ["grok", "antigravity", "kimi", "copilot", "cursor", "gemini", "opencode"];
-    const reasoningUnsupportedRuntimes = ["antigravity", "kimi", "cursor", "gemini", "opencode"];
+    const reasoningUnsupportedRuntimes = ["kimi", "cursor", "gemini", "opencode"];
 
     const cases = [
       ...providerUnsupportedRuntimes.map((runtime) => ({
@@ -4889,6 +5163,21 @@ test("GET /agents/:id/channels returns viewer-visible listable channel membershi
     const jointChannel = await createChannel(server.id, "gamma-joint", undefined, "joint");
     const hiddenPrivateChannel = await createChannel(server.id, "delta-hidden-private", undefined, "private");
     const hiddenJointChannel = await createChannel(server.id, "epsilon-hidden-joint", undefined, "joint");
+    for (const local of [jointChannel, hiddenJointChannel]) {
+      const canonical = await createChannel(server.id, `${local.name}-storage`);
+      const [joint] = await db.insert(jointChannels).values({
+        canonicalChannelId: canonical.id,
+        createdByServerId: server.id,
+        createdByUserId: owner.id,
+      }).returning();
+      await db.insert(jointChannelServers).values({
+        jointChannelId: joint.id,
+        serverId: server.id,
+        localChannelId: local.id,
+        role: "host",
+        joinedByUserId: owner.id,
+      });
+    }
     await addAgent(publicChannel.id, agentA.id);
     await addAgent(privateChannel.id, agentA.id);
     await addAgent(jointChannel.id, agentA.id);
@@ -5093,7 +5382,7 @@ test("bootstrap-token denial names issueAgentCredentials and human creator autho
   const oldPepper = process.env.AGENT_BOOTSTRAP_TOKEN_PEPPER;
   process.env[gateKey] = "true";
   process.env.AGENT_BOOTSTRAP_TOKEN_PEPPER = "bootstrap-copy-test-pepper-at-least-32-bytes";
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const db = getDb();
     const owner = await seedUser("bootstrap-copy-owner@slock.test", "bootstrap-copy-owner");
@@ -5255,34 +5544,653 @@ test("activity-summaries hides where a turn came from when the viewer cannot see
     const agent = await createAgent(server.id, "activity-summary-agent", { runtime: "claude", creatorType: "user", creatorId: owner.id });
     const publicChannel = await createChannel(server.id, "summary-public", "visible");
     const privateChannel = await createChannel(server.id, "summary-secret", "not joined", "private");
+    const waking = await postWakingMessage(publicChannel.id, owner.id);
     const base = { v: 1 as const, outcome: "completed" as const, actions: [], toolCalls: 0, problems: [], problemCount: 0, messagesSent: 0 };
     const calls: unknown[] = [];
     Object.assign(app.app.get("agentOrchestrator"), {
-      listTurnSummaries: async (agentId: string, options: unknown) => {
+      listTurnSummaries: async (agentId: string, options: { limit?: number }) => {
         calls.push([agentId, options]);
+        // The turn just older than the page, for splitting time at its edge.
+        if (options.limit === 1) return { summaries: [] };
         return { next: { endedAt: 1, id: "00000000-0000-4000-8000-000000000001" }, summaries: [
-          { ...base, startedAt: 5, endedAt: 6, trigger: { target: "#summary-public", channelId: publicChannel.id, sender: "richard", messageId: "m1" } },
+          { ...base, startedAt: 5, endedAt: 6, trigger: { target: "#summary-public", channelId: publicChannel.id, sender: "richard", messageId: waking.id } },
           { ...base, startedAt: 3, endedAt: 4, trigger: { target: "#summary-secret", channelId: privateChannel.id, sender: "richard", messageId: "m2" } },
           { ...base, startedAt: 1, endedAt: 2, trigger: { target: "dm:@someone", channelId: randomUUID(), sender: "someone", messageId: "m3" } },
           { ...base, startedAt: 0, endedAt: 1 },
         ] };
       },
+      getTurnSummary: async () => null,
     });
 
+    // What the agent sent: one message in the public channel during the first
+    // turn, one in the private channel during the second.
+    const [visibleSent] = await getDb().insert(messages).values({
+      channelId: publicChannel.id, senderType: "agent", senderId: agent.id,
+      content: "visible reply", messageType: "chat", searchText: "visible reply", createdAt: new Date(5),
+    }).returning();
+    await getDb().insert(messages).values({
+      channelId: privateChannel.id, senderType: "agent", senderId: agent.id,
+      content: "secret reply", messageType: "chat", searchText: "secret reply", createdAt: new Date(3),
+    });
     const res = await fetch(`${app.baseUrl}/api/agents/${agent.id}/activity-summaries?limit=4&before=99:00000000-0000-4000-8000-000000000009`, {
       headers: authHeaders(await tokenForHuman(owner.email), server.id),
     });
     assert.equal(res.status, 200);
     const body = await res.json() as { summaries: Array<{ trigger?: unknown }>; next?: string };
-    assert.deepEqual(calls, [[agent.id, { limit: 4, before: { endedAt: 99, id: "00000000-0000-4000-8000-000000000009" } }]]);
+    assert.deepEqual(calls, [
+      [agent.id, { limit: 4, before: { endedAt: 99, id: "00000000-0000-4000-8000-000000000009" } }],
+      [agent.id, { limit: 1, before: { endedAt: 1, id: "00000000-0000-4000-8000-000000000001" } }],
+    ]);
     assert.equal(body.next, "1:00000000-0000-4000-8000-000000000001");
     assert.deepEqual(body.summaries.map((summary) => summary.trigger), [
-      { target: "#summary-public", channelId: publicChannel.id, sender: "richard", messageId: "m1" },
+      {
+        target: "#summary-public", channelId: publicChannel.id, sender: "richard", messageId: waking.id,
+        display: { kind: "channel", channelName: "summary-public", senderName: "activity-summary-owner" },
+      },
       { hidden: "private_channel" },
       { hidden: "dm" },
       undefined,
     ]);
     assert.doesNotMatch(JSON.stringify(body), /summary-secret|someone/);
+    const sent = body.summaries as Array<{ sentMessageIds?: string[]; hiddenSentCount?: number }>;
+    assert.deepEqual(sent.map((summary) => [summary.sentMessageIds, summary.hiddenSentCount]), [
+      [[visibleSent!.id], undefined],
+      [[], 1],
+      [undefined, undefined],
+      [undefined, undefined],
+    ], "every sent message the viewer can see, and only a count of the private one");
+});
+
+test("activity-summaries splits time with the turns just outside the page, so an edge message is listed once (task #17)", async ({ app }) => {
+    const owner = await seedUser("activity-sent-edge-owner@slock.test", "activity-sent-edge-owner");
+    const server = await createServer("Activity Sent Edge Server", "activity-sent-edge", owner.id);
+    const agent = await createAgent(server.id, "activity-sent-edge-agent", { runtime: "claude", creatorType: "user", creatorId: owner.id });
+    const channel = await createChannel(server.id, "sent-edge-public", "visible");
+    const base = { v: 1 as const, outcome: "completed" as const, actions: [], toolCalls: 0, problems: [], problemCount: 0, messagesSent: 0 };
+    const cursorId = "00000000-0000-4000-8000-00000000000a";
+    Object.assign(app.app.get("agentOrchestrator"), {
+      listTurnSummaries: async (_agentId: string, options: { limit?: number }) => options.limit === 1
+        ? { summaries: [{ ...base, id: "older", startedAt: 0, endedAt: 10_000 }] }
+        : { next: { endedAt: 60_000, id: "00000000-0000-4000-8000-00000000000b" }, summaries: [{ ...base, startedAt: 50_000, endedAt: 60_000 }] },
+      getTurnSummary: async (_agentId: string, id: string) => (id === cursorId ? { ...base, id, startedAt: 110_000, endedAt: 120_000 } : null),
+    });
+    const sent = await getDb().insert(messages).values([25_000, 55_000, 90_000].map((at) => ({
+      channelId: channel.id, senderType: "agent" as const, senderId: agent.id,
+      content: `sent at ${at}`, messageType: "chat" as const, searchText: "sent", createdAt: new Date(at),
+    }))).returning();
+    const res = await fetch(`${app.baseUrl}/api/agents/${agent.id}/activity-summaries?before=200000:${cursorId}`, {
+      headers: authHeaders(await tokenForHuman(owner.email), server.id),
+    });
+    assert.equal(res.status, 200);
+    const body = await res.json() as { summaries: Array<{ sentMessageIds?: string[] }> };
+    // 25 s belongs to the older neighbour and 90 s to the newer one; only 55 s is this page's.
+    assert.deepEqual(body.summaries.map((summary) => summary.sentMessageIds), [[sent[1]!.id]]);
+});
+
+test("activity-summaries lists sends newest first and leaves a turn the send query cut short on its last-reply card (task #17)", async ({ app }) => {
+    const owner = await seedUser("activity-sent-cut-owner@slock.test", "activity-sent-cut-owner");
+    const server = await createServer("Activity Sent Cut Server", "activity-sent-cut", owner.id);
+    const agent = await createAgent(server.id, "activity-sent-cut-agent", { runtime: "claude", creatorType: "user", creatorId: owner.id });
+    const channel = await createChannel(server.id, "sent-cut-public", "visible");
+    const base = { v: 1 as const, outcome: "completed" as const, actions: [], toolCalls: 0, problems: [], problemCount: 0, messagesSent: 0 };
+    Object.assign(app.app.get("agentOrchestrator"), {
+      listTurnSummaries: async () => ({ summaries: [
+        { ...base, startedAt: 1_000_000, endedAt: 1_010_000 },
+        { ...base, startedAt: 0, endedAt: 10_000 },
+      ] }),
+    });
+    // 2100 sends: 1500 in the newer turn and 600 in the older one; the query
+    // returns the newest 2000, so the older turn's list would be partial.
+    const row = (at: number) => ({
+      channelId: channel.id, senderType: "agent" as const, senderId: agent.id,
+      content: "sent", messageType: "chat" as const, searchText: "sent", createdAt: new Date(at),
+    });
+    await getDb().insert(messages).values([
+      ...Array.from({ length: 1500 }, (_, i) => row(1_000_001 + i)),
+      ...Array.from({ length: 600 }, (_, i) => row(1 + i)),
+    ]);
+    const res = await fetch(`${app.baseUrl}/api/agents/${agent.id}/activity-summaries`, {
+      headers: authHeaders(await tokenForHuman(owner.email), server.id),
+    });
+    assert.equal(res.status, 200);
+    const body = await res.json() as { summaries: Array<{ sentMessageCount?: number; sentMessageIds?: string[] }> };
+    assert.deepEqual(body.summaries.map((summary) => summary.sentMessageCount), [1500, undefined]);
+    assert.equal(body.summaries[1]!.sentMessageIds, undefined);
+});
+
+test("activity-summaries lists the app events delivered in each turn and names the one that woke it, never the payload", async ({ app }) => {
+  const owner = await seedUser("activity-app-events-owner@slock.test", "activity-app-events-owner");
+  const server = await createServer("Activity App Events Server", "activity-app-events", owner.id);
+  const agent = await createAgent(server.id, "activity-app-events-agent", { runtime: "claude", creatorType: "user", creatorId: owner.id });
+  const otherAgent = await createAgent(server.id, "activity-app-events-other", { runtime: "claude", creatorType: "user", creatorId: owner.id });
+  const stamp = await createOAuthClient({ serverId: server.id, createdByUserId: owner.id, clientId: "stamp-overview", name: "Stamp", allowedScopes: ["agent:event:write"] });
+  const t = Date.now() - 60 * 60_000;
+  const base = { v: 1 as const, outcome: "completed" as const, actions: [], toolCalls: 1, problems: [], problemCount: 0, messagesSent: 0 };
+  const event = (id: string, at: number | null, extra: Partial<typeof thirdPartyAgentEvents.$inferInsert> = {}) => ({
+    id,
+    serverId: server.id,
+    agentId: agent.id,
+    clientId: stamp.client.id,
+    kind: "event" as const,
+    summary: `summary ${id.slice(0, 8)}`,
+    payload: { token: "secret-payload" },
+    payloadHash: "secret-hash",
+    resource: "urn:secret-resource",
+    status: at === null ? "queued" as const : "delivered" as const,
+    deliveredAt: at === null ? null : new Date(at),
+    expiresAt: new Date(Date.now() + 24 * 60 * 60_000),
+    createdAt: new Date(t),
+    ...extra,
+  });
+  await getDb().insert(thirdPartyAgentEvents).values([
+    // Woke the older turn, and arrived in it.
+    event("11111111-0000-4000-8000-000000000001", t + 10_000, { summary: "CI failed on #10827" }),
+    // Just before the boundary (75 s, halfway into the idle gap): still the older turn.
+    event("22222222-0000-4000-8000-000000000002", t + 74_000),
+    // A Raft system app's event (no OAuth client): kept, just after the boundary.
+    event("33333333-0000-4000-8000-000000000003", t + 76_000, { clientId: null, systemApp: "system.assistant" }),
+    // Never delivered: not counted.
+    event("44444444-0000-4000-8000-000000000004", null, { createdAt: new Date(t + 150_000) }),
+    // Two events behind one short id, delivered during the running turn.
+    event("abcdef01-0000-4000-8000-000000000005", t + 350_000),
+    event("abcdef01-0000-4000-8000-000000000006", t + 351_000),
+    // Another agent's event, in the newer turn's time and behind its trigger's short id.
+    event("deadbeef-0000-4000-8000-000000000007", t + 150_000, { agentId: otherAgent.id }),
+  ]);
+  Object.assign(app.app.get("agentOrchestrator"), {
+    listTurnSummaries: async () => ({ summaries: [
+      { ...base, id: "00000000-0000-4000-8000-0000000000b2", startedAt: t + 100_000, endedAt: t + 200_000, trigger: { target: "agent-event:deadbeef" } },
+      { ...base, id: "00000000-0000-4000-8000-0000000000b1", startedAt: t, endedAt: t + 50_000, trigger: { target: "agent-event:11111111" } },
+    ] }),
+    getTurnSummary: async () => null,
+    getActivity: async () => ({ activity: "working", activityDetail: "" }),
+    getRunningTurn: async () => ({
+      continuesPreviousTurn: false,
+      turn: { ...base, outcome: undefined, running: true, startedAt: t + 300_000, endedAt: t + 400_000, trigger: { target: "agent-event:abcdef01" } },
+    }),
+  });
+  const res = await fetch(`${app.baseUrl}/api/agents/${agent.id}/activity-summaries`, {
+    headers: authHeaders(await tokenForHuman(owner.email), server.id),
+  });
+  assert.equal(res.status, 200);
+  type Turn = { trigger?: { target?: string; appEvent?: unknown }; appEvents?: Array<Record<string, unknown>>; appEventCount?: number };
+  const body = await res.json() as { summaries: Turn[]; current?: Turn };
+  const ids = (turn: Turn | undefined) => turn?.appEvents?.map((row) => String(row.id).slice(0, 8));
+  assert.deepEqual(body.summaries.map(ids), [["33333333"], ["11111111", "22222222"]]);
+  assert.deepEqual(body.summaries.map((turn) => turn.appEventCount), [1, 2]);
+  assert.deepEqual(ids(body.current), ["abcdef01", "abcdef01"], "the running turn lists its events too");
+  assert.deepEqual(body.summaries[1]!.appEvents![0], {
+    id: "11111111-0000-4000-8000-000000000001",
+    appName: "Stamp",
+    clientKey: "stamp-overview",
+    logoUrl: null,
+    summary: "CI failed on #10827",
+    deliveredAt: t + 10_000,
+    kind: "event",
+  });
+  assert.deepEqual(body.summaries[0]!.appEvents![0]!.appName, "system.assistant");
+  // The trigger: resolved by name; another agent's event and a short-id collision are not.
+  assert.deepEqual(body.summaries[1]!.trigger, { target: "agent-event:11111111", appEvent: { appName: "Stamp", summary: "CI failed on #10827" } });
+  assert.deepEqual(body.summaries[0]!.trigger, { target: "agent-event:deadbeef" });
+  assert.deepEqual(body.current!.trigger, { target: "agent-event:abcdef01" });
+  assert.doesNotMatch(JSON.stringify(body), /secret-payload|secret-hash|secret-resource|44444444|deadbeef-0000|"payload"/);
+});
+
+test("activity-summaries never passes on server-owned fields a stored summary carries (a forged daemon turn_summary)", async ({ app }) => {
+  const owner = await seedUser("activity-forged-owner@slock.test", "activity-forged-owner");
+  const server = await createServer("Activity Forged Server", "activity-forged", owner.id);
+  const agent = await createAgent(server.id, "activity-forged-agent", { runtime: "claude", creatorType: "user", creatorId: owner.id });
+  const t = Date.now() - 60 * 60_000;
+  // Stored as a daemon sent it (rows written before the server narrowed them).
+  const forged = {
+    v: 1 as const, startedAt: t, endedAt: t + 10_000, outcome: "completed" as const, toolCalls: 0, problems: [], problemCount: 0, messagesSent: 0,
+    trigger: { target: "agent-event:11111111", appEvent: { appName: "Forged App", summary: "forged summary" }, hidden: "dm", extra: "forged-extra" },
+    appEvents: [{ id: "forged-event", appName: "Forged App", clientKey: "forged", logoUrl: "https://evil.example/logo.png", summary: "forged summary", deliveredAt: t + 1, kind: "event" }],
+    appEventCount: 9,
+    sentMessageIds: ["forged-message"],
+    sentMessageCount: 9,
+    hiddenSentCount: 9,
+    running: true,
+    // Keys no producer has: dropped by the allowlist, whatever they are called.
+    viewerNote: "forged-note",
+    actions: [{ kind: "run_command", count: 1, label: "forged-label" }, { kind: "forged_kind", count: 2 }],
+  };
+  // A message trigger whose text claims a private channel and another sender,
+  // over a public channel and a real message in it.
+  const channel = await createChannel(server.id, "named-public", "visible");
+  const waking = await postWakingMessage(channel.id, owner.id);
+  const forgedText = {
+    v: 1 as const, startedAt: t - 60_000, endedAt: t - 50_000, outcome: "completed" as const, actions: [], toolCalls: 0, problems: [], problemCount: 0, messagesSent: 0,
+    trigger: { target: "#ceo-private", channelId: channel.id, sender: "ceo", messageId: waking.id, display: { kind: "channel", channelName: "ceo-private", senderName: "ceo" } },
+    viewerNote: "forged-note",
+  };
+  await upsertAgentTurnSummaries(agent.id, [
+    { turnKey: `daemon:${t}`, summary: forged as never },
+    { turnKey: `daemon:${t - 60_000}`, summary: forgedText as never },
+  ]);
+  const real = useRealTurnReads(app, { activity: "online" });
+  try {
+    const res = await fetch(`${app.baseUrl}/api/agents/${agent.id}/activity-summaries`, {
+      headers: authHeaders(await tokenForHuman(owner.email), server.id),
+    });
+    assert.equal(res.status, 200);
+    const body = await res.json() as { summaries: Array<Record<string, unknown>> };
+    assert.equal(body.summaries.length, 2);
+    const [turn, named] = body.summaries;
+    for (const key of ["appEvents", "appEventCount", "sentMessageIds", "sentMessageCount", "hiddenSentCount", "running", "viewerNote"]) {
+      assert.ok(!(key in turn!), `${key} is the server's to set`);
+    }
+    assert.deepEqual(turn!.trigger, { target: "agent-event:11111111" });
+    assert.deepEqual(turn!.actions, [{ kind: "run_command", count: 1 }]);
+    assert.ok(!("viewerNote" in named!));
+    // The display is the server's: the real channel and sender, not the daemon's.
+    assert.deepEqual(named!.trigger, {
+      target: "#ceo-private", channelId: channel.id, sender: "ceo", messageId: waking.id,
+      display: { kind: "channel", channelName: "named-public", senderName: "activity-forged-owner" },
+    });
+    assert.doesNotMatch(JSON.stringify(body), /Forged App|forged-(?:note|label|extra|event|message|summary)|forged_kind|evil\.example/);
+  } finally {
+    real.shutdown();
+  }
+});
+
+test("activity-summaries names a trigger's channel and sender from the server's rows, not the daemon's target and sender", async ({ app }) => {
+  const owner = await seedUser("activity-display-owner@slock.test", "activity-display-owner");
+  const alice = await seedUser("activity-display-alice@slock.test", "activity-display-alice");
+  const server = await createServer("Activity Display Server", "activity-display", owner.id);
+  const agent = await createAgent(server.id, "activity-display-agent", { runtime: "claude", creatorType: "user", creatorId: owner.id });
+  const general = await createChannel(server.id, "display-general", "visible");
+  const other = await createChannel(server.id, "display-other", "visible");
+  const dm = await findOrCreateDM(server.id, owner.id, agent.id);
+  const fromAlice = await postWakingMessage(general.id, alice!.id);
+  const elsewhere = await postWakingMessage(other.id, alice!.id);
+  const t = Date.now() - 60 * 60_000;
+  const base = { v: 1 as const, outcome: "completed" as const, actions: [], toolCalls: 1, problems: [], problemCount: 0, messagesSent: 0 };
+  const turn = (at: number, trigger: Record<string, string>) => ({ turnKey: `daemon:${at}`, summary: { ...base, startedAt: at, endedAt: at + 1_000, trigger } });
+  await upsertAgentTurnSummaries(agent.id, [
+    // Claims #ceo-private and @ceo over a public channel and alice's message in it.
+    turn(t + 40_000, { target: "#ceo-private", channelId: general.id, sender: "ceo", messageId: fromAlice.id }),
+    // A real message, but in another channel than the trigger says.
+    turn(t + 30_000, { target: "#ceo-private", channelId: general.id, sender: "ceo", messageId: elsewhere.id }),
+    // A message id that is no message.
+    turn(t + 20_000, { target: "#ceo-private", channelId: general.id, sender: "ceo", messageId: randomUUID() }),
+    // No message id: the channel by name, no sender; a DM by its peer.
+    turn(t + 10_000, { target: "#ceo-private:9b526607", channelId: general.id, sender: "ceo" }),
+    turn(t, { target: "dm:@ceo", channelId: dm!.id, sender: "ceo" }),
+  ]);
+  const real = useRealTurnReads(app, { activity: "online" });
+  try {
+    const res = await fetch(`${app.baseUrl}/api/agents/${agent.id}/activity-summaries`, {
+      headers: authHeaders(await tokenForHuman(owner.email), server.id),
+    });
+    assert.equal(res.status, 200);
+    const body = await res.json() as { summaries: Array<{ trigger?: Record<string, unknown> }> };
+    assert.deepEqual(body.summaries.map((summary) => summary.trigger?.display ?? summary.trigger), [
+      { kind: "channel", channelName: "display-general", senderName: "activity-display-alice" },
+      { unresolved: true },
+      { unresolved: true },
+      { kind: "channel", channelName: "display-general" },
+      { kind: "dm", peerName: "activity-display-owner" },
+    ]);
+    // An unresolved trigger carries none of the daemon's text (nor its ids).
+    assert.deepEqual(body.summaries[1]!.trigger, { unresolved: true });
+  } finally {
+    real.shutdown();
+  }
+});
+
+test("activity-summaries skips a stored row that does not read as a turn summary and pages past it", async ({ app }) => {
+  const owner = await seedUser("activity-unreadable-owner@slock.test", "activity-unreadable-owner");
+  const server = await createServer("Activity Unreadable Server", "activity-unreadable", owner.id);
+  const agent = await createAgent(server.id, "activity-unreadable-agent", { runtime: "claude", creatorType: "user", creatorId: owner.id });
+  const base = { v: 1 as const, outcome: "completed" as const, actions: [], toolCalls: 1, problems: [], problemCount: 0, messagesSent: 0 };
+  const turn = (at: number, extra: Record<string, unknown> = {}) => ({ turnKey: `daemon:${at}`, summary: { ...base, startedAt: at, endedAt: at + 1_000, ...extra } as never });
+  await upsertAgentTurnSummaries(agent.id, [
+    turn(40_000),
+    // Rows written before the server checked them on write: never shown.
+    turn(30_000, { trigger: { target: 5 } }),
+    turn(20_000, { v: 2 }),
+    turn(10_000),
+  ]);
+  const real = useRealTurnReads(app, { activity: "online" });
+  const headers = authHeaders(await tokenForHuman(owner.email), server.id);
+  try {
+    const first = await (await fetch(`${app.baseUrl}/api/agents/${agent.id}/activity-summaries?limit=1`, { headers })).json() as SummariesBody & { next?: string };
+    assert.deepEqual(first.summaries.map((summary) => summary.startedAt), [40_000]);
+    assert.ok(first.next, "older rows remain");
+    // The first page's read (the turn and the two after it) ends on the unreadable rows: the cursor is past them.
+    const second = await (await fetch(`${app.baseUrl}/api/agents/${agent.id}/activity-summaries?limit=1&before=${first.next}`, { headers })).json() as SummariesBody & { next?: string };
+    assert.deepEqual(second.summaries.map((summary) => summary.startedAt), [10_000]);
+    assert.equal(second.next, undefined);
+  } finally {
+    real.shutdown();
+  }
+});
+
+test("activity-summaries reads as far as the neighbour turns: an event in the idle gap at a page edge shows on exactly one page", async ({ app }) => {
+  const owner = await seedUser("activity-app-edge-owner@slock.test", "activity-app-edge-owner");
+  const server = await createServer("Activity App Edge Server", "activity-app-edge", owner.id);
+  const agent = await createAgent(server.id, "activity-app-edge-agent", { runtime: "claude", creatorType: "user", creatorId: owner.id });
+  const t = Date.now() - 60 * 60_000;
+  const base = { v: 1 as const, outcome: "completed" as const, actions: [], toolCalls: 1, problems: [], problemCount: 0, messagesSent: 0 };
+  // Ten idle minutes between the two turns: the boundary sits 5 min after the older one ends.
+  const older = { ...base, id: "00000000-0000-4000-8000-0000000000c1", startedAt: t, endedAt: t + 60_000 };
+  const newer = { ...base, id: "00000000-0000-4000-8000-0000000000c2", startedAt: t + 660_000, endedAt: t + 720_000 };
+  Object.assign(app.app.get("agentOrchestrator"), {
+    listTurnSummaries: async (_agentId: string, options: { before?: unknown }) => (options.before
+      ? { summaries: [older] }
+      : { summaries: [newer], next: { endedAt: newer.endedAt, id: newer.id } }),
+    getTurnSummary: async (_agentId: string, id: string) => (id === newer.id ? newer : null),
+  });
+  const stamp = await createOAuthClient({ serverId: server.id, createdByUserId: owner.id, clientId: "stamp-edge", name: "Stamp", allowedScopes: ["agent:event:write"] });
+  const event = (id: string, at: number) => ({
+    id, serverId: server.id, agentId: agent.id, clientId: stamp.client.id, kind: "event" as const, summary: id.slice(0, 8),
+    payload: {}, payloadHash: "h", resource: "r", status: "delivered" as const, deliveredAt: new Date(at),
+    expiresAt: new Date(Date.now() + 24 * 60 * 60_000), createdAt: new Date(t),
+  });
+  // Both more than the 60 s edge slack from either turn, on either side of the boundary.
+  await getDb().insert(thirdPartyAgentEvents).values([
+    event("aaaaaaaa-0000-4000-8000-000000000001", t + 240_000),
+    event("bbbbbbbb-0000-4000-8000-000000000002", t + 420_000),
+  ]);
+  const headers = authHeaders(await tokenForHuman(owner.email), server.id);
+  type Page = { summaries: Array<{ appEvents?: Array<{ summary: string }> }>; next?: string };
+  const first = await (await fetch(`${app.baseUrl}/api/agents/${agent.id}/activity-summaries`, { headers })).json() as Page;
+  const second = await (await fetch(`${app.baseUrl}/api/agents/${agent.id}/activity-summaries?before=${first.next}`, { headers })).json() as Page;
+  assert.deepEqual(first.summaries.map((turn) => turn.appEvents?.map((row) => row.summary)), [["bbbbbbbb"]]);
+  assert.deepEqual(second.summaries.map((turn) => turn.appEvents?.map((row) => row.summary)), [["aaaaaaaa"]]);
+});
+
+/**
+ * Task #17: a daemon agent's overview read through the real orchestrator and
+ * database. The Remy sequence: a wake at `t` that the daemon closes empty a
+ * second later (the runtime's `result`), then the real work as tool rows with
+ * no closing idle (a background task outstanding).
+ */
+/** A message a person posted in `channelId`, for a turn trigger to name. */
+async function postWakingMessage(channelId: string, senderUserId: string) {
+  const [row] = await getDb().insert(messages).values({
+    channelId, senderType: "user", senderId: senderUserId, content: "wake up", messageType: "chat", searchText: "wake up",
+  }).returning();
+  return row!;
+}
+
+async function seedEmptyWakeThenWork(agentId: string, trigger: { target: string; channelId: string; messageId?: string }, t: number) {
+  const base = { v: 1 as const, actions: [], problems: [], problemCount: 0, messagesSent: 0 };
+  const wake = { ...base, startedAt: t, endedAt: t + 1_000, outcome: "completed" as const, toolCalls: 0, trigger: { messageId: "m-wake", ...trigger, sender: "tenny" } };
+  await upsertAgentTurnSummaries(agentId, [
+    { turnKey: `daemon:${t - 60_000}`, summary: { ...base, startedAt: t - 60_000, endedAt: t - 50_000, outcome: "completed", toolCalls: 0, trigger: { target: "dm:@richard" } } },
+    { turnKey: `daemon:${t}`, summary: wake },
+  ]);
+  const row = (at: number, activity: string, entries: TrajectoryEntry[]) => appendAgentActivityEvent(agentId, activity, "", entries, new Date(at));
+  await row(t, "working", [{ kind: "status", activity: "working", detail: "Message received", detailKind: "model_request_started" }]);
+  await row(t + 1_000, "online", [{ kind: "status", activity: "online", detail: "Idle", detailKind: "idle" }, { kind: "turn_summary", summary: wake }]);
+  await row(t + 2_000, "working", [{ kind: "tool_start", toolName: "Bash", toolInput: "pnpm test", callId: "c1" }]);
+  await row(t + 4_000, "working", [{ kind: "status", activity: "working", detail: "Tool finished", detailKind: "tool_end", tool: { callId: "c1", ok: true, exitCode: 1 } }]);
+  await row(t + 5_000, "working", [{ kind: "tool_start", toolName: "Read", toolInput: JSON.stringify({ file_path: "src/a.ts" }), callId: "c2" }]);
+  await row(t + 6_000, "working", [{ kind: "status", activity: "working", detail: "Waiting for 1 background task", detailKind: "subagent_activity" }]);
+  const [wakeRow] = await getDb().select({ id: agentActivitySummaryV2.id }).from(agentActivitySummaryV2)
+    .where(and(eq(agentActivitySummaryV2.agentId, agentId), eq(agentActivitySummaryV2.turnKey, `daemon:${t}`)));
+  return { wake, wakeId: wakeRow!.id };
+}
+
+/** The real turn reads, with the agent's live activity as given (working unless a test says otherwise). */
+function useRealTurnReads(app: { app: { get(name: string): unknown } }, live: { activity: string } = { activity: "working" }) {
+  const real = new AgentOrchestrator();
+  Object.assign(app.app.get("agentOrchestrator") as object, {
+    getActivity: async () => ({ activityDetail: "", ...live }),
+    listTurnSummaries: (agentId: string, options: Parameters<AgentOrchestrator["listTurnSummaries"]>[1]) => real.listTurnSummaries(agentId, options),
+    getTurnSummary: (agentId: string, id: string) => real.getTurnSummary(agentId, id),
+    getRunningTurn: (agentId: string, afterMs: number | null) => real.getRunningTurn(agentId, afterMs),
+  });
+  return real;
+}
+
+type SummariesBody = {
+  summaries: Array<{ id: string; startedAt: number; endedAt: number; toolCalls: number; trigger?: unknown; outcome?: string }>;
+  next?: string;
+  current?: { id?: string; running: true; startedAt: number; endedAt: number; outcome?: unknown; trigger?: unknown; toolCalls: number; actions: unknown; problems: unknown; sentMessageIds?: string[] };
+};
+
+test("activity-summaries folds the running turn from the activity rows after the last finished turn, and the work after an empty wake takes over its trigger (task #17)", async ({ app }) => {
+  const owner = await seedUser("activity-running-owner@slock.test", "activity-running-owner");
+  const server = await createServer("Activity Running Server", "activity-running", owner.id);
+  const agent = await createAgent(server.id, "activity-running-agent", { runtime: "claude", creatorType: "user", creatorId: owner.id });
+  const channel = await createChannel(server.id, "running-public", "visible");
+  const t = Date.now() - 10 * 60_000;
+  const waking = await postWakingMessage(channel.id, owner.id);
+  const { wake, wakeId } = await seedEmptyWakeThenWork(agent.id, { target: "#running-public", channelId: channel.id, messageId: waking.id }, t);
+  // Named by the server from the channel and the message.
+  const shownTrigger = { ...wake.trigger, display: { kind: "channel", channelName: "running-public", senderName: "activity-running-owner" } };
+  const [sent] = await getDb().insert(messages).values({
+    channelId: channel.id, senderType: "agent", senderId: agent.id,
+    content: "progress", messageType: "chat", searchText: "progress", createdAt: new Date(t + 5_500),
+  }).returning();
+  const real = useRealTurnReads(app);
+  const headers = authHeaders(await tokenForHuman(owner.email), server.id);
+  try {
+    const res = await fetch(`${app.baseUrl}/api/agents/${agent.id}/activity-summaries`, { headers });
+    assert.equal(res.status, 200);
+    const body = await res.json() as SummariesBody;
+    // The empty wake leaves the list; the running work carries its trigger, start and id.
+    assert.deepEqual(body.summaries.map((summary) => [summary.startedAt, summary.trigger]), [[t - 60_000, { hidden: "dm" }]]);
+    const current = body.current!;
+    assert.ok(current, "the open turn is returned");
+    assert.equal(current.running, true);
+    assert.equal(current.outcome, undefined);
+    assert.equal(current.id, wakeId);
+    assert.equal(current.startedAt, t);
+    assert.ok(current.endedAt >= t + 6_000);
+    assert.deepEqual(current.trigger, shownTrigger);
+    assert.equal(current.toolCalls, 2);
+    assert.deepEqual(current.actions, [{ kind: "run_checks", count: 1 }, { kind: "read_file", count: 1 }]);
+    assert.deepEqual(current.problems, [{ kind: "run_checks", reason: "exit_nonzero", exitCode: 1, at: t + 4_000 }]);
+    assert.deepEqual(current.sentMessageIds, [sent!.id]);
+
+    // The work ends as its own turn (no trigger) and the agent goes idle. The
+    // daemon's clock runs 1.5 s behind the server's, so the last busy row and
+    // the idle row come after the turn's recorded end: the rows show the turn
+    // closed, and nothing is running. The pair reads as one turn.
+    const work = { v: 1 as const, startedAt: t + 2_000, endedAt: t + 5_500, outcome: "unknown" as const, actions: [{ kind: "run_checks" as const, count: 1 }, { kind: "read_file" as const, count: 1 }], toolCalls: 2, problems: [], problemCount: 0, messagesSent: 1 };
+    await upsertAgentTurnSummaries(agent.id, [{ turnKey: `daemon:${t + 2_000}`, summary: work }]);
+    await appendAgentActivityEvent(agent.id, "online", "", [{ kind: "status", activity: "online", detail: "Idle", detailKind: "idle" }], new Date(t + 7_000));
+    const after = await (await fetch(`${app.baseUrl}/api/agents/${agent.id}/activity-summaries`, { headers })).json() as SummariesBody;
+    assert.equal(after.current, undefined, "no running turn once the rows show it closed");
+    assert.deepEqual(after.summaries.map((summary) => [summary.id, summary.startedAt, summary.endedAt, summary.toolCalls, summary.trigger]), [
+      [wakeId, t, t + 5_500, 2, shownTrigger],
+      [after.summaries[1]!.id, t - 60_000, t - 50_000, 0, { hidden: "dm" }],
+    ]);
+
+    // Another empty wake, then a new message wakes the agent: the running
+    // turn started with a message handed over, so it is a turn of its own and
+    // the empty wake stays listed.
+    const emptyAgain = { ...wake, startedAt: t + 8_000, endedAt: t + 9_000 };
+    await upsertAgentTurnSummaries(agent.id, [{ turnKey: `daemon:${t + 8_000}`, summary: emptyAgain }]);
+    await appendAgentActivityEvent(agent.id, "working", "", [{ kind: "status", activity: "working", detail: "Message received", detailKind: "model_request_started" }], new Date(t + 10_000));
+    await appendAgentActivityEvent(agent.id, "working", "", [{ kind: "tool_start", toolName: "Bash", toolInput: "ls", callId: "c3" }], new Date(t + 11_000));
+    const woken = await (await fetch(`${app.baseUrl}/api/agents/${agent.id}/activity-summaries`, { headers })).json() as SummariesBody;
+    assert.deepEqual(woken.summaries.map((summary) => [summary.startedAt, summary.toolCalls]), [[t + 8_000, 0], [t, 2], [t - 60_000, 0]]);
+    assert.deepEqual(woken.current && [woken.current.id, woken.current.startedAt, woken.current.trigger, woken.current.toolCalls], [undefined, t + 10_000, undefined, 1]);
+  } finally {
+    real.shutdown();
+  }
+});
+
+test("activity-summaries shows no running turn while the agent is not busy, whatever the rows leave open (task #17)", async ({ app }) => {
+  const owner = await seedUser("activity-not-busy-owner@slock.test", "activity-not-busy-owner");
+  const server = await createServer("Activity Not Busy Server", "activity-not-busy", owner.id);
+  const agent = await createAgent(server.id, "activity-not-busy-agent", { runtime: "claude", creatorType: "user", creatorId: owner.id });
+  const channel = await createChannel(server.id, "not-busy-public", "visible");
+  const t = Date.now() - 10 * 60_000;
+  // The rows leave the work after the empty wake open (no idle after it).
+  const { wakeId } = await seedEmptyWakeThenWork(agent.id, { target: "#not-busy-public", channelId: channel.id }, t);
+  const live = { activity: "error" };
+  const real = useRealTurnReads(app, live);
+  const headers = authHeaders(await tokenForHuman(owner.email), server.id);
+  const read = async () => (await (await fetch(`${app.baseUrl}/api/agents/${agent.id}/activity-summaries`, { headers })).json()) as SummariesBody;
+  try {
+    // A usage limit: the turn never closed, but nothing is running.
+    const errored = await read();
+    assert.equal(errored.current, undefined);
+    assert.equal(errored.summaries[0]!.id, wakeId, "the empty wake stays listed");
+    // Idle with a lost idle frame: the rows still look open.
+    live.activity = "online";
+    assert.equal((await read()).current, undefined);
+    live.activity = "offline";
+    assert.equal((await read()).current, undefined);
+    // Busy again: the same rows are the running turn.
+    live.activity = "working";
+    assert.equal((await read()).current?.id, wakeId);
+  } finally {
+    real.shutdown();
+  }
+});
+
+test("activity-summaries keeps an empty wake apart from work that a restart started after it (task #17)", async ({ app }) => {
+  const owner = await seedUser("activity-restart-owner@slock.test", "activity-restart-owner");
+  const server = await createServer("Activity Restart Server", "activity-restart", owner.id);
+  const agent = await createAgent(server.id, "activity-restart-agent", { runtime: "claude", creatorType: "user", creatorId: owner.id });
+  const t = Date.now() - 10 * 60_000;
+  const base = { v: 1 as const, actions: [], problems: [], problemCount: 0, messagesSent: 0, toolCalls: 0 };
+  await upsertAgentTurnSummaries(agent.id, [{ turnKey: `daemon:${t}`, summary: { ...base, startedAt: t, endedAt: t + 1_000, outcome: "completed", trigger: { target: "agent-event:x" } } }]);
+  // Two seconds later the runtime starts again: its turn opens at the start row, not at runtime output.
+  await appendAgentActivityEvent(agent.id, "working", "", [{ kind: "status", activity: "working", detail: "Starting…", detailKind: "starting" }], new Date(t + 3_000));
+  await appendAgentActivityEvent(agent.id, "working", "", [{ kind: "tool_start", toolName: "Bash", toolInput: "ls", callId: "c1" }], new Date(t + 4_000));
+  const real = useRealTurnReads(app);
+  try {
+    const body = await (await fetch(`${app.baseUrl}/api/agents/${agent.id}/activity-summaries`, {
+      headers: authHeaders(await tokenForHuman(owner.email), server.id),
+    })).json() as SummariesBody;
+    assert.deepEqual(body.summaries.map((summary) => summary.startedAt), [t]);
+    assert.deepEqual(body.current && [body.current.id, body.current.startedAt, body.current.trigger, body.current.toolCalls], [undefined, t + 3_000, undefined, 1]);
+  } finally {
+    real.shutdown();
+  }
+});
+
+test("activity-summaries hides the running turn's trigger like a finished one's when the viewer cannot see that channel (task #17)", async ({ app }) => {
+  const owner = await seedUser("activity-running-private-owner@slock.test", "activity-running-private-owner");
+  const server = await createServer("Activity Running Private Server", "activity-running-private", owner.id);
+  const agent = await createAgent(server.id, "activity-running-private-agent", { runtime: "claude", creatorType: "user", creatorId: owner.id });
+  const secret = await createChannel(server.id, "running-secret", "not joined", "private");
+  await seedEmptyWakeThenWork(agent.id, { target: "#running-secret", channelId: secret.id }, Date.now() - 10 * 60_000);
+  const real = useRealTurnReads(app);
+  try {
+    const res = await fetch(`${app.baseUrl}/api/agents/${agent.id}/activity-summaries`, {
+      headers: authHeaders(await tokenForHuman(owner.email), server.id),
+    });
+    assert.equal(res.status, 200);
+    const body = await res.json() as SummariesBody;
+    assert.deepEqual(body.current?.trigger, { hidden: "private_channel" });
+    assert.doesNotMatch(JSON.stringify(body), /running-secret|m-wake|tenny/);
+  } finally {
+    real.shutdown();
+  }
+});
+
+test("activity-summaries names the running turn's trigger from the status that opened it, hidden like a finished one's without channel access (task #17)", async ({ app }) => {
+  const owner = await seedUser("activity-running-trigger-owner@slock.test", "activity-running-trigger-owner");
+  const server = await createServer("Activity Running Trigger Server", "activity-running-trigger", owner.id);
+  const visible = await createChannel(server.id, "trigger-public", "visible");
+  const secret = await createChannel(server.id, "trigger-secret", "not joined", "private");
+  const real = useRealTurnReads(app);
+  const headers = authHeaders(await tokenForHuman(owner.email), server.id);
+  try {
+    const currentFor = async (channel: { id: string; name: string }) => {
+      const agent = await createAgent(server.id, `activity-trigger-${channel.name}`, { runtime: "claude", creatorType: "user", creatorId: owner.id });
+      const t = Date.now() - 60_000;
+      const waking = await postWakingMessage(channel.id, owner.id);
+      const trigger = { target: `#${channel.name}`, channelId: channel.id, sender: "tenny", messageId: waking.id };
+      // A newer daemon's "Message received" names the message that woke the agent.
+      await appendAgentActivityEvent(agent.id, "working", "", [{ kind: "status", activity: "working", detail: "Message received", detailKind: "model_request_started", trigger }], new Date(t));
+      await appendAgentActivityEvent(agent.id, "working", "", [{ kind: "tool_start", toolName: "Bash", toolInput: "ls", callId: "c1" }], new Date(t + 1_000));
+      const body = await (await fetch(`${app.baseUrl}/api/agents/${agent.id}/activity-summaries`, { headers })).json() as SummariesBody;
+      return { trigger, body };
+    };
+    const shown = await currentFor({ id: visible.id, name: "trigger-public" });
+    assert.deepEqual(shown.body.current && [shown.body.current.trigger, shown.body.current.toolCalls], [
+      { ...shown.trigger, display: { kind: "channel", channelName: "trigger-public", senderName: "activity-running-trigger-owner" } },
+      1,
+    ]);
+    const hidden = await currentFor({ id: secret.id, name: "trigger-secret" });
+    assert.deepEqual(hidden.body.current?.trigger, { hidden: "private_channel" });
+    assert.doesNotMatch(JSON.stringify(hidden.body), new RegExp(`trigger-secret|${hidden.trigger.messageId}|tenny|activity-running-trigger-owner`));
+
+    // A malformed trigger in a stored row is no trigger, not a failed read.
+    const malformed = await createAgent(server.id, "activity-trigger-malformed", { runtime: "claude", creatorType: "user", creatorId: owner.id });
+    await appendAgentActivityEvent(malformed.id, "working", "", [{ kind: "status", activity: "working", detail: "Message received", detailKind: "model_request_started", trigger: { target: 5, channelId: visible.id } as never }], new Date(Date.now() - 60_000));
+    const res = await fetch(`${app.baseUrl}/api/agents/${malformed.id}/activity-summaries`, { headers });
+    assert.equal(res.status, 200);
+    const body = await res.json() as SummariesBody;
+    assert.ok(body.current);
+    assert.equal(body.current.trigger, undefined);
+  } finally {
+    real.shutdown();
+  }
+});
+
+test("activity-summaries gives the work after an empty wake the daemon held (no stored summary yet) the wake's trigger and start (task #17)", async ({ app }) => {
+  const owner = await seedUser("activity-held-wake-owner@slock.test", "activity-held-wake-owner");
+  const server = await createServer("Activity Held Wake Server", "activity-held-wake", owner.id);
+  const agent = await createAgent(server.id, "activity-held-wake-agent", { runtime: "claude", creatorType: "user", creatorId: owner.id });
+  const channel = await createChannel(server.id, "held-public", "visible");
+  const t = Date.now() - 10 * 60_000;
+  const base = { v: 1 as const, actions: [], problems: [], problemCount: 0, messagesSent: 0, toolCalls: 0, outcome: "completed" as const };
+  await upsertAgentTurnSummaries(agent.id, [{ turnKey: `daemon:${t - 60_000}`, summary: { ...base, startedAt: t - 60_000, endedAt: t - 50_000, trigger: { target: "dm:@richard" } } }]);
+  const waking = await postWakingMessage(channel.id, owner.id);
+  const trigger = { target: "#held-public", channelId: channel.id, sender: "tenny", messageId: waking.id };
+  const row = (at: number, activity: string, entries: TrajectoryEntry[]) => appendAgentActivityEvent(agent.id, activity, "", entries, new Date(at));
+  await row(t, "working", [{ kind: "status", activity: "working", detail: "Message received", detailKind: "model_request_started", trigger }]);
+  // Claude's `result` a second later: Idle, and no turn_summary (the daemon holds the empty wake).
+  await row(t + 1_000, "online", [{ kind: "status", activity: "online", detail: "Idle", detailKind: "idle" }]);
+  await row(t + 2_000, "working", [{ kind: "text", text: "picking the notice up" }, { kind: "status", activity: "working", detail: "", detailKind: "model_response_started" }]);
+  await row(t + 3_000, "working", [{ kind: "tool_start", toolName: "Bash", toolInput: "pnpm test", callId: "c1" }]);
+  const real = useRealTurnReads(app);
+  try {
+    const body = await (await fetch(`${app.baseUrl}/api/agents/${agent.id}/activity-summaries`, {
+      headers: authHeaders(await tokenForHuman(owner.email), server.id),
+    })).json() as SummariesBody;
+    assert.deepEqual(body.summaries.map((summary) => summary.startedAt), [t - 60_000]);
+    assert.deepEqual(body.current && [body.current.startedAt, body.current.trigger, body.current.toolCalls], [
+      t, { ...trigger, display: { kind: "channel", channelName: "held-public", senderName: "activity-held-wake-owner" } }, 1,
+    ]);
+  } finally {
+    real.shutdown();
+  }
+});
+
+test("activity-summaries pages an empty wake and its work as one turn across a page boundary, with no running turn past the first page (task #17)", async ({ app }) => {
+  const owner = await seedUser("activity-page-owner@slock.test", "activity-page-owner");
+  const server = await createServer("Activity Page Server", "activity-page", owner.id);
+  const agent = await createAgent(server.id, "activity-page-agent", { runtime: "claude", creatorType: "user", creatorId: owner.id });
+  const base = { v: 1 as const, outcome: "completed" as const, actions: [], toolCalls: 0, problems: [], problemCount: 0, messagesSent: 0 };
+  await upsertAgentTurnSummaries(agent.id, [
+    { turnKey: "daemon:1000", summary: { ...base, startedAt: 1_000, endedAt: 2_000, trigger: { target: "#oldest" } } },
+    { turnKey: "daemon:10000", summary: { ...base, startedAt: 10_000, endedAt: 11_000, trigger: { target: "#wake" } } },
+    { turnKey: "daemon:11500", summary: { ...base, startedAt: 11_500, endedAt: 30_000, toolCalls: 4, actions: [{ kind: "run_command", count: 4 }] } },
+    { turnKey: "daemon:40000", summary: { ...base, startedAt: 40_000, endedAt: 50_000, trigger: { target: "#newest" }, toolCalls: 1 } },
+  ]);
+  // A running turn the first page would show, after the newest finished one.
+  await appendAgentActivityEvent(agent.id, "working", "", [{ kind: "tool_start", toolName: "Bash", toolInput: "ls", callId: "c1" }], new Date(60_000));
+  const real = useRealTurnReads(app);
+  const headers = authHeaders(await tokenForHuman(owner.email), server.id);
+  try {
+    const first = await (await fetch(`${app.baseUrl}/api/agents/${agent.id}/activity-summaries?limit=2`, { headers })).json() as SummariesBody;
+    // The wake's trigger (a channel this test did not create, so shown hidden) on the work.
+    assert.deepEqual(first.summaries.map((summary) => [summary.startedAt, summary.toolCalls, summary.trigger !== undefined]), [
+      [40_000, 1, true],
+      [10_000, 4, true],
+    ]);
+    assert.equal(first.current?.toolCalls, 1);
+    assert.ok(first.next);
+    const second = await (await fetch(`${app.baseUrl}/api/agents/${agent.id}/activity-summaries?limit=2&before=${first.next}`, { headers })).json() as SummariesBody;
+    // The wake is not listed again on its own; the oldest turn is all that is left.
+    assert.deepEqual(second.summaries.map((summary) => summary.startedAt), [1_000]);
+    assert.equal(second.next, undefined);
+    assert.equal(second.current, undefined);
+  } finally {
+    real.shutdown();
+  }
 });
 
 test("workspace file tree forwards includeHidden to the daemon request", async ({ app }) => {
@@ -5518,6 +6426,10 @@ test("workspace file routes classify closed machine failures while unknown failu
     assert.equal(offlineListEvent.attrs?.http_status, 409);
     assert.equal(offlineListEvent.attrs?.response_code, "machine_offline");
     assert.equal(events().some((event) => event.name === "server.route.error_response"), false);
+    // The request span names the Computer it waited on, hashed, never the raw id (#proj-o11y:#29).
+    const offlineListSpan = sink.getAllSpans().find((span) => span.name === "server.http.request");
+    assert.equal(offlineListSpan?.attrs?.target_runtime, assignedAgent.runtime);
+    assert.ok(!JSON.stringify(sink.getAllSpans()).includes(machine!.id));
 
     sink.clear();
     const timeoutReadRes = await fetch(
@@ -5728,22 +6640,14 @@ test("agent skills failures return typed statuses and record classified sanitize
     const timeoutRes = await fetch(`${app.baseUrl}/api/agents/${timeoutAgent.id}/skills`, {
       headers: authHeaders(ownerToken, server.id),
     });
-    assert.equal(timeoutRes.status, 504);
-    assert.equal((await timeoutRes.json() as { code?: string }).code, "daemon_timeout");
-    const timeoutEvent = findFailedEvent();
-    assert.ok(timeoutEvent, "expected skills-list failure trace event");
-    assert.equal(timeoutEvent.attrs?.route_action, "skills_list");
-    assert.equal(timeoutEvent.attrs?.outcome, "error");
-    assert.equal(timeoutEvent.attrs?.reason, "daemon_timeout");
-    assert.equal(timeoutEvent.attrs?.error_class, "RouteFailureError");
-    assert.equal(timeoutEvent.attrs?.error_kind, "daemon_unavailable");
-    assert.equal(timeoutEvent.attrs?.error_subkind, "daemon_timeout");
-    assert.equal(timeoutEvent.attrs?.error_message, "Skills list request timed out");
-    assert.equal(timeoutEvent.attrs?.runtime, "codex");
-    assert.equal(timeoutEvent.attrs?.http_status, 504);
-    assert.equal(timeoutEvent.attrs?.response_code, "daemon_timeout");
-    assert.equal(typeof timeoutEvent.attrs?.duration_ms, "number");
-    const timeoutTraceJson = JSON.stringify(timeoutEvent.attrs);
+    // A timeout is answered from the probe cache: nothing cached, so 200 unavailable, never 504.
+    assert.equal(timeoutRes.status, 200);
+    assert.deepEqual(await timeoutRes.json(), { global: [], workspace: [], state: "unavailable" });
+    assert.equal(findFailedEvent(), undefined, "a timeout is a state, not a failed request");
+    const timeoutSpan = sink.getAllSpans().find((span) =>
+      span.name === "server.http.request" && span.attrs?.route_pattern === "/api/agents/:id/skills");
+    assert.equal(timeoutSpan?.attrs?.computer_probe_state, "unavailable");
+    const timeoutTraceJson = JSON.stringify(sink.getAllSpans());
     assert.equal(timeoutTraceJson.includes("/Users/alice"), false);
     assert.equal(timeoutTraceJson.includes("secret-skill"), false);
 
@@ -5958,7 +6862,7 @@ test("GET /agents records restore-path trace phases with batched creator enrichm
     );
     assert.ok(span, "expected GET /api/agents root span");
 
-    const processEventNames = span.events
+    const processEventNames = handlerTraceEvents(span.events)
       .map((event) => event.name)
       .filter((name) => name !== "db.query.finished" && name !== "server.runtime_config.parse");
     assert.deepEqual(processEventNames, [
@@ -5973,7 +6877,7 @@ test("GET /agents records restore-path trace phases with batched creator enrichm
       "http.response.finished",
     ]);
 
-    const dbEvents = span.events.filter((event) => event.name === "db.query.finished");
+    const dbEvents = handlerTraceEvents(span.events).filter((event) => event.name === "db.query.finished");
     assert.deepEqual(
       dbEvents.map((event) => event.attrs?.query_name).sort(),
       [
@@ -6131,6 +7035,34 @@ test("Antigravity permits existing-agent edits but rejects new agents and runtim
   assert.equal((await getAgent(other.id))?.runtime, "codex");
 });
 
+test("with agent_runtime_oar_antigravity on, Antigravity agents can be created and switched to again (tygg, #oar-raft:e9798673)", async ({ app }) => {
+  const owner = await seedUser("antigravity-revived@slock.test", "antigravity-revived");
+  const server = await createServer("Antigravity Revived", "antigravity-revived", owner.id);
+  await getDb().insert(featureFlags).values({ key: "agent_runtime_oar_antigravity", randomizationUnit: "server", salt: "test", defaultEnabled: false }).onConflictDoNothing();
+  await getDb().insert(featureFlagRules).values({ id: randomUUID(), flagKey: "agent_runtime_oar_antigravity", stage: "server", priority: 0, decision: "allow", values: [server.id] });
+  const ownerToken = await tokenForHuman(owner.email);
+  const other = await createAgent(server.id, "revived-codex", { runtime: "codex", model: "gpt-5" });
+  const headers = { ...authHeaders(ownerToken, server.id), "Content-Type": "application/json" };
+
+  const created = await fetch(`${app.baseUrl}/api/agents`, {
+    method: "POST", headers, body: JSON.stringify({ name: "new-antigravity", runtime: "antigravity", model: "default" }),
+  });
+  assert.equal(created.status, 200, await created.clone().text());
+  assert.equal((await created.json() as { runtime: string }).runtime, "antigravity");
+
+  const switched = await fetch(`${app.baseUrl}/api/agents/${other.id}`, {
+    method: "PATCH", headers, body: JSON.stringify({ runtime: "antigravity", model: "default" }),
+  });
+  assert.equal(switched.status, 200, await switched.clone().text());
+  assert.equal((await getAgent(other.id))?.runtime, "antigravity");
+
+  // Only Antigravity is revived: other deprecated runtimes are still refused.
+  const gemini = await fetch(`${app.baseUrl}/api/agents`, {
+    method: "POST", headers, body: JSON.stringify({ name: "new-gemini", runtime: "gemini", model: "default" }),
+  });
+  assert.equal(gemini.status, 400);
+});
+
 test("Copilot permits existing-agent model and env edits but rejects new agents and runtime transitions", async ({ app }) => {
   const owner = await seedUser("copilot-existing@slock.test", "copilot-existing");
   const server = await createServer("Copilot Existing", "copilot-existing", owner.id);
@@ -6284,7 +7216,7 @@ test("PATCH /agents/:id accepts the mobile runtimeConfig shape and keeps an enab
         loadLocalPlugins: true,
       },
     });
-    await assignAgentMachine(builtin.id, null);
+    await placeAgentOnMachine(builtin.id, null);
     const builtinRes = await patch(builtin.id, {
       version: 1,
       runtime: "builtin",
@@ -6400,12 +7332,47 @@ test("batch 2 v2 create: OpenCode stores the legacy runtimeConfig; Kimi CLI, Gem
   for (const [runtimeId, formValues] of [
     ["kimi", { model: "default" }],
     ["gemini", { model: "gemini-2.5-pro" }],
-    ["antigravity", {}],
+    // Antigravity now has a model field; a server without its OAR flag still refuses the create.
+    ["antigravity", { model: "default" }],
   ] as const) {
     const refused = await create(runtimeId, `v2-${runtimeId}`, formValues);
     assert.equal(refused.status, 400, runtimeId);
     assert.deepEqual(await refused.json(), { error: `Runtime is deprecated and cannot be selected: ${runtimeId}` }, runtimeId);
   }
+});
+
+test("runtime_form.v3: a protocolVersion 3 submit stores what a v2 one does, and the edit form answers v3 only to a client that advertises it", async ({ app }) => {
+  const owner = await seedUser("v3-submit@slock.test", "v3-submit");
+  const server = await createServer("V3 Submit", "v3-submit", owner.id);
+  const [machine] = await getDb().insert(machines).values({
+    serverId: server.id, userId: owner.id, name: "v3-submit-machine", apiKeyHash: "v3-submit", runtimes: ["opencode"],
+  }).returning();
+  const headers = { ...authHeaders(await tokenForHuman(owner.email), server.id), "Content-Type": "application/json" };
+  const create = (protocolVersion: number, name: string) => fetch(`${app.baseUrl}/api/agents`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ name, machineId: machine.id, formDefinitionRef: { protocolVersion, runtimeId: "opencode" }, formValues: { model: "deepseek/deepseek-v4-pro", envVars: {} } }),
+  });
+  const v3Res = await create(3, "v3-opencode");
+  assert.equal(v3Res.status, 200, await v3Res.clone().text());
+  const v2Res = await create(2, "v2-opencode");
+  assert.equal(v2Res.status, 200);
+  const v3Agent = await getAgent((await v3Res.json() as { id: string }).id);
+  const v2Agent = await getAgent((await v2Res.json() as { id: string }).id);
+  assert.deepEqual(v3Agent?.runtimeConfig, v2Agent?.runtimeConfig);
+  assert.equal((await create(4, "v4-opencode")).status, 409, "an unknown protocol is never read as v2");
+
+  const editUrl = `${app.baseUrl}/api/agents/${v3Agent!.id}/runtime-form`;
+  const v2Edit = await (await fetch(editUrl, { headers })).json() as { protocolVersion: number; revision?: string };
+  assert.equal(v2Edit.protocolVersion, 2);
+  assert.equal(v2Edit.revision, undefined);
+  const v3Edit = await (await fetch(`${editUrl}?clientCapabilities=runtime_form.v3`, { headers })).json() as {
+    protocolVersion: number; revision?: string; values: Record<string, unknown>; uiSchema: Record<string, unknown>;
+  };
+  assert.equal(v3Edit.protocolVersion, 3);
+  assert.ok(v3Edit.revision);
+  assert.equal(v3Edit.values.model, "deepseek/deepseek-v4-pro");
+  assert.ok(Array.isArray(v3Edit.uiSchema.rules));
 });
 
 test("batch 3a v2 create and edit: Codex/Grok store the legacy runtimeConfig; the live list decides reasoning efforts; legacy submits are unchanged", async ({ app }) => {
@@ -6465,11 +7432,6 @@ test("batch 3a v2 create and edit: Codex/Grok store the legacy runtimeConfig; th
     version: 1, runtime: "codex", model: { kind: "custom", name: "my-org/codex-custom" }, mode: { kind: "fast" }, reasoningEffort: "high", envVars: null,
   });
 
-  // Grok is gated by its runtime flag, for v2 exactly like legacy.
-  const grokOff = await create("grok", "v2-grok-off", { model: "grok-4.5", reasoningEffort: "high" });
-  assert.equal(grokOff.status, 403);
-  assert.equal((await grokOff.json() as { code: string }).code, "grok_runtime_disabled");
-  await enableGrokRuntimeFlag(server.id);
   const grok = await create("grok", "v2-grok-live", { model: "grok-live-only", reasoningEffort: "max" });
   assert.equal(grok.status, 200, await grok.clone().text());
   const grokAgent = await grok.json() as { id: string };
@@ -6521,6 +7483,183 @@ test("batch 3a v2 create and edit: Codex/Grok store the legacy runtimeConfig; th
   app.app.set("agentOrchestrator", originalOrchestrator);
 });
 
+test("Antigravity v2 edit: a saved effort the model no longer lists levels for falls back to Default; a newly chosen one is refused", async ({ app }) => {
+  const owner = await seedUser("v2-antigravity-effort@slock.test", "v2-antigravity-effort");
+  const server = await createServer("V2 Antigravity Effort", "v2-antigravity-effort", owner.id);
+  const [machine] = await getDb().insert(machines).values({
+    serverId: server.id, userId: owner.id, name: "v2-antigravity-effort-machine",
+    apiKeyHash: "v2-antigravity-effort", runtimes: ["antigravity"],
+  }).returning();
+  const headers = { ...authHeaders(await tokenForHuman(owner.email), server.id), "Content-Type": "application/json" };
+  const agent = await createAgent(server.id, "agy-effort", {
+    runtime: "antigravity",
+    model: "gemini-3.8-flash",
+    machineId: machine.id,
+    reasoningEffort: "high",
+    runtimeConfig: {
+      version: 1, runtime: "antigravity", model: { kind: "preset", id: "gemini-3.8-flash" }, mode: { kind: "default" }, reasoningEffort: "high", envVars: null,
+    } as RuntimeConfig,
+  });
+  // agy now starts on another model, so gemini-3.8-flash is listed without levels.
+  const originalOrchestrator = app.app.get("agentOrchestrator") as Record<string, unknown>;
+  app.app.set("agentOrchestrator", {
+    ...originalOrchestrator,
+    detectMachineRuntimeModels: async () => ({
+      kind: "live",
+      value: {
+        models: [
+          { id: "gemini-4-pro", label: "Gemini 4 Pro", supportedReasoningEfforts: ["low", "high"], defaultReasoningEffort: "high" },
+          { id: "gemini-3.8-flash", label: "Gemini 3.8 Flash" },
+        ],
+        default: "gemini-4-pro",
+      },
+    }),
+  });
+  try {
+    const storedConfig = async () => (await getAgent(agent.id))?.runtimeConfig as unknown as Record<string, unknown>;
+    const editForm = await (await fetch(`${app.baseUrl}/api/agents/${agent.id}/runtime-form`, { headers })).json() as { values: Record<string, unknown> };
+    assert.deepEqual(editForm.values, { model: "gemini-3.8-flash", reasoningEffort: "high", envVars: {} });
+    const patch = (formValues: Record<string, unknown>) => fetch(`${app.baseUrl}/api/agents/${agent.id}`, {
+      method: "PATCH",
+      headers,
+      body: JSON.stringify({ formDefinitionRef: { protocolVersion: 2, runtimeId: "antigravity" }, formValues }),
+    });
+
+    // A newly chosen level the model does not list is refused at the field.
+    const refused = await patch({ ...editForm.values, reasoningEffort: "low" });
+    assert.equal(refused.status, 400);
+    assert.deepEqual((await refused.json() as { issues: unknown }).issues, [
+      { code: "reasoning_effort_not_supported", pointer: "/formValues/reasoningEffort" },
+    ]);
+    assert.equal((await storedConfig()).reasoningEffort, "high", "nothing saved");
+
+    // Saving the form as it came back (the hidden field still holds the saved level) succeeds with Default.
+    const saved = await patch({ ...editForm.values, envVars: { K: "v" } });
+    assert.equal(saved.status, 200, await saved.clone().text());
+    assert.deepEqual(await storedConfig(), {
+      version: 1, runtime: "antigravity", model: { kind: "preset", id: "gemini-3.8-flash" }, mode: { kind: "default" }, reasoningEffort: null, envVars: { K: "v" },
+    });
+
+    // agy's configured default takes no effort: one sent with it is dropped by the static rule.
+    const toDefault = await patch({ model: "default", reasoningEffort: "high", envVars: {} });
+    assert.equal(toDefault.status, 200, await toDefault.clone().text());
+    assert.deepEqual((await storedConfig()).model, { kind: "preset", id: "default" });
+    assert.equal((await storedConfig()).reasoningEffort, null);
+  } finally {
+    app.app.set("agentOrchestrator", originalOrchestrator);
+  }
+});
+
+test("v2 edit: a submit for another runtime switches the agent to it, takes nothing from the old runtime's config, and clears the session", async ({ app }) => {
+  // The web editor saves a runtime switch through the new runtime's v2 create
+  // form (task #8), with the agent's stored config of the old runtime as `existing`.
+  const owner = await seedUser("v2-runtime-switch@slock.test", "v2-runtime-switch");
+  const server = await createServer("V2 Runtime Switch", "v2-runtime-switch", owner.id);
+  const headers = { ...authHeaders(await tokenForHuman(owner.email), server.id), "Content-Type": "application/json" };
+  const SECRET = "sk-claude-old-secret-switch";
+  const agent = await createAgent(server.id, "v2-runtime-switch", {
+    runtime: "claude",
+    model: "sonnet",
+    runtimeConfig: {
+      version: 1, runtime: "claude",
+      provider: { kind: "custom", apiUrl: "https://gateway.example.test", apiKey: SECRET },
+      model: { kind: "preset", id: "sonnet" }, mode: { kind: "default" }, reasoningEffort: "high",
+      envVars: { OLD: "1" }, command: "/opt/claude",
+    } as unknown as RuntimeConfig,
+  });
+  await updateAgentStatus(agent.id, "active", "claude-session-id");
+
+  const res = await fetch(`${app.baseUrl}/api/agents/${agent.id}`, {
+    method: "PATCH",
+    headers,
+    body: JSON.stringify({
+      formDefinitionRef: { protocolVersion: 2, runtimeId: "codex" },
+      formValues: { model: "gpt-5.5", envVars: { NEW: "1" } },
+      restartMode: "session",
+    }),
+  });
+  assert.equal(res.status, 200, await res.clone().text());
+  const updated = await getAgent(agent.id);
+  assert.equal(updated?.runtime, "codex");
+  assert.equal(updated?.sessionId, null);
+  const stored = updated?.runtimeConfig as unknown as Record<string, unknown>;
+  assert.equal(stored.runtime, "codex");
+  assert.deepEqual(stored.envVars, { NEW: "1" });
+  assert.equal(JSON.stringify(stored).includes(SECRET), false, "the old runtime's secret is not carried over");
+  assert.equal("command" in stored, false, "nor its command");
+});
+
+test("PATCH /agents/:id: a cleared reasoning effort stays cleared; the stored one fills in only when the request leaves it out (task #1334)", async ({ app }) => {
+  // The legacy reasoningEffort column used to stand in for an explicit null in
+  // the submitted runtimeConfig, so switching a Pi agent on high to OpenCode
+  // (which has no effort) failed with "reasoningEffort is not supported".
+  const owner = await seedUser("effort-clear-switch@slock.test", "effort-clear-switch");
+  const server = await createServer("Effort Clear Switch", "effort-clear-switch", owner.id);
+  const headers = { ...authHeaders(await tokenForHuman(owner.email), server.id), "Content-Type": "application/json" };
+  const piOnHigh = (name: string) => createAgent(server.id, name, {
+    runtime: "pi",
+    model: "anthropic/sonnet-live",
+    reasoningEffort: "high",
+    runtimeConfig: {
+      version: 1, runtime: "pi", provider: { kind: "default" }, model: { kind: "preset", id: "anthropic/sonnet-live" }, mode: { kind: "default" }, reasoningEffort: "high", envVars: null,
+    } as unknown as RuntimeConfig,
+  });
+  const patch = (id: string, body: Record<string, unknown>) => fetch(`${app.baseUrl}/api/agents/${id}`, { method: "PATCH", headers, body: JSON.stringify(body) });
+  const storedEffort = async (id: string) => ((await getAgent(id))?.runtimeConfig as unknown as { reasoningEffort: unknown }).reasoningEffort;
+
+  // Pi -> OpenCode through the v2 form the web editor uses.
+  const v2Switch = await piOnHigh("effort-v2-switch");
+  const v2Res = await patch(v2Switch.id, { formDefinitionRef: { protocolVersion: 2, runtimeId: "opencode" }, formValues: { model: "deepseek/deepseek-v4-pro" }, restartMode: "session" });
+  assert.equal(v2Res.status, 200, await v2Res.clone().text());
+  assert.equal((await getAgent(v2Switch.id))?.runtime, "opencode");
+  assert.equal(await storedEffort(v2Switch.id), null);
+
+  // Pi -> OpenCode as a structured runtimeConfig with an explicit null.
+  const structuredSwitch = await piOnHigh("effort-structured-switch");
+  const structuredRes = await patch(structuredSwitch.id, {
+    runtimeConfig: { version: 1, runtime: "opencode", model: { kind: "preset", id: "deepseek/deepseek-v4-pro" }, mode: { kind: "default" }, reasoningEffort: null, envVars: null },
+  });
+  assert.equal(structuredRes.status, 200, await structuredRes.clone().text());
+  assert.equal(await storedEffort(structuredSwitch.id), null);
+
+  // Same runtime, effort explicitly cleared.
+  const sameRuntime = await piOnHigh("effort-same-runtime-clear");
+  const clearRes = await patch(sameRuntime.id, {
+    runtimeConfig: { version: 1, runtime: "pi", provider: { kind: "default" }, model: { kind: "preset", id: "anthropic/sonnet-live" }, mode: { kind: "default" }, reasoningEffort: null, envVars: null },
+  });
+  assert.equal(clearRes.status, 200, await clearRes.clone().text());
+  assert.equal(await storedEffort(sameRuntime.id), null);
+
+  // Left out of the request: the stored effort is kept.
+  const omitted = await piOnHigh("effort-omitted-keeps");
+  const omittedRes = await patch(omitted.id, {
+    runtimeConfig: { version: 1, runtime: "pi", provider: { kind: "default" }, model: { kind: "preset", id: "anthropic/sonnet-live" }, mode: { kind: "default" }, envVars: null },
+  });
+  assert.equal(omittedRes.status, 200, await omittedRes.clone().text());
+  assert.equal(await storedEffort(omitted.id), "high");
+  const descriptionRes = await patch(omitted.id, { description: "only the description" });
+  assert.equal(descriptionRes.status, 200, await descriptionRes.clone().text());
+  assert.equal(await storedEffort(omitted.id), "high");
+});
+
+test("v2 edit: an older Built-in row with no provider opens with a blank provider instead of 404", async ({ app }) => {
+  // The web editor no longer falls back to the v1 form when the v2 edit read
+  // fails (task #8), so a hydrated Built-in config without a provider must
+  // still get a form: the provider is blank and has to be chosen.
+  const owner = await seedUser("v2-builtin-no-provider@slock.test", "v2-builtin-no-provider");
+  const server = await createServer("V2 Builtin No Provider", "v2-builtin-no-provider", owner.id);
+  const headers = { ...authHeaders(await tokenForHuman(owner.email), server.id), "Content-Type": "application/json" };
+  const agent = await createAgent(server.id, "v2-builtin-no-provider", { runtime: "builtin", model: "deepseek/deepseek-v4-pro", runtimeConfig: null, envVars: { KEEP: "1" } });
+  assert.equal(hydrateRuntimeConfig((await getAgent(agent.id))!).provider, undefined, "precondition: the row hydrates without a provider");
+
+  const formRes = await fetch(`${app.baseUrl}/api/agents/${agent.id}/runtime-form`, { headers });
+  assert.equal(formRes.status, 200, await formRes.clone().text());
+  const form = await formRes.json() as { runtimeId: string; values: Record<string, unknown> };
+  assert.equal(form.runtimeId, "builtin");
+  assert.equal(form.values.providerId, "");
+  assert.deepEqual(form.values.envVars, { KEEP: "1" });
+});
+
 test("batch 3b v2 edit: Claude's custom-provider API key never comes back through the v2 form, and saving without it keeps the stored key", async ({ app }) => {
   const owner = await seedUser("v2-batch3b-claude@slock.test", "v2-batch3b-claude");
   const server = await createServer("V2 Batch3b Claude", "v2-batch3b-claude", owner.id);
@@ -6548,7 +7687,7 @@ test("batch 3b v2 edit: Claude's custom-provider API key never comes back throug
   assert.equal(form.runtimeId, "claude");
   assert.deepEqual(form.capabilities.writeOnlyPointers, ["/apiKey"]);
   assert.deepEqual(form.values, {
-    provider: "custom", apiUrl: "https://gateway.example.test", model: "sonnet", reasoningEffort: "high", fastMode: false, command: "/opt/claude", envVars: { KEEP: "1" },
+    provider: "custom", apiUrl: "https://gateway.example.test", authType: "api_key", model: "sonnet", reasoningEffort: "high", fastMode: false, command: "/opt/claude", envVars: { KEEP: "1" },
   });
 
   const patch = (formValues: Record<string, unknown>) => fetch(`${app.baseUrl}/api/agents/${agent.id}`, {
@@ -6677,6 +7816,14 @@ test("batch 4 v2 create and edit: Pi stores the legacy runtimeConfig, its built-
       version: 1, runtime: "pi", provider: { kind: "default" }, model: { kind: "preset", id: "anthropic/sonnet-live" }, mode: { kind: "default" }, reasoningEffort: "high", envVars: null,
     });
 
+    // Pi's "off" is kept in runtimeConfig only: the legacy column, which the agent
+    // API exposes to CLIs that validate it against the older set, stays empty.
+    const off = await create("v2-pi-off", { provider: "configured", model: "anthropic/sonnet-live", reasoningEffort: "off" });
+    assert.equal(off.status, 200, await off.clone().text());
+    const offAgent = await getAgent((await off.json() as { id: string }).id);
+    assert.equal((offAgent?.runtimeConfig as { reasoningEffort?: unknown } | null)?.reasoningEffort, "off");
+    assert.equal(offAgent?.reasoningEffort ?? null, null);
+
     // DeepSeek: the key and a model from the provider's list.
     const created = await create("v2-pi-deepseek", { provider: "deepseek", apiKey: SECRET, providerModel: "deepseek/deepseek-v4-pro", providerReasoningEffort: "low", envVars: { KEEP: "1" } });
     assert.equal(created.status, 200, await created.clone().text());
@@ -6727,7 +7874,7 @@ test("batch 4 v2 create and edit: Pi stores the legacy runtimeConfig, its built-
   }
 });
 
-test("batch 2 v2 edit: Gemini, Kimi CLI and Antigravity round-trip through GET runtime-form and PATCH; Antigravity keeps its stored model", async ({ app }) => {
+test("batch 2 v2 edit: Gemini, Kimi CLI and Antigravity round-trip through GET runtime-form and PATCH", async ({ app }) => {
   const owner = await seedUser("v2-batch2-edit@slock.test", "v2-batch2-edit");
   const server = await createServer("V2 Batch2 Edit", "v2-batch2-edit", owner.id);
   const headers = { ...authHeaders(await tokenForHuman(owner.email), server.id), "Content-Type": "application/json" };
@@ -6737,7 +7884,8 @@ test("batch 2 v2 edit: Gemini, Kimi CLI and Antigravity round-trip through GET r
   const cases = [
     { runtime: "gemini", stored: config("gemini", { kind: "preset", id: "gemini-2.5-pro" }, { OLD: "1" }), values: { model: "gemini-2.5-pro", envVars: { OLD: "1" } }, edit: { model: "gemini-2.5-flash" } },
     { runtime: "kimi", stored: config("kimi", { kind: "preset", id: "default" }, null), values: { model: "default", envVars: {} }, edit: { model: "kimi-live-model" } },
-    { runtime: "antigravity", stored: config("antigravity", { kind: "custom", name: "agy-picked" }, { OLD: "1" }), values: { envVars: { OLD: "1" } }, edit: {} },
+    // Antigravity has a model and an effort now; a typed model with no live list to check stays custom.
+    { runtime: "antigravity", stored: config("antigravity", { kind: "custom", name: "agy-picked" }, { OLD: "1" }), values: { model: "agy-picked", reasoningEffort: "", envVars: { OLD: "1" } }, edit: { model: "agy-other" } },
   ];
   for (const { runtime, stored, values, edit } of cases) {
     const agent = await createAgent(server.id, `v2-edit-${runtime}`, { runtime, model: "x", runtimeConfig: stored });
@@ -6762,7 +7910,7 @@ test("batch 2 v2 edit: Gemini, Kimi CLI and Antigravity round-trip through GET r
     assert.equal(editRes.status, 200, `${runtime}: ${await editRes.clone().text()}`);
     const after = hydrateRuntimeConfig((await getAgent(agent.id))!);
     assert.deepEqual(after.envVars, { NEW: "2" }, runtime);
-    assert.deepEqual(after.model, runtime === "antigravity" ? stored.model : { kind: "preset", id: (edit as { model: string }).model }, runtime);
+    assert.deepEqual(after.model, runtime === "antigravity" ? { kind: "custom", name: "agy-other" } : { kind: "preset", id: (edit as { model: string }).model }, runtime);
     assert.equal(after.runtime, runtime);
   }
 });
@@ -6870,7 +8018,19 @@ test("RFC 071 §5: Start and Reset are explicit human controls; PATCH lifts the 
     body: JSON.stringify({ model: "gpt-5.6-sol" }),
   });
   assert.equal(same.status, 200);
-  assert.deepEqual(lifts.at(-1), { agentId: agent.id, options: { runtimeValuesChanged: false } });
+  assert.deepEqual(lifts.at(-1), { agentId: agent.id, options: { runtimeValuesChanged: false, runtimeOrModelChanged: false } });
+
+  // #triage:#263: another model clears the old one's runtime error (in the orchestrator).
+  const model = await fetch(`${app.baseUrl}/api/agents/${agent.id}`, {
+    method: "PATCH",
+    headers: { ...authHeaders(token, server.id), "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "gpt-5.6-terra",
+      runtimeConfig: { version: 1, runtime: "codex", model: { kind: "preset", id: "gpt-5.6-terra" }, mode: { kind: "default" }, reasoningEffort: null, envVars: null },
+    }),
+  });
+  assert.equal(model.status, 200);
+  assert.deepEqual(lifts.at(-1), { agentId: agent.id, options: { runtimeValuesChanged: true, runtimeOrModelChanged: true } });
 
   const changed = await fetch(`${app.baseUrl}/api/agents/${agent.id}`, {
     method: "PATCH",
@@ -6878,5 +8038,122 @@ test("RFC 071 §5: Start and Reset are explicit human controls; PATCH lifts the 
     body: JSON.stringify({ reasoningEffort: "high" }),
   });
   assert.equal(changed.status, 200);
-  assert.deepEqual(lifts.at(-1), { agentId: agent.id, options: { runtimeValuesChanged: true } });
+  assert.deepEqual(lifts.at(-1), { agentId: agent.id, options: { runtimeValuesChanged: true, runtimeOrModelChanged: false } });
+});
+
+test("GET /api/agents survives a version-floor check that throws for one machine", async ({ app }) => {
+  const owner = await seedUser("gate-throw-owner@slock.test", "gate-throw-owner");
+  const server = await createServer("Gate Throw Server", "gate-throw-server", owner.id);
+  const [machine] = await getDb().insert(machines).values({
+    serverId: server.id,
+    userId: owner.id,
+    name: "gate-throw-machine",
+    apiKeyHash: "gate-throw-machine-hash",
+    runtimes: ["codex"],
+  }).returning();
+  const agent = await createAgent(server.id, "gate-throw-agent", {
+    runtime: "codex",
+    creatorType: "user",
+    creatorId: owner.id,
+    machineId: machine!.id,
+  });
+  const orchestrator = app.app.get("agentOrchestrator") as { isMachineAgentWorkHeld: (machineId: string) => Promise<boolean> };
+  const original = orchestrator.isMachineAgentWorkHeld;
+  // A synchronous throw, not a rejected promise: `.catch()` on the call would not see it.
+  orchestrator.isMachineAgentWorkHeld = () => {
+    throw new Error("version floor unavailable");
+  };
+  try {
+    const res = await fetch(`${app.baseUrl}/api/agents`, { headers: authHeaders(await tokenForHuman(owner.email), server.id) });
+    assert.equal(res.status, 200);
+    const list = await res.json() as Array<{ id: string; blockedReason?: string | null }>;
+    assert.equal(list.find((entry) => entry.id === agent.id)?.blockedReason, null, "a failed check reads as not held");
+  } finally {
+    orchestrator.isMachineAgentWorkHeld = original;
+  }
+});
+
+test("POST /agents/:id/interrupt-turn stops the current turn through the orchestrator and reports why it could not (task #25)", async ({ app }) => {
+  const owner = await seedUser("interrupt-turn-owner@slock.test", "interrupt-turn-owner");
+  const server = await createServer("Interrupt Turn Server", "interrupt-turn-server", owner.id);
+  const agent = await createAgent(server.id, "interrupt-turn-target", { runtime: "codex", creatorType: "user", creatorId: owner.id });
+  const token = await tokenForHuman(owner.email);
+  const original = app.app.get("agentOrchestrator");
+  const calls: Array<{ agentId: string; machineId: string | null }> = [];
+  let next: () => Promise<unknown> = async () => ({ outcome: "restarted", toolName: "bash", stuckForMs: 660_000 });
+  app.app.set("agentOrchestrator", {
+    ...original,
+    interruptAgentTurn: async (agentId: string, machineId: string | null) => {
+      calls.push({ agentId, machineId });
+      return next();
+    },
+  });
+  onTestFinished(() => {
+    app.app.set("agentOrchestrator", original);
+  });
+  const post = async () => {
+    const res = await fetch(`${app.baseUrl}/api/agents/${agent.id}/interrupt-turn`, { method: "POST", headers: authHeaders(token, server.id) });
+    return { status: res.status, body: await res.json() as Record<string, unknown> };
+  };
+
+  assert.deepEqual(await post(), { status: 200, body: { outcome: "restarted", toolName: "bash", stuckForMs: 660_000 } });
+  assert.equal(calls[0]?.agentId, agent.id);
+
+  next = async () => ({ outcome: "computer_upgrade_required" });
+  const upgrade = await post();
+  assert.equal(upgrade.status, 409);
+  assert.equal(upgrade.body.code, "computer_upgrade_required");
+
+  next = async () => ({ outcome: "computer_offline" });
+  assert.equal((await post()).body.code, "computer_offline");
+
+  next = async () => {
+    throw new RouteFailureError("daemon_timeout", "Machine response timed out");
+  };
+  const timeout = await post();
+  assert.equal(timeout.status, 504);
+  assert.equal(timeout.body.code, "computer_timeout");
+
+  const other = await createServer("Interrupt Turn Other", "interrupt-turn-other", owner.id);
+  const res = await fetch(`${app.baseUrl}/api/agents/${agent.id}/interrupt-turn`, { method: "POST", headers: authHeaders(token, other.id) });
+  assert.equal(res.status, 404, "an agent of another server is not found");
+});
+
+test("POST /agents/:id/subagents/:taskId/interrupt stops one sub-agent through the orchestrator (#proj-runtime:#41)", async ({ app }) => {
+  const owner = await seedUser("interrupt-subagent-owner@slock.test", "interrupt-subagent-owner");
+  const server = await createServer("Interrupt Subagent Server", "interrupt-subagent-server", owner.id);
+  const agent = await createAgent(server.id, "interrupt-subagent-target", { runtime: "codex", creatorType: "user", creatorId: owner.id });
+  const token = await tokenForHuman(owner.email);
+  const original = app.app.get("agentOrchestrator");
+  const calls: Array<{ agentId: string; machineId: string | null; taskId: string }> = [];
+  let next: () => Promise<unknown> = async () => ({ outcome: "interrupted" });
+  app.app.set("agentOrchestrator", {
+    ...original,
+    interruptAgentSubagent: async (agentId: string, machineId: string | null, taskId: string) => {
+      calls.push({ agentId, machineId, taskId });
+      return next();
+    },
+  });
+  onTestFinished(() => {
+    app.app.set("agentOrchestrator", original);
+  });
+  const post = async (taskId = "thread-child", as = token) => {
+    const res = await fetch(`${app.baseUrl}/api/agents/${agent.id}/subagents/${encodeURIComponent(taskId)}/interrupt`, { method: "POST", headers: authHeaders(as, server.id) });
+    return { status: res.status, body: await res.json() as Record<string, unknown> };
+  };
+
+  assert.deepEqual(await post(), { status: 200, body: { outcome: "interrupted" } });
+  assert.deepEqual(calls[0], { agentId: agent.id, machineId: agent.machineId ?? null, taskId: "thread-child" });
+
+  next = async () => ({ outcome: "computer_upgrade_required" });
+  const upgrade = await post();
+  assert.equal(upgrade.status, 409);
+  assert.equal(upgrade.body.code, "computer_upgrade_required");
+
+  const callsBefore = calls.length;
+  assert.equal((await post("x".repeat(161))).status, 400, "an over-long sub-agent id");
+  const other = await createServer("Interrupt Subagent Other", "interrupt-subagent-other", owner.id);
+  const res = await fetch(`${app.baseUrl}/api/agents/${agent.id}/subagents/thread-child/interrupt`, { method: "POST", headers: authHeaders(token, other.id) });
+  assert.equal(res.status, 404, "an agent of another server is not found");
+  assert.equal(calls.length, callsBefore, "no request for a refused stop");
 });

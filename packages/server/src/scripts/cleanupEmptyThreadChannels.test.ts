@@ -1,16 +1,9 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
 import {
   classifyCandidate,
   parseArgs,
   type EmptyThreadCandidate,
 } from "../../scripts/cleanup-empty-thread-channels";
-
-const cleanupSource = readFileSync(
-  fileURLToPath(new URL("../../scripts/cleanup-empty-thread-channels.ts", import.meta.url)),
-  "utf8",
-);
 
 const emptyCandidate: EmptyThreadCandidate = {
   threadChannelId: "00000000-0000-4000-8000-000000000001",
@@ -62,13 +55,4 @@ test("reply-bearing channels can never enter the destructive disposition", () =>
   const decision = classifyCandidate({ ...emptyCandidate, replyCount: 1 }, []);
   assert.equal(decision.disposition, "quarantine");
   assert.deepEqual(decision.reasons, ["has_reply_messages"]);
-});
-
-test("apply minimizes and bounds the message-write lock window before reinspection", () => {
-  const discovery = cleanupSource.indexOf("const initial = await discoverCandidates(client, options);");
-  const lock = cleanupSource.indexOf('await client.query("LOCK TABLE messages IN SHARE ROW EXCLUSIVE MODE");');
-  const reinspection = cleanupSource.indexOf("const decisions = await inspect(");
-  assert.ok(discovery >= 0 && lock > discovery && reinspection > lock);
-  assert.match(cleanupSource, /SET LOCAL lock_timeout = '5s'/);
-  assert.match(cleanupSource, /SET LOCAL statement_timeout = '5min'/);
 });

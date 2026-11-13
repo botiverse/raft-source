@@ -1,0 +1,38 @@
+{
+  "formatVersion": 1,
+  "id": "R9-muted-with-threads",
+  "rule": "R9",
+  "title": "A muted channel with unread and unread threads shows a grey number, not the badge",
+  "why": "Muting keeps the unread visible but quiet. Which numbers the grey count shows is S1 (S1-muted-grey-segments).",
+  "status": "agreed",
+  "sources": {
+    "web": [
+      "packages/web/src/utils/channelUnreadIndicator.ts (getChannelUnreadIndicatorState)",
+      "packages/web/src/features/sidebar/rows/ChannelRow.tsx"
+    ],
+    "app": [
+      "compose/shared/src/commonMain/kotlin/build/raft/app/RaftHomeComponents.kt (homeChannelRowMarks)"
+    ]
+  },
+  "given": {
+    "conversation": {
+      "id": "channel-1",
+      "kind": "channel"
+    },
+    "row": {
+      "joined": true,
+      "muted": true,
+      "unread": 5,
+      "threads": 1
+    }
+  },
+  "steps": [],
+  "expect": {
+    "state": {
+      "rowDisplay": {
+        "kind": "quiet",
+        "unreadTone": false
+      }
+    }
+  }
+}

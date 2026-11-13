@@ -102,3 +102,25 @@ test("resuming a computer that already existed is flagged as ambiguous", () => {
   assert.equal(progress.state, "connected");
   assert.equal(progress.requiresConfirmation, true, "we cannot be sure this is the one they just set up");
 });
+
+// Add Computer adds *another* computer and registers no placeholder row, so a
+// computer of this user's that was already online when the attempt began is
+// not the one being added: without a new or resumed one it is still idle.
+test("without includeAlreadyOnline, a computer already online is not this attempt's connection", () => {
+  const existing = owned("c1", "online");
+  const progress = resolveComputerConnectionProgress([existing], "", baselineOf([existing]), {
+    includeAlreadyOnline: false,
+  });
+  assert.equal(progress.state, "idle");
+  assert.equal(progress.machine, null);
+});
+
+test("without includeAlreadyOnline, a new computer coming online still reads as connected", () => {
+  const existing = owned("c1", "online");
+  const fresh = owned("c2", "online");
+  const progress = resolveComputerConnectionProgress([existing, fresh], "", baselineOf([existing]), {
+    includeAlreadyOnline: false,
+  });
+  assert.equal(progress.state, "connected");
+  assert.equal(progress.machine?.id, "c2");
+});

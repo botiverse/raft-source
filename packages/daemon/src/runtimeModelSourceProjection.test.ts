@@ -86,3 +86,15 @@ test("task #1242: the serialized result frame keeps the lookup verdict beside th
   assert.deepEqual(wire.outcome, { kind: "error", retryable: true, code: "runtime_not_found", reason: "probe_timeout" });
   assert.equal(wire.error, "error");
 });
+
+test("runtime model wire carries unavailable models only inside the typed outcome, never in legacy models", () => {
+  const unavailable = [{ id: "claude-opus-9", label: "Claude Opus 9", reason: "Upgrade Claude Code" }];
+  const message = buildRuntimeModelSourceResultMessage("req-unavailable", {
+    kind: "live",
+    value: { models: [{ id: "opus", label: "Claude Opus" }], unavailable },
+  }, "launchable");
+  assert.ok(message.outcome?.kind === "live");
+  assert.deepEqual(message.outcome.value.unavailable, unavailable);
+  assert.deepEqual(message.outcome.value.models.map((model) => model.id), ["opus"]);
+  assert.deepEqual(message.models?.map((model) => model.id), ["opus"]);
+});

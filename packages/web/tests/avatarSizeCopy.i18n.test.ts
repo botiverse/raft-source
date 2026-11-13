@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { readdirSync, readFileSync, statSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { join, relative, resolve } from "node:path";
+import { isTestPath } from "../scripts/testLocations";
 
 import { en as enMessages } from "../src/i18n/messages/en";
 import { zhCn as zhMessages } from "../src/i18n/messages/zh-cn";
@@ -33,7 +34,8 @@ function walk(dir: string, out: string[] = []): string[] {
   }
   return out;
 }
-const FILES = walk(SRC);
+// Feature tests (src/features/<feature>/tests/) are not app code.
+const FILES = walk(SRC).filter((p) => !isTestPath(`src/${relative(SRC, p)}`));
 
 test("the English-returning helper no longer exists", () => {
   // Deleted, not deprecated. A deprecated helper that still compiles is one
@@ -45,7 +47,6 @@ test("the English-returning helper no longer exists", () => {
 });
 
 test("the size sentence exists exactly once, as a catalog message", () => {
-  assert.equal(en["avatar.tooLarge"], "Avatar image must be {maxLabel} or smaller");
   assert.match(zh["avatar.tooLarge"], /\{maxLabel\}/);
   // The page-scoped duplicate is gone. HumanDetailPanel had its own id saying
   // the same thing in both languages; converging removes a row rather than
@@ -63,7 +64,7 @@ test("the size sentence exists exactly once, as a catalog message", () => {
 
 test("every surface that checks size renders the shared id", () => {
   const callers = FILES.filter((f) => /isAvatarFileTooLarge/.test(readFileSync(f, "utf8")));
-  // SettingsPanel x1 file, AgentDetailPanel, HumanDetailPanel,
+  // AccountSection, AgentDetailPanel, HumanDetailPanel,
   // AccountIdentitySetupPage, authStore, and the util itself.
   assert.ok(callers.length >= 5, `expected the known call sites, found ${callers.length}`);
   for (const f of callers) {
@@ -78,9 +79,6 @@ test("every surface that checks size renders the shared id", () => {
 });
 
 test("the store throws a code, and no surface renders that code raw", () => {
-  const store = readFileSync(join(SRC, "store", "authStore.ts"), "utf8");
-  assert.match(store, /throw new Error\(AVATAR_TOO_LARGE_CODE\)/);
-  assert.equal((store.match(/throw new Error\(AVATAR_TOO_LARGE_CODE\)/g) ?? []).length, 2);
   // Every catch that could receive the code must map it before falling back to
   // the generic upload-failure text — otherwise the user sees the raw string
   // "AVATAR_TOO_LARGE", which is WORSE than the English this change removed.

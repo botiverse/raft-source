@@ -1,0 +1,38 @@
+{
+  "formatVersion": 1,
+  "id": "R11-marked-unread-muted",
+  "rule": "R11",
+  "title": "A muted channel marked unread shows the marked dot without the unread name",
+  "why": "Muting keeps the name quiet; the dot still says it is unread.",
+  "status": "agreed",
+  "sources": {
+    "web": [
+      "packages/web/src/utils/channelUnreadIndicator.ts (getChannelUnreadIndicatorState)",
+      "packages/web/src/features/sidebar/rows/ChannelRow.tsx"
+    ],
+    "app": [
+      "compose/shared/src/commonMain/kotlin/build/raft/app/RaftHomeComponents.kt (homeChannelRowMarks)"
+    ]
+  },
+  "given": {
+    "conversation": {
+      "id": "channel-1",
+      "kind": "channel"
+    },
+    "row": {
+      "joined": true,
+      "muted": true,
+      "unread": 0,
+      "markedUnread": true
+    }
+  },
+  "steps": [],
+  "expect": {
+    "state": {
+      "rowDisplay": {
+        "kind": "markedDot",
+        "unreadTone": false
+      }
+    }
+  }
+}

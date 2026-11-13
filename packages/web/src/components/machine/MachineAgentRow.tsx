@@ -5,12 +5,16 @@ import AvatarSlot from "../ui/AvatarSlot";
 import StatusDot from "../ui/StatusDot";
 import Tooltip from "../ui/Tooltip";
 import { agentModelLabel } from "../../utils/agentModelName";
-import { formatActivityText } from "../../utils/activity";
+import { formatActivityText, formatAgentBlockedText, getActivityTextDescriptor } from "../../utils/activity";
 import { formatRuntimeLabelWithStatus } from "../../utils/runtimeAvailabilityLabel";
+import { useRuntimeDeprecatedHere } from "../../hooks/useServerRuntimeCatalog";
 import { useCallback } from "react";
 import { useIntl } from "react-intl";
 
-const BULK_HIGHLIGHT_BUTTON_PROPS = { "data-bulk-highlight": "true" } as const;
+// A row a bulk action just changed is located (states.md#located): the same
+// cyan as any item a jump lands on, not a green "success" (the banner above
+// says it worked).
+const BULK_HIGHLIGHT_BUTTON_PROPS = { "data-bulk-highlight": "true", "data-located": "" } as const;
 
 export function MachineAgentRow({
   agent,
@@ -20,7 +24,7 @@ export function MachineAgentRow({
   canManageMachines,
   onToggleSelection,
   onOpenAgent,
-  highlighted = false,
+  located = false,
 }: {
   agent: Agent;
   displayState: AgentDisplayState;
@@ -29,10 +33,12 @@ export function MachineAgentRow({
   canManageMachines: boolean;
   onToggleSelection: (agentId: string) => void;
   onOpenAgent: (agentId: string) => void;
-  /** Briefly marks a row just changed by a bulk action (3 s, one-shot). */
-  highlighted?: boolean;
+  /** Located (states.md#located) while the panel's highlight for the bulk
+   *  change that just changed this row is on. */
+  located?: boolean;
 }) {
   const { formatMessage } = useIntl();
+  const deprecatedHere = useRuntimeDeprecatedHere();
   const agentId = agent.id;
   const handleToggleSelection = useCallback(() => onToggleSelection(agentId), [agentId, onToggleSelection]);
   const handleOpenAgent = useCallback(() => onOpenAgent(agentId), [agentId, onOpenAgent]);
@@ -40,24 +46,57 @@ export function MachineAgentRow({
   // show the model alongside the runtime (artin 2026-09-27), not
   // only the chat-side "Show agent model" preference.
   const agentIdentityLabel = [
-    formatRuntimeLabelWithStatus(agent.runtime, formatMessage),
+    formatRuntimeLabelWithStatus(agent.runtime, formatMessage, deprecatedHere(agent.runtime)),
     agentModelLabel(agent),
   ].filter(Boolean).join(" · ");
-  const activityText = formatActivityText(
-    formatMessage,
-    displayState.activity,
-    displayState.activityDetail,
-    displayState.activityDetailKind,
-  );
+  const activityText = displayState.blocked
+    ? formatAgentBlockedText(formatMessage, displayState.blocked)
+    : displayState.likelyOnline
+    ? formatMessage({ id: "activity.status.likelyOnline" })
+    : formatActivityText(
+      formatMessage,
+      displayState.activity,
+      displayState.activityDetail,
+      displayState.activityDetailKind,
+      displayState.activityErrorCode,
+    );
   const avatar = <AvatarSlot context="list-row" type="agent" agentAvatarUrl={agent.avatarUrl} />;
+  // Only a plain Online / Offline may shrink to the dot alone; anything else
+  // (an error, a block, what it is working on) is text the reader may need to
+  // act on, and a tooltip is not enough (touch, screen readers).
+  // "Likely online" (no state yet, #triage:#97) is a plain presence too.
+  const activityTextId = displayState.blocked
+    ? null
+    : (() => {
+      const { primary } = getActivityTextDescriptor(
+        displayState.activity,
+        displayState.activityDetail,
+        displayState.activityDetailKind,
+      );
+      return "id" in primary ? primary.id : null;
+    })();
+  const plainPresence = activityTextId === "activity.status.online" || activityTextId === "activity.status.offline";
+  // The row is the container (`@container`), not the window: next to an open
+  // profile the Computer column is ~320px on a wide window. From @md the
+  // status sits on the right; below it, non-plain status gets its own line
+  // under the name and wraps.
   const rightStatus = (
-    <>
+    <span className={`${plainPresence ? "flex" : "hidden @md:flex"} items-center gap-1.5`}>
       <StatusDot activity={displayState.activity} title={activityText} />
       <Tooltip content={activityText}><span
-        className="hidden max-w-[min(32rem,42vw)] truncate align-middle font-mono text-mono-meta text-foreground-hint sm:inline-block"
+        className="hidden max-w-[min(32rem,42cqw)] truncate align-middle font-mono text-mono-meta text-foreground-hint @md:inline-block"
       >
         {activityText}
       </span></Tooltip>
+    </span>
+  );
+  const subtitle = plainPresence ? agentIdentityLabel : (
+    <>
+      <span className="block">{agentIdentityLabel}</span>
+      <span className="mt-1 flex items-start gap-1.5 @md:hidden" data-testid="machine-agent-row-status-line">
+        <StatusDot activity={displayState.activity} className="mt-[3px] shrink-0" />
+        <span className="line-clamp-3 min-w-0 break-words text-foreground-muted">{activityText}</span>
+      </span>
     </>
   );
   if (selectionMode) {
@@ -75,7 +114,7 @@ export function MachineAgentRow({
         selected={canManageMachines && selected}
         onClick={handleToggleSelection}
         // `group`: CheckboxIndicator's previewOnHover hook (group-hover).
-        className="group"
+        className="group @container"
         aria-label={
           selected
             ? formatMessage({ id: "machine.detail.deselectAgentName" }, { name: agent.displayName || agent.name })
@@ -90,9 +129,9 @@ export function MachineAgentRow({
         {avatar}
         <ListRowBody>
           <ListRowTitle>{agent.displayName || agent.name}</ListRowTitle>
-          <ListRowMeta>{agentIdentityLabel}</ListRowMeta>
+          <ListRowMeta>{subtitle}</ListRowMeta>
         </ListRowBody>
-        <span className="flex shrink-0 items-center gap-1.5">{rightStatus}</span>
+        <span className="flex shrink-0 items-center">{rightStatus}</span>
       </ListRow>
       </Tooltip>
     );
@@ -101,16 +140,12 @@ export function MachineAgentRow({
     <AvatarListRow
       avatar={avatar}
       name={agent.displayName || agent.name}
-      subtitle={agentIdentityLabel}
+      subtitle={subtitle}
       rightContent={rightStatus}
       onClick={handleOpenAgent}
       selected={false}
-      buttonProps={highlighted ? BULK_HIGHLIGHT_BUTTON_PROPS : undefined}
-      // A row a bulk action just changed: a lime-soft wash that fades back
-      // (soft washes are highlights, no edge).
-      className={highlighted
-        ? "bg-success-soft duration-300 motion-reduce:transition-none"
-        : "duration-300 motion-reduce:transition-none"}
+      buttonProps={located ? BULK_HIGHLIGHT_BUTTON_PROPS : undefined}
+      className="@container"
     />
   );
 }

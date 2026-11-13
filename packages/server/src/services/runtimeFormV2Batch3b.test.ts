@@ -13,7 +13,9 @@ import assert from "node:assert/strict";
 import { parseRuntimeFormV2 } from "@botiverse/raft-runtime-form";
 import {
   BASE_REASONING_EFFORTS,
+  buildLaunchPlan,
   getStaticRuntimeModelSourceSet,
+  hydrateRuntimeConfig,
   parseRuntimeConfig,
   REASONING_EFFORT_RUNTIMES,
   RUNTIME_CONFIG_VERSION,
@@ -29,7 +31,6 @@ import {
   buildRuntimeConfig,
   supportsRuntimeApiUrl,
   supportsRuntimeCommand,
-  supportsRuntimeCustomModelName,
   supportsRuntimeFastMode,
 } from "../../../web/src/utils/runtimeConfigForm";
 import { RouteFailureError } from "../tracing/routeFailure";
@@ -41,12 +42,18 @@ import {
   reasoningEffortChoices,
   reconcileRuntimeFormV2SubmissionWithLiveModels,
   redactWriteOnlyRuntimeConfig,
+  retainOmittedClaudeAuthType,
   retainOmittedWriteOnlySecrets,
   runtimeFormV2Entry,
   runtimeFormValuesFromRuntimeConfig,
   type RuntimeFormOptionSourceContext,
 } from "./runtimeFormV2Registry";
 import { RUNTIME_FORM_V2_REASON_RETRYABLE } from "./runtimeFormV2SourceStatus";
+
+// Frozen from the retired web legacy form (task #8, PR #11812): the runtimes whose
+// model field accepted a typed custom name. The v2 forms must keep matching it.
+const LEGACY_CUSTOM_MODEL_NAME_RUNTIMES = new Set(["builtin", "claude", "codex", "cursor", "copilot", "pi"]);
+const supportsRuntimeCustomModelName = (runtime: string) => LEGACY_CUSTOM_MODEL_NAME_RUNTIMES.has(runtime);
 
 const BATCH_3B = ["claude", "cursor", "copilot"] as const;
 
@@ -59,6 +66,7 @@ test("claude, cursor and copilot forms: fields by kind, in order", () => {
     claude: [
       ["provider", "select", true, false],
       ["apiUrl", "url", false, false],
+      ["authType", "select", false, false],
       ["apiKey", "secret", false, false],
       ["model", "select", true, false],
       ["reasoningEffort", "derived_select", false, false],
@@ -100,11 +108,8 @@ test("each runtime declares exactly the capabilities its legacy form needs", () 
     const keys = parsed.fields.map((field) => field.key);
     const reasoning = REASONING_EFFORT_RUNTIMES.has(runtime);
     // Every runtime here has a Computer-probed model list.
-    const expected = [
-      ...(supportsRuntimeCustomModelName(runtime) ? ["select.custom_value"] : []),
-      ...(reasoning ? ["choice.labels"] : []),
-      "option_source.status",
-    ];
+    // choice.labels and option_source.status are always on, never listed.
+    const expected = supportsRuntimeCustomModelName(runtime) ? ["select.custom_value"] : [];
     assert.deepEqual(form.requiredClientCapabilities, expected, runtime);
     assert.equal(keys.includes("reasoningEffort"), reasoning, `${runtime}: reasoning`);
     assert.equal(keys.includes("fastMode"), supportsRuntimeFastMode(runtime), `${runtime}: fast mode`);
@@ -116,9 +121,9 @@ test("each runtime declares exactly the capabilities its legacy form needs", () 
       assert.deepEqual(effort.derivedFrom, { key: "model", attribute: "supportedReasoningEfforts", defaultAttribute: "defaultReasoningEffort" });
     }
   }
-  assert.deepEqual(buildRuntimeFormV2("claude").requiredClientCapabilities, ["select.custom_value", "choice.labels", "option_source.status"]);
-  assert.deepEqual(buildRuntimeFormV2("cursor").requiredClientCapabilities, ["select.custom_value", "option_source.status"]);
-  assert.deepEqual(buildRuntimeFormV2("copilot").requiredClientCapabilities, ["select.custom_value", "choice.labels", "option_source.status"]);
+  assert.deepEqual(buildRuntimeFormV2("claude").requiredClientCapabilities, ["select.custom_value"]);
+  assert.deepEqual(buildRuntimeFormV2("cursor").requiredClientCapabilities, ["select.custom_value"]);
+  assert.deepEqual(buildRuntimeFormV2("copilot").requiredClientCapabilities, ["select.custom_value"]);
 });
 
 // ── Option sources ──
@@ -298,6 +303,8 @@ test("claude, cursor and copilot: v2 values assemble exactly the legacy runtimeC
   const cases: Array<[string, Record<string, unknown>, Parameters<typeof legacy>[1]]> = [
     ["claude", { provider: "default", model: "sonnet", reasoningEffort: "high", fastMode: true, command: "", envVars: { K: "v" } }, { model: "sonnet", effort: "high", fast: true, envVars: { K: "v" } }],
     ["claude", { provider: "default", model: "opus", reasoningEffort: null, fastMode: false, command: " /opt/claude " }, { model: "opus", command: "/opt/claude" }],
+    // Opus 4.8 no longer runs fast (Claude Code removes it on 2026-11-30): fast mode is dropped, as in legacy.
+    ["claude", { provider: "default", model: "claude-opus-4-8", reasoningEffort: null, fastMode: true }, { model: "claude-opus-4-8", fast: true }],
     ["claude", { provider: "custom", apiUrl: " https://gw.example.test ", apiKey: " sk-1 ", model: "claude-opus-5-5", reasoningEffort: "" }, { model: "claude-opus-5-5", provider: { apiUrl: "https://gw.example.test", apiKey: "sk-1" } }],
     // Custom model: a typed value that is not listed.
     ["claude", { provider: "default", model: "vendor/private-model", reasoningEffort: "low" }, { model: "vendor/private-model", custom: true, effort: "low" }],
@@ -333,13 +340,17 @@ test("edit values round-trip the stored config; the API key is never part of the
     assertSameAsLegacy(saved as Record<string, unknown>, config, JSON.stringify(config));
   }
   assert.deepEqual(runtimeFormValuesFromRuntimeConfig(stored[0]!), {
-    provider: "custom", apiUrl: "https://gw.example.test", model: "sonnet", reasoningEffort: "high", fastMode: true, command: "/opt/claude", envVars: { KEEP: "1" },
+    provider: "custom", apiUrl: "https://gw.example.test", authType: "api_key", model: "sonnet", reasoningEffort: "high", fastMode: true, command: "/opt/claude", envVars: { KEEP: "1" },
   });
   assert.deepEqual(runtimeFormValuesFromRuntimeConfig(stored[1]!), {
     provider: "default", model: "vendor/private-model", reasoningEffort: "", fastMode: false, command: "", envVars: {},
   });
   assert.deepEqual(runtimeFormValuesFromRuntimeConfig(stored[2]!), { model: "my-org/cursor-custom", envVars: { C: "1" } });
   assert.deepEqual(runtimeFormValuesFromRuntimeConfig(stored[3]!), { model: "gpt-5.4", reasoningEffort: "low", envVars: {} });
+  // A saved fast mode on Claude Opus 4.8 (no longer runs fast) shows as off, as it launches.
+  const fastOpus48 = submitted("claude", { provider: "default", model: "claude-opus-5-5", fastMode: true });
+  assert.equal(runtimeFormValuesFromRuntimeConfig({ ...fastOpus48, model: { kind: "preset", id: "claude-opus-4-8" } })?.fastMode, false);
+  assert.equal(runtimeFormValuesFromRuntimeConfig(fastOpus48)?.fastMode, true);
 });
 
 test("submit errors point at the field", () => {
@@ -402,6 +413,103 @@ test("v1 agent reads keep Claude's key for released clients (redactOnAgentRead: 
   assert.deepEqual(runtimeFormV2Entry("claude")!.writeOnlySecrets?.map((secret) => [secret.path, secret.redactOnAgentRead]), [[["provider", "apiKey"], false]]);
   assert.equal(runtimeFormV2Entry("cursor")!.writeOnlySecrets, undefined);
   assert.equal(runtimeFormV2Entry("copilot")!.writeOnlySecrets, undefined);
+});
+
+// ── Env vars the provider fields own ──
+
+test("a provider-owned env var is refused on submit instead of being dropped", () => {
+  const values = { provider: "default", model: "sonnet", envVars: { ANTHROPIC_AUTH_TOKEN: "tok", ANTHROPIC_BASE_URL: "https://gw.example.test" } };
+  const result = buildRuntimeConfigFromFormValues("claude", values);
+  assert.ok(!result.ok);
+  assert.deepEqual(result.issue, { code: "controlled_env_var", pointer: "/formValues/envVars" });
+  assert.match(result.message ?? "", /ANTHROPIC_BASE_URL .*Provider → Custom/);
+  const model = buildRuntimeConfigFromFormValues("claude", { ...values, envVars: { ANTHROPIC_CUSTOM_MODEL_OPTION: "m" } });
+  assert.ok(!model.ok);
+  assert.match(model.message ?? "", /ANTHROPIC_CUSTOM_MODEL_OPTION .*Model field/);
+  // Keys the provider fields do not own still pass through.
+  const kept = submitted("claude", { ...values, envVars: { ANTHROPIC_AUTH_TOKEN: "tok" } });
+  assert.deepEqual(kept.envVars, { ANTHROPIC_AUTH_TOKEN: "tok" });
+  // Other runtimes refuse their own provider keys.
+  const pi = buildRuntimeConfigFromFormValues("pi", { provider: "default", model: "m", envVars: { DEEPSEEK_API_KEY: "k" } });
+  assert.ok(!pi.ok);
+  assert.equal(pi.issue.code, "controlled_env_var");
+  // In any case: Windows would read Anthropic_Base_Url as the base URL.
+  const mixedCase = buildRuntimeConfigFromFormValues("claude", { ...values, envVars: { Anthropic_Base_Url: "https://gw.example.test" } });
+  assert.ok(!mixedCase.ok);
+  assert.match(mixedCase.message ?? "", /Anthropic_Base_Url .*Provider → Custom/);
+  // Codex has no provider fields: the message says where an endpoint goes instead.
+  const codex = buildRuntimeConfigFromFormValues("codex", { model: "default", envVars: { OPENAI_BASE_URL: "https://proxy.example.test/v1" } });
+  assert.ok(!codex.ok);
+  assert.equal(codex.issue.code, "controlled_env_var");
+  assert.match(codex.message ?? "", /OPENAI_BASE_URL .*computer's own Codex config/);
+});
+
+test("a stored config that once carried a provider-owned env var re-submits unchanged", () => {
+  // Guards the premise the refusal relies on, not the refusal itself: configs
+  // saved before this check still hold the keys in storage, and reading strips
+  // them, so the edit form never sends them back.
+  const raw = {
+    ...legacy("claude", { model: "sonnet", provider: { apiUrl: "https://gw.example.test", apiKey: "sk-stored" } }),
+    envVars: { ANTHROPIC_BASE_URL: "https://old.example.test", ANTHROPIC_API_KEY: "sk-old", KEEP: "1" },
+  };
+  const parsed = parseRuntimeConfig({ runtimeConfig: raw });
+  assert.ok(parsed.ok);
+  const values = runtimeFormValuesFromRuntimeConfig(parsed.config);
+  assert.ok(values);
+  assert.deepEqual(values.envVars, { KEEP: "1" });
+  const resubmitted = submitted("claude", { ...values, apiKey: "" }, { editing: true, existing: parsed.config });
+  assert.deepEqual(resubmitted.envVars, { KEEP: "1" });
+});
+
+// ── Claude Custom provider: how the key is sent ──
+
+test("Custom with Bearer token stores authType and launches with ANTHROPIC_AUTH_TOKEN, not ANTHROPIC_API_KEY", () => {
+  const values = { provider: "custom", apiUrl: "https://gw.example.test", authType: "auth_token", apiKey: "tok", model: "sonnet" };
+  const config = submitted("claude", values);
+  assert.deepEqual(config.provider, { kind: "custom", apiUrl: "https://gw.example.test", apiKey: "tok", authType: "auth_token" });
+  const parsed = parseRuntimeConfig({ runtimeConfig: config });
+  assert.ok(parsed.ok);
+  const env = buildLaunchPlan(parsed.config).envVars ?? {};
+  assert.equal(env.ANTHROPIC_BASE_URL, "https://gw.example.test");
+  assert.equal(env.ANTHROPIC_AUTH_TOKEN, "tok");
+  assert.equal("ANTHROPIC_API_KEY" in env, false);
+  // Edit shows the stored choice; API key (absent or chosen) keeps today's shape.
+  assert.equal(runtimeFormValuesFromRuntimeConfig(parsed.config)?.authType, "auth_token");
+  assert.deepEqual(submitted("claude", { ...values, authType: "api_key" }).provider, { kind: "custom", apiUrl: "https://gw.example.test", apiKey: "tok" });
+  assert.deepEqual(submitted("claude", { ...values, authType: undefined }).provider, { kind: "custom", apiUrl: "https://gw.example.test", apiKey: "tok" });
+  const bad = buildRuntimeConfigFromFormValues("claude", { ...values, authType: "none" });
+  assert.ok(!bad.ok);
+  assert.deepEqual(bad.issue, { code: "select_valid_auth_type", pointer: "/formValues/authType" });
+});
+
+test("a Custom provider refuses ANTHROPIC_AUTH_TOKEN in Environment Variables; Default still passes it through", () => {
+  const custom = { provider: "custom", apiUrl: "https://gw.example.test", apiKey: "k", model: "sonnet", envVars: { ANTHROPIC_AUTH_TOKEN: "t" } };
+  const refused = buildRuntimeConfigFromFormValues("claude", custom);
+  assert.ok(!refused.ok);
+  assert.deepEqual(refused.issue, { code: "controlled_env_var", pointer: "/formValues/envVars" });
+  assert.match(refused.message ?? "", /Bearer token under Authentication/);
+  assert.deepEqual(submitted("claude", { provider: "default", model: "sonnet", envVars: { ANTHROPIC_AUTH_TOKEN: "t" } }).envVars, { ANTHROPIC_AUTH_TOKEN: "t" });
+});
+
+test("an older Computer reading a Bearer-token config still sees a complete custom provider", () => {
+  // Older hydration whitelists provider fields without authType: simulate by dropping it.
+  const config = submitted("claude", { provider: "custom", apiUrl: "https://gw.example.test", authType: "auth_token", apiKey: "tok", model: "sonnet" });
+  const { authType: _dropped, ...oldProvider } = config.provider as Record<string, unknown>;
+  const old = hydrateRuntimeConfig({ runtimeConfig: { ...config, provider: oldProvider } });
+  assert.deepEqual(old.provider, { kind: "custom", apiUrl: "https://gw.example.test", apiKey: "tok" });
+  // The current reader keeps it.
+  assert.equal((hydrateRuntimeConfig({ runtimeConfig: config }).provider as { authType?: string }).authType, "auth_token");
+});
+
+test("v1 writes keep a stored Bearer-token choice while the API URL is unchanged", () => {
+  const stored = submitted("claude", { provider: "custom", apiUrl: "https://gw.example.test", authType: "auth_token", apiKey: "tok", model: "sonnet" });
+  const parsed = parseRuntimeConfig({ runtimeConfig: stored });
+  assert.ok(parsed.ok);
+  const v1 = legacy("claude", { model: "opus", provider: { apiUrl: "https://gw.example.test/", apiKey: "tok" } }) as unknown as Record<string, unknown>;
+  const kept = retainOmittedClaudeAuthType(v1, parsed.config) as { provider: Record<string, unknown> };
+  assert.equal(kept.provider.authType, "auth_token");
+  const moved = { ...v1, provider: { kind: "custom", apiUrl: "https://other.example.test", apiKey: "tok" } };
+  assert.equal("authType" in (retainOmittedClaudeAuthType(moved, parsed.config) as { provider: Record<string, unknown> }).provider, false);
 });
 
 // ── Submit: the live model list ──

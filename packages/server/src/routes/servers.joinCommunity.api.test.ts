@@ -1,12 +1,14 @@
 import { fixturePasswordHash, tokenForHuman } from "../test/integration/credentials";
 import { createApiTest } from "../test/integration/apiTest";
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
+import { eq } from "drizzle-orm";
 
 import { getDb } from "../db/index";
-import { users } from "../db/schema";
+import { servers, subscriptions, users } from "../db/schema";
 import { createServer as createServerRecord } from "../services/serverService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 /**
  * Regression guard for `POST /api/servers/join-community`.
@@ -69,6 +71,43 @@ test("POST /servers/join-community joins the community server as a new member", 
 
   // joiner just to keep the linter from flagging it as unused data
   void joiner;
+});
+
+test("POST /servers/join-community on a full Pro server answers the seat code, not the head counts", async ({ app }) => {
+  const owner = await seedVerifiedUser("jc-full-owner@slock.test", "jc-full-owner");
+  const community = await createServerRecord("The Community", "community", owner.id);
+  // Billing applies to `free` plus a Pro subscription; one seat, which the owner takes.
+  await getDb().update(servers).set({ plan: "free" }).where(eq(servers.id, community.id));
+  await getDb().insert(subscriptions).values({
+    serverId: community.id,
+    plan: "pro",
+    provider: "stripe",
+    stripeCustomerId: `cus_${randomUUID()}`,
+    stripeSubscriptionId: `sub_${randomUUID()}`,
+    stripeProPackItemId: `si_pro_${randomUUID()}`,
+    status: "active",
+    provisionedHumanSeats: 1,
+    provisionedAgentSeats: 10,
+    proPackQuantity: 1,
+    currentPeriodStart: new Date(),
+    currentPeriodEnd: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
+    createdByUserId: owner.id,
+    updatedByUserId: owner.id,
+  });
+
+  await seedVerifiedUser("jc-full-joiner@slock.test", "jc-full-joiner");
+  const res = await fetch(`${app.baseUrl}/api/servers/join-community`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${await tokenForHuman("jc-full-joiner@slock.test")}`,
+    },
+  });
+  assert.equal(res.status, 403);
+  const body = await res.json() as { error: string; code?: string; capacityLimit?: unknown };
+  assert.match(body.error, /Seat limit reached/);
+  assert.equal(body.code, "human_seat_limit_reached");
+  assert.equal(body.capacityLimit, undefined, "someone joining isn't a member yet");
 });
 
 test("POST /servers/join-community can join the Chinese community slug", async ({ app }) => {

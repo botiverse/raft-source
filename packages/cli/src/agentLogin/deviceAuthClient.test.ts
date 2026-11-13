@@ -6,6 +6,7 @@ import {
   authorizeDeviceCode,
   DeviceCodeLoginError,
   describeDeviceCodeLoginError,
+  pollAgentKey,
   pollDeviceToken,
   runDeviceCodeLogin,
 } from "./deviceAuthClient";
@@ -124,10 +125,13 @@ test("runDeviceCodeLogin throws on device_login_disabled (authorize-side 404)", 
   );
 });
 
-test("authorizeDeviceCode returns the handle + absolutized verificationUriComplete", async () => {
-  const fakeFetch = (async (input: FetchInput) => {
+test("authorizeDeviceCode returns the handle + absolutized verificationUri, never a link with the code in it", async () => {
+  const bodies: unknown[] = [];
+  const fakeFetch = (async (input: FetchInput, init?: FetchInit) => {
     const url = typeof input === "string" ? input : String(input);
     if (url.endsWith("/api/auth/device/authorize")) {
+      bodies.push(JSON.parse(String(init?.body)));
+      // An older server still sends verification_uri_complete: ignored.
       return makeJsonResponse(201, {
         deviceCode: "dc-9",
         userCode: "WXYZ-7777",
@@ -145,14 +149,18 @@ test("authorizeDeviceCode returns the handle + absolutized verificationUriComple
     fetchImpl: fakeFetch,
   });
 
-  assert.equal(auth.deviceCode, "dc-9");
-  assert.equal(auth.userCode, "WXYZ-7777");
-  assert.equal(auth.verificationUri, "https://server.example.com/device");
-  assert.equal(auth.verificationUriComplete, "https://server.example.com/device?user_code=WXYZ-7777");
-  assert.equal(auth.intervalMs, 5000);
+  assert.deepEqual(auth, {
+    deviceCode: "dc-9",
+    userCode: "WXYZ-7777",
+    verificationUri: "https://server.example.com/device",
+    expiresInSeconds: 600,
+    intervalMs: 5000,
+  });
+  // The approval page names the program: the CLI's own name unless the caller gives one.
+  assert.deepEqual(bodies, [{ clientName: "raft-cli" }]);
 });
 
-test("runDeviceCodeLogin surfaces verificationUriComplete to onUserAction", async () => {
+test("runDeviceCodeLogin hands onUserAction the approval page and the code to type, not a pre-filled link", async () => {
   let polledOnce = false;
   const fakeFetch = (async (input: FetchInput) => {
     const url = typeof input === "string" ? input : String(input);
@@ -180,17 +188,17 @@ test("runDeviceCodeLogin surfaces verificationUriComplete to onUserAction", asyn
     throw new Error(`unexpected fetch: ${url}`);
   }) as unknown as UndiciFetch;
 
-  let seenComplete: string | undefined;
+  let seen: unknown;
   await runDeviceCodeLogin({
     serverUrl: "https://server.example.com",
     fetchImpl: fakeFetch,
     pollIntervalOverrideMs: 0,
-    onUserAction: ({ verificationUriComplete }) => {
-      seenComplete = verificationUriComplete;
+    onUserAction: (action) => {
+      seen = action;
     },
   });
 
-  assert.equal(seenComplete, "https://server.example.com/device?user_code=AAAA-1111");
+  assert.deepEqual(seen, { verificationUri: "https://server.example.com/device", userCode: "AAAA-1111", expiresInSeconds: 600 });
 });
 
 test("pollDeviceToken resumes polling with a device_code and returns the session", async () => {
@@ -237,4 +245,42 @@ test("pollDeviceToken throws expired_token once the deadline passes", async () =
       }),
     (err: unknown) => err instanceof DeviceCodeLoginError && err.code === "expired_token",
   );
+});
+
+test("authorizeDeviceCode sends an agent_key grant only when asked for one", async () => {
+  const bodies: Array<Record<string, unknown>> = [];
+  const fakeFetch = (async (_input: FetchInput, init?: FetchInit) => {
+    bodies.push(JSON.parse(String(init?.body)));
+    return makeJsonResponse(201, { deviceCode: "dc", userCode: "UC", verificationUri: "/login/device", expiresIn: 600, interval: 5 });
+  }) as unknown as UndiciFetch;
+  const grant = { kind: "agent_key" as const, machineName: "raft-cli", hostname: "host", os: "Linux", agentId: "11111111-2222-3333-4444-555555555555" };
+  await authorizeDeviceCode({ serverUrl: "https://server.example.com", grant, fetchImpl: fakeFetch });
+  await authorizeDeviceCode({ serverUrl: "https://server.example.com", fetchImpl: fakeFetch });
+  assert.deepEqual(bodies[0], { clientName: "raft-cli", grant });
+  assert.deepEqual(bodies[1], { clientName: "raft-cli" });
+});
+
+test("pollAgentKey returns the agent key, reads a session only from an older server's non-grant answer, and refuses anything else", async () => {
+  const poll = (body: unknown) => pollAgentKey({
+    serverUrl: "https://server.example.com",
+    deviceCode: "dc",
+    pollIntervalMs: 0,
+    deadlineMs: Date.now() + 60_000,
+    fetchImpl: (async () => makeJsonResponse(200, body)) as unknown as UndiciFetch,
+  });
+  const key = { credentialId: "cred-1", apiKey: "sk_agent_abc", scopes: ["read"], agentId: "agent-1", agentName: "Keyed", serverId: "server-1" };
+  assert.deepEqual(await poll({ kind: "agent_key", ...key }), { kind: "agent_key", credential: key });
+
+  const session = { accessToken: "a", refreshToken: "r", userId: "u" };
+  assert.deepEqual(await poll(session), { kind: "legacy_session", session });
+
+  for (const bad of [
+    { kind: "agent_key", ...key, apiKey: "not-a-key" },
+    { kind: "agent_key", ...key, serverId: undefined },
+    { kind: "agent_key", ...session },
+    { kind: "computer_attach", ...session },
+    {},
+  ]) {
+    await assert.rejects(poll(bad), (err: unknown) => err instanceof DeviceCodeLoginError && err.code === "token_response_invalid");
+  }
 });

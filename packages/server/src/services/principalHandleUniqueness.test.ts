@@ -8,7 +8,7 @@ import { agents, serverMembers, users } from "../db/schema";
 import { createAgent } from "./agentService";
 import { addMember, createServer } from "./serverService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 async function seedUser(email: string, name: string) {
   const db = getDb();

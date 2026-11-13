@@ -1,0 +1,33 @@
+{
+  "_comment": "Fixture comments for the fake data source (user content, not UI copy). A word @<handle> is a mention of that fake actor.",
+  "runbookText": "Staging deploy runbook: 1.0.48 candidate\n\n1. Freeze merges to staging in #proj-daemon-size.\n2. Build the daemon bundle with the release profile.\n3. Check the bundle is under 40 MB (1.0.47 was 51 MB).\n4. Upload the bundle to the staging bucket.\n5. Restart the staging computers one at a time.\n6. Watch the error rate for 15 minutes.\n7. If errors go up, roll back with the previous bundle.\n8. Post the result in #proj-daemon-size.\n\nOwner: Niko. Questions go in the comments.\n",
+  "comments": {
+    "bundle-weekly": "Can we get this every week? @niko",
+    "bundle-weekly-reply": "Yes. I'll publish a new version every Monday morning.",
+    "bundle-undici": "The undici row double-counts the shim.",
+    "bundle-compressed": "Is 12.4 MB measured on the compressed bundle?",
+    "bundle-compressed-reply": "Uncompressed. The compressed difference is 4.1 MB; it's in v4 now.",
+    "bundle-data": "These numbers come from the CI artifact of build 4812, not a local build.",
+    "bundle-ship": "Looks good to ship. @remy can you check the native part before Friday?",
+    "signups-events": "Events more than doubled. Was that the meetup?",
+    "signups-events-reply": "Yes, the Shanghai meetup on October 12.",
+    "signups-partners": "Partners is small but growing fastest; worth a line in the update.",
+    "runbook-size": "40 MB is the hard limit, right? @niko what happens at 41?",
+    "runbook-size-reply": "The upload step refuses it. I'll say so in step 3.",
+    "runbook-watch": "15 minutes feels short for the error rate.",
+    "runbook-old": "Step 9 should say who approves the rollback.",
+    "launch-date": "@xxchan can we move the date to October 7? The 1.0.48 daemon needs a week on staging.",
+    "launch-scope": "Do public Artifacts ship in 1.1, or only server ones? @xxchan",
+    "wireframe-rail": "@xxchan the rail entry is gone in this version. Is that on purpose?"
+  },
+  "anchors": {
+    "bundle-undici": {
+      "label": "Undici row",
+      "quote": "undici 2.8 MB 1.4 MB"
+    },
+    "bundle-compressed": {
+      "label": "Daemon bundle size: 1.0.48 candidate",
+      "quote": "12.4 MB smaller than 1.0.47"
+    }
+  }
+}

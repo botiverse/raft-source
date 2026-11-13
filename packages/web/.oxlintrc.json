@@ -6,12 +6,45 @@
   // report-only (no CI gate) per xxchan #proj-frontend:4d5df538.
   // Promotions / new rules land as follow-up PRs.
 
+  // raft-ui's recommended lint config: it loads @botiverse/raft-ui/lint (the
+  // design system's rules for app code) and turns every rule it has on as an
+  // error, so a rule a raft-ui upgrade adds reaches this app with the upgrade
+  // (https://raft-design.botiverse.build/about/use-raft-ui/#lint-rules). It
+  // sets "plugins": [] (raft-ui 0.77.1), so the "plugins" below stay exactly
+  // as listed. Task #proj-raft-ui:#209: every scrolling region is a ScrollArea.
+  // New native scrollers fail `raft-ui/prefer-scroll-area`; an exception (one
+  // raft-design allows, or one docs/frontend/scroll-areas.md lists) carries a
+  // `// raft-ui: native-scroll <reason>` comment. The scrollers that predate
+  // the rule are suppressed one by one and counted by
+  // scripts/check-scroll-area-debt.ts, a ratchet chained into `lint` that also
+  // fails if this config turns the rule down.
+  "extends": ["./node_modules/@botiverse/raft-ui/dist/lint/recommended.json"],
+
   "jsPlugins": [
-    { "name": "react-doctor", "specifier": "oxlint-plugin-react-doctor" }
+    { "name": "react-doctor", "specifier": "oxlint-plugin-react-doctor" },
+    "./scripts/oxlint-plugins/raft-test/index.ts"
   ],
   "plugins": ["typescript", "import", "react", "react-perf"],
 
+  // Feature tests (src/features/<feature>/tests/) are test code: the `lint`
+  // script lints them with scripts/oxlint-tests.json, as it does tests/.
+  "ignorePatterns": ["src/features/*/tests/**"],
+
   "rules": {
+    // A DOM node handed to assert.equal/deepEqual/... makes node:assert build a
+    // multi-GiB diff off the V8 heap when the assertion fails. Tests are
+    // linted with scripts/oxlint-tests.json, which carries the same rule; it is
+    // here too so editors flag it and so src/ helpers can't slip one in.
+    "raft-test/no-dom-node-in-assert": "error",
+
+    // #proj-raft-ui:#218 step 2: every z-index is a named layer of raft-ui's
+    // scale (z-below … z-drag; design/foundations/elevation.md#layer-order).
+    // A Tailwind z class with a number or arbitrary value, a numeric `zIndex`
+    // and `el.style.zIndex = n` fail. A number kept on purpose carries a
+    // `// raft-ui: z-index <reason>` comment on the line above. raft-ui ships
+    // the rule "off" in recommended.json until its apps have moved; slock has.
+    "raft-ui/no-raw-z-index": "error",
+
     // Task #709 (Artea): no new function/object/array identities as JSX props
     // on components (native DOM elements are exempt), and complete hook deps.
     // No inline disables: hoist, memoise, or split into a child component.
@@ -255,11 +288,10 @@
     "react-doctor/rerender-memo-before-early-return": "off",
 
     // Fires on Vite/React Fast Refresh boundaries that mix component
-    // exports with hook / util exports. The rule is a dev-time HMR
-    // hygiene check, not a runtime concern; the production bundle is
-    // unaffected. Fixing it requires splitting many small modules,
-    // which we don't want to absorb during the lint bootstrap.
-    // Revisit: if we ever see actual HMR breakage trace to this.
+    // exports with hook / util exports. Off here because --max-warnings=0
+    // can't ratchet: scripts/check-module-shape.ts (chained into `lint`)
+    // counts these files against scripts/module-shape-baseline/, and
+    // the count may only go down (Artea, #proj-frontend:22900a50).
     "react-doctor/only-export-components": "off",
 
     // Mechanical "add type=button to every <button>" sweep. ESLint

@@ -9,6 +9,7 @@ const PACKAGE_SRC_ROOT = path.join(REPO_ROOT, "packages");
 const APPROVED_SDK_ADAPTERS = new Set([
   "packages/server/src/services/productEventScopeDbWriter.ts",
   "packages/server/src/tracing/scopeDbTraceEventSink.ts",
+  "packages/server/src/tracing/traceExportSummary.ts",
   "packages/trace-upload-worker/src/traces/traceEventProjector.ts",
 ]);
 
@@ -28,7 +29,7 @@ async function productionSourceFiles(root: string): Promise<string[]> {
   return files;
 }
 
-test("ScopeDB SDK calls stay inside classified adapters with no buffered path", async () => {
+test("ScopeDB SDK calls stay inside classified adapters and write only through Append", async () => {
   const violations: string[] = [];
   for (const file of await productionSourceFiles(PACKAGE_SRC_ROOT)) {
     const source = await readFile(file, "utf8");
@@ -38,14 +39,26 @@ test("ScopeDB SDK calls stay inside classified adapters with no buffered path", 
     if (importsScopeDb && !APPROVED_SDK_ADAPTERS.has(relative)) {
       violations.push(`${relative}: direct scopedb import is not an approved adapter`);
     }
-    if (/\.ingest\s*\(\s*\{[\s\S]{0,300}?type\s*:\s*["']buffered["']/.test(source)) {
-      violations.push(`${relative}: buffered ingest has no production exception`);
+    // scopedb 0.3 removed legacy POST /v1/ingest (insert/ingest/ingestStream);
+    // writes go through Table.append()/appendStream() with rows already
+    // encoded for their column types (encodeScopeDbAppendLine).
+    if (/\bingestStream\s*\(|\bIngestStream(?:Builder)?\b/.test(source)) {
+      violations.push(`${relative}: legacy ScopeDB ingest stream; use table(...).appendStream()`);
     }
-    if (/ingestStream\s*\(/.test(source) && relative.includes("/routes/")) {
-      violations.push(`${relative}: request handlers must not own an ingest stream`);
+    if (importsScopeDb && /\.(?:insert|ingest)\s*\(/.test(source)) {
+      violations.push(`${relative}: legacy ScopeDB insert/ingest; use table(...).append()`);
     }
-    if (importsScopeDb && /\.(?:intoObjects|intoValues|first)\s*\(/.test(source)) {
-      const conversions = source.match(/\.(?:intoObjects|intoValues|first)\s*\([^)]*\)/gs) ?? [];
+    if (/["'`][^"'`\n]*\/v1\/ingest\b/.test(source)) {
+      violations.push(`${relative}: legacy ScopeDB /v1/ingest endpoint`);
+    }
+    if (/appendStream\s*\(/.test(source) && relative.includes("/routes/")) {
+      violations.push(`${relative}: request handlers must not own an append stream`);
+    }
+    if (importsScopeDb && /\.(?:intoObjects|intoValues|jsonRows)\s*\(/.test(source)) {
+      violations.push(`${relative}: scopedb 0.2 result conversion; use toObjects/toValues/rawRows`);
+    }
+    if (importsScopeDb && /\.(?:toObjects|toValues|first)\s*\(/.test(source)) {
+      const conversions = source.match(/\.(?:toObjects|toValues|first)\s*\([^)]*\)/gs) ?? [];
       for (const conversion of conversions) {
         if (!/integerMode\s*:/.test(conversion)) {
           violations.push(`${relative}: ScopeDB read conversion lacks explicit integerMode`);
@@ -57,67 +70,38 @@ test("ScopeDB SDK calls stay inside classified adapters with no buffered path", 
   assert.deepEqual(violations, []);
 });
 
-test("approved ScopeDB adapters declare their decision-support tier", async () => {
-  const [productEventWriter, traceSink, traceProjector] = await Promise.all([
-    readFile(path.join(REPO_ROOT, "packages/server/src/services/productEventScopeDbWriter.ts"), "utf8"),
-    readFile(path.join(REPO_ROOT, "packages/server/src/tracing/scopeDbTraceEventSink.ts"), "utf8"),
-    readFile(path.join(REPO_ROOT, "packages/trace-upload-worker/src/traces/traceEventProjector.ts"), "utf8"),
-  ]);
+async function decodedBody(init: RequestInit | undefined): Promise<string> {
+  const body = init?.body;
+  const encoded = body instanceof ArrayBuffer ? body : await new Response(body as BodyInit).arrayBuffer();
+  if (new Headers(init?.headers).get("content-encoding") !== "gzip") return new TextDecoder().decode(encoded);
+  const stream = new Blob([encoded]).stream().pipeThrough(new DecompressionStream("gzip"));
+  return new Response(stream).text();
+}
 
-  assert.match(productEventWriter, /PRODUCT_EVENTS_SCOPEDB_PERSISTENCE_TIER[^=]*= "decision_support"/);
-  assert.match(traceSink, /TRACE_EVENT_SCOPEDB_PERSISTENCE_TIER[^=]*= "decision_support"/);
-  assert.match(traceProjector, /TRACE_UPLOAD_SCOPEDB_PERSISTENCE_TIER[^=]*= "decision_support"/);
-});
-
-test("approved ScopeDB adapters use the non-deprecated apiKey client option", async () => {
-  for (const relative of APPROVED_SDK_ADAPTERS) {
-    const source = await readFile(path.join(REPO_ROOT, relative), "utf8");
-    assert.match(
-      source,
-      /new\s+Client\([^\n]+\{\s*apiKey\s*:/,
-      `${relative}: ScopeDB Client must authenticate with apiKey`,
-    );
-    assert.doesNotMatch(
-      source,
-      /new\s+Client\([^\n]+\{\s*token\s*:/,
-      `${relative}: deprecated ScopeDB Client token option must not return`,
-    );
-  }
-});
-
-test("ScopeDB 0.2 apiKey reaches the committed-ingest request boundary", async () => {
-  let observedUrl = "";
-  let observedInit: RequestInit | undefined;
+test("ScopeDB 0.4 Append reaches the table append endpoint with Bearer auth, never /v1/ingest", async () => {
+  const observed: Array<{ url: string; init?: RequestInit }> = [];
   const client = new Client("https://scope.example/base", {
     apiKey: "test-write-key",
     fetch: async (input, init) => {
-      observedUrl = String(input);
-      observedInit = init;
-      return new Response(JSON.stringify({ num_rows_inserted: 1 }), {
+      observed.push({ url: String(input), init });
+      return new Response(JSON.stringify({ status: "committed", num_rows_inserted: 1 }), {
         status: 200,
         headers: { "content-type": "application/json" },
       });
     },
   });
 
-  const result = await client.insert('{"event_kind":"test"}', "INTO raft.agent_events");
+  const result = await client.table("trace_events_v2", { schema: "raft" }).append('{"row_kind":"event"}');
 
-  assert.deepEqual(result, { num_rows_inserted: 1 });
-  assert.equal(observedUrl, "https://scope.example/base/v1/ingest");
-  assert.equal(observedInit?.method, "POST");
-  assert.equal(new Headers(observedInit?.headers).get("authorization"), "Bearer test-write-key");
-  const body = observedInit?.body;
-  const encoded = body instanceof ArrayBuffer ? body : await new Response(body as BodyInit).arrayBuffer();
-  const contentEncoding = new Headers(observedInit?.headers).get("content-encoding");
-  const decoded = contentEncoding === "gzip"
-    ? await new Response(encoded).arrayBuffer().then(async (bytes) => {
-        const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream("gzip"));
-        return new Response(stream).text();
-      })
-    : new TextDecoder().decode(encoded);
-  assert.deepEqual(JSON.parse(decoded), {
-    type: "committed",
-    data: { format: "json", rows: '{"event_kind":"test"}' },
-    statement: "INTO raft.agent_events",
-  });
+  assert.deepEqual(result, { status: "succeeded", num_rows_inserted: 1 });
+  assert.equal(observed.length, 1);
+  const [{ url, init }] = observed as [{ url: string; init?: RequestInit }];
+  assert.equal(url, "https://scope.example/base/v1/catalog/databases/scopedb/schemas/raft/tables/trace_events_v2/ingest");
+  assert.equal(url.includes("/v1/ingest"), false);
+  assert.equal(init?.method, "POST");
+  const headers = new Headers(init?.headers);
+  assert.equal(headers.get("authorization"), "Bearer test-write-key");
+  assert.equal(headers.get("content-type"), "application/x-ndjson");
+  // The body is the NDJSON itself: no statement, no {type, data} envelope.
+  assert.equal(await decodedBody(init), '{"row_kind":"event"}');
 });

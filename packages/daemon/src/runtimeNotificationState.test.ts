@@ -184,3 +184,13 @@ test("failed encode memo suppresses only identical failed attempts in the same s
   state.clear();
   assert.equal(state.isDuplicateEncodeFailedNotice(fp, "sess-1"), false, "fresh launch must not inherit failed-attempt memo");
 });
+
+test("a contribution mark separates what was told before it from what was told after", () => {
+  const state = new RuntimeNotificationState();
+  state.recordNoticeWritten("fp-1", "session-1", [{ seq: 1 }]);
+  const mark = state.contributionMark();
+  state.recordNoticeWritten("fp-2", "session-1", [{ seq: 1 }, { seq: 2 }]);
+  assert.equal(state.hasContributedMessage({ seq: 1 }, "session-1", mark), true, "told before the mark (telling it again keeps its first time)");
+  assert.equal(state.hasContributedMessage({ seq: 2 }, "session-1", mark), false, "told only after the mark");
+  assert.equal(state.hasContributedMessage({ seq: 2 }, "session-1"), true, "without a mark, told is told");
+});

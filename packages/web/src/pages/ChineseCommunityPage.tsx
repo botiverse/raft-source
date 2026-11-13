@@ -1,7 +1,10 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useIntl } from "react-intl";
-import { Card } from "@botiverse/raft-ui";
+import { useLocation, useNavigate } from "react-router-dom";
+import { Card, ScrollArea } from "@botiverse/raft-ui";
 import { trackEvent } from "../analytics/track";
+import CloseButton from "../components/ui/CloseButton";
+import { useHistoryStep } from "../components/topbar/historyNavigation";
 import {
   CHINESE_COMMUNITY_QR_FALLBACK_CONFIG_PATH,
   getChineseCommunityQrConfigUrl,
@@ -39,13 +42,13 @@ async function fetchConfig(url: string) {
 
 export default function ChineseCommunityPage() {
   const { formatMessage } = useIntl();
+  const location = useLocation();
+  const navigate = useNavigate();
+  const stepHistory = useHistoryStep();
   const [state, setState] = useState<QrState>({ status: "loading" });
   const [failedImageUrl, setFailedImageUrl] = useState<string | null>(null);
   const configUrl = useMemo(() => getChineseCommunityQrConfigUrl(), []);
-  const from = useMemo(() => {
-    if (typeof window === "undefined") return "";
-    return new URLSearchParams(window.location.search).get("from") || "direct";
-  }, []);
+  const from = useMemo(() => new URLSearchParams(location.search).get("from") || "direct", [location.search]);
 
   useBrowserDocumentTitle(formatMessage({ id: "pages.chineseCommunity.title" }));
 
@@ -81,10 +84,20 @@ export default function ChineseCommunityPage() {
   const imageLoadFailed = Boolean(config && failedImageUrl === config.imageUrl);
   const showQrImage = Boolean(config && !expired && !imageLoadFailed);
   const unavailableMessageId = qrUnavailableMessageId(state, expired, imageLoadFailed);
+  const closePage = useCallback(() => {
+    if (!stepHistory("back")) void navigate("/", { replace: true });
+  }, [navigate, stepHistory]);
 
   return (
-    <main className="h-dvh overflow-hidden bg-layer-sidebar px-4 font-display text-foreground safe-top safe-bottom">
-      <div className="mx-auto flex h-full w-full max-w-sm flex-col items-center justify-center gap-5 text-center">
+    // The page scrolls in a raft-ui ScrollArea (the <main>); its gutters layer is a
+    // zero-height first row of the column, so the sticky close row stays on top.
+    <ScrollArea render={<main />} className="flex h-dvh flex-col bg-layer-sidebar px-4 font-display text-foreground safe-top safe-bottom">
+      <div className="sticky top-0 z-chrome flex shrink-0 justify-end bg-layer-sidebar">
+        <div className="p-4">
+          <CloseButton onClick={closePage} data-testid="chinese-community-close" />
+        </div>
+      </div>
+      <div className="mx-auto my-auto flex w-full max-w-sm shrink-0 flex-col items-center gap-5 py-6 text-center">
         <h1 className="text-title sm:text-display">
           {formatMessage({ id: "pages.chineseCommunity.title" })}
         </h1>
@@ -94,7 +107,7 @@ export default function ChineseCommunityPage() {
           render={<section />}
           className="w-full max-w-[20rem] shrink-0 p-3 sm:p-4"
         >
-          <div className="mx-auto grid aspect-square w-full place-items-center overflow-hidden rounded-control border border-line-hairline bg-layer-canvas">
+          <div className="relative mx-auto grid aspect-square w-full place-items-center overflow-hidden rounded-control border border-line-hairline bg-layer-canvas">
             {state.status === "loading" ? (
               <div
                 data-testid="chinese-community-qr-loading"
@@ -115,7 +128,7 @@ export default function ChineseCommunityPage() {
                   setFailedImageUrl(config.imageUrl);
                 }}
                 data-testid="chinese-community-qr-image"
-                className="size-full object-contain [image-rendering:pixelated]"
+                className="absolute inset-0 size-full object-contain [image-rendering:pixelated]"
               />
             ) : (
               <div
@@ -129,6 +142,6 @@ export default function ChineseCommunityPage() {
           </div>
         </Card>
       </div>
-    </main>
+    </ScrollArea>
   );
 }

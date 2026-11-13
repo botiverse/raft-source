@@ -26,6 +26,7 @@ export function InlineBadgeMenuItem({
       role="button"
       onClick={handleClick}
       data-testid={testId}
+      data-current={selected || undefined}
       icon={option.avatar}
       trailing={<Check size={16} aria-hidden="true" className={`shrink-0 text-foreground ${selected ? "opacity-100" : "opacity-0"}`} />}
     >

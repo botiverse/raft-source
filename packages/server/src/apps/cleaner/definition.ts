@@ -22,6 +22,7 @@
 import {
   CLEANER_APP_ID,
   CLEANER_CONFIG_CANONICAL,
+  CLEANER_BACKUP_IGNORE_NOTIFICATION_CLASS,
   CLEANER_DISK_NOTIFICATION_CLASS,
 } from "@botiverse/raft-shared/src/apps/cleaner/configProtocol";
 
@@ -34,12 +35,15 @@ export const BUILT_IN_MEMORY_HINT_EVENT_KIND = "memory_size_hint" as const;
 
 export const BUILT_IN_MEMORY_CLEANER_APP = {
   appId: CLEANER_APP_ID as AppId,
-  composerReference: { displayName: "Memory Cleaner" },
   manifest: {
     app_id: CLEANER_APP_ID as AppId,
     hooks: [],
     syscalls: [],
-    notifications: [BUILT_IN_MEMORY_HINT_EVENT_KIND, CLEANER_DISK_NOTIFICATION_CLASS],
+    notifications: [
+      BUILT_IN_MEMORY_HINT_EVENT_KIND,
+      CLEANER_DISK_NOTIFICATION_CLASS,
+      CLEANER_BACKUP_IGNORE_NOTIFICATION_CLASS,
+    ],
     config: {
       enabled: {
         type: "boolean",

@@ -4,7 +4,6 @@ import {
   createServerLabMasterMutation,
   getServerLabEnrollmentDisabledReasonMessageId,
   getServerLabSettingsAuthority,
-  getServerLabStateMessageId,
   isServerLabEffectivelyEnabled,
   isServerLabEnrollmentEditable,
   normalizeServerLabSettingsReadback,
@@ -107,13 +106,6 @@ test("server Labs mutations carry serverLabVersion and do not invent local versi
     enabled: false,
     expectedVersion: 17,
   });
-});
-
-test("server Labs state labels are stable for settings badges", () => {
-  assert.equal(getServerLabStateMessageId("draft"), "settings.labs.stateDraft");
-  assert.equal(getServerLabStateMessageId("open"), "settings.labs.stateOpen");
-  assert.equal(getServerLabStateMessageId("paused"), "settings.labs.statePaused");
-  assert.equal(getServerLabStateMessageId("retired"), "settings.labs.stateRetired");
 });
 
 test("server Labs settings normalizes canonical API readback", () => {

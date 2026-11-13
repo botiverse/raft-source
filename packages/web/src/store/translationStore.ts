@@ -9,21 +9,22 @@ import {
   normalizeTimeFormatPreference,
   normalizeTranslationLanguageCode,
   SUPPORTED_TRANSLATION_LANGUAGES,
+  translationLanguageName,
 } from "@botiverse/raft-shared";
 import type {
   TimeFormatPreference,
 } from "@botiverse/raft-shared";
 import { detectBrowserTimeFormat, detectBrowserTimezone } from "../utils/timeFormatting";
-import { DEFAULT_LOCALE, getStoredLocale } from "../i18n/locale";
-import { mergedMessages } from "../i18n/messages";
+import { DEFAULT_LOCALE, resolveInitialLocale } from "../i18n/locale";
+import type { Locale } from "../i18n/locale";
+import { shownLocaleMessages } from "../i18n/messages";
 
 const translationIntlCache = createIntlCache();
 
 function formatTranslationSettingsLoadFailed(): string {
-  const locale = getStoredLocale(typeof localStorage === "undefined" ? undefined : localStorage)
-    ?? DEFAULT_LOCALE;
+  const { locale, messages } = shownLocaleMessages();
   return createIntl(
-    { locale, defaultLocale: DEFAULT_LOCALE, messages: mergedMessages(locale) },
+    { locale, defaultLocale: DEFAULT_LOCALE, messages },
     translationIntlCache,
   ).formatMessage({ id: "settings.translation.loadFailed" });
 }
@@ -98,17 +99,30 @@ interface TranslationState {
   requestTranslations: (messages: Message[], options: { targetLanguage: string; viewerUserId?: string | null; force?: boolean }) => Promise<void>;
   retryMessage: (message: Message, options: { targetLanguage: string; viewerUserId?: string | null }) => Promise<void>;
   setShowOriginal: (messageId: string, showOriginal: boolean) => void;
+  /** The display language changed: the no-preference translation target follows it. */
+  followDisplayLanguage: (locale: Locale) => void;
 }
 
 const PENDING_TIMEOUT_MS = 30_000;
 const PUBLIC_TRANSLATION_PREFERENCES_KEY = "raft:public-translation-preferences:v1";
-const BROWSER_TRANSLATION_TARGET = "browser";
-const FALLBACK_TRANSLATION_TARGET_LANGUAGE = "en";
-/** Static option values (labels are formatted at the call site). */
-export const TRANSLATION_LANGUAGE_OPTIONS = [
-  { value: BROWSER_TRANSLATION_TARGET, labelId: "settings.language.browserLanguage" as const },
-  ...SUPPORTED_TRANSLATION_LANGUAGES,
-];
+/**
+ * The translation-target choice that stores no preference: translate into the
+ * display language. Every display locale is a translation language (shared
+ * test), so the display locale's code is the target.
+ */
+export const FOLLOW_DISPLAY_LANGUAGE_TARGET = "display";
+// Stored by older builds as the same no-preference choice.
+const LEGACY_BROWSER_TRANSLATION_TARGET = "browser";
+
+// The display locale the no-preference target follows. Seeded like
+// LocaleProvider's first render; App keeps it current (followDisplayLanguage).
+let displayLanguageTarget: Locale = typeof window === "undefined"
+  ? DEFAULT_LOCALE
+  : resolveInitialLocale({
+    storage: window.localStorage,
+    languages: window.navigator?.languages,
+    search: window.location?.search,
+  });
 
 const COMMON_TIMEZONE_IDS = [
   "UTC",
@@ -181,20 +195,27 @@ function formatUtcOffset(minutes: number) {
   return `UTC${sign}${hours}:${mins}`;
 }
 
-export function formatTimezoneLabel(timezone: string) {
-  return `${formatUtcOffset(getTimezoneOffsetMinutes(timezone))} ${timezone}`;
-}
+/** "UTC+08:00 Shanghai": the offset, then the zone's city with spaces (Jasper, #triage:c95a5e53); a zone without a region (UTC) keeps its id. */
+export const formatTimezoneLabel = (timezone: string) =>
+  `${formatUtcOffset(getTimezoneOffsetMinutes(timezone))} ${timezone.slice(timezone.lastIndexOf("/") + 1).replaceAll("_", " ")}`;
 
+/**
+ * Translation-target options for a reader whose UI language is `uiLocaleTag`:
+ * "same as display language" first, then every language named in the UI
+ * language and sorted the way that language sorts.
+ */
 export function getTranslationLanguageOptions(
-  effectiveLanguage: string | null | undefined,
+  uiLocaleTag: string,
   formatMessage: IntlShape["formatMessage"],
 ) {
-  void effectiveLanguage;
-  return TRANSLATION_LANGUAGE_OPTIONS.map((option) =>
-    "labelId" in option
-      ? { value: option.value, label: formatMessage({ id: option.labelId }) }
-      : { value: option.value, label: option.label },
-  );
+  const collator = new Intl.Collator(uiLocaleTag);
+  const languages = SUPPORTED_TRANSLATION_LANGUAGES
+    .map(({ value }) => ({ value, label: translationLanguageName(value, uiLocaleTag) }))
+    .sort((a, b) => collator.compare(a.label, b.label));
+  return [
+    { value: FOLLOW_DISPLAY_LANGUAGE_TARGET, label: formatMessage({ id: "settings.language.followDisplayLanguage" }) },
+    ...languages,
+  ];
 }
 
 export function getTimezoneOptions(
@@ -226,7 +247,7 @@ function normalizeTimezone(timezone: string | null | undefined): string | null {
 }
 
 function normalizePreferredTranslationLanguage(language: string | null | undefined): string | null {
-  if (language === BROWSER_TRANSLATION_TARGET) return null;
+  if (language === FOLLOW_DISPLAY_LANGUAGE_TARGET || language === LEGACY_BROWSER_TRANSLATION_TARGET) return null;
   return normalizeTranslationLanguageCode(language);
 }
 
@@ -242,19 +263,6 @@ function normalizePreferredTranslationDisplay(display: unknown): PreferredTransl
   return display === "original" ? "original" : "translated";
 }
 
-export function detectBrowserLanguage(): string | null {
-  if (typeof navigator === "undefined") return null;
-  const languages = [
-    ...(Array.isArray(navigator.languages) ? navigator.languages : []),
-    navigator.language,
-  ];
-  for (const language of languages) {
-    const normalized = normalizeTranslationLanguageCode(language);
-    if (normalized) return normalized;
-  }
-  return null;
-}
-
 function normalizeSettings(data: any): TranslationSettings {
   const preferredLanguage = normalizePreferredTranslationLanguage(data?.preferredLanguage ?? data?.targetLanguage ?? null);
   const preferredTranslationMode = normalizePreferredTranslationMode(
@@ -267,7 +275,7 @@ function normalizeSettings(data: any): TranslationSettings {
   const providerAvailable = data?.providerAvailable ?? data?.translationAvailable ?? data?.available ?? true;
   return {
     preferredLanguage,
-    effectiveLanguage: preferredLanguage ?? detectBrowserLanguage() ?? FALLBACK_TRANSLATION_TARGET_LANGUAGE,
+    effectiveLanguage: preferredLanguage ?? displayLanguageTarget,
     preferredTimezone,
     effectiveTimezone: preferredTimezone ?? detectBrowserTimezone(),
     autoTranslationEnabled: preferredTranslationMode === "auto",
@@ -383,7 +391,7 @@ export const useTranslationStore = create<TranslationState>((set, get) => ({
   entries: {},
   settings: {
     preferredLanguage: null,
-    effectiveLanguage: detectBrowserLanguage() ?? FALLBACK_TRANSLATION_TARGET_LANGUAGE,
+    effectiveLanguage: displayLanguageTarget,
     preferredTimezone: null,
     effectiveTimezone: detectBrowserTimezone(),
     autoTranslationEnabled: false,
@@ -705,7 +713,8 @@ export const useTranslationStore = create<TranslationState>((set, get) => ({
 
   updateServerTranslationEnabled: async (enabled) => {
     const serverId = get().settingsServerId;
-    if (!serverId) return;
+    // No server settings loaded: nothing is stored, so the caller must not say "Saved".
+    if (!serverId) throw new Error("No server translation settings to update");
 
     const previous = get().settings.serverTranslationEnabled;
     set((state) => ({
@@ -919,5 +928,14 @@ export const useTranslationStore = create<TranslationState>((set, get) => ({
         },
       };
     });
+  },
+
+  followDisplayLanguage: (locale) => {
+    displayLanguageTarget = locale;
+    set((state) => (
+      state.settings.preferredLanguage !== null || state.settings.effectiveLanguage === locale
+        ? state
+        : { settings: { ...state.settings, effectiveLanguage: locale } }
+    ));
   },
 }));

@@ -23,6 +23,8 @@ import {
   type AttachReason,
   type PassiveTouch,
 } from "./passiveEngine";
+import { countRendered } from "./renderCounts";
+import { cliTraceRuntime, emitCliTraceSpan } from "../transportTrace";
 
 /** Longest guidance a command may carry: it is printed on held and attached runs. */
 export const MAX_GUIDANCE_LINES = 12;
@@ -66,6 +68,38 @@ function touchFor(path: string, guidance: string): PassiveTouch {
   return { type: "command.guidance", id: path, rev: guidanceRev(guidance) };
 }
 
+/**
+ * One span per run of a command that carries guidance, wherever passive AX is
+ * on (#wg-ax:#25): whether it was held, attached or passed, the command, a
+ * hash of its arguments, and the context, the one the decision used. A held
+ * run followed by the next run in the same context shows whether the hold
+ * changed what the agent did (same hash) or not. Tracing never affects the
+ * command: any failure here is dropped.
+ */
+function traceGuidanceDecision(
+  path: string,
+  decision: ReturnType<typeof decidePassiveDelivery>,
+  agentId: string | undefined,
+  argsHash: string | undefined,
+  env: NodeJS.ProcessEnv,
+): void {
+  try {
+    if (!agentId || !decision.contextId) return;
+    emitCliTraceSpan("cli.guidance.decision", {
+      producer: "cli",
+      command: path,
+      decision: decision.deliver,
+      reason: decision.deliver === "attach" ? decision.reason : undefined,
+      args_hash: argsHash,
+      context_id: decision.contextId,
+      runtime: cliTraceRuntime(env),
+      agentId,
+    }, { status: "ok", kind: "internal" }, env);
+  } catch {
+    // Tracing must never affect the command.
+  }
+}
+
 /** `--help`: always the full guidance, before Usage; recorded once flushed. */
 export function attachGuidanceToHelp(
   command: Command,
@@ -106,21 +140,30 @@ export function gateCommandGuidance(
   guidance: string,
   stdout: Stdout,
   env: NodeJS.ProcessEnv = process.env,
+  /** A hash of this run's arguments, so a held run and the run after it can be compared (same or changed). */
+  argsHash?: string,
 ): "execute" | "held" {
   const agentId = passiveAgentId(env);
   const touch = touchFor(path, guidance);
   const decision = decidePassiveDelivery(agentId, touch, env);
+  traceGuidanceDecision(path, decision, agentId, argsHash, env);
   switch (decision.deliver) {
     case "pass":
       return "execute";
-    case "attach":
-      stdout.write(`${ATTACH_HEADERS[decision.reason]}\n${guidance}\n\n`);
+    case "attach": {
+      const text = `${ATTACH_HEADERS[decision.reason]}\n${guidance}\n\n`;
+      stdout.write(text);
+      countRendered(agentId, "command_guidance", text, env);
       return "execute";
-    case "hold":
-      stdout.write(`${GUIDANCE_HOLD_HEADER}\n\n${guidance}\n\nEquivalent: raft ${path} --help\n`);
+    }
+    case "hold": {
+      const text = `${GUIDANCE_HOLD_HEADER}\n\n${guidance}\n\nEquivalent: raft ${path} --help\n`;
+      stdout.write(text);
+      countRendered(agentId, "command_guidance", text, env);
       stdout.write("", (error?: Error | null) => {
         if (!error) confirmPassiveDelivery(agentId, touch, decision.contextId, env);
       });
       return "held";
+    }
   }
 }

@@ -1,5 +1,5 @@
 import { useCallback, useState } from "react";
-import { Input, Button, TextSans } from "@botiverse/raft-ui";
+import { Input, Button, TextSans, TextLink } from "@botiverse/raft-ui";
 import type { ChangeEvent, FormEvent } from "react";
 import { useIntl } from "react-intl";
 import { useAuthStore } from "../../store/authStore";
@@ -7,7 +7,6 @@ import { ArrowLeft } from "lucide-react";
 import AuthPageFrame, { AuthPageIntro } from "./AuthPageFrame";
 import Banner from "../ui/Banner";
 import FormField from "../ui/FormField";
-import TextLink from "../ui/TextLink";
 import { AUTH_MESSAGE_IDS, authServerErrorMessage } from "./authErrors";
 
 interface ResetPasswordPageProps {
@@ -96,7 +95,9 @@ export default function ResetPasswordPage({ token, onBack }: ResetPasswordPagePr
           <Banner intent="warning" className="mb-4">{error}</Banner>
         )}
 
-        <form onSubmit={handleSubmit} className="space-y-4" noValidate>
+        <Banner intent="info" className="mb-4">{formatMessage({ id: "pages.resetPassword.deviceLoginNotice" })}</Banner>
+
+        <form onSubmit={handleSubmit} className="stack-y-4 md:pointer-fine:stack-y-3" noValidate>
           <FormField label={formatMessage({ id: "pages.resetPassword.newPasswordLabel" })} error={fieldErrors.password}>
             <Input
               type="password"
@@ -130,7 +131,7 @@ export default function ResetPasswordPage({ token, onBack }: ResetPasswordPagePr
         </form>
 
         <TextSans size="small" className="mt-4 text-center">
-          <TextLink variant="primary" onClick={onBack}>
+          <TextLink onClick={onBack}>
             {formatMessage({ id: "auth.backToSignIn.link" })}
           </TextLink>
         </TextSans>

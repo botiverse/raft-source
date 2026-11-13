@@ -159,3 +159,37 @@ test("remove-member command requires exactly one member selector", async () => {
     },
   );
 });
+
+test("remove-member: a private channel's last member is refused with the --delete-if-last command; with the flag it sends deleteIfLast and says the channel went", async () => {
+  const { io, stdout } = memoryIo();
+  const requests: Array<{ method: string; path: string; body: unknown }> = [];
+  const ctx = createCommandContext({
+    io,
+    loadAgentContext: () => agentContext,
+    createApiClient: () => ({
+      request: async (method: string, path: string, body: unknown): Promise<ApiResponse<unknown>> => {
+        requests.push({ method, path, body });
+        if (method === "GET") return { ok: true, status: 200, error: null, data: serverInfoData };
+        if ((body as { deleteIfLast?: boolean }).deleteIfLast !== true) {
+          return { ok: false, status: 409, data: null, error: "…", errorCode: "last_member_deletes_channel", suggestedNextAction: "(the Server's)" };
+        }
+        return { ok: true, status: 200, error: null, data: { ok: true, wasMember: true, channelId: "channel-1", member: { type: "agent", id: "agent-1", name: "helper" }, channelDeleted: true } };
+      },
+    }) as any,
+  });
+
+  await assert.rejects(
+    async () => { await channelRemoveMemberCommand.handler(ctx, { target: "#engineering", agent: "@helper" }); },
+    (err: unknown) => {
+      assert.ok(err instanceof CliError);
+      assert.equal(err.code, "LAST_MEMBER");
+      assert.equal(err.message, "@helper is the last member of #engineering, a private channel: removing them would delete the channel and all its messages, and that can't be undone. Nothing changed.");
+      assert.equal(err.suggestedNextAction, `Only if the channel and all its messages should go: raft channel remove-member --target "#engineering" --agent @helper --delete-if-last. Otherwise leave them in it.`);
+      return true;
+    },
+  );
+
+  await channelRemoveMemberCommand.handler(ctx, { target: "#engineering", agent: "@helper", deleteIfLast: true });
+  assert.deepEqual(requests.at(-1)?.body, { agent: "helper", deleteIfLast: true });
+  assert.equal(stdout.join(""), "@helper was the last member of #engineering, a private channel, so it and all its messages were deleted. That can't be undone.\n");
+});

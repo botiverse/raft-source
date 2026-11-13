@@ -6,7 +6,8 @@ import { eq } from "drizzle-orm";
 import { getDb } from "../db/index";
 import { notificationEvents, users, serverMembers } from "../db/schema";
 import { createServer } from "../services/serverService";
-import { createAgent, assignMachine } from "../services/agentService";
+import { createAgent } from "../services/agentService";
+import { placeAgentOnMachine } from "../test/agentMachineFixture";
 import {
   createChannel,
   addHuman,
@@ -19,7 +20,7 @@ import {
 import { createMessage } from "../services/messageService";
 import { registerMachine } from "../services/machineService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 type Fixtures = {
   serverId: string;
@@ -68,8 +69,8 @@ async function seedArchiveFixture(baseUrl: string): Promise<Fixtures> {
   const parentMessage = await createMessage(channel.id, "user", owner.id, "seed message for thread");
 
   const { machine, apiKey } = await registerMachine(server.id, owner.id, "archive-test-daemon");
-  await assignMachine(agent.id, machine.id);
-  await assignMachine(extraAgent.id, machine.id);
+  await placeAgentOnMachine(agent.id, machine.id);
+  await placeAgentOnMachine(extraAgent.id, machine.id);
 
   const loginRes = await fetch(`${baseUrl}/api/auth/login`, {
     method: "POST",

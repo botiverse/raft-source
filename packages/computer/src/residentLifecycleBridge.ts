@@ -13,9 +13,17 @@ import {
   waitForRestartConvergence,
 } from "./machineServiceAttestation";
 import type { MachineServiceAttestation } from "./lib/types";
+import { connectService } from "./lib/ipc-client";
 
 export interface ResidentLifecycleBridge {
   supervisorMutationsAttested: boolean;
+  /**
+   * This runner could not open the Computer service's IPC seam at start. Web
+   * upgrades are relayed through it (`requestServiceUpgradeStartViaIpc`), so
+   * they would fail with "unable to connect to \\.\pipe\raft-computer-…"
+   * (Windows, 10-27: 27 failures on 7 machines).
+   */
+  serviceIpcUnreachable: boolean;
   getAcknowledgements(): ComputerLifecycleExecutionAck[];
   getReadyAcknowledgements(): Promise<ComputerLifecycleExecutionAck[]>;
   acknowledgeReceipt(operationId: string, phase: "shutdown" | "ready"): Promise<void>;
@@ -78,9 +86,21 @@ async function getReadyAcknowledgements(
   return [...shutdown, ...readyResults.flat()];
 }
 
+/** Open and close the service IPC seam; false when it cannot be reached in time. */
+export async function probeServiceIpc(slockHome: string, timeoutMs = 3_000): Promise<boolean> {
+  try {
+    const client = await connectService(slockHome, { timeoutMs });
+    await client.close().catch(() => undefined);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export async function prepareResidentLifecycleBridge(
   slockHome: string,
   serverId: string,
+  deps: { probeServiceIpc?: (slockHome: string) => Promise<boolean> } = {},
 ): Promise<ResidentLifecycleBridge> {
   await retireCompletedUpgradeShutdownsFromLog(slockHome, serverId);
   const initialService = await readMachineServiceAttestation(slockHome);
@@ -89,8 +109,10 @@ export async function prepareResidentLifecycleBridge(
     && initialService.computerVersion === COMPUTER_VERSION
     && isProcessAlive(initialService.servicePid),
   );
+  const serviceIpcUnreachable = !(await (deps.probeServiceIpc ?? probeServiceIpc)(slockHome));
   return {
     supervisorMutationsAttested,
+    serviceIpcUnreachable,
     getAcknowledgements: () => readPendingLifecycleAcknowledgements(
       slockHome,
       serverId,

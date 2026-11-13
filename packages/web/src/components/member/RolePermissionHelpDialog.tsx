@@ -58,7 +58,7 @@ export default function RolePermissionHelpDialog({
       onClose={onClose}
       closeOnBackdrop
     >
-        <div className="space-y-2">
+        <div className="stack-y-2">
           {rows.map((row) => (
             <Card key={row.roleId} className="p-3">
               <div className="mb-1 flex flex-wrap items-baseline gap-x-2 gap-y-1">

@@ -5,6 +5,7 @@ import type { AgentContext } from "../../auth/env";
 import { createCommandContext } from "../../core/context";
 import { CliError } from "../../core/errors";
 import type { CliIo } from "../../core/io";
+import { readPassiveRenderCountsForTest, withPassiveAxContextForTest } from "../../state/passiveRenderCountsTestReader";
 import { taskAmendCommand } from "./amend";
 
 function memoryIo(): { io: CliIo; stdout: string[]; stderr: string[] } {
@@ -60,7 +61,7 @@ test("task amend sends explicit fields and renders the durable revision/event re
     }) as any,
   });
 
-  await taskAmendCommand.handler(ctx, {
+  await taskAmendCommand.handler(ctx, undefined, {
     target: "  #proj-raft-cli  ",
     number: "99",
     title: "Current title",
@@ -82,8 +83,8 @@ test("task amend sends explicit fields and renders the durable revision/event re
     "#99 amended — revision 3, event seq 123.",
     "title: Current title",
     "details:",
-    "  criterion A",
-    "  criterion B",
+    "  │ criterion A",
+    "  │ criterion B",
     "",
   ].join("\n"));
 });
@@ -118,16 +119,16 @@ test("task amend supports explicit description clearing and rejects empty/ambigu
     }) as any,
   });
 
-  await taskAmendCommand.handler(ctx, { target: "#proj-raft-cli", number: "99", clearDescription: true });
+  await taskAmendCommand.handler(ctx, undefined, { target: "#proj-raft-cli", number: "99", clearDescription: true });
   assert.deepEqual(bodies, [{ channel: "#proj-raft-cli", task_number: 99, description: null }]);
 
   await assert.rejects(
-    async () => { await taskAmendCommand.handler(ctx, { target: "#proj-raft-cli", number: "99" }); },
+    async () => { await taskAmendCommand.handler(ctx, undefined, { target: "#proj-raft-cli", number: "99" }); },
     (error: unknown) => error instanceof CliError && error.code === "INVALID_ARG",
   );
   await assert.rejects(
     async () => {
-      await taskAmendCommand.handler(ctx, {
+      await taskAmendCommand.handler(ctx, undefined, {
         target: "#proj-raft-cli",
         number: "99",
         description: "new",
@@ -158,7 +159,7 @@ test("reviewer-isolation task amend requests withheld freshness context", async 
     }) as any,
   });
 
-  await taskAmendCommand.handler(ctx, { target: "#proj-raft-cli", number: "99", title: "new" });
+  await taskAmendCommand.handler(ctx, undefined, { target: "#proj-raft-cli", number: "99", title: "new" });
   assert.deepEqual(bodies, [{
     channel: "#proj-raft-cli",
     task_number: 99,
@@ -167,4 +168,25 @@ test("reviewer-isolation task amend requests withheld freshness context", async 
   }]);
   assert.equal(stdout.join(""), "Reviewer-isolation freshness hold: 2 newer messages withheld.\n");
   assert.doesNotMatch(stdout.join(""), /task amendment|title: new/);
+});
+
+test("a held task amend is counted for the daemon's turn report while passive AX is on", async () => {
+  await withPassiveAxContextForTest("ctx-A", async () => {
+    const { io, stdout } = memoryIo();
+    const ctx = createCommandContext({
+      io,
+      loadAgentContext: () => agentContext,
+      createApiClient: () => ({
+        request: async (): Promise<ApiResponse<unknown>> => ({
+          ok: true, status: 200, error: null, data: { state: "held", newMessageCount: 1, shownMessageCount: 1, heldMessages: [] },
+        }),
+      }) as any,
+    });
+    await taskAmendCommand.handler(ctx, undefined, { target: "#proj-raft-cli", number: "99", title: "new" });
+    const held = stdout.join("");
+    assert.match(held, /Your task amendment was not applied/);
+    assert.deepEqual(readPassiveRenderCountsForTest(agentContext.agentId), [
+      { contextId: "ctx-A", kind: "freshness_hold", renders: 1, chars: Array.from(held).length, bytes: Buffer.byteLength(held, "utf8") },
+    ]);
+  });
 });

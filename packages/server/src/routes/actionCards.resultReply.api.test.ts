@@ -1,3 +1,4 @@
+import { fillJointMembersFromChannelHumans } from "../test/jointMemberFill";
 import { fixturePasswordHash, tokenForHuman } from "../test/integration/credentials";
 import { createApiTest } from "../test/integration/apiTest";
 // The preparing agent learns how its action card resolved through a durable
@@ -20,7 +21,7 @@ import { prepareActionCard } from "../services/actionCardsService";
 import { __setExternalAgentInboxChainSelectorForTests } from "../services/messageService";
 import { referenceAgentInboxChain } from "../test/agentInboxChainReference";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 // CI has no RisingWave: serve the external inbox chain from the reference view.
 __setExternalAgentInboxChainSelectorForTests(async (agentId: string) => ({
@@ -167,6 +168,7 @@ test("an external preparer of a Joint card receives the result reply through /ev
     { jointChannelId: joint!.id, serverId: hostServer.id, localChannelId: hostProjection.id, role: "host", joinedByUserId: hostOwner.id },
     { jointChannelId: joint!.id, serverId: peerServer.id, localChannelId: peerProjection.id, role: "participant", joinedByUserId: peerOwner.id },
   ]);
+  await fillJointMembersFromChannelHumans();
   // A human of the host server who is also eligible on the peer (target) server.
   const dual = await seedUser("card-reply-joint-dual");
   await db.insert(serverMembers).values([
@@ -178,7 +180,7 @@ test("an external preparer of a Joint card receives the result reply through /ev
 
   const agent = await createAgent(peerServer.id, "ReplyExternal", { runtime: "external", model: "external" });
   await channelService.addAgent(peerProjection.id, agent.id);
-  const { apiKey } = await mintAgentCredential({ agentId: agent.id, scopes: ["send", "read", "tasks"], name: "reply-external", createdByUserId: null });
+  const { apiKey } = await mintAgentCredential({ agentId: agent.id, scopes: ["send", "read", "tasks"], name: "reply-external", issuedVia: "computer", createdByUserId: null });
   app.app.set("agentOrchestrator", new AgentOrchestrator());
 
   const prepared = await fetch(`${app.baseUrl}/internal/agent-api/prepare-action`, {
@@ -207,4 +209,53 @@ test("an external preparer of a Joint card receives the result reply through /ev
   const event = body.events.find((candidate) => candidate.message_id === reply.id);
   assert.ok(event, `external preparer must receive the result reply via /events, got ${JSON.stringify(body.events.map((e) => e.message_id))}`);
   assert.match(event.content ?? "", /created channel #reply-joint-created/);
+});
+
+// #bug-triage task #29: a joint thread's local projection has no parent
+// message, so the card's membership authority resolved to null and every card
+// in a joint thread was refused with 403.
+test("a member can confirm an action card prepared inside a Joint thread", async ({ app }) => {
+  const db = getDb();
+  const hostOwner = await seedUser("card-joint-thread-host");
+  const peerOwner = await seedUser("card-joint-thread-peer");
+  const hostServer = await createServer("Thread Host", `thread-host-${randomUUID().slice(0, 8)}`, hostOwner.id);
+  const peerServer = await createServer("Thread Peer", `thread-peer-${randomUUID().slice(0, 8)}`, peerOwner.id);
+  const canonical = await channelService.createChannel(hostServer.id, "thread-joint-storage", undefined, "channel");
+  const hostProjection = await channelService.createChannel(hostServer.id, "thread-joint", undefined, "joint");
+  const peerProjection = await channelService.createChannel(peerServer.id, "thread-joint", undefined, "joint");
+  await channelService.addHuman(hostProjection.id, hostOwner.id);
+  await channelService.addHuman(peerProjection.id, peerOwner.id);
+  const [joint] = await db.insert(jointChannels).values({ canonicalChannelId: canonical.id, createdByServerId: hostServer.id, createdByUserId: hostOwner.id }).returning();
+  await db.insert(jointChannelServers).values([
+    { jointChannelId: joint!.id, serverId: hostServer.id, localChannelId: hostProjection.id, role: "host", joinedByUserId: hostOwner.id },
+    { jointChannelId: joint!.id, serverId: peerServer.id, localChannelId: peerProjection.id, role: "participant", joinedByUserId: peerOwner.id },
+  ]);
+  await fillJointMembersFromChannelHumans();
+
+  const agent = await createAgent(peerServer.id, "ThreadExternal", { runtime: "external", model: "external" });
+  await channelService.addAgent(peerProjection.id, agent.id);
+  const { apiKey } = await mintAgentCredential({ agentId: agent.id, scopes: ["send", "read", "tasks"], name: "thread-external", issuedVia: "computer", createdByUserId: null });
+  app.app.set("agentOrchestrator", new AgentOrchestrator());
+
+  const peerToken = await tokenForHuman(peerOwner.email);
+  const root = await fetch(`${app.baseUrl}/api/messages`, {
+    method: "POST",
+    headers: authHeaders(peerToken, peerServer.id),
+    signal: AbortSignal.timeout(10_000),
+    body: JSON.stringify({ channelId: peerProjection.id, content: "thread root" }),
+  });
+  assert.equal(root.status, 200, await root.clone().text());
+  const { id: rootId } = await root.json() as { id: string };
+
+  const prepared = await fetch(`${app.baseUrl}/internal/agent-api/prepare-action`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+    signal: AbortSignal.timeout(10_000),
+    body: JSON.stringify({ target: `#${peerProjection.name}:${rootId.slice(0, 8)}`, action: { type: "channel:create", name: "thread-joint-created" } }),
+  });
+  assert.equal(prepared.status, 201, await prepared.clone().text());
+  const { messageId } = await prepared.json() as { messageId: string };
+
+  const executed = await execute(app.baseUrl, messageId, peerToken, peerServer.id);
+  assert.equal(executed.status, 200, await executed.clone().text());
 });

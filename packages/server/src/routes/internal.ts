@@ -1,6 +1,11 @@
+import { JointChannelAccessChangedError } from "../lib/channelActorPermissions";
+import { projectRuntimeErrorActivityDetail, projectRuntimeErrorState } from "../services/agentRuntimeErrorVisibility";
+import { DmPeerNotMemberError } from "../services/dmSendPolicy";
+import { DEPRECATED_GRAVATAR_HASH, formatAgentTaskRefTail, isSubConversationType } from "@botiverse/raft-shared";
 import { respondToTaskWriteError } from "../lib/taskWriteErrorResponse";
 import { serializeErrorForLog } from "../tracing/safeErrorLog";
-import { refuseIfRemindersMovedToApp } from "./reminderAppRollout";
+import { traceIdentityHash } from "../tracing/traceIdentity";
+import { refuseIfRemindersMovedToApp, reminderMigratedRefusal } from "./reminderAppRollout";
 // LEGACY AGENT API SURFACE: DO NOT ADD OR EXPAND ROUTES HERE.
 //
 // This router exists for old daemon builds and compatibility clients that
@@ -22,6 +27,7 @@ import { Router, type Request, type RequestHandler, type Response, type Router a
 import multer from "multer";
 import { randomUUID } from "node:crypto";
 import * as messageService from "../services/messageService";
+import { agentMessageCardField } from "../services/messageCardService";
 import * as channelService from "../services/channelService";
 import * as agentService from "../services/agentService";
 import * as machineService from "../services/machineService";
@@ -41,17 +47,23 @@ import { resolveScheduleInput } from "../services/reminderScheduleInput";
 import { parseRecurrenceString, computeNextFire, formatRecurrence, type Recurrence } from "../services/recurrence";
 import * as agentPermalinkRenderService from "../services/agentPermalinkRenderService";
 import * as actionCardsService from "../services/actionCardsService";
+import { messageWithoutAgentHiddenActionCardSpec, withoutAgentHiddenActionCardSpec } from "../services/actionCardPresentation";
 import * as attestedSendService from "../services/attestedSendService";
 import { emitScopeReadUpdated } from "../services/readReceiptService";
 import { emitThreadFollowersUpdated } from "../services/threadFollowerRealtimeService";
 import { emitTaskCreated, emitTaskMessageNew } from "../services/taskRealtimeEvents";
+import { INVALID_TASK_SOURCE_STEP, isTaskV2ConversationsEnabled, TaskV2NotEnabledError, taskSourceRequiredRefusal } from "../services/taskConversationsGate";
+import { taskV2ClaimByMessageRefusal } from "../services/taskV2UseCreate";
+import { announceTaskClaim, announceTasksCreatedFromSourceMessages, buildTaskStatusNotice, postTaskConversationNotice } from "../services/taskConversationNotice";
 import {
   describeTaskMutation,
   emitTaskMutationToSurfaces,
+  withTaskConversationEnsured,
 } from "../services/taskMutationBroadcast";
 import {
   loadCanonicalTaskFactsByMessageId,
   refreshQueuedAgentTaskProjections,
+  withAgentSourceTasks,
   withProjectedTaskFacts,
 } from "../services/messageTaskProjection";
 import { projectRichMessageSocketPayload } from "../services/messageRealtimeEvents";
@@ -60,14 +72,14 @@ import { ChannelConversionInProgressError } from "../services/channelConversionF
 import { buildMachineReadModel } from "../services/machineReadModel";
 import { resolveSearchSenderFilter } from "../services/searchSenderFilterService";
 import { actorHasServerCapabilityInServer } from "../lib/actorPermissions";
-import { getServerPlan, getHistoryCutoff, isChannelReadOnlyByBillingFeature, isChannelReadOnlyByQuota } from "../services/planService";
+import { getServerPlan, getHistoryCutoff, channelBillingReadOnlyRefusal, getChannelBillingReadOnly, isChannelReadOnlyByQuota } from "../services/planService";
+import { agentHistoryLimitedRefusal, agentHistoryLimitNote, getServerHistoryWindowForRead, isBehindHistoryWindow } from "../services/historyWindow";
+import { resolveMessageResourceAccess } from "../services/messageResourceAccess";
 import {
-  PLAN_CONFIG,
   DAEMON_CAPABILITY_MODEL_SEEN_BOUNDARY,
   buildApmFreshnessDecisionProducerFactId,
   projectApmHeldFreshnessActivity,
   projectApmHeldFreshnessEnvelope,
-  getEffectiveLimits,
   getServerCapabilities,
   renderThirdPartyInertText,
   isSlackBridgedExternalProvider,
@@ -81,7 +93,6 @@ import {
   type ProfileCreatorSummary,
   type ProfileView,
   type ReminderStatus,
-  type ServerPlan,
   type TaskStatus,
   type ActionCardAction,
   type ApmFreshnessHeldDecision,
@@ -101,6 +112,7 @@ import {
   type FeedbackTraceBundleTranscriptMetadataKey,
   AGENT_API_MESSAGE_SEARCH_DEFAULT_LIMIT,
   AGENT_API_MESSAGE_SEARCH_MAX_LIMIT,
+  RAFT_CLIENT_CAPABILITIES_HEADER,
   type ServerRole,
 } from "@botiverse/raft-shared";
 import type { AgentOrchestrator } from "../services/agentOrchestrator";
@@ -120,13 +132,11 @@ import {
 } from "../db/schema";
 import { and, desc, eq, gt, isNull, not, sql } from "drizzle-orm";
 import { getStorage, getCdnStorage, isStorageTimeoutError } from "../services/storageService";
-import {
-  FileUploadQuotaExceededError,
-  buildFileUploadQuotaExceededResponse,
-} from "../services/fileUploadQuotaService";
+import { FileUploadQuotaExceededError } from "../services/fileUploadQuotaService";
+import { agentFileUploadQuotaExceededResponse } from "../services/agentUploadUpgradeHint";
 import { uploadAttachmentBuffers } from "../services/attachmentUploadWriterService";
 import {
-  buildAttachmentTooLargeResponse,
+  attachmentTooLargeRefusal,
   canGenerateImagePreview,
   generateThumbnail,
   generateSvgRasterPreview,
@@ -143,33 +153,121 @@ import {
 } from "./attachments";
 import { applyHistoryThreadMetadata, getHistoryThreadParentMessageIds } from "./historyThreadMetadata";
 import { paginateHistoryProbe } from "./historyCursor";
-import { forbiddenMessageForTarget, notFoundMessageForTarget, resolveWritableAgentTarget } from "./agentWritableTarget";
+import { rejectUnwritableTaskConversation, resolveAgentTaskRefConversation, resolveWritableAgentTarget } from "./agentWritableTarget";
 import { createScopeAttestation, ScopeAttestationOverBudgetError } from "../lib/scopeAttestation";
 import { messageIdShortPrefixConditions, UUID_RE } from "../lib/messageId";
 import { requireAgentScope } from "../middleware/agentScope";
-import { AGENT_CREDENTIAL_BRIDGE_MACHINE_ID } from "../middleware/agentCredentialBridge";
 import * as agentScopesService from "../services/agentScopesService";
 import { addTraceEvent, errorClassOf, getCurrentTraceContext, getCurrentTraceSpan, safeAddTraceEvent, tracePhase } from "../tracing/semanticTrace";
 import {
   createAvatarUpload,
-  MAX_PROFILE_AVATAR_BYTES,
   PROFILE_AVATAR_BAD_FORMAT_MESSAGE,
-  PROFILE_AVATAR_TOO_LARGE_MESSAGE,
   runSingleAvatarUpload,
   storeAgentAvatar,
   storeServerAvatar,
 } from "../services/avatarService";
 import { handleAgentKnowledgeGet, handleAgentKnowledgeSearch } from "./agentKnowledge";
 import { AttachmentLinkError } from "../services/attachmentLinkingService";
+import { renderAgentFacingContents } from "../services/agentFacingContent";
+import { partitionDeliverableSystemAppEventMessages } from "../services/systemAppDeliveryGuards";
 import { getActorServerRoleInServer, getAgentServerRolesInServer } from "../lib/actorPermissions";
 import { bindRequestAbortSignal } from "./requestAbortSignal";
 import { broadcastAgentUpdated } from "./agentUpdatedBroadcast";
 import { createChannelForAgent } from "./agentChannelCreate";
-import { addChannelMemberForAgent, removeChannelMemberForAgent } from "./agentChannelMembers";
+import { addChannelMemberForAgent, lastMemberRefusal, removeChannelMemberForAgent, removeUnlessLastMember } from "./agentChannelMembers";
 import { updateChannelForAgent } from "./agentChannelUpdate";
 import { respondToDmTargetResolutionError, sendJsonServerError, transientSendConflictBody } from "./errorResponse";
 import { transientTransactionSqlState } from "../db/transientTransactionRetry";
-import { assertAgentCanManageServerProfile, updateServerProfileForAgent } from "./agentServerManage";
+import { agentServerProfileAudit, assertAgentCanManageServerProfile, updateServerProfileForAgent } from "./agentServerManage";
+import { agentProfileWriteRefusal, ASSISTANT_PROFILE_FIXED_CODE, ASSISTANT_PROFILE_FIXED_ERROR } from "../services/assistantService";
+import { parseOffsetQueryParam } from "../lib/offsetQueryParam";
+import { resolveAgentLoginClient } from "../services/oauthClientKeys";
+import { refuse } from "../lib/refusal";
+import { getHostedRuntimeSummary } from "../services/agentRuntimeProvisionService";
+import {
+  AGENT_CHANNEL_NOT_FOUND_REFUSAL,
+  agentProfileFenceRefusal,
+  APP_BOT_AVATAR_MANAGED_REFUSAL,
+  AGENT_GONE_REFUSAL,
+  AVATAR_TOO_LARGE_REFUSAL,
+  SERVER_GONE_FOR_AVATAR_REFUSAL,
+  AGENT_SERVER_GONE_REFUSAL,
+  agentLoginScopeRefusal,
+  APP_CARD_MODE_INVALID_REFUSAL,
+  APP_CARD_TARGET_REQUIRED_REFUSAL,
+  APP_NAME_REQUIRED_REFUSAL,
+  APP_RETURN_URL_REQUIRED_REFUSAL,
+  APP_UPDATE_CARD_DISABLED_REFUSAL,
+  installationSuspendedRefusal,
+  targetNotFoundRefusal,
+  ALL_CHANNEL_MEMBERSHIP_FIXED_REFUSAL,
+  CHANNEL_ARCHIVED_REFUSAL,
+  CHANNEL_TYPE_NOT_LEAVABLE_REFUSAL,
+  DM_NOT_JOINABLE_REFUSAL,
+  EMOJI_INVALID_REFUSAL,
+  HISTORY_NOT_ACCESSIBLE_REFUSAL,
+  HISTORY_TARGET_REQUIRED_REFUSAL,
+  JOIN_CHANNEL_ARCHIVED_REFUSAL,
+  JOINT_CHANNEL_ADD_ONLY_REFUSAL,
+  JOINT_TASK_READ_ONLY_REFUSAL,
+  LEAVE_CHANNEL_ARCHIVED_REFUSAL,
+  NOT_A_THREAD_REFUSAL,
+  PRIVATE_CHANNEL_INVITE_ONLY_REFUSAL,
+  REACTION_CHANNEL_ARCHIVED_REFUSAL,
+  REACTION_CHANNEL_READ_ONLY_REFUSAL,
+  REACTION_MEMBERSHIP_REQUIRED_REFUSAL,
+  REMINDER_CHANNEL_INVALID_REFUSAL,
+  REMINDER_CHANNEL_NOT_FOUND_REFUSAL,
+  REMINDER_FIRED_NOT_UPDATABLE_REFUSAL,
+  REMINDER_MAX_TITLE_LEN,
+  REMINDER_MESSAGE_REQUIRED_REFUSAL,
+  REMINDER_NOT_FOUND_REFUSAL,
+  REMINDER_REPEAT_INVALID_REFUSAL,
+  REMINDER_SCHEDULE_REQUIRED_REFUSAL,
+  REMINDER_STATE_CONFLICT_REFUSAL,
+  REMINDER_STATUS_FILTER_INVALID_REFUSAL,
+  REMINDER_TIMEZONE_INVALID_REFUSAL,
+  REMINDER_TIMEZONE_REQUIRED_REFUSAL,
+  REMINDER_TITLE_REQUIRED_REFUSAL,
+  REMINDER_TITLE_TOO_LONG_REFUSAL,
+  REMINDER_UPDATE_INVALID_REFUSAL,
+  reminderNotCancelableRefusal,
+  reminderNotSnoozableRefusal,
+  reminderNotUpdatableRefusal,
+  reminderRepeatUnparsedRefusal,
+  reminderScheduleInvalidRefusal,
+  reminderTimezoneUnknownRefusal,
+  SERVER_ROLE_CANNOT_JOIN_REFUSAL,
+  SYSTEM_MESSAGE_NOT_REACTABLE_REFUSAL,
+  TASK_CHANNEL_NOT_FOUND_REFUSAL,
+  TASK_CLAIM_IN_THREAD_REFUSAL,
+  TASK_CREATE_IN_THREAD_REFUSAL,
+  TASK_MEMBERSHIP_REQUIRED_REFUSAL,
+  taskNotFoundRefusal,
+  taskStatusRefusal,
+  taskUnclaimRefusal,
+  THREAD_NOT_FOUND_REFUSAL,
+  THREAD_NOT_JOINABLE_REFUSAL,
+  TOO_MANY_TASKS_REFUSAL,
+  agentProfileUpdateFields,
+  AVATAR_BAD_FORMAT_REFUSAL,
+  AVATAR_FILE_REQUIRED_REFUSAL,
+  unwritableTargetRefusal,
+  UPLOAD_CHANNEL_REQUIRED_REFUSAL,
+  UPLOAD_FILE_EMPTY_REFUSAL,
+  UPLOAD_FILE_REQUIRED_REFUSAL,
+  UPLOAD_MEMBERSHIP_REQUIRED_REFUSAL,
+  ACTION_TYPE_NOT_PREPARABLE_REFUSAL,
+  agentLoginNotFoundRefusal,
+  appRegistrationScopeRefusal,
+  MACHINE_AUTH_REQUIRED_REFUSAL,
+  MACHINE_NOT_FOUND_REFUSAL,
+  MACHINE_SERVER_GONE_REFUSAL,
+  MESSAGE_NOT_FOUND_REFUSAL,
+  messageResolveRefusal,
+  serviceMessageRefusal,
+  TARGET_REQUIRED_REFUSAL,
+} from "./agentRouteRefusals";
 
 export const internalRouter: RouterType = Router();
 
@@ -182,7 +280,8 @@ async function syncReminderToComputer(
   if (!orchestrator) return;
   try {
     if (mode === "cancel") {
-      await orchestrator.pushReminderCancel(row.ownerAgentId, row.id, row.version);
+      // The reminder itself was canceled: its Computer drops the un-acked items it holds of it.
+      await orchestrator.pushReminderCancel(row.ownerAgentId, row.id, row.version, { canceled: true });
     } else {
       await orchestrator.pushReminderUpsert(row.ownerAgentId, row);
     }
@@ -225,30 +324,17 @@ async function loadVisibleMessageForAgent(
   serverId: string,
   res: Response,
 ): Promise<NonNullable<Awaited<ReturnType<typeof messageService.getMessage>>> | null> {
-  const resolvedMessageId = await messageService.resolveMessageIdVisibleToAgent(serverId, agentId, messageId);
-  if (!resolvedMessageId.ok) {
-    res.status(resolvedMessageId.status).json({ error: resolvedMessageId.error });
+  // Access, then the plan's history window (services/messageResourceAccess.ts).
+  const access = await resolveMessageResourceAccess({ messageId, serverId, actor: { type: "agent", id: agentId } });
+  if (access.kind === "no_access") {
+    res.status(access.status).json({ error: access.error });
     return null;
   }
-  const message = await messageService.getMessage(resolvedMessageId.messageId);
-  if (!message) {
-    res.status(404).json({ error: "Message not found" });
+  if (access.kind === "history_limited") {
+    refuse(res, 404, agentHistoryLimitedRefusal(access.historyWindow));
     return null;
   }
-
-  const channel = await channelService.getChannel(message.channelId);
-  if (!channel || channel.serverId !== serverId) {
-    res.status(404).json({ error: "Message not found" });
-    return null;
-  }
-
-  const canAccess = await channelService.canAgentAccessChannel(message.channelId, agentId);
-  if (!canAccess) {
-    res.status(404).json({ error: "Message not found" });
-    return null;
-  }
-
-  return message;
+  return access.message;
 }
 
 async function canAgentAccessQueuedMessageTarget(
@@ -318,7 +404,7 @@ async function buildServerInfoAgentSummary(
 
 function toServerInfoAgentSummary(
   a: Awaited<ReturnType<typeof agentService.listAgents>>[number],
-  visibleActivity: { activity: string | null; activityDetail: string } | null,
+  visibleActivity: { activity: string | null; activityDetail: string; activityDetailKind?: string } | null,
   resolvedRole: ServerRole | null,
 ) {
   return {
@@ -326,7 +412,10 @@ function toServerInfoAgentSummary(
     description: a.description,
     status: a.status,
     activity: visibleActivity?.activity ?? null,
-    activityDetail: visibleActivity?.activityDetail ?? "",
+    // #wg-rbac:#57: another agent reads an error activity as a member does.
+    activityDetail: visibleActivity
+      ? projectRuntimeErrorActivityDetail({ activity: visibleActivity.activity, detailKind: visibleActivity.activityDetailKind ?? null, detail: visibleActivity.activityDetail, lastRuntimeError: a.lastRuntimeError ?? null }, "member").detail
+      : "",
     role: resolvedRole === "guest" ? null : resolvedRole,
   };
 }
@@ -335,7 +424,7 @@ export async function buildServerInfoAgentSummaries(
   serverId: string,
   agentOrchestrator?: AgentOrchestrator,
 ) {
-  const allAgentsList = await agentService.listAgents(serverId);
+  const allAgentsList = await agentService.listAgents(serverId, false, { memberListsOnly: true });
   // Every agent's activity and role as two batches, not two reads per agent
   // under Promise.all (one connection each on a server with hundreds).
   const [activities, roles] = await Promise.all([
@@ -354,7 +443,7 @@ export async function findServerInfoAgentSummaryByName(
   name: string,
   agentOrchestrator?: AgentOrchestrator,
 ) {
-  const agent = (await agentService.listAgents(serverId)).find((candidate) => candidate.name === name);
+  const agent = (await agentService.listAgents(serverId, false, { memberListsOnly: true })).find((candidate) => candidate.name === name);
   return agent ? { id: agent.id, summary: await buildServerInfoAgentSummary(serverId, agent, agentOrchestrator) } : null;
 }
 
@@ -381,26 +470,6 @@ export async function buildServerInfoHumanSummaries(serverId: string, agentId: s
 export async function findServerInfoHumanSummaryByName(serverId: string, agentId: string, name: string) {
   const member = (await listServerInfoVisibleHumans(serverId, agentId)).find((candidate) => candidate.name === name);
   return member ? { id: member.userId, summary: toServerInfoHumanSummary(member) } : null;
-}
-
-export function messageResolveErrorPayload(resolved: { ok: false; error: string }) {
-  if (/ambiguous/i.test(resolved.error)) {
-    return {
-      error: resolved.error,
-      errorCode: "AMBIGUOUS_ID",
-      suggestedNextAction: "Use the full message UUID instead of the 8-character short id.",
-    };
-  }
-  if (/must be/i.test(resolved.error)) {
-    return {
-      error: resolved.error,
-      errorCode: "INVALID_ARG",
-    };
-  }
-  return {
-    error: resolved.error,
-    errorCode: "NOT_FOUND",
-  };
 }
 
 function isHistoryAnchorShape(value: string): boolean {
@@ -448,7 +517,7 @@ export async function buildAgentResolvedMessagePayload(
 ) {
   // v1.4: task facts live in `tasks`; project them onto the host message so the
   // agent-facing `[task #N status=...]` suffix survives the storage move.
-  const [message] = await withProjectedTaskFacts([resolvedMessage]);
+  const [message] = await withAgentSourceTasks(await withProjectedTaskFacts([resolvedMessage]), undefined, serverId);
   const external = message.senderType === "external_projection";
   const sender = message.messageType === "system"
     ? { name: "system", description: null }
@@ -458,9 +527,22 @@ export async function buildAgentResolvedMessagePayload(
         ? { name: message.externalAuthor?.displayName ?? "External user", description: null }
         : await agentService.getAgent(message.senderId);
   let parentChannel: Awaited<ReturnType<typeof channelService.getChannel>> | null = null;
-  if (channel.type === "thread" && channel.parentMessageId) {
-    const parentMessage = await messageService.getMessage(channel.parentMessageId);
-    parentChannel = parentMessage ? await channelService.getChannel(parentMessage.channelId) : null;
+  let threadParentMessageId: string | null = null;
+  // Task v2: a message in a task's own conversation is addressed by the task
+  // ref (`#parent:#7`): a thread under the task's channel plus its number.
+  const taskConversationNumber = await messageService.taskConversationNumberForChannel(channel);
+  if (channel.type === "task" && channel.parentChannelId) {
+    parentChannel = await channelService.getChannel(channel.parentChannelId);
+  }
+  if (channel.type === "thread") {
+    // resolveThreadParent also covers a joint thread's local projection, whose
+    // parent is this server's joint channel face and whose reply target is
+    // the canonical parent message (what `#channel:<id>` resolves).
+    const threadParent = await channelService.resolveThreadParent(channel);
+    if (threadParent) {
+      threadParentMessageId = threadParent.parentMessageId;
+      parentChannel = await channelService.getChannel(threadParent.parentChannelId);
+    }
   }
   const channelName = channel.type === "dm"
     ? await channelService.resolveAgentFacingDmPeerFace(serverId, requestingAgentId, channel.id)
@@ -485,25 +567,32 @@ export async function buildAgentResolvedMessagePayload(
   return {
     message_id: message.id,
     seq: message.seq,
-    channel_type: channel.type === "thread"
+    channel_type: channel.type === "thread" || taskConversationNumber
       ? "thread"
       : channel.type === "dm"
         ? "dm"
         : channel.type === "private"
           ? "private"
           : "channel",
-    channel_name: channel.type === "thread" && channel.parentMessageId
-      ? channel.parentMessageId.slice(0, 8)
-      : channelName,
+    channel_name: taskConversationNumber
+      ? formatAgentTaskRefTail(taskConversationNumber)
+      : channel.type === "thread" && threadParentMessageId
+        ? threadParentMessageId.slice(0, 8)
+        : channelName,
     parent_channel_type: parentChannel
       ? parentChannel.type === "dm" ? "dm" : parentChannel.type === "private" ? "private" : "channel"
       : null,
     parent_channel_name: parentChannelName,
+    ...(taskConversationNumber && { task_conversation_number: taskConversationNumber }),
     timestamp: message.createdAt.toISOString(),
     sender_type: message.messageType === "system" ? "system" : toAgentFacingActorType(message.senderType),
     sender_name: sender?.name ?? "unknown",
     sender_description: sender?.description ?? null,
     sender_timezone: external ? null : message.senderTimezone ?? null,
+    // RFC 077: resolve reads "sent by an assistant for its owner" like every other read.
+    ...(await messageService.agentDelegatedByField(message as { delegatedByAgentId?: string | null })),
+    // RFC 082: a card message reads `card=r<revision>` in the header; its content is the fallback.
+    ...agentMessageCardField(external ? null : "actionMetadata" in message ? message.actionMetadata : null),
     ...messageService.toAgentVisibleExternalMessage(message),
     ...(external && {
       mentioned: messageService.isSlackBridgedExternalMessage(message)
@@ -531,6 +620,8 @@ export async function buildAgentResolvedMessagePayload(
       task_assignee_id: message.taskAssigneeId,
       task_assignee_name: taskAssigneeName,
     }),
+    // Task v2: every task hanging under this chat message (flag-on servers).
+    ...(!external && message.source_tasks && { source_tasks: message.source_tasks }),
     ...(!external && message.taskCurrentProjection && {
       task_current_projection: {
         title: message.taskCurrentProjection.title,
@@ -566,7 +657,7 @@ export async function resolveAgentVisibleMessagePayload(
     if (!canAccessProjection) return null;
     const [viewerScopedMessage] = await messageService.listMessagesByIds([message.id], {
       forwardedBundleViewerAgentId: requestingAgentId,
-      forwardedBundleViewerServerId: serverId,
+      viewerServerId: serverId,
       includeSenderTimezone: true,
     });
     if (!viewerScopedMessage) return null;
@@ -583,7 +674,7 @@ export async function resolveAgentVisibleMessagePayload(
   if (!canAccess) return null;
   const [viewerScopedMessage] = await messageService.listMessagesByIds([message.id], {
     forwardedBundleViewerAgentId: requestingAgentId,
-    forwardedBundleViewerServerId: serverId,
+    viewerServerId: serverId,
     includeSenderTimezone: true,
   });
   if (!viewerScopedMessage) return null;
@@ -643,30 +734,6 @@ function optionalString(raw: unknown): string | undefined {
   return typeof raw === "string" ? raw.trim() || undefined : undefined;
 }
 
-function resolveAgentLoginClient(
-  clients: Awaited<ReturnType<typeof oauthService.listOAuthClients>>,
-  rawService: unknown,
-):
-  | { ok: true; client: Awaited<ReturnType<typeof oauthService.listOAuthClients>>[number] }
-  | { ok: false; status: 400 | 404 | 409; error: string } {
-  if (typeof rawService !== "string" || !rawService.trim()) {
-    return { ok: false, status: 400, error: "service is required" };
-  }
-
-  const service = rawService.trim();
-  const exact = clients.find((client) => client.id === service || client.clientId === service);
-  if (exact) return { ok: true, client: exact };
-
-  const normalized = service.toLowerCase();
-  const nameMatches = clients.filter((client) => client.name.toLowerCase() === normalized);
-  if (nameMatches.length === 1) return { ok: true, client: nameMatches[0] };
-  if (nameMatches.length > 1) {
-    return { ok: false, status: 409, error: "Service name is ambiguous; use the service id or client id" };
-  }
-
-  return { ok: false, status: 404, error: "Registered service not found" };
-}
-
 function classifyAgentSendTarget(raw: unknown): "channel" | "thread" | "dm" | "legacy_dm" | "unknown" {
   if (typeof raw !== "string") return "unknown";
   if (raw.startsWith("dm:@")) return "dm";
@@ -679,6 +746,7 @@ function classifyAgentSendTarget(raw: unknown): "channel" | "thread" | "dm" | "l
 const validateLegacyAgentSendBody: RequestHandler<{ id: string }> = (req, res, next) => {
   const parsed = legacyAgentSendBodySchema.safeParse(req.body ?? {});
   if (!parsed.success) {
+    // refusal-ok: `issues` names the field that is wrong, the only detail behind this generic sentence; the envelope has `details` only for listed codes
     res.status(400).json({
       error: "Invalid legacy agent send body",
       code: "legacy_agent_send_contract_invalid",
@@ -703,7 +771,6 @@ function verifyMachineOwnsAgent(
   serverId: string | undefined,
 ): string | null {
   if (agent.serverId !== serverId) return "Agent not found";
-  if (machineId === AGENT_CREDENTIAL_BRIDGE_MACHINE_ID && agent.machineId === null) return null;
   if (!machineId || agent.machineId !== machineId) return "This agent is not assigned to your machine";
   return null; // OK
 }
@@ -789,7 +856,7 @@ function toProfileCreatorSummary(
       name: creator.name,
       displayName: creator.displayName,
       avatarUrl: creator.avatarUrl,
-      gravatarHash: creator.gravatarHash,
+      gravatarHash: DEPRECATED_GRAVATAR_HASH,
     };
   }
 
@@ -803,14 +870,23 @@ function toProfileCreatorSummary(
   };
 }
 
+/**
+ * A human's profile as an agent reads it. Agents never get a human's email:
+ * the member read below has no requester, so getServerMembers already masks
+ * it, and the view pins `email: null` so a change to that masking cannot leak
+ * it here. The profile card renders a null email as absent.
+ */
 async function buildHumanProfileView(
   serverId: string,
   userId: string,
+  selfAgentId: string,
 ): Promise<HumanProfileView | null> {
   const members = await serverService.getServerMembers(serverId, null);
   const member = members.find((candidate) => candidate.userId === userId);
   if (!member) return null;
-  const createdAgents = await agentService.listCreatedAgents(serverId, "user", userId);
+  // Read by an agent, which is never the owner: another person's assistant
+  // is left out; the assistant reading its own owner's profile finds itself.
+  const createdAgents = await agentService.listCreatedAgents(serverId, "user", userId, { agentId: selfAgentId });
 
   return {
     kind: "human",
@@ -820,7 +896,7 @@ async function buildHumanProfileView(
     displayName: member.displayName,
     description: member.description,
     avatarUrl: member.avatarUrl,
-    email: member.email,
+    email: null,
     role: member.role,
     joinedAt: member.joinedAt.toISOString(),
     membershipStatus: "active",
@@ -837,7 +913,7 @@ export async function buildAgentProfileView(
   if (!agent) return null;
 
   const creator = await agentService.getAgentCreator(agent);
-  const createdAgents = await agentService.listCreatedAgents(agent.serverId, "agent", agent.id);
+  const createdAgents = await agentService.listCreatedAgents(agent.serverId, "agent", agent.id, { agentId: selfAgentId });
   const resolvedServerRole = await getActorServerRoleInServer(agent.serverId, "agent", agent.id);
   const serverRole = resolvedServerRole === "guest" ? null : resolvedServerRole;
   const machine = agent.machineId ? await machineService.getMachine(asMachineId(agent.machineId)) : null;
@@ -856,7 +932,8 @@ export async function buildAgentProfileView(
     status: agent.status,
     serverRole,
     runtime: agent.runtime,
-    lastRuntimeError: agent.lastRuntimeError ?? null,
+    // #wg-rbac:#57: an agent reads its own error scrubbed; another agent reads it as a member does.
+    lastRuntimeError: projectRuntimeErrorState(agent.lastRuntimeError, agent.id === selfAgentId ? "manager" : "member"),
     model: agent.model,
     reasoningEffort: agent.reasoningEffort ?? null,
     executionMode: agent.executionMode,
@@ -895,10 +972,14 @@ export async function resolveProfileViewForAgent(
     return { ok: true, profile: selfProfile };
   }
 
-  const [humanId, targetAgentId] = await Promise.all([
-    channelService.resolveUserByName(serverId, targetHandle),
-    channelService.resolveAgentByName(serverId, targetHandle),
+  // A human the agent's hidden human directory does not show resolves like a
+  // handle nobody has (findAgentVisibleServerHuman), so neither the profile nor
+  // the ambiguous/not-found answers confirm a hidden person.
+  const [human, targetAgentId] = await Promise.all([
+    serverService.findAgentVisibleServerHuman(serverId, selfAgentId, { name: targetHandle }),
+    channelService.resolveAgentByName(serverId, targetHandle, { agentId: selfAgentId }),
   ]);
+  const humanId = human?.userId ?? null;
 
   if (humanId && targetAgentId) {
     return { ok: false, status: 409, error: `Profile handle @${targetHandle} is ambiguous` };
@@ -912,7 +993,7 @@ export async function resolveProfileViewForAgent(
   }
 
   if (humanId) {
-    const profile = await buildHumanProfileView(serverId, humanId);
+    const profile = await buildHumanProfileView(serverId, humanId, selfAgentId);
     return profile
       ? { ok: true, profile }
       : { ok: false, status: 404, error: `Profile @${targetHandle} not found` };
@@ -1307,20 +1388,6 @@ function readAttestationInteger(value: unknown, name: string, max: number): numb
   return value;
 }
 
-// Reminder receipt fallback text: deterministic UTC minute precision. The
-// receipt now ships a structured token and the web UI re-renders it into the
-// viewer's local timezone, but this UTC string remains as a safe fallback for
-// any surface that doesn't understand the token yet.
-function formatFireAtForReceiptFallback(d: Date): string {
-  const pad = (n: number) => String(n).padStart(2, "0");
-  return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())} UTC`;
-}
-
-function buildReminderFireAtToken(d: Date): string {
-  const fallback = formatFireAtForReceiptFallback(d);
-  return `<span data-reminder-fire-at="${d.toISOString()}">${fallback}</span>`;
-}
-
 export async function resolveReminderMsgId(
   serverId: string,
   agentId: string,
@@ -1402,13 +1469,13 @@ internalRouter.get("/machine/self", async (req, res) => {
     const machineId = req.machineId;
     const serverId = req.serverId;
     if (!machineId || !serverId) {
-      res.status(401).json({ error: "Machine authentication required" });
+      refuse(res, 401, MACHINE_AUTH_REQUIRED_REFUSAL);
       return;
     }
 
     const machine = await machineService.getMachine(machineId);
     if (!machine || machine.serverId !== serverId) {
-      res.status(404).json({ error: "Machine not found" });
+      refuse(res, 404, MACHINE_NOT_FOUND_REFUSAL);
       return;
     }
 
@@ -1433,13 +1500,13 @@ internalRouter.get("/machine/agents", async (req, res) => {
     const machineId = req.machineId;
     const serverId = req.serverId;
     if (!machineId || !serverId) {
-      res.status(401).json({ error: "Machine authentication required" });
+      refuse(res, 401, MACHINE_AUTH_REQUIRED_REFUSAL);
       return;
     }
 
     const machine = await machineService.getMachine(machineId);
     if (!machine || machine.serverId !== serverId) {
-      res.status(404).json({ error: "Machine not found" });
+      refuse(res, 404, MACHINE_NOT_FOUND_REFUSAL);
       return;
     }
 
@@ -1567,20 +1634,30 @@ internalRouter.post("/agent/:id/integrations/login", async (req, res) => {
 
     const server = await serverService.getServer(result.agent.serverId);
     if (!server) {
-      res.status(404).json({ error: "Server not found" });
+      refuse(res, 404, AGENT_SERVER_GONE_REFUSAL);
       return;
     }
 
     const clients = await oauthService.listAgentAvailableOAuthClients(result.agent.serverId);
-    const resolved = resolveAgentLoginClient(clients, req.body?.service);
+    const resolved = await resolveAgentLoginClient(clients, req.body?.service);
     if (!resolved.ok) {
       if (resolved.status !== 404) {
         res.status(resolved.status).json({ error: resolved.error });
         return;
       }
 
+      // Installed here but suspended: refuse rather than offer an install.
+      const suspended = await resolveAgentLoginClient(
+        await oauthService.listSuspendedThirdPartyOAuthClients(result.agent.serverId),
+        req.body?.service,
+      );
+      if (suspended.ok) {
+        refuse(res, 403, installationSuspendedRefusal(suspended.client.clientId));
+        return;
+      }
+
       const publicClients = await oauthService.listPublicMarketplaceOAuthClients();
-      const marketplaceResolved = resolveAgentLoginClient(publicClients, req.body?.service);
+      const marketplaceResolved = await resolveAgentLoginClient(publicClients, req.body?.service);
       if (!marketplaceResolved.ok) {
         res.status(marketplaceResolved.status).json({ error: marketplaceResolved.error });
         return;
@@ -1590,6 +1667,7 @@ internalRouter.post("/agent/:id/integrations/login", async (req, res) => {
       const marketplaceUrl = `${getAppUrl()}/s/${encodeURIComponent(server.slug)}/settings/applications?marketplace_app=${encodeURIComponent(marketplaceResolved.client.id)}`;
       const response: {
         status: "install_required";
+        agentHandoffProtocol: "legacy" | "v1";
         nextAction: "install_from_marketplace";
         service: Awaited<ReturnType<typeof serializeOAuthClientForAgent>>;
         scopes: string[];
@@ -1602,6 +1680,7 @@ internalRouter.post("/agent/:id/integrations/login", async (req, res) => {
         };
       } = {
         status: "install_required",
+        agentHandoffProtocol: marketplaceResolved.client.agentHandoffProtocol,
         nextAction: "install_from_marketplace",
         service: await serializeOAuthClientForAgent(marketplaceResolved.client),
         scopes,
@@ -1622,7 +1701,7 @@ internalRouter.post("/agent/:id/integrations/login", async (req, res) => {
           target,
         );
         if (!resolvedTarget) {
-          res.status(404).json({ error: "Install target not found or not visible to this agent" });
+          refuse(res, 404, targetNotFoundRefusal(target));
           return;
         }
         const agentName = result.agent.displayName ?? result.agent.name;
@@ -1663,6 +1742,7 @@ internalRouter.post("/agent/:id/integrations/login", async (req, res) => {
     if (requested.grantStatus === "pending") {
       const response: {
         status: "approval_required";
+        agentHandoffProtocol: "legacy" | "v1";
         service: Awaited<ReturnType<typeof serializeOAuthClientForAgent>>;
         scopes: string[];
         requestId: string;
@@ -1673,6 +1753,7 @@ internalRouter.post("/agent/:id/integrations/login", async (req, res) => {
         };
       } = {
         status: "approval_required",
+        agentHandoffProtocol: resolved.client.agentHandoffProtocol,
         service: await serializeOAuthClientForAgent(resolved.client),
         scopes: requested.request.scopes ?? [],
         requestId: requested.request.id,
@@ -1692,7 +1773,7 @@ internalRouter.post("/agent/:id/integrations/login", async (req, res) => {
           target,
         );
         if (!resolvedTarget) {
-          res.status(404).json({ error: "Approval target not found or not visible to this agent" });
+          refuse(res, 404, targetNotFoundRefusal(target));
           return;
         }
         const card = await actionCardsService.prepareActionCard({
@@ -1723,24 +1804,24 @@ internalRouter.post("/agent/:id/integrations/login", async (req, res) => {
 
     res.json({
       status: requested.grantStatus === "reused" ? "already_logged_in" : "logged_in",
+      agentHandoffProtocol: resolved.client.agentHandoffProtocol,
       service: await serializeOAuthClientForAgent(resolved.client),
       scopes: requested.request.scopes ?? [],
       requestId: requested.request.id,
     });
   } catch (err: any) {
+    if (err instanceof oauthService.OAuthInstallationSuspendedError) {
+      refuse(res, 403, installationSuspendedRefusal(null));
+      return;
+    }
     const message = err?.message || "Failed to provision agent login";
-    if (
-      message === "scopes must be an array" ||
-      message === "scopes must contain strings" ||
-      message === "scope values must be non-empty" ||
-      message === "at least one scope is required" ||
-      message === "invalid_scope"
-    ) {
-      res.status(400).json({ error: message });
+    const scopeRefusal = agentLoginScopeRefusal(message);
+    if (scopeRefusal) {
+      refuse(res, 400, scopeRefusal);
       return;
     }
     if (message.includes("not found")) {
-      res.status(404).json({ error: message });
+      refuse(res, 404, agentLoginNotFoundRefusal(message));
       return;
     }
     sendJsonServerError(req, res, {
@@ -1762,19 +1843,16 @@ internalRouter.post("/agent/:id/integrations/app/prepare", async (req, res) => {
     const body = (req.body ?? {}) as Record<string, unknown>;
     const target = optionalString(body.target);
     if (!target) {
-      res.status(400).json({ error: "target is required" });
+      refuse(res, 400, APP_CARD_TARGET_REQUIRED_REFUSAL);
       return;
     }
     const mode = optionalString(body.mode);
-    if (mode !== "register" && mode !== "update") {
-      res.status(400).json({ error: "mode must be register or update" });
+    if (mode === "update") {
+      refuse(res, 410, APP_UPDATE_CARD_DISABLED_REFUSAL);
       return;
     }
-    if (mode === "update") {
-      res.status(410).json({
-        error: "App registration update cards are disabled; the app owner must use the direct integration app update command",
-        errorCode: "LEGACY_APP_UPDATE_DISABLED",
-      });
+    if (mode !== "register") {
+      refuse(res, 400, APP_CARD_MODE_INVALID_REFUSAL);
       return;
     }
     const clientKey = optionalString(body.clientKey);
@@ -1785,7 +1863,7 @@ internalRouter.post("/agent/:id/integrations/app/prepare", async (req, res) => {
       target,
     );
     if (!resolvedTarget) {
-      res.status(404).json({ error: "Action-card target not found or not visible to this agent" });
+      refuse(res, 404, targetNotFoundRefusal(target));
       return;
     }
 
@@ -1796,47 +1874,27 @@ internalRouter.post("/agent/:id/integrations/app/prepare", async (req, res) => {
     const returnUrl = optionalString(body.returnUrl);
     const agentManifestUrl = optionalString(body.agentManifestUrl);
 
-    let action: ActionCardAction;
-    if (mode === "register") {
-      const name = optionalString(body.name);
-      if (!name) {
-        res.status(400).json({ error: "name is required for register" });
-        return;
-      }
-      if (!returnUrl) {
-        res.status(400).json({ error: "returnUrl is required for register" });
-        return;
-      }
-      action = {
-        type: "integration:register_app",
-        name,
-        ...(clientKey ? { clientKey } : {}),
-        description: optionalString(body.description),
-        homepageUrl,
-        returnUrl,
-        agentManifestUrl,
-        scopes,
-        unsafeDemoUrlOverride,
-        draftHint: draftHint ?? `Agent prepared a Login with Raft app registration for ${name}. The requester becomes the app owner after server commit and receives the initial secret through a private transient handoff; only a lost handoff should be recovered with rotate-secret --output <new-private-path>. No secret is stored in this card.`,
-      };
-    } else {
-      if (!clientKey) {
-        res.status(400).json({ error: "clientKey is required for update" });
-        return;
-      }
-      action = {
-        type: "integration:update_app_registration",
-        clientKey,
-        name: optionalString(body.name),
-        description: optionalString(body.description),
-        homepageUrl,
-        returnUrl,
-        agentManifestUrl,
-        scopes: body.scopes === undefined ? undefined : scopes,
-        unsafeDemoUrlOverride,
-        draftHint: draftHint ?? `Agent prepared a compatibility approval update for Login with Raft app ${clientKey}. App owners can use the direct integration app update command instead.`,
-      };
+    const name = optionalString(body.name);
+    if (!name) {
+      refuse(res, 400, APP_NAME_REQUIRED_REFUSAL);
+      return;
     }
+    if (!returnUrl) {
+      refuse(res, 400, APP_RETURN_URL_REQUIRED_REFUSAL);
+      return;
+    }
+    const action: ActionCardAction = {
+      type: "integration:register_app",
+      name,
+      ...(clientKey ? { clientKey } : {}),
+      description: optionalString(body.description),
+      homepageUrl,
+      returnUrl,
+      agentManifestUrl,
+      scopes,
+      unsafeDemoUrlOverride,
+      draftHint: draftHint ?? `Agent prepared a Login with Raft app registration for ${name}. The requester becomes the app owner after server commit and receives the initial secret through a private transient handoff; only a lost handoff should be recovered with rotate-secret --output <new-private-path>. No secret is stored in this card.`,
+    };
 
     const card = await actionCardsService.prepareActionCard({
       serverId: result.agent.serverId,
@@ -1865,7 +1923,7 @@ internalRouter.post("/agent/:id/integrations/app/prepare", async (req, res) => {
       return;
     }
     if (err instanceof Error && /scope/.test(err.message)) {
-      res.status(400).json({ error: err.message });
+      refuse(res, 400, appRegistrationScopeRefusal(err.message));
       return;
     }
     sendJsonServerError(req, res, {
@@ -1882,7 +1940,7 @@ internalRouter.post("/agent/:id/integrations/app/prepare", async (req, res) => {
 internalRouter.post("/machine/scope-attestation", async (req, res) => {
   try {
     if (!req.machineId || !req.serverId) {
-      res.status(401).json({ error: "Machine authentication required" });
+      refuse(res, 401, MACHINE_AUTH_REQUIRED_REFUSAL);
       return;
     }
 
@@ -1913,7 +1971,7 @@ internalRouter.post("/machine/scope-attestation", async (req, res) => {
       }),
     );
     if (!machine || machine.serverId !== req.serverId) {
-      res.status(401).json({ error: "Machine authentication required" });
+      refuse(res, 401, MACHINE_AUTH_REQUIRED_REFUSAL);
       return;
     }
 
@@ -1928,7 +1986,7 @@ internalRouter.post("/machine/scope-attestation", async (req, res) => {
       }),
     );
     if (!server) {
-      res.status(404).json({ error: "Server not found" });
+      refuse(res, 404, MACHINE_SERVER_GONE_REFUSAL);
       return;
     }
 
@@ -1945,7 +2003,7 @@ internalRouter.post("/machine/scope-attestation", async (req, res) => {
       && !(await isAgentBoundToMachine(String(metadata.agentId), { serverId: server.id, machineId: machine.id }))
     ) {
       addTraceEvent("response.ready", { status_code: 403, surface: "machine", scope, reason: "machine_evidence_agent_not_bound" });
-      res.status(403).json({ error: "agentId is not an agent on this machine", code: "machine_evidence_agent_not_bound" });
+      refuse(res, 403, { code: "machine_evidence_agent_not_bound", error: "That agentId isn't an agent bound to this machine, so this machine can't attest evidence for it: name an agent that runs here." });
       return;
     }
 
@@ -2021,7 +2079,7 @@ internalRouter.post("/machine/scope-attestation", async (req, res) => {
       message === "metadata must be a JSON object" ||
       message.startsWith("metadata.")
     ) {
-      res.status(400).json({ error: message });
+      refuse(res, 400, serviceMessageRefusal("scope_attestation_invalid", message, "This scope attestation request isn't valid: check its scope and metadata."));
       return;
     }
     res.status(500).json({ error: "Failed to create scope attestation" });
@@ -2086,31 +2144,34 @@ async function listRecentFreshnessMessagesAfterSeq(
   agentId: string,
   agentServerId: string,
   channelId: string,
+  messageChannelId: string,
   afterSeq: number,
   limit: number,
   latestSeq: number,
   useAttentionFacts: boolean,
   options?: attestedSendService.FreshnessMessageAnchorOptions,
 ): Promise<unknown[]> {
+  // Same as the agent API: not past the plan's history window.
+  const { cutoff: createdAfter } = await getServerHistoryWindowForRead(agentServerId);
   const freshnessMessages = useAttentionFacts
     ? await attestedSendService.listRecentAgentAttentionMessagesAfterSeq(
       agentId,
       channelId,
       afterSeq,
       limit,
-      { ...options, latestSeq },
+      { ...options, latestSeq, createdAfter },
     )
     : await attestedSendService.listRecentMessagesAfterSeq(
-      channelId,
+      messageChannelId,
       afterSeq,
       limit,
-      { ...options, latestSeq },
+      { ...options, latestSeq, createdAfter },
     );
   const recentMessages = await messageService.listMessagesByIds(
     freshnessMessages.map((message) => message.messageId),
     {
       forwardedBundleViewerAgentId: agentId,
-      forwardedBundleViewerServerId: agentServerId,
+      viewerServerId: agentServerId,
       includeSenderTimezone: true,
     },
   );
@@ -2118,53 +2179,54 @@ async function listRecentFreshnessMessagesAfterSeq(
   // Same as the agent API held path: label each held row with the send
   // target's agent-facing conversation identity, resolved once.
   const identity = await messageService.resolveAgentConversationIdentity(agentServerId, agentId, channelId);
-  return recentMessages.map((message) => ({ ...message, ...identity }));
+  return recentMessages.map((message) => ({ ...messageWithoutAgentHiddenActionCardSpec(message), ...identity }));
 }
 
 // Agent uploads an attachment
 internalRouter.post("/agent/:id/upload", requireAgentScope("attachment:upload"), (req, res, next) => {
   runSingleAttachmentUpload(req, res, next);
 }, async (req, res) => {
+  const agentId = req.params.id as string;
+  const channelId = typeof req.body?.channelId === "string" ? req.body.channelId : undefined;
   try {
-    const agentId = req.params.id as string;
     const result = await loadOwnedMachineAgent(agentId, req.machineId, req.serverId);
     if ("error" in result) { res.status(result.status).json({ error: result.error }); return; }
     const { agent } = result;
 
     const file = req.file;
     if (!file) {
-      res.status(400).json({ error: "No file provided" });
+      refuse(res, 400, UPLOAD_FILE_REQUIRED_REFUSAL);
       return;
     }
     if (isEmptyUploadedFile(file)) {
-      res.status(400).json({ error: "Empty files are not allowed" });
+      refuse(res, 400, UPLOAD_FILE_EMPTY_REFUSAL);
       return;
     }
     const maxBytes = await resolveRequestAttachmentFileSizeLimitBytes(req);
     if (isOversizedUploadedFile(file, maxBytes)) {
-      res.status(413).json(buildAttachmentTooLargeResponse(maxBytes));
+      refuse(res, 413, attachmentTooLargeRefusal(maxBytes));
       return;
     }
 
-    const channelId = typeof req.body.channelId === "string" ? req.body.channelId : undefined;
     if (!channelId) {
-      res.status(400).json({ error: "channelId is required" });
+      refuse(res, 400, UPLOAD_CHANNEL_REQUIRED_REFUSAL);
       return;
     }
 
     const canPost = await channelService.canAgentPostToChannel(channelId, agentId);
     if (!canPost) {
-      res.status(403).json({ error: "Agent must join this channel before sending or uploading" });
+      refuse(res, 403, UPLOAD_MEMBERSHIP_REQUIRED_REFUSAL);
       return;
     }
 
     // Archive gate: no new attachments on an archived channel.
     if (await channelService.isChannelArchived(channelId)) {
-      res.status(409).json({ error: "This channel is archived", code: "channel_archived" });
+      refuse(res, 409, CHANNEL_ARCHIVED_REFUSAL);
       return;
     }
-    if (await isChannelReadOnlyByBillingFeature(channelId, agent.serverId)) {
-      res.status(403).json({ error: "This joint channel is read-only because it has more than 2 free servers. It becomes writable again when a server upgrades or a free server leaves." });
+    const billingReadOnly = await getChannelBillingReadOnly(channelId, agent.serverId);
+    if (billingReadOnly) {
+      refuse(res, 403, channelBillingReadOnlyRefusal(billingReadOnly));
       return;
     }
 
@@ -2219,7 +2281,10 @@ internalRouter.post("/agent/:id/upload", requireAgentScope("attachment:upload"),
       return;
     }
     if (err instanceof FileUploadQuotaExceededError) {
-      res.status(err.status).json(await buildFileUploadQuotaExceededResponse(req.serverId!, err));
+      res.status(err.status).json(await agentFileUploadQuotaExceededResponse(
+        { serverId: req.serverId!, agentId, channelId, capabilities: req.header(RAFT_CLIENT_CAPABILITIES_HEADER) },
+        err,
+      ));
       return;
     }
     res.status(500).json({ error: "Failed to upload file" });
@@ -2233,7 +2298,7 @@ internalRouter.post("/agent/:id/resolve-channel", async (req, res) => {
     const { target } = req.body;
 
     if (!target) {
-      res.status(400).json({ error: "target is required" });
+      refuse(res, 400, TARGET_REQUIRED_REFUSAL);
       return;
     }
 
@@ -2242,20 +2307,15 @@ internalRouter.post("/agent/:id/resolve-channel", async (req, res) => {
     const { agent } = result;
 
     const resolved = await resolveWritableAgentTarget(agent.serverId, agentId, target);
-    if (resolved === "forbidden") {
-      res.status(403).json({ error: forbiddenMessageForTarget(target) });
+    if (resolved === "forbidden" || resolved === "peer-not-found" || resolved === "self-dm") {
+      const { status, refusal } = unwritableTargetRefusal(resolved, target);
+      refuse(res, status, refusal);
       return;
     }
-    if (resolved === "peer-not-found") {
-      res.status(404).json({ error: `User or agent not found: @${target.slice(4)}` });
-      return;
-    }
-    if (resolved === "self-dm") {
-      res.status(400).json({ error: "Cannot create a DM with yourself" });
-      return;
-    }
+    if (rejectUnwritableTaskConversation(resolved, res)) return;
     if (!resolved) {
-      res.status(404).json({ error: notFoundMessageForTarget(target) });
+      const { status, refusal } = unwritableTargetRefusal(null, target);
+      refuse(res, status, refusal);
       return;
     }
 
@@ -2287,19 +2347,25 @@ internalRouter.post("/agent/:id/send", validateLegacyAgentSendBody, requireAgent
 
     if (deprecatedContinue === true) {
       addTraceEvent("agent_send.request.rejected", { reason: "deprecated_continue" });
-      res.status(400).json({
-        error: "--continue is no longer supported. Use normal message send to update a draft, or --send-draft to send the current saved draft.",
+      refuse(res, 400, {
+        code: "send_continue_unsupported",
+        error: "Continuing a draft is no longer supported: send the message normally to update the draft, or send the saved draft as it is.",
+        suggestedNextAction: "Run the normal message send to update the draft, or add --send-draft to send the current saved draft (--continue is no longer supported).",
       });
       return;
     }
     if (!content) {
       addTraceEvent("agent_send.request.rejected", { reason: "missing_content" });
-      res.status(400).json({ error: "Content is required" });
+      refuse(res, 400, { code: "content_required", error: "Content is required: a message needs the text to post." });
       return;
     }
     if (isContinueAnyway && !isSendDraft) {
       addTraceEvent("agent_send.request.rejected", { reason: "send_draft_anyway_without_send_draft" });
-      res.status(400).json({ error: "--send-draft --anyway requires a saved draft" });
+      refuse(res, 400, {
+        code: "send_draft_required",
+        error: "Sending anyway applies only to sending a saved draft: send the saved draft with it, or leave it out.",
+        suggestedNextAction: "Use --anyway only together with --send-draft.",
+      });
       return;
     }
 
@@ -2308,7 +2374,7 @@ internalRouter.post("/agent/:id/send", validateLegacyAgentSendBody, requireAgent
     const targetKind = classifyAgentSendTarget(effectiveTarget);
     if (!effectiveTarget) {
       addTraceEvent("agent_send.request.rejected", { reason: "missing_target" });
-      res.status(400).json({ error: "target is required" });
+      refuse(res, 400, TARGET_REQUIRED_REFUSAL);
       return;
     }
 
@@ -2335,12 +2401,12 @@ internalRouter.post("/agent/:id/send", validateLegacyAgentSendBody, requireAgent
       (requestedSendFreshness || sendFreshnessMode === "force");
     if (!sendFreshnessEnabled && requestedSendFreshness) {
       addTraceEvent("agent_send.request.rejected", { reason: "send_freshness_disabled" });
-      res.status(403).json({ error: "Send freshness interface is not enabled for this agent." });
+      refuse(res, 403, { code: "send_freshness_disabled", error: "Send freshness is not enabled for this agent: send without asking for it." });
       return;
     }
 
     const resolved = await tracePhase(
-      () => resolveWritableAgentTarget(agent.serverId, agentId, effectiveTarget),
+      () => resolveWritableAgentTarget(agent.serverId, agentId, effectiveTarget, { io: req.app.get("io") as SocketServer | undefined }),
       (_durationMs, targetResult) => ({
         name: "target.resolved",
         attrs: {
@@ -2354,24 +2420,20 @@ internalRouter.post("/agent/:id/send", validateLegacyAgentSendBody, requireAgent
         },
       }),
     );
-    if (resolved === "forbidden") {
-      res.status(403).json({ error: forbiddenMessageForTarget(effectiveTarget) });
+    if (resolved === "forbidden" || resolved === "peer-not-found" || resolved === "self-dm") {
+      const { status, refusal } = unwritableTargetRefusal(resolved, effectiveTarget);
+      refuse(res, status, refusal);
       return;
     }
-    if (resolved === "peer-not-found") {
-      res.status(404).json({ error: `User or agent not found: @${effectiveTarget.slice(4)}` });
-      return;
-    }
-    if (resolved === "self-dm") {
-      res.status(400).json({ error: "Cannot create a DM with yourself" });
-      return;
-    }
+    if (rejectUnwritableTaskConversation(resolved, res)) return;
     if (!resolved) {
-      res.status(404).json({ error: notFoundMessageForTarget(effectiveTarget) });
+      const { status, refusal } = unwritableTargetRefusal(null, effectiveTarget);
+      refuse(res, status, refusal);
       return;
     }
-    if (await isChannelReadOnlyByBillingFeature(resolved.channelId, agent.serverId)) {
-      res.status(403).json({ error: "This joint channel is read-only because it has more than 2 free servers. It becomes writable again when a server upgrades or a free server leaves." });
+    const billingReadOnly = await getChannelBillingReadOnly(resolved.channelId, agent.serverId);
+    if (billingReadOnly) {
+      refuse(res, 403, channelBillingReadOnlyRefusal(billingReadOnly));
       return;
     }
 
@@ -2385,19 +2447,35 @@ internalRouter.post("/agent/:id/send", validateLegacyAgentSendBody, requireAgent
       if (shouldRunSendFreshness) {
         const selfSender = { senderType: "agent" as const, senderId: agentId };
         const useAttentionFacts = resolved.type !== "thread";
-        const latestAnchor = useAttentionFacts
-          ? await attestedSendService.getLatestAgentAttentionAnchor(agentId, resolved.channelId, {
-            excludeSender: selfSender,
-          })
-          : await attestedSendService.getLatestMessageAnchor(resolved.channelId, {
-            excludeSender: selfSender,
-          });
+        // Joint thread projection: messages live on the canonical thread (see
+        // evaluateAgentFreshness in internalAgentApi.ts); mentions stay local.
+        const messageChannelId = resolved.type === "thread"
+          ? await channelService.getMessageStorageChannelIdWithExecutor(getDb(), resolved.channelId)
+          : resolved.channelId;
+        // As in the agent API: messages behind the plan's history window are
+        // never unseen, so counts and anchors read only what is after it.
+        const { cutoff: createdAfter } = await getServerHistoryWindowForRead(agent.serverId);
         const hasClientSeenBoundary = typeof seenUpToSeq === "number" && Number.isFinite(seenUpToSeq);
         const clientSeenUpToSeq = hasClientSeenBoundary
           ? Math.max(0, Math.floor(seenUpToSeq))
           : 0;
+        // As in evaluateAgentFreshness: the anchor is searched only after the
+        // model-seen boundary; nothing after it leaves the boundary as latest.
+        const attentionAnchor = useAttentionFacts
+          ? await attestedSendService.getLatestAgentAttentionAnchor(agentId, resolved.channelId, {
+            excludeSender: selfSender,
+            createdAfter,
+            ...(hasClientSeenBoundary ? { afterSeq: Math.min(clientSeenUpToSeq, Number.MAX_SAFE_INTEGER) } : {}),
+          })
+          : null;
+        const latestAnchor = attentionAnchor
+          ? (hasClientSeenBoundary && attentionAnchor.seq === 0 ? { seq: Math.min(clientSeenUpToSeq, Number.MAX_SAFE_INTEGER), messageId: null } : attentionAnchor)
+          : await attestedSendService.getLatestMessageAnchor(messageChannelId, {
+            excludeSender: selfSender,
+            createdAfter,
+          });
         const threadParentAnchor = !hasClientSeenBoundary && resolved.type === "thread"
-          ? await attestedSendService.getThreadParentAnchor(resolved.channelId)
+          ? await attestedSendService.getThreadParentAnchor(messageChannelId)
           : null;
         // A cold thread still has a freshness boundary: the parent message the
         // first reply is based on. Once the first reply lands, peers based on
@@ -2422,16 +2500,18 @@ internalRouter.post("/agent/:id/send", validateLegacyAgentSendBody, requireAgent
           ? null
           : attestedBoundarySeq === threadParentAnchor?.seq
             ? threadParentAnchor.messageId
-            : await attestedSendService.getMessageIdForSeq(resolved.channelId, attestedBoundarySeq);
+            : await attestedSendService.getMessageIdForSeq(messageChannelId, attestedBoundarySeq);
         const newMessageCount = latestFreshnessSeq > attestedBoundarySeq
           ? useAttentionFacts
             ? await attestedSendService.countAgentAttentionMessagesAfterSeq(agentId, resolved.channelId, attestedBoundarySeq, {
               excludeSender: selfSender,
               latestSeq: latestFreshnessSeq,
+              createdAfter,
             })
-            : await attestedSendService.countMessagesAfterSeq(resolved.channelId, attestedBoundarySeq, {
+            : await attestedSendService.countMessagesAfterSeq(messageChannelId, attestedBoundarySeq, {
               excludeSender: selfSender,
               latestSeq: latestFreshnessSeq,
+              createdAfter,
             })
           : 0;
         const attestedTargetType = toAttestedSendTargetType(resolved.type);
@@ -2441,7 +2521,7 @@ internalRouter.post("/agent/:id/send", validateLegacyAgentSendBody, requireAgent
           newMessageCount,
         };
         const formalMentionFacts = attestedBoundarySeq > 0 && latestFreshnessSeq > attestedBoundarySeq
-          ? await attestedSendService.getFormalMentionFacts(agentId, resolved.channelId, attestedBoundarySeq, latestFreshnessSeq)
+          ? await attestedSendService.getFormalMentionFacts(agentId, resolved.channelId, attestedBoundarySeq, latestFreshnessSeq, undefined, createdAfter)
           : { count: 0, firstMessageId: null, firstHandle: null };
         const shouldHoldForFreshness =
           !isContinueAnyway && newMessageCount > 0 && formalMentionFacts.count === 0;
@@ -2477,6 +2557,7 @@ internalRouter.post("/agent/:id/send", validateLegacyAgentSendBody, requireAgent
             agentId,
             agent.serverId,
             resolved.channelId,
+            messageChannelId,
             attestedBoundarySeq,
             ATTESTED_SEND_HELD_CONTEXT_LIMIT,
             latestSeq,
@@ -2492,7 +2573,7 @@ internalRouter.post("/agent/:id/send", validateLegacyAgentSendBody, requireAgent
                 excludeSender: { senderType: "agent", senderId: agentId },
                 latestSeq,
               })
-              : await attestedSendService.countMessagesAfterSeq(resolved.channelId, attestedBoundarySeq, {
+              : await attestedSendService.countMessagesAfterSeq(messageChannelId, attestedBoundarySeq, {
                 excludeSender: { senderType: "agent", senderId: agentId },
                 latestSeq,
               })
@@ -2648,17 +2729,34 @@ internalRouter.post("/agent/:id/send", validateLegacyAgentSendBody, requireAgent
           ? { agentSendKey: idempotencyKey, rejectMismatchedAgentSendReplay: true }
           : {}),
       }),
-      (_durationMs, message) => ({
-        name: "message.sent",
-        attrs: {
-          channel_type: resolved.type,
-          message_id_present: Boolean(message.id),
-          attachments_count: message.attachments.length,
-          idempotency_key_present: typeof idempotencyKey === "string" && idempotencyKey.length > 0,
-          send_draft_requested: isSendDraft,
-        },
-      }),
+      (_durationMs, message) => {
+        // Keyed hashes, never the raw ids: lets a trace be matched to the
+        // message and conversation an agent sent to (traceIdentity.ts).
+        const messageIdHash = traceIdentityHash("message_id_hash", message.id);
+        const conversationIdHash = traceIdentityHash("conversation_id_hash", resolved.channelId);
+        return {
+          name: "message.sent",
+          attrs: {
+            channel_type: resolved.type,
+            message_id_present: Boolean(message.id),
+            ...(messageIdHash ? { message_id_hash: messageIdHash } : {}),
+            ...(conversationIdHash ? { conversation_id_hash: conversationIdHash } : {}),
+            attachments_count: message.attachments.length,
+            idempotency_key_present: typeof idempotencyKey === "string" && idempotencyKey.length > 0,
+            send_draft_requested: isSendDraft,
+          },
+        };
+      },
     );
+
+    // Agent typing line: the agent is no longer about to post here (see the agent-api send route).
+    void agentOrchestrator?.endAgentTypingForPostedMessage?.({
+      agentId,
+      serverId: agent.serverId,
+      channelId: resolved.channelId,
+      channelType: resolved.type,
+      target: effectiveTarget,
+    });
 
     addTraceEvent("response.ready", {
       attachment_ids_count: Array.isArray(attachmentIds) ? attachmentIds.length : 0,
@@ -2720,7 +2818,11 @@ internalRouter.post("/agent/:id/send", validateLegacyAgentSendBody, requireAgent
       return;
     }
     if (err instanceof channelService.ChannelArchivedError) {
-      res.status(409).json({ error: "This channel is archived", code: "channel_archived" });
+      refuse(res, 409, CHANNEL_ARCHIVED_REFUSAL);
+      return;
+    }
+    if (err instanceof DmPeerNotMemberError || err instanceof JointChannelAccessChangedError) {
+      res.status(err.status).json({ error: err.message, code: err.code });
       return;
     }
     if (err instanceof messageService.AgentSendIdempotencyConflictError) {
@@ -2755,7 +2857,7 @@ internalRouter.post("/agent/:id/messages/:messageId/reactions", requireAgentScop
   try {
     const emoji = parseReactionEmoji(req.body?.emoji);
     if (!emoji) {
-      res.status(400).json({ error: "A valid emoji is required" });
+      refuse(res, 400, EMOJI_INVALID_REFUSAL);
       return;
     }
 
@@ -2766,24 +2868,25 @@ internalRouter.post("/agent/:id/messages/:messageId/reactions", requireAgentScop
     const message = await loadVisibleMessageForAgent(req.params.messageId, agent.id, agent.serverId, res);
     if (!message) return;
     if (message.messageType === "system") {
-      res.status(400).json({ error: "System messages cannot receive reactions" });
+      refuse(res, 400, SYSTEM_MESSAGE_NOT_REACTABLE_REFUSAL);
       return;
     }
 
     const canPost = await channelService.canAgentPostToChannel(message.channelId, agent.id);
     if (!canPost) {
-      res.status(403).json({ error: "Agent must join this channel to react to messages" });
+      refuse(res, 403, REACTION_MEMBERSHIP_REQUIRED_REFUSAL);
       return;
     }
 
     await channelService.assertChannelNotArchived(message.channelId);
 
-    if (await isChannelReadOnlyByBillingFeature(message.channelId, agent.serverId)) {
-      res.status(403).json({ error: "This joint channel is read-only because it has more than 2 free servers. It becomes writable again when a server upgrades or a free server leaves." });
+    const billingReadOnly = await getChannelBillingReadOnly(message.channelId, agent.serverId);
+    if (billingReadOnly) {
+      refuse(res, 403, channelBillingReadOnlyRefusal(billingReadOnly));
       return;
     }
     if (await isChannelReadOnlyByQuota(message.channelId, agent.serverId)) {
-      res.status(403).json({ error: "This channel is read-only on your current plan. Upgrade to continue." });
+      refuse(res, 403, REACTION_CHANNEL_READ_ONLY_REFUSAL);
       return;
     }
 
@@ -2793,11 +2896,13 @@ internalRouter.post("/agent/:id/messages/:messageId/reactions", requireAgentScop
       emoji,
       actor: { kind: "agent", id: agent.id },
       operation: "add",
+      noticeDeliverer: req.app.get("agentOrchestrator") as AgentOrchestrator | undefined,
+      message,
     });
 
     const context = await messageService.getMessageContext(message.id, 0, 0, undefined, {
       forwardedBundleViewerAgentId: agent.id,
-      forwardedBundleViewerServerId: agent.serverId,
+      viewerServerId: agent.serverId,
       includeSenderTimezone: true,
     });
     const enriched = context?.messages[0];
@@ -2819,7 +2924,7 @@ internalRouter.post("/agent/:id/messages/:messageId/reactions", requireAgentScop
       return;
     }
     if (err instanceof channelService.ChannelArchivedError) {
-      res.status(409).json({ error: "This channel is archived", code: "channel_archived" });
+      refuse(res, 409, REACTION_CHANNEL_ARCHIVED_REFUSAL);
       return;
     }
     sendJsonServerError(req, res, {
@@ -2834,7 +2939,7 @@ internalRouter.delete("/agent/:id/messages/:messageId/reactions", requireAgentSc
   try {
     const emoji = parseReactionEmoji(req.body?.emoji);
     if (!emoji) {
-      res.status(400).json({ error: "A valid emoji is required" });
+      refuse(res, 400, EMOJI_INVALID_REFUSAL);
       return;
     }
 
@@ -2845,24 +2950,25 @@ internalRouter.delete("/agent/:id/messages/:messageId/reactions", requireAgentSc
     const message = await loadVisibleMessageForAgent(req.params.messageId, agent.id, agent.serverId, res);
     if (!message) return;
     if (message.messageType === "system") {
-      res.status(400).json({ error: "System messages cannot receive reactions" });
+      refuse(res, 400, SYSTEM_MESSAGE_NOT_REACTABLE_REFUSAL);
       return;
     }
 
     const canPost = await channelService.canAgentPostToChannel(message.channelId, agent.id);
     if (!canPost) {
-      res.status(403).json({ error: "Agent must join this channel to react to messages" });
+      refuse(res, 403, REACTION_MEMBERSHIP_REQUIRED_REFUSAL);
       return;
     }
 
     await channelService.assertChannelNotArchived(message.channelId);
 
-    if (await isChannelReadOnlyByBillingFeature(message.channelId, agent.serverId)) {
-      res.status(403).json({ error: "This joint channel is read-only because it has more than 2 free servers. It becomes writable again when a server upgrades or a free server leaves." });
+    const billingReadOnly = await getChannelBillingReadOnly(message.channelId, agent.serverId);
+    if (billingReadOnly) {
+      refuse(res, 403, channelBillingReadOnlyRefusal(billingReadOnly));
       return;
     }
     if (await isChannelReadOnlyByQuota(message.channelId, agent.serverId)) {
-      res.status(403).json({ error: "This channel is read-only on your current plan. Upgrade to continue." });
+      refuse(res, 403, REACTION_CHANNEL_READ_ONLY_REFUSAL);
       return;
     }
 
@@ -2872,11 +2978,13 @@ internalRouter.delete("/agent/:id/messages/:messageId/reactions", requireAgentSc
       emoji,
       actor: { kind: "agent", id: agent.id },
       operation: "remove",
+      noticeDeliverer: req.app.get("agentOrchestrator") as AgentOrchestrator | undefined,
+      message,
     });
 
     const context = await messageService.getMessageContext(message.id, 0, 0, undefined, {
       forwardedBundleViewerAgentId: agent.id,
-      forwardedBundleViewerServerId: agent.serverId,
+      viewerServerId: agent.serverId,
       includeSenderTimezone: true,
     });
     const enriched = context?.messages[0];
@@ -2898,7 +3006,7 @@ internalRouter.delete("/agent/:id/messages/:messageId/reactions", requireAgentSc
       return;
     }
     if (err instanceof channelService.ChannelArchivedError) {
-      res.status(409).json({ error: "This channel is archived", code: "channel_archived" });
+      refuse(res, 409, REACTION_CHANNEL_ARCHIVED_REFUSAL);
       return;
     }
     sendJsonServerError(req, res, {
@@ -2910,6 +3018,36 @@ internalRouter.delete("/agent/:id/messages/:messageId/reactions", requireAgentSc
 });
 
 // Agent receives messages (long-poll)
+// A long poll (`block=true`) whose buffer holds only system-app events their
+// guard withholds (fail closed: they stay buffered) would otherwise answer at
+// once, empty, and the daemon would ask again at once, in a loop. It reads the
+// buffer again every withheldReceiveBackoffMs instead, until something can be
+// handed over or the poll's timeout ends.
+let withheldReceiveBackoffMs = 5_000;
+
+/** Test seam: how long a blocking receive waits between reads while all it has is withheld. */
+export function __setWithheldReceiveBackoffMsForTests(ms: number | null): void {
+  withheldReceiveBackoffMs = ms ?? 5_000;
+}
+
+function abortableDelay(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal.aborted) {
+      resolve();
+      return;
+    }
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
 internalRouter.get("/agent/:id/receive", requireAgentScope("message:read"), async (req, res) => {
   try {
     const agentId = req.params.id;
@@ -2974,21 +3112,38 @@ internalRouter.get("/agent/:id/receive", requireAgentScope("message:read"), asyn
       block,
       timeout_ms: timeoutMs,
     });
-    const messages = await tracePhase(
-      () => agentOrchestrator.receiveMessages(agentId, block, timeoutMs, abortController.signal),
-      (_durationMs, receivedMessages) => ({
-        name: "agent_receive.messages.received",
-        attrs: {
-          messages_count: receivedMessages.length,
-          outcome: receivedMessages.length > 0 ? "messages" : block ? "timeout" : "empty",
-        },
-      }),
-    );
+    const deadline = Date.now() + timeoutMs;
+    let messages: AgentMessage[];
+    let guarded: Awaited<ReturnType<typeof partitionDeliverableSystemAppEventMessages<AgentMessage>>>;
+    for (;;) {
+      const remainingMs = Math.max(0, deadline - Date.now());
+      messages = await tracePhase(
+        () => agentOrchestrator.receiveMessages(agentId, block, remainingMs, abortController.signal),
+        (_durationMs, receivedMessages) => ({
+          name: "agent_receive.messages.received",
+          attrs: {
+            messages_count: receivedMessages.length,
+            outcome: receivedMessages.length > 0 ? "messages" : block ? "timeout" : "empty",
+          },
+        }),
+      );
 
-    if (abortController.signal.aborted) return;
+      if (abortController.signal.aborted) return;
+      // System-app events their app's delivery guard vetoes are dropped too; one
+      // it withholds (fail closed) is not returned but stays buffered.
+      guarded = await partitionDeliverableSystemAppEventMessages(messages, agentId);
+      // Withheld alone, in a long poll: back off and read again (see
+      // withheldReceiveBackoffMs) rather than answer empty at once.
+      if (!block || guarded.deliverable.length > 0 || guarded.vetoed.length > 0 || guarded.withheld.length === 0) break;
+      const waitMs = Math.min(withheldReceiveBackoffMs, deadline - Date.now());
+      if (waitMs <= 0) break;
+      addTraceEvent("agent_receive.withheld_backoff", { withheld_count: guarded.withheld.length, wait_ms: waitMs });
+      await abortableDelay(waitMs, abortController.signal);
+      if (abortController.signal.aborted) return;
+    }
     const deliverableMessages: typeof messages = [];
-    const undeliverableMessages: typeof messages = [];
-    for (const message of messages) {
+    const undeliverableMessages: typeof messages = [...guarded.vetoed];
+    for (const message of guarded.deliverable) {
       const canAccess = await canAgentAccessQueuedMessageTarget(message, agentId, agent.serverId);
       if (canAccess) {
         deliverableMessages.push(message);
@@ -3010,11 +3165,9 @@ internalRouter.get("/agent/:id/receive", requireAgentScope("message:read"), asyn
     // task snapshot is never returned as current after a later amendment.
     const refreshedDeliverableMessages = await refreshQueuedAgentTaskProjections(deliverableMessages);
 
+    // Raft's own system apps' events read as ordinary messages; an external app's inert (agentFacingContent.ts).
     const renderedContents = await tracePhase(
-      () => agentPermalinkRenderService.renderAgentReadablePermalinksInTexts(
-        refreshedDeliverableMessages.map((message) => message.content),
-        agent.serverId,
-      ),
+      () => renderAgentFacingContents(refreshedDeliverableMessages, agentId, agent.serverId),
       (_durationMs, rendered) => ({
         name: "messages.rendered",
         attrs: {
@@ -3028,11 +3181,7 @@ internalRouter.get("/agent/:id/receive", requireAgentScope("message:read"), asyn
     res.json({
       messages: refreshedDeliverableMessages.map((message, index) => ({
         ...message,
-        content: message.sender_type === "third_party_app"
-          ? message.external_message
-            ? message.content
-            : renderThirdPartyInertText({ field: "tool_result", value: message.content })
-          : renderedContents[index],
+        content: renderedContents[index],
       })),
     });
   } catch (err) {
@@ -3059,7 +3208,7 @@ internalRouter.post("/agent/:id/receive-ack", async (req, res) => {
       : [];
 
     if (seqs.length === 0 && messageIds.length === 0) {
-      res.status(400).json({ error: "seqs or messageIds must be a non-empty array" });
+      refuse(res, 400, { code: "receive_ack_ids_required", error: "An acknowledgement needs the deliveries it covers: give a non-empty list of seqs or message ids." });
       return;
     }
 
@@ -3148,13 +3297,20 @@ internalRouter.get("/agent/:id/messages/:messageId/resolve", requireAgentScope("
 
     const resolved = await messageService.resolveMessageIdVisibleToAgent(agent.serverId, agentId, rawMessageId);
     if (!resolved.ok) {
-      res.status(resolved.status).json(messageResolveErrorPayload(resolved));
+      refuse(res, resolved.status, messageResolveRefusal(resolved.error));
+      return;
+    }
+    // After the access check, as the agent API does: behind the plan's history
+    // window (the time is from the row the lookup matched).
+    const historyWindow = await getServerHistoryWindowForRead(agent.serverId);
+    if (isBehindHistoryWindow(resolved.message.createdAt, historyWindow)) {
+      refuse(res, 404, agentHistoryLimitedRefusal(historyWindow));
       return;
     }
 
     const payload = await resolveAgentVisibleMessagePayload(resolved.messageId, agent.serverId, agentId);
     if (!payload) {
-      res.status(404).json({ error: "Message not found", errorCode: "NOT_FOUND" });
+      refuse(res, 404, MESSAGE_NOT_FOUND_REFUSAL);
       return;
     }
 
@@ -3177,7 +3333,7 @@ internalRouter.get("/agent/:id/history", requireAgentScope("message:read"), asyn
     const around = typeof req.query.around === "string" ? req.query.around.trim() : undefined;
 
     if (!channelRef) {
-      res.status(400).json({ error: "channel query param is required (e.g. #all, DM:@richard)" });
+      refuse(res, 400, HISTORY_TARGET_REQUIRED_REFUSAL);
       return;
     }
 
@@ -3185,21 +3341,30 @@ internalRouter.get("/agent/:id/history", requireAgentScope("message:read"), asyn
     if ("error" in result) { res.status(result.status).json({ error: result.error }); return; }
     const { agent } = result;
 
-    const resolved = await channelService.resolveChannelByName(agent.serverId, agentId, channelRef);
+    // Task v2: a task ref (`#parent:#7`, as deliveries name a task's
+    // conversation) reads that conversation; none yet is an empty page.
+    const taskConversation = await resolveAgentTaskRefConversation(agent.serverId, agentId, channelRef, { create: false });
+    if (taskConversation && typeof taskConversation === "object" && taskConversation.kind === "pending") {
+      res.json({ messages: [], has_more: false, has_older: false, has_newer: false, last_read_seq: 0 });
+      return;
+    }
+    const resolved = taskConversation && typeof taskConversation === "object"
+      ? { channelId: taskConversation.channelId, type: "thread" as const }
+      : await channelService.resolveChannelByName(agent.serverId, agentId, channelRef);
     if (!resolved) {
-      res.status(404).json({ error: `Channel not found: ${channelRef}` });
+      refuse(res, 404, AGENT_CHANNEL_NOT_FOUND_REFUSAL);
       return;
     }
 
     const channelId = resolved.channelId;
     const hasAccess = await channelService.canAgentAccessChannel(channelId, agentId);
     if (!hasAccess) {
-      res.status(403).json({ error: "You do not have access to this history" });
+      refuse(res, 403, HISTORY_NOT_ACCESSIBLE_REFUSAL);
       return;
     }
 
     const channel = await channelService.getChannel(channelId);
-    const jointThreadProjection = channel?.type === "thread"
+    const jointThreadProjection = isSubConversationType(channel?.type)
       ? await channelService.getJointThreadProjectionByLocalThread(channelId, agent.serverId)
       : null;
     const resolvedAccess = channel?.type === "joint"
@@ -3270,7 +3435,7 @@ internalRouter.get("/agent/:id/history", requireAgentScope("message:read"), asyn
         historyCutoff,
         {
           forwardedBundleViewerAgentId: agent.id,
-          forwardedBundleViewerServerId: agent.serverId,
+          viewerServerId: agent.serverId,
           includeSenderTimezone: true,
         },
       );
@@ -3285,7 +3450,7 @@ internalRouter.get("/agent/:id/history", requireAgentScope("message:read"), asyn
     } else {
       msgs = await messageService.listMessages(storageChannelId, limit + 1, beforeSeq, afterSeq, historyCutoff, {
         forwardedBundleViewerAgentId: agent.id,
-        forwardedBundleViewerServerId: agent.serverId,
+        viewerServerId: agent.serverId,
         includeSenderTimezone: true,
       });
     }
@@ -3303,6 +3468,13 @@ internalRouter.get("/agent/:id/history", requireAgentScope("message:read"), asyn
     const pageMsgs = page.messages;
     hasOlder = page.hasOlder;
     hasNewer = page.hasNewer;
+    // As the agent API: a `--before` page says whether anything is at or after its anchor.
+    if (!around && beforeSeq !== undefined && afterSeq === undefined && !hasNewer) {
+      hasNewer = await messageService.hasMessagesAtOrAfter(storageChannelId, beforeSeq, historyCutoff, {
+        forwardedBundleViewerAgentId: agent.id,
+        viewerServerId: agent.serverId,
+      });
+    }
 
     // Check if plan limit is truncating results
     let historyLimited = false;
@@ -3310,8 +3482,7 @@ internalRouter.get("/agent/:id/history", requireAgentScope("message:read"), asyn
     if (historyCutoff) {
       historyLimited = await messageService.hasOlderMessages(storageChannelId, historyCutoff, beforeSeq);
       if (historyLimited) {
-        const days = getEffectiveLimits(plan as ServerPlan).messageHistoryDays;
-        historyLimitMessage = `History limited to ${days} days on the ${PLAN_CONFIG[plan as ServerPlan].displayName} plan.`;
+        historyLimitMessage = agentHistoryLimitNote({ plan, cutoff: historyCutoff });
       }
     }
 
@@ -3360,7 +3531,7 @@ internalRouter.get("/agent/:id/history", requireAgentScope("message:read"), asyn
           ...visibleMessage,
           senderType: message.messageType === "system" ? "system" : toAgentFacingActorType(message.senderType),
           ...(!external && {
-            actionMetadata,
+            actionMetadata: withoutAgentHiddenActionCardSpec(actionMetadata),
             taskStatus,
             taskNumber,
             taskAssigneeType: taskAssigneeType ? toAgentFacingActorType(taskAssigneeType) : null,
@@ -3401,14 +3572,14 @@ function parseOffsetSearchTimestamp(raw: string): { ok: true; value: Date } | { 
   if (!EXPLICIT_SEARCH_TIMESTAMP_OFFSET_RE.test(trimmed)) {
     return {
       ok: false,
-      error: "Search date filters are missing a timezone offset; use a \"+08:00\"-style ISO timestamp or the raft CLI.",
+      error: "A search date filter needs a time zone offset: give an ISO timestamp such as 2026-08-06T04:38:00+08:00.",
     };
   }
   const value = new Date(trimmed);
   if (Number.isNaN(value.getTime())) {
     return {
       ok: false,
-      error: "Invalid date filter; use an ISO timestamp with a timezone offset such as 2026-08-06T04:38:00+08:00 or the raft CLI.",
+      error: "That search date filter isn't a valid time: give an ISO timestamp with a time zone offset, such as 2026-08-06T04:38:00+08:00.",
     };
   }
   return { ok: true, value };
@@ -3430,7 +3601,7 @@ internalRouter.get("/agent/:id/search", requireAgentScope("message:read"), async
     if (channelRef) {
       const resolved = await channelService.resolveChannelByName(agent.serverId, agentId, channelRef);
       if (!resolved) {
-        res.status(404).json({ error: `Channel not found: ${channelRef}` });
+        refuse(res, 404, AGENT_CHANNEL_NOT_FOUND_REFUSAL);
         return;
       }
       channelId = resolved.channelId;
@@ -3440,7 +3611,7 @@ internalRouter.get("/agent/:id/search", requireAgentScope("message:read"), async
       Number(req.query.limit) || AGENT_API_MESSAGE_SEARCH_DEFAULT_LIMIT,
       AGENT_API_MESSAGE_SEARCH_MAX_LIMIT,
     );
-    const offset = Math.max(Number(req.query.offset) || 0, 0);
+    const offset = parseOffsetQueryParam(req.query.offset);
     const senderFilter = await resolveSearchSenderFilter(
       agent.serverId,
       { type: "agent", id: agentId },
@@ -3455,19 +3626,19 @@ internalRouter.get("/agent/:id/search", requireAgentScope("message:read"), async
     const beforeRaw = typeof req.query.before === "string" ? req.query.before : undefined;
     const afterParsed = afterRaw ? parseOffsetSearchTimestamp(afterRaw) : undefined;
     if (afterParsed && !afterParsed.ok) {
-      res.status(400).json({ error: afterParsed.error, errorCode: "INVALID_DATE_FILTER" });
+      refuse(res, 400, { code: "INVALID_DATE_FILTER", error: afterParsed.error });
       return;
     }
     const beforeParsed = beforeRaw ? parseOffsetSearchTimestamp(beforeRaw) : undefined;
     if (beforeParsed && !beforeParsed.ok) {
-      res.status(400).json({ error: beforeParsed.error, errorCode: "INVALID_DATE_FILTER" });
+      refuse(res, 400, { code: "INVALID_DATE_FILTER", error: beforeParsed.error });
       return;
     }
     const after = afterParsed?.value;
     const before = beforeParsed?.value;
     const sortRaw = typeof req.query.sort === "string" ? req.query.sort : undefined;
     if (sortRaw && sortRaw !== "relevance" && sortRaw !== "recent") {
-      res.status(400).json({ error: "Invalid search sort" });
+      refuse(res, 400, { code: "search_sort_invalid", error: "A search sorts by relevance or by recent: use one of those, or leave the sort out." });
       return;
     }
     const sort = sortRaw === "recent" ? "recent" : "relevance";
@@ -3485,6 +3656,7 @@ internalRouter.get("/agent/:id/search", requireAgentScope("message:read"), async
       senderId: senderFilter.senderId,
       after,
       before,
+      historyCutoff: getHistoryCutoff(await getServerPlan(agent.serverId)),
       sort: query ? sort : "recent",
       limit,
       offset,
@@ -3505,15 +3677,19 @@ internalRouter.get("/agent/:id/search", requireAgentScope("message:read"), async
     res.json({
       ...searchResponse,
       results: searchResponse.results.map((result, index) => {
-        const { externalMessage, ...visibleResult } = result;
+        // RFC 077: an agent reads "sent by an assistant for its owner" as `delegated_by=@name`, as on every other message it reads.
+        const { externalMessage, delegatedBy, retracted: _retracted, ...visibleResult } = result;
         const external = result.senderType === "external_projection";
         // Slack-bridged rows read like ordinary messages; other external content stays inert.
-        const inert = external && !isSlackBridgedExternalProvider(externalMessage?.provider);
+        const inert = external && (!isSlackBridgedExternalProvider(externalMessage?.provider)
+          || externalMessage?.actor_kind === "unknown");
         const taskFact = external ? undefined : taskFacts.get(result.id);
         return {
           ...visibleResult,
+          ...(external && !externalMessage ? { senderId: "" } : {}),
           senderType: toAgentFacingActorType(result.senderType),
           ...(externalMessage ? { external_message: externalMessage } : {}),
+          ...(delegatedBy ? { delegated_by: { name: delegatedBy.name } } : {}),
           content: inert
             ? renderThirdPartyInertText({ field: "tool_result", value: result.content })
             : renderedContents[index],
@@ -3558,28 +3734,31 @@ internalRouter.post("/agent/:id/channels/:channelId/join", requireAgentScope("ch
     }
 
     const channel = await channelService.getChannel(req.params.channelId);
-    if (!channel || channel.serverId !== result.agent.serverId) {
-      res.status(404).json({ error: "Channel not found" });
+    // A channel the agent cannot see answers 404 whatever its type, exactly
+    // like an id that does not exist (#wg-rbac B14, as the agent API's join).
+    if (!channel || channel.serverId !== result.agent.serverId || !await channelService.canAgentAccessChannel(channel.id, result.agent.id)) {
+      // One constant for a missing channel and one the agent cannot see (no existence oracle).
+      refuse(res, 404, AGENT_CHANNEL_NOT_FOUND_REFUSAL);
       return;
     }
-    if (channel.type === "thread") {
-      res.status(400).json({ error: "Thread membership is managed via follow/unfollow" });
+    if (isSubConversationType(channel.type)) {
+      refuse(res, 400, THREAD_NOT_JOINABLE_REFUSAL);
       return;
     }
     if (channel.type === "dm") {
-      res.status(403).json({ error: "Cannot join DM channels" });
+      refuse(res, 403, DM_NOT_JOINABLE_REFUSAL);
       return;
     }
     if (channel.type === "private") {
-      res.status(403).json({ error: "Private channels require an invitation" });
+      refuse(res, 403, PRIVATE_CHANNEL_INVITE_ONLY_REFUSAL);
       return;
     }
     if (channel.type === "joint") {
-      res.status(403).json({ error: "Joint channels require an invitation" });
+      refuse(res, 403, JOINT_CHANNEL_ADD_ONLY_REFUSAL);
       return;
     }
     if (channel.archivedAt) {
-      res.status(409).json({ error: "This channel is archived", code: "channel_archived" });
+      refuse(res, 409, JOIN_CHANNEL_ARCHIVED_REFUSAL);
       return;
     }
     const wasAgentMember = await channelService.isChannelAgent(channel.id, result.agent.id);
@@ -3588,7 +3767,7 @@ internalRouter.post("/agent/:id/channels/:channelId/join", requireAgentScope("ch
       return;
     }
     if (!await actorHasServerCapabilityInServer(result.agent.serverId, "agent", result.agent.id, "joinPublicChannels")) {
-      res.status(403).json({ error: "Server role cannot join public channels" });
+      refuse(res, 403, SERVER_ROLE_CANNOT_JOIN_REFUSAL);
       return;
     }
 
@@ -3640,28 +3819,32 @@ internalRouter.post("/agent/:id/channels/:channelId/leave", requireAgentScope("c
     }
 
     const channel = await channelService.getChannel(req.params.channelId);
-    if (!channel || channel.serverId !== result.agent.serverId) {
-      res.status(404).json({ error: "Channel not found" });
+    // Visibility first: a channel the agent cannot see answers 404 whatever
+    // its type, exactly like an id that does not exist (#wg-rbac B14).
+    if (!channel || channel.serverId !== result.agent.serverId || !await channelService.canAgentAccessChannel(channel.id, result.agent.id)) {
+      // One constant for a missing channel and one the agent cannot see (no existence oracle).
+      refuse(res, 404, AGENT_CHANNEL_NOT_FOUND_REFUSAL);
       return;
     }
     // Joint channels carry ordinary membership: a human can leave one, so an
     // agent can too. Leaving only removes this agent's row on this server's
     // projection; other servers' members are untouched.
     if (channel.type !== "channel" && channel.type !== "private" && channel.type !== "joint") {
-      res.status(403).json({ error: "Agents can only leave regular or joint channels" });
-      return;
-    }
-    const hasAccess = await channelService.canAgentAccessChannel(channel.id, result.agent.id);
-    if (!hasAccess) {
-      res.status(403).json({ error: "Agents can only leave channels they can see" });
+      refuse(res, 403, CHANNEL_TYPE_NOT_LEAVABLE_REFUSAL);
       return;
     }
     if (channel.archivedAt) {
-      res.status(409).json({ error: "This channel is archived", code: "channel_archived" });
+      refuse(res, 409, LEAVE_CHANNEL_ARCHIVED_REFUSAL);
       return;
     }
 
-    await channelService.removeAgent(channel.id, result.agent.id);
+    // An older CLI's path: the same refusal as the agent API's leave (it can't send deleteIfLast, so a person deletes the channel).
+    const deleteIfLast = (req.body as { deleteIfLast?: unknown } | undefined)?.deleteIfLast === true;
+    const removal = await removeUnlessLastMember(() => channelService.removeAgent(channel.id, result.agent.id, undefined, undefined, deleteIfLast ? "delete" : "refuse"));
+    if (!removal) {
+      refuse(res, 409, lastMemberRefusal({ target: `#${channel.name}` }));
+      return;
+    }
     if (channel.type !== "channel") {
       const agentOrchestrator = req.app.get("agentOrchestrator") as AgentOrchestrator;
       await agentOrchestrator.purgeAgentInboxForChannelTree(
@@ -3671,7 +3854,7 @@ internalRouter.post("/agent/:id/channels/:channelId/leave", requireAgentScope("c
       );
     }
     req.app.get("io")?.to(channel.type === "private" ? `channel:${channel.id}` : `server:${result.agent.serverId}`).emit("channel:members-updated", { channelId: channel.id });
-    res.json({ ok: true });
+    res.json({ ok: true, ...(removal.channelDeleted ? { channelDeleted: true } : {}) });
     recordRaftCliActivity(req, result.agent.id, {
       command: "channel.leave",
       summary: "Left channel",
@@ -3679,8 +3862,8 @@ internalRouter.post("/agent/:id/channels/:channelId/leave", requireAgentScope("c
     });
   } catch (err: any) {
     const msg = err?.message || "";
-    if (msg.includes("Cannot remove")) {
-      res.status(403).json({ error: msg });
+    if (msg === channelService.ALL_CHANNEL_LEAVE_MESSAGE || msg === channelService.ALL_CHANNEL_REMOVE_MEMBERS_MESSAGE) {
+      refuse(res, 403, ALL_CHANNEL_MEMBERSHIP_FIXED_REFUSAL);
       return;
     }
     res.status(500).json({ error: "Failed to leave channel" });
@@ -3830,33 +4013,33 @@ internalRouter.post("/agent/:id/threads/unfollow", requireAgentScope("thread:unf
 
     const threadRef = typeof req.body?.thread === "string" ? req.body.thread.trim() : "";
     if (!threadRef) {
-      res.status(400).json({ error: "thread is required" });
+      refuse(res, 400, { code: "thread_required", error: "An unfollow needs a thread: name it as #channel:<msg> or dm:@peer:<msg>, with the parent message's msg= short id." });
       return;
     }
-    const reason = typeof req.body?.reason === "string" && req.body.reason.trim()
-      ? req.body.reason.trim()
-      : "no longer following";
+    const reason = messageService.normalizeUnfollowReason(req.body?.reason);
 
     let threadChannelId: string | null = null;
     if (UUID_RE.test(threadRef)) {
       const channel = await channelService.getChannel(threadRef);
-      if (!channel || channel.serverId !== result.agent.serverId) {
-        res.status(404).json({ error: "Thread not found" });
+      // Visibility before the kind check: an id the agent cannot see answers
+      // 404 like one that does not exist, never "not a thread" (#wg-rbac B14).
+      if (!channel || channel.serverId !== result.agent.serverId || !await channelService.canAgentAccessChannel(channel.id, result.agent.id)) {
+        refuse(res, 404, THREAD_NOT_FOUND_REFUSAL);
         return;
       }
-      if (channel.type !== "thread") {
-        res.status(400).json({ error: "Target must be a thread" });
+      if (!isSubConversationType(channel.type)) {
+        refuse(res, 400, NOT_A_THREAD_REFUSAL);
         return;
       }
       threadChannelId = channel.id;
     } else {
       const resolved = await channelService.resolveChannelByName(result.agent.serverId, result.agent.id, threadRef);
       if (!resolved) {
-        res.status(404).json({ error: "Thread not found" });
+        refuse(res, 404, THREAD_NOT_FOUND_REFUSAL);
         return;
       }
       if (resolved.type !== "thread") {
-        res.status(400).json({ error: "Target must be a thread" });
+        refuse(res, 400, NOT_A_THREAD_REFUSAL);
         return;
       }
       threadChannelId = resolved.channelId;
@@ -3879,7 +4062,7 @@ internalRouter.post("/agent/:id/threads/unfollow", requireAgentScope("thread:unf
         io,
         agentOrchestrator,
         threadChannelId,
-        `@${result.agent.name} stopped following this thread: ${messageService.summarizeForSystemMessage(reason)}`,
+        messageService.buildUnfollowNotice(result.agent.name, "thread", reason),
         {
           // Self-unfollow has a zero-person audience. Record no inbox fact.
           // Tenny ruling (#8): skip-mode, not born-read.
@@ -3912,13 +4095,13 @@ internalRouter.get("/agent/:id/channel-members", requireAgentScope("channel:read
   try {
     const channelRef = typeof req.query.channel === "string" ? req.query.channel : "";
     if (!channelRef) {
-      res.status(400).json({ error: "channel query param is required (e.g. #general)" });
+      refuse(res, 400, { code: "channel_required", error: "Listing a channel's members needs a channel: name one, such as #general." });
       return;
     }
 
     const ctx = await resolveAgentChannel(req.params.id, req.serverId!, req.machineId, channelRef);
     if (!ctx) {
-      res.status(404).json({ error: `Channel not found: ${channelRef}` });
+      refuse(res, 404, AGENT_CHANNEL_NOT_FOUND_REFUSAL);
       return;
     }
 
@@ -3939,7 +4122,8 @@ internalRouter.get("/agent/:id/channel-members", requireAgentScope("channel:read
       agents: visibleAgents,
       humans: visibleHumans.map((u) => {
         const servers = channelService.agentVisibleMemberServers(u, ctx.agent.serverId);
-        return { name: u.name, description: u.description, role: u.role, ...(servers ? { servers } : {}) };
+        // Another server's person: their role stays with their organization.
+        return { name: u.name, description: u.description, ...(u.serverId === ctx.agent.serverId ? { role: u.role } : {}), ...(servers ? { servers } : {}) };
       }),
     });
   } catch (err) {
@@ -4059,19 +4243,21 @@ internalRouter.post("/agent/:id/server/avatar", requireAgentScope("server:update
 
     const server = await serverService.getServer(result.agent.serverId);
     if (!server) {
-      res.status(404).json({ error: "Server not found" });
+      refuse(res, 404, SERVER_GONE_FOR_AVATAR_REFUSAL);
       return;
     }
     const uploaded = await runSingleAvatarUpload(serverAvatarUpload, req);
     if (!uploaded) {
-      res.status(400).json({ error: "No avatar file provided" });
+      refuse(res, 400, AVATAR_FILE_REQUIRED_REFUSAL);
       return;
     }
 
     const avatarUrl = await storeServerAvatar(server.id, server.avatarUrl, uploaded.buffer);
-    const updated = await serverService.updateServerProfile(server.id, { avatarUrl });
+    const updated = await serverService.updateServerProfile(server.id, { avatarUrl }, {
+      audit: await agentServerProfileAudit({ id: result.agent.id, name: result.agent.name, serverId: result.agent.serverId }, server.id),
+    });
     if (!updated) {
-      res.status(404).json({ error: "Server not found" });
+      refuse(res, 404, SERVER_GONE_FOR_AVATAR_REFUSAL);
       return;
     }
 
@@ -4083,18 +4269,11 @@ internalRouter.post("/agent/:id/server/avatar", requireAgentScope("server:update
     });
   } catch (err: any) {
     if (err instanceof multer.MulterError && err.code === "LIMIT_FILE_SIZE") {
-      res.status(400).json({
-        error: PROFILE_AVATAR_TOO_LARGE_MESSAGE,
-        errorCode: "PROFILE_AVATAR_TOO_LARGE",
-        maxBytes: MAX_PROFILE_AVATAR_BYTES,
-      });
+      refuse(res, 400, AVATAR_TOO_LARGE_REFUSAL);
       return;
     }
     if (err instanceof Error && err.message.includes(PROFILE_AVATAR_BAD_FORMAT_MESSAGE)) {
-      res.status(400).json({
-        error: PROFILE_AVATAR_BAD_FORMAT_MESSAGE,
-        errorCode: "PROFILE_AVATAR_BAD_FORMAT",
-      });
+      refuse(res, 400, AVATAR_BAD_FORMAT_REFUSAL);
       return;
     }
     sendJsonServerError(req, res, {
@@ -4163,9 +4342,19 @@ internalRouter.post("/agent/:id/profile/avatar", async (req, res) => {
       return;
     }
 
+    // Same fence as the agent API: a managed bot's avatar follows the app logo.
+    if (result.agent.managedByAppInstallId) {
+      refuse(res, 403, APP_BOT_AVATAR_MANAGED_REFUSAL);
+      return;
+    }
+    // A personal assistant's avatar is always Ottie's.
+    if (result.agent.assistantOwnerUserId) {
+      refuse(res, 403, { code: ASSISTANT_PROFILE_FIXED_CODE, error: ASSISTANT_PROFILE_FIXED_ERROR });
+      return;
+    }
     const uploaded = await runSingleAvatarUpload(profileAvatarUpload, req);
     if (!uploaded) {
-      res.status(400).json({ error: "No avatar file provided" });
+      refuse(res, 400, AVATAR_FILE_REQUIRED_REFUSAL);
       return;
     }
 
@@ -4179,7 +4368,7 @@ internalRouter.post("/agent/:id/profile/avatar", async (req, res) => {
 
     const profile = await buildAgentProfileView(result.agent.id, result.agent.id, agentOrchestrator);
     if (!profile) {
-      res.status(404).json({ error: "Agent not found" });
+      refuse(res, 404, AGENT_GONE_REFUSAL);
       return;
     }
 
@@ -4191,18 +4380,11 @@ internalRouter.post("/agent/:id/profile/avatar", async (req, res) => {
     });
   } catch (err) {
     if (err instanceof multer.MulterError && err.code === "LIMIT_FILE_SIZE") {
-      res.status(400).json({
-        error: PROFILE_AVATAR_TOO_LARGE_MESSAGE,
-        errorCode: "PROFILE_AVATAR_TOO_LARGE",
-        maxBytes: MAX_PROFILE_AVATAR_BYTES,
-      });
+      refuse(res, 400, AVATAR_TOO_LARGE_REFUSAL);
       return;
     }
     if (err instanceof Error && err.message.includes(PROFILE_AVATAR_BAD_FORMAT_MESSAGE)) {
-      res.status(400).json({
-        error: PROFILE_AVATAR_BAD_FORMAT_MESSAGE,
-        errorCode: "PROFILE_AVATAR_BAD_FORMAT",
-      });
+      refuse(res, 400, AVATAR_BAD_FORMAT_REFUSAL);
       return;
     }
     sendJsonServerError(req, res, {
@@ -4213,9 +4395,6 @@ internalRouter.post("/agent/:id/profile/avatar", async (req, res) => {
   }
 });
 
-const MAX_AGENT_PROFILE_DESCRIPTION_LENGTH = 3000;
-const MAX_AGENT_PROFILE_DISPLAY_NAME_LENGTH = 80;
-
 internalRouter.post("/agent/:id/profile", async (req, res) => {
   try {
     const result = await loadOwnedMachineAgent(req.params.id, req.machineId, req.serverId);
@@ -4225,82 +4404,27 @@ internalRouter.post("/agent/:id/profile", async (req, res) => {
     }
 
     const body = (req.body ?? {}) as { avatarUrl?: unknown; displayName?: unknown; description?: unknown };
-    const hasAvatarUrl = Object.prototype.hasOwnProperty.call(body, "avatarUrl");
-    const hasDisplayName = Object.prototype.hasOwnProperty.call(body, "displayName");
-    const hasDescription = Object.prototype.hasOwnProperty.call(body, "description");
-    if (!hasAvatarUrl && !hasDisplayName && !hasDescription) {
-      res.status(400).json({
-        error: "Provide at least one of avatarUrl, displayName, or description",
-        errorCode: "PROFILE_UPDATE_NO_FIELDS",
-      });
+    const fenced = await agentProfileFenceRefusal(result.agent, body, async () => Boolean(await getHostedRuntimeSummary(result.agent.id)));
+    if (fenced) {
+      refuse(res, 403, fenced);
       return;
     }
-
-    const fields: { avatarUrl?: string; displayName?: string; description?: string } = {};
-
-    if (hasAvatarUrl) {
-      const value = body.avatarUrl;
-      if (typeof value !== "string") {
-        res.status(400).json({ error: "avatarUrl must be a string" });
-        return;
-      }
-      const trimmed = value.trim();
-      if (trimmed.length === 0) {
-        res.status(400).json({ error: "avatarUrl must not be empty" });
-        return;
-      }
-      if (!trimmed.startsWith("pixel:")) {
-        res.status(400).json({
-          error: "avatarUrl must be a pixel: URL",
-          errorCode: "PROFILE_AVATAR_URL_BAD_FORMAT",
-        });
-        return;
-      }
-      fields.avatarUrl = trimmed;
+    const checked = agentProfileUpdateFields(body);
+    if (!checked.ok) {
+      refuse(res, 400, checked.refusal);
+      return;
     }
-
-    if (hasDisplayName) {
-      const value = body.displayName;
-      if (typeof value !== "string") {
-        res.status(400).json({ error: "displayName must be a string" });
-        return;
-      }
-      const trimmed = value.trim();
-      if (trimmed.length === 0) {
-        res.status(400).json({ error: "displayName must not be empty" });
-        return;
-      }
-      if (trimmed.length > MAX_AGENT_PROFILE_DISPLAY_NAME_LENGTH) {
-        res.status(400).json({
-          error: `displayName must be at most ${MAX_AGENT_PROFILE_DISPLAY_NAME_LENGTH} characters`,
-        });
-        return;
-      }
-      fields.displayName = trimmed;
-    }
-
-    if (hasDescription) {
-      const value = body.description;
-      if (typeof value !== "string") {
-        res.status(400).json({ error: "description must be a string" });
-        return;
-      }
-      if (value.length === 0) {
-        res.status(400).json({ error: "description must not be empty" });
-        return;
-      }
-      if (value.length > MAX_AGENT_PROFILE_DESCRIPTION_LENGTH) {
-        res.status(400).json({
-          error: `description must be at most ${MAX_AGENT_PROFILE_DESCRIPTION_LENGTH} characters`,
-        });
-        return;
-      }
-      fields.description = value;
+    const { fields } = checked;
+    // A personal assistant is always Ottie; its avatar is reserved for assistants.
+    const profileRefusal = agentProfileWriteRefusal(result.agent, fields);
+    if (profileRefusal) {
+      refuse(res, profileRefusal.status, { code: profileRefusal.code, error: profileRefusal.error });
+      return;
     }
 
     const updated = await agentService.updateAgent(result.agent.id, fields);
     if (!updated) {
-      res.status(404).json({ error: "Agent not found" });
+      refuse(res, 404, AGENT_GONE_REFUSAL);
       return;
     }
     broadcastAgentUpdated(req, result.agent.serverId, result.agent.id);
@@ -4312,7 +4436,7 @@ internalRouter.post("/agent/:id/profile", async (req, res) => {
 
     const profile = await buildAgentProfileView(result.agent.id, result.agent.id, agentOrchestrator);
     if (!profile) {
-      res.status(404).json({ error: "Agent not found" });
+      refuse(res, 404, AGENT_GONE_REFUSAL);
       return;
     }
 
@@ -4359,7 +4483,7 @@ async function resolveAgentTaskChannel(agentId: string, serverId: string, machin
 
 function rejectAgentTaskWriteIfNeeded(canPost: boolean, res: Response): boolean {
   if (!canPost) {
-    res.status(403).json({ error: "Agent must join this channel to modify tasks" });
+    refuse(res, 403, TASK_MEMBERSHIP_REQUIRED_REFUSAL);
     return true;
   }
   return false;
@@ -4371,10 +4495,7 @@ function rejectHistoricalJointTaskWriteIfNeeded(
   res: Response,
 ): boolean {
   if (!surface || !isHistoricalJointTaskReadOnly(surface, createdAt)) return false;
-  res.status(403).json({
-    error: "Historical tasks are read-only from a participant workspace",
-    code: "joint_task_read_only",
-  });
+  refuse(res, 403, JOINT_TASK_READ_ONLY_REFUSAL);
   return true;
 }
 
@@ -4383,13 +4504,13 @@ internalRouter.get("/agent/:id/tasks", requireAgentScope("task:read"), async (re
   try {
     const channelRef = req.query.channel as string;
     if (!channelRef) {
-      res.status(400).json({ error: "channel query param is required (e.g. #general)" });
+      refuse(res, 400, { code: "channel_required", error: "Listing tasks needs a channel: name one, such as #general." });
       return;
     }
 
     const ctx = await resolveAgentTaskChannel(req.params.id, req.serverId!, req.machineId, channelRef);
     if (!ctx) {
-      res.status(404).json({ error: "Agent or channel not found" });
+      refuse(res, 404, TASK_CHANNEL_NOT_FOUND_REFUSAL);
       return;
     }
 
@@ -4402,7 +4523,7 @@ internalRouter.get("/agent/:id/tasks", requireAgentScope("task:read"), async (re
     let statusFilter: TaskStatus | undefined;
     if (statusParam !== undefined) {
       if (typeof statusParam !== "string" || !isTaskStatus(statusParam)) {
-        res.status(400).json({ error: "Invalid status value" });
+        refuse(res, 400, { code: "invalid_status", error: "That isn't a task status: filter by backlog, todo, in_progress, in_review, done or closed." });
         return;
       }
       statusFilter = statusParam;
@@ -4423,52 +4544,99 @@ internalRouter.post("/agent/:id/tasks", requireAgentScope("task:write"), async (
   try {
     const { channel, tasks: items } = req.body;
     if (!channel || !Array.isArray(items) || items.length === 0) {
-      res.status(400).json({ error: "channel and tasks array are required" });
+      refuse(res, 400, { code: "tasks_required", error: "A task create needs a channel and at least one task: name the channel and give each task a title." });
       return;
     }
     if (items.length > 50) {
-      res.status(400).json({ error: "Cannot create more than 50 tasks at once" });
+      refuse(res, 400, TOO_MANY_TASKS_REFUSAL);
       return;
     }
     for (const item of items) {
       if (!item.title || typeof item.title !== "string" || item.title.trim().length === 0) {
-        res.status(400).json({ error: "Each task must have a non-empty title" });
+        refuse(res, 400, { code: "task_title_required", error: "Every task needs a title: give each one a short line saying what the work is." });
+        return;
+      }
+      if (item.description != null && typeof item.description !== "string") {
+        refuse(res, 400, { code: "task_description_invalid", error: "A task's description has to be text: send it as a string, or leave it out." });
+        return;
+      }
+      if (item.source_message_id != null && typeof item.source_message_id !== "string") {
+        refuse(res, 400, { code: "invalid_source_message", error: "A task's source message has to be given as a message id." });
         return;
       }
     }
 
     const ctx = await resolveAgentTaskChannel(req.params.id, req.serverId!, req.machineId, channel);
     if (!ctx) {
-      res.status(404).json({ error: "Agent or channel not found" });
+      refuse(res, 404, TASK_CHANNEL_NOT_FOUND_REFUSAL);
       return;
     }
-    if (ctx.channelType === "thread") {
-      res.status(409).json({ error: "Thread messages cannot become tasks" });
+    // A sub-conversation (a thread, a task's own conversation) holds no tasks.
+    if (isSubConversationType(ctx.channelType)) {
+      refuse(res, 409, TASK_CREATE_IN_THREAD_REFUSAL);
       return;
     }
     if (rejectAgentTaskWriteIfNeeded(await channelService.canAgentPostToChannel(ctx.channelId, req.params.id), res)) return;
     if (await channelService.isChannelArchived(ctx.channelId)) {
-      res.status(409).json({ error: "This channel is archived", code: "channel_archived" });
+      refuse(res, 409, CHANNEL_ARCHIVED_REFUSAL);
       return;
     }
 
-    const { tasks: created, hostMessages } = await taskService.createTasks(
+    // Task v2: a source message needs task v2 conversations on this server.
+    const hasSource = (item: { source_message_id?: unknown }) => typeof item.source_message_id === "string" && item.source_message_id.trim().length > 0;
+    const taskV2 = await isTaskV2ConversationsEnabled(ctx.localChannel.serverId);
+    if (items.some(hasSource) && !taskV2) {
+      const refusal = new TaskV2NotEnabledError();
+      res.status(refusal.status).json({ error: refusal.message, code: refusal.code });
+      return;
+    }
+    // Task v2: a task always has a source, the message that asked for it
+    // (#wg-task-v2:#23). Flag off keeps the pre-v2 host message.
+    if (taskV2 && !items.every(hasSource)) {
+      refuse(res, 400, taskSourceRequiredRefusal(channel));
+      return;
+    }
+
+    // Task v2: resolve each item's source message (full or short id) here, a
+    // reply in one of the channel's threads to that thread's root;
+    // createTasks re-validates it under the channel lock.
+    const createItems: taskService.TaskCreateItem[] = [];
+    for (const item of items) {
+      let sourceMessageId: string | null = null;
+      if (item.source_message_id) {
+        const resolved = await taskService.resolveTaskSourceMessage(ctx.storageChannelId, item.source_message_id.trim());
+        if (!resolved) {
+          refuse(res, 400, { code: "invalid_source_message", error: `There is no such message in this channel or its threads to make a task from: ${INVALID_TASK_SOURCE_STEP}` });
+          return;
+        }
+        sourceMessageId = resolved.id;
+      }
+      const description = typeof item.description === "string" ? item.description.trim() : "";
+      createItems.push({ title: item.title.trim(), ...(description ? { description } : {}), sourceMessageId });
+    }
+
+    const { tasks: created, hostMessages, hostMessagesVisible } = await taskService.createTasks(
       ctx.storageChannelId,
       "agent",
       req.params.id,
-      items.map((i) => ({ title: i.title.trim() })),
+      createItems,
+      { initiatingServerId: ctx.localChannel.serverId },
     );
 
     const io: SocketServer = req.app.get("io");
     const agentOrchestrator = req.app.get("agentOrchestrator") as AgentOrchestrator;
     const creatorName = created[0]?.createdByName || "Unknown";
 
-    // v1.4: host message broadcasts on the ordinary message:new / agent-delivery
-    // path; the task fact broadcasts separately on the task board.
+    // Task v2 (flag on): creating a task writes no message (the task has
+    // its own conversation), so nothing goes out as message:new or to agents. Flag off (pre-v2, v1.4): the
+    // host message broadcasts on the ordinary message:new / agent-delivery
+    // path. The task fact broadcasts separately on the task board.
     const targets = await getTaskRealtimeSurfaceTargets(ctx.surface);
     for (const target of targets) {
       const projectedTasks = taskService.projectTasksToChannel(created, target.localChannel);
-      const projectedMessages = hostMessages.map((message) => ({ ...message, channelId: target.channelId }));
+      const projectedMessages = hostMessagesVisible
+        ? hostMessages.map((message) => ({ ...message, channelId: target.channelId }))
+        : [];
       for (const message of projectedMessages) {
         // message-realtime-producer: task-route.new.internal-agent
         emitTaskMessageNew(io, target, message, creatorName);
@@ -4477,17 +4645,21 @@ internalRouter.post("/agent/:id/tasks", requireAgentScope("task:write"), async (
         channelId: target.channelId,
         tasks: projectedTasks,
       });
-      await messageService.deliverMessagesToAgents(
-        agentOrchestrator,
-        projectedMessages,
-        creatorName,
-      );
+      if (projectedMessages.length > 0) {
+        await messageService.deliverMessagesToAgents(
+          agentOrchestrator,
+          projectedMessages,
+          creatorName,
+        );
+      }
     }
 
-    // Emit system message to chat (visible to humans + agents, counts as unread)
+    // Emit system message to chat (visible to humans + agents, counts as unread).
+    // Task v2 (flag on): creating a task posts nothing in the
+    // channel (spec §2, §4); the task board event above is the whole update.
     const taskList = created.map((t) => `#${t.taskNumber} "${messageService.summarizeForSystemMessage(t.title)}"`).join(", ");
     const sysContent = `📋 ${created.length} new task${created.length > 1 ? "s" : ""} created: ${taskList}`;
-    messageService.broadcastSystemMessageToLocalSurfaces(io, agentOrchestrator, ctx.channelId, sysContent, {
+    if (hostMessagesVisible) messageService.broadcastSystemMessageToLocalSurfaces(io, agentOrchestrator, ctx.channelId, sysContent, {
       inboxFactPolicy: {
         mode: "record",
         producer: "task.created_summary",
@@ -4496,6 +4668,16 @@ internalRouter.post("/agent/:id/tasks", requireAgentScope("task:write"), async (
       },
       // The agent that created the tasks should not see its own action as unread.
     }).catch(() => {});
+
+    // Task v2: the "created from this message" line in the source's thread,
+    // as on the agent API, so whoever asked sees their request was taken.
+    if (taskV2) {
+      await announceTasksCreatedFromSourceMessages(io, agentOrchestrator, {
+        tasks: created,
+        localChannel: ctx.localChannel,
+        actor: { type: "agent", id: req.params.id },
+      }).catch((err) => console.error("internal.task-create source announcement failed:", err));
+    }
 
     res.json({ tasks: taskService.projectTasksToChannel(created, ctx.localChannel) });
     recordRaftCliActivity(req, req.params.id, {
@@ -4521,23 +4703,41 @@ internalRouter.post("/agent/:id/tasks/claim", requireAgentScope("task:write"), a
     const hasMessageIds = Array.isArray(message_ids) && message_ids.length > 0;
 
     if (!channel || (!hasTaskNumbers && !hasMessageIds)) {
-      res.status(400).json({ error: "channel and either task_numbers or message_ids array are required" });
+      refuse(res, 400, { code: "task_numbers_required", error: "A claim needs a channel and the tasks to claim: name the channel, and give the task numbers or message ids." });
       return;
     }
 
     const ctx = await resolveAgentTaskChannel(req.params.id, req.serverId!, req.machineId, channel);
     if (!ctx) {
-      res.status(404).json({ error: "Agent or channel not found" });
+      refuse(res, 404, TASK_CHANNEL_NOT_FOUND_REFUSAL);
       return;
     }
-    if (ctx.channelType === "thread") {
-      res.status(409).json({ error: "Thread messages cannot be claimed as tasks" });
+    if (isSubConversationType(ctx.channelType)) {
+      refuse(res, 409, TASK_CLAIM_IN_THREAD_REFUSAL);
       return;
     }
     if (rejectAgentTaskWriteIfNeeded(await channelService.canAgentPostToChannel(ctx.channelId, req.params.id), res)) return;
     if (await channelService.isChannelArchived(ctx.channelId)) {
-      res.status(409).json({ error: "This channel is archived", code: "channel_archived" });
+      refuse(res, 409, CHANNEL_ARCHIVED_REFUSAL);
       return;
+    }
+
+    // Task v2 server: claim by message id does not execute (nothing in the
+    // call is claimed); the error text carries the --number / create commands
+    // so CLIs that only speak this legacy route print them (spec §5).
+    if (hasMessageIds) {
+      const useCreate = await taskV2ClaimByMessageRefusal({
+        storageChannelId: ctx.storageChannelId,
+        initiatingServerId: ctx.localChannel.serverId,
+        channel,
+        messageIds: message_ids,
+        selfHandle: ctx.agent.name,
+        alsoHadTaskNumbers: hasTaskNumbers,
+      });
+      if (useCreate) {
+        res.status(useCreate.status).json(useCreate.body);
+        return;
+      }
     }
 
     const io: SocketServer = req.app.get("io");
@@ -4545,12 +4745,32 @@ internalRouter.post("/agent/:id/tasks/claim", requireAgentScope("task:write"), a
     const agentName = ctx.agent.displayName || ctx.agent.name;
     const successfulClaims: { taskNumber: number; title: string; messageId: string }[] = [];
 
+    // The rows before the claim: each claim's lifecycle lines name what it
+    // changed (taken / moved to In Progress).
+    const claimTargetsBefore = new Map<number, { status: string; claimedByType: string | null; claimedById: string | null }>();
     if (hasTaskNumbers) {
       for (const taskNumber of task_numbers) {
         const existing = await taskService.getTaskByNumber(ctx.storageChannelId, taskNumber);
         if (existing && rejectHistoricalJointTaskWriteIfNeeded(ctx.surface, existing.createdAt, res)) return;
+        if (existing) claimTargetsBefore.set(taskNumber, existing);
       }
     }
+    // Task v2: the claimer follows the task conversation (`assigned`; an
+    // explicit unfollow is reactivated) and the conversation gets the claim's
+    // lines. Flag off / none: nothing, as before (no chat-surface line).
+    const announceClaim = (
+      claimedRow: { id: string; taskNumber: number; title: string; status: string },
+      before: { status: string; claimedByType: string | null; claimedById: string | null } | undefined,
+    ) => announceTaskClaim(io, agentOrchestrator, {
+      taskId: claimedRow.id,
+      taskNumber: claimedRow.taskNumber,
+      title: claimedRow.title,
+      localChannel: ctx.localChannel,
+      actor: { type: "agent", id: req.params.id },
+      before: before ?? { status: "todo", claimedByType: null, claimedById: null },
+      afterStatus: claimedRow.status,
+      legacyContent: null,
+    });
 
     // Claim by task numbers
     const results: { taskNumber?: number; messageId?: string; success: boolean; reason?: string }[] = [];
@@ -4566,7 +4786,11 @@ internalRouter.post("/agent/:id/tasks/claim", requireAgentScope("task:write"), a
       for (const r of batchResults) {
         let claimedMessageId: string | undefined;
         if (r.success && r.task) {
-          const facts = await emitTaskMutationToSurfaces(io, ctx.surface, r.task);
+          // Task v2: a pre-v2 task gets its own conversation now, so the
+          // returned thread target is that conversation (flag off: no-op).
+          const claimedTask = await withTaskConversationEnsured(r.task, { initiatingServerId: ctx.localChannel.serverId });
+          const facts = await emitTaskMutationToSurfaces(io, ctx.surface, claimedTask);
+          await announceClaim(claimedTask.row, claimTargetsBefore.get(r.taskNumber));
           claimedMessageId = facts.messageId ?? undefined;
           if (facts.messageId) {
             successfulClaims.push({ taskNumber: facts.taskNumber, title: facts.title, messageId: facts.messageId });
@@ -4582,10 +4806,35 @@ internalRouter.post("/agent/:id/tasks/claim", requireAgentScope("task:write"), a
         const preflight = await taskService.resolveMessageInChannel(ctx.storageChannelId, rawMsgId);
         if (preflight && rejectHistoricalJointTaskWriteIfNeeded(ctx.surface, preflight.createdAt, res)) return;
         if (preflight) {
-          const existing = await taskService.resolveTaskByMessageId(preflight.id);
-          if (existing && rejectHistoricalJointTaskWriteIfNeeded(ctx.surface, existing.row.createdAt, res)) return;
+          const existing = await taskService.resolveClaimTargetByMessageId(preflight.id);
+          if (existing.kind === "task" && rejectHistoricalJointTaskWriteIfNeeded(ctx.surface, existing.owner.row.createdAt, res)) return;
         }
       }
+      // Claim an existing task this message names (its pre-v2 host message, or
+      // the single task hanging under it). "rejected-joint" = the response was already sent.
+      const claimExistingTask = async (msgId: string, existingOwner: taskService.TaskOwner): Promise<"done" | "rejected-joint"> => {
+        if (rejectHistoricalJointTaskWriteIfNeeded(ctx.surface, existingOwner.row.createdAt, res)) return "rejected-joint";
+        const existingNumber = existingOwner.row.taskNumber;
+        const reason = await taskService.getClaimConflictReasonForOwner(existingOwner, "agent", req.params.id);
+        if (reason) {
+          results.push({ messageId: msgId, success: false, reason, taskNumber: existingNumber });
+          return "done";
+        }
+        const claimed = await taskService.claimTask(existingOwner.row.id, "agent", req.params.id);
+        if (typeof claimed !== "string") {
+          const facts = await emitTaskMutationToSurfaces(io, ctx.surface, claimed);
+          await announceClaim(claimed.row, existingOwner.row);
+          if (facts.messageId) {
+            successfulClaims.push({ taskNumber: facts.taskNumber, title: facts.title, messageId: facts.messageId });
+          }
+          results.push({ messageId: msgId, success: true, taskNumber: facts.taskNumber });
+          return "done";
+        }
+        results.push({ messageId: msgId, success: false, reason: claimed, taskNumber: existingNumber });
+        return "done";
+      };
+      // As in the agent API: a message behind the plan's history window can't become a task.
+      const claimHistoryWindow = await getServerHistoryWindowForRead(ctx.agent.serverId);
       for (const rawMsgId of message_ids) {
         // Resolve short ID prefix to full message ID
         const resolved = await taskService.resolveMessageInChannel(ctx.storageChannelId, rawMsgId);
@@ -4600,31 +4849,42 @@ internalRouter.post("/agent/:id/tasks/claim", requireAgentScope("task:write"), a
         // or mutate task identity in their local workspace.
         if (rejectHistoricalJointTaskWriteIfNeeded(ctx.surface, resolved.createdAt, res)) return;
 
-        // First convert message to task
+        // Task v2: a pre-v2 host message names its task; a source message names the
+        // tasks hanging under it — one is claimed, several must be picked by
+        // number; none keeps the convert-to-task behavior below.
+        const target = await taskService.resolveClaimTargetByMessageId(msgId);
+        if (target.kind === "ambiguous") {
+          results.push({
+            messageId: msgId,
+            success: false,
+            reason: taskService.describeAmbiguousClaimByMessage(target.taskNumbers),
+          });
+          continue;
+        }
+        if (target.kind === "task") {
+          if (await claimExistingTask(msgId, target.owner) === "rejected-joint") return;
+          continue;
+        }
+        if (isBehindHistoryWindow(resolved.createdAt, claimHistoryWindow)) {
+          results.push({ messageId: msgId, success: false, reason: agentHistoryLimitedRefusal(claimHistoryWindow).error });
+          continue;
+        }
+
         const converted = await taskService.convertMessageToTask(msgId, "agent", req.params.id, ctx.storageChannelId);
         if (typeof converted === "string") {
-          // If already converted, try to find and claim the existing task
           if (converted === "already converted") {
-            const existingOwner = await taskService.resolveTaskByMessageId(msgId);
-            if (existingOwner) {
-              if (rejectHistoricalJointTaskWriteIfNeeded(ctx.surface, existingOwner.row.createdAt, res)) return;
-              // P3: both arms of the old ownership ternary read the same field.
-              const existingNumber = existingOwner.row.taskNumber;
-              const reason = await taskService.getClaimConflictReasonForOwner(existingOwner, "agent", req.params.id);
-              if (reason) {
-                results.push({ messageId: msgId, success: false, reason, taskNumber: existingNumber });
-                continue;
-              }
-              const claimed = await taskService.claimTask(existingOwner.row.id, "agent", req.params.id);
-              if (typeof claimed !== "string") {
-                const facts = await emitTaskMutationToSurfaces(io, ctx.surface, claimed);
-                if (facts.messageId) {
-                  successfulClaims.push({ taskNumber: facts.taskNumber, title: facts.title, messageId: facts.messageId });
-                }
-                results.push({ messageId: msgId, success: true, taskNumber: facts.taskNumber });
-                continue;
-              }
-              results.push({ messageId: msgId, success: false, reason: claimed, taskNumber: existingNumber });
+            // Lost a race with a concurrent convert: claim what it created.
+            const raced = await taskService.resolveClaimTargetByMessageId(msgId);
+            if (raced.kind === "task") {
+              if (await claimExistingTask(msgId, raced.owner) === "rejected-joint") return;
+              continue;
+            }
+            if (raced.kind === "ambiguous") {
+              results.push({
+                messageId: msgId,
+                success: false,
+                reason: taskService.describeAmbiguousClaimByMessage(raced.taskNumbers),
+              });
               continue;
             }
           }
@@ -4676,29 +4936,57 @@ internalRouter.post("/agent/:id/tasks/claim", requireAgentScope("task:write"), a
   }
 });
 
+/**
+ * Task v2: a lifecycle line in the task conversation from a legacy daemon
+ * route (created first for a v2 task). Without a conversation (flag off) these
+ * routes post nothing, as before task v2. Never throws: the mutation committed.
+ */
+function postAgentTaskLifecycleLine(
+  req: Request,
+  task: { id: string },
+  localChannel: { id: string; serverId?: string; deletedAt: Date | null },
+  buildContent: () => Promise<string>,
+): void {
+  void (async () => {
+    try {
+      const agentOrchestrator = req.app.get("agentOrchestrator") as AgentOrchestrator | undefined;
+      if (!agentOrchestrator) return;
+      await postTaskConversationNotice(req.app.get("io") as SocketServer, agentOrchestrator, {
+        taskId: task.id,
+        localChannel,
+        actor: { type: "agent", id: req.params.id as string },
+        content: await buildContent(),
+        legacyContent: null,
+      });
+    } catch (err) {
+      console.error(`[internal] task ${task.id}: failed to post lifecycle line:`, err);
+    }
+  })();
+}
+
 // Agent unclaims a task
 internalRouter.post("/agent/:id/tasks/unclaim", requireAgentScope("task:write"), async (req, res) => {
   try {
     const { channel, task_number } = req.body;
     if (!channel || task_number == null) {
-      res.status(400).json({ error: "channel and task_number are required" });
+      refuse(res, 400, { code: "task_number_required", error: "An unclaim needs a channel and a task number: name the task's channel and its number." });
       return;
     }
 
     const ctx = await resolveAgentTaskChannel(req.params.id, req.serverId!, req.machineId, channel);
     if (!ctx) {
-      res.status(404).json({ error: "Agent or channel not found" });
+      refuse(res, 404, TASK_CHANNEL_NOT_FOUND_REFUSAL);
       return;
     }
     if (rejectAgentTaskWriteIfNeeded(await channelService.canAgentPostToChannel(ctx.channelId, req.params.id), res)) return;
     if (await channelService.isChannelArchived(ctx.channelId)) {
-      res.status(409).json({ error: "This channel is archived", code: "channel_archived" });
+      refuse(res, 409, CHANNEL_ARCHIVED_REFUSAL);
       return;
     }
 
     const task = await taskService.getTaskByNumber(ctx.storageChannelId, task_number);
     if (!task) {
-      res.status(404).json({ error: "Task not found" });
+      refuse(res, 404, taskNotFoundRefusal(channel, task_number));
       return;
     }
 
@@ -4706,7 +4994,7 @@ internalRouter.post("/agent/:id/tasks/unclaim", requireAgentScope("task:write"),
 
     const result = await taskService.unclaimTask(task.id, "agent", req.params.id);
     if (typeof result === "string") {
-      res.status(409).json({ error: result });
+      refuse(res, 409, taskUnclaimRefusal(result, channel, task.taskNumber ?? Number(task_number)));
       return;
     }
 
@@ -4714,7 +5002,10 @@ internalRouter.post("/agent/:id/tasks/unclaim", requireAgentScope("task:write"),
     await emitTaskMutationToSurfaces(io, ctx.surface, result);
 
     // Task unclaim is a small-audience event — no chat-surface 🔓 system
-    // message. (stdrc #proj-task msg=c580faed)
+    // message. (stdrc #proj-task msg=c580faed) Task v2: the "released" line
+    // in the task conversation, as the agent API and the web write it.
+    postAgentTaskLifecycleLine(req, task, ctx.localChannel, async () =>
+      `🔓 ${ctx.agent.displayName || ctx.agent.name || "An agent"} released #${task.taskNumber} "${messageService.summarizeForSystemMessage(task.title)}"`);
 
     res.json({ ok: true });
     recordRaftCliActivity(req, req.params.id, {
@@ -4738,38 +5029,44 @@ internalRouter.post("/agent/:id/tasks/update-status", requireAgentScope("task:wr
   try {
     const { channel, task_number, status } = req.body;
     if (!channel || task_number == null || !status) {
-      res.status(400).json({ error: "channel, task_number, and status are required" });
+      refuse(res, 400, { code: "task_status_required", error: "A status change needs a channel, a task number and the new status." });
       return;
     }
+    // The pre-Agent-API route, for CLIs from before backlog: backlog and its
+    // reason go through the Agent API route only, so here it stays invalid.
     if (!["todo", "in_progress", "in_review", "done", "closed"].includes(status)) {
-      res.status(400).json({ error: "invalid status" });
+      refuse(res, 400, { code: "invalid_status", error: "That isn't a status this request can set: use todo, in_progress, in_review, done or closed." });
       return;
     }
 
     const ctx = await resolveAgentTaskChannel(req.params.id, req.serverId!, req.machineId, channel);
     if (!ctx) {
-      res.status(404).json({ error: "Agent or channel not found" });
+      refuse(res, 404, TASK_CHANNEL_NOT_FOUND_REFUSAL);
       return;
     }
     if (rejectAgentTaskWriteIfNeeded(await channelService.canAgentPostToChannel(ctx.channelId, req.params.id), res)) return;
     if (await channelService.isChannelArchived(ctx.channelId)) {
-      res.status(409).json({ error: "This channel is archived", code: "channel_archived" });
+      refuse(res, 409, CHANNEL_ARCHIVED_REFUSAL);
       return;
     }
 
     const task = await taskService.getTaskByNumber(ctx.storageChannelId, task_number);
     if (!task) {
-      res.status(404).json({ error: "Task not found" });
+      refuse(res, 404, taskNotFoundRefusal(channel, task_number));
       return;
     }
 
     if (rejectHistoricalJointTaskWriteIfNeeded(ctx.surface, task.createdAt, res)) return;
 
-    const result = await taskService.updateTaskStatus(task.id, status, req.params.id, "agent");
+    const result = await taskService.updateTaskStatus(task.id, status, req.params.id, "agent", undefined, {
+      initiatingServerId: ctx.localChannel.serverId,
+    });
     if (typeof result === "string") {
-      res.status(409).json({ error: result });
+      refuse(res, 409, taskStatusRefusal(result, channel, task.taskNumber ?? Number(task_number)));
       return;
     }
+    // What was stored: a task v2 task asked for in_review stores in_progress.
+    const storedStatus = result.row.status;
 
     const io: SocketServer = req.app.get("io");
     await emitTaskMutationToSurfaces(io, ctx.surface, result);
@@ -4778,11 +5075,21 @@ internalRouter.post("/agent/:id/tasks/update-status", requireAgentScope("task:wr
     // chat-surface system message. (stdrc #proj-task msg=ef870d97 +
     // msg=b9b41129 + msg=c580faed). The current status is rendered on the
     // task card itself; assignee/creator/reviewer follow via task UI.
+    // Task v2: the status line in the task conversation, as every path writes it
+    // (none when nothing changed: in_review asked of a task v2 task already in_progress).
+    if (!result.unchanged) {
+      postAgentTaskLifecycleLine(req, task, ctx.localChannel, () => buildTaskStatusNotice({
+        actor: { type: "agent", id: req.params.id },
+        taskNumber: task.taskNumber,
+        title: task.title,
+        status: storedStatus,
+      }));
+    }
 
-    res.json({ ok: true });
+    res.json({ ok: true, status: storedStatus });
     recordRaftCliActivity(req, req.params.id, {
       command: "task.update_status",
-      summary: `Updated task #${task_number} to ${status}`,
+      summary: `Updated task #${task_number} to ${storedStatus}`,
       target: channel,
       correlationId: task.id,
     });
@@ -4796,7 +5103,6 @@ internalRouter.post("/agent/:id/tasks/update-status", requireAgentScope("task:wr
   }
 });
 
-const REMINDER_MAX_TITLE_LEN = 500;
 
 // Agent lists its own reminders
 internalRouter.get("/agent/:id/reminders", async (req, res) => {
@@ -4814,7 +5120,7 @@ internalRouter.get("/agent/:id/reminders", async (req, res) => {
       const validated: ReminderStatus[] = [];
       for (const p of parts) {
         if (!isReminderStatus(p)) {
-          res.status(400).json({ error: "Invalid status value" });
+          refuse(res, 400, REMINDER_STATUS_FILTER_INVALID_REFUSAL);
           return;
         }
         validated.push(p); // p narrowed to ReminderStatus by the guard — no cast
@@ -4852,11 +5158,11 @@ internalRouter.post("/agent/:id/reminders", async (req, res) => {
 
     const { title, fireAt, delaySeconds, msgId, payload, repeat, tz, channel } = req.body ?? {};
     if (typeof title !== "string" || title.trim().length === 0) {
-      res.status(400).json({ error: "title is required" });
+      refuse(res, 400, REMINDER_TITLE_REQUIRED_REFUSAL);
       return;
     }
     if (title.length > REMINDER_MAX_TITLE_LEN) {
-      res.status(400).json({ error: `title must be at most ${REMINDER_MAX_TITLE_LEN} characters` });
+      refuse(res, 400, REMINDER_TITLE_TOO_LONG_REFUSAL);
       return;
     }
 
@@ -4866,13 +5172,13 @@ internalRouter.post("/agent/:id/reminders", async (req, res) => {
     let ruleTz = "UTC";
     if (tz !== undefined) {
       if (typeof tz !== "string" || tz.length === 0) {
-        res.status(400).json({ error: "tz must be a non-empty IANA timezone string" });
+        refuse(res, 400, REMINDER_TIMEZONE_INVALID_REFUSAL);
         return;
       }
       try {
         new Intl.DateTimeFormat("en-US", { timeZone: tz }).format(new Date());
       } catch {
-        res.status(400).json({ error: `unknown timezone "${tz}"` });
+        refuse(res, 400, reminderTimezoneUnknownRefusal(tz));
         return;
       }
       ruleTz = tz;
@@ -4881,12 +5187,12 @@ internalRouter.post("/agent/:id/reminders", async (req, res) => {
     let recurrence: Recurrence | null = null;
     if (repeat != null) {
       if (typeof repeat !== "string") {
-        res.status(400).json({ error: "repeat must be a string (e.g. every:15m | daily@09:00 | weekly:mon,fri@09:00)" });
+        refuse(res, 400, REMINDER_REPEAT_INVALID_REFUSAL);
         return;
       }
       const parsed = parseRecurrenceString(repeat, ruleTz);
       if (!parsed.ok) {
-        res.status(400).json({ error: `repeat: ${parsed.error}` });
+        refuse(res, 400, reminderRepeatUnparsedRefusal(parsed.error));
         return;
       }
       // Wall-clock rules (daily, weekly) are ambiguous without an explicit
@@ -4896,9 +5202,7 @@ internalRouter.post("/agent/:id/reminders", async (req, res) => {
         (parsed.recurrence.rule.kind === "daily" || parsed.recurrence.rule.kind === "weekly") &&
         tz === undefined
       ) {
-        res.status(400).json({
-          error: "tz is required for daily@ or weekly: rules (IANA name, e.g. America/Los_Angeles)",
-        });
+        refuse(res, 400, REMINDER_TIMEZONE_REQUIRED_REFUSAL);
         return;
       }
       recurrence = parsed.recurrence;
@@ -4914,7 +5218,7 @@ internalRouter.post("/agent/:id/reminders", async (req, res) => {
     if (hasScheduleInput) {
       const schedule = resolveScheduleInput({ delaySeconds, fireAt }, Date.now());
       if (!schedule.ok) {
-        res.status(400).json({ error: schedule.error });
+        refuse(res, 400, reminderScheduleInvalidRefusal(schedule.error));
         return;
       }
       fireAtDate = schedule.fireAt;
@@ -4922,12 +5226,12 @@ internalRouter.post("/agent/:id/reminders", async (req, res) => {
     } else if (recurrence) {
       fireAtDate = computeNextFire(recurrence, new Date());
     } else {
-      res.status(400).json({ error: "Provide delaySeconds, fireAt, or repeat" });
+      refuse(res, 400, REMINDER_SCHEDULE_REQUIRED_REFUSAL);
       return;
     }
 
     if (typeof msgId !== "string" || msgId.length === 0) {
-      res.status(400).json({ error: "msgId is required for agent-created reminders" });
+      refuse(res, 400, REMINDER_MESSAGE_REQUIRED_REFUSAL);
       return;
     }
 
@@ -4944,12 +5248,12 @@ internalRouter.post("/agent/:id/reminders", async (req, res) => {
     let targetChannelId: string | null = null;
     if (channel != null) {
       if (typeof channel !== "string" || channel.length === 0) {
-        res.status(400).json({ error: "channel must be a non-empty string" });
+        refuse(res, 400, REMINDER_CHANNEL_INVALID_REFUSAL);
         return;
       }
       const ctx = await resolveAgentChannel(req.params.id, req.serverId!, req.machineId, channel);
       if (!ctx) {
-        res.status(404).json({ error: "Agent or channel not found" });
+        refuse(res, 404, REMINDER_CHANNEL_NOT_FOUND_REFUSAL);
         return;
       }
       targetChannelId = ctx.channelId;
@@ -5009,11 +5313,15 @@ internalRouter.delete("/agent/:id/reminders/:reminderId", async (req, res) => {
 
     const existing = await reminderCrud.getAppReminderById(req.params.reminderId);
     if (!existing || existing.serverId !== req.serverId || existing.ownerAgentId !== req.params.id) {
-      res.status(404).json({ error: "Reminder not found" });
+      refuse(res, 404, REMINDER_NOT_FOUND_REFUSAL);
+      return;
+    }
+    if (existing.status === "migrated") {
+      refuse(res, 409, reminderMigratedRefusal(existing.id));
       return;
     }
     if (existing.status !== "scheduled" && existing.status !== "fired") {
-      res.status(409).json({ error: `Reminder is already ${existing.status}` });
+      refuse(res, 409, reminderNotCancelableRefusal(existing.status));
       return;
     }
 
@@ -5022,7 +5330,7 @@ internalRouter.delete("/agent/:id/reminders/:reminderId", async (req, res) => {
       expectedVersion: existing.version,
     });
     if (!canceled) {
-      res.status(409).json({ error: "Reminder state changed; refresh and retry" });
+      refuse(res, 409, REMINDER_STATE_CONFLICT_REFUSAL);
       return;
     }
     await syncReminderToComputer(req, canceled, "cancel");
@@ -5062,19 +5370,21 @@ internalRouter.post("/agent/:id/reminders/:reminderId/snooze", async (req, res) 
     const { delaySeconds } = req.body ?? {};
     const schedule = resolveScheduleInput({ delaySeconds }, Date.now());
     if (!schedule.ok) {
-      res.status(400).json({ error: schedule.error });
+      refuse(res, 400, reminderScheduleInvalidRefusal(schedule.error));
       return;
     }
 
     const existing = await reminderCrud.getAppReminderById(req.params.reminderId);
     if (!existing || existing.serverId !== req.serverId || existing.ownerAgentId !== req.params.id) {
-      res.status(404).json({ error: "Reminder not found" });
+      refuse(res, 404, REMINDER_NOT_FOUND_REFUSAL);
+      return;
+    }
+    if (existing.status === "migrated") {
+      refuse(res, 409, reminderMigratedRefusal(existing.id));
       return;
     }
     if (existing.status !== "scheduled" && existing.status !== "fired") {
-      res.status(409).json({
-        error: `Reminder ${existing.id} is ${existing.status}; only scheduled or fired reminders can be snoozed`,
-      });
+      refuse(res, 409, reminderNotSnoozableRefusal(existing.status));
       return;
     }
 
@@ -5083,7 +5393,7 @@ internalRouter.post("/agent/:id/reminders/:reminderId/snooze", async (req, res) 
       expectedVersion: existing.version,
     });
     if (!snoozed) {
-      res.status(409).json({ error: "Reminder state changed; refresh and retry" });
+      refuse(res, 409, REMINDER_STATE_CONFLICT_REFUSAL);
       return;
     }
     await syncReminderToComputer(req, snoozed, "upsert");
@@ -5118,17 +5428,19 @@ internalRouter.patch("/agent/:id/reminders/:reminderId", async (req, res) => {
 
     const existing = await reminderCrud.getAppReminderById(req.params.reminderId);
     if (!existing || existing.serverId !== req.serverId || existing.ownerAgentId !== req.params.id) {
-      res.status(404).json({ error: "Reminder not found" });
+      refuse(res, 404, REMINDER_NOT_FOUND_REFUSAL);
       return;
     }
     if (existing.status === "fired") {
-      res.status(409).json({
-        error: `Reminder ${existing.id} is fired; snooze it back to scheduled before updating, or schedule a new reminder`,
-      });
+      refuse(res, 409, REMINDER_FIRED_NOT_UPDATABLE_REFUSAL);
+      return;
+    }
+    if (existing.status === "migrated") {
+      refuse(res, 409, reminderMigratedRefusal(existing.id));
       return;
     }
     if (existing.status !== "scheduled") {
-      res.status(409).json({ error: `Reminder ${existing.id} is ${existing.status}` });
+      refuse(res, 409, reminderNotUpdatableRefusal(existing.status));
       return;
     }
 
@@ -5139,7 +5451,7 @@ internalRouter.patch("/agent/:id/reminders/:reminderId", async (req, res) => {
       title != null ? "title" : null,
     ].filter(Boolean);
     if (mutations.length !== 1) {
-      res.status(400).json({ error: "update requires exactly one of fireAt/delaySeconds, repeat, or title" });
+      refuse(res, 400, REMINDER_UPDATE_INVALID_REFUSAL);
       return;
     }
 
@@ -5148,7 +5460,7 @@ internalRouter.patch("/agent/:id/reminders/:reminderId", async (req, res) => {
     if (fireAt != null || delaySeconds != null) {
       const schedule = resolveScheduleInput({ fireAt, delaySeconds }, Date.now());
       if (!schedule.ok) {
-        res.status(400).json({ error: schedule.error });
+        refuse(res, 400, reminderScheduleInvalidRefusal(schedule.error));
         return;
       }
       warning = schedule.warning;
@@ -5157,45 +5469,43 @@ internalRouter.patch("/agent/:id/reminders/:reminderId", async (req, res) => {
         : { kind: "delay", delaySeconds: Number(delaySeconds) };
     } else if (repeat != null) {
       if (typeof repeat !== "string") {
-        res.status(400).json({ error: "repeat must be a string (e.g. every:15m | daily@09:00 | weekly:mon,fri@09:00)" });
+        refuse(res, 400, REMINDER_REPEAT_INVALID_REFUSAL);
         return;
       }
       let ruleTz = "UTC";
       if (tz !== undefined) {
         if (typeof tz !== "string" || tz.length === 0) {
-          res.status(400).json({ error: "tz must be a non-empty IANA timezone string" });
+          refuse(res, 400, REMINDER_TIMEZONE_INVALID_REFUSAL);
           return;
         }
         try {
           new Intl.DateTimeFormat("en-US", { timeZone: tz }).format(new Date());
         } catch {
-          res.status(400).json({ error: `unknown timezone "${tz}"` });
+          refuse(res, 400, reminderTimezoneUnknownRefusal(tz));
           return;
         }
         ruleTz = tz;
       }
       const parsed = parseRecurrenceString(repeat, ruleTz);
       if (!parsed.ok) {
-        res.status(400).json({ error: `repeat: ${parsed.error}` });
+        refuse(res, 400, reminderRepeatUnparsedRefusal(parsed.error));
         return;
       }
       if (
         (parsed.recurrence.rule.kind === "daily" || parsed.recurrence.rule.kind === "weekly") &&
         tz === undefined
       ) {
-        res.status(400).json({
-          error: "tz is required for daily@ or weekly: rules (IANA name, e.g. America/Los_Angeles)",
-        });
+        refuse(res, 400, REMINDER_TIMEZONE_REQUIRED_REFUSAL);
         return;
       }
       patch = { kind: "recurrence", recurrence: parsed.recurrence };
     } else {
       if (typeof title !== "string" || title.trim().length === 0) {
-        res.status(400).json({ error: "title must be a non-empty string" });
+        refuse(res, 400, REMINDER_TITLE_REQUIRED_REFUSAL);
         return;
       }
       if (title.length > REMINDER_MAX_TITLE_LEN) {
-        res.status(400).json({ error: `title must be at most ${REMINDER_MAX_TITLE_LEN} characters` });
+        refuse(res, 400, REMINDER_TITLE_TOO_LONG_REFUSAL);
         return;
       }
       patch = { kind: "title", title: title.trim() };
@@ -5206,7 +5516,7 @@ internalRouter.patch("/agent/:id/reminders/:reminderId", async (req, res) => {
       expectedVersion: existing.version,
     });
     if (!updated) {
-      res.status(409).json({ error: "Reminder state changed; refresh and retry" });
+      refuse(res, 409, REMINDER_STATE_CONFLICT_REFUSAL);
       return;
     }
     await syncReminderToComputer(req, updated, "upsert");
@@ -5242,12 +5552,13 @@ internalRouter.get("/agent/:id/reminders/:reminderId/log", async (req, res) => {
 
     const existing = await reminderCrud.getAppReminderById(req.params.reminderId);
     if (!existing || existing.serverId !== req.serverId || existing.ownerAgentId !== req.params.id) {
-      res.status(404).json({ error: "Reminder not found" });
+      refuse(res, 404, REMINDER_NOT_FOUND_REFUSAL);
       return;
     }
 
     const events = await reminderCrud.listAppReminderEvents(existing.id);
-    res.json({ events: reminderService.toReminderEventSummaries(events) });
+    // Older Computers parse the event enum strictly; `migrated` stays server-side.
+    res.json({ events: reminderService.toReminderEventSummaries(events.filter((event) => event.eventType !== "migrated")) });
   } catch (err) {
     sendJsonServerError(req, res, {
       error: "Failed to read reminder log",
@@ -5274,22 +5585,14 @@ internalRouter.post("/agent/:id/prepare-action", requireAgentScope("action:prepa
 
     const body = (req.body ?? {}) as { target?: unknown; action?: unknown };
     if (typeof body.target !== "string" || body.target.trim().length === 0) {
-      res.status(400).json({ error: "target is required" });
+      refuse(res, 400, TARGET_REQUIRED_REFUSAL);
       return;
     }
     const actionType = typeof (body.action as { type?: unknown } | null | undefined)?.type === "string"
       ? (body.action as { type: string }).type
       : null;
-    if (
-      actionType === "integration:approve_agent_login"
-      || actionType === "integration:install_marketplace_app"
-      || actionType === "integration:register_app"
-      || actionType === "integration:update_app_registration"
-    ) {
-      res.status(400).json({
-        error: "integration action cards must be created by raft integration commands",
-        errorCode: "ACTION_TYPE_NOT_PREPARABLE",
-      });
+    if (actionType !== null && actionCardsService.INTEGRATION_COMMAND_ACTION_TYPES.has(actionType)) {
+      refuse(res, 400, ACTION_TYPE_NOT_PREPARABLE_REFUSAL);
       return;
     }
     const target = body.target.trim();
@@ -5298,20 +5601,15 @@ internalRouter.post("/agent/:id/prepare-action", requireAgentScope("action:prepa
       req.params.id,
       target,
     );
-    if (resolved === "forbidden") {
-      res.status(403).json({ error: forbiddenMessageForTarget(target) });
+    if (resolved === "forbidden" || resolved === "peer-not-found" || resolved === "self-dm") {
+      const { status, refusal } = unwritableTargetRefusal(resolved, target);
+      refuse(res, status, refusal);
       return;
     }
-    if (resolved === "peer-not-found") {
-      res.status(404).json({ error: `User or agent not found: @${target.slice(4)}` });
-      return;
-    }
-    if (resolved === "self-dm") {
-      res.status(400).json({ error: "Cannot create a DM with yourself" });
-      return;
-    }
+    if (rejectUnwritableTaskConversation(resolved, res)) return;
     if (!resolved) {
-      res.status(400).json({ error: `Could not resolve target: ${body.target}` });
+      const { status, refusal } = unwritableTargetRefusal(null, target);
+      refuse(res, status, refusal);
       return;
     }
 
@@ -5321,18 +5619,23 @@ internalRouter.post("/agent/:id/prepare-action", requireAgentScope("action:prepa
       requesterAgentId: req.params.id,
       targetChannelId: resolved.channelId,
       action: body.action as Parameters<typeof actionCardsService.prepareActionCard>[0]["action"],
+      agentAuthored: true,
       io: io ?? null,
     });
-    res.status(201).json({ messageId: out.messageId, metadata: out.metadata });
+    res.status(out.existing ? 200 : 201).json({ messageId: out.messageId, metadata: withoutAgentHiddenActionCardSpec(out.metadata), ...(out.existing ? { existing: true } : {}) });
     recordRaftCliActivity(req, req.params.id, {
       command: "action.prepare",
-      summary: "Prepared action card",
+      summary: out.existing ? "Action card already posted" : "Prepared action card",
       target: body.target.trim(),
       correlationId: out.messageId,
     });
   } catch (err) {
     if (err instanceof actionCardsService.ActionCardError) {
-      res.status(err.status).json({ error: err.message, errorCode: err.code });
+      res.status(err.status).json({
+        error: err.message,
+        errorCode: err.code,
+        ...(err.suggestedNextAction ? { suggestedNextAction: err.suggestedNextAction } : {}),
+      });
       return;
     }
     sendJsonServerError(req, res, {
@@ -5364,7 +5667,7 @@ internalRouter.get("/agent/:id/scopes", async (req, res) => {
     res.json(set);
   } catch (err) {
     if (err instanceof agentScopesService.AgentScopesNotFoundError) {
-      res.status(404).json({ error: "Agent not found" });
+      refuse(res, 404, { code: "agent_not_found", error: "This agent no longer exists, so it has no scopes to read." });
       return;
     }
     sendJsonServerError(req, res, {

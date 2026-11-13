@@ -3,8 +3,7 @@
   "runtimeId": "cursor",
   "schemaVersion": "cursor.create.v1",
   "requiredClientCapabilities": [
-    "select.custom_value",
-    "option_source.status"
+    "select.custom_value"
   ],
   "dataSchema": {
     "type": "object",

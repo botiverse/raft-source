@@ -9,6 +9,8 @@ export const STATE_TRANSITION_DOMAINS = [
   "task",
   "messages",
   "notification_prefs",
+  // The web's socket reconnects and live-session recoveries (trigger, tab.visibility).
+  "live_session",
 ] as const;
 
 export type StateTransitionDomain = (typeof STATE_TRANSITION_DOMAINS)[number];

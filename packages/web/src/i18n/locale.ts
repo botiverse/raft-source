@@ -12,14 +12,22 @@
 // (`@botiverse/raft-shared` SUPPORTED_TRANSLATION_LANGUAGES) so the two systems never
 // diverge on language identifiers.
 
-import { DISPLAY_LOCALES } from "@botiverse/raft-shared";
+import {
+  DISPLAY_LOCALE_INFO,
+  DISPLAY_LOCALES,
+  displayLocaleTag,
+  isDisplayLocale,
+  matchDisplayLocale,
+  matchDisplayLocaleFromList,
+  matchSystemDisplayLocale,
+} from "@botiverse/raft-shared";
 import type { DisplayLocale } from "@botiverse/raft-shared";
 
 /**
- * Supported UI display locales. Single-sourced from `@botiverse/raft-shared`
- * DISPLAY_LOCALES — the set the app ships a catalog for — so the client and the
- * server's display-language validator can never diverge. Starts narrow (en +
- * zh-cn) per @Wug's P0 guidance; expand by adding a locale there + a catalog.
+ * Supported UI display locales. Single-sourced from the `@botiverse/raft-shared`
+ * locale registry (DISPLAY_LOCALES / DISPLAY_LOCALE_INFO) — the set the app ships
+ * a catalog for, in picker order — so the client and the server's
+ * display-language validator can never diverge.
  */
 export type Locale = DisplayLocale;
 
@@ -27,19 +35,13 @@ export const DEFAULT_LOCALE: Locale = "en";
 
 export const SUPPORTED_LOCALES: readonly Locale[] = DISPLAY_LOCALES;
 
-/** Human-readable label shown in the display-language selector, in-language. */
-export const LOCALE_LABELS: Record<Locale, string> = {
-  en: "English",
-  "zh-cn": "简体中文",
-};
-
-export const HTML_LANG_BY_LOCALE: Record<Locale, string> = {
-  en: "en",
-  "zh-cn": "zh-CN",
-};
+/** Label shown in the display-language selector: the language's own name. */
+export const LOCALE_LABELS: Record<Locale, string> = Object.fromEntries(
+  DISPLAY_LOCALES.map((locale) => [locale, DISPLAY_LOCALE_INFO[locale].nativeName]),
+) as Record<Locale, string>;
 
 export function htmlLangForLocale(locale: Locale): string {
-  return HTML_LANG_BY_LOCALE[locale];
+  return displayLocaleTag(locale);
 }
 
 /**
@@ -51,7 +53,7 @@ export function htmlLangForLocale(locale: Locale): string {
 export const DISPLAY_LOCALE_STORAGE_KEY = "slock.displayLanguage";
 
 export function isSupportedLocale(value: string | null | undefined): value is Locale {
-  return value === "en" || value === "zh-cn";
+  return isDisplayLocale(value);
 }
 
 /** Read the cached display locale from storage, or null if unset/invalid. */
@@ -81,27 +83,17 @@ export function rememberLocale(locale: Locale, storage: Storage | undefined): vo
  * and suggestion metadata for language pickers.
  */
 export function getBrowserPreferredLocale(languages: readonly string[] | undefined): Locale {
-  for (const language of languages ?? []) {
-    const normalized = language.toLowerCase();
-    if (normalized === "zh" || normalized.startsWith("zh-") || normalized.startsWith("zh_")) {
-      // All Chinese variants fold to zh-cn until zh-tw is added to the set.
-      return "zh-cn";
-    }
-    if (normalized === "en" || normalized.startsWith("en-")) {
-      return "en";
-    }
-  }
-  return DEFAULT_LOCALE;
+  // Browsers report BCP 47; older ones were seen sending `zh_CN`, so accept that too.
+  return matchDisplayLocaleFromList((languages ?? []).map((language) => language.replace(/_/g, "-")))
+    ?? DEFAULT_LOCALE;
 }
 
-/**
- * Resolve the initial display locale before the server user record is known.
- * A navigation override wins, then an explicit stored choice, then the
- * browser's ordered preferences, with English as the final fallback.
- * Once the authenticated user's persisted preference loads, LocaleProvider
- * reconciles only when that account value is an explicit supported locale.
- */
-const CHINESE_LANGUAGE_RE = /^zh(?:-|$)/i;
+// `?lang=` tag → locale; anything unmatched resolves to English. Underscore tags
+// (`zh_TW`) deliberately do not match: that is the frozen billing-resolver
+// behaviour an Android host already relies on (see localeLangParam.test).
+function langParamTagLocale(tag: string): Locale | null {
+  return matchDisplayLocale(tag);
+}
 
 /**
  * Resolve the `?lang=` navigation parameter, or null when it is absent.
@@ -112,12 +104,14 @@ const CHINESE_LANGUAGE_RE = /^zh(?:-|$)/i;
  * user record has not loaded yet, so without this the embedded surface falls
  * back to English on a Chinese device.
  *
- * `lang=system` means the HOST explicitly asked to follow the device language.
- * It remains a separate path from automatic browser detection because the
- * navigation instruction deliberately outranks a cached user choice.
+ * `lang=system` means the HOST explicitly asked to follow the device language:
+ * `matchSystemDisplayLocale` (the first device language with a catalog; English
+ * listed first yields only to a later Chinese language), else English. It remains a separate path from automatic browser detection because
+ * the navigation instruction deliberately outranks a cached user choice.
  *
- * Semantics are kept identical to the billing-only resolver this replaces, so
- * migrating that surface to the catalog cannot change what an embedded host sees.
+ * For en/zh the semantics are kept identical to the billing-only resolver this
+ * replaces, so migrating that surface to the catalog cannot change what an
+ * embedded host sees; every other shipped locale follows the same rule.
  */
 export function resolveLangParamLocale(
   search: string | undefined,
@@ -126,15 +120,17 @@ export function resolveLangParamLocale(
   if (!search) return null;
   const requested = new URLSearchParams(search).get("lang")?.trim();
   if (!requested) return null;
-  if (requested === "system") {
-    return (browserLanguages ?? []).some((language) => CHINESE_LANGUAGE_RE.test(language))
-      ? "zh-cn"
-      : "en";
-  }
-  return CHINESE_LANGUAGE_RE.test(requested) ? "zh-cn" : "en";
+  if (requested === "system") return matchSystemDisplayLocale(browserLanguages);
+  return langParamTagLocale(requested) ?? DEFAULT_LOCALE;
 }
 
 /**
+ * Resolve the initial display locale before the server user record is known.
+ * A navigation override wins, then an explicit stored choice, then the
+ * browser's ordered preferences, with English as the final fallback.
+ * Once the authenticated user's persisted preference loads, LocaleProvider
+ * reconciles only when that account value is an explicit supported locale.
+ *
  * `?lang=` wins over the cached choice and is deliberately NOT persisted: it is
  * a per-navigation instruction from an embedding host, and writing it to storage
  * would let one embedded visit silently rewrite the user's own setting.

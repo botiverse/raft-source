@@ -1,7 +1,9 @@
+import { newSlackMentionAuthorizationId } from "./slackMentionReconcileState";
 import { createApiTest } from "../test/integration/apiTest";
 import assert from "node:assert/strict";
 import { createHash, createHmac, randomUUID } from "node:crypto";
 import sharp from "sharp";
+import { Agent } from "undici";
 import { runNamedCase } from "../test/runNamedCase";
 
 import { and, desc, eq, gt, inArray, sql } from "drizzle-orm";
@@ -26,6 +28,7 @@ import {
   externalDeliveryPartitions,
   externalInboundEvents,
   externalHumanIdentityLinks,
+  slackUsergroupIdentities,
   externalMessageLinks,
   externalOutboundDeliveries,
   externalProjectionAvatarArtifacts,
@@ -36,7 +39,7 @@ import {
   oauthClientInstalls,
   users,
 } from "../db/schema";
-import { signAccessToken } from "../middleware/auth";
+import { accessTokenForTest } from "../test/integration/credentials";
 import { SLACK_BRIDGE_REQUIRED_BOT_SCOPES } from "../routes/slackBridge";
 import { openTestApp } from "../test/integration/app";
 import { createServer } from "./serverService";
@@ -58,7 +61,7 @@ import {
   listSlackBridgeAgentMentionCandidates,
   listSlackBridgeMentionCandidates,
   reconcileSlackBridgeOAuthIdentityAppType,
-  refreshSlackPublicConversationAuthority,
+  refreshSlackConversationAuthority,
   slackBridgeProvisioningManifestHash,
   SLACK_BRIDGE_PROVISIONING_CAPABILITIES,
 } from "./slackBridgeProvisioningControlPlane";
@@ -67,11 +70,36 @@ import {
   ExternalAppControlPlaneError,
   resolveExternalBindingAuthority,
 } from "./externalAppControlPlaneService";
+import { revealAllChannelForTest } from "../test/allChannelFixture";
+
+// Every request to the test app opens its own connection. This test runs long
+// stretches of in-process work between requests, and on the CI shard a request
+// reusing an idle keep-alive connection was reset (ECONNRESET, staging since
+// 10-25, task #87). A failure also names the request, which the bare
+// "fetch failed" did not.
+const appDispatcher = new Agent({ pipelining: 0 });
+async function appFetch(input: string, init?: RequestInit): Promise<Response> {
+  try {
+    return await globalThis.fetch(input, { ...init, dispatcher: appDispatcher } as RequestInit);
+  } catch (error) {
+    throw new Error(`${init?.method ?? "GET"} ${new URL(input).pathname} failed`, { cause: error });
+  }
+}
+
+/**
+ * The Cookie header a browser sends back to the OAuth callback: the start response binds the
+ * install to the starting browser (oauthBrowserBinding.ts), and only that browser may finish it.
+ */
+function oauthBindingCookie(start: Response): string {
+  const binding = start.headers.getSetCookie().find((cookie) => cookie.startsWith("raft_slack_oauth_"));
+  assert.ok(binding, "the OAuth start response must bind the install to this browser");
+  return binding.split(";")[0]!;
+}
 
 // Built at runtime so secret scanners don't flag this test sample.
 const SLACK_XOXB = "xo" + "xb-";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 const REGISTRATION_ID = "11111111-1111-4111-8111-111111111111";
 const CREDENTIAL_KEY = Buffer.alloc(32, 17).toString("base64");
@@ -114,9 +142,9 @@ const PRODUCTION_BOOTSTRAP = {
   },
 };
 
-function requestHeaders(userId: string, serverId: string): Record<string, string> {
+async function requestHeaders(userId: string, serverId: string): Promise<Record<string, string>> {
   return {
-    Authorization: `Bearer ${signAccessToken(userId)}`,
+    Authorization: `Bearer ${await accessTokenForTest(userId)}`,
     "Content-Type": "application/json",
     "X-Server-Id": serverId,
   };
@@ -174,7 +202,7 @@ async function observeProvisioningEndpoints(baseUrl: string, headers: Record<str
     code: string | null;
   }> = [];
   for (const [method, path, body] of PROVISIONING_REQUESTS) {
-    const response = await fetch(`${baseUrl}${path}`, {
+    const response = await appFetch(`${baseUrl}${path}`, {
       method,
       headers,
       ...(body ? { body: JSON.stringify(body) } : {}),
@@ -210,6 +238,7 @@ test("true Server production composition makes all seven provisioning endpoints 
   let grantIdentityMode: "valid" | "wrong-team" | "wrong-user" | "missing-bot" = "valid";
   let providerAuthTestCalls = 0;
   let providerAudienceCalls = 0;
+  let providerAuthorizerMember = true;
   let beforeAudienceResponse: (() => Promise<void>) | null = null;
   let providerBotInConversation = true;
   let providerOtherChannelMember = false;
@@ -232,8 +261,15 @@ test("true Server production composition makes all seven provisioning endpoints 
   let providerGrantedScopes = [...SLACK_BRIDGE_REQUIRED_BOT_SCOPES];
   let providerUsergroupListCalls = 0;
   let providerUsergroupsFail = false;
+  let providerUsergroupCreateError: string | null = null;
+  let beforeUsergroupCreateRefusal: (() => Promise<void>) | null = null;
+  let providerDisableFail = false;
+  let providerEnableFail = false;
+  let rateLimitNextGroupCreate = false;
+  let providerUsergroupDisableCalls = 0;
   const providerUsergroupCreateAttempts: string[] = [];
   const providerUsergroupUpdateAttempts: string[] = [];
+  let loseNextUsergroupCreateResponse = false;
   const mentionReconcileClaims: string[] = [];
   let denyMentionReconcileClaim = false;
   const providerUsergroupCreateRefusals = new Map<string, string>();
@@ -371,7 +407,7 @@ test("true Server production composition makes all seven provisioning endpoints 
           ok: true,
           members: [
             ...(providerBotInConversation ? ["U_PRODUCTION_BOT"] : []),
-            "U_PRODUCTION_OWNER",
+            ...(providerAuthorizerMember ? ["U_PRODUCTION_OWNER"] : []),
           ],
           response_metadata: { next_cursor: "" },
         }), { status: 200, headers: { "content-type": "application/json" } });
@@ -416,6 +452,8 @@ test("true Server production composition makes all seven provisioning endpoints 
           ok: true,
           user: {
             id: "U_PRODUCTION_OWNER",
+            team_id: "T_PRODUCTION_COMPOSITION",
+            deleted: false,
             name: "production-owner",
             is_admin: true,
             is_bot: false,
@@ -450,6 +488,18 @@ test("true Server production composition makes all seven provisioning endpoints 
           description: string;
         };
         providerUsergroupCreateAttempts.push(request.handle);
+        if (providerUsergroupCreateError) {
+          const hook = beforeUsergroupCreateRefusal;
+          beforeUsergroupCreateRefusal = null;
+          if (hook) await hook();
+          return new Response(JSON.stringify({ ok: false, error: providerUsergroupCreateError }), {
+            status: 200, headers: { "content-type": "application/json" },
+          });
+        }
+        if (rateLimitNextGroupCreate) {
+          rateLimitNextGroupCreate = false;
+          return new Response("rate limited", { status: 429, headers: { "Retry-After": "120" } });
+        }
         const refusal = providerUsergroupCreateRefusals.get(request.handle);
         if (refusal) {
           return new Response(JSON.stringify({ ok: false, error: refusal }), {
@@ -463,6 +513,10 @@ test("true Server production composition makes all seven provisioning endpoints 
           date_delete: 0,
         };
         providerUsergroups.push(group);
+        if (loseNextUsergroupCreateResponse) {
+          loseNextUsergroupCreateResponse = false;
+          return Response.json({ ok: false }, { status: 503 });
+        }
         return new Response(JSON.stringify({ ok: true, usergroup: group }), {
           status: 200,
           headers: { "content-type": "application/json" },
@@ -488,9 +542,9 @@ test("true Server production composition makes all seven provisioning endpoints 
           });
         }
         Object.assign(group, {
-          name: request.name,
-          handle: request.handle,
-          description: request.description,
+          ...(request.name === undefined ? {} : { name: request.name }),
+          ...(request.handle === undefined ? {} : { handle: request.handle }),
+          ...(request.description === undefined ? {} : { description: request.description }),
         });
         return new Response(JSON.stringify({ ok: true, usergroup: group }), {
           status: 200,
@@ -498,6 +552,9 @@ test("true Server production composition makes all seven provisioning endpoints 
         });
       }
       if (method === "usergroups.enable" || method === "usergroups.disable") {
+        if (method === "usergroups.enable" && providerEnableFail) return Response.json({ ok: false, error: "permission_denied" });
+        if (method === "usergroups.disable") providerUsergroupDisableCalls += 1;
+        if (method === "usergroups.disable" && providerDisableFail) return new Response(JSON.stringify({ ok: false, error: "permission_denied" }));
         const request = JSON.parse(String(init?.body)) as { usergroup: string };
         const group = providerUsergroups.find((candidate) => candidate.id === request.usergroup);
         if (!group) return new Response(JSON.stringify({ ok: false, error: "usergroup_not_found" }));
@@ -557,7 +614,7 @@ test("true Server production composition makes all seven provisioning endpoints 
       }
       throw new Error(`unexpected Slack method ${method}`);
     }) as typeof fetch;
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false, async slackBridgeFactory() {
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, async slackBridgeFactory() {
       runtime = await createSlackBridgeServerRuntimeFromEnv(PRODUCTION_ENV, {
         db: getDb(),
         fetch: providerFetch,
@@ -573,7 +630,7 @@ test("true Server production composition makes all seven provisioning endpoints 
     const probe = await seedOwner();
     const observations = await observeProvisioningEndpoints(
       app.baseUrl,
-      requestHeaders(probe.owner.id, probe.server.id),
+      await requestHeaders(probe.owner.id, probe.server.id),
     );
     assert.deepEqual(
       observations.filter(({ status }) => status === 503),
@@ -582,12 +639,15 @@ test("true Server production composition makes all seven provisioning endpoints 
     );
 
     const { owner, server } = await seedOwner();
-    const headers = requestHeaders(owner.id, server.id);
-    const load = await fetch(`${app.baseUrl}/api/slack-bridge/provisioning`, { headers });
+    // #all live as on an established server; the private onboarding-owner
+    // channel a new server is born with stays, as in production.
+    await revealAllChannelForTest(server.id);
+    const headers = await requestHeaders(owner.id, server.id);
+    const load = await appFetch(`${app.baseUrl}/api/slack-bridge/provisioning`, { headers });
     assert.equal(load.status, 200, await load.clone().text());
     assert.equal((await load.json() as { snapshot: { stage: string } }).snapshot.stage, "connect");
 
-    const connect = await fetch(`${app.baseUrl}/api/slack-bridge/provisioning/connect`, {
+    const connect = await appFetch(`${app.baseUrl}/api/slack-bridge/provisioning/connect`, {
       method: "POST",
       headers,
     });
@@ -726,7 +786,7 @@ test("true Server production composition makes all seven provisioning endpoints 
           eq(externalAppServerGrants.state, "active"),
         ));
       try {
-        const drifted = await fetch(`${app.baseUrl}/api/slack-bridge/provisioning`, { headers });
+        const drifted = await appFetch(`${app.baseUrl}/api/slack-bridge/provisioning`, { headers });
         assert.equal(drifted.status, 200, await drifted.clone().text());
         const [repairedRegistration] = await getDb().select()
           .from(externalAppRegistrations)
@@ -768,7 +828,7 @@ test("true Server production composition makes all seven provisioning endpoints 
           eq(externalAppServerGrants.state, "active"),
         ));
       try {
-        const conflicted = await fetch(`${app.baseUrl}/api/slack-bridge/provisioning`, { headers });
+        const conflicted = await appFetch(`${app.baseUrl}/api/slack-bridge/provisioning`, { headers });
         assert.equal(conflicted.status, 409);
         assert.equal((await conflicted.json() as { code?: string }).code, "external_app_install_conflict");
         const [untouched] = await getDb().select()
@@ -857,7 +917,7 @@ test("true Server production composition makes all seven provisioning endpoints 
       grantEpoch: grant.grantEpoch,
     });
 
-    const oauthStart = await fetch(`${app.baseUrl}/api/slack-bridge/oauth/start`, {
+    const oauthStart = await appFetch(`${app.baseUrl}/api/slack-bridge/oauth/start`, {
       method: "POST",
       headers,
       body: JSON.stringify(connectBody.oauthAuthority),
@@ -868,10 +928,10 @@ test("true Server production composition makes all seven provisioning endpoints 
     );
     const state = authorizationUrl.searchParams.get("state");
     assert.ok(state);
-    const oauthCallback = await fetch(
+    const oauthCallback = await appFetch(
       `${app.baseUrl}/api/slack-bridge/oauth/callback`
       + `?state=${encodeURIComponent(state)}&code=production-composition-code`,
-      { redirect: "manual" },
+      { redirect: "manual", headers: { Cookie: oauthBindingCookie(oauthStart) } },
     );
     assert.equal(oauthCallback.status, 302, await oauthCallback.clone().text());
     assert.equal(
@@ -884,7 +944,7 @@ test("true Server production composition makes all seven provisioning endpoints 
     assert.equal(install.providerAuthorityId, "T_PRODUCTION_COMPOSITION");
     assert.deepEqual(install.installedScopes, [...SLACK_BRIDGE_REQUIRED_BOT_SCOPES]);
 
-    const postOauth = await fetch(`${app.baseUrl}/api/slack-bridge/provisioning`, { headers });
+    const postOauth = await appFetch(`${app.baseUrl}/api/slack-bridge/provisioning`, { headers });
     assert.equal(postOauth.status, 200, await postOauth.clone().text());
     const postOauthSnapshot = (await postOauth.json() as {
       snapshot: { stage: string; slackChannels: Array<{ id: string; name: string; privacyClass: string; isMember: boolean }> };
@@ -896,7 +956,7 @@ test("true Server production composition makes all seven provisioning endpoints 
       { id: "C_PRODUCTION_PRIVATE", name: "private", privacyClass: "private", isMember: true },
       { id: "C_PRODUCTION_PRIVATE_2", name: "private-2", privacyClass: "private", isMember: true },
     ], "production provisioning must inventory a real app-member private channel");
-    assert.deepEqual(providerQueryRequests.at(-1), {
+    assert.deepEqual(providerQueryRequests.filter(call => call.method === "conversations.list").at(-1), {
       method: "conversations.list",
       httpMethod: "GET",
       body: undefined,
@@ -904,9 +964,27 @@ test("true Server production composition makes all seven provisioning endpoints 
       contentType: null,
       query: "exclude_archived=true&limit=200&types=public_channel%2Cprivate_channel",
     }, "private inventory must use Slack's complete GET-query shape");
+    assert.ok(providerQueryRequests.some(call => call.method === "conversations.members"
+      && call.httpMethod === "GET" && call.query.includes("channel=C_PRODUCTION_PRIVATE")),
+    "private channel visibility requires live authorizer membership");
+    // The pairs below use public Slack channels, and a pair must match privacy:
+    // pick a public Raft channel, not whichever row comes first.
     const [raftChannel] = await getDb().select().from(channels)
-      .where(eq(channels.serverId, server.id)).limit(1);
+      .where(and(eq(channels.serverId, server.id), eq(channels.type, "channel"))).limit(1);
     assert.ok(raftChannel);
+    providerAuthorizerMember = false;
+    const notMemberView = await appFetch(`${app.baseUrl}/api/slack-bridge/provisioning`, { headers });
+    assert.equal(notMemberView.status, 200);
+    const notMemberSnapshot = (await notMemberView.json() as { snapshot: { slackChannels: Array<{ id: string }> } }).snapshot;
+    assert.equal(notMemberSnapshot.slackChannels.some(channel => channel.id === "C_PRODUCTION_PRIVATE"), false);
+    const forgedPrivatePair = await appFetch(`${app.baseUrl}/api/slack-bridge/provisioning/channel-pairs`, {
+      method: "PUT", headers, body: JSON.stringify({ pairs: [{ raftChannelId: raftChannel.id,
+        slackChannelId: "C_PRODUCTION_PRIVATE" }] }),
+    });
+    assert.notEqual(forgedPrivatePair.status, 200, "a guessed private channel cannot bypass the list check");
+    assert.equal((await getDb().select().from(externalChannelBindings)
+      .where(eq(externalChannelBindings.serverId, server.id))).length, 0);
+    providerAuthorizerMember = true;
     const [mentionAgent] = await getDb().insert(agents).values({
       serverId: server.id,
       name: "production-agent",
@@ -918,7 +996,7 @@ test("true Server production composition makes all seven provisioning endpoints 
       agentId: mentionAgent.id,
     });
 
-    const nonMemberPair = await fetch(`${app.baseUrl}/api/slack-bridge/provisioning/channel-pairs`, {
+    const nonMemberPair = await appFetch(`${app.baseUrl}/api/slack-bridge/provisioning/channel-pairs`, {
       method: "PUT",
       headers,
       body: JSON.stringify({
@@ -929,10 +1007,11 @@ test("true Server production composition makes all seven provisioning endpoints 
     assert.deepEqual(await nonMemberPair.json(), {
       ok: false,
       code: "external_app_invalid_state",
+      reason: "not_member",
     }, "a Slack channel outside the app audience must fail before binding persistence");
     providerOtherChannelMember = true;
 
-    const pairs = await fetch(`${app.baseUrl}/api/slack-bridge/provisioning/channel-pairs`, {
+    const pairs = await appFetch(`${app.baseUrl}/api/slack-bridge/provisioning/channel-pairs`, {
       method: "PUT",
       headers,
       body: JSON.stringify({
@@ -942,7 +1021,7 @@ test("true Server production composition makes all seven provisioning endpoints 
     assert.equal(pairs.status, 200, await pairs.clone().text());
 
     providerBotInConversation = false;
-    const missingBotPreflight = await fetch(`${app.baseUrl}/api/slack-bridge/provisioning/preflight`, {
+    const missingBotPreflight = await appFetch(`${app.baseUrl}/api/slack-bridge/provisioning/preflight`, {
       method: "POST",
       headers,
     });
@@ -963,13 +1042,14 @@ test("true Server production composition makes all seven provisioning endpoints 
     assert.equal(missingBotSnapshot.rawHealth.failingSurface, "audience");
 
     providerBotInConversation = true;
-    const preflight = await fetch(`${app.baseUrl}/api/slack-bridge/provisioning/preflight`, {
+    const preflight = await appFetch(`${app.baseUrl}/api/slack-bridge/provisioning/preflight`, {
       method: "POST",
       headers,
     });
     assert.equal(preflight.status, 200, await preflight.clone().text());
     assert.equal((await preflight.json() as { snapshot: { stage: string } }).snapshot.stage, "enable");
-    assert.deepEqual(providerQueryRequests.slice(-3), [{
+    assert.deepEqual(providerQueryRequests.filter(call => !(call.method === "conversations.members"
+      && call.query.includes("channel=C_PRODUCTION_PRIVATE"))).slice(-3), [{
       method: "conversations.list",
       httpMethod: "GET",
       body: undefined,
@@ -1038,7 +1118,7 @@ test("true Server production composition makes all seven provisioning endpoints 
     assert.equal(orderedPublicAudienceSnapshots[1]?.externalMemberCount, 1);
     assert.equal(orderedPublicAudienceSnapshots[1]?.raftMemberCount, 1);
     driftBindingId = binding.id;
-    const driftedEnable = await fetch(`${app.baseUrl}/api/slack-bridge/provisioning/enable`, {
+    const driftedEnable = await appFetch(`${app.baseUrl}/api/slack-bridge/provisioning/enable`, {
       method: "POST",
       headers,
     });
@@ -1053,7 +1133,7 @@ test("true Server production composition makes all seven provisioning endpoints 
     await getDb().update(externalChannelBindings).set({
       providerConversationId: "C_PRODUCTION_GENERAL",
     }).where(eq(externalChannelBindings.id, binding.id));
-    const recoveredPreflight = await fetch(`${app.baseUrl}/api/slack-bridge/provisioning/preflight`, {
+    const recoveredPreflight = await appFetch(`${app.baseUrl}/api/slack-bridge/provisioning/preflight`, {
       method: "POST",
       headers,
     });
@@ -1075,7 +1155,7 @@ test("true Server production composition makes all seven provisioning endpoints 
       BEFORE INSERT ON external_app_install_grant_receipts
       FOR EACH ROW EXECUTE FUNCTION reject_install_grant_receipt_for_test()
     `));
-    const failedEnable = await fetch(`${app.baseUrl}/api/slack-bridge/provisioning/enable`, {
+    const failedEnable = await appFetch(`${app.baseUrl}/api/slack-bridge/provisioning/enable`, {
       method: "POST",
       headers,
     });
@@ -1095,7 +1175,7 @@ test("true Server production composition makes all seven provisioning endpoints 
     await getDb().execute(sql.raw("DROP FUNCTION reject_install_grant_receipt_for_test()"));
 
 
-    const enable = await fetch(`${app.baseUrl}/api/slack-bridge/provisioning/enable`, {
+    const enable = await appFetch(`${app.baseUrl}/api/slack-bridge/provisioning/enable`, {
       method: "POST",
       headers,
     });
@@ -1108,7 +1188,11 @@ test("true Server production composition makes all seven provisioning endpoints 
     })), [{
       id: "SPRODUCTION1",
       handle: "production-agent",
-      description: `raft-agent:${server.id}:${mentionAgent.id}`,
+      description: "Raft agent",
+    }, {
+      id: "SPRODUCTION2",
+      handle: owner.name,
+      description: "Raft member",
     }]);
     const [baselineGrantReceipt] = await getDb().select()
       .from(externalAppInstallGrantReceipts)
@@ -1120,7 +1204,7 @@ test("true Server production composition makes all seven provisioning endpoints 
       installedScopes: [...SLACK_BRIDGE_CORE_BOT_SCOPES],
       scopeRevision: install.scopeRevision + 1,
     }).where(eq(externalAppInstalls.id, install.id));
-    const legacyRepair = await fetch(`${app.baseUrl}/api/slack-bridge/provisioning/enable`, {
+    const legacyRepair = await appFetch(`${app.baseUrl}/api/slack-bridge/provisioning/enable`, {
       method: "POST",
       headers,
     });
@@ -1140,7 +1224,7 @@ test("true Server production composition makes all seven provisioning endpoints 
     // collision) must degrade, not block binding: enable still succeeds and
     // the binding stays active.
     providerUsergroupsFail = true;
-    const degradedEnable = await fetch(`${app.baseUrl}/api/slack-bridge/provisioning/enable`, {
+    const degradedEnable = await appFetch(`${app.baseUrl}/api/slack-bridge/provisioning/enable`, {
       method: "POST",
       headers,
     });
@@ -1148,8 +1232,8 @@ test("true Server production composition makes all seven provisioning endpoints 
     const [degradedBinding] = await getDb().select().from(externalChannelBindings)
       .where(eq(externalChannelBindings.id, binding.id));
     assert.equal(degradedBinding?.state, "active", "usergroup sync failure must not pause binding");
-    const [degradedInstall] = await getDb().select().from(externalAppInstalls)
-      .where(eq(externalAppInstalls.id, install.id));
+    const [degradedInstall] = await getDb().select().from(externalAppInstallServerGrants)
+      .where(and(eq(externalAppInstallServerGrants.installId, install.id), eq(externalAppInstallServerGrants.serverId, server.id)));
     assert.deepEqual(degradedInstall?.agentMentionSync && {
       state: degradedInstall.agentMentionSync.state,
       slackError: degradedInstall.agentMentionSync.slackError,
@@ -1158,6 +1242,16 @@ test("true Server production composition makes all seven provisioning endpoints 
       slackError: "paid_teams_only",
     }, "deterministic usergroup failure must persist Slack's error for the settings hint");
     providerUsergroupsFail = false;
+    const cachedFreeEnableCalls = providerUsergroupListCalls;
+    const cachedFreeEnable = await appFetch(`${app.baseUrl}/api/slack-bridge/provisioning/enable`, {
+      method: "POST", headers,
+    });
+    assert.equal(cachedFreeEnable.status, 200);
+    assert.equal(providerUsergroupListCalls, cachedFreeEnableCalls,
+      "a known free workspace keeps binding usable without repeating usergroup reads");
+    // End this simulated free-plan scenario before independent paid scenarios.
+    await getDb().update(externalAppInstalls).set({ slackMentionCapability: null })
+      .where(eq(externalAppInstalls.id, install.id));
 
     await getDb().delete(externalAppInstallGrantReceipts)
       .where(eq(externalAppInstallGrantReceipts.installId, install.id));
@@ -1219,12 +1313,14 @@ test("true Server production composition makes all seven provisioning endpoints 
       installedScopes: [...SLACK_BRIDGE_REQUIRED_BOT_SCOPES],
       scopeRevision: install.scopeRevision,
     }).where(eq(externalAppInstalls.id, install.id));
+    let mentionNow = new Date();
     const mentionProbe = createSlackBridgeProviderRuntime({
       credentialCipher: createSlackBridgeEnvCredentialCipher({
         key: Buffer.from(CREDENTIAL_KEY, "base64"),
       }),
       db: getDb(),
       fetch: providerFetch,
+      now: () => mentionNow,
     });
     const mentionAuthority = {
       installId: install.id,
@@ -1233,8 +1329,161 @@ test("true Server production composition makes all seven provisioning endpoints 
       botUserId: install.botUserId!,
       connectionEpoch: install.connectionEpoch,
       credentialRevision: install.credentialRevision,
-      now: new Date(),
+      now: mentionNow,
     };
+    // Independent historical scenarios run after retry windows. The explicit
+    // frozen-clock cases below exercise requests inside those windows.
+    const reconcileMentions: NonNullable<typeof mentionProbe.provisioningProvider.reconcileAgentMentionHandles> = async (authority, request) => {
+      mentionNow = new Date(mentionNow.getTime() + 61 * 60_000);
+      authority.now = mentionNow;
+      return mentionProbe.provisioningProvider.reconcileAgentMentionHandles!(authority, request);
+    };
+    // Existing Slack groups are adopted by the exact legacy marker, then the
+    // UUID-bearing description is cleared without replacing their identity.
+    const originalGroup = providerUsergroups[0]!;
+    originalGroup.description = `raft-agent:${server.id}:${mentionAgent.id}`;
+    const ownerGroupBefore = structuredClone(providerUsergroups.find(group => group.handle === owner.name));
+    const ownerMappingQuery = () => getDb().select({ id: slackUsergroupIdentities.id,
+      providerUsergroupId: slackUsergroupIdentities.providerUsergroupId,
+    }).from(slackUsergroupIdentities).where(and(
+      eq(slackUsergroupIdentities.installId, install.id),
+      eq(slackUsergroupIdentities.principalKind, "user"),
+      eq(slackUsergroupIdentities.principalId, owner.id),
+    ));
+    const ownerMappingBefore = await ownerMappingQuery();
+    assert.equal(ownerMappingBefore.length, 1);
+    await getDb().delete(slackUsergroupIdentities).where(and(
+      eq(slackUsergroupIdentities.installId, install.id),
+      eq(slackUsergroupIdentities.principalKind, "agent"),
+      eq(slackUsergroupIdentities.principalId, mentionAgent.id),
+    ));
+    const currentBindings = await getDb().select().from(externalChannelBindings).where(eq(externalChannelBindings.id, binding.id));
+    const originalCandidates = await listSlackBridgeAgentMentionCandidates(getDb(), server.id, currentBindings);
+    const reconcileOriginal = () => reconcileMentions(
+      mentionAuthority, { serverId: server.id, candidates: originalCandidates },
+    );
+    await runNamedCase("free workspace stops on first create refusal and reprobes after authorization changes", async () => {
+      const freeCandidates = [0, 1, 2].map((index) => ({
+        ...originalCandidates[0]!, agentId: randomUUID(), name: `free-agent-${index}`, displayName: `Free Agent ${index}`,
+      }));
+      const freeRequest = { serverId: server.id, candidates: freeCandidates };
+      const beforeCreates = providerUsergroupCreateAttempts.length;
+      providerUsergroupCreateError = "paid_teams_only";
+      const refused = await reconcileMentions(mentionAuthority, freeRequest);
+      assert.deepEqual(refused, { kind: "failed", slackError: "paid_teams_only" });
+      assert.equal(providerUsergroupCreateAttempts.length, beforeCreates + 1,
+        "the first plan refusal must stop later principals in the same pass");
+      const [cachedInstall] = await getDb().select().from(externalAppInstalls)
+        .where(eq(externalAppInstalls.id, install.id));
+      assert.equal(cachedInstall?.slackMentionCapability?.result, "paid_teams_only");
+      assert.equal(cachedInstall?.slackMentionCapability?.credentialRevision, mentionAuthority.credentialRevision);
+      const restart = createSlackBridgeProviderRuntime({
+        credentialCipher: createSlackBridgeEnvCredentialCipher({ key: Buffer.from(CREDENTIAL_KEY, "base64") }),
+        db: getDb(), fetch: providerFetch, now: () => mentionNow,
+      });
+      try {
+        const listCalls = providerUsergroupListCalls;
+        mentionNow = new Date(mentionNow.getTime() + 24 * 60 * 60_000);
+        mentionAuthority.now = mentionNow;
+        const anotherServer = randomUUID();
+        const cached = await restart.provisioningProvider.reconcileAgentMentionHandles!(mentionAuthority, {
+          serverId: anotherServer, candidates: freeCandidates.map((candidate) => ({ ...candidate, serverId: anotherServer })),
+        });
+        assert.deepEqual(cached, refused);
+        assert.equal(providerUsergroupListCalls, listCalls,
+          "another runtime/server must reuse the persisted capability without any Slack call");
+        assert.equal(providerUsergroupCreateAttempts.length, beforeCreates + 1);
+      } finally { await restart.stop(); }
+      // A second server's fresh OAuth consent can reuse the same token.
+      await getDb().update(externalAppInstalls).set({ slackMentionCapability: {
+        authorizationId: newSlackMentionAuthorizationId(), result: "unverified",
+        connectionEpoch: mentionAuthority.connectionEpoch, credentialRevision: mentionAuthority.credentialRevision,
+      } }).where(eq(externalAppInstalls.id, install.id));
+      providerUsergroupCreateError = null;
+      const resumed = await reconcileMentions(mentionAuthority, freeRequest);
+      assert.equal(resumed.kind, "fact");
+      assert.equal(providerUsergroupCreateAttempts.length, beforeCreates + 4,
+        "fresh consent must allow all three candidates without rotating the token");
+      await getDb().update(externalAppInstalls).set({ slackMentionCapability: null })
+        .where(eq(externalAppInstalls.id, install.id));
+      // A delayed old-token refusal cannot disable an authorization installed
+      // while the provider request was in flight.
+      providerUsergroupCreateError = "paid_teams_only";
+      beforeUsergroupCreateRefusal = async () => {
+        await getDb().update(externalAppInstalls).set({ slackMentionCapability: {
+          authorizationId: newSlackMentionAuthorizationId(), result: "unverified",
+          connectionEpoch: mentionAuthority.connectionEpoch, credentialRevision: mentionAuthority.credentialRevision,
+        } }).where(eq(externalAppInstalls.id, install.id));
+      };
+      try {
+        const delayed = await reconcileMentions(mentionAuthority, {
+          serverId: server.id, candidates: [{ ...freeCandidates[0]!, agentId: randomUUID(), name: "delayed-free-agent" }],
+        });
+        assert.equal(delayed.kind, "unverified");
+        const [after] = await getDb().select().from(externalAppInstalls).where(eq(externalAppInstalls.id, install.id));
+        assert.equal(after?.slackMentionCapability?.result, "unverified", "old refusal must not poison the new authorization even when token versions stay the same");
+      } finally {
+        providerUsergroupCreateError = null;
+        beforeUsergroupCreateRefusal = null;
+        await getDb().update(externalAppInstalls).set({ credentialRevision: mentionAuthority.credentialRevision, slackMentionCapability: null })
+          .where(eq(externalAppInstalls.id, install.id));
+      }
+      assert.equal((await reconcileOriginal()).kind, "fact");
+      for (const candidate of freeCandidates) {
+        const index = providerUsergroups.findIndex((group) => group.handle === candidate.name);
+        if (index >= 0) providerUsergroups.splice(index, 1);
+      }
+      await getDb().delete(slackUsergroupIdentities).where(and(
+        eq(slackUsergroupIdentities.installId, install.id),
+        inArray(slackUsergroupIdentities.principalId, freeCandidates.map((candidate) => candidate.agentId)),
+      ));
+    });
+    assert.equal((await reconcileOriginal()).kind, "fact");
+    assert.equal(providerUsergroups[0]?.id, "SPRODUCTION1");
+    assert.equal(providerUsergroups[0]?.handle, "production-agent");
+    assert.equal(providerUsergroups[0]?.description, "Raft agent");
+    const known = await mentionProbe.resolveAgentMentionHandles(mentionAuthority, {
+      serverId: server.id, providerUsergroupIds: ["SPRODUCTION1"],
+    });
+    assert.ok(known.kind === "fact" && known.fact.handles.some((h) => h.agentId === mentionAgent.id));
+    const foreign = await mentionProbe.resolveAgentMentionHandles(mentionAuthority, {
+      serverId: randomUUID(), providerUsergroupIds: ["SPRODUCTION1"],
+    });
+    assert.ok(foreign.kind === "fact" && foreign.fact.handles.length === 0);
+
+    // Use a separate synthetic candidate for uncertain-create recovery; do
+    // not delete other principals' mappings or the original Slack group.
+    const recoveryCandidate = { ...originalCandidates[0]!, agentId: randomUUID(),
+      name: "recovery-agent", displayName: "Recovery Agent" };
+    const reconcileRecovery = () => reconcileMentions(
+      mentionAuthority, { serverId: server.id, candidates: [...originalCandidates, recoveryCandidate] },
+    );
+    loseNextUsergroupCreateResponse = true;
+    const uncertain = await reconcileRecovery();
+    assert.ok(uncertain.kind === "fact" && uncertain.fact.failures.length === 1);
+    const recoveryGroup = providerUsergroups.find(group => group.handle === recoveryCandidate.name)!;
+    assert.ok(recoveryGroup);
+    assert.match(recoveryGroup.description, /^Raft identity pending [0-9a-f]{48}$/);
+    assert.ok(!recoveryGroup.description.includes(server.id));
+    assert.ok(!recoveryGroup.description.includes(recoveryCandidate.agentId));
+    const attempts = providerUsergroupCreateAttempts.length;
+    assert.equal((await reconcileRecovery()).kind, "fact");
+    assert.equal(providerUsergroupCreateAttempts.length, attempts, "lost create response must not create a duplicate");
+    assert.equal(recoveryGroup.description, "Raft agent");
+    providerUsergroupUpdateAttempts.length = 0;
+    assert.equal((await reconcileRecovery()).kind, "fact");
+    assert.deepEqual(providerUsergroupUpdateAttempts, [], "clean descriptions converge without repeat writes");
+    assert.deepEqual(providerUsergroups.find(group => group.handle === owner.name), ownerGroupBefore,
+      "an Agent-only recovery must not replace or retire the owner's group");
+    assert.deepEqual(await ownerMappingQuery(), ownerMappingBefore,
+      "Agent recovery must preserve the existing human identity mapping");
+    assert.equal((await reconcileOriginal()).kind, "fact");
+    assert.equal(recoveryGroup.date_delete, 1);
+    providerUsergroups.splice(providerUsergroups.indexOf(recoveryGroup), 1);
+    await getDb().delete(slackUsergroupIdentities).where(and(
+      eq(slackUsergroupIdentities.installId, install.id),
+      eq(slackUsergroupIdentities.principalId, recoveryCandidate.agentId),
+    ));
     let exhaustedHumanId: string | null = null;
     try {
       await getDb().update(agents).set({
@@ -1255,13 +1504,13 @@ test("true Server production composition makes all seven provisioning endpoints 
       // write and reports `unverified` (the persisted state stays as is).
       providerUsergroupCreateAttempts.length = 0;
       providerUsergroupUpdateAttempts.length = 0;
-      assert.equal((await mentionProbe.provisioningProvider.reconcileAgentMentionHandles!(
+      assert.equal((await reconcileMentions(
         mentionAuthority,
         { serverId: server.id, candidates: renamedCandidates, isClaimHeld: async () => false },
       )).kind, "unverified");
       assert.deepEqual([...providerUsergroupCreateAttempts, ...providerUsergroupUpdateAttempts], []);
       assert.equal(providerUsergroups[0]?.handle, "production-agent", "a lapsed holder renamed nothing");
-      assert.equal((await mentionProbe.provisioningProvider.reconcileAgentMentionHandles!(
+      assert.equal((await reconcileMentions(
         mentionAuthority,
         { serverId: server.id, candidates: renamedCandidates },
       )).kind, "fact");
@@ -1281,7 +1530,7 @@ test("true Server production composition makes all seven provisioning endpoints 
         activeBindings,
       );
       assert.deepEqual(removedCandidates, []);
-      assert.equal((await mentionProbe.provisioningProvider.reconcileAgentMentionHandles!(
+      assert.equal((await reconcileMentions(
         mentionAuthority,
         { serverId: server.id, candidates: removedCandidates },
       )).kind, "fact");
@@ -1300,8 +1549,7 @@ test("true Server production composition makes all seven provisioning endpoints 
         server.id,
         activeBindings,
       );
-      const restoredReconcile = await mentionProbe.provisioningProvider
-        .reconcileAgentMentionHandles!(
+      const restoredReconcile = await reconcileMentions(
           mentionAuthority,
           { serverId: server.id, candidates: restoredCandidates },
         );
@@ -1343,7 +1591,7 @@ test("true Server production composition makes all seven provisioning endpoints 
         { channelId: raftChannel.id, userId: mentionHuman!.id },
         { channelId: raftChannel.id, userId: retiredHuman!.id },
       ]);
-      const humanMarker = `raft-user:${server.id}:${mentionHuman!.id}`;
+
       const withHuman = await listSlackBridgeMentionCandidates(getDb(), server.id, activeBindings);
       assert.deepEqual(withHuman.candidates.map((candidate) => candidate.agentId), [mentionAgent.id]);
       assert.ok(withHuman.humanCandidates.some((candidate) => candidate.userId === mentionHuman!.id));
@@ -1351,16 +1599,239 @@ test("true Server production composition makes all seven provisioning endpoints 
         withHuman.humanCandidates.every((candidate) => candidate.userId !== retiredHuman!.id),
         "retired users are never mention candidates",
       );
-      const humanReconcile = await mentionProbe.provisioningProvider.reconcileAgentMentionHandles!(
+      const humanReconcile = await reconcileMentions(
         mentionAuthority,
         { serverId: server.id, ...withHuman },
       );
       assert.equal(humanReconcile.kind, "fact");
-      const humanGroup = providerUsergroups.find((group) => group.description === humanMarker);
+      const humanGroup = providerUsergroups.find((group) => group.handle === mentionHuman!.name);
       assert.ok(humanGroup, "a paired-channel human gets a managed usergroup");
       assert.equal(humanGroup.handle, mentionHuman!.name);
-      assert.equal(humanGroup.name, "Production Human · Slack Production Composition");
+      assert.equal(humanGroup.name, "Production Human · Raft");
       assert.equal(humanGroup.date_delete, 0);
+      const existingHumanGroupId = humanGroup.id;
+      humanGroup.name = `Production Human · ${mentionHuman!.id.slice(0, 8)}`;
+      await reconcileMentions(mentionAuthority, { serverId: server.id, ...withHuman });
+      const renamedHumanGroup = providerUsergroups.find((group) => group.id === existingHumanGroupId)!;
+      assert.equal(renamedHumanGroup.name, "Production Human · Raft",
+        "an old ID-suffixed group is renamed in place to its source server");
+      assert.equal(renamedHumanGroup.handle, mentionHuman!.name, "renaming preserves the mention handle");
+      const groupsBeforeSharedHuman = providerUsergroups.length;
+      const otherMentionServer = await createServer("Other Raft Server", `other-mention-${randomUUID()}`, owner.id);
+      const otherServerId = otherMentionServer.id;
+      const sharedHuman = await reconcileMentions(mentionAuthority, {
+        serverId: otherServerId, candidates: [],
+        humanCandidates: withHuman.humanCandidates.map((human) => ({ ...human, serverId: otherServerId })),
+      });
+      assert.equal(sharedHuman.kind, "fact");
+      assert.equal(providerUsergroups.length, groupsBeforeSharedHuman, "another Raft server reuses the same human usergroup");
+      assert.ok(sharedHuman.kind === "fact" && sharedHuman.fact.humanHandles?.some((handle) =>
+        handle.userId === mentionHuman!.id && handle.providerUsergroupId === existingHumanGroupId));
+      const sharedResolved = await mentionProbe.resolveAgentMentionHandles(mentionAuthority, {
+        serverId: otherServerId, providerUsergroupIds: [existingHumanGroupId],
+      });
+      assert.ok(sharedResolved.kind === "fact" && sharedResolved.fact.humanHandles?.some((handle) => handle.userId === mentionHuman!.id),
+        "workspace identity resolution is independent of the reservation's original server");
+      humanGroup.name = "Production Human · outdated";
+      let releaseBeforeWrite!: () => void;
+      let enteredBeforeWrite!: () => void;
+      const writeGate = new Promise<void>((resolve) => { releaseBeforeWrite = resolve; });
+      const entered = new Promise<void>((resolve) => { enteredBeforeWrite = resolve; });
+      const firstWorkspacePass = reconcileMentions(mentionAuthority, {
+        serverId: server.id, ...withHuman,
+        isClaimHeld: async () => { enteredBeforeWrite(); await writeGate; return true; },
+      });
+      await entered;
+      try {
+        const listedBeforeContender = providerUsergroupListCalls;
+        const contendingPass = await reconcileMentions(mentionAuthority, {
+          serverId: otherServerId, candidates: [], humanCandidates: withHuman.humanCandidates.map((human) => ({ ...human, serverId: otherServerId })),
+        });
+        assert.equal(contendingPass.kind, "unverified", "another server cannot interleave a reconcile after list but before write");
+        assert.equal(providerUsergroupListCalls, listedBeforeContender, "the workspace guard covers the entire provider sequence");
+      } finally {
+        releaseBeforeWrite();
+        await firstWorkspacePass;
+      }
+      await getDb().execute(sql`INSERT INTO slack_usergroup_identities
+        (id, install_id, server_id, principal_kind, principal_id, recovery_ref, provider_usergroup_id)
+        VALUES ('ffffffff-ffff-ffff-ffff-ffffffffffff', ${install.id}, ${otherServerId}, 'user', ${mentionHuman!.id}, 'legacy-human-alias', 'SLEGACYHUMAN')`);
+      providerUsergroups.push({ id: "SLEGACYHUMAN", name: "Production Human · old-id", handle: "production-human-legacy", description: "Raft member", date_delete: 0 });
+      providerDisableFail = true;
+      const cleanupDenied = await reconcileMentions(mentionAuthority, { serverId: server.id, ...withHuman });
+      assert.ok(cleanupDenied.kind === "fact");
+      assert.ok(cleanupDenied.fact.humanHandles?.some((handle) => handle.userId === mentionHuman!.id && handle.providerUsergroupId === existingHumanGroupId));
+      assert.deepEqual(cleanupDenied.fact.failures, [], "cleanup refusal does not remove current handles");
+      assert.deepEqual(cleanupDenied.fact.cleanupFailures, [{ slackError: "permission_denied" }]);
+      providerDisableFail = false;
+      await reconcileMentions(mentionAuthority, { serverId: otherServerId, candidates: [], humanCandidates: withHuman.humanCandidates.map((human) => ({ ...human, serverId: otherServerId })) });
+      assert.equal(providerUsergroups.find((group) => group.id === "SLEGACYHUMAN")?.date_delete, 1);
+      assert.equal(providerUsergroups.find((group) => group.id === existingHumanGroupId)?.date_delete, 0, "shared winner remains enabled");
+      const retiredAlias = await mentionProbe.resolveAgentMentionHandles(mentionAuthority, { serverId: otherServerId, providerUsergroupIds: ["SLEGACYHUMAN"] });
+      assert.ok(retiredAlias.kind === "fact" && retiredAlias.fact.humanHandles?.some((handle) => handle.userId === mentionHuman!.id),
+        "queued old human tokens retain identity after duplicate cleanup; membership is checked at commit");
+
+      const legacyAliasGroup = providerUsergroups.find((group) => group.id === "SLEGACYHUMAN")!;
+      humanGroup.date_delete = 1;
+      legacyAliasGroup.date_delete = 0;
+      const activeAlias = await reconcileMentions(mentionAuthority, { serverId: server.id, ...withHuman });
+      assert.ok(activeAlias.kind === "fact" && activeAlias.fact.humanHandles?.some((handle) => handle.userId === mentionHuman!.id && handle.providerUsergroupId === "SLEGACYHUMAN"),
+        "an already active alias is preferred over re-enabling a disabled canonical row");
+      const canonicalRows = await getDb().select().from(slackUsergroupIdentities).where(and(
+        eq(slackUsergroupIdentities.installId, install.id), eq(slackUsergroupIdentities.principalId, mentionHuman!.id),
+        eq(slackUsergroupIdentities.humanCanonical, true),
+      ));
+      assert.deepEqual(canonicalRows.map((row) => row.providerUsergroupId), ["SLEGACYHUMAN"],
+        "switching to an active alias atomically replaces the durable outbound destination");
+      humanGroup.date_delete = 0;
+      legacyAliasGroup.date_delete = 1;
+
+      providerUsergroups.splice(providerUsergroups.findIndex((group) => group.id === "SLEGACYHUMAN"), 1);
+
+      // Permanent per-user naming conflicts must not starve a later healthy user.
+      const blockedHumans = Array.from({ length: 68 }, (_, index) => ({
+        ...withHuman.humanCandidates[0]!, userId: `00000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`,
+        name: `budget-conflict-${index}`, displayName: `Budget Conflict ${index}`,
+      }));
+      for (const human of blockedHumans) for (const handle of slackHumanHandleCandidates(human)) providerUsergroupCreateRefusals.set(handle, "name_taken");
+      const healthyAfterFailures = { ...withHuman.humanCandidates[0]!, userId: "ffffffff-ffff-4fff-8fff-fffffffffff0", name: "healthy-after-conflicts", displayName: "Healthy after conflicts" };
+      for (let pass = 0; pass < 3; pass++) {
+        const result = await reconcileMentions(mentionAuthority, {
+          serverId: server.id, candidates: withHuman.candidates,
+          humanCandidates: [...withHuman.humanCandidates, ...blockedHumans, healthyAfterFailures],
+        });
+        assert.equal(result.kind, "fact");
+        if (pass === 2) assert.ok(result.kind === "fact" && result.fact.humanHandles?.some((handle) => handle.userId === healthyAfterFailures.userId),
+          "permanent failures at the front must not consume each reconciliation and starve a healthy member");
+      }
+
+      const probeHumanIds = [...blockedHumans.map((human) => human.userId), healthyAfterFailures.userId];
+      await getDb().delete(slackUsergroupIdentities).where(and(eq(slackUsergroupIdentities.installId, install.id), inArray(slackUsergroupIdentities.principalId, probeHumanIds)));
+      providerUsergroups.splice(0, providerUsergroups.length, ...providerUsergroups.filter((group) => group.handle !== healthyAfterFailures.name));
+
+      // Failure memory and workspace deduplication survive a new runtime and
+      // a different Raft server. No cache or cooldown is kept only in process.
+      const memoBlocked = { ...withHuman.humanCandidates[0]!, userId: randomUUID(), name: "memo-blocked", displayName: "Memo Blocked" };
+      const memoPermission = { ...memoBlocked, userId: randomUUID(), name: "memo-permission", displayName: "Memo Permission" };
+      const memoHealthy = { ...memoBlocked, userId: randomUUID(), name: "memo-healthy", displayName: "Memo Healthy" };
+      for (const handle of slackHumanHandleCandidates(memoBlocked)) providerUsergroupCreateRefusals.set(handle, "name_taken");
+      providerUsergroupCreateRefusals.set(memoPermission.name, "permission_denied");
+      const memoHumans = [...withHuman.humanCandidates, memoBlocked, memoPermission, memoHealthy];
+      const frozenReconcile = mentionProbe.provisioningProvider.reconcileAgentMentionHandles!;
+      const replica = createSlackBridgeProviderRuntime({
+        credentialCipher: createSlackBridgeEnvCredentialCipher({ key: Buffer.from(CREDENTIAL_KEY, "base64") }),
+        db: getDb(), fetch: providerFetch, now: () => mentionNow,
+      });
+      const replicaReconcile = replica.provisioningProvider.reconcileAgentMentionHandles!;
+      const attemptsFor = (names: readonly string[]) => providerUsergroupCreateAttempts.filter((handle) => names.includes(handle)).length;
+      const blockedNames = [...slackHumanHandleCandidates(memoBlocked), memoPermission.name];
+      const frozenRequest = { serverId: server.id, candidates: withHuman.candidates, humanCandidates: memoHumans };
+      try {
+        const memoStartedAt = mentionNow.getTime();
+        const firstMemo = await frozenReconcile(mentionAuthority, frozenRequest);
+        assert.ok(firstMemo.kind === "fact" && firstMemo.fact.humanHandles?.some((h) => h.userId === memoHealthy.userId));
+        let refusedAttempts = attemptsFor(blockedNames);
+        assert.ok(refusedAttempts >= 4, "initial naming and permission failures reach Slack");
+        const healthyGroup = providerUsergroups.find((group) => group.handle === memoHealthy.name)!;
+        healthyGroup.name = "Externally changed between workspace passes";
+        const updatesBeforeReplica = providerUsergroupUpdateAttempts.length;
+        await replicaReconcile(mentionAuthority, {
+          serverId: otherServerId, candidates: [], humanCandidates: memoHumans.map((h) => ({ ...h, serverId: otherServerId, serverSlug: "other-raft-server", serverName: "Other Raft Server" })),
+        });
+        assert.equal(providerUsergroupUpdateAttempts.length, updatesBeforeReplica,
+          "the other server reuses this workspace candidate version instead of running the human pass again");
+        // Fresh consent invalidates both completed human results and negative
+        // write memory even when a shared install keeps the same token.
+        await getDb().update(externalAppInstalls).set({ slackMentionCapability: {
+          authorizationId: newSlackMentionAuthorizationId(), result: "unverified",
+          connectionEpoch: mentionAuthority.connectionEpoch, credentialRevision: mentionAuthority.credentialRevision,
+        } }).where(eq(externalAppInstalls.id, install.id));
+        await replicaReconcile(mentionAuthority, frozenRequest);
+        assert.equal(healthyGroup.name, "Memo Healthy · Raft",
+          "fresh consent must bypass the unchanged human snapshot immediately");
+        assert.ok(attemptsFor(blockedNames) > refusedAttempts,
+          "fresh consent must re-probe unchanged rejected writes before the one-hour deadline");
+        refusedAttempts = attemptsFor(blockedNames);
+        mentionNow = new Date(memoStartedAt + 6 * 60_000); mentionAuthority.now = mentionNow;
+        await replicaReconcile(mentionAuthority, frozenRequest);
+        assert.equal(healthyGroup.name, "Memo Healthy · Raft", "after the shared interval another replica can refresh the workspace");
+        assert.equal(attemptsFor(blockedNames), refusedAttempts,
+          "expired workspace snapshot does not forget rejected candidates or permission failures before one hour");
+        mentionNow = new Date(memoStartedAt + 60 * 60_000 + 1); mentionAuthority.now = mentionNow;
+        await replicaReconcile(mentionAuthority, frozenRequest);
+        assert.ok(attemptsFor(blockedNames) > refusedAttempts, "one-hour expiry permits recovery attempts");
+        const renamedBlocked = { ...memoBlocked, name: "memo-name-change", displayName: "Memo Name Change" };
+        const changedHumans = memoHumans.map((h) => h.userId === memoBlocked.userId ? renamedBlocked : h);
+        const changedMemo = await replicaReconcile(mentionAuthority, { ...frozenRequest, humanCandidates: changedHumans });
+        assert.ok(changedMemo.kind === "fact" && changedMemo.fact.humanHandles?.some((h) => h.userId === memoBlocked.userId),
+          "changed candidates invalidate both deduplication and the old rejected write fingerprint immediately");
+
+        healthyGroup.date_delete = 1;
+        providerEnableFail = true;
+        mentionNow = new Date(mentionNow.getTime() + 6 * 60_000); mentionAuthority.now = mentionNow;
+        await replicaReconcile(mentionAuthority, { ...frozenRequest, humanCandidates: changedHumans });
+        const [disabledIdentity] = await getDb().select().from(slackUsergroupIdentities).where(and(
+          eq(slackUsergroupIdentities.installId, install.id), eq(slackUsergroupIdentities.principalId, memoHealthy.userId),
+        ));
+        assert.equal(disabledIdentity?.humanCanonical, false,
+          "a disabled group cannot remain a new outbound destination while enable permission is refused/backed off");
+        providerEnableFail = false;
+        mentionNow = new Date(mentionNow.getTime() + 61 * 60_000); mentionAuthority.now = mentionNow;
+        await replicaReconcile(mentionAuthority, { ...frozenRequest, humanCandidates: changedHumans });
+
+        // 429 stops agents, humans and cleanup, and fences every replica until
+        // Retry-After expires, even if a different server requests a pass.
+        const rateAgent = { ...withHuman.candidates[0]!, agentId: "00000000-0000-4000-8000-000000000999", name: "rate-limit-first", displayName: "Rate Limit First" };
+        const afterRateHuman = { ...memoHealthy, userId: randomUUID(), name: "not-sent-after429", displayName: "After Rate Limit" };
+        const rateRequest = { serverId: server.id, candidates: [rateAgent, ...withHuman.candidates], humanCandidates: [...changedHumans, afterRateHuman] };
+        const createsBefore429 = providerUsergroupCreateAttempts.length;
+        const updatesBefore429 = providerUsergroupUpdateAttempts.length;
+        const disablesBefore429 = providerUsergroupDisableCalls;
+        const limitedAt = mentionNow.getTime();
+        rateLimitNextGroupCreate = true;
+        assert.equal((await frozenReconcile(mentionAuthority, rateRequest)).kind, "unverified");
+        assert.equal(providerUsergroupCreateAttempts.length, createsBefore429 + 1, "no later principal is attempted after 429");
+        assert.equal(providerUsergroupUpdateAttempts.length, updatesBefore429);
+        assert.equal(providerUsergroupDisableCalls, disablesBefore429, "cleanup also stops on 429");
+        const listsAfter429 = providerUsergroupListCalls;
+        assert.equal((await replicaReconcile(mentionAuthority, { serverId: otherServerId, candidates: [] })).kind, "unverified");
+        mentionNow = new Date(limitedAt + 119_999); mentionAuthority.now = mentionNow;
+        assert.equal((await replicaReconcile(mentionAuthority, rateRequest)).kind, "unverified");
+        assert.equal(providerUsergroupListCalls, listsAfter429, "no sync API call occurs before Retry-After, including from a new replica");
+        mentionNow = new Date(limitedAt + 120_001); mentionAuthority.now = mentionNow;
+        const resumed = await replicaReconcile(mentionAuthority, rateRequest);
+        assert.ok(resumed.kind === "fact" && resumed.fact.humanHandles?.some((h) => h.userId === afterRateHuman.userId),
+          "the pass resumes after Retry-After and reaches later healthy humans");
+        const probeIds = [memoBlocked.userId, memoPermission.userId, memoHealthy.userId, afterRateHuman.userId, rateAgent.agentId];
+        const probeRows = await getDb().delete(slackUsergroupIdentities)
+          .where(and(eq(slackUsergroupIdentities.installId, install.id), inArray(slackUsergroupIdentities.principalId, probeIds))).returning();
+        const probeGroupIds = new Set(probeRows.map((row) => row.providerUsergroupId));
+        providerUsergroups.splice(0, providerUsergroups.length, ...providerUsergroups.filter((group) => !probeGroupIds.has(group.id)));
+      } finally {
+        await replica.stop();
+        // This probe advanced only its injected clock. Restore the shared
+        // fixture before the HTTP app continues on its real clock below.
+        await getDb().update(externalAppInstalls).set({ slackMentionRateLimitedUntil: null })
+          .where(eq(externalAppInstalls.id, install.id));
+      }
+
+      const batchHumans = Array.from({ length: 202 }, (_, index) => ({
+        ...withHuman.humanCandidates[0]!, userId: randomUUID(), name: `batch-human-${index}`, displayName: `Batch Human ${index}`,
+      }));
+      const fullWorkspaceHumans = [...withHuman.humanCandidates, ...batchHumans];
+      const batchResult = await reconcileMentions(mentionAuthority, {
+        serverId: server.id, candidates: withHuman.candidates, humanCandidates: fullWorkspaceHumans,
+      });
+      assert.ok(batchResult.kind === "fact");
+      assert.ok(providerUsergroups.filter((group) => group.handle.startsWith("batch-human-")).every((group) => group.date_delete === 0),
+        "complete workspace membership protects all still-needed groups from retirement");
+      assert.equal(batchResult.fact.humanHandles?.length, fullWorkspaceHumans.length,
+        "workspace membership larger than 200 is reconciled without truncation");
+      const batchIds = batchHumans.map((human) => human.userId);
+      await getDb().delete(slackUsergroupIdentities).where(and(eq(slackUsergroupIdentities.installId, install.id), inArray(slackUsergroupIdentities.principalId, batchIds)));
+      providerUsergroups.splice(0, providerUsergroups.length, ...providerUsergroups.filter((group) => !group.handle.startsWith("batch-human-")));
+
+
       assert.ok(humanReconcile.kind === "fact" && humanReconcile.fact.humanHandles?.some((handle) => (
         handle.userId === mentionHuman!.id && handle.providerUsergroupId === humanGroup.id
       )));
@@ -1394,7 +1865,7 @@ test("true Server production composition makes all seven provisioning endpoints 
       ]);
 
       // An Agent-only reconcile never disables human groups.
-      assert.equal((await mentionProbe.provisioningProvider.reconcileAgentMentionHandles!(
+      assert.equal((await reconcileMentions(
         mentionAuthority,
         { serverId: server.id, candidates: withHuman.candidates },
       )).kind, "fact");
@@ -1407,7 +1878,7 @@ test("true Server production composition makes all seven provisioning endpoints 
       ));
       const withoutHuman = await listSlackBridgeMentionCandidates(getDb(), server.id, activeBindings);
       assert.ok(withoutHuman.humanCandidates.every((candidate) => candidate.userId !== mentionHuman!.id));
-      assert.equal((await mentionProbe.provisioningProvider.reconcileAgentMentionHandles!(
+      assert.equal((await reconcileMentions(
         mentionAuthority,
         { serverId: server.id, ...withoutHuman },
       )).kind, "fact");
@@ -1432,16 +1903,16 @@ test("true Server production composition makes all seven provisioning endpoints 
         id: "SZDUPLICATE",
         name: "Production Agent duplicate",
         handle: "production-agent-duplicate",
-        description: agentGroup.description,
+        description: `raft-agent:${server.id}:${mentionAgent.id}`,
         date_delete: 0,
       }, {
         id: "SFOREIGNSAMENAME",
         name: agentGroup.name,
         handle: "someone-elses-group",
-        description: "ordinary Slack group",
+        description: "Raft agent",
         date_delete: 0,
       });
-      const healed = await mentionProbe.provisioningProvider.reconcileAgentMentionHandles!(
+      const healed = await reconcileMentions(
         mentionAuthority,
         { serverId: server.id, ...withoutHuman },
       );
@@ -1451,7 +1922,7 @@ test("true Server production composition makes all seven provisioning endpoints 
       assert.equal(providerUsergroups.find((group) => group.id === "SZDUPLICATE")?.date_delete, 1);
       assert.equal(providerUsergroups.find((group) => group.id === "SFOREIGNSAMENAME")?.date_delete, 0);
       providerUsergroupUpdateAttempts.length = 0;
-      const healedAgain = await mentionProbe.provisioningProvider.reconcileAgentMentionHandles!(
+      const healedAgain = await reconcileMentions(
         mentionAuthority,
         { serverId: server.id, ...withoutHuman },
       );
@@ -1485,7 +1956,6 @@ test("true Server production composition makes all seven provisioning endpoints 
       const exhaustedHuman = await seedChannelHuman("production-exhausted");
       const handleCandidatesOf = (user: { id: string; name: string }) => slackHumanHandleCandidates({
         name: user.name,
-        serverSlug: server.slug,
         userId: user.id,
       });
       const refusedCandidates = handleCandidatesOf(refusedHuman);
@@ -1498,14 +1968,14 @@ test("true Server production composition makes all seven provisioning endpoints 
       }
       providerUsergroupCreateAttempts.length = 0;
       const withRefusals = await listSlackBridgeMentionCandidates(getDb(), server.id, activeBindings);
-      const refusalReconcile = await mentionProbe.provisioningProvider.reconcileAgentMentionHandles!(
+      const refusalReconcile = await reconcileMentions(
         mentionAuthority,
         { serverId: server.id, ...withRefusals },
       );
       assert.equal(refusalReconcile.kind, "fact");
       assert.ok(refusalReconcile.kind === "fact");
       const refusedGroup = providerUsergroups.find((group) => (
-        group.description === `raft-user:${server.id}:${refusedHuman.id}`
+        refusalReconcile.fact.humanHandles?.some((handle) => handle.userId === refusedHuman.id && handle.providerUsergroupId === group.id)
       ));
       assert.equal(refusedGroup?.handle, refusedCandidates[1], "refused bare handle falls back to the server-suffixed one");
       assert.ok(refusalReconcile.fact.humanHandles?.some((handle) => handle.userId === refusedHuman.id));
@@ -1515,7 +1985,7 @@ test("true Server production composition makes all seven provisioning endpoints 
         "a non-naming failure never cycles handle candidates",
       );
       assert.ok(providerUsergroups.every((group) => (
-        group.description !== `raft-user:${server.id}:${permissionHuman.id}`
+        !permissionCandidates.includes(group.handle)
       )));
       assert.deepEqual(
         providerUsergroupCreateAttempts.filter((handle) => exhaustedCandidates.includes(handle)),
@@ -1538,7 +2008,7 @@ test("true Server production composition makes all seven provisioning endpoints 
       // instead of re-sending the refused write on every tick.
       providerUsergroupCreateAttempts.length = 0;
       providerUsergroupUpdateAttempts.length = 0;
-      const settledReconcile = await mentionProbe.provisioningProvider.reconcileAgentMentionHandles!(
+      const settledReconcile = await reconcileMentions(
         mentionAuthority,
         { serverId: server.id, ...withRefusals },
       );
@@ -1636,7 +2106,7 @@ test("true Server production composition makes all seven provisioning endpoints 
       return delivery;
     });
 
-    const repeatEnable = await fetch(`${app.baseUrl}/api/slack-bridge/provisioning/enable`, {
+    const repeatEnable = await appFetch(`${app.baseUrl}/api/slack-bridge/provisioning/enable`, {
       method: "POST",
       headers,
     });
@@ -1666,14 +2136,14 @@ test("true Server production composition makes all seven provisioning endpoints 
       externalAddressabilityProjections.id,
       addressesAfterPreflight[0]!.id,
     ));
-    const addresslessLoad = await fetch(`${app.baseUrl}/api/slack-bridge/provisioning`, { headers });
+    const addresslessLoad = await appFetch(`${app.baseUrl}/api/slack-bridge/provisioning`, { headers });
     assert.equal(addresslessLoad.status, 200, await addresslessLoad.clone().text());
     assert.equal(
       (await addresslessLoad.json() as { snapshot: { stage: string } }).snapshot.stage,
       "enable",
       "active setup must not report health after exact addressability disappears",
     );
-    const repairAddress = await fetch(`${app.baseUrl}/api/slack-bridge/provisioning/enable`, {
+    const repairAddress = await appFetch(`${app.baseUrl}/api/slack-bridge/provisioning/enable`, {
       method: "POST",
       headers,
     });
@@ -1688,14 +2158,14 @@ test("true Server production composition makes all seven provisioning endpoints 
       state: "tombstoned",
       deactivated: true,
     }).where(eq(externalActorProjections.id, actorsAfterPreflight[0]!.id));
-    const actorlessLoad = await fetch(`${app.baseUrl}/api/slack-bridge/provisioning`, { headers });
+    const actorlessLoad = await appFetch(`${app.baseUrl}/api/slack-bridge/provisioning`, { headers });
     assert.equal(actorlessLoad.status, 200, await actorlessLoad.clone().text());
     assert.equal(
       (await actorlessLoad.json() as { snapshot: { stage: string } }).snapshot.stage,
       "enable",
       "active setup must not report health after exact actor authority disappears",
     );
-    const repairActor = await fetch(`${app.baseUrl}/api/slack-bridge/provisioning/enable`, {
+    const repairActor = await appFetch(`${app.baseUrl}/api/slack-bridge/provisioning/enable`, {
       method: "POST",
       headers,
     });
@@ -1731,13 +2201,13 @@ test("true Server production composition makes all seven provisioning endpoints 
       "X-Slack-Request-Timestamp": requestTimestamp,
       "X-Slack-Signature": signature,
     };
-    const firstInbound = await fetch(`${app.baseUrl}/api/slack-bridge/events`, {
+    const firstInbound = await appFetch(`${app.baseUrl}/api/slack-bridge/events`, {
       method: "POST",
       headers: eventHeaders,
       body: eventBody,
     });
     assert.equal(firstInbound.status, 200, await firstInbound.clone().text());
-    const retryInbound = await fetch(`${app.baseUrl}/api/slack-bridge/events`, {
+    const retryInbound = await appFetch(`${app.baseUrl}/api/slack-bridge/events`, {
       method: "POST",
       headers: {
         ...eventHeaders,
@@ -1764,12 +2234,12 @@ test("true Server production composition makes all seven provisioning endpoints 
     // paired-channel human whose every handle candidate Slack refused:
     // `name_taken`, with Agents and humans counted together.
     const exhaustedSyncDeadline = Date.now() + 2_000;
-    let exhaustedSync: typeof externalAppInstalls.$inferSelect["agentMentionSync"] = null;
+    let exhaustedSync: typeof externalAppInstallServerGrants.$inferSelect["agentMentionSync"] = null;
     while (Date.now() < exhaustedSyncDeadline) {
       [{ agentMentionSync: exhaustedSync }] = await getDb()
-        .select({ agentMentionSync: externalAppInstalls.agentMentionSync })
-        .from(externalAppInstalls)
-        .where(eq(externalAppInstalls.id, install.id));
+        .select({ agentMentionSync: externalAppInstallServerGrants.agentMentionSync })
+        .from(externalAppInstallServerGrants)
+        .where(and(eq(externalAppInstallServerGrants.installId, install.id), eq(externalAppInstallServerGrants.serverId, server.id)));
       if (exhaustedSync?.slackError === "name_taken") break;
       await new Promise((resolve) => setTimeout(resolve, 20));
     }
@@ -1825,7 +2295,7 @@ test("true Server production composition makes all seven provisioning endpoints 
     await getDb().update(externalAppInstallGrantReceipts).set({
       grantHash: tamperedGrantHash,
     }).where(eq(externalAppInstallGrantReceipts.installId, install.id));
-    const repairEnable = await fetch(`${app.baseUrl}/api/slack-bridge/provisioning/enable`, {
+    const repairEnable = await appFetch(`${app.baseUrl}/api/slack-bridge/provisioning/enable`, {
       method: "POST",
       headers,
     });
@@ -2030,7 +2500,7 @@ test("true Server production composition makes all seven provisioning endpoints 
           reconciliationMarker: "m".repeat(43),
           author: {
             displayName: "Production Owner",
-            avatarPublicUrl: null,
+            avatarPublicUrl: "https://cdn.example.test/production-owner.webp",
             fallbackKind: "human" as const,
           },
         };
@@ -2050,7 +2520,28 @@ test("true Server production composition makes all seven provisioning endpoints 
           files: [{ id: ticket.providerFileId }],
           channel_id: binding.providerConversationId,
           initial_comment: "outbound attachment",
+          username: "Production Owner from Raft",
+          icon_url: "https://cdn.example.test/production-owner.webp",
         }]);
+        for (const [caseName, fallbackKind, displayName, username] of [
+          ["human", "human", "Fallback Author", "Fallback Author from Raft"],
+          ["agent", "agent", "Fallback Author", "Fallback Author from Raft"],
+          ["invalid-name", "human", "Invalid\nName", null],
+        ] as const) {
+          await outboundAdapter.completeOutboundMessage({
+            authority: attachmentAuthority,
+            completion: { ...completion, providerFileIds: [`F_AUTHOR_${caseName}`],
+              providerRootThreadId: "1788541200.000100",
+              author: { displayName, avatarPublicUrl: null, fallbackKind } },
+            signal: new AbortController().signal,
+          });
+          assert.deepEqual(providerCompletionBodies.at(-1), {
+            files: [{ id: `F_AUTHOR_${caseName}` }], channel_id: binding.providerConversationId,
+            thread_ts: "1788541200.000100", initial_comment: "outbound attachment",
+            ...(username ? { username } : {}),
+            icon_emoji: fallbackKind === "agent" ? ":robot_face:" : ":bust_in_silhouette:",
+          });
+        }
       } finally {
         await providerProbe.releaseCredential(outboundCredential);
       }
@@ -2169,7 +2660,7 @@ test("true Server production composition makes all seven provisioning endpoints 
           credentialRevision: install.credentialRevision,
           now: new Date(),
         }), { kind: "failed" }, `${mode} x-oauth-scopes must fail closed at the provider boundary`);
-        const rejectedEnable = await fetch(`${app.baseUrl}/api/slack-bridge/provisioning/enable`, {
+        const rejectedEnable = await appFetch(`${app.baseUrl}/api/slack-bridge/provisioning/enable`, {
           method: "POST",
           headers,
         });
@@ -2281,7 +2772,7 @@ test("true Server production composition makes all seven provisioning endpoints 
       const callsBefore = providerAudienceCalls;
       const observedAt = new Date();
       assert.deepEqual(
-        await refreshSlackPublicConversationAuthority({
+        await refreshSlackConversationAuthority({
           db: getDb(),
           provider: providerProbe.provisioningProvider,
           bindingId: binding.id,
@@ -2332,7 +2823,7 @@ test("true Server production composition makes all seven provisioning endpoints 
       };
       const observedAt = new Date();
       try {
-        const refreshResult = await refreshSlackPublicConversationAuthority({
+        const refreshResult = await refreshSlackConversationAuthority({
           db: getDb(),
           provider: raceProvider.provisioningProvider,
           bindingId: binding.id,
@@ -2443,11 +2934,11 @@ test("true Server production composition makes all seven provisioning endpoints 
       }
     });
 
-    const repaired = await fetch(`${app.baseUrl}/api/slack-bridge/provisioning`, { headers });
+    const repaired = await appFetch(`${app.baseUrl}/api/slack-bridge/provisioning`, { headers });
     assert.equal(repaired.status, 200, await repaired.clone().text());
     assert.equal((await repaired.json() as { snapshot: { stage: string } }).snapshot.stage, "health");
 
-    const createPrivate = await fetch(`${app.baseUrl}/api/channels`, {
+    const createPrivate = await appFetch(`${app.baseUrl}/api/channels`, {
       method: "POST",
       headers,
       body: JSON.stringify({
@@ -2469,7 +2960,7 @@ test("true Server production composition makes all seven provisioning endpoints 
       raftChannelId: privateRaftChannel.id,
       slackChannelId: "C_PRODUCTION_PRIVATE",
     }];
-    const additive = await fetch(`${app.baseUrl}/api/slack-bridge/provisioning/channel-pairs`, {
+    const additive = await appFetch(`${app.baseUrl}/api/slack-bridge/provisioning/channel-pairs`, {
       method: "PUT",
       headers,
       body: JSON.stringify({ pairs: additivePairs }),
@@ -2517,7 +3008,7 @@ test("true Server production composition makes all seven provisioning endpoints 
       "official provisioning readback must expose the exact epochs required by teardown CAS",
     );
 
-    const additivePreflight = await fetch(
+    const additivePreflight = await appFetch(
       `${app.baseUrl}/api/slack-bridge/provisioning/preflight`,
       { method: "POST", headers, body: "{}" },
     );
@@ -2531,7 +3022,7 @@ test("true Server production composition makes all seven provisioning endpoints 
     assert.equal(privateBeforeAdditiveEnable.state, "paused");
     assert.equal(privateBeforeAdditiveEnable.stateReason, "provisioning_preflight_passed");
 
-    const additiveEnable = await fetch(`${app.baseUrl}/api/slack-bridge/provisioning/enable`, {
+    const additiveEnable = await appFetch(`${app.baseUrl}/api/slack-bridge/provisioning/enable`, {
       method: "POST",
       headers,
       body: "{}",
@@ -2589,9 +3080,9 @@ test("true Server production composition makes all seven provisioning endpoints 
 
     await getDb().update(externalChannelBindings).set({
       state: "paused",
-      stateReason: "privacy_changed_audience_migration_required",
+      stateReason: "privacy_changed_reconfirmation_required",
     }).where(eq(externalChannelBindings.id, publicAfterAdditiveEnable.id));
-    const migrationBlockedHealth = await fetch(
+    const migrationBlockedHealth = await appFetch(
       `${app.baseUrl}/api/slack-bridge/provisioning`,
       { headers },
     );
@@ -2616,17 +3107,17 @@ test("true Server production composition makes all seven provisioning endpoints 
         id: publicAfterAdditiveEnable.id,
         state: "paused",
         bindingEpoch: publicAfterAdditiveEnable.bindingEpoch,
-        stateReason: "privacy_changed_audience_migration_required",
-        recoveryAction: "migrate_slack_channel_audience",
+        stateReason: "privacy_changed_reconfirmation_required",
+        recoveryAction: "review_and_resume_binding",
       },
-      "owner provisioning health must expose the actionable privacy migration block",
+      "owner provisioning health must expose the actionable privacy reconfirmation block",
     );
     await getDb().update(externalChannelBindings).set({
       state: "active",
       stateReason: null,
     }).where(eq(externalChannelBindings.id, publicAfterAdditiveEnable.id));
 
-    const visibleChannels = await fetch(`${app.baseUrl}/api/channels`, { headers });
+    const visibleChannels = await appFetch(`${app.baseUrl}/api/channels`, { headers });
     assert.equal(visibleChannels.status, 200, await visibleChannels.clone().text());
     const visibleChannelBody = await visibleChannels.json() as Array<{
       id: string;
@@ -2654,8 +3145,30 @@ test("true Server production composition makes all seven provisioning endpoints 
       },
       "private channel members must receive the same bridge identity projection",
     );
+    // An installation waiting for reauthorization stops every pair it carries,
+    // even pairs whose own binding is still active.
+    const [installBeforeChannelReauth] = await getDb().select().from(externalAppInstalls)
+      .where(eq(externalAppInstalls.id, install.id));
+    await getDb().update(externalAppInstalls).set({ state: "reauth_required", stateReason: "provider_credential_revoked" })
+      .where(eq(externalAppInstalls.id, install.id));
+    const reauthChannels = await appFetch(`${app.baseUrl}/api/channels`, { headers });
+    assert.equal(reauthChannels.status, 200, await reauthChannels.clone().text());
+    assert.deepEqual(
+      (await reauthChannels.json() as typeof visibleChannelBody).find((channel) => channel.id === raftChannel.id)?.bridge,
+      {
+        provider: "slack",
+        providerConversationId: "C_PRODUCTION_GENERAL",
+        state: "active",
+        installState: "reauth_required",
+      },
+      "channel readers must see that the installation stopped the pair",
+    );
+    await getDb().update(externalAppInstalls).set({
+      state: installBeforeChannelReauth!.state, stateReason: installBeforeChannelReauth!.stateReason,
+    })
+      .where(eq(externalAppInstalls.id, install.id));
 
-    const visiblePrivateMembers = await fetch(
+    const visiblePrivateMembers = await appFetch(
       `${app.baseUrl}/api/channels/${privateRaftChannel.id}/members`,
       { headers },
     );
@@ -2680,7 +3193,7 @@ test("true Server production composition makes all seven provisioning endpoints 
       && !Object.hasOwn(member, "externalActorId")
     ), "external Slack projections stay separate from Raft human/agent principals and hide provider actor IDs");
 
-    const retirePrivateBeforeRepair = await fetch(
+    const retirePrivateBeforeRepair = await appFetch(
       `${app.baseUrl}/api/slack-bridge/provisioning/channel-pairs`,
       {
         method: "DELETE",
@@ -2704,7 +3217,7 @@ test("true Server production composition makes all seven provisioning endpoints 
     assert.equal(retiredPrivate.state, "revoked");
     assert.equal(retiredPrivate.stateReason, "provisioning_pair_removed");
 
-    const repairWithRetiredSibling = await fetch(
+    const repairWithRetiredSibling = await appFetch(
       `${app.baseUrl}/api/slack-bridge/provisioning/enable`,
       { method: "POST", headers, body: "{}" },
     );
@@ -2725,7 +3238,7 @@ test("true Server production composition makes all seven provisioning endpoints 
       "explicit enable must leave the retired sibling byte-equivalent",
     );
 
-    const restorePrivateAfterRepair = await fetch(
+    const restorePrivateAfterRepair = await appFetch(
       `${app.baseUrl}/api/slack-bridge/provisioning/channel-pairs`,
       { method: "PUT", headers, body: JSON.stringify({ pairs: additivePairs }) },
     );
@@ -2734,7 +3247,7 @@ test("true Server production composition makes all seven provisioning endpoints 
       200,
       await restorePrivateAfterRepair.clone().text(),
     );
-    const restorePrivatePreflight = await fetch(
+    const restorePrivatePreflight = await appFetch(
       `${app.baseUrl}/api/slack-bridge/provisioning/preflight`,
       { method: "POST", headers, body: "{}" },
     );
@@ -2743,7 +3256,7 @@ test("true Server production composition makes all seven provisioning endpoints 
       200,
       await restorePrivatePreflight.clone().text(),
     );
-    const restorePrivateEnable = await fetch(
+    const restorePrivateEnable = await appFetch(
       `${app.baseUrl}/api/slack-bridge/provisioning/enable`,
       { method: "POST", headers, body: "{}" },
     );
@@ -2760,7 +3273,7 @@ test("true Server production composition makes all seven provisioning endpoints 
     const quarantinedBeforeAdd = (await getDb().select().from(externalChannelBindings)
       .where(eq(externalChannelBindings.id, privateBinding.id)))[0]!;
 
-    const createSecondPrivate = await fetch(`${app.baseUrl}/api/channels`, {
+    const createSecondPrivate = await appFetch(`${app.baseUrl}/api/channels`, {
       method: "POST",
       headers,
       body: JSON.stringify({
@@ -2777,7 +3290,7 @@ test("true Server production composition makes all seven provisioning endpoints 
       raftChannelId: secondPrivateRaftChannel.id,
       slackChannelId: "C_PRODUCTION_PRIVATE_2",
     }];
-    const addBesideQuarantined = await fetch(
+    const addBesideQuarantined = await appFetch(
       `${app.baseUrl}/api/slack-bridge/provisioning/channel-pairs`,
       {
         method: "PUT",
@@ -2819,7 +3332,7 @@ test("true Server production composition makes all seven provisioning endpoints 
     assert.ok(secondPrivateBinding);
     assert.equal(secondPrivateBinding.state, "paused");
 
-    const createOtherPublic = await fetch(`${app.baseUrl}/api/channels`, {
+    const createOtherPublic = await appFetch(`${app.baseUrl}/api/channels`, {
       method: "POST",
       headers,
       body: JSON.stringify({
@@ -2836,7 +3349,7 @@ test("true Server production composition makes all seven provisioning endpoints 
       .where(eq(externalChannelBindings.serverId, server.id));
     const provisioning = runtime.provisioning;
     assert.ok(provisioning);
-    const omittedActive = await fetch(`${app.baseUrl}/api/slack-bridge/provisioning/channel-pairs`, {
+    const omittedActive = await appFetch(`${app.baseUrl}/api/slack-bridge/provisioning/channel-pairs`, {
       method: "PUT",
       headers,
       body: JSON.stringify({ pairs: additiveWithQuarantined.slice(1) }),
@@ -2868,7 +3381,7 @@ test("true Server production composition makes all seven provisioning endpoints 
     for (const { label, pair } of replacementCases) {
       await runNamedCase(label, async () => {
         const requestedPairs = [...additiveWithQuarantined, pair];
-        const rejected = await fetch(`${app.baseUrl}/api/slack-bridge/provisioning/channel-pairs`, {
+        const rejected = await appFetch(`${app.baseUrl}/api/slack-bridge/provisioning/channel-pairs`, {
           method: "PUT",
           headers,
           body: JSON.stringify({ pairs: requestedPairs }),
@@ -2902,7 +3415,7 @@ test("true Server production composition makes all seven provisioning endpoints 
     const teardownPair = additiveWithQuarantined[2]!;
     const bindingsBeforeAtomicReject = await getDb().select().from(externalChannelBindings)
       .where(eq(externalChannelBindings.serverId, server.id));
-    const staleAtomicRemoval = await fetch(
+    const staleAtomicRemoval = await appFetch(
       `${app.baseUrl}/api/slack-bridge/provisioning/channel-pairs`,
       {
         method: "DELETE",
@@ -2926,7 +3439,7 @@ test("true Server production composition makes all seven provisioning endpoints 
       "one stale epoch must reject the entire multi-pair removal",
     );
 
-    const wrongCoordinateRemoval = await fetch(
+    const wrongCoordinateRemoval = await appFetch(
       `${app.baseUrl}/api/slack-bridge/provisioning/channel-pairs`,
       {
         method: "DELETE",
@@ -2949,7 +3462,7 @@ test("true Server production composition makes all seven provisioning endpoints 
     );
 
     const providerCallsBeforePausedRemoval = providerQueryRequests.length;
-    const pausedRemoval = await fetch(`${app.baseUrl}/api/slack-bridge/provisioning/channel-pairs`, {
+    const pausedRemoval = await appFetch(`${app.baseUrl}/api/slack-bridge/provisioning/channel-pairs`, {
       method: "DELETE",
       headers,
       body: JSON.stringify({
@@ -2974,7 +3487,7 @@ test("true Server production composition makes all seven provisioning endpoints 
     assert.equal(privateRevoked.stateReason, "provisioning_pair_removed");
     assert.equal(privateRevoked.bindingEpoch, secondPrivateBinding.bindingEpoch + 1);
 
-    const repeatedRemoval = await fetch(`${app.baseUrl}/api/slack-bridge/provisioning/channel-pairs`, {
+    const repeatedRemoval = await appFetch(`${app.baseUrl}/api/slack-bridge/provisioning/channel-pairs`, {
       method: "DELETE",
       headers,
       body: JSON.stringify({
@@ -2989,7 +3502,7 @@ test("true Server production composition makes all seven provisioning endpoints 
       "stale retry must leave the revoked row byte-equivalent",
     );
 
-    const readdPrivate = await fetch(`${app.baseUrl}/api/slack-bridge/provisioning/channel-pairs`, {
+    const readdPrivate = await appFetch(`${app.baseUrl}/api/slack-bridge/provisioning/channel-pairs`, {
       method: "PUT",
       headers,
       body: JSON.stringify({ pairs: additiveWithQuarantined }),
@@ -3007,7 +3520,7 @@ test("true Server production composition makes all seven provisioning endpoints 
       stateReason: "test_quarantined_before_remove",
     }).where(eq(externalChannelBindings.id, privateReadded.id));
     const providerCallsBeforeQuarantinedRemoval = providerQueryRequests.length;
-    const quarantinedRemoval = await fetch(
+    const quarantinedRemoval = await appFetch(
       `${app.baseUrl}/api/slack-bridge/provisioning/channel-pairs`,
       {
         method: "DELETE",
@@ -3026,7 +3539,7 @@ test("true Server production composition makes all seven provisioning endpoints 
     assert.equal(quarantinedRevoked.bindingEpoch, privateReadded.bindingEpoch + 1);
 
     const providerCallsBeforeActiveRemoval = providerQueryRequests.length;
-    const activeRemoval = await fetch(`${app.baseUrl}/api/slack-bridge/provisioning/channel-pairs`, {
+    const activeRemoval = await appFetch(`${app.baseUrl}/api/slack-bridge/provisioning/channel-pairs`, {
       method: "DELETE",
       headers,
       body: JSON.stringify({
@@ -3045,7 +3558,7 @@ test("true Server production composition makes all seven provisioning endpoints 
       raftChannelId: raftChannel.id,
       slackChannelId: "C_PRODUCTION_OTHER",
     };
-    const replaceAfterOfficialRemoval = await fetch(
+    const replaceAfterOfficialRemoval = await appFetch(
       `${app.baseUrl}/api/slack-bridge/provisioning/channel-pairs`,
       {
         method: "PUT",
@@ -3077,7 +3590,7 @@ test("true Server production composition makes all seven provisioning endpoints 
       "replacement must preserve an unrelated quarantined sibling byte-equivalent",
     );
 
-    const removeReplacement = await fetch(
+    const removeReplacement = await appFetch(
       `${app.baseUrl}/api/slack-bridge/provisioning/channel-pairs`,
       {
         method: "DELETE",
@@ -3089,7 +3602,7 @@ test("true Server production composition makes all seven provisioning endpoints 
     );
     assert.equal(removeReplacement.status, 200, await removeReplacement.clone().text());
 
-    const readdPublic = await fetch(`${app.baseUrl}/api/slack-bridge/provisioning/channel-pairs`, {
+    const readdPublic = await appFetch(`${app.baseUrl}/api/slack-bridge/provisioning/channel-pairs`, {
       method: "PUT",
       headers,
       body: JSON.stringify({ pairs: additivePairs }),
@@ -3108,7 +3621,7 @@ test("true Server production composition makes all seven provisioning endpoints 
     }).where(eq(externalChannelBindings.id, publicReadded.id));
     const securityRevoked = (await getDb().select().from(externalChannelBindings)
       .where(eq(externalChannelBindings.id, publicReadded.id)))[0]!;
-    const rejectedSecurityRevival = await fetch(
+    const rejectedSecurityRevival = await appFetch(
       `${app.baseUrl}/api/slack-bridge/provisioning/channel-pairs`,
       {
         method: "PUT",
@@ -3214,7 +3727,7 @@ test("true Server production composition makes all seven provisioning endpoints 
 
     const liveAuthorityBeforeWrongEpoch = await readDisconnectAuthority();
     const providerCallsBeforeDisconnect = providerQueryRequests.length;
-    const wrongEpochDisconnect = await fetch(`${app.baseUrl}/api/slack-bridge/provisioning/disconnect`, {
+    const wrongEpochDisconnect = await appFetch(`${app.baseUrl}/api/slack-bridge/provisioning/disconnect`, {
       method: "POST",
       headers,
       body: JSON.stringify({ expectedConnectionEpoch: install.connectionEpoch + 1 }),
@@ -3235,7 +3748,7 @@ test("true Server production composition makes all seven provisioning endpoints 
       "wrong-epoch disconnect must leave every live authority row byte-equivalent",
     );
 
-    const disconnected = await fetch(`${app.baseUrl}/api/slack-bridge/provisioning/disconnect`, {
+    const disconnected = await appFetch(`${app.baseUrl}/api/slack-bridge/provisioning/disconnect`, {
       method: "POST",
       headers,
       body: JSON.stringify({ expectedConnectionEpoch: install.connectionEpoch }),
@@ -3323,7 +3836,7 @@ test("true Server production composition makes all seven provisioning endpoints 
       links: linksAfterDisconnect,
       clientInstall: clientInstallAfterDisconnect,
     };
-    const staleDisconnect = await fetch(`${app.baseUrl}/api/slack-bridge/provisioning/disconnect`, {
+    const staleDisconnect = await appFetch(`${app.baseUrl}/api/slack-bridge/provisioning/disconnect`, {
       method: "POST",
       headers,
       body: JSON.stringify({ expectedConnectionEpoch: install.connectionEpoch }),
@@ -3335,7 +3848,7 @@ test("true Server production composition makes all seven provisioning endpoints 
       "stale disconnect replay must leave every authority row byte-equivalent",
     );
 
-    const reconnect = await fetch(`${app.baseUrl}/api/slack-bridge/provisioning/connect`, {
+    const reconnect = await appFetch(`${app.baseUrl}/api/slack-bridge/provisioning/connect`, {
       method: "POST",
       headers,
     });
@@ -3346,7 +3859,7 @@ test("true Server production composition makes all seven provisioning endpoints 
     };
     assert.equal(reconnectBody.snapshot.stage, "oauth");
 
-    const reconnectOauthStart = await fetch(`${app.baseUrl}/api/slack-bridge/oauth/start`, {
+    const reconnectOauthStart = await appFetch(`${app.baseUrl}/api/slack-bridge/oauth/start`, {
       method: "POST",
       headers,
       body: JSON.stringify(reconnectBody.oauthAuthority),
@@ -3357,14 +3870,14 @@ test("true Server production composition makes all seven provisioning endpoints 
     );
     const reconnectState = reconnectAuthorizationUrl.searchParams.get("state");
     assert.ok(reconnectState);
-    const reconnectCallback = await fetch(
+    const reconnectCallback = await appFetch(
       `${app.baseUrl}/api/slack-bridge/oauth/callback`
       + `?state=${encodeURIComponent(reconnectState)}&code=production-composition-reconnect-code`,
-      { redirect: "manual" },
+      { redirect: "manual", headers: { Cookie: oauthBindingCookie(reconnectOauthStart) } },
     );
     assert.equal(reconnectCallback.status, 302, await reconnectCallback.clone().text());
 
-    const reconnectedProvisioning = await fetch(
+    const reconnectedProvisioning = await appFetch(
       `${app.baseUrl}/api/slack-bridge/provisioning`,
       { headers },
     );
@@ -3379,7 +3892,7 @@ test("true Server production composition makes all seven provisioning endpoints 
     );
     assert.deepEqual(reconnectedSnapshot.channelPairs, []);
 
-    const reconnectedPairs = await fetch(`${app.baseUrl}/api/slack-bridge/provisioning/channel-pairs`, {
+    const reconnectedPairs = await appFetch(`${app.baseUrl}/api/slack-bridge/provisioning/channel-pairs`, {
       method: "PUT",
       headers,
       body: JSON.stringify({
@@ -3414,7 +3927,7 @@ test("true Server production composition makes all seven provisioning endpoints 
     }), { active: false, reason: "binding_inactive" },
     "workspace reconnect must freeze every server partition at the new epoch");
 
-    const reconnectPreflight = await fetch(
+    const reconnectPreflight = await appFetch(
       `${app.baseUrl}/api/slack-bridge/provisioning/preflight`,
       { method: "POST", headers },
     );
@@ -3423,7 +3936,7 @@ test("true Server production composition makes all seven provisioning endpoints 
       (await reconnectPreflight.json() as { snapshot: { stage: string } }).snapshot.stage,
       "enable",
     );
-    const reconnectEnable = await fetch(`${app.baseUrl}/api/slack-bridge/provisioning/enable`, {
+    const reconnectEnable = await appFetch(`${app.baseUrl}/api/slack-bridge/provisioning/enable`, {
       method: "POST",
       headers,
     });
@@ -3446,7 +3959,7 @@ test("true Server production composition makes all seven provisioning endpoints 
         eq(externalChannelBindings.state, "active"),
       ))).map((row) => row.id).sort();
     assert.ok(healthyBindingsBeforeReauth.length > 0);
-    const healthyLoad = await fetch(`${app.baseUrl}/api/slack-bridge/provisioning`, { headers });
+    const healthyLoad = await appFetch(`${app.baseUrl}/api/slack-bridge/provisioning`, { headers });
     assert.equal(healthyLoad.status, 200, await healthyLoad.clone().text());
     const healthyBody = await healthyLoad.json() as {
       snapshot: { stage: string };
@@ -3454,7 +3967,7 @@ test("true Server production composition makes all seven provisioning endpoints 
     };
     assert.equal(healthyBody.snapshot.stage, "health");
     assert.ok(healthyBody.oauthAuthority, "a connected workspace must expose re-authorization authority");
-    const reauthStart = await fetch(`${app.baseUrl}/api/slack-bridge/oauth/start`, {
+    const reauthStart = await appFetch(`${app.baseUrl}/api/slack-bridge/oauth/start`, {
       method: "POST",
       headers,
       body: JSON.stringify(healthyBody.oauthAuthority),
@@ -3464,10 +3977,10 @@ test("true Server production composition makes all seven provisioning endpoints 
       (await reauthStart.json() as { authorizationUrl: string }).authorizationUrl,
     ).searchParams.get("state");
     assert.ok(reauthState);
-    const reauthCallback = await fetch(
+    const reauthCallback = await appFetch(
       `${app.baseUrl}/api/slack-bridge/oauth/callback`
       + `?state=${encodeURIComponent(reauthState)}&code=production-composition-reauthorize-code`,
-      { redirect: "manual" },
+      { redirect: "manual", headers: { Cookie: oauthBindingCookie(reauthStart) } },
     );
     assert.equal(reauthCallback.status, 302, await reauthCallback.clone().text());
     const [installAfterReauth] = await getDb().select().from(externalAppInstalls)
@@ -3487,7 +4000,7 @@ test("true Server production composition makes all seven provisioning endpoints 
       "re-authorization must resume the same bindings, not recreate or drop them",
     );
     assert.equal(bindingsAfterReauth.some((row) => row.state === "paused"), false);
-    const afterReauthLoad = await fetch(`${app.baseUrl}/api/slack-bridge/provisioning`, { headers });
+    const afterReauthLoad = await appFetch(`${app.baseUrl}/api/slack-bridge/provisioning`, { headers });
     assert.equal(
       (await afterReauthLoad.json() as { snapshot: { stage: string } }).snapshot.stage,
       "health",
@@ -3500,14 +4013,14 @@ test("true Server production composition makes all seven provisioning endpoints 
 
 test("deleting the production provisioning injection makes all seven endpoints fail closed", async () => {
   let runtime: Awaited<ReturnType<typeof createSlackBridgeServerRuntimeFromEnv>>;
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false, async slackBridgeFactory() {
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, async slackBridgeFactory() {
       runtime = await createSlackBridgeServerRuntimeFromEnv(PRODUCTION_ENV, { db: getDb() });
       assert.ok(runtime);
       return { ...runtime, provisioning: undefined };
     } });
   try {
     const { owner, server } = await seedOwner();
-    const headers = requestHeaders(owner.id, server.id);
+    const headers = await requestHeaders(owner.id, server.id);
     assert.deepEqual(await observeProvisioningEndpoints(app.baseUrl, headers), [
       {
         method: "GET",

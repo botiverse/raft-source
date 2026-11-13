@@ -7,7 +7,7 @@ import { openTestApp } from "../test/integration/app";
 // The release version is whatever the package declares; a literal here breaks on every bump.
 const PACKAGE_VERSION = (createRequire(import.meta.url)("../../package.json") as { version: string }).version;
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 const BUILD_ENV_KEYS = [
   "SLOCK_RELEASE_SHA",
@@ -43,7 +43,7 @@ test("GET /api/version returns the build-time git identity without auth", async 
     SLOCK_BUILD_AT: "2026-07-13T04:52:55Z",
     SLOCK_RELEASE_BRANCH: "staging",
   }, async () => {
-    const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+    const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
     try {
       const response = await fetch(`${app.baseUrl}/api/version`);
       assert.equal(response.status, 200);
@@ -64,7 +64,7 @@ test("GET /api/version fails explicitly instead of returning unknown identity", 
     SLOCK_BUILD_AT: "2026-07-13T04:52:55Z",
     SLOCK_RELEASE_BRANCH: "staging",
   }, async () => {
-    const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+    const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
     try {
       const response = await fetch(`${app.baseUrl}/api/version`);
       assert.equal(response.status, 503);

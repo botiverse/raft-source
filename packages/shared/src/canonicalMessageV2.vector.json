@@ -185,5 +185,35 @@
       "viewerOverlayJson": "null\n",
       "viewerOverlaySha256": "38e0b9de817f645c4bec37c0d4a3e58baecccb040f5718dc069a72c7385a0bed"
     }
+  ],
+  "retractionCases": [
+    {
+      "name": "retracted-delegated-message-carries-deletedAt",
+      "legacyRow": { "deletedAt": "2026-10-20T08:15:30.123Z" },
+      "expectedFact": { "deletedAt": "2026-10-20T08:15:30.123Z" },
+      "retractionFactJson": "{\"deletedAt\":\"2026-10-20T08:15:30.123Z\"}\n",
+      "retractionFactSha256": "e1e3ee8325b671531eed94dca1a715854fe1479ede34b9695e920250facd129b"
+    },
+    {
+      "name": "live-message-null-deletedAt-omits-key",
+      "legacyRow": { "deletedAt": null },
+      "expectedFact": {},
+      "retractionFactJson": "{}\n",
+      "retractionFactSha256": "ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356"
+    },
+    {
+      "name": "task-status-projector-absent-key-omits-key",
+      "legacyRow": {},
+      "expectedFact": {},
+      "retractionFactJson": "{}\n",
+      "retractionFactSha256": "ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356"
+    },
+    {
+      "name": "malformed-empty-deletedAt-omits-key",
+      "legacyRow": { "deletedAt": "" },
+      "expectedFact": {},
+      "retractionFactJson": "{}\n",
+      "retractionFactSha256": "ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356"
+    }
   ]
 }

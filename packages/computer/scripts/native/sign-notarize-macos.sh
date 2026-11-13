@@ -142,9 +142,20 @@ for binary in "${binaries[@]}"; do
   receipt_json="${binary}.notarization.receipt.json"
 
   codesign --remove-signature "$binary" 2>/dev/null || true
+  # task #166: macOS keys privacy (TCC) grants on the designated requirement,
+  # identifier plus Team. A Desktop-supervised Computer is its own TCC
+  # identity, so the identifier must never change across releases or users
+  # lose their Full Disk Access grant on upgrade. Pin it explicitly rather
+  # than deriving it from the file name.
+  case "$target" in
+    darwin-arm64) signing_identifier=raft-computer-darwin-arm64 ;;
+    darwin-x64) signing_identifier=raft-computer-darwin-x64 ;;
+    *) echo "::error::no pinned signing identifier for ${target}" >&2; exit 1 ;;
+  esac
   codesign \
     --force \
     --sign "$IDENTITY_SHA" \
+    --identifier "$signing_identifier" \
     --keychain "$KEYCHAIN_PATH" \
     --options runtime \
     --timestamp \
@@ -155,6 +166,10 @@ for binary in "${binaries[@]}"; do
   SIGNATURE_DETAILS="$(codesign -dv --verbose=4 "$binary" 2>&1)"
   printf '%s\n' "$SIGNATURE_DETAILS" | grep -F 'Authority=Developer ID Application'
   printf '%s\n' "$SIGNATURE_DETAILS" | grep -F "TeamIdentifier=${APPLE_TEAM_ID}"
+  printf '%s\n' "$SIGNATURE_DETAILS" | grep -Fx "Identifier=${signing_identifier}" || {
+    echo "::error::${file_name} must be signed as ${signing_identifier} (stable TCC identity)" >&2
+    exit 1
+  }
   printf '%s\n' "$SIGNATURE_DETAILS" | grep -Eq 'flags=.*runtime'
   CDHASH="$(printf '%s\n' "$SIGNATURE_DETAILS" | awk -F= '/^CDHash=/{print $2; exit}')"
   [[ "$CDHASH" =~ ^[0-9A-Fa-f]{40}$ ]] || {

@@ -7,7 +7,7 @@ import { dismissOwnerOnboarding } from "../../fixtures/session";
 // After the channel Tasks tab and the server-wide Tasks page were unified onto
 // TasksPanel (PR #1439, #proj-task task #3), the channel-mode panel:
 //   - exposes Board/List view toggle (default Board)
-//   - shows a +Create Task CTA (channel-mode only)
+//   - shows a +New task CTA (channel-mode only)
 //   - renders 4 status columns in board view (TODO / IN PROGRESS / IN REVIEW / DONE)
 //   - drops the per-status filter tabs that the legacy TaskBoard exposed —
 //     filtering by status is implicit in the column layout.
@@ -71,9 +71,8 @@ test.describe("channel task board view", () => {
     await expect(page.getByTestId("channel-task-view-list")).toHaveAttribute("aria-checked", "false");
     await expect(page.getByTestId("channel-task-board-view")).toBeVisible();
 
-    // Channel-mode-only CTA. It says the title of the dialog it opens
-    // (Create Task), per the Raft DS copy rule.
-    await expect(page.getByRole("button", { name: "Create Task", exact: true })).toBeVisible();
+    // Channel-mode-only CTA, named "New task" like the Tasks page's (tasks.md).
+    await expect(page.getByRole("button", { name: "New task", exact: true })).toBeVisible();
 
     // All five status columns render in board view (todo / in_progress /
     // in_review / done / closed). The 5th column (Closed = won't-do) was
@@ -148,7 +147,7 @@ test.describe("channel task board view", () => {
 
     const board = page.getByTestId("channel-task-board-view");
     const card = board.getByTestId("task-board-draggable-card").filter({ hasText: title }).first();
-    const inProgressColumn = board.getByRole("button", { name: /^Hide In Progress$/ }).locator("..");
+    const inProgressColumn = board.getByRole("button", { name: /^Hide In progress$/ }).locator("..");
     await expect(card).toBeVisible();
     const before = await card.boundingBox();
     const target = await inProgressColumn.boundingBox();
@@ -163,8 +162,11 @@ test.describe("channel task board view", () => {
     ));
     await page.mouse.move(target!.x + target!.width / 2, target!.y + 80, { steps: 12 });
 
+    // The dragged card follows the pointer in raft-ui's TaskDragOverlay; the
+    // card in the column steps aside while it is carried.
+    const overlay = page.locator("[data-slot=task-drag-overlay]").filter({ hasText: title });
     await expect.poll(async () => {
-      const box = await card.boundingBox();
+      const box = await overlay.boundingBox();
       return box ? box.x - before!.x : 0;
     }).toBeGreaterThan(40);
 
@@ -224,9 +226,17 @@ test.describe("channel task board view", () => {
     const properties = page.getByTestId("task-properties");
     const propertyItems = properties.locator('[data-slot="description-item"]');
     await expect(propertyItems).toHaveCount(3);
+    // The facts sit on one text baseline (raft-ui DescriptionList
+    // direction="inline"), not on one box centre: a fact whose value is a
+    // chip is taller than a plain-text one, so item boxes may differ by a
+    // subpixel. The terms share one type style, so on one baseline their
+    // boxes line up exactly.
     await expect.poll(async () => {
       const boxes = await propertyItems.evaluateAll((items) => items.map((item) => {
-        const { left, top, height } = item.getBoundingClientRect();
+        const { left } = item.getBoundingClientRect();
+        const term = item.querySelector('[data-slot="description-term"]');
+        if (!term) return { left, centerY: Number.NaN };
+        const { top, height } = term.getBoundingClientRect();
         return { left, centerY: top + height / 2 };
       }));
       const centerYs = boxes.map(({ centerY }) => centerY);

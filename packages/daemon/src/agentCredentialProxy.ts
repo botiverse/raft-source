@@ -1,5 +1,7 @@
 import { AgentProxyBindError } from "./spawnFailureErrors";
+import { fetchUsesHttpProxy } from "./proxy";
 import { randomBytes, randomUUID } from "node:crypto";
+import { setTimeout as sleep } from "node:timers/promises";
 import http from "node:http";
 import { brotliDecompressSync, gunzipSync, inflateSync } from "node:zlib";
 import type { AddressInfo } from "node:net";
@@ -7,8 +9,10 @@ import { URL } from "node:url";
 import {
   AGENT_API_EVENTS_ACK_HEADER,
   AGENT_API_EVENTS_ACK_LEASE,
+  agentInboxAppItemDismissTarget,
   agentApiHistoryConsumptionScopeSchema,
   type AgentApiHistoryConsumptionScope,
+  type AgentApiInboxDismissResponse,
   errorClassOf,
   isThirdPartyEventId,
   normalizeThirdPartyEventId,
@@ -16,12 +20,26 @@ import {
   noopTracer,
   parseAgentApiAppSourceAckReject,
   parseTraceparent,
+  RAFT_CLIENT_CAPABILITIES_HEADER,
+  RAFT_COMPUTER_VERSION_HEADER,
+  RAFT_DAEMON_VERSION_HEADER,
+  RAFT_RUNTIME_HEADER,
+  RAFT_CLI_ENTRY_HEADER,
+  RAFT_CLI_STABLE_ENTRY,
+  PROC_CAPABILITY,
   sourceRefIdentityKey,
   type ActiveSpan,
   type AgentInboxSourceRef,
   type AgentMessage,
   type TraceStatus,
   type Tracer,
+  AGENT_GATED_WRITES,
+  agentGatedWriteForPath,
+  agentWriteLandingTarget,
+  agentWriteSourceMessageId,
+  agentTaskWriteKey,
+  formatAgentTaskRef,
+  type AgentGatedWriteAction,
 } from "@botiverse/raft-shared";
 import type { ApmHeldFreshnessEnvelopeBody } from "./apmStateMachine";
 import {
@@ -31,12 +49,23 @@ import {
   sortInboxMessagesBySeq,
   type AgentInboxStateMachineEffect,
 } from "./agentInboxStateMachine";
-import { projectAgentInboxSnapshot } from "./agentInboxProjection";
+import { projectAgentInboxSnapshot, projectAgentInboxSnapshotWithoutAppItems } from "./agentInboxProjection";
 import { formatProxyVisibleMessageTarget } from "./agentVisibleDeliveryLedger";
 import type { AgentInboxTargetRow } from "./agentInboxProjection";
 import type { AgentAppInboxStore } from "./agentAppInbox";
 import { daemonFetch, type DaemonFetchOptions } from "./daemonFetch";
 import { logger } from "./logger";
+import { REMINDER_SERVER_ACK_CAPABILITY } from "./reminderServerAck";
+import { handleProcRequest, type ProcJobManager } from "./procJobs";
+import {
+  __resetRetiredLaunchesForTest,
+  agentNotRunningRefusal,
+  launchSupersededRefusal,
+  rememberRetiredLaunch,
+  retiredLaunchForToken,
+  stableEntryAgentMismatchRefusal,
+  type LocalProxyRefusal,
+} from "./agentProxyLaunchLifecycle";
 import {
   createThirdPartyEventDeliveryReporter,
   thirdPartyEventIdsFromEvents,
@@ -49,28 +78,26 @@ type ProxyRegistration = {
   launchId: string | null;
   activeCapabilities: string;
   inboxCoordinator?: AgentProxyInboxCoordinator;
+  /** For a launch with no coordinator (the OAR host): `recordMessageCommitted`, on its own. */
+  recordMessageCommitted?: AgentProxyInboxCoordinator["recordMessageCommitted"];
+  /** For a launch with no coordinator (the OAR host): `recordSendOutcome`, on its own. */
+  recordSendOutcome?: AgentProxyInboxCoordinator["recordSendOutcome"];
   /** Phase 1 typed app Inbox store (Computer-local). Optional for legacy tests. */
   appInbox?: AgentAppInboxStore;
   tracer: Tracer;
   daemonVersion: string | null;
   computerVersion: string | null;
+  /** The agent's runtime (`claude`, `codex`, ...), named on every forwarded request. */
+  runtime: string | null;
   /** Task #178: third-party events served under lease, keyed by batch id. Lives with the registration, so a relaunch voids them. */
   thirdPartyLeases?: Map<string, ThirdPartyEventLease>;
-  /** Glimpse G2-3: this agent's recent local holds of a task write, keyed by target and write (see taskWriteRehold). */
-  taskWriteHolds?: Map<string, { seenUpToSeq: number; at: number }>;
+  /** RFC 081: the agent's current `AgentConfig.inboxItems`, read at each `inbox check`. Absent: off. */
+  inboxItems?: () => boolean;
+  /** The agent's stable entry wrapper this launch wrote, named when the launch's transport is used after it ended. */
+  stableEntryPath: string | null;
 };
 
-/** How long a local hold of a task write covers its rerun: one hold per catch-up (the Server's window too). */
-const TASK_WRITE_REHOLD_WINDOW_MS = 10 * 60_000;
 
-/** A task write's identity on its board: the action and its task(s), so a hold covers only its own rerun. */
-function taskWriteKey(action: AgentProxyFreshnessAction, body: Record<string, unknown>): string {
-  const numbers = (value: unknown) => (Array.isArray(value) ? value : []).filter((n): n is number => typeof n === "number").sort((a, b) => a - b).join(",");
-  const strings = (value: unknown) => (Array.isArray(value) ? value : []).filter((v): v is string => typeof v === "string").sort().join(",");
-  if (action === "task_claim") return `task_claim:${numbers(body.task_numbers)}|${strings(body.message_ids)}`;
-  if (action === "task_update") return `task_update:${String(body.task_number)}:${String(body.status)}`;
-  return `${action}:${String(body.task_number)}`;
-}
 
 // Task #178 — serve = lease, ack = consume + report. A leased event stays in
 // the Local Inbox: a later /events re-serves it under a new batch (voiding the
@@ -138,6 +165,8 @@ function clearThirdPartyLeases(registration: ProxyRegistration): void {
 type ProxyHandle = {
   proxyUrl: string;
   proxyToken: string;
+  /** Settles when this registration's server-ack backfill run ends (tests await it). */
+  serverAckBackfill?: Promise<void>;
 };
 
 type ProxyServerState = {
@@ -169,6 +198,10 @@ export type AgentProxyVisibleMessage = {
   channel_name?: string;
   parent_channel_type?: string;
   parent_channel_name?: string;
+  /** The parent channel of a thread message, when the server sends it (#proj-raft-computer:#27). */
+  parent_channel_id?: string;
+  /** Task v2: the message is in this task's own conversation (target = task ref). */
+  task_conversation_number?: number;
   sender_type?: string;
   sender_name?: string;
   sender_description?: string | null;
@@ -204,11 +237,34 @@ export type AgentProxyInboxCoordinator = {
     target?: string;
     messages: AgentProxyVisibleMessage[];
     boundarySeq?: number;
-    source: "server_held_context" | "agent_api_events_local" | "agent_api_events_server" | "agent_api_history" | "agent_api_send_commit" | "side_effect_preflight_context";
+    source: "server_held_context" | "agent_api_events_local" | "agent_api_events_server" | "agent_api_history" | "agent_api_inbox_read" | "agent_api_send_commit" | "side_effect_preflight_context";
+    /** Telemetry only: size of the response body the messages came from. */
+    responseBytes?: number;
   }): void;
+  /**
+   * A held task write's context reached the model: the Server's
+   * `seenUpToSeq` covers `target` for that same write's rerun only
+   * (`writeKey`, agentTaskWriteKey), never for another write, a send or
+   * delivery (agentVisibleDeliveryLedger recordHeldWriteSpan).
+   */
+  recordHeldWriteSpan?(input: { target: string; writeKey: string; seenUpToSeq: number }): void;
+  /** What a hold of this same write booked, in the model's current context (recordHeldWriteSpan). */
+  getHeldWriteSpan?(input: { target: string; writeKey: string }): number | undefined;
+  /**
+   * The thread under `parentTarget` the model saw message `messageId` in,
+   * when it is a reply there (not the thread of its own): where a task
+   * created from it lands.
+   */
+  getThreadTargetOfMessage?(input: { parentTarget: string; messageId: string }): string | undefined;
   recordFreshnessDecision?(input: AgentProxyFreshnessDecision): void;
   /** What the Server said about a forwarded message send: accepted (with its id) or held as a draft. */
   recordSendOutcome?(input: { state: "sent"; messageId?: string } | { state: "held" }): void;
+  /**
+   * The Server accepted a message the agent sent (a 2xx `sent` or reconciled
+   * `committed` answer with its id), by `raft message send` or `raft task
+   * reply`. View Context indexes it; must not throw or block.
+   */
+  recordMessageCommitted?(input: { messageId: string; route: "send" | "task_reply" }): void;
   recordDrainOutcome?(input: AgentProxyDrainOutcome): void;
   recordProxyFailure?(input: AgentProxyFailure): void;
   recordTransportNormalizedError?(input: AgentProxyTransportNormalizedError): void;
@@ -220,7 +276,7 @@ export type AgentProxyInboxProjectionTraceInput = {
   pendingMessageCount: number;
 };
 
-export type AgentProxyFreshnessAction = "send" | "task_claim" | "task_update" | "task_amend";
+export type AgentProxyFreshnessAction = AgentGatedWriteAction;
 
 export type AgentProxyFreshnessDecision = {
   action: AgentProxyFreshnessAction;
@@ -295,6 +351,7 @@ export type AgentProxyTransportRouteFamily =
   | "channels/leave"
   | "integrations"
   | "knowledge"
+  | "proc"
   | "profile"
   | "reminders"
   | "runtime-version"
@@ -332,11 +389,37 @@ export type AgentProxyTransportNormalizedError = {
   originalMessage?: string;
   launchId?: string | null;
   targetHostClass: "api.slock.ai" | "api.raft.build" | "custom_server" | "local_daemon";
+  /** The upstream fetch went through an HTTP proxy from the env (#47: tells proxy failures from direct ones). */
+  viaHttpProxy?: boolean;
+  /** Addresses Node tried before the connect failed (autoSelectFamily), and how many of them timed out. */
+  connectAttemptedAddresses?: number;
+  connectTimedOutAddresses?: number;
   downstreamCaller: "cli" | "runtime" | "daemon_internal";
   upstream: "server" | "local_daemon";
 };
 
 const registrations = new Map<string, ProxyRegistration>();
+
+/**
+ * `raft proc` (procJobs.ts): the daemon's job manager, set once the machine
+ * dir is known on a platform that runs jobs (not Windows in v1). While it is
+ * set the proxy declares `proc@1`; proc routes are never forwarded to the
+ * Server, set or not.
+ */
+let procJobManager: ProcJobManager | null = null;
+
+export function setAgentProcJobManager(manager: ProcJobManager | null): void {
+  procJobManager = manager;
+}
+
+/** What this daemon runs for its agents, as `runtime-version` and the proc routes name it. */
+function daemonRunCapabilities(): string[] {
+  return procJobManager ? [PROC_CAPABILITY] : [];
+}
+
+function isProcPath(pathname: string): boolean {
+  return pathname === "/internal/agent-api/proc" || pathname.startsWith("/internal/agent-api/proc/");
+}
 
 const THIRD_PARTY_EVENT_DELIVERY_REPORT_RETRY_BASE_MS = 5_000;
 let thirdPartyEventDeliveryReportRetryBaseMs = THIRD_PARTY_EVENT_DELIVERY_REPORT_RETRY_BASE_MS;
@@ -358,6 +441,45 @@ const thirdPartyEventDeliveryReporter = createThirdPartyEventDeliveryReporter({
     );
   },
 });
+
+/**
+ * Report third-party events whose body the daemon handed to the model outside
+ * this proxy (a start's first prompt). Same reporter, retries and target as the
+ * `/events` and lease-ack reports. An agent with no proxy registration has no
+ * credential to report with, so nothing is attempted (a report would only
+ * retry until dropped); the event stays `delivering` and is re-delivered.
+ * Returns whether the report was handed to the reporter.
+ */
+export function reportThirdPartyEventsDelivered(agentId: string, eventIds: readonly string[]): boolean {
+  let registered = false;
+  for (const registration of registrations.values()) {
+    if (registration.agentId === agentId) registered = true;
+  }
+  if (!registered) return false;
+  thirdPartyEventDeliveryReporter.report(agentId, eventIds);
+  return true;
+}
+
+/**
+ * `raft message read --target agent-event:<id>` re-reads one event through
+ * `/history` (task #257), and the response carries its body. Only a read that
+ * consumes counts: `consume=false` is for output that may never reach the model.
+ */
+function isAgentEventHistoryRead(method: string, target: URL): boolean {
+  return method === "GET"
+    && target.pathname === "/internal/agent-api/history"
+    && /^agent-event:/i.test(target.searchParams.get("channel")?.trim() ?? "")
+    && target.searchParams.get("consume") !== "false";
+}
+
+function thirdPartyEventIdsFromHistoryResponse(responseText: string): string[] {
+  try {
+    const messages = (JSON.parse(responseText) as { messages?: unknown } | null)?.messages;
+    return Array.isArray(messages) ? thirdPartyEventIdsFromEvents(messages) : [];
+  } catch {
+    return [];
+  }
+}
 let proxyServerState: ProxyServerState | null = null;
 let proxyServerStartPromise: Promise<ProxyServerState> | null = null;
 let proxyServerFactory: ProxyServerFactory = createProxyServer;
@@ -531,6 +653,8 @@ async function ensureServer(): Promise<ProxyServerState> {
 
 export async function __resetAgentCredentialProxyForTest(): Promise<void> {
   registrations.clear();
+  procJobManager = null;
+  __resetRetiredLaunchesForTest();
   thirdPartyEventDeliveryReporter.reset();
   thirdPartyEventDeliveryReportRetryBaseMs = THIRD_PARTY_EVENT_DELIVERY_REPORT_RETRY_BASE_MS;
   const state = proxyServerState;
@@ -580,12 +704,37 @@ async function handleProxyRequest(req: http.IncomingMessage, res: http.ServerRes
   const token = typeof auth === "string" && auth.startsWith("Bearer ")
     ? auth.slice("Bearer ".length)
     : "";
-  const registration = registrations.get(token);
-  if (!registration) {
+  const tokenRegistration = registrations.get(token);
+  if (!tokenRegistration) {
+    const retired = retiredLaunchForToken(token);
+    if (retired) {
+      // A launch this proxy served has ended (#proj-raft-computer:#58): say
+      // whether the agent runs on in a newer session, and point only at its
+      // stable entry. The retired token itself never authorizes anything.
+      const refusal = latestRegistrationForAgent(retired.agentId)
+        ? launchSupersededRefusal(retired.stableEntryPath)
+        : agentNotRunningRefusal(retired.stableEntryPath);
+      logger.info(`[Agent Credential Proxy] ended launch transport used agent=${retired.agentId} outcome=${refusal.body.code}`);
+      writeLocalProxyRefusal(res, refusal);
+      return;
+    }
     res.writeHead(401, { "content-type": "application/json" });
     res.end(JSON.stringify({ error: "invalid local agent proxy token", code: "invalid_agent_proxy_token" }));
     return;
   }
+  // The stable entry (cli-transport/<agent>/current/) carries the proxy token
+  // of the launch that last wrote it. It is served by the agent's current
+  // launch at request time, only when the request names the credential's own
+  // agent: never another agent's, never a launch that has ended.
+  const viaStableEntry = firstRequestHeader(req.headers[RAFT_CLI_ENTRY_HEADER.toLowerCase()])?.trim() === RAFT_CLI_STABLE_ENTRY;
+  if (viaStableEntry && firstRequestHeader(req.headers["x-agent-id"])?.trim() !== tokenRegistration.agentId) {
+    logger.warn(`[Agent Credential Proxy] stable entry agent mismatch agent=${tokenRegistration.agentId}`);
+    writeLocalProxyRefusal(res, stableEntryAgentMismatchRefusal());
+    return;
+  }
+  const registration = viaStableEntry
+    ? latestRegistrationForAgent(tokenRegistration.agentId) ?? tokenRegistration
+    : tokenRegistration;
 
   const method = req.method ?? "GET";
   const correlationId = randomBytes(8).toString("hex");
@@ -609,6 +758,7 @@ async function handleProxyRequest(req: http.IncomingMessage, res: http.ServerRes
     surface: "daemon",
     kind: "client",
     attrs: {
+      agentId: registration.agentId,
       route_family: routeFamilyForPath(localPathname),
       // route_family folds v1 and v2 send together; keep the version visible
       // so a client route change cannot hide behind the family (task #360).
@@ -616,6 +766,8 @@ async function handleProxyRequest(req: http.IncomingMessage, res: http.ServerRes
       method: normalizedProxyMethod(method),
       trace_context_state: traceContextState,
       proxy_launch_id_present: registration.launchId !== null,
+      // Which CLI entry sent it: the launch's own wrapper, or the agent's stable entry.
+      via: viaStableEntry ? RAFT_CLI_STABLE_ENTRY : "launch",
       correlation_id: correlationId,
     },
   });
@@ -635,6 +787,18 @@ async function handleProxyRequest(req: http.IncomingMessage, res: http.ServerRes
   };
   let upstreamResponseStarted = false;
   let upstreamResponseComplete = false;
+  // Set when the upstream request was retried after a pre-response connection
+  // failure; `outcome` is whether the retry got a response.
+  let retry: { firstCauseCode: string; outcome: "ok" | "failed" } | undefined;
+  // The CLI gives up on its own timeout (300 s) and may retry. An upstream
+  // request it no longer waits for must not reach the Server later (a
+  // connection that was still being set up can succeed after the CLI left),
+  // or a retried side effect runs twice: abort it once the CLI's connection
+  // closes before the response was written.
+  const clientGone = new AbortController();
+  res.once("close", () => {
+    if (!res.writableFinished) clientGone.abort();
+  });
   // Upload failures are read by size, so the upload span carries a coarse
   // bucket only (never names or bytes). The declared length covers failures
   // before the body is read; the buffered length replaces it once known.
@@ -689,7 +853,16 @@ async function handleProxyRequest(req: http.IncomingMessage, res: http.ServerRes
     const contextId = registration.inboxCoordinator?.getContextId?.();
     if (contextId) headers.set("X-Agent-Context-Id", contextId);
     headers.set("X-Raft-Client", "cli");
+    // The daemon is the authority on the entry: a caller's value is replaced.
+    setOrDeleteHeader(headers, RAFT_CLI_ENTRY_HEADER, viaStableEntry ? RAFT_CLI_STABLE_ENTRY : null);
+    // What the agent runs on, for the server's request span (task #15 in
+    // #proj-analytics): the daemon is the authority, so a caller's own values
+    // are replaced. The CLI's X-Raft-Client-Version passes through.
+    setOrDeleteHeader(headers, RAFT_COMPUTER_VERSION_HEADER, registration.computerVersion);
+    setOrDeleteHeader(headers, RAFT_DAEMON_VERSION_HEADER, registration.daemonVersion);
+    setOrDeleteHeader(headers, RAFT_RUNTIME_HEADER, registration.runtime);
     headers.set("X-Slock-Agent-Active-Capabilities", registration.activeCapabilities);
+    appendDaemonClientCapabilities(headers);
     // The caller-supplied context is only a parent. Always create a daemon
     // child span and overwrite the carrier so the server/preflight requests
     // are causally joined without trusting the local caller's span identity.
@@ -707,6 +880,7 @@ async function handleProxyRequest(req: http.IncomingMessage, res: http.ServerRes
     }
     let sendTarget: string | undefined;
     let sideEffectFreshnessContextMode: "inline" | "withheld" | undefined;
+    let sideEffectTaskWriteKey: string | undefined;
     // v2 sends feed the ledger from their response but keep the v2 response
     // unreprojected, so their mode only steers consumption.
     let sendV2ConsumeFreshnessContextMode: "inline" | "withheld" | undefined;
@@ -738,7 +912,34 @@ async function handleProxyRequest(req: http.IncomingMessage, res: http.ServerRes
         daemonVersion: registration.daemonVersion,
         computerVersion: registration.computerVersion,
         observation: "live_daemon_process",
+        ...(daemonRunCapabilities().length > 0 ? { capabilities: daemonRunCapabilities() } : {}),
       }));
+      return;
+    }
+
+    // `raft proc`: answered by the daemon as the registration's agent (a live
+    // launch, or the stable entry served by the agent's current one). The
+    // body carries the CLI's environment: it never leaves this process.
+    if (isProcPath(target.pathname)) {
+      const proc = await handleProcRequest(procJobManager, {
+        agentId: registration.agentId,
+        stableEntryPath: registration.stableEntryPath,
+        launchId: registration.launchId,
+        runtime: registration.runtime,
+        method,
+        pathname: target.pathname,
+        query: target.searchParams,
+        body: rawBodyBuffer,
+      });
+      proxySpanStatus = proc.status < 400 ? "ok" : "error";
+      proxySpanEndAttrs = {
+        outcome: "local_response",
+        local_response_kind: "proc",
+        http_status: proc.status,
+        ...(typeof proc.body.code === "string" ? { normalized_code: proc.body.code } : {}),
+      };
+      res.writeHead(proc.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(proc.body));
       return;
     }
 
@@ -790,6 +991,25 @@ async function handleProxyRequest(req: http.IncomingMessage, res: http.ServerRes
       res.writeHead(localAck.status, { "content-type": "application/json" });
       res.end(JSON.stringify(localAck.body));
       return;
+    }
+
+    // `raft inbox dismiss --target <the target a Computer-local app item's row
+    // prints>`: the item exists only in this daemon's store, so the daemon
+    // removes it and answers as the Server answers one dismissed app item.
+    // Every other dismiss is the Server's and is forwarded below unchanged.
+    if (method === "POST" && target.pathname === INBOX_DISMISS_PATH) {
+      const localDismiss = localAgentApiInboxDismissResponse(registration, rawBodyBuffer ?? Buffer.alloc(0));
+      if (localDismiss) {
+        proxySpanStatus = "ok";
+        proxySpanEndAttrs = {
+          outcome: "local_response",
+          local_response_kind: "inbox_dismiss",
+          http_status: localDismiss.status,
+        };
+        res.writeHead(localDismiss.status, { "content-type": "application/json" });
+        res.end(JSON.stringify(localDismiss.body));
+        return;
+      }
     }
 
     // Task #178: the CLI acks a leased batch of third-party events after it
@@ -866,6 +1086,7 @@ async function handleProxyRequest(req: http.IncomingMessage, res: http.ServerRes
       // The target whose held context (a send's or a task write's) the response books.
       sendTarget = prepared.target;
       sideEffectFreshnessContextMode = prepared.freshnessContextMode;
+      sideEffectTaskWriteKey = prepared.taskWriteKey;
       headers.set("content-type", "application/json");
       headers.delete("content-length");
     } else if (method === "POST" && isMessageSendV2) {
@@ -885,22 +1106,45 @@ async function handleProxyRequest(req: http.IncomingMessage, res: http.ServerRes
       headers.delete("content-length");
     }
 
-    const upstream = await daemonFetch(
-      target,
+    const upstreamTarget = target;
+    const fetchUpstream = () => daemonFetch(
+      upstreamTarget,
       {
         method,
         headers,
         body,
-        redirect: shouldRelayAgentAttachmentRedirect(target.pathname) ? "manual" : "follow",
+        redirect: shouldRelayAgentAttachmentRedirect(upstreamTarget.pathname) ? "manual" : "follow",
+        signal: clientGone.signal,
       },
       process.env,
-      agentCredentialProxyFetchOptions(target.pathname, process.env),
+      agentCredentialProxyFetchOptions(upstreamTarget.pathname, process.env),
     );
+    let upstream: Awaited<ReturnType<typeof fetchUpstream>>;
+    try {
+      upstream = await fetchUpstream();
+    } catch (err) {
+      // A connection reset before any response (Clash in TUN mode, a stale
+      // keep-alive socket) is retried once, only for a request the Server can
+      // safely see twice. The failed socket is gone, so the retry connects anew.
+      if (clientGone.signal.aborted) throw err;
+      const firstError = transportNormalizedErrorForError(upstreamTarget, err, registration.launchId);
+      if (!isRetryablePreResponseConnectionError(err, firstError)) throw err;
+      if (!isProxyRequestSafeToRepeat(method, upstreamTarget, body)) throw err;
+      retry = { firstCauseCode: firstError.causeCode, outcome: "failed" };
+      logger.info(
+        `[Agent Credential Proxy] retrying once after a pre-response connection failure ` +
+        `(route_family=${firstError.routeFamily}, cause_code=${firstError.causeCode}, correlation_id=${correlationId})`,
+      );
+      await sleep(proxyPreResponseRetryDelayMs, undefined, { signal: clientGone.signal });
+      upstream = await fetchUpstream();
+      retry.outcome = "ok";
+    }
     upstreamResponseStarted = true;
 
     const shouldBufferReviewerIsolationResponse =
       sideEffectFreshnessContextMode === "withheld"
       && Boolean(sideEffectAction);
+    const agentEventHistoryRead = isAgentEventHistoryRead(method, target);
     if (
       upstream.status >= 500 ||
       shouldBufferReviewerIsolationResponse
@@ -911,6 +1155,7 @@ async function handleProxyRequest(req: http.IncomingMessage, res: http.ServerRes
         responseText = (await decodedUpstreamBuffer(upstream, noteUpstreamDecodeFailed)).toString("utf8");
         upstreamResponseComplete = true;
       } catch (err) {
+        if (clientGone.signal.aborted && isAbortError(err)) throw err;
         const transportError = transportNormalizedErrorForError(target, err, registration.launchId, {
           responseStarted: true,
           responseComplete: false,
@@ -946,6 +1191,12 @@ async function handleProxyRequest(req: http.IncomingMessage, res: http.ServerRes
         logger.warn(formatProxyFailureLogMessage(registration, failure));
         registration.inboxCoordinator?.recordProxyFailure?.(failure);
         registration.inboxCoordinator?.recordTransportNormalizedError?.(transportError);
+        if (isDeliberateServerErrorAnswer(upstream.headers, responseText) && !res.headersSent) {
+          proxySpanEndAttrs.relayed_server_answer = true;
+          res.writeHead(upstream.status, { "content-type": "application/json", "x-raft-correlation-id": correlationId });
+          res.end(responseText);
+          return;
+        }
         writeProxyFailureResponse(res, failure);
         return;
       }
@@ -960,10 +1211,14 @@ async function handleProxyRequest(req: http.IncomingMessage, res: http.ServerRes
       // hold hides the draft and its context (PROXY_5XX on 2026-10-14, thread
       // alias, see serverResolvedThreadTarget). A read can simply be retried,
       // so there the failure stays a post_response_local error.
+      noteCommittedMessage(registration, target.pathname, upstream.status, responseText);
+      if (!registration.inboxCoordinator) noteSendOutcomeWithoutCoordinator(registration, target.pathname, responseText);
       try {
-        await consumeVisibleResponse(registration, target, sendTarget, sideEffectFreshnessContextMode ?? sendV2ConsumeFreshnessContextMode, responseText);
+        await consumeVisibleResponse(registration, target, sendTarget, sideEffectFreshnessContextMode ?? sendV2ConsumeFreshnessContextMode, responseText, sideEffectTaskWriteKey);
       } catch (err) {
-        if (!sideEffectAction && !isMessageSendV2) throw err;
+        // `inbox read` consumed its page on the Server: losing the answer would
+        // lose those messages, and the read must not be retried to get them back.
+        if (!sideEffectAction && !isMessageSendV2 && target.pathname !== INBOX_READ_PATH) throw err;
         const errorMessage = truncateProxyErrorMessage(err instanceof Error ? err.message : String(err));
         logger.warn(`[Agent Credential Proxy] visible-delivery ledger update failed; forwarding the upstream response (correlation_id=${correlationId}): ${errorMessage}`);
         proxySpan.addEvent("daemon.agent_proxy.visible_ledger_failed", {
@@ -974,6 +1229,18 @@ async function handleProxyRequest(req: http.IncomingMessage, res: http.ServerRes
       const downstreamResponseText = sideEffectFreshnessContextMode === "withheld"
         ? reprojectReviewerIsolationResponse(responseText, upstream.status, target.pathname)
         : responseText;
+      // An `agent-event:` re-read hands the event body to the runtime, like a
+      // Local Inbox `/events` serve: report it delivered once the response
+      // has been written. Error responses (absent, ambiguous, expired) carry
+      // no body and report nothing.
+      const reReadThirdPartyEventIds = agentEventHistoryRead && upstream.status >= 200 && upstream.status < 300
+        ? thirdPartyEventIdsFromHistoryResponse(responseText)
+        : [];
+      if (reReadThirdPartyEventIds.length > 0) {
+        proxySpanEndAttrs.third_party_ack_mode = "history_reread";
+        proxySpanEndAttrs.third_party_served_count = reReadThirdPartyEventIds.length;
+        res.once("finish", () => thirdPartyEventDeliveryReporter.report(registration.agentId, reReadThirdPartyEventIds));
+      }
       res.writeHead(upstream.status, responseHeadersForLocalProxy(upstream));
       res.end(downstreamResponseText);
       return;
@@ -1011,6 +1278,18 @@ async function handleProxyRequest(req: http.IncomingMessage, res: http.ServerRes
       res.end();
     }
   } catch (err) {
+    if (clientGone.signal.aborted && isAbortError(err)) {
+      // The CLI left first: nothing to answer, and not a transport failure.
+      // Once the response had started this is how a stream ends (the bridge
+      // closing its wake-hint stream), so only an unanswered request is an error.
+      proxySpanStatus = upstreamResponseStarted ? "ok" : "error";
+      proxySpanEndAttrs = {
+        outcome: "client_closed",
+        response_started: upstreamResponseStarted,
+        response_complete: upstreamResponseComplete,
+      };
+      return;
+    }
     const transportError = transportNormalizedErrorForError(target, err, registration.launchId, {
       responseStarted: upstreamResponseStarted,
       responseComplete: upstreamResponseComplete,
@@ -1031,7 +1310,103 @@ async function handleProxyRequest(req: http.IncomingMessage, res: http.ServerRes
     if (requestBodyBytes !== undefined) {
       proxySpanEndAttrs = { ...proxySpanEndAttrs, body_size_bucket: bodySizeBucket(requestBodyBytes) };
     }
+    if (retry) {
+      proxySpanEndAttrs = {
+        ...proxySpanEndAttrs,
+        retried: true,
+        retry_outcome: retry.outcome,
+        retry_first_cause_code: retry.firstCauseCode,
+      };
+    }
     proxySpan.end(proxySpanStatus, { attrs: proxySpanEndAttrs });
+  }
+}
+
+function isAbortError(err: unknown): boolean {
+  return err instanceof Error && err.name === "AbortError";
+}
+
+/** The wait before the one retry of a request reset before any response. */
+const PROXY_PRE_RESPONSE_RETRY_DELAY_MS = 400;
+let proxyPreResponseRetryDelayMs = PROXY_PRE_RESPONSE_RETRY_DELAY_MS;
+
+export function __setProxyPreResponseRetryDelayMsForTest(ms: number | undefined): void {
+  proxyPreResponseRetryDelayMs = ms ?? PROXY_PRE_RESPONSE_RETRY_DELAY_MS;
+}
+
+/**
+ * Connection-level failures that end a request before any response: the
+ * socket was refused, reset or closed under us, or the connect timed out.
+ * Read timeouts (UND_ERR_HEADERS_TIMEOUT) are not among them: the request
+ * was sent and the Server may be working on it.
+ */
+const PRE_RESPONSE_RETRYABLE_CAUSE_CODES = new Set([
+  "ECONNRESET",
+  "EPIPE",
+  "ECONNREFUSED",
+  "UND_ERR_SOCKET",
+  "UND_ERR_CONNECT_TIMEOUT",
+]);
+
+function isRetryablePreResponseConnectionError(err: unknown, error: AgentProxyTransportNormalizedError): boolean {
+  if (error.normalizedCode !== "transport_failure" || error.failureClass !== "pre_response_transport") return false;
+  if (PRE_RESPONSE_RETRYABLE_CAUSE_CODES.has(error.causeCode)) return true;
+  // A bare ETIMEDOUT can be a read timeout; only one raised by connect counts.
+  return error.causeCode === "ETIMEDOUT" && isConnectPhaseError(err);
+}
+
+function isConnectPhaseError(err: unknown): boolean {
+  for (let current: unknown = err, depth = 0; current && depth < 4; current = (current as { cause?: unknown }).cause, depth += 1) {
+    if (current instanceof AggregateError) return true;
+    if ((current as { syscall?: unknown }).syscall === "connect") return true;
+  }
+  return false;
+}
+
+/**
+ * Agent API writes whose Server handler honours a body `idempotencyKey`: a
+ * repeat with the same key replays the first answer and writes nothing, and a
+ * unique index makes concurrent repeats land once (messages.agent_send_key,
+ * message_card_revisions.idempotency_key, agent_api_idempotency_keys).
+ * `POST /assistant/notify` takes an `idempotency_key` but the Server does not
+ * use it yet, so it is not here.
+ */
+const IDEMPOTENCY_KEYED_WRITES: ReadonlyArray<{ method: string; path: RegExp }> = [
+  { method: "POST", path: /^\/internal\/agent-api\/send$/ },
+  { method: "POST", path: /^\/internal\/agent-api\/v2\/send$/ },
+  { method: "POST", path: /^\/internal\/agent-api\/tasks\/reply$/ },
+  { method: "POST", path: /^\/internal\/agent-api\/tasks$/ },
+  { method: "POST", path: /^\/internal\/agent-api\/prepare-action$/ },
+  { method: "PUT", path: /^\/internal\/agent-api\/messages\/[^/]+\/card$/ },
+];
+
+/** Only a small body the proxy already holds in memory is sent again. */
+const PROXY_RETRY_MAX_BODY_BYTES = 1024 * 1024;
+
+function isProxyRequestSafeToRepeat(method: string, target: URL, body: BodyInit | undefined): boolean {
+  if (method === "GET" || method === "HEAD") {
+    // GETs that consume on the Server: a repeat after a lost answer would
+    // hand over the next batch (or nothing) instead of failing visibly.
+    if (target.pathname === "/internal/agent-api/events") return false;
+    // Any `unread=true` read (history, a task's conversation, the next route on
+    // the shared history read) moves the read position: a repeat after a lost
+    // answer would come back "no unread" and the agent would never see them.
+    if (target.searchParams.get("unread") === "true") return false;
+    return true;
+  }
+  if (!IDEMPOTENCY_KEYED_WRITES.some((route) => route.method === method && route.path.test(target.pathname))) return false;
+  let text: string;
+  if (typeof body === "string") text = body;
+  else if (body instanceof ArrayBuffer) text = Buffer.from(body).toString("utf8");
+  else return false;
+  if (Buffer.byteLength(text, "utf8") > PROXY_RETRY_MAX_BODY_BYTES) return false;
+  try {
+    const parsed = JSON.parse(text) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
+    const key = (parsed as { idempotencyKey?: unknown }).idempotencyKey;
+    return typeof key === "string" && key.trim().length > 0;
+  } catch {
+    return false;
   }
 }
 
@@ -1105,6 +1480,11 @@ function proxyFailureSpanAttrs(error: AgentProxyTransportNormalizedError): Recor
     response_complete: error.responseComplete,
     failure_class: error.failureClass,
     cause_code: error.causeCode,
+    upstream_layer: error.upstreamLayer,
+    target_host_class: error.targetHostClass,
+    ...(error.viaHttpProxy === undefined ? {} : { via_http_proxy: error.viaHttpProxy }),
+    ...(error.connectAttemptedAddresses === undefined ? {} : { connect_attempted_addresses: error.connectAttemptedAddresses }),
+    ...(error.connectTimedOutAddresses === undefined ? {} : { connect_timed_out_addresses: error.connectTimedOutAddresses }),
     ...(error.upstreamStatus === undefined ? {} : { http_status: error.upstreamStatus }),
   };
 }
@@ -1266,6 +1646,27 @@ function truncateProxyErrorMessage(message: string): string {
   return normalized.length > 500 ? `${normalized.slice(0, 497)}...` : normalized;
 }
 
+/**
+ * A 5xx the Server answered on purpose: a JSON object with its own `error` and
+ * `code` (Artifact storage not set up, an overload, …). The agent needs that
+ * answer and its next step, as an agent calling the Server directly gets it,
+ * so it is relayed as is. The Server's catch-all for an unexpected route error
+ * (marked `X-Slock-Error-Id`) and any other body are still replaced by the
+ * proxy's failure envelope, which never repeats an upstream body.
+ */
+function isDeliberateServerErrorAnswer(headers: Headers, responseText: string): boolean {
+  if (headers.get("x-slock-error-id")) return false;
+  let body: unknown;
+  try {
+    body = JSON.parse(responseText);
+  } catch {
+    return false;
+  }
+  if (!body || typeof body !== "object" || Array.isArray(body)) return false;
+  const { error, code } = body as { error?: unknown; code?: unknown };
+  return typeof error === "string" && typeof code === "string";
+}
+
 function transportNormalizedErrorForHttpStatus(target: URL, status: number, launchId: string | null): AgentProxyTransportNormalizedError {
   const failureClass = proxyFailureClassForPhase("upstream_http_response");
   return {
@@ -1325,11 +1726,32 @@ function transportNormalizedErrorForError(
     originalMessage: sanitizeTransportOriginalMessage(err instanceof Error ? err.message : String(err)),
     launchId,
     targetHostClass: local ? "local_daemon" : target ? daemonUpstreamTargetHostClass(target) : "custom_server",
+    ...(local || !target ? {} : { viaHttpProxy: fetchUsesHttpProxy(target.toString(), process.env) }),
+    ...connectAttemptCountsOf(err),
     // Today the local credential proxy is only used by CLI wrappers. If runtime
     // or daemon-internal callers use it later, plumb the caller identity here.
     downstreamCaller: "cli",
     upstream: local ? "local_daemon" : "server",
   };
+}
+
+/**
+ * Node's per-address connect attempts (autoSelectFamily) end in an
+ * AggregateError with one error per address tried; undici keeps it as the
+ * cause of its connect timeout. Only counts are kept, never the addresses:
+ * how many were tried, and how many of those timed out rather than failed at
+ * once (#47: a slow link times out every IPv4 attempt while IPv6 fails at once).
+ */
+function connectAttemptCountsOf(err: unknown): { connectAttemptedAddresses?: number; connectTimedOutAddresses?: number } {
+  for (let current: unknown = err, depth = 0; current && depth < 4; current = (current as { cause?: unknown }).cause, depth += 1) {
+    if (current instanceof AggregateError) {
+      return {
+        connectAttemptedAddresses: current.errors.length,
+        connectTimedOutAddresses: current.errors.filter((e: unknown) => (e as { code?: unknown } | null)?.code === "ETIMEDOUT").length,
+      };
+    }
+  }
+  return {};
 }
 
 function proxyFailureClassForPhase(source: AgentProxyFailureClass): AgentProxyFailureClass {
@@ -1347,6 +1769,7 @@ export function __transportNormalizedErrorForErrorForTest(
 
 export function routeFamilyForPath(pathname: string): AgentProxyTransportRouteFamily {
   if (pathname === "/internal/agent-api/runtime-version") return "runtime-version";
+  if (pathname === "/internal/agent-api/proc" || pathname.startsWith("/internal/agent-api/proc/")) return "proc";
   if (pathname === "/internal/agent-api/v2/send") return "agent-api/send";
   if (pathname === "/internal/agent-api/send") return "agent-api/send";
   if (pathname === "/internal/agent-api/events") return "agent-api/events";
@@ -1485,8 +1908,14 @@ function localAgentApiInboxResponse(
 ): { status: number; body: Record<string, unknown> } | undefined {
   const coordinator = registration.inboxCoordinator;
   if (!coordinator && !registration.appInbox) return undefined;
-  const pending = coordinator?.getAllPendingMessages?.() ?? [];
-  const rows = projectAgentInboxSnapshot(pending);
+  const allPending = coordinator?.getAllPendingMessages?.() ?? [];
+  // RFC 081, inbox items on: the Server lists the third-party events it marks
+  // with an inbox item itself (`app:` rows), so the snapshot leaves them out
+  // and its grouped row counts only the events the Server does not list, as
+  // the wake-up notice does (the same shared split).
+  const { rows, pending } = inboxItemsOn(registration)
+    ? projectAgentInboxSnapshotWithoutAppItems(allPending)
+    : { rows: projectAgentInboxSnapshot(allPending), pending: allPending };
   const appItems = registration.appInbox?.list() ?? [];
   const acknowledgedAppSources = registration.appInbox?.listAcknowledgedSources() ?? [];
   const seals = registration.appInbox?.listSeals() ?? [];
@@ -1550,6 +1979,189 @@ function parseExactAppSourceAckSuccess(
   };
 }
 
+type ServerAckTarget = {
+  itemId: string;
+  appId: string;
+  notificationClass: string;
+  sourceRef: AgentInboxSourceRef;
+  actionCli?: string;
+};
+
+/**
+ * One `POST /app-sources/ack` for `target`: accepted (the exact Server
+ * answer), or failed with the agent-facing answer (the item is still not
+ * acknowledged; refused: the same ack would be refused again; unavailable:
+ * it is safe to run again). `authoritative`: the Server's refusal is final
+ * for this source (a closed reject code), not a transient failure.
+ */
+async function postServerAppSourceAck(
+  registration: ProxyRegistration,
+  store: AgentAppInboxStore,
+  headers: Headers,
+  target: ServerAckTarget,
+  ackAttemptId: string,
+): Promise<
+  | { kind: "accepted"; status: number; json: Record<string, unknown>; accepted: AppSourceAckAcceptedResponse | null }
+  | { kind: "failed"; authoritative: boolean; response: { status: number; body: Record<string, unknown> } }
+> {
+  headers.set("content-type", "application/json");
+  headers.delete("content-length");
+  const url = new URL("/internal/agent-api/app-sources/ack", registration.serverUrl);
+  const notAcknowledged = (reason: string) =>
+    `${reason}; ${describeAppInboxItemForAgent(target)} is still not acknowledged.`;
+  // The app may word the next step (a reminder names its full-id ack command
+  // and, refused, where its current ack lines are); else a generic one.
+  const nextAction = (outcome: "refused" | "unavailable") => store.ackFailureNextAction(target, outcome)
+    ?? (outcome === "refused"
+      ? "Nothing was acknowledged."
+      : `Retry in a few seconds; it is safe to run the same ack again${target.actionCli ? `: ${target.actionCli}` : ""}`);
+  let upstream: Response;
+  let upstreamText: string;
+  try {
+    upstream = await daemonFetch(
+      url,
+      {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          itemId: target.itemId,
+          appId: target.appId,
+          notificationClass: target.notificationClass,
+          sourceRef: target.sourceRef,
+          ackAttemptId,
+        }),
+        redirect: "follow",
+      },
+      process.env,
+      agentCredentialProxyFetchOptions(url.pathname, process.env),
+    );
+    upstreamText = await upstream.text();
+  } catch (err) {
+    logger.warn(`[AgentCredentialProxy] app-source ACK did not reach the Server (agent=${registration.agentId} item=${target.itemId}): ${errorClassOf(err)}`);
+    return {
+      kind: "failed",
+      authoritative: false,
+      response: {
+        status: 503,
+        body: {
+          error: notAcknowledged("The Server could not be reached"),
+          code: "app_source_ack_unavailable",
+          suggested_next_action: nextAction("unavailable"),
+        },
+      },
+    };
+  }
+  let upstreamJson: Record<string, unknown>;
+  try {
+    upstreamJson = JSON.parse(upstreamText || "{}") as Record<string, unknown>;
+  } catch {
+    upstreamJson = { error: upstreamText || "invalid upstream response", code: "invalid_upstream_response" };
+  }
+  if (upstream.status >= 400) {
+    const authoritativeReject = parseAgentApiAppSourceAckReject(upstream.status, upstreamJson);
+    const serverSaid = typeof upstreamJson.error === "string" && upstreamJson.error.length > 0
+      ? upstreamJson.error
+      : `HTTP ${upstream.status}`;
+    if (!authoritativeReject) {
+      return {
+        kind: "failed",
+        authoritative: false,
+        response: {
+          status: upstream.status,
+          body: upstream.status >= 500
+            ? {
+              ...upstreamJson,
+              error: notAcknowledged(`The Server could not take the ack (${serverSaid})`),
+              suggested_next_action: nextAction("unavailable"),
+            }
+            : {
+              ...upstreamJson,
+              error: notAcknowledged(`The Server refused the ack (${serverSaid})`),
+              suggested_next_action: nextAction("refused"),
+            },
+        },
+      };
+    }
+    return {
+      kind: "failed",
+      authoritative: true,
+      response: {
+        status: upstream.status,
+        body: {
+          ...authoritativeReject,
+          error: notAcknowledged(`The Server refused the ack (${authoritativeReject.error})`),
+          suggested_next_action: nextAction("refused"),
+        },
+      },
+    };
+  }
+  return {
+    kind: "accepted",
+    status: upstream.status,
+    json: upstreamJson,
+    accepted: parseExactAppSourceAckSuccess(upstreamJson, {
+      itemId: target.itemId,
+      appId: target.appId,
+      notificationClass: target.notificationClass,
+      sourceRef: target.sourceRef,
+      ackAttemptId,
+    }),
+  };
+}
+
+const INVALID_APP_SOURCE_ACK_RESPONSE = {
+  status: 502,
+  body: {
+    error: "Server app-source ACK response did not match the exact item it was sent for; retry the ack",
+    code: "invalid_app_source_ack_response",
+  },
+};
+
+/** RFC 081 `raft inbox dismiss` (agentApiContract `inboxDismiss`). */
+export const INBOX_DISMISS_PATH = "/internal/agent-api/inbox/dismiss";
+
+/**
+ * A dismiss whose `target` is the one a Computer-local app item's row prints
+ * (agentInboxAppItemDismissTarget, the one rule for what an agent may
+ * dismiss: never a reminder or a sealed item), among the calling agent's own
+ * items. Exactly one such item: it is removed here and the answer is the
+ * Server's for one dismissed app item (handleInboxDismiss's `deps.answer`).
+ * Undefined for everything else (no item or more than one with that target,
+ * `before`, any other target or body): the request is the Server's, forwarded
+ * as it came, and its answer is the agent's.
+ */
+function localAgentApiInboxDismissResponse(
+  registration: ProxyRegistration,
+  bodyRaw: Buffer,
+): { status: number; body: Record<string, unknown> } | undefined {
+  const store = registration.appInbox;
+  if (!store) return undefined;
+  let request: { target?: unknown; before?: unknown } | null;
+  try {
+    request = JSON.parse(bodyRaw.toString("utf8")) as { target?: unknown; before?: unknown } | null;
+  } catch {
+    return undefined;
+  }
+  if (!request || typeof request.target !== "string" || request.before !== undefined) return undefined;
+  const target = request.target.trim();
+  const matches = store.list().filter((item) => agentInboxAppItemDismissTarget(item) === target);
+  if (matches.length !== 1) return undefined;
+  const item = matches[0]!;
+  if (!store.dismiss(item.itemId)) return undefined;
+  const dismissed: AgentApiInboxDismissResponse = {
+    dismissed: 1,
+    conversations: 0,
+    appItems: 1,
+    skippedNeedsAck: 0,
+    // When the item was minted; a value no Date holds says nothing.
+    earliestActivityAt: typeof item.createdAtMs === "number" && Number.isFinite(new Date(item.createdAtMs).getTime())
+      ? new Date(item.createdAtMs).toISOString()
+      : null,
+    remaining: 0,
+  };
+  return { status: 200, body: dismissed };
+}
+
 async function localAgentApiInboxAckResponse(
   registration: ProxyRegistration,
   headers: Headers,
@@ -1562,9 +2174,9 @@ async function localAgentApiInboxAckResponse(
       body: { error: "app inbox not available for this runner", code: "app_inbox_unavailable" },
     };
   }
-  let parsed: { itemId?: unknown };
+  let parsed: { itemId?: unknown; source?: unknown };
   try {
-    parsed = JSON.parse(bodyRaw.toString("utf8") || "{}") as { itemId?: unknown };
+    parsed = JSON.parse(bodyRaw.toString("utf8") || "{}") as { itemId?: unknown; source?: unknown };
   } catch {
     return { status: 400, body: { error: "invalid JSON body", code: "invalid_json" } };
   }
@@ -1573,9 +2185,7 @@ async function localAgentApiInboxAckResponse(
     return { status: 400, body: { error: "itemId required", code: "item_id_required" } };
   }
   const item = store.list().find((entry) => entry.itemId === itemId);
-  if (!item) {
-    return { status: 404, body: { error: "item not found", code: "item_not_found" } };
-  }
+  if (!item) return serverAckOfSourceNotHeld(registration, store, headers, itemId, parsed.source);
   const protectingSeal = store.findProtectingSeal(item);
   if (protectingSeal) {
     return {
@@ -1586,8 +2196,14 @@ async function localAgentApiInboxAckResponse(
       },
     };
   }
-  const acked = store.ack(itemId);
-  if (acked) {
+  // A server-authority item (a fired reminder) is acked only by the Server,
+  // whatever the inbox items flag (a flipped or stale flag must not leave a
+  // Server-listed reminder acked only here): a local ack would answer
+  // "acknowledged" while the Server still lists it as not acked (RFC 081 D7,
+  // one read state). The local item stays until the Server accepts; a refusal
+  // or an unreachable Server is the caller's error.
+  const serverOnly = store.requiresServerAuthorizedAck(item);
+  if (!serverOnly && store.ack(itemId)) {
     return { status: 200, body: { ok: true, itemId, remaining_app_items: store.list().length } };
   }
   const intent = store.beginServerAuthorizedAckIntent({
@@ -1597,51 +2213,22 @@ async function localAgentApiInboxAckResponse(
   if (!intent) {
     return { status: 404, body: { error: "item not found", code: "item_not_found" } };
   }
-
-  const upstreamBody = JSON.stringify({
-    itemId: item.itemId,
-    appId: item.appId,
-    notificationClass: item.notificationClass,
-    sourceRef: item.sourceRef,
-    ackAttemptId: intent.ackAttemptId,
-  });
-  headers.set("content-type", "application/json");
-  headers.delete("content-length");
-  const target = new URL("/internal/agent-api/app-sources/ack", registration.serverUrl);
-  const upstream = await daemonFetch(
-    target,
-    {
-      method: "POST",
-      headers,
-      body: upstreamBody,
-      redirect: "follow",
-    },
-    process.env,
-    agentCredentialProxyFetchOptions(target.pathname, process.env),
-  );
-  const upstreamText = await upstream.text();
-  let upstreamJson: Record<string, unknown>;
-  try {
-    upstreamJson = JSON.parse(upstreamText || "{}") as Record<string, unknown>;
-  } catch {
-    upstreamJson = { error: upstreamText || "invalid upstream response", code: "invalid_upstream_response" };
-  }
-  if (upstream.status >= 400) {
-    const authoritativeReject = parseAgentApiAppSourceAckReject(upstream.status, upstreamJson);
-    if (!authoritativeReject) {
-      return { status: upstream.status, body: upstreamJson };
-    }
-    store.clearServerAuthorizedAckIntent({ itemId: item.itemId, ackAttemptId: intent.ackAttemptId });
-    return { status: upstream.status, body: authoritativeReject };
-  }
-  const accepted = parseExactAppSourceAckSuccess(upstreamJson, {
+  // Unanswered or 5xx, the intent stays: the same ack is replayed under the
+  // same ackAttemptId. An authoritative refusal clears it.
+  const result = await postServerAppSourceAck(registration, store, headers, {
     itemId: intent.itemId,
     appId: intent.appId,
     notificationClass: intent.notificationClass,
     sourceRef: intent.sourceRef,
-    ackAttemptId: intent.ackAttemptId,
-  });
-  if (!accepted) {
+    ...(item.actionCli ? { actionCli: item.actionCli } : {}),
+  }, intent.ackAttemptId);
+  if (result.kind === "failed") {
+    if (result.authoritative) {
+      store.clearServerAuthorizedAckIntent({ itemId: item.itemId, ackAttemptId: intent.ackAttemptId });
+    }
+    return result.response;
+  }
+  if (!result.accepted) {
     return {
       status: 502,
       body: {
@@ -1661,13 +2248,88 @@ async function localAgentApiInboxAckResponse(
     };
   }
   return {
-    status: upstream.status,
+    status: result.status,
     body: {
-      ...upstreamJson,
+      ...result.json,
       itemId: item.itemId,
       remaining_app_items: store.list().length,
     },
   };
+}
+
+/**
+ * An ack of a server-authority source this store holds no live item for:
+ * one it already acked (a daemon before reminder-server-ack@1 acked it only
+ * here, so the Server may still list it), or, from `source`, one it never
+ * held (a lost store, another machine). Either goes to the Server, whose
+ * answer is the answer; an "already acknowledged" there is a success.
+ */
+async function serverAckOfSourceNotHeld(
+  registration: ProxyRegistration,
+  store: AgentAppInboxStore,
+  headers: Headers,
+  itemId: string,
+  rawSource: unknown,
+): Promise<{ status: number; body: Record<string, unknown> }> {
+  const notFound = { status: 404, body: { error: "item not found", code: "item_not_found" } };
+  const acknowledged = store.listAcknowledgedSources().find((entry) => entry.itemId === itemId);
+  let target: ServerAckTarget | null = null;
+  if (acknowledged) {
+    if (!store.requiresServerAuthorizedAck(acknowledged)) return notFound;
+    target = {
+      itemId: acknowledged.itemId,
+      appId: acknowledged.appId,
+      notificationClass: acknowledged.notificationClass,
+      sourceRef: acknowledged.sourceRef,
+    };
+  } else if (rawSource && typeof rawSource === "object" && !Array.isArray(rawSource)) {
+    const source = rawSource as { appId?: unknown; notificationClass?: unknown; sourceRef?: unknown };
+    if (typeof source.appId !== "string" || typeof source.notificationClass !== "string") return notFound;
+    const normalized = store.normalizeServerAckSource({
+      appId: source.appId,
+      notificationClass: source.notificationClass,
+      sourceRef: source.sourceRef,
+    });
+    if (!normalized || normalized.itemId !== itemId) {
+      return {
+        status: 400,
+        body: { error: "source is not an exact server-acknowledged app source for this itemId", code: "invalid_ack_source" },
+      };
+    }
+    target = normalized;
+  }
+  if (!target) return notFound;
+  const protectingSeal = store.findProtectingSeal(target);
+  if (protectingSeal) {
+    return {
+      status: 409,
+      body: {
+        error: `Inbox source ${target.sourceRef.id} is sealed by ${protectingSeal.owner} until ${protectingSeal.until}; unseal it explicitly before acknowledging`,
+        code: "item_sealed",
+      },
+    };
+  }
+  const result = await postServerAppSourceAck(registration, store, headers, target, randomUUID());
+  if (result.kind === "failed") {
+    if (result.authoritative && acknowledged) store.markAcknowledgedSourceServerAck(acknowledged, "refused");
+    return result.response;
+  }
+  if (!result.accepted) return INVALID_APP_SOURCE_ACK_RESPONSE;
+  if (acknowledged) store.markAcknowledgedSourceServerAck(acknowledged, "accepted");
+  return {
+    status: result.status,
+    body: {
+      ...result.json,
+      itemId: target.itemId,
+      remaining_app_items: store.list().length,
+    },
+  };
+}
+
+/** `reminder cccccccc-… revision 1`: the item as its source names it, for agent-facing errors. */
+function describeAppInboxItemForAgent(item: { sourceRef: AgentInboxSourceRef }): string {
+  const { kind, id, revision } = item.sourceRef;
+  return revision === undefined ? `${kind} ${id}` : `${kind} ${id} revision ${revision}`;
 }
 
 function localAgentApiInboxSealResponse(
@@ -1899,6 +2561,61 @@ function recordFreshnessDecision(
 }
 
 const MESSAGE_SEND_V2_PATH = "/internal/agent-api/v2/send";
+const TASK_REPLY_PATH = "/internal/agent-api/tasks/reply";
+/**
+ * RFC 081 `raft inbox read` (agentApiContract `inboxRead`): a destructive read.
+ * What its page printed is consumed on the Server, so the daemon drops the same
+ * messages from its local queue (consumeVisibleResponse) and never retries it.
+ */
+export const INBOX_READ_PATH = "/internal/agent-api/inbox/read";
+/** `inbox read` kinds whose page the Server records as given out; a reminder's read consumes nothing. */
+const INBOX_READ_CONSUMING_KINDS: ReadonlySet<string> = new Set(["conversation", "app", "app_fallback", "event"]);
+
+/**
+ * A message the Server accepted on a send or task reply route (2xx, `sent`
+ * or `committed`, with its id) goes to `recordMessageCommitted`. Bookkeeping
+ * only: whatever it throws is dropped, the agent gets the response as is.
+ */
+function noteCommittedMessage(registration: ProxyRegistration, pathname: string, status: number, responseText: string): void {
+  const record = registration.recordMessageCommitted ?? registration.inboxCoordinator?.recordMessageCommitted;
+  if (!record || status < 200 || status >= 300) return;
+  const route = isAgentApiSendPath(pathname) ? "send" : pathname === TASK_REPLY_PATH ? "task_reply" : null;
+  if (!route) return;
+  try {
+    const parsed = JSON.parse(responseText) as { state?: unknown; messageId?: unknown } | null;
+    if (!parsed || (parsed.state !== "sent" && parsed.state !== "committed")) return;
+    if (typeof parsed.messageId !== "string" || parsed.messageId.length === 0) return;
+    record({ messageId: parsed.messageId, route });
+  } catch {
+    // not JSON, or the recorder failed: nothing to index
+  }
+}
+
+/** What the Server said about a forwarded message send (`recordSendOutcome`); null for another route or answer. */
+function sendOutcomeOf(
+  pathname: string,
+  parsed: { state?: unknown; messageId?: unknown } | null,
+): Parameters<NonNullable<AgentProxyInboxCoordinator["recordSendOutcome"]>>[0] | null {
+  if (!parsed || !isAgentApiSendPath(pathname)) return null;
+  if (parsed.state === "sent") return { state: "sent", ...(typeof parsed.messageId === "string" ? { messageId: parsed.messageId } : {}) };
+  if (parsed.state === "held") return { state: "held" };
+  return null;
+}
+
+/**
+ * A launch with no coordinator (the OAR host) hears of its sends as one with
+ * a coordinator does (`consumeVisibleResponse`). Bookkeeping only: whatever it
+ * throws is dropped, the agent gets the response as is.
+ */
+function noteSendOutcomeWithoutCoordinator(registration: ProxyRegistration, pathname: string, responseText: string): void {
+  if (!registration.recordSendOutcome) return;
+  try {
+    const outcome = sendOutcomeOf(pathname, JSON.parse(responseText) as { state?: unknown; messageId?: unknown } | null);
+    if (outcome) registration.recordSendOutcome(outcome);
+  } catch {
+    // not JSON, or the recorder failed: nothing to count
+  }
+}
 
 /** Both message send routes; v1 and v2 share the request and response shape. */
 function isAgentApiSendPath(pathname: string): boolean {
@@ -1911,23 +2628,31 @@ export function __agentApiSideEffectActionForTest(pathname: string): AgentProxyF
   return agentApiSideEffectAction(pathname);
 }
 
-/** A task write the Server can hold for freshness (glimpse G2): claim, status update, amend. */
+/** A task write the Server can hold for freshness (agentWriteLanding.ts). */
 function isAgentApiTaskWritePath(pathname: string): boolean {
   const action = agentApiSideEffectAction(pathname);
   return action !== undefined && action !== "send";
 }
 
 function agentApiSideEffectAction(pathname: string): AgentProxyFreshnessAction | undefined {
-  if (pathname === "/internal/agent-api/send") return "send";
-  if (pathname === "/internal/agent-api/tasks/claim") return "task_claim";
-  if (pathname === "/internal/agent-api/tasks/update-status") return "task_update";
-  if (pathname === "/internal/agent-api/tasks/amend") return "task_amend";
-  return undefined;
+  // POST only (the caller checks): a GET of `/tasks` is the task list.
+  return agentGatedWriteForPath(pathname);
 }
 
-function sideEffectTarget(action: AgentProxyFreshnessAction, body: Record<string, unknown>): string | undefined {
-  const field = action === "send" ? body.target : body.channel;
-  return typeof field === "string" && field.length > 0 ? field : undefined;
+/** The conversation a gated write's result lands in: the target its model-seen boundary is attested for. */
+function sideEffectTarget(
+  action: AgentProxyFreshnessAction,
+  body: Record<string, unknown>,
+  coordinator: AgentProxyInboxCoordinator | undefined,
+): string | undefined {
+  const landing = agentWriteLandingTarget(action, body);
+  if (action !== "task_create" || !landing || !coordinator?.getThreadTargetOfMessage) return landing;
+  // A create from a reply in a thread hangs under the thread's root, so the
+  // Server checks that thread: attest what the model has seen of it, not of
+  // the never-existing thread named after the reply (`#ch:<reply short>`).
+  const source = agentWriteSourceMessageId(body);
+  const parentTarget = landing.slice(0, landing.lastIndexOf(":"));
+  return (source && coordinator.getThreadTargetOfMessage({ parentTarget, messageId: source })) || landing;
 }
 
 async function loadRecentTargetMessages(
@@ -1991,6 +2716,30 @@ function mergeDaemonExactSeenSeqs(body: Record<string, unknown>, daemonSeqs: rea
     .slice(-MAX_FORWARDED_EXACT_SEEN_SEQS);
 }
 
+/**
+ * Whether the connected Server checks task writes by landing
+ * (SERVER_CAPABILITY_TASK_WRITE_LANDING_V1, from `machine:context`). Until it
+ * says so a task write attests nothing: an older Server would compare a
+ * task-conversation boundary with the board and hold nearly every write.
+ */
+let serverChecksTaskWriteLanding = false;
+
+export function setAgentProxyServerChecksTaskWriteLanding(capable: boolean): void {
+  serverChecksTaskWriteLanding = capable;
+}
+
+/**
+ * A forwarded task write names the landing its boundary is for (`seenFor`), so
+ * the Server never reads it against another conversation. A conversation the
+ * model never read attests 0, not nothing: an unattested write is not checked,
+ * and a reply may land between this preflight and the Server's check.
+ */
+function attestTaskWriteLanding(action: AgentProxyFreshnessAction, body: Record<string, unknown>): void {
+  if (action === "send") return;
+  if (body.seenUpToSeq === undefined && !Array.isArray(body.seenExactSeqs)) body.seenUpToSeq = 0;
+  body.seenFor = AGENT_GATED_WRITES[action].landing;
+}
+
 async function prepareAgentApiSideEffectForward(
   registration: ProxyRegistration,
   headers: Headers,
@@ -2002,6 +2751,8 @@ async function prepareAgentApiSideEffectForward(
     bodyText: string;
     target?: string;
     freshnessContextMode?: "inline" | "withheld";
+    /** A task write's identity (agentTaskWriteKey): the hold its response books covers only its rerun. */
+    taskWriteKey?: string;
     localResponse?: ApmHeldFreshnessEnvelopeBody<AgentProxyVisibleMessage>;
   }
 > {
@@ -2012,20 +2763,45 @@ async function prepareAgentApiSideEffectForward(
     return { bodyText: rawBody };
   }
 
-  const target = sideEffectTarget(action, body);
+  const target = sideEffectTarget(action, body, registration.inboxCoordinator);
   const freshnessContextMode = body.freshnessContextMode === "withheld"
     ? "withheld"
     : "inline";
+  if (action !== "send" && !serverChecksTaskWriteLanding) {
+    // An older Server reads any boundary on a task write against the board:
+    // send none, whoever set it (the SDK attests task writes by landing too).
+    delete body.seenUpToSeq;
+    delete body.seenExactSeqs;
+    delete body.seenFor;
+    return { bodyText: JSON.stringify(body), target, freshnessContextMode };
+  }
   const coordinator = registration.inboxCoordinator;
   if (!target || !coordinator) {
     return { bodyText: JSON.stringify(body), target, freshnessContextMode };
   }
-  const pending = coordinator.getPendingMessages(target);
   const existingBoundary = typeof body.seenUpToSeq === "number" && Number.isFinite(body.seenUpToSeq)
     ? Math.max(0, Math.floor(body.seenUpToSeq))
     : undefined;
+  if (action !== "send") {
+    // A task write is never held here: it carries what the model has seen of
+    // the conversation it lands in, and the Server decides (agentWriteLanding.ts),
+    // because only the Server knows which lines the agent caused itself and
+    // which messages count, and it attaches unseen ones instead of holding a
+    // status update. Held or attached context is booked from the response.
+    // The identical rerun of a held write also attests the span that hold
+    // showed: the Server holds a write once per catch-up (gateTaskWriteFreshness),
+    // and without it the rerun attested only the few messages shown.
+    const taskWriteKey = agentTaskWriteKey(action, body);
+    const heldSpan = coordinator.getHeldWriteSpan?.({ target, writeKey: taskWriteKey }) ?? 0;
+    const boundary = Math.max(existingBoundary ?? 0, coordinator.getBoundary(target) ?? 0, heldSpan);
+    if (boundary > 0) body.seenUpToSeq = boundary;
+    mergeDaemonExactSeenSeqs(body, coordinator.getExactSeenSeqs?.(target) ?? []);
+    attestTaskWriteLanding(action, body);
+    return { bodyText: JSON.stringify(body), target, freshnessContextMode, taskWriteKey };
+  }
+  const pending = coordinator.getPendingMessages(target);
 
-  const continueAnyway = action === "send" && body.continueAnyway === true;
+  const continueAnyway = body.continueAnyway === true;
   // A blind seat must not materialize target bodies merely to perform a
   // first-touch freshness preflight. Forward the metadata-only mode to the
   // server, whose freshness query can return the strict count-only hold.
@@ -2052,31 +2828,7 @@ async function prepareAgentApiSideEffectForward(
     mergeDaemonExactSeenSeqs(body, coordinator.getExactSeenSeqs?.(target) ?? []);
     return { bodyText: JSON.stringify(body), target, freshnessContextMode };
   }
-  // Glimpse G2-3: a task write has no --anyway, so its local hold is at most
-  // one per catch-up, as the Server's is. When the same write was held here
-  // within the window and the model has taken in what that hold showed, newer
-  // messages that reached the daemon meanwhile do not hold the rerun again:
-  // it is forwarded with the model-seen boundary (nothing newer consumed), and
-  // the Server's gate decides by the same rule. Reviewer isolation shows no
-  // messages, so there one hold lets the rerun through.
-  if (plan.localResponse && action !== "send") {
-    const holds = registration.taskWriteHolds ??= new Map();
-    const key = `${target}|${taskWriteKey(action, body)}`;
-    const last = holds.get(key);
-    const now = Date.now();
-    const boundary = coordinator.getBoundary(target) ?? 0;
-    if (last && now - last.at < TASK_WRITE_REHOLD_WINDOW_MS && (freshnessContextMode === "withheld" || boundary >= last.seenUpToSeq)) {
-      holds.delete(key);
-      if (boundary > 0) body.seenUpToSeq = Math.max(existingBoundary ?? 0, boundary);
-      mergeDaemonExactSeenSeqs(body, coordinator.getExactSeenSeqs?.(target) ?? []);
-      return { bodyText: JSON.stringify(body), target, freshnessContextMode };
-    }
-    const shown = (plan.localResponse as { seenUpToSeq?: unknown }).seenUpToSeq;
-    holds.set(key, { seenUpToSeq: typeof shown === "number" ? shown : 0, at: now });
-  }
   await applyAgentInboxStateMachineEffects(coordinator, plan.effects);
-  // Every gated write carries the model-seen boundary (glimpse G2-3): the
-  // Server holds a task write by it as it holds a send.
   if (typeof plan.forwardSeenUpToSeq === "number") body.seenUpToSeq = plan.forwardSeenUpToSeq;
   if (!plan.localResponse) mergeDaemonExactSeenSeqs(body, coordinator.getExactSeenSeqs?.(target) ?? []);
   return {
@@ -2087,14 +2839,43 @@ async function prepareAgentApiSideEffectForward(
   };
 }
 
+/**
+ * Routes that answer with a history window the model reads, each with the
+ * target its pages are booked under as seen (consumeVisibleResponse):
+ * `undefined` books each message by its own metadata, `null` books nothing.
+ * A route left out is never booked, so it never counts as read (task v2's
+ * `/tasks/read` once was).
+ */
+const AGENT_API_HISTORY_WINDOW_TARGETS = new Map<string, (targetUrl: URL, answerTarget: unknown) => string | null | undefined>([
+  ["/internal/agent-api/history", (targetUrl) => targetUrl.searchParams.get("channel") ?? undefined],
+  // `raft task read`: a window on a task's own conversation, whose messages a
+  // task write's evidence and the pending inbox both key by the task ref.
+  // Booked only under the ref the request asked for, and only when the
+  // Server's answer names it: the `channel` query is the board (`#proj`),
+  // and booking there would count task messages as the board's. A
+  // consume=false read books nothing.
+  ["/internal/agent-api/tasks/read", (targetUrl, answerTarget) => {
+    const ref = requestedTaskReadRef(targetUrl);
+    return ref && answerTarget === ref && targetUrl.searchParams.get("consume") !== "false" ? ref : null;
+  }],
+]);
+
+export function __agentApiBooksHistoryWindowForTest(pathname: string): boolean {
+  return AGENT_API_HISTORY_WINDOW_TARGETS.has(pathname);
+}
+
 function shouldBufferJsonResponse(upstream: Response, pathname: string, registration: ProxyRegistration): boolean {
-  if (!registration.inboxCoordinator) return false;
+  if (!registration.inboxCoordinator && !registration.recordMessageCommitted && !registration.recordSendOutcome) return false;
   const contentType = upstream.headers.get("content-type") ?? "";
   if (!contentType.includes("application/json")) return false;
+  if (!registration.inboxCoordinator) return isAgentApiSendPath(pathname) || pathname === TASK_REPLY_PATH;
   return isAgentApiSendPath(pathname) ||
     isAgentApiTaskWritePath(pathname) ||
+    // Read only for its message id (noteCommittedMessage).
+    (pathname === TASK_REPLY_PATH && Boolean(registration.inboxCoordinator.recordMessageCommitted)) ||
     pathname === "/internal/agent-api/events" ||
-    pathname === "/internal/agent-api/history" ||
+    pathname === INBOX_READ_PATH ||
+    AGENT_API_HISTORY_WINDOW_TARGETS.has(pathname) ||
     /^\/internal\/agent-api\/messages\/[^/]+\/resolve$/.test(pathname);
 }
 
@@ -2135,6 +2916,7 @@ async function consumeVisibleResponse(
   sendTarget: string | undefined,
   requestedFreshnessContextMode: "inline" | "withheld" | undefined,
   responseText: string,
+  taskWriteKey?: string,
 ): Promise<void> {
   const coordinator = registration.inboxCoordinator;
   if (!coordinator) return;
@@ -2148,17 +2930,17 @@ async function consumeVisibleResponse(
     freshnessContextMode?: "inline" | "withheld";
     events?: AgentProxyVisibleMessage[];
     messages?: AgentProxyVisibleMessage[];
+    target?: string;
+    unseen?: { messages?: AgentProxyVisibleMessage[]; omittedMessageCount?: number; seenUpToSeq?: number };
+    entries?: AgentProxyVisibleMessage[];
   };
   try {
     parsed = JSON.parse(responseText) as typeof parsed;
   } catch {
     return;
   }
-  if (isAgentApiSendPath(targetUrl.pathname) && (parsed.state === "sent" || parsed.state === "held")) {
-    coordinator.recordSendOutcome?.(parsed.state === "sent"
-      ? { state: "sent", ...(typeof parsed.messageId === "string" ? { messageId: parsed.messageId } : {}) }
-      : { state: "held" });
-  }
+  const sendOutcome = sendOutcomeOf(targetUrl.pathname, parsed);
+  if (sendOutcome) coordinator.recordSendOutcome?.(sendOutcome);
   if (
     (isAgentApiSendPath(targetUrl.pathname) || isAgentApiTaskWritePath(targetUrl.pathname))
     && parsed.state === "held"
@@ -2168,10 +2950,41 @@ async function consumeVisibleResponse(
   ) {
     // The Server's held context reaches the model with the response, so its
     // boundary is the model's: the identical rerun attests it and passes.
+    const resolvedTarget = serverResolvedThreadTarget(sendTarget, parsed.heldMessages);
     coordinator.consumeVisibleMessages({
-      target: serverResolvedThreadTarget(sendTarget, parsed.heldMessages),
+      target: resolvedTarget,
       messages: normalizeInboxVisibleMessages(parsed.heldMessages, sendTarget),
       boundarySeq: typeof parsed.seenUpToSeq === "number" ? parsed.seenUpToSeq : undefined,
+      source: "server_held_context",
+    });
+    // That consume is set-only (it never moves the model-seen boundary), so
+    // on its own a task write's rerun attested only the few messages shown
+    // and was held again for the rest. Book the whole span for this write's
+    // rerun only (the Server's write key, which names the write, not the
+    // landing), as the CLI books a held send's `seenUpToSeq` for its draft:
+    // under the landing it attested and the thread the Server resolved, since
+    // a create from a reply the hold just showed attests that thread on the
+    // rerun (sideEffectTarget).
+    if (isAgentApiTaskWritePath(targetUrl.pathname) && sendTarget && taskWriteKey && typeof parsed.seenUpToSeq === "number") {
+      for (const target of new Set([sendTarget, resolvedTarget ?? sendTarget])) {
+        coordinator.recordHeldWriteSpan?.({ target, writeKey: taskWriteKey, seenUpToSeq: parsed.seenUpToSeq });
+      }
+    }
+    return;
+  }
+  if (
+    isAgentApiTaskWritePath(targetUrl.pathname)
+    && requestedFreshnessContextMode !== "withheld"
+    && Array.isArray(parsed.unseen?.messages)
+  ) {
+    // An applied task write's attached context (agentWriteLanding.ts
+    // `attach`) reaches the model with the response, like a hold's. The
+    // boundary moves only when every counted message was attached.
+    const unseen = parsed.unseen!;
+    coordinator.consumeVisibleMessages({
+      target: sendTarget,
+      messages: normalizeInboxVisibleMessages(unseen.messages!, sendTarget),
+      boundarySeq: unseen.omittedMessageCount === 0 && typeof unseen.seenUpToSeq === "number" ? unseen.seenUpToSeq : undefined,
       source: "server_held_context",
     });
     return;
@@ -2204,14 +3017,60 @@ async function consumeVisibleResponse(
     });
     return;
   }
-  if (targetUrl.pathname === "/internal/agent-api/history" && Array.isArray(parsed.messages)) {
-    const target = targetUrl.searchParams.get("channel") ?? undefined;
+  // Only the kinds whose read the Server records as given out (conversation,
+  // app, app_fallback, a single event). Reading a reminder writes nothing
+  // there (`consumed` is always false; only its ack consumes it), and its
+  // entries carry the firing event's id: dropping them here would unqueue a
+  // reminder notice the agent has not acked (RFC 081 D13, Tenny #wg-ax:#19).
+  if (targetUrl.pathname === INBOX_READ_PATH && Array.isArray(parsed.entries) && INBOX_READ_CONSUMING_KINDS.has(String((parsed as { kind?: unknown }).kind))) {
+    // RFC 081 D1 / §7: what an `inbox read` page printed is consumed, so the
+    // same messages leave the local queue by id and seq and are not pushed
+    // again, as a `message read` page's are. Each entry is booked under the
+    // conversation its own Server metadata names, not under the target the
+    // agent typed: an alternate thread address, `~agent` or another letter
+    // case reaches the same queued messages. A conversation page's entries
+    // are history rows, which carry no channel name or type of their own:
+    // those come from the page's `target`, the Server's canonical one (never
+    // the typed one); an entry's own metadata still wins. Exact ids and seqs
+    // only, never a boundary: a page is not proof that older messages were read.
+    coordinator.consumeVisibleMessages({
+      messages: normalizeInboxVisibleMessages(
+        parsed.entries.filter((entry) => entry && typeof entry === "object"),
+        typeof parsed.target === "string" ? parsed.target : undefined,
+      ),
+      source: "agent_api_inbox_read",
+      responseBytes: Buffer.byteLength(responseText, "utf8"),
+    });
+    return;
+  }
+  const historyWindowTarget = AGENT_API_HISTORY_WINDOW_TARGETS.get(targetUrl.pathname);
+  if (historyWindowTarget && Array.isArray(parsed.messages)) {
+    // A history page counts as seen. `agent_api_history` books exact seqs and
+    // ids only and never moves a boundary, so a --before/--after page marks
+    // nothing it didn't return.
+    const target = historyWindowTarget(targetUrl, parsed.target);
+    if (target === null) return;
     const messages = normalizeInboxVisibleMessages(parsed.messages, target);
     const scope = agentApiHistoryConsumptionScopeSchema.safeParse(parsed.consumption_scope);
     const historyScope = scope.success && scope.data.agent_id === registration.agentId
       && scope.data.target === target ? scope.data : undefined;
-    coordinator.consumeVisibleMessages({ target, messages, boundarySeq: maxInboxMessageSeq(messages), source: "agent_api_history", ...(historyScope && { historyScope }) });
+    coordinator.consumeVisibleMessages({
+      target,
+      messages,
+      boundarySeq: maxInboxMessageSeq(messages),
+      source: "agent_api_history",
+      responseBytes: Buffer.byteLength(responseText, "utf8"),
+      ...(historyScope && { historyScope }),
+    });
   }
+}
+
+/** The task ref (`#proj:#7`, `dm:@peer:#7`) a `/tasks/read` request asked for. */
+function requestedTaskReadRef(targetUrl: URL): string | null {
+  const channel = targetUrl.searchParams.get("channel")?.trim();
+  const taskNumber = Number(targetUrl.searchParams.get("task_number"));
+  if (!channel || !Number.isInteger(taskNumber) || taskNumber <= 0) return null;
+  return formatAgentTaskRef(channel, taskNumber);
 }
 
 function reprojectReviewerIsolationResponse(
@@ -2255,6 +3114,164 @@ function reprojectReviewerIsolationResponse(
   }
 }
 
+/** RFC 081 inbox items on for this agent (its `AgentConfig.inboxItems`, read per request). */
+function inboxItemsOn(registration: ProxyRegistration): boolean {
+  return registration.inboxItems?.() === true;
+}
+
+/**
+ * What this daemon build does, added to the caller's own
+ * `X-Raft-Client-Capabilities` (the CLI's tokens pass through; the CLI never
+ * declares these). `reminder-server-ack@1` is unconditional: reminders are
+ * acked through the Server, which this build always does. `proc@1` only while
+ * this daemon runs jobs (`setAgentProcJobManager`; not on Windows in v1).
+ */
+function appendDaemonClientCapabilities(headers: Headers): void {
+  const declared = (headers.get(RAFT_CLIENT_CAPABILITIES_HEADER) ?? "")
+    .split(",")
+    .map((value) => value.trim())
+    .filter((value) => value.length > 0);
+  if (!declared.includes(REMINDER_SERVER_ACK_CAPABILITY)) declared.push(REMINDER_SERVER_ACK_CAPABILITY);
+  for (const capability of daemonRunCapabilities()) {
+    if (!declared.includes(capability)) declared.push(capability);
+  }
+  headers.set(RAFT_CLIENT_CAPABILITIES_HEADER, declared.join(","));
+}
+
+function setOrDeleteHeader(headers: Headers, name: string, value: string | null): void {
+  if (value) headers.set(name, value);
+  else headers.delete(name);
+}
+
+/** The agent's newest live launch registration (registrations keep insertion order), or null when none is live. */
+function latestRegistrationForAgent(agentId: string): ProxyRegistration | null {
+  let latest: ProxyRegistration | null = null;
+  for (const registration of registrations.values()) {
+    if (registration.agentId === agentId) latest = registration;
+  }
+  return latest;
+}
+
+function writeLocalProxyRefusal(res: http.ServerResponse, refusal: LocalProxyRefusal): void {
+  res.writeHead(refusal.status, { "content-type": "application/json" });
+  res.end(JSON.stringify(refusal.body));
+}
+
+/**
+ * A request the daemon itself makes to the Agent API as the agent (the idle
+ * task reminder), with the agent's newest runner credential: the one its CLI
+ * requests go out with, so the Server authorizes it exactly as the agent. Null
+ * when no live launch of the agent has one (a legacy-token launch, a stopped
+ * agent): nothing is sent.
+ */
+export async function fetchAgentApiAsAgent(
+  agentId: string,
+  pathname: string,
+  init: { method: "POST"; body: unknown; signal?: AbortSignal },
+): Promise<Response | null> {
+  const latest = latestRegistrationForAgent(agentId);
+  if (!latest) return null;
+  return daemonFetch(new URL(pathname, latest.serverUrl), {
+    method: init.method,
+    headers: daemonAsAgentHeaders(latest),
+    body: JSON.stringify(init.body),
+    ...(init.signal ? { signal: init.signal } : {}),
+  }, process.env, { isolationKey: AGENT_CREDENTIAL_PROXY_FETCH_ISOLATION_KEY });
+}
+
+/** Headers for a request the daemon itself makes to the Agent API as the agent. */
+function daemonAsAgentHeaders(registration: ProxyRegistration): Headers {
+  const headers = new Headers({
+    Authorization: `Bearer ${registration.apiKey}`,
+    "Content-Type": "application/json",
+    "X-Agent-Id": registration.agentId,
+    "X-Raft-Client": "daemon",
+    "X-Slock-Agent-Active-Capabilities": registration.activeCapabilities,
+  });
+  if (registration.launchId) headers.set("X-Agent-Launch-Id", registration.launchId);
+  appendDaemonClientCapabilities(headers);
+  setOrDeleteHeader(headers, RAFT_COMPUTER_VERSION_HEADER, registration.computerVersion);
+  setOrDeleteHeader(headers, RAFT_DAEMON_VERSION_HEADER, registration.daemonVersion);
+  setOrDeleteHeader(headers, RAFT_RUNTIME_HEADER, registration.runtime);
+  return headers;
+}
+
+/** Acks one backfill batch sends at most. */
+const SERVER_ACK_BACKFILL_LIMIT_PER_RUN = 100;
+/**
+ * Batches one run sends before leaving the rest for the next start (10,000
+ * acks): a store with more than that is not drained in one launch.
+ */
+const SERVER_ACK_BACKFILL_MAX_BATCHES_PER_RUN = 100;
+/** Pause between batches, so a long backlog is not one burst at the Server. */
+const SERVER_ACK_BACKFILL_BATCH_PAUSE_MS = 200;
+/** Stores with a backfill run in flight (one per store at a time). */
+const serverAckBackfillsInFlight = new WeakSet<AgentAppInboxStore>();
+
+/**
+ * #wg-ax:#17: a daemon before REMINDER_SERVER_ACK_CAPABILITY acked a fired
+ * reminder only in its own store, so the Server still lists it as fired and
+ * not acked. Once per agent store, on the agent's first start under a build
+ * that declares the token, send the Server an ack (idempotent there) for each
+ * such source. Accepted or authoritatively refused (the Server holds nothing
+ * to ack) settles a source; a transient failure leaves it for the next start.
+ * Done (durable) only when none is left. Bounded per run; one run per store
+ * at a time; a trace event carries the counts.
+ */
+async function runServerAckBackfill(registration: ProxyRegistration, store: AgentAppInboxStore): Promise<void> {
+  if (serverAckBackfillsInFlight.has(store)) return;
+  serverAckBackfillsInFlight.add(store);
+  try {
+    if (store.serverAckBackfillDone() === REMINDER_SERVER_ACK_CAPABILITY) return;
+    // Batch after batch until none is left, not one batch per start: an
+    // agent with a long local-only history (an hourly reminder at revision
+    // 349) otherwise kept listing old fires for several starts after the
+    // upgrade (#proj-raft-computer:27e207f5, Remy). A batch with a transient
+    // failure ends the run: those sources stay pending, so another batch
+    // would only resend them; the next start retries.
+    let attempted = 0;
+    let accepted = 0;
+    let refused = 0;
+    let failed = 0;
+    for (let batch = 0; batch < SERVER_ACK_BACKFILL_MAX_BATCHES_PER_RUN; batch += 1) {
+      // Pause before listing, so an ack the agent makes live meanwhile is
+      // already settled when the next batch is listed and not posted twice.
+      if (batch > 0) await new Promise((resolve) => setTimeout(resolve, SERVER_ACK_BACKFILL_BATCH_PAUSE_MS));
+      const pending = store.listServerAckBackfillPending(SERVER_ACK_BACKFILL_LIMIT_PER_RUN);
+      if (pending.length === 0) break;
+      let batchFailed = 0;
+      for (const source of pending) {
+        attempted += 1;
+        const result = await postServerAppSourceAck(registration, store, daemonAsAgentHeaders(registration), {
+          itemId: source.itemId,
+          appId: source.appId,
+          notificationClass: source.notificationClass,
+          sourceRef: source.sourceRef,
+        }, randomUUID());
+        if (result.kind === "accepted" && result.accepted) {
+          store.markAcknowledgedSourceServerAck(source, "accepted");
+          accepted += 1;
+        } else if (result.kind === "failed" && result.authoritative) {
+          store.markAcknowledgedSourceServerAck(source, "refused");
+          refused += 1;
+        } else {
+          batchFailed += 1;
+        }
+      }
+      failed += batchFailed;
+      if (batchFailed > 0) break;
+    }
+    const remaining = store.listServerAckBackfillPending(SERVER_ACK_BACKFILL_LIMIT_PER_RUN).length;
+    const done = remaining === 0;
+    if (done) store.markServerAckBackfillDone(REMINDER_SERVER_ACK_CAPABILITY);
+    store.traceServerAckBackfill({ attempted, accepted, refused, failed, remaining, done });
+  } catch (err) {
+    logger.warn(`[AgentCredentialProxy] reminder server-ack backfill failed (agent=${registration.agentId}): ${errorClassOf(err)}`);
+  } finally {
+    serverAckBackfillsInFlight.delete(store);
+  }
+}
+
 export async function registerAgentCredentialProxy(input: {
   agentId: string;
   launchId?: string | null;
@@ -2262,29 +3279,50 @@ export async function registerAgentCredentialProxy(input: {
   apiKey: string;
   activeCapabilities: string;
   inboxCoordinator?: AgentProxyInboxCoordinator;
+  recordMessageCommitted?: AgentProxyInboxCoordinator["recordMessageCommitted"];
+  recordSendOutcome?: AgentProxyInboxCoordinator["recordSendOutcome"];
   appInbox?: AgentAppInboxStore;
   tracer?: Tracer;
   daemonVersion?: string | null;
   computerVersion?: string | null;
+  runtime?: string | null;
+  inboxItems?: () => boolean;
+  /** The agent's stable entry wrapper this launch writes (cliTransport.ts). */
+  stableEntryPath?: string | null;
 }): Promise<ProxyHandle> {
   const server = await ensureServer();
   const proxyToken = `sap_${randomBytes(32).toString("base64url")}`;
-  registrations.set(proxyToken, {
+  const registration: ProxyRegistration = {
     serverUrl: input.serverUrl,
     apiKey: input.apiKey,
     agentId: input.agentId,
     launchId: input.launchId ?? null,
     activeCapabilities: input.activeCapabilities,
     inboxCoordinator: input.inboxCoordinator,
+    recordMessageCommitted: input.recordMessageCommitted,
+    recordSendOutcome: input.recordSendOutcome,
     appInbox: input.appInbox,
     tracer: input.tracer ?? noopTracer,
     daemonVersion: input.daemonVersion?.trim() || null,
     computerVersion: input.computerVersion?.trim() || null,
-  });
+    runtime: input.runtime?.trim() || null,
+    ...(input.inboxItems ? { inboxItems: input.inboxItems } : {}),
+    stableEntryPath: input.stableEntryPath ?? null,
+  };
+  registrations.set(proxyToken, registration);
   return {
     proxyUrl: server.proxyUrl,
     proxyToken,
+    ...(input.appInbox ? { serverAckBackfill: runServerAckBackfill(registration, input.appInbox) } : {}),
   };
+}
+
+function retireRegistration(token: string, registration: ProxyRegistration): void {
+  rememberRetiredLaunch(token, {
+    agentId: registration.agentId,
+    launchId: registration.launchId,
+    stableEntryPath: registration.stableEntryPath,
+  });
 }
 
 export function unregisterAgentCredentialProxyForLaunch(input: {
@@ -2297,6 +3335,7 @@ export function unregisterAgentCredentialProxyForLaunch(input: {
     if (registration.agentId === input.agentId && registration.launchId === launchId) {
       clearThirdPartyLeases(registration);
       registrations.delete(token);
+      retireRegistration(token, registration);
       removed += 1;
     }
   }
@@ -2309,6 +3348,7 @@ export function unregisterAgentCredentialProxiesForAgent(agentId: string): numbe
     if (registration.agentId !== agentId) continue;
     clearThirdPartyLeases(registration);
     registrations.delete(token);
+    retireRegistration(token, registration);
     removed += 1;
   }
   return removed;

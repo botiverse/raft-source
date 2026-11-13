@@ -52,6 +52,9 @@ export type StableFieldProps = LabelMarker & {
   error?: ReactNode;
   /** Persistent right-aligned auxiliary text (e.g. a character counter). */
   counter?: ReactNode;
+  /** `false`: with nothing to say, the message row takes no space. For a field
+   *  that never has a message and no neighbour whose height it must match. */
+  reserveMessage?: boolean;
   /** Small control rendered beside the label (e.g. a rescan action). */
   labelAccessory?: ReactNode;
   /** Composite fields (a repeating list of rows, say) have no single
@@ -72,6 +75,10 @@ export type StableFieldProps = LabelMarker & {
    *  They must not go through `FieldControl`, which adopts exactly one
    *  interactive control. */
   belowControl?: ReactNode;
+  /** Nodes rendered after the message row, last in the field: a notice about
+   *  the chosen value (a runtime's sign-in notice) reads after the field's own
+   *  description, not between the control and it. */
+  belowDescription?: ReactNode;
   htmlFor?: string;
   className?: string;
   children: ReactNode;
@@ -115,7 +122,7 @@ export function FieldSelectTrigger({ children, ...props }: React.ComponentProps<
 }
 
 export default function StableField({
-  label, required, optional, hint, error, counter, labelAccessory, belowControl, adopt = true, layout = "stacked", htmlFor, className, children,
+  label, required, optional, hint, error, counter, reserveMessage = true, labelAccessory, belowControl, belowDescription, adopt = true, layout = "stacked", htmlFor, className, children,
 }: StableFieldProps) {
 
   // Exactly one interactive control per field, or fail closed. `Children.toArray`
@@ -300,7 +307,14 @@ export default function StableField({
       {/* A plain element, deliberately not `FieldDescription` — see `messageId`
           above. `data-slot="field-description"` is kept so the slot still names
           what this row is for anything selecting on it. */}
-      <div id={messageId} data-slot="field-description" className="text-caption">
+      {/* With nothing to say, the reserved row gives way to a notice below it:
+          the notice holds the space instead, so an empty line does not sit
+          between the control and the notice. The id stays for aria. */}
+      <div
+        id={messageId}
+        data-slot="field-description"
+        className={`text-caption ${message || counter ? "" : reserveMessage ? "[&:has(+[data-slot=field-below-description]:not(:empty))]:hidden" : "hidden"}`}
+      >
         {/* One line reserved, not two. Per cindyz: reserve a single line and let
             the dialog grow when a message genuinely wraps, rather than paying two
             lines of empty space on every field to keep the height pinned. */}
@@ -318,6 +332,12 @@ export default function StableField({
           ) : null}
         </span>
       </div>
+      {/* `empty:hidden`: a notice that renders nothing leaves no box behind.
+          The bottom padding stands in for the reserved row it replaced, so the
+          next field keeps its distance. */}
+      {belowDescription !== undefined ? (
+        <div data-slot="field-below-description" className="pb-4 empty:hidden">{belowDescription}</div>
+      ) : null}
       </FieldMessageContext.Provider>
     </Field>
   );

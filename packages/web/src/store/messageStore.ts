@@ -1,31 +1,45 @@
+import { isAxiosError } from "axios";
+import { isAutoReadHeld } from "./autoReadHold";
 import { useProfileStore } from "./profileStore";
 import { create } from "zustand";
 import { isThreadMaximized, useUIStore } from "./uiStore";
+import { clearHiddenHistory, clearHiddenTarget, readHistoryLimitedError, recordHiddenHistory, recordHiddenTarget } from "./hiddenHistoryStore";
 import type {
   ActionCardMetadata,
+  ArtifactReference,
   CanonicalReactionFact,
   ExternalMessageAuthorProjection,
   LegacyReactionRosterDto,
 } from "@botiverse/raft-shared";
-import { clearClockTimeout, setClockTimeout } from "@botiverse/raft-shared";
+import { ACTIVE_INPUT_WINDOW_MS, resolveMarkUnreadOutcome } from "@botiverse/raft-shared";
+import { isOlderCardRevision, messageCardRevision } from "./messageCardRevision";
+import { flushPendingDraftSnapshot, loadDrafts, loadDraftTimes, onDraftsForgotten, persistDraftSnapshotImmediately, scheduleDraftSnapshot } from "./draftStorage";
 import api from "../api/client";
-import { getWithRwOverloadRetry } from "../api/overloadRetry";
+import { getRwRead } from "../api/overloadRetry";
+import { saveLastCounts } from "./lastCounts";
 import { detectBrowserTimezone } from "../utils/timeFormatting";
-import { useServerStore } from "./serverStore";
+import { emitStateTransitionTrace } from "../utils/stateTransitionTrace";
+import { isCurrentServerConfirmed, onCurrentServerConfirmed, useServerStore } from "./serverStore";
 import { useThreadStore } from "./threadStore";
+import { consumeManualUnread, forgetManualUnread, rememberManualUnread, shouldSkipInitialAutoRead } from "./manualUnreadSkip";
+import { forgetSkippedSeenRead, noteSkippedSeenRead, runSeenReadCatchUp } from "./seenReadCatchUp";
 import type { ThreadSummary } from "./threadStore";
 import { setCurrentPrincipalId } from "./principalRuntime";
+import { noteOutlineMessage } from "./messageOutlineStore";
+import { coerceWireMessageSeq, coerceWireMessageSeqs } from "./wireMessageSeq";
 import {
   captureReceiverPrivateIngressContext,
   captureHumanActivityIngressContext,
   invalidateReceiverPrivateIngressContexts,
   isReceiverPrivateIngressContextCurrent,
+  isReadForAnotherPersonHere,
   registerReceiverPrivatePrincipalReader,
 } from "./receiverPrivateIngress";
 import type {
   ReceiverPrivateIngressContext,
 } from "./receiverPrivateIngress";
 import { hydrateThreadRepliesSnapshotWithSyncCore } from "./threadRepliesSyncDomain";
+import { latestPageRequest, messageWindowRequest, takeInFlightMessagePage, takeMessagePage, withLiveRowsAfter } from "./messagePagePrefetch";
 import type { ThreadRepliesScope } from "./threadRepliesReadModel";
 import { registerServerReset } from "./serverResetRegistry";
 import { reactionReadModelStore } from "./reactionReadModels";
@@ -42,6 +56,21 @@ import {
 import type {
   ReadStateProjection,
 } from "./readStateSync";
+import { clearMarkedUnreadForRead } from "./markedUnreadStore";
+import { isChannelAccessLost, noteChannelReadError } from "./channelAccessLoss";
+import { gapSyncWaitsForShow } from "./hiddenOwedReads";
+import {
+  channelOwesGapFill,
+  clearPendingGapMessages,
+  finishGapRead,
+  getGapFillSinceSeq,
+  getPendingGapMessages,
+  joinGapReadInFlight,
+  rememberPendingGapMessage,
+  setGapFillReader,
+  settlePendingGapMessages,
+  startGapRead,
+} from "./liveGapFill";
 
 export interface MessageAttachment {
   id: string;
@@ -55,6 +84,12 @@ export interface MessageAttachment {
   localPreviewUrl?: string | null;
   /** Scoped attachment-comment count (attachment-comments MVP §5 chip badge). */
   commentCount?: number;
+  /**
+   * The Artifact this attachment was saved as, for this viewer (workspace
+   * Artifacts S5). Set only by the fake data source's stand-in: the server
+   * never puts it on a message (the app asks `attachmentSaves`).
+   */
+  savedAsArtifact?: ArtifactReference | null;
 }
 
 /** Present when a message is a scoped attachment comment (MVP §5 `re:` chip). */
@@ -118,7 +153,8 @@ export interface PendingMentionAction {
 export interface MessageDeliveryWarning {
   targetType: "agent";
   targetId: string;
-  reason: "agent_stopped";
+  /** `agent_stuck_on_tool` (task #25): queued behind a tool call the agent is stuck on. */
+  reason: "agent_stopped" | "agent_stuck_on_tool";
 }
 
 export interface SendMessageResult {
@@ -129,10 +165,13 @@ export interface SendMessageResult {
 }
 
 export interface ConversationContext {
-  channelType: "channel" | "private" | "joint" | "dm" | "thread";
+  /** `task`: a task's own conversation (task v2), which has no parent message. */
+  channelType: "channel" | "private" | "joint" | "dm" | "thread" | "task";
   parentMessageId?: string;
   parentChannelId?: string;
   parentChannelType?: "channel" | "private" | "joint" | "dm";
+  /** Task v2: the task a task-conversation message belongs to. */
+  taskId?: string;
 }
 
 export interface Message {
@@ -171,6 +210,13 @@ export interface Message {
    */
   threadId?: string | null;
   createdAt: string;
+  updatedAt?: string;
+  /**
+   * RFC 077: ISO time the owner retracted this delegated message, else null
+   * (canonical manifest v7 optional aggregate). Web reads it through
+   * `isRetractedMessage` (components/message/delegatedMessage.ts).
+   */
+  deletedAt?: string | null;
   attachments?: MessageAttachment[];
   reactions?: MessageReaction[];
   /** Set when this message is a scoped attachment comment (MVP §5). */
@@ -202,30 +248,6 @@ export {
   isReceiverPrivateIngressContextCurrent,
 };
 export type { ReceiverPrivateIngressContext };
-
-/**
- * `messages.seq` is an int8. A server path that leaks the raw driver value
- * (GET /messages/sync did) serializes it as a JSON string, and a string seq
- * breaks every numeric consumer: ThreadPanel's window merge drops rows whose
- * seq is not a number, `seq === cursor + 1` never matches, and `+ 1` on a
- * string concatenates. Coerce once at ingest so the store only holds numbers.
- */
-export function coerceWireMessageSeq<T extends { seq?: unknown }>(message: T): T {
-  const seq = message.seq;
-  if (typeof seq !== "string") return message;
-  const numeric = Number(seq);
-  return { ...message, seq: Number.isFinite(numeric) ? numeric : undefined };
-}
-
-export function coerceWireMessageSeqs<T extends { seq?: unknown }>(messages: readonly T[]): T[] {
-  let changed = false;
-  const next = messages.map((message) => {
-    const coerced = coerceWireMessageSeq(message);
-    if (coerced !== message) changed = true;
-    return coerced;
-  });
-  return changed ? next : (messages as T[]);
-}
 
 function coerceCurrentReceiverPrivateMessages(
   rawMessages: readonly Message[],
@@ -277,7 +299,8 @@ function isSyncCoreCompatThreadSummary(
     ));
 }
 
-function hydrateBundledThreadSummaries(
+/** Fold the thread summaries a messages response bundles into the thread store (every messages read does this). */
+export function hydrateBundledThreadSummaries(
   data: MessagesPageThreadSummaryPayload,
   ingressContext: ReceiverPrivateIngressContext,
 ): void {
@@ -362,10 +385,33 @@ interface CanonicalThreadTarget {
 export interface MessageState {
   channelMessages: Record<string, Message[]>;
   channelWindowMeta: Record<string, ChannelWindowMeta>;
+  /** Channels whose `channelMessages` list was filled by a history read
+   * (latest page or a message's context window). A list made only of live
+   * rows (`message:new`, `sync:resume`) that arrived while the channel was
+   * closed is not the channel: opening it must fetch, never show it as-is. */
+  historyFetchedChannels: Record<string, true>;
   messages: Message[];
   highlightedMessageId: string | null;
+  /** Bumped on every jump, so a second jump to the same message restarts its
+   * located highlight (useLocated). */
+  highlightNonce: number;
+  /** A jump found nothing (not there, or not for this reader): the toast that
+   * says so is owed once, then taken, so a remount or a language switch does
+   * not show it again. */
+  pendingNotFoundToast: boolean;
   transientFocusRequest: { channelId: string; messageId: string; nonce: number } | null;
   lastSeq: number;
+  /** The server's commit horizon (xid8, decimal string) from the last global
+   * catch-up, or from `sync:horizon` at connect. Sent back as `sinceHorizon`
+   * so a message that took a lower seq but committed after that catch-up is
+   * still delivered. Null until the server has given one.
+   *
+   * Invariant (Tenny): the horizon held here must have been computed before
+   * every later read that raises `lastSeq`. The starting horizon guarantees it
+   * by arriving before the first history request (otherwise it is dropped);
+   * each `sync:resume` response's horizon predates the loads after it. A
+   * scoped read (one channel) never replaces it. */
+  syncHorizon: string | null;
   currentChannelId: string | null;
   loading: boolean;
   loadingOlder: boolean;
@@ -385,10 +431,14 @@ export interface MessageState {
   newFlags: Record<string, boolean>;
   currentUserId: string | null;
   drafts: Record<string, string>;
+  /** When each draft was last edited (epoch ms); a draft from before times were kept has none. */
+  draftUpdatedAt: Record<string, number>;
   historyLimited: boolean;
   isNearBottom: boolean;
   loadMessages: (channelId: string, requestGeneration?: number) => Promise<void>;
   loadOlderMessages: (channelId?: string) => Promise<void>;
+  /** The plan stopped cutting history (an upgrade): the top of a cut channel opens again and its older messages load. */
+  reopenHistoryWindow: (channelId: string) => void;
   loadNewerMessages: (channelId?: string) => Promise<void>;
   loadUnreadCounts: () => Promise<void>;
   addMessage: (message: Message, source?: "receiver-private" | "channel-room") => void;
@@ -411,6 +461,8 @@ export interface MessageState {
   // attendant scroll-to-center side-effect, so the timeline can land at the
   // anchor itself via persistKey memory.
   loadMessageWindowSilent: (channelId: string, messageId: string) => Promise<void>;
+  /** A jump's target is behind the history window: the first messages the window shows after it, under the paywall. */
+  loadWindowAfterHiddenTarget: (channelId: string, targetSeq: number, requestGeneration: number) => Promise<void>;
   syncGap: (channelId?: string, options?: { sinceSeq?: number }) => Promise<void>;
   setCurrentChannelId: (channelId: string | null) => void;
   setCurrentUserId: (userId: string | null) => void;
@@ -430,136 +482,19 @@ export interface MessageState {
   clearDraft: (channelId: string) => void;
 }
 
-export const DRAFTS_STORAGE_KEY = "slock_drafts";
-// Draft edits are kept synchronous in Zustand, while durable storage is
-// coalesced. The maxWait is deliberately independent of the debounce timer:
-// mobile browsers are not guaranteed to deliver a lifecycle event before a
-// process is killed.
-export const DRAFT_PERSISTENCE_DEBOUNCE_MS = 250;
-export const DRAFT_PERSISTENCE_MAX_WAIT_MS = 3_000;
-const MANUAL_UNREAD_SKIP_STORAGE_KEY = "slock_manual_unread_skip";
+export {
+  DRAFT_PERSISTENCE_DEBOUNCE_MS,
+  DRAFT_PERSISTENCE_MAX_WAIT_MS,
+  draftsStorageKey,
+  LEGACY_DRAFTS_STORAGE_KEY,
+} from "./draftStorage";
 const PENDING_READ_SEQS_STORAGE_KEY = "slock_pending_read_seqs";
 const LOCAL_READ_SUPPRESSION_TTL_MS = 30_000;
-const LIVE_APPEND_AUTO_READ_ACTIVITY_WINDOW_MS = 1_000;
 const OPTIMISTIC_MATCH_CREATED_AT_WINDOW_MS = 5 * 60 * 1000;
-const pendingGapMessages = new Map<string, Message[]>();
 
 export interface LocalReadSuppression {
   seq: number;
   expiresAt: number;
-}
-
-function loadDraftsFromStorage(): Record<string, string> {
-  try {
-    const raw = localStorage.getItem(DRAFTS_STORAGE_KEY);
-    return raw ? JSON.parse(raw) : {};
-  } catch {
-    return {};
-  }
-}
-
-function saveDraftsToStorage(drafts: Record<string, string>) {
-  try {
-    if (Object.keys(drafts).length === 0) {
-      localStorage.removeItem(DRAFTS_STORAGE_KEY);
-    } else {
-      localStorage.setItem(DRAFTS_STORAGE_KEY, JSON.stringify(drafts));
-    }
-  } catch {
-    // ignore quota errors
-  }
-}
-
-let pendingDraftSnapshot: Record<string, string> | null = null;
-let draftDebounceTimer: unknown = null;
-let draftMaxWaitTimer: unknown = null;
-let draftPersistenceGeneration = 0;
-let draftDebounceToken = 0;
-
-function cancelDraftPersistenceTimers() {
-  if (draftDebounceTimer !== null) {
-    clearClockTimeout(draftDebounceTimer);
-    draftDebounceTimer = null;
-  }
-  if (draftMaxWaitTimer !== null) {
-    clearClockTimeout(draftMaxWaitTimer);
-    draftMaxWaitTimer = null;
-  }
-}
-
-function flushPendingDraftSnapshot() {
-  const snapshot = pendingDraftSnapshot;
-  if (snapshot === null) return;
-  pendingDraftSnapshot = null;
-  draftPersistenceGeneration += 1;
-  draftDebounceToken += 1;
-  cancelDraftPersistenceTimers();
-  saveDraftsToStorage(snapshot);
-}
-
-function persistDraftSnapshotImmediately(drafts: Record<string, string>) {
-  // clear/adopt are durability boundaries: a stale trailing timer must not be
-  // able to restore a sent or migrated draft after this synchronous write.
-  draftPersistenceGeneration += 1;
-  draftDebounceToken += 1;
-  cancelDraftPersistenceTimers();
-  pendingDraftSnapshot = { ...drafts };
-  flushPendingDraftSnapshot();
-}
-
-function scheduleDraftSnapshot(drafts: Record<string, string>) {
-  // `drafts` is a fresh Zustand snapshot and is never mutated after the
-  // transition, so retaining it avoids another full-map clone per keystroke.
-  pendingDraftSnapshot = drafts;
-  draftDebounceToken += 1;
-  const debounceToken = draftDebounceToken;
-  if (draftDebounceTimer !== null) clearClockTimeout(draftDebounceTimer);
-  draftDebounceTimer = setClockTimeout(() => {
-    if (debounceToken !== draftDebounceToken) return;
-    flushPendingDraftSnapshot();
-  }, DRAFT_PERSISTENCE_DEBOUNCE_MS);
-
-  if (draftMaxWaitTimer === null) {
-    const generation = draftPersistenceGeneration;
-    draftMaxWaitTimer = setClockTimeout(() => {
-      draftMaxWaitTimer = null;
-      if (generation !== draftPersistenceGeneration) return;
-      flushPendingDraftSnapshot();
-    }, DRAFT_PERSISTENCE_MAX_WAIT_MS);
-  }
-}
-
-function installDraftPersistenceLifecycle() {
-  if (typeof window === "undefined" || typeof document === "undefined") return;
-  window.addEventListener("pagehide", flushPendingDraftSnapshot);
-  document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "hidden") flushPendingDraftSnapshot();
-  });
-}
-
-installDraftPersistenceLifecycle();
-
-function loadManualUnreadSkips(): Set<string> {
-  try {
-    const raw = sessionStorage.getItem(MANUAL_UNREAD_SKIP_STORAGE_KEY);
-    if (!raw) return new Set();
-    const channelIds = JSON.parse(raw);
-    return Array.isArray(channelIds) ? new Set(channelIds.filter((id): id is string => typeof id === "string")) : new Set();
-  } catch {
-    return new Set();
-  }
-}
-
-function persistManualUnreadSkips(channelIds: Set<string>) {
-  try {
-    if (channelIds.size === 0) {
-      sessionStorage.removeItem(MANUAL_UNREAD_SKIP_STORAGE_KEY);
-    } else {
-      sessionStorage.setItem(MANUAL_UNREAD_SKIP_STORAGE_KEY, JSON.stringify([...channelIds]));
-    }
-  } catch {
-    // ignore storage errors
-  }
 }
 
 function loadPendingReadSeqs(): Record<string, number> {
@@ -640,6 +575,32 @@ function getMaxDisplaySeq(messages: Message[]): number {
 /** Default channel metadata. */
 /** `contextLoadError` value for a jump target hidden by the plan history cutoff. */
 export const CONTEXT_BEYOND_HISTORY_ERROR = "message.chatPanel.messageBeyondHistory";
+/**
+ * `contextLoadError` value for a jump target the server says is not there, or
+ * not for this reader (400 bad id, 403, 404): the answer is final.
+ */
+export const CONTEXT_NOT_FOUND_ERROR = "message.chatPanel.messageNotFound";
+/**
+ * `contextLoadError` value for a jump whose context read failed for another
+ * reason (5xx, timeout, offline): the message may well exist. Shown with the
+ * same toast as before; only a final answer may say "not found" on its own.
+ */
+export const CONTEXT_LOAD_FAILED_ERROR = "message.chatPanel.messageContextFailed";
+
+/**
+ * A read that may succeed if asked again: the request itself failed (5xx,
+ * timeout, offline), not the server's final answer, and not an answer we
+ * could not read (a thrown parse or coerce error has no request behind it).
+ */
+export function isRetryableReadError(error: unknown): boolean {
+  return isAxiosError(error) && !isFinalNotFound(error);
+}
+
+/** The server's final answer that a message is not there, or not for this reader (400, 403, 404). */
+function isFinalNotFound(error: unknown): boolean {
+  const status = (error as { response?: { status?: unknown } } | null)?.response?.status;
+  return status === 400 || status === 403 || status === 404;
+}
 
 const DEFAULT_META: ChannelMeta = { hasMore: true, hasNewer: false, historyLimited: false };
 const DEFAULT_WINDOW_META: ChannelWindowMeta = {
@@ -667,6 +628,21 @@ function ownsMessageWindowRequest(
   currentChannelId: string | null,
 ): boolean {
   return requestGeneration === messageWindowRequestGeneration && currentChannelId === channelId;
+}
+
+/**
+ * A window read dropped as stale (receiver-private ingress) does not stay on
+ * the skeleton: when only who it was read for changed (a sign-in switch) and
+ * it is still the open window, it is read again for the person signed in now;
+ * otherwise (signed out, another server, another window) it stops loading.
+ */
+function settleStaleWindowRead(channelId: string, readFor: ReceiverPrivateIngressContext, readAgain: (() => Promise<void>) | null): Promise<void> {
+  if (readAgain && isReadForAnotherPersonHere(readFor)) return readAgain();
+  useMessageStore.setState((state) => ({
+    channelWindowMeta: updateWindowMetaRecord(state.channelWindowMeta, channelId, { loading: false }),
+    ...(state.currentChannelId === channelId ? { loading: false } : {}),
+  }));
+  return Promise.resolve();
 }
 
 function sameWindowMeta(a: ChannelWindowMeta, b: ChannelWindowMeta): boolean {
@@ -700,16 +676,67 @@ function currentChannelWindowMeta(state: MessageState): ChannelWindowMeta {
   return currentChannelWindowMetaSnapshot;
 }
 
-/** Per-channel metadata (hasMore, historyLimited). Stored outside Zustand to avoid
- *  triggering re-renders when non-current channels' metadata changes. */
-const channelMetaMap = new Map<string, ChannelMeta>();
-
 // Window reloads replace loading flags; request ownership must outlive them.
 // A stale ingress may be replaced, but its completion cannot release its successor.
 const olderPageFlights = new Map<string, ReceiverPrivateIngressContext>();
 
-function getChannelMeta(channelId: string): ChannelMeta {
-  return channelMetaMap.get(channelId) ?? DEFAULT_META;
+function getChannelMeta(state: Pick<MessageState, "channelWindowMeta">, channelId: string): ChannelMeta {
+  const stored = state.channelWindowMeta[channelId];
+  if (!stored) return DEFAULT_META;
+  return { hasMore: stored.hasMore, hasNewer: stored.hasNewer, historyLimited: stored.historyLimited };
+}
+
+/** Whether live rows for a closed channel land past the end of its loaded
+ * context window (newer history still unloaded), leaving a hole. Its list is
+ * then no longer one fetched segment: the rows stay (dedupe and unread rely
+ * on them) but the history mark goes, so the next open fetches. */
+function liveRowsLeaveHole(
+  meta: ChannelWindowMeta | undefined,
+  existing: Message[],
+  incoming: Message[],
+): boolean {
+  if (!meta?.hasNewer) return false;
+  let cursor = getMaxSeq(existing);
+  if (cursor <= 0) return false;
+  for (const message of sortBySeq(incoming)) {
+    const seq = message.seq || 0;
+    if (seq > cursor + 1) return true;
+    cursor = Math.max(cursor, seq);
+  }
+  return false;
+}
+
+function forgetHistoryFetched(current: Record<string, true>, channelId: string): Record<string, true> {
+  if (!current[channelId]) return current;
+  const { [channelId]: _, ...rest } = current;
+  return rest;
+}
+
+function markHistoryFetched(current: Record<string, true>, channelId: string): Record<string, true> {
+  return current[channelId] ? current : { ...current, [channelId]: true };
+}
+
+type ChannelOpenBranch = "latest" | "context" | "remembered";
+
+/** One per window-open call (an open that falls back to the latest page emits
+ * a second one): which window it asked for, whether the list already in
+ * memory was shown as-is, and what that list was. Ids and counts only. */
+function traceChannelOpen(
+  state: Pick<MessageState, "channelMessages" | "historyFetchedChannels">,
+  channelId: string,
+  branch: ChannelOpenBranch,
+  cacheHit: boolean,
+): void {
+  const cachedCount = state.channelMessages[channelId]?.length ?? 0;
+  const history = state.historyFetchedChannels[channelId] ? "fetched" : cachedCount > 0 ? "live_only" : "none";
+  emitStateTransitionTrace({
+    domain: "messages",
+    event: "window.open",
+    entityId: channelId,
+    outcome: "applied",
+    outcomeDetail: `branch=${branch};cache=${cacheHit ? "hit" : "miss"};cached=${cachedCount};history=${history}`,
+    touched: 1,
+  });
 }
 
 function toWindowMeta(meta: ChannelMeta, override?: Partial<ChannelWindowMeta>): ChannelWindowMeta {
@@ -721,7 +748,7 @@ function updateWindowMetaRecord(
   channelId: string,
   partial: Partial<ChannelWindowMeta>,
 ): Record<string, ChannelWindowMeta> {
-  const next = { ...DEFAULT_WINDOW_META, ...(current[channelId] ?? channelMetaMap.get(channelId)), ...partial };
+  const next = { ...DEFAULT_WINDOW_META, ...current[channelId], ...partial };
   const previous = current[channelId];
   if (previous && Object.keys(next).every((key) => previous[key as keyof ChannelWindowMeta] === next[key as keyof ChannelWindowMeta])) {
     return current;
@@ -751,7 +778,27 @@ function getCachedChannelWindowState(
   };
 }
 
-const manualUnreadSkipChannels = loadManualUnreadSkips();
+// Requests whose reply can raise lastSeq (history reads and sends), counted
+// since the store was last reset. A starting sync horizon (socketBridge) is
+// only safe when the server took it before any of them ran, which is
+// guaranteed only if its reply arrived before the first one went out.
+let messageHistoryRequestCount = 0;
+export function noteMessageHistoryRequest() {
+  messageHistoryRequestCount += 1;
+}
+/** A sync horizon the server reported in a response header (decimal xid8), or null. */
+function readSyncHorizonHeader(headers: unknown): string | null {
+  const read = headers as { get?: (name: string) => unknown } & Record<string, unknown> | undefined;
+  const value = typeof read?.get === "function" ? read.get("x-sync-horizon") : read?.["x-sync-horizon"];
+  return typeof value === "string" && /^(0|[1-9][0-9]*)$/.test(value) ? value : null;
+}
+export function messageHistoryRequestsSent(): number {
+  return messageHistoryRequestCount;
+}
+export function __resetMessageHistoryRequestsForTests() {
+  messageHistoryRequestCount = 0;
+}
+
 const pendingReadSeqs = loadPendingReadSeqs();
 const pendingReadRequests = new Map<string, Promise<void>>();
 // A canonical unread receipt can arrive before its RW summary. Keep its count
@@ -831,9 +878,14 @@ function forgetExplicitAutoReadUserActivity() {
   explicitAutoReadUserActivityAt = 0;
 }
 
+/**
+ * The person is using this window: input within ACTIVE_INPUT_WINDOW_MS, the server's test for
+ * holding the phone's alert (notifications/presenceReport), so a message read in view is read
+ * there too (#triage:#157; it used to need input in the last second).
+ */
 function hasRecentExplicitAutoReadUserActivity(now = Date.now()) {
   return explicitAutoReadUserActivityAt > 0
-    && now - explicitAutoReadUserActivityAt <= LIVE_APPEND_AUTO_READ_ACTIVITY_WINDOW_MS;
+    && now - explicitAutoReadUserActivityAt < ACTIVE_INPUT_WINDOW_MS;
 }
 
 export function canAutoMarkCurrentChannelRead(
@@ -862,14 +914,24 @@ export function canAutoMarkLiveAppendRead(
 }
 
 if (typeof window !== "undefined" && typeof document !== "undefined") {
+  // Back in front of the person: what landed in view meanwhile is read now (store/seenReadCatchUp).
   const claimAutoReadTab = () => {
     if (canAutoMarkCurrentChannelRead(document, () => true, "thread")) {
       markCurrentBrowserTabActiveForAutoRead();
     }
+    runSeenReadCatchUp();
   };
   const claimAutoReadTabFromUserActivity = () => {
     rememberExplicitAutoReadUserActivity();
     claimAutoReadTab();
+  };
+  // Scrolling and touches fire many times a second; once a second says the window is in use.
+  let lastContinuousInputAt = 0;
+  const claimAutoReadTabFromContinuousInput = () => {
+    const now = Date.now();
+    if (now - lastContinuousInputAt < 1_000) return;
+    lastContinuousInputAt = now;
+    claimAutoReadTabFromUserActivity();
   };
   const releaseAutoReadTab = () => {
     if (document.visibilityState && document.visibilityState !== "visible") {
@@ -886,32 +948,17 @@ if (typeof window !== "undefined" && typeof document !== "undefined") {
   window.addEventListener("blur", releaseAutoReadTab, true);
   document.addEventListener("visibilitychange", claimAutoReadTab, true);
   document.addEventListener("visibilitychange", releaseAutoReadTab, true);
+  // The same inputs presence counts (WEB_PRESENCE_INPUT_EVENTS).
   document.addEventListener("pointerdown", claimAutoReadTabFromUserActivity, true);
   // keydown-global-exempt: records the actively used tab for unread auto-read gating, does not move focus
   document.addEventListener("keydown", claimAutoReadTabFromUserActivity, true);
+  document.addEventListener("wheel", claimAutoReadTabFromContinuousInput, { capture: true, passive: true });
+  document.addEventListener("touchstart", claimAutoReadTabFromContinuousInput, { capture: true, passive: true });
   window.setTimeout(claimAutoReadTab, 0);
 }
 
-function shouldSkipInitialAutoRead(channelId: string): boolean {
-  return manualUnreadSkipChannels.has(channelId);
-}
-
-function rememberManualUnread(channelId: string) {
-  manualUnreadSkipChannels.add(channelId);
-  persistManualUnreadSkips(manualUnreadSkipChannels);
-}
-
-function consumeManualUnread(channelId: string) {
-  if (!manualUnreadSkipChannels.delete(channelId)) return;
-  persistManualUnreadSkips(manualUnreadSkipChannels);
-}
-
-function forgetManualUnread(channelId: string) {
-  if (!manualUnreadSkipChannels.delete(channelId)) return;
-  persistManualUnreadSkips(manualUnreadSkipChannels);
-}
-
-function getPendingReadSeq(channelId: string): number {
+/** The newest seq a read of this conversation is queued for (its auto-read included), 0 for none. */
+export function getPendingReadSeq(channelId: string): number {
   return pendingReadSeqs[channelId] ?? 0;
 }
 
@@ -1082,6 +1129,22 @@ function canProjectCompleteReadState(messages: Message[] | undefined, meta: Chan
   return Number.isFinite(minSeq) && minSeq <= maxReadSeq + 1;
 }
 
+/**
+ * #244: has a complete accepted read-state projection of the scope's loaded
+ * messages already counted this message? addMessage projects the scope after
+ * storing a live message, and the projection sets the Activity row's unread,
+ * so the row's in-place patch must not count the message again. Computed
+ * fresh: the stored projection is not replaced by a later incomplete one.
+ */
+export function loadedProjectionCountsMessage(message: Pick<Message, "id" | "channelId">): boolean {
+  const state = useMessageStore.getState();
+  const readState = getAcceptedReadState(useServerStore.getState().current?.id, message.channelId);
+  if (!readState) return false;
+  const bucket = state.channelMessages[message.channelId];
+  if (!bucket?.some((known) => known.id === message.id)) return false;
+  return canProjectCompleteReadState(bucket, selectChannelWindowMeta(state, message.channelId), readState.maxReadSeq);
+}
+
 function projectReadStateFromMessages(
   messages: Message[] | undefined,
   meta: ChannelMeta | undefined,
@@ -1225,10 +1288,14 @@ function resetPendingReads() {
 async function flushPendingRead(channelId: string): Promise<void> {
   const seq = getPendingReadSeq(channelId);
   if (seq <= 0) return;
+  // A server taken from the device is only shown until GET /servers confirms
+  // it; the read waits and goes out then (onCurrentServerConfirmed below).
+  if (!isCurrentServerConfirmed()) return;
 
   const existing = pendingReadRequests.get(channelId);
   if (existing) return existing;
 
+  clearMarkedUnreadForRead(channelId);
   const request = api.post(`/channels/${channelId}/read`, { seq })
     .then(() => {
       forgetPendingRead(channelId, seq);
@@ -1255,20 +1322,38 @@ async function flushAllPendingReads(): Promise<void> {
 
 function queueReadSync(channelId: string, seq: number) {
   if (seq <= 0) return;
+  // Activity reopened this conversation on its own: shown, not read, until the person acts in it.
+  if (isAutoReadHeld(channelId)) return;
   rememberPendingRead(channelId, seq);
   void flushPendingRead(channelId);
 }
 
 function queueAutoReadSync(channelId: string, seq: number): boolean {
-  if (!canAutoMarkCurrentChannelRead()) return false;
+  if (isAutoReadHeld(channelId) || !canAutoMarkCurrentChannelRead()) return false;
   queueReadSync(channelId, seq);
   return true;
 }
 
-function queueLiveAppendAutoReadSync(channelId: string, seq: number, surface: "channel" | "thread" = "channel"): boolean {
-  if (!canAutoMarkLiveAppendRead(undefined, undefined, undefined, surface)) return false;
+/** A live message that landed in view; refused (not in use), `readLater` reads it on return (store/seenReadCatchUp). */
+function queueLiveAppendAutoReadSync(channelId: string, seq: number, surface: "channel" | "thread", readLater: () => boolean): boolean {
+  if (isAutoReadHeld(channelId)) return false;
+  if (!canAutoMarkLiveAppendRead(undefined, undefined, undefined, surface)) {
+    noteSkippedSeenRead(channelId, readLater);
+    return false;
+  }
   queueReadSync(channelId, seq);
   return true;
+}
+
+/** The channel view's catch-up: reads it if it is still the one shown, at its bottom. */
+function readCurrentChannelLater(channelId: string): () => boolean {
+  return () => {
+    const { currentChannelId, isNearBottom, hasNewer } = useMessageStore.getState();
+    if (currentChannelId !== channelId) return true;
+    if (!isNearBottom || hasNewer || isAutoReadHeld(channelId) || !canAutoMarkCurrentChannelRead()) return false;
+    useMessageStore.getState().markCurrentChannelRead();
+    return true;
+  };
 }
 
 /**
@@ -1277,8 +1362,8 @@ function queueLiveAppendAutoReadSync(channelId: string, seq: number, surface: "c
  * panel keeps its replies in local state, so the channel append path never
  * sees them and the server cursor used to stay behind what the user had read.
  */
-export function queueThreadLiveReplyReadSync(threadChannelId: string, seq: number): boolean {
-  return queueLiveAppendAutoReadSync(threadChannelId, seq, "thread");
+export function queueThreadLiveReplyReadSync(threadChannelId: string, seq: number, readLater: () => boolean): boolean {
+  return queueLiveAppendAutoReadSync(threadChannelId, seq, "thread", readLater);
 }
 
 /** Get messages for a channel from the bucket, or empty array. */
@@ -1304,13 +1389,41 @@ function getMaxSeq(messages: Message[]): number {
   return messages.reduce((maxSeq, message) => Math.max(maxSeq, message.seq || 0), 0);
 }
 
+/**
+ * RFC 077: who sent a message for its owner (`delegatedBy`,
+ * `delegatedByAgentId`) and its retraction (`deletedAt`) never go away once
+ * known. A copy of the same message that lacks them (a `/messages/sync` page
+ * whose rows don't carry them, an update from a producer that doesn't) must
+ * not erase them, or a live "sent by" label vanishes until a reload.
+ */
+const DELEGATION_FACT_KEYS = ["delegatedBy", "delegatedByAgentId", "deletedAt"] as const;
+
+function delegationFact(message: object, key: (typeof DELEGATION_FACT_KEYS)[number]): unknown {
+  return (message as Record<string, unknown>)[key];
+}
+
+export function keepDelegationFacts<T extends object>(next: T, known: object): T {
+  let patch: Record<string, unknown> | null = null;
+  for (const key of DELEGATION_FACT_KEYS) {
+    if (delegationFact(next, key) == null && delegationFact(known, key) != null) {
+      patch = { ...(patch ?? {}), [key]: delegationFact(known, key) };
+    }
+  }
+  return patch ? { ...next, ...patch } : next;
+}
+
 export function mergeIncomingMessage(
   existing: Message,
   incoming: Pick<Message, "id" | "channelId"> & Partial<Message>,
 ): Message {
+  if (isOlderCardRevision(messageCardRevision(existing.actionMetadata), messageCardRevision(incoming.actionMetadata))) return existing; // RFC 082
   let changed = false;
   for (const [key, value] of Object.entries(incoming) as Array<[keyof Message, unknown]>) {
     if (key === "commentRef" && existing.commentRef && value == null) {
+      continue;
+    }
+    if ((DELEGATION_FACT_KEYS as readonly string[]).includes(key) && value == null
+      && delegationFact(existing, key as (typeof DELEGATION_FACT_KEYS)[number]) != null) {
       continue;
     }
     if (existing[key] !== value) {
@@ -1328,7 +1441,7 @@ export function mergeIncomingMessage(
   if (existing.commentRef && incoming.commentRef == null) {
     merged.commentRef = existing.commentRef;
   }
-  return merged;
+  return keepDelegationFacts(merged, existing);
 }
 
 function getCreatedAtDistanceMs(left: Message, right: Message): number {
@@ -1450,10 +1563,10 @@ export function normalizeDeliveryWarnings(raw: unknown): MessageDeliveryWarning[
   return raw
     .filter((item): item is Record<string, unknown> => Boolean(item && typeof item === "object"))
     .flatMap((item): MessageDeliveryWarning[] => {
-      if (item.targetType !== "agent" || item.reason !== "agent_stopped") return [];
+      if (item.targetType !== "agent" || (item.reason !== "agent_stopped" && item.reason !== "agent_stuck_on_tool")) return [];
       const targetId = typeof item.targetId === "string" ? item.targetId : "";
       if (!targetId) return [];
-      return [{ targetType: "agent", targetId, reason: "agent_stopped" }];
+      return [{ targetType: "agent", targetId, reason: item.reason }];
     });
 }
 
@@ -1481,79 +1594,19 @@ export function normalizeSendMessageResponse(data: unknown): {
   throw new Error("Invalid message send response");
 }
 
-function getPendingGapMessages(channelId: string): Message[] {
-  return pendingGapMessages.get(channelId) ?? [];
-}
-
-function rememberPendingGapMessage(message: Message) {
-  if (!message.seq) return;
-  const pending = getPendingGapMessages(message.channelId);
-  if (pending.some((pendingMessage) => pendingMessage.id === message.id)) return;
-  pendingGapMessages.set(message.channelId, sortBySeq([...pending, message]));
-}
-
-function forgetPendingGapMessage(channelId: string, messageId: string) {
-  const pending = getPendingGapMessages(channelId);
-  if (pending.length === 0) return;
-  const filtered = pending.filter((message) => message.id !== messageId);
-  if (filtered.length === pending.length) return;
-  if (filtered.length === 0) {
-    pendingGapMessages.delete(channelId);
-    return;
-  }
-  pendingGapMessages.set(channelId, filtered);
-}
-
-function clearPendingGapMessages(channelId?: string) {
-  if (channelId) {
-    pendingGapMessages.delete(channelId);
-    return;
-  }
-  pendingGapMessages.clear();
-}
-
-// Stryker disable all: pre-existing gap-stitching helper is outside the read-state projection contract; gap behavior is covered by sync/window tests, not this diff-gate oracle.
-function takeContiguousPendingGapMessages(channelId: string, currentMaxSeq: number, existingIds: Set<string>): Message[] {
-  const pending = getPendingGapMessages(channelId);
-  if (pending.length === 0) return [];
-
-  let cursor = currentMaxSeq;
-  const stitched: Message[] = [];
-  const remaining: Message[] = [];
-
-  for (const message of pending) {
-    if (existingIds.has(message.id)) {
-      cursor = Math.max(cursor, message.seq || 0);
-      continue;
-    }
-
-    const seq = message.seq || 0;
-    if (seq > 0 && seq === cursor + 1) {
-      stitched.push(message);
-      cursor = seq;
-      continue;
-    }
-
-    remaining.push(message);
-  }
-
-  if (remaining.length === 0) {
-    pendingGapMessages.delete(channelId);
-  } else {
-    pendingGapMessages.set(channelId, remaining);
-  }
-
-  return stitched;
-}
-// Stryker restore all
+let unreadCountsRequestSeq = 0;
 
 export const useMessageStore = create<MessageState>((set, get) => ({
   channelMessages: {},
   channelWindowMeta: {},
+  historyFetchedChannels: {},
   messages: [],
   highlightedMessageId: null,
+  highlightNonce: 0,
+  pendingNotFoundToast: false,
   transientFocusRequest: null,
   lastSeq: 0,
+  syncHorizon: null,
   currentChannelId: null,
   loading: false,
   loadingOlder: false,
@@ -1573,7 +1626,8 @@ export const useMessageStore = create<MessageState>((set, get) => ({
   mentionFlags: {},
   newFlags: {},
   currentUserId: null,
-  drafts: loadDraftsFromStorage(),
+  drafts: loadDrafts(null),
+  draftUpdatedAt: loadDraftTimes(null),
 
   loadUnreadCounts: async () => {
     const epoch = useServerStore.getState().serverEpoch;
@@ -1582,8 +1636,12 @@ export const useMessageStore = create<MessageState>((set, get) => ({
     try {
       await flushAllPendingReads();
       const requestReadStateGeneration = getReadStateLedgerGeneration();
-      const { data } = await getWithRwOverloadRetry("/channels/unread", { params: { summary: 1 } });
+      // Newest-started read wins: an older one landing late must not overwrite
+      // counts read after a change (sync/changes, #triage:458d78f1).
+      const request = ++unreadCountsRequestSeq;
+      const { data, stale } = await getRwRead<unknown>("unread", "/channels/unread", { params: { summary: 1 } });
       if (useServerStore.getState().serverEpoch !== epoch) return;
+      if (request !== unreadCountsRequestSeq) return;
       // #632 C1: fold the authority union off the RAW response, before
       // parseUnreadSnapshot narrows it to counts/flags.
       // The payload keys channels by id (object map, not an array) and may also
@@ -1660,8 +1718,13 @@ export const useMessageStore = create<MessageState>((set, get) => ({
           newFlags: nextState.newFlags,
         };
       });
+      // Task #164: the last clean counts are what a later boot shows while RW is unavailable.
+      if (!stale) {
+        const { unreadCounts, mentionFlags, newFlags, currentUserId } = get();
+        saveLastCounts(currentUserId, serverId, { unread: { unreadCounts, mentionFlags, newFlags } });
+      }
     } catch {
-      // ignore
+      // Keep the counts shown; store/rwFreshness says they may be out of date.
     }
   },
 
@@ -1699,6 +1762,7 @@ export const useMessageStore = create<MessageState>((set, get) => ({
 
   markRead: async (channelId) => {
     pendingUnreadReceipts.delete(channelId);
+    clearMarkedUnreadForRead(channelId);
     const { data } = await api.post(`/channels/${channelId}/read-all`);
     const seq = Number(data?.seq ?? 0);
     if (seq > 0) {
@@ -1712,6 +1776,7 @@ export const useMessageStore = create<MessageState>((set, get) => ({
   markConversationRead: async (channelId) => {
     pendingUnreadReceipts.delete(channelId);
     const ingress = captureHumanActivityIngressContext(get().currentUserId);
+    clearMarkedUnreadForRead(channelId);
     const { data } = await api.post(`/channels/${channelId}/conversation-read-all`);
     if (!isReceiverPrivateIngressContextCurrent(ingress)) return;
     // HTTP and socket receipts share the same versioned ingress. Loading the
@@ -1739,7 +1804,7 @@ export const useMessageStore = create<MessageState>((set, get) => ({
       });
       if (!projection.complete && !knownNewerMessage) state.clearUnread(channelId);
     }
-    await Promise.all([get().loadUnreadCounts(), useThreadStore.getState().loadFollowedThreads()]);
+    await Promise.all([get().loadUnreadCounts(), useThreadStore.getState().loadFollowedThreads("manual")]);
   },
 
   markUnread: async (channelId) => {
@@ -1766,13 +1831,29 @@ export const useMessageStore = create<MessageState>((set, get) => ({
       if (!isCurrent()) return;
       const unreadCount = Number(data?.unreadCount ?? 0);
       const version = Number(data?.readStateVersion ?? 0);
+      // Nothing countable: the conversation is marked unread with no count. The
+      // answer goes through the same version-ordered path as its socket event,
+      // so an answer later than a newer read never brings the mark back.
+      const outcome = resolveMarkUnreadOutcome(data);
+      const markedUnread = outcome === "marked";
+      if (markedUnread && serverId && Number.isSafeInteger(version) && version > 0) {
+        const { applyReadStateUpdate } = await import("./applyReadStateUpdate");
+        if (!isCurrent()) return;
+        applyReadStateUpdate({
+          serverId,
+          scopeId: channelId,
+          maxReadSeq: Number(data?.maxReadSeq ?? 0),
+          readStateVersion: version,
+          markedUnread: true,
+        });
+      }
       pendingUnreadReceipts.delete(channelId);
       if (version > 0) {
         const accepted = getAcceptedReadState(serverId, channelId);
         if (accepted && accepted.readStateVersion > version) return;
         pendingUnreadReceipts.set(channelId, { readStateVersion: version, unreadCount, maxReadSeq: Number(data?.maxReadSeq ?? 0) });
       }
-      if (get().currentChannelId === channelId && unreadCount > 0) {
+      if (get().currentChannelId === channelId && outcome !== "nothing") {
         rememberManualUnread(channelId);
       } else {
         forgetManualUnread(channelId);
@@ -1791,15 +1872,19 @@ export const useMessageStore = create<MessageState>((set, get) => ({
     set((state) => {
       if (state.drafts[channelId] === content) return state;
       let newDrafts: Record<string, string>;
+      let newTimes: Record<string, number>;
       if (!content.trim()) {
         if (!state.drafts[channelId]) return state;
         const { [channelId]: _, ...rest } = state.drafts;
         newDrafts = rest;
+        const { [channelId]: _time, ...restTimes } = state.draftUpdatedAt;
+        newTimes = restTimes;
       } else {
         newDrafts = { ...state.drafts, [channelId]: content };
+        newTimes = { ...state.draftUpdatedAt, [channelId]: Date.now() };
       }
-      scheduleDraftSnapshot(newDrafts);
-      return { drafts: newDrafts };
+      scheduleDraftSnapshot(state.currentUserId, newDrafts, newTimes);
+      return { drafts: newDrafts, draftUpdatedAt: newTimes };
     });
   },
 
@@ -1818,14 +1903,22 @@ export const useMessageStore = create<MessageState>((set, get) => ({
       if (!hasSourceDraft && (!preferSource || !hasDestinationDraft)) return state;
 
       const nextDrafts = { ...state.drafts };
+      const nextTimes = { ...state.draftUpdatedAt };
+      const adoptedTime = adoptedDraft === sourceDraft
+        ? state.draftUpdatedAt[sourceChannelId] ?? state.draftUpdatedAt[destinationChannelId]
+        : state.draftUpdatedAt[destinationChannelId] ?? state.draftUpdatedAt[sourceChannelId];
       delete nextDrafts[sourceChannelId];
+      delete nextTimes[sourceChannelId];
       if (adoptedDraft.trim()) {
         nextDrafts[destinationChannelId] = adoptedDraft;
+        if (adoptedTime !== undefined) nextTimes[destinationChannelId] = adoptedTime;
+        else delete nextTimes[destinationChannelId];
       } else {
         delete nextDrafts[destinationChannelId];
+        delete nextTimes[destinationChannelId];
       }
-      persistDraftSnapshotImmediately(nextDrafts);
-      return { drafts: nextDrafts };
+      persistDraftSnapshotImmediately(state.currentUserId, nextDrafts, nextTimes);
+      return { drafts: nextDrafts, draftUpdatedAt: nextTimes };
     });
     return adoptedDraft;
   },
@@ -1834,8 +1927,9 @@ export const useMessageStore = create<MessageState>((set, get) => ({
     set((state) => {
       if (!state.drafts[channelId]) return state;
       const { [channelId]: _, ...rest } = state.drafts;
-      persistDraftSnapshotImmediately(rest);
-      return { drafts: rest };
+      const { [channelId]: _time, ...restTimes } = state.draftUpdatedAt;
+      persistDraftSnapshotImmediately(state.currentUserId, rest, restTimes);
+      return { drafts: rest, draftUpdatedAt: restTimes };
     });
   },
 
@@ -1849,14 +1943,18 @@ export const useMessageStore = create<MessageState>((set, get) => ({
     }
 
     const skipInitialAutoRead = shouldSkipInitialAutoRead(channelId);
-    if (!skipInitialAutoRead && canAutoMarkCurrentChannelRead()) {
+    if (!skipInitialAutoRead && !isAutoReadHeld(channelId) && canAutoMarkCurrentChannelRead()) {
       get().clearUnread(channelId);
     }
 
-    // If we have cached messages for this channel, show them immediately
-    const cached = get().channelMessages[channelId];
-    const meta = getChannelMeta(channelId);
-    const canReuseCachedTail = !!cached && cached.length > 0 && !meta.hasNewer;
+    // A fetched list for this channel shows at once while the page refreshes;
+    // a list of only live rows is not the channel, so it waits for the page.
+    const opening = get();
+    const cached = opening.channelMessages[channelId];
+    const meta = getChannelMeta(opening, channelId);
+    const canReuseCachedTail = !!cached && cached.length > 0 && !meta.hasNewer
+      && !!opening.historyFetchedChannels[channelId];
+    traceChannelOpen(opening, channelId, "latest", canReuseCachedTail);
     if (canReuseCachedTail) {
       set((state) => ({
         ...getCachedChannelWindowState(channelId, cached, meta),
@@ -1891,32 +1989,47 @@ export const useMessageStore = create<MessageState>((set, get) => ({
       }));
     }
 
-    const ingressContext = captureReceiverPrivateIngressContext(get().currentUserId);
+    // The click that opened it may have sent this read already (messagePagePrefetch): take it;
+    // over a cached list only while it is in flight (takeInFlightMessagePage).
+    const prefetched = (canReuseCachedTail ? takeInFlightMessagePage : takeMessagePage)(latestPageRequest(channelId), get().currentUserId);
+    const ingressContext = prefetched?.ingressContext ?? captureReceiverPrivateIngressContext(get().currentUserId);
     try {
       const limit = 50;
-      const { data } = await api.get(`/messages/channel/${channelId}?limit=${limit}`);
+      // The page's own sync horizon (taken before its read) can start the
+      // first sync:resume only if it was the page's only history read: none
+      // went out before it, and none while it was in flight (the server may
+      // run a later request's read before this one's horizon). The socket's
+      // starting horizon follows the same rule (socketBridge).
+      const firstHistoryRead = messageHistoryRequestsSent() === 0;
+      noteMessageHistoryRequest();
+      const { data, headers } = await (prefetched?.request ?? api.get(`/messages/channel/${channelId}?limit=${limit}`));
+      // A read sent at the click went out before this count: its horizon is not known to be the first.
+      const onlyHistoryRead = !prefetched && firstHistoryRead && messageHistoryRequestsSent() === 1;
+      const pageHorizon = onlyHistoryRead ? readSyncHorizonHeader(headers) : null;
       if (
         get().currentChannelId === channelId &&
         requestGeneration !== messageWindowRequestGeneration
       ) return;
-      const msgs = coerceCurrentReceiverPrivateMessages(
+      const coerced = coerceCurrentReceiverPrivateMessages(
         data.messages ?? data,
         ingressContext,
       );
-      if (!msgs) return;
+      if (!coerced) {
+        return settleStaleWindowRead(channelId, ingressContext, get().currentChannelId === channelId ? () => get().loadMessages(channelId, requestGeneration) : null);
+      }
       // The server bundles this page's thread summaries with the messages.
       // Hydrate them first so React never commits a parent-only intermediate
       // frame whose later inline-reply expansion changes scrollTop.
       hydrateBundledThreadSummaries(data, ingressContext);
       const historyLimited: boolean = data.historyLimited ?? false;
-      const hasMore = msgs.length >= limit;
+      recordHiddenHistory(channelId, data);
+      const msgs = prefetched ? withLiveRowsAfter(coerced, get().channelMessages[channelId], prefetched.seqAtSend) : coerced;
+      const hasMore = coerced.length >= limit;
       const maxSeq = Math.max(...msgs.map((m) => m.seq || 0), 0);
-
-      // Update per-channel metadata
-      channelMetaMap.set(channelId, { hasMore, hasNewer: false, historyLimited });
 
       set((state) => withAcceptedReadStateProjection(state, {
         channelMessages: { ...state.channelMessages, [channelId]: msgs },
+        historyFetchedChannels: markHistoryFetched(state.historyFetchedChannels, channelId),
         channelWindowMeta: updateWindowMetaRecord(state.channelWindowMeta, channelId, {
           loading: false,
           loadingOlder: false,
@@ -1929,6 +2042,7 @@ export const useMessageStore = create<MessageState>((set, get) => ({
           contextLoadError: null,
         }),
         lastSeq: Math.max(state.lastSeq, maxSeq),
+        ...(pageHorizon && state.syncHorizon === null ? { syncHorizon: pageHorizon } : {}),
         ...(state.currentChannelId === channelId ? {
           messages: msgs,
           loading: false,
@@ -1962,6 +2076,25 @@ export const useMessageStore = create<MessageState>((set, get) => ({
     }
   },
 
+  reopenHistoryWindow: (channelId) => {
+    if (!getChannelMeta(get(), channelId).historyLimited) return;
+    clearHiddenHistory(channelId);
+    // A jump that landed on the paywall is no longer behind anything: the
+    // older pages that load now bring its target.
+    const reopened = (current: string | null) => (current === CONTEXT_BEYOND_HISTORY_ERROR ? null : current);
+    set((state) => ({
+      channelWindowMeta: updateWindowMetaRecord(state.channelWindowMeta, channelId, {
+        hasMore: true,
+        historyLimited: false,
+        contextLoadError: reopened(selectChannelWindowMeta(state, channelId).contextLoadError),
+      }),
+      ...(state.currentChannelId === channelId ? { hasMore: true, historyLimited: false, contextLoadError: reopened(state.contextLoadError) } : {}),
+    }));
+    const loaded = getBucket(get().channelMessages, channelId);
+    if (loaded.length > 0) void get().loadOlderMessages(channelId);
+    else void get().loadMessages(channelId);
+  },
+
   loadOlderMessages: async (channelId) => {
     const state = get();
     const targetChannelId = channelId ?? state.currentChannelId;
@@ -1993,17 +2126,11 @@ export const useMessageStore = create<MessageState>((set, get) => ({
       if (!older) return;
       hydrateBundledThreadSummaries(data, ingressContext);
       const historyLimited: boolean = data.historyLimited ?? false;
+      recordHiddenHistory(targetChannelId, data);
       const hasMoreResult = older.length >= limit;
       const existingBucket = getBucket(get().channelMessages, targetChannelId);
       const existingIds = new Set(existingBucket.map((m) => m.id));
       const newMsgs = older.filter((m) => !existingIds.has(m.id));
-
-      // Update per-channel metadata
-      channelMetaMap.set(targetChannelId, {
-        hasMore: hasMoreResult,
-        hasNewer: selectChannelWindowMeta(get(), targetChannelId).hasNewer,
-        historyLimited,
-      });
 
       set((state) => {
         const existing = getBucket(state.channelMessages, targetChannelId);
@@ -2054,6 +2181,7 @@ export const useMessageStore = create<MessageState>((set, get) => ({
     const ingressContext = captureReceiverPrivateIngressContext(state.currentUserId);
     try {
       const limit = 50;
+      noteMessageHistoryRequest();
       const { data } = await api.get(
         `/messages/channel/${targetChannelId}?limit=${limit}&after=${maxSeq}`
       );
@@ -2067,12 +2195,6 @@ export const useMessageStore = create<MessageState>((set, get) => ({
       const existingBucket = getBucket(get().channelMessages, targetChannelId);
       const existingIds = new Set(existingBucket.map((m) => m.id));
       const newMsgs = newer.filter((m) => !existingIds.has(m.id));
-
-      channelMetaMap.set(targetChannelId, {
-        hasMore: selectChannelWindowMeta(get(), targetChannelId).hasMore,
-        hasNewer: hasNewerResult,
-        historyLimited: selectChannelWindowMeta(get(), targetChannelId).historyLimited,
-      });
 
       set((state) => {
         const existing = getBucket(state.channelMessages, targetChannelId);
@@ -2109,12 +2231,6 @@ export const useMessageStore = create<MessageState>((set, get) => ({
 
   exitContextWindow: (channelId) => {
     clearPendingGapMessages(channelId);
-    channelMetaMap.set(channelId, {
-      hasMore: get().hasMore,
-      // Stryker disable next-line BooleanLiteral: exiting a context window always drops newer-context state; this is legacy window bookkeeping outside read-state projection behavior.
-      hasNewer: false,
-      historyLimited: get().historyLimited,
-    });
     if (get().currentChannelId !== channelId) return;
     set((state) => ({
       hasNewer: false,
@@ -2140,13 +2256,13 @@ export const useMessageStore = create<MessageState>((set, get) => ({
           captureReceiverPrivateIngressContext(get().currentUserId),
         );
     if (!message) return;
+    noteOutlineMessage(message);
     set((state) => {
       // Stryker disable next-line MethodExpression,ConditionalExpression,LogicalOperator: lastSeq monotonic bookkeeping predates this read-state projection slice; unread behavior is asserted separately.
       const newLastSeq = Math.max(state.lastSeq, message.seq || 0);
       const currentMaxSeq = getMaxSeq(state.messages);
       const project = (nextState: Partial<MessageState>) =>
         withAcceptedReadStateProjection(state, nextState, [message.channelId]);
-      forgetPendingGapMessage(message.channelId, message.id);
       const receipt = pendingUnreadReceipts.get(message.channelId);
       if (receipt && (message.seq ?? 0) > receipt.maxReadSeq
         && !isSelfAuthoredMessage(message, state.currentUserId)
@@ -2191,15 +2307,24 @@ export const useMessageStore = create<MessageState>((set, get) => ({
 
       // Non-current channel: update bucket + unread count, don't touch `messages`
       if (message.channelId !== state.currentChannelId) {
+        const historyFetchedChannels = liveRowsLeaveHole(
+          state.channelWindowMeta[message.channelId],
+          bucket,
+          [persistedMessage],
+        )
+          ? forgetHistoryFetched(state.historyFetchedChannels, message.channelId)
+          : state.historyFetchedChannels;
         if (isSelfAuthoredMessage(message, state.currentUserId)) {
           return project({
             channelMessages: newChannelMessages,
+            historyFetchedChannels,
             lastSeq: newLastSeq,
           });
         }
         const prev = state.unreadCounts[message.channelId] || 0;
         return project({
           channelMessages: newChannelMessages,
+          historyFetchedChannels,
           lastSeq: newLastSeq,
           unreadCounts: { ...state.unreadCounts, [message.channelId]: prev + 1 },
         });
@@ -2227,40 +2352,22 @@ export const useMessageStore = create<MessageState>((set, get) => ({
         });
       }
 
-      // Preserve a contiguous loaded window: if socket delivery skips seqs,
-      // defer appending until we heal the gap from the current window tail.
-      if (!state.hasNewer && (state.hasGap || hasSeqGap)) {
-        rememberPendingGapMessage(message);
-        if (!state.loadingGap) {
-          setTimeout(() => get().syncGap(message.channelId), 0);
-        }
-        const channelWindowMeta = updateWindowMetaRecord(state.channelWindowMeta, message.channelId, {
-          hasGap: true,
-          loadingGap: state.loadingGap,
-        });
-        if (isSelfAuthoredMessage(message, state.currentUserId)) {
-          return project({
-            lastSeq: newLastSeq,
-            hasGap: true,
-            channelWindowMeta,
-          });
-        }
-        const prev = state.unreadCounts[message.channelId] || 0;
-        return project({
-          lastSeq: newLastSeq,
-          hasGap: true,
-          channelWindowMeta,
-          unreadCounts: { ...state.unreadCounts, [message.channelId]: prev + 1 },
-        });
-      }
+      // A seq jump is almost never a real hole (seqs are server-global), so
+      // the row is shown at once; a background /messages/sync from the window
+      // tail fills whatever did go missing, and until it answers the channel
+      // has a gap. While a hole is unconfirmed the row is not auto-read (that
+      // would mark the hole read): the fill reads the channel once it lands.
+      if (hasSeqGap && !state.hasNewer) rememberPendingGapMessage(persistedMessage, currentMaxSeq);
+      const holeUnconfirmed = channelOwesGapFill(message.channelId);
 
       // Only mark as read if user is near the real latest bottom, not the
       // bottom of an older centered context slice.
       const autoReadQueued = Boolean(
+        !holeUnconfirmed &&
         message.seq &&
         state.isNearBottom &&
         !state.hasNewer &&
-        queueLiveAppendAutoReadSync(message.channelId, message.seq)
+        queueLiveAppendAutoReadSync(message.channelId, message.seq, "channel", readCurrentChannelLater(message.channelId))
       );
 
       // If user is scrolled up, or is intentionally viewing an older slice with
@@ -2269,14 +2376,15 @@ export const useMessageStore = create<MessageState>((set, get) => ({
         ? { unreadCounts: { ...state.unreadCounts, [message.channelId]: (state.unreadCounts[message.channelId] || 0) + 1 } }
         : {};
 
+      const hasGap = holeUnconfirmed || (state.loadingGap && state.hasGap);
       return project({
         channelMessages: newChannelMessages,
         channelWindowMeta: updateWindowMetaRecord(state.channelWindowMeta, message.channelId, {
-          hasGap: false,
+          hasGap,
         }),
         messages: updatedBucket,
         lastSeq: newLastSeq,
-        hasGap: false,
+        hasGap,
         ...unreadUpdate,
       });
     });
@@ -2370,19 +2478,32 @@ export const useMessageStore = create<MessageState>((set, get) => ({
       for (const m of newMsgs) {
         let arr = byChannel.get(m.channelId);
         if (!arr) { arr = []; byChannel.set(m.channelId, arr); }
-        arr.push(m);
+        // As in syncGap: a held-back live copy may know who sent it (RFC 077).
+        const live = getPendingGapMessages(m.channelId).find((pending) => pending.id === m.id);
+        arr.push(live ? keepDelegationFacts(m, live) : m);
       }
 
       // Merge into channel buckets
       const newChannelMessages = { ...state.channelMessages };
       const unreadUpdates = { ...state.unreadCounts };
+      let historyFetchedChannels = state.historyFetchedChannels;
 
       for (const [channelId, msgs] of byChannel) {
         const existing = newChannelMessages[channelId] ?? [];
-        const existingIds = new Set(existing.map((m) => m.id));
-        const deduped = msgs.filter((m) => !existingIds.has(m.id));
+        // Known ids include the ones earlier in this batch: a catch-up page can
+        // carry the same message twice, and each copy must count once.
+        const knownIds = new Set(existing.map((m) => m.id));
+        const deduped = msgs.filter((m) => {
+          if (knownIds.has(m.id)) return false;
+          knownIds.add(m.id);
+          return true;
+        });
         if (deduped.length > 0) {
           newChannelMessages[channelId] = sortBySeq([...existing, ...deduped]);
+        }
+        if (channelId !== state.currentChannelId
+          && liveRowsLeaveHole(state.channelWindowMeta[channelId], existing, deduped)) {
+          historyFetchedChannels = forgetHistoryFetched(historyFetchedChannels, channelId);
         }
         const newestDedupedSeq = getMaxSeq(deduped);
         forgetLocalReadSuppressionIfNewerMessage(channelId, newestDedupedSeq);
@@ -2402,6 +2523,7 @@ export const useMessageStore = create<MessageState>((set, get) => ({
           ? updateWindowMetaRecord(state.channelWindowMeta, state.currentChannelId, {})
           : state.channelWindowMeta,
         messages: getBucket(newChannelMessages, state.currentChannelId),
+        historyFetchedChannels,
         lastSeq: maxSeq,
         unreadCounts: unreadUpdates,
       }, byChannel.keys());
@@ -2409,6 +2531,9 @@ export const useMessageStore = create<MessageState>((set, get) => ({
 
   sendMessage: async (channelId, content, attachmentIds, asTask, optimisticId, randomId, mentions) => {
     const ingressContext = captureReceiverPrivateIngressContext(get().currentUserId);
+    // The reply raises lastSeq to the sent message's seq: a starting sync
+    // horizon that arrives after this write is not safe to use either.
+    noteMessageHistoryRequest();
     const { data } = await api.post("/v2/messages", {
       channelId,
       content,
@@ -2498,16 +2623,23 @@ export const useMessageStore = create<MessageState>((set, get) => ({
     clearPendingGapMessages(channelId);
     const state = get();
     const cached = state.channelMessages[channelId];
-    if (cached?.some((message) => message.id === messageId)) {
+    // Only a list a history read filled may stand in for the window around
+    // the target; live rows that arrived while the channel was closed are not
+    // its history, even when the target is one of them.
+    const cacheHit = !!state.historyFetchedChannels[channelId]
+      && !!cached?.some((message) => message.id === messageId);
+    traceChannelOpen(state, channelId, "context", cacheHit);
+    if (cached && cacheHit) {
       const meta = state.currentChannelId === channelId
         ? {
             hasMore: state.hasMore,
             hasNewer: state.hasNewer,
             historyLimited: state.historyLimited,
           }
-          : getChannelMeta(channelId);
+          : getChannelMeta(state, channelId);
       set((current) => ({
         ...getCachedChannelWindowState(channelId, cached, meta, messageId),
+        highlightNonce: current.highlightNonce + 1,
         channelWindowMeta: updateWindowMetaRecord(current.channelWindowMeta, channelId, toWindowMeta(meta)),
       }));
       return;
@@ -2524,12 +2656,15 @@ export const useMessageStore = create<MessageState>((set, get) => ({
         contextLoadError: null,
       }),
       highlightedMessageId: messageId,
+      highlightNonce: current.highlightNonce + 1,
       contextLoadError: null,
     }));
 
-    const ingressContext = captureReceiverPrivateIngressContext(get().currentUserId);
+    const prefetched = takeMessagePage(messageWindowRequest(channelId, messageId), get().currentUserId);
+    const ingressContext = prefetched?.ingressContext ?? captureReceiverPrivateIngressContext(get().currentUserId);
     try {
-      const { data } = await api.get(`/messages/context/${messageId}`, { params: { channelId } });
+      noteMessageHistoryRequest();
+      const { data } = await (prefetched?.request ?? api.get(`/messages/context/${messageId}`, { params: { channelId } }));
       if (!ownsMessageWindowRequest(requestGeneration, channelId, get().currentChannelId)) return;
       const canonicalTarget = data.canonicalTarget as CanonicalThreadTarget | undefined;
       if (canonicalTarget?.kind === "thread") {
@@ -2544,22 +2679,24 @@ export const useMessageStore = create<MessageState>((set, get) => ({
         }
         return;
       }
-      const msgs = coerceCurrentReceiverPrivateMessages(
+      const coerced = coerceCurrentReceiverPrivateMessages(
         data.messages ?? [],
         ingressContext,
       );
-      if (!msgs) return;
+      if (!coerced) return settleStaleWindowRead(channelId, ingressContext, () => get().loadMessageContext(channelId, messageId));
+      const msgs = prefetched && !data.hasNewer ? withLiveRowsAfter(coerced, get().channelMessages[channelId], prefetched.seqAtSend) : coerced;
       hydrateBundledThreadSummaries(data, ingressContext);
       const targetMessageId = data.targetMessageId ?? messageId;
       const maxSeq = Math.max(...msgs.map((m) => m.seq || 0), 0);
-      channelMetaMap.set(channelId, {
-        hasMore: !!data.hasOlder,
-        hasNewer: !!data.hasNewer,
-        historyLimited: false,
-      });
+      // The window can reach the start of what the plan shows: keep the flag
+      // (the history paywall goes there) and what the cutoff hides.
+      const historyLimited = !data.hasOlder && data.historyLimited === true;
+      recordHiddenHistory(channelId, data);
+      clearHiddenTarget(channelId);
 
       set((state) => withAcceptedReadStateProjection(state, {
         channelMessages: { ...state.channelMessages, [channelId]: msgs },
+        historyFetchedChannels: markHistoryFetched(state.historyFetchedChannels, channelId),
         channelWindowMeta: updateWindowMetaRecord(state.channelWindowMeta, channelId, {
           loading: false,
           loadingOlder: false,
@@ -2567,7 +2704,7 @@ export const useMessageStore = create<MessageState>((set, get) => ({
           hasMore: !!data.hasOlder,
           hasNewer: !!data.hasNewer,
           hasGap: false,
-          historyLimited: false,
+          historyLimited,
           contextLoadError: null,
         }),
         messages: msgs,
@@ -2576,35 +2713,60 @@ export const useMessageStore = create<MessageState>((set, get) => ({
         hasMore: !!data.hasOlder,
         hasNewer: !!data.hasNewer,
         hasGap: false,
-        historyLimited: false,
+        historyLimited,
         contextLoadError: null,
         highlightedMessageId: targetMessageId,
       }, [channelId]));
-    } catch {
-      if (ownsMessageWindowRequest(requestGeneration, channelId, get().currentChannelId)) {
-        set((state) => ({
-          // Stryker disable next-line BooleanLiteral: context-load failure spinner reset is legacy UI scaffolding outside read-state projection behavior.
-          loading: false,
-          highlightedMessageId: null,
-          channelWindowMeta: updateWindowMetaRecord(state.channelWindowMeta, channelId, { loading: false }),
-        }));
-        const fallbackGeneration = claimMessageWindowRequest();
-        await get().loadMessages(channelId, fallbackGeneration);
-        if (ownsMessageWindowRequest(fallbackGeneration, channelId, get().currentChannelId)) {
-          // The context route 404s for a target behind the plan history cutoff
-          // just as for a missing message. When the fallback page reports the
-          // channel is history-limited, say the target is beyond the plan's
-          // history range (with the billing CTA) instead of "not found" (task #14).
-          const contextLoadError = selectChannelWindowMeta(get(), channelId).historyLimited
-            ? CONTEXT_BEYOND_HISTORY_ERROR
-            : "message.chatPanel.messageNotFound";
-          set((state) => ({
-            contextLoadError,
-            channelWindowMeta: updateWindowMetaRecord(state.channelWindowMeta, channelId, {
-              contextLoadError,
-            }),
-          }));
+    } catch (error) {
+      if (!ownsMessageWindowRequest(requestGeneration, channelId, get().currentChannelId)) return;
+      const hidden = readHistoryLimitedError(error);
+      const hiddenThreadTarget = hidden?.canonicalTarget;
+      if (
+        hiddenThreadTarget?.kind === "thread"
+        && hiddenThreadTarget.channelId
+        && hiddenThreadTarget.messageId
+        && hiddenThreadTarget.threadParentMessageId
+      ) {
+        // A reply behind the plan's history window opens its thread, as a
+        // reply inside it does; the thread's paywall centers on it (task #8).
+        await useThreadStore.getState().openThread({
+          parentChannelId: hiddenThreadTarget.channelId,
+          parentMessageId: hiddenThreadTarget.threadParentMessageId,
+          focusedMessageId: hiddenThreadTarget.messageId,
+        });
+        if (ownsMessageWindowRequest(requestGeneration, channelId, get().currentChannelId)) {
+          await get().loadMessages(channelId);
         }
+        return;
+      }
+      if (hidden?.hiddenTarget) {
+        // The target is behind the plan's history window (task #8): the
+        // history paywall centers on it, over the first messages the window
+        // shows after it.
+        recordHiddenTarget(channelId, hidden.hiddenTarget);
+        await get().loadWindowAfterHiddenTarget(channelId, hidden.hiddenTarget.target.seq, requestGeneration);
+        return;
+      }
+      set((state) => ({
+        // Stryker disable next-line BooleanLiteral: context-load failure spinner reset is legacy UI scaffolding outside read-state projection behavior.
+        loading: false,
+        highlightedMessageId: null,
+        channelWindowMeta: updateWindowMetaRecord(state.channelWindowMeta, channelId, { loading: false }),
+      }));
+      const fallbackGeneration = claimMessageWindowRequest();
+      await get().loadMessages(channelId, fallbackGeneration);
+      if (ownsMessageWindowRequest(fallbackGeneration, channelId, get().currentChannelId)) {
+        // Not behind the window (the route says so with history_limited):
+        // the message is not there, or not for this reader; or the read
+        // failed and nobody knows yet.
+        const contextLoadError = isFinalNotFound(error) ? CONTEXT_NOT_FOUND_ERROR : CONTEXT_LOAD_FAILED_ERROR;
+        set((state) => ({
+          contextLoadError,
+          pendingNotFoundToast: true,
+          channelWindowMeta: updateWindowMetaRecord(state.channelWindowMeta, channelId, {
+            contextLoadError,
+          }),
+        }));
       }
     }
   },
@@ -2612,6 +2774,7 @@ export const useMessageStore = create<MessageState>((set, get) => ({
   loadMessageWindowSilent: async (channelId, messageId) => {
     const requestGeneration = claimMessageWindowRequest();
     clearPendingGapMessages(channelId);
+    traceChannelOpen(get(), channelId, "remembered", false);
     set((state) => ({
       loading: true,
       loadingOlder: false,
@@ -2627,25 +2790,27 @@ export const useMessageStore = create<MessageState>((set, get) => ({
       contextLoadError: null,
     }));
 
-    const ingressContext = captureReceiverPrivateIngressContext(get().currentUserId);
+    const prefetched = takeMessagePage(messageWindowRequest(channelId, messageId), get().currentUserId);
+    const ingressContext = prefetched?.ingressContext ?? captureReceiverPrivateIngressContext(get().currentUserId);
     try {
-      const { data } = await api.get(`/messages/context/${messageId}`, { params: { channelId } });
+      noteMessageHistoryRequest();
+      const { data } = await (prefetched?.request ?? api.get(`/messages/context/${messageId}`, { params: { channelId } }));
       if (!ownsMessageWindowRequest(requestGeneration, channelId, get().currentChannelId)) return;
-      const msgs = coerceCurrentReceiverPrivateMessages(
+      const coerced = coerceCurrentReceiverPrivateMessages(
         data.messages ?? [],
         ingressContext,
       );
-      if (!msgs) return;
+      if (!coerced) return settleStaleWindowRead(channelId, ingressContext, () => get().loadMessageWindowSilent(channelId, messageId));
+      const msgs = prefetched && !data.hasNewer ? withLiveRowsAfter(coerced, get().channelMessages[channelId], prefetched.seqAtSend) : coerced;
       hydrateBundledThreadSummaries(data, ingressContext);
       const maxSeq = Math.max(...msgs.map((m) => m.seq || 0), 0);
-      channelMetaMap.set(channelId, {
-        hasMore: !!data.hasOlder,
-        hasNewer: !!data.hasNewer,
-        historyLimited: false,
-      });
+      const historyLimited = !data.hasOlder && data.historyLimited === true;
+      recordHiddenHistory(channelId, data);
+      clearHiddenTarget(channelId);
 
       set((state) => withAcceptedReadStateProjection(state, {
         channelMessages: { ...state.channelMessages, [channelId]: msgs },
+        historyFetchedChannels: markHistoryFetched(state.historyFetchedChannels, channelId),
         channelWindowMeta: updateWindowMetaRecord(state.channelWindowMeta, channelId, {
           loading: false,
           loadingOlder: false,
@@ -2653,7 +2818,7 @@ export const useMessageStore = create<MessageState>((set, get) => ({
           hasMore: !!data.hasOlder,
           hasNewer: !!data.hasNewer,
           hasGap: false,
-          historyLimited: false,
+          historyLimited,
           contextLoadError: null,
         }),
         messages: msgs,
@@ -2662,7 +2827,7 @@ export const useMessageStore = create<MessageState>((set, get) => ({
         hasMore: !!data.hasOlder,
         hasNewer: !!data.hasNewer,
         hasGap: false,
-        historyLimited: false,
+        historyLimited,
         contextLoadError: null,
       }, [channelId]));
     } catch {
@@ -2671,21 +2836,84 @@ export const useMessageStore = create<MessageState>((set, get) => ({
           loading: false,
           channelWindowMeta: updateWindowMetaRecord(state.channelWindowMeta, channelId, { loading: false }),
         }));
+        // The remembered row is gone from the window (it aged past the plan's
+        // history, or it is not there): open at the latest messages instead
+        // of an empty channel (task #8).
+        await get().loadMessages(channelId, claimMessageWindowRequest());
+      }
+    }
+  },
+
+  loadWindowAfterHiddenTarget: async (channelId, targetSeq, requestGeneration) => {
+    const ingressContext = captureReceiverPrivateIngressContext(get().currentUserId);
+    try {
+      const limit = 50;
+      const { data } = await api.get(`/messages/channel/${channelId}?limit=${limit}&after=${targetSeq}`);
+      if (!ownsMessageWindowRequest(requestGeneration, channelId, get().currentChannelId)) return;
+      const msgs = coerceCurrentReceiverPrivateMessages(data.messages ?? data, ingressContext);
+      if (!msgs) return settleStaleWindowRead(channelId, ingressContext, () => get().loadWindowAfterHiddenTarget(channelId, targetSeq, requestGeneration));
+      hydrateBundledThreadSummaries(data, ingressContext);
+      const maxSeq = Math.max(...msgs.map((m) => m.seq || 0), 0);
+      // An after page always reports hasNewer; a short page is the end.
+      const hasNewer = msgs.length >= limit;
+      // Nothing above the paywall loads: the window starts here.
+      set((state) => withAcceptedReadStateProjection(state, {
+        channelMessages: { ...state.channelMessages, [channelId]: msgs },
+        historyFetchedChannels: markHistoryFetched(state.historyFetchedChannels, channelId),
+        channelWindowMeta: updateWindowMetaRecord(state.channelWindowMeta, channelId, {
+          loading: false,
+          loadingOlder: false,
+          loadingNewer: false,
+          hasMore: false,
+          hasNewer,
+          hasGap: false,
+          historyLimited: true,
+          contextLoadError: CONTEXT_BEYOND_HISTORY_ERROR,
+        }),
+        messages: msgs,
+        lastSeq: Math.max(state.lastSeq, maxSeq),
+        loading: false,
+        hasMore: false,
+        hasNewer,
+        hasGap: false,
+        historyLimited: true,
+        contextLoadError: CONTEXT_BEYOND_HISTORY_ERROR,
+        highlightedMessageId: null,
+      }, [channelId]));
+    } catch {
+      if (ownsMessageWindowRequest(requestGeneration, channelId, get().currentChannelId)) {
+        set((state) => ({
+          loading: false,
+          highlightedMessageId: null,
+          contextLoadError: CONTEXT_BEYOND_HISTORY_ERROR,
+          channelWindowMeta: updateWindowMetaRecord(state.channelWindowMeta, channelId, { loading: false, contextLoadError: CONTEXT_BEYOND_HISTORY_ERROR }),
+        }));
       }
     }
   },
 
   syncGap: async (channelId, options) => {
-    const { currentChannelId, loadingGap, isNearBottom, hasNewer, unreadCounts } = get();
+    const { currentChannelId } = get();
     const targetChannelId = channelId ?? currentChannelId ?? undefined;
-    if (loadingGap) return;
+    // A channel this person was removed from: its sync is refused every time.
+    if (isChannelAccessLost(targetChannelId)) return;
 
-    const sinceSeq = options?.sinceSeq ?? (
-      targetChannelId
-        ? getMaxSeq(get().channelMessages[targetChannelId] ?? [])
-        : get().lastSeq
-    );
+    // From the window tail, or lower when a live row shown across a jump
+    // still has its hole unconfirmed.
+    const pendingSince = targetChannelId ? getGapFillSinceSeq(targetChannelId) : null;
+    const tailSeq = targetChannelId
+      ? getMaxSeq(get().channelMessages[targetChannelId] ?? [])
+      : get().lastSeq;
+    const sinceSeq = options?.sinceSeq ?? (pendingSince === null ? tailSeq : Math.min(pendingSince, tailSeq));
     if (sinceSeq <= 0) return;
+
+    // One read per scope at a time: a read asked for meanwhile (a live row
+    // that lands while it is in flight, a heartbeat) runs once after it.
+    const readKey = targetChannelId ?? "";
+    if (joinGapReadInFlight(readKey, sinceSeq)) return;
+    if (gapSyncWaitsForShow(targetChannelId, sinceSeq, get().syncGap)) return;
+    const { read, startEpoch } = startGapRead(readKey);
+    const { isNearBottom, hasNewer, unreadCounts } = get();
 
     const shouldTrackCurrentGap = Boolean(targetChannelId && currentChannelId === targetChannelId);
     if (shouldTrackCurrentGap) {
@@ -2699,6 +2927,8 @@ export const useMessageStore = create<MessageState>((set, get) => ({
     }
 
     const ingressContext = captureReceiverPrivateIngressContext(get().currentUserId);
+    let outcome: "read" | "failed" | "abandoned" = "abandoned";
+    let remainingPending = 0;
     try {
       const limit = 200;
       let cursor = sinceSeq;
@@ -2711,11 +2941,14 @@ export const useMessageStore = create<MessageState>((set, get) => ({
         });
         if (targetChannelId) params.set("channel_id", targetChannelId);
 
+        noteMessageHistoryRequest();
         const { data } = await api.get(`/messages/sync?${params}`);
         const page = coerceCurrentReceiverPrivateMessages(
           (data as Message[]) ?? [],
           ingressContext,
         );
+        // The signed-in person changed under the read: drop it (finally
+        // still clears the loading flags).
         if (!page) return;
         if (page.length === 0) break;
         syncedMessages.push(...page);
@@ -2730,29 +2963,35 @@ export const useMessageStore = create<MessageState>((set, get) => ({
           let arr = byChannel.get(m.channelId);
           // Stryker disable next-line BooleanLiteral,ConditionalExpression,BlockStatement,ArrayDeclaration: grouping bucket initialization is legacy sync-gap mechanics; read-state tests assert downstream unread projection.
           if (!arr) { arr = []; byChannel.set(m.channelId, arr); }
-          arr.push(m);
+          // The live copy of a message shown across this gap may know more
+          // than the sync row (RFC 077: who sent it for its owner); keep it.
+          const live = getPendingGapMessages(m.channelId).find((pending) => pending.id === m.id);
+          arr.push(live ? keepDelegationFacts(m, live) : m);
         }
 
+        // Older rows the read returns interleave with the live rows already
+        // shown: merge by id and order by seq.
         const newChannelMessages = { ...state.channelMessages };
         for (const [chId, msgs] of byChannel) {
           const existing = newChannelMessages[chId] ?? [];
-          const existingIds = new Set(existing.map((m) => m.id));
-          const deduped = msgs.filter((m) => !existingIds.has(m.id));
+          const knownIds = new Set(existing.map((m) => m.id));
+          const deduped = msgs.filter((m) => {
+            if (knownIds.has(m.id)) return false;
+            knownIds.add(m.id);
+            return true;
+          });
           if (deduped.length > 0) {
             newChannelMessages[chId] = sortBySeq([...existing, ...deduped]);
           }
         }
 
         if (targetChannelId) {
-          const existing = newChannelMessages[targetChannelId] ?? [];
-          const stitched = takeContiguousPendingGapMessages(
+          remainingPending = settlePendingGapMessages(
             targetChannelId,
-            getMaxSeq(existing),
-            new Set(existing.map((message) => message.id))
+            sinceSeq,
+            startEpoch,
+            new Set(syncedMessages.map((message) => message.id)),
           );
-          if (stitched.length > 0) {
-            newChannelMessages[targetChannelId] = sortBySeq([...existing, ...stitched]);
-          }
         }
 
         const maxSeq = Math.max(getMaxSeq(syncedMessages), state.lastSeq);
@@ -2762,7 +3001,7 @@ export const useMessageStore = create<MessageState>((set, get) => ({
           lastSeq: maxSeq,
         };
         if (shouldTrackCurrentGap) {
-          nextState.hasGap = targetChannelId ? getPendingGapMessages(targetChannelId).length > 0 : false;
+          nextState.hasGap = remainingPending > 0;
           nextState.loadingGap = false;
           if (targetChannelId) {
             nextState.channelWindowMeta = updateWindowMetaRecord(state.channelWindowMeta, targetChannelId, {
@@ -2775,27 +3014,39 @@ export const useMessageStore = create<MessageState>((set, get) => ({
         if (targetChannelId) projectionChannelIds.add(targetChannelId);
         return withAcceptedReadStateProjection(state, nextState, projectionChannelIds);
       });
+      outcome = "read";
 
-      if (shouldTrackCurrentGap && targetChannelId) {
+      // Read the channel through its newest row once no hole is left
+      // unconfirmed (a row that landed during the read waits for its own).
+      if (shouldTrackCurrentGap && targetChannelId && remainingPending === 0) {
         const updatedMessages = get().channelMessages[targetChannelId] ?? [];
         const newestSeq = getMaxSeq(updatedMessages);
         if (newestSeq > 0 && isNearBottom && !hasNewer) {
-          const autoReadQueued = queueLiveAppendAutoReadSync(targetChannelId, newestSeq);
+          const autoReadQueued = queueLiveAppendAutoReadSync(targetChannelId, newestSeq, "channel", readCurrentChannelLater(targetChannelId));
           if (autoReadQueued && unreadCounts[targetChannelId]) {
             get().clearUnread(targetChannelId);
           }
         }
       }
-    } catch {
-      if (shouldTrackCurrentGap) {
-        set((state) => ({
-          loadingGap: false,
-          channelWindowMeta: targetChannelId
-            ? updateWindowMetaRecord(state.channelWindowMeta, targetChannelId, { loadingGap: false })
-            : state.channelWindowMeta,
-        }));
+    } catch (error) {
+      noteChannelReadError(targetChannelId, error);
+      outcome = "failed";
+    } finally {
+      // Never leave the loading flag up: not on an error, not on a read
+      // dropped because the signed-in person changed.
+      if (shouldTrackCurrentGap && outcome !== "read") {
+        set((state) => {
+          const stillOwed = targetChannelId ? channelOwesGapFill(targetChannelId) : false;
+          return {
+            loadingGap: false,
+            hasGap: stillOwed,
+            channelWindowMeta: targetChannelId
+              ? updateWindowMetaRecord(state.channelWindowMeta, targetChannelId, { loadingGap: false, hasGap: stillOwed })
+              : state.channelWindowMeta,
+          };
+        });
       }
-      // Ignore sync errors
+      finishGapRead(readKey, read, targetChannelId, outcome, (rerunSince) => void get().syncGap(targetChannelId, { sinceSeq: rerunSince }));
     }
   },
 
@@ -2808,10 +3059,16 @@ export const useMessageStore = create<MessageState>((set, get) => ({
   },
 
   markCurrentChannelRead: () => {
-    const { currentChannelId, messages, hasNewer } = get();
+    const { currentChannelId, messages, hasNewer, isNearBottom } = get();
     if (!currentChannelId) return;
-    if (!canAutoMarkCurrentChannelRead()) return;
-    if (hasNewer) return;
+    if (isAutoReadHeld(currentChannelId) || !canAutoMarkCurrentChannelRead()) return;
+    // Only what is in front of the person: not while they read older history
+    // (a window focus used to read the whole channel from up there).
+    if (hasNewer || !isNearBottom) return;
+    // A live row is shown past a hole not yet confirmed empty: the gap fill
+    // reads the channel once it answers (syncGap), not past the hole now.
+    if (channelOwesGapFill(currentChannelId)) return;
+    forgetSkippedSeenRead(currentChannelId);
     const maxSeq = Math.max(...messages.map((m) => m.seq || 0), 0);
     if (maxSeq > 0) {
       queueReadSync(currentChannelId, maxSeq);
@@ -2824,14 +3081,19 @@ export const useMessageStore = create<MessageState>((set, get) => ({
     set({ currentChannelId: channelId });
   },
   setCurrentUserId: (userId) => {
-    const previousUserId = get().currentUserId;
-    set({ currentUserId: userId });
     setCurrentPrincipalId(userId);
-    if (previousUserId === userId) return;
+    // The same person again (a token refresh, /auth/me agreeing): nothing
+    // changes, so no subscriber is told.
+    if (get().currentUserId === userId) return;
+    set({ currentUserId: userId });
     invalidateReceiverPrivateIngressContexts();
     reactionReadModelStore.getState().activatePrincipal(userId);
   },
-  setHighlightedMessageId: (messageId) => set({ highlightedMessageId: messageId }),
+  setHighlightedMessageId: (messageId) =>
+    set((state) => ({
+      highlightedMessageId: messageId,
+      highlightNonce: messageId ? state.highlightNonce + 1 : state.highlightNonce,
+    })),
   requestTransientFocus: (channelId, messageId) =>
     set({
       transientFocusRequest: {
@@ -2854,6 +3116,28 @@ registerReceiverPrivatePrincipalReader(
   () => useMessageStore.getState().currentUserId,
 );
 
+onCurrentServerConfirmed(() => {
+  void flushAllPendingReads();
+});
+
+// Drafts belong to the signed-in person (draftStorage.ts). Followed on
+// the store rather than in setCurrentUserId so a seeded `setState` is covered
+// too: a new person gets their own drafts and the previous one's leave memory.
+// A switch without a sign-out keeps the previous person's drafts in their own
+// entry (their pending write lands there); a sign-out has already dropped it.
+useMessageStore.subscribe((state, previousState) => {
+  if (state.currentUserId === previousState.currentUserId) return;
+  flushPendingDraftSnapshot();
+  useMessageStore.setState({ drafts: loadDrafts(state.currentUserId), draftUpdatedAt: loadDraftTimes(state.currentUserId) });
+});
+
+onDraftsForgotten((userId) => {
+  const { currentUserId } = useMessageStore.getState();
+  if (userId === null || currentUserId === null || currentUserId === userId) useMessageStore.setState({ drafts: {}, draftUpdatedAt: {} });
+});
+
+setGapFillReader((channelId, sinceSeq) => void useMessageStore.getState().syncGap(channelId, { sinceSeq }));
+
 // Reset server-scoped state when the user switches servers.
 // channelMessages and drafts are intentionally kept: channelMessages becomes
 // unreachable once channels are cleared, and drafts are harmless cross-server.
@@ -2865,13 +3149,16 @@ registerServerReset(() =>
     resetPendingReads();
     pendingUnreadReceipts.clear();
     clearPendingGapMessages();
+    messageHistoryRequestCount = 0;
     useMessageStore.setState({
       channelMessages: {},
       channelWindowMeta: {},
+      historyFetchedChannels: {},
       messages: [],
       highlightedMessageId: null,
       transientFocusRequest: null,
       lastSeq: 0,
+      syncHorizon: null,
       currentChannelId: null,
       loading: false,
       loadingOlder: false,

@@ -1,0 +1,1 @@
+ALTER TABLE "third_party_agent_events" ADD COLUMN "wake_coalesced_at" timestamp with time zone;

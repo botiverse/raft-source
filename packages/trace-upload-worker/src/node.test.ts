@@ -176,6 +176,57 @@ test("Node trace upload service uses forwarded HTTPS proto when returning signed
   }
 });
 
+test("Node trace upload service logs request_aborted when the client closes mid-body", async () => {
+  const port = await getFreePort();
+  const child = spawn(
+    process.execPath,
+    [
+      "--import",
+      "@oxc-node/core/register",
+      "src/node.ts",
+    ],
+    {
+      env: {
+        ...process.env,
+        PORT: String(port),
+        SCOPE_ATTESTATION_SECRET: SECRET,
+        R2_ENDPOINT: "https://example.com",
+        R2_BUCKET: "trace-bucket",
+        R2_ACCESS_KEY_ID: "access-key",
+        R2_SECRET_ACCESS_KEY: "secret-key",
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  );
+  let output = "";
+  child.stdout.on("data", (chunk) => { output += String(chunk); });
+  child.stderr.on("data", (chunk) => { output += String(chunk); });
+
+  try {
+    await waitForHealthz(port);
+    const { connect } = await import("node:net");
+    await new Promise<void>((resolve, reject) => {
+      const socket = connect(port, "127.0.0.1", () => {
+        // Promise 1000 bytes, send 7, then hang up.
+        socket.write(
+          "POST /api/web-traces HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 1000\r\n\r\n{\"a\":1",
+          () => setTimeout(() => { socket.destroy(); resolve(); }, 50),
+        );
+      });
+      socket.on("error", reject);
+    });
+
+    const deadline = Date.now() + 5000;
+    while (!output.includes("request_aborted") && !output.includes("request_failed") && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.match(output, /\[TraceUploadWorker\] request_aborted \{\s+method: 'POST',\s+path: '\/api\/web-traces',\s+error_message: 'aborted'\s+\}/);
+    assert.doesNotMatch(output, /request_failed/);
+  } finally {
+    child.kill();
+  }
+});
+
 async function waitForHealthz(port: number): Promise<void> {
   const deadline = Date.now() + 5000;
   while (Date.now() < deadline) {

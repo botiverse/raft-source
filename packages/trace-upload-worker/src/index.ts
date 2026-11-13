@@ -9,6 +9,7 @@ import {
   isFeedbackReportPath,
   putFeedbackReportObject,
 } from "./feedback/reports";
+import { ANTIPROTON_TRACE_PATH, ingestAntiprotonTraceBatch } from "./external/antiprotonTrace";
 import { GITHUB_REFRESH_PATH, ingestGithubRefreshBatch } from "./external/githubRefresh";
 import { HttpError, jsonResponse } from "./shared/http";
 import { createTraceBundleUpload, putTraceBundleObject } from "./traces/bundles";
@@ -34,6 +35,9 @@ export async function handleRequest(request: Request, env: TraceUploadWorkerEnv,
     }
     if (request.method === "POST" && url.pathname === GITHUB_REFRESH_PATH) {
       return await ingestGithubRefreshBatch(request, env);
+    }
+    if (request.method === "POST" && url.pathname === ANTIPROTON_TRACE_PATH) {
+      return await ingestAntiprotonTraceBatch(request, env);
     }
     if (url.pathname === "/api/web-traces") {
       if (request.method === "OPTIONS") {
@@ -70,6 +74,26 @@ export async function handleRequest(request: Request, env: TraceUploadWorkerEnv,
         : { error: err.message };
       return jsonResponse(body, err.status, headers);
     }
+    // The client went away, or stalled into the server's request timeout,
+    // before its request arrived (the Node entry point aborts the request's
+    // signal). It is not a failure of ours, so it gets its own line; the
+    // message is kept so a mislabelled failure would still show.
+    if (request.signal.aborted) {
+      console.warn("[TraceUploadWorker] request_aborted", {
+        method: request.method,
+        path: url.pathname,
+        error_message: err instanceof Error ? err.message : String(err),
+      });
+      return jsonResponse({ error: "Internal server error" }, 500, headers);
+    }
+    // The client only sees "Internal server error"; without this line a 500
+    // leaves no trace of its cause. Path only: the query can carry a token.
+    console.error("[TraceUploadWorker] request_failed", {
+      method: request.method,
+      path: url.pathname,
+      error_class: err instanceof Error ? err.name : "Error",
+      error_message: err instanceof Error ? err.message : String(err),
+    });
     return jsonResponse({ error: "Internal server error" }, 500, headers);
   }
 }

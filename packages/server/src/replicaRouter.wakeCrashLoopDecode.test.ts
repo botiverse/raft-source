@@ -35,6 +35,12 @@ const task1221Defaults = {
   startFailureOwnedLaunchId: null,
   blockedByLaunchId: null,
   actionRequiredNotifiedFingerprint: null,
+  pauseRetryAtMs: null,
+  pauseRetryCooldownMs: null,
+  pauseRetryLaunchId: null,
+  pauseRetryReadyLaunchId: null,
+  pauseRetryReadyCooldownMs: null,
+  pauseRetryCapNotified: false,
 };
 
 test("a whole record decodes unchanged with nothing repaired", () => {
@@ -75,6 +81,12 @@ const everyFieldSet: Required<WakeCrashLoopEpisodeState> = {
   startFailureOwnedLaunchId: "launch-owned",
   blockedByLaunchId: "launch-blocker",
   actionRequiredNotifiedFingerprint: "0123456789abcdef",
+  pauseRetryAtMs: 1_700_001_800_000,
+  pauseRetryCooldownMs: 1_800_000,
+  pauseRetryLaunchId: "launch-try",
+  pauseRetryReadyLaunchId: "launch-ready-try",
+  pauseRetryReadyCooldownMs: 3_600_000,
+  pauseRetryCapNotified: true,
 };
 
 test("every field of the episode state round-trips through the Redis codec", () => {
@@ -85,6 +97,16 @@ test("every field of the episode state round-trips through the Redis codec", () 
     assert.notDeepEqual(value, fresh[key], `${key} must differ from its default so an omission is visible`);
   }
   assert.deepEqual(decodeWakeCrashLoopState(encodeWakeCrashLoopState(everyFieldSet)), { state: everyFieldSet, repaired: [] });
+});
+
+test("step 12 follow-up: the capped-notice mark round-trips; a record without it decodes as not told, a malformed one is repaired", () => {
+  const told: Required<WakeCrashLoopEpisodeState> = { ...whole, ...task1221Defaults, lastExitKind: "agent_process_exited", blocked: true, needsActionReason: "runtime_repeated_failure", pauseRetryAtMs: 1_700_028_800_000, pauseRetryCooldownMs: 28_800_000, pauseRetryCapNotified: true };
+  assert.deepEqual(decodeWakeCrashLoopState(encodeWakeCrashLoopState(told)), { state: told, repaired: [] }, "a replica restart does not tell the owner again");
+  const { pauseRetryCapNotified: _omitted, ...older } = told;
+  assert.deepEqual(decodeWakeCrashLoopState(JSON.stringify(older)), { state: { ...older, pauseRetryCapNotified: false }, repaired: [] });
+  const malformed = decodeWakeCrashLoopState(JSON.stringify({ ...told, pauseRetryCapNotified: "yes" }));
+  assert.equal(malformed?.state.pauseRetryCapNotified, false);
+  assert.deepEqual(malformed?.repaired, ["pauseRetryCapNotified"]);
 });
 
 test("malformed task #1221 fields are repaired to their defaults and named", () => {

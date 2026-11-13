@@ -1,10 +1,15 @@
-import { RuntimeModelNotFoundError } from "../spawnFailureErrors";
+import type { TurnEndCompactionDriverOutcome, TurnEndContextFacts } from "../turnEndCompaction";
+import { ProviderApiKeyInvalidError, RuntimeModelNotFoundError } from "../spawnFailureErrors";
 import { withProcessEnvPatch } from "../processEnvPatch";
 import type { ProviderRequestObserver } from "../providerRequestFetch";
+import { PiRequestLog } from "../agentContextView/piRequestLog";
+import { PiProviderCallTracker } from "./piProviderCallTracker";
+import { PI_ANTHROPIC_REQUEST_SOURCE, PiAnthropicRequestMeter } from "./piAnthropicRequests";
+import { readGatewayModelLimits, type GatewayModelLimits, type GatewayModelLimitsResult } from "../gatewayModelLimits";
 import "../bundledPiOAuth";
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { existsSync, mkdirSync, readdirSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, statSync } from "node:fs";
 import path from "node:path";
 import {
   createAgentSessionFromServices,
@@ -36,6 +41,9 @@ import {
   getRuntimeProviderDisplayName,
   humanizeRuntimeProviderSegment,
   hydrateRuntimeConfig,
+  BUILTIN_RUNTIME_CUSTOM_MODEL_PRESET_PROVIDER_IDS,
+  isBuiltInRuntimeCustomModelPresetProviderId,
+  PI_BUILTIN_PROVIDER_CONNECTION_PROBES,
   isBuiltInRuntimeGatewayProviderId,
   isBuiltInRuntimeProviderId,
   PI_BUILTIN_PROVIDER_ENV_KEYS,
@@ -44,14 +52,20 @@ import {
   runtimeModelSourceOutcomeFromSet,
   type ActiveSpan,
   type AgentConfig,
+  type BuiltInRuntimeProviderId,
+  type RuntimeModelConfig,
   type RuntimeModelInfo,
   type RuntimeModelSet,
   type RuntimeModelSourceOutcome,
   type RuntimeConfig,
   type ProviderRequestActivity,
   type ProviderConnectionLaunchProjection,
+  PI_RESPONSE_NOTICE_TEXT,
+  currentDate,
   currentTimeMs,
   type AxSurfaceText,
+  type ModelLimits,
+  type ModelLimitValue,
 } from "@botiverse/raft-shared";
 import {
   normalizeRuntimeCompactionReason,
@@ -59,15 +73,31 @@ import {
 } from "../runtimeCompactionProjection";
 import { buildRuntimeErrorActivityDiagnostic } from "../runtimeErrorDiagnostics";
 import { buildCliTransportSystemPrompt, prepareCliTransport } from "./cliTransport";
+import { formatBuiltInDefaultModelLimitsNote, withSystemPromptSection } from "./piModelLimitsNote";
 import { buildPiTokenUsageEvent } from "./piEventNormalizer";
 import { createManagedMcpPiTools } from "./managedMcpTools";
 import { createPiCommandTool } from "./piCommandTool";
+import { SendIntentArgumentScanner } from "./sendIntentScanner";
+import { trackPiSessionMemory } from "./piSessionMemory";
+import { buildPiSessionSeed, type PiSessionRotationStats, type PiSessionSeed } from "./piSessionSeed";
+import {
+  countPiUserExtensions,
+  newestPiSessionFile,
+  PI_DAEMON_EXTENSION_NAME,
+  piSessionSeedRefusalTraceAttrs,
+  resolvePiSessionRotationConfig,
+  undoPiSessionRotationFiles,
+  writePiSessionRotationFiles,
+  type PiSessionRotationConfig,
+  type PiSessionRotationSkipReason,
+} from "./piSessionRotation";
 import {
   createPiCompactionFitExtension,
   piCompactionFitTelemetryAttrs,
   takePiCompactionFit,
   type PiCompactionFit,
 } from "./piCompactionFit";
+import { RuntimeTurnOriginHolder, type RuntimeTurnOrigin } from "../runtimeTurnOrigin";
 import {
   createProviderHttpClient,
   type ProviderHttpClient,
@@ -90,9 +120,11 @@ import type {
   RuntimeExitInfo,
   RuntimeModelDetectionContext,
   RuntimeProbeResult,
+  RuntimeProviderCallSnapshot,
   RuntimeSendResult,
   RuntimeSession,
   RuntimeSessionDescriptor,
+  RuntimeSessionRotationHold,
   SpawnContext,
   SpawnResult,
 } from "./types";
@@ -123,12 +155,34 @@ const BUILTIN_BLOCKED_HOST_PROVIDER_ENV_KEYS = Array.from(new Set([
 ])) as readonly string[];
 
 type PiModelRegistryLike = Pick<ModelRegistry, "getAvailable">;
+/**
+ * A pi SDK session the daemon opened, and how to open its session file again
+ * on the same spawn resources (services, model, tools including managed MCP
+ * tools, provider HTTP client, CLI transport): a rotation's resume, which
+ * must neither redo the spawn's side effects nor change the request.
+ */
+export class PiSdkSessionHandle {
+  constructor(
+    readonly session: AgentSession,
+    /**
+     * Opens the newest file of the id, then disposes `session`. If the open
+     * fails, `session` is left as it was, still usable.
+     */
+    readonly reopen: () => Promise<PiSdkSessionHandle>,
+    /** task #1357 item 1: the limits registered for the session's model (`configureBuiltInGatewayCustomModel`); null when none were. */
+    readonly modelLimits: ModelLimits | null = null,
+  ) {}
+}
+
+/** A bare AgentSession (test doubles) cannot be reopened, so it is never rotated. */
 type PiSessionFactory = (
   ctx: SpawnContext,
   sessionId: string,
   toolExecutionObserver?: PiToolExecutionObserver,
   providerObserver?: ProviderRequestObserver,
-) => Promise<AgentSession>;
+  providerCallTracker?: PiProviderCallTracker,
+  anthropicRequests?: PiAnthropicRequestMeter,
+) => Promise<AgentSession | PiSdkSessionHandle>;
 type PiAssistantMessageEvent = Extract<AgentSessionEvent, { type: "message_update" }>["assistantMessageEvent"];
 
 type RuntimeSessionEvents = {
@@ -142,27 +196,51 @@ type RuntimeSessionEvents = {
 
 type RuntimeSessionEventName = keyof RuntimeSessionEvents;
 
+interface PiResponseObservation {
+  text: boolean;
+  whitespace: boolean;
+  thinkingOrTool: boolean;
+  indeterminate: boolean;
+}
+
 export interface PiSdkEventMappingState {
   sessionId: string | null;
   sessionAnnounced: boolean;
+  responseSessionId: string | null;
+  responseObservation: PiResponseObservation | null;
+  /** SDK final message object identity, not timestamps (two responses can share a millisecond). */
+  endedResponses: WeakSet<object>;
+  responseCancelled: boolean;
   pendingTurnEnd: boolean;
   pendingProviderError: string | null;
   providerErrorOwnedByCompaction: boolean;
   compactionTerminal: boolean;
+  /** Counts this session's compactions; pi runs one at a time, so a start's id is its end's. */
+  compactionCycle: number;
+  /** The id of the compaction started and not yet ended; an end without one carries no id. */
+  openCompactionCycle: number | null;
   thinkingBuffers: Map<number, string>;
   announcedThinkingIndexes: Set<number>;
   textBuffers: Map<number, string>;
   announcedTextIndexes: Set<number>;
+  /** Agent typing line: `raft message send` targets in streaming bash arguments (created on first use). */
+  sendIntentScanner?: SendIntentArgumentScanner;
 }
 
 export function createPiSdkEventMappingState(sessionId: string | null = null): PiSdkEventMappingState {
   return {
     sessionId,
     sessionAnnounced: false,
+    responseSessionId: sessionId,
+    responseObservation: null,
+    endedResponses: new WeakSet(),
+    responseCancelled: false,
     pendingTurnEnd: false,
     pendingProviderError: null,
     providerErrorOwnedByCompaction: false,
     compactionTerminal: false,
+    compactionCycle: 0,
+    openCompactionCycle: null,
     thinkingBuffers: new Map(),
     announcedThinkingIndexes: new Set(),
     textBuffers: new Map(),
@@ -323,6 +401,12 @@ export function buildBuiltInAgentDir(workingDirectory: string): string {
   return path.join(workingDirectory, BUILTIN_AGENT_DIR);
 }
 
+/** `target` as the agent names it from its workspace: relative inside it, absolute outside. */
+function workspaceRelativePath(workingDirectory: string, target: string): string {
+  const relative = path.relative(workingDirectory, target);
+  return relative && !relative.startsWith("..") && !path.isAbsolute(relative) ? relative.split(path.sep).join("/") : target;
+}
+
 export function buildPiLegacyRpcArgs(ctx: SpawnContext, sessionId: string | null): string[] {
   const launchRuntimeFields = runtimeConfigToLaunchFields(hydrateRuntimeConfig(ctx.config));
   const args = [
@@ -371,10 +455,9 @@ export function assertProviderApiKeyIsHeaderSafe(apiKey: string, keyName: string
   for (let index = 0; index < trimmed.length; index += 1) {
     const code = trimmed.charCodeAt(index);
     if (code > 0xff || code === 0x0a || code === 0x0d || code === 0x00) {
-      throw new Error(
-        `${keyName} contains a character that cannot be sent in an HTTP header (position ${leading + index + 1}, `
-        + `code ${code}). Remove any pasted text, line breaks or other characters that are not part of the key.`,
-      );
+      // task #1307: typed, so the start failure is classified as a key problem
+      // instead of the generic runtime_spawn_failed.
+      throw new ProviderApiKeyInvalidError({ keyName, position: leading + index + 1, charCode: code });
     }
   }
 }
@@ -493,6 +576,12 @@ export function resolvePiModelFromRegistry(
   if (gateway && runtimeConfig.runtime === "builtin" && runtimeConfig.model.kind === "custom") {
     return modelRegistry.find(builtInGatewayRegistryProvider(gateway.providerId).id, runtimeConfig.model.name);
   }
+  // A typed model on a preset provider that accepts one (task #10): the name is
+  // the provider's own id (it may contain "/"), registered under exactly that
+  // provider by configureBuiltInPresetCustomModel. Same rule as above: no
+  // fallback, so an unregistered name fails as RuntimeModelNotFoundError.
+  const presetCustom = resolveBuiltInPresetCustomModel(runtimeConfig);
+  if (presetCustom) return modelRegistry.find(presetCustom.providerId, presetCustom.modelId);
   const [provider, ...modelParts] = modelId.split("/");
   if (provider && modelParts.length > 0) {
     return modelRegistry.find(provider, modelParts.join("/"));
@@ -676,6 +765,264 @@ export function resolveBuiltInGatewayLaunch(
 export interface BuiltInGatewayRegistration {
   /** The on-record contract applied to this (endpoint, id) pair; null when the SDK catalog knew the pair or nothing was on record. */
   thinkingContract: AnthropicGatewayThinkingContract | null;
+  /**
+   * task #1357 item 1: exactly the contextWindow and maxTokens registered for
+   * the model, each with its own source. Null when no gateway custom model
+   * was registered (other runtimes, providers or model kinds).
+   */
+  modelLimits: ModelLimits | null;
+}
+
+/**
+ * The agent's declared limit (#proj-runtime:#50), else the value the gateway's
+ * own model list reported (#proj-runtime:#53), else the value a matching
+ * catalog entry had, else Raft's default; the source says which. What the
+ * registry then applies on top is effectiveModelLimits.
+ */
+function registeredModelLimit(
+  configured: number | undefined,
+  gatewayValue: number | undefined,
+  catalogValue: number | undefined,
+  raftDefault: number,
+): ModelLimitValue {
+  if (typeof configured === "number") return { value: configured, source: "agent_config" };
+  if (typeof gatewayValue === "number") return { value: gatewayValue, source: "gateway" };
+  return typeof catalogValue === "number"
+    ? { value: catalogValue, source: "catalog" }
+    : { value: raftDefault, source: "raft_default" };
+}
+
+/**
+ * The `modelOverrides` entry for a model in the models.json snapshot the
+ * registry composes with, or undefined. pi-coding-agent keeps that snapshot
+ * in `ModelRuntime#config` (a `ModelConfig`; neither is exported), read when
+ * the session's services are built. Reading it, not comparing values, is
+ * what tells an override that happens to equal Raft's default from no
+ * override. Returns undefined when the registry has no such snapshot (a test
+ * double, or an SDK that moved it: pi.modelLimits.test.ts then fails).
+ */
+function loadedModelOverride(
+  modelRegistry: object,
+  providerId: string,
+  modelId: string,
+): { contextWindow?: unknown; maxTokens?: unknown } | undefined {
+  const config = (modelRegistry as { runtime?: { config?: { getProvider?: unknown } } }).runtime?.config;
+  if (!config || typeof config.getProvider !== "function") return undefined;
+  const provider = (config.getProvider as (id: string) => { modelOverrides?: Record<string, unknown> } | undefined).call(config, providerId);
+  const overrides = provider?.modelOverrides;
+  if (!overrides || !Object.hasOwn(overrides, modelId)) return undefined;
+  const entry = overrides[modelId];
+  return entry && typeof entry === "object" ? entry as { contextWindow?: unknown; maxTokens?: unknown } : undefined;
+}
+
+/**
+ * The limits a model Raft just registered runs with. Pi applies the agent
+ * dir's models.json `modelOverrides` over a registered provider's models, as
+ * its topmost layer (pi-coding-agent `composeModelProvider`), so a field the
+ * loaded file overrides runs with the file's value whatever Raft registered,
+ * the agent's own setting included. Such a field is reported with the value
+ * the registry holds, as `catalog` (the Pi model registry had it); every
+ * other field keeps what was registered.
+ */
+function effectiveModelLimits(
+  registered: ModelLimits,
+  override: { contextWindow?: unknown; maxTokens?: unknown } | undefined,
+  effective: { contextWindow: number; maxTokens: number } | undefined,
+): ModelLimits {
+  if (!override || !effective) return registered;
+  return {
+    contextWindow: typeof override.contextWindow === "number"
+      ? { value: effective.contextWindow, source: "catalog" }
+      : registered.contextWindow,
+    maxTokens: typeof override.maxTokens === "number"
+      ? { value: effective.maxTokens, source: "catalog" }
+      : registered.maxTokens,
+  };
+}
+
+/**
+ * The key a Built-in gateway custom model sends, from where the session's own
+ * seeding takes it (`seedPiSessionModelRuntime`); null when there is none.
+ */
+function builtInGatewayApiKey(
+  runtimeConfig: RuntimeConfig,
+  providerConnection: ProviderConnectionLaunchProjection | null,
+  launchEnvVars: Record<string, string> | null,
+): string | null {
+  if (runtimeConfig.runtime !== "builtin") return null;
+  if (runtimeConfig.provider.kind === "gateway") return runtimeConfig.provider.apiKey || null;
+  if (
+    runtimeConfig.provider.kind === "connection"
+    && providerConnection
+    && isBuiltInRuntimeGatewayProviderId(providerConnection.providerId)
+  ) {
+    return launchEnvVars?.[BUILTIN_RUNTIME_GATEWAY_PROVIDER_ENV_KEYS[providerConnection.providerId]] || null;
+  }
+  return null;
+}
+
+/**
+ * #proj-runtime:#53: read the gateway's model list for a Built-in gateway
+ * custom model whose agent config lacks a limit. The contract is the public
+ * docs page developers/gateway-model-limits. Never throws and never blocks a
+ * start: every failure is an outcome, and registration falls through.
+ */
+export async function readBuiltInGatewayModelLimits(
+  runtimeConfig: RuntimeConfig,
+  providerConnection: ProviderConnectionLaunchProjection | null,
+  launchEnvVars: Record<string, string> | null,
+  fetchImpl: typeof globalThis.fetch,
+): Promise<GatewayModelLimitsResult> {
+  const gateway = resolveBuiltInGatewayLaunch(runtimeConfig, providerConnection);
+  if (!gateway || runtimeConfig.runtime !== "builtin" || runtimeConfig.model.kind !== "custom") {
+    return { limits: null, outcome: "skipped", cached: false };
+  }
+  if (typeof runtimeConfig.model.contextWindow === "number" && typeof runtimeConfig.model.maxOutputTokens === "number") {
+    return { limits: null, outcome: "skipped", cached: false };
+  }
+  const apiKey = builtInGatewayApiKey(runtimeConfig, providerConnection, launchEnvVars);
+  if (!apiKey) return { limits: null, outcome: "skipped", cached: false };
+  return readGatewayModelLimits({
+    kind: gateway.providerId,
+    baseUrl: gateway.baseUrl,
+    apiKey,
+    modelId: runtimeConfig.model.name,
+    fetch: fetchImpl,
+    // A stock CLIProxyAPI lists limits only in its `client_version=pi` catalog.
+    clientVersionCatalog: true,
+  });
+}
+
+/**
+ * Preset providers whose own model list follows the gateway contract
+ * (docs.raft.build/developers/gateway-model-limits): OpenRouter's
+ * `<base>/models` lists `context_length` and `top_provider.max_completion_tokens`.
+ */
+const PRESET_MODEL_LIST_PROVIDER_IDS: ReadonlySet<string> = new Set(["openrouter"]);
+
+/**
+ * The base URL a preset provider's model list is read from: the provider's
+ * catalog transport (the one its connection probe calls); null when the
+ * provider has no model list Raft reads.
+ */
+export function builtInPresetModelListBaseUrl(providerId: string): string | null {
+  if (!PRESET_MODEL_LIST_PROVIDER_IDS.has(providerId)) return null;
+  const transport = (PI_BUILTIN_PROVIDER_CONNECTION_PROBES as Record<string, { api: string; baseUrl: string } | undefined>)[providerId];
+  return transport?.api === "openai-completions" && transport.baseUrl ? transport.baseUrl : null;
+}
+
+/**
+ * #proj-runtime:#53 follow-up to task #10: read OpenRouter's model list for a
+ * typed OpenRouter model whose agent config lacks a limit, with the agent's
+ * own OpenRouter key and the gateway reader's rules (5 s, 2 MB, no
+ * redirects, an hour's cache per URL and key). The model is looked up by the
+ * API id the config stores (normalizeBuiltInPresetCustomModel). Never throws
+ * and never blocks a start.
+ */
+export async function readBuiltInPresetCustomModelLimits(
+  runtimeConfig: RuntimeConfig,
+  fetchImpl: typeof globalThis.fetch,
+): Promise<GatewayModelLimitsResult & { baseUrl: string | null }> {
+  const skipped = { limits: null, outcome: "skipped" as const, cached: false, baseUrl: null };
+  const presetCustom = resolveBuiltInPresetCustomModel(runtimeConfig);
+  if (!presetCustom || runtimeConfig.runtime !== "builtin" || runtimeConfig.provider.kind !== "preset") return skipped;
+  const { model } = presetCustom;
+  if (typeof model.contextWindow === "number" && typeof model.maxOutputTokens === "number") return skipped;
+  const baseUrl = builtInPresetModelListBaseUrl(presetCustom.providerId);
+  const apiKey = runtimeConfig.provider.apiKey;
+  if (!baseUrl || !apiKey) return skipped;
+  const result = await readGatewayModelLimits({
+    kind: "openai-compatible",
+    baseUrl,
+    apiKey,
+    modelId: presetCustom.modelId,
+    fetch: fetchImpl,
+  });
+  return { ...result, baseUrl };
+}
+
+/**
+ * task #10: a Built-in agent on a preset provider that accepts a typed model id
+ * (BUILTIN_RUNTIME_CUSTOM_MODEL_PRESET_PROVIDER_IDS, i.e. OpenRouter) whose model
+ * is that typed id; null for every other config. Saved connections are not
+ * covered: their model stays list-only.
+ */
+export function resolveBuiltInPresetCustomModel(
+  runtimeConfig: RuntimeConfig,
+): { providerId: BuiltInRuntimeProviderId; modelId: string; model: Extract<RuntimeModelConfig, { kind: "custom" }> } | null {
+  if (runtimeConfig.runtime !== "builtin" || runtimeConfig.model.kind !== "custom") return null;
+  if (runtimeConfig.provider.kind !== "preset") return null;
+  if (!isBuiltInRuntimeCustomModelPresetProviderId(runtimeConfig.provider.providerId)) return null;
+  return { providerId: runtimeConfig.provider.providerId, modelId: runtimeConfig.model.name, model: runtimeConfig.model };
+}
+
+/**
+ * task #10: register a typed model id under its preset provider so the launch
+ * can resolve it. Transport settings (api, base URL, headers, compat) come
+ * from the catalog entry with that exact id when there is one, else from any
+ * catalog model of the same provider. Limits follow the gateway order: the
+ * agent's declared value, else `reportedLimits` (the provider's own model
+ * list, readBuiltInPresetCustomModelLimits), else the exact catalog entry, else Raft's
+ * default; a `modelOverrides` value in the agent dir's models.json wins over
+ * all of them (effectiveModelLimits). Null limits when nothing was registered.
+ */
+export function configureBuiltInPresetCustomModel(
+  modelRegistry: Pick<ModelRegistry, "getAll" | "find" | "registerProvider">,
+  runtimeConfig: RuntimeConfig,
+  // From readBuiltInPresetCustomModelLimits; used only when the list was read
+  // from the host this registration's model calls go to.
+  reportedLimits: GatewayModelLimits | null = null,
+  reportedFromBaseUrl: string | null = null,
+): { modelLimits: ModelLimits | null } {
+  const presetCustom = resolveBuiltInPresetCustomModel(runtimeConfig);
+  if (!presetCustom) return { modelLimits: null };
+  const { providerId, modelId, model } = presetCustom;
+  const exact = modelRegistry.find(providerId, modelId);
+  const template = exact ?? modelRegistry.getAll().find((model) => model.provider === providerId);
+  // No catalog model of this provider at all: nothing to copy the transport
+  // from. Leave the registry alone so the launch fails as model-not-found.
+  if (!template) return { modelLimits: null };
+  // OpenRouter serves one model list for every transport it offers (Pi's
+  // catalog has both `<host>/api` and `<host>/api/v1`), so the list counts
+  // when it came from the host this registration's model calls go to.
+  const sameOrigin = (a: string, b: string) => {
+    try {
+      return new URL(a).origin === new URL(b).origin;
+    } catch {
+      return false;
+    }
+  };
+  const reported = reportedLimits && reportedFromBaseUrl && sameOrigin(reportedFromBaseUrl, template.baseUrl) ? reportedLimits : null;
+  const contextWindow = registeredModelLimit(model.contextWindow, reported?.contextWindow, exact?.contextWindow, 200_000);
+  const reportedMaxTokens = reported?.maxTokens !== undefined && reported.maxTokens <= contextWindow.value
+    ? reported.maxTokens
+    : undefined;
+  const modelLimits: ModelLimits = {
+    contextWindow,
+    maxTokens: registeredModelLimit(model.maxOutputTokens, reportedMaxTokens, exact?.maxTokens, 8192),
+  };
+  const apiKeyEnv = BUILTIN_RUNTIME_PROVIDER_ENV_KEYS[providerId];
+  modelRegistry.registerProvider(providerId, {
+    name: getRuntimeProviderDisplayName(providerId),
+    baseUrl: template.baseUrl,
+    apiKey: "$" + apiKeyEnv,
+    api: template.api,
+    ...(template.headers ? { headers: template.headers } : {}),
+    models: [{
+      id: modelId,
+      name: exact?.name ?? modelId,
+      reasoning: exact?.reasoning ?? true,
+      thinkingLevelMap: exact?.thinkingLevelMap,
+      input: exact?.input ?? ["text"],
+      cost: exact?.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: modelLimits.contextWindow.value,
+      maxTokens: modelLimits.maxTokens.value,
+      ...(template.compat ? { compat: template.compat } : {}),
+    }],
+  });
+  return {
+    modelLimits: effectiveModelLimits(modelLimits, loadedModelOverride(modelRegistry, providerId, modelId), modelRegistry.find(providerId, modelId)),
+  };
 }
 
 export function configureBuiltInGatewayCustomModel(
@@ -683,9 +1030,10 @@ export function configureBuiltInGatewayCustomModel(
   runtimeConfig: RuntimeConfig,
   providerConnection: ProviderConnectionLaunchProjection | null,
   deps: AnthropicGatewayContractDeps = {},
+  gatewayLimits: GatewayModelLimits | null = null,
 ): BuiltInGatewayRegistration {
   const gateway = resolveBuiltInGatewayLaunch(runtimeConfig, providerConnection);
-  if (!gateway || runtimeConfig.runtime !== "builtin" || runtimeConfig.model.kind !== "custom") return { thinkingContract: null };
+  if (!gateway || runtimeConfig.runtime !== "builtin" || runtimeConfig.model.kind !== "custom") return { thinkingContract: null, modelLimits: null };
 
   const provider = builtInGatewayRegistryProvider(gateway.providerId);
   const matchingModel: Model<"openai-completions"> | Model<"anthropic-messages"> | undefined = provider.api === "openai-completions"
@@ -710,6 +1058,16 @@ export function configureBuiltInGatewayCustomModel(
     matchingModel?.input,
     gateway.supportsImageInput,
   );
+  const contextWindow = registeredModelLimit(runtimeConfig.model.contextWindow, gatewayLimits?.contextWindow, matchingModel?.contextWindow, 200_000);
+  // A gateway max output that does not fit the context window the model ends
+  // up with is ignored (docs page: "Max output must fit in the context window").
+  const gatewayMaxTokens = gatewayLimits?.maxTokens !== undefined && gatewayLimits.maxTokens <= contextWindow.value
+    ? gatewayLimits.maxTokens
+    : undefined;
+  const modelLimits: ModelLimits = {
+    contextWindow,
+    maxTokens: registeredModelLimit(runtimeConfig.model.maxOutputTokens, gatewayMaxTokens, matchingModel?.maxTokens, 8192),
+  };
 
   modelRegistry.registerProvider(provider.id, {
     name: getRuntimeProviderDisplayName(gateway.providerId),
@@ -723,8 +1081,8 @@ export function configureBuiltInGatewayCustomModel(
       thinkingLevelMap: matchingModel?.thinkingLevelMap ?? anthropicContract?.thinkingLevelMap,
       input,
       cost: matchingModel?.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-      contextWindow: matchingModel?.contextWindow ?? 200_000,
-      maxTokens: matchingModel?.maxTokens ?? 8192,
+      contextWindow: modelLimits.contextWindow.value,
+      maxTokens: modelLimits.maxTokens.value,
       ...(provider.api === "openai-completions"
         ? {
             // A user-supplied OpenAI-compatible endpoint is not necessarily
@@ -743,20 +1101,14 @@ export function configureBuiltInGatewayCustomModel(
             : {}),
     }],
   });
-  return { thinkingContract: anthropicContract ?? null };
-}
-
-function findPiSessionFile(sessionDir: string, sessionId: string): string | null {
-  let entries: string[];
-  try {
-    entries = readdirSync(sessionDir);
-  } catch {
-    return null;
-  }
-
-  const suffix = `_${sessionId}.jsonl`;
-  const match = entries.find((entry) => entry.endsWith(suffix));
-  return match ? path.join(sessionDir, match) : null;
+  return {
+    thinkingContract: anthropicContract ?? null,
+    modelLimits: effectiveModelLimits(
+      modelLimits,
+      loadedModelOverride(modelRegistry, provider.id, runtimeConfig.model.name),
+      modelRegistry.find(provider.id, runtimeConfig.model.name),
+    ),
+  };
 }
 
 export function detectPiModelsFromRegistry(modelRegistry: PiModelRegistryLike): RuntimeModelSet | null {
@@ -1138,10 +1490,47 @@ function resetPiText(index: number, state: PiSdkEventMappingState): void {
   state.announcedTextIndexes.delete(index);
 }
 
+function newPiResponseObservation(): PiResponseObservation {
+  return { text: false, whitespace: false, thinkingOrTool: false, indeterminate: false };
+}
+
+function observePiText(observation: PiResponseObservation, text: unknown): void {
+  if (typeof text !== "string") { observation.indeterminate = true; return; }
+  if (text.trim()) observation.text = true;
+  else if (text.length) observation.whitespace = true;
+}
+
+/** Untrusted SDK snapshot: an unfamiliar/malformed block is not proof of an empty response. */
+function observePiResponseContent(observation: PiResponseObservation, content: unknown): void {
+  if (!Array.isArray(content)) {
+    observation.indeterminate = true;
+    return;
+  }
+  for (const block of content) {
+    if (!block || typeof block !== "object") { observation.indeterminate = true; continue; }
+    if (block.type === "text" && typeof block.text === "string") observePiText(observation, block.text);
+    else if (block.type === "thinking" && typeof block.thinking === "string") observation.thinkingOrTool = true;
+    else if (block.type === "toolCall" && typeof block.id === "string" && block.id && typeof block.name === "string" && block.name) observation.thinkingOrTool = true;
+    else observation.indeterminate = true;
+  }
+}
+
+function observePiResponseStream(event: PiAssistantMessageEvent, state: PiSdkEventMappingState): void {
+  const observation = state.responseObservation;
+  if (!observation) return;
+  if ("partial" in event) observePiResponseContent(observation, event.partial?.content);
+  if (event.type === "text_delta") observePiText(observation, event.delta);
+  else if (event.type === "text_end") observePiText(observation, event.content);
+  else if (event.type === "thinking_start" || event.type === "thinking_delta" || event.type === "thinking_end"
+    || event.type === "toolcall_start" || event.type === "toolcall_delta" || event.type === "toolcall_end") observation.thinkingOrTool = true;
+  else if (event.type === "error") observation.indeterminate = true;
+}
+
 function mapPiAssistantMessageEvent(
   assistantEvent: PiAssistantMessageEvent,
   state: PiSdkEventMappingState,
 ): ParsedEvent[] {
+  observePiResponseStream(assistantEvent, state);
   switch (assistantEvent.type) {
     case "thinking_start": {
       const index = piAssistantContentIndex(assistantEvent);
@@ -1190,16 +1579,42 @@ function mapPiAssistantMessageEvent(
     case "error":
       return [{ kind: "error", message: piErrorMessage(assistantEvent.error.errorMessage || assistantEvent.error) }];
     case "toolcall_start":
-    case "toolcall_delta":
-    case "toolcall_end":
+    case "toolcall_delta": {
+      // Agent typing line. The live block at `contentIndex` names the call
+      // (id + name); `toolcall_delta` carries the next arguments-JSON text.
+      const call = piStreamingToolCall(assistantEvent.partial, assistantEvent.contentIndex);
+      if (!call) return [];
+      const sendIntent = (state.sendIntentScanner ??= new SendIntentArgumentScanner())
+        .append(call.id, call.name, assistantEvent.type === "toolcall_delta" ? assistantEvent.delta : undefined);
+      return sendIntent ? [sendIntent] : [];
+    }
+    case "toolcall_end": {
+      // Providers that hand over the arguments whole (no deltas) are read
+      // here, still before the tool runs.
+      const call = assistantEvent.toolCall;
+      if (!call || typeof call.id !== "string" || typeof call.name !== "string") return [];
+      const sendIntent = (state.sendIntentScanner ??= new SendIntentArgumentScanner())
+        .complete(call.id, call.name, call.arguments);
+      return sendIntent ? [sendIntent] : [];
+    }
     case "start":
     case "done":
       return [];
     default: {
       const _exhaustive: never = assistantEvent;
-      return _exhaustive;
+      // An SDK version can add events before the daemon learns their shape.
+      // Preserve uncertainty rather than mistaking their payload for silence.
+      if (state.responseObservation) state.responseObservation.indeterminate = true;
+      return [];
     }
   }
+}
+
+function piStreamingToolCall(partial: unknown, contentIndex: number): { id: string; name: string } | null {
+  const content = (partial as { content?: unknown } | undefined)?.content;
+  const block = Array.isArray(content) ? content[contentIndex] as { type?: unknown; id?: unknown; name?: unknown } | undefined : undefined;
+  if (!block || block.type !== "toolCall" || typeof block.id !== "string" || !block.id) return null;
+  return { id: block.id, name: typeof block.name === "string" ? block.name : "" };
 }
 
 function mapPiMessageEndEvent(
@@ -1211,9 +1626,26 @@ function mapPiMessageEndEvent(
     stopReason?: unknown;
     errorMessage?: unknown;
     usage?: unknown;
+    content?: unknown;
   } | undefined;
 
   const events: ParsedEvent[] = [];
+  // Pi dispatches the finalized message object to its listeners once, then persists it.
+  // Replaying that SDK event must not create another notice; no content/timestamp hash.
+  if (message?.role === "assistant" && state.endedResponses.has(message)) return events;
+  if (message?.role === "assistant") {
+    const observation = state.responseObservation ?? newPiResponseObservation();
+    state.responseObservation = null;
+    state.endedResponses.add(message);
+    if (message.stopReason === "stop" && !state.responseCancelled) {
+      observePiResponseContent(observation, message.content);
+      if (!observation.indeterminate && !observation.text && !observation.thinkingOrTool) {
+        const itemType = observation.whitespace ? "whitespace_response" : "empty_response";
+        events.push({ kind: "runtime_diagnostic", severity: "info", source: "pi_empty_response", itemType,
+          message: PI_RESPONSE_NOTICE_TEXT[itemType], sessionId: state.sessionId ?? undefined });
+      }
+    }
+  }
 
   // The pi-ai AssistantMessage carries a `usage` object (tokens + cost) on both
   // successful and error turns. Emit token_usage telemetry only when usage is
@@ -1275,9 +1707,18 @@ export function mapPiSdkEventToParsedEvents(
 ): ParsedEvent[] {
   const events: ParsedEvent[] = [];
   pushSessionInitIfNeeded(state, events);
+  if (state.responseSessionId !== state.sessionId) {
+    state.responseSessionId = state.sessionId;
+    state.responseObservation = null;
+    state.endedResponses = new WeakSet();
+    state.responseCancelled = false;
+  }
 
   switch (event.type) {
     case "agent_start":
+      state.responseObservation = null;
+      state.responseCancelled = false;
+      return events;
     case "turn_start":
     case "turn_end":
     case "tool_execution_update":
@@ -1311,6 +1752,8 @@ export function mapPiSdkEventToParsedEvents(
       }
       return events;
     case "agent_settled":
+      state.responseObservation = null;
+      if (event.aborted) state.responseCancelled = true;
       if (state.pendingProviderError) {
         events.push({ kind: "error", message: state.pendingProviderError });
         state.pendingProviderError = null;
@@ -1326,6 +1769,7 @@ export function mapPiSdkEventToParsedEvents(
       return events;
     case "message_start":
       if ((event.message as { role?: string }).role === "assistant") {
+        state.responseObservation = newPiResponseObservation();
         state.thinkingBuffers.clear();
         state.announcedThinkingIndexes.clear();
         state.textBuffers.clear();
@@ -1353,21 +1797,33 @@ export function mapPiSdkEventToParsedEvents(
       return events;
     case "compaction_start":
       if (state.compactionTerminal) return events;
-      events.push({ kind: "compaction_started" });
+      state.compactionCycle += 1;
+      state.openCompactionCycle = state.compactionCycle;
+      // task #1362: compacting between agent_end and agent_settled (Pi's own
+      // post-run compaction, or an extension's from its agent_settled hook):
+      // the daemon's turn end is still to come.
+      events.push({
+        kind: "compaction_started",
+        cycleId: state.compactionCycle,
+        ...(state.pendingTurnEnd ? { afterRunEnd: true as const } : {}),
+      });
       return events;
     case "compaction_end": {
       if (state.compactionTerminal) return events;
       const projection = projectPiCompactionEnd(event);
       const { outcome, reason, failureReason, willRetry } = projection;
+      const cycleId = state.openCompactionCycle ?? undefined;
+      state.openCompactionCycle = null;
       if (outcome === "aborted") {
         events.push({
           kind: "compaction_interrupted",
+          ...(cycleId === undefined ? {} : { cycleId }),
           outcome,
           reason,
           willRetry,
         });
       } else if (outcome === "compaction_succeeded") {
-        events.push({ kind: "compaction_finished" });
+        events.push({ kind: "compaction_finished", ...(cycleId === undefined ? {} : { cycleId }) });
       } else {
         state.compactionTerminal = true;
       }
@@ -1438,10 +1894,46 @@ const PI_RUNTIME_SESSION_DESCRIPTOR = {
 const PI_IDLE_PROMPT_RETRY_MS = 25;
 const PI_IDLE_PROMPT_MAX_WAIT_MS = 1_000;
 
+/**
+ * View Context: records each provider request body, after the SDK's own
+ * `onPayload` (extensions may replace it). Only the session's own turns: a
+ * compaction's summary call carries an id of its own and can't send a message.
+ *
+ * pi-ai calls `onPayload` with the full body (system, tools, every message)
+ * before it turns an Anthropic message-threads request into a `continue` that
+ * carries only the new messages, so the record is the whole context with
+ * threads on or off. piRequestLog.threads.test.ts pins that order.
+ */
+export function recordingRequests<O extends { onPayload?: unknown; sessionId?: string } | undefined>(
+  requestLog: { log: PiRequestLog; sessionId: () => string | null } | undefined,
+  model: { api?: unknown; provider?: unknown; id?: unknown },
+  options: O,
+): O {
+  const sessionId = options?.sessionId;
+  if (!requestLog || !sessionId || sessionId !== requestLog.sessionId()) return options;
+  const caller = options?.onPayload as ((payload: unknown, model: never) => unknown) | undefined;
+  return {
+    ...options,
+    onPayload: async (payload: unknown, payloadModel: never) => {
+      const replaced = await caller?.(payload, payloadModel);
+      requestLog.log.record(replaced ?? payload, {
+        sessionId,
+        provider: typeof model.provider === "string" ? model.provider : null,
+        api: typeof model.api === "string" ? model.api : null,
+        model: typeof model.id === "string" ? model.id : null,
+      });
+      return replaced;
+    },
+  };
+}
+
 function installProviderHttpClient(
   modelRuntime: ModelRuntime,
   providerHttpClient: ProviderHttpClient,
   customEndpoint: boolean,
+  providerCallTracker?: PiProviderCallTracker,
+  requestLog?: { log: PiRequestLog; sessionId: () => string | null },
+  anthropicRequests?: PiAnthropicRequestMeter,
 ): void {
   const fetchForModel = (model: Parameters<ModelRuntime["stream"]>[0]) => {
     const prefix = model.id.split("/")[0];
@@ -1452,26 +1944,52 @@ function installProviderHttpClient(
   const stream = modelRuntime.stream.bind(modelRuntime);
   modelRuntime.stream = ((model, context, options) => {
     const providerOptions = {
-      ...options,
+      ...recordingRequests(requestLog, model, options),
       fetch: fetchForModel(model),
     } as typeof options;
-    return stream(model, context, providerOptions);
+    const call = (callOptions: typeof options) => providerCallTracker
+      ? providerCallTracker.observe(model, callOptions, (observed) => stream(model, context, observed))
+      : stream(model, context, callOptions);
+    return anthropicRequests ? anthropicRequests.observe(model, providerOptions, call) : call(providerOptions);
   }) as ModelRuntime["stream"];
 
   const streamSimple = modelRuntime.streamSimple.bind(modelRuntime);
-  modelRuntime.streamSimple = ((model, context, options) => streamSimple(model, context, {
-    ...options,
-    fetch: fetchForModel(model),
-  })) as ModelRuntime["streamSimple"];
+  modelRuntime.streamSimple = ((model, context, options) => {
+    const providerOptions = {
+      ...recordingRequests(requestLog, model, options),
+      fetch: fetchForModel(model),
+    };
+    const call = (callOptions: typeof providerOptions) => providerCallTracker
+      ? providerCallTracker.observe(model, callOptions, (observed) => streamSimple(model, context, observed))
+      : streamSimple(model, context, callOptions);
+    return anthropicRequests ? anthropicRequests.observe(model, providerOptions, call) : call(providerOptions);
+  }) as ModelRuntime["streamSimple"];
 }
+
+type PiAgentSessionOptions = { agentDir?: string; thinkingContracts?: AnthropicGatewayContractDeps["thinkingContracts"]; sessionDir?: string; traceName?: string; traceEventPrefix?: string; logPrefix?: string; exposeLaunchEnvToTools?: boolean; isolateHostProviderEnv?: boolean; agentDirSource?: "default" | "spawn_env" | "managed_builtin"; exposeLaunchTraceEvidence?: boolean };
 
 export async function createPiAgentSessionForContext(
   ctx: SpawnContext,
   sessionId: string,
-  opts: { agentDir?: string; thinkingContracts?: AnthropicGatewayContractDeps["thinkingContracts"]; sessionDir?: string; traceName?: string; traceEventPrefix?: string; logPrefix?: string; exposeLaunchEnvToTools?: boolean; isolateHostProviderEnv?: boolean; agentDirSource?: "default" | "spawn_env" | "managed_builtin"; exposeLaunchTraceEvidence?: boolean } = {},
+  opts: PiAgentSessionOptions = {},
   toolExecutionObserver?: PiToolExecutionObserver,
   providerObserver?: ProviderRequestObserver,
+  providerCallTracker?: PiProviderCallTracker,
+  anthropicRequests?: PiAnthropicRequestMeter,
 ): Promise<AgentSession> {
+  return (await openPiAgentSessionForContext(ctx, sessionId, opts, toolExecutionObserver, providerObserver, providerCallTracker, anthropicRequests)).session;
+}
+
+/** The spawn of a pi SDK session: env, CLI transport, services, tools; the handle reopens the session on them. */
+export async function openPiAgentSessionForContext(
+  ctx: SpawnContext,
+  sessionId: string,
+  opts: PiAgentSessionOptions = {},
+  toolExecutionObserver?: PiToolExecutionObserver,
+  providerObserver?: ProviderRequestObserver,
+  providerCallTracker?: PiProviderCallTracker,
+  anthropicRequests?: PiAnthropicRequestMeter,
+): Promise<PiSdkSessionHandle> {
   const sessionDir = opts.sessionDir ?? buildPiSessionDir(ctx.workingDirectory);
   mkdirSync(sessionDir, { recursive: true });
 
@@ -1550,6 +2068,7 @@ export async function createPiAgentSessionForContext(
   const traceEventPrefix = opts.traceEventPrefix ?? "daemon.pi.session";
   let providerHttpClient: ProviderHttpClient | undefined;
 
+  let liveSessionId: string | null = null;
   try {
     const spawnEnv = await buildPiSpawnEnv(ctx);
     const agentDir = opts.agentDir ?? spawnEnv.PI_CODING_AGENT_DIR ?? getAgentDir();
@@ -1571,6 +2090,31 @@ export async function createPiAgentSessionForContext(
     }
     const providerEnvScope = opts.isolateHostProviderEnv ? BUILTIN_BLOCKED_HOST_PROVIDER_ENV_KEYS : undefined;
     const sessionCreateEnvPatch = buildPiSessionCreateEnvPatch(runtimeConfig, launchRuntimeFields.envVars);
+    // #proj-runtime:#53: the gateway's model list is read while the session's
+    // services are built, through a client routed like its model calls (the
+    // proxy env snapshot is taken here, with the session's env patch).
+    // A typed OpenRouter model (task #10) reads OpenRouter's list the same way.
+    type ModelListRead = GatewayModelLimitsResult & { providerKind: "gateway" | "openrouter"; baseUrl: string | null };
+    const gatewayLimitsRead = ((): Promise<ModelListRead> => {
+      const gateway = Boolean(resolveBuiltInGatewayLaunch(runtimeConfig, managedProviderConnection));
+      const presetCustom = !gateway && resolveBuiltInPresetCustomModel(runtimeConfig) !== null;
+      if (!gateway && !presetCustom) {
+        return Promise.resolve({ limits: null, outcome: "skipped", cached: false, providerKind: "gateway", baseUrl: null });
+      }
+      const providerKind = gateway ? "gateway" as const : "openrouter" as const;
+      let client: ProviderHttpClient;
+      try {
+        client = createProviderHttpClient({ ...process.env, ...(sessionCreateEnvPatch ?? {}) }, `pi-gateway-limits:${randomUUID()}`);
+      } catch {
+        return Promise.resolve({ limits: null, outcome: "failed:network", cached: false, providerKind, baseUrl: null });
+      }
+      // Never rejects; the client goes as soon as the read is done, whatever the session does.
+      const read: Promise<ModelListRead> = gateway
+        ? readBuiltInGatewayModelLimits(runtimeConfig, managedProviderConnection, launchRuntimeFields.envVars, client.fetch)
+          .then((result) => ({ ...result, providerKind, baseUrl: null }))
+        : readBuiltInPresetCustomModelLimits(runtimeConfig, client.fetch).then((result) => ({ ...result, providerKind }));
+      return read.finally(() => client.dispose());
+    })();
     const sessionServices = await withProcessEnvPatch(sessionCreateEnvPatch, async () => {
       const sessionProviderHttpClient = createProviderHttpClient(
         process.env,
@@ -1580,12 +2124,21 @@ export async function createPiAgentSessionForContext(
       try {
         const modelRuntime = await ModelRuntime.create({
           authPath: path.join(agentDir, "auth.json"),
+          // The user's file as is: pi-ai's default Anthropic message threads apply (#runtime-watch:#1).
           modelsPath: path.join(agentDir, "models.json"),
           allowModelNetwork: false,
         });
         installProviderHttpClient(modelRuntime, sessionProviderHttpClient,
           runtimeConfig.runtime === "builtin" && (runtimeConfig.provider.kind === "gateway"
-            || (runtimeConfig.provider.kind === "connection" && Boolean(managedProviderConnection?.endpointUrl))));
+            || (runtimeConfig.provider.kind === "connection" && Boolean(managedProviderConnection?.endpointUrl))),
+          providerCallTracker,
+          ctx.contextViewRequestLogDir ? {
+            log: new PiRequestLog(ctx.contextViewRequestLogDir, (reason, error) => {
+              console.warn("[%s] View Context request not recorded: %s %s", logPrefix, reason, error ? safeDiagnosticErrorClass(error) : "");
+            }),
+            sessionId: () => liveSessionId,
+          } : undefined,
+          anthropicRequests);
         // Request-time credentials and proxy routing must be session-local.
         // Holding a process.env patch across an async SDK turn serializes every
         // Pi agent in this runner. The short create-time scope also keeps
@@ -1605,7 +2158,8 @@ export async function createPiAgentSessionForContext(
           resourceLoaderOptions: {
             additionalExtensionPaths: localExtensionPaths,
             // Keeps an oversized compaction request inside the model limit (task #10).
-            extensionFactories: [createPiCompactionFitExtension()],
+            // Named so session rotation can tell it from a user extension.
+            extensionFactories: [{ name: PI_DAEMON_EXTENSION_NAME, factory: createPiCompactionFitExtension() }],
             systemPromptOverride: () => ctx.standingPrompt,
           },
         });
@@ -1619,7 +2173,33 @@ export async function createPiAgentSessionForContext(
     providerHttpClient = sessionServices.providerHttpClient;
     const modelRegistry = new ModelRegistry(services.modelRuntime);
     const contractDeps: AnthropicGatewayContractDeps = opts.thinkingContracts ? { thinkingContracts: opts.thinkingContracts } : {};
-    const gatewayRegistration = configureBuiltInGatewayCustomModel(modelRegistry, runtimeConfig, managedProviderConnection, contractDeps);
+    const gatewayLimits = await gatewayLimitsRead;
+    if (gatewayLimits.outcome !== "skipped") {
+      traceSpan?.addEvent(`${traceEventPrefix}.gateway_model_limits`, {
+        outcome: gatewayLimits.outcome,
+        cached: gatewayLimits.cached,
+        provider_kind: gatewayLimits.providerKind,
+        context_window_reported: gatewayLimits.limits?.contextWindow !== undefined,
+        max_tokens_reported: gatewayLimits.limits?.maxTokens !== undefined,
+        ...(gatewayLimits.format ? { format: gatewayLimits.format } : {}),
+        fallback_read: gatewayLimits.fallbackRead === true,
+      });
+    }
+    const gatewayRegistration = configureBuiltInGatewayCustomModel(
+      modelRegistry,
+      runtimeConfig,
+      managedProviderConnection,
+      contractDeps,
+      gatewayLimits.providerKind === "gateway" ? gatewayLimits.limits : null,
+    );
+    // A typed OpenRouter model (task #10) reports its limits on the same frame as a gateway one.
+    const presetCustomRegistration = configureBuiltInPresetCustomModel(
+      modelRegistry,
+      runtimeConfig,
+      gatewayLimits.providerKind === "openrouter" ? gatewayLimits.limits : null,
+      gatewayLimits.baseUrl,
+    );
+    const registeredModelLimits = gatewayRegistration.modelLimits ?? presetCustomRegistration.modelLimits;
     applyPiDaemonSettingsOverrides(services.settingsManager);
     logPiServiceDiagnostics("create_session", services);
     addPiServiceTraceEvent(traceSpan, `${traceEventPrefix}.services_ready`, services, {
@@ -1682,40 +2262,6 @@ export async function createPiAgentSessionForContext(
       throw new RuntimeModelNotFoundError({ runtimeId: ctx.config.runtime || "pi", model: launchRuntimeFields.model });
     }
 
-    const existingSessionFile = ctx.config.sessionId ? findPiSessionFile(sessionDir, ctx.config.sessionId) : null;
-    const sessionManager = existingSessionFile
-      ? SessionManager.open(existingSessionFile, sessionDir, ctx.workingDirectory)
-      : SessionManager.create(ctx.workingDirectory, sessionDir, { id: sessionId });
-    const persistSessionEntry = sessionManager._persist.bind(sessionManager);
-    let lastTranscriptPersistOutcome: "deferred" | "persisted" | "failed" | null = null;
-    sessionManager._persist = (entry) => {
-      const entryType = safeTranscriptEntryType(entry.type);
-      try {
-        persistSessionEntry(entry);
-        const sessionFile = sessionManager.getSessionFile();
-        const outcome = sessionFile && existsSync(sessionFile) ? "persisted" : "deferred";
-        if (outcome !== lastTranscriptPersistOutcome) {
-          lastTranscriptPersistOutcome = outcome;
-          writePiLifecycleDiagnostic(ctx, sessionId, {
-            kind: "transcript_persist",
-            outcome,
-            entryType,
-          }, logPrefix);
-        }
-      } catch (error) {
-        lastTranscriptPersistOutcome = "failed";
-        const errorCode = safeDiagnosticErrorCode(error);
-        writePiLifecycleDiagnostic(ctx, sessionId, {
-          kind: "transcript_persist",
-          outcome: "failed",
-          entryType,
-          errorClass: safeDiagnosticErrorClass(error),
-          ...(errorCode ? { errorCode } : {}),
-        }, logPrefix);
-        throw error;
-      }
-    };
-
     const toolSpawnEnv = { ...spawnEnv };
     if (opts.exposeLaunchEnvToTools === false) {
       for (const key of Object.keys(launchRuntimeFields.envVars ?? {})) {
@@ -1726,51 +2272,134 @@ export async function createPiAgentSessionForContext(
     const managedMcpTools = await createManagedMcpPiTools({
       serverUrl: ctx.config.serverUrl,
       agentCredentialKey: ctx.config.agentCredentialKey,
+      processInstanceId: ctx.processInstanceId,
+      readTurnOrigin: ctx.readTurnOrigin,
       onWarning: (message) => console.warn("[%s] %s", logPrefix, message),
     });
+    // Built once per spawn. A rotation reopens the session file on these same
+    // instances, so the resumed session sends the same tools (and request).
+    const customTools = [
+      createPiCommandTool(ctx.workingDirectory, toolSpawnEnv, {
+        observer: toolExecutionObserver,
+      }),
+      ...managedMcpTools,
+    ];
+    const thinkingLevel = resolveBuiltInThinkingLevel(launchRuntimeFields.reasoningEffort, gatewayRegistration.thinkingContract);
+    // A value Raft had to default is only a web warning for humans; the agent
+    // is told in its system prompt how to declare the real one (models.json).
+    const modelLimitsNote = registeredModelLimits && model
+      ? formatBuiltInDefaultModelLimitsNote({
+          providerId: model.provider,
+          modelId: model.id,
+          modelLimits: registeredModelLimits,
+          modelsJsonPath: workspaceRelativePath(ctx.workingDirectory, path.join(agentDir, "models.json")),
+        })
+      : null;
+    const sessionCreateServices = modelLimitsNote
+      ? { ...services, resourceLoader: withSystemPromptSection(services.resourceLoader, modelLimitsNote) }
+      : services;
+    const sessionProviderHttpClient = sessionServices.providerHttpClient;
+    // The spawn owns the provider client; it goes with the spawn's live
+    // session. A session becomes live only once it is fully open, so one that
+    // fails to open (a reopen's included) or one a reopen replaced never takes
+    // the client with it. A failed first open releases it in the catch below.
+    let liveSession: AgentSession | null = null;
 
-    const { session } = await withProcessEnvPatch(sessionCreateEnvPatch, () => {
-      // task #365: right before the SDK session exists, inside the env-patch
-      // lock (waiting for it is an await too). What ran before it is local
-      // preparation only: env, the session file, the session services and
-      // the managed MCP tool list (a list call to this daemon's own proxy); no
-      // provider request and no tool execution. A stale launch throws here
-      // and the catch below releases the provider client.
-      ctx.assertLaunchCurrent?.();
-      return createAgentSessionFromServices({
-        services,
-        sessionManager,
-        model,
-        thinkingLevel: resolveBuiltInThinkingLevel(launchRuntimeFields.reasoningEffort, gatewayRegistration.thinkingContract),
-        customTools: [
-          createPiCommandTool(ctx.workingDirectory, toolSpawnEnv, {
-            observer: toolExecutionObserver,
-          }),
-          ...managedMcpTools,
-        ],
-      });
-    }, { removeFirst: providerEnvScope });
-    const disposeSession = session.dispose.bind(session);
-    let sessionDisposed = false;
-    session.dispose = () => {
-      if (sessionDisposed) return;
-      sessionDisposed = true;
-      try {
-        disposeSession();
-      } finally {
-        sessionServices.providerHttpClient.dispose();
+    const openSdkSession = async (sessionFile: string | null): Promise<PiSdkSessionHandle> => {
+      const sessionManager = sessionFile
+        ? SessionManager.open(sessionFile, sessionDir, ctx.workingDirectory)
+        : SessionManager.create(ctx.workingDirectory, sessionDir, { id: sessionId });
+      liveSessionId = sessionManager.getSessionId();
+      const persistSessionEntry = sessionManager._persist.bind(sessionManager);
+      let lastTranscriptPersistOutcome: "deferred" | "persisted" | "failed" | null = null;
+      sessionManager._persist = (entry) => {
+        const entryType = safeTranscriptEntryType(entry.type);
+        try {
+          persistSessionEntry(entry);
+          const persistedFile = sessionManager.getSessionFile();
+          const outcome = persistedFile && existsSync(persistedFile) ? "persisted" : "deferred";
+          if (outcome !== lastTranscriptPersistOutcome) {
+            lastTranscriptPersistOutcome = outcome;
+            writePiLifecycleDiagnostic(ctx, sessionId, {
+              kind: "transcript_persist",
+              outcome,
+              entryType,
+            }, logPrefix);
+          }
+        } catch (error) {
+          lastTranscriptPersistOutcome = "failed";
+          const errorCode = safeDiagnosticErrorCode(error);
+          writePiLifecycleDiagnostic(ctx, sessionId, {
+            kind: "transcript_persist",
+            outcome: "failed",
+            entryType,
+            errorClass: safeDiagnosticErrorClass(error),
+            ...(errorCode ? { errorCode } : {}),
+          }, logPrefix);
+          throw error;
+        }
+      };
+
+      const { session } = await withProcessEnvPatch(sessionCreateEnvPatch, () => {
+        // task #365: right before the SDK session exists, inside the env-patch
+        // lock (waiting for it is an await too). What ran before it is local
+        // preparation only: env, the session file, the session services and
+        // the managed MCP tool list (a list call to this daemon's own proxy); no
+        // provider request and no tool execution. A stale launch throws here
+        // and the catch below releases the provider client.
+        ctx.assertLaunchCurrent?.();
+        return createAgentSessionFromServices({ services: sessionCreateServices, sessionManager, model, thinkingLevel, customTools });
+      }, { removeFirst: providerEnvScope });
+      const untrackSessionMemory = trackPiSessionMemory(session);
+      const disposeSdkSession = session.dispose.bind(session);
+      let released = false;
+      const release = () => {
+        if (released) return;
+        released = true;
+        untrackSessionMemory();
+        disposeSdkSession();
+      };
+      session.dispose = () => {
+        if (released) return;
+        try {
+          release();
+        } finally {
+          if (liveSession === session) sessionProviderHttpClient.dispose();
+        }
+      };
+
+      if (runtimeConfig.runtime === "builtin" && runtimeConfig.loadLocalPlugins === true) {
+        try {
+          // Complete the SDK extension lifecycle, including session_start hooks.
+          await session.bindExtensions({ mode: "rpc" });
+        } catch (error) {
+          session.dispose();
+          throw error;
+        }
       }
+
+      liveSession = session;
+      return new PiSdkSessionHandle(session, async () => {
+        // The same open a restart does, on this spawn's resources. The new
+        // session rebinds the extension runtime the services share; pi's
+        // dispose of the old one then marks that runtime stale, which only an
+        // extension calling pi's API at run time would notice. Rotation runs
+        // with the daemon's own extension alone, which does not.
+        const reopenFile = newestPiSessionFile(sessionDir, sessionId);
+        if (!reopenFile) throw new Error("Pi session rotation found no session file to reopen");
+        const next = await openSdkSession(reopenFile);
+        // The old session goes only once the new one is live (it has the client now).
+        try {
+          release();
+        } catch (error) {
+          console.warn("[%s] reopen: disposing the old session failed: %s", logPrefix, piErrorMessage(error));
+        }
+        return next;
+      }, registeredModelLimits);
     };
 
-    if (runtimeConfig.runtime === "builtin" && runtimeConfig.loadLocalPlugins === true) {
-      try {
-        // Complete the SDK extension lifecycle, including session_start hooks.
-        await session.bindExtensions({ mode: "rpc" });
-      } catch (error) {
-        session.dispose();
-        throw error;
-      }
-    }
+    const opened = await openSdkSession(ctx.config.sessionId ? newestPiSessionFile(sessionDir, ctx.config.sessionId) : null);
+    const session = opened.session;
 
     traceSpan?.addEvent(`${traceEventPrefix}.started`, {
       requested_model: requestedModel,
@@ -1801,7 +2430,7 @@ export async function createPiAgentSessionForContext(
       phase: "ready",
     }, logPrefix);
     providerHttpClient = undefined;
-    return session;
+    return opened;
   } catch (error) {
     providerHttpClient?.dispose();
     const errorCode = safeDiagnosticErrorCode(error);
@@ -1851,9 +2480,25 @@ export class PiSdkRuntimeSession implements RuntimeSession {
   private started = false;
   private didClose = false;
   private requestedStopReason: string | undefined;
-  private cancellationSource: "requested_stop" | "dispose" | null = null;
+  private cancellationSource: "requested_stop" | "requested_interrupt" | "dispose" | null = null;
   private exitInfo: RuntimeExitInfo | null = null;
   private activeProviderRequest: PiProviderRequestState | null = null;
+  private readonly turnOrigin: RuntimeTurnOriginHolder;
+  /** How to reopen the live SDK session for a rotation; null for a session that cannot be (test doubles). */
+  private sessionHandle: PiSdkSessionHandle | null = null;
+  /** Inputs accepted but not handed to the SDK yet (deferSdkCall, or waiting out a rotation). */
+  private queuedInputs = 0;
+  private readonly rotationConfig: PiSessionRotationConfig;
+  /** A compaction finished for good (`willRetry: false`); its run has not settled yet. */
+  private compactionAwaitingSettle = false;
+  /** A compaction finished and its run settled since the last rotation (plan §1). */
+  private rotationDue = false;
+  /** Steps 3 and 4 of a running rotation (dispose, resume); inputs wait for it. */
+  private rotation: Promise<void> | null = null;
+  /** Task #1310: open provider calls, so a stall can say whether one was still running. */
+  private readonly providerCallTracker: PiProviderCallTracker;
+  /** #runtime-watch:#1: per-call request size on `anthropic-messages` (piAnthropicRequests.ts). */
+  private readonly anthropicRequests: PiAnthropicRequestMeter;
 
   constructor(
     private readonly ctx: SpawnContext,
@@ -1863,11 +2508,42 @@ export class PiSdkRuntimeSession implements RuntimeSession {
       sessionId,
       observer,
       providerObserver,
-    ) => createPiAgentSessionForContext(sessionCtx, sessionId, {}, observer, providerObserver),
+      providerCallTracker,
+      anthropicRequests,
+    ) => openPiAgentSessionForContext(sessionCtx, sessionId, {}, observer, providerObserver, providerCallTracker, anthropicRequests),
   ) {
     this.mappingState = createPiSdkEventMappingState(ctx.config.sessionId || null);
+    this.turnOrigin = new RuntimeTurnOriginHolder(ctx.processInstanceId);
+    this.providerCallTracker = new PiProviderCallTracker((ended) => {
+      ctx.tracer?.emitEvent("daemon.pi.provider_call.ended", {
+        surface: "daemon",
+        attrs: {
+          agentId: ctx.agentId,
+          launchId: ctx.launchId || undefined,
+          runtime: ctx.config.runtime,
+          ...ended,
+        },
+      });
+    });
+    this.anthropicRequests = new PiAnthropicRequestMeter({
+      warmRecycleFlag: ctx.config.wakeRecycleWarm === true,
+      // Through the manager's telemetry path: `daemon.runtime.telemetry.provider_request`, and the turn's byte totals.
+      emitRequest: (attrs) => {
+        if (this.didClose) return;
+        this.emitRuntimeEvent({ kind: "telemetry", name: "provider_request", source: PI_ANTHROPIC_REQUEST_SOURCE, attrs });
+      },
+    });
+    // Registered in the constructor so these run BEFORE any manager listener: on turn_end the
+    // manager may immediately send the next idle prompt, which must see the previous turn closed.
+    this.events.on("runtime_event", (event: ParsedEvent) => {
+      if (event.kind === "turn_end") this.turnOrigin.endTurn();
+    });
+    this.events.on("exit", () => this.turnOrigin.close());
+    this.rotationConfig = resolvePiSessionRotationConfig(ctx.config.piSessionRotation, ctx.config.envVars);
     const runtimeContext = ctx.config.runtimeContext;
-    this.toolExecutionObserver = ctx.config.runtime === "pi"
+    // Built-in runs the same Pi session and command tool, so it gets the same
+    // tool facts; stalled recovery depends on them (task #1302).
+    this.toolExecutionObserver = (ctx.config.runtime === "pi" || ctx.config.runtime === "builtin")
       && Boolean(runtimeContext?.serverId)
       && Boolean(runtimeContext?.machineId)
       && Boolean(ctx.launchId)
@@ -1877,6 +2553,7 @@ export class PiSdkRuntimeSession implements RuntimeSession {
           machineId: runtimeContext!.machineId!,
           agentId: ctx.agentId,
           launchId: ctx.launchId!,
+          runtime: ctx.config.runtime,
           runtimeVersion: PI_SDK_VERSION,
           runtimeSessionId: ctx.config.sessionId,
         })
@@ -1906,6 +2583,10 @@ export class PiSdkRuntimeSession implements RuntimeSession {
   // In-process SDK session: there is no OS pid to probe with signal-0, so
   // liveness is unknowable via the pid-probe boundary. Return undefined, which
   // callers treat the same as the historic "no pid" probe result (RS-011).
+  providerCallSnapshot(): RuntimeProviderCallSnapshot {
+    return this.providerCallTracker.snapshot();
+  }
+
   isAlive(): boolean | undefined {
     return undefined;
   }
@@ -1923,7 +2604,7 @@ export class PiSdkRuntimeSession implements RuntimeSession {
     this.events.on(event, cb as (...args: unknown[]) => void);
   }
 
-  async start(input: { text: string; sessionId?: string | null }): Promise<RuntimeSendResult> {
+  async start(input: { text: string; sessionId?: string | null; origin?: RuntimeTurnOrigin | null }): Promise<RuntimeSendResult> {
     if (this.started) {
       return { ok: false, reason: "runtime_error", error: "runtime session already started" };
     }
@@ -1936,8 +2617,9 @@ export class PiSdkRuntimeSession implements RuntimeSession {
 
     // task #365: before the native runtime session is created.
     this.ctx.assertLaunchCurrent?.();
-    const session = await this.sessionFactory({
+    this.bindSession(await this.sessionFactory({
       ...this.ctx,
+      readTurnOrigin: this.turnOrigin.read,
       config: {
         ...this.ctx.config,
         sessionId,
@@ -1945,14 +2627,34 @@ export class PiSdkRuntimeSession implements RuntimeSession {
     }, sessionId, this.toolExecutionObserver, (activity) => {
       this.recordProviderRequestActivity(activity);
       if (!this.didClose) this.emitRuntimeEvent({ kind: "provider_request", activity });
-    });
+    }, this.providerCallTracker, this.anthropicRequests));
+
+    this.turnOrigin.beginTurn(input.origin);
+    this.launchPrompt(input.text);
+    // Register the initial prompt before announcing readiness. The runtime
+    // event is synchronous, and a zero-delay readiness-debt settlement may
+    // enqueue a busy steer; FIFO setImmediate ordering must keep the initial
+    // prompt ahead of that steer.
+    this.emitSessionInit();
+    return { ok: true, acceptedAs: "prompt" };
+  }
+
+  private bindSession(opened: AgentSession | PiSdkSessionHandle): void {
+    this.sessionHandle = opened instanceof PiSdkSessionHandle ? opened : null;
+    const session = opened instanceof PiSdkSessionHandle ? opened.session : opened;
     this.session = session;
+    this.mappingState.responseObservation = null;
+    this.mappingState.endedResponses = new WeakSet();
+    this.mappingState.responseCancelled = false;
     this.mappingState.sessionId = session.sessionId;
     this.setCurrentSessionId(session.sessionId);
     this.toolExecutionObserver?.setRuntimeSessionId(session.sessionId);
     this.unsubscribe = session.subscribe((event) => {
       this.observeToolExecutionEvent(event);
       this.recordCompactionLifecycle(event);
+      if (event.type === "compaction_start") this.providerCallTracker.noteCompactionStarted();
+      else if (event.type === "compaction_end") this.providerCallTracker.noteCompactionEnded();
+      this.noteRotationProgress(event);
       if (
         event.type === "message_start" &&
         (event.message as { role?: unknown }).role === "assistant"
@@ -1973,22 +2675,42 @@ export class PiSdkRuntimeSession implements RuntimeSession {
         this.emitRuntimeEvent(parsed, piTerminalCausePhaseForSdkEvent(event));
       }
     });
-
-    this.launchPrompt(input.text);
-    // Register the initial prompt before announcing readiness. The runtime
-    // event is synchronous, and a zero-delay readiness-debt settlement may
-    // enqueue a busy steer; FIFO setImmediate ordering must keep the initial
-    // prompt ahead of that steer.
-    this.emitSessionInit();
-    return { ok: true, acceptedAs: "prompt" };
+    // task #1357 item 1: every session opened here (a start, a rotation's
+    // reopen) reports the limits registered for its model, with the revision
+    // of the config this spawn was built from.
+    const modelLimits = opened instanceof PiSdkSessionHandle ? opened.modelLimits : null;
+    if (modelLimits && session.sessionId) {
+      this.emitRuntimeEvent({
+        kind: "model_limits",
+        sessionId: session.sessionId,
+        configRevision: typeof this.ctx.config.configRevision === "number" ? this.ctx.config.configRevision : null,
+        modelLimits,
+      } satisfies ParsedEvent);
+    }
   }
 
   send(input: {
     mode: "idle" | "busy";
     text: string;
     sessionId?: string | null;
+    origin?: RuntimeTurnOrigin | null;
   }): RuntimeSendResult {
     if (this.didClose) return { ok: false, reason: "closed" };
+    const rotation = this.rotation;
+    if (rotation) {
+      // A rotation is reopening the session: hand the input over once it is
+      // done, to the resumed session, or to the old one when the reopen
+      // failed (resumeRotatedSession undoes the files and keeps it). APM
+      // counts an accepted input as told (a tracked mention is acked), so the
+      // input must reach a live session; only a failed undo ends the runtime
+      // with it still queued.
+      this.queuedInputs += 1;
+      void rotation.then(() => {
+        this.queuedInputs -= 1;
+        if (!this.didClose) this.send(input);
+      });
+      return { ok: true, acceptedAs: input.mode === "busy" ? "steer" : "prompt" };
+    }
     const session = this.session;
     if (!session) return { ok: false, reason: "closed" };
 
@@ -2002,11 +2724,82 @@ export class PiSdkRuntimeSession implements RuntimeSession {
     }
 
     if (session.isStreaming) {
+      // May still fall back to steering the running turn, so this cannot be shown to be a new turn:
+      // it opens one with NO origin rather than lending its message to calls of the streaming run.
+      this.turnOrigin.beginTurn(null);
       this.launchPromptAfterStreaming(input.text);
       return { ok: true, acceptedAs: "prompt" };
     }
+    this.turnOrigin.beginTurn(input.origin);
     this.launchPrompt(input.text, true);
     return { ok: true, acceptedAs: "prompt" };
+  }
+
+  /**
+   * task #25 step 2: abort the running prompt and keep the session. Pi's bash
+   * tool kills the command's process tree on the abort signal, and the turn
+   * ends through agent_settled like any other.
+   */
+  interruptTurn(): "sent" | "unsupported" {
+    const session = this.session;
+    if (this.didClose || !session?.isStreaming) return "unsupported";
+    this.mappingState.responseObservation = null;
+    this.mappingState.responseCancelled = true;
+    this.cancellationSource = "requested_interrupt";
+    this.toolExecutionObserver?.observeAbortRequested("interrupt");
+    this.recordLifecycle({
+      kind: "cancel_requested",
+      source: "requested_interrupt",
+      signal: null,
+      providerRequestActive: Boolean(this.activeProviderRequest),
+    });
+    void Promise.resolve()
+      .then(() => session.abort())
+      .catch((error) => {
+        this.events.emit("stderr", piErrorMessage(error));
+      });
+    return "sent";
+  }
+
+  /** #proj-runtime:#54 phase 3: Pi's own estimate of the session's context and its model's window (the registered limit for a custom model). */
+  async turnEndContextFacts(): Promise<TurnEndContextFacts> {
+    const usage = this.didClose ? undefined : this.session?.getContextUsage();
+    const tokens = usage?.tokens;
+    const window = usage?.contextWindow;
+    return {
+      contextTokens: typeof tokens === "number" && tokens > 0 ? tokens : null,
+      windowTokens: typeof window === "number" && window > 0 ? window : null,
+    };
+  }
+
+  /**
+   * #proj-runtime:#54 phase 3: Pi's manual compaction on an idle session.
+   * `compact()` aborts whatever runs first, so a streaming or compacting
+   * session is refused here instead. Its compaction_start/compaction_end
+   * events reach the manager as any compaction's do.
+   */
+  async compactAtTurnEnd(): Promise<TurnEndCompactionDriverOutcome> {
+    const session = this.session;
+    if (this.didClose || !session) return { kind: "refused", reason: "no_session" };
+    if (session.isStreaming) return { kind: "refused", reason: "busy" };
+    if (session.isCompacting) return { kind: "refused", reason: "compacting" };
+    try {
+      await session.compact();
+      return { kind: "completed" };
+    } catch (error) {
+      return { kind: "failed", reason: classifyTurnEndCompactionError(error) };
+    }
+  }
+
+  /** Pi's prompt() throws while a compaction is open, so the held delivery would be refused: abort it first. */
+  async cancelTurnEndCompaction(): Promise<void> {
+    const session = this.session;
+    if (this.didClose || !session || !session.isCompacting) return;
+    session.abortCompaction();
+    const deadline = Date.now() + 5_000;
+    while (session.isCompacting && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
   }
 
   async stop(opts?: {
@@ -2015,7 +2808,11 @@ export class PiSdkRuntimeSession implements RuntimeSession {
     reason?: string;
   }): Promise<void> {
     if (this.didClose) return;
+    this.mappingState.responseObservation = null;
+    this.mappingState.responseCancelled = true;
+    this.turnOrigin.close();
     this.requestedStopReason = opts?.reason;
+    this.toolExecutionObserver?.observeAbortRequested("stop");
     const signal = opts?.signal ?? "SIGTERM";
     const session = this.session;
     if (session?.isStreaming || this.activeProviderRequest) {
@@ -2028,11 +2825,15 @@ export class PiSdkRuntimeSession implements RuntimeSession {
       });
     }
     if (session?.isStreaming) {
-      try {
-        await session.abort();
-      } catch (error) {
-        this.events.emit("stderr", piErrorMessage(error));
-      }
+      const aborted = Promise.resolve()
+        .then(() => session.abort())
+        .catch((error) => {
+          this.events.emit("stderr", piErrorMessage(error));
+        });
+      // abort() waits for the run to go idle, which never happens if a tool
+      // ignores the abort. A forced stop (the stalled-recovery SIGKILL
+      // escalation) must still end the session (task #1302).
+      if (signal !== "SIGKILL") await aborted;
     }
     await this.disposeSession();
     this.emitExitAndClose(null, signal);
@@ -2040,6 +2841,10 @@ export class PiSdkRuntimeSession implements RuntimeSession {
 
   async dispose(): Promise<void> {
     if (this.didClose) return;
+    this.mappingState.responseObservation = null;
+    this.mappingState.responseCancelled = true;
+    // session.dispose() aborts the running tool too.
+    this.toolExecutionObserver?.observeAbortRequested("stop");
     if (this.session?.isStreaming || this.activeProviderRequest) {
       this.cancellationSource = "dispose";
       this.recordLifecycle({
@@ -2058,6 +2863,173 @@ export class PiSdkRuntimeSession implements RuntimeSession {
     if (!sessionId || this.mappingState.sessionAnnounced) return;
     this.mappingState.sessionAnnounced = true;
     this.emitRuntimeEvent({ kind: "session_init", sessionId } satisfies ParsedEvent);
+  }
+
+  /**
+   * pi session rotation (pi#10642, plan v2.1): after a compaction, move a
+   * session file over the size threshold to a seed that starts at the latest
+   * compaction, under the same session id, and resume from it so the old
+   * SessionManager (which holds every entry ever written) is released.
+   */
+  rotateSessionIfDue(hold: () => RuntimeSessionRotationHold | null): void {
+    if (!this.rotationDue || this.rotation || this.didClose) return;
+    // pi resolves the settled run's prompt only after its agent_settled
+    // listeners (the turn end that calls this among them) have returned.
+    setImmediate(() => this.rotateIfStillDue(hold));
+  }
+
+  private noteRotationProgress(event: AgentSessionEvent): void {
+    if (!this.rotationConfig.enabled || !this.sessionHandle) return;
+    if (event.type === "compaction_end") {
+      const projection = projectPiCompactionEnd(event);
+      if (projection.outcome === "compaction_succeeded" && !projection.willRetry) this.compactionAwaitingSettle = true;
+    } else if (event.type === "agent_settled" && this.compactionAwaitingSettle) {
+      this.compactionAwaitingSettle = false;
+      this.rotationDue = true;
+    }
+  }
+
+  /** The SDK session has a run, retry, queued message or daemon input of its own. */
+  private sessionBusy(session: AgentSession): boolean {
+    return this.queuedInputs > 0
+      || this.activeProviderRequest !== null
+      || !session.isIdle
+      || session.isRetrying
+      || session.pendingMessageCount > 0;
+  }
+
+  private rotateIfStillDue(hold: () => RuntimeSessionRotationHold | null): void {
+    const session = this.session;
+    const handle = this.sessionHandle;
+    if (!this.rotationDue || this.rotation || this.didClose || !session || !handle) return;
+    const held = hold() ?? (this.sessionBusy(session) ? "runtime_busy" : null);
+    if (held) {
+      // Still due: the input in flight ends in another turn end.
+      this.emitRotationEvent("pi.session.rotation_skipped", { reason: held });
+      return;
+    }
+    this.rotationDue = false;
+    const skip = (reason: PiSessionRotationSkipReason, attrs: Record<string, number> = {}) =>
+      this.emitRotationEvent("pi.session.rotation_skipped", { reason, ...attrs });
+
+    const userExtensions = countPiUserExtensions(session.resourceLoader.getExtensions().extensions);
+    if (userExtensions > 0) return skip("user_extension", { user_extension_count: userExtensions });
+    const oldFile = session.sessionManager.getSessionFile();
+    let bytes: number;
+    try {
+      if (!oldFile) throw new Error("no session file");
+      bytes = statSync(oldFile).size;
+    } catch {
+      return skip("session_file_unreadable");
+    }
+    if (bytes < this.rotationConfig.minBytes) {
+      return skip("below_threshold", { session_bytes: bytes, min_bytes: this.rotationConfig.minBytes });
+    }
+    const seed = buildPiSessionSeed(session.sessionManager, { now: currentDate(), oldFileBytes: bytes });
+    if (!seed.rotatable) {
+      this.emitRotationEvent("pi.session.rotate_refused", { ...piSessionSeedRefusalTraceAttrs(seed), session_bytes: bytes });
+      return;
+    }
+    // Steps 1 and 2. A failure leaves the old session running on its file,
+    // unless the seed is left as the file a resume opens: then follow it.
+    const files = writePiSessionRotationFiles(seed, oldFile);
+    if (!files.ok) {
+      this.emitRotationFailure(files.stage, files.error, files.resumeFrom === "seed" ? "resumed_seed" : "kept_old");
+      if (files.resumeFrom === "old") return;
+    }
+    // Steps 3 and 4. Nothing above awaited, so no input got in between.
+    this.rotation = this.resumeRotatedSession(handle, seed, oldFile, files.ok ? seed.stats : null).finally(() => {
+      this.rotation = null;
+    });
+  }
+
+  /**
+   * Steps 3 and 4 on the spawn's own resources (PiSdkSessionHandle.reopen):
+   * the spawn path is not run again, so the CLI transport, the published
+   * context generation, the credential proxy and the tools stay as they are.
+   * The session id does not change, so nothing is announced again. The seed
+   * is opened before the old session goes: a failed open undoes the files
+   * and the old session keeps running, with the inputs queued meanwhile.
+   */
+  private async resumeRotatedSession(
+    handle: PiSdkSessionHandle,
+    seed: PiSessionSeed,
+    oldFile: string,
+    stats: PiSessionRotationStats | null,
+  ): Promise<void> {
+    let next: PiSdkSessionHandle;
+    try {
+      next = await handle.reopen();
+    } catch (error) {
+      if (this.didClose) return;
+      if (undoPiSessionRotationFiles(seed, oldFile)) {
+        this.emitRotationFailure("resume", error, "kept_old");
+        return;
+      }
+      // The seed is what a resume opens and the old file is gone from under
+      // the old session: end this runtime; a restart resumes from the seed.
+      this.emitRotationFailure("resume", error, "runtime_ended");
+      this.emitRuntimeEvent({ kind: "error", message: `Pi session rotation could not resume the session: ${piErrorMessage(error)}` }, "session_start");
+      this.emitExitAndClose(1, null);
+      return;
+    }
+    if (this.didClose) {
+      next.session.dispose();
+      return;
+    }
+    const unsubscribe = this.unsubscribe;
+    this.unsubscribe = null;
+    unsubscribe?.();
+    // The old session's calls are no longer observed; a late result for one is ignored.
+    this.providerCallTracker.abandonAll();
+    this.bindSession(next);
+    if (stats) {
+      this.emitRotationEvent("pi.session.rotated", { ...stats });
+      this.recordLifecycle({
+        kind: "session_rotated",
+        fromFile: path.basename(seed.rotatedOldFile),
+        toFile: path.basename(seed.seedFile),
+        entriesBefore: stats.entries_before,
+        bytesBefore: stats.bytes_before,
+        entriesAfter: stats.entries_after,
+        bytesAfter: stats.bytes_after,
+      });
+      console.info("[%s] session_rotated %s", this.logPrefix(), JSON.stringify({ sessionId: next.session.sessionId, ...stats }));
+    }
+  }
+
+  private emitRotationFailure(
+    stage: "write_seed" | "rename_old" | "resume",
+    error: unknown,
+    outcome: "kept_old" | "resumed_seed" | "runtime_ended",
+  ): void {
+    const errorCode = safeDiagnosticErrorCode(error);
+    this.emitRotationEvent("pi.session.rotation_failed", {
+      stage,
+      outcome,
+      error_class: safeDiagnosticErrorClass(error),
+      ...(errorCode ? { error_code: errorCode } : {}),
+    });
+    console.warn("[%s] session_rotation_failed stage=%s %s", this.logPrefix(), stage, piErrorMessage(error));
+  }
+
+  private emitRotationEvent(
+    name: "pi.session.rotated" | "pi.session.rotation_skipped" | "pi.session.rotate_refused" | "pi.session.rotation_failed",
+    attrs: Record<string, string | number>,
+  ): void {
+    this.ctx.tracer?.emitEvent(name, {
+      surface: "daemon",
+      attrs: {
+        agentId: this.ctx.agentId,
+        launchId: this.ctx.launchId || undefined,
+        runtime: this.ctx.config.runtime,
+        ...attrs,
+      },
+    });
+  }
+
+  private logPrefix(): string {
+    return this.ctx.config.runtime === "builtin" ? "builtin-driver" : "pi-driver";
   }
 
   private launchPrompt(text: string, delivery = false): void {
@@ -2124,12 +3096,7 @@ export class PiSdkRuntimeSession implements RuntimeSession {
   private recordLifecycle(event: RuntimeLifecycleDiagnosticEvent): void {
     const sessionId = this.mappingState.sessionId || this.ctx.config.sessionId;
     if (!sessionId) return;
-    writePiLifecycleDiagnostic(
-      this.ctx,
-      sessionId,
-      event,
-      this.ctx.config.runtime === "builtin" ? "builtin-driver" : "pi-driver",
-    );
+    writePiLifecycleDiagnostic(this.ctx, sessionId, event, this.logPrefix());
   }
 
   private recordProviderRequestActivity(activity: ProviderRequestActivity): void {
@@ -2182,7 +3149,9 @@ export class PiSdkRuntimeSession implements RuntimeSession {
     delivery?: PiDeliveryRequest,
   ): void {
     const queuedAt = currentTimeMs();
+    this.queuedInputs += 1;
     setImmediate(() => {
+      this.queuedInputs -= 1;
       if (this.didClose) return;
       const span = this.ctx.tracer?.startSpan("daemon.pi.prompt", {
         surface: "daemon",
@@ -2353,6 +3322,7 @@ export class PiSdkRuntimeSession implements RuntimeSession {
   private emitExitAndClose(code: number | null, signal: NodeJS.Signals | null): void {
     if (this.didClose) return;
     this.didClose = true;
+    this.providerCallTracker.abandonAll();
     const info: RuntimeExitInfo = {
       code,
       signal,
@@ -2387,6 +3357,10 @@ export class PiDriver implements RuntimeDriver {
   } as const;
   readonly session = {
     recovery: "resume_or_fresh",
+    // Emits the compaction events (builtin extends this driver).
+    compaction: "reported",
+    // One request summarizes the whole session: once it no longer fits the model, every resume fails again (builtin extends this driver).
+    compactionFailure: "sticks_to_session",
   } as const;
   readonly model = {
     detectedModelsVerifiedAs: "launchable" as const,
@@ -2394,6 +3368,8 @@ export class PiDriver implements RuntimeDriver {
   };
   readonly supportsStdinNotification = true;
   readonly busyDeliveryMode = "direct" as const;
+  // The Pi SDK runs in the daemon process (builtin extends this driver).
+  readonly shipsWithComputer = true;
 
   protected sessionId: string | null = null;
 
@@ -2488,6 +3464,8 @@ export class BuiltInDriver extends PiDriver {
           protocolVersion: 1,
           runtime: "builtin",
           runtimeVersion: PI_SDK_VERSION,
+          // task #10: this Computer runs a typed model id on these preset providers.
+          customModelProviderIds: [...BUILTIN_RUNTIME_CUSTOM_MODEL_PRESET_PROVIDER_IDS],
         },
       },
     };
@@ -2497,7 +3475,7 @@ export class BuiltInDriver extends PiDriver {
     this.sessionId = ctx.config.sessionId || null;
     return new PiSdkRuntimeSession(ctx, (sessionId) => {
       this.sessionId = sessionId;
-    }, (sessionCtx, sessionId, _observer, providerObserver) => createPiAgentSessionForContext(sessionCtx, sessionId, {
+    }, (sessionCtx, sessionId, observer, providerObserver, providerCallTracker, anthropicRequests) => openPiAgentSessionForContext(sessionCtx, sessionId, {
       agentDir: buildBuiltInAgentDir(sessionCtx.workingDirectory),
       sessionDir: buildBuiltInSessionDir(sessionCtx.workingDirectory),
       traceName: "daemon.builtin.session.create",
@@ -2507,7 +3485,7 @@ export class BuiltInDriver extends PiDriver {
       exposeLaunchTraceEvidence: true,
       exposeLaunchEnvToTools: false,
       isolateHostProviderEnv: true,
-    }, undefined, providerObserver));
+    }, observer, providerObserver, providerCallTracker, anthropicRequests));
   }
 
   buildSystemPrompt(config: AgentConfig, _agentId: string): AxSurfaceText {
@@ -2526,4 +3504,13 @@ function delay(ms: number): Promise<void> {
     const timer = setTimeout(resolve, ms);
     timer.unref?.();
   });
+}
+
+/** A short, content-free class for a failed turn-end compaction (no summary or provider text). */
+function classifyTurnEndCompactionError(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  if (/token cap|incomplete|length/i.test(message)) return "summary_incomplete";
+  if (/nothing to compact|no messages/i.test(message)) return "nothing_to_compact";
+  if (/abort|cancel/i.test(message)) return "aborted";
+  return "error";
 }

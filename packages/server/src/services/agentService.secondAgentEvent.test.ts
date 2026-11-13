@@ -8,7 +8,7 @@ import { agents, productEvents, users } from "../db/schema";
 import { createAgent } from "./agentService";
 import { createServer } from "./serverService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 async function seedOwner(label: string) {
   const [owner] = await getDb().insert(users).values({

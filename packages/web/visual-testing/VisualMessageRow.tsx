@@ -21,6 +21,10 @@ export function VisualMessageRow({ fixture }: { fixture: VisualMessageRowFixture
       threadSummary={fixture.threadSummary}
       linkedTask={fixture.linkedTask}
       hideThreadActions={fixture.hideThreadActions}
+      parentChannelId={fixture.parentChannelId}
+      parentMessageId={fixture.parentMessageId}
+      showAgentReadStatus={fixture.showAgentReadStatus}
+      agentReadFaces={fixture.agentReadFaces}
     />
   );
 }

@@ -1,6 +1,10 @@
 import type { Message } from "../../store/messageStore";
 import { rankComposerSuggestions } from "../../utils/composerSuggestionSearch";
 import type { ComposerSuggestionSearchEntry } from "../../utils/composerSuggestionSearch";
+import type { ChannelAgent, ChannelHuman } from "../../hooks/useChannelMembers";
+import { memberServerBadgeLabels } from "../../utils/channelLocalMembership";
+import { isViewerServerGuest, memberOrigin } from "../../utils/memberOrigin";
+import type { MemberOrigin } from "../../utils/memberOrigin";
 
 export interface MentionCandidate {
   id: string;
@@ -18,11 +22,14 @@ export interface MentionCandidate {
    * projection id, name is the outbound handle. Never wakes a Raft actor;
    * it mints an `external_mention_facts` row for the Slack renderer.
    */
-  type: "agent" | "user" | "computer" | "app" | "external";
+  type: "agent" | "user" | "external";
   avatarUrl: string | null;
-  gravatarHash?: string | null;
-  email?: string | null;
   description?: string | null;
+  /** Where the candidate is from, as the roster says (#wg-rbac:#46): another
+   *  server's gets that server's tile on the avatar and its name after the kind. */
+  origin?: MemberOrigin;
+  /** A Guest of the viewed server (never another server's person). */
+  guest?: boolean;
 }
 
 interface BuildMentionCandidateGroupsOptions {
@@ -40,13 +47,11 @@ interface BuildMentionCandidateGroupsFromRankedOptions {
   prioritizeThreadParticipants?: boolean;
 }
 
-interface MentionCandidateGroups {
+export interface MentionCandidateGroups {
   inChannel: MentionCandidate[];
   notInChannel: MentionCandidate[];
   /** Linked provider members (e.g. Slack) — always channel-scoped. */
   externals: MentionCandidate[];
-  computers: MentionCandidate[];
-  apps: MentionCandidate[];
   flat: MentionCandidate[];
 }
 
@@ -59,7 +64,52 @@ export function isMemberScopedMentionChannel(channel: MentionScopeChannel | null
   return channel.type === "private" || channel.type === "joint";
 }
 
+/**
+ * A channel roster's person as an @ candidate: where they are from (the
+ * avatar's tile and the server's name) and whether they are a Guest of the
+ * viewed server, read as the member list reads it (rosterRoleTag): the
+ * roster sends a guest viewer no `role`, only `effectiveChannelRole`.
+ */
+export function channelHumanMentionCandidate(human: ChannelHuman, viewerServerId: string | null | undefined): MentionCandidate {
+  const isRemoteHuman = Boolean(viewerServerId && human.serverId && human.serverId !== viewerServerId);
+  const serverLabels = memberServerBadgeLabels(human, viewerServerId);
+  const origin = memberOrigin(human, viewerServerId);
+  return {
+    origin,
+    guest: isViewerServerGuest(human.effectiveChannelRole ?? human.role, origin),
+    id: human.id,
+    serverId: isRemoteHuman ? human.serverId : undefined,
+    serverName: isRemoteHuman ? human.serverName : undefined,
+    serverSlug: isRemoteHuman ? human.serverSlug : undefined,
+    serverLabels: serverLabels.length > 0 ? serverLabels : undefined,
+    name: human.name,
+    displayName: human.displayName,
+    type: "user",
+    avatarUrl: human.avatarUrl,
+    description: human.description,
+  };
+}
+
+/** A channel roster's agent as an @ candidate, with where it is from. */
+export function channelAgentMentionCandidate(agent: ChannelAgent, viewerServerId: string | null | undefined): MentionCandidate {
+  const isRemoteAgent = Boolean(viewerServerId && agent.serverId && agent.serverId !== viewerServerId);
+  return {
+    origin: memberOrigin(agent, viewerServerId),
+    id: agent.id,
+    serverId: isRemoteAgent ? agent.serverId : undefined,
+    serverName: isRemoteAgent ? agent.serverName : undefined,
+    serverSlug: isRemoteAgent ? agent.serverSlug : undefined,
+    name: agent.name,
+    displayName: agent.displayName,
+    type: "agent",
+    avatarUrl: agent.avatarUrl,
+    description: agent.description,
+  };
+}
+
 export function getMentionCandidateDescription(candidate: MentionCandidate): string | null {
+  // Another server's agent has no description in this list.
+  if (candidate.type === "agent" && candidate.origin?.external) return null;
   const description = candidate.description?.trim().replace(/\s+/g, " ");
   return description || null;
 }
@@ -69,7 +119,7 @@ export function getMentionCandidateServerLabel(candidate: MentionCandidate): str
   return candidate.serverName || candidate.serverSlug || null;
 }
 
-export function createMentionCandidateSearchEntries(candidates: MentionCandidate[]): ComposerSuggestionSearchEntry<MentionCandidate>[] {
+export function createMentionCandidateSearchEntries(candidates: readonly MentionCandidate[]): ComposerSuggestionSearchEntry<MentionCandidate>[] {
   return candidates.map((candidate, index) => ({
     index,
     suggestion: candidate,
@@ -138,15 +188,13 @@ export function buildMentionCandidateGroupsFromRankedCandidates({
 }: BuildMentionCandidateGroupsFromRankedOptions): MentionCandidateGroups {
   const people = rankedCandidates.filter((candidate) => candidate.type === "agent" || candidate.type === "user");
   const externals = rankedCandidates.filter((candidate) => candidate.type === "external");
-  const computers = rankedCandidates.filter((candidate) => candidate.type === "computer");
-  const apps = rankedCandidates.filter((candidate) => candidate.type === "app");
   const inChannel = people.filter((candidate) => channelMemberIds.has(candidate.id));
   const notInChannel = people.filter((candidate) => !channelMemberIds.has(candidate.id));
 
   if (prioritizeThreadParticipants !== true) {
     // Externals sit inside the in-channel group in the UI (Slack badge marks
     // them), so they land after inChannel in flat index order.
-    return { inChannel, notInChannel, externals, computers, apps, flat: [...inChannel, ...externals, ...notInChannel, ...computers, ...apps] };
+    return { inChannel, notInChannel, externals, flat: [...inChannel, ...externals, ...notInChannel] };
   }
 
   // Stryker disable next-line ArrayDeclaration: empty original-order tuples are equivalent under stable sort for this tie-breaker; query order preservation is covered by non-thread and recency tests.
@@ -159,8 +207,6 @@ export function buildMentionCandidateGroupsFromRankedCandidates({
     inChannel: sortedInChannel,
     notInChannel: sortedNotInChannel,
     externals,
-    computers,
-    apps,
-    flat: [...sortedInChannel, ...externals, ...sortedNotInChannel, ...computers, ...apps],
+    flat: [...sortedInChannel, ...externals, ...sortedNotInChannel],
   };
 }

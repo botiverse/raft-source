@@ -10,7 +10,7 @@ import { PRODUCT_EVENT_SINK_APP_KEY } from "../services/productEventIngest";
 import type { ProductEventRow, ProductEventSink } from "../services/productEventScopeDbWriter";
 import { createServer } from "../services/serverService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 async function seedVerifiedUser(email: string, name: string) {
   const db = getDb();
@@ -85,6 +85,45 @@ test("POST /product-events/onboarding-wizard records a sanitized core wizard eve
   });
 });
 
+// The usage-data notice promises nothing typed is stored (2026-10-21): every
+// client-sent string here is kept only as a token, anything else is dropped.
+test("POST /product-events/onboarding-wizard drops any client string that is not a token", async ({ app }) => {
+  const owner = await seedVerifiedUser("onboarding-event-text@slock.test", "onboarding-event-text");
+  const server = await createServer("Onboarding Event Text", "onboarding-event-text", owner.id);
+  const token = await tokenForHuman(owner.email);
+
+  const res = await fetch(`${app.baseUrl}/api/product-events/onboarding-wizard`, {
+    method: "POST",
+    headers: authHeaders(token, server.id),
+    body: JSON.stringify({
+      eventType: "onboarding_wizard.primary_clicked",
+      idempotencyKey: "key with spaces",
+      metadata: {
+        step_id: "referral-source",
+        wizard_version: "Owner Wizard v3",
+        session_id: "me@example.com",
+        action: "submit referral",
+        result: "a friend told me",
+        reason: "Error: could not reach api.example.com",
+        latency_ms: 50,
+      },
+    }),
+  });
+  assert.equal(res.status, 204);
+
+  const rows = await getDb().select().from(productEvents).where(
+    and(eq(productEvents.subjectType, "onboarding_wizard"), eq(productEvents.subjectId, server.id)),
+  );
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].idempotencyKey, null);
+  assert.deepEqual(rows[0].metadata, {
+    step_id: "referral-source",
+    wizard_version: "unknown",
+    session_id: "unknown",
+    latency_ms: 50,
+  });
+});
+
 test("POST /product-events/onboarding-wizard rejects untracked push-notification steps", async ({ app }) => {
   const owner = await seedVerifiedUser("onboarding-event-push@slock.test", "onboarding-event-push");
   const server = await createServer("Onboarding Push Exclusion", "onboarding-push-exclusion", owner.id);
@@ -131,9 +170,10 @@ function clientEvent(event: string, properties: Record<string, unknown>, timesta
   return { uuid: randomUUID(), event, timestamp, client_session_id: SESSION_ID, properties };
 }
 
-test("client events: nothing is accepted until the user shares usage data", async ({ app }) => {
+test("client events: nothing is accepted from a user who turned sharing off", async ({ app }) => {
   const user = await seedVerifiedUser("client-events-default@slock.test", "client-events-default");
   const server = await createServer("Client Events Default", "client-events-default", user.id);
+  await getDb().update(users).set({ shareUsageData: false }).where(eq(users.id, user.id));
   const token = await tokenForHuman(user.email);
   const store = memoryProductEventSink();
   app.app.set(PRODUCT_EVENT_SINK_APP_KEY, store.sink);
@@ -190,6 +230,7 @@ test("client events: registered events are stored under the analytics id only", 
   assert.equal(row.source, "web");
   assert.equal(row.client_session_id, SESSION_ID);
   assert.equal(row.app_version, "1.2.3");
+  assert.equal(row.platform, "web", "a computer's browser");
   assert.deepEqual(row.properties, {
     from: "rail",
     $browser: "chrome",
@@ -197,6 +238,7 @@ test("client events: registered events are stored under the analytics id only", 
     $os: "windows",
     $device_type: "desktop",
     $country: "DE",
+    $account_age: "0-7d",
   });
   assert.doesNotMatch(JSON.stringify(store.rows), new RegExp(user.id), "the Raft user id must not reach the store");
   assert.equal(JSON.stringify(store.rows).includes("Win64"), false, "the raw user agent must not reach the store");
@@ -229,9 +271,9 @@ test("client events: duplicates are dropped and malformed ids or versions are re
 
   const event = { ...clientEvent("activity_open", { from: "rail" }), client_session_id: randomUUID() };
   const first = await post({ source: "web", events: [event, event] });
-  assert.deepEqual(await first.json(), { accepted: 1 }, "a repeated uuid in one batch is stored once");
+  assert.deepEqual(await first.json(), { accepted: 1, duplicates: 1 }, "a repeated uuid in one batch is stored once");
   const again = await post({ source: "web", events: [event] });
-  assert.deepEqual(await again.json(), { accepted: 0 }, "a recently seen uuid is dropped");
+  assert.deepEqual(await again.json(), { accepted: 0, duplicates: 1 }, "a recently seen uuid is dropped, and the answer says it was already taken");
   assert.equal(store.rows.length, 1);
 
   const badSession = await post({ source: "web", events: [{ ...clientEvent("activity_open", {}), client_session_id: "tab-1 <script>" }] });
@@ -262,4 +304,85 @@ test("onboarding-wizard events honor an explicit opt-out and the workspace switc
   await getDb().update(servers).set({ productAnalyticsEnabled: false }).where(eq(servers.id, server.id));
   assert.equal((await record("workspace-off")).status, 204);
   assert.equal(await count(), 1, "the workspace turned analytics off: nothing recorded");
+});
+
+// Tenny, 2026-10-21: web and desktop builds before 1.21.28 show "Share usage
+// data" as off for an account that never chose, so their batches for such an
+// account are dropped; newer builds, explicit choices and the native apps are not.
+test("client events: old web builds send nothing for an account that never chose; newer builds and native apps do", async ({ app }) => {
+  const user = await seedVerifiedUser("client-events-old-web@slock.test", "client-events-old-web");
+  const server = await createServer("Client Events Old Web", "client-events-old-web", user.id);
+  await getDb().update(users).set({ shareUsageData: null }).where(eq(users.id, user.id));
+  const token = await tokenForHuman(user.email);
+  const store = memoryProductEventSink();
+  app.app.set(PRODUCT_EVENT_SINK_APP_KEY, store.sink);
+  const send = async (source: string, appVersion?: string, envelope: Record<string, string> = {}) => {
+    const res = await fetch(`${app.baseUrl}/api/product-events/batch`, {
+      method: "POST",
+      headers: authHeaders(token, server.id),
+      body: JSON.stringify({
+        source,
+        ...(appVersion === undefined ? {} : { app_version: appVersion }),
+        ...envelope,
+        events: [clientEvent("page_viewed", { route: "channel" })],
+      }),
+    });
+    assert.equal(res.status, 202);
+    return ((await res.json()) as { accepted: number }).accepted;
+  };
+
+  assert.equal(await send("web", "1.21.27"), 0, "1.21.27 shows not chosen as off");
+  assert.equal(await send("desktop", "1.21.19"), 0, "an old desktop build");
+  assert.equal(await send("web"), 0, "no version counts as old");
+  assert.equal(await send("web", "1.21.28"), 1, "1.21.28 shows not chosen as on");
+  assert.equal(await send("web", "1.22.0"), 1);
+  assert.equal(await send("android", "1.15.1"), 1, "the native apps have no switch and follow the server");
+  // v1.21.30 was first cut still labelled 1.21.26: builds that send the
+  // #10790 fields are new whatever their label says.
+  assert.equal(await send("web", "1.21.26", { display_mode: "browser" }), 1, "a web build that sends display_mode");
+  assert.equal(await send("desktop", "0.1.22", { web_version: "1.21.26" }), 1, "a desktop app that sends its web build");
+  assert.equal(await send("desktop", "0.1.22"), 0, "a desktop batch without its web build is old");
+
+  await getDb().update(users).set({ shareUsageData: true }).where(eq(users.id, user.id));
+  assert.equal(await send("web", "1.21.27"), 1, "an explicit choice to share holds on any build");
+  assert.equal(store.rows.length, 6);
+});
+
+// xxchan, 2026-10-22 (task #13): every client row says which client it came
+// from, and the desktop app's batches pass the old-build rule by the web
+// build they embed, not by their own (differently numbered) version.
+test("client events: the platform column names the client, and the desktop app is judged by its embedded web build", async ({ app }) => {
+  const user = await seedVerifiedUser("client-events-platform@slock.test", "client-events-platform");
+  const server = await createServer("Client Events Platform", "client-events-platform", user.id);
+  const token = await tokenForHuman(user.email);
+  const store = memoryProductEventSink();
+  app.app.set(PRODUCT_EVENT_SINK_APP_KEY, store.sink);
+  const iphoneSafari = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1";
+  const androidNoMobile = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36";
+  const electronMac = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Raft/0.1.22 Chrome/141.0.0.0 Electron/38.0.0 Safari/537.36";
+  const send = async (envelope: Record<string, string>, userAgent?: string) => {
+    const res = await fetch(`${app.baseUrl}/api/product-events/batch`, {
+      method: "POST",
+      headers: { ...authHeaders(token, server.id), ...(userAgent ? { "User-Agent": userAgent } : {}) },
+      body: JSON.stringify({ ...envelope, events: [clientEvent("page_viewed", { route: "channel" })] }),
+    });
+    assert.equal(res.status, 202);
+    return ((await res.json()) as { accepted: number }).accepted;
+  };
+
+  // The account never chose (default on): 1.21.30 builds count.
+  assert.equal(await send({ source: "web", app_version: "1.21.30", display_mode: "browser" }, iphoneSafari), 1);
+  assert.equal(await send({ source: "web", app_version: "1.21.30", display_mode: "standalone" }, iphoneSafari), 1);
+  assert.equal(await send({ source: "desktop", app_version: "0.1.22", web_version: "1.21.30" }, electronMac), 1);
+  assert.equal(await send({ source: "desktop", app_version: "0.1.22" }, electronMac), 0, "no embedded web build: an old desktop app");
+  assert.equal(await send({ source: "android", app_version: "1.15.2", device_class: "phone" }, androidNoMobile), 1);
+
+  const rows = store.rows.map((row) => [row.source, row.platform, row.app_version, row.properties.$device_type, row.properties.$web_version ?? null]);
+  assert.deepEqual(rows, [
+    ["web", "mobile_web", "1.21.30", "mobile", null],
+    ["web", "pwa", "1.21.30", "mobile", null],
+    ["desktop", "desktop_app", "0.1.22", "desktop", "1.21.30"],
+    ["android", "android", "1.15.2", "mobile", null],
+  ]);
+  for (const row of store.rows) assert.equal(row.properties.$account_age, "0-7d");
 });

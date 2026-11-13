@@ -8,13 +8,19 @@
 // operation that does the same for a runtime that calls operations), and
 // whose `text` is the canonical agent-readable rendering. Failures carry a
 // stable SDK code, the Server's machine code when it sent one, and a next
-// action; raw bodies and transport causes are never surfaced.
+// action; raw bodies and transport causes are never surfaced (the Server
+// sentences shown are ones written for agents: core's rate limit's,
+// rateLimitedError, a too-old client's, clientUpgradeError, and an action
+// card refusal's, actions.ts).
 
 import type { z } from "zod";
 
 import type { AgentApiClientError, AgentApiClientResult } from "../agentApiClient";
 import type { AgentApiRouteKey } from "../agentApiContract";
-import { formatHint, RAFT_HINTS, type RaftHintStyle, type RaftNextOperation } from "./hint";
+import { AGENT_API_CLIENT_UPGRADE_REQUIRED_CODE, AGENT_API_CLIENT_UPGRADE_REQUIRED_STATUS, parseAgentApiClientUpgradeRequiredBody } from "../agentApiClientUpgrade";
+import { agentApiRateLimitedSentence, parseAgentApiRateLimitedBody } from "../agentApiRateLimit";
+import { formatHint, RAFT_HINTS, type RaftHint, type RaftHintStyle, type RaftNextOperation } from "./hint";
+import { readRefusal } from "../refusal";
 
 export interface RaftNextStep {
   /** Stable step kind, for example `read_target`, `run_inbox_check`, `retry_after_review`. */
@@ -54,11 +60,17 @@ export type RaftOpErrorCode =
   | "UNSUPPORTED_FOR_EXTERNAL_AGENTS"
   | "UNAVAILABLE"
   /** A model-only operation was invoked from code (`invoke(…, { origin: "code" })`); nothing was sent. */
-  | "MODEL_ONLY";
+  | "MODEL_ONLY"
+  /** A Raft app (Agent Login integration) refused or failed the call, or cannot be called safely. */
+  | "APP_ERROR";
 
 export interface RaftOpError {
   code: RaftOpErrorCode;
-  /** Safe SDK text; never a raw Server body or transport cause. */
+  /**
+   * Safe SDK text; never a raw Server body or transport cause. The Server's
+   * own sentence only where it is written for agents: core's rate limit, and
+   * an `actions.prepare` refusal (what is wrong with the card).
+   */
   message: string;
   status?: number;
   /** The Server's stable machine code for an HTTP rejection, when it sent one. */
@@ -66,6 +78,10 @@ export interface RaftOpError {
   /** What to do now; from the Server when it said, otherwise the SDK default for this code. */
   nextAction: string;
   retryable: boolean;
+  /** Whole seconds until the same request may go again: a 429 RATE_LIMITED, or any refusal that carries `retryAfterSeconds`. */
+  retryAfterSeconds?: number;
+  /** The Server's next step as an operation (the refusal's `next`); `nextAction` is it rendered, in the caller's hint style. */
+  nextHint?: RaftHint;
 }
 
 export interface RaftFailure {
@@ -95,6 +111,7 @@ const DEFAULT_MESSAGES: Record<RaftOpErrorCode, string> = {
   UNSUPPORTED_FOR_EXTERNAL_AGENTS: "This operation is not available to External Agents.",
   UNAVAILABLE: "The Raft Server could not serve this operation right now.",
   MODEL_ONLY: "This operation only counts when the model sees its result, so it cannot be run from code; nothing was sent.",
+  APP_ERROR: "The app refused or failed the call.",
 };
 
 function notFoundNextAction(style: RaftHintStyle): string {
@@ -104,7 +121,7 @@ function notFoundNextAction(style: RaftHintStyle): string {
 const DEFAULT_NEXT_ACTION: Record<RaftOpErrorCode, string> = {
   INVALID_REQUEST: "Fix the request arguments; nothing was sent.",
   TRANSPORT_ERROR: "Check connectivity to the Raft Server and retry if the operation is safe to repeat.",
-  HTTP_ERROR: "Read the Server's error code and adjust the request.",
+  HTTP_ERROR: "Change what the error says, then try again. If it doesn't say what to change, this client may be older than the Raft Server: update it to the latest version.",
   INVALID_RESPONSE: "Upgrade the SDK or report the Server version; the response shape is not the one this SDK knows.",
   CAPABILITY_NOT_AUTHORIZED: "Ask a human who can mint credentials to include the missing capability.",
   SCOPE_DENIED: "Ask a human with editAgents authority to extend this agent's scopes.",
@@ -114,6 +131,7 @@ const DEFAULT_NEXT_ACTION: Record<RaftOpErrorCode, string> = {
   UNSUPPORTED_FOR_EXTERNAL_AGENTS: "Use your own runtime for this; the Server does not provide it to External Agents.",
   UNAVAILABLE: "Retry in a moment.",
   MODEL_ONLY: "Call it as a model tool call instead of from code.",
+  APP_ERROR: "Read the app's error and adjust the request; if it keeps failing, tell the person who asked.",
 };
 
 const RETRYABLE: Record<RaftOpErrorCode, boolean> = {
@@ -129,6 +147,7 @@ const RETRYABLE: Record<RaftOpErrorCode, boolean> = {
   UNSUPPORTED_FOR_EXTERNAL_AGENTS: false,
   UNAVAILABLE: true,
   MODEL_ONLY: false,
+  APP_ERROR: false,
 };
 
 function classifyHttp(status: number, serverCode: string | undefined): RaftOpErrorCode {
@@ -144,6 +163,70 @@ function classifyHttp(status: number, serverCode: string | undefined): RaftOpErr
   return "HTTP_ERROR";
 }
 
+const REFUSAL_SENTENCE_MAX_CHARS = 500;
+
+/**
+ * A 4xx refusal's own sentence, the body's `error`. The Server writes it for
+ * the agent (why it refused, and what to change), so it is shown as sent,
+ * whether or not this client knows the code: a rule added on a newer Server
+ * still reads on an older client. One bounded line with a space in it, else
+ * null (the default sentence stands).
+ */
+function refusalSentence(response: unknown): string | null {
+  if (!response || typeof response !== "object") return null;
+  const raw = (response as { error?: unknown }).error;
+  if (typeof raw !== "string") return null;
+  const sentence = raw.trim();
+  // A sentence has a space: a bare code ("invalid_scope") or word ("Unauthorized") in `error` is not one.
+  return /\s/.test(sentence) && !/[\r\n]/.test(sentence) && sentence.length <= REFUSAL_SENTENCE_MAX_CHARS ? sentence : null;
+}
+
+/**
+ * Core's 429 RATE_LIMITED (agentApiRateLimit.ts: an app's writes over the
+ * agent's budget): the Server's sentence, the one it writes for agents
+ * (which writes, the limit, the wait; a stand-in from the details if it isn't
+ * one short line), retryable after the wait. Nothing else of the body. The
+ * refused request ran nothing, so repeating it does nothing twice.
+ */
+function rateLimitedError(response: unknown): Omit<RaftOpError, "code" | "status"> | null {
+  const body = parseAgentApiRateLimitedBody(response);
+  if (!body) return null;
+  const { retryAfterSeconds } = body.details;
+  const wait = `${retryAfterSeconds} second${retryAfterSeconds === 1 ? "" : "s"}`;
+  return {
+    message: agentApiRateLimitedSentence(body),
+    serverCode: body.code,
+    nextAction: `Wait ${wait}, then make the same request again (the refused one changed nothing).`,
+    retryable: true,
+    retryAfterSeconds,
+  };
+}
+
+const CLIENT_UPGRADE_SENTENCE_MAX_CHARS = 1000;
+
+/**
+ * A 426 CLIENT_UPGRADE_REQUIRED (agentApiClientUpgrade.ts: this client is
+ * older than the route accepts): the Server's sentence, which says exactly
+ * how to upgrade (from the body, or the transport's `error` when it kept no
+ * body, as a binary download's; a stand-in if it isn't one bounded line).
+ * Not retryable: the same client is refused again until it is upgraded.
+ */
+function clientUpgradeError(error: Extract<AgentApiClientError, { kind: "http" }>): Omit<RaftOpError, "code" | "status"> | null {
+  if (error.status !== AGENT_API_CLIENT_UPGRADE_REQUIRED_STATUS) return null;
+  const body = parseAgentApiClientUpgradeRequiredBody(error.response);
+  if (!body && error.errorCode !== AGENT_API_CLIENT_UPGRADE_REQUIRED_CODE) return null;
+  const sentence = (body?.error ?? error.message).trim();
+  const message = sentence && !/[\r\n]/.test(sentence) && sentence.length <= CLIENT_UPGRADE_SENTENCE_MAX_CHARS
+    ? sentence
+    : `This client is too old for this request${body ? `: the Raft Server needs ${body.minVersion} or newer` : ""}. Upgrade it.`;
+  return {
+    message,
+    serverCode: AGENT_API_CLIENT_UPGRADE_REQUIRED_CODE,
+    nextAction: "Upgrade as the error says, then run the same command again (the refused request changed nothing).",
+    retryable: false,
+  };
+}
+
 export function opErrorFromClientError(error: AgentApiClientError, status?: number): RaftOpError {
   if (error.kind === "transport") {
     return { code: "TRANSPORT_ERROR", message: DEFAULT_MESSAGES.TRANSPORT_ERROR, nextAction: DEFAULT_NEXT_ACTION.TRANSPORT_ERROR, retryable: true };
@@ -151,16 +234,35 @@ export function opErrorFromClientError(error: AgentApiClientError, status?: numb
   if (error.kind === "http") {
     const serverCode = typeof error.errorCode === "string" && SERVER_ERROR_CODE.test(error.errorCode) ? error.errorCode : undefined;
     const code = classifyHttp(error.status, serverCode);
-    const nextAction = typeof error.suggestedNextAction === "string" && error.suggestedNextAction.trim()
-      ? error.suggestedNextAction.trim()
-      : DEFAULT_NEXT_ACTION[code];
+    const limited = error.status === 429 ? rateLimitedError(error.response) : null;
+    if (limited) return { ...limited, code, status: error.status };
+    const upgrade = clientUpgradeError(error);
+    if (upgrade) return { ...upgrade, code, status: error.status };
+    // The refusal envelope (shared refusal.ts): a structured `next` wins over
+    // the text step, and `retryAfterSeconds` makes any refusal retryable after
+    // the wait, whatever its code.
+    const refusal = readRefusal(error.response);
+    const hint = refusal.next;
+    const wait = refusal.retryAfterSeconds;
+    const serverStep = hint
+      ? formatHint(hint, "cli")
+      : typeof error.suggestedNextAction === "string" && error.suggestedNextAction.trim()
+        ? error.suggestedNextAction.trim()
+        : null;
+    const nextAction = serverStep
+      ?? (wait !== undefined
+        ? `Wait ${wait} second${wait === 1 ? "" : "s"}, then make the same request again.`
+        : DEFAULT_NEXT_ACTION[code]);
+    const sentence = error.status >= 400 && error.status < 500 ? refusalSentence(error.response) : null;
     return {
       code,
-      message: DEFAULT_MESSAGES[code],
+      message: sentence ?? DEFAULT_MESSAGES[code],
       status: error.status,
       ...(serverCode ? { serverCode } : {}),
       nextAction,
-      retryable: RETRYABLE[code],
+      retryable: wait !== undefined ? true : RETRYABLE[code],
+      ...(wait !== undefined ? { retryAfterSeconds: wait } : {}),
+      ...(hint ? { nextHint: hint } : {}),
     };
   }
   const requestSide = error.reason === "request_contract_mismatch" || error.reason === "missing_path_param" || error.reason === "missing_route";
@@ -193,12 +295,22 @@ export function formatOpErrorText(error: RaftOpError): string {
   return lines.join("\n");
 }
 
+/**
+ * The Server's hint, while it is still the step: an operation that writes its
+ * own next action over it (the Artifacts' words) leaves `nextHint` behind,
+ * and then the hint must not override that step in another style.
+ */
+function currentHint(error: RaftOpError): RaftHint | undefined {
+  return error.nextHint && error.nextAction === formatHint(error.nextHint, "cli") ? error.nextHint : undefined;
+}
+
 export function failureOutcome(error: RaftOpError): RaftFailure {
-  return { ok: false, state: "error", error, next: { kind: "recover", why: error.nextAction }, text: formatOpErrorText(error) };
+  const operation = currentHint(error)?.op;
+  return { ok: false, state: "error", error, next: { kind: "recover", why: error.nextAction, ...(operation ? { operation } : {}) }, text: formatOpErrorText(error) };
 }
 
 /** A next action written for the CLI: it names a `raft` command or a `--flag`. */
-const CLI_NEXT_ACTION_PATTERN = /\braft [a-z]|(^|[\s`'"(])--[a-z]/;
+export const CLI_NEXT_ACTION_PATTERN = /\braft [a-z]|(^|[\s`'"(])--[a-z]/;
 
 /**
  * The attachment routes answer one uniform 404 for missing, unreadable and
@@ -221,14 +333,20 @@ export function restyleDefaultNextAction<T>(outcome: T, style: RaftHintStyle): T
   const failure = outcome as unknown as Partial<RaftFailure>;
   if (failure.ok !== false || !failure.error) return outcome;
   const current = failure.error.nextAction;
-  let nextAction: string;
-  if (current === DEFAULT_NEXT_ACTION.NOT_FOUND) nextAction = notFoundNextAction(style);
+  let nextAction = current;
+  const hint = currentHint(failure.error);
+  if (hint) nextAction = formatHint(hint, style);
+  else if (current === DEFAULT_NEXT_ACTION.NOT_FOUND) nextAction = notFoundNextAction(style);
   else if (failure.error.serverCode === "ATTACHMENT_UNAVAILABLE") nextAction = ATTACHMENT_UNAVAILABLE_TOOL_NEXT_ACTION;
   else if (CLI_NEXT_ACTION_PATTERN.test(current)) {
     nextAction = failure.error.code === "NOT_FOUND" ? notFoundNextAction(style) : DEFAULT_NEXT_ACTION[failure.error.code];
-  } else return outcome;
-  if (nextAction === current) return outcome;
-  const error: RaftOpError = { ...failure.error, nextAction };
+  }
+  // A Server sentence written for the CLI (it names a command or a flag, as
+  // ATTACHMENT_UNAVAILABLE's does) is not for a model that can't run one: the
+  // code's own sentence instead.
+  const message = CLI_NEXT_ACTION_PATTERN.test(failure.error.message) ? DEFAULT_MESSAGES[failure.error.code] : failure.error.message;
+  if (nextAction === current && message === failure.error.message) return outcome;
+  const error: RaftOpError = { ...failure.error, message, nextAction };
   const next = failure.next && failure.next.why === current ? { ...failure.next, why: nextAction } : failure.next ?? null;
   return { ...failure, error, next, text: formatOpErrorText(error) } as T;
 }

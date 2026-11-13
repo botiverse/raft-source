@@ -1,5 +1,11 @@
 import assert from "node:assert/strict";
-import { redactDiagnosticText } from "./diagnosticRedaction";
+import {
+  addDiagnosticRedactionCounts,
+  DIAGNOSTIC_REDACTION_KINDS,
+  diagnosticRedactionMarker,
+  redactDiagnosticSecrets,
+  redactDiagnosticText,
+} from "./diagnosticRedaction";
 import { DIAGNOSTIC_REDACTION_CREDENTIAL_SAMPLES, PEM_PRIVATE_KEY_BEGIN } from "./test/diagnosticRedactionCredentialSamples";
 
 describe("redactDiagnosticText", () => {
@@ -54,5 +60,86 @@ describe("redactDiagnosticText", () => {
     assert.ok(!out.includes(body));
     assert.ok(out.includes("before line"), "text before a complete block must survive");
     assert.ok(out.includes("after line"), "text after a complete block must survive");
+  });
+});
+
+// Assembled at runtime so secret scanners don't flag these samples.
+const ENV_TOKEN_SAMPLE = `HF_${"TOKEN"}=hf${"_"}AbCdEfGhIjKlMnOpQrSt`;
+const ENV_KEY_SAMPLE = `"STRIPE_${"KEY"}": "rk${"_"}live_0123456789abcdef"`;
+
+describe("environment-style _TOKEN / _KEY assignments", () => {
+  test("are masked in both modes", () => {
+    for (const sample of [ENV_TOKEN_SAMPLE, ENV_KEY_SAMPLE]) {
+      const value = sample.includes("hf_") ? "AbCdEfGhIjKlMnOpQrSt" : "0123456789abcdef";
+      assert.ok(!redactDiagnosticText(sample).includes(value), sample);
+      assert.ok(!redactDiagnosticSecrets(sample).text.includes(value), sample);
+    }
+  });
+
+  test("lower-case data names ending in _key are left alone", () => {
+    const line = 'sort_key: "created_at", cache_key = users';
+    assert.equal(redactDiagnosticText(line), line);
+    assert.deepEqual(redactDiagnosticSecrets(line), { text: line, counts: {} });
+  });
+});
+
+describe("redactDiagnosticSecrets (counted mode)", () => {
+  test("masks every known credential sample and reports at least one hit for each", () => {
+    for (const { label, sample, mustNotContain } of DIAGNOSTIC_REDACTION_CREDENTIAL_SAMPLES) {
+      const { text, counts } = redactDiagnosticSecrets(sample);
+      assert.ok(!text.includes(mustNotContain), `${label} leaked: ${text}`);
+      assert.ok(Object.keys(counts).length > 0, `${label} reported no redaction`);
+    }
+  });
+
+  test("replaces with «redacted:<kind>» markers and the counts equal the markers left", () => {
+    const text = [
+      "Authorization: Bearer abcDEF123456_secret-token",
+      "token eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0In0.dGVzdHNpZ25hdHVyZQ",
+      "using sk_agent_9f7c12d7abcdef0123456789 and sk_agent_00000000aaaaaaaa",
+      PEM_PRIVATE_KEY_BEGIN,
+      "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7",
+      "-----END PRIVATE KEY-----",
+    ].join("\n");
+    const out = redactDiagnosticSecrets(text);
+    assert.deepEqual(out.counts, { authorization: 1, jwt: 1, raft_key: 2, private_key: 1 });
+    const markers = [...out.text.matchAll(/«redacted:([a-z_]+)»/g)].map((m) => m[1]);
+    assert.equal(markers.length, 5);
+    for (const [kind, count] of Object.entries(out.counts)) {
+      assert.equal(markers.filter((m) => m === kind).length, count, kind);
+    }
+    assert.equal(diagnosticRedactionMarker("jwt"), "«redacted:jwt»");
+    assert.ok(out.text.includes("token «redacted:jwt»"));
+  });
+
+  test("keeps paths and emails readable, masks URL queries and credentials", () => {
+    const text = "read /home/alice/repo/a.ts for alice@example.test via https://user:pw@api.example.test/v1/x?sig=abc#top";
+    const out = redactDiagnosticSecrets(text);
+    assert.equal(
+      out.text,
+      "read /home/alice/repo/a.ts for alice@example.test via https://«redacted:url_credentials»@api.example.test/v1/x?«redacted:url_query»#top",
+    );
+    assert.deepEqual(out.counts, { url_credentials: 1, url_query: 1 });
+  });
+
+  test("leaves ordinary text untouched with no counts", () => {
+    const line = "2026-09-15T04:00:00.000Z [INFO] agent agent-1 ran `raft message send` (pid 4242)";
+    assert.deepEqual(redactDiagnosticSecrets(line), { text: line, counts: {} });
+  });
+
+  test("addDiagnosticRedactionCounts sums per kind without changing its inputs", () => {
+    const a = { jwt: 1 } as const;
+    const b = { jwt: 2, bearer: 1 } as const;
+    assert.deepEqual(addDiagnosticRedactionCounts(a, b), { jwt: 3, bearer: 1 });
+    assert.deepEqual(a, { jwt: 1 });
+  });
+
+  test("every kind is a marker-safe identifier", () => {
+    for (const kind of DIAGNOSTIC_REDACTION_KINDS) {
+      assert.match(kind, /^[a-z_]+$/);
+      // A marker on its own is never caught again by a rule.
+      const marker = diagnosticRedactionMarker(kind);
+      assert.deepEqual(redactDiagnosticSecrets(marker), { text: marker, counts: {} });
+    }
   });
 });

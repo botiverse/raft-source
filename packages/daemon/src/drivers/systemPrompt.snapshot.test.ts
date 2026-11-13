@@ -72,3 +72,16 @@ test("configured role, context and release notice output", async () => {
   });
   await expectVariant("configured", prompt);
 });
+
+test("Artifacts app on: its commands in entry 6, no entry of its own, artifact-share out of the installed apps", async () => {
+  const prompt = buildCliSystemPrompt(promptConfig({
+    enabledApps: ["artifacts"],
+    installedApps: [
+      { name: "Raft Artifacts", description: "Versioned pages with comments.", whenToUse: "Publish a page that gets feedback.", service: "artifact-share" },
+      { name: "Sentinel", description: "Watches deploys.", whenToUse: "Check a deploy.", service: "sentinel-abc" },
+    ],
+  }), {
+    extraCriticalRules: [],
+  });
+  await expectVariant("artifacts-app", prompt);
+});

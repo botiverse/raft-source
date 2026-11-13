@@ -1,32 +1,33 @@
-import { Input, InputGroup, InputGroupAddon, InputGroupInput, Textarea, Card, Button, CheckboxIndicator } from "@botiverse/raft-ui";
+import { Input, Textarea, Button, TextLink } from "@botiverse/raft-ui";
 import { useCallback, useMemo, useRef, useState } from "react";
-import { GitBranch, Plus, Search } from "lucide-react";
+import { GitBranch, Plus } from "lucide-react";
 import { MAX_JOINT_CHANNEL_SERVERS, validateNameReason } from "@botiverse/raft-shared";
 import { useIntl } from "react-intl";
 import type { IntlShape } from "react-intl";
 import { formatNameValidationError } from "../../i18n/nameValidation";
-import { useAgentStore } from "../../store/agentStore";
+import { isAgentInMemberLists, useAgentStore } from "../../store/agentStore";
 import { useAuthStore } from "../../store/authStore";
 import { useChannelStore } from "../../store/channelStore";
 import { useServerStore } from "../../store/serverStore";
 import { useAppNavigate } from "../../hooks/useAppNavigate";
+import { usePaywallUpgrade } from "../../hooks/usePaywallUpgrade";
+import { isPaywallGate, PaywallShown } from "../../analytics/paywall";
+import type { UpgradeGate } from "../../store/upgradeDialogStore";
 import AvatarSlot from "../ui/AvatarSlot";
+import AppBadge from "../agent/AppBadge";
 import Banner from "../ui/Banner";
 import FormField from "../ui/FormField";
-import TextLink from "../ui/TextLink";
 import SectionEyebrow from "../ui/SectionEyebrow";
 import DialogCard from "../ui/DialogCard";
-import { usePeopleSuggestionSearch } from "../../hooks/usePeopleSuggestionSearch";
-import type { PeopleSuggestionCandidate } from "../../utils/peopleSuggestionSearch";
+import { formatJointInviteRateLimited, jointFreeHostLimitMessage } from "../../utils/jointChannelLimit";
 import { JointInviteDraftCard } from "./JointInviteDraftCard";
-import { PICKER_GROUP_LABEL_CLASS, PICKER_ROW_CLASS } from "./memberPickerClasses";
+import { MemberChoiceList, memberChoiceKey, useMemberChoiceSearch } from "./MemberChoiceList";
+import type { MemberChoice } from "./MemberChoiceList";
 import { findSameAdminJointTarget, parseInvitedPeopleText } from "../../utils/jointSameAdmin";
-
-interface ArchivedCollision {
-  archivedChannelId: string;
-  archivedChannelName: string;
-  canUnarchiveArchivedChannel: boolean;
-}
+import { DialogCardFooter, DialogCommit } from "../ui/NarrowDialog";
+import { ArchivedNameCollisionBanner } from "./ArchivedNameCollisionBanner";
+import { parseArchivedNameCollision } from "./archivedNameCollision";
+import type { ArchivedNameCollision } from "./archivedNameCollision";
 
 export interface JointInviteDraft {
   id: string;
@@ -53,13 +54,13 @@ export default function CreateJointChannelDialog({ onClose }: { onClose: () => v
   const [selectedAgentIds, setSelectedAgentIds] = useState<Set<string>>(new Set());
   const [selectedHumanIds, setSelectedHumanIds] = useState<Set<string>>(new Set());
   const [error, setError] = useState("");
-  const [billingError, setBillingError] = useState(false);
-  const [archivedCollision, setArchivedCollision] = useState<ArchivedCollision | null>(null);
+  /** The Free limit the server answered with, if any: its Upgrade opens the upgrade dialog. */
+  const [billingError, setBillingError] = useState<UpgradeGate | null>(null);
+  const [archivedCollision, setArchivedCollision] = useState<ArchivedNameCollision | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const submitInFlightRef = useRef(false);
   const nextInviteIdRef = useRef(2);
   const createChannel = useChannelStore((s) => s.createChannel);
-  const unarchiveChannel = useChannelStore((s) => s.unarchiveChannel);
   const allAgents = useAgentStore((s) => s.agents);
   const members = useServerStore((s) => s.members);
   const plan = useServerStore((s) => s.current?.plan) || "free";
@@ -68,22 +69,26 @@ export default function CreateJointChannelDialog({ onClose }: { onClose: () => v
   const servers = useServerStore((s) => s.servers);
   const currentUser = useAuthStore((s) => s.user);
   const nav = useAppNavigate();
-  const openBillingSettings = useCallback(() => {
+  const paywallUpgrade = usePaywallUpgrade();
+  const openUpgrade = useCallback(() => {
+    if (!billingError) return;
     onClose();
-    nav.toSettings("billing");
-  }, [nav, onClose]);
-  // Contract v0.3: free servers may host any number of joint channels; the
-  // limit is at most 2 free servers per joint channel, enforced by the server.
-  const freeAllowance = plan === "free";
+    paywallUpgrade(billingError);
+  }, [billingError, onClose, paywallUpgrade]);
 
-  const memberSearchCandidates = useMemo<PeopleSuggestionCandidate<(typeof allAgents)[number] | (typeof members)[number]>[]>(() => [
-      ...allAgents.filter((agent) => !agent.deletedAt).map((agent) => ({
+  // Agents, then people: the same fields the people search ranks on (MemberChoiceList).
+  const memberChoices = useMemo<MemberChoice<unknown>[]>(() => [
+      ...allAgents.filter(isAgentInMemberLists).map((agent) => ({
         kind: "agent" as const,
         id: agent.id,
         value: agent,
         handle: agent.name,
         displayName: agent.displayName,
         description: agent.description,
+        media: <AvatarSlot context="sidebar-list" type="agent" agentAvatarUrl={agent.avatarUrl} />,
+        badge: agent.managedByAppInstallId
+          ? <AppBadge className="shrink-0" appName={agent.managedByApp?.name} botName={agent.displayName || agent.name} />
+          : undefined,
       })),
       ...members.filter((member) => member.userId !== currentUser?.id).map((member) => ({
         kind: "human" as const,
@@ -93,16 +98,23 @@ export default function CreateJointChannelDialog({ onClose }: { onClose: () => v
         displayName: member.displayName,
         description: member.description,
         sourceServerLabel: member.serverName || member.serverSlug,
+        media: <AvatarSlot context="sidebar-list" type="human" humanPlaceholder />,
       })),
     ], [allAgents, currentUser?.id, members]);
-  const { entries: memberSearchEntries, ranked: rankedMembers } = usePeopleSuggestionSearch(
-    memberSearch,
-    memberSearchCandidates,
-  );
-  const filteredAgents = rankedMembers.filter((candidate) => candidate.kind === "agent").map((candidate) => candidate.value as (typeof allAgents)[number]);
-  const filteredHumans = rankedMembers.filter((candidate) => candidate.kind === "human").map((candidate) => candidate.value as (typeof members)[number]);
-  const hasMembers = memberSearchEntries.length > 0;
-  const hasFilteredMembers = filteredAgents.length > 0 || filteredHumans.length > 0;
+  const memberMatches = useMemberChoiceSearch(memberSearch, memberChoices);
+  const selectedMemberKeys = useMemo(() => [
+    ...[...selectedAgentIds].map((id) => memberChoiceKey("agent", id)),
+    ...[...selectedHumanIds].map((id) => memberChoiceKey("human", id)),
+  ], [selectedAgentIds, selectedHumanIds]);
+  const handleMembersChange = useCallback((keys: string[]) => {
+    const pick = (kind: "agent" | "human") => new Set(keys.filter((key) => key.startsWith(`${kind}:`)).map((key) => key.slice(kind.length + 1)));
+    setSelectedAgentIds(pick("agent"));
+    setSelectedHumanIds(pick("human"));
+  }, []);
+  const memberGroupLabels = useMemo(() => ({
+    agent: formatMessage({ id: "channel.create.agents" }),
+    human: formatMessage({ id: "channel.create.humans" }),
+  }), [formatMessage]);
   // RFC 075 §4.5: per draft, the server the inviter administers when they are
   // inviting themselves there; the draft then needs an explicit confirmation.
   const sameAdminTargets = useMemo(() => new Map(jointInviteDrafts.map((draft) => [
@@ -123,7 +135,7 @@ export default function CreateJointChannelDialog({ onClose }: { onClose: () => v
   // it, so clear it rather than leave a stale reason on screen.
   const clearSubmitError = useCallback(() => {
     setError("");
-    setBillingError(false);
+    setBillingError(null);
   }, []);
 
   const updateJointInviteDraft = useCallback((id: string, updates: JointInviteDraftUpdate) => {
@@ -143,29 +155,11 @@ export default function CreateJointChannelDialog({ onClose }: { onClose: () => v
     setJointInviteDrafts((prev) => prev.length > 1 ? prev.filter((draft) => draft.id !== id) : prev);
   }, [clearSubmitError]);
 
-  const toggleAgent = (agentId: string) => {
-    setSelectedAgentIds((prev) => {
-      const next = new Set(prev);
-      if (next.has(agentId)) next.delete(agentId);
-      else next.add(agentId);
-      return next;
-    });
-  };
-
-  const toggleHuman = (userId: string) => {
-    setSelectedHumanIds((prev) => {
-      const next = new Set(prev);
-      if (next.has(userId)) next.delete(userId);
-      else next.add(userId);
-      return next;
-    });
-  };
-
   const handleSubmit = async (event: React.FormEvent) => {
     event.preventDefault();
     if (submitInFlightRef.current) return;
     setError("");
-    setBillingError(false);
+    setBillingError(null);
     setArchivedCollision(null);
 
     const nameError = formatNameValidationError(
@@ -215,29 +209,21 @@ export default function CreateJointChannelDialog({ onClose }: { onClose: () => v
             code?: string;
             targetServerSlug?: string;
             invitee?: string;
-            archivedChannelId?: string;
-            archivedChannelName?: string;
-            archivedChannelType?: string;
-            canUnarchiveArchivedChannel?: boolean;
+            retryAfterSeconds?: number;
           };
         };
       };
       const body = axiosErr.response?.data;
       const inviteError = describeJointInviteError(body, currentServerSlug, formatMessage);
-      if (
-        body?.code === "archived_name_collision"
-        && body.archivedChannelId
-        && body.archivedChannelName
-        && body.archivedChannelType === "joint"
-      ) {
-        setArchivedCollision({
-          archivedChannelId: body.archivedChannelId,
-          archivedChannelName: body.archivedChannelName,
-          canUnarchiveArchivedChannel: body.canUnarchiveArchivedChannel === true,
-        });
+      const collision = parseArchivedNameCollision(err, ["joint"]);
+      if (collision) {
+        setArchivedCollision(collision);
+      } else if (body?.code === "joint_channel_free_limit_reached" || body?.code === "joint_channel_plan_limit_reached") {
+        setError(jointFreeHostLimitMessage(err, formatMessage) ?? "");
+        setBillingError(body?.code === "joint_channel_free_limit_reached" ? "joint_channel_host_limit" : null);
       } else if (body?.code === "joint_free_server_limit") {
         setError(formatMessage({ id: "channel.joint.freeServerLimit" }));
-        setBillingError(true);
+        setBillingError("joint_channel_free_cap");
       } else if (body?.code === "joint_server_limit") {
         setError(formatMessage({ id: "channel.joint.serverLimit" }, { max: MAX_JOINT_CHANNEL_SERVERS }));
       } else if (inviteError) {
@@ -245,28 +231,13 @@ export default function CreateJointChannelDialog({ onClose }: { onClose: () => v
       } else {
         const nextError = body?.error || formatMessage({ id: "channel.createJoint.failedCreate" });
         setError(nextError);
-        setBillingError(isBillingGateError(nextError));
+        setBillingError(isBillingGateError(nextError) ? "joint_channel_host_limit" : null);
       }
     } finally {
       submitInFlightRef.current = false;
       setSubmitting(false);
     }
   };
-
-  const handleUnarchiveCollision = useCallback(async () => {
-    if (!archivedCollision) return;
-    setSubmitting(true);
-    try {
-      const channel = await unarchiveChannel(archivedCollision.archivedChannelId);
-      onClose();
-      nav.toChannel(channel.id);
-    } catch (err: unknown) {
-      const axiosErr = err as { response?: { data?: { error?: string } } };
-      setError(axiosErr.response?.data?.error || formatMessage({ id: "channel.create.failedUnarchive" }));
-    } finally {
-      setSubmitting(false);
-    }
-  }, [archivedCollision, unarchiveChannel, onClose, nav, formatMessage]);
 
   const handleChangeCollidingName = useCallback(() => {
     setArchivedCollision(null);
@@ -280,79 +251,44 @@ export default function CreateJointChannelDialog({ onClose }: { onClose: () => v
     (event: React.ChangeEvent<HTMLTextAreaElement>) => setDescription(event.target.value),
     [],
   );
-  const handleMemberSearchChange = useCallback(
-    (event: React.ChangeEvent<HTMLInputElement>) => setMemberSearch(event.target.value),
-    [],
-  );
-
-  const dialogTitle = (
-    <span className="flex min-w-0 items-center gap-2">
-      <GitBranch size={18} aria-hidden="true" className="shrink-0" />
-      <span className="truncate">{formatMessage({ id: "channel.createJoint.title" })}</span>
-    </span>
-  );
 
   return (
     <DialogCard
-      title={dialogTitle}
+      title={(
+        <span className="flex min-w-0 items-center gap-2">
+          <span className="truncate">{formatMessage({ id: "channel.createJoint.title" })}</span>
+        </span>
+      )}
       onClose={onClose}
       maxWidthClass="max-w-lg"
+      narrow="sheet"
     >
-        <form onSubmit={handleSubmit} className="space-y-4">
-          {freeAllowance && (
-            <Banner intent="info">
-              {formatMessage({ id: "channel.createJoint.freeAllowance" })}
-            </Banner>
-          )}
+        <form onSubmit={handleSubmit} className="stack-y-4 md:pointer-fine:stack-y-3">
           {error && (
             <Banner intent="warning">
               {error}
               {billingError && (
                 <>
                   {" "}
+                  {isPaywallGate(billingError) ? <PaywallShown gate={billingError} /> : null}
                   <TextLink
-                    variant="primary"
-                    onClick={openBillingSettings}
+                    variant="strong"
+                    onClick={openUpgrade}
+                    data-testid="create-joint-upgrade"
                   >
-                    {formatMessage({ id: "channel.createJoint.viewBilling" })}
+                    {formatMessage({ id: plan === "free" ? "billing.upgradeToPro" : "channel.createJoint.viewBilling" })}
                   </TextLink>
                 </>
               )}
             </Banner>
           )}
-          {archivedCollision && (
-            <Banner
-              intent="warning"
-              title={formatMessage(
-                { id: "channel.create.archivedNameHeld" },
-                {
-                  name: archivedCollision.archivedChannelName,
-                  mono: (chunks: React.ReactNode) => <span key="mono" className="font-mono">{chunks}</span>,
-                },
-              )}
-              actions={(
-                <>
-                  {archivedCollision.canUnarchiveArchivedChannel && (
-                    <Button size="sm"
-                      variant="outline"
-                      type="button"
-                      onClick={handleUnarchiveCollision}
-                      disabled={submitting}
-                    >
-                      {formatMessage({ id: "channel.create.unarchive" })}
-                    </Button>
-                  )}
-                  <Button size="sm"
-                    variant="ghost"
-                    type="button"
-                    onClick={handleChangeCollidingName}
-                  >
-                    {formatMessage({ id: "channel.create.changeName" })}
-                  </Button>
-                </>
-              )}
-            />
-          )}
+          <ArchivedNameCollisionBanner
+            collision={archivedCollision}
+            onLeave={onClose}
+            onError={setError}
+            onChangeName={handleChangeCollidingName}
+            showHint={false}
+          />
 
           <FormField label={formatMessage({ id: "channel.create.nameLabel" })} required>
             <Input
@@ -378,13 +314,13 @@ export default function CreateJointChannelDialog({ onClose }: { onClose: () => v
 
           {/* The invites are one section of the form: a 13/18 700 ink-2 heading
               with its add action, then one inset card per server. */}
-          <section className="space-y-3">
+          <section className="stack-y-3">
             <div className="flex items-center justify-between gap-3">
               <SectionEyebrow as="div" tone="muted" className="flex items-center gap-2">
                 <GitBranch size={16} aria-hidden="true" />
                 {formatMessage({ id: "channel.createJoint.inviteServersSection" })}
               </SectionEyebrow>
-              <Button size="sm"
+              <Button size="md"
                 variant="outline"
                 type="button"
                 onClick={addJointInviteDraft}
@@ -419,85 +355,23 @@ export default function CreateJointChannelDialog({ onClose }: { onClose: () => v
           </section>
 
           <FormField label={formatMessage({ id: "channel.createJoint.currentServerMembers" })} optional>
-            {hasMembers ? (
-              <div className="space-y-2">
-                <InputGroup>
-                  <InputGroupAddon align="inline-start">
-                    <Search aria-hidden="true" />
-                  </InputGroupAddon>
-                  <InputGroupInput
-                    type="text"
-                    value={memberSearch}
-                    onChange={handleMemberSearchChange}
-                    placeholder={formatMessage({ id: "channel.create.membersSearchPlaceholder" })}
-                  />
-                </InputGroup>
-
-                <Card className="max-h-48 overflow-y-auto p-1.5">
-                  {filteredAgents.length > 0 && (
-                    <>
-                      <SectionEyebrow as="div" className={PICKER_GROUP_LABEL_CLASS}>
-                        {formatMessage({ id: "channel.create.agents" })}
-                      </SectionEyebrow>
-                      {filteredAgents.map((agent) => {
-                        const selected = selectedAgentIds.has(agent.id);
-                        return (
-                          <button
-                            key={agent.id}
-                            type="button"
-                            onClick={() => toggleAgent(agent.id)}
-                            className={PICKER_ROW_CLASS}
-                          >
-                            <CheckboxIndicator checked={selected} />
-                            <AvatarSlot context="sidebar-list" type="agent" agentAvatarUrl={agent.avatarUrl} />
-                            <span className="min-w-0 flex-1 truncate">{agent.displayName || agent.name}</span>
-                          </button>
-                        );
-                      })}
-                    </>
-                  )}
-
-                  {filteredHumans.length > 0 && (
-                    <>
-                      <SectionEyebrow as="div" className={PICKER_GROUP_LABEL_CLASS}>
-                        {formatMessage({ id: "channel.create.humans" })}
-                      </SectionEyebrow>
-                      {filteredHumans.map((human) => {
-                        const selected = selectedHumanIds.has(human.userId);
-                        return (
-                          <button
-                            key={human.userId}
-                            type="button"
-                            onClick={() => toggleHuman(human.userId)}
-                            className={PICKER_ROW_CLASS}
-                          >
-                            <CheckboxIndicator checked={selected} />
-                            <AvatarSlot context="sidebar-list" type="human" humanPlaceholder />
-                            <span className="min-w-0 flex-1 truncate">{human.displayName || human.name}</span>
-                          </button>
-                        );
-                      })}
-                    </>
-                  )}
-
-                  {!hasFilteredMembers && (
-                    <div className="px-2.5 py-2 text-callout text-foreground-hint">
-                      {formatMessage(
-                        { id: "channel.create.noMatchesFor" },
-                        { query: memberSearch.trim() },
-                      )}
-                    </div>
-                  )}
-                </Card>
-              </div>
-            ) : (
-              <div className="text-callout text-foreground-hint">
-                {formatMessage({ id: "channel.create.noMembersAvailable" })}
-              </div>
-            )}
+            <MemberChoiceList
+              choices={memberChoices}
+              value={selectedMemberKeys}
+              onValueChange={handleMembersChange}
+              query={memberSearch}
+              onQueryChange={setMemberSearch}
+              matchedValues={memberMatches}
+              ariaLabel={formatMessage({ id: "channel.createJoint.currentServerMembers" })}
+              groupLabels={memberGroupLabels}
+              searchLabel={formatMessage({ id: "channel.create.membersSearchPlaceholder" })}
+              clearSearchLabel={formatMessage({ id: "search.clearSearch" })}
+              noMatchLabel={formatMessage({ id: "channel.create.noMatchesFor" }, { query: memberSearch.trim() })}
+              empty={formatMessage({ id: "channel.create.noMembersAvailable" })}
+            />
           </FormField>
 
-          <div className="flex flex-wrap justify-end gap-2 pt-1">
+          <DialogCardFooter>
             <Button size="lg"
               variant="ghost"
               type="button"
@@ -506,16 +380,20 @@ export default function CreateJointChannelDialog({ onClose }: { onClose: () => v
             >
               {formatMessage({ id: "settings.common.cancel" })}
             </Button>
-            <Button size="lg"
-              variant="accent"
-              type="submit"
-              disabled={submitting}
-            >
-              {submitting
-                ? formatMessage({ id: "channel.create.creating" })
-                : formatMessage({ id: "channel.createJoint.title" })}
-            </Button>
-          </div>
+            <DialogCommit>
+              {(inHead) => (
+                <Button size={inHead ? "md" : "lg"}
+                  variant="primary"
+                  type="submit"
+                  disabled={submitting}
+                >
+                  {submitting
+                    ? formatMessage({ id: "channel.create.creating" })
+                    : formatMessage({ id: "channel.create.submit" })}
+                </Button>
+              )}
+            </DialogCommit>
+          </DialogCardFooter>
         </form>
     </DialogCard>
   );
@@ -533,24 +411,18 @@ export default function CreateJointChannelDialog({ onClose }: { onClose: () => v
  * existing fallback (server text, else the generic failure).
  */
 function describeJointInviteError(
-  body: { code?: string; targetServerSlug?: string; invitee?: string } | undefined,
+  body: { code?: string; targetServerSlug?: string; invitee?: string; retryAfterSeconds?: number } | undefined,
   currentServerSlug: string | null,
   formatMessage: IntlShape["formatMessage"],
 ): string | null {
   const server = body?.targetServerSlug;
   switch (body?.code) {
-    case "joint_invitee_not_found":
-    case "joint_invitee_not_admin": {
+    // One code whether nobody matches or the match is not an admin, so the
+    // answer does not tell whether an address belongs to that server.
+    case "joint_invitee_unavailable": {
       const invitee = body.invitee;
       if (!server || !invitee) return null;
-      return formatMessage(
-        {
-          id: body.code === "joint_invitee_not_found"
-            ? "channel.jointInvite.error.inviteeNotFound"
-            : "channel.jointInvite.error.inviteeNotAdmin",
-        },
-        { invitee, server },
-      );
+      return formatMessage({ id: "channel.jointInvite.error.inviteeUnavailable" }, { invitee, server });
     }
     case "joint_target_server_invalid":
       // One code, two causes: the server says "Target server not found" or "Cannot
@@ -562,6 +434,8 @@ function describeJointInviteError(
       return formatMessage({ id: "channel.jointInvite.error.serverNotFound" }, { server });
     case "joint_invite_required":
       return formatMessage({ id: "channel.edit.inviteePersonRequired" });
+    case "joint_invite_rate_limited":
+      return formatJointInviteRateLimited(body.retryAfterSeconds, formatMessage);
     default:
       return null;
   }

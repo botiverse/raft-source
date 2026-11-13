@@ -1,0 +1,2 @@
+ALTER TABLE "push_registrations" ADD COLUMN "preview_mode" text DEFAULT 'full' NOT NULL;--> statement-breakpoint
+ALTER TABLE "push_registrations" ADD CONSTRAINT "push_registrations_preview_mode_check" CHECK ("push_registrations"."preview_mode" IN ('full', 'sender_only', 'hidden'));

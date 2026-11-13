@@ -22,12 +22,13 @@
  *   - ensure_rustfs_bucket reuses bash's @aws-sdk/client-s3
  *     Head/Create approach (60× retry) to keep behavior byte-equivalent
  *     rather than risk SDK-version drift. The script lives as a real
- *     file at packages/server/ensure-rustfs-bucket.mjs (invoked as
- *     `pnpm exec node ensure-rustfs-bucket.mjs` with cwd=packages/server) so
+ *     file at packages/server/ensure-rustfs-bucket.ts (invoked as
+ *     `pnpm exec node --import @oxc-node/core/register ensure-rustfs-bucket.ts` with cwd=packages/server) so
  *     that Windows + shell:true does not corrupt a multi-line --eval
  *     payload (Node DEP0190 — args are concatenated, not escaped).
  */
 import { spawn, spawnSync } from "node:child_process";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import {
   chmodSync,
   closeSync,
@@ -43,9 +44,81 @@ import {
   writeFileSync,
 } from "node:fs";
 import { basename, dirname, join } from "node:path";
-import { tmpdir } from "node:os";
+import { homedir, hostname, tmpdir } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { parseReaderStartedAtMs, runTraceCli, traceBannerLines } from "./raftdev-trace";
+import {
+  prepareDevEnvDir,
+  recordDevEnvProcesses,
+  removeDevEnvDir,
+  resolveDevCachePaths,
+  resolveDevEnvDir,
+  runCacheCli,
+  type DevEnvDir,
+} from "./raftdev-cache";
+import { POST_MIGRATION_INDEXES } from "../../packages/server/src/db/postMigrationIndexes";
+import {
+  PREVIEW_CLEANER_PATH,
+  PREVIEW_DOCKER_MEMORY_CAPS,
+  PREVIEW_IDLE_TTL_SECONDS,
+  PREVIEW_INVALID_DBUS_ADDRESS,
+  cancelPreviewReminder,
+  descendantPids,
+  dockerInspectState,
+  formatCleanupLeftovers,
+  formatDuration,
+  isInUnitCgroup,
+  isRecordedProcessAlive,
+  isoSeconds,
+  janitorDecision,
+  liveStarttime,
+  listPreviewRecords,
+  parseCleanerStopOutput,
+  parseContainerInspect,
+  parsePreviewUnitSpec,
+  previewAdoptionRefusal,
+  previewSeedRefusal,
+  previewDockerEndpointRefusal,
+  shouldStartDaemonWindow,
+  parsePreviewStartArgs,
+  parsePreviewState,
+  previewCleanerEnvFile,
+  previewLoginLines,
+  previewSeedPasswordEnv,
+  previewOwner,
+  previewRecordPath,
+  previewDroppedResources,
+  previewIdentityChanges,
+  previewRecordProblems,
+  previewRegistryDir,
+  previewStopUnitArgs,
+  previewSystemdRunArgs,
+  previewTmuxSocket,
+  previewUnitEnv,
+  previewUnitName,
+  processesOutsideUnit,
+  provisionalPreviewRecord,
+  runningPreviewRecord,
+  readProcStat,
+  schedulePreviewReminder,
+  seedAccountsFromSeedFile,
+  selectPreviewRecord,
+  summarizePreviewRecord,
+  tmuxSessionFromArgs,
+  verifyPreviewCleanup,
+  webAutoLoginEnv,
+  withDockerMemoryCap,
+  withPreviewContainer,
+  withPreviewProcesses,
+  withPreviewVolume,
+  type CommandRunner,
+  type ContainerInspection,
+  type PreviewProcess,
+  type PreviewRecord,
+  type PreviewStartArgs,
+  type PreviewUnitSpec,
+  type PreviewState,
+} from "./raftdev-preview";
 
 export const PROJECT_DIR = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
 
@@ -88,7 +161,7 @@ interface Env {
   RISINGWAVE_NETWORK: string;
   RUSTFS_VOLUME: string; TMUX_SESSION: string; SEED_FILE: string;
   SLOCKDEV_DIR: string; SLOCK_HOME: string; ACTIVITY_FILE: string; IDLE_TTL_FILE: string;
-  RISINGWAVE_DSN_FILE: string; RISINGWAVE_STATE_FILE: string;
+  RISINGWAVE_DSN_FILE: string; RISINGWAVE_STATE_FILE: string; TUNNEL_STATE_FILE: string;
   POSTGRES_PASSWORD: string; JWT_SECRET: string;
   DATABASE_URL: string; REDIS_URL: string;
   RISINGWAVE_DATABASE_URL: string;
@@ -266,12 +339,17 @@ export function risingWaveDatabaseUrlCommandAssignment(
   return envAssign("RISINGWAVE_DATABASE_URL", config.databaseUrl);
 }
 
-/** Parse the explicit RAFTDEV_RISINGWAVE local-container profile. */
+/**
+ * Parse the RAFTDEV_RISINGWAVE / --risingwave[=...] / --no-risingwave switch.
+ * `null` means unset (the default profile applies); `"off"` is the explicit
+ * opt-out (`0` / `--no-risingwave`).
+ */
 export function parseRisingWaveLocalProfile(
   raw: string | undefined,
-): RisingWaveLocalProfile | null {
-  if (raw === undefined || raw.trim() === "" || raw.trim() === "0") return null;
+): RisingWaveLocalProfile | "off" | null {
+  if (raw === undefined || raw.trim() === "") return null;
   const value = raw.trim();
+  if (value === "0") return "off";
   if (value === "1" || value === "full") return "full";
   if (value === "process-only") return "process-only";
   throw new Error(
@@ -283,12 +361,23 @@ export function risingWaveNeedsBootstrap(config: RisingWaveDependencyConfig): bo
   return config.mode === "local" && config.profile === "full";
 }
 
+/** Server surfaces that answer 503 when no RisingWave is configured. */
+export const RISINGWAVE_DISABLED_WARNING = [
+  "WARNING: RisingWave is disabled (--no-risingwave / RAFTDEV_RISINGWAVE=0).",
+  "  The Activity endpoints (inbox, followed threads, unread summary, channel unread)",
+  "  will return 503. Restart without --no-risingwave to use the product's main pages.",
+] as const;
+
 /**
- * Resolve the optional dependency without touching Docker.
+ * Resolve the RisingWave dependency without touching Docker.
  *
- * A local standalone instance is an explicit opt-in (`--risingwave` or
- * RAFTDEV_RISINGWAVE=1). Supplying RISINGWAVE_DATABASE_URL instead selects an
- * already-managed external instance. Refuse both at once so a developer never
+ * A managed local full instance (standalone + CDC + serving MVs) is the
+ * default, because the product's main pages read from it. `--no-risingwave`
+ * (RAFTDEV_RISINGWAVE=0) is the backend-only opt-out; `--risingwave` /
+ * `=full` restate the default and `=process-only` selects the pgwire smoke.
+ * Supplying RISINGWAVE_DATABASE_URL without an explicit local profile selects
+ * an already-managed external instance instead of the default container.
+ * Refuse an explicit local profile plus an external URL so a developer never
  * thinks they are testing local RisingWave while the server points elsewhere.
  */
 export function resolveRisingWaveDependency(
@@ -297,23 +386,22 @@ export function resolveRisingWaveDependency(
   localDatabaseUrl: string,
   imageRaw: string | undefined,
 ): RisingWaveDependencyConfig {
-  const profile = parseRisingWaveLocalProfile(localRaw);
+  const selection = parseRisingWaveLocalProfile(localRaw);
   const external = externalDatabaseUrl?.trim() ?? "";
-  if (profile && external !== "") {
+  if (selection !== null && selection !== "off" && external !== "") {
     throw new Error(
       "a local --risingwave/RAFTDEV_RISINGWAVE profile cannot be combined with RISINGWAVE_DATABASE_URL; unset one source",
     );
   }
-  if (profile) {
-    return {
-      mode: "local",
-      profile,
-      databaseUrl: localDatabaseUrl,
-      image: imageRaw?.trim() || DEFAULT_RISINGWAVE_IMAGE,
-    };
-  }
   if (external !== "") return { mode: "external", databaseUrl: external };
-  return { mode: "disabled" };
+  const profile = selection ?? "full";
+  if (profile === "off") return { mode: "disabled" };
+  return {
+    mode: "local",
+    profile,
+    databaseUrl: localDatabaseUrl,
+    image: imageRaw?.trim() || DEFAULT_RISINGWAVE_IMAGE,
+  };
 }
 
 /**
@@ -365,19 +453,73 @@ export function waitForRisingWaveReadiness(options: {
 }
 
 /** Exact documented standalone Docker shape, with host exposure kept local. */
+// A dev RisingWave holds a few hundred rows but runs the whole inbox MV chain
+// (51 objects) continuously. Without a cap it sizes its own memory from the
+// whole host (it saw ~62 GiB on a shared 16 GiB-limited machine) and held 5.5
+// GiB plus 2.3 GiB of swap (IT, 2026-10-23). It gets a budget (2 GiB unless
+// RAFTDEV_RW_MEMORY_BYTES says otherwise) and a Docker limit 1 GiB above it,
+// with no extra swap.
+//
+// single_node gives the compactor 1/8 of the budget, and below ~8 GiB that is
+// under the compactor's own floor: it fails `compactor_memory_limit_bytes >
+// min_compactor_memory_limit_bytes * 2` and RisingWave exits (139) before
+// pgwire is up (#10967, reverted in #10974). A config file sets the
+// compactor's limit outright (768 MB; it takes 80% of that), so a small
+// budget starts.
+export const DEFAULT_RISINGWAVE_MEMORY_BYTES = 2 * 1024 * 1024 * 1024;
+const RISINGWAVE_DOCKER_HEADROOM_BYTES = 1024 * 1024 * 1024;
+export const RISINGWAVE_CONFIG_IN_CONTAINER = "/raftdev/risingwave.toml";
+export const RISINGWAVE_CONFIG = "[storage]\ncompactor_memory_limit_mb = 768\n";
+
+/**
+ * RAFTDEV_RW_MEMORY_BYTES, or the 2 GiB default. The default is also the
+ * floor: 2 GiB is the smallest budget seen to start and pass the realRw suite
+ * (IT, CCX23, 2026-10-23); nothing smaller has been tried.
+ */
+export function parseRisingWaveMemoryBytes(raw: string | undefined): number {
+  if (!raw || raw.trim() === "") return DEFAULT_RISINGWAVE_MEMORY_BYTES;
+  const value = Number(raw.trim());
+  if (!Number.isInteger(value) || value < DEFAULT_RISINGWAVE_MEMORY_BYTES) {
+    out(`ERROR: RAFTDEV_RW_MEMORY_BYTES must be a whole number of bytes, at least ${DEFAULT_RISINGWAVE_MEMORY_BYTES}; got: ${raw}`);
+    process.exit(1);
+  }
+  return value;
+}
+
+/**
+ * Who started a raftdev container: the checkout's directory, hashed. The
+ * orphan sweep only ever touches containers carrying its own owner, since
+ * agents share machines and tmux only sees its own user's (and socket's)
+ * sessions.
+ */
+export const RAFTDEV_OWNER_LABEL = "com.botiverse.raftdev.owner";
+export function raftdevOwner(projectDir: string): string {
+  return createHash("sha256").update(projectDir).digest("hex").slice(0, 16);
+}
+
 export function risingWaveDockerRunArgs(
   e: RisingWaveDockerEnv,
   image: string = DEFAULT_RISINGWAVE_IMAGE,
   network?: string,
+  opts: { owner?: string; memoryBytes?: number; configFile?: string } = {},
 ): string[] {
+  const memoryBytes = opts.memoryBytes ?? DEFAULT_RISINGWAVE_MEMORY_BYTES;
+  const dockerLimit = String(memoryBytes + RISINGWAVE_DOCKER_HEADROOM_BYTES);
   return [
     "run", "-d", "--pull=always", "--name", e.RISINGWAVE_CONTAINER,
     "--label", RAFTDEV_MANAGED_LABEL_ARG,
+    ...(opts.owner ? ["--label", `${RAFTDEV_OWNER_LABEL}=${opts.owner}`] : []),
     ...(network ? ["--network", network] : []),
     "-p", `127.0.0.1:${e.RISINGWAVE_PORT}:4566`,
     "-p", `127.0.0.1:${e.RISINGWAVE_DASHBOARD_PORT}:5691`,
+    "--memory", dockerLimit,
+    "--memory-swap", dockerLimit,
+    ...(opts.configFile ? ["-v", `${opts.configFile}:${RISINGWAVE_CONFIG_IN_CONTAINER}:ro`] : []),
     image,
     "single_node",
+    // single_node has no environment variable for this (`single_node --help`).
+    "--total-memory-bytes", String(memoryBytes),
+    ...(opts.configFile ? ["--config-path", RISINGWAVE_CONFIG_IN_CONTAINER] : []),
   ];
 }
 
@@ -493,6 +635,7 @@ function setupEnv(name: string): Env {
     IDLE_TTL_FILE: join(SLOCKDEV_DIR, "idle-ttl-seconds"),
     RISINGWAVE_DSN_FILE: join(SLOCKDEV_DIR, "risingwave-database-url"),
     RISINGWAVE_STATE_FILE: join(SLOCKDEV_DIR, "risingwave-state.json"),
+    TUNNEL_STATE_FILE: join(SLOCKDEV_DIR, "tunnel.json"),
     POSTGRES_PASSWORD,
     JWT_SECRET: `dev-secret-${name}`,
     DATABASE_URL: `postgresql://postgres:${POSTGRES_PASSWORD}@localhost:${PG_PORT}/slock`,
@@ -699,13 +842,102 @@ function formatTimestamp(seconds: number | null): string {
   return new Date(seconds * 1000).toISOString();
 }
 
+/**
+ * The environment's services' TMPDIR on disk (`<cache root>/env/<env-key>/tmp`,
+ * scripts/dev/raftdev-cache.ts), set by `start` once the dir exists; null when
+ * the caller's TMPDIR is kept (explicit, CI, non-Linux, no on-disk root).
+ */
+let serviceEnvDir: DevEnvDir | null = null;
+
 // Wraps a command so tmux window prints its exit status then drops into a
 // login shell — identical contract to bash slockdev's run_tmux_shell_command.
-function runTmuxShellCommand(cmd: string): string {
+// New tmux windows don't inherit this process's env (the tmux server may be
+// older); carry the on-disk compile cache (applyDevCacheEnv) and the
+// environment's TMPDIR into them explicitly.
+export function tmuxShellCommand(
+  cmd: string,
+  carry: { NODE_COMPILE_CACHE?: string; TMPDIR?: string },
+  shell: string,
+): string {
+  let exports = "";
+  for (const name of ["NODE_COMPILE_CACHE", "TMPDIR"] as const) {
+    const value = carry[name];
+    if (value) exports += `export ${envAssign(name, value)}; `;
+  }
   const wrapped =
-    `${cmd}; status=$?; echo; echo "[raftdev] command exited with status $status"; ` +
-    `exec "${process.env.SHELL || "/bin/zsh"}" -l`;
+    `${exports}${cmd}; status=$?; echo; echo "[raftdev] command exited with status $status"; ` +
+    `exec "${shell}" -l`;
   return `bash -lc ${shellQuote(wrapped)}`;
+}
+
+export function runTmuxShellCommand(cmd: string): string {
+  return tmuxShellCommand(cmd, {
+    NODE_COMPILE_CACHE: process.env.NODE_COMPILE_CACHE,
+    TMPDIR: serviceEnvDir?.tmpdir ?? undefined,
+  }, process.env.SHELL || "/bin/zsh");
+}
+
+/** The environment's unique id: its state dir (`<project>/.slockdev/<name>`). */
+function devEnvId(e: Pick<Env, "SLOCKDEV_DIR">): string {
+  return e.SLOCKDEV_DIR;
+}
+
+/**
+ * `start`: creates the environment's on-disk temp dir; the tmux windows
+ * (runTmuxShellCommand) and cloudflared (serviceSpawnEnv) get it as TMPDIR.
+ * process.env is left alone: `tmux new-session` may start the user's tmux
+ * server with it, and every later window on that server (the user's own
+ * shells included) would inherit this environment's dir. Keeps the caller's
+ * TMPDIR when it is explicit or nothing applies.
+ */
+export function prepareServiceTmpdir(
+  e: Pick<Env, "SLOCKDEV_DIR">,
+  input: { env?: NodeJS.ProcessEnv; maxTmpdirBytes?: number; warn?: (msg: string) => void } = {},
+): DevEnvDir | null {
+  const warn = input.warn ?? out;
+  const resolved = resolveDevEnvDir(devEnvId(e), { env: input.env, maxTmpdirBytes: input.maxTmpdirBytes });
+  // The cache-root warnings were printed by applyDevCacheEnv.
+  for (const w of resolved.warnings) if (w.includes("environment TMPDIR")) warn(w);
+  serviceEnvDir = prepareDevEnvDir(resolved, { warn, starttimeOf: procStarttime }) ? resolved : null;
+  return serviceEnvDir;
+}
+
+/** The env for a service raftdev spawns itself (cloudflared): `base` plus the environment's TMPDIR. */
+export function serviceSpawnEnv(base: NodeJS.ProcessEnv, envDir: DevEnvDir | null): NodeJS.ProcessEnv {
+  return envDir?.tmpdir ? { ...base, TMPDIR: envDir.tmpdir } : base;
+}
+
+/**
+ * `stop` / `nuke`: removes the environment's temp dir once its processes are
+ * confirmed gone (raftdev-cache.ts removeDevEnvDir); otherwise leaves it.
+ */
+function removeServiceTmpdir(e: Env): void {
+  // Wherever start put it, whatever TMPDIR this stop runs with.
+  const env = { ...process.env };
+  delete env.TMPDIR;
+  const resolved = resolveDevEnvDir(devEnvId(e), { env });
+  if (!resolved.dir) return;
+  const attempt = () => removeDevEnvDir(resolved.dir as string, {
+    envId: devEnvId(e),
+    hostname: hostname(),
+    bootId: currentBootId() || null,
+    starttimeOf: procStarttime,
+    selfPid: process.pid,
+    sessionAlive: () => tmuxHasSession(e.TMUX_SESSION),
+  });
+  let result = attempt();
+  // Services may take a few seconds to exit after the session is killed.
+  for (let i = 0; i < 5 && result.liveProcesses; i++) {
+    spawnSync("sleep", ["1"]);
+    result = attempt();
+  }
+  if (result.removed) out(`Removed temp dir ${resolved.dir}`);
+  else if (result.reason !== "absent") out(`Temp dir ${resolved.dir} preserved: ${result.reason}.`);
+}
+
+/** cloudflared's log: in the environment's dir when it has one, else the caller's temp dir. */
+export function cloudflaredLogPath(name: string, envDir: string | null, tmp: string = tmpdir()): string {
+  return envDir ? join(envDir, "cloudflared.log") : join(tmp, `slockdev-cf-${name}.log`);
 }
 
 interface ShResult { code: number; stdout: string; stderr: string }
@@ -721,19 +953,46 @@ export function packageManagerSpawnShell(platform: NodeJS.Platform = process.pla
   return platform === "win32";
 }
 
+/**
+ * The web window: pre-bundle Vite's dependencies in a short-lived `vite
+ * optimize` process, then start the dev server, both with the same env.
+ * On a cold cache (a fresh worktree, or a lockfile/config change) the dev
+ * server would otherwise run the dependency bundle itself, and Rolldown's
+ * native allocator keeps that memory (~0.9 GB) for the life of the server.
+ * The dev server reuses the cache this process writes (same config hash), so
+ * it never bundles at startup; with a warm cache `vite optimize` only checks
+ * the metadata and exits. A failure is not fatal: the dev server then
+ * pre-bundles in-process as before. `vite optimize` is deprecated in Vite 8
+ * but still supported.
+ */
+export function webWindowCommand(envPrefix: string): string {
+  // pnpm exits 1 on Ctrl-C, so a trap tells an interrupt from a failure: an
+  // interrupted optimize stops the window (status 130) instead of starting the
+  // dev server, as a Ctrl-C of the dev server itself would.
+  return `optimize_interrupted=; trap 'optimize_interrupted=1' INT; ` +
+    `${envPrefix}pnpm --filter @botiverse/raft-web exec vite optimize; optimize_status=$?; trap - INT; ` +
+    `if [ -n "$optimize_interrupted" ]; then (exit 130); else ` +
+    `[ "$optimize_status" -eq 0 ] || echo "[raftdev] vite optimize failed; the dev server will pre-bundle dependencies itself"; ` +
+    `${envPrefix}pnpm --filter @botiverse/raft-web dev; fi`;
+}
+
 export type SeedCommandOptions = {
   name: string;
   withOnboarding: boolean;
+  withAgentRuns: boolean;
 };
 
 export function parseSeedCommandArgs(args: string[], defaultName: string): SeedCommandOptions {
   let name = defaultName;
   let nameSet = false;
   let withOnboarding = false;
+  let withAgentRuns = false;
 
   for (const arg of args) {
     if (arg === "--with-onboarding") {
       withOnboarding = true;
+    } else if (arg === "--with-agent-runs") {
+      withAgentRuns = true;
     } else if (arg.startsWith("--")) {
       throw new Error(`Unknown seed option: ${arg}`);
     } else if (nameSet) {
@@ -745,7 +1004,7 @@ export function parseSeedCommandArgs(args: string[], defaultName: string): SeedC
   }
 
   validateEnvironmentName(name);
-  return { name, withOnboarding };
+  return { name, withOnboarding, withAgentRuns };
 }
 
 // TypeScript scripts run on Node with the oxc-node loader. `pnpm exec` keeps
@@ -754,12 +1013,124 @@ export function tsScriptArgs(script: string, args: string[] = []): string[] {
   return ["exec", "node", "--import", "@oxc-node/core/register", script, ...args];
 }
 
-export function buildDevSeedArgs(outputPath: string, withOnboarding: boolean): string[] {
+export function buildDevSeedArgs(outputPath: string, withOnboarding: boolean, withAgentRuns = false): string[] {
   return tsScriptArgs("scripts/seed.ts", [
     "--output",
     outputPath,
     ...(withOnboarding ? ["--with-onboarding"] : []),
+    ...(withAgentRuns ? ["--with-agent-runs"] : []),
   ]);
+}
+
+/**
+ * Steps of packages/server `db:migrate:deploy` that raftdev does not run, and
+ * why. Everything else in that script (the migrator, the CONCURRENTLY index
+ * builds and the post-migration index check) runs locally in the same order.
+ */
+export const DEV_SKIPPED_DEPLOY_STEPS: Readonly<Record<string, string>> = {
+  // Admission check for the operator migration DSN: refuses unless its
+  // statement_timeout equals SERVER_MIGRATION_EXPECTED_STATEMENT_TIMEOUT_MS.
+  "scripts/migration-preflight.ts": "checks the production migrator DSN's statement_timeout",
+  // Both reconcile grants for operator roles that exist only in staging and
+  // production; without FEATURE_FLAG_ADMIN_PRIVILEGE_GUARD_REQUIRED=1 (set only
+  // by those deploys) they skip on a local database anyway.
+  "scripts/verify-feature-flag-admin-privileges.ts": "grants for a production-only operator role",
+  "scripts/verify-app-admin-privileges.ts": "grants for a production-only operator role",
+};
+
+const SCRIPT_STEP_PATTERN = /^node --import @oxc-node\/core\/register (scripts\/[\w.-]+\.ts)$/;
+const VERIFY_POST_MIGRATION_INDEXES = "scripts/verify-post-migration-indexes.ts";
+
+function scriptStepPath(command: string, what: string): string {
+  const match = SCRIPT_STEP_PATTERN.exec(command.trim());
+  if (!match) throw new Error(`unexpected ${what}: ${command.trim()}`);
+  return match[1];
+}
+
+/**
+ * The scripts raftdev runs to build its database, in order: the steps of the
+ * `db:migrate:deploy` package script minus DEV_SKIPPED_DEPLOY_STEPS, plus the
+ * create script of every post-migration index (`indexCreateScripts`, package
+ * script names from POST_MIGRATION_INDEXES) that the deploy does not run, just
+ * before the index check. Production and staging ran those once by hand
+ * (postMigrationIndexes.ts); a local database gets them every time, so it has
+ * production's whole index set and the check can fail instead of warning.
+ * Throws when a step is not a plain `node --import ... scripts/<x>.ts` call,
+ * or when a skipped step is no longer in the deploy, so a change is noticed.
+ */
+export function devMigrationSteps(packageScripts: Readonly<Record<string, string>>, indexCreateScripts: readonly string[]): string[] {
+  const deploy = (packageScripts["db:migrate:deploy"] ?? "").split("&&")
+    .map((step) => scriptStepPath(step, "db:migrate:deploy step"));
+  for (const skipped of Object.keys(DEV_SKIPPED_DEPLOY_STEPS)) {
+    if (!deploy.includes(skipped)) throw new Error(`db:migrate:deploy no longer runs ${skipped}`);
+  }
+  const steps = deploy.filter((script) => !(script in DEV_SKIPPED_DEPLOY_STEPS));
+  const verifyAt = steps.indexOf(VERIFY_POST_MIGRATION_INDEXES);
+  if (verifyAt === -1) throw new Error(`db:migrate:deploy no longer runs ${VERIFY_POST_MIGRATION_INDEXES}`);
+  const extra: string[] = [];
+  for (const name of indexCreateScripts) {
+    const command = packageScripts[name];
+    if (command === undefined) throw new Error(`post-migration index create script ${name} is not a package script`);
+    const script = scriptStepPath(command, `${name} command`);
+    if (!steps.includes(script) && !extra.includes(script)) extra.push(script);
+  }
+  return [...steps.slice(0, verifyAt), ...extra, ...steps.slice(verifyAt)];
+}
+
+export type DevDatabaseSchemaState = "empty" | "migrated" | "push-built";
+
+/** The deploy phase-contract fields packages/server/scripts/migrate-deploy.ts
+ *  reads (its `phaseContractFields`); it refuses any of them non-blank while
+ *  the contract is off. */
+export const DEV_MIGRATION_PHASE_FIELDS = [
+  "SERVER_MIGRATION_PHASE_BOUNDARY_TAGS",
+  "SERVER_MIGRATION_REQUIRED_PHASE_BOUNDARY_TAGS",
+  "SERVER_MIGRATION_EXPECTED_LOCK_TIMEOUT_MS",
+  "SERVER_MIGRATION_LOCK_SCHEMA",
+  "SERVER_MIGRATION_LOCK_RELATIONS",
+  "SERVER_MIGRATION_ADVISORY_LOCK_NAMESPACE",
+  "SERVER_MIGRATION_ADVISORY_LOCK_KEY",
+] as const;
+
+/** Retry-budget overrides packages/server/src/db/migrateDeploy.ts reads; a
+ *  blank value selects its built-in default. */
+export const DEV_MIGRATION_RETRY_FIELDS = [
+  "SERVER_MIGRATION_RETRY_MAX_ATTEMPTS",
+  "SERVER_MIGRATION_RETRY_BASE_DELAY_MS",
+] as const;
+
+/** The environment of a dev migration step: the developer's shell and `.env`
+ *  must not change how the local database is migrated. The child scripts load
+ *  packages/server/.env with `import "dotenv/config"`, which fills only
+ *  variables that are unset, so deleting a variable is not enough: every value
+ *  is set explicitly. MIGRATIONS_FOLDER is the repo's drizzle folder (the
+ *  migrator uses `??`, so a blank value would count as set), the phase
+ *  contract is pinned off and its fields blank (the migrator checks
+ *  `?.trim()`), and the retry overrides blank (built-in defaults). */
+export function devMigrationEnv(base: NodeJS.ProcessEnv, databaseUrl: string): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {
+    ...base,
+    DATABASE_URL: databaseUrl,
+    MIGRATIONS_FOLDER: join(PROJECT_DIR, "packages/server/drizzle"),
+    SERVER_MIGRATION_PHASE_CONTRACT_REQUIRED: "false",
+    // The post-migration index check fails instead of warning: every index
+    // it lists is built by the steps before it (devMigrationSteps).
+    POST_MIGRATION_INDEX_GUARD_REQUIRED: "1",
+  };
+  for (const name of [...DEV_MIGRATION_PHASE_FIELDS, ...DEV_MIGRATION_RETRY_FIELDS]) env[name] = "";
+  return env;
+}
+
+/**
+ * What a local Postgres holds before raftdev migrates it. `appliedMigrations`
+ * is the row count of drizzle.__drizzle_migrations, or null when that table
+ * does not exist. Tables without migration history mean the database was
+ * built by `drizzle-kit push` (raftdev before it ran migrations): the migrator
+ * would replay every migration against existing tables and fail.
+ */
+export function classifyDevDatabaseSchema(publicTables: number, appliedMigrations: number | null): DevDatabaseSchemaState {
+  if ((appliedMigrations ?? 0) > 0) return "migrated";
+  return publicTables > 0 ? "push-built" : "empty";
 }
 
 function sh(
@@ -767,12 +1138,15 @@ function sh(
   args: string[],
   opts: { quiet?: boolean; input?: string; env?: NodeJS.ProcessEnv; cwd?: string } = {},
 ): ShResult {
+  if (cmd === "tmux") args = [...previewTmuxSocketArgs(args), ...args];
   const r = spawnSync(cmd, args, {
     encoding: "utf8",
     input: opts.input,
     env: opts.env ?? process.env,
     cwd: opts.cwd,
-    stdio: opts.quiet ? ["ignore", "pipe", "pipe"] : ["inherit", "pipe", "pipe"],
+    // `input` needs a piped stdin; "ignore" would drop it silently (the
+    // preview record reaches raft-preview-cleaner register this way).
+    stdio: [opts.input !== undefined ? "pipe" : opts.quiet ? "ignore" : "inherit", "pipe", "pipe"],
   });
   return { code: r.status ?? 1, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
 }
@@ -827,23 +1201,65 @@ function risingWaveSqlReady(databaseUrl: string): boolean {
   return result.status === 0;
 }
 
-export function validateStartTooling(): void {
-  const missing: string[] = [];
-  for (const command of ["docker", "tmux", "lsof", "bash"]) {
-    if (!commandExists(command)) missing.push(command);
+// External programs each raftdev command shells out to. They are checked
+// once, before the command touches Docker or tmux, so a missing tool fails up
+// front with every gap and its install hint listed together. lsof matters most:
+// without it portInUse cannot tell a free port from an unknown one.
+export type ToolingCommand = "start" | "stop" | "status" | "nuke" | "janitor";
+const COMMAND_TOOLING: Record<ToolingCommand, readonly string[]> = {
+  start: ["docker", "tmux", "lsof", "bash"],
+  stop: ["docker", "tmux"],
+  status: ["docker", "tmux", "lsof"],
+  nuke: ["docker", "tmux"],
+  janitor: ["docker", "tmux"],
+};
+const TOOL_INSTALL_HINTS: Record<string, string> = {
+  docker: "Docker Engine or Docker Desktop (https://docs.docker.com/get-docker/); your user must be able to run `docker ps`",
+  tmux: "macOS: brew install tmux; Debian/Ubuntu: sudo apt-get install tmux; Fedora: sudo dnf install tmux",
+  lsof: "macOS: preinstalled; Debian/Ubuntu: sudo apt-get install lsof; Fedora: sudo dnf install lsof",
+  bash: "install bash and make sure `bash -lc true` succeeds",
+};
+
+export function missingTooling(command: ToolingCommand): { tool: string; hint: string }[] {
+  const missing: { tool: string; hint: string }[] = [];
+  for (const tool of COMMAND_TOOLING[command]) {
+    if (!commandExists(tool)) missing.push({ tool, hint: TOOL_INSTALL_HINTS[tool] });
   }
-  if (!missing.includes("bash") && !commandRuns("bash", ["-lc", "true"])) {
-    missing.push("usable bash");
+  const has = (tool: string) => COMMAND_TOOLING[command].includes(tool) && !missing.some((m) => m.tool === tool);
+  if (has("bash") && !commandRuns("bash", ["-lc", "true"])) {
+    missing.push({ tool: "usable bash", hint: TOOL_INSTALL_HINTS.bash });
   }
+  return missing;
+}
+
+export function validateTooling(command: ToolingCommand): void {
+  const missing = missingTooling(command);
   if (missing.length === 0) return;
 
-  out("ERROR: raftdev start requires POSIX dev tools that are not available:");
-  for (const command of missing) out(`  - ${command}`);
+  out(`ERROR: raftdev ${command} requires POSIX dev tools that are not available:`);
+  for (const { tool, hint } of missing) out(`  - ${tool}: ${hint}`);
   if (process.platform === "win32") {
     out("");
     out("Native Windows is not fully supported by this tmux-based raftdev launcher yet.");
     out("Use WSL with bash, tmux, lsof, Docker access, and this repo mounted inside WSL; or install equivalent POSIX tools on PATH.");
   }
+  out("");
+  out(command === "start"
+    ? "No containers or local processes were started."
+    : "Nothing was changed.");
+  process.exit(1);
+}
+
+// Only start creates containers, so only start needs a daemon that answers;
+// it runs this after the read-only stale-session report and before the first
+// port check or container. The other commands report what Docker tells them.
+function validateDockerDaemon(): void {
+  const info = sh("docker", ["info", "--format", "{{.ServerVersion}}"], { quiet: true });
+  if (info.code === 0) return;
+  const reason = info.stderr.trim().split("\n").find(Boolean) ?? `exit ${info.code}`;
+  out("ERROR: raftdev start needs a reachable Docker daemon; `docker info` failed:");
+  out(`  ${reason}`);
+  out(`  ${TOOL_INSTALL_HINTS.docker}`);
   out("");
   out("No containers or local processes were started.");
   process.exit(1);
@@ -899,6 +1315,70 @@ function postgresLogicalWalReady(e: Env): boolean {
 function tmuxHasSession(session: string): boolean {
   return sh("tmux", ["has-session", "-t", session], { quiet: true }).code === 0;
 }
+/**
+ * Kill a tmux session; one that is already gone counts as killed. The C-c sent
+ * before the kill can end its last window, and with it the session, so
+ * kill-session finds nothing and fails (IT, 2026-10-23: the first `raftdev
+ * stop` returned 1 that way). Any other failure still fails.
+ */
+function killTmuxSession(session: string): boolean {
+  return sh("tmux", ["kill-session", "-t", session], { quiet: true }).code === 0 ||
+    !tmuxHasSession(session);
+}
+
+/**
+ * The raftdev RisingWave containers whose environment is no longer running
+ * (no `slock-<name>` tmux session): an environment that died or was stopped
+ * part-way leaves its RisingWave running the whole MV chain with nothing
+ * reading it. Only containers this checkout started (`owner`) are
+ * considered, never another agent's or user's: their tmux sessions are not
+ * visible from here, and a container without an owner is skipped. They
+ * must also be named `slock-dev-<name>-risingwave` and have run for
+ * `graceMs`, since an environment that is starting creates its RisingWave
+ * before its tmux session.
+ */
+export const ORPHAN_RISINGWAVE_GRACE_MS = 30 * 60 * 1000;
+export function orphanRisingWaveContainers(
+  containers: readonly { name: string; startedAt: number; owner?: string }[],
+  owner: string,
+  hasSession: (session: string) => boolean,
+  now: number,
+  graceMs: number = ORPHAN_RISINGWAVE_GRACE_MS,
+): string[] {
+  return containers
+    .filter((container) => {
+      const env = /^slock-dev-(.+)-risingwave$/.exec(container.name)?.[1];
+      return env !== undefined && container.owner === owner &&
+        now - container.startedAt >= graceMs && !hasSession(`slock-${env}`);
+    })
+    .map(({ name }) => name);
+}
+
+/** Stop the raftdev RisingWave containers left by environments that are gone (orphanRisingWaveContainers). */
+export function sweepOrphanRisingWave(graceMs: number = ORPHAN_RISINGWAVE_GRACE_MS): void {
+  const owner = raftdevOwner(PROJECT_DIR);
+  // Only this checkout's containers: docker filters on both labels.
+  const listed = sh("docker", [
+    "ps", "--filter", `label=${RAFTDEV_MANAGED_LABEL}=true`, "--filter", `label=${RAFTDEV_OWNER_LABEL}=${owner}`,
+    "--format", "{{.Names}}",
+  ], { quiet: true });
+  if (listed.code !== 0) return;
+  const containers = listed.stdout.split("\n").map((line) => line.trim()).filter(Boolean).map((name) => {
+    const started = sh("docker", ["inspect", "--format", "{{.State.StartedAt}}", name], { quiet: true }).stdout.trim();
+    const startedAt = Date.parse(started);
+    // Unknown start time: treat as just started, never as old.
+    const labelled = sh("docker", [
+      "inspect", "--format", `{{ index .Config.Labels ${JSON.stringify(RAFTDEV_OWNER_LABEL)} }}`, name,
+    ], { quiet: true }).stdout.trim();
+    return { name, startedAt: Number.isFinite(startedAt) ? startedAt : Date.now(), owner: labelled || undefined };
+  });
+  for (const container of orphanRisingWaveContainers(containers, owner, tmuxHasSession, Date.now(), graceMs)) {
+    const removed = sh("docker", ["rm", "-fv", container], { quiet: true }).code === 0;
+    out(removed
+      ? `[raftdev] removed '${container}': its environment is no longer running.`
+      : `[raftdev] WARN: could not remove orphaned '${container}'.`);
+  }
+}
 
 // Actual window names in a session. Used by stop/nuke so cluster-mode replica
 // windows (server-2 … server-N) — whose count isn't known at stop time — all
@@ -909,10 +1389,19 @@ function tmuxWindowNames(session: string): string[] {
 }
 
 function portInUse(port: number): boolean {
-  const r = process.platform === "win32"
-    ? sh("cmd.exe", ["/c", "lsof.cmd", "-iTCP:" + String(port), "-sTCP:LISTEN", "-P", "-n"], { quiet: true })
-    : sh("lsof", ["-iTCP:" + String(port), "-sTCP:LISTEN", "-P", "-n"], { quiet: true });
-  return r.code === 0 && r.stdout.trim() !== "";
+  const [cmd, args] = process.platform === "win32"
+    ? ["cmd.exe", ["/c", "lsof.cmd", "-iTCP:" + String(port), "-sTCP:LISTEN", "-P", "-n"]] as const
+    : ["lsof", ["-iTCP:" + String(port), "-sTCP:LISTEN", "-P", "-n"]] as const;
+  const r = spawnSync(cmd, args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  // lsof exits 1 both for "no listener" and, through spawnSync, for "could not
+  // run". Never read the second as a free port. On Windows cmd.exe itself
+  // starts and reports a missing lsof.cmd as "not recognized".
+  if (r.error || (process.platform === "win32" && /not recognized/i.test(r.stderr ?? ""))) {
+    out(`ERROR: Could not run lsof to check port ${port}: ${r.error?.message ?? (r.stderr ?? "").trim()}`);
+    out(`  Install it: ${TOOL_INSTALL_HINTS.lsof}`);
+    process.exit(1);
+  }
+  return r.status === 0 && (r.stdout ?? "").trim() !== "";
 }
 // tmux keeps a login shell after a command exits, and Node --watch may keep
 // its parent alive after the server child exits. Check sockets, not those PIDs.
@@ -950,7 +1439,7 @@ function ensureRustfsBucket(e: Env): boolean {
   out(`Waiting for RustFS and ensuring bucket '${e.RUSTFS_BUCKET}'...`);
   const dir = mkdtempSync(join(tmpdir(), `slockdev-rustfs-init-${e.RUSTFS_BUCKET}-`));
   const initLog = join(dir, "init.log");
-  // Script lives at packages/server/ensure-rustfs-bucket.mjs so that Node's
+  // Script lives at packages/server/ensure-rustfs-bucket.ts so that Node's
   // ESM resolution walks up into the monorepo's node_modules for
   // @aws-sdk/client-s3. The earlier shape (`tsx --eval <multi-line string>`
   // with `shell: true` on Windows) silently succeeded without running:
@@ -962,7 +1451,7 @@ function ensureRustfsBucket(e: Env): boolean {
     writeFileSync(initLog, "");
     const fdOut = openSync(initLog, "a");
     const fdErr = openSync(initLog, "a");
-    const r = spawnSync(packageManagerCommand("pnpm"), ["exec", "node", "ensure-rustfs-bucket.mjs"], {
+    const r = spawnSync(packageManagerCommand("pnpm"), ["exec", "node", "--import", "@oxc-node/core/register", "ensure-rustfs-bucket.ts"], {
       cwd: join(PROJECT_DIR, "packages/server"),
       env: {
         ...process.env,
@@ -1005,11 +1494,11 @@ function usageAndExit(): never {
 Usage: ./raftdev <command> [name]
 
 Commands:
-  start [name] [--description <text>] [--replicas N] [--risingwave[=full|process-only]] [--with-onboarding]
+  start [name] [--description <text>] [--replicas N] [--no-risingwave | --risingwave=process-only] [--with-onboarding] [--with-agent-runs]
                   Start an isolated dev environment
   stop [name]     Stop and clean up an environment
   status          Show environment resources and application listeners
-  seed [name] [--with-onboarding]
+  seed [name] [--with-onboarding] [--with-agent-runs]
                   Re-run seed script; default fixture skips onboarding
   script <name>   Run a repo-owned dev script against an environment
   logs [name]     Attach to the tmux session
@@ -1021,6 +1510,16 @@ Commands:
   trace show <trace-id> [--env <name>] [--wait <duration>] [--raw]
                   Show one local web/server/daemon trace tree
   nuke            Stop ALL environments and remove ALL containers
+  preview <name> [--for <duration>] [--with-agent-runs] [--profile frontend|local-stack]
+          [--memory-max <size>] [--notify <conversation[:message-id]>] [start options]
+                  Start a reviewer preview: systemd user unit, public tunnel,
+                  hard deadline (default 2h, max 8h), registry record
+  preview stop <name|id>
+                  Verified stop of a preview (IT's raft-preview-cleaner)
+  preview list [--json]
+                  List recorded previews: owner, branch, URL, deadline, liveness
+  cache status    Where dev caches and test temp files go, and which are on tmpfs
+  cache prune     Remove leftover test temp dirs (>24h, owner gone), then pnpm store prune
 
 Name defaults to the directory basename (e.g., "slock").
 Different names get different ports, so multiple environments can coexist.
@@ -1037,6 +1536,10 @@ Optional:
   --with-onboarding on start or seed preserves the real fresh-owner account
   and server onboarding gates. The default seed writes canonical completed /
   grandfathered state so routine product validation opens on the app surface.
+  --with-agent-runs on start or seed lets the seeded agents on the dev machine
+  run (assistant inactive, codex-reviewer active). By default the seed only
+  builds data: those agents are stopped, so no seeded message, mention or
+  reminder starts a model until you start one yourself.
   --replicas N (default 1; or SLOCKDEV_REPLICAS=N) on start launches N server
   replicas (tmux windows server, server-2, …, server-N) that SHARE the same
   Postgres + Redis + seed, each on its own derived port, so you can test
@@ -1049,15 +1552,22 @@ Optional:
   derived server port (13001+(k-1)*100+offset) and metrics port
   (12001+(k-2)*100+offset). The daemon connects to replica 1. Capped at 8.
   Example: ./raftdev start clustertest --replicas 2
-  --risingwave (or --risingwave=full) starts an optional managed RisingWave
-  standalone plus Postgres CDC and the serving materialized-view graph, gates
-  seeded PG/RW parity, then injects RISINGWAVE_DATABASE_URL into the server.
-  --risingwave=process-only preserves the lightweight pgwire/pool/fallback
-  wiring smoke and intentionally creates no CDC/MVs. It is disabled by default.
-  RAFTDEV_RISINGWAVE=1|full|process-only provides the same profiles, and
-  RAFTDEV_RISINGWAVE_IMAGE can override the pinned v2.8.0 image. To use an already-managed instance,
-  set RISINGWAVE_DATABASE_URL without --risingwave; credentials are never
-  printed. Local standalone data is ephemeral and removed by raftdev stop.
+  RisingWave: start runs a managed RisingWave standalone plus Postgres CDC and
+  the serving materialized-view graph by default (the product's main pages
+  read from it), gates seeded PG/RW parity, then injects
+  RISINGWAVE_DATABASE_URL into the server. Local standalone data is ephemeral
+  and removed by raftdev stop.
+  --no-risingwave (or RAFTDEV_RISINGWAVE=0) skips it for a faster
+  backend-only start; the Activity endpoints (inbox, followed threads, unread
+  summary, channel unread) then return 503.
+  --risingwave=process-only starts only the RisingWave process (pgwire/pool/
+  fallback wiring smoke, no CDC/MVs). --risingwave and --risingwave=full are
+  accepted and mean the default. RAFTDEV_RISINGWAVE=0|1|full|process-only
+  provides the same choices, and RAFTDEV_RISINGWAVE_IMAGE can override the
+  pinned v2.8.0 image. To use an already-managed instance, set
+  RISINGWAVE_DATABASE_URL (with no local profile flag); credentials are never
+  printed. A managed/full environment refuses a live \`raftdev seed\`; start
+  with --no-risingwave if you need repeated reseeds.
   See docs/operations/raftdev-risingwave.md.
   --latency <min>-<max> (or a single <n>) on start spawns an HTTP latency
   proxy in front of the dev server and points the Web's API requests at it.
@@ -1097,7 +1607,49 @@ Optional:
   web port and prints the trycloudflare URL. If 'cloudflared' is not on
   PATH, only localhost is started and an install hint is shown. Set
   SLOCKDEV_TUNNEL=0 to skip opening a tunnel even when cloudflared is
-  available.`);
+  available. \`./raftdev stop\` ends that tunnel by its recorded pid and
+  start time (.slockdev/<name>/tunnel.json).
+
+Previews (Linux, systemd user session, cloudflared, IT's
+/usr/local/libexec/raft-preview-cleaner; see docs/development/README.md):
+  preview runs \`start\` inside the user unit raft-preview-<id>.service
+  (MemoryMax from --profile: frontend=2G, local-stack=4G (default), or
+  --memory-max; MemorySwapMax=0; RuntimeMaxSec = the deadline;
+  KillMode=control-group), with its own tmux socket and no session bus, so
+  every process stays in the unit. The tunnel is forced on; the URL is
+  printed only after each recorded process is checked to be in the unit.
+  --for takes 90m, 2h, 1h30m (default 2h, max 8h). The 1h idle stop also
+  applies; whichever comes first stops it, and the janitor enforces both.
+  Docker services get their own --memory caps (postgres 1g, redis 256m,
+  rustfs 512m, otelcol 256m; RisingWave keeps its cap).
+  The record (no credentials; a new UUID per launch, never reused) is
+  written only by raft-preview-cleaner register, to
+  \${XDG_STATE_HOME:-~/.local/state}/raft/previews/<id>.json. To move the
+  registry, put one line RAFT_PREVIEW_REGISTRY=/absolute/path in
+  ~/.config/raft/preview-cleaner.env: the cleanup timer reads only that file;
+  RAFT_PREVIEW_REGISTRY in your shell alone does not reach it.
+  --notify "#channel:<message-id>" or "dm:@name:<message-id>" schedules your
+  own Raft reminder at deadline + 10 minutes (\`raft reminder schedule\`),
+  recorded as notify + reminderId and cancelled by a verified \`preview stop\`.
+  A failed schedule only warns.
+  A preview never reuses resources: it refuses to start while any container
+  of the name (pg, redis, rustfs, otelcol, risingwave) or its RustFS volume
+  exists, or when Docker cannot answer; stop them or pick a new name.
+  The unit gets an allowlist of the environment (PATH, HOME, locale, Docker,
+  Node/pnpm, RAFTDEV_*/SLOCKDEV_*/VITE_*), never tokens, secrets, RAFT_* or
+  CLAUDE_*; only --with-agent-runs adds the daemon's model variables
+  (ANTHROPIC_*, OPENAI_*, KIMI_API_KEY, CODEX_HOME, ...).
+  Without --with-agent-runs it prints the passwordless link (the auto-login
+  account's role) and the seed accounts, and starts NO daemon window: no
+  agent runs behind a passwordless URL. With --with-agent-runs it prints no
+  passwordless link, forces VITE_SLOCKDEV_SKIP_AUTO_LOGIN=1 and seeds a
+  random password (not password123): only that password signs in. It appears
+  in the owner-only unit log the launcher prints and in the owner-only seed
+  file. \`raftdev seed\` refuses a preview: previews are seeded only at
+  launch. Post links only in the requester's thread.
+  preview stop <name|id> runs \`raft-preview-cleaner stop <id>\`: unit,
+  processes (pid + starttime + boot), containers and volumes are verified gone
+  before the record is removed; otherwise it reports the residue and exits 1.`);
   process.exit(1);
 }
 
@@ -1113,7 +1665,7 @@ function cmdPorts(name: string): void {
   } else {
     const label = risingWaveState?.mode === "local"
       ? `managed/${risingWaveState.profile ?? "full"}; ${risingWaveState.status}`
-      : "reserved; opt in with --risingwave";
+      : "reserved; not running (started with --no-risingwave, or not started)";
     out(`  RisingWave : localhost:${e.RISINGWAVE_PORT} (dashboard: http://localhost:${e.RISINGWAVE_DASHBOARD_PORT}; ${label})`);
     out(`  RW pgwire  : ${e.RISINGWAVE_DATABASE_URL}${risingWaveState ? "" : " (reserved)"}`);
   }
@@ -1314,7 +1866,8 @@ function cmdLogs(name: string): void {
     process.exit(1);
   }
   // Node has no exec(); inherit stdio + exit on child exit is the closest equivalent.
-  const r = spawnSync("tmux", ["attach", "-t", e.TMUX_SESSION], { stdio: "inherit" });
+  const attachArgs = ["attach", "-t", e.TMUX_SESSION];
+  const r = spawnSync("tmux", [...previewTmuxSocketArgs(attachArgs), ...attachArgs], { stdio: "inherit" });
   process.exit(r.status ?? 0);
 }
 
@@ -1326,6 +1879,8 @@ function cmdScript(args: string[]): void {
     out("  Example: ./raftdev script smoke-runtime --env cli-e2e --matrix runtime=claude,codex");
     out("  Example: ./raftdev script feedback-report --env cli-e2e");
     out("  Example: ./raftdev script onboarding-scenarios --env onboarding-preview --scenario matrix");
+    out("  Example: ./raftdev script docs-fixture --env docs-shots");
+    out("  Example: ./raftdev script migration-log-fixture --env migration-log");
     process.exit(1);
   }
   let envName = basename(PROJECT_DIR);
@@ -1354,6 +1909,10 @@ function cmdScript(args: string[]): void {
     scriptPath = join(PROJECT_DIR, "scripts/smoke/smoke-feedback-report.ts");
   } else if (scriptName === "onboarding-scenarios") {
     scriptPath = join(PROJECT_DIR, "packages/server/scripts/onboarding-scenarios.ts");
+  } else if (scriptName === "docs-fixture") {
+    scriptPath = join(PROJECT_DIR, "packages/server/scripts/docs-fixture.ts");
+  } else if (scriptName === "migration-log-fixture") {
+    scriptPath = join(PROJECT_DIR, "packages/server/scripts/migration-log-fixture.ts");
   } else {
     out(`ERROR: Unknown script '${scriptName}'.`);
     process.exit(1);
@@ -1362,6 +1921,34 @@ function cmdScript(args: string[]): void {
     out(`ERROR: Script file not found: ${scriptPath}`);
     process.exit(1);
   }
+  const scriptEnv: NodeJS.ProcessEnv = {
+    ...process.env,
+    DATABASE_URL: e.DATABASE_URL,
+    // docs-fixture uploads attachments and marks its computers online.
+    ...(scriptName === "docs-fixture"
+      ? {
+        REDIS_URL: e.REDIS_URL,
+        S3_ENDPOINT: e.S3_ENDPOINT,
+        S3_REGION: "us-east-1",
+        S3_FORCE_PATH_STYLE: "true",
+        S3_ACCESS_KEY_ID: e.RUSTFS_ACCESS_KEY,
+        S3_SECRET_ACCESS_KEY: e.RUSTFS_SECRET_KEY,
+        S3_ATTACHMENTS_BUCKET: e.RUSTFS_BUCKET,
+        S3_CDN_BUCKET: e.RUSTFS_BUCKET,
+      }
+      : {}),
+  };
+  // docs-fixture checks Activity parity against RisingWave at the end, so pass
+  // the RW URL only for a local, full-profile RW that is serving. Otherwise drop
+  // it, including one exported in the shell (as cmdSeed does).
+  const rwState = scriptName === "docs-fixture" ? readRisingWaveState(e) : null;
+  if (scriptName === "docs-fixture") {
+    if (rwState?.mode === "local" && rwState.profile === "full" && rwState.status === "serving-ready") {
+      scriptEnv.RISINGWAVE_DATABASE_URL = e.RISINGWAVE_DATABASE_URL;
+    } else {
+      delete scriptEnv.RISINGWAVE_DATABASE_URL;
+    }
+  }
   const r = spawnSync(
     "node",
     [
@@ -1369,10 +1956,15 @@ function cmdScript(args: string[]): void {
       "--server-url", `http://localhost:${e.SERVER_PORT}`,
       "--seed-file", e.SEED_FILE,
       ...(scriptName === "feedback-report" ? ["--worker-url", `http://localhost:${e.TRACE_WORKER_PORT}`] : []),
-      ...(scriptName === "onboarding-scenarios" ? ["--web-url", `http://localhost:${e.WEB_PORT}`] : []),
+      ...(scriptName === "onboarding-scenarios" || scriptName === "docs-fixture" || scriptName === "migration-log-fixture"
+        ? ["--web-url", `http://localhost:${e.WEB_PORT}`]
+        : []),
       ...passthrough,
     ],
-    { stdio: "inherit", env: { ...process.env, DATABASE_URL: e.DATABASE_URL } },
+    {
+      stdio: "inherit",
+      env: scriptEnv,
+    },
   );
   process.exit(r.status ?? 0);
 }
@@ -1463,6 +2055,137 @@ function inspectRisingWaveCdcResidue(e: Env): RisingWaveCdcResidue {
   if (value === "t") return "present";
   if (value === "f") return "absent";
   return "unknown";
+}
+
+function psqlScalar(e: Env, sql: string): string | null {
+  const result = sh("docker", [
+    "exec", e.CONTAINER,
+    "psql", "-X", "-U", "postgres", "-d", "slock", "-At", "-v", "ON_ERROR_STOP=1", "-c", sql,
+  ], { quiet: true });
+  return result.code === 0 ? result.stdout.trim() : null;
+}
+
+// pg_isready only shows that some server answers on the container's Unix
+// socket. On first boot postgres:16-alpine runs a temporary socket-only server
+// (listen_addresses='') for its init scripts, then restarts, so "ready" could
+// land on the temporary one. Ready therefore means one real read-only query
+// over TCP inside the container, which only the final server accepts, within
+// one overall deadline.
+const POSTGRES_READY_TIMEOUT_MS = 60_000;
+const POSTGRES_READY_QUERY =
+  'PGPASSWORD="$POSTGRES_PASSWORD" PGCONNECT_TIMEOUT=2 exec psql -X -h 127.0.0.1 -U postgres -d slock -At -v ON_ERROR_STOP=1 -c "SELECT 1"';
+
+function postgresQueryOnce(e: Env): { ok: boolean; error: string } {
+  const r = sh("docker", ["exec", e.CONTAINER, "sh", "-c", POSTGRES_READY_QUERY], { quiet: true });
+  const error = r.code === 0 ? "" : ((r.stderr || r.stdout).trim().split("\n").slice(-3).join(" | ") || `exit ${r.code}`);
+  return { ok: r.code === 0, error };
+}
+
+// Injectable probe, clock and sleep so the deadline is testable without Docker.
+export function waitForQueryReady(options: {
+  timeoutMs: number;
+  probe: () => { ok: boolean; error: string };
+  now: () => number;
+  sleep: () => void;
+}): { ready: boolean; lastError: string } {
+  const deadline = options.now() + options.timeoutMs;
+  while (true) {
+    const probe = options.probe();
+    if (probe.ok) return { ready: true, lastError: "" };
+    if (options.now() >= deadline) return { ready: false, lastError: probe.error };
+    options.sleep();
+  }
+}
+
+// Printed whenever raftdev gives up on Postgres, so the next occurrence shows
+// which server state it hit instead of only "could not read".
+function printPostgresDiagnostics(e: Env, lastError: string): void {
+  out(`  Last query error: ${lastError || "(none)"}`);
+  out(`  Connection: docker exec ${e.CONTAINER} psql -h 127.0.0.1 -U postgres -d slock (host port ${e.PG_PORT})`);
+  const state = sh("docker", [
+    "inspect", "--format",
+    "status={{.State.Status}} running={{.State.Running}} restarting={{.State.Restarting}} restarts={{.RestartCount}} " +
+      "exit={{.State.ExitCode}} oom={{.State.OOMKilled}} started={{.State.StartedAt}}",
+    e.CONTAINER,
+  ], { quiet: true });
+  out(`  Container : ${state.code === 0 ? state.stdout.trim() : `inspect failed (exit ${state.code})`}`);
+  for (const [label, args] of [
+    ["pg_isready (socket)", ["exec", e.CONTAINER, "pg_isready", "-U", "postgres"]],
+    ["pg_isready (tcp)   ", ["exec", e.CONTAINER, "pg_isready", "-h", "127.0.0.1", "-U", "postgres"]],
+  ] as const) {
+    const r = sh("docker", [...args], { quiet: true });
+    out(`  ${label}: ${(r.stdout || r.stderr).trim() || `exit ${r.code}`}`);
+  }
+  const logs = sh("docker", ["logs", "--tail", "30", e.CONTAINER], { quiet: true });
+  const tail = `${logs.stdout}${logs.stderr}`.trim();
+  if (tail) {
+    out("  Server log (last 30 lines):");
+    for (const line of tail.split("\n")) out(`    ${line}`);
+  }
+}
+
+function inspectDevDatabaseSchema(e: Env): DevDatabaseSchemaState | null {
+  const tables = psqlScalar(e,
+    "SELECT (SELECT count(*) FROM pg_tables WHERE schemaname = 'public') || ',' || " +
+      "(to_regclass('drizzle.__drizzle_migrations') IS NOT NULL)::text");
+  const match = tables === null ? null : /^(\d+),(true|false)$/.exec(tables);
+  if (!match) return null;
+  let applied: number | null = null;
+  if (match[2] === "true") {
+    const count = psqlScalar(e, "SELECT count(*) FROM drizzle.__drizzle_migrations");
+    if (count === null || !/^\d+$/.test(count)) return null;
+    applied = Number(count);
+  }
+  return classifyDevDatabaseSchema(Number(match[1]), applied);
+}
+
+/**
+ * Build or update the environment's Postgres the way production does: the
+ * migrations in packages/server/drizzle, in journal order, then the
+ * post-migration index steps of `db:migrate:deploy` (devMigrationSteps).
+ * Prints the reason and returns false on any failure.
+ */
+function migrateDevDatabase(e: Env): boolean {
+  const state = inspectDevDatabaseSchema(e);
+  if (state === null) {
+    out(`ERROR: Could not read the migration state of Postgres in '${e.CONTAINER}'.`);
+    out(`  Inspect: docker exec ${e.CONTAINER} psql -U postgres -d slock -c '\\dt drizzle.*'`);
+    printPostgresDiagnostics(e, postgresQueryOnce(e).error);
+    return false;
+  }
+  if (state === "push-built") {
+    out(`ERROR: Postgres in '${e.CONTAINER}' was built by \`drizzle-kit push\` (tables, but no drizzle.__drizzle_migrations history).`);
+    out("  raftdev now builds the database by running packages/server/drizzle migrations, as production does,");
+    out("  and cannot convert a pushed database. Recreate it (this deletes the environment's local data):");
+    out(`  Recovery: ./raftdev stop ${e.name} && ./raftdev start ${e.name}  (add the flags you use, e.g. --replicas)`);
+    return false;
+  }
+  const serverDir = join(PROJECT_DIR, "packages/server");
+  const pkg = JSON.parse(readFileSync(join(serverDir, "package.json"), "utf8")) as { scripts: Record<string, string> };
+  let steps: string[];
+  try {
+    steps = devMigrationSteps(pkg.scripts, POST_MIGRATION_INDEXES.map((index) => index.createScript));
+  } catch (error) {
+    out(`ERROR: ${error instanceof Error ? error.message : String(error)} (update DEV_SKIPPED_DEPLOY_STEPS in scripts/dev/raftdev.ts).`);
+    return false;
+  }
+  out(state === "empty" ? "Migrating database from empty..." : "Applying pending database migrations...");
+  const startedAt = Date.now();
+  for (const step of steps) {
+    const r = spawnSync(packageManagerCommand("pnpm"), tsScriptArgs(step), {
+      cwd: serverDir,
+      env: devMigrationEnv(process.env, e.DATABASE_URL),
+      stdio: "inherit",
+      shell: packageManagerSpawnShell(),
+    });
+    if (r.status !== 0) {
+      out(`ERROR: Database migration step ${step} failed (exit ${r.status ?? r.signal ?? "unknown"}); the database was not migrated.`);
+      out(`  Recovery: fix the failure above, then ./raftdev stop ${e.name} && ./raftdev start ${e.name}`);
+      return false;
+    }
+  }
+  out(`Database migrated (${((Date.now() - startedAt) / 1000).toFixed(1)}s).`);
+  return true;
 }
 
 function redactRisingWaveDiagnostic(e: Env, value: string): string {
@@ -1567,8 +2290,13 @@ function runSeededRisingWaveParity(
 
 function cmdSeed(args: string[]): void {
   if (args.includes("-h") || args.includes("--help")) usageAndExit();
-  const { name, withOnboarding } = parseSeedCommandArgs(args, basename(PROJECT_DIR));
+  const { name, withOnboarding, withAgentRuns } = parseSeedCommandArgs(args, basename(PROJECT_DIR));
   const e = setupEnv(name);
+  const previewRefusal = previewSeedRefusal(name, readPreviewState(e));
+  if (previewRefusal) {
+    for (const line of previewRefusal) out(line);
+    process.exit(1);
+  }
   // Reseed never needs the server's optional external dependency. Scrub an
   // exported credential before RustFS/Drizzle/seed children inherit it.
   delete process.env.RISINGWAVE_DATABASE_URL;
@@ -1584,7 +2312,7 @@ function cmdSeed(args: string[]): void {
     hasSeededEnvironmentOwnershipProof(e),
   )) {
     out(`ERROR: Postgres container '${e.CONTAINER}' is not proven to be owned by raftdev.`);
-    out("  Refusing to run schema push or seed against a same-named external container.");
+    out("  Refusing to migrate or seed a same-named external container.");
     out(`  Recovery: choose a different environment name, or restore the validated raftdev ownership state.`);
     process.exit(1);
   }
@@ -1606,7 +2334,7 @@ function cmdSeed(args: string[]): void {
     } else if (cdcResidue === "unknown") {
       out("  Could not prove that Postgres is free of owned RisingWave CDC state.");
     }
-    out(`  Recovery: ./raftdev stop ${name} && ./raftdev start ${name} --risingwave`);
+    out(`  Recovery: ./raftdev stop ${name} && ./raftdev start ${name}`);
     process.exit(1);
   }
   if (
@@ -1617,34 +2345,26 @@ function cmdSeed(args: string[]): void {
     writeRisingWaveState(e, { ...risingWaveState, status: "failed" });
     out(`ERROR: Managed/full RisingWave is not running for '${name}'.`);
     out("  Postgres was not reseeded because strict CDC parity could not be proved.");
-    out(`  Recovery: ./raftdev stop ${name} && ./raftdev start ${name} --risingwave`);
+    out(`  Recovery: ./raftdev stop ${name} && ./raftdev start ${name}`);
     process.exit(1);
   }
   if (risingWaveState?.mode === "local" && risingWaveState.profile === "full") {
     out(`ERROR: '${name}' is a managed/full CDC environment; live reseed is intentionally refused.`);
     out("  Rebuilding explicit CDC schemas requires quiescing server traffic and replacing the RisingWave catalog.");
-    out(`  Use: ./raftdev stop ${name} && ./raftdev start ${name} --risingwave`);
+    out(`  Use: ./raftdev stop ${name} && ./raftdev start ${name}  (fresh seed with the CDC graph),`);
+    out(`  or start it with --no-risingwave when you need repeated live reseeds.`);
     process.exit(1);
   }
-  out("Pushing database schema...");
-  const npxCommand = packageManagerCommand("npx");
-  let r = spawnSync(npxCommand, ["drizzle-kit", "push", "--force"], {
-    cwd: join(PROJECT_DIR, "packages/server"),
-    env: { ...process.env, DATABASE_URL: e.DATABASE_URL },
-    stdio: "inherit",
-    shell: packageManagerSpawnShell(),
-  });
-  if ((r.status ?? 1) !== 0) {
+  if (!migrateDevDatabase(e)) {
     writeFailedRisingWaveState(e, risingWaveState);
-    process.exit(r.status ?? 1);
+    process.exit(1);
   }
-  out("Schema is up to date.");
   if (!ensureRustfsBucket(e)) {
     writeFailedRisingWaveState(e, risingWaveState);
     process.exit(1);
   }
   out(`Seeding test data for '${name}'...`);
-  r = spawnSync(packageManagerCommand("pnpm"), buildDevSeedArgs(e.SEED_FILE, withOnboarding), {
+  const r = spawnSync(packageManagerCommand("pnpm"), buildDevSeedArgs(e.SEED_FILE, withOnboarding, withAgentRuns), {
     cwd: join(PROJECT_DIR, "packages/server"),
     env: {
       ...process.env,
@@ -1674,13 +2394,24 @@ function cmdStop(name: string): void {
     hasSeededEnvironmentOwnershipProof(e);
   let cleanupFailed = false;
   out(`=== Stopping dev environment: ${name} ===`);
+  // The tunnel `start` opened is detached from tmux, so it outlives the
+  // session: end it by its recorded identity (pid + starttime + boot), as the
+  // preview teardown does, never by searching process names. First, so the
+  // public way in closes first and is gone even if the teardown below fails.
+  const tunnelStop = stopRecordedTunnel(e.TUNNEL_STATE_FILE);
+  if (tunnelStop.outcome === "stopped") {
+    out(`Cloudflared tunnel (pid ${tunnelStop.pid}) stopped.`);
+  } else if (tunnelStop.outcome === "still-running") {
+    cleanupFailed = true;
+    out(`ERROR: Cloudflared tunnel (pid ${tunnelStop.pid}) is still running after SIGTERM.`);
+  }
   if (tmuxHasSession(e.TMUX_SESSION)) {
     // C-c every actual window (covers cluster-mode server-2 … server-N too).
     for (const w of tmuxWindowNames(e.TMUX_SESSION)) {
       sh("tmux", ["send-keys", "-t", `${e.TMUX_SESSION}:${w}`, "C-c"], { quiet: true });
     }
     spawnSync("sleep", ["1"]);
-    if (sh("tmux", ["kill-session", "-t", e.TMUX_SESSION], { quiet: true }).code === 0) {
+    if (killTmuxSession(e.TMUX_SESSION)) {
       out(`tmux session '${e.TMUX_SESSION}' stopped.`);
     } else {
       cleanupFailed = true;
@@ -1698,7 +2429,7 @@ function cmdStop(name: string): void {
       dockerContainerIsRaftdevManaged(e.RISINGWAVE_CONTAINER);
     if (!owned || risingWaveState?.mode === "external") {
       out(`External/unmanaged container '${e.RISINGWAVE_CONTAINER}' preserved.`);
-    } else if (sh("docker", ["rm", "-f", e.RISINGWAVE_CONTAINER], { quiet: true }).code === 0) {
+    } else if (sh("docker", ["rm", "-fv", e.RISINGWAVE_CONTAINER], { quiet: true }).code === 0) {
       out(`Container '${e.RISINGWAVE_CONTAINER}' removed.`);
     } else {
       cleanupFailed = true;
@@ -1709,7 +2440,7 @@ function cmdStop(name: string): void {
     if (dockerNameExists(c)) {
       if (!dockerContainerIsRaftdevManaged(c) && !baseOwnershipProof) {
         out(`Unowned container '${c}' preserved.`);
-      } else if (sh("docker", ["rm", "-f", c], { quiet: true }).code === 0) {
+      } else if (sh("docker", ["rm", "-fv", c], { quiet: true }).code === 0) {
         out(`Container '${c}' removed.`);
       } else {
         cleanupFailed = true;
@@ -1767,6 +2498,7 @@ function cmdStop(name: string): void {
     rmSync(e.RISINGWAVE_STATE_FILE, { force: true });
   }
   markTraceReaderStoppedIfPresent(e);
+  removeServiceTmpdir(e);
   out("Done.");
 }
 
@@ -1812,6 +2544,13 @@ function cmdNuke(): void {
     } catch {
       continue;
     }
+    const tunnelStop = stopRecordedTunnel(e.TUNNEL_STATE_FILE);
+    if (tunnelStop.outcome === "stopped") {
+      out(`Cloudflared tunnel of '${entry.name}' (pid ${tunnelStop.pid}) stopped.`);
+    } else if (tunnelStop.outcome === "still-running") {
+      cleanupFailed = true;
+      out(`ERROR: Cloudflared tunnel of '${entry.name}' (pid ${tunnelStop.pid}) is still running after SIGTERM.`);
+    }
     const state = readRisingWaveState(e);
     if (state?.mode === "local") registerBaseEnvironment(e);
     if (state?.mode === "external") {
@@ -1833,7 +2572,7 @@ function cmdNuke(): void {
     }
     spawnSync("sleep", ["1"]);
     for (const s of sessions) {
-      if (sh("tmux", ["kill-session", "-t", s], { quiet: true }).code === 0) {
+      if (killTmuxSession(s)) {
         out(`Killed tmux session: ${s}`);
       } else {
         cleanupFailed = true;
@@ -1859,7 +2598,7 @@ function cmdNuke(): void {
         out(`Preserved unowned container: ${c}`);
         continue;
       }
-      if (sh("docker", ["rm", "-f", c], { quiet: true }).code === 0) {
+      if (sh("docker", ["rm", "-fv", c], { quiet: true }).code === 0) {
         out(`Removed container: ${c}`);
       } else {
         cleanupFailed = true;
@@ -1935,6 +2674,7 @@ function cmdNuke(): void {
       rmSync(risingWaveStateFile, { force: true });
       removedRisingWaveStateFiles += 1;
     }
+    removeServiceTmpdir(e);
   }
   if (stoppedTraceReaders > 0) {
     out(`Marked ${stoppedTraceReaders} trace reader state file(s) stopped.`);
@@ -1971,20 +2711,26 @@ interface TunnelInfo {
   reason?: string;
 }
 
-function startCloudflaredTunnel(e: Env, onSpawn?: (pid: number | undefined) => void): TunnelInfo {
-  if (process.env.SLOCKDEV_TUNNEL === "0") {
+// `force` (raftdev preview) ignores the SLOCKDEV_TUNNEL=0 opt-out: a preview
+// exists to be reached through the tunnel.
+function startCloudflaredTunnel(
+  e: Env,
+  onSpawn?: (pid: number | undefined) => void,
+  force = false,
+): TunnelInfo {
+  if (!force && process.env.SLOCKDEV_TUNNEL === "0") {
     return { enabled: false, reason: "SLOCKDEV_TUNNEL=0 (opt-out)" };
   }
   if (!detectCloudflared()) {
     return { enabled: false, reason: "cloudflared not installed" };
   }
-  const logFile = join(tmpdir(), `slockdev-cf-${e.name}.log`);
+  const logFile = cloudflaredLogPath(e.name, serviceEnvDir?.dir ?? null);
   try { writeFileSync(logFile, ""); } catch {}
   const logFd = openSync(logFile, "a");
   const child = spawn(
     "cloudflared",
     ["tunnel", "--url", `http://localhost:${e.WEB_PORT}`, "--no-autoupdate", "--protocol", "http2"],
-    { detached: true, stdio: ["ignore", logFd, logFd] },
+    { detached: true, stdio: ["ignore", logFd, logFd], env: serviceSpawnEnv(process.env, serviceEnvDir) },
   );
   child.unref();
   onSpawn?.(child.pid);
@@ -2000,6 +2746,107 @@ function startCloudflaredTunnel(e: Env, onSpawn?: (pid: number | undefined) => v
     spawnSync("sleep", ["1"]);
   }
   return { enabled: true, pid: child.pid, logFile, reason: "tunnel started but URL not parsed within 20s; see log" };
+}
+
+/** The tunnel a plain `start` opened, by identity: pid + starttime + boot (preview records the same triple). */
+export interface TunnelRecord {
+  pid: number;
+  starttime: string;
+  bootId: string;
+}
+
+export interface TunnelProbes {
+  starttimeOf(pid: number): string | null;
+  bootId(): string;
+  signal(pid: number, signal: NodeJS.Signals): void;
+  sleepMs(ms: number): void;
+}
+
+const defaultTunnelProbes: TunnelProbes = {
+  starttimeOf: processStarttime,
+  bootId: currentBootId,
+  signal: (pid, signal) => process.kill(pid, signal),
+  sleepMs: (ms) => { spawnSync("sleep", [String(ms / 1000)]); },
+};
+
+/**
+ * A process's start time: /proc's starttime on Linux, else `ps`'s start time
+ * (macOS has no /proc). The prefix keeps the two sources from ever comparing
+ * equal.
+ */
+function processStarttime(pid: number): string | null {
+  const fromProc = procStarttime(pid);
+  if (fromProc !== null) return fromProc;
+  const ps = spawnSync("ps", ["-o", "lstart=", "-p", String(pid)], {
+    encoding: "utf8",
+    // The same text at record and at stop, whatever the caller's locale or zone.
+    env: { ...process.env, LC_ALL: "C", TZ: "UTC" },
+  });
+  const started = ps.status === 0 ? ps.stdout.trim() : "";
+  return started ? `ps:${started}` : null;
+}
+
+/** Writes the tunnel's identity right after spawn, so `stop` can end that process and only that one. */
+export function recordTunnelProcess(file: string, pid: number | undefined, probes: TunnelProbes = defaultTunnelProbes): void {
+  rmSync(file, { force: true });
+  if (pid === undefined) return;
+  const starttime = probes.starttimeOf(pid);
+  if (starttime === null) return;
+  const record: TunnelRecord = { pid, starttime, bootId: probes.bootId() };
+  mkdirSync(dirname(file), { recursive: true });
+  writeFileSync(file, `${JSON.stringify(record)}\n`, { mode: 0o600 });
+}
+
+function readTunnelRecord(file: string): TunnelRecord | null {
+  try {
+    const value = JSON.parse(readFileSync(file, "utf8")) as Partial<TunnelRecord>;
+    if (!Number.isInteger(value.pid) || (value.pid ?? 0) <= 1) return null;
+    if (typeof value.starttime !== "string" || typeof value.bootId !== "string") return null;
+    return { pid: value.pid!, starttime: value.starttime, bootId: value.bootId };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Ends the recorded tunnel: SIGTERM only when the pid still has the recorded
+ * starttime on the recorded boot (a reused pid or a reboot means it is already
+ * gone), then waits for it to exit. The record goes only with the tunnel: it
+ * is removed once the tunnel is stopped or gone, and kept while it still runs
+ * so the next stop can still find it.
+ */
+export function stopRecordedTunnel(
+  file: string,
+  probes: TunnelProbes = defaultTunnelProbes,
+  waitMs = 5_000,
+): { outcome: "none" | "gone" | "stopped" | "still-running"; pid?: number } {
+  const record = readTunnelRecord(file);
+  if (!record) {
+    rmSync(file, { force: true });
+    return { outcome: "none" };
+  }
+  const alive = (): boolean => record.bootId === probes.bootId() && probes.starttimeOf(record.pid) === record.starttime;
+  if (!alive()) {
+    rmSync(file, { force: true });
+    return { outcome: "gone", pid: record.pid };
+  }
+  const term = (): void => {
+    try {
+      probes.signal(record.pid, "SIGTERM");
+    } catch {
+      // Exited between the check and the signal.
+    }
+  };
+  term();
+  for (let waited = 0; waited < waitMs && alive(); waited += 100) {
+    // cloudflared drains open requests for its grace period (30s) after the
+    // first SIGTERM; a second one makes it exit at once.
+    if (waited === 1_000) term();
+    probes.sleepMs(100);
+  }
+  if (alive()) return { outcome: "still-running", pid: record.pid };
+  rmSync(file, { force: true });
+  return { outcome: "stopped", pid: record.pid };
 }
 
 // ──── trace-observe loop: local otelcol-contrib (docker) ────
@@ -2084,7 +2931,7 @@ function cleanupFailedStart(
       .stdout.split("\n").filter(Boolean)) {
       sh("tmux", ["send-keys", "-t", `${e.TMUX_SESSION}:${window}`, "C-c"], { quiet: true });
     }
-    if (sh("tmux", ["kill-session", "-t", e.TMUX_SESSION], { quiet: true }).code === 0) {
+    if (killTmuxSession(e.TMUX_SESSION)) {
       out(`tmux session '${e.TMUX_SESSION}' removed.`);
     } else {
       complete = false;
@@ -2108,7 +2955,7 @@ function cleanupFailedStart(
       out(`Unowned container '${container}' preserved.`);
       continue;
     }
-    if (sh("docker", ["rm", "-f", container], { quiet: true }).code === 0) {
+    if (sh("docker", ["rm", "-fv", container], { quiet: true }).code === 0) {
       out(`Container '${container}' removed.`);
     } else {
       complete = false;
@@ -2217,7 +3064,36 @@ function armStartFailureCleanup(
 
 // ──── start ────
 
-function cmdStart(args: string[]): void {
+/**
+ * What `raftdev preview` adds to `start` (it runs inside the preview's
+ * systemd unit, see cmdPreviewUnit): a forced tunnel that must yield a URL,
+ * the pinned one-hour idle TTL, Docker memory caps, the auto-login rule
+ * (webAutoLoginEnv), a janitor that also enforces the hard deadline, no URL
+ * in the start banner, and a hook that checks the unit and registers the
+ * record while the start failure cleanup is still armed (a failure there
+ * tears the start down). Absent → `start` behaves exactly as before.
+ */
+interface PreviewStartHooks {
+  /** Right after `docker run`/`docker start` of an environment container (staged registration). */
+  containerCreated(name: string): void;
+  /** Right after `docker volume create`. */
+  volumeCreated(name: string): void;
+  /** Right after a recorded process is spawned (cloudflared). */
+  processStarted(role: string, pid: number | undefined): void;
+  /** Right after the tmux session (and so its dedicated server) exists. */
+  tmuxStarted(): void;
+  onRunning(context: PreviewRunningContext): void;
+}
+
+interface PreviewRunningContext {
+  e: Env;
+  url: string;
+  tunnelPid: number | undefined;
+  withAgentRuns: boolean;
+  dockerMemoryCaps: Record<string, string>;
+}
+
+function cmdStart(args: string[], preview?: PreviewStartHooks): void {
   let name = basename(PROJECT_DIR);
   let nameSet = false;
   let previewDescription =
@@ -2231,11 +3107,13 @@ function cmdStart(args: string[]): void {
   // launch N server replicas over one shared Postgres + Redis. Default 1 (the
   // env fallback so CI/scripts can drive it) → byte-for-byte single-replica.
   let replicasRaw: string | undefined = process.env.SLOCKDEV_REPLICAS;
-  // Local RisingWave is default-off. The CLI flag wins only by explicitly
-  // setting the same switch as RAFTDEV_RISINGWAVE=1; an external URL is a
-  // separate mode resolved below and intentionally cannot be combined.
+  // Managed local RisingWave (full) is the default. The CLI flags set the same
+  // switch as RAFTDEV_RISINGWAVE (--no-risingwave = 0, --risingwave = 1); an
+  // external URL is a separate mode resolved below and cannot be combined
+  // with an explicit local profile.
   let risingWaveLocalRaw: string | undefined = process.env.RAFTDEV_RISINGWAVE;
   let withOnboarding = false;
+  let withAgentRuns = false;
   let i = 0;
   while (i < args.length) {
     const a = args[i];
@@ -2260,11 +3138,16 @@ function cmdStart(args: string[]): void {
     } else if (a.startsWith("--replicas=")) {
       replicasRaw = a.slice(a.indexOf("=") + 1); i += 1;
     } else if (a === "--risingwave") {
+      // Compatibility alias: the managed full profile is now the default.
       risingWaveLocalRaw = "1"; i += 1;
+    } else if (a === "--no-risingwave") {
+      risingWaveLocalRaw = "0"; i += 1;
     } else if (a.startsWith("--risingwave=")) {
       risingWaveLocalRaw = a.slice(a.indexOf("=") + 1); i += 1;
     } else if (a === "--with-onboarding") {
       withOnboarding = true; i += 1;
+    } else if (a === "--with-agent-runs") {
+      withAgentRuns = true; i += 1;
     } else if (a === "-h" || a === "--help") {
       usageAndExit();
     } else if (a.startsWith("--")) {
@@ -2291,7 +3174,8 @@ function cmdStart(args: string[]): void {
     );
   } catch (err) {
     out(`ERROR: ${(err as Error).message}`);
-    out("  Use --risingwave[=full|process-only] for managed local, or only RISINGWAVE_DATABASE_URL for external.");
+    out("  Managed local full is the default; use --risingwave=process-only for the pgwire smoke,");
+    out("  --no-risingwave to skip it, or only RISINGWAVE_DATABASE_URL (no local profile) for external.");
     process.exit(1);
   }
   scrubExternalRisingWaveDatabaseUrl(risingWave, process.env);
@@ -2340,7 +3224,11 @@ function cmdStart(args: string[]): void {
   // it empty rather than reading a dead SLOCKDEV_TRACE_WORKER_SECRET env (it
   // would never reach a process — cross-process auth is scope-attestation only).
   const traceWorkerSecret = traceWorker ? `trace-worker-dev-secret-${name}` : "";
-  const idleTtlSeconds = parseIdleTtlSeconds(process.env.SLOCKDEV_IDLE_TTL_SECONDS);
+  // A preview pins the one-hour idle TTL: the cleanup contract accepts no other.
+  const idleTtlSeconds = preview ? PREVIEW_IDLE_TTL_SECONDS : parseIdleTtlSeconds(process.env.SLOCKDEV_IDLE_TTL_SECONDS);
+  if (preview && process.env.SLOCKDEV_IDLE_TTL_SECONDS && Number(process.env.SLOCKDEV_IDLE_TTL_SECONDS) !== PREVIEW_IDLE_TTL_SECONDS) {
+    out(`  NOTE: a preview keeps the ${PREVIEW_IDLE_TTL_SECONDS}s idle TTL; SLOCKDEV_IDLE_TTL_SECONDS is ignored.`);
+  }
   // Cluster mode: number of server replicas to launch. Validated before we
   // touch docker/tmux. 1 → single-replica (unchanged behavior).
   let replicas: number;
@@ -2351,7 +3239,7 @@ function cmdStart(args: string[]): void {
     out("  Examples: --replicas 2   --replicas 3   SLOCKDEV_REPLICAS=2 ./raftdev start");
     process.exit(1);
   }
-  validateStartTooling();
+  validateTooling("start");
   // Validate latency early — malformed values should fail before we touch
   // docker / tmux. Unset → undefined → proxy never spawns, slockdev start
   // is byte-for-byte unchanged.
@@ -2373,6 +3261,9 @@ function cmdStart(args: string[]): void {
     out(`  RisingWave : localhost:${e.RISINGWAVE_PORT} (managed/${risingWave.profile}; dashboard: http://localhost:${e.RISINGWAVE_DASHBOARD_PORT})`);
   } else if (risingWave.mode === "external") {
     out("  RisingWave : external RISINGWAVE_DATABASE_URL (value hidden)");
+  } else {
+    out("  RisingWave : disabled (--no-risingwave)");
+    for (const line of RISINGWAVE_DISABLED_WARNING) out(`  ${line}`);
   }
   out(`  RustFS     : http://localhost:${e.RUSTFS_PORT} (console: http://localhost:${e.RUSTFS_CONSOLE_PORT})`);
   if (replicas > 1) {
@@ -2411,6 +3302,10 @@ function cmdStart(args: string[]): void {
     process.exit(1);
   }
 
+  validateDockerDaemon();
+  // A plain start never inherits an earlier preview's state (its janitor would
+  // otherwise enforce that deadline, and tmux would use that socket).
+  if (!preview) rmSync(previewStateFile(e), { force: true });
   checkPort(e.PG_PORT, "PostgreSQL");
   checkPort(e.RUSTFS_PORT, "RustFS");
   checkPort(e.RUSTFS_CONSOLE_PORT, "RustFS console");
@@ -2528,6 +3423,7 @@ function cmdStart(args: string[]): void {
     risingWaveNetwork: previousRisingWaveState?.mode === "local" &&
       previousRisingWaveState.profile === "full",
   });
+  prepareServiceTmpdir(e);
   const risingWaveFull = risingWaveNeedsBootstrap(risingWave);
   if (risingWaveFull) {
     // Full mode is intentionally ephemeral/destructive. Recreate both database
@@ -2549,7 +3445,7 @@ function cmdStart(args: string[]): void {
           process.exit(1);
         }
         out(`Replacing existing full-profile container ${container}...`);
-        if (sh("docker", ["rm", "-f", container], { quiet: true }).code !== 0) {
+        if (sh("docker", ["rm", "-fv", container], { quiet: true }).code !== 0) {
           updateRisingWaveStatus("failed");
           out(`ERROR: Failed to replace container '${container}'.`);
           process.exit(1);
@@ -2588,9 +3484,14 @@ function cmdStart(args: string[]): void {
   if (dockerNameExists(e.CONTAINER)) {
     out(`Starting existing container ${e.CONTAINER}...`);
     sh("docker", ["start", e.CONTAINER], { quiet: true });
+    preview?.containerCreated(e.CONTAINER);
   } else {
     out(`Creating PostgreSQL container ${e.CONTAINER}...`);
-    const launch = sh("docker", postgresDockerRunArgs(e, risingWaveFull), { quiet: true });
+    const launch = sh("docker", withDockerMemoryCap(
+      postgresDockerRunArgs(e, risingWaveFull),
+      preview ? PREVIEW_DOCKER_MEMORY_CAPS.postgres : undefined,
+    ), { quiet: true });
+    preview?.containerCreated(e.CONTAINER);
     if (launch.code !== 0) {
       updateRisingWaveStatus("failed");
       out(`ERROR: Failed to create PostgreSQL container '${e.CONTAINER}'.`);
@@ -2604,14 +3505,16 @@ function cmdStart(args: string[]): void {
   } else if (dockerNameExists(e.REDIS_CONTAINER)) {
     out(`Starting existing container ${e.REDIS_CONTAINER}...`);
     sh("docker", ["start", e.REDIS_CONTAINER], { quiet: true });
+    preview?.containerCreated(e.REDIS_CONTAINER);
   } else {
     out(`Creating Redis container ${e.REDIS_CONTAINER}...`);
-    sh("docker", [
+    sh("docker", withDockerMemoryCap([
       "run", "-d", "--name", e.REDIS_CONTAINER,
       "--label", RAFTDEV_MANAGED_LABEL_ARG,
       "-p", `${e.REDIS_PORT}:6379`,
       "redis:7-alpine",
-    ], { quiet: true });
+    ], preview ? PREVIEW_DOCKER_MEMORY_CAPS.redis : undefined), { quiet: true });
+    preview?.containerCreated(e.REDIS_CONTAINER);
   }
 
   // Optional RisingWave standalone data plane. The documented Docker shape is
@@ -2636,7 +3539,7 @@ function cmdStart(args: string[]): void {
       // instead of silently retaining stale catalog state or ignoring a new
       // image/port override after an interrupted prior start.
       out(`Replacing existing container ${e.RISINGWAVE_CONTAINER}...`);
-      const removeCode = sh("docker", ["rm", "-f", e.RISINGWAVE_CONTAINER], { quiet: true }).code;
+      const removeCode = sh("docker", ["rm", "-fv", e.RISINGWAVE_CONTAINER], { quiet: true }).code;
       if (removeCode !== 0) {
         updateRisingWaveStatus("failed");
         out(`ERROR: Failed to replace RisingWave container '${e.RISINGWAVE_CONTAINER}'.`);
@@ -2644,6 +3547,12 @@ function cmdStart(args: string[]): void {
         process.exit(1);
       }
     }
+    // Before adding a RisingWave, drop this checkout's ones whose environment
+    // is gone (only here, once the start is really going ahead: a refused
+    // start touches nothing).
+    sweepOrphanRisingWave();
+    const risingWaveConfigFile = join(e.SLOCKDEV_DIR, "risingwave.toml");
+    writeFileSync(risingWaveConfigFile, RISINGWAVE_CONFIG);
     out(`Creating RisingWave standalone container ${e.RISINGWAVE_CONTAINER}...`);
     launchCode = sh(
       "docker",
@@ -2651,9 +3560,15 @@ function cmdStart(args: string[]): void {
         e,
         risingWave.image ?? DEFAULT_RISINGWAVE_IMAGE,
         risingWaveFull ? e.RISINGWAVE_NETWORK : undefined,
+        {
+          owner: raftdevOwner(PROJECT_DIR),
+          memoryBytes: parseRisingWaveMemoryBytes(process.env.RAFTDEV_RW_MEMORY_BYTES),
+          configFile: risingWaveConfigFile,
+        },
       ),
       { quiet: true },
     ).code;
+    preview?.containerCreated(e.RISINGWAVE_CONTAINER);
     if (launchCode !== 0) {
       updateRisingWaveStatus("failed");
       out(`ERROR: Failed to start RisingWave container '${e.RISINGWAVE_CONTAINER}'.`);
@@ -2670,6 +3585,7 @@ function cmdStart(args: string[]): void {
   sh("docker", [
     "volume", "create", "--label", RAFTDEV_MANAGED_LABEL_ARG, e.RUSTFS_VOLUME,
   ], { quiet: true });
+  preview?.volumeCreated(e.RUSTFS_VOLUME);
   sh("docker", [
     "run", "--rm", "-v", `${e.RUSTFS_VOLUME}:/data`,
     "postgres:16-alpine", "sh", "-c", "chown -R 10001:10001 /data",
@@ -2677,9 +3593,10 @@ function cmdStart(args: string[]): void {
   if (dockerNameExists(e.RUSTFS_CONTAINER)) {
     out(`Starting existing container ${e.RUSTFS_CONTAINER}...`);
     sh("docker", ["start", e.RUSTFS_CONTAINER], { quiet: true });
+    preview?.containerCreated(e.RUSTFS_CONTAINER);
   } else {
     out(`Creating RustFS container ${e.RUSTFS_CONTAINER}...`);
-    sh("docker", [
+    sh("docker", withDockerMemoryCap([
       "run", "-d", "--name", e.RUSTFS_CONTAINER,
       "--label", RAFTDEV_MANAGED_LABEL_ARG,
       "-e", "RUSTFS_ADDRESS=:9000",
@@ -2691,19 +3608,21 @@ function cmdStart(args: string[]): void {
       "-v", `${e.RUSTFS_VOLUME}:/data`,
       "mirror.gcr.io/rustfs/rustfs:latest",
       "/data",
-    ], { quiet: true });
+    ], preview ? PREVIEW_DOCKER_MEMORY_CAPS.rustfs : undefined), { quiet: true });
+    preview?.containerCreated(e.RUSTFS_CONTAINER);
   }
 
   out("Waiting for PostgreSQL...");
-  let pgReady = false;
-  for (let n = 1; n <= 30; n++) {
-    const r = sh("docker", ["exec", e.CONTAINER, "pg_isready", "-U", "postgres"], { quiet: true });
-    if (r.code === 0) { pgReady = true; break; }
-    spawnSync("sleep", ["1"]);
-  }
-  if (!pgReady) {
+  const pgReadiness = waitForQueryReady({
+    timeoutMs: POSTGRES_READY_TIMEOUT_MS,
+    probe: () => postgresQueryOnce(e),
+    now: () => Date.now(),
+    sleep: () => { spawnSync("sleep", ["1"]); },
+  });
+  if (!pgReadiness.ready) {
     updateRisingWaveStatus("failed");
-    out("ERROR: PostgreSQL did not become ready in time.");
+    out(`ERROR: PostgreSQL did not answer a read-only query within ${POSTGRES_READY_TIMEOUT_MS / 1000}s.`);
+    printPostgresDiagnostics(e, pgReadiness.lastError);
     process.exit(1);
   }
   out("PostgreSQL is ready.");
@@ -2745,25 +3664,28 @@ function cmdStart(args: string[]): void {
     process.exit(1);
   }
 
-  out("Pushing database schema...");
-  const npxCommand = packageManagerCommand("npx");
-  let r = spawnSync(npxCommand, ["drizzle-kit", "push", "--force"], {
-    cwd: join(PROJECT_DIR, "packages/server"),
-    env: { ...process.env, DATABASE_URL: e.DATABASE_URL },
-    stdio: "inherit",
-    shell: packageManagerSpawnShell(),
-  });
-  if ((r.status ?? 1) !== 0) {
+  if (!migrateDevDatabase(e)) {
     updateRisingWaveStatus("failed");
-    process.exit(r.status ?? 1);
+    process.exit(1);
   }
-  out("Schema is up to date.");
 
   out("Seeding test data...");
-  r = spawnSync(packageManagerCommand("pnpm"), buildDevSeedArgs(e.SEED_FILE, withOnboarding), {
+  if (preview) {
+    // The seed file holds the machine key and (with agent runs) the random
+    // password; create it owner-only so the seed's write keeps that mode.
+    writeFileSync(e.SEED_FILE, "", { mode: 0o600 });
+    chmodSync(e.SEED_FILE, 0o600);
+  }
+  const seedPasswordEnv = Object.fromEntries(previewSeedPasswordEnv({
+    preview: preview !== undefined,
+    withAgentRuns,
+    randomPassword: () => randomBytes(18).toString("base64url"),
+  }));
+  let r = spawnSync(packageManagerCommand("pnpm"), buildDevSeedArgs(e.SEED_FILE, withOnboarding, withAgentRuns), {
     cwd: join(PROJECT_DIR, "packages/server"),
     env: {
       ...process.env,
+      ...seedPasswordEnv,
       DATABASE_URL: e.DATABASE_URL,
       S3_ENDPOINT: e.S3_ENDPOINT,
       S3_REGION: "us-east-1",
@@ -2840,8 +3762,25 @@ function cmdStart(args: string[]): void {
 
   // Start the preview tunnel before constructing server/web commands so OAuth
   // callbacks can default to the public localdev URL instead of localhost.
-  const tunnel = startCloudflaredTunnel(e, (pid) => failureCleanup.trackTunnel(pid));
+  // A tunnel recorded by an earlier start whose tmux session is gone would
+  // lose its record to the new one below: end it first.
+  if (stopRecordedTunnel(e.TUNNEL_STATE_FILE).outcome === "still-running") {
+    out(`ERROR: the tunnel an earlier start opened is still running after SIGTERM; see ${e.TUNNEL_STATE_FILE}.`);
+    process.exit(1);
+  }
+  const tunnel = startCloudflaredTunnel(e, (pid) => {
+    failureCleanup.trackTunnel(pid);
+    recordTunnelProcess(e.TUNNEL_STATE_FILE, pid);
+    preview?.processStarted("cloudflared", pid);
+    if (serviceEnvDir?.dir && pid !== undefined) recordDevEnvProcesses(serviceEnvDir.dir, [{ pid, role: "cloudflared" }], procStarttime);
+  }, preview !== undefined);
   const publicPreviewUrl = tunnel.url;
+  if (preview && !tunnel.url) {
+    updateRisingWaveStatus("failed");
+    out(`ERROR: raftdev preview needs a public tunnel URL; ${tunnel.reason ?? "cloudflared did not report one"}.`);
+    if (tunnel.logFile) out(`  cloudflared log: ${tunnel.logFile}`);
+    process.exit(1);
+  }
 
   const passthrough = (n: string): string => envAssign(n, process.env[n] ?? "");
   const risingWaveServerEnv = risingWaveServerEnvironment(risingWave, process.env);
@@ -2868,6 +3807,12 @@ function cmdStart(args: string[]): void {
     // the dev supplied for the remote worker, if any).
     if (scopeAttestationSecret) serverCmd += `${envAssign("SCOPE_ATTESTATION_SECRET", scopeAttestationSecret)} `;
     serverCmd += `${envAssign("SLOCK_HOME", e.SLOCK_HOME)} `;
+    // Tell every machine attached to this server (including a `raft-computer`
+    // started outside raftdev) to upload traces to this env's worker, not the
+    // production default. Daemons accept it only for loopback or the
+    // production host (packages/daemon/src/traceUploadUrl.ts), so a remote
+    // point-anywhere URL still needs the daemon's own env (set below).
+    if (effectiveWorkerUrl) serverCmd += `${envAssign("SLOCK_MACHINE_TRACE_UPLOAD_URL", effectiveWorkerUrl)} `;
     serverCmd += `${envAssign("SLOCKDEV_LAST_ACTIVITY_FILE", e.ACTIVITY_FILE)} `;
     serverCmd += `${envAssign("DEPLOYMENT_ENV", "slockdev")} `;
     serverCmd += `${envAssign("DATABASE_URL", e.DATABASE_URL)} `;
@@ -2879,6 +3824,12 @@ function cmdStart(args: string[]): void {
     // enables the device-code login surface + the >=32-char bootstrap
     // pepper device-auth requires, so `raft-computer login/attach/start`
     // works against this env with no manual slockdev edits.
+    // #proj-assistant:#24 — opt-in: `RAFTDEV_ASSISTANT_WITHOUT_RUNTIME=1` shows the
+    // seeded personal assistant (its otter, its DM) with no hosted runtime
+    // behind it (assistantService.assistantWithoutRuntimeForPreview).
+    if (process.env.RAFTDEV_ASSISTANT_WITHOUT_RUNTIME === "1") {
+      serverCmd += `${envAssign("RAFTDEV_ASSISTANT_WITHOUT_RUNTIME", "1")} `;
+    }
     if (process.env.RAFTDEV_COMPUTER && process.env.RAFTDEV_COMPUTER !== "0") {
       serverCmd += `${envAssign("SLOCK_DEVICE_LOGIN_ENABLED", "true")} `;
       serverCmd += `${envAssign("AGENT_BOOTSTRAP_TOKEN_PEPPER", `raftdev-computer-pepper-${name}-0123456789abcdef`)} `;
@@ -2945,6 +3896,7 @@ function cmdStart(args: string[]): void {
     ["new-session", "-d", "-s", e.TMUX_SESSION, "-n", replicaWindowName(1), "-c", PROJECT_DIR, runTmuxShellCommand(buildServerCmd(1))],
     replicaWindowName(1),
   );
+  preview?.tmuxStarted();
   // Extra replica windows (server-2 … server-N), each on its own derived
   // server + metrics port, all over the same Postgres + Redis.
   for (let k = 2; k <= replicas; k++) {
@@ -2967,19 +3919,21 @@ function cmdStart(args: string[]): void {
   webCmd += `${envAssign("VITE_DEPLOYMENT_ENV", "slockdev")} `;
   webCmd += `${envAssign("VITE_SLOCKDEV_ENV_NAME", name)} `;
   webCmd += `${envAssign("VITE_SLOCKDEV_PREVIEW_DESCRIPTION", previewDescription)} `;
-  // Opt-in: skip the slockdev auto-login into dev@slock.ai so a preview can
-  // exercise the genuinely-fresh unauthenticated entry (signup / onboarding
-  // rework). Baked inline (not tmux-env-inherited) for the same reason the
-  // server flags are — new tmux windows do not inherit the launching shell's
-  // env. Unset → not added → auto-login behaves exactly as before.
-  if (process.env.VITE_SLOCKDEV_SKIP_AUTO_LOGIN) {
-    webCmd += `${envAssign("VITE_SLOCKDEV_SKIP_AUTO_LOGIN", process.env.VITE_SLOCKDEV_SKIP_AUTO_LOGIN)} `;
-  }
-  // Preview acceptance can bind one environment to a seeded owner/admin/member
-  // account. This stays slockdev-only and keeps each public role URL
-  // passwordless without introducing a product-side account impersonation UI.
-  if (process.env.VITE_SLOCKDEV_EMAIL) {
-    webCmd += `${envAssign("VITE_SLOCKDEV_EMAIL", process.env.VITE_SLOCKDEV_EMAIL)} `;
+  // Opt-in VITE_SLOCKDEV_SKIP_AUTO_LOGIN skips the slockdev auto-login into
+  // dev@slock.ai so a preview can exercise the genuinely-fresh unauthenticated
+  // entry (signup / onboarding rework). VITE_SLOCKDEV_EMAIL binds one
+  // environment to a seeded owner/admin/member account, keeping each public
+  // role URL passwordless without a product-side impersonation UI. Both are
+  // baked inline (not tmux-env-inherited) for the same reason the server flags
+  // are — new tmux windows do not inherit the launching shell's env. Unset →
+  // not added → auto-login behaves exactly as before. A preview with agent
+  // runs always skips auto-login (hard rule: see webAutoLoginEnv).
+  for (const [key, value] of webAutoLoginEnv({
+    preview: preview !== undefined,
+    withAgentRuns,
+    env: process.env,
+  })) {
+    webCmd += `${envAssign(key, value)} `;
   }
   // Point the web Report Issue export at whichever worker is in play (local or
   // remote), mirroring the daemon. Empty when no worker (SLOCKDEV_TRACE_WORKER=0).
@@ -2992,13 +3946,15 @@ function cmdStart(args: string[]): void {
   // tracing-link verification; mirrors xxchan's prod-side wiring done earlier
   // in the same investigation (#proj-frontend:0485c3a7 daily report).
   if (effectiveWorkerUrl) webCmd += `${envAssign("VITE_WEB_TRACE_URL", effectiveWorkerUrl)} `;
-  webCmd += "pnpm --filter @botiverse/raft-web dev";
   runRequiredTmux(
-    ["new-window", "-t", e.TMUX_SESSION, "-n", "web", "-c", PROJECT_DIR, runTmuxShellCommand(webCmd)],
+    ["new-window", "-t", e.TMUX_SESSION, "-n", "web", "-c", PROJECT_DIR, runTmuxShellCommand(webWindowCommand(webCmd))],
     "web",
   );
 
-  // Window 2: daemon
+  // Window 2: daemon. A preview without --with-agent-runs has none: its URL
+  // is passwordless, so nothing behind it may run agents on this machine's
+  // model credentials.
+  const startDaemon = shouldStartDaemonWindow({ preview: preview !== undefined, withAgentRuns });
   let daemonCmd = "";
   // Point the daemon at whichever worker is in play. For a local worker this is
   // the derived localhost URL; for point-anywhere it is the remote URL the dev
@@ -3017,10 +3973,14 @@ function cmdStart(args: string[]): void {
   }
   daemonCmd += `${envAssign("SLOCK_HOME", e.SLOCK_HOME)} `;
   daemonCmd += `pnpm --filter @botiverse/raft-daemon dev -- --server-url ${shellQuote(`http://localhost:${e.SERVER_PORT}`)} --api-key-file ${shellQuote(machineApiKeyFile)}`;
-  runRequiredTmux(
-    ["new-window", "-t", e.TMUX_SESSION, "-n", "daemon", "-c", PROJECT_DIR, runTmuxShellCommand(daemonCmd)],
-    "daemon",
-  );
+  if (startDaemon) {
+    runRequiredTmux(
+      ["new-window", "-t", e.TMUX_SESSION, "-n", "daemon", "-c", PROJECT_DIR, runTmuxShellCommand(daemonCmd)],
+      "daemon",
+    );
+  } else {
+    out("  Daemon: not started (preview without --with-agent-runs; no agent runs on this machine).");
+  }
 
   if (traceWorker) {
     let twCmd = "";
@@ -3071,6 +4031,9 @@ function cmdStart(args: string[]): void {
       `docker rm -f ${shellQuote(e.OTELCOL_CONTAINER)} >/dev/null 2>&1; ` +
       `exec docker run --rm --name ${shellQuote(e.OTELCOL_CONTAINER)} ` +
       `--label ${shellQuote(RAFTDEV_MANAGED_LABEL_ARG)} ` +
+      (preview
+        ? `--memory ${PREVIEW_DOCKER_MEMORY_CAPS.otelcol} --memory-swap ${PREVIEW_DOCKER_MEMORY_CAPS.otelcol} `
+        : "") +
       `-p 127.0.0.1:${e.OTELCOL_GRPC_PORT}:4317 ` +
       `-p 127.0.0.1:${e.OTELCOL_HTTP_PORT}:4318 ` +
       `-v ${shellQuote(`${otelcolConfigPath}:${OTELCOL_CONTAINER_CONFIG}`)} ` +
@@ -3090,6 +4053,8 @@ function cmdStart(args: string[]): void {
         spawnSync("sleep", ["0.25"]);
       }
     }
+    // tmux starts this container asynchronously; record it once it exists.
+    preview?.containerCreated(e.OTELCOL_CONTAINER);
     updateTraceReaderStatus(otelcolStarted ? "ready" : "failed");
   }
 
@@ -3107,7 +4072,7 @@ function cmdStart(args: string[]): void {
     );
   }
 
-  if (idleTtlSeconds > 0) {
+  if (idleTtlSeconds > 0 || preview) {
     const janitorCmd = `node --import @oxc-node/core/register scripts/dev/raftdev.ts janitor ${shellQuote(name)} ${String(idleTtlSeconds)}`;
     runRequiredTmux(
       ["new-window", "-t", e.TMUX_SESSION, "-n", "janitor", "-c", PROJECT_DIR, runTmuxShellCommand(janitorCmd)],
@@ -3116,6 +4081,11 @@ function cmdStart(args: string[]): void {
   }
 
   sh("tmux", ["select-window", "-t", `${e.TMUX_SESSION}:server`], { quiet: true });
+  if (serviceEnvDir?.dir) {
+    const panes = sh("tmux", ["list-panes", "-s", "-t", e.TMUX_SESSION, "-F", "#{pane_pid}"], { quiet: true });
+    const panePids = panes.stdout.split("\n").filter((l) => /^\d+$/.test(l)).map((l) => ({ pid: Number(l), role: "tmux-pane" }));
+    recordDevEnvProcesses(serviceEnvDir.dir, panePids, procStarttime);
+  }
 
   out("");
   out(`=== Environment '${name}' is running ===`);
@@ -3174,13 +4144,19 @@ function cmdStart(args: string[]): void {
   } else if (risingWave.mode === "external") {
     out("  RisingWave: external/unmanaged RISINGWAVE_DATABASE_URL (value hidden)");
     out("              raftdev stop/nuke will not modify the external instance");
+  } else {
+    out("  RisingWave: disabled (--no-risingwave)");
+    for (const line of RISINGWAVE_DISABLED_WARNING) out(`  ${line}`);
   }
   out(`  RustFS:    ${e.S3_ENDPOINT} (bucket: ${e.RUSTFS_BUCKET})`);
-  out(`  Login:     dev@slock.ai / password123`);
+  if (!(preview && withAgentRuns)) out(`  Login:     dev@slock.ai / password123`);
   out(idleTtlSeconds > 0
     ? `  Auto-stop: after ${idleTtlSeconds}s idle (last activity ${e.ACTIVITY_FILE})`
     : "  Auto-stop: disabled");
-  if (tunnel.enabled && tunnel.url) {
+  if (preview && tunnel.url) {
+    // The URL is published only after the unit check (cmdPreviewUnit).
+    out(`  CF Tunnel: opened (cloudflared pid ${tunnel.pid}); URL follows once the unit check passes`);
+  } else if (tunnel.enabled && tunnel.url) {
     out(`  CF Tunnel: ${tunnel.url} (cloudflared pid ${tunnel.pid}, log ${tunnel.logFile})`);
   } else if (tunnel.enabled) {
     out(`  CF Tunnel: started (pid ${tunnel.pid}) — URL not yet visible; see ${tunnel.logFile}`);
@@ -3193,35 +4169,907 @@ function cmdStart(args: string[]): void {
   }
   out("");
   out(`  Attach:    ./raftdev logs ${name}`);
-  out(`  Stop:      ./raftdev stop ${name}`);
+  out(preview ? `  Stop:      ./raftdev preview stop ${name}` : `  Stop:      ./raftdev stop ${name}`);
   out(`  Creds:     ${e.SEED_FILE}`);
+  if (preview) {
+    const dockerMemoryCaps: Record<string, string> = { ...PREVIEW_DOCKER_MEMORY_CAPS };
+    if (risingWave.mode === "local") {
+      dockerMemoryCaps.risingwave = String(
+        parseRisingWaveMemoryBytes(process.env.RAFTDEV_RW_MEMORY_BYTES) + RISINGWAVE_DOCKER_HEADROOM_BYTES,
+      );
+    }
+    preview.onRunning({ e, url: tunnel.url!, tunnelPid: tunnel.pid, withAgentRuns, dockerMemoryCaps });
+  }
   failureCleanup.disarm();
+}
+
+/**
+ * The plain janitor's stop. The janitor runs in a window of the tmux session
+ * that `stop` sends C-c to and then kills, so running `stop` in-process ended
+ * the janitor partway through: tmux, containers and volumes kept running.
+ * Like the preview's stop unit, it runs as its own process instead, in a new
+ * session (detached) with its output in .slockdev/<name>/janitor-stop.log
+ * (latest stop only; it ends in "Done." on success), so neither the C-c nor
+ * the session's hangup reaches it.
+ */
+export function janitorStopCommand(options: {
+  nodePath: string;
+  raftdevScript: string;
+  name: string;
+}): { command: string; args: string[] } {
+  return {
+    command: options.nodePath,
+    args: ["--import", "@oxc-node/core/register", options.raftdevScript, "stop", options.name],
+  };
+}
+
+function launchJanitorStop(e: Env): void {
+  const logFile = join(e.SLOCKDEV_DIR, "janitor-stop.log");
+  let logFd: number | null = null;
+  try {
+    mkdirSync(e.SLOCKDEV_DIR, { recursive: true });
+    logFd = openSync(logFile, "w");
+  } catch (err) {
+    // No log is better than no stop.
+    out(`[raftdev] cannot write ${logFile} (${(err as Error).message}); the stop runs without a log.`);
+  }
+  const { command, args } = janitorStopCommand({
+    nodePath: process.execPath,
+    raftdevScript: join(PROJECT_DIR, "scripts/dev/raftdev.ts"),
+    name: e.name,
+  });
+  const output = logFd ?? "ignore";
+  const child = spawn(command, args, {
+    cwd: PROJECT_DIR, env: process.env, detached: true, stdio: ["ignore", output, output],
+  });
+  child.on("error", (err) => out(`[raftdev] could not start the stop: ${err.message}; run ./raftdev stop ${e.name}`));
+  child.unref();
+  if (logFd !== null) {
+    try { closeSync(logFd); } catch {}
+  }
+  if (child.pid === undefined) return;
+  out(`[raftdev] stop started outside tmux (pid ${child.pid})${logFd !== null ? `; log: ${logFile}` : ""}`);
 }
 
 function cmdJanitor(name: string, ttlSecondsArg: string | undefined): void {
   const e = setupEnv(name);
   const ttlSeconds = parseIdleTtlSeconds(ttlSecondsArg);
-  if (ttlSeconds <= 0) return;
-  out(`[raftdev] janitor watching '${name}' (idle TTL ${ttlSeconds}s)`);
+  const previewState = readPreviewState(e);
+  if (ttlSeconds <= 0 && !previewState) return;
+  out(ttlSeconds > 0
+    ? `[raftdev] janitor watching '${name}' (idle TTL ${ttlSeconds}s)`
+    : `[raftdev] janitor watching '${name}' (idle TTL disabled)`);
+  const deadlineAtSeconds = previewState ? Math.floor(Date.parse(previewState.deadlineAt) / 1000) : null;
+  if (previewState) out(`[raftdev] preview ${previewState.id} hard deadline ${previewState.deadlineAt}`);
   while (true) {
+    // Also stop any other environment's RisingWave left running after it died.
+    sweepOrphanRisingWave();
     const now = Math.floor(Date.now() / 1000);
     const lastActivity = readIntegerFile(e.ACTIVITY_FILE) ?? now;
-    const idleSeconds = now - lastActivity;
-    if (idleSeconds >= ttlSeconds) {
-      out(`[raftdev] '${name}' idle for ${idleSeconds}s; auto-stopping environment.`);
-      cmdStop(name);
+    const decision = janitorDecision({
+      nowSeconds: now,
+      lastActivitySeconds: lastActivity,
+      idleTtlSeconds: ttlSeconds,
+      deadlineAtSeconds,
+    });
+    if (decision.action === "stop") {
+      out(decision.reason === "deadline"
+        ? `[raftdev] '${name}' reached its preview deadline; auto-stopping environment.`
+        : `[raftdev] '${name}' idle for ${decision.idleSeconds}s; auto-stopping environment.`);
+      if (previewState) {
+        launchPreviewStopUnit(previewState, decision.reason);
+      } else {
+        launchJanitorStop(e);
+      }
       return;
     }
-    const remaining = Math.max(1, ttlSeconds - idleSeconds);
-    spawnSync("sleep", [String(Math.min(60, remaining))]);
+    spawnSync("sleep", [String(decision.sleepSeconds)]);
   }
+}
+
+// ──── raftdev preview: reviewer environments (scripts/dev/raftdev-preview.ts) ────
+//
+// `./raftdev preview <name>` (the launcher, in the caller's shell) checks the
+// host, schedules the owner's reminder, then starts `__preview-unit` as the
+// systemd user unit raft-preview-<id>.service (MemoryMax, RuntimeMaxSec =
+// deadline, KillMode=control-group). Inside the unit, cmdPreviewUnit runs
+// `start` with preview hooks on a dedicated tmux socket and an invalid session
+// bus, so tmux, server, vite and cloudflared all stay in the unit's cgroup;
+// it checks that, registers the record through IT's raft-preview-cleaner, and
+// on stop (RuntimeMaxSec, systemctl stop, or the cleaner) tears down with
+// cmdStop. `preview stop` asks the cleaner for its verified stop.
+
+function previewStateFile(e: Env): string {
+  return join(e.SLOCKDEV_DIR, "preview.json");
+}
+function previewSpecFile(e: Env): string {
+  return join(e.SLOCKDEV_DIR, "preview-unit-spec.json");
+}
+function previewLogFile(e: Env): string {
+  return join(e.SLOCKDEV_DIR, "preview-unit.log");
+}
+function previewLaunchFile(e: Env): string {
+  return join(e.SLOCKDEV_DIR, "preview-launch.json");
+}
+
+function readPreviewStateFile(path: string): PreviewState | null {
+  try {
+    return parsePreviewState(readFileSync(path, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function readPreviewState(e: Env): PreviewState | null {
+  return readPreviewStateFile(previewStateFile(e));
+}
+
+/**
+ * `-L raft-preview-<id>` for a tmux call that addresses a preview's session
+ * (`slock-<name>` with a preview state in this checkout), else nothing: the
+ * default socket and plain environments are unchanged. A dedicated socket
+ * makes the preview's tmux server a child of its unit instead of joining the
+ * user's existing server outside it.
+ */
+function previewTmuxSocketArgs(args: readonly string[]): string[] {
+  const session = tmuxSessionFromArgs(args);
+  if (!session?.startsWith("slock-")) return [];
+  const name = session.slice("slock-".length);
+  if (!ENVIRONMENT_NAME_RE.test(name) || name === "." || name === "..") return [];
+  const state = readPreviewStateFile(join(PROJECT_DIR, ".slockdev", name, "preview.json"));
+  return state ? ["-L", state.tmuxSocket] : [];
+}
+
+const runCommand: CommandRunner = (command, args) => sh(command, args, { quiet: true });
+
+/**
+ * The environment for systemctl/systemd-run: inside a preview unit the
+ * job-local invalid bus address is dropped so they reach the user manager
+ * through $XDG_RUNTIME_DIR (set to the uid default when missing).
+ */
+function hostBusEnv(): NodeJS.ProcessEnv {
+  const env = { ...process.env };
+  if (env.DBUS_SESSION_BUS_ADDRESS === PREVIEW_INVALID_DBUS_ADDRESS) delete env.DBUS_SESSION_BUS_ADDRESS;
+  if (!env.XDG_RUNTIME_DIR && typeof process.getuid === "function") env.XDG_RUNTIME_DIR = `/run/user/${process.getuid()}`;
+  return env;
+}
+
+function procStarttime(pid: number): string | null {
+  return liveStarttime(readProcStat(pid));
+}
+
+function currentBootId(): string {
+  try {
+    return readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
+  } catch {
+    return "";
+  }
+}
+
+function procCgroup(pid: number | "self"): string | null {
+  try {
+    return readFileSync(`/proc/${pid}/cgroup`, "utf8");
+  } catch {
+    return null;
+  }
+}
+
+function procParentTable(): Map<number, number> {
+  const table = new Map<number, number>();
+  let entries: string[] = [];
+  try { entries = readdirSync("/proc"); } catch { return table; }
+  for (const entry of entries) {
+    if (!/^\d+$/.test(entry)) continue;
+    const stat = readProcStat(Number(entry));
+    if (stat) table.set(Number(entry), stat.ppid);
+  }
+  return table;
+}
+
+function listenerPids(port: number): number[] {
+  return sh("lsof", ["-nP", `-iTCP:${port}`, "-sTCP:LISTEN", "-t"], { quiet: true }).stdout
+    .split("\n").map((line) => Number(line.trim())).filter((pid) => Number.isInteger(pid) && pid > 1);
+}
+
+/** systemd's view of a unit: gone (not loaded, inactive or failed), present, or unknown. */
+function unitState(unitName: string, env: NodeJS.ProcessEnv): { state: "present" | "gone" | "unknown"; invocationId: string } {
+  const result = sh("systemctl", ["--user", "show", unitName, "-p", "LoadState", "-p", "ActiveState", "-p", "InvocationID"], {
+    quiet: true,
+    env,
+  });
+  const values = new Map(result.stdout.split("\n").filter((line) => line.includes("=")).map((line) => {
+    const eq = line.indexOf("=");
+    return [line.slice(0, eq), line.slice(eq + 1).trim()] as const;
+  }));
+  if (values.get("LoadState") === "not-found") return { state: "gone", invocationId: "" };
+  if (result.code !== 0) return { state: "unknown", invocationId: "" };
+  const active = values.get("ActiveState") ?? "";
+  return {
+    state: active === "inactive" || active === "failed" ? "gone" : "present",
+    invocationId: values.get("InvocationID") ?? "",
+  };
+}
+
+/**
+ * The processes a preview owns, by pid + starttime: its tmux server
+ * (dedicated socket), each pane and the pane's descendants at record time,
+ * the server and web listeners, and cloudflared.
+ */
+function collectPreviewProcesses(e: Env, tunnelPid: number | undefined): PreviewProcess[] {
+  const byPid = new Map<number, PreviewProcess>();
+  const add = (pid: number, role: string, override = false): void => {
+    if (!Number.isInteger(pid) || pid <= 1) return;
+    const starttime = procStarttime(pid);
+    if (starttime === null) return;
+    if (override || !byPid.has(pid)) byPid.set(pid, { pid, starttime, role });
+  };
+  const serverPid = Number(sh("tmux", ["display-message", "-p", "-t", e.TMUX_SESSION, "#{pid}"], { quiet: true }).stdout.trim());
+  add(serverPid, "tmux-server", true);
+  const parents = procParentTable();
+  const panes = sh("tmux", ["list-panes", "-s", "-t", e.TMUX_SESSION, "-F", "#{window_name}\t#{pane_pid}"], { quiet: true })
+    .stdout.split("\n").map((line) => line.split("\t")).filter((parts) => parts.length === 2);
+  for (const [window, pidText] of panes) {
+    const panePid = Number(pidText);
+    add(panePid, `tmux:${window}`);
+    for (const child of descendantPids([panePid], parents)) add(child, `tmux:${window}:child`);
+  }
+  for (const pid of listenerPids(e.SERVER_PORT)) add(pid, "server", true);
+  for (const pid of listenerPids(e.WEB_PORT)) add(pid, "vite", true);
+  if (tunnelPid !== undefined) add(tunnelPid, "cloudflared", true);
+  // The contract takes at most 256 identities: named roles first, then pane
+  // descendants.
+  return [...byPid.values()]
+    .sort((a, b) => Number(a.role.endsWith(":child")) - Number(b.role.endsWith(":child")))
+    .slice(0, 256);
+}
+
+function inspectPreviewContainer(name: string): ContainerInspection {
+  return parseContainerInspect(
+    sh("docker", ["container", "inspect", "--format", "{{.Id}}\t{{json .Mounts}}", name], { quiet: true }),
+  );
+}
+
+/**
+ * Full container ids and their `volume` mounts (anonymous included) of this
+ * environment's containers. A failed Docker query is an error, never "no
+ * such container": the caller must not publish an incomplete list.
+ */
+function collectPreviewDocker(e: Env): { containerIds: string[]; volumeNames: string[]; errors: string[] } {
+  const containerIds: string[] = [];
+  const volumeNames: string[] = [];
+  const errors: string[] = [];
+  for (const name of [e.CONTAINER, e.REDIS_CONTAINER, e.RUSTFS_CONTAINER, e.OTELCOL_CONTAINER, e.RISINGWAVE_CONTAINER]) {
+    const inspection = inspectPreviewContainer(name);
+    if (inspection.state === "unknown") errors.push(`${name}: ${inspection.error}`);
+    if (inspection.state !== "present") continue;
+    containerIds.push(inspection.id);
+    volumeNames.push(...inspection.volumeNames);
+  }
+  return { containerIds, volumeNames, errors };
+}
+
+function gitValue(args: string[]): string {
+  const result = sh("git", args, { quiet: true, cwd: PROJECT_DIR });
+  return result.code === 0 ? result.stdout.trim() : "unknown";
+}
+
+function previewCleanerInstalled(): boolean {
+  return existsSync(PREVIEW_CLEANER_PATH);
+}
+
+const PREVIEW_CLEANER_MISSING = [
+  `ERROR: IT's preview helper is not installed (${PREVIEW_CLEANER_PATH}). It is the only record writer`,
+  "  (locked register) and the verified stop. Ask IT to install raft-preview-cleaner and its user timer",
+  "  (~/.config/systemd/user/raft-preview-cleaner.{service,timer}) on this host for this Unix user.",
+];
+
+function readCleanerEnvText(): string | null {
+  try {
+    return readFileSync(previewCleanerEnvFile(homedir()), "utf8");
+  } catch {
+    return null;
+  }
+}
+
+/** The registry, resolved the way raft-preview-cleaner resolves it (env, then its env file, then XDG). */
+function resolvePreviewRegistry(): string {
+  return previewRegistryDir(process.env, homedir(), readCleanerEnvText());
+}
+
+
+function cmdPreview(args: string[]): number | void {
+  const sub = args[0];
+  if (sub === "stop") return cmdPreviewStop(args.slice(1));
+  if (sub === "list") return cmdPreviewList(args.slice(1));
+  if (sub === undefined || sub === "-h" || sub === "--help") usageAndExit();
+
+  let parsed: PreviewStartArgs;
+  try {
+    parsed = parsePreviewStartArgs(args);
+    validateEnvironmentName(parsed.name);
+  } catch (error) {
+    out(`ERROR: ${(error as Error).message}`);
+    return 1;
+  }
+  const fail = (lines: string[]): number => {
+    for (const line of lines) out(line);
+    out("No containers or local processes were started.");
+    return 1;
+  };
+  if (!existsSync("/proc/self/stat") || !existsSync("/proc/sys/kernel/random/boot_id")) {
+    return fail(["ERROR: raftdev preview records processes by /proc identity and needs Linux."]);
+  }
+  if (!commandExists("systemd-run") || !commandExists("systemctl")) {
+    return fail(["ERROR: raftdev preview runs as a systemd user unit; systemd-run/systemctl are not on PATH."]);
+  }
+  if (!detectCloudflared()) {
+    return fail([
+      "ERROR: raftdev preview needs cloudflared on PATH for its public tunnel.",
+      "  Install it (e.g. `brew install cloudflare/cloudflare/cloudflared` or the Cloudflare .deb), then retry.",
+    ]);
+  }
+  if (!previewCleanerInstalled()) return fail(PREVIEW_CLEANER_MISSING);
+  const owner = previewOwner(process.env);
+  if (!owner.agentId) {
+    return fail(["ERROR: raftdev preview needs the owning agent's id (SLOCK_AGENT_ID) for its record."]);
+  }
+  const registryDir = resolvePreviewRegistry();
+  const timerRegistry = previewRegistryDir({ XDG_STATE_HOME: process.env.XDG_STATE_HOME }, homedir(), readCleanerEnvText());
+  if (registryDir !== timerRegistry) {
+    out(`WARNING: RAFT_PREVIEW_REGISTRY=${registryDir} is not what the cleanup timer reads (${timerRegistry}).`);
+    out(`  The timer follows an override only through ${previewCleanerEnvFile(homedir())}: one line RAFT_PREVIEW_REGISTRY=${registryDir}`);
+  }
+  const sameName = listPreviewRecords(registryDir)
+    .flatMap((entry) => (entry.record && entry.record.name === parsed.name && entry.record.repo === PROJECT_DIR ? [entry.record] : []));
+  if (sameName.length > 0) {
+    return fail([
+      `ERROR: preview '${parsed.name}' is already recorded (${sameName.map((r) => r.id).join(", ")}).`,
+      `  Stop it first: ./raftdev preview stop ${parsed.name}`,
+    ]);
+  }
+  const dockerRefusal = previewDockerEndpointRefusal(process.env);
+  if (dockerRefusal) return fail(dockerRefusal);
+  const e = setupEnv(parsed.name);
+  const previous = readPreviewState(e);
+  if (
+    previous &&
+    !existsSync(previewRecordPath(previous.registryDir, previous.id)) &&
+    unitState(previewUnitName(previous.id), process.env).state === "gone"
+  ) {
+    // A launch that died before registering: nothing runs and nothing is recorded.
+    rmSync(previewStateFile(e), { force: true });
+  }
+  if (spawnSync("tmux", ["has-session", "-t", e.TMUX_SESSION], { stdio: "ignore" }).status === 0 || readPreviewState(e)) {
+    return fail([
+      `ERROR: environment '${parsed.name}' already has a tmux session or preview state.`,
+      `  Stop it first (./raftdev stop ${parsed.name} or ./raftdev preview stop ${parsed.name}), or pick another name.`,
+    ]);
+  }
+  // A preview never adopts resources it did not create (contract): `start`
+  // would otherwise reuse a leftover database with its old accounts,
+  // sessions and refresh tokens (the seed's password reset is only defence
+  // in depth). A Docker query failure refuses too.
+  const adoption = previewAdoptionRefusal(parsed.name, [
+    ...[e.CONTAINER, e.REDIS_CONTAINER, e.RUSTFS_CONTAINER, e.OTELCOL_CONTAINER, e.RISINGWAVE_CONTAINER].map((container) => ({
+      kind: "container" as const,
+      name: container,
+      state: dockerInspectState(sh("docker", ["container", "inspect", container], { quiet: true })),
+    })),
+    {
+      kind: "volume" as const,
+      name: e.RUSTFS_VOLUME,
+      state: dockerInspectState(sh("docker", ["volume", "inspect", e.RUSTFS_VOLUME], { quiet: true })),
+    },
+  ]);
+  if (adoption) return fail(adoption);
+
+
+  const id = randomUUID();
+  const unitName = previewUnitName(id);
+  const createdAt = new Date();
+  const deadlineAt = new Date(createdAt.getTime() + parsed.forSeconds * 1000);
+  out(`=== raftdev preview '${parsed.name}' (${id}) ===`);
+  out(`  Deadline:  ${isoSeconds(deadlineAt)} UTC (${formatDuration(parsed.forSeconds)})`);
+  out(`  Unit:      ${unitName} (profile ${parsed.resources.profile}, MemoryMax ${parsed.resources.memoryMax})`);
+
+  let reminderId: string | null = null;
+  if (parsed.notify) {
+    if (commandExists("raft")) {
+      const scheduled = schedulePreviewReminder({ id, name: parsed.name, deadlineAt, notify: parsed.notify }, runCommand);
+      reminderId = scheduled.reminderId;
+      if (scheduled.warning) out(`  WARNING: ${scheduled.warning}`);
+    } else {
+      out("  WARNING: `raft` CLI not on PATH; no owner reminder scheduled.");
+    }
+    if (reminderId) out(`  Reminder:  #${reminderId} at deadline + 10m in ${parsed.notify.target}`);
+  }
+
+  mkdirSync(e.SLOCKDEV_DIR, { recursive: true });
+  const state: PreviewState = {
+    schemaVersion: 1,
+    id,
+    deadlineAt: isoSeconds(deadlineAt),
+    registryDir,
+    tmuxSocket: previewTmuxSocket(id),
+  };
+  writeFileSync(previewStateFile(e), JSON.stringify(state) + "\n");
+  const spec: PreviewUnitSpec = {
+    schemaVersion: 1,
+    id,
+    name: parsed.name,
+    startArgs: parsed.startArgs,
+    withAgentRuns: parsed.withAgentRuns,
+    createdAt: isoSeconds(createdAt),
+    deadlineAt: isoSeconds(deadlineAt),
+    registryDir,
+    resources: parsed.resources,
+    owner,
+    notify: parsed.notify,
+    reminderId,
+    env: previewUnitEnv(process.env, { withAgentRuns: parsed.withAgentRuns }),
+  };
+  writeFileSync(previewSpecFile(e), JSON.stringify(spec), { mode: 0o600 });
+  chmodSync(previewSpecFile(e), 0o600);
+  // The unit's log carries the preview's login block (with --with-agent-runs,
+  // the random seed password): owner-only. systemd appends to it in place.
+  writeFileSync(previewLogFile(e), "", { mode: 0o600 });
+  chmodSync(previewLogFile(e), 0o600);
+  rmSync(previewLaunchFile(e), { force: true });
+
+  let offset = 0;
+  const flushLog = (): void => {
+    try {
+      const text = readFileSync(previewLogFile(e), "utf8");
+      if (text.length > offset) {
+        process.stdout.write(text.slice(offset));
+        offset = text.length;
+      }
+    } catch {}
+  };
+  const abandon = (lines: string[]): number => {
+    flushLog();
+    for (const line of lines) out(line);
+    rmSync(previewSpecFile(e), { force: true });
+    if (existsSync(previewRecordPath(registryDir, id))) {
+      // The unit registered (at least the provisional record): let the
+      // cleaner stop it and verify every recorded resource, as for any stop.
+      const stop = sh(PREVIEW_CLEANER_PATH, ["--registry", registryDir, "stop", id], { quiet: true, env: hostBusEnv() });
+      const result = parseCleanerStopOutput(stop.stdout);
+      if (stop.code !== 0 || (result.outcome !== "cleaned" && result.outcome !== "absent")) {
+        out(`  Cleanup of ${id} is not verified (${result.outcome}); the record and the reminder are kept:`);
+        for (const line of result.detail) out(line);
+        out(`  Retry: ./raftdev preview stop ${id}`);
+        return 1;
+      }
+      out(`  Cleanup of ${id} verified by raft-preview-cleaner.`);
+    } else {
+      sh("systemctl", ["--user", "stop", unitName], { quiet: true });
+    }
+    const cancelled = cancelPreviewReminder(reminderId, runCommand);
+    if (cancelled.attempted && !cancelled.ok) out(`  WARNING: ${cancelled.message}`);
+    rmSync(previewStateFile(e), { force: true });
+    return 1;
+  };
+
+  const runtimeMaxSeconds = Math.max(1, Math.ceil((deadlineAt.getTime() - Date.now()) / 1000));
+  const launch = sh("systemd-run", previewSystemdRunArgs({
+    id,
+    memoryMax: parsed.resources.memoryMax,
+    runtimeMaxSeconds,
+    workingDirectory: PROJECT_DIR,
+    logFile: previewLogFile(e),
+    command: [
+      process.execPath, "--import", "@oxc-node/core/register", join(PROJECT_DIR, "scripts/dev/raftdev.ts"),
+      "__preview-unit", previewSpecFile(e),
+    ],
+  }), { quiet: true });
+  if (launch.code !== 0) {
+    return abandon([`ERROR: systemd-run failed (exit ${launch.code}): ${launch.stderr.trim().split("\n")[0] ?? ""}`]);
+  }
+  out(`  Log:       ${previewLogFile(e)} (Ctrl-C stops following; the preview keeps running)`);
+  out("");
+
+  // Follow the unit's log until it reports running or failed, or stops.
+  const followUntil = Date.now() + 30 * 60_000;
+  let lastUnitCheck = 0;
+  while (true) {
+    flushLog();
+    let launchState: { status?: string; message?: string } | null = null;
+    try { launchState = JSON.parse(readFileSync(previewLaunchFile(e), "utf8")) as { status?: string; message?: string }; } catch {}
+    if (launchState?.status === "running") break;
+    if (launchState?.status === "failed") {
+      return abandon([`ERROR: preview '${parsed.name}' failed to start: ${launchState.message ?? "see the log above"}`]);
+    }
+    if (Date.now() - lastUnitCheck > 5_000) {
+      lastUnitCheck = Date.now();
+      if (unitState(unitName, process.env).state === "gone") {
+        return abandon([`ERROR: ${unitName} stopped before the preview came up; see ${previewLogFile(e)}`]);
+      }
+    }
+    if (Date.now() > followUntil) {
+      return abandon(["ERROR: the preview did not come up within 30 minutes; it was stopped."]);
+    }
+    spawnSync("sleep", ["1"]);
+  }
+  flushLog();
+  out("");
+  out(`Preview '${parsed.name}' is running in ${unitName}.`);
+  out(`  Stop:      ./raftdev preview stop ${parsed.name}   (or by id: ./raftdev preview stop ${id})`);
+  return 0;
+}
+
+/**
+ * The preview unit's main process. Runs `start` with the preview hooks,
+ * publishes the record only after every recorded process is proven to be in
+ * this unit's cgroup, then waits; SIGTERM (RuntimeMaxSec at the deadline,
+ * `systemctl --user stop`, the cleaner) runs the teardown: cmdStop for the
+ * containers, tmux and files, and the tunnel. KillMode=control-group signals
+ * every process in the unit at the same time.
+ */
+function cmdPreviewUnit(specPath: string | undefined): number | void {
+  if (!specPath) return 1;
+  let spec: PreviewUnitSpec;
+  try {
+    spec = parsePreviewUnitSpec(readFileSync(specPath, "utf8"));
+  } catch (error) {
+    out(`ERROR: ${(error as Error).message}`);
+    return 1;
+  } finally {
+    rmSync(specPath, { force: true });
+  }
+  for (const [key, value] of Object.entries(spec.env)) process.env[key] = value;
+  const e = setupEnv(spec.name);
+  const unitName = previewUnitName(spec.id);
+  let published = false;
+  const writeLaunch = (status: "running" | "failed", message?: string): void => {
+    writeFileSync(previewLaunchFile(e), JSON.stringify({ status, message: message ?? null }) + "\n");
+  };
+  process.once("exit", () => { if (!published) writeLaunch("failed", "start did not complete; see the log"); });
+  const invocationId = process.env.INVOCATION_ID?.trim() ?? "";
+  if (!/^[0-9a-f]{32}$/.test(invocationId) || !isInUnitCgroup(procCgroup("self"), unitName)) {
+    out(`ERROR: __preview-unit must run as ${unitName} (no INVOCATION_ID or a different cgroup).`);
+    writeLaunch("failed", `not running inside ${unitName}`);
+    published = true;
+    return 1;
+  }
+
+  // Staged registration of one UUID. A SIGKILL/OOM kill of this process runs
+  // no exit or SIGTERM cleanup, and Docker containers live outside the unit,
+  // so every resource is recorded as soon as it exists and the cleaner's
+  // timer can always remove it: the provisional record now (nothing created
+  // yet), each container/volume right after creation, processes as they
+  // start, and the final record (url, stage "running") after the cgroup check.
+  const supervisorStarttime = procStarttime(process.pid);
+  let current: PreviewRecord = provisionalPreviewRecord({
+    id: spec.id,
+    name: spec.name,
+    owner: spec.owner,
+    repo: PROJECT_DIR,
+    branch: gitValue(["rev-parse", "--abbrev-ref", "HEAD"]),
+    commit: gitValue(["rev-parse", "HEAD"]),
+    createdAt: new Date(spec.createdAt),
+    deadlineAt: new Date(spec.deadlineAt),
+    withAgentRuns: spec.withAgentRuns,
+    resources: spec.resources,
+    dockerMemoryCaps: { ...PREVIEW_DOCKER_MEMORY_CAPS },
+    bootId: currentBootId(),
+    unitInvocationId: invocationId,
+    notify: spec.notify,
+    reminderId: spec.reminderId,
+  }, supervisorStarttime ? { pid: process.pid, starttime: supervisorStarttime, role: "supervisor" } : undefined);
+  let registeredOnce = false;
+  /** Registers `next`, or returns the reason it was refused (nothing is written then). */
+  const register = (next: PreviewRecord): string | null => {
+    const problems = [
+      ...previewRecordProblems(next),
+      ...(registeredOnce ? previewIdentityChanges(current, next).map((field) => `immutable ${field} changed`) : []),
+      ...(registeredOnce ? previewDroppedResources(current, next).map((item) => `${item} would be dropped`) : []),
+    ];
+    if (problems.length > 0) return problems.join("; ");
+    // The helper is the only writer (shared per-id lock, atomic write).
+    const registered = sh(PREVIEW_CLEANER_PATH, ["--registry", spec.registryDir, "register"], {
+      quiet: true,
+      input: JSON.stringify(next),
+    });
+    if (registered.code !== 0) {
+      return `raft-preview-cleaner register failed (exit ${registered.code}): ${registered.stderr.trim().slice(0, 240)}`;
+    }
+    current = next;
+    registeredOnce = true;
+    return null;
+  };
+  /** Inside start (failure cleanup armed): a refused register tears the start down. */
+  const registerOrFail = (next: PreviewRecord, what: string): void => {
+    const refused = register(next);
+    if (refused === null) return;
+    out(`ERROR: could not record ${what} for preview ${spec.id}: ${refused}`);
+    out("  Tearing the start down; the URL is not published.");
+    process.exit(1);
+  };
+  const provisionalRefused = register(current);
+  if (provisionalRefused !== null) {
+    out(`ERROR: could not register the provisional preview record: ${provisionalRefused}`);
+    writeLaunch("failed", "provisional register failed");
+    published = true;
+    return 1;
+  }
+  out(`[raftdev] provisional record ${previewRecordPath(spec.registryDir, spec.id)} registered (stage starting).`);
+  let containersRecorded = 0;
+
+  let tunnelPid: number | undefined;
+  cmdStart([spec.name, ...spec.startArgs, ...(spec.withAgentRuns ? ["--with-agent-runs"] : [])], {
+    containerCreated(name) {
+      const inspection = inspectPreviewContainer(name);
+      if (inspection.state === "gone") return; // the create itself failed; start reports it
+      if (inspection.state === "unknown") {
+        out(`ERROR: cannot inspect just-created container ${name}: ${inspection.error}`);
+        out("  Tearing the start down; the URL is not published.");
+        process.exit(1);
+      }
+      registerOrFail(withPreviewContainer(current, inspection.id, inspection.volumeNames), `container ${name}`);
+      containersRecorded += 1;
+      if (containersRecorded === 1 && process.env.RAFTDEV_PREVIEW_HOLD_AFTER_FIRST_CONTAINER === "1") {
+        // Test hook for the kill-during-start check: the first container is
+        // recorded; hold here so the supervisor can be SIGKILLed.
+        out(`[raftdev] HOLD: ${name} (${inspection.id}) is recorded; holding 600s (RAFTDEV_PREVIEW_HOLD_AFTER_FIRST_CONTAINER=1).`);
+        spawnSync("sleep", ["600"]);
+      }
+    },
+    volumeCreated(name) {
+      const state = dockerInspectState(sh("docker", ["volume", "inspect", name], { quiet: true }));
+      if (state === "gone") return;
+      if (state === "unknown") {
+        out(`ERROR: cannot inspect just-created volume ${name}; tearing the start down.`);
+        process.exit(1);
+      }
+      registerOrFail(withPreviewVolume(current, name), `volume ${name}`);
+    },
+    processStarted(role, pid) {
+      if (pid === undefined || pid <= 1) return;
+      const starttime = procStarttime(pid);
+      if (starttime === null) return;
+      registerOrFail(withPreviewProcesses(current, [{ pid, starttime, role }]), `${role} process ${pid}`);
+    },
+    tmuxStarted() {
+      const serverPid = Number(sh("tmux", ["display-message", "-p", "-t", e.TMUX_SESSION, "#{pid}"], { quiet: true }).stdout.trim());
+      const starttime = Number.isInteger(serverPid) && serverPid > 1 ? procStarttime(serverPid) : null;
+      if (starttime === null) {
+        out(`ERROR: cannot identify the tmux server of ${e.TMUX_SESSION}; tearing the start down.`);
+        process.exit(1);
+      }
+      registerOrFail(withPreviewProcesses(current, [{ pid: serverPid, starttime, role: "tmux-server" }]), "the tmux server");
+    },
+    onRunning(context) {
+      tunnelPid = context.tunnelPid;
+      // Wait (bounded) for the server and vite listeners so the record holds
+      // those processes, not only their pane shells.
+      const waitUntil = Date.now() + 120_000;
+      while (Date.now() < waitUntil && !(portInUse(e.SERVER_PORT) && portInUse(e.WEB_PORT))) {
+        spawnSync("sleep", ["2"]);
+      }
+      if (!(portInUse(e.SERVER_PORT) && portInUse(e.WEB_PORT))) {
+        out("ERROR: server/web did not start listening within 120s; the preview is not published.");
+        process.exit(1);
+      }
+      const collected = collectPreviewProcesses(e, context.tunnelPid);
+      const stillAlive = (p: PreviewProcess): boolean => procStarttime(p.pid) === p.starttime;
+      const processes = collected.filter(stillAlive);
+      const docker = collectPreviewDocker(e);
+      if (docker.errors.length > 0) {
+        out("ERROR: Docker could not be queried for this preview's containers; the URL is not published:");
+        for (const error of docker.errors) out(`  ${error}`);
+        process.exit(1);
+      }
+      // Record everything before the cgroup check, so a kill during or after
+      // it still leaves server, vite, cloudflared and the panes recorded.
+      let staged = withPreviewProcesses(current, processes);
+      for (const id of docker.containerIds) staged = withPreviewContainer(staged, id, []);
+      for (const volume of docker.volumeNames) staged = withPreviewVolume(staged, volume);
+      registerOrFail(staged, "the started processes");
+
+      // A short-lived pane child that exited meanwhile is not checked.
+      const outside = processesOutsideUnit(collected, unitName, (pid) => procCgroup(pid)).filter(stillAlive);
+      const roles = new Set(current.processes.map((p) => p.role));
+      if (outside.length > 0 || !roles.has("tmux-server") || !roles.has("cloudflared")) {
+        out(`ERROR: not every preview process is inside ${unitName}; tearing down without publishing the URL:`);
+        for (const p of outside) out(`  pid ${p.pid} (${p.role}) cgroup ${procCgroup(p.pid)?.trim() ?? "unreadable"}`);
+        if (!roles.has("tmux-server")) out("  the tmux server was not found");
+        if (!roles.has("cloudflared")) out("  cloudflared was not found");
+        process.exit(1);
+      }
+      registerOrFail(runningPreviewRecord(current, {
+        url: context.url,
+        processes,
+        containerIds: docker.containerIds,
+        volumeNames: docker.volumeNames,
+        dockerMemoryCaps: context.dockerMemoryCaps,
+      }), "the final record");
+      const record = current;
+
+      // Only now is the URL printed (and so published).
+      let accounts: ReturnType<typeof seedAccountsFromSeedFile> = [];
+      try { accounts = seedAccountsFromSeedFile(readFileSync(e.SEED_FILE, "utf8")); } catch {}
+      const remaining = Math.max(0, Math.floor((Date.parse(record.deadlineAt) - Date.now()) / 1000));
+      out("");
+      out(`=== Preview '${spec.name}' is up (${record.processes.length} processes checked inside ${unitName}) ===`);
+      out(`  URL:       ${context.url}`);
+      out(`  Deadline:  ${record.deadlineAt} UTC (in ${formatDuration(remaining)}; idle stop after ${formatDuration(record.idleTtlSeconds)}, whichever comes first)`);
+      out(`  Resources: profile ${record.profile}, MemoryMax ${record.memoryMax}${record.memoryMaxOverride ? " (--memory-max)" : ""}; Docker caps ${Object.entries(record.dockerMemoryCaps).map(([k, v]) => `${k}=${v}`).join(" ")}`);
+      for (const line of previewLoginLines({ url: context.url, withAgentRuns: context.withAgentRuns, accounts, env: process.env })) out(line);
+      out(`  Record:    ${previewRecordPath(spec.registryDir, spec.id)}`);
+      out(`  Stop:      ./raftdev preview stop ${spec.name}`);
+      published = true;
+      writeLaunch("running");
+    },
+  });
+
+  let tearingDown = false;
+  const teardown = (signal: NodeJS.Signals): void => {
+    if (tearingDown) return;
+    tearingDown = true;
+    out(`[raftdev] ${unitName} received ${signal}; tearing the preview down.`);
+    cmdStop(spec.name);
+    // Signal the tunnel only while it is still the recorded process (same
+    // boot, pid and starttime), never a reused pid.
+    const tunnel = current.processes.find((p) => p.pid === tunnelPid && p.role === "cloudflared");
+    if (tunnel && isRecordedProcessAlive(tunnel, current.bootId, currentBootId(), procStarttime)) {
+      try { process.kill(tunnel.pid, "SIGTERM"); } catch {}
+    }
+    process.exit(process.exitCode ?? 0);
+  };
+  for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"] as const) process.on(signal, () => teardown(signal));
+  // The unit lives as long as this process: keep the event loop alive.
+  setInterval(() => {}, 1 << 30);
+}
+
+/**
+ * The janitor lives inside the preview unit that the stop kills, so it starts
+ * the verified stop (`preview stop <id>`) as a separate transient unit. If
+ * that cannot start, it stops its own unit (whose teardown removes the
+ * containers and tunnel) and leaves the record to the cleaner's timer.
+ */
+function launchPreviewStopUnit(state: PreviewState, reason: "deadline" | "idle"): void {
+  const env = hostBusEnv();
+  const launched = sh("systemd-run", previewStopUnitArgs({
+    id: state.id,
+    reason,
+    nodePath: process.execPath,
+    raftdevScript: join(PROJECT_DIR, "scripts/dev/raftdev.ts"),
+    workingDirectory: PROJECT_DIR,
+    registryDir: state.registryDir,
+    path: process.env.PATH ?? "/usr/bin:/bin",
+    // Previews refuse Docker endpoint overrides at launch, so the stop uses the default daemon too.
+    dockerEnv: {},
+  }), { quiet: true, env });
+  if (launched.code === 0) {
+    out(`[raftdev] verified stop started as raft-preview-${state.id}-stop.service`);
+    return;
+  }
+  out(`[raftdev] could not start the stop unit (exit ${launched.code}); stopping ${previewUnitName(state.id)} directly.`);
+  sh("systemctl", ["--user", "stop", "--no-block", previewUnitName(state.id)], { quiet: true, env });
+}
+
+function cmdPreviewStop(args: string[]): number {
+  const target = args[0];
+  if (!target || target.startsWith("-")) {
+    out("ERROR: usage: ./raftdev preview stop <name|id>");
+    return 1;
+  }
+  const reasonIndex = args.indexOf("--reason");
+  const reason = reasonIndex > 0 ? args[reasonIndex + 1] ?? "manual" : "manual";
+  const registryDir = resolvePreviewRegistry();
+  const records = listPreviewRecords(registryDir).flatMap((entry) => (entry.record ? [entry.record] : []));
+  const selected = selectPreviewRecord(records, target, PROJECT_DIR);
+  if ("error" in selected) {
+    out(`ERROR: ${selected.error} in ${registryDir}.`);
+    out("  For a plain raftdev environment use ./raftdev stop <name>.");
+    return 1;
+  }
+  const { record } = selected;
+  const recordPath = previewRecordPath(registryDir, record.id);
+  out(`=== Stopping preview '${record.name}' (${record.id}, ${reason}) ===`);
+  if (!previewCleanerInstalled()) {
+    for (const line of PREVIEW_CLEANER_MISSING) out(line);
+    out("Nothing was stopped.");
+    return 1;
+  }
+  // The cleaner stops the matching unit invocation (whose teardown runs
+  // cmdStop), signals only pid+starttime+boot matches, removes the recorded
+  // containers and volumes, verifies, and deletes the record only on success.
+  const env = hostBusEnv();
+  const result = sh(PREVIEW_CLEANER_PATH, ["--registry", registryDir, "stop", record.id], { quiet: true, env });
+  const parsed = parseCleanerStopOutput(result.stdout);
+  if (result.code !== 0 || (parsed.outcome !== "cleaned" && parsed.outcome !== "absent")) {
+    out(`ERROR: raft-preview-cleaner stop ${record.id}: ${parsed.outcome} (exit ${result.code}); the record is kept for retry.`);
+    for (const line of parsed.detail) out(line);
+    if (result.stderr.trim()) out(`  ${result.stderr.trim().slice(0, 240)}`);
+    out(`  Details: ${join(registryDir, "results", `${record.id}.json`)}`);
+    return 1;
+  }
+  // raftdev's own check of the same identities, from the record read before
+  // the stop: a cleaner "cleaned" is not taken on trust.
+  const verification = verifyPreviewCleanup(record, {
+    bootId: currentBootId(),
+    starttimeOf: procStarttime,
+    unitActive: (name) => unitState(name, env).state,
+    containerState: (id) => dockerInspectState(sh("docker", ["container", "inspect", id], { quiet: true })),
+    volumeState: (volume) => dockerInspectState(sh("docker", ["volume", "inspect", volume], { quiet: true })),
+  });
+  if (!verification.ok || existsSync(recordPath)) {
+    const recordGone = !existsSync(recordPath);
+    out(recordGone
+      ? `ERROR: raft-preview-cleaner reported "${parsed.outcome}" and removed the record, but raftdev's own check still finds:`
+      : `ERROR: raft-preview-cleaner reported "${parsed.outcome}", but raftdev still finds:`);
+    for (const line of formatCleanupLeftovers(verification, record.unitName)) out(line);
+    if (!recordGone) out(`  the record ${recordPath}`);
+    if (recordGone) out("  The record is gone, so the cleaner's timer will not retry these; nothing here is removed by raftdev.");
+    out(`  Cleaner result: ${join(registryDir, "results", `${record.id}.json`)}`);
+    out("  The reminder is kept. Report this to IT with the lines above and that result file.");
+    return 1;
+  }
+  out(`Verified: unit, ${record.processes.length} processes, ${record.containerIds.length} containers and ${record.volumeNames.length} volumes are gone; record removed.`);
+  const cancelled = cancelPreviewReminder(record.reminderId, runCommand);
+  if (cancelled.attempted) out(cancelled.ok ? `Owner ${cancelled.message}.` : `WARNING: ${cancelled.message}`);
+  if (record.repo === PROJECT_DIR) {
+    const e = setupEnv(record.name);
+    if (readPreviewState(e)?.id === record.id) {
+      for (const file of [previewStateFile(e), previewLaunchFile(e), previewSpecFile(e)]) rmSync(file, { force: true });
+    }
+  }
+  return 0;
+}
+
+function cmdPreviewList(args: string[]): number {
+  const json = args.includes("--json");
+  const registryDir = resolvePreviewRegistry();
+  const now = Date.now();
+  const boot = currentBootId();
+  const entries = listPreviewRecords(registryDir);
+  const summaries = entries.flatMap(({ path, record }) =>
+    record
+      ? [{ ...summarizePreviewRecord(record, now, boot, procStarttime), unitState: unitState(record.unitName, hostBusEnv()).state, recordPath: path }]
+      : []);
+  const invalid = entries.filter((entry) => !entry.record).map((entry) => entry.path);
+  if (json) {
+    process.stdout.write(JSON.stringify({ registry: registryDir, previews: summaries, invalidRecords: invalid }, null, 2) + "\n");
+    return 0;
+  }
+  out(`Preview registry: ${registryDir}`);
+  if (summaries.length === 0) out("No previews recorded.");
+  for (const s of summaries) {
+    out("");
+    out(`${s.name}  ${s.id}  (owner ${s.owner}, branch ${s.branch})`);
+    out(`  URL:       ${s.url ?? "(not published; stage starting)"}`);
+    out(`  Deadline:  ${s.deadlineAt} (${s.remainingSeconds > 0 ? `${formatDuration(s.remainingSeconds)} left` : "passed"})`);
+    out(`  Processes: ${s.processesAlive}/${s.processesRecorded} recorded processes alive; unit ${s.unitName} ${s.unitState === "present" ? "active" : s.unitState}`);
+    out(`  Profile:   ${s.profile} (MemoryMax ${s.memoryMax})`);
+    out(`  Repo:      ${s.repo}`);
+  }
+  for (const path of invalid) out(`WARNING: unreadable or non-contract record: ${path}`);
+  return 0;
 }
 
 // ───────────────── dispatch ─────────────────
 
+/**
+ * NODE_COMPILE_CACHE on disk (~/.cache/raft-dev/node-compile-cache) for every
+ * process raftdev starts, instead of Node's default under a possibly tmpfs
+ * /tmp (scripts/dev/raftdev-cache.ts). An explicit value, CI and non-Linux are
+ * left alone. Warnings (caches stay in RAM) are printed for `start` only.
+ */
+function applyDevCacheEnv(command: string): void {
+  const paths = resolveDevCachePaths();
+  if (paths.nodeCompileCache.source === "raft-dev" && paths.nodeCompileCache.path) {
+    process.env.NODE_COMPILE_CACHE = paths.nodeCompileCache.path;
+  }
+  if (command === "start" || command === "preview") for (const w of paths.warnings) out(w);
+}
+
 async function main(argv: string[]): Promise<number | void> {
   const command = argv[0] ?? "";
   const envName = argv[1] ?? basename(PROJECT_DIR);
+  if (command === "cache") return runCacheCli(argv.slice(1), { out });
+  applyDevCacheEnv(command);
   switch (command) {
     case "__cleanup-failed-start": {
       try {
@@ -3240,8 +5088,8 @@ async function main(argv: string[]): Promise<number | void> {
       }) ? 0 : 1;
     }
     case "start":  cmdStart(argv.slice(1)); break;
-    case "stop":   cmdStop(envName); break;
-    case "status": cmdStatus(); break;
+    case "stop":   validateTooling("stop"); cmdStop(envName); break;
+    case "status": validateTooling("status"); cmdStatus(); break;
     case "seed":   cmdSeed(argv.slice(1)); break;
     case "script": cmdScript(argv.slice(1)); break;
     case "logs":   cmdLogs(envName); break;
@@ -3250,8 +5098,10 @@ async function main(argv: string[]): Promise<number | void> {
       projectDir: PROJECT_DIR,
       defaultEnvName: basename(PROJECT_DIR),
     });
-    case "nuke":   cmdNuke(); break;
-    case "janitor": cmdJanitor(envName, argv[2]); break;
+    case "nuke":   validateTooling("nuke"); cmdNuke(); break;
+    case "janitor": validateTooling("janitor"); cmdJanitor(envName, argv[2]); break;
+    case "preview": return cmdPreview(argv.slice(1));
+    case "__preview-unit": return cmdPreviewUnit(argv[1]);
     default:       usageAndExit();
   }
 }

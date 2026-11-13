@@ -158,6 +158,42 @@ test("integration env command writes per-agent HOME exports for explicit local_c
   assert.match(stdout.join(""), /integration-profiles\/server-456\/agent-123\/drive9/);
 });
 
+test("integration env asks the server only for what the list can't answer: an old id finds its App, and a miss stays a miss", async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "slock-integration-env-alias-"));
+  const previousSlockHome = process.env.SLOCK_HOME;
+  process.env.SLOCK_HOME = tmp;
+  const { io, stdout } = memoryIo();
+  const requests: Array<{ method: string; path: string }> = [];
+  const contextAnswering = (resolvedServiceId: string | null) => createCommandContext({
+    io,
+    loadAgentContext: () => agentContext,
+    createApiClient: () => ({
+      request: async (method: string, requestPath: string): Promise<ApiResponse<unknown>> => {
+        requests.push({ method, path: requestPath });
+        return { ok: true, status: 200, error: null, data: { services: [service()], activeLogins: [], ...(requestPath.includes("?service=") ? { resolvedServiceId } : {}) } };
+      },
+    }) as any,
+  });
+  try {
+    await withMockFetch({ schema: "slock-agent-manifest.v0", docs_url: "https://drive9.ai/skill.md", execution: { mode: "local_cli", command: "drive9" }, credential_boundary: { storage: "per_agent_home", forbid_user_home: true } }, async () => {
+      await integrationEnvCommand.handler(contextAnswering("svc-1"), { service: "drive9-old" });
+    });
+    assert.deepEqual(requests, [
+      { method: "GET", path: "/internal/agent-api/integrations" },
+      { method: "GET", path: "/internal/agent-api/integrations?service=drive9-old" },
+    ]);
+    assert.match(stdout.join(""), /drive9/);
+
+    await assert.rejects(
+      async () => integrationEnvCommand.handler(contextAnswering(null), { service: "no-such-app" }),
+      /No registered integration matched no-such-app/,
+    );
+  } finally {
+    if (previousSlockHome === undefined) delete process.env.SLOCK_HOME;
+    else process.env.SLOCK_HOME = previousSlockHome;
+  }
+});
+
 test("integration env never materializes credentials for a v1 local CLI surface", async () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "slock-integration-env-v1-local-"));
   const previousSlockHome = process.env.SLOCK_HOME;

@@ -12,8 +12,18 @@
 import type { AgentCreateFormDefinition } from "@botiverse/raft-shared";
 
 import type { RuntimeFormV2Definition, RuntimeFormV2OptionsFrom } from "./generated/runtimeFormV2";
+import { isSupportedRuntimeFormV3Schema, runtimeFormV3ScopeKey, type RuntimeFormV3Condition, type RuntimeFormV3Schema } from "./v3Rules";
 
 export const RUNTIME_FORM_V2_PROTOCOL_VERSION = 2;
+/**
+ * Protocol v3 (README, "Protocol v3"): the same endpoints answer v3 when the
+ * request advertises RUNTIME_FORM_V3_CLIENT_CAPABILITY. Rules instead of
+ * visibility, conditional required, a reasoning effort as a dependent_select,
+ * unavailable options only in `unavailableOptions`. This parser reads both.
+ */
+export const RUNTIME_FORM_V3_PROTOCOL_VERSION = 3;
+/** Advertised capability (`?clientCapabilities=`) that asks the server for v3 shapes. */
+export const RUNTIME_FORM_V3_CLIENT_CAPABILITY = "runtime_form.v3";
 
 /** Field schema key naming the optionSources entry that supplies its choices. */
 export const RUNTIME_FORM_V2_OPTION_SOURCE_KEY = "x-optionSource";
@@ -24,6 +34,7 @@ export type {
   RuntimeFormV2OptionSource,
   RuntimeFormV2SubmitRef,
   RuntimeFormV2Submission,
+  RuntimeFormV2UnavailableOption,
 } from "./generated/runtimeFormV2";
 
 /**
@@ -63,6 +74,35 @@ export const RUNTIME_FORM_V2_RESERVED_CLIENT_CAPABILITIES = [
 export type RuntimeFormV2ClientCapability = (typeof RUNTIME_FORM_V2_RESERVED_CLIENT_CAPABILITIES)[number];
 
 /**
+ * Capabilities a client ADVERTISES to the server (query `clientCapabilities`,
+ * comma-separated, on the definition, edit-form, option-source and submit
+ * requests), the other direction from `requiredClientCapabilities`. Optional:
+ * a client that sends none gets the form exactly as before the capability
+ * existed. Frozen once released, like the reserved names.
+ * - `dependent_select.custom_value_with_options`: a dependent_select value that
+ *   has listed options AND allows a typed value renders as a combobox starting
+ *   at defaultValueByValue (runtimeFormV2Choices), not as a blank text box.
+ *   Without it the server keeps such a value list-only (task #10: Built-in
+ *   OpenRouter).
+ */
+export const RUNTIME_FORM_V2_ADVERTISED_CLIENT_CAPABILITIES = [
+  "dependent_select.custom_value_with_options",
+  // Protocol v3 shapes on the definition, edit-form and option-source
+  // endpoints (RUNTIME_FORM_V3_CLIENT_CAPABILITY); implies the one above.
+  "runtime_form.v3",
+] as const;
+export type RuntimeFormV2AdvertisedClientCapability = (typeof RUNTIME_FORM_V2_ADVERTISED_CLIENT_CAPABILITIES)[number];
+export const RUNTIME_FORM_V2_CLIENT_CAPABILITIES_QUERY = "clientCapabilities";
+
+/** The advertised capabilities a `clientCapabilities` query value names (unknown names ignored). */
+export function parseRuntimeFormV2ClientCapabilities(value: unknown): RuntimeFormV2AdvertisedClientCapability[] {
+  const raw = Array.isArray(value) ? value.join(",") : typeof value === "string" ? value : "";
+  const known = new Set<string>(RUNTIME_FORM_V2_ADVERTISED_CLIENT_CAPABILITIES);
+  return [...new Set(raw.split(",").map((item) => item.trim()).filter((item) => known.has(item)))]
+    .sort() as RuntimeFormV2AdvertisedClientCapability[];
+}
+
+/**
  * `OptionSource.status` (capability `option_source.status`), best to worst.
  * One status per source; when a source combines several probes the worst wins.
  */
@@ -95,6 +135,12 @@ export function worseRuntimeFormV2OptionSourceStatus(
  * (fail closed) rather than rendered on a guess.
  */
 export const RUNTIME_FORM_V2_MALFORMED_CAPABILITY = "(malformed requiredClientCapabilities)";
+/**
+ * What the parser records for a v3 rule or conditional required it cannot
+ * evaluate (an unknown effect, scope or condition keyword): the form is
+ * unavailable, never rendered with a rule silently ignored.
+ */
+export const RUNTIME_FORM_V3_UNSUPPORTED_RULE = "(unsupported v3 rule)";
 
 function requiredClientCapabilities(value: unknown): string[] {
   if (value === undefined || value === null) return [];
@@ -165,8 +211,15 @@ export type RuntimeFormV2Field = {
    * formValues; see runtimeFormV2SelectedConnection.
    */
   connectionOwned?: boolean;
-  /** Shown only when every rule matches; empty means always shown. */
+  /** v2 visibility: shown only when every rule matches; empty means always shown. */
   visibleWhen: Array<{ key: string; in: string[] }>;
+  /** v3 `uiSchema.rules` entry for this field (SHOW/HIDE on a condition). */
+  rule?: { effect: "SHOW" | "HIDE"; condition: RuntimeFormV3Condition };
+  /**
+   * v3 `dataSchema.allOf`: required while `condition` (over the whole values)
+   * evaluates to `when`, in addition to the unconditional `required`.
+   */
+  requiredWhen?: Array<{ condition: RuntimeFormV3Schema; when: boolean }>;
 };
 
 export type RuntimeFormV2OptionSourceRef = {
@@ -177,6 +230,8 @@ export type RuntimeFormV2OptionSourceRef = {
 };
 
 export type ParsedRuntimeFormV2 = {
+  /** The wire protocolVersion; a submit echoes it in formDefinitionRef. */
+  protocolVersion: 2 | 3;
   runtimeId: string;
   schemaVersion: string;
   fields: RuntimeFormV2Field[];
@@ -227,7 +282,10 @@ function propertyKey(pointer: unknown): string | null {
  * Returns null only when the body is not a v2 form at all.
  */
 export function parseRuntimeFormV2(value: unknown): ParsedRuntimeFormV2 | null {
-  if (!isRecord(value) || value.protocolVersion !== RUNTIME_FORM_V2_PROTOCOL_VERSION) return null;
+  if (!isRecord(value)) return null;
+  const protocolVersion = value.protocolVersion;
+  if (protocolVersion !== RUNTIME_FORM_V2_PROTOCOL_VERSION && protocolVersion !== RUNTIME_FORM_V3_PROTOCOL_VERSION) return null;
+  const v3 = protocolVersion === RUNTIME_FORM_V3_PROTOCOL_VERSION;
   const dataSchema = isRecord(value.dataSchema) ? value.dataSchema : null;
   const properties = dataSchema && isRecord(dataSchema.properties) ? dataSchema.properties : null;
   if (!properties) return null;
@@ -259,6 +317,41 @@ export function parseRuntimeFormV2(value: unknown): ParsedRuntimeFormV2 | null {
     visibility.set(key, [...(visibility.get(key) ?? []), { key: on, in: stringArray(rule.when.in) }]);
   }
 
+  // v3 rules and conditional required; anything unsupported fails the form closed.
+  let unsupportedRule = false;
+  const rules = new Map<string, NonNullable<RuntimeFormV2Field["rule"]>>();
+  const requiredWhen = new Map<string, NonNullable<RuntimeFormV2Field["requiredWhen"]>>();
+  if (v3) {
+    for (const rule of Array.isArray(uiSchema.rules) ? uiSchema.rules : []) {
+      const key = isRecord(rule) ? runtimeFormV3ScopeKey(rule.scope) : undefined;
+      const condition = isRecord(rule) && isRecord(rule.condition) ? rule.condition : null;
+      const on = condition ? runtimeFormV3ScopeKey(condition.scope) : undefined;
+      if (!isRecord(rule) || typeof key !== "string" || !condition || on === undefined
+        || (rule.effect !== "SHOW" && rule.effect !== "HIDE") || !isSupportedRuntimeFormV3Schema(condition.schema) || rules.has(key)) {
+        unsupportedRule = true;
+        continue;
+      }
+      rules.set(key, { effect: rule.effect, condition: { key: on, schema: condition.schema } });
+    }
+    for (const entry of Array.isArray(dataSchema?.allOf) ? dataSchema.allOf : []) {
+      if (!isRecord(entry) || !isSupportedRuntimeFormV3Schema(entry.if)) {
+        unsupportedRule = true;
+        continue;
+      }
+      for (const [branch, when] of [["then", true], ["else", false]] as const) {
+        const clause = entry[branch];
+        if (clause === undefined) continue;
+        if (!isRecord(clause) || !Array.isArray(clause.required)) {
+          unsupportedRule = true;
+          continue;
+        }
+        for (const key of stringArray(clause.required)) {
+          requiredWhen.set(key, [...(requiredWhen.get(key) ?? []), { condition: entry.if, when }]);
+        }
+      }
+    }
+  }
+
   const declaredOrder = stringArray(uiSchema.order).filter((key) => key in properties);
   const order = [...new Set([...declaredOrder, ...Object.keys(properties)])];
 
@@ -288,18 +381,24 @@ export function parseRuntimeFormV2(value: unknown): ParsedRuntimeFormV2 | null {
     }
     if (derived) field.derivedFrom = derived;
     if (schema["x-connectionOwned"] === true) field.connectionOwned = true;
+    const rule = rules.get(key);
+    if (rule) field.rule = rule;
+    const conditional = requiredWhen.get(key);
+    if (conditional) field.requiredWhen = conditional;
     const choices = choiceCopy(copy.choices);
     if (choices) field.choices = choices;
     fields.push(field);
   }
 
+  const capabilities = requiredClientCapabilities(value.requiredClientCapabilities);
   return {
+    protocolVersion,
     runtimeId: stringOr(value.runtimeId, "")!,
     schemaVersion: stringOr(value.schemaVersion, "")!,
     fields,
     optionSources,
     blockingFieldKeys: fields.filter((field) => field.kind === "unsupported" && field.required).map((field) => field.key),
-    requiredClientCapabilities: requiredClientCapabilities(value.requiredClientCapabilities),
+    requiredClientCapabilities: unsupportedRule ? [...capabilities, RUNTIME_FORM_V3_UNSUPPORTED_RULE] : capabilities,
     ...(typeof value.revision === "string" && value.revision ? { revision: value.revision } : {}),
     ...(isRecord(value.values) ? { values: value.values } : {}),
     ...keepRequiresUnchanged(value.writeOnlyKeepRequiresUnchanged, fields),

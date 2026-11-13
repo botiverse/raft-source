@@ -395,7 +395,7 @@ test(
         { type: "user", id: target.id },
         { assigneeName: target.name },
       );
-      const [assignedReceipt] = await db.select().from(messages).where(eq(messages.id, assigned.assignmentReceipt.message.id)).limit(1);
+      const [assignedReceipt] = await db.select().from(messages).where(eq(messages.id, assigned.assignmentReceipt!.message.id)).limit(1);
       assert.equal(assignedReceipt?.systemSubtype, "task.assignment_receipt");
       assert.equal(assignedReceipt?.causalActorType, "user");
       assert.equal(assignedReceipt?.causalActorId, owner.id);
@@ -409,7 +409,7 @@ test(
         { type: "agent", id: agent.id },
         { assigneeName: agent.name },
       );
-      const [startedReceipt] = await db.select().from(messages).where(eq(messages.id, started.assignmentReceipt.message.id)).limit(1);
+      const [startedReceipt] = await db.select().from(messages).where(eq(messages.id, started.assignmentReceipt!.message.id)).limit(1);
       assert.equal(startedReceipt?.systemSubtype, "task.assignment_receipt");
       assert.equal(startedReceipt?.causalActorType, "agent");
       assert.equal(startedReceipt?.causalActorId, agent.id);

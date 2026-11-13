@@ -105,7 +105,7 @@ async function plan(db: Database, value: WriterInput, now = new Date("2026-07-30
   }, db, now);
 }
 
-test("dual writer atomically creates one object, charge, and pending projection then linking publishes it", async () => {
+test("the projection writer atomically creates one object, charge, and pending projection then linking publishes it", async () => {
   const { client, db } = await fixture();
   try {
     const projectionId = "55555555-5555-4555-8555-555555555555";
@@ -295,47 +295,19 @@ test("existing immutable object reuse creates occurrence-owned reservations and 
   }
 });
 
-test("legacy linked deterministic artifact replay succeeds without fabricating an object or charge", async () => {
+// Storage step 2c: object_id is NOT NULL, so no objectless legacy artifact row
+// can exist for a deterministic replay to meet.
+test("a legacy objectless projection for a deterministic artifact replay cannot be stored", async () => {
   const { client, db } = await fixture();
   try {
     const projectionId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
-    const replayInput = input(projectionId);
-    const { objectId: _objectId, transferIntentId: _transferIntentId, ...legacyInput } = replayInput;
-    await db.insert(attachments).values({ ...legacyInput, messageId: MESSAGE_ID });
-    const replay = await db.transaction((tx) =>
-      createIdempotentPendingAttachmentProjectionWithExecutor(tx, {
-        ...replayInput,
-        objectId: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
-      })
-    );
-    assert.equal(replay.id, projectionId);
-    assert.equal(replay.messageId, MESSAGE_ID);
-    assert.equal(replay.objectId, null);
-    assert.equal((await db.select().from(attachmentObjects)).length, 0);
-    assert.equal((await db.select().from(attachmentObjectCharges)).length, 0);
-  } finally {
-    await client.close();
-  }
-});
-
-test("mismatched legacy deterministic artifact replay fails without detached object state", async () => {
-  const { client, db } = await fixture();
-  try {
-    const projectionId = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
-    const replayInput = input(projectionId);
-    const { objectId: _objectId, transferIntentId: _transferIntentId, ...legacyInput } = replayInput;
-    await db.insert(attachments).values({ ...legacyInput, filename: "different.txt", messageId: MESSAGE_ID });
-    await assert.rejects(
-      db.transaction((tx) => createIdempotentPendingAttachmentProjectionWithExecutor(tx, {
-        ...replayInput,
-        objectId: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
-      })),
-      /replay conflict/,
-    );
-    assert.equal((await db.select().from(attachmentObjects)).length, 0);
-    assert.equal((await db.select().from(attachmentObjectCharges)).length, 0);
-    const [legacy] = await db.select().from(attachments).where(eq(attachments.id, projectionId));
-    assert.equal(legacy?.objectId, null);
+    const { objectId: _objectId, transferIntentId: _transferIntentId, ...legacyInput } = input(projectionId);
+    await assert.rejects(db.insert(attachments).values({
+      ...legacyInput,
+      objectId: null as unknown as string,
+      messageId: MESSAGE_ID,
+    }));
+    assert.equal((await db.select().from(attachments)).length, 0);
   } finally {
     await client.close();
   }
@@ -378,7 +350,7 @@ test("backfilled deterministic artifact replay accepts its existing uncharged ob
   }
 });
 
-test("production attachment inserts are limited to the dual upload writer and atomic forward copier", () => {
+test("production attachment inserts are limited to the projection writer and atomic forward copier", () => {
   const sourceRoot = fileURLToPath(new URL("../", import.meta.url));
   const directInsertFiles: string[] = [];
   const artifactInsertFiles: string[] = [];
@@ -386,6 +358,9 @@ test("production attachment inserts are limited to the dual upload writer and at
     for (const entry of readdirSync(directory, { withFileTypes: true })) {
       const absolute = path.join(directory, entry.name);
       if (entry.isDirectory()) {
+        // src/test holds test-only fixtures (attachmentObjectFixture.ts seeds
+        // projections directly); it never runs in production.
+        if (absolute === path.join(sourceRoot, "test")) continue;
         visit(absolute);
       } else if (entry.name.endsWith(".ts") && !entry.name.endsWith(".test.ts")) {
         const source = readFileSync(absolute, "utf8");

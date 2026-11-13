@@ -36,8 +36,9 @@ test("reserved Cindy sprites are excluded from AVATAR_KEYS", () => {
   // surfaced in the manual picker grid (AgentDetailPanel). Both call sites
   // iterate AVATAR_KEYS, so filtering Cindy-only avatars out of AVATAR_KEYS is the
   // single-point enforcement that covers them both. Duoyu 2026-06-02 DM,
-  // cindyz approved.
-  for (const key of ["finch", "mug"]) {
+  // cindyz approved. `ottie` is every personal assistant's, set only by the
+  // server (tygg, #proj-assistant a859e8fd).
+  for (const key of ["finch", "mug", "ottie"]) {
     assert.ok(
       RESERVED_AVATAR_KEYS.includes(key),
       `${key} must be listed in RESERVED_AVATAR_KEYS`,
@@ -53,8 +54,8 @@ test("reserved Cindy sprites are excluded from AVATAR_KEYS", () => {
 
 test("the reserved avatar asset matches the exported runtime reservation list", () => {
   const avatarJson = JSON.parse(
-    readFileSync(resolve(repoRoot, "assets/avatars/pixelAvatars.json"), "utf8"),
+    readFileSync(resolve(repoRoot, "../shared/assets/pixelAvatars.json"), "utf8"),
   );
-  assert.deepEqual(avatarJson.reservedKeys, ["finch", "mug"]);
+  assert.deepEqual(avatarJson.reservedKeys, ["finch", "mug", "ottie"]);
   assert.deepEqual(RESERVED_AVATAR_KEYS, avatarJson.reservedKeys);
 });

@@ -25,6 +25,11 @@ import {
   type CallToolResult,
 } from "@modelcontextprotocol/sdk/types.js";
 import { logger } from "./logger";
+import { managedMcpRefusalGuidance } from "./managedMcpRefusal";
+import {
+  confirmRuntimeTurnOrigin,
+  type RuntimeTurnOriginReader,
+} from "./runtimeTurnOrigin";
 
 const HOST = "127.0.0.1";
 const MAX_REQUEST_BYTES = 1024 * 1024;
@@ -41,6 +46,13 @@ type ManagedMcpDiscoveryUnavailableReason =
 type Registration = {
   agentId: string;
   launchId: string | null;
+  /**
+   * The process this registration was created for, and that process's turn-origin getter. A call
+   * carries an origin only when the getter's snapshot names this same process instance -- never an
+   * agent-wide or "most recent" value (task #21, @peng).
+   */
+  processInstanceId?: string | null;
+  readTurnOrigin?: RuntimeTurnOriginReader;
   snapshot: ManagedMcpRuntimeSnapshot;
   loadSnapshot?: () => Promise<ManagedMcpRuntimeSnapshot>;
   callTool: (request: ManagedMcpCallRequest) => Promise<ManagedMcpCallResult>;
@@ -203,10 +215,9 @@ export function installManagedMcpRuntimeJsonOverlay(input: {
   state.layers.set(layerId, { id: layerId, apply: input.apply });
   const rendered = renderJsonConfig(input.filePath, state);
   mkdirSync(path.dirname(input.filePath), { recursive: true });
-  writeFileSync(input.filePath, rendered, {
-    encoding: "utf8",
-    mode: state.originalMode ?? 0o600,
-  });
+  // `mode` only applies to a new file: narrow a user's 0644 file before it holds the token.
+  if (existsSync(input.filePath)) chmodSync(input.filePath, 0o600);
+  writeFileSync(input.filePath, rendered, { encoding: "utf8", mode: 0o600 });
   state.lastWritten = rendered;
 
   registerLaunchCleanup(input, () => {
@@ -220,10 +231,7 @@ export function installManagedMcpRuntimeJsonOverlay(input: {
     state.layers.delete(layerId);
     if (state.layers.size > 0) {
       const next = renderJsonConfig(input.filePath, state);
-      writeFileSync(input.filePath, next, {
-        encoding: "utf8",
-        mode: state.originalMode ?? 0o600,
-      });
+      writeFileSync(input.filePath, next, { encoding: "utf8", mode: 0o600 });
       state.lastWritten = next;
       return;
     }
@@ -275,16 +283,24 @@ async function requestAgentApi<T>(input: {
   });
   const payload = (await response.json().catch(() => null)) as
     | T
-    | { error?: unknown; code?: unknown }
+    | { error?: unknown; code?: unknown; connectionRequested?: unknown; suggestedNextAction?: unknown }
     | null;
   if (!response.ok) {
-    const detail =
+    // The Server's own sentence plus what happens next. Previously this surfaced only
+    // `HTTP 409 (some_code)`, which tells the model nothing it can act on.
+    const code =
       typeof (payload as { code?: unknown } | null)?.code === "string"
-        ? ` (${(payload as { code: string }).code})`
-        : "";
-    throw new Error(
-      `Raft MCP gateway request failed: HTTP ${response.status}${detail}`,
-    );
+        ? (payload as { code: string }).code
+        : null;
+    const message =
+      typeof (payload as { error?: unknown } | null)?.error === "string"
+        ? (payload as { error: string }).error
+        : `Raft MCP gateway request failed: HTTP ${response.status}`;
+    const connectionRequested =
+      (payload as { connectionRequested?: unknown } | null)?.connectionRequested === true;
+    const agentWorded =
+      typeof (payload as { suggestedNextAction?: unknown } | null)?.suggestedNextAction === "string";
+    throw new Error(managedMcpRefusalGuidance({ message, code, connectionRequested, agentWorded }));
   }
   return payload as T;
 }
@@ -350,6 +366,10 @@ function createMcpServer(registration: Registration): Server {
     };
   });
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    // Read the turn origin FIRST, before any await: this is the turn the runtime issued the call in.
+    // It is re-confirmed just before forwarding, so a turn that ends during the snapshot reload
+    // sends the call without an origin instead of with the next turn's.
+    const capturedOrigin = registration.readTurnOrigin?.() ?? null;
     try {
       const nativeTools = await loadNativeTools(registration);
       const tool = nativeTools.find(
@@ -362,12 +382,18 @@ function createMcpServer(registration: Registration): Server {
           ),
         );
       }
+      const origin = confirmRuntimeTurnOrigin({
+        read: registration.readTurnOrigin,
+        captured: capturedOrigin,
+        expectedProcessInstanceId: registration.processInstanceId,
+      });
       const result = await registration.callTool({
         mcpServerId: tool.mcpServerId,
         toolName: tool.toolName,
         arguments: request.params.arguments ?? {},
         expectedConfigVersion: tool.configVersion,
         expectedAssignmentVersion: tool.assignmentVersion,
+        ...(origin ? { origin } : {}),
       });
       return result as CallToolResult;
     } catch (error) {
@@ -383,9 +409,13 @@ async function handleRequest(
 ): Promise<void> {
   const pathname = new URL(request.url ?? "/", "http://managed-mcp.local")
     .pathname;
+  // The token is in the path, or (runtimes that read it from their own
+  // environment, so it never sits in a process's arguments) a bearer header.
   const token = pathname.startsWith("/mcp/")
     ? pathname.slice("/mcp/".length)
-    : "";
+    : pathname === "/mcp"
+      ? bearerToken(request.headers.authorization)
+      : "";
   const registration = registrations.get(token);
   if (!registration) {
     response.writeHead(404, { "content-type": "application/json" });
@@ -458,9 +488,28 @@ async function ensureProxy(): Promise<ProxyState> {
   }
 }
 
+function bearerToken(header: string | undefined): string {
+  const match = /^Bearer\s+(\S+)$/i.exec(header ?? "");
+  return match ? match[1] : "";
+}
+
+/**
+ * A launch's managed MCP endpoint. `url` carries the token in its path, for
+ * runtimes that read it from a 0600 file or their own environment;
+ * `endpointUrl` + `token` (sent as `Authorization: Bearer`) is for config that
+ * would otherwise put the URL in a process's arguments, which other OS users
+ * can read.
+ */
+export interface ManagedMcpRuntimeEndpoint {
+  name: string;
+  url: string;
+  endpointUrl: string;
+  token: string;
+}
+
 export async function registerManagedMcpRuntimeProxy(
   input: Registration,
-): Promise<{ name: string; url: string }> {
+): Promise<ManagedMcpRuntimeEndpoint> {
   applyLoopbackNoProxyEnv(process.env);
   const state = await ensureProxy();
   const token = randomBytes(32).toString("base64url");
@@ -471,6 +520,8 @@ export async function registerManagedMcpRuntimeProxy(
     // grammar happy and cannot collide with a user's existing MCP server key.
     name: `${MANAGED_MCP_RUNTIME_SERVER_NAME_PREFIX}${serverNameSuffix}`,
     url: `${state.baseUrl}/mcp/${token}`,
+    endpointUrl: `${state.baseUrl}/mcp`,
+    token,
   };
 }
 
@@ -512,10 +563,18 @@ export function unregisterManagedMcpRuntimeProxiesForAgent(agentId: string): num
 export async function prepareManagedMcpRuntimeProxy(input: {
   agentId: string;
   launchId?: string | null;
+  processInstanceId?: string | null;
+  readTurnOrigin?: RuntimeTurnOriginReader;
   serverUrl?: string | null;
   agentCredentialKey?: string | null;
   onWarning?: (message: string) => void;
-}): Promise<{ name: string; url: string } | null> {
+  /**
+   * Decides from the discovered snapshot whether this launch attaches the
+   * server at all. Refused: nothing is registered and no token is minted.
+   * Omitted: always attached (an empty catalog included).
+   */
+  admit?: (snapshot: ManagedMcpRuntimeSnapshot) => boolean | Promise<boolean>;
+}): Promise<ManagedMcpRuntimeEndpoint | null> {
   if (!input.serverUrl) {
     emitManagedMcpDiscoveryWarning(input, "missing_server_url");
     return null;
@@ -534,9 +593,12 @@ export async function prepareManagedMcpRuntimeProxy(input: {
       emitManagedMcpDiscoveryWarning(input, "unsupported_catalog_version");
       return null;
     }
+    if (input.admit && !(await input.admit(snapshot))) return null;
     return await registerManagedMcpRuntimeProxy({
       agentId: input.agentId,
       launchId: input.launchId ?? null,
+      processInstanceId: input.processInstanceId ?? null,
+      ...(input.readTurnOrigin ? { readTurnOrigin: input.readTurnOrigin } : {}),
       snapshot,
       loadSnapshot: () =>
         requestAgentApi<ManagedMcpRuntimeSnapshot>({

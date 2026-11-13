@@ -35,6 +35,14 @@ export function projectTaskCreated(row: TaskCreatedProjectionSource) {
   return {
     id: row.id,
     messageId: row.messageId,
+    // The real `tasks.message_id` (null for a task v2 task), as on the task DTO;
+    // only when the source row carries it (older internal callers do not).
+    ...("hostMessageId" in row && { hostMessageId: row.hostMessageId ?? null }),
+    sourceMessageId: row.sourceMessageId ?? null,
+    conversationReplyCount: row.conversationReplyCount ?? 0,
+    conversationAnchored: row.conversationAnchored === true,
+    // Task v2: the task's canonical conversation (channels.type = 'task').
+    conversationChannelId: row.conversationChannelId ?? null,
     channelId: row.channelId,
     channelName: row.channelName,
     channelType: row.channelType,
@@ -126,7 +134,12 @@ export function emitTaskUpdated(
 export function emitTaskDeleted(
   io: SocketServer,
   target: TaskRealtimeTarget,
-  payload: { channelId: string; taskId: string },
+  /**
+   * `conversationChannelId`: task v2, the task's conversation as this
+   * surface saw it (joint: its local projection), deleted with the task —
+   * clients drop it from their followed / Activity lists and close it.
+   */
+  payload: { channelId: string; taskId: string; conversationChannelId?: string },
 ) {
   messageAudience(io, target).emit("task:deleted", payload);
 }

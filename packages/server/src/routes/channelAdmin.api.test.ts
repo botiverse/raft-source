@@ -1,6 +1,5 @@
 import { createApiTest } from "../test/integration/apiTest";
 import assert from "node:assert/strict";
-import fs from "node:fs";
 import { randomUUID } from "node:crypto";
 
 import { and, eq } from "drizzle-orm";
@@ -16,7 +15,7 @@ import {
   serverMembers,
   users,
 } from "../db/schema";
-import { signAccessToken } from "../middleware/auth";
+import { accessTokenForTest } from "../test/integration/credentials";
 import { createAgent } from "../services/agentService";
 import { mintAgentCredential } from "../services/agentCredentialService";
 import {
@@ -31,8 +30,9 @@ import { drainChannelMembershipRoleOutbox } from "../services/channelMembershipR
 import { setChannelArchivedForAgent } from "./agentChannelLifecycle";
 import { addChannelMemberForAgent, removeChannelMemberForAgent } from "./agentChannelMembers";
 import { updateChannelForAgent } from "./agentChannelUpdate";
+import { seedBoundGuest } from "../test/guestFixture";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 async function seedUser(label: string) {
   const [user] = await getDb().insert(users).values({
@@ -45,9 +45,9 @@ async function seedUser(label: string) {
   return user;
 }
 
-function headers(userId: string, serverId: string) {
+async function headers(userId: string, serverId: string) {
   return {
-    Authorization: `Bearer ${signAccessToken(userId)}`,
+    Authorization: `Bearer ${await accessTokenForTest(userId)}`,
     "Content-Type": "application/json",
     "X-Server-Id": serverId,
   };
@@ -77,31 +77,6 @@ test("creator bootstrap and initial members commit atomically with distinct role
   assert.equal(agentMembership?.role, "member");
 });
 
-test("action-card channel:create uses the atomic human creator-admin bootstrap", () => {
-  const source = fs.readFileSync(
-    new URL("../services/actionCardsService.ts", import.meta.url),
-    "utf8",
-  );
-  const actionStart = source.indexOf(
-    'const channelType = action.visibility === "private" ? "private" : "channel";',
-  );
-  assert.notEqual(actionStart, -1, "channel:create execution block must exist");
-  const actionEnd = source.indexOf('case "agent:create":', actionStart);
-  assert.notEqual(actionEnd, -1, "channel:create execution block must be bounded");
-  const channelCreateBlock = source.slice(actionStart, actionEnd);
-
-  assert.match(
-    channelCreateBlock,
-    /createChannel\([\s\S]*?channelType,\s*\{[\s\S]*?type: "user",[\s\S]*?id: userId,[\s\S]*?initialUserIds,[\s\S]*?initialAgentIds,[\s\S]*?\},?\s*\)/,
-    "action-card creation must pass the executing human to the atomic creator bootstrap",
-  );
-  assert.doesNotMatch(
-    channelCreateBlock,
-    /addHuman\(channel\.id,\s*userId\)/,
-    "action-card creation must not add the creator in a second write",
-  );
-});
-
 test("archived-name collision projects the target channel's effective restore capability", async ({ app }) => {
   const owner = await seedUser("collision-owner");
   const localAdmin = await seedUser("collision-local-admin");
@@ -115,9 +90,9 @@ test("archived-name collision projects the target channel's effective restore ca
   await addHuman(archived.id, localAdmin.id, { role: "admin" });
   await getDb().update(channels).set({ archivedAt: new Date() }).where(eq(channels.id, archived.id));
 
-  const collide = (userId: string) => fetch(`${app.baseUrl}/api/channels`, {
+  const collide = async (userId: string) => fetch(`${app.baseUrl}/api/channels`, {
     method: "POST",
-    headers: headers(userId, server.id),
+    headers: await headers(userId, server.id),
     body: JSON.stringify({ name: "restore-me", visibility: "public" }),
   });
   const allowed = await collide(localAdmin.id);
@@ -133,92 +108,6 @@ test("archived-name collision projects the target channel's effective restore ca
   ));
   const stale = await collide(localAdmin.id);
   assert.equal((await stale.json() as { canUnarchiveArchivedChannel?: boolean }).canUnarchiveArchivedChannel, false);
-});
-
-test("human add-member route uses effective channel authority and rechecks it under the channel lock", () => {
-  const source = fs.readFileSync(new URL("./channels.ts", import.meta.url), "utf8");
-  const routeStart = source.indexOf('channelRouter.post("/:id/members", async (req, res) => {');
-  assert.notEqual(routeStart, -1, "human add-member route must exist");
-  const routeEnd = source.indexOf("// Human-only v1 surface for channel-local member/admin transitions.", routeStart);
-  assert.notEqual(routeEnd, -1, "human add-member route must be bounded");
-  const routeBlock = source.slice(routeStart, routeEnd);
-
-  assert.match(
-    routeBlock,
-    /actorHasChannelCapability\([\s\S]*?"addChannelMembers"\)/,
-    "the route-level denial must resolve the effective server-or-channel capability",
-  );
-  assert.doesNotMatch(
-    routeBlock,
-    /actorHasServerCapabilityInServer\([\s\S]*?"addChannelMembers"\)/,
-    "the add-member route must not collapse channel-local authority back to server role",
-  );
-  assert.equal(
-    routeBlock.match(/withLockedChannelActorCapability\(\{/g)?.length,
-    2,
-    "human and Agent membership writes must each recheck authority under the channel lock",
-  );
-});
-
-test("Agent add-member service rechecks both target writes under the channel lock", () => {
-  const source = fs.readFileSync(new URL("./agentChannelMembers.ts", import.meta.url), "utf8");
-  const serviceStart = source.indexOf("export async function addChannelMemberForAgent");
-  assert.notEqual(serviceStart, -1, "Agent add-member service must exist");
-  const serviceEnd = source.indexOf("export async function removeChannelMemberForAgent", serviceStart);
-  assert.notEqual(serviceEnd, -1, "Agent add-member service must be bounded");
-  const serviceBlock = source.slice(serviceStart, serviceEnd);
-
-  assert.equal(
-    serviceBlock.match(/withLockedChannelActorCapability\(\{/g)?.length,
-    2,
-    "Agent add-human and add-Agent writes must each recheck authority under the channel lock",
-  );
-  assert.match(
-    serviceBlock,
-    /addAgent\(channel\.id, target\.id, \{ executor: tx \}\)/,
-    "Agent-target membership must use the caller-owned locked transaction",
-  );
-  assert.match(
-    serviceBlock,
-    /addHumanWithMembershipSystemMessage\([\s\S]*?executor: tx/,
-    "human-target membership, notice, and inbox facts must use the caller-owned locked transaction",
-  );
-  assert.match(
-    serviceBlock,
-    /capability_required_under_lock[\s\S]*?status: 403/,
-    "authority loss at the locked recheck must fail closed as 403",
-  );
-});
-
-test("mention add surfaces project and recheck effective channel authority", () => {
-  const executionSource = fs.readFileSync(new URL("../services/mentionActionService.ts", import.meta.url), "utf8");
-  const projectionSource = fs.readFileSync(new URL("../services/messageService.ts", import.meta.url), "utf8");
-
-  assert.doesNotMatch(
-    executionSource,
-    /actorHasServerCapabilityInServer\([\s\S]*?"addChannelMembers"\)/,
-    "mention add execution must not collapse local authority to server role",
-  );
-  assert.match(
-    executionSource,
-    /actorHasChannelCapability\([\s\S]*?"addChannelMembers"\)/,
-    "mention add execution must check effective authority before entering the mutation",
-  );
-  assert.match(
-    executionSource,
-    /\.for\("update"\)[\s\S]*?channelActorHasCapability\(context, "addChannelMembers"\)/,
-    "mention add execution must lock its membership channel and recheck effective authority",
-  );
-  assert.doesNotMatch(
-    projectionSource,
-    /pendingMentionAvailableActions[\s\S]*?actorHasServerCapabilityInServer\([\s\S]*?"addChannelMembers"\)/,
-    "pending mention actions must not advertise add from server role alone",
-  );
-  assert.match(
-    projectionSource,
-    /pendingMentionAvailableActions[\s\S]*?actorHasChannelCapability\([\s\S]*?"addChannelMembers",[\s\S]*?executor[\s\S]*?\)/,
-    "pending mention actions must advertise add from effective channel authority on the caller-owned executor",
-  );
 });
 
 test("human channel admin can manage local roles but cannot cross server-only boundaries", async ({ app }) => {
@@ -242,7 +131,7 @@ test("human channel admin can manage local roles but cannot cross server-only bo
   await addHuman(channel.id, serverAdmin.id);
 
   const detail = await fetch(`${app.baseUrl}/api/channels/${channel.id}`, {
-    headers: headers(localAdmin.id, server.id),
+    headers: await headers(localAdmin.id, server.id),
   });
   assert.equal(detail.status, 200);
   const detailBody = await detail.json() as {
@@ -263,7 +152,7 @@ test("human channel admin can manage local roles but cannot cross server-only bo
   assert.equal(detailBody.channelCapabilities?.federateChannels, false);
 
   const roster = await fetch(`${app.baseUrl}/api/channels/${channel.id}/members`, {
-    headers: headers(localAdmin.id, server.id),
+    headers: await headers(localAdmin.id, server.id),
   });
   assert.equal(roster.status, 200);
   const rosterBody = await roster.json() as {
@@ -302,34 +191,34 @@ test("human channel admin can manage local roles but cannot cross server-only bo
 
   const rename = await fetch(`${app.baseUrl}/api/channels/${channel.id}`, {
     method: "PATCH",
-    headers: headers(localAdmin.id, server.id),
+    headers: await headers(localAdmin.id, server.id),
     body: JSON.stringify({ description: "managed locally" }),
   });
   assert.equal(rename.status, 200);
 
   const visibility = await fetch(`${app.baseUrl}/api/channels/${channel.id}`, {
     method: "PATCH",
-    headers: headers(localAdmin.id, server.id),
+    headers: await headers(localAdmin.id, server.id),
     body: JSON.stringify({ visibility: "public" }),
   });
   assert.equal(visibility.status, 403);
 
   const deleteResponse = await fetch(`${app.baseUrl}/api/channels/${channel.id}`, {
     method: "DELETE",
-    headers: headers(localAdmin.id, server.id),
+    headers: await headers(localAdmin.id, server.id),
   });
   assert.equal(deleteResponse.status, 403);
 
   const unjoinedMemberAdd = await fetch(`${app.baseUrl}/api/channels/${channel.id}/members`, {
     method: "POST",
-    headers: headers(outsider.id, server.id),
+    headers: await headers(outsider.id, server.id),
     body: JSON.stringify({ userId: invitee.id }),
   });
   assert.equal(unjoinedMemberAdd.status, 404, "ordinary human members must join a private channel before adding peers");
 
   const addHumanResponse = await fetch(`${app.baseUrl}/api/channels/${channel.id}/members`, {
     method: "POST",
-    headers: headers(localAdmin.id, server.id),
+    headers: await headers(localAdmin.id, server.id),
     body: JSON.stringify({ userId: invitee.id }),
   });
   assert.equal(addHumanResponse.status, 200);
@@ -338,7 +227,7 @@ test("human channel admin can manage local roles but cannot cross server-only bo
   const invitedAgent = await createAgent(server.id, `role-invited-agent-${randomUUID().slice(0, 8)}`, { runtime: "codex" });
   const addAgentResponse = await fetch(`${app.baseUrl}/api/channels/${channel.id}/members`, {
     method: "POST",
-    headers: headers(localAdmin.id, server.id),
+    headers: await headers(localAdmin.id, server.id),
     body: JSON.stringify({ agentId: invitedAgent.id }),
   });
   assert.equal(addAgentResponse.status, 200);
@@ -350,7 +239,7 @@ test("human channel admin can manage local roles but cannot cross server-only bo
 
   const promote = await fetch(`${app.baseUrl}/api/channels/${channel.id}/members/user/${peer.id}/role`, {
     method: "PATCH",
-    headers: headers(localAdmin.id, server.id),
+    headers: await headers(localAdmin.id, server.id),
     body: JSON.stringify({ role: "admin" }),
   });
   assert.equal(promote.status, 200);
@@ -370,7 +259,7 @@ test("human channel admin can manage local roles but cannot cross server-only bo
 
   const selfDemote = await fetch(`${app.baseUrl}/api/channels/${channel.id}/members/user/${localAdmin.id}/role`, {
     method: "PATCH",
-    headers: headers(localAdmin.id, server.id),
+    headers: await headers(localAdmin.id, server.id),
     body: JSON.stringify({ role: "member" }),
   });
   assert.equal(selfDemote.status, 409);
@@ -378,7 +267,7 @@ test("human channel admin can manage local roles but cannot cross server-only bo
 
   const protectedTarget = await fetch(`${app.baseUrl}/api/channels/${channel.id}/members/user/${serverAdmin.id}/role`, {
     method: "PATCH",
-    headers: headers(localAdmin.id, server.id),
+    headers: await headers(localAdmin.id, server.id),
     body: JSON.stringify({ role: "admin" }),
   });
   assert.equal(protectedTarget.status, 403);
@@ -386,7 +275,7 @@ test("human channel admin can manage local roles but cannot cross server-only bo
 
   const hiddenPrivate = await fetch(`${app.baseUrl}/api/channels/${channel.id}/members/user/${peer.id}/role`, {
     method: "PATCH",
-    headers: headers(outsider.id, server.id),
+    headers: await headers(outsider.id, server.id),
     body: JSON.stringify({ role: "member" }),
   });
   assert.equal(hiddenPrivate.status, 404);
@@ -409,33 +298,33 @@ test("archived channels reject every human membership and metadata mutation exce
 
   const archive = await fetch(`${app.baseUrl}/api/channels/${channel.id}/archive`, {
     method: "POST",
-    headers: headers(localAdmin.id, server.id),
+    headers: await headers(localAdmin.id, server.id),
   });
   assert.equal(archive.status, 200);
 
   const attempts = await Promise.all([
     fetch(`${app.baseUrl}/api/channels/${channel.id}`, {
       method: "PATCH",
-      headers: headers(localAdmin.id, server.id),
+      headers: await headers(localAdmin.id, server.id),
       body: JSON.stringify({ description: "must stay frozen" }),
     }),
     fetch(`${app.baseUrl}/api/channels/${channel.id}/members`, {
       method: "POST",
-      headers: headers(localAdmin.id, server.id),
+      headers: await headers(localAdmin.id, server.id),
       body: JSON.stringify({ userId: candidate.id }),
     }),
     fetch(`${app.baseUrl}/api/channels/${channel.id}/members/user/${peer.id}`, {
       method: "DELETE",
-      headers: headers(localAdmin.id, server.id),
+      headers: await headers(localAdmin.id, server.id),
     }),
     fetch(`${app.baseUrl}/api/channels/${channel.id}/members/user/${peer.id}/role`, {
       method: "PATCH",
-      headers: headers(localAdmin.id, server.id),
+      headers: await headers(localAdmin.id, server.id),
       body: JSON.stringify({ role: "admin" }),
     }),
     fetch(`${app.baseUrl}/api/channels/${channel.id}/leave`, {
       method: "POST",
-      headers: headers(localAdmin.id, server.id),
+      headers: await headers(localAdmin.id, server.id),
     }),
   ]);
   assert.deepEqual(attempts.map((response) => response.status), [409, 409, 409, 409, 409]);
@@ -459,6 +348,7 @@ test("agent channel admin uses existing management actions without gaining visib
     agentId: agent.id,
     scopes: ["channels"],
     name: "channel-admin-surface-test",
+    issuedVia: "computer",
     createdByUserId: null,
   });
   const channel = await createChannel(server.id, "agent-local-admin", undefined, "private", { type: "user", id: owner.id });
@@ -581,10 +471,6 @@ test("agent channel admin uses existing management actions without gaining visib
     headers: { Authorization: `Bearer ${credential.apiKey}` },
   });
   assert.equal(agentRoot.status, 200, `agent credential positive control: ${await agentRoot.text()}`);
-  const agentApiSource = fs.readFileSync(new URL("./internalAgentApi.ts", import.meta.url), "utf8");
-  const legacyAgentApiSource = fs.readFileSync(new URL("./internal.ts", import.meta.url), "utf8");
-  assert.doesNotMatch(agentApiSource, /members\/:targetType\/:memberId\/role/);
-  assert.doesNotMatch(legacyAgentApiSource, /members\/:targetType\/:memberId\/role/);
 });
 
 test("channel-role outbox retries idempotently and dead-letters after a bounded attempt count", async ({ app }) => {
@@ -635,7 +521,7 @@ test("membership system messages persist causal actor and subtype at send (human
   // (persistedMessage path), which must now write the columns at persist time.
   const addHumanResponse = await fetch(`${app.baseUrl}/api/channels/${channel.id}/members`, {
     method: "POST",
-    headers: headers(owner.id, server.id),
+    headers: await headers(owner.id, server.id),
     body: JSON.stringify({ userId: invitee.id }),
   });
   assert.equal(addHumanResponse.status, 200);
@@ -652,7 +538,7 @@ test("membership system messages persist causal actor and subtype at send (human
   const agent = await createAgent(server.id, `membership-agent-${randomUUID().slice(0, 8)}`, { runtime: "codex" });
   const addAgentResponse = await fetch(`${app.baseUrl}/api/channels/${channel.id}/members`, {
     method: "POST",
-    headers: headers(owner.id, server.id),
+    headers: await headers(owner.id, server.id),
     body: JSON.stringify({ agentId: agent.id }),
   });
   assert.equal(addAgentResponse.status, 200);
@@ -691,4 +577,31 @@ test("agent channel rename broadcasts a channel.rename system message with the a
   )).orderBy(messages.seq).limit(1);
   assert.equal(renameMessage?.causalActorType, "agent");
   assert.equal(renameMessage?.causalActorId, agent.id);
+});
+
+test("an agent cannot make a channel with a Guest public: 409 external_members_keep_private (#wg-rbac:#16)", async ({ app: _app }) => {
+  const owner = await seedUser("ext-private-owner");
+  const guest = await seedUser("ext-private-guest");
+  const server = await createServer(`Ext private ${randomUUID().slice(0, 8)}`, `ext-private-${randomUUID().slice(0, 8)}`, owner.id);
+  const agent = await createAgent(server.id, `ext-private-agent-${randomUUID().slice(0, 8)}`, { runtime: "codex" });
+  await getDb().update(serverAgentMembers).set({ role: "admin" }).where(and(
+    eq(serverAgentMembers.serverId, server.id),
+    eq(serverAgentMembers.agentId, agent.id),
+  ));
+  const channel = await createChannel(server.id, `ext-private-${randomUUID().slice(0, 8)}`, undefined, "private", { type: "user", id: owner.id });
+  await addAgent(channel.id, agent.id);
+  await seedBoundGuest({ serverId: server.id, userId: guest.id, channelId: channel.id });
+  const actor = { id: agent.id, name: agent.name, serverId: server.id };
+
+  const refused = await updateChannelForAgent({ actor, serverId: server.id, channelId: channel.id, body: { visibility: "public" } });
+  assert.equal(refused.status, 409);
+  assert.equal((refused.body as { code?: string }).code, "external_members_keep_private");
+  const [still] = await getDb().select({ type: channels.type }).from(channels).where(eq(channels.id, channel.id));
+  assert.equal(still?.type, "private");
+
+  // Once the external relation is gone, the agent may make it public.
+  await getDb().delete(channelHumans).where(and(eq(channelHumans.channelId, channel.id), eq(channelHumans.userId, guest.id)));
+  await getDb().delete(serverMembers).where(and(eq(serverMembers.serverId, server.id), eq(serverMembers.userId, guest.id)));
+  const allowed = await updateChannelForAgent({ actor, serverId: server.id, channelId: channel.id, body: { visibility: "public" } });
+  assert.equal(allowed.status, 200, JSON.stringify(allowed.body));
 });

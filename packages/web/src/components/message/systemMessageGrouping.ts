@@ -1,8 +1,11 @@
+import { DELEGATED_RECEIPT_KIND } from "@botiverse/raft-shared";
 import type { IntlShape } from "react-intl";
 
+import { isWeChatConnectedNotice } from "../../assistant/wechatNotice";
+import { readTaskHandoffNotice } from "../task/taskHandoffNotice";
 import type { Message } from "../../store/messageStore";
 
-type MessageSlice = Pick<Message, "id" | "messageType" | "content">;
+type MessageSlice = Pick<Message, "id" | "messageType" | "content"> & Partial<Pick<Message, "actionMetadata" | "randomId">>;
 
 export type SystemMessageRenderState =
   | { kind: "hide"; groupId: string }
@@ -92,6 +95,13 @@ type SystemMessageCategory = "taskUpdate" | "reminder" | "system";
 
 function classifySystemMessage(message: MessageSlice): SystemMessageCategory | null {
   if (message.messageType !== "system") return null;
+  // RFC 077: a receipt for a message the assistant sent as its owner is a card
+  // with Retract, not an event line: it never folds into a group's summary.
+  if (message.actionMetadata?.kind === DELEGATED_RECEIPT_KIND) return null;
+  // Nor does the WeChat connected notice, a card with Disconnect WeChat.
+  if (isWeChatConnectedNotice(message)) return null;
+  // Nor does a task handed to someone with a reason: a card the assignee reads.
+  if (readTaskHandoffNotice(message)) return null;
   const content = stripLeadingStatusGlyph(message.content);
 
   if (parseTaskSystemEvent(message)) return "taskUpdate";
@@ -186,4 +196,27 @@ export function buildSystemMessageRenderStates(
   }
 
   return states;
+}
+
+/**
+ * The messages a system-message group folds into its summary: each hidden
+ * message's id, mapped to the id of the group's first message (the summary
+ * row, which renders the whole group, collapsed or expanded). A timeline
+ * gives a group ONE row: a hidden message is not a row of its own, so a long
+ * run of task events cannot fill the rows a virtual list mounts with empty
+ * ones (MessageTimelineProps.foldedMessageIds).
+ */
+export function foldedSystemMessageIds(
+  messages: readonly Pick<Message, "id">[],
+  states: readonly (SystemMessageRenderState | null)[],
+): ReadonlyMap<string, string> {
+  const folded = new Map<string, string>();
+  let owner: string | null = null;
+  for (let i = 0; i < messages.length; i += 1) {
+    const state = states[i];
+    if (state?.kind === "summary") owner = messages[i]!.id;
+    else if (state?.kind === "hide" && owner) folded.set(messages[i]!.id, owner);
+    else owner = null;
+  }
+  return folded;
 }

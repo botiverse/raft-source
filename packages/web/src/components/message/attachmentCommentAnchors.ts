@@ -11,6 +11,8 @@
 // (task #16).
 
 import type { IntlShape } from "react-intl";
+import { focusJumpTarget, lastInputWasKeyboard } from "../../hooks/useKeyboardJumpFocus";
+import { locateElement } from "../../utils/locateElement";
 
 type FormatMessage = IntlShape["formatMessage"];
 
@@ -115,38 +117,18 @@ function nearestMarkdownHeading(node: Node, mdRoot: HTMLElement): HTMLElement | 
 }
 
 /**
- * Map a TAPPED node to a structural anchor (tap-to-structure, task #26):
- * the line / row / nearest section the tap landed on, with that structure's
- * own text as the context quote. Returns null outside annotated structures.
+ * Map a TAPPED node to a structural anchor (tap-to-structure, task #26): the
+ * spreadsheet row the tap landed on, with the row's own text as the context
+ * quote. Returns null outside annotated rows. Only the side panel's comment
+ * mode taps to anchor, and of its previews only XLSX has rows; Markdown, text
+ * and CSV comment from a selection in the margin (task #118).
  */
 export function captureNodeAnchor(node: Node): CommentAnchor | null {
-  const line = closestWithAttr(node, "data-anchor-line");
-  if (line) {
-    const n = Number(line.getAttribute("data-anchor-line"));
-    if (Number.isFinite(n)) {
-      return { type: "lines", data: { start: n, end: n, quote: trimQuote(line.textContent ?? "") } };
-    }
-  }
   const row = closestWithAttr(node, "data-anchor-row");
   if (row) {
     const n = Number(row.getAttribute("data-anchor-row"));
     if (Number.isFinite(n)) {
       return { type: "csv-rows", data: { start: n, end: n, quote: trimQuote(row.textContent ?? "") } };
-    }
-  }
-  const mdRoot = closestWithAttr(node, "data-anchor-md-root");
-  if (mdRoot) {
-    const nearest = nearestMarkdownHeading(node, mdRoot);
-    if (nearest?.id) {
-      const block = node instanceof Element ? node : node.parentElement;
-      return {
-        type: "md-section",
-        data: {
-          headingId: nearest.id,
-          headingTitle: nearest.textContent?.trim() || nearest.id,
-          quote: trimQuote(block?.textContent ?? ""),
-        },
-      };
     }
   }
   return null;
@@ -175,6 +157,8 @@ export function anchorLabel(anchor: StoredAnchor, formatMessage: FormatMessage):
   if (anchor.type === "html-region") {
     // Quote-first: text near the captured region (via the bridge describe
     // request) is what a reader recognizes — "~37%" was not (cindyz 6/10).
+    // Where the full quote shows right under the chip (the comments panel's
+    // rows), the chip says "Jump to location" instead (AnchorJumpChip).
     const quote = anchor.data.quote;
     if (typeof quote === "string" && quote.trim().length > 0) {
       const trimmed = quote.trim();
@@ -238,28 +222,20 @@ export function parseTimestampLabel(label: string): number | null {
 
 /**
  * Vertical document-order key for sorting comments by anchor position
- * (Figma-list presentation): lines/rows sort by their 1-based start, html
- * regions by content y, markdown sections by the live heading's offset
- * inside the active preview scope. null = unanchored (callers sink these).
+ * in the side panel: spreadsheet rows by their 1-based start, html regions
+ * by content y, video times by time. null = unanchored (callers sink these).
+ * Markdown, text and CSV comments are ordered by the margin, beside their
+ * passages (task #118).
  * One attachment = one format, so keys never mix coordinate spaces.
  */
 export function anchorOrderKey(anchor: StoredAnchor): number | null {
-  if (anchor.type === "lines" || anchor.type === "csv-rows") {
+  if (anchor.type === "csv-rows") {
     const start = Number(anchor.data.start);
     return Number.isFinite(start) ? start : null;
   }
   if (anchor.type === "html-region") {
     const y = Number(anchor.data.y);
     return Number.isFinite(y) ? y : null;
-  }
-  if (anchor.type === "md-section") {
-    const id = typeof anchor.data.headingId === "string" ? anchor.data.headingId : "";
-    if (!id) return null;
-    const scopes = document.querySelectorAll<HTMLElement>("[data-anchor-scope]");
-    const root = scopes.length > 0 ? scopes[scopes.length - 1] : null;
-    const el = root?.querySelector<HTMLElement>(`#${CSS.escape(id)}`);
-    if (!el || !root) return null;
-    return el.getBoundingClientRect().top - root.getBoundingClientRect().top;
   }
   if (anchor.type === "video-timestamp") {
     const time = Number(anchor.data.time);
@@ -278,7 +254,8 @@ export function anchorQuote(anchor: StoredAnchor): string | undefined {
 const MAX_FLASH_ELEMENTS = 200;
 
 /**
- * Scroll the open preview to the anchor's location and flash-highlight it.
+ * Scroll the open preview to the anchor's location and locate it (the
+ * located highlight, states.md#located).
  * Returns false when the target structure is not in the DOM (e.g. preview
  * truncated before the anchored line).
  */
@@ -292,17 +269,15 @@ export function jumpToAnchor(anchor: StoredAnchor): boolean {
     return videoTimestampJumpHandler ? videoTimestampJumpHandler(time) : false;
   }
   // Resolve inside the ACTIVE preview only (last open [data-anchor-scope]) so
-  // a heading id or line marker in a background surface can never be hit.
+  // a row marker in a background surface can never be hit. Only the side
+  // panel jumps, and of its previews only XLSX has rows; Markdown, text and
+  // CSV comments sit beside their passage in the margin instead (task #118).
   const scopes = document.querySelectorAll<HTMLElement>("[data-anchor-scope]");
   const root: ParentNode = scopes.length > 0 ? scopes[scopes.length - 1] : document;
 
   const targets: HTMLElement[] = [];
-  if (anchor.type === "md-section") {
-    const id = typeof anchor.data.headingId === "string" ? anchor.data.headingId : "";
-    const el = id ? root.querySelector<HTMLElement>(`#${CSS.escape(id)}`) : null;
-    if (el) targets.push(el);
-  } else if (anchor.type === "lines" || anchor.type === "csv-rows") {
-    const attr = anchor.type === "lines" ? "data-anchor-line" : "data-anchor-row";
+  if (anchor.type === "csv-rows") {
+    const attr = "data-anchor-row";
     const start = Number(anchor.data.start);
     const end = Number(anchor.data.end ?? start);
     if (Number.isFinite(start)) {
@@ -316,12 +291,9 @@ export function jumpToAnchor(anchor: StoredAnchor): boolean {
   if (targets.length === 0) return false;
 
   targets[0].scrollIntoView({ behavior: "smooth", block: "center" });
-  for (const el of targets) {
-    // Restart the animation when jumping to the same anchor twice.
-    el.classList.remove("anchor-flash");
-    void el.offsetWidth;
-    el.classList.add("anchor-flash");
-    el.addEventListener("animationend", () => el.classList.remove("anchor-flash"), { once: true });
-  }
+  for (const el of targets) locateElement(el);
+  // A jump started from the keyboard lands focus on the first row
+  // (states.md#located); a click leaves it on the comment.
+  if (lastInputWasKeyboard()) focusJumpTarget(targets[0]);
   return true;
 }

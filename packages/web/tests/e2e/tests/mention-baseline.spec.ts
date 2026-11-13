@@ -72,8 +72,14 @@ for (const mode of MODES) {
     expect(measured!.offsets.map((o) => o.label)).toEqual(
       expect.arrayContaining([expect.stringContaining(peer.name), expect.stringContaining(seed.user.name)]),
     );
+    // A mention of the person reading is the yellow sticker, a chip set at
+    // 0.875em of the sentence like every chip in running text (raft-ui 0.22,
+    // message-item.md "Chips in running text"); another person's mention is
+    // inline text at the body size. Both sit on the body's baseline.
+    const bodyPx = Number.parseFloat(measured!.bodyFontSize);
     for (const { label, offset, fontSize } of measured!.offsets) {
-      expect(fontSize, `${label} uses the body font size`).toBe(measured!.bodyFontSize);
+      const chip = label === `@${seed.user.name}`;
+      expect(fontSize, `${label} ${chip ? "is a chip at 0.875em of" : "uses"} the body font size`).toBe(`${chip ? bodyPx * 0.875 : bodyPx}px`);
       expect(Math.abs(offset), `${label} baseline offset vs body text (px)`).toBeLessThanOrEqual(MAX_BASELINE_OFFSET_PX);
     }
   });

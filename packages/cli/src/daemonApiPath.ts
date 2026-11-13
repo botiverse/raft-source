@@ -167,6 +167,16 @@ export function createDaemonApiSurfaceClient(client: CliDaemonApiHttpClient) {
       ack: (body: DaemonApiRequestBodyByRoute["thirdPartyEventsAck"]) =>
         requestClientAsApiResponse(daemonApi.thirdPartyEvents.ack(body)),
     },
+    proc: {
+      list: () =>
+        requestClientAsApiResponse(daemonApi.proc.list()),
+      start: (body: DaemonApiRequestBodyByRoute["procStart"]) =>
+        requestClientAsApiResponse(daemonApi.proc.start(body)),
+      stop: (body: DaemonApiRequestBodyByRoute["procStop"]) =>
+        requestClientAsApiResponse(daemonApi.proc.stop(body)),
+      logs: (query: DaemonApiRequestQueryByRoute["procLogs"]) =>
+        requestClientAsApiResponse(daemonApi.proc.logs(query)),
+    },
     wakeHints: {
       fetch: (query: DaemonApiRequestQueryByRoute["wakeHintsFetch"]) =>
         requestClientAsApiResponse(daemonApi.wakeHints.fetch(query)),

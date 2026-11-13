@@ -30,7 +30,7 @@ export default function DeleteServerConfirmDialog({ onClose, layer }: { onClose:
       layer={layer}
       title={formatMessage({ id: "settings.dangerZone.deleteServerTitle" })}
       message={(
-        <div className="space-y-4">
+        <div className="stack-y-4">
           <p>
             {formatMessage({ id: "settings.dangerZone.deleteWarningPrefix" })}<span className="font-semibold text-foreground">{server.name}</span>{formatMessage({ id: "settings.dangerZone.deleteWarningSuffix" })}
           </p>

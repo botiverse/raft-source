@@ -32,7 +32,7 @@ import { createServer } from "../services/serverService";
 import { createAgent, deleteAgent } from "../services/agentService";
 import { mintAgentCredential } from "../services/agentCredentialService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 const PEPPER = "test-pepper";
 
@@ -77,7 +77,7 @@ async function login(baseUrl: string, email: string): Promise<string> {
 
 test("owner of agent's server mints sk_agent_* without X-Server-Id header", async () => {
   await withDeviceAuthGateOn(async () => {
-    const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+    const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
     try {
       const owner = await seedUser("owner-mint@slock.test", "owner-mint");
       const server = await createServer("Mint Test", "mint-test", owner.id);
@@ -105,6 +105,10 @@ test("owner of agent's server mints sk_agent_* without X-Server-Id header", asyn
       assert.equal(body.agentId, agent.id);
       assert.equal(body.serverId, server.id);
       assert.ok(typeof body.credentialId === "string" && body.credentialId.length > 0);
+      const [stored] = await getDb().select().from(agentCredentials).where(eq(agentCredentials.id, body.credentialId));
+      assert.equal(stored?.issuedVia, "human", "a person's mint records the human origin");
+      assert.equal(stored?.createdByUserId, owner.id);
+      assert.equal(stored?.issuedByMachineId, null);
       const whoami = await fetch(`${app.baseUrl}/internal/agent-api/`, {
         headers: { Authorization: `Bearer ${body.apiKey}` },
       });
@@ -113,9 +117,9 @@ test("owner of agent's server mints sk_agent_* without X-Server-Id header", asyn
       assert.equal(identity.agentId, agent.id);
       assert.equal(identity.credentialId, body.credentialId);
       // A credential from the pre-existing service remains usable and manageable.
-      const old = await mintAgentCredential({ agentId: agent.id, scopes: ["read"], createdByUserId: owner.id, name: "Existing deployment" });
+      const old = await mintAgentCredential({ agentId: agent.id, scopes: ["read"], issuedVia: "human", createdByUserId: owner.id, name: "Existing deployment" });
       const otherAgent = await createAgent(server.id, "other-credential-agent", { runtime: "external" });
-      const other = await mintAgentCredential({ agentId: otherAgent.id, scopes: ["read"], createdByUserId: owner.id });
+      const other = await mintAgentCredential({ agentId: otherAgent.id, scopes: ["read"], issuedVia: "human", createdByUserId: owner.id });
       const headers = { Authorization: `Bearer ${token}` };
       const list = await fetch(`${app.baseUrl}/api/agents/${agent.id}/credentials`, { headers });
       assert.equal(list.status, 200);
@@ -157,7 +161,7 @@ test("owner of agent's server mints sk_agent_* without X-Server-Id header", asyn
 
 test("agent creator keeps issueAgentCredentials authority after demotion to member", async () => {
   await withDeviceAuthGateOn(async () => {
-    const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+    const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
     try {
       const owner = await seedUser("creator-mint-owner@slock.test", "creator-mint-owner");
       const creator = await seedUser("creator-mint-member@slock.test", "creator-mint-member");
@@ -188,7 +192,7 @@ test("agent creator keeps issueAgentCredentials authority after demotion to memb
 
 test("user who is not a member of agent's server gets 404 agent_missing (anti-enumeration)", async () => {
   await withDeviceAuthGateOn(async () => {
-    const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+    const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
     try {
       // user_A is the owner of server_X. agent_Y belongs to server_Z, which
       // user_A is NOT a member of. user_A must NOT be able to learn agent_Y
@@ -225,7 +229,7 @@ test("user who is not a member of agent's server gets 404 agent_missing (anti-en
 
 test("server member without issueAgentCredentials or creator authority gets 403 insufficient_role", async () => {
   await withDeviceAuthGateOn(async () => {
-    const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+    const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
     try {
       const owner = await seedUser("role-owner@slock.test", "role-owner");
       const member = await seedUser("role-member@slock.test", "role-member");
@@ -267,7 +271,7 @@ test("server member without issueAgentCredentials or creator authority gets 403 
 
 test("soft-deleted agent returns 404 agent_missing — not 403, not 400 (Hao gate)", async () => {
   await withDeviceAuthGateOn(async () => {
-    const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+    const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
     try {
       // Two probes against a soft-deleted agent:
       //   (a) the server owner: must see anti-enum 404 (not 400 from bad
@@ -334,7 +338,7 @@ test("soft-deleted agent returns 404 agent_missing — not 403, not 400 (Hao gat
 
 test("unknown agent id returns 404 agent_missing (same shape as cross-server)", async () => {
   await withDeviceAuthGateOn(async () => {
-    const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+    const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
     try {
       const user = await seedUser("unknown-agent-user@slock.test", "unknown-agent-user");
       await createServer("Unknown Agent Test", "unknown-agent-test", user.id);

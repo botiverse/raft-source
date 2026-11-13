@@ -1,0 +1,1 @@
+ALTER TABLE "oauth_client_installs" ADD COLUMN "bot_status_text" text;

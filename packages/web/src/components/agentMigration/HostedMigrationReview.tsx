@@ -136,7 +136,7 @@ export function HostedMigrationReview({
                 {shown.length > 0 ? (
                   // Plain list: raft-ui has no non-markdown list primitive; each path is DS mono meta text.
                   <dd className="m-0">
-                    <ul className="space-y-0.5">
+                    <ul className="stack-y-0.5">
                       {shown.map((path) => (
                         <TextMono key={path} size="meta" variant="muted" className="break-all" render={<li />}>
                           {path}
@@ -169,10 +169,10 @@ export function HostedMigrationReview({
         ) : null}
       </CardContent>
       <CardFooter className="flex justify-end gap-2">
-        <Button variant="outline" size="sm" type="button" onClick={onShowCancel} disabled={submitting || !canCancelMigration(notice)}>
+        <Button variant="outline" size="md" type="button" onClick={onShowCancel} disabled={submitting || !canCancelMigration(notice)}>
           {formatMessage({ id: "agent.detail.cancel" })}
         </Button>
-        <Button variant="accent" size="sm" type="button" onClick={confirm} disabled={submitting} aria-busy={submitting}>
+        <Button variant="accent" size="md" type="button" onClick={confirm} disabled={submitting} aria-busy={submitting}>
           {submitting
             ? formatMessage({ id: "agent.migration.hosted.confirming" })
             : formatMessage({ id: "agent.migration.hosted.confirm" })}

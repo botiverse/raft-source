@@ -36,6 +36,7 @@ afterEach(() => {
   api.get = originalGet;
   useTaskStore.setState({
     tasks: [], loading: false, currentChannelId: null,
+    tasksByChannelId: {}, loadingByChannelId: {}, loadedByChannelId: {},
     serverTasks: [], serverLoading: false, serverTasksLoaded: false, serverTasksGeneration: 0,
     serverTasksActiveConsumers: 0,
     serverTaskPages: {
@@ -267,4 +268,33 @@ test("with no Tasks view open, a reconnect does not fetch; the next mount does",
   assert.equal(urls.length, 3);
   assert.ok(urls.every((url) => url.includes("detail=summary")));
   cleanup();
+});
+
+// Screenshot review 5e: a per-channel load that arrives while the same channel
+// is already loading used to return at once, before the tasks landed, so a
+// caller reading tasksByChannelId right after `await loadTasks(id)` (the task
+// window) saw an empty bucket. Concurrent callers share the in-flight request.
+test("concurrent loadTasks callers for one channel share the fetch AND its completion", async () => {
+  let calls = 0;
+  let release: () => void = () => {};
+  api.get = ((url: string) => {
+    assert.equal(url, "/tasks/channel/c1");
+    calls += 1;
+    return new Promise((res) => { release = () => res({ data: { tasks: [TASK] } }); });
+  }) as typeof api.get;
+  const a = useTaskStore.getState().loadTasks("c1");
+  const b = useTaskStore.getState().loadTasks("c1");
+  let seenWhenBResolved: number | undefined;
+  const bDone = b.then(() => { seenWhenBResolved = useTaskStore.getState().tasksByChannelId.c1?.length; });
+  assert.equal(calls, 1, "the second caller stacked another fetch");
+  release();
+  await Promise.all([a, bDone]);
+  assert.equal(seenWhenBResolved, 1, "the second caller resolved before the channel's tasks landed");
+  assert.equal(useTaskStore.getState().loadingByChannelId.c1, false);
+
+  // Once settled, a later call fetches again (no stale in-flight slot).
+  const c = useTaskStore.getState().loadTasks("c1");
+  assert.equal(calls, 2);
+  release();
+  await c;
 });

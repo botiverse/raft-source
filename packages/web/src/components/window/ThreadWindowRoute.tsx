@@ -1,11 +1,16 @@
-import { useCallback, useEffect, useEffectEvent, useMemo, useState } from "react";
+import { Suspense, useCallback, useEffect, useEffectEvent, useMemo, useState } from "react";
 import { MapPin, X } from "lucide-react";
 import { useIntl } from "react-intl";
 import { useLocation, useNavigate, useParams } from "react-router-dom";
 import { Button, PanelAction } from "@botiverse/raft-ui";
-import ThreadPanel from "../message/ThreadPanel";
+import { ThreadPanel } from "../../features/thread/DeferredThreadPanel";
 import LegacyTaskPanel from "../task/LegacyTaskPanel";
 import TaskModalHead from "../task/TaskModalHead";
+import { loadTaskConversationDialog, TaskConversationPage } from "../task/taskConversationDialogChunk";
+import { parseTaskConversationParam } from "../../utils/taskConversation";
+import { getSocket } from "../../api/socket";
+import { applyTaskDeleted, isTaskDeletedForTarget } from "../../store/taskRealtimeSync";
+import type { TaskDeletedEvent } from "../../store/taskRealtimeSync";
 import Tooltip from "../ui/Tooltip";
 import { useChannelStore } from "../../store/channelStore";
 import { useLegacyTaskPanelStore } from "../../store/legacyTaskPanelStore";
@@ -13,6 +18,8 @@ import { selectChannelTaskBucket, useTaskStore } from "../../store/taskStore";
 import { useThreadStore } from "../../store/threadStore";
 import { resolveThreadHostTask } from "../layout/threadHostTask";
 import { buildTaskChannelUrl, closeThreadWindow } from "./closeThreadWindow";
+import { ContentLoading } from "../ui/ContentLoading";
+import { CONTROL_END_PULL } from "../ui/headEdges";
 
 const NON_INTERACTIVE_TOOLTIP_PROPS = { className: "pointer-events-none" };
 
@@ -47,13 +54,25 @@ export default function ThreadWindowRoute() {
   const threadParam = params.get("thread");
   const legacyTaskParam = params.get("legacyTask");
   const taskIntent = params.get("task") === "1";
+  // Task v2: `task=<ch>:task:<taskId>` opens the task dialog's content keyed
+  // by the task (its own conversation), as in the main window.
+  const taskConversationParam = params.get("task");
+  const taskConversationTarget = useMemo(() => parseTaskConversationParam(taskConversationParam), [taskConversationParam]);
+  const taskConversationChannelId = taskConversationTarget?.channelId ?? null;
+  const taskConversationTaskId = taskConversationTarget?.taskId ?? null;
+  const openTaskConversation = useThreadStore((state) => state.openTaskConversation);
+  const taskConversationOpen = !!taskConversationTaskId && taskModal?.taskId === taskConversationTaskId && !taskModal.parentMessageId;
+  // A task window: its page's code (deferred) loads beside the task itself.
+  useEffect(() => {
+    if (taskConversationTaskId) void loadTaskConversationDialog().catch(() => {});
+  }, [taskConversationTaskId]);
   const surfaceParentChannelId = taskIntent ? taskModal?.parentChannelId ?? null : openParentChannelId;
   const surfaceParentMessageId = taskIntent ? taskModal?.parentMessageId ?? null : openParentMessageId;
   const parentChannelTasks = useTaskStore((state) => selectChannelTaskBucket(state, surfaceParentChannelId));
   const invalidTarget = !serverSlug
-    || (!legacyTaskParam && !threadParam)
+    || (!legacyTaskParam && !threadParam && !taskConversationTarget)
     || (legacyTaskParam !== null && !legacyTaskParam.includes(":"))
-    || (legacyTaskParam === null && !threadParam?.includes(":"));
+    || (legacyTaskParam === null && !taskConversationTarget && !threadParam?.includes(":"));
 
   const closeWindow = useCallback(() => {
     closeThreadWindow({
@@ -65,6 +84,26 @@ export default function ThreadWindowRoute() {
       navigate,
     });
   }, [closeLegacyTask, closeThread, navigate, serverSlug]);
+
+  // Task v2: this window has no main-layout socket bridge, so it hears
+  // `task:deleted` itself. When its task is deleted, its conversation is gone
+  // with it: drop it from the stores and close the window, as the main window
+  // closes the task dialog.
+  const boundConversationChannelId = taskConversationOpen ? taskModal?.threadChannelId ?? null : null;
+  const handleTaskDeleted = useEffectEvent((data: TaskDeletedEvent) => {
+    if (!isTaskDeletedForTarget(data, { taskId: taskConversationTaskId, conversationChannelId: boundConversationChannelId })) return;
+    applyTaskDeleted(data);
+    closeWindow();
+  });
+  useEffect(() => {
+    if (!taskConversationTaskId) return;
+    const socket = getSocket();
+    const listener = (data: TaskDeletedEvent) => handleTaskDeleted(data);
+    socket.on("task:deleted", listener);
+    return () => {
+      socket.off("task:deleted", listener);
+    };
+  }, [taskConversationTaskId]);
 
   const viewInChannel = useCallback((
     channelId: string,
@@ -134,6 +173,30 @@ export default function ThreadWindowRoute() {
       return () => { cancelled = true; };
     }
 
+    if (taskConversationChannelId && taskConversationTaskId) {
+      const channelId = taskConversationChannelId;
+      const focusedMessageId = readFocusedMessageId();
+      void ensureChannel(channelId).then(async (resolved) => {
+        if (!resolved) throw new Error("Channel unavailable");
+        await loadTasks(channelId);
+        if (cancelled) return;
+        const known = useTaskStore.getState().tasksByChannelId[channelId]?.some((item) => item.id === taskConversationTaskId);
+        if (!known) {
+          fail();
+          return;
+        }
+        openTaskConversation({
+          serverSlug,
+          taskId: taskConversationTaskId,
+          parentChannelId: channelId,
+          focusedMessageId,
+        });
+      }).catch(() => {
+        fail();
+      });
+      return () => { cancelled = true; };
+    }
+
     if (!threadParam) {
       return () => { cancelled = true; };
     }
@@ -167,6 +230,9 @@ export default function ThreadWindowRoute() {
     threadParam,
     legacyTaskParam,
     taskIntent,
+    taskConversationChannelId,
+    taskConversationTaskId,
+    openTaskConversation,
     closeThread,
     closeLegacyTask,
     ensureChannel,
@@ -194,6 +260,7 @@ export default function ThreadWindowRoute() {
     parentChannelId: taskModal.parentChannelId ?? "",
     threadChannelId: taskModal.threadChannelId,
     focusedMessageId: taskModal.focusedMessageId,
+    focusNonce: taskModal.focusNonce,
   } : undefined, [taskIntent, taskModal]);
 
   const viewLegacyTaskInChannel = useCallback(() => {
@@ -202,9 +269,10 @@ export default function ThreadWindowRoute() {
   }, [legacyChannelId, legacyChannelType, legacyMessageId, viewInChannel]);
   const taskPageSlot = task ? (
     <>
-      {/* Head actions are raft-ui PanelAction; md:pr-[13px] is the panel-head
-          recipe's right edge, landing the last glyph 20px from the edge. */}
-      <div className="flex shrink-0 items-center justify-between gap-3 border-b border-line-seam bg-layer-canvas px-4 py-2 md:pr-[13px]">
+      {/* The bar pads by the content margin (16, 20 from 768px) and its
+          PanelActions are pulled out by their icon inset, so the last icon
+          box ends on the margin at 32px and 44px alike (headEdges.ts). */}
+      <div className="flex shrink-0 items-center justify-between gap-3 border-b border-line-seam bg-layer-canvas px-4 py-2 md:px-(--surface-inset)">
         <Tooltip
           content={task.title}
           disableHoverablePopup
@@ -214,7 +282,7 @@ export default function ThreadWindowRoute() {
             {formatMessage({ id: "task.modal.taskWithNumber" }, { taskNumber: task.taskNumber })}
           </strong>
         </Tooltip>
-        <div className="flex shrink-0 items-center gap-1">
+        <div className={`flex shrink-0 items-center gap-1 ${CONTROL_END_PULL}`}>
           <Tooltip
             content={formatMessage({ id: "message.threadPanel.viewInChannel" })}
             disableHoverablePopup
@@ -253,10 +321,22 @@ export default function ThreadWindowRoute() {
         {invalidTarget || asyncError ? (
           <div className="flex w-full max-w-2xl flex-col items-center justify-center gap-4 rounded-container border border-line-seam bg-layer-canvas p-8 text-center">
             <p className="text-headline text-foreground">{asyncError ?? formatMessage({ id: "message.threadPanel.loadFailedTitle" })}</p>
-            <Button type="button" onClick={closeWindow} size="sm" variant="outline">
+            <Button type="button" onClick={closeWindow} size="md" variant="outline">
               {formatMessage({ id: "message.threadPanel.closeThread" })}
             </Button>
           </div>
+        ) : taskConversationTarget ? (
+          taskConversationOpen ? (
+            <div data-testid="thread-window-surface" className="flex min-h-full w-full max-w-none flex-col overflow-hidden bg-layer-canvas sm:h-[calc(100dvh-1.5rem)] sm:max-h-full sm:min-h-0 sm:max-w-3xl sm:rounded-container sm:border sm:border-line-seam">
+              <Suspense fallback={<ContentLoading>{formatMessage({ id: "common.loading" })}</ContentLoading>}>
+                <TaskConversationPage presentation="modal" page onClose={closeWindow} />
+              </Suspense>
+            </div>
+          ) : (
+            <div className="flex h-[calc(100dvh-1.5rem)] max-h-full w-full max-w-3xl items-center justify-center rounded-container border border-line-seam bg-layer-canvas">
+              <ContentLoading>{formatMessage({ id: "common.loading" })}</ContentLoading>
+            </div>
+          )
         ) : legacyTask ? (
           <LegacyTaskPanel
             presentation="modal"
@@ -277,7 +357,7 @@ export default function ThreadWindowRoute() {
           </div>
         ) : (
           <div className="flex h-[calc(100dvh-1.5rem)] max-h-full w-full max-w-3xl items-center justify-center rounded-container border border-line-seam bg-layer-canvas">
-            <span className="text-callout text-foreground-hint">{formatMessage({ id: "common.loading" })}</span>
+            <ContentLoading>{formatMessage({ id: "common.loading" })}</ContentLoading>
           </div>
         )}
       </div>

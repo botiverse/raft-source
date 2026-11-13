@@ -11,17 +11,21 @@ import api from "../../api/client";
 import Banner from "../ui/Banner";
 import DialogCard from "../ui/DialogCard";
 import FormField from "../ui/FormField";
+import { DialogCardFooter, DialogCommit } from "../ui/NarrowDialog";
 
 export default function EditProviderConnectionModal({
   connection,
   providerOptions,
   onClose,
   onCompleted,
+  layer,
 }: {
   connection: ProviderConnectionSummary;
   providerOptions: ProviderConnectionProviderOption[];
   onClose: () => void;
   onCompleted: () => Promise<void>;
+  /** The layer of the dialog it is rendered inside (the runtime editor's 1), so it stacks over that one. */
+  layer?: 0 | 1;
 }) {
   const { formatMessage } = useIntl();
   // oxlint-disable-next-line react-doctor/no-derived-useState -- the keyed modal snapshots the selected row when it opens; catalog refreshes must not overwrite in-progress input.
@@ -79,12 +83,12 @@ export default function EditProviderConnectionModal({
       onClose={onClose}
       title={formatMessage({ id: "settings.providers.editTitle" }, { name: connection.name })}
       testId="provider-connection-edit-dialog"
-      // Opens from inside the agent detail runtime editor (Modal layer=1) and
-      // the onboarding create dialog (layer=1): without an explicit tier it
-      // renders at z-50, behind its own parent.
-      layer={2}
+      narrow="sheet"
+      // Rendered inside the dialog it opens from (Create Agent, the agent detail runtime editor), so raft-ui stacks it
+      // over that one; it takes that dialog's layer (the editor is at 1). From Settings it is the only dialog.
+      layer={layer}
     >
-      <form onSubmit={submit} className="space-y-4" data-testid="provider-connection-edit-form">
+      <form onSubmit={submit} className="stack-y-4 md:pointer-fine:stack-y-3" data-testid="provider-connection-edit-form">
         <FormField label={formatMessage({ id: "settings.providers.name" })} htmlFor={nameInputId}>
           <Input
             id={nameInputId}
@@ -133,19 +137,23 @@ export default function EditProviderConnectionModal({
           </label>
         )}
         {error && <Banner intent="warning" density="sm">{error}</Banner>}
-        <div className="flex justify-end gap-2">
+        <DialogCardFooter>
           <Button size="lg" type="button" variant="ghost" onClick={onClose}>
             {formatMessage({ id: "settings.common.cancel" })}
           </Button>
-          <Button size="lg"
-            type="submit"
-            variant="primary"
-            disabled={submitting || !name.trim() || (gateway && !endpointUrl.trim())}
-          >
-            {submitting ? <Spinner size="sm" aria-hidden="true" /> : <Pencil size={16} />}
-            {formatMessage({ id: "settings.providers.saveChanges" })}
-          </Button>
-        </div>
+          <DialogCommit>
+            {(inHead) => (
+              <Button size={inHead ? "md" : "lg"}
+                type="submit"
+                variant="primary"
+                disabled={submitting || !name.trim() || (gateway && !endpointUrl.trim())}
+              >
+                {submitting ? <Spinner size="sm" aria-hidden="true" /> : <Pencil size={16} />}
+                {formatMessage({ id: "settings.providers.saveChanges" })}
+              </Button>
+            )}
+          </DialogCommit>
+        </DialogCardFooter>
       </form>
     </DialogCard>
   );

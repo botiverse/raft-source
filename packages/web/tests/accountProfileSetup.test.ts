@@ -6,7 +6,6 @@ function user(overrides: Partial<User> = {}): User {
   return {
     id: "user-1",
     email: "user@example.com",
-    gravatarHash: "hash",
     name: "user-name",
     displayName: "User Name",
     description: null,

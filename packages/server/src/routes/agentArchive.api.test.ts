@@ -12,13 +12,14 @@ import { registerMachine } from "../services/machineService";
 import { mintAgentCredential } from "../services/agentCredentialService";
 import { createReminder } from "../apps/reminder/service";
 import { beginTestAgentMigration } from "../test/agentMigrationFixture";
+import { seedBoundGuest } from "../test/guestFixture";
 import {
   dispatchPendingAgentArchiveOps,
   getAgentArchive,
   type AgentArchiveDispatchPort,
 } from "../services/agentArchiveService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 function userHeaders(token: string, serverId: string): Record<string, string> {
   return { Authorization: `Bearer ${token}`, "X-Server-Id": serverId, "Content-Type": "application/json" };
@@ -74,7 +75,7 @@ test("archiving keeps the workspace on its Computer, cancels reminders and revok
     payload: null,
     createdBy: { type: "agent", id: fixture.agent.id },
   });
-  await mintAgentCredential({ agentId: fixture.agent.id, scopes: ["send"], name: "archive-test", createdByUserId: fixture.owner.id });
+  await mintAgentCredential({ agentId: fixture.agent.id, scopes: ["send"], name: "archive-test", issuedVia: "human", createdByUserId: fixture.owner.id });
 
   const res = await archive(app.baseUrl, fixture);
   assert.equal(res.status, 200);
@@ -282,7 +283,8 @@ async function seedMember(serverId: string, role: "member" | "guest") {
     emailVerified: true,
     profileSetupCompletedAt: new Date(),
   }).returning();
-  await getDb().insert(serverMembers).values({ serverId, userId: user.id, role });
+  if (role === "guest") await seedBoundGuest({ serverId, userId: user.id });
+  else await getDb().insert(serverMembers).values({ serverId, userId: user.id, role });
   return { user, token: await tokenForHuman(user.email) };
 }
 

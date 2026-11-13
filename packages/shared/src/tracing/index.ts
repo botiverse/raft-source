@@ -309,6 +309,7 @@ export const TRACE_SCOPE_ATTR_REGISTRY = {
   daemon_version_present: { key: "daemon_version_present", category: "resource", valueKind: "presence", highCardinality: false },
   computer_version: { key: "computer_version", category: "resource", valueKind: "version", highCardinality: false },
   computer_version_present: { key: "computer_version_present", category: "resource", valueKind: "presence", highCardinality: false },
+  computer_build_sha: { key: "computer_build_sha", category: "resource", valueKind: "version", highCardinality: true },
   deployment_environment: { key: "deployment_environment", category: "resource", valueKind: "closed_enum", highCardinality: false },
   service_revision: { key: "service_revision", category: "resource", valueKind: "version", highCardinality: true },
   request_id: { key: "request_id", category: "request", valueKind: "identity", highCardinality: true },
@@ -335,6 +336,7 @@ export type TraceScopeAttrKey = keyof typeof TRACE_SCOPE_ATTR_REGISTRY;
 export interface ResourceTraceScope {
   daemonVersion?: string | null;
   computerVersion?: string | null;
+  computerBuildSha?: string | null;
   deploymentEnvironment?: "production" | "staging" | "development" | "test" | string | null;
   serviceRevision?: string | null;
 }
@@ -373,6 +375,7 @@ export function projectTraceScopeAttrs(scope: TraceScope): TraceAttributes {
   addPresenceAttr(attrs, "daemon_version_present", scope.resource?.daemonVersion);
   addOptionalStringAttr(attrs, "computer_version", scope.resource?.computerVersion);
   addPresenceAttr(attrs, "computer_version_present", scope.resource?.computerVersion);
+  addOptionalStringAttr(attrs, "computer_build_sha", scope.resource?.computerBuildSha);
   addOptionalStringAttr(attrs, "deployment_environment", scope.resource?.deploymentEnvironment);
   addOptionalStringAttr(attrs, "service_revision", scope.resource?.serviceRevision);
 

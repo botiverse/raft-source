@@ -10,10 +10,10 @@ import { once } from "node:events";
 import { and, eq } from "drizzle-orm";
 import WebSocket from "ws";
 import { createApiTest } from "../test/integration/apiTest";
-import { signAccessToken } from "../middleware/auth";
+import { accessTokenForTest } from "../test/integration/credentials";
 import { inboxNotificationFacts, pushRegistrations } from "../db/schema";
 
-const test = createApiTest({ onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest();
 
 function waitPacket(ws: WebSocket, packets: string[], predicate: (p: string) => boolean, label: string) {
   if (packets.some(predicate)) return Promise.resolve();
@@ -70,13 +70,13 @@ test("hostile custom client cannot subscribe to, replay, or be push-targeted for
   const reg = await fetch(`${app.baseUrl}/api/push/registrations`, {
     method: "POST",
     headers: { ...json, Authorization: `Bearer ${accessToken}`, "X-Server-Id": s1.id },
-    body: JSON.stringify({ installationId: "attacker-install", provider: "apns", env: "production", topic: "ai.slock.app", deviceToken: "attacker-token" }),
+    body: JSON.stringify({ installationId: "attacker-install", provider: "apns", env: "production", topic: "build.raft.app", deviceToken: "attacker-token" }),
   });
   assert.equal(reg.status, 200, await reg.clone().text());
 
   // 1. Handshake against a server the attacker is not a member of is refused.
   {
-    const { ws, packets } = rawSocket(app.baseUrl, { token: signAccessToken(attacker.id), serverId: s2.id });
+    const { ws, packets } = rawSocket(app.baseUrl, { token: await accessTokenForTest(attacker.id), serverId: s2.id });
     try {
       await waitPacket(ws, packets, (p) => p.startsWith("44") || p.startsWith("40"), "handshake result");
       const denied = packets.find((p) => p.startsWith("44"));
@@ -87,7 +87,7 @@ test("hostile custom client cannot subscribe to, replay, or be push-targeted for
   }
 
   // 2. Legit handshake against s1, then hostile join:channel attempts.
-  const { ws, packets } = rawSocket(app.baseUrl, { token: signAccessToken(attacker.id), serverId: s1.id, clientKind: "mobile" });
+  const { ws, packets } = rawSocket(app.baseUrl, { token: await accessTokenForTest(attacker.id), serverId: s1.id, clientKind: "mobile" });
   try {
     await waitPacket(ws, packets, (p) => p.includes('"rooms:joined"'), "rooms:joined");
     const connected = packets.find((p) => p.startsWith("40"))!;

@@ -21,7 +21,7 @@ export function IntegrationActionButton({
 }) {
   const handleClick = useCallback(() => onAct(path, body, failureMessageId), [onAct, path, body, failureMessageId]);
   return (
-    <Button variant={variant} size="sm" onClick={handleClick}>
+    <Button variant={variant} size="md" onClick={handleClick}>
       {children}
     </Button>
   );

@@ -1,13 +1,13 @@
 import { createApiTest } from "../test/integration/apiTest";
 import assert from "node:assert/strict";
 
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import argon2 from "argon2";
 import { PGlite } from "@electric-sql/pglite";
 import { drizzle as drizzlePglite } from "drizzle-orm/pglite";
 import { and, eq, sql } from "drizzle-orm";
-import { CHANNEL_TO_JOINT_CONVERSION_FEATURE_FLAG_KEY, COMPOSER_RESOURCE_REFERENCES_FEATURE_FLAG_KEY } from "@botiverse/raft-shared";
+import { MOBILE_INBOX_INPLACE_FEATURE_FLAG_KEY, WORKSPACE_ARTIFACTS_FEATURE_FLAG_KEY } from "@botiverse/raft-shared";
 import { openTestApp } from "../test/integration/app";
 import { openTestApp as startTestApp } from "../test/integration/app";
 import { getDb, type DatabaseExecutor } from "../db/index";
@@ -27,13 +27,7 @@ import {
 } from "../db/schema";
 import { createServer } from "./serverService";
 import {
-  AGENT_MIGRATION_FEATURE_FLAG_KEY,
-  LLM_TRANSLATION_FEATURE_FLAG_KEY,
-  APPLE_WEB_LOGIN_FEATURE_FLAG_KEY,
-  ATTACHMENT_COMMENTS_FEATURE_FLAG_KEY,
-  ATTACHMENT_DIRECT_UPLOAD_FEATURE_FLAG_KEY,
-  ATTACHMENT_ORIGINAL_STORAGE_V2_FEATURE_FLAG_KEY,
-  GROK_RUNTIME_FEATURE_FLAG_KEY,
+  AGENT_READ_PROGRESS_FEATURE_FLAG_KEY,
   SERVER_LABS_UI_FEATURE_FLAG_KEY,
   bumpFeatureFlagConfigVersion,
   computeFeatureFlagBucket,
@@ -78,7 +72,7 @@ function parseChannelJointMigration(sqlText: string): Record<string, string> {
   assert.equal(columns.length, values.length, "migration INSERT columns and VALUES must stay positionally aligned");
   return Object.fromEntries(columns.map((column, index) => [column, values[index]]));
 }
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 function causedByConstraint(name: string) {
   return (error: unknown): boolean => {
@@ -88,7 +82,7 @@ function causedByConstraint(name: string) {
 }
 
 test("feature flags: reusable audiences match user OR server while direct rules retain precedence", async () => {
-  const { close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const { close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   const key = "audience_or_v0";
   const audienceKey = "insiders";
   const userId = "00000000-0000-4000-8000-00000000a101";
@@ -144,16 +138,18 @@ test("feature flags: reusable audiences match user OR server while direct rules 
   }
 });
 
-test("feature flags: seeded attachment comments flag is default-on and global kill switch is fresh", async () => {
-  const { close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+test("feature flags: a default-on flag's global kill switch is fresh for every context", async () => {
+  const { close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
+    const key = "kill_switch_fresh_v0";
     const serverId = "00000000-0000-4000-8000-00000000ff01";
+    await createFeatureFlag({ key, randomizationUnit: "server", defaultEnabled: true, salt: "kill-switch-fresh" });
     const before = await evaluateFeatureFlag({
-      key: ATTACHMENT_COMMENTS_FEATURE_FLAG_KEY,
+      key,
       serverId,
     });
     assert.deepEqual(before, {
-      key: ATTACHMENT_COMMENTS_FEATURE_FLAG_KEY,
+      key,
       enabled: true,
       reason: "default",
     });
@@ -161,7 +157,7 @@ test("feature flags: seeded attachment comments flag is default-on and global ki
     await getDb()
       .update(featureFlags)
       .set({ killSwitch: true })
-      .where(eq(featureFlags.key, ATTACHMENT_COMMENTS_FEATURE_FLAG_KEY));
+      .where(eq(featureFlags.key, key));
 
     const killedContexts = [
       { serverId },
@@ -173,10 +169,10 @@ test("feature flags: seeded attachment comments flag is default-on and global ki
     ];
     for (const context of killedContexts) {
       assert.deepEqual(await evaluateFeatureFlag({
-        key: ATTACHMENT_COMMENTS_FEATURE_FLAG_KEY,
+        key,
         ...context,
       }), {
-        key: ATTACHMENT_COMMENTS_FEATURE_FLAG_KEY,
+        key,
         enabled: false,
         reason: "kill_switch",
       });
@@ -186,15 +182,14 @@ test("feature flags: seeded attachment comments flag is default-on and global ki
   }
 });
 
-test("feature flags: attachment original storage v2 is default-on and immediately killable", async () => {
-  const { close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+test("feature flags: a default-on flag is immediately killable", async () => {
+  const { close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
+    const key = "default_on_kill_switch_v0";
     const serverId = "00000000-0000-4000-8000-00000000ff11";
-    assert.deepEqual(await evaluateFeatureFlag({
-      key: ATTACHMENT_ORIGINAL_STORAGE_V2_FEATURE_FLAG_KEY,
-      serverId,
-    }), {
-      key: ATTACHMENT_ORIGINAL_STORAGE_V2_FEATURE_FLAG_KEY,
+    await createFeatureFlag({ key, randomizationUnit: "server", defaultEnabled: true, salt: "default-on-kill-switch" });
+    assert.deepEqual(await evaluateFeatureFlag({ key, serverId }), {
+      key,
       enabled: true,
       reason: "default",
     });
@@ -202,13 +197,10 @@ test("feature flags: attachment original storage v2 is default-on and immediatel
     await getDb()
       .update(featureFlags)
       .set({ killSwitch: true })
-      .where(eq(featureFlags.key, ATTACHMENT_ORIGINAL_STORAGE_V2_FEATURE_FLAG_KEY));
+      .where(eq(featureFlags.key, key));
 
-    assert.deepEqual(await evaluateFeatureFlag({
-      key: ATTACHMENT_ORIGINAL_STORAGE_V2_FEATURE_FLAG_KEY,
-      serverId,
-    }), {
-      key: ATTACHMENT_ORIGINAL_STORAGE_V2_FEATURE_FLAG_KEY,
+    assert.deepEqual(await evaluateFeatureFlag({ key, serverId }), {
+      key,
       enabled: false,
       reason: "kill_switch",
     });
@@ -218,7 +210,7 @@ test("feature flags: attachment original storage v2 is default-on and immediatel
 });
 
 test("feature flags: seeded human Activity mute gate is default-off", async () => {
-  const { close } = await openTestApp("pglite://", 0, { onboardingOpenerFlagDefaultEnabled: false, humanActivityMuteFlagDefaultEnabled: false });
+  const { close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: false });
   try {
     assert.deepEqual(await evaluateFeatureFlag({
       key: "human_activity_mute_v0",
@@ -234,11 +226,11 @@ test("feature flags: seeded human Activity mute gate is default-off", async () =
 });
 
 test("feature flags: config version cursor bumps on service writes", async () => {
-  const { close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const { close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
-    assert.equal(await getFeatureFlagConfigVersion(), 0);
-    assert.equal(await bumpFeatureFlagConfigVersion({ updatedBy: "test-operator" }), 1);
-    assert.equal(await getFeatureFlagConfigVersion(), 1);
+    const initialVersion = await getFeatureFlagConfigVersion();
+    assert.equal(await bumpFeatureFlagConfigVersion({ updatedBy: "test-operator" }), initialVersion + 1);
+    assert.equal(await getFeatureFlagConfigVersion(), initialVersion + 1);
 
     const flag = await createFeatureFlag({
       key: "config_version_cursor_v0",
@@ -247,10 +239,10 @@ test("feature flags: config version cursor bumps on service writes", async () =>
       salt: "config-version-cursor",
     });
     assert.equal(flag.key, "config_version_cursor_v0");
-    assert.equal(await getFeatureFlagConfigVersion(), 2);
+    assert.equal(await getFeatureFlagConfigVersion(), initialVersion + 2);
 
     await updateFeatureFlag("config_version_cursor_v0", { defaultEnabled: true });
-    assert.equal(await getFeatureFlagConfigVersion(), 3);
+    assert.equal(await getFeatureFlagConfigVersion(), initialVersion + 3);
 
     const rule = await createFeatureFlagRule({
       flagKey: "config_version_cursor_v0",
@@ -258,60 +250,28 @@ test("feature flags: config version cursor bumps on service writes", async () =>
       decision: "allow",
       values: ["00000000-0000-4000-8000-00000000dd01"],
     });
-    assert.equal(await getFeatureFlagConfigVersion(), 4);
+    assert.equal(await getFeatureFlagConfigVersion(), initialVersion + 4);
 
     await updateFeatureFlagRule("config_version_cursor_v0", rule.id, {
       values: ["00000000-0000-4000-8000-00000000dd01", "00000000-0000-4000-8000-00000000dd02"],
     });
-    assert.equal(await getFeatureFlagConfigVersion(), 5);
+    assert.equal(await getFeatureFlagConfigVersion(), initialVersion + 5);
 
     await deleteFeatureFlagRule("config_version_cursor_v0", rule.id);
-    assert.equal(await getFeatureFlagConfigVersion(), 6);
+    assert.equal(await getFeatureFlagConfigVersion(), initialVersion + 6);
   } finally {
     await close();
   }
 });
 
 test("feature flags: historical message forwarding row remains default-off", async () => {
-  const { close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const { close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     assert.deepEqual(await evaluateFeatureFlag({
       key: "message_forwarding_v0",
       serverId: "00000000-0000-4000-8000-00000000ff21",
     }), {
       key: "message_forwarding_v0",
-      enabled: false,
-      reason: "default",
-    });
-  } finally {
-    await close();
-  }
-});
-
-test("feature flags: missing direct attachment upload gate fails closed", async () => {
-  const { close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
-  try {
-    assert.deepEqual(await evaluateFeatureFlag({
-      key: ATTACHMENT_DIRECT_UPLOAD_FEATURE_FLAG_KEY,
-      serverId: "00000000-0000-4000-8000-00000000ff31",
-    }), {
-      key: ATTACHMENT_DIRECT_UPLOAD_FEATURE_FLAG_KEY,
-      enabled: false,
-      reason: "missing_flag",
-    });
-  } finally {
-    await close();
-  }
-});
-
-test("feature flags: seeded agent migration gate is default-off", async () => {
-  const { close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
-  try {
-    assert.deepEqual(await evaluateFeatureFlag({
-      key: AGENT_MIGRATION_FEATURE_FLAG_KEY,
-      serverId: "00000000-0000-4000-8000-00000000ff41",
-    }), {
-      key: AGENT_MIGRATION_FEATURE_FLAG_KEY,
       enabled: false,
       reason: "default",
     });
@@ -348,16 +308,19 @@ test("feature flags: agent migration is dark for botiverse after follow-up deny"
   assert.doesNotMatch(sql, /'community-cn'/);
 });
 
+// The retired conversion flag's migration, as shipped (the key left code with #wg-rbac:#50).
+const RETIRED_CHANNEL_TO_JOINT_CONVERSION_FLAG_KEY = "channel_to_joint_conversion_v0";
+
 test("feature flags: channel-to-joint conversion is default-off without slug allowlists", () => {
   const migration = readFileSync(
     resolve(import.meta.dirname, "../../drizzle/0266_channel_joint_conversion.sql"),
     "utf8",
   );
 
-  assert.match(migration, new RegExp(`'${CHANNEL_TO_JOINT_CONVERSION_FEATURE_FLAG_KEY}'`));
+  assert.match(migration, new RegExp(`'${RETIRED_CHANNEL_TO_JOINT_CONVERSION_FLAG_KEY}'`));
   assert.match(migration, /'server'/);
   const mapped = parseChannelJointMigration(migration);
-  assert.equal(mapped.key, `'${CHANNEL_TO_JOINT_CONVERSION_FEATURE_FLAG_KEY}'`);
+  assert.equal(mapped.key, `'${RETIRED_CHANNEL_TO_JOINT_CONVERSION_FLAG_KEY}'`);
   assert.equal(mapped.default_enabled, "false", "channel conversion must be disabled by default");
   assert.equal(mapped.randomization_unit, "'server'");
   assert.doesNotMatch(migration, /INSERT INTO "feature_flag_rules"/);
@@ -389,6 +352,156 @@ test("feature flags: thread-unread badge is default-off without allow rules", ()
   assert.doesNotMatch(migration, /INSERT INTO "feature_flag_rules"/);
 });
 
+test("feature flags: the continuation pilot is default-off, server-scoped, without allow rules", () => {
+  const migration = readFileSync(
+    resolve(import.meta.dirname, "../../drizzle/0464_continuations_pilot_flag.sql"),
+    "utf8",
+  );
+
+  const mapped = parseChannelJointMigration(migration);
+  assert.equal(mapped.key, "'continuations_pilot_v0'");
+  assert.equal(mapped.enabled, "true");
+  assert.equal(mapped.kill_switch, "false");
+  assert.equal(mapped.default_enabled, "false", "every server keeps the draft flow until FFA allows it");
+  assert.equal(mapped.randomization_unit, "'server'");
+  assert.doesNotMatch(migration, /INSERT INTO "feature_flag_rules"/);
+});
+
+test("feature flags: computers rack overview is default-off without allow rules", () => {
+  const migration = readFileSync(
+    resolve(import.meta.dirname, "../../drizzle/0440_computers_rack_overview_flag.sql"),
+    "utf8",
+  );
+
+  const mapped = parseChannelJointMigration(migration);
+  assert.equal(mapped.key, "'computers_rack_overview_v0'");
+  assert.equal(mapped.enabled, "true");
+  assert.equal(mapped.kill_switch, "false");
+  assert.equal(mapped.default_enabled, "false", "the rack overview must be disabled by default");
+  assert.equal(mapped.randomization_unit, "'server'");
+  assert.doesNotMatch(migration, /INSERT INTO "feature_flag_rules"/);
+});
+
+test("feature flags: web preview is default-off, server-scoped and without rules", () => {
+  const migration = readFileSync(
+    resolve(import.meta.dirname, "../../drizzle/0677_web_preview_flag.sql"),
+    "utf8",
+  );
+
+  const mapped = parseChannelJointMigration(migration);
+  assert.equal(mapped.key, "'web_preview_v0'");
+  assert.equal(mapped.enabled, "true");
+  assert.equal(mapped.kill_switch, "false");
+  assert.equal(mapped.default_enabled, "false", "web preview must be disabled by default");
+  assert.equal(mapped.randomization_unit, "'server'");
+  assert.equal(mapped.pre_auth_evaluable, "false");
+  assert.doesNotMatch(migration, /INSERT INTO "feature_flag_rules"/);
+});
+
+test("feature flags: inbox read in place (#244 step 3a) is default-off, server-scoped and without rules", () => {
+  const migration = readFileSync(
+    resolve(import.meta.dirname, "../../drizzle/0678_inbox_read_inplace_flag.sql"),
+    "utf8",
+  );
+
+  const mapped = parseChannelJointMigration(migration);
+  assert.equal(mapped.key, "'inbox_read_inplace_v1'");
+  assert.equal(mapped.enabled, "true");
+  assert.equal(mapped.kill_switch, "false");
+  assert.equal(mapped.default_enabled, "false", "inbox read in place must be disabled by default");
+  assert.equal(mapped.randomization_unit, "'server'");
+  assert.equal(mapped.pre_auth_evaluable, "false");
+  assert.doesNotMatch(migration, /INSERT INTO "feature_flag_rules"/);
+});
+
+test("feature flags: mobile inbox in place (#245) is default-off, user-scoped and without rules", () => {
+  const migration = readFileSync(
+    resolve(import.meta.dirname, "../../drizzle/0679_mobile_inbox_inplace_flag.sql"),
+    "utf8",
+  );
+
+  const mapped = parseChannelJointMigration(migration);
+  assert.equal(mapped.key, "'mobile_inbox_inplace_v0'");
+  assert.equal(mapped.key, `'${MOBILE_INBOX_INPLACE_FEATURE_FLAG_KEY}'`);
+  assert.equal(mapped.enabled, "true");
+  assert.equal(mapped.kill_switch, "false");
+  assert.equal(mapped.default_enabled, "false", "mobile inbox in place must be disabled by default");
+  assert.equal(mapped.randomization_unit, "'user'", "evaluated per user, so FFA can open it for internal users only");
+  assert.equal(mapped.pre_auth_evaluable, "false");
+  assert.doesNotMatch(migration, /INSERT INTO "feature_flag_rules"/);
+});
+
+test("feature flags: desktop web preview view is default-off, server-scoped and without rules", () => {
+  const migration = readFileSync(
+    resolve(import.meta.dirname, "../../drizzle/0686_desktop_web_preview_view_flag.sql"),
+    "utf8",
+  );
+
+  const mapped = parseChannelJointMigration(migration);
+  assert.equal(mapped.key, "'desktop_web_preview_view_v0'");
+  assert.equal(mapped.enabled, "true");
+  assert.equal(mapped.kill_switch, "false");
+  assert.equal(mapped.default_enabled, "false", "the desktop web preview view must be disabled by default");
+  assert.equal(mapped.randomization_unit, "'server'");
+  assert.equal(mapped.pre_auth_evaluable, "false");
+  assert.doesNotMatch(migration, /INSERT INTO "feature_flag_rules"/);
+});
+
+test("feature flags: deep links v1 is default-off, server-scoped and answerable before login", () => {
+  const migration = readFileSync(
+    resolve(import.meta.dirname, "../../drizzle/0436_deep_links_flag.sql"),
+    "utf8",
+  );
+
+  const mapped = parseChannelJointMigration(migration);
+  assert.equal(mapped.key, "'deep_links_v1'");
+  assert.equal(mapped.enabled, "true");
+  assert.equal(mapped.kill_switch, "false");
+  assert.equal(mapped.default_enabled, "false", "deep links must be disabled by default");
+  assert.equal(mapped.randomization_unit, "'server'");
+  // The in-app browser guide also shows signed out, which only the pre-auth
+  // endpoint can answer; it still answers false until FFA turns it on.
+  assert.equal(mapped.pre_auth_evaluable, "true");
+  assert.doesNotMatch(migration, /INSERT INTO "feature_flag_rules"/);
+});
+
+test("feature flags: drafts section is default-off and allowed for botiverse and raft only", () => {
+  const migration = readFileSync(
+    resolve(import.meta.dirname, "../../drizzle/0530_drafts_section_flag.sql"),
+    "utf8",
+  );
+
+  const mapped = parseChannelJointMigration(migration);
+  assert.equal(mapped.key, "'drafts_section_v0'");
+  assert.equal(mapped.enabled, "true");
+  assert.equal(mapped.kill_switch, "false");
+  assert.equal(mapped.default_enabled, "false", "Drafts must be off by default");
+  assert.equal(mapped.randomization_unit, "'server'");
+  assert.equal(mapped.pre_auth_evaluable, "false");
+  // artin (#triage:#127): on for the two servers trying it, nowhere else.
+  assert.match(migration, /INSERT INTO "feature_flag_rules"/);
+  assert.match(migration, /"slug" IN \('botiverse', 'raft'\)/);
+  assert.match(migration, /'drafts_section_v0',\s*'server',\s*0,\s*'allow'/);
+  assert.doesNotMatch(migration, /'deny'/);
+  assert.doesNotMatch(migration, /'community'/);
+});
+
+test("feature flags: agent read progress is default-off, server-scoped and without rules", () => {
+  const migration = readFileSync(
+    resolve(import.meta.dirname, "../../drizzle/0576_agent_read_progress_flag.sql"),
+    "utf8",
+  );
+
+  const mapped = parseChannelJointMigration(migration);
+  assert.equal(mapped.key, `'${AGENT_READ_PROGRESS_FEATURE_FLAG_KEY}'`);
+  assert.equal(mapped.enabled, "true");
+  assert.equal(mapped.kill_switch, "false");
+  assert.equal(mapped.default_enabled, "false", "agent read progress must be off by default");
+  assert.equal(mapped.randomization_unit, "'server'");
+  assert.equal(mapped.pre_auth_evaluable, "false");
+  assert.doesNotMatch(migration, /INSERT INTO "feature_flag_rules"/);
+});
+
 test("feature flags: activity conversation list is default-off without allow rules", () => {
   const migration = readFileSync(
     resolve(import.meta.dirname, "../../drizzle/0362_activity_conversation_list_flag.sql"),
@@ -400,6 +513,23 @@ test("feature flags: activity conversation list is default-off without allow rul
   assert.equal(mapped.enabled, "true");
   assert.equal(mapped.kill_switch, "false");
   assert.equal(mapped.default_enabled, "false", "activity conversation list must be disabled by default");
+  assert.equal(mapped.randomization_unit, "'server'");
+  assert.doesNotMatch(migration, /INSERT INTO "feature_flag_rules"/);
+});
+
+test("feature flags: workspace artifacts is default-off without allow rules", () => {
+  // By name, not number: the branch's one migration is renumbered on every
+  // staging merge (docs/development/workspace-artifacts.md).
+  const drizzleDir = resolve(import.meta.dirname, "../../drizzle");
+  const file = readdirSync(drizzleDir).find((entry) => /^\d{4}_workspace_artifacts\.sql$/.test(entry));
+  assert.ok(file, "the workspace_artifacts migration exists");
+  const migration = readFileSync(resolve(drizzleDir, file), "utf8");
+
+  const mapped = parseChannelJointMigration(migration);
+  assert.equal(mapped.key, `'${WORKSPACE_ARTIFACTS_FEATURE_FLAG_KEY}'`);
+  assert.equal(mapped.enabled, "true");
+  assert.equal(mapped.kill_switch, "false");
+  assert.equal(mapped.default_enabled, "false", "workspace artifacts must be disabled by default");
   assert.equal(mapped.randomization_unit, "'server'");
   assert.doesNotMatch(migration, /INSERT INTO "feature_flag_rules"/);
 });
@@ -421,40 +551,8 @@ test("feature flags: Activity v2 seed is globally default-off and allowlists slo
   assert.doesNotMatch(sql, /'community-cn'/);
 });
 
-test("feature flags: composer resource references allowlist only botiverse and slock-android", () => {
-  const migration = readFileSync(
-    resolve(import.meta.dirname, "../../drizzle/0234_composer_resource_references_flag.sql"),
-    "utf8",
-  );
-
-  assert.match(migration, new RegExp(`'${COMPOSER_RESOURCE_REFERENCES_FEATURE_FLAG_KEY}'`));
-  assert.match(migration, /'server'/);
-  assert.match(migration, /false/);
-  assert.match(migration, /"slug" IN \('botiverse', 'slock-android'\)/);
-  assert.match(migration, /INSERT INTO "feature_flag_rules"/);
-  assert.match(migration, /'allow'/);
-  assert.doesNotMatch(migration, /'community'/);
-  assert.doesNotMatch(migration, /'community-cn'/);
-});
-
-test("feature flags: seeded Grok runtime gate is default-off", async () => {
-  const { close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
-  try {
-    assert.deepEqual(await evaluateFeatureFlag({
-      key: GROK_RUNTIME_FEATURE_FLAG_KEY,
-      serverId: "00000000-0000-4000-8000-00000000ff51",
-    }), {
-      key: GROK_RUNTIME_FEATURE_FLAG_KEY,
-      enabled: false,
-      reason: "default",
-    });
-  } finally {
-    await close();
-  }
-});
-
 test("feature flags: seeded Server Labs Web UI gate is default-off", async () => {
-  const { close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const { close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const flag = await getFeatureFlag(SERVER_LABS_UI_FEATURE_FLAG_KEY);
     assert.equal(flag?.randomizationUnit, "server");
@@ -474,46 +572,13 @@ test("feature flags: seeded Server Labs Web UI gate is default-off", async () =>
   }
 });
 
-test("feature flags: seeded Apple Web login gate is present but web and mobile stay fail-closed", async () => {
-  const { close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
-  try {
-    const flag = await getFeatureFlag(APPLE_WEB_LOGIN_FEATURE_FLAG_KEY);
-    assert.equal(flag?.enabled, true);
-    assert.equal(flag?.killSwitch, false);
-    assert.equal(flag?.randomizationUnit, "user");
-    assert.equal(flag?.defaultEnabled, false);
-    assert.equal(flag?.defaultVariant, null);
-
-    const rules = await listFeatureFlagRules(APPLE_WEB_LOGIN_FEATURE_FLAG_KEY);
-    assert.deepEqual(rules, []);
-    assert.deepEqual(await evaluateFeatureFlag({
-      key: APPLE_WEB_LOGIN_FEATURE_FLAG_KEY,
-      platform: "web",
-    }), {
-      key: APPLE_WEB_LOGIN_FEATURE_FLAG_KEY,
-      enabled: false,
-      reason: "missing_user_unit",
-    });
-    assert.deepEqual(await evaluateFeatureFlag({
-      key: APPLE_WEB_LOGIN_FEATURE_FLAG_KEY,
-      platform: "mobile",
-    }), {
-      key: APPLE_WEB_LOGIN_FEATURE_FLAG_KEY,
-      enabled: false,
-      reason: "missing_user_unit",
-    });
-  } finally {
-    await close();
-  }
-});
-
 test("feature flags: Apple Web login seed has no rollout rule and preserves fail-closed defaults", () => {
   const sql = readFileSync(
     resolve(import.meta.dirname, "../../drizzle/0211_apple_web_login_feature_flag.sql"),
     "utf8",
   );
 
-  assert.match(sql, new RegExp(`'${APPLE_WEB_LOGIN_FEATURE_FLAG_KEY}'`));
+  assert.match(sql, /'apple_web_login_v0'/);
   assert.match(sql, /'user'/);
   assert.match(sql, /false/);
   assert.doesNotMatch(sql, /INSERT INTO "feature_flag_rules"/);
@@ -532,22 +597,8 @@ test("feature flags: Server Labs Web UI seed is default-off with no rollout rule
   assert.doesNotMatch(sql, /INSERT INTO "feature_flag_rules"/);
 });
 
-test("feature flags: Grok runtime seed allowlists botiverse only", () => {
-  const sql = readFileSync(
-    resolve(import.meta.dirname, "../../drizzle/0185_grok_runtime_feature_flag.sql"),
-    "utf8",
-  );
-
-  assert.match(sql, new RegExp(`'${GROK_RUNTIME_FEATURE_FLAG_KEY}'`));
-  assert.match(sql, /"slug" IN \('botiverse'\)/);
-  assert.match(sql, /'server'/);
-  assert.match(sql, /'allow'/);
-  assert.doesNotMatch(sql, /'community'/);
-  assert.doesNotMatch(sql, /'community-cn'/);
-});
-
 test("feature flags: an absent flag key evaluates default-off with missing_flag", async () => {
-  const { close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const { close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     assert.deepEqual(await evaluateFeatureFlag({
       key: "test_absent_flag_gate_v0",
@@ -564,7 +615,7 @@ test("feature flags: an absent flag key evaluates default-off with missing_flag"
 });
 
 test("feature flags: server randomization fails closed without serverId and percent thresholds are deterministic", async () => {
-  const { close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const { close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const db = getDb();
     const key = "percent_test_v0";
@@ -620,7 +671,7 @@ test("feature flags: server randomization fails closed without serverId and perc
 });
 
 test("feature flags: explicit user rules take precedence over server rules", async () => {
-  const { close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const { close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const db = getDb();
     const serverId = "00000000-0000-4000-8000-00000000bb01";
@@ -697,7 +748,7 @@ test("feature flags: explicit user rules take precedence over server rules", asy
 });
 
 test("feature flags: platform rules split web/mobile while omitted platform preserves legacy matching", async () => {
-  const { close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const { close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const db = getDb();
     const serverId = "00000000-0000-4000-8000-00000000bc01";
@@ -747,7 +798,7 @@ test("feature flags: platform rules split web/mobile while omitted platform pres
 });
 
 test("feature flags: earlier-priority server deny overrides server allow", async () => {
-  const { close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const { close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const db = getDb();
     const serverId = "00000000-0000-4000-8000-00000000dd01";
@@ -787,7 +838,7 @@ test("feature flags: earlier-priority server deny overrides server allow", async
 });
 
 test("feature flags: plan rules use effective server entitlement", async () => {
-  const { close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const { close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const db = getDb();
     const passwordHash = await argon2.hash("password123");
@@ -836,7 +887,7 @@ test("feature flags: pro plan rules match the Pro-entitled billing cohort", asyn
   Date.now = () => new Date("2026-06-24T00:00:00Z").getTime();
   let close: (() => Promise<void>) | undefined;
   try {
-    ({ close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false }));
+    ({ close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true }));
     const db = getDb();
     const passwordHash = await argon2.hash("password123");
     const [owner] = await db.insert(users).values({
@@ -895,7 +946,7 @@ test("feature flags: trial Free keeps deterministic plan-rule priority", async (
   Date.now = () => new Date("2026-06-14T00:00:00Z").getTime();
   let close: (() => Promise<void>) | undefined;
   try {
-    ({ close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false }));
+    ({ close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true }));
     const db = getDb();
     const passwordHash = await argon2.hash("password123");
     const [owner] = await db.insert(users).values({
@@ -960,7 +1011,7 @@ test("feature flags: trial Free keeps deterministic plan-rule priority", async (
 });
 
 test("feature flags: lab stage is effective only for master-on open enrolled servers and precedes plan", async () => {
-  const { close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const { close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const db = getDb();
     const [owner] = await db.insert(users).values({
@@ -1097,7 +1148,7 @@ test("feature flags: lab stage is effective only for master-on open enrolled ser
 });
 
 test("feature flags: lab rule priority is first-match and variants remain out of v1", async () => {
-  const { close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const { close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const db = getDb();
     const [owner] = await db.insert(users).values({
@@ -1166,7 +1217,7 @@ test("feature flags: lab rule priority is first-match and variants remain out of
 });
 
 test("feature flags: Server Labs Web UI gate cannot bootstrap itself through a lab rule", async () => {
-  const { close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const { close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const db = getDb();
     await db.insert(featureFlags).values({
@@ -1216,7 +1267,7 @@ test("feature flags: Server Labs Web UI gate cannot bootstrap itself through a l
 });
 
 test("Labs schema preserves agent actor parity and append-only server-version audit identity", async () => {
-  const { close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const { close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const db = getDb();
     const [owner] = await db.insert(users).values({
@@ -1337,55 +1388,36 @@ test("feature flags: batch Lab and plan preload query count is constant for 1/10
       return originalQuery(query, params, options as never);
     }) as typeof client.query;
 
-    const counts: number[] = [];
-    for (const size of [1, 10, 50]) {
-      queryCount = 0;
-      const evaluations = await evaluateFeatureFlags(
-        flagRows.slice(0, size).map((flag) => ({ key: flag.key, serverId: server.id })),
-        db,
-      );
-      counts.push(queryCount);
-      assert.equal(evaluations.length, size);
-      assert.equal(evaluations.every((evaluation) => evaluation.enabled && evaluation.reason === "lab_rule"), true);
+    for (const source of ["ordinary", "appsumo"] as const) {
+      if (source === "appsumo") {
+        const { parseAppSumoLicenseKey } = await import("./appSumoContracts");
+        const licenseKey = parseAppSumoLicenseKey("c8f3a7be-cf94-4e71-87b8-864a4c701801")!;
+        await db.insert(dbSchema.appSumoLicenses).values({
+          productId: "batch-query-test", licenseKey,
+          tier: 2, status: "active", verifiedAt: new Date(),
+        });
+        await db.insert(dbSchema.appSumoLicenseBindings).values({
+          productId: "batch-query-test", originalLicenseKey: licenseKey, currentLicenseKey: licenseKey,
+          serverId: server.id, boundByUserId: owner.id, activatedAt: new Date(),
+        });
+      }
+      const counts: number[] = [];
+      for (const size of [1, 10, 50]) {
+        queryCount = 0;
+        const evaluations = await evaluateFeatureFlags(
+          flagRows.slice(0, size).map((flag) => ({ key: flag.key, serverId: server.id })),
+          db,
+        );
+        counts.push(queryCount);
+        assert.equal(evaluations.length, size);
+        assert.equal(evaluations.every((evaluation) => evaluation.enabled && evaluation.reason === "lab_rule"), true);
+      }
+      // Plan is two batched reads since prepaid Pro (#12857): the entitlement
+      // join, then the prepaid grants for the same server ids.
+      assert.deepEqual(counts, [5, 5, 5], `${source}: flags + rules + Labs + plan (entitlements, prepaid grants) each stay one query per batch`);
     }
-    assert.deepEqual(counts, [4, 4, 4], "flags + rules + Labs + plan each stay one query per batch");
   } finally {
     await client.close();
-  }
-});
-
-// Behavioral guard for the 2026-09-07 entitlement mismatch: Pro-gated seeded
-// flags must evaluate through the whole Pro-capable billing cohort.
-test("feature flags: llm_translation_v0 is enabled for pro and for the comp plans", async () => {
-  const { close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
-  try {
-    const db = getDb();
-    const passwordHash = await argon2.hash("password123");
-    const [owner] = await db.insert(users).values({
-      email: "llm-translation-plan-owner@slock.test",
-      name: "llm-translation-plan-owner",
-      passwordHash,
-      emailVerified: true,
-    }).returning();
-    const server = await createServer("LLM Translation Plan", "llm-translation-plan", owner.id);
-
-    for (const plan of ["pro", "founder", "partner"] as const) {
-      await db.update(servers).set({ plan }).where(eq(servers.id, server.id));
-      assert.deepEqual(
-        await evaluateFeatureFlag({ key: LLM_TRANSLATION_FEATURE_FLAG_KEY, serverId: server.id }),
-        { key: LLM_TRANSLATION_FEATURE_FLAG_KEY, enabled: true, reason: "plan_rule" },
-        `${plan} must resolve through the plan rule, not fall through to the flag default`,
-      );
-    }
-
-    await db.update(servers).set({ plan: "free" }).where(eq(servers.id, server.id));
-    assert.deepEqual(
-      await evaluateFeatureFlag({ key: LLM_TRANSLATION_FEATURE_FLAG_KEY, serverId: server.id }),
-      { key: LLM_TRANSLATION_FEATURE_FLAG_KEY, enabled: false, reason: "default" },
-      "free stays outside the paid gate",
-    );
-  } finally {
-    await close();
   }
 });
 
@@ -1395,7 +1427,7 @@ test("feature flags: llm_translation_v0 is enabled for pro and for the comp plan
 // every server. Both orderings are asserted because the bug is invisible in one
 // of them: with the ramped server first, the wrong implementation looks right.
 test("feature flags: a batch spanning servers answers each server on its own identity", async () => {
-  const { close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const { close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const key = "server_ramp_batch_identity_v0";
     const rampedServerId = "00000000-0000-4000-8000-00000000ee01";

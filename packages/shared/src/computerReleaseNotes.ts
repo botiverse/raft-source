@@ -59,7 +59,8 @@ export function pickComputerReleaseNotesText(
   locale: DisplayLocale,
 ): string | null {
   if (!notes) return null;
-  const preferred: ComputerReleaseNotesLocale = locale === "zh-cn" ? "zh-CN" : "en";
+  // Notes are written in en and zh-CN; a Traditional Chinese reader gets the Chinese.
+  const preferred: ComputerReleaseNotesLocale = locale === "zh-cn" || locale === "zh-tw" ? "zh-CN" : "en";
   const fallback: ComputerReleaseNotesLocale = preferred === "en" ? "zh-CN" : "en";
   return notes[preferred] ?? notes[fallback] ?? null;
 }

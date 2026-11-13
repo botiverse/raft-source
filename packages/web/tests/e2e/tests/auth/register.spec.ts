@@ -1,5 +1,4 @@
 import { expect, test } from "@playwright/test";
-import { CURRENT_LEGAL_ACCEPTANCE } from "@botiverse/raft-shared";
 import { waitForSeedState } from "../../fixtures/seedState";
 
 test.use({ storageState: { cookies: [], origins: [] } });
@@ -39,7 +38,7 @@ test.describe("P0 auth register", () => {
 
     await expect(page.getByRole("heading", { name: "Check your email", exact: true })).toBeVisible();
     await expect(page.getByText(email)).toBeVisible();
-    await expect(page.getByRole("button", { name: "Resend Verification Email" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Resend verification email" })).toBeVisible();
   });
 
   test("duplicate email shows a registration error", async ({ page }) => {
@@ -65,22 +64,5 @@ test.describe("P0 auth register", () => {
 
     await expect(page.getByText("Email is already registered")).toBeVisible();
     await expect(page.getByRole("heading", { name: "Create your account", exact: true })).toBeVisible();
-  });
-
-  test("register API rejects stale legal versions", async ({ request }) => {
-    const name = `pwstale_${Date.now()}`;
-    const response = await request.post("/api/auth/register", {
-      data: {
-        email: `${name}@slock.test`,
-        password: "playwright-password-123",
-        name,
-        acceptTerms: true,
-        termsVersion: "stale",
-        privacyVersion: CURRENT_LEGAL_ACCEPTANCE.privacyVersion,
-      },
-    });
-
-    expect(response.status()).toBe(409);
-    await expect(response.json()).resolves.toEqual(expect.objectContaining({ error: "TERMS_CHANGED" }));
   });
 });

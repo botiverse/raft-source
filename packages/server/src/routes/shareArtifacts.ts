@@ -1,50 +1,50 @@
-import { Router, type NextFunction, type Request, type Response, type Router as RouterType } from "express";
+import { Router, type Request, type Response, type Router as RouterType } from "express";
 import { UUID_RE } from "../lib/messageId";
-import multer from "multer";
-import { randomUUID } from "node:crypto";
-import sharp from "sharp";
 import { eq } from "drizzle-orm";
 import { getDb } from "../db/index";
 import { shareArtifacts } from "../db/schema";
-import { getActorServerRoleInServer } from "../lib/actorPermissions";
-import * as channelService from "../services/channelService";
-import { getCdnStorage, isStorageTimeoutError } from "../services/storageService";
+import { refuse } from "../lib/refusal";
+import { runtimeFormCopyLocale } from "../services/runtimeFormV2Copy";
+import { getCdnStorage } from "../services/storageService";
 import { streamStorageResponse } from "../services/storageResponseStream";
 
-const SHARE_ARTIFACT_MAX_BYTES = 10 * 1024 * 1024;
-const SHARE_ARTIFACT_MAX_LABEL = "10MB";
+/**
+ * Share to X, and with it every way to make, list or delete a share link, was
+ * retired on 2026-11-09 (docs/contracts/share-artifacts.md). The links made
+ * before stay in `share_artifacts` and their images stay in the CDN bucket, so
+ * they can be brought back; while this is true the public page answers 410
+ * with a "no longer available" page (no image, no card tags) and the server's
+ * own image route answers 410. Set it to false to serve existing links again.
+ *
+ * Not covered by this switch: the CDN URL (`CDN_BASE_URL/<serverId>/share-artifacts/<id>.png`,
+ * cdn.raft.build), which botiverse/raft-cdn-worker serves straight from the
+ * bucket without reading the row.
+ */
+export const SHARE_ARTIFACTS_RETIRED: boolean = true;
 
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: SHARE_ARTIFACT_MAX_BYTES + 1024 * 1024 },
-});
+let retiredForTests: boolean | null = null;
+
+function shareArtifactsRetired(): boolean {
+  return retiredForTests ?? SHARE_ARTIFACTS_RETIRED;
+}
+
+/** Tests only: serve existing links as before (false) or as retired (true); null restores the switch. */
+export function __setShareArtifactsRetiredForTests(retired: boolean | null): void {
+  if (process.env.NODE_ENV !== "test") throw new Error("Share artifact retirement hooks are test-only");
+  retiredForTests = retired;
+}
+
+const SHARE_ARTIFACT_RETIRED_CODE = "SHARE_ARTIFACT_RETIRED";
+
+/**
+ * The public page and the server's own copy of the image: a minute, the same
+ * as cdn.raft.build gives the image (botiverse/raft-cdn-worker), so retiring
+ * or restoring links takes effect within a minute.
+ */
+const SHARE_ARTIFACT_PUBLIC_CACHE_CONTROL = "public, max-age=60";
 
 export const shareArtifactRouter: RouterType = Router();
 export const shareArtifactPublicRouter: RouterType = Router();
-
-
-function runShareArtifactUpload(req: Request, res: Response, next: NextFunction): void {
-  upload.single("image")(req, res, (err: unknown) => {
-    if (err instanceof multer.MulterError && err.code === "LIMIT_FILE_SIZE") {
-      res.status(413).json({
-        error: `Max ${SHARE_ARTIFACT_MAX_LABEL} per image`,
-        errorCode: "SHARE_ARTIFACT_TOO_LARGE",
-        maxBytes: SHARE_ARTIFACT_MAX_BYTES,
-      });
-      return;
-    }
-    if (err) {
-      res.status(400).json({ error: err instanceof Error ? err.message : "Upload failed" });
-      return;
-    }
-    next();
-  });
-}
-
-function isPngBuffer(buffer: Buffer): boolean {
-  return buffer.length >= 8
-    && buffer.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]));
-}
 
 function stripTrailingSlash(value: string): string {
   return value.replace(/\/$/, "");
@@ -135,87 +135,67 @@ function renderShareArtifactHtml(
 </html>`;
 }
 
-shareArtifactRouter.post(
-  "/message-selection",
-  runShareArtifactUpload,
-  async (req, res) => {
-    try {
-      const requesterRole = await getActorServerRoleInServer(req.serverId!, "user", req.userId!);
-      if (requesterRole === "guest") {
-        res.status(403).json({ error: "Guests cannot create share artifacts" });
-        return;
-      }
-      const file = req.file;
-      if (!file || file.size <= 0 || file.buffer.length <= 0) {
-        res.status(400).json({ error: "image is required" });
-        return;
-      }
-      if (file.size > SHARE_ARTIFACT_MAX_BYTES) {
-        res.status(413).json({
-          error: `Max ${SHARE_ARTIFACT_MAX_LABEL} per image`,
-          errorCode: "SHARE_ARTIFACT_TOO_LARGE",
-          maxBytes: SHARE_ARTIFACT_MAX_BYTES,
-        });
-        return;
-      }
-      if (!isPngBuffer(file.buffer)) {
-        res.status(415).json({ error: "Share artifact must be a PNG image" });
-        return;
-      }
+/** The retired page's one sentence: Simplified Chinese when asked for, else English. */
+const SHARE_ARTIFACT_RETIRED_COPY = {
+  en: { lang: "en", text: "This shared link is no longer available." },
+  "zh-cn": { lang: "zh-CN", text: "这个分享链接已失效。" },
+} as const;
 
-      const channelId = typeof req.body.channelId === "string" ? req.body.channelId : null;
-      if (!channelId) {
-        res.status(400).json({ error: "channelId is required" });
-        return;
-      }
+function shareArtifactRetiredCopy(acceptLanguage: string | undefined): { lang: string; text: string } {
+  return runtimeFormCopyLocale(acceptLanguage) === "zh-cn"
+    ? SHARE_ARTIFACT_RETIRED_COPY["zh-cn"]
+    : SHARE_ARTIFACT_RETIRED_COPY.en;
+}
 
-      const canAccess = await channelService.canUserAccessChannel(channelId, req.userId!, req.serverId!);
-      if (!canAccess) {
-        res.status(403).json({ error: "You do not have access to this channel" });
-        return;
-      }
+/**
+ * The page an existing link answers while links are retired: the sentence,
+ * and no image or card tags, so X and other sites show no screenshot.
+ */
+function renderShareArtifactRetiredHtml(copy: { lang: string; text: string }): string {
+  const text = escapeHtml(copy.text);
+  return `<!doctype html>
+<html lang="${escapeHtml(copy.lang)}">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>${text}</title>
+  <meta name="robots" content="noindex, nofollow">
+  <meta property="og:title" content="${text}">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="${text}">
+  <style>
+    body { margin: 0; font-family: ui-sans-serif, system-ui, sans-serif; background: #fffdf4; color: #111; }
+    main { min-height: 100vh; display: grid; place-items: center; padding: 24px; box-sizing: border-box; }
+    p { font-size: 15px; margin: 0; }
+  </style>
+</head>
+<body>
+  <main>
+    <p>${text}</p>
+  </main>
+</body>
+</html>`;
+}
 
-      const storage = getCdnStorage();
-      if (!storage) {
-        res.status(503).json({ error: "File storage is not configured on this server" });
-        return;
-      }
+function answerRetiredSharePage(req: Request, res: Response): void {
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.setHeader("Cache-Control", SHARE_ARTIFACT_PUBLIC_CACHE_CONTROL);
+  res.setHeader("X-Robots-Tag", "noindex, nofollow");
+  res.vary("Accept-Language");
+  // refusal-ok: a public HTML page for browsers and card crawlers, not the JSON envelope
+  res.status(410).send(renderShareArtifactRetiredHtml(shareArtifactRetiredCopy(req.get("accept-language"))));
+}
 
-      const id = randomUUID();
-      const storageKey = `${req.serverId}/share-artifacts/${id}.png`;
-      const metadata = await sharp(file.buffer).metadata();
-      await storage.put(storageKey, file.buffer, "image/png");
-
-      const [artifact] = await getDb()
-        .insert(shareArtifacts)
-        .values({
-          id,
-          serverId: req.serverId!,
-          channelId,
-          createdByUserId: req.userId!,
-          storageKey,
-          mimeType: "image/png",
-          sizeBytes: file.size,
-          width: metadata.width ?? null,
-          height: metadata.height ?? null,
-        })
-        .returning();
-
-      res.json({
-        id: artifact.id,
-        url: buildShareUrl(req, artifact.id),
-        imageUrl: buildShareImageUrl(req, artifact.id, artifact.storageKey),
-      });
-    } catch (err) {
-      console.error("[ShareArtifacts] Failed to create share artifact", err);
-      if (isStorageTimeoutError(err)) {
-        res.status(504).json({ error: "Share image storage timed out" });
-        return;
-      }
-      res.status(500).json({ error: "Failed to create share image" });
-    }
-  },
-);
+// Creation was retired on 2026-11-09. Older web, desktop and mobile builds
+// still offer Share to X and POST here: they get 410 with a sentence they can
+// show (the web shows a refusal's `error`) instead of a bare 404. List
+// (GET /) and delete (DELETE /:id) are gone and answer 404.
+shareArtifactRouter.post("/message-selection", (_req, res) => {
+  refuse(res, 410, {
+    code: SHARE_ARTIFACT_RETIRED_CODE,
+    error: "Sharing to X has been retired, so new share links can't be made: download the image or copy it instead.",
+  });
+});
 
 shareArtifactPublicRouter.get("/:id.png", async (req, res) => {
   try {
@@ -238,6 +218,12 @@ shareArtifactPublicRouter.get("/:id.png", async (req, res) => {
       res.status(404).send("Not found");
       return;
     }
+    if (shareArtifactsRetired()) {
+      res.setHeader("Cache-Control", SHARE_ARTIFACT_PUBLIC_CACHE_CONTROL);
+      // refusal-ok: the public image route answers plain text, like its 404
+      res.status(410).send("Gone");
+      return;
+    }
 
     const storage = getCdnStorage();
     if (!storage) {
@@ -249,7 +235,7 @@ shareArtifactPublicRouter.get("/:id.png", async (req, res) => {
     res.setHeader("Content-Type", artifact.mimeType);
     res.setHeader("Content-Length", String(artifact.sizeBytes));
     res.setHeader("Content-Disposition", "inline");
-    res.setHeader("Cache-Control", "public, immutable, max-age=31536000");
+    res.setHeader("Cache-Control", SHARE_ARTIFACT_PUBLIC_CACHE_CONTROL);
     res.setHeader("X-Content-Type-Options", "nosniff");
     await streamStorageResponse(stream, res);
   } catch (err) {
@@ -280,9 +266,13 @@ shareArtifactPublicRouter.get("/:id", async (req, res) => {
       res.status(404).send("Not found");
       return;
     }
+    if (shareArtifactsRetired()) {
+      answerRetiredSharePage(req, res);
+      return;
+    }
 
     res.setHeader("Content-Type", "text/html; charset=utf-8");
-    res.setHeader("Cache-Control", "public, max-age=300");
+    res.setHeader("Cache-Control", SHARE_ARTIFACT_PUBLIC_CACHE_CONTROL);
     res.setHeader("X-Robots-Tag", "noindex, nofollow");
     res.send(renderShareArtifactHtml(req, artifact.id, {
       storageKey: artifact.storageKey,

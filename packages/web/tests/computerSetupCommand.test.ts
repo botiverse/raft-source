@@ -3,7 +3,6 @@ import assert from "node:assert/strict";
 import {
   computerInstallCommand,
   COMPUTER_CDN_BASE_PROD,
-  COMPUTER_CDN_BASE_STAGING,
   DEFAULT_COMPUTER_SERVER_URL,
   getComputerCommands,
   getComputerSetupCommand,
@@ -22,6 +21,7 @@ function isolatedCommands(slug: string, deploymentEnv: string, serverUrlArg = ""
     setup: `${environment} "${home}/bin/raft-computer" setup /${slug}${serverUrlArg}`,
     status: `${environment} "${home}/bin/raft-computer" status`,
     doctor: `${environment} "${home}/bin/raft-computer" doctor`,
+    upgrade: `${environment} "${home}/bin/raft-computer" upgrade`,
     restartService: `${environment} "${home}/bin/raft-computer" restart`,
     restart: `${environment} "${home}/bin/raft-computer" restart /${slug}`,
     stop: `${environment} "${home}/bin/raft-computer" stop`,
@@ -43,6 +43,7 @@ function isolatedWindowsCommands(slug: string, deploymentEnv: string, serverUrlA
     installAndSetup: null,
     status: `${environment} ${binary} status`,
     doctor: `${environment} ${binary} doctor`,
+    upgrade: `${environment} ${binary} upgrade`,
     restartService: `${environment} ${binary} restart`,
     restart: `${environment} ${binary} restart /${slug}`,
     stop: `${environment} ${binary} stop`,
@@ -82,21 +83,6 @@ test("Computer setup command omits production server-url when absent", () => {
 test("Computer setup command isolates the staging command with a per-server home/bin", () => {
   assert.equal(
     getComputerSetupCommand("botiverse", "staging"),
-    isolatedCommands("botiverse", "staging", ` --server-url ${STAGING_COMPUTER_SERVER_URL}`).setup,
-  );
-});
-
-test("Computer setup command ignores legacyApiKey option (CLI flags removed in RFC v9 PR-impl-3)", () => {
-  // The CLI no longer accepts `--adopt-legacy` / `--legacy-api-key` —
-  // legacy-daemon adoption is driven by an interactive TTY prompt inside
-  // `raft-computer setup`. The web option is preserved as a no-op so
-  // existing callsites don't need to change.
-  assert.equal(
-    getComputerSetupCommand("botiverse", "production", undefined, { legacyApiKey: "sk_machine_test" }),
-    productionCommand("botiverse"),
-  );
-  assert.equal(
-    getComputerSetupCommand("botiverse", "staging", undefined, { legacyApiKey: "sk_machine_test" }),
     isolatedCommands("botiverse", "staging", ` --server-url ${STAGING_COMPUTER_SERVER_URL}`).setup,
   );
 });
@@ -149,6 +135,7 @@ test("Computer command bundle keeps production default and gives non-prod steps 
   assert.equal(prod.setup, productionCommand("botiverse"));
   assert.equal(prod.status, "raft-computer status");
   assert.equal(prod.doctor, "raft-computer doctor");
+  assert.equal(prod.upgrade, "raft-computer upgrade");
   assert.equal(prod.restartService, "raft-computer restart");
   assert.equal(prod.restart, "raft-computer restart /botiverse");
   assert.equal(prod.stop, "raft-computer stop");
@@ -211,12 +198,15 @@ test("Windows Computer staging and slockdev commands are self-contained PowerShe
       assert.match(command, /\$env:RAFT_COMPUTER_INSTALL_DIR = "\$env:RAFT_HOME\\bin"/);
       assert.doesNotMatch(command, /RAFT_HOME="\$HOME| sh -c |npx\.cmd|raft-daemon/);
     }
-    assert.match(commands.install, /install\.ps1"? \| iex$/);
+    assert.match(commands.install, env === "staging"
+      ? /& \(\[scriptblock\]::Create\(\(irm https:\/\/cdn\.raft\.build\/computer\/install\.ps1\)\)\) --channel alpha$/
+      : /install\.ps1"? \| iex$/);
     assert.match(commands.setup, /& "\$env:RAFT_COMPUTER_INSTALL_DIR\\raft-computer\.exe" setup \/acme/);
     if (env === "staging") {
-      assert.match(commands.install, /RAFT_COMPUTER_RELEASE_BASE/);
-      assert.match(commands.install, /RAFT_COMPUTER_INSTALL_CHANNEL = "alpha"/);
-      assert.match(commands.install, new RegExp(COMPUTER_CDN_BASE_STAGING.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+      assert.doesNotMatch(commands.install, /RAFT_COMPUTER_RELEASE_BASE/, "the installer no longer reads it");
+      assert.doesNotMatch(commands.install, /RAFT_COMPUTER_INSTALL_CHANNEL/, "the staging bootstrap defaults to alpha itself");
+      assert.match(commands.install, new RegExp(COMPUTER_CDN_BASE_PROD.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+      assert.doesNotMatch(commands.install, /cdn-staging/);
     }
   }
 });
@@ -230,6 +220,7 @@ test("Computer terminal commands are exact-copy isolated cells in staging and sl
       {
         status: commands.status,
         doctor: commands.doctor,
+        upgrade: commands.upgrade,
         restartService: commands.restartService,
         restart: commands.restart,
         stop: commands.stop,
@@ -238,6 +229,7 @@ test("Computer terminal commands are exact-copy isolated cells in staging and sl
       {
         status: expected.status,
         doctor: expected.doctor,
+        upgrade: expected.upgrade,
         restartService: expected.restartService,
         restart: expected.restart,
         stop: expected.stop,
@@ -276,16 +268,16 @@ test("Computer command shapes are table-driven across env and fresh/migrate/reco
   }
 });
 
-test("Computer install command is a curl one-liner against the env's CDN", () => {
+test("Computer install command is a curl one-liner against the production entry script", () => {
   assert.equal(
     computerInstallCommand("production"),
     `curl -fsSL ${COMPUTER_CDN_BASE_PROD}/install.sh | sh`,
   );
   assert.equal(
     computerInstallCommand("staging"),
-    `curl -fsSL ${COMPUTER_CDN_BASE_STAGING}/install.sh | RAFT_COMPUTER_RELEASE_BASE=${COMPUTER_CDN_BASE_STAGING} RAFT_COMPUTER_INSTALL_CHANNEL=alpha sh`,
+    "curl -fsSL https://cdn.raft.build/computer/install.sh | sh -s -- --channel alpha",
   );
-  // slockdev / unset fall back to the prod CDN (only staging gets the staging bucket).
+  // slockdev / unset install the default channel (only staging selects alpha).
   assert.equal(computerInstallCommand("slockdev"), `curl -fsSL ${COMPUTER_CDN_BASE_PROD}/install.sh | sh`);
   assert.equal(computerInstallCommand(undefined), `curl -fsSL ${COMPUTER_CDN_BASE_PROD}/install.sh | sh`);
 });
@@ -296,8 +288,9 @@ test("Computer fresh install command pins a validated published version at the i
     `curl -fsSL ${COMPUTER_CDN_BASE_PROD}/install.sh | RAFT_COMPUTER_VERSION=1.0.14 sh`,
   );
   assert.equal(
+    // The pin wins: the installer rejects --version together with --channel.
     computerInstallCommand("staging", "1.0.14"),
-    `curl -fsSL ${COMPUTER_CDN_BASE_STAGING}/install.sh | RAFT_COMPUTER_RELEASE_BASE=${COMPUTER_CDN_BASE_STAGING} RAFT_COMPUTER_INSTALL_CHANNEL=alpha RAFT_COMPUTER_VERSION=1.0.14 sh`,
+    "curl -fsSL https://cdn.raft.build/computer/install.sh | RAFT_COMPUTER_VERSION=1.0.14 sh",
   );
   assert.equal(
     computerInstallCommand("production", "1.0.14; touch /tmp/nope"),
@@ -305,14 +298,14 @@ test("Computer fresh install command pins a validated published version at the i
   );
 });
 
-test("Windows Computer install command is a PowerShell one-liner against the env's CDN", () => {
+test("Windows Computer install command is a PowerShell one-liner against the production entry script", () => {
   assert.equal(
     windowsComputerInstallCommand("production"),
     `irm ${COMPUTER_CDN_BASE_PROD}/install.ps1 | iex`,
   );
   assert.equal(
     windowsComputerInstallCommand("staging"),
-    `$env:RAFT_COMPUTER_RELEASE_BASE = "${COMPUTER_CDN_BASE_STAGING}"; $env:RAFT_COMPUTER_INSTALL_CHANNEL = "alpha"; irm "$env:RAFT_COMPUTER_RELEASE_BASE/install.ps1" | iex`,
+    "& ([scriptblock]::Create((irm https://cdn.raft.build/computer/install.ps1))) --channel alpha",
   );
   assert.equal(
     windowsComputerInstallCommand("production", "1.0.14"),
@@ -320,8 +313,9 @@ test("Windows Computer install command is a PowerShell one-liner against the env
   );
   assert.equal(
     windowsComputerInstallCommand("staging", "1.0.14"),
-    `$env:RAFT_COMPUTER_RELEASE_BASE = "${COMPUTER_CDN_BASE_STAGING}"; $env:RAFT_COMPUTER_INSTALL_CHANNEL = "alpha"; $env:RAFT_COMPUTER_VERSION = "1.0.14"; irm "$env:RAFT_COMPUTER_RELEASE_BASE/install.ps1" | iex`,
+    '$env:RAFT_COMPUTER_VERSION = "1.0.14"; irm https://cdn.raft.build/computer/install.ps1 | iex',
   );
+  assert.doesNotMatch(windowsComputerInstallCommand("staging", "1.0.14"), /--channel/);
 });
 
 test("mac/Linux production offers one paste that installs then runs setup; Windows and isolated envs keep two steps", () => {
@@ -355,4 +349,32 @@ test("Computer setup command uses the installed Raft binary without path details
 test("the retired standalone daemon connect command is not exported", async () => {
   const commands = await import("../src/utils/computerSetupCommand");
   assert.equal("getDaemonConnectCommand" in commands, false);
+});
+
+test("staging isolated installs use the production entry script on the alpha channel; a version pin drops the channel", () => {
+  const home = "$HOME/.raft-computer-acme";
+  const environment = `RAFT_HOME="${home}" RAFT_COMPUTER_INSTALL_DIR="${home}/bin"`;
+  assert.equal(
+    getComputerCommands("acme", "staging")?.install,
+    `${environment} sh -c 'curl -fsSL https://cdn.raft.build/computer/install.sh | sh -s -- --channel alpha'`,
+  );
+  assert.equal(
+    getComputerCommands("acme", "staging", undefined, { version: "1.0.45" })?.install,
+    `${environment} sh -c 'curl -fsSL https://cdn.raft.build/computer/install.sh | RAFT_COMPUTER_VERSION=1.0.45 sh'`,
+  );
+  const windowsEnvironment = '$env:RAFT_HOME = "$env:USERPROFILE\\.raft-computer-acme"; $env:RAFT_COMPUTER_INSTALL_DIR = "$env:RAFT_HOME\\bin";';
+  assert.equal(
+    getComputerCommands("acme", "staging", undefined, { platform: "windows" })?.install,
+    `${windowsEnvironment} & ([scriptblock]::Create((irm https://cdn.raft.build/computer/install.ps1))) --channel alpha`,
+  );
+  assert.equal(
+    getComputerCommands("acme", "staging", undefined, { platform: "windows", version: "1.0.45" })?.install,
+    `${windowsEnvironment} $env:RAFT_COMPUTER_VERSION = "1.0.45"; irm https://cdn.raft.build/computer/install.ps1 | iex`,
+  );
+  for (const platform of ["mac-linux", "windows"] as const) {
+    const commands = getComputerCommands("acme", "staging", undefined, { platform });
+    for (const command of Object.values(commands ?? {}).filter((value): value is string => typeof value === "string")) {
+      assert.doesNotMatch(command, /cdn-staging|computer\/staging/);
+    }
+  }
 });

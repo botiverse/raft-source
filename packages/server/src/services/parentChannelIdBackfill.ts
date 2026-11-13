@@ -128,7 +128,8 @@ export async function verifyParentChannelIds(
         (SELECT count(*)::int FROM slice) AS scanned,
         (SELECT max(id::text) FROM slice) AS last_id,
         (SELECT count(*)::int FROM bad) AS divergent,
-        (SELECT count(*)::int FROM slice WHERE type <> 'thread' AND parent_channel_id IS NOT NULL) AS non_thread,
+        -- Task v2 conversations (type 'task') carry parent_channel_id by design.
+        (SELECT count(*)::int FROM slice WHERE type NOT IN ('thread', 'task') AND parent_channel_id IS NOT NULL) AS non_thread,
         (SELECT coalesce(array_agg(id::text), '{}') FROM (SELECT id FROM bad LIMIT ${sampleLimit}) sample) AS sample_ids
     `);
     const row = rows[0] as { scanned: number; last_id: string | null; divergent: number; non_thread: number; sample_ids: string[] } | undefined;

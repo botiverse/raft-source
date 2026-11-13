@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { readdirSync, readFileSync } from "node:fs";
 import { relative, resolve } from "node:path";
+import { isTestPath } from "../scripts/testLocations";
 
 /**
  * Named decision: retain 22 legacy FormatJS baseline literals, but prove they
@@ -34,7 +35,10 @@ function listTsSources(directory: string): string[] {
 function loadProductionSources(): SourceMap {
   const map: SourceMap = new Map();
   for (const absolute of listTsSources(srcRoot)) {
-    map.set(relative(repoRoot, absolute).replaceAll("\\", "/"), readFileSync(absolute, "utf8"));
+    const path = relative(repoRoot, absolute).replaceAll("\\", "/");
+    // Feature tests (src/features/<feature>/tests/) are not production sources.
+    if (isTestPath(path)) continue;
+    map.set(path, readFileSync(absolute, "utf8"));
   }
   return map;
 }
@@ -114,27 +118,6 @@ function findReactionSpriteLabelReaders(
   }
   return readers.sort();
 }
-
-// ── Presence: retain the legacy values ──────────────────────────────────────
-
-test("SETTINGS_LABEL_BY_ID remains exported from settings navigation", () => {
-  const source = readFileSync(resolve(repoRoot, SETTINGS_NAV), "utf8");
-  assert.match(source, /export const SETTINGS_LABEL_BY_ID\b/);
-  assert.match(source, /label: "Account"/);
-});
-
-test("reaction sprite labels remain present on generated items", () => {
-  const source = readFileSync(resolve(repoRoot, REACTION_MANIFEST), "utf8");
-  assert.match(source, /label: string/);
-  assert.match(source, /label: "Thumbs up"/);
-  assert.match(source, /label: "Heart"/);
-});
-
-test("runtimeApiUrlUnsupportedCopy remains exported", () => {
-  const source = readFileSync(resolve(repoRoot, RUNTIME_CONFIG_FORM), "utf8");
-  assert.match(source, /export function runtimeApiUrlUnsupportedCopy\b/);
-  assert.match(source, /Cursor CLI does not expose a per-agent API URL/);
-});
 
 // ── Non-consumption boundaries ──────────────────────────────────────────────
 

@@ -14,6 +14,7 @@ import { afterEach, test } from "vitest";
 
 import type { AgentContext } from "./auth/env";
 import { ApiClient } from "./client";
+import { setCanonicalFetchImplForTests } from "./proxy";
 
 const ctxFor = (serverUrl: string): AgentContext => ({
   agentId: "agent-1",
@@ -80,19 +81,25 @@ test("a redirect is re-sent through fetch, which follows it as before", async ()
   assert.equal(fetchCalls, 1);
 });
 
-test("with an HTTP proxy configured, the request stays on fetch with the proxy dispatcher", async () => {
+test("with an HTTP proxy configured, the request goes to the package fetch with the proxy dispatcher", async () => {
   process.env.HTTP_PROXY = "http://127.0.0.1:9";
   delete process.env.NO_PROXY;
   delete process.env.no_proxy;
   const inits: Array<RequestInit & { dispatcher?: unknown }> = [];
-  globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+  // The dispatcher is a package-undici ProxyAgent, so it must ride the package
+  // fetch, never Node's built-in fetch (another undici major).
+  const previousImpl = setCanonicalFetchImplForTests((async (_input: RequestInfo | URL, init?: RequestInit) => {
     inits.push(init ?? {});
     return new Response(JSON.stringify({ viaProxy: true }), { status: 200, headers: { "content-type": "application/json" } });
-  }) as typeof fetch;
-  const response = await new ApiClient(ctxFor("http://api.example.test")).request("GET", "/internal/agent-api/server");
-  assert.deepEqual(response.data, { viaProxy: true });
+  }) as typeof fetch);
+  try {
+    const response = await new ApiClient(ctxFor("http://api.example.test")).request("GET", "/internal/agent-api/server");
+    assert.deepEqual(response.data, { viaProxy: true });
+  } finally {
+    setCanonicalFetchImplForTests(previousImpl);
+  }
   assert.equal(inits.length, 1);
-  assert.ok(inits[0]!.dispatcher, "the undici ProxyAgent is passed to fetch");
+  assert.ok(inits[0]!.dispatcher, "the undici ProxyAgent is passed to the package fetch");
 });
 
 test("https honours NODE_EXTRA_CA_CERTS (self-signed CA)", async () => {

@@ -62,6 +62,8 @@ export interface TraceUploadRuntimeEnv {
   TRACE_UPLOAD_RATE_LIMIT_MODE?: string;
   /** Bearer token for POST /api/external/github-refresh (antiproton). Unset = endpoint off (404). */
   EXTERNAL_GITHUB_REFRESH_TOKEN?: string;
+  /** Bearer token for POST /api/external/antiproton-trace (antiproton agent trace rows). Unset = endpoint off (404). */
+  EXTERNAL_ANTIPROTON_TRACE_TOKEN?: string;
   DEPLOYMENT_ENV?: string;
   SLOCK_RELEASE_SHA?: string;
 }

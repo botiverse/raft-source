@@ -43,6 +43,8 @@ export type ServerSetupProjection = {
    */
   postSetup?: {
     surveyPending: boolean;
+    /** The Pro step (Free servers). Absent from older servers. */
+    upgradePending?: boolean;
     handoffPending: boolean;
   };
   surface: ServerSetupSurface;
@@ -71,6 +73,13 @@ export type ServerSetupProjection = {
   hasConnectedComputer?: boolean;
   /** Their sleeping computers, BY NAME — from `computers`, same source as the fact above. */
   offlineComputers?: Array<{ id: string; name: string; lastHeartbeat: string | null; isComputer?: boolean }>;
+  /**
+   * Staging only: the owner may create the hosted Cindy for this server from the setup
+   * footer ("Use cloud agent") without `antiproton_cindy` (tygg, #raft-antiproton:f5f3e410).
+   * The server decides — false on every other deployment — so the browser never guesses
+   * from an env var of its own.
+   */
+  hostedCindyTestEntry?: boolean;
 };
 
 export async function getServerSetupProjection(serverId: string): Promise<ServerSetupProjection> {
@@ -79,11 +88,63 @@ export async function getServerSetupProjection(serverId: string): Promise<Server
 }
 
 /**
+ * The staging-only test entry's outcome. The server speaks in codes, not sentences:
+ * the browser owns the copy, so a 404 (`hosted_cindy_test_entry_unavailable`) and a
+ * 409 (`onboarding_agent_exists`) can each say what the user can do next.
+ */
+export type HostedCindyTestEntryOutcome =
+  | { kind: "created"; agentId: string }
+  | { kind: "failed"; code: HostedCindyTestEntryFailureCode };
+
+export type HostedCindyTestEntryFailureCode =
+  | "hosted_cindy_test_entry_unavailable"
+  | "onboarding_agent_exists"
+  | "hosted_cindy_cap_reached"
+  | "hosted_cindy_name_taken"
+  | "hosted_runtime_unavailable"
+  | "unknown";
+
+const HOSTED_CINDY_TEST_ENTRY_CODES: readonly HostedCindyTestEntryFailureCode[] = [
+  "hosted_cindy_test_entry_unavailable",
+  "onboarding_agent_exists",
+  "hosted_cindy_cap_reached",
+  "hosted_cindy_name_taken",
+  "hosted_runtime_unavailable",
+];
+
+/**
+ * "Use cloud agent": create this server's hosted Cindy without a computer. Never throws —
+ * every failure this entry can hit (staging-only 404, an onboarding agent that appeared in
+ * another tab, the daily cap, the name taken, the runtime down) is a sentence for the user,
+ * not an exception for a boundary, so the caller renders `failed` in place.
+ */
+export async function createHostedCindyTestEntry(serverId: string): Promise<HostedCindyTestEntryOutcome> {
+  try {
+    const { data } = await api.post<{ agentId: string }>(`/servers/${serverId}/hosted-cindy`);
+    return { kind: "created", agentId: data.agentId };
+  } catch (error) {
+    const code = (error as { response?: { data?: { code?: unknown } } })?.response?.data?.code;
+    return {
+      kind: "failed",
+      code: typeof code === "string" && (HOSTED_CINDY_TEST_ENTRY_CODES as readonly string[]).includes(code)
+        ? (code as HostedCindyTestEntryFailureCode)
+        : "unknown",
+    };
+  }
+}
+
+/**
  * "Let's Go". A command with a durable effect (the owner's handoff acknowledgment), not a
  * hint to the client. It returns the fresh projection, so the caller never has to guess.
  */
 export async function acknowledgeSetupHandoff(serverId: string): Promise<ServerSetupProjection> {
   const { data } = await api.post<ServerSetupProjection>(`/servers/${serverId}/setup-handoff`);
+  return data;
+}
+
+/** The owner answered the Pro step, either way. Idempotent; returns the fresh projection. */
+export async function answerSetupUpgradePrompt(serverId: string): Promise<ServerSetupProjection> {
+  const { data } = await api.post<ServerSetupProjection>(`/servers/${serverId}/setup-upgrade-prompt`);
   return data;
 }
 

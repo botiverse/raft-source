@@ -1,3 +1,4 @@
+import { fillJointMembersFromChannelHumans } from "../test/jointMemberFill";
 import { createApiTest } from "../test/integration/apiTest";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
@@ -12,7 +13,6 @@ import {
 import { ATTACHMENT_UPLOAD_MAX_SIZE_BYTES } from "@botiverse/raft-shared/src/attachmentUploadContract";
 import { getDb } from "../db/index";
 import {
-  attachments,
   channels,
   jointChannels,
   jointChannelServers,
@@ -20,7 +20,7 @@ import {
   servers,
   users,
 } from "../db/schema";
-import { signAccessToken } from "../middleware/auth";
+import { accessTokenForTest } from "../test/integration/credentials";
 import {
   addHuman,
   canUserAccessChannel,
@@ -31,6 +31,7 @@ import { isChannelReadOnlyByBillingFeature, isChannelReadOnlyByQuota } from "../
 import { addMember, createServer } from "../services/serverService";
 import { billingUsageMonth } from "../services/fileUploadQuotaService";
 import { openTestApp } from "../test/integration/app";
+import { insertAttachmentsWithObjects } from "../test/attachmentObjectFixture";
 import type {
   AttachmentUploadSessionContext,
   AttachmentUploadSessionResult,
@@ -38,7 +39,7 @@ import type {
   CreateAttachmentUploadSessionInput,
 } from "./attachmentUploadSessions";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 type StoredSession = {
   context: AttachmentUploadSessionContext;
@@ -222,7 +223,7 @@ async function seedMemberFixture() {
     server: { ...server, id: server.id as ServerId },
     channel,
     headers: {
-      Authorization: `Bearer ${signAccessToken(owner.id)}`,
+      Authorization: `Bearer ${await accessTokenForTest(owner.id)}`,
       "X-Server-Id": server.id,
       "Content-Type": "application/json",
     },
@@ -269,7 +270,7 @@ test("default createApp keeps disabled P2 mutation paths typed instead of fallin
 
 test("enabled fake declines legacy upload and computer-auth download before P2 middleware", async () => {
   const fake = new FakeAttachmentUploadSessionService();
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false, attachmentUploadSessionService: fake });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, attachmentUploadSessionService: fake });
   try {
     const fixture = await seedMemberFixture();
 
@@ -282,7 +283,7 @@ test("enabled fake declines legacy upload and computer-auth download before P2 m
     assert.equal(fake.calls.create, 0, "legacy upload never enters the P2 service");
 
     const attachmentId = randomUUID();
-    await getDb().insert(attachments).values({
+    await insertAttachmentsWithObjects(getDb(), {
       id: attachmentId,
       channelId: fixture.channel.id,
       uploaderId: fixture.owner.id,
@@ -311,8 +312,8 @@ test("enabled fake declines legacy upload and computer-auth download before P2 m
       headers: { Authorization: `Bearer ${apiKey}` },
       redirect: "manual",
     });
-    assert.notEqual(download.status, 401, "legacy download still reaches canonical requireFlexAuth");
-    assert.notEqual(download.status, 403, "computer credential keeps canonical same-server scope");
+    // requireFlexAuth refuses machine credentials outright (#proj-raft-computer:8e6a4629).
+    assert.equal(download.status, 403, "a computer credential no longer reads attachments");
     assert.equal(fake.calls.status, 0, "legacy attachment UUID never enters the P2 service");
   } finally {
     await app.close();
@@ -321,7 +322,7 @@ test("enabled fake declines legacy upload and computer-auth download before P2 m
 
 test("enabled fake uses canonical admission and P1 response schemas for the lifecycle", async () => {
   const fake = new FakeAttachmentUploadSessionService();
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false, attachmentUploadSessionService: fake });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, attachmentUploadSessionService: fake });
   try {
     const fixture = await seedMemberFixture();
     const input = createInput(fixture.channel.id);
@@ -334,6 +335,12 @@ test("enabled fake uses canonical admission and P1 response schemas for the life
       directUploadThresholdBytes: 90 * 1024 * 1024,
       maxBytes: ATTACHMENT_UPLOAD_MAX_SIZE_BYTES,
       sessionExpiresInSeconds: 900,
+      // The web's addition (not the service's, which the agent API shares): Free's month, untouched.
+      monthlyUpload: {
+        month: billingUsageMonth(),
+        limitBytes: FREE_MONTHLY_FILE_UPLOAD_LIMIT_BYTES,
+        remainingBytes: FREE_MONTHLY_FILE_UPLOAD_LIMIT_BYTES,
+      },
     });
     assert.equal(fake.calls.capabilities, 1);
     const unauthenticated = await fetch(`${app.baseUrl}/api/attachments/upload-sessions`, {
@@ -506,7 +513,22 @@ test("enabled fake uses canonical admission and P1 response schemas for the life
       body: JSON.stringify(createInput(fixture.channel.id)),
     });
     assert.equal(quotaDenied.status, 403);
-    assert.equal((await json(quotaDenied) as { code: string }).code, "UPLOAD_FORBIDDEN");
+    // Its own code and what is left, not the permission refusal it used to share.
+    const quotaBody = await json(quotaDenied) as { code: string; message: string; retryable: boolean; monthlyUpload: unknown };
+    assert.equal(quotaBody.code, "FILE_UPLOAD_QUOTA_EXCEEDED");
+    assert.equal(quotaBody.retryable, false);
+    assert.match(quotaBody.message, /^Monthly file upload quota exceeded\./);
+    assert.deepEqual(quotaBody.monthlyUpload, {
+      month: billingUsageMonth(),
+      limitBytes: FREE_MONTHLY_FILE_UPLOAD_LIMIT_BYTES,
+      remainingBytes: 0,
+    });
+    const usedUpCapabilities = await fetch(`${app.baseUrl}/api/attachments/upload-capabilities`, { headers: fixture.headers });
+    assert.deepEqual(
+      (await json(usedUpCapabilities) as { monthlyUpload: unknown }).monthlyUpload,
+      { month: billingUsageMonth(), limitBytes: FREE_MONTHLY_FILE_UPLOAD_LIMIT_BYTES, remainingBytes: 0 },
+      "the web learns the month is used up before anyone picks a file",
+    );
 
     const [privateChannel] = await getDb().insert(channels).values({
       serverId: fixture.server.id,
@@ -535,7 +557,7 @@ test("enabled fake uses canonical admission and P1 response schemas for the life
 
 test("enabled fake exercises distinct post, channel quota, Joint entitlement, and Pro size admission", async () => {
   const fake = new FakeAttachmentUploadSessionService();
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false, attachmentUploadSessionService: fake });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, attachmentUploadSessionService: fake });
   try {
     const fixture = await seedMemberFixture();
     const expectDenied = async (channelId: string, label: string) => {
@@ -603,6 +625,7 @@ test("enabled fake exercises distinct post, channel quota, Joint entitlement, an
       role: "host",
       joinedByUserId: fixture.owner.id,
     });
+    await fillJointMembersFromChannelHumans();
     assert.equal(
       await canUserAccessChannel(projection.id, fixture.owner.id, fixture.server.id),
       true,
@@ -637,7 +660,7 @@ test("enabled fake exercises distinct post, channel quota, Joint entitlement, an
 
 test("existing sessions are non-disclosing across actors and servers and malformed UUIDs never reach the fake", async () => {
   const fake = new FakeAttachmentUploadSessionService();
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false, attachmentUploadSessionService: fake });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, attachmentUploadSessionService: fake });
   try {
     const fixture = await seedMemberFixture();
     const create = await fetch(`${app.baseUrl}/api/attachments/upload-sessions`, {
@@ -652,7 +675,7 @@ test("existing sessions are non-disclosing across actors and servers and malform
     await addMember(fixture.server.id, otherActor.id);
     const otherActorHeaders = {
       ...fixture.headers,
-      Authorization: `Bearer ${signAccessToken(otherActor.id)}`,
+      Authorization: `Bearer ${await accessTokenForTest(otherActor.id)}`,
     };
     const otherServer = await createServer(
       "Upload Other Server",
@@ -710,7 +733,7 @@ test("existing sessions are non-disclosing across actors and servers and malform
 
 test("bad fake output fails closed without returning the invalid body", async () => {
   const fake = new FakeAttachmentUploadSessionService();
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false, attachmentUploadSessionService: fake });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, attachmentUploadSessionService: fake });
   try {
     const fixture = await seedMemberFixture();
     fake.nextResult = { status: 201, body: { url: "https://secret.invalid/leak" } };
@@ -739,6 +762,11 @@ test("capabilities returns typed disabled response instead of falling through to
     directUploadThresholdBytes: null,
     maxBytes: FREE_SINGLE_FILE_UPLOAD_LIMIT_BYTES,
     sessionExpiresInSeconds: null,
+    monthlyUpload: {
+      month: billingUsageMonth(),
+      limitBytes: FREE_MONTHLY_FILE_UPLOAD_LIMIT_BYTES,
+      remainingBytes: FREE_MONTHLY_FILE_UPLOAD_LIMIT_BYTES,
+    },
   });
 });
 
@@ -747,7 +775,7 @@ test("disabled direct upload advertises the legacy-safe limit without applying t
   process.env.ATTACHMENT_DIRECT_UPLOAD_THRESHOLD_BYTES = String(10 * 1024 * 1024);
   let app: Awaited<ReturnType<typeof openTestApp>> | undefined;
   try {
-    app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+    app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
     const fixture = await seedMemberFixture();
     await getDb().update(servers).set({ plan: "pro" }).where(eq(servers.id, fixture.server.id));
     const res = await fetch(`${app.baseUrl}/api/attachments/upload-capabilities`, {
@@ -759,6 +787,8 @@ test("disabled direct upload advertises the legacy-safe limit without applying t
       directUploadThresholdBytes: null,
       maxBytes: 90 * 1024 * 1024,
       sessionExpiresInSeconds: null,
+      // Pro has no monthly quota.
+      monthlyUpload: null,
     });
   } finally {
     await app?.close();
@@ -784,7 +814,7 @@ test("disabled direct upload session mutation paths fail typed instead of reachi
 
 test("dedicated create limiter emits the declared typed 429 and does not reach the fake", async () => {
   const fake = new FakeAttachmentUploadSessionService();
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false, attachmentUploadSessionService: fake });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, attachmentUploadSessionService: fake });
   try {
     const fixture = await seedMemberFixture();
     for (let index = 0; index < 10; index += 1) {
@@ -811,4 +841,34 @@ test("dedicated create limiter emits the declared typed 429 and does not reach t
   } finally {
     await app.close();
   }
+});
+
+
+test("AppSumo upload allowance and refusal identify the managed source for ordinary members", async () => {
+  const fake = new FakeAttachmentUploadSessionService();
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, attachmentUploadSessionService: fake });
+  try {
+    const fixture = await seedMemberFixture();
+    const { appSumoLicenses, appSumoLicenseBindings } = await import("../db/schema");
+    const { parseAppSumoLicenseKey } = await import("../services/appSumoContracts");
+    const key = parseAppSumoLicenseKey(randomUUID())!;
+    await getDb().insert(appSumoLicenses).values({ productId: "fixture", licenseKey: key, tier: 1, status: "active", verifiedAt: new Date() });
+    await getDb().insert(appSumoLicenseBindings).values({ serverId: fixture.server.id, productId: "fixture", originalLicenseKey: key, currentLicenseKey: key, boundByUserId: fixture.owner.id });
+    const member = await seedVerifiedUser("AppSumo member");
+    await addMember(fixture.server.id, member.id);
+    await addHuman(fixture.channel.id, member.id);
+    const headers = { ...fixture.headers, Authorization: `Bearer ${await accessTokenForTest(member.id)}` };
+    await getDb().insert(serverFileUploadUsageMonths).values({ serverId: fixture.server.id, month: billingUsageMonth(), usedBytes: 1024 ** 3, reservedBytes: 0 });
+    const caps = await fetch(`${app.baseUrl}/api/attachments/upload-capabilities`, { headers });
+    const expected = { month: billingUsageMonth(), limitBytes: 1024 ** 3, remainingBytes: 0, source: "appsumo" };
+    assert.equal(caps.status, 200);
+    assert.deepEqual((await json(caps) as { monthlyUpload: unknown }).monthlyUpload, expected);
+    const refused = await fetch(`${app.baseUrl}/api/attachments/upload-sessions`, { method: "POST", headers, body: JSON.stringify(createInput(fixture.channel.id)) });
+    assert.equal(refused.status, 403);
+    const body = await json(refused) as { monthlyUpload: unknown; message: string };
+    assert.deepEqual(body.monthlyUpload, expected);
+    assert.match(body.message, /AppSumo/);
+    assert.doesNotMatch(body.message, /upgrade to Pro/i);
+    assert.equal(fake.calls.create, 0);
+  } finally { await app.close(); }
 });

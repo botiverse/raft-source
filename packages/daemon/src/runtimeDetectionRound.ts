@@ -1,8 +1,10 @@
 import { ambientProcessEnv } from "./processEnvPatch";
 import { spawn as nodeSpawn, type ChildProcess } from "node:child_process";
 import { createInterface } from "node:readline";
-import { createRequire } from "node:module";
+import { resolveSelfExec, selfExecHostFromProcess, type SelfExecHost } from "@botiverse/raft-shared/src/selfExec";
 import type { RuntimeDetection, RuntimeDetectionCheckedRuntime } from "./core";
+import { seaDetected } from "./drivers/nodeHostLaunch";
+import { liveHostExecutablePath } from "./drivers/liveHostExecutable";
 import { parseRuntimeDetectionChildLine, RUNTIME_DETECTION_CHILD_MODE } from "./runtimeDetectionChild";
 
 /**
@@ -71,26 +73,22 @@ export interface RuntimeDetectionRoundHandle {
   cancel(): void;
 }
 
-function isSeaProcess(): boolean {
-  try {
-    const seaRequire = createRequire(__filename);
-    return (seaRequire("node:sea") as { isSea(): boolean }).isSea();
-  } catch {
-    return false;
-  }
+/** The running process as a self-exec host; a SEA re-execs its live path. */
+export function currentSelfExecHost(): SelfExecHost {
+  const isSea = seaDetected() === true;
+  return selfExecHostFromProcess(process, isSea, isSea ? liveHostExecutablePath() : process.execPath);
 }
 
 /**
- * Argv that re-executes this daemon in detection-child mode: the SEA binary
- * itself, or Node + execArgv + the entry script. Both the standalone daemon
- * entry and the Computer entry dispatch `__detect-runtimes`.
+ * Argv that re-executes this daemon in detection-child mode, per host shape
+ * (resolveSelfExec): Node + execArgv + the entry script, the SEA binary
+ * itself, or the Electron app launcher whose argv guard routes the mode. The
+ * standalone daemon entry, the Computer entry and Raft Desktop's main all
+ * dispatch `__detect-runtimes`.
  */
-export function defaultRuntimeDetectionSelfExec(): RuntimeDetectionSelfExec {
-  if (isSeaProcess()) return { command: process.execPath, args: [RUNTIME_DETECTION_CHILD_MODE] };
-  return {
-    command: process.execPath,
-    args: [...process.execArgv, ...(process.argv[1] !== undefined ? [process.argv[1]] : []), RUNTIME_DETECTION_CHILD_MODE],
-  };
+export function defaultRuntimeDetectionSelfExec(host: SelfExecHost = currentSelfExecHost()): RuntimeDetectionSelfExec {
+  const { command, args } = resolveSelfExec([RUNTIME_DETECTION_CHILD_MODE], host);
+  return { command, args };
 }
 
 /**
@@ -107,28 +105,6 @@ export function killRuntimeDetectionTree(pid: number, platform: NodeJS.Platform)
     }
   } catch {
     // already gone
-  }
-}
-
-/**
- * Kill a runtime child's process tree when it leads a group, otherwise the
- * child itself (POSIX); Windows walks the tree with `taskkill /T`. Kept here,
- * beside the detection tree kill, so AgentProcessManager owns no raw signals
- * (runtimeContract.test.ts).
- */
-export function killProcessGroupOrSelf(pid: number, platform: NodeJS.Platform): void {
-  if (platform === "win32") {
-    killRuntimeDetectionTree(pid, "win32");
-    return;
-  }
-  try {
-    process.kill(-pid, "SIGKILL");
-  } catch {
-    try {
-      process.kill(pid, "SIGKILL");
-    } catch {
-      // already gone
-    }
   }
 }
 

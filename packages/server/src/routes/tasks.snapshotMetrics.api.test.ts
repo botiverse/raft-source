@@ -6,7 +6,7 @@ import { tasks, users, serverMembers } from "../db/schema";
 import { createChannel, addHuman } from "../services/channelService";
 import { createServer } from "../services/serverService";
 
-const test = createApiTest({ onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest();
 test("historical task snapshot reads visible DB facts without AI runs or task paging", async ({ app }) => {
   const db = getDb();
   const [owner] = await db.insert(users).values({ email: "snapshot-owner@slock.test", name: "snapshot-owner", passwordHash: await fixturePasswordHash("password123"), emailVerified: true }).returning();

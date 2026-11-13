@@ -1,11 +1,12 @@
 import type { IntlShape } from "react-intl";
 import { isMachineDiskLow } from "@botiverse/raft-shared";
 import type { MachineDiskStatus } from "@botiverse/raft-shared";
-import { formatFileSizeBytes } from "./fileSizePresentation";
+import { formatDiskSizeBytes } from "./fileSizePresentation";
 
 export interface MachineDiskLowPresentation {
+  /** What is free, the actionable amount, said with the whole: "4.2 GB free of 460 GB". */
   free: string;
-  freePercent: number;
+  total: string;
   /**
    * Coarse severity band. A dismissed warning returns only when the band gets
    * worse, so it does not nag while space stays roughly the same.
@@ -22,8 +23,8 @@ export function machineDiskLowPresentation(
   if (machine.status !== "online" || !disk || !isMachineDiskLow(disk)) return null;
   const percent = disk.availableBytes / disk.totalBytes * 100;
   return {
-    free: formatFileSizeBytes(disk.availableBytes, formatMessage),
-    freePercent: Math.floor(percent * 10) / 10,
+    free: formatDiskSizeBytes(disk.availableBytes, formatMessage),
+    total: formatDiskSizeBytes(disk.totalBytes, formatMessage),
     band: percent < 1 ? "under1" : percent < 2 ? "under2" : percent < 5 ? "under5" : "under10",
   };
 }

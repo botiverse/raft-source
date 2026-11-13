@@ -1,0 +1,88 @@
+// The content Worker for Raft's workspace Artifacts (S2; src/raftContent.ts).
+// A Worker of its own: it shares nothing with Raft at runtime but the R2
+// bucket, which it reads through R2's S3 API with a read-only token (no R2
+// binding: a binding can write). Build: pnpm run build. Never deployed from
+// here by hand; the vars and database below are placeholders, set by the deploy
+// (docs/development/workspace-artifacts-content-worker.md).
+{
+  "name": "raft-content",
+  "main": "src/raftContent.ts",
+  "compatibility_date": "2026-07-24",
+  // The issue host: Raft calls POST https://raft-content.<account>.workers.dev/_raft/frames
+  // (its ARTIFACTS_CONTENT_WORKER_URL). On purpose: it is not under the content
+  // domain (whose hosts are Porthole's alone) and needs no zone of its own; the
+  // route is behind RAFT_TOKENS and every other path there is a 404.
+  "workers_dev": true,
+  // No per-version preview hosts (<version>-raft-content.<account>.workers.dev):
+  // an old build must never answer the issue route.
+  "preview_urls": false,
+  // The content domain: one wildcard route, `*.<CONTENT_DOMAIN>/*`, on a
+  // registrable domain used for nothing else (proxied wildcard DNS). That route
+  // is owned by the infrastructure repository's Terraform, never declared here:
+  // a deploy with `routes` would replace or fight it. No "routes" key.
+  // pdf.js for the PDF viewer (src/services/pdfjsAssets.ts): its scripts as
+  // text and its data as bytes, served as files of a PDF version, never run here.
+  "rules": [
+    { "type": "Text", "globs": ["pdfjs-dist/build/*.min.mjs", "pdfjs-dist/LICENSE", "pdfjs-dist/*/LICENSE*"], "fallthrough": true },
+    {
+      "type": "Data",
+      "globs": [
+        "pdfjs-dist/cmaps/*.bcmap",
+        "pdfjs-dist/standard_fonts/*.pfb",
+        "pdfjs-dist/standard_fonts/*.ttf",
+        "pdfjs-dist/wasm/*.wasm",
+        "pdfjs-dist/iccs/*.icc"
+      ],
+      "fallthrough": true
+    },
+    // Raft's fonts for a Markdown page (src/services/markdownFonts.ts), served as files of the version.
+    { "type": "Data", "globs": ["**/*.woff2"], "fallthrough": true }
+  ],
+  // No "r2_buckets": an R2 binding can put, delete and list across its whole bucket. The Worker
+  // reads Artifact files over R2's S3 API with a token that can only read (R2_* below).
+  "d1_databases": [
+    // Porthole's one-time tickets, and nothing else.
+    {
+      "binding": "TICKETS",
+      "database_name": "raft-content-tickets",
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "vars": {
+    // `w-<uuid>.<CONTENT_DOMAIN>`; required.
+    "CONTENT_DOMAIN": "",
+    // The Raft app's origin: the first frame ancestor; required.
+    "APP_ORIGIN": "",
+    // Raft's other clients that frame pages, a comma list (https origins or app://raft, Raft
+    // Desktop); optional.
+    "EXTRA_APP_ORIGINS": "",
+    // Pages that frame the Raft app itself (Deck), a comma list of https origins: ancestors of
+    // every page above the app, never origins a page talks to (Porthole's framedBy); optional,
+    // none locally. The deploy sets it per environment.
+    "FRAMED_BY_ORIGINS": "",
+    // Embeds of public Artifacts on any site (Porthole P143): "1" or "true" turns them on, with
+    // EMBED_DOMAIN set; anything else is off (the kill switch). Optional, off by default.
+    "EMBEDS": "",
+    // The embed host (Raft's outer page), on the content domain's site but outside it, e.g.
+    // embed.raftusercontent.com. Its route is the infrastructure repository's, as the content
+    // domain's. Optional.
+    "EMBED_DOMAIN": "",
+    // Raft's API, for /internal/artifacts-content/*; required.
+    "RAFT_API_URL": "",
+    // The account's R2 S3 endpoint, an origin (https://<account id>.r2.cloudflarestorage.com); required.
+    "R2_ENDPOINT": "",
+    // The platform's app-content bucket Raft writes Artifact files to (the server's
+    // APP_STORAGE_R2_BUCKET), read under apps/artifacts/ by key; required.
+    "R2_BUCKET": ""
+  }
+  // Secrets (the first three each at least 32 random bytes), kept in the deployment's secret store
+  // and set on the Worker by its sync-worker-secrets workflow, not by hand (`wrangler secret put`):
+  //   PORTHOLE_SECRET — signs tickets, cookies and sealed file paths
+  //   RAFT_API_TOKEN — the Worker's token to Raft (in Raft's ARTIFACTS_CONTENT_RAFT_TOKENS)
+  //   RAFT_TOKENS — comma list of Raft's tokens to the Worker (Raft's
+  //     ARTIFACTS_CONTENT_WORKER_TOKEN): each verifies the tickets Raft signs (by kid) and is a
+  //     bearer for /_raft/frames; rotate by adding, switching, removing
+  //   R2_READ_ACCESS_KEY_ID, R2_READ_SECRET_ACCESS_KEY — an R2 API token with "Object Read
+  //     only" on R2_BUCKET alone (never an Admin or read-write token, never all buckets)
+}

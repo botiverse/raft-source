@@ -47,14 +47,16 @@ test("task assign sends the handle and writes canonical text", async () => {
   const { io, stdout, stderr } = memoryIo();
   const requests: Array<{ method: string; path: string; body: unknown }> = [];
 
-  await taskAssignCommand.handler(recordingCtx(io, requests), {
+  await taskAssignCommand.handler(recordingCtx(io, requests), undefined, undefined, {
     target: "  #proj-runtime  ", number: "7", assignee: "@akko",
   });
 
   assert.deepEqual(requests, [{
     method: "POST",
     path: "/internal/agent-api/tasks/assign",
-    body: { channel: "#proj-runtime", task_number: 7, assignee: "@akko" },
+    // `reason` is always sent (empty when not given): the server then knows
+    // this client can give one.
+    body: { channel: "#proj-runtime", task_number: 7, assignee: "@akko", reason: "" },
   }]);
   assert.deepEqual(stderr, []);
   assert.equal(stdout.join(""), "#7 assigned to @akko.\n");
@@ -64,7 +66,7 @@ test("a bare handle without @ is normalized rather than rejected", async () => {
   const { io, stdout } = memoryIo();
   const requests: Array<{ method: string; path: string; body: unknown }> = [];
 
-  await taskAssignCommand.handler(recordingCtx(io, requests), {
+  await taskAssignCommand.handler(recordingCtx(io, requests), undefined, undefined, {
     target: "#proj-runtime", number: "7", assignee: "akko",
   });
 
@@ -75,13 +77,13 @@ test("a bare handle without @ is normalized rather than rejected", async () => {
 test("--expected-revision is forwarded only when supplied", async () => {
   const { io } = memoryIo();
   const withRev: Array<{ method: string; path: string; body: unknown }> = [];
-  await taskAssignCommand.handler(recordingCtx(io, withRev), {
+  await taskAssignCommand.handler(recordingCtx(io, withRev), undefined, undefined, {
     target: "#proj-runtime", number: "7", assignee: "@akko", expectedRevision: "3",
   });
   assert.equal((withRev[0]!.body as { expected_revision?: number }).expected_revision, 3);
 
   const withoutRev: Array<{ method: string; path: string; body: unknown }> = [];
-  await taskAssignCommand.handler(recordingCtx(io, withoutRev), {
+  await taskAssignCommand.handler(recordingCtx(io, withoutRev), undefined, undefined, {
     target: "#proj-runtime", number: "7", assignee: "@akko",
   });
   assert.ok(
@@ -107,7 +109,7 @@ test("a missing assignee is refused before auth bootstrap, and points at `unassi
       createApiClient: () => { throw new Error(`${label}: must not reach the network`); },
     });
     await assert.rejects(
-      async () => { await taskAssignCommand.handler(ctx, opts); },
+      async () => { await taskAssignCommand.handler(ctx, undefined, undefined, opts); },
       (err: unknown) => {
         assert.ok(err instanceof CliError, label);
         assert.equal(err.code, "INVALID_ARG", label);
@@ -133,7 +135,7 @@ test("invalid numbers and revisions map to typed CliError", async () => {
       createApiClient: () => { throw new Error("must not reach the network"); },
     });
     await assert.rejects(
-      async () => { await taskAssignCommand.handler(ctx, opts); },
+      async () => { await taskAssignCommand.handler(ctx, undefined, undefined, opts); },
       (err: unknown) => err instanceof CliError && err.code === "INVALID_ARG",
       JSON.stringify(opts),
     );
@@ -153,9 +155,123 @@ test("server failures map to a typed CliError, 5xx distinctly", async () => {
       }) as any,
     });
     await assert.rejects(
-      async () => { await taskAssignCommand.handler(ctx, { target: "#proj-runtime", number: "7", assignee: "@akko" }); },
+      async () => { await taskAssignCommand.handler(ctx, undefined, undefined, { target: "#proj-runtime", number: "7", assignee: "@akko" }); },
       (err: unknown) => err instanceof CliError && err.code === code,
       `status ${status}`,
     );
   }
+});
+
+test("task assign over the task-write budget: RATE_LIMITED, retryable, how long to wait", async () => {
+  const { io } = memoryIo();
+  const body = {
+    error: "This agent made too many task changes: the limit is 120 a minute. Retry in 9 seconds.",
+    code: "RATE_LIMITED",
+    details: { operation: "tasks.assign", limit: 120, windowSeconds: 60, retryAfterSeconds: 9 },
+  };
+  const ctx = createCommandContext({
+    io,
+    loadAgentContext: () => agentContext,
+    createApiClient: () => ({
+      request: async (): Promise<ApiResponse<unknown>> => ({ ok: false, status: 429, error: body.error, errorCode: "RATE_LIMITED", data: null, errorBody: body }),
+    }) as any,
+  });
+  await assert.rejects(
+    async () => taskAssignCommand.handler(ctx, undefined, undefined, { target: "#proj-runtime", number: "7", assignee: "@akko" }),
+    (err: unknown) => {
+      assert.ok(err instanceof CliError);
+      assert.equal(err.code, "RATE_LIMITED");
+      assert.equal(err.message, body.error);
+      assert.equal(err.retryable, true);
+      assert.equal(err.suggestedNextAction, "Wait 9 seconds, then run the same command again (the refused request changed nothing).");
+      return true;
+    },
+  );
+});
+
+test("a task ref and a positional assignee name the task and who gets it, with the reason", async () => {
+  const { io, stdout } = memoryIo();
+  const requests: Array<{ method: string; path: string; body: unknown }> = [];
+
+  await taskAssignCommand.handler(recordingCtx(io, requests), "#proj-runtime:#51", "@xxchan", {
+    reason: "  Your call:\nship Friday or Monday?  ",
+  });
+
+  assert.deepEqual(requests, [{
+    method: "POST",
+    path: "/internal/agent-api/tasks/assign",
+    body: { channel: "#proj-runtime", task_number: 51, assignee: "@xxchan", reason: "Your call: ship Friday or Monday?" },
+  }]);
+  assert.equal(stdout.join(""), "#51 assigned to @xxchan.\n");
+});
+
+test("a DM task ref works, and --assignee still names the assignee after a ref", async () => {
+  const { io } = memoryIo();
+  const requests: Array<{ method: string; path: string; body: unknown }> = [];
+
+  await taskAssignCommand.handler(recordingCtx(io, requests), "dm:@richard:#3", undefined, { assignee: "akko", reason: "Review the draft" });
+
+  assert.deepEqual(requests[0]!.body, { channel: "dm:@richard", task_number: 3, assignee: "@akko", reason: "Review the draft" });
+});
+
+test("a lone @who positional with --target/--number is the assignee", async () => {
+  const { io } = memoryIo();
+  const requests: Array<{ method: string; path: string; body: unknown }> = [];
+
+  await taskAssignCommand.handler(recordingCtx(io, requests), "@akko", undefined, { target: "#proj-runtime", number: "7", reason: "Needs your sign-off" });
+
+  assert.deepEqual(requests[0]!.body, { channel: "#proj-runtime", task_number: 7, assignee: "@akko", reason: "Needs your sign-off" });
+});
+
+test("a ref and flags that disagree, or two different assignees, are refused before auth bootstrap", async () => {
+  for (const [label, ref, who, opts] of [
+    ["ref vs --number", "#proj-runtime:#51", "@akko", { number: "52" }],
+    ["ref vs --target", "#proj-runtime:#51", "@akko", { target: "#other" }],
+    ["positional vs --assignee", "#proj-runtime:#51", "@akko", { assignee: "@bob" }],
+    ["not a ref", "proj-runtime-51", "@akko", {}],
+    ["reason too long", "#proj-runtime:#51", "@akko", { reason: "x".repeat(501) }],
+  ] as const) {
+    const { io } = memoryIo();
+    const ctx = createCommandContext({
+      io,
+      loadAgentContext: () => { throw new Error(`${label}: must not reach auth`); },
+      createApiClient: () => { throw new Error(`${label}: must not reach the network`); },
+    });
+    await assert.rejects(
+      async () => { await taskAssignCommand.handler(ctx, ref, who, opts); },
+      (err: unknown) => err instanceof CliError && (err.code === "INVALID_ARG" || err.code === "INVALID_TARGET"),
+      label,
+    );
+  }
+});
+
+test("the server's refusal of a hand-off without a reason is printed as it says it, with its next step", async () => {
+  const { io } = memoryIo();
+  const error = "Handing a task to someone else needs a reason: say in one line what you are waiting on them for.";
+  const step = 'raft task assign "#proj-runtime:#51" @xxchan --reason "…"';
+  const ctx = createCommandContext({
+    io,
+    loadAgentContext: () => agentContext,
+    createApiClient: () => ({
+      request: async (): Promise<ApiResponse<unknown>> => ({ ok: false, status: 400, error, errorCode: "task_assign_reason_required", suggestedNextAction: step, data: null }),
+    }) as any,
+  });
+  await assert.rejects(
+    async () => taskAssignCommand.handler(ctx, "#proj-runtime:#51", "@xxchan", {}),
+    (err: unknown) => err instanceof CliError && err.code === "ASSIGN_FAILED" && err.message === error && err.suggestedNextAction === step,
+  );
+});
+
+test("a ref the shell cut off (unquoted #) is named as the likely cause, before auth bootstrap", async () => {
+  const { io } = memoryIo();
+  const ctx = createCommandContext({
+    io,
+    loadAgentContext: () => { throw new Error("must not reach auth"); },
+    createApiClient: () => { throw new Error("must not reach the network"); },
+  });
+  // `raft task assign #proj:#51 @x --reason …` reaches the CLI as `raft task assign`.
+  await assert.rejects(
+    async () => { await taskAssignCommand.handler(ctx, undefined, undefined, {}); },
+    (err: unknown) => err instanceof CliError && err.code === "INVALID_ARG" && /# starts a shell comment/.test(err.message),
+  );
 });

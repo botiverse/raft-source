@@ -1,12 +1,10 @@
 import { useEffect, useState } from "react";
 import type { ReactNode } from "react";
 import { useIntl } from "react-intl";
-import { Gauge } from "lucide-react";
-import { Card, Spinner } from "@botiverse/raft-ui";
+import { Card, CardContent, CardHeader, CardTitle, Spinner } from "@botiverse/raft-ui";
 import type { HostedRuntimeSpendView } from "@botiverse/raft-shared";
 import api from "../../api/client";
 import Banner from "../ui/Banner";
-import SectionHeader from "../ui/SectionHeader";
 import { useTimeFormatter } from "../../hooks/useTimeFormatter";
 import { formatUsdAmount } from "../../utils/usdAmount";
 
@@ -81,7 +79,7 @@ export function HostedRuntimeSpendCard() {
             )}
           </Banner>
         )}
-        <dl className="m-0 space-y-3">
+        <dl className="m-0 stack-y-3">
           <SpendRow label={formatMessage({ id: "settings.hostedSpend.today" })}>
             <div data-testid="hosted-runtime-spend-today">
               {today.limitUsd === null
@@ -107,7 +105,7 @@ export function HostedRuntimeSpendCard() {
           </SpendRow>
           {spend.agents.length > 0 && (
             <SpendRow label={formatMessage({ id: "settings.hostedSpend.byAgent" })}>
-              <ul className="m-0 list-none space-y-0.5 p-0 text-footnote" data-testid="hosted-runtime-spend-agents">
+              <ul className="m-0 list-none stack-y-0.5 p-0 text-footnote" data-testid="hosted-runtime-spend-agents">
                 {spend.agents.map((agent) => (
                   <li key={agent.agentId ?? "deleted"} className="flex min-w-0 items-baseline gap-2">
                     <span className="truncate">{agent.name ?? formatMessage({ id: "settings.hostedSpend.deletedAgents" })}</span>
@@ -126,12 +124,13 @@ export function HostedRuntimeSpendCard() {
     );
   }
 
+  // One of Plan & Billing's cards, titled like the others (task #13).
   return (
-    <div data-testid="hosted-runtime-spend">
-      <SectionHeader className="mb-3" icon={<Gauge size={16} />} label={formatMessage({ id: "settings.hostedSpend.title" })} />
-      <Card className="mb-6 block p-4">
-        {body}
-      </Card>
-    </div>
+    <Card data-testid="hosted-runtime-spend">
+      <CardHeader>
+        <CardTitle render={<h2>{formatMessage({ id: "settings.hostedSpend.title" })}</h2>} />
+      </CardHeader>
+      <CardContent>{body}</CardContent>
+    </Card>
   );
 }

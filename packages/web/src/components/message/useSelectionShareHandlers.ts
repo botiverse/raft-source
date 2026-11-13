@@ -1,22 +1,27 @@
-import { useState, useCallback } from "react";
+import { useState, useCallback, useEffect, useRef } from "react";
 import type { RefObject } from "react";
 import { useIntl } from "react-intl";
 import { useSelectionStore } from "../../store/selectionStore";
 import { useMessageStore } from "../../store/messageStore";
 import type { Message } from "../../store/messageStore";
 import {
-  captureSelectedMessageImage,
+  SelectScreenshotRowsMissingError,
+  SelectScreenshotTransientContentError,
   SelectScreenshotTimeoutError,
   SHARE_PREVIEW_MAX_WIDTH,
-} from "../../utils/selectScreenshot";
+} from "../../utils/selectScreenshotShared";
+import type { ScreenshotCaptureProgress } from "../../utils/selectScreenshot";
+import { deferredModule } from "../../boot/deferredUi";
+import { importHandledLocally, isDynamicImportFailure } from "../../utils/dynamicImportRecovery";
 import { ScreenshotInvalidOutputError, ScreenshotNeedsPaginationError } from "../../utils/screenshotBudget";
 import type { ValidatedScreenshot } from "../../utils/screenshotBudget";
-import {
-  selectionToMarkdown,
-  copyTextToClipboard,
-  createSelectedMessagesShareArtifact,
-  navigateShareArtifactToX,
-} from "../../utils/selectMarkdown";
+import { selectionToMarkdown, copyTextToClipboard } from "../../utils/selectMarkdown";
+
+// The image export (html-to-image and the capture pipeline), off the first
+// download (boot/deferredUi): loaded when someone makes an image, normally
+// already fetched in the background. A failed load is the share's own error
+// line, and making the image again asks again.
+const loadSelectScreenshot = deferredModule(() => import("../../utils/selectScreenshot"));
 
 /**
  * Resolve the messages currently selected, regardless of selection mode.
@@ -41,8 +46,8 @@ import {
  * export degrades to "parent only" — exactly the regression huxijin
  * caught at #proj-mobile a8748fc2 2026-05-02.
  *
- * Each result is annotated with `isThreadChild` so the renderer can indent
- * replies one step under their parent in the export.
+ * Each result is annotated with `isThreadChild` for text exports. Image
+ * exports intentionally keep parent and reply rows on the same left edge.
  */
 export function gatherSelectedMessages(opts?: {
   channelMessages?: readonly Message[];
@@ -155,28 +160,43 @@ function describeCaptureFailure(
   err: unknown,
   formatMessage: ReturnType<typeof useIntl>["formatMessage"],
 ): string | null {
+  if (isDynamicImportFailure(err)) return formatMessage({ id: "common.deferred.failedDescription" });
   if (err instanceof ScreenshotNeedsPaginationError) return formatMessage({ id: "message.share.selectionTooLong" });
   if (err instanceof ScreenshotInvalidOutputError) return formatMessage({ id: "message.share.renderEmpty" });
+  if (err instanceof SelectScreenshotTransientContentError) return formatMessage({ id: "message.share.contentNotReady" });
+  if (err instanceof SelectScreenshotRowsMissingError) {
+    return formatMessage(
+      { id: "message.share.selectionNotRendered" },
+      { missing: err.missingMessageIds.length, total: err.total },
+    );
+  }
   return null;
+}
+
+/**
+ * Rejects with an AbortError once the capture job was cancelled.
+ */
+function throwIfShareAborted(signal: AbortSignal): void {
+  if (signal.aborted) throw new DOMException("Share cancelled", "AbortError");
 }
 
 export interface SelectionShareHandlers {
   picCapturing: boolean;
-  picPreview: ValidatedScreenshot | null;
-  setPicPreview: (v: ValidatedScreenshot | null) => void;
+  picCaptureProgress: ScreenshotCaptureProgress | null;
+  cancelPicCapture: () => void;
+  picPreview: ValidatedScreenshot[] | null;
+  setPicPreview: (v: ValidatedScreenshot[] | null) => void;
   picError: string | null;
   setPicError: (v: string | null) => void;
   copiedMd: boolean;
   onSavePic: () => Promise<void>;
-  onShareX: () => Promise<void>;
-  onSharePreviewToX: (image: ValidatedScreenshot) => Promise<void>;
   onCopyMd: () => Promise<void>;
 }
 
 /**
  * Shared share-action handlers used by both ChatPanel (channel mode) and
- * ThreadPanel (thread mode). Centralizes the rasterize / intent-window /
- * clipboard plumbing so the two surfaces don't drift.
+ * ThreadPanel (thread mode). Centralizes the rasterize / clipboard
+ * plumbing so the two surfaces don't drift.
  *
  * Filename choice for the PNG download lives in the lightbox caller —
  * this hook no longer owns the surface-name-derived filename.
@@ -201,7 +221,8 @@ export function useSelectionShareHandlers(
 ): SelectionShareHandlers {
   const { formatMessage } = useIntl();
   const [picCapturing, setPicCapturing] = useState(false);
-  const [picPreview, setPicPreview] = useState<ValidatedScreenshot | null>(null);
+  const [picCaptureProgress, setPicCaptureProgress] = useState<ScreenshotCaptureProgress | null>(null);
+  const [picPreview, setPicPreview] = useState<ValidatedScreenshot[] | null>(null);
   const [picError, setPicError] = useState<string | null>(null);
   const [copiedMd, setCopiedMd] = useState(false);
   const channelMessages = opts.channelMessages;
@@ -209,30 +230,41 @@ export function useSelectionShareHandlers(
   const threadParentMessageRef = opts.threadParentMessageRef;
   const onUnresolvedSelection = opts.onUnresolvedSelection;
   const captureScopeRef = opts.captureScopeRef;
+  const captureJobRef = useRef<{ id: number; controller: AbortController } | null>(null);
 
-  const captureSharePreview = useCallback(async () => {
+  // Unmounting the panel mid-capture is a cancel: no capture continues after
+  // the user has left.
+  useEffect(() => () => {
+    captureJobRef.current?.controller.abort();
+    captureJobRef.current = null;
+  }, []);
+
+  const cancelPicCapture = useCallback(() => {
+    captureJobRef.current?.controller.abort();
+    captureJobRef.current = null;
+    setPicCapturing(false);
+    setPicCaptureProgress(null);
+  }, []);
+
+  const captureSharePreview = useCallback(async (job: { id: number; controller: AbortController }) => {
     const { messages, unresolvedCount } = gatherSelectedMessagesWithMeta({ channelMessages, threadReplyMessages, threadParentMessageRef });
     if (unresolvedCount > 0) {
       onUnresolvedSelection?.(unresolvedCount);
       return null;
     }
     if (messages.length === 0) return null;
-    return await captureSelectedMessageImage(messages.map((m) => m.id), {
+    const { captureSelectedMessageImages } = await importHandledLocally(loadSelectScreenshot);
+    // Cancelled while the export's code was loading: nothing to capture.
+    throwIfShareAborted(job.controller.signal);
+    return await captureSelectedMessageImages(messages.map((m) => m.id), {
       maxWidth: SHARE_PREVIEW_MAX_WIDTH,
-      threadChildIds: new Set(messages.filter((m) => m.isThreadChild).map((m) => m.id)),
       scope: captureScopeRef?.current,
+      signal: job.controller.signal,
+      onProgress: (progress) => {
+        if (captureJobRef.current?.id === job.id) setPicCaptureProgress(progress);
+      },
     });
   }, [captureScopeRef, channelMessages, onUnresolvedSelection, threadParentMessageRef, threadReplyMessages]);
-
-  const createShareArtifactAndNavigateToX = useCallback(async (image: ValidatedScreenshot) => {
-    const selectionChannelId = useSelectionStore.getState().channelId;
-    if (!selectionChannelId) return;
-    const file = new File([image.blob], "raft-thread.png", { type: "image/png" });
-    const artifact = await createSelectedMessagesShareArtifact(file, selectionChannelId);
-    setPicPreview(null);
-    useSelectionStore.getState().exit();
-    navigateShareArtifactToX(artifact.url, formatMessage);
-  }, [formatMessage]);
 
   const onSavePic = useCallback(async () => {
     if (picCapturing) return;
@@ -244,10 +276,14 @@ export function useSelectionShareHandlers(
     if (messages.length === 0) return;
     setPicError(null);
     setPicCapturing(true);
+    const job = { id: Date.now(), controller: new AbortController() };
+    captureJobRef.current?.controller.abort();
+    captureJobRef.current = job;
     try {
-      const image = await captureSharePreview();
-      if (image) setPicPreview(image);
+      const images = await captureSharePreview(job);
+      if (images && captureJobRef.current?.id === job.id) setPicPreview(images);
     } catch (err) {
+      if (err instanceof DOMException && err.name === "AbortError") return;
       // html-to-image rejects with the raw `<img onerror>` Event when a
       // cloned <img> fails to load — `String(err)` on an Event yields
       // "[object Event]" which is useless for triage. Pull useful fields
@@ -278,50 +314,13 @@ export function useSelectionShareHandlers(
       }
       setPicError(msg);
     } finally {
-      setPicCapturing(false);
+      if (captureJobRef.current?.id === job.id) {
+        captureJobRef.current = null;
+        setPicCapturing(false);
+        setPicCaptureProgress(null);
+      }
     }
   }, [captureSharePreview, channelMessages, formatMessage, onUnresolvedSelection, picCapturing, threadParentMessageRef, threadReplyMessages]);
-
-  const onShareX = useCallback(async () => {
-    if (picCapturing) return;
-    const selectionChannelId = useSelectionStore.getState().channelId;
-    const { messages, unresolvedCount } = gatherSelectedMessagesWithMeta({ channelMessages, threadReplyMessages, threadParentMessageRef });
-    if (unresolvedCount > 0) {
-      onUnresolvedSelection?.(unresolvedCount);
-      return;
-    }
-    if (messages.length === 0 || !selectionChannelId) return;
-    setPicError(null);
-    setPicCapturing(true);
-    try {
-      const image = await captureSharePreview();
-      if (image) await createShareArtifactAndNavigateToX(image);
-    } catch (err) {
-      if (err instanceof DOMException && err.name === "AbortError") {
-        return;
-      }
-      console.error("share to X failed:", err);
-      setPicError(describeCaptureFailure(err, formatMessage)
-        ?? (err instanceof Error ? err.message : formatMessage({ id: "message.share.failed" })));
-    } finally {
-      setPicCapturing(false);
-    }
-  }, [captureSharePreview, channelMessages, createShareArtifactAndNavigateToX, formatMessage, onUnresolvedSelection, picCapturing, threadParentMessageRef, threadReplyMessages]);
-
-  const onSharePreviewToX = useCallback(async (image: ValidatedScreenshot) => {
-    if (picCapturing) return;
-    setPicError(null);
-    setPicCapturing(true);
-    try {
-      await createShareArtifactAndNavigateToX(image);
-    } catch (err) {
-      console.error("share preview to X failed:", err);
-      setPicError(err instanceof Error ? err.message : formatMessage({ id: "message.share.failed" }));
-      throw err;
-    } finally {
-      setPicCapturing(false);
-    }
-  }, [createShareArtifactAndNavigateToX, formatMessage, picCapturing]);
 
   const onCopyMd = useCallback(async () => {
     const { messages, unresolvedCount } = gatherSelectedMessagesWithMeta({ channelMessages, threadReplyMessages, threadParentMessageRef });
@@ -343,14 +342,14 @@ export function useSelectionShareHandlers(
 
   return {
     picCapturing,
+    picCaptureProgress,
+    cancelPicCapture,
     picPreview,
     setPicPreview,
     picError,
     setPicError,
     copiedMd,
     onSavePic,
-    onShareX,
-    onSharePreviewToX,
     onCopyMd,
   };
 }

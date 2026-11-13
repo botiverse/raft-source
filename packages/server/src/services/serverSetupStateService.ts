@@ -7,12 +7,12 @@ import { getActorServerRoleInServer } from "../lib/actorPermissions";
 import type { AgentOrchestrator } from "./agentOrchestrator";
 import { resolveHostedCindySetupState, type HostedCindySetupState } from "./hostedCindyService";
 import { hasOfficialOnboardingAgentIdentity } from "./officialOnboardingAgentIdentity";
-import { withAgentCreateLock } from "./planService";
+import { getServerBillingEntitlement, withAgentCreateLock } from "./planService";
 import {
   projectSetupRuntimeOptions,
-  resolveRuntimeAdmissionPolicy,
 } from "./runtimeAdmissionService";
 import { hasServerCompletedSetupForProjection } from "./serverSetupCompletionService";
+import { newAuditOperationId, recordIntegrationAuditEvent, serverAuditContextMetadata } from "./integrationAuditService";
 
 /**
  * ONBOARDING HAS ONE SERVER-WIDE TERMINAL STATE. One owner completing setup completes the
@@ -142,6 +142,12 @@ export interface ServerSetupLiveFacts {
    */
   ownerSurveyPending: boolean;
   ownerHandoffPending: boolean;
+  /**
+   * The Pro step is still owed: the handoff is still owed, the owner has not answered the
+   * step, and the server is on Free. Tied to the handoff so a server whose owner already
+   * pressed "Let's Go" never gets it.
+   */
+  ownerUpgradePromptPending: boolean;
   /** The person looking. The survey and the handoff are the OWNER's, and nobody else's. */
   actorIsOwner: boolean;
 }
@@ -209,9 +215,10 @@ export interface ServerSetupProjection {
    * The recovery screen exists to say "I remember you". One question, one source.
    */
   offlineComputers: ServerSetupOfflineComputer[];
-  /** Post-setup steps still owed: survey, then handoff. Persisted, not client state. */
+  /** Post-setup steps still owed: survey, Pro, then handoff. Persisted, not client state. */
   postSetup: {
     surveyPending: boolean;
+    upgradePending: boolean;
     handoffPending: boolean;
   };
 }
@@ -330,7 +337,7 @@ function noSetupProjection(reason: Exclude<ServerSetupGateReason, null>): Server
     runtimeOptions: [],
     hasConnectedComputer: false,
     offlineComputers: [],
-    postSetup: { surveyPending: false, handoffPending: false },
+    postSetup: { surveyPending: false, upgradePending: false, handoffPending: false },
   };
 }
 
@@ -348,7 +355,7 @@ function retryProjection(phase: ServerSetupStatus | null, reason: ServerSetupGat
     runtimeOptions: [],
     hasConnectedComputer: false,
     offlineComputers: [],
-    postSetup: { surveyPending: false, handoffPending: false },
+    postSetup: { surveyPending: false, upgradePending: false, handoffPending: false },
   };
 }
 
@@ -370,6 +377,7 @@ export function projectServerSetup(
   const postSetupEligible = flowCompleted && live.actorIsOwner;
   const postSetup = {
     surveyPending: postSetupEligible && live.ownerSurveyPending,
+    upgradePending: postSetupEligible && live.ownerHandoffPending && live.ownerUpgradePromptPending,
     handoffPending: postSetupEligible && live.ownerHandoffPending,
   };
 
@@ -651,6 +659,7 @@ export function createServerSetupStateService(deps: ServerSetupStateServiceDeps)
           officialOnboardingAgent: "unknown",
           ownerSurveyPending: false,
           ownerHandoffPending: false,
+          ownerUpgradePromptPending: false,
           actorIsOwner: false,
         },
       );
@@ -806,6 +815,12 @@ async function resolveOnboardingAgentFacts(serverId: string): Promise<Pick<Serve
 async function resolveOwnerPostSetupFacts(serverId: string, actorUserId: string): Promise<{
   ownerSurveyPending: boolean;
   ownerHandoffPending: boolean;
+  /**
+   * The Pro step is still owed: the handoff is still owed, the owner has not answered the
+   * step, and the server is on Free. Tied to the handoff so a server whose owner already
+   * pressed "Let's Go" never gets it.
+   */
+  ownerUpgradePromptPending: boolean;
   /** The person looking. The survey and the handoff are the OWNER's, and nobody else's. */
   actorIsOwner: boolean;
 }> {
@@ -816,11 +831,11 @@ async function resolveOwnerPostSetupFacts(serverId: string, actorUserId: string)
   try {
     db = getDb();
   } catch {
-    return { ownerSurveyPending: false, ownerHandoffPending: false, actorIsOwner: false };
+    return { ownerSurveyPending: false, ownerHandoffPending: false, ownerUpgradePromptPending: false, actorIsOwner: false };
   }
 
   const [server] = await db.select({ ownerId: servers.ownerId }).from(servers).where(eq(servers.id, serverId));
-  if (!server) return { ownerSurveyPending: false, ownerHandoffPending: false, actorIsOwner: false };
+  if (!server) return { ownerSurveyPending: false, ownerHandoffPending: false, ownerUpgradePromptPending: false, actorIsOwner: false };
 
   const [owner] = await db
     .select({ signupSurveyCompletedAt: users.signupSurveyCompletedAt })
@@ -828,9 +843,17 @@ async function resolveOwnerPostSetupFacts(serverId: string, actorUserId: string)
     .where(eq(users.id, server.ownerId));
 
   const [prefs] = await db
-    .select({ setupHandoffAcknowledgedAt: serverMembers.setupHandoffAcknowledgedAt })
+    .select({
+      setupHandoffAcknowledgedAt: serverMembers.setupHandoffAcknowledgedAt,
+      setupUpgradePromptSeenAt: serverMembers.setupUpgradePromptSeenAt,
+    })
     .from(serverMembers)
     .where(and(eq(serverMembers.serverId, serverId), eq(serverMembers.userId, server.ownerId)));
+
+  const ownerHandoffPending = !prefs?.setupHandoffAcknowledgedAt;
+  const ownerUpgradePromptPending = ownerHandoffPending && !!prefs && !prefs.setupUpgradePromptSeenAt
+    ? await isUpgradePromptOwed(db, serverId)
+    : false;
 
   return {
     ownerSurveyPending: !!owner && owner.signupSurveyCompletedAt === null,
@@ -841,9 +864,24 @@ async function resolveOwnerPostSetupFacts(serverId: string, actorUserId: string)
     // "Starting…", and an old server that never had a briefing read as "still owes a
     // handoff" — which is how existing users were shown the completion celebration.
     // Delivery is delivery. It never speaks for the user.
-    ownerHandoffPending: !prefs?.setupHandoffAcknowledgedAt,
+    ownerHandoffPending,
+    ownerUpgradePromptPending,
     actorIsOwner: actorUserId === server.ownerId,
   };
+}
+
+/**
+ * The Pro step is an offer, never a gate: like the other facts here, an entitlement we
+ * could not read means "not owed". Only checked while the step is otherwise owed, so an
+ * owner past the handoff costs no extra reads.
+ */
+async function isUpgradePromptOwed(db: DatabaseExecutor, serverId: string): Promise<boolean> {
+  try {
+    const entitlement = await getServerBillingEntitlement(db, serverId);
+    return entitlement.plan === "free";
+  } catch {
+    return false;
+  }
 }
 
 async function resolvePersistedCompletionFacts(serverId: string, actorUserId: string): Promise<ServerSetupLiveFacts> {
@@ -955,8 +993,7 @@ export async function resolveServerSetupLiveFacts(
     // #154 / Screen B Next readiness (multi-replica).
     const perMachineRuntimes = onlineConnected.map(({ machine }) => machine.runtimes);
     const runtimeIds = perMachineRuntimes.flatMap((runtimes) => runtimes ?? []);
-    const policy = await resolveRuntimeAdmissionPolicy({ serverId, userId: actorUserId });
-    runtimeOptions = projectSetupRuntimeOptions(runtimeIds, policy);
+    runtimeOptions = projectSetupRuntimeOptions(runtimeIds);
     const availableRuntimeIds = runtimeOptions
       .filter((option) => option.canSelectInThisContext)
       .map((option) => option.runtimeId);
@@ -1015,7 +1052,7 @@ export async function resolveServerSetupLiveFacts(
 export async function resetServerSetup(input: {
   serverId: string;
   actor: ServerSetupActor;
-}): Promise<{ revokedComputers: number }> {
+}): Promise<{ revokedComputers: number; revokedMachineIds: string[] }> {
   if (input.actor.type !== "user") {
     throw new ServerSetupStateError("ACTOR_NOT_HUMAN", "Only a human may reset setup");
   }
@@ -1065,7 +1102,22 @@ export async function resetServerSetup(input: {
       .update(computers)
       .set({ revokedAt: currentDate() })
       .where(and(eq(computers.serverId, input.serverId), isNull(computers.revokedAt)))
-      .returning({ id: computers.id });
+      .returning({ id: computers.id, name: computers.name, machineId: computers.machineId, attachedByUserId: computers.attachedByUserId });
+    // Each revoked Computer is audited in this commit: the owner reset it; whoever
+    // attached it had authorized its access. One reset, one operation id.
+    const audit = serverAuditContextMetadata({ actorRole: lockedRole, operationId: newAuditOperationId() });
+    for (const computer of revoked) {
+      await recordIntegrationAuditEvent({
+        serverId: input.serverId,
+        eventType: "computer.key_revoked",
+        outcome: "success",
+        source: "web",
+        actor: { type: "human", id: input.actor.id },
+        requester: computer.attachedByUserId ? { type: "human", id: computer.attachedByUserId } : null,
+        target: { type: "computer", id: computer.id },
+        metadata: { computerId: computer.id, computerName: computer.name, machineId: computer.machineId, reason: "setup_reset", ...audit },
+      }, tx);
+    }
 
     await tx
       .update(serverMembers)
@@ -1075,7 +1127,10 @@ export async function resetServerSetup(input: {
         eq(serverMembers.userId, server.ownerId),
       ));
 
-    return { revokedComputers: revoked.length };
+    return {
+      revokedComputers: revoked.length,
+      revokedMachineIds: revoked.flatMap((computer) => (computer.machineId ? [computer.machineId] : [])),
+    };
   });
 }
 

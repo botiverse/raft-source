@@ -84,3 +84,32 @@ export function messageUnreadEligibleForReceiverSql(receiver: InboxReceiver): SQ
       )
     ))`;
 }
+
+/**
+ * Task v2: what a task conversation's human-facing unread counts — "N new" on
+ * its Activity row, the followed list and the sidebar — on the same basis as
+ * its reply count: chat messages from people and agents, not the lifecycle
+ * lines (system messages: status moves, assignment receipts). Applied on top of
+ * the cursor and own-send halves of the rule above, so "new" never exceeds the
+ * replies. RisingWave: rw_task_conversation_unread_v1
+ * (infra/risingwave/sql/078-task-conversations.sql). Web live increment:
+ * applyTaskConversationReply (packages/web/src/store/socketBridge.ts).
+ *
+ * Deliberately NOT part of isMessageUnreadEligibleForReceiver: agent delivery
+ * and the inbox facts keep the transport rule (an agent is still woken by a
+ * status change it did not cause), and personal attention is separate — a
+ * mention on a lifecycle line (the assignment notice) still reaches the
+ * assignee through the mention arm and its inbox fact.
+ */
+export function countsTowardTaskConversationUnread(message: Pick<InboxEligibilityMessage, "messageType">): boolean {
+  return message.messageType == null || message.messageType === "chat";
+}
+
+/**
+ * countsTowardTaskConversationUnread as a SQL condition over a `messages` alias,
+ * guarded by whether the row is a task conversation (`isTaskConversation`): a
+ * thread or channel row keeps every eligible message.
+ */
+export function taskConversationUnreadMessageSql(messageAlias: SQL, isTaskConversation: SQL): SQL {
+  return sql`(NOT (${isTaskConversation}) OR ${messageAlias}.message_type = 'chat')`;
+}

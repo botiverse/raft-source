@@ -35,6 +35,8 @@ test("pickComputerReleaseNotesText prefers the UI language and falls back to the
   const both = { version: "1.0.40", en: "- fixed", "zh-CN": "- 修复" };
   assert.equal(pickComputerReleaseNotesText(both, "en"), "- fixed");
   assert.equal(pickComputerReleaseNotesText(both, "zh-cn"), "- 修复");
+  assert.equal(pickComputerReleaseNotesText(both, "zh-tw"), "- 修复", "Traditional Chinese reads the Chinese notes");
+  assert.equal(pickComputerReleaseNotesText(both, "es"), "- fixed");
   assert.equal(pickComputerReleaseNotesText({ version: "1.0.40", en: "- fixed" }, "zh-cn"), "- fixed");
   assert.equal(pickComputerReleaseNotesText({ version: "1.0.40", "zh-CN": "- 修复" }, "en"), "- 修复");
   assert.equal(pickComputerReleaseNotesText(null, "en"), null);

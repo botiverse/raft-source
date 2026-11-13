@@ -150,15 +150,13 @@ function setupDepsForIntegration(serverId: string) {
   // writeMentionFacts uses getDb() directly, so it will use PGlite.
   // But broadcastAndDeliver also calls deps.getChannel, getChannelAgents, etc.
   // For integration tests, we use the real implementations by NOT overriding them.
-  // However, we need to stub io-related and push-related deps.
+  // However, we need to stub io-related deps.
   __setMessageServiceDepsForTests({
     renderAgentReadablePermalinks: async (content: string) => content,
     getSenderIdentity: async (_senderType, _senderId, fallbackName) => ({
       uniqueName: fallbackName,
       description: null,
     }),
-    buildPushTargets: async () => new Map(),
-    sendPushNotifications: async () => undefined,
   });
 }
 

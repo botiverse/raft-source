@@ -1,5 +1,4 @@
 import type { AttachmentPreviewData, AttachmentPreviewResponse, XlsxAttachmentPreviewData } from "@botiverse/raft-shared";
-import type { attachments } from "../../db/schema";
 import { getStorage } from "../storageService";
 import { WorkerCircuitOpen, WorkerCrashed, WorkerPoolBusy, WorkerTaskTimeout } from "../workerPool/errors";
 import { getServerWorkerPool } from "../workerPool/serverWorkerPool";
@@ -13,6 +12,7 @@ import { isXlsxAttachment, xlsxPreviewProvider } from "./providers/xlsx";
 import { markdownPreviewProvider } from "./providers/markdown";
 import { pdfPreviewProvider } from "./providers/pdf";
 import { textPreviewProvider } from "./providers/text";
+import type { ResolvedAttachment } from "../attachmentRecord";
 
 // Preview providers are ordered by specificity. The first matching provider
 // owns the response shape, so generic text-like previews should stay last.
@@ -27,7 +27,7 @@ export const attachmentPreviewProviders: AttachmentPreviewProvider[] = [
   textPreviewProvider,
 ];
 
-export function getAttachmentPreviewProvider(attachment: typeof attachments.$inferSelect): AttachmentPreviewProvider | null {
+export function getAttachmentPreviewProvider(attachment: ResolvedAttachment): AttachmentPreviewProvider | null {
   return attachmentPreviewProviders.find((provider) => provider.canPreview(attachment)) ?? null;
 }
 
@@ -81,7 +81,7 @@ async function buildXlsxPreviewWithPool(buffer: Buffer, workerPool: Pick<WorkerP
 }
 
 export async function buildAttachmentPreviewResponse(
-  attachment: typeof attachments.$inferSelect,
+  attachment: ResolvedAttachment,
   deps: AttachmentPreviewBuildDeps = {},
 ): Promise<AttachmentPreviewResponse> {
   const provider = getAttachmentPreviewProvider(attachment);

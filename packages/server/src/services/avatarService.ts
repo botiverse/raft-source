@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import sharp from "sharp";
+import { withImageDecodeSlot } from "../lib/imageDecodeLimit";
 
 import { getCdnStorage, getStorage } from "./storageService";
 import type { StorageBackend } from "./storageService";
@@ -7,8 +8,14 @@ import type { Express } from "express";
 import type { Request } from "express";
 import multer from "multer";
 import { getThumbnailUrl } from "../routes/attachments";
+import { MAX_PROFILE_AVATAR_BYTES } from "@botiverse/raft-shared";
+import { isHumanAvatarUrl } from "@botiverse/raft-shared/src/humanAvatar";
+import { and, isNull, sql } from "drizzle-orm";
+import { getDb } from "../db/index";
+import { agents, users } from "../db/schema";
 
-export const MAX_PROFILE_AVATAR_BYTES = 5 * 1024 * 1024;
+export { MAX_PROFILE_AVATAR_BYTES };
+
 export const PROFILE_AVATAR_MAX_SIZE_LABEL = "5 MB";
 export const PROFILE_AVATAR_MIME_TYPES = new Set([
   "image/jpeg",
@@ -39,6 +46,83 @@ export function isStoredUserAvatarUrl(avatarUrl: string | null | undefined): boo
   return pathname ? STORED_USER_AVATAR_PATH_PATTERN.test(pathname) : false;
 }
 
+/**
+ * The content hash naming a stored user avatar's image (lowercase), the same
+ * for every spelling of its URL (`/api/avatars/...`, a CDN origin, a query
+ * string); null when the URL is not a stored user avatar.
+ */
+export function storedUserAvatarContentHash(avatarUrl: string | null | undefined): string | null {
+  if (!avatarUrl || !isStoredUserAvatarUrl(avatarUrl)) return null;
+  return /\/avatars\/users\/([0-9a-f]{32})\.webp$/i.exec(avatarPathname(avatarUrl) ?? "")?.[1]?.toLowerCase() ?? null;
+}
+
+/**
+ * A person's avatar that may be shown to others: an image Raft stores
+ * (isStoredUserAvatarUrl) or a built pixel avatar (`pixel-human:v1:...`, the
+ * options they chose; shared humanAvatar.ts). Anything else a person's
+ * avatarUrl may hold (an old social-provider URL) is not shown. For the
+ * projections only: storage questions (delete, replace, materialize) ask
+ * isStoredUserAvatarUrl, since a built avatar has no stored image.
+ */
+export function isShownUserAvatarUrl(avatarUrl: string | null | undefined): boolean {
+  return isStoredUserAvatarUrl(avatarUrl) || isHumanAvatarUrl(avatarUrl);
+}
+
+/**
+ * Deletes a stored user avatar's image when no live user or agent still shows
+ * it (account deletion: the avatar goes with the account; Tenny, #triage:d10ace06).
+ * User avatars share one namespace keyed by content hash, so the same image
+ * uploaded by two people is one object, and one object has several spellings
+ * (`/api/avatars/...`, an old or a new CDN origin, a query string): "still
+ * shown" is asked by that hash, never by the exact URL. Best effort: someone
+ * uploading the same image between the check and the delete loses it. True
+ * when deleted.
+ */
+export async function deleteStoredUserAvatarIfUnused(
+  avatarUrl: string | null | undefined,
+  isHashStillShown: (contentHash: string) => Promise<boolean>,
+): Promise<boolean> {
+  if (!avatarUrl || !isStoredUserAvatarUrl(avatarUrl)) return false;
+  const contentHash = storedUserAvatarContentHash(avatarUrl);
+  const storage = getAvatarStorage();
+  if (!storage || !contentHash) return false;
+  if (await isHashStillShown(contentHash)) return false;
+  await storage.delete(`avatars/users/${contentHash}.webp`);
+  return true;
+}
+
+/**
+ * After a person's avatar changed away from a photo Raft stores (a built
+ * avatar saved, PATCH /me to null): delete that image unless someone still shows it,
+ * so a photo they took down is no longer served and doesn't outlive their
+ * account. Best effort: the change itself is already saved.
+ */
+export async function deleteReplacedUserAvatar(previousAvatarUrl: string | null | undefined, currentAvatarUrl: string | null | undefined): Promise<void> {
+  if (!previousAvatarUrl || previousAvatarUrl === currentAvatarUrl || !isStoredUserAvatarUrl(previousAvatarUrl)) return;
+  try {
+    await deleteStoredUserAvatarIfUnused(previousAvatarUrl, isUserAvatarHashStillShown);
+  } catch (err) {
+    console.warn("[Avatar] Failed to delete a replaced user avatar:", err);
+  }
+}
+
+/**
+ * A live account or agent still shows the user avatar with this content hash,
+ * in any spelling of its URL (origin, `/api/`, query string). The hash is 32
+ * hex characters (checked by the caller's pattern), so it is safe inside LIKE.
+ */
+export async function isUserAvatarHashStillShown(contentHash: string): Promise<boolean> {
+  if (!/^[0-9a-f]{32}$/.test(contentHash)) return true;
+  const db = getDb();
+  const pattern = `%/avatars/users/${contentHash}.webp%`;
+  const [user] = await db.select({ id: users.id }).from(users)
+    .where(and(sql`lower(${users.avatarUrl}) like ${pattern}`, isNull(users.retiredAt))).limit(1);
+  if (user) return true;
+  const [agent] = await db.select({ id: agents.id }).from(agents)
+    .where(and(sql`lower(${agents.avatarUrl}) like ${pattern}`, isNull(agents.deletedAt))).limit(1);
+  return Boolean(agent);
+}
+
 export function isStoredServerScopedAvatarUrl(
   avatarUrl: string | null | undefined,
   serverId: string,
@@ -50,7 +134,8 @@ export function isStoredServerScopedAvatarUrl(
   return new RegExp(`^/(?:api/)?avatars/${escapedServerId}/[0-9a-f]{32}\\.webp$`, "i").test(pathname);
 }
 
-async function readBoundedAvatarResponse(response: Response): Promise<Buffer> {
+/** Reads an image response body, refusing more than MAX_PROFILE_AVATAR_BYTES (the upload limit). */
+export async function readBoundedAvatarResponse(response: Response): Promise<Buffer> {
   const contentLength = Number.parseInt(response.headers.get("content-length") ?? "", 10);
   if (Number.isFinite(contentLength) && contentLength > MAX_PROFILE_AVATAR_BYTES) {
     throw new Error(PROFILE_AVATAR_TOO_LARGE_MESSAGE);
@@ -134,10 +219,10 @@ export async function storeProfileAvatar(
     throw new Error("Storage not configured");
   }
 
-  const processed = await sharp(fileBuffer)
+  const processed = await withImageDecodeSlot(() => sharp(fileBuffer)
     .resize(256, 256, { fit: "cover" })
     .webp({ quality: 85 })
-    .toBuffer();
+    .toBuffer());
 
   const contentHash = createHash("sha256").update(processed).digest("hex").slice(0, 32);
   const storageKey = `avatars/${namespace}/${contentHash}.webp`;

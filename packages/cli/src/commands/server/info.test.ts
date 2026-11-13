@@ -139,6 +139,80 @@ test("server info --channels filters joined rows and prints paging command", asy
   assert.match(output, /More: raft server info --channels --offset 1 --limit 1 --joined/);
 });
 
+test("server info --channels shows each channel's last post, and nothing when the Server doesn't know it", async () => {
+  const threeDaysAgo = new Date(Date.now() - (3 * 24 * 60 + 5) * 60_000).toISOString();
+  const run = async (channels: unknown[], opts: Record<string, unknown> = {}) => {
+    const { io, stdout, stderr } = memoryIo();
+    const ctx = createCommandContext({
+      io,
+      loadAgentContext: () => agentContext,
+      createApiClient: () => ({
+        request: async (): Promise<ApiResponse<unknown>> => ({
+          ok: true,
+          status: 200,
+          error: null,
+          data: { runtimeContext: { agentId: "agent-1", serverId: "server-1" }, channels, agents: [], humans: [] },
+        }),
+      }) as any,
+    });
+    await serverInfoCommand.handler(ctx, { channels: true, ...opts });
+    assert.deepEqual(stderr, []);
+    return stdout.join("");
+  };
+
+  const known = await run([
+    { id: "c1", name: "alpha", joined: true, type: "public", lastPostAt: threeDaysAgo },
+    { id: "c2", name: "quiet", joined: false, type: "public", lastPostAt: null },
+  ]);
+  const stamp = `${threeDaysAgo.slice(0, 16).replace("T", " ")}Z`;
+  assert.ok(known.includes(`#alpha [public, joined, last post ${stamp} (3d ago)]`), known);
+  assert.match(known, /#quiet \[public, not joined, no posts yet\]/);
+
+  // Older Servers, or before the Server's one-time backfill: the field is absent, so nothing is claimed.
+  const unknown = await run([{ id: "c1", name: "alpha", joined: true, type: "public" }]);
+  assert.match(unknown, /#alpha \[public, joined\]/);
+  assert.doesNotMatch(unknown, /last post|no posts yet/);
+
+  // --query matches text, not the timestamp.
+  const queried = await run([
+    { id: "c1", name: "alpha", joined: true, type: "public", lastPostAt: "2026-10-18T07:12:00.000Z" },
+    { id: "c2", name: "release-10", joined: true, type: "public", lastPostAt: "2026-10-18T07:12:00.000Z" },
+  ], { query: "10" });
+  assert.doesNotMatch(queried, /#alpha/);
+  assert.match(queried, /#release-10/);
+});
+
+test("server info --channels counts archived channels under the list; --archived lists them; --query finds them", async () => {
+  const run = async (opts: Record<string, unknown>) => {
+    const { io, stdout, stderr } = memoryIo();
+    const paths: string[] = [];
+    const ctx = createCommandContext({
+      io,
+      loadAgentContext: () => agentContext,
+      createApiClient: () => ({
+        request: async (_method: string, path: string): Promise<ApiResponse<unknown>> => {
+          paths.push(path);
+          return path.endsWith("/server?archived=include")
+            ? { ok: true, status: 200, error: null, data: { runtimeContext: { agentId: "agent-1", serverId: "server-1" }, channels: [{ id: "c1", name: "alpha", joined: true, type: "channel" }], archivedChannelCount: 1, archivedChannels: [{ id: "c9", name: "proj-task", joined: true, type: "channel", archived: true }], agents: [], humans: [] } }
+            : { ok: true, status: 200, error: null, data: { runtimeContext: { agentId: "agent-1", serverId: "server-1" }, channels: [{ id: "c1", name: "alpha", joined: true, type: "channel" }], archivedChannelCount: 1, agents: [], humans: [] } };
+        },
+      }) as any,
+    });
+    await serverInfoCommand.handler(ctx, { channels: true, ...opts });
+    assert.deepEqual(stderr, []);
+    return { text: stdout.join(""), paths };
+  };
+  const plain = await run({});
+  assert.match(plain.text, /Showing 1-1 of 1\.\n1 archived channel not shown \(read-only\)\. To list them: raft server info --channels --archived\n$/);
+  assert.ok(!plain.paths.some((path) => path.endsWith("?archived=include")));
+  const archived = await run({ archived: true });
+  assert.match(archived.text, /#proj-task \[public, joined, archived\]/);
+  assert.doesNotMatch(archived.text, /#alpha|not shown/);
+  const queried = await run({ query: "task" });
+  assert.match(queried.text, /#proj-task \[public, joined, archived\]/);
+  assert.doesNotMatch(queried.text, /not shown/);
+});
+
 test("server info rejects --full combined with section filters before auth bootstrap", async () => {
   const { io } = memoryIo();
   const ctx = createCommandContext({
@@ -180,7 +254,7 @@ test("server info rejects list modifiers without a selected list section before 
       (err: unknown) => {
         assert.ok(err instanceof CliError);
         assert.equal(err.code, "INVALID_ARG");
-        assert.equal(err.message, "--query, --limit, --offset, and --joined require --channels, --agents, or --humans");
+        assert.equal(err.message, "--query, --limit, --offset, --joined, and --archived require --channels, --agents, or --humans");
         return true;
       },
     );

@@ -8,14 +8,16 @@ import { fileURLToPath } from "node:url";
  * they joined (#8292). Any service code that adds a member must therefore
  * either write that position (startReadPositionAtJoin / raiseReadPositionForJoin)
  * or say why none is needed: a brand-new conversation has no history, and no
- * row means position 0. Without this, a path that adds a member to a
+ * row means position 0. A role-only projection of an existing J member must
+ * instead preserve their existing read positions; it is not another join.
+ * Without this, a path that adds a member to a
  * conversation WITH history (as rapRegistryStore's restore once did) silently
  * turns that whole history into unread for the member.
  */
 const SERVICES = path.dirname(fileURLToPath(import.meta.url));
 const INSERT = /\.insert\((channelAgents|channelHumans)\)/;
 const WRITES = /startReadPositionAtJoin\(|raiseReadPositionForJoin\(/;
-const MARKER = /\/\/ read-position: (new conversation|test-only mutation)/;
+const MARKER = /\/\/ read-position: (new conversation|test-only mutation|existing member projection)/;
 const LOOK_BACK = 6;
 const LOOK_AHEAD = 40;
 
@@ -34,5 +36,5 @@ test("every membership insert in services writes a read position or says why non
     });
   }
   assert.ok(sites >= 15, `expected to find the membership insert sites, found ${sites}`);
-  assert.deepEqual(offenders, [], "add startReadPositionAtJoin, or a `// read-position: new conversation …` comment if the conversation is brand new");
+  assert.deepEqual(offenders, [], "add startReadPositionAtJoin, or a truthful read-position reason for a new conversation or an existing-member role projection");
 });

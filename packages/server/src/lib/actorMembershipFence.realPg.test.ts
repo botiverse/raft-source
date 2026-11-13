@@ -22,6 +22,7 @@ import { adoptLegacyMachineByFingerprint } from "../services/computerAdoptionSer
 import { extractApiKeyFingerprint, registerMachine } from "../services/machineService";
 import { removeMember, transitionMemberRole } from "../services/serverService";
 import { resetServerSetup, ServerSetupStateError } from "../services/serverSetupStateService";
+import { setComputerOwner } from "../services/computerOwnerService";
 import { ServerMembershipRevokedError, withActorMembershipFence } from "./actorMembershipFence";
 
 const REAL_PG_URL = process.env.ACTOR_MEMBERSHIP_FENCE_REAL_PG_URL;
@@ -29,6 +30,67 @@ const REAL_PG_REQUIRED = process.env.ACTOR_MEMBERSHIP_FENCE_REAL_PG_REQUIRED ===
 const MIGRATIONS_FOLDER = fileURLToPath(new URL("../../drizzle", import.meta.url));
 const TEST_TIMEOUT_MS = 30_000;
 const LOCK_WAIT_TIMEOUT_MS = 5_000;
+
+test("real PG: Computer owner rejects another server's locked machine without waiting on it", async () => {
+  await withRealPg(async (observer) => {
+    const own = await seed("member"), foreign = await seed("member");
+    const [machine] = await getDb().insert(machines).values({
+      serverId: foreign.server.id, userId: foreign.actor.id, name: "foreign-owner-scope",
+      apiKeyHash: randomUUID(), runtimes: [],
+    }).returning();
+    assert(machine);
+    const blocker = await observer.connect();
+    try {
+      await blocker.query("BEGIN");
+      await blocker.query("SELECT id FROM daemons WHERE id=$1 FOR UPDATE", [machine.id]);
+      const result = await getDb().transaction(async (tx) => {
+        await tx.execute(sql`SET LOCAL lock_timeout = '200ms'`);
+        return setComputerOwner({
+          serverId: own.server.id, machineId: machine.id, actorUserId: own.actor.id, ownerUserId: null,
+        });
+      });
+      assert.deepEqual(result, { ok: false, status: 404, code: "machine_not_found" });
+      const [unchanged] = await getDb().select({ ownerUserId: machines.ownerUserId }).from(machines).where(eq(machines.id, machine.id));
+      assert(unchanged);
+      assert.equal(unchanged.ownerUserId, null);
+    } finally {
+      await blocker.query("ROLLBACK").catch(() => undefined);
+      blocker.release();
+    }
+  });
+}, TEST_TIMEOUT_MS);
+
+test("real PG: Computer owner still waits on its own server's locked machine", async () => {
+  await withRealPg(async (observer) => {
+    const own = await seed("admin");
+    const [machine] = await getDb().insert(machines).values({
+      serverId: own.server.id, userId: own.actor.id, name: "own-owner-scope",
+      apiKeyHash: randomUUID(), runtimes: [],
+    }).returning();
+    assert(machine);
+    const blocker = await observer.connect();
+    try {
+      await blocker.query("BEGIN");
+      await blocker.query("SELECT id FROM daemons WHERE id=$1 FOR UPDATE", [machine.id]);
+      await assert.rejects(getDb().transaction(async (tx) => {
+        await tx.execute(sql`SET LOCAL lock_timeout = '200ms'`);
+        return setComputerOwner({
+          serverId: own.server.id, machineId: machine.id, actorUserId: own.actor.id, ownerUserId: own.actor.id,
+        });
+      }), (error: unknown) => {
+        const value = error as { code?: string; cause?: { code?: string } };
+        return value.code === "55P03" || value.cause?.code === "55P03";
+      });
+    } finally {
+      await blocker.query("ROLLBACK").catch(() => undefined);
+      blocker.release();
+    }
+    const result = await setComputerOwner({
+      serverId: own.server.id, machineId: machine.id, actorUserId: own.actor.id, ownerUserId: own.actor.id,
+    });
+    assert(result.ok && result.changed, "the legitimate same-server transfer must still succeed after the lock releases");
+  });
+}, TEST_TIMEOUT_MS);
 
 async function withRealPg(run: (observer: pg.Pool) => Promise<void>): Promise<void> {
   if (!REAL_PG_URL) {
@@ -201,7 +263,6 @@ test("real PG: a role demotion through transitionMemberRole waits for an in-flig
       actorUserId: owner.id,
       targetUserId: actor.id,
       nextRole: "member",
-      guestTransitionsEnabled: false,
     }));
     try {
       await waitForLockWaiter(observer, '%from "server_members"%for update%', write.pid());

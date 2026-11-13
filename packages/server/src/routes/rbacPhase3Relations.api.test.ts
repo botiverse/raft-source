@@ -11,13 +11,13 @@ import { and, eq } from "drizzle-orm";
 import { getDb } from "../db/index";
 import { agents, machines, serverMembers, servers, users } from "../db/schema";
 import { createAgent } from "../services/agentService";
+import { createChannel } from "../services/channelService";
 import { registerMachine } from "../services/machineService";
 import { createServer } from "../services/serverService";
-import { signAccessToken } from "../middleware/auth";
 import { createApiTest } from "../test/integration/apiTest";
-import { fixturePasswordHash, tokenForHuman } from "../test/integration/credentials";
+import { accessTokenForTest, fixturePasswordHash, tokenForHuman } from "../test/integration/credentials";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 async function seedUser(label: string) {
   const [user] = await getDb().insert(users).values({
@@ -243,11 +243,12 @@ function waitForPacket(ws: WebSocket, packets: string[], predicate: (packet: str
 
 async function openServerSocket(baseUrl: string, userId: string, serverId: string) {
   const packets: string[] = [];
+  const token = await accessTokenForTest(userId);
   const ws = new WebSocket(`${baseUrl.replace("http:", "ws:")}/socket.io/?EIO=4&transport=websocket`);
   ws.on("message", (data) => {
     const packet = data.toString();
     packets.push(packet);
-    if (packet.startsWith("0")) ws.send(`40${JSON.stringify({ token: signAccessToken(userId), serverId })}`);
+    if (packet.startsWith("0")) ws.send(`40${JSON.stringify({ token, serverId })}`);
   });
   await waitForPacket(ws, packets, (packet) => packet.startsWith("42") && packet.includes('"rooms:joined"'));
   assert.ok(packets.some((packet) => packet.includes('"rooms:joined"')), "socket must finish real room setup");
@@ -294,3 +295,52 @@ for (const how of ["removed", "left"] as const) {
     }
   });
 }
+
+// Stopping agents is an owner/admin's (cindyz, 2026-10-29): a member stops only agents it
+// created, and its stop-all reaches only those; restart, reset session and Stop turn stay open.
+test("a Member may stop only the Agents it created; restart and reset session stay open", async ({ app }) => {
+  const ctx = await seedRelation("stop-member", "member");
+  const own = await createAgent(ctx.server.id, "stop-own", { runtime: "codex", creatorType: "user", creatorId: ctx.related.id });
+  const other = await createAgent(ctx.server.id, "stop-other", { runtime: "codex", creatorType: "user", creatorId: ctx.owner.id });
+  const channel = await createChannel(ctx.server.id, `stop-${randomUUID().slice(0, 8)}`, undefined, "channel", {
+    type: "user", id: ctx.owner.id, initialUserIds: [ctx.related.id], initialAgentIds: [own.id, other.id],
+  });
+  const as = (token: string) => (method: string, path: string, body?: unknown) => fetch(`${app.baseUrl}${path}`, {
+    method,
+    headers: authHeaders(token, ctx.server.id),
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  const member = as(ctx.relatedToken);
+  const owner = as(ctx.ownerToken);
+
+  assert.equal((await member("POST", `/api/agents/${other.id}/stop`, {})).status, 403, "member must not stop someone else's agent");
+  assert.equal((await member("POST", `/api/agents/${own.id}/stop`, {})).status, 200, "creator stops its own agent");
+  for (const mode of ["restart", "session"] as const) {
+    assert.equal((await member("POST", `/api/agents/${other.id}/reset`, { mode })).status, 202, `member keeps ${mode}`);
+  }
+
+  const stopAll = await member("POST", `/api/channels/${channel.id}/stop-all-agents`, {});
+  assert.equal(stopAll.status, 200);
+  const rows = (await stopAll.json() as { results: Array<{ agentId: string; ok: boolean; reason?: string }> }).results;
+  assert.deepEqual(rows.find((row) => row.agentId === other.id), { agentId: other.id, ok: false, reason: "forbidden" });
+  assert.equal(rows.find((row) => row.agentId === own.id)?.ok, true);
+
+  // Positive control: the owner stops someone else's agent and every agent in the channel.
+  assert.equal((await owner("POST", `/api/agents/${own.id}/stop`, {})).status, 200);
+  // A person's stop-all is their Stop: each agent is told `owner_stop`, which also ends its `raft proc` jobs.
+  const orchestrator = app.app.get("agentOrchestrator") as { stopAgent: (agentId: string, reason?: string, options?: { daemonReason?: string }) => Promise<unknown> };
+  const originalStop = orchestrator.stopAgent;
+  const told: string[] = [];
+  orchestrator.stopAgent = async (agentId, reason, options) => {
+    told.push(`${agentId}:${options?.daemonReason}`);
+    return originalStop.call(orchestrator, agentId, reason, options);
+  };
+  try {
+    const ownerAll = await owner("POST", `/api/channels/${channel.id}/stop-all-agents`, {});
+    assert.equal(ownerAll.status, 200);
+    assert.ok((await ownerAll.json() as { results: Array<{ ok: boolean }> }).results.every((row) => row.ok));
+  } finally {
+    orchestrator.stopAgent = originalStop;
+  }
+  assert.deepEqual(told.sort(), [`${own.id}:owner_stop`, `${other.id}:owner_stop`].sort());
+});

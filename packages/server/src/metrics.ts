@@ -1,15 +1,22 @@
 import { Registry, Counter, Gauge, Histogram, collectDefaultMetrics } from "prom-client";
 import express from "express";
 import type { TraceDeploymentIdentity } from "./tracing/traceDeploymentIdentity";
-import { readBuildIdentityStatus, type BuildIdentityStatus } from "./version";
+import { readBuildIdentityStatus, SERVER_VERSION, type BuildIdentityStatus } from "./version";
 
 // Dedicated registry (avoids polluting the global default)
 export const register = new Registry();
-register.setDefaultLabels({ app: "slock-server" });
+
+// `service_version` is the server semver (package.json, bumped with every
+// release), the same value traces carry as `service.version`. It lets every
+// application metric be split by release, so a deploy can compare the old and
+// the new version side by side. One value per process, so it adds no series:
+// each task already has its own `service_instance_id`.
+const BASE_DEFAULT_LABELS = { app: "slock-server", service_version: SERVER_VERSION };
+register.setDefaultLabels(BASE_DEFAULT_LABELS);
 
 export function configureMetricsDeploymentIdentity(identity: TraceDeploymentIdentity) {
   register.setDefaultLabels({
-    app: "slock-server",
+    ...BASE_DEFAULT_LABELS,
     service_instance_id: identity.serviceInstanceId,
     deployment_instance_source: identity.deploymentInstanceSource,
     deployment_identity_state: identity.deploymentIdentityState,
@@ -43,6 +50,35 @@ export const appMetricsInfo = new Gauge({
 appMetricsInfo.set({ git_sha: releaseShaLabel(readBuildIdentityStatus()) }, 1);
 
 // Labels never include caller-supplied service names or Agent/token identifiers.
+// First-party apps' operations (platform/tracing countAppOperation): `app`
+// is the app's id, `operation` and `outcome` fixed strings in its code, so
+// the series stay bounded.
+export const appOperationsTotal = new Counter({
+  name: "slock_app_operations_total",
+  help: "First-party app operations by app, operation and outcome",
+  labelNames: ["app", "operation", "outcome"] as const,
+  registers: [register],
+});
+
+// Object files (services/objectFiles.ts): each deleted row's bytes, deleted
+// (`deleted`) or left for the hourly sweep to try again (`failed`), by who
+// tried (`after_commit`: the app's delete, `sweep`).
+export const objectFileByteDeletesTotal = new Counter({
+  name: "slock_object_file_byte_deletes_total",
+  help: "Object file byte deletes by outcome and caller",
+  labelNames: ["outcome", "caller"] as const,
+  registers: [register],
+});
+
+// A Server the platform reviewed for "Require SSO" verified a domain for the first time
+// (services/sso/ssoDomains.ts): an operator re-checks it. No labels, so it exists at 0 from start
+// and the first increase is visible; which Server and domain is in the audit log.
+export const ssoReviewedDomainVerifiedTotal = new Counter({
+  name: "slock_sso_reviewed_domain_verified_total",
+  help: "Domains verified for the first time by Servers whose Require SSO the platform reviewed",
+  registers: [register],
+});
+
 export const agentJwtIssuanceCounter = new Counter({
   name: "slock_agent_jwt_issuance_total",
   help: "Agent audience JWT issuance outcomes by registered App and finite reason",
@@ -88,6 +124,18 @@ export const socketDisconnects = new Counter({
   name: "slock_socketio_disconnects_total",
   help: "Total Socket.io disconnections",
   labelNames: ["reason"] as const,
+  registers: [register],
+});
+
+/**
+ * Notification retractions sent (a conversation was read): `transport` socket
+ * (one per conversation, to every client socket of the reader), apns or fcm
+ * (background push to a phone it alerted on), with the push `outcome`.
+ */
+export const notificationRetractsTotal = new Counter({
+  name: "slock_notification_retracts_total",
+  help: "Notification retractions sent, by transport and outcome",
+  labelNames: ["transport", "outcome"] as const,
   registers: [register],
 });
 
@@ -360,8 +408,10 @@ export const machineDuplicateConnectionsTotal = new Counter({
 
 /**
  * Task #374 enforcement (behind SLOCK_MACHINE_DUPLICATE_CONNECTION_ENFORCEMENT):
- * `closed_older` when the refused older socket is closed, `refused_held` when a
- * new connection is refused because the winner still holds the key. A refused
+ * `closed_older` when the refused older socket is closed,
+ * `refused_held_handshake` when a new connection is refused with 409 before the
+ * upgrade because the winner still holds the key, and `refused_held` when one
+ * slips past the handshake and is closed after opening. A refused
  * connection has not sent `ready`, so `daemon_version` on `refused_held` is the
  * version of the connection that was closed as the duplicate (nearly always
  * the one reconnecting).
@@ -441,6 +491,116 @@ export const slackBridgeIngressObservationsTotal = new Counter({
   registers: [register],
 });
 
+// Slack Bridge queues (services/slackBridgeQueueMetrics.ts). Every process
+// samples the database once a minute, so read them with max() across
+// instances. A pair is one Raft channel and Slack channel, summed over its
+// binding generations. Pair status: idle | flowing | waiting (pair-level
+// block, e.g. app not in the channel) | stalled (head needs a retry or skip)
+// | paused (binding or installation not active, or master switch off).
+export const slackBridgeOutboundPairs = new Gauge({
+  name: "slock_slack_bridge_outbound_pairs",
+  help: "Slack Bridge channel pairs by outbound queue status",
+  labelNames: ["status"] as const,
+  registers: [register],
+});
+
+export const slackBridgeOutboundPendingMessages = new Gauge({
+  name: "slock_slack_bridge_outbound_pending_messages",
+  help: "Raft messages queued for Slack and not yet sent or skipped, by pair status",
+  labelNames: ["status"] as const,
+  registers: [register],
+});
+
+export const slackBridgeOutboundOldestPendingAgeSeconds = new Gauge({
+  name: "slock_slack_bridge_outbound_oldest_pending_age_seconds",
+  help: "Age of the oldest Raft message queued for Slack, by pair status",
+  labelNames: ["status"] as const,
+  registers: [register],
+});
+
+// Per pair only for pairs that are waiting, stalled or paused with work, or
+// flowing with a head older than five minutes; at most 50 pairs (oldest first).
+export const slackBridgeOutboundPairPendingMessages = new Gauge({
+  name: "slock_slack_bridge_outbound_pair_pending_messages",
+  help: "Raft messages queued for Slack on one unhealthy or slow pair",
+  labelNames: ["binding_id", "status"] as const,
+  registers: [register],
+});
+
+export const slackBridgeOutboundPairOldestPendingAgeSeconds = new Gauge({
+  name: "slock_slack_bridge_outbound_pair_oldest_pending_age_seconds",
+  help: "Age of the oldest Raft message queued for Slack on one unhealthy or slow pair",
+  labelNames: ["binding_id", "status"] as const,
+  registers: [register],
+});
+
+// Inbound events not yet committed (status: queued | processing), and events
+// received in the last 24 hours that ended without a Raft message
+// (status: dead | revoked | quarantined).
+export const slackBridgeInboundPendingEvents = new Gauge({
+  name: "slock_slack_bridge_inbound_pending_events",
+  help: "Slack events stored for Raft and not yet committed, by status",
+  labelNames: ["status"] as const,
+  registers: [register],
+});
+
+export const slackBridgeInboundOldestPendingAgeSeconds = new Gauge({
+  name: "slock_slack_bridge_inbound_oldest_pending_age_seconds",
+  help: "Age of the oldest Slack event stored for Raft and not yet committed, by status",
+  labelNames: ["status"] as const,
+  registers: [register],
+});
+
+// Parser-held raw receipts retain encrypted bodies for replay, but do not
+// block subsequent messages in the same conversation.
+export const slackBridgeInboundHeldEvents = new Gauge({
+  name: "slock_slack_bridge_inbound_held_events",
+  help: "Slack ingress events held for a future parser replay",
+  registers: [register],
+});
+export const slackBridgeInboundOldestHeldAgeSeconds = new Gauge({
+  name: "slock_slack_bridge_inbound_oldest_held_age_seconds",
+  help: "Age since the first parse failure of the oldest held Slack event",
+  registers: [register],
+});
+
+export const slackBridgeInboundFailedEvents24h = new Gauge({
+  name: "slock_slack_bridge_inbound_failed_events_24h",
+  help: "Slack events received in the last 24 hours that ended without a Raft message, by status",
+  labelNames: ["status"] as const,
+  registers: [register],
+});
+
+// Worker outcomes per processed head/event. Outbound result: attempted |
+// skipped | cursor_recovered | authority_blocked | blocked | lease_reclaimed;
+// state is the delivery state after an attempt, the recovered state, the
+// authority severity ("control_wait" for an intentional pause or master
+// switch), or "none". A drop is result="skipped" or
+// result="cursor_recovered",state="skipped". Inbound worker: event |
+// attachment; result is the worker's closed result kind.
+export const slackBridgeOutboundWorkerResultsTotal = new Counter({
+  name: "slock_slack_bridge_outbound_worker_results_total",
+  help: "Slack Bridge outbound worker results by closed result and state",
+  labelNames: ["result", "state"] as const,
+  registers: [register],
+});
+
+export const slackBridgeInboundWorkerResultsTotal = new Counter({
+  name: "slock_slack_bridge_inbound_worker_results_total",
+  help: "Slack Bridge inbound worker results by worker and closed result",
+  labelNames: ["worker", "result"] as const,
+  registers: [register],
+});
+
+// One observation per binding per lifecycle pass: the projected health state
+// and closed reason (e.g. backlog_backpressure), "none" when connected.
+export const slackBridgeLifecycleHealthObservationsTotal = new Counter({
+  name: "slock_slack_bridge_lifecycle_health_observations_total",
+  help: "Slack Bridge lifecycle health projections by state and closed reason",
+  labelNames: ["state", "reason"] as const,
+  registers: [register],
+});
+
 // ---------------------------------------------------------------------------
 // Database pool metrics
 // ---------------------------------------------------------------------------
@@ -503,6 +663,38 @@ export const dbProbeErrorsTotal = new Counter({
   name: "slock_db_probe_errors_total",
   help: "Background SELECT 1 probes that failed other than by timeout, by endpoint",
   labelNames: ["endpoint"] as const,
+  registers: [register],
+});
+
+// Replication slots on the primary (db/replicationSlotMonitor.ts), read once
+// a minute. Every task reports the same slots, so rules use max by (slot_name).
+// slot_name is set by operators (RisingWave CDC sources), so it stays bounded.
+export const dbReplicationSlotRetainedWalBytes = new Gauge({
+  name: "slock_db_replication_slot_retained_wal_bytes",
+  help: "WAL the primary keeps for a replication slot (current WAL LSN minus the slot's restart_lsn), in bytes",
+  labelNames: ["slot_name", "slot_type"] as const,
+  registers: [register],
+});
+
+export const dbReplicationSlotActive = new Gauge({
+  name: "slock_db_replication_slot_active",
+  help: "1 if a consumer is attached to the replication slot, 0 if not",
+  labelNames: ["slot_name", "slot_type"] as const,
+  registers: [register],
+});
+
+// State set: one series per slot with value 1 for its current wal_status
+// (reserved, extended, unreserved, lost, or unknown when NULL).
+export const dbReplicationSlotWalStatus = new Gauge({
+  name: "slock_db_replication_slot_wal_status",
+  help: "Current wal_status of the replication slot (value 1 on the series whose wal_status label applies)",
+  labelNames: ["slot_name", "slot_type", "wal_status"] as const,
+  registers: [register],
+});
+
+export const dbReplicationSlotCheckErrorsTotal = new Counter({
+  name: "slock_db_replication_slot_check_errors_total",
+  help: "Replication slot checks that failed; the slot gauges keep their last values meanwhile",
   registers: [register],
 });
 
@@ -632,7 +824,20 @@ export const scopeDbTraceSinkRowsExportedTotal = new Counter({
 export const scopeDbTraceSinkRowsDroppedTotal = new Counter({
   name: "slock_scopedb_trace_sink_rows_dropped_total",
   help: "Typed trace rows dropped by the direct ScopeDB sink",
-  labelNames: ["reason"] as const, // queue_full, export_error
+  labelNames: ["reason"] as const, // queue_full, export_error, encode_error, shutdown
+  registers: [register],
+});
+
+/**
+ * Live schema checks the direct ScopeDB sink skipped because the catalog
+ * could not be read (unauthorized: 401/403, e.g. a write-only key;
+ * catalog_error: timeout/5xx/network). Rows are still written; Append rejects
+ * a real mismatch. Counted once per skip window, not per batch.
+ */
+export const scopeDbTraceSinkSchemaCheckSkippedTotal = new Counter({
+  name: "slock_scopedb_trace_sink_schema_check_skipped_total",
+  help: "Live schema checks skipped by the direct ScopeDB sink because the catalog could not be read",
+  labelNames: ["reason"] as const, // unauthorized, catalog_error
   registers: [register],
 });
 
@@ -676,6 +881,23 @@ export const machineHeartbeatAgeSeconds = new Gauge({
   name: "slock_machine_heartbeat_age_seconds",
   help: "Seconds since the machine last heartbeated, for machines of MACHINE_LIVENESS_METRICS_SERVER_ID",
   labelNames: ["machine_id"] as const,
+  registers: [register],
+});
+
+// marketplace_review_outbox (services/marketplaceReviewOutbox.ts): what a
+// marketplace review decision still has to tell clients. Every task reads the
+// same table every 5 s, so take max() across tasks. The age keeps growing
+// from the last oldest row read while reads fail, so a stuck worker or a
+// failing read both show as a growing age (alert: docs/raft-app/README.md).
+export const marketplaceReviewOutboxOldestUndeliveredAgeSeconds = new Gauge({
+  name: "slock_marketplace_review_outbox_oldest_undelivered_age_seconds",
+  help: "Age in seconds of the oldest marketplace review side effect not delivered yet (0 when none)",
+  registers: [register],
+});
+
+export const marketplaceReviewOutboxUndeliveredRows = new Gauge({
+  name: "slock_marketplace_review_outbox_undelivered_rows",
+  help: "Marketplace review side effects not delivered yet, at the last successful read",
   registers: [register],
 });
 
@@ -765,5 +987,44 @@ export const durableTasksOpenGauge = new Gauge({
   name: "slock_durable_tasks_open",
   help: "Open durable tasks per kind by lease status",
   labelNames: ["kind", "lease"] as const, // lease: active | overdue
+  registers: [register],
+});
+
+// Interactive link cards (RFC 076 §5.2): an installation's open operations
+// (sent, accepted, unknown, needs_reconciliation), set at admission once it
+// passes half its cap of 1,000 and removed again below that, so monitoring
+// catches a broken App before it is locked out (AndyLok owns the alert rule).
+// Only installations past 500 ever get a series.
+export const linkCardOpenOperations = new Gauge({
+  name: "slock_link_card_open_operations",
+  help: "Open interactive link card operations of an installation past half its cap (link_card.open_operations)",
+  labelNames: ["installation_key"] as const,
+  registers: [register],
+});
+
+// Object Activity (S6; services/objectInboxStates.ts, services/objectActivity.ts).
+// The per-(person, object) rows live in Postgres, written with each object
+// event and read by one index range per person. Move them into RisingWave
+// (an object arm of the inbox chain) when either outgrows Postgres: P99
+// fan-out above 1,000 rows per event, or P99 rows per person above 2,000.
+// Fan-out is the event's people among its recipients: those it mentions and
+// those who follow the object (explicit follows, or by publishing or
+// commenting), never everyone who can see it.
+
+/** Activity rows written per object event: its people recipients (agents get none). */
+export const objectActivityFanout = new Histogram({
+  name: "slock_object_activity_fanout_rows",
+  help: "Object Activity rows created or moved per recorded object event (people among its recipients)",
+  labelNames: ["object_kind"] as const,
+  buckets: [0, 1, 2, 5, 10, 25, 50, 100, 250, 500, 1_000, 2_500, 5_000],
+  registers: [register],
+});
+
+/** One person's Activity rows that a read went over (the list: the server's; the badge: every server asked). */
+export const objectActivityRowsPerUser = new Histogram({
+  name: "slock_object_activity_rows_per_user",
+  help: "Object Activity rows of one person read by the Activity list or the unread badge",
+  labelNames: ["surface"] as const, // surface: list | badge
+  buckets: [0, 1, 5, 10, 25, 50, 100, 250, 500, 1_000, 2_000, 5_000],
   registers: [register],
 });

@@ -3,7 +3,7 @@
 // registration and pins the bytes with its snapshot tests).
 
 import { AGENT_API_MESSAGE_SEARCH_DEFAULT_LIMIT, AGENT_API_MESSAGE_SEARCH_MAX_LIMIT } from "../agentApiContract";
-import { formatAgentTaskCurrentProjection, type AgentMessageTaskCurrentProjectionLike } from "../agentMessageText";
+import { AGENT_BODY_CONTINUATION_PREFIX, foldAgentOneLineText, formatAgentTaskCurrentProjection, indentAgentBodyContinuationLines, type AgentMessageTaskCurrentProjectionLike } from "../agentMessageText";
 import { formatHint, formatHintFlag, RAFT_HINTS, type RaftHintStyle } from "../agentOps/hint";
 
 export interface AgentSearchResultLike {
@@ -16,6 +16,8 @@ export interface AgentSearchResultLike {
   parentChannelName?: string;
   senderName?: string;
   senderType?: string;
+  /** RFC 077: an assistant sent this for its owner (the sender); shown as on message lines. */
+  delegated_by?: { name: string } | null;
   content?: string;
   snippet?: string;
   threadId?: string;
@@ -37,6 +39,21 @@ export interface AgentSearchData {
   searchedThrough?: string;
   /** incomplete only: how many messages were read before the search stopped. */
   searchedMessages?: number;
+  /** No message matched every word; matching any word was skipped (too many match). */
+  relaxedSkipped?: "too_broad";
+  /** The plan's history window hid matches; historyLimitMessage says how many. */
+  historyLimited?: boolean;
+  historyLimitMessage?: string;
+  /** How many matches the window hid (up to 100; capped past it). */
+  olderHidden?: { count: number; capped: boolean };
+  /** Relevance only: too many matches to rank, so the results are newest first. */
+  relevanceFallback?: "too_broad";
+}
+
+/** The line a search carries when the plan's history window hid matches (task #proj-commercial:#24, F). */
+function searchHistoryLimitLine(data: AgentSearchData): string | null {
+  if (data.historyLimited !== true) return null;
+  return data.historyLimitMessage?.trim() || "Older matches are hidden by this plan's message history limit, so don't say nothing older exists.";
 }
 
 /** The caller's own filters, repeated in the continue command. */
@@ -79,7 +96,7 @@ const PREVIEW_BEFORE_CHARS = 80;
 const PREVIEW_AFTER_CHARS = 120;
 const PREVIEW_FALLBACK_CHARS = PREVIEW_BEFORE_CHARS + PREVIEW_AFTER_CHARS;
 
-interface SearchMatchRange {
+export interface SearchMatchRange {
   start: number;
   end: number;
 }
@@ -131,16 +148,17 @@ function* findRaftRefLiteralRanges(content: string): Generator<SearchMatchRange>
   }
 }
 
-function expandSearchMatchToRefLiteral(content: string, match: SearchMatchRange): SearchMatchRange {
+/** Widen a match to the whole `@handle` / `#channel` / `dm:@peer` / `task #N` literal it touches, so it is neutralised whole. */
+export function expandSearchMatchToRefLiteral(content: string, match: SearchMatchRange): SearchMatchRange {
+  // Every literal it touches, not only the first found: a match across `@a in dm:@b` covers both.
+  let { start, end } = match;
   for (const refRange of findRaftRefLiteralRanges(content)) {
     if (match.start < refRange.end && match.end > refRange.start) {
-      return {
-        start: Math.min(match.start, refRange.start),
-        end: Math.max(match.end, refRange.end),
-      };
+      start = Math.min(start, refRange.start);
+      end = Math.max(end, refRange.end);
     }
   }
-  return match;
+  return { start, end };
 }
 
 function trimPreviewWindow(content: string, start: number, end: number): { start: number; end: number } {
@@ -273,31 +291,41 @@ export function formatAgentSearchResults(
           + `${limitSource}, which is also what a capped page returns; ${atCapRemedy}`
         : "truncated=false"
       : "truncated=unknown · server did not report hasMore";
+  const historyLimitLine = searchHistoryLimitLine(data);
   if (!data.results || data.results.length === 0) {
-    return data.incomplete === true
+    const empty = data.incomplete === true
       ? [
         `Search incomplete: no matches in the messages searched so far${searchedScope ? ` (${searchedScope})` : ""}. `
           + "Older messages were not searched, so this does NOT mean no message matches. (incomplete=true)",
         ...continueLines,
       ].join("\n")
+      : data.relaxedSkipped === "too_broad"
+      ? [
+        "No message contains all of these words. Matching any one of them was skipped: too many messages "
+          + "contain some of these words to rank them, so this does NOT mean no message matches. (relaxedSkipped=too_broad)",
+        `Next: search for fewer, more specific words${narrowFlags.length ? `, or add ${narrowFlags.join(" or ")}` : ""}.`,
+      ].join("\n")
       : `No search results. (${truncation})`;
+    return historyLimitLine ? `${empty}\n${historyLimitLine}` : empty;
   }
 
   const formatted = data.results.map((result) => {
     const ref = `msg:${result.id}`;
     const content = result.content ?? result.snippet ?? "";
-    const sender = neutralizeAgentRaftRefLiterals(result.senderName ?? "unknown");
+    const sender = neutralizeAgentRaftRefLiterals(foldAgentOneLineText(result.senderName ?? "unknown"));
     const senderType = result.senderType ? ` (${result.senderType})` : "";
+    const delegated = result.delegated_by?.name ? ` delegated_by=@${neutralizeAgentRaftRefLiterals(result.delegated_by.name)}` : "";
     const taskProjection = formatAgentTaskCurrentProjection(result.taskCurrentProjection, result.taskNumber, renderAgentSearchPreviewText).trimStart();
     return [
       `<result ref="${ref}">`,
       `Source: ${renderSearchSource(result)}`,
-      `Sender: ${sender}${senderType}`,
+      `Sender: ${sender}${senderType}${delegated}`,
       `Time: ${result.createdAt ? formatLocalTimeWithOffset(result.createdAt) : "-"}`,
       ...(taskProjection ? [taskProjection] : []),
       "",
       "<preview>",
-      renderSearchPreview(content, trimmedQuery),
+      // Every preview line is quoted: a message's first line may itself look like a header.
+      `${AGENT_BODY_CONTINUATION_PREFIX}${indentAgentBodyContinuationLines(renderSearchPreview(content, trimmedQuery))}`,
       "</preview>",
       "</result>",
     ].join("\n");
@@ -309,6 +337,13 @@ export function formatAgentSearchResults(
     trimmedQuery
       ? `Search results for: "${trimmedQuery}" (${count})`
       : `Filtered message results (${count})`,
+    ...(historyLimitLine ? [historyLimitLine] : []),
+    ...(data.relevanceFallback === "too_broad"
+      ? [
+        "Sorted newest first, NOT by relevance: too many messages match these words to rank them. "
+          + `For the most relevant matches, search for more specific words${narrowFlags.length ? `, or add ${narrowFlags.join(" or ")}` : ""}. (relevanceFallback=too_broad)`,
+      ]
+      : []),
     "",
     formatted,
     "",

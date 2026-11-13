@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { __embedTestInternals } from "../src/embed";
+import { __embedTestInternals, __setEmbedModeForTests, markHostToolbarDrawn, needsEmbedRepair, readHostDesktop, withEmbedParams } from "../src/embed";
 
 const { parseEmbedMode } = __embedTestInternals;
 
@@ -60,4 +60,71 @@ test("the decision is synchronous — no async, no effect, no store", () => {
   const mode = parseEmbedMode("?embed=raft-settings-v1&shell=host");
   assert.equal(typeof mode.embedded, "boolean");
   assert.equal(Date.now, before);
+});
+
+test("chrome=none with the host shell: the native shell draws the page's toolbar too (#proj-workspace:#127)", () => {
+  assert.equal(parseEmbedMode("?embed=raft-settings-v1&shell=host&chrome=none").chromeless, true);
+  // Without it, or with the web shell (which keeps its own header), the page draws its toolbar.
+  assert.equal(parseEmbedMode("?embed=raft-settings-v1&shell=host").chromeless, undefined);
+  assert.equal(parseEmbedMode("?embed=raft-settings-v1&shell=web&chrome=none").chromeless, undefined);
+  assert.equal(parseEmbedMode("?chrome=none").embedded, false);
+});
+
+test("back=host with the host shell: the page draws Back for the App, which closes it on #host=close (#proj-workspace:#264)", () => {
+  assert.equal(parseEmbedMode("?embed=raft-settings-v1&shell=host&back=host").hostBack, true);
+  assert.equal(parseEmbedMode("?embed=raft-settings-v1&shell=host&back=host&chrome=none").chromeless, true, "kept with chrome=none");
+  // Without it, with another value, with the web shell (its own header has Back) or not embedded: nothing.
+  assert.equal(parseEmbedMode("?embed=raft-settings-v1&shell=host").hostBack, undefined);
+  assert.equal(parseEmbedMode("?embed=raft-settings-v1&shell=host&back=1").hostBack, undefined);
+  assert.equal(parseEmbedMode("?embed=raft-settings-v1&shell=web&back=host").hostBack, undefined);
+  assert.equal(parseEmbedMode("?back=host").embedded, false);
+});
+
+test("hostMenu with the host shell: the App's own items for the page's ⋯, known names only, in its order (mobile #4635)", () => {
+  assert.deepEqual(parseEmbedMode("?embed=raft-settings-v1&shell=host&hostMenu=desktop-mode,open-in-browser").hostMenu, ["desktop-mode", "open-in-browser"]);
+  assert.deepEqual(parseEmbedMode("?embed=raft-settings-v1&shell=host&hostMenu=open-in-browser,desktop-mode").hostMenu, ["open-in-browser", "desktop-mode"], "the App's order");
+  assert.deepEqual(parseEmbedMode("?embed=raft-settings-v1&shell=host&hostMenu=print,desktop-mode,desktop-mode").hostMenu, ["desktop-mode"], "an unknown name dropped, a repeat once");
+  assert.equal(parseEmbedMode("?embed=raft-settings-v1&shell=host&hostMenu=print").hostMenu, undefined, "none known: none");
+  assert.equal(parseEmbedMode("?embed=raft-settings-v1&shell=host&hostMenu=").hostMenu, undefined);
+  assert.equal(parseEmbedMode("?embed=raft-settings-v1&shell=web&hostMenu=desktop-mode").hostMenu, undefined, "only with the host shell");
+  assert.equal(parseEmbedMode("?hostMenu=desktop-mode").embedded, false);
+});
+
+test("the keeper keeps the one bar: hostToolbar=1 once drawn, the App's hostMenu as it wrote it, hostDesktop only where the query lost it", () => {
+  __embedTestInternals.reset();
+  const restore = __setEmbedModeForTests({ embedded: true, shell: "host", hostMenu: ["desktop-mode", "open-in-browser"] });
+  try {
+    const entry = "?embed=raft-settings-v1&shell=host&hostMenu=desktop-mode,open-in-browser,print&hostDesktop=on";
+    assert.equal(needsEmbedRepair(entry), false, "as the App opened it: nothing to write");
+    assert.equal(readHostDesktop(entry), true);
+    assert.equal(markHostToolbarDrawn(), true);
+    assert.equal(markHostToolbarDrawn(), false, "once");
+    // A navigation that kept the query but not the flag (it was written outside the router): put back, alone.
+    assert.equal(needsEmbedRepair(entry), true, "hostToolbar missing");
+    const repaired = withEmbedParams(new URLSearchParams(entry));
+    assert.equal(repaired.get("hostToolbar"), "1");
+    assert.equal(repaired.get("hostMenu"), "desktop-mode,open-in-browser,print", "the App's own value, never rewritten");
+    assert.equal(repaired.get("hostDesktop"), "on");
+    // A navigation that dropped the query: all of it back, Desktop mode as last seen.
+    const all = withEmbedParams(new URLSearchParams("tab=1"));
+    assert.deepEqual([all.get("tab"), all.get("hostMenu"), all.get("hostToolbar"), all.get("hostDesktop")], ["1", "desktop-mode,open-in-browser", "1", "on"]);
+    // The App switched it off: its value stands; nothing older is written over it.
+    assert.equal(withEmbedParams(new URLSearchParams(`${entry.replace("hostDesktop=on", "hostDesktop=off")}&hostToolbar=1`)).get("hostDesktop"), "off");
+  } finally {
+    restore();
+    __embedTestInternals.reset();
+  }
+});
+
+test("without hostMenu the page never says it draws the only bar", () => {
+  __embedTestInternals.reset();
+  const restore = __setEmbedModeForTests({ embedded: true, shell: "host" });
+  try {
+    assert.equal(markHostToolbarDrawn(), false);
+    assert.equal(withEmbedParams(new URLSearchParams("?embed=raft-settings-v1&shell=host")).has("hostToolbar"), false);
+    assert.equal(readHostDesktop("?hostDesktop=on"), null, "no desktop-mode item: no Desktop mode");
+  } finally {
+    restore();
+    __embedTestInternals.reset();
+  }
 });

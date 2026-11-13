@@ -6,7 +6,7 @@ import { canAgentReceiveChannelDelivery } from "./channelService";
 import { agents, channelAgents, channels, jointChannels, jointChannelServers, messages, servers, threadFollows, users } from "../db/schema";
 import { referenceAgentInboxChain } from "../test/agentInboxChainReference";
 
-// The agent inbox view (rw_agent_inbox_v6, mirrored in CI by
+// The agent inbox view (rw_agent_inbox_v7, mirrored in CI by
 // referenceAgentInboxChain) holds a thread row only when the agent can receive
 // the thread. Recovery and `raft inbox check` trust that, so the view's thread
 // deliverability must agree with live delivery's per-thread check on every shape

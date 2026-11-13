@@ -154,7 +154,7 @@ test('promotion fetches the hosted original files and rejects byte corruption or
   const rows = v.assets.map(a => ({ ...a, file_hash: a.sha256, r2_key: a.sha256, metadata_json: JSON.stringify({ file_name: a.file }) }));
   const api = async (_, path) => {
     if (path === '/api/apps') return { apps: [{ id: 'app', slug: 'raft-computer-cli' }] };
-    if (path.endsWith('/channels')) return { channels: [{ id: 'alpha', slug: 'alpha' }] };
+    if (path.endsWith('/channels')) return { channels: [{ id: 'candidate', slug: 'candidate' }] };
     if (path.includes('/releases?')) return { releases: [{ id: 'fixed', build_id: 'build', version_name: v.version, status: 'superseded' }] };
     if (path.endsWith('/assets')) return { assets: rows };
     return { id: 'build', artifact_mode: 'hands_r2', version_name: v.version, provenance_json: { source_commit: 'a'.repeat(40) } };
@@ -178,6 +178,68 @@ test('promotion fetches the hosted original files and rejects byte corruption or
   await assert.rejects(downloadHandsCandidate({ ...options, dir: join(f.dir, 'corrupt'), fetchImpl: async () => new Response('evil') }), /frozen identity/);
 });
 
+test('promotion takes the candidate from the candidate channel, falling back to alpha only when candidate has no release for the version', async t => {
+  const { downloadHandsCandidate } = await import('./download-hands-candidate.mjs');
+  const f = await fixture();
+  const v = await loadHostedArtifacts(f.options);
+  const rows = v.assets.map(a => ({ ...a, file_hash: a.sha256, r2_key: a.sha256, metadata_json: JSON.stringify({ file_name: a.file }) }));
+  const releasesByChannel = { 'ch-candidate': [], 'ch-alpha': [] };
+  const released = id => ({ id, build_id: 'build', version_name: v.version, status: 'active' });
+  const queried = [];
+  const api = async (_, path) => {
+    if (path === '/api/apps') return { apps: [{ id: 'app', slug: 'raft-computer-cli' }] };
+    if (path.endsWith('/channels')) return { channels: [{ id: 'ch-candidate', slug: 'candidate' }, { id: 'ch-alpha', slug: 'alpha' }] };
+    if (path.includes('/releases?')) {
+      const channel = new URLSearchParams(path.split('?')[1]).get('channel');
+      queried.push(channel);
+      return { releases: releasesByChannel[channel] };
+    }
+    if (path.endsWith('/assets')) return { assets: rows };
+    return { id: 'build', artifact_mode: 'hands_r2', version_name: v.version, provenance_json: { source_commit: 'a'.repeat(40) } };
+  };
+  const fetchedFrom = new Set();
+  const fetchImpl = async url => {
+    fetchedFrom.add(url.pathname.split('/releases/')[1].split('/')[0]);
+    const target = url.pathname.split('/').at(-1).replace(/\.gz$/, '');
+    const variant = url.searchParams.get('kind') ?? (url.pathname.endsWith('.gz') ? 'gzip' : null);
+    return new Response(f.bytes.get(rows.find(r => r.target === target && r.variant === variant).file));
+  };
+  const options = { api, apiBase: 'https://hands.build', appSlug: 'raft-computer-cli', version: v.version, sourceCommit: 'a'.repeat(40), fetchImpl };
+
+  // Candidate present on both channels: candidate wins, alpha is never read.
+  releasesByChannel['ch-candidate'] = [released('rel-candidate')];
+  releasesByChannel['ch-alpha'] = [released('rel-alpha')];
+  const fromCandidate = await downloadHandsCandidate({ ...options, dir: join(f.dir, 'candidate') });
+  assert.equal(fromCandidate.candidateChannel, 'candidate');
+  assert.deepEqual(queried, ['ch-candidate']);
+  assert.deepEqual([...fetchedFrom], ['rel-candidate']);
+
+  // Switch-over version: its rc went to alpha, candidate has none -> alpha.
+  queried.length = 0; fetchedFrom.clear();
+  releasesByChannel['ch-candidate'] = [];
+  const fromAlpha = await downloadHandsCandidate({ ...options, dir: join(f.dir, 'alpha') });
+  assert.equal(fromAlpha.candidateChannel, 'alpha');
+  assert.deepEqual(queried, ['ch-candidate', 'ch-alpha']);
+  assert.deepEqual([...fetchedFrom], ['rel-alpha']);
+  assert.equal((await loadHostedArtifacts(fromAlpha)).version, v.version);
+
+  // Neither channel has it: fail naming both channels.
+  releasesByChannel['ch-alpha'] = [];
+  await assert.rejects(downloadHandsCandidate({ ...options, dir: join(f.dir, 'none') }),
+    /one published candidate for 1\.0\.37 on candidate or alpha; found 0/);
+
+  // An ambiguous candidate channel is an error, never a reason to read alpha.
+  queried.length = 0;
+  releasesByChannel['ch-candidate'] = [released('a'), released('b')];
+  releasesByChannel['ch-alpha'] = [released('rel-alpha')];
+  await assert.rejects(downloadHandsCandidate({ ...options, dir: join(f.dir, 'ambiguous') }), /on candidate; found 2$/);
+  assert.deepEqual(queried, ['ch-candidate']);
+
+  // A missing candidate channel is a Hands setup error, not a fallback.
+  const noChannel = async (m, path) => path.endsWith('/channels') ? { channels: [{ id: 'ch-alpha', slug: 'alpha' }] } : api(m, path);
+  await assert.rejects(downloadHandsCandidate({ ...options, api: noChannel, dir: join(f.dir, 'no-channel') }), /Hands channel 'candidate' resolved 0 times/);
+});
+
 test('promotion follows Hands\' one signed redirect into its own R2 and refuses any other redirect target', async t => {
   const { downloadHandsCandidate } = await import('./download-hands-candidate.mjs');
   const f = await fixture();
@@ -185,7 +247,7 @@ test('promotion follows Hands\' one signed redirect into its own R2 and refuses 
   const rows = v.assets.map(a => ({ ...a, file_hash: a.sha256, r2_key: a.sha256, metadata_json: JSON.stringify({ file_name: a.file }) }));
   const api = async (_, path) => {
     if (path === '/api/apps') return { apps: [{ id: 'app', slug: 'raft-computer-cli' }] };
-    if (path.endsWith('/channels')) return { channels: [{ id: 'alpha', slug: 'alpha' }] };
+    if (path.endsWith('/channels')) return { channels: [{ id: 'candidate', slug: 'candidate' }] };
     if (path.includes('/releases?')) return { releases: [{ id: 'fixed', build_id: 'build', version_name: v.version, status: 'active' }] };
     if (path.endsWith('/assets')) return { assets: rows };
     return { id: 'build', artifact_mode: 'hands_r2', version_name: v.version, provenance_json: { source_commit: 'a'.repeat(40) } };

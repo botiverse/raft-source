@@ -5,7 +5,7 @@ import { cleanup, render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { TestIntlProvider } from "../helpers/intl";
 import api from "../../src/api/client";
-import ChatPanel from "../../src/components/message/ChatPanel";
+import { ChatPanel } from "../../src/features/channel/ChatPanel";
 import { useAuthStore } from "../../src/store/authStore";
 import type { User } from "../../src/store/authStore";
 import { useChannelStore } from "../../src/store/channelStore";
@@ -62,7 +62,6 @@ function makeUser(): User {
   return {
     id: "user-1",
     email: "owner@example.com",
-    gravatarHash: "",
     name: "owner",
     displayName: "Owner",
     description: null,
@@ -251,6 +250,6 @@ test("T4a-J1 DOM baseline: ChatPanel row list absorbs same-randomId echo without
   });
 
   assert.deepEqual(visibleRowIds(), ["server-1", "server-2", "server-1001"]);
-  assert.equal(document.querySelector('[data-message-id="optimistic-msg-1001"]'), null);
+  assert.ok(document.querySelector('[data-message-id="optimistic-msg-1001"]') === null);
   assert.equal(document.querySelectorAll('[data-index][data-message-id="server-1001"]').length, 1);
 });

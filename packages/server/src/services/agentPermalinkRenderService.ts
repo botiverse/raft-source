@@ -16,10 +16,12 @@ const FULL_UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9
 interface MessagePermalinkRow {
   messageId: string;
   channelName: string;
-  channelType: "channel" | "private" | "joint" | "dm" | "thread";
+  // `task` (task v2 conversation): no parent message, so no thread-form ref
+  // here; the agent-facing `#channel/N` task ref arrives with the agent surface.
+  channelType: "channel" | "private" | "joint" | "dm" | "thread" | "task";
   parentMessageId: string | null;
   parentChannelName: string | null;
-  parentChannelType: "channel" | "private" | "joint" | "dm" | "thread" | null;
+  parentChannelType: "channel" | "private" | "joint" | "dm" | "thread" | "task" | null;
 }
 
 interface ParsedMatch {

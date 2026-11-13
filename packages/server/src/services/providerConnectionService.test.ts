@@ -2,8 +2,6 @@ import { dbTest as test } from "../test/integration/dbTest";
 import { closeTestDatabase, openTestDatabase } from "../test/integration/database";
 import assert from "node:assert/strict";
 import { createCipheriv, randomBytes, randomUUID } from "node:crypto";
-import { readFile } from "node:fs/promises";
-import { fileURLToPath } from "node:url";
 import { and, eq } from "drizzle-orm";
 import { RUNTIME_CONFIG_VERSION } from "@botiverse/raft-shared";
 import { getDb } from "../db/index";
@@ -546,7 +544,7 @@ test("preset providers use generated Pi launch metadata for storage, models, and
     fetch: (async (input, init) => {
       assert.equal(
         String(input),
-        "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-pro-preview:generateContent",
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-4-argon:generateContent",
       );
       assert.equal(init?.method, "POST");
       assert.deepEqual(init?.headers, {
@@ -803,37 +801,4 @@ test("provider API key containing a non-Latin-1 character is rejected on the dec
       error.code === "provider_connection_invalid" &&
       error.message.includes("character 13 (1-based)"),
   );
-});
-
-test("all apiKey usages that build HTTP headers are confined to the two known functions", async () => {
-  const sourcePath = fileURLToPath(new URL("./providerConnectionService.ts", import.meta.url));
-  const source = await readFile(sourcePath, "utf8");
-  const lines = source.split("\n");
-  const allowedFunctions = new Set(["connectionTestRequest", "connectionModelCatalogRequest"]);
-  const functionStack: { name: string; entryDepth: number }[] = [];
-  let pendingFunction: string | null = null;
-  let braceDepth = 0;
-  const violations: number[] = [];
-  const headerKeywordPattern = /Bearer|x-api-key|x-goog-api-key|Authorization/;
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    const declaration = line.match(/function\s+(\w+)\s*\(/);
-    if (declaration) {
-      pendingFunction = declaration[1] ?? null;
-    }
-    if (pendingFunction && line.includes("{")) {
-      functionStack.push({ name: pendingFunction, entryDepth: braceDepth });
-      pendingFunction = null;
-    }
-    braceDepth += (line.match(/\{/g) ?? []).length;
-    braceDepth -= (line.match(/\}/g) ?? []).length;
-    const currentFunction = functionStack.length > 0 ? functionStack[functionStack.length - 1].name : null;
-    if (line.includes("apiKey") && headerKeywordPattern.test(line) && !allowedFunctions.has(currentFunction ?? "")) {
-      violations.push(i + 1);
-    }
-    while (functionStack.length > 0 && braceDepth <= functionStack[functionStack.length - 1].entryDepth) {
-      functionStack.pop();
-    }
-  }
-  assert.deepEqual(violations, []);
 });

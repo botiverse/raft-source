@@ -4,7 +4,7 @@
 // URLs, request headers, and errors never enter this buffer. In production the
 // VITE_E2E branch is compiled false, so recording is a no-op.
 
-export type ProfileOpenDiagnosticProfileType = "agent" | "human" | "external" | "unknown";
+export type ProfileOpenDiagnosticProfileType = "agent" | "human" | "computer" | "external" | "unknown";
 export type ProfileOpenDiagnosticSource = "channel" | "thread" | "unknown";
 export type ProfileOpenDiagnosticModule = "profile-panel" | "agent-detail";
 export type ProfileOpenDiagnosticDomTarget = "wrapper" | "fallback" | "panel";
@@ -102,7 +102,7 @@ export function recordProfileOpenE2eUrl(
   if (!enabled || !active) return;
   const value = new URLSearchParams(search.startsWith("?") ? search.slice(1) : search).get("profile");
   const prefix = value?.split(":", 1)[0];
-  const profileType = prefix === "agent" || prefix === "human" || prefix === "external"
+  const profileType = prefix === "agent" || prefix === "human" || prefix === "computer" || prefix === "external"
     ? prefix
     : value
       ? "unknown"

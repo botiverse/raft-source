@@ -63,7 +63,7 @@ export function messageSearchErrorTraceAttrs(error: unknown, context: { query?: 
   };
 }
 
-function queryLengthBucket(query: string): "empty" | "short" | "medium" | "long" {
+export function queryLengthBucket(query: string): "empty" | "short" | "medium" | "long" {
   const length = query.trim().length;
   if (length === 0) return "empty";
   if (length <= 32) return "short";

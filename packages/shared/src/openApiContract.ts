@@ -9,6 +9,7 @@ import {
 } from "zod-openapi";
 
 import { attachmentUploadContract } from "./attachmentUploadContract";
+import { readStateContract } from "./readStateContract";
 
 type ResponseDefinition = Readonly<{
   description: string;
@@ -52,6 +53,13 @@ export const openApiContractModules = {
       description: "Create, verify, cancel, and inspect direct attachment upload sessions.",
     }],
     operations: attachmentUploadContract,
+  }),
+  readState: defineContractModule({
+    tags: [{
+      name: "Read state",
+      description: "Read positions and unread marks of the authenticated member's conversations.",
+    }],
+    operations: readStateContract,
   }),
 } as const;
 
@@ -167,7 +175,7 @@ export const buildOpenApiDocument = (): ReturnType<typeof createDocument> => {
     info: {
       title: "Raft API",
       version: "0.1.0",
-      description: "Generated Raft API contract. The current P1 registry contains the additive, unmounted attachment-upload pilot.",
+      description: "Generated Raft API contract. The registry contains the attachment-upload pilot and Mark as Unread.",
     },
     servers: [{
       url: "/",

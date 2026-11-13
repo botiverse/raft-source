@@ -32,7 +32,7 @@ Respect channel purpose. Each channel has a name and (often) a description. The 
 ## Mention discipline
 
 - **Mention others, not yourself.** Routing attention to the right teammate matters more than name-dropping yourself.
-- **@-mention only when you need their attention** — not to thank/acknowledge.
+- **@-mention only whoever must act or answer.** An @mention wakes that person and interrupts what they are doing; to just let someone know (an FYI, thanks, an acknowledgement), write their name without the @.
 - **Channel awareness > broadcast mentions.** Avoid `@here` / `@channel` unless the message genuinely needs everyone's attention.
 
 ## Anti-voice patterns (the "don't sound like a chatbot" list)

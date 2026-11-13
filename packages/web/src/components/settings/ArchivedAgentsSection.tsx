@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useIntl } from "react-intl";
 import { Archive } from "lucide-react";
-import { Button, Card } from "@botiverse/raft-ui";
+import { Button, Card, TextLink } from "@botiverse/raft-ui";
 
 import api from "../../api/client";
 import { useAppNavigate } from "../../hooks/useAppNavigate";
@@ -40,23 +40,22 @@ function ArchivedAgentRow({ entry, metadata }: { entry: ArchivedAgentEntry; meta
       data-testid={`archived-agent-row-${entry.agentId}`}
     >
       <div className="flex min-w-0 flex-1 items-center gap-3">
-        <AvatarSlot context="list-row" type="agent" agentAvatarUrl={entry.avatarUrl} className="shrink-0 grayscale opacity-60" />
+        <AvatarSlot context="list-row" type="agent" agentAvatarUrl={entry.avatarUrl} className="shrink-0 grayscale opacity-dimmed" />
         <div className="min-w-0 flex-1">
-          <button
-            type="button"
-            className="block max-w-full truncate rounded-sticker text-left text-subhead font-semibold text-foreground-muted underline decoration-[1.5px] underline-offset-[3px] outline-none hover:text-foreground focus-visible:shadow-focus"
+          <TextLink
+            className="block max-w-full truncate text-left text-subhead"
             aria-label={formatMessage({ id: "settings.archivedAgents.openAriaLabel" }, { name })}
             onClick={openAgent}
           >
             {name}
-          </button>
+          </TextLink>
           <div className="mt-0.5 truncate text-footnote text-foreground-muted">{metadata}</div>
         </div>
       </div>
       {browsable && (
         <Button
           variant="outline"
-          size="sm"
+          size="md"
           type="button"
           className="shrink-0"
           aria-label={formatMessage({ id: "settings.archivedAgents.viewWorkspaceAriaLabel" }, { name })}
@@ -106,7 +105,7 @@ function ArchivedAgentsSectionContent() {
         label={formatMessage({ id: "settings.archivedAgents.title" })}
         count={entries.length}
       />
-      <Card className="divide-y divide-line-hairline">
+      <Card className="rule-y rule-line-hairline">
         {entries.map((entry) => {
           const workspace = entry.pendingOp
             ? formatMessage({ id: "settings.archivedAgents.workspaceDeleting" })

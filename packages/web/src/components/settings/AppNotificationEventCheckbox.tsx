@@ -1,8 +1,8 @@
 import { useCallback } from "react";
 import type { AppNotificationEvent } from "@botiverse/raft-shared";
 import { Checkbox } from "@botiverse/raft-ui";
-import { toggleAppNotificationEvent } from "./AppNotificationsControls";
-import type { AppNotificationSelection } from "./AppNotificationsControls";
+import { toggleAppNotificationEvent } from "./appNotificationSelection";
+import type { AppNotificationSelection } from "./appNotificationSelection";
 
 export function AppNotificationEventCheckbox({
   event,

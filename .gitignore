@@ -11,6 +11,7 @@ shim-dist/
 !.claude/skills/
 *.db
 release/
+!/scripts/release/
 .env
 .env.scopedb
 .dev-env-*.json
@@ -36,9 +37,14 @@ packages/web/.render-perf/
 scripts/app-name-ratchet-baseline.txt.mutating
 
 
-# Written by scripts/source-available/export-snapshot.mjs into exported snapshots only;
+# Written by scripts/source-available/export-snapshot.ts into exported snapshots only;
 # tests skip private-layout contracts when it exists.
 /RELEASE_SOURCE
 
 # vitest coverage reports (e.g. packages/sync-core test:coverage)
 coverage/
+# The official raft-computer-installer binaries (+ its LICENSE/NOTICE) Raft
+# Desktop ships, fetched and sha256-verified at build time by
+# apps/desktop/scripts/fetch-computer-installer.mjs from the pin in
+# apps/desktop/build/computer-installer.json (which is committed).
+apps/desktop/build/computer-installer/

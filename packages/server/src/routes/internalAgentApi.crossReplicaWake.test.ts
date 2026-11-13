@@ -35,7 +35,7 @@ import {
   __setMachinePrincipalFenceHandlerForTests,
 } from "../replicaRouter";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 // CI has no RisingWave: the external agent inbox pull reads the test-only
 // reference derivation of the agent inbox chain.
@@ -68,6 +68,7 @@ async function seedExternalFixture(label: string) {
     agentId: agent.id,
     scopes: ["send", "read"],
     name: `xreplica-${label}`,
+    issuedVia: "computer",
     createdByUserId: null,
   });
   return { ownerId: owner!.id, serverId: server.id, channelId: channel.id, channelName: channel.name, agentId: agent.id, apiKey: minted.apiKey };
@@ -134,7 +135,7 @@ test("external delivery publishes the cross-replica wake signal; transient notic
 
 test("routed signal wakes only the target agent's stream — sibling pending stays unpushed until its own trigger", async () => {
   process.env.SLOCK_WAKE_STREAM_HEARTBEAT_MS = "60000"; // park the heartbeat floor out of the test window
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const a = await seedExternalFixture("a");
     const b = await seedExternalFixture("b");

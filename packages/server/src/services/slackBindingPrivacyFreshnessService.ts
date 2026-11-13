@@ -13,10 +13,10 @@ import {
 } from "./slackProviderAdapter";
 import { resolveExternalInstallServerGrantAuthority } from "./externalInstallServerGrantAuthority";
 
-export const SLACK_PRIVACY_CHANGED_AUDIENCE_MIGRATION_REQUIRED =
-  "privacy_changed_audience_migration_required" as const;
-export const SLACK_PRIVACY_CHANGED_RECONFIRMATION_REQUIRED =
-  "privacy_changed_reconfirmation_required" as const;
+// Visibility is per-platform (yezizp, task #241): a channel flipping
+// public/private on either side is recorded, never paused. The historical
+// stateReason values "privacy_changed_reconfirmation_required" and
+// "raft_privacy_mismatch" remain readable on old rows.
 
 const DEFAULT_PRIVACY_FRESHNESS_MS = 10 * 60_000;
 
@@ -32,7 +32,7 @@ export function slackPrivacyFreshUntil(
 
 export type SlackBindingPrivacyRefreshReceipt =
   | { kind: "fresh"; bindingId: string; privacyClass: "public" | "private"; freshUntil: Date }
-  | { kind: "changed_paused"; bindingId: string; privacyClass: "public" | "private"; reason: string; freshUntil: Date }
+  | { kind: "changed"; bindingId: string; privacyClass: "public" | "private"; freshUntil: Date }
   | { kind: "unavailable"; bindingId: string; reason: string; retryAfterMs?: number }
   | { kind: "missing"; bindingId: string };
 
@@ -118,6 +118,7 @@ export async function refreshSlackBindingPrivacy(input: {
   db?: Database;
   now?: Date;
   freshnessMs?: number;
+  isRunHeld?(): Promise<boolean>;
 }): Promise<SlackBindingPrivacyRefreshReceipt> {
   const db = input.db ?? getDb();
   const now = input.now ?? currentDate();
@@ -149,6 +150,9 @@ export async function refreshSlackBindingPrivacy(input: {
   if (!handle) return { kind: "unavailable", bindingId: row.bindingId, reason: "credential_unavailable" };
   let observation;
   try {
+    if (input.isRunHeld && !await input.isRunHeld()) {
+      return { kind: "unavailable", bindingId: input.bindingId, reason: "fence_mismatch" };
+    }
     observation = await lookupSlackProviderConversation({
       transport: input.provider.transport,
       quarantineSink: input.provider.quarantineSink,
@@ -169,6 +173,9 @@ export async function refreshSlackBindingPrivacy(input: {
         ? { retryAfterMs: observation.retryAfterMs }
         : {}),
     };
+  }
+  if (input.isRunHeld && !await input.isRunHeld()) {
+    return { kind: "unavailable", bindingId: input.bindingId, reason: "fence_mismatch" };
   }
   const privacyClass = observation.fact.privacyClass;
   const freshUntil = slackPrivacyFreshUntil(now, freshnessMs);
@@ -192,18 +199,13 @@ export async function refreshSlackBindingPrivacy(input: {
         ? { kind: "fresh" as const, bindingId: row.bindingId, privacyClass, freshUntil }
         : { kind: "unavailable" as const, bindingId: row.bindingId, reason: "fence_mismatch" };
     }
-    const reason = privacyClass === "private"
-      ? SLACK_PRIVACY_CHANGED_AUDIENCE_MIGRATION_REQUIRED
-      : SLACK_PRIVACY_CHANGED_RECONFIRMATION_REQUIRED;
+    // Visibility changed: record the new class in place — no pause, no
+    // re-confirmation. The binding keeps syncing; each platform's own
+    // access control still applies.
     const [updated] = await tx.update(externalChannelBindings).set({
       privacyClass,
       providerConversationKind: privacyClass === "private" ? "private_channel" : "public_channel",
       privacyFreshUntil: freshUntil,
-      audienceRevision: null,
-      audienceFreshUntil: null,
-      state: "paused",
-      stateReason: reason,
-      bindingEpoch: row.bindingEpoch + 1,
       updatedAt: now,
     }).where(and(
       eq(externalChannelBindings.id, row.bindingId),
@@ -213,7 +215,7 @@ export async function refreshSlackBindingPrivacy(input: {
       eq(externalChannelBindings.bindingEpoch, row.bindingEpoch),
     )).returning({ id: externalChannelBindings.id });
     return updated
-      ? { kind: "changed_paused" as const, bindingId: row.bindingId, privacyClass, reason, freshUntil }
+      ? { kind: "changed" as const, bindingId: row.bindingId, privacyClass, freshUntil }
       : { kind: "unavailable" as const, bindingId: row.bindingId, reason: "fence_mismatch" };
   });
 }
@@ -248,3 +250,4 @@ export async function refreshSlackChannelBindingsPrivacy(input: {
   }
   return receipts;
 }
+

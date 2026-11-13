@@ -39,6 +39,13 @@ export type InboxScopeReadFrontier =
       maxReadSeq: string;
       /** Same-source pair or null; see module contract above. */
       latestActivity: { messageId: string; seq: string } | null;
+      /**
+       * Marked unread by the person with nothing countable past the cursor
+       * ("manually marked unread"): show the scope unread with no number.
+       * Present only when true; absent means not marked. Rides with
+       * readStateVersion like the cursor (additive: older servers omit it).
+       */
+      markedUnread?: true;
     };
 
 // Decimal-string validation/ordering deliberately reuses the sync-core
@@ -55,6 +62,8 @@ export interface InboxScopeCursorRow {
   maxReadSeq: string;
   latestActivityMessageId: string | null;
   latestActivitySeq: string | null;
+  /** The cursor row's marked_unread; omitted by readers that do not carry it. */
+  markedUnread?: boolean;
 }
 
 /**
@@ -114,6 +123,7 @@ export function makeInboxScopeReadFrontier(
     readStateVersion: cursor.readStateVersion,
     maxReadSeq: cursor.maxReadSeq,
     latestActivity,
+    ...(cursor.markedUnread === true ? { markedUnread: true as const } : {}),
   };
 }
 

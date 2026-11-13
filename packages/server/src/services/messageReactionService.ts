@@ -1,18 +1,27 @@
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { and, asc, eq, gt, inArray, or, sql } from "drizzle-orm";
-import { getDb, type DatabaseExecutor } from "../db/index";
+import { recordAssistantOwnerAction } from "./assistantService";
+import { runExecutorOnly } from "../db/ambientTransaction";
+import { getDb, type DatabaseExecutor, type DatabaseTransaction } from "../db/index";
+import type { AppMessageReactionRequest, AppMessageReactionWrite, FirstPartyApp } from "../platform/apps";
 import {
   agents,
+  channels,
   externalActorProjections,
   externalAddressabilityProjections,
   externalReactionStates,
   messageReactionDiscussionVersions,
   messageReactions,
   messageReactionViewerVersions,
+  messages,
   users,
 } from "../db/schema";
+import { messageReactionApps } from "../apps/firstPartyApps";
 import { withChannelWriterFence } from "./channelConversionFenceService";
 import { enqueueExternalReactionAggregateTransition } from "./externalReactionCommandRuntime";
+import { appNoticeOutbox } from "./firstPartyAppHost";
+import type { SystemAppAgentEventDeliverer } from "./systemAppAgentEvents";
+import { serializeErrorForLog } from "../tracing/safeErrorLog";
 
 const REACTION_ACTORS_CURSOR_KIND = "message-reaction-actors-v1";
 const MAX_CURSOR_LENGTH = 2_048;
@@ -235,13 +244,157 @@ export function projectReactionViewerSnapshot(input: {
   };
 }
 
+/**
+ * The message a reaction is on, as a caller that already read it hands it
+ * over (every route does, from its access check), so the apps that hear of
+ * reactions cost no read of the message.
+ */
+export type ReactionMessageFacts = Pick<typeof messages.$inferSelect, "id" | "channelId" | "senderType" | "senderId" | "messageType" | "content">;
+
+type ReactionRequest = { messageId: string; emoji: string; actor: { kind: ReactionActorKind; id: string }; operation: "add" | "remove"; message?: ReactionMessageFacts };
+/** One app's write for a reaction, prepared before the transaction opened. */
+type PreparedAppWrite = { app: string; write: AppMessageReactionWrite };
+
+let messageReactionAppsOverride: readonly FirstPartyApp[] | null = null;
+/** Test hook: the apps told of reactions, instead of the registry's, until the returned restore is called. */
+export function __setMessageReactionAppsForTests(apps: readonly FirstPartyApp[]): () => void {
+  const previous = messageReactionAppsOverride;
+  messageReactionAppsOverride = apps;
+  return () => { messageReactionAppsOverride = previous; };
+}
+
+/**
+ * An app's step for a reaction failed. Never thrown on: a notice may be lost,
+ * a reaction may not. Names the app, the step and the reaction's message;
+ * nothing of the message or of the error's parameters (serializeErrorForLog).
+ */
+function logAppStepFailure(app: string, step: "prepare" | "write" | "after_commit", request: ReactionRequest, err: unknown): void {
+  console.error("[MessageReaction] first-party app step failed; the reaction is not affected", {
+    event: "message_reaction.app_step_failed",
+    app,
+    step,
+    operation: request.operation,
+    messageId: request.messageId,
+    error: serializeErrorForLog(err),
+  });
+}
+
+/**
+ * Asks the first-party apps that hear of reactions (FirstPartyApp.messageReactions,
+ * apps/firstPartyApps.ts) what each would write if this reaction changes,
+ * BEFORE the reaction's transaction opens: an app reads what it needs here,
+ * on the pool, with no transaction open and no writer fence held. Core reads
+ * nothing for it when the caller handed the message over (`request.message`),
+ * else the message by its id; with no app registered, nothing either way.
+ * An app that throws is logged and left out.
+ */
+async function prepareAppWrites(request: ReactionRequest, deliverer: SystemAppAgentEventDeliverer | undefined): Promise<PreparedAppWrite[]> {
+  const apps = messageReactionAppsOverride ?? messageReactionApps();
+  if (apps.length === 0) return [];
+  let facts: AppMessageReactionRequest;
+  try {
+    const message = request.message?.id === request.messageId ? request.message : (await getDb().select({
+      id: messages.id,
+      channelId: messages.channelId,
+      senderType: messages.senderType,
+      senderId: messages.senderId,
+      messageType: messages.messageType,
+      content: messages.content,
+    }).from(messages).where(eq(messages.id, request.messageId)).limit(1))[0];
+    if (!message) return [];
+    const author = message.messageType === "system" || message.senderType === "external_projection"
+      ? null
+      : { type: message.senderType, id: message.senderId };
+    facts = {
+      operation: request.operation,
+      message: { id: message.id, channelId: message.channelId, author, content: message.content },
+      reactor: { type: request.actor.kind, id: request.actor.id },
+      emoji: request.emoji,
+    };
+  } catch (err) {
+    logAppStepFailure("core", "prepare", request, err);
+    return [];
+  }
+  const prepared: PreparedAppWrite[] = [];
+  for (const app of apps) {
+    try {
+      const write = await app.messageReactions!.prepare(facts, { noticeOutbox: appNoticeOutbox(app, deliverer) });
+      if (write) prepared.push({ app: app.id, write });
+    } catch (err) {
+      logAppStepFailure(app.id, "prepare", request, err);
+    }
+  }
+  return prepared;
+}
+
+/**
+ * Runs the prepared writes for a reaction that did change, inside its
+ * transaction, each in a SAVEPOINT of its own and with the root database off
+ * limits (runExecutorOnly): an app reads and writes there only through the
+ * savepoint it is handed. A write that throws is rolled back to its
+ * savepoint and logged; the reaction and the other apps' writes commit.
+ * Returns what the apps want run once the transaction has committed.
+ */
+async function runAppWrites(
+  tx: DatabaseTransaction,
+  prepared: readonly PreparedAppWrite[],
+  request: ReactionRequest,
+): Promise<Array<{ app: string; run: () => Promise<void> }>> {
+  const afterCommit: Array<{ app: string; run: () => Promise<void> }> = [];
+  const at = new Date();
+  for (const { app, write } of prepared) {
+    try {
+      const run = await tx.transaction((savepoint) =>
+        runExecutorOnly(`first-party app ${app}'s write in a reaction's transaction`, () => write({ executor: savepoint, at })));
+      if (run) afterCommit.push({ app, run });
+    } catch (err) {
+      logAppStepFailure(app, "write", request, err);
+    }
+  }
+  return afterCommit;
+}
+
+/**
+ * Adds or removes one reaction. First-party apps that hear of reactions
+ * (reaction notices) are asked before the transaction what they would write,
+ * write it inside the transaction when the reaction changed, and push after
+ * the commit (prepareAppWrites, runAppWrites). None of the three can fail
+ * the reaction. `noticeDeliverer` (the request's agent orchestrator) is what
+ * a queued notice is pushed through; without one it waits for the agent's
+ * next pull or the push sweep. `message`: the row the caller's access check
+ * already read, so asking the apps reads nothing more.
+ */
 export async function mutateMessageReaction(input: {
   channelId: string;
   messageId: string;
   emoji: string;
   actor: { kind: ReactionActorKind; id: string };
   operation: "add" | "remove";
+  noticeDeliverer?: SystemAppAgentEventDeliverer;
+  /** The message, when the caller already read it (ReactionMessageFacts); read here otherwise, only if an app hears of reactions. */
+  message?: ReactionMessageFacts;
 }): Promise<ReactionMutationResult> {
+  const prepared = await prepareAppWrites(input, input.noticeDeliverer);
+  const afterCommit: Array<{ app: string; run: () => Promise<void> }> = [];
+  const result = await mutateMessageReactionInTransaction(input, prepared, afterCommit);
+  // Committed: a failed push leaves the notice queued.
+  for (const { app, run } of afterCommit) {
+    try {
+      await run();
+    } catch (err) {
+      logAppStepFailure(app, "after_commit", input, err);
+    }
+  }
+  return result;
+}
+
+function mutateMessageReactionInTransaction(input: {
+  channelId: string;
+  messageId: string;
+  emoji: string;
+  actor: { kind: ReactionActorKind; id: string };
+  operation: "add" | "remove";
+}, prepared: readonly PreparedAppWrite[], afterCommit: Array<{ app: string; run: () => Promise<void> }>): Promise<ReactionMutationResult> {
   return withChannelWriterFence(input.channelId, async (tx) => {
     const [aggregateBeforeRow] = await tx.select({ count: sql<number>`count(*)::int` })
       .from(messageReactions)
@@ -294,9 +447,22 @@ export async function mutateMessageReaction(input: {
           now: new Date(),
         });
       }
+      // The apps' prepared writes, each in its own savepoint: none can fail the reaction.
+      if (prepared.length > 0) afterCommit.push(...await runAppWrites(tx, prepared, input));
     }
 
     if (input.actor.kind !== "user") return { changed, discussionVersion };
+    // RFC 077: a person's new reaction rings their personal assistant (owner action).
+    if (changed && input.operation === "add") {
+      const [reacted] = await tx.select({ seq: messages.seq, serverId: channels.serverId })
+        .from(messages)
+        .innerJoin(channels, eq(channels.id, messages.channelId))
+        .where(eq(messages.id, input.messageId))
+        .limit(1);
+      if (reacted) {
+        await recordAssistantOwnerAction({ ownerUserId: input.actor.id, serverId: reacted.serverId, channelId: input.channelId, seq: reacted.seq, messageId: input.messageId }, tx);
+      }
+    }
     const viewerVersion = changed
       ? await bumpViewerVersion(tx, input.messageId, input.actor.id)
       : await readViewerVersion(tx, input.messageId, input.actor.id);

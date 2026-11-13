@@ -32,13 +32,8 @@ class MemoryStorage {
 Object.defineProperty(globalThis, "localStorage", { value: new MemoryStorage(), configurable: true });
 Object.defineProperty(globalThis, "sessionStorage", { value: new MemoryStorage(), configurable: true });
 
-const { useInboxStore, getInboxItemKey } = await import("../src/store/inboxStore");
+const { useInboxStore, getInboxItemKey, INBOX_LOCAL_MUTATION_HOLD_MS } = await import("../src/store/inboxStore");
 const { triggerServerReset } = await import("../src/store/serverResetRegistry");
-const {
-  captureActivityShadowGeneration,
-  getActivityShadowVersion,
-  publishActivityShadowVersion,
-} = await import("../src/store/activityShadowBridge");
 const { useServerStore } = await import("../src/store/serverStore");
 const { default: api } = await import("../src/api/client");
 
@@ -197,13 +192,10 @@ test("#5690 T1: activity newer than the click-time marker stays visible during A
 
   try {
     resetInbox([atS1]);
-    const shadowGeneration = captureActivityShadowGeneration();
-    assert.equal(publishActivityShadowVersion(shadowGeneration, "77"), true);
     void useInboxStore.getState().markDone(atS1);
     await flushPromises();
 
     // Optimistic removal happened, but S2 is newer than the suppressed marker.
-    assert.equal(getActivityShadowVersion(), null, "click-time Done must invalidate the old Core snapshot");
     await useInboxStore.getState().refreshInbox();
     await flushPromises();
     assert.deepEqual(visibleKeys(), [key], "S2 must be visible while the Done is still pending");
@@ -384,7 +376,7 @@ test("#5690 T7 (boundary): if the authoritative refresh itself still serves the 
     persisted.resolve({ data: { ok: true } });
     await flushPromises();
 
-    Date.now = () => realNow() + 60_000;
+    Date.now = () => realNow() + INBOX_LOCAL_MUTATION_HOLD_MS + 1;
     await useInboxStore.getState().refreshInbox();
     await flushPromises();
 
@@ -512,34 +504,6 @@ test("#5690 T11: an ordinary clearThreadUnread still notifies and drives the can
       "the default (unscoped) caller must still trigger the canonical refresh after persist",
     );
   } finally { restoreApi(); resetInbox(); }
-});
-
-test("a confirmed Done invalidates the pre-mutation Activity Core snapshot", async () => {
-  const item = makeThreadItem({
-    threadChannelId: "thread-shadow-done",
-    isFollowing: false,
-  });
-  api.post = (async () => ({ data: { ok: true } })) as typeof api.post;
-  serveItems([]);
-
-  try {
-    resetInbox([item]);
-    const generation = captureActivityShadowGeneration();
-    assert.equal(publishActivityShadowVersion(generation, "77"), true);
-    assert.equal(getActivityShadowVersion(), "77");
-
-    await useInboxStore.getState().markDone(item);
-
-    assert.equal(
-      getActivityShadowVersion(),
-      null,
-      "the Core snapshot accepted before Done must not remain eligible after the mutation commits",
-    );
-    assert.deepEqual(visibleKeys(), []);
-  } finally {
-    restoreApi();
-    resetInbox();
-  }
 });
 
 test("#5690 T12: a superseded server's Done ack performs NO side effect against the new server", async () => {
@@ -681,7 +645,7 @@ for (const recovery of ["newer activity", "expiry"] as const) {
       useInboxStore.setState({ filter: "unread", allCount: 100 });
       const done = useInboxStore.getState().markDone(item);
       assert.equal(useInboxStore.getState().allCount, 99);
-      if (recovery === "expiry") now += 60_000;
+      if (recovery === "expiry") now += INBOX_LOCAL_MUTATION_HOLD_MS + 1;
       await useInboxStore.getState().refreshInbox({ background: true });
       assert.equal(useInboxStore.getState().items.length, 1);
       assert.equal(useInboxStore.getState().allCount, 100, "restored row and total must agree in this response");

@@ -1,7 +1,10 @@
+import { lockJointTaskWriteAuthority, type JointTaskWriteActor } from "./jointTaskWriteAuthority";
+import { resolveJointHumanEntrySql, jointHumanConnectedIdentitySql, jointMembershipRemovalPendingSql, acquireJointSourceExitFlagReadLock, jointHumanHasLiveSourceSql, resolveJointSourceExitJointIds, resolveJointGuestEntryJointIds } from "./jointHumanMembershipAccess";
 import { conversionReadChannelIdsQuery, conversionReadChannelPredicate } from "./channelConversionReadScope";
 import { withChannelWriterFence, assertChannelWritableInTransaction } from "./channelConversionFenceService";
+import { recordAssistantOwnerTaskAction } from "./assistantService";
 import { randomUUID } from "node:crypto";
-import { eq, and, inArray, sql, asc, isNotNull, isNull, or, type SQL } from "drizzle-orm";
+import { eq, and, inArray, sql, asc, isNotNull, isNull, lte, or, type SQL } from "drizzle-orm";
 import { getDb, type DatabaseExecutor } from "../db/index";
 import {
   messages,
@@ -17,27 +20,44 @@ import {
   messageMentions,
   userChannelInboxStates,
   jointChannels,
+  jointChannelMembers,
   jointChannelServers,
+  notificationOutbox,
 } from "../db/schema";
 import {
   currentDate,
   failpoints,
+  formatAgentTaskRef,
+  isSubConversationType,
   type AgentApiTaskClaimConflict,
   type ServerId,
   type TaskResourceReceipt,
   type TaskStatus,
   type TaskReadOnlyReason,
+  TASK_ASSIGN_REASON_UNCHANGED_MESSAGE,
   TASK_CLAIM_REASON_ALREADY_CLAIMED_BY_YOU,
+  TASK_STATUSES,
+  TASK_DESCRIPTION_MAX_LENGTH,
+  TASK_TITLE_MAX_LENGTH,
+  checkTaskCreateStatus,
+  resolveTaskCreateStatus,
+  type TaskCreateStatus,
+  type TaskCreateStatusRefusal,
 } from "@botiverse/raft-shared";
 import { isMessageShortId, messageIdShortPrefixConditions, UUID_RE } from "../lib/messageId";
-import { buildSearchText } from "./searchService";
+import { buildSearchText } from "./searchTokenizer";
 import {
   filterUserAccessibleChannelIds,
   getActiveJointChannelProjectionsByLocalChannel,
+  resolveAgentFacingChannelRef,
   type JointChannelProjection,
 } from "./channelService";
-import { getTaskReadOnlyReason, resolveTaskChannelSurfaces, type TaskChannelSurface } from "./taskChannelSurface";
+import { asTaskChannelType, getTaskReadOnlyReason, resolveTaskChannelSurfaces, type TaskChannelSurface, type TaskChannelType } from "./taskChannelSurface";
+import { canView, visibleRootChannelIds } from "./visibilityService";
 import { loadTaskCurrentProjectionsByTaskId } from "./messageTaskProjection";
+import { ensureTaskConversation } from "./taskConversationService";
+import { hasTaskSourceMessage, isTaskV2ConversationsEnabled, isTaskV2ConversationsEnabledForRequest, TaskV2NotEnabledError } from "./taskConversationsGate";
+import { isV2Task, pendingTaskConversationFollowerSql, TASK_V2_RETIRED_IN_REVIEW_REASON, taskAliasColumns, taskUsesOwnConversation, taskV2StoredStatus } from "./taskV2Mode";
 
 type MessageRow = typeof messages.$inferSelect;
 
@@ -47,10 +67,11 @@ export class TaskMutationConflictError extends Error {
   constructor() { super("The task changed while this request was waiting. Refresh and retry."); }
 }
 
-async function withTaskWriter<T>(observed: TaskRow, work: (tx: DatabaseExecutor) => Promise<T>): Promise<T> {
+async function withTaskWriter<T>(observed: TaskRow, work: (tx: DatabaseExecutor) => Promise<T>, actor?: JointTaskWriteActor): Promise<T> {
   return withChannelWriterFence(observed.channelId, async (tx) => {
     const [current] = await tx.select({ channelId: tasks.channelId }).from(tasks).where(eq(tasks.id, observed.id)).limit(1);
     if (current && current.channelId !== observed.channelId) throw new TaskMutationConflictError();
+    if (actor) await lockJointTaskWriteAuthority(tx, observed.channelId, actor);
     return work(tx);
   });
 }
@@ -61,6 +82,60 @@ async function withTaskChannelWriter<T>(channelId: string, work: (tx: DatabaseEx
     return work(executor);
   }
   return withChannelWriterFence(channelId, work);
+}
+
+/**
+ * `tasks.last_activity_at` for a write that is task activity on the Tasks
+ * page: the statement's now(). Written by task creation and by status,
+ * assignee, title and description changes, in the same statement as the
+ * change; a chat message in the task's own conversation writes it through
+ * touchTaskConversationActivity. Bookkeeping writes (the conversation link, a
+ * resource receipt) leave it. now() is the transaction's start, so tasks
+ * created by one createTasks call share it and tie on activity time; the
+ * sorted walk breaks the tie by task id, so their order is still total.
+ */
+const TASK_ACTIVITY_NOW = sql`now()`;
+
+/**
+ * The board's activity time: last_activity_at, or for a row last written
+ * before that column existed (no backfill) its updated_at. The expression of
+ * idx_tasks_channel_activity; the activity sort orders by exactly this.
+ */
+export const taskActivityAt = sql`COALESCE(${tasks.lastActivityAt}, ${tasks.updatedAt})`;
+
+/**
+ * A chat message in a task conversation re-stamps at most once per this
+ * interval per task: every stamp is a new tasks row version (the activity
+ * index reads the column, so it is never a HOT update), and a busy
+ * conversation would otherwise write one per message.
+ */
+export const TASK_ACTIVITY_MESSAGE_THROTTLE = "1 minute";
+
+/**
+ * Stamp `last_activity_at` for a chat message posted in task `taskId`'s own
+ * conversation (messageService.broadcastAndDeliver starts it after the
+ * message committed and does not wait for it). One statement by primary key:
+ *  - skipped while the stamp is younger than TASK_ACTIVITY_MESSAGE_THROTTLE;
+ *  - never waits for a lock: the row is taken FOR NO KEY UPDATE SKIP LOCKED,
+ *    so while a task write holds it (and stamps it itself when it is
+ *    activity) this one writes nothing instead of queueing behind it;
+ *  - outside the message's transaction, so the send never holds the task
+ *    row's lock either, and a task write that also writes into the
+ *    conversation cannot deadlock against it.
+ * Resolves true when it stamped.
+ */
+export async function touchTaskConversationActivity(taskId: string, executor: DatabaseExecutor = getDb()): Promise<boolean> {
+  const result = await executor.execute(sql`
+    UPDATE ${tasks} SET last_activity_at = now()
+    WHERE ${tasks.id} = (
+      SELECT locked.id FROM ${tasks} AS locked
+      WHERE locked.id = ${taskId}::uuid
+        AND (locked.last_activity_at IS NULL OR locked.last_activity_at < now() - ${TASK_ACTIVITY_MESSAGE_THROTTLE}::interval)
+      FOR NO KEY UPDATE SKIP LOCKED
+    )
+    RETURNING ${tasks.id}
+  `);
+  return result.rows.length > 0;
 }
 
 function nextClaimedAt(previous: Date | null): Date {
@@ -106,6 +181,145 @@ export class AssignedTaskCreationChannelError extends Error {
   }
 }
 
+/**
+ * A task-create item named a `sourceMessageId` the task cannot hang under:
+ * missing, in another channel, a thread reply, a system message, or an
+ * external projection. Mirrors convertMessageToTask.
+ */
+export class TaskSourceMessageError extends Error {
+  readonly code = "invalid_source_message" as const;
+  readonly status = 400;
+
+  constructor(message: string) {
+    super(message);
+    this.name = "TaskSourceMessageError";
+  }
+}
+
+/**
+ * A create asked for a status the task can't start in
+ * (`checkTaskCreateStatus`). Routes check first and answer 400 before any
+ * write; the writers re-check so no caller can skip it.
+ */
+export class TaskCreateStatusError extends Error {
+  readonly status = 400;
+  readonly code: TaskCreateStatusRefusal["code"];
+
+  constructor(refusal: TaskCreateStatusRefusal) {
+    super(refusal.message);
+    this.name = "TaskCreateStatusError";
+    this.code = refusal.code;
+  }
+}
+
+function assertTaskCreateStatus(requested: TaskCreateStatus | undefined, opts: { taskV2?: boolean } = {}): void {
+  const refusal = checkTaskCreateStatus(requested, opts);
+  if (refusal) throw new TaskCreateStatusError(refusal);
+}
+
+/**
+ * A status write asked for a status this task can't have: `backlog` on a
+ * pre-v2 task where task conversations are off. To the caller it is an invalid
+ * status (400), not a refused move (409): the status does not exist here.
+ */
+export class TaskStatusNotAvailableError extends Error {
+  readonly status = 400;
+  readonly code = "task_status_not_available" as const;
+
+  constructor(status: string) {
+    super(`valid status is required (${TASK_STATUSES.filter((known) => known !== "backlog").join(", ")}): ${status} needs task conversations, which this task does not have`);
+    this.name = "TaskStatusNotAvailableError";
+  }
+}
+
+export type TaskCreateItem = {
+  title: string;
+  description?: string;
+  createsResource?: boolean;
+  /** Task v2: the visible chat message this task hangs under (full UUID, same channel). */
+  sourceMessageId?: string | null;
+};
+
+/**
+ * Validate every distinct `sourceMessageId` of a create batch inside the
+ * creating transaction (the channel row is already locked by the caller).
+ */
+async function assertTaskSourceMessages(
+  tx: DatabaseExecutor,
+  channelId: string,
+  channelType: string,
+  items: readonly TaskCreateItem[],
+): Promise<void> {
+  const ids = [...new Set(items.map((item) => item.sourceMessageId).filter((id): id is string => typeof id === "string" && id.length > 0))];
+  if (ids.length === 0) return;
+  for (const id of ids) {
+    if (!UUID_RE.test(id)) throw new TaskSourceMessageError("source message not found");
+  }
+  // A sub-conversation (a thread, a task's own conversation) carries no tasks.
+  if (isSubConversationType(channelType)) throw new TaskSourceMessageError("thread messages cannot carry tasks");
+  const rows = await tx
+    .select({
+      id: messages.id,
+      channelId: messages.channelId,
+      senderType: messages.senderType,
+      messageType: messages.messageType,
+    })
+    .from(messages)
+    .where(inArray(messages.id, ids));
+  const byId = new Map(rows.map((row) => [row.id, row]));
+  for (const id of ids) {
+    const row = byId.get(id);
+    if (!row) throw new TaskSourceMessageError("source message not found");
+    if (row.channelId !== channelId) throw new TaskSourceMessageError("source message not in this channel");
+    if (row.senderType === "external_projection") {
+      throw new TaskSourceMessageError("external projection messages cannot carry tasks");
+    }
+    if (row.messageType === "system") throw new TaskSourceMessageError("system messages cannot carry tasks");
+  }
+}
+
+/**
+ * Pre-task-v2 host messages (task_v2_conversations_v0 off): one PLAIN, visible
+ * channel chat message per task (no task_status) that serves as the task's
+ * display line and thread parent; the task fact lives in `tasks`, linked by
+ * messageId. Callers broadcast / deliver / record inbox facts for them.
+ */
+function taskHostMessageValues(
+  channelId: string,
+  createdByType: "user" | "agent",
+  createdById: string,
+  items: readonly TaskCreateItem[],
+) {
+  return items.map((item) => ({
+    channelId,
+    senderType: createdByType,
+    senderId: createdById,
+    messageType: "chat" as const,
+    content: item.title,
+  }));
+}
+
+/**
+ * Resolve the write-side mode of a create batch and refuse a source message
+ * where task v2 conversations are off. The flag is read for the INITIATING
+ * server: the server whose local channel the request came through. For a
+ * joint channel the storage channel lives on the shared joint storage server,
+ * whose flag never says anything about the requester.
+ */
+async function resolveTaskConversationMode(
+  tx: DatabaseExecutor,
+  initiatingServerId: string,
+  items: readonly TaskCreateItem[],
+  initialStatus?: TaskCreateStatus,
+): Promise<{ conversations: boolean }> {
+  const conversations = await isTaskV2ConversationsEnabled(initiatingServerId, tx);
+  // A new task has no row to ask `taskUsesOwnConversation`: this read decides
+  // whether it is task v2 (its `own_conversation`), so it decides backlog too.
+  assertTaskCreateStatus(initialStatus, { taskV2: conversations });
+  if (!conversations && hasTaskSourceMessage(items)) throw new TaskV2NotEnabledError();
+  return { conversations };
+}
+
 type JointAssignmentRouting = {
   projections: JointChannelProjection[];
   preferredProjection: JointChannelProjection;
@@ -129,47 +343,19 @@ async function resolveJointAssignmentRouting(
 
   const projectionIds = projections.map((projection) => projection.localChannelId);
   const reachableIds = new Set<string>();
+  const [storage] = await tx.select().from(channels).where(eq(channels.id,storageChannelId));
+  if (!storage || await lockTaskAssigneeEligibility(tx, storage, assignee)) return null;
   if (assignee.type === "user") {
-    const [identity] = await tx
-      .select({ id: users.id })
-      .from(users)
-      .where(eq(users.id, assignee.id))
-      .limit(1)
-      .for("update");
-    if (!identity) return null;
-    const rows = await tx
-      .select({ channelId: channelHumans.channelId })
-      .from(channelHumans)
-      .where(and(
-        inArray(channelHumans.channelId, projectionIds),
-        eq(channelHumans.userId, assignee.id),
-      ))
-      .for("update");
-    for (const row of rows) reachableIds.add(row.channelId);
+    const permission = await resolveJointHumanEntrySql({ localChannelIds: projectionIds }, tx);
+    const rows = await tx.execute<{ channelId: string }>(sql`SELECT p.local_channel_id AS "channelId"
+      FROM joint_channel_servers p WHERE p.local_channel_id IN (${sql.join(projectionIds.map(id => sql`${id}::uuid`),sql`, `)})
+        AND ${permission(sql`p.local_channel_id`,sql`${assignee.id}::uuid`)}`);
+    rows.rows.forEach(row => reachableIds.add(row.channelId));
   } else {
-    const [identity] = await tx
-      .select({ id: agents.id })
-      .from(agents)
-      .where(and(eq(agents.id, assignee.id), isNull(agents.deletedAt)))
-      .limit(1)
-      .for("update");
-    if (!identity) return null;
-    const rows = await tx
-      .select({ channelId: channelAgents.channelId, serverId: agents.serverId })
-      .from(channelAgents)
-      .innerJoin(agents, and(
-        eq(agents.id, channelAgents.agentId),
-        isNull(agents.deletedAt),
-      ))
-      .where(and(
-        inArray(channelAgents.channelId, projectionIds),
-        eq(channelAgents.agentId, assignee.id),
-      ))
-      .for("update");
-    for (const row of rows) {
-      const projection = projections.find((candidate) => candidate.localChannelId === row.channelId);
-      if (projection?.serverId === row.serverId) reachableIds.add(row.channelId);
-    }
+    const rows = await tx.select({ channelId: channelAgents.channelId, serverId: agents.serverId })
+      .from(channelAgents).innerJoin(agents,and(eq(agents.id,channelAgents.agentId),isNull(agents.deletedAt)))
+      .where(and(inArray(channelAgents.channelId,projectionIds),eq(channelAgents.agentId,assignee.id)));
+    for (const row of rows) if (projections.some(p => p.localChannelId===row.channelId && p.serverId===row.serverId)) reachableIds.add(row.channelId);
   }
 
   const preferredProjection = projections.find((projection) => (
@@ -187,6 +373,11 @@ async function resolveJointAssignmentRouting(
   };
 }
 
+/** Statuses a claim moves to in_progress: work waiting to be picked up. */
+function isClaimStartableStatus(status: string | null): boolean {
+  return status === "todo" || status === "backlog";
+}
+
 export function getTaskClaimConflictReason(
   task: Pick<MessageRow, "taskAssigneeType" | "taskAssigneeId" | "taskStatus" | "taskClaimedAt">,
   claimedByType: "user" | "agent",
@@ -198,8 +389,9 @@ export function getTaskClaimConflictReason(
       && task.taskAssigneeId === claimedById;
     // Assignment and work-start are distinct. An owner/admin may preassign a
     // todo task to another actor; only that actor may perform the first claim,
-    // which atomically starts it and stamps taskClaimedAt.
-    if (assignedToRequester && task.taskStatus === "todo" && task.taskClaimedAt === null) return null;
+    // which atomically starts it and stamps taskClaimedAt. A parked task
+    // reserved for them is claimed the same way.
+    if (assignedToRequester && isClaimStartableStatus(task.taskStatus) && task.taskClaimedAt === null) return null;
     return assignedToRequester ? TASK_CLAIM_REASON_ALREADY_CLAIMED_BY_YOU : "already assigned";
   }
   if (task.taskStatus === "done") return "task is done";
@@ -462,42 +654,31 @@ async function lockTaskAssigneeEligibility(
       : "assignee is not a member of this channel";
   }
 
+  await acquireJointSourceExitFlagReadLock(tx);
+  await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(${`joint-human-membership:${joint.id}`},0))`);
   if (assignee.type === "user") {
-    const [identity] = await tx
-      .select({ id: users.id })
-      .from(users)
-      .where(eq(users.id, assignee.id))
-      .limit(1)
-      .for("update");
+    const [identity] = await tx.select({ id: users.id }).from(users).where(eq(users.id, assignee.id)).limit(1);
     if (!identity) return "assignee not found";
-    const [membership] = await tx
-      .select({ id: users.id })
-      .from(jointChannelServers)
-      .innerJoin(channelHumans, and(
-        eq(channelHumans.channelId, jointChannelServers.localChannelId),
-        eq(channelHumans.userId, assignee.id),
-      ))
-      .innerJoin(channels, and(
-        eq(channels.id, jointChannelServers.localChannelId),
-        eq(channels.serverId, jointChannelServers.serverId),
-        isNull(channels.deletedAt),
-      ))
-      .innerJoin(users, eq(users.id, channelHumans.userId))
-      .where(and(
-        eq(jointChannelServers.jointChannelId, joint.id),
-        eq(jointChannelServers.status, "active"),
-      ))
-      .limit(1)
-      .for("update");
-    return membership ? null : "assignee is not a member of this channel";
+    // Hold the authoritative member, not a source CH or another channel's
+    // row after J. Source departure/role writers own SM before J.
+    const membership = await tx.select({ id: jointChannelMembers.userId }).from(jointChannelMembers).where(and(
+      eq(jointChannelMembers.jointChannelId, joint.id), eq(jointChannelMembers.userId, assignee.id),
+      // P3: a bound host Guest is assignable only while the host admits guests.
+      jointHumanConnectedIdentitySql(jointChannelMembers.jointChannelId, jointChannelMembers.userId, await resolveJointGuestEntryJointIds([joint.id], tx)),
+      // With source exit, a member without a live source is not assignable.
+      (await resolveJointSourceExitJointIds([joint.id], tx)).has(joint.id)
+        ? jointHumanHasLiveSourceSql(jointChannelMembers.jointChannelId, jointChannelMembers.userId)
+        : undefined,
+      sql`NOT (${jointMembershipRemovalPendingSql(jointChannelMembers.jointChannelId, "user", jointChannelMembers.userId)})`,
+    )).limit(1).for("key share");
+    return membership.length ? null : "assignee is not a member of this channel";
   }
 
   const [identity] = await tx
     .select({ id: agents.id })
     .from(agents)
     .where(and(eq(agents.id, assignee.id), isNull(agents.deletedAt)))
-    .limit(1)
-    .for("update");
+    .limit(1);
   if (!identity) return "assignee not found";
   const [membership] = await tx
     .select({ id: agents.id })
@@ -519,63 +700,72 @@ async function lockTaskAssigneeEligibility(
     .where(and(
       eq(jointChannelServers.jointChannelId, joint.id),
       eq(jointChannelServers.status, "active"),
+      sql`NOT (${jointMembershipRemovalPendingSql(jointChannelServers.jointChannelId, "agent", channelAgents.agentId)})`,
     ))
     .limit(1)
-    .for("update");
+    .for("key share", { of: channelAgents });
   return membership ? null : "assignee is not a member of this channel";
 }
 
-/** Allocate the next task number for a channel, accounting for both messages and legacy tasks. */
+/**
+ * Reserve `count` consecutive task numbers in `channelId` (the storage
+ * channel) and return the first. A number is never reused within a channel
+ * (RFC 078): next = max(messages.task_number, tasks.task_number,
+ * channels.task_number_high_water) + 1, and the high-water mark moves to the
+ * last reserved number in the same statement. A legacy task keeps its host
+ * message, but a v2 task has none, so without the mark deleting the newest v2
+ * task would free its number and an old `#channel:#N` ref would point at the
+ * next task.
+ *
+ * Call inside the allocation transaction, after the channel's advisory lock
+ * (`pg_advisory_xact_lock(hashtext(channelId))`) where the caller takes it.
+ * The UPDATE also row-locks the channel, and it reads the mark from the row
+ * it locks, so even allocators that serialize only on the channel row
+ * (workflows) cannot hand out a number another committed allocation took.
+ */
+export async function reserveTaskNumbers(tx: DatabaseExecutor, channelId: string, count = 1): Promise<number> {
+  if (!Number.isInteger(count) || count < 1) throw new Error("reserveTaskNumbers needs a positive count");
+  const result = await tx.execute(sql`
+    UPDATE channels
+       SET task_number_high_water = GREATEST(
+             channels.task_number_high_water,
+             (SELECT COALESCE(MAX(m.task_number), 0) FROM messages m WHERE m.channel_id = ${channelId}::uuid),
+             (SELECT COALESCE(MAX(t.task_number), 0) FROM tasks t WHERE t.channel_id = ${channelId}::uuid)
+           ) + ${count}::int
+     WHERE channels.id = ${channelId}::uuid
+     RETURNING task_number_high_water AS "highWater"
+  `);
+  const row = result.rows[0] as { highWater: number | string } | undefined;
+  if (!row) throw new Error("Task channel is unavailable");
+  return Number(row.highWater) - count + 1;
+}
+
+/** Allocate the next task number for a channel (see reserveTaskNumbers). */
 export async function allocateTaskNumber(channelId: string): Promise<{ taskStatus: "todo"; taskNumber: number }> {
-  const db = getDb();
   return withTaskChannelWriter(channelId, async (tx) => {
     await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${channelId}))`);
-
-    const [{ maxMsgNum }] = await tx
-      .select({ maxMsgNum: sql<number>`COALESCE(MAX(${messages.taskNumber}), 0)` })
-      .from(messages)
-      .where(eq(messages.channelId, channelId));
-
-    // No catch: inside this transaction a failed query has already aborted it
-    // in Postgres, so continuing could only fail later with 25P02 (and the
-    // tasks table is canonical now, so "legacy table missing" cannot happen).
-    const [row] = await tx
-      .select({ maxLegacyNum: sql<number>`COALESCE(MAX(${tasks.taskNumber}), 0)` })
-      .from(tasks)
-      .where(eq(tasks.channelId, channelId));
-    const maxLegacyNum = row?.maxLegacyNum ?? 0;
-
-    return { taskStatus: "todo" as const, taskNumber: Math.max(maxMsgNum ?? 0, maxLegacyNum) + 1 };
+    return { taskStatus: "todo" as const, taskNumber: await reserveTaskNumbers(tx, channelId) };
   });
 }
 
 /**
- * Valid status transitions. Key = current status, value = allowed next statuses.
- *
- * `closed` is a terminal "won't do" state reachable from any active or
- * completed status — at any point a task can be deliberately abandoned. The
- * An assigned task can resume directly from `closed`; the permission check
- * below still restricts that transition to its current assignee. Unassigned
- * work must reopen to `todo` before it can be claimed.
- *
- * stdrc 2026-05-08 #proj-task:5ca7dfa3 msg=56ec4e74 ("干吧"):
- *   accepted state machine extending the closed status.
+ * Any status can be set from any other status, by people and agents alike:
+ * stdrc 2026-10-31 #wg-task-v2:7415abae msg=ad820421 ("所有的状态之间切换的限制
+ * 其实都不需要了 因为人和 Agent 都知道他现在应该要把它切成什么状态"). This
+ * replaced the transition table of 2026-05-08 (#proj-task:5ca7dfa3). Setting
+ * the status a task already has is the only refusal; the side effects of a
+ * move (start epoch, completedAt, closed_*) are derived in writeCanonicalStatus.
  */
-const VALID_TRANSITIONS: Record<TaskStatus, TaskStatus[]> = {
-  todo: ["in_progress", "closed"],
-  in_progress: ["in_review", "done", "closed"],
-  in_review: ["done", "in_progress", "closed"],  // can send back, or abandon
-  done: ["todo", "in_progress", "in_review", "closed"],  // can reopen, or retroactively abandon
-  closed: ["todo", "in_progress"],  // assignee may resume directly; unassigned work reopens via todo
-};
-
 export function getTaskStatusTransitionError(
   currentStatus: TaskStatus,
   newStatus: TaskStatus,
 ): string | null {
-  const allowed = VALID_TRANSITIONS[currentStatus];
-  if (allowed?.includes(newStatus)) return null;
-  return `cannot transition from ${currentStatus} to ${newStatus}`;
+  return currentStatus === newStatus ? `already ${newStatus}` : null;
+}
+
+/** Statuses of work not started yet: entering in_progress from one starts it. */
+function isUnstartedStatus(status: TaskStatus): boolean {
+  return status === "backlog" || status === "todo" || status === "closed";
 }
 
 /** Batch-resolve creator and claimer names for a list of task-messages. */
@@ -600,7 +790,7 @@ async function enrichWithNames(rows: MessageRow[], executor: DatabaseExecutor = 
   const nameMap = new Map<string, string>();
   const handleMap = new Map<string, string>();
   const channelIds = [...new Set(rows.map((t) => t.channelId))];
-  const channelMap = new Map<string, { name: string; type: "channel" | "private" | "joint" | "dm" | "thread" }>();
+  const channelMap = new Map<string, { name: string; type: TaskChannelType }>();
 
   if (userIds.size > 0) {
     const userRows = await db
@@ -632,7 +822,7 @@ async function enrichWithNames(rows: MessageRow[], executor: DatabaseExecutor = 
     for (const channel of channelRows) {
       channelMap.set(channel.id, {
         name: channel.name,
-        type: channel.type,
+        type: asTaskChannelType(channel.type),
       });
     }
   }
@@ -643,6 +833,7 @@ async function enrichWithNames(rows: MessageRow[], executor: DatabaseExecutor = 
     createdByType: t.senderType,
     createdById: t.senderId,
     createdByName: nameMap.get(t.senderId) || "Unknown",
+    createdByHandle: handleMap.get(t.senderId) ?? null,
     claimedByType: t.taskAssigneeType ?? null,
     claimedById: t.taskAssigneeId ?? null,
     claimedByName: t.taskAssigneeId ? handleMap.get(t.taskAssigneeId) || "Unknown" : null,
@@ -682,21 +873,35 @@ export async function listTasks(channelId: string, statusFilter?: TaskStatus) {
   const taskConditions = [conversionReadChannelPredicate(tasks.channelId, channelId)];
   if (statusFilter) taskConditions.push(eq(tasks.status, statusFilter));
 
-  let taskRows: (typeof tasks.$inferSelect)[] = [];
-  try {
-    taskRows = await db
-      .select()
-      .from(tasks)
-      .where(and(...taskConditions))
-      .orderBy(asc(tasks.taskNumber));
-  } catch (err) {
-    console.error("[listTasks] tasks query failed:", err);
-  }
+  // A failed query is not an empty board. Let each route report the failure;
+  // callers can only assert completeness after the query and enrichment pass.
+  const taskRows = await db
+    .select()
+    .from(tasks)
+    .where(and(...taskConditions))
+    .orderBy(asc(tasks.taskNumber));
 
-  return enrichTaskRows(taskRows);
+  // A single-channel board includes current-text provenance. Do not present
+  // fallback provenance as a complete result if its queries fail.
+  return enrichTaskRows(taskRows, db, { failClosedCurrentProjection: true });
 }
 
+// Backlog is not here on purpose: parked work is not active (raft-design decision 0042).
 const UNFINISHED_TASK_STATUSES = ["todo", "in_progress", "in_review"] as const satisfies readonly TaskStatus[];
+
+/**
+ * The caller-supplied channel ids, each expanded once to its storage-equivalent
+ * ids, to join on `tasks.channel_id` (see listTasksAssignedToAgent).
+ */
+function authorizedTaskSurface(visibleChannelIds: readonly string[]) {
+  return getDb().select({
+    channelId: sql<string>`requested.id`.as("read_channel_id"),
+    position: sql<number>`requested.position`.as("read_position"),
+    storageChannelId: sql<string>`storage.id`.as("storage_channel_id"),
+  }).from(sql`unnest(ARRAY[${sql.join(visibleChannelIds.map(id => sql`${id}::uuid`), sql`, `)}]) WITH ORDINALITY AS requested(id, position)
+    CROSS JOIN LATERAL (${conversionReadChannelIdsQuery(sql`requested.id`)}) AS storage`)
+    .as("authorized_task_surface");
+}
 
 /**
  * List every canonical task assigned to one exact agent identity within a
@@ -725,13 +930,7 @@ export async function listTasksAssignedToAgent(
   // joined on channel_id, so the planner reads tasks through the channel
   // index. Testing equivalence per task and id instead cost ~1.9 ms a pair
   // and hit the statement timeout for agents in 100+ channels.
-  const readSurface = db.select({
-    channelId: sql<string>`requested.id`.as("read_channel_id"),
-    position: sql<number>`requested.position`.as("read_position"),
-    storageChannelId: sql<string>`storage.id`.as("storage_channel_id"),
-  }).from(sql`unnest(ARRAY[${sql.join(visibleChannelIds.map(id => sql`${id}::uuid`), sql`, `)}]) WITH ORDINALITY AS requested(id, position)
-    CROSS JOIN LATERAL (${conversionReadChannelIdsQuery(sql`requested.id`)}) AS storage`)
-    .as("authorized_task_surface");
+  const readSurface = authorizedTaskSurface(visibleChannelIds);
   const conditions: SQL[] = [
     eq(tasks.claimedByType, "agent"),
     eq(tasks.claimedById, agentId),
@@ -753,10 +952,137 @@ export async function listTasksAssignedToAgent(
   return enriched.map(task => ({ ...task, channelId: surfaceByTask.get(task.id)! }));
 }
 
+/**
+ * The unfinished tasks assigned to one agent in already-authorized channel
+ * ids (as listTasksAssignedToAgent), one row per task with the requested id it
+ * was read through: a subquery for the bounded reads below.
+ */
+function assignedOpenTaskRowsSubquery(visibleChannelIds: readonly string[], agentId: string) {
+  const db = getDb();
+  const readSurface = authorizedTaskSurface(visibleChannelIds);
+  return db
+    .selectDistinctOn([tasks.id], {
+      id: tasks.id,
+      taskNumber: tasks.taskNumber,
+      title: tasks.title,
+      updatedAt: tasks.updatedAt,
+      channelId: readSurface.channelId,
+    })
+    .from(tasks)
+    .innerJoin(readSurface, eq(tasks.channelId, readSurface.storageChannelId))
+    .where(and(
+      eq(tasks.claimedByType, "agent"),
+      eq(tasks.claimedById, agentId),
+      inArray(tasks.status, [...UNFINISHED_TASK_STATUSES]),
+    ))
+    .orderBy(asc(tasks.id), asc(readSurface.position))
+    .as("assigned_open_task");
+}
+
+/**
+ * At most `limit` unfinished tasks assigned to the agent in these
+ * already-authorized channel ids, most recently updated first (then task
+ * number), with the total: the bounded read behind a summary that names a
+ * few and counts the rest. No enrichment.
+ */
+export async function listRecentTasksAssignedToAgent(
+  visibleChannelIds: readonly string[],
+  agentId: string,
+  limit: number,
+): Promise<{ rows: Array<{ id: string; taskNumber: number; title: string; channelId: string }>; total: number }> {
+  if (visibleChannelIds.length === 0) return { rows: [], total: 0 };
+  const assigned = assignedOpenTaskRowsSubquery(visibleChannelIds, agentId);
+  const [rows, total] = await Promise.all([
+    limit > 0
+      ? getDb()
+        .select({ id: assigned.id, taskNumber: assigned.taskNumber, title: assigned.title, channelId: assigned.channelId })
+        .from(assigned)
+        .orderBy(sql`${assigned.updatedAt} desc`, asc(assigned.taskNumber), asc(assigned.id))
+        .limit(limit)
+      : Promise.resolve([]),
+    countTasksAssignedToAgent(visibleChannelIds, agentId),
+  ]);
+  return { rows, total };
+}
+
+/** How many unfinished tasks are assigned to the agent in these already-authorized channel ids. */
+export async function countTasksAssignedToAgent(visibleChannelIds: readonly string[], agentId: string): Promise<number> {
+  if (visibleChannelIds.length === 0) return 0;
+  const assigned = assignedOpenTaskRowsSubquery(visibleChannelIds, agentId);
+  const [row] = await getDb().select({ total: sql<number>`count(*)::int` }).from(assigned);
+  return Number(row?.total ?? 0);
+}
+
+/**
+ * At most `limit` task v2 tasks this agent created that nobody holds, in these
+ * already-authorized channel ids, most recently updated first (idle task
+ * reminder). Only statuses the caller names, each created at or before its
+ * cutoff: a task's "untouched" clock cannot start before its creation, so a
+ * younger one cannot be due and must not take a place under the limit.
+ *
+ * Reads tasks through idx_tasks_channel_status like the assigned reads, no
+ * index on the creator; the creator and assignee are filters on those rows. No
+ * enrichment.
+ */
+export async function listUnassignedTasksCreatedByAgent(
+  visibleChannelIds: readonly string[],
+  agentId: string,
+  opts: { createdByStatus: Partial<Record<TaskStatus, Date>>; limit: number },
+) {
+  const statuses = Object.entries(opts.createdByStatus).flatMap(([status, cutoff]) => cutoff
+    ? [and(eq(tasks.status, status as TaskStatus), lte(tasks.createdAt, cutoff))]
+    : []);
+  if (visibleChannelIds.length === 0 || statuses.length === 0 || opts.limit <= 0) return [];
+  const db = getDb();
+  const readSurface = authorizedTaskSurface(visibleChannelIds);
+  const created = db
+    .selectDistinctOn([tasks.id], {
+      id: tasks.id,
+      taskNumber: tasks.taskNumber,
+      title: tasks.title,
+      status: tasks.status,
+      messageId: tasks.messageId,
+      conversationChannelId: tasks.conversationChannelId,
+      sourceMessageId: tasks.sourceMessageId,
+      createdAt: tasks.createdAt,
+      updatedAt: tasks.updatedAt,
+      channelId: readSurface.channelId,
+    })
+    .from(tasks)
+    .innerJoin(readSurface, eq(tasks.channelId, readSurface.storageChannelId))
+    .where(and(
+      eq(tasks.createdByType, "agent"),
+      eq(tasks.createdById, agentId),
+      isNull(tasks.claimedById),
+      or(eq(tasks.ownConversation, true), isNotNull(tasks.conversationChannelId)),
+      or(...statuses),
+    ))
+    .orderBy(asc(tasks.id), asc(readSurface.position))
+    .as("unassigned_created_task");
+  const rows = await db
+    .select()
+    .from(created)
+    .orderBy(sql`${created.updatedAt} desc`, asc(created.taskNumber), asc(created.id))
+    .limit(opts.limit);
+  return rows.map((row) => ({
+    id: row.id,
+    taskNumber: row.taskNumber,
+    title: row.title,
+    status: row.status as TaskStatus,
+    hostMessageId: row.messageId ?? null,
+    conversationChannelId: row.conversationChannelId ?? null,
+    // As enrichTaskRows: a task from before task v2 hangs under its host message.
+    sourceMessageId: row.sourceMessageId ?? row.messageId ?? null,
+    createdAt: new Date(row.createdAt).toISOString(),
+    updatedAt: new Date(row.updatedAt).toISOString(),
+    channelId: row.channelId,
+  }));
+}
+
 type TaskProjectionChannel = {
   id: string;
   name?: string | null;
-  type: "channel" | "private" | "joint" | "dm" | "thread";
+  type: "channel" | "private" | "joint" | "dm" | "thread" | "task";
   taskReadOnlyBefore?: Date | null;
 };
 
@@ -764,7 +1090,7 @@ type TaskProjectionChannel = {
 export function projectTasksToChannel<T extends {
   channelId: string;
   channelName?: string | null;
-  channelType?: "channel" | "private" | "joint" | "dm" | "thread";
+  channelType?: "channel" | "private" | "joint" | "dm" | "thread" | "task";
   createdAt?: Date | string;
 }>(taskRows: T[], channel: TaskProjectionChannel): Array<T & { readOnlyReason: TaskReadOnlyReason | null }> {
   return taskRows.map((task) => ({
@@ -779,7 +1105,7 @@ export function projectTasksToChannel<T extends {
 export function projectTaskToChannel<T extends {
   channelId: string;
   channelName?: string | null;
-  channelType?: "channel" | "private" | "joint" | "dm" | "thread";
+  channelType?: "channel" | "private" | "joint" | "dm" | "thread" | "task";
 }>(task: T, channel: TaskProjectionChannel): T & { readOnlyReason: TaskReadOnlyReason | null } {
   return projectTasksToChannel([task], channel)[0]!;
 }
@@ -802,28 +1128,247 @@ async function loadCanonicalMessageIds(
 }
 
 /**
- * List tasks for all non-DM, non-thread, non-archived task surfaces in a server.
- * Joint rows are read from canonical storage but projected back to the local
- * channel id, and remain membership-gated even though ordinary public-channel
- * tasks are server-visible.
+ * The server task board's conversations for one human, ordered by (name, id):
+ * the visible public, private and joint channels (visibilityService), minus
+ * archived ones. DMs stay off the board by product choice (an agent's
+ * `task list --mine` does list them); threads never carry tasks. Guests get
+ * the same rule: the board lists what canView lets them read.
+ */
+async function listServerTaskBoardChannelIds(serverId: string, userId: string): Promise<string[]> {
+  const { roots } = await visibleRootChannelIds(
+    { type: "user", id: userId, serverId: serverId as ServerId },
+    // The board reads top-level tasks only: no thread candidates, no joint storage map.
+    { includeThreads: false },
+  );
+  const boardTypes = new Set(["channel", "private", "joint"]);
+  return roots
+    .filter((root) => boardTypes.has(root.type) && root.archivedAt === null)
+    .map((root) => root.id);
+}
+
+/**
+ * List tasks for all visible non-DM, non-thread, non-archived task surfaces in
+ * a server (see listServerTaskBoardChannelIds). Joint rows are read from
+ * canonical storage but projected back to the local channel id, and remain
+ * membership-gated even though ordinary public-channel tasks are
+ * server-visible; private channels likewise list only for their members.
  */
 export async function listServerTasks(serverId: string, statusFilter: TaskStatus | undefined, userId: string) {
-  const db = getDb();
-  const serverChannels = await db
-    .select({ id: channels.id })
-    .from(channels)
-    .where(and(
-      eq(channels.serverId, serverId),
-      or(eq(channels.type, "channel"), eq(channels.type, "joint")),
-      isNull(channels.archivedAt),
-    ))
-    .orderBy(asc(channels.name));
-
-  if (serverChannels.length === 0) return [];
-  const surfaces = await resolveVisibleServerTaskSurfaces(serverId, userId, serverChannels.map((channel) => channel.id));
+  const boardChannelIds = await listServerTaskBoardChannelIds(serverId, userId);
+  if (boardChannelIds.length === 0) return [];
+  const surfaces = await resolveOrderedTaskSurfaces(serverId, boardChannelIds);
   // A failed read surfaces as an error: an empty board would claim the server has no tasks.
-  const rows = await selectServerTaskRows(surfaces, statusFilter);
+  const rows = await selectServerTaskRows(surfaces, serverTaskConditions(statusFilter, undefined, userId));
   return projectServerTaskRows(surfaces, rows);
+}
+
+/** A person or agent as the board's Creator / Assignee filters name it (`<type>:<id>` on the wire). */
+export type ServerTaskActorRef = { type: "user" | "agent"; id: string };
+
+/**
+ * The board's relation to the requesting person. Each is exclusive of the
+ * ones before it, so one task lands in one relation tab:
+ * - assigned_to_me: claimed by the person;
+ * - created_by_me: created by the person and not claimed by them;
+ * - from_my_message: its task v2 source message (`tasks.source_message_id`)
+ *   was sent by the person, still exists and is not retracted, and the task
+ *   was neither created by them nor claimed by them. Pre-v2 tasks have no source message (the
+ *   summary's `sourceMessageId` host-message fallback is not one), so they
+ *   never match.
+ */
+export const SERVER_TASK_RELATIONS = ["assigned_to_me", "created_by_me", "from_my_message"] as const;
+export type ServerTaskRelation = (typeof SERVER_TASK_RELATIONS)[number];
+
+/**
+ * Opt-in filters of the server task board reads (`GET /api/tasks/server` new
+ * shapes and `GET /api/tasks/server/counts`). Every filter narrows the same
+ * visible board (listServerTaskBoardChannelIds); none can widen it.
+ */
+export interface ServerTaskFilters {
+  /**
+   * Board statuses. `in_progress` also matches stored `in_review` rows: task
+   * v2 retired in_review and the board shows those rows as in progress, so
+   * the column and its count must include them. `in_review` alone still
+   * matches only in_review rows.
+   */
+  statuses?: readonly TaskStatus[];
+  /** Local channel ids; ids outside the visible board simply match nothing. */
+  channelIds?: readonly string[];
+  /** Claimer identities, or "unassigned" for no claimer; any one matches. */
+  assignees?: readonly (ServerTaskActorRef | "unassigned")[];
+  /** Creator identities; any one matches. */
+  creators?: readonly ServerTaskActorRef[];
+  relation?: ServerTaskRelation;
+  /**
+   * Done tasks completed before this instant are left out; tasks in other
+   * statuses are unaffected (completed_at is set only while a task is done),
+   * so a board can bound its Done column without hiding the active ones.
+   */
+  completedSince?: Date;
+  /**
+   * Tasks created before this instant are left out, in every status (the
+   * Tasks page's "created today": counts with created_since summed over the
+   * columns).
+   */
+  createdSince?: Date;
+  /**
+   * The Tasks page's search: words the title contains, case-insensitively
+   * (every word, in any order), or a task number (`12` / `#12`), which also
+   * matches that number in any channel.
+   */
+  query?: string;
+}
+
+/** A LIKE pattern matching `text` anywhere, its own `%`, `_` and `\` taken literally. */
+function containsPattern(text: string): string {
+  return `%${text.replace(/[\\%_]/g, (char) => `\\${char}`)}%`;
+}
+
+/** Search words of ServerTaskFilters.query, at most this many. */
+const SERVER_TASK_QUERY_MAX_WORDS = 8;
+
+function serverTaskQueryPredicate(query: string): SQL | null {
+  const words = [...new Set(query.trim().split(/\s+/u).filter(Boolean))].slice(0, SERVER_TASK_QUERY_MAX_WORDS);
+  if (words.length === 0) return null;
+  const title = and(...words.map((word) => sql`${tasks.title} ILIKE ${containsPattern(word)} ESCAPE '\\'`))!;
+  const number = words.length === 1 ? /^#?(\d{1,9})$/.exec(words[0]!) : null;
+  return number ? sql`(${title} OR ${tasks.taskNumber} = ${Number(number[1])})` : title;
+}
+
+const STATUSES_SHOWN_AS_IN_PROGRESS = ["in_progress", "in_review"] as const satisfies readonly TaskStatus[];
+// Relation tabs count work that is still open; backlog is parked (as UNFINISHED_TASK_STATUSES).
+const RELATION_COUNTED_STATUSES = ["todo", ...STATUSES_SHOWN_AS_IN_PROGRESS] as const satisfies readonly TaskStatus[];
+
+function storedBoardStatuses(statuses: readonly TaskStatus[]): TaskStatus[] {
+  const stored = new Set<TaskStatus>(statuses);
+  if (stored.has("in_progress")) stored.add("in_review");
+  return [...stored];
+}
+
+function serverTaskRelationPredicate(relation: ServerTaskRelation, userId: string): SQL {
+  // Plain equalities where the relation selects rows, so a WHERE can read them
+  // through idx_tasks_claimed_by / idx_tasks_created_by (a NULL claimer is
+  // simply not a match there).
+  const claimedByMeMatch = sql`(${tasks.claimedByType} = 'user' AND ${tasks.claimedById} = ${userId})`;
+  // COALESCE where it excludes: an unclaimed task's NULL claimer must read as "not mine", or NOT would drop it.
+  const claimedByMe = sql`COALESCE(${tasks.claimedByType} = 'user' AND ${tasks.claimedById} = ${userId}, false)`;
+  const createdByMe = sql`(${tasks.createdByType} = 'user' AND ${tasks.createdById} = ${userId})`;
+  switch (relation) {
+    case "assigned_to_me":
+      return claimedByMeMatch;
+    case "created_by_me":
+      return sql`(${createdByMe} AND NOT ${claimedByMe})`;
+    case "from_my_message":
+      return sql`(NOT ${createdByMe} AND NOT ${claimedByMe} AND EXISTS (
+        SELECT 1 FROM ${messages}
+        WHERE ${messages.id} = ${tasks.sourceMessageId}
+          AND ${messages.senderType} = 'user'
+          AND ${messages.senderId} = ${userId}
+          AND ${messages.deletedAt} IS NULL
+      ))`;
+  }
+}
+
+function actorRefPredicate(typeColumn: typeof tasks.createdByType | typeof tasks.claimedByType, idColumn: typeof tasks.createdById | typeof tasks.claimedById, ref: ServerTaskActorRef): SQL {
+  return and(eq(typeColumn, ref.type), eq(idColumn, ref.id))!;
+}
+
+/**
+ * WHERE conditions on `tasks` for a board read. `statusFilter` is the legacy
+ * exact single status (no in_review folding); `filters` are the opt-in ones.
+ * `channelIds` is not here: it narrows the surfaces, not the rows.
+ */
+function serverTaskConditions(
+  statusFilter: TaskStatus | undefined,
+  filters: ServerTaskFilters | undefined,
+  userId: string,
+  options: { ignoreRelation?: boolean } = {},
+): SQL[] {
+  const conditions: SQL[] = [];
+  if (statusFilter) conditions.push(eq(tasks.status, statusFilter));
+  if (!filters) return conditions;
+  if (filters.statuses) conditions.push(inArray(tasks.status, storedBoardStatuses(filters.statuses)));
+  if (filters.assignees) {
+    conditions.push(or(...filters.assignees.map((assignee) => (
+      assignee === "unassigned" ? isNull(tasks.claimedById) : actorRefPredicate(tasks.claimedByType, tasks.claimedById, assignee)
+    )))!);
+  }
+  if (filters.creators) {
+    conditions.push(or(...filters.creators.map((creator) => actorRefPredicate(tasks.createdByType, tasks.createdById, creator)))!);
+  }
+  if (filters.relation && !options.ignoreRelation) conditions.push(serverTaskRelationPredicate(filters.relation, userId));
+  if (filters.completedSince) {
+    conditions.push(sql`(${tasks.status} <> 'done' OR ${tasks.completedAt} >= ${filters.completedSince.toISOString()}::timestamptz)`);
+  }
+  if (filters.createdSince) {
+    conditions.push(sql`${tasks.createdAt} >= ${filters.createdSince.toISOString()}::timestamptz`);
+  }
+  if (filters.query) {
+    const matches = serverTaskQueryPredicate(filters.query);
+    if (matches) conditions.push(matches);
+  }
+  return conditions;
+}
+
+/** The board's ordered channel ids, narrowed to `channelIds` when given; ids outside the board drop out. */
+function narrowServerTaskBoard(boardChannelIds: string[], channelIds: readonly string[] | undefined): string[] {
+  if (!channelIds) return boardChannelIds;
+  const wanted = new Set(channelIds);
+  return boardChannelIds.filter((id) => wanted.has(id));
+}
+
+export interface ServerTaskCounts {
+  /** Per board column; `in_progress` includes stored in_review rows. */
+  counts: { backlog: number; todo: number; in_progress: number; done: number; closed: number };
+  /** Open (todo / in progress) tasks per relation, within every filter but `relation`. */
+  relations: Record<ServerTaskRelation, number>;
+}
+
+/**
+ * Counts for the server task board over exactly the rows the board list
+ * (`listServerTasksPage` with the same filters) would page through: same
+ * visible surfaces, same per-surface rows, so a column's count is the number
+ * of rows its pages hold. One aggregate query, no rows loaded.
+ */
+export async function countServerTasks(serverId: string, userId: string, filters: ServerTaskFilters): Promise<ServerTaskCounts> {
+  const boardChannelIds = narrowServerTaskBoard(await listServerTaskBoardChannelIds(serverId, userId), filters.channelIds);
+  const zero: ServerTaskCounts = {
+    counts: { backlog: 0, todo: 0, in_progress: 0, done: 0, closed: 0 },
+    relations: { assigned_to_me: 0, created_by_me: 0, from_my_message: 0 },
+  };
+  if (boardChannelIds.length === 0) return zero;
+  const surfaces = await resolveOrderedTaskSurfaces(serverId, boardChannelIds);
+  if (surfaces.length === 0) return zero;
+
+  // The relation param narrows the column counts only; the relation counts
+  // are the tabs' badges, each computed within every other filter.
+  const inRelation = filters.relation ? serverTaskRelationPredicate(filters.relation, userId) : sql`TRUE`;
+  const statusIn = (statuses: readonly TaskStatus[]) => inArray(tasks.status, [...statuses]);
+  const column = (statuses: readonly TaskStatus[]) =>
+    sql<number>`count(*) FILTER (WHERE ${statusIn(statuses)} AND ${inRelation})`.mapWith(Number);
+  const relationCount = (relation: ServerTaskRelation) =>
+    sql<number>`count(*) FILTER (WHERE ${statusIn(RELATION_COUNTED_STATUSES)} AND ${serverTaskRelationPredicate(relation, userId)})`.mapWith(Number);
+  const conditions = serverTaskConditions(undefined, filters, userId, { ignoreRelation: true });
+
+  const [row] = await getDb()
+    .select({
+      backlog: column(["backlog"]),
+      todo: column(["todo"]),
+      inProgress: column(STATUSES_SHOWN_AS_IN_PROGRESS),
+      done: column(["done"]),
+      closed: column(["closed"]),
+      assignedToMe: relationCount("assigned_to_me"),
+      createdByMe: relationCount("created_by_me"),
+      fromMyMessage: relationCount("from_my_message"),
+    })
+    .from(serverTaskSurfaceSource(surfaces))
+    .innerJoin(tasks, eq(tasks.channelId, sql`read_scope.id`))
+    .where(conditions.length > 0 ? and(...conditions) : undefined);
+  if (!row) return zero;
+  return {
+    counts: { backlog: row.backlog, todo: row.todo, in_progress: row.inProgress, done: row.done, closed: row.closed },
+    relations: { assigned_to_me: row.assignedToMe, created_by_me: row.createdByMe, from_my_message: row.fromMyMessage },
+  };
 }
 
 type ServerTaskSurfaceRow = { position: number; task: TaskRow };
@@ -839,12 +1384,30 @@ async function resolveVisibleServerTaskSurfaces(
   orderedChannelIds: string[],
 ): Promise<TaskChannelSurface[]> {
   const accessible = await filterUserAccessibleChannelIds(orderedChannelIds, userId, serverId as ServerId);
-  const accessibleIds = orderedChannelIds.filter((id) => accessible.has(id));
+  return resolveOrderedTaskSurfaces(serverId, orderedChannelIds.filter((id) => accessible.has(id)));
+}
+
+/** The task surfaces of already-visible channel ids, in that order. */
+async function resolveOrderedTaskSurfaces(serverId: string, accessibleIds: string[]): Promise<TaskChannelSurface[]> {
   const surfaceById = await resolveTaskChannelSurfaces(serverId, accessibleIds);
   return accessibleIds.flatMap((id) => {
     const surface = surfaceById.get(id);
     return surface ? [surface] : [];
   });
+}
+
+/**
+ * The board's row source: each surface's conversion-read equivalence set as
+ * `surface(storage_id, position)` x `read_scope(id)`, to join on
+ * `tasks.channel_id = read_scope.id`. Shared by the board list and its counts
+ * so both read exactly the same rows.
+ */
+function serverTaskSurfaceSource(surfaces: TaskChannelSurface[]): SQL {
+  const storageIds = sql.join(surfaces.map((surface) => sql`${surface.storageChannelId}::uuid`), sql`, `);
+  const localIds = sql.join(surfaces.map((surface) => sql`${surface.localChannel.id}::uuid`), sql`, `);
+  // local_id: the surface's local channel id, the sorted walks' last tiebreaker.
+  return sql`unnest(ARRAY[${storageIds}], ARRAY[${localIds}]) WITH ORDINALITY AS surface(storage_id, local_id, position)
+      CROSS JOIN LATERAL (${conversionReadChannelIdsQuery(sql`surface.storage_id`)}) AS read_scope(id)`;
 }
 
 /**
@@ -857,22 +1420,19 @@ async function resolveVisibleServerTaskSurfaces(
  */
 async function selectServerTaskRows(
   surfaces: TaskChannelSurface[],
-  statusFilter: TaskStatus | undefined,
+  filterConditions: SQL[],
   page?: { after?: { position: number; taskNumber: number } | null; limit?: number },
 ): Promise<ServerTaskSurfaceRow[]> {
   if (surfaces.length === 0) return [];
-  const storageIds = sql.join(surfaces.map((surface) => sql`${surface.storageChannelId}::uuid`), sql`, `);
   // WITH ORDINALITY is 1-based; positions exposed to callers are 0-based.
   const position = sql<string>`(surface.position - 1)`;
-  const conditions: SQL[] = [];
-  if (statusFilter) conditions.push(eq(tasks.status, statusFilter));
+  const conditions: SQL[] = [...filterConditions];
   if (page?.after) {
     conditions.push(sql`(${position} > ${page.after.position} OR (${position} = ${page.after.position} AND ${tasks.taskNumber} > ${page.after.taskNumber}))`);
   }
   const query = getDb()
     .select({ position, task: tasks })
-    .from(sql`unnest(ARRAY[${storageIds}]) WITH ORDINALITY AS surface(storage_id, position)
-      CROSS JOIN LATERAL (${conversionReadChannelIdsQuery(sql`surface.storage_id`)}) AS read_scope(id)`)
+    .from(serverTaskSurfaceSource(surfaces))
     .innerJoin(tasks, eq(tasks.channelId, sql`read_scope.id`))
     .where(conditions.length > 0 ? and(...conditions) : undefined)
     .orderBy(sql`surface.position`, asc(tasks.taskNumber), asc(tasks.id));
@@ -905,6 +1465,200 @@ export interface ServerTasksPageCursor {
 }
 
 /**
+ * The board's sorted walks (`GET /api/tasks/server?sort=`); without `sort`
+ * the walk keeps its (channel, task number) order.
+ *   activity      activity time (taskActivityAt) DESC: most recently updated first
+ *   activity_asc  activity time ASC: longest without an update first (the
+ *                 Tasks page's "least recently updated")
+ *   created       created_at DESC
+ *   number        task number DESC (numbers are per channel, so channels interleave)
+ * Ties break on task id, then the surface's local channel id (one task is
+ * listed once per surface that reads its channel), in the sort's direction,
+ * so the order is total and a keyset over it is exact. activity_asc is
+ * exactly the reverse of activity.
+ */
+export const SERVER_TASK_SORTS = ["activity", "activity_asc", "created", "number"] as const;
+export type ServerTaskSort = (typeof SERVER_TASK_SORTS)[number];
+
+/** Whether a sort walks its key (and its tie-breaks) ascending. */
+export function isAscendingServerTaskSort(sort: ServerTaskSort): boolean {
+  return sort === "activity_asc";
+}
+
+/**
+ * Position marker of a sorted walk: the last emitted item's sort key, task id
+ * and local channel id. Resumes strictly after that item in the sort's total
+ * order; it does not depend on which channels are still visible, so it never
+ * goes stale. Only valid for the sort that produced it.
+ */
+export interface ServerTasksSortedCursor {
+  sort: ServerTaskSort;
+  /**
+   * activity / activity_asc / created: the instant as stored, `YYYY-MM-DDTHH:MM:SS.ffffffZ`
+   * (microseconds: a millisecond ISO string would round, and the walk could
+   * skip or repeat a row); number: the task number.
+   */
+  key: string | number;
+  taskId: string;
+  channelId: string;
+}
+
+export function isServerTasksSortedCursor(cursor: ServerTasksPageCursor | ServerTasksSortedCursor): cursor is ServerTasksSortedCursor {
+  return "sort" in cursor;
+}
+
+function serverTaskSortKey(sort: ServerTaskSort): SQL {
+  switch (sort) {
+    case "activity":
+    case "activity_asc":
+      return taskActivityAt;
+    case "created":
+      return sql`${tasks.createdAt}`;
+    case "number":
+      return sql`${tasks.taskNumber}`;
+  }
+}
+
+/** The sort key as the cursor carries it (ServerTasksSortedCursor.key). */
+function serverTaskSortKeyText(sort: ServerTaskSort, key: SQL): SQL {
+  return sort === "number"
+    ? sql`(${key})::text`
+    : sql`to_char((${key}) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')`;
+}
+
+function serverTaskSortKeyValue(cursor: ServerTasksSortedCursor): SQL {
+  return cursor.sort === "number" ? sql`${cursor.key}::integer` : sql`${cursor.key}::timestamptz`;
+}
+
+type SortedServerTaskSurfaceRow = { position: number; taskId: string; sortKey: string };
+
+/**
+ * Whether the filters pin the rows to named people or agents (an
+ * assigned_to_me / created_by_me relation, an Assignee list without
+ * "unassigned", a Creator list): their rows are few and
+ * idx_tasks_claimed_by / idx_tasks_created_by reach them directly, so the
+ * sorted walk reads them in one join and sorts them (selectSortedServerTaskRows'
+ * "actor" shape). Without one, the per-channel LATERAL bounds a page; with
+ * one, it would scan each channel's sort index past every row that is not
+ * that actor's.
+ */
+function serverTaskFiltersPinActors(filters: ServerTaskFilters | undefined): boolean {
+  if (!filters) return false;
+  if (filters.relation === "assigned_to_me" || filters.relation === "created_by_me") return true;
+  if (filters.creators && filters.creators.length > 0) return true;
+  return Boolean(filters.assignees && filters.assignees.length > 0 && !filters.assignees.includes("unassigned"));
+}
+
+/**
+ * The SQL of a sorted walk's page: up to `limit` (task, surface) pairs in
+ * `sort`'s total order, strictly after `after`, as
+ * (position, taskId, sortKey). Every ORDER BY and keyset bound uses exactly
+ * the sort key expression (serverTaskSortKey; for activity
+ * COALESCE(last_activity_at, updated_at), the expression of
+ * idx_tasks_channel_activity), so the planner can read the index in order.
+ *
+ * Two shapes over the same row source and conditions as selectServerTaskRows:
+ *   per_channel  each channel of each surface reads its own top `limit` rows
+ *                (a LATERAL in the sort's order: idx_tasks_channel_activity /
+ *                idx_tasks_channel_created / idx_tasks_channel_number), and
+ *                the outer query merges them: at most limit rows per channel,
+ *                never the whole board;
+ *   actor        one join, sorted (serverTaskFiltersPinActors): the planner
+ *                reaches the named actor's rows through their index.
+ * Exported for the EXPLAIN tests.
+ */
+export function sortedServerTaskRowsQuery(
+  surfaces: TaskChannelSurface[],
+  filterConditions: SQL[],
+  sort: ServerTaskSort,
+  page: { after?: ServerTasksSortedCursor | null; limit?: number; shape: "per_channel" | "actor" },
+): SQL {
+  const key = serverTaskSortKey(sort);
+  // One direction for the key and both tie-breaks, so a btree on (channel,
+  // key, id) serves either: forward for one, backward for the other.
+  const ascending = isAscendingServerTaskSort(sort);
+  const dir = ascending ? sql.raw("ASC") : sql.raw("DESC");
+  const conditions: SQL[] = [sql`${tasks.channelId} = read_scope.id`, ...filterConditions];
+  if (page.after) {
+    // Strictly after (k, i, c) in (key, id, local_id), all DESC (or all ASC):
+    // the row comparison is the index-friendly bound, the NOT drops the
+    // cursor's own row and its copies on surfaces at or before c.
+    const k = serverTaskSortKeyValue(page.after);
+    const i = sql`${page.after.taskId}::uuid`;
+    if (ascending) {
+      conditions.push(sql`(${key}, ${tasks.id}) >= (${k}, ${i})`);
+      conditions.push(sql`NOT ((${key}, ${tasks.id}) = (${k}, ${i}) AND surface.local_id <= ${page.after.channelId}::uuid)`);
+    } else {
+      conditions.push(sql`(${key}, ${tasks.id}) <= (${k}, ${i})`);
+      conditions.push(sql`NOT ((${key}, ${tasks.id}) = (${k}, ${i}) AND surface.local_id >= ${page.after.channelId}::uuid)`);
+    }
+  }
+  const limit = page.limit != null ? sql` LIMIT ${page.limit}` : sql``;
+  if (page.shape === "actor") {
+    return sql`
+    SELECT (surface.position - 1) AS "position", ${tasks.id}::text AS "taskId", ${serverTaskSortKeyText(sort, key)} AS "sortKey"
+    FROM ${serverTaskSurfaceSource(surfaces)}
+    JOIN ${tasks} ON ${and(...conditions)}
+    ORDER BY ${key} ${dir}, ${tasks.id} ${dir}, surface.local_id ${dir}${limit}
+  `;
+  }
+  return sql`
+    SELECT (surface.position - 1) AS "position", picked.id::text AS "taskId", picked.sort_key AS "sortKey"
+    FROM ${serverTaskSurfaceSource(surfaces)}
+    CROSS JOIN LATERAL (
+      SELECT ${tasks.id} AS id, ${key} AS sort_value, ${serverTaskSortKeyText(sort, key)} AS sort_key
+      FROM ${tasks}
+      WHERE ${and(...conditions)}
+      ORDER BY ${key} ${dir}, ${tasks.id} ${dir}${limit}
+    ) AS picked
+    ORDER BY picked.sort_value ${dir}, picked.id ${dir}, surface.local_id ${dir}${limit}
+  `;
+}
+
+/** sortedServerTaskRowsQuery for a board read: the filters' conditions and shape. Exported for the EXPLAIN tests. */
+export function sortedServerTaskPageQuery(
+  surfaces: TaskChannelSurface[],
+  statusFilter: TaskStatus | undefined,
+  filters: ServerTaskFilters | undefined,
+  userId: string,
+  sort: ServerTaskSort,
+  page: { after?: ServerTasksSortedCursor | null; limit?: number },
+): SQL {
+  return sortedServerTaskRowsQuery(surfaces, serverTaskConditions(statusFilter, filters, userId), sort, {
+    ...page,
+    shape: serverTaskFiltersPinActors(filters) ? "actor" : "per_channel",
+  });
+}
+
+async function selectSortedServerTaskRows(
+  surfaces: TaskChannelSurface[],
+  statusFilter: TaskStatus | undefined,
+  filters: ServerTaskFilters | undefined,
+  userId: string,
+  sort: ServerTaskSort,
+  page: { after?: ServerTasksSortedCursor | null; limit?: number },
+): Promise<SortedServerTaskSurfaceRow[]> {
+  if (surfaces.length === 0) return [];
+  const result = await getDb().execute(sortedServerTaskPageQuery(surfaces, statusFilter, filters, userId, sort, page));
+  return result.rows.map((row) => ({
+    position: Number(row.position),
+    taskId: String(row.taskId),
+    sortKey: String(row.sortKey),
+  }));
+}
+
+/** The full rows of a sorted page, in its order; a task deleted since the first read drops out. */
+async function loadSortedServerTaskRows(picked: readonly SortedServerTaskSurfaceRow[]): Promise<ServerTaskSurfaceRow[]> {
+  if (picked.length === 0) return [];
+  const rows = await getDb().select().from(tasks).where(inArray(tasks.id, [...new Set(picked.map((row) => row.taskId))]));
+  const byId = new Map(rows.map((row) => [row.id, row]));
+  return picked.flatMap((row) => {
+    const task = byId.get(row.taskId);
+    return task ? [{ position: row.position, task }] : [];
+  });
+}
+
+/**
  * Small per-item projection for `detail=summary`: every field a task panel
  * needs to render a row, none of the unbounded text. `description` itself is
  * never selected into this shape; `hasDescription`/`descriptionBytes` let the
@@ -934,13 +1688,54 @@ export interface ServerTaskSummary {
   completedAt: string | null;
   createdAt: string;
   updatedAt: string;
+  /** As on the full row: the stored last_activity_at, null on a row last written before it existed. */
+  lastActivityAt: string | null;
+  /** As on the full row: lastActivityAt ?? updatedAt, the time `sort=activity` orders by. */
+  activityAt: string;
   isLegacy: boolean;
   source: "tasks" | "message";
   hasDescription: boolean;
   descriptionBytes: number;
+  /** As on the full row: the task v2 source message, else a pre-v2 task's host message. */
+  sourceMessageId: string | null;
+  /** As on the full row: whether `sourceMessageId` is a real source (false: "Source not recorded"). */
+  sourceRecorded: boolean;
+  /**
+   * Who sent the task v2 source message (`tasks.source_message_id`): what the
+   * `from_my_message` relation reads, so a client can place a live-updated row
+   * in the same tab the server counts it in. Null for a task without one (a
+   * pre-v2 task: its `sourceMessageId` above is the host-message fallback),
+   * and when that message was deleted or retracted.
+   */
+  sourceSenderType: "user" | "agent" | "external_projection" | null;
+  sourceSenderId: string | null;
+  /** As on the full row: messages in the task's discussion. */
+  conversationReplyCount: number;
 }
 
-function toServerTaskSummary(task: ServerTaskListItem): ServerTaskSummary {
+type ServerTaskSourceSender = { senderType: "user" | "agent" | "external_projection"; senderId: string };
+
+/**
+ * Senders of the rows' task v2 source messages, keyed by task id: one
+ * primary-key read per page. Deleted (retracted) messages are left out.
+ */
+async function loadServerTaskSourceSenders(rows: readonly TaskRow[]): Promise<Map<string, ServerTaskSourceSender>> {
+  const senders = new Map<string, ServerTaskSourceSender>();
+  const sourceIds = [...new Set(rows.map((row) => row.sourceMessageId).filter((id): id is string => Boolean(id)))];
+  if (sourceIds.length === 0) return senders;
+  const messageRows = await getDb()
+    .select({ id: messages.id, senderType: messages.senderType, senderId: messages.senderId })
+    .from(messages)
+    .where(and(inArray(messages.id, sourceIds), isNull(messages.deletedAt)));
+  const byMessage = new Map(messageRows.map((row) => [row.id, row]));
+  for (const row of rows) {
+    const message = row.sourceMessageId ? byMessage.get(row.sourceMessageId) : undefined;
+    if (message) senders.set(row.id, { senderType: message.senderType, senderId: message.senderId });
+  }
+  return senders;
+}
+
+function toServerTaskSummary(task: ServerTaskListItem, sourceSender: ServerTaskSourceSender | undefined): ServerTaskSummary {
   const descriptionBytes = task.description ? Buffer.byteLength(task.description, "utf8") : 0;
   return {
     id: task.id,
@@ -963,18 +1758,25 @@ function toServerTaskSummary(task: ServerTaskListItem): ServerTaskSummary {
     completedAt: task.completedAt,
     createdAt: task.createdAt,
     updatedAt: task.updatedAt,
+    lastActivityAt: task.lastActivityAt,
+    activityAt: task.activityAt,
     isLegacy: task.isLegacy,
     source: "tasks",
     hasDescription: descriptionBytes > 0,
     descriptionBytes,
+    sourceMessageId: task.sourceMessageId,
+    sourceRecorded: task.sourceRecorded,
+    sourceSenderType: sourceSender?.senderType ?? null,
+    sourceSenderId: sourceSender?.senderId ?? null,
+    conversationReplyCount: task.conversationReplyCount,
   };
 }
 
 /**
  * Paginated / summary read over exactly the same visibility set as
- * `listServerTasks` (non-archived channel|joint surfaces, per-channel access
- * check, joint storage projection, same status filter). Anything this returns
- * is a subset of what the legacy read returns, in the same order.
+ * `listServerTasks` (listServerTaskBoardChannelIds, joint storage projection,
+ * same status filter). Anything this returns is a subset of what the legacy
+ * read returns, in the same order.
  *
  * Differences from the legacy read, all opt-in from the route:
  * - `limit` bounds the page; one extra row (limit + 1 in the single tasks
@@ -985,6 +1787,11 @@ function toServerTaskSummary(task: ServerTaskListItem): ServerTaskSummary {
  *   walk refuses it: returns "invalid cursor" for the route to map to 400.
  *   The client's remedy is to restart pagination from the beginning.
  * - `detail: "summary"` projects each item down to `ServerTaskSummary`.
+ * - `filters` (ServerTaskFilters) narrow the rows; `countServerTasks` counts
+ *   the same rows. `filters.channelIds` narrows the walk's channels, so a
+ *   cursor from a walk with other channel filters may be refused as above.
+ * - `sort` walks the same rows in another order (listSortedServerTasksPage),
+ *   with its own cursor shape; a cursor of another walk is "invalid cursor".
  */
 export async function listServerTasksPage(
   serverId: string,
@@ -992,47 +1799,52 @@ export async function listServerTasksPage(
   userId: string,
   options: {
     limit?: number;
-    cursor?: ServerTasksPageCursor | null;
+    cursor?: ServerTasksPageCursor | ServerTasksSortedCursor | null;
     detail: "full" | "summary";
+    filters?: ServerTaskFilters;
+    /** A sorted walk (SERVER_TASK_SORTS); absent = the (channel, task number) walk. */
+    sort?: ServerTaskSort;
   },
-): Promise<{ tasks: (ServerTaskListItem | ServerTaskSummary)[]; nextCursor: ServerTasksPageCursor | null } | "invalid cursor"> {
-  const db = getDb();
-  const serverChannels = await db
-    .select({ id: channels.id })
-    .from(channels)
-    .where(and(
-      eq(channels.serverId, serverId),
-      or(eq(channels.type, "channel"), eq(channels.type, "joint")),
-      isNull(channels.archivedAt),
-    ))
-    .orderBy(asc(channels.name), asc(channels.id));
-
-  // A cursor naming a channel outside the candidate set can be refused
-  // before any visibility work.
-  if (options.cursor && !serverChannels.some((channel) => channel.id === options.cursor!.channelId)) {
+): Promise<{ tasks: (ServerTaskListItem | ServerTaskSummary)[]; nextCursor: ServerTasksPageCursor | ServerTasksSortedCursor | null } | "invalid cursor"> {
+  // A cursor resumes only the walk that produced it: a (channel, number)
+  // cursor under a sort, a sorted one without it or under another sort, is
+  // refused rather than read as a position in a different order.
+  const sortedCursor = options.cursor && isServerTasksSortedCursor(options.cursor) ? options.cursor : null;
+  if (options.cursor && (options.sort ? sortedCursor?.sort !== options.sort : sortedCursor)) {
     return "invalid cursor";
   }
-  const surfaces = await resolveVisibleServerTaskSurfaces(serverId, userId, serverChannels.map((channel) => channel.id));
+  if (options.sort) return listSortedServerTasksPage(serverId, statusFilter, userId, options.sort, { ...options, cursor: sortedCursor });
+  const cursor = options.cursor as ServerTasksPageCursor | null | undefined;
+
+  const boardChannelIds = narrowServerTaskBoard(await listServerTaskBoardChannelIds(serverId, userId), options.filters?.channelIds);
+
+  // A cursor naming a channel outside the board can be refused before any
+  // surface work.
+  if (cursor && !boardChannelIds.includes(cursor.channelId)) {
+    return "invalid cursor";
+  }
+  const surfaces = await resolveOrderedTaskSurfaces(serverId, boardChannelIds);
 
   let after: { position: number; taskNumber: number } | null = null;
-  if (options.cursor) {
+  if (cursor) {
     // Visible surfaces keep the candidate order, so the cursor channel's index
     // among them is its position in the total order. Not visible (access
     // revoked, no task surface) => unknowable position => refuse.
-    const position = surfaces.findIndex((surface) => surface.localChannel.id === options.cursor!.channelId);
+    const position = surfaces.findIndex((surface) => surface.localChannel.id === cursor.channelId);
     if (position === -1) return "invalid cursor";
-    after = { position, taskNumber: options.cursor.taskNumber };
+    after = { position, taskNumber: cursor.taskNumber };
   }
 
   const limit = options.limit;
   // `limit + 1`: the extra row is the witness for "another page exists" and
   // is never emitted on this page.
-  const rows = await selectServerTaskRows(surfaces, statusFilter, {
+  const rows = await selectServerTaskRows(surfaces, serverTaskConditions(statusFilter, options.filters, userId), {
     after,
     limit: limit != null ? limit + 1 : undefined,
   });
   const hasMore = limit != null && rows.length > limit;
-  const items = await projectServerTaskRows(surfaces, hasMore ? rows.slice(0, limit) : rows);
+  const pageRows = hasMore ? rows.slice(0, limit) : rows;
+  const items = await projectServerTaskRows(surfaces, pageRows);
 
   // The cursor resumes against `serverChannels`, whose ids are this server's
   // local channel ids — the same ids projection puts on the items — so the
@@ -1043,9 +1855,102 @@ export async function listServerTasksPage(
     : null;
 
   if (options.detail === "summary") {
-    return { tasks: items.map(toServerTaskSummary), nextCursor };
+    const sourceSenders = await loadServerTaskSourceSenders(pageRows.map((row) => row.task));
+    return { tasks: items.map((item) => toServerTaskSummary(item, sourceSenders.get(item.id))), nextCursor };
   }
   return { tasks: items, nextCursor };
+}
+
+/**
+ * listServerTasksPage's sorted walk: the same board, filters, enrichment and
+ * page contract, in `sort`'s order (SERVER_TASK_SORTS). Its cursor is
+ * ServerTasksSortedCursor.
+ */
+async function listSortedServerTasksPage(
+  serverId: string,
+  statusFilter: TaskStatus | undefined,
+  userId: string,
+  sort: ServerTaskSort,
+  options: {
+    limit?: number;
+    cursor: ServerTasksSortedCursor | null;
+    detail: "full" | "summary";
+    filters?: ServerTaskFilters;
+  },
+): Promise<{ tasks: (ServerTaskListItem | ServerTaskSummary)[]; nextCursor: ServerTasksSortedCursor | null }> {
+  const boardChannelIds = narrowServerTaskBoard(await listServerTaskBoardChannelIds(serverId, userId), options.filters?.channelIds);
+  const surfaces = await resolveOrderedTaskSurfaces(serverId, boardChannelIds);
+  const limit = options.limit;
+  // `limit + 1`: the extra row is the witness for "another page exists".
+  const picked = await selectSortedServerTaskRows(surfaces, statusFilter, options.filters, userId, sort, {
+    after: options.cursor,
+    limit: limit != null ? limit + 1 : undefined,
+  });
+  const hasMore = limit != null && picked.length > limit;
+  const pagePicked = hasMore ? picked.slice(0, limit) : picked;
+  const pageRows = await loadSortedServerTaskRows(pagePicked);
+  const items = await projectServerTaskRows(surfaces, pageRows);
+
+  // From the ordered read itself, not the reloaded row: a write between the
+  // two reads must not move the resume point.
+  const last = pagePicked[pagePicked.length - 1];
+  const nextCursor = hasMore && last
+    ? { sort, key: sort === "number" ? Number(last.sortKey) : last.sortKey, taskId: last.taskId, channelId: surfaces[last.position]!.localChannel.id }
+    : null;
+
+  if (options.detail === "summary") {
+    const sourceSenders = await loadServerTaskSourceSenders(pageRows.map((row) => row.task));
+    return { tasks: items.map((item) => toServerTaskSummary(item, sourceSenders.get(item.id))), nextCursor };
+  }
+  return { tasks: items, nextCursor };
+}
+
+/**
+ * Task v2: reply count of each task's discussion, one grouped query per kind:
+ *  - a task with its own conversation (`conversation_channel_id`): chat
+ *    messages in it (lifecycle lines are system rows and do not count);
+ *  - a pre-v2 task without one: replies in its host message's thread (the
+ *    discussion it has had so far, flag off or not yet moved).
+ * Keyed by task id; tasks without a discussion are absent (0).
+ */
+async function loadTaskConversationReplyCounts(
+  rows: readonly (typeof tasks.$inferSelect)[],
+  db: DatabaseExecutor,
+): Promise<Map<string, number>> {
+  const counts = new Map<string, number>();
+  const conversationIds = [...new Set(rows.map((t) => t.conversationChannelId).filter((id): id is string => Boolean(id)))];
+  if (conversationIds.length > 0) {
+    const countRows = await db
+      .select({ channelId: messages.channelId, replyCount: sql<number>`count(${messages.id})::int` })
+      .from(messages)
+      .where(and(inArray(messages.channelId, conversationIds), eq(messages.messageType, "chat")))
+      .groupBy(messages.channelId);
+    const byConversation = new Map(countRows.map((row) => [row.channelId, Number(row.replyCount)]));
+    for (const t of rows) {
+      if (t.conversationChannelId) counts.set(t.id, byConversation.get(t.conversationChannelId) ?? 0);
+    }
+  }
+  const hostIds = [...new Set(rows.filter((t) => !t.conversationChannelId).map((t) => t.messageId).filter((id): id is string => Boolean(id)))];
+  if (hostIds.length > 0) {
+    const countRows = await db
+      .select({
+        parentMessageId: channels.parentMessageId,
+        replyCount: sql<number>`count(${messages.id})::int`,
+      })
+      .from(channels)
+      .innerJoin(messages, eq(messages.channelId, channels.id))
+      .where(and(
+        inArray(channels.parentMessageId, hostIds),
+        eq(channels.type, "thread"),
+        isNull(channels.deletedAt),
+      ))
+      .groupBy(channels.parentMessageId);
+    const byHost = new Map(countRows.map((row) => [row.parentMessageId, Number(row.replyCount)]));
+    for (const t of rows) {
+      if (!t.conversationChannelId && t.messageId) counts.set(t.id, byHost.get(t.messageId) ?? 0);
+    }
+  }
+  return counts;
 }
 
 /**
@@ -1059,10 +1964,79 @@ export async function listServerTasksPage(
  * Keying it on the table instead would have flipped every new v1.4 task to the
  * LEGACY badge / read-only CLI marker / LegacyTaskPanel.
  */
+/**
+ * Pre-v2 tasks (a host message) whose source is a real request, keyed by task
+ * id; every other pre-v2 task has no recorded source (see sourceRecordedOf).
+ *
+ * A pre-v2 task's source is its host message (`source_message_id` = the host,
+ * or NULL before migration 0420; read-time fallback). That host is a real
+ * source when an existing message was converted into the task: its `created`
+ * event says `convertedFromMessage` (convertMessageToTask, send-as-task). A
+ * direct create posted the title as a brand-new message: the "source" is the
+ * task's own echo, so nothing that asked for the work was recorded. A task with
+ * no `created` event (legacy message tasks folded into the table) falls back to
+ * the host's sender: someone else's message was converted; the creator's own
+ * message is read as the echo.
+ */
+async function loadPreV2RecordedSources(rows: readonly (typeof tasks.$inferSelect)[], db: DatabaseExecutor): Promise<Set<string>> {
+  const recorded = new Set<string>();
+  const hosted = rows.filter(isPreV2HostedSource);
+  if (hosted.length === 0) return recorded;
+  const ids = hosted.map((row) => row.id);
+  const events = await db
+    .select({ taskId: taskEvents.taskId, converted: sql<boolean>`COALESCE(${taskEvents.payload} ->> 'convertedFromMessage' = 'true', false)` })
+    .from(taskEvents)
+    .where(and(inArray(taskEvents.taskId, ids), eq(taskEvents.eventType, "created")));
+  const withEvent = new Set<string>();
+  for (const event of events) {
+    withEvent.add(event.taskId);
+    if (event.converted) recorded.add(event.taskId);
+  }
+  const eventless = hosted.filter((row) => !withEvent.has(row.id));
+  if (eventless.length > 0) {
+    const hosts = await db
+      .select({ id: messages.id, senderType: messages.senderType, senderId: messages.senderId })
+      .from(messages)
+      .where(inArray(messages.id, eventless.map((row) => row.messageId!)));
+    const byId = new Map(hosts.map((host) => [host.id, host]));
+    for (const row of eventless) {
+      const host = byId.get(row.messageId!);
+      if (host && !(host.senderType === row.createdByType && host.senderId === row.createdById)) recorded.add(row.id);
+    }
+  }
+  return recorded;
+}
+
+/**
+ * Whether a task has a recorded source, the message that asked for the work
+ * ("A task must always have a source", #wg-task-v2:#23). A task v2 task has
+ * one when `source_message_id` is set (agents and the web always set it now;
+ * older ones may have none). A pre-v2 task: loadPreV2RecordedSources, read
+ * only where task v2 is on; with the flag off its host stays its source.
+ */
+function sourceRecordedOf(
+  row: typeof tasks.$inferSelect,
+  preV2Recorded: ReadonlySet<string>,
+  taskV2Servers: ReadonlySet<string>,
+  serverId: string | undefined,
+): boolean {
+  if (isPreV2HostedSource(row)) {
+    // Flag off: a pre-v2 task's host stands for its source, as before.
+    if (!serverId || !taskV2Servers.has(serverId)) return true;
+    return preV2Recorded.has(row.id);
+  }
+  return row.sourceMessageId !== null;
+}
+
+/** A pre-v2 task whose source is its host message (or unset: read-time fallback to it). */
+function isPreV2HostedSource(row: typeof tasks.$inferSelect): boolean {
+  return Boolean(row.messageId) && (row.sourceMessageId === null || row.sourceMessageId === row.messageId);
+}
+
 async function enrichTaskRows(
   rows: (typeof tasks.$inferSelect)[],
   executor: DatabaseExecutor = getDb(),
-  options: { includeCurrentProjection?: boolean } = {},
+  options: { includeCurrentProjection?: boolean; failClosedCurrentProjection?: boolean } = {},
 ) {
   if (rows.length === 0) return [];
   // Callers inside a transaction MUST pass `tx`: the assigned-create path holds
@@ -1089,7 +2063,7 @@ async function enrichTaskRows(
   const channelMap = new Map<string, {
     name: string;
     serverId: string;
-    type: "channel" | "private" | "joint" | "dm" | "thread";
+    type: TaskChannelType;
   }>();
 
   if (userIds.size > 0) {
@@ -1130,7 +2104,7 @@ async function enrichTaskRows(
       channelMap.set(channel.id, {
         name: channel.name,
         serverId: channel.serverId,
-        type: channel.type,
+        type: asTaskChannelType(channel.type),
       });
     }
   }
@@ -1156,21 +2130,20 @@ async function enrichTaskRows(
   const activeJointCreatorKeys = new Set<string>();
   const jointIds = [...jointIdByCanonicalChannel.values()];
   if (jointIds.length > 0 && userIds.size > 0) {
+    const permission=await resolveJointHumanEntrySql({jointIds},db);
     const jointHumanRows = await db
       .select({
         canonicalChannelId: jointChannels.canonicalChannelId,
-        userId: channelHumans.userId,
+        userId: users.id,
       })
       .from(jointChannels)
       .innerJoin(jointChannelServers, and(
         eq(jointChannelServers.jointChannelId, jointChannels.id),
         eq(jointChannelServers.status, "active"),
       ))
-      .innerJoin(channelHumans, and(
-        eq(channelHumans.channelId, jointChannelServers.localChannelId),
-        inArray(channelHumans.userId, [...userIds]),
-      ))
+      .innerJoin(users,inArray(users.id,[...userIds]))
       .where(and(
+        permission(jointChannelServers.localChannelId,users.id),
         inArray(jointChannels.id, jointIds),
         eq(jointChannels.status, "active"),
       ));
@@ -1194,6 +2167,7 @@ async function enrichTaskRows(
         inArray(channelAgents.agentId, [...agentIds]),
       ))
       .where(and(
+        sql`NOT (${jointMembershipRemovalPendingSql(jointChannels.id,"agent",channelAgents.agentId)})`,
         inArray(jointChannels.id, jointIds),
         eq(jointChannels.status, "active"),
       ));
@@ -1271,12 +2245,56 @@ async function enrichTaskRows(
   // reads it. Single-channel boards and task payloads keep it.
   const includeCurrentProjection = options.includeCurrentProjection ?? true;
   const currentProjections = includeCurrentProjection
-    ? await loadTaskCurrentProjectionsByTaskId(rows, db)
+    ? await loadTaskCurrentProjectionsByTaskId(rows, db, { failClosed: options.failClosedCurrentProjection })
     : new Map<string, never>();
+  const conversationReplyCounts = await loadTaskConversationReplyCounts(rows, db);
+  // Only where task v2 is on (the task's channel's server) is a pre-v2 echo
+  // "not recorded"; flag-off servers keep the host as the source, unread.
+  const hostedServerIds = [...new Set(rows.filter(isPreV2HostedSource).flatMap((t) => {
+    const serverId = channelMap.get(t.channelId)?.serverId;
+    return serverId ? [serverId] : [];
+  }))];
+  const taskV2Servers = new Set<string>();
+  for (const serverId of hostedServerIds) {
+    if (await isTaskV2ConversationsEnabled(serverId, db)) taskV2Servers.add(serverId);
+  }
+  const preV2RecordedSources = await loadPreV2RecordedSources(
+    rows.filter((t) => isPreV2HostedSource(t) && taskV2Servers.has(channelMap.get(t.channelId)?.serverId ?? "")),
+    db,
+  );
 
   return rows.map((t) => ({
     id: t.id,
+    // Pre-v2 host message (thread = earlier discussion). Task v2 tasks have
+    // none; the id fallback keeps the field's pre-v2 shape for old clients.
     messageId: t.messageId || t.id,
+    /** The real `tasks.message_id` (null for task v2 tasks). */
+    hostMessageId: t.messageId ?? null,
+    // A task from before task v2 hangs under its host message (read-time
+    // fallback: the task_source_message_id migration does not backfill).
+    sourceMessageId: t.sourceMessageId ?? t.messageId ?? null,
+    /**
+     * Whether `sourceMessageId` is a real source, the message that asked for
+     * the work. False for a task created without one, and for a pre-v2 task
+     * whose "source" is the message it was posted as (its own echo): clients
+     * show "Source not recorded" (sourceRecordedOf).
+     */
+    sourceRecorded: sourceRecordedOf(t, preV2RecordedSources, taskV2Servers, channelMap.get(t.channelId)?.serverId),
+    conversationReplyCount: conversationReplyCounts.get(t.id) ?? 0,
+    /**
+     * Task v2: the task's own (canonical) conversation, channels.type =
+     * 'task'. Null for a pre-v2 task that has not been written to since task
+     * v2 (its discussion is still `messageId`'s thread) and for every task on
+     * a flag-off server. A joint surface resolves its local conversation via
+     * POST /api/tasks/:id/conversation.
+     */
+    conversationChannelId: t.conversationChannelId ?? null,
+    /**
+     * Task v2: the discussion is the task's own conversation — it exists
+     * (conversationChannelId != null) or will be created on first use
+     * (ownConversation, conversationChannelId still null).
+     */
+    conversationAnchored: t.conversationChannelId != null || t.ownConversation,
     channelId: t.channelId,
     channelName: channelMap.get(t.channelId)?.name ?? null,
     channelType: channelMap.get(t.channelId)?.type ?? "channel",
@@ -1287,6 +2305,8 @@ async function enrichTaskRows(
     createdByType: t.createdByType,
     createdById: t.createdById,
     createdByName: nameMap.get(t.createdById) || "Unknown",
+    /** The creator's handle (`createdByName` is the display name); null when unresolved. */
+    createdByHandle: handleMap.get(t.createdById) ?? null,
     createdByMembershipStatus: creatorMembershipStatus(t),
     claimedByType: t.claimedByType ?? null,
     claimedById: t.claimedById ?? null,
@@ -1300,9 +2320,15 @@ async function enrichTaskRows(
     resourceExpiryFollowupId: t.resourceExpiryFollowupId,
     createdAt: t.createdAt.toISOString(),
     updatedAt: t.updatedAt.toISOString(),
+    /** The stored `last_activity_at`; null for a row last written before that column existed. */
+    lastActivityAt: t.lastActivityAt?.toISOString() ?? null,
+    /** The board's activity time, what `sort=activity` orders by: lastActivityAt, else updatedAt (taskActivityAt). */
+    activityAt: (t.lastActivityAt ?? t.updatedAt).toISOString(),
     revision: t.revision,
     ...(includeCurrentProjection ? { taskCurrentProjection: currentProjections.get(t.id) } : {}),
-    isLegacy: t.messageId == null,
+    // A true pre-message-task orphan: neither a host message nor its own
+    // conversation. Task v2 tasks (no host message) are not legacy.
+    isLegacy: t.messageId == null && t.conversationChannelId == null && !t.ownConversation,
   }));
 }
 
@@ -1362,6 +2388,41 @@ export async function resolveTaskByMessageId(messageId: string): Promise<TaskOwn
   return canonical ? { source: "tasks", row: canonical } : null;
 }
 
+/**
+ * What "claim by message id" means under task v2, where one chat message can
+ * carry several tasks (`tasks.source_message_id`):
+ *  - the id names exactly one task — a pre-v2 host message (`message_id`) or
+ *    a source message with a single task → claim that task;
+ *  - a source message carrying several tasks → ambiguous: the caller must
+ *    name one by number (`taskNumbers` ascending);
+ *  - no task → the caller keeps the convert-to-task behavior.
+ * Callers resolve the message inside the target channel first; task links
+ * are keyed by message id alone (like `resolveTaskByMessageId`).
+ */
+export type TaskClaimByMessageTarget =
+  | { kind: "task"; owner: TaskOwner }
+  | { kind: "ambiguous"; tasks: TaskRow[]; taskNumbers: number[] }
+  | { kind: "none" };
+
+export async function resolveClaimTargetByMessageId(messageId: string): Promise<TaskClaimByMessageTarget> {
+  if (!UUID_RE.test(messageId)) return { kind: "none" };
+  // A chat message matches the task it hosts (pre-v2 / converted) plus every
+  // task hanging under it (`source_message_id`); a converted host is both.
+  const rows = await getDb()
+    .select()
+    .from(tasks)
+    .where(or(eq(tasks.messageId, messageId), eq(tasks.sourceMessageId, messageId)))
+    .orderBy(asc(tasks.taskNumber));
+  if (rows.length === 0) return { kind: "none" };
+  if (rows.length === 1) return { kind: "task", owner: { source: "tasks", row: rows[0]! } };
+  return { kind: "ambiguous", tasks: rows, taskNumbers: rows.map((row) => row.taskNumber) };
+}
+
+/** Claim rejection for a message that carries several tasks. */
+export function describeAmbiguousClaimByMessage(taskNumbers: readonly number[]): string {
+  return `message has ${taskNumbers.length} tasks (${taskNumbers.map((n) => `#${n}`).join(", ")}) — claim one with --number`;
+}
+
 /** Get a single message-task by ID (message ID where taskStatus is not null). */
 export async function getTask(taskId: string) {
   return (await resolveTaskById(taskId))?.row ?? null;
@@ -1378,7 +2439,9 @@ export async function getTask(taskId: string) {
 function isOrphanTask(owner: TaskOwner): boolean {
   // P3: `owner.source` is always "tasks", so an orphan is simply a canonical
   // row with no host message.
-  return owner.row.messageId == null;
+  // Task v2: a task with its own conversation has a place to discuss changes.
+  // Task v2 tasks own their (lazily created) conversation before it exists.
+  return owner.row.messageId == null && owner.row.conversationChannelId == null && !owner.row.ownConversation;
 }
 
 /**
@@ -1398,6 +2461,20 @@ export async function getTaskByNumber(channelId: string, taskNumber: number) {
   const owner = await resolveTaskByNumber(channelId, taskNumber);
   if (!owner || isOrphanTask(owner)) return null;
   return owner.row;
+}
+
+/**
+ * Task v2, per-task mode (./taskV2Mode): which of these task numbers in the
+ * channel are v2 tasks (created the v2 way, or already with a conversation).
+ */
+export async function listV2TaskNumbers(channelId: string, taskNumbers: readonly number[]): Promise<Set<number>> {
+  const numbers = [...new Set(taskNumbers)];
+  if (numbers.length === 0) return new Set();
+  const rows = await getDb()
+    .select({ taskNumber: tasks.taskNumber, ownConversation: tasks.ownConversation, conversationChannelId: tasks.conversationChannelId })
+    .from(tasks)
+    .where(and(eq(tasks.channelId, channelId), inArray(tasks.taskNumber, numbers)));
+  return new Set(rows.filter(isV2Task).map((row) => row.taskNumber));
 }
 
 /** Get a canonical `tasks` row by channel ID + task number. */
@@ -1432,8 +2509,14 @@ async function recordTaskEvent(
     actorId,
     payload,
   }).returning();
+  // RFC 077: a person's task change rings their personal assistant (owner action).
+  if (actorType === "user" && actorId && OWNER_ACTION_TASK_EVENTS.has(eventType)) {
+    await recordAssistantOwnerTaskAction({ actorUserId: actorId, taskRowId }, tx);
+  }
   return event;
 }
+
+const OWNER_ACTION_TASK_EVENTS = new Set(["status_changed", "reopened", "closed", "assignee_changed"]);
 
 export type TaskAmendPatch = {
   title?: string;
@@ -1461,7 +2544,10 @@ export type TaskAmendmentResult = {
   };
 };
 
-const TASK_AMEND_MEMBERSHIP_ERROR = "only current channel members with post access can amend the card";
+export const TASK_AMEND_MEMBERSHIP_ERROR = "only current channel members with post access can amend the card";
+/** A stale `expectedRevision` or a lost revision CAS: nothing was written. */
+export const TASK_AMEND_STALE_REVISION_ERROR = "task changed concurrently; read the current card and retry";
+export const TASK_AMEND_NO_CHANGES_ERROR = "task amendment makes no changes";
 
 async function isTaskAmendActorChannelMember(
   executor: DatabaseExecutor,
@@ -1498,22 +2584,32 @@ async function isTaskAmendActorChannelMember(
  * record. The task row is the queryable current view; `task_events` is the
  * immutable history. Both commit in one transaction, and every write is
  * revision-CAS guarded so two editors cannot silently overwrite each other.
+ *
+ * `expectedRevision` (optional) is the caller's OCC token, as on `assignTask`:
+ * when supplied it must match the row read here, so an editor saving over a
+ * stale view loses (TASK_AMEND_STALE_REVISION_ERROR) instead of overwriting a
+ * concurrent change. Absent (the agent path), the read-then-CAS alone guards.
  */
 export async function amendTask(
   taskId: string,
   patch: TaskAmendPatch,
   requesterType: "user" | "agent",
   requesterId: string,
+  opts: { expectedRevision?: number; serverId?: string } = {},
 ): Promise<TaskAmendmentResult | string> {
+  const { serverId } = opts;
   const owner = await resolveTaskById(taskId);
   if (!owner) return "task not found";
-  if (owner.source !== "tasks" || owner.row.messageId == null) {
+  if (owner.source !== "tasks" || isOrphanTask(owner)) {
     return "legacy task cards cannot be amended";
   }
 
   const observed = owner.row;
   if (!await isTaskAmendActorChannelMember(getDb(), observed.channelId, requesterType, requesterId)) {
     return TASK_AMEND_MEMBERSHIP_ERROR;
+  }
+  if (opts.expectedRevision !== undefined && opts.expectedRevision !== observed.revision) {
+    return TASK_AMEND_STALE_REVISION_ERROR;
   }
 
   const changes: Partial<Record<"title" | "description", TaskAmendmentChange>> = {};
@@ -1526,7 +2622,7 @@ export async function amendTask(
     changes.description = { from: observed.description, to: patch.description };
     setFields.description = patch.description;
   }
-  if (Object.keys(changes).length === 0) return "task amendment makes no changes";
+  if (Object.keys(changes).length === 0) return TASK_AMEND_NO_CHANGES_ERROR;
 
   await failpoints.hit("server.task.amend.afterAuthorizationRead", {
     taskId,
@@ -1550,6 +2646,7 @@ export async function amendTask(
         ...setFields,
         revision: nextRevision,
         updatedAt: new Date(),
+        lastActivityAt: TASK_ACTIVITY_NOW,
       })
       .where(canonicalRevisionCas(observed))
       .returning();
@@ -1557,7 +2654,7 @@ export async function amendTask(
     if (!updated) {
       const [current] = await tx.select().from(tasks).where(eq(tasks.id, taskId));
       if (!current) return "task not found";
-      return "task changed concurrently; read the current card and retry";
+      return TASK_AMEND_STALE_REVISION_ERROR;
     }
 
     const payload = { revision: nextRevision, changes };
@@ -1580,7 +2677,7 @@ export async function amendTask(
         payload,
       },
     };
-  });
+  }, { type: requesterType, id: requesterId, serverId });
 }
 
 export type TaskHistoryEvent = {
@@ -1597,7 +2694,7 @@ export type TaskHistoryEvent = {
 export async function listTaskHistory(taskId: string): Promise<TaskHistoryEvent[] | string> {
   const owner = await resolveTaskById(taskId);
   if (!owner) return "task not found";
-  if (owner.source !== "tasks" || owner.row.messageId == null) {
+  if (owner.source !== "tasks" || isOrphanTask(owner)) {
     return "legacy task cards do not have canonical history";
   }
 
@@ -1634,7 +2731,7 @@ export async function createTasks(
   channelId: string,
   createdByType: "user" | "agent",
   createdById: string,
-  items: { title: string; description?: string; createsResource?: boolean }[],
+  items: TaskCreateItem[],
   opts: {
     /**
      * Runs on the creating transaction after every row is written and before
@@ -1645,13 +2742,27 @@ export async function createTasks(
       executor: DatabaseExecutor,
       result: { tasks: Awaited<ReturnType<typeof enrichTaskRows>>; hostMessages: MessageRow[] },
     ) => Promise<void>;
+    /**
+     * The server whose local channel the request came through (task v2 flag
+     * gate). Defaults to the storage channel's server, which is right for
+     * every non-joint channel.
+     */
+    initiatingServerId?: string;
+    /**
+     * The status every task starts in (`TASK_CREATE_STATUSES`); default todo.
+     * An unassigned in_progress task has no claimant, so claimedAt stays null.
+     */
+    initialStatus?: TaskCreateStatus;
   } = {},
 ) {
-  if (items.length === 0) return { tasks: [], hostMessages: [] };
+  if (items.length === 0) return { tasks: [], hostMessages: [], hostMessagesVisible: false };
+  assertTaskCreateStatus(opts.initialStatus);
+  const initialStatus = resolveTaskCreateStatus(opts.initialStatus, "none");
   const db = getDb();
 
   // Use a transaction with advisory lock on channel to prevent task number collisions
   const created = await withTaskChannelWriter(channelId, async (tx) => {
+    await lockJointTaskWriteAuthority(tx, channelId, { type: createdByType, id: createdById, serverId: opts.initiatingServerId });
     // Advisory lock keyed on channel UUID to serialize task number allocation
     await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${channelId}))`);
 
@@ -1670,40 +2781,26 @@ export async function createTasks(
       ))
       .for("update");
     if (!channel) throw new Error("Task channel is unavailable");
-    // Check both messages and legacy tasks tables to avoid number collisions
-    const [{ maxMsgNum }] = await tx
-      .select({ maxMsgNum: sql<number>`COALESCE(MAX(${messages.taskNumber}), 0)` })
-      .from(messages)
-      .where(eq(messages.channelId, channelId));
+    // Numbers past every message, task and deleted task (never reused).
+    let nextNum = await reserveTaskNumbers(tx, channelId, items.length);
 
-    // No catch: inside this transaction a failed query has already aborted it
-    // in Postgres, so continuing could only fail later with 25P02 (and the
-    // tasks table is canonical now, so "legacy table missing" cannot happen).
-    const [row] = await tx
-      .select({ maxLegacyNum: sql<number>`COALESCE(MAX(${tasks.taskNumber}), 0)` })
-      .from(tasks)
-      .where(eq(tasks.channelId, channelId));
-    const maxLegacyNum = row?.maxLegacyNum ?? 0;
+    const initiatingServerId = opts.initiatingServerId ?? channel.serverId;
+    const { conversations } = await resolveTaskConversationMode(tx, initiatingServerId, items, initialStatus);
+    await assertTaskSourceMessages(tx, channelId, channel.type, items);
 
-    let nextNum = Math.max(maxMsgNum ?? 0, maxLegacyNum) + 1;
-
-    // v1.4 (tasks-table-canonical): the host message is a PLAIN channel message
-    // (no task_status) that serves as display/thread anchor; the task fact lives
-    // in the canonical `tasks` table, linked by messageId. New tasks are never
-    // written into messages.task_*, so they never form a dual representation.
-    const hostValues = items.map((item) => ({
-      channelId,
-      senderType: createdByType as "user" | "agent",
-      senderId: createdById,
-      messageType: "chat" as const,
-      content: item.title,
-    }));
-    const hostMessages = await tx.insert(messages).values(hostValues).returning();
+    // Task v2 (flag on): no message at all — each task gets its own
+    // conversation (channels.type = 'task') below; `source_message_id` = the
+    // chat message the task hangs under, if any. Flag off: the pre-v2 visible
+    // host message, whose thread is the discussion and which is also the
+    // task's source message. The task fact lives only in `tasks` either way.
+    const hostMessages = conversations
+      ? []
+      : await tx.insert(messages).values(taskHostMessageValues(channelId, createdByType, createdById, items)).returning();
 
     const taskRows: (typeof tasks.$inferSelect)[] = [];
     for (let i = 0; i < items.length; i++) {
       const item = items[i];
-      const host = hostMessages[i];
+      const host = hostMessages[i] ?? null;
       const [taskRow] = await tx
         .insert(tasks)
         .values({
@@ -1711,41 +2808,60 @@ export async function createTasks(
           taskNumber: nextNum++,
           title: item.title,
           description: item.description ?? null,
-          status: "todo",
+          status: initialStatus,
           requiresResourceReceipt: item.createsResource === true,
           createdByType,
           createdById,
-          messageId: host.id,
+          messageId: host?.id ?? null,
+          sourceMessageId: host ? host.id : item.sourceMessageId ?? null,
+          // Task v2: its discussion is its own (lazily created) conversation.
+          ownConversation: conversations,
+          lastActivityAt: TASK_ACTIVITY_NOW,
         })
         .returning();
       await recordTaskEvent(tx, taskRow.id, "created", createdByType, createdById, {
         taskNumber: taskRow.taskNumber,
-        status: "todo",
+        status: initialStatus,
         requiresResourceReceipt: taskRow.requiresResourceReceipt,
       });
       taskRows.push(taskRow);
     }
 
+    // Task v2: the task's conversation is created lazily, like a thread, by
+    // the first action that needs it (reply, follow, lifecycle line, …;
+    // taskConversationService.ensureTaskConversation), which also makes the
+    // creator and the assignee follow it.
+
     if (opts.beforeCommit) {
       const enrichedInTransaction = await enrichTaskRows(taskRows, tx);
       await opts.beforeCommit(tx, { tasks: enrichedInTransaction, hostMessages });
-      return { hostMessages, taskRows, enrichedInTransaction };
+      return { hostMessages, taskRows, enrichedInTransaction, conversations };
     }
-    return { hostMessages, taskRows, enrichedInTransaction: null };
+    return { hostMessages, taskRows, enrichedInTransaction: null, conversations };
   });
 
-  const { recordInboxFactsForPersistedMessages } = await import("./messageService");
-  await recordInboxFactsForPersistedMessages(created.hostMessages, {
-    inboxFactPolicy: {
-      mode: "record",
-      producer: "task.body",
-      reason: "task body messages are durable shared work items and count as channel activity",
-    },
-    dedupeLogicalReceiverAcrossJointProjections: true,
-  });
+  if (!created.conversations) {
+    // Pre-v2 visible host messages are channel activity.
+    const { recordInboxFactsForPersistedMessages } = await import("./messageService");
+    await recordInboxFactsForPersistedMessages(created.hostMessages, {
+      inboxFactPolicy: {
+        mode: "record",
+        producer: "task.body",
+        reason: "task body messages are durable shared work items and count as channel activity",
+      },
+      dedupeLogicalReceiverAcrossJointProjections: true,
+    });
+  }
+  // Task v2 (flag on): there is no message, so no inbox fact, and the routes
+  // post no `task.created_summary` either — creating a task posts nothing in
+  // the channel (spec §2, §4).
 
   const enrichedTasks = created.enrichedInTransaction ?? await enrichTaskRows(created.taskRows);
-  return { tasks: enrichedTasks, hostMessages: created.hostMessages };
+  return {
+    tasks: enrichedTasks,
+    hostMessages: created.hostMessages,
+    hostMessagesVisible: !created.conversations,
+  };
 }
 
 const TASK_SYSTEM_MESSAGE_SUMMARY_MAX = 80;
@@ -1764,11 +2880,20 @@ export async function createTasksWithAssignmentReceipt(
   channelId: string,
   createdByType: "user" | "agent",
   createdById: string,
-  items: { title: string; description?: string; createsResource?: boolean }[],
+  items: TaskCreateItem[],
   assignee: TaskCreationAssignee,
   receiptRequest: TaskAssignmentReceiptRequest,
   opts: {
     initiatingLocalChannelId?: string;
+    /**
+     * The status every task starts in (`TASK_CREATE_STATUSES`). Omitted: the
+     * behaviour from before statuses could be chosen — assigning yourself
+     * starts the work, assigning someone else reserves a todo for them.
+     * in_progress for someone else starts it for them (claimedAt stamped, as a
+     * start); todo for yourself reserves it for later (claimedAt null), and so
+     * does backlog for anyone.
+     */
+    initialStatus?: TaskCreateStatus;
     /**
      * Runs on the creating transaction after the tasks and the assignment
      * receipt are written and before it commits. A rejection rolls the whole
@@ -1779,19 +2904,33 @@ export async function createTasksWithAssignmentReceipt(
       result: {
         tasks: Awaited<ReturnType<typeof enrichTaskRows>>;
         hostMessages: MessageRow[];
-        assignmentReceipt: TaskAssignmentReceipt;
+        assignmentReceipt: TaskAssignmentReceipt | null;
       },
     ) => Promise<void>;
   } = {},
 ): Promise<{
   tasks: Awaited<ReturnType<typeof enrichTaskRows>>;
   hostMessages: MessageRow[];
-  assignmentReceipt: TaskAssignmentReceipt;
+  /** Pre-v2 visible host messages (flag off): the caller broadcasts and delivers them. */
+  hostMessagesVisible: boolean;
+  /**
+   * The channel assignment receipt (flag off). Null with task v2
+   * conversations on: creating a task posts nothing in the channel, and the
+   * caller announces the assignment in each task's own conversation instead
+   * (`taskConversationNotice.announceTaskCreationAssignment`), which mentions
+   * the assignee exactly like a later assign.
+   */
+  assignmentReceipt: TaskAssignmentReceipt | null;
 }> {
   if (items.length === 0) throw new Error("Assigned task creation requires at least one task");
+  assertTaskCreateStatus(opts.initialStatus);
   const db = getDb();
 
   return withTaskChannelWriter(channelId, async (tx) => {
+    const entryServer = opts.initiatingLocalChannelId
+      ? (await tx.select({ serverId: channels.serverId }).from(channels).where(eq(channels.id,opts.initiatingLocalChannelId)))[0]?.serverId
+      : undefined;
+    await lockJointTaskWriteAuthority(tx, channelId, { type: createdByType, id: createdById, serverId: entryServer });
     await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${channelId}))`);
 
     // Establish the immutable server/type lookup without taking the channel
@@ -1811,7 +2950,8 @@ export async function createTasksWithAssignmentReceipt(
       ));
     if (!channelSnapshot) throw new Error("Task channel is unavailable");
     const jointRequest = opts.initiatingLocalChannelId !== undefined;
-    if (channelSnapshot.type === "thread" || (channelSnapshot.type === "joint" && !jointRequest)) {
+    // A sub-conversation (thread, task conversation) never holds tasks.
+    if (isSubConversationType(channelSnapshot.type) || (channelSnapshot.type === "joint" && !jointRequest)) {
       throw new AssignedTaskCreationChannelError();
     }
     if (!jointRequest && !await lockTaskCreationAssigneeIdentity(tx, channelSnapshot.serverId, assignee)) {
@@ -1843,38 +2983,35 @@ export async function createTasksWithAssignmentReceipt(
       throw new TaskCreationAssigneeEligibilityError();
     }
 
-    const [{ maxMsgNum }] = await tx
-      .select({ maxMsgNum: sql<number>`COALESCE(MAX(${messages.taskNumber}), 0)` })
-      .from(messages)
-      .where(eq(messages.channelId, channelId));
-
-    // No catch: inside this transaction a failed query has already aborted it
-    // in Postgres, so continuing could only fail later with 25P02 (and the
-    // tasks table is canonical now, so "legacy table missing" cannot happen).
-    const [row] = await tx
-      .select({ maxLegacyNum: sql<number>`COALESCE(MAX(${tasks.taskNumber}), 0)` })
-      .from(tasks)
-      .where(eq(tasks.channelId, channelId));
-    const maxLegacyNum = row?.maxLegacyNum ?? 0;
-
-    let nextNum = Math.max(maxMsgNum ?? 0, maxLegacyNum) + 1;
-    const startsAssignedWork = assignee.type === createdByType && assignee.id === createdById;
+    // Numbers past every message, task and deleted task (never reused).
+    let nextNum = await reserveTaskNumbers(tx, channelId, items.length);
+    const selfAssigned = assignee.type === createdByType && assignee.id === createdById;
+    const initialStatus = resolveTaskCreateStatus(opts.initialStatus, selfAssigned ? "self" : "other");
+    // A task created in progress is started (claimedAt stamped, as a start
+    // does), whoever it is assigned to; a todo is reserved, not started.
+    const startsAssignedWork = initialStatus === "in_progress";
     const claimedAt = startsAssignedWork ? currentDate() : null;
-    const initialStatus = startsAssignedWork ? "in_progress" as const : "todo" as const;
 
-    // v1.4 (tasks-table-canonical): plain host messages + canonical tasks rows.
-    // The assignee and status live on the task row, not messages.task_*.
-    const created = await tx.insert(messages).values(items.map((item) => ({
-      channelId,
-      senderType: createdByType,
-      senderId: createdById,
-      messageType: "chat" as const,
-      content: item.title,
-    }))).returning();
+    // The initiating server gates task v2 (a joint storage channel lives on
+    // the shared joint storage server).
+    const initiatingServerId = jointRouting
+      ? jointRouting.projections.find((projection) => projection.localChannelId === opts.initiatingLocalChannelId)?.serverId
+        ?? channel.serverId
+      : channel.serverId;
+    const { conversations } = await resolveTaskConversationMode(tx, initiatingServerId, items, initialStatus);
+    await assertTaskSourceMessages(tx, channelId, channel.type, items);
+
+    // Task v2 (flag on): no message; each task gets its own conversation
+    // below. Flag off: the pre-v2 visible host messages (see createTasks).
+    // Canonical tasks rows either way; the assignee and status live on the
+    // task row.
+    const created = conversations
+      ? []
+      : await tx.insert(messages).values(taskHostMessageValues(channelId, createdByType, createdById, items)).returning();
 
     const taskRows: (typeof tasks.$inferSelect)[] = [];
     for (let i = 0; i < items.length; i++) {
-      const host = created[i];
+      const host = created[i] ?? null;
       const [taskRow] = await tx
         .insert(tasks)
         .values({
@@ -1889,7 +3026,11 @@ export async function createTasksWithAssignmentReceipt(
           claimedByType: assignee.type,
           claimedById: assignee.id,
           claimedAt,
-          messageId: host.id,
+          messageId: host?.id ?? null,
+          sourceMessageId: host ? host.id : items[i].sourceMessageId ?? null,
+          // Task v2: its discussion is its own (lazily created) conversation.
+          ownConversation: conversations,
+          lastActivityAt: TASK_ACTIVITY_NOW,
         })
         .returning();
       await recordTaskEvent(tx, taskRow.id, "created", createdByType, createdById, {
@@ -1906,8 +3047,26 @@ export async function createTasksWithAssignmentReceipt(
 
     await failpoints.hit("server.task.assignedCreate.afterTaskRows", {
       channelId,
-      taskIds: created.map((task) => task.id),
+      taskIds: taskRows.map((task) => task.id),
     }, async () => undefined);
+
+    // Task v2 (flag on): nothing is posted in the channel — no host message,
+    // no assignment receipt — so the channel gains no activity, and no
+    // conversation is created here. The caller announces the assignment in
+    // each task's conversation after commit (one personal notification);
+    // that first line creates the conversation lazily, and its creation makes
+    // the creator (`authored`) and the assignee (`assigned`) follow it.
+    if (conversations) {
+      const enrichedConversations = await enrichTaskRows(taskRows, tx);
+      const conversationResult = {
+        tasks: enrichedConversations,
+        hostMessages: created,
+        hostMessagesVisible: false,
+        assignmentReceipt: null,
+      };
+      if (opts.beforeCommit) await opts.beforeCommit(tx, conversationResult);
+      return conversationResult;
+    }
 
     await tx.update(userChannelInboxStates)
       .set({ doneAt: null, updatedAt: currentDate() })
@@ -1916,6 +3075,9 @@ export async function createTasksWithAssignmentReceipt(
         isNotNull(userChannelInboxStates.doneAt),
       ));
 
+    // Pre-v2 host messages are channel activity, recorded in this transaction
+    // as before; the assignment receipt below is the durable, visible
+    // attention record.
     const messageService = await import("./messageService");
     await messageService.recordInboxFactsForPersistedMessages(created, {
       inboxFactPolicy: {
@@ -1936,7 +3098,9 @@ export async function createTasksWithAssignmentReceipt(
       taskIds: created.map((task) => task.id),
     }, async () => undefined);
 
-    const state = startsAssignedWork ? "started" as const : "assigned" as const;
+    // "started" reads "@x started …": only true when the creator started its
+    // own work. Starting it for someone else is still their assignment.
+    const state = startsAssignedWork && selfAssigned ? "started" as const : "assigned" as const;
     const assigneeRef = `@${receiptRequest.assigneeName}`;
     const taskList = taskRows
       .map((task) => `task #${task.taskNumber} "${summarizeTaskTitle(task.title)}"`)
@@ -2008,6 +3172,7 @@ export async function createTasksWithAssignmentReceipt(
     const result = {
       tasks: enriched,
       hostMessages: created,
+      hostMessagesVisible: true,
       assignmentReceipt: {
         message: receiptMessage,
         content: receiptContent,
@@ -2020,7 +3185,7 @@ export async function createTasksWithAssignmentReceipt(
   });
 }
 
-/** Claim a task (set assignee). Does not require specific status. If status is todo, auto-advances to in_progress. */
+/** Claim a task (set assignee). Does not require specific status. If status is todo or backlog, auto-advances to in_progress. */
 export interface TaskClaimOutcome {
   result: TaskMutationResult;
   /** Present only when the failure was an assignment-held conflict; built by
@@ -2032,10 +3197,11 @@ export async function claimTaskDetailed(
   taskId: string,
   claimedByType: "user" | "agent",
   claimedById: string,
+  serverId?: string,
 ): Promise<TaskClaimOutcome> {
   const owner = await resolveTaskById(taskId);
   if (!owner) return { result: "task not found" };
-  const written = await withTaskWriter(owner.row, (tx) => writeCanonicalClaim(tx, owner.row, claimedByType, claimedById));
+  const written = await withTaskWriter(owner.row, (tx) => writeCanonicalClaim(tx, owner.row, claimedByType, claimedById), { type: claimedByType, id: claimedById, serverId });
   if (isTaskClaimRejection(written)) {
     // Deterministic seam for the temporal-congruence tooth: state may change
     // here (between the writer forming its rejection and this function
@@ -2051,8 +3217,9 @@ export async function claimTask(
   taskId: string,
   claimedByType: "user" | "agent",
   claimedById: string,
+  serverId?: string,
 ): Promise<TaskMutationResult> {
-  return (await claimTaskDetailed(taskId, claimedByType, claimedById)).result;
+  return (await claimTaskDetailed(taskId, claimedByType, claimedById, serverId)).result;
 }
 
 /**
@@ -2070,7 +3237,17 @@ export async function claimTask(
  * existing call sites and their narrowing stay unchanged.
  */
 export type TaskMutationResult =
-  | { source: "tasks"; row: TaskRow }
+  | {
+    source: "tasks";
+    row: TaskRow;
+    /**
+     * Nothing was written: a status write asked a task v2 task already in
+     * in_progress for in_review, which it stores as in_progress. Success
+     * for older clients that still send in_review; callers post no
+     * lifecycle line for it.
+     */
+    unchanged?: true;
+  }
   | string;
 
 function wrapCanonical(result: TaskRow | string): TaskMutationResult {
@@ -2112,7 +3289,8 @@ export async function batchClaimTasks(
         // Orphans stay unreachable from the agent surface — same reason and
         // same wording as `getTaskByNumber`. Before v1.4 this query ran against
         // `messages` alone, so an orphan produced exactly this result.
-        if (canonical.messageId == null) {
+        // Task v2 tasks have no host message but their own conversation.
+        if (canonical.messageId == null && canonical.conversationChannelId == null && !canonical.ownConversation) {
           results.push({ taskNumber: num, success: false, reason: "task not found" });
           continue;
         }
@@ -2148,10 +3326,11 @@ export async function unclaimTask(
   taskId: string,
   requesterType: "user" | "agent",
   requesterId: string,
+  serverId?: string,
 ): Promise<TaskMutationResult> {
   const owner = await resolveTaskById(taskId);
   if (!owner) return "task not found";
-  return wrapCanonical(await withTaskWriter(owner.row, (tx) => writeCanonicalUnclaim(tx, owner.row, requesterType, requesterId)));
+  return wrapCanonical(await withTaskWriter(owner.row, (tx) => writeCanonicalUnclaim(tx, owner.row, requesterType, requesterId), { type: requesterType, id: requesterId, serverId }));
 }
 
 /**
@@ -2160,8 +3339,8 @@ export async function unclaimTask(
  * This is the v1.4 successor to "claim", and it is deliberately NOT a superset
  * of it:
  *
- *  - **`claim` assigns self AND advances `todo -> in_progress`.** Claiming means
- *    "I am starting this."
+ *  - **`claim` assigns self AND advances `todo` or `backlog -> in_progress`.**
+ *    Claiming means "I am starting this."
  *  - **`assign` only moves the assignee.** Handing work to someone else must not
  *    assert on their behalf that it has started. This asymmetry is the point,
  *    not an oversight -- see the tests that pin it.
@@ -2181,12 +3360,20 @@ export async function unclaimTask(
  * match the row we read, so a client acting on a stale view loses instead of
  * silently overwriting a concurrent assignment.
  */
+/** assignTask's refusal of a reason with an unchanged assignee (a backstop; the routes check first). */
+export const TASK_ASSIGN_REASON_UNCHANGED_ERROR = TASK_ASSIGN_REASON_UNCHANGED_MESSAGE;
+
 export async function assignTask(
   taskId: string,
   assignee: TaskCreationAssignee | null,
   actorType: "user" | "agent",
   actorId: string,
-  opts: { expectedRevision?: number } = {},
+  opts: {
+    expectedRevision?: number;
+    serverId?: string;
+    /** Handing it to someone else: what it waits on them for, already normalized (`checkTaskAssignReason`). */
+    reason?: string;
+  } = {},
 ): Promise<TaskMutationResult> {
   const owner = await resolveTaskById(taskId);
   if (!owner) return "task not found";
@@ -2202,7 +3389,12 @@ export async function assignTask(
   const sameAssignee = assignee
     ? observed.claimedByType === assignee.type && observed.claimedById === assignee.id
     : observed.claimedById === null;
-  if (sameAssignee) return wrapCanonical(observed);
+  if (sameAssignee) {
+    // A reason has nowhere to go when nothing changes: say so rather than drop
+    // it (the routes word this with the task and handle first).
+    if (assignee && opts.reason) return TASK_ASSIGN_REASON_UNCHANGED_ERROR;
+    return wrapCanonical(observed);
+  }
 
   return wrapCanonical(await withTaskWriter(observed, async (tx) => {
     const [channel] = await tx
@@ -2242,6 +3434,7 @@ export async function assignTask(
         revision: observed.revision + 1,
         // Use the shared clock seam so tests can control this write.
         updatedAt: currentDate(),
+        lastActivityAt: TASK_ACTIVITY_NOW,
       })
       .where(and(
         canonicalRevisionCas(observed),
@@ -2261,23 +3454,57 @@ export async function assignTask(
       assigneeId: assignee?.id ?? null,
       previousAssigneeType: observed.claimedByType,
       previousAssigneeId: observed.claimedById,
+      ...(assignee && opts.reason && { reason: opts.reason }),
     });
     return updated;
-  }));
+  }, { type: actorType, id: actorId, serverId: opts.serverId }));
 }
 
-/** Update task status. Validates transition. Assignee or admin can update. Sets completedAt when transitioning to done. */
+/** Where a status write came from, for the task v2 rules (`taskV2StoredStatus`). */
+export type TaskStatusWriteContext = {
+  /**
+   * The server whose surface the request came through: its
+   * `task_v2_conversations_v0` decides whether a pre-v2 task counts as task
+   * v2 (`taskUsesOwnConversation`). Absent: `serverId`, else the server that
+   * owns the task's storage channel.
+   */
+  initiatingServerId?: string | null;
+  /** A move into backlog: what would bring it back, already normalized (`checkTaskStatusReason`). */
+  backlogReason?: string;
+};
+
+/**
+ * Update task status. Sets completedAt when transitioning to done.
+ *
+ * Task v2: `in_review` is retired for task v2 tasks; asking for it stores
+ * `in_progress` (assignee unchanged). The returned row is what was stored, so
+ * callers must report `row.status`, not the requested status. `backlog` is task
+ * v2 only; asking for it on any other task throws `TaskStatusNotAvailableError`.
+ */
 export async function updateTaskStatus(
   taskId: string,
   newStatus: TaskStatus,
   requesterId: string,
   requesterType?: "user" | "agent",
+  serverId?: string,
+  context: TaskStatusWriteContext = {},
 ): Promise<TaskMutationResult> {
   const owner = await resolveTaskById(taskId);
   if (!owner) return "task not found";
-  return wrapCanonical(
-    await writeCanonicalStatus(owner.row, newStatus, { requesterId, requesterType }),
+  return wrapCanonicalStatus(
+    await writeCanonicalStatus(owner.row, newStatus, {
+      requesterId,
+      requesterType,
+      serverId,
+      initiatingServerId: context.initiatingServerId,
+      backlogReason: context.backlogReason,
+    }),
   );
+}
+
+function wrapCanonicalStatus(result: TaskRow | string | CanonicalStatusUnchanged): TaskMutationResult {
+  if (typeof result === "object" && "unchanged" in result) return { source: "tasks", row: result.unchanged, unchanged: true };
+  return wrapCanonical(result);
 }
 
 /** Force update task status (admin/owner override). Skips assignee check. */
@@ -2300,13 +3527,18 @@ export async function forceUpdateTaskStatus(
   newStatus: TaskStatus,
   actorType: "user" | "agent",
   actorId: string,
+  serverId?: string,
+  context: TaskStatusWriteContext = {},
 ): Promise<TaskMutationResult> {
   const owner = await resolveTaskById(taskId);
   if (!owner) return "task not found";
-  return wrapCanonical(await writeCanonicalStatus(owner.row, newStatus, {
+  return wrapCanonicalStatus(await writeCanonicalStatus(owner.row, newStatus, {
     force: true,
     requesterType: actorType,
     requesterId: actorId,
+    serverId,
+    initiatingServerId: context.initiatingServerId,
+    backlogReason: context.backlogReason,
   }));
 }
 
@@ -2327,6 +3559,8 @@ export async function convertMessageToTask(
   convertedById: string,
   expectedChannelId?: string,
   executor?: DatabaseExecutor,
+  /** The Joint entry server the caller already locked (a send-as-task). */
+  entryServerId?: string,
 ): Promise<TaskRow | string> {
   const db = executor ?? getDb();
 
@@ -2337,48 +3571,90 @@ export async function convertMessageToTask(
   // Validate channel ownership if expected channel is provided
   if (expectedChannelId && msg.channelId !== expectedChannelId) return "message not in this channel";
 
+  // Already a task host — checked before the shape rejections below.
+  if (msg.taskStatus !== null) return "already converted";
+  // A pre-v2 host message is already its task.
+  const [existingLink] = await db.select({ id: tasks.id }).from(tasks).where(eq(tasks.messageId, messageId));
+  if (existingLink) return "already converted";
+
   const [channel] = await db
-    .select({ type: channels.type })
+    .select({ type: channels.type, serverId: channels.serverId })
     .from(channels)
     .where(eq(channels.id, msg.channelId));
   if (!channel) return "channel not found";
-  if (channel.type === "thread") return "thread messages cannot be claimed as tasks";
+  // A message in a sub-conversation (a thread, a task's own conversation)
+  // never becomes a task: no task nests in another task.
+  if (isSubConversationType(channel.type)) return "thread messages cannot be claimed as tasks";
   if (msg.senderType === "external_projection") {
     return "external projection messages cannot be claimed as tasks";
   }
   if (msg.messageType === "system")
     return "system messages cannot be claimed as tasks — if the message describes an action you should take, just do it; otherwise ignore it. Don't claim.";
 
-  // Check if already a task — either the legacy message-task shape, or a v1.4
-  // canonical tasks-table row already linked to this message.
-  if (msg.taskStatus !== null) return "already converted";
-  const [existingLink] = await db.select().from(tasks).where(eq(tasks.messageId, messageId));
-  if (existingLink) return "already converted";
-
   // v1.4 (tasks-table-canonical): create a canonical tasks row linked to the
   // message; the message itself stays a plain message (task_status untouched).
   const created = await withTaskChannelWriter(msg.channelId, async (tx) => {
     const [fresh] = await tx.select({ channelId: messages.channelId }).from(messages).where(eq(messages.id, messageId)).limit(1);
     if (fresh && fresh.channelId !== msg.channelId) throw new TaskMutationConflictError();
+    // A send-as-task re-checks the entry the send itself locked (its row,
+    // then J); any other projection taken here after J could close a cycle
+    // with a concurrent send through that projection.
+    await lockJointTaskWriteAuthority(tx, msg.channelId, { type: convertedByType, id: convertedById, ...(entryServerId ? { serverId: entryServerId } : {}) });
     await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${msg.channelId}))`);
 
-    // Check both messages and tasks tables to avoid number collisions
-    const [{ maxMsgNum }] = await tx
-      .select({ maxMsgNum: sql<number>`COALESCE(MAX(${messages.taskNumber}), 0)` })
-      .from(messages)
-      .where(eq(messages.channelId, msg.channelId));
+    // Task v2: there is no "converting" a message any more (spec §1, §5).
+    // Agents' `task convert` / `task claim --message-id` and the web convert
+    // route refuse with `task_v2_use_create` before reaching here; humans and
+    // agents create tasks from a message through createTasks
+    // (`sourceMessageId`). The one remaining flag-on caller is send-as-task
+    // (`ensureTaskForMessage`), kept tolerant for older web clients: the task
+    // gets its own conversation with the message as its source, created once
+    // per message so replayed sends converge (the conversation itself
+    // is created lazily). Without the flag the message is
+    // the host, as before.
+    // The flag is the sender's server's (the Joint entry the send locked), not
+    // the joint storage server's, as createTasks reads it.
+    if (await isTaskV2ConversationsEnabled(entryServerId ?? channel.serverId, tx)) {
+      const [raced] = await tx
+        .select({ id: tasks.id })
+        .from(tasks)
+        .where(eq(tasks.sourceMessageId, messageId))
+        .limit(1);
+      if (raced) return null;
+      // Reserved only once the task will be inserted, so a lost race leaves no gap.
+      const nextNum = await reserveTaskNumbers(tx, msg.channelId);
+      const [inserted] = await tx
+        .insert(tasks)
+        .values({
+          channelId: msg.channelId,
+          taskNumber: nextNum,
+          // The message's first line is the title and the rest its
+          // description, as the New task dialog writes them.
+          ...taskTextFromMessage(msg.content),
+          status: "todo",
+          createdByType: convertedByType,
+          createdById: convertedById,
+          messageId: null,
+          sourceMessageId: messageId,
+          ownConversation: true,
+          lastActivityAt: TASK_ACTIVITY_NOW,
+        })
+        .returning();
+      await recordTaskEvent(tx, inserted.id, "created", convertedByType, convertedById, {
+        taskNumber: nextNum,
+        status: "todo",
+        convertedFromMessage: true,
+      });
+      // Its conversation is created lazily, by the first action that needs it.
+      return inserted;
+    }
 
-    // No catch: inside this transaction a failed query has already aborted it
-    // in Postgres, so continuing could only fail later with 25P02 (and the
-    // tasks table is canonical now, so "legacy table missing" cannot happen).
-    const [legacyRow] = await tx
-      .select({ maxLegacyNum: sql<number>`COALESCE(MAX(${tasks.taskNumber}), 0)` })
-      .from(tasks)
-      .where(eq(tasks.channelId, msg.channelId));
-    const maxLegacyNum = legacyRow?.maxLegacyNum ?? 0;
-
-    const nextNum = Math.max(maxMsgNum ?? 0, maxLegacyNum) + 1;
-
+    // A concurrent convert of this message took the same channel advisory
+    // lock and has committed by now: settle the race before reserving a number
+    // (the conflict target below stays as the backstop).
+    const [linked] = await tx.select({ id: tasks.id }).from(tasks).where(eq(tasks.messageId, messageId)).limit(1);
+    if (linked) return null;
+    const nextNum = await reserveTaskNumbers(tx, msg.channelId);
     const [row] = await tx
       .insert(tasks)
       .values({
@@ -2389,6 +3665,8 @@ export async function convertMessageToTask(
         createdByType: convertedByType,
         createdById: convertedById,
         messageId,
+        sourceMessageId: messageId,
+        lastActivityAt: TASK_ACTIVITY_NOW,
       })
       .onConflictDoNothing({ target: tasks.messageId })
       .returning();
@@ -2411,6 +3689,18 @@ export async function getTaskByMessageId(messageId: string) {
   return (await resolveTaskByMessageId(messageId))?.row ?? null;
 }
 
+/** A message sent as a task: its first non-empty line is the title, the rest the description, both within the limits. */
+export function taskTextFromMessage(content: string): { title: string; description: string | null } {
+  const lines = content.replace(/\r\n?/g, "\n").split("\n");
+  const first = lines.findIndex((line) => line.trim().length > 0);
+  const title = (first === -1 ? content : lines[first]!).trim();
+  const rest = first === -1 ? "" : lines.slice(first + 1).join("\n").trim();
+  return {
+    title: Array.from(title).slice(0, TASK_TITLE_MAX_LENGTH).join("") || content.slice(0, TASK_TITLE_MAX_LENGTH),
+    description: rest ? Array.from(rest).slice(0, TASK_DESCRIPTION_MAX_LENGTH).join("") : null,
+  };
+}
+
 /**
  * Idempotently associate a canonical task with an existing message.
  *
@@ -2425,11 +3715,18 @@ export async function ensureTaskForMessage(
   createdByType: "user" | "agent",
   createdById: string,
   executor?: DatabaseExecutor,
+  /** The Joint entry server the send locked; see convertMessageToTask. */
+  entryServerId?: string,
 ): Promise<TaskRow | null> {
-  const created = await convertMessageToTask(messageId, createdByType, createdById, undefined, executor);
+  const created = await convertMessageToTask(messageId, createdByType, createdById, undefined, executor, entryServerId);
   if (typeof created !== "string") return created;
   if (created === "already converted") {
-    const [row] = await (executor ?? getDb()).select().from(tasks).where(eq(tasks.messageId, messageId)).limit(1);
+    const [row] = await (executor ?? getDb())
+      .select()
+      .from(tasks)
+      .where(or(eq(tasks.messageId, messageId), eq(tasks.sourceMessageId, messageId)))
+      .orderBy(tasks.taskNumber)
+      .limit(1);
     return row ?? null;
   }
   console.error(`[taskService] ensureTaskForMessage(${messageId}) failed: ${created}`);
@@ -2458,6 +3755,96 @@ export async function resolveMessageInChannel(channelId: string, idOrPrefix: str
   return null; // Not found or ambiguous
 }
 
+/** A person's message sent with `randomId` (the web New task's source message key), if any. */
+export async function findCreatorSourceMessageByRandomId(userId: string, randomId: string) {
+  const [row] = await getDb()
+    .select({ id: messages.id, channelId: messages.channelId, content: messages.content })
+    .from(messages)
+    .where(and(eq(messages.senderType, "user"), eq(messages.senderId, userId), eq(messages.randomId, randomId)))
+    .limit(1);
+  return row ?? null;
+}
+
+/**
+ * The tasks `creator` created from `sourceMessageId` in `channelId`, enriched
+ * as createTasks returns them, in task-number order. A person's create that
+ * posted its own source message reads them on a retry (the same
+ * sourceRandomId), so a lost response does not create the tasks twice.
+ */
+export async function listTasksFromSourceByCreator(
+  channelId: string,
+  sourceMessageId: string,
+  creator: { type: "user" | "agent"; id: string },
+) {
+  const rows = await getDb()
+    .select()
+    .from(tasks)
+    .where(and(
+      eq(tasks.channelId, channelId),
+      eq(tasks.sourceMessageId, sourceMessageId),
+      eq(tasks.createdByType, creator.type),
+      eq(tasks.createdById, creator.id),
+    ))
+    .orderBy(asc(tasks.taskNumber));
+  return enrichTaskRows(rows);
+}
+
+/**
+ * Task v2: a task's source, from the id a caller gave (full UUID or short
+ * prefix). A top-level message of `channelId` is the source itself. A reply in
+ * one of `channelId`'s threads resolves to that thread's root message (the
+ * channel message the thread hangs under), and `threadReplyId` names the
+ * reply given. Anything else (another channel, a DM, a task conversation, a
+ * thread under another channel) is null: no such message here. A short id is
+ * null when it is ambiguous: it matches more than one message, whether
+ * top-level messages, replies, or one of each.
+ *
+ * A system or external-projection reply is refused (TaskSourceMessageError),
+ * as such a top-level message is; the shape checks on the root (system,
+ * external projection) stay in assertTaskSourceMessages, under the channel
+ * lock.
+ */
+export async function resolveTaskSourceMessage(
+  channelId: string,
+  idOrPrefix: string,
+): Promise<{ id: string; threadReplyId: string | null } | null> {
+  const value = idOrPrefix.trim();
+  const fullId = UUID_RE.test(value);
+  if (!fullId && !isMessageShortId(value)) return null;
+  const db = getDb();
+  const idMatch = fullId ? [eq(messages.id, value)] : messageIdShortPrefixConditions(value);
+  const topLevel = await db
+    .select({ id: messages.id })
+    .from(messages)
+    .where(and(eq(messages.channelId, channelId), ...idMatch))
+    .limit(2);
+  const replies = await db
+    .select({ id: messages.id, rootId: channels.parentMessageId, senderType: messages.senderType, messageType: messages.messageType })
+    .from(messages)
+    .innerJoin(channels, eq(channels.id, messages.channelId))
+    .where(and(
+      eq(channels.type, "thread"),
+      eq(channels.parentChannelId, channelId),
+      isNull(channels.deletedAt),
+      ...idMatch,
+    ))
+    .limit(2);
+  if (topLevel.length + replies.length !== 1) return null;
+  if (topLevel.length === 1) return { id: topLevel[0]!.id, threadReplyId: null };
+  const reply = replies[0]!;
+  if (!reply.rootId) return null;
+  if (reply.senderType === "external_projection") throw new TaskSourceMessageError("external projection messages cannot carry tasks");
+  if (reply.messageType === "system") throw new TaskSourceMessageError("system messages cannot carry tasks");
+  // The thread hangs under a message of this channel (parent_channel_id is
+  // where its root lives); re-read it so a moved root is never taken.
+  const [root] = await db
+    .select({ id: messages.id })
+    .from(messages)
+    .where(and(eq(messages.id, reply.rootId), eq(messages.channelId, channelId)))
+    .limit(1);
+  return root ? { id: root.id, threadReplyId: reply.id } : null;
+}
+
 /**
  * Delete a task without deleting its host message.
  *
@@ -2471,11 +3858,45 @@ export async function resolveMessageInChannel(channelId: string, idOrPrefix: str
  * keeps the frozen rollback snapshot honest, since a rolled-back 1.6.2 reads
  * `messages.task_*` directly and would otherwise list a task the user deleted.
  */
-export async function deleteTaskByOwner(owner: TaskOwner) {
+export async function deleteTaskByOwner(owner: TaskOwner, actor?: JointTaskWriteActor) {
   await withTaskWriter(owner.row, async (tx) => {
     if (owner.row.messageId) await clearTaskShadow(tx, owner.row.messageId);
+    await retireTaskConversations(tx, owner.row.id);
     await tx.delete(tasks).where(and(eq(tasks.id, owner.row.id), eq(tasks.channelId, owner.row.channelId)));
-  });
+  }, actor);
+}
+
+/**
+ * Task v2 (RFC 078 "Deleting a task"): a deleted task's conversation is
+ * soft-deleted like a deleted channel, not hard-deleted by the
+ * `channels.task_id` cascade. Its messages may be referenced ON DELETE
+ * RESTRICT by external bridge rows (external_message_links,
+ * external_outbound_deliveries, inbound events, reaction facts), so the cascade
+ * could fail the delete. Every face (canonical and joint locals) gets
+ * `deleted_at` and loses `task_id` (the task_conversation_detach_on_delete check admits that shape) in the
+ * delete transaction, before the task row goes; follows still go with the task
+ * (thread_follows.parent_task_id cascade), and every reader already hides a
+ * deleted conversation. Pending phone pushes for it are revoked, as the
+ * cascade used to drop them.
+ */
+async function retireTaskConversations(tx: DatabaseExecutor, taskId: string): Promise<void> {
+  const now = currentDate();
+  const retired = await tx.update(channels)
+    .set({ taskId: null, deletedAt: sql`coalesce(${channels.deletedAt}, ${now.toISOString()}::timestamptz)` })
+    .where(and(eq(channels.taskId, taskId), eq(channels.type, "task")))
+    .returning({ id: channels.id });
+  if (retired.length === 0) return;
+  await tx.update(notificationOutbox)
+    .set({
+      status: "revoked",
+      processedAt: now,
+      updatedAt: now,
+      lastError: "task_deleted",
+    })
+    .where(and(
+      inArray(notificationOutbox.sourceChannelId, retired.map((row) => row.id)),
+      inArray(notificationOutbox.status, ["pending", "processing"]),
+    ));
 }
 
 /** Delete a message-task — clears task fields (does NOT delete the message). */
@@ -2569,15 +3990,16 @@ function canonicalClaimCasPredicate(claimedByType: "user" | "agent", claimedById
   return and(
     sql`${tasks.status} != 'done'`,
     or(
+      // Nobody holds it: claimable whatever claimedAt says. A task moved to
+      // in_progress with no assignee used to stamp it, and those rows stay.
       and(
         isNull(tasks.claimedByType),
         isNull(tasks.claimedById),
-        isNull(tasks.claimedAt),
       ),
       and(
         eq(tasks.claimedByType, claimedByType),
         eq(tasks.claimedById, claimedById),
-        eq(tasks.status, "todo"),
+        inArray(tasks.status, ["todo", "backlog"]),
         isNull(tasks.claimedAt),
       ),
     ),
@@ -2611,7 +4033,7 @@ async function writeCanonicalClaim(
   if (rejection) return rejection;
 
   const previousStatus = observed.status as TaskStatus;
-  const nextStatus: TaskStatus = previousStatus === "todo" ? "in_progress" : previousStatus;
+  const nextStatus: TaskStatus = isClaimStartableStatus(previousStatus) ? "in_progress" : previousStatus;
 
   const [updated] = await executor
     .update(tasks)
@@ -2625,6 +4047,7 @@ async function writeCanonicalClaim(
       claimedAt: nextClaimedAt(observed.claimedAt),
       revision: observed.revision + 1,
       updatedAt: new Date(),
+      lastActivityAt: TASK_ACTIVITY_NOW,
     })
     .where(and(
       canonicalRevisionCas(observed),
@@ -2693,6 +4116,7 @@ async function writeCanonicalUnclaim(
       claimedAt: null,
       revision: observed.revision + 1,
       updatedAt: new Date(),
+      lastActivityAt: TASK_ACTIVITY_NOW,
     })
     .where(and(
       canonicalRevisionCas(observed),
@@ -2729,6 +4153,9 @@ async function writeCanonicalUnclaim(
   return updated;
 }
 
+/** `writeCanonicalStatus` wrote nothing: in_review asked of a task v2 task already in_progress. */
+type CanonicalStatusUnchanged = { unchanged: TaskRow };
+
 /**
  * Status transition on a canonical task.
  *
@@ -2738,11 +4165,34 @@ async function writeCanonicalUnclaim(
  */
 async function writeCanonicalStatus(
   observed: TaskRow,
-  newStatus: TaskStatus,
-  opts: { requesterId?: string; requesterType?: "user" | "agent"; force?: boolean },
-): Promise<TaskRow | string> {
+  requestedStatus: TaskStatus,
+  opts: {
+    requesterId?: string;
+    requesterType?: "user" | "agent";
+    force?: boolean;
+    serverId?: string;
+    initiatingServerId?: string | null;
+    backlogReason?: string;
+  },
+): Promise<TaskRow | string | CanonicalStatusUnchanged> {
   const previousStatus = observed.status as TaskStatus;
   const force = opts.force === true;
+  // Task v2: in_review is retired; a task v2 task asked for it stores
+  // in_progress, through every rule below exactly as if in_progress had been
+  // asked for. The flag is read only when it can matter (in_review or backlog
+  // on a pre-v2 task: on that server it gets its conversation, so it is task v2).
+  const flagOn = (requestedStatus === "in_review" || requestedStatus === "backlog") && !isV2Task(observed)
+    ? await isTaskV2ConversationsEnabledForRequest({
+      initiatingServerId: opts.initiatingServerId ?? opts.serverId,
+      storageChannelId: observed.channelId,
+    })
+    : false;
+  // Backlog is task v2 only, for every writer, the admin force path included.
+  if (requestedStatus === "backlog" && !taskUsesOwnConversation(observed, flagOn)) {
+    throw new TaskStatusNotAvailableError(requestedStatus);
+  }
+  const newStatus: TaskStatus = taskV2StoredStatus(observed, flagOn, requestedStatus);
+  const inReviewRetired = newStatus !== requestedStatus;
 
   // This is a completion invariant, not a permission check. Every writer,
   // including the owner/admin force path, must cross it.
@@ -2750,8 +4200,21 @@ async function writeCanonicalStatus(
     return "resource receipt required before task can move to done";
   }
 
+  // Already in_progress: what an older client asking for in_review means is
+  // already true, so it is a success that writes nothing (no revision bump,
+  // no event), not the "already in_progress" refusal it would ask for.
+  // Still through the writer fence and joint write authority, as a write is.
+  const writerActor = opts.requesterId
+    ? { type: opts.requesterType ?? "user", id: opts.requesterId, serverId: opts.serverId }
+    : undefined;
+  if (inReviewRetired && previousStatus === newStatus) {
+    return withTaskWriter(observed, async (): Promise<CanonicalStatusUnchanged> => ({ unchanged: observed }), writerActor);
+  }
+
+  const transitionError = getTaskStatusTransitionError(previousStatus, newStatus);
+  if (transitionError) return transitionError;
+
   if (force) {
-    if (previousStatus === newStatus) return `already ${newStatus}`;
     if (previousStatus === "todo" && newStatus === "in_progress" && !observed.claimedById) {
       return "task must be claimed before moving to in_progress";
     }
@@ -2759,18 +4222,6 @@ async function writeCanonicalStatus(
       return "task start state changed concurrently";
     }
   } else {
-    // Assigned create deliberately treats assigning yourself as "start now",
-    // but a mistaken self-start must be reversible without admin help. Keep
-    // this narrower than the member-level status transition table: adding
-    // `in_progress -> todo` there would let any channel member demote someone
-    // else's active work. The current assignee alone may undo their own start;
-    // the write keeps the reservation and clears its start epoch below.
-    const assigneeUndoingOwnStart = previousStatus === "in_progress"
-      && newStatus === "todo"
-      && observed.claimedByType === opts.requesterType
-      && observed.claimedById === opts.requesterId;
-    const transitionError = getTaskStatusTransitionError(previousStatus, newStatus);
-    if (transitionError && !assigneeUndoingOwnStart) return transitionError;
     // No assignee check. @stdrc ruled that status is a member-level action:
     // "status 应该也是，人都可以做。你想象一个正常的 to-do list 管理软件，
     //  它没理由是只有 admin 能操作的。" Only DELETE stays creator/admin-only.
@@ -2787,7 +4238,8 @@ async function writeCanonicalStatus(
     //
     // The guard below is NOT a permission check -- it is concurrency
     // protection (two people starting the same task), and it stays.
-    if (previousStatus === "todo" && newStatus === "in_progress" && observed.claimedAt !== null) {
+    if (previousStatus === "todo" && newStatus === "in_progress" && observed.claimedById && observed.claimedAt !== null) {
+      // With no holder, claimedAt says nothing about a start: older writes left it on such rows.
       return "task start state changed concurrently";
     }
 
@@ -2807,13 +4259,18 @@ async function writeCanonicalStatus(
     revision: observed.revision + 1,
     updatedAt: new Date(),
   };
-  if ((previousStatus === "todo" || previousStatus === "closed") && newStatus === "in_progress") {
+  if (observed.claimedById && isUnstartedStatus(previousStatus) && newStatus === "in_progress") {
     // Starting preassigned todo work and resuming closed owned work both stamp
     // the current ownership epoch, exactly as updateMessageTaskStatus does. The
     // assignee check plus the revision CAS keep a stale owner from reviving it.
+    // With nobody holding the task there is no ownership to stamp, as when one
+    // is created in_progress with no assignee; the first claim stamps it.
     setFields.claimedAt = nextClaimedAt(observed.claimedAt);
   }
-  if (previousStatus === "in_progress" && newStatus === "todo") {
+  if ((newStatus === "todo" || newStatus === "backlog") && observed.claimedAt !== null) {
+    // Back to not started, from any status: the assignment stays, its start
+    // epoch goes, so starting it again (or the assignee's first claim) stamps
+    // a new one instead of tripping the concurrent-start guard below.
     setFields.claimedAt = null;
   }
   if (newStatus === "done") setFields.completedAt = new Date();
@@ -2834,7 +4291,7 @@ async function writeCanonicalStatus(
   return withTaskWriter(observed, async (executor) => {
   const [updated] = await executor
     .update(tasks)
-    .set(setFields)
+    .set({ ...setFields, lastActivityAt: TASK_ACTIVITY_NOW })
     .where(and(
       canonicalRevisionCas(observed),
       eq(tasks.status, previousStatus),
@@ -2881,9 +4338,11 @@ async function writeCanonicalStatus(
     from: previousStatus,
     to: newStatus,
     forced: force,
+    ...(inReviewRetired && { reason: TASK_V2_RETIRED_IN_REVIEW_REASON }),
+    ...(newStatus === "backlog" && opts.backlogReason && { reason: opts.backlogReason }),
   });
   return updated;
-  });
+  }, writerActor);
 }
 
 const TASK_RESOURCE_RECEIPT_FIELDS = [
@@ -2975,6 +4434,19 @@ export interface TaskResourceReceiptResult {
   expiryFollowup: TaskResourceExpiryFollowup;
   receipt: TaskResourceReceipt;
   idempotent: boolean;
+  /**
+   * Task v2, a task without a host or source message: the "resource receipt
+   * recorded" line committed in the task conversation as the follow-up's
+   * anchor. Persisted (and anchored) in the receipt transaction; the caller
+   * fans it out after commit (publishTaskResourceReceiptLine). Absent for
+   * idempotent retries and for tasks anchored on a message.
+   */
+  receiptLine?: {
+    message: typeof messages.$inferSelect;
+    content: string;
+    /** The conversation as the teardown owner's server sees it (the follow-up's target). */
+    localConversationId: string;
+  };
 }
 
 /**
@@ -2999,7 +4471,12 @@ export async function recordTaskResourceReceipt(
       .for("update");
     if (!observed) return "task not found";
     if (!observed.requiresResourceReceipt) return "task is not marked as creating a resource";
-    if (!observed.messageId) return "resource receipt requires a task message anchor";
+    // Task v2 tasks have no host message; their source message (if any) is
+    // the conversational anchor of the expiry follow-up. A v2 task without a
+    // source message anchors it on a "resource receipt recorded" line in its
+    // own conversation, written below once the receipt is valid (needs the
+    // task's conversation; without one the receipt is refused as before).
+    const anchorMessageId = observed.messageId ?? observed.sourceMessageId;
 
     if (observed.resourceReceipt) {
       const existing = normalizeTaskResourceReceipt(observed.resourceReceipt);
@@ -3019,15 +4496,49 @@ export async function recordTaskResourceReceipt(
     if (fireAt.getTime() <= currentDate().getTime()) {
       return "resource receipt expiry must be in the future";
     }
+    // Lazy conversation: created only once the receipt is valid and new, so
+    // a refused receipt creates nothing.
+    const anchorConversation = anchorMessageId
+      ? null
+      : await ensureTaskConversation(observed.id, { initiatingServerId: input.teardownOwnerServerId, executor: tx });
+    if (!anchorMessageId && !anchorConversation) return "resource receipt requires a task message anchor";
 
     const followupId = randomUUID();
     const recordedAt = currentDate();
+    let followupMessageId = anchorMessageId;
+    let followupTargetChannelId = input.teardownOwnerTargetChannelId;
+    let receiptLine: TaskResourceReceiptResult["receiptLine"];
+    if (!followupMessageId && anchorConversation) {
+      const { conversation } = anchorConversation;
+      const ownerLocal = [...conversation.localByServer.values()]
+        .find((local) => local.localParentChannelId === input.teardownOwnerTargetChannelId)
+        ?? conversation.localByServer.get(input.teardownOwnerServerId);
+      const content = `🧾 Resource receipt recorded for #${observed.taskNumber} "${summarizeTaskTitle(observed.title)}": `
+        + `${summarizeTaskTitle(normalized.object)} · teardown ${normalized.teardown_owner} · expires ${normalized.expiry}`;
+      const [line] = await tx.insert(messages).values({
+        // Messages live in the canonical conversation (joint: on storage).
+        channelId: conversation.canonicalChannelId,
+        senderType: "user",
+        senderId: "system",
+        messageType: "system",
+        content,
+        searchText: buildSearchText(content),
+        causalActorType: input.actorType,
+        causalActorId: input.actorId,
+        systemSubtype: "task.lifecycle_thread",
+      }).returning();
+      if (!line) throw new Error("Failed to persist the resource receipt line");
+      followupMessageId = line.id;
+      // The follow-up fires into the task's conversation (the owner's face).
+      followupTargetChannelId = ownerLocal?.localChannelId ?? conversation.canonicalChannelId;
+      receiptLine = { message: line, content, localConversationId: followupTargetChannelId };
+    }
     const expiryFollowup = await input.expiryFollowups.create({
       id: followupId,
       serverId: input.teardownOwnerServerId,
       ownerAgentId: input.teardownOwnerAgentId,
-      targetChannelId: input.teardownOwnerTargetChannelId,
-      msgId: observed.messageId,
+      targetChannelId: followupTargetChannelId,
+      msgId: followupMessageId!,
       title: `Resource expiry: task #${observed.taskNumber} — ${normalized.object}`,
       fireAt,
       payload: {
@@ -3065,8 +4576,14 @@ export async function recordTaskResourceReceipt(
       teardownOwnerAgentId: input.teardownOwnerAgentId,
       expiryFollowupId: expiryFollowup.id,
     });
-    return { task: updated, expiryFollowup, receipt: normalized, idempotent: false };
-  });
+    return {
+      task: updated,
+      expiryFollowup,
+      receipt: normalized,
+      idempotent: false,
+      ...(receiptLine ? { receiptLine } : {}),
+    };
+  }, { type: input.actorType, id: input.actorId });
 }
 
 /** Get a canonical task row by ID. */
@@ -3134,7 +4651,7 @@ export async function getServerTaskSnapshot(serverId: string, userId: string, ch
     isNull(channels.deletedAt), isNull(channels.archivedAt), channelId ? eq(channels.id, channelId) : undefined,
   )).orderBy(asc(channels.name), asc(channels.id));
   const surfaces = await resolveVisibleServerTaskSurfaces(serverId, userId, candidates.map((channel) => channel.id));
-  const empty = { surfaces: surfaces.length, total: 0, todo: 0, inProgress: 0, inReview: 0, done: 0, closed: 0,
+  const empty = { surfaces: surfaces.length, total: 0, backlog: 0, todo: 0, inProgress: 0, inReview: 0, done: 0, closed: 0,
     humanCreated: 0, agentCreated: 0, durationSamples: 0, medianHours: null as number | null, p90Hours: null as number | null,
     firstCreatedAt: null as Date | null, latestCreatedAt: null as Date | null, latestUpdatedAt: null as Date | null };
   if (!surfaces.length) return empty;
@@ -3148,6 +4665,7 @@ export async function getServerTaskSnapshot(serverId: string, userId: string, ch
   const validDuration = sql`${facts.status} = 'done' AND ${facts.completedAt} IS NOT NULL AND ${elapsed} >= 0`;
   const [row] = await getDb().select({
     total: sql<number>`count(*)`.mapWith(Number),
+    backlog: sql<number>`count(*) FILTER (WHERE ${facts.status} = 'backlog')`.mapWith(Number),
     todo: sql<number>`count(*) FILTER (WHERE ${facts.status} = 'todo')`.mapWith(Number),
     inProgress: sql<number>`count(*) FILTER (WHERE ${facts.status} = 'in_progress')`.mapWith(Number),
     inReview: sql<number>`count(*) FILTER (WHERE ${facts.status} = 'in_review')`.mapWith(Number),
@@ -3163,4 +4681,135 @@ export async function getServerTaskSnapshot(serverId: string, userId: string, ch
     latestUpdatedAt: sql<Date | null>`max(${facts.updatedAt})`.mapWith((value) => value === null ? null : new Date(String(value))),
   }).from(facts);
   return { ...row, surfaces: surfaces.length };
+}
+
+/** One row of `raft task list --following` (task v2). */
+export interface AgentFollowedTaskConversation {
+  /** `#channel:#7` / `dm:@peer:#7`, as this agent names the task's channel. */
+  taskRef: string;
+  taskNumber: number;
+  title: string;
+  status: TaskStatus;
+  /** Messages from others after the agent's read position in the conversation. */
+  unread: number;
+  followedAt: string;
+  reason: string | null;
+  /** The agent-facing (local) conversation channel; null while not created yet (lazy). */
+  conversationChannelId: string | null;
+}
+
+/**
+ * Task v2: the task conversations an agent follows on this server (its
+ * replies wake the agent), newest follow first — the task counterpart of
+ * listAgentFollowedThreads. `unread` counts by the inbox's own unread rule
+ * (markAgentOwnSendRead): not the agent's own sends, not system rows it
+ * caused, not noise subtypes, after its read cursor on the local conversation
+ * (messages live in the canonical conversation, which differs for a joint
+ * channel's projection).
+ *
+ * Lazy conversations: a task v2 task whose conversation does not exist yet is
+ * followed by its creator (`authored`) and assignee (`assigned`) from
+ * creation, so it is listed for them too (unread 0), as `raft task view`
+ * reports it — in the same query, reached through the channels the agent is
+ * a member of on this server (a joint channel through its local projection),
+ * so the task scan rides the tasks' channel index.
+ */
+export async function listAgentFollowedTaskConversations(
+  serverId: string,
+  agentId: string,
+): Promise<AgentFollowedTaskConversation[]> {
+  const result = await getDb().execute(sql`
+    SELECT
+      c.id::text AS "conversationChannelId",
+      c.parent_channel_id::text AS "parentChannelId",
+      t.task_number AS "taskNumber",
+      t.title AS "title",
+      t.status AS "status",
+      tf.created_at AS "followedAt",
+      tf.reason AS "reason",
+      (
+        SELECT count(*)::int FROM messages m
+        WHERE m.channel_id = COALESCE(t.conversation_channel_id, c.id)
+          AND m.seq > COALESCE((
+            SELECT COALESCE(r.last_read_seq8, CAST(r.last_read_seq AS BIGINT))
+            FROM agent_channel_read_cursors r
+            WHERE r.agent_id = ${agentId}::uuid AND r.channel_id = c.id
+          ), 0)
+          AND NOT (m.sender_type = 'agent' AND m.sender_id = ${agentId}::text)
+          AND NOT COALESCE(m.message_type = 'system' AND m.causal_actor_type = 'agent' AND m.causal_actor_id = ${agentId}::text, FALSE)
+          AND (m.system_subtype IS NULL OR m.system_subtype NOT IN ('channel.self_unfollow_thread', 'task.deleted_summary'))
+      ) AS "unread"
+    FROM thread_follows tf
+    JOIN channels c ON c.id = tf.thread_channel_id
+      AND c.type = 'task'
+      AND c.server_id = ${serverId}::uuid
+      AND c.deleted_at IS NULL
+    JOIN tasks t ON t.id = c.task_id
+    WHERE tf.follower_type = 'agent'
+      AND tf.follower_id = ${agentId}::uuid
+      AND tf.unfollowed_at IS NULL
+    UNION ALL
+    SELECT
+      NULL AS "conversationChannelId",
+      lc.id::text AS "parentChannelId",
+      t.task_number AS "taskNumber",
+      t.title AS "title",
+      t.status AS "status",
+      CASE WHEN t.created_by_type = 'agent' AND t.created_by_id = ${agentId}::text
+        THEN t.created_at ELSE COALESCE(t.claimed_at, t.created_at) END AS "followedAt",
+      CASE WHEN t.created_by_type = 'agent' AND t.created_by_id = ${agentId}::text
+        THEN 'authored' ELSE 'assigned' END AS "reason",
+      0 AS "unread"
+    FROM channel_agents ca
+    JOIN channels lc ON lc.id = ca.channel_id
+      AND lc.server_id = ${serverId}::uuid
+      AND lc.deleted_at IS NULL
+    LEFT JOIN joint_channel_servers jcs ON jcs.local_channel_id = lc.id AND jcs.status = 'active'
+    LEFT JOIN joint_channels jc ON jc.id = jcs.joint_channel_id
+    JOIN tasks t ON t.channel_id = COALESCE(jc.canonical_channel_id, lc.id)
+    WHERE ca.agent_id = ${agentId}::uuid
+      -- A v2 task without its conversation yet: its creator and assignee
+      -- follow it from creation (one rule with raft task view and the web).
+      AND ${pendingTaskConversationFollowerSql(taskAliasColumns("t"), { type: "agent", id: agentId })}
+    ORDER BY "followedAt" DESC, "conversationChannelId" DESC NULLS LAST, "taskNumber" DESC
+  `);
+  const rows = result.rows as Array<{
+    conversationChannelId: string | null;
+    parentChannelId: string | null;
+    taskNumber: number;
+    title: string;
+    status: TaskStatus;
+    followedAt: Date | string;
+    reason: string | null;
+    unread: number;
+  }>;
+  const parentRefs = new Map<string, string | null>();
+  const items: AgentFollowedTaskConversation[] = [];
+  // Visibility through the one entry (visibilityService.canView), for every
+  // row at once. Not created yet: the agent reaches it through the task's channel.
+  const visible = await canView(
+    { type: "agent", id: agentId, serverId: serverId as ServerId },
+    rows.map((row) => ({ kind: "conversation" as const, channelId: row.conversationChannelId ?? row.parentChannelId ?? "" })),
+  );
+  for (const [index, row] of rows.entries()) {
+    if (!row.parentChannelId) continue;
+    if (!visible[index]) continue;
+    if (!parentRefs.has(row.parentChannelId)) {
+      parentRefs.set(row.parentChannelId, await resolveAgentFacingChannelRef(serverId, agentId, row.parentChannelId));
+    }
+    const parentRef = parentRefs.get(row.parentChannelId);
+    const taskRef = parentRef ? formatAgentTaskRef(parentRef, Number(row.taskNumber)) : null;
+    if (!taskRef) continue;
+    items.push({
+      taskRef,
+      taskNumber: Number(row.taskNumber),
+      title: row.title,
+      status: row.status,
+      unread: Number(row.unread) || 0,
+      followedAt: new Date(row.followedAt).toISOString(),
+      reason: row.reason,
+      conversationChannelId: row.conversationChannelId,
+    });
+  }
+  return items;
 }

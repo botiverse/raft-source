@@ -6,10 +6,10 @@ import { fixturePasswordHash, tokenForHuman } from "../test/integration/credenti
 // `lastSeenAt` for external agents, and pushed as `agent:seen` on write.
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 
 import { getDb } from "../db/index";
-import { agentCredentials, users } from "../db/schema";
+import { agentCredentials, jointChannels, jointChannelServers, users } from "../db/schema";
 import { createServer } from "../services/serverService";
 import { createAgent } from "../services/agentService";
 import {
@@ -20,8 +20,10 @@ import {
 import { AgentOrchestrator } from "../services/agentOrchestrator";
 import { referenceAgentInboxChain } from "../test/agentInboxChainReference";
 import { __setExternalAgentInboxChainSelectorForTests } from "../services/messageService";
+import { addAgent, addHuman } from "../services/channelService";
+import { seedJointChannel } from "../test/integration/jointFixture";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 __setExternalAgentInboxChainSelectorForTests(async (agentId: string) => ({ source: "chain", rows: await referenceAgentInboxChain(agentId) }));
 
@@ -58,15 +60,18 @@ async function seedFixture() {
     agentId: external.id,
     scopes: ["read"],
     name: "presence-ext",
+    issuedVia: "computer",
     createdByUserId: null,
   });
   const managedCredential = await mintAgentCredential({
     agentId: managed.id,
     scopes: ["read"],
     name: "presence-managed",
+    issuedVia: "computer",
     createdByUserId: null,
   });
   return {
+    ownerId: owner!.id,
     ownerToken: await tokenForHuman(email),
     serverId: server.id,
     externalId: external.id,
@@ -210,4 +215,72 @@ test("an open wake-hint stream keeps the external agent seen on heartbeat ticks"
     delete process.env.SLOCK_WAKE_STREAM_HEARTBEAT_MS;
     __setAgentCredentialUseThrottleMsForTests(null);
   }
+});
+
+// Joint channels: people on another server see the external agent's presence.
+async function seedJointPresenceFixture() {
+  const f = await seedFixture();
+  const peer = await createServer("Presence Peer", `presence-peer-${randomUUID()}`, f.ownerId);
+  const seedJoint = async (name: string) => {
+    const joint = await seedJointChannel({ name, serverIds: [peer.id, f.serverId], createdByUserId: f.ownerId });
+    const [peerProjection, homeProjection] = joint.projections;
+    await addHuman(peerProjection!.id, f.ownerId);
+    await addAgent(homeProjection!.id, f.externalId);
+    await addAgent(homeProjection!.id, f.managedId);
+    return { jointChannelId: joint.jointChannelId, peerChannelId: peerProjection!.id };
+  };
+  const active = await seedJoint(`presence-active-${randomUUID().slice(0, 8)}`);
+  const disconnected = await seedJoint(`presence-disc-${randomUUID().slice(0, 8)}`);
+  await getDb().update(jointChannelServers).set({ status: "disconnected", disconnectedAt: new Date() })
+    .where(and(eq(jointChannelServers.jointChannelId, disconnected.jointChannelId), eq(jointChannelServers.serverId, peer.id)));
+  const closed = await seedJoint(`presence-closed-${randomUUID().slice(0, 8)}`);
+  await getDb().update(jointChannels).set({ status: "closed" }).where(eq(jointChannels.id, closed.jointChannelId));
+  return { ...f, peerServerId: peer.id, active, disconnected, closed };
+}
+
+test("agent:seen also reaches active joint channels' other-server projection rooms", async ({ app }) => {
+  __setAgentCredentialUseThrottleMsForTests(null);
+  const f = await seedJointPresenceFixture();
+  const emitted = installFakeIo(app);
+
+  await agentApiCall(app.baseUrl, f.external.apiKey);
+  const written = await waitFor(() => lastUsedAt(f.external.credentialId), (v) => v !== null);
+  await waitFor(async () => emitted.filter((e) => e.event === "agent:seen").length, (n) => n >= 2);
+  await new Promise((resolve) => setTimeout(resolve, 100));
+
+  const payload = { agentId: f.externalId, lastSeenAt: new Date(written!).toISOString() };
+  const seen = emitted.filter((e) => e.event === "agent:seen");
+  assert.deepEqual(
+    seen.map((e) => e.room).sort(),
+    [`channel:${f.active.peerChannelId}`, `server:${f.serverId}`].sort(),
+    `home server room + the active peer projection only, got ${JSON.stringify(seen)}`,
+  );
+  for (const e of seen) assert.deepEqual(e.payload, payload, "only agentId and lastSeenAt");
+});
+
+test("a joint channel roster serves lastSeenAt for another server's external agent", async ({ app }) => {
+  __setAgentCredentialUseThrottleMsForTests(null);
+  const f = await seedJointPresenceFixture();
+  installFakeIo(app);
+  const roster = async () => {
+    const res = await fetch(`${app.baseUrl}/api/channels/${f.active.peerChannelId}/members`, {
+      headers: { Authorization: `Bearer ${f.ownerToken}`, "X-Server-Id": f.peerServerId },
+    });
+    assert.equal(res.status, 200);
+    return (await res.json() as { agents: Array<{ id: string; external?: boolean; lastSeenAt?: string | null }> }).agents;
+  };
+
+  const before = await roster();
+  const externalBefore = before.find((a) => a.id === f.externalId);
+  assert.equal(externalBefore?.external, true);
+  assert.equal(externalBefore?.lastSeenAt, null, "never-seen external agent → null");
+  const managed = before.find((a) => a.id === f.managedId)!;
+  assert.ok(managed, "the managed agent is listed");
+  assert.equal("lastSeenAt" in managed, false, "managed agents carry no lastSeenAt");
+  assert.equal("external" in managed, false);
+
+  await agentApiCall(app.baseUrl, f.external.apiKey);
+  const written = await waitFor(() => lastUsedAt(f.external.credentialId), (v) => v !== null);
+  const after = await roster();
+  assert.equal(after.find((a) => a.id === f.externalId)?.lastSeenAt, new Date(written!).toISOString());
 });

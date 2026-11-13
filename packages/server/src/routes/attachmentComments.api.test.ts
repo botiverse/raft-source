@@ -1,4 +1,5 @@
 import { tokenForHuman, fixturePasswordHash } from "../test/integration/credentials";
+import { insertAttachmentsWithObjects } from "../test/attachmentObjectFixture";
 import { createApiTest } from "../test/integration/apiTest";
 import assert from "node:assert/strict";
 
@@ -6,14 +7,13 @@ import argon2 from "argon2";
 import { eq } from "drizzle-orm";
 import { openTestApp } from "../test/integration/app";
 import { getDb } from "../db/index";
-import { attachmentCommentRefs, attachments, channels, featureFlagRules, featureFlags, messageMentions, messages, serverMembers, users } from "../db/schema";
+import { attachmentCommentRefs, channels, messageMentions, messages, serverMembers, users } from "../db/schema";
 import { createServer } from "../services/serverService";
 import { addHuman, createChannel, getOrCreateThread } from "../services/channelService";
 import { createMessage } from "../services/messageService";
-import { ATTACHMENT_COMMENTS_FEATURE_FLAG_KEY } from "../services/featureFlagService";
 import { mintAgentCredential } from "../services/agentCredentialService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 /**
  * API tests for attachment comments (attachment-comments MVP spec §4, task #3 / PR1).
@@ -64,9 +64,7 @@ async function seedFixture() {
   const parentMessage = await createMessage(channel.id, "user", owner.id, "daily report", "chat");
 
   const mkAttachment = async (id: string, filename: string, messageId: string | null) => {
-    const [row] = await db
-      .insert(attachments)
-      .values({
+    const [row] = await insertAttachmentsWithObjects(db, {
         id,
         messageId,
         channelId: channel.id,
@@ -76,8 +74,7 @@ async function seedFixture() {
         mimeType: "text/html",
         sizeBytes: 10,
         storageKey: `${server.id}/${filename}`,
-      })
-      .returning();
+      });
     return row;
   };
 
@@ -123,63 +120,15 @@ function installFakeIo(app: { set: (key: string, value: unknown) => void }): Emi
   return events;
 }
 
-test("attachment comments: feature flag kill switch gates before body validation", async () => {
-  const { baseUrl, close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
-  try {
-    const fx = await seedFixture();
-    const reviewerToken = await tokenForHuman("ac-reviewer@slock.test");
-    const headers = authHeaders(reviewerToken, fx.server.id);
-
-    await fx.db
-      .update(featureFlags)
-      .set({ killSwitch: true })
-      .where(eq(featureFlags.key, ATTACHMENT_COMMENTS_FEATURE_FLAG_KEY));
-
-    const createRes = await fetch(`${baseUrl}/api/attachments/${fx.linked.id}/comments`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({
-        content: "still hidden",
-        mentions: [{ type: "user", id: "not-a-uuid", name: "x" }],
-      }),
-    });
-    assert.equal(createRes.status, 403, "kill switch wins before invalid mention body parsing");
-    assert.equal(((await createRes.json()) as { code: string }).code, "attachment_comments_disabled");
-
-    const listRes = await fetch(`${baseUrl}/api/attachments/${fx.linked.id}/comments`, { headers });
-    assert.equal(listRes.status, 403);
-    assert.equal(((await listRes.json()) as { code: string }).code, "attachment_comments_disabled");
-
-    const countsRes = await fetch(`${baseUrl}/api/attachments/comments/counts?ids=${fx.linked.id}`, { headers });
-    assert.equal(countsRes.status, 403);
-    assert.equal(((await countsRes.json()) as { code: string }).code, "attachment_comments_disabled");
-  } finally {
-    await close();
-  }
-});
-
-/**
- * The ordering tooth, requested by @cross's counterexample review of PR #6393.
- *
- * The kill-switch test above passes a VALID attachment id and an invalid mention
- * *body*, so it proves "flag gate beats body parsing" and says nothing about the
- * path parameter. Moving the malformed-id guard ahead of the feature gate left
- * that whole suite 11/11 green — i.e. it could not tell the correct order from
- * the order that leaks feature existence. This test is what discriminates them.
- *
- * Both arms are load-bearing:
- *   enabled     + malformed id ⇒ typed 400   (deleting the guard reds this)
- *   kill switch + malformed id ⇒ uniform 403 (hoisting the guard above the gate reds this)
- */
-test("attachment comments: malformed :id is a typed 400 when enabled, and stays a uniform 403 under the kill switch", async () => {
-  const { baseUrl, close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+test("attachment comments: malformed :id is a typed 400", async () => {
+  const { baseUrl, close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const fx = await seedFixture();
     const reviewerToken = await tokenForHuman("ac-reviewer@slock.test");
     const headers = authHeaders(reviewerToken, fx.server.id);
     const malformed = "not-a-uuid";
 
-    // ── enabled: the id never reaches the uuid column, so it is a client error ──
+    // The id never reaches the uuid column, so it is a client error.
     const enabledGet = await fetch(`${baseUrl}/api/attachments/${malformed}/comments`, { headers });
     assert.equal(enabledGet.status, 400, `GET expected 400, got ${enabledGet.status}`);
     assert.equal(((await enabledGet.json()) as { code: string }).code, "invalid_attachment_id");
@@ -192,32 +141,13 @@ test("attachment comments: malformed :id is a typed 400 when enabled, and stays 
     assert.equal(enabledPost.status, 400, `POST expected 400, got ${enabledPost.status}`);
     assert.equal(((await enabledPost.json()) as { code: string }).code, "invalid_attachment_id");
 
-    // ── disabled: the SAME malformed id must now be indistinguishable from any
-    //    other request. A 400 here would tell a caller that the feature exists
-    //    and which inputs it parses, which is exactly what the gate order buys.
-    await fx.db
-      .update(featureFlags)
-      .set({ killSwitch: true })
-      .where(eq(featureFlags.key, ATTACHMENT_COMMENTS_FEATURE_FLAG_KEY));
-
-    const disabledGet = await fetch(`${baseUrl}/api/attachments/${malformed}/comments`, { headers });
-    assert.equal(disabledGet.status, 403, "GET: the id guard must not precede the feature gate");
-    assert.equal(((await disabledGet.json()) as { code: string }).code, "attachment_comments_disabled");
-
-    const disabledPost = await fetch(`${baseUrl}/api/attachments/${malformed}/comments`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({ content: "never stored" }),
-    });
-    assert.equal(disabledPost.status, 403, "POST: the id guard must not precede the feature gate");
-    assert.equal(((await disabledPost.json()) as { code: string }).code, "attachment_comments_disabled");
   } finally {
     await close();
   }
 });
 
-test("attachment comments: message history hides scoped metadata for user-denied viewers", async () => {
-  const { app, baseUrl, close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+test("attachment comments: message reads expose scoped metadata while shared live updates strip it", async () => {
+  const { app, baseUrl, close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const fx = await seedFixture();
     const ownerToken = await tokenForHuman("ac-owner@slock.test");
@@ -253,196 +183,16 @@ test("attachment comments: message history hides scoped metadata for user-denied
       "shared comment-create live update must not expose scoped commentRef",
     );
 
-    await fx.db.insert(featureFlagRules).values({
-      flagKey: ATTACHMENT_COMMENTS_FEATURE_FLAG_KEY,
-      stage: "user",
-      decision: "deny",
-      values: [fx.reviewer.id],
-    });
-
-    const deniedListRes = await fetch(`${baseUrl}/api/attachments/${fx.linked.id}/comments`, {
-      headers: reviewerHeaders,
-    });
-    assert.equal(deniedListRes.status, 403);
-    assert.equal(((await deniedListRes.json()) as { code: string }).code, "attachment_comments_disabled");
-
-    const deniedCountsRes = await fetch(`${baseUrl}/api/attachments/comments/counts?ids=${fx.linked.id}`, {
-      headers: reviewerHeaders,
-    });
-    assert.equal(deniedCountsRes.status, 403);
-    assert.equal(((await deniedCountsRes.json()) as { code: string }).code, "attachment_comments_disabled");
-
-    const deniedThreadRes = await fetch(`${baseUrl}/api/messages/channel/${created.threadChannelId}?limit=50`, {
-      headers: reviewerHeaders,
-    });
-    assert.equal(deniedThreadRes.status, 200, await deniedThreadRes.clone().text());
-    const deniedThreadMessages = (await deniedThreadRes.json()) as {
-      messages: Array<{ id: string; commentRef: unknown | null }>;
-    };
-    const deniedComment = deniedThreadMessages.messages.find((m) => m.id === created.message.id);
-    assert.ok(deniedComment, "comment message remains readable as a normal thread message");
-    assert.equal(deniedComment!.commentRef, null, "user-denied viewer must not observe scoped commentRef");
-
-    const deniedParentRes = await fetch(`${baseUrl}/api/messages/channel/${fx.channel.id}?limit=50`, {
-      headers: reviewerHeaders,
-    });
-    assert.equal(deniedParentRes.status, 200, await deniedParentRes.clone().text());
-    const deniedParentMessages = (await deniedParentRes.json()) as {
-      messages: Array<{ id: string; attachments: Array<{ id: string; commentCount: number }> }>;
-    };
-    const deniedParent = deniedParentMessages.messages.find((m) => m.id === fx.parentMessage.id);
-    assert.ok(deniedParent, "parent message present for user-denied viewer");
-    assert.equal(
-      deniedParent!.attachments.find((a) => a.id === fx.linked.id)?.commentCount,
-      0,
-      "user-denied viewer must not observe scoped commentCount",
-    );
-
-    const deniedThreadContextRes = await fetch(
-      `${baseUrl}/api/messages/context/${created.message.id}?channelId=${created.threadChannelId}`,
-      { headers: reviewerHeaders },
-    );
-    assert.equal(deniedThreadContextRes.status, 200, await deniedThreadContextRes.clone().text());
-    const deniedThreadContext = (await deniedThreadContextRes.json()) as {
-      messages: Array<{ id: string; commentRef: unknown | null }>;
-    };
-    assert.equal(
-      deniedThreadContext.messages.find((m) => m.id === created.message.id)?.commentRef,
-      null,
-      "user-denied viewer must not observe scoped commentRef via context/permalink",
-    );
-
-    const deniedParentContextRes = await fetch(
-      `${baseUrl}/api/messages/context/${fx.parentMessage.id}?channelId=${fx.channel.id}`,
-      { headers: reviewerHeaders },
-    );
-    assert.equal(deniedParentContextRes.status, 200, await deniedParentContextRes.clone().text());
-    const deniedParentContext = (await deniedParentContextRes.json()) as {
-      messages: Array<{ id: string; attachments: Array<{ id: string; commentCount: number }> }>;
-    };
-    assert.equal(
-      deniedParentContext.messages
-        .find((m) => m.id === fx.parentMessage.id)
-        ?.attachments.find((a) => a.id === fx.linked.id)?.commentCount,
-      0,
-      "user-denied viewer must not observe scoped commentCount via context/permalink",
-    );
-
-    const deniedThreadSyncRes = await fetch(
-      `${baseUrl}/api/messages/sync?channel_id=${created.threadChannelId}&since_seq=0&limit=50`,
-      { headers: reviewerHeaders },
-    );
-    assert.equal(deniedThreadSyncRes.status, 200, await deniedThreadSyncRes.clone().text());
-    const deniedThreadSync = (await deniedThreadSyncRes.json()) as Array<{ id: string; commentRef: unknown | null }>;
-    assert.equal(
-      deniedThreadSync.find((m) => m.id === created.message.id)?.commentRef,
-      null,
-      "user-denied viewer must not observe scoped commentRef via sync",
-    );
-
-    const deniedParentSyncRes = await fetch(
-      `${baseUrl}/api/messages/sync?channel_id=${fx.channel.id}&since_seq=0&limit=50`,
-      { headers: reviewerHeaders },
-    );
-    assert.equal(deniedParentSyncRes.status, 200, await deniedParentSyncRes.clone().text());
-    const deniedParentSync = (await deniedParentSyncRes.json()) as Array<{
-      id: string;
-      attachments: Array<{ id: string; commentCount: number }>;
-    }>;
-    assert.equal(
-      deniedParentSync.find((m) => m.id === fx.parentMessage.id)?.attachments.find((a) => a.id === fx.linked.id)?.commentCount,
-      0,
-      "user-denied viewer must not observe scoped commentCount via sync",
-    );
-
-    const deniedCommentReactionRes = await fetch(`${baseUrl}/api/messages/${created.message.id}/reactions`, {
-      method: "POST",
-      headers: reviewerHeaders,
-      body: JSON.stringify({ emoji: "eyes" }),
-    });
-    assert.equal(deniedCommentReactionRes.status, 200, await deniedCommentReactionRes.clone().text());
-    const deniedCommentReaction = (await deniedCommentReactionRes.json()) as { commentRef: unknown | null };
-    assert.equal(
-      deniedCommentReaction.commentRef,
-      null,
-      "user-denied viewer must not observe scoped commentRef via reaction response",
-    );
-    const commentReactionLiveUpdate = [...events].reverse().find((event) =>
-      event.event === "message:updated"
-      && event.room === `channel:${created.threadChannelId}`
-      && (event.payload as { id?: string }).id === created.message.id
-    );
-    assert.ok(commentReactionLiveUpdate, "comment reaction should emit a shared live update");
-    assert.equal(
-      (commentReactionLiveUpdate!.payload as { commentRef?: unknown }).commentRef,
-      null,
-      "shared comment reaction live update must not expose scoped commentRef",
-    );
-    const deniedCommentReactionDeleteRes = await fetch(`${baseUrl}/api/messages/${created.message.id}/reactions`, {
-      method: "DELETE",
-      headers: reviewerHeaders,
-      body: JSON.stringify({ emoji: "eyes" }),
-    });
-    assert.equal(deniedCommentReactionDeleteRes.status, 200, await deniedCommentReactionDeleteRes.clone().text());
-    const deniedCommentReactionDelete = (await deniedCommentReactionDeleteRes.json()) as { commentRef: unknown | null };
-    assert.equal(
-      deniedCommentReactionDelete.commentRef,
-      null,
-      "user-denied viewer must not observe scoped commentRef via reaction delete response",
-    );
-
-    const deniedParentReactionRes = await fetch(`${baseUrl}/api/messages/${fx.parentMessage.id}/reactions`, {
-      method: "POST",
-      headers: reviewerHeaders,
-      body: JSON.stringify({ emoji: "memo" }),
-    });
-    assert.equal(deniedParentReactionRes.status, 200, await deniedParentReactionRes.clone().text());
-    const deniedParentReaction = (await deniedParentReactionRes.json()) as {
-      attachments: Array<{ id: string; commentCount: number }>;
-    };
-    assert.equal(
-      deniedParentReaction.attachments.find((a) => a.id === fx.linked.id)?.commentCount,
-      0,
-      "user-denied viewer must not observe scoped commentCount via reaction response",
-    );
-    const parentReactionLiveUpdate = [...events].reverse().find((event) =>
-      event.event === "message:updated"
-      && event.room === `channel:${fx.channel.id}`
-      && (event.payload as { id?: string }).id === fx.parentMessage.id
-    );
-    assert.ok(parentReactionLiveUpdate, "parent reaction should emit a shared live update");
-    assert.equal(
-      ((parentReactionLiveUpdate!.payload as { attachments?: Array<{ id: string; commentCount: number }> })
-        .attachments ?? [])
-        .find((a) => a.id === fx.linked.id)?.commentCount,
-      0,
-      "shared parent reaction live update must not expose scoped commentCount",
-    );
-    const deniedParentReactionDeleteRes = await fetch(`${baseUrl}/api/messages/${fx.parentMessage.id}/reactions`, {
-      method: "DELETE",
-      headers: reviewerHeaders,
-      body: JSON.stringify({ emoji: "memo" }),
-    });
-    assert.equal(deniedParentReactionDeleteRes.status, 200, await deniedParentReactionDeleteRes.clone().text());
-    const deniedParentReactionDelete = (await deniedParentReactionDeleteRes.json()) as {
-      attachments: Array<{ id: string; commentCount: number }>;
-    };
-    assert.equal(
-      deniedParentReactionDelete.attachments.find((a) => a.id === fx.linked.id)?.commentCount,
-      0,
-      "user-denied viewer must not observe scoped commentCount via reaction delete response",
-    );
-
-    const deniedSearchRes = await fetch(
+    const commentSearchRes = await fetch(
       `${baseUrl}/api/messages/search?q=${encodeURIComponent("viewer-scoped flag probe")}&limit=10`,
       { headers: reviewerHeaders },
     );
-    assert.equal(deniedSearchRes.status, 200, await deniedSearchRes.clone().text());
-    const deniedSearch = (await deniedSearchRes.json()) as { results: Array<Record<string, unknown>> };
-    const deniedSearchHit = deniedSearch.results.find((m) => m.id === created.message.id);
-    assert.ok(deniedSearchHit, "search still returns the normal message result");
-    assert.equal("commentRef" in deniedSearchHit!, false, "search shape must not expose scoped commentRef");
-    assert.equal("attachments" in deniedSearchHit!, false, "search shape must not expose scoped attachment counts");
+    assert.equal(commentSearchRes.status, 200, await commentSearchRes.clone().text());
+    const commentSearch = (await commentSearchRes.json()) as { results: Array<Record<string, unknown>> };
+    const commentSearchHit = commentSearch.results.find((m) => m.id === created.message.id);
+    assert.ok(commentSearchHit, "search still returns the normal message result");
+    assert.equal("commentRef" in commentSearchHit!, false, "search shape must not expose scoped commentRef");
+    assert.equal("attachments" in commentSearchHit!, false, "search shape must not expose scoped attachment counts");
 
     const ownerThreadRes = await fetch(`${baseUrl}/api/messages/channel/${created.threadChannelId}?limit=50`, {
       headers: ownerHeaders,
@@ -454,7 +204,7 @@ test("attachment comments: message history hides scoped metadata for user-denied
     assert.equal(
       ownerThreadMessages.messages.find((m) => m.id === created.message.id)?.commentRef?.attachmentId,
       fx.linked.id,
-      "non-denied viewer still observes scoped commentRef",
+      "viewer observes scoped commentRef",
     );
 
     const ownerParentRes = await fetch(`${baseUrl}/api/messages/channel/${fx.channel.id}?limit=50`, {
@@ -465,7 +215,7 @@ test("attachment comments: message history hides scoped metadata for user-denied
       messages: Array<{ id: string; attachments: Array<{ id: string; commentCount: number }> }>;
     };
     const ownerParent = ownerParentMessages.messages.find((m) => m.id === fx.parentMessage.id);
-    assert.ok(ownerParent, "parent message present for non-denied viewer");
+    assert.ok(ownerParent, "parent message present");
     assert.equal(ownerParent!.attachments.find((a) => a.id === fx.linked.id)?.commentCount, 1);
 
     const ownerThreadContextRes = await fetch(
@@ -479,7 +229,7 @@ test("attachment comments: message history hides scoped metadata for user-denied
     assert.equal(
       ownerThreadContext.messages.find((m) => m.id === created.message.id)?.commentRef?.attachmentId,
       fx.linked.id,
-      "non-denied viewer still observes scoped commentRef via context/permalink",
+      "viewer observes scoped commentRef via context/permalink",
     );
 
     const ownerParentContextRes = await fetch(
@@ -495,7 +245,7 @@ test("attachment comments: message history hides scoped metadata for user-denied
         .find((m) => m.id === fx.parentMessage.id)
         ?.attachments.find((a) => a.id === fx.linked.id)?.commentCount,
       1,
-      "non-denied viewer still observes scoped commentCount via context/permalink",
+      "viewer observes scoped commentCount via context/permalink",
     );
 
     const ownerThreadSyncRes = await fetch(
@@ -510,7 +260,7 @@ test("attachment comments: message history hides scoped metadata for user-denied
     assert.equal(
       ownerThreadSync.find((m) => m.id === created.message.id)?.commentRef?.attachmentId,
       fx.linked.id,
-      "non-denied viewer still observes scoped commentRef via sync",
+      "viewer observes scoped commentRef via sync",
     );
 
     const ownerParentSyncRes = await fetch(
@@ -525,7 +275,7 @@ test("attachment comments: message history hides scoped metadata for user-denied
     assert.equal(
       ownerParentSync.find((m) => m.id === fx.parentMessage.id)?.attachments.find((a) => a.id === fx.linked.id)?.commentCount,
       1,
-      "non-denied viewer still observes scoped commentCount via sync",
+      "viewer observes scoped commentCount via sync",
     );
 
     events.length = 0;
@@ -541,7 +291,7 @@ test("attachment comments: message history hides scoped metadata for user-denied
     assert.equal(
       ownerCommentReaction.commentRef?.attachmentId,
       fx.linked.id,
-      "non-denied reaction response still observes scoped commentRef",
+      "reaction response observes scoped commentRef",
     );
     const ownerCommentReactionLiveUpdate = events.find((event) =>
       event.event === "message:updated"
@@ -568,7 +318,7 @@ test("attachment comments: message history hides scoped metadata for user-denied
     assert.equal(
       ownerParentReaction.attachments.find((a) => a.id === fx.linked.id)?.commentCount,
       1,
-      "non-denied reaction response still observes scoped commentCount",
+      "reaction response observes scoped commentCount",
     );
     const ownerParentReactionLiveUpdate = events.find((event) =>
       event.event === "message:updated"
@@ -589,7 +339,7 @@ test("attachment comments: message history hides scoped metadata for user-denied
 });
 
 test("attachment comments: closed loop (create → scoped list → counts → thread reuse → cascade)", async () => {
-  const { baseUrl, close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const { baseUrl, close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const fx = await seedFixture();
     const reviewerToken = await tokenForHuman("ac-reviewer@slock.test");
@@ -701,8 +451,8 @@ test("attachment comments: closed loop (create → scoped list → counts → th
   }
 });
 
-test("attachment comments: boundaries (unlinked 422, non-member 403, read-only A3 can read, archived 409)", async () => {
-  const { baseUrl, close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+test("attachment comments: boundaries (unlinked 404, non-member 403, read-only A3 can read, archived 409)", async () => {
+  const { baseUrl, close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const fx = await seedFixture();
     const reviewerToken = await tokenForHuman("ac-reviewer@slock.test");
@@ -710,14 +460,17 @@ test("attachment comments: boundaries (unlinked 422, non-member 403, read-only A
     const reviewerHeaders = authHeaders(reviewerToken, fx.server.id);
     const readonlyHeaders = authHeaders(readonlyToken, fx.server.id);
 
-    // J12: unlinked attachment rejects comment creation.
+    // J12: unlinked attachment rejects comment creation. An object-bound
+    // draft is not readable before its message exists (attachment authority),
+    // so it answers 404 like any unreadable id; the 422 below that check was
+    // only ever reached by object-less legacy rows (storage step 2b).
     const unlinkedRes = await fetch(`${baseUrl}/api/attachments/${fx.unlinked.id}/comments`, {
       method: "POST",
       headers: reviewerHeaders,
       body: JSON.stringify({ content: "too early" }),
     });
-    assert.equal(unlinkedRes.status, 422);
-    assert.equal(((await unlinkedRes.json()) as { code: string }).code, "attachment_not_linked");
+    assert.equal(unlinkedRes.status, 404);
+    assert.deepEqual(await unlinkedRes.json(), { error: "Attachment not found" });
 
     // Seed one comment so read paths have content.
     const seedComment = await fetch(`${baseUrl}/api/attachments/${fx.linked.id}/comments`, {
@@ -772,7 +525,7 @@ test("attachment comments: boundaries (unlinked 422, non-member 403, read-only A
 });
 
 test("attachment comments: GET viewer state and POST agree for writable channels", async () => {
-  const { baseUrl, close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const { baseUrl, close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const fx = await seedFixture();
     const reviewerToken = await tokenForHuman("ac-reviewer@slock.test");
@@ -798,7 +551,7 @@ test("attachment comments: GET viewer state and POST agree for writable channels
 });
 
 test("attachment comments: attachment hosted on a THREAD REPLY uses the existing thread (no thread-in-thread)", async () => {
-  const { baseUrl, close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const { baseUrl, close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const fx = await seedFixture();
     const db = getDb();
@@ -809,9 +562,7 @@ test("attachment comments: attachment hosted on a THREAD REPLY uses the existing
     // and a REPLY inside that thread carries its own attachment.
     const thread = await getOrCreateThread(fx.parentMessage.id, fx.owner.id, "user");
     const threadReply = await createMessage(thread.id, "user", fx.owner.id, "follow-up artifact", "chat");
-    const [threadHosted] = await db
-      .insert(attachments)
-      .values({
+    const [threadHosted] = await insertAttachmentsWithObjects(db, {
         id: "00000000-0000-4000-8000-00000000ac03",
         messageId: threadReply.id,
         channelId: thread.id,
@@ -821,8 +572,7 @@ test("attachment comments: attachment hosted on a THREAD REPLY uses the existing
         mimeType: "text/html",
         sizeBytes: 10,
         storageKey: `${fx.server.id}/fix-v2.html`,
-      })
-      .returning();
+      });
 
     const createRes = await fetch(`${baseUrl}/api/attachments/${threadHosted.id}/comments`, {
       method: "POST",
@@ -875,7 +625,7 @@ test("attachment comments: attachment hosted on a THREAD REPLY uses the existing
 });
 
 test("attachment comments: cross-server attachment ids are indistinguishable from nonexistent (404, not 422)", async () => {
-  const { baseUrl, close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const { baseUrl, close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const fx = await seedFixture();
     const db = getDb();
@@ -914,30 +664,29 @@ test("attachment comments: cross-server attachment ids are indistinguishable fro
     });
     assert.equal(linkedProbe.status, 404);
 
-    // Same-server member still gets the distinguishable 422 for unlinked.
+    // A same-server member gets the same 404 for an object-bound draft (see
+    // the J12 note in the boundaries case).
     const reviewerToken = await tokenForHuman("ac-reviewer@slock.test");
     const sameServer = await fetch(`${baseUrl}/api/attachments/${fx.unlinked.id}/comments`, {
       method: "POST",
       headers: authHeaders(reviewerToken, fx.server.id),
-      body: JSON.stringify({ content: "still 422 at home" }),
+      body: JSON.stringify({ content: "draft at home" }),
     });
-    assert.equal(sameServer.status, 422);
+    assert.equal(sameServer.status, 404);
   } finally {
     await close();
   }
 });
 
 test("attachment comments: private-channel attachment create cloaks before body validation", async () => {
-  const { baseUrl, close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const { baseUrl, close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const fx = await seedFixture();
     const db = getDb();
     const privateChannel = await createChannel(fx.server.id, "ac-private", "private reports", "private");
     await addHuman(privateChannel.id, fx.owner.id);
     const privateMessage = await createMessage(privateChannel.id, "user", fx.owner.id, "private report", "chat");
-    const [privateAttachment] = await db
-      .insert(attachments)
-      .values({
+    const [privateAttachment] = await insertAttachmentsWithObjects(db, {
         id: "00000000-0000-4000-8000-00000000ac04",
         messageId: privateMessage.id,
         channelId: privateChannel.id,
@@ -947,8 +696,7 @@ test("attachment comments: private-channel attachment create cloaks before body 
         mimeType: "text/html",
         sizeBytes: 10,
         storageKey: `${fx.server.id}/private.html`,
-      })
-      .returning();
+      });
 
     const reviewerToken = await tokenForHuman("ac-reviewer@slock.test");
     const reviewerHeaders = authHeaders(reviewerToken, fx.server.id);
@@ -972,7 +720,7 @@ test("attachment comments: private-channel attachment create cloaks before body 
 });
 
 test("attachment comments: structural anchors — closed vocabulary, payload cap, round-trip on list", async () => {
-  const { baseUrl, close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const { baseUrl, close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const fx = await seedFixture();
     const reviewerToken = await tokenForHuman("ac-reviewer@slock.test");
@@ -1116,7 +864,7 @@ test("attachment comments: structural anchors — closed vocabulary, payload cap
 });
 
 test("attachment comments: structured mentions ride the shared message pipeline", async () => {
-  const { baseUrl, close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const { baseUrl, close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const fx = await seedFixture();
     const reviewerToken = await tokenForHuman("ac-reviewer@slock.test");
@@ -1176,13 +924,14 @@ test("attachment comments: agents receive complete scope quotation across live, 
       agentId: agent.id,
       scopes: ["read"],
       name: "scope-history-search",
+      issuedVia: "computer",
       createdByUserId: null,
     });
     const channel = await createChannel(server.id, "scope-room", "channel");
     await addHuman(channel.id, owner.id);
     await addAgent(channel.id, agent.id);
     const parentMessage = await createMessage(channel.id, "user", owner.id, "artifact", "chat");
-    const [attachment] = await db.insert(attachments).values({
+    const [attachment] = await insertAttachmentsWithObjects(db, {
       messageId: parentMessage.id,
       channelId: channel.id,
       uploaderId: owner.id,
@@ -1191,7 +940,7 @@ test("attachment comments: agents receive complete scope quotation across live, 
       mimeType: "text/html",
       sizeBytes: 10,
       storageKey: `${server.id}/screen_text.html`,
-    }).returning();
+    });
 
     // Capture agent deliveries (harness stub pattern, see channels.api.test).
     const deliveries: Array<{ agentId: string; message: { content: string } }> = [];
@@ -1290,15 +1039,7 @@ test("attachment comments: agents receive complete scope quotation across live, 
       `filename-only scope line, got: ${plain!.message.content.slice(0, 60)}`,
     );
 
-    // Agent history/search deliberately evaluate the attachment-comment flag
-    // at SERVER scope, matching the dedicated Agent comment APIs. A user-only
-    // deny must not erase the quotation for an Agent viewer.
-    await db.insert(featureFlagRules).values({
-      flagKey: ATTACHMENT_COMMENTS_FEATURE_FLAG_KEY,
-      stage: "user",
-      decision: "deny",
-      values: [owner.id],
-    });
+    // Agent history/search carry the same scope block as live delivery.
     const agentHeaders = { Authorization: `Bearer ${agentCredential.apiKey}` };
     const threadRef = `#scope-room:${parentMessage.id.slice(0, 8)}`;
     const historyRes = await fetch(
@@ -1327,41 +1068,6 @@ test("attachment comments: agents receive complete scope quotation across live, 
       searchBody.results.find((message) => message.id === created.message.id)?.content,
       expectedScopedContent,
       "search carries the same two-line scope block as live delivery",
-    );
-
-    // Global flag-off must suppress the scope on BOTH retrospective Agent
-    // paths. The ordinary message remains readable, but filename and full
-    // selected text cannot leak through the projection.
-    await db
-      .update(featureFlags)
-      .set({ killSwitch: true })
-      .where(eq(featureFlags.key, ATTACHMENT_COMMENTS_FEATURE_FLAG_KEY));
-
-    const disabledHistoryRes = await fetch(
-      `${baseUrl}/internal/agent-api/history?channel=${encodeURIComponent(threadRef)}&limit=50`,
-      { headers: agentHeaders },
-    );
-    assert.equal(disabledHistoryRes.status, 200, await disabledHistoryRes.clone().text());
-    const disabledHistory = await disabledHistoryRes.json() as {
-      messages: Array<{ id: string; content: string }>;
-    };
-    assert.equal(
-      disabledHistory.messages.find((message) => message.id === created.message.id)?.content,
-      commentContent,
-      "flag-off history keeps the ordinary message but hides its attachment scope",
-    );
-
-    const disabledSearchRes = await fetch(`${baseUrl}/internal/agent-api/search?${searchParams}`, {
-      headers: agentHeaders,
-    });
-    assert.equal(disabledSearchRes.status, 200, await disabledSearchRes.clone().text());
-    const disabledSearch = await disabledSearchRes.json() as {
-      results: Array<{ id: string; content: string }>;
-    };
-    assert.equal(
-      disabledSearch.results.find((message) => message.id === created.message.id)?.content,
-      commentContent,
-      "flag-off search keeps the ordinary message but hides its attachment scope",
     );
   } finally {
     await close();

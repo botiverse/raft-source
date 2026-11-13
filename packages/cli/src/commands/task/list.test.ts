@@ -52,6 +52,7 @@ test("task list command uses injected ApiClient and writes canonical text", asyn
                 claimedById: "agent-haohao",
                 claimedByName: "HaoHao",
                 createdByName: "xxchan",
+                createdByHandle: "xxchan",
                 messageId: "abcd1234efgh5678",
                 revision: 4,
                 description: "field assertion\nrendering assertion",
@@ -76,7 +77,7 @@ test("task list command uses injected ApiClient and writes canonical text", asyn
       "",
       "#7 [in_progress] → @HaoHao (by @xxchan) msg=abcd1234 rev=4 Current title: migrate CLI command",
       "  Current description: field assertion",
-      "                       rendering assertion",
+      "  │ rendering assertion",
       "",
     ].join("\n"),
   );
@@ -103,6 +104,7 @@ test("task list --mine requests the bound-agent scope and renders grouped comple
                 title: "migrate\nCLI command",
                 channelRef: "#proj-runtime",
                 createdByName: "xxchan",
+                createdByHandle: "xxchan",
                 messageId: "abcd1234efgh5678",
               },
               {
@@ -239,4 +241,50 @@ test("task list command maps server failures into typed CliError", async () => {
       return true;
     },
   );
+});
+
+test("task list --following (task v2): GET /tasks/following, refs with unread and the read command", async () => {
+  const { io, stdout, stderr } = memoryIo();
+  const requests: Array<{ method: string; path: string }> = [];
+  const ctx = createCommandContext({
+    io,
+    loadAgentContext: () => agentContext,
+    createApiClient: () => ({
+      request: async (method: string, path: string): Promise<ApiResponse<unknown>> => {
+        requests.push({ method, path });
+        return {
+          ok: true,
+          status: 200,
+          error: null,
+          data: {
+            tasks: [
+              { taskRef: "#proj:#7", taskNumber: 7, title: "hero copy", status: "in_progress", unread: 2, followedAt: "2026-09-10T12:00:00.000Z", reason: "assigned" },
+              { taskRef: "dm:@alice:#3", taskNumber: 3, title: "pricing", status: "todo", unread: 0, followedAt: "2026-09-09T12:00:00.000Z", reason: "manual" },
+            ],
+          },
+        };
+      },
+    }) as any,
+  });
+
+  await taskListCommand.handler(ctx, { following: true });
+
+  assert.deepEqual(requests, [{ method: "GET", path: "/internal/agent-api/tasks/following" }]);
+  assert.deepEqual(stderr, []);
+  const out = stdout.join("");
+  assert.match(out, /^## Task conversations you follow on this server \(2\)\n/);
+  assert.ok(out.includes(`- #proj:#7 "hero copy" [in_progress] · 2 unread · raft task read "#proj:#7" --unread · followed `), out);
+  assert.ok(out.includes(`- dm:@alice:#3 "pricing" [todo] · 0 unread · followed `), out);
+  assert.ok(out.includes(`Stop following one: raft task unfollow "<ref>"`), out);
+});
+
+test("task list --following refuses --mine / --target / --status", async () => {
+  for (const extra of [{ mine: true }, { target: "#proj" }, { status: "all" }]) {
+    const { io } = memoryIo();
+    const ctx = createCommandContext({ io, loadAgentContext: () => agentContext, createApiClient: () => { throw new Error("no request"); } });
+    await assert.rejects(
+      async () => taskListCommand.handler(ctx, { following: true, ...extra } as any),
+      (err: unknown) => err instanceof CliError && err.code === "INVALID_ARG",
+    );
+  }
 });

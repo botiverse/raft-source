@@ -177,3 +177,29 @@ test("concurrent billing loads coalesce into a single request (task #17)", async
     useServerStore.setState({ billing: null, current: null, servers: [] });
   }
 });
+
+test("loadServers({ listOnly }) refreshes the list without the members / sidebar-order reads", async () => {
+  const original = api.get;
+  const paths: string[] = [];
+  api.get = (async (path: string) => {
+    paths.push(path);
+    if (path === "/servers") return { data: [server()] };
+    if (path.endsWith("/sidebar-order")) return { data: DEFAULT_SIDEBAR_ORDER };
+    return { data: [] };
+  }) as typeof api.get;
+  try {
+    useServerStore.setState({ servers: [server()], current: server() });
+    await useServerStore.getState().loadServers({ fresh: true, listOnly: true });
+    await new Promise((r) => setTimeout(r, 0));
+    assert.ok(paths.includes("/servers"), "the list is read");
+    assert.ok(!paths.some((p) => p.endsWith("/members") || p.endsWith("/sidebar-order")), `listOnly: ${paths.join(", ")}`);
+
+    paths.length = 0;
+    await useServerStore.getState().loadServers({ fresh: true });
+    await new Promise((r) => setTimeout(r, 0));
+    assert.ok(paths.some((p) => p.endsWith("/members")), `default still cascades: ${paths.join(", ")}`);
+  } finally {
+    api.get = original;
+    useServerStore.setState({ current: null, servers: [] });
+  }
+});

@@ -7,7 +7,7 @@ import { users, servers, serverMembers, channels, channelHumans, agents, message
 import { mintAgentCredential } from "../services/agentCredentialService";
 import * as occurrenceService from "../services/mentionDeliveryOccurrenceService";
 
-const test = createApiTest({ onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest();
 afterEach(() => vi.restoreAllMocks());
 
 async function seed() {
@@ -69,7 +69,7 @@ test("missing occurrence is unknown and failed lookup is not an empty success", 
 
 test("agent credentials cannot read another human sender's projection", async ({ http }) => {
   const s = await seed();
-  const credential = await mintAgentCredential({ agentId: s.agent.id, scopes: ["mentions"], createdByUserId: s.author.id });
+  const credential = await mintAgentCredential({ agentId: s.agent.id, scopes: ["mentions"], issuedVia: "human", createdByUserId: s.author.id });
   const response = await http.as(s.author, s.server).request(`/api/messages/${s.message.id}/mention-deliveries`, {
     method: "GET", headers: { Authorization: `Bearer ${credential.apiKey}` },
   });

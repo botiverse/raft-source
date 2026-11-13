@@ -1,6 +1,6 @@
 /**
  * Pure, Docker-free contract for the managed RisingWave bootstrap used by
- * raftdev (`--risingwave`) and the `risingwave-real` CI job.
+ * raftdev (`./raftdev start`, on by default) and the `risingwave-real` CI job.
  *
  * Runtime orchestration lives in packages/server/scripts/bootstrap-risingwave-local.ts,
  * where the server package's pg dependency is available. Keeping the manifest and
@@ -63,6 +63,9 @@ export const RISINGWAVE_CDC_TABLES: readonly RisingWaveCdcTable[] = [
       "name varchar",
       "type varchar",
       "parent_message_id varchar",
+      // Task conversations (078): the local parent channel and the task.
+      "parent_channel_id varchar",
+      "task_id varchar",
       "created_at timestamptz",
       "archived_at timestamptz",
       "deleted_at timestamptz",
@@ -153,6 +156,8 @@ export const RISINGWAVE_CDC_TABLES: readonly RisingWaveCdcTable[] = [
     name: "rw_message_mentions_v2",
     columns: [
       "id varchar",
+      // The first-mention anchor (078 rw_inbox_mention_v7, serve-time outsider lookup).
+      "message_id varchar",
       "message_seq bigint",
       "channel_id varchar",
       "target_type varchar",
@@ -203,8 +208,10 @@ export const RISINGWAVE_CDC_TABLES: readonly RisingWaveCdcTable[] = [
     primaryKey: ["receiver_type", "receiver_id", "target_kind", "target_channel_id"],
   },
   {
-    // The parent message's task in rw_followed_threads_v5 (074). Production
-    // carries the full table as `rw_tasks (*)`; this is the slice 074 reads.
+    // The parent message's task in rw_followed_threads_v5 (074); in
+    // rw_inbox_serving_v9 (078) also a task conversation's task (by
+    // channels.task_id). Production carries the full table as `rw_tasks (*)`;
+    // this is the slice 074 and 078 read.
     upstream: "tasks",
     name: "rw_tasks",
     columns: [
@@ -236,10 +243,10 @@ export const RISINGWAVE_ARTIFACT_CDC_TABLES = [
  * join on the Activity page) and the CDC integrity checker's windowed tables.
  */
 export const RISINGWAVE_SERVER_READ_RELATIONS = [
-  "rw_inbox_serving_v8",
-  "rw_activity_totals_v6",
-  "rw_agent_inbox_v6",
-  "rw_conversation_unread_v3",
+  "rw_inbox_serving_v9",
+  "rw_activity_totals_v7",
+  "rw_agent_inbox_v7",
+  "rw_conversation_unread_v4",
   "rw_followed_threads_v5",
   "rw_target_latest_v4",
   "rw_target_eligible_v1",
@@ -254,7 +261,7 @@ export interface RisingWaveBootstrapArtifact {
   /** Repo-relative path of the production SQL artifact. */
   file: string;
   /**
-   * CREATE TABLE / CREATE MATERIALIZED VIEW names to take from the file, in
+   * CREATE TABLE / CREATE [MATERIALIZED] VIEW names to take from the file, in
    * file order. Every other relation in the file is a superseded generation
    * and is skipped. Indexes are taken iff their base relation is built.
    */
@@ -273,6 +280,12 @@ export interface RisingWaveBootstrapArtifact {
  * (rw_agent_inbox_v4); all replaced by rw_agent_inbox_v5 in 068. Nor
  * 068-chain-mention-v6-consumers.sql: its generation (items v10, serving v6,
  * totals v4, agent inbox v5, conversation unread v2) is superseded by 076.
+ * Nor 067, 076 and 077 any more: every relation they create that the server
+ * reads, or that feeds one, has a 078 generation that treats task
+ * conversations as sub-conversations (078-task-conversations.sql); 075's arms
+ * stay (078 reads them). 066 is applied for rw_inbox_muted_full_v1 only: 078's
+ * conversation unread reads it instead of 075's rw_inbox_muted_full_v2 (same
+ * columns and semantics), which is therefore not built.
  */
 export const RISINGWAVE_BOOTSTRAP_ARTIFACTS: readonly RisingWaveBootstrapArtifact[] = [
   {
@@ -297,7 +310,8 @@ export const RISINGWAVE_BOOTSTRAP_ARTIFACTS: readonly RisingWaveBootstrapArtifac
   },
   {
     // v4 chain base. rw_inbox_normal_v4 is superseded by v5 (075); the v4
-    // mention/watermark/items/serving/totals by 063-chain-v5 + 067 + 076.
+    // mention/watermark/items/serving/totals by 063-chain-v5 + 067 + 076 + 077
+    // and then 078.
     file: "infra/risingwave/sql/063-unified-inbox-chain.sql",
     relations: [
       "rw_message_target_v3",
@@ -309,43 +323,46 @@ export const RISINGWAVE_BOOTSTRAP_ARTIFACTS: readonly RisingWaveBootstrapArtifac
   },
   {
     // Muted subscriptions. The per-(receiver, server) watermark v5 is superseded
-    // by v6 (077); the muted prefix arm v1 by v2 (075); items v9, serving v5,
-    // totals v3 and agent inbox v2 by 076.
+    // by v6 (077) and v7 (078); the muted prefix arm v1 by v2 (075); items v9,
+    // serving v5, totals v3 and agent inbox v2 by 076, 077 and 078.
     file: "infra/risingwave/sql/063-chain-v5.sql",
     relations: ["rw_muted_subs_v1"],
   },
   {
+    // The muted full-count arm rw_conversation_unread_v4 (078) reads.
+    // rw_conversation_unread_v1 in the same file is superseded.
+    file: "infra/risingwave/sql/066-conversation-unread-v1.sql",
+    relations: ["rw_inbox_muted_full_v1"],
+  },
+  {
     // The cursor-decoupled arms: the read cursor is a join condition, not a
-    // grouping key. Supersede rw_inbox_normal_v4 (063), rw_inbox_muted_prefix_v1
-    // (063-chain-v5) and rw_inbox_muted_full_v1 (066, whose file is no longer
-    // applied: rw_conversation_unread_v1 there is superseded too).
+    // grouping key. Supersede rw_inbox_normal_v4 (063) and
+    // rw_inbox_muted_prefix_v1 (063-chain-v5). rw_inbox_muted_full_v2 is not
+    // built: 078 reads 066's rw_inbox_muted_full_v1 instead.
     file: "infra/risingwave/sql/075-inbox-cursor-decouple.sql",
-    relations: ["rw_inbox_normal_v5", "rw_inbox_muted_full_v2", "rw_inbox_muted_prefix_v2"],
+    relations: ["rw_inbox_normal_v5", "rw_inbox_muted_prefix_v2"],
   },
   {
-    file: "infra/risingwave/sql/067-mention-v6.sql",
-    relations: ["rw_inbox_mention_v6"],
-  },
-  {
-    // 068's consumers on the 075 arms (same definitions, source names advanced).
-    // Its serving v7 and totals v5 are superseded by 077; items v11 stays as the
-    // base 077's items v12 filters.
-    file: "infra/risingwave/sql/076-cursor-decouple-consumers.sql",
+    // Task conversations (channels.type = 'task') are sub-conversations like
+    // threads: rw_conversation_parent_v1 (rw_thread_parent_v3 plus task
+    // conversations) and the generation on it, which supersedes 067's mention
+    // arm, 076's items / agent inbox / conversation unread and 077's watermark
+    // / items / serving / totals.
+    file: "infra/risingwave/sql/078-task-conversations.sql",
     relations: [
-      "rw_inbox_items_v11",
-      "rw_agent_inbox_v6",
-      "rw_conversation_unread_v3",
-    ],
-  },
-  {
-    // Threads below a deleted parent leave the human Activity: the watermark,
-    // items, serving and totals generation that filters them (task #333).
-    file: "infra/risingwave/sql/077-deleted-parent-threads.sql",
-    relations: [
-      "rw_activity_watermark_v6",
-      "rw_inbox_items_v12",
-      "rw_inbox_serving_v8",
-      "rw_activity_totals_v6",
+      "rw_conversation_parent_v1",
+      "rw_task_conversation_replies_v1",
+      "rw_task_conversation_unread_v1",
+      "rw_inbox_mention_v7",
+      "rw_activity_watermark_v7",
+      "rw_inbox_items_v13",
+      "rw_inbox_preview_need_v1",
+      "rw_inbox_preview_seq_v1",
+      "rw_inbox_preview_parent_v1",
+      "rw_inbox_serving_v9",
+      "rw_activity_totals_v7",
+      "rw_agent_inbox_v7",
+      "rw_conversation_unread_v4",
     ],
   },
   {
@@ -360,12 +377,13 @@ export const RISINGWAVE_BOOTSTRAP_ARTIFACTS: readonly RisingWaveBootstrapArtifac
     // the parent message and its task (rw_tasks), joint projections included
     // (canonical parent, local joint parent channel). Reads
     // rw_receiver_cursors_v1 (063). Supersedes 072 (rw_followed_threads_v4).
+    // Threads only: followed task conversations are read from Postgres.
     file: "infra/risingwave/sql/074-followed-threads-v5.sql",
     relations: ["rw_followed_threads_v5"],
   },
 ] as const;
 
-/** Every table/MV the bootstrap creates, in creation order. */
+/** Every table/view/MV the bootstrap creates, in creation order. */
 export const RISINGWAVE_REQUIRED_RELATIONS: readonly string[] = [
   ...RISINGWAVE_CDC_TABLES.map((table) => table.name),
   ...RISINGWAVE_BOOTSTRAP_ARTIFACTS.flatMap((artifact) => artifact.relations),
@@ -485,7 +503,7 @@ function sqlStatementBody(statement: string): string {
 
 export function createdRelationName(statement: string): string | null {
   const match = sqlStatementBody(statement).match(
-    /^CREATE\s+(?:MATERIALIZED\s+VIEW|TABLE|(?:UNIQUE\s+)?INDEX)\s+([a-zA-Z_][a-zA-Z0-9_]*)\b/i,
+    /^CREATE\s+(?:(?:MATERIALIZED\s+)?VIEW|TABLE|(?:UNIQUE\s+)?INDEX)\s+([a-zA-Z_][a-zA-Z0-9_]*)\b/i,
   );
   return match?.[1] ?? null;
 }
@@ -499,7 +517,7 @@ export function createdIndexTarget(statement: string): string | null {
 }
 
 function isCreateRelation(statement: string): boolean {
-  return /^CREATE\s+(?:MATERIALIZED\s+VIEW|TABLE)\b/i.test(sqlStatementBody(statement));
+  return /^CREATE\s+(?:(?:MATERIALIZED\s+)?VIEW|TABLE)\b/i.test(sqlStatementBody(statement));
 }
 
 /** Statement text with comments and string literals blanked, for identifier scans. */
@@ -557,7 +575,7 @@ function isDdlSetting(body: string): boolean {
  * `artifacts` maps each RISINGWAVE_BOOTSTRAP_ARTIFACTS file to its contents.
  * Guards make a future artifact rewrite fail loudly instead of silently
  * applying a partial, unsafe, duplicate, or out-of-order graph:
- *   - an artifact may contain only CREATE TABLE / MATERIALIZED VIEW / INDEX and
+ *   - an artifact may contain only CREATE TABLE / [MATERIALIZED] VIEW / INDEX and
  *     the two DDL settings (which are dropped: the prelude pins foreground DDL);
  *   - every selected relation exists exactly once in its artifact;
  *   - leading comments are dropped (history notes may quote superseded settings);

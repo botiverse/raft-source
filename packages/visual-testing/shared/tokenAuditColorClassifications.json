@@ -87,28 +87,22 @@
         "reason": "Muted reaction chip border pending promotion to a named shared token."
       },
       {
-        "file": "packages/web/src/components/search/MessageSearchPage.tsx",
+        "file": "packages/web/src/features/search/MessageSearchPage.tsx",
         "value": "#FFF4BF",
         "category": "search-highlight",
         "reason": "Search match highlight surface; should be promoted only after KMP parity review."
       },
       {
-        "file": "packages/web/src/components/search/MessageSearchPage.tsx",
+        "file": "packages/web/src/features/search/MessageSearchPage.tsx",
         "value": "#FF7AD9",
         "category": "search-highlight",
         "reason": "Search entity accent; should be promoted only after KMP parity review."
       },
       {
-        "file": "packages/web/src/components/search/MessageSearchPage.tsx",
+        "file": "packages/web/src/features/search/MessageSearchPage.tsx",
         "value": "#FFEEFB",
         "category": "search-highlight",
         "reason": "Search entity pale accent; should be promoted only after KMP parity review."
-      },
-      {
-        "file": "packages/web/src/components/settings/MemberGraphSection.tsx",
-        "value": "#F8F8F0",
-        "category": "graph-surface",
-        "reason": "Member graph canvas surface pending component-specific token decision."
       },
       {
         "file": "packages/web/src/components/settings/SettingsPanel.tsx",

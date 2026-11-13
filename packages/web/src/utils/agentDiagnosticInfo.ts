@@ -120,6 +120,7 @@ function buildExternalAgentDiagnosticLines({
       `pushLastDeliveryAtUtc: ${formatIsoString(push.lastDeliveryAt)}`,
       `pushLastAttemptAtUtc: ${formatIsoString(push.lastAttemptAt)}`,
       `pushLastError: ${push.lastError ?? "none"}`,
+      ...(push.recovery ? [`pushRecovery: ${push.recovery}`] : []),
     );
   }
   lines.push(

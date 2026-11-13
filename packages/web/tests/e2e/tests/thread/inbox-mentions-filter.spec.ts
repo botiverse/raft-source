@@ -1,9 +1,16 @@
 import { expect, test } from "@playwright/test";
-import type { APIRequestContext } from "@playwright/test";
+import type { APIRequestContext, Page } from "@playwright/test";
 import { loginViaApi } from "../../fixtures/auth";
 import { waitForSeedState } from "../../fixtures/seedState";
 import type { PlaywrightSeedState } from "../../fixtures/seedState";
 import { dismissOwnerOnboarding, loginWithCredentials } from "../../fixtures/session";
+
+/** Picks a list in Activity's Filter menu (task #172); the pick closes the menu. */
+async function chooseInboxFilter(page: Page, choice: "all" | "unread" | "mentions" | "pinned") {
+  await page.getByTestId("inbox-filter-button").click();
+  await page.getByTestId(`inbox-filter-${choice}`).click();
+  await expect(page.getByTestId("inbox-filter-menu")).toHaveCount(0);
+}
 
 function headers(seedState: PlaywrightSeedState, accessToken: string) {
   return {
@@ -121,7 +128,7 @@ test.describe("Inbox Mentions filter (Plan A)", () => {
 
     await page.goto(`/s/${seedState.server.slug}/inbox`);
     await expect(page.getByRole("heading", { name: "Activity" })).toBeVisible();
-    await expect(page.getByTestId("inbox-filter-mentions")).toBeVisible();
+    await expect(page.getByTestId("inbox-filter-button")).toBeVisible();
 
     // All filter — both channels visible.
     const rows = page.getByTestId("inbox-row");
@@ -129,7 +136,7 @@ test.describe("Inbox Mentions filter (Plan A)", () => {
     await expect(rows.filter({ hasText: noMentionText })).toBeVisible();
 
     // Mentions filter — only the @-mentioned channel.
-    await page.getByTestId("inbox-filter-mentions").click();
+    await chooseInboxFilter(page, "mentions");
     await expect(rows.filter({ hasText: mentionText })).toBeVisible();
     await expect(rows.filter({ hasText: noMentionText })).toHaveCount(0);
 
@@ -142,17 +149,17 @@ test.describe("Inbox Mentions filter (Plan A)", () => {
 
     // Reload to refetch inbox. Mentions tab still shows the now-read row.
     await page.goto(`/s/${seedState.server.slug}/inbox`);
-    await page.getByTestId("inbox-filter-mentions").click();
+    await chooseInboxFilter(page, "mentions");
     const persistedRow = page.getByTestId("inbox-row").filter({ hasText: mentionText });
     await expect(persistedRow).toBeVisible();
-    await expect(persistedRow).not.toContainText(" new");
+    await expect(persistedRow.getByTestId("conversation-card-new-badge")).toHaveCount(0);
 
     // Unread filter — read row should NOT appear.
-    await page.getByTestId("inbox-filter-unread").click();
+    await chooseInboxFilter(page, "unread");
     await expect(page.getByTestId("inbox-row").filter({ hasText: mentionText })).toHaveCount(0);
 
     // Marking the row done removes it from Mentions (consistent with All).
-    await page.getByTestId("inbox-filter-mentions").click();
+    await chooseInboxFilter(page, "mentions");
     const mentionRow = page.getByTestId("inbox-row").filter({ hasText: mentionText });
     await expect(mentionRow).toBeVisible();
     // The card reveals pointer actions on hover; the done affordance is a RUI

@@ -2,12 +2,11 @@ import { randomUUID } from "node:crypto";
 import { Readable } from "node:stream";
 import { and, eq, gt, inArray, lt, or } from "drizzle-orm";
 import { clearClockInterval, currentDate, noopTracer, setClockInterval, type Tracer } from "@botiverse/raft-shared";
-import { isAttachmentDirectUploadEnabledForServer } from "../config/attachmentDirectUpload";
-import { isAttachmentOriginalStorageV2EnabledForServer } from "../config/attachmentOriginalStorage";
 import type { AttachmentUploadSessionService, AttachmentUploadSessionContext, AttachmentUploadSessionResult, CreateAttachmentUploadSessionInput } from "../routes/attachmentUploadSessions";
-import { normalizeAttachmentFilename, normalizeUploadedMimeType } from "../routes/attachments";
+import { canGenerateImagePreview, normalizeAttachmentFilename, normalizeUploadedMimeType } from "../routes/attachments";
 import { getDb, type DatabaseTransaction } from "../db/index";
-import { attachments, attachmentUploadReservations, attachmentUploadSessions } from "../db/schema";
+import { attachmentObjects, attachments, attachmentUploadReservations, attachmentUploadSessions } from "../db/schema";
+import { type ResolvedAttachment, withAttachmentObjectMetadata } from "./attachmentRecord";
 import { createPendingAttachmentProjectionWithExecutor } from "./attachmentProjectionWriterService";
 import { terminateAttachmentReservationWithExecutor } from "./attachmentLifecycleService";
 import {
@@ -40,7 +39,6 @@ import { reconcileConversionUploadBlocker } from "./channelConversionUploadRecon
 import { errorClassOf, withTraceRoot } from "../tracing/semanticTrace";
 import {
   buildDirectAttachmentStorageKey,
-  buildLegacyDirectAttachmentStorageKey,
   getDirectUploadStorage,
   getStorage,
 } from "./storageService";
@@ -51,7 +49,7 @@ const CLEANUP_LEASE_MS = 5 * 60 * 1000;
 const SWEEP_BATCH_SIZE = 100;
 
 type SessionRow = typeof attachmentUploadSessions.$inferSelect;
-type AttachmentRow = typeof attachments.$inferSelect;
+type AttachmentRow = ResolvedAttachment;
 type CleanupClaim = { session: SessionRow; leaseId: string };
 
 export interface AttachmentUploadSessionServiceHooks {
@@ -62,10 +60,6 @@ export interface AttachmentUploadSessionServiceHooks {
   beforePublicationTransition?: (uploadId: string) => Promise<void>;
   afterPublicationFence?: (uploadId: string) => Promise<void>;
 }
-
-export type AttachmentDirectUploadGate = (
-  context: AttachmentUploadSessionContext,
-) => Promise<boolean>;
 
 const forbidden = (message = "The member cannot access this upload."): AttachmentUploadSessionResult => ({
   status: 403,
@@ -152,8 +146,15 @@ function attachmentBody(row: AttachmentRow) {
 
 async function attachmentForSession(row: SessionRow): Promise<AttachmentRow | null> {
   if (row.state !== "completed") return null;
-  const [attachment] = await getDb().select().from(attachments).where(eq(attachments.id, row.attachmentId)).limit(1);
-  return attachment ?? null;
+  const [found] = await getDb()
+    .select({ projection: attachments, object: attachmentObjects })
+    .from(attachments)
+    .innerJoin(attachmentObjects, eq(attachmentObjects.id, attachments.objectId))
+    .where(eq(attachments.id, row.attachmentId))
+    .limit(1);
+  if (!found) return null;
+  // Type and size come from the object only.
+  return withAttachmentObjectMetadata(found.projection, found.object);
 }
 
 async function sessionBody(row: SessionRow) {
@@ -196,15 +197,20 @@ function uploadActor(context: AttachmentUploadSessionContext): Readonly<{
 
 export class DurableAttachmentUploadSessionService implements AttachmentUploadSessionService {
   private readonly directUploadEnabled: boolean;
+  private readonly onThumbnailPending: (() => void) | undefined;
 
   constructor(
     private readonly storage: StorageBackend,
-    private readonly isEnabledForServer: AttachmentDirectUploadGate,
     private readonly now: () => Date = currentDate,
     private readonly hooks: AttachmentUploadSessionServiceHooks = {},
-    options: Readonly<{ directUploadEnabled?: boolean }> = {},
+    options: Readonly<{
+      directUploadEnabled?: boolean;
+      /** Wakes the thumbnail worker after a completed image upload (it never blocks completion). */
+      onThumbnailPending?: () => void;
+    }> = {},
   ) {
     this.directUploadEnabled = options.directUploadEnabled ?? true;
+    this.onThumbnailPending = options.onThumbnailPending;
     if (this.directUploadEnabled && (!storage.head || !storage.getPresignedPutUrl)) {
       throw new Error("Direct attachment uploads require storage head and conditional presign support");
     }
@@ -212,7 +218,7 @@ export class DurableAttachmentUploadSessionService implements AttachmentUploadSe
 
   async capabilities(context: AttachmentUploadSessionContext): Promise<AttachmentUploadSessionResult> {
     const quota = await getFileUploadQuotaSummary(context.serverId, this.now());
-    if (!this.directUploadEnabled || !await this.isEnabledForServer(context)) {
+    if (!this.directUploadEnabled) {
       return {
         status: 200,
         body: {
@@ -277,7 +283,6 @@ export class DurableAttachmentUploadSessionService implements AttachmentUploadSe
     if (!this.directUploadEnabled || !this.storage.getPresignedPutUrl) {
       return forbidden("Direct uploads are disabled; cancel any unfinished upload instead.");
     }
-    if (!await this.isEnabledForServer(context)) return forbidden("Direct uploads are disabled for this server.");
     const actor = uploadActor(context);
     const normalizedInput = {
       ...input,
@@ -300,9 +305,7 @@ export class DurableAttachmentUploadSessionService implements AttachmentUploadSe
     const attachmentId = randomUUID();
     const objectId = randomUUID();
     const storageObjectId = randomUUID();
-    const storageKey = await isAttachmentOriginalStorageV2EnabledForServer(context.serverId)
-      ? buildDirectAttachmentStorageKey(context.serverId, uploadId, storageObjectId)
-      : buildLegacyDirectAttachmentStorageKey(context.serverId, uploadId, storageObjectId);
+    const storageKey = buildDirectAttachmentStorageKey(context.serverId, uploadId, storageObjectId);
     const expiresAt = new Date(now.getTime() + sessionTtlMs());
     const uploadUrl = await this.storage.getPresignedPutUrl!(storageKey, {
       expiresIn: Math.ceil(sessionTtlMs() / 1000),
@@ -370,7 +373,6 @@ export class DurableAttachmentUploadSessionService implements AttachmentUploadSe
   }
 
   async complete(context: AttachmentUploadSessionContext, uploadId: string): Promise<AttachmentUploadSessionResult> {
-    if (!await this.isEnabledForServer(context)) return forbidden("Direct uploads are disabled for this server.");
     const actor = uploadActor(context);
     let session = await this.findOwned(context, uploadId);
     if (!session) return forbidden("The member cannot complete this upload.");
@@ -515,6 +517,9 @@ export class DurableAttachmentUploadSessionService implements AttachmentUploadSe
         objectEtag: object.etag,
         verifiedSizeBytes: object.sizeBytes,
         verifiedContentType: object.contentType,
+        // The thumbnail worker picks a previewable image up after this commit
+        // (task #57); anything else never gets one.
+        thumbnailState: canGenerateImagePreview(locked.mimeType) ? "pending" : "skipped",
         completedAt: this.now(),
         updatedAt: this.now(),
       }).where(eq(attachmentUploadSessions.id, locked.id)).returning();
@@ -525,6 +530,7 @@ export class DurableAttachmentUploadSessionService implements AttachmentUploadSe
       throw err;
     }
     if (!completed) return forbidden("The member cannot complete this upload.");
+    if (completed.state === "completed" && completed.thumbnailState === "pending") this.onThumbnailPending?.();
     if (completed.state !== "completed") {
       return {
         status: 409,
@@ -540,7 +546,6 @@ export class DurableAttachmentUploadSessionService implements AttachmentUploadSe
   }
 
   async cancel(context: AttachmentUploadSessionContext, uploadId: string): Promise<AttachmentUploadSessionResult> {
-    if (!await this.isEnabledForServer(context)) return forbidden("Direct uploads are disabled for this server.");
     const session = await this.findOwned(context, uploadId);
     if (!session) return sessionNotFound();
     if (session.state === "completed") {
@@ -594,7 +599,6 @@ export class DurableAttachmentUploadSessionService implements AttachmentUploadSe
   }
 
   async status(context: AttachmentUploadSessionContext, uploadId: string): Promise<AttachmentUploadSessionResult> {
-    if (!await this.isEnabledForServer(context)) return forbidden("Direct uploads are disabled for this server.");
     let session = await this.findOwned(context, uploadId);
     if (!session) return sessionNotFound();
     if ((session.state === "pending" || session.state === "verifying") && session.expiresAt <= this.now()) {
@@ -823,7 +827,9 @@ export class DurableAttachmentUploadSessionService implements AttachmentUploadSe
   }
 }
 
-export function createDurableAttachmentUploadSessionService(): DurableAttachmentUploadSessionService | null {
+export function createDurableAttachmentUploadSessionService(
+  options: Readonly<{ onThumbnailPending?: () => void }> = {},
+): DurableAttachmentUploadSessionService | null {
   const attachmentStorage = getStorage();
   const storage = getDirectUploadStorage();
   const directUploadEnabled = isAttachmentDirectUploadEnabled();
@@ -834,7 +840,10 @@ export function createDurableAttachmentUploadSessionService(): DurableAttachment
     get: async () => Readable.from([]),
     delete: async () => {},
   };
-  return new DurableAttachmentUploadSessionService(recoveryStorage, isAttachmentDirectUploadEnabledForServer, currentDate, {}, { directUploadEnabled });
+  return new DurableAttachmentUploadSessionService(recoveryStorage, currentDate, {}, {
+    directUploadEnabled,
+    onThumbnailPending: options.onThumbnailPending,
+  });
 }
 
 export function startAttachmentUploadSessionCleanup(

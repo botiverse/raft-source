@@ -1,6 +1,4 @@
 import { test as base } from "@playwright/test";
-import type { TestInfo } from "@playwright/test";
-import { evidenceConfig, observeLogin } from "../../../../../scripts/e2e/transportEvidence";
 import { waitForSeedState } from "./seedState";
 import type { ScenarioSeedState } from "./seedState";
 
@@ -10,18 +8,14 @@ type Scenario = {
   peer: { id: string; name: string; accessToken: string };
 };
 
-async function loginAccount(apiUrl: string, account: { email: string; password: string }, info: TestInfo) {
-  return observeLogin(evidenceConfig(), {
-    retry: info.retry, workerIndex: info.workerIndex, parallelIndex: info.parallelIndex,
-  }, async (evidenceHeaders) => {
-    const response = await fetch(`${apiUrl}/api/auth/login`, {
-      signal: AbortSignal.timeout(10_000),
-      method: "POST", headers: { "Content-Type": "application/json", ...evidenceHeaders },
-      body: JSON.stringify({ email: account.email, password: account.password }),
-    });
-    if (!response.ok) throw new Error(`Scenario login failed: HTTP ${response.status}`);
-    return await response.json() as Scenario["login"];
+async function loginAccount(apiUrl: string, account: { email: string; password: string }) {
+  const response = await fetch(`${apiUrl}/api/auth/login`, {
+    signal: AbortSignal.timeout(10_000),
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email: account.email, password: account.password }),
   });
+  if (!response.ok) throw new Error(`Scenario login failed: HTTP ${response.status}`);
+  return await response.json() as Scenario["login"];
 }
 
 /** Large history is setup; browser search still reads it through the real API. */
@@ -36,6 +30,39 @@ export async function seedThreadWindow(seed: ScenarioSeedState): Promise<{
   });
   if (!response.ok) throw new Error(`Thread scenario seed failed: HTTP ${response.status}`);
   return response.json();
+}
+
+export type ChannelHistory = {
+  /** Oldest first. */
+  messages: Array<{ id: string; content: string }>;
+  latestContent: string;
+  /** `focusFromEnd` messages before the latest: a permalink detached from the tail. */
+  focusMessageId: string;
+};
+
+/**
+ * `count` messages in the scenario's channel, which nobody else posts to: the
+ * tail and the size of the history are known whatever other workers do.
+ */
+export async function seedChannelHistory(
+  seed: ScenarioSeedState,
+  { count = 60, focusFromEnd = 30 }: { count?: number; focusFromEnd?: number } = {},
+): Promise<ChannelHistory> {
+  const shared = await waitForSeedState();
+  const response = await fetch(
+    `${seed.urls.api}/__playwright/scenarios/${seed.server.id}/channel-history?count=${count}`,
+    {
+      method: "POST", signal: AbortSignal.timeout(30_000),
+      headers: { Authorization: `Bearer ${shared.scenarioCapability}` },
+    },
+  );
+  if (!response.ok) throw new Error(`Channel history seed failed: HTTP ${response.status}`);
+  const { messages } = await response.json() as { messages: ChannelHistory["messages"] };
+  return {
+    messages,
+    latestContent: messages[messages.length - 1]!.content,
+    focusMessageId: messages[Math.max(0, messages.length - 1 - focusFromEnd)]!.id,
+  };
 }
 
 /** Test-scoped, including retry/repeat: browser and API always use the same owner. */
@@ -53,8 +80,8 @@ export const test = base.extend<{ scenario: Scenario }>({
     };
     const seed: ScenarioSeedState = { ...provisioned, urls: shared.urls };
     try {
-      const login = await loginAccount(seed.urls.api, seed.user, testInfo);
-      const peerLogin = await loginAccount(seed.urls.api, provisioned.peer, testInfo);
+      const login = await loginAccount(seed.urls.api, seed.user);
+      const peerLogin = await loginAccount(seed.urls.api, provisioned.peer);
       await use({ seed, login, peer: {
         id: provisioned.peer.id, name: provisioned.peer.name, accessToken: peerLogin.accessToken,
       } });

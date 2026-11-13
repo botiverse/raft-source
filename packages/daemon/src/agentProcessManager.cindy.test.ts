@@ -35,7 +35,7 @@ async function withCindyManager(
     id: "prompt-test",
     lifecycle: { kind: "persistent", stdin: "direct", inFlightWake: "steer" },
     communication: { chat: "slock_cli", runtimeControl: "none" },
-    session: { recovery: "resume_or_fresh" },
+    session: { recovery: "resume_or_fresh", compaction: "reported", compactionFailure: "does_not_stick" } as const,
     model: { detectedModelsVerifiedAs: "suggestion_only" },
     supportsStdinNotification: true,
     busyDeliveryMode: "direct",

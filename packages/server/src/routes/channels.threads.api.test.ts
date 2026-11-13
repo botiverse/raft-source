@@ -1,3 +1,4 @@
+import { handlerTraceEvents } from "../test/handlerTraceEvents";
 import { fixturePasswordHash, tokenForHuman } from "../test/integration/credentials";
 import { createApiTest } from "../test/integration/apiTest";
 import { openTestApp } from "../test/integration/app";
@@ -11,6 +12,7 @@ import {
   MemoryTraceSink
 } from "@botiverse/raft-shared";
 import { getDb } from "../db/index";
+import { traceIdentityHash } from "../tracing/traceIdentity";
 import { dbQueryErrorsTotal } from "../metrics";
 import { closeRisingWavePool, RisingWaveOverloadedError } from "../db/risingwave";
 import { __setStaleReadStoreForTests } from "./rwStaleRead";
@@ -22,7 +24,7 @@ import {
   channelHumans,
   channelAgents,
   messages, threadFollows, userChannelReadCursors, inboxNotificationFacts,
-  inboxSuppressionStates, tasks, featureFlags, agentActivityEvents, messageMentions
+  inboxSuppressionStates, tasks, featureFlags, agentActivityEvents, messageMentions, notificationOutbox
 } from "../db/schema";
 import { addMember, removeMember } from "../services/serverService";
 import { createAgent } from "../services/agentService";
@@ -32,10 +34,10 @@ import {
 } from "../services/messageService";
 import * as taskService from "../services/taskService";
 import { registerMachine } from "../services/machineService";
-import { assignMachine } from "../services/agentService";
+import { placeAgentOnMachine } from "../test/agentMachineFixture";
 import { createServer, installFakeIo, recordTestInboxFact, seedThreadFixture, headers, channelDoneBody, threadDoneBody, legacyDoneFallbackCount, seedUser, fetchInboxAll } from "./channels.api.fixtures";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 /**
  * The v3 stats tests below mock the pool's query (the v3 read). The active list
@@ -346,10 +348,11 @@ test("GET /api/channels/threads/followed records followed-thread phases and quer
   );
   assert.ok(span, "expected GET /api/channels/threads/followed root span");
 
-  const processEventNames = span.events
+  const processEventNames = handlerTraceEvents(span.events)
     .map((event) => event.name)
     .filter((name) => name !== "db.query.finished");
   assert.deepEqual(processEventNames, [
+    "activity.list.fetch",
     "followed_threads.load.started",
     "history.policy.checked",
     // hasMention: the sidebar unread read (same source as threadUnread.hasMention).
@@ -366,10 +369,13 @@ test("GET /api/channels/threads/followed records followed-thread phases and quer
 
   // Active follows of a member: the rw_followed_threads_v5 path. Its query set
   // is constant in the number of threads (primary-key / distinct-parent reads).
-  const dbEvents = span.events.filter((event) => event.name === "db.query.finished");
+  const dbEvents = handlerTraceEvents(span.events).filter((event) => event.name === "db.query.finished");
   assert.deepEqual(
     dbEvents.map((event) => event.attrs?.query_name).sort(),
     [
+      // Task v2: followed task conversations are one more query, whatever the
+      // reader's flag (a v2 task keeps its conversation after a rollback).
+      "channels.followed_task_conversations_by_user",
       "channels.followed_thread_ids_by_user",
       "channels.followed_threads.parent_channels",
       "channels.followed_threads.read_cursors",
@@ -378,7 +384,7 @@ test("GET /api/channels/threads/followed records followed-thread phases and quer
       "channels.unread_counts_by_user",
     ],
   );
-  assert.equal(dbEvents.length, 6, "followed threads query count should stay constant for task-claimant enrichment");
+  assert.equal(dbEvents.length, 7, "followed threads query count should stay constant for task-claimant enrichment");
 
   const dbEventByQuery = new Map(dbEvents.map((event) => [event.attrs?.query_name, event]));
   assert.equal(dbEventByQuery.get("channels.followed_thread_ids_by_user")?.attrs?.phase, "followed_threads.loaded");
@@ -1120,7 +1126,7 @@ test("GET /api/channels/:id/threads records thread-summary phases and constant q
   );
   assert.ok(span, "expected GET /api/channels/:id/threads root span");
 
-  const processEventNames = span.events
+  const processEventNames = handlerTraceEvents(span.events)
     .map((event) => event.name)
     .filter((name) => name !== "db.query.finished");
   assert.deepEqual(processEventNames, [
@@ -1132,7 +1138,7 @@ test("GET /api/channels/:id/threads records thread-summary phases and constant q
     "http.response.finished",
   ]);
 
-  const dbEvents = span.events.filter((event) => event.name === "db.query.finished");
+  const dbEvents = handlerTraceEvents(span.events).filter((event) => event.name === "db.query.finished");
   assert.deepEqual(
     dbEvents.map((event) => event.attrs?.query_name).sort(),
     [
@@ -1248,6 +1254,36 @@ test("GET /api/channels/:id/threads projects agent display names into latest rep
 });
 
 
+test("member reply previews in a non-joint channel resolve an agent exactly like its parent row (wg-rbac #56)", async ({ app }) => {
+  const owner = await seedUser("thread-summary-foreign-agent-owner@slock.test", "thread-summary-foreign-agent-owner");
+  const server = await createServer("Thread Summary Foreign Agent Server", "thread-summary-foreign-agent-server", owner.id);
+  const otherServer = await createServer("Thread Summary Foreign Agent Other", "thread-summary-foreign-agent-other", owner.id);
+  const channel = await createChannel(server.id, "thread-summary-foreign-agent-channel");
+  await addHuman(channel.id, owner.id);
+  const foreignAgent = await createAgent(otherServer.id, "ForeignAgent", { runtime: "codex" });
+  await getDb().update(agents).set({ displayName: "Foreign Agent Label" }).where(eq(agents.id, foreignAgent.id));
+
+  // Same agent as a parent row and as a reply: the preview must say what the
+  // parent row says for that agent, whatever the member rule is.
+  const parent = await createMessage(channel.id, "agent", foreignAgent.id, "foreign agent parent");
+  const thread = await getOrCreateThread(parent.id, owner.id, "user");
+  await createMessage(thread.id, "agent", foreignAgent.id, "foreign agent reply");
+
+  const ownerToken = await tokenForHuman(owner.email);
+  const res = await fetch(`${app.baseUrl}/api/messages/channel/${channel.id}`, { headers: headers(ownerToken, server.id) });
+  assert.equal(res.status, 200, await res.clone().text());
+  const body = await res.json() as {
+    messages: Array<{ id: string; senderName: string }>;
+    threadSummariesByParentMessageId: Record<string, { latestReplies: Array<{ preview: string; senderDisplayName: string }> }>;
+  };
+  const parentRow = body.messages.find((message) => message.id === parent.id);
+  assert.ok(parentRow);
+  const reply = body.threadSummariesByParentMessageId[parent.id]?.latestReplies.find((item) => item.preview === "foreign agent reply");
+  assert.ok(reply);
+  assert.equal(reply.senderDisplayName, parentRow.senderName, "the reply preview and the parent row resolve the agent by one rule");
+});
+
+
 test("GET /api/channels/:id/threads bounds missing parentMessageIds to recent parent scope", async ({ app }) => {
   const sink = new MemoryTraceSink();
   const tracer = new BasicTracer({
@@ -1292,7 +1328,7 @@ test("GET /api/channels/:id/threads bounds missing parentMessageIds to recent pa
   );
   assert.ok(span, "expected GET /api/channels/:id/threads root span");
 
-  const dbEvents = span.events.filter((event) => event.name === "db.query.finished");
+  const dbEvents = handlerTraceEvents(span.events).filter((event) => event.name === "db.query.finished");
   const dbEventByQuery = new Map(dbEvents.map((event) => [event.attrs?.query_name, event]));
   assert.equal(dbEventByQuery.get("channel_threads.list_by_channel")?.attrs?.row_count, 100);
   assert.equal(dbEventByQuery.get("channel_threads.list_by_channel")?.attrs?.parent_message_scope_count, 100);
@@ -1365,7 +1401,7 @@ test("GET /api/channels/:id/threads scopes summaries to requested parent message
   );
   assert.ok(span, "expected GET /api/channels/:id/threads root span");
 
-  const dbEvents = span.events.filter((event) => event.name === "db.query.finished");
+  const dbEvents = handlerTraceEvents(span.events).filter((event) => event.name === "db.query.finished");
   assert.deepEqual(
     dbEvents.map((event) => event.attrs?.query_name).sort(),
     [
@@ -1580,7 +1616,7 @@ test("GET /api/messages/context/:id records plan history facts, including a targ
   const hidden = await context(oldMessage.id);
   assert.equal(hidden.status, 404);
   const notFound = hidden.events.find((event) => event.name === "message_context.not_found");
-  assert.deepEqual(notFound?.attrs, { plan: "free", history_cutoff_present: true });
+  assert.deepEqual(notFound?.attrs, { plan: "free", history_cutoff_present: true, history_limited: true });
 });
 
 
@@ -1729,6 +1765,33 @@ test("thread read paths prefer the canonical thread when historical duplicates e
   assert.deepEqual(info.participantIds.sort(), [owner.id, replier.id].sort());
 });
 
+
+test("public -> private conversion also prunes task conversation follows outside the private snapshot", async ({ app }) => {
+  const db = getDb();
+  const owner = await seedUser("visibility-task-owner@slock.test", "visibility-task-owner");
+  const outsider = await seedUser("visibility-task-follower@slock.test", "visibility-task-follower");
+  const server = await createServer("Visibility Task Server", "visibility-task-server", owner.id);
+  await addMember(server.id, outsider.id);
+  const channel = await createChannel(server.id, "task-toggle-room", "convert me");
+  await addHuman(channel.id, owner.id);
+  const [task] = await db.insert(tasks).values({ channelId: channel.id, taskNumber: 1, title: "a task", createdByType: "user", createdById: owner.id }).returning();
+  const [conversation] = await db.insert(channels).values({ serverId: server.id, name: "task-1", type: "task", taskId: task!.id, parentChannelId: channel.id }).returning();
+  await db.insert(threadFollows).values([
+    { threadChannelId: conversation!.id, followerType: "user", followerId: owner.id, parentTaskId: task!.id, reason: "authored" },
+    { threadChannelId: conversation!.id, followerType: "user", followerId: outsider.id, parentTaskId: task!.id, reason: "manual" },
+  ]).onConflictDoNothing();
+
+  const toPrivate = await fetch(`${app.baseUrl}/api/channels/${channel.id}`, {
+    method: "PATCH",
+    headers: headers(await tokenForHuman(owner.email), server.id),
+    body: JSON.stringify({ visibility: "private" }),
+  });
+  assert.equal(toPrivate.status, 200);
+
+  const left = await db.select({ followerId: threadFollows.followerId }).from(threadFollows)
+    .where(eq(threadFollows.threadChannelId, conversation!.id));
+  assert.deepEqual(left, [{ followerId: owner.id }], "the outsider's task conversation follow is pruned, the member's kept");
+});
 
 test("private -> public restores thread permalink access for non-members (task #417)", async ({ app }) => {
   // Repro of #engineering task #417: opening a thread permalink in a channel
@@ -1954,8 +2017,8 @@ test("GET /internal/agent/:id/channel-members returns parent-channel members for
   const f = await seedThreadFixture(app.baseUrl);
   const { machine, apiKey } = await registerMachine(f.serverId, f.ownerId, "members-daemon");
 
-  await assignMachine(f.agentAId, machine.id);
-  await assignMachine(f.agentBId, machine.id);
+  await placeAgentOnMachine(f.agentAId, machine.id);
+  await placeAgentOnMachine(f.agentBId, machine.id);
 
   const shortId = f.parentMessageId.slice(0, 8);
   const threadTarget = `#parent-room:${shortId}`;
@@ -2161,8 +2224,8 @@ test("agent post authority: /internal/agent/:id/send to thread requires parent-c
 
   // Both agents must be assigned to this machine for /internal auth to accept them.
   // agentA is in the parent channel; agentB is in thread_follows only.
-  await assignMachine(f.agentAId, machine.id);
-  await assignMachine(f.agentBId, machine.id);
+  await placeAgentOnMachine(f.agentAId, machine.id);
+  await placeAgentOnMachine(f.agentBId, machine.id);
 
   // Thread target in the format the daemon uses: #<channel-name>:<8-hex short id>.
   const shortId = f.parentMessageId.slice(0, 8);
@@ -2183,11 +2246,13 @@ test("agent post authority: /internal/agent/:id/send to thread requires parent-c
   // Following a thread must not grant post permission.
   let res = await agentSend(f.agentBId, threadTarget, "bot wants to reply");
   assert.equal(res.status, 403, "agent in follows-only must not post to thread");
-  const errBody = await res.json() as { error: string };
+  const errBody = await res.json() as { error: string; code?: string };
+  // The shared writable-target refusal (agentRouteRefusals.unwritableTargetRefusal).
+  assert.equal(errBody.code, "target_forbidden");
   assert.match(
     errBody.error,
-    /parent channel/i,
-    `403 error must mention parent channel (got: ${errBody.error})`,
+    /aren't a member of its channel/,
+    `403 error must say the thread's channel needs membership (got: ${errBody.error})`,
   );
 
   // Positive control: agentA is in the parent channel → thread post succeeds.
@@ -2211,8 +2276,6 @@ test("agent post authority: /internal/agent/:id/send to thread requires parent-c
     "message_pipeline.frontend_emitted",
     "message_pipeline.sender_read_scheduled",
     "message_pipeline.agent_delivery.scheduled",
-    "message_pipeline.push_targets.built",
-    "message_pipeline.push.scheduled",
     "message.sent",
     "response.ready",
     "http.response.finished",
@@ -2232,7 +2295,7 @@ test("agent post authority: /internal/agent/:id/send to thread requires parent-c
   ), [
     "message_pipeline.db_phase.finished",
     "message_pipeline.db_phase.finished",
-    "push.mobile.delivery.enqueued",
+    "notification.enqueued",
     "send.facts_fanout.finished",
     "message_pipeline.inbox_notification_facts.recorded",
     "message_pipeline.db_phase.finished",
@@ -2246,7 +2309,7 @@ test("agent post authority: /internal/agent/:id/send to thread requires parent-c
     "messages.direct_send_transaction",
   ]);
 
-  const mobilePushEnqueuedIndex = transactionEventNames.indexOf("push.mobile.delivery.enqueued");
+  const mobilePushEnqueuedIndex = transactionEventNames.indexOf("notification.enqueued");
   const recordedIndex = transactionEventNames.indexOf("message_pipeline.inbox_notification_facts.recorded");
   const senderReadIndex = processEventNames.indexOf("message_pipeline.sender_read_scheduled");
   assert.ok(mobilePushEnqueuedIndex >= 0);
@@ -2283,6 +2346,12 @@ test("agent post authority: /internal/agent/:id/send to thread requires parent-c
   assert.ok(sentEvent);
   assert.equal(sentEvent.attrs?.channel_type, "thread");
   assert.equal(sentEvent.attrs?.message_id_present, true);
+  // The sent message and its conversation as keyed hashes, never raw ids.
+  const sentBody = await res.json() as { messageId: string };
+  assert.equal(sentEvent.attrs?.message_id_hash, traceIdentityHash("message_id_hash", sentBody.messageId));
+  assert.equal(sentEvent.attrs?.conversation_id_hash, traceIdentityHash("conversation_id_hash", f.threadId));
+  assert.equal(Object.values(sentEvent.attrs ?? {}).includes(sentBody.messageId), false);
+  assert.equal(Object.values(sentEvent.attrs ?? {}).includes(f.threadId), false);
   assert.equal(sentEvent.attrs?.attachments_count, 0);
 
   assert.equal(Object.values(span.attrs ?? {}).includes(f.agentAId), false);
@@ -2919,7 +2988,7 @@ test("removing a private parent member preserves thread follows but blocks stale
     },
   ]);
 
-  await removeHuman(privateChannel.id, member.id);
+  await removeHuman(privateChannel.id, member.id, { self: true });
 
   const memberFollowRows = await db
     .select()
@@ -2949,14 +3018,12 @@ test("removing a private parent member preserves thread follows but blocks stale
     "private thread replies must not broadcast to the thread room where stale sockets may remain",
   );
 
-  const span = sink.getAllSpans().find((candidate) =>
-    candidate.name === "server.http.request"
-    && candidate.events.some((event) => event.name === "message_pipeline.push_targets.built"),
-  );
-  assert.ok(span, "expected private thread reply request span");
-  const pushTargetsEvent = span.events.find((event) => event.name === "message_pipeline.push_targets.built");
-  assert.ok(pushTargetsEvent, "expected push target build event");
-  assert.equal(pushTargetsEvent.attrs?.target_count, 0, "stale private-thread follower must not be a push target");
+  // Notifications have one audience, the outbox (services/notifications/enqueue.ts):
+  // the stale private-thread follower gets no row, the remaining member does.
+  const { id: replyId } = await res.json() as { id: string };
+  const outboxReceivers = (await db.select({ receiverId: notificationOutbox.receiverId }).from(notificationOutbox)
+    .where(eq(notificationOutbox.messageId, replyId))).map((row) => row.receiverId);
+  assert.ok(!outboxReceivers.includes(member.id), "stale private-thread follower must not be a notification target");
 });
 
 
@@ -3006,7 +3073,7 @@ test("removing public parent members preserves their human and agent thread foll
     },
   ]);
 
-  await removeHuman(publicChannel.id, member.id);
+  await removeHuman(publicChannel.id, member.id, { self: true });
   await removeAgent(publicChannel.id, agent.id);
 
   const rows = await db
@@ -3089,6 +3156,7 @@ test("public to private conversion traces stale thread-follow prune phase", asyn
   assert.equal(pruneEvent.attrs?.user_row_count, 1);
   assert.equal(pruneEvent.attrs?.agent_row_count, 1);
   assert.equal(pruneEvent.attrs?.row_count, 2);
+  assert.equal(pruneEvent.attrs?.scope_count, 1, "one thread under the converted channel");
   assert.equal(typeof pruneEvent.attrs?.duration_ms, "number");
 });
 
@@ -3126,7 +3194,7 @@ test("private task thread system messages do not leak through stale thread rooms
   const claimed = await taskService.claimTask(task.id, "user", owner.id);
   assert.notEqual(typeof claimed, "string");
 
-  await removeHuman(privateChannel.id, member.id);
+  await removeHuman(privateChannel.id, member.id, { self: true });
   events.length = 0;
 
   const ownerToken = await tokenForHuman(owner.email);

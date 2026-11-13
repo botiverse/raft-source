@@ -1,5 +1,7 @@
+import { DmPeerNotMemberError } from "../services/dmSendPolicy";
 import { Router, type NextFunction, type Request, type Response, type Router as RouterType } from "express";
 import { UUID_RE } from "../lib/messageId";
+import { refuse } from "../lib/refusal";
 import {
   createAttachmentPreviewBridgeTransform,
 } from "../services/attachmentPreviewBridge";
@@ -8,11 +10,14 @@ import multer from "multer";
 import fs from "node:fs";
 import { createHash } from "node:crypto";
 import sharp, { type Sharp } from "sharp";
+import { withImageDecodeSlot } from "../lib/imageDecodeLimit";
 import { eq, inArray, and, isNull, isNotNull } from "drizzle-orm";
 import {
+  replaceAgentLineBreaks,
   FREE_SINGLE_FILE_UPLOAD_LIMIT_BYTES,
   PRO_SINGLE_FILE_UPLOAD_LIMIT_BYTES,
   type AttachmentPreviewResponse,
+  summarizeAttachmentPreviewResponse,
 } from "@botiverse/raft-shared";
 import { getDb } from "../db/index";
 import { attachments, messages } from "../db/schema";
@@ -20,7 +25,8 @@ import * as channelService from "../services/channelService";
 import * as userService from "../services/userService";
 import * as attachmentCommentService from "../services/attachmentCommentService";
 import { parseStructuredMentions } from "./messages";
-import { isChannelReadOnlyByBillingFeature, isChannelReadOnlyByQuota } from "../services/planService";
+import { channelBillingReadOnlyBody, getChannelBillingReadOnly, isChannelReadOnlyByBillingFeature, isChannelReadOnlyByQuota } from "../services/planService";
+import { noteFreePlanPaywallHit, notePaywallHit } from "./paywallHit";
 import type { AgentOrchestrator } from "../services/agentOrchestrator";
 import { getAttachmentPreviewProvider } from "../services/attachmentPreviews/registry";
 import { getAttachmentPreviewWithCache, type AttachmentPreviewCacheOutcome } from "../services/attachmentPreviews/previewCache";
@@ -35,7 +41,7 @@ import {
   buildFileUploadQuotaExceededResponse,
   getFileUploadQuotaSummary,
 } from "../services/fileUploadQuotaService";
-import { getWebFrameAncestorOrigins } from "../config/appUrl";
+import { getFramedByOrigins, getWebFrameAncestorOrigins } from "../config/appUrl";
 import {
   getAttachmentsForMessagesWithExecutor,
 } from "../services/attachmentLinkingService";
@@ -44,6 +50,12 @@ import {
   getLegacyAttachmentFileSizeLimitBytes,
 } from "../services/attachmentUploadPolicy";
 import { resolveReadableAttachmentAuthorityContext } from "../services/attachmentAuthorityService";
+import {
+  type AttachmentObjectMetadata,
+  type ResolvedAttachment,
+  withAttachmentObjectMetadata,
+} from "../services/attachmentRecord";
+import { getRequestHistoryWindow, isAttachmentBehindWindow } from "../services/historyWindow";
 import { uploadAttachmentBuffers } from "../services/attachmentUploadWriterService";
 import { buildSvgRasterTransferKey } from "../services/attachmentTransferIntentService";
 import { sendJsonServerError } from "./errorResponse";
@@ -60,6 +72,12 @@ const SVG_RASTER_PREVIEW_QUALITY = 85;
 const SVG_RASTER_DENSITY = 192;
 const SVG_RASTER_MAX_PIXELS = 4096 * 4096;
 const HEIC_DECODE_MAX_PIXELS = 64 * 1024 * 1024;
+/**
+ * The pixel cap for a direct upload's thumbnail (task #57): sharp reads the
+ * dimensions from the header and refuses a larger image before decoding its
+ * pixels, the same bound HEIC uses.
+ */
+export const DIRECT_UPLOAD_THUMBNAIL_MAX_PIXELS = HEIC_DECODE_MAX_PIXELS;
 const HTML_PREVIEW_TOKEN_TTL_SECONDS = 300;
 export const ATTACHMENT_PRESIGNED_URL_TTL_SECONDS = 300;
 // Inline video/audio previews use the presigned URL as a long-lived
@@ -140,20 +158,45 @@ async function createImageSharp(buffer: Buffer, mimeType?: string | null): Promi
     : sharp(buffer).rotate();
 }
 
-/** Generate a WebP thumbnail from an image buffer. SVG input is rasterized first. */
-export async function generateThumbnail(buffer: Buffer, mimeType?: string | null): Promise<Buffer> {
+async function renderThumbnail(buffer: Buffer, mimeType?: string | null): Promise<Buffer> {
   return (await createImageSharp(buffer, mimeType))
     .resize(THUMBNAIL_MAX_WIDTH, undefined, { withoutEnlargement: true })
     .webp({ quality: THUMBNAIL_QUALITY })
     .toBuffer();
 }
 
-/** Generate the larger safe bitmap used by the image lightbox for SVG attachments. */
+/** Generate a WebP thumbnail from an image buffer, in an image-decode slot. SVG input is rasterized first. */
+export async function generateThumbnail(buffer: Buffer, mimeType?: string | null): Promise<Buffer> {
+  return withImageDecodeSlot(() => renderThumbnail(buffer, mimeType));
+}
+
+/**
+ * A direct upload's thumbnail (task #57): the multipart thumbnail, with the
+ * raster formats also held to DIRECT_UPLOAD_THUMBNAIL_MAX_PIXELS (HEIC and SVG
+ * already carry their own caps). The caller bounds the bytes it reads.
+ */
+export async function generateDirectUploadThumbnail(buffer: Buffer, mimeType: string): Promise<Buffer> {
+  return withImageDecodeSlot(async () => {
+    if (isHeicAttachmentMimeType(mimeType) || isSvgAttachmentMimeType(mimeType)) return renderThumbnail(buffer, mimeType);
+    return sharp(buffer, { limitInputPixels: DIRECT_UPLOAD_THUMBNAIL_MAX_PIXELS }).rotate()
+      .resize(THUMBNAIL_MAX_WIDTH, undefined, { withoutEnlargement: true })
+      .webp({ quality: THUMBNAIL_QUALITY })
+      .toBuffer();
+  });
+}
+
+/** Whether a thumbnail failure is the image itself being over the pixel caps (no retry helps). */
+export function isThumbnailPixelLimitError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err);
+  return /pixel limit|dimensions exceed preview limit/i.test(message);
+}
+
+/** Generate the larger safe bitmap used by the image lightbox for SVG attachments, in an image-decode slot. */
 export async function generateSvgRasterPreview(buffer: Buffer): Promise<Buffer> {
-  return (await createImageSharp(buffer, "image/svg+xml"))
+  return withImageDecodeSlot(async () => (await createImageSharp(buffer, "image/svg+xml"))
     .resize(SVG_RASTER_PREVIEW_MAX_WIDTH, SVG_RASTER_PREVIEW_MAX_WIDTH, { fit: "inside", withoutEnlargement: true })
     .webp({ quality: SVG_RASTER_PREVIEW_QUALITY })
-    .toBuffer();
+    .toBuffer());
 }
 
 export const attachmentRouter: RouterType = Router();
@@ -223,12 +266,27 @@ export function isAttachmentUploadEnabled(): boolean {
   return process.env.ATTACHMENT_UPLOAD_ENABLED !== "false";
 }
 
-export function getAttachmentTooLargeMessage(limitBytes = MAX_ATTACHMENT_FILE_SIZE_BYTES): string {
+function attachmentSizeLabel(limitBytes: number): string {
   const mebibyte = 1024 * 1024;
-  const label = limitBytes % mebibyte === 0
+  return limitBytes % mebibyte === 0
     ? `${limitBytes / mebibyte}MB`
     : `${limitBytes} bytes`;
-  return `Max ${label} per file`;
+}
+
+export function getAttachmentTooLargeMessage(limitBytes = MAX_ATTACHMENT_FILE_SIZE_BYTES): string {
+  return `Max ${attachmentSizeLabel(limitBytes)} per file`;
+}
+
+/**
+ * The agent routes' multipart upload refusal for a file over the plan's limit
+ * (413 `ATTACHMENT_TOO_LARGE`, through refuse()): the limit is in the
+ * sentence (no agent client read the former `maxBytes`).
+ */
+export function attachmentTooLargeRefusal(limitBytes: number): { code: "ATTACHMENT_TOO_LARGE"; error: string } {
+  return {
+    code: "ATTACHMENT_TOO_LARGE",
+    error: `That file is over this server's upload limit of ${attachmentSizeLabel(limitBytes)} per file: upload a smaller file.`,
+  };
 }
 
 export function buildAttachmentTooLargeResponse(limitBytes = MAX_ATTACHMENT_FILE_SIZE_BYTES): {
@@ -276,7 +334,10 @@ export function runSingleAttachmentUpload(req: Request, res: Response, next: Nex
   void resolveRequestAttachmentFileSizeLimitBytes(req).then((limitBytes) => {
     createAttachmentUpload(limitBytes).single("file")(req, res, (err: unknown) => {
       if (err instanceof multer.MulterError && err.code === "LIMIT_FILE_SIZE") {
-        res.status(413).json(buildAttachmentTooLargeResponse(limitBytes));
+        void noteFreePlanPaywallHit(req, "upload_file_size");
+        // Only the agent routes upload one file at a time: they answer the
+        // same refusal as their own size check after multer.
+        refuse(res, 413, attachmentTooLargeRefusal(limitBytes));
         return;
       }
       if (err) {
@@ -300,6 +361,7 @@ function runAttachmentUpload(req: Request, res: Response, next: NextFunction): v
   void resolveRequestLegacyAttachmentFileSizeLimitBytes(req).then((limitBytes) => {
     createAttachmentUpload(limitBytes).array("files", MAX_ATTACHMENT_UPLOAD_FILES)(req, res, (err: unknown) => {
       if (err instanceof multer.MulterError && err.code === "LIMIT_FILE_SIZE") {
+        void noteFreePlanPaywallHit(req, "upload_file_size");
         res.status(413).json(buildAttachmentTooLargeResponse(limitBytes));
         return;
       }
@@ -455,7 +517,12 @@ export function normalizeUploadedMimeType(
     || "application/octet-stream";
 }
 
+/** A stored or uploaded filename as shown: mojibake repaired, and no line break (it lands on a message's header line). */
 export function normalizeAttachmentFilename(filename: string): string {
+  return replaceAgentLineBreaks(repairAttachmentFilenameEncoding(filename), " ");
+}
+
+function repairAttachmentFilenameEncoding(filename: string): string {
   if (!/[^\x00-\x7F]/.test(filename)) return filename;
 
   const repaired = Buffer.from(filename, "latin1").toString("utf8");
@@ -618,8 +685,15 @@ const DESKTOP_APP_FRAME_ANCESTOR = "app://raft";
 // (an origin identifier, not an application identity); attachment ACL / token
 // checks still run before the stream, and every other origin stays refused.
 // CORS and the web-side frame policy are untouched.
-function getPreviewFrameAncestorOrigins(raw = process.env.CORS_ORIGIN): string[] {
-  return [...getWebFrameAncestorOrigins(raw), DESKTOP_APP_FRAME_ANCESTOR];
+//
+// Then FRAMED_BY_ORIGINS (getFramedByOrigins): a page that frames the Raft app
+// itself (Deck). frame-ancestors names every ancestor, so a preview the app
+// frames inside Deck is blocked unless Deck is listed too. An ancestor only:
+// it is not a CORS origin, not a redirect target, and nothing here takes a
+// message from it; the preview's parent is still the app. Unset: none.
+function getPreviewFrameAncestorOrigins(raw = process.env.CORS_ORIGIN, framedBy = process.env.FRAMED_BY_ORIGINS): string[] {
+  const origins = [...getWebFrameAncestorOrigins(raw), DESKTOP_APP_FRAME_ANCESTOR];
+  return [...origins, ...getFramedByOrigins(framedBy).filter((origin) => !origins.includes(origin))];
 }
 
 export function buildAttachmentInlinePreviewContentSecurityPolicy(frameAncestorOrigins = getPreviewFrameAncestorOrigins()): string {
@@ -680,7 +754,7 @@ function logAttachmentAccessError(
   operation: "url" | "serve" | "preview",
   attachmentId: string | undefined,
   err: unknown,
-  attachment?: typeof attachments.$inferSelect | null,
+  attachment?: (typeof attachments.$inferSelect & Partial<AttachmentObjectMetadata>) | null,
 ): void {
   console.error(`[Attachments] Failed to ${operation} attachment`, {
     attachmentId: attachment?.id ?? attachmentId ?? null,
@@ -693,84 +767,35 @@ function logAttachmentAccessError(
   }, err);
 }
 
-async function canAccessLinkedJointAttachment(
-  attachment: typeof attachments.$inferSelect,
-  req: Request,
-): Promise<boolean> {
-  // Message-child resource access seam.
-  //
-  // Linked attachments inherit visibility from their message, not from the
-  // attachment's storage server alone. For joint channels the message is stored
-  // in canonical storage, while the caller's permission lives on their local
-  // projection channel. Keep this resolver shape aligned with reaction access
-  // in routes/messages.ts. If another message-child resource is added (read
-  // receipts, saved/pinned state, translations, shares, previews, etc.),
-  // extract a shared resolveMessageResourceAccess({ messageId, serverId, actor })
-  // helper instead of copying a new one-off joint-channel authorization branch.
-  if (!attachment.messageId || !req.userId || !req.serverId) return false;
-
-  const db = getDb();
-  const [message] = await db
-    .select({ channelId: messages.channelId })
-    .from(messages)
-    .where(eq(messages.id, attachment.messageId))
-    .limit(1);
-  if (!message) return false;
-
-  const projections = await channelService.getActiveJointChannelProjectionsByLocalChannel(message.channelId);
-  const localProjection = projections.find((projection) => projection.serverId === req.serverId);
-  if (!localProjection) return false;
-
-  return channelService.canUserAccessChannel(localProjection.localChannelId, req.userId, req.serverId);
-}
-
-async function verifyAttachmentAccess(
-  attachment: typeof attachments.$inferSelect,
-  req: Request,
-): Promise<boolean> {
-  let authorityChannelId = attachment.channelId;
-  if (attachment.messageId) {
-    const [message] = await getDb().select({ channelId: messages.channelId }).from(messages)
-      .where(eq(messages.id, attachment.messageId)).limit(1);
-    if (!message) return false;
-    authorityChannelId = message.channelId;
-  }
-  if (req.userId) {
-    if (await channelService.canUserAccessChannel(authorityChannelId, req.userId, req.serverId!)) {
-      return true;
-    }
-    return canAccessLinkedJointAttachment(attachment, req);
-  }
-  if (req.machineId) {
-    const channel = await channelService.getChannel(authorityChannelId);
-    if (channel?.serverId === req.serverId) return true;
-    // A joint message lives in canonical storage; the machine's server holds a
-    // projection of that channel.
-    if (!attachment.messageId) return false;
-    const projections = await channelService.getActiveJointChannelProjectionsByLocalChannel(authorityChannelId);
-    return projections.some((projection) => projection.serverId === req.serverId);
-  }
-  return false;
-}
-
 async function resolveReadableAttachmentForRequest(
   projection: typeof attachments.$inferSelect,
   req: Request,
   principalOverride?: { type: "user" | "machine"; id: string },
-): Promise<typeof attachments.$inferSelect | null> {
-  // Legacy null-object projections remain readable during the rolling window.
-  // Once bound, the typed RFC 049 resolver owns both authorization and the
-  // immutable physical read model; it never falls back to projection copies.
-  if (!projection.objectId) {
-    if (principalOverride) return projection;
-    return await verifyAttachmentAccess(projection, req) ? projection : null;
-  }
+): Promise<ResolvedAttachment | null> {
+  const readable = await resolveReadableAttachmentAccess(projection, req, principalOverride);
+  if (!readable) return null;
+  // A file posted in a message behind the plan's history window is behind it
+  // too (services/historyWindow.ts); the web never shows that message. The
+  // window is read once per request (batch routes resolve many files), and a
+  // bound file's message time comes from the access check's own row.
+  const historyWindow = await getRequestHistoryWindow(req, req.serverId!);
+  const behind = await isAttachmentBehindWindow(
+    { messageId: readable.attachment.messageId, messageCreatedAt: readable.messageCreatedAt },
+    historyWindow,
+  );
+  return behind ? null : readable.attachment;
+}
+
+async function resolveReadableAttachmentAccess(
+  projection: typeof attachments.$inferSelect,
+  req: Request,
+  principalOverride?: { type: "user" | "machine"; id: string },
+): Promise<{ attachment: ResolvedAttachment; messageCreatedAt: Date | null } | null> {
+  // The typed RFC 049 resolver owns both authorization and the immutable
+  // physical read model (attachment_objects).
   if (!req.serverId) return null;
-  const principal = principalOverride ?? (req.userId
-    ? { type: "user" as const, id: req.userId }
-    : req.machineId
-      ? { type: "machine" as const, id: req.machineId }
-      : null);
+  // Machine credentials do not read attachments (#proj-raft-computer:8e6a4629).
+  const principal = principalOverride ?? (req.userId ? { type: "user" as const, id: req.userId } : null);
   if (!principal) return null;
   const context = await resolveReadableAttachmentAuthorityContext({
     projectionId: projection.id,
@@ -779,22 +804,18 @@ async function resolveReadableAttachmentForRequest(
   });
   if (!context) return null;
   return {
-    ...context.projection,
-    channelId: context.localHostChannel.id,
-    uploaderId: context.object.uploaderId,
-    uploaderType: context.object.uploaderType,
-    mimeType: context.object.mimeType,
-    sizeBytes: context.object.sizeBytes,
-    storageKey: context.object.storageKey,
-    thumbnailKey: context.object.thumbnailKey,
-    contentHash: context.object.contentHash,
-    width: context.object.width,
-    height: context.object.height,
+    attachment: withAttachmentObjectMetadata({
+      ...context.projection,
+      channelId: context.localHostChannel.id,
+      uploaderId: context.object.uploaderId,
+      uploaderType: context.object.uploaderType,
+    }, context.object),
+    messageCreatedAt: context.canonicalMessage.createdAt,
   };
 }
 
 function signHtmlPreviewToken(
-  attachment: typeof attachments.$inferSelect,
+  attachment: ResolvedAttachment,
   req: Request,
 ): { token: string; expiresAt: string } {
   const nowMs = Date.now();
@@ -869,7 +890,7 @@ function buildAuthenticatedAttachmentUrl(req: Request, pathSuffix = ""): URL {
   return url;
 }
 
-function buildHtmlPreviewUrl(req: Request, attachment: typeof attachments.$inferSelect): {
+function buildHtmlPreviewUrl(req: Request, attachment: ResolvedAttachment): {
   url: URL;
   expiresAt: string;
 } {
@@ -900,6 +921,7 @@ attachmentRouter.post(
       }
       const tooLargeResponse = await getRequestAttachmentTooLargeResponse(req);
       if (files.some((file) => isOversizedUploadedFile(file, tooLargeResponse.maxBytes))) {
+        void noteFreePlanPaywallHit(req, "upload_file_size");
         res.status(413).json(tooLargeResponse);
         return;
       }
@@ -922,8 +944,10 @@ attachmentRouter.post(
         res.status(409).json({ error: "This channel is archived", code: "channel_archived" });
         return;
       }
-      if (await isChannelReadOnlyByBillingFeature(channelId, req.serverId!)) {
-        res.status(403).json({ error: "This joint channel is read-only because it has more than 2 free servers. It becomes writable again when a server upgrades or a free server leaves." });
+      const billingReadOnly = await getChannelBillingReadOnly(channelId, req.serverId!);
+      if (billingReadOnly) {
+        if (billingReadOnly.reason === "joint_over_limit") notePaywallHit(req, "joint_channel_read_only");
+        res.status(403).json(channelBillingReadOnlyBody(billingReadOnly));
         return;
       }
 
@@ -972,7 +996,8 @@ attachmentRouter.post(
         return;
       }
       if (err instanceof FileUploadQuotaExceededError) {
-        res.status(err.status).json(await buildFileUploadQuotaExceededResponse(req.serverId!, err));
+        notePaywallHit(req, "upload_monthly_quota", { requestedBytes: err.requestedBytes, monthUsedBytes: err.summary.usedBytes });
+        res.status(err.status).json(await buildFileUploadQuotaExceededResponse(req.serverId!, err, "human"));
         return;
       }
       res.status(500).json({ error: "Failed to upload files" });
@@ -990,12 +1015,6 @@ attachmentRouter.post(
 // for clarity; only attachments the caller can access are included.
 attachmentRouter.get("/comments/counts", async (req, res) => {
   try {
-    // Feature flag gate: outside the enabled server the feature does not
-    // exist — consistent 403, not an empty result.
-    if (!(await attachmentCommentService.attachmentCommentsEnabledForServer(req.serverId!, req.userId!))) {
-      res.status(403).json({ error: "Attachment comments are not enabled on this server", code: "attachment_comments_disabled" });
-      return;
-    }
     const idsParam = typeof req.query.ids === "string" ? req.query.ids : "";
     const ids = idsParam.split(",").map((s) => s.trim()).filter(Boolean);
     if (ids.length === 0 || ids.length > 100) {
@@ -1019,13 +1038,6 @@ attachmentRouter.get("/comments/counts", async (req, res) => {
 // List comments scoped to one attachment (thread messages joined via refs).
 attachmentRouter.get("/:id/comments", async (req, res) => {
   try {
-    if (!(await attachmentCommentService.attachmentCommentsEnabledForServer(req.serverId!, req.userId!))) {
-      res.status(403).json({ error: "Attachment comments are not enabled on this server", code: "attachment_comments_disabled" });
-      return;
-    }
-    // Deliberately AFTER the feature-flag gate, for the ordering reason spelled
-    // out on the POST sibling: a pre-gate 400 would leak that the feature
-    // exists to a server that has it disabled.
     if (rejectMalformedAttachmentId(req, res)) return;
     const db = getDb();
     const [projection] = await db
@@ -1070,16 +1082,6 @@ attachmentRouter.get("/:id/comments", async (req, res) => {
 // member + not read-only); the service owns mechanics and state validation.
 attachmentRouter.post("/:id/comments", async (req, res) => {
   try {
-    // Feature flag gate answers before ANY body validation: a non-enabled
-    // server must see one uniform 403 for every payload — a pre-gate 400
-    // (e.g. mentions_invalid) would leak that the feature exists and which
-    // inputs it parses. The service checks again (agent transport shares that
-    // pipeline); this route-level check only owns ordering.
-    if (!(await attachmentCommentService.attachmentCommentsEnabledForServer(req.serverId!, req.userId!))) {
-      res.status(403).json({ error: "Attachment comments are not enabled on this server", code: "attachment_comments_disabled" });
-      return;
-    }
-    // Same ordering rule as the flag gate above: this 400 must not precede it.
     if (rejectMalformedAttachmentId(req, res)) return;
     const db = getDb();
     const [projection] = await db
@@ -1131,6 +1133,10 @@ attachmentRouter.post("/:id/comments", async (req, res) => {
     res.json(result);
   } catch (err) {
     if (err instanceof attachmentCommentService.AttachmentCommentError) {
+      res.status(err.status).json({ error: err.message, code: err.code });
+      return;
+    }
+    if (err instanceof DmPeerNotMemberError) {
       res.status(err.status).json({ error: err.message, code: err.code });
       return;
     }
@@ -1353,7 +1359,9 @@ attachmentPublicRouter.get("/:id/preview", async (req, res) => {
         }),
       },
     );
-    res.json(result.response);
+    // `?view=summary` is the attachment card's read (task #164): the kind and
+    // stats line only, never the document body. Same build and cache.
+    res.json(req.query.view === "summary" ? summarizeAttachmentPreviewResponse(result.response) : result.response);
   } catch (err) {
     // A missing storage object is a 404, not a server fault: the attachment
     // row outlived its object (lifecycle sweep, manual bucket edit, staging
@@ -1409,7 +1417,7 @@ attachmentPublicRouter.get("/:id/html-preview-url", async (req, res) => {
 // downloads intentionally still use `attachment` disposition.
 attachmentPublicRouter.get("/:id/html-preview", async (req, res) => {
   if (rejectMalformedAttachmentId(req, res)) return;
-  let attachmentForLog: typeof attachments.$inferSelect | null = null;
+  let attachmentForLog: (typeof attachments.$inferSelect & Partial<AttachmentObjectMetadata>) | null = null;
   let streamFailureLogged = false;
   try {
     const db = getDb();
@@ -1439,6 +1447,7 @@ attachmentPublicRouter.get("/:id/html-preview", async (req, res) => {
       res.status(404).json({ error: "Attachment not found" });
       return;
     }
+    attachmentForLog = attachment;
 
     // Resolve visibility before returning token-shape errors. Otherwise an
     // authenticated caller can add an invalid previewToken (or a user bearer
@@ -1509,7 +1518,7 @@ attachmentPublicRouter.get("/:id/html-preview", async (req, res) => {
 // Serve an attachment by UUID (requires auth via requireFlexAuth)
 attachmentPublicRouter.get("/:id", async (req, res) => {
   if (rejectMalformedAttachmentId(req, res)) return;
-  let attachmentForLog: typeof attachments.$inferSelect | null = null;
+  let attachmentForLog: (typeof attachments.$inferSelect & Partial<AttachmentObjectMetadata>) | null = null;
   try {
     const db = getDb();
     const [projection] = await db
@@ -1528,6 +1537,7 @@ attachmentPublicRouter.get("/:id", async (req, res) => {
       res.status(404).json({ error: "Attachment not found" });
       return;
     }
+    attachmentForLog = attachment;
 
     const storage = getStorage();
     if (!storage) {
@@ -1588,6 +1598,16 @@ attachmentPublicRouter.get("/:id", async (req, res) => {
       res.setHeader("Content-Security-Policy", buildAttachmentInlinePreviewContentSecurityPolicy());
       res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
       res.setHeader("Referrer-Policy", "no-referrer");
+    } else if (
+      !shouldUseDownloadDisposition(req)
+      && isPreviewableImageMimeType(resolveAttachmentMimeType(attachment.filename, attachment.mimeType))
+    ) {
+      // An inline image is an <img> in the web app, which a self-hosted
+      // deployment may serve from another origin or site than this API.
+      // Helmet's same-origin CORP would block it there (presigned storage
+      // URLs carry no CORP). The URL is still token/ACL scoped, as for the
+      // inline previews above; downloads keep the default.
+      res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
     }
     await streamStorageResponse(stream, res);
   } catch (err) {
@@ -1607,6 +1627,6 @@ attachmentPublicRouter.get("/:id", async (req, res) => {
  */
 export async function getAttachmentsForMessages(
   messageIds: string[]
-): Promise<Map<string, typeof attachments.$inferSelect[]>> {
+): Promise<Map<string, ResolvedAttachment[]>> {
   return getAttachmentsForMessagesWithExecutor(getDb(), messageIds);
 }

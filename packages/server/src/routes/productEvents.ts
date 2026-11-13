@@ -1,5 +1,8 @@
+import { PRODUCT_EVENT_STRING_TOKEN } from "@botiverse/raft-shared";
 import { Router, type Router as RouterType } from "express";
+import { eq } from "drizzle-orm";
 import { getDb } from "../db/index";
+import { users } from "../db/schema";
 import { legacyProductEventsAllowed, resolveProductAnalyticsGate } from "../services/productAnalyticsGate";
 import {
   buildClientEventRows,
@@ -7,7 +10,7 @@ import {
   countIngest,
   getProductEventSink,
 } from "../services/productEventIngest";
-import { productEventContext } from "../services/productEventContext";
+import { accountAgeBucket, productEventContext } from "../services/productEventContext";
 import * as productEventsService from "../services/productEventsService";
 import { sendJsonServerError } from "./errorResponse";
 
@@ -35,6 +38,15 @@ function shortField(value: unknown, maxLength = 64): string | undefined {
   if (typeof value !== "string") return undefined;
   const trimmed = value.trim();
   return trimmed ? trimmed.slice(0, maxLength) : undefined;
+}
+
+// Client-sent strings are kept only as tokens ([a-z0-9_-], as for every
+// product-event string), so no typed text can be stored: the usage-data notice
+// promises it (Tenny, Arkbriar, 2026-10-21). Anything else is dropped. Old
+// desktop builds and cached pages may still call this route.
+function tokenField(value: unknown, maxLength = 64): string | undefined {
+  const field = shortField(value, maxLength);
+  return field !== undefined && PRODUCT_EVENT_STRING_TOKEN.test(field) ? field : undefined;
 }
 
 // POST /api/product-events/onboarding-wizard
@@ -69,17 +81,17 @@ productEventsRouter.post("/onboarding-wizard", async (req, res) => {
       return;
     }
 
-    const wizardVersion = shortField(rawMetadata.wizard_version) ?? "unknown";
-    const sessionId = shortField(rawMetadata.session_id) ?? "unknown";
+    const wizardVersion = tokenField(rawMetadata.wizard_version) ?? "unknown";
+    const sessionId = tokenField(rawMetadata.session_id) ?? "unknown";
     const metadata: productEventsService.OnboardingWizardEventMetadata = {
       step_id: stepId as productEventsService.OnboardingWizardStepId,
       wizard_version: wizardVersion,
       session_id: sessionId,
     };
 
-    const action = shortField(rawMetadata.action);
-    const result = shortField(rawMetadata.result);
-    const reason = shortField(rawMetadata.reason);
+    const action = tokenField(rawMetadata.action);
+    const result = tokenField(rawMetadata.result);
+    const reason = tokenField(rawMetadata.reason);
     if (action) metadata.action = action;
     if (result) metadata.result = result;
     if (reason) metadata.reason = reason;
@@ -91,7 +103,7 @@ productEventsRouter.post("/onboarding-wizard", async (req, res) => {
       metadata.latency_ms = Math.round(rawMetadata.latency_ms);
     }
 
-    const idempotencyKey = shortField(body.idempotencyKey, 128);
+    const idempotencyKey = tokenField(body.idempotencyKey, 128);
 
     // RFC-067 controls: an explicit "no" (workspace switch off, or the user
     // turned "Share usage data" off) means nothing is recorded.
@@ -138,11 +150,42 @@ productEventsRouter.get("/config", async (req, res) => {
   }
 });
 
+// Web and desktop builds before 1.21.28 show "Share usage data" as off for an
+// account that never chose, but since default on (2026-10-21) the server says
+// yes and they send. Their user sees "off", so for them not chosen stays off
+// until they reload into 1.21.28 or later (Tenny, #proj-analytics:63b84f03).
+// Old desktop builds bundle their own web page, so they report `web` too;
+// newer ones report `desktop` with the embedded web build in `web_version`
+// (their own app_version is numbered differently). A batch without a web
+// version counts as old. The native apps have no switch and follow the
+// server, so they are not affected.
+//
+// Builds from #10790 on say so themselves: the web sends `display_mode` and the
+// desktop app `web_version`, fields no older build can send (the batch schema
+// is strict). They are judged by that, not by their version label, which comes
+// from a release stamp: v1.21.30 was first cut still labelled 1.21.26 (AndyLok,
+// #proj-analytics:3d10cdf1), and staging builds carry the last stamped label.
+const FIRST_WEB_VERSION_SHOWING_SHARING_ON = [1, 21, 28] as const;
+
+function webBuildShowsNotChosenAsOff(batch: { source: string; app_version?: string; web_version?: string; display_mode?: string }): boolean {
+  if (batch.source !== "web" && batch.source !== "desktop") return false;
+  if (batch.display_mode !== undefined || batch.web_version !== undefined) return false;
+  if (batch.source === "desktop") return true; // its own app_version is not a web version
+  const match = /^(\d+)\.(\d+)\.(\d+)/.exec(batch.app_version ?? "");
+  if (!match) return true;
+  const version = [Number(match[1]), Number(match[2]), Number(match[3])];
+  for (let i = 0; i < 3; i += 1) {
+    if (version[i] !== FIRST_WEB_VERSION_SHOWING_SHARING_ON[i]) return version[i] < FIRST_WEB_VERSION_SHOWING_SHARING_ON[i];
+  }
+  return false;
+}
+
 // POST /api/product-events/batch
 //
 // Always 202 once the body is well-formed: the client drops its batch either
-// way. `accepted` is how many rows were queued for the store; counts of what
-// was written, lost, gated or rejected live in metrics.
+// way. `accepted` is how many rows were queued for the store (`duplicates`:
+// how many this replica had already queued), answered before the background
+// write; counts of what was written, lost, gated or rejected live in metrics.
 productEventsRouter.post("/batch", async (req, res) => {
   const parsed = clientEventBatchSchema.safeParse(req.body);
   if (!parsed.success) {
@@ -164,19 +207,38 @@ productEventsRouter.post("/batch", async (req, res) => {
       res.status(202).json({ accepted: 0 });
       return;
     }
+    const [user] = await getDb()
+      .select({ shareUsageData: users.shareUsageData, createdAt: users.createdAt })
+      .from(users)
+      .where(eq(users.id, req.userId!))
+      .limit(1);
+    if (webBuildShowsNotChosenAsOff(batch) && (user?.shareUsageData ?? null) === null) {
+      countIngest("gated", batch.events.length);
+      res.status(202).json({ accepted: 0 });
+      return;
+    }
+    const receivedAt = new Date();
     const { rows, rejected } = buildClientEventRows({
       batch,
       analyticsId: gate.analyticsId,
       serverId: req.serverId!,
-      receivedAt: new Date(),
-      context: productEventContext({ userAgent: req.get("user-agent"), country: req.get("cloudfront-viewer-country") }),
+      receivedAt,
+      context: {
+        ...productEventContext({ userAgent: req.get("user-agent"), country: req.get("cloudfront-viewer-country") }),
+        ...(user ? { $account_age: accountAgeBucket(user.createdAt, receivedAt) } : {}),
+      },
     });
     for (const [reason, count] of Object.entries(rejected)) {
       countIngest(`rejected_${reason as keyof typeof rejected}`, count);
     }
     // Queued for the background writer, which counts written and lost rows.
     sink.enqueue(rows);
-    res.status(202).json({ accepted: rows.length });
+    // `duplicates`: events this replica already queued (their uuid queued
+    // recently; a refused event is not remembered, so it is judged again).
+    // Like `accepted`, it means queued for the background writer, not
+    // written: a row the writer loses is only counted in metrics. Desktop's
+    // migration reports stop sending on either. Absent when 0.
+    res.status(202).json({ accepted: rows.length, ...(rejected.duplicate ? { duplicates: rejected.duplicate } : {}) });
   } catch (err) {
     sendJsonServerError(req, res, {
       error: "Failed to record product events",

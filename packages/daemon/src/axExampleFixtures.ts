@@ -33,6 +33,35 @@ export const exampleMessage: AgentMessage = {
   seq: 100,
 };
 
+/**
+ * A third-party app event as the daemon receives it (the grouped transport DM).
+ * With `inboxItemTarget`, the Server lists it as that inbox item (RFC 081).
+ */
+export function exampleThirdPartyEvent(seq: number, inboxItemTarget?: string): AgentMessage {
+  const id = String(seq).padStart(12, "0");
+  return {
+    ...exampleMessage,
+    message_id: `eeeeeeee-0000-4000-8000-${id}`,
+    seq,
+    channel_id: "third-party-agent-events:agent-1",
+    channel_type: "dm",
+    channel_name: "third-party-agent-events:agent-1",
+    sender_name: "stamp-bot",
+    content: "Third-party notification: checks failed on 9ed73d5",
+    third_party_event: {
+      id: `ffffffff-0000-4000-8000-${id}`,
+      kind: "notification",
+      client_id: "stamp",
+      client_name: "Stamp",
+      payload_hash: "example-hash",
+      payload: {},
+      expires_at: EXAMPLE_T,
+      source: { client_id: "stamp", client_name: "Stamp", oauth_client_id: "oauth-client-1", resource: "raft" },
+      ...(inboxItemTarget === undefined ? {} : { inbox_item_target: inboxItemTarget }),
+    },
+  };
+}
+
 export const exampleUnreadSummary: Record<string, number> = {
   "#channel-a": 12,
   "dm:@peer": 1,

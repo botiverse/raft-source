@@ -1,9 +1,10 @@
 // External Agent inbox push: a signed NOTICE (`raft-agent-inbox-notice.v1`),
 // the external counterpart of a managed agent's "Inbox update". It says which
 // conversations have new unread messages (target, counts, first/latest message
-// ids, sender, flags) and carries no message bodies. The agent reads and
+// ids, latest seq, sender, flags) and carries no message bodies. The agent reads and
 // acknowledges through its own pull (`GET /internal/agent-api/events?ack=cursor`,
-// `raft message check`, `raft inbox check`); a notice never moves any cursor.
+// `raft message check`) or its reads (`raft inbox read`, `raft message read
+// --unread`); `raft inbox check` only lists, and a notice never moves any cursor.
 //
 // Hot path: when this replica delivers a message to an external agent's inbox
 // (`external-inbox-delivered` with the message), its row is merged into the
@@ -24,6 +25,14 @@
 // older than AGENT_INBOX_NOTICE_REMIND_AFTER_MS (the hot-path notice is sent
 // without reading the chain, so the agent's pull may have beaten the chain to
 // the row).
+//
+// A registration that stops (disabled_at: 3 consecutive 404/410, at least 3
+// 401s with no other answer for 24 hours, or a revoked credential) is not silent: the UPDATE
+// that sets disabled_at also claims a notice to the agent's owner (at most one
+// per 24 hours; none when the owner revoked the credential themselves). Nor is
+// an endpoint_rejected stop permanent: the sweep probes it with an empty
+// notice, 1 hour after the stop and then doubling up to every 24 hours, and a
+// 2xx re-enables it (#proj-assistant:742b8915).
 import { createHmac, randomUUID } from "node:crypto";
 import {
   clearClockInterval,
@@ -40,9 +49,9 @@ import {
   type AgentMessage,
   type Tracer,
 } from "@botiverse/raft-shared";
-import { and, eq, isNull, sql } from "drizzle-orm";
+import { and, eq, isNotNull, isNull, sql } from "drizzle-orm";
 import { getDb, type DatabaseExecutor } from "../db/index";
-import { agentCredentials, agentInboxEventsPendingAcks, agentInboxPushRegistrations, agents } from "../db/schema";
+import { agentCredentials, agentInboxEventsPendingAcks, agentInboxPushRegistrations, agents, users } from "../db/schema";
 import { serializeErrorForLog } from "../tracing/safeErrorLog";
 import { addTraceEvent, errorClassOf, runWithTraceSpan } from "../tracing/semanticTrace";
 import { agentIdHashAttrs, serverIdHashAttrs } from "../tracing/traceIdentity";
@@ -63,10 +72,31 @@ import {
 import { currentRaftTraceId, raftTraceIdHeaders } from "./externalRequestCorrelation";
 import * as messageService from "./messageService";
 import * as oauthService from "./oauthService";
+import { assistantOwnerPassesSso } from "./sso/ssoEnforcement";
 
 export const AGENT_INBOX_NOTICE_SCHEMA = "raft-agent-inbox-notice.v1";
-/** Consecutive 401/404/410 responses that disable a registration. */
+/** Consecutive 404/410 responses that disable a registration. */
 export const AGENT_INBOX_PUSH_REJECTION_LIMIT = 3;
+/**
+ * A 401 does not count toward the rejections: receivers answer it while their
+ * runtime deploys or rotates credentials. A run of 401s (no other outcome in
+ * between) disables once it has both lasted this long since its first 401…
+ */
+export const AGENT_INBOX_PUSH_UNAUTHORIZED_DISABLE_AFTER_MS = 24 * 60 * 60_000;
+/** …and held at least this many 401s in a row (two 401s a day apart prove little). */
+export const AGENT_INBOX_PUSH_UNAUTHORIZED_MIN_COUNT = 3;
+/** At most one "pushes stopped" notice to the agent's owner per this interval, however often it flaps. */
+export const AGENT_INBOX_PUSH_DISABLED_NOTICE_INTERVAL_MS = 24 * 60 * 60_000;
+/** Recovery probe of an endpoint_rejected registration: first this long after the stop, then doubling… */
+export const AGENT_INBOX_PUSH_PROBE_FIRST_DELAY_MS = 60 * 60_000;
+/** …up to this, then at this interval… */
+export const AGENT_INBOX_PUSH_PROBE_MAX_DELAY_MS = 24 * 60 * 60_000;
+/**
+ * …until the registration has been stopped this long: then probing stops for
+ * good (the URL may be abandoned and its domain re-registered by someone
+ * else), and only a new PUT resumes delivery. No owner notice for this.
+ */
+export const AGENT_INBOX_PUSH_PROBE_GIVE_UP_AFTER_MS = 30 * 24 * 60 * 60_000;
 /**
  * Backoff after the Nth consecutive failure (the last entry repeats). Capped at
  * 5 minutes: a notice is a small POST, and a longer cap only makes an agent
@@ -111,6 +141,17 @@ const SECRET_MAX_LENGTH = 512;
 
 export type AgentInboxPushDisabledReason = "endpoint_rejected" | "credential_revoked" | "agent_inactive";
 
+/**
+ * Why the owner is told pushes stopped: the endpoint kept refusing, or someone
+ * other than the owner revoked the credential the registration is bound to.
+ */
+export type AgentInboxPushPausedCause = "endpoint_failing" | "credential_revoked";
+/**
+ * Posts the owner's notice (server.ts wires agentActionRequiredNoticeService).
+ * Called after the disable committed, once per claimed notice.
+ */
+export type AgentInboxPushOwnerNotifier = (input: { agentId: string; cause: AgentInboxPushPausedCause }) => Promise<unknown>;
+
 export class AgentInboxPushError extends Error {
   constructor(
     readonly code: "INVALID_URL" | "INVALID_SECRET" | "AGENT_NOT_EXTERNAL" | "AGENT_NOT_FOUND" | "CREDENTIAL_INACTIVE" | "PUSH_UNAVAILABLE",
@@ -131,6 +172,27 @@ export interface AgentInboxPushStatus {
   lastError: string | null;
   consecutiveFailures: number;
   nextAttemptAt: string | null;
+  /** When Raft stopped probing a stopped endpoint (30 days without recovering); a new PUT clears it. */
+  probeStoppedAt: string | null;
+  /** While disabled: how delivery resumes (probing, or a new PUT). Null while enabled. */
+  recovery: string | null;
+}
+
+/** How a stopped registration gets going again, for its status and diagnostics. */
+export function agentInboxPushRecoveryText(input: {
+  disabledReason: AgentInboxPushDisabledReason | null;
+  probeStoppedAt: Date | null;
+}): string | null {
+  switch (input.disabledReason) {
+    case "endpoint_rejected":
+      return input.probeStoppedAt
+        ? "Raft stopped probing the endpoint after 30 days without recovery; register it again (PUT /push-webhook) to resume push delivery."
+        : "Raft probes the endpoint (1 hour after the stop, then doubling up to every 24 hours) and resumes push delivery when it answers 2xx; registering it again (PUT /push-webhook) resumes delivery at once.";
+    case "credential_revoked":
+      return "Register the endpoint again (PUT /push-webhook) with an active credential to resume push delivery.";
+    default:
+      return null;
+  }
 }
 
 type RegistrationRow = typeof agentInboxPushRegistrations.$inferSelect;
@@ -152,19 +214,24 @@ function toStatus(row: RegistrationRow | undefined): AgentInboxPushStatus {
       lastError: null,
       consecutiveFailures: 0,
       nextAttemptAt: null,
+      probeStoppedAt: null,
+      recovery: null,
     };
   }
+  const disabledReason = (row.disabledReason as AgentInboxPushDisabledReason | null) ?? null;
   return {
     registered: true,
     url: row.endpointUrl,
     enabled: row.disabledAt === null,
-    disabledReason: (row.disabledReason as AgentInboxPushDisabledReason | null) ?? null,
+    disabledReason,
     disabledAt: iso(row.disabledAt),
     lastAttemptAt: iso(row.lastAttemptAt),
     lastDeliveryAt: iso(row.lastDeliveryAt),
     lastError: row.lastError,
     consecutiveFailures: row.consecutiveFailures,
     nextAttemptAt: row.disabledAt === null ? iso(row.nextAttemptAt) : null,
+    probeStoppedAt: row.disabledAt === null ? null : iso(row.probeStoppedAt),
+    recovery: row.disabledAt === null ? null : agentInboxPushRecoveryText({ disabledReason, probeStoppedAt: row.probeStoppedAt }),
   };
 }
 
@@ -223,6 +290,11 @@ export async function putAgentInboxPushRegistration(input: {
   credentialId: string;
   url: unknown;
   secret: unknown;
+  /**
+   * `agent`: PUT /push-webhook with the agent's own credential. `provider`:
+   * the runtime provider's control route (routes/runtimeProviderControl.ts).
+   */
+  configuredBy: "agent" | "provider";
   now?: Date;
 }, executor: DatabaseExecutor = getDb()): Promise<AgentInboxPushStatus> {
   const endpointUrl = normalizeEndpoint(input.url);
@@ -268,7 +340,13 @@ export async function putAgentInboxPushRegistration(input: {
     nextAttemptAt: now,
     consecutiveFailures: 0,
     consecutiveRejections: 0,
+    firstUnauthorizedAt: null,
+    consecutiveUnauthorized: 0,
+    nextProbeAt: null,
+    probeBackoffMs: null,
+    probeStoppedAt: null,
     lastError: null,
+    configuredBy: input.configuredBy,
     updatedAt: now,
   };
   const [row] = await executor.insert(agentInboxPushRegistrations)
@@ -295,10 +373,16 @@ export async function deleteAgentInboxPushRegistration(
 // ---------------------------------------------------------------------------
 // Notice
 
-/** One conversation in a notice: the inbox row, without seqs or attention hints. */
+/**
+ * One conversation in a notice: the inbox row, without attention hints and
+ * with only its latest seq, as a decimal string (`latestSeq`; absent when the
+ * row has none, e.g. a third-party event). An agent passes `channelId:latestSeq`
+ * back as `/events?wait_for=`, so its pull waits for the inbox chain to hold
+ * the message.
+ */
 export type AgentInboxNoticeTarget = Pick<AgentInboxTargetRow,
   "target" | "channelId" | "channelType" | "pendingCount" | "firstPendingMsgId" | "latestMsgId"
-  | "latestSenderName" | "latestSenderType" | "flags">;
+  | "latestSenderName" | "latestSenderType" | "flags"> & { latestSeq?: string };
 
 export interface AgentInboxNotice {
   schema: typeof AGENT_INBOX_NOTICE_SCHEMA;
@@ -313,12 +397,17 @@ export interface AgentInboxNotice {
 const NOTICE_TARGET_KEYS = [
   "target", "channelId", "channelType", "pendingCount", "firstPendingMsgId", "latestMsgId",
   "latestSenderName", "latestSenderType", "flags",
-] as const satisfies readonly (keyof AgentInboxNoticeTarget)[];
+] as const satisfies readonly (keyof AgentInboxNoticeTarget & keyof AgentInboxTargetRow)[];
 
 function toNoticeTarget(row: AgentInboxTargetRow): AgentInboxNoticeTarget {
   const target: Partial<AgentInboxNoticeTarget> = {};
   for (const key of NOTICE_TARGET_KEYS) {
     if (row[key] !== undefined) Object.assign(target, { [key]: row[key] });
+  }
+  // Decimal string: seqs are bigint in Postgres, and a string stays exact in
+  // any receiver's JSON parser should one ever pass 2^53.
+  if (typeof row.latestSeq === "number" && Number.isSafeInteger(row.latestSeq) && row.latestSeq > 0) {
+    target.latestSeq = String(row.latestSeq);
   }
   return target as AgentInboxNoticeTarget;
 }
@@ -436,6 +525,7 @@ export function signAgentInboxPushBody(secret: string, body: string): string {
 type AttemptOutcome =
   | { kind: "delivered" }
   | { kind: "rejected"; error: string }
+  | { kind: "unauthorized"; error: "http_401" }
   | { kind: "bad_request"; error: string }
   | { kind: "retry"; error: string; retryAfterMs: number | null };
 
@@ -454,7 +544,8 @@ function parseRetryAfterMs(value: string | undefined, now: Date): number | null 
 
 function classify(status: number, errorCode: string | null, retryAfter: string | undefined, now: Date): AttemptOutcome {
   if (status >= 200 && status < 300) return { kind: "delivered" };
-  if (status === 401 || status === 404 || status === 410) return { kind: "rejected", error: `http_${status}` };
+  if (status === 401) return { kind: "unauthorized", error: "http_401" };
+  if (status === 404 || status === 410) return { kind: "rejected", error: `http_${status}` };
   if (status === 400) return { kind: "bad_request", error: "http_400" };
   if (status === 429) return { kind: "retry", error: "http_429", retryAfterMs: parseRetryAfterMs(retryAfter, now) };
   // A 503 may say when to come back, but never later than the backoff cap.
@@ -489,26 +580,159 @@ function withStepTimeout<T>(step: string, ms: number, work: Promise<T>): Promise
   return Promise.race([work, timeout]).finally(() => clearClockTimeout(timer));
 }
 
-/** The registration and its live delivery authority, or why it may not push. */
-async function loadSendable(agentId: string, executor: DatabaseExecutor) {
+/**
+ * The registration (enabled or not) and its live delivery authority, or why it
+ * may not push. `ownerRevoked`: the bound credential's revocation was the
+ * owner's own doing (they revoked it, or it was their own key that a cascade
+ * of theirs revoked) or a rotation, so the owner is not told about the stop.
+ */
+async function loadRegistrationAuthority(agentId: string, executor: DatabaseExecutor) {
   const [row] = await executor.select({
     registration: agentInboxPushRegistrations,
     credentialRevokedAt: agentCredentials.revokedAt,
+    credentialRevokedByUserId: agentCredentials.revokedByUserId,
+    credentialRevokedReason: agentCredentials.revokedReason,
+    credentialCreatedByUserId: agentCredentials.createdByUserId,
     runtime: agents.runtime,
     agentServerId: agents.serverId,
     agentDeletedAt: agents.deletedAt,
+    assistantPausedAt: agents.assistantPausedAt,
+    assistantOwnerUserId: agents.assistantOwnerUserId,
+    creatorType: agents.creatorType,
+    creatorId: agents.creatorId,
   }).from(agentInboxPushRegistrations)
     .innerJoin(agentCredentials, eq(agentCredentials.id, agentInboxPushRegistrations.credentialId))
     .innerJoin(agents, eq(agents.id, agentInboxPushRegistrations.agentId))
     .where(eq(agentInboxPushRegistrations.agentId, agentId))
     .limit(1);
-  if (!row || row.registration.disabledAt !== null) return null;
+  if (!row) return null;
   const disabledReason: AgentInboxPushDisabledReason | null = row.credentialRevokedAt
     ? "credential_revoked"
     : row.agentDeletedAt || !isExternalAgentRuntime(row.runtime) || row.agentServerId !== row.registration.serverId
       ? "agent_inactive"
       : null;
-  return { registration: row.registration, disabledReason };
+  const ownerId = row.creatorType === "user" ? row.creatorId : null;
+  // A rotation replaced the credential on purpose; its holder registers again with the new one.
+  const ownerRevoked = row.credentialRevokedReason === "rotated" || (ownerId !== null && (
+    row.credentialRevokedByUserId === ownerId
+    || (row.credentialRevokedByUserId === null && row.credentialCreatedByUserId === ownerId)
+  ));
+  return { registration: row.registration, disabledReason, ownerRevoked, paused: row.assistantPausedAt !== null, assistantOwnerUserId: row.assistantOwnerUserId };
+}
+
+/** The enabled registration and its live delivery authority, or why it may not push. */
+async function loadSendable(agentId: string, executor: DatabaseExecutor) {
+  const loaded = await loadRegistrationAuthority(agentId, executor);
+  return loaded && loaded.registration.disabledAt === null ? loaded : null;
+}
+
+/**
+ * Stop the registration: only the NULL -> set transition of disabled_at, so of
+ * concurrent failures (replicas, retries) exactly one disables. The same UPDATE
+ * claims the owner's notice when `notifyCause` is given and no notice went out
+ * in the last 24 hours, so exactly one caller is told to send it; and an
+ * endpoint_rejected stop gets its first recovery probe an hour out.
+ */
+async function disableRegistration(executor: DatabaseExecutor, input: {
+  registrationId: string;
+  reason: AgentInboxPushDisabledReason;
+  now: Date;
+  lastError?: string;
+  notifyCause: AgentInboxPushPausedCause | null;
+}): Promise<{ disabled: boolean; notify: boolean }> {
+  const t = agentInboxPushRegistrations;
+  const probe = input.reason === "endpoint_rejected";
+  const nowIso = input.now.toISOString();
+  const noticeCutoffIso = new Date(input.now.getTime() - AGENT_INBOX_PUSH_DISABLED_NOTICE_INTERVAL_MS).toISOString();
+  const [row] = await executor.update(t).set({
+    disabledAt: input.now,
+    disabledReason: input.reason,
+    ...(input.lastError ? { lastError: input.lastError } : {}),
+    nextProbeAt: probe ? new Date(input.now.getTime() + AGENT_INBOX_PUSH_PROBE_FIRST_DELAY_MS) : null,
+    probeBackoffMs: probe ? AGENT_INBOX_PUSH_PROBE_FIRST_DELAY_MS : null,
+    probeStoppedAt: null,
+    ...(input.notifyCause ? {
+      lastDisabledNoticeAt: sql`CASE WHEN ${t.lastDisabledNoticeAt} IS NULL OR ${t.lastDisabledNoticeAt} <= ${noticeCutoffIso}::timestamptz
+        THEN ${nowIso}::timestamptz ELSE ${t.lastDisabledNoticeAt} END`,
+    } : {}),
+    updatedAt: input.now,
+  }).where(and(eq(t.id, input.registrationId), isNull(t.disabledAt)))
+    .returning({ lastDisabledNoticeAt: t.lastDisabledNoticeAt });
+  if (!row) return { disabled: false, notify: false };
+  const notify = input.notifyCause !== null && row.lastDisabledNoticeAt?.getTime() === input.now.getTime();
+  addTraceEvent("agent_inbox_push.disabled", { reason: input.reason, owner_notice: notify });
+  return { disabled: true, notify };
+}
+
+/** Post the owner's notice a disable claimed. Best effort: the disable stands either way. */
+async function notifyOwnerOfDisable(
+  notifier: AgentInboxPushOwnerNotifier | undefined,
+  agentId: string,
+  cause: AgentInboxPushPausedCause,
+): Promise<void> {
+  if (!notifier) return;
+  try {
+    if (await notifier({ agentId, cause }) === false) {
+      console.warn("[AgentInboxPush] owner notice not posted (no owner or DM)");
+    }
+  } catch (error) {
+    console.error("[AgentInboxPush] owner notice failed", serializeErrorForLog(error));
+  }
+}
+
+interface NoticePostResult {
+  status: number;
+  retryAfter?: string;
+  errorCode: string | null;
+  responseRequestId: string | null;
+  timing?: WebhookPostTiming;
+  timeoutPhase: WebhookPostError["timeoutPhase"];
+}
+
+/** The signed, bounded POST of one notice to the registration's endpoint (public HTTPS only, SSRF-checked). */
+async function postNotice(
+  registration: RegistrationRow,
+  notice: AgentInboxNotice,
+  post: WebhookPost | undefined,
+  traceId: string | null,
+): Promise<NoticePostResult> {
+  const body = JSON.stringify(notice);
+  const result: NoticePostResult = { status: 0, errorCode: null, responseRequestId: null, timeoutPhase: null };
+  try {
+    const secret = decryptWebhookSigningSecret({
+      ciphertext: registration.secretCiphertext,
+      iv: registration.secretIv,
+      authTag: registration.secretAuthTag,
+    });
+    const response = await withStepTimeout("POST", AGENT_INBOX_NOTICE_POST_TIMEOUT_MS, (post ?? postPublicHttps)({
+      endpointUrl: registration.endpointUrl,
+      body,
+      timeoutMs: REQUEST_TIMEOUT_MS,
+      headers: {
+        "content-type": "application/json",
+        "content-length": Buffer.byteLength(body, "utf8").toString(),
+        "user-agent": "Raft-Agent-Inbox/2.0",
+        "x-raft-delivery-id": notice.noticeId,
+        "x-raft-signature-256": signAgentInboxPushBody(secret, body),
+        // This notice span's trace id, for the receiver to log (correlation);
+        // omitted when no tracer records the span.
+        ...raftTraceIdHeaders(traceId),
+      },
+    }));
+    result.status = response.status;
+    result.retryAfter = response.retryAfter;
+    result.responseRequestId = response.requestId ?? null;
+    result.timing = response.timing;
+  } catch (error) {
+    result.errorCode = appWebhookDeliveryErrorCode(error);
+    // The phases that did complete (connect, TLS) before the failure, and
+    // where a timeout stopped.
+    if (error instanceof WebhookPostError) {
+      result.timing = error.timing;
+      result.timeoutPhase = error.timeoutPhase;
+    }
+  }
+  return result;
 }
 
 export type AgentInboxNoticeMode = "direct" | "retry" | "sweep";
@@ -516,7 +740,7 @@ export type AgentInboxNoticeMode = "direct" | "retry" | "sweep";
 export type AgentInboxNoticeSweepReason = "new" | "remind";
 
 export interface AgentInboxNoticeResult {
-  outcome: "delivered" | "rejected" | "bad_request" | "retry" | "backoff" | "disabled" | "unregistered" | "nothing_to_send";
+  outcome: "delivered" | "rejected" | "bad_request" | "retry" | "backoff" | "disabled" | "paused" | "unregistered" | "nothing_to_send";
   /** When a failed notice should be tried again (in-memory retry on this replica). */
   retryInMs?: number;
 }
@@ -535,6 +759,8 @@ export async function sendAgentInboxNotice(input: {
   tracer?: Tracer;
   clock?: () => Date;
   executor?: DatabaseExecutor;
+  /** Told when this send stopped the registration and claimed the owner's notice. */
+  notifyOwner?: AgentInboxPushOwnerNotifier;
 }): Promise<AgentInboxNoticeResult> {
   const executor = input.executor ?? getDb();
   const clock = input.clock ?? currentDate;
@@ -544,11 +770,29 @@ export async function sendAgentInboxNotice(input: {
   const { registration } = sendable;
   const now = clock();
   if (sendable.disabledReason) {
-    await executor.update(t).set({
-      disabledAt: now, disabledReason: sendable.disabledReason, lastError: sendable.disabledReason, updatedAt: now,
-    }).where(and(eq(t.id, registration.id), isNull(t.disabledAt)));
-    addTraceEvent("agent_inbox_push.disabled", { reason: sendable.disabledReason });
+    // A revoked credential is told to the owner unless the revocation was
+    // theirs; an inactive agent (deleted, no longer External) is not.
+    const notifyCause = sendable.disabledReason === "credential_revoked" && !sendable.ownerRevoked ? "credential_revoked" : null;
+    const { notify } = await disableRegistration(executor, {
+      registrationId: registration.id, reason: sendable.disabledReason, now, lastError: sendable.disabledReason, notifyCause,
+    });
+    if (notify && notifyCause) await notifyOwnerOfDisable(input.notifyOwner, input.agentId, notifyCause);
     return { outcome: "disabled" };
+  }
+  // A personal assistant an admin paused: nothing wakes it. Not a disable: the
+  // unread stays and the sweep announces it once its owner starts it again.
+  if (sendable.paused) {
+    addTraceEvent("agent_inbox_push.paused");
+    return { outcome: "paused" };
+  }
+  // A personal assistant acts as its owner: while the owner's require-SSO refuses them, nothing
+  // wakes it either (RFC 083 §6.2). Like a pause: the unread stays, and a later send announces it.
+  if (sendable.assistantOwnerUserId) {
+    const [owner] = await executor.select({ email: users.email }).from(users).where(eq(users.id, sendable.assistantOwnerUserId));
+    if (owner && !(await assistantOwnerPassesSso({ userId: sendable.assistantOwnerUserId, email: owner.email }, executor)).ok) {
+      addTraceEvent("agent_inbox_push.owner_sso_required");
+      return { outcome: "paused" };
+    }
   }
   // Only third-party events that expired while waiting: nothing left to announce.
   input.pending.dropExpired(now.getTime());
@@ -584,47 +828,9 @@ export async function sendAgentInboxNotice(input: {
   });
   try {
     return await runWithTraceSpan(span, async (): Promise<AgentInboxNoticeResult> => {
-      const body = JSON.stringify(notice);
-      let status = 0;
-      let retryAfter: string | undefined;
-      let errorCode: string | null = null;
-      let responseRequestId: string | null = null;
-      let timing: WebhookPostTiming | undefined;
-      let timeoutPhase: WebhookPostError["timeoutPhase"] = null;
-      try {
-        const secret = decryptWebhookSigningSecret({
-          ciphertext: registration.secretCiphertext,
-          iv: registration.secretIv,
-          authTag: registration.secretAuthTag,
-        });
-        const response = await withStepTimeout("POST", AGENT_INBOX_NOTICE_POST_TIMEOUT_MS, (input.post ?? postPublicHttps)({
-          endpointUrl: registration.endpointUrl,
-          body,
-          timeoutMs: REQUEST_TIMEOUT_MS,
-          headers: {
-            "content-type": "application/json",
-            "content-length": Buffer.byteLength(body, "utf8").toString(),
-            "user-agent": "Raft-Agent-Inbox/2.0",
-            "x-raft-delivery-id": notice.noticeId,
-            "x-raft-signature-256": signAgentInboxPushBody(secret, body),
-            // This notice span's trace id, for the receiver to log (correlation);
-            // omitted when no tracer records the span.
-            ...raftTraceIdHeaders(baseTracer === noopTracer ? null : currentRaftTraceId()),
-          },
-        }));
-        status = response.status;
-        retryAfter = response.retryAfter;
-        responseRequestId = response.requestId ?? null;
-        timing = response.timing;
-      } catch (error) {
-        errorCode = appWebhookDeliveryErrorCode(error);
-        // The phases that did complete (connect, TLS) before the failure, and
-        // where a timeout stopped.
-        if (error instanceof WebhookPostError) {
-          timing = error.timing;
-          timeoutPhase = error.timeoutPhase;
-        }
-      }
+      const { status, retryAfter, errorCode, responseRequestId, timing, timeoutPhase } = await postNotice(
+        registration, notice, input.post, baseTracer === noopTracer ? null : currentRaftTraceId(),
+      );
       const finishedAt = clock();
       const outcome = classify(status, errorCode, retryAfter, finishedAt);
       const latencyMs = input.pending.oldestWriteAtMs === null ? null : finishedAt.getTime() - input.pending.oldestWriteAtMs;
@@ -656,6 +862,8 @@ export async function sendAgentInboxNotice(input: {
         await executor.update(t).set({
           consecutiveFailures: 0,
           consecutiveRejections: 0,
+          firstUnauthorizedAt: null,
+          consecutiveUnauthorized: 0,
           lastAttemptAt: finishedAt,
           lastDeliveryAt: finishedAt,
           lastError: null,
@@ -667,23 +875,36 @@ export async function sendAgentInboxNotice(input: {
 
       const [counted] = await executor.update(t).set({
         consecutiveFailures: sql`${t.consecutiveFailures} + 1`,
+        // Each run counts only its own kind: a 401 neither counts toward nor
+        // keeps the 404/410 run, and any other outcome ends a run of 401s.
         consecutiveRejections: outcome.kind === "rejected" ? sql`${t.consecutiveRejections} + 1` : 0,
+        firstUnauthorizedAt: outcome.kind === "unauthorized"
+          ? sql`coalesce(${t.firstUnauthorizedAt}, ${finishedAt.toISOString()}::timestamptz)`
+          : null,
+        consecutiveUnauthorized: outcome.kind === "unauthorized" ? sql`${t.consecutiveUnauthorized} + 1` : 0,
         lastAttemptAt: finishedAt,
         lastError: outcome.error,
         updatedAt: finishedAt,
       }).where(eq(t.id, registration.id)).returning({
         consecutiveFailures: t.consecutiveFailures,
         consecutiveRejections: t.consecutiveRejections,
+        firstUnauthorizedAt: t.firstUnauthorizedAt,
+        consecutiveUnauthorized: t.consecutiveUnauthorized,
       });
       if (!counted) {
         span.end("ok", { attrs: endAttrs });
         return { outcome: "unregistered" };
       }
-      if (outcome.kind === "rejected" && counted.consecutiveRejections >= AGENT_INBOX_PUSH_REJECTION_LIMIT) {
-        await executor.update(t).set({ disabledAt: finishedAt, disabledReason: "endpoint_rejected" })
-          .where(and(eq(t.id, registration.id), isNull(t.disabledAt)));
-        addTraceEvent("agent_inbox_push.disabled", { reason: "endpoint_rejected" });
+      const stop = (outcome.kind === "rejected" && counted.consecutiveRejections >= AGENT_INBOX_PUSH_REJECTION_LIMIT)
+        || (outcome.kind === "unauthorized" && counted.firstUnauthorizedAt !== null
+          && counted.consecutiveUnauthorized >= AGENT_INBOX_PUSH_UNAUTHORIZED_MIN_COUNT
+          && finishedAt.getTime() - counted.firstUnauthorizedAt.getTime() >= AGENT_INBOX_PUSH_UNAUTHORIZED_DISABLE_AFTER_MS);
+      if (stop) {
+        const { notify } = await disableRegistration(executor, {
+          registrationId: registration.id, reason: "endpoint_rejected", now: finishedAt, notifyCause: "endpoint_failing",
+        });
         span.end("ok", { attrs: { ...endAttrs, disabled: true } });
+        if (notify) await notifyOwnerOfDisable(input.notifyOwner, input.agentId, "endpoint_failing");
         return { outcome: "disabled" };
       }
       if (outcome.kind === "bad_request") {
@@ -697,7 +918,7 @@ export async function sendAgentInboxNotice(input: {
           );
       await executor.update(t).set({ nextAttemptAt: new Date(finishedAt.getTime() + retryInMs) }).where(eq(t.id, registration.id));
       span.end("ok", { attrs: { ...endAttrs, retry_in_ms: retryInMs } });
-      return { outcome: outcome.kind, retryInMs };
+      return { outcome: outcome.kind === "unauthorized" ? "rejected" : outcome.kind, retryInMs };
     }, tracer).catch((error: unknown) => {
       span.end("error", { attrs: { mode: input.mode, error_class: errorClassOf(error) } });
       throw error;
@@ -824,6 +1045,7 @@ export async function sweepAgentInboxNotices(input: {
   agentIds?: readonly string[];
   skip?: (agentId: string) => boolean;
   remindAfterMs?: number;
+  notifyOwner?: AgentInboxPushOwnerNotifier;
 }): Promise<{ checked: number; sent: number; failed: number }> {
   const clock = input.clock ?? currentDate;
   const remindAfterMs = input.remindAfterMs ?? AGENT_INBOX_NOTICE_REMIND_AFTER_MS;
@@ -843,6 +1065,8 @@ export async function sweepAgentInboxNotices(input: {
       .where(and(
         isNull(t.disabledAt),
         sql`(${t.consecutiveFailures} = 0 OR ${t.nextAttemptAt} <= ${now.toISOString()}::timestamptz)`,
+        // A paused assistant is not woken (sendAgentInboxNotice refuses too).
+        sql`NOT EXISTS (SELECT 1 FROM ${agents} a WHERE a.id = ${t.agentId} AND a.assistant_paused_at IS NOT NULL)`,
         ...(input.agentIds ? [sql`${t.agentId} IN ${input.agentIds}`] : []),
       ))
       .limit(SWEEP_BATCH_SIZE);
@@ -874,7 +1098,7 @@ export async function sweepAgentInboxNotices(input: {
         let delivered = false;
         try {
           const result = await runWithTraceSpan(span, () => sendAgentInboxNotice({
-            agentId, pending: unread.pending, mode: "sweep", reason, post: input.post, tracer, clock,
+            agentId, pending: unread.pending, mode: "sweep", reason, post: input.post, tracer, clock, notifyOwner: input.notifyOwner,
           }), tracer);
           delivered = result.outcome === "delivered";
         } finally {
@@ -902,6 +1126,129 @@ export async function sweepAgentInboxNotices(input: {
     span.end("error", { attrs: { error_class: errorClassOf(error) } });
     throw error;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Recovery probe
+
+/** The probe's backoff after a failed probe scheduled with `previousMs`: doubled, capped at 24 hours. */
+export function agentInboxPushNextProbeBackoffMs(previousMs: number | null): number {
+  return Math.min(Math.max(previousMs ?? AGENT_INBOX_PUSH_PROBE_FIRST_DELAY_MS, AGENT_INBOX_PUSH_PROBE_FIRST_DELAY_MS) * 2, AGENT_INBOX_PUSH_PROBE_MAX_DELAY_MS);
+}
+
+/**
+ * Probe each endpoint_rejected registration whose probe is due: a notice with
+ * no targets ("Inbox update: no pending targets"), signed and bounded like any
+ * notice. A push is only a wake signal (the agent pulls /events), so an extra
+ * one is harmless. A 2xx re-enables the registration (no owner notice) and
+ * `onRecovered` lets the sweep announce what is unread; anything else doubles
+ * the backoff, up to 24 hours. Each probe is claimed on the row (next_probe_at
+ * moved past the POST), so one replica sends it. A registration whose
+ * credential was revoked or whose agent went away since is not probed: it gets
+ * that reason instead, which no probe can recover from. A registration stopped
+ * for 30 days stops being probed (probe_stopped_at) and is never claimed
+ * again; a new PUT clears that.
+ */
+export async function probeDisabledAgentInboxPushRegistrations(input: {
+  post?: WebhookPost;
+  tracer?: Tracer;
+  clock?: () => Date;
+  agentIds?: readonly string[];
+  onRecovered?: (agentId: string) => void;
+} = {}): Promise<{ probed: number; recovered: number }> {
+  const clock = input.clock ?? currentDate;
+  const tracer = input.tracer ?? noopTracer;
+  const t = agentInboxPushRegistrations;
+  const totals = { probed: 0, recovered: 0 };
+  // Due: next_probe_at has passed, or is unset (stopped before this probe existed, or by a replica
+  // that predates it), which probes at once.
+  const probeDue = (at: Date) => sql`coalesce(${t.nextProbeAt}, '-infinity'::timestamptz) <= ${at.toISOString()}::timestamptz`;
+  const due = await getDb().select({ id: t.id, agentId: t.agentId }).from(t).where(and(
+    isNotNull(t.disabledAt),
+    eq(t.disabledReason, "endpoint_rejected"),
+    isNull(t.probeStoppedAt),
+    probeDue(clock()),
+    // A paused assistant is not woken; its probe waits until it is started again.
+    sql`NOT EXISTS (SELECT 1 FROM ${agents} a WHERE a.id = ${t.agentId} AND a.assistant_paused_at IS NOT NULL)`,
+    ...(input.agentIds ? [sql`${t.agentId} IN ${input.agentIds}`] : []),
+  )).limit(SWEEP_BATCH_SIZE);
+  for (const { id, agentId } of due) {
+    try {
+      // The claim moves next_probe_at past this probe's POST, so one replica sends it.
+      const now = clock();
+      const [claimed] = await getDb().update(t)
+        .set({ nextProbeAt: new Date(now.getTime() + AGENT_INBOX_NOTICE_DIRECT_LEASE_MS) })
+        .where(and(eq(t.id, id), isNotNull(t.disabledAt), eq(t.disabledReason, "endpoint_rejected"), isNull(t.probeStoppedAt), probeDue(now)))
+        .returning({ disabledAt: t.disabledAt, probeBackoffMs: t.probeBackoffMs });
+      if (!claimed?.disabledAt) continue;
+      const stillDisabled = and(
+        eq(t.id, id),
+        eq(t.disabledReason, "endpoint_rejected"),
+        sql`date_trunc('milliseconds', ${t.disabledAt}) = ${claimed.disabledAt.toISOString()}::timestamptz`,
+      );
+      const loaded = await loadRegistrationAuthority(agentId, getDb());
+      // Gone, or re-registered (a PUT) since the claim: nothing to probe.
+      if (!loaded || loaded.registration.disabledAt?.getTime() !== claimed.disabledAt.getTime()) continue;
+      if (now.getTime() - claimed.disabledAt.getTime() >= AGENT_INBOX_PUSH_PROBE_GIVE_UP_AFTER_MS) {
+        // Stopped for 30 days: give up for good (no owner notice); only a new PUT resumes delivery.
+        await getDb().update(t).set({ probeStoppedAt: now, nextProbeAt: null, updatedAt: now }).where(stillDisabled);
+        addTraceEvent("agent_inbox_push.probe_stopped");
+        continue;
+      }
+      if (loaded.disabledReason) {
+        await getDb().update(t).set({
+          disabledReason: loaded.disabledReason, lastError: loaded.disabledReason, nextProbeAt: null, probeBackoffMs: null, updatedAt: now,
+        }).where(stillDisabled);
+        continue;
+      }
+      totals.probed += 1;
+      const span = tracer.startSpan("server.agent_push.probe", {
+        surface: "server",
+        kind: "internal",
+        attrs: { ...agentIdHashAttrs(agentId), ...serverIdHashAttrs(loaded.registration.serverId) },
+      });
+      const result = await runWithTraceSpan(span, () => postNotice(
+        loaded.registration, new PendingNotice().toNotice(agentId, now), input.post, tracer === noopTracer ? null : currentRaftTraceId(),
+      ), tracer);
+      const finishedAt = clock();
+      const outcome = classify(result.status, result.errorCode, result.retryAfter, finishedAt);
+      if (outcome.kind === "delivered") {
+        const [recovered] = await getDb().update(t).set({
+          disabledAt: null,
+          disabledReason: null,
+          consecutiveFailures: 0,
+          consecutiveRejections: 0,
+          firstUnauthorizedAt: null,
+          consecutiveUnauthorized: 0,
+          nextProbeAt: null,
+          probeBackoffMs: null,
+          nextAttemptAt: finishedAt,
+          lastAttemptAt: finishedAt,
+          lastError: null,
+          updatedAt: finishedAt,
+        }).where(stillDisabled).returning({ id: t.id });
+        span.end("ok", { attrs: { outcome: "recovered", http_status: result.status } });
+        if (recovered) {
+          totals.recovered += 1;
+          addTraceEvent("agent_inbox_push.recovered");
+          input.onRecovered?.(agentId);
+        }
+        continue;
+      }
+      const backoffMs = agentInboxPushNextProbeBackoffMs(claimed.probeBackoffMs);
+      await getDb().update(t).set({
+        nextProbeAt: new Date(finishedAt.getTime() + backoffMs),
+        probeBackoffMs: backoffMs,
+        lastAttemptAt: finishedAt,
+        lastError: outcome.error,
+        updatedAt: finishedAt,
+      }).where(stillDisabled);
+      span.end("ok", { attrs: { outcome: outcome.kind, http_status: result.status || null, error_code: outcome.error, next_probe_in_ms: backoffMs } });
+    } catch (error) {
+      console.error("[AgentInboxPush] recovery probe failed", serializeErrorForLog(error));
+    }
+  }
+  return totals;
 }
 
 // ---------------------------------------------------------------------------
@@ -933,6 +1280,8 @@ export function startAgentInboxPushWorker(input: {
   sweepIntervalMs?: number;
   /** Test seam: the in-memory retry timer's delay for a given backoff. */
   retryTimerMs?: (backoffMs: number) => number;
+  /** Posts the owner's notice when a registration stops (server.ts: the agent's DM with its owner). */
+  notifyOwner?: AgentInboxPushOwnerNotifier;
 }) {
   const states = new Map<string, AgentNoticeState>();
   let stopped = false;
@@ -956,14 +1305,17 @@ export function startAgentInboxPushWorker(input: {
     state.pending = new PendingNotice();
     let result: AgentInboxNoticeResult;
     try {
-      result = await sendAgentInboxNotice({ agentId, pending: taken, mode, post: input.post, tracer: input.tracer, clock: input.clock });
+      result = await sendAgentInboxNotice({
+        agentId, pending: taken, mode, post: input.post, tracer: input.tracer, clock: input.clock, notifyOwner: input.notifyOwner,
+      });
     } catch (error) {
       console.error("[AgentInboxPush] notice failed", serializeErrorForLog(error));
       result = { outcome: "retry", retryInMs: AGENT_INBOX_PUSH_RETRY_DELAYS_MS[0] };
     } finally {
       state.inFlight = false;
     }
-    if (result.outcome === "delivered" || result.outcome === "disabled" || result.outcome === "unregistered" || result.outcome === "nothing_to_send") {
+    // Paused: dropped here; the sweep announces what is still unread once the owner starts it again.
+    if (result.outcome === "delivered" || result.outcome === "disabled" || result.outcome === "paused" || result.outcome === "unregistered" || result.outcome === "nothing_to_send") {
       if (result.outcome !== "delivered") state.pending = new PendingNotice();
       if (!state.pending.empty) void send(agentId, "direct");
       else if (state.retryTimer === null) states.delete(agentId);
@@ -1004,13 +1356,37 @@ export function startAgentInboxPushWorker(input: {
       agentIds,
       // An agent with a notice pending or in flight here is covered already.
       skip: (agentId) => states.has(agentId),
+      notifyOwner: input.notifyOwner,
     })
       .catch((error) => console.error("[AgentInboxPush] sweep failed", serializeErrorForLog(error)))
       .finally(() => {
         if (!agentIds) sweeping = false;
       });
   };
-  const handle = setClockInterval(() => sweep(), input.sweepIntervalMs ?? AGENT_INBOX_NOTICE_SWEEP_INTERVAL_MS);
+  // Stopped endpoints are probed on the same interval, on a chain of their own
+  // so slow probes never hold up the sweep. One that answers is swept at once,
+  // so its unread is announced.
+  let probing = false;
+  const probe = () => {
+    if (probing) return;
+    probing = true;
+    probeDisabledAgentInboxPushRegistrations({
+      post: input.post,
+      tracer: input.tracer,
+      clock: input.clock,
+      onRecovered: (agentId) => {
+        if (!stopped) sweep([agentId]);
+      },
+    })
+      .catch((error) => console.error("[AgentInboxPush] recovery probes failed", serializeErrorForLog(error)))
+      .finally(() => {
+        probing = false;
+      });
+  };
+  const handle = setClockInterval(() => {
+    sweep();
+    probe();
+  }, input.sweepIntervalMs ?? AGENT_INBOX_NOTICE_SWEEP_INTERVAL_MS);
   if (typeof handle === "object" && handle && "unref" in handle && typeof handle.unref === "function") handle.unref();
   const worker: ActiveWorker = { kick: (agentId) => sweep([agentId]) };
   activeWorker = worker;

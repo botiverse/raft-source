@@ -3,6 +3,7 @@ import { createRequire } from "node:module";
 declare const __RAFT_COMPUTER_VERSION__: string | undefined;
 declare const __RAFT_DAEMON_VERSION__: string | undefined;
 declare const __RAFT_CLI_VERSION__: string | undefined;
+declare const __RAFT_COMPUTER_BUILD_SHA__: string | undefined;
 
 function readBakedComputerVersion(): string | undefined {
   return typeof __RAFT_COMPUTER_VERSION__ === "string" ? __RAFT_COMPUTER_VERSION__ : undefined;
@@ -14,6 +15,10 @@ function readBakedDaemonVersion(): string | undefined {
 
 function readBakedCliVersion(): string | undefined {
   return typeof __RAFT_CLI_VERSION__ === "string" ? __RAFT_CLI_VERSION__ : undefined;
+}
+
+function readBakedComputerBuildSha(): string | undefined {
+  return typeof __RAFT_COMPUTER_BUILD_SHA__ === "string" ? __RAFT_COMPUTER_BUILD_SHA__ : undefined;
 }
 
 export function readComputerVersion(
@@ -60,3 +65,12 @@ export function readBundledCliVersion(
 }
 
 export const BUNDLED_CLI_VERSION = readBundledCliVersion();
+
+export function readComputerBuildSha(
+  bakedSha: unknown = readBakedComputerBuildSha(),
+): string | undefined {
+  // Only CI SEA builds bake the source commit; local builds have none.
+  return typeof bakedSha === "string" && bakedSha.length > 0 ? bakedSha : undefined;
+}
+
+export const COMPUTER_BUILD_SHA = readComputerBuildSha();

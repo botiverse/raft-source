@@ -25,11 +25,14 @@ import { recordExternalSinkInsideTransaction } from "../db/ambientTransaction";
 const FCM_SCOPE = "https://www.googleapis.com/auth/firebase.messaging";
 const FCM_REQUEST_TIMEOUT_MS = 5_000;
 const FCM_TTL_SECONDS = 60 * 60;
+/** The boot prefetch waits longer than a send: nothing is held while it runs. */
+const FCM_PREFETCH_TIMEOUT_MS = 30_000;
 
 export interface FcmMessage {
   /** FCM `message.data`: string values only. */
   data: Record<string, string>;
-  collapseKey: string;
+  /** `android.priority`; absent = HIGH (callers before the unified notifications). */
+  priority?: "HIGH" | "NORMAL";
 }
 
 export interface FcmDeliveryInput {
@@ -48,6 +51,8 @@ export interface FcmPushProvider {
   send(input: FcmDeliveryInput): Promise<FcmDeliveryResult>;
   /** False when `send` would skip with `provider_not_configured`. Absent = configured. */
   isConfigured?(): boolean;
+  /** Fetches the access token ahead of the first send (boot warm-up). */
+  prefetchAccessToken?(): Promise<"warmed" | "not_configured">;
 }
 
 export class FcmDeliveryError extends Error {
@@ -253,6 +258,19 @@ export class ConfiguredFcmPushProvider implements FcmPushProvider {
     return this.tokenSource() !== null;
   }
 
+  /**
+   * Boot warm-up: runs the token exchange (AWS credentials, Google STS,
+   * impersonation) before the first send needs it. The auth client caches the
+   * token and shares an exchange in flight, so a send during the prefetch
+   * waits on it instead of starting its own.
+   */
+  async prefetchAccessToken(timeoutMs: number = FCM_PREFETCH_TIMEOUT_MS): Promise<"warmed" | "not_configured"> {
+    const source = this.tokenSource();
+    if (!source) return "not_configured";
+    await withTimeout(source.getAccessToken(), timeoutMs);
+    return "warmed";
+  }
+
   async send(input: FcmDeliveryInput): Promise<FcmDeliveryResult> {
     recordExternalSinkInsideTransaction("fcm");
     const source = this.tokenSource();
@@ -285,9 +303,11 @@ export class ConfiguredFcmPushProvider implements FcmPushProvider {
           // can stay silent when that conversation is already on screen).
           data: input.message.data,
           android: {
-            priority: "HIGH",
+            priority: input.message.priority ?? "HIGH",
             ttl: `${FCM_TTL_SECONDS}s`,
-            collapse_key: input.message.collapseKey,
+            // No collapse_key: every message reaches the device, also after it
+            // was offline, and the app stacks them per conversation itself
+            // (FCM keeps only ~4 collapse keys per device anyway).
           },
         },
       }),

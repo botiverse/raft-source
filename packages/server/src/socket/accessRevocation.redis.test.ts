@@ -2,15 +2,15 @@ import assert from "node:assert/strict";
 import { once } from "node:events";
 import Redis from "ioredis";
 import WebSocket from "ws";
-import { and, eq } from "drizzle-orm";
 import { SERVER_GUEST_FEATURE_FLAG_KEY } from "@botiverse/raft-shared";
-import { featureFlagRules, serverMembers } from "../db/schema";
+import { featureFlagRules } from "../db/schema";
 import { createHttpClient } from "../test/integration/http";
+import { accessTokenForTest, signInForTest } from "../test/integration/credentials";
 import { updateChannel } from "../services/channelService";
 import { dbTest } from "../test/integration/dbTest";
+import { seedBoundGuest } from "../test/guestFixture";
 import { createTestApp } from "../test/integration/app";
-import { signAccessToken } from "../middleware/auth";
-import { createSession, revokeSession, revokeAllUserSessions } from "../services/sessionService";
+import { revokeSession, revokeAllUserSessions } from "../services/sessionService";
 import * as redis from "../redis";
 import * as revocations from "./accessRevocation";
 
@@ -21,14 +21,13 @@ dbTest.skipIf(!redisUrl)("Redis peers acknowledge authorized channel subscriptio
   const owner = await seed.human();
   const guest = await seed.human();
   const server = await seed.server({ owner, members: [guest] });
-  await db.update(serverMembers).set({ role: "guest" }).where(and(
-    eq(serverMembers.serverId, server.id), eq(serverMembers.userId, guest.id),
-  ));
+  // A Guest always has its one channel (server_members_guest_has_channel).
+  await seedBoundGuest({ serverId: server.id, userId: guest.id }, db);
   await db.insert(featureFlagRules).values({
     flagKey: SERVER_GUEST_FEATURE_FLAG_KEY, stage: "server", priority: 0, decision: "allow", values: [server.id],
   });
-  const firstSession = await createSession(owner.id);
-  const secondSession = await createSession(owner.id);
+  const firstSession = await signInForTest(owner.id);
+  const secondSession = await signInForTest(owner.id);
   const clients = Array.from({ length: 5 }, () => new Redis(redisUrl!));
   const apps: Awaited<ReturnType<typeof createTestApp>>[] = [];
   const sockets: WebSocket[] = [];
@@ -45,15 +44,15 @@ dbTest.skipIf(!redisUrl)("Redis peers acknowledge authorized channel subscriptio
     // worker would. Both apps otherwise use the production Socket setup.
     spies.push(vi.spyOn(revocations, "onSocketAccessRevoked")
       .mockImplementationOnce(subscribe).mockImplementation(() => () => {}));
-    apps.push(await createTestApp(0, { onboardingOpenerFlagDefaultEnabled: false }));
-    apps.push(await createTestApp(0, { onboardingOpenerFlagDefaultEnabled: false }));
+    apps.push(await createTestApp(0));
+    apps.push(await createTestApp(0));
     await Promise.all([clients[2].ping(), clients[4].ping()]);
 
     const guestPackets: string[] = [];
     const tokens = [
-      signAccessToken(owner.id, firstSession.familyId),
-      signAccessToken(owner.id, secondSession.familyId),
-      signAccessToken(guest.id),
+      firstSession.token,
+      secondSession.token,
+      await accessTokenForTest(guest.id),
     ];
     for (const token of tokens) {
       const socket = new WebSocket(`${apps[1].baseUrl.replace("http:", "ws:")}/socket.io/?EIO=4&transport=websocket`);

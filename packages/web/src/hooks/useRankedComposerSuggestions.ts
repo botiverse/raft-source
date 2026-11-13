@@ -18,6 +18,7 @@ const WORKER_RANK_DEBOUNCE_MS = 50;
 interface ComposerSuggestionWorkerEntry {
   index: number;
   fields: ComposerSuggestionSearchField[];
+  tier?: number;
 }
 
 interface ComposerSuggestionWorkerResponse {
@@ -38,11 +39,27 @@ interface WorkerState<T> {
   } | null;
 }
 
+const NOTHING_YET: never[] = [];
+
 export function useRankedComposerSuggestions<T>(
   query: string,
   entries: ComposerSuggestionSearchEntry<T>[],
-  { workerThreshold = DEFAULT_WORKER_THRESHOLD }: UseRankedComposerSuggestionsOptions = {},
+  options: UseRankedComposerSuggestionsOptions = {},
 ): T[] {
+  return useRankedComposerSuggestionsOrPending(query, entries, options) ?? NOTHING_YET;
+}
+
+/**
+ * The same ranking, but `null` while the worker hasn't answered the first
+ * query yet (after that, the previous answer stays until the next one), so a
+ * caller can tell "not ranked yet" from "nothing matches": a picker would
+ * otherwise flash its no-match line on the first keystroke in a big server.
+ */
+export function useRankedComposerSuggestionsOrPending<T>(
+  query: string,
+  entries: ComposerSuggestionSearchEntry<T>[],
+  { workerThreshold = DEFAULT_WORKER_THRESHOLD }: UseRankedComposerSuggestionsOptions = {},
+): T[] | null {
   const requestIdRef = useRef(0);
   const workerRef = useRef<Worker | null>(null);
   const lastWorkerEntriesRef = useRef<ComposerSuggestionSearchEntry<T>[] | null>(null);
@@ -129,6 +146,7 @@ export function useRankedComposerSuggestions<T>(
         ? entries.map((entry) => ({
             index: entry.index,
             fields: entry.fields,
+            tier: entry.tier,
           }))
         : undefined;
       lastWorkerEntriesRef.current = entries;
@@ -158,7 +176,7 @@ export function useRankedComposerSuggestions<T>(
   return useMemo(() => {
     if (needsWorker && !shouldUseWorker) return rankBasicComposerSuggestions(query, entries);
     if (!shouldUseWorker) return rankComposerSuggestions(query, entries);
-    if (!workerState.result) return [];
+    if (!workerState.result) return null;
     return workerState.result.suggestions;
   }, [entries, needsWorker, query, shouldUseWorker, workerState.result]);
 }

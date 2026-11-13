@@ -44,6 +44,7 @@
  *   - `no_agents_on_manageable_servers`     — has `issueAgentCredentials` on ≥1 server, but those servers have zero agents.
  */
 
+import { agentFindableBy } from "../services/agentMemberListPolicy";
 import type { Request, Response } from "express";
 import { and, eq, inArray, isNull } from "drizzle-orm";
 
@@ -101,6 +102,8 @@ export async function listManageableAgentsHandler(req: Request, res: Response): 
       .where(and(
         isNull(agents.deletedAt),
         inArray(agents.serverId, memberServerIds),
+        // Another person's personal assistant is never offered (agentFindableBy).
+        agentFindableBy({ userId: req.userId! }),
       ));
 
     const authorizedRows = rows.filter((agent) => capableServerIds.has(agent.serverId)

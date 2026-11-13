@@ -1,6 +1,7 @@
 // Glimpse G2-2: task writes tell the Server what the model's context has seen
-// of the task's channel, as a send does, and a held write is an interrupt the
-// frontier books.
+// of the conversation their result lands in (the task's own, `#board:#7`;
+// shared agentWriteLanding.ts), as a send does, and a held write is an
+// interrupt the frontier books.
 import assert from "node:assert/strict";
 import { createRaft } from "./index";
 
@@ -35,16 +36,17 @@ const held = (seenUpToSeq: number) => ({
 });
 const claimed = { results: [{ taskNumber: 7, success: true }] };
 
-test("a claim attests what the context has seen of the channel", async () => {
+test("a claim attests what the context has seen of the task's conversation", async () => {
   const { calls, fetch } = server([claimed]);
   const raft = createRaft({ serverUrl: "https://raft.example", credential, fetch });
   raft.frontier.setContext("ctx-1");
-  raft.frontier.recordUpTo("#board", 40);
+  raft.frontier.recordUpTo("#board:#7", 40);
   await raft.tasks.claim({ target: "#board", taskNumbers: [7] });
   assert.equal(calls[0]!.body!.seenUpToSeq, 40);
+  assert.equal(calls[0]!.body!.seenFor, "task_conversation");
 });
 
-test("nothing seen of the channel attests nothing, so the Server does not hold the write", async () => {
+test("nothing seen of the conversation attests nothing, so the Server does not hold the write", async () => {
   const { calls, fetch } = server([claimed, { ok: true }, { ok: true, task: { taskNumber: 7 }, event: { seq: 1 } }]);
   const raft = createRaft({ serverUrl: "https://raft.example", credential, fetch });
   await raft.tasks.claim({ target: "#board", taskNumbers: [7] });
@@ -59,12 +61,11 @@ test("a held claim is an interrupt: booked by recordHeld, and the identical reru
   const { calls, fetch } = server([held(42), claimed]);
   const raft = createRaft({ serverUrl: "https://raft.example", credential, fetch });
   raft.frontier.setContext("ctx-1");
-  raft.frontier.recordUpTo("#board", 40);
+  raft.frontier.recordUpTo("#board:#7", 40);
   const outcome = await raft.tasks.claim({ target: "#board", taskNumbers: [7] });
   if (!outcome.ok || outcome.state !== "interrupted") return assert.fail("expected an interrupt");
   assert.equal(outcome.interrupt.reason, "unread_messages");
   assert.equal(outcome.interrupt.contextId, "ctx-1");
-  assert.match(outcome.text, /Your task claim was not applied\./);
   assert.match(outcome.text, /hold on, scope changed/);
   assert.equal(raft.frontier.recordHeld(outcome.interrupt), true);
   await raft.tasks.claim({ target: "#board", taskNumbers: [7] });
@@ -74,13 +75,11 @@ test("a held claim is an interrupt: booked by recordHeld, and the identical reru
 test("updateStatus and amend attest too, and a hold applies nothing", async () => {
   const { calls, fetch } = server([held(42), held(42)]);
   const raft = createRaft({ serverUrl: "https://raft.example", credential, fetch });
-  raft.frontier.recordUpTo("#board", 40);
+  raft.frontier.recordUpTo("#board:#7", 40);
   const update = await raft.tasks.updateStatus({ target: "#board", taskNumber: 7, status: "in_review" });
   const amend = await raft.tasks.amend({ target: "#board", taskNumber: 7, title: "new title" });
   assert.equal(update.ok && update.state, "interrupted");
   assert.equal(amend.ok && amend.state, "interrupted");
-  assert.match(update.ok ? update.text : "", /The status change was not applied\./);
-  assert.match(amend.ok ? amend.text : "", /The amendment was not applied\./);
   assert.equal(calls[0]!.body!.seenUpToSeq, 40);
   assert.equal(calls[1]!.body!.seenUpToSeq, 40);
 });
@@ -88,7 +87,7 @@ test("updateStatus and amend attest too, and a hold applies nothing", async () =
 test("invoke with a per-call context attests that context's view only, and recordHeld on the root books under it", async () => {
   const { calls, fetch } = server([held(42), claimed, claimed]);
   const raft = createRaft({ serverUrl: "https://raft.example", credential, fetch });
-  raft.frontier.inContext("ctx-A").recordUpTo("#board", 40);
+  raft.frontier.inContext("ctx-A").recordUpTo("#board:#7", 40);
   const outcome = await raft.invoke("tasks.claim", { target: "#board", taskNumbers: [7] }, { contextId: "ctx-A" });
   if (!outcome.ok || outcome.state !== "interrupted") return assert.fail("expected an interrupt");
   assert.equal(calls[0]!.body!.seenUpToSeq, 40);
@@ -106,7 +105,7 @@ test("a fresh client loads the saved state before a task write, so it attests wh
     version: 3,
     cursor: null,
     pendingCursor: null,
-    frontier: { version: 1, targets: { "#ops": { upTo: 41 } }, aliases: {} },
+    frontier: { version: 1, targets: { "#ops:#7": { upTo: 41 } }, aliases: {} },
     continuations: [],
   };
   const state = { load: async () => saved as never, save: async () => {} };

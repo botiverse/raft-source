@@ -1,0 +1,468 @@
+{
+  "protocolVersion": 1,
+  "runtimeId": "claude",
+  "schemaVersion": "claude.create.v1",
+  "sourceId": "reasoningEffort",
+  "kind": "dependent_select",
+  "pointer": "/reasoningEffort",
+  "dependsOn": "/model",
+  "optionsByValue": {
+    "opus": [
+      {
+        "value": "",
+        "label": "Default"
+      },
+      {
+        "value": "low",
+        "label": "Low"
+      },
+      {
+        "value": "medium",
+        "label": "Medium"
+      },
+      {
+        "value": "high",
+        "label": "High"
+      },
+      {
+        "value": "xhigh",
+        "label": "Extra high"
+      },
+      {
+        "value": "max",
+        "label": "Max"
+      }
+    ],
+    "fable": [
+      {
+        "value": "",
+        "label": "Default"
+      },
+      {
+        "value": "low",
+        "label": "Low"
+      },
+      {
+        "value": "medium",
+        "label": "Medium"
+      },
+      {
+        "value": "high",
+        "label": "High"
+      },
+      {
+        "value": "xhigh",
+        "label": "Extra high"
+      },
+      {
+        "value": "max",
+        "label": "Max"
+      }
+    ],
+    "sonnet": [
+      {
+        "value": "",
+        "label": "Default"
+      },
+      {
+        "value": "low",
+        "label": "Low"
+      },
+      {
+        "value": "medium",
+        "label": "Medium"
+      },
+      {
+        "value": "high",
+        "label": "High"
+      },
+      {
+        "value": "xhigh",
+        "label": "Extra high"
+      },
+      {
+        "value": "max",
+        "label": "Max"
+      }
+    ],
+    "haiku": [
+      {
+        "value": "",
+        "label": "Default"
+      },
+      {
+        "value": "low",
+        "label": "Low"
+      },
+      {
+        "value": "medium",
+        "label": "Medium"
+      },
+      {
+        "value": "high",
+        "label": "High"
+      },
+      {
+        "value": "xhigh",
+        "label": "Extra high"
+      }
+    ],
+    "claude-opus-5-5": [
+      {
+        "value": "",
+        "label": "Default"
+      },
+      {
+        "value": "low",
+        "label": "Low"
+      },
+      {
+        "value": "medium",
+        "label": "Medium"
+      },
+      {
+        "value": "high",
+        "label": "High"
+      },
+      {
+        "value": "xhigh",
+        "label": "Extra high"
+      },
+      {
+        "value": "max",
+        "label": "Max"
+      }
+    ],
+    "claude-opus-5": [
+      {
+        "value": "",
+        "label": "Default"
+      },
+      {
+        "value": "low",
+        "label": "Low"
+      },
+      {
+        "value": "medium",
+        "label": "Medium"
+      },
+      {
+        "value": "high",
+        "label": "High"
+      },
+      {
+        "value": "xhigh",
+        "label": "Extra high"
+      },
+      {
+        "value": "max",
+        "label": "Max"
+      }
+    ],
+    "claude-opus-4-8": [
+      {
+        "value": "",
+        "label": "Default"
+      },
+      {
+        "value": "low",
+        "label": "Low"
+      },
+      {
+        "value": "medium",
+        "label": "Medium"
+      },
+      {
+        "value": "high",
+        "label": "High"
+      },
+      {
+        "value": "xhigh",
+        "label": "Extra high"
+      },
+      {
+        "value": "max",
+        "label": "Max"
+      }
+    ],
+    "claude-opus-4-7": [
+      {
+        "value": "",
+        "label": "Default"
+      },
+      {
+        "value": "low",
+        "label": "Low"
+      },
+      {
+        "value": "medium",
+        "label": "Medium"
+      },
+      {
+        "value": "high",
+        "label": "High"
+      },
+      {
+        "value": "xhigh",
+        "label": "Extra high"
+      },
+      {
+        "value": "max",
+        "label": "Max"
+      }
+    ],
+    "claude-opus-4-6": [
+      {
+        "value": "",
+        "label": "Default"
+      },
+      {
+        "value": "low",
+        "label": "Low"
+      },
+      {
+        "value": "medium",
+        "label": "Medium"
+      },
+      {
+        "value": "high",
+        "label": "High"
+      },
+      {
+        "value": "xhigh",
+        "label": "Extra high"
+      },
+      {
+        "value": "max",
+        "label": "Max"
+      }
+    ],
+    "claude-fable-5-2": [
+      {
+        "value": "",
+        "label": "Default"
+      },
+      {
+        "value": "low",
+        "label": "Low"
+      },
+      {
+        "value": "medium",
+        "label": "Medium"
+      },
+      {
+        "value": "high",
+        "label": "High"
+      },
+      {
+        "value": "xhigh",
+        "label": "Extra high"
+      },
+      {
+        "value": "max",
+        "label": "Max"
+      }
+    ],
+    "claude-fable-5-1": [
+      {
+        "value": "",
+        "label": "Default"
+      },
+      {
+        "value": "low",
+        "label": "Low"
+      },
+      {
+        "value": "medium",
+        "label": "Medium"
+      },
+      {
+        "value": "high",
+        "label": "High"
+      },
+      {
+        "value": "xhigh",
+        "label": "Extra high"
+      },
+      {
+        "value": "max",
+        "label": "Max"
+      }
+    ],
+    "claude-fable-5": [
+      {
+        "value": "",
+        "label": "Default"
+      },
+      {
+        "value": "low",
+        "label": "Low"
+      },
+      {
+        "value": "medium",
+        "label": "Medium"
+      },
+      {
+        "value": "high",
+        "label": "High"
+      },
+      {
+        "value": "xhigh",
+        "label": "Extra high"
+      },
+      {
+        "value": "max",
+        "label": "Max"
+      }
+    ],
+    "claude-sonnet-5-5": [
+      {
+        "value": "",
+        "label": "Default"
+      },
+      {
+        "value": "low",
+        "label": "Low"
+      },
+      {
+        "value": "medium",
+        "label": "Medium"
+      },
+      {
+        "value": "high",
+        "label": "High"
+      },
+      {
+        "value": "xhigh",
+        "label": "Extra high"
+      },
+      {
+        "value": "max",
+        "label": "Max"
+      }
+    ],
+    "claude-sonnet-5": [
+      {
+        "value": "",
+        "label": "Default"
+      },
+      {
+        "value": "low",
+        "label": "Low"
+      },
+      {
+        "value": "medium",
+        "label": "Medium"
+      },
+      {
+        "value": "high",
+        "label": "High"
+      },
+      {
+        "value": "xhigh",
+        "label": "Extra high"
+      },
+      {
+        "value": "max",
+        "label": "Max"
+      }
+    ],
+    "claude-sonnet-4-6": [
+      {
+        "value": "",
+        "label": "Default"
+      },
+      {
+        "value": "low",
+        "label": "Low"
+      },
+      {
+        "value": "medium",
+        "label": "Medium"
+      },
+      {
+        "value": "high",
+        "label": "High"
+      },
+      {
+        "value": "xhigh",
+        "label": "Extra high"
+      },
+      {
+        "value": "max",
+        "label": "Max"
+      }
+    ],
+    "claude-haiku-5-5": [
+      {
+        "value": "",
+        "label": "Default"
+      },
+      {
+        "value": "low",
+        "label": "Low"
+      },
+      {
+        "value": "medium",
+        "label": "Medium"
+      },
+      {
+        "value": "high",
+        "label": "High"
+      },
+      {
+        "value": "xhigh",
+        "label": "Extra high"
+      },
+      {
+        "value": "max",
+        "label": "Max"
+      }
+    ],
+    "claude-haiku-4-5": [
+      {
+        "value": "",
+        "label": "Default"
+      },
+      {
+        "value": "low",
+        "label": "Low"
+      },
+      {
+        "value": "medium",
+        "label": "Medium"
+      },
+      {
+        "value": "high",
+        "label": "High"
+      },
+      {
+        "value": "xhigh",
+        "label": "Extra high"
+      }
+    ]
+  },
+  "defaultValueByValue": {
+    "opus": "",
+    "fable": "",
+    "sonnet": "",
+    "haiku": "",
+    "claude-opus-5-5": "",
+    "claude-opus-5": "",
+    "claude-opus-4-8": "",
+    "claude-opus-4-7": "",
+    "claude-opus-4-6": "",
+    "claude-fable-5-2": "",
+    "claude-fable-5-1": "",
+    "claude-fable-5": "",
+    "claude-sonnet-5-5": "",
+    "claude-sonnet-5": "",
+    "claude-sonnet-4-6": "",
+    "claude-haiku-5-5": "",
+    "claude-haiku-4-5": ""
+  },
+  "customValueAllowedByValue": {},
+  "status": "fallback",
+  "reason": "machine_offline",
+  "retryable": true
+}

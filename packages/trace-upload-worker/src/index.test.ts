@@ -1,8 +1,7 @@
 import { createHash, createHmac } from "node:crypto";
 import { gzipSync } from "node:zlib";
 import assert from "node:assert/strict";
-import { TRACE_EVENT_ROW_V2_PROJECTION_COLUMNS } from "@botiverse/raft-shared";
-import type { Client } from "scopedb";
+import { fakeScopeDbTraceEventClient } from "./testing/fakeScopeDbTraceEventClient";
 import { handleRequest, ingestTraceBundleObject, type TraceUploadWorkerEnv } from "./index";
 import { resetTraceUploadBudgetsForTest } from "./traces/uploadRateLimit";
 
@@ -66,19 +65,6 @@ function baseEnv() {
     TRACE_BUNDLES: bucket,
   };
   return { env, bucket };
-}
-
-function mockTraceEventTable() {
-  const table = {
-    withSchema: () => table,
-    tableSchema: async () => ({
-      fields: () => TRACE_EVENT_ROW_V2_PROJECTION_COLUMNS.map(([name, dataType]) => ({
-        name: () => name,
-        dataType: () => dataType,
-      })),
-    }),
-  };
-  return table;
 }
 
 function signAttestation(claims: Record<string, unknown>, secret = SECRET): string {
@@ -251,14 +237,13 @@ test("web trace endpoint projects V2 rows after the canonical OTLP write", async
   env.RAFT_TRACE_SCOPEDB_PROJECTOR = "on";
   env.SCOPEDB_TRACE_EVENTS_ENDPOINT = "https://scopedb.test";
   env.SCOPEDB_TRACE_EVENTS_WRITE_KEY = "test-key";
-  env.SCOPEDB_TRACE_EVENTS_CLIENT = {
-    table: () => mockTraceEventTable(),
-    insert: async (payload: string) => {
+  env.SCOPEDB_TRACE_EVENTS_CLIENT = fakeScopeDbTraceEventClient({
+    append: async (payload: string) => {
       callOrder.push("v2");
       projectedPayload = payload;
       return { num_rows_inserted: 2 };
     },
-  } as unknown as Pick<Client, "insert" | "table">;
+  });
 
   const res = await handleRequest(new Request("https://trace-worker.test/api/web-traces", {
     method: "POST",
@@ -303,13 +288,12 @@ test("web trace endpoint projects a mixed unset and closed-status batch into V2"
   env.RAFT_TRACE_SCOPEDB_PROJECTOR = "on";
   env.SCOPEDB_TRACE_EVENTS_ENDPOINT = "https://scopedb-mixed-status.test";
   env.SCOPEDB_TRACE_EVENTS_WRITE_KEY = "test-key";
-  env.SCOPEDB_TRACE_EVENTS_CLIENT = {
-    table: () => mockTraceEventTable(),
-    insert: async (payload: string) => {
+  env.SCOPEDB_TRACE_EVENTS_CLIENT = fakeScopeDbTraceEventClient({
+    append: async (payload: string) => {
       projectedPayload = payload;
       return { num_rows_inserted: 4 };
     },
-  } as unknown as Pick<Client, "insert" | "table">;
+  });
 
   const res = await handleRequest(new Request("https://trace-worker.test/api/web-traces", {
     method: "POST",
@@ -360,13 +344,12 @@ test("web trace endpoint preserves valid V2 siblings when one record is invalid"
   env.RAFT_TRACE_SCOPEDB_PROJECTOR = "on";
   env.SCOPEDB_TRACE_EVENTS_ENDPOINT = "https://scopedb-partial.test";
   env.SCOPEDB_TRACE_EVENTS_WRITE_KEY = "test-key";
-  env.SCOPEDB_TRACE_EVENTS_CLIENT = {
-    table: () => mockTraceEventTable(),
-    insert: async (payload: string) => {
+  env.SCOPEDB_TRACE_EVENTS_CLIENT = fakeScopeDbTraceEventClient({
+    append: async (payload: string) => {
       projectedPayload = payload;
       return { num_rows_inserted: 2 };
     },
-  } as unknown as Pick<Client, "insert" | "table">;
+  });
 
   const res = await handleRequest(new Request("https://trace-worker.test/api/web-traces", {
     method: "POST",
@@ -415,12 +398,11 @@ test("web trace endpoint reports V2 failure without failing canonical OTLP", asy
   env.RAFT_TRACE_SCOPEDB_PROJECTOR = "on";
   env.SCOPEDB_TRACE_EVENTS_ENDPOINT = "https://scopedb.test";
   env.SCOPEDB_TRACE_EVENTS_WRITE_KEY = "test-key";
-  env.SCOPEDB_TRACE_EVENTS_CLIENT = {
-    table: () => mockTraceEventTable(),
-    insert: async () => {
+  env.SCOPEDB_TRACE_EVENTS_CLIENT = fakeScopeDbTraceEventClient({
+    append: async () => {
       throw new Error("projector unavailable");
     },
-  } as unknown as Pick<Client, "insert" | "table">;
+  });
 
   const res = await handleRequest(new Request("https://trace-worker.test/api/web-traces", {
     method: "POST",
@@ -1417,6 +1399,83 @@ test("trace upload worker schedules async R2 to OTLP ingest after successful upl
   assert.equal(spans[0].events[0].name, "daemon.agent.stdin.written");
 });
 
+test("trace upload worker logs the cause when a storage write fails inside the request", async () => {
+  const { env, bucket } = baseEnv();
+  const bundle = Buffer.from(`${JSON.stringify(spanRecord())}\n`);
+  const metadata = {
+    uploadId: "upload-r2-500-in-request",
+    objectKey: "trace-bundles/server-1/machine-1/upload-r2-500-in-request.jsonl",
+    bundleId: "bundle-r2-500-in-request",
+    bundleSha256: sha256Hex(bundle),
+    bundleSizeBytes: bundle.byteLength,
+    bundleContentType: "application/x-ndjson",
+    maxBytes: 1024 * 1024,
+  };
+  const createRes = await handleRequest(new Request("https://trace-worker.test/api/trace-bundles", {
+    method: "POST",
+    body: JSON.stringify({
+      attestation: signAttestation(traceUploadClaims(metadata)),
+      bundleSha256: metadata.bundleSha256,
+      bundleSizeBytes: metadata.bundleSizeBytes,
+    }),
+  }), env);
+  const createBody = await createRes.json() as { upload: { url: string } };
+  bucket.putError = new Error("R2 PUT failed with status 500");
+
+  const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+  try {
+    const putRes = await handleRequest(new Request(createBody.upload.url, { method: "PUT", body: bundle }), env);
+
+    assert.equal(putRes.status, 500);
+    assert.deepEqual(await putRes.json(), { error: "Internal server error" });
+    assert.deepEqual(error.mock.calls, [["[TraceUploadWorker] request_failed", {
+      method: "PUT",
+      // Path only: the upload token in the query is never logged.
+      path: "/api/trace-bundles/upload-r2-500-in-request/object",
+      error_class: "Error",
+      error_message: "R2 PUT failed with status 500",
+    }]]);
+  } finally {
+    error.mockRestore();
+  }
+});
+
+test("trace upload worker logs a client disconnect as request_aborted, not request_failed", async () => {
+  const { env } = baseEnv();
+  // What the Node entry point hands over when the client closes the connection
+  // mid-body: the request's signal is aborted and the body read rejects.
+  const clientGone = new AbortController();
+  const body = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      controller.error(Object.assign(new Error("aborted"), { code: "ECONNRESET" }));
+    },
+  });
+  const request = new Request("https://trace-worker.test/api/web-traces", {
+    method: "POST",
+    body,
+    duplex: "half",
+    signal: clientGone.signal,
+  } as RequestInit);
+  clientGone.abort();
+
+  const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+  try {
+    const res = await handleRequest(request, env);
+
+    assert.equal(res.status, 500);
+    assert.deepEqual(warn.mock.calls, [["[TraceUploadWorker] request_aborted", {
+      method: "POST",
+      path: "/api/web-traces",
+      error_message: "aborted",
+    }]]);
+    assert.deepEqual(error.mock.calls, []);
+  } finally {
+    error.mockRestore();
+    warn.mockRestore();
+  }
+});
+
 // Task #426 red-first: an R2 5xx on a background-path ledger PUT must never
 // escape the detached ingest chain as an unhandledRejection (that killed both
 // prod tasks in the same second). The failure is logged + counted instead.
@@ -1797,14 +1856,13 @@ test("trace bundle ingest shadows every successful OTLP batch into V2", async ()
   env.RAFT_TRACE_SCOPEDB_PROJECTOR = "on";
   env.SCOPEDB_TRACE_EVENTS_ENDPOINT = "https://scopedb.test";
   env.SCOPEDB_TRACE_EVENTS_WRITE_KEY = "test-key";
-  env.SCOPEDB_TRACE_EVENTS_CLIENT = {
-    table: () => mockTraceEventTable(),
-    insert: async (payload: string) => {
+  env.SCOPEDB_TRACE_EVENTS_CLIENT = fakeScopeDbTraceEventClient({
+    append: async (payload: string) => {
       callOrder.push("v2");
       projectedPayloads.push(payload);
       return { num_rows_inserted: 2 };
     },
-  } as unknown as Pick<Client, "insert" | "table">;
+  });
   const bundle = Buffer.from([
     JSON.stringify(spanRecord({ span_id: "1111111111111111", name: "daemon.connection.opened" })),
     JSON.stringify(spanRecord({ span_id: "2222222222222222", name: "daemon.connection.closed" })),
@@ -2283,4 +2341,27 @@ test("trace bundle ingest leaves standalone events uncapped by default and caps 
   );
   assert.equal(attrs.record_type, "event");
   assert.equal(attrs.cap, "2");
+});
+
+test("feedback and web trace endpoints allow Raft Desktop's app://raft origin exactly", async () => {
+  const { env } = baseEnv();
+  env.TRACE_WEB_CORS_ORIGIN = "https://app.raft.build";
+  for (const path of ["/api/reports", "/api/web-traces"]) {
+    const desktop = await handleRequest(new Request(`https://trace-worker.test${path}`, {
+      method: "OPTIONS",
+      headers: { Origin: "app://raft" },
+    }), env);
+    assert.equal(desktop.status, 204);
+    assert.equal(desktop.headers.get("Access-Control-Allow-Origin"), "app://raft", path);
+    assert.equal(desktop.headers.get("Vary"), "Origin");
+    assert.equal(desktop.headers.get("Access-Control-Allow-Credentials"), null);
+    // Any other origin still gets the configured web origin, not its own.
+    for (const origin of ["app://raft.evil", "app://evil", "https://evil.example.com"]) {
+      const other = await handleRequest(new Request(`https://trace-worker.test${path}`, {
+        method: "OPTIONS",
+        headers: { Origin: origin },
+      }), env);
+      assert.equal(other.headers.get("Access-Control-Allow-Origin"), "https://app.raft.build", `${path} ${origin}`);
+    }
+  }
 });

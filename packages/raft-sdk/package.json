@@ -1,7 +1,7 @@
 {
   "name": "@botiverse/raft-sdk",
-  "version": "0.24.0",
-  "license": "FSL-1.1-ALv2",
+  "version": "0.35.1",
+  "license": "LicenseRef-Raft-License",
   "description": "Typed Raft Agent API client for external agents and bots.",
   "type": "module",
   "main": "./dist/cjs/index.cjs",
@@ -13,10 +13,20 @@
       "import": "./dist/esm/index.js",
       "require": "./dist/cjs/index.cjs"
     },
+    "./app": {
+      "types": "./dist/app.d.ts",
+      "import": "./dist/esm/app.js",
+      "require": "./dist/cjs/app.cjs"
+    },
     "./agent": {
       "types": "./dist/agent.d.ts",
       "import": "./dist/esm/agent.js",
       "require": "./dist/cjs/agent.cjs"
+    },
+    "./continuations": {
+      "types": "./dist/continuations.d.ts",
+      "import": "./dist/esm/continuations.js",
+      "require": "./dist/cjs/continuations.cjs"
     },
     "./operations.json": "./operations.json",
     "./package.json": "./package.json"
@@ -24,6 +34,7 @@
   "files": [
     "dist",
     "operations.json",
+    "CHANGELOG.md",
     "MIGRATING.md"
   ],
   "sideEffects": false,
@@ -44,11 +55,12 @@
   "scripts": {
     "build": "tsdown",
     "test": "vitest run",
-    "test:artifact": "pnpm run build && node scripts/check-packed-artifact.mjs",
+    "test:artifact": "pnpm run build && node --import @oxc-node/core/register scripts/check-packed-artifact.ts",
     "prepack": "pnpm run build",
     "prepublishOnly": "pnpm run test && pnpm run test:artifact",
-    "lint:publish-package": "node scripts/check-publish-package.mjs && node scripts/check-publish-workflow.mjs",
-    "typecheck": "tsc --noEmit",
+    "lint:publish-package": "node --import @oxc-node/core/register scripts/check-publish-package.ts && node --import @oxc-node/core/register scripts/check-publish-workflow.ts",
+    "typecheck": "tsrs --noEmit",
+    "typecheck:tsc": "tsc --noEmit",
     "generate:operations": "node --import @oxc-node/core/register scripts/generate-operations.ts"
   },
   "devDependencies": {

@@ -5,6 +5,7 @@ import type { Presence } from "@botiverse/raft-ui";
 import { Cloud } from "lucide-react";
 import type { AgentHostedRuntimeSummary } from "@botiverse/raft-shared";
 import StatusDot from "../ui/StatusDot";
+import { AssistantPausedChip } from "../../assistant/AssistantPaused";
 import { HostedModelChoice, useHostedRuntimeModels } from "./HostedModelChoice";
 
 export type HostedRuntimeStateLabelId =
@@ -42,21 +43,28 @@ export function describeHostedRuntime(summary: AgentHostedRuntimeSummary): {
  * lights plus its word (setting up / syncing / removing = busy, running =
  * online, setup failed = error, removed = offline).
  */
-const STATE_CHIP: Record<HostedRuntimeStateLabelId, { variant: "success" | "warning" | "primary" | "muted"; presence: Presence }> = {
-  "agent.detail.hostedRuntime.state.provisioning": { variant: "primary", presence: "busy" },
+const STATE_CHIP: Record<HostedRuntimeStateLabelId, { variant: "success" | "warning" | "busy" | "muted"; presence: Presence }> = {
+  "agent.detail.hostedRuntime.state.provisioning": { variant: "busy", presence: "busy" },
   "agent.detail.hostedRuntime.state.active": { variant: "success", presence: "online" },
-  "agent.detail.hostedRuntime.state.syncing": { variant: "primary", presence: "busy" },
+  "agent.detail.hostedRuntime.state.syncing": { variant: "busy", presence: "busy" },
   "agent.detail.hostedRuntime.state.failed": { variant: "warning", presence: "error" },
-  "agent.detail.hostedRuntime.state.deleting": { variant: "primary", presence: "busy" },
+  "agent.detail.hostedRuntime.state.deleting": { variant: "busy", presence: "busy" },
   "agent.detail.hostedRuntime.state.deleted": { variant: "muted", presence: "offline" },
 };
 
 export function HostedRuntimeStatus({
   summary,
   onRetry,
+  paused = false,
 }: {
   summary: AgentHostedRuntimeSummary;
   onRetry: (options?: { model?: string | null }) => Promise<void>;
+  /**
+   * A paused personal assistant (#10654): its runtime is up but runs nothing,
+   * so "Running" would contradict the pause. Shows the Paused chip instead;
+   * any other state (setting up, syncing, failed) keeps its own chip.
+   */
+  paused?: boolean;
 }) {
   const { formatMessage } = useIntl();
   const [retrying, setRetrying] = useState(false);
@@ -89,12 +97,16 @@ export function HostedRuntimeStatus({
   const handleRetryClick = useCallback(() => void retry(), [retry]);
   const chip = STATE_CHIP[view.labelId];
   return (
-    <div className="space-y-2" data-testid="agent-hosted-runtime-status" data-state={summary.state}>
+    <div className="stack-y-2" data-testid="agent-hosted-runtime-status" data-state={summary.state}>
       <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-        <Badge appearance="soft" variant={chip.variant}>
-          <StatusDot presence={chip.presence} />
-          {formatMessage({ id: view.labelId })}
-        </Badge>
+        {paused && view.labelId === "agent.detail.hostedRuntime.state.active" ? (
+          <AssistantPausedChip />
+        ) : (
+          <Badge appearance="soft" variant={chip.variant}>
+            <StatusDot presence={chip.presence} />
+            {formatMessage({ id: view.labelId })}
+          </Badge>
+        )}
         {/* The provider's name is not shown to people: a cloud agent "runs in the cloud". */}
         <Badge appearance="soft" variant="information" data-testid="hosted-runtime-location">
           <Cloud size={14} aria-hidden="true" />
@@ -119,7 +131,7 @@ export function HostedRuntimeStatus({
         </p>
       )}
       {needsModel && (
-        <div className="space-y-1.5" data-testid="agent-hosted-runtime-retry-model">
+        <div className="stack-y-1.5" data-testid="agent-hosted-runtime-retry-model">
           <p className="text-callout text-foreground-muted">
             {formatMessage({ id: "agent.detail.hostedRuntime.retryNeedsModel" })}
           </p>
@@ -136,7 +148,7 @@ export function HostedRuntimeStatus({
         <div className="flex flex-wrap items-center gap-2">
           <Button
             variant="outline"
-            size="sm"
+            size="md"
             type="button"
             disabled={retrying || (needsModel && models.state.kind === "loading")}
             onClick={handleRetryClick}

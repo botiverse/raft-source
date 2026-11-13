@@ -1,10 +1,10 @@
 import type { z } from "zod";
+import { MAX_PROFILE_AVATAR_BYTES } from "@botiverse/raft-shared";
 import type { AgentApiClient, AgentApiClientResult } from "@botiverse/raft-shared/src/agentApiClient";
+import type { prepareActionCardRequestSchema } from "@botiverse/raft-shared/src/agentOps/index";
 import {
   parseAgentApiResponse,
-  type agentApiActionPrepareBodySchema,
   type agentApiAppConfigPatchBodySchema,
-  type AgentApiActionPrepareBody,
   type AgentApiActionPrepareResponse,
   type AgentApiAppConfigPatchBody,
   type AgentApiAppConfigResponse,
@@ -21,7 +21,9 @@ export type RaftServerUpdate = AgentApiServerUpdateBody;
 export type RaftServerProfile = AgentApiServerUpdateResponse;
 // Request types use the schema INPUT, so fields with Server-side defaults
 // (for example channel:create `visibility`, patch `unset`) stay optional.
-export type RaftActionPrepareRequest = z.input<typeof agentApiActionPrepareBodySchema>;
+// A card is typed as this version knows it (the actions.prepare operation's
+// schema); the wire carries any card, and the Server checks it.
+export type RaftActionPrepareRequest = z.input<typeof prepareActionCardRequestSchema>;
 export type RaftActionPrepared = AgentApiActionPrepareResponse;
 export type RaftAppConfig = AgentApiAppConfigResponse;
 export type RaftAppConfigPatch = z.input<typeof agentApiAppConfigPatchBodySchema>;
@@ -46,7 +48,6 @@ export interface RaftAvatarUpload {
 }
 
 const AVATAR_MIME_TYPES = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"]);
-const AVATAR_MAX_BYTES = 5 * 1024 * 1024;
 const SERVER_ERROR_CODE = /^[A-Za-z0-9_.:-]{1,64}$/;
 
 const MESSAGES: Record<RaftApiError["code"], string> = {
@@ -98,7 +99,7 @@ export async function uploadRaftAvatar(
   const blob = upload.data instanceof Blob
     ? upload.data
     : upload.data instanceof Uint8Array ? new Blob([Uint8Array.from(upload.data)], { type: upload.mimeType }) : null;
-  if (!blob || blob.size === 0 || blob.size > AVATAR_MAX_BYTES) return failure("INVALID_REQUEST");
+  if (!blob || blob.size === 0 || blob.size > MAX_PROFILE_AVATAR_BYTES) return failure("INVALID_REQUEST");
 
   const form = new FormData();
   form.append("avatar", blob, upload.filename);
@@ -175,8 +176,8 @@ export function createRaftManageClient(
       update: async (request) => toRaftApiResult(await writeApi.server.update(request)),
     },
     actions: {
-      // The shared client parses the body with the same schema, applying defaults.
-      prepare: async (request) => toRaftApiResult(await writeApi.actions.prepare(request as AgentApiActionPrepareBody)),
+      // The shared client parses the body: a known card gets its defaults; any other goes as written, for the Server to check.
+      prepare: async (request) => toRaftApiResult(await writeApi.actions.prepare(request)),
     },
     apps: {
       getConfig: async (appId) => toRaftApiResult(await readApi.apps.getConfig({ appId })),

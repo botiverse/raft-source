@@ -11,6 +11,13 @@ export interface ComposerSuggestionSearchEntry<T> {
   index: number;
   suggestion: T;
   fields: ComposerSuggestionSearchField[];
+  /**
+   * Ranked within a match band, lowest first (absent is 0; see `matchBand`): among the strong
+   * matches a lower tier comes first, but an exact name always leads and a loose fuzzy match
+   * always trails. Search uses it so an archived channel never goes above a live one on a
+   * comparable match (searchEntities `SEARCH_ENTITY_TIER`).
+   */
+  tier?: number;
 }
 
 interface ComposerSuggestionScore {
@@ -43,9 +50,9 @@ export function rankComposerSuggestions<T>(query: string, entries: ComposerSugge
   return entries
     .map((entry) => {
       const score = minScore(entry.fields.map((field) => scoreComposerSuggestionField(field, queryKey)));
-      return score ? { index: entry.index, suggestion: entry.suggestion, score } : null;
+      return score ? { index: entry.index, tier: entry.tier ?? 0, suggestion: entry.suggestion, score } : null;
     })
-    .filter((entry): entry is { index: number; suggestion: T; score: ComposerSuggestionScore } => entry != null)
+    .filter((entry): entry is { index: number; tier: number; suggestion: T; score: ComposerSuggestionScore } => entry != null)
     .sort((a, b) => compareRankedSuggestion(a, b))
     .slice(0, COMPOSER_SUGGESTION_MAX_RESULTS)
     .map((entry) => entry.suggestion);
@@ -68,10 +75,12 @@ export function rankBasicComposerSuggestions<T>(query: string, entries: Composer
         .filter((match): match is { rank: number; fieldPriority: number; position: number } => match != null)
         .sort((a, b) => a.rank - b.rank || a.fieldPriority - b.fieldPriority || a.position - b.position);
       const score = matches[0];
-      return score ? { index: entry.index, suggestion: entry.suggestion, score } : null;
+      return score ? { index: entry.index, tier: entry.tier ?? 0, suggestion: entry.suggestion, score } : null;
     })
-    .filter((entry): entry is { index: number; suggestion: T; score: { rank: number; fieldPriority: number; position: number } } => entry != null)
-    .sort((a, b) => a.score.rank - b.score.rank
+    .filter((entry): entry is { index: number; tier: number; suggestion: T; score: { rank: number; fieldPriority: number; position: number } } => entry != null)
+    .sort((a, b) => matchBand(a.score.rank) - matchBand(b.score.rank)
+      || a.tier - b.tier
+      || a.score.rank - b.score.rank
       || a.score.fieldPriority - b.score.fieldPriority
       || a.score.position - b.score.position
       || a.index - b.index)
@@ -296,11 +305,23 @@ function boundedSubsequenceScore(candidate: string, query: string): ComposerSugg
   return gap > allowedGap ? null : { rank: 6, fieldPriority: 0, position: first, gap };
 }
 
+/**
+ * How much a tier may outrank match quality: an exact name always comes first, then the strong
+ * matches (prefix, word starts, substrings: ranks 1-5) by tier, then the loose fuzzy ones (6-7).
+ * So an archived channel or one you haven't joined still wins on its exact name (Enter goes to it,
+ * and the cap never drops it), and never loses to a loose match elsewhere.
+ */
+function matchBand(rank: number): number {
+  return rank === 0 ? 0 : rank <= 5 ? 1 : 2;
+}
+
 function compareRankedSuggestion<T>(
-  a: { index: number; score: ComposerSuggestionScore; suggestion: T },
-  b: { index: number; score: ComposerSuggestionScore; suggestion: T },
+  a: { index: number; tier: number; score: ComposerSuggestionScore; suggestion: T },
+  b: { index: number; tier: number; score: ComposerSuggestionScore; suggestion: T },
 ): number {
-  return a.score.rank - b.score.rank
+  return matchBand(a.score.rank) - matchBand(b.score.rank)
+    || a.tier - b.tier
+    || a.score.rank - b.score.rank
     || a.score.fieldPriority - b.score.fieldPriority
     || a.score.position - b.score.position
     || a.score.gap - b.score.gap

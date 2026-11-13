@@ -138,19 +138,68 @@ function buildTraceJoin(input: AgentActivityTraceJoin | undefined): { clientEven
   return { clientEventId: input.clientEventId };
 }
 
+/**
+ * Routine agent activity (a heartbeat, a refresh-only push, an applied push
+ * that leaves the agent's activity as it was, a detail-only change included)
+ * is traced at this rate, with
+ * `sample_rate` on the event so counts can be weighted back (1 / rate). On a
+ * server with many agents these arrive several times a second on every
+ * member's tab, and tracing each one was most of the tab's idle memory growth
+ * (#proj-frontend:#8). A change of activity (online, working, thinking,
+ * error, offline) is always traced, with its join id, so a status change can
+ * still be followed from push to dot. The trace carries only a length bucket
+ * of the detail, so a detail-only change adds nothing a sample doesn't.
+ */
+export const ROUTINE_AGENT_ACTIVITY_TRACE_SAMPLE_RATE = 0.01;
+
+let sampleRandom: () => number = Math.random;
+
+/** The activity of each agent's last received push (agent ids are unique across servers). */
+const lastReceivedActivity = new Map<string, string>();
+
+/** Tests only: the sampler's random source (null restores Math.random); also forgets received pushes. */
+export function setAgentActivityTraceRandomForTests(random: (() => number) | null): void {
+  sampleRandom = random ?? Math.random;
+  lastReceivedActivity.clear();
+}
+
+/** Whether a routine event is traced this time; its attrs then carry the rate. */
+function sampledRoutine(): boolean {
+  return sampleRandom() < ROUTINE_AGENT_ACTIVITY_TRACE_SAMPLE_RATE;
+}
+
 function emitAgentActivityTrace(name: WebAgentActivityTraceEventName, attrs: Record<string, unknown>): void {
   emitWebEvent(name, attrs);
 }
 
-export function traceAgentActivitySocketReceived(input: ActivityTraceBase): void {
+/**
+ * `previousActivity`: the agent's activity in the store before this push is
+ * applied (null: none known). A push that leaves it as it was (a detail-only
+ * change, most of real traffic) is routine. With nothing in the store, the
+ * agent's last received push stands in for it; an agent's first push is traced in full.
+ */
+export function traceAgentActivitySocketReceived(input: ActivityTraceBase & { previousActivity?: string | null }): void {
+  const agentId = input.agentId ?? null;
+  const lastReceived = agentId ? lastReceivedActivity.get(agentId) : undefined;
+  if (agentId && typeof input.activity === "string") lastReceivedActivity.set(agentId, input.activity);
+  const prior = input.previousActivity ?? lastReceived ?? null;
+  const unchanged = typeof input.activity === "string" && prior === input.activity;
+  const routine = input.isHeartbeat === true || input.isRefreshOnly === true || unchanged;
+  if (routine && !sampledRoutine()) return;
   emitAgentActivityTrace("slock.agent_activity.socket_received", {
     ...baseAttrs(input),
     outcome: "received",
+    ...(routine ? { sample_rate: ROUTINE_AGENT_ACTIVITY_TRACE_SAMPLE_RATE } : {}),
   });
 }
 
 export function traceAgentActivityStoreDecision(input: StoreDecisionTrace): void {
+  // Applied without changing the activity (a detail-only change included): routine. Stale and
+  // invalid pushes are rare anomalies and stay traced in full.
+  const routine = input.outcome === "applied" && (input.previousActivity ?? null) === (input.nextActivity ?? null);
+  if (routine && !sampledRoutine()) return;
   emitAgentActivityTrace("slock.agent_activity.store_decision", {
+    ...(routine ? { sample_rate: ROUTINE_AGENT_ACTIVITY_TRACE_SAMPLE_RATE } : {}),
     ...baseAttrs(input),
     outcome: input.outcome,
     previous_activity: activityAttr(input.previousActivity),

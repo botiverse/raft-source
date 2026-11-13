@@ -1,11 +1,12 @@
 import { useEffect, useState } from "react";
 import { useIntl } from "react-intl";
-import { Button } from "@botiverse/raft-ui";
+import { Button, TextLink, TextLinkDownloadIcon } from "@botiverse/raft-ui";
 import type { MessageId } from "../../i18n/messages";
 import api from "../../api/client";
 import {
   DEFAULT_DESKTOP_PLATFORMS,
   desktopDownloadUrl,
+  desktopTargetOs,
   detectDesktopOs,
   detectMacArch,
   offered,
@@ -77,6 +78,14 @@ export function desktopDownloadOptions(platforms: DesktopPlatforms): DesktopDown
 export type DesktopDownloadView = {
   os: DesktopOs | null;
   recommended: { target: DesktopTarget; labelId: MessageId; intelHint: boolean } | null;
+  /**
+   * The same platform's other way in, under the button: the Intel build when
+   * the release splits by chip and the browser hides it, the .deb under the
+   * AppImage (raft-design getting-the-app.md).
+   */
+  footnote: { target: DesktopTarget; labelId: MessageId } | null;
+  /** Every other platform's builds: this computer's OS is the button and the footnote. */
+  others: DesktopDownloadOption[];
   /** This is a Windows PC and no Windows build has shipped. */
   windowsSoon: boolean;
   options: DesktopDownloadOption[];
@@ -100,29 +109,42 @@ export function useDesktopDownloadView(): DesktopDownloadView {
     return () => { live = false; };
   }, [os, nav]);
   const pick = os ? recommendedDesktopDownload(os, macArch, platforms) : null;
+  const options = desktopDownloadOptions(platforms);
+  const footnote: DesktopDownloadView["footnote"] = pick?.intelHint
+    ? { target: "mac-x64", labelId: "settings.desktopApp.download.macIntel" }
+    : pick?.target === "linux-appimage"
+      ? { target: "linux-deb", labelId: "settings.desktopApp.download.linuxDeb" }
+      : null;
   return {
     os,
     recommended: pick ? { target: pick.target, labelId: LABEL[pick.kind], intelHint: pick.intelHint } : null,
+    footnote,
+    others: pick ? options.filter((option) => desktopTargetOs(option.target) !== os) : options,
     windowsSoon: os === "windows" && !pick,
-    options: desktopDownloadOptions(platforms),
+    options,
   };
 }
 
 /**
- * Settings → About: one primary button for this computer, every platform one
- * click away below it — the pattern of Slack's, Discord's and VS Code's download
- * pages, because detection is a guess and must never be the only path.
+ * Settings → About: one primary button for this computer, every other platform
+ * one click away below it (raft-design "Getting the app"). This computer's own
+ * build isn't repeated in the list; the same OS's other build (a Mac's Intel
+ * build when the chip is unknown, Linux's .deb) stays as the footnote. When
+ * detection fails there is no primary button and every platform is listed.
  *
  * Same tab: each link resolves to a file download (see the Android button).
  */
 export default function DesktopDownloadOptions() {
   const { formatMessage } = useIntl();
-  const { recommended, windowsSoon, options } = useDesktopDownloadView();
+  const { recommended, footnote, windowsSoon, options } = useDesktopDownloadView();
+  // As on /download: this computer's own build is the button, so the list
+  // doesn't repeat it; the same OS's other build stays only where the page
+  // shows it as the footnote.
+  const listed = recommended ? options.filter((option) => desktopTargetOs(option.target) !== desktopTargetOs(recommended.target) || option.target === footnote?.target) : options;
   return (
-    <div className="min-w-0 space-y-3" data-testid="desktop-download">
-      <div className="text-footnote text-foreground-muted">{formatMessage({ id: "settings.desktopApp.description" })}</div>
+    <div className="min-w-0 stack-y-3" data-testid="desktop-download">
       {recommended ? (
-        <div className="space-y-1">
+        <div className="stack-y-1">
           <Button
             render={(
               <a
@@ -133,38 +155,31 @@ export default function DesktopDownloadOptions() {
               />
             )}
             nativeButton={false}
-            variant="accent"
-            size="sm"
+            variant="primary"
+            size="md"
           >
             {formatMessage({ id: recommended.labelId })}
           </Button>
-          {recommended.intelHint ? (
-            <div className="text-footnote text-foreground-muted" data-testid="desktop-download-intel-hint">
-              {formatMessage({ id: "settings.desktopApp.intelHint" })}
-            </div>
-          ) : null}
         </div>
       ) : windowsSoon ? (
         <div className="text-callout text-foreground" data-testid="desktop-download-windows-soon">
           {formatMessage({ id: "settings.desktopApp.windowsSoon" })}
         </div>
       ) : null}
-      <div className="space-y-1">
+      <div className="stack-y-1">
         <div className="text-footnote text-foreground-muted">
           {formatMessage({ id: recommended || windowsSoon ? "settings.desktopApp.otherPlatforms" : "settings.desktopApp.allPlatforms" })}
         </div>
         <ul className="flex flex-wrap gap-x-3 gap-y-1 text-footnote">
-          {options.map((option) => (
+          {listed.map((option) => (
             <li key={option.target}>
               {option.available ? (
-                <Button
+                <TextLink
                   render={<a href={desktopDownloadUrl(option.target)} aria-label={formatMessage({ id: option.labelId })} data-testid={`desktop-download-${option.target}`} />}
-                  nativeButton={false}
-                  variant="link"
-                  size="inline"
                 >
                   {formatMessage({ id: option.labelId })}
-                </Button>
+                  <TextLinkDownloadIcon />
+                </TextLink>
               ) : (
                 <span className="text-foreground-hint" data-testid={`desktop-download-${option.target}`}>
                   {formatMessage({ id: "settings.desktopApp.option.unavailable" }, { platform: formatMessage({ id: option.labelId }) })}

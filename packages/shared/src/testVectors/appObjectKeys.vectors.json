@@ -1,0 +1,166 @@
+{
+  "//": "Object keys relative to an app's prefix in the platform bucket, and why each is refused (null: a key). The server's app object storage (checkedKey) and Artifacts' content Worker both check keys with appObjectKeyProblem; packages/shared/src/appObjectKey.test.ts and packages/server/src/services/appObjectStorage.test.ts run every case.",
+  "prefix": "apps/artifacts/",
+  "cases": [
+    {
+      "why": "Artifacts' blob key",
+      "key": "servers/22222222-2222-4222-8222-222222222222/blobs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/b_x",
+      "problem": null
+    },
+    {
+      "why": "one segment",
+      "key": "a",
+      "problem": null
+    },
+    {
+      "why": "every allowed character",
+      "key": "a/b.c_d~e-F9",
+      "problem": null
+    },
+    {
+      "why": "a segment starting with a dot",
+      "key": ".hidden/x",
+      "problem": null
+    },
+    {
+      "why": "exactly 1024 bytes with the prefix",
+      "key": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "problem": null
+    },
+    {
+      "why": "empty",
+      "key": "",
+      "problem": "empty"
+    },
+    {
+      "why": "a leading slash",
+      "key": "/servers/22222222-2222-4222-8222-222222222222/blobs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/b_x",
+      "problem": "leading slash"
+    },
+    {
+      "why": "only a slash",
+      "key": "/",
+      "problem": "leading slash"
+    },
+    {
+      "why": "a trailing slash",
+      "key": "servers/22222222-2222-4222-8222-222222222222/blobs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/b_x/",
+      "problem": "not slash-separated segments of A-Z a-z 0-9 . _ ~ -"
+    },
+    {
+      "why": "an empty segment",
+      "key": "servers//22222222-2222-4222-8222-222222222222",
+      "problem": "not slash-separated segments of A-Z a-z 0-9 . _ ~ -"
+    },
+    {
+      "why": "a .. segment",
+      "key": "servers/22222222-2222-4222-8222-222222222222/../x",
+      "problem": "contains .."
+    },
+    {
+      "why": "only ..",
+      "key": "..",
+      "problem": "contains .."
+    },
+    {
+      "why": ".. inside a segment",
+      "key": "a..b",
+      "problem": "contains .."
+    },
+    {
+      "why": "climbing out of a prefix",
+      "key": "apps/artifacts/../other/x",
+      "problem": "contains .."
+    },
+    {
+      "why": "a . segment",
+      "key": "servers/./x",
+      "problem": "a . segment"
+    },
+    {
+      "why": "only .",
+      "key": ".",
+      "problem": "a . segment"
+    },
+    {
+      "why": "a trailing . segment",
+      "key": "x/.",
+      "problem": "a . segment"
+    },
+    {
+      "why": "a backslash",
+      "key": "servers\\x",
+      "problem": "not slash-separated segments of A-Z a-z 0-9 . _ ~ -"
+    },
+    {
+      "why": "a space",
+      "key": "servers/x y",
+      "problem": "not slash-separated segments of A-Z a-z 0-9 . _ ~ -"
+    },
+    {
+      "why": "a non-ASCII character",
+      "key": "servers/é",
+      "problem": "not slash-separated segments of A-Z a-z 0-9 . _ ~ -"
+    },
+    {
+      "why": "a query mark",
+      "key": "servers/x?y",
+      "problem": "not slash-separated segments of A-Z a-z 0-9 . _ ~ -"
+    },
+    {
+      "why": "a percent escape",
+      "key": "servers/%2e%2e",
+      "problem": "not slash-separated segments of A-Z a-z 0-9 . _ ~ -"
+    },
+    {
+      "why": "a newline",
+      "key": "servers/x\ny",
+      "problem": "not slash-separated segments of A-Z a-z 0-9 . _ ~ -"
+    },
+    {
+      "why": "1025 bytes with the prefix",
+      "key": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "problem": "longer than 1024 bytes with the app's prefix"
+    },
+    {
+      "why": "a dot inside a segment",
+      "key": "a.b",
+      "problem": null
+    },
+    {
+      "why": "a later segment starting with a dot",
+      "key": "a/.b",
+      "problem": null
+    },
+    {
+      "why": "a leading .. segment",
+      "key": "../other/x",
+      "problem": "contains .."
+    },
+    {
+      "why": "climbing out twice",
+      "key": "a/../../other/x",
+      "problem": "contains .."
+    },
+    {
+      "why": "a trailing .. segment",
+      "key": "a/..",
+      "problem": "contains .."
+    },
+    {
+      "why": "a leading . segment",
+      "key": "./a",
+      "problem": "a . segment"
+    },
+    {
+      "why": "backslashed ..",
+      "key": "a\\..\\b",
+      "problem": "contains .."
+    },
+    {
+      "why": "a NUL",
+      "key": "a\u0000b",
+      "problem": "not slash-separated segments of A-Z a-z 0-9 . _ ~ -"
+    }
+  ]
+}

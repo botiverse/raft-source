@@ -10,10 +10,13 @@
       "value": "default",
       "label": "Configured Default / Auto",
       "supportedReasoningEfforts": [
+        "off",
+        "minimal",
         "low",
         "medium",
         "high",
-        "xhigh"
+        "xhigh",
+        "max"
       ]
     }
   ],

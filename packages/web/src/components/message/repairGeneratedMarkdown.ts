@@ -6,6 +6,8 @@
 
 import type { Blockquote, Nodes, Paragraph, Parent, PhrasingContent, Root, Text } from "mdast";
 import type { VFile } from "vfile";
+import { drawnQuoteEnd } from "@botiverse/raft-shared";
+import { alignWithSource, pointAt } from "../../utils/markdownSourceAlignment";
 import { replaceTokensInTree } from "./remarkMessageTokens";
 
 function isParent(node: Nodes): node is Parent & Nodes {
@@ -41,18 +43,19 @@ function strongWithClosingWhitespace(tree: Root, file: VFile): void {
 /**
  * `> quote` followed by an unquoted line: CommonMark's lazy continuation
  * pulls that line into the quote. Writers (and LLMs) mean a new paragraph, so
- * the unquoted lines move out to a paragraph after the quote. Runs before
- * remark-breaks, while each source line still ends in a `\n` inside text.
+ * the unquoted lines move out to a paragraph after the quote. Where the quote
+ * ends is raft-shared's drawnQuoteEnd, the same offset the Server's mention
+ * parse ends the quote at, so a handle is a chip exactly where it notifies.
+ * Runs before remark-breaks, while each source line still ends in a `\n`
+ * inside text.
  */
 function splitLazyBlockquoteContinuation(tree: Root, file: VFile): void {
-  const lines = String(file.value ?? "").split("\n");
-  const isQuotedLine = (line: number) => /^\s*>/.test(lines[line - 1] ?? "");
-
+  const source = String(file.value ?? "");
   const visit = (parent: Parent) => {
     for (let index = 0; index < parent.children.length; index += 1) {
       const child = parent.children[index] as Nodes;
       if (child.type === "blockquote") {
-        const outside = takeLazyLines(child, isQuotedLine);
+        const outside = takeLazyLines(child, source);
         if (outside) parent.children.splice(index + 1, 0, outside as never);
       } else if (isParent(child)) {
         visit(child);
@@ -62,32 +65,77 @@ function splitLazyBlockquoteContinuation(tree: Root, file: VFile): void {
   visit(tree);
 }
 
-function takeLazyLines(quote: Blockquote, isQuotedLine: (line: number) => boolean): Paragraph | null {
+function takeLazyLines(quote: Blockquote, source: string): Paragraph | null {
+  const end = drawnQuoteEnd(source, quote);
   const last = quote.children.at(-1);
-  if (last?.type !== "paragraph") return null;
-  const startLine = last.position?.start.line;
-  if (startLine === undefined) return null;
-  let line = startLine;
-  const children = last.children;
-  for (let index = 0; index < children.length; index += 1) {
-    const child = children[index];
-    if (child.type !== "text") {
-      if (child.type === "break") line += 1;
-      continue;
-    }
-    let newline = child.value.indexOf("\n");
-    while (newline !== -1) {
-      line += 1;
-      if (!isQuotedLine(line)) {
-        const before: Text = { type: "text", value: child.value.slice(0, newline) };
-        const after: Text = { type: "text", value: child.value.slice(newline + 1) };
-        last.children = [...children.slice(0, index), ...(before.value ? [before] : [])];
-        return { type: "paragraph", children: [...(after.value ? [after] : []), ...children.slice(index + 1)] };
-      }
-      newline = child.value.indexOf("\n", newline + 1);
+  if (end === null || last?.type !== "paragraph") return null;
+  const [inside, outside] = splitPhrasingAt(last.children, end, source);
+  if (outside.length === 0) return null;
+  last.children = inside;
+  // The quote ended at the end of a link or code span: the line break after
+  // it starts the moved paragraph, which would draw as a leading `<br>`.
+  const first = outside[0];
+  if (first.type === "text") first.value = first.value.replace(/^[ \t]*\n/, "");
+  return { type: "paragraph", children: outside };
+}
+
+/**
+ * Split inline content at a source offset: the start of a line, or the end of
+ * a node (drawnQuoteEnd never ends inside a code span, formula or link).
+ * Emphasis spanning the offset becomes two, one on each side; text is split
+ * at the line break the offset follows, which is dropped.
+ */
+function splitPhrasingAt(
+  children: PhrasingContent[],
+  offset: number,
+  source: string,
+): [PhrasingContent[], PhrasingContent[]] {
+  const before: PhrasingContent[] = [];
+  const after: PhrasingContent[] = [];
+  for (const child of children) {
+    const start = child.position?.start.offset;
+    const end = child.position?.end.offset;
+    if (start === undefined || end === undefined) {
+      (after.length > 0 ? after : before).push(child);
+    } else if (start >= offset) {
+      after.push(child);
+    } else if (end <= offset) {
+      before.push(child);
+    } else if (child.type === "text") {
+      const [head, tail] = splitTextAt(child, offset, source);
+      if (head.value) before.push(head);
+      if (tail.value) after.push(tail);
+    } else if ("children" in child) {
+      const [head, tail] = splitPhrasingAt(child.children as PhrasingContent[], offset, source);
+      if (head.length > 0) before.push({ ...child, children: head } as PhrasingContent);
+      if (tail.length > 0) after.push({ ...child, children: tail } as PhrasingContent);
+    } else {
+      before.push(child);
     }
   }
-  return null;
+  return [before, after];
+}
+
+/**
+ * Split a text node at a source offset. The value lost escapes, entity
+ * references and `> ` prefixes, so the split index is found through the
+ * source alignment, never by counting `\n` in the value (a `&#10;` is one
+ * there). Both halves keep their source span, so later matchers still see
+ * escapes (`\<@name>`). The line break the offset follows is dropped.
+ */
+function splitTextAt(text: Text, offset: number, source: string): [Text, Text] {
+  const position = text.position;
+  const start = position?.start.offset;
+  const end = position?.end.offset;
+  if (!position || start === undefined || end === undefined) return [text, { type: "text", value: "" }];
+  const { offsets } = alignWithSource(text.value, source.slice(start, end), start);
+  let at = 0;
+  while (at < text.value.length && offsets[at] < offset) at += 1;
+  const headEnd = at > 0 && source[offsets[at - 1]] === "\n" ? at - 1 : at;
+  return [
+    { type: "text", value: text.value.slice(0, headEnd), position: { start: position.start, end: pointAt(source, offset) } },
+    { type: "text", value: text.value.slice(at), position: { start: pointAt(source, offset), end: position.end } },
+  ];
 }
 
 export function repairGeneratedMarkdown(tree: Root, file: VFile): void {

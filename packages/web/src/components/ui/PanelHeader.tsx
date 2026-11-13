@@ -1,13 +1,18 @@
+import { useContext } from "react";
 import { ArrowLeft } from "lucide-react";
 import { isHostShell } from "../../embed";
-import type { HTMLAttributes, ReactNode } from "react";
+import type { HTMLAttributes, ReactNode, Ref } from "react";
+import type { PanelActionProps } from "@botiverse/raft-ui";
 import { PanelAction, PanelActions, PanelHeader, PanelHeaderContent, PanelHeaderIcon, PanelHeading, PanelMeta, PanelStatus, PanelTitle } from "@botiverse/raft-ui";
+import { PanelHeadChromeContext } from "../layout/panelHeadChrome";
 
 // React's `HTMLAttributes` doesn't expose `data-*` keys in TS, so widen
 // passthrough prop types with a string-key index signature so callsites
 // can attach `data-testid` etc. without casting.
 type DivPassthroughProps = HTMLAttributes<HTMLDivElement> & Record<`data-${string}`, string | undefined>;
 type ButtonPassthroughProps = HTMLAttributes<HTMLButtonElement> & Record<`data-${string}`, string | undefined>;
+// raft-ui's PanelAction options the Back takes as well (`activateOnTouchEnd`: Back on finger lift).
+type BackButtonProps = ButtonPassthroughProps & Pick<PanelActionProps, "activateOnTouchEnd">;
 
 const NO_CONTAINER_PROPS: DivPassthroughProps = {};
 
@@ -41,7 +46,7 @@ export const PROFILE_HANDLE_FONT_CLASS = "font-mono";
  * **API design**:
  * - `iconTone` says what the icon tile means: `"location"` is the yellow
  *   "you are here" sticker that only a channel (#) head carries; every other
- *   panel (Tasks, Activity, Saved, Graph, Settings, a computer, …) gets the
+ *   panel (Tasks, Activity, Saved, Settings, a computer, …) gets the
  *   default `"neutral"` tile — the sunken fill and an ink-2 glyph (DS
  *   ChannelIcon / tile: yellow only marks where you are).
  * - `titleSlot` replaces the H2+subtitle stack entirely — for
@@ -113,8 +118,8 @@ export interface AppPanelHeaderProps {
    *  layout collapses later). */
   mobileBreakpoint?: "md" | "lg";
   /** Additional props passed to the mobile back button (e.g.
-   *  `data-testid`, `title` for tooltip). */
-  mobileBackProps?: ButtonPassthroughProps;
+   *  `data-testid`, `title` for tooltip, `activateOnTouchEnd`). */
+  mobileBackProps?: BackButtonProps;
   /** Back buttons are responsive by default: they disappear once the
    *  parent/detail columns are visible side-by-side. Drawer-internal page
    *  stacks still need a structural Back control on desktop, because it
@@ -126,11 +131,18 @@ export interface AppPanelHeaderProps {
    *  `title` for tooltip). */
   titleClickProps?: DivPassthroughProps;
   /** Additional props passed to the outer header container (e.g.
-   *  `data-testid`, `title` for tooltip, additional `className`). */
-  containerProps?: DivPassthroughProps;
+   *  `data-testid`, `title` for tooltip, additional `className`; a `ref`
+   *  where the head carries a drag grip, task v2's side sections). */
+  containerProps?: DivPassthroughProps & { ref?: Ref<HTMLDivElement> };
   /** Right-aligned action slot — typically ghost icon buttons
    *  (`PanelAction`). */
   actions?: ReactNode;
+  /** Classes for the actions group: `[--icon-inset:0px]` when its last action
+   *  is a filled button, which sits on the margin rather than being pulled
+   *  out by a frameless icon's inset (raft-ui head-edges). */
+  actionsClassName?: string;
+  /** A control before everything but Back (a `PanelAction`: task v2's collapse chevron). */
+  leading?: ReactNode;
 }
 
 export default function AppPanelHeader({
@@ -152,7 +164,15 @@ export default function AppPanelHeader({
   titleClickProps,
   containerProps,
   actions,
+  actionsClassName,
+  leading,
 }: AppPanelHeaderProps) {
+  // The head of a row region's panel (the profile beside the conversation, #189; RowRegionChrome): the grip that moves
+  // it (rule 7), and where its column holds the columns the row couldn't give 160, their tabs in place of its icon and
+  // title (rule 4). Every other head is as it is.
+  const chrome = useContext(PanelHeadChromeContext);
+  const drag = chrome;
+  const rowTabs = chrome?.tabs ?? null;
   // HOST-SHELL EMBED: the native WebView already draws a title bar, so web must not
   // draw a second one. But the ACTIONS must not die with the title — Computers' "+"
   // and Connected Apps' "Register App" live in this slot, and dropping the whole
@@ -169,7 +189,7 @@ export default function AppPanelHeader({
         {...containerProps}
         data-testid="panel-header-embed-actions"
         data-embed-shell="host"
-        className={`flex items-center justify-end gap-2 px-5 pt-3 ${containerProps?.className ?? ""}`}
+        className={`flex items-center justify-end gap-2 px-(--surface-inset) pt-3 ${containerProps?.className ?? ""}`}
       >
         {actions}
       </div>
@@ -190,31 +210,43 @@ export default function AppPanelHeader({
   return (
     <PanelHeader
       {...containerRest}
+      data-side-head={drag?.props["data-side-head"] ?? containerRest["data-side-head"]}
+      // Last in its column with its head alone (stackEnd): no seam along the column's bottom.
+      data-stack-end={drag?.props["data-stack-end"] ?? containerRest["data-stack-end"]}
+      ref={containerProps?.ref}
       // Padding, gap and the edge buttons' placement belong to the raft-ui
       // recipe, so every column head starts and ends on the same edges.
-      className={containerExtraClass}
+      className={[containerExtraClass, drag?.props.className].filter(Boolean).join(" ") || undefined}
     >
+      {/* Back first, at the top left (DS Navigation), before a leading control. The two never show together: the
+          thread's fold chevron renders only where it is stacked in the row, which hides its Back (index.css); covering
+          the conversation, or on a phone, it stands in no column and has no chevron. */}
       {onMobileBack && (
         <PanelAction
           {...mobileBackProps}
           onClick={onMobileBack}
+          // raft-ui's head puts this Back's icon box on the content margin
+          // at every width, mirroring the last action (DS › Alignment).
           className={`${mobileHiddenClass} ${mobileBackProps?.className ?? ""}`}
         >
           <ArrowLeft size={22} />
         </PanelAction>
       )}
-      {icon && (
+      {leading}
+      {icon && !rowTabs && (
         <PanelHeaderIcon className={`${iconVisibilityClass} ${ICON_TONE_CLASS[iconTone]}`}>
           {icon}
         </PanelHeaderIcon>
       )}
-      {iconSlot && (
+      {iconSlot && !rowTabs && (
         <PanelHeaderIcon className={iconVisibilityClass} data-icon-kind={iconKind}>
           {iconSlot}
         </PanelHeaderIcon>
       )}
-      {titleSlot ? (
-        <PanelHeaderContent>{titleSlot}</PanelHeaderContent>
+      {rowTabs ? (
+        <PanelHeaderContent>{rowTabs}{drag?.grip}</PanelHeaderContent>
+      ) : titleSlot ? (
+        <PanelHeaderContent>{titleSlot}{drag?.grip}</PanelHeaderContent>
       ) : (
         <PanelHeaderContent {...titleClickProps}>
           <PanelHeading>
@@ -239,10 +271,12 @@ export default function AppPanelHeader({
               {subtitle}
             </PanelMeta>
           )}
+          {/* The grip, absolute along the head's top edge (a row region's, #189 rule 7). */}
+          {drag?.grip}
         </PanelHeaderContent>
       )}
       {actions && (
-        <PanelActions>{actions}</PanelActions>
+        <PanelActions className={actionsClassName}>{actions}</PanelActions>
       )}
     </PanelHeader>
   );

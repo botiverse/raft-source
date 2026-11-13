@@ -7,7 +7,6 @@ import { CliError } from "../../core/errors";
 import type { CliIo } from "../../core/io";
 import {
   channelJoinCommand,
-  formatAlreadyJoined,
   formatJoinChannelResult,
 } from "./join";
 
@@ -33,19 +32,6 @@ const agentContext: AgentContext = {
   secretSource: "profile-credential-file",
   activeCapabilities: null,
 };
-
-test("join channel output explains post-join delivery", () => {
-  assert.equal(
-    formatJoinChannelResult("#engineering"),
-    [
-      "Joined #engineering. You can now send messages there and receive ordinary channel delivery.",
-      "Still arrives:",
-      "- Personal @mentions still reach you even if you later mute ordinary channel updates.",
-      "- Threads you started or follow stay followed even if you later mute this channel.",
-    ].join("\n"),
-  );
-  assert.equal(formatAlreadyJoined("#engineering"), "Already joined #engineering.");
-});
 
 test("join channel command uses injected ApiClient and writes join result", async () => {
   const { io, stdout, stderr } = memoryIo();

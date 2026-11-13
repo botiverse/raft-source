@@ -1,4 +1,5 @@
 import { EventEmitter } from "node:events";
+import { stripInboxPreviewLines } from "./testing/inboxPreview";
 import type { ChildProcess } from "node:child_process";
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
@@ -8,7 +9,10 @@ import { AgentProcessManager } from "./agentProcessManager";
 import { setDaemonFetchImplForTests } from "./daemonFetch";
 import { formatResumeEmptyPrompt, formatResumeUnreadSummaryPrompt } from "./agentRuntimeInput";
 import type { RuntimeDriver, SpawnContext } from "./drivers/index";
-import { promptConfig } from "./testing/promptFixture";
+import { buildCopilotArgs, CopilotDriver } from "./drivers/copilot";
+import { buildCursorArgs, CursorDriver } from "./drivers/cursor";
+import { GeminiDriver } from "./drivers/gemini";
+import { afterFreshSessionStandingPrompt, afterStartupMemoryBlock, promptConfig } from "./testing/promptFixture";
 
 class PromptChild extends EventEmitter {
   exitCode: number | null = null;
@@ -28,16 +32,16 @@ class PromptChild extends EventEmitter {
 }
 
 async function withPromptManager(
-  nativeStandingPrompt: boolean,
+  nativeStandingPrompt: boolean | RuntimeDriver,
   run: (ctx: { manager: AgentProcessManager; driver: RuntimeDriver; spawns: SpawnContext[] }) => Promise<void>,
 ): Promise<void> {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "raft-prompt-test-"));
   const spawns: SpawnContext[] = [];
-  const driver: RuntimeDriver = {
+  const driver: RuntimeDriver = typeof nativeStandingPrompt !== "boolean" ? nativeStandingPrompt : {
     id: "prompt-test",
     lifecycle: { kind: "persistent", stdin: "direct", inFlightWake: "steer" },
     communication: { chat: "slock_cli", runtimeControl: "none" },
-    session: { recovery: "resume_or_fresh" },
+    session: { recovery: "resume_or_fresh", compaction: "reported", compactionFailure: "does_not_stick" } as const,
     model: { detectedModelsVerifiedAs: "suggestion_only" },
     supportsStdinNotification: true,
     busyDeliveryMode: "direct",
@@ -52,6 +56,13 @@ async function withPromptManager(
     parseLine: () => [],
     encodeStdinMessage: (text) => text,
   };
+  if (typeof nativeStandingPrompt !== "boolean") {
+    // A real driver: everything but the child process.
+    driver.spawn = async (ctx) => {
+      spawns.push(ctx);
+      return { process: new PromptChild() as unknown as ChildProcess };
+    };
+  }
   const fetch = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
     const url = String(input instanceof Request ? input.url : input);
     const method = init?.method ?? (input instanceof Request ? input.method : "GET");
@@ -87,7 +98,64 @@ test.each([true, false])("cold start routes standing instructions with native su
     await manager.startAgent("agent-1", promptConfig({ description: "initial-role" }));
     expect(spawns).toHaveLength(1);
     expect(spawns[0].standingPrompt).toBe("standing:initial-role");
-    expect(spawns[0].prompt).toBe(native ? "Start." : "standing:initial-role");
+    // Without a native layer the standing prompt comes first; then the startup
+    // MEMORY.md block (RFC 070, always on) and the neutral starter.
+    const afterStandingPrompt = native ? spawns[0].prompt : afterFreshSessionStandingPrompt(spawns[0]);
+    expect(afterStartupMemoryBlock(afterStandingPrompt)).toBe("Start.");
+    if (native) expect(spawns[0].prompt).not.toContain("standing:");
+  });
+});
+
+const wakeMessage = (overrides: Partial<AgentMessage> = {}): AgentMessage => ({
+  message_id: "wake-1", channel_id: "channel-1", channel_name: "general", channel_type: "channel",
+  sender_id: "human-1", sender_name: "bob", sender_type: "human",
+  content: "message-body-sentinel", timestamp: "2026-09-05T00:00:00.000Z",
+  ...overrides,
+});
+
+// Every way a fresh session can start. Without a native standing prompt the
+// first input is the only place the runtime ever sees it.
+const freshStarts: Array<[string, (manager: AgentProcessManager) => Promise<void>, RegExp]> = [
+  ["a wake message", (manager) => manager.startAgent("agent-1", promptConfig({ description: "role" }), wakeMessage()), /^\[Raft inbox notice:/],
+  ["a transient wake", (manager) => manager.startAgent("agent-1", promptConfig({ description: "role" }), wakeMessage(), undefined, undefined, undefined, true), /^System notice received:/],
+  ["resume catch-up for a dropped session", (manager) => manager.startAgent("agent-1", promptConfig({ description: "role" }), undefined, undefined, undefined, "launch-1", false, [wakeMessage()]), /message-body-sentinel/],
+  ["a release notice", (manager) => manager.startAgent("agent-1", promptConfig({
+    description: "role",
+    runtimeProfileControl: { kind: "daemon_release_notice", key: "release-1", message: "Daemon v9 released" } as never,
+  })), /^Start\.$/],
+];
+
+test.each(freshStarts)("a fresh session started by %s opens with the standing prompt when the runtime has no native one", async (_label, start, rest) => {
+  await withPromptManager(false, async ({ manager, spawns }) => {
+    await start(manager);
+    expect(spawns).toHaveLength(1);
+    expect(spawns[0].config.sessionId ?? null).toBeNull();
+    expect(afterStartupMemoryBlock(afterFreshSessionStandingPrompt(spawns[0]))).toMatch(rest);
+  });
+});
+
+test.each(freshStarts)("a native runtime's fresh session started by %s keeps the standing prompt out of its first input", async (_label, start) => {
+  await withPromptManager(true, async ({ manager, spawns }) => {
+    await start(manager);
+    expect(spawns).toHaveLength(1);
+    expect(spawns[0].standingPrompt).toBe("standing:role");
+    expect(spawns[0].prompt).not.toContain("standing:");
+  });
+});
+
+test.each([
+  ["cursor", () => new CursorDriver(), (ctx: SpawnContext) => buildCursorArgs(ctx).at(-1)],
+  ["gemini", () => new GeminiDriver(), (ctx: SpawnContext) => ctx.prompt],
+  ["copilot", () => new CopilotDriver(), (ctx: SpawnContext) => { const args = buildCopilotArgs(ctx); return args[args.indexOf("-p") + 1]; }],
+] as const)("%s: a session-less wake sends the full standing prompt ahead of the message", async (runtime, makeDriver, sentInput) => {
+  const driver: RuntimeDriver = makeDriver();
+  expect(driver.supportsNativeStandingPrompt ?? false).toBe(false);
+  await withPromptManager(driver, async ({ manager, spawns }) => {
+    await manager.startAgent("agent-1", promptConfig({ runtime, description: "standing-role-sentinel" }), wakeMessage());
+    expect(spawns).toHaveLength(1);
+    expect(spawns[0].standingPrompt).toContain("standing-role-sentinel");
+    expect(sentInput(spawns[0])).toBe(spawns[0].prompt);
+    expect(afterStartupMemoryBlock(afterFreshSessionStandingPrompt(spawns[0]))).toMatch(/^\[Raft inbox notice:/);
   });
 });
 
@@ -143,6 +211,6 @@ test("a concrete wake takes precedence over the empty-resume path without replac
     expect(spawns[0].standingPrompt).toBe("standing:role");
     expect(spawns[0].prompt).not.toBe(formatResumeEmptyPrompt(driver));
     expect(spawns[0].prompt).toContain("#general");
-    expect(spawns[0].prompt).not.toContain(wake.content);
+    expect(stripInboxPreviewLines(spawns[0].prompt)).not.toContain(wake.content);
   });
 });

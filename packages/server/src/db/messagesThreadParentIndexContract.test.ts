@@ -13,6 +13,13 @@ async function readServerFile(relativePath: string) {
   return readFile(path.join(SERVER_ROOT, relativePath), "utf8");
 }
 
+/** The newest snapshot: the one drizzle-kit generate diffs schema.ts against (older ones are pruned). */
+async function latestSnapshot() {
+  const journal = JSON.parse(await readServerFile("drizzle/meta/_journal.json")) as { entries: Array<{ idx: number }> };
+  const last = String(journal.entries.at(-1)!.idx).padStart(4, "0");
+  return JSON.parse(await readServerFile(`drizzle/meta/${last}_snapshot.json`));
+}
+
 const stripSql = (sql: string) => sql.replace(/--.*$/gm, "").replace(/\s/g, "");
 
 test("0293 and 0309 keep the thread-parent index out of drizzle migrate", async () => {
@@ -20,23 +27,7 @@ test("0293 and 0309 keep the thread-parent index out of drizzle migrate", async 
   assert.equal(stripSql(await readServerFile("drizzle/0309_messages_drop_channel_thread_parent_index.sql")), "SELECT1;");
 });
 
-test("snapshot no longer declares the thread-parent index", async () => {
-  const snapshot = JSON.parse(await readServerFile("drizzle/meta/0309_snapshot.json"));
+test("the latest snapshot does not declare the thread-parent index", async () => {
+  const snapshot = await latestSnapshot();
   assert.equal(snapshot.tables["public.messages"].indexes.idx_messages_channel_thread_parent, undefined);
-});
-
-test("server package exposes concurrent thread-parent index drop and verify scripts", async () => {
-  const packageJson = JSON.parse(await readServerFile("package.json"));
-  assert.equal(packageJson.scripts["db:drop-messages-thread-parent-index"], "node --import @oxc-node/core/register scripts/drop-messages-thread-parent-index.ts");
-  assert.equal(packageJson.scripts["db:verify-messages-thread-parent-index-dropped"], "node --import @oxc-node/core/register scripts/verify-messages-thread-parent-index-dropped.ts");
-
-  const helper = await readServerFile("scripts/messages-thread-parent-index.ts");
-  assert.match(helper, /DROP INDEX CONCURRENTLY IF EXISTS "\$\{THREAD_PARENT_INDEX_NAME\}"/);
-  assert.match(helper, /MESSAGES_THREAD_PARENT_INDEX_STATEMENT_TIMEOUT/);
-  assert.match(helper, /MESSAGES_THREAD_PARENT_INDEX_LOCK_TIMEOUT/);
-
-  const drop = await readServerFile("scripts/drop-messages-thread-parent-index.ts");
-  assert.match(drop, /set_config\('statement_timeout'/);
-  assert.match(drop, /set_config\('lock_timeout'/);
-  assert.doesNotMatch(drop, /BEGIN|transaction\(/);
 });

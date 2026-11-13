@@ -67,6 +67,10 @@ test("Server built-in App pushes expose content-free identities shared with Comp
     true,
   );
   assert.equal(deliveries.length, 2);
+  // A bare cancel only disarms; `canceled` is sent only for a reminder that was itself canceled (RFC 081 D21).
+  assert.deepEqual(deliveries[1], { type: "reminder.cancel", agentId: agent.id, reminderId: "reminder-a", version: 6 });
+  assert.equal(await orchestrator.pushReminderCancel(agent.id, "reminder-a", 7, { canceled: true }), true);
+  assert.deepEqual(deliveries[2], { type: "reminder.cancel", agentId: agent.id, reminderId: "reminder-a", version: 7, canceled: true });
 
   const spans = sink.getAllSpans();
   const config = spans.find(

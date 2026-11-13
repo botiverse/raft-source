@@ -1,3 +1,4 @@
+import { enableTestSlackIngress } from "../test/integration/slackIngressRollout";
 import { dbTest as test } from "../test/integration/dbTest";
 import { closeTestDatabase, openTestDatabase } from "../test/integration/database";
 import assert from "node:assert/strict";
@@ -23,6 +24,7 @@ import {
   externalAttachmentAssets,
   externalAttachmentMessageFacts,
   externalAttachmentTransferJobs,
+  externalChannelBindings,
   externalHumanIdentityLinks,
   externalInboundEvents,
   externalMessageAuthorFacts,
@@ -35,6 +37,7 @@ import {
   messages,
   oauthClients,
   serverMembers,
+  slackVerifiedIngressEvents,
   servers,
   threadFollows,
   users,
@@ -340,8 +343,8 @@ async function enqueue(
     normalizedPayloadDigest: digest(plaintext),
     encryptedPayload: plaintext,
     envelopeKeyId: "opaque-envelope-key-1",
-    payloadSchemaVersion: body.schema === "external-inbound-normalized-event.v2"
-      || body.schema === "external-inbound-normalized-event.v3" ? 2 : 1,
+    payloadSchemaVersion: body.schema === "external-inbound-normalized-edit.v1" ? 4 : body.schema === "external-inbound-normalized-event.v2"
+      || body.schema === "external-inbound-normalized-event.v3" || body.schema === "external-inbound-normalized-event.v4" ? 2 : 1,
     payloadExpiresAt: new Date(receivedAt.getTime() + 5 * 60_000),
     receivedAt,
   });
@@ -352,7 +355,7 @@ function dependencies(
   fixture: Awaited<ReturnType<typeof seedFixture>>,
   input: {
     now?: () => Date;
-    runtime?: ExternalInboundRuntimeAuthority | null;
+    runtime?: Awaited<ReturnType<ExternalInboundWorkerDependencies["resolveCurrentRuntime"]>>;
     decrypt?: ExternalInboundWorkerDependencies["decryptNormalizedPayload"];
     resolveProviderMentionProfiles?: ExternalInboundWorkerDependencies["resolveProviderMentionProfiles"];
     resolveProviderAgentMentionHandles?: ExternalInboundWorkerDependencies["resolveProviderAgentMentionHandles"];
@@ -404,6 +407,7 @@ async function createInboundFileHarness(
   let inspections = 0;
   let streamWrites = 0;
   let inspectFailure: string | null = null;
+  let bridgePaused = false;
   let revokeAfterPutActorId: string | null = null;
   const revokedActors = new Set<string>();
   const maximumByServer = new Map<string, number>();
@@ -467,7 +471,7 @@ async function createInboundFileHarness(
     storage,
     resolveAdapter: (provider: string) => provider === adapter.provider ? adapter : null,
     authorityIsCurrent: async (_authority: unknown, sourceActorProjectionId: string) => (
-      !revokedActors.has(sourceActorProjectionId)
+      bridgePaused ? "paused" as const : !revokedActors.has(sourceActorProjectionId)
     ),
     maximumFileSizeBytes: async (serverId: string) => maximumByServer.get(serverId) ?? 1024,
     now: () => at,
@@ -512,6 +516,7 @@ async function createInboundFileHarness(
     writes,
     counters: () => ({ downloads, inspections, streamWrites }),
     failInspection(reason: string) { inspectFailure = reason; },
+    setBridgePaused(paused: boolean) { bridgePaused = paused; },
     revokeActor(actorId: string) { revokedActors.add(actorId); },
     revokeActorAfterNextPut(actorId: string) { revokeAfterPutActorId = actorId; },
     setMaximum(serverId: string, maximumBytes: number) { maximumByServer.set(serverId, maximumBytes); },
@@ -546,6 +551,48 @@ async function createInboundFileHarness(
       return { admitted, transfer, committed: null };
     },
   };
+}
+
+test("inbound attachment work pauses with the bridge and resumes without losing its file", async () => {
+  const fixture = await seedFixture();
+  const harness = await createInboundFileHarness(fixture);
+  const { at } = await harness.prepare(fixture.actor, "bridge-pause");
+  harness.setBridgePaused(true);
+  const paused = await harness.processTransfer("pause", at);
+  assert.equal(paused.kind, "retry");
+  assert.equal(paused.kind === "retry" ? paused.reason : null, "bridge_disabled");
+  assert.equal(harness.counters().inspections, 0);
+  harness.setBridgePaused(false);
+  const resumed = await harness.processTransfer("resume", new Date(at.getTime() + 31_000));
+  assert.equal(resumed.kind, "metadata_ready");
+  const stored = await harness.processTransfer("store", new Date(at.getTime() + 31_000));
+  assert.equal(stored.kind, "stored");
+  assert.equal((await harness.commit(new Date(at.getTime() + 31_000))).kind, "committed");
+});
+
+// Visibility is per-platform: a pair is allowed in all four combinations and
+// a post-enqueue visibility flip must not strand queued events. Inbound commit
+// only requires a live ordinary channel, not a class match.
+for (const privacyClass of ["public", "private"] as const) {
+  for (const flip of [false, true] as const) {
+    test(`cross-class inbound commits ${flip ? "after a queued Raft visibility flip" : "at enqueue"} (${privacyClass})`, async () => {
+      const fixture = await seedFixture(privacyClass);
+      const raftType = privacyClass === "public" ? "channel" : "private";
+      const flipped = raftType === "channel" ? "private" : "channel";
+      if (!flip) {
+        // The Raft channel is already the opposite class at enqueue+commit.
+        await fixture.db.update(channels).set({ type: flipped }).where(eq(channels.id, fixture.channel.id));
+      }
+      const admitted = await enqueue(fixture, `event-cross-${privacyClass}-${flip}`, payload(fixture, `provider-cross-${privacyClass}-${flip}`));
+      assert.equal(admitted.event.status, "queued");
+      if (flip) {
+        await fixture.db.update(channels).set({ type: flipped }).where(eq(channels.id, fixture.channel.id));
+      }
+      const result = await process(fixture);
+      assert.equal(result.kind, "committed", "a visibility flip must not lose inbound authority");
+      assert.equal(result.eventId, admitted.event.id);
+    });
+  }
 }
 
 test("disabled worker is side-effect free and top-level commit is one atomic canonical unit", async () => {
@@ -644,6 +691,64 @@ test("Slack inbound mention labels use current directory projections without min
   );
   assert.doesNotMatch(stored?.content ?? "", /U0BTXDF3LGY|UDISPLAYONLY|UUNKNOWN|UTOMBSTONED/u);
   assert.equal((await fixture.db.select().from(messageMentions)).length, 0);
+});
+
+test("Slack member mention with a Raft member's handle cannot mint a Raft mention", async () => {
+  const fixture = await seedFixture("public", "slack");
+  // The Slack-side actor happens to share the bound Raft owner's handle; a
+  // <@U…> picked in Slack must render as a display-only fact, never a
+  // messageMentions row that would notify the same-named Raft member.
+  const [sameNameProjection] = await fixture.db.insert(externalActorProjections).values({
+    provider: "slack",
+    appRegistrationId: fixture.actor.appRegistrationId,
+    installId: fixture.actor.installId,
+    workspaceId: fixture.actor.workspaceId,
+    externalActorId: "USAMENAME",
+    displayName: fixture.owner.displayName ?? fixture.owner.name,
+    handles: [fixture.owner.name],
+    actorKind: "human",
+    state: "active",
+    deactivated: false,
+    projectionRevision: 1,
+    observedAt: NOW,
+  }).returning();
+  await fixture.db.insert(externalAddressabilityProjections).values({
+    projectionId: sameNameProjection.id,
+    provider: "slack",
+    appRegistrationId: fixture.actor.appRegistrationId,
+    installId: fixture.actor.installId,
+    workspaceId: fixture.actor.workspaceId,
+    connectionEpoch: fixture.authority.connectionEpoch,
+    bindingId: fixture.authority.bindingId,
+    bindingEpoch: fixture.authority.bindingEpoch,
+    conversationId: fixture.authority.providerConversationId,
+    memberRevision: 1,
+    contextRevision: 1,
+    state: "active",
+    observedAt: NOW,
+    expiresAt: new Date(NOW.getTime() + 60_000),
+  });
+  const body = {
+    ...payload(fixture, "provider-message-samename-mention"),
+    content: `hi <@USAMENAME>`,
+  };
+  await enqueue(fixture, "event-samename-mention", body);
+  const mentionResult = await process(fixture, dependencies(fixture, {
+    async resolveProviderMentionProfiles() {
+      return [{ providerUserId: "USAMENAME", displayName: fixture.owner.name, handle: fixture.owner.name }];
+    },
+  }));
+  assert.equal(mentionResult.kind, "committed", JSON.stringify(mentionResult));
+  const [stored] = await fixture.db.select().from(messages)
+    .where(eq(messages.senderType, "external_projection"));
+  assert.equal(stored?.content, `hi @${fixture.owner.name}`);
+  assert.equal(
+    (await fixture.db.select().from(messageMentions)).length,
+    0,
+    "a Slack-picked mention must never mint Raft mention authority for the same-named member",
+  );
+  const facts = await fixture.db.select().from(externalMentionFacts);
+  assert.equal(facts.length, 1, "the Slack member stays a display-only external fact");
 });
 
 test("Slack directory mention labels reject opaque provider identifiers as handles", async () => {
@@ -969,7 +1074,7 @@ test("Slack mention rendering is bounded and provider-neutral content remains by
 });
 
 test("v2 file events stay non-canonical until provider bytes are stored, then link atomically", async () => {
-  const fixture = await seedFixture();
+  const fixture = await seedFixture("public", "slack");
   const fileBodies = new Map([
     ["provider-file-1", Buffer.from("first provider attachment", "utf8")],
     ["provider-file-2", Buffer.from("second provider attachment", "utf8")],
@@ -1145,6 +1250,11 @@ test("v2 file events stay non-canonical until provider bytes are stored, then li
     [...writes.values()].map((value) => value.toString("utf8")).sort(),
     [...fileBodies.values()].map((value) => value.toString("utf8")).sort(),
   );
+  await enqueue(fixture, "edit-file-caption", editPayload(fixture, "provider-message-file-1", "1785758400.000004", "new caption"));
+  assert.equal((await process(fixture, dependencies(fixture, { now: () => committedAt }))).kind, "committed");
+  assert.deepEqual(await fixture.db.select().from(attachments).where(eq(attachments.messageId, committed.messageId)), linkedAttachments);
+  assert.deepEqual(await fixture.db.select().from(externalAttachmentTransferJobs), jobs);
+  assert.equal((await fixture.db.select().from(messages).where(eq(messages.id, committed.messageId)))[0].content, "new caption");
 });
 
 test("the same actor can re-share one stored provider file without a second download or charge", async () => {
@@ -1550,10 +1660,12 @@ test("a different actor gets an occurrence-owned projection and later failure ca
   assert.deepEqual(harness.counters(), { downloads: 1, inspections: 2, streamWrites: 1 });
 });
 
-test("a terminal provider-file failure commits one visible unavailable marker without a fake attachment", async () => {
-  const fixture = await seedFixture();
+for (const provider of ["provider-test", "slack"] as const) {
+test(`a terminal ${provider} file failure keeps the body and one unavailable marker without a fake attachment`, async () => {
+  const fixture = await seedFixture("public", provider);
+  const originalContent = provider === "slack" ? "中".repeat(15_000) : "original body";
   const filePayload: ExternalInboundNormalizedMessage = {
-    ...payload(fixture, "provider-message-file-missing"),
+    ...payload(fixture, "provider-message-file-missing", null, originalContent),
     schema: "external-inbound-normalized-event.v2",
     providerFileIds: ["provider-file-missing"],
   };
@@ -1611,7 +1723,8 @@ test("a terminal provider-file failure commits one visible unavailable marker wi
   if (committed.kind !== "committed") assert.fail("expected unavailable file message commit");
   const [message] = await fixture.db.select().from(messages)
     .where(eq(messages.id, committed.messageId));
-  assert.match(message.content, /\[One or more attachments unavailable\]$/);
+  assert.ok(message.content === `${originalContent}\n\n[One or more attachments unavailable]`,
+    "the complete original body and marker must survive together");
   assert.equal((await fixture.db.select().from(attachments)
     .where(eq(attachments.messageId, committed.messageId))).length, 0);
   const [fact] = await fixture.db.select().from(externalAttachmentMessageFacts)
@@ -1620,6 +1733,7 @@ test("a terminal provider-file failure commits one visible unavailable marker wi
   assert.equal(fact.terminalFailureClass, "provider_file_not_found");
   assert.ok(fact.messageLinkId);
 });
+}
 
 test("top-level Joint inbound keeps local authority but commits only to canonical storage", async () => {
   const fixture = await seedFixture("public");
@@ -2775,4 +2889,839 @@ test("Joint thread inbound delivers per-face parent context and host-face mentio
   assert.equal(participant!.channelId, participantFace.mapping.localChannelId);
   assert.equal(participant!.parentId, jointFixture.participant.id);
   assert.equal(participant!.parentType, "joint");
+});
+
+function editPayload(fixture: Awaited<ReturnType<typeof seedFixture>>, id: string, ts: string, content: string, threadId: string | null = null): ExternalInboundNormalizedMessage {
+  return { ...payload(fixture, id, threadId, content), schema: "external-inbound-normalized-edit.v1",
+    providerFileIds: [], providerAgentMentions: [], providerEditedTs: ts };
+}
+
+for (const visibility of ["public", "private"] as const) {
+  test(`Slack body edit updates the original row without new inbox facts or send notifications (${visibility})`, async () => {
+    const fixture = await seedFixture(visibility, "slack");
+    await enqueue(fixture, "original", payload(fixture, "1785758340.000001"));
+    const original = await process(fixture, dependencies(fixture));
+    assert.equal(original.kind, "committed");
+    const [before] = await fixture.db.select().from(messages);
+    const inboxBefore = await fixture.db.select().from(inboxNotificationFacts);
+    let edited = 0;
+    let newMessages = 0;
+    await enqueue(fixture, "edit", editPayload(fixture, "1785758340.000001", "1785758400.000002", "new searchable content"));
+    assert.equal((await process(fixture, { ...dependencies(fixture),
+      onMessageEdited: ({ messageId }) => { assert.equal(messageId, before.id); edited++; },
+      onMessageCommitted: () => { newMessages++; },
+    })).kind, "committed");
+    const [after] = await fixture.db.select().from(messages);
+    assert.equal(after.id, before.id);
+    assert.equal(after.seq, before.seq);
+    assert.equal(after.senderId, before.senderId);
+    assert.equal(after.content, "new searchable content");
+    assert.equal(after.searchText, after.content);
+    assert.deepEqual(await fixture.db.select().from(inboxNotificationFacts), inboxBefore);
+    assert.equal(edited, 1);
+    assert.equal(newMessages, 0);
+    // Redelivery under a different event ID and an older microsecond edit
+    // cannot overwrite the latest body or emit a second update.
+    for (const [eventId, ts] of [["duplicate-edit", "1785758400.000002"], ["older-edit", "1785758400.000001"]]) {
+      await enqueue(fixture, eventId, editPayload(fixture, "1785758340.000001", ts, "stale body"));
+      assert.equal((await process(fixture, { ...dependencies(fixture), onMessageEdited: () => { edited++; } })).kind, "duplicate");
+    }
+    assert.equal(edited, 1);
+    assert.equal((await fixture.db.select().from(messages))[0].content, "new searchable content");
+    await enqueue(fixture, "newer-edit", editPayload(fixture, "1785758340.000001", "1785758400.000003", "newer within same millisecond"));
+    assert.equal((await process(fixture, dependencies(fixture))).kind, "committed");
+    const [newer] = await fixture.db.select().from(messages);
+    assert.equal(newer.content, "newer within same millisecond");
+    assert.ok(newer.updatedAt > after.updatedAt, "consecutive accepted edits retain a monotonic preview content revision even when the clock is unchanged");
+    // Original-message retries retain their original fingerprint after edits.
+    await enqueue(fixture, "original-redelivery", payload(fixture, "1785758340.000001"));
+    assert.equal((await process(fixture, dependencies(fixture))).kind, "duplicate");
+  });
+}
+
+test("Slack thread reply edits preserve the reply's channel and root", async () => {
+  const fixture = await seedFixture("public", "slack");
+  await enqueue(fixture, "root", payload(fixture, "root-id"));
+  await process(fixture, dependencies(fixture));
+  await enqueue(fixture, "reply", payload(fixture, "reply-id", "root-id"));
+  await process(fixture, dependencies(fixture));
+  const [link] = (await fixture.db.select().from(externalMessageLinks)).filter((row) => row.providerMessageId === "reply-id");
+  const [before] = await fixture.db.select().from(messages).where(eq(messages.id, link.raftMessageId));
+  await enqueue(fixture, "edit-reply", editPayload(fixture, "reply-id", "1785758400.000003", "edited reply", "root-id"));
+  assert.equal((await process(fixture, dependencies(fixture))).kind, "committed");
+  const [after] = await fixture.db.select().from(messages).where(eq(messages.id, link.raftMessageId));
+  assert.equal(after.channelId, before.channelId);
+  assert.equal(after.content, "edited reply");
+  assert.equal((await fixture.db.select().from(messages)).length, 2);
+});
+
+async function messageChangeRows(fixture: Awaited<ReturnType<typeof seedFixture>>, messageId: string) {
+  const result = await fixture.db.execute(sql`
+    SELECT scope_kind, scope_id::text AS scope_id, parent_id::text AS parent_id, op
+    FROM public.change_log WHERE entity = 'message' AND entity_id = ${messageId} ORDER BY seq`);
+  return result.rows;
+}
+
+test("RFC 082: a Slack body edit writes one message change row in its conversation's scope (a thread reply: its parent channel)", async () => {
+  const fixture = await seedFixture("public", "slack");
+  await enqueue(fixture, "root", payload(fixture, "root-id"));
+  await process(fixture, dependencies(fixture));
+  await enqueue(fixture, "reply", payload(fixture, "reply-id", "root-id"));
+  await process(fixture, dependencies(fixture));
+  const links = await fixture.db.select().from(externalMessageLinks);
+  const rootId = links.find((link) => link.providerMessageId === "root-id")!.raftMessageId;
+  const replyId = links.find((link) => link.providerMessageId === "reply-id")!.raftMessageId;
+  assert.deepEqual(await messageChangeRows(fixture, rootId), [], "a new message writes none (clients get it by sequence)");
+
+  await enqueue(fixture, "edit-root", editPayload(fixture, "root-id", "1785758400.000002", "edited root"));
+  assert.equal((await process(fixture, dependencies(fixture))).kind, "committed");
+  await enqueue(fixture, "edit-reply", editPayload(fixture, "reply-id", "1785758400.000003", "edited reply", "root-id"));
+  assert.equal((await process(fixture, dependencies(fixture))).kind, "committed");
+  const [reply] = await fixture.db.select().from(messages).where(eq(messages.id, replyId));
+  assert.notEqual(reply.channelId, fixture.channel.id);
+  assert.deepEqual(await messageChangeRows(fixture, rootId), [{ scope_kind: "channel", scope_id: fixture.channel.id, parent_id: null, op: "upsert" }]);
+  assert.deepEqual(await messageChangeRows(fixture, replyId), [{ scope_kind: "channel", scope_id: reply.channelId, parent_id: fixture.channel.id, op: "upsert" }]);
+  // A metadata-only change (the same body) changes nothing a client holds.
+  await enqueue(fixture, "edit-root-same", editPayload(fixture, "root-id", "1785758400.000004", "edited root"));
+  assert.equal((await process(fixture, dependencies(fixture))).kind, "duplicate");
+  assert.equal((await messageChangeRows(fixture, rootId)).length, 1);
+});
+
+test("RFC 082: a Slack edit leaves a message card alone", async () => {
+  const fixture = await seedFixture("public", "slack");
+  await enqueue(fixture, "original", payload(fixture, "card-id"));
+  await process(fixture, dependencies(fixture));
+  const [before] = await fixture.db.select().from(messages);
+  const metadata = {
+    kind: "message-card",
+    revision: 1,
+    updatedAt: NOW.toISOString(),
+    card: { version: 1, root: "t", elements: { t: { type: "Text", props: { text: "In review", tone: "default", mono: false } } } },
+  };
+  await fixture.db.update(messages).set({ actionMetadata: metadata }).where(eq(messages.id, before.id));
+  let edited = 0;
+  await enqueue(fixture, "edit", editPayload(fixture, "card-id", "1785758400.000002", "rewritten in Slack"));
+  assert.equal((await process(fixture, { ...dependencies(fixture), onMessageEdited: () => { edited++; } })).kind, "duplicate");
+  const [after] = await fixture.db.select().from(messages).where(eq(messages.id, before.id));
+  assert.equal(after.content, before.content);
+  assert.equal(after.searchText, before.searchText);
+  assert.deepEqual(after.actionMetadata, metadata);
+  assert.equal(edited, 0, "no message:updated");
+  assert.deepEqual(await messageChangeRows(fixture, before.id), []);
+});
+
+test("RFC 082 §4.6: an edit event on a card message's bridged copy that reaches the worker is left alone and never called our echo", async () => {
+  const fixture = await seedFixture("public", "slack");
+  const metadata = {
+    kind: "message-card",
+    revision: 2,
+    updatedAt: NOW.toISOString(),
+    card: { version: 1, root: "t", elements: { t: { type: "Text", props: { text: "Ready", tone: "default", mono: false } } } },
+  };
+  const outbound = async (providerMessageId: string, actionMetadata: unknown) => {
+    const [message] = await fixture.db.insert(messages).values({
+      channelId: fixture.channel.id, content: "Build 1.19.0 · Ready", senderType: "agent", senderId: fixture.agent.id,
+      messageType: "chat", actionMetadata, createdAt: NOW, updatedAt: NOW,
+    }).returning();
+    await fixture.db.insert(externalMessageLinks).values({
+      provider: "slack", installId: fixture.authority.installId, providerAuthorityId: fixture.authority.providerAuthorityId,
+      providerConversationId: fixture.authority.providerConversationId, providerMessageId,
+      bindingId: fixture.authority.bindingId, bindingEpoch: fixture.authority.bindingEpoch,
+      connectionEpoch: fixture.authority.connectionEpoch, raftMessageId: message.id, firstDirection: "raft_outbound",
+      payloadFingerprint: digest(providerMessageId), outcomeState: "accepted", authorityState: "active",
+      stateReason: "raft_outbound_committed",
+    });
+    return message;
+  };
+  const cardMessage = await outbound("1785758400.000100", metadata);
+  const ordinary = await outbound("1785758400.000200", null);
+  let edited = 0;
+  await enqueue(fixture, "card-edit", editPayload(fixture, "1785758400.000100", "1785758400.000101", "@here rewritten"));
+  const cardResult = await process(fixture, { ...dependencies(fixture), onMessageEdited: () => { edited++; } });
+  assert.equal(cardResult.kind, "duplicate", "not proven our echo: the safe handling leaves the card alone");
+  await enqueue(fixture, "ordinary-edit", editPayload(fixture, "1785758400.000200", "1785758400.000201", "rewritten"));
+  assert.equal((await process(fixture, dependencies(fixture))).kind, "echo", "an ordinary bridged message keeps its echo");
+  const [after] = await fixture.db.select().from(messages).where(eq(messages.id, cardMessage.id));
+  assert.equal(after.content, cardMessage.content);
+  assert.deepEqual(after.actionMetadata, metadata);
+  assert.equal(edited, 0);
+  assert.deepEqual(await messageChangeRows(fixture, cardMessage.id), []);
+  assert.deepEqual(await messageChangeRows(fixture, ordinary.id), []);
+});
+
+test("Slack edit arriving before its original retries instead of inserting a second message", async () => {
+  const fixture = await seedFixture("public", "slack");
+  const edit = await enqueue(fixture, "early-edit", editPayload(fixture, "late-original", "1785758400.000003", "latest"));
+  const result = await process(fixture, dependencies(fixture));
+  assert.deepEqual(result, { kind: "blocked", eventId: edit.event.id, reason: "edit_original_message_pending" });
+  assert.equal((await fixture.db.select().from(messages)).length, 0);
+  await enqueue(fixture, "late-original-event", payload(fixture, "late-original"));
+  assert.equal((await process(fixture, dependencies(fixture))).kind, "committed");
+  assert.equal((await process(fixture, dependencies(fixture, { now: () => new Date(NOW.getTime() + 31_000) }))).kind, "committed");
+  assert.equal((await fixture.db.select().from(messages)).length, 1);
+  assert.equal((await fixture.db.select().from(messages))[0].content, "latest");
+});
+
+for (const denial of ["actor", "revoked", "archive", "workspace"] as const) {
+  test(`Slack edit cannot overwrite outside its original authority: ${denial}`, async () => {
+    const fixture = await seedFixture("public", "slack");
+    await enqueue(fixture, "original", payload(fixture, "original-id"));
+    await process(fixture, dependencies(fixture));
+    const body = editPayload(fixture, "original-id", "1785758400.000003", "must not replace");
+    if (denial === "actor") body.externalActorId = "OTHER_USER";
+    if (denial === "workspace") fixture.authority.providerAuthorityId = "different-workspace";
+    if (denial === "archive") await fixture.db.update(channels).set({ archivedAt: NOW }).where(eq(channels.id, fixture.channel.id));
+    await enqueue(fixture, "denied-edit", body);
+    const result = await process(fixture, dependencies(fixture, denial === "revoked" ? { runtime: null } : {}));
+    assert.equal(result.kind, "blocked");
+    assert.equal((await fixture.db.select().from(messages))[0].content, "provider content original-id");
+  });
+}
+
+test("Slack metadata-only changes advance ordering without marking the body edited", async () => {
+  const fixture = await seedFixture("public", "slack");
+  await enqueue(fixture, "original", payload(fixture, "original-id", null, "unchanged"));
+  await process(fixture, dependencies(fixture));
+  const [before] = await fixture.db.select().from(messages);
+  await enqueue(fixture, "metadata", editPayload(fixture, "original-id", "1785758400.000003", "unchanged"));
+  assert.equal((await process(fixture, { ...dependencies(fixture), onMessageEdited: () => assert.fail("metadata must not emit a body edit") })).kind, "duplicate");
+  assert.deepEqual((await fixture.db.select().from(messages))[0], before);
+  await enqueue(fixture, "older-edit", editPayload(fixture, "original-id", "1785758400.000002", "older content"));
+  assert.equal((await process(fixture, dependencies(fixture))).kind, "duplicate");
+  assert.equal((await fixture.db.select().from(messages))[0].content, "unchanged");
+});
+
+test("Slack edit custody rejects a null edit timestamp before touching its message", async () => {
+  const fixture = await seedFixture("public", "slack");
+  const body = editPayload(fixture, "original-id", "1785758400.000003", "invalid");
+  Object.assign(body, { providerEditedTs: null });
+  const event = await enqueue(fixture, "invalid-edit", body);
+  assert.deepEqual(await process(fixture, dependencies(fixture)), {
+    kind: "blocked", eventId: event.event.id, reason: "payload_invalid",
+  });
+  assert.equal((await fixture.db.select().from(messages)).length, 0);
+});
+
+test("Slack edit cannot move an original into a different thread or create that thread", async () => {
+  const fixture = await seedFixture("public", "slack");
+  for (const id of ["original", "other-root"]) {
+    await enqueue(fixture, id, payload(fixture, id));
+    await process(fixture, dependencies(fixture));
+  }
+  const beforeChannels = await fixture.db.select().from(channels);
+  await enqueue(fixture, "move-edit", editPayload(fixture, "original", "1785758400.000003", "moved", "other-root"));
+  const result = await process(fixture, dependencies(fixture));
+  assert.equal(result.kind, "blocked");
+  assert.deepEqual(await fixture.db.select().from(channels), beforeChannels);
+  assert.equal((await fixture.db.select().from(messages)).some((row) => row.content === "moved"), false);
+});
+
+for (const privacy of ["public", "private"] as const) {
+  test(`Slack emoji render in roots, replies and edits through one canonical path (${privacy})`, async () => {
+    const fixture = await seedFixture(privacy, "slack");
+    await enqueue(fixture, "emoji-root", payload(fixture, "emoji-root-id", null, ":test_tube: :+1::skin-tone-4:"));
+    const root = await process(fixture);
+    assert.equal(root.kind, "committed");
+    const [originalRoot] = await fixture.db.select().from(messages).where(eq(messages.id, root.messageId!));
+    assert.equal(originalRoot.content, "🧪 👍🏽");
+    await enqueue(fixture, "emoji-reply", payload(fixture, "emoji-reply-id", "emoji-root-id", ":female-technologist::skin-tone-4: `:test_tube:`"));
+    const reply = await process(fixture);
+    assert.equal(reply.kind, "committed");
+    const [originalReply] = await fixture.db.select().from(messages).where(eq(messages.id, reply.messageId!));
+    assert.equal(originalReply.content, "👩🏽‍💻 `:test_tube:`");
+    await enqueue(fixture, "emoji-edit-root", editPayload(fixture, "emoji-root-id", "1785758400.000004", "root :white_check_mark: :workspace_parrot:"));
+    assert.equal((await process(fixture)).kind, "committed");
+    await enqueue(fixture, "emoji-edit-reply", editPayload(fixture, "emoji-reply-id", "1785758400.000005", "reply :test_tube:", "emoji-root-id"));
+    assert.equal((await process(fixture)).kind, "committed");
+    const [editedRoot] = await fixture.db.select().from(messages).where(eq(messages.id, root.messageId!));
+    const [editedReply] = await fixture.db.select().from(messages).where(eq(messages.id, reply.messageId!));
+    assert.equal(editedRoot.content, "root ✅ :workspace_parrot:");
+    assert.equal(editedRoot.searchText, editedRoot.content);
+    assert.equal(editedReply.content, "reply 🧪");
+    assert.equal(editedReply.channelId, originalReply.channelId);
+    assert.equal((await fixture.db.select().from(messages)).length, 2);
+  });
+}
+
+test("other providers do not inherit Slack shortcode interpretation", async () => {
+  const fixture = await seedFixture();
+  await enqueue(fixture, "literal-provider", payload(fixture, "literal-provider-id", null, ":test_tube:"));
+  const result = await process(fixture);
+  assert.equal(result.kind, "committed");
+  const [message] = await fixture.db.select().from(messages).where(eq(messages.id, result.messageId!));
+  assert.equal(message.content, ":test_tube:");
+});
+
+
+test("Slack emoji rendering preserves escaped tones and uppercase URL bytes in canonical storage", async () => {
+  const fixture = await seedFixture("private", "slack");
+  const literal = "\\:thumbsup::skin-tone-4: HTTPS://example.test/:test_tube:";
+  await enqueue(fixture, "emoji-literal-fidelity", payload(fixture, "emoji-literal-fidelity-id", null, `${literal} :test_tube:`));
+  const result = await process(fixture);
+  assert.equal(result.kind, "committed");
+  const [message] = await fixture.db.select().from(messages).where(eq(messages.id, result.messageId!));
+  assert.equal(message.content, `${literal} 🧪`);
+  assert.equal(message.searchText, message.content);
+});
+
+for (const kind of ["public", "private", "joint"] as const) {
+  test(`historical receipt preserves inbound replies and edits after binding update (${kind})`, async () => {
+    const fixture = await seedFixture(kind === "private" ? "private" : "public", "slack");
+    if (kind === "joint") await convertFixtureToJointWithParticipant(fixture);
+    await enqueue(fixture, "old-root", payload(fixture, "old-root"));
+    const root = await process(fixture);
+    assert.equal(root.kind, "committed");
+    await fixture.db.update(externalMessageLinks).set({ bindingEpoch: 1, bindingId: "historical-binding",
+      installId: "historical-install", connectionEpoch: 1, authorityState: "stale" })
+      .where(eq(externalMessageLinks.providerMessageId, "old-root"));
+    const [oldActor] = await fixture.db.insert(externalActorProjections).values({ ...fixture.actor,
+      id: randomUUID(), installId: "historical-install", appRegistrationId: "historical-registration" }).returning();
+    await fixture.db.update(messages).set({ senderId: oldActor.id }).where(eq(messages.id, root.messageId));
+    await fixture.db.update(externalMessageAuthorFacts).set({ projectionId: oldActor.id,
+      installId: "historical-install", appRegistrationId: "historical-registration" })
+      .where(eq(externalMessageAuthorFacts.messageId, root.messageId));
+    await enqueue(fixture, "new-reply", payload(fixture, "new-reply", "old-root"));
+    const reply = await process(fixture);
+    assert.equal(reply.kind, "committed");
+    const [replyLink] = await fixture.db.select().from(externalMessageLinks)
+      .where(eq(externalMessageLinks.providerMessageId, "new-reply"));
+    assert.equal(replyLink.raftCanonicalRootMessageId, root.messageId);
+    assert.equal(replyLink.bindingEpoch, 2, "the new operation belongs to current authority");
+    await enqueue(fixture, "old-root-edit", editPayload(fixture, "old-root", "1785758400.000010", "edited historical root"));
+    assert.equal((await process(fixture)).kind, "committed");
+    const [updated] = await fixture.db.select().from(messages).where(eq(messages.id, root.messageId));
+    assert.equal(updated.content, "edited historical root");
+    const [historical] = await fixture.db.select().from(externalMessageLinks)
+      .where(eq(externalMessageLinks.providerMessageId, "old-root"));
+    assert.equal(historical.bindingEpoch, 1, "historical provenance is not rewritten");
+  });
+}
+
+test("historical root lookup rejects a different channel pair or unaccepted receipt", async () => {
+  const fixture = await seedFixture("public", "slack");
+  await enqueue(fixture, "root", payload(fixture, "root"));
+  await process(fixture);
+  const [root] = await fixture.db.select().from(externalMessageLinks);
+  for (const patch of [
+    { providerConversationId: "another-channel" },
+    { providerAuthorityId: "another-workspace" }, { outcomeState: "unknown" as const, providerMessageId: null, firstDirection: "raft_outbound" as const },
+  ]) {
+    await fixture.db.update(externalMessageLinks).set({ ...root, bindingEpoch: 1, ...patch })
+      .where(eq(externalMessageLinks.id, root.id));
+    const body = payload(fixture, `rejected-${JSON.stringify(patch)}`, "root");
+    await enqueue(fixture, `event-${JSON.stringify(patch)}`, body);
+    assert.equal((await process(fixture)).kind, "blocked");
+  }
+  await fixture.db.update(externalMessageLinks).set(root).where(eq(externalMessageLinks.id, root.id));
+  const [otherParent] = await fixture.db.insert(channels).values({ serverId: fixture.server.id,
+    name: "another-actual-channel", type: "channel" }).returning();
+  await fixture.db.update(messages).set({ channelId: otherParent.id }).where(eq(messages.id, root.raftMessageId));
+  await enqueue(fixture, "wrong-raft-parent", payload(fixture, "wrong-raft-reply", "root"));
+  assert.equal((await process(fixture)).kind, "blocked", "same Slack coordinates cannot move another Raft channel into this pair");
+  assert.equal((await fixture.db.select().from(messages)).length, 1);
+});
+
+async function seedCurrentBindingForMissingRoot(fixture: Awaited<ReturnType<typeof seedFixture>>) {
+  const [binding] = await fixture.db.insert(externalChannelBindings).values({
+    serverId: fixture.server.id, registrationId: fixture.actor.appRegistrationId, installId: fixture.install.id,
+    channelId: fixture.channel.id, providerConversationId: fixture.authority.providerConversationId,
+    providerConversationKind: "public_channel", privacyClass: "public", state: "active", grantEpoch: 1,
+    connectionEpoch: fixture.authority.connectionEpoch, bindingEpoch: fixture.authority.bindingEpoch,
+    consentedByType: "human", consentedById: fixture.owner.id, consentedAt: NOW,
+  }).returning();
+  fixture.authority.bindingId = binding.id;
+}
+
+for (const kind of ["reply", "reaction"] as const) {
+  test(`confirmed missing historical parent discards inbound ${kind} and the next body commits`, async () => {
+    const fixture = await seedFixture("public", "slack");
+    await seedCurrentBindingForMissingRoot(fixture);
+    let discardedId: string;
+    if (kind === "reply") {
+      discardedId = (await enqueue(fixture, "orphan-reply", payload(fixture, "1790000000.000200", "1500000000.000100"))).event.id;
+    } else {
+      const plaintext = JSON.stringify({ schema: "external-inbound-normalized-reaction.v1", operation: "add",
+        providerMessageId: "1500000000.000100", externalActorId: fixture.actor.externalActorId,
+        providerReactionKey: "eyes", eventOccurredAt: NOW.toISOString(), eventSequence: NOW.getTime() * 1000,
+        botUserId: "U_BOT" });
+      const [event] = await fixture.db.insert(externalInboundEvents).values({ ...fixture.authority,
+        providerEventId: "orphan-reaction", normalizedPayloadDigest: digest(plaintext), encryptedPayload: plaintext,
+        envelopeKeyId: "opaque-envelope-key-1", payloadSchemaVersion: 3,
+        payloadAadPurpose: "external-inbound-normalized-event", payloadAadVersion: 1,
+        payloadExpiresAt: new Date(NOW.getTime() + 60_000), receivedAt: NOW, updatedAt: NOW,
+      }).returning();
+      discardedId = event.id;
+    }
+    const discarded = await process(fixture);
+    assert.equal(discarded.kind, "blocked");
+    assert.equal("reason" in discarded ? discarded.reason : null, "confirmed_thread_root_missing");
+    const [row] = await fixture.db.select().from(externalInboundEvents).where(eq(externalInboundEvents.id, discardedId));
+    assert.equal(row.status, "dead");
+    assert.equal(row.encryptedPayload, null);
+    assert.ok(row.payloadErasedAt);
+    await enqueue(fixture, "following-body", payload(fixture, "1790000000.000300", null, "following delivered body"));
+    assert.equal((await process(fixture)).kind, "committed");
+    const rows = await fixture.db.select().from(messages);
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].content, "following delivered body");
+  });
+}
+
+test("a fresh reordered inbound root stays recoverable instead of being discarded", async () => {
+  const fixture = await seedFixture("public", "slack");
+  await seedCurrentBindingForMissingRoot(fixture);
+  const rootId = `${Math.floor(NOW.getTime() / 1000) + 1}.000100`;
+  const child = await enqueue(fixture, "reordered-child", payload(fixture, "1790000000.000500", rootId));
+  assert.equal((await process(fixture)).kind, "blocked");
+  const [waiting] = await fixture.db.select().from(externalInboundEvents).where(eq(externalInboundEvents.id, child.event.id));
+  assert.equal(waiting.status, "queued");
+  assert.ok(waiting.encryptedPayload);
+  await enqueue(fixture, "delayed-root", payload(fixture, rootId));
+  assert.equal((await process(fixture)).kind, "committed");
+  assert.equal((await process(fixture, dependencies(fixture, { now: () => new Date(NOW.getTime() + 31_000) }))).kind, "committed");
+  assert.equal((await fixture.db.select().from(messages)).length, 2);
+});
+
+for (const operation of ["reply", "edit", "duplicate"] as const) {
+  test(`ambiguous historical Slack mappings cannot choose an arbitrary ${operation} target`, async () => {
+    const fixture = await seedFixture("public", "slack");
+    await enqueue(fixture, "first-root", payload(fixture, "conflicted-root"));
+    const first = await process(fixture);
+    assert.equal(first.kind, "committed");
+    await enqueue(fixture, "second-root", payload(fixture, "other-root"));
+    const second = await process(fixture);
+    assert.equal(second.kind, "committed");
+    const [original] = await fixture.db.select().from(externalMessageLinks).where(eq(externalMessageLinks.raftMessageId, first.messageId!));
+    await fixture.db.insert(externalMessageLinks).values({ ...original, id: randomUUID(), installId: "older-install",
+      raftMessageId: second.messageId!, bindingId: "older-binding", bindingEpoch: 1 });
+    const body = operation === "edit" ? editPayload(fixture, "conflicted-root", "1785758400.000010", "must not overwrite")
+      : operation === "reply" ? payload(fixture, "conflicted-reply", "conflicted-root")
+      : payload(fixture, "conflicted-root", null, "duplicate must not pick");
+    await enqueue(fixture, `ambiguous-${operation}`, body);
+    assert.equal((await process(fixture)).kind, "blocked");
+    const stored = await fixture.db.select().from(messages);
+    assert.equal(stored.length, 2);
+    assert.ok(stored.every((message) => message.content !== "must not overwrite"));
+  });
+}
+
+test("an old Slack root queued after rebind is not mistaken for confirmed absence", async () => {
+  const fixture = await seedFixture("public", "slack");
+  await seedCurrentBindingForMissingRoot(fixture);
+  const oldRoot = "1500000000.000100";
+  const child = await enqueue(fixture, "late-child", payload(fixture, "1790000000.000700", oldRoot));
+  const root = await enqueue(fixture, "late-old-root", payload(fixture, oldRoot));
+  await fixture.db.update(externalInboundEvents).set({ receivedAt: new Date(NOW.getTime() + 1) }).where(eq(externalInboundEvents.id, root.event.id));
+  assert.equal((await process(fixture)).kind, "blocked");
+  const [waiting] = await fixture.db.select().from(externalInboundEvents).where(eq(externalInboundEvents.id, child.event.id));
+  assert.equal(waiting.status, "queued");
+  assert.ok(waiting.encryptedPayload, "the old root's arrival time cannot justify erasing its reply");
+  assert.equal((await process(fixture)).kind, "committed");
+  assert.equal((await process(fixture, dependencies(fixture, { now: () => new Date(NOW.getTime() + 31_000) }))).kind, "committed");
+  assert.equal((await fixture.db.select().from(messages)).length, 2);
+});
+
+
+test("queued inbound reply and edit retain custody while using the reauthorized current actor", async () => {
+  const fixture = await seedFixture("public", "slack");
+  await enqueue(fixture, "before-rebind-root", payload(fixture, "before-rebind-root"));
+  const root = await process(fixture);
+  assert.equal(root.kind, "committed");
+  await enqueue(fixture, "queued-rebind-reply", payload(fixture, "queued-rebind-reply", "before-rebind-root"));
+  await enqueue(fixture, "queued-rebind-edit", editPayload(fixture, "before-rebind-root", "1785758400.000020", "edited under current actor"), new Date(NOW.getTime() + 1));
+  const [actor] = await fixture.db.insert(externalActorProjections).values({ ...fixture.actor,
+    id: randomUUID(), installId: "reauthorized-install" }).returning();
+  await fixture.db.update(externalActorProjections).set({ state: "tombstoned" }).where(eq(externalActorProjections.id, fixture.actor.id));
+  const current = { ...fixture.authority, installId: actor.installId, appRegistrationId: actor.appRegistrationId,
+    bindingId: randomUUID(), bindingEpoch: 1, connectionEpoch: 3, runtimeRevision: "current-reauthorized-runtime" };
+  const runtime = { ...fixture.authority, operationAuthority: current };
+  const reply = await process(fixture, dependencies(fixture, { runtime }));
+  assert.equal(reply.kind, "committed");
+  const [storedReply] = await fixture.db.select().from(messages).where(eq(messages.id, reply.messageId));
+  assert.equal(storedReply.senderId, actor.id);
+  assert.equal((await process(fixture, dependencies(fixture, { runtime }))).kind, "committed");
+  const [edited] = await fixture.db.select().from(messages).where(eq(messages.id, root.messageId));
+  assert.equal(edited.content, "edited under current actor");
+  const originalEvent = (await fixture.db.select().from(externalInboundEvents)).find((event) => event.providerEventId === "queued-rebind-reply");
+  assert.equal(originalEvent?.installId, fixture.authority.installId, "the original sealed custody coordinates are retained");
+});
+
+test("late self-bot detection reaches a terminal state without creating a message", async () => {
+  const fixture = await seedFixture("public", "slack");
+  await fixture.db.update(externalAppInstalls).set({ providerBotId: "B_CURRENT" }).where(eq(externalAppInstalls.id, fixture.install.id));
+  await fixture.db.update(externalActorProjections).set({ actorKind: "bot", externalActorId: "B_CURRENT" })
+    .where(eq(externalActorProjections.id, fixture.actor.id));
+  fixture.actor.externalActorId = "B_CURRENT";
+  const event = await enqueue(fixture, "late-self-bot", payload(fixture, "1785758340.000001"));
+  const result = await process(fixture);
+  assert.equal(result.kind, "blocked");
+  if (result.kind === "blocked") assert.equal(result.reason, "provider_self_echo_without_link");
+  const [stored] = await fixture.db.select().from(externalInboundEvents).where(eq(externalInboundEvents.id, event.event.id));
+  assert.equal(stored.status, "dead");
+  assert.equal(stored.outcomeReason, "provider_self_echo_without_link");
+  assert.equal(stored.encryptedPayload, null);
+  assert.equal((await fixture.db.select().from(messages)).length, 0);
+  assert.equal((await process(fixture)).kind, "empty");
+});
+
+test("normalized Slack bot messages and edits preserve bot authorship without new principals", async () => {
+  const fixture = await seedFixture("public", "slack");
+  await fixture.db.update(externalActorProjections).set({ actorKind: "bot", externalActorId: "B_ALERT" })
+    .where(eq(externalActorProjections.id, fixture.actor.id));
+  fixture.actor.externalActorId = "B_ALERT";
+  const membersBefore = (await fixture.db.select().from(serverMembers)).length;
+  const agentsBefore = (await fixture.db.select().from(agents)).length;
+  await enqueue(fixture, "bot-original", payload(fixture, "1785758340.000001", null, "bot original"));
+  const original = await process(fixture, dependencies(fixture));
+  assert.equal(original.kind, "committed");
+  const [fact] = await fixture.db.select().from(externalMessageAuthorFacts);
+  assert.equal(fact.actorKind, "bot");
+  assert.equal(fact.externalActorId, "B_ALERT");
+  await enqueue(fixture, "bot-edit", editPayload(fixture, "1785758340.000001", "1785758400.000002", "bot edited"));
+  assert.equal((await process(fixture, dependencies(fixture))).kind, "committed");
+  const [message] = await fixture.db.select().from(messages);
+  assert.equal(message.content, "bot edited");
+  assert.equal((await fixture.db.select().from(messages)).length, 1);
+  assert.equal((await fixture.db.select().from(serverMembers)).length, membersBefore);
+  assert.equal((await fixture.db.select().from(agents)).length, agentsBefore);
+  await fixture.db.update(externalActorProjections).set({ actorKind: "human" })
+    .where(eq(externalActorProjections.id, fixture.actor.id));
+  await enqueue(fixture, "wrong-kind-edit", editPayload(fixture, "1785758340.000001", "1785758400.000003", "wrong"));
+  const mismatch = await process(fixture, dependencies(fixture));
+  assert.equal(mismatch.kind, "blocked");
+  if (mismatch.kind === "blocked") assert.equal(mismatch.reason, "edit_message_authority_mismatch");
+  assert.equal((await fixture.db.select().from(messages))[0]?.content, "bot edited");
+});
+
+for (const actorKind of ["bot", "human"] as const) {
+  test(`normalized bot presentation cannot rewrite stable ${actorKind} identity`, async () => {
+    const fixture = await seedFixture("public", "slack");
+    if (actorKind === "bot") {
+      await fixture.db.update(externalActorProjections).set({ actorKind: "bot", externalActorId: "B_ALERT" })
+        .where(eq(externalActorProjections.id, fixture.actor.id));
+      fixture.actor.externalActorId = "B_ALERT";
+    }
+    const body: ExternalInboundNormalizedMessage = { ...payload(fixture, "1785758340.000002"),
+      schema: "external-inbound-normalized-event.v4", providerFileIds: [], providerAgentMentions: [],
+      botPresentation: { displayName: "Deployment alert", avatarArtifactId: null } };
+    await enqueue(fixture, `presentation-${actorKind}`, body);
+    const result = await process(fixture, dependencies(fixture));
+    if (actorKind === "human") {
+      assert.equal(result.kind, "blocked");
+      if (result.kind === "blocked") assert.equal(result.reason, "bot_actor_authority_mismatch");
+      assert.equal((await fixture.db.select().from(messages)).length, 0);
+    } else {
+      assert.equal(result.kind, "committed");
+      const [fact] = await fixture.db.select().from(externalMessageAuthorFacts);
+      assert.equal(fact.actorKind, "bot");
+      assert.equal(fact.displayName, fixture.actor.displayName);
+      const [profile] = await fixture.db.select().from(externalActorProjections).where(eq(externalActorProjections.id, fixture.actor.id));
+      assert.equal(profile.displayName, fixture.actor.displayName);
+      assert.equal(profile.externalActorId, "B_ALERT");
+    }
+  });
+}
+
+test("Slack text within the message character limit preserves multilingual content", async () => {
+  const fixture = await seedFixture("public", "slack");
+  const content = "中".repeat(15_000);
+  await enqueue(fixture, "unicode-message", payload(fixture, "1785758340.000010", null, content));
+  const result = await process(fixture, dependencies(fixture));
+  assert.equal(result.kind, "committed", JSON.stringify(result));
+  const [stored] = await fixture.db.select().from(messages);
+  assert.equal(stored.content, content);
+});
+
+test("durable Slack delivery survives a display-only actor refresh on the same binding", async () => {
+  const fixture = await seedFixture("public", "slack");
+  await enqueue(fixture, "durable-profile-refresh", payload(fixture, "provider-profile-refresh", null, "original body"));
+  await fixture.db.update(externalActorProjections).set({ displayName: "Refreshed Slack Name",
+    projectionRevision: fixture.actor.projectionRevision + 1, updatedAt: new Date(NOW.getTime() + 1_000) })
+    .where(eq(externalActorProjections.id, fixture.actor.id));
+  await enableTestSlackIngress();
+  const result = await processExternalInboundEventOnce({ db: fixture.db, leaseOwner: "durable-worker",
+    dependencies: dependencies(fixture), durableSlackMode: true, providerScope: "slack" });
+  assert.equal(result.kind, "committed");
+  const [message] = await fixture.db.select().from(messages).where(eq(messages.id, result.messageId!));
+  const [author] = await fixture.db.select().from(externalMessageAuthorFacts).where(eq(externalMessageAuthorFacts.messageId, result.messageId!));
+  assert.equal(message.content, "original body");
+  assert.equal(message.senderId, fixture.actor.id);
+  assert.equal(author.externalActorId, fixture.actor.externalActorId);
+  assert.equal(author.displayName, "Refreshed Slack Name");
+});
+
+test("durable Slack delivery retains ciphertext when its actor identity is no longer current", async () => {
+  const fixture = await seedFixture("public", "slack");
+  const admitted = await enqueue(fixture, "durable-actor-unavailable", payload(fixture, "provider-actor-unavailable", null, "retain body"));
+  await fixture.db.update(externalActorProjections).set({ state: "tombstoned" })
+    .where(eq(externalActorProjections.id, fixture.actor.id));
+  await enableTestSlackIngress();
+  const result = await processExternalInboundEventOnce({ db: fixture.db, leaseOwner: "durable-worker",
+    dependencies: dependencies(fixture), durableSlackMode: true, providerScope: "slack" });
+  assert.equal(result.kind, "blocked");
+  const [event] = await fixture.db.select().from(externalInboundEvents).where(eq(externalInboundEvents.id, admitted.event.id));
+  assert.equal(event.status, "queued");
+  assert.ok(event.encryptedPayload, "temporary identity uncertainty must not erase the message");
+  assert.equal((await fixture.db.select().from(messages)).length, 0);
+});
+
+test("a single unrecognized raw event does not block delivery of the surrounding messages", async () => {
+  const { enqueueSlackVerifiedIngress } = await import("./slackVerifiedIngressInbox");
+  const { sealSlackVerifiedIngress, openSlackVerifiedIngress } = await import("./slackVerifiedIngressCrypto");
+  const { processVerifiedSlackIngressOnce } = await import("./slackVerifiedIngressRuntime");
+  const { parseVerifiedSlackMessage } = await import("./slackVerifiedIngressNormalize");
+  const fixture = await seedFixture("public", "slack");
+  await enableTestSlackIngress();
+  // Use one coherent provider scope, as the durable raw worker requires.
+  await fixture.db.update(externalAppInstalls).set({ providerTeamId: fixture.actor.workspaceId,
+    providerAuthorityId: fixture.actor.workspaceId }).where(eq(externalAppInstalls.id, fixture.install.id));
+  const authority = { ...fixture.authority, providerAuthorityId: fixture.actor.workspaceId };
+  const providerAppId = fixture.install.providerAppId;
+  const key = Buffer.alloc(32, 9);
+  let clock = new Date(NOW);
+  for (const [id, subtype, text] of [["Ev_FIRST", undefined, "first body"],
+    ["Ev_BAD", "future_format", "held body"], ["Ev_LAST", undefined, "last body"]] as const) {
+    const aad = { purpose: "slack-verified-ingress" as const, version: 1 as const,
+      registrationId: authority.appRegistrationId, environment: authority.environment, providerAppId,
+      providerAuthorityId: authority.providerAuthorityId, providerConversationId: authority.providerConversationId,
+      providerEventId: id };
+    const bytes = Buffer.from(JSON.stringify({ type: "event_callback", api_app_id: providerAppId,
+      team_id: authority.providerAuthorityId, event_id: id, event: { type: "message", channel: authority.providerConversationId,
+        ...(subtype ? { subtype } : {}), user: fixture.actor.externalActorId, ts: id === "Ev_FIRST"
+          ? "1785758340.000001" : id === "Ev_BAD" ? "1785758341.000001" : "1785758342.000001", text } }));
+    await enqueueSlackVerifiedIngress({ db: fixture.db, aad, rawDigest: digest(bytes.toString("utf8")),
+      encryptedPayload: sealSlackVerifiedIngress({ bytes, key, aad }), envelopeKeyId: "test", now: clock,
+      validateEndpoint: async () => true });
+  }
+  const tick = () => processVerifiedSlackIngressOnce({ db: fixture.db, leaseOwner: "raw-worker", leaseMs: 5_000,
+    now: () => clock,
+    crypto: { async seal() { throw new Error("unused"); }, async open(input) {
+      return openSlackVerifiedIngress({ envelope: input.encryptedPayload, key, aad: input.aad });
+    } },
+    prepare: async (event) => {
+      const parsed = parseVerifiedSlackMessage(event);
+      if (!parsed) return { kind: "unrecognized" as const, reason: "unsupported_event_format" as const };
+      const plaintext = JSON.stringify({ schema: "external-inbound-normalized-event.v3", projectionId: fixture.actor.id,
+        actorProjectionRevision: fixture.actor.projectionRevision, externalActorId: fixture.actor.externalActorId,
+        providerMessageId: parsed.providerMessageId, providerThreadId: parsed.providerThreadId,
+        providerFileIds: parsed.providerFileIds, providerAgentMentions: parsed.providerAgentMentions,
+        content: parsed.content, createdAt: parsed.createdAt });
+      return { kind: "materialize" as const, authority, normalizedPayloadDigest: digest(plaintext),
+        encryptedPayload: plaintext, envelopeKeyId: "test", payloadSchemaVersion: 2 as const,
+        payloadExpiresAt: new Date(clock.getTime() + 60_000), validateCurrentAuthority: async () => true };
+    } });
+  const consume = () => processExternalInboundEventOnce({ db: fixture.db, leaseOwner: "normalized-worker", durableSlackMode: true,
+    dependencies: dependencies(fixture, { now: () => clock, runtime: authority }) });
+  assert.equal((await tick()).kind, "materialized");
+  assert.equal((await consume()).kind, "committed");
+  assert.equal((await tick()).kind, "empty", "settle the completed first head");
+  for (let n = 1; n <= 3; n++) {
+    assert.equal((await tick()).kind, n < 3 ? "deferred" : "held");
+    clock = new Date(clock.getTime() + 60_000);
+  }
+  assert.equal((await tick()).kind, "materialized");
+  assert.equal((await consume()).kind, "committed");
+  const delivered = await fixture.db.select().from(messages).where(eq(messages.channelId, fixture.channel.id));
+  assert.deepEqual(delivered.map(message => message.content), ["first body", "last body"]);
+  const held = await fixture.db.select().from(slackVerifiedIngressEvents)
+    .where(eq(slackVerifiedIngressEvents.providerEventId, "Ev_BAD"));
+  assert.equal(held[0]?.state, "held");
+  assert.ok(held[0]?.encryptedPayload);
+});
+
+test.each(["invalid_json", "invalid_envelope", "key_unavailable"] as const)("normalized event recovery distinguishes %s", async (corruption) => {
+  const { enqueueSlackVerifiedIngress } = await import("./slackVerifiedIngressInbox");
+  const { sealSlackVerifiedIngress, openSlackVerifiedIngress } = await import("./slackVerifiedIngressCrypto");
+  const { processVerifiedSlackIngressOnce } = await import("./slackVerifiedIngressRuntime");
+  const { replayHeldSlackIngress } = await import("./slackVerifiedIngressWorker");
+  const { parseVerifiedSlackMessage } = await import("./slackVerifiedIngressNormalize");
+  const { SlackNormalizedEnvelopeInvalid } = await import("./slackNormalizedPayloadError");
+  const fixture = await seedFixture("public", "slack");
+  await enableTestSlackIngress();
+  await fixture.db.update(externalAppInstalls).set({ providerTeamId: fixture.actor.workspaceId,
+    providerAuthorityId: fixture.actor.workspaceId }).where(eq(externalAppInstalls.id, fixture.install.id));
+  const authority = { ...fixture.authority, providerAuthorityId: fixture.actor.workspaceId };
+  const key = Buffer.alloc(32, 12);
+  let clock = new Date(NOW);
+  let retryBad: (() => ReturnType<typeof enqueueSlackVerifiedIngress>) | undefined;
+  for (const [id, text, ts] of [["Ev_BAD_NORMALIZED", "original bad body", "1785758340.000001"],
+    ["Ev_FOLLOWER", "following body", "1785758341.000001"]] as const) {
+    const aad = { purpose: "slack-verified-ingress" as const, version: 1 as const,
+      registrationId: authority.appRegistrationId, environment: authority.environment, providerAppId: fixture.install.providerAppId,
+      providerAuthorityId: authority.providerAuthorityId, providerConversationId: authority.providerConversationId, providerEventId: id };
+    const bytes = Buffer.from(JSON.stringify({ type: "event_callback", api_app_id: aad.providerAppId,
+      team_id: aad.providerAuthorityId, event_id: id, event: { type: "message", channel: aad.providerConversationId,
+        user: fixture.actor.externalActorId, ts, text } }));
+    const admit = () => enqueueSlackVerifiedIngress({ db: fixture.db, aad, rawDigest: digest(bytes.toString("utf8")),
+      encryptedPayload: sealSlackVerifiedIngress({ bytes, key, aad }), envelopeKeyId: "test", now: clock,
+      validateEndpoint: async () => true });
+    if (id === "Ev_BAD_NORMALIZED") retryBad = admit;
+    await admit();
+  }
+  let repaired = false;
+  const tick = () => processVerifiedSlackIngressOnce({ db: fixture.db, leaseOwner: "raw-worker", leaseMs: 5_000,
+    now: () => clock, crypto: { async seal() { throw new Error("unused"); }, async open(input) {
+      return openSlackVerifiedIngress({ envelope: input.encryptedPayload, key, aad: input.aad });
+    } }, prepare: async event => {
+      const parsed = parseVerifiedSlackMessage(event);
+      if (!parsed) return { kind: "unrecognized" as const, reason: "invalid_event_shape" as const };
+      const bad = parsed.content === "original bad body" && !repaired;
+      const plaintext = bad ? "invalid-normalized-json" : JSON.stringify({ schema: "external-inbound-normalized-event.v3",
+        projectionId: fixture.actor.id, actorProjectionRevision: fixture.actor.projectionRevision,
+        externalActorId: fixture.actor.externalActorId, providerMessageId: parsed.providerMessageId,
+        providerThreadId: parsed.providerThreadId, providerFileIds: parsed.providerFileIds,
+        providerAgentMentions: parsed.providerAgentMentions, content: parsed.content, createdAt: parsed.createdAt });
+      return { kind: "materialize" as const, authority, normalizedPayloadDigest: digest(plaintext), encryptedPayload: plaintext,
+        envelopeKeyId: "test", payloadSchemaVersion: 2 as const, payloadExpiresAt: new Date(clock.getTime() + 60_000),
+        validateCurrentAuthority: async () => true };
+    } });
+  const consume = () => processExternalInboundEventOnce({ db: fixture.db, leaseOwner: "normalized-worker",
+    durableSlackMode: true, dependencies: dependencies(fixture, { now: () => clock, runtime: authority,
+      decrypt: async input => {
+        if (corruption === "key_unavailable" && input.ciphertext === "invalid-normalized-json") {
+          throw new Error("temporary key service failure");
+        }
+        if (corruption === "invalid_envelope" && input.ciphertext === "invalid-normalized-json") {
+          throw new SlackNormalizedEnvelopeInvalid();
+        }
+        return input.ciphertext;
+      } }) });
+  if (corruption === "key_unavailable") {
+    assert.equal((await tick()).kind, "materialized");
+    const result = await consume();
+    assert.equal(result.kind, "blocked");
+    if (result.kind !== "blocked") throw new Error("expected blocked");
+    assert.equal(result.reason, "payload_decrypt_failed");
+    await tick();
+    const [waiting] = await fixture.db.select().from(slackVerifiedIngressEvents)
+      .where(eq(slackVerifiedIngressEvents.providerEventId, "Ev_BAD_NORMALIZED"));
+    assert.equal(waiting?.state, "materialized");
+    assert.ok(waiting?.encryptedPayload, "an unavailable key must preserve FIFO custody, not isolate");
+    return;
+  }
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    assert.equal((await tick()).kind, "materialized");
+    assert.equal((await consume()).kind, "blocked");
+    assert.equal((await tick()).kind, "empty", "raw worker settles the failed normalized head");
+    clock = new Date(clock.getTime() + 60_000);
+  }
+  const [held] = await fixture.db.select().from(slackVerifiedIngressEvents)
+    .where(eq(slackVerifiedIngressEvents.providerEventId, "Ev_BAD_NORMALIZED"));
+  assert.equal(held?.state, "quarantined"); assert.ok(held?.encryptedPayload);
+  assert.equal(held?.lastIsolationReason, "normalized_payload_invalid");
+  const duplicate = await retryBad!();
+  assert.equal(duplicate.kind, "receipt");
+  if (duplicate.kind !== "receipt") throw new Error("expected retained receipt");
+  assert.equal(duplicate.id, held!.id, "a signed retry acknowledges the already retained receipt");
+  assert.equal(duplicate.duplicate, true);
+  assert.equal((await tick()).kind, "materialized");
+  assert.equal((await consume()).kind, "committed", "a later normal event must not be blocked by the isolated row");
+  assert.equal((await tick()).kind, "empty", "finish the follower before replay");
+  repaired = true;
+  assert.equal(await replayHeldSlackIngress({ db: fixture.db, partitionId: held!.partitionId, eventId: held!.id,
+    now: () => clock, authorize: async () => ({ kind: "human" as const, id: "test-operator" }) }), true);
+  assert.equal((await tick()).kind, "materialized");
+  assert.equal((await consume()).kind, "committed");
+  const delivered = await fixture.db.select().from(messages).where(eq(messages.channelId, fixture.channel.id));
+  assert.deepEqual(delivered.map(message => message.content).sort(), ["following body", "original bad body"].sort());
+  assert.equal(delivered.find(message => message.content === "original bad body")?.createdAt.toISOString(),
+    new Date(1785758340 * 1000).toISOString());
+  const [replayed] = await fixture.db.select().from(slackVerifiedIngressEvents)
+    .where(eq(slackVerifiedIngressEvents.id, held!.id));
+  assert.equal(replayed?.replayCount, 1); assert.ok(replayed?.lastReplayedAt);
+  assert.equal(replayed?.lastIsolationReason, "normalized_payload_invalid");
+});
+
+test("verified attachment by a departed human downloads and commits without restoring the sender", async () => {
+  const { enqueueSlackVerifiedIngress } = await import("./slackVerifiedIngressInbox");
+  const { sealSlackVerifiedIngress, openSlackVerifiedIngress } = await import("./slackVerifiedIngressCrypto");
+  const { processVerifiedSlackIngressOnce } = await import("./slackVerifiedIngressRuntime");
+  const fixture = await seedFixture("public", "slack");
+  await enableTestSlackIngress();
+  await fixture.db.update(externalAppInstalls).set({ providerTeamId: fixture.actor.workspaceId,
+    providerAuthorityId: fixture.actor.workspaceId }).where(eq(externalAppInstalls.id, fixture.install.id));
+  const authority = { ...fixture.authority, providerAuthorityId: fixture.actor.workspaceId };
+  const aad = { purpose: "slack-verified-ingress" as const, version: 1 as const, registrationId: authority.appRegistrationId,
+    environment: authority.environment, providerAppId: fixture.install.providerAppId, providerAuthorityId: authority.providerAuthorityId,
+    providerConversationId: authority.providerConversationId, providerEventId: "Ev_DEPARTED_FILE" };
+  const event = { type: "event_callback", api_app_id: aad.providerAppId, team_id: aad.providerAuthorityId,
+    event_id: aad.providerEventId, event: { type: "message", channel: aad.providerConversationId,
+      user: fixture.actor.externalActorId, ts: "1785758340.000001", text: "file from earlier", files: [{ id: "F_LEFT" }] } };
+  const bytes = Buffer.from(JSON.stringify(event)); const key = Buffer.alloc(32, 4);
+  await enqueueSlackVerifiedIngress({ db: fixture.db, aad, rawDigest: digest(bytes.toString("utf8")),
+    encryptedPayload: sealSlackVerifiedIngress({ bytes, key, aad }), envelopeKeyId: "test", now: NOW,
+    validateEndpoint: async () => true });
+  await fixture.db.update(externalActorProjections).set({ state: "tombstoned", deactivated: true })
+    .where(eq(externalActorProjections.id, fixture.actor.id));
+  const plaintext = JSON.stringify({ schema: "external-inbound-normalized-event.v3", projectionId: fixture.actor.id,
+    actorProjectionRevision: fixture.actor.projectionRevision, externalActorId: fixture.actor.externalActorId,
+    providerMessageId: "1785758340.000001", providerThreadId: null, providerFileIds: ["F_LEFT"],
+    providerAgentMentions: [], content: "file from earlier", createdAt: new Date(1785758340 * 1000).toISOString() });
+  const raw = await processVerifiedSlackIngressOnce({ db: fixture.db, leaseOwner: "left-file-raw", leaseMs: 30_000,
+    now: () => NOW, scope: { registrationId: aad.registrationId, environment: aad.environment },
+    crypto: { async seal() { throw new Error("unused"); }, async open(input) {
+      return openSlackVerifiedIngress({ envelope: input.encryptedPayload, key, aad: input.aad });
+    } }, prepare: async () => ({ kind: "materialize" as const, authority, normalizedPayloadDigest: digest(plaintext),
+      encryptedPayload: plaintext, envelopeKeyId: "test", payloadSchemaVersion: 2 as const,
+      payloadExpiresAt: new Date(NOW.getTime() + 60_000), validateCurrentAuthority: async () => true }) });
+  assert.equal(raw.kind, "materialized");
+  let inboundClock = NOW;
+  const consume = () => processExternalInboundEventOnce({ db: fixture.db, leaseOwner: "left-file-inbound", durableSlackMode: true,
+    dependencies: dependencies(fixture, { now: () => inboundClock, runtime: authority }) });
+  const waiting = await consume(); assert.equal(waiting.kind, "blocked");
+  if (waiting.kind !== "blocked") throw new Error("expected file wait");
+  assert.equal(waiting.reason, "attachment_transfer_pending");
+  const harness = await createInboundFileHarness(fixture);
+  assert.equal((await harness.processTransfer("left-file-metadata", NOW)).kind, "metadata_ready");
+  assert.equal((await harness.processTransfer("left-file-store", NOW)).kind, "stored");
+  inboundClock = new Date(NOW.getTime() + 60_000);
+  assert.equal((await consume()).kind, "committed");
+  assert.equal(harness.counters().downloads, 1);
+  const [actor] = await fixture.db.select().from(externalActorProjections).where(eq(externalActorProjections.id, fixture.actor.id));
+  assert.equal(actor.state, "tombstoned"); assert.equal(actor.deactivated, true);
+});
+
+test("a verified queued edit by a departed human updates only their original message", async () => {
+  const { enqueueSlackVerifiedIngress } = await import("./slackVerifiedIngressInbox");
+  const { sealSlackVerifiedIngress, openSlackVerifiedIngress } = await import("./slackVerifiedIngressCrypto");
+  const { processVerifiedSlackIngressOnce } = await import("./slackVerifiedIngressRuntime");
+  const fixture = await seedFixture("public", "slack");
+  await fixture.db.update(externalAppInstalls).set({ providerTeamId: fixture.actor.workspaceId,
+    providerAuthorityId: fixture.actor.workspaceId }).where(eq(externalAppInstalls.id, fixture.install.id));
+  fixture.authority.providerAuthorityId = fixture.actor.workspaceId;
+  await enqueue(fixture, "original-before-left", payload(fixture, "1785758340.000001", null, "original text"));
+  const original = await process(fixture, dependencies(fixture));
+  assert.equal(original.kind, "committed");
+  await enableTestSlackIngress();
+  const authority = fixture.authority;
+  const aad = { purpose: "slack-verified-ingress" as const, version: 1 as const, registrationId: authority.appRegistrationId,
+    environment: authority.environment, providerAppId: fixture.install.providerAppId, providerAuthorityId: authority.providerAuthorityId,
+    providerConversationId: authority.providerConversationId, providerEventId: "Ev_DEPARTED_EDIT" };
+  const event = { type: "event_callback", api_app_id: aad.providerAppId, team_id: aad.providerAuthorityId, event_id: aad.providerEventId,
+    event: { type: "message", subtype: "message_changed", channel: aad.providerConversationId, event_ts: "1785758400.000002",
+      message: { user: fixture.actor.externalActorId, ts: "1785758340.000001", text: "edited before leaving", edited: { ts: "1785758400.000002" } } } };
+  const bytes = Buffer.from(JSON.stringify(event)); const key = Buffer.alloc(32, 4);
+  await enqueueSlackVerifiedIngress({ db: fixture.db, aad, rawDigest: digest(bytes.toString("utf8")),
+    encryptedPayload: sealSlackVerifiedIngress({ bytes, key, aad }), envelopeKeyId: "test", now: NOW,
+    validateEndpoint: async () => true });
+  await fixture.db.update(externalActorProjections).set({ state: "tombstoned", deactivated: true })
+    .where(eq(externalActorProjections.id, fixture.actor.id));
+  const plaintext = JSON.stringify(editPayload(fixture, "1785758340.000001", "1785758400.000002", "edited before leaving"));
+  const raw = await processVerifiedSlackIngressOnce({ db: fixture.db, leaseOwner: "left-edit-raw", leaseMs: 30_000,
+    now: () => NOW, scope: { registrationId: aad.registrationId, environment: aad.environment },
+    crypto: { async seal() { throw new Error("unused"); }, async open(input) {
+      return openSlackVerifiedIngress({ envelope: input.encryptedPayload, key, aad: input.aad });
+    } }, prepare: async () => ({ kind: "materialize" as const, authority, normalizedPayloadDigest: digest(plaintext),
+      encryptedPayload: plaintext, envelopeKeyId: "test", payloadSchemaVersion: 4 as const,
+      payloadExpiresAt: new Date(NOW.getTime() + 60_000), validateCurrentAuthority: async () => true }) });
+  assert.equal(raw.kind, "materialized");
+  const inboxBefore = await fixture.db.select().from(inboxNotificationFacts);
+  const result = await processExternalInboundEventOnce({ db: fixture.db, leaseOwner: "left-edit", durableSlackMode: true,
+    dependencies: dependencies(fixture, { now: () => NOW, runtime: authority }) });
+  assert.equal(result.kind, "committed");
+  const [message] = await fixture.db.select().from(messages);
+  assert.equal(message.content, "edited before leaving");
+  assert.deepEqual(await fixture.db.select().from(inboxNotificationFacts), inboxBefore);
+  const [actor] = await fixture.db.select().from(externalActorProjections).where(eq(externalActorProjections.id, fixture.actor.id));
+  assert.equal(actor.state, "tombstoned"); assert.equal(actor.deactivated, true);
 });

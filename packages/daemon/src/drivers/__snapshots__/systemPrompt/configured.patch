@@ -15,11 +15,11 @@
 +- Daemon: v1.0.0
 +- Workspace: /example/workspace
 +
-@@ -48,0 +60,1 @@
+@@ -50,0 +62,1 @@
 +- Example runtime restriction.
-@@ -53,0 +66,1 @@
+@@ -55,0 +68,1 @@
 +0. If this system prompt contains a **Runtime Profile Control** section, read that notice first. It is informational only; no runtime control action or chat reply is required. Do not read MEMORY.md, check messages, or respond to inbox messages before reading it.
-@@ -59,0 +73,8 @@
+@@ -61,0 +75,8 @@
 +## Runtime Profile Control
 +
 +This section is a trusted daemon release notice. Read it before normal startup work; it does not require a runtime control action, chat reply, or migration acknowledgment.
@@ -28,7 +28,7 @@
 +
 +Daemon updated from 1.0.0 to 1.0.1.
 +
-@@ -287,1 +308,4 @@
+@@ -298,1 +319,4 @@
 -- Keep MEMORY.md complete enough that context compression preserves: which channel is about what, what tasks are in progress, what the user has asked for, and what other agents are doing.
 \ No newline at end of file
 +- Keep MEMORY.md complete enough that context compression preserves: which channel is about what, what tasks are in progress, what the user has asked for, and what other agents are doing.

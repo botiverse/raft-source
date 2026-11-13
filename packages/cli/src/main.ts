@@ -20,15 +20,18 @@
 //   raft thread unfollow --target "#name:shortid"
 //   raft manual get <topic>
 //   raft manual search <keywords>
-//   raft inbox check
-//   raft message send/check/read/search/resolve/react
+//   raft context search/read
+//   raft inbox check/read/dismiss
+//   raft message send/check/read/search/resolve/react/update-card
 //   raft attachment upload/view
 //   raft task list/create/claim/unclaim/assign/unassign/update/amend/history/convert/delete
 //   raft mention pending/notify/invite
 //   raft profile show/update
 //   raft integration list/marketplace/login/env/invoke/app prepare|rotate-secret|update|transfer-owner
-//   raft reminder schedule/list/cancel/snooze/update/log
-//   raft action prepare
+//   raft reminder schedule/list/cancel/snooze/update/log/trigger
+//   raft action prepare/withdraw
+//   raft migration retry
+//   raft proc start/list/logs/stop
 
 import { CliError } from "./core/errors";
 import { defaultCliIo } from "./core/io";

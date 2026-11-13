@@ -1,13 +1,10 @@
 import { Button, Popover, PopoverTrigger, PopoverContent } from "@botiverse/raft-ui";
 import Tooltip from "../ui/Tooltip";
-import { useOptionalAppTheme } from "../../hooks/useAppTheme";
-import { useCallback, useEffect, useState } from "react";
-import type { ComponentType } from "react";
+import { DeferredEmojiPickerPanel as EmojiPickerPanel } from "../ui/PickerPanelDeferred";
+import { useCallback, useState } from "react";
 import type { PickerProps } from "emoji-picker-react";
 import { SmilePlus, X } from "lucide-react";
 import { useIntl } from "react-intl";
-
-const PICKER_PREVIEW_CONFIG: PickerProps["previewConfig"] = { showPreview: false };
 
 export default function SidebarSectionEmojiPicker({
   value,
@@ -18,39 +15,17 @@ export default function SidebarSectionEmojiPicker({
 }) {
   const { formatMessage } = useIntl();
   const [open, setOpen] = useState(false);
-  const [EmojiPicker, setEmojiPicker] = useState<ComponentType<PickerProps> | null>(null);
-  const appTheme = useOptionalAppTheme();
   const handleEmojiClick = useCallback<NonNullable<PickerProps["onEmojiClick"]>>((emojiData) => {
     onChange(emojiData.emoji);
     setOpen(false);
   }, [onChange]);
-
-  useEffect(() => {
-    if (!open || EmojiPicker) return;
-    let cancelled = false;
-
-    void import("emoji-picker-react").then((module) => {
-      // Vite unwraps the package's CommonJS compatibility wrapper, while the
-      // repository's direct Node DOM runner exposes another `.default` layer.
-      const candidate = module.default as unknown;
-      const component = (
-        (candidate as { default?: ComponentType<PickerProps> }).default
-        ?? candidate
-      ) as ComponentType<PickerProps>;
-      if (!cancelled) setEmojiPicker(() => component);
-    });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [EmojiPicker, open]);
 
   return (
     <Popover open={open} onOpenChange={setOpen}>
       <Tooltip content={formatMessage({ id: value ? "layout.sidebar.changeEmoji" : "layout.sidebar.chooseEmoji" })}>
         <PopoverTrigger
           render={(
-            <Button type="button" variant="ghost" size="icon-sm"
+            <Button type="button" variant="ghost" size="icon-md"
               aria-label={value
                 ? formatMessage({ id: "layout.sidebar.changeSectionEmojiAria" }, { emoji: value })
                 : formatMessage({ id: "layout.sidebar.chooseSectionEmoji" })}
@@ -66,7 +41,7 @@ export default function SidebarSectionEmojiPicker({
           align="start"
           role="dialog"
           aria-label={formatMessage({ id: "layout.sidebar.chooseSectionEmoji" })}
-          className="z-[70] p-0"
+          className="p-0"
         >
           {value && (
             <button
@@ -75,26 +50,13 @@ export default function SidebarSectionEmojiPicker({
                 onChange("");
                 setOpen(false);
               }}
-              className="flex h-9 w-full items-center justify-center gap-2 border-b border-line-hairline bg-layer-popover px-3 font-sans text-callout font-medium text-foreground outline-none transition-colors hover:bg-brand-soft focus-visible:bg-brand-soft"
+              className="flex h-option w-full items-center justify-center gap-2 border-b border-line-hairline bg-layer-popover px-3 font-sans text-callout font-medium text-foreground outline-none transition-colors hover:bg-brand-soft focus-visible:bg-brand-soft"
             >
               <X size={14} aria-hidden />
-              {formatMessage({ id: "layout.sidebar.noEmoji" })}
+              {formatMessage({ id: "layout.sidebar.removeEmoji" })}
             </button>
           )}
-          {EmojiPicker ? (
-            <EmojiPicker
-              width="min(340px, calc(100vw - 48px))"
-              height={360}
-              theme={(appTheme?.resolvedMode === "dark" ? "dark" : "light") as PickerProps["theme"]}
-              lazyLoadEmojis
-              previewConfig={PICKER_PREVIEW_CONFIG}
-              onEmojiClick={handleEmojiClick}
-            />
-          ) : (
-            <div role="status" className="flex h-24 w-[min(340px,calc(100vw-48px))] items-center justify-center font-sans text-callout text-foreground-hint">
-              {formatMessage({ id: "layout.sidebar.loadingEmoji" })}
-            </div>
-          )}
+          <EmojiPickerPanel onEmojiClick={handleEmojiClick} />
         </PopoverContent>
       )}
     </Popover>

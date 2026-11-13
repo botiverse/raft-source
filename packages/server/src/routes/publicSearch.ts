@@ -5,7 +5,7 @@ import {
   PUBLIC_SERVER_SEARCH_INDEX_FEATURE_FLAG_KEY,
 } from "@botiverse/raft-shared";
 import { getDb } from "../db/index";
-import { isStoredServerScopedAvatarUrl, isStoredUserAvatarUrl } from "../services/avatarService";
+import { isShownUserAvatarUrl, isStoredServerScopedAvatarUrl } from "../services/avatarService";
 import { evaluateFeatureFlags } from "../services/featureFlagService";
 
 /**
@@ -231,13 +231,13 @@ interface SenderRow {
   agentAvatarUrl: string | null;
 }
 
-/** Display name and a stored-upload avatar only — the guest view's rule. No id, no handle. */
+/** Display name and a stored-upload (or built pixel) avatar only — the guest view's rule. No id, no handle. */
 function projectSender(row: SenderRow, serverId: string) {
   return {
     type: row.senderType === "user" ? "user" as const : row.senderType === "agent" ? "agent" as const : "external" as const,
     displayName: row.senderName,
     avatarUrl: row.senderType === "user"
-      ? (isStoredUserAvatarUrl(row.userAvatarUrl) ? row.userAvatarUrl : null)
+      ? (isShownUserAvatarUrl(row.userAvatarUrl) ? row.userAvatarUrl : null)
       : row.senderType === "agent"
         ? (isStoredServerScopedAvatarUrl(row.agentAvatarUrl, serverId) ? row.agentAvatarUrl : null)
         : null,

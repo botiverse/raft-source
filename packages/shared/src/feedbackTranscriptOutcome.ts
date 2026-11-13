@@ -19,7 +19,7 @@
 export const FEEDBACK_TRANSCRIPT_CONTENT_KINDS = [
   /** The runtime's own session file (a conversation log). */
   "native_session_file",
-  /** The runtime's own STATE file (e.g. kimi-sdk state.json): not necessarily a conversation. */
+  /** The runtime's own STATE file (e.g. the legacy kimi CLI's state.json): not necessarily a conversation. */
   "native_state_file",
   /** The daemon-written workspace handoff file. NEVER uploaded as a transcript. */
   "placeholder",
@@ -41,7 +41,8 @@ export function isFeedbackTranscriptUploadableContentKind(value: unknown): value
  * - no_config_in_memory: neither a live process nor a restart snapshot for the
  *   agent is in this daemon's memory. Says nothing about where the agent ran;
  *   `workspaceDirPresent` reports what the local directory lookup saw.
- * - no_session_id: a config is in memory but no session id is bound to it.
+ * - no_session_id: a config is known (in memory, or the server's copy sent
+ *   with the request) but no session id is bound to it.
  * - runtime_has_no_native_lookup: this daemon has no lookup for the runtime's
  *   own session files (cursor, gemini, copilot, opencode today).
  * - native_session_file_not_found: the lookup ran (see lookupMethod) and
@@ -106,7 +107,10 @@ export interface FeedbackTranscriptLookupOutcome {
   runtime: string | null;
   lookupMethod: FeedbackTranscriptLookupMethod | null;
   workspaceDirPresent: boolean | null;
-  /** Size of the source file on disk at read time. */
+  /**
+   * Size of the source file at read time: its size on disk, or for a
+   * compressed file (a codex `.jsonl.zst` rollout) its decompressed size.
+   */
   sourceBytes: number | null;
   /**
    * Uncompressed bytes kept for upload, after windowing and redaction. A
@@ -129,6 +133,34 @@ export interface FeedbackTranscriptUploadOutcome {
   uploadId: string | null;
   /** Whether the server echoed the content label into the signed claims. */
   contentLabel: (typeof FEEDBACK_TRANSCRIPT_CONTENT_LABELS)[number] | null;
+}
+
+/**
+ * What the reporter is told about the session record, from the Computer's
+ * typed upload outcome:
+ * - attached: the worker stored it.
+ * - not_attached: every other typed outcome. Why is not said: `not_attempted`
+ *   with `lookup_failed` covers a Computer that found no record, but also one
+ *   that declined to look, could not read the file, or failed while looking,
+ *   and a failed upload is no different to the reporter.
+ */
+export const FEEDBACK_SESSION_RECORD_ANSWERS = ["attached", "not_attached"] as const;
+export type FeedbackSessionRecordAnswer = (typeof FEEDBACK_SESSION_RECORD_ANSWERS)[number];
+
+export function isFeedbackSessionRecordAnswer(value: unknown): value is FeedbackSessionRecordAnswer {
+  return typeof value === "string" && (FEEDBACK_SESSION_RECORD_ANSWERS as readonly string[]).includes(value);
+}
+
+/**
+ * Null when the Computer gave no typed outcome (an older Computer): nothing is
+ * known, so nothing is claimed.
+ */
+export function feedbackSessionRecordAnswer(outcome: {
+  outcomeVersion?: 1;
+  upload?: FeedbackTranscriptUploadOutcome;
+}): FeedbackSessionRecordAnswer | null {
+  if (outcome.outcomeVersion !== 1 || !outcome.upload) return null;
+  return outcome.upload.status === "stored" ? "attached" : "not_attached";
 }
 
 /**

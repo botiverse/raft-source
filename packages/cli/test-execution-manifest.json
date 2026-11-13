@@ -3,8 +3,8 @@
   "package": "@botiverse/raft",
   "runner": "vitest run",
   "testFileGlob": "src/**/*.test.ts",
-  "fileCount": 127,
-  "total": 1211,
+  "fileCount": 160,
+  "total": 1666,
   "files": [
     {
       "file": "src/agentApiNoBypass.test.ts",
@@ -128,7 +128,7 @@
     },
     {
       "file": "src/agentLogin/deviceAuthClient.test.ts",
-      "count": 7,
+      "count": 9,
       "cases": [
         {
           "name": "runDeviceCodeLogin drives authorize → onUserAction → token poll"
@@ -140,16 +140,22 @@
           "name": "runDeviceCodeLogin throws on device_login_disabled (authorize-side 404)"
         },
         {
-          "name": "authorizeDeviceCode returns the handle + absolutized verificationUriComplete"
+          "name": "authorizeDeviceCode returns the handle + absolutized verificationUri, never a link with the code in it"
         },
         {
-          "name": "runDeviceCodeLogin surfaces verificationUriComplete to onUserAction"
+          "name": "runDeviceCodeLogin hands onUserAction the approval page and the code to type, not a pre-filled link"
         },
         {
           "name": "pollDeviceToken resumes polling with a device_code and returns the session"
         },
         {
           "name": "pollDeviceToken throws expired_token once the deadline passes"
+        },
+        {
+          "name": "authorizeDeviceCode sends an agent_key grant only when asked for one"
+        },
+        {
+          "name": "pollAgentKey returns the agent key, reads a session only from an older server's non-grant answer, and refuses anything else"
         }
       ]
     },
@@ -290,13 +296,16 @@
     },
     {
       "file": "src/ax/commandGuidance.test.ts",
-      "count": 17,
+      "count": 19,
       "cases": [
         {
           "name": "C1 first use: nothing executes, not-executed line first, guidance, equivalent command, GUIDANCE_DELIVERED"
         },
         {
           "name": "C2 an unchanged re-run executes"
+        },
+        {
+          "name": "each guided run leaves one cli.guidance.decision span: the hold, then the re-run, with the same args hash and context (#wg-ax:#25)"
         },
         {
           "name": "C3 a new context, and C4 a changed guidance text, each hold once more"
@@ -342,6 +351,9 @@
         },
         {
           "name": "a pre-release observations table without context_id gains the column and reads as not delivered"
+        },
+        {
+          "name": "held and attached guidance is counted for the daemon's turn report; --help and plain runs are not"
         }
       ]
     },
@@ -370,11 +382,32 @@
       ]
     },
     {
+      "file": "src/client.launchLifecycle.test.ts",
+      "count": 4,
+      "cases": [
+        {
+          "name": "RAFT_CLI_ENTRY=stable_entry marks a managed context, and only that value"
+        },
+        {
+          "name": "the stable entry names itself to the proxy; a launch wrapper does not"
+        },
+        {
+          "name": "LAUNCH_SUPERSEDED from the proxy is one envelope for every command"
+        },
+        {
+          "name": "a self-hosted CLI never reads a Server answer as a proxy lifecycle refusal"
+        }
+      ]
+    },
+    {
       "file": "src/client.test.ts",
-      "count": 25,
+      "count": 29,
       "cases": [
         {
           "name": "ApiClient marks requests as slock CLI traffic"
+        },
+        {
+          "name": "ApiClient declares it can post plan:upgrade cards on JSON and multipart requests (an upload's Free-limit refusal hints the card only then)"
         },
         {
           "name": "ApiClient rewrites supported legacy paths when using sk_agent credential"
@@ -389,7 +422,13 @@
           "name": "ApiClient follows one HTTPS attachment redirect without forwarding Raft credentials"
         },
         {
+          "name": "ApiClient sends a proxied attachment redirect through the package fetch with its dispatcher"
+        },
+        {
           "name": "ApiClient fails closed on expired or unapproved attachment redirects without exposing the signed URL"
+        },
+        {
+          "name": "ApiClient keeps a binary route's JSON refusal body and its step, as the JSON path does"
         },
         {
           "name": "ApiClient scrubs a signed object URL from attachment transport traces and errors"
@@ -411,6 +450,9 @@
         },
         {
           "name": "ApiClient preserves server code and suggested next action from error bodies"
+        },
+        {
+          "name": "ApiClient reads a contract-shaped error's message when it has no error field"
         },
         {
           "name": "ApiClient surfaces invalid JSON responses instead of returning null data"
@@ -461,7 +503,7 @@
           "name": "a redirect is re-sent through fetch, which follows it as before"
         },
         {
-          "name": "with an HTTP proxy configured, the request stays on fetch with the proxy dispatcher"
+          "name": "with an HTTP proxy configured, the request goes to the package fetch with the proxy dispatcher"
         },
         {
           "name": "https honours NODE_EXTRA_CA_CERTS (self-signed CA)"
@@ -469,9 +511,42 @@
       ]
     },
     {
-      "file": "src/commands/action/prepare.test.ts",
-      "count": 21,
+      "file": "src/clientRawBody.test.ts",
+      "count": 2,
       "cases": [
+        {
+          "name": "requestRawBody PUTs the bytes as octet-stream with the agent's auth; 204 is ok"
+        },
+        {
+          "name": "a refusal keeps its code and its whole body (details) as errorBody"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/action/prepare.test.ts",
+      "count": 30,
+      "cases": [
+        {
+          "name": "raft action prepare sends a card type this CLI does not know to the Server as written"
+        },
+        {
+          "name": "raft action prepare: a question card says whom it asks, where the answers arrive, when it expires and how to withdraw it"
+        },
+        {
+          "name": "raft action prepare prints the Server's refusal of a card: its sentence, code, Retryable: no and next action"
+        },
+        {
+          "name": "raft action prepare shows any code the Server refuses with, as it sent it (an upgrade card's cooldown)"
+        },
+        {
+          "name": "raft action prepare: a question card's two limits read apart — the hourly one is retryable after its wait, the per-conversation one is not"
+        },
+        {
+          "name": "raft action prepare over the write budget (429 RATE_LIMITED): retryable, how long to wait, the same command again"
+        },
+        {
+          "name": "raft action prepare refuses JSON without a card type before sending anything"
+        },
         {
           "name": "resolveActionInput parses well-formed channel:create JSON"
         },
@@ -534,6 +609,42 @@
         },
         {
           "name": "actionCardActionSchema drops an agent-prefilled runtime on agent:create; a model needs hosting antiproton"
+        },
+        {
+          "name": "raft action prepare --help: its question:ask examples are valid cards, piped through a heredoc; the second is a confirm card (one option)"
+        },
+        {
+          "name": "question:ask: a question of one option is a valid card; none, or one with Other…, is not"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/action/withdraw.test.ts",
+      "count": 8,
+      "cases": [
+        {
+          "name": "raft action withdraw: withdrawn — the receipt names the card and who can no longer answer it; the id goes as given"
+        },
+        {
+          "name": "raft action withdraw: already withdrawn — exit 0, nothing changed"
+        },
+        {
+          "name": "raft action withdraw --json: the state, the full message id and the card's metadata"
+        },
+        {
+          "name": "raft action withdraw: answered first — the answers on stdout as the result reply lists them, ALREADY_ANSWERED on stderr, exit 1"
+        },
+        {
+          "name": "raft action withdraw: expired — says it expired unanswered, QUESTION_EXPIRED, exit 1"
+        },
+        {
+          "name": "raft action withdraw: another agent's card, no such card, a prefix of two — the Server's sentence and its next step, exit 1"
+        },
+        {
+          "name": "raft action withdraw: --message is required; nothing is sent without it"
+        },
+        {
+          "name": "raft action withdraw: an id under 8 or over 64 characters is refused before sending, with the next step"
         }
       ]
     },
@@ -548,13 +659,13 @@
           "name": "formatAlreadyLoggedIn matches pre-move login.ts bytes"
         },
         {
-          "name": "formatCredentialRemintNotice matches pre-move login.ts bytes"
-        },
-        {
-          "name": "bridge diagnostics match pre-move bridge.ts bytes"
-        },
-        {
           "name": "formatVerificationHandoff matches the pre-move inline list.ts bytes (both variants)"
+        },
+        {
+          "name": "login report names what became of the previous key in one line before the Next lines"
+        },
+        {
+          "name": "logout copy"
         }
       ]
     },
@@ -629,7 +740,7 @@
     },
     {
       "file": "src/commands/agent/list.test.ts",
-      "count": 4,
+      "count": 3,
       "cases": [
         {
           "name": "describeListResult: ok includes the next CLI command with serverUrl interpolated"
@@ -638,16 +749,13 @@
           "name": "describeListResult: no_manageable_server points at credential authority recovery"
         },
         {
-          "name": "describeListResult: no_agents_on_manageable_servers tells the operator to create an agent"
-        },
-        {
           "name": "describeListResult: every reason returns non-empty copy (contract — CLI must always have a next step)"
         }
       ]
     },
     {
       "file": "src/commands/agent/login.test.ts",
-      "count": 23,
+      "count": 35,
       "cases": [
         {
           "name": "authorized login report gives both audiences an executable Manual next step"
@@ -717,15 +825,72 @@
         },
         {
           "name": "login wait sends the profile's previous credential as replacesCredentialId (rotation)"
+        },
+        {
+          "name": "login start asks the server for an agent_key grant for the requested agent"
+        },
+        {
+          "name": "login wait saves the key an agent_key grant returns, with no session and no mint"
+        },
+        {
+          "name": "login wait refuses a key for a different agent and leaves the profile unchanged"
+        },
+        {
+          "name": "login wait on denied saves nothing"
+        },
+        {
+          "name": "login wait on expired saves nothing"
+        },
+        {
+          "name": "login wait on malformed key answer saves nothing"
+        },
+        {
+          "name": "login wait revokes the previous key with that key, after the new key is saved"
+        },
+        {
+          "name": "login wait keeps the new key and asks the user to revoke the previous one on an older server without the route (404)"
+        },
+        {
+          "name": "login wait keeps the new key and asks the user to revoke the previous one on a server error (500)"
+        },
+        {
+          "name": "login wait keeps the new key and asks the user to revoke the previous one on a key that cannot revoke itself (403)"
+        },
+        {
+          "name": "login wait keeps the new key and asks the user to revoke the previous one on a dropped connection"
+        },
+        {
+          "name": "login wait says the previous key was already not active when self-revoke answers 401"
         }
       ]
     },
     {
-      "file": "src/commands/app/_format.test.ts",
-      "count": 1,
+      "file": "src/commands/agent/logout.test.ts",
+      "count": 8,
       "cases": [
         {
-          "name": "formatAppConfig matches pre-move config.ts bytes"
+          "name": "logout removes the credential file once the key is revoked (200)"
+        },
+        {
+          "name": "logout removes the credential file once the key is already not active (401)"
+        },
+        {
+          "name": "logout keeps the credential file and names the next step on a server error (500)"
+        },
+        {
+          "name": "logout keeps the credential file and names the next step on a dropped connection"
+        },
+        {
+          "name": "logout keeps the credential file and names the next step on an older server without the route (404)"
+        },
+        {
+          "name": "logout keeps the credential file and names the next step on a key that cannot revoke itself (403)"
+        },
+        {
+          "name": "logout with no credential file says there is nothing to log out and calls nothing"
+        },
+        {
+          "name": "logout without a selected profile refuses and names the profile flag"
         }
       ]
     },
@@ -751,6 +916,345 @@
       ]
     },
     {
+      "file": "src/commands/artifact/artifact.test.ts",
+      "count": 15,
+      "cases": [
+        {
+          "name": "read: a link is parsed to its id (and pinned version) before it is sent; the text comes from the shared formatter"
+        },
+        {
+          "name": "read: a link (or a bare id) with the short id is the same Artifact, sent as its pt_ id, so an older Server reads it too"
+        },
+        {
+          "name": "read: no artifact, an unrecognised link and a bad --rev fail before any request, each with what to do"
+        },
+        {
+          "name": "read: the Server's NOT_VISIBLE and ARTIFACTS_NOT_ENABLED become their own codes with a next step"
+        },
+        {
+          "name": "list: target and paging go to the query"
+        },
+        {
+          "name": "comments: path and --all go to the query; a path with .. is refused without a request"
+        },
+        {
+          "name": "download: one encoded path segment, bytes written as they are, receipt names the file"
+        },
+        {
+          "name": "argv: read with --artifact, --rev and --files reaches the request and the text"
+        },
+        {
+          "name": "argv: comments sends --path, --all and --cursor"
+        },
+        {
+          "name": "argv: a CLI too old for Artifacts prints the Server's sentence (how to upgrade) under its code, not retryable"
+        },
+        {
+          "name": "argv: download writes the file; the Server's FILE_NOT_FOUND on the binary route keeps its code"
+        },
+        {
+          "name": "download: a binary route's refusal reaches the operations whole, so a code without local wording shows the Server's sentence and step"
+        },
+        {
+          "name": "argv: download --image saves a comment's image as it is and says its type and size; not with a path; IMAGE_NOT_FOUND points at the comments"
+        },
+        {
+          "name": "argv: list --query sends the query and prints where each matched, the next page and the top result"
+        },
+        {
+          "name": "pull: an artifact with no version yet is refused with its title on one line"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/artifact/check.test.ts",
+      "count": 8,
+      "cases": [
+        {
+          "name": "check: every status prints the shared text and exits 0 (none, pending, running, failed, skipped); --rev and links pin the version"
+        },
+        {
+          "name": "check --wait: one line on stderr, then every 5 s on the version first read until the check is done"
+        },
+        {
+          "name": "check --wait: still pending after 90 s says so and to run it again; exit 0"
+        },
+        {
+          "name": "check done: the screenshots go to .raft-check in the current directory (made if missing), which push leaves out; --output elsewhere"
+        },
+        {
+          "name": "check done: a screenshot that can't be downloaded is named with why, the rest saved; still exit 0"
+        },
+        {
+          "name": "check --json: the check, the state and the screenshots saved; a refusal as JSON on stderr, exit 1"
+        },
+        {
+          "name": "check: refusals exit 1 in the Artifacts' words; a bad --rev or no artifact is refused before any request"
+        },
+        {
+          "name": "check: the text is the shared formatter's, as the SDK's artifacts.check renders it"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/artifact/comment.test.ts",
+      "count": 11,
+      "cases": [
+        {
+          "name": "comment: the body from stdin as written, --path, --reply-to and --rev reach the request; the answer is the shared text"
+        },
+        {
+          "name": "comment: nothing on stdin is refused before any request, with the heredoc to use"
+        },
+        {
+          "name": "follow and unfollow: PUT and DELETE, then where you stand and how to undo it"
+        },
+        {
+          "name": "comment: a link through --artifact, an extra argument refused, a hold shown with its code"
+        },
+        {
+          "name": "comment: over core's rate limit, the Server's sentence, when to retry, and the same command to run again with the comment on stdin; never retried"
+        },
+        {
+          "name": "comment --image: each file uploaded in order as raw bytes, then the comment with their ids; the receipt lists them with how to save each"
+        },
+        {
+          "name": "comment --image: with an image the text may be empty (nothing piped, or an empty stdin); without one, still refused"
+        },
+        {
+          "name": "comment --image: refused before any request: more than 4, unreadable, over 10 MiB, not an image (by its first bytes)"
+        },
+        {
+          "name": "comment --image on a Server from before images: the upload's 404 without an Artifacts code posts nothing, under its own code"
+        },
+        {
+          "name": "comment --image: the Server refusing one image names which --image it was; nothing is posted"
+        },
+        {
+          "name": "comment --image: an upload that doesn't reach the Server posts nothing, and says so (and that images uploaded before it go unused); the next step is the same command again"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/artifact/guideEntry.test.ts",
+      "count": 1,
+      "cases": [
+        {
+          "name": "the prompt's Artifacts entry names every `raft artifact` subcommand, and only those"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/artifact/manage.test.ts",
+      "count": 4,
+      "cases": [
+        {
+          "name": "move: POST …/home { to: server } with a link sent as its id; the answer says who sees it now, who can move it back, and its link"
+        },
+        {
+          "name": "move: --to anyone-with-link is a person's step and any other --to (public included, or none) is refused, all before any request"
+        },
+        {
+          "name": "move: the Server's refusals in the shared words, with their codes"
+        },
+        {
+          "name": "delete: DELETE …/:artifact, then what went and that it can't be undone; a refusal keeps its code"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/artifact/publish.test.ts",
+      "count": 29,
+      "cases": [
+        {
+          "name": "pull: writes every file, records the base and each file's sha256, says how to push"
+        },
+        {
+          "name": "pull's default folder is the title made safe as one folder name, else the short id"
+        },
+        {
+          "name": "pull without --dir puts the files in ./<its title>"
+        },
+        {
+          "name": "pull: another server's artifact comes down as a copy with no base, and says to push it as a new artifact"
+        },
+        {
+          "name": "pull: the artifact's own .raft-artifact.json is never written, for a copy or a base"
+        },
+        {
+          "name": "push: only changed files, missing bytes uploaded, merged files fetched, the base moves to the new version"
+        },
+        {
+          "name": "push: no changes says so; a new directory needs --target; both without a request"
+        },
+        {
+          "name": "push --target a task ref: refused as a task that can't be a home, with the task's conversation as the target to use; nothing written"
+        },
+        {
+          "name": "push: BASE_MOVED keeps the directory as it was and names the way forward"
+        },
+        {
+          "name": "push: a refusal code this CLI doesn't know (a newer Server) shows the Server's sentence as sent, its code as the Code line, and a step to the latest version"
+        },
+        {
+          "name": "push: FILE_UPLOAD_QUOTA_EXCEEDED (the attachments' monthly quota) names the plan and the agent's billing line; the base stays"
+        },
+        {
+          "name": "push: FILE_UPLOAD_QUOTA_EXCEEDED with the Server's upgrade card (details.upgradeHint): printed as the next action, its heredoc unindented so it runs as printed, then the way on"
+        },
+        {
+          "name": "push: once pushed, the base moves even if others' merged files can't be fetched; a merged deletion is removed locally"
+        },
+        {
+          "name": "push --delete (repeatable) removes the files from the directory too, so they don't come back"
+        },
+        {
+          "name": "push refuses --target on a pulled directory, --name (artifacts have none), extra arguments, and an empty new directory, sending nothing"
+        },
+        {
+          "name": "push a new directory: hidden files left out and reported, the state written for the new artifact"
+        },
+        {
+          "name": "push --target a thread: the thread target is sent as given; the reply says nothing was posted there and gives the command that sends its link; v2 says nothing of it"
+        },
+        {
+          "name": "push a new directory needs a title: --title, else its page's <title>; neither is refused before any request"
+        },
+        {
+          "name": "push --title with no file changed renames the artifact: no new version, the base stays"
+        },
+        {
+          "name": "pull: a failed download leaves the directory as it was; another artifact's directory is refused; an update removes old files"
+        },
+        {
+          "name": "pull downloads several files at once (at most six), keeps their order, and starts nothing after the first failure"
+        },
+        {
+          "name": "pull refuses a version with a .git path before downloading or writing anything"
+        },
+        {
+          "name": "symbolic links: pull won't write through a linked folder; push leaves linked files out and says so"
+        },
+        {
+          "name": "push: an upload refused because the server's file storage isn't set up says nothing was pushed and not to retry"
+        },
+        {
+          "name": "push: an upload over core's rate limit stops it with the Server's sentence, when to retry and the same command again; nothing retried or recorded"
+        },
+        {
+          "name": "push --announcement: checks the channel first, pushes, then sets the announcement through channel update"
+        },
+        {
+          "name": "push --announcement is refused before any push: announcements off, no right to set it, a DM target, a pulled directory"
+        },
+        {
+          "name": "push --announcement: a set the Server refuses after the push says the artifact was pushed and how to set it later"
+        },
+        {
+          "name": "push to an artifact that is a channel's announcement, without the right to set it: the Server's reason and the copy to push instead"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/artifact/resolve.test.ts",
+      "count": 4,
+      "cases": [
+        {
+          "name": "resolve --note: the thread and the note reach the request; the answer says what was posted, who heard, and how to reopen"
+        },
+        {
+          "name": "resolve again: already resolved, nothing changed and no note; reopen without a body"
+        },
+        {
+          "name": "resolve: no comment is refused before any request; a reply and someone else's thread are refused with a next step"
+        },
+        {
+          "name": "comments --all: a resolved thread is marked status=resolved with who resolved it, and the open ones are listed with the resolve step"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/artifact/review.test.ts",
+      "count": 19,
+      "cases": [
+        {
+          "name": "review: the JSON from stdin reaches the request as given, with --rev; the answer names the review, its comments and who heard"
+        },
+        {
+          "name": "review: just an array of comments is a review without a summary"
+        },
+        {
+          "name": "review: nothing on stdin, bad JSON, or an unknown field is refused before any request, saying where and how to send it"
+        },
+        {
+          "name": "review: a comment the Server refuses is named by its place (index is 0-based), and nothing was posted"
+        },
+        {
+          "name": "review: a lost answer is sent once more under the same key; the Server's 200 reads as already posted, nobody told twice"
+        },
+        {
+          "name": "review: lost twice, the error gives the key to run it with; the JSON's idempotencyKey is sent as given"
+        },
+        {
+          "name": "review: a resend that is rate limited, or an answer that can't be read, keeps the key in play"
+        },
+        {
+          "name": "comments --review: the review and its summary, then its comments in order"
+        },
+        {
+          "name": "review with images: every file uploaded in order as raw bytes, then the review with each comment's ids; an image alone needs no body; the receipt counts them"
+        },
+        {
+          "name": "review with images: a file that can't go is refused before any request, naming its comment and the file; so are too many, and a malformed images field"
+        },
+        {
+          "name": "review with images on a Server from before images: the first upload's 404 without an Artifacts code posts nothing, under its own code"
+        },
+        {
+          "name": "review with images: the Server refusing one image names its comment and file (the one uploaded before it left behind), a rate limit says nothing was posted; the review is not posted"
+        },
+        {
+          "name": "review with images: a lost answer is sent once more with the same image ids under the same key; the images are uploaded once"
+        },
+        {
+          "name": "review with images: a failure after an image was uploaded says those go unused (a rate limit in its wait, a refusal in its message); before any, as it was"
+        },
+        {
+          "name": "review with images: the server's quota or storage refusing an upload is the whole review's, not a comment's"
+        },
+        {
+          "name": "review with images: an image file that changes after the check, once one was uploaded, is refused naming its comment and file, and says the uploaded ones go unused"
+        },
+        {
+          "name": "review with images: a daemon proxy's failure mid-upload keeps its code and next step, and says nothing of the review was posted (and, once one was uploaded, that it goes unused)"
+        },
+        {
+          "name": "review with images: a lost answer, then a resend refused before the Server looks its key up (NOT_VISIBLE), says nothing of what was posted or left behind"
+        },
+        {
+          "name": "review with images: rerun under the key of a review that went in (IDEMPOTENCY_KEY_REUSED): nothing more posted, and no word of images going unused (that review has its own)"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/artifact/save.test.ts",
+      "count": 4,
+      "cases": [
+        {
+          "name": "save: POST …/save-attachment { attachmentId }; the answer says where it lives, that the attachment links to it and you follow it, its link and how to revise it"
+        },
+        {
+          "name": "save: one saved before answers that artifact, nothing new"
+        },
+        {
+          "name": "save: no id, or more than one, is refused before any request"
+        },
+        {
+          "name": "save: the Server's refusals in the shared words, with their codes"
+        }
+      ]
+    },
+    {
       "file": "src/commands/attachment/_format.test.ts",
       "count": 3,
       "cases": [
@@ -758,16 +1262,16 @@
           "name": "formatAttachmentUploaded matches pre-move upload.ts bytes"
         },
         {
-          "name": "formatAttachmentDownloaded matches pre-move view.ts bytes"
+          "name": "formatAttachmentComments matches pre-move comments.ts bytes (empty and list)"
         },
         {
-          "name": "formatAttachmentComments matches pre-move comments.ts bytes (empty and list)"
+          "name": "formatAttachmentUploaded: uploaded to a task ref, the hint is the task reply (raft message send refuses task refs)"
         }
       ]
     },
     {
       "file": "src/commands/attachment/upload.test.ts",
-      "count": 14,
+      "count": 17,
       "cases": [
         {
           "name": "inferUploadMimeType detects images from magic bytes without an extension"
@@ -810,12 +1314,21 @@
         },
         {
           "name": "attachment upload completes once after a lost PUT response recovers as 412"
+        },
+        {
+          "name": "attachment upload declares a file over the plan limit and keeps the server's next action for it"
+        },
+        {
+          "name": "attachment upload refuses an over-limit file as before when the server does not explain it"
+        },
+        {
+          "name": "attachment upload sends a declared over-limit file through the session the server took"
         }
       ]
     },
     {
       "file": "src/commands/attachment/view.test.ts",
-      "count": 10,
+      "count": 11,
       "cases": [
         {
           "name": "attachment view command advertises positional id while keeping --id alias"
@@ -846,6 +1359,9 @@
         },
         {
           "name": "attachment view command does not write a file or signed URL on an expired object response"
+        },
+        {
+          "name": "attachment view says a file is behind the plan's history window instead of unavailable"
         }
       ]
     },
@@ -911,7 +1427,7 @@
     },
     {
       "file": "src/commands/channel/info.test.ts",
-      "count": 4,
+      "count": 5,
       "cases": [
         {
           "name": "channel info command returns narrow visible channel facts and member counts"
@@ -924,16 +1440,16 @@
         },
         {
           "name": "channel info takes the target as --target too, as the card's agents tried after a hold"
+        },
+        {
+          "name": "channel info answers for an archived channel (read-only) that server info counts but does not list"
         }
       ]
     },
     {
       "file": "src/commands/channel/join.test.ts",
-      "count": 5,
+      "count": 4,
       "cases": [
-        {
-          "name": "join channel output explains post-join delivery"
-        },
         {
           "name": "join channel command uses injected ApiClient and writes join result"
         },
@@ -950,7 +1466,7 @@
     },
     {
       "file": "src/commands/channel/leave.test.ts",
-      "count": 4,
+      "count": 5,
       "cases": [
         {
           "name": "parseRegularChannelTarget accepts only top-level channel targets"
@@ -963,6 +1479,9 @@
         },
         {
           "name": "leave channel command maps invalid target into typed CliError"
+        },
+        {
+          "name": "leave: a private channel's last member is refused with the --delete-if-last command; with the flag it sends deleteIfLast and says the channel went"
         }
       ]
     },
@@ -1028,7 +1547,7 @@
     },
     {
       "file": "src/commands/channel/remove-member.test.ts",
-      "count": 3,
+      "count": 4,
       "cases": [
         {
           "name": "remove-member output distinguishes removed and already absent"
@@ -1038,12 +1557,15 @@
         },
         {
           "name": "remove-member command requires exactly one member selector"
+        },
+        {
+          "name": "remove-member: a private channel's last member is refused with the --delete-if-last command; with the flag it sends deleteIfLast and says the channel went"
         }
       ]
     },
     {
       "file": "src/commands/channel/update.test.ts",
-      "count": 3,
+      "count": 6,
       "cases": [
         {
           "name": "update channel output reports channel visibility"
@@ -1053,6 +1575,126 @@
         },
         {
           "name": "update channel command rejects empty updates and conflicting visibility"
+        },
+        {
+          "name": "--announcement sends the Artifact's id (from an id or a link) and prints what the announcement is now"
+        },
+        {
+          "name": "--no-announcement (through the parser) sends null and says the channel has none now"
+        },
+        {
+          "name": "--announcement refusals: a title, a DM or thread target (before any request), and the Server's reason with its next step"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/context/context.test.ts",
+      "count": 11,
+      "cases": [
+        {
+          "name": "search posts the message id, query and paging, and lists matches with the next commands"
+        },
+        {
+          "name": "a matched line can't start a line of its own"
+        },
+        {
+          "name": "no match, and a page past the end, each say so"
+        },
+        {
+          "name": "search refuses bad flags before asking the Server"
+        },
+        {
+          "name": "the Server's refusal is the error, its sentence and next step kept"
+        },
+        {
+          "name": "a rate-limit refusal gives the wait and the same command again"
+        },
+        {
+          "name": "a whole view in place of an answer is refused, never printed"
+        },
+        {
+          "name": "--json prints the checked answer"
+        },
+        {
+          "name": "read posts the anchor and window, prints each entry's text as an indented block, and the rest of a long one"
+        },
+        {
+          "name": "read of an entry the context doesn't have says so"
+        },
+        {
+          "name": "read refuses an id that isn't an entry id before asking the Server"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/continuation/continue.test.ts",
+      "count": 22,
+      "cases": [
+        {
+          "name": "a command that pauses prints its question and every answer, exits 10, and keeps the continuation in the agent's ledger"
+        },
+        {
+          "name": "cont answers it: the command carries on from its question, finishes, and exits 0"
+        },
+        {
+          "name": "an option that takes text reads it from stdin; cancel runs nothing further"
+        },
+        {
+          "name": "empty stdin is not text; text given to an option that takes none, or none to one that needs it, is refused"
+        },
+        {
+          "name": "an answer that is not one of the options, or no option at all, lists the options again"
+        },
+        {
+          "name": "an ask for text alone is answered with stdin and no option"
+        },
+        {
+          "name": "an id that is not here, or not one at all: UNKNOWN, which also covers another agent's id from its own ledger"
+        },
+        {
+          "name": "another agent reaching the same store is refused: NOT_YOURS, and the continuation stays open for its agent"
+        },
+        {
+          "name": "past its deadline: EXPIRED, with the original command to run again and how long it had"
+        },
+        {
+          "name": "once its result is no longer kept: RESULT_EXPIRED, with the exact command to check before running anything again"
+        },
+        {
+          "name": "a different CLI version: PROGRAM_CHANGED says to run it again only while nothing ran, else what to check"
+        },
+        {
+          "name": "on the second question of an exchange, after the first answer wrote: refusals say what to check, never to run the command again"
+        },
+        {
+          "name": "a command that wrote before its first question: once that continuation can't be resumed, what to check, never to run it again"
+        },
+        {
+          "name": "a failed step the command caught before its question may still have written: past the deadline, what to check"
+        },
+        {
+          "name": "a record of another format, or a command the CLI no longer has, is refused without lines it cannot render"
+        },
+        {
+          "name": "a replay that no longer follows the journal: REPLAY_DIVERGED, with the original command"
+        },
+        {
+          "name": "a different answer to an answered continuation: ALREADY_ANSWERED, with how to get its result, never its text"
+        },
+        {
+          "name": "while another call runs the answer: IN_PROGRESS; once its lease runs out the step runs again and the server sees one write"
+        },
+        {
+          "name": "a store that fails: what may already have taken effect and what to check, or that nothing was done and what to run again"
+        },
+        {
+          "name": "`raft cont <id>` (the raft prefix an agent is used to) answers it like `cont <id>`"
+        },
+        {
+          "name": "`raft --help` does not list __continue"
+        },
+        {
+          "name": "the paused output and the refusals are registered AX surfaces"
         }
       ]
     },
@@ -1121,13 +1763,13 @@
     },
     {
       "file": "src/commands/inbox/check.test.ts",
-      "count": 15,
+      "count": 31,
       "cases": [
         {
-          "name": "formatter: empty inbox says so and ends with one Next line"
+          "name": "formatter: empty inbox says so and prints no Next line"
         },
         {
-          "name": "formatter: a page with more renders open commands, the More trailer, and exactly one Next line"
+          "name": "formatter: a page with more renders read commands, the More trailer, and exactly one Next line"
         },
         {
           "name": "formatter: the last page has no More line and names its seq window"
@@ -1140,6 +1782,9 @@
         },
         {
           "name": "formatter: daemon pending rows annotate listed targets and lead the first page when the list lags"
+        },
+        {
+          "name": "formatter: the header counts the conversations only the daemon has, so it never says 0 above a row"
         },
         {
           "name": "formatter: the grouped third-party app events row points at message check, not an unreadable target"
@@ -1167,6 +1812,135 @@
         },
         {
           "name": "inbox check command renders structured sourceRef and exact actionCli from OS mint"
+        },
+        {
+          "name": "formatter: a sender name or task title with a line break stays on its row"
+        },
+        {
+          "name": "[items] every kind renders through the shared row, read with raft inbox read, and the header counts app items and reminders"
+        },
+        {
+          "name": "[items] with no unread conversations the header still lists app items, never \"nothing unread\""
+        },
+        {
+          "name": "[items] daemon pending counts annotate conversation rows; pending-only targets lead the first page"
+        },
+        {
+          "name": "[items] a pending grouped third-party events row says its events are not in this list and names no command (message check is gone, RFC 081 D10)"
+        },
+        {
+          "name": "[items][D12] pre-launch items get one dismiss line after Next, and only then"
+        },
+        {
+          "name": "[items] rows past the caps are counted in the header and named on a Not listed line"
+        },
+        {
+          "name": "[items] inbox check asks for items and drops the daemon's reminder app items, which the server now lists"
+        },
+        {
+          "name": "daemon section: a Computer-local app item's row is followed by its dismiss command, with the exact target; a reminder's row is not"
+        },
+        {
+          "name": "daemon section: a sealed item, or one whose id cannot stand in a target, prints no dismiss command"
+        },
+        {
+          "name": "inbox check command prints the daemon's Cleaner item with its dismiss command"
+        },
+        {
+          "name": "[items] a reminder that fired before launch is not a server row, so the daemon's copy still shows with its ack"
+        },
+        {
+          "name": "[items] a daemon reminder with a short id is matched against the server's full id"
+        },
+        {
+          "name": "[items] the seal registry still checks seals against the daemon's reminder items"
+        },
+        {
+          "name": "[items] legacy mode: a server that ignores items=true keeps today's conversation-only output"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/inbox/dismiss.test.ts",
+      "count": 7,
+      "cases": [
+        {
+          "name": "[D12] --target dismisses one item without reading it"
+        },
+        {
+          "name": "[D12][D13] --before says what it skipped and what is left"
+        },
+        {
+          "name": "exactly one of --target or --before, checked before any request; there is no all"
+        },
+        {
+          "name": "[D13] a reminder is never dismissed: NEEDS_ACK points at its ack"
+        },
+        {
+          "name": "a bad or too recent --before keeps the server's sentence and says what is accepted"
+        },
+        {
+          "name": "inbox items off, not implemented yet, and an unknown item"
+        },
+        {
+          "name": "a 429 (dismiss is in the write budget) says how long to wait and the command to run again"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/inbox/read.test.ts",
+      "count": 17,
+      "cases": [
+        {
+          "name": "[D4] a conversation page says how many are left, prints the entries as message lines, and points at the rest"
+        },
+        {
+          "name": "[D4] the last page prints only its entries (no count, no Next); the printed seqs count as seen"
+        },
+        {
+          "name": "[D4] history-row entries (camelCase, channelId only) print as message read prints them, under the page's target, and count as seen there"
+        },
+        {
+          "name": "a capped remaining count is printed as at least"
+        },
+        {
+          "name": "[D13] a reminder is shown with an ack line per entry and stays listed"
+        },
+        {
+          "name": "[D6][D8] an app item names its app and related conversation; the app name cannot start a line"
+        },
+        {
+          "name": "a reaction item reads as the reactions to your message, who and when, its excerpt, and one Next: reply in its thread"
+        },
+        {
+          "name": "a reaction to a message with no reply target points at the message in its conversation; names and the excerpt cannot start a line"
+        },
+        {
+          "name": "a reaction item whose entries carry no app_event (an older Server) reads as any app item"
+        },
+        {
+          "name": "EXPIRED on a reaction item: its reactions were removed before it was read"
+        },
+        {
+          "name": "an item already read says so and how to re-read it"
+        },
+        {
+          "name": "--limit is sent as a number; bad flags fail before any request"
+        },
+        {
+          "name": "inbox items off (404 INBOX_ITEMS_DISABLED): read the conversation the old way"
+        },
+        {
+          "name": "a server that has the route but cannot read items yet (501)"
+        },
+        {
+          "name": "NOT_FOUND and EXPIRED name the item and point at the list"
+        },
+        {
+          "name": "AMBIGUOUS_ID, INVALID_TARGET and INVALID_CURSOR keep the server's sentence and next step"
+        },
+        {
+          "name": "a 429 says how long to wait; a server error is sent once and never retried"
         }
       ]
     },
@@ -1216,8 +1990,50 @@
       ]
     },
     {
+      "file": "src/commands/integration/agentHandoffCommand.test.ts",
+      "count": 2,
+      "cases": [
+        {
+          "name": "v1 login verifies Raft and App identities, uses no manifest, and stores a private bound cookie"
+        },
+        {
+          "name": "v1 rejects an unexpected App identity before saving; unknown protocol never reaches the App"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/integration/agentHandoffDirect.test.ts",
+      "count": 4,
+      "cases": [
+        {
+          "name": "protocol comes from login: old Servers are legacy, unknown values never downgrade"
+        },
+        {
+          "name": "v1 uses the registered origin and confirms the Agent and Server before returning a session"
+        },
+        {
+          "name": "v1 fails closed for unconfirmed context, insecure cookies and a wrong session identity"
+        },
+        {
+          "name": "a cached v1 session is rechecked, and a wrong binding or App subject is not used"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/integration/agentHandoffProof.test.ts",
+      "count": 2,
+      "cases": [
+        {
+          "name": "concurrent approval requests retain both verifiers and resume the one approved first"
+        },
+        {
+          "name": "a committed approval request remains recoverable when its response is lost"
+        }
+      ]
+    },
+    {
       "file": "src/commands/integration/app.test.ts",
-      "count": 24,
+      "count": 26,
       "cases": [
         {
           "name": "integration app list/status reconstruct pending and committed state without secret-shaped fields"
@@ -1277,6 +2093,9 @@
           "name": "integration app update JSON emits only the fixed mutation receipt"
         },
         {
+          "name": "integration app update --client-key sends the new client id next to the App it names"
+        },
+        {
           "name": "integration app transfer-owner JSON emits a fixed audited no-op receipt"
         },
         {
@@ -1286,31 +2105,13 @@
           "name": "integration app share-link fails closed when the one-time URL is missing"
         },
         {
+          "name": "integration app share-link needs --target-server before it contacts the server"
+        },
+        {
           "name": "integration app logo uploads multipart bytes to the dedicated route"
         },
         {
           "name": "integration app prepare recover-owner creates an admin-only recovery card"
-        }
-      ]
-    },
-    {
-      "file": "src/commands/integration/appManualContract.test.ts",
-      "count": 5,
-      "cases": [
-        {
-          "name": "the manual locates the repo it documents"
-        },
-        {
-          "name": "every rotate-secret flag the manual names is a flag the CLI defines"
-        },
-        {
-          "name": "NEGATIVE CONTROL: a documented flag the CLI lacks is actually rejected"
-        },
-        {
-          "name": "the manual pairs --output with the flag-list self-check, not a version number"
-        },
-        {
-          "name": "the manual warns that probing costs the live secret"
         }
       ]
     },
@@ -1334,13 +2135,16 @@
     },
     {
       "file": "src/commands/integration/env.test.ts",
-      "count": 17,
+      "count": 18,
       "cases": [
         {
           "name": "resolveIntegrationEnv returns per-agent HOME exports for explicit local_cli boundary"
         },
         {
           "name": "integration env command writes per-agent HOME exports for explicit local_cli boundary"
+        },
+        {
+          "name": "integration env asks the server only for what the list can't answer: an old id finds its App, and a miss stays a miss"
         },
         {
           "name": "integration env never materializes credentials for a v1 local CLI surface"
@@ -1391,7 +2195,7 @@
     },
     {
       "file": "src/commands/integration/invoke.test.ts",
-      "count": 103,
+      "count": 110,
       "cases": [
         {
           "name": "integration invoke sends feedback-admin id in URL and param content in POST JSON body"
@@ -1425,9 +2229,6 @@
         },
         {
           "name": "integration invoke preserves typed v0 arrays and objects from --data-json"
-        },
-        {
-          "name": "integration invoke help identifies --param as text-only and points structured fields to typed JSON"
         },
         {
           "name": "integration invoke file response rejects non-POSIX platform for default temp"
@@ -1640,6 +2441,12 @@
           "name": "integration invoke renders structured non-2xx status and redacted response body with or without --json"
         },
         {
+          "name": "integration invoke puts an app's own typed message on its own line, and leaves other failures as they were"
+        },
+        {
+          "name": "integration invoke tells an App's own 403 refusal apart from a refused service session"
+        },
+        {
           "name": "integration invoke recursively redacts structured error fields even when Content-Type is text/plain"
         },
         {
@@ -1701,6 +2508,24 @@
         },
         {
           "name": "CleanupOutcome cleaned factory is private to the finalizer"
+        },
+        {
+          "name": "integration list-actions filters one v0 action without login or invoking a write"
+        },
+        {
+          "name": "integration list-actions filters v1 contract and readiness in text and JSON without invocation"
+        },
+        {
+          "name": "integration list-actions unknown action fails without login or invocation for v0 and v1"
+        },
+        {
+          "name": "invokeAppAction logs in and returns the v0 action's parsed answer without printing"
+        },
+        {
+          "name": "invokeAppAction names an unknown service INTEGRATION_NOT_FOUND before any app call"
+        },
+        {
+          "name": "invokeAppAction with requireOfficial refuses a listed service the platform hasn't marked official, before any login or app call"
         }
       ]
     },
@@ -1823,8 +2648,23 @@
     },
     {
       "file": "src/commands/integration/manifest.test.ts",
-      "count": 22,
+      "count": 27,
       "cases": [
+        {
+          "name": "manifest fetch accepts v0 and v1 bodies above 64 KiB through the inclusive 1 MiB limit"
+        },
+        {
+          "name": "manifest fetch rejects an oversized declared length before reading and cancels the body"
+        },
+        {
+          "name": "manifest fetch stops oversized chunked bodies even with an understated Content-Length"
+        },
+        {
+          "name": "manifest fetch applies the size limit to UTF-8 bytes rather than characters"
+        },
+        {
+          "name": "large manifests below the byte limit still pass through schema validation"
+        },
         {
           "name": "validateAgentManifestV0 accepts minimal local CLI per-agent HOME manifest"
         },
@@ -1945,6 +2785,33 @@
       ]
     },
     {
+      "file": "src/commands/integration/mcpApps.test.ts",
+      "count": 7,
+      "cases": [
+        {
+          "name": "⭐ list shows each MCP App with type MCP, its state, its tools, and no Agent Login hint"
+        },
+        {
+          "name": "list says when the server does not report MCP Apps, and 'none' when there are none"
+        },
+        {
+          "name": "list --json passes the server's mcpApps through, and adds none for an older server"
+        },
+        {
+          "name": "⭐ invoke and env on an MCP App (by name or id) say what it is, not 'not found'"
+        },
+        {
+          "name": "⭐ an MCP App this Agent lacks is listed with its grant, and its next step is the login request"
+        },
+        {
+          "name": "⭐ login on an MCP App: a posted request, a ready App and a missing --target are answers, not failures"
+        },
+        {
+          "name": "login on a disabled MCP App surfaces the server's message with its code"
+        }
+      ]
+    },
+    {
       "file": "src/commands/integration/readiness.test.ts",
       "count": 7,
       "cases": [
@@ -2012,7 +2879,7 @@
     },
     {
       "file": "src/commands/knowledge/get.test.ts",
-      "count": 8,
+      "count": 7,
       "cases": [
         {
           "name": "formatKnowledgeStdout: byte-preserves content that already ends with newline"
@@ -2022,9 +2889,6 @@
         },
         {
           "name": "formatKnowledgeStdout: does not parse, strip, or render component-shaped tokens"
-        },
-        {
-          "name": "manual get help points agents to the index topic catalog"
         },
         {
           "name": "knowledge get command uses injected ApiClient and byte-preserves server content"
@@ -2042,13 +2906,10 @@
     },
     {
       "file": "src/commands/knowledge/search.test.ts",
-      "count": 9,
+      "count": 8,
       "cases": [
         {
           "name": "formatKnowledgeSearchResults renders slug title and first screen"
-        },
-        {
-          "name": "manual search help documents recipes scope"
         },
         {
           "name": "knowledge search command uses injected ApiClient and preserves top-3 result order"
@@ -2195,7 +3056,7 @@
     },
     {
       "file": "src/commands/message/_format.test.ts",
-      "count": 61,
+      "count": 79,
       "cases": [
         {
           "name": "formatInboxHint: points at raft inbox check with the conversation count"
@@ -2237,10 +3098,31 @@
           "name": "formatHistory: empty channel"
         },
         {
-          "name": "formatHistory: basic history with last_read_seq"
+          "name": "formatHistory: one app event reads as that event, with no thread to reply in"
+        },
+        {
+          "name": "formatHistory: the whole conversation on screen prints no window lines (no Read window, cursor or End of window)"
+        },
+        {
+          "name": "formatHistory (message read, task read): a message's reactions print on one line under it; one without prints nothing"
+        },
+        {
+          "name": "formatMessageLine (message check, inbox read of a conversation): the same reactions line"
+        },
+        {
+          "name": "formatHistory: a card message is marked in the header (card=r1; updated= once replaced), never in the body"
+        },
+        {
+          "name": "formatHistory: a card message's own text follows its body (card:, then the markdown, quoted like a body)"
         },
         {
           "name": "formatHistory: has_more with default (backward) pagination"
+        },
+        {
+          "name": "formatHistory: a default read whose window starts past the read position names the read for the unread before it"
+        },
+        {
+          "name": "formatHistory: a read's --limit is carried into the Older:, Newer: and Unread before commands it prints"
         },
         {
           "name": "formatHistory: has_more with forward pagination (after)"
@@ -2276,13 +3158,25 @@
           "name": "formatHistory: parent reads declare that thread replies are excluded"
         },
         {
+          "name": "formatHistory: a context that already has the channel card gets no Coverage line (read and --unread alike)"
+        },
+        {
           "name": "formatHistory: the last-colon thread rule permits colons in the parent target"
         },
         {
           "name": "formatHistory: historyLimited footer"
         },
         {
+          "name": "formatHistory: an empty window behind the plan's history limit says why"
+        },
+        {
+          "name": "formatHistory: an --unread read that started behind the plan's history window says why"
+        },
+        {
           "name": "formatSearchResults: a capped page declares truncated=true and how to page"
+        },
+        {
+          "name": "formatSearchResults: a message an assistant sent for its owner says so on the Sender line"
         },
         {
           "name": "formatSearchResults: an exhausted page declares truncated=false"
@@ -2322,6 +3216,9 @@
         },
         {
           "name": "formatSearchResults: empty"
+        },
+        {
+          "name": "formatSearchResults: a history-limited search prints the server's line, empty or not"
         },
         {
           "name": "formatSearchResults: the EMPTY render also carries a truncation verdict"
@@ -2378,7 +3275,25 @@
           "name": "formatHistory: superseded task description cannot forge structural lines"
         },
         {
+          "name": "formatMessages: a sender description, sender name or filename cannot forge a header line"
+        },
+        {
+          "name": "formatHistory: a sender description, sender name or filename cannot forge a header line"
+        },
+        {
           "name": "AGENT_BODY_LINE_SEPARATOR is stateless (no g flag) and matches the test split"
+        },
+        {
+          "name": "formatMessageLine: task v2 source_tasks render as one list bracket"
+        },
+        {
+          "name": "formatMessageLine: a task conversation message targets the task ref and names raft task reply"
+        },
+        {
+          "name": "formatHistory: a task conversation window names the task commands, never message read/send"
+        },
+        {
+          "name": "formatHistory: rows list their tasks by ref (task v2 source_tasks)"
         }
       ]
     },
@@ -2444,7 +3359,7 @@
     },
     {
       "file": "src/commands/message/channelCard.test.ts",
-      "count": 5,
+      "count": 9,
       "cases": [
         {
           "name": "passive AX off, no context signal, or no card from the Server: the read is unchanged"
@@ -2456,19 +3371,43 @@
           "name": "a changed card comes again, marked as changed; a new context starts over"
         },
         {
+          "name": "read coverage: a thread read first does not use it up; the first top-level read prints it, the next one does not"
+        },
+        {
+          "name": "read coverage: a send that showed the card does not use it up; a new context prints it again"
+        },
+        {
+          "name": "read coverage: without the gate (no context signal, passive AX off, no compaction reports) every top-level read prints it; output that never reached stdout does not use it up"
+        },
+        {
           "name": "a runtime that does not report compaction gets the card on every read"
         },
         {
           "name": "a card that never reached stdout is not recorded as shown"
+        },
+        {
+          "name": "each card printed is counted for the daemon's turn report, per context; nothing is counted with passive AX off"
         }
       ]
     },
     {
       "file": "src/commands/message/check.test.ts",
-      "count": 14,
+      "count": 18,
       "cases": [
         {
           "name": "message check command drains inbox through injected ApiClient and writes canonical text"
+        },
+        {
+          "name": "message check is gone where the server lists inbox items: it points to the inbox and drains nothing (RFC 081 D10)"
+        },
+        {
+          "name": "message check keeps draining for a personal assistant, whose inbox lists app rows only (appRowsOnly)"
+        },
+        {
+          "name": "message check reads as before whenever the inbox probe isn't a positive answer: 400, 403, 404, 500, 503 INBOX_UNAVAILABLE"
+        },
+        {
+          "name": "a probe with no answer within the timeout reads as before; a thrown request does too"
         },
         {
           "name": "message check command prints the server's inbox hint after the messages"
@@ -2512,8 +3451,56 @@
       ]
     },
     {
+      "file": "src/commands/message/draftResolvedTrace.test.ts",
+      "count": 14,
+      "cases": [
+        {
+          "name": "--send-draft that is sent resolves the draft as sent_unchanged"
+        },
+        {
+          "name": "a normal send that replaces a held draft and is sent resolves the old draft as replaced_and_sent"
+        },
+        {
+          "name": "a normal send that replaces a held draft and is held again supersedes it; the new draft lives on"
+        },
+        {
+          "name": "a thread-context confirmation that replaces a held draft supersedes it"
+        },
+        {
+          "name": "a confirmation draft ends with cause thread_confirmation: superseded by a re-run, then expired"
+        },
+        {
+          "name": "a confirmed confirmation draft is sent_unchanged with its cause; one the server then holds becomes held"
+        },
+        {
+          "name": "a failed replacing send leaves a draft with the cause of the one it replaced"
+        },
+        {
+          "name": "--discard-draft resolves the draft as discarded"
+        },
+        {
+          "name": "a draft found past its TTL resolves as expired, whichever command finds it"
+        },
+        {
+          "name": "drafts the server never held, and drafts that stay unresolved, emit no resolution"
+        },
+        {
+          "name": "a send the server holds writes cli.draft.held for the draft it saves; held again, the same draft_id with a higher count"
+        },
+        {
+          "name": "the span carries the runtime the daemon reports, and omits one that is unset or not an id"
+        },
+        {
+          "name": "the span is appended to the daemon-shipped CLI trace file as a valid ok span"
+        },
+        {
+          "name": "a failing trace sink never changes the command result"
+        }
+      ]
+    },
+    {
       "file": "src/commands/message/peerCard.test.ts",
-      "count": 7,
+      "count": 8,
       "cases": [
         {
           "name": "a DM read whose window has no message from the peer starts with their card, once"
@@ -2535,6 +3522,9 @@
         },
         {
           "name": "a card that only reached JSON output is recorded, so JSON-mode sends are held once too"
+        },
+        {
+          "name": "the peer card on read and in a send's reply is counted for the daemon's turn report"
         }
       ]
     },
@@ -2621,7 +3611,7 @@
     },
     {
       "file": "src/commands/message/resolve.test.ts",
-      "count": 5,
+      "count": 6,
       "cases": [
         {
           "name": "buildResolvePath: encodes message id on the id-less surface"
@@ -2636,13 +3626,16 @@
           "name": "message resolve command fails closed for unknown ids"
         },
         {
+          "name": "message resolve says a message is behind the plan's history window, not that it is missing"
+        },
+        {
           "name": "message resolve command does not pick an ambiguous short id"
         }
       ]
     },
     {
       "file": "src/commands/message/search.test.ts",
-      "count": 14,
+      "count": 18,
       "cases": [
         {
           "name": "message search command uses injected ApiClient and writes canonical results"
@@ -2685,18 +3678,33 @@
         },
         {
           "name": "message search command rejects --cursor outside a recent text search and with --offset"
+        },
+        {
+          "name": "argv: a text search ends with the Artifacts line when artifacts match; not when they don't, are off, or a filter can't apply"
+        },
+        {
+          "name": "argv: when the daemon says Artifacts are off for this Server, no artifacts request is made; on, or not said, it asks"
+        },
+        {
+          "name": "argv: a probe still running after the search's grace is aborted, and the search prints without the line"
+        },
+        {
+          "name": "argv: a search that is refused or throws ends the probe at once"
         }
       ]
     },
     {
       "file": "src/commands/message/send.test.ts",
-      "count": 105,
+      "count": 110,
       "cases": [
         {
           "name": "resolveSendContent reads multiline content from stdin"
         },
         {
           "name": "typed mention selectors bind one actor type and id per visible handle"
+        },
+        {
+          "name": "an anonymous search sender cannot be bound as a structured mention"
         },
         {
           "name": "resolveSendContent rejects empty stdin"
@@ -2766,6 +3774,9 @@
         },
         {
           "name": "send-draft on an expired draft fails with SEND_DRAFT_EXPIRED, returns the last copy of the body, and sends nothing"
+        },
+        {
+          "name": "formatHeldSendOutput for a card alone offers sending nothing first, without the 'someone already answered' example"
         },
         {
           "name": "formatHeldSendOutput frames held context as bounded latest messages"
@@ -2954,10 +3965,13 @@
           "name": "send warns when an authored mention resolved to no visible target"
         },
         {
+          "name": "send names the agents the message was delivered to, under the sent line"
+        },
+        {
           "name": "send --json exposes layered message and mention effects without an extra warning stream"
         },
         {
-          "name": "send --json mention partial renders one queued-effect error envelope"
+          "name": "send --json mention partial exits 0 with one partial-result document"
         },
         {
           "name": "send --json exposes unresolved mention warnings as a partial result"
@@ -3006,6 +4020,12 @@
         },
         {
           "name": "5xx guidance is only attached when a draft was actually saved"
+        },
+        {
+          "name": "a send over the message budget (429 RATE_LIMITED): nothing sent, the draft kept, how long to wait and the command that sends it"
+        },
+        {
+          "name": "a reviewer-isolation send over the message budget: the draft kept, and the send-draft command bound to this send's key"
         }
       ]
     },
@@ -3025,8 +4045,59 @@
       ]
     },
     {
+      "file": "src/commands/message/sendCard.test.ts",
+      "count": 15,
+      "cases": [
+        {
+          "name": "a card from a file is sent on v2 with the text on stdin as its fallback, and the receipt says how to update it"
+        },
+        {
+          "name": "an answer without messageCard is still a success: the receipt says the message went out as text only, with no update hint"
+        },
+        {
+          "name": "the update hint starts from the revision the receipt names (a replay after the card was updated)"
+        },
+        {
+          "name": "a lost answer reconciled as committed: the card line comes from the reconciliation's messageCard"
+        },
+        {
+          "name": "without text on stdin no content is sent: the Server derives the fallback from the card"
+        },
+        {
+          "name": "a card that breaks a rule is refused with its path and limit before any request or stdin read"
+        },
+        {
+          "name": "v2.0: a card with a header, Markdown, Fields and a Divider is sent as written; Markdown outside the subset is refused before any request, naming the node"
+        },
+        {
+          "name": "no text and nothing on the card to derive one from is refused before any request"
+        },
+        {
+          "name": "--mention without text is refused: a derived fallback mentions no one"
+        },
+        {
+          "name": "--card with --attachment-id is refused before any request or stdin read: a card message carries no files"
+        },
+        {
+          "name": "a card file that cannot be read, or --card -, is refused before any request"
+        },
+        {
+          "name": "the Server's card refusals keep their code and say what to do next"
+        },
+        {
+          "name": "a held card send keeps the card in its draft, and --send-draft sends it with the card"
+        },
+        {
+          "name": "--card with --send-draft or --discard-draft is refused: the draft keeps the card it was saved with"
+        },
+        {
+          "name": "a held text send's instructions are unchanged; a held card's name the card"
+        }
+      ]
+    },
+    {
       "file": "src/commands/message/sendChannelCard.test.ts",
-      "count": 7,
+      "count": 8,
       "cases": [
         {
           "name": "a context that never saw the card is held once with it; the unchanged draft then goes through"
@@ -3048,6 +4119,60 @@
         },
         {
           "name": "a card that only reached JSON output is recorded, so a JSON-mode send is held once, not forever"
+        },
+        {
+          "name": "the hold and a card in the reply are counted for the daemon's turn report"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/message/sendContinuation.test.ts",
+      "count": 15,
+      "cases": [
+        {
+          "name": "pilot off, unknown or unreadable: a held send keeps today's draft flow, its held text byte for byte"
+        },
+        {
+          "name": "the flag is read once, only when a send is held: none for a send that goes through, none for cont"
+        },
+        {
+          "name": "on: a held send asks what to do and keeps the message in the continuation, not a draft (exit 10)"
+        },
+        {
+          "name": "c: the same message is sent once, under its step's key, attesting what the hold showed; the same answer again only reports it"
+        },
+        {
+          "name": "b sends the new message from stdin; a sends nothing and says so"
+        },
+        {
+          "name": "held again: a new continuation with the same options; from the third rehold, d sends anyway"
+        },
+        {
+          "name": "past its deadline: the send already ran (it was held), so EXPIRED says what to check, never to run the send again"
+        },
+        {
+          "name": "--send-draft finds no draft while the message waits in the continuation; cont then sends it, once"
+        },
+        {
+          "name": "a send step run twice (its first run taken over) books one message: both runs pass the step's key"
+        },
+        {
+          "name": "a later attempt held with a copy it cannot remove: the question still holds the message, and the same cont sends it once, under the same key"
+        },
+        {
+          "name": "the first send held with a copy it cannot remove keeps no question: today's wording"
+        },
+        {
+          "name": "a question that could not be saved showed nothing: the held messages stay unread, and the next send holds for them again"
+        },
+        {
+          "name": "JSON, reviewer isolation and --send-draft keep the draft flow with the pilot on"
+        },
+        {
+          "name": "a codex agent keeps the draft flow with the pilot on: it reads exit 10 as a failure (#wg-ax:#5)"
+        },
+        {
+          "name": "held for a channel description alone: the question says so, the description is the preview, and anyway is never offered"
         }
       ]
     },
@@ -3127,6 +4252,90 @@
       ]
     },
     {
+      "file": "src/commands/message/updateCard.test.ts",
+      "count": 11,
+      "cases": [
+        {
+          "name": "the card and its new text replace the card by message id, with a key for the run; the answer names who was not notified"
+        },
+        {
+          "name": "without text on stdin no content is sent (the Server derives it); --idempotency-key is sent as given; --json prints the answer"
+        },
+        {
+          "name": "a card that breaks a rule is refused with its path and limit before any request"
+        },
+        {
+          "name": "409 card_revision_conflict when the card is not what this run sent: the exact command to run again"
+        },
+        {
+          "name": "the retry rule: a 409 whose current card and text are what this run sent reports success (an earlier run landed)"
+        },
+        {
+          "name": "the retry rule compares the card alone when no text was sent: the Server derives the text, maybe differently from this CLI"
+        },
+        {
+          "name": "the retry rule compares the text this run wrote: the same card with another text is still a conflict"
+        },
+        {
+          "name": "404: the one answer for every case, and the next step is a new message"
+        },
+        {
+          "name": "429: how many seconds to wait; the flag off: send text instead; a reused key: a new key"
+        },
+        {
+          "name": "a request that may not have reached the Server is sent once more under the same key; still unknown, the error names the key to run again with"
+        },
+        {
+          "name": "flags: --message-id and --card are required; --expected-revision is a positive whole number"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/migration/retry.test.ts",
+      "count": 13,
+      "cases": [
+        {
+          "name": "an accepted retry names the move, the target and the Server's note, then one Next line"
+        },
+        {
+          "name": "a target name with a line break stays on its line"
+        },
+        {
+          "name": "a response that does not match the shared schema is not printed as a started move"
+        },
+        {
+          "name": "only a target that can't take you yet is worth running again"
+        },
+        {
+          "name": "refused with NO_RETRYABLE_MIGRATION: the Server's reason, the code, and the Server's next step"
+        },
+        {
+          "name": "refused with ALREADY_RETRIED: the Server's reason, the code, and the Server's next step"
+        },
+        {
+          "name": "refused with TARGET_UNAVAILABLE: the Server's reason, the code, and the Server's next step"
+        },
+        {
+          "name": "refused with MIGRATION_ACTIVE: the Server's reason, the code, and the Server's next step"
+        },
+        {
+          "name": "a refusal without the Server's next step still ends in one: ask the owner"
+        },
+        {
+          "name": "an older server without the route: not supported yet, ask the owner to retry from the web app"
+        },
+        {
+          "name": "a 503 keeps the Server's sentence and its next step (used up: ask the owner)"
+        },
+        {
+          "name": "a failure with no next step from the Server (a stale runtime catalog, a 500) still ends in one"
+        },
+        {
+          "name": "a local proxy failure keeps the proxy's own next step"
+        }
+      ]
+    },
+    {
       "file": "src/commands/peerKind.test.ts",
       "count": 6,
       "cases": [
@@ -3147,6 +4356,45 @@
         },
         {
           "name": "thread unfollow and reminder anchors carry the kind"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/proc/proc.test.ts",
+      "count": 11,
+      "cases": [
+        {
+          "name": "start: the command after -- goes to the daemon with an absolute cwd, the env and the CLI's pid; the reply names the job, pid, log and next commands"
+        },
+        {
+          "name": "start without --name says the name was made from the command"
+        },
+        {
+          "name": "start where the job shares the Computer service's cgroup adds one line saying a service restart ends it"
+        },
+        {
+          "name": "start refusals: a running duplicate name, the 9th job (with the running jobs), an invalid name before any request"
+        },
+        {
+          "name": "start: the daemon's scope and full-access refusals say why and what to do instead"
+        },
+        {
+          "name": "an older daemon, a Windows daemon and an agent no Computer runs each get their refusal; nothing is started"
+        },
+        {
+          "name": "list: one row per job and the next commands; an empty list says how to start one"
+        },
+        {
+          "name": "stop: SIGTERM exit, a kill after the grace, --force, an exited job, an unknown name"
+        },
+        {
+          "name": "logs: the tail with a header and the next commands; --tail is bounded"
+        },
+        {
+          "name": "logs --follow prints what arrives, stops at the time limit and points at --tail; it ends early when the job exits"
+        },
+        {
+          "name": "raft proc is a visible command with its four actions"
         }
       ]
     },
@@ -3177,6 +4425,30 @@
         },
         {
           "name": "profile show command maps server failures into typed CliError"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/profile/update.test.ts",
+      "count": 2,
+      "cases": [
+        {
+          "name": "readAvatarFile accepts an avatar at the Server's 5 MB limit"
+        },
+        {
+          "name": "readAvatarFile rejects an avatar over the limit"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/registryPin/harness.test.ts",
+      "count": 2,
+      "cases": [
+        {
+          "name": "a pinned run removes its local state directory"
+        },
+        {
+          "name": "a pinned sequence removes its local state directory, also when the body throws"
         }
       ]
     },
@@ -3215,7 +4487,7 @@
     },
     {
       "file": "src/commands/registryPin/registryPin.test.ts",
-      "count": 20,
+      "count": 22,
       "cases": [
         {
           "name": "message read"
@@ -3237,6 +4509,12 @@
         },
         {
           "name": "inbox check"
+        },
+        {
+          "name": "inbox check (inbox items, RFC 081)"
+        },
+        {
+          "name": "inbox read / dismiss"
         },
         {
           "name": "thread unfollow"
@@ -3281,7 +4559,7 @@
     },
     {
       "file": "src/commands/reminder/_format.test.ts",
-      "count": 15,
+      "count": 17,
       "cases": [
         {
           "name": "formatReminder: scheduled without msgRef"
@@ -3311,6 +4589,9 @@
           "name": "formatReminderList: multiple"
         },
         {
+          "name": "formatReminderList: fired reminders left out of the default view are counted with the command that lists them"
+        },
+        {
           "name": "formatReminderCanceled"
         },
         {
@@ -3327,12 +4608,15 @@
         },
         {
           "name": "formatReminderList: marks only the overdue rows in a mixed list"
+        },
+        {
+          "name": "a migrated reminder shows where it went, with no next fire here, and the list explains once"
         }
       ]
     },
     {
       "file": "src/commands/reminder/ack.test.ts",
-      "count": 13,
+      "count": 15,
       "cases": [
         {
           "name": "ack rejects a sealed exact reminder before posting the item"
@@ -3356,7 +4640,10 @@
           "name": "dismiss command shares the same exact fired-item acknowledgement path"
         },
         {
-          "name": "repeat ack is idempotent only with an exact durable acknowledged-source tombstone"
+          "name": "repeat ack of an acked item sends the daemon the ack (it forwards it to the Server) and reports it acknowledged"
+        },
+        {
+          "name": "repeat ack against a daemon that only knows the local tombstone (item_not_found) keeps the old answer"
         },
         {
           "name": "ack 404 after a stale snapshot only succeeds with a refreshed exact tombstone"
@@ -3365,7 +4652,10 @@
           "name": "ack 404 after a stale snapshot fails closed without a refreshed exact tombstone"
         },
         {
-          "name": "ack does not treat absence as idempotency without an exact tombstone"
+          "name": "ack of a full reminder id the daemon does not hold sends the exact source; item_not_found fails closed"
+        },
+        {
+          "name": "ack of a short id nothing local matches asks for the full id without posting"
         },
         {
           "name": "repeat ack of N stays idempotent after the same reminder advances to active N+1"
@@ -3398,13 +4688,25 @@
     },
     {
       "file": "src/commands/reminder/log.test.ts",
-      "count": 2,
+      "count": 6,
       "cases": [
         {
           "name": "historical reminder short action reads the full source without acknowledging local due item"
         },
         {
           "name": "failed reminder log read never checks or acknowledges local Inbox"
+        },
+        {
+          "name": "--key lists entries newest first, one line each, titles folded and cut, bodies not printed"
+        },
+        {
+          "name": "--key with no entries says so for the last 7 days; the reserved raft.throttled key can be read"
+        },
+        {
+          "name": "--id and --key: exactly one; both or neither is INVALID_ARG naming both flags"
+        },
+        {
+          "name": "--key without the Reminder app: REMINDER_APP_NOT_INSTALLED"
         }
       ]
     },
@@ -3454,6 +4756,45 @@
       ]
     },
     {
+      "file": "src/commands/reminder/trigger.test.ts",
+      "count": 11,
+      "cases": [
+        {
+          "name": "woke: sent, wakes you, and says until when later triggers are recorded"
+        },
+        {
+          "name": "the app's { ok, result, status } envelope is unwrapped (the live reminder.raft.build answer)"
+        },
+        {
+          "name": "merged: recorded, not sent, with the count and when the next one is sent"
+        },
+        {
+          "name": "recorded (level log): logged only, never wakes"
+        },
+        {
+          "name": "throttled: over the hourly cap, dated when the wake allowance is another UTC day"
+        },
+        {
+          "name": "payload: requestId per call, merge window in seconds, level, anchor from --channel and --message-id"
+        },
+        {
+          "name": "details: --details text or --details - from stdin (trailing newline dropped); stdin is never read without -"
+        },
+        {
+          "name": "details: --details - from a terminal, or more than 4 KB, is refused before any call"
+        },
+        {
+          "name": "key, window, level, title and anchor are checked before any call, naming the rule and the bad value"
+        },
+        {
+          "name": "no Reminder app on the server: REMINDER_APP_NOT_INSTALLED with where to look"
+        },
+        {
+          "name": "other invoke errors (login needed, the app's own answer) pass through unchanged"
+        }
+      ]
+    },
+    {
       "file": "src/commands/reviewerIsolation.test.ts",
       "count": 2,
       "cases": [
@@ -3467,7 +4808,7 @@
     },
     {
       "file": "src/commands/sdkOpsParity.test.ts",
-      "count": 3,
+      "count": 5,
       "cases": [
         {
           "name": "users.info text is the CLI's `raft user info` (human, agent, paged, skipped rosters)"
@@ -3477,6 +4818,12 @@
         },
         {
           "name": "tasks.show text is the CLI's `raft task show` (three description states, done tasks, misses)"
+        },
+        {
+          "name": "actions.withdraw text is the CLI's `raft action withdraw` (withdrawn, already withdrawn, asked anyone, misses)"
+        },
+        {
+          "name": "artifacts.check text is the CLI's `raft artifact check` (none, pending, running, failed, skipped, done with no screenshots kept, misses)"
         }
       ]
     },
@@ -3503,7 +4850,7 @@
     },
     {
       "file": "src/commands/server/info.test.ts",
-      "count": 7,
+      "count": 9,
       "cases": [
         {
           "name": "server info command uses injected ApiClient and env workspace fallback"
@@ -3513,6 +4860,12 @@
         },
         {
           "name": "server info --channels filters joined rows and prints paging command"
+        },
+        {
+          "name": "server info --channels shows each channel's last post, and nothing when the Server doesn't know it"
+        },
+        {
+          "name": "server info --channels counts archived channels under the list; --archived lists them; --query finds them"
         },
         {
           "name": "server info rejects --full combined with section filters before auth bootstrap"
@@ -3548,7 +4901,7 @@
     },
     {
       "file": "src/commands/task/_format.test.ts",
-      "count": 28,
+      "count": 37,
       "cases": [
         {
           "name": "formatTaskList: empty with no filter"
@@ -3633,12 +4986,39 @@
         },
         {
           "name": "formatMyTaskList: the same report-block title stays on one line (task #123, other render path)"
+        },
+        {
+          "name": "formatTaskList: task v2 tasks are named by their ref, with their source message"
+        },
+        {
+          "name": "formatTaskList: a pre-v2 task with its own conversation names its earlier thread"
+        },
+        {
+          "name": "formatTasksCreated: task v2 tasks print their ref and the task reply command"
+        },
+        {
+          "name": "formatClaimResults: task v2 results are named by ref and follow up with raft task reply"
+        },
+        {
+          "name": "formatTasksCreated: a task v2 task taken from a message points back to the message's thread"
+        },
+        {
+          "name": "formatTaskStatusUpdated: a task v2 task moved to in_review is steered to done or in_progress, and where to answer"
+        },
+        {
+          "name": "formatTaskList / formatMyTaskList: a pre-v2 task without its conversation on a task v2 server is named by ref"
+        },
+        {
+          "name": "task mutation receipts: the server's taskRef names the task (task v2); #N otherwise"
+        },
+        {
+          "name": "formatTaskList / formatMyTaskList: the creator is named by handle; a display name is never @-prefixed"
         }
       ]
     },
     {
       "file": "src/commands/task/amend.test.ts",
-      "count": 3,
+      "count": 4,
       "cases": [
         {
           "name": "task amend sends explicit fields and renders the durable revision/event receipt"
@@ -3648,12 +5028,15 @@
         },
         {
           "name": "reviewer-isolation task amend requests withheld freshness context"
+        },
+        {
+          "name": "a held task amend is counted for the daemon's turn report while passive AX is on"
         }
       ]
     },
     {
       "file": "src/commands/task/assign.test.ts",
-      "count": 6,
+      "count": 13,
       "cases": [
         {
           "name": "task assign sends the handle and writes canonical text"
@@ -3672,12 +5055,33 @@
         },
         {
           "name": "server failures map to a typed CliError, 5xx distinctly"
+        },
+        {
+          "name": "task assign over the task-write budget: RATE_LIMITED, retryable, how long to wait"
+        },
+        {
+          "name": "a task ref and a positional assignee name the task and who gets it, with the reason"
+        },
+        {
+          "name": "a DM task ref works, and --assignee still names the assignee after a ref"
+        },
+        {
+          "name": "a lone @who positional with --target/--number is the assignee"
+        },
+        {
+          "name": "a ref and flags that disagree, or two different assignees, are refused before auth bootstrap"
+        },
+        {
+          "name": "the server's refusal of a hand-off without a reason is printed as it says it, with its next step"
+        },
+        {
+          "name": "a ref the shell cut off (unquoted #) is named as the likely cause, before auth bootstrap"
         }
       ]
     },
     {
       "file": "src/commands/task/claim.test.ts",
-      "count": 8,
+      "count": 12,
       "cases": [
         {
           "name": "task claim command keeps repeated task numbers as one batched claim request"
@@ -3702,12 +5106,66 @@
         },
         {
           "name": "proxy 5xx with upstream_http_response yields PROXY_5XX with the server-side next action"
+        },
+        {
+          "name": "a held claim is counted for the daemon's turn report while passive AX is on"
+        },
+        {
+          "name": "task v2 server: claim --message-id surfaces task_v2_use_create with the server's commands verbatim"
+        },
+        {
+          "name": "task claim over the task-write budget: RATE_LIMITED, retryable, the wait; under reviewer isolation too (the sentence holds only counts)"
+        },
+        {
+          "name": "task claim takes one task by its ref"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/task/conversation.test.ts",
+      "count": 12,
+      "cases": [
+        {
+          "name": "resolveTaskAddress: a ref, or --target + --number, never both disagreeing"
+        },
+        {
+          "name": "task view: GET /tasks/view and the task named by its ref with next commands"
+        },
+        {
+          "name": "task view: Created by names the creator's handle, never a display name as @name"
+        },
+        {
+          "name": "task reply: POST /tasks/reply with the stdin body, mentions and attachments; prints the ref"
+        },
+        {
+          "name": "task reply: names the agents the reply was delivered to"
+        },
+        {
+          "name": "task reply: a lost 5xx is reconciled under the same idempotency key, never sent twice"
+        },
+        {
+          "name": "task reply: no stdin body names the task reply heredoc, without a request"
+        },
+        {
+          "name": "task reply: the server's refusal (flag off) surfaces its code"
+        },
+        {
+          "name": "task read: GET /tasks/read with the window flags; the window is named by the ref"
+        },
+        {
+          "name": "task follow / unfollow: POST and receipts naming the ref"
+        },
+        {
+          "name": "message send / message read refuse a task ref locally, naming the task command"
+        },
+        {
+          "name": "inbox check: a task conversation row is labelled by its ref and title and is read with raft task read"
         }
       ]
     },
     {
       "file": "src/commands/task/convert.test.ts",
-      "count": 4,
+      "count": 5,
       "cases": [
         {
           "name": "task convert command uses injected ApiClient and writes canonical text"
@@ -3720,21 +5178,21 @@
         },
         {
           "name": "task convert maps a 5xx to SERVER_5XX rather than CONVERT_FAILED"
+        },
+        {
+          "name": "task v2 server: convert surfaces task_v2_use_create with the create command verbatim"
         }
       ]
     },
     {
       "file": "src/commands/task/create.test.ts",
-      "count": 7,
+      "count": 12,
       "cases": [
         {
           "name": "task create command uses injected ApiClient and writes canonical text"
         },
         {
           "name": "task create sends one atomic create-and-assign request"
-        },
-        {
-          "name": "task create help advertises atomic assignee semantics"
         },
         {
           "name": "task create marks every batch item as resource-creating"
@@ -3747,6 +5205,24 @@
         },
         {
           "name": "task create command maps server failures into typed CliError"
+        },
+        {
+          "name": "task create without a source on a task v2 server shows the Server's sentence and the create to run instead"
+        },
+        {
+          "name": "task create from a thread reply says the task hangs under the thread's root message"
+        },
+        {
+          "name": "task create help says the source message is required where task conversations are on"
+        },
+        {
+          "name": "task create sends description and source message id"
+        },
+        {
+          "name": "task create applies --message-id to every title and rejects --description with several titles"
+        },
+        {
+          "name": "task create sends --status for every title and refuses a status a task can't start in"
         }
       ]
     },
@@ -3779,7 +5255,7 @@
     },
     {
       "file": "src/commands/task/list.test.ts",
-      "count": 6,
+      "count": 8,
       "cases": [
         {
           "name": "task list command uses injected ApiClient and writes canonical text"
@@ -3798,24 +5274,21 @@
         },
         {
           "name": "task list command maps server failures into typed CliError"
+        },
+        {
+          "name": "task list --following (task v2): GET /tasks/following, refs with unread and the read command"
+        },
+        {
+          "name": "task list --following refuses --mine / --target / --status"
         }
       ]
     },
     {
       "file": "src/commands/task/mineManualContract.test.ts",
-      "count": 4,
+      "count": 1,
       "cases": [
         {
-          "name": "the manual quotes the heading the renderer actually prints"
-        },
-        {
-          "name": "the manual documents server scope, not just channel scope"
-        },
-        {
-          "name": "an absent pagination block renders unknown, and the manual says unknown is not false"
-        },
-        {
-          "name": "showing X of X is the same count twice, and the manual says so"
+          "name": "an absent pagination block renders unknown"
         }
       ]
     },
@@ -3833,7 +5306,7 @@
     },
     {
       "file": "src/commands/task/show.test.ts",
-      "count": 9,
+      "count": 10,
       "cases": [
         {
           "name": "task show renders the delivery surface's labels verbatim"
@@ -3857,6 +5330,9 @@
           "name": "an EMPTY list with the completeness assertion is a definite not-found"
         },
         {
+          "name": "a different or incomplete scope cannot prove a task absent from this channel"
+        },
+        {
           "name": "a truncated:true body never reaches the completeness branch — the contract rejects it first"
         },
         {
@@ -3866,7 +5342,7 @@
     },
     {
       "file": "src/commands/task/unassign.test.ts",
-      "count": 4,
+      "count": 5,
       "cases": [
         {
           "name": "task unassign sends an explicit null assignee and writes canonical text"
@@ -3879,6 +5355,9 @@
         },
         {
           "name": "task unassign maps invalid numbers and revisions to typed CliError"
+        },
+        {
+          "name": "task unassign takes the task by its ref"
         }
       ]
     },
@@ -3899,13 +5378,16 @@
     },
     {
       "file": "src/commands/task/update.test.ts",
-      "count": 8,
+      "count": 13,
       "cases": [
         {
           "name": "task update command uses injected ApiClient and writes canonical text"
         },
         {
           "name": "task update command preserves freshness-hold output"
+        },
+        {
+          "name": "a held task update is counted for the daemon's turn report while passive AX is on"
         },
         {
           "name": "reviewer-isolation task update sends withheld mode and never renders poisoned hold metadata"
@@ -3924,6 +5406,36 @@
         },
         {
           "name": "task update command maps server failures into typed CliError"
+        },
+        {
+          "name": "task update sends backlog with its reason, folded to one line, and without one"
+        },
+        {
+          "name": "task update refuses --reason with any other status before loading credentials"
+        },
+        {
+          "name": "task update takes the task by its ref, as task view does, and refuses a ref that disagrees with --number"
+        },
+        {
+          "name": "--peer-kind applies to a DM task ref; a channel ref refuses it, naming the DM forms"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/thread/follow.test.ts",
+      "count": 4,
+      "cases": [
+        {
+          "name": "follow thread output names the unfollow command"
+        },
+        {
+          "name": "follow thread command POSTs /threads/follow and writes the receipt"
+        },
+        {
+          "name": "follow thread command refuses a non-thread target (a task ref names raft task follow) without a request"
+        },
+        {
+          "name": "follow thread command surfaces a server refusal"
         }
       ]
     },
@@ -3944,16 +5456,13 @@
     },
     {
       "file": "src/commands/thread/unfollow.test.ts",
-      "count": 5,
+      "count": 4,
       "cases": [
         {
           "name": "parseThreadTarget accepts explicit thread targets and UUIDs"
         },
         {
           "name": "parseThreadTarget rejects non-thread targets"
-        },
-        {
-          "name": "unfollow thread output explains delivery semantics"
         },
         {
           "name": "unfollow thread command uses injected ApiClient and writes result"
@@ -4015,8 +5524,20 @@
       ]
     },
     {
+      "file": "src/contBin.test.ts",
+      "count": 2,
+      "cases": [
+        {
+          "name": "the package bins include cont, pointing at the generated wrapper"
+        },
+        {
+          "name": "cont runs the CLI as raft __continue: its arguments, stdin and exit status pass through"
+        }
+      ]
+    },
+    {
       "file": "src/core/apiFailure.test.ts",
-      "count": 8,
+      "count": 11,
       "cases": [
         {
           "name": "every proxy failure class starts with what the agent itself can do, then the diagnosis"
@@ -4041,6 +5562,15 @@
         },
         {
           "name": "post_response_local points at the local daemon, not the server (task #369)"
+        },
+        {
+          "name": "a 429 RATE_LIMITED: the Server's sentence, retryable, the wait in the next action"
+        },
+        {
+          "name": "a 429 RATE_LIMITED whose sentence isn't one short line gets a stand-in from its details"
+        },
+        {
+          "name": "not a 429 RATE_LIMITED body: no rate-limit error"
         }
       ]
     },
@@ -4166,37 +5696,16 @@
     },
     {
       "file": "src/parserOutput.test.ts",
-      "count": 10,
+      "count": 3,
       "cases": [
         {
-          "name": "root help exact output"
-        },
-        {
-          "name": "app config help exact output"
+          "name": "app config help names its flags (flag names are the interface)"
         },
         {
           "name": "root --version identifies the CLI carrier and never emits a placeholder"
         },
         {
           "name": "parser harness isolates the repository CLI from an inherited managed transport"
-        },
-        {
-          "name": "manual help exact output"
-        },
-        {
-          "name": "manual get help exact output"
-        },
-        {
-          "name": "manual search help exact output"
-        },
-        {
-          "name": "missing parser argument exact stderr"
-        },
-        {
-          "name": "unknown parser command exact stderr"
-        },
-        {
-          "name": "unknown parser option exact stderr"
         }
       ]
     },
@@ -4217,13 +5726,16 @@
     },
     {
       "file": "src/proxy.test.ts",
-      "count": 2,
+      "count": 3,
       "cases": [
         {
           "name": "canonical fetch reaches a proxy-only target and preserves a direct no-proxy route"
         },
         {
           "name": "canonical fetch diagnostics keep bounded cause classes and redact URL credentials"
+        },
+        {
+          "name": "fetchWithDispatcher sends a FormData body through a real proxy with the package dispatcher"
         }
       ]
     },
@@ -4241,7 +5753,7 @@
     },
     {
       "file": "src/runtimePreflight.test.ts",
-      "count": 6,
+      "count": 5,
       "cases": [
         {
           "name": "parseNodeMajor accepts normal Node version strings"
@@ -4254,9 +5766,6 @@
         },
         {
           "name": "runtime copy tracks the published CLI Node contract and repository pin"
-        },
-        {
-          "name": "bootstrap runs preflight before dynamically importing the CLI implementation"
         },
         {
           "name": "bootstrap reports a main-module load failure and exits nonzero"
@@ -4295,7 +5804,7 @@
     },
     {
       "file": "src/state/agentLedger.test.ts",
-      "count": 15,
+      "count": 16,
       "cases": [
         {
           "name": "ledger path resolution prefers the explicit override, then legacy aliases, then the Raft home"
@@ -4334,6 +5843,9 @@
           "name": "an agent id that could name another directory is refused"
         },
         {
+          "name": "any ledger open creates the passive render counts table, also in a ledger an older CLI made"
+        },
+        {
           "name": "the exported read record is never older than the ledger"
         },
         {
@@ -4354,6 +5866,48 @@
       ]
     },
     {
+      "file": "src/state/continuationStore.test.ts",
+      "count": 12,
+      "cases": [
+        {
+          "name": "put then get returns the record as written; an unknown id reads as undefined"
+        },
+        {
+          "name": "what comes back is exactly what was written: no field added, none dropped or retyped"
+        },
+        {
+          "name": "put never overwrites an existing id"
+        },
+        {
+          "name": "records are copies: changing one written or read changes nothing stored"
+        },
+        {
+          "name": "update replaces the record only from the expected revision"
+        },
+        {
+          "name": "update never inserts"
+        },
+        {
+          "name": "delete removes the record, not its tombstone; deleting a missing id does nothing"
+        },
+        {
+          "name": "a tombstone is kept apart from records and replaced by the next one for its id"
+        },
+        {
+          "name": "deleteExpired deletes exactly what has deleteAfter before now: no status, deadline or lease counts"
+        },
+        {
+          "name": "the continuation tables are additive: the ledger stays at version 1 and its other books are untouched"
+        },
+        {
+          "name": "a ledger the store cannot use throws instead of answering that nothing is stored"
+        },
+        {
+          "name": "another agent on the same machine cannot answer a continuation: its ledger has none, and a shared store refuses it"
+        }
+      ]
+    },
+    {
       "file": "src/stdoutEpipe.test.ts",
       "count": 2,
       "cases": [
@@ -4362,6 +5916,15 @@
         },
         {
           "name": "EPIPE keeps quiet but never decides success: a non-zero exit code survives"
+        }
+      ]
+    },
+    {
+      "file": "src/testEnvironment.test.ts",
+      "count": 1,
+      "cases": [
+        {
+          "name": "Vitest config removes inherited Raft state and preserves test harness controls"
         }
       ]
     },

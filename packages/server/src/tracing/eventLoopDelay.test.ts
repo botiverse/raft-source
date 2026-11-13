@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "vitest";
 import { BasicTracer, type TraceLogEvent } from "@botiverse/raft-shared";
-import { startEventLoopDelaySampler, toSample } from "./eventLoopDelay";
+import { startEventLoopDelaySampler, toCpuGcSample, toSample } from "./eventLoopDelay";
 
 test("toSample converts nanoseconds to rounded milliseconds", () => {
   const sample = toSample(
@@ -31,5 +31,33 @@ test("the sampler emits one server.event_loop.delay event per interval", async (
   assert.equal(event.surface, "server");
   for (const key of ["delay_p50_ms", "delay_p99_ms", "delay_max_ms", "delay_mean_ms", "utilization"]) {
     assert.equal(typeof event.attrs?.[key], "number", key);
+  }
+});
+
+test("toCpuGcSample reports CPU as cores used over the wall interval", () => {
+  assert.deepEqual(toCpuGcSample({ user: 6_000_000, system: 1_500_000 }, 10_000, 4, 12.34, "Intel Xeon"), {
+    cpu_cores_used: 0.75,
+    gc_count: 4,
+    gc_pause_ms: 12.3,
+    "host.cpu.model.name": "Intel Xeon",
+  });
+  assert.equal(toCpuGcSample({ user: 1, system: 1 }, 0, 0, 0, "x").cpu_cores_used, 0);
+});
+
+test("the sampler carries the load reader's counts, and survives one that throws", async () => {
+  for (const [load, expected] of [
+    [() => ({ machine_connections: 7 }), 7],
+    [() => { throw new Error("boom"); }, undefined],
+  ] as const) {
+    const events: TraceLogEvent[] = [];
+    const tracer = new BasicTracer({ sink: { record: () => undefined, recordLogEvent: (event) => { events.push(event); } } });
+    const stop = startEventLoopDelaySampler(tracer, 20, load);
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    stop();
+    assert.ok(events.length >= 1);
+    const attrs = events[0]!.attrs as Record<string, unknown>;
+    assert.equal(attrs.machine_connections, expected);
+    assert.equal(typeof attrs.cpu_cores_used, "number");
+    assert.equal(typeof attrs["host.cpu.model.name"], "string");
   }
 });

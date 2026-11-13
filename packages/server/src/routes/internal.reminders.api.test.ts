@@ -1,13 +1,15 @@
 import { fixturePasswordHash } from "../test/integration/credentials";
 import { createApiTest } from "../test/integration/apiTest";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { refusalBody } from "../lib/refusal";
+import { AGENT_CHANNEL_NOT_FOUND_REFUSAL } from "./agentRouteRefusals";
 
 import { getDb } from "../db/index";
 import { eq } from "drizzle-orm";
 import { agents, jointChannels, jointChannelServers, reminders, serverMembers, threadFollows, users } from "../db/schema";
 import { addMember, createServer } from "../services/serverService";
-import { createAgent, assignMachine } from "../services/agentService";
+import { createAgent } from "../services/agentService";
+import { placeAgentOnMachine } from "../test/agentMachineFixture";
 import { registerMachine } from "../services/machineService";
 import { mintAgentCredential } from "../services/agentCredentialService";
 import { createMessage } from "../services/messageService";
@@ -18,11 +20,13 @@ import * as channelService from "../services/channelService";
 import {
   fireReminder,
   getReminderById,
+  markReminderMigrated,
   replaceReminder,
   type ReminderRow,
 } from "../apps/reminder/service";
+import { revealAllChannelForTest } from "../test/allChannelFixture";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 /**
  * These route tests create reminders through the HTTP surface, so their fireAt
@@ -57,49 +61,6 @@ function firedOk<T extends { ok: boolean }>(result: T): Extract<T, { ok: true }>
   }
   return result as Extract<T, { ok: true }>;
 }
-
-test("reminder route families bind CRUD to the App-owned service and sync lifecycle revisions to Computer", () => {
-  for (const routeFile of ["./internal.ts", "./internalAgentApi.ts"]) {
-    const source = readFileSync(new URL(routeFile, import.meta.url), "utf8");
-    const operations = [
-      "createAppReminder",
-      "cancelAppReminder",
-      "snoozeAppReminder",
-      "updateAppReminder",
-      "listAppReminders",
-      "getAppReminderById",
-    ];
-    operations.push(routeFile === "./internalAgentApi.ts"
-      ? "listAppReminderEventsForOwner"
-      : "listAppReminderEvents");
-    for (const operation of operations) {
-      assert.match(source, new RegExp(`reminderCrud\\.${operation}\\(`), `${routeFile} must use ${operation}`);
-    }
-    if (routeFile === "./internalAgentApi.ts") {
-      assert.match(source, /reminderCrud\.resolveAppHistoricalReminderIdForOwner\(/);
-      const logRouteStart = source.indexOf('registerAgentApiRoute("reminderLog"');
-      const nextRouteStart = source.indexOf("\nregisterAgentApiRoute(", logRouteStart + 1);
-      const logRouteSource = source.slice(logRouteStart, nextRouteStart);
-      assert.doesNotMatch(
-        logRouteSource,
-        /loadOwnedReminder\(/,
-        "historical source actions must not require ownership of the current reminder row",
-      );
-    }
-    assert.doesNotMatch(
-      source,
-      /reminderService\.(?:createReminder|cancelReminder|snoozeReminder|updateReminder|listReminders|listReminderEvents|getReminderById)\(/,
-      `${routeFile} must not bypass the App-owned CRUD boundary`,
-    );
-    assert.match(source, /pushReminderUpsert\(/, `${routeFile} must sync scheduled revisions`);
-    assert.match(source, /pushReminderCancel\(/, `${routeFile} must sync canceled revisions`);
-    assert.equal(
-      source.match(/expectedVersion: existing\.version/g)?.length,
-      3,
-      `${routeFile} must bind cancel, snooze, and update to the caller-observed row version`,
-    );
-  }
-});
 
 // Agent-facing write path emits live Reminders-tab updates via socket. This
 // pairs the server contract with the new human-facing tab on agent profile
@@ -180,18 +141,18 @@ function deliveredTo(events: EmittedEvent[], event: string): string[] {
 function installReminderOrchestratorStub(app: {
   get: (k: string) => unknown;
   set: (k: string, v: unknown) => void;
-}): { upserts: Array<{ agentId: string; row: ReminderRow }>; cancels: Array<{ agentId: string; reminderId: string; version: number }> } {
+}): { upserts: Array<{ agentId: string; row: ReminderRow }>; cancels: Array<{ agentId: string; reminderId: string; version: number; canceled: boolean }> } {
   const existing = (app.get("agentOrchestrator") as Record<string, unknown>) ?? {};
   const upserts: Array<{ agentId: string; row: ReminderRow }> = [];
-  const cancels: Array<{ agentId: string; reminderId: string; version: number }> = [];
+  const cancels: Array<{ agentId: string; reminderId: string; version: number; canceled: boolean }> = [];
   app.set("agentOrchestrator", {
     ...existing,
     pushReminderUpsert: (agentId: string, row: ReminderRow) => {
       upserts.push({ agentId, row });
       return true;
     },
-    pushReminderCancel: (agentId: string, reminderId: string, version: number) => {
-      cancels.push({ agentId, reminderId, version });
+    pushReminderCancel: (agentId: string, reminderId: string, version: number, opts?: { canceled?: boolean }) => {
+      cancels.push({ agentId, reminderId, version, canceled: opts?.canceled === true });
       return true;
     },
   });
@@ -211,9 +172,10 @@ async function seed() {
     })
     .returning();
   const server = await createServer("Internal Reminders", "internal-reminders", owner.id);
+  await revealAllChannelForTest(server.id);
   const agent = await createAgent(server.id, "r-agent", { runtime: "claude" });
   const { machine, apiKey } = await registerMachine(server.id, owner.id, "dev-machine");
-  await assignMachine(agent.id, machine.id);
+  await placeAgentOnMachine(agent.id, machine.id);
   const [channel] = await channelService.listChannels(server.id);
   const anchor = await createMessage(channel.id, "user", owner.id, "anchor reminder here");
   return { owner, server, agent, machine, apiKey, anchorId: anchor.id };
@@ -243,7 +205,6 @@ async function seedJointReminderAnchor(input: { server: { id: string }; agent: {
   const canonical = await channelService.createChannel(hostServer.id, "joint-reminder-storage", undefined, "channel");
   const hostProjection = await channelService.createChannel(hostServer.id, "Github-Runner运维", undefined, "joint");
   const localProjection = await channelService.createChannel(input.server.id, "Github-Runner运维", undefined, "joint");
-  await channelService.addAgent(localProjection.id, input.agent.id);
 
   const [joint] = await db.insert(jointChannels).values({
     canonicalChannelId: canonical.id,
@@ -267,6 +228,8 @@ async function seedJointReminderAnchor(input: { server: { id: string }; agent: {
     },
   ]);
 
+  await channelService.addAgent(localProjection.id, input.agent.id);
+
   return createMessage(canonical.id, "user", hostOwner.id, "joint reminder anchor");
 }
 
@@ -282,6 +245,7 @@ async function agentApiKey(agentId: string): Promise<string> {
     agentId,
     scopes: ["read", "tasks"],
     name: "internal-reminders-agent-api",
+    issuedVia: "computer",
     createdByUserId: null,
   });
   return minted.apiKey;
@@ -433,10 +397,12 @@ test("reminder_app on: legacy reminder writes are refused with reminders_moved_t
   ];
   for (const res of refused) {
     assert.equal(res.status, 409);
-    const body = await res.json() as { code?: string; error?: string };
+    const body = await res.json() as { code?: string; error?: string; suggestedNextAction?: string };
     assert.equal(body.code, "reminders_moved_to_app");
     assert.match(body.error ?? "", /moved to the Reminder app/);
-    assert.match(body.error ?? "", /raft integration invoke --service <id> --list-actions/);
+    // The sentence names no command; the next step does.
+    assert.doesNotMatch(body.error ?? "", /raft /);
+    assert.match(body.suggestedNextAction ?? "", /raft integration invoke --service <id> --list-actions/);
   }
   const requestSpans = sink.getAllSpans().filter((span) => span.name === "server.http.request");
   assert.equal(requestSpans.filter((span) => span.attrs?.error_code === "reminders_moved_to_app").length, refused.length);
@@ -467,7 +433,7 @@ test("every agent-api 4xx is classified on the request span (error_code + reason
 
   const missing = await read(`channel=${encodeURIComponent("#no-such-channel")}`);
   assert.equal(missing.status, 404);
-  assert.deepEqual(await missing.json(), { error: "Channel not found or not visible" }, "the caller still gets the neutral body");
+  assert.deepEqual(await missing.json(), refusalBody(AGENT_CHANNEL_NOT_FOUND_REFUSAL), "the caller still gets the neutral body");
   const missingThread = await read(`channel=${encodeURIComponent("#no-such-channel:deadbeef")}`);
   assert.equal(missingThread.status, 404);
   const invalid = await read(`channel=${encodeURIComponent(`#${visible!.name}`)}&unread=true&before=1`);
@@ -481,7 +447,8 @@ test("every agent-api 4xx is classified on the request span (error_code + reason
   assert.deepEqual(classified.slice(0, 3), [
     ["channel_not_found", "not_found"],
     ["thread_parent_channel_not_found", "not_found"],
-    ["invalid_arg", "invalid_input"],
+    // refuse() records the refusal's own code, as sent (INVALID_ARG).
+    ["INVALID_ARG", "invalid_input"],
   ]);
   const last = classified.at(-1)!;
   assert.equal(last[1], "invalid_input");
@@ -568,8 +535,9 @@ test("agent-api reminder routes use bound credential identity without legacy age
     ownerAgentId: agent.id,
   });
   assert.deepEqual(sync.upserts.map(({ row }) => row.version), [1, 2, 4]);
-  assert.deepEqual(sync.cancels.map(({ reminderId, version }) => [reminderId, version]), [
-    [createBody.reminder.reminderId, 5],
+  // The push says the reminder itself was canceled: its Computer drops the un-acked items it holds of it (RFC 081 D21).
+  assert.deepEqual(sync.cancels.map(({ reminderId, version, canceled }) => [reminderId, version, canceled]), [
+    [createBody.reminder.reminderId, 5, true],
   ]);
 });
 
@@ -655,13 +623,10 @@ test("agent-api recurring create preserves --channel as lifecycle metadata witho
   const { owner, server, agent, anchorId } = await seed();
   installReminderOrchestratorStub(app.app);
   installFakeIo(app.app);
-  const ownerChannel = await channelService.createChannel(
-    server.id,
-    "onboarding-owner",
-    "owner-only onboarding",
-    "private",
-  );
-  await channelService.addHuman(ownerChannel.id, owner.id);
+  // Every new server is born with the owner's private onboarding-owner channel.
+  const ownerChannel = (await channelService.listChannels(server.id, owner.id))
+    .find((ch) => ch.name === "onboarding-owner");
+  assert.ok(ownerChannel);
   await channelService.addAgent(ownerChannel.id, agent.id);
 
   const thread = await channelService.getOrCreateThread(anchorId, agent.id, "agent");
@@ -813,14 +778,15 @@ test("GET /internal/agent-api/reminders validates the ?status filter", async ({ 
     headers: agentHeaders(apiKey),
   });
   assert.equal(res.status, 400, `expected 400, got ${res.status}`);
-  const body = (await res.json()) as { error?: string };
-  assert.equal(body.error, "Invalid status value");
+  const body = (await res.json()) as { code?: string; error?: string };
+  assert.equal(body.code, "reminder_status_invalid");
+  assert.match(body.error ?? "", /scheduled, fired, canceled or migrated/);
 });
 
 test("DELETE /internal/agent/:id/reminders/:reminderId delivers reminder:canceled only to users who may inspect the owner agent", async ({ app }) => {
   const { owner, server, agent, apiKey, anchorId } = await seed();
   const { admin, creator } = await seedReminderViewers(server.id, agent.id);
-  installReminderOrchestratorStub(app.app);
+  const sync = installReminderOrchestratorStub(app.app);
 
   // Create the reminder first via the same route so we exercise the real path.
   const createRes = await fetch(`${app.baseUrl}/internal/agent/${agent.id}/reminders`, {
@@ -844,6 +810,7 @@ test("DELETE /internal/agent/:id/reminders/:reminderId delivers reminder:cancele
     },
   );
   assert.equal(delRes.status, 200, `expected 200, got ${delRes.status}`);
+  assert.deepEqual(sync.cancels.map(({ reminderId, canceled }) => [reminderId, canceled]), [[reminderId, true]]);
 
   assert.deepEqual(
     deliveredTo(events, "reminder:canceled"),
@@ -870,8 +837,9 @@ test("POST /internal/agent/:id/reminders rejects missing msgId", async ({ app })
     }),
   });
   assert.equal(res.status, 400, `expected 400, got ${res.status}`);
-  const body = (await res.json()) as { error?: string };
-  assert.match(body.error ?? "", /msgId is required/);
+  const body = (await res.json()) as { code?: string; error?: string };
+  assert.equal(body.code, "reminder_message_required");
+  assert.match(body.error ?? "", /needs the message it is about/);
 });
 
 test("snooze/update/log routes enforce B-minimal reminder state", async ({ app }) => {
@@ -947,6 +915,60 @@ test("GET /internal/agent/:id/reminders validates the ?status filter", async ({ 
     { headers: machineHeaders(apiKey) },
   );
   assert.equal(badRes.status, 400, `expected 400 for invalid status, got ${badRes.status}`);
-  const badBody = (await badRes.json()) as { error: string };
-  assert.equal(badBody.error, "Invalid status value");
+  const badBody = (await badRes.json()) as { code?: string; error: string };
+  assert.equal(badBody.code, "reminder_status_invalid");
+  assert.match(badBody.error, /scheduled, fired, canceled or migrated/);
+});
+
+test("a migrated reminder reaches only clients that ask, and every mutation points to the Reminder app", async ({ app }) => {
+  const { agent, anchorId } = await seed();
+  installReminderOrchestratorStub(app.app);
+  installFakeIo(app.app);
+  const headers = agentHeaders(await agentApiKey(agent.id));
+
+  const createRes = await fetch(`${app.baseUrl}/internal/agent-api/reminders`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ title: "moves", delaySeconds: 3600, msgId: anchorId }),
+  });
+  assert.equal(createRes.status, 201);
+  const { reminder } = (await createRes.json()) as { reminder: { reminderId: string } };
+  const row = await getReminderById(reminder.reminderId);
+  assert.ok(row);
+  assert.ok(await markReminderMigrated(row.id, { appReminderId: "app-1" }, { expectedVersion: row.version }));
+
+  const statuses = async (query: string) => {
+    const res = await fetch(`${app.baseUrl}/internal/agent-api/reminders${query}`, { headers });
+    assert.equal(res.status, 200, query);
+    return ((await res.json()) as { reminders: Array<{ status: string }> }).reminders.map((r) => r.status);
+  };
+  // What older CLIs send: never a `migrated` row (their enum would reject the whole list).
+  assert.deepEqual(await statuses("?status=scheduled,fired"), []);
+  assert.deepEqual(await statuses("?all=true"), []);
+  // What a new CLI sends.
+  assert.deepEqual(await statuses("?status=scheduled,fired&includeMigrated=true"), ["migrated"]);
+  assert.deepEqual(await statuses("?status=migrated"), ["migrated"]);
+
+  for (const [method, path, body] of [
+    ["DELETE", "", undefined],
+    ["POST", "/snooze", { delaySeconds: 300 }],
+    ["PATCH", "", { title: "renamed" }],
+  ] as const) {
+    const res: Response = await fetch(`${app.baseUrl}/internal/agent-api/reminders/${row.id}${path}`, {
+      method,
+      headers,
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    assert.equal(res.status, 409, `${method} ${path}`);
+    const error = (await res.json()) as { error: string; code: string };
+    assert.equal(error.code, "reminder_migrated");
+    assert.match(error.error, /moved to the Reminder app/);
+  }
+  const after = await getReminderById(row.id);
+  assert.equal(after?.status, "migrated", "nothing was changed");
+
+  const logRes = await fetch(`${app.baseUrl}/internal/agent-api/reminders/${row.id}/log`, { headers });
+  assert.equal(logRes.status, 200);
+  const log = (await logRes.json()) as { events: Array<{ eventType: string }> };
+  assert.deepEqual(log.events.map((e) => e.eventType), ["scheduled"], "the migrated event stays server-side");
 });

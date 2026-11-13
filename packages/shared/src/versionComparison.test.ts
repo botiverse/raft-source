@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 
-import { bothComputerVersionsKnown, compareComputerVersions, COMPUTER_REMOTE_UPGRADE_MIN_VERSION, isComputerOutdated, isDaemonOutdated, isRemoteUpgradeSupported } from "./index";
+import { bothComputerVersionsKnown, compareComputerVersions, COMPUTER_REMOTE_UPGRADE_MIN_VERSION, isComputerOutdated, isDaemonOutdated, isRemoteUpgradeSupported, evaluateComputerVersionGate } from "./index";
 
 test("isComputerOutdated: prefer-miss-over-mistrigger when either side is null/empty", () => {
   // We never want to flash "update available" on a stale-row Computer where
@@ -124,4 +124,34 @@ test("compareComputerVersions: SemVer precedence (the server's already_current o
     assert.equal(compareComputerVersions(a, b), expected, `${a} vs ${b}`);
     assert.equal(compareComputerVersions(b, a), -expected || 0, `${b} vs ${a}`);
   }
+});
+
+describe("evaluateComputerVersionGate", () => {
+  const policy = { minVersion: "1.0.47", enforceAt: "2026-11-10T00:00:00Z", enforcementEnabled: true };
+  const before = Date.parse("2026-11-09T23:59:59Z");
+  const after = Date.parse("2026-11-10T00:00:00Z");
+
+  it("is null without a policy and at or above the floor, including the floor's prereleases", () => {
+    expect(evaluateComputerVersionGate("1.0.20", null, after)).toBeNull();
+    expect(evaluateComputerVersionGate("1.0.47", policy, after)).toBeNull();
+    expect(evaluateComputerVersionGate("1.0.51-staging.1.sha.abc", policy, after)).toBeNull();
+    expect(evaluateComputerVersionGate("1.0.47-rc.1", policy, after)).toBeNull();
+  });
+
+  it("hints before the deadline and enforces from it", () => {
+    expect(evaluateComputerVersionGate("1.0.46", policy, before)).toEqual({
+      reason: "computer_version_unsupported", minVersion: "1.0.47", enforcedAt: "2026-11-10T00:00:00.000Z", enforced: false,
+    });
+    expect(evaluateComputerVersionGate("1.0.46", policy, after)?.enforced).toBe(true);
+  });
+
+  it("treats a missing or non-SemVer version as unknown, below the floor", () => {
+    expect(evaluateComputerVersionGate(null, policy, after)).toMatchObject({ reason: "computer_version_unknown", enforced: true });
+    expect(evaluateComputerVersionGate("dev", policy, after)).toMatchObject({ reason: "computer_version_unknown", enforced: true });
+  });
+
+  it("never enforces without a deadline or with the emergency stop off", () => {
+    expect(evaluateComputerVersionGate("1.0.30", { ...policy, enforceAt: null }, after)).toMatchObject({ enforcedAt: null, enforced: false });
+    expect(evaluateComputerVersionGate("1.0.30", { ...policy, enforcementEnabled: false }, after)?.enforced).toBe(false);
+  });
 });

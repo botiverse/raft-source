@@ -5,6 +5,7 @@ import {
   getMachineRuntimeDisplayOptions,
   getSetupRuntimeOptions,
   isRuntimeDeprecated,
+  isRuntimeExperimental,
   RUNTIMES,
   runtimeAvailabilitySuffix,
   type RuntimeInfo,
@@ -88,3 +89,7 @@ for (const runtimeId of ["antigravity", "copilot"]) {
     assert.equal(getExistingAgentRuntimeOptions(runtimeId).some((runtime) => runtime.id === runtimeId && runtime.supported), true);
   });
 }
+
+test("Qwen Code, Qoder and CodeBuddy Code are experimental; no other runtime is", () => {
+  assert.deepEqual(RUNTIMES.filter((runtime) => isRuntimeExperimental(runtime.id)).map((runtime) => runtime.id).sort(), ["codebuddy", "qoder", "qwen"]);
+});

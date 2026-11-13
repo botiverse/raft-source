@@ -78,7 +78,7 @@ export async function resolveSearchSenderFilter(
 
   const [humanId, agentId] = await Promise.all([
     channelService.resolveUserByName(serverId, handle),
-    channelService.resolveAgentByName(serverId, handle),
+    channelService.resolveAgentByName(serverId, handle, requester?.type === "user" ? { userId: requester.id } : { agentId: requester?.id }),
   ]);
 
   const humanDirectoryHidden = humanId

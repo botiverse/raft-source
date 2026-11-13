@@ -48,13 +48,13 @@ export function JointInviteDraftCard({
   return (
     // One server invite = one inset card (DS card: surface, hairline). Removing
     // a draft is local and reversible, so it is a quiet icon button, not red.
-    <Card className="space-y-3 p-3">
+    <Card className="stack-y-3 p-3">
       <div className="flex items-center justify-between gap-3">
         <SectionEyebrow as="div" tone="muted">
           {formatMessage({ id: "channel.createJoint.serverInviteIndex" }, { n: index + 1 })}
         </SectionEyebrow>
         {canRemove && (
-          <Button size="icon-sm"
+          <Button size="icon-md"
             variant="ghost"
             type="button"
             onClick={handleRemove}
@@ -77,6 +77,7 @@ export function JointInviteDraftCard({
       <FormField
         label={formatMessage({ id: "channel.edit.invitedPeopleLabel" })}
         required
+        // Kept (access): only the target server's owners or admins can accept; without it people enter the wrong handles.
         hint={formatMessage({ id: "channel.edit.invitedPeopleHint" })}
       >
         <Textarea

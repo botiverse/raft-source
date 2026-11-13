@@ -26,7 +26,6 @@ import { readdir } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { prepareTransportEvidence } from "../../../scripts/e2e/transportEvidence";
 
 interface ShardSummary {
   shard: number;
@@ -141,14 +140,10 @@ async function main() {
 
   // Playwright accepts multiple file args; explicit list bypasses its
   // internal --shard slicing entirely.
-  const evidence = prepareTransportEvidence(path.join(WEB_DIR, "playwright-report", "transport"));
-  if (evidence) console.log(`[e2e-transport] runId=${evidence.runId}`);
   const child = spawn("pnpm", ["exec", "playwright", "test", ...present], {
     cwd: WEB_DIR,
     env: {
       ...process.env, TZ: process.env.TZ || "Asia/Singapore",
-      SLOCK_E2E_TRANSPORT_DIR: evidence?.directory ?? "",
-      SLOCK_E2E_TRANSPORT_RUN_ID: evidence?.runId ?? "",
     },
     stdio: "inherit",
   });

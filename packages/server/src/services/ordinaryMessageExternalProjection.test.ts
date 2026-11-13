@@ -42,6 +42,21 @@ test("ordinary external projection classification is closed over chat/task/actio
     }),
     { eligible: false, reason: "action_metadata" },
   );
+  // RFC 082 §4.3: a card message mirrors its fallback text (its content); any other action metadata stays out.
+  const messageCard = { kind: "message-card", revision: 1, updatedAt: "2026-11-03T12:00:00.000Z", card: { version: 1, root: "t", elements: {} } };
+  assert.deepEqual(
+    classifyOrdinaryMessageExternalProjection({ senderType: "agent", messageType: "chat", actionMetadata: messageCard }),
+    { eligible: true },
+  );
+  assert.deepEqual(
+    classifyOrdinaryMessageExternalProjection({ senderType: "agent", messageType: "chat", actionMetadata: { kind: "action-card", state: "prepared" } }),
+    { eligible: false, reason: "action_metadata" },
+  );
+  assert.deepEqual(
+    classifyOrdinaryMessageExternalProjection({ senderType: "agent", messageType: "chat", actionMetadata: { ...messageCard, revision: 0 } }),
+    { eligible: false, reason: "action_metadata" },
+    "only a well-formed message card's metadata",
+  );
   assert.deepEqual(
     classifyOrdinaryMessageExternalProjection({ senderType: "system", messageType: "chat" }),
     { eligible: false, reason: "unsupported_sender" },

@@ -366,8 +366,7 @@ export function verifyResendWebhookSignature(payload: Buffer, headers: ResendWeb
     throw new Error("Stale Resend webhook timestamp");
   }
 
-  const signedPayload = `${id}.${timestamp}.${payload.toString("utf8")}`;
-  const expected = createHmac("sha256", decodeSvixSecret(secret)).update(signedPayload).digest();
+  const expected = createHmac("sha256", decodeSvixSecret(secret)).update(`${id}.${timestamp}.`).update(payload).digest();
   const valid = signature
     .split(" ")
     .some((part) => {

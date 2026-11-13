@@ -10,6 +10,7 @@ import {
 import {
   createAgentApiClient,
 } from "@botiverse/raft-shared/src/agentApiClient";
+import { MANUAL_CONTEXT_CAPABILITY, RAFT_CLIENT_CAPABILITIES_HEADER } from "@botiverse/raft-shared";
 
 import {
   joinRaftChannelByTarget,
@@ -70,7 +71,7 @@ export interface CreateRaftClientOptions {
   credential: string;
   /** Optional fetch implementation for runtimes, tests, or network policy wrappers. */
   fetch?: typeof fetch;
-  /** Static request headers. `authorization` is always overwritten by `credential`. */
+  /** Static request headers, over the SDK's own (`sdkRequestHeaders`). `authorization` is always overwritten by `credential`. */
   headers?: Record<string, string>;
   /** Bounded transport retries. Defaults to one attempt and is capped at five. events.receive always uses one attempt. */
   retry?: AgentApiMessageClientOptions["retry"];
@@ -136,6 +137,18 @@ export function requireAgentCredential(value: string): string {
 }
 
 /**
+ * The headers every SDK request carries: the caller's static `headers` over
+ * the SDK's own `X-Raft-Client: sdk` (the Server records Manual requests by
+ * client) and `X-Raft-Client-Capabilities: manual-context-v1` (manual.get and
+ * manual.search always send intent and reason). Names come back lowercase.
+ */
+export function sdkRequestHeaders(headers?: Record<string, string>): Record<string, string> {
+  const merged = new Headers({ "X-Raft-Client": "sdk", [RAFT_CLIENT_CAPABILITIES_HEADER]: MANUAL_CONTEXT_CAPABILITY });
+  for (const [name, value] of new Headers(headers)) merged.set(name, value);
+  return Object.fromEntries(merged);
+}
+
+/**
  * Create the program-layer client for the credential-derived
  * `/internal/agent-api/*` surface: typed calls with plain API results, for
  * programs and bots. Stable under semver. The agent layer
@@ -145,11 +158,12 @@ export function createRaftClient(options: CreateRaftClientOptions): RaftClient {
   const serverUrl = requireServerUrl(options.serverUrl);
   const credential = requireAgentCredential(options.credential);
   const auth = { authorization: `Bearer ${credential}` };
+  const headers = sdkRequestHeaders(options.headers);
 
   const messageClient = createAgentApiMessageClient({
     baseUrl: serverUrl,
     fetch: options.fetch,
-    headers: options.headers,
+    headers,
     retry: options.retry,
     throttle: options.throttle,
     auth,
@@ -158,7 +172,7 @@ export function createRaftClient(options: CreateRaftClientOptions): RaftClient {
     fetch: {
       baseUrl: serverUrl,
       fetch: options.fetch,
-      headers: options.headers,
+      headers,
       retry: {
         attempts: Math.min(Math.max(1, options.retry?.attempts ?? 1), 5),
       },
@@ -172,7 +186,7 @@ export function createRaftClient(options: CreateRaftClientOptions): RaftClient {
     fetch: {
       baseUrl: serverUrl,
       fetch: options.fetch,
-      headers: options.headers,
+      headers,
       retry: { attempts: 1 },
       throttle: options.throttle,
       auth,
@@ -183,8 +197,8 @@ export function createRaftClient(options: CreateRaftClientOptions): RaftClient {
       baseUrl: serverUrl,
       // This GET acknowledges messages. Avoid browser cache reuse and implicit redirect requests.
       fetch: (input, init) => (options.fetch ?? fetch)(input, { ...init, cache: "no-store", redirect: "error" }),
-      // Normalize casing before the shared transport overlays authorization.
-      headers: Object.fromEntries(new Headers(options.headers)),
+      // sdkRequestHeaders lowercases names, so the shared transport's authorization overlay wins.
+      headers,
       retry: { attempts: 1 },
       throttle: options.throttle,
       auth,
@@ -196,7 +210,7 @@ export function createRaftClient(options: CreateRaftClientOptions): RaftClient {
     ...createRaftManageClient(agentApi, writeApi, {
       serverUrl,
       fetch: options.fetch ?? fetch,
-      headers: Object.fromEntries(new Headers(options.headers)),
+      headers,
       authorization: auth.authorization,
       beforeRequest: options.throttle?.beforeRequest,
     }),
@@ -209,7 +223,7 @@ export function createRaftClient(options: CreateRaftClientOptions): RaftClient {
     routes: createRaftRoutes({
       serverUrl,
       fetch: options.fetch,
-      headers: options.headers,
+      headers,
       authorization: auth.authorization,
       readAttempts: options.retry?.attempts,
       beforeRequest: options.throttle?.beforeRequest,

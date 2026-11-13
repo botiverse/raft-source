@@ -203,4 +203,24 @@ describe("held-send drafts", () => {
     expect(await lookupSavedDraft(store, "#r", () => 1_000 + 10 * 60 * 1000 + 1)).toEqual({ status: "expired", savedAt: 1_000, content: "hi" });
     expect(await lookupSavedDraft(store, "#r", () => 0)).toEqual({ status: "missing" });
   });
+
+  it("round-trips a known draft cause and reads an unknown one as absent", async () => {
+    const store = createMemoryCommandStateStore();
+    await setSavedDraft(store, "#r", { content: "hi", attachmentIds: [], savedAt: 1_000, reholdCount: 1, cause: "thread_confirmation" });
+    expect(await lookupSavedDraft(store, "#r", () => 2_000)).toMatchObject({ status: "found", draft: { cause: "thread_confirmation" } });
+    await store.writeDraft("#r", { content: "hi", attachmentIds: [], savedAt: 1_000, reholdCount: 1, cause: "from-a-newer-cli" });
+    const lookup = await lookupSavedDraft(store, "#r", () => 2_000);
+    expect(lookup.status).toBe("found");
+    expect(lookup.status === "found" && "cause" in lookup.draft).toBe(false);
+  });
+
+  it("keeps a card message's card (RFC 082) and reads one that is not an object as absent", async () => {
+    const store = createMemoryCommandStateStore();
+    const card = { version: 1 as const, root: "t", elements: { t: { type: "Text" as const, props: { text: "In review" } } } };
+    await setSavedDraft(store, "#r", { content: "", attachmentIds: [], card, savedAt: 1_000, reholdCount: 1 });
+    expect(await lookupSavedDraft(store, "#r", () => 2_000)).toMatchObject({ status: "found", draft: { content: "", card } });
+    await store.writeDraft("#r", { content: "hi", attachmentIds: [], card: "not a card", savedAt: 1_000, reholdCount: 1 });
+    const lookup = await lookupSavedDraft(store, "#r", () => 2_000);
+    expect(lookup.status === "found" && "card" in lookup.draft).toBe(false);
+  });
 });

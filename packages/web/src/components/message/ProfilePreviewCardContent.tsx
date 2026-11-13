@@ -1,6 +1,9 @@
 import { useCallback, useEffect, useMemo } from "react";
 import { Separator } from "@botiverse/raft-ui";
+import AppBadge from "../agent/AppBadge";
+import { AgentComputerOfflineStatusLink } from "../agent/AgentComputerOfflineStatusLink";
 import { formatRuntimeLabelWithStatus } from "../../utils/runtimeAvailabilityLabel";
+import { useRuntimeDeprecatedHere } from "../../hooks/useServerRuntimeCatalog";
 import { useIntl } from "react-intl";
 import { isExternalAgentRuntime, REASONING_EFFORT_RUNTIMES, runtimeConfigModelValue } from "@botiverse/raft-shared";
 import { useAgentDisplayState, useAgentStore } from "../../store/agentStore";
@@ -20,6 +23,9 @@ import AvatarSlot from "../ui/AvatarSlot";
 import StatusDot from "../ui/StatusDot";
 import Tooltip from "../ui/Tooltip";
 import MentionHoverActivityPreview from "./MentionHoverActivityPreview";
+import { ExternalOriginRibbon, RoleCornerTag, RoleCornerTagSpacer } from "../member/MemberLabelParts";
+import { hoverCardRoleLabelId, memberOrigin } from "../../utils/memberOrigin";
+import type { MemberOrigin } from "../../utils/memberOrigin";
 
 interface ProfilePreviewCardContentProps {
   mentionType: "agent" | "user";
@@ -51,11 +57,25 @@ interface ProfilePreviewCardContentProps {
    * floating over the destination.
    */
   onOpenAgentActivity?: (agentId: string) => void;
+  /**
+   * Whether the mentioned agent has read the message this mention is in, for
+   * the message's sender. The mention shows the read mark only once it has; the card
+   * says it either way, so any mention can be checked (message-item.md, "Read
+   * receipts on a mention"). Undefined when it isn't known.
+   */
+  readReceipt?: "read" | "unread";
+  /**
+   * Where the card's subject is from, when the caller already worked out that
+   * they are from another server (a message row names a sender's server from
+   * the channel's connected servers). Otherwise the card reads the profile's
+   * own server fields.
+   */
+  origin?: MemberOrigin;
 }
 
 const EMPTY_TRAJECTORY_LOG: never[] = [];
 
-export default function ProfilePreviewCardContent({ mentionType, mentionId, fallbackAgent, fallbackMember, fallbackLabel, readOnlyProfile, onOpenAgentActivity }: ProfilePreviewCardContentProps) {
+export default function ProfilePreviewCardContent({ mentionType, mentionId, fallbackAgent, fallbackMember, fallbackLabel, readOnlyProfile, onOpenAgentActivity, readReceipt, origin }: ProfilePreviewCardContentProps) {
   const intl = useIntl();
   const { formatMessage } = intl;
   const { formatClockWithSeconds } = useTimeFormatter();
@@ -82,7 +102,22 @@ export default function ProfilePreviewCardContent({ mentionType, mentionId, fall
   const displayState = useAgentDisplayState(mentionId, mentionType === "agent" ? profileAgent : undefined);
   const member = useServerStore((s) => (mentionType === "user" ? s.members.find((m) => m.userId === mentionId) : undefined));
   const profileMember = mentionType === "user" ? member ?? fallbackMember : undefined;
-  const canViewPrivateAgentSurfaces = mentionType === "agent" && profileAgent
+  const currentServerId = useServerStore((s) => s.current?.id);
+  const deprecatedHere = useRuntimeDeprecatedHere();
+  // Member labels (#wg-rbac:#46): someone from another server gets the ribbon
+  // across the card's top, and no server role. A person the server's own
+  // directory lists (`member`) is this server's, whatever a fallback says.
+  const profileOrigin = useMemo(
+    () => (origin?.external ? origin : memberOrigin(mentionType === "agent" ? profileAgent : member ? null : profileMember, currentServerId)),
+    [origin, mentionType, profileAgent, member, profileMember, currentServerId],
+  );
+  // Another server's agent in a joint channel: the server sends its identity
+  // only (toJointAgentProfile), no Computer, runtime or model, so the card has
+  // no rows for them rather than this server's placeholders (#wg-rbac:#46),
+  // and none of its private surfaces (the profile panel's rule). A model row
+  // comes back when the server sends the agent's model label.
+  const hideAgentServerFacts = mentionType === "agent" && profileOrigin.external;
+  const canViewPrivateAgentSurfaces = mentionType === "agent" && profileAgent && !hideAgentServerFacts
     ? canViewAgentPrivateSurfaces(profileAgent, currentUserId, capabilities.editAgents)
     : false;
   const isChannelSummaryAgent = mentionType === "agent" && profileAgent?.profileProjection === "channel_summary";
@@ -177,7 +212,16 @@ export default function ProfilePreviewCardContent({ mentionType, mentionId, fall
           </div>
         );
       }
-      const displayName = profileAgent.displayName || profileAgent.name;
+      const isManagedBot = Boolean(profileAgent.managedByAppInstallId);
+      // App-owned bot: name and description resolve live from the joined app,
+      // so the card can never show a stale pre-rename snapshot.
+      const displayName = isManagedBot
+        ? (profileAgent.managedByApp ? profileAgent.managedByApp.name : (profileAgent.displayName || profileAgent.name))
+        : (profileAgent.displayName || profileAgent.name);
+      const botDescription = isManagedBot
+        ? (profileAgent.managedByApp ? profileAgent.managedByApp.description : null)
+        : profileAgent.description;
+      const botStatusText = isManagedBot ? (profileAgent.managedByApp?.botStatusText ?? null) : null;
       const activityText = canViewPrivateAgentSurfaces
         ? displayState
           ? formatAgentDisplayStateText(intl, displayState)
@@ -188,7 +232,7 @@ export default function ProfilePreviewCardContent({ mentionType, mentionId, fall
       const renderedActivityText = activityText || formatMessage({ id: "activity.status.offline" });
       const runtimeId = runtimeConfig?.runtime ?? profileAgent.runtime ?? "unknown";
       const modelId = runtimeConfig ? runtimeConfigModelValue(runtimeConfig) : profileAgent.model || "default";
-      const runtimeLabel = formatRuntimeLabelWithStatus(runtimeId, formatMessage);
+      const runtimeLabel = formatRuntimeLabelWithStatus(runtimeId, formatMessage, deprecatedHere(runtimeId));
       const modelPresentation = projectRuntimeModelLabelPresentation(runtimeId, modelId, runtimeModels, profileAgent.machineId);
       const modelLabel = modelPresentation.kind === "pending"
         ? formatMessage({ id: "common.loading" })
@@ -204,20 +248,57 @@ export default function ProfilePreviewCardContent({ mentionType, mentionId, fall
           : agentMachine
             ? agentMachine.name
             : formatMessage({ id: "message.profilePreview.noComputerAssigned" });
+      // An agent's role is written only when it is an Admin, and only for this server's.
+      const roleLabelId = isManagedBot ? null : hoverCardRoleLabelId("agent", profileAgent.serverRole, profileOrigin);
+      const roleLabel = roleLabelId ? formatMessage({ id: roleLabelId }) : null;
       return (
-        <>
-          <div className="flex items-start gap-3 px-4 pt-4 pb-3 last:pb-4">
+        <div className="relative" data-testid="profile-preview-card" data-profile-origin={profileOrigin.external ? "external" : "local"}>
+          <ExternalOriginRibbon origin={profileOrigin} />
+          {roleLabel ? <RoleCornerTag label={roleLabel} /> : null}
+          <div className="flex items-start gap-3 px-4 pt-4 pb-3 last:pb-4" data-testid="profile-preview-card-header">
             <AvatarSlot context="mention-card" type="agent" agentAvatarUrl={profileAgent.avatarUrl} className="mt-0.5 self-start" />
             <div className="min-w-0 flex-1">
               <div className="flex items-center gap-1.5">
-                <span className="min-w-0 truncate text-headline text-foreground">{displayName}</span>
-                <StatusDot activity={displayState?.activity ?? "offline"} external={displayState?.isExternal && !displayState.isOnline} size="sm" />
-                <span className="min-w-0 flex-1 max-w-fit truncate text-callout text-foreground-hint">
-                  {renderedActivityText}
-                </span>
+                <span className="min-w-0 truncate text-headline text-foreground" data-testid="profile-preview-card-name">{displayName}</span>
+                {profileAgent.managedByAppInstallId && (
+                  <AppBadge className="shrink-0" appName={profileAgent.managedByApp?.name} botName={displayName} />
+                )}
+                {/* Bots render no presence: the always-offline daemon signal does not apply to them. */}
+                {!profileAgent.managedByAppInstallId && (
+                  <>
+                    <StatusDot activity={displayState?.activity ?? "offline"} external={displayState?.isExternal && !displayState.isOnline} size="sm" />
+                    {(displayState.blocked === "computer_offline" || displayState.blocked === "computer_too_old") && !hideAgentServerFacts ? (
+                      <AgentComputerOfflineStatusLink agentId={profileAgent.id} className="min-w-0 max-w-fit truncate text-callout" testId={displayState.blocked === "computer_offline" ? "mention-card-computer-offline" : "mention-card-computer-too-old"}>
+                        {renderedActivityText}
+                      </AgentComputerOfflineStatusLink>
+                    ) : (
+                      <span className="min-w-0 flex-1 max-w-fit truncate text-callout text-foreground-hint">
+                        {renderedActivityText}
+                      </span>
+                    )}
+                  </>
+                )}
+                {roleLabel ? <RoleCornerTagSpacer label={roleLabel} /> : null}
               </div>
               <div className="truncate font-mono text-mono-meta text-foreground-muted">@{profileAgent.name}</div>
-              {!isChannelSummaryAgent ? <><Separator className="mt-2" /><dl className="grid grid-cols-[auto_minmax(0,1fr)] items-baseline gap-x-3 gap-y-1 pt-2">
+              {readReceipt ? (
+                <div data-testid="mention-card-read-receipt" className="pt-1 text-caption text-foreground-hint">
+                  {formatMessage({ id: readReceipt === "read" ? "message.mention.agentRead" : "message.mention.agentUnread" })}
+                </div>
+              ) : null}
+              {isManagedBot && !hideAgentServerFacts && (
+                <><Separator className="mt-2" /><dl className="grid grid-cols-[auto_minmax(0,1fr)] items-baseline gap-x-3 gap-y-1 pt-2" data-testid="profile-preview-card-app-rows">
+                  <dt className="text-caption text-foreground-hint">{formatMessage({ id: "agent.detail.managedByApp" })}</dt>
+                  <dd className="min-w-0 truncate text-caption text-foreground-muted">{profileAgent.managedByApp?.name ?? formatMessage({ id: "agent.detail.managedByAppUnknown" })}</dd>
+                  {botStatusText ? (
+                    <>
+                      <dt className="text-caption text-foreground-hint">{formatMessage({ id: "agent.detail.appBotStatus" })}</dt>
+                      <dd className="min-w-0 truncate text-caption text-foreground-muted">{botStatusText}</dd>
+                    </>
+                  ) : null}
+                </dl></>
+              )}
+              {!isChannelSummaryAgent && !hideAgentServerFacts && !isManagedBot ? <><Separator className="mt-2" /><dl className="grid grid-cols-[auto_minmax(0,1fr)] items-baseline gap-x-3 gap-y-1 pt-2" data-testid="profile-preview-card-agent-rows">
                 {computerLabel !== null ? (
                   <>
                     <dt className="text-caption text-foreground-hint">{formatMessage({ id: "message.profilePreview.labelComputer" })}</dt>
@@ -237,17 +318,17 @@ export default function ProfilePreviewCardContent({ mentionType, mentionId, fall
               </dl></> : null}
             </div>
           </div>
-          {profileAgent.description ? (
+          {botDescription ? (
             <>
             <Separator />
-            <Tooltip content={profileAgent.description}>
-            <div className="truncate px-4 py-3 last:pb-4 text-callout text-foreground-muted">
-              {profileAgent.description}
+            <Tooltip content={botDescription}>
+            <div className="line-clamp-2 px-4 py-3 last:pb-4 text-callout text-foreground-muted" data-testid="profile-preview-card-description">
+              {botDescription}
             </div>
             </Tooltip>
             </>
           ) : null}
-          {canViewPrivateAgentSurfaces ? (
+          {canViewPrivateAgentSurfaces && !isManagedBot ? (
             <MentionHoverActivityPreview
               entries={trajectoryLog ?? EMPTY_TRAJECTORY_LOG}
               formatTimestamp={formatClockWithSeconds}
@@ -258,7 +339,7 @@ export default function ProfilePreviewCardContent({ mentionType, mentionId, fall
               }
             />
           ) : null}
-        </>
+        </div>
       );
     }
 
@@ -276,12 +357,20 @@ export default function ProfilePreviewCardContent({ mentionType, mentionId, fall
       );
     }
     const displayName = profileMember.displayName || profileMember.name;
+    // Owner, Admin or Guest, for this server's people only; a plain member has no tag.
+    const roleLabelId = hoverCardRoleLabelId("human", profileMember.role, profileOrigin);
+    const roleLabel = roleLabelId ? formatMessage({ id: roleLabelId }) : null;
     return (
-      <>
-        <div className="flex items-start gap-3 px-4 pt-4 pb-3 last:pb-4">
-          <AvatarSlot context="mention-card" type="human" humanAvatarUrl={profileMember.avatarUrl} gravatarHash={profileMember.gravatarHash} className="mt-0.5 self-start" />
+      <div className="relative" data-testid="profile-preview-card" data-profile-origin={profileOrigin.external ? "external" : "local"}>
+        <ExternalOriginRibbon origin={profileOrigin} />
+        {roleLabel ? <RoleCornerTag label={roleLabel} /> : null}
+        <div className="flex items-start gap-3 px-4 pt-4 pb-3 last:pb-4" data-testid="profile-preview-card-header">
+          <AvatarSlot context="mention-card" type="human" humanAvatarUrl={profileMember.avatarUrl} className="mt-0.5 self-start" />
           <div className="min-w-0 flex-1">
-            <div className="truncate text-headline text-foreground">{displayName}</div>
+            <div className="flex items-center gap-1.5">
+              <span className="min-w-0 truncate text-headline text-foreground" data-testid="profile-preview-card-name">{displayName}</span>
+              {roleLabel ? <RoleCornerTagSpacer label={roleLabel} /> : null}
+            </div>
             <div className="truncate font-mono text-mono-meta text-foreground-muted">@{profileMember.name}</div>
           </div>
         </div>
@@ -289,13 +378,13 @@ export default function ProfilePreviewCardContent({ mentionType, mentionId, fall
           <>
           <Separator />
           <Tooltip content={profileMember.description}>
-          <div className="truncate px-4 py-3 last:pb-4 text-callout text-foreground-muted">
+          <div className="line-clamp-2 px-4 py-3 last:pb-4 text-callout text-foreground-muted" data-testid="profile-preview-card-description">
             {profileMember.description}
           </div>
           </Tooltip>
           </>
         ) : null}
-      </>
+      </div>
     );
-  }, [mentionType, profileAgent, agentMachine, agentMachineRow.kind, runtimeConfig, runtimeModels, canViewPrivateAgentSurfaces, isChannelSummaryAgent, displayState, trajectoryLog, formatClockWithSeconds, profileMember, readOnlyProfile, readOnlyHandle, unavailableHandle, formatMessage, intl, onOpenAgentActivity, handleOpenActivity]);
+  }, [mentionType, profileAgent, agentMachine, agentMachineRow.kind, runtimeConfig, runtimeModels, canViewPrivateAgentSurfaces, isChannelSummaryAgent, hideAgentServerFacts, profileOrigin, displayState, trajectoryLog, formatClockWithSeconds, profileMember, readOnlyProfile, readOnlyHandle, unavailableHandle, formatMessage, intl, onOpenAgentActivity, handleOpenActivity, readReceipt, deprecatedHere]);
 }

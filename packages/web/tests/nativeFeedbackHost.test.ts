@@ -26,6 +26,15 @@ test("host validation rejects unsupported identity/origin before network", () =>
     const named = { ...host, session: { ...host.session, clientKind } };
     assert.equal(parseFeedbackHost(named, origin), named, clientKind);
   }
+  // Every locale the page ships copy for is accepted; anything else (a raw
+  // navigator.language like `en-US`) is still rejected, as before.
+  for (const locale of ["en", "zh-CN", "ja", "ko"]) {
+    const localized = { ...host, session: { ...host.session, locale } } as FeedbackHost;
+    assert.equal(parseFeedbackHost(localized, origin), localized, locale);
+  }
+  for (const locale of ["en-US", "zh-cn", "ja-JP", "fr"]) {
+    assert.equal(parseFeedbackHost({ ...host, session: { ...host.session, locale } }, origin), null, locale);
+  }
   const crossOrigin = { ...host, session: { ...host.session, apiOrigin: "https://api.raft.test" } };
   assert.equal(parseFeedbackHost(crossOrigin, origin, "https://api.raft.test"), crossOrigin);
   assert.equal(parseFeedbackHost(crossOrigin, origin, "https://other.raft.test"), null);

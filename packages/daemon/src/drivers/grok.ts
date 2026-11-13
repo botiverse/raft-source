@@ -222,6 +222,45 @@ export async function resolveGrokSpawnAsync(args: string[], deps: ProbeDeps = {}
   return resolveWindowsDirectLaunchAsync("grok", command, args, deps);
 }
 
+/**
+ * What another host (the OAR host, RFC 060) needs to run grok the way this
+ * driver does: the same executable, launch environment (Raft transport added,
+ * credentials removed), model, effort and native session to resume. Built
+ * with the same calls `spawn` makes, so the two cannot drift apart.
+ */
+export interface GrokLaunchPlan {
+  /** The grok executable this driver would spawn (one PATH lookup). */
+  command: string;
+  /** The complete launch environment. */
+  env: NodeJS.ProcessEnv;
+  /** Absent for the runtime's default (`default` or none configured). */
+  model?: string;
+  /**
+   * The effort the agent chose, with or without a model: this driver sends it
+   * with `session/set_model`, on Grok's current model when the agent runs the
+   * default; OAR applies it on its own (`set_config_option`).
+   */
+  reasoningEffort?: string;
+  /** The native grok session (`session/load`) this launch resumes. */
+  resumeSessionId?: string;
+}
+
+export async function prepareGrokLaunch(ctx: SpawnContext, deps: ProbeDeps = {}): Promise<GrokLaunchPlan> {
+  const { spawnEnv } = await prepareCliTransport(ctx, { NO_COLOR: "1" });
+  const launchFields = runtimeConfigToLaunchFields(hydrateRuntimeConfig(ctx.config));
+  const model = launchFields.model === "default" ? null : nonEmptyString(launchFields.model);
+  const reasoningEffort = nonEmptyString(launchFields.reasoningEffort);
+  const resumeSessionId = nonEmptyString(ctx.config.sessionId);
+  const launch = await resolveGrokSpawnAsync([...GROK_AGENT_ARGS], { ...deps, env: deps.env ?? spawnEnv, signal: ctx.launchSignal });
+  return {
+    command: launch.command,
+    env: spawnEnv,
+    ...(model ? { model } : {}),
+    ...(reasoningEffort ? { reasoningEffort } : {}),
+    ...(resumeSessionId ? { resumeSessionId } : {}),
+  };
+}
+
 export function probeGrok(deps: ProbeDeps = {}): RuntimeProbeResult {
   const { command, missReason } = lookupCommandOnPath("grok", deps);
   if (!command) {
@@ -405,7 +444,12 @@ export class GrokDriver implements RuntimeDriver {
     runtimeControl: "none",
   } as const;
   readonly stdoutChannel = "structured_protocol" as const;
-  readonly session = { recovery: "resume_or_fresh" } as const;
+  readonly session = {
+    recovery: "resume_or_fresh",
+    // Never emits a compaction event.
+    compaction: "unreported",
+    compactionFailure: "does_not_stick",
+  } as const;
   readonly model = {
     detectedModelsVerifiedAs: "launchable",
     toLaunchSpec: (modelId: string) => ({ params: { model: modelId } }),
@@ -429,6 +473,8 @@ export class GrokDriver implements RuntimeDriver {
   private freshSessionParams: Record<string, unknown> | null = null;
   private selectedModel: string | null = null;
   private selectedReasoningEffort: string | null = null;
+  /** The model Grok runs when none is chosen, from the initialize result. */
+  private initializeDefaultModel: string | null = null;
   private normalizer = new GrokEventNormalizer();
   private grokHomeRoot: string | null = null;
   private autoApprovePermissionRequests = false;
@@ -467,6 +513,7 @@ export class GrokDriver implements RuntimeDriver {
     this.requestedResumeSessionId = nonEmptyString(ctx.config.sessionId);
     this.selectedModel = launchFields.model === "default" ? null : nonEmptyString(launchFields.model);
     this.selectedReasoningEffort = nonEmptyString(launchFields.reasoningEffort);
+    this.initializeDefaultModel = null;
     this.normalizer.reset();
     this.autoApprovePermissionRequests = false;
     this.grokHomeRoot = resolveGrokHomeFromEnv(spawnEnv, {
@@ -596,6 +643,7 @@ export class GrokDriver implements RuntimeDriver {
         this.pendingSessionAfterInitialize = null;
         return [{ kind: "error", message: initializeFailureMessage(), startupRequestMethod: "initialize" }];
       }
+      this.initializeDefaultModel = grokModelSetFromInitializeResult(message.result)?.default ?? null;
       if (this.pendingSessionAfterInitialize) {
         const pending = this.pendingSessionAfterInitialize;
         this.pendingSessionAfterInitialize = null;
@@ -633,7 +681,11 @@ export class GrokDriver implements RuntimeDriver {
         }];
       }
       this.normalizer.adoptSession(sessionId);
-      const modelId = this.selectedModel;
+      // Grok takes the effort only with a model selection. An agent on Grok's
+      // default model with an effort chosen selects that default explicitly,
+      // or the effort would never reach Grok.
+      const modelId = this.selectedModel
+        ?? (this.selectedReasoningEffort ? this.initializeDefaultModel : null);
       if (modelId) {
         this.pendingModelRequestId = this.sendRequest("session/set_model", {
           sessionId,

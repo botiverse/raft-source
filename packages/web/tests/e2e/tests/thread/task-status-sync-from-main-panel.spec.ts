@@ -138,7 +138,7 @@ test.describe("P0 thread task status sync from main panel", () => {
     // STATUS_STYLES.todo.label is "Todo" (Title Case) — the InlineBadgeEditor
     // button shows that text; Raft never transforms case (DS rule 7: status
     // names are Title Case). Click it to open the dropdown, then pick the
-    // "In Progress" option (matches STATUS_LABELS).
+    // "In progress" option (matches STATUS_LABELS).
     await taskCard.getByRole("button", { name: /Todo/ }).click();
     await page.getByTestId("task-status-option-in_progress").click();
 

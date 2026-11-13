@@ -1,3 +1,4 @@
+import { parseSlackReconciliationScan, type SlackReconciliationScan } from "./slackReconciliationScan";
 import assert from "node:assert/strict";
 import type { SlackBridgeRenderSnapshot } from "./externalDeliveryOutboxService";
 import {
@@ -6,10 +7,11 @@ import {
   createSlackOAuthHttpTransport,
   createSlackOAuthManagedHandleCoordinator,
   createSlackProviderPreparation,
+  renderSlackBridgeText,
   reconcileSlackOutboundDelivery,
   listSlackProviderConversationMembers,
   lookupSlackProviderConversation,
-  lookupSlackProviderUser,
+  lookupSlackProviderUser, lookupSlackProviderBot,
   normalizeSlackOAuthExchangeResult,
   SLACK_EVENTS_CONSUMED_HEADER_NAMES,
   SLACK_EVENTS_REQUIRED_HEADER_NAMES,
@@ -24,6 +26,7 @@ import {
   type SlackWebApiRequest,
   type SlackWebApiTransport,
   type SlackWebApiTransportResult,
+  type SlackJsonObject,
 } from "./slackProviderAdapter";
 
 // Built at runtime so secret scanners don't flag this test sample.
@@ -64,7 +67,7 @@ function snapshot(
   overrides: Partial<SlackBridgeRenderSnapshot> = {},
 ): SlackBridgeRenderSnapshot {
   return {
-    schema: "slack-bridge-render-snapshot.v4",
+    schema: "slack-bridge-render-snapshot.v5",
     sourceMessageId: "message-1",
     sourceMessageSeq: 42,
     canonicalConversationId: "channel-1",
@@ -98,6 +101,7 @@ function snapshot(
       handleSnapshot: "mention",
       resolutionReason: "explicit_projection",
     }],
+    raftMentionSubstitutions: [],
     attachments: [],
     bindingAuthority: {
       provider: "slack",
@@ -300,6 +304,7 @@ test("outbound reconciliation finds exactly one Slack metadata marker", async ()
         messages: [
           {
             channel: "C_CHANNEL",
+            app_id: "A_APP",
             ts: "1753865100.000300",
             metadata: {
               event_type: "raft_message",
@@ -310,13 +315,14 @@ test("outbound reconciliation finds exactly one Slack metadata marker", async ()
         response_metadata: { next_cursor: "" },
       },
     }], calls),
+    releaseCredential: async () => {},
     leaseCredential: async () => {
       leases += 1;
       return credential({ leaseId: `reconcile-${leases}` });
     },
     authority: authority(),
     reconciliationMarker: "A".repeat(43),
-    now: NOW,
+    now: NOW, firstAttemptAt: new Date("2025-07-30T08:40:00.000Z"), providerAttempt: 1,
   });
   assert.deepEqual(result, {
     kind: "found",
@@ -338,16 +344,17 @@ test("outbound reconciliation treats marker conflicts and incomplete scans as un
       body: {
         ok: true,
         messages: [
-          { ts: "1753865100.000301", metadata: { event_type: "raft_message", event_payload: { reconciliation_marker: "B".repeat(43) } } },
-          { ts: "1753865100.000302", metadata: { event_type: "raft_message", event_payload: { reconciliation_marker: "B".repeat(43) } } },
+          { ts: "1753865100.000301", app_id: "A_APP", metadata: { event_type: "raft_message", event_payload: { reconciliation_marker: "B".repeat(43) } } },
+          { ts: "1753865100.000302", app_id: "A_APP", metadata: { event_type: "raft_message", event_payload: { reconciliation_marker: "B".repeat(43) } } },
         ],
         response_metadata: { next_cursor: "" },
       },
     }]),
+    releaseCredential: async () => {},
     leaseCredential: async () => credential({ leaseId: "reconcile-conflict" }),
     authority: authority(),
     reconciliationMarker: "B".repeat(43),
-    now: NOW,
+    now: NOW, firstAttemptAt: new Date("2025-07-30T08:40:00.000Z"), providerAttempt: 1,
   });
   assert.deepEqual(conflict, { kind: "unavailable", reason: "reconciliation_marker_conflict" });
 
@@ -362,21 +369,23 @@ test("outbound reconciliation treats marker conflicts and incomplete scans as un
         response_metadata: { next_cursor: "still-more" },
       },
     }]),
+    releaseCredential: async () => {},
     leaseCredential: async () => credential({ leaseId: "reconcile-incomplete" }),
     authority: authority(),
     reconciliationMarker: "C".repeat(43),
-    now: NOW,
+    now: NOW, firstAttemptAt: new Date("2025-07-30T08:40:00.000Z"), providerAttempt: 1,
     maxPages: 1,
   });
-  assert.deepEqual(incomplete, { kind: "unavailable", reason: "reconciliation_page_limit_exceeded" });
+  assert.deepEqual(incomplete, { kind: "unavailable", reason: "reconciliation_scan_pending", retryAfterMs: 30_000 });
 });
 
 test("outbound reconciliation keeps first delivery safe while detecting stripped bridge metadata", async () => {
   const input = {
+    releaseCredential: async () => {},
     leaseCredential: async () => credential({ leaseId: "reconcile-control" }),
     authority: authority(),
     reconciliationMarker: "D".repeat(43),
-    now: NOW,
+    now: NOW, firstAttemptAt: new Date("2025-07-30T08:40:00.000Z"), providerAttempt: 1,
   } as const;
 
   const firstDelivery = await reconcileSlackOutboundDelivery({
@@ -420,7 +429,7 @@ test("outbound reconciliation keeps first delivery safe while detecting stripped
   });
   assert.deepEqual(strippedMetadata, {
     kind: "unavailable",
-    reason: "reconciliation_bridge_metadata_missing",
+    reason: "reconciliation_bridge_metadata_missing", unconfirmable: "reconciliation_bridge_metadata_missing", retryAfterMs: 900_000,
   });
 
   const attachmentFileShare = await reconcileSlackOutboundDelivery({
@@ -442,6 +451,119 @@ test("outbound reconciliation keeps first delivery safe while detecting stripped
     }]),
   });
   assert.deepEqual(attachmentFileShare, { kind: "not_found" });
+});
+
+test("outbound render escapes user text exactly once", async () => {
+  const calls: SlackWebApiRequest[] = [];
+  const prepare = createSlackProviderPreparation({
+    transport: transportDouble([{
+      kind: "response",
+      status: 200,
+      headers: {},
+      body: { ok: true, channel: "C_CHANNEL", ts: "1753865100.000103" },
+      observedAuthority: { providerAppId: "A_APP", providerAuthorityId: "T_TEAM" },
+    }], calls),
+    quarantineSink: quarantineDouble(),
+    now: () => NOW,
+  });
+  const prepared = await prepare(dispatchInput({
+    renderSnapshot: snapshot({
+      sanitizedText: "a < b & c > d",
+      raftMentionSubstitutions: [{
+        kind: "user",
+        handle: "mention",
+        token: "<@UWAKE>",
+        installId: "install-1",
+        bindingId: "binding-1",
+        bindingEpoch: 9,
+      }],
+    }),
+  }));
+  assert.equal(prepared.ready, true);
+  if (!prepared.ready) assert.fail("expected provider preparation");
+  assert.equal((await prepared.dispatch()).kind, "accepted");
+  assert.equal(calls[0]?.body.text, "a &lt; b &amp; c &gt; d");
+});
+
+test("protocol 3 renders bot IDs literally and preserves user mention ambiguity", () => {
+  const base = snapshot();
+  const bot = { ...base.externalMentions[0]!, externalActorId: "BVALID123", handleSnapshot: "bot" };
+  const user = { ...base.externalMentions[0]!, externalActorId: "UVALID123", handleSnapshot: "user" };
+  assert.equal(renderSlackBridgeText(snapshot({ sanitizedText: "@bot and @user & hello", externalMentions: [bot, user],
+    raftMentionSubstitutions: [] })), "@bot and <@UVALID123> &amp; hello");
+  assert.equal(renderSlackBridgeText(snapshot({ sanitizedText: "@bot", externalMentions: [bot, { ...user, handleSnapshot: "bot" }],
+    raftMentionSubstitutions: [] })), "@bot");
+  assert.equal(renderSlackBridgeText(snapshot({ sanitizedText: "@bot", externalMentions: [{ ...bot, externalActorId: "XINVALID" }],
+    raftMentionSubstitutions: [] })), null);
+});
+
+test("an external member and Raft member sharing one handle renders literal text for both", async () => {
+  const calls: SlackWebApiRequest[] = [];
+  const prepare = createSlackProviderPreparation({
+    transport: transportDouble([{
+      kind: "response",
+      status: 200,
+      headers: {},
+      body: { ok: true, channel: "C_CHANNEL", ts: "1753865100.000104" },
+      observedAuthority: { providerAppId: "A_APP", providerAuthorityId: "T_TEAM" },
+    }], calls),
+    quarantineSink: quarantineDouble(),
+    now: () => NOW,
+  });
+  const base = snapshot();
+  const prepared = await prepare(dispatchInput({
+    renderSnapshot: snapshot({
+      sanitizedText: "ack @mention please",
+      externalMentions: [{
+        ...base.externalMentions[0]!,
+        externalActorId: "UEXTERNAL",
+        handleSnapshot: "mention",
+      }],
+      raftMentionSubstitutions: [{
+        kind: "user",
+        handle: "mention",
+        token: "<@URAFT>",
+        installId: "install-1",
+        bindingId: "binding-1",
+        bindingEpoch: 9,
+      }],
+    }),
+  }));
+  assert.equal(prepared.ready, true);
+  if (!prepared.ready) assert.fail("expected provider preparation");
+  assert.equal((await prepared.dispatch()).kind, "accepted");
+  // Neither interpretation may be notified: the ambiguous @handle stays
+  // literal rather than letting pass order pick a winner.
+  assert.equal(calls[0]?.body.text, "ack @mention please");
+});
+
+test("two Raft members sharing one handle stay literal for both", async () => {
+  const calls: SlackWebApiRequest[] = [];
+  const prepare = createSlackProviderPreparation({
+    transport: transportDouble([{
+      kind: "response",
+      status: 200,
+      headers: {},
+      body: { ok: true, channel: "C_CHANNEL", ts: "1753865100.000105" },
+      observedAuthority: { providerAppId: "A_APP", providerAuthorityId: "T_TEAM" },
+    }], calls),
+    quarantineSink: quarantineDouble(),
+    now: () => NOW,
+  });
+  const prepared = await prepare(dispatchInput({
+    renderSnapshot: snapshot({
+      sanitizedText: "cc @dup @dup",
+      externalMentions: [],
+      raftMentionSubstitutions: [
+        { kind: "user", handle: "dup", token: "<@URAFT1>", installId: "install-1", bindingId: "binding-1", bindingEpoch: 9 },
+        { kind: "user", handle: "dup", token: "<@URAFT2>", installId: "install-1", bindingId: "binding-1", bindingEpoch: 9 },
+      ],
+    }),
+  }));
+  assert.equal(prepared.ready, true);
+  if (!prepared.ready) assert.fail("expected provider preparation");
+  assert.equal((await prepared.dispatch()).kind, "accepted");
+  assert.equal(calls[0]?.body.text, "cc @dup @dup");
 });
 
 test("outbound attachment snapshots append the fixed marker without exposing file metadata", async () => {
@@ -648,7 +770,7 @@ test("revoked credentials and provider identity substitution fence authority bef
   assert.equal(revokedPrepared.ready, true);
   if (!revokedPrepared.ready) assert.fail("expected revoked preparation");
   assert.deepEqual(await revokedPrepared.dispatch(), {
-    kind: "deterministic_failure",
+    kind: "deterministic_failure", pairBlockedReason: "provider_credential_revoked",
   });
   assert.equal(quarantineCalls.length, 1);
   assert.equal(quarantineCalls[0]?.reason, "provider_credential_revoked");
@@ -844,6 +966,7 @@ test("live OAuth HTTP transport consumes handles once and exposes only sealed cr
           ok: true,
           user: {
             id: "U_HUMAN",
+            team_id: "T_TEAM",
             is_admin: true,
             is_owner: false,
             is_primary_owner: false,
@@ -896,6 +1019,7 @@ test("live OAuth HTTP transport consumes handles once and exposes only sealed cr
     providerTeamId: "T_TEAM",
     providerEnterpriseId: null,
     providerUserId: "U_HUMAN",
+    workspaceAdminVerified: true,
     botUserId: "U_BOT",
     providerBotId: "B_BOT",
     workspaceName: "Workspace",
@@ -914,6 +1038,7 @@ test("live OAuth HTTP transport consumes handles once and exposes only sealed cr
 
 test("live OAuth accepts a workspace member who is not a Slack admin", async () => {
   let seals = 0;
+  let installer = { id: "U_HUMAN", team_id: "T_TEAM", is_admin: false, is_owner: false, is_bot: false, deleted: false };
   const transport = createSlackOAuthHttpTransport({
     endpoint: "https://slack.test/api/oauth.v2.access",
     handles: {
@@ -949,7 +1074,7 @@ test("live OAuth accepts a workspace member who is not a Slack admin", async () 
       if (String(url).endsWith("/users.info")) {
         return new Response(JSON.stringify({
           ok: true,
-          user: { id: "U_HUMAN", is_admin: false, is_owner: false, is_bot: false, deleted: false },
+          user: installer,
         }), { status: 200, headers: { "content-type": "application/json" } });
       }
       return new Response(JSON.stringify({
@@ -969,7 +1094,19 @@ test("live OAuth accepts a workspace member who is not a Slack admin", async () 
   // the installer to be a Slack workspace admin.
   const outcome = await transport.exchange(oauthRequest());
   assert.equal(outcome.kind, "authorized");
+  assert.equal(outcome.kind === "authorized" && outcome.workspaceAdminVerified, false);
   assert.equal(seals, 1);
+  installer = { ...installer, is_admin: true, team_id: "T_OTHER" };
+  assert.equal((await transport.exchange(oauthRequest())).kind, "transport_failure", "another workspace cannot confer the role");
+  assert.equal(seals, 1);
+  installer = { ...installer, team_id: "T_TEAM" };
+  const admin = await transport.exchange(oauthRequest());
+  assert.equal(admin.kind === "authorized" && admin.workspaceAdminVerified, true);
+  installer = { ...installer, is_admin: false, is_owner: true };
+  const owner = await transport.exchange(oauthRequest());
+  assert.equal(owner.kind === "authorized" && owner.workspaceAdminVerified, true);
+  installer = { ...installer, deleted: true };
+  assert.equal((await transport.exchange(oauthRequest())).kind, "transport_failure");
 });
 
 test("live OAuth HTTP transport rejects missing or accepted-only scope headers before sealing", async () => {
@@ -1448,6 +1585,30 @@ test("HTTP Events adapter consumes only the Worker-forwarded header contract and
   assert.equal(SLACK_EVENTS_CONSUMED_HEADER_NAMES.includes("host" as never), false);
 });
 
+test("bot directory lookup requires exact provider identity and never exposes icon URLs", async () => {
+  const calls: SlackWebApiRequest[] = [];
+  const input = { quarantineSink: quarantineDouble(), credentialHandle: credential(), authority: authority(),
+    providerBotId: "B12345", now: NOW };
+  const response = (bot: SlackJsonObject) => ({ kind: "response" as const, status: 200, headers: {}, body: { ok: true, bot } });
+  const transport = transportDouble([
+    response({ id: "B12345", user_id: "U12345", app_id: "A12345", name: "Official bot", icons: { image_72: "https://cdn.test/icon.png" } }),
+    response({ id: "BOTHER", user_id: "U12345", name: "Wrong bot" }),
+    response({ id: "B12345", user_id: "invalid", name: "Wrong user" }),
+    response({ id: "B12345", name: "Classic" }),
+  ], calls);
+  const first = await lookupSlackProviderBot({ ...input, transport });
+  assert.equal(first.kind, "fact");
+  if (first.kind !== "fact") throw new Error("expected provider fact");
+  assert.equal(first.fact.providerBotId, "B12345"); assert.equal(first.fact.providerUserId, "U12345");
+  assert.equal(first.fact.displayNameSnapshot, "Official bot"); assert.ok(first.fact.avatarUrlDigest);
+  assert.equal(JSON.stringify(first).includes("https://cdn.test"), false);
+  assert.deepEqual(await lookupSlackProviderBot({ ...input, transport }), { kind: "unavailable", reason: "identity_conflict" });
+  assert.deepEqual(await lookupSlackProviderBot({ ...input, transport }), { kind: "unavailable", reason: "identity_conflict" });
+  const classic = await lookupSlackProviderBot({ ...input, transport });
+  assert.equal(classic.kind === "fact" && classic.fact.providerUserId, null);
+  assert.equal(calls.length, 4); assert.ok(calls.every(call => call.method === "bots.info"));
+});
+
 test("directory adapters return stable provider IDs with display and avatar as snapshots only", async () => {
   const calls: SlackWebApiRequest[] = [];
   const transport = transportDouble([
@@ -1643,3 +1804,371 @@ test("conversation member observation consumes every page and rejects a repeated
     now: NOW,
   }), { kind: "unavailable", reason: "outcome_unknown" });
 });
+
+function scanInput(clock = NOW) {
+  return {
+    authority: authority(), reconciliationMarker: "W".repeat(43), now: clock,
+    firstAttemptAt: new Date(NOW.getTime() - 120_000), providerAttempt: 1,
+    releaseCredential: async () => {},
+    leaseCredential: async () => credential({ leaseId: "window-read", leaseExpiresAt: new Date(clock.getTime() + 60_000) }),
+  };
+}
+
+const scanMessage = (suffix: number) => ({ ts: `${Math.floor(NOW.getTime() / 1000) - 30}.${String(suffix).padStart(6, "0")}`, app_id: "A_OTHER" });
+const scanResponse = (messages: SlackJsonObject[], cursor = "") => ({
+  kind: "response" as const, status: 200, headers: {},
+  body: { ok: true, messages, response_metadata: { next_cursor: cursor }, has_more: cursor !== "" },
+});
+
+test("reconciliation bounds history by the first attempt instead of paging through unrelated old messages", async () => {
+  const calls: SlackWebApiRequest[] = [];
+  const result = await reconcileSlackOutboundDelivery({ ...scanInput(), transport: { evidence: "double",
+    async call(request) {
+      calls.push(request);
+      return request.body.oldest ? scanResponse([]) : scanResponse([scanMessage(1)], "unrelated-old-history");
+    },
+  } });
+  assert.deepEqual(result, { kind: "not_found" });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0]!.body.oldest, ((NOW.getTime() - 180_000) / 1000).toFixed(6));
+  assert.equal(calls[0]!.body.latest, ((NOW.getTime() + 60_000) / 1000).toFixed(6));
+  assert.equal(calls[0]!.body.inclusive, true);
+});
+
+test("a busy scan resumes across worker invocations and new traffic cannot move its upper bound", async () => {
+  let saved: SlackReconciliationScan | null = null;
+  const calls: SlackWebApiRequest[] = [];
+  const latest = ((NOW.getTime() + 60_000) / 1000).toFixed(6);
+  let result: Awaited<ReturnType<typeof reconcileSlackOutboundDelivery>> | undefined;
+  for (let tick = 0; tick < 10; tick += 1) {
+    const clock = new Date(NOW.getTime() + tick * 30_000);
+    result = await reconcileSlackOutboundDelivery({ ...scanInput(clock), scan: saved,
+      saveScan: async (scan) => { saved = scan ? JSON.parse(JSON.stringify(scan)) : null; },
+      transport: { evidence: "double", async call(request) {
+        calls.push(request);
+        assert.equal(request.body.latest, latest, "new channel traffic must remain outside this complete scan");
+        const page = request.body.cursor ? Number(String(request.body.cursor).slice(1)) : 0;
+        return scanResponse(Array.from({ length: 100 }, (_, i) => scanMessage(page * 100 + i)), page < 12 ? `p${page + 1}` : "");
+      } },
+    });
+    if (result.kind === "not_found") break;
+    assert.deepEqual(result, { kind: "unavailable", reason: "reconciliation_scan_pending", retryAfterMs: 30_000 });
+  }
+  assert.deepEqual(result, { kind: "not_found" });
+  assert.equal(calls.length, 13, "over 1000 messages must finish without restarting from page one");
+  assert.equal(saved, null, "completed scans must not cache absence for a later attempt");
+});
+
+for (const mode of ["found", "conflict", "metadata_missing", "limited"] as const) {
+  test(`scan evidence survives a checkpoint (${mode})`, async () => {
+    let saved: SlackReconciliationScan | null = null;
+    const first = scanMessage(1);
+    const marked = { ...first, app_id: "A_APP", metadata: { event_type: "raft_message", event_payload: { reconciliation_marker: "W".repeat(43) } } };
+    await reconcileSlackOutboundDelivery({ ...scanInput(), ...(mode === "limited" ? { firstAttemptAt: new Date(NOW.getTime() - 91 * 86400000) } : {}), maxPages: 1,
+      saveScan: async (scan) => { saved = scan; },
+      transport: transportDouble([{ ...scanResponse([mode === "metadata_missing" ? { ...first, app_id: "A_APP" } : mode === "limited" ? first : marked], "checkpoint"),
+        body: { ...scanResponse([mode === "metadata_missing" ? { ...first, app_id: "A_APP" } : mode === "limited" ? first : marked], "checkpoint").body, is_limited: mode === "limited" } }]),
+    });
+    assert.ok(saved);
+    const result = await reconcileSlackOutboundDelivery({ ...scanInput(), ...(mode === "limited" ? { firstAttemptAt: new Date(NOW.getTime() - 91 * 86400000) } : {}), scan: saved,
+      transport: transportDouble([scanResponse(mode === "conflict" ? [{ ...marked, ts: scanMessage(2).ts }] : [scanMessage(3)])]),
+    });
+    if (mode === "found") assert.deepEqual(result, { kind: "found", providerMessageId: first.ts, providerThreadId: null });
+    else assert.deepEqual(result, { kind: "unavailable", reason: mode === "conflict" ? "reconciliation_marker_conflict"
+      : mode === "limited" ? "reconciliation_history_limited" : "reconciliation_bridge_metadata_missing",
+      ...(mode === "conflict" ? {} : { unconfirmable: mode === "limited" ? "reconciliation_history_limited" : "reconciliation_bridge_metadata_missing", retryAfterMs: 900_000 }) });
+  });
+}
+
+test("a new provider attempt or authority scope cannot reuse an older scan cursor", async () => {
+  let saved: SlackReconciliationScan | null = null;
+  await reconcileSlackOutboundDelivery({ ...scanInput(), maxPages: 1, saveScan: async (scan) => { saved = scan; },
+    transport: transportDouble([scanResponse([scanMessage(1)], "old-scan")]) });
+  for (const changed of ["attempt", "scope", "marker"] as const) {
+    const calls: SlackWebApiRequest[] = [];
+    await reconcileSlackOutboundDelivery({ ...scanInput(), scan: saved,
+      ...(changed === "attempt" ? { providerAttempt: 2 } : changed === "marker" ? { reconciliationMarker: "Y".repeat(43) }
+        : { authority: { ...authority(), bindingEpoch: 10 } }),
+      transport: transportDouble([scanResponse([])], calls) });
+    assert.equal(calls[0]!.body.cursor, undefined);
+  }
+});
+
+const malformedHistoryPages: SlackJsonObject[] = [
+  { ok: true, messages: [], has_more: true },
+  { ok: true, messages: [] },
+  { ok: true, messages: [], has_more: false, response_metadata: { next_cursor: 0 } },
+  { ok: true, messages: [null], has_more: false },
+  { ok: true, messages: [{ ...scanMessage(1), channel: "C_WRONG_CHANNEL" }], has_more: false },
+];
+for (const [index, body] of malformedHistoryPages.entries()) {
+  test(`an incomplete or malformed history page is never evidence of absence (case ${index + 1})`, async () => {
+    const result = await reconcileSlackOutboundDelivery({ ...scanInput(),
+      transport: transportDouble([{ kind: "response", status: 200, headers: {}, body }]) });
+    assert.equal(result.kind, "unavailable");
+  });
+}
+
+test("expired cursors restart the same fixed window without forgetting a previously found receipt", async () => {
+  let saved: SlackReconciliationScan | null = null;
+  const message = { ...scanMessage(1), app_id: "A_APP", metadata: { event_type: "raft_message", event_payload: { reconciliation_marker: "W".repeat(43) } } };
+  const saveScan = async (scan: SlackReconciliationScan | null) => { saved = scan; };
+  await reconcileSlackOutboundDelivery({ ...scanInput(), maxPages: 1, saveScan,
+    transport: transportDouble([scanResponse([message], "expired")]) });
+  const expired = await reconcileSlackOutboundDelivery({ ...scanInput(), scan: saved, saveScan,
+    transport: transportDouble([{ kind: "response", status: 200, headers: {}, body: { ok: false, error: "invalid_cursor" } }]) });
+  assert.equal(expired.kind, "unavailable");
+  const calls: SlackWebApiRequest[] = [];
+  const result = await reconcileSlackOutboundDelivery({ ...scanInput(), scan: saved, saveScan,
+    transport: transportDouble([scanResponse([])], calls) });
+  assert.deepEqual(result, { kind: "found", providerMessageId: message.ts, providerThreadId: null });
+  assert.equal(calls[0]!.body.cursor, undefined);
+});
+
+test("thread reply scans use the same bounded interval and retain their parent receipt", async () => {
+  const calls: SlackWebApiRequest[] = [];
+  const message = { ...scanMessage(1), app_id: "A_APP", thread_ts: "1753865100.000001",
+    metadata: { event_type: "raft_message", event_payload: { reconciliation_marker: "W".repeat(43) } } };
+  const result = await reconcileSlackOutboundDelivery({ ...scanInput(), providerThreadId: message.thread_ts,
+    transport: transportDouble([scanResponse([message])], calls) });
+  assert.deepEqual(result, { kind: "found", providerMessageId: message.ts, providerThreadId: message.thread_ts });
+  assert.equal(calls[0]!.method, "conversations.replies");
+  assert.equal(calls[0]!.body.ts, message.thread_ts);
+  assert.equal(typeof calls[0]!.body.oldest, "string");
+});
+
+test("the inclusive lower bound retains a receipt immediately before the first local attempt timestamp", async () => {
+  const ts = ((NOW.getTime() - 180_000) / 1000).toFixed(6);
+  const result = await reconcileSlackOutboundDelivery({ ...scanInput(), transport: transportDouble([scanResponse([{
+    ...scanMessage(1), app_id: "A_APP", ts, metadata: { event_type: "raft_message", event_payload: { reconciliation_marker: "W".repeat(43) } },
+  }])]) });
+  assert.deepEqual(result, { kind: "found", providerMessageId: ts, providerThreadId: null });
+});
+
+test("invalid first-attempt evidence never triggers provider I/O", async () => {
+  let calls = 0;
+  const result = await reconcileSlackOutboundDelivery({ ...scanInput(), firstAttemptAt: new Date(NOW.getTime() + 1),
+    transport: { evidence: "double", async call() { calls += 1; return scanResponse([]); } } });
+  assert.deepEqual(result, { kind: "unavailable", reason: "reconciliation_preflight_invalid" });
+  assert.equal(calls, 0);
+});
+
+test("rate limiting keeps the last completed page and honors Retry-After before another scan chunk", async () => {
+  let saved: SlackReconciliationScan | null = null;
+  const result = await reconcileSlackOutboundDelivery({ ...scanInput(), saveScan: async (scan) => { saved = scan; },
+    transport: transportDouble([scanResponse([scanMessage(1)], "resume-after-limit"),
+      { kind: "response", status: 429, headers: { "retry-after": "60" }, body: { ok: false, error: "ratelimited" } }]) });
+  assert.deepEqual(result, { kind: "unavailable", reason: "reconciliation_rate_limited", retryAfterMs: 60_000 });
+  const calls: SlackWebApiRequest[] = [];
+  const resumed = await reconcileSlackOutboundDelivery({ ...scanInput(new Date(NOW.getTime() + 60_000)), scan: saved,
+    transport: transportDouble([scanResponse([])], calls) });
+  assert.deepEqual(resumed, { kind: "not_found" });
+  assert.equal(calls[0]!.body.cursor, "resume-after-limit");
+  assert.equal(calls[0]!.body.latest, ((NOW.getTime() + 60_000) / 1000).toFixed(6));
+});
+
+test("the upper clock-skew margin includes a Slack receipt timestamp ahead of the worker", async () => {
+  const acceptedAt = ((NOW.getTime() + 2_000) / 1000).toFixed(6);
+  const result = await reconcileSlackOutboundDelivery({ ...scanInput(), transport: { evidence: "double", async call(request) {
+    const ts = Number(acceptedAt);
+    return scanResponse(ts >= Number(request.body.oldest) && ts <= Number(request.body.latest) ? [{
+      ts: acceptedAt, app_id: "A_APP", metadata: { event_type: "raft_message", event_payload: { reconciliation_marker: "W".repeat(43) } },
+    }] : []);
+  } } });
+  assert.deepEqual(result, { kind: "found", providerMessageId: acceptedAt, providerThreadId: null });
+});
+
+test("a free workspace's limited older history does not hide a complete recent scan", async () => {
+  const result = await reconcileSlackOutboundDelivery({ ...scanInput(), transport: transportDouble([{
+    ...scanResponse([]), body: { ...scanResponse([]).body, is_limited: true },
+  }]) });
+  assert.deepEqual(result, { kind: "not_found" });
+});
+
+test("a completed unconfirmable observation is durable and rechecks only after its cooldown", async () => {
+  let saved: SlackReconciliationScan | null = null;
+  const input = { ...scanInput(), saveScan: async (scan: SlackReconciliationScan | null) => { saved = scan; } };
+  const result = await reconcileSlackOutboundDelivery({ ...input, transport: transportDouble([scanResponse([{
+    ...scanMessage(1), app_id: "A_APP",
+  }])]) });
+  assert.equal(result.kind === "unavailable" ? result.unconfirmable : null, "reconciliation_bridge_metadata_missing");
+  assert.ok(saved);
+  const before = new Date(NOW.getTime() + 30_000);
+  const calls: SlackWebApiRequest[] = [];
+  const waiting = await reconcileSlackOutboundDelivery({ ...input, ...scanInput(before), scan: saved,
+    transport: transportDouble([], calls) });
+  assert.equal(waiting.kind === "unavailable" ? waiting.retryAfterMs : null, 870_000);
+  assert.equal(calls.length, 0, "a completed unknown scan must not restart every 30 seconds");
+  const recovered = await reconcileSlackOutboundDelivery({ ...input, ...scanInput(new Date(NOW.getTime() + 900_000)), scan: saved,
+    transport: transportDouble([scanResponse([])], calls) });
+  assert.equal(recovered.kind === "unavailable" ? recovered.unconfirmable : null, "reconciliation_bridge_metadata_missing");
+  assert.equal(calls.length, 1, "cooldown permits rechecking, not erasing evidence");
+  assert.ok(saved);
+  const original = await reconcileSlackOutboundDelivery({ ...input, ...scanInput(new Date(NOW.getTime() + 1_800_000)), scan: saved,
+    transport: transportDouble([scanResponse([{ ...scanMessage(1), app_id: "A_APP", metadata: { event_type: "raft_message", event_payload: { reconciliation_marker: "W".repeat(43) } } }])], calls) });
+  assert.equal(original.kind, "found");
+  assert.equal(saved, null, "only the verified original clears the uncertainty");
+});
+
+test("a read handle rejected before transport is returned to its credential owner", async () => {
+  const handle = credential({ installId: "wrong-install" });
+  const released: SlackBridgeCredentialHandle[] = [];
+  const calls: SlackWebApiRequest[] = [];
+  const result = await reconcileSlackOutboundDelivery({ ...scanInput(), leaseCredential: async () => handle,
+    releaseCredential: async (value) => { released.push(value); }, transport: transportDouble([], calls) });
+  assert.deepEqual(result, { kind: "unavailable", reason: "reconciliation_credential_unavailable" });
+  assert.deepEqual(released, [handle]);
+  assert.equal(calls.length, 0);
+});
+
+
+test("checkpoints from the old timestamp-bound contract are not reused", () => {
+  assert.equal(parseSlackReconciliationScan({ schema: "slack-reconciliation-scan.v1", providerAttempt: 1,
+    scopeKey: "a".repeat(64), oldest: "1.000000", latest: "2.000000", cursor: null, match: null,
+    metadataMissing: false, historyLimited: false }), null);
+});
+
+test("workspace app restrictions request an administrator instead of another OAuth grant", async () => {
+  const calls: SlackWebApiRequest[] = [];
+  const prepare = createSlackProviderPreparation({ transport: transportDouble([{
+    kind: "response", status: 200, headers: {}, body: { ok: false, error: "app_access_restricted" },
+  }], calls), quarantineSink: quarantineDouble(), now: () => NOW });
+  const prepared = await prepare(dispatchInput());
+  assert.equal(prepared.ready, true);
+  if (!prepared.ready) return;
+  assert.deepEqual(await prepared.dispatch(), { kind: "deterministic_failure", pairBlockedReason: "slack_workspace_admin_required" });
+  assert.equal(calls.length, 1);
+});
+
+for (const mode of ["foreign_only", "foreign_then_original", "missing_app", "original", "foreign_outside_window"] as const) {
+  test(`receipt origin is verified independently of a copied reconciliation marker (${mode})`, async () => {
+    const metadata = { event_type: "raft_message", event_payload: { reconciliation_marker: "W".repeat(43) } };
+    const original = { ...scanMessage(1), app_id: "A_APP", metadata };
+    const copied = { ...scanMessage(2), app_id: "A_OTHER", metadata };
+    const messages: SlackJsonObject[] = mode === "original" ? [original]
+      : mode === "foreign_then_original" ? [copied, original]
+      : mode === "missing_app" ? [{ ts: copied.ts, bot_id: "B_UNVERIFIED", metadata }]
+      : mode === "foreign_outside_window" ? [{ ...copied, ts: "1.000002" }] : [copied];
+    const result = await reconcileSlackOutboundDelivery({ ...scanInput(), transport: transportDouble([scanResponse(messages)]) });
+    if (mode === "original" || mode === "foreign_then_original") {
+      assert.deepEqual(result, { kind: "found", providerMessageId: original.ts, providerThreadId: null });
+    } else {
+      assert.deepEqual(result, { kind: "unavailable", reason: "reconciliation_marker_unconfirmed",
+        unconfirmable: "reconciliation_marker_unconfirmed", retryAfterMs: 900_000 });
+    }
+  });
+}
+
+test("receipt origin is rechecked instead of adopting a legacy saved marker match", async () => {
+  let saved: SlackReconciliationScan | null = null;
+  await reconcileSlackOutboundDelivery({ ...scanInput(), maxPages: 1, saveScan: async scan => { saved = scan; },
+    transport: transportDouble([scanResponse([{ ...scanMessage(1), app_id: "A_APP",
+      metadata: { event_type: "raft_message", event_payload: { reconciliation_marker: "W".repeat(43) } } }], "legacy-cursor")]) });
+  assert.ok(saved);
+  const checkpoint = parseSlackReconciliationScan(saved);
+  assert.ok(checkpoint);
+  const legacy = parseSlackReconciliationScan({ ...checkpoint, schema: "slack-reconciliation-scan.v2",
+    match: { providerMessageId: scanMessage(2).ts, providerThreadId: null } });
+  const calls: SlackWebApiRequest[] = [];
+  const result = await reconcileSlackOutboundDelivery({ ...scanInput(), scan: legacy,
+    transport: transportDouble([scanResponse([])], calls) });
+  assert.equal(result.kind, "unavailable", "an old match cannot prove acceptance or absence");
+  assert.equal(result.kind === "unavailable" ? result.unconfirmable : null, "reconciliation_marker_unconfirmed");
+  assert.equal(calls[0]!.body.cursor, undefined, "the old scan must start again, not skip its earlier pages");
+});
+
+for (const originalVisible of [false, true]) {
+  test(`receipt origin uncertainty survives pagination without hiding a verified original (${originalVisible})`, async () => {
+    let saved: SlackReconciliationScan | null = null;
+    const metadata = { event_type: "raft_message", event_payload: { reconciliation_marker: "W".repeat(43) } };
+    await reconcileSlackOutboundDelivery({ ...scanInput(), maxPages: 1, saveScan: async scan => { saved = scan; },
+      transport: transportDouble([scanResponse([{ ts: scanMessage(1).ts, metadata }], "next-page")]) });
+    assert.ok(saved);
+    const result = await reconcileSlackOutboundDelivery({ ...scanInput(), scan: saved,
+      saveScan: async scan => { saved = scan; },
+      transport: transportDouble([scanResponse(originalVisible ? [{ ...scanMessage(2), app_id: "A_APP", metadata }] : [])]) });
+    if (originalVisible) {
+      assert.deepEqual(result, { kind: "found", providerMessageId: scanMessage(2).ts, providerThreadId: null });
+    } else {
+      assert.deepEqual(result, { kind: "unavailable", reason: "reconciliation_marker_unconfirmed",
+        unconfirmable: "reconciliation_marker_unconfirmed", retryAfterMs: 900_000 });
+      const calls: SlackWebApiRequest[] = [];
+      const held = await reconcileSlackOutboundDelivery({ ...scanInput(new Date(NOW.getTime() + 30_000)), scan: saved,
+        transport: transportDouble([], calls) });
+      assert.equal(held.kind === "unavailable" ? held.retryAfterMs : null, 870_000);
+      assert.equal(calls.length, 0, "identity uncertainty must not cause a query every worker tick");
+      for (const changedAuthority of [false, true]) {
+        const rechecked = await reconcileSlackOutboundDelivery({ ...scanInput(new Date(NOW.getTime() + 900_000)),
+          ...(changedAuthority ? { authority: { ...authority(), bindingEpoch: 9 } } : {}), scan: saved,
+          transport: transportDouble([scanResponse([])]) });
+        assert.equal(rechecked.kind === "unavailable" ? rechecked.unconfirmable : null,
+          "reconciliation_marker_unconfirmed", "elapsed time or authority refresh cannot erase an observed marker");
+      }
+    }
+  });
+}
+
+for (const error of ["timestamp", "message_shape", "pagination"] as const) {
+  test(`receipt origin witness survives an early page error (${error})`, async () => {
+    let saved: SlackReconciliationScan | null = null;
+    const copy = { ...scanMessage(1), app_id: "A_OTHER", metadata: {
+      event_type: "raft_message", event_payload: { reconciliation_marker: "W".repeat(43) } } };
+    const body: SlackJsonObject = { ok: true, has_more: false, response_metadata: { next_cursor: "" },
+      messages: error === "timestamp" ? [copy, { ts: "invalid" }] : error === "message_shape" ? [copy, null] : [copy] };
+    if (error === "pagination") body.has_more = "invalid";
+    const first = await reconcileSlackOutboundDelivery({ ...scanInput(), saveScan: async scan => { saved = scan; },
+      transport: transportDouble([{ kind: "response", status: 200, headers: {}, body }]) });
+    assert.equal(first.kind, "unavailable");
+    assert.ok(saved, "marker evidence must be durable before returning the parse error");
+    const second = await reconcileSlackOutboundDelivery({ ...scanInput(), scan: saved,
+      transport: transportDouble([scanResponse([])]) });
+    assert.equal(second.kind === "unavailable" ? second.unconfirmable : null, "reconciliation_marker_unconfirmed",
+      "a disappearing copy cannot become evidence to resend after an earlier malformed page");
+  });
+}
+
+for (const evidence of ["metadata", "history"] as const) {
+  for (const error of ["timestamp", "message_shape", "pagination"] as const) {
+    test(`absence-blocking ${evidence} evidence survives an early page error (${error})`, async () => {
+      let saved: SlackReconciliationScan | null = null;
+      const input = scanInput();
+      if (evidence === "history") input.firstAttemptAt = new Date(input.now.getTime() - 91 * 24 * 60 * 60_000);
+      const witness = { ts: scanMessage(1).ts!, app_id: evidence === "history" ? "A_OTHER" : input.authority.providerAppId };
+      const body: SlackJsonObject = { ok: true, has_more: false, response_metadata: { next_cursor: "" },
+        ...(evidence === "history" ? { is_limited: true } : {}),
+        messages: error === "timestamp" ? [witness, { ts: "invalid" }] : error === "message_shape" ? [witness, null] : [witness] };
+      if (error === "pagination") body.has_more = "invalid";
+      const first = await reconcileSlackOutboundDelivery({ ...input, saveScan: async scan => { saved = scan; },
+        transport: transportDouble([{ kind: "response", status: 200, headers: {}, body }]) });
+      assert.equal(first.kind, "unavailable");
+      assert.ok(saved, "absence-blocking observation must precede the parse error");
+      const second = await reconcileSlackOutboundDelivery({ ...input, scan: saved,
+        transport: transportDouble([scanResponse([])]) });
+      assert.equal(second.kind === "unavailable" ? second.unconfirmable : null,
+        evidence === "history" ? "reconciliation_history_limited" : "reconciliation_bridge_metadata_missing");
+    });
+  }
+}
+
+for (const evidence of ["metadata", "history"] as const) {
+  for (const changedBinding of [false, true]) {
+    test(`${evidence} uncertainty survives cooldown and authority refresh (changedBinding=${changedBinding})`, async () => {
+      let saved: SlackReconciliationScan | null = null;
+      const input = scanInput();
+      if (evidence === "history") input.firstAttemptAt = new Date(input.now.getTime() - 91 * 24 * 60 * 60_000);
+      const body: SlackJsonObject = { ok: true, has_more: false, response_metadata: { next_cursor: "" },
+        messages: evidence === "metadata" ? [{ ts: scanMessage(1).ts!, app_id: input.authority.providerAppId }] : [],
+        ...(evidence === "history" ? { is_limited: true } : {}) };
+      const first = await reconcileSlackOutboundDelivery({ ...input, saveScan: async value => { saved = value; },
+        transport: transportDouble([{ kind: "response", status: 200, headers: {}, body }]) });
+      assert.equal(first.kind, "unavailable"); assert.ok(saved);
+      const later = { ...input, now: new Date(input.now.getTime() + 900_000),
+        authority: { ...input.authority, bindingEpoch: input.authority.bindingEpoch + (changedBinding ? 1 : 0) } };
+      const second = await reconcileSlackOutboundDelivery({ ...later, scan: structuredClone(saved),
+        leaseCredential: async () => credential({ ...later.authority, leaseExpiresAt: new Date(later.now.getTime() + 60_000) }),
+        transport: transportDouble([scanResponse([])]) });
+      assert.equal(second.kind === "unavailable" ? second.unconfirmable : null,
+        evidence === "metadata" ? "reconciliation_bridge_metadata_missing" : "reconciliation_history_limited");
+    });
+  }
+}

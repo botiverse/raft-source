@@ -1,4 +1,4 @@
-import { ChevronRight, Hash, LockKeyhole } from "lucide-react";
+import { ChevronRight, Hash, Lock } from "lucide-react";
 import { useCallback, useState } from "react";
 import type { ReactNode } from "react";
 import { useIntl } from "react-intl";
@@ -72,7 +72,7 @@ function SectionLabel({
       <SectionEyebrow
         as="button"
         onClick={onToggle}
-        className="-mx-1 flex min-w-0 items-center gap-1.5 rounded-control px-1 py-0.5 outline-none hover:bg-fill-pressed focus-visible:shadow-focus active:bg-fill-pressed"
+        className="-mx-1 flex min-w-0 items-center gap-1.5 rounded-control px-1 py-0.5 outline-none hover:bg-fill-medium focus-visible:shadow-focus active:bg-fill-medium"
         // Was aria-label={`${label} section`}. Blank the hole and the residue is
         // " section" — a single lowercase word that no prose heuristic can tell
         // from code, which is exactly why the shared scanner grew a positional
@@ -112,7 +112,7 @@ function SidebarRow({
     <div
       className={`flex min-h-8 items-center gap-1.5 rounded-control border-[1.5px] px-2 py-1 text-footnote ${
         active
-          ? "border-sticker-ink bg-brand font-bold text-sticker-ink"
+          ? "border-sticker-ink bg-selected font-bold text-sticker-ink"
           : "border-transparent font-medium text-foreground"
       }`}
     >
@@ -185,7 +185,7 @@ export default function ServerCreatePreview({
         </div>
         <div className="flex h-8 items-center justify-center rounded-control border-[1.5px] border-line-strong bg-layer-card px-3 font-mono text-mono-meta text-foreground-muted">
           <span className="inline-flex min-w-0 items-center gap-1.5">
-            <LockKeyhole size={12} className="shrink-0 text-foreground-hint" />
+            <Lock size={12} className="shrink-0 text-foreground-hint" />
             <span className="shrink-0 text-foreground-hint">{RAFT_APP_SERVER_PATH_PREFIX}</span>
             <span
               key={previewSlug}

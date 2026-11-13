@@ -1,0 +1,92 @@
+{
+  "protocolVersion": 3,
+  "runtimeId": "kimi-sdk",
+  "schemaVersion": "kimi-sdk.create.v1",
+  "dataSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "model"
+    ],
+    "properties": {
+      "model": {
+        "type": "string",
+        "title": "Model",
+        "minLength": 1,
+        "x-optionSource": "model"
+      },
+      "reasoningEffort": {
+        "type": "string",
+        "title": "Thinking effort",
+        "minLength": 1,
+        "x-optionSource": "reasoningEffort"
+      },
+      "envVars": {
+        "type": "object",
+        "title": "Environment Variables",
+        "additionalProperties": {
+          "type": "string"
+        }
+      }
+    }
+  },
+  "uiSchema": {
+    "order": [
+      "model",
+      "reasoningEffort",
+      "envVars"
+    ],
+    "layout": {
+      "advanced": [
+        "/envVars"
+      ]
+    },
+    "localization": {
+      "model": {
+        "label": "Model",
+        "hint": "Models available from this computer's Kimi configuration."
+      },
+      "reasoningEffort": {
+        "label": "Thinking effort",
+        "hint": "Available values are declared by the selected model."
+      },
+      "envVars": {
+        "label": "Environment Variables",
+        "hint": "These will be injected into the runtime command environment."
+      }
+    },
+    "rules": []
+  },
+  "capabilities": {
+    "providerKinds": [],
+    "writeOnlyPointers": [],
+    "forbiddenPointers": [
+      "/hostUserState"
+    ]
+  },
+  "optionSources": {
+    "model": {
+      "protocolVersion": 1,
+      "runtimeId": "kimi-sdk",
+      "schemaVersion": "kimi-sdk.create.v1",
+      "sourceId": "model",
+      "kind": "select",
+      "pointer": "/model"
+    },
+    "reasoningEffort": {
+      "protocolVersion": 1,
+      "runtimeId": "kimi-sdk",
+      "schemaVersion": "kimi-sdk.create.v1",
+      "sourceId": "reasoningEffort",
+      "kind": "dependent_select",
+      "pointer": "/reasoningEffort",
+      "dependsOn": "/model"
+    }
+  },
+  "values": {
+    "model": "kimi-k2",
+    "reasoningEffort": "high",
+    "envVars": {}
+  },
+  "revision": "56bb203bc49df1992af2388a"
+}

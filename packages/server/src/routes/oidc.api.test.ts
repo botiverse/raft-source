@@ -12,7 +12,7 @@ import { decodeOidcAuthorizationCode } from "../services/oidcService";
 import { createServer } from "../services/serverService";
 import { openTestApp } from "../test/integration/app";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 function base64UrlJson(value: string): Record<string, unknown> {
   return JSON.parse(Buffer.from(value, "base64url").toString("utf8")) as Record<string, unknown>;
@@ -47,7 +47,7 @@ test("standard OIDC discovery, authorization, PKCE, ID token, JWKS, and email cl
   process.env.SERVER_URL = "https://api.raft.test";
   process.env.APP_URL = "https://app.raft.test";
 
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const suffix = randomUUID();
     const email = `oidc-owner-${suffix}@raft.test`;
@@ -91,12 +91,12 @@ test("standard OIDC discovery, authorization, PKCE, ID token, JWKS, and email cl
       lookupClient(client.id),
     ]);
     assert.equal(keyLookup.status, 200);
-    assert.equal(uuidLookup.status, 404);
+    assert.equal(uuidLookup.status, 403);
     const keyLookupBody = await keyLookup.json() as Record<string, unknown>;
     assert.equal(keyLookupBody.clientId, client.clientId);
     assert.equal(keyLookupBody.availability, "ready");
     const unknownUuidLookup = await lookupClient(randomUUID());
-    assert.equal(unknownUuidLookup.status, 404);
+    assert.equal(unknownUuidLookup.status, 403);
 
     const [rootDiscovery, nestedDiscovery] = await Promise.all([
       fetch(`${app.baseUrl}/.well-known/openid-configuration`),
@@ -232,8 +232,8 @@ test("standard OIDC discovery, authorization, PKCE, ID token, JWKS, and email cl
         server: otherServer.slug,
       }),
     });
-    assert.equal(wrongServerAuthorize.status, 404);
-    assert.equal((await wrongServerAuthorize.json() as { error: string }).error, "OAuth client not found for server");
+    assert.equal(wrongServerAuthorize.status, 403);
+    assert.equal((await wrongServerAuthorize.json() as { code: string }).code, "app_not_available");
 
     const uuidAuthorize = await fetch(`${app.baseUrl}/api/oauth/authorize/human`, {
       method: "POST",
@@ -253,8 +253,8 @@ test("standard OIDC discovery, authorization, PKCE, ID token, JWKS, and email cl
         server: server.slug,
       }),
     });
-    assert.equal(uuidAuthorize.status, 404);
-    assert.equal((await uuidAuthorize.json() as { error: string }).error, "OAuth client not found for server");
+    assert.equal(uuidAuthorize.status, 403);
+    assert.equal((await uuidAuthorize.json() as { code: string }).code, "app_not_available");
 
     const authorize = await fetch(`${app.baseUrl}/api/oauth/authorize/human`, {
       method: "POST",
@@ -588,7 +588,7 @@ test("server-scoped OIDC issuer replaces the server query parameter", async () =
   process.env.SERVER_URL = "https://api.raft.test";
   process.env.APP_URL = "https://app.raft.test";
 
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const suffix = randomUUID();
     const [owner] = await getDb().insert(users).values({
@@ -653,6 +653,25 @@ test("server-scoped OIDC issuer replaces the server query parameter", async () =
     const rejectedBody = await rejected.json() as Record<string, unknown>;
     assert.equal(rejectedBody.error, "invalid_request");
     assert.match(String(rejectedBody.error_description), /no longer supported/);
+
+    // Presence, not the parsed value, matters. Express represents repeated
+    // values as an array, and empty/whitespace values used to be treated as
+    // absent, silently widening a request that still supplied this parameter.
+    for (const values of [[slug, "other-server"], ["", slug], [""], [" "]]) {
+      for (const path of ["/api/oauth/authorize", `/oidc/${slug}/api/oauth/authorize`]) {
+        const malformed = new URL(path, app.baseUrl);
+        for (const [name, value] of authorizeUrl.searchParams) {
+          if (name !== "server") malformed.searchParams.append(name, value);
+        }
+        for (const value of values) malformed.searchParams.append("server", value);
+        const response = await fetch(malformed, { redirect: "manual" });
+        assert.equal(response.status, 400, `${path}: server=${JSON.stringify(values)}`);
+        const body = await response.json() as Record<string, unknown>;
+        assert.equal(body.error, "invalid_request");
+        assert.match(String(body.error_description), /no longer supported/);
+        assert.equal(response.headers.get("location"), null);
+      }
+    }
 
     // Control for the line above: the identical request without `server=`
     // still redirects, proving the 400 came from that parameter and not from

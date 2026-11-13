@@ -6,12 +6,12 @@ import { eq } from "drizzle-orm";
 
 import { getDb } from "../db/index";
 import { agents, servers, users, serverMembers } from "../db/schema";
-import { signAccessToken } from "../middleware/auth";
+import { accessTokenForTest } from "../test/integration/credentials";
 import { createAgent } from "../services/agentService";
 import { createChannel, addHuman, findOrCreateDM, findOrCreateUserDM, getOrCreateThread, listChannels } from "../services/channelService";
 import { createMessage } from "../services/messageService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 /**
  * Contract test for `GET /api/channels/:id` `joined` field.
@@ -74,7 +74,7 @@ async function seed() {
 async function fetchChannel(baseUrl: string, channelId: string, userId: string, serverId: string) {
   const res = await fetch(`${baseUrl}/api/channels/${channelId}`, {
     headers: {
-      Authorization: `Bearer ${signAccessToken(userId)}`,
+      Authorization: `Bearer ${await accessTokenForTest(userId)}`,
       "X-Server-Id": serverId,
     },
   });
@@ -167,7 +167,7 @@ test("GET /channels/:id hydrates a participant DM whose agent peer was deleted",
 
   const listRes = await fetch(`${app.baseUrl}/api/channels/dm`, {
     headers: {
-      Authorization: `Bearer ${signAccessToken(owner.id)}`,
+      Authorization: `Bearer ${await accessTokenForTest(owner.id)}`,
       "X-Server-Id": server.id,
     },
   });

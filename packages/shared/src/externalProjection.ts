@@ -29,6 +29,8 @@ export interface ExternalActorProjection extends ExternalProjectionIdentity {
   state: ExternalProjectionState;
   actorKind: ExternalActorKind;
   deactivated: boolean;
+  /** Server-verified bot mapping version; never provided by clients. */
+  slackBotMappingRevision?: number;
 }
 
 /**
@@ -36,6 +38,8 @@ export interface ExternalActorProjection extends ExternalProjectionIdentity {
  * message. It intentionally contains no Raft principal or membership fields.
  */
 export interface ExternalMessageAuthorProjection extends ExternalProjectionIdentity {
+  /** Anonymous Slack origin has no provider user identity and is not addressable. */
+  identityKind?: "provider_actor" | "anonymous";
   workspaceName: string | null;
   externalConversationId: string;
   externalMessageId: string;
@@ -43,7 +47,23 @@ export interface ExternalMessageAuthorProjection extends ExternalProjectionIdent
   actorKind: ExternalActorKind;
   avatarUrl: string | null;
   avatarDigest: string | null;
+  /** Current verified external bot profile when the original binding is still authorized. */
+  profileDisplayName?: string | null;
+  profileAvatarUrl?: string | null;
+  /** Name of the external App that owns the bot, when known. */
+  appName?: string | null;
+  /** Profile was unavailable after the bounded Slack recovery wait. */
+  profileFallback?: "unresolved";
   actorProjectionRevision: number;
+}
+
+/** Stable fallback when a verified Slack bot profile is unavailable. */
+export function slackBotFallbackLabel(providerBotId: string): string {
+  return `Slack bot · ${providerBotId.slice(-4)}`;
+}
+
+export function isSlackBotFallbackLabel(label: string, providerBotId: string): boolean {
+  return label === slackBotFallbackLabel(providerBotId);
 }
 
 /**
@@ -127,6 +147,8 @@ export interface ResolvedExternalMentionFact extends ExternalProjectionIdentity 
   freshnessObservedAt: string;
   freshnessExpiresAt: string;
   handleAtSendTime: string;
+  /** Stable bot target mapping frozen when this fact was minted. */
+  slackBotMappingRevision?: number;
   resolutionReason: ExternalMentionResolutionReason;
 }
 
@@ -194,7 +216,9 @@ function freshnessReason(
 ): ExternalMentionRejectionReason | null {
   if (!contextMatches(candidate, expected)) return "context_mismatch";
   if (candidate.actor.state !== "active" || candidate.actor.deactivated) return "actor_not_active";
-  if (candidate.actor.actorKind !== "human") return "actor_not_m0_addressable";
+  const verifiedSlackBot = candidate.actor.provider === "slack" && candidate.actor.actorKind === "bot"
+    && Number.isSafeInteger(candidate.actor.slackBotMappingRevision) && (candidate.actor.slackBotMappingRevision ?? 0) > 0;
+  if (candidate.actor.actorKind !== "human" && !verifiedSlackBot) return "actor_not_m0_addressable";
   if (candidate.state !== "active") return "membership_not_active";
 
   const observedAtMs = Date.parse(candidate.observedAt);
@@ -232,6 +256,7 @@ function toMentionFact(
     freshnessObservedAt: candidate.observedAt,
     freshnessExpiresAt: candidate.expiresAt,
     handleAtSendTime: rawHandle,
+    ...(candidate.actor.actorKind === "bot" ? { slackBotMappingRevision: candidate.actor.slackBotMappingRevision } : {}),
     resolutionReason,
   };
 }

@@ -1,4 +1,4 @@
-import { RAFT_SERVER_CAPABILITIES_HEADER } from "@botiverse/raft-shared";
+import { MACHINE_DUPLICATE_CONNECTION_HELD_CLOSE_REASON, RAFT_SERVER_CAPABILITIES_HEADER } from "@botiverse/raft-shared";
 import { serverMachineContextCapabilities } from "../runtimeOutcomeOutboxIngest";
 import { WebSocketServer, type WebSocket } from "ws";
 import type http from "node:http";
@@ -22,6 +22,8 @@ import type {
 import { newMachineConnectionEpochId, sendAuthenticatedMachineContext } from "../services/machineContext";
 import { errorClassOf, recordTraceEvent, runWithTraceSpan } from "../tracing/semanticTrace";
 import { argon2VerifyTraceAttrs, newArgon2VerifyStats, type Argon2VerifyStats } from "../services/argon2VerifyStats";
+import { admitMachineConnect, admitMachineConnectFromAddress, cachedMachineConnectRejection, isMachineConnectVerified, recordMachineConnectAuthFailure, recordMachineConnectVerified, rememberMachineConnectRejection } from "../services/machineConnectRateLimit";
+import { clientIpForRateLimit } from "../lib/clientIpForRateLimit";
 import type { MachineToServerMessage } from "@botiverse/raft-shared";
 import {
   buildMachineConnectTraceContext,
@@ -127,6 +129,18 @@ async function resolveUpgradeAuth(apiKey: string | null, argon2Stats: Argon2Veri
 }
 
 /**
+ * The address a `/daemon/connect` budget is keyed on, as an Express route with
+ * `trust proxy 1` would see `req.ip` (the right-most X-Forwarded-For hop, else the
+ * socket peer), refined by clientIpForRateLimit's viewer-header rule.
+ */
+export function upgradeRequestAddress(request: Pick<http.IncomingMessage, "headers" | "socket">): string {
+  const forwarded = request.headers["x-forwarded-for"];
+  const hops = (Array.isArray(forwarded) ? forwarded.join(",") : forwarded ?? "").split(",").map((hop) => hop.trim()).filter(Boolean);
+  const ip = hops.at(-1) ?? request.socket?.remoteAddress ?? "unknown";
+  return clientIpForRateLimit({ ip, headers: request.headers as never });
+}
+
+/**
  * Setup WebSocket endpoint for machine connections: ws://server/daemon/connect
  * Auth prefers Authorization: Bearer <api_key>. The legacy ?key= query form
  * remains accepted for older daemon processes during rollout.
@@ -209,9 +223,48 @@ export function setupMachineWebSocket(
     // Wall time in argon2 (incl. the wait for a libuv pool thread), on every outcome.
     const argon2Stats = newArgon2VerifyStats();
     try {
-      const result = await resolveUpgradeAuth(apiKey, argon2Stats);
+      // Budgets before any credential work (argon2, DB, registry): a key in a
+      // reconnect loop, and an address whose handshakes keep failing, get 429.
+      // The address budget is read first (no write), so random keys from an
+      // address already over it never create key counters; a key that verified
+      // recently passes it. Then the key's own budget.
+      const address = upgradeRequestAddress(request);
+      const fingerprint = apiKey ? extractApiKeyFingerprint(apiKey) : null;
+      let addressAdmission = await admitMachineConnectFromAddress(address);
+      if (!addressAdmission.admitted && fingerprint && await isMachineConnectVerified(fingerprint)) {
+        addressAdmission = { admitted: true };
+      }
+      const admission = addressAdmission.admitted && fingerprint
+        ? await admitMachineConnect(fingerprint)
+        : { admitted: true as const };
+      if (!addressAdmission.admitted || !admission.admitted) {
+        const limited = !addressAdmission.admitted ? addressAdmission : admission as Extract<typeof admission, { admitted: false }>;
+        const reason = !addressAdmission.admitted ? "auth_failure_rate_limited" : "connect_rate_limited";
+        socket.write(`HTTP/1.1 429 Too Many Requests\r\nRetry-After: ${limited.retryAfterSeconds}\r\nSlock-Reason: ${reason}\r\nConnection: close\r\n\r\n`);
+        socket.destroy();
+        span.end("ok", { attrs: { outcome: "rate_limited", reason, retry_after_seconds: limited.retryAfterSeconds, ...traceAttrs } });
+        return;
+      }
+
+      // A rejection that cannot turn into an accept by itself is answered from
+      // the cache: same 401 and reason, no verify (machineConnectRateLimit.ts).
+      const cachedRejection = fingerprint ? await cachedMachineConnectRejection(fingerprint) : null;
+      const result: UpgradeAuthResult = cachedRejection
+        ? {
+          outcome: "rejected",
+          principalKind: cachedRejection.principalKind as PrincipalKind,
+          reason: cachedRejection.reason as AuthDenyReason,
+          stage: cachedRejection.stage as AuthStage,
+        }
+        : await resolveUpgradeAuth(apiKey, argon2Stats);
 
       if (result.outcome === "rejected") {
+        if (!cachedRejection) {
+          void recordMachineConnectAuthFailure(address);
+          if (fingerprint) {
+            void rememberMachineConnectRejection(fingerprint, { reason: result.reason, stage: result.stage, principalKind: result.principalKind });
+          }
+        }
         span.addEvent("auth.rejected", {
           outcome: "rejected",
           reason: result.reason,
@@ -230,6 +283,29 @@ export function setupMachineWebSocket(
             reason: result.reason,
             principal_kind: result.principalKind,
             auth_stage: result.stage,
+            ...(cachedRejection ? { rejection_cached: true } : {}),
+            ...traceAttrs,
+            ...argon2VerifyTraceAttrs(argon2Stats),
+          },
+        });
+        return;
+      }
+
+      if (fingerprint) void recordMachineConnectVerified(fingerprint);
+
+      // Task #374: a held duplicate is refused here, before the upgrade, so an
+      // old daemon backs off instead of reconnecting the moment its socket
+      // opens and is closed. Off unless duplicate enforcement is on.
+      if (await orchestrator.refuseHeldDuplicateAtHandshake(result.machine.id)) {
+        socket.write(`HTTP/1.1 409 Conflict\r\nSlock-Reason: ${MACHINE_DUPLICATE_CONNECTION_HELD_CLOSE_REASON}\r\n\r\n`);
+        socket.destroy();
+        span.end("ok", {
+          attrs: {
+            outcome: "refused",
+            reason: MACHINE_DUPLICATE_CONNECTION_HELD_CLOSE_REASON,
+            principal_kind: result.principalKind,
+            machine_id: result.machine.id,
+            server_id: result.machine.serverId,
             ...traceAttrs,
             ...argon2VerifyTraceAttrs(argon2Stats),
           },

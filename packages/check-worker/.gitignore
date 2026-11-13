@@ -1,0 +1,2 @@
+# `pnpm run build` (wrangler deploy --dry-run --outdir dist).
+dist/

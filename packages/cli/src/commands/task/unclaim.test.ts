@@ -49,7 +49,7 @@ test("task unclaim command uses injected ApiClient and writes canonical text", a
     }) as any,
   });
 
-  await taskUnclaimCommand.handler(ctx, { target: "  #proj-runtime  ", number: "7" });
+  await taskUnclaimCommand.handler(ctx, undefined, { target: "  #proj-runtime  ", number: "7" });
 
   assert.deepEqual(requests, [
     {
@@ -70,7 +70,7 @@ test("task unclaim command maps invalid numbers into typed CliError", async () =
   });
 
   await assert.rejects(
-    async () => { await taskUnclaimCommand.handler(ctx, { channel: "#engineering", number: "0" }); },
+    async () => { await taskUnclaimCommand.handler(ctx, undefined, { channel: "#engineering", number: "0" }); },
     (err: unknown) => {
       assert.ok(err instanceof CliError);
       assert.equal(err.code, "INVALID_ARG");
@@ -96,7 +96,7 @@ test("task unclaim command maps server failures into typed CliError", async () =
   });
 
   await assert.rejects(
-    async () => { await taskUnclaimCommand.handler(ctx, { channel: "#engineering", number: "7" }); },
+    async () => { await taskUnclaimCommand.handler(ctx, undefined, { channel: "#engineering", number: "7" }); },
     (err: unknown) => {
       assert.ok(err instanceof CliError);
       assert.equal(err.code, "UNCLAIM_FAILED");

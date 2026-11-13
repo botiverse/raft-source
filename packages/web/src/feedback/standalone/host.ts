@@ -1,4 +1,5 @@
 import axios, { AxiosHeaders } from "axios";
+import { DISPLAY_LOCALES, displayLocaleTag } from "@botiverse/raft-shared/src/displayLocales";
 import type { AxiosInstance } from "axios";
 
 const COMPILED_API_ORIGIN = typeof import.meta.env?.VITE_API_URL === "string" ? import.meta.env.VITE_API_URL.replace(/\/$/, "") : "";
@@ -14,11 +15,17 @@ export interface FeedbackHostSession {
   /** Which native client is hosting the page. Passed through as given: the Server decides which kinds it accepts. */
   clientKind: string;
   clientVersion: string;
-  locale: "en" | "zh-CN";
+  locale: FeedbackHostLocale;
   /** The host's own theme family. The page always renders the Raft Design System; only `mode` is honoured. */
   theme: "brutal" | "elegant" | "raft";
   mode: "light" | "dark";
 }
+/**
+ * Locales the page ships copy for: the BCP 47 tag of every display locale
+ * (`en`, `zh-CN`, `ja`, …). Older hosts send only en / zh-CN.
+ */
+export const FEEDBACK_HOST_LOCALES: readonly string[] = DISPLAY_LOCALES.map(displayLocaleTag);
+export type FeedbackHostLocale = string;
 export type FeedbackBinding = Pick<FeedbackHostSession, "accountId" | "sessionGeneration" | "webViewGeneration">;
 export interface FeedbackHost {
   version: typeof FEEDBACK_HOST_VERSION;
@@ -44,7 +51,7 @@ export function parseFeedbackHost(value: unknown, pageOrigin: string, compiledAp
   // as a request header.
   if (typeof s.clientKind !== "string" || !s.clientKind || s.clientKind.length > 64 || /\s/.test(s.clientKind)) return null;
   if (typeof s.clientVersion !== "string" || !s.clientVersion.trim() || s.clientVersion.length > 64) return null;
-  if (!["en", "zh-CN"].includes(s.locale) || !["brutal", "elegant", "raft"].includes(s.theme) || !["light", "dark"].includes(s.mode)) return null;
+  if (!FEEDBACK_HOST_LOCALES.includes(s.locale) || !["brutal", "elegant", "raft"].includes(s.theme) || !["light", "dark"].includes(s.mode)) return null;
   try {
     const origin = new URL(s.apiOrigin);
     // The additional API target is build-owned, never an arbitrary host choice.

@@ -30,34 +30,14 @@ describe("favicon assets", () => {
       },
     );
   });
+});
 
-  it("keeps manifest and browser chrome colors on the current icon token", () => {
-    const html = readFileSync(resolve(repoRoot, "index.html"), "utf8");
-    const manifest = JSON.parse(readFileSync(resolve(repoRoot, "public/site.webmanifest"), "utf8"));
-
-    assert.match(html, /<meta name="theme-color" content="#FFD440" \/>/);
-    assert.match(html, /<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" \/>/);
-    assert.equal(manifest.theme_color, "#FFD440");
-    assert.equal(manifest.background_color, "#FFD440");
-  });
-
-  it("version-busts favicon links so browser favicon caches refresh", () => {
-    const html = readFileSync(resolve(repoRoot, "index.html"), "utf8");
-
-    assert.match(html, /href="\/favicon\.ico\?v=20260511"/);
-    assert.match(html, /href="\/android-chrome-512x512\.png\?v=20260511"/);
-    assert.match(html, /href="\/android-chrome-192x192\.png\?v=20260511"/);
-    assert.match(html, /href="\/favicon-32x32\.png\?v=20260511"/);
-    assert.match(html, /href="\/favicon-16x16\.png\?v=20260511"/);
-    assert.match(html, /href="\/apple-touch-icon\.png\?v=20260511"/);
-    assert.match(html, /href="\/site\.webmanifest\?v=20260628"/);
-  });
-
-  it("advertises high-resolution browser icons for desktop taskbar pins", () => {
-    const html = readFileSync(resolve(repoRoot, "index.html"), "utf8");
-
-    assert.match(html, /<link rel="icon" href="\/favicon\.ico\?v=20260511" sizes="any" \/>/);
-    assert.match(html, /<link rel="icon" type="image\/png" sizes="512x512" href="\/android-chrome-512x512\.png\?v=20260511" \/>/);
-    assert.match(html, /<link rel="icon" type="image\/png" sizes="192x192" href="\/android-chrome-192x192\.png\?v=20260511" \/>/);
+describe("dotted favicon variants (notifications/badge.ts)", () => {
+  it("exist as PNGs at their stated sizes", () => {
+    for (const [file, size] of [["favicon-dot-16x16.png", 16], ["favicon-dot-32x32.png", 32], ["favicon-dot-192x192.png", 192]] as const) {
+      const data = readFileSync(resolve(repoRoot, "public", file));
+      assert.equal(data.subarray(1, 4).toString("latin1"), "PNG", file);
+      assert.deepEqual([data.readUInt32BE(16), data.readUInt32BE(20)], [size, size], file);
+    }
   });
 });

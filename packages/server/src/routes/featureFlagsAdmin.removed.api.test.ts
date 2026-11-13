@@ -8,7 +8,7 @@ import { getDb } from "../db/index";
 import { users } from "../db/schema";
 import { createFeatureFlag, createFeatureFlagRule } from "../services/featureFlagService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 // Absence tooth for the server-side feature-flag admin surface (Group C).
 //
@@ -38,16 +38,8 @@ async function readProductionServerSources(directory: URL): Promise<string[]> {
   return sources;
 }
 
-test("production routers and services carry no admin declarations or core operator roster", async () => {
-  const [featureFlagsSource, oauthSource, productionSources] = await Promise.all([
-    readFile(new URL("./featureFlags.ts", import.meta.url), "utf8"),
-    readFile(new URL("./oauth.ts", import.meta.url), "utf8"),
-    readProductionServerSources(new URL("../", import.meta.url)),
-  ]);
-
-  assert.doesNotMatch(featureFlagsSource, /["']\/admin\/flags/, "core featureFlags router must not declare admin routes");
-  assert.doesNotMatch(oauthSource, /["']\/operator\/feature-flags/, "core OAuth router must not declare flag admin routes");
-  assert.doesNotMatch(oauthSource, /["']\/operator\/announcements/, "core OAuth router must not declare announcement admin routes");
+test("production server code carries no core operator roster", async () => {
+  const productionSources = await readProductionServerSources(new URL("../", import.meta.url));
 
   const retiredCoreEnvNames = [
     ["RAFT", "FEATURE", "FLAG", "OPERATOR", "USER", "IDS"].join("_"),
@@ -65,7 +57,7 @@ test("production routers and services carry no admin declarations or core operat
 test("public API does not expose feature-flag admin routes", async () => {
   const authorityEnv = "RAFT_FEATURE_FLAG_OPERATOR_USER_IDS";
   const previousAuthority = process.env[authorityEnv];
-  const { baseUrl, close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const { baseUrl, close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const db = getDb();
     const passwordHash = await argon2.hash("password123");

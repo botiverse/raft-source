@@ -7,6 +7,7 @@
  */
 
 import type { ComputerOperationProgress, Machine, MachineRuntimeDetection } from "../machineStore";
+import type { ComputerVersionGate } from "@botiverse/raft-shared";
 
 export interface MachineDomainState {
   machines: Machine[];
@@ -38,10 +39,16 @@ export type MachineEvent =
       runtimeVersions?: Record<string, string>;
       hostname?: string;
       os?: string;
+      /** Absent on a detection-only push and from older servers (keep); null = now unknown. */
+      hostProvider?: string | null;
+      osRelease?: string | null;
+      deviceClass?: string | null;
       daemonVersion?: string;
       computerVersion?: string | null;
       /** task #1268: explicit detection state; absent = complete (leave as is). */
       runtimeDetection?: MachineRuntimeDetection | null;
+      /** Version floor verdict; absent = not in this push (keep), null = not gated. */
+      versionGate?: ComputerVersionGate | null;
     }
   | {
       kind: "operation-set";
@@ -236,12 +243,16 @@ function applyCapabilities(
           : {}),
       ...(event.hostname !== undefined ? { hostname: event.hostname } : {}),
       ...(event.os !== undefined ? { os: event.os } : {}),
+      ...(event.hostProvider !== undefined ? { hostProvider: event.hostProvider } : {}),
+      ...(event.osRelease !== undefined ? { osRelease: event.osRelease } : {}),
+      ...(event.deviceClass !== undefined ? { deviceClass: event.deviceClass } : {}),
       ...(event.daemonVersion !== undefined
         ? { daemonVersion: event.daemonVersion }
         : {}),
       ...(event.computerVersion !== undefined
         ? { computerVersion: event.computerVersion }
         : {}),
+      ...(event.versionGate !== undefined ? { versionGate: event.versionGate } : {}),
     };
     if (!machineShallowEqual(machine, next)) changed = true;
     return machineShallowEqual(machine, next) ? machine : next;

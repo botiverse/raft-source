@@ -7,6 +7,8 @@
  */
 export const AGENT_MIGRATION_TERMINAL_FAILURE_CODES = [
   "MIGRATION_TRANSPORT_LOST",
+  /** A Computer got no response from object storage for minutes (proxy, firewall, outage). */
+  "MIGRATION_OBJECT_STORE_UNREACHABLE",
   "MIGRATION_OBJECT_STORE_BUNDLE_TOO_LARGE",
   "MIGRATION_OBJECT_STORE_MANIFEST_TOO_LARGE",
   "MIGRATION_OBJECT_STORE_INSUFFICIENT_DISK",
@@ -19,13 +21,27 @@ export const AGENT_MIGRATION_TERMINAL_FAILURE_CODES = [
   "MIGRATION_GENERATION_STALE",
   "MIGRATION_CONTROL_MANIFEST_INVALID",
   "MIGRATION_CONTROL_MANIFEST_TOO_LARGE",
+  /** The owner of the source or target Computer asked to delete their account; its keys are revoked, so the move can never finish. */
+  "MIGRATION_COMPUTER_OWNER_DELETED",
+  /** The target Computer's key was revoked (detached) before the agent moved onto it; it stays on its source. */
+  "MIGRATION_TARGET_COMPUTER_DETACHED",
+  /**
+   * The source's own transfer summary failed validation (Computer 1.0.59 and older counted more
+   * than a million files under ignored paths). The Server derives it from the daemon's JS_ZodError.
+   */
+  "MIGRATION_TRANSFER_SUMMARY_INVALID",
+  /**
+   * The source could not write the paths the user chose to leave out to
+   * `.raftbackupignore.user` (MIGRATION_USER_IGNORE_WRITE_FAILED in
+   * ./agentMigrationUserIgnore); the detail code carries the reason.
+   */
+  "MIGRATION_USER_IGNORE_WRITE_FAILED",
 ] as const;
 
 export type AgentMigrationTerminalFailureCode =
   (typeof AGENT_MIGRATION_TERMINAL_FAILURE_CODES)[number];
 
 export const AGENT_MIGRATION_USER_ERROR_CODES = [
-  "agent_migration_ui_disabled",
   "not_supported",
   "AGENT_NOT_FOUND",
   "TARGET_COMPUTER_REQUIRED",

@@ -4,18 +4,16 @@ import {
   getDefaultModel,
   hydrateRuntimeConfig,
   PI_BUILTIN_PROVIDER_ENV_KEYS,
-  PI_BUILTIN_PROVIDER_DEFAULT_MODELS,
-  PI_BUILTIN_PROVIDER_MODELS,
   parseRuntimeConfig,
   RUNTIME_CONFIG_VERSION,
   RUNTIME_FAST_MODE_RUNTIMES,
+  runtimeConfigModelValue,
+  runtimeModelSupportsFastMode,
 } from "@botiverse/raft-shared";
 import type {
   BuiltInRuntimeAnyProviderId,
-  BuiltInRuntimeConfig,
   BuiltInRuntimeGatewayProviderId,
   BuiltInRuntimeProviderId,
-  ResolvedAgentCreateFormDefinition,
   ReasoningEffort,
   RuntimeConfig,
   RuntimeConfigHydrationInput,
@@ -34,17 +32,6 @@ export type RuntimeConfigBuildErrorCode =
   | "modelRequired"
   | "baseUrlInvalid"
   | "runtimeConfigInvalid";
-
-export const RUNTIME_CONFIG_BUILD_ERROR_MESSAGE_ID = {
-  optionSourcesInvalid: "agent.runtimeConfig.optionSourcesInvalid",
-  selectValidProvider: "agent.runtimeConfig.selectValidProvider",
-  selectValidProviderConnection: "agent.runtimeConfig.selectValidProviderConnection",
-  selectValidProviderModel: "agent.runtimeConfig.selectValidProviderModel",
-  apiKeyRequired: "agent.runtimeConfig.apiKeyRequired",
-  modelRequired: "agent.runtimeConfig.modelRequired",
-  baseUrlInvalid: "agent.runtimeConfig.baseUrlInvalid",
-  runtimeConfigInvalid: "agent.detail.runtimeConfigInvalid",
-} as const;
 
 export class RuntimeConfigBuildError extends Error {
   readonly code: RuntimeConfigBuildErrorCode;
@@ -81,125 +68,10 @@ export const PI_PROVIDER_CONFIGURED: PiProviderMode = "configured";
 export const PI_BUILTIN_PROVIDER_IDS = Object.keys(PI_BUILTIN_PROVIDER_ENV_KEYS);
 export const BUILTIN_RUNTIME_PROVIDER_IDS = Object.keys(BUILTIN_RUNTIME_PROVIDER_ENV_KEYS) as BuiltInRuntimeProviderId[];
 export const BUILTIN_RUNTIME_GATEWAY_PROVIDER_IDS = Object.keys(BUILTIN_RUNTIME_GATEWAY_PROVIDER_ENV_KEYS) as BuiltInRuntimeGatewayProviderId[];
-export const BUILTIN_RUNTIME_ALL_PROVIDER_IDS = [
-  ...BUILTIN_RUNTIME_PROVIDER_IDS,
-  ...BUILTIN_RUNTIME_GATEWAY_PROVIDER_IDS,
-] as BuiltInRuntimeAnyProviderId[];
 export const BUILTIN_RUNTIME_DEFAULT_PROVIDER_ID: BuiltInProviderMode = BUILTIN_RUNTIME_PROVIDER_IDS[0] ?? "deepseek";
 
 export function isBuiltInGatewayProviderMode(providerMode: string): providerMode is BuiltInRuntimeGatewayProviderId {
   return (BUILTIN_RUNTIME_GATEWAY_PROVIDER_IDS as readonly string[]).includes(providerMode);
-}
-
-export function supportsRuntimeBuiltInProvider(runtime: string): boolean {
-  return runtime === "builtin";
-}
-
-export function supportsRuntimePiProvider(runtime: string): boolean {
-  return runtime === "pi";
-}
-
-export function runtimeConfigBuiltInProviderApiKey(config: RuntimeConfig): string {
-  if (config.runtime !== "builtin") return "";
-  const provider = (config as { provider?: { kind?: string; apiKey?: string } }).provider;
-  return (provider?.kind === "preset" || provider?.kind === "gateway") && typeof provider.apiKey === "string" ? provider.apiKey : "";
-}
-
-export function runtimeConfigBuiltInProviderBaseUrl(config: RuntimeConfig): string {
-  if (config.runtime !== "builtin") return "";
-  const provider = (config as { provider?: { kind?: string; baseUrl?: string } }).provider;
-  return provider?.kind === "gateway" && typeof provider.baseUrl === "string" ? provider.baseUrl : "";
-}
-
-export function runtimeConfigBuiltInProviderSupportsImageInput(config: RuntimeConfig): boolean {
-  // Built-in hydration can arrive without provider when member projections /
-  // agent:created strip private runtimeConfig (same hole as shared legacy
-  // builtInSelectionTraceAttrs). Never throw on render paths.
-  if (config.runtime !== "builtin" || config.provider?.kind !== "gateway") return false;
-  return config.provider.supportsImageInput === true;
-}
-
-export function runtimeConfigBuiltInProviderMode(config: RuntimeConfig): BuiltInProviderMode {
-  if (config.runtime !== "builtin") return BUILTIN_RUNTIME_DEFAULT_PROVIDER_ID;
-  return config.provider?.kind === "preset" || config.provider?.kind === "gateway"
-    ? config.provider.providerId
-    : BUILTIN_RUNTIME_DEFAULT_PROVIDER_ID;
-}
-
-export function runtimeConfigProviderConnectionId(config: RuntimeConfig): string {
-  return config.runtime === "builtin" && config.provider?.kind === "connection"
-    ? config.provider.connectionId
-    : "";
-}
-
-export function runtimeConfigPiProviderMode(config: RuntimeConfig): PiProviderMode {
-  if (config.runtime !== "pi") return PI_PROVIDER_CONFIGURED;
-  return config.provider?.kind === "pi-builtin"
-    ? config.provider.providerId
-    : PI_PROVIDER_CONFIGURED;
-}
-
-export function runtimeConfigPiProviderApiKey(config: RuntimeConfig): string {
-  return config.provider?.kind === "pi-builtin" ? config.provider.apiKey : "";
-}
-
-/**
- * Returns the SDK-known model list for a Built-in/Pi provider, or null when
- * the providerId isn't one we surface. The first entry is the default (kept
- * aligned with the SDK's defaultModelPerProvider).
- */
-export function piBuiltinProviderModels(providerId: string): ReadonlyArray<{ id: string; label: string }> | null {
-  return PI_BUILTIN_PROVIDER_MODELS[providerId] ?? null;
-}
-
-export function builtInProviderModels(providerId: string): ReadonlyArray<{ id: string; label: string }> | null {
-  if (isBuiltInGatewayProviderMode(providerId)) return null;
-  return PI_BUILTIN_PROVIDER_MODELS[providerId] ?? null;
-}
-
-export function piBuiltinProviderDefaultModel(providerId: string): string | null {
-  return PI_BUILTIN_PROVIDER_DEFAULT_MODELS[providerId as keyof typeof PI_BUILTIN_PROVIDER_DEFAULT_MODELS] ?? null;
-}
-
-export function builtInProviderDefaultModel(providerId: string): string | null {
-  return PI_BUILTIN_PROVIDER_DEFAULT_MODELS[providerId as keyof typeof PI_BUILTIN_PROVIDER_DEFAULT_MODELS] ?? null;
-}
-
-/**
- * Keep a still-valid model when the Provider choice changes, including when the
- * choice is a saved Provider connection projected into the same selector.
- *
- * The server-owned form definition remains authoritative for schema-backed
- * Built-in runtimes. The legacy catalog is only the rolling-compat fallback.
- */
-export function reconcileBuiltInProviderModelSelection(input: {
-  definition?: ResolvedAgentCreateFormDefinition | null;
-  providerId: string;
-  currentModel: string;
-}): { model: string; customModelMode: boolean } {
-  const modelSource = input.definition?.runtimeId === "builtin"
-    ? input.definition.optionSources.model
-    : undefined;
-  if (modelSource?.kind === "dependent_select") {
-    const customModelMode = modelSource.customValueAllowedByValue[input.providerId] === true;
-    if (customModelMode) {
-      return { model: input.currentModel, customModelMode: true };
-    }
-    const options = modelSource.optionsByValue[input.providerId] ?? [];
-    const model = options.some((option) => option.value === input.currentModel)
-      ? input.currentModel
-      : modelSource.defaultValueByValue[input.providerId] ?? options[0]?.value ?? "";
-    return { model, customModelMode: false };
-  }
-
-  if (isBuiltInGatewayProviderMode(input.providerId)) {
-    return { model: input.currentModel, customModelMode: true };
-  }
-  const options = builtInProviderModels(input.providerId) ?? [];
-  const model = options.some((option) => option.id === input.currentModel)
-    ? input.currentModel
-    : builtInProviderDefaultModel(input.providerId) ?? options[0]?.id ?? "";
-  return { model, customModelMode: false };
 }
 
 export function supportsRuntimeApiUrl(runtime: string): boolean {
@@ -211,15 +83,6 @@ export function runtimeApiUrlUnsupportedCopy(runtime: string): string | null {
     return "Cursor CLI does not expose a per-agent API URL flag or env var. Configure provider routing in Cursor itself.";
   }
   return null;
-}
-
-export function supportsRuntimeCustomModelName(runtime: string): boolean {
-  return runtime === "builtin" || runtime === "claude" || runtime === "codex" || runtime === "cursor" || runtime === "copilot" || runtime === "pi";
-}
-
-/** Antigravity owns model selection internally; its Web model field is ignored. */
-export function runtimeIgnoresModel(runtime: string): boolean {
-  return runtime === "antigravity";
 }
 
 export function supportsRuntimeFastMode(runtime: string): boolean {
@@ -238,16 +101,9 @@ export function runtimeConfigApiUrl(config: RuntimeConfig): string {
   return config.provider?.kind === "custom" ? config.provider.apiUrl : "";
 }
 
-export function runtimeConfigApiKey(config: RuntimeConfig): string {
-  return config.provider?.kind === "custom" ? config.provider.apiKey : "";
-}
-
-export function runtimeConfigProviderMode(config: RuntimeConfig): RuntimeProviderMode {
-  return config.provider?.kind === "custom" ? "custom" : "default";
-}
-
+/** Fast mode as it launches: a saved fast mode on a model that no longer runs fast launches at the standard speed. */
 export function runtimeConfigFastMode(config: RuntimeConfig): boolean {
-  return config.mode.kind === "fast";
+  return config.mode.kind === "fast" && runtimeModelSupportsFastMode(config.runtime, runtimeConfigModelValue(config));
 }
 
 export function runtimeConfigCommand(config: RuntimeConfig): string {
@@ -289,7 +145,10 @@ export function buildRuntimeConfig(input: {
     runtime === "pi"
     && piProviderMode !== PI_PROVIDER_CONFIGURED
     && PI_BUILTIN_PROVIDER_IDS.includes(piProviderMode);
-  const mode: RuntimeModeConfig = input.fastMode && supportsRuntimeFastMode(runtime)
+  const modelId = isBuiltInGateway || input.customModelMode
+    ? customModelName || getDefaultModel(runtime)
+    : input.model || getDefaultModel(runtime);
+  const mode: RuntimeModeConfig = input.fastMode && runtimeModelSupportsFastMode(runtime, modelId)
     ? { kind: "fast" }
     : { kind: "default" };
   const runtimeConfig = {
@@ -343,8 +202,8 @@ export function buildRuntimeConfig(input: {
         }
       : {}),
     model: isBuiltInGateway || input.customModelMode
-      ? { kind: "custom", name: customModelName || getDefaultModel(runtime) }
-      : { kind: "preset", id: input.model || getDefaultModel(runtime) },
+      ? { kind: "custom", name: modelId }
+      : { kind: "preset", id: modelId },
     mode,
     reasoningEffort: input.reasoningEffort ?? null,
     envVars: input.envVars ?? null,
@@ -354,44 +213,6 @@ export function buildRuntimeConfig(input: {
   };
   const parsed = parseRuntimeConfig({ runtimeConfig });
   if (!parsed.ok) throw new RuntimeConfigBuildError(parsed.error);
-  return parsed.config;
-}
-
-export function buildManagedConnectionRuntimeConfig(input: {
-  loadLocalPlugins?: boolean;
-  connectionId: string;
-  providerId: string;
-  model: string;
-  envVars: Record<string, string> | null;
-}): BuiltInRuntimeConfig {
-  const connectionId = input.connectionId.trim();
-  const model = input.model.trim();
-  if (!connectionId || !BUILTIN_RUNTIME_ALL_PROVIDER_IDS.includes(input.providerId as BuiltInRuntimeAnyProviderId)) {
-    throw new RuntimeConfigBuildError("selectValidProviderConnection", "Select a valid provider connection");
-  }
-  if (!model) throw new RuntimeConfigBuildError("modelRequired", "Model is required");
-  const gateway = isBuiltInGatewayProviderMode(input.providerId);
-  if (!gateway && !(builtInProviderModels(input.providerId) ?? []).some((candidate) => candidate.id === model)) {
-    throw new RuntimeConfigBuildError("selectValidProviderModel", "Select a valid provider model");
-  }
-  const runtimeConfig: BuiltInRuntimeConfig = {
-    version: RUNTIME_CONFIG_VERSION,
-    runtime: "builtin",
-    provider: { kind: "connection", connectionId },
-    model: gateway ? { kind: "custom", name: model } : { kind: "preset", id: model },
-    mode: { kind: "default" },
-    reasoningEffort: null,
-    envVars: input.envVars,
-    hostUserState: "forbidden",
-    ...(input.loadLocalPlugins !== undefined ? { loadLocalPlugins: input.loadLocalPlugins } : {}),
-  };
-  const parsed = parseRuntimeConfig({ runtimeConfig });
-  if (!parsed.ok || parsed.config.runtime !== "builtin") {
-    throw new RuntimeConfigBuildError(
-      "runtimeConfigInvalid",
-      parsed.ok ? "Runtime config is invalid" : parsed.error,
-    );
-  }
   return parsed.config;
 }
 
@@ -435,58 +256,3 @@ export function hydrateRuntimeConfigForm(input: RuntimeConfigHydrationInput): Ru
   return hydrateRuntimeConfig(input);
 }
 
-/**
- * Whether an agent-local built-in provider API key is genuinely missing.
- *
- * Selecting a saved Provider connection means the credential comes from the
- * connection reference, so an empty agent-local key is not a defect in that
- * state — this is the predicate behind that rule. It lives here, rather than
- * inline in the panel, so it can be tested for the right cause: asserting on
- * the rendered save button cannot distinguish "blocked by the key" from
- * "blocked because nothing changed yet", since both disable the same button.
- */
-export function isBuiltInProviderApiKeyInvalid(input: {
-  builtInProviderSupported: boolean;
-  managedConnectionActive: boolean;
-  apiKey: string;
-  retainsExistingKey: boolean;
-}): boolean {
-  return input.builtInProviderSupported
-    && !input.managedConnectionActive
-    && !input.apiKey.trim()
-    && !input.retainsExistingKey;
-}
-
-/**
- * The runtime-config save gate.
- *
- * Every reason the submit button can be disabled, in one place. Kept as a pure
- * function because the button collapses eleven independent causes into a single
- * boolean: a test that only reads `button.disabled` proves nothing about *which*
- * cause fired, so a regression in one term can hide behind another.
- */
-export function isRuntimeConfigSaveDisabled(input: {
-  saving: boolean;
-  changed: boolean;
-  runtimeCanSelect: boolean;
-  providerConnectionInvalid: boolean;
-  providerApiUrlInvalid: boolean;
-  providerApiKeyInvalid: boolean;
-  builtInProviderApiKeyInvalid: boolean;
-  piProviderApiKeyInvalid: boolean;
-  builtInProviderBaseUrlInvalid: boolean;
-  customModelInvalid: boolean;
-  modelSourceInvalid: boolean;
-}): boolean {
-  return input.saving
-    || !input.changed
-    || !input.runtimeCanSelect
-    || input.providerConnectionInvalid
-    || input.providerApiUrlInvalid
-    || input.providerApiKeyInvalid
-    || input.builtInProviderApiKeyInvalid
-    || input.piProviderApiKeyInvalid
-    || input.builtInProviderBaseUrlInvalid
-    || input.customModelInvalid
-    || input.modelSourceInvalid;
-}

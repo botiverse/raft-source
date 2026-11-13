@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { normalizeActivity } from "@botiverse/raft-shared";
 import type { AgentActivityDetailKind, AgentActivityKind, MachineToServerMessage } from "@botiverse/raft-shared";
+import { stalledWithWork, type StalledWithWorkClearReason, type StalledWithWorkFacts, type StalledWithWorkThresholds, type StalledWithWorkVerdict } from "./stalledWithWork";
 export {
   buildApmFreshnessDecisionProducerFactId,
   projectApmFreshnessDecisionTrace,
@@ -29,6 +30,7 @@ function projectTraceActivityFromFact(detailKind: AgentActivityDetailKind | unde
     case "computer_operation_failed":
       return "error";
     case "runtime_crashed":
+    case "claude_root_privileges":
     case "runtime_unavailable":
     case "stopped":
     case "runtime_interrupted":
@@ -119,6 +121,8 @@ export type ApmExpectedTerminationReason =
   | "startup_timeout"
   | "startup_request_error"
   | "cold_idle_recycle"
+  /** task #25 step 2: a person stopped the current turn of a runtime without a native interrupt. */
+  | "turn_interrupt"
   | null;
 
 export interface ApmGatedSteeringDecisionState {
@@ -194,16 +198,15 @@ export interface ApmGatedTurnEndReduction {
   effects: ApmGatedSteeringEffect[];
 }
 
-export type ApmStalledRecoveryBlockReason =
-  | "empty_inbox"
-  | "runtime_not_restartable"
-  | "runtime_progress_recent";
+export type ApmStalledRecoveryBlockReason = Exclude<StalledWithWorkClearReason, "recovery_underway">;
 
 export interface ApmStalledRecoveryTerminationReduction {
   nextState: ApmGatedSteeringDecisionState;
   shouldTerminate: boolean;
   alreadyRecovering: boolean;
   blockedReason: ApmStalledRecoveryBlockReason | null;
+  /** What stalledWithWork decided (its deadline, when only time is missing). */
+  verdict: StalledWithWorkVerdict;
 }
 
 export type ApmStartupTimeoutBlockReason = "runtime_progress_started";
@@ -609,40 +612,31 @@ export function reduceApmColdIdleRecycleTermination(
   };
 }
 
+/**
+ * Reconciler step 9: the legacy host's stalledWithWork (stalledWithWork.ts),
+ * with the facts its decision state holds (open tool uses, a stop already
+ * underway). Broken commits the stalled-recovery stop.
+ */
 export function reduceApmStalledRecoveryTermination(
   state: ApmGatedSteeringDecisionState,
-  input: {
-    inboxLength: number;
-    supportsStdinNotification: boolean;
-    busyDeliveryMode: "direct" | "notification" | "none";
-    hasSession: boolean;
-    hasDirectStdinRecoveryEvidence: boolean;
-    runtimeProgressIsStale: boolean;
-    staleForMs: number;
-    staleThresholdMs: number;
-  },
+  facts: Omit<StalledWithWorkFacts, "outstandingToolUses" | "recoveryUnderway">,
+  thresholds?: StalledWithWorkThresholds,
 ): ApmStalledRecoveryTerminationReduction {
-  if (input.inboxLength === 0) {
-    return { nextState: state, shouldTerminate: false, alreadyRecovering: false, blockedReason: "empty_inbox" };
+  const verdict = stalledWithWork({
+    ...facts,
+    outstandingToolUses: state.outstandingToolUses,
+    recoveryUnderway: state.expectedTerminationReason === "stalled_recovery" || state.expectedTerminationReason === "turn_interrupt",
+  }, thresholds);
+  if (!verdict.broken) {
+    const alreadyRecovering = verdict.reason === "recovery_underway";
+    return {
+      nextState: state,
+      shouldTerminate: false,
+      alreadyRecovering,
+      blockedReason: alreadyRecovering ? null : verdict.reason as ApmStalledRecoveryBlockReason,
+      verdict,
+    };
   }
-
-  if (state.expectedTerminationReason === "stalled_recovery") {
-    return { nextState: state, shouldTerminate: false, alreadyRecovering: true, blockedReason: null };
-  }
-
-  const directStdinRuntime = input.supportsStdinNotification && input.busyDeliveryMode === "direct";
-  const canRestartDirectStdinProcess = directStdinRuntime &&
-    input.hasSession &&
-    (state.outstandingToolUses === 0 || input.hasDirectStdinRecoveryEvidence);
-  const canRestartStalledProcess = !input.supportsStdinNotification || canRestartDirectStdinProcess;
-  if (!canRestartStalledProcess) {
-    return { nextState: state, shouldTerminate: false, alreadyRecovering: false, blockedReason: "runtime_not_restartable" };
-  }
-
-  if (input.staleForMs < input.staleThresholdMs && !input.runtimeProgressIsStale) {
-    return { nextState: state, shouldTerminate: false, alreadyRecovering: false, blockedReason: "runtime_progress_recent" };
-  }
-
   return {
     nextState: {
       ...state,
@@ -651,6 +645,7 @@ export function reduceApmStalledRecoveryTermination(
     shouldTerminate: true,
     alreadyRecovering: false,
     blockedReason: null,
+    verdict,
   };
 }
 
@@ -805,6 +800,8 @@ type RuntimeToolDiagnosticActivityInput = {
     | "unknown";
   toolAgeMs?: number;
   lastProgressAgeMs?: number;
+  processGroupLiveness?: "alive" | "exited" | "unknown";
+  runtimeToolCallId?: string;
 };
 
 function formatDiagnosticAge(ageMs: number | undefined): string {
@@ -812,6 +809,51 @@ function formatDiagnosticAge(ageMs: number | undefined): string {
   if (boundedMs < 60_000) return `${Math.max(1, Math.floor(boundedMs / 1_000))}s`;
   if (boundedMs < 3_600_000) return `${Math.floor(boundedMs / 60_000)}m`;
   return `${Math.floor(boundedMs / 3_600_000)}h`;
+}
+
+export type OpenToolRecoveryDecision =
+  | "no_live_work"
+  | "alive_silent_blocked"
+  | "group_alive_blocked"
+  | "recent_progress_blocked"
+  | "no_evidence";
+
+/**
+ * Whether a stalled runtime's open tool call may be cut off to deliver queued
+ * messages. Only one fact proves no live work can be lost: the tracked bash
+ * tool's child exited, its whole process group is gone, and the tool still
+ * never completed. Everything else keeps the old block:
+ * - a live child is never killed, however long it has been silent (an
+ *   hours-long DDL or backfill looks exactly like a hang);
+ * - a shell that exited can leave a backgrounded descendant working in its
+ *   process group, and abort kills the whole group (group_alive_blocked);
+ * - "no tracked tool" or "no child process" is not proof, because the tracker
+ *   only sees bash, and an in-process MCP or file tool may still be working.
+ *   Stopping a Pi session cannot force-kill such a tool either;
+ * - the snapshots must match the open calls one to one, by the runtime's call
+ *   id: one safe bash snapshot cannot vouch for an untracked call open beside
+ *   it, and equal counts alone do not prove which calls they describe.
+ */
+export function classifyOpenToolRecovery(
+  snapshots: readonly Pick<RuntimeToolDiagnosticActivityInput, "classification" | "processGroupLiveness" | "runtimeToolCallId">[],
+  openCalls: { outstandingToolUses: number; openToolCallIds: readonly string[] },
+): OpenToolRecoveryDecision {
+  if (snapshots.length === 0) return "no_evidence";
+  if (snapshots.some((s) => s.classification === "running_with_recent_progress")) return "recent_progress_blocked";
+  if (snapshots.some((s) => s.classification === "running_no_observed_progress")) return "alive_silent_blocked";
+  if (snapshots.some((s) => s.classification === "completion_loss" && s.processGroupLiveness === "alive")) {
+    return "group_alive_blocked";
+  }
+  const openIds = new Set(openCalls.openToolCallIds);
+  const snapshotIds = new Set(snapshots.map((s) => s.runtimeToolCallId));
+  const coversEveryOpenCall = openIds.size === openCalls.outstandingToolUses
+    && snapshots.length === openIds.size
+    && snapshotIds.size === openIds.size
+    && [...snapshotIds].every((id) => id !== undefined && openIds.has(id));
+  return coversEveryOpenCall
+    && snapshots.every((s) => s.classification === "completion_loss" && s.processGroupLiveness === "exited")
+    ? "no_live_work"
+    : "no_evidence";
 }
 
 export function projectRuntimeToolDiagnosticActivity(

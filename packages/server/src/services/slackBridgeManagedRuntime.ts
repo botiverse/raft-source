@@ -1,4 +1,6 @@
+import type { SlackTestIdentityObserver } from "./slackInboundIdentityObservation";
 import type { SlackBridgeRouteDependencies } from "../routes/slackBridge";
+import type { SlackVerifiedIngressPayloadCrypto } from "./slackVerifiedIngressContracts";
 import type {
   ExternalIngressPayloadSealer,
   ExternalIngressRuntimeResolver,
@@ -25,10 +27,13 @@ export interface SlackBridgeManagedRuntimeDependencies {
   credentialSealer: SlackBotCredentialSealer;
   secretResolver: ExternalIngressSecretResolver;
   payloadSealer: ExternalIngressPayloadSealer;
+  verifiedIngressCrypto?: SlackVerifiedIngressPayloadCrypto;
   provisioning?: SlackBridgeRouteDependencies["provisioning"];
   runtimeResolver?: ExternalIngressRuntimeResolver;
+  testIdentityObserver?: SlackTestIdentityObserver;
   admitSlackIngress?: SlackIngressAuthorityAdapter;
-  requestLifecycleReconcile?(): Promise<unknown> | void;
+  requestLifecycleReconcile?(bindingId?: string): Promise<unknown> | void;
+  readLifecycleMemberProfile?: SlackBridgeRouteDependencies["readLifecycleMemberProfile"];
   onLifecycleError?(error: unknown): void;
   fetch?: typeof fetch;
   oauthEndpoint?: string;
@@ -79,10 +84,13 @@ export function createSlackBridgeManagedRuntime(
     exchangeOAuth,
     secretResolver: dependencies.secretResolver,
     payloadSealer: dependencies.payloadSealer,
+    verifiedIngressCrypto: dependencies.verifiedIngressCrypto,
     provisioning: dependencies.provisioning,
     runtimeResolver: dependencies.runtimeResolver,
+    testIdentityObserver: dependencies.testIdentityObserver,
     admitSlackIngress: dependencies.admitSlackIngress,
     requestLifecycleReconcile: dependencies.requestLifecycleReconcile,
+    readLifecycleMemberProfile: dependencies.readLifecycleMemberProfile,
     onLifecycleError: dependencies.onLifecycleError,
     now: dependencies.now,
     stop: coordinator.stop,

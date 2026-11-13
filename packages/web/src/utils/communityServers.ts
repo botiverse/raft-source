@@ -8,8 +8,9 @@ export function hasJoinedCommunity(servers: Array<{ slug: string }>, slug: Commu
   return servers.some((server) => server.slug === slug);
 }
 
+/** Both Chinese display locales: the community server is for Chinese readers, whatever the script. */
 export function shouldShowChineseCommunityEntry(displayLocale: string) {
-  return displayLocale === "zh-cn";
+  return displayLocale === "zh-cn" || displayLocale === "zh-tw";
 }
 
 export function recommendedCommunitySlug(_servers: Array<{ slug: string }>) {

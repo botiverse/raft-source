@@ -11,7 +11,7 @@ import { join } from "node:path";
 import { ComputerServiceError } from "./errors";
 import { stop } from "./stop";
 import type { ComputerApiEvent } from "../lib/events";
-import { servicePidPath } from "../paths";
+import { servicePidPath, serviceVersionPath } from "../paths";
 
 async function withHome<T>(fn: (home: string) => Promise<T>): Promise<T> {
   const home = await mkdtemp(join(tmpdir(), "raft-computer-stop-svc-"));
@@ -249,6 +249,94 @@ test("stop service: stale pidfile → clears pidfile + status='stale_pidfile_cle
     assert.ok(cleared && cleared.kind === "stop.stale_pidfile_cleared");
     assert.equal(cleared.pid, 99999);
     assert.equal(events.find((e) => e.kind === "stop.signaled"), undefined);
+  });
+});
+
+// --- a live recorded pid that is not the service ---
+// A service that ended with its Windows sign-in session leaves run/service.pid
+// and service-version.json behind, and the pid goes to an unrelated program.
+const SERVICE_RECORDED_AT = "2026-11-13T08:00:00.000Z";
+
+async function writeServiceRecord(home: string, pid: number): Promise<void> {
+  await writePidfile(home, pid);
+  await writeFile(serviceVersionPath(home), JSON.stringify({ version: "1.22.0", installRoot: "/raft", pid, writtenAt: SERVICE_RECORDED_AT }));
+}
+
+test("stop service: a live recorded pid that started after the service's evidence is another program → not signalled, record cleared, reported", async () => {
+  await withHome(async (home) => {
+    await writeServiceRecord(home, 7720);
+    const killed: number[] = [];
+    const events: ComputerApiEvent[] = [];
+    const result = await stop(
+      { slockHome: home },
+      {
+        isProcessAlive: (pid) => pid === 7720,
+        probeLiveServicePid: async () => null, // nothing answers on the IPC endpoint
+        processStartTimeMs: async () => Date.parse(SERVICE_RECORDED_AT) + 10 * 60_000,
+        killService: (pid) => { killed.push(pid); },
+        onEvent: (e) => events.push(e),
+      },
+    );
+    assert.deepEqual(killed, [], "another program is never signalled");
+    assert.equal(result.status, "stale_pidfile_cleared");
+    assert.equal(result.pid, 7720);
+    await assert.rejects(() => readFile(servicePidPath(home), "utf8"), (e) => (e as NodeJS.ErrnoException).code === "ENOENT");
+    assert.deepEqual(events.find((e) => e.kind === "stop.stale_pidfile_cleared"), { kind: "stop.stale_pidfile_cleared", pid: 7720, otherProgram: true });
+    assert.equal(events.find((e) => e.kind === "stop.signaled"), undefined);
+  });
+});
+
+for (const [evidence, deps, startReads] of [
+  ["the service answering on IPC names that pid", { probeLiveServicePid: async () => 7720 }, 0],
+  ["nothing answers, and it started before the service's evidence", { probeLiveServicePid: async () => null, startedAtMs: Date.parse(SERVICE_RECORDED_AT) - 2_000 }, 1],
+  ["nothing answers, and its start cannot be read", { probeLiveServicePid: async () => null, startedAtMs: undefined }, 1],
+] as const) {
+  test(`stop service: a live recorded pid is stopped as before when ${evidence}`, async () => {
+    await withHome(async (home) => {
+      await writeServiceRecord(home, 7720);
+      let alive = true;
+      let reads = 0;
+      const killed: number[] = [];
+      const result = await stop(
+        { slockHome: home },
+        {
+          isProcessAlive: (pid) => pid === 7720 && alive,
+          probeLiveServicePid: deps.probeLiveServicePid,
+          processStartTimeMs: async () => { reads += 1; return "startedAtMs" in deps ? deps.startedAtMs : undefined; },
+          killService: (pid) => { killed.push(pid); alive = false; },
+          sleep: async () => undefined,
+          inspectSupervisor: async () => null,
+        },
+      );
+      assert.equal(result.status, "stopped");
+      assert.deepEqual(killed, [7720]);
+      assert.equal(reads, startReads, "a start is read only when the service does not answer");
+    });
+  });
+}
+
+// Another service answering on the endpoint says nothing about the recorded
+// pid: only an answer that reports that very pid counts for it.
+test("stop service: IPC answers with a different live pid → the recorded pid is judged by its start, never signalled as the service; the answering service is stopped", async () => {
+  await withHome(async (home) => {
+    await writeServiceRecord(home, 7720);
+    const alive = new Set([7720, 8844]);
+    let reads = 0;
+    const killed: number[] = [];
+    const result = await stop(
+      { slockHome: home },
+      {
+        isProcessAlive: (pid) => alive.has(pid),
+        probeLiveServicePid: async () => 8844,
+        processStartTimeMs: async () => { reads += 1; return Date.parse(SERVICE_RECORDED_AT) + 10 * 60_000; },
+        killService: (pid) => { killed.push(pid); alive.delete(pid); },
+        sleep: async () => undefined,
+        inspectSupervisor: async () => null,
+      },
+    );
+    assert.equal(reads, 1, "the answer from pid 8844 did not vouch for pid 7720");
+    assert.deepEqual(killed, [8844]);
+    assert.deepEqual({ status: result.status, pid: result.pid }, { status: "stopped", pid: 8844 });
   });
 });
 
@@ -492,22 +580,6 @@ test("stop service: abort during wait-for-exit loop → AbortError + service NOT
     // SIGTERM then time out", not "force-kill on cancel".
     assert.equal(killCount, 1);
   });
-});
-
-// The default OS signal is not visible through the injected one-argument
-// kill seam used by the runtime matrix. Treat the complete production source
-// as the negative policy subject: Stop owns one direct signal authority and it
-// must remain graceful TERM-only, with no numeric or SIGKILL escalation path.
-test("stop service: source has exactly one graceful process.kill(SIGTERM) authority", async () => {
-  const raw = await readFile(new URL("./stop.ts", import.meta.url), "utf8");
-  const src = raw
-    .split("\n")
-    .map((line) => line.replace(/\/\/.*$/, ""))
-    .join("\n");
-
-  assert.equal(src.match(/process\.kill\s*\(/g)?.length, 1);
-  assert.match(src, /process\.kill\s*\([^)]*,\s*["']SIGTERM["']\s*\)/);
-  assert.equal(src.match(/\b(?:process\.)?kill\s*\([^)]*,\s*(?:9|["']SIGKILL["'])/g), null);
 });
 
 

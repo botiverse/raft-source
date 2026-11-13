@@ -7,7 +7,6 @@ import type { ServerMember } from "../src/store/serverStore";
 const currentUser: User = {
   id: "user-1",
   email: "me@slock.test",
-  gravatarHash: "selfhash",
   name: "me",
   displayName: "Me",
   description: "Current user",
@@ -31,7 +30,6 @@ function member(overrides: Partial<ServerMember> = {}): ServerMember {
   return {
     userId: "user-1",
     email: "me@slock.test",
-    gravatarHash: "hash",
     name: "me",
     displayName: "Me",
     description: null,
@@ -59,7 +57,6 @@ test("current user's message avatar still renders when member cache is missing",
   assert.equal(resolved?.avatarUrl, "/api/avatars/users/self.webp");
   assert.equal(resolved?.userId, "user-1");
   assert.equal(resolved?.email, null);
-  assert.equal(resolved?.gravatarHash, "selfhash");
   assert.equal(resolved?.role, "admin");
 });
 
@@ -83,10 +80,9 @@ test("member-list resolver keeps the current-user avatar fallback for preview su
 
   assert.equal(resolved?.avatarUrl, "/api/avatars/users/self.webp");
   assert.equal(resolved?.email, "me@slock.test");
-  assert.equal(resolved?.gravatarHash, "hash");
 });
 
-test("current-user fallback member keeps auth gravatar hash when there is no uploaded avatar", () => {
+test("current-user fallback member has no avatar and no email when there is no uploaded avatar", () => {
   const resolved = resolveMessageSenderMember(
     userMessage("user-1"),
     new Map(),
@@ -94,6 +90,5 @@ test("current-user fallback member keeps auth gravatar hash when there is no upl
   );
 
   assert.equal(resolved?.avatarUrl, null);
-  assert.equal(resolved?.gravatarHash, "selfhash");
   assert.equal(resolved?.email, null);
 });

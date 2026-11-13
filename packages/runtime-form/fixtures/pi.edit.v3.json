@@ -1,0 +1,300 @@
+{
+  "protocolVersion": 3,
+  "runtimeId": "pi",
+  "schemaVersion": "pi.create.v1",
+  "dataSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "provider",
+      "model",
+      "providerModel"
+    ],
+    "properties": {
+      "provider": {
+        "type": "string",
+        "title": "Provider",
+        "minLength": 1,
+        "x-optionSource": "provider"
+      },
+      "apiKey": {
+        "type": "string",
+        "title": "API Key",
+        "writeOnly": true
+      },
+      "model": {
+        "type": "string",
+        "title": "Model",
+        "minLength": 1,
+        "x-optionSource": "model"
+      },
+      "reasoningEffort": {
+        "type": "string",
+        "title": "Reasoning",
+        "x-optionSource": "reasoningEffort"
+      },
+      "providerModel": {
+        "type": "string",
+        "title": "Model",
+        "minLength": 1,
+        "x-optionSource": "providerModel"
+      },
+      "providerReasoningEffort": {
+        "type": "string",
+        "title": "Reasoning",
+        "x-optionSource": "providerReasoningEffort"
+      },
+      "envVars": {
+        "type": "object",
+        "title": "Environment Variables",
+        "additionalProperties": {
+          "type": "string"
+        }
+      }
+    }
+  },
+  "uiSchema": {
+    "order": [
+      "provider",
+      "apiKey",
+      "model",
+      "reasoningEffort",
+      "providerModel",
+      "providerReasoningEffort",
+      "envVars"
+    ],
+    "layout": {
+      "advanced": [
+        "/envVars"
+      ]
+    },
+    "localization": {
+      "provider": {
+        "label": "Provider",
+        "hint": "Configured uses your machine's Pi auth.json. Other options inject the matching API key as an env var so the Pi SDK picks it up — no auth.json edit on your machine."
+      },
+      "apiKey": {
+        "label": "API Key",
+        "placeholder": "sk-..."
+      },
+      "model": {
+        "label": "Model",
+        "hint": "Models available from this computer's Pi configuration. You can also type a model ID."
+      },
+      "reasoningEffort": {
+        "label": "Reasoning",
+        "hint": "Available values depend on the selected model.",
+        "choices": {
+          "off": {
+            "label": "No reasoning",
+            "description": "Answers directly, without a thinking phase"
+          },
+          "minimal": {
+            "label": "Minimal",
+            "description": "Very light reasoning for the fastest responses"
+          },
+          "low": {
+            "label": "Low",
+            "description": "Fast responses with lighter reasoning"
+          },
+          "medium": {
+            "label": "Medium",
+            "description": "Balances speed and reasoning depth for everyday tasks"
+          },
+          "high": {
+            "label": "High",
+            "description": "Greater reasoning depth for complex problems"
+          },
+          "xhigh": {
+            "label": "Extra high",
+            "description": "Extra high reasoning depth for complex problems"
+          },
+          "max": {
+            "label": "Max",
+            "description": "Maximum reasoning depth for the hardest problems"
+          },
+          "ultra": {
+            "label": "Ultra",
+            "description": "Maximum reasoning with automatic task delegation"
+          }
+        }
+      },
+      "providerModel": {
+        "label": "Model",
+        "hint": "Models the selected provider offers."
+      },
+      "providerReasoningEffort": {
+        "label": "Reasoning",
+        "hint": "Available values depend on the selected model.",
+        "choices": {
+          "off": {
+            "label": "No reasoning",
+            "description": "Answers directly, without a thinking phase"
+          },
+          "minimal": {
+            "label": "Minimal",
+            "description": "Very light reasoning for the fastest responses"
+          },
+          "low": {
+            "label": "Low",
+            "description": "Fast responses with lighter reasoning"
+          },
+          "medium": {
+            "label": "Medium",
+            "description": "Balances speed and reasoning depth for everyday tasks"
+          },
+          "high": {
+            "label": "High",
+            "description": "Greater reasoning depth for complex problems"
+          },
+          "xhigh": {
+            "label": "Extra high",
+            "description": "Extra high reasoning depth for complex problems"
+          },
+          "max": {
+            "label": "Max",
+            "description": "Maximum reasoning depth for the hardest problems"
+          },
+          "ultra": {
+            "label": "Ultra",
+            "description": "Maximum reasoning with automatic task delegation"
+          }
+        }
+      },
+      "envVars": {
+        "label": "Environment Variables",
+        "hint": "These will be injected into the runtime command environment."
+      }
+    },
+    "rules": [
+      {
+        "scope": "#/properties/apiKey",
+        "effect": "SHOW",
+        "condition": {
+          "scope": "#/properties/provider",
+          "schema": {
+            "enum": [
+              "deepseek"
+            ]
+          }
+        }
+      },
+      {
+        "scope": "#/properties/model",
+        "effect": "SHOW",
+        "condition": {
+          "scope": "#/properties/provider",
+          "schema": {
+            "enum": [
+              "configured"
+            ]
+          }
+        }
+      },
+      {
+        "scope": "#/properties/reasoningEffort",
+        "effect": "SHOW",
+        "condition": {
+          "scope": "#/properties/provider",
+          "schema": {
+            "enum": [
+              "configured"
+            ]
+          }
+        }
+      },
+      {
+        "scope": "#/properties/providerModel",
+        "effect": "SHOW",
+        "condition": {
+          "scope": "#/properties/provider",
+          "schema": {
+            "enum": [
+              "deepseek"
+            ]
+          }
+        }
+      },
+      {
+        "scope": "#/properties/providerReasoningEffort",
+        "effect": "SHOW",
+        "condition": {
+          "scope": "#/properties/provider",
+          "schema": {
+            "enum": [
+              "deepseek"
+            ]
+          }
+        }
+      }
+    ]
+  },
+  "capabilities": {
+    "providerKinds": [],
+    "writeOnlyPointers": [
+      "/apiKey"
+    ],
+    "forbiddenPointers": [
+      "/hostUserState"
+    ]
+  },
+  "optionSources": {
+    "provider": {
+      "protocolVersion": 1,
+      "runtimeId": "pi",
+      "schemaVersion": "pi.create.v1",
+      "sourceId": "provider",
+      "kind": "select",
+      "pointer": "/provider"
+    },
+    "model": {
+      "protocolVersion": 1,
+      "runtimeId": "pi",
+      "schemaVersion": "pi.create.v1",
+      "sourceId": "model",
+      "kind": "select",
+      "pointer": "/model"
+    },
+    "providerModel": {
+      "protocolVersion": 1,
+      "runtimeId": "pi",
+      "schemaVersion": "pi.create.v1",
+      "sourceId": "providerModel",
+      "kind": "dependent_select",
+      "pointer": "/providerModel",
+      "dependsOn": "/provider"
+    },
+    "reasoningEffort": {
+      "protocolVersion": 1,
+      "runtimeId": "pi",
+      "schemaVersion": "pi.create.v1",
+      "sourceId": "reasoningEffort",
+      "kind": "dependent_select",
+      "pointer": "/reasoningEffort",
+      "dependsOn": "/model"
+    },
+    "providerReasoningEffort": {
+      "protocolVersion": 1,
+      "runtimeId": "pi",
+      "schemaVersion": "pi.create.v1",
+      "sourceId": "providerReasoningEffort",
+      "kind": "dependent_select",
+      "pointer": "/providerReasoningEffort",
+      "dependsOn": "/providerModel"
+    }
+  },
+  "writeOnlyKeepRequiresUnchanged": {
+    "/apiKey": [
+      "/provider"
+    ]
+  },
+  "values": {
+    "provider": "deepseek",
+    "providerModel": "deepseek/deepseek-v4-pro",
+    "providerReasoningEffort": "high",
+    "envVars": {
+      "EXAMPLE_FLAG": "1"
+    }
+  },
+  "revision": "95b088adbe3031a0726c7fe6"
+}

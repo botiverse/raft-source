@@ -1,10 +1,10 @@
 import { createIntl, createIntlCache } from "react-intl";
 import type { IntlShape } from "react-intl";
 import type { Presence } from "@botiverse/raft-ui";
-import { en } from "../i18n/messages/en";
+import { enFallbackMessages } from "../i18n/messages/enFallback";
 
 const enComputerIntl = createIntl(
-  { locale: "en", defaultLocale: "en", messages: en },
+  { locale: "en", defaultLocale: "en", messages: enFallbackMessages },
   createIntlCache(),
 );
 
@@ -25,6 +25,17 @@ export interface ComputerAttentionMachine {
   isComputer?: boolean;
   daemonVersion?: string | null;
   computerUpgradeAvailable?: boolean | null;
+  /** The server's "needs attention" summary (#68); absent from older servers. */
+  attention?: { count: number } | null;
+}
+
+/**
+ * #68: the server's "needs attention" verdict, when it sent one: true when a
+ * person must act on this Computer. Undefined from an older server (the
+ * callers keep their own rule).
+ */
+export function serverNeedsAttention(machine: { attention?: { count: number } | null }): boolean | undefined {
+  return machine.attention ? machine.attention.count > 0 : undefined;
 }
 
 export interface ComputerAttentionSummary<T extends ComputerAttentionMachine = ComputerAttentionMachine> {
@@ -71,15 +82,16 @@ export function countMachinesNeedingAttention(
   for (const machine of machines) {
     // Only managed Computers have an upgrade signal; the standalone daemon has
     // no release line of its own any more.
-    if (shouldShowComputerUpgradeIndicator(machine) || machine.status === "offline") count += 1;
+    if (serverNeedsAttention(machine) ?? (shouldShowComputerUpgradeIndicator(machine) || machine.status === "offline")) count += 1;
   }
   return count;
 }
 
-// Raft DS colours: an available upgrade is something waiting for you (the pink
-// attention pixel); presence lights are fixed (online lime, offline stone).
+// Raft DS colours: an update (available or required) needs handling, so it is
+// orange, the error light; pink is only for unread / new. Presence lights are
+// fixed (online lime, offline stone).
 export function getComputerAttentionDotTone(status: ComputerAttentionStatus): string | undefined {
-  if (status === "upgrade") return "bg-attention";
+  if (status === "upgrade") return "bg-presence-error";
   if (status === "offline") return "bg-presence-offline";
   return undefined;
 }
@@ -97,23 +109,28 @@ export function getComputerRowDotStatus(
   // the web's version comparison, independent of whether web upgrade is on).
   // Omitted: fall back to the server's broadcast projection.
   availableVersion?: string | null,
+  // Below the version floor (useComputerVersionTier is not "none"): the row's
+  // "Update required" fact. Orange too, even with no newer version to
+  // name (a Computer that does not report its version).
+  belowVersionFloor = false,
 ): ComputerRowDotStatus {
   const upgrade = availableVersion === undefined
     ? shouldShowComputerUpgradeIndicator(machine)
     : machine.isComputer === true && availableVersion !== null;
-  if (upgrade) return "upgrade";
+  if (upgrade || (machine.isComputer === true && belowVersionFloor)) return "upgrade";
   return machine.status === "online" ? "online" : "offline";
 }
 
 /**
  * The row dot's light, as StatusDot props: liveness is a fixed presence light
- * (raft-ui `Status presence`: online lime, offline stone); an upgrade waiting
- * for you is the pink attention pixel, which is not a presence.
+ * (raft-ui `Status presence`: online lime, offline stone); an update waiting
+ * for you (available or required) needs handling: the orange error light.
+ * Pink is only for unread / new.
  */
 export function getComputerRowDotLight(
   status: ComputerRowDotStatus,
 ): { presence: Presence; tone?: undefined } | { presence?: undefined; tone: string } {
-  if (status === "upgrade") return { tone: "bg-attention" };
+  if (status === "upgrade") return { presence: "error" };
   return { presence: status };
 }
 

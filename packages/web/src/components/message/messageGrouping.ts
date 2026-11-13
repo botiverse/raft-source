@@ -19,7 +19,9 @@
  * Look up each message's state by id while rendering.
  *
  * Grouping rules — a message CONTINUES the previous sender's group iff all hold:
- *   1. same sender (same senderType AND senderId),
+ *   1. same sender (same senderType AND senderId) and the same assistant
+ *      sending for them, if any (RFC 077: a message an assistant sent for its
+ *      owner starts its own group; DS Identity and presence),
  *   2. neither this message nor the previous is a `system` message
  *      (system messages have their own grouping in `systemMessageGrouping.ts`
  *      and never act as a chat continuation), and
@@ -27,6 +29,8 @@
  *      date divider sits between groups, never inside one).
  */
 import { useMemo, useRef } from "react";
+import { delegatedGroupKey } from "./delegatedMessage";
+import { cachedDateTimeFormat } from "../../utils/timeFormatting";
 
 export interface MessageGroupState {
   /** First row of a sender group — renders the avatar + name; a day boundary always starts a new group. */
@@ -70,8 +74,9 @@ export function shouldShowGroupedMessageHeader(
  * new group ("group") — or nothing at the list end (undefined). Rendered rows
  * cannot see their neighbours through the app's per-message wrappers, so this
  * is computed from the list data and written onto the row root as
- * `data-followed-by`; the recipe reads it to collapse the row's bottom padding
- * (see message-item.recipe.ts).
+ * `data-followed-by`; MessageItem's own `group-data-[followed-by]/message:`
+ * classes read it to drop the body's and footer's trailing margin
+ * (FOLLOWED_BODY_ENDING).
  */
 export function followedByFor(
   messages: readonly { id: string; messageType?: "chat" | "system" }[],
@@ -88,23 +93,12 @@ export function followedByFor(
   return nextState?.showAvatar === false ? "compact" : "group";
 }
 
-/**
- * True when the message at `index` directly follows a system note (2026-10-11):
- * the note keeps a net 12/12 rhythm, and the following message cancels the
- * rest of the group-break accounting via `data-follows-system`.
- */
-export function followsSystemFor(
-  messages: readonly { messageType?: "chat" | "system" }[],
-  index: number,
-): boolean {
-  return messages[index - 1]?.messageType === "system";
-}
-
 /** Minimal shape the grouping computation needs from a message. */
 export interface GroupableMessage {
   id: string;
   senderType: "user" | "agent" | "external_projection";
   senderId: string;
+  externalAuthor?: { displayName: string; avatarUrl: string | null; avatarDigest: string | null } | null;
   messageType?: "chat" | "system";
   createdAt: string;
 }
@@ -119,16 +113,26 @@ export interface GroupableMessage {
 export function localDayKey(createdAt: string, timeZone?: string): string {
   const d = new Date(createdAt);
   if (Number.isNaN(d.getTime())) return "";
-  return d.toLocaleDateString("en-CA", {
+  return cachedDateTimeFormat("en-CA", {
     year: "numeric",
     month: "2-digit",
     day: "2-digit",
     timeZone,
-  });
+  }).format(d);
 }
 
 function isSameSender(a: GroupableMessage, b: GroupableMessage): boolean {
-  return a.senderType === b.senderType && a.senderId === b.senderId;
+  if (a.senderType !== b.senderType || a.senderId !== b.senderId
+    || delegatedGroupKey(a) !== delegatedGroupKey(b)) return false;
+  if (a.senderType !== "external_projection") return true;
+  // External message authors are immutable per-message presentation facts.
+  // A bot can override its name or avatar without changing its stable identity.
+  const left = a.externalAuthor;
+  const right = b.externalAuthor;
+  if (!left || !right) return left === right;
+  return left.displayName === right.displayName
+    && left.avatarUrl === right.avatarUrl
+    && left.avatarDigest === right.avatarDigest;
 }
 
 function isSystem(m: GroupableMessage): boolean {

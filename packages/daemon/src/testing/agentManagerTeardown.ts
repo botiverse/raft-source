@@ -116,7 +116,7 @@ interface ProcessTimerInternals {
   activityHeartbeat: { kind: string; timer?: ReturnType<typeof setInterval> };
   pendingTrajectory: { timer?: Timer | null } | null;
   compaction: { kind: string; watchdog?: Timer | null };
-  exit: { kind: string; stalledRecoverySigtermTimer?: Timer | null };
+  exit: { kind: string };
   runtimeErrorDeliveryBackoff: { kind: string; timer?: Timer | null };
   sessionReadyDeliveryRetry: { kind: string; scheduler?: { clearTimer(): void } };
 }
@@ -150,7 +150,6 @@ export async function releaseAgentManagerForTests(
     if (ap.activityHeartbeat.kind === "active") clearInterval(ap.activityHeartbeat.timer);
     if (ap.pendingTrajectory?.timer) clearTimeout(ap.pendingTrajectory.timer);
     if (ap.compaction.kind === "active" && ap.compaction.watchdog) clearTimeout(ap.compaction.watchdog);
-    if (ap.exit.kind === "live" && ap.exit.stalledRecoverySigtermTimer) clearTimeout(ap.exit.stalledRecoverySigtermTimer);
     if (ap.runtimeErrorDeliveryBackoff.kind === "backing_off" && ap.runtimeErrorDeliveryBackoff.timer) {
       clearTimeout(ap.runtimeErrorDeliveryBackoff.timer);
     }

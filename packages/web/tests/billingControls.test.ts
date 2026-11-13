@@ -1,6 +1,13 @@
 import assert from "node:assert/strict";
 import { getBillingControlsState } from "../src/utils/billingControls";
 
+test("a pending AppSumo reservation suppresses Stripe purchase without granting Pro", () => {
+  const pending = getBillingControlsState({ plan: "free", source: "server", appsumoBillingReserved: true });
+  assert.equal(pending.canCheckout, false);
+  assert.equal(pending.hasEntitlingSubscription, false);
+  assert.equal(getBillingControlsState({ plan: "free", source: "server", appsumoBillingReserved: false }).canCheckout, true);
+});
+
 test("billing controls allow checkout for non-entitling subscription rows", () => {
   for (const subscriptionStatus of ["canceled", "incomplete", null] as const) {
     const state = getBillingControlsState({ plan: "free", subscriptionStatus });

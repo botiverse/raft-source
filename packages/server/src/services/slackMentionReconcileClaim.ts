@@ -151,3 +151,17 @@ export function redisSlackMentionReconcileClaimStore(redis: {
     owner: (key) => redis.get(key),
   };
 }
+
+
+/** Explicit owner-checked release for a completed workspace write sequence.
+ * Lifecycle callers can keep the default TTL spacing by using end() alone. */
+export async function releaseSlackMentionReconcileClaim(redis: {
+  eval(script: string, numKeys: number, ...args: Array<string | number>): Promise<unknown>;
+}, key: string, token: string): Promise<boolean> {
+  return Number(await redis.eval(`
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+  return redis.call("DEL", KEYS[1])
+end
+return 0
+`, 1, key, token)) === 1;
+}

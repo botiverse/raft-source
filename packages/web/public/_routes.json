@@ -4,7 +4,9 @@
     "/.well-known/*",
     "/assets/*",
     "/feedback/assets/*",
-    "/desktop-manifest.json"
+    "/desktop-manifest.json",
+    "/artifacts/*",
+    "/sitemap.xml"
   ],
   "exclude": []
 }

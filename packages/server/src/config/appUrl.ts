@@ -40,12 +40,22 @@ function unique(values: Iterable<string>): string[] {
   return [...new Set(values)];
 }
 
+/**
+ * Raft Desktop's page origin: the desktop bundles this web app and serves it
+ * from its own `app://raft` scheme, so its API calls carry `Origin: app://raft`.
+ * Allowed in every deployment, exactly this one origin (no other app:// host,
+ * no pattern). Only a browser that serves a page under that scheme (the
+ * desktop app) sends it; it grants nothing to any web page.
+ */
+export const RAFT_DESKTOP_APP_ORIGIN = "app://raft";
+
 export function getWebCorsOrigins(raw = process.env.CORS_ORIGIN): string[] {
   const origins = parseOriginList(raw);
   if (origins.includes("*")) return ["*"];
   const appUrl = getConfiguredAppUrl();
   if (appUrl) origins.push(appUrl);
   if (origins.length === 0) origins.push(DEFAULT_APP_URL);
+  origins.push(RAFT_DESKTOP_APP_ORIGIN);
   return unique(origins);
 }
 
@@ -64,6 +74,34 @@ export function getWebFrameAncestorOrigins(raw = process.env.CORS_ORIGIN): strin
       .map((origin) => normalizeAppUrl(origin))
       .filter((origin): origin is string => origin !== null),
   );
+}
+
+/** `https://host[:port]`, lowercase DNS labels: no wildcard, path, credentials, query or fragment. */
+const HTTPS_ORIGIN = /^https:\/\/[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*(:\d{1,5})?$/;
+
+/**
+ * FRAMED_BY_ORIGINS: the origins of a page that frames the Raft app itself
+ * (Deck: https://deck.raft.build for Raft's own). `frame-ancestors` is checked against every ancestor, so a
+ * preview the app frames (attachments.ts) is blank inside Deck unless Deck is
+ * named there too. They are added to the previews' `frame-ancestors` and used
+ * nowhere else: never a CORS origin (getWebCorsOrigins), a redirect target
+ * (getWebFrameAncestorOrigins, billing's validateRedirectUrl) or anything
+ * that takes a message. A comma or space list of exact https origins, in
+ * order, without repeats; unset or empty: none (today's behaviour). Throws on
+ * a bad entry: the server checks it at startup (server.ts) and refuses to
+ * start, so a mistyped list never frames for fewer or other origins.
+ */
+export function getFramedByOrigins(raw = process.env.FRAMED_BY_ORIGINS): string[] {
+  const origins: string[] = [];
+  for (const entry of (raw ?? "").split(/[\s,]+/)) {
+    if (entry === "") continue;
+    const url = URL.canParse(entry) ? new URL(entry) : null;
+    if (url === null || !HTTPS_ORIGIN.test(entry) || url.origin !== entry) {
+      throw new Error(`FRAMED_BY_ORIGINS: ${JSON.stringify(entry)} is not an https origin (https://host[:port])`);
+    }
+    if (!origins.includes(entry)) origins.push(entry);
+  }
+  return origins;
 }
 
 function hostnameFromHostOrOrigin(raw: string): string | null {

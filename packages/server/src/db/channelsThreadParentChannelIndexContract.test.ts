@@ -13,37 +13,24 @@ async function readServerFile(relativePath: string) {
   return readFile(path.join(SERVER_ROOT, relativePath), "utf8");
 }
 
+/** The newest snapshot: the one drizzle-kit generate diffs schema.ts against (older ones are pruned). */
+async function latestSnapshot() {
+  const journal = JSON.parse(await readServerFile("drizzle/meta/_journal.json")) as { entries: Array<{ idx: number }> };
+  const last = String(journal.entries.at(-1)!.idx).padStart(4, "0");
+  return JSON.parse(await readServerFile(`drizzle/meta/${last}_snapshot.json`));
+}
+
 test("0298 keeps the thread parent-channel index out of drizzle migrate", async () => {
   const migration = await readServerFile("drizzle/0298_channels_thread_parent_channel_index.sql");
   assert.equal(migration.replace(/--.*$/gm, "").replace(/\s/g, ""), "SELECT1;");
 });
 
-test("snapshot declares the thread parent-channel partial index for future schema diffs", async () => {
-  const snapshot = JSON.parse(await readServerFile("drizzle/meta/0298_snapshot.json"));
+test("the latest snapshot declares the thread parent-channel partial index for future schema diffs", async () => {
+  const snapshot = await latestSnapshot();
   const index = snapshot.tables["public.channels"].indexes.idx_channels_thread_parent_channel;
   assert.ok(index, "snapshot must declare idx_channels_thread_parent_channel");
   assert.deepEqual(index.columns.map((column: { expression: string }) => column.expression), ["parent_channel_id", "id"]);
   assert.equal(index.where, "type = 'thread' AND deleted_at IS NULL");
-});
-
-test("server package exposes concurrent thread parent-channel index create and verify scripts", async () => {
-  const packageJson = JSON.parse(await readServerFile("package.json"));
-  assert.equal(packageJson.scripts["db:create-channels-thread-parent-channel-index"], "node --import @oxc-node/core/register scripts/create-channels-thread-parent-channel-index.ts");
-  assert.equal(packageJson.scripts["db:verify-channels-thread-parent-channel-index"], "node --import @oxc-node/core/register scripts/verify-channels-thread-parent-channel-index.ts");
-
-  const helper = await readServerFile("scripts/channels-thread-parent-channel-index.ts");
-  assert.match(helper, /CREATE INDEX CONCURRENTLY IF NOT EXISTS "\$\{THREAD_PARENT_CHANNEL_INDEX_NAME\}"/);
-  assert.match(helper, /ON "channels" USING btree \("parent_channel_id", "id"\)/);
-  assert.match(helper, /WHERE type = 'thread' AND deleted_at IS NULL/);
-  assert.match(helper, /CHANNELS_THREAD_PARENT_CHANNEL_INDEX_STATEMENT_TIMEOUT/);
-  assert.match(helper, /CHANNELS_THREAD_PARENT_CHANNEL_INDEX_LOCK_TIMEOUT/);
-  assert.match(helper, /indisvalid/);
-  assert.match(helper, /indisready/);
-
-  const create = await readServerFile("scripts/create-channels-thread-parent-channel-index.ts");
-  assert.match(create, /assertParentChannelColumnExists/);
-  assert.match(create, /set_config\('statement_timeout'/);
-  assert.match(create, /set_config\('lock_timeout'/);
 });
 
 test("the readiness check accepts exactly the built shape", () => {

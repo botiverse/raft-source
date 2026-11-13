@@ -1,0 +1,1 @@
+ALTER TABLE "push_registrations" ADD COLUMN "revoked_user_id" uuid;

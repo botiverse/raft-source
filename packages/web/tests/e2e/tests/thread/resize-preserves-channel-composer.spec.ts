@@ -91,11 +91,13 @@ test("thread presentation follows the phone, iPad orientation, and desktop width
   await page.getByRole("tab", { name: "Tasks", exact: true }).click();
   const toolbar = page.locator('[data-slot="tasks-panel-toolbar"]');
   await expect(toolbar.getByTestId("channel-task-view-board")).toBeVisible();
-  // Toolbar controls share one height (32: Raft DS sizes buttons by use, and
-  // a toolbar's are 32). Their edges differ by kind on purpose: an inactive
-  // filter draws a 1px seam ring, a button the 1.5px ink line that says
-  // "control", and a segmented item sits in its track.
-  const controls = await toolbar.locator("button").evaluateAll((buttons) => buttons.map((button) => ({
+  // Visible toolbar controls share one height (Raft DS sizes buttons by use;
+  // a toolbar's are the control height). Only visible ones: FitToolbar keeps
+  // its ⋯ More trigger in the DOM, display:none until something overflows.
+  // Their edges differ by kind on purpose: an inactive filter draws a 1px
+  // seam ring, a button the 1.5px ink line that says "control", and a
+  // segmented item sits in its track.
+  const controls = await toolbar.locator("button:visible").evaluateAll((buttons) => buttons.map((button) => ({
     slot: button.getAttribute("data-slot"),
     height: button.getBoundingClientRect().height,
     borderWidth: parseFloat(getComputedStyle(button).borderTopWidth),
@@ -111,11 +113,17 @@ test("thread presentation follows the phone, iPad orientation, and desktop width
   for (const button of buttons) expect(button.borderWidth).toBeGreaterThan(0);
   await page.getByRole("tab", { name: "Chat", exact: true }).click();
 
+  // 1100px: the row (1100 - 49 rail - 320 sidebar = 731; the rail is 49 with a
+  // mouse since #12730) is short of the remembered 900px thread and the
+  // channel's 400 by 569: both give up what they have above their content's 360
+  // in proportion (#189 rule 4: 40 and 540 above it, so about 360.8 and 370.2),
+  // so the channel keeps its 360 (361 rounded), the thread keeps its 360 beside
+  // it and nothing clips.
   await page.setViewportSize({ width: 1100, height: 820 });
 
   await expect
     .poll(async () => channelComposer.evaluate((input) => input.closest("form")?.clientWidth ?? 0))
-    .toBeGreaterThanOrEqual(318);
+    .toBeGreaterThanOrEqual(358);
 
   const layout = await channelComposer.evaluate((input) => {
     const channelForm = input.closest("form");
@@ -125,20 +133,30 @@ test("thread presentation follows the phone, iPad orientation, and desktop width
     return {
       channelWidth: Math.round(channelForm.getBoundingClientRect().width),
       channelOverflow: channelForm.scrollWidth - channelForm.clientWidth,
-      threadMaxWidth: getComputedStyle(threadPanel).maxWidth,
+      // In the planned row the thread's width is the plan's (rowLayout
+      // `--row-width`, index.css `[data-row-width]`, max-width none), not a CSS
+      // cap: what the row guarantees is the widths themselves.
+      threadWidth: threadPanel.getBoundingClientRect().width,
+      rowRoom: (threadPanel.parentElement?.getBoundingClientRect().width ?? 0) - (channelForm.closest<HTMLElement>(".thread-main-column")?.getBoundingClientRect().width ?? 0),
+      threadClipped: threadPanel.hasAttribute("data-clipped"),
       storedThreadWidth: localStorage.getItem("slock:threadPanelWidth"),
     };
   });
 
-  expect(layout).toEqual({
-    channelWidth: 320,
+  expect(layout).toMatchObject({
+    channelWidth: 361,
     channelOverflow: 0,
-    threadMaxWidth: "calc(100% - 320px)",
+    // Rule 4 gives up width above the content's 360 before anything clips (rule 2).
+    threadClipped: false,
+    // A narrow window changes the rendered width only, never the remembered one.
     storedThreadWidth: "900",
   });
+  expect(layout.threadWidth).toBeGreaterThanOrEqual(359.5);
+  // The thread stands beside the channel in what the row leaves it: nothing overflows the row.
+  expect(layout.threadWidth).toBeLessThanOrEqual(layout.rowRoom + 0.5);
 
   // iPad mini 6 portrait: 744 CSS px (1488 physical px at DPR 2). The row is
-  // wider than the old 680px geometric floor, but portrait tablet content is
+  // wider than the 720px geometric floor, but portrait tablet content is
   // not readable as two half-width panes and must remain thread-only.
   await page.setViewportSize({ width: 744, height: 1133 });
 
@@ -158,7 +176,7 @@ test("thread presentation follows the phone, iPad orientation, and desktop width
       panelWidth: Math.round(panel.getBoundingClientRect().width),
     };
   });
-  expect(portraitTabletGeometry.rowWidth).toBeGreaterThanOrEqual(680);
+  expect(portraitTabletGeometry.rowWidth).toBeGreaterThanOrEqual(720);
   expect(portraitTabletGeometry.panelWidth).toBe(portraitTabletGeometry.rowWidth);
 
   // The same iPad in landscape has enough usable row width and should restore
@@ -175,13 +193,17 @@ test("thread presentation follows the phone, iPad orientation, and desktop width
   await expect(channelComposer).toBeVisible();
   await expect(threadPanel).toHaveCSS("position", "relative");
 
-  // A landscape desktop whose actual chat row falls below 680px remains
-  // thread-only, preserving #4590's rail/sidebar-aware container contract.
-  await page.setViewportSize({ width: 1024, height: 820 });
+  // A landscape desktop whose row cannot give the channel and the thread 360
+  // each (900 - 57 - 320 sidebar = 523 < 720; the sidebar keeps its width
+  // beside the row): the thread folds into the channel's column (#189 rule 3),
+  // a layer over it at the row's whole width. The channel keeps its box under
+  // it, out of reach (inert), so it is not "hidden" to the browser.
+  await page.setViewportSize({ width: 900, height: 700 });
 
   await expect(threadPanel).toHaveCSS("position", "absolute");
   await expect(threadPanel).toHaveCSS("inset", "0px");
-  await expect(channelComposer).not.toBeVisible();
+  await expect(threadPanel).toHaveAttribute("data-covers");
+  await expect(page.getByTestId("thread-main-column")).toHaveAttribute("inert", "");
   await expect(page.getByTestId("thread-mobile-back")).toBeVisible();
   await expect(page.getByTestId("thread-close")).not.toBeVisible();
 
@@ -197,7 +219,7 @@ test("thread presentation follows the phone, iPad orientation, and desktop width
       rightDelta: Math.round(rowRect.right - panelRect.right),
     };
   });
-  expect(threadOnlyGeometry.rowWidth).toBeLessThan(680);
+  expect(threadOnlyGeometry.rowWidth).toBeLessThan(720);
   expect(threadOnlyGeometry.panelWidth).toBe(threadOnlyGeometry.rowWidth);
   expect(threadOnlyGeometry.leftDelta).toBe(0);
   expect(threadOnlyGeometry.rightDelta).toBe(0);

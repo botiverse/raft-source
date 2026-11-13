@@ -1,23 +1,36 @@
+import { JointChannelAccessChangedError } from "../lib/channelActorPermissions";
+import { refuse } from "../lib/refusal";
+import { DmPeerNotMemberError } from "../services/dmSendPolicy";
+import { CHANNEL_THREAD_SORT_FEATURE_FLAG_KEY, channelTypeSupportsThreadSort, decodeChannelActivityCursor, isMessageCardMetadata, isSubConversationType } from "@botiverse/raft-shared";
+import { listMessageCardRevisions } from "../services/messageCardService";
+import { getTaskForConversationChannel } from "../services/taskConversationService";
+import rateLimit from "express-rate-limit";
+import { resolveAppLinkPreviews } from "../services/appLinkPreviewService";
+import { LINK_CARD_READ_MAX_BODY_BYTES, LINK_CARD_READ_URLS_PER_MINUTE, parseLinkCardReadBody, readLinkCards } from "../services/linkCardReadService";
 import { serializeErrorForLog } from "../tracing/safeErrorLog";
-import { Router, type Request, type Response, type Router as RouterType } from "express";
+import express, { Router, type ErrorRequestHandler, type Request, type RequestHandler, type Response, type Router as RouterType } from "express";
 import { isMessageShortId, UUID_RE } from "../lib/messageId";
 import { guardUuidPathParams } from "../lib/uuidPathParams";
-import { createHash, randomUUID } from "node:crypto";
 import { and, eq } from "drizzle-orm";
 import * as messageService from "../services/messageService";
 import * as channelService from "../services/channelService";
 import * as userService from "../services/userService";
-import * as agentService from "../services/agentService";
 import * as serverService from "../services/serverService";
 import * as searchService from "../services/searchService";
 import * as onboardingService from "../services/onboardingService";
-import { getServerPlan, getHistoryCutoff, isChannelReadOnlyByBillingFeature, isChannelReadOnlyByQuota } from "../services/planService";
+import { getServerPlan, getHistoryCutoff, getServerHistoryWindow, channelBillingReadOnlyBody, getChannelBillingReadOnly, isChannelReadOnlyByQuota } from "../services/planService";
+import { notePaywallHit } from "./paywallHit";
+import { getRequestHistoryWindow, getServerHistoryWindowForRead, humanHistoryLimitedError, isBehindHistoryWindow } from "../services/historyWindow";
+import { personLocalConversationId, resolveMessageResourceAccess } from "../services/messageResourceAccess";
 import type { AgentOrchestrator } from "../services/agentOrchestrator";
-import { failpoints, type ServerId, AGENT_API_MESSAGE_SEARCH_DEFAULT_LIMIT, AGENT_API_MESSAGE_SEARCH_MAX_LIMIT } from "@botiverse/raft-shared";
+import { failpoints, type ServerId, AGENT_API_MESSAGE_SEARCH_DEFAULT_LIMIT, AGENT_API_MESSAGE_SEARCH_MAX_LIMIT, FORWARD_TOO_MANY_MESSAGES_CODE, MAX_FORWARD_DESTINATIONS } from "@botiverse/raft-shared";
 import { addTraceEvent, createTraceDbQueryTracer, safeAddTraceEvent, tracePhase } from "../tracing/semanticTrace";
+import { traceRouteFailure } from "../tracing/routeFailure";
+import { traceIdentityHash } from "../tracing/traceIdentity";
 import {
   boundedUnexpectedForwardError,
   forwardCommitState,
+  noteForwardTargets,
   recordForwardTerminal,
   type ForwardDiagnosticPhase,
 } from "../tracing/messageForwardTrace";
@@ -26,9 +39,9 @@ import { getDb } from "../db/index";
 import { messageMentions } from "../db/schema";
 import { listMentionDeliveryOccurrencesForMessage, evaluateMentionDeliveryOccurrence } from "../services/mentionDeliveryOccurrenceService";
 import { projectMentionDeliveryForSender } from "../services/senderMentionDeliveryProjection";
-import { getAttachmentsForMessages, normalizeAttachmentFilename, resolveAttachmentMimeType } from "./attachments";
 import { AttachmentLinkError } from "../services/attachmentLinkingService";
 import { isAttachmentPreviewUnifiedEnabledForServer } from "../config/attachmentPreviewUnified";
+import { evaluateFeatureFlag } from "../services/featureFlagService";
 import { bindRequestAbortSignal } from "./requestAbortSignal";
 import { sendJsonServerError } from "./errorResponse";
 import {
@@ -48,11 +61,18 @@ import {
   ReactionActorVisibilityChangedError,
   ReactionDiscussionVersionChangedError,
 } from "../services/messageReactionService";
+import { ForwardPersistenceError } from "../services/attachmentForwardService";
 import {
-  ForwardPersistenceError,
-  persistForwardBundle,
-  type InternalForwardBundleMetadata,
-} from "../services/attachmentForwardService";
+  admitForwardConversationTargets,
+  buildForwardedBundleMetadata,
+  forwardBundleAsUser,
+  FORWARD_TOO_MANY_MESSAGES_ERROR,
+  forwardMessageContent,
+  ForwardRequestError,
+  isOverForwardMessageCap,
+  parseForwardSourceMessageIds,
+  searchForwardTargets,
+} from "../services/messageForwardService";
 import {
   assertChannelConversionWritable,
   ChannelConversionInProgressError,
@@ -60,7 +80,17 @@ import {
 } from "../services/channelConversionFenceService";
 import { projectSlackBridgeOutboundAdmissionFailure } from "../services/externalDeliveryOutboxService";
 import { getActorServerRoleInServer } from "../lib/actorPermissions";
+import { canView } from "../services/visibilityService";
+import { checkHumanPostAdmission, HUMAN_POST_REFUSALS } from "../services/humanPostAdmission";
+import {
+  forwardParentContent,
+  listForwardConversationCandidates,
+  type ForwardConversationCandidate,
+  type ForwardConversationTarget,
+} from "../services/forwardConversationTargets";
 import { parseOptionalIanaTimezone } from "../lib/ianaTimezone";
+import { parseSyncHorizon, readSyncHorizon, SYNC_HORIZON_HEADER, SYNC_HORIZON_RESET_HEADER } from "../services/syncHorizon";
+import { parseOffsetQueryParam } from "../lib/offsetQueryParam";
 
 export const messageRouter: RouterType = Router();
 export const messageV2Router: RouterType = Router();
@@ -69,11 +99,11 @@ export const messageV2Router: RouterType = Router();
 guardUuidPathParams(messageRouter, { channelId: "Channel" });
 
 export const MAX_MESSAGE_LENGTH = 32_000;
+const HUMAN_OUTLINE_DEFAULT_LIMIT = 200;
+const HUMAN_OUTLINE_MAX_LIMIT = 500;
 const MAX_RANDOM_ID_LENGTH = 128;
 const INVALID_RANDOM_ID = Symbol("invalidRandomId");
 const MAX_REACTION_LENGTH = 16;
-const MAX_FORWARD_BUNDLE_ITEMS = 20;
-const MAX_FORWARD_DESTINATIONS = 10;
 // The authenticated human author can inspect only coarse outcomes of their own
 // mentions while they still have access to the original conversation. Runtime
 // identities and terminal provenance remain on the existing diagnostic surface.
@@ -176,25 +206,6 @@ function parseHumanMessageCreateBody(value: unknown): HumanMessageCreateBody | "
   };
 }
 
-class ForwardRequestError extends Error {
-  constructor(
-    readonly status: 400 | 403 | 404 | 409,
-    message: string,
-    readonly code: string,
-    readonly diagnosticCode: string = code,
-  ) {
-    super(message);
-  }
-}
-
-function parseForwardSourceMessageIds(value: unknown): string[] | "invalid" {
-  if (!Array.isArray(value) || value.length === 0 || value.length > MAX_FORWARD_BUNDLE_ITEMS) return "invalid";
-  const ids = value.map((item) => typeof item === "string" ? item.trim() : "");
-  if (ids.some((id) => !UUID_RE.test(id))) return "invalid";
-  if (new Set(ids).size !== ids.length) return "invalid";
-  return ids;
-}
-
 function parseForwardDestinationChannelIds(value: unknown): string[] | "invalid" | null {
   if (value === undefined) return null;
   if (!Array.isArray(value) || value.length === 0) return "invalid";
@@ -203,313 +214,6 @@ function parseForwardDestinationChannelIds(value: unknown): string[] | "invalid"
   const canonicalIds = [...new Set(ids)];
   if (canonicalIds.length > MAX_FORWARD_DESTINATIONS) return "invalid";
   return canonicalIds;
-}
-
-function forwardRequestDigest(opts: {
-  serverId: string;
-  userId: string;
-  sourceMessageIds: string[];
-  destinationChannelId: string;
-  note: string;
-}): string {
-  return createHash("sha256")
-    .update(JSON.stringify({
-      serverId: opts.serverId,
-      userId: opts.userId,
-      sourceMessageIds: opts.sourceMessageIds,
-      destinationChannelId: opts.destinationChannelId,
-      note: opts.note,
-    }))
-    .digest("hex");
-}
-
-function hasActionMetadata(value: unknown): boolean {
-  if (value == null) return false;
-  if (Array.isArray(value)) return value.length > 0;
-  if (typeof value === "object") return Object.keys(value).length > 0;
-  return true;
-}
-
-function isForwardedBundleActionMetadata(value: unknown): boolean {
-  return !!value
-    && typeof value === "object"
-    && !Array.isArray(value)
-    && (value as { kind?: unknown }).kind === "forwarded-bundle";
-}
-
-async function getSenderSnapshot(
-  senderType: "user" | "agent" | "external_projection",
-  senderId: string,
-  externalAuthor?: messageService.EnrichedMessageRow["externalAuthor"],
-) {
-  if (senderType === "user") {
-    const user = await userService.getUser(senderId);
-    return {
-      type: senderType,
-      id: senderId,
-      name: user?.displayName || user?.name || "User",
-      uniqueName: user?.name || "unknown",
-    };
-  }
-
-  if (senderType === "external_projection") {
-    return {
-      type: senderType,
-      id: senderId,
-      name: externalAuthor?.displayName ?? "External user",
-    };
-  }
-
-  const agent = await agentService.getAgent(senderId);
-  return {
-    type: senderType,
-    id: senderId,
-    name: agent?.displayName || agent?.name || "Agent",
-    uniqueName: agent?.name || "unknown",
-  };
-}
-
-type MessageChannel = NonNullable<Awaited<ReturnType<typeof channelService.getChannel>>>;
-
-type ForwardSourceContext = {
-  bundleSourceId: string;
-  sourceTargetId: string | null;
-  sourceThreadId?: string;
-  sourceParentMessageId?: string;
-  parentChannelId?: string;
-  displayType?: MessageChannel["type"];
-  snapshotChannel: MessageChannel;
-};
-
-function sourceTargetSnapshot(channel: MessageChannel, displayType = channel.type) {
-  if (channel.type === "channel") {
-    return {
-      id: channel.id,
-      type: displayType,
-      label: `#${channel.name}`,
-      labelVisibility: "public",
-    };
-  }
-
-  return {
-    id: null,
-    type: displayType,
-    label: "",
-    labelVisibility: "restricted",
-  };
-}
-
-async function resolveForwardSourceVisibleChannel(opts: {
-  serverId: ServerId;
-  storageChannel: MessageChannel;
-}): Promise<MessageChannel | null> {
-  const { serverId, storageChannel } = opts;
-
-  if (storageChannel.type === "thread") {
-    if (storageChannel.serverId === serverId) return storageChannel;
-    const localThreadProjection = (await channelService.getActiveJointThreadProjectionsByCanonicalThread(storageChannel.id))
-      .find((projection) => projection.localServerId === serverId);
-    return localThreadProjection?.threadChannel ?? null;
-  }
-
-  // Joint messages live in a dedicated canonical storage channel whose type
-  // is `channel`, not `joint`. Resolve both that canonical id and a caller's
-  // local projection through the active joint mapping before applying the
-  // ordinary same-server fence.
-  const localChannelProjection = (await channelService.getActiveJointChannelProjectionsByLocalChannel(storageChannel.id))
-    .find((projection) => projection.serverId === serverId);
-  if (localChannelProjection) return localChannelProjection.channel;
-
-  if (storageChannel.serverId !== serverId) return null;
-  return storageChannel;
-}
-
-async function resolveForwardSourceContext(opts: {
-  serverId: ServerId;
-  message: NonNullable<Awaited<ReturnType<typeof messageService.getMessage>>>;
-  messageChannel: MessageChannel;
-  storageMessageChannel?: MessageChannel;
-  selectedThreadChannelIds: ReadonlySet<string>;
-}): Promise<ForwardSourceContext> {
-  const { message, messageChannel } = opts;
-  const storageMessageChannel = opts.storageMessageChannel ?? messageChannel;
-  if (messageChannel.type !== "thread") {
-    const threadInfo = await channelService.getThreadInfo(message.id);
-    const threadChannelId = threadInfo?.threadChannelId ?? message.threadId;
-    if (threadChannelId && opts.selectedThreadChannelIds.has(threadChannelId)) {
-      return {
-        bundleSourceId: threadChannelId,
-        sourceTargetId: messageChannel.type === "channel" ? threadChannelId : null,
-        sourceThreadId: threadChannelId,
-        sourceParentMessageId: message.id,
-        parentChannelId: messageChannel.id,
-        displayType: "thread",
-        snapshotChannel: messageChannel,
-      };
-    }
-    return {
-      bundleSourceId: messageChannel.id,
-      sourceTargetId: messageChannel.type === "channel" ? messageChannel.id : null,
-      snapshotChannel: messageChannel,
-    };
-  }
-
-  const parentMessageId = storageMessageChannel.parentMessageId ?? messageChannel.parentMessageId;
-  if (!parentMessageId) {
-    throw new ForwardRequestError(400, "Forwarding from this thread is not supported", "unsupported_source");
-  }
-  const parentMessage = await messageService.getMessage(parentMessageId);
-  if (!parentMessage) {
-    throw new ForwardRequestError(400, "Forwarding from this thread is not supported", "unsupported_source");
-  }
-  const storageParentChannel = await channelService.getChannel(parentMessage.channelId);
-  if (!storageParentChannel || storageParentChannel.type === "thread") {
-    throw new ForwardRequestError(400, "Forwarding from this thread is not supported", "unsupported_source");
-  }
-  const parentChannel = await resolveForwardSourceVisibleChannel({
-    serverId: opts.serverId,
-    storageChannel: storageParentChannel,
-  });
-  if (!parentChannel || parentChannel.type === "thread") {
-    throw new ForwardRequestError(400, "Forwarding from this thread is not supported", "unsupported_source");
-  }
-
-  const publicThreadSource = parentChannel.type === "channel";
-  return {
-    bundleSourceId: storageMessageChannel.id,
-    sourceTargetId: publicThreadSource ? messageChannel.id : null,
-    sourceThreadId: publicThreadSource ? messageChannel.id : undefined,
-    sourceParentMessageId: parentMessage.id,
-    parentChannelId: publicThreadSource ? parentChannel.id : undefined,
-    displayType: "thread",
-    snapshotChannel: parentChannel,
-  };
-}
-
-async function buildForwardedBundleMetadata(opts: {
-  serverId: ServerId;
-  forwarderUserId: string;
-  sourceMessageIds: string[];
-}) {
-  const sourceRows: Array<{
-    message: NonNullable<Awaited<ReturnType<typeof messageService.getMessage>>>;
-    channel: NonNullable<Awaited<ReturnType<typeof channelService.getChannel>>>;
-    storageChannel: NonNullable<Awaited<ReturnType<typeof channelService.getChannel>>>;
-  }> = [];
-
-  for (const id of opts.sourceMessageIds) {
-    const resolved = await messageService.resolveMessageIdInServer(opts.serverId, id);
-    if (!resolved.ok) {
-      throw new ForwardRequestError(resolved.status, resolved.error, "source_not_found");
-    }
-
-    const message = await messageService.getMessage(resolved.messageId);
-    if (!message) throw new ForwardRequestError(404, "Source message not found", "source_not_found");
-
-    const channel = await channelService.getChannel(message.channelId);
-    if (!channel) {
-      throw new ForwardRequestError(400, "Forwarding across servers is not supported", "cross_server_source");
-    }
-    const visibleChannel = await resolveForwardSourceVisibleChannel({
-      serverId: opts.serverId,
-      storageChannel: channel,
-    });
-    if (!visibleChannel) {
-      throw new ForwardRequestError(400, "Forwarding across servers is not supported", "cross_server_source");
-    }
-    const canReadSource = await channelService.canUserAccessChannel(visibleChannel.id, opts.forwarderUserId, opts.serverId);
-    if (!canReadSource) {
-      throw new ForwardRequestError(404, "Source message not found", "source_not_found");
-    }
-
-    if (isForwardedBundleActionMetadata(message.actionMetadata)) {
-      throw new ForwardRequestError(
-        400,
-        "Forwarded messages can't be forwarded. Select the original message instead.",
-        "forwarded_source_not_supported",
-      );
-    }
-
-    if (message.messageType !== "chat" || hasActionMetadata(message.actionMetadata)) {
-      throw new ForwardRequestError(400, "Only ordinary chat messages can be forwarded", "unsupported_source_message");
-    }
-
-    sourceRows.push({ message, channel: visibleChannel, storageChannel: channel });
-  }
-
-  const selectedThreadChannelIds = new Set(
-    sourceRows.flatMap(({ channel, storageChannel }) => storageChannel.type === "thread"
-      ? [storageChannel.id, channel.id]
-      : []),
-  );
-  const contextualSourceRows = await Promise.all(sourceRows.map(async ({ message, channel, storageChannel }) => ({
-    message,
-    channel: {
-      ...channel,
-      forwardSourceContext: await resolveForwardSourceContext({
-        serverId: opts.serverId,
-        message,
-        messageChannel: channel,
-        storageMessageChannel: storageChannel,
-        selectedThreadChannelIds,
-      }),
-    },
-  })));
-
-  const sourceChannelIds = new Set(contextualSourceRows.map((row) => row.channel.forwardSourceContext.bundleSourceId));
-  if (sourceChannelIds.size !== 1) {
-    throw new ForwardRequestError(400, "Forwarded bundles must come from a single source", "cross_source_bundle");
-  }
-
-  const forwarder = await getSenderSnapshot("user", opts.forwarderUserId);
-  const forwardedAt = new Date().toISOString();
-  const orderedRows = [...contextualSourceRows].sort((a, b) => {
-    const aParent = a.channel.forwardSourceContext.sourceParentMessageId === a.message.id;
-    const bParent = b.channel.forwardSourceContext.sourceParentMessageId === b.message.id;
-    if (aParent !== bParent) return aParent ? -1 : 1;
-    const createdAtDelta = a.message.createdAt.getTime() - b.message.createdAt.getTime();
-    if (createdAtDelta !== 0) return createdAtDelta;
-    const seqDelta = a.message.seq - b.message.seq;
-    if (seqDelta !== 0) return seqDelta;
-    return a.message.id.localeCompare(b.message.id);
-  });
-  const attachmentMap = await getAttachmentsForMessages(orderedRows.map(({ message }) => message.id));
-
-  return {
-    kind: "forwarded-bundle",
-    version: 1,
-    sourceAuthorityChannelIds: orderedRows.map(({ channel }) => channel.forwardSourceContext.snapshotChannel.id),
-    forwardedBy: forwarder,
-    forwardedAt,
-    forwardedItems: await Promise.all(orderedRows.map(async ({ message, channel }, index) => {
-      const sourceContext = channel.forwardSourceContext;
-      const sourceSnapshot = sourceTargetSnapshot(sourceContext.snapshotChannel, sourceContext.displayType ?? channel.type);
-      const exposesSourcePointers = sourceSnapshot.labelVisibility === "public" && Boolean(sourceContext.sourceTargetId);
-      return {
-        index,
-        sourceIsThreadParent: sourceContext.sourceParentMessageId === message.id,
-        sourceHostMessageId: message.id,
-        sourceServerId: exposesSourcePointers ? opts.serverId : null,
-        sourceTargetId: exposesSourcePointers ? sourceContext.sourceTargetId : null,
-        ...(exposesSourcePointers && sourceContext.sourceThreadId ? { sourceThreadId: sourceContext.sourceThreadId } : {}),
-        ...(exposesSourcePointers && sourceContext.parentChannelId ? { parentChannelId: sourceContext.parentChannelId } : {}),
-        sourceMessageId: exposesSourcePointers ? message.id : null,
-        sourceMessageSeq: exposesSourcePointers ? message.seq : null,
-        sourceTargetSnapshot: sourceSnapshot,
-        sourceAuthorSnapshot: await getSenderSnapshot(message.senderType, message.senderId),
-        sourceCreatedAt: message.createdAt.toISOString(),
-        contentSnapshot: message.content,
-        attachmentSnapshots: (attachmentMap.get(message.id) ?? [])
-          .map((attachment) => ({
-            sourceProjectionId: attachment.id,
-            filename: normalizeAttachmentFilename(attachment.filename),
-            mimeType: resolveAttachmentMimeType(attachment.filename, attachment.mimeType),
-          })),
-        attachmentPolicy: "pending-projection",
-        provenanceState: "available",
-      };
-    })),
-  };
 }
 
 function parseReactionEmoji(value: unknown): string | null {
@@ -575,66 +279,31 @@ async function loadVisibleMessageForUser(
   localChannelId: string;
   localServerId: string;
 } | null> {
-  // Message-child resource access seam.
+  // Message-child resource access seam (services/messageResourceAccess.ts).
   //
   // Reactions, attachment previews/URLs, read receipts, saved/pinned state,
   // translations, shares, and any future message-scoped capability must not
   // authorize against message.channelId directly. Joint-channel messages live
   // in canonical storage, while authority is held by the caller's local
-  // projection channel. Resolve message -> canonical channel -> local
-  // projection first, then run ordinary channel access/post checks on that
-  // local projection. If another route needs the same shape, extract a shared
-  // resolveMessageResourceAccess({ messageId, serverId, actor }) helper rather
-  // than adding another bespoke joint-channel branch.
-  const resolvedMessageId = await messageService.resolveMessageIdVisibleToUser(serverId, userId, messageId);
-  if (!resolvedMessageId.ok) {
-    res.status(resolvedMessageId.status).json({ error: resolvedMessageId.error });
+  // projection channel; the resolver authorizes there, then checks the plan's
+  // history window (a message behind it takes no reactions and shows none).
+  const access = await resolveMessageResourceAccess({ messageId, serverId, actor: { type: "user", id: userId } });
+  if (access.kind === "no_access") {
+    res.status(access.status).json({ error: access.error });
     return null;
   }
-  const message = await messageService.getMessage(resolvedMessageId.messageId);
-  if (!message) {
-    res.status(404).json({ error: "Message not found" });
+  if (access.kind === "history_limited") {
+    res.status(404).json(humanHistoryLimitedError(access.historyWindow));
     return null;
   }
-
-  const channel = await channelService.getChannel(message.channelId);
-  if (!channel) {
-    res.status(404).json({ error: "Message not found" });
-    return null;
-  }
-
-  let localChannelId = message.channelId;
-  if (channel.serverId !== serverId) {
-    if (channel.type === "thread") {
-      const localThreadProjection = (await channelService.getActiveJointThreadProjectionsByCanonicalThread(message.channelId))
-        .find((projection) => projection.localServerId === serverId);
-      localChannelId = localThreadProjection?.localThreadChannelId ?? "";
-    } else {
-      const localChannelProjection = (await channelService.getActiveJointChannelProjectionsByLocalChannel(message.channelId))
-        .find((projection) => projection.serverId === serverId);
-      localChannelId = localChannelProjection?.localChannelId ?? "";
-    }
-  }
-
-  if (!localChannelId) {
-    res.status(404).json({ error: "Message not found" });
-    return null;
-  }
-
-  const canAccess = await channelService.canUserAccessChannel(localChannelId, userId, serverId);
-  if (!canAccess) {
-    res.status(404).json({ error: "Message not found" });
-    return null;
-  }
-
-  return { message, localChannelId, localServerId: serverId };
+  return { message: access.message, localChannelId: access.localChannelId, localServerId: serverId };
 }
 
 async function isHiddenAllDirectoryScope(
   localChannel: NonNullable<Awaited<ReturnType<typeof channelService.getChannel>>>,
 ): Promise<boolean> {
   if (channelService.isAllSystemChannel(localChannel)) return true;
-  if (localChannel.type !== "thread") return false;
+  if (!isSubConversationType(localChannel.type)) return false;
 
   const jointThread = await channelService.getJointThreadProjectionByLocalThread(
     localChannel.id,
@@ -671,7 +340,7 @@ async function getVisibleReactionActorIds(
   };
 }
 
-async function projectUpdatedMessageForLocalChannel(
+export async function projectUpdatedMessageForLocalChannel(
   message: NonNullable<Awaited<ReturnType<typeof messageService.getMessage>>>,
   enriched: NonNullable<Awaited<ReturnType<typeof messageService.getMessageContext>>>["messages"][number],
   localChannelId: string,
@@ -685,16 +354,62 @@ async function projectUpdatedMessageForLocalChannel(
   return messageService.projectMessagesToChannel([enriched], localChannelId)[0] ?? enriched;
 }
 
-async function emitProjectedMessageUpdate(
-  io: { to: (room: string) => { emit: (event: string, payload: unknown) => void } },
-  message: NonNullable<Awaited<ReturnType<typeof messageService.getMessage>>>,
-  enriched: NonNullable<Awaited<ReturnType<typeof messageService.getMessageContext>>>["messages"][number],
+/**
+ * One message as this person's message list shows it, or null when they may
+ * not read it: the list's access (the conversation through their local
+ * projection, the plan's history window; services/messageResourceAccess.ts),
+ * the list's per-viewer read and projection. GET /api/sync/changes rebuilds a
+ * `message` change with it (RFC 082 §4.4).
+ */
+export async function readVisibleMessageRow(messageId: string, userId: string, serverId: ServerId) {
+  const access = await resolveMessageResourceAccess({ messageId, serverId, actor: { type: "user", id: userId } });
+  if (access.kind !== "readable") return null;
+  const context = await messageService.getMessageContext(access.message.id, 0, 0, undefined, {
+    attachmentCommentViewerUserId: userId, forwardedBundleViewerUserId: userId, viewerServerId: serverId,
+  });
+  const enriched = context?.messages.find((item) => item.id === access.message.id);
+  if (!enriched) return null;
+  return projectUpdatedMessageForLocalChannel(access.message, enriched, access.localChannelId, serverId);
+}
+
+// RFC 082 §4.5: a card message's kept versions, oldest first, read from the
+// message by whoever may read it, and only by them: the message's own
+// visibility (messageVisibleToViewer), so a private channel's or a DM's
+// are its members' only; an owner or admin outside it gets the unknown
+// message's 404, as does a deleted message. A card message can be in a Joint
+// Channel (its channel converted to one since it was sent): then each viewer
+// reads it through their own Server's projection, under their own Server's
+// history window. A person's session only (requireAuth): never an App's OAuth
+// token or an agent key, so the sender's App cannot read them. Any other
+// message: none.
+messageRouter.get("/:messageId/card-revisions", async (req, res) => {
+  res.setHeader("Cache-Control", "private, no-store");
+  const messageId = req.params.messageId;
+  if (typeof messageId !== "string" || !UUID_RE.test(messageId)) { res.status(404).json({ error: "Message not found" }); return; }
+  try {
+    const message = await messageService.getMessage(messageId);
+    // getMessage does not filter deleted rows: a deleted (or retracted) message is the unknown one's 404.
+    if (!message || message.deletedAt || !await messageVisibleToViewer(req, message)) { res.status(404).json({ error: "Message not found" }); return; }
+    const revisions = isMessageCardMetadata(message.actionMetadata) ? await listMessageCardRevisions(message.id) : [];
+    res.json({ messageId: message.id, revisions });
+  } catch {
+    res.status(500).json({ error: "Failed to read card revisions" });
+  }
+});
+
+type MessageUpdateIo = { to: (room: string) => { emit: (event: string, payload: unknown) => void } };
+type UpdatedMessage = NonNullable<Awaited<ReturnType<typeof messageService.getMessage>>>;
+type EnrichedUpdatedMessage = NonNullable<Awaited<ReturnType<typeof messageService.getMessageContext>>>["messages"][number];
+
+/** Every local channel a message update reaches: its joint projections, or the current channel. */
+async function collectMessageUpdateTargets(
+  message: UpdatedMessage,
   currentLocalChannelId: string,
   currentServerId: string,
-) {
+): Promise<{ localChannelId: string; serverId: string }[]> {
   const storageChannel = await channelService.getChannel(message.channelId);
   const targets = new Map<string, { localChannelId: string; serverId: string }>();
-  if (storageChannel?.type === "thread") {
+  if (isSubConversationType(storageChannel?.type)) {
     const projections = await channelService.getActiveJointThreadProjectionsByCanonicalThread(message.channelId);
     for (const projection of projections) {
       targets.set(projection.localThreadChannelId, {
@@ -715,11 +430,44 @@ async function emitProjectedMessageUpdate(
   if (targets.size === 0) {
     targets.set(currentLocalChannelId, { localChannelId: currentLocalChannelId, serverId: currentServerId });
   }
+  return [...targets.values()];
+}
 
-  for (const target of targets.values()) {
+export async function emitProjectedMessageUpdate(
+  io: MessageUpdateIo,
+  message: UpdatedMessage,
+  enriched: EnrichedUpdatedMessage,
+  currentLocalChannelId: string,
+  currentServerId: string,
+) {
+  for (const target of await collectMessageUpdateTargets(message, currentLocalChannelId, currentServerId)) {
     const projected = await projectUpdatedMessageForLocalChannel(message, enriched, target.localChannelId, target.serverId);
     const broadcastProjected = messageService.sanitizeForwardedBundleMetadataForBroadcast(projected);
     // message-realtime-producer: route-message.updated.projected
+    io.to(`channel:${target.localChannelId}`).emit(
+      "message:updated",
+      projectRichMessageSocketPayload(messageService.stripViewerScopedAttachmentCommentMetadata(broadcastProjected)),
+    );
+  }
+}
+
+/**
+ * Re-broadcast a message whose attachment gained a preview after it was sent
+ * (a direct upload's thumbnail, task #57), so open clients swap the original
+ * for the thumbnail. Same rooms and projection as an edit.
+ */
+export async function emitAttachmentPreviewMessageUpdate(io: MessageUpdateIo, messageId: string): Promise<void> {
+  const message = await messageService.getMessage(messageId);
+  if (!message) return;
+  const channel = await channelService.getChannel(message.channelId);
+  if (!channel) return;
+  const context = await messageService.getMessageContext(message.id, 0, 0, undefined, { viewerServerId: channel.serverId });
+  const enriched = context?.messages[0];
+  if (!enriched) return;
+  for (const target of await collectMessageUpdateTargets(message, message.channelId, channel.serverId)) {
+    const projected = await projectUpdatedMessageForLocalChannel(message, enriched, target.localChannelId, target.serverId);
+    const broadcastProjected = messageService.sanitizeForwardedBundleMetadataForBroadcast(projected);
+    // message-realtime-producer: route-message.updated.attachment-preview
     io.to(`channel:${target.localChannelId}`).emit(
       "message:updated",
       projectRichMessageSocketPayload(messageService.stripViewerScopedAttachmentCommentMetadata(broadcastProjected)),
@@ -736,9 +484,9 @@ messageRouter.get("/search", async (req, res) => {
     queryForErrorTrace = query;
 
     const channelId = typeof req.query.channelId === "string" ? req.query.channelId : undefined;
+    const scopedChannel = channelId ? await channelService.getChannel(channelId) : undefined;
     if (channelId) {
-      const channel = await channelService.getChannel(channelId);
-      if (!channel || channel.serverId !== req.serverId) {
+      if (!scopedChannel || scopedChannel.serverId !== req.serverId) {
         res.status(404).json({ error: "Channel not found" });
         return;
       }
@@ -753,7 +501,7 @@ messageRouter.get("/search", async (req, res) => {
       Number(req.query.limit) || AGENT_API_MESSAGE_SEARCH_DEFAULT_LIMIT,
       AGENT_API_MESSAGE_SEARCH_MAX_LIMIT,
     );
-    const offset = Math.max(Number(req.query.offset) || 0, 0);
+    const offset = parseOffsetQueryParam(req.query.offset);
     const senderId = typeof req.query.senderId === "string" ? req.query.senderId : undefined;
     const senderType = parseSearchSenderType(req.query.senderType);
     if (senderType === "invalid") {
@@ -778,7 +526,9 @@ messageRouter.get("/search", async (req, res) => {
     }
     const rawCursor = typeof req.query.cursor === "string" && req.query.cursor ? req.query.cursor : undefined;
     const cursor = rawCursor === undefined ? undefined : searchService.parseMessageSearchWalkCursor(rawCursor);
-    if (cursor === null || (cursor && (!query || sort !== "recent"))) {
+    // A cursor continues a recent page, or a relevance page answered newest
+    // first (relevanceFallback).
+    if (cursor === null || (cursor && !query)) {
       res.status(400).json({ error: "Invalid search cursor" });
       return;
     }
@@ -802,7 +552,7 @@ messageRouter.get("/search", async (req, res) => {
         results_count: 0,
         has_more: false,
       });
-      res.json({ results: [], hasMore: false });
+      res.json({ results: [], hasMore: false, historyLimited: false });
       return;
     }
 
@@ -823,7 +573,10 @@ messageRouter.get("/search", async (req, res) => {
       reason: "request_accepted",
     });
 
-    const searchRole = await getActorServerRoleInServer(req.serverId!, "user", req.userId!);
+    const [searchRole, historyWindow] = await Promise.all([
+      getActorServerRoleInServer(req.serverId!, "user", req.userId!),
+      getServerHistoryWindow(req.serverId!),
+    ]);
     const guestVisibleChannelIds = searchRole === "guest"
       ? (await channelService.listChannels(req.serverId!, req.userId!, { archived: "include" })).map((channel) => channel.id)
       : undefined;
@@ -839,6 +592,7 @@ messageRouter.get("/search", async (req, res) => {
         : undefined,
       after,
       before,
+      historyCutoff: historyWindow.cutoff,
       sort: query ? sort : "recent",
       limit,
       offset,
@@ -846,6 +600,17 @@ messageRouter.get("/search", async (req, res) => {
       signal: requestAbort.signal,
       allowedRootChannelIds: guestVisibleChannelIds,
     });
+    // `historyLimited`: the cutoff may have narrowed this search, because the
+    // searched scope (the channel, else the server) existed before it.
+    // Creation time stands in for "has older messages", which would cost a
+    // second search. It records the paywall hit; the web's search notice no
+    // longer reads it (it shows on every Free search, 2026-10-29).
+    const scopeCreatedAt = scopedChannel?.createdAt ?? historyWindow.serverCreatedAt;
+    const historyLimited = historyWindow.cutoff !== undefined
+      && scopeCreatedAt !== undefined
+      && scopeCreatedAt < historyWindow.cutoff
+      && (!after || after < historyWindow.cutoff);
+    if (historyLimited) notePaywallHit(req, "history_30d");
     addTraceEvent("message_search.response.ready", {
       ...messageSearchParamTraceAttrs({
         query,
@@ -863,8 +628,9 @@ messageRouter.get("/search", async (req, res) => {
       reason: "response_ready",
       results_count: searchResponse.results.length,
       has_more: searchResponse.hasMore,
+      history_limited: historyLimited,
     });
-    res.json(searchResponse);
+    res.json({ ...searchResponse, historyLimited });
   } catch (err) {
     if (searchService.isMessageSearchPublicError(err)) {
       addTraceEvent("message_search.route.rejected", {
@@ -911,6 +677,158 @@ function parseContextWindowSide(raw: unknown): number {
   return Math.min(Number(raw), MESSAGE_CONTEXT_WINDOW_DEFAULT);
 }
 
+const appLinkPreviewLimiter = rateLimit({
+  windowMs: 60_000, limit: 60, standardHeaders: true, legacyHeaders: false,
+  // One budget per person, not per Server: joining more Servers must not
+  // multiply the outbound callback volume one account can drive.
+  keyGenerator: (req) => req.userId!,
+  message: { previews: [], prompts: [] },
+});
+/**
+ * Whether the viewer may read `message` from this request's Server, as the
+ * people branch of services/messageResourceAccess.ts decides it: through the
+ * conversation they hold it by (its own channel on this Server, or this
+ * Server's active projection of the Joint Channel or thread that stores it:
+ * personLocalConversationId), which they can see (canView), within this
+ * Server's history window; null otherwise. The one check behind both the card
+ * revisions read and link previews (readPreviewableMessage), so they can't
+ * drift. `joint`: the message is read through a Joint Channel or thread, not a
+ * local conversation of this Server.
+ */
+async function messageVisibleToViewer(req: Request, message: { channelId: string; createdAt: Date }) {
+  const visibility = await messageVisibility(req, message);
+  return "refusal" in visibility ? null : visibility;
+}
+
+/** Why a preview read answers 404, recorded as `preview_refusal` (#proj-o11y:#29). */
+type PreviewRefusal = "not_found" | "not_previewable" | "not_visible" | "out_of_history";
+
+async function messageVisibility(
+  req: Request,
+  message: { channelId: string; createdAt: Date },
+): Promise<{ refusal: "not_visible" | "out_of_history" } | { historyWindow: Awaited<ReturnType<typeof getServerHistoryWindowForRead>>; joint: boolean }> {
+  const serverId = req.serverId!;
+  const channel = await channelService.getChannel(message.channelId);
+  if (!channel) return { refusal: "not_visible" };
+  const localChannelId = await personLocalConversationId(channel, serverId);
+  if (!localChannelId || !(await canView({ type: "user", id: req.userId!, serverId }, [{ kind: "conversation", channelId: localChannelId }]))[0]) return { refusal: "not_visible" };
+  const historyWindow = await getServerHistoryWindowForRead(serverId);
+  if (isBehindHistoryWindow(message.createdAt, historyWindow)) return { refusal: "out_of_history" };
+  return { historyWindow, joint: channel.serverId !== serverId || channel.type === "joint" };
+}
+
+/**
+ * The message whose links a preview read may resolve, as the viewer sees it, or
+ * null (404). Ordinary chat the viewer can read from the request's Server
+ * (messageVisibleToViewer): a local channel of it, or a Joint Channel or thread
+ * this Server holds a projection of (RFC 076 §16). Shared by the v1 GET, the batched link-card
+ * read and the link-card actions (routes/linkCards.ts), so all apply the same
+ * checks. Everything the read does with the message after this is keyed to the
+ * request's Server, never the Server that stores the message.
+ */
+export async function readPreviewableMessage(req: Request, messageId: string) {
+  const result = await readPreviewableMessageOrRefusal(req, messageId);
+  return "refusal" in result ? null : result.message;
+}
+
+type PreviewableMessage = NonNullable<Awaited<ReturnType<typeof messageService.getMessageContext>>>["messages"][number];
+
+async function readPreviewableMessageOrRefusal(req: Request, messageId: string): Promise<{ message: PreviewableMessage } | { refusal: PreviewRefusal }> {
+  const message = await messageService.getMessage(messageId);
+  if (!message) return { refusal: "not_found" };
+  if (message.messageType !== "chat" || message.actionMetadata) return { refusal: "not_previewable" };
+  const visibility = await messageVisibility(req, message);
+  if ("refusal" in visibility) return { refusal: visibility.refusal };
+  const context = await messageService.getMessageContext(message.id, 0, 0, visibility.historyWindow.cutoff, {
+    attachmentCommentViewerUserId: req.userId, forwardedBundleViewerUserId: req.userId, viewerServerId: req.serverId,
+  });
+  const visible = context?.messages.find((item) => item.id === message.id);
+  return visible ? { message: visible } : { refusal: "not_visible" };
+}
+
+/**
+ * A preview read's 404 or failure, on its request span: which check refused it
+ * (never which one to the client, which keeps the unknown message's 404), and
+ * the message as its keyed trace hash, never the raw id. A failure keeps its
+ * empty 200 for the web but is no longer silent.
+ */
+function tracePreviewRefusal(route: "app_link_previews" | "link_cards_read", messageId: string, refusal: PreviewRefusal) {
+  const messageIdHash = traceIdentityHash("message_id_hash", messageId);
+  addTraceEvent("link_preview.refused", {
+    route_action: route,
+    preview_refusal: refusal,
+    ...(messageIdHash ? { message_id_hash: messageIdHash } : {}),
+  });
+}
+function tracePreviewFailure(route: "app_link_previews" | "link_cards_read", messageId: string, err: unknown) {
+  const messageIdHash = traceIdentityHash("message_id_hash", messageId);
+  traceRouteFailure("link_preview.failed", err, {
+    route_action: route,
+    outcome: "error",
+    ...(messageIdHash ? { message_id_hash: messageIdHash } : {}),
+  });
+}
+
+// Third-party previews are personal, transient views, never persisted into chat.
+// `prompts` (Apps the viewer has neither consented to nor declined) is a field
+// older web clients drop: their response schema is not strict at the top level.
+messageRouter.get("/:messageId/app-link-previews", appLinkPreviewLimiter, async (req, res) => {
+  res.setHeader("Cache-Control", "private, no-store");
+  const messageId = req.params.messageId;
+  if (typeof messageId !== "string" || !UUID_RE.test(messageId)) { res.status(404).json({ error: "Message not found" }); return; }
+  const readVisible = () => readPreviewableMessage(req, messageId);
+  try {
+    const first = await readPreviewableMessageOrRefusal(req, messageId);
+    if ("refusal" in first) { tracePreviewRefusal("app_link_previews", messageId, first.refusal); res.status(404).json({ error: "Message not found" }); return; }
+    const message = first.message;
+    const { previews, prompts, appIcons } = await resolveAppLinkPreviews({ serverId: req.serverId!, userId: req.userId!, content: message.content,
+      stillVisible: async () => (await readVisible())?.content === message.content });
+    res.json({ previews, prompts, appIcons });
+  } catch (err) {
+    tracePreviewFailure("app_link_previews", messageId, err);
+    res.json({ previews: [], prompts: [], appIcons: {} });
+  }
+});
+
+// The batched interactive link-card read (RFC 076 §6.1; services/linkCardReadService.ts).
+// Its body is parsed by its own bounded parser, registered in app.ts ahead of
+// the global one, so an oversized body is refused before it is parsed.
+export const LINK_CARD_READ_PATH = "/api/messages/:messageId/link-cards/read";
+export const linkCardReadBodyParser: RequestHandler = express.json({ limit: LINK_CARD_READ_MAX_BODY_BYTES });
+export const linkCardReadBodyErrorHandler: ErrorRequestHandler = (err, _req, res, _next) => {
+  res.setHeader("Cache-Control", "private, no-store");
+  const tooLarge = (err as { type?: unknown }).type === "entity.too.large";
+  res.status(tooLarge ? 413 : 400).json({ error: tooLarge ? "Link card read request too large" : "Invalid link card read request" });
+};
+/** Under the /api/messages mount: a read, so the message-sending limiter skips it. */
+export const isLinkCardReadRequest = (req: Request) => req.method === "POST" && /^\/[^/]+\/link-cards\/read\/?$/i.test(req.path);
+// Requests per person (one budget across Servers, like the GET). Set to the
+// per-link budget, so a read that carries links is bounded by the per-link
+// limiter first and comes back item by item, not as a whole-request 429.
+const linkCardReadLimiter = rateLimit({
+  windowMs: 60_000, limit: LINK_CARD_READ_URLS_PER_MINUTE, standardHeaders: true, legacyHeaders: false,
+  keyGenerator: (req) => req.userId!,
+  message: { items: [], prompts: [] },
+});
+messageRouter.post("/:messageId/link-cards/read", linkCardReadLimiter, async (req, res) => {
+  res.setHeader("Cache-Control", "private, no-store");
+  const messageId = req.params.messageId;
+  if (typeof messageId !== "string" || !UUID_RE.test(messageId)) { res.status(404).json({ error: "Message not found" }); return; }
+  const request = parseLinkCardReadBody(req.body);
+  if (!request) { res.status(400).json({ error: "Invalid link card read request" }); return; }
+  const readVisible = () => readPreviewableMessage(req, messageId);
+  try {
+    const first = await readPreviewableMessageOrRefusal(req, messageId);
+    if ("refusal" in first) { tracePreviewRefusal("link_cards_read", messageId, first.refusal); res.status(404).json({ error: "Message not found" }); return; }
+    const message = first.message;
+    res.json(await readLinkCards({ serverId: req.serverId!, userId: req.userId!, messageId, content: message.content, request,
+      stillVisible: async () => (await readVisible())?.content === message.content }));
+  } catch (err) {
+    tracePreviewFailure("link_cards_read", messageId, err);
+    res.json({ items: [], prompts: [] });
+  }
+});
+
 messageRouter.get("/context/:messageId", async (req, res) => {
   // A malformed id (e.g. a permalink whose `msg=` swallowed the CJK text after
   // it) is a client error, not a uuid-cast 500.
@@ -941,7 +859,7 @@ messageRouter.get("/context/:messageId", async (req, res) => {
     const queryJointResolved = localJointProjection
       ? await channelService.resolveChannelAccess({ serverId: req.serverId!, channelId: localJointProjection.localChannelId })
       : null;
-    const sourceJointThreadProjection = queryChannel?.type === "thread"
+    const sourceJointThreadProjection = isSubConversationType(queryChannel?.type)
       ? await channelService.getJointThreadProjectionByLocalThread(channelId!)
       : null;
     const queryJointThreadProjection = sourceJointThreadProjection?.localServerId === req.serverId
@@ -962,70 +880,115 @@ messageRouter.get("/context/:messageId", async (req, res) => {
     const contextQueryOptions = {
       attachmentCommentViewerUserId: req.userId,
       forwardedBundleViewerUserId: req.userId,
-      forwardedBundleViewerServerId: req.serverId,
+      viewerServerId: req.serverId,
     };
-    const context = channelId
+    const findContext = async (
+      cutoff: Date | undefined,
+      before: typeof contextBefore = contextBefore,
+      after: typeof contextAfter = contextAfter,
+    ) => channelId
       ? looksLikeFullUuid
-        ? await messageService.getMessageContextInChannel(contextChannelId!, req.params.messageId, contextBefore, contextAfter, historyCutoff, contextQueryOptions)
-          ?? await messageService.getThreadReplyContextForParentChannel(contextChannelId!, req.params.messageId, contextBefore, contextAfter, historyCutoff, contextQueryOptions)
-          ?? await messageService.getThreadParentContextByThreadChannelIdForParentChannel(contextChannelId!, req.params.messageId, contextBefore, contextAfter, historyCutoff, contextQueryOptions)
-        : await messageService.getMessageContextByShortId(contextChannelId!, req.params.messageId, contextBefore, contextAfter, historyCutoff, contextQueryOptions)
-          ?? await messageService.getThreadReplyContextByShortIdForParentChannel(contextChannelId!, req.params.messageId, contextBefore, contextAfter, historyCutoff, contextQueryOptions)
-          ?? await messageService.getThreadParentContextByThreadChannelIdForParentChannel(contextChannelId!, req.params.messageId, contextBefore, contextAfter, historyCutoff, contextQueryOptions)
-      : await messageService.getMessageContext(req.params.messageId, contextBefore, contextAfter, historyCutoff, contextQueryOptions);
+        ? await messageService.getMessageContextInChannel(contextChannelId!, req.params.messageId, before, after, cutoff, contextQueryOptions)
+          ?? await messageService.getThreadReplyContextForParentChannel(contextChannelId!, req.params.messageId, before, after, cutoff, contextQueryOptions)
+          ?? await messageService.getThreadParentContextByThreadChannelIdForParentChannel(contextChannelId!, req.params.messageId, before, after, cutoff, contextQueryOptions)
+        : await messageService.getMessageContextByShortId(contextChannelId!, req.params.messageId, before, after, cutoff, contextQueryOptions)
+          ?? await messageService.getThreadReplyContextByShortIdForParentChannel(contextChannelId!, req.params.messageId, before, after, cutoff, contextQueryOptions)
+          ?? await messageService.getThreadParentContextByThreadChannelIdForParentChannel(contextChannelId!, req.params.messageId, before, after, cutoff, contextQueryOptions)
+      : await messageService.getMessageContext(req.params.messageId, before, after, cutoff, contextQueryOptions);
+    type FoundContext = NonNullable<Awaited<ReturnType<typeof findContext>>>;
+    // Where the found message is read from, and whether this person may read
+    // it there: the same answer for a message inside the window and one behind it.
+    const authorizeContext = async (found: FoundContext) => {
+      let responseChannelId = queryJointResolved?.kind === "joint"
+        ? queryJointResolved.localChannelId
+        : queryJointThreadProjection?.localThreadChannelId ?? found.channelId;
+      const canonicalTarget = (("canonicalTarget" in found ? found.canonicalTarget : null)
+        ?? (queryJointThreadProjection ? {
+          kind: "thread",
+          channelId: queryJointThreadProjection.localParentChannelId,
+          threadChannelId: queryJointThreadProjection.localThreadChannelId,
+          threadParentMessageId: queryJointThreadProjection.canonicalParentMessageId,
+          messageId: found.targetMessageId,
+        } : null)) as null | {
+        kind?: string;
+        channelId?: string;
+        threadChannelId?: string;
+      };
+      if (
+        canonicalTarget?.kind === "thread"
+        && queryJointResolved?.kind === "joint"
+        && typeof canonicalTarget.threadChannelId === "string"
+      ) {
+        const [localThreadProjection] = await channelService.getActiveJointThreadProjectionsByCanonicalThread(canonicalTarget.threadChannelId)
+          .then((projections) => projections.filter((projection) => projection.localServerId === req.serverId));
+        if (localThreadProjection) {
+          responseChannelId = localThreadProjection.localThreadChannelId;
+        }
+      }
+      // A batch may already have rehomed the target while the local channel
+      // intentionally remains ordinary until final cutover. Authorize its local
+      // projection below, never the storage namespace.
+      const localReadProjection = (await channelService.getActiveJointChannelProjectionsByLocalChannel(responseChannelId))
+        .find((projection) => projection.serverId === req.serverId);
+      if (localReadProjection) responseChannelId = localReadProjection.localChannelId;
+      const channel = await channelService.getChannel(responseChannelId);
+      if (!channel || channel.serverId !== req.serverId) return { denied: "channel" as const };
+      const canAccess = await channelService.canUserAccessChannel(responseChannelId, req.userId!, req.serverId!);
+      if (!canAccess) return { denied: "message" as const };
+      // Local ids only: a thread target names this server's projection of it.
+      const projectedTarget = canonicalTarget?.kind === "thread"
+        ? { ...canonicalTarget, channelId: queryJointResolved?.localChannelId ?? canonicalTarget.channelId, threadChannelId: responseChannelId }
+        : canonicalTarget ?? ("canonicalTarget" in found ? found.canonicalTarget : undefined);
+      return { denied: null, responseChannelId, canonicalTarget, projectedTarget };
+    };
+    const context = await findContext(historyCutoff);
     if (!context) {
       // Context queries apply the plan cutoff, so a target behind it lands
-      // here too; record whether a cutoff was in force (task #14).
+      // here too (task #14). Find it without the cutoff: one this person may
+      // read is "older than the history window", not "not found", and the
+      // history paywall centers on it (task #8, frames 4, 5, 8, 9).
+      // Only its location is needed: no window around it.
+      const hiddenContext = historyCutoff ? await findContext(undefined, 0, 0) : null;
+      const hiddenAccess = hiddenContext ? await authorizeContext(hiddenContext) : null;
+      const hiddenTarget = hiddenContext && hiddenAccess?.denied === null && historyCutoff
+        ? await messageService.getHiddenTargetPreview(hiddenContext.channelId, hiddenContext.targetMessageId, historyCutoff, {
+          traceQuery: createTraceDbQueryTracer("history.hidden_target"),
+          viewerServerId: req.serverId,
+        })
+        : null;
       addTraceEvent("message_context.not_found", {
         plan,
         history_cutoff_present: Boolean(historyCutoff),
+        history_limited: Boolean(hiddenTarget),
       });
+      if (hiddenTarget && hiddenAccess?.denied === null) {
+        notePaywallHit(req, "history_30d");
+        // Still a 404 for older clients, which treat it as not found.
+        res.status(404).json({
+          ...humanHistoryLimitedError({ plan, cutoff: historyCutoff }),
+          channelId: hiddenAccess.responseChannelId,
+          targetMessageId: hiddenContext!.targetMessageId,
+          // Where it sits (a thread reply names its thread), so a link to it
+          // can open the thread on the paywall: ids only.
+          ...(hiddenAccess.projectedTarget ? { canonicalTarget: hiddenAccess.projectedTarget } : {}),
+          hiddenTarget,
+        });
+        return;
+      }
       res.status(404).json({ error: "Message not found" });
       return;
     }
 
-    let responseChannelId = queryJointResolved?.kind === "joint"
-      ? queryJointResolved.localChannelId
-      : queryJointThreadProjection?.localThreadChannelId ?? context.channelId;
-    const canonicalTarget = (("canonicalTarget" in context ? context.canonicalTarget : null)
-      ?? (queryJointThreadProjection ? {
-        kind: "thread",
-        channelId: queryJointThreadProjection.localParentChannelId,
-        threadChannelId: queryJointThreadProjection.localThreadChannelId,
-        threadParentMessageId: queryJointThreadProjection.canonicalParentMessageId,
-        messageId: context.targetMessageId,
-      } : null)) as null | {
-      kind?: string;
-      channelId?: string;
-      threadChannelId?: string;
-    };
-    if (
-      canonicalTarget?.kind === "thread"
-      && queryJointResolved?.kind === "joint"
-      && typeof canonicalTarget.threadChannelId === "string"
-    ) {
-      const [localThreadProjection] = await channelService.getActiveJointThreadProjectionsByCanonicalThread(canonicalTarget.threadChannelId)
-        .then((projections) => projections.filter((projection) => projection.localServerId === req.serverId));
-      if (localThreadProjection) {
-        responseChannelId = localThreadProjection.localThreadChannelId;
-      }
-    }
-    // A batch may already have rehomed the target while the local channel
-    // intentionally remains ordinary until final cutover. Authorize its local
-    // projection below, never the storage namespace.
-    const localReadProjection = (await channelService.getActiveJointChannelProjectionsByLocalChannel(responseChannelId))
-      .find((projection) => projection.serverId === req.serverId);
-    if (localReadProjection) responseChannelId = localReadProjection.localChannelId;
-    const channel = await channelService.getChannel(responseChannelId);
-    if (!channel || channel.serverId !== req.serverId) {
+    const access = await authorizeContext(context);
+    if (access.denied === "channel") {
       res.status(404).json({ error: "Channel not found" });
       return;
     }
-    const canAccess = await channelService.canUserAccessChannel(responseChannelId, req.userId!, req.serverId!);
-    if (!canAccess) {
+    if (access.denied === "message") {
       res.status(404).json({ error: "Message not found" });
       return;
     }
+    const { responseChannelId } = access;
 
     let historyLimited = false;
     if (historyCutoff) {
@@ -1034,7 +997,19 @@ messageRouter.get("/context/:messageId", async (req, res) => {
         historyCutoff,
         context.messages[0]?.seq,
       );
+      if (!historyLimited && !context.hasOlder) {
+        historyLimited = await messageService.isThreadParentHidden(context.channelId, historyCutoff);
+      }
     }
+    // The window reaches the start of what the plan shows: say what the cutoff
+    // hides there, as a channel page that reaches it does.
+    const hiddenHistory = historyLimited && historyCutoff && !context.hasOlder
+      ? await messageService.getHiddenHistoryPreview(context.channelId, historyCutoff, {
+        traceQuery: createTraceDbQueryTracer("history.hidden_preview"),
+        viewerServerId: req.serverId,
+      })
+      : undefined;
+    if (hiddenHistory) notePaywallHit(req, "history_30d");
     addTraceEvent("history.limit.checked", {
       plan,
       history_cutoff_present: Boolean(historyCutoff),
@@ -1057,12 +1032,11 @@ messageRouter.get("/context/:messageId", async (req, res) => {
     res.json({
       ...context,
       channelId: responseChannelId,
-      canonicalTarget: canonicalTarget?.kind === "thread"
-        ? { ...canonicalTarget, channelId: queryJointResolved?.localChannelId ?? canonicalTarget.channelId, threadChannelId: responseChannelId }
-        : canonicalTarget ?? ("canonicalTarget" in context ? context.canonicalTarget : undefined),
+      canonicalTarget: access.projectedTarget,
       messages: projectedContextMessages,
       threadSummariesByParentMessageId,
       historyLimited,
+      ...(hiddenHistory ? { hiddenHistory } : {}),
       channelArchived,
     });
   } catch (err) {
@@ -1111,7 +1085,7 @@ messageRouter.get("/channel/:channelId", async (req, res) => {
     const resolved = channel.type === "joint"
       ? await channelService.resolveChannelAccess({ serverId: req.serverId!, channelId: req.params.channelId })
       : null;
-    const jointThreadProjection = channel.type === "thread"
+    const jointThreadProjection = isSubConversationType(channel.type)
       ? await channelService.getJointThreadProjectionByLocalThread(req.params.channelId, req.serverId!)
       : null;
     const storageChannelId = resolved?.kind === "joint"
@@ -1142,12 +1116,19 @@ messageRouter.get("/channel/:channelId", async (req, res) => {
     );
     const historyCutoff = getHistoryCutoff(plan);
     const direction = afterSeq !== undefined ? "after" : beforeSeq !== undefined ? "before" : "latest";
+    // The latest page reports a sync horizon taken before it reads
+    // (services/syncHorizon.ts): every transaction below it had finished, so
+    // its rows were visible to this read. A client whose first history read
+    // this is can start sync:resume from it instead of racing the socket's
+    // `sync:horizon` against this request. Keep this read BEFORE the page
+    // query: a horizon taken after it could pass rows the page never saw.
+    const startingHorizon = direction === "latest" ? await readSyncHorizon() : null;
     const page = await tracePhase(
       () => messageService.listMessagesWithCoverage(storageChannelId, limit, beforeSeq, afterSeq, historyCutoff, {
         traceQuery: createTraceDbQueryTracer("messages.paged"),
         attachmentCommentViewerUserId: req.userId,
         forwardedBundleViewerUserId: req.userId,
-        forwardedBundleViewerServerId: req.serverId,
+        viewerServerId: req.serverId,
       }),
       (_durationMs, result) => ({
         name: "messages.paged",
@@ -1187,6 +1168,35 @@ messageRouter.get("/channel/:channelId", async (req, res) => {
         reason: historyCutoff ? "after_cursor" : "unlimited_history",
       });
     }
+    // A thread whose replies are all in the window can still have its first
+    // message (in the parent channel) behind the cutoff: that is hidden
+    // history too, and only matters where the page reached the start.
+    if (!historyLimited && historyCutoff && afterSeq === undefined && page.messages.length < limit) {
+      historyLimited = await messageService.isThreadParentHidden(storageChannelId, historyCutoff, {
+        traceQuery: createTraceDbQueryTracer("history.thread_parent.checked"),
+      });
+    }
+    // A short page reached the start of the visible window, so the web shows
+    // the history paywall next: say what the cutoff hides there (a count and
+    // a faded preview of the newest hidden messages).
+    const hiddenHistory = historyLimited && historyCutoff && page.messages.length < limit
+      ? await tracePhase(
+          () => messageService.getHiddenHistoryPreview(storageChannelId, historyCutoff, {
+            traceQuery: createTraceDbQueryTracer("history.hidden_preview"),
+            viewerServerId: req.serverId,
+          }),
+          (_durationMs, result) => ({
+            name: "history.hidden_preview.loaded",
+            attrs: {
+              hidden_count: result.hiddenCount,
+              hidden_count_capped: result.hiddenCountCapped,
+              preview_count: result.latest.length,
+            },
+          }),
+        )
+      : undefined;
+    // The cutoff did leave older messages out of what this person reads.
+    if (hiddenHistory) notePaywallHit(req, "history_30d");
 
     // task #809 (inline replies cold path): thread summaries for THIS page's
     // parents ride the same response — the client must never need a second
@@ -1219,10 +1229,12 @@ messageRouter.get("/channel/:channelId", async (req, res) => {
       history_limited: historyLimited,
       thread_summaries_count: Object.keys(threadSummariesByParentMessageId).length,
     });
+    if (startingHorizon) res.setHeader(SYNC_HORIZON_HEADER, startingHorizon.horizon);
     res.json({
       messages: projectedMsgs,
       threadSummariesByParentMessageId,
       historyLimited,
+      ...(hiddenHistory ? { hiddenHistory } : {}),
       messageWindow: {
         schemaVersion: 1,
         domain: "receiver_visible_messages_v1",
@@ -1232,6 +1244,115 @@ messageRouter.get("/channel/:channelId", async (req, res) => {
         scopeId: responseScopeId,
         ...page.coverage,
       },
+    });
+  } catch {
+    res.status(500).json({ error: "Failed to list messages" });
+  }
+});
+
+// The conversation outline (消息时间线): a page of what people themselves wrote,
+// newest first, `before` a seq. Same access, joint storage and history window
+// as GET /channel/:channelId. A hidden human directory (hideHumansFromMembers)
+// changes nothing here: it hides the member list, not who wrote what in a
+// conversation the reader can open, which that route shows too.
+messageRouter.get("/channel/:channelId/human-outline", async (req, res) => {
+  try {
+    const channel = await channelService.getChannel(req.params.channelId);
+    if (!channel || channel.serverId !== req.serverId) {
+      refuse(res, 404, { code: "channel_not_found", error: "That conversation doesn't exist on this server or you can't see it; check the channel id." });
+      return;
+    }
+    const [visible] = await canView({ type: "user", id: req.userId!, serverId: req.serverId! }, [{ kind: "conversation", channelId: channel.id }]);
+    if (!visible) {
+      await denyChannelAccess(res, req.userId!, req.params.channelId, "You do not have access to this channel");
+      return;
+    }
+    const beforeSeq = parseMessagePageCursor(req.query.before);
+    if (beforeSeq === "invalid") {
+      refuse(res, 400, { code: "invalid_message_page_cursor", error: "The before cursor isn't a message seq; pass the seq of the oldest item already read." });
+      return;
+    }
+    const limit = Math.max(1, Math.min(Number.parseInt(String(req.query.limit ?? ""), 10) || HUMAN_OUTLINE_DEFAULT_LIMIT, HUMAN_OUTLINE_MAX_LIMIT));
+    const resolved = channel.type === "joint"
+      ? await channelService.resolveChannelAccess({ serverId: req.serverId!, channelId: req.params.channelId })
+      : null;
+    const jointThreadProjection = isSubConversationType(channel.type)
+      ? await channelService.getJointThreadProjectionByLocalThread(req.params.channelId, req.serverId!)
+      : null;
+    const storageChannelId = resolved?.kind === "joint"
+      ? resolved.canonicalChannelId
+      : jointThreadProjection?.canonicalThreadChannelId ?? req.params.channelId;
+    const historyCutoff = getHistoryCutoff(await getServerPlan(req.serverId!));
+    const page = await messageService.listHumanOutlineMessages(storageChannelId, limit, beforeSeq, historyCutoff, {
+      traceQuery: createTraceDbQueryTracer("messages.human_outline"),
+    });
+    res.json({ items: page.items, hasMore: page.hasMore });
+  } catch {
+    res.status(500).json({ error: "Failed to list the conversation outline" });
+  }
+});
+
+// Forum-style channels (#proj-chat:#24): a page of the channel's top-level
+// messages ordered by latest activity (own time or latest thread reply),
+// oldest first, newest activity last. `before` is the opaque keyset cursor the
+// previous page returned (`nextCursor`). 404 while channel_thread_sort_v0 is
+// off or the channel is not a regular channel set to `activity`; same access
+// and history window as GET /channel/:channelId.
+messageRouter.get("/channel/:channelId/by-activity", async (req, res) => {
+  try {
+    const channel = await channelService.getChannel(req.params.channelId);
+    if (!channel || channel.serverId !== req.serverId) {
+      res.status(404).json(CHANNEL_NOT_FOUND_BODY);
+      return;
+    }
+    const [visible] = await canView({ type: "user", id: req.userId!, serverId: req.serverId! }, [{ kind: "conversation", channelId: channel.id }]);
+    if (!visible) {
+      await denyChannelAccess(res, req.userId!, req.params.channelId, "You do not have access to this channel");
+      return;
+    }
+    const gate = await evaluateFeatureFlag({
+      key: CHANNEL_THREAD_SORT_FEATURE_FLAG_KEY,
+      serverId: req.serverId!,
+      userId: req.userId!,
+    });
+    if (!gate.enabled || !channelTypeSupportsThreadSort(channel.type) || channel.threadSort !== "activity") {
+      res.status(404).json({ error: "This channel is not ordered by activity", code: "thread_sort_not_activity" });
+      return;
+    }
+    const limit = Math.max(1, Math.min(Number(req.query.limit) || 50, 200));
+    const before = req.query.before === undefined ? null : decodeChannelActivityCursor(req.query.before);
+    if (req.query.before !== undefined && !before) {
+      res.status(400).json({ error: "Invalid message page cursor", code: "invalid_message_page_cursor" });
+      return;
+    }
+    const historyCutoff = getHistoryCutoff(await getServerPlan(req.serverId!));
+    const page = await messageService.listTopLevelMessagesByActivity(channel.id, limit, before, historyCutoff, {
+      traceQuery: createTraceDbQueryTracer("messages.activity_paged"),
+      attachmentCommentViewerUserId: req.userId,
+      forwardedBundleViewerUserId: req.userId,
+      viewerServerId: req.serverId,
+    });
+    // Joint channels never get here (type gate above): no joint thread
+    // projection, only the conversion scope's rows shown under this channel.
+    const projected = messageService.projectMessagesToChannel(page.messages, channel.id);
+    const activityById = new Map(page.messages.map((message) => [message.id, message.activityAt]));
+    const pageMessages = projected.map((message) => ({ ...message, activityAt: activityById.get(message.id) ?? null }));
+    const historyLimited = Boolean(historyCutoff) && !page.hasMore
+      && await messageService.hasOlderMessages(channel.id, historyCutoff!, undefined, {});
+    const threadSummariesByParentMessageId = pageMessages.length === 0
+      ? {}
+      : await channelService.getThreadSummaries(channel.id, {
+          userId: req.userId!,
+          parentMessageIds: pageMessages.map((message) => message.id),
+          parentMessageScopeSource: "messages_page",
+          traceQuery: createTraceDbQueryTracer("messages.activity_thread_summaries"),
+        });
+    res.json({
+      messages: pageMessages,
+      threadSummariesByParentMessageId,
+      hasMore: page.hasMore,
+      nextCursor: page.nextCursor,
+      historyLimited,
     });
   } catch {
     res.status(500).json({ error: "Failed to list messages" });
@@ -1263,149 +1384,83 @@ messageRouter.get("/forward/enabled", (_req, res) => {
   res.json({ enabled: true });
 });
 
-const MAX_FORWARD_SEARCH_LIMIT = 20;
+const MAX_FORWARD_CONVERSATIONS_LIMIT = 4;
+
+/**
+ * The picker's "Threads & tasks" group: up to 4 threads / task conversations
+ * the person takes part in (follows: replied, authored, assigned, followed),
+ * newest activity first, each visible and open to a forward now. A current
+ * thread / task conversation the person can post in comes first (`current`).
+ */
+messageRouter.get("/forward/targets/conversations", async (req, res) => {
+  try {
+    const limit = Math.min(
+      Math.max(1, parseInt(String(req.query.limit), 10) || MAX_FORWARD_CONVERSATIONS_LIMIT),
+      MAX_FORWARD_CONVERSATIONS_LIMIT,
+    );
+    const currentChannelId = typeof req.query.currentChannelId === "string" && UUID_RE.test(req.query.currentChannelId.trim())
+      ? req.query.currentChannelId.trim()
+      : null;
+    const serverId = req.serverId!;
+    const userId = req.userId!;
+    // Parents behind the plan's history window show only their glimpse (forwardParentContent).
+    const historyCutoff = (await getRequestHistoryWindow(req, serverId)).cutoff;
+    const current = currentChannelId
+      ? (await admitForwardConversationTargets({
+          serverId,
+          userId,
+          candidates: await listCurrentForwardConversationCandidate(currentChannelId, serverId, historyCutoff),
+          limit: 1,
+        })).map((target): ForwardConversationTarget => ({ ...target, current: true }))
+      : [];
+    const recent = await admitForwardConversationTargets({
+      serverId,
+      userId,
+      candidates: await listForwardConversationCandidates({ serverId, userId, excludeChannelId: current[0]?.channelId ?? null, historyCutoff }),
+      limit: limit - current.length,
+    });
+    res.json({ targets: [...current, ...recent] });
+  } catch (err) {
+    sendJsonServerError(req, res, {
+      error: "Failed to list forward conversations",
+      logPrefix: "Forward conversation targets failed:",
+      err,
+    });
+  }
+});
+
+/** The current conversation as a candidate, when it is a live thread / task conversation of this server. */
+async function listCurrentForwardConversationCandidate(channelId: string, serverId: string, historyCutoff: Date | undefined): Promise<ForwardConversationCandidate[]> {
+  const channel = await channelService.getChannel(channelId);
+  if (!channel || channel.serverId !== serverId || !isSubConversationType(channel.type)) return [];
+  if (channel.type === "task") {
+    const jointThread = await channelService.getJointThreadProjectionByLocalThread(channel.id, serverId);
+    const task = await getTaskForConversationChannel(jointThread?.canonicalThreadChannelId ?? channel.id);
+    if (!task) return [];
+    return [{ channelId, type: "task", parentMessageContent: null, taskNumber: task.taskNumber, taskTitle: task.taskTitle }];
+  }
+  const jointThread = await channelService.getJointThreadProjectionByLocalThread(channel.id, serverId);
+  const storage = jointThread ? await channelService.getChannel(jointThread.canonicalThreadChannelId) : channel;
+  const parentMessage = storage?.parentMessageId ? await messageService.getMessage(storage.parentMessageId) : null;
+  if (!parentMessage || parentMessage.deletedAt) return [];
+  return [{
+    channelId,
+    type: "thread",
+    parentMessageContent: forwardParentContent(parentMessage.content, parentMessage.createdAt, historyCutoff),
+    taskNumber: null,
+    taskTitle: null,
+  }];
+}
 
 messageRouter.get("/forward/targets/search", async (req, res) => {
   try {
-    const q = typeof req.query.q === "string" ? req.query.q.trim().toLowerCase() : "";
-    const limit = Math.min(
-      Math.max(1, parseInt(String(req.query.limit), 10) || MAX_FORWARD_SEARCH_LIMIT),
-      MAX_FORWARD_SEARCH_LIMIT,
-    );
-    const serverId = req.serverId!;
-    const userId = req.userId!;
-    const requesterRole = await getActorServerRoleInServer(serverId, "user", userId);
-
-    if (!q) {
-      res.json({ targets: [] });
-      return;
-    }
-
-    const [allChannels, dmChannels, allAgents, hideHumanDirectory] = await Promise.all([
-      channelService.listChannels(serverId, userId),
-      channelService.listDMChannels(serverId, userId),
-      requesterRole === "guest" ? Promise.resolve([]) : agentService.listAgents(serverId, false),
-      serverService.shouldHideHumanDirectoryFromRequester(serverId, userId),
-    ]);
-    const members = hideHumanDirectory || requesterRole === "guest"
-      ? []
-      : await serverService.getServerMembers(serverId, userId);
-
-    type ScoredTarget = {
-      type: "channel" | "dm" | "human" | "agent";
-      channelType: "channel" | "private" | "joint" | "dm" | null;
-      id: string;
-      title: string;
-      subtitle: string;
-      avatarUrl: string | null;
-      channelId: string | null;
-      joined: boolean | null;
-      dmExists: boolean | null;
-      canForwardNow: boolean;
-      requiredAction: "join_channel" | "create_dm" | null;
-      score: number;
-    };
-
-    const results: ScoredTarget[] = [];
-
-    for (const ch of allChannels) {
-      if ((ch.type !== "channel" && ch.type !== "private" && ch.type !== "joint") || ch.archivedAt) continue;
-      const name = ch.name.toLowerCase();
-      const score = scoreMatch(q, name);
-      if (score <= 0) continue;
-      const isJoined = (ch as { joined?: boolean }).joined === true;
-      if (requesterRole === "guest" && !(await channelService.canUserPostToChannel(ch.id, userId))) continue;
-      if (ch.type !== "channel") {
-        if (!isJoined || !(await channelService.canUserPostToChannel(ch.id, userId))) continue;
-        if (
-          await isChannelReadOnlyByBillingFeature(ch.id, serverId)
-          || await isChannelReadOnlyByQuota(ch.id, serverId)
-        ) continue;
-      }
-      results.push({
-        type: "channel",
-        channelType: ch.type,
-        id: ch.id,
-        title: `#${ch.name}`,
-        subtitle: ch.description ?? "",
-        avatarUrl: null,
-        channelId: ch.id,
-        joined: isJoined,
-        dmExists: null,
-        canForwardNow: ch.type !== "channel" || isJoined,
-        requiredAction: ch.type === "channel" && !isJoined ? "join_channel" : null,
-        score: score + (isJoined ? 50 : 0),
-      });
-    }
-
-    for (const dm of dmChannels) {
-      const label = dm.peerDisplayName || dm.peerName || dm.name;
-      const searchable = [label, dm.peerName, dm.peerDisplayName].filter(Boolean).map((s) => s!.toLowerCase());
-      const score = Math.max(...searchable.map((s) => scoreMatch(q, s)));
-      if (score <= 0) continue;
-      results.push({
-        type: "dm",
-        channelType: "dm",
-        id: dm.peerId,
-        title: `@${label}`,
-        subtitle: dm.peerType === "agent" ? "agent" : "",
-        avatarUrl: dm.peerAvatarUrl ?? null,
-        channelId: dm.id,
-        joined: null,
-        dmExists: true,
-        canForwardNow: true,
-        requiredAction: null,
-        score: score + 50,
-      });
-    }
-
-    const existingDmPeerIds = new Set(dmChannels.map((dm) => dm.peerId));
-    for (const agent of allAgents) {
-      if (existingDmPeerIds.has(agent.id)) continue;
-      const searchable = [agent.name, agent.displayName].filter(Boolean).map((s) => s!.toLowerCase());
-      const score = Math.max(0, ...searchable.map((s) => scoreMatch(q, s)));
-      if (score <= 0) continue;
-      results.push({
-        type: "agent",
-        channelType: null,
-        id: agent.id,
-        title: `@${agent.displayName || agent.name}`,
-        subtitle: "agent",
-        avatarUrl: agent.avatarUrl ?? null,
-        channelId: null,
-        joined: null,
-        dmExists: false,
-        canForwardNow: false,
-        requiredAction: "create_dm",
-        score,
-      });
-    }
-
-    for (const member of members) {
-      if (member.userId === userId) continue;
-      if (existingDmPeerIds.has(member.userId)) continue;
-      const searchable = [member.name, member.displayName].filter(Boolean).map((s) => s!.toLowerCase());
-      const score = Math.max(0, ...searchable.map((s) => scoreMatch(q, s)));
-      if (score <= 0) continue;
-      results.push({
-        type: "human",
-        channelType: null,
-        id: member.userId,
-        title: `@${member.displayName || member.name}`,
-        subtitle: "",
-        avatarUrl: member.avatarUrl ?? null,
-        channelId: null,
-        joined: null,
-        dmExists: false,
-        canForwardNow: false,
-        requiredAction: "create_dm",
-        score,
-      });
-    }
-
-    results.sort((a, b) => b.score - a.score || a.title.localeCompare(b.title));
-    const targets = results.slice(0, limit).map(({ score: _score, ...rest }) => rest);
-    res.json({ targets });
+    const { targets, conversations } = await searchForwardTargets({
+      serverId: req.serverId!,
+      userId: req.userId!,
+      q: typeof req.query.q === "string" ? req.query.q : "",
+      limit: parseInt(String(req.query.limit), 10),
+    });
+    res.json({ targets: [...targets.map(({ handle: _handle, peerKind: _peerKind, ...target }) => target), ...conversations] });
   } catch (err) {
     sendJsonServerError(req, res, {
       error: "Failed to search forward targets",
@@ -1415,18 +1470,8 @@ messageRouter.get("/forward/targets/search", async (req, res) => {
   }
 });
 
-function scoreMatch(query: string, candidate: string): number {
-  if (!candidate) return 0;
-  if (candidate === query) return 400;
-  if (candidate.startsWith(query)) return 300;
-  const wordBoundaryIndex = candidate.indexOf(` ${query}`);
-  if (wordBoundaryIndex >= 0) return 250;
-  const containsIndex = candidate.indexOf(query);
-  if (containsIndex >= 0) return Math.max(1, 150 - containsIndex);
-  return 0;
-}
-
 function boundedForwardError(error: unknown): { stableCode: string; errorClass: string; status: number } {
+  if (error instanceof DmPeerNotMemberError || error instanceof JointChannelAccessChangedError) return { stableCode: error.code, errorClass: error.name, status: error.status };
   if (error instanceof ForwardRequestError) {
     return { stableCode: error.diagnosticCode, errorClass: "ForwardRequestError", status: error.status };
   }
@@ -1471,6 +1516,11 @@ messageRouter.post("/forward", async (req, res) => {
       : parsedDestinationChannelIds;
     const parsedRandomId = parseRandomId(req.body?.randomId);
 
+    if (isOverForwardMessageCap(req.body?.sourceMessageIds)) {
+      recordForwardTerminal(req, { phase, outcome: "rejected", status: 400, stableCode: FORWARD_TOO_MANY_MESSAGES_CODE, errorClass: "ValidationError" });
+      res.status(400).json({ error: FORWARD_TOO_MANY_MESSAGES_ERROR, code: FORWARD_TOO_MANY_MESSAGES_CODE });
+      return;
+    }
     if (
       destinationChannelIds.length === 0
       || sourceMessageIds === "invalid"
@@ -1489,6 +1539,7 @@ messageRouter.post("/forward", async (req, res) => {
       return;
     }
 
+    noteForwardTargets(req, { destinationChannelIds, sourceMessageIds });
     const userId = req.userId!;
     phase = "source_snapshot";
     await failpoints.hit("server.message.forward.beforeSourceSnapshot");
@@ -1502,72 +1553,27 @@ messageRouter.post("/forward", async (req, res) => {
     const senderName = user?.displayName || user?.name || "User";
     const io = req.app.get("io");
     const agentOrchestrator = req.app.get("agentOrchestrator") as AgentOrchestrator;
-    const content = note || `Forwarded ${baseActionMetadata.forwardedItems.length} message${baseActionMetadata.forwardedItems.length === 1 ? "" : "s"}`;
+    const content = forwardMessageContent(note, baseActionMetadata.forwardedItems.length);
 
     const forwardToDestination = async (targetChannelId: string) => {
       let destinationPhase: ForwardDiagnosticPhase = "resolve_authorize";
       try {
-        const destination = await channelService.getChannel(targetChannelId);
-        if (!destination || destination.serverId !== req.serverId) {
-          throw new ForwardRequestError(404, "Channel not found", "destination_unavailable", "destination_not_found");
-        }
-        if (!(await channelService.canUserPostToChannel(targetChannelId, userId))) {
-          throw new ForwardRequestError(403, "You must join this channel to send messages", "destination_unavailable", "destination_membership_required");
-        }
-        if (await isChannelReadOnlyByBillingFeature(targetChannelId, req.serverId!)) {
-          throw new ForwardRequestError(403, "This joint channel is read-only because it has more than 2 free servers. It becomes writable again when a server upgrades or a free server leaves.", "destination_unavailable", "destination_billing_read_only");
-        }
-        if (await isChannelReadOnlyByQuota(targetChannelId, req.serverId!)) {
-          throw new ForwardRequestError(403, "This channel is read-only on your current plan. Upgrade to continue.", "destination_unavailable", "destination_quota_read_only");
-        }
-
-        const requestDigest = requestId
-          ? forwardRequestDigest({
-              serverId: req.serverId!,
-              userId,
-              sourceMessageIds,
-              destinationChannelId: targetChannelId,
-              note,
-            })
-          : null;
-        const actionMetadata = {
-          ...baseActionMetadata,
-          destinationTargetId: targetChannelId,
-          ...(requestDigest ? { _forwardRequestDigest: requestDigest } : {}),
-        };
-        const jointProjections = destination.type === "joint"
-          ? await channelService.getActiveJointChannelProjectionsByLocalChannel(targetChannelId)
-          : [];
-        const destinationJointProjection = jointProjections.find((projection) => projection.localChannelId === targetChannelId);
-        const destinationStorageChannelId = destinationJointProjection?.canonicalChannelId ?? targetChannelId;
-        destinationPhase = "persist_broadcast";
-        const persisted = await persistForwardBundle({
-          destinationStorageChannelId,
-          destinationRequestChannelId: targetChannelId,
-          senderId: userId,
-          content,
-          randomId: requestId
-            ? `forward:${requestId}:${targetChannelId}`
-            : parsedRandomId ?? `forward-${randomUUID()}`,
-          sourceMessageIds,
-          requestServerId: req.serverId!,
-          metadata: actionMetadata as InternalForwardBundleMetadata,
-        });
-        // slack-bridge-ordinary-message-producer: messages.forward_bundle
-        const enriched = await messageService.broadcastAndDeliver(io, agentOrchestrator, {
-          channelId: targetChannelId,
-          senderType: "user",
-          senderId: userId,
+        return await forwardBundleAsUser({
+          io,
+          orchestrator: agentOrchestrator,
+          serverId: req.serverId!,
+          userId,
           senderName,
+          targetChannelId,
           content,
-          randomId: persisted.message.randomId ?? undefined,
-          actionMetadata: persisted.message.actionMetadata,
-          prePersisted: persisted,
+          note,
+          sourceMessageIds,
+          bundleMetadata: baseActionMetadata,
+          requestId,
+          randomId: parsedRandomId,
+          onPaywallHit: (kind) => notePaywallHit(req, kind),
+          onPhase: (next) => { destinationPhase = next; },
         });
-        return {
-          message: messageService.projectForwardDestinationMessage(enriched),
-          replayed: persisted.replayed,
-        };
       } catch (error) {
         if ((typeof error === "object" && error !== null) || typeof error === "function") {
           errorPhases.set(error as object, destinationPhase);
@@ -1605,11 +1611,19 @@ messageRouter.post("/forward", async (req, res) => {
           ...await forwardToDestination(targetChannelId),
         };
       } catch (err) {
+        if (err instanceof DmPeerNotMemberError || err instanceof JointChannelAccessChangedError) {
+          return { destinationChannelId: targetChannelId, status: "failed" as const, code: err.code, error: err.message };
+        }
         if (err instanceof ChannelConversionInProgressError) {
-          addTraceEvent("messages.forward.destination.failed", {
-            destinationChannelId: targetChannelId,
-            code: err.code,
-            error: err.message,
+          // Bounded fields only: the destination as its keyed hash, never the raw id or error text.
+          safeAddTraceEvent("messages.forward.destination.failed", () => {
+            const conversationIdHash = traceIdentityHash("conversation_id_hash", targetChannelId);
+            return {
+              route_family: "message_forward",
+              phase: errorPhases.get(err) ?? "persist_broadcast",
+              code: err.code,
+              ...(conversationIdHash ? { conversation_id_hash: conversationIdHash } : {}),
+            };
           });
           return {
             destinationChannelId: targetChannelId,
@@ -1697,6 +1711,10 @@ messageRouter.post("/forward", async (req, res) => {
       stableCode: detail.stableCode,
       errorClass: detail.errorClass,
     });
+    if (err instanceof DmPeerNotMemberError || err instanceof JointChannelAccessChangedError) {
+      res.status(err.status).json({ error: err.message, code: err.code });
+      return;
+    }
     if (err instanceof ChannelConversionInProgressError) {
       res.status(err.status).json({ error: err.message, code: err.code, conversionEpoch: err.conversionEpoch });
       return;
@@ -1765,17 +1783,21 @@ async function createHumanMessage(
     }
 
     const userId = req.userId!;
-    const channel = await channelService.getChannel(channelId);
-    if (!channel || channel.serverId !== req.serverId) {
-      res.status(404).json({ error: "Channel not found" });
+    const admission = await checkHumanPostAdmission(req.serverId!, userId, channelId);
+    if (!admission.ok) {
+      if (admission.refusal === "billing_read_only") {
+        if (admission.billing.reason === "joint_over_limit") notePaywallHit(req, "joint_channel_read_only");
+        res.status(403).json(channelBillingReadOnlyBody(admission.billing));
+        return;
+      }
+      const refusal = HUMAN_POST_REFUSALS[admission.refusal];
+      res.status(refusal.status).json({ error: refusal.error, ...(admission.refusal === "joint_task_read_only" ? { code: "joint_task_read_only" } : {}) });
       return;
     }
-
-    // Verify user can post to this channel (must be a member)
-    const canPost = await channelService.canUserPostToChannel(channelId, userId);
-    if (!canPost) {
-      res.status(403).json({ error: "You must join this channel to send messages" });
-      return;
+    const { channel } = admission;
+    // Agent Lounge: posting is joining (announced as POST /channels/:id/join does).
+    if (channel.type === "channel" && await channelService.ensureLoungeHumanMember(channelId, userId)) {
+      req.app.get("io")?.to(`server:${req.serverId}`).emit("channel:members-updated", { channelId });
     }
 
     // Fast typed rejection for an already-fenced source. The persistence
@@ -1784,16 +1806,6 @@ async function createHumanMessage(
     const conversionTarget = await resolveChannelConversionLockTarget(getDb(), channelId);
     if (conversionTarget) {
       await assertChannelConversionWritable(conversionTarget.sourceChannelId);
-    }
-
-    // Check if channel is read-only due to quota (excess channels on free plan)
-    if (await isChannelReadOnlyByBillingFeature(channelId, req.serverId!)) {
-      res.status(403).json({ error: "This joint channel is read-only because it has more than 2 free servers. It becomes writable again when a server upgrades or a free server leaves." });
-      return;
-    }
-    if (await isChannelReadOnlyByQuota(channelId, req.serverId!)) {
-      res.status(403).json({ error: "This channel is read-only on your current plan. Upgrade to continue." });
-      return;
     }
 
     // Get sender name from user record
@@ -1845,6 +1857,10 @@ async function createHumanMessage(
 
     res.json(enriched);
   } catch (err) {
+    if (err instanceof DmPeerNotMemberError || err instanceof JointChannelAccessChangedError) {
+      res.status(err.status).json({ error: err.message, code: err.code });
+      return;
+    }
     if (err instanceof ChannelConversionInProgressError) {
       res.status(err.status).json({ error: err.message, code: err.code, conversionEpoch: err.conversionEpoch });
       return;
@@ -2093,8 +2109,10 @@ messageRouter.post("/:messageId/reactions", async (req, res) => {
 
     await channelService.assertChannelNotArchived(localChannelId);
 
-    if (await isChannelReadOnlyByBillingFeature(localChannelId, req.serverId!)) {
-      res.status(403).json({ error: "This joint channel is read-only because it has more than 2 free servers. It becomes writable again when a server upgrades or a free server leaves." });
+    const billingReadOnly = await getChannelBillingReadOnly(localChannelId, req.serverId!);
+    if (billingReadOnly) {
+      if (billingReadOnly.reason === "joint_over_limit") notePaywallHit(req, "joint_channel_read_only");
+      res.status(403).json(channelBillingReadOnlyBody(billingReadOnly));
       return;
     }
     if (await isChannelReadOnlyByQuota(localChannelId, req.serverId!)) {
@@ -2108,12 +2126,14 @@ messageRouter.post("/:messageId/reactions", async (req, res) => {
       emoji,
       actor: { kind: "user", id: req.userId! },
       operation: "add",
+      noticeDeliverer: req.app.get("agentOrchestrator") as AgentOrchestrator | undefined,
+      message,
     });
 
     const context = await messageService.getMessageContext(message.id, 0, 0, undefined, {
       attachmentCommentViewerUserId: req.userId,
       forwardedBundleViewerUserId: req.userId,
-      forwardedBundleViewerServerId: req.serverId,
+      viewerServerId: req.serverId,
     });
     const enriched = context?.messages[0];
     if (!enriched) {
@@ -2170,8 +2190,10 @@ messageRouter.delete("/:messageId/reactions", async (req, res) => {
 
     await channelService.assertChannelNotArchived(localChannelId);
 
-    if (await isChannelReadOnlyByBillingFeature(localChannelId, req.serverId!)) {
-      res.status(403).json({ error: "This joint channel is read-only because it has more than 2 free servers. It becomes writable again when a server upgrades or a free server leaves." });
+    const billingReadOnly = await getChannelBillingReadOnly(localChannelId, req.serverId!);
+    if (billingReadOnly) {
+      if (billingReadOnly.reason === "joint_over_limit") notePaywallHit(req, "joint_channel_read_only");
+      res.status(403).json(channelBillingReadOnlyBody(billingReadOnly));
       return;
     }
     if (await isChannelReadOnlyByQuota(localChannelId, req.serverId!)) {
@@ -2185,12 +2207,14 @@ messageRouter.delete("/:messageId/reactions", async (req, res) => {
       emoji,
       actor: { kind: "user", id: req.userId! },
       operation: "remove",
+      noticeDeliverer: req.app.get("agentOrchestrator") as AgentOrchestrator | undefined,
+      message,
     });
 
     const context = await messageService.getMessageContext(message.id, 0, 0, undefined, {
       attachmentCommentViewerUserId: req.userId,
       forwardedBundleViewerUserId: req.userId,
-      forwardedBundleViewerServerId: req.serverId,
+      viewerServerId: req.serverId,
     });
     const enriched = context?.messages[0];
     if (!enriched) {
@@ -2223,12 +2247,32 @@ messageRouter.delete("/:messageId/reactions", async (req, res) => {
   }
 });
 
-// Sync messages (gap sync after reconnection)
+// Sync messages (gap sync after reconnection).
+//
+// Body: a bare Message[] (unchanged). Response header X-Sync-Horizon: the
+// read's sync horizon (decimal xid8, see services/syncHorizon.ts).
+// Paging rule: send `since_horizon` only on a round's FIRST page; the next
+// round's since_horizon is the X-Sync-Horizon of this round's first page; later
+// pages of a round omit it. With since_horizon the page holds only rows whose
+// transaction finished, plus the "late" rows (seq <= since_seq that finished
+// after that horizon). If more than SYNC_LATE_CAP late rows qualify, none are
+// returned and X-Sync-Horizon-Reset: 1 is set: the client refetches its
+// visible scope instead of paging the late rows. Late rows have
+// seq <= since_seq: the client's cursor is max(since_seq, max seq of the body),
+// and "has more" counts only rows with seq > since_seq. Without since_horizon
+// the rows are exactly what they were before the horizon existed.
 messageRouter.get("/sync", async (req, res) => {
   try {
     const sinceSeq = Number(req.query.since_seq) || 0;
     const channelId = req.query.channel_id as string | undefined;
     const limit = Math.min(Number(req.query.limit) || 200, 500);
+    const rawSinceHorizon = req.query.since_horizon;
+    const sinceHorizon = rawSinceHorizon === undefined ? null : parseSyncHorizon(rawSinceHorizon);
+    if (rawSinceHorizon !== undefined && !sinceHorizon) {
+      addTraceEvent("messages.sync.rejected", { reason: "since_horizon_invalid" });
+      res.status(400).json({ error: "since_horizon must be the decimal string of a non-negative 64-bit transaction id", code: "invalid_since_horizon" });
+      return;
+    }
     let jointResolved: channelService.ChannelAccessResolution | null = null;
 
     if (channelId) {
@@ -2252,9 +2296,23 @@ messageRouter.get("/sync", async (req, res) => {
     const plan = await getServerPlan(req.serverId!);
     const historyCutoff = getHistoryCutoff(plan);
 
+    const sendSync = (result: Awaited<ReturnType<typeof messageService.syncMessagesWithHorizon>>, body: unknown[]) => {
+      addTraceEvent("messages.sync.read", {
+        horizon_requested: Boolean(sinceHorizon),
+        late_count: result.lateCount,
+        horizon_reset: result.horizonReset,
+        ...(result.snapshotXidSpan === null ? {} : { snapshot_xid_span: result.snapshotXidSpan }),
+        messages_count: body.length,
+        channel_scoped: Boolean(channelId),
+      });
+      res.setHeader(SYNC_HORIZON_HEADER, result.horizon);
+      if (result.horizonReset) res.setHeader(SYNC_HORIZON_RESET_HEADER, "1");
+      res.json(body);
+    };
+
     // Always scope to current server
     if (jointResolved?.kind === "joint") {
-      const msgs = await messageService.syncMessages(
+      const result = await messageService.syncMessagesWithHorizon(
         sinceSeq,
         jointResolved.canonicalChannelId,
         limit,
@@ -2262,13 +2320,14 @@ messageRouter.get("/sync", async (req, res) => {
         historyCutoff,
         req.userId!,
         req.serverId!,
+        { sinceHorizon },
       );
-      res.json(await messageService.projectJointMessagesToLocalChannel(msgs, jointResolved.localChannelId, req.serverId!));
+      sendSync(result, await messageService.projectJointMessagesToLocalChannel(result.messages, jointResolved.localChannelId, req.serverId!));
       return;
     }
 
-    const msgs = await messageService.syncMessages(sinceSeq, channelId, limit, req.serverId!, historyCutoff, req.userId!, req.serverId!);
-    res.json(msgs);
+    const result = await messageService.syncMessagesWithHorizon(sinceSeq, channelId, limit, req.serverId!, historyCutoff, req.userId!, req.serverId!, { sinceHorizon });
+    sendSync(result, result.messages);
   } catch {
     res.status(500).json({ error: "Failed to sync messages" });
   }

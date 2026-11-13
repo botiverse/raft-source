@@ -1,0 +1,178 @@
+{
+  "purpose": "Official provider artwork used to identify MCP integrations. Trademarks belong to their respective owners.",
+  "assets": [
+    {
+      "key": "notion",
+      "file": "notion.svg",
+      "sourcePage": "https://www.notion.com",
+      "sourceUrl": "https://www.notion.com",
+      "sha256": "a5018b6085f44d22615faadd9bc955e25eeaec278785023af46250d74d4fc24c",
+      "retrievedAt": "2026-10-26",
+      "modifications": "First inline SVG (HWB10a_logoStickerized) from official homepage. Only CSS-dependent ink fill resolved to black for standalone rendering; paths, white sticker, proportions unchanged."
+    },
+    {
+      "key": "linear",
+      "file": "linear.svg",
+      "sourcePage": "https://linear.app/brand",
+      "sourceUrl": "https://linear.app/static/favicon.svg?v=2",
+      "sha256": "6d49f8079f8cf91617657bd059ba1e186f2d3ecdcd9a4a366e0a6d5071c558e6",
+      "retrievedAt": "2026-10-26",
+      "modifications": "None; original downloaded file bytes."
+    },
+    {
+      "key": "atlassian",
+      "file": "atlassian.svg",
+      "sourcePage": "https://atlassian.design/foundations/logos",
+      "sourceUrl": "https://atlassian.design/assets/ea513a1d5d9c/logos/atlassian_logo.zip",
+      "sha256": "4bde9a5f2253655b939847e8df0434bb718bd979922e2f13008a4ffe750c361d",
+      "retrievedAt": "2026-10-26",
+      "modifications": "None; original downloaded file bytes.",
+      "archiveMember": "Atlassian/Atlassian Mark/SVG/Atlassian mark brand RGB.svg"
+    },
+    {
+      "key": "figma",
+      "file": "figma.svg",
+      "sourcePage": "https://www.figma.com",
+      "sourceUrl": "https://static.figma.com/app/icon/2/favicon.svg",
+      "sha256": "e6227b7dbc49c86da6f4ccfa02ba439428106b0ca627a0a33ea6ad1e09f335b3",
+      "retrievedAt": "2026-10-26",
+      "modifications": "None; original downloaded file bytes."
+    },
+    {
+      "key": "gmail",
+      "file": "gmail.png",
+      "sourcePage": "https://workspace.google.com/",
+      "sourceUrl": "https://www.gstatic.com/images/branding/product/2x/gmail_2020q4_96dp.png",
+      "sha256": "d49100a00e2caa1626f9f3339879e047327f28c0c3a2a18c767c1a5682863981",
+      "retrievedAt": "2026-10-26",
+      "modifications": "None; original downloaded file bytes."
+    },
+    {
+      "key": "drive",
+      "file": "drive.png",
+      "sourcePage": "https://workspace.google.com/",
+      "sourceUrl": "https://www.gstatic.com/images/branding/product/2x/drive_2020q4_96dp.png",
+      "sha256": "d53d5d1b60242b61f058b37ee0c3395bf3f1d620047c1df7958bcdf43182f404",
+      "retrievedAt": "2026-10-26",
+      "modifications": "None; original downloaded file bytes."
+    },
+    {
+      "key": "calendar",
+      "file": "calendar.png",
+      "sourcePage": "https://workspace.google.com/",
+      "sourceUrl": "https://www.gstatic.com/images/branding/product/2x/calendar_2020q4_96dp.png",
+      "sha256": "76a70f2332cb47edf75087d3b2bc3c2192a4d0ef8caf06661aed9824bfcaab80",
+      "retrievedAt": "2026-10-26",
+      "modifications": "None; original downloaded file bytes."
+    },
+    {
+      "key": "sentry",
+      "file": "sentry.ico",
+      "sourcePage": "https://sentry.io",
+      "sourceUrl": "https://sentry.io/favicon.ico",
+      "sha256": "49a1d2db07116397feff5454872ecec134df7cad81aa366c0ced3a2940f13355",
+      "retrievedAt": "2026-10-26",
+      "modifications": "None; original downloaded file bytes."
+    },
+    {
+      "key": "airtable",
+      "file": "airtable.ico",
+      "sourcePage": "https://www.airtable.com",
+      "sourceUrl": "https://www.airtable.com/favicon.ico",
+      "sha256": "8020f46841434ab3782fa38d6b8d6c47b3ea69fc025ba8f8d3608e87c36c9aa3",
+      "retrievedAt": "2026-10-26",
+      "modifications": "None; original downloaded file bytes."
+    },
+    {
+      "key": "monday",
+      "file": "monday.png",
+      "sourcePage": "https://monday.com",
+      "sourceUrl": "https://cdn.prod.website-files.com/656da6fea306219773d04208/65af6bd6e742d497b5f23f69_645898132bbaac20f1963919_256x256.png",
+      "sha256": "03c5839ffc8eaec1759f3ce99e329d1cb52e8de5e9cff1e0f0e779fe604c6c08",
+      "retrievedAt": "2026-10-26",
+      "modifications": "None; original downloaded file bytes."
+    },
+    {
+      "key": "asana",
+      "file": "asana.ico",
+      "sourcePage": "https://asana.com",
+      "sourceUrl": "https://asana.com/assets/img/brand/asana-logo-favicon.ico",
+      "sha256": "a42ae227f92cc034bed8015af2bb5664327c3ef4c207e3dc6cd06e8642845e77",
+      "retrievedAt": "2026-10-26",
+      "modifications": "None; original downloaded file bytes."
+    },
+    {
+      "key": "hubspot",
+      "file": "hubspot.png",
+      "sourcePage": "https://www.hubspot.com",
+      "sourceUrl": "https://www.hubspot.com/hubfs/HubSpot_Logos/HubSpot-Inversed-Favicon.png",
+      "sha256": "81ba53ce8917d2e443e5f4b17bbb8239ee7d73e8212008c4299525a0b80caf1a",
+      "retrievedAt": "2026-10-26",
+      "modifications": "None; original downloaded file bytes."
+    },
+    {
+      "key": "stripe",
+      "file": "stripe.svg",
+      "sourcePage": "https://stripe.com",
+      "sourceUrl": "https://images.stripeassets.com/fzn2n1nzq965/1hgcBNd12BfT9VLgbId7By/01d91920114b124fb4cf6d448f9f06eb/favicon.svg",
+      "sha256": "7253e3eb4657773723a696a1f4ad9c8f62794191b9f09c1359db74a51d2d3ae5",
+      "retrievedAt": "2026-10-26",
+      "modifications": "None; original downloaded file bytes."
+    },
+    {
+      "key": "supabase",
+      "file": "supabase.png",
+      "sourcePage": "https://supabase.com",
+      "sourceUrl": "https://supabase.com/favicon/apple-icon-180x180.png",
+      "sha256": "c5419949ba350d2dbf0d5df566cf330fe416727e475e3326ae85f8da5e8c0dee",
+      "retrievedAt": "2026-10-26",
+      "modifications": "None; original downloaded file bytes."
+    },
+    {
+      "key": "sheets",
+      "file": "sheets.png",
+      "sourcePage": "https://workspace.google.com/",
+      "sourceUrl": "https://www.gstatic.com/images/branding/product/2x/sheets_2020q4_96dp.png",
+      "sha256": "2047adc537a69c2278cafa728e9c3a5d06fba21ec968e0164efd8206c0c2abb0",
+      "retrievedAt": "2026-10-26",
+      "modifications": "None; original downloaded file bytes."
+    },
+    {
+      "key": "docs",
+      "file": "docs.png",
+      "sourcePage": "https://workspace.google.com/",
+      "sourceUrl": "https://www.gstatic.com/images/branding/product/2x/docs_2020q4_96dp.png",
+      "sha256": "da3b15086d4450956ba8940752e0d6484536bddc3db1e7dcd2a043a1e949ed48",
+      "retrievedAt": "2026-10-26",
+      "modifications": "None; original downloaded file bytes."
+    },
+    {
+      "key": "slides",
+      "file": "slides.png",
+      "sourcePage": "https://workspace.google.com/",
+      "sourceUrl": "https://www.gstatic.com/images/branding/product/2x/slides_2020q4_96dp.png",
+      "sha256": "567af867c86432ae76c57bb138c7f678f7eb9e81297a014d92c6e2efe1a84e16",
+      "retrievedAt": "2026-10-26",
+      "modifications": "None; original downloaded file bytes."
+    },
+    {
+      "key": "workiq",
+      "file": "workiq.png",
+      "sourcePage": "https://learn.microsoft.com/en-us/microsoft-iq/",
+      "sourceUrl": "https://learn.microsoft.com/en-us/microsoft-iq/media/index/work-iq.png",
+      "sha256": "dce90052d11789d4890c9a5ef6df5fc41084a408d0df195c9ba16ab764562967",
+      "retrievedAt": "2026-10-26",
+      "modifications": "None; original downloaded file bytes."
+    },
+    {
+      "key": "canva",
+      "file": "canva.svg",
+      "sourcePage": "https://www.canva.dev/docs/apps/rest-apis/brand-guidelines/",
+      "sourceUrl": "https://www.canva.dev/assets/connect/Canva-logos.zip",
+      "sha256": "fbbd91cfb0dcc0f9e9eeabc7ea5a6393974167bb06902c27df0b5b50c1fe798f",
+      "retrievedAt": "2026-10-26",
+      "modifications": "None; original downloaded file bytes.",
+      "archiveMember": "Canva logos/svg/Canva Icon logo.svg"
+    }
+  ]
+}

@@ -34,6 +34,19 @@ export const SLOCKDEV_PASSWORD = "password123";
 
 export type AuthView = "login" | "register" | "forgot-password";
 
+/** The address the website's "Get started" links to: a signed-out visitor lands on Create Account, not Sign In. */
+export const SIGNUP_PATH = "/signup";
+
+/** Opens "Forgot password" directly: the server's two-step lock email links here (emailService forgotPasswordUrl). */
+export const FORGOT_PASSWORD_PATH = "/forgot-password";
+
+export function initialAuthView(pathname: string): AuthView {
+  const path = pathname.replace(/\/+$/, "");
+  if (path === SIGNUP_PATH) return "register";
+  if (path === FORGOT_PASSWORD_PATH) return "forgot-password";
+  return "login";
+}
+
 export function isSlockdevEnvironment(deploymentEnv: string | undefined | null): boolean {
   return deploymentEnv === "slockdev";
 }

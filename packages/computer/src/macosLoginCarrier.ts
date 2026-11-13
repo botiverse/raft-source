@@ -1,6 +1,5 @@
 import { createHash } from "node:crypto";
-import { constants as fsConstants, realpathSync } from "node:fs";
-import { access, readFile, rm, stat } from "node:fs/promises";
+import { readFile, rm, stat } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
@@ -11,8 +10,11 @@ import { ComputerServiceError } from "./services/errors";
 /*
  * macOS host lifecycle: who brings Computer back after login.
  *
- * - Raft Desktop owns it through Electron's "Launch at login" item
- *   (`convergeAppHostLifecycle`).
+ * - Nothing installs a login item for Computer. Raft Desktop starts the
+ *   official install when it opens (its own login item); it records nothing
+ *   here. An `owner: "app"` record is left by an older Raft Desktop that ran
+ *   an embedded Computer; that Desktop removes it when it moves the machine to
+ *   the official install.
  * - The CLI does NOT autostart at login. Earlier releases installed a CLI
  *   LaunchAgent (`build.raft.computer.login.<hash>`) whose plist baked in a
  *   binary path and proxy environment; keeping it correct across upgrades and
@@ -20,21 +22,19 @@ import { ComputerServiceError } from "./services/errors";
  *   CLI-hosted Computer comes back on the next CLI/app start or wake, like a
  *   crash.
  *
- * Every CLI converge, and the Desktop paths, only delete a leftover CLI
+ * Every CLI converge only deletes a leftover CLI
  * LaunchAgent file for this home, best effort: none of this may affect start,
  * stop, upgrade, or Desktop's Launch at login. If it fails, it fails. They never call launchctl: on a machine
  * that booted through the old agent, the running service IS that launchd job,
  * and `launchctl bootout` would kill it. Deleting the file is enough: the job
  * had `RunAtLoad` and no `KeepAlive`, so nothing loads it again.
  *
- * The owner record (`computer/host-lifecycle-owner.json`) stays: Raft Desktop
- * reads it to decide whether it may manage this Computer.
+ * The owner record (`computer/host-lifecycle-owner.json`) records the CLI's
+ * enabled intent; an `owner: "app"` record tells Raft Desktop the machine
+ * still has to move from its old embedded Computer to the official install.
  */
 
 const HOST_LIFECYCLE_FORMAT_VERSION = 1 as const;
-
-export const RAFT_COMPUTER_DISPATCHER_PATH_ENV_VAR =
-  "RAFT_COMPUTER_DISPATCHER_PATH";
 
 export type HostLifecycleOwner = "app" | "cli";
 
@@ -51,21 +51,6 @@ export interface MacosHostLifecycleDeps {
   platform?: NodeJS.Platform;
   userHome?: string;
   signal?: AbortSignal;
-  /** @deprecated Ignored; nothing persists a dispatcher any more. Kept so
-   * Raft Desktop's existing calls still type-check. */
-  dispatcherPath?: string;
-  /** @deprecated Ignored; see `dispatcherPath`. */
-  proxyEnvSource?: "capture" | "persisted-read";
-}
-
-export interface AppHostLifecycleDeps extends MacosHostLifecycleDeps {
-  setOpenAtLogin: (enabled: boolean) => void | Promise<void>;
-  getOpenAtLogin: () => boolean | Promise<boolean>;
-}
-
-export interface HostLifecycleRemovalDeps extends MacosHostLifecycleDeps {
-  setOpenAtLogin?: (enabled: boolean) => void | Promise<void>;
-  getOpenAtLogin?: () => boolean | Promise<boolean>;
 }
 
 export interface HostLifecycleConvergenceResult {
@@ -75,137 +60,6 @@ export interface HostLifecycleConvergenceResult {
   label: string | null;
   definitionPath: string | null;
   definition: string | null;
-}
-
-export interface HostLifecycleRemovalResult {
-  status: "removed" | "not-applicable";
-  label: string | null;
-  definitionPath: string | null;
-}
-
-
-/**
- * Resolve the stable PATH dispatcher that survives K slot swaps (never a K slot
- * or temp path). Nothing in this package persists it any more; it stays
- * exported only because Raft Desktop's CLI hand-back still calls it.
- */
-function isWithinPath(candidate: string, root: string): boolean {
-  const relative = path.relative(root, candidate);
-  return (
-    relative === ""
-    || (!relative.startsWith(`..${path.sep}`) && relative !== "..")
-  );
-}
-
-function canonicalPathIfPresent(candidate: string): string {
-  const resolved = path.resolve(candidate);
-  try {
-    return realpathSync(resolved);
-  } catch {
-    return resolved;
-  }
-}
-
-function dispatcherPathInstability(
-  slockHome: string,
-  candidate: string,
-): "k-slot" | "temporary" | null {
-  const resolved = path.resolve(candidate);
-  const kRoot = path.resolve(slockHome, "computer", "k");
-  const canonicalCandidate = canonicalPathIfPresent(resolved);
-  const canonicalKRoot = canonicalPathIfPresent(kRoot);
-  if (
-    isWithinPath(resolved, kRoot)
-    || isWithinPath(canonicalCandidate, canonicalKRoot)
-  ) {
-    return "k-slot";
-  }
-
-  const lexicalTempRoot = path.resolve(os.tmpdir());
-  const canonicalTempRoot = canonicalPathIfPresent(lexicalTempRoot);
-  if (
-    isWithinPath(resolved, lexicalTempRoot)
-    || isWithinPath(canonicalCandidate, canonicalTempRoot)
-  ) {
-    return "temporary";
-  }
-  return null;
-}
-
-function assertStableDispatcherPath(
-  slockHome: string,
-  candidate: string,
-): string {
-  if (!path.isAbsolute(candidate)) {
-    throw new ComputerServiceError(
-      "HOST_LIFECYCLE_DISPATCHER_UNBOUND",
-      "Raft Computer received a non-absolute stable dispatcher path and refused to persist it.",
-    );
-  }
-  const resolved = path.resolve(candidate);
-  const instability = dispatcherPathInstability(slockHome, resolved);
-  if (instability === "temporary") {
-    throw new ComputerServiceError(
-      "HOST_LIFECYCLE_DISPATCHER_UNBOUND",
-      "Raft Computer received a temporary dispatcher path and refused to persist it. Reinstall the current Computer build, then retry.",
-    );
-  }
-  if (instability === "k-slot") {
-    throw new ComputerServiceError(
-      "HOST_LIFECYCLE_DISPATCHER_UNBOUND",
-      "Raft Computer is running from a K slot without stable dispatcher evidence. Reinstall the current Computer build, then run `raft-computer start` again.",
-    );
-  }
-  return resolved;
-}
-
-async function isExistingDispatcher(candidate: string): Promise<boolean> {
-  try {
-    const info = await stat(candidate);
-    if (!info.isFile()) return false;
-    await access(candidate, fsConstants.X_OK);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-export async function resolveStableDispatcherPath(
-  slockHome: string,
-  env: NodeJS.ProcessEnv = process.env,
-  currentBinary: string = process.execPath,
-): Promise<string> {
-  const explicit = env[RAFT_COMPUTER_DISPATCHER_PATH_ENV_VAR]?.trim();
-  if (explicit) {
-    return assertStableDispatcherPath(slockHome, explicit);
-  }
-  const resolvedCurrent = path.resolve(currentBinary);
-  try {
-    return assertStableDispatcherPath(slockHome, resolvedCurrent);
-  } catch (error) {
-    if (
-      (error as { code?: string }).code
-      !== "HOST_LIFECYCLE_DISPATCHER_UNBOUND"
-    ) {
-      throw error;
-    }
-    const marker = await readHostLifecycleMarker(slockHome);
-    const recorded = marker?.owner === "cli" ? marker.dispatcherPath?.trim() : null;
-    if (recorded) {
-      try {
-        const stableRecorded = assertStableDispatcherPath(slockHome, recorded);
-        if (await isExistingDispatcher(stableRecorded)) return stableRecorded;
-      } catch (recordedError) {
-        if (
-          (recordedError as { code?: string }).code
-          !== "HOST_LIFECYCLE_DISPATCHER_UNBOUND"
-        ) {
-          throw recordedError;
-        }
-      }
-    }
-    throw error;
-  }
 }
 
 function loginCarrierHash(slockHome: string): string {
@@ -396,87 +250,4 @@ export async function convergeCliHostLifecycle(
     definitionPath: null,
     definition: null,
   };
-}
-
-/** Raft Desktop takes the lifecycle: remove any leftover CLI LaunchAgent, set
- * and read back the app's "Launch at login", record the App as owner. */
-export async function convergeAppHostLifecycle(
-  slockHome: string,
-  openAtLogin: boolean,
-  deps: AppHostLifecycleDeps,
-): Promise<HostLifecycleConvergenceResult> {
-  const platform = deps.platform ?? process.platform;
-  const current = await readHostLifecycleMarker(slockHome);
-  if (platform !== "darwin") {
-    return {
-      owner: "app",
-      enabled: current?.enabled ?? true,
-      status: "not-applicable",
-      label: null,
-      definitionPath: null,
-      definition: null,
-    };
-  }
-  await retireCliLoginCarrier(slockHome, { ...deps, platform });
-  await deps.setOpenAtLogin(openAtLogin);
-  const readback = await deps.getOpenAtLogin();
-  if (readback !== openAtLogin) {
-    throw new ComputerServiceError(
-      "HOST_LIFECYCLE_APP_READBACK_FAILED",
-      "Raft Desktop could not verify its Launch at login setting after writing it.",
-    );
-  }
-  const marker: HostLifecycleMarker = {
-    formatVersion: HOST_LIFECYCLE_FORMAT_VERSION,
-    owner: "app",
-    enabled: current?.enabled ?? true,
-    dispatcherPath: null,
-    label: null,
-    definitionPath: null,
-  };
-  await writeMarker(slockHome, marker);
-  return {
-    owner: "app",
-    enabled: marker.enabled,
-    status: "converged",
-    label: null,
-    definitionPath: null,
-    definition: null,
-  };
-}
-
-/** Uninstall / hand-back: turn off an App-owned "Launch at login", remove any
- * leftover CLI LaunchAgent and the owner record. */
-export async function removeHostLifecycle(
-  slockHome: string,
-  deps: HostLifecycleRemovalDeps = {},
-): Promise<HostLifecycleRemovalResult> {
-  const current = await readHostLifecycleMarker(slockHome);
-  if (current?.owner === "app") {
-    if (!deps.setOpenAtLogin || !deps.getOpenAtLogin) {
-      throw new ComputerServiceError(
-        "HOST_LIFECYCLE_APP_OWNER_REQUIRED",
-        "Raft Desktop owns Launch at login. Remove it through the Desktop uninstall path before deleting the host-lifecycle owner record.",
-      );
-    }
-    await deps.setOpenAtLogin(false);
-    if (await deps.getOpenAtLogin()) {
-      throw new ComputerServiceError(
-        "HOST_LIFECYCLE_APP_READBACK_FAILED",
-        "Raft Desktop could not verify that Launch at login was removed.",
-      );
-    }
-  }
-  const retired = await retireCliLoginCarrier(slockHome, deps);
-  await rm(markerPath(slockHome), { force: true });
-  if ((await readHostLifecycleMarker(slockHome)) !== null) {
-    throw new ComputerServiceError(
-      "HOST_LIFECYCLE_REMOVAL_FAILED",
-      "Raft Computer could not remove its host-lifecycle owner record.",
-    );
-  }
-  if (retired.label === null) {
-    return { status: "not-applicable", label: null, definitionPath: null };
-  }
-  return { status: "removed", label: retired.label, definitionPath: retired.definitionPath };
 }

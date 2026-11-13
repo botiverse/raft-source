@@ -5,6 +5,7 @@ import { getHeapSpaceStatistics } from "node:v8";
 import { lazySchemaStats } from "@botiverse/raft-shared";
 
 import type { Clock } from "./connection";
+import { PI_SESSION_MEMORY_TRACE_ATTRS } from "./drivers/piSessionMemory";
 
 // How much memory this daemon process holds, sampled on a timer: process and
 // V8 counters only, never heap contents. The sample goes to a local file the
@@ -88,13 +89,17 @@ export const PROCESS_MEMORY_TRACE_ATTRS = [
   // Linux only; a long-idle runner can have a third of itself swapped out.
   "swap_mb",
   "service_swap_mb",
+  // How much transcript the in-process pi sessions hold, from the daemon;
+  // pi_session_count is 0 when there are none.
+  ...PI_SESSION_MEMORY_TRACE_ATTRS,
 ] as const;
 
 const mb = (bytes: number | undefined): number => Math.round((bytes ?? 0) / (1024 * 1024));
 
 type SampleAttr = Exclude<
   (typeof PROCESS_MEMORY_TRACE_ATTRS)[number],
-  "process_instance_id" | "agents_running" | "agents_in_process" | "service_rss_mb" | "service_heap_used_mb" | "swap_mb" | "service_swap_mb"
+  | "process_instance_id" | "agents_running" | "agents_in_process" | "service_rss_mb" | "service_heap_used_mb" | "swap_mb" | "service_swap_mb"
+  | (typeof PI_SESSION_MEMORY_TRACE_ATTRS)[number]
 >;
 
 export function processMemoryTraceAttrs(sample: ProcessMemorySample): Record<SampleAttr, number> & { swap_mb?: number } {

@@ -331,7 +331,6 @@ test("real PG: removeMember first vs an owner-driven transitionMemberRole on the
         actorUserId: seeded.owner.id,
         targetUserId: seeded.member.id,
         nextRole: "admin",
-        guestTransitionsEnabled: false,
       }));
       // Behind the removal on `servers` (this order) or on the member row (an order without the `servers` lock, where the
       // departure insert's key-share on `servers` then deadlocks with the transition).
@@ -385,18 +384,19 @@ test("real PG: a writer in transitionMemberRole's lock order first — removeMem
   });
 }, TEST_TIMEOUT_MS);
 
-test("real PG: removeMember keeps its existing results for a user who is not a member and for a missing Server", async () => {
+test("real PG: removeMember for a user who is not a member, and for a missing Server, changes nothing", async () => {
   await withRealPg(async () => {
     const seeded = await seed();
     const stranger = await seedUser("stranger");
-    // Not a member: no error, nothing of the stranger's to delete, and the departure is recorded as before.
+    // Not a member: no error, nothing of the stranger's to delete, and no departure either: only a
+    // membership that ended records one (RFC 083 §6.1, #13377), so a late call cannot rewrite how it ended.
     await removeMember(seeded.server.id, stranger.id, { reason: "removed", actorUserId: seeded.owner.id });
     const departures = await getDb().select({ userId: serverMembershipDepartures.userId }).from(serverMembershipDepartures)
       .where(and(eq(serverMembershipDepartures.serverId, seeded.server.id), eq(serverMembershipDepartures.userId, stranger.id)));
-    assert.equal(departures.length, 1, "the departure is recorded for a non-member, unchanged");
+    assert.equal(departures.length, 0, "no departure for someone who was not a member");
     assert.deepEqual(await memberResidue(seeded), { members: 1, channelHumans: 1, threadFollows: 1 }, "the real member is untouched");
-    // Missing Server: the departure insert's foreign key rejects the removal, as before.
-    await assert.rejects(removeMember(randomUUID(), seeded.member.id, { reason: "removed" }));
+    // Missing Server: there is no membership to end, so nothing is written and nothing is cleaned up.
+    await removeMember(randomUUID(), seeded.member.id, { reason: "removed" });
     assert.deepEqual(await memberResidue(seeded), { members: 1, channelHumans: 1, threadFollows: 1 }, "nothing was partially cleaned up");
   });
 }, TEST_TIMEOUT_MS);

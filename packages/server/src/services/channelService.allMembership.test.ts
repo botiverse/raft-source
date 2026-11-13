@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { and, eq } from "drizzle-orm";
 import { BasicTracer, MemoryTraceSink } from "@botiverse/raft-shared";
 import { getDb } from "../db/index";
-import { users, channels, channelAgents, channelHumans, inboxNotificationFacts } from "../db/schema";
+import { users, channels, channelAgents, channelHumans, inboxNotificationFacts, notificationOutbox } from "../db/schema";
 import { createServer } from "./serverService";
 import { addMember } from "./serverService";
 import { createAgent } from "./agentService";
@@ -21,8 +21,9 @@ import {
 import { broadcastAndDeliver, broadcastSystemMessage } from "./messageService";
 import { withTraceRoot } from "../tracing/semanticTrace";
 import { withChannelDelivery } from "../test/orchestratorStub";
+import { revealAllChannelForTest } from "../test/allChannelFixture";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 let userSeq = 0;
 async function seedUser(label: string) {
@@ -73,7 +74,8 @@ test("getChannelAgents/getChannelHumans virtualize the non-Guest audience for en
 
   const server = await createServer("All Parity Server", "all-parity", owner.id);
   await addMember(server.id, memberB.id);
-  await addMember(server.id, guest.id, "guest");
+  const guestHome = await createChannel(server.id, "guest-home", undefined, "private");
+  await addMember(server.id, guest.id, "guest", { guestChannelId: guestHome.id });
   const agentA = await createAgent(server.id, "agent-a", { runtime: "codex" });
   const agentB = await createAgent(server.id, "agent-b", { runtime: "codex" });
 
@@ -95,9 +97,16 @@ test("getChannelAgents/getChannelHumans virtualize the non-Guest audience for en
     .select({ userId: channelHumans.userId })
     .from(channelHumans)
     .where(eq(channelHumans.channelId, allChannelId));
+  // Humans do get a row now (#triage:64b44a12): both inbox read paths build
+  // subscriptions from channel_humans. The roster below stays derived from the
+  // server's members either way; a Guest never gets one.
   assert.ok(
-    !rawAllHumans.some((r) => r.userId === memberB.id),
-    "memberB must not have an explicit channel_humans row in #all (membership is virtual)",
+    rawAllHumans.some((r) => r.userId === memberB.id),
+    "memberB has a channel_humans row in the enabled #all (inbox subscription)",
+  );
+  assert.ok(
+    !rawAllHumans.some((r) => r.userId === guest.id),
+    "a Guest never gets an #all row",
   );
 
   // Positive: full server audience is returned for #all.
@@ -173,13 +182,10 @@ test("#all message delivery traces include virtual audience counts without priva
   assert.equal(Object.values(agentDelivery.attrs ?? {}).includes(agentA.id), false);
   assert.equal(Object.values(agentDelivery.attrs ?? {}).includes(agentB.id), false);
 
-  const pushTargets = ordinarySpan.events.find((event) => event.name === "message_pipeline.push_targets.built");
-  assert.ok(pushTargets, "expected push target trace");
-  assert.equal(pushTargets.attrs?.is_all_channel, true);
-  assert.equal(pushTargets.attrs?.human_audience_count, 2);
-  assert.equal(pushTargets.attrs?.human_delivery_count, 1);
-  assert.equal(Object.values(pushTargets.attrs ?? {}).includes(owner.id), false);
-  assert.equal(Object.values(pushTargets.attrs ?? {}).includes(memberB.id), false);
+  // Notifications go to the outbox audience: the #all member, never the sender.
+  const notified = (await getDb().select({ receiverId: notificationOutbox.receiverId }).from(notificationOutbox)
+    .where(eq(notificationOutbox.sourceChannelId, allChannelId))).map((row) => row.receiverId);
+  assert.deepEqual(notified, [memberB.id]);
 
   sink.clear();
   await withTraceRoot(tracer, "test.all.system_message", { surface: "server", kind: "server" }, async () => {
@@ -216,11 +222,16 @@ test("#all message delivery traces include virtual audience counts without priva
 test("#all delivery excludes Guests from inbox facts and push targets", async ({ app }) => {
   const owner = await seedUser("guest-delivery-owner");
   const memberB = await seedUser("guest-delivery-member");
+  const memberC = await seedUser("guest-delivery-member-c");
   const guest = await seedUser("guest-delivery-guest");
 
   const server = await createServer("Guest Delivery Server", "guest-delivery", owner.id);
   await addMember(server.id, memberB.id);
-  await addMember(server.id, guest.id, "guest");
+  // A Guest does not grow the team (#wg-rbac:#16), so a third real member
+  // reveals #all here; the Guest is then added to check it gets no delivery.
+  await addMember(server.id, memberC.id);
+  const guestHome = await createChannel(server.id, "guest-home", undefined, "private");
+  await addMember(server.id, guest.id, "guest", { guestChannelId: guestHome.id });
 
   const allChannelId = await findAllChannel(server.id);
   const allChannel = await getChannel(allChannelId);
@@ -273,15 +284,13 @@ test("#all delivery excludes Guests from inbox facts and push targets", async ({
     ));
   assert.equal(memberFacts.length, 1, "ordinary member must receive exactly one inbox notification fact for #all");
 
-  // Push targeting is built from the same audience, so the Guest must not be
-  // counted there either: audience = owner + memberB, delivery = memberB.
+  // Every notification transport reads the outbox, built from the same
+  // audience: the Guest gets no row, each real member exactly one, the sender none.
   const span = sink.getAllSpans().find((s) => s.name === "test.all.guest_delivery");
   assert.ok(span, "expected delivery trace span");
-  const pushTargets = span.events.find((event) => event.name === "message_pipeline.push_targets.built");
-  assert.ok(pushTargets, "expected push target trace");
-  assert.equal(pushTargets.attrs?.is_all_channel, true);
-  assert.equal(pushTargets.attrs?.human_audience_count, 2, "#all human audience must exclude the Guest");
-  assert.equal(pushTargets.attrs?.human_delivery_count, 1, "#all human push delivery must exclude the Guest");
+  const notified = (await getDb().select({ receiverId: notificationOutbox.receiverId }).from(notificationOutbox)
+    .where(eq(notificationOutbox.sourceChannelId, allChannelId))).map((row) => row.receiverId);
+  assert.deepEqual([...notified].sort(), [memberB.id, memberC.id].sort(), "#all notifications must exclude the Guest");
 });
 
 // Negative: non-#all channels keep explicit-membership semantics; the
@@ -322,6 +331,7 @@ test("non-#all channels keep explicit membership (no audience leak)", async ({ a
 test("#all virtual audience is isolated per server", async ({ app }) => {
   const ownerA = await seedUser("iso-owner-a");
   const serverA = await createServer("Iso Server A", "iso-server-a", ownerA.id);
+  await revealAllChannelForTest(serverA.id);
   const agentA = await createAgent(serverA.id, "iso-agent-a", { runtime: "codex" });
 
   const ownerB = await seedUser("iso-owner-b");

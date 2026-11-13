@@ -8,6 +8,9 @@ import { formatHint, formatHintFlag, formatHintName, RAFT_HINTS, type RaftHintSt
 
 export type AgentMentionActionKind = "notify" | "add";
 
+/** Pending-mention reason for an agent mentioned in another agent's lounge: never deliverable. */
+export const AGENT_LOUNGE_EXCLUDED_MENTION_REASON = "lounge_agent_excluded";
+
 export interface AgentPendingMentionAction {
   resolutionId: string;
   messageId: string;
@@ -160,6 +163,37 @@ export function normalizeAgentUnresolvedMentionHandles(data: unknown): string[] 
   ));
 }
 
+/** How many recipients the send receipt names before "and N more". */
+const DELIVERED_AGENTS_SHOWN = 10;
+
+/**
+ * The agent handles a send response says it was delivered to
+ * (`deliveredToAgents`), deduplicated, in the Server's order; [] when it
+ * reached none, null when the Server did not count (Joint channel, older Server).
+ */
+export function normalizeAgentDeliveredToAgents(data: unknown): string[] | null {
+  const value = data as { deliveredToAgents?: unknown } | null;
+  if (!Array.isArray(value?.deliveredToAgents)) return null;
+  return Array.from(new Set(
+    value.deliveredToAgents
+      .filter((name): name is string => typeof name === "string")
+      .map((name) => name.trim())
+      .filter(Boolean),
+  ));
+}
+
+/**
+ * The send receipt's line naming the agents this message was delivered to,
+ * by plain name (no @, so copying it mentions no one). Empty when it reached
+ * none, or when the Server did not count.
+ */
+export function formatAgentDeliveredToAgentsLine(names: readonly string[] | null): string {
+  if (!names || names.length === 0) return "";
+  const shown = names.slice(0, DELIVERED_AGENTS_SHOWN).join(", ");
+  const more = names.length > DELIVERED_AGENTS_SHOWN ? ` and ${names.length - DELIVERED_AGENTS_SHOWN} more` : "";
+  return `Delivered to ${names.length} ${names.length === 1 ? "agent" : "agents"}: ${shown}${more}.`;
+}
+
 export function normalizeAgentMentionActionResults(data: unknown): AgentMentionActionResult[] {
   const value = data as { results?: unknown; actionResults?: unknown } | null;
   const raw = Array.isArray(value?.results)
@@ -243,6 +277,15 @@ export function formatAgentPendingMentionActions(
       "",
     ];
     for (const rawAction of actions) {
+      if (rawAction.reason === AGENT_LOUNGE_EXCLUDED_MENTION_REASON) {
+        // Agent Lounge: other agents never take part there, so nothing can be recovered.
+        lines.push(`- ${formatAuthoredMentionToken(rawAction.targetHandle)} — status=not_queued`);
+        lines.push(`  reason: ${AGENT_LOUNGE_EXCLUDED_MENTION_REASON}`);
+        lines.push("  consequence: This @mention did not notify anyone.");
+        lines.push("  pending action: none; only this lounge's own agent takes part here, other agents never receive its mentions");
+        lines.push("  recovery: none; to reach that agent, write to it where it takes part (a DM or a channel it is in).");
+        continue;
+      }
       const action = toAgentSenderPendingMentionAction(rawAction);
       lines.push(`- ${action.targetHandle} — status=${action.status}`);
       lines.push(`  reason: ${action.reason}`);

@@ -177,7 +177,8 @@ test("contract agent-api surface client exposes task list/create/unclaim/amend/h
   assert.equal(list.ok, true);
   assert.deepEqual(list.data?.tasks, []);
   assert.equal(created.ok, true);
-  assert.equal(created.data?.tasks[0]?.taskNumber, 9);
+  assert.ok(created.data && "tasks" in created.data);
+  assert.equal((created.data.tasks as Array<{ taskNumber: number }>)[0]?.taskNumber, 9);
   assert.equal(unclaimed.ok, true);
   assert.ok(amended.data && "task" in amended.data);
   assert.equal((amended.data.task as { revision: number }).revision, 2);
@@ -254,7 +255,7 @@ test("contract agent API client exposes channel and reaction methods", async () 
     {
       method: "POST",
       path: "/internal/agent/agent-1/channels/chan-1/leave",
-      body: undefined,
+      body: {},
     },
     {
       method: "POST",
@@ -414,7 +415,7 @@ test("contract agent-api surface client exposes remaining command methods over i
     { method: "POST", path: "/internal/agent-api/messages/msg-1/reactions", body: { emoji: "👀" } },
     { method: "DELETE", path: "/internal/agent-api/messages/msg-1/reactions", body: { emoji: "👀" } },
     { method: "POST", path: "/internal/agent-api/channels/chan%2Fwith%20spaces/join", body: undefined },
-    { method: "POST", path: "/internal/agent-api/channels/chan-1/leave", body: undefined },
+    { method: "POST", path: "/internal/agent-api/channels/chan-1/leave", body: {} },
     { method: "POST", path: "/internal/agent-api/channels/chan-1/mute", body: {} },
     { method: "POST", path: "/internal/agent-api/channels/chan-1/unmute", body: undefined },
     { method: "POST", path: "/internal/agent-api/channels/archive", body: { target: "#engineering" } },

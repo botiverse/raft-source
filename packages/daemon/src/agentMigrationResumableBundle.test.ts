@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash, randomBytes } from "node:crypto";
 import { unlinkSync } from "node:fs";
-import { chmod, mkdir, mkdtemp, open, readdir, readFile, readlink, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, open, readdir, readFile, readlink, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { PassThrough, Readable } from "node:stream";
@@ -662,6 +662,41 @@ async function streamToMemory(
   return { ...streamed, uploaded, uploadOrder, maxInFlight };
 }
 
+test("the streamed summary carries excludedIgnoredBySource only for a Server that accepts it", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "migration-streamed-ignore-sources-"));
+  const workspace = path.join(root, "agents", "agent-ignore-sources");
+  try {
+    await mkdir(path.join(workspace, "scratch"), { recursive: true });
+    await mkdir(path.join(workspace, "repo", "checkout"), { recursive: true });
+    await writeFile(path.join(workspace, "MEMORY.md"), "memory\n");
+    await writeFile(path.join(workspace, "scratch", "big.log"), "ignored\n");
+    await writeFile(path.join(workspace, "repo", "checkout", "x"), "abc");
+    await writeFile(path.join(workspace, ".raftmigrateignore"), "scratch\n");
+    await writeFile(path.join(workspace, ".raftbackupignore"), "**/checkout\n");
+    const excludedIgnored = {
+      count: 2,
+      fileCount: 2,
+      bytes: 11,
+      largest: [{ path: "scratch", bytes: 8 }, { path: "repo/checkout", bytes: 3 }],
+    };
+
+    const older = await streamToMemory(workspace, {}, 0);
+    assert.deepEqual(older.control.transferSummary.excludedIgnored, excludedIgnored);
+    assert.equal("excludedIgnoredBySource" in older.control.transferSummary, false);
+
+    const current = await streamToMemory(workspace, { reportIgnoredBySource: () => true }, 0);
+    assert.deepEqual(current.control.transferSummary.excludedIgnored, excludedIgnored);
+    assert.deepEqual(current.control.transferSummary.excludedIgnoredBySource, {
+      userFile: { count: 0, fileCount: 0, bytes: 0 },
+      agentFile: { count: 1, fileCount: 1, bytes: 3 },
+      legacyFile: { count: 1, fileCount: 1, bytes: 8 },
+      wildcard: { count: 1, fileCount: 1, bytes: 3 },
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 /** Streams a workspace to memory and serves its chunks back, for target-side tests. */
 async function buildBundle(input: Partial<StreamAgentMigrationResumableBundleInput> & { workspacePath: string }) {
   const streamed = await streamToMemory(input.workspacePath, input, 0);
@@ -885,6 +920,32 @@ test("a streamed bundle over the byte limit names the largest top-level paths in
   }
 });
 
+test("a workspace that compresses under the byte limit but is over the summary's uncompressed cap fails as too large, not as a validation error", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "migration-streamed-expanded-too-large-"));
+  try {
+    await mkdir(path.join(root, "a"), { recursive: true });
+    await mkdir(path.join(root, "z"), { recursive: true });
+    // Zeros compress to almost nothing, so only the uncompressed total is over.
+    await writeFile(path.join(root, "a", "1.bin"), Buffer.alloc(1_500_000));
+    await writeFile(path.join(root, "z", "1.bin"), Buffer.alloc(1_500_000));
+    await writeFile(path.join(root, "z", "2.bin"), Buffer.alloc(1_500_000));
+    await writeFile(path.join(root, "MEMORY.md"), "m");
+    await assert.rejects(
+      streamToMemory(root, { maxBytes: 100_000_000, maxExpandedBytes: 2_000_000 }),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.match(
+          error.message,
+          /^MIGRATION_OBJECT_STORE_BUNDLE_TOO_LARGE:actualBytes=4500001:maxBytes=2000000:topEntries=z%2F,3000000;a%2F,1500000;MEMORY\.md,1$/,
+        );
+        return true;
+      },
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("a failed chunk upload fails the streamed bundle", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "migration-streamed-upload-failure-"));
   try {
@@ -1011,9 +1072,21 @@ test("a chunk stream that breaks mid-body leaves no partial file; a digest misma
 
     // The connection drops after some bytes: the caller retries this chunk, so
     // each failed attempt must not leave its partial behind.
-    const dropped = new PassThrough();
-    dropped.write(randomBytes(4096));
-    setTimeout(() => dropped.destroy(new Error("socket hang up")), 10);
+    // The break comes from the stream itself, never from a timer: a timer can
+    // fire before the reader is attached, and the error then has no listener
+    // (unhandled "socket hang up" on slow CI). It waits until the first bytes
+    // are on disk, so the break really is mid-body.
+    const partialHasData = async () => {
+      for (const name of await listPartials()) {
+        if ((await stat(path.join(chunksDirectory, name))).size > 0) return true;
+      }
+      return false;
+    };
+    const dropped = Readable.from((async function* () {
+      yield randomBytes(4096);
+      while (!(await partialHasData())) await new Promise((resolve) => setTimeout(resolve, 5));
+      throw new Error("socket hang up");
+    })());
     await assert.rejects(
       verifyAndStoreAgentMigrationChunk({ control: built.control, chunkIndex: 0, chunk: dropped, chunksDirectory }),
       /socket hang up/,

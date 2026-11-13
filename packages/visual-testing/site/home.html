@@ -29,10 +29,10 @@
         <div class="lbl">Runs</div>
         <div id="vt-runs"></div>
         <div class="lbl">Data</div>
-        <a class="link" href="index.json">index.json</a>
-        <a class="link" href="llms.txt">llms.txt</a>
-        <a class="link" href="latest/component-matrix.json">coverage matrix JSON</a>
-        <a class="link" href="latest/metadata.json">latest metadata</a>
+        <a class="link" href="{{SITE_ROOT}}index.json">index.json</a>
+        <a class="link" href="{{SITE_ROOT}}llms.txt">llms.txt</a>
+        <a class="link" href="{{SITE_ROOT}}latest/component-matrix.json">coverage matrix JSON</a>
+        <a class="link" href="{{SITE_ROOT}}latest/metadata.json">latest metadata</a>
       </div>
       <div class="sb-resizer" id="vt-resizer" title="Drag to resize · double-click to reset" aria-hidden="true"></div>
     </aside>
@@ -80,6 +80,7 @@
   <script type="application/json" id="vt-data">{{VT_DATA_JSON}}</script>
   {{OVERLAY_SCRIPT}}
   <script>
+{{APPLICABILITY_JS}}
 {{HOME_JS}}
   </script>
   {{LOCALIZED_TIME_SCRIPT}}

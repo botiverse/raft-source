@@ -257,6 +257,41 @@ export function describeKillModeRequirement(unit: string, killMode: string | nul
     + "`systemctl daemon-reload` (with `--user` for a user unit), restart the unit, then retry the upgrade.";
 }
 
+export interface SupervisorOomPolicy {
+  record: ExternalSupervisorRecord;
+  /** `OOMPolicy` as systemd reports it (stop/continue/kill); null on a systemd too old to have it. */
+  oomPolicy: string | null;
+  /** Made by `systemd-run`: there is no unit file to edit. */
+  transient: boolean;
+}
+
+/**
+ * The OOM policy of the unit this Computer runs under. Raft never edits a
+ * user's own unit (#917), so an upgrade cannot fix an old `OOMPolicy=stop`:
+ * doctor reports it instead. Null when not under systemd or it can't be read.
+ */
+export async function readSupervisorOomPolicy(slockHome: string, deps: InspectDeps = {}): Promise<SupervisorOomPolicy | null> {
+  const record = await readSupervisorRecord(slockHome);
+  if (!record) return null;
+  const runner = deps.systemctl ?? runSystemctl;
+  const [loadState, oomPolicy, transient] = await Promise.all([
+    showUnitProperty(runner, record.scope, record.unit, "LoadState"),
+    showUnitProperty(runner, record.scope, record.unit, "OOMPolicy"),
+    showUnitProperty(runner, record.scope, record.unit, "Transient"),
+  ]);
+  if (loadState !== "loaded") return null;
+  return { record, oomPolicy: oomPolicy || null, transient: transient === "yes" };
+}
+
+export function describeOomPolicyRequirement(policy: SupervisorOomPolicy): string {
+  const { unit, scope } = policy.record;
+  const systemctl = scope === "user" ? "systemctl --user" : "sudo systemctl";
+  const fix = policy.transient
+    ? `It was made by systemd-run, so it cannot be edited: stop it, run \`${systemctl} reset-failed ${unit}\`, and start it again with \`-p OOMPolicy=continue\` added to the systemd-run command.`
+    : `Run \`${systemctl} edit ${unit}\`, add the two lines \`[Service]\` and \`OOMPolicy=continue\`, save, then restart the unit when no agent is busy.`;
+  return `systemd unit ${unit} has OOMPolicy=${policy.oomPolicy}: when the kernel kills one agent for memory, systemd ends the whole Computer. ${fix}`;
+}
+
 export function describeSupervisorUnreachable(record: ExternalSupervisorRecord, detail: string): string {
   const scopeHint = record.scope === "user"
     ? " A `systemctl --user` call needs the user's session bus: run it from a session of that user with XDG_RUNTIME_DIR set (for example after `loginctl enable-linger`)."

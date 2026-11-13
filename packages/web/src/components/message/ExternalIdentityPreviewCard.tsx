@@ -18,6 +18,9 @@ interface ExternalIdentityPreviewCardProps {
   workspaceName?: string | null;
   actorKind?: ExternalActorKind | null;
   avatarUrl?: string | null;
+  profileDisplayName?: string | null;
+  profileAvatarUrl?: string | null;
+  appName?: string | null;
   testId?: string;
   onNavigate: () => void;
 }
@@ -28,6 +31,8 @@ interface ExternalIdentityPreviewBodyProps {
   workspaceName?: string | null;
   actorKind?: ExternalActorKind | null;
   avatarUrl?: string | null;
+  appName?: string | null;
+  postedAs?: string | null;
 }
 
 /** Shared preview body — extracted so MentionLink (external @-mention) can
@@ -38,6 +43,8 @@ export function ExternalIdentityPreviewBody({
   workspaceName,
   actorKind,
   avatarUrl,
+  appName,
+  postedAs,
 }: ExternalIdentityPreviewBodyProps) {
   const { formatMessage } = useIntl();
   const providerLabel = formatExternalProviderLabel(provider, formatMessage);
@@ -57,19 +64,25 @@ export function ExternalIdentityPreviewBody({
           {displayName}
         </div>
         <div className="truncate text-footnote text-foreground-muted">
-          {providerLabel
+          {actorKind === "bot" && appName ? actorKindLabel : providerLabel
             ? formatMessage(
                 { id: "message.externalIdentity.providerAndKind" },
                 { provider: providerLabel, kind: actorKindLabel },
               )
             : actorKindLabel}
         </div>
-        {workspaceName ? (
+        {actorKind === "bot" && appName && providerLabel ? (
           <div className="mt-1 truncate text-footnote text-foreground-muted">
-            {formatMessage(
-              { id: "message.externalIdentity.fromWorkspace" },
-              { workspace: workspaceName },
-            )}
+            {formatMessage({ id: "message.externalIdentity.fromWorkspace" }, { workspace: `${providerLabel} · ${appName}` })}
+          </div>
+        ) : workspaceName ? (
+          <div className="mt-1 truncate text-footnote text-foreground-muted">
+            {formatMessage({ id: "message.externalIdentity.fromWorkspace" }, { workspace: workspaceName })}
+          </div>
+        ) : null}
+        {postedAs && postedAs !== displayName ? (
+          <div className="mt-1 truncate text-footnote text-foreground-muted">
+            {formatMessage({ id: "message.externalIdentity.postedAs" }, { name: postedAs })}
           </div>
         ) : null}
         <div className="mt-1 text-caption text-foreground-hint">
@@ -86,6 +99,9 @@ export default function ExternalIdentityPreviewCard({
   workspaceName,
   actorKind,
   avatarUrl,
+  profileDisplayName,
+  profileAvatarUrl,
+  appName,
   testId,
   onNavigate,
 }: ExternalIdentityPreviewCardProps) {
@@ -126,11 +142,13 @@ export default function ExternalIdentityPreviewCard({
         collisionPadding={6}
       >
         <ExternalIdentityPreviewBody
-          displayName={displayName}
+          displayName={actorKind === "bot" ? profileDisplayName || displayName : displayName}
           provider={provider}
           workspaceName={workspaceName}
           actorKind={actorKind}
-          avatarUrl={avatarUrl}
+          avatarUrl={actorKind === "bot" && profileAvatarUrl !== undefined ? profileAvatarUrl : avatarUrl}
+          appName={appName}
+          postedAs={actorKind === "bot" && profileDisplayName && profileDisplayName !== displayName ? displayName : null}
         />
       </PreviewCardContent>
     </PreviewCard>

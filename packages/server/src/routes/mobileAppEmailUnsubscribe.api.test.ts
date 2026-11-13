@@ -17,7 +17,6 @@ import { createMobileAppEmailUnsubscribeToken } from "../services/mobileAppEmail
 
 const test = createApiTest({
   humanActivityMuteFlagDefaultEnabled: true,
-  onboardingOpenerFlagDefaultEnabled: false,
 });
 
 afterEach(() => {
@@ -79,7 +78,7 @@ test("visible and one-click unsubscribe share a signed URL and persist one local
 test("tampered unsubscribe tokens fail closed without writing contact state", async ({ app, db }) => {
   const user = await seedUser(db);
   const token = createMobileAppEmailUnsubscribeToken(user.id);
-  const tampered = `${token.slice(0, -1)}x`;
+  const tampered = `${token.slice(0, -1)}${token.endsWith("x") ? "y" : "x"}`;
 
   const response = await fetch(
     `${app.baseUrl}/api/email/mobile-app/unsubscribe?token=${encodeURIComponent(tampered)}`,

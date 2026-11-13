@@ -1,6 +1,6 @@
 import { Card } from "@botiverse/raft-ui";
 import { useCallback } from "react";
-import type { BulkResetMode, BulkResetOption } from "./MachineDetailPanel";
+import type { BulkResetMode, BulkResetOption } from "../../features/computer/machineDetailTypes";
 
 export function BulkResetOptionCard({
   option,
@@ -24,7 +24,7 @@ export function BulkResetOptionCard({
       render={<button type="button" aria-pressed={selected} disabled={disabled} />}
       onClick={handleClick}
       className={`w-full p-3 text-left outline-none transition-colors focus-visible:shadow-focus disabled:cursor-not-allowed disabled:bg-fill-muted disabled:text-foreground-disabled ${
-        selected ? option.selectedClass : "hover:press-overlay"
+        selected ? option.selectedClass : "hover:overlay-subtle active:overlay-medium"
       }`}
     >
       <div className="text-callout font-semibold">{option.label}</div>

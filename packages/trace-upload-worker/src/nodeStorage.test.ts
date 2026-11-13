@@ -120,3 +120,140 @@ test("S3TraceStorage refuses keys with dot path segments instead of sending them
   await storage.put("a/..b/c.json", "x");
   assert.equal(calls, 1);
 });
+
+function storageAnswering(statuses: Array<number | Error>, putRetryDelaysMs: readonly number[] = [0, 0]) {
+  const calls: Headers[] = [];
+  const storage = new S3TraceStorage({
+    endpoint: "https://account.r2.cloudflarestorage.com",
+    bucket: "trace-bucket",
+    accessKeyId: "access-key",
+    secretAccessKey: "secret-key",
+    putRetryDelaysMs,
+    fetch: async (_input, init) => {
+      calls.push(new Headers(init?.headers));
+      const next = statuses[calls.length - 1];
+      if (next instanceof Error) throw next;
+      return new Response(null, { status: next, headers: next === 200 ? { etag: '"etag-ok"' } : {} });
+    },
+  });
+  return { storage, calls };
+}
+
+test("S3TraceStorage retries a PUT that R2 answers with 429 or 5xx, and logs each failed attempt", async () => {
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+  try {
+    const { storage, calls } = storageAnswering([429, 500, 200]);
+
+    const result = await storage.put("trace-ledgers/server/machine/upload.json", "{}");
+
+    assert.deepEqual(result, { etag: '"etag-ok"' });
+    assert.equal(calls.length, 3);
+    // Each attempt is signed on its own: a retry must not sign the previous
+    // attempt's authorization header.
+    for (const headers of calls) {
+      assert.doesNotMatch(headers.get("authorization") ?? "", /SignedHeaders=[^,]*authorization/);
+    }
+    assert.deepEqual(warn.mock.calls.map(([line, fields]) => [line, fields.status, fields.attempt, fields.will_retry]), [
+      ["[TraceStorage] put_failed", 429, 1, true],
+      ["[TraceStorage] put_failed", 500, 2, true],
+    ]);
+    assert.equal(warn.mock.calls[0][1].key, "trace-ledgers/server/machine/upload.json");
+  } finally {
+    warn.mockRestore();
+  }
+});
+
+test("S3TraceStorage retries a PUT whose request failed before R2 answered", async () => {
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+  try {
+    const { storage, calls } = storageAnswering([new TypeError("fetch failed"), 200]);
+
+    await storage.put("trace-bundles/server/machine/upload.jsonl.gz", Buffer.from("bundle"));
+
+    assert.equal(calls.length, 2);
+    assert.equal(warn.mock.calls.length, 1);
+    assert.equal(warn.mock.calls[0][1].error_message, "R2 PUT failed before a response: fetch failed");
+  } finally {
+    warn.mockRestore();
+  }
+});
+
+test("S3TraceStorage waits 1 s, then 2 s, between attempts by default", async () => {
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+  const waits: Array<number | undefined> = [];
+  const timer = vi.spyOn(globalThis, "setTimeout").mockImplementation(((run: () => void, ms?: number) => {
+    waits.push(ms);
+    queueMicrotask(run);
+    return 0;
+  }) as unknown as typeof setTimeout);
+  try {
+    let calls = 0;
+    const storage = new S3TraceStorage({
+      endpoint: "https://account.r2.cloudflarestorage.com",
+      bucket: "trace-bucket",
+      accessKeyId: "access-key",
+      secretAccessKey: "secret-key",
+      fetch: async () => {
+        calls += 1;
+        // The wait before this attempt has already been requested.
+        assert.equal(waits.length, calls - 1);
+        return new Response(null, { status: calls < 3 ? 429 : 200 });
+      },
+    });
+
+    await storage.put("trace-ledgers/server/machine/upload.json", "{}");
+
+    assert.equal(calls, 3);
+    assert.deepEqual(waits, [1_000, 2_000]);
+  } finally {
+    timer.mockRestore();
+    warn.mockRestore();
+  }
+});
+
+test("S3TraceStorage does not retry or count an error raised before the request is sent", async () => {
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+  try {
+    const { storage, calls } = storageAnswering([200]);
+
+    await assert.rejects(storage.put("a/../b", "x"), /dot path segment/);
+    await assert.rejects(
+      storage.put("key", "x", { customMetadata: { source: "非 Latin-1" } }),
+      TypeError,
+    );
+
+    assert.equal(calls.length, 0);
+    assert.equal(warn.mock.calls.length, 0);
+  } finally {
+    warn.mockRestore();
+  }
+});
+
+test("S3TraceStorage gives up after the configured retries and throws the last failure", async () => {
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+  try {
+    const { storage, calls } = storageAnswering([500, 500, 503]);
+
+    await assert.rejects(storage.put("key", "{}"), /R2 PUT failed with status 503/);
+
+    assert.equal(calls.length, 3);
+    assert.equal(warn.mock.calls.length, 3);
+    assert.equal(warn.mock.calls[2][1].will_retry, false);
+  } finally {
+    warn.mockRestore();
+  }
+});
+
+test("S3TraceStorage does not retry a PUT that R2 refuses for another reason", async () => {
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+  try {
+    const { storage, calls } = storageAnswering([403, 200]);
+
+    await assert.rejects(storage.put("key", "{}"), /R2 PUT failed with status 403/);
+
+    assert.equal(calls.length, 1);
+    assert.equal(warn.mock.calls[0][1].will_retry, false);
+  } finally {
+    warn.mockRestore();
+  }
+});

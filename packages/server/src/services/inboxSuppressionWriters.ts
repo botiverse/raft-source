@@ -195,14 +195,15 @@ export async function resolveThreadSuppressionTarget(
      AND thread_joint.status = 'active'
     LEFT JOIN channels canonical_thread
       ON canonical_thread.id = thread_joint.canonical_channel_id
-     AND canonical_thread.type = 'thread'
+     AND canonical_thread.type = t.type
      AND canonical_thread.deleted_at IS NULL
     LEFT JOIN messages m
       ON m.channel_id = COALESCE(canonical_thread.id, t.id)
     LEFT JOIN messages parent_msg
       ON parent_msg.id = COALESCE(canonical_thread.parent_message_id, t.parent_message_id)
     WHERE t.id = ${threadChannelId}::uuid
-      AND t.type = 'thread'
+      -- Thread or task conversation (task v2; no parent message: latest = its own max seq).
+      AND t.type IN ('thread', 'task')
       AND t.deleted_at IS NULL
     GROUP BY t.server_id, t.id, COALESCE(canonical_thread.id, t.id), parent_msg.seq
   `);

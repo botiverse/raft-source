@@ -43,3 +43,4 @@ export function releasedRuntimeFormDefinition(schemaVersion: string): AgentCreat
 
 export * from "./v2";
 export * from "./v2State";
+export * from "./v3Rules";

@@ -154,6 +154,35 @@ test("message resolve command fails closed for unknown ids", async () => {
   );
 });
 
+test("message resolve says a message is behind the plan's history window, not that it is missing", async () => {
+  const { io } = memoryIo();
+  const error = "This message is older than the 30-day history on the Free plan. Upgrading to Pro restores the full history.";
+  const ctx = createCommandContext({
+    io,
+    loadAgentContext: () => agentContext,
+    createApiClient: () => ({
+      request: async (): Promise<ApiResponse<unknown>> => ({
+        ok: false,
+        status: 404,
+        data: null,
+        error,
+        errorCode: "HISTORY_LIMITED",
+      }),
+    }) as any,
+  });
+
+  await assert.rejects(
+    async () => { await messageResolveCommand.handler(ctx, "4f9c2210"); },
+    (err: unknown) => {
+      assert.ok(err instanceof CliError);
+      assert.equal(err.code, "HISTORY_LIMITED");
+      assert.equal(err.message, error);
+      assert.equal(err.suggestedNextAction, undefined, "no search or --around hint: neither reaches it");
+      return true;
+    },
+  );
+});
+
 test("message resolve command does not pick an ambiguous short id", async () => {
   const { io } = memoryIo();
   const ctx = createCommandContext({

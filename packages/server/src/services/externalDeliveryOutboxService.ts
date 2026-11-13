@@ -1,5 +1,5 @@
 import { createHash, createHmac, randomUUID } from "node:crypto";
-import { and, asc, eq, isNull, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, isNull, or, sql } from "drizzle-orm";
 import {
   currentDate,
   SLACK_BRIDGE_DELIVERY_CONTRACT_VERSION,
@@ -13,19 +13,23 @@ import {
   externalDeliveryPartitions,
   externalMentionFacts,
   externalOutboundDeliveries,
+  messageMentions,
   messages,
   serverMembers,
   servers,
+  slackUsergroupIdentities,
   users,
 } from "../db/schema";
 import type { OrdinaryMessageExternalProjectionDecision } from "./ordinaryMessageExternalProjection";
 import { resolveExternalConversationTarget } from "./externalConversationTargetService";
-import { appendSlackBridgeAttachmentMarker } from "./slackBridgeAttachmentPolicy";
-import { createOutboundExternalAttachmentTransferWithExecutor } from "./externalAttachmentTransferService";
+import { attachmentSha256OrNull, createOutboundExternalAttachmentTransferWithExecutor } from "./externalAttachmentTransferService";
 import { effectiveAgentSenderName, effectiveUserSenderName } from "./effectiveSenderName";
 import { isStoredServerScopedAvatarUrl, isStoredUserAvatarUrl } from "./avatarService";
+import { cdnPublicBaseUrl } from "./storageService";
 
-export const SLACK_BRIDGE_RENDER_SNAPSHOT_SCHEMA = "slack-bridge-render-snapshot.v4" as const;
+export const SLACK_BRIDGE_RENDER_SNAPSHOT_SCHEMA = "slack-bridge-render-snapshot.v5" as const;
+
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
 
 export interface ProviderNeutralOutboundBindingAuthority {
   provider: string;
@@ -50,7 +54,6 @@ export interface ProviderNeutralOutboundRuntimeFact {
   /** Permission-facing local conversation used to authorize and link this send. */
   authorityConversationId: string;
   runtimePredicateRevision: string;
-  attachmentTransferEnabled?: boolean;
   bindingAuthority: ProviderNeutralOutboundBindingAuthority;
 }
 
@@ -62,8 +65,27 @@ export interface SlackBridgeFrozenAttachment {
   filename: string;
   mimeType: string;
   sizeBytes: number;
-  contentDigest: string;
+  contentDigest: string | null;
   messagePosition: number;
+}
+
+/**
+ * A Raft-principal mention frozen to its exact Slack token at enqueue.
+ * `handle` is the literal text (`handleAtSendTime`) the adapter finds in
+ * sanitizedText; `token` is the exact mrkdwn token written — `<!subteam^S…>`
+ * for both humans and agents through the install/server-scoped
+ * slack_usergroup_identities map. Per-member OAuth links are no longer the
+ * bridge precondition. The adapter renders it verbatim and never re-derives
+ * identity at dispatch.
+ */
+export interface SlackBridgeFrozenMentionSubstitution {
+  kind: "user" | "usergroup";
+  handle: string;
+  /** `<@U…>` or `<!subteam^S…>` — validated by a strict pattern. */
+  token: string;
+  installId: string;
+  bindingId: string;
+  bindingEpoch: number;
 }
 
 export interface SlackBridgeFrozenExternalMention {
@@ -110,13 +132,15 @@ function frozenAuthorAvatar(input: {
 }): SlackBridgeFrozenAuthorPresentation["avatar"] {
   if (!input.avatarUrl) return null;
   let url: URL;
-  let cdnBase: URL;
+  let cdnBase: URL | null;
   try {
     url = new URL(input.avatarUrl);
-    cdnBase = new URL(process.env.CDN_BASE_URL ?? "");
+    const base = cdnPublicBaseUrl();
+    cdnBase = base ? new URL(base) : null;
   } catch {
     return null;
   }
+  if (!cdnBase) return null;
   if (
     url.protocol !== "https:"
     || url.username
@@ -124,7 +148,7 @@ function frozenAuthorAvatar(input: {
     || url.search
     || url.hash
   ) return null;
-  if (url.origin !== cdnBase.origin) {
+  if (cdnBase.origin !== url.origin) {
     if (!EXTERNAL_AVATAR_ALLOWED_HOSTS.has(url.hostname)) return null;
     return {
       publicUrl: url.toString(),
@@ -142,7 +166,9 @@ function frozenAuthorAvatar(input: {
 }
 
 export interface SlackBridgeRenderSnapshot {
-  schema: typeof SLACK_BRIDGE_RENDER_SNAPSHOT_SCHEMA;
+  schema: "slack-bridge-render-snapshot.v3"
+    | "slack-bridge-render-snapshot.v4"
+    | typeof SLACK_BRIDGE_RENDER_SNAPSHOT_SCHEMA;
   sourceMessageId: string;
   sourceMessageSeq: number;
   canonicalConversationId: string;
@@ -155,6 +181,7 @@ export interface SlackBridgeRenderSnapshot {
   authorPresentation: SlackBridgeFrozenAuthorPresentation;
   sanitizedText: string;
   externalMentions: SlackBridgeFrozenExternalMention[];
+  raftMentionSubstitutions: SlackBridgeFrozenMentionSubstitution[];
   attachments: SlackBridgeFrozenAttachment[];
   bindingAuthority: ProviderNeutralOutboundBindingAuthority;
   enqueueRuntimeRevision: string;
@@ -686,6 +713,73 @@ async function resolveFrozenRenderAuthority(input: {
   }
   const mentionRows = await input.executor.select().from(externalMentionFacts)
     .where(eq(externalMentionFacts.messageId, input.message.id));
+  // Raft-principal mentions freeze to their Slack token here, inside the
+  // admission transaction. Humans use the install's confirmed canonical
+  // group; agents use the install/server usergroup mapping. A
+  // principal without either stays a literal @handle (highlightless, same
+  // as today) rather than blocking the send.
+  const raftMentionRows = await input.executor.select({
+    targetType: messageMentions.targetType,
+    targetId: messageMentions.targetId,
+    handleAtSendTime: messageMentions.handleAtSendTime,
+  }).from(messageMentions).where(and(
+    eq(messageMentions.messageId, input.message.id),
+    eq(messageMentions.serverId, conversation.serverId),
+  ));
+  const raftUserMentionIds = raftMentionRows
+    .filter((mention) => mention.targetType === "user")
+    .map((mention) => mention.targetId);
+  const raftAgentMentionIds = raftMentionRows
+    .filter((mention) => mention.targetType === "agent")
+    .map((mention) => mention.targetId);
+  // Usergroup mappings only exist for real install identities; a synthetic
+  // test authority (non-UUID installId) cannot have any, so skip before the
+  // uuid-typed join column rejects the value.
+  const installUuid = UUID_PATTERN.test(authority.installId);
+  const allPrincipalIds = [...raftUserMentionIds, ...raftAgentMentionIds];
+  const principalUsergroups = installUuid && allPrincipalIds.length > 0
+    ? await input.executor.select({
+      principalId: slackUsergroupIdentities.principalId,
+      principalKind: slackUsergroupIdentities.principalKind,
+      providerUsergroupId: slackUsergroupIdentities.providerUsergroupId,
+    }).from(slackUsergroupIdentities).where(and(
+      eq(slackUsergroupIdentities.installId, authority.installId),
+      or(
+        and(eq(slackUsergroupIdentities.principalKind, "user"), eq(slackUsergroupIdentities.humanCanonical, true), inArray(slackUsergroupIdentities.principalId, raftUserMentionIds)),
+        and(eq(slackUsergroupIdentities.principalKind, "agent"), eq(slackUsergroupIdentities.serverId, conversation.serverId), inArray(slackUsergroupIdentities.principalId, raftAgentMentionIds)),
+      ),
+    ))
+    : [];
+  const providerUsergroupByPrincipal = new Map(
+    principalUsergroups.map((row) => [`${row.principalKind}:${row.principalId}`, row.providerUsergroupId]),
+  );
+  const raftMentionSubstitutions: SlackBridgeFrozenMentionSubstitution[] = [];
+  const seenSubstitutionTargets = new Set<string>();
+  for (const mention of raftMentionRows) {
+    const handle = mention.handleAtSendTime.trim();
+    if (
+      !handle
+      || /^[@<>&\s\u0000-\u001f\u007f]/u.test(handle)
+      || seenSubstitutionTargets.has(`${mention.targetType}:${mention.targetId}`)
+    ) continue;
+    const providerUsergroupId = providerUsergroupByPrincipal.get(`${mention.targetType}:${mention.targetId}`) ?? null;
+    const token = providerUsergroupId && /^S[A-Z0-9_]{2,}$/.test(providerUsergroupId)
+      ? `<!subteam^${providerUsergroupId}>`
+      : null;
+    if (!token) continue;
+    seenSubstitutionTargets.add(`${mention.targetType}:${mention.targetId}`);
+    raftMentionSubstitutions.push({
+      // The kind field follows the token shape, not the Raft principal type:
+      // every live substitution renders through a managed usergroup, so the
+      // worker's frozen-snapshot contract only accepts "usergroup" here.
+      kind: "usergroup",
+      handle,
+      token,
+      installId: authority.installId,
+      bindingId: authority.bindingId,
+      bindingEpoch: authority.bindingEpoch,
+    });
+  }
   const linkedAttachments = await input.executor.select({
     projection: attachments,
     object: attachmentObjects,
@@ -713,30 +807,25 @@ async function resolveFrozenRenderAuthority(input: {
   }));
   validateFrozenMentions(externalMentions, authority);
 
-  const attachmentTransferEnabled = input.activeRuntime.attachmentTransferEnabled === true;
-  const frozenAttachments: SlackBridgeFrozenAttachment[] = attachmentTransferEnabled
-    ? linkedAttachments.map(({ projection, object }, messagePosition) => {
-        if (
-          projection.revokedAt
-          || !object
-          || object.lifecycleState !== "active"
-          || projection.messagePosition !== messagePosition
-          || !object.contentHash
-          || !/^[0-9a-f]{64}$/.test(object.contentHash)
-        ) throw new Error("Slack Bridge attachment source is not immutable and ordered");
-        return {
-          sourceAttachmentId: projection.id,
-          objectId: object.id,
-          originServerId: object.originServerId,
-          storageKey: object.storageKey,
-          filename: projection.filename,
-          mimeType: object.mimeType,
-          sizeBytes: object.sizeBytes,
-          contentDigest: object.contentHash,
-          messagePosition,
-        };
-      })
-    : [];
+  const frozenAttachments: SlackBridgeFrozenAttachment[] = linkedAttachments.map(({ projection, object }, messagePosition) => {
+    if (
+      projection.revokedAt
+      || !object
+      || object.lifecycleState !== "active"
+      || projection.messagePosition !== messagePosition
+    ) throw new Error("Slack Bridge attachment source is not immutable and ordered");
+    return {
+      sourceAttachmentId: projection.id,
+      objectId: object.id,
+      originServerId: object.originServerId,
+      storageKey: object.storageKey,
+      filename: projection.filename,
+      mimeType: object.mimeType,
+      sizeBytes: object.sizeBytes,
+      contentDigest: attachmentSha256OrNull(object.contentHash),
+      messagePosition,
+    };
+  });
 
   const authorPresentation: SlackBridgeFrozenAuthorPresentation = {
     displayName,
@@ -747,12 +836,7 @@ async function resolveFrozenRenderAuthority(input: {
       avatarUrl: presentation[0]!.avatarUrl,
     }),
   };
-  const sanitizedText = linkedAttachments.length > 0 && !attachmentTransferEnabled
-    ? appendSlackBridgeAttachmentMarker(input.sanitizedText)
-    : input.sanitizedText;
-  if (sanitizedText.length > 40_000) {
-    throw new Error("Slack Bridge attachment marker exceeds the provider text limit");
-  }
+  const sanitizedText = input.sanitizedText;
 
   return {
     schema: SLACK_BRIDGE_RENDER_SNAPSHOT_SCHEMA,
@@ -768,6 +852,7 @@ async function resolveFrozenRenderAuthority(input: {
     authorPresentation,
     sanitizedText,
     externalMentions,
+    raftMentionSubstitutions,
     attachments: frozenAttachments,
     bindingAuthority: { ...authority },
     enqueueRuntimeRevision: input.activeRuntime.runtimePredicateRevision,

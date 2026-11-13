@@ -1,3 +1,5 @@
+import type { SlackTestIdentityObserver } from "../services/slackInboundIdentityObservation";
+import type { SlackLifecycleMemberProfile } from "../services/slackChannelLifecycleObservation";
 import {
   type ErrorRequestHandler,
   type Request,
@@ -42,11 +44,19 @@ import {
   type SlackIngressEventStatus,
 } from "../services/slackProviderAdapter";
 import { slackBridgeIngressObservationsTotal } from "../metrics";
+import type { SlackVerifiedIngressPayloadCrypto } from "../services/slackVerifiedIngressContracts";
 import { SLACK_BRIDGE_REQUIRED_BOT_SCOPES } from "../services/slackBridgeProductionAppContract";
 
 export { SLACK_BRIDGE_REQUIRED_BOT_SCOPES } from "../services/slackBridgeProductionAppContract";
 
 import { UUID_RE as UUID_PATTERN } from "../lib/messageId";
+import { addTraceEvent } from "../tracing/semanticTrace";
+import {
+  clearOAuthBrowserBindingCookie,
+  oauthBrowserBindingCookie,
+  oauthCallbackIsBound,
+  type OAuthBrowserBinding,
+} from "../services/oauthBrowserBinding";
 const OAUTH_CODE_MAX_LENGTH = 4_096;
 const OAUTH_STATE_MAX_LENGTH = 1_024;
 const OAUTH_LEASE_AUDIENCE = "slack-oauth-exchange";
@@ -115,6 +125,16 @@ export interface SlackBridgeProvisioningRequestAuthority {
   serverId: string;
   requestingUserId: string;
   now: Date;
+  includeDeliveryHealth?: boolean;
+  includePairDeliveryHealth?: boolean;
+  includeWorkspaceAdminHint?: boolean;
+  /** `?confirmationHint=1`: a pair block Raft cannot confirm yet carries `detail` (strict older clients don't ask). */
+  includeConfirmationHint?: boolean;
+  includeAttachmentSourceHealth?: boolean;
+  /** `?cardEditNotices=1`: RFC 082 §4.6 card Slack notices (strict older clients don't ask). */
+  includeCardEditNotices?: boolean;
+  includePrivateAuthorizerHint?: boolean;
+  includeInboundRecovery?: boolean;
 }
 
 /**
@@ -136,6 +156,18 @@ export interface SlackBridgeProvisioningControlPlane {
   }): Promise<SlackBridgeProvisioningResponse>;
   runPreflight(input: SlackBridgeProvisioningRequestAuthority): Promise<SlackBridgeProvisioningResponse>;
   enable(input: SlackBridgeProvisioningRequestAuthority): Promise<SlackBridgeProvisioningResponse>;
+  retryDelivery?(input: SlackBridgeProvisioningRequestAuthority & {
+    bindingId: string;
+    bindingEpoch: number;
+    deliveryId: string;
+    expectedProviderAttempts: number;
+  }): Promise<SlackBridgeProvisioningResponse>;
+  replayInbound?(input: SlackBridgeProvisioningRequestAuthority & {
+    bindingId: string;
+    bindingEpoch: number;
+    eventId?: string;
+    reason?: string;
+  }): Promise<SlackBridgeProvisioningResponse>;
   /** Re-activates this server's bindings paused by a re-authorization; null when none were paused. */
   resumeAfterReauthorization?(input: SlackBridgeProvisioningRequestAuthority): Promise<SlackBridgeProvisioningResponse | null>;
 }
@@ -166,9 +198,12 @@ export interface SlackBridgeRouteDependencies {
   secretResolver: ExternalIngressSecretResolver;
   payloadSealer: ExternalIngressPayloadSealer;
   runtimeResolver?: ExternalIngressRuntimeResolver;
+  verifiedIngressCrypto?: SlackVerifiedIngressPayloadCrypto;
+  testIdentityObserver?: SlackTestIdentityObserver;
   admitSlackIngress?: SlackIngressAuthorityAdapter;
   provisioning?: SlackBridgeProvisioningControlPlane;
-  requestLifecycleReconcile?(): Promise<unknown> | void;
+  requestLifecycleReconcile?(bindingId?: string): Promise<unknown> | void;
+  readLifecycleMemberProfile?(bindingId: string, providerUserId: string): Promise<SlackLifecycleMemberProfile | null>;
   onLifecycleError?(error: unknown): void;
   now?(): Date;
 }
@@ -181,6 +216,8 @@ export interface SlackBridgeRouteHandlers {
   disconnectProvisioning: RequestHandler;
   runPreflight: RequestHandler;
   enable: RequestHandler;
+  retryDelivery: RequestHandler;
+  replayInbound: RequestHandler;
   startOAuth: RequestHandler;
   completeOAuth: RequestHandler;
   observeEventsArrival: RequestHandler;
@@ -347,13 +384,22 @@ function controlPlaneError(error: ExternalAppControlPlaneError, res: Response): 
   const status = error.code === "external_app_not_authorized"
     ? 403
     : error.code === "external_app_install_conflict"
+      || error.code === "external_app_workspace_mismatch"
       || error.code === "external_app_scope_mismatch"
       ? 409
       : error.code === "external_app_invalid_state"
         ? 400
         : 503;
+  addTraceEvent("slack_bridge.provisioning.rejected", {
+    code: error.code,
+    ...(error.reason ? { reason: error.reason } : {}),
+  });
   noStore(res);
-  res.status(status).json({ ok: false, code: error.code });
+  res.status(status).json({ ok: false, code: error.code, ...(error.reason ? { reason: error.reason } : {}),
+    ...(error.code === "external_app_workspace_mismatch" ? {
+      message: "You selected another Slack workspace. Reauthorize the connected workspace, or disconnect it before switching.",
+    } : {}),
+  });
 }
 
 async function handleProvisioningOperation(
@@ -408,12 +454,14 @@ function oauthAuthorizationUrl(input: {
   providerOAuthClientId: string;
   redirectUri: string;
   state: string;
+  providerTeamId: string | null;
 }): string {
   const url = new URL("https://slack.com/oauth/v2/authorize");
   url.searchParams.set("client_id", input.providerOAuthClientId);
   url.searchParams.set("scope", SLACK_BRIDGE_REQUIRED_BOT_SCOPES.join(","));
   url.searchParams.set("redirect_uri", input.redirectUri);
   url.searchParams.set("state", input.state);
+  if (input.providerTeamId) url.searchParams.set("team", input.providerTeamId);
   return url.toString();
 }
 
@@ -535,12 +583,22 @@ function sendIngressResponse(result: SlackEventsHttpResponse, res: Response): vo
   res.status(result.statusCode).json({ ok: true });
 }
 
+/** The Slack install's browser binding: its cookie is scoped to the registered callback path. */
+function slackOAuthBinding(dependencies: { oauthRedirectUri: string }): OAuthBrowserBinding {
+  return { prefix: "raft_slack_oauth", callbackPath: new URL(dependencies.oauthRedirectUri).pathname };
+}
+
 export function createSlackBridgeRouteHandlers(
   dependencies?: SlackBridgeRouteDependencies,
 ): SlackBridgeRouteHandlers {
   const loadProvisioning: RequestHandler = async (req, res) => {
     await handleProvisioningOperation(req, res, dependencies, (controlPlane, authority) =>
-      controlPlane.load(authority));
+      controlPlane.load({ ...authority, includeDeliveryHealth: req.query.deliveryHealth === "1",
+        includePairDeliveryHealth: req.query.pairDeliveryHealth === "1", includeWorkspaceAdminHint: req.query.workspaceAdminHint === "1",
+        includeConfirmationHint: req.query.confirmationHint === "1",
+        includePrivateAuthorizerHint: req.query.privateAuthorizerHint === "1", includeAttachmentSourceHealth: req.query.attachmentSourceHealth === "1",
+        includeCardEditNotices: req.query.cardEditNotices === "1",
+        includeInboundRecovery: req.query.inboundRecovery === "1" }));
   };
 
   const connectProvisioning: RequestHandler = async (req, res) => {
@@ -596,6 +654,42 @@ export function createSlackBridgeRouteHandlers(
       controlPlane.enable(authority));
   };
 
+  const retryDelivery: RequestHandler = async (req, res) => {
+    const body = objectBody(req);
+    const bindingId = uuid(body.bindingId);
+    const deliveryId = uuid(body.deliveryId);
+    const bindingEpoch = positiveInteger(body.bindingEpoch);
+    const expectedProviderAttempts = positiveInteger(body.expectedProviderAttempts);
+    if (!expectedProviderAttempts || !bindingId || !deliveryId || !bindingEpoch || body.duplicateRiskAcknowledged !== true) {
+      noStore(res);
+      res.status(400).json({ ok: false, code: "slack_delivery_retry_invalid" });
+      return;
+    }
+    await handleProvisioningOperation(req, res, dependencies, (controlPlane, authority) => {
+      if (!controlPlane.retryDelivery) throw new ExternalAppControlPlaneError("Delivery retry is unavailable", "external_app_invalid_state");
+      return controlPlane.retryDelivery({ ...authority, bindingId, bindingEpoch, deliveryId, expectedProviderAttempts });
+    });
+  };
+
+  const replayInbound: RequestHandler = async (req, res) => {
+    const body = objectBody(req);
+    const bindingId = uuid(body.bindingId);
+    const bindingEpoch = positiveInteger(body.bindingEpoch);
+    const eventId = uuid(body.eventId);
+    const reason = typeof body.reason === "string" && /^[a-z][a-z0-9_]{0,159}$/u.test(body.reason) ? body.reason : null;
+    if (!bindingId || !bindingEpoch || ("eventId" in body && !eventId) || ("reason" in body && !reason)
+      || (!!eventId === !!reason)) {
+      noStore(res);
+      res.status(400).json({ ok: false, code: "slack_inbound_replay_invalid" });
+      return;
+    }
+    await handleProvisioningOperation(req, res, dependencies, (controlPlane, authority) => {
+      if (!controlPlane.replayInbound) throw new ExternalAppControlPlaneError("Inbound replay is unavailable", "external_app_invalid_state");
+      return controlPlane.replayInbound({ ...authority, bindingId, bindingEpoch,
+        ...(eventId ? { eventId } : { reason: reason! }) });
+    });
+  };
+
   const startOAuth: RequestHandler = async (req, res) => {
     if (!runtimeReady(dependencies)) {
       unavailable(res);
@@ -637,11 +731,18 @@ export function createSlackBridgeRouteHandlers(
         return;
       }
       noStore(res);
+      // Bind the install to this browser: only it may finish the sign-in.
+      res.append("Set-Cookie", oauthBrowserBindingCookie(
+        slackOAuthBinding(dependencies),
+        begun.state,
+        (begun.expiresAt.getTime() - now.getTime()) / 1000,
+      ));
       res.status(201).json({
         authorizationUrl: oauthAuthorizationUrl({
           providerOAuthClientId: begun.providerOAuthClientId,
           redirectUri: dependencies.oauthRedirectUri,
           state: begun.state,
+          providerTeamId: begun.providerTeamId,
         }),
         expiresAt: begun.expiresAt.toISOString(),
       });
@@ -661,6 +762,8 @@ export function createSlackBridgeRouteHandlers(
     }
     const now = safeNow(dependencies);
     const state = queryString(req.query.state, OAUTH_STATE_MAX_LENGTH);
+    // One callback per sign-in: whatever happens next, this browser's binding is spent.
+    if (state) res.append("Set-Cookie", clearOAuthBrowserBindingCookie(slackOAuthBinding(dependencies), state));
     if (!now || !state) {
       noStore(res);
       res.status(400).json({ ok: false, code: "slack_oauth_callback_invalid" });
@@ -680,6 +783,16 @@ export function createSlackBridgeRouteHandlers(
         return;
       }
       unavailable(res);
+      return;
+    }
+
+    // Only the browser that started the install may finish it. Anyone else who
+    // opens the authorization link would otherwise connect their workspace to
+    // the starter's Server; the attempt is fenced before any provider call.
+    if (!oauthCallbackIsBound(slackOAuthBinding(dependencies), req.headers.cookie, state)) {
+      await fenceUnknown(claimed.attemptId);
+      noStore(res);
+      res.status(400).json({ ok: false, code: "slack_oauth_callback_unbound" });
       return;
     }
 
@@ -814,6 +927,7 @@ export function createSlackBridgeRouteHandlers(
         providerTeamId: outcome.providerTeamId,
         providerEnterpriseId: outcome.providerEnterpriseId,
         providerUserId: outcome.providerUserId,
+        workspaceAdminVerified: outcome.workspaceAdminVerified === true,
         botUserId: outcome.botUserId,
         providerBotId: outcome.providerBotId,
         workspaceName: outcome.workspaceName,
@@ -891,6 +1005,14 @@ export function createSlackBridgeRouteHandlers(
         secretResolver: dependencies.secretResolver,
         payloadSealer: dependencies.payloadSealer,
         runtimeResolver: dependencies.runtimeResolver,
+        verifiedIngressCrypto: dependencies.verifiedIngressCrypto,
+        testIdentityObserver: dependencies.testIdentityObserver,
+        readLifecycleMemberProfile: dependencies.readLifecycleMemberProfile,
+        requestLifecycleRefresh(bindingId) {
+          try { Promise.resolve(dependencies.requestLifecycleReconcile?.(bindingId))
+            .catch(error => dependencies.onLifecycleError?.(error)); }
+          catch (error) { dependencies.onLifecycleError?.(error); }
+        },
         now: safeNow(dependencies) ?? undefined,
       });
       observeSlackIngress(
@@ -901,17 +1023,6 @@ export function createSlackBridgeRouteHandlers(
         delivery,
       );
       sendIngressResponse(result, res);
-      // Durable admission is the acknowledgement boundary. Lifecycle refresh
-      // is best-effort after that boundary: its failure must not turn an
-      // accepted Slack event into a provider retry and duplicate admission.
-      if (result.body.kind === "event" && dependencies.requestLifecycleReconcile) {
-        try {
-          void Promise.resolve(dependencies.requestLifecycleReconcile())
-            .catch((error) => dependencies.onLifecycleError?.(error));
-        } catch (error) {
-          dependencies.onLifecycleError?.(error);
-        }
-      }
     } catch (error) {
       if (error instanceof ExternalAppIngressError) {
         observeSlackIngress("terminal", error.code, delivery);
@@ -931,6 +1042,8 @@ export function createSlackBridgeRouteHandlers(
     disconnectProvisioning,
     runPreflight,
     enable,
+    retryDelivery,
+    replayInbound,
     startOAuth,
     completeOAuth,
     observeEventsArrival,

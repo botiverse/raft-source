@@ -1,4 +1,5 @@
 import api from "../api/client";
+import { TASK_STATUSES } from "@botiverse/raft-shared";
 import type { TaskStatus } from "@botiverse/raft-shared";
 
 export interface TaskFact {
@@ -15,7 +16,7 @@ export interface TaskSnapshot {
   fetchedAt: string;
 }
 export const TASK_SNAPSHOT_LIMIT = 1000;
-const STATUSES: TaskStatus[] = ["todo", "in_progress", "in_review", "done", "closed"];
+const STATUSES: readonly TaskStatus[] = TASK_STATUSES;
 function parseTask(value: unknown): TaskFact {
   if (!value || typeof value !== "object") throw new Error("Invalid task row");
   const row = value as Record<string, unknown>;
@@ -55,7 +56,7 @@ export async function loadTaskSnapshot(serverId: string, signal: AbortSignal): P
   return { tasks, complete: false, fetchedAt: new Date().toISOString() };
 }
 export function summarizeTasks(tasks: readonly TaskFact[]) {
-  const statuses: Record<TaskStatus, number> = { todo: 0, in_progress: 0, in_review: 0, done: 0, closed: 0 };
+  const statuses: Record<TaskStatus, number> = { backlog: 0, todo: 0, in_progress: 0, in_review: 0, done: 0, closed: 0 };
   const owners = { user: 0, agent: 0, unassigned: 0 };
   const durations: number[] = [];
   for (const task of tasks) {

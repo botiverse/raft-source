@@ -1,4 +1,7 @@
 import { isElectronDesktopShell } from "../../utils/desktopShell";
+import { getDesktopBridge } from "../../utils/desktopBridge";
+import { correlateSelfMachine } from "../machine/localComputer/localComputerLogic";
+import type { LocalMachineIdentity } from "../machine/localComputer/localComputerLogic";
 
 // Desktop-only Handoff (#kabi-desktop task #13 → task #104): recent LOCAL
 // Claude Code / Codex sessions read through the electron bridge, migrated into a
@@ -45,7 +48,7 @@ export interface HandoffBridge {
 export function getHandoffBridge(): HandoffBridge | null {
   // Runtime narrowing, not just a type assertion: the preload owns this shape,
   // but a stale/foreign global must not crash the flow.
-  const handoff = (globalThis as { raftDesktop?: { handoff?: unknown } }).raftDesktop?.handoff;
+  const handoff: unknown = getDesktopBridge()?.handoff;
   if (!handoff || typeof handoff !== "object") return null;
   const candidate = handoff as Partial<HandoffBridge>;
   if (typeof candidate.listSessions !== "function" || typeof candidate.sessionExcerpt !== "function") return null;
@@ -78,59 +81,28 @@ export function searchReducer(_state: SearchState, action: SearchAction): Search
   }
 }
 
-export interface LocalIdentity {
-  hostname: string | null;
-  /** Authoritative machine ids from the local computer host's attachments. */
-  machineIds: string[];
-}
-
-export async function getLocalIdentity(): Promise<LocalIdentity> {
-  const computer = (globalThis as {
-    raftDesktop?: {
-      computer?: {
-        getLocalInfo?: () => Promise<{ hostname: string }>;
-        getStatus?: () => Promise<unknown>;
-      };
-    };
-  }).raftDesktop?.computer;
-  const hostname = typeof computer?.getLocalInfo === "function"
-    ? await computer.getLocalInfo().then((info) => info?.hostname ?? null).catch(() => null)
-    : null;
-  const status = typeof computer?.getStatus === "function"
-    ? await computer.getStatus().catch(() => null)
-    : null;
-  const rows = (status as { servers?: Array<{ machineId?: string | null }> } | null)?.servers ?? [];
-  const machineIds = rows
-    .map((row) => row.machineId)
-    .filter((id): id is string => typeof id === "string" && id.length > 0);
-  return { hostname, machineIds };
-}
+export type LocalIdentity = LocalMachineIdentity;
 
 export interface MachineLike {
   id: string;
   hostname: string | null;
   status: "online" | "offline";
+  computerAttachedByCurrentUser?: boolean;
 }
 
 /**
- * The machineStore row this app runs on, ONLINE only. Mirrors the desktop
- * frontend's `correlateSelfMachine` contract: authoritative attachment
- * machineIds win; hostname is only trusted when it matches exactly one row —
- * duplicate hostnames must not route a handoff to a different computer.
+ * The machineStore row this app runs on, ONLINE only: the same match as the
+ * Computers list's "This device" (correlateSelfMachine — the attachment's
+ * machineId; a hostname only while no attachment names an id, for a row the
+ * current user attached, matching exactly one such row — so a handoff never
+ * routes to another computer).
  */
 export function pickLocalOnlineMachine<T extends MachineLike>(
   machines: readonly T[],
   identity: LocalIdentity,
 ): T | null {
-  for (const id of identity.machineIds) {
-    const match = machines.find((m) => m.id === id);
-    if (match) return match.status === "online" ? match : null;
-  }
-  if (identity.hostname) {
-    const matches = machines.filter((m) => m.hostname === identity.hostname);
-    if (matches.length === 1 && matches[0].status === "online") return matches[0];
-  }
-  return null;
+  const match = correlateSelfMachine(machines, identity);
+  return match?.status === "online" ? match : null;
 }
 
 export const TOOL_LABEL: Record<LocalSession["tool"], string> = {

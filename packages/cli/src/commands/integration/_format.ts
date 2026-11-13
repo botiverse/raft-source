@@ -5,6 +5,8 @@ import type {
 } from "@botiverse/raft-shared";
 import {
   AGENT_LOGIN_INTEGRATION_INVENTORY_PROJECTION,
+  foldAgentOneLineText,
+  formatManagedMcpPromptName,
 } from "@botiverse/raft-shared/src/agentCliSurface";
 
 export interface RegisteredIntegrationService {
@@ -44,9 +46,31 @@ export interface ActiveAgentLogin {
   createdAt: string;
 }
 
+/**
+ * An MCP App this Agent has. MCP Apps and Agent Login services are all Raft Apps, of different
+ * types: an MCP App is used through the MCP tools it gives the runtime, never through
+ * `raft integration login` / `invoke`. Mirrors the server's `agentApiIntegrationMcpAppSchema`;
+ * `state` is kept open (`string`) so a state a newer server adds is shown rather than dropped.
+ */
+export interface IntegrationMcpApp {
+  type: "mcp";
+  id: string;
+  name: string;
+  description: string | null;
+  homepageUrl: string | null;
+  state: "ready" | "login_required" | "authorization_expired" | "disabled" | (string & {});
+  access: "mcp_tools";
+  toolCount: number;
+  toolNames: string[];
+  /** Whether this Agent has the App; absent from older servers, which listed only Apps it has. */
+  grant?: "granted" | "revoked" | "not_granted" | (string & {});
+}
+
 export interface IntegrationListResponse {
   services: RegisteredIntegrationService[];
   activeLogins: ActiveAgentLogin[];
+  /** Absent from servers older than MCP Apps in this list. */
+  mcpApps?: IntegrationMcpApp[];
 }
 
 export function projectCurrentIntegrationList(data: IntegrationListResponse): IntegrationListResponse {
@@ -57,18 +81,94 @@ export function projectCurrentIntegrationList(data: IntegrationListResponse): In
     activeLogins: data.activeLogins.filter((login) => (
       login.appType !== "slock_builtin" && serviceIds.has(login.serviceId)
     )),
+    ...(Array.isArray(data.mcpApps) ? { mcpApps: data.mcpApps } : {}),
   };
+}
+
+function normalizeServiceQuery(value: string): string {
+  return value.trim().toLowerCase();
+}
+
+/**
+ * The MCP App a `--service` argument names (by id, or by name, case-insensitive), so `login`,
+ * `invoke` and `env` can say what it is instead of "not found".
+ */
+export function findMcpAppForService(data: Pick<IntegrationListResponse, "mcpApps">, service: string): IntegrationMcpApp | null {
+  const query = service.trim();
+  if (!query) return null;
+  const apps = data.mcpApps ?? [];
+  return apps.find((app) => app.id === query)
+    ?? apps.find((app) => normalizeServiceQuery(app.name) === normalizeServiceQuery(query))
+    ?? null;
+}
+
+const MCP_APP_STATE_LABEL: Record<string, string> = {
+  ready: "ready",
+  login_required: "needs sign-in",
+  authorization_expired: "sign-in expired",
+  disabled: "disabled on this server",
+};
+
+const MCP_APP_GRANT_LABEL: Record<string, string> = {
+  granted: "granted",
+  revoked: "revoked",
+  not_granted: "not granted",
+};
+
+function mcpAppGranted(app: IntegrationMcpApp): boolean {
+  return app.grant === undefined || app.grant === "granted";
+}
+
+/**
+ * The next step for an MCP App. Anything missing (access, or a connection) is asked for with
+ * `raft integration login --service <id> --target <conversation>`, which posts the App's Connect
+ * card there, as an ordinary App's login posts its approval card.
+ */
+function mcpAppNextStep(app: IntegrationMcpApp): string {
+  if (app.state === "disabled") return "a server owner/admin can switch it on; until then its tools are unavailable";
+  if (app.state === "ready" && mcpAppGranted(app)) {
+    return "call its MCP tools from your runtime; they are in your tool list (if not yet, use raft_app_tools / raft_app_call)";
+  }
+  const login = `raft integration login --service ${JSON.stringify(app.id)} --target <channel-or-thread>`;
+  if (!mcpAppGranted(app)) {
+    return `run \`${login}\` to post a request card in that conversation for a person who can grant you this App; use its tools after they have`;
+  }
+  return `run \`${login}\` to post a request card in that conversation for a person who can connect it (calling any of its tools from a conversation raises the same card there); use its tools after they have`;
+}
+
+/** The message `login` / `invoke` / `env` give for an MCP App: there is no Agent Login for it. */
+export function mcpAppIsNotAgentLoginMessage(app: IntegrationMcpApp, command: string): string {
+  // App and tool names reach the model quoted on one line (formatManagedMcpPromptName).
+  return `${formatManagedMcpPromptName(app.name)} is an MCP App (type: MCP), not an Agent Login service: \`raft integration ${command}\` does not apply to it. `
+    + `It is used through the MCP tools it gives your runtime. State: ${MCP_APP_STATE_LABEL[app.state] ?? app.state}; next: ${mcpAppNextStep(app)}.`;
+}
+
+function pushMcpAppBlock(lines: string[], app: IntegrationMcpApp): void {
+  lines.push(`- ${foldAgentOneLineText(app.name)}`);
+  lines.push("  type: MCP");
+  lines.push(`  id: ${app.id}`);
+  if (app.grant !== undefined) lines.push(`  grant: ${MCP_APP_GRANT_LABEL[app.grant] ?? app.grant}`);
+  lines.push(`  state: ${MCP_APP_STATE_LABEL[app.state] ?? app.state}`);
+  // Tool names come from the remote MCP server: each quoted on one line (formatManagedMcpPromptName).
+  const shown = app.toolNames.slice(0, 10).map(formatManagedMcpPromptName);
+  const more = app.toolNames.length - shown.length;
+  lines.push(`  tools: ${app.toolCount}${shown.length > 0 ? ` (${shown.join(", ")}${more > 0 ? `, +${more} more` : ""})` : ""}`);
+  if (app.homepageUrl) lines.push(`  homepage: ${app.homepageUrl}`);
+  if (app.description) lines.push(`  description: ${foldAgentOneLineText(app.description)}`);
+  lines.push(`  next: ${mcpAppNextStep(app)}`);
 }
 
 export interface IntegrationLoginResponse {
   status: "logged_in" | "already_logged_in" | "approval_required" | "install_required";
   nextAction?: "install_from_marketplace";
+  /** Supplied only by Raft's login response; absent on older Servers. */
+  agentHandoffProtocol?: string;
   service: RegisteredIntegrationService;
   scopes: string[];
   requestId?: string;
   session?: {
     status: "stored";
-    authentication?: "unverified";
+    authentication?: "unverified" | "verified";
     source: "cache" | "fresh";
     path: string | null;
   };
@@ -112,7 +212,7 @@ function pushServiceBlock(
   service: RegisteredIntegrationService,
   active: ActiveAgentLogin | undefined,
 ): void {
-  lines.push(`- ${service.name}`);
+  lines.push(`- ${foldAgentOneLineText(service.name)}`);
   lines.push(`  service: ${service.clientId}`);
   lines.push(`  id: ${service.id}`);
   lines.push(`  session: ${active ? "active login" : "not logged in"}`);
@@ -127,7 +227,7 @@ function pushServiceBlock(
     if (service.setup.url) lines.push(`  setup link for a Server administrator: ${service.setup.url}`);
   } else if (service.setupUrl) lines.push("  post-install setup: required");
   if (service.homepageUrl) lines.push(`  homepage: ${service.homepageUrl}`);
-  if (service.description) lines.push(`  description: ${service.description}`);
+  if (service.description) lines.push(`  description: ${foldAgentOneLineText(service.description)}`);
   // Contract rev3.1 §4b: the `official` mark is platform-set, never app-supplied, and
   // the list shows installed services only. Ordinary services print neither line.
   if (service.official === true) lines.push("  official: yes (set by the platform, never by the app)");
@@ -171,7 +271,7 @@ export const formatIntegrationList = axSurface(
     lines.push("- none");
   } else {
     for (const login of visibleActiveLogins) {
-      lines.push(`- ${login.name}`);
+      lines.push(`- ${foldAgentOneLineText(login.name)}`);
       lines.push(`  service: ${login.clientId}`);
       lines.push(`  grant id: ${login.id}`);
       lines.push("  session: active login");
@@ -186,10 +286,33 @@ export const formatIntegrationList = axSurface(
     }
   }
 
+  lines.push("");
+  lines.push("MCP Apps (used through their MCP tools, not `invoke`; `login` asks a person for access or a connection):");
+  if (data.mcpApps === undefined) {
+    lines.push("- not reported: this server predates MCP Apps in this list; see your Apps tab");
+  } else if (data.mcpApps.length === 0) {
+    lines.push("- none");
+  } else {
+    for (const app of data.mcpApps) pushMcpAppBlock(lines, app);
+  }
+
   return (lines.join("\n"));
 },
   {
-    examples: [{ args: [{ services: [{ id: "svc-2", clientId: "lens", name: "lens", appType: "third_party_global", description: "trajectory viewer", returnUrl: "https://lens.example/callback", homepageUrl: "https://lens.example", agentManifestUrl: null }], activeLogins: [{ id: "grant-00000001", serviceId: "svc-2", clientId: "lens", name: "lens", description: "trajectory viewer", homepageUrl: "https://lens.example", returnUrl: "https://lens.example/callback", agentManifestUrl: null, scopes: ["identity", "openid"], createdAt: "2026-08-31T08:00:00.000Z" }] } as never] }],
+    examples: [{ args: [{ services: [{ id: "svc-2", clientId: "lens", name: "lens", appType: "third_party_global", description: "trajectory viewer", returnUrl: "https://lens.example/callback", homepageUrl: "https://lens.example", agentManifestUrl: null }], activeLogins: [{ id: "grant-00000001", serviceId: "svc-2", clientId: "lens", name: "lens", description: "trajectory viewer", homepageUrl: "https://lens.example", returnUrl: "https://lens.example/callback", agentManifestUrl: null, scopes: ["identity", "openid"], createdAt: "2026-08-31T08:00:00.000Z" }], mcpApps: [{ type: "mcp", id: "mcp-1", name: "Team Notion", description: "Workspace pages", homepageUrl: "https://notion.example", state: "login_required", access: "mcp_tools", toolCount: 2, toolNames: ["notion-search", "notion-fetch"] }] } as never] }],
+  },
+);
+
+/**
+ * `raft integration login` on an MCP App: the server's own answer (a request card posted or reused,
+ * already usable, or --target needed), printed as is. It is written for an Agent and carries the
+ * next step, and is what older CLIs print too.
+ */
+export const formatIntegrationMcpLoginOutcome = axSurface(
+  "raft integration login on an MCP App: the server's answer (request card posted or reused, already usable, or rerun with --target), with the next step.",
+  (message: string) => message,
+  {
+    examples: [{ args: ["\"Team Notion\" is an MCP App, used through its MCP tools rather than Agent Login. A request card was posted to #apps for a person who can connect it. Wait for them to grant it in the card, then call its MCP tools (if they are not in your tool list yet, use raft_app_tools / raft_app_call)."] }],
   },
 );
 
@@ -198,7 +321,7 @@ export const formatIntegrationLogin = axSurface(
   (data: IntegrationLoginOutput): string => {
   if (data.status === "install_required") {
     const lines = [
-      `Marketplace install required: ${data.service.name}`,
+      `Marketplace install required: ${foldAgentOneLineText(data.service.name)}`,
       `service: ${data.service.clientId}`,
       `id: ${data.service.id}`,
       `server: ${data.installation?.serverName ?? "-"}`,
@@ -220,7 +343,7 @@ export const formatIntegrationLogin = axSurface(
   }
   if (data.status === "approval_required") {
     const lines = [
-      `Human approval required: ${data.service.name}`,
+      `Human approval required: ${foldAgentOneLineText(data.service.name)}`,
       `service: ${data.service.clientId}`,
       `id: ${data.service.id}`,
       `scopes: ${data.scopes.length > 0 ? data.scopes.join(", ") : "-"}`,
@@ -239,7 +362,7 @@ export const formatIntegrationLogin = axSurface(
 
   const verb = "Raft grant active";
   const lines = [
-    `${verb}: ${data.service.name}`,
+    `${verb}: ${foldAgentOneLineText(data.service.name)}`,
     `service: ${data.service.clientId}`,
     `id: ${data.service.id}`,
     `scopes: ${data.scopes.length > 0 ? data.scopes.join(", ") : "-"}`,
@@ -257,9 +380,13 @@ export const formatIntegrationLogin = axSurface(
   }
   lines.push("identity: run `raft profile show` if the service or human asks for your Raft Agent identity card");
   if (data.session) {
-    lines.push("session: callback cookies stored for this agent; application authentication unverified");
+    lines.push(data.session.authentication === "verified"
+      ? "session: the App confirmed this Agent and Server"
+      : "session: callback cookies stored for this agent; application authentication unverified");
     if (data.session.path) lines.push(`session store: ${data.session.path}`);
-    lines.push(`next: use \`raft integration invoke --service ${JSON.stringify(data.service.clientId)} --list-actions\` only for login_with_raft HTTP API action manifests; for session-cookie services, verify authentication with a documented read-only service check before use`);
+    lines.push(data.session.authentication === "verified"
+      ? `next: use \`raft integration invoke --service ${JSON.stringify(data.service.clientId)} --list-actions\` for login_with_raft HTTP API action manifests`
+      : `next: use \`raft integration invoke --service ${JSON.stringify(data.service.clientId)} --list-actions\` only for login_with_raft HTTP API action manifests; for session-cookie services, verify authentication with a documented read-only service check before use`);
   } else {
     lines.push("session: no service callback session was established; Raft grant is active");
     lines.push("next: follow the service documentation to establish and verify application authentication");

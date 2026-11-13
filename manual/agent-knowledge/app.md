@@ -11,21 +11,38 @@ Verified against:
 - packages/shared/src/apps/cleaner/configProtocol.ts (canonical defaults, bounds, and disk threshold)
 - packages/daemon/src/apps/cleaner/runtime.ts (memory and disk checks, hints presented only at Working → Idle, memory hint with daily rewake cooldown, workspace tip weekly or once per low-disk episode)
 - packages/daemon/src/apps/cleaner/definition.ts (memory threshold action and the guidance action on the workspace tip)
+- packages/shared/src/agentInboxApp.ts and packages/daemon/src/agentCredentialProxy.ts (a Cleaner item's `dismiss:` line; `raft inbox dismiss --target` removes it on the Computer)
+- packages/daemon/src/apps/cleaner/runtime.ts dropCurrentOwnerItem / withdrawClearedReminder (which items the Cleaner removes itself: the memory hint under the threshold, the reminder by its three rules, every item on a config change; never the workspace tip or the weekly "Tidy up" item) and packages/daemon/src/agentAppInboxNotice.ts appInboxItemNoticed (an item updated in place is not announced again; one removed and listed again is)
 - packages/daemon/src/agentProcessManager.ts (Working → Idle signal; notices that must not interrupt a turn)
 - manual/agent-knowledge/inbox.md (linked inbox guide)
 @ verified 2026-10-11 against repository sources; no live runner verification in this update
+Re-verified 2026-10-28 against staging 1883339e9 (public-docs audit fixes):
+- Reminder App: not documented publicly yet, 2026-10-28 (body mentions removed); gate = reminder_app flag (server-scoped, default off) OR app installed+migrated; refusal reminders_moved_to_app on schedule/update/snooze (external agents get reminders_unsupported_for_external_agents first); a moved reminder answers reminder_migrated and has status/event migrated.
+- packages/server/src/services/reminderAppGate.ts + apps/reminder/appMigration.ts (where the Reminder App is active it replaces system.reminder for new reminders)
+- packages/cli/src/commands/message/_format.ts ("App items: not available for external agents.")
 */}
 
 ## Built-in apps
 
 Built-in apps deliver reminders and cleanup hints to your agent's [inbox](/agent-knowledge/inbox).
-Use `raft inbox check` to read them.
+Use `raft inbox check` to read them (app items are not available to external agents).
 
-- **`system.reminder`** delivers due reminders.
+- **`system.reminder`** delivers due reminders. See [Reminder](/agent-knowledge/coordination/reminder).
 - **`system.cleaner`** reminds you to tidy up when `MEMORY.md` exceeds its size threshold, and
   occasionally to tidy your workspace files. It also checks whether the disk holding agent data has
   less than 10% (and under 20 GiB) available space. Low disk space is a machine-wide condition, so
   there is no disk warning for agents; it can only prompt one extra workspace tip.
+
+How long a Cleaner item stays in `raft inbox check`:
+
+- The memory hint: until `MEMORY.md` is back within the threshold.
+- The `.raftbackupignore` reminder: until the Cleaner takes it back (when, is under
+  [Keep your workspace migratable](/agent-knowledge/agent)).
+- The workspace tip, and the "Tidy up" item that came with a memory hint: until you dismiss them.
+  The Cleaner never takes these back.
+
+You can remove any of them yourself: the `dismiss:` line under the row is the command. While an
+item is still in your list, the Cleaner may update its text without telling you again.
 
 ## Respond to a memory hint
 
@@ -46,7 +63,8 @@ never starts a stopped agent or wakes an agent that has not been working.
 ## Respond to a workspace tip
 
 At most once a week the memory hint comes with a separate workspace tip, and low disk space can
-add one more. Cleaner does not scan your workspace. When you have time:
+add one more. Cleaner does not pick files for you; at most it names your largest top-level folders
+(see [Keep your workspace migratable](/agent-knowledge/agent)). When you have time:
 
 - Delete workspace files you are sure you no longer need, such as stale worktrees, old build
   outputs, or temporary downloads.

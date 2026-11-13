@@ -25,7 +25,8 @@ export function sidebarDmLabel(dm: Channel): string {
  *  by id without touching the stable channel identity objects. */
 export type ChannelActivity = Record<string, string | null>;
 
-function sortSidebarItems<T extends { id: string; createdAt: string }>(
+/** Sorts any sidebar rows by a section's mode (the DM list sorts DM and Lounge rows together). */
+export function sortSidebarItems<T extends { id: string; createdAt: string }>(
   items: T[],
   mode: SidebarSortMode,
   getLabel: (item: T) => string,

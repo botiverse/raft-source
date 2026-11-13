@@ -71,6 +71,33 @@ test("real PostgreSQL proves durable reconciliation, exact grants, and binding i
   await target.query("CREATE TABLE feature_flag_rules (id uuid PRIMARY KEY, flag_key text NOT NULL REFERENCES feature_flags(key) ON DELETE CASCADE, stage text NOT NULL)");
   await target.query("CREATE TABLE feature_flag_audiences (key text PRIMARY KEY, name text NOT NULL, description text NOT NULL DEFAULT '', enabled boolean NOT NULL DEFAULT false)");
   await target.query("CREATE TABLE feature_flag_audience_members (id uuid PRIMARY KEY, audience_key text NOT NULL REFERENCES feature_flag_audiences(key), kind text NOT NULL, target_id uuid NOT NULL)");
+  await target.query("CREATE TABLE oauth_clients (id uuid PRIMARY KEY, client_id text NOT NULL UNIQUE, server_id uuid NOT NULL, name text NOT NULL, app_type text NOT NULL, publish_status text NOT NULL, enabled boolean NOT NULL DEFAULT true, client_secret_hash text NOT NULL, UNIQUE (id, client_id, server_id))");
+  await target.query(`CREATE TABLE official_app_registry (
+    oauth_client_id uuid PRIMARY KEY,
+    client_key text NOT NULL UNIQUE,
+    publisher_server_id uuid NOT NULL,
+    auto_install boolean NOT NULL DEFAULT false,
+    purpose text NOT NULL,
+    status text NOT NULL DEFAULT 'pending_review',
+    revision integer NOT NULL DEFAULT 1,
+    created_by_user_id uuid REFERENCES users(id) ON DELETE SET NULL,
+    updated_by_user_id uuid REFERENCES users(id) ON DELETE SET NULL,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    FOREIGN KEY (oauth_client_id, client_key, publisher_server_id) REFERENCES oauth_clients(id, client_id, server_id)
+  )`);
+  await target.query(`CREATE TABLE integration_audit_events (
+    id uuid PRIMARY KEY, server_id uuid, client_id uuid, event_type text NOT NULL, event_category text NOT NULL,
+    outcome text NOT NULL, source text NOT NULL, actor_type text NOT NULL, actor_id uuid, requester_type text,
+    requester_id uuid, subject_type text, subject_id uuid, target_type text NOT NULL, target_id uuid,
+    correlation_id text, request_id text, metadata jsonb NOT NULL DEFAULT '{}'::jsonb, diff jsonb,
+    created_at timestamptz NOT NULL DEFAULT now()
+  )`);
+  // The real interactive link card tables (0386); they reference only each other.
+  const linkCardTables = readFileSync(new URL("../../drizzle/0386_link_card_interactions.sql", import.meta.url), "utf8");
+  await target.query(linkCardTables.replaceAll("--> statement-breakpoint", ""));
+  const linkCardSendTarget = readFileSync(new URL("../../drizzle/0400_link_card_operation_send_target.sql", import.meta.url), "utf8");
+  await target.query(linkCardSendTarget.replaceAll("--> statement-breakpoint", ""));
 
   const migration = readFileSync(
     path.resolve(
@@ -138,6 +165,12 @@ test("real PostgreSQL proves durable reconciliation, exact grants, and binding i
   await target.query(announcementImagePrivilegeMigration);
   const targetingMigration = readFileSync(new URL("../../drizzle/0355_announcement_targeting.sql", import.meta.url), "utf8");
   await target.query(targetingMigration.replaceAll("--> statement-breakpoint", ""));
+  const officialRegistryMigration = readFileSync(new URL("../../drizzle/0384_ffa_official_app_registry_privileges.sql", import.meta.url), "utf8");
+  await target.query(officialRegistryMigration.replaceAll("--> statement-breakpoint", ""));
+  const linkCardResolutionMigration = readFileSync(new URL("../../drizzle/0387_ffa_link_card_resolution_privileges.sql", import.meta.url), "utf8");
+  await target.query(linkCardResolutionMigration.replaceAll("--> statement-breakpoint", ""));
+  const rulesReachMigration = readFileSync(new URL("../../drizzle/0617_announcement_rules_reach.sql", import.meta.url), "utf8");
+  await target.query(rulesReachMigration.replaceAll("--> statement-breakpoint", ""));
   await assert.rejects(
     reconcileAndVerifyFeatureFlagAdminPrivileges((text, values) => target.query(text, values)),
     (error: unknown) => (error as { code?: string }).code === "42704",
@@ -172,6 +205,14 @@ test("real PostgreSQL proves durable reconciliation, exact grants, and binding i
   await target.query(`GRANT INSERT (key, name, description, state, created_at, updated_at) ON TABLE public.lab_definitions TO ${FEATURE_FLAG_ADMIN_OPERATOR_ROLE}`);
   await target.query(`GRANT UPDATE (name, description, state, updated_at) ON TABLE public.lab_definitions TO ${FEATURE_FLAG_ADMIN_OPERATOR_ROLE}`);
   await target.query(`GRANT SELECT (id, server_id, deleted_at) ON TABLE public.agents TO ${FEATURE_FLAG_ADMIN_OPERATOR_ROLE}`);
+  await target.query(`GRANT SELECT (oauth_client_id, client_key, publisher_server_id, auto_install, purpose, status, revision, created_by_user_id, updated_by_user_id, created_at, updated_at) ON TABLE public.official_app_registry TO ${FEATURE_FLAG_ADMIN_OPERATOR_ROLE}`);
+  await target.query(`GRANT INSERT (oauth_client_id, client_key, publisher_server_id, auto_install, purpose, status, revision, created_by_user_id, updated_by_user_id, created_at, updated_at) ON TABLE public.official_app_registry TO ${FEATURE_FLAG_ADMIN_OPERATOR_ROLE}`);
+  await target.query(`GRANT UPDATE (auto_install, purpose, status, revision, updated_by_user_id, updated_at) ON TABLE public.official_app_registry TO ${FEATURE_FLAG_ADMIN_OPERATOR_ROLE}`);
+  await target.query(`GRANT SELECT (id, client_id, server_id, name, app_type, publish_status, enabled) ON TABLE public.oauth_clients TO ${FEATURE_FLAG_ADMIN_OPERATOR_ROLE}`);
+  await target.query(`GRANT INSERT (id, server_id, client_id, event_type, event_category, outcome, source, actor_type, actor_id, subject_type, subject_id, target_type, target_id, request_id, metadata, diff, created_at) ON TABLE public.integration_audit_events TO ${FEATURE_FLAG_ADMIN_OPERATOR_ROLE}`);
+  await target.query(`GRANT SELECT (operation_id, viewer_id, server_id, provider_kind, provider_key, installation_key, message_id, action_id, state, receipt_revision, last_status_at, resolved_by_user_id, resolution_reason, resolved_at, created_at, updated_at) ON TABLE public.link_card_operations TO ${FEATURE_FLAG_ADMIN_OPERATOR_ROLE}`);
+  await target.query(`GRANT UPDATE (state, resolved_by_user_id, resolution_reason, resolved_at, updated_at) ON TABLE public.link_card_operations TO ${FEATURE_FLAG_ADMIN_OPERATOR_ROLE}`);
+  await target.query(`GRANT EXECUTE ON FUNCTION public.announcement_rules_reach(jsonb, text, uuid[], uuid[], timestamptz) TO ${FEATURE_FLAG_ADMIN_OPERATOR_ROLE}`);
   await verifyFeatureFlagAdminPrivileges((text, values) => target.query(text, values));
   await assert.rejects(
     verifyFeatureFlagAdminPrivilegeReceipt((text, values) => target.query(text, values)),
@@ -223,6 +264,114 @@ test("real PostgreSQL proves durable reconciliation, exact grants, and binding i
   await operator.query("UPDATE lab_definitions SET name = 'Tmp2', description = 'd', state = 'open', updated_at = NOW() WHERE key = 'lab_tmp'");
   // Trace identity lookup (0312): the Worker reads only these agents columns and HMACs the ids itself.
   await operator.query("SELECT id, server_id, deleted_at FROM agents");
+  // Official app registry (0384): list apps, register, approve/disable with a revision bump, audit it.
+  await target.query("INSERT INTO users (id, email) VALUES ('00000000-0000-4000-8000-0000000000a1', 'operator@raft.test')");
+  await target.query("INSERT INTO oauth_clients (id, client_id, server_id, name, app_type, publish_status, client_secret_hash) VALUES ('00000000-0000-4000-8000-0000000000a2', 'vault-1a2b3c', '00000000-0000-4000-8000-0000000000a3', 'Vault', 'third_party_global', 'published', 'hash')");
+  await operator.query("SELECT id, client_id, server_id, name, app_type, publish_status, enabled FROM oauth_clients");
+  await operator.query("INSERT INTO official_app_registry (oauth_client_id, client_key, publisher_server_id, auto_install, purpose, status, revision, created_by_user_id, updated_by_user_id, created_at, updated_at) VALUES ('00000000-0000-4000-8000-0000000000a2', 'vault-1a2b3c', '00000000-0000-4000-8000-0000000000a3', false, 'Credentials', 'pending_review', 1, '00000000-0000-4000-8000-0000000000a1', '00000000-0000-4000-8000-0000000000a1', NOW(), NOW())");
+  await operator.query("UPDATE official_app_registry SET status = 'approved', purpose = 'Credentials for agents', auto_install = false, revision = revision + 1, updated_by_user_id = '00000000-0000-4000-8000-0000000000a1', updated_at = NOW() WHERE oauth_client_id = '00000000-0000-4000-8000-0000000000a2'");
+  await operator.query("SELECT oauth_client_id, client_key, publisher_server_id, auto_install, purpose, status, revision, created_by_user_id, updated_by_user_id, created_at, updated_at FROM official_app_registry");
+  await operator.query("INSERT INTO integration_audit_events (id, server_id, client_id, event_type, event_category, outcome, source, actor_type, actor_id, subject_type, subject_id, target_type, target_id, request_id, metadata, diff, created_at) VALUES ('00000000-0000-4000-8000-0000000000a4', '00000000-0000-4000-8000-0000000000a3', '00000000-0000-4000-8000-0000000000a2', 'official_app.registry_updated', 'registration', 'success', 'web', 'human', '00000000-0000-4000-8000-0000000000a1', 'app', '00000000-0000-4000-8000-0000000000a2', 'app', '00000000-0000-4000-8000-0000000000a2', 'req-1', '{}'::jsonb, NULL, NOW())");
+  for (const forbiddenRegistryQuery of [
+    "DELETE FROM official_app_registry",
+    "TRUNCATE official_app_registry",
+    "UPDATE official_app_registry SET client_key = client_key",
+    "UPDATE official_app_registry SET publisher_server_id = publisher_server_id",
+    "UPDATE official_app_registry SET oauth_client_id = oauth_client_id",
+    "UPDATE official_app_registry SET created_by_user_id = NULL",
+    "SELECT client_secret_hash FROM oauth_clients",
+    "SELECT * FROM oauth_clients",
+    "UPDATE oauth_clients SET name = name",
+    "INSERT INTO oauth_clients (id, client_id, server_id, name, app_type, publish_status, client_secret_hash) VALUES ('00000000-0000-4000-8000-0000000000a5', 'x-1a2b3c', '00000000-0000-4000-8000-0000000000a3', 'X', 'server_local', 'private', 'h')",
+    "SELECT id FROM integration_audit_events",
+    "UPDATE integration_audit_events SET outcome = outcome",
+    "DELETE FROM integration_audit_events",
+    "INSERT INTO integration_audit_events (id, event_type, event_category, outcome, source, actor_type, target_type, correlation_id) VALUES ('00000000-0000-4000-8000-0000000000a6', 'x', 'registration', 'success', 'web', 'human', 'app', 'c')",
+  ]) {
+    await assert.rejects(
+      operator.query(forbiddenRegistryQuery),
+      (error: unknown) => (error as { code?: string }).code === "42501",
+      forbiddenRegistryQuery,
+    );
+  }
+  // Announcement reach with rules (0617): the operator gets a count through the function but
+  // still cannot read the columns it is computed from.
+  await target.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS created_at timestamptz NOT NULL DEFAULT now(), ADD COLUMN IF NOT EXISTS display_language text");
+  await target.query("ALTER TABLE servers ADD COLUMN IF NOT EXISTS created_at timestamptz NOT NULL DEFAULT now()");
+  const rulesReach = await operator.query(
+    "SELECT public.announcement_rules_reach($1::jsonb, 'all', NULL, NULL, now()) AS n",
+    [JSON.stringify({ match: "all", groups: [{ match: "all", conditions: [{ field: "account_created", op: "within_days", days: 30 }] }] })],
+  );
+  assert.ok(rulesReach.rows[0].n === null || typeof rulesReach.rows[0].n === "number");
+  for (const forbiddenReachColumn of [
+    "SELECT created_at FROM users",
+    "SELECT display_language FROM users",
+    "SELECT created_at FROM servers",
+  ]) {
+    await assert.rejects(
+      operator.query(forbiddenReachColumn),
+      (error: unknown) => (error as { code?: string }).code === "42501",
+      forbiddenReachColumn,
+    );
+  }
+  // Stuck link card operations (0387): list them and resolve one manually; nothing else.
+  const linkCardOp = (id: string, state: string) => target.query(
+    "INSERT INTO link_card_operations (operation_id, viewer_id, server_id, provider_kind, provider_key, installation_key, registration_revision, view_nonce, message_id, url_sha256, action_endpoint_sha256, action_origin, created_at, first_send_deadline, action_id, request_sha256, state) VALUES ($1, '00000000-0000-4000-8000-0000000000b1', '00000000-0000-4000-8000-0000000000a3', 'app', 'vault-1a2b3c', '00000000-0000-4000-8000-0000000000b2', 'rev-1', 'nonce-1', '00000000-0000-4000-8000-0000000000b3', encode(sha256('https://vault.example/r/1'), 'hex'), repeat('a', 64), 'https://vault.example', date_trunc('second', now()), date_trunc('second', now()) + interval '10 minutes', 'approve', 'r', $2)",
+    [id, state],
+  );
+  const op = (suffix: string) => `00000000-0000-4000-8000-0000000000${suffix}`;
+  await linkCardOp(op("b4"), "needs_reconciliation");
+  await linkCardOp(op("b5"), "done");
+  await linkCardOp(op("b6"), "unknown");
+  await linkCardOp(op("b7"), "needs_reconciliation");
+  const resolve = (id: string, state = "resolved_manually") => operator!.query(
+    "UPDATE link_card_operations SET state = $2, resolved_by_user_id = '00000000-0000-4000-8000-0000000000a1', resolution_reason = 'Checked in Vault: approved by the owner', resolved_at = NOW(), updated_at = NOW() WHERE operation_id = $1",
+    [id, state],
+  );
+  await operator.query("SELECT operation_id, viewer_id, server_id, provider_kind, provider_key, installation_key, message_id, action_id, state, receipt_revision, last_status_at, resolved_by_user_id, resolution_reason, resolved_at, created_at, updated_at FROM link_card_operations");
+  await operator.query("SELECT operation_id FROM link_card_operations WHERE state = 'needs_reconciliation' FOR UPDATE");
+  // The one allowed path, and the trigger bumps receipt_revision by exactly 1.
+  await resolve(op("b4"));
+  const [resolvedRow] = (await target.query("SELECT state, receipt_revision FROM link_card_operations WHERE operation_id = $1", [op("b4")])).rows;
+  assert.deepEqual(resolvedRow, { state: "resolved_manually", receipt_revision: 1 });
+  for (const forbiddenLinkCardQuery of [
+    "SELECT view_nonce FROM link_card_operations",
+    "SELECT request_sha256 FROM link_card_operations",
+    "SELECT registration_revision FROM link_card_operations",
+    "SELECT url_sha256 FROM link_card_operations",
+    "SELECT action_endpoint_sha256, action_origin FROM link_card_operations",
+    "SELECT first_send_deadline FROM link_card_operations",
+    "UPDATE link_card_operations SET first_send_deadline = first_send_deadline",
+    "SELECT * FROM link_card_operations",
+    "INSERT INTO link_card_operations (operation_id) VALUES ('00000000-0000-4000-8000-0000000000c1')",
+    "DELETE FROM link_card_operations",
+    "TRUNCATE link_card_operations",
+    "UPDATE link_card_operations SET installation_key = installation_key",
+    "UPDATE link_card_operations SET viewer_id = viewer_id",
+    "UPDATE link_card_operations SET receipt_revision = receipt_revision + 1",
+    "SELECT operation_id FROM link_card_client_requests",
+    "SELECT jti FROM link_card_attempts",
+  ]) {
+    await assert.rejects(
+      operator.query(forbiddenLinkCardQuery),
+      (error: unknown) => (error as { code?: string }).code === "42501",
+      forbiddenLinkCardQuery,
+    );
+  }
+  const refusedByTrigger = (error: unknown) => (error as { code?: string }).code === "23514";
+  // The FFA role can never record an App outcome, resolve anything not in reconciliation,
+  // or touch a row outside its one transition (Tenny d4dcfdbd).
+  await assert.rejects(resolve(op("b7"), "done").then(() => undefined), refusedByTrigger, "needs_reconciliation -> done");
+  await assert.rejects(operator.query("UPDATE link_card_operations SET state = 'done', updated_at = NOW() WHERE operation_id = $1", [op("b7")]), refusedByTrigger);
+  await assert.rejects(resolve(op("b6")), refusedByTrigger, "unknown -> resolved_manually");
+  await assert.rejects(operator.query("UPDATE link_card_operations SET resolution_reason = 'Rewritten later' WHERE operation_id = $1", [op("b4")]), refusedByTrigger, "rewrite an earlier resolution");
+  await assert.rejects(operator.query("UPDATE link_card_operations SET updated_at = NOW() WHERE operation_id = $1", [op("b6")]), refusedByTrigger, "touch an unrelated row");
+  // Every other writer follows the state machine and cannot resolve manually.
+  await assert.rejects(target.query("UPDATE link_card_operations SET state = 'resolved_manually', resolved_by_user_id = '00000000-0000-4000-8000-0000000000a1', resolution_reason = 'Not an admin path', resolved_at = NOW() WHERE operation_id = $1", [op("b7")]), refusedByTrigger);
+  for (const [id, state] of [["b4", "done"], ["b5", "unknown"], ["b5", "sent"]] as const) {
+    await assert.rejects(target.query("UPDATE link_card_operations SET state = $2, resolved_by_user_id = NULL, resolution_reason = NULL, resolved_at = NULL WHERE operation_id = $1", [op(id), state]), refusedByTrigger, `${id} -> ${state}`);
+  }
+  await target.query("UPDATE link_card_operations SET state = 'done' WHERE operation_id = $1", [op("b7")]);
   await assert.rejects(
     operator.query("DELETE FROM announcements"),
     (error: unknown) => (error as { code?: string }).code === "42501",

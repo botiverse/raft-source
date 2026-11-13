@@ -1,23 +1,20 @@
 import assert from "node:assert/strict";
 
+import { TASK_STATUSES } from "@botiverse/raft-shared";
+
 import { getTaskStatusTransitionError } from "./taskService";
 
-test("closed tasks allow direct assignee resumption but not unrelated active states", () => {
-  assert.equal(getTaskStatusTransitionError("closed", "in_progress"), null);
-  assert.equal(
-    getTaskStatusTransitionError("closed", "in_review"),
-    "cannot transition from closed to in_review",
-  );
+// stdrc 2026-10-31 (#wg-task-v2 msg=ad820421): no transition limits.
+test("every status can move to every other status", () => {
+  for (const from of TASK_STATUSES) {
+    for (const to of TASK_STATUSES) {
+      if (from === to) continue;
+      assert.equal(getTaskStatusTransitionError(from, to), null, `${from} -> ${to}`);
+    }
+  }
 });
 
-test("closed tasks can reopen to todo while other transition errors stay generic", () => {
-  assert.equal(getTaskStatusTransitionError("closed", "todo"), null);
-  assert.equal(
-    getTaskStatusTransitionError("todo", "done"),
-    "cannot transition from todo to done",
-  );
-  assert.equal(
-    getTaskStatusTransitionError("closed", "closed"),
-    "cannot transition from closed to closed",
-  );
+test("setting the status a task already has is refused as unchanged", () => {
+  assert.equal(getTaskStatusTransitionError("closed", "closed"), "already closed");
+  assert.equal(getTaskStatusTransitionError("todo", "todo"), "already todo");
 });

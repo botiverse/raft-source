@@ -12,7 +12,7 @@
 // independent tiny PR after #2220 merge, owned by Huaihuai, reviewed by Hao.
 
 import assert from "node:assert/strict";
-import { ClaudeEventNormalizer, claudeToolResultOutcome } from "./claudeEventNormalizer";
+import { ClaudeEventNormalizer, claudeToolResultOutcome, parseClaudeRateLimitInfo } from "./claudeEventNormalizer";
 
 const normalizer = new ClaudeEventNormalizer();
 
@@ -613,6 +613,31 @@ test("6b: system task_started becomes a subagent_progress signal with closed lin
   ]);
 });
 
+test("a task's task_type says whether it is a sub-agent; a command task's later envelopes, which name none, keep it", () => {
+  // Envelopes as Claude Code 2.1.311 sends them (captured 2026-11-05): a
+  // foreground Bash that ran ~7 s, and an Agent tool sub-agent.
+  const bashStarted = JSON.stringify({ type: "system", subtype: "task_started", task_id: "b13bfy1qy", run_id: "0mw35citi-86e1bf53", tool_use_id: "toolu_01BK8sa4u2hD8tmMi7ajhuTn", description: "Sleep 7 seconds then echo done", is_backgrounded: false, task_type: "local_bash", uuid: "6c08dce7-195a-46b3-a56d-0a979b9acbb2", session_id: "s-task-kind" });
+  const bashDone = JSON.stringify({ type: "system", subtype: "task_notification", task_id: "b13bfy1qy", run_id: "0mw35citi-86e1bf53", tool_use_id: "toolu_01BK8sa4u2hD8tmMi7ajhuTn", status: "completed", output_file: "", summary: "Sleep 7 seconds then echo done", uuid: "72269056-9dac-4cd2-b29a-28f9031ca331", session_id: "s-task-kind" });
+  const agentStarted = JSON.stringify({ type: "system", subtype: "task_started", task_id: "ab0d4888d1aa52da2", tool_use_id: "toolu_01Wk5KTNo6jeNbZw4KNXDzqK", description: "Reply with hi", subagent_type: "general-purpose", is_backgrounded: true, spawn_depth: 1, task_type: "local_agent", session_id: "s-task-kind" });
+  const agentDone = JSON.stringify({ type: "system", subtype: "task_notification", task_id: "ab0d4888d1aa52da2", tool_use_id: "toolu_01Wk5KTNo6jeNbZw4KNXDzqK", status: "completed", session_id: "s-task-kind" });
+
+  const [started] = normalizer.normalizeLine(bashStarted) as any[];
+  assert.equal(started.kind, "subagent_progress");
+  assert.equal(started.taskKind, "command");
+  // A notification with no closed status is not the task's end: the kind stays.
+  const noStatus = JSON.stringify({ type: "system", subtype: "task_notification", task_id: "b13bfy1qy", session_id: "s-task-kind" });
+  assert.equal((normalizer.normalizeLine(noStatus)[0] as any).taskKind, "command");
+  const [done] = normalizer.normalizeLine(bashDone) as any[];
+  assert.equal(done.taskKind, "command", "the notification names no task_type: the started one carries over");
+  assert.equal(done.taskStatus, "completed");
+  assert.equal((normalizer.normalizeLine(agentStarted)[0] as any).taskKind, "agent");
+  assert.equal((normalizer.normalizeLine(agentDone)[0] as any).taskKind, undefined);
+  // An envelope with no task_type for an unknown task is a sub-agent, as before.
+  assert.equal((normalizer.normalizeLine(JSON.stringify({ type: "system", subtype: "task_started", task_id: "old" }))[0] as any).taskKind, undefined);
+  assert.equal((normalizer.normalizeLine(JSON.stringify({ type: "system", subtype: "task_started", task_id: "w1", task_type: "local_workflow" }))[0] as any).taskKind, "other");
+  assert.equal((normalizer.normalizeLine(JSON.stringify({ type: "system", subtype: "task_started", task_id: "tm1", task_type: "in_process_teammate" }))[0] as any).taskKind, "agent");
+});
+
 test("6b: system task_progress and task_notification map to bounded phases", () => {
   const progressLine = JSON.stringify({ type: "system", subtype: "task_progress", task_id: "t1" });
   const notificationLine = JSON.stringify({ type: "system", subtype: "task_notification", task_id: "t1" });
@@ -708,6 +733,8 @@ test("task #379: an assistant message with the SDK error field is an error, not 
       nativeReasonPresent: true,
       reasonProvenance: "runtime_error_event",
       providerLimit: { kind: "quota_exhausted" },
+      // The typed code, for the error's trace class (RateLimitError).
+      providerError: { codes: ["rate_limit"] },
     },
   ]);
 });
@@ -762,10 +789,29 @@ test("task #379: a rate limit without used-up evidence stays a transient throttl
   assert.deepEqual(event && event.kind === "error" ? event.providerLimit : null, { kind: "transient_rate_limit" });
 });
 
+test("a Claude API error carries its typed code and status; a result error carries them when it reports them", () => {
+  const fresh = new ClaudeEventNormalizer();
+  const [event] = fresh.normalizeLine(JSON.stringify({
+    type: "assistant",
+    error: "rate_limit",
+    is_api_error_message: true,
+    api_error_status: 429,
+    api_error_code: "rate_limit_error",
+    message: { model: "<synthetic>", content: [{ type: "text", text: "You've hit your limit · resets 1pm (UTC)" }] },
+    session_id: "session-379",
+  }));
+  assert.deepEqual(event && event.kind === "error" ? event.providerError : null, { codes: ["rate_limit_error", "rate_limit"], httpStatus: 429 });
+
+  const [resultError] = new ClaudeEventNormalizer().normalizeLine(JSON.stringify({
+    type: "result", subtype: "success", is_error: true, api_error_status: 529, result: "API Error: Overloaded", session_id: "session-379",
+  }));
+  assert.deepEqual(resultError, { kind: "error", message: "API Error: Overloaded", providerError: { httpStatus: 529 } });
+});
+
 test("task #379: other SDK errors are errors without a provider-limit classification", () => {
   const fresh = new ClaudeEventNormalizer();
   assert.deepEqual(fresh.normalizeLine(syntheticApiErrorAssistant("overloaded", "API Error: Overloaded")), [
-    { kind: "error", message: "API Error: Overloaded", nativeReasonPresent: true, reasonProvenance: "runtime_error_event" },
+    { kind: "error", message: "API Error: Overloaded", nativeReasonPresent: true, reasonProvenance: "runtime_error_event", providerError: { codes: ["overloaded"] } },
   ]);
 });
 
@@ -871,4 +917,174 @@ test("task #17: Exit code N format of Claude Code Bash tool_result maps to ok wi
   assert.deepEqual(claudeToolResultOutcome({ is_error: true, content: "Exit code: 1" }), { ok: false });
   assert.deepEqual(claudeToolResultOutcome({ is_error: false, content: "Exit code 1" }), { ok: true });
   assert.deepEqual(claudeToolResultOutcome({ content: "done" }), { ok: true });
+});
+
+test("task #25 step 2: the failed result after a requested interrupt ends the turn as interrupted, without an error, once", () => {
+  const fresh = new ClaudeEventNormalizer();
+  const interruptedResult = JSON.stringify({
+    type: "result",
+    subtype: "error_during_execution",
+    is_error: true,
+    stop_reason: null,
+    result: "",
+    session_id: "session-1",
+  });
+
+  fresh.noteInterruptRequested();
+  assert.deepEqual(
+    fresh.normalizeLine(interruptedResult).filter((event) => event.kind !== "telemetry"),
+    [{ kind: "turn_end", sessionId: "session-1", interrupted: true }],
+  );
+  assert.ok(
+    fresh.normalizeLine(interruptedResult).some((event) => event.kind === "error"),
+    "a later failure without a requested interrupt is an error again",
+  );
+  assert.deepEqual(fresh.normalizeLine(JSON.stringify({ type: "control_response", response: { subtype: "success", request_id: "raft-interrupt-1" } })), []);
+});
+
+test("#54: the result's usage carries the context the main agent's last request carried; a sub-agent's request doesn't count", () => {
+  const fresh = new ClaudeEventNormalizer();
+  const assistant = (usage: Record<string, number>, lineage?: Record<string, unknown>) => JSON.stringify({
+    type: "assistant",
+    ...(lineage ?? {}),
+    message: { content: [{ type: "text", text: "working" }], usage },
+  });
+  fresh.normalizeLine(assistant({ input_tokens: 10, cache_read_input_tokens: 200_000, cache_creation_input_tokens: 5_000 }));
+  fresh.normalizeLine(assistant({ input_tokens: 20, cache_read_input_tokens: 205_000, cache_creation_input_tokens: 3_000 }));
+  fresh.normalizeLine(assistant({ input_tokens: 1, cache_read_input_tokens: 999_999 }, { parent_tool_use_id: "toolu_sub" }));
+  const events = fresh.normalizeLine(JSON.stringify({
+    type: "result",
+    subtype: "success",
+    is_error: false,
+    stop_reason: "end_turn",
+    usage: { input_tokens: 30, output_tokens: 9, cache_read_input_tokens: 405_000, cache_creation_input_tokens: 8_000 },
+  }));
+  const usage = events.find((event) => event.kind === "telemetry");
+  assert.ok(usage && usage.kind === "telemetry");
+  assert.equal(usage.attrs.lastRequestContextTokens, 208_020, "the last main request: 20 + 205,000 + 3,000, not the turn's sum");
+  assert.equal(usage.attrs.inputTokens, 30, "the per-turn sum is unchanged");
+});
+
+// Shape confirmed from the rate_limit_info schema in Claude Code 2.1.317
+// (top-level status / resetsAt in epoch seconds / rateLimitType / utilization /
+// surpassedThreshold, plus overage and per-window fields the daemon ignores).
+test("rate_limit_event: a warning reading carries a provider quota observation", () => {
+  const fresh = new ClaudeEventNormalizer(() => BEFORE_RESET_MS);
+  const events = fresh.normalizeLine(JSON.stringify({
+    type: "rate_limit_event",
+    rate_limit_info: {
+      status: "allowed_warning",
+      resetsAt: 1791900000,
+      rateLimitType: "five_hour",
+      utilization: 0.91,
+      surpassedThreshold: 0.9,
+      isUsingOverage: false,
+      overageStatus: "rejected",
+      overageDisabledReason: "org_level_disabled",
+      unifiedWindows: { five_hour: { utilization: 0.91, resetsAt: 1791900000, status: "allowed_warning", surpassedThreshold: 0.9 } },
+    },
+    uuid: "c0ffee00-0000-4000-8000-000000000000",
+    session_id: "session-quota",
+  }));
+  assert.equal(events.length, 1);
+  const [event] = events;
+  assert.equal(event?.kind, "telemetry");
+  assert.deepEqual(event?.kind === "telemetry" ? event.providerQuota : null, {
+    status: "allowed_warning",
+    utilization: 0.91,
+    surpassedThreshold: 0.9,
+    rateLimitType: "five_hour",
+    resetsAtMs: 1791900000 * 1000,
+  });
+  assert.deepEqual(event?.kind === "telemetry" ? event.attrs : null, {
+    status: "allowed_warning",
+    resetsAt: 1791900000,
+    rateLimitType: "five_hour",
+    overageStatus: "rejected",
+    isUsingOverage: false,
+  }, "the existing rate_limits telemetry is unchanged");
+});
+
+test("rate_limit_event: malformed or unknown rate_limit_info yields no quota observation", () => {
+  for (const info of [undefined, null, "allowed", [], {}, { status: "maybe" }, { status: 3 }]) {
+    assert.equal(parseClaudeRateLimitInfo(info, BEFORE_RESET_MS), undefined, JSON.stringify(info));
+    const fresh = new ClaudeEventNormalizer();
+    const [event] = fresh.normalizeLine(JSON.stringify({ type: "rate_limit_event", rate_limit_info: info, session_id: "s" }));
+    assert.equal(event?.kind === "telemetry" ? event.providerQuota : "not telemetry", undefined);
+  }
+  assert.deepEqual(
+    parseClaudeRateLimitInfo({ status: "allowed", utilization: "high", resetsAt: "soon", rateLimitType: "ten_minute", surpassedThreshold: Number.NaN }, BEFORE_RESET_MS),
+    { status: "allowed" },
+    "fields of the wrong type are dropped",
+  );
+  assert.deepEqual(new ClaudeEventNormalizer().normalizeLine("{not json"), []);
+});
+
+test("rate_limit_event: a resetsAt outside the coming year is not a reset", () => {
+  const nowSec = BEFORE_RESET_MS / 1000;
+  const cases: Array<[string, number]> = [
+    ["oversized (new Date would throw)", 1e20],
+    ["millisecond-scale", BEFORE_RESET_MS + 3_600_000],
+    ["more than a year ahead", nowSec + 366 * 86_400],
+  ];
+  for (const [label, resetsAt] of cases) {
+    assert.deepEqual(parseClaudeRateLimitInfo({ status: "rejected", resetsAt, rateLimitType: "five_hour" }, BEFORE_RESET_MS), {
+      status: "rejected",
+      rateLimitType: "five_hour",
+    }, label);
+  }
+  assert.deepEqual(
+    parseClaudeRateLimitInfo({ status: "rejected", resetsAt: nowSec + 3600 }, BEFORE_RESET_MS),
+    { status: "rejected", resetsAtMs: BEFORE_RESET_MS + 3_600_000 },
+    "an hour ahead is kept",
+  );
+  assert.deepEqual(
+    parseClaudeRateLimitInfo({ status: "rejected", resetsAt: nowSec - 60 }, BEFORE_RESET_MS),
+    { status: "rejected", resetsAtMs: BEFORE_RESET_MS - 60_000 },
+    "a past reset is kept, so the store can expire the reading at once",
+  );
+});
+
+// #proj-raft-computer:#68 — Claude refuses every call until the account
+// holder verifies the account (HTTP 403 `verification_required`). Both
+// fixtures are real samples: live stream-json (snake_case, a `result` line
+// with `subtype: "success"` + `is_error: true`) and persisted session JSONL
+// (camelCase `isApiErrorMessage`, no status).
+test("#68: verification_required from live stream-json and from session JSONL is one typed account error, never the provider's text", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const { buildRuntimeErrorActivityDiagnostic, credentialInvalidReasonOf, credentialProblemCodeOf, CREDENTIAL_PROBLEM_MESSAGES } = await import("../runtimeErrorDiagnostics");
+  const live = JSON.parse(await readFile(new URL("./fixtures/claude-verification-required.live.json", import.meta.url), "utf8")) as { prompt: { events: unknown[] } };
+  const jsonl = JSON.parse(await readFile(new URL("./fixtures/claude-verification-required.jsonl.json", import.meta.url), "utf8")) as { samples: unknown[] };
+  const expected = { kind: "error", message: CREDENTIAL_PROBLEM_MESSAGES.verification_required, nativeReasonPresent: true, reasonProvenance: "runtime_error_event" };
+
+  // The typed code and status ride along for the error's trace class and
+  // status (AuthError, 403); session JSONL has no status.
+  const live403 = { ...expected, providerError: { codes: ["verification_required"], httpStatus: 403 } };
+  const fresh = new ClaudeEventNormalizer();
+  const [assistantLine, resultLine] = live.prompt.events;
+  assert.deepEqual(fresh.normalizeLine(JSON.stringify(assistantLine)), [live403]);
+  // The result line repeats the same fact: no second error.
+  const resultEvents = fresh.normalizeLine(JSON.stringify(resultLine));
+  assert.equal(resultEvents.filter((event) => event.kind === "error").length, 0);
+  assert.ok(resultEvents.some((event) => event.kind === "turn_end"));
+  // A result line alone (no assistant line before it) still says it once.
+  const resultOnly = new ClaudeEventNormalizer().normalizeLine(JSON.stringify(resultLine));
+  assert.deepEqual(resultOnly.filter((event) => event.kind === "error"), [live403]);
+
+  for (const sample of jsonl.samples) {
+    assert.deepEqual(new ClaudeEventNormalizer().normalizeLine(JSON.stringify(sample)), [{ ...expected, providerError: { codes: ["verification_required"] } }]);
+  }
+
+  // Old servers pause and tell the owner: AuthError + user_reauth; the readiness code rides along.
+  const message = expected.message;
+  assert.equal(credentialInvalidReasonOf(message), "user_reauth");
+  assert.equal(credentialProblemCodeOf(message), "verification_required");
+  const diagnostic = buildRuntimeErrorActivityDiagnostic(message);
+  assert.equal(diagnostic.errorClass, "AuthError");
+  assert.equal(diagnostic.requiredAction, "user_reauth");
+  assert.equal(diagnostic.readinessCode, "verification_required");
+  // The provider's own wording is never classified as an account problem.
+  const providerText = "API Error: Your account can't receive replies from Claude right now. You can find the next step in the Anthropic Verification Portal: https://evil.example/verify";
+  assert.equal(credentialProblemCodeOf(providerText), null);
+  assert.equal(credentialInvalidReasonOf(providerText), null);
 });

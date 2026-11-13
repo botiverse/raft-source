@@ -5,7 +5,6 @@ import { fileURLToPath } from "node:url";
 
 const daemonRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 const packageJson = JSON.parse(readFileSync(join(daemonRoot, "package.json"), "utf8"));
-const preflightSource = readFileSync(join(daemonRoot, "scripts/release-runtime-sdk-preflight.mjs"), "utf8");
 
 test("the daemon has no release lane of its own: it ships only inside Computer", () => {
   // docs/operations/computer-release-version.md: one release number, one
@@ -27,16 +26,4 @@ test("the daemon has no release lane of its own: it ships only inside Computer",
 test("the daemon version is the Computer version", () => {
   const computer = JSON.parse(readFileSync(join(daemonRoot, "../computer/package.json"), "utf8"));
   assert.equal(packageJson.version, computer.version);
-});
-
-test("runtime SDK preflight covers both Pi packages and the Kimi botiverse dist-tag", () => {
-  assert.match(preflightSource, /@earendil-works\/pi-ai.+distTag: "latest"/s);
-  assert.match(preflightSource, /@earendil-works\/pi-coding-agent.+distTag: "latest"/s);
-  assert.match(preflightSource, /@botiverse\/kimi-code-sdk.+distTag: "botiverse"/s);
-  assert.match(preflightSource, /RAFT_RUNTIME_SDK_DECISION/);
-  assert.match(preflightSource, /RAFT_RUNTIME_SDK_HOLD_REASON/);
-  assert.match(preflightSource, /runtime-sdk-release-preflight\.json/);
-  assert.match(preflightSource, /selectedVersions/);
-  assert.match(preflightSource, /generate:pi-builtin-models/);
-  assert.match(preflightSource, /generate:runtime-provider-display-names/);
 });

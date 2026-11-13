@@ -71,9 +71,10 @@ export const taskShowCommand = defineCommand(
     if (!task) {
       // Completeness first: `pagination: {mode:"complete", truncated:false}` is the contract's only
       // assertion that the list is whole, and it is `.optional()` (agentApiTaskListResponseSchema).
-      // Today the `scope:"channel"` path this command uses (internalAgentApi.ts, taskList) never sends
-      // it; only `--mine` does. So absence means the server asserted NOTHING, not "complete".
-      const asserted = res.data.pagination?.mode === "complete" && res.data.pagination.truncated === false;
+      // Older `scope:"channel"` servers do not send it. Absence means the server
+      // asserted NOTHING, not "complete".
+      const asserted = res.data.scope === "channel" && res.data.coverage?.status !== "incomplete"
+        && res.data.pagination?.mode === "complete" && res.data.pagination.truncated === false;
       if (asserted) {
         throw new CliError({
           code: "NOT_FOUND",
@@ -81,7 +82,7 @@ export const taskShowCommand = defineCommand(
         });
       }
       // Without that assertion an EMPTY list is ambiguous, not a failure (@Huaihuai, PR #8048 review):
-      // a channel with no tasks is a successful read, and the server also returns [] when it swallows
+      // a channel with no tasks is a successful read, and older servers can return [] when they swallow
       // a read error (task #327: listTasks catches → logs → returns []). The CLI cannot tell which, so
       // it names both and claims neither. A genuinely invalid response is rejected earlier.
       if (tasks.length === 0) {

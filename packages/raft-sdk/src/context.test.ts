@@ -40,12 +40,12 @@ test("agent.context returns the bound agent, server slug and name, and capabilit
     data: {
       agent: {
         id: "agent-1", name: "bobo", displayName: "BoBo", description: null,
-        runtime: "external", external: true, assistantOf: null,
+        runtime: "external", external: true, assistantOf: null, raftbenchReader: false,
       },
       server: { id: "server-1", slug: "botiverse", name: "Botiverse" },
       capabilities: ["send", "read"],
       guide: "# Guide",
-      features: { reminderApp: false, vaultApp: false },
+      features: { reminderApp: false, vaultApp: false, enabledApps: [] },
     },
   });
 });
@@ -96,7 +96,7 @@ test("agent.context failures carry a stable code and no response body", async ()
   assert.equal(JSON.stringify(transportResult).includes(secret), false);
 });
 
-test("agent.context carries assistantOf (RFC 074): the owner when set, null when null or absent", async () => {
+test("agent.context carries assistantOf (RFC 074/075): the owner when set, null when null or absent", async () => {
   const contextWith = async (agentExtra: Record<string, unknown>) => {
     const client = createRaftClient({
       serverUrl: "https://raft.example",
@@ -108,12 +108,16 @@ test("agent.context carries assistantOf (RFC 074): the owner when set, null when
     return result.ok ? result.data.agent.assistantOf : "unreached";
   };
   const owner = "11111111-1111-4111-8111-111111111111";
-  assert.deepEqual(await contextWith({ assistantOf: { userId: owner } }), { userId: owner });
+  assert.deepEqual(
+    await contextWith({ assistantOf: { userId: owner, name: "ada", displayName: "Ada", timezone: "Asia/Shanghai", language: "zh-CN", dmTarget: "dm:@ada~human" } }),
+    { userId: owner, name: "ada", displayName: "Ada", raftCheck: false, timezone: "Asia/Shanghai", language: "zh-CN", dmTarget: "dm:@ada~human" },
+  );
+  assert.deepEqual(await contextWith({ assistantOf: { userId: owner } }), { userId: owner, name: null, displayName: null, raftCheck: false, timezone: null, language: null, dmTarget: null }, "older Servers omit the newer fields");
   assert.equal(await contextWith({ assistantOf: null }), null);
   assert.equal(await contextWith({}), null, "older Servers omit it");
 });
 
-test("agent.context carries the Server's app rollout features; older Servers read as both off", async () => {
+test("agent.context carries the Server's app rollout features; older Servers read as both off and no apps", async () => {
   const featuresFrom = async (extra: Record<string, unknown>) => {
     const client = createRaftClient({
       serverUrl: "https://raft.example",
@@ -124,6 +128,25 @@ test("agent.context carries the Server's app rollout features; older Servers rea
     assert.equal(result.ok, true);
     return result.ok ? result.data.features : "unreached";
   };
-  assert.deepEqual(await featuresFrom({ features: { reminderApp: true, vaultApp: false } }), { reminderApp: true, vaultApp: false });
-  assert.deepEqual(await featuresFrom({}), { reminderApp: false, vaultApp: false });
+  assert.deepEqual(
+    await featuresFrom({ features: { reminderApp: true, vaultApp: false, enabledApps: ["artifacts", "future-app"] } }),
+    { reminderApp: true, vaultApp: false, enabledApps: ["artifacts", "future-app"] },
+    "ids are passed through as the Server sends them, unknown ones included",
+  );
+  assert.deepEqual(
+    await featuresFrom({ features: { reminderApp: true, vaultApp: false } }),
+    { reminderApp: true, vaultApp: false, enabledApps: [] },
+    "a Server with the booleans but without enabledApps",
+  );
+  assert.deepEqual(await featuresFrom({}), { reminderApp: false, vaultApp: false, enabledApps: [] });
 });
+
+ test("context projects reader availability and defaults older Servers to false", async () => {
+   for (const allowed of [true, false]) {
+     const client = createRaftClient({ serverUrl: "https://raft.example", credential,
+       fetch: async () => Response.json({ ...body, agent: { ...body.agent, ...(allowed ? { raftbenchReader: true } : {}) } }) });
+     const result = await client.agent.context();
+     assert.equal(result.ok, true);
+     if (result.ok) assert.equal(result.data.agent.raftbenchReader, allowed);
+   }
+ });

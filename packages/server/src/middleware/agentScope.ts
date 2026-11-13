@@ -28,7 +28,6 @@ import {
 } from "@botiverse/raft-shared";
 import { loadAgentScopes, AgentScopesNotFoundError } from "../services/agentScopesService";
 import * as agentService from "../services/agentService";
-import { AGENT_CREDENTIAL_BRIDGE_MACHINE_ID } from "./agentCredentialBridge";
 import { runWithTraceAttrs } from "../tracing/semanticTrace";
 import { agentIdHashAttrs, serverIdHashAttrs } from "../tracing/traceIdentity";
 
@@ -89,11 +88,7 @@ export function requireAgentScope(scope: AgentScope): RequestHandler<any> {
       res.status(404).json({ error: "Agent not found" });
       return;
     }
-    const isAgentCredentialBridge = req.machineId === AGENT_CREDENTIAL_BRIDGE_MACHINE_ID &&
-      req.principalKind === "agent_credential" &&
-      req.actingAgentId === agentId &&
-      agent.machineId === null;
-    if (!isAgentCredentialBridge && agent.machineId !== req.machineId) {
+    if (agent.machineId !== req.machineId) {
       res.status(403).json({ error: "This agent is not assigned to your machine" });
       return;
     }

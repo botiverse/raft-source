@@ -140,13 +140,26 @@ test("remaining direct app receipts also drop undeclared response fields", () =>
       shareUrl: "https://demo.example/share/allowed-token",
       link: {
         id: "link-1",
+        targetServerSlug: "allowed-target",
+        expiresAt: null,
+        revokedAt: null,
+        consumedAt: null,
+        lastUsedAt: null,
+        createdAt: "2026-07-21T00:00:00.000Z",
+        updatedAt: "2026-07-21T00:00:00.000Z",
+        credentials: { clientSecret: "manage_link_nested_must_not_render" },
+        targetServerId: "target_id_must_not_render",
+      },
+      links: [{
+        id: "link-1",
+        targetServerSlug: "allowed-target",
         expiresAt: null,
         revokedAt: null,
         lastUsedAt: null,
         createdAt: "2026-07-21T00:00:00.000Z",
         updatedAt: "2026-07-21T00:00:00.000Z",
-        credentials: { clientSecret: "manage_link_nested_must_not_render" },
-      },
+        tokenHash: "links_nested_must_not_render",
+      }],
       client_secret: "manage_alias_must_not_render",
       unknownTopLevel: "manage_unknown_must_not_render",
     } as never),
@@ -171,6 +184,7 @@ test("remaining direct app receipts also drop undeclared response fields", () =>
   const wire = JSON.stringify(receipts);
   assert.doesNotMatch(wire, /must_not_render/);
   assert.match(wire, /allowed-token/);
+  assert.match(wire, /allowed-target/);
   assert.deepEqual(receipts.actionPrepare, {
     messageId: "message-1",
     metadata: { kind: "action-card" },

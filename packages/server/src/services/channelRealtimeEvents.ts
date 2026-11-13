@@ -5,6 +5,7 @@ import { isMember } from "./serverService";
 import { fanoutWithAck } from "../socket/fanout";
 import { serializeErrorForLog } from "../tracing/safeErrorLog";
 import { socketServerAllRooms } from "../socket/platformScope";
+import { withVisitorVisible } from "./channelVisitorVisibility";
 
 /**
  * The one exit for "this joint channel changed": every active participant's
@@ -72,7 +73,7 @@ export async function publishLocalChannelUpdate<T extends { id: string; serverId
     if (typeof userId !== "string" || !access.get(userId)) continue;
     if (socket.data.accessRevoked) continue;
     await socket.join(`channel:${channel.id}`);
-    socket.emit("channel:updated", { channel });
+    socket.emit("channel:updated", { channel: withVisitorVisible(channel) });
   }
 }
 

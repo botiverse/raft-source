@@ -5,7 +5,7 @@ import { useIntl } from "react-intl";
 import { useLocation } from "react-router-dom";
 import { useMobileBack } from "../../hooks/useAppNavigate";
 import { useLiveSearchParams } from "../../hooks/useLiveSearchParams";
-import { PanelAction, PanelHeader } from "@botiverse/raft-ui";
+import { PanelAction, PanelHeader, ScrollArea } from "@botiverse/raft-ui";
 import ForwardedBundleCard from "./ForwardedBundleCard";
 import type {
   ForwardedBundleAttachmentSnapshot,
@@ -60,7 +60,7 @@ export default function ForwardedBundleRouteCard({
       />
       {detailOpen && createPortal(
         <section
-          className="fixed bottom-0 left-0 right-0 top-0 z-[70] flex flex-col bg-layer-canvas md:hidden"
+          className="fixed bottom-0 left-0 right-0 top-0 z-dialog flex flex-col bg-layer-canvas md:hidden"
           data-testid="forwarded-bundle-detail-page"
           aria-label={formatMessage({ id: "message.forwardedBundle.detailTitle" })}
         >
@@ -72,14 +72,19 @@ export default function ForwardedBundleRouteCard({
             </PanelAction>
             <h1 className="min-w-0 truncate text-headline text-foreground">{formatMessage({ id: "message.forwardedBundle.detailTitle" })}</h1>
           </PanelHeader>
-          <main className="min-h-0 flex-1 overflow-y-auto p-3">
+          <ScrollArea
+            render={<main />}
+            aria-label={formatMessage({ id: "message.forwardedBundle.detailTitle" })}
+            className="min-h-0 flex-1"
+            contentClassName="p-3"
+          >
             <ForwardedBundleCard
               metadata={metadata}
               onOpenSource={onOpenSource}
               onOpenAttachment={onOpenAttachment}
               forceExpanded
             />
-          </main>
+          </ScrollArea>
         </section>,
         document.body,
       )}

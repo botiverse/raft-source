@@ -1,8 +1,9 @@
 import { createApiTest } from "./test/integration/apiTest";
+import { AI_TRAINING_CRAWLERS } from "@botiverse/raft-shared";
 import assert from "node:assert/strict";
 
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 test("unmatched app routes return a noindex JSON 404", async ({ app }) => {
   const root = await fetch(`${app.baseUrl}/`);
@@ -54,6 +55,7 @@ test("ordinary app never mounts Playwright scenario lifecycle routes", async ({ 
     ["POST", "/__playwright/scenarios"],
     ["DELETE", "/__playwright/scenarios/not-owned"],
     ["POST", "/__playwright/scenarios/not-owned/thread-window"],
+    ["POST", "/__playwright/scenarios/not-owned/channel-history"],
   ]) {
     const response = await fetch(`${app.baseUrl}${path}`, { method });
     assert.equal(response.status, 404);
@@ -61,15 +63,12 @@ test("ordinary app never mounts Playwright scenario lifecycle routes", async ({ 
   }
 });
 
-test("API robots.txt explicitly rejects crawlers", async ({ app }) => {
+test("API robots.txt turns every AI training crawler away, and other crawlers from all but public Artifacts' routes", async ({ app }) => {
   const robots = await fetch(`${app.baseUrl}/robots.txt`);
   assert.equal(robots.status, 200);
   assert.match(robots.headers.get("content-type") ?? "", /text\/plain/);
   assert.equal(robots.headers.get("x-robots-tag"), "noindex, nofollow");
-  assert.equal(await robots.text(), [
-    "# Raft API host: authenticated API surface with no indexable public pages.",
-    "User-agent: *",
-    "Disallow: /",
-    "",
-  ].join("\n"));
+  const rules = (await robots.text()).split("\n").filter((line) => line && !line.startsWith("#"));
+  const training = AI_TRAINING_CRAWLERS.flatMap((agent) => [`User-agent: ${agent}`, "Disallow: /"]);
+  assert.deepEqual(rules, [...training, "User-agent: *", "Allow: /api/public/artifacts/", "Disallow: /"]);
 });

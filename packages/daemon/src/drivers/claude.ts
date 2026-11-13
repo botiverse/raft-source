@@ -1,10 +1,11 @@
 import { spawnRuntimeChild } from "./runtimeChild";
-import type { AgentConfig, AxSurfaceText } from "@botiverse/raft-shared";
+import type { AgentConfig, AxSurfaceText, RuntimeModelSourceOutcome } from "@botiverse/raft-shared";
 import type { RuntimeDriver, SpawnContext, SpawnResult, ParsedEvent, RuntimeProbeResult } from "./types";
 import { buildCliTransportSystemPrompt, prepareCliTransport } from "./cliTransport";
 import { ClaudeEventNormalizer } from "./claudeEventNormalizer";
 import { assertClaudeStartupPayloadWithinBudget } from "./claudeInputBudget";
 import { buildClaudeArgs, buildClaudeManagedMcpConfig, buildClaudeSpawnSpec, probeClaude, probeClaudeLaunch, resolveClaudeLaunchCommand, resolveClaudeLaunchCommandAsync, writeClaudeSystemPromptFile } from "./claudeLaunch";
+import { detectClaudeModelSource } from "./claudeModels";
 import { ProbeChildError } from "./probeChild";
 import {
   buildClaudeProviderIsolationEnv,
@@ -26,10 +27,13 @@ export {
   CLAUDE_DESKTOP_CLI_SYSTEM_PATH,
   CLAUDE_DISALLOWED_TOOLS,
   probeClaude,
+  readClaudeInstallationAsync,
   resolveClaudeCommand,
   resolveClaudeLaunchCommand,
 } from "./claudeLaunch";
 export { buildClaudeProviderIsolationEnv } from "./claudeProviderIsolation";
+
+export const CLAUDE_CODE_ENTRYPOINT = "raft";
 
 export class ClaudeDriver implements RuntimeDriver {
   readonly id = "claude";
@@ -44,6 +48,9 @@ export class ClaudeDriver implements RuntimeDriver {
   } as const;
   readonly session = {
     recovery: "resume_or_fresh",
+    // ClaudeEventNormalizer emits the compaction events.
+    compaction: "reported",
+    compactionFailure: "does_not_stick",
   } as const;
   readonly model = {
     detectedModelsVerifiedAs: "launchable",
@@ -61,6 +68,8 @@ export class ClaudeDriver implements RuntimeDriver {
   // reaches a boundary; existing --resume sessions are ready at launch.
   readonly liveSessionReadyAt = "turn_end" as const;
   readonly supportsNativeStandingPrompt = true;
+  // Claude Code's `Agent` tool is not in CLAUDE_DISALLOWED_TOOLS.
+  readonly supportsSubagents = true;
   // Field receipts prove Claude Code 2.1.59 fails Raft first-run launch with the
   // thinking.type.adaptive request shape and that upgrading to 2.1.220 fixes the
   // failing install. The true minimum fixed version is unknown and may be below
@@ -75,6 +84,10 @@ export class ClaudeDriver implements RuntimeDriver {
 
   probe(): RuntimeProbeResult {
     return probeClaude();
+  }
+
+  async detectModels(): Promise<RuntimeModelSourceOutcome> {
+    return detectClaudeModelSource();
   }
 
   buildClaudeArgs(
@@ -93,7 +106,7 @@ export class ClaudeDriver implements RuntimeDriver {
     // `slock` wrapper and prepends that directory to PATH. This keeps runtime
     // behavior deterministic: agents always hit the daemon-managed CLI rather
     // than whatever `slock` binary the host machine happens to have installed.
-    const { slockDir, tokenFile, spawnEnv } = await prepareCliTransport(
+    const { slockDir, spawnEnv } = await prepareCliTransport(
       ctx,
       buildClaudeProviderIsolationEnv(ctx),
     );
@@ -109,6 +122,8 @@ export class ClaudeDriver implements RuntimeDriver {
     const managedMcp = await prepareManagedMcpRuntimeProxy({
       agentId: ctx.agentId,
       launchId: ctx.launchId,
+      processInstanceId: ctx.processInstanceId,
+      readTurnOrigin: ctx.readTurnOrigin,
       serverUrl: ctx.config.serverUrl,
       agentCredentialKey: ctx.config.agentCredentialKey,
     });
@@ -129,9 +144,19 @@ export class ClaudeDriver implements RuntimeDriver {
     });
 
     delete spawnEnv.CLAUDECODE;
+    // Name the client that runs this session (Claude Code records it as the
+    // transcript `entrypoint`). Overwritten, not defaulted: a daemon started
+    // from inside another Claude Code / SDK session inherits `sdk-cli` / `sdk-ts`.
+    // Headless `sdk-*` sessions were measured to use a subscription's 5-hour
+    // window ~2x faster per token (anthropics/claude-code#97074; #triage:c73bf864).
+    spawnEnv.CLAUDE_CODE_ENTRYPOINT = CLAUDE_CODE_ENTRYPOINT;
+    // Raft keeps agent memory in the workspace MEMORY.md. Claude Code's auto
+    // memory adds a second MEMORY.md under ~/.claude/projects/<slug>/memory
+    // with its own rules, so turn it off (as Qwen's managed memory is).
+    spawnEnv.CLAUDE_CODE_DISABLE_AUTO_MEMORY = "1";
 
     logger.info(
-      `[Agent ${ctx.agentId}] transport=cli cli=${ctx.slockCliPath} token_file=${tokenFile}`,
+      `[Agent ${ctx.agentId}] transport=cli cli=${ctx.slockCliPath}`,
     );
 
     // task #1277: the PATH lookup runs as a bounded probe child under this
@@ -172,6 +197,43 @@ export class ClaudeDriver implements RuntimeDriver {
     return this.eventNormalizer.currentSessionId;
   }
 
+  /**
+   * task #25 step 2: Claude Code's stream-json interrupt. Checked on 2.1.299:
+   * the turn ends with an `error_during_execution` result, Claude kills the
+   * running tool's whole process tree (a `setsid` child included), and the
+   * process takes the next message.
+   */
+  encodeInterruptRequest(): string {
+    this.eventNormalizer.noteInterruptRequested();
+    this.interruptRequests += 1;
+    return JSON.stringify({
+      type: "control_request",
+      request_id: `raft-interrupt-${this.interruptRequests}`,
+      request: { subtype: "interrupt" },
+    });
+  }
+
+  private interruptRequests = 0;
+
+  /**
+   * #proj-runtime:#41: Claude Code's `stop_task` control request stops one
+   * task by its `task_id` (the `task_started` envelope's, kept as the
+   * subagent's `SubagentLineage.taskId`). Checked on 2.1.304, without an
+   * initialize: a background or a foreground subagent ends with
+   * `task_notification` status `stopped`; the agent's turn and its other
+   * subagents carry on. Its control_response is not read.
+   */
+  encodeSubagentInterruptRequest(subagentTaskId: string): string {
+    this.subagentStopRequests += 1;
+    return JSON.stringify({
+      type: "control_request",
+      request_id: `raft-stop-task-${this.subagentStopRequests}`,
+      request: { subtype: "stop_task", task_id: subagentTaskId },
+    });
+  }
+
+  private subagentStopRequests = 0;
+
   encodeStdinMessage(
     text: string,
     sessionId: string | null,
@@ -190,8 +252,7 @@ export class ClaudeDriver implements RuntimeDriver {
   buildSystemPrompt(config: AgentConfig, _agentId: string): AxSurfaceText {
     return buildCliTransportSystemPrompt(config, {
       extraCriticalRules: [],
-      // Claude Code's `Agent` tool is not in CLAUDE_DISALLOWED_TOOLS.
-      supportsSubagents: true,
+      supportsSubagents: this.supportsSubagents,
     });
   }
 

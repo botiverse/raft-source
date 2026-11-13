@@ -28,6 +28,17 @@ export default defineConfig({
     // Playwright default: the app derives its translation language from
     // navigator.languages, and the captures must not switch UI language.
     timezoneId: fixtureLocale.timezone,
+    // Linux Chrome hints fonts and snaps every glyph's advance to a whole CSS px: bold
+    // Space Grotesk at 14px came out ~6% wider and Space Mono at 12px ~5% narrower than the
+    // font's own metrics, which is what Chrome on macOS, Android and iOS draw (fractional
+    // advances). Unhinted text keeps the metrics, so React and the apps compare like for like
+    // (artin 2026-11-02: text width drift in every overlay).
+    //
+    // Emulated deviceScaleFactor alone also snaps a border to whole CSS px: raft-ui's 1.5px
+    // control stroke (buttons, fields, selects) came out 1px (3 device px) where Chrome on a
+    // real 2x/3x screen draws 1.5px, so every Android outline read as twice as heavy. Forcing
+    // the same scale on the browser makes borders snap to device pixels, as on a device.
+    launchOptions: { args: ["--font-render-hinting=none", "--force-device-scale-factor=3"] },
   },
   webServer: {
     command: `pnpm exec vite --host 127.0.0.1 --port ${port}`,

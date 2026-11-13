@@ -4,7 +4,7 @@ import {
   assertMobilePushOutboxTableExists,
   assertActiveIndexReady,
   createPool,
-  CREATE_ACTIVE_INDEX_SQL,
+  createActiveIndexSql,
   describeActiveIndexStatus,
   readActiveIndexStatus,
   ACTIVE_INDEX_LOCK_TIMEOUT,
@@ -19,7 +19,7 @@ async function main() {
   const pool = createPool();
   const client = await pool.connect();
   try {
-    await assertMobilePushOutboxTableExists(client);
+    const table = await assertMobilePushOutboxTableExists(client);
 
     await client.query(`SELECT set_config('statement_timeout', $1, false)`, [
       ACTIVE_INDEX_STATEMENT_TIMEOUT,
@@ -28,7 +28,7 @@ async function main() {
       ACTIVE_INDEX_LOCK_TIMEOUT,
     ]);
 
-    const before = await readActiveIndexStatus(client);
+    const before = await readActiveIndexStatus(client, table);
     if (before.exists) {
       assertActiveIndexReady(before);
       console.error(describeActiveIndexStatus(before));
@@ -37,12 +37,12 @@ async function main() {
     }
 
     console.error(
-      `Creating ${ACTIVE_INDEX_NAME} concurrently ` +
+      `Creating ${ACTIVE_INDEX_NAME} on ${table} concurrently ` +
         `(statement_timeout=${ACTIVE_INDEX_STATEMENT_TIMEOUT}, lock_timeout=${ACTIVE_INDEX_LOCK_TIMEOUT})`,
     );
-    await client.query(CREATE_ACTIVE_INDEX_SQL);
+    await client.query(createActiveIndexSql(table));
 
-    const after = await readActiveIndexStatus(client);
+    const after = await readActiveIndexStatus(client, table);
     assertActiveIndexReady(after);
     console.error(describeActiveIndexStatus(after));
   } finally {

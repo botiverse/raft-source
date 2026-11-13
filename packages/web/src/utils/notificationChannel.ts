@@ -4,11 +4,11 @@ import { isElectronDesktopShell } from "./desktopShell";
 // notification in THIS runtime. Decided synchronously from capabilities — no
 // network calls, no service-worker probes — so callers can never hang on it.
 //
-//   desktop-native  Raft Desktop: the renderer's Notification API maps straight to
-//                   OS notifications (DesktopNativeBridge already fires them for
-//                   live messages while the window is unfocused). Web Push does not
-//                   apply: the app:// origin cannot host a service worker and
-//                   Electron has no push service.
+//   desktop-native  Raft Desktop: the web consumes the server's desktop stream
+//                   and posts through the shell's raftDesktop.notifications.show
+//                   (notifications/desktopNative), which main turns into OS
+//                   notifications. Web Push does not apply: the app:// origin
+//                   cannot host a service worker and Electron has no push service.
 //   web-push        A browser with service workers + PushManager + Notification on
 //                   a secure origin.
 //   unsupported     Anything else, with the concrete reason so the UI can say why.

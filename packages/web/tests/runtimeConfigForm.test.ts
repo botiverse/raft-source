@@ -2,84 +2,15 @@ import assert from "node:assert/strict";
 import { REASONING_EFFORT_RUNTIMES } from "@botiverse/raft-shared";
 import {
   buildRuntimeConfig,
-  buildManagedConnectionRuntimeConfig,
-  builtInProviderDefaultModel,
   hydrateRuntimeConfigForm,
   PI_PROVIDER_CONFIGURED,
-  piBuiltinProviderDefaultModel,
-  reconcileBuiltInProviderModelSelection,
-  runtimeConfigApiKey,
   runtimeConfigApiUrl,
-  runtimeConfigBuiltInProviderMode,
-  runtimeConfigBuiltInProviderApiKey,
-  runtimeConfigBuiltInProviderBaseUrl,
-  runtimeConfigBuiltInProviderSupportsImageInput,
   runtimeConfigCustomModelName,
-  runtimeConfigPiProviderApiKey,
-  runtimeConfigPiProviderMode,
-  runtimeConfigProviderMode,
-  runtimeConfigProviderConnectionId,
-  runtimeIgnoresModel,
+  runtimeConfigFastMode,
   runtimeApiUrlUnsupportedCopy,
   supportsRuntimeFastMode,
   supportsRuntimeApiUrl,
-  supportsRuntimeCustomModelName,
-  isBuiltInProviderApiKeyInvalid,
-  isRuntimeConfigSaveDisabled,
 } from "../src/utils/runtimeConfigForm";
-
-test("saved Provider selection preserves a compatible model and resets only an incompatible one", () => {
-  assert.deepEqual(reconcileBuiltInProviderModelSelection({
-    providerId: "deepseek",
-    currentModel: "deepseek/deepseek-v4-pro",
-  }), {
-    model: "deepseek/deepseek-v4-pro",
-    customModelMode: false,
-  });
-  assert.deepEqual(reconcileBuiltInProviderModelSelection({
-    providerId: "deepseek",
-    currentModel: "wrong/provider-model",
-  }), {
-    model: builtInProviderDefaultModel("deepseek"),
-    customModelMode: false,
-  });
-  assert.deepEqual(reconcileBuiltInProviderModelSelection({
-    providerId: "openai-compatible",
-    currentModel: "my-gateway-model",
-  }), {
-    model: "my-gateway-model",
-    customModelMode: true,
-  });
-});
-
-test("managed connection builder persists only a compatible connection reference", () => {
-  const deepseek = buildManagedConnectionRuntimeConfig({
-    connectionId: "11111111-1111-4111-8111-111111111111",
-    providerId: "deepseek",
-    model: "deepseek/deepseek-v4-pro",
-    envVars: { TEAM_FLAG: "1", DEEPSEEK_API_KEY: "must-be-scrubbed" },
-  });
-  assert.equal(runtimeConfigProviderConnectionId(deepseek), "11111111-1111-4111-8111-111111111111");
-  assert.deepEqual(deepseek.provider, {
-    kind: "connection",
-    connectionId: "11111111-1111-4111-8111-111111111111",
-  });
-  assert.deepEqual(deepseek.envVars, { TEAM_FLAG: "1" });
-  assert.equal(JSON.stringify(deepseek).includes("must-be-scrubbed"), false);
-
-  assert.throws(() => buildManagedConnectionRuntimeConfig({
-    connectionId: "11111111-1111-4111-8111-111111111111",
-    providerId: "deepseek",
-    model: "custom-model",
-    envVars: null,
-  }), /valid provider model/);
-  assert.deepEqual(buildManagedConnectionRuntimeConfig({
-    connectionId: "22222222-2222-4222-8222-222222222222",
-    providerId: "openai-compatible",
-    model: "gateway-model",
-    envVars: null,
-  }).model, { kind: "custom", name: "gateway-model" });
-});
 
 test("buildRuntimeConfig maps Claude API URL and custom model into structured config", () => {
   const config = buildRuntimeConfig({
@@ -118,9 +49,9 @@ test("hydrateRuntimeConfigForm maps legacy agent rows into editable runtime conf
   });
 
   assert.equal(config.runtime, "claude");
-  assert.equal(runtimeConfigProviderMode(config), "custom");
+  assert.equal(config.provider?.kind, "custom");
   assert.equal(runtimeConfigApiUrl(config), "https://gateway.example.test/v1");
-  assert.equal(runtimeConfigApiKey(config), "sk-ant-test");
+  assert.equal(config.provider?.kind === "custom" ? config.provider.apiKey : "", "sk-ant-test");
   assert.equal(runtimeConfigCustomModelName(config), "claude-opus-router");
   assert.equal(config.reasoningEffort, "high");
   assert.deepEqual(config.envVars, { TEAM_FLAG: "1" });
@@ -179,7 +110,6 @@ test("buildRuntimeConfig maps Built-in provider mode into structured config", ()
     envVars: { OPENAI_API_KEY: "stale-user-key", SAFE_FLAG: "1" },
   });
 
-  assert.equal(runtimeConfigBuiltInProviderMode(config), "openai");
   assert.deepEqual(config, {
     version: 1,
     runtime: "builtin",
@@ -210,10 +140,6 @@ test("buildRuntimeConfig maps Built-in gateway provider mode into structured con
     },
   });
 
-  assert.equal(runtimeConfigBuiltInProviderMode(config), "openai-compatible");
-  assert.equal(runtimeConfigBuiltInProviderApiKey(config), "sk-openai-test");
-  assert.equal(runtimeConfigBuiltInProviderBaseUrl(config), "https://gateway.example.test/v1");
-  assert.equal(runtimeConfigBuiltInProviderSupportsImageInput(config), true);
   assert.equal(runtimeConfigCustomModelName(config), "openai/gpt-custom");
   assert.deepEqual(config, {
     version: 1,
@@ -255,14 +181,9 @@ test("Built-in gateway readback preserves image-input state while keeping its se
     },
   });
 
-  assert.equal(runtimeConfigBuiltInProviderApiKey(config), "");
-  assert.equal(runtimeConfigBuiltInProviderSupportsImageInput(config), true);
-});
-
-test("built-in provider default model follows Pi SDK default, not display order", () => {
-  assert.equal(piBuiltinProviderDefaultModel("moonshotai"), "moonshotai/kimi-k2.6");
-  assert.equal(builtInProviderDefaultModel("moonshotai"), "moonshotai/kimi-k2.6");
-  assert.equal(piBuiltinProviderDefaultModel("unknown-provider"), null);
+  assert.equal(config.provider?.kind, "gateway");
+  assert.equal(config.provider?.kind === "gateway" ? config.provider.apiKey : undefined, "");
+  assert.equal(config.provider?.kind === "gateway" ? config.provider.supportsImageInput : undefined, true);
 });
 
 test("buildRuntimeConfig maps Pi configured provider model selections into structured config", () => {
@@ -276,8 +197,6 @@ test("buildRuntimeConfig maps Pi configured provider model selections into struc
     envVars: null,
   });
 
-  assert.equal(runtimeConfigPiProviderMode(config), PI_PROVIDER_CONFIGURED);
-  assert.equal(runtimeConfigPiProviderApiKey(config), "");
   assert.deepEqual(config, {
     version: 1,
     runtime: "pi",
@@ -300,8 +219,6 @@ test("buildRuntimeConfig maps Pi built-in provider model selections and API key 
     envVars: { DEEPSEEK_API_KEY: "stale-user-key", SAFE_FLAG: "1" },
   });
 
-  assert.equal(runtimeConfigPiProviderMode(config), "deepseek");
-  assert.equal(runtimeConfigPiProviderApiKey(config), "sk-ds-test");
   assert.deepEqual(config, {
     version: 1,
     runtime: "pi",
@@ -362,7 +279,6 @@ test("Cursor supports custom model name but not per-agent API URL", () => {
     envVars: null,
   });
 
-  assert.equal(supportsRuntimeCustomModelName("cursor"), true);
   assert.equal(supportsRuntimeApiUrl("cursor"), false);
   assert.match(runtimeApiUrlUnsupportedCopy("cursor") ?? "", /does not expose a per-agent API URL/);
   assert.deepEqual(config, {
@@ -385,7 +301,6 @@ test("Codex supports custom model name and no per-agent API URL", () => {
     envVars: null,
   });
 
-  assert.equal(supportsRuntimeCustomModelName("codex"), true);
   assert.equal(supportsRuntimeApiUrl("codex"), false);
   assert.deepEqual(config, {
     version: 1,
@@ -402,9 +317,7 @@ test("runtime config form exposes only supported per-runtime axes", () => {
 
   assert.deepEqual(runtimes.filter(supportsRuntimeApiUrl), ["claude"]);
   assert.deepEqual(runtimes.filter(supportsRuntimeFastMode), ["claude", "codex"]);
-  assert.deepEqual(runtimes.filter(supportsRuntimeCustomModelName), ["builtin", "claude", "codex", "copilot", "cursor", "pi"]);
-  assert.deepEqual(runtimes.filter(runtimeIgnoresModel), ["antigravity"]);
-  assert.deepEqual(runtimes.filter((runtime) => REASONING_EFFORT_RUNTIMES.has(runtime)), ["builtin", "claude", "codex", "grok", "copilot", "pi"]);
+  assert.deepEqual(runtimes.filter((runtime) => REASONING_EFFORT_RUNTIMES.has(runtime)), ["builtin", "claude", "codex", "grok", "antigravity", "copilot", "pi"]);
 });
 
 test("buildRuntimeConfig maps fast mode only for supported runtimes", () => {
@@ -428,10 +341,19 @@ test("buildRuntimeConfig maps fast mode only for supported runtimes", () => {
   assert.deepEqual(cursorConfig.mode, { kind: "default" });
 });
 
-test("Built-in hydration missing provider does not throw on form read helpers (agent detail route)", () => {
+test("buildRuntimeConfig drops fast mode for Claude Opus 4.8, which no longer runs fast", () => {
+  const opus48 = buildRuntimeConfig({ runtime: "claude", model: "claude-opus-4-8", customModelMode: false, fastMode: true, envVars: null });
+  const opus55 = buildRuntimeConfig({ runtime: "claude", model: "claude-opus-5-5", customModelMode: false, fastMode: true, envVars: null });
+
+  assert.deepEqual(opus48.mode, { kind: "default" });
+  assert.deepEqual(opus55.mode, { kind: "fast" });
+  assert.equal(runtimeConfigFastMode({ ...opus55, model: { kind: "preset", id: "claude-opus-4-8" } }), false);
+});
+
+test("Built-in hydration missing provider does not throw (agent detail route)", () => {
   // Member projections / agent:created strip private runtimeConfig; hydrate
-  // still yields runtime:"builtin" with no provider. AgentDetailPanel calls
-  // these helpers on every render — they must fail soft.
+  // still yields runtime:"builtin" with no provider. AgentDetailPanel reads
+  // the hydrated config on every render — it must fail soft.
   const config = hydrateRuntimeConfigForm({
     runtime: "builtin",
     model: "deepseek-v4-pro",
@@ -442,60 +364,7 @@ test("Built-in hydration missing provider does not throw on form read helpers (a
 
   assert.equal(config.runtime, "builtin");
   assert.equal(config.provider, undefined);
-  assert.equal(runtimeConfigBuiltInProviderMode(config), "deepseek");
-  assert.equal(runtimeConfigBuiltInProviderApiKey(config), "");
-  assert.equal(runtimeConfigBuiltInProviderBaseUrl(config), "");
-  assert.equal(runtimeConfigBuiltInProviderSupportsImageInput(config), false);
   // Model string still hydrates; only provider is absent.
   assert.equal(typeof runtimeConfigCustomModelName(config), "string");
-  assert.equal(runtimeConfigProviderMode(config), "default");
-});
-
-// task #22, acceptance item 2. The save button collapses eleven independent causes
-// into a single boolean, so reading `button.disabled` cannot show WHICH cause fired
-// — a regression in the credential term hides behind "nothing changed yet". These
-// pin the two predicates the button is built from.
-
-test("a saved connection supplies the credential, so an empty agent-local key is not invalid", () => {
-  assert.equal(isBuiltInProviderApiKeyInvalid({
-    builtInProviderSupported: true, managedConnectionActive: true,
-    apiKey: "", retainsExistingKey: false,
-  }), false);
-});
-
-test("without a connection an empty agent-local key is invalid", () => {
-  assert.equal(isBuiltInProviderApiKeyInvalid({
-    builtInProviderSupported: true, managedConnectionActive: false,
-    apiKey: "", retainsExistingKey: false,
-  }), true);
-});
-
-test("an existing stored key is retained, so leaving it blank is not invalid", () => {
-  assert.equal(isBuiltInProviderApiKeyInvalid({
-    builtInProviderSupported: true, managedConnectionActive: false,
-    apiKey: "", retainsExistingKey: true,
-  }), false);
-});
-
-// Every other term is pinned false so the credential term is the only thing moving:
-// otherwise a red result could come from `changed: false` and would prove nothing.
-const SAVEABLE = {
-  saving: false, changed: true, runtimeCanSelect: true,
-  providerConnectionInvalid: false, providerApiUrlInvalid: false,
-  providerApiKeyInvalid: false, builtInProviderApiKeyInvalid: false,
-  piProviderApiKeyInvalid: false, builtInProviderBaseUrlInvalid: false,
-  customModelInvalid: false, modelSourceInvalid: false,
-};
-
-test("save is enabled when the draft changed and nothing is invalid", () => {
-  assert.equal(isRuntimeConfigSaveDisabled(SAVEABLE), false);
-});
-
-test("the credential term alone disables save", () => {
-  assert.equal(isRuntimeConfigSaveDisabled({ ...SAVEABLE, builtInProviderApiKeyInvalid: true }), true);
-});
-
-test("an unchanged draft disables save even when nothing is invalid", () => {
-  // Named explicitly so a future red here is not misread as the credential term.
-  assert.equal(isRuntimeConfigSaveDisabled({ ...SAVEABLE, changed: false }), true);
+  assert.equal(runtimeConfigApiUrl(config), "");
 });

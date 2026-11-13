@@ -294,6 +294,7 @@ test("a bound agent's stored config maps back to the connection option value, wi
   } as unknown as RuntimeConfig;
   const values = runtimeFormValuesFromRuntimeConfig(stored);
   assert.deepEqual(values, {
+    reasoningEffort: "",
     providerId: "connection:conn-1",
     model: "deepseek/deepseek-v4-pro",
     loadLocalPlugins: true,

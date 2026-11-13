@@ -1,3 +1,5 @@
+import { externalMessageReceiptScope } from "./externalMessageReceiptScope";
+import { resolveExternalConversationTarget } from "./externalConversationTargetService";
 import { and, asc, desc, eq, inArray, lte, or, sql } from "drizzle-orm";
 import {
   clearClockInterval,
@@ -133,14 +135,16 @@ export async function processExternalReactionCommandOnce(input: {
       eq(externalChannelBindings.providerConversationId, command.providerConversationId),
       eq(externalChannelBindings.state, "active"),
     )).limit(1);
+    if (!install?.botUserId || !binding) return null;
+    const target = await resolveExternalConversationTarget({ executor: tx, authorityChannelId: binding.channelId });
+    if (!target || target.level !== "top_level" || (target.kind === "joint" && target.role !== "host")) return null;
     const [link] = await tx.select().from(externalMessageLinks).where(and(
       eq(externalMessageLinks.id, command.messageLinkId),
       eq(externalMessageLinks.raftMessageId, command.raftMessageId),
       eq(externalMessageLinks.providerMessageId, command.providerMessageId),
-      eq(externalMessageLinks.authorityState, "active"),
-      eq(externalMessageLinks.outcomeState, "accepted"),
+      externalMessageReceiptScope(tx, { ...command, canonicalRaftChannelId: target.storageChannelId }),
     )).limit(1);
-    if (!install?.botUserId || !binding || !link) return null;
+    if (!link) return null;
     const serverAuthority = await resolveExternalInstallServerGrantAuthority(tx, {
       installId: install.id,
       serverId: binding.serverId,
@@ -151,12 +155,24 @@ export async function processExternalReactionCommandOnce(input: {
       key: SLACK_BRIDGE_FEATURE_FLAG_KEYS.master,
       serverId: binding.serverId,
     }, tx as unknown as Database);
-    const enabled = await evaluateFeatureFlag({
-      key: SLACK_BRIDGE_FEATURE_FLAG_KEYS.reactionSync,
-      serverId: binding.serverId,
-    }, tx as unknown as Database);
-    return master.enabled && enabled.enabled ? { install, binding } : null;
+    return master.enabled ? { kind: "active" as const, install, binding } : { kind: "paused" as const };
   });
+  if (authority?.kind === "paused") {
+    await input.db.update(externalReactionCommands).set({
+      state: claim.originState,
+      attempts: command.attempts - 1,
+      nextAttemptAt: new Date(claimAt.getTime() + RETRY_MS),
+      leaseOwner: null,
+      leaseExpiresAt: null,
+      lastErrorClass: "bridge_disabled",
+      updatedAt: claimAt,
+    }).where(and(
+      eq(externalReactionCommands.id, command.id),
+      eq(externalReactionCommands.leaseGeneration, command.leaseGeneration),
+      eq(externalReactionCommands.state, "dispatching"),
+    ));
+    return { kind: "blocked", commandId: command.id, reason: "bridge_disabled" };
+  }
   if (!authority) {
     await input.db.update(externalReactionCommands).set({
       state: "revoked",

@@ -13,6 +13,26 @@ export const PI_TOOL_PROGRESS_COALESCE_MS = 60_000;
 
 type PiToolProgressSource = "stdio" | "runtime_update";
 
+/**
+ * Who asked for the abort. Pi's `session.abort()` takes no reason and the tool's
+ * signal belongs to Pi's run, so `signal.reason` is always the default
+ * AbortError; the driver records the cause here before it aborts.
+ */
+export type PiToolAbortCause = "stop" | "interrupt";
+
+/**
+ * Why a failed or aborted execution ended, from typed observations only
+ * (the abort cause, the command tool's own timeout, the process exit kind);
+ * never from command text, output, or error messages.
+ */
+type PiToolFailureReason =
+  | "timeout"
+  | "killed_by_signal"
+  | "aborted_by_stop"
+  | "aborted_by_interrupt"
+  | "spawn_failed"
+  | "other";
+
 type PiToolExecutionState = {
   runtimeToolCallId: string;
   runtimeToolCallIdPresent: boolean;
@@ -22,10 +42,13 @@ type PiToolExecutionState = {
   startedAtMs: number;
   processCapability: "daemon_owned" | "not_applicable" | "unknown";
   process?: ChildProcess;
+  processTreeTracking?: "root_only" | "process_group" | "job_object" | "unknown";
   processInstanceId?: string;
   processSpawnedAtMs?: number;
   processExitObservedAtMs?: number;
   processExitKind?: "code_zero" | "code_nonzero" | "signal" | "spawn_error" | "unknown";
+  timeoutFired?: boolean;
+  abortCause?: PiToolAbortCause;
   lastProgressAtMs?: number;
   progressBytesSinceEmit: number;
   progressUpdatesSinceEmit: number;
@@ -58,6 +81,10 @@ export interface PiToolExecutionObserver {
     signal: NodeJS.Signals | null;
     spawnError?: boolean;
   }): void;
+  /** The command tool's own timeout ended the command. */
+  observeTimeout(): void;
+  /** Call before aborting; marks the executions pending at that moment. */
+  observeAbortRequested(cause: PiToolAbortCause): void;
   emitDiagnosticSnapshots(input: RuntimeToolDiagnosticInput): RuntimeToolDiagnosticSnapshot[];
 }
 
@@ -67,11 +94,15 @@ type PiToolExecutionObserverOptions = {
   machineId: string;
   agentId: string;
   launchId: string;
+  /** Runtime that owns the Pi session; built-in reuses Pi's command tool. */
+  runtime?: "pi" | "builtin";
   runtimeVersion: string;
   runtimeSessionId?: string | null;
   now?: () => number;
   idGenerator?: () => string;
   probeChildLiveness?: (child: ChildProcess) => boolean | undefined;
+  /** Whether any process is left in the child's process group (task #1302). */
+  probeProcessGroupLiveness?: (child: ChildProcess) => boolean | undefined;
 };
 
 function nonNegativeMs(value: number): number {
@@ -105,6 +136,42 @@ function progressSource(
       : "stdio";
 }
 
+function failureReason(
+  executionState: "failed" | "aborted",
+  state: PiToolExecutionState,
+): PiToolFailureReason {
+  if (executionState === "aborted") {
+    return state.abortCause === "stop"
+      ? "aborted_by_stop"
+      : state.abortCause === "interrupt"
+        ? "aborted_by_interrupt"
+        : "other";
+  }
+  if (state.timeoutFired) return "timeout";
+  if (state.processExitKind === "spawn_error") return "spawn_failed";
+  // Pi's bash tool resolves a non-zero exit code as an isError result, so it
+  // finishes `succeeded` and only process.exited `exit_kind` carries it; a
+  // throw after such an exit is some later step failing (saving output, …),
+  // which is `other` like the same failure after exit 0. A signal death the
+  // tool did not cause (the OOM killer) throws: Raft's operations return no
+  // exit code for it.
+  if (state.processExitKind === "signal") return "killed_by_signal";
+  return "other";
+}
+
+function defaultProbeProcessGroupLiveness(child: ChildProcess): boolean | undefined {
+  if (process.platform === "win32" || typeof child.pid !== "number") return undefined;
+  try {
+    process.kill(-child.pid, 0);
+    return true;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException)?.code;
+    if (code === "EPERM") return true;
+    if (code === "ESRCH") return false;
+    return undefined;
+  }
+}
+
 function defaultProbeChildLiveness(child: ChildProcess): boolean | undefined {
   if (child.exitCode !== null || child.signalCode !== null) return false;
   if (typeof child.pid !== "number") return undefined;
@@ -126,6 +193,7 @@ export class PiToolExecutionTraceObserver implements PiToolExecutionObserver {
   private readonly now: () => number;
   private readonly idGenerator: () => string;
   private readonly probeChildLiveness: (child: ChildProcess) => boolean | undefined;
+  private readonly probeProcessGroupLiveness: (child: ChildProcess) => boolean | undefined;
   private runtimeSessionId: string | null;
   private runtimeTurnId: string | null = null;
   private runtimeTurnIdentityPresent = false;
@@ -134,6 +202,7 @@ export class PiToolExecutionTraceObserver implements PiToolExecutionObserver {
     this.now = options.now ?? Date.now;
     this.idGenerator = options.idGenerator ?? randomUUID;
     this.probeChildLiveness = options.probeChildLiveness ?? defaultProbeChildLiveness;
+    this.probeProcessGroupLiveness = options.probeProcessGroupLiveness ?? defaultProbeProcessGroupLiveness;
     this.runtimeSessionId = options.runtimeSessionId ?? null;
   }
 
@@ -194,6 +263,9 @@ export class PiToolExecutionTraceObserver implements PiToolExecutionObserver {
       this.flushProgress(state);
       this.emitFact("daemon.runtime.tool.execution.finished", state, {
         execution_state: executionState,
+        ...(executionState === "failed" || executionState === "aborted"
+          ? { failure_reason: failureReason(executionState, state) }
+          : {}),
         execution_runtime_ms: nonNegativeMs(this.now() - state.startedAtMs),
         process_exit_observed_before_finish: state.processExitObservedAtMs !== undefined,
       });
@@ -223,6 +295,7 @@ export class PiToolExecutionTraceObserver implements PiToolExecutionObserver {
     const state = this.executionContext.getStore();
     if (!state || state.process) return;
     state.process = child;
+    state.processTreeTracking = input.processTreeTracking;
     state.processInstanceId = this.idGenerator();
     state.processSpawnedAtMs = this.now();
     this.emitFact("daemon.runtime.tool.process.spawned", state, {
@@ -264,6 +337,17 @@ export class PiToolExecutionTraceObserver implements PiToolExecutionObserver {
     });
   }
 
+  observeTimeout(): void {
+    const state = this.executionContext.getStore();
+    if (state) state.timeoutFired = true;
+  }
+
+  observeAbortRequested(cause: PiToolAbortCause): void {
+    for (const state of this.pendingExecutions.values()) {
+      state.abortCause ??= cause;
+    }
+  }
+
   emitDiagnosticSnapshots(input: RuntimeToolDiagnosticInput): RuntimeToolDiagnosticSnapshot[] {
     const observationIntervalMs = Math.max(
       1,
@@ -289,6 +373,7 @@ export class PiToolExecutionTraceObserver implements PiToolExecutionObserver {
       const now = this.now();
       const snapshot: RuntimeToolDiagnosticSnapshot = {
         ...this.classifyPending(state, observationIntervalMs),
+        ...(state.runtimeToolCallIdPresent ? { runtimeToolCallId: state.runtimeToolCallId } : {}),
         toolAgeMs: nonNegativeMs(now - state.startedAtMs),
         ...(state.lastProgressAtMs !== undefined
           ? { lastProgressAgeMs: nonNegativeMs(now - state.lastProgressAtMs) }
@@ -359,6 +444,7 @@ export class PiToolExecutionTraceObserver implements PiToolExecutionObserver {
         processInstanceId: state.processInstanceId,
         toolPending: true,
         processLiveness: "exited",
+        processGroupLiveness: this.processGroupLiveness(state),
         progressState: this.progressState(state, observationIntervalMs),
         negativeEvidenceBucket: identityNegativeEvidence ?? "none",
       };
@@ -438,6 +524,17 @@ export class PiToolExecutionTraceObserver implements PiToolExecutionObserver {
     };
   }
 
+  /**
+   * The shell exiting does not end its work: a backgrounded descendant in the
+   * same process group can still be running, and abort kills the whole group.
+   * Only a process-group probe can say the group is gone.
+   */
+  private processGroupLiveness(state: PiToolExecutionState): "alive" | "exited" | "unknown" {
+    if (state.processTreeTracking !== "process_group" || !state.process) return "unknown";
+    const alive = this.probeProcessGroupLiveness(state.process);
+    return alive === true ? "alive" : alive === false ? "exited" : "unknown";
+  }
+
   private emitDiagnosticFact(
     state: PiToolExecutionState,
     input: RuntimeToolDiagnosticInput,
@@ -455,6 +552,9 @@ export class PiToolExecutionTraceObserver implements PiToolExecutionObserver {
       tool_pending: snapshot.toolPending,
       process_liveness: snapshot.processLiveness,
       process_liveness_source: processLivenessSource,
+      ...(snapshot.processGroupLiveness !== undefined
+        ? { process_group_liveness: snapshot.processGroupLiveness }
+        : {}),
       progress_state: snapshot.progressState,
       ...(snapshot.toolAgeMs !== undefined ? { tool_age_ms: snapshot.toolAgeMs } : {}),
       ...(snapshot.lastProgressAgeMs !== undefined
@@ -492,7 +592,7 @@ export class PiToolExecutionTraceObserver implements PiToolExecutionObserver {
         runtime_tool_call_id_present: state.runtimeToolCallIdPresent,
         process_instance_id: state.processInstanceId,
         producer_fact_id: this.idGenerator(),
-        runtime: "pi",
+        runtime: this.options.runtime ?? "pi",
         runtime_version: this.options.runtimeVersion,
         tool_class: "bash",
         ...attrs,

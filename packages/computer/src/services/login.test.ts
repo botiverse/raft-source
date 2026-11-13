@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { ComputerServiceError } from "./errors";
-import { login } from "./login";
+import { login, MAX_CONSECUTIVE_POLL_FAILURES } from "./login";
 import type { ComputerApiEvent } from "../lib/events";
 
 async function withHome<T>(fn: (home: string) => Promise<T>): Promise<T> {
@@ -59,7 +59,8 @@ async function withProxyEnv<T>(env: Partial<Record<(typeof PROXY_ENV_KEYS)[numbe
 
 interface DeviceServerOptions {
   authorize?: { status: number; body: unknown };
-  token?: Array<{ status: number; body: unknown }>;
+  /** One entry per poll (the last repeats); `drop` closes the connection without an answer. */
+  token?: Array<{ status: number; body: unknown } | { drop: true }>;
   /** GET /api/auth/me response for the login-time identity enrichment (#112). */
   meStatus?: number;
   meBody?: unknown;
@@ -92,6 +93,10 @@ async function startDeviceServer(opts: DeviceServerOptions): Promise<{ server: S
         ];
         const next = seq[Math.min(tokenIdx, seq.length - 1)];
         tokenIdx += 1;
+        if ("drop" in next) {
+          req.socket.destroy();
+          return;
+        }
         res.statusCode = next.status;
         res.end(JSON.stringify(next.body));
         return;
@@ -151,7 +156,7 @@ test("login service: happy path emits device-code + approved, writes user-sessio
     const deviceCode = events.find((e) => e.kind === "login.device-code");
     assert.ok(deviceCode && deviceCode.kind === "login.device-code");
     assert.equal(deviceCode.userCode, "ABCD-1234");
-    assert.match(deviceCode.verifyUrl, /\/login\/device\?user_code=ABCD-1234$/);
+    assert.match(deviceCode.verifyUrl, /\/login\/device$/);
     // expiresAt is ISO not seconds (Hao msg=51a17400 byte-pin).
     assert.match(deviceCode.expiresAt, /^\d{4}-\d{2}-\d{2}T/);
     assert.equal(deviceCode.expiresInSeconds, 30);
@@ -272,6 +277,7 @@ test("login service: token poll → expired_token throws LOGIN_EXPIRED", async (
           return true;
         },
       );
+      assert.equal(ctx.tokenCalls(), 1, "an explicit server answer is final, never retried");
     } finally {
       await stop(ctx.server);
     }
@@ -320,6 +326,74 @@ test("login service: AbortSignal aborts the polling loop without throwing Comput
           return true;
         },
       );
+    } finally {
+      await stop(ctx.server);
+    }
+  });
+});
+
+// --- A dropped poll does not end the sign-in ---
+test("login service: one dropped token poll, then success → login completes", async () => {
+  await withHome(async (home) => {
+    const ctx = await startDeviceServer({
+      token: [
+        { drop: true },
+        { status: 200, body: { accessToken: "access", refreshToken: "refresh", userId: "user-1" } },
+      ],
+    });
+    try {
+      const result = await login({ serverUrl: ctx.baseUrl, slockHome: home });
+      assert.equal(result.userId, "user-1");
+      assert.equal(ctx.tokenCalls(), 2);
+    } finally {
+      await stop(ctx.server);
+    }
+  });
+});
+
+test("login service: consecutive dropped polls → LOGIN_FAILED naming the host and the cause code only", async () => {
+  await withHome(async (home) => {
+    const ctx = await startDeviceServer({ token: [{ drop: true }] });
+    try {
+      await assert.rejects(
+        () => login({ serverUrl: ctx.baseUrl, slockHome: home }),
+        (err: unknown) => {
+          assert.ok(err instanceof ComputerServiceError);
+          assert.equal(err.code, "LOGIN_FAILED");
+          const host = new URL(ctx.baseUrl).host;
+          assert.ok(err.message.startsWith(`Lost connection to ${host} while waiting for approval (`), err.message);
+          assert.match(err.message, /\((UND_ERR_[A-Z_]+|ECONNRESET)[^)]*\)/);
+          assert.match(err.message, /HTTPS_PROXY \/ HTTP_PROXY \/ NO_PROXY/);
+          assert.match(err.message, /Then run `raft-computer login` again\.$/);
+          assert.doesNotMatch(err.message, /fetch failed|other side closed/, "the cause's message is never shown");
+          assert.notEqual(err.cause, undefined, "cause kept in-process");
+          return true;
+        },
+      );
+      assert.equal(ctx.tokenCalls(), MAX_CONSECUTIVE_POLL_FAILURES);
+    } finally {
+      await stop(ctx.server);
+    }
+  });
+});
+
+test("login service: dropped answer then device_code_consumed → says the approval went through but its answer was lost", async () => {
+  await withHome(async (home) => {
+    const ctx = await startDeviceServer({
+      token: [{ drop: true }, { status: 410, body: { code: "device_code_consumed" } }],
+    });
+    try {
+      await assert.rejects(
+        () => login({ serverUrl: ctx.baseUrl, slockHome: home }),
+        (err: unknown) => {
+          assert.ok(err instanceof ComputerServiceError);
+          assert.equal(err.code, "LOGIN_FAILED");
+          assert.match(err.message, /approved, but the server's answer was lost on the network/);
+          assert.match(err.message, /Re-run `raft-computer login`\.$/);
+          return true;
+        },
+      );
+      assert.equal(ctx.tokenCalls(), 2, "the consumed answer is final");
     } finally {
       await stop(ctx.server);
     }

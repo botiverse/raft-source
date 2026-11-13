@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 
 import type { AgentContext } from "./auth/env";
-import { MANUAL_CONTEXT_CAPABILITY, RAFT_CLIENT_CAPABILITIES_HEADER } from "@botiverse/raft-shared";
+import { hasPlanUpgradeCardCapability, MANUAL_CONTEXT_CAPABILITY, PLAN_UPGRADE_CARD_CAPABILITY, RAFT_CLIENT_CAPABILITIES_HEADER } from "@botiverse/raft-shared";
 import { ApiClient } from "./client";
 import { CliError } from "./core/errors";
 import {
@@ -12,6 +12,7 @@ import {
   type CliTransportNormalizedErrorAttrs,
 } from "./transportTrace";
 import { globalFetchJsonTransport, setJsonTransportForTests } from "./client";
+import { setCanonicalFetchImplForTests } from "./proxy";
 import { afterEach, beforeEach } from "vitest";
 // These tests stub globalThis.fetch; route the client's JSON transport (node:http
 // in production) through it.
@@ -51,9 +52,39 @@ test("ApiClient marks requests as slock CLI traffic", async () => {
   assert.equal(calls.length, 1);
   const headers = new Headers(calls[0].headers);
   assert.equal(headers.get("X-Raft-Client"), "cli");
-  assert.equal(headers.get(RAFT_CLIENT_CAPABILITIES_HEADER), MANUAL_CONTEXT_CAPABILITY);
+  // The Manual context contract, that it posts plan:upgrade cards, then the first-party app entries this CLI carries (artifacts).
+  assert.equal(headers.get(RAFT_CLIENT_CAPABILITIES_HEADER), `${MANUAL_CONTEXT_CAPABILITY},action-card:plan:upgrade@1,inbox-items@1,guide-app:artifacts@6`);
   assert.equal(headers.get("X-Agent-Id"), "agent-1");
   assert.equal(headers.get("X-Server-Id"), "server-1");
+});
+
+test("ApiClient declares it can post plan:upgrade cards on JSON and multipart requests (an upload's Free-limit refusal hints the card only then)", async () => {
+  const original = globalThis.fetch;
+  const calls: RequestInit[] = [];
+  globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+    calls.push(init ?? {});
+    return new Response(JSON.stringify({ ok: true }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }) as typeof fetch;
+
+  try {
+    const client = new ApiClient(ctx);
+    await client.request("GET", "/internal/agent-api/history?channel=%23general");
+    const form = new FormData();
+    form.append("channelId", "channel-1");
+    await client.requestMultipart("POST", "/internal/agent-api/upload", form);
+  } finally {
+    globalThis.fetch = original;
+  }
+
+  assert.equal(calls.length, 2);
+  for (const call of calls) {
+    const declared = new Headers(call.headers).get(RAFT_CLIENT_CAPABILITIES_HEADER);
+    assert.ok(declared?.split(",").includes(PLAN_UPGRADE_CARD_CAPABILITY), String(declared));
+    assert.equal(hasPlanUpgradeCardCapability(declared), true);
+  }
 });
 
 test("ApiClient rewrites supported legacy paths when using sk_agent credential", async () => {
@@ -210,6 +241,46 @@ test("ApiClient follows one HTTPS attachment redirect without forwarding Raft cr
   }
 });
 
+test("ApiClient sends a proxied attachment redirect through the package fetch with its dispatcher", async () => {
+  // Node's built-in fetch is another undici major than the package ProxyAgent;
+  // paired, they fail before connecting (UND_ERR_INVALID_ARG). The object GET
+  // behind HTTPS_PROXY must use the package fetch.
+  const originalFetch = globalThis.fetch;
+  const originalProxy = process.env.HTTPS_PROXY;
+  const signedUrl = "https://objects.example.test/private/file?X-Amz-Signature=proxy-secret";
+  const objectBytes = new Uint8Array([4, 3, 2, 1]);
+  const globalCalls: string[] = [];
+  const packageCalls: Array<{ input: string; init: RequestInit & { dispatcher?: unknown } }> = [];
+  process.env.HTTPS_PROXY = "http://127.0.0.1:3128";
+  globalThis.fetch = (async (input: RequestInfo | URL) => {
+    globalCalls.push(String(input));
+    return new Response(null, { status: 302, headers: { Location: signedUrl } });
+  }) as typeof fetch;
+  const previousImpl = setCanonicalFetchImplForTests((async (input: RequestInfo | URL, init?: RequestInit) => {
+    packageCalls.push({ input: String(input), init: init ?? {} });
+    return new Response(objectBytes, { status: 200 });
+  }) as typeof fetch);
+
+  try {
+    const client = new ApiClient(ctx);
+    const response = await client.requestBinary("GET", "/internal/agent-api/attachments/attachment-1");
+    assert.equal(response.ok, true);
+    assert.deepEqual([...response.body], [...objectBytes]);
+  } finally {
+    setCanonicalFetchImplForTests(previousImpl);
+    globalThis.fetch = originalFetch;
+    if (originalProxy === undefined) delete process.env.HTTPS_PROXY;
+    else process.env.HTTPS_PROXY = originalProxy;
+  }
+
+  assert.equal(globalCalls.length, 1, "only the plain-http server request uses the built-in fetch");
+  assert.equal(packageCalls.length, 1);
+  assert.equal(packageCalls[0]!.input, signedUrl);
+  assert.ok(packageCalls[0]!.init.dispatcher, "the proxy dispatcher rides the package fetch");
+  assert.equal(packageCalls[0]!.init.redirect, "error");
+  assert.equal(new Headers(packageCalls[0]!.init.headers).has("authorization"), false);
+});
+
 test("ApiClient fails closed on expired or unapproved attachment redirects without exposing the signed URL", async () => {
   const original = globalThis.fetch;
   const signedUrl = "https://objects.example.test/private/file?X-Amz-Signature=expired-secret";
@@ -251,6 +322,24 @@ test("ApiClient fails closed on expired or unapproved attachment redirects witho
   assert.equal(calls.length, 3, "the rejected same-origin redirect must not receive a second request");
 });
 
+test("ApiClient keeps a binary route's JSON refusal body and its step, as the JSON path does", async () => {
+  const original = globalThis.fetch;
+  const refusal = { error: "That file isn't in this version: list the files to find it.", code: "FILE_NOT_FOUND", errorCode: "FILE_NOT_FOUND", suggestedNextAction: "List the files, then download one of them.", details: { path: "a.png", version: 3 } };
+  globalThis.fetch = (async () => new Response(JSON.stringify(refusal), { status: 404, headers: { "content-type": "application/json" } })) as typeof fetch;
+  try {
+    const client = new ApiClient(ctx);
+    const response = await client.requestBinary("GET", "/internal/agent-api/artifacts/pt_abc/files/a.png");
+    assert.equal(response.ok, false);
+    assert.equal(response.status, 404);
+    assert.equal(response.error, refusal.error);
+    assert.equal(response.errorCode, "FILE_NOT_FOUND");
+    assert.equal(response.suggestedNextAction, refusal.suggestedNextAction);
+    assert.deepEqual(response.errorBody, refusal);
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
 test("ApiClient scrubs a signed object URL from attachment transport traces and errors", async () => {
   const original = globalThis.fetch;
   const signedUrl = "https://objects.example.test/private/file?X-Amz-Signature=trace-secret";
@@ -270,7 +359,11 @@ test("ApiClient scrubs a signed object URL from attachment transport traces and 
     await assert.rejects(
       () => client.requestBinary("GET", "/internal/agent-api/attachments/attachment-1"),
       (err: unknown) => {
-        assert.doesNotMatch(err instanceof Error ? err.message : String(err), /objects\.example|X-Amz|trace-secret/);
+        const message = err instanceof Error ? err.message : String(err);
+        // The storage host and the nested failure stay diagnosable; the signed
+        // path and query never appear.
+        assert.match(message, /objects\.example\.test direct: unknown/);
+        assert.doesNotMatch(message, /private\/file|X-Amz|trace-secret/);
         return true;
       },
     );
@@ -472,6 +565,24 @@ test("ApiClient preserves server code and suggested next action from error bodie
     assert.equal(response.errorCode, "knowledge_not_found");
     assert.match(response.error ?? "", /manual get index --intent/);
     assert.match(response.suggestedNextAction ?? "", /--reason/);
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
+test("ApiClient reads a contract-shaped error's message when it has no error field", async () => {
+  const original = globalThis.fetch;
+  globalThis.fetch = (async () => new Response(
+    JSON.stringify({ code: "UPLOAD_FORBIDDEN", message: "The monthly upload quota is exhausted.", retryable: false }),
+    { status: 403, headers: { "content-type": "application/json" } },
+  )) as typeof fetch;
+
+  try {
+    const client = new ApiClient(ctx);
+    const response = await client.request("POST", "/internal/agent-api/attachment-upload-sessions", {});
+    assert.equal(response.ok, false);
+    assert.equal(response.errorCode, "UPLOAD_FORBIDDEN");
+    assert.equal(response.error, "The monthly upload quota is exhausted.");
   } finally {
     globalThis.fetch = original;
   }

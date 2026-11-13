@@ -9,10 +9,10 @@ import {
   isActivityPromotionSuppressedByMute,
 } from "./inboxMutePolicy";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 test("activity mute SQL predicate matches TypeScript policy", async () => {
-  const { close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const { close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const db = getDb();
     const cases: Array<{

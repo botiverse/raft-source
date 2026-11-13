@@ -146,7 +146,8 @@ v1 agent read keeps returning the key, as for Claude. Pi has no saved provider
 connections (the legacy form loads them only for Built-in Pi). Every runtime in
 the catalog now has a v2 form. The runtime admission row
 (`GET .../runtime-options`) carries `runtimeFormV2: { protocolVersion: 2 }` for
-every registered runtime; web opens v2 by that marker (behind its flag). It is
+every registered runtime; web opens v2 by that marker and has no v1 form any
+more (a row without it shows the form as unavailable). The marker is
 independent of the row's v1 `formDefinitionRef`: a runtime can have a v2 form
 and no v1 form, and then v1 clients never see it (the v1 routes 404 and the row
 has no `formDefinitionRef`). Mobile asks the v2 endpoint directly and falls back
@@ -161,7 +162,12 @@ Client obligations:
    source is `dependent_select`.
 3. Order by `uiSchema.order`, then any remaining fields; `layout.advanced` goes
    under Advanced; apply `visibility`; label from `localization`, else `title`,
-   else the key.
+   else the key. Advanced starts open when any visible field in it has a
+   non-blank value (`runtimeFormV2AdvancedStartsOpen`), so a value in effect is
+   never collapsed out of sight; the user may close it. A `hint` may contain
+   inline Markdown links `[text](https://…)`: render them as links opening
+   outside the app; nothing else is Markdown, and a non-https or malformed
+   link stays plain text.
 4. Unknown field kind: optional → skip it and keep its stored value; required →
    show the form, ask the user to update, and disable saving
    (`blockingFieldKeys`). Never drop the whole form.
@@ -196,7 +202,8 @@ Client obligations:
    implement beyond the base renderer. Absent or `null` means `[]`. If the list
    contains a name the client does not implement, or the value is not an array,
    or an entry is not a string, the whole v2 form is unavailable to that client:
-   fall back to the v1/legacy form, never render part of it
+   fall back to the v1/legacy form (mobile) or show the form as unavailable
+   (web, which has no v1 form), never render part of it
    (`missingRuntimeFormV2Capabilities`). Names, frozen (contract docs carry
    the full rules):
    - `select.custom_value`: `OptionSource.customValueAllowed` (kind `select`
@@ -217,9 +224,18 @@ Client obligations:
      `unavailable` has no options. A required field whose source is unavailable
      shows the status (and a retry when `retryable`) and blocks submit; an
      optional one is hidden. Retry re-requests the same source with
-     `?refresh=1` (the server bypasses any cache; it keeps none today). A
-     source-level failure never sends a client back to v1: that is only for a
-     form-level 404 or protocol error.
+     `?refresh=1` (the server asks the Computer again, bypassing its model-list
+     cache). A source-level failure never sends a client back to v1: that is
+     only for a form-level 404 or protocol error.
+     Additive `state`, sent only when the Computer did not answer in time (the
+     server waits at most 6s, below the 8s cross-replica replay budget):
+     `stale` with `fetchedAt` when the list is the last one it reported (status
+     `fallback`, reason `probe_timeout`, retryable), `unavailable` when there is
+     no earlier list. The server keeps the Computer's request running, caches a
+     late answer for ten minutes (Redis, shared across replicas), and also
+     answers from that cache when the replay to the owner replica fails, so
+     these reads never answer 504
+     (`packages/server/src/services/computerProbeCacheService.ts`).
 
    - `provider.saved_connection`: saved provider connections inside the form
      (today Built-in Pi). `Option.connectionId` (with the hard constraint
@@ -243,14 +259,14 @@ Client obligations:
      (`recovery: refetch_form`) — the client refetches the whole form and
      never merges options across builds.
 
-   The server sends these fields only on the v2 endpoints and only to forms
-   that list the capability: a form without it (Kimi Code,
-   OpenCode, Kimi CLI, Gemini, Antigravity, and Built-in Pi on servers
-   without provider connections) gets its option sources exactly as
-   before, typed 409s included (per registry entry, not by inspecting the
-   request). Today Codex, Claude, Copilot and Pi list the first three, Grok
-   lists `choice.labels` and `option_source.status`, Cursor lists
-   `select.custom_value` and `option_source.status`, and Built-in Pi lists
+   The server sends these fields only on the v2 endpoints, per registry
+   entry (not by inspecting the request): a runtime without a probed source
+   (OpenCode, Kimi CLI, Gemini, Antigravity) gets its option sources exactly
+   as before. `choice.labels` and `option_source.status` stay reserved and
+   known to every client, but no form lists them any more: every client that
+   renders v2 (web, mobile >= 1.15) implements both, so a failed source marks
+   only its own field unavailable on any form. Today Codex, Claude, Cursor,
+   Copilot and Pi list `select.custom_value`, and Built-in Pi lists
    `provider.saved_connection` only on servers with provider connections
    enabled. Web implements all four (`WEB_RUNTIME_FORM_V2_CAPABILITIES`);
    mobile does not implement `provider.saved_connection` yet and falls back to
@@ -283,6 +299,15 @@ Client obligations:
    offered, refused at `/formValues/reasoningEffort` if not, and the model is
    stored as a preset); otherwise the static rule stands.
 
+Model sources may carry `unavailableOptions` (`[{ value, label, reason? }]`,
+no capability name): models the Computer's runtime itself listed as disabled,
+listed apart from `options` so a client that ignores the field never offers
+them. Raft's bundled catalog never adds entries: when the Computer provides a
+list, that list alone decides. `reason` is the runtime's own text (render as
+plain text); absent when the runtime gave none. Clients draw them
+after the list as a disabled group; the server sends them only for a live
+Computer list, never on the bundled fallback, and never on v1 option sources.
+
 The server may add optional fields, change copy, add options or enum values and
 reorder. A new required field or a new field kind is breaking: ship it behind a
 `requiredClientCapabilities` name so older clients fall back instead of
@@ -303,6 +328,82 @@ shape (artin, `#raft-mobile-reconcile:3a0de29d`). `pnpm --filter
 
 The package test fails when a generated file is stale. What is generated is the
 protocol, not each form: form contents stay server data delivered at runtime.
+
+## Protocol v3
+
+One switch: a client that advertises `runtime_form.v3` (query
+`clientCapabilities`, comma-separated, on the definition, edit-form and
+option-source requests) gets v3 shapes from the same endpoints; any other
+request gets exactly the v2 bodies (the v2 fixtures stay byte-identical). The
+server keeps building v2 internally and converts at the edge
+(`packages/server/src/services/runtimeFormV3.ts`). v3 implies
+`dependent_select.custom_value_with_options`. The v2 shape is deleted once
+the minimum supported mobile build speaks v3.
+
+What differs from v2 (contract docs carry the details):
+
+- `protocolVersion: 3`; a v2 parser rejects it (fail closed).
+  `requiredClientCapabilities` is absent: v3 implies every v2 name and the
+  list is reserved for future breaking additions. `revision` is on every
+  form; echo it as `?formRevision=` (409 `form_revision_stale` = refetch).
+- `uiSchema.rules` replaces `visibility`: at most one
+  `{ scope, effect: SHOW | HIDE, condition: { scope, schema } }` per field.
+  Condition keywords: `const`, `enum`, `pattern`, `not`, `anyOf`, `allOf`,
+  `properties`; an absent value is `""`. Anything else (keyword, effect,
+  scope, or a pattern outside the portable subset below) makes the whole
+  form unavailable. `dataSchema.allOf`
+  (`{ if, then|else: { required } }`) adds conditional required. A field
+  hidden by a rule is not validated, not required and not submitted.
+  `src/v3Rules.ts` is the evaluator; `fixtures/v3.conditions.conformance.json`
+  is the table every client runs.
+- `const` / `enum` compare structurally: objects are equal when they have the
+  same keys with equal values, in any key order; arrays compare in order;
+  scalars by type and value (`true` is not `"true"`).
+- `pattern` is a portable regex subset (`isPortableRuntimeFormV3Pattern`),
+  unanchored unless it anchors: `^` / `$`; literals, with a backslash only
+  before a syntax character `^ $ \ . * + ? ( ) [ ] { } | /` (and `-` inside
+  a class); character classes `[…]` / `[^…]` with ranges (a literal `-` only
+  first or last, no nested `[`, no `&&`, not empty); `.`; quantifiers
+  `* + ? {m} {m,} {m,n}` directly after a literal, `.`, class or group; groups
+  `( )`; alternation `|`. Anything else is outside the subset: lookahead and
+  lookbehind, `(?…)` groups (named, non-capturing, inline flags),
+  backreferences, `\d` / `\w` / `\s` / `\b` / `\p{…}` and every other
+  escape, lazy, possessive or stacked quantifiers, a bare `]` `{` `}`. Matching
+  follows ECMAScript: `$` matches only at the very end (a JVM evaluator uses
+  `\z`, not `$`), and `.` excludes only `\n`, `\r`, U+2028 and U+2029 (a JVM
+  `.` also excludes U+0085, so use `[^\n\r\u2028\u2029]`). The server only
+  emits `^connection:` today.
+- Saved connections: no `x-connectionOwned`. An owned field without its own
+  visibility HIDEs while the provider matches `^connection:`; one with
+  visibility (a gateway URL) is simply not listed for connections. A required
+  owned field moves to `allOf[{ if: provider matches ^connection:, else:
+  { required } }]`. Fields a gateway shows that a connection does not own
+  (the model limits) list the gateway connections' values in their SHOW
+  condition; the connection set is folded into `revision`. The server still
+  refuses any owned-field value on a connection submit
+  (`savedConnection.connectionOwnedFields`).
+- Reasoning effort (Codex, Grok, Claude, Copilot, Kimi Code, Pi): no
+  `x-optionsFrom`. The field is an `x-optionSource` dependent_select on the
+  model (`dependsOn: /model`; Pi's built-in providers: `/providerModel`,
+  keyed by its model ids, which are unique across providers). Each listed
+  model with efforts has a key, `{ value: "", label: "Default" }` first (`""`
+  is stored as null; the server localizes the label and clients show it
+  as-is), `defaultValueByValue` its default; the source mirrors
+  the model source's status. A model without a key (a typed model) hides the
+  optional field and keeps its value (an edit submits the stored one).
+  Refreshing a source re-requests its dependents.
+- Unavailable options only in `OptionSource.unavailableOptions` (never
+  `Option.unavailable`); entries may carry `connectionId`,
+  `underlyingProviderId`, `group`, `providerKind`, and `reason` as plain text.
+  Draw them after the list, grouped by `group` (else "Not available on this
+  computer"). A current value equal to one shows selected-and-unavailable and
+  blocks saving (`option_unavailable`), except on a source with
+  `customValueAllowed`, which accepts it as typed.
+- Submit: `formDefinitionRef.protocolVersion` 2 or 3, same `formValues`.
+
+Fixtures: `fixtures/*.v3.json` (server-produced, byte-locked by
+`packages/server/src/services/runtimeFormV3Fixtures.test.ts`) and the
+conformance table.
 
 ## Shared v2 fixtures
 
@@ -330,7 +431,8 @@ stored key is not in `values`), `cursor.form.json`, `cursor.edit.json` (a stored
 custom model), `copilot.edit.json` (Copilot CLI is deprecated, so edit-only; a
 stored custom model), `claude.option-source.provider.json` (the
 static provider select), `claude.option-source.fallback.json` (Computer
-offline), `cursor.option-source.fallback.json` (missing config) and
+offline), `claude.option-source.live.json` (Claude Code's own list, with
+`unavailableOptions`), `cursor.option-source.fallback.json` (missing config) and
 `copilot.option-source.live.json` (the declared static catalog).
 
 Batch 4 adds `pi.form.json`, `pi.edit.json` (a DeepSeek provider; the stored

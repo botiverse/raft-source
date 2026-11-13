@@ -1,12 +1,9 @@
-import { Button, Card, DialogSurface } from "@botiverse/raft-ui";
-import CloseButton from "../ui/CloseButton";
-import Tooltip from "../ui/Tooltip";
-import { useCallback, useState } from "react";
+import { Button, Card, Dialog, DialogBody, DialogClose, DialogFooter, DialogHeader, DialogTitle, ScrollArea } from "@botiverse/raft-ui";
+import { useCallback, useRef, useState } from "react";
 import { useIntl } from "react-intl";
-import { X } from "lucide-react";
-import Modal from "../Modal";
 import Banner from "../ui/Banner";
 import AgreementBody from "./AgreementBody";
+import { DialogActions, DialogCommit, NarrowDialogContent, useNarrowPresentation } from "../ui/NarrowDialog";
 
 export interface CommunityAgreement {
   id: string;
@@ -27,6 +24,8 @@ export default function CommunityAgreementDialog({
   const { formatMessage } = useIntl();
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState("");
+  const narrow = useNarrowPresentation("sheet");
+  const popupRef = useRef<HTMLDivElement | null>(null);
 
   const handleAgree = useCallback(async () => {
     setSubmitting(true);
@@ -45,42 +44,52 @@ export default function CommunityAgreementDialog({
     }
   }, [agreement.id, formatMessage, onAgree]);
 
+  const handleOpenChange = useCallback((open: boolean) => { if (!open) onClose(); }, [onClose]);
+  const version = formatMessage({ id: "server.communityAgreement.version" }, { version: agreement.version });
+  const closeLabel = formatMessage({ id: "common.close" });
+
   return (
-    <Modal onClose={onClose}>
-      {/* DS Dialog surface (rf-dialog): raft-ui's DialogSurface draws the frame;
-          20 padding here. The surface rather than raft-ui's Dialog parts because
-          the shared Modal owns Escape/backdrop/focus here. */}
-      <DialogSurface className="w-full max-w-lg p-5">
-        <div className="mb-4 flex items-start justify-between gap-3">
-          <div className="min-w-0">
-            <h2 className="text-headline">{agreement.title}</h2>
-            <div className="mt-1 font-mono text-mono-meta text-foreground-hint">
-              {formatMessage({ id: "server.communityAgreement.version" }, { version: agreement.version })}
+    // DS Dialog: Base UI owns Esc, the focus trap and focus return. No scrim
+    // press, as the old Modal (closeOnBackdrop off). On a phone, the sheet:
+    // a long text and Agree, the version line opening the body.
+    // disablePointerDismissal is deliberate: joining needs an explicit choice, Agree or Cancel.
+    <Dialog open disablePointerDismissal onOpenChange={handleOpenChange}>
+      <NarrowDialogContent
+        ref={popupRef}
+        narrow="sheet"
+        // Focus starts on the dialog itself, as the old Modal: not on ×.
+        initialFocus={popupRef}
+        className="max-w-lg"
+        title={agreement.title}
+        closeLabel={closeLabel}
+        header={(
+          <DialogHeader>
+            <div className="min-w-0">
+              <DialogTitle>{agreement.title}</DialogTitle>
+              <div className="mt-1 font-mono text-mono-meta text-foreground-hint">{version}</div>
             </div>
-          </div>
-          <Tooltip content={formatMessage({ id: "common.close" })}>
-            <CloseButton
-              type="button"
-              onClick={onClose}
-              className="shrink-0"
-              data-slot="button"
-            >
-              <X size={18} />
-            </CloseButton>
-          </Tooltip>
-        </div>
-
-        <Card className="max-h-[50vh] overflow-y-auto p-4 text-callout text-foreground-muted">
-          <AgreementBody source={agreement.bodyMarkdown} />
-        </Card>
-
-        {error && (
-          <Banner intent="warning" density="sm" className="mt-4">
-            {error}
-          </Banner>
+            <DialogClose aria-label={closeLabel} />
+          </DialogHeader>
         )}
+      >
+        <DialogBody>
+          {narrow && <div className="mb-3 font-mono text-mono-meta text-foreground-hint">{version}</div>}
+          {/* The card frames the agreement; it scrolls in a raft-ui ScrollArea
+              inside, padded on its content so the scrollbar sits at the edge. */}
+          <Card className="text-callout text-foreground-muted">
+            <ScrollArea className="max-h-[50vh] min-h-0" contentClassName="p-4">
+              <AgreementBody source={agreement.bodyMarkdown} />
+            </ScrollArea>
+          </Card>
 
-        <div className="mt-5 flex justify-end gap-2">
+          {error && (
+            <Banner intent="warning" density="sm" className="mt-4">
+              {error}
+            </Banner>
+          )}
+        </DialogBody>
+
+        <DialogActions as={DialogFooter}>
           <Button size="lg"
             variant="ghost"
             type="button"
@@ -89,18 +98,22 @@ export default function CommunityAgreementDialog({
           >
             {formatMessage({ id: "server.communityAgreement.cancel" })}
           </Button>
-          <Button size="lg"
-            variant="accent"
-            type="button"
-            onClick={handleAgree}
-            disabled={submitting}
-          >
-            {submitting
-              ? formatMessage({ id: "server.communityAgreement.joining" })
-              : formatMessage({ id: "server.communityAgreement.agreeContinue" })}
-          </Button>
-        </div>
-      </DialogSurface>
-    </Modal>
+          <DialogCommit>
+            {(inHead) => (
+              <Button size={inHead ? "md" : "lg"}
+                variant="primary"
+                type="button"
+                onClick={handleAgree}
+                disabled={submitting}
+              >
+                {submitting
+                  ? formatMessage({ id: "server.communityAgreement.joining" })
+                  : formatMessage({ id: "server.communityAgreement.agreeContinue" })}
+              </Button>
+            )}
+          </DialogCommit>
+        </DialogActions>
+      </NarrowDialogContent>
+    </Dialog>
   );
 }

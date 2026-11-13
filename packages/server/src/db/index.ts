@@ -8,7 +8,7 @@ import { PGlite } from "@electric-sql/pglite";
 import pg from "pg";
 import { attachPoolClientErrorHandler } from "./pgPoolErrorHandler";
 import { prewarmPool, resolvePoolPrewarmCount } from "./poolPrewarm";
-import { connectErrorCategory, connectPermitWaitMs, createConnectGate, gatedClientClass, resolveConnectConcurrency, type ConnectAttemptFailure, type ConnectGate } from "./connectGate";
+import { connectErrorCategory, connectPermitWaitMs, connectPhases, createConnectGate, gatedClientClass, resolveConnectConcurrency, resolveConnectTransportTimeoutMs, type ConnectAttemptFailure, type ConnectGate, type ConnectPhases } from "./connectGate";
 import { noopTracer, type TraceContext, type Tracer } from "@botiverse/raft-shared";
 import * as schema from "./schema";
 import { migratePglite } from "./pgliteMigrations";
@@ -16,6 +16,7 @@ import { closeRisingWavePool, getRisingWavePoolState, isRisingWaveConfigured } f
 import {
   isInTransaction,
   recordSecondConnectionInsideTransaction,
+  refuseInsideExecutorOnly,
   scopeTransactions,
   setSavepointLeakReporter,
   type Database,
@@ -33,6 +34,8 @@ import {
   type DbStatementKind,
 } from "./statementMetrics";
 import { errorClassOf, getCurrentTraceContext, recordTraceEvent } from "../tracing/semanticTrace";
+import { beginLockOrderStep } from "./lockOrderRecorder";
+import { beginStatementStat } from "./statementStats";
 
 let _tracer: Tracer = noopTracer;
 const dbTraceAttributes = new AsyncLocalStorage<Record<string, string | number | boolean>>();
@@ -109,6 +112,8 @@ interface PoolCheckoutState {
   // New clients only: part of connect_ms spent queued behind other handshakes
   // of this pool (./connectGate).
   connectPermitWaitMs?: number;
+  // New clients only: where the handshake spent its time (./connectGate).
+  connectPhases?: ConnectPhases;
   traceParent: TraceContext | null;
   traceAttributes?: Record<string, string | number | boolean>;
 }
@@ -422,6 +427,7 @@ function recordConnectionSpan(checkout: PoolCheckoutState, releaseArgs: unknown[
       connection_reused: checkout.connectionReused,
       ...(checkout.connectionReused ? {} : { connect_ms: checkout.queueMs }),
       ...(checkout.connectPermitWaitMs === undefined ? {} : { connect_permit_wait_ms: checkout.connectPermitWaitMs }),
+      ...connectPhaseAttrs(checkout.connectPhases),
       ...(checkout.firstQueryMs === undefined ? {} : { first_query_ms: checkout.firstQueryMs }),
       ...(checkout.firstQueryWriteMs === undefined ? {} : { first_query_write_ms: checkout.firstQueryWriteMs }),
       ...(checkout.firstQueryFirstByteMs === undefined ? {} : { first_query_first_byte_ms: checkout.firstQueryFirstByteMs }),
@@ -539,7 +545,15 @@ function preparePoolClient(
       // pool.query times its own statement (no checkout here); a submittable
       // (pg.Query) completes after this call returns, so its caller times it.
       const timesStatement = Boolean(checkout) && !isSubmittable(args[0]);
+      const finishLockOrderStep = beginLockOrderStep(
+        queryTextFromInput(args[0]),
+        Array.isArray(args[1]) ? args[1] : (args[0] as { values?: unknown } | null)?.values,
+        () => queryIdentityFromInput(args[0]).hash,
+      );
+      const finishStatementStat = beginStatementStat(() => queryIdentityFromInput(args[0]).hash);
       const finishStatement = (err?: unknown) => {
+        finishLockOrderStep?.(err);
+        finishStatementStat?.(err);
         if (checkout && timesFirstQuery && checkout.firstQueryMs === undefined && checkout.firstQueryStartMs !== undefined) {
           checkout.firstQueryMs = Date.now() - checkout.firstQueryStartMs;
         }
@@ -621,7 +635,7 @@ function preparePoolClient(
     queueMs,
     connectionReused,
     ...checkoutIdentity(client, connectionReused),
-    ...(connectionReused ? {} : { connectPermitWaitMs: connectPermitWaitMs(client) }),
+    ...(connectionReused ? {} : { connectPermitWaitMs: connectPermitWaitMs(client), connectPhases: connectPhases(client) }),
     startMs: Date.now(),
     queryIdentity: queryIdentityFromInput(undefined),
     traceParent: getCurrentTraceContext(),
@@ -975,6 +989,63 @@ export async function executeCancellablePgPoolSql<T extends pg.QueryResultRow = 
   }
 }
 
+const REPLICA_CONNECTION_ERROR_CODES = new Set([
+  // Connection exception class, admin/crash shutdown, "cannot connect now", too many connections.
+  "08000", "08001", "08003", "08004", "08006", "57P01", "57P02", "57P03", "53300",
+  "ECONNREFUSED", "ECONNRESET", "ENOTFOUND", "EAI_AGAIN", "EHOSTUNREACH", "ENETUNREACH", "EPIPE", "ETIMEDOUT",
+]);
+
+/**
+ * Why a failed replica search query may run once more on the primary, or null
+ * when it must not: the replica could not be reached or dropped the connection
+ * ("connection"), or it cancelled the query to apply WAL ("recovery_conflict",
+ * 40001). Statement timeouts, query errors and caller aborts are not retried,
+ * and neither is waiting for a free connection in the search pool itself
+ * ("timeout exceeded when trying to connect"): that is load, and moving it onto
+ * the primary would spread it there.
+ */
+export function searchReplicaFallbackReason(error: unknown): "connection" | "recovery_conflict" | null {
+  if (!error || typeof error !== "object" || isSearchQueryAbortedError(error)) return null;
+  const code = (error as { code?: unknown }).code;
+  if (code === "40001") return "recovery_conflict";
+  if (typeof code === "string" && REPLICA_CONNECTION_ERROR_CODES.has(code)) return "connection";
+  const message = error instanceof Error ? error.message : "";
+  if (/timeout exceeded when trying to connect|waiting for a connect permit/i.test(message)) return null;
+  if (/connection terminated|connection error|due to connection timeout/i.test(message)) return "connection";
+  return null;
+}
+
+type PoolSqlExecutor = <T extends pg.QueryResultRow>(
+  pool: pg.Pool,
+  statement: SQL,
+  options: CancellableSearchSqlOptions,
+) => Promise<SearchQueryResult<T>>;
+
+/**
+ * Run a search query on the replica; when the replica fails for a reason
+ * `searchReplicaFallbackReason` accepts, run it once on the primary and record
+ * `server.db.search_replica_fallback` so the fallbacks can be counted.
+ */
+export async function executeSearchSqlWithPrimaryFallback<T extends pg.QueryResultRow = pg.QueryResultRow>(
+  searchPool: pg.Pool,
+  primaryPool: pg.Pool,
+  statement: SQL,
+  options: CancellableSearchSqlOptions = {},
+  execute: PoolSqlExecutor = executeCancellablePgPoolSql,
+): Promise<SearchQueryResult<T>> {
+  try {
+    return await execute<T>(searchPool, statement, options);
+  } catch (error) {
+    const reason = searchReplicaFallbackReason(error);
+    if (!reason || options.signal?.aborted) throw error;
+    recordTraceEvent("server.db.search_replica_fallback", {
+      reason,
+      error_code: connectErrorCategory(error),
+    });
+    return execute<T>(primaryPool, statement, options);
+  }
+}
+
 export async function executeSearchSql<T extends pg.QueryResultRow = pg.QueryResultRow>(
   statement: SQL,
   options: CancellableSearchSqlOptions = {},
@@ -987,8 +1058,13 @@ export async function executeSearchSql<T extends pg.QueryResultRow = pg.QueryRes
   // A separate replica pool is a second connection relative to the ambient
   // transaction; surface it in the audit so search reads can't silently split
   // off from an in-flight transaction.
+  refuseInsideExecutorOnly("executeSearchSql()");
   recordSecondConnectionInsideTransaction("executeSearchSql");
-  return executeCancellablePgPoolSql<T>(searchPool, statement, options);
+  const primaryPool = _pool;
+  if (!primaryPool || primaryPool === searchPool) {
+    return executeCancellablePgPoolSql<T>(searchPool, statement, options);
+  }
+  return executeSearchSqlWithPrimaryFallback<T>(searchPool, primaryPool, statement, options);
 }
 
 function isPgliteUrl(connectionString: string) {
@@ -1025,6 +1101,17 @@ export function resolvePoolIdleTimeoutMs(env: NodeJS.ProcessEnv): number {
 // + attach site), not a mirror of it.
 // Which side a stuck connect is on (o11y 2026-10-15): queued behind full
 // permits, or the handshake itself; and the error category, not text.
+/** A handshake's phase timings as span attributes (absent phases are left out). */
+function connectPhaseAttrs(phases: ConnectPhases | undefined): Record<string, number> {
+  if (!phases) return {};
+  return {
+    ...(phases.dnsMs === undefined ? {} : { connect_dns_ms: phases.dnsMs }),
+    ...(phases.tcpMs === undefined ? {} : { connect_tcp_ms: phases.tcpMs }),
+    ...(phases.tlsMs === undefined ? {} : { connect_tls_ms: phases.tlsMs }),
+    ...(phases.authMs === undefined ? {} : { connect_auth_ms: phases.authMs }),
+  };
+}
+
 function recordConnectAttemptFailure(label: string, gate: ConnectGate, failure: ConnectAttemptFailure): void {
   const gateState = gate.state();
   _tracer.emitEvent("server.db.connect_attempt_failed", {
@@ -1037,6 +1124,8 @@ function recordConnectAttemptFailure(label: string, gate: ConnectGate, failure: 
       connect_permit_wait_ms: failure.permitWaitMs,
       handshake_ms: failure.handshakeMs,
       error_category: failure.errorCategory,
+      ...(failure.handshakeStage ? { handshake_stage: failure.handshakeStage } : {}),
+      ...connectPhaseAttrs(failure.phases),
       connect_in_flight: gateState.connecting,
       connect_queued: gateState.queued,
       connect_limit: gate.limit,
@@ -1056,7 +1145,7 @@ export function createPool(
   const pool = new pg.Pool({
     Client: gatedClientClass(connectGate, (waitMs) => {
       dbPoolConnectPermitWait.labels(label).observe(waitMs / 1000);
-    }, (failure) => recordConnectAttemptFailure(label, connectGate, failure)),
+    }, (failure) => recordConnectAttemptFailure(label, connectGate, failure), resolveConnectTransportTimeoutMs(process.env)),
     connectionString,
     max: pgMaxConnections(),
     // Idle clients up to `min` are not closed by idleTimeoutMillis. Set only on
@@ -1169,6 +1258,7 @@ export function getDb() {
  */
 export function getRootDb(): Database {
   if (!_rootDb) throw new Error("Database not initialized. Call initDatabase() first.");
+  refuseInsideExecutorOnly("getRootDb()");
   recordSecondConnectionInsideTransaction("getRootDb");
   return _rootDb;
 }

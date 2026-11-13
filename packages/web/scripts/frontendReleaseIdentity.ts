@@ -2,11 +2,6 @@ import type { Plugin } from "vite";
 import { createHash } from "node:crypto";
 import { readFile, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
-import { CAPABILITY_IDS } from "@raft/desktop-contract/capabilities";
-import {
-  type DesktopManifest,
-  validateManifestSchema,
-} from "@raft/desktop-contract/manifest";
 import type { FrontendReleaseIdentity } from "../src/buildIdentity";
 
 type BuildEnvironment = Readonly<Record<string, string | undefined>>;
@@ -17,18 +12,60 @@ export const DESKTOP_PROTOCOL_VERSION = 1;
 export const DESKTOP_MANIFEST_ETAG_PLACEHOLDER =
   "__RAFT_DESKTOP_MANIFEST_ETAG__";
 
+// The deployed /desktop-manifest.json shape. Its bytes are frozen: the preview
+// deploy verifies them (deploy-web-preview.yml) and the Cloudflare worker and
+// nginx serve them with a content ETag. The capability list is the historical
+// one; nothing in the Electron desktop reads this file.
+const DESKTOP_MANIFEST_CAPABILITIES = ["desktop.handshake", "window.focus", "window.bindServer"] as const;
+
+type DesktopManifest = {
+  manifestVersion: 1;
+  frontendReleaseId: string;
+  frontendCommitSha: string;
+  compatibility: {
+    appSemver: string;
+    protocolMin: number;
+    protocolMax: number;
+    requiredCapabilities: string[];
+  };
+  updateRecommendation: "current" | "recommended" | "none";
+};
+
+function hasExactFields(value: Record<string, unknown>, expected: readonly string[]): boolean {
+  return Object.keys(value).sort().join(",") === [...expected].sort().join(",");
+}
+
+function validateManifestSchema(value: unknown): string | null {
+  if (typeof value !== "object" || value === null) return "manifest must be an object";
+  const manifest = value as Record<string, unknown>;
+  if (!hasExactFields(manifest, ["manifestVersion", "frontendReleaseId", "frontendCommitSha", "compatibility", "updateRecommendation"])) {
+    return "manifest fields are not closed";
+  }
+  if (manifest.manifestVersion !== 1) return "manifestVersion must be exactly 1";
+  if (typeof manifest.frontendReleaseId !== "string" || manifest.frontendReleaseId.length === 0) {
+    return "frontendReleaseId must be a non-empty string";
+  }
+  if (typeof manifest.frontendCommitSha !== "string" || !/^[0-9a-f]{40}$/.test(manifest.frontendCommitSha)) {
+    return "frontendCommitSha must be a full lowercase 40-character SHA";
+  }
+  const compat = manifest.compatibility;
+  if (typeof compat !== "object" || compat === null) return "compatibility must be an object";
+  if (!hasExactFields(compat as Record<string, unknown>, ["appSemver", "protocolMin", "protocolMax", "requiredCapabilities"])) {
+    return "compatibility fields are not closed";
+  }
+  const rec = manifest.updateRecommendation;
+  if (rec !== "current" && rec !== "recommended" && rec !== "none") {
+    return "updateRecommendation must be 'current' | 'recommended' | 'none'";
+  }
+  return null;
+}
+
 export type DesktopManifestReleaseIdentity = Readonly<{
   releaseId: string;
   commitSha: string;
 }>;
 
-/**
- * Adapter boundary for the canonical monorepo desktop contract.
- *
- * This module deliberately does not know manifestVersion, compatibility ranges,
- * capability IDs, or handshake bytes. The future packages/desktop-contract adapter
- * must render and validate those canonical bytes before this plugin will emit them.
- */
+/** Renders and validates the desktop-manifest.json bytes the plugin emits. */
 export interface DesktopManifestContractAdapter {
   render(identity: FrontendReleaseIdentity): string;
   assertValid(bytes: string): void;
@@ -93,11 +130,8 @@ function parseDesktopManifest(bytes: string): DesktopManifest {
 }
 
 /**
- * Canonical Web producer adapter for the shared Phase 1A contract.
- *
- * Preview artifacts remain compatibility-only and never advertise a
- * production update. All schema, capability, and IPC names come from
- * @raft/desktop-contract rather than a Web-local copy.
+ * The Web producer of desktop-manifest.json. Preview artifacts never advertise
+ * a production update.
  */
 export function createDesktopManifestContractAdapter(
   environment: BuildEnvironment,
@@ -115,7 +149,7 @@ export function createDesktopManifestContractAdapter(
           appSemver: DESKTOP_APP_SEMVER,
           protocolMin: DESKTOP_PROTOCOL_VERSION,
           protocolMax: DESKTOP_PROTOCOL_VERSION,
-          requiredCapabilities: [...CAPABILITY_IDS],
+          requiredCapabilities: [...DESKTOP_MANIFEST_CAPABILITIES],
         },
         updateRecommendation,
       };

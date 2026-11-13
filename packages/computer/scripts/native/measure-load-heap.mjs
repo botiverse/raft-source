@@ -15,6 +15,9 @@
 // The service process and Computer commands run `computer-lite-bundle.cjs`,
 // which has no daemon: measure it with `--phases cli`.
 //
+// heap-gate.mjs (with scripts/ci/computer-heap-gate.sh) uses it to check a
+// commit's bundles against the last stable release's, failing on more than 8 MB.
+//
 // What it proves: for each load phase (bundle evaluated -> `raft-computer` CLI
 // module -> daemon core module, i.e. what a `__run` runner loads before it
 // connects), the JS heap after a full GC, and how many zod schema instances
@@ -59,8 +62,9 @@ const MODULE_MARKER = /^\/\/ ((?:packages|node_modules|\.\.)\/\S+\.(?:[cm]?[jt]s
 // zod v4 core's `$constructor(name, initializer, params)`: every schema and
 // check instance is created through the inner constructor holding ZOD_CTOR.
 // Whitespace-tolerant: the SEA build minifies whitespace (identifiers stay,
-// `new Definition()` prints as `new Definition`).
-const ZOD_CTOR = /const inst\s*=\s*params\?\.Parent\s*\?\s*new Definition(?:\(\))?\s*:\s*this;/g;
+// `new Definition()` prints as `new Definition`). zod 4.6 builds the Parent
+// case through a helper (`newError(Definition)`), so either form matches.
+const ZOD_CTOR = /const inst\s*=\s*params\?\.Parent\s*\?\s*(?:new Definition(?:\(\))?|[\w$]+\(Definition\))\s*:\s*this;/g;
 const ZOD_SIGNATURE = /function \$constructor\d*\(([\w$]+),/g;
 
 const escapeRegExp = (s) => s.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&");

@@ -1,11 +1,32 @@
 import { CheckoutPromotionUnavailableError, normalizeCheckoutPromotionCode, resolveCheckoutPromotion } from "./checkoutPromotion";
 import Stripe from "stripe";
+import { getActiveAppSumoGrant, hasAppSumoBillingReservation } from "./appSumoLicenseService";
+import { getActivePrepaidGrant } from "./prepaidProService";
+import { isPrepaidCheckoutSession } from "./prepaidProContracts";
+import { createPrepaidSeatsCheckout, getPrepaidSeatsQuote, type PrepaidSeatsCheckoutRequest } from "./prepaidProSeats";
+import { parsePrepaidSeatsCheckoutTerms } from "./prepaidProSeatsPricing";
+import {
+  PrepaidRequestError,
+  createPrepaidCheckout,
+  expireOpenPrepaidSessions,
+  getPrepaidOffer,
+  recordPrepaidChargeRefunded,
+  recordPrepaidCheckout,
+  recordedPrepaidSessionIds,
+  refundPaymentOnce,
+  type PrepaidCheckoutRecorded,
+  type PrepaidCheckoutRequest,
+} from "./prepaidProBilling";
 import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
-import { and, eq, isNull, lt } from "drizzle-orm";
+import { and, eq, inArray, isNull, lt, sql } from "drizzle-orm";
 import { getDb } from "../db/index";
-import { subscriptions, servers, webhookEvents } from "../db/schema";
+import type { DatabaseExecutor } from "../db/index";
+import { isInTransaction } from "../db/ambientTransaction";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { subscriptions, servers, serverMembers, users, webhookEvents, type AccountDeletionSubscriptionSnapshot, type SubscriptionRestorationResult, accountDeletionRequests } from "../db/schema";
 import type { Server as SocketIOServer } from "socket.io";
 import {
+  APPSUMO_PLAN_LIMITS,
   PRO_AGENT_SEAT_BLOCK_SIZE,
   PLAN_CONFIG,
   DEFAULT_BILLING_INTERVAL,
@@ -15,20 +36,41 @@ import {
   calculateProSeatPrice,
   currentTimeMs,
   normalizeBillingInterval,
+  BILLING_ENTRIES,
+  CHECKOUT_OPENED_FROM,
+  getEffectiveLimits,
+  PAYWALL_SURFACES,
+  type BillingEntry,
+  type CheckoutOpenedFrom,
+  type PaywallSurface,
   type BillingInterval,
   type BillingPriceSummary,
+  type PrepaidOffer,
+  type PrepaidSeatsQuote,
+  type ServerId,
   type ServerPlan,
 } from "@botiverse/raft-shared";
+import { countAgentHistoryBlocks7d } from "./agentHistoryBlocks";
 import { getServerBillingEntitlement, getServerBillingUsage } from "./planService";
+import { countExternalChannelsOfServer } from "./externalChannelFreezeState";
+import type { ProductEventSink } from "./productEventScopeDbWriter";
+import type { AgentOrchestrator } from "./agentOrchestrator";
+import { recordServerProductEvent } from "./serverProductEvents";
 import { getWebFrameAncestorOrigins } from "../config/appUrl";
 import { addTraceEvent, traceAttrs } from "../tracing/semanticTrace";
+import { recordPaidLifecycleProjection, syncPaidLifecycleForServer, verifyPaidLifecyclePayment, type PaidPaymentProjection } from "./paidLifecycleService";
+import { reserveStripeCheckout, markCheckoutKnown, markCheckoutAmbiguous, CheckoutOutcomeUnknownError } from "./billingCheckoutCustody";
+import { inspectStripeCheckouts, type StripeCheckoutSafety } from "./stripeCheckoutInspection";
 
 // ── Socket.io reference for broadcasting plan changes ──
 
 let _io: SocketIOServer | null = null;
+/** For replies to people whose cards the plan change ends (seat requests, task #10). */
+let _orchestrator: AgentOrchestrator | null = null;
 
-export function setIO(io: SocketIOServer) {
+export function setIO(io: SocketIOServer, orchestrator: AgentOrchestrator | null = null) {
   _io = io;
+  _orchestrator = orchestrator;
 }
 
 function broadcastPlanChange(serverId: string, plan: string) {
@@ -57,23 +99,33 @@ function traceRequestedSeatQuantity(request: BillingPackQuantityRequest): number
 
 // ── Stripe Client (lazy init — only created when env vars are present) ──
 
+const SUBSCRIPTION_MUTATION_OPTIONS = { timeout: 5_000, maxNetworkRetries: 0 } as const satisfies Stripe.RequestOptions;
+const billingAfterCommit = new AsyncLocalStorage<Map<string, () => Promise<void>>>();
 let _stripe: Stripe | null = null;
+let _subscriptionMutationStripe: Stripe | null = null;
+let _stripeForTests: Stripe | null = null;
 
 function getStripe(): Stripe {
-  if (!_stripe) {
-    const key = process.env.STRIPE_SECRET_KEY;
-    if (!key) throw new Error("Stripe is not configured (STRIPE_SECRET_KEY missing)");
-    _stripe = new Stripe(key);
-  }
-  return _stripe;
+  if (_stripeForTests) return _stripeForTests;
+  const mutating = billingAfterCommit.getStore() !== undefined;
+  const existing = mutating ? _subscriptionMutationStripe : _stripe;
+  if (existing) return existing;
+  const key = process.env.STRIPE_SECRET_KEY;
+  if (!key) throw new Error("Stripe is not configured (STRIPE_SECRET_KEY missing)");
+  const client = new Stripe(key, mutating ? SUBSCRIPTION_MUTATION_OPTIONS : undefined);
+  if (mutating) _subscriptionMutationStripe = client;
+  else _stripe = client;
+  return client;
 }
 
 export function __setStripeForTests(stripe: Stripe | null): void {
-  _stripe = stripe;
+  _stripeForTests = stripe;
 }
 
 export function __resetStripeForTests(): void {
   _stripe = null;
+  _subscriptionMutationStripe = null;
+  _stripeForTests = null;
 }
 
 const REQUIRED_STRIPE_BILLING_ENV = [
@@ -135,30 +187,51 @@ export async function getBillingSummary(serverId: string) {
     .where(and(eq(servers.id, serverId), isNull(servers.deletedAt)));
   const entitlement = await getServerBillingEntitlement(db, serverId);
   const usage = await getServerBillingUsage(db, serverId);
+  // A plan with a history window: how often its agents reached behind it in
+  // the last 7 days, for the history upgrade dialog (task #24, C+ step 2).
+  // Read beside the rest; its own short deadline bounds it.
+  const agentHistoryBlocks7dRead = getEffectiveLimits(entitlement.plan).messageHistoryDays === -1
+    ? Promise.resolve(null)
+    : countAgentHistoryBlocks7d(serverId);
   const fileUploadQuota = await getFileUploadQuotaSummary(serverId);
   const sub = await getSubscription(serverId);
   const billingInterval = normalizeBillingInterval(entitlement.billingInterval ?? sub?.billingInterval ?? DEFAULT_BILLING_INTERVAL);
   const provisionedHumans = entitlement.provisionedHumanSeats ?? (entitlement.plan === "pro" ? entitlement.capacity.maxHumans : usage.humans);
   const provisionedAgents = entitlement.provisionedAgentSeats ?? (entitlement.plan === "pro" ? entitlement.capacity.maxAgents : usage.agents);
   const isInternalUnlimitedPlan = entitlement.plan === "founder" || entitlement.plan === "partner";
+  const activeGrant = await getActiveAppSumoGrant(db, serverId);
+  const appsumoBillingReserved = await hasAppSumoBillingReservation(db, serverId);
+  const sourceConflict = activeGrant && sub && isEntitlingStatus(sub.status) ? "appsumo_stripe" as const : null;
 
+  const jointUsage = entitlement.appsumo
+    ? await (await import("./jointChannelLimitService")).countHostedJointChannels(db, serverId)
+    : null;
+  // Every external channel it is in, hosted or connected to (the freeze's count): the cancel confirmation's "Acme is in N external channels".
+  const externalChannelsTotal = await countExternalChannelsOfServer(db, serverId);
   const summary = {
+    externalChannelsTotal,
+    appsumo: entitlement.appsumo ? { ...entitlement.appsumo, ...APPSUMO_PLAN_LIMITS[entitlement.appsumo.tier], hostedJointChannels: jointUsage } : null,
+    appsumoBillingReserved,
     plan: entitlement.plan,
     displayName: PLAN_CONFIG[entitlement.plan].displayName,
     serverPlan: server?.plan ?? "free",
     source: entitlement.source,
+    sourceConflict,
     capacity: entitlement.capacity,
     usage,
     fileUploadQuota,
+    agentHistoryBlocks7d: await agentHistoryBlocks7dRead,
     provisioned: {
-      humans: provisionedHumans,
-      agents: provisionedAgents,
+      humans: entitlement.appsumo ? entitlement.capacity.maxHumans : provisionedHumans,
+      agents: entitlement.appsumo ? entitlement.capacity.maxAgents : provisionedAgents,
       proPackQuantity: entitlement.proPackQuantity ?? 0,
       trialFreePackQuantity: entitlement.trialFreePackQuantity ?? 0,
       firstPackTrialEndsAt: entitlement.firstPackTrialEndsAt ?? null,
     },
-    price: priceForSummary(entitlement.plan, entitlement.proPackQuantity ?? 0, billingInterval),
-    subscription: sub && !isInternalUnlimitedPlan
+    // Prepaid time has no recurring price and no subscription to show (an old canceled one is history).
+    price: entitlement.appsumo || entitlement.prepaid ? null : priceForSummary(entitlement.plan, entitlement.proPackQuantity ?? 0, billingInterval),
+    prepaid: entitlement.prepaid ?? null,
+    subscription: sub && !entitlement.prepaid && (!isInternalUnlimitedPlan || sourceConflict)
       ? {
           status: sub.status,
           billingInterval: sub.billingInterval,
@@ -207,6 +280,14 @@ export interface BillingCheckoutRequest {
   promotionCode?: unknown;
   targetPlan?: unknown;
   billingTraceId?: unknown;
+  /** Where the owner came from (a paywall or `settings`); product analytics only. */
+  entry?: unknown;
+  /** The seat count the page proposed; product analytics only. */
+  defaultSeatQuantity?: unknown;
+  /** What opened the upgrade dialog, when not a paywall (`agent_card`); product analytics only. */
+  openedFrom?: unknown;
+  /** The surface the paywall that opened the dialog was on (`artifact`); product analytics only. */
+  surface?: unknown;
   billingInterval?: unknown;
   interval?: unknown;
   seatQuantity?: unknown;
@@ -232,6 +313,8 @@ export interface BillingPackQuantityRequest {
   provisionedAgentSeats?: unknown;
   promotionCode?: unknown;
   previewToken?: unknown;
+  /** Where the owner came from (a paywall or `settings`); product analytics only. */
+  entry?: unknown;
 }
 
 export interface BillingPackQuantityUpdateResult {
@@ -240,6 +323,20 @@ export interface BillingPackQuantityUpdateResult {
   requestedPackQuantity: number;
   effectiveAt: "current" | "after_payment" | "period_end";
   currentPeriodEnd: Date | null;
+  /** With `pending_payment`: where the owner finishes the payment Stripe held, when Stripe gives one. */
+  heldPayment?: BillingHeldPayment;
+  /** The request withdrew a scheduled cancellation (Keep Pro, or a seat change while one was scheduled). */
+  cancellationWithdrawn?: { billingInterval: BillingInterval };
+}
+
+/**
+ * A seat payment Stripe held (`pending_if_incomplete`): the invoice's own
+ * Stripe page, where the owner confirms with the bank or pays with another
+ * card, and which of the two it waits for.
+ */
+export interface BillingHeldPayment {
+  url: string | null;
+  action: "authenticate" | "update_payment_method" | null;
 }
 
 export interface BillingPackQuantityPreviewResult {
@@ -264,6 +361,11 @@ export interface BillingPackQuantityPreviewResult {
 interface CheckoutContract {
   lineItems: Array<{ price: string; quantity: number }>;
   metadata: Record<string, string>;
+  /**
+   * Product analytics only (billing_checkout_*): on the Checkout session,
+   * which the webhook reads, never on the subscription (Tenny, #10389).
+   */
+  analyticsMetadata: Record<string, string>;
   subscriptionData: Stripe.Checkout.SessionCreateParams.SubscriptionData;
 }
 
@@ -291,6 +393,36 @@ function toBillingInterval(value: unknown): BillingInterval {
   if (value == null || value === "") return DEFAULT_BILLING_INTERVAL;
   if (value === "monthly" || value === "annual") return value;
   throw new Error("billingInterval must be monthly or annual");
+}
+
+/** An entry the client named, `unknown` when it named none or one we do not know. */
+export function toBillingEntry(value: unknown): BillingEntry {
+  return typeof value === "string" && (BILLING_ENTRIES as readonly string[]).includes(value)
+    ? value as BillingEntry
+    : "unknown";
+}
+
+/** What opened the upgrade dialog, or null when the client named nothing we know (a paywall, older clients). */
+function toCheckoutOpenedFrom(value: unknown): CheckoutOpenedFrom | null {
+  return typeof value === "string" && (CHECKOUT_OPENED_FROM as readonly string[]).includes(value)
+    ? value as CheckoutOpenedFrom
+    : null;
+}
+
+/**
+ * The surface the paywall that opened the upgrade dialog was on, or null when
+ * the client named none we know (not a paywall's surface, older clients).
+ * Analytics only: an unknown value is dropped, never a failed checkout.
+ */
+function toCheckoutSurface(value: unknown): PaywallSurface | null {
+  return typeof value === "string" && (PAYWALL_SURFACES as readonly string[]).includes(value)
+    ? value as PaywallSurface
+    : null;
+}
+
+/** Product analytics hooks for billing; absent in callers that record nothing. */
+export interface BillingProductEventOptions {
+  productEvents?: ProductEventSink | null;
 }
 
 function toBillingTraceId(value: unknown): string | null {
@@ -324,6 +456,12 @@ function buildCheckoutContract(input: BillingCheckoutRequest, userId: string, se
   const seatQuantity = explicitSeats ?? calculateProPackQuantity(requestedHumans, requestedAgents);
   const provisionedAgentSeats = seatQuantity * PRO_AGENT_SEAT_BLOCK_SIZE;
   const billingTraceId = toBillingTraceId(input.billingTraceId);
+  let defaultSeatQuantity: number | null = null;
+  try {
+    defaultSeatQuantity = toPositiveInteger(input.defaultSeatQuantity, "defaultSeatQuantity");
+  } catch {
+    // Analytics only: a bad value is dropped, never a failed checkout.
+  }
   const metadata = {
     pricingContract: RAFT_PRO_SEAT_PRICING_CONTRACT,
     serverId,
@@ -342,6 +480,14 @@ function buildCheckoutContract(input: BillingCheckoutRequest, userId: string, se
     trialFreePackQuantity: "0",
     ...(billingTraceId ? { billingTraceId } : {}),
   };
+  const openedFrom = toCheckoutOpenedFrom(input.openedFrom);
+  const surface = toCheckoutSurface(input.surface);
+  const analyticsMetadata: Record<string, string> = {
+    checkoutEntry: toBillingEntry(input.entry),
+    ...(defaultSeatQuantity != null ? { defaultSeatQuantity: String(defaultSeatQuantity) } : {}),
+    ...(openedFrom ? { checkoutOpenedFrom: openedFrom } : {}),
+    ...(surface ? { checkoutSurface: surface } : {}),
+  };
   const subscriptionData: Stripe.Checkout.SessionCreateParams.SubscriptionData = {
     metadata,
   };
@@ -349,8 +495,144 @@ function buildCheckoutContract(input: BillingCheckoutRequest, userId: string, se
   return {
     lineItems,
     metadata,
+    analyticsMetadata,
     subscriptionData,
   };
+}
+
+/** billing_checkout_* properties, from the Checkout session metadata (what the webhook gets back). */
+function checkoutEventProperties(metadata: Stripe.Metadata) {
+  const seatQuantity = Number(metadata.seatQuantity);
+  const defaultSeatQuantity = Number(metadata.defaultSeatQuantity);
+  const openedFrom = toCheckoutOpenedFrom(metadata.checkoutOpenedFrom);
+  const surface = toCheckoutSurface(metadata.checkoutSurface);
+  return {
+    entry: toBillingEntry(metadata.checkoutEntry),
+    billing_interval: normalizeBillingInterval(metadata.billingInterval),
+    seat_quantity: Number.isSafeInteger(seatQuantity) ? seatQuantity : 0,
+    ...(Number.isSafeInteger(defaultSeatQuantity) && defaultSeatQuantity > 0 ? { default_seat_quantity: defaultSeatQuantity } : {}),
+    returning_customer: metadata.returningCustomer === "true",
+    ...(openedFrom ? { opened_from: openedFrom } : {}),
+    ...(surface ? { surface } : {}),
+  };
+}
+
+/** billing_prepaid_checkout_* properties, from the prepaid Checkout session metadata. */
+function prepaidCheckoutEventProperties(metadata: Stripe.Metadata, fallback: { months: number; seatQuantity: number; renewal: boolean }) {
+  const defaultSeatQuantity = Number(metadata.defaultSeatQuantity);
+  const openedFrom = toCheckoutOpenedFrom(metadata.checkoutOpenedFrom);
+  const surface = toCheckoutSurface(metadata.checkoutSurface);
+  return {
+    entry: toBillingEntry(metadata.checkoutEntry),
+    months: fallback.months,
+    seat_quantity: fallback.seatQuantity,
+    ...(Number.isSafeInteger(defaultSeatQuantity) && defaultSeatQuantity > 0 ? { default_seat_quantity: defaultSeatQuantity } : {}),
+    renewal: fallback.renewal,
+    ...(openedFrom ? { opened_from: openedFrom } : {}),
+    ...(surface ? { surface } : {}),
+  };
+}
+
+/** billing_prepaid_seats_checkout_* properties, from the seats Checkout session metadata. */
+function prepaidSeatsCheckoutEventProperties(metadata: Stripe.Metadata, seatQuantity: number) {
+  const previousSeatQuantity = Number(metadata.previousSeatQuantity);
+  const days = parsePrepaidSeatsCheckoutTerms(metadata)?.segments.reduce((sum, segment) => sum + segment.daysLeft, 0) ?? 0;
+  const openedFrom = toCheckoutOpenedFrom(metadata.checkoutOpenedFrom);
+  return {
+    entry: toBillingEntry(metadata.checkoutEntry),
+    seat_quantity: seatQuantity,
+    previous_seat_quantity: Number.isSafeInteger(previousSeatQuantity) && previousSeatQuantity > 0 ? previousSeatQuantity : 0,
+    days,
+    ...(openedFrom ? { opened_from: openedFrom } : {}),
+  };
+}
+
+// ── Prepaid Pro (task #19; prepaidProBilling.ts) ──
+
+export async function getPrepaidOfferForServer(serverId: string, enabled: boolean): Promise<PrepaidOffer> {
+  return getPrepaidOffer({ stripe: configuredStripeOrNull(), serverId, enabled });
+}
+
+/** Owner only, behind pro_prepaid (the route checks both). Returns the Checkout URL. */
+export async function createPrepaidCheckoutSession(
+  serverId: string,
+  userId: string,
+  request: Pick<PrepaidCheckoutRequest, "months" | "seatQuantity" | "successUrl" | "cancelUrl"> & { entry?: string; openedFrom?: string; surface?: string; defaultSeatQuantity?: number },
+  options: BillingProductEventOptions = {},
+): Promise<string> {
+  if (!isStripeConfigured()) throw new PrepaidRequestError(503, "billing_not_configured", "Billing is not configured");
+  let defaultSeatQuantity: number | null = null;
+  try { defaultSeatQuantity = toPositiveInteger(request.defaultSeatQuantity, "defaultSeatQuantity"); } catch { /* analytics only */ }
+  const entry = toBillingEntry(request.entry);
+  const openedFrom = toCheckoutOpenedFrom(request.openedFrom);
+  const surface = toCheckoutSurface(request.surface);
+  const started = await createPrepaidCheckout(getStripe(), serverId, userId, {
+    months: request.months, seatQuantity: request.seatQuantity, successUrl: request.successUrl, cancelUrl: request.cancelUrl,
+    entry, openedFrom, surface, defaultSeatQuantity,
+  });
+  if (options.productEvents !== undefined) {
+    void recordServerProductEvent(options.productEvents, {
+      event: "billing_prepaid_checkout_started",
+      userId,
+      serverId: serverId as ServerId,
+      properties: {
+        entry,
+        months: started.months,
+        seat_quantity: started.seatQuantity,
+        ...(defaultSeatQuantity ? { default_seat_quantity: defaultSeatQuantity } : {}),
+        renewal: started.renewal,
+        ...(openedFrom ? { opened_from: openedFrom } : {}),
+        ...(surface ? { surface } : {}),
+      },
+    });
+  }
+  return started.url;
+}
+
+function configuredStripeOrNull(): Stripe | null {
+  if (!isStripeConfigured()) return null;
+  try { return getStripe(); } catch { return null; }
+}
+
+/** Seats added to prepaid time mid-period (task #19 PR4; prepaidProSeats.ts): what they cost now. */
+export async function getPrepaidSeatsQuoteForServer(serverId: string, enabled: boolean, seatQuantity: number): Promise<PrepaidSeatsQuote> {
+  return getPrepaidSeatsQuote({ stripe: configuredStripeOrNull(), serverId, enabled, seatQuantity });
+}
+
+/** Owner only, behind pro_prepaid (the route checks both). Returns the Checkout URL. */
+export async function createPrepaidSeatsCheckoutSession(
+  serverId: string,
+  userId: string,
+  request: Pick<PrepaidSeatsCheckoutRequest, "seatQuantity" | "successUrl" | "cancelUrl"> & { entry?: string; openedFrom?: string },
+  options: BillingProductEventOptions = {},
+): Promise<{ url: string; expiresAt: string }> {
+  if (!isStripeConfigured()) throw new PrepaidRequestError(503, "billing_not_configured", "Billing is not configured");
+  const entry = toBillingEntry(request.entry);
+  const openedFrom = toCheckoutOpenedFrom(request.openedFrom);
+  const started = await createPrepaidSeatsCheckout(getStripe(), serverId, userId, {
+    seatQuantity: request.seatQuantity, successUrl: request.successUrl, cancelUrl: request.cancelUrl, entry, openedFrom,
+  });
+  if (options.productEvents !== undefined) {
+    void recordServerProductEvent(options.productEvents, {
+      event: "billing_prepaid_seats_checkout_started",
+      userId,
+      serverId: serverId as ServerId,
+      properties: {
+        entry,
+        seat_quantity: started.seatQuantity,
+        previous_seat_quantity: started.previousSeatQuantity,
+        days: started.days,
+        ...(openedFrom ? { opened_from: openedFrom } : {}),
+      },
+    });
+  }
+  return { url: started.url, expiresAt: started.expiresAt };
+}
+
+async function assertStripeBillingSource(serverId: string): Promise<void> {
+  if (await hasAppSumoBillingReservation(getDb(), serverId)) {
+    throw new Error("Stripe changes are not supported for an AppSumo license. Manage the license in AppSumo or contact support.");
+  }
 }
 
 export async function createCheckoutSession(
@@ -359,13 +641,17 @@ export async function createCheckoutSession(
   successUrl: string,
   cancelUrl: string,
   request: BillingCheckoutRequest = {},
+  options: BillingProductEventOptions = {},
 ): Promise<string> {
+  await assertStripeBillingSource(serverId);
   traceBillingEvent("billing.checkout.requested", {
     server_id: serverId,
     billing_trace_id: toBillingTraceId(request.billingTraceId),
     user_id_present: Boolean(userId),
     target_plan: typeof request.targetPlan === "string" ? request.targetPlan : "unknown",
     requested_seat_quantity: request.seatQuantity ?? request.packQuantity ?? request.proPackQuantity ?? null,
+    entry: toBillingEntry(request.entry),
+    opened_from: toCheckoutOpenedFrom(request.openedFrom),
     ...traceStripeBillingState(),
   });
   try {
@@ -390,8 +676,15 @@ export async function createCheckoutSession(
       requested_agent_seats: Number(contract.metadata.requestedAgentSeats),
       provisioned_human_seats: Number(contract.metadata.provisionedHumanSeats),
       provisioned_agent_seats: Number(contract.metadata.provisionedAgentSeats),
+      default_seat_quantity: contract.analyticsMetadata.defaultSeatQuantity ? Number(contract.analyticsMetadata.defaultSeatQuantity) : null,
     });
     const existing = await getSubscription(serverId);
+    // The webhook reads these back from the session when it records the purchase.
+    const sessionMetadata = {
+      ...contract.metadata,
+      ...contract.analyticsMetadata,
+      returningCustomer: String(Boolean(existing?.stripeCustomerId)),
+    };
     const promotionId = code ? await resolveCheckoutPromotion(stripe, code, {
       customerId: existing?.stripeCustomerId ?? null,
       priceId: contract.lineItems[0].price!,
@@ -406,15 +699,30 @@ export async function createCheckoutSession(
       customer: existing?.stripeCustomerId,
       ...(promotionId ? { discounts: [{ promotion_code: promotionId }] } : { allow_promotion_codes: true }),
       line_items: contract.lineItems,
-      metadata: contract.metadata,
+      metadata: sessionMetadata,
       subscription_data: contract.subscriptionData,
     };
+    const checkoutAttemptId = await reserveStripeCheckout(getDb(), serverId);
+    // An open prepaid Checkout must not complete beside this one (task #19).
+    await expireOpenPrepaidSessions(stripe, serverId);
+    params.metadata = { ...sessionMetadata, raftCheckoutAttemptId: checkoutAttemptId };
     let session: Stripe.Checkout.Session;
     try {
-      session = await stripe.checkout.sessions.create(params, code ? { timeout: 15_000, maxNetworkRetries: 0 } : undefined);
-    } catch (error) {
-      if (code) throw new CheckoutPromotionUnavailableError();
-      throw error;
+      session = await stripe.checkout.sessions.create(params, {
+        idempotencyKey: `raft-checkout-${checkoutAttemptId}`,
+        timeout: 15_000, maxNetworkRetries: 0,
+      });
+    } catch {
+      await markCheckoutAmbiguous(getDb(), { id: checkoutAttemptId, serverId }).catch(() => {});
+      // A network failure after dispatch does not prove Stripe created nothing.
+      // Do not log provider error text or suggest that retrying is safe.
+      throw new CheckoutOutcomeUnknownError();
+    }
+
+    if (typeof session.id !== "string" || !session.id.trim()
+      || !await markCheckoutKnown(getDb(), { id: checkoutAttemptId, serverId, stripeSessionId: session.id })) {
+      await markCheckoutAmbiguous(getDb(), { id: checkoutAttemptId, serverId }).catch(() => {});
+      throw new CheckoutOutcomeUnknownError();
     }
 
     if (!session.url) {
@@ -422,8 +730,7 @@ export async function createCheckoutSession(
         server_id: serverId,
         billing_trace_id: contract.metadata.billingTraceId ?? null,
       });
-      if (code) throw new CheckoutPromotionUnavailableError();
-      throw new Error("Stripe Checkout did not return a URL");
+      throw new CheckoutOutcomeUnknownError();
     }
     traceBillingEvent("billing.checkout.session.created", {
       server_id: serverId,
@@ -433,6 +740,14 @@ export async function createCheckoutSession(
       stripe_session_url_present: Boolean(session.url),
       line_item_count: contract.lineItems.length,
     });
+    if (options.productEvents !== undefined) {
+      void recordServerProductEvent(options.productEvents, {
+        event: "billing_checkout_started",
+        userId,
+        serverId: serverId as ServerId,
+        properties: checkoutEventProperties(sessionMetadata),
+      });
+    }
     return session.url;
   } catch (error) {
     traceBillingEvent("billing.checkout.failed", {
@@ -443,6 +758,18 @@ export async function createCheckoutSession(
     });
     throw error;
   }
+}
+
+/** Read-only provider verification for a pending AppSumo binding. */
+export async function inspectStripeBillingForAppSumo(input: {
+  serverId: string; knownCustomerId: string | null; knownSubscriptionId: string | null; knownSessionIds: readonly string[];
+}): Promise<StripeCheckoutSafety> {
+  let stripe: Stripe;
+  try { stripe = getStripe(); } catch { return "unavailable"; }
+  // A prepaid Checkout the webhook recorded has its outcome in the table (a
+  // live grant keeps the Server Pro, which binding refuses on its own).
+  const recordedPrepaidSessions = await recordedPrepaidSessionIds(getDb(), input.knownSessionIds);
+  return inspectStripeCheckouts({ stripe, ...input, recordedPrepaidSessions });
 }
 
 // ── Existing Subscription Seat Quantity Updates ──
@@ -508,6 +835,35 @@ function billingIntervalFromStripeSubscription(
 
 function hasPendingUpdate(stripeSub: Stripe.Subscription): boolean {
   return stripeSub.pending_update != null;
+}
+
+/**
+ * The page for a held seat payment: the subscription's latest invoice is the
+ * one the update made. Best effort: the update is already held either way, so
+ * a failed lookup answers null and the client falls back to Plan & Billing.
+ */
+async function getHeldSeatPayment(stripe: Stripe, stripeSub: Stripe.Subscription, serverId: string): Promise<BillingHeldPayment | null> {
+  const invoiceId = typeof stripeSub.latest_invoice === "string" ? stripeSub.latest_invoice : stripeSub.latest_invoice?.id;
+  if (!invoiceId) return null;
+  try {
+    const invoice = await stripe.invoices.retrieve(invoiceId, { expand: ["payments.data.payment.payment_intent"] });
+    // The attempt still open; a failed or canceled one stays on the invoice beside it.
+    const intent = invoice.payments?.data
+      .filter((payment) => payment.status === "open")
+      .map((payment) => payment.payment.payment_intent)
+      .find((paymentIntent): paymentIntent is Stripe.PaymentIntent => typeof paymentIntent === "object" && paymentIntent != null);
+    const action = intent?.status === "requires_action"
+      ? "authenticate"
+      : intent?.status === "requires_payment_method" ? "update_payment_method" : null;
+    return { url: invoice.hosted_invoice_url ?? null, action };
+  } catch (err) {
+    traceBillingEvent("billing.seat_update.held_payment_lookup_failed", {
+      server_id: serverId,
+      invoice_id: invoiceId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return null;
+  }
 }
 
 const BILLING_SEAT_PREVIEW_TOKEN_VERSION = 1;
@@ -761,6 +1117,7 @@ export async function previewProPackQuantityUpdate(
   userId: string,
   request: BillingPackQuantityRequest,
 ): Promise<BillingPackQuantityPreviewResult> {
+  await assertStripeBillingSource(serverId);
   traceBillingEvent("billing.seat_update.preview_requested", {
     server_id: serverId,
     user_id_present: Boolean(userId),
@@ -877,15 +1234,43 @@ export async function updateProPackQuantity(
   userId: string,
   request: BillingPackQuantityRequest,
 ): Promise<BillingPackQuantityUpdateResult> {
+  await assertStripeBillingSource(serverId);
   traceBillingEvent("billing.seat_update.requested", {
     server_id: serverId,
     user_id_present: Boolean(userId),
     requested_seat_quantity: traceRequestedSeatQuantity(request),
+    entry: toBillingEntry(request.entry),
     requested_human_seats: request.humanSeatQuantity ?? request.humanSeats ?? request.provisionedHumanSeats ?? null,
     requested_agent_seats: request.agentSeatQuantity ?? request.agentSeats ?? request.provisionedAgentSeats ?? null,
     ...traceStripeBillingState(),
   });
   try {
+    // Passive refresh may project a different payer from Stripe metadata.
+    // Finish it before this mutation takes its user and Server locks.
+    if (isStripeBillingFlagEnabled()) await getSubscription(serverId);
+    const result = await withServerSubscriptionMutation(serverId, () => applyProPackQuantityUpdate(serverId, userId, request), { userId });
+    traceBillingEvent("billing.seat_update.completed", {
+      server_id: serverId,
+      status: result.status,
+      current_seat_quantity: result.currentPackQuantity,
+      requested_seat_quantity: result.requestedPackQuantity,
+    });
+    return result;
+  } catch (error) {
+    traceBillingEvent("billing.seat_update.failed", {
+      server_id: serverId,
+      requested_seat_quantity: traceRequestedSeatQuantity(request),
+      ...traceAttrs.error(error),
+    });
+    throw error;
+  }
+}
+
+async function applyProPackQuantityUpdate(
+  serverId: string,
+  userId: string,
+  request: BillingPackQuantityRequest,
+): Promise<BillingPackQuantityUpdateResult> {
   if (!isStripeBillingFlagEnabled()) throw new Error("Billing is not configured (STRIPE_BILLING_ENABLED must be true)");
   const requestedSeatQuantity = toPositiveInteger(request.seatQuantity ?? request.packQuantity ?? request.proPackQuantity, "seatQuantity") ?? null;
   const requestedHumanSeatQuantity = toPositiveInteger(
@@ -910,7 +1295,7 @@ export async function updateProPackQuantity(
     throw new Error("Seat update preview is invalid or expired");
   }
 
-  const sub = await getSubscription(serverId);
+  const sub = await readSubscription(serverId);
   if (!sub || !isEntitlingStatus(sub.status)) {
     throw new Error("Server does not have an active Pro subscription");
   }
@@ -995,6 +1380,7 @@ export async function updateProPackQuantity(
           requestedPackQuantity: nextPackQuantity,
           effectiveAt: "current",
           currentPeriodEnd: getPeriodEnd(reactivated) ?? currentPeriodEnd,
+          cancellationWithdrawn: { billingInterval: billingIntervalFromStripeSubscription(reactivated, priceIds) },
         };
       }
       return {
@@ -1022,6 +1408,9 @@ export async function updateProPackQuantity(
         userId,
       });
     }
+    const withdrawn = shouldReactivate
+      ? { cancellationWithdrawn: { billingInterval: billingIntervalFromStripeSubscription(stripeSubForQuantityUpdate, priceIds) } }
+      : {};
     if (nextPackQuantity < currentPackQuantity) {
       const updated = await stripe.subscriptions.update(sub.stripeSubscriptionId, {
         items: [{ id: proSeatItem.id, quantity: nextPackQuantity }],
@@ -1044,6 +1433,7 @@ export async function updateProPackQuantity(
         requestedPackQuantity: nextPackQuantity,
         effectiveAt: "current",
         currentPeriodEnd: getPeriodEnd(updated) ?? currentPeriodEnd,
+        ...withdrawn,
       };
     }
     const updated = await stripe.subscriptions.update(sub.stripeSubscriptionId, {
@@ -1063,12 +1453,15 @@ export async function updateProPackQuantity(
       idempotencyKey: billingSeatPreviewConfirmIdempotencyKey(request.previewToken, "quantity"),
     } : undefined);
     if (hasPendingUpdate(updated)) {
+      const heldPayment = await getHeldSeatPayment(stripe, updated, serverId);
       return {
         status: "pending_payment",
         currentPackQuantity,
         requestedPackQuantity: nextPackQuantity,
         effectiveAt: "after_payment",
         currentPeriodEnd,
+        ...(heldPayment ? { heldPayment } : {}),
+        ...withdrawn,
       };
     }
     return {
@@ -1077,17 +1470,10 @@ export async function updateProPackQuantity(
       requestedPackQuantity: nextPackQuantity,
       effectiveAt: "after_payment",
       currentPeriodEnd,
+      ...withdrawn,
     };
   }
   throw new Error("Server does not have a Pro Seat subscription item");
-  } catch (error) {
-    traceBillingEvent("billing.seat_update.failed", {
-      server_id: serverId,
-      requested_seat_quantity: traceRequestedSeatQuantity(request),
-      ...traceAttrs.error(error),
-    });
-    throw error;
-  }
 }
 
 // ── Customer Portal ──
@@ -1096,6 +1482,7 @@ export async function createPortalSession(
   serverId: string,
   returnUrl: string,
 ): Promise<string> {
+  await assertStripeBillingSource(serverId);
   traceBillingEvent("billing.portal.requested", {
     server_id: serverId,
     ...traceStripeBillingState(),
@@ -1129,50 +1516,51 @@ export async function createPortalSession(
   }
 }
 
-export async function cancelSubscriptionAtPeriodEnd(
-  serverId: string,
-  userId: string,
-): Promise<{ status: "scheduled_period_end"; currentPeriodEnd: Date | null }> {
-  traceBillingEvent("billing.cancel.requested", {
-    server_id: serverId,
-    user_id_present: Boolean(userId),
-    ...traceStripeBillingState(),
-  });
-  try {
-    if (!isStripeBillingFlagEnabled()) throw new Error("Billing is not configured (STRIPE_BILLING_ENABLED must be true)");
-    const sub = await getSubscription(serverId);
-    if (!sub || !isEntitlingStatus(sub.status)) {
-      traceBillingEvent("billing.cancel.rejected", {
-        server_id: serverId,
-        reason: "missing_entitling_subscription",
-        subscription_status: sub?.status ?? "none",
-      });
-      throw new Error("Server does not have an active Pro subscription");
-    }
+/**
+ * What Stripe will charge for the subscription, for Plan & Billing's Billing
+ * card (owners only; task #13, #proj-commercial): the brand and last four of a
+ * card, the last four of a bank account, or just the kind. Never the number,
+ * never stored. The subscription's own method first, else the customer's
+ * default for invoices, as Stripe picks it. `null` when there is none.
+ */
+export type BillingPaymentMethodSummary =
+  | { type: "card"; brand: string; last4: string; expMonth: number; expYear: number }
+  | { type: "bank_account"; last4: string | null; bankName: string | null }
+  | { type: string };
 
-    const stripe = getStripe();
-    const stripeSub = await stripe.subscriptions.update(sub.stripeSubscriptionId, {
-      cancel_at_period_end: true,
-      metadata: {
-        cancelRequestedByUserId: userId,
-        cancelRequestedAt: new Date().toISOString(),
-      },
+function summarizePaymentMethod(method: Stripe.PaymentMethod | string | null | undefined): BillingPaymentMethodSummary | null {
+  if (!method || typeof method === "string") return null;
+  if (method.type === "card" && method.card) {
+    return { type: "card", brand: method.card.brand, last4: method.card.last4, expMonth: method.card.exp_month, expYear: method.card.exp_year };
+  }
+  if (method.type === "us_bank_account" && method.us_bank_account) {
+    return { type: "bank_account", last4: method.us_bank_account.last4 ?? null, bankName: method.us_bank_account.bank_name ?? null };
+  }
+  if (method.type === "sepa_debit" && method.sepa_debit) {
+    return { type: "bank_account", last4: method.sepa_debit.last4 ?? null, bankName: null };
+  }
+  return { type: method.type };
+}
+
+export async function getSubscriptionPaymentMethod(serverId: string): Promise<BillingPaymentMethodSummary | null> {
+  // A read: an AppSumo license or a server without Stripe simply has none to show.
+  if (!isStripeConfigured()) return null;
+  const sub = await getSubscription(serverId);
+  if (!sub) return null;
+  try {
+    const stripeSub = await getStripe().subscriptions.retrieve(sub.stripeSubscriptionId, {
+      expand: ["default_payment_method", "customer.invoice_settings.default_payment_method"],
     });
-    await syncStripeSubscriptionProjection(stripeSub, {
-      serverId,
-      userId,
-    });
-    traceBillingEvent("billing.cancel.scheduled", {
+    const customer = typeof stripeSub.customer === "string" || "deleted" in stripeSub.customer ? null : stripeSub.customer;
+    const summary = summarizePaymentMethod(stripeSub.default_payment_method)
+      ?? summarizePaymentMethod(customer?.invoice_settings?.default_payment_method);
+    traceBillingEvent("billing.payment_method.read", {
       server_id: serverId,
-      cancel_at_period_end: true,
-      current_period_end_present: Boolean(getPeriodEnd(stripeSub) ?? sub.currentPeriodEnd),
+      payment_method_type: summary?.type ?? "none",
     });
-    return {
-      status: "scheduled_period_end",
-      currentPeriodEnd: getPeriodEnd(stripeSub) ?? sub.currentPeriodEnd,
-    };
+    return summary;
   } catch (error) {
-    traceBillingEvent("billing.cancel.failed", {
+    traceBillingEvent("billing.payment_method.failed", {
       server_id: serverId,
       ...traceAttrs.error(error),
     });
@@ -1180,31 +1568,223 @@ export async function cancelSubscriptionAtPeriodEnd(
   }
 }
 
+export async function cancelSubscriptionAtPeriodEnd(
+  serverId: string,
+  userId: string,
+): Promise<{ status: "scheduled_period_end"; currentPeriodEnd: Date | null; seatQuantity: number; billingInterval: BillingInterval }> {
+  if (isStripeBillingFlagEnabled()) await getSubscription(serverId);
+  return withServerSubscriptionMutation(serverId, async () => {
+    await assertStripeBillingSource(serverId);
+    traceBillingEvent("billing.cancel.requested", {
+      server_id: serverId,
+      user_id_present: Boolean(userId),
+      ...traceStripeBillingState(),
+    });
+    try {
+      if (!isStripeBillingFlagEnabled()) throw new Error("Billing is not configured (STRIPE_BILLING_ENABLED must be true)");
+      const sub = await readSubscription(serverId);
+      if (!sub || !isEntitlingStatus(sub.status)) {
+        traceBillingEvent("billing.cancel.rejected", {
+          server_id: serverId,
+          reason: "missing_entitling_subscription",
+          subscription_status: sub?.status ?? "none",
+        });
+        throw new Error("Server does not have an active Pro subscription");
+      }
+
+      const stripe = getStripe();
+      const stripeSub = await stripe.subscriptions.update(sub.stripeSubscriptionId, {
+        cancel_at_period_end: true,
+        metadata: {
+          cancelRequestedByUserId: userId,
+          cancelRequestedAt: new Date().toISOString(),
+        },
+      });
+      await syncStripeSubscriptionProjection(stripeSub, {
+        serverId,
+        userId,
+      });
+      traceBillingEvent("billing.cancel.scheduled", {
+        server_id: serverId,
+        cancel_at_period_end: true,
+        current_period_end_present: Boolean(getPeriodEnd(stripeSub) ?? sub.currentPeriodEnd),
+      });
+      return {
+        status: "scheduled_period_end",
+        currentPeriodEnd: getPeriodEnd(stripeSub) ?? sub.currentPeriodEnd,
+        // For billing_cancellation_scheduled.
+        seatQuantity: Math.max(1, sub.proPackQuantity),
+        billingInterval: billingIntervalFromStripeSubscription(stripeSub),
+      };
+    } catch (error) {
+      traceBillingEvent("billing.cancel.failed", {
+        server_id: serverId,
+        ...traceAttrs.error(error),
+      });
+      throw error;
+    }
+  }, { userId });
+}
+
+/** Acquire all projection FK targets once, in stable order, before Server. */
+async function lockSubscriptionUsers(
+  tx: DatabaseExecutor,
+  userIds: readonly (string | null | undefined)[],
+  strength: "key share" | "no key update" = "key share",
+  noWait = false,
+): Promise<void> {
+  const ids = [...new Set(userIds.filter((id): id is string => Boolean(id)))].sort();
+  if (ids.length) await tx.select({ id: users.id }).from(users).where(inArray(users.id, ids)).orderBy(users.id).for(strength, noWait ? { noWait: true } : undefined);
+}
+
+/** All application subscription mutations use the projection's Server row fence.
+ * Stripe calls deliberately hold this short transaction (Tenny cb8fef31): 5s
+ * per provider request, no retries; competing database lock waits are bounded.
+ * Projection savepoints join the ambient connection rather than self-locking.
+ */
+async function withServerSubscriptionMutation<T>(
+  serverId: string,
+  work: () => Promise<T>,
+  actor?: { userId: string; restoringDeletion?: true },
+): Promise<T> {
+  const inheritedTransaction = isInTransaction();
+  const run = () => getDb().transaction(async (tx) => {
+    await tx.execute(sql`SET LOCAL lock_timeout = '2s'`);
+    if (actor) {
+      // Projection writes explicitly attribute these mutations to this user.
+      // Take the FK lock before Server, never while a deletion holding the
+      // user row could be waiting to write a Computer audit on that Server.
+      // Restoration also excludes new deletion writers on the same user.
+      await lockSubscriptionUsers(tx, [actor.userId], actor.restoringDeletion ? "no key update" : "key share", inheritedTransaction);
+    }
+    const [server] = await tx.select({ id: servers.id }).from(servers).where(eq(servers.id, serverId)).for("update");
+    if (!server) throw new Error("Subscription Server no longer exists");
+    return work();
+  });
+  if (billingAfterCommit.getStore()) return run();
+  const afterCommit = new Map<string, () => Promise<void>>();
+  const result = await billingAfterCommit.run(afterCommit, run);
+  // Await external delivery only after the owning transaction releases locks.
+  for (const deliver of afterCommit.values()) {
+    try { await deliver(); } catch { traceBillingEvent("billing.projection.after_commit_pending", { server_id: serverId }); }
+  }
+  return result;
+}
+
+/** Capture only the exact subscription the deletion request selected, never its replacement. */
+export async function cancelSubscriptionForAccountDeletion(
+  serverId: string,
+  userId: string,
+  stripeSubscriptionId: string,
+  requestId: string,
+): Promise<AccountDeletionSubscriptionSnapshot | null> {
+  return withServerSubscriptionMutation(serverId, async () => {
+    await assertStripeBillingSource(serverId);
+    if (!isStripeBillingFlagEnabled()) throw new Error("Billing is not configured");
+    const [current] = await getDb().select({ id: subscriptions.stripeSubscriptionId }).from(subscriptions)
+      .where(eq(subscriptions.serverId, serverId)).limit(1);
+    if (current?.id !== stripeSubscriptionId) return null;
+    const stripe = getStripe();
+    const live = await stripe.subscriptions.retrieve(stripeSubscriptionId);
+    // Someone already chose cancellation: that decision is not this request's.
+    if (live.id !== stripeSubscriptionId || !isEntitlingStatus(mapStripeStatus(live.status)) || live.cancel_at_period_end) return null;
+    const changed = await stripe.subscriptions.update(stripeSubscriptionId, {
+      cancel_at_period_end: true,
+      metadata: { cancelRequestedByUserId: userId, cancelRequestedAt: new Date().toISOString() },
+    }, { idempotencyKey: `account-deletion-cancel-${requestId}-${serverId}` });
+    // A projection failure must not discard the provider's cancellation proof.
+    try { await getDb().transaction(() => syncStripeSubscriptionProjection(changed, { serverId, userId })); }
+    catch { traceBillingEvent("billing.deletion_cancel.projection_failed", { server_id: serverId }); }
+    if (changed.id !== stripeSubscriptionId || !changed.cancel_at_period_end
+      || !Number.isSafeInteger(changed.canceled_at) || changed.canceled_at === null || changed.canceled_at < 0) return null;
+    return { stripeSubscriptionId, canceledAt: changed.canceled_at };
+  }, { userId });
+}
+
+async function deletionRequesterStillOwnsServer(serverId: string, userId: string): Promise<boolean> {
+  const [owner] = await getDb().select({ id: users.id }).from(serverMembers)
+    .innerJoin(users, and(eq(users.id, serverMembers.userId), isNull(users.retiredAt)))
+    .innerJoin(servers, and(eq(servers.id, serverMembers.serverId), isNull(servers.deletedAt), eq(servers.kind, "normal")))
+    .where(and(eq(serverMembers.serverId, serverId), eq(serverMembers.userId, userId), eq(serverMembers.role, "owner"))).limit(1);
+  return !!owner;
+}
+
+/**
+ * Undo only this request's still-current cancellation (task #182). Undefined
+ * snapshot is the explicit legacy compatibility path; a null time in a NEW
+ * snapshot never falls back to it. Stripe reads and updates are separate API
+ * calls: this checks current state, not a provider-side compare-and-swap.
+ */
+export async function resumeSubscriptionAfterCancelledDeletion(
+  serverId: string,
+  userId: string,
+  snapshot?: AccountDeletionSubscriptionSnapshot,
+): Promise<SubscriptionRestorationResult> {
+  const skipped = (reason: string): SubscriptionRestorationResult => {
+    traceBillingEvent("billing.cancel.undo_skipped", { server_id: serverId, reason });
+    console.info("[Billing] Account-deletion subscription not automatically restored", { serverId, reason });
+    return "not_restored";
+  };
+  if (snapshot && (!Number.isSafeInteger(snapshot.canceledAt) || snapshot.canceledAt === null || snapshot.canceledAt < 0)) return skipped("missing_cancellation_snapshot");
+  try {
+    return await withServerSubscriptionMutation(serverId, async () => {
+        const [pending] = await getDb().select({ id: accountDeletionRequests.id }).from(accountDeletionRequests)
+          .where(and(eq(accountDeletionRequests.userId, userId), eq(accountDeletionRequests.state, "pending"))).limit(1);
+        if (pending) return skipped("new_deletion_pending");
+        await assertStripeBillingSource(serverId);
+        if (!isStripeBillingFlagEnabled()) return skipped("billing_unavailable");
+        if (!await deletionRequesterStillOwnsServer(serverId, userId)) return skipped("not_current_owner");
+        const [current] = await getDb().select({ id: subscriptions.stripeSubscriptionId }).from(subscriptions)
+          .where(eq(subscriptions.serverId, serverId)).limit(1);
+        const id = current?.id;
+        if (!id || (snapshot && id !== snapshot.stripeSubscriptionId)) return skipped("subscription_changed");
+        const stripe = getStripe();
+        const live = await stripe.subscriptions.retrieve(id);
+        const resumable = snapshot ? live.status === "active" : isEntitlingStatus(mapStripeStatus(live.status));
+        if (live.id !== id || !resumable || !live.cancel_at_period_end) return skipped("not_resumable_scheduled_cancellation");
+        if (snapshot && live.canceled_at !== snapshot.canceledAt) return skipped("cancellation_changed");
+        if (!await deletionRequesterStillOwnsServer(serverId, userId)) return skipped("not_current_owner");
+        const [afterRead] = await getDb().select({ id: subscriptions.stripeSubscriptionId }).from(subscriptions).where(eq(subscriptions.serverId, serverId)).limit(1);
+        if (afterRead?.id !== id) return skipped("subscription_changed");
+        await stripe.subscriptions.update(id, {
+          cancel_at_period_end: false,
+          metadata: { cancelRequestedByUserId: "", cancelRequestedAt: "", resumedAfterDeletionCancelAt: new Date().toISOString() },
+        });
+        // Readback detects obvious anomalies, not an overwritten external decision.
+        const confirmed = await stripe.subscriptions.retrieve(id);
+        if (confirmed.id !== id || confirmed.cancel_at_period_end || confirmed.cancel_at != null || confirmed.status !== live.status) {
+          traceBillingEvent("billing.cancel.undo_readback_unconfirmed", { server_id: serverId });
+          return "unknown";
+        }
+        // A failed projection is not evidence that Stripe failed. Roll back
+        // that savepoint only; the provider has already confirmed restoration.
+        try { await getDb().transaction(() => syncStripeSubscriptionProjection(confirmed, { serverId, userId })); }
+        catch { traceBillingEvent("billing.cancel.undo_projection_pending", { server_id: serverId }); }
+        traceBillingEvent("billing.cancel.undone", { server_id: serverId, reason: "account_deletion_cancelled" });
+        return "restored";
+    }, { userId, restoringDeletion: true });
+  } catch {
+    traceBillingEvent("billing.cancel.undo_outcome_unknown", { server_id: serverId });
+    return "unknown";
+  }
+}
+
 // ── Subscription CRUD ──
 
+/** A cache-only read for a mutation that already owns its user/Server fence. */
+async function readSubscription(serverId: string) {
+  const [row] = await getDb().select().from(subscriptions).where(eq(subscriptions.serverId, serverId));
+  return row ?? null;
+}
+
 export async function getSubscription(serverId: string) {
-  const db = getDb();
-  const [row] = await db
-    .select()
-    .from(subscriptions)
-    .where(eq(subscriptions.serverId, serverId));
+  const row = await readSubscription(serverId);
   if (!row) return null;
-
-  // If subscription looks active but period has expired, verify with Stripe
-  if (
-    row.status === "active" &&
-    row.currentPeriodEnd &&
-    new Date(row.currentPeriodEnd) < new Date()
-  ) {
+  // Provider-backed refresh runs before callers acquire mutation locks.
+  if (row.status === "active" && row.currentPeriodEnd && new Date(row.currentPeriodEnd) < new Date()) {
     await refreshSubscriptionStatus(row);
-    // Re-fetch after refresh
-    const [updated] = await db
-      .select()
-      .from(subscriptions)
-      .where(eq(subscriptions.serverId, serverId));
-    return updated ?? null;
+    return readSubscription(serverId);
   }
-
   return row;
 }
 
@@ -1442,18 +2022,29 @@ export async function cancelSubscriptionForDeletedServer(serverId: string): Prom
     .from(subscriptions)
     .where(eq(subscriptions.serverId, serverId));
   if (!sub) return; // No subscription — nothing to cancel
+  await cancelStripeSubscriptionOfDeletedServer(serverId, sub.stripeSubscriptionId);
+}
 
-  if (isStripeConfigured()) {
-    try {
-      const stripe = getStripe();
-      await stripe.subscriptions.cancel(sub.stripeSubscriptionId);
-      console.log(`[Billing] Canceled Stripe subscription ${sub.stripeSubscriptionId} for deleted server ${serverId}`);
-    } catch (err) {
-      console.error(`[Billing] Failed to cancel Stripe subscription for server ${serverId}:`, err);
-      // Deletion remains best-effort at the provider boundary. The local row is
-      // removed atomically with the server tombstone by deleteServer.
+/**
+ * Cancels a deleted server's Stripe subscription now, best effort (failures
+ * are logged, never thrown). For a caller that read the subscription before
+ * its transaction removed the local row with the tombstone (deleteServer, the
+ * account deletion cleanup).
+ */
+export async function cancelStripeSubscriptionOfDeletedServer(serverId: string, stripeSubscriptionId: string): Promise<void> {
+  return withServerSubscriptionMutation(serverId, async () => {
+    if (isStripeConfigured()) {
+      try {
+        const stripe = getStripe();
+        await stripe.subscriptions.cancel(stripeSubscriptionId);
+        console.log(`[Billing] Canceled Stripe subscription ${stripeSubscriptionId} for deleted server ${serverId}`);
+      } catch (err) {
+        console.error(`[Billing] Failed to cancel Stripe subscription for server ${serverId}:`, err);
+        // Deletion remains best-effort at the provider boundary. The local row is
+        // removed atomically with the server tombstone by deleteServer.
+      }
     }
-  }
+  });
 }
 
 // ── Webhook Handling ──
@@ -1471,7 +2062,7 @@ const WEBHOOK_PROCESSING_STALE_MS = 5 * 60 * 1000;
  * Process a Stripe webhook event with idempotency protection.
  * Only processed events are final; stale processing claims can be retried.
  */
-export async function handleWebhookEvent(event: Stripe.Event): Promise<void> {
+export async function handleWebhookEvent(event: Stripe.Event, options: BillingProductEventOptions = {}): Promise<void> {
   traceBillingEvent("billing.webhook.received", {
     event_type: event.type,
     stripe_event_id_present: Boolean(event.id),
@@ -1556,10 +2147,18 @@ export async function handleWebhookEvent(event: Stripe.Event): Promise<void> {
     return;
   }
 
+  let purchase: CheckoutPurchase | null = null;
+  let prepaid: PrepaidCheckoutRecorded | null = null;
   try {
     switch (event.type) {
-      case "checkout.session.completed":
-        await handleCheckoutCompleted(event.data.object as Stripe.Checkout.Session, event.id);
+      case "checkout.session.completed": {
+        const session = event.data.object as Stripe.Checkout.Session;
+        if (isPrepaidCheckoutSession(session)) prepaid = await handlePrepaidCheckoutCompleted(session);
+        else purchase = await handleCheckoutCompleted(session, event.id);
+        break;
+      }
+      case "charge.refunded":
+        await handleChargeRefunded(event.data.object as Stripe.Charge);
         break;
       case "invoice.paid":
         await handleInvoicePaid(event.data.object as Stripe.Invoice, event.id);
@@ -1598,6 +2197,29 @@ export async function handleWebhookEvent(event: Stripe.Event): Promise<void> {
       event_type: event.type,
       claim_marked_processed: Boolean(processed),
     });
+    // Only once the claim is ours and processed: a retried event never records twice.
+    if (purchase && processed && options.productEvents !== undefined) {
+      void recordServerProductEvent(options.productEvents, {
+        event: "billing_checkout_completed",
+        userId: purchase.userId,
+        serverId: purchase.serverId,
+        properties: checkoutEventProperties(purchase.metadata),
+      });
+    }
+    if (prepaid?.serverId && processed && options.productEvents !== undefined) {
+      // Seats added mid-period: their own event.
+      void recordServerProductEvent(options.productEvents, prepaid.kind === "seats" ? {
+        event: "billing_prepaid_seats_checkout_completed",
+        userId: prepaid.userId,
+        serverId: prepaid.serverId as ServerId,
+        properties: { ...prepaidSeatsCheckoutEventProperties(prepaid.metadata, prepaid.seatQuantity), result: prepaid.result },
+      } : {
+        event: "billing_prepaid_checkout_completed",
+        userId: prepaid.userId,
+        serverId: prepaid.serverId as ServerId,
+        properties: { ...prepaidCheckoutEventProperties(prepaid.metadata, prepaid), result: prepaid.result },
+      });
+    }
   } catch (err) {
     traceBillingEvent("billing.webhook.failed", {
       event_type: event.type,
@@ -1612,7 +2234,14 @@ export async function handleWebhookEvent(event: Stripe.Event): Promise<void> {
   }
 }
 
-async function handleCheckoutCompleted(session: Stripe.Checkout.Session, eventId: string): Promise<void> {
+interface CheckoutPurchase {
+  serverId: ServerId;
+  userId: string | null;
+  metadata: Stripe.Metadata;
+}
+
+/** The purchase it applied, or null when it skipped the session. */
+async function handleCheckoutCompleted(session: Stripe.Checkout.Session, eventId: string): Promise<CheckoutPurchase | null> {
   const serverId = session.metadata?.serverId;
   const billingTraceId = toBillingTraceId(session.metadata?.billingTraceId);
   traceBillingEvent("billing.checkout.completed.received", {
@@ -1629,7 +2258,7 @@ async function handleCheckoutCompleted(session: Stripe.Checkout.Session, eventId
       billing_trace_id: billingTraceId,
       mode: session.mode,
     });
-    return;
+    return null;
   }
 
   // Skip if server has been deleted
@@ -1643,20 +2272,94 @@ async function handleCheckoutCompleted(session: Stripe.Checkout.Session, eventId
       reason: "deleted_server",
     });
     console.log(`[Billing] Skipping checkout for deleted server ${serverId}`);
-    return;
+    return null;
   }
 
   const stripe = getStripe();
   const subscriptionId = session.subscription as string;
 
   // Fetch the full subscription to verify real status + get line item IDs
-  const stripeSub = await stripe.subscriptions.retrieve(subscriptionId);
-  await syncStripeSubscriptionProjection(stripeSub, {
-    serverId,
-    customerId: getStripeCustomerId(session.customer),
-    userId: session.metadata?.userId ?? null,
-    eventId,
-  });
+  const stripeSub: Stripe.Subscription = await stripe.subscriptions.retrieve(subscriptionId);
+  const syncOptions = { serverId, customerId: getStripeCustomerId(session.customer), userId: session.metadata?.userId ?? null, eventId };
+  await syncStripeSubscriptionProjection(stripeSub, syncOptions);
+  // Checked after the locked sync, so whichever of this and a prepaid webhook
+  // commits second sees the other: prepaid saw no subscription and granted,
+  // so this subscription came second and is undone (task #19). Also when an
+  // earlier try already canceled it for this reason: Stripe retries the event
+  // after a refund that failed, and the refund must still happen (security
+  // review v1.21.52 M6). Undoing is idempotent (one refund per payment).
+  const live = stripeSub.status !== "canceled" && stripeSub.status !== "incomplete_expired";
+  const undoneBefore = stripeSub.cancellation_details?.comment === SUBSCRIPTION_OVER_PREPAID_COMMENT;
+  if ((live || undoneBefore) && await getActivePrepaidGrant(db0, serverId, new Date())) {
+    const undone = await undoSubscriptionOverPrepaid(stripe, stripeSub, serverId);
+    await syncStripeSubscriptionProjection(undone, syncOptions);
+    // A purchase undone over prepaid time is not a completed checkout.
+    return null;
+  }
+  return { serverId: serverId as ServerId, userId: session.metadata?.userId || null, metadata: session.metadata ?? {} };
+}
+
+async function handlePrepaidCheckoutCompleted(session: Stripe.Checkout.Session): Promise<PrepaidCheckoutRecorded | null> {
+  const recorded = await recordPrepaidCheckout(getStripe(), session);
+  if (recorded?.serverId && recorded.nextPlan) {
+    await reconcileAfterPaidProjection(recorded.serverId, {
+      previousPlan: recorded.previousPlan ?? recorded.nextPlan, nextPlan: recorded.nextPlan, now: new Date(), changed: recorded.result === "granted",
+    });
+  }
+  return recorded;
+}
+
+async function handleChargeRefunded(charge: Stripe.Charge): Promise<void> {
+  const refunded = await recordPrepaidChargeRefunded(getStripe, charge);
+  if (refunded) {
+    await reconcileAfterPaidProjection(refunded.serverId, { previousPlan: refunded.previousPlan, nextPlan: refunded.nextPlan, now: new Date(), changed: true });
+  }
+}
+
+/**
+ * A subscription Checkout completed while prepaid time grants Pro (both
+ * Checkouts were open at once): whichever payment came second is undone, here
+ * the subscription. Cancel it now without proration and refund what its first
+ * invoice took. A refund that fails throws, so Stripe retries the event.
+ */
+/** Marks a subscription Raft canceled because it completed over prepaid time, so a retried event finishes its refund. */
+const SUBSCRIPTION_OVER_PREPAID_COMMENT = "raft: subscription completed over prepaid time";
+
+async function undoSubscriptionOverPrepaid(stripe: Stripe, stripeSub: Stripe.Subscription, serverId: string): Promise<Stripe.Subscription> {
+  console.error(`[Billing] Subscription ${stripeSub.id} completed over prepaid time on server ${serverId}; canceling and refunding`);
+  traceBillingEvent("billing.prepaid.subscription_conflict", { server_id: serverId, stripe_status: stripeSub.status });
+  let current = stripeSub;
+  if (current.status !== "canceled" && current.status !== "incomplete_expired") {
+    current = await withServerSubscriptionMutation(serverId, () => getStripe().subscriptions.cancel(current.id, { prorate: false, invoice_now: false, cancellation_details: { comment: SUBSCRIPTION_OVER_PREPAID_COMMENT } }, SUBSCRIPTION_MUTATION_OPTIONS));
+  }
+  const invoiceId = typeof stripeSub.latest_invoice === "string" ? stripeSub.latest_invoice : stripeSub.latest_invoice?.id;
+  try {
+    if (invoiceId) {
+      for await (const allocation of stripe.invoicePayments.list({ invoice: invoiceId, status: "paid", limit: 10 })) {
+        const intentId = allocation.payment.type === "payment_intent"
+          ? (typeof allocation.payment.payment_intent === "string" ? allocation.payment.payment_intent : allocation.payment.payment_intent?.id)
+          : null;
+        const chargeId = allocation.payment.type === "charge"
+          ? (typeof allocation.payment.charge === "string" ? allocation.payment.charge : allocation.payment.charge?.id)
+          : null;
+        if (!intentId && !chargeId) continue;
+        await refundPaymentOnce(stripe, {
+          paymentIntentId: intentId, chargeId,
+          idempotencyKey: `raft-sub-over-prepaid-refund-${invoiceId}-${allocation.id}`,
+          metadata: { raftConflict: "subscription_over_prepaid", serverId },
+        });
+      }
+      // A delayed payment method (bank debit) can leave the first invoice open: it must not be paid later.
+      const invoice = await stripe.invoices.retrieve(invoiceId);
+      if (invoice.status === "open") await stripe.invoices.voidInvoice(invoiceId);
+    }
+    traceBillingEvent("billing.prepaid.subscription_conflict_refunded", { server_id: serverId });
+  } catch (err) {
+    console.error(`[Billing] ALERT: refunding subscription ${stripeSub.id} over prepaid time failed; Stripe will retry the event. Refund it by hand if this repeats.`);
+    traceBillingEvent("billing.prepaid.subscription_conflict_refund_failed", { server_id: serverId, ...traceAttrs.error(err) });
+    throw err;
+  }
+  return current;
 }
 
 async function handleInvoicePaid(invoice: Stripe.Invoice, eventId: string): Promise<void> {
@@ -1669,7 +2372,8 @@ async function handleInvoicePaid(invoice: Stripe.Invoice, eventId: string): Prom
 
   const stripe = getStripe();
   const stripeSub = await stripe.subscriptions.retrieve(subscriptionId);
-  await syncStripeSubscriptionProjection(stripeSub, { eventId });
+  const paidLifecyclePayment = await verifyPaidLifecyclePayment(stripe, invoice, stripeSub);
+  await syncStripeSubscriptionProjection(stripeSub, { eventId, paidLifecyclePayment });
 }
 
 async function handleInvoicePaymentFailed(invoice: Stripe.Invoice, eventId: string): Promise<void> {
@@ -1709,6 +2413,69 @@ async function handleSubscriptionDeleted(stripeSub: Stripe.Subscription, eventId
   });
 }
 
+/**
+ * What follows a paid-source projection of `servers.plan` (Stripe or
+ * prepaid): Joint caps, the external channel freeze, the hosted runtime's
+ * spend limit, open upgrade requests, seat-full join notices, and the clients.
+ * Each step is best effort; its own sweep is the backstop. `changed`: the
+ * plan, the seats or the billing record moved.
+ */
+async function reconcileAfterPaidProjection(serverId: string, change: { previousPlan: ServerPlan; nextPlan: ServerPlan; now: Date; changed: boolean }): Promise<void> {
+  // Contract v0.3 §18.8: a plan change can move a joint over (or back within)
+  // its free-server cap. Observe it now instead of waiting for the hourly
+  // sweep. Best effort: the sweep is the backstop if this fails.
+  try {
+    const { reconcileJointsForServer } = await import("./jointChannelLimitService");
+    await reconcileJointsForServer(serverId, change.now);
+  } catch (err) {
+    console.error(`[Billing] Joint over-limit reconcile failed for server ${serverId}:`, err instanceof Error ? err.message : err);
+  }
+  // The free plan's external channel freeze: an upgrade lifts it at once, a
+  // downgrade of a server in more than one external channel freezes it at
+  // once (no grace). Best effort: the sweep is the backstop.
+  try {
+    const { reconcileExternalFreezeForBillingChange } = await import("./externalChannelFreezeService");
+    await reconcileExternalFreezeForBillingChange(serverId, change.now);
+  } catch (err) {
+    console.error(`[Billing] External channel freeze reconcile failed for server ${serverId}:`, err instanceof Error ? err.message : err);
+  }
+
+  // The hosting provider's spend limit follows the plan. Best effort: its sync
+  // sweep re-checks every server with a hosted agent each minute.
+  if (change.previousPlan !== change.nextPlan) {
+    try {
+      const { markHostedRuntimePlanChanged } = await import("./hostedRuntimeServerPlanSync");
+      const { kickHostedRuntimePlanSync } = await import("./agentRuntimeProvisionService");
+      await markHostedRuntimePlanChanged(serverId);
+      kickHostedRuntimePlanSync();
+    } catch (err) {
+      console.error(`[Billing] Hosted runtime plan kick failed for server ${serverId}:`, err instanceof Error ? err.message : err);
+    }
+    // People's open "ask an owner for Pro" cards are done once it's on Pro.
+    if (change.nextPlan !== "free") {
+      try {
+        const { completeUpgradeRequests } = await import("./seatRequestService");
+        await completeUpgradeRequests(_io, serverId, _orchestrator);
+      } catch (err) {
+        console.error(`[Billing] Completing upgrade requests failed for server ${serverId}:`, err instanceof Error ? err.message : err);
+      }
+    }
+  }
+
+  // Seats added (or the plan changed): if a person fits now, the notices of
+  // people a full link turned away end; they open the link again.
+  if (change.changed) {
+    try {
+      const { resolveSeatJoinBlocksWithRoom } = await import("./seatJoinBlockService");
+      await resolveSeatJoinBlocksWithRoom(serverId);
+    } catch (err) {
+      console.error(`[Billing] Resolving seat join notices failed for server ${serverId}:`, err instanceof Error ? err.message : err);
+    }
+  }
+
+  if (change.changed || change.previousPlan !== change.nextPlan) broadcastPlanChange(serverId, change.nextPlan);
+}
+
 async function syncStripeSubscriptionProjection(
   stripeSub: Stripe.Subscription,
   opts: {
@@ -1718,8 +2485,14 @@ async function syncStripeSubscriptionProjection(
     eventId?: string | null;
     fallbackPlan?: PaidBillingPlan | null;
     overrideStatus?: "active" | "past_due" | "canceled" | "incomplete";
+    paidLifecyclePayment?: PaidPaymentProjection | null;
   } = {},
 ): Promise<void> {
+  // An admission caller may already own users and Server. A new user wait
+  // could reverse that parent's order: fail this projection's savepoint
+  // immediately instead. Passive refresh catches that failure and keeps cache;
+  // non-passive handlers still propagate it for retry.
+  const inheritedTransaction = isInTransaction();
   traceBillingEvent("billing.subscription_projection.sync_started", {
     server_id_present: Boolean(opts.serverId ?? stripeSub.metadata?.serverId),
     billing_trace_id: toBillingTraceId(stripeSub.metadata?.billingTraceId),
@@ -1744,6 +2517,23 @@ async function syncStripeSubscriptionProjection(
     });
     console.warn(`[Billing] Cannot reconcile Stripe subscription ${stripeSub.id}: missing serverId metadata`);
     return;
+  }
+  const [tracked] = await db.select().from(subscriptions).where(eq(subscriptions.serverId, serverId));
+  let verifiedReplacement = false;
+  // A webhook can arrive after a server has moved on to another subscription.
+  // Replacing a terminal record with a different active ID requires a live
+  // provider read; an event snapshot alone is not proof that it is current.
+  if (tracked && tracked.stripeSubscriptionId !== stripeSub.id && tracked.status === "canceled"
+    && (opts.overrideStatus ?? mapStripeStatus(stripeSub.status)) !== "canceled") {
+    const verified = await getStripe().subscriptions.retrieve(stripeSub.id);
+    if (verified.id !== stripeSub.id || verified.metadata?.serverId !== serverId
+      || getStripeCustomerId(verified.customer) !== tracked.stripeCustomerId
+      || (opts.customerId != null && opts.customerId !== tracked.stripeCustomerId)) {
+      throw new Error("Stripe subscription replacement could not be verified");
+    }
+    stripeSub = verified;
+    opts = { ...opts, overrideStatus: undefined };
+    verifiedReplacement = true;
   }
   const [srv] = await db.select({ id: servers.id, plan: servers.plan }).from(servers)
     .where(and(eq(servers.id, serverId), isNull(servers.deletedAt)));
@@ -1787,8 +2577,76 @@ async function syncStripeSubscriptionProjection(
   const currentPeriodStart = getPeriodStart(stripeSub);
   const currentPeriodEnd = getPeriodEnd(stripeSub);
   const cancelAtPeriodEnd = isStripeSubscriptionScheduledToCancel(stripeSub);
-  const serverInternalPlan = srv.plan === "founder" || srv.plan === "partner" ? srv.plan : null;
-  const nextPlan: ServerPlan = serverInternalPlan ?? (isEntitlingStatus(status) ? projection.plan : "free");
+
+  // Serialize subscription projection, entitlement and email admission under the server fence.
+  const nextPlan: ServerPlan | null = await db.transaction(async tx => {
+    // Webhooks and passive refresh enter here directly. Lock the effective
+    // subscription attribution and any new paid-journey recipient together,
+    // in user-id order, before the Server fence and their foreign-key writes.
+    // Application mutations already hold this same explicit attribution lock.
+    await lockSubscriptionUsers(tx, [userId,
+      opts.paidLifecyclePayment?.canStartJourney ? opts.paidLifecyclePayment.recipientUserId : null,
+    ], "key share", inheritedTransaction);
+    const [lockedServer] = await tx.select({ plan: servers.plan }).from(servers)
+      .where(and(eq(servers.id, serverId), isNull(servers.deletedAt))).for("update");
+    if (!lockedServer) return null;
+    const [applied] = await tx.insert(subscriptions).values({
+      serverId, provider: "stripe", stripeCustomerId: customerId, stripeSubscriptionId: stripeSub.id,
+      plan: projection.plan, billingInterval: projection.billingInterval,
+      stripeProPackItemId: projection.stripeProPackItemId, status,
+      provisionedHumanSeats: projection.provisionedHumanSeats, provisionedAgentSeats: projection.provisionedAgentSeats,
+      proPackQuantity: projection.proPackQuantity, trialFreePackQuantity: projection.trialFreePackQuantity,
+      firstPackTrialEndsAt: projection.firstPackTrialEndsAt, currentPeriodStart, currentPeriodEnd,
+      cancelAtPeriodEnd, createdByUserId: userId, updatedByUserId: userId, lastProviderEventId: opts.eventId ?? null,
+    }).onConflictDoUpdate({
+      target: subscriptions.serverId,
+      // Terminal subscription snapshots must not be resurrected by late events;
+      // a replacement is valid only against the exact provider-verified prior row.
+      setWhere: sql`(
+        (${subscriptions.stripeSubscriptionId} = excluded.stripe_subscription_id
+          AND NOT (${subscriptions.provider} = 'stripe' AND ${subscriptions.status} = 'canceled' AND excluded.status <> 'canceled'))
+        OR (${subscriptions.stripeSubscriptionId} <> excluded.stripe_subscription_id
+          AND ${subscriptions.stripeSubscriptionId} = ${tracked?.stripeSubscriptionId ?? null}
+          AND ${subscriptions.stripeCustomerId} = ${tracked?.stripeCustomerId ?? null}
+          AND ${subscriptions.status} = 'canceled' AND excluded.status <> 'canceled' AND ${verifiedReplacement})
+      )`,
+      set: {
+        provider: "stripe", stripeCustomerId: customerId, stripeSubscriptionId: stripeSub.id,
+        plan: projection.plan, billingInterval: projection.billingInterval,
+        stripeProPackItemId: projection.stripeProPackItemId, status,
+        provisionedHumanSeats: projection.provisionedHumanSeats, provisionedAgentSeats: projection.provisionedAgentSeats,
+        proPackQuantity: projection.proPackQuantity, trialFreePackQuantity: projection.trialFreePackQuantity,
+        firstPackTrialEndsAt: projection.firstPackTrialEndsAt, currentPeriodStart, currentPeriodEnd,
+        cancelAtPeriodEnd, updatedByUserId: userId, lastProviderEventId: opts.eventId ?? null, updatedAt: now,
+      },
+    }).returning({ serverId: subscriptions.serverId });
+    if (!applied) {
+      const [current] = await tx.select().from(subscriptions).where(eq(subscriptions.serverId, serverId));
+      if (current && ((current.stripeSubscriptionId === stripeSub.id && current.status === "canceled")
+        || (current.stripeSubscriptionId !== stripeSub.id && status === "canceled"))) {
+        traceBillingEvent("billing.subscription_projection.stale_terminal_skipped", { server_id: serverId });
+        return null;
+      }
+      throw new Error("Stripe subscription conflict requires reconciliation");
+    }
+
+    // Re-read under the same fence; a stale Stripe snapshot cannot erase a
+    // current lifetime grant, prepaid time or internal plan.
+    const grant = await getActiveAppSumoGrant(tx, serverId) ?? await getActivePrepaidGrant(tx, serverId, now);
+    const internalPlan = lockedServer.plan === "founder" || lockedServer.plan === "partner" ? lockedServer.plan : null;
+    const plan: ServerPlan = internalPlan ?? (grant ? "pro" : isEntitlingStatus(status) ? projection.plan : "free");
+    await tx.update(servers).set({
+      plan,
+      planDowngradedAt: plan === "free" ? now : null,
+      updatedAt: now,
+    }).where(eq(servers.id, serverId));
+    await recordPaidLifecycleProjection(tx, { serverId, payerUserId: userId, stripeSubscriptionId: stripeSub.id, paidUntil: currentPeriodEnd, payment: opts.paidLifecyclePayment });
+    return plan;
+  });
+  if (nextPlan === null) return;
+  // Best effort after commit. Dirty flags persist, but there is no scheduled
+  // recovery; a later business event is needed for another sync attempt.
+
   const shouldBroadcast = !existing
     || srv.plan !== nextPlan
     || existing.provider !== "stripe"
@@ -1807,85 +2665,16 @@ async function syncStripeSubscriptionProjection(
     || !sameTimestamp(existing.currentPeriodEnd, currentPeriodEnd)
     || existing.cancelAtPeriodEnd !== cancelAtPeriodEnd;
 
-  await db.insert(subscriptions).values({
-    serverId,
-    provider: "stripe",
-    stripeCustomerId: customerId,
-    stripeSubscriptionId: stripeSub.id,
-    plan: projection.plan,
-    billingInterval: projection.billingInterval,
-    stripeProPackItemId: projection.stripeProPackItemId,
-    status,
-    provisionedHumanSeats: projection.provisionedHumanSeats,
-    provisionedAgentSeats: projection.provisionedAgentSeats,
-    proPackQuantity: projection.proPackQuantity,
-    trialFreePackQuantity: projection.trialFreePackQuantity,
-    firstPackTrialEndsAt: projection.firstPackTrialEndsAt,
-    currentPeriodStart,
-    currentPeriodEnd,
-    cancelAtPeriodEnd,
-    createdByUserId: userId,
-    updatedByUserId: userId,
-    lastProviderEventId: opts.eventId ?? null,
-  }).onConflictDoUpdate({
-    target: subscriptions.serverId,
-    set: {
-      provider: "stripe",
-      stripeCustomerId: customerId,
-      stripeSubscriptionId: stripeSub.id,
-      plan: projection.plan,
-      billingInterval: projection.billingInterval,
-      stripeProPackItemId: projection.stripeProPackItemId,
-      status,
-      provisionedHumanSeats: projection.provisionedHumanSeats,
-      provisionedAgentSeats: projection.provisionedAgentSeats,
-      proPackQuantity: projection.proPackQuantity,
-      trialFreePackQuantity: projection.trialFreePackQuantity,
-      firstPackTrialEndsAt: projection.firstPackTrialEndsAt,
-      currentPeriodStart,
-      currentPeriodEnd,
-      cancelAtPeriodEnd,
-      updatedByUserId: userId,
-      lastProviderEventId: opts.eventId ?? null,
-      updatedAt: now,
-    },
-  });
 
-  await db
-    .update(servers)
-    .set({
-      plan: nextPlan,
-      planDowngradedAt: isEntitlingStatus(status) ? null : new Date(),
-      updatedAt: now,
-    })
-    .where(and(eq(servers.id, serverId), isNull(servers.deletedAt)));
-
-  // Contract v0.3 §18.8: a plan change can move a joint over (or back within)
-  // its free-server cap. Observe it now instead of waiting for the hourly
-  // sweep. Best effort: the sweep is the backstop if this fails.
-  try {
-    const { reconcileJointsForServer } = await import("./jointChannelLimitService");
-    await reconcileJointsForServer(serverId, new Date(now));
-  } catch (err) {
-    console.error(`[Billing] Joint over-limit reconcile failed for server ${serverId}:`, err instanceof Error ? err.message : err);
-  }
-
-  // The hosting provider's spend limit follows the plan. Best effort: its sync
-  // sweep re-checks every server with a hosted agent each minute.
-  if (srv.plan !== nextPlan) {
-    try {
-      const { markHostedRuntimePlanChanged } = await import("./hostedRuntimeServerPlanSync");
-      const { kickHostedRuntimePlanSync } = await import("./agentRuntimeProvisionService");
-      await markHostedRuntimePlanChanged(serverId);
-      kickHostedRuntimePlanSync();
-    } catch (err) {
-      console.error(`[Billing] Hosted runtime plan kick failed for server ${serverId}:`, err instanceof Error ? err.message : err);
-    }
-  }
-
+  const afterProjectionCommit = async () => {
+    await syncPaidLifecycleForServer(serverId).catch(() => { traceBillingEvent("billing.paid_lifecycle.sync_pending"); });
+    await reconcileAfterPaidProjection(serverId, { previousPlan: srv.plan as ServerPlan, nextPlan, now: new Date(now), changed: shouldBroadcast });
+  };
+  const deferred = billingAfterCommit.getStore();
+  if (deferred) deferred.set(serverId, afterProjectionCommit);
+  else await afterProjectionCommit();
   if (shouldBroadcast) {
     console.log(`[Billing] Synced Stripe subscription ${stripeSub.id} for server ${serverId}: ${projection.plan}/${status}`);
-    broadcastPlanChange(serverId, nextPlan);
   }
   traceBillingEvent("billing.subscription_projection.synced", {
     server_id: serverId,

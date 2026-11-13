@@ -3,6 +3,8 @@
 // registrations and pins the bytes with its snapshot tests).
 
 import { formatHint, RAFT_HINTS, type RaftHintStyle } from "../agentOps/hint";
+import { foldAgentOneLineText, indentAgentBodyContinuationLines } from "../agentMessageText";
+import { parseAgentTaskRef } from "./taskRef";
 
 export interface AgentAttachmentUploadedLike {
   id: string;
@@ -10,10 +12,20 @@ export interface AgentAttachmentUploadedLike {
   sizeBytes: number;
 }
 
-/** Upload receipt with attachment id and send-usage hint. */
-export function formatAgentAttachmentUploaded(attachment: AgentAttachmentUploadedLike, style: RaftHintStyle = "cli"): string {
+/**
+ * Upload receipt with attachment id and send-usage hint. Uploaded to a task
+ * ref (`#channel:#7`), the hint is the task reply — `raft message send`
+ * refuses task refs; otherwise the message send, without a target (unchanged).
+ */
+export function formatAgentAttachmentUploaded(attachment: AgentAttachmentUploadedLike, style: RaftHintStyle = "cli", target?: string): string {
+  const taskRef = target === undefined ? null : parseAgentTaskRef(target)?.ref ?? null;
+  const head = `File uploaded: ${attachment.filename} (${(attachment.sizeBytes / 1024).toFixed(1)}KB)\nAttachment ID: ${attachment.id}\n\n`;
+  if (taskRef) {
+    const reply = formatHint(RAFT_HINTS.messageSend({ target: taskRef, attachmentId: attachment.id }), style);
+    return `${head}Use this ID with ${reply} to include it in a reply in the task's conversation.\n`;
+  }
   const send = formatHint(RAFT_HINTS.messageSend({ attachmentId: attachment.id }), style);
-  return (`File uploaded: ${attachment.filename} (${(attachment.sizeBytes / 1024).toFixed(1)}KB)\nAttachment ID: ${attachment.id}\n\nUse this ID with ${send} to include it in a message.\n`);
+  return (`${head}Use this ID with ${send} to include it in a message.\n`);
 }
 
 /** Download destination line. */
@@ -34,7 +46,7 @@ export interface AgentAttachmentCommentRow {
 function anchorSummary(anchor: NonNullable<AgentAttachmentCommentRow["anchor"]>): string {
   if (anchor.type === "md-section") {
     const title = anchor.data.headingTitle ?? anchor.data.headingId;
-    return typeof title === "string" && title ? `§ ${title}` : "§ section";
+    return typeof title === "string" && title ? `§ ${foldAgentOneLineText(title)}` : "§ section";
   }
   if (anchor.type === "lines" || anchor.type === "csv-rows") {
     const start = Number(anchor.data.start);
@@ -46,7 +58,7 @@ function anchorSummary(anchor: NonNullable<AgentAttachmentCommentRow["anchor"]>)
   if (anchor.type === "html-region") {
     const quote = anchor.data.quote;
     if (typeof quote === "string" && quote.trim().length > 0) {
-      const trimmed = quote.trim();
+      const trimmed = foldAgentOneLineText(quote);
       return trimmed.length > 60 ? `${trimmed.slice(0, 60)}…` : trimmed;
     }
     return "HTML region";
@@ -67,7 +79,7 @@ export function formatAgentAttachmentComments(
   for (const c of comments) {
     const check = c.reactions.some((r) => r.emoji === "✅") ? " ✅" : "";
     const anchor = c.anchor ? ` [anchor: ${anchorSummary(c.anchor)}]` : "";
-    lines.push(`[msg=${c.id.slice(0, 8)} time=${c.createdAt} type=${c.senderType}]${check}${anchor} @${c.senderName}: ${c.content}`);
+    lines.push(`[msg=${c.id.slice(0, 8)} time=${c.createdAt} type=${c.senderType}]${check}${anchor} @${foldAgentOneLineText(c.senderName)}: ${indentAgentBodyContinuationLines(c.content)}`);
   }
   if (threadChannelId) {
     lines.push(`(full conversation lives in thread channel ${threadChannelId})`);

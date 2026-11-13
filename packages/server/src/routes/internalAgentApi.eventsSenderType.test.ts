@@ -21,7 +21,7 @@ import { referenceAgentInboxChain } from "../test/agentInboxChainReference";
 import { createMessage, __setExternalAgentInboxChainSelectorForTests } from "../services/messageService";
 
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 // CI has no RisingWave: the external agent inbox pull reads the test-only
 // reference derivation of the agent inbox chain.
@@ -46,6 +46,7 @@ test("/events senderType echo mirrors the buffer's agent-facing sender_type", as
     agentId: agent.id,
     scopes: ["send", "read"],
     name: "events-sendertype-test",
+    issuedVia: "computer",
     createdByUserId: null,
   });
 

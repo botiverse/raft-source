@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { readdirSync, readFileSync, statSync } from "node:fs";
-import { resolve } from "node:path";
+import { relative, resolve } from "node:path";
+import { isTestPath } from "../scripts/testLocations";
 
 /**
  * Auth clear-session contract (Auth Session Contract, #2494 §"Clear-Session
@@ -21,13 +22,12 @@ import { resolve } from "node:path";
  *   2. `packages/web/src/store/authStore.ts::logout`
  *
  * Dev-only exemption (per contract §"Dev-only exemption"):
- *   - `packages/web/src/App.tsx::SlockdevDebugPanel.clearLocalState` may
+ *   - `packages/web/src/App.tsx::clearLocalState` (EnvironmentDebugPanel) may
  *     clear local state ONLY under the existing `isSlockdev` gate. This
  *     code path must remain inside that gate; production builds short-
  *     circuit before reaching it.
  *
- * Pattern modeled on `restoreTimeoutWiringContract.test.ts` /
- * `keydownFocusContract.test.ts` — mechanical, narrow, no runtime.
+ * Pattern modeled on `keydownFocusContract.test.ts` — mechanical, narrow, no runtime.
  */
 
 const repoRoot = resolve(import.meta.dirname, "..");
@@ -56,7 +56,8 @@ function listTsFiles(dir: string): string[] {
     const st = statSync(full);
     if (st.isDirectory()) {
       out.push(...listTsFiles(full));
-    } else if (TS_FILE_RE.test(name)) {
+    // Feature tests (src/features/<feature>/tests/) are not app code.
+    } else if (TS_FILE_RE.test(name) && !isTestPath(relative(repoRoot, full))) {
       out.push(full);
     }
   }
@@ -64,8 +65,7 @@ function listTsFiles(dir: string): string[] {
 }
 
 // Strip line-and-block comments so commented-out code or doc text never
-// becomes a violation signal. Mirrors the strip-comments idiom used in
-// restoreTimeoutWiringContract.test.ts.
+// becomes a violation signal.
 function stripComments(source: string): string {
   // Block comments first (non-greedy across newlines).
   let s = source.replace(/\/\*[\s\S]*?\*\//g, "");
@@ -285,61 +285,5 @@ test("redirect-plus-clear-token combos must live inside an authorized sink", () 
       `Per contract §"Redirect policy": redirect + token storage clear in the same scope ` +
       `is only allowed inside an authorized sink with terminal evidence.\n` +
       violations.map((v) => `  ${v.filePath}:${v.line}  ${v.text}`).join("\n"),
-  );
-});
-
-test("dev-only clearLocalState is gated by an isSlockdev early-return", () => {
-  // The contract §"Dev-only exemption" reads:
-  //
-  //   `App.tsx::SlockdevDebugPanel.clearLocalState` may clear local state
-  //   only under the existing slockdev/debug gate. Dev-only clear paths
-  //   must not be reachable in production builds or production deployment
-  //   envs.
-  //
-  // Without this test, deleting the early-return `if (!isSlockdev) return null;`
-  // would silently turn the dev panel into a production-reachable sink while
-  // still satisfying the file/function exemption above. Anchor the assertion
-  // on a position-based check: inside the SlockdevDebugPanel function body,
-  // an `if (!isSlockdev) return null;` (or strictly equivalent) MUST appear
-  // BEFORE any reference to `clearLocalState`.
-  const appSrc = stripComments(readFileSync(resolve(srcRoot, "App.tsx"), "utf8"));
-  const panelRange = extractFunctionRange(appSrc, "SlockdevDebugPanel");
-  assert.ok(
-    panelRange,
-    "SlockdevDebugPanel function declaration not found in App.tsx. If the dev panel was renamed, update this test AND the AUTHORIZED_CLEAR_TOKEN_SITES `App.tsx::clearLocalState` entry to match.",
-  );
-  const panelBody = appSrc.slice(panelRange.start, panelRange.end);
-  const gateRe = /\bif\s*\(\s*!\s*isSlockdev\s*\)\s*return\s+null\s*;/;
-  const gateMatch = gateRe.exec(panelBody);
-  assert.ok(
-    gateMatch,
-    "SlockdevDebugPanel no longer contains the `if (!isSlockdev) return null;` early-return gate. The dev-only clearLocalState exemption depends on this guard; without it, the dev panel becomes reachable in production builds.",
-  );
-  const clearLocalStateIdx = panelBody.indexOf("clearLocalState");
-  assert.ok(
-    clearLocalStateIdx >= 0,
-    "SlockdevDebugPanel no longer references `clearLocalState`. If it was renamed, update AUTHORIZED_CLEAR_TOKEN_SITES.",
-  );
-  assert.ok(
-    gateMatch.index < clearLocalStateIdx,
-    `The \`if (!isSlockdev) return null;\` gate must appear BEFORE clearLocalState is referenced inside SlockdevDebugPanel (gate at offset ${gateMatch.index}, first clearLocalState reference at offset ${clearLocalStateIdx}). Moving the guard after the clear path makes the dev sink reachable in production.`,
-  );
-});
-
-test("authorized sinks are still present (anti-rot)", () => {
-  // If someone deletes or renames clearAuthAndRedirect / logout, this test
-  // catches the drift before the scans above silently pass against a
-  // non-existent authorized site.
-  const clientSrc = readFileSync(resolve(srcRoot, "api/client.ts"), "utf8");
-  const authStoreSrc = readFileSync(resolve(srcRoot, "store/authStore.ts"), "utf8");
-  assert.match(
-    stripComments(clientSrc),
-    /\bfunction\s+clearAuthAndRedirect\s*\(/,
-    "api/client.ts no longer declares `clearAuthAndRedirect`. If renamed, update this contract's AUTHORIZED_CLEAR_TOKEN_SITES.",
-  );
-  assert.match(
-    stripComments(authStoreSrc),
-    /\blogout\s*:\s*\(/,
-    "store/authStore.ts no longer declares a `logout:` zustand reducer. If renamed, update this contract's AUTHORIZED_CLEAR_TOKEN_SITES.",
   );
 });

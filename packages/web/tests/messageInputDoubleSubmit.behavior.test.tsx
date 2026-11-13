@@ -12,18 +12,19 @@ const mentionFmt = createIntl({ locale: DEFAULT_LOCALE, messages: mergedMessages
 import { MemoryRouter } from "react-router-dom";
 import api from "../src/api/client";
 import { resetUploadCapability, withUploadCapability } from "./helpers/uploadCapability";
-import MessageInput, {
+import { MessageInput } from "../src/features/composer/MessageInput";
+import {
   clearDraftPendingFilesForTests,
   clearFailedSendMentionsForTests,
+} from "../src/features/composer/draftPendingFilesCache";
+import {
   formatMentionActionStatusNotice,
   mergeFailedSendIntoDraft,
   mentionActionSucceeded,
   releaseSubmittedDraftIntent,
-} from "../src/components/message/MessageInput";
-import type {
-  PendingMentionActionExecuteResult,
-} from "../src/components/message/MessageInput";
-import ChannelMembers from "../src/components/agent/ChannelMembers";
+} from "../src/features/composer/pendingMentionActions";
+import type { PendingMentionActionExecuteResult } from "../src/features/composer/pendingMentionActions";
+import { ChannelMembers } from "../src/features/channel/ChannelMembers";
 import { subscribeChannelMembersChanged } from "../src/store/channelMemberEvents";
 import type { MessageMention } from "../src/components/message/messageMentionTypes";
 import { useAuthStore } from "../src/store/authStore";
@@ -145,7 +146,6 @@ function setupComposer(
     user: {
       id: "user-1",
       email: "user@example.com",
-      gravatarHash: "",
       name: "user",
       displayName: "User",
       description: null,
@@ -202,7 +202,7 @@ function setupComposer(
 
   const view = render(
     <MemoryRouter>
-      {options.renderChannelMembers ? <ChannelMembers channelId={CHANNEL_ID} /> : null}
+      {options.renderChannelMembers ? <ChannelMembers channelId={CHANNEL_ID} presentation="page" /> : null}
       <MessageInput channelId={CHANNEL_ID} channelName="#general" {...overrides} />
     </MemoryRouter>,
   );
@@ -290,7 +290,7 @@ async function submitForm(form: HTMLFormElement) {
 }
 
 function assertSendGlyph(button: HTMLButtonElement) {
-  assert.equal(button.querySelector('[role="status"]'), null);
+  assert.ok(button.querySelector('[role="status"]') === null);
   assert.ok(button.querySelector("svg"), "send icon should render for non-loading submit buttons");
 }
 
@@ -411,7 +411,7 @@ test("MessageInput keeps unresolved mention warnings dismissible in channels", a
   ));
   fireEvent.click(screen.getByRole("button", { name: "Dismiss unnotified mention warning" }));
 
-  await waitFor(() => assert.equal(screen.queryByText(/Not notified:/u), null));
+  await waitFor(() => assert.ok(screen.queryByText(/Not notified:/u) === null));
   assert.deepEqual(sendMessage.calls, [{ content: "hello @croxx", attachmentIds: [] }]);
 });
 
@@ -432,7 +432,7 @@ test("MessageInput clears unresolved mention warnings when the composer switches
     </MemoryRouter>,
   );
 
-  await waitFor(() => assert.equal(screen.queryByText(/Not notified:/u), null));
+  await waitFor(() => assert.ok(screen.queryByText(/Not notified:/u) === null));
 });
 
 test("MessageInput suppresses unresolved mention warnings in DMs without changing send delivery", async () => {
@@ -447,8 +447,8 @@ test("MessageInput suppresses unresolved mention warnings in DMs without changin
   await submitForm(form);
 
   await waitFor(() => assert.equal(sendMessage.calls.length, 1));
-  assert.equal(screen.queryByText(/Not notified:/u), null);
-  assert.equal(screen.queryByRole("button", { name: "Dismiss unnotified mention warning" }), null);
+  assert.ok(screen.queryByText(/Not notified:/u) === null);
+  assert.ok(screen.queryByRole("button", { name: "Dismiss unnotified mention warning" }) === null);
   assert.deepEqual(sendMessage.details[0], {
     channelId: CHANNEL_ID,
     content: "hello @croxx",
@@ -603,6 +603,30 @@ test("mention action result policy is closed across notify, add, dropped, stale,
   );
 });
 
+test("thread composer names the parent channel in the pending mention strip, not the thread", async () => {
+  const sendMessage = makeSendSpy([{
+    resolutionId: "resolution-thread",
+    messageId: "message-thread",
+    targetType: "agent",
+    targetHandle: "Noel",
+    targetAvatarUrl: null,
+    reason: "not in channel",
+    availableActions: ["notify"],
+    expiresAt: null,
+  }]);
+  const { textarea, form } = setupComposer(sendMessage, {
+    channelId: "thread-channel-1",
+    channelName: "thread",
+    mentionChannelId: CHANNEL_ID,
+  });
+
+  fireEvent.change(textarea, { target: { value: "hello @Noel" } });
+  await submitForm(form);
+  const strip = await screen.findByTestId("pending-mention-action-strip");
+  assert.match(strip.textContent ?? "", /@Noel was not notified because they are not in #general/);
+  assert.doesNotMatch(strip.textContent ?? "", /#thread/);
+});
+
 test("MessageInput treats queued notify as success and removes the resolved strip row", async () => {
   const resolutionId = "resolution-queued";
   const sendMessage = makeSendSpy([{
@@ -647,7 +671,7 @@ test("MessageInput treats queued notify as success and removes the resolved stri
     act(() => removalTimers[0]?.());
     assert.match(screen.getByTestId("pending-mention-action-rows").querySelector(":scope > div")?.className ?? "", /opacity-0/);
     act(() => removalTimers[1]?.());
-    assert.equal(screen.queryByTestId("pending-mention-action-strip"), null);
+    assert.ok(screen.queryByTestId("pending-mention-action-strip") === null);
   } finally {
     globalThis.setTimeout = originalSetTimeout;
   }
@@ -671,7 +695,6 @@ test("successful mention Add refreshes the sibling channel member count and list
     displayName: "User",
     description: null,
     avatarUrl: null,
-    gravatarHash: "",
     role: "owner",
   };
   const addedHuman = {
@@ -680,7 +703,6 @@ test("successful mention Add refreshes the sibling channel member count and list
     displayName: "Added User",
     description: null,
     avatarUrl: null,
-    gravatarHash: "",
     role: "member",
   };
   let membershipAdded = false;
@@ -700,21 +722,8 @@ test("successful mention Add refreshes the sibling channel member count and list
     {},
     { apiGet, renderChannelMembers: true },
   );
-  const participantsButton = screen.getByRole("button", { name: "Members" });
-  await waitFor(() => assert.equal(participantsButton.textContent?.trim(), "1"));
-  assert.equal(participantsButton.tagName, "BUTTON");
-  // Raft's smallest button step (sm, 32px) with the compact count padding.
-  assert.match(participantsButton.className, /(?:^| )h-8(?: |$)/);
-  assert.match(participantsButton.className, /\bmin-w-7\b/);
-  assert.match(participantsButton.className, /\bgap-1\b/);
-  assert.match(participantsButton.className, /\bpx-1\.5\b/);
-  const participantsIcon = participantsButton.querySelector("svg");
-  const participantsCount = participantsButton.querySelector('[data-testid="channel-members-count"]');
-  assert.ok(participantsIcon);
-  assert.ok(participantsCount);
-  assert.equal(participantsIcon.getAttribute("width"), "14");
-  assert.match(participantsIcon.getAttribute("class") ?? "", /\bshrink-0\b/);
-  assert.ok(participantsCount?.textContent);
+  const memberCount = () => screen.queryByTestId("member-page-count")?.textContent?.trim();
+  await waitFor(() => assert.equal(memberCount(), "1"));
 
   api.post = (async (url: string, body?: unknown) => {
     assert.equal(url, "/messages/mention-actions/execute");
@@ -733,51 +742,9 @@ test("successful mention Add refreshes the sibling channel member count and list
   await submitForm(form);
   fireEvent.click(within(await screen.findByTestId("pending-mention-action-strip")).getByRole("button", { name: "Add" }));
 
-  await waitFor(() => assert.equal(participantsButton.textContent?.trim(), "2"));
+  await waitFor(() => assert.equal(memberCount(), "2"));
   assert.equal(memberReads, 2, "the sibling snapshots should share one initial read and one post-mutation refresh");
-
-  fireEvent.click(participantsButton);
-  assert.ok(screen.getByRole("heading", { name: "Members (2)" }));
   assert.ok(screen.getByText("Added User"));
-});
-
-test("ChannelMembers compact trigger renders the real participant count and caps it at 99+", async () => {
-  const makeHumans = (count: number) => Array.from({ length: count }, (_, index) => ({
-    id: `member-${index}`,
-    name: `member-${index}`,
-    displayName: `Member ${index}`,
-    description: null,
-    avatarUrl: null,
-    gravatarHash: "",
-    role: "member",
-  }));
-  const mountCount = (count: number) => setupComposer(
-    makeSendSpy(),
-    {},
-    {
-      renderChannelMembers: true,
-      apiGet: (async () => ({ data: { agents: [], humans: makeHumans(count) } })) as typeof api.get,
-    },
-  );
-
-  const three = mountCount(3);
-  const threeButton = screen.getByRole("button", { name: "Members" });
-  await waitFor(() => assert.equal(threeButton.textContent?.trim(), "3"));
-  // The compact trigger is raft's 32px sm step, never the 44px form size.
-  assert.match(threeButton.className, /(?:^| )h-8(?: |$)/);
-  assert.doesNotMatch(threeButton.className, /(?:^| )h-11(?: |$)/);
-  assert.match(threeButton.className, /\bmin-w-7\b/);
-  assert.match(threeButton.className, /\bgap-1\b/);
-  assert.match(threeButton.className, /\bpx-1\.5\b/);
-  const icon = threeButton.querySelector("svg");
-  assert.ok(icon);
-  assert.equal(icon.getAttribute("width"), "14");
-  assert.match(icon.getAttribute("class") ?? "", /\bshrink-0\b/);
-  three.unmount();
-
-  mountCount(100);
-  const hundredButton = screen.getByRole("button", { name: "Members" });
-  await waitFor(() => assert.equal(hundredButton.textContent?.trim(), "99+"));
 });
 
 test("MessageInput batches Add all once, removes successes, and keeps partial failures retryable", async () => {
@@ -872,7 +839,7 @@ test("MessageInput batches Add all once, removes successes, and keeps partial fa
     assert.match(remainingStrip.textContent ?? "", /@King/);
     assert.doesNotMatch(remainingStrip.textContent ?? "", /@Tommy/);
     assert.ok(within(remainingStrip).getByRole("button", { name: "Add" }));
-    assert.equal(within(remainingStrip).queryByRole("button", { name: "Add all" }), null);
+    assert.ok(within(remainingStrip).queryByRole("button", { name: "Add all" }) === null);
   } finally {
     unsubscribeMemberRefresh();
     globalThis.setTimeout = originalSetTimeout;
@@ -1049,21 +1016,21 @@ test("MessageInput prevents task-toggle pointerdown from blurring the mobile com
 
   fireEvent.change(textarea, { target: { value: "ready text" } });
   textarea.focus();
-  assert.equal(document.activeElement, textarea);
+  assert.ok(document.activeElement === textarea);
 
-  const taskToggle = screen.getByRole("checkbox", { name: "As Task" }) as HTMLButtonElement;
+  const taskToggle = screen.getByRole("checkbox", { name: "As task" }) as HTMLButtonElement;
   assert.equal(taskToggle.getAttribute("aria-checked"), "false");
 
   const pointerDown = new window.Event("pointerdown", { bubbles: true, cancelable: true });
   taskToggle.dispatchEvent(pointerDown);
 
   assert.equal(pointerDown.defaultPrevented, true);
-  assert.equal(document.activeElement, textarea);
+  assert.ok(document.activeElement === textarea);
   assert.deepEqual(sendMessage.calls, []);
 
   fireEvent.click(taskToggle);
   assert.equal(taskToggle.getAttribute("aria-checked"), "true");
-  assert.equal(document.activeElement, textarea);
+  assert.ok(document.activeElement === textarea);
   assert.deepEqual(sendMessage.calls, []);
 });
 
@@ -1074,21 +1041,21 @@ test("MessageInput does not focus the composer when task mode is toggled while t
   fireEvent.change(textarea, { target: { value: "ready text" } });
   textarea.focus();
   textarea.blur();
-  assert.notEqual(document.activeElement, textarea);
+  assert.ok(document.activeElement !== textarea);
 
-  const taskToggle = screen.getByRole("checkbox", { name: "As Task" }) as HTMLButtonElement;
+  const taskToggle = screen.getByRole("checkbox", { name: "As task" }) as HTMLButtonElement;
   assert.equal(taskToggle.getAttribute("aria-checked"), "false");
 
   const pointerDown = new window.Event("pointerdown", { bubbles: true, cancelable: true });
   taskToggle.dispatchEvent(pointerDown);
 
   assert.equal(pointerDown.defaultPrevented, true);
-  assert.notEqual(document.activeElement, textarea);
+  assert.ok(document.activeElement !== textarea);
   assert.deepEqual(sendMessage.calls, []);
 
   fireEvent.click(taskToggle);
   assert.equal(taskToggle.getAttribute("aria-checked"), "true");
-  assert.notEqual(document.activeElement, textarea);
+  assert.ok(document.activeElement !== textarea);
   assert.deepEqual(sendMessage.calls, []);
 });
 
@@ -1103,7 +1070,7 @@ test("MessageInput preserves focus through the picker tap, then blurs after medi
 
   fireEvent.change(textarea, { target: { value: "ready text" } });
   textarea.focus();
-  assert.equal(document.activeElement, textarea);
+  assert.ok(document.activeElement === textarea);
 
   const imageInput = container.querySelector('input[type="file"][accept*="image/"]') as HTMLInputElement | null;
   const fileInput = container.querySelector('input[type="file"]:not([accept])') as HTMLInputElement | null;
@@ -1119,26 +1086,26 @@ test("MessageInput preserves focus through the picker tap, then blurs after medi
   const imagePointerDown = new window.Event("pointerdown", { bubbles: true, cancelable: true });
   imageButton.dispatchEvent(imagePointerDown);
   assert.equal(imagePointerDown.defaultPrevented, true);
-  assert.equal(document.activeElement, textarea);
+  assert.ok(document.activeElement === textarea);
   fireEvent.click(imageButton);
   assert.equal(imagePickerClicks, 1);
-  assert.equal(document.activeElement, textarea);
+  assert.ok(document.activeElement === textarea);
 
   const fileButton = screen.getByRole("button", { name: "Attach file" }) as HTMLButtonElement;
   const filePointerDown = new window.Event("pointerdown", { bubbles: true, cancelable: true });
   fileButton.dispatchEvent(filePointerDown);
   assert.equal(filePointerDown.defaultPrevented, true);
-  assert.equal(document.activeElement, textarea);
+  assert.ok(document.activeElement === textarea);
   fireEvent.click(fileButton);
   assert.equal(filePickerClicks, 1);
-  assert.equal(document.activeElement, textarea);
+  assert.ok(document.activeElement === textarea);
 
   await act(async () => {
     fireEvent.change(imageInput, {
       target: { files: [new File(["video"], "clip.mp4", { type: "video/mp4" })] },
     });
   });
-  assert.notEqual(document.activeElement, textarea, "native media selection should dismiss the mobile keyboard");
+  assert.ok(document.activeElement !== textarea, "native media selection should dismiss the mobile keyboard");
   assert.equal(imageInput.value, "", "picker value should reset so the same media can be selected again");
   assert.deepEqual(sendMessage.calls, []);
 });
@@ -1154,13 +1121,13 @@ test("MessageInput blurs the composer as soon as submit is accepted so the mobil
 
   textarea.style.height = "64px";
   textarea.focus();
-  assert.equal(document.activeElement, textarea);
+  assert.ok(document.activeElement === textarea);
 
   await submitForm(form);
 
   assert.equal(sendMessage.calls.length, 1);
   assert.equal(textarea.style.height, "");
-  assert.notEqual(document.activeElement, textarea);
+  assert.ok(document.activeElement !== textarea);
 
   // Accepting the submit must not leave the queued frame able to overwrite the
   // cleared height. Without the cancel at the submit reset this fails: the
@@ -1203,12 +1170,31 @@ test("MessageInput shows a stopped-agent delivery warning after a successful DM 
   assert.equal(textarea.value, "");
   const warning = await screen.findByText("Message sent, but this agent is stopped and was not notified.");
   assert.ok(warning);
-  assert.equal(screen.queryByText("Failed to send"), null);
+  assert.ok(screen.queryByText("Failed to send") === null);
 
   fireEvent.click(screen.getByRole("button", { name: "Dismiss delivery warning" }));
   await waitFor(() => {
-    assert.equal(screen.queryByText("Message sent, but this agent is stopped and was not notified."), null);
+    assert.ok(screen.queryByText("Message sent, but this agent is stopped and was not notified.") === null);
   });
+});
+
+test("MessageInput shows a stuck-agent delivery warning after a successful DM send (task #25)", async () => {
+  const sendMessage = makeSendSpy([], [], [{
+    targetType: "agent",
+    targetId: "agent-stuck",
+    reason: "agent_stuck_on_tool",
+  }]);
+  const { textarea, form } = setupComposer(sendMessage, { channelName: "StuckAgent" }, { channelType: "dm" });
+
+  fireEvent.change(textarea, { target: { value: "hello" } });
+  await submitForm(form);
+
+  assert.equal(sendMessage.calls.length, 1);
+  const warning = await screen.findByText(
+    "Message sent, but this agent is stuck on a command with no output. It will see the message once the command ends or the agent is restarted.",
+  );
+  assert.ok(warning);
+  assert.ok(screen.queryByText("Message sent, but this agent is stopped and was not notified.") === null);
 });
 
 test("MessageInput only renders stopped-agent delivery warnings in DMs", async () => {
@@ -1224,7 +1210,7 @@ test("MessageInput only renders stopped-agent delivery warnings in DMs", async (
 
   assert.equal(sendMessage.calls.length, 1);
   await waitFor(() => assert.equal(textarea.value, ""));
-  assert.equal(screen.queryByText("Message sent, but this agent is stopped and was not notified."), null);
+  assert.ok(screen.queryByText("Message sent, but this agent is stopped and was not notified.") === null);
 });
 
 test("MessageInput clears stopped-agent delivery warnings when the composer switches channel", async () => {
@@ -1283,7 +1269,7 @@ test("MessageInput keeps the composer focused after a successful desktop Enter s
 
     fireEvent.change(textarea, { target: { value: "ready text" } });
     textarea.focus();
-    assert.equal(document.activeElement, textarea);
+    assert.ok(document.activeElement === textarea);
 
     fireEvent.keyDown(textarea, { key: "Enter", code: "Enter" });
 
@@ -1318,7 +1304,7 @@ test("MessageInput leaves Shift+Enter to the textarea newline behavior", async (
     assert.equal(defaultAllowed, true);
     assert.equal(sendMessage.details.length, 0);
     assert.equal(textarea.value, "line one");
-    assert.equal(document.activeElement, textarea);
+    assert.ok(document.activeElement === textarea);
     unmount();
   } finally {
     Object.defineProperty(window, "matchMedia", { configurable: true, value: previousMatchMedia });
@@ -1345,7 +1331,7 @@ test("MessageInput leaves plain Enter to the textarea on portrait touch-primary 
     assert.equal(defaultAllowed, true);
     assert.equal(sendMessage.details.length, 0);
     assert.equal(textarea.value, "mobile line");
-    assert.equal(document.activeElement, textarea);
+    assert.ok(document.activeElement === textarea);
     unmount();
   } finally {
     Object.defineProperty(window, "matchMedia", { configurable: true, value: previousMatchMedia });
@@ -1368,7 +1354,7 @@ for (const shortcut of [
 
       fireEvent.change(textarea, { target: { value: `${shortcut.label} body` } });
       textarea.focus();
-      assert.equal(document.activeElement, textarea);
+      assert.ok(document.activeElement === textarea);
 
       fireEvent.keyDown(textarea, { key: "Enter", code: "Enter", ...shortcut.event });
 
@@ -1376,7 +1362,7 @@ for (const shortcut of [
       assert.equal(sendMessage.details[0]?.content, `${shortcut.label} body`);
       assert.equal(sendMessage.details[0]?.asTask, undefined);
       assert.equal(textarea.value, "");
-      assert.equal(document.activeElement, textarea);
+      assert.ok(document.activeElement === textarea);
       unmount();
     } finally {
       Object.defineProperty(window, "matchMedia", { configurable: true, value: previousMatchMedia });
@@ -1400,7 +1386,7 @@ for (const shortcut of [
 
       fireEvent.change(textarea, { target: { value: `${shortcut.label} body` } });
       textarea.focus();
-      assert.equal(document.activeElement, textarea);
+      assert.ok(document.activeElement === textarea);
 
       const defaultAllowed = fireEvent.keyDown(textarea, { key: "Enter", code: "Enter", ...shortcut.event });
 
@@ -1409,7 +1395,7 @@ for (const shortcut of [
       assert.equal(sendMessage.details[0]?.content, `${shortcut.label} body`);
       assert.equal(sendMessage.details[0]?.asTask, true);
       assert.equal(textarea.value, "");
-      assert.equal(document.activeElement, textarea);
+      assert.ok(document.activeElement === textarea);
       unmount();
     } finally {
       Object.defineProperty(window, "matchMedia", { configurable: true, value: previousMatchMedia });
@@ -1424,19 +1410,38 @@ test("MessageInput restores the draft and focus when an accepted send fails afte
 
   fireEvent.change(textarea, { target: { value: "retry text" } });
   textarea.focus();
-  assert.equal(document.activeElement, textarea);
+  assert.ok(document.activeElement === textarea);
 
   await submitForm(form);
 
   assert.equal(sendMessage.calls.length, 1);
-  assert.notEqual(document.activeElement, textarea);
+  assert.ok(document.activeElement !== textarea);
 
   await act(async () => {
     sendMessage.rejectSend(new Error("network failed"));
   });
 
   await waitFor(() => assert.equal(textarea.value, "retry text"));
-  assert.equal(document.activeElement, textarea);
+  assert.ok(document.activeElement === textarea);
+});
+
+test("MessageInput explains a departed DM peer and preserves the unsent draft", async () => {
+  const sendMessage = makeDeferredSendSpy();
+  console.error = () => {};
+  const { textarea, form } = setupComposer(sendMessage, {}, { channelType: "dm" });
+  fireEvent.change(textarea, { target: { value: "keep this message" } });
+  await submitForm(form);
+  assert.equal(sendMessage.calls.length, 1);
+  assert.equal(useMessageStore.getState().messages.length, 1);
+  await act(async () => {
+    sendMessage.rejectSend({ response: { status: 403, data: { code: "peer_not_member", error: "raw server fallback" } } });
+  });
+  await waitFor(() => {
+    assert.ok(screen.getByText("The other person is no longer a member of this server. You can send messages after they rejoin."));
+    assert.equal(textarea.value, "keep this message");
+    assert.equal(useMessageStore.getState().messages.length, 0);
+  });
+  assert.ok(document.activeElement === textarea);
 });
 
 test("MessageInput prepends failed sends instead of overwriting text typed while retry is pending", async () => {
@@ -1458,7 +1463,7 @@ test("MessageInput prepends failed sends instead of overwriting text typed while
 
   await waitFor(() => assert.equal(textarea.value, "failed message\nnew draft in progress"));
   assert.equal(useMessageStore.getState().drafts[CHANNEL_ID], "failed message\nnew draft in progress");
-  assert.equal(document.activeElement, textarea);
+  assert.ok(document.activeElement === textarea);
 });
 
 test("MessageInput restores a failed send into its originating thread after a switch", async () => {
@@ -1548,7 +1553,7 @@ test("MessageInput routes a failure after the next thread commits but before pas
       "failed before passive effects",
     ));
     assert.equal(nextTextarea.value, "");
-    assert.notEqual(document.activeElement, nextTextarea, "failed originating send must not focus the newly committed thread");
+    assert.ok(document.activeElement !== nextTextarea, "failed originating send must not focus the newly committed thread");
     assert.equal(useMessageStore.getState().drafts[SUSPENDED_THREAD_ID] ?? "", "");
     assert.ok(phases.includes(`layout:${SUSPENDED_THREAD_ID}`));
     assert.ok(phases.includes(`passive:${SUSPENDED_THREAD_ID}`));
@@ -1592,7 +1597,7 @@ test("MessageInput keeps committed ownership when a concurrent transition is aba
   ));
   const visibleTextarea = screen.getByPlaceholderText("Message #general") as HTMLTextAreaElement;
   assert.equal(visibleTextarea.value, "failed before abandoned transition");
-  assert.equal(document.activeElement, visibleTextarea);
+  assert.ok(document.activeElement === visibleTextarea);
 });
 
 test("MessageInput restores structured mentions when retrying a failed send after a thread switch", async () => {
@@ -1602,7 +1607,6 @@ test("MessageInput restores structured mentions when retrying a failed send afte
   const member: ServerMember = {
     userId: "user-teammate",
     email: "team@example.com",
-    gravatarHash: "",
     name: "teammate",
     displayName: "Team Mate",
     description: null,
@@ -1661,7 +1665,6 @@ test("MessageInput preserves failed mentions across unmount, async failure, and 
   const member: ServerMember = {
     userId: "user-teammate",
     email: "team@example.com",
-    gravatarHash: "",
     name: "teammate",
     displayName: "Team Mate",
     description: null,
@@ -1697,8 +1700,8 @@ test("MessageInput preserves failed mentions across unmount, async failure, and 
     useMessageStore.getState().drafts[sourceChannelId],
     "retry after remount @teammate ",
   ));
-  assert.equal(screen.queryByText("Failed to send message"), null);
-  assert.notEqual(document.activeElement, oldTextarea);
+  assert.ok(screen.queryByText("Failed to send message") === null);
+  assert.ok(document.activeElement !== oldTextarea);
 
   // Remount the originating composer and retry. The draft restore effect must
   // recover the structured mention payload that was saved while unmounted.
@@ -1754,7 +1757,7 @@ test("MessageInput restores pending attachments when an accepted send fails afte
     assert.equal(submit.disabled, false);
   });
   textarea.focus();
-  assert.equal(document.activeElement, textarea);
+  assert.ok(document.activeElement === textarea);
 
   await submitForm(form);
 
@@ -1763,8 +1766,8 @@ test("MessageInput restores pending attachments when an accepted send fails afte
   // continuation, so assert the observable call instead of scheduler timing.
   await waitFor(() => assert.equal(sendMessage.calls.length, 1));
   assert.deepEqual(sendMessage.calls[0], { content: "retry with file", attachmentIds: ["attachment-retry-1"] });
-  assert.notEqual(document.activeElement, textarea);
-  assert.equal(screen.queryByText("retry.txt"), null);
+  assert.ok(document.activeElement !== textarea);
+  assert.ok(screen.queryByText("retry.txt") === null);
 
   await act(async () => {
     sendMessage.rejectSend(new Error("network failed"));
@@ -1772,7 +1775,7 @@ test("MessageInput restores pending attachments when an accepted send fails afte
 
   await waitFor(() => assert.equal(textarea.value, "retry with file"));
   assert.ok(screen.getByText("retry.txt"));
-  assert.equal(document.activeElement, textarea);
+  assert.ok(document.activeElement === textarea);
 });
 
 test("MessageInput forwards the exact send contract for attachments, task flag, optimistic ids, randomId, and mentions", async () => {
@@ -1787,7 +1790,6 @@ test("MessageInput forwards the exact send contract for attachments, task flag, 
   const member: ServerMember = {
     userId: "user-teammate",
     email: "team@example.com",
-    gravatarHash: "",
     name: "teammate",
     displayName: "Team Mate",
     description: null,
@@ -1929,8 +1931,7 @@ test("MessageInput upload states block submit with precise labels", async () => 
   assert.equal(failedButton.disabled, true);
   assert.equal(failedButton.getAttribute("title"), null);
   assert.ok(failedButton.hasAttribute("data-base-ui-tooltip-trigger"), "retry-failed tooltip uses the RUI Tooltip");
-  assert.equal(failedButton.getAttribute("aria-label"), "Retry or remove failed attachments");
-  assert.equal(failedButton.querySelector('[role="status"]'), null);
+  assert.ok(failedButton.querySelector('[role="status"]') === null);
   assert.deepEqual(sendMessage.calls, []);
 });
 
@@ -1960,7 +1961,7 @@ test("MessageInput distinguishes byte transfer from server finishing and keeps t
     await screen.findByText("Finishing upload…"),
     "a fully sent request must stop presenting itself as a frozen 99% byte transfer",
   );
-  assert.equal(screen.queryByText("99%"), null);
+  assert.ok(screen.queryByText("99%") === null);
 
   const storageTimeout = Object.assign(new Error("request failed"), {
     response: { data: { error: "Attachment storage timed out" } },
@@ -1979,9 +1980,8 @@ test("MessageInput distinguishes byte transfer from server finishing and keeps t
     /The file reached Raft, but saving it timed out\./,
     "the complete failure reason must also be announced without a hover interaction",
   );
-  assert.equal(
-    visibleFailure.querySelector(".line-clamp-2"),
-    null,
+  assert.ok(
+    visibleFailure.querySelector(".line-clamp-2") === null,
     "the touch-readable failure surface must not truncate the precise reason inside the attachment tile",
   );
   assert.match(visibleFailure.className, /w-full/, "the precise reason needs a full-width surface outside the 64px tile");
@@ -2037,7 +2037,7 @@ test("an older failed request cannot clear the newer draft's duplicate-submit in
   console.error = () => {};
   api.get = withUploadCapability((async () => ({ data: { agents: [], humans: [] } })) as typeof api.get);
   useAuthStore.setState({ user: {
-    id: "user-1", email: "user@example.com", gravatarHash: "", name: "user", displayName: "User",
+    id: "user-1", email: "user@example.com", name: "user", displayName: "User",
     description: null, avatarUrl: null, emailVerified: true, preferredLanguage: null,
     preferredTimezone: null, autoTranslationEnabled: false, preferredTimeFormat: null,
     preferredMessageBodyFontSize: null, referralSource: null, referralSourceOther: null,
@@ -2105,7 +2105,6 @@ test("locale switch preserves the selected @mention payload (@铁根 regression 
   const member: ServerMember = {
     userId: "user-teammate",
     email: "team@example.com",
-    gravatarHash: "",
     name: "teammate",
     displayName: "Team Mate",
     description: null,
@@ -2116,7 +2115,7 @@ test("locale switch preserves the selected @mention payload (@铁根 regression 
   api.get = (async () => ({ data: { agents: [], humans: [] } })) as typeof api.get;
   useAuthStore.setState({
     user: {
-      id: "user-1", email: "user@example.com", gravatarHash: "", name: "user", displayName: "User",
+      id: "user-1", email: "user@example.com", name: "user", displayName: "User",
       description: null, avatarUrl: null, emailVerified: true, preferredLanguage: null,
       preferredTimezone: null, autoTranslationEnabled: false, preferredTimeFormat: null,
       preferredMessageBodyFontSize: null, referralSource: null, referralSourceOther: null,
@@ -2185,7 +2184,6 @@ test("Cmd+Z restores the text and structured payload from before mention complet
   const member: ServerMember = {
     userId: "user-teammate",
     email: "team@example.com",
-    gravatarHash: "",
     name: "teammate",
     displayName: "Team Mate",
     description: null,
@@ -2219,7 +2217,6 @@ test("live lazy-thread adoption preserves mention payload and persists the desti
   const member: ServerMember = {
     userId: "user-teammate",
     email: "team@example.com",
-    gravatarHash: "",
     name: "teammate",
     displayName: "Team Mate",
     description: null,
@@ -2237,6 +2234,12 @@ test("live lazy-thread adoption preserves mention payload and persists the desti
     { members: [member] },
   );
   const textarea = view.textarea;
+  // Drafts persist per signed-in person: user-1, whose session this browser holds.
+  globalThis.localStorage.setItem(
+    "slock_access_token",
+    `e30.${Buffer.from(JSON.stringify({ sub: "user-1", type: "access" })).toString("base64url")}.signature`,
+  );
+  useMessageStore.setState({ currentUserId: "user-1" });
 
   fireEvent.change(textarea, { target: { value: "hello @team" } });
   await waitFor(() => assert.ok(screen.getByText("@teammate")));
@@ -2255,7 +2258,7 @@ test("live lazy-thread adoption preserves mention payload and persists the desti
   const originalSetItem = storagePrototype.setItem;
   let draftStorageWrites = 0;
   storagePrototype.setItem = function (key: string, value: string) {
-    if (key === "slock_drafts") draftStorageWrites += 1;
+    if (key === "slock_drafts:user-1") draftStorageWrites += 1;
     return originalSetItem.call(this, key, value);
   };
 
@@ -2281,12 +2284,14 @@ test("live lazy-thread adoption preserves mention payload and persists the desti
     assert.equal(draftTransitions, 1, "adoption should publish one drafts-store transition");
     assert.equal(draftStorageWrites, 1, "adoption should persist the destination draft once");
     assert.deepEqual(
-      JSON.parse(globalThis.localStorage.getItem("slock_drafts") ?? "{}"),
+      JSON.parse(globalThis.localStorage.getItem("slock_drafts:user-1") ?? "{}"),
       { [durableChannelId]: "hello @teammate " },
     );
   } finally {
     storagePrototype.setItem = originalSetItem;
     unsubscribe();
+    globalThis.localStorage.removeItem("slock_access_token");
+    globalThis.localStorage.removeItem("slock_drafts:user-1");
   }
 
   await submitForm(textarea.closest("form")!);
@@ -2309,7 +2314,6 @@ test("failed lazy-thread send follows the provisional-to-durable composer identi
   const member: ServerMember = {
     userId: "user-teammate",
     email: "team@example.com",
-    gravatarHash: "",
     name: "teammate",
     displayName: "Team Mate",
     description: null,
@@ -2455,8 +2459,8 @@ test("lazy resolve failure stays silent after switching to another channel", asy
 
   await waitFor(() => assert.equal(useMessageStore.getState().drafts[pendingChannelId], "stay in source"));
   assert.equal(useMessageStore.getState().drafts["ordinary-away-resolve"] ?? "", "");
-  assert.equal(screen.queryByText("Failed to create thread"), null);
-  assert.notEqual(document.activeElement, awayTextarea);
+  assert.ok(screen.queryByText("Failed to create thread") === null);
+  assert.ok(document.activeElement !== awayTextarea);
   assert.deepEqual(sendMessage.details, []);
 });
 
@@ -2537,8 +2541,8 @@ test("lazy upload failure stays silent after switching to another channel", asyn
     rejectUpload(new Error("upload failed"));
   });
   await waitFor(() => assert.equal(useMessageStore.getState().drafts[pendingChannelId] ?? "", ""));
-  assert.equal(screen.queryByText("Remove or retry failed attachments before sending."), null);
-  assert.notEqual(document.activeElement, awayTextarea);
+  assert.ok(screen.queryByText("Remove or retry failed attachments before sending.") === null);
+  assert.ok(document.activeElement !== awayTextarea);
   assert.deepEqual(sendMessage.details, []);
 });
 
@@ -2587,8 +2591,8 @@ test("pending lazy-thread upload failure stays with its origin after switching b
   });
 
   await waitFor(() => assert.equal(useMessageStore.getState().drafts[pendingChannelId] ?? "", ""));
-  assert.equal(screen.queryByText("Remove or retry failed attachments before sending."), null);
-  assert.notEqual(document.activeElement, awayTextarea);
+  assert.ok(screen.queryByText("Remove or retry failed attachments before sending.") === null);
+  assert.ok(document.activeElement !== awayTextarea);
 
   await act(async () => {
     view.rerender(
@@ -2602,7 +2606,6 @@ test("pending lazy-thread upload failure stays with its origin after switching b
     );
   });
   await waitFor(() => assert.ok(screen.getByRole("button", { name: "Retry uploading before-resolve.txt" })));
-  assert.ok(screen.getByText("File no longer available or upload failed. Tap to retry."));
 });
 
 test("attachment comment override failure restores only its originating composer after a switch", async () => {
@@ -2641,8 +2644,8 @@ test("attachment comment override failure restores only its originating composer
 
   await waitFor(() => assert.equal(useMessageStore.getState().drafts[sourceChannelId], "retry source comment"));
   assert.equal(useMessageStore.getState().drafts["attachment-comment:other-attachment"] ?? "", "");
-  assert.equal(screen.queryByText("Failed to send message"), null);
-  assert.notEqual(document.activeElement, awayTextarea);
+  assert.ok(screen.queryByText("Failed to send message") === null);
+  assert.ok(document.activeElement !== awayTextarea);
 });
 
 test("ordinary channel switches still clear structured mention payloads", async () => {
@@ -2652,7 +2655,6 @@ test("ordinary channel switches still clear structured mention payloads", async 
   const member: ServerMember = {
     userId: "user-teammate",
     email: "team@example.com",
-    gravatarHash: "",
     name: "teammate",
     displayName: "Team Mate",
     description: null,

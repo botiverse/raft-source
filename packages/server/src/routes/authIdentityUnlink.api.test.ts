@@ -7,9 +7,9 @@ import { and, eq } from "drizzle-orm";
 
 import { getDb } from "../db/index";
 import { passwordResets, userAuthIdentities, users } from "../db/schema";
-import { signAccessToken } from "../middleware/auth";
+import { accessTokenForTest } from "../test/integration/credentials";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 type Provider = "google" | "github" | "apple";
 
@@ -39,9 +39,9 @@ async function seedIdentity(userId: string, provider: Provider) {
   });
 }
 
-function bearer(userId: string) {
+async function bearer(userId: string) {
   return {
-    Authorization: `Bearer ${signAccessToken(userId)}`,
+    Authorization: `Bearer ${await accessTokenForTest(userId)}`,
     "Content-Type": "application/json",
   };
 }
@@ -97,7 +97,7 @@ test("identity unlink keeps at least one established login method and is owner-b
   assert.equal(unauthenticated.status, 401, "unlink is authenticated");
 
   const methodsBefore = await fetch(`${app.baseUrl}/api/auth/identities`, {
-    headers: bearer(passwordlessUser.id),
+    headers: await bearer(passwordlessUser.id),
   });
   assert.equal(methodsBefore.status, 200);
   assert.deepEqual(await methodsBefore.json(), {
@@ -136,7 +136,7 @@ test("identity unlink keeps at least one established login method and is owner-b
 
   const blockedLastIdentity = await fetch(`${app.baseUrl}/api/auth/identities/github`, {
     method: "DELETE",
-    headers: bearer(passwordlessUser.id),
+    headers: await bearer(passwordlessUser.id),
   });
   assert.equal(blockedLastIdentity.status, 409);
   assert.deepEqual(await blockedLastIdentity.json(), {
@@ -150,7 +150,7 @@ test("identity unlink keeps at least one established login method and is owner-b
 
   const firstOfTwo = await fetch(`${app.baseUrl}/api/auth/identities/google`, {
     method: "DELETE",
-    headers: bearer(multiIdentityUser.id),
+    headers: await bearer(multiIdentityUser.id),
   });
   assert.equal(firstOfTwo.status, 200);
   assert.deepEqual(await firstOfTwo.json(), {
@@ -161,18 +161,19 @@ test("identity unlink keeps at least one established login method and is owner-b
 
   const secondOfTwo = await fetch(`${app.baseUrl}/api/auth/identities/github`, {
     method: "DELETE",
-    headers: bearer(multiIdentityUser.id),
+    headers: await bearer(multiIdentityUser.id),
   });
   assert.equal(secondOfTwo.status, 409, "consecutive unlinks cannot strand the account");
 
+  const concurrentHeaders = await bearer(concurrentUser.id);
   const concurrentUnlinks = await Promise.all([
     fetch(`${app.baseUrl}/api/auth/identities/google`, {
       method: "DELETE",
-      headers: bearer(concurrentUser.id),
+      headers: concurrentHeaders,
     }),
     fetch(`${app.baseUrl}/api/auth/identities/github`, {
       method: "DELETE",
-      headers: bearer(concurrentUser.id),
+      headers: concurrentHeaders,
     }),
   ]);
   assert.deepEqual(
@@ -186,7 +187,7 @@ test("identity unlink keeps at least one established login method and is owner-b
 
   const cannotDeleteAnotherHumansIdentity = await fetch(`${app.baseUrl}/api/auth/identities/apple`, {
     method: "DELETE",
-    headers: bearer(unrelatedUser.id),
+    headers: await bearer(unrelatedUser.id),
   });
   assert.equal(cannotDeleteAnotherHumansIdentity.status, 200);
   assert.deepEqual(await cannotDeleteAnotherHumansIdentity.json(), {
@@ -201,7 +202,7 @@ test("identity unlink keeps at least one established login method and is owner-b
 
   const unlinkedLastIdentity = await fetch(`${app.baseUrl}/api/auth/identities/apple`, {
     method: "DELETE",
-    headers: bearer(passwordUser.id),
+    headers: await bearer(passwordUser.id),
   });
   assert.equal(unlinkedLastIdentity.status, 200);
   assert.deepEqual(await unlinkedLastIdentity.json(), {
@@ -212,7 +213,7 @@ test("identity unlink keeps at least one established login method and is owner-b
 
   const replay = await fetch(`${app.baseUrl}/api/auth/identities/apple`, {
     method: "DELETE",
-    headers: bearer(passwordUser.id),
+    headers: await bearer(passwordUser.id),
   });
   assert.equal(replay.status, 200);
   assert.deepEqual(await replay.json(), {
@@ -245,14 +246,14 @@ test("verified password reset establishes the credential that permits final unli
   assert.equal(reset.status, 200);
 
   const methodsAfterReset = await fetch(`${app.baseUrl}/api/auth/identities`, {
-    headers: bearer(user.id),
+    headers: await bearer(user.id),
   });
   assert.equal(methodsAfterReset.status, 200);
   assert.equal((await methodsAfterReset.json() as { passwordConfigured: boolean }).passwordConfigured, true);
 
   const unlink = await fetch(`${app.baseUrl}/api/auth/identities/google`, {
     method: "DELETE",
-    headers: bearer(user.id),
+    headers: await bearer(user.id),
   });
   assert.equal(unlink.status, 200);
   assert.equal((await unlink.json() as { unlinked: boolean }).unlinked, true);

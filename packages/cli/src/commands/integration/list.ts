@@ -34,7 +34,7 @@ export function integrationListJsonResponse(
 export const integrationListCommand = defineCommand(
   {
     name: "list",
-    description: "List the scoped Raft Agent Login service and active-login inventory",
+    description: "List the scoped Raft App inventory: Agent Login services, active logins, and MCP Apps",
     options: [{ flags: "--json", description: "Emit machine-readable JSON" }],
   },
   async (ctx, opts: ListOptions) => {

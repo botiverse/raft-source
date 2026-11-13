@@ -1,4 +1,5 @@
 import { closeTestDatabase, openTestDatabase } from "./integration/database";
+import { fillJointMembersFromChannelHumans } from "./jointMemberFill";
 import { and, eq, isNotNull, sql } from "drizzle-orm";
 import {
   BasicTracer,
@@ -61,9 +62,9 @@ import {
   drainSenderReadReceiptsForTests,
 } from "../services/messageService";
 import {
-  __resetMobilePushDeliveryRuntimeForTests,
-  __setMobilePushDeliveryRuntimeForTests,
-} from "../services/pushService";
+  __resetNotificationDispatchRuntimeForTests,
+  __setNotificationDispatchRuntimeForTests,
+} from "../services/notifications/dispatcher";
 import { withTraceRoot } from "../tracing/semanticTrace";
 import {
   runSlackBridgeFullFlowPreflight,
@@ -393,6 +394,8 @@ async function targetForTopology(
     joinedByUserId: fixture.peer.id,
   }]);
   await getDb().insert(channelHumans).values({ channelId: localChannel.id, userId: fixture.owner.id });
+  // Computed joint membership: the CH row above as a joint member.
+  await fillJointMembersFromChannelHumans();
   return { requestChannelId: localChannel.id, storedChannelId: canonicalChannel.id };
 }
 
@@ -617,10 +620,8 @@ export async function runSlackBridgeExecutableBatchCase(
   hooks: SlackBridgeExecutableBatchHooks = {},
 ): Promise<SlackBridgeExecutableBatchReceipt> {
   await openTestDatabase("pglite://");
-  __setMobilePushDeliveryRuntimeForTests({ schedule: () => undefined });
+  __setNotificationDispatchRuntimeForTests({ schedule: () => undefined });
   __setMessageServiceDepsForTests({
-    sendPushNotifications: async () => undefined,
-    persistNativeNotificationIntents: async () => 0,
     getActiveJointChannelProjectionsByLocalChannel,
     getActiveJointThreadProjectionsByCanonicalThread,
     getJointThreadProjectionForMember,
@@ -766,7 +767,7 @@ export async function runSlackBridgeExecutableBatchCase(
     __resetFailpointsForTests();
     __resetOrdinaryMessageOutboundAuthorizationResolverForTests();
     __resetMessageServiceDepsForTests();
-    __resetMobilePushDeliveryRuntimeForTests();
+    __resetNotificationDispatchRuntimeForTests();
     await drainSenderReadReceiptsForTests();
     await closeTestDatabase();
   }

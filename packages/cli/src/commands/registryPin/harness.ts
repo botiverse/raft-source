@@ -9,7 +9,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
-import type { ApiResponse } from "../../client";
+import type { ApiResponse, BinaryResponse } from "../../client";
 import type { AgentContext } from "../../auth/env";
 import { buildRaftProgram, runRaftArgv } from "../../program";
 
@@ -30,6 +30,8 @@ export interface FakeRoute {
   /** Response data, or a full response for failures. */
   data?: unknown;
   response?: ApiResponse<unknown>;
+  /** A binary route's bytes (a screenshot, a file); `response` still answers a failure. */
+  bytes?: Uint8Array;
 }
 
 export interface PinRun {
@@ -57,6 +59,7 @@ function isolateLocalState(): () => void {
       if (value === undefined) delete process.env[key];
       else process.env[key] = value;
     }
+    fs.rmSync(dir, { recursive: true, force: true });
   };
 }
 
@@ -134,6 +137,15 @@ async function runInCurrentState(
         const route = routes.find((r) => (!r.method || r.method === method) && r.path.test(requestPath));
         if (!route) return { ok: false, status: 404, error: `no fake route for ${method} ${requestPath}`, data: null } as never;
         return route.response ?? { ok: true, status: 200, error: null, data: route.data } as never;
+      },
+      requestBinary: async (method: string, requestPath: string): Promise<BinaryResponse> => {
+        run.requests.push({ method, path: requestPath });
+        const route = routes.find((r) => (!r.method || r.method === method) && r.path.test(requestPath));
+        if (!route) return { ok: false, status: 404, body: null, error: `no fake route for ${method} ${requestPath}`, errorCode: null } as never;
+        if (route.response && !route.response.ok) {
+          return { ok: false, status: route.response.status, body: null, error: route.response.error, errorCode: route.response.errorCode ?? null } as never;
+        }
+        return { ok: true, status: 200, body: route.bytes ?? new Uint8Array(), error: null };
       },
     }) as never,
     helpWidth: 80,

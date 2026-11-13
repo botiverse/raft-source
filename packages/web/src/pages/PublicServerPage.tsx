@@ -1,43 +1,40 @@
-import { lazy, Suspense, useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
-import { BadgeInfo, BookOpenText, Cookie, FileText, Hash, Languages, LogIn, MessageSquare, Type, User, UserPlus } from "lucide-react";
+import { Suspense, useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
+import { BadgeInfo, BookOpenText, Cookie, FileText, Hash, Languages, LogIn, Type, User, UserPlus, X } from "lucide-react";
 import { useIntl } from "react-intl";
 import api from "../api/client";
 import { recordPublicVisit } from "../analytics/publicVisits";
-import { applyPublicVisitorIdMode, publicVisitorId, usePublicVisitorConsent } from "../analytics/publicVisitorConsent";
+import { applyPublicVisitorIdMode, usePublicVisitorConsent } from "../analytics/publicVisitorConsent";
 import PublicCookieConsent from "../components/server/PublicCookieConsent";
 import Banner from "../components/ui/Banner";
-import { AppShellMainSlot, AppShellPanelSlot, AppShellRailSlot, AppShellRoot, AppShellSidebarSlot, Button, ConversationPanelContent, ConversationPanelRoot, Spinner, SidebarItemIcon } from "@botiverse/raft-ui";
+import { AppShellMainSlot, AppShellPanelSlot, AppShellRailSlot, AppShellRoot, AppShellSidebarSlot, Button, ConversationPanelContent, ConversationPanelRoot, ScrollArea, Spinner, SidebarItemIcon } from "@botiverse/raft-ui";
+import { MessageIcon, FeedbackIcon } from "@botiverse/ricons";
 import PanelHeader from "../components/ui/PanelHeader";
-import PanelResizeHandle from "../components/ui/PanelResizeHandle";
+import ColumnResizeHandle from "../components/ui/ColumnResizeHandle";
 import EmptyState from "../components/ui/EmptyState";
+import { useLocation } from "react-router-dom";
+import MessageLinkUnavailable from "../components/deeplinks/MessageLinkUnavailable";
+import { conversationPathOf, usePublicDeepLinksFlag } from "../components/deeplinks/deepLinksFlag";
+import { isMessageLinkLanding, isThreadMismatch, parseMessageLink } from "../utils/messageLinkLanding";
 import type { ReadOnlySenderProjection } from "../components/message/MessageItem";
 import type { OpenThreadRequest } from "../store/threadStore";
 import { PublicMessageRow } from "./PublicMessageRow";
 import { ReadOnlyAttachmentUrlContext } from "../components/message/ReadOnlyMessageAttachments";
 import type { ReadOnlyAttachmentUrls } from "../components/message/ReadOnlyMessageAttachments";
-import { RUNTIME_API_BASE } from "../desktopRuntimeEnvironment";
+import { RUNTIME_API_BASE } from "../runtimeEndpoints";
 import MessageTimeline from "../components/message/MessageTimeline";
 import type { MessageTimelineSource } from "../components/message/MessageTimeline";
-import ThreadPanel from "../components/message/ThreadPanel";
-import type { ReadOnlyThreadData } from "../components/message/ThreadPanel";
+import { ThreadPanel } from "../features/thread/DeferredThreadPanel";
+import type { ReadOnlyThreadData } from "../features/thread/threadPanelTypes";
 import { LeftRail } from "../components/layout/LeftRail";
 import SettingsSidebarList from "../components/settings/SettingsSidebarList";
-import SettingsPanel from "../components/settings/SettingsPanel";
 import type { SettingsTabId } from "../components/settings/settingsNavigation";
-import ConfirmDialog from "../components/ConfirmDialog";
-import CommunityAgreementDialog from "../components/server/CommunityAgreementDialog";
 import PublicServerChannelSidebar from "../components/server/PublicServerChannelSidebar";
 import PublicServerSidebarFrame from "../components/server/PublicServerSidebarFrame";
-import type { CommunityAgreement } from "../components/server/CommunityAgreementDialog";
-import {
-  getThreadPanelDynamicMax,
-  SIDEBAR_PANEL_BOUNDS,
-  THREAD_PANEL_DEFAULT_WIDTH,
-  THREAD_PANEL_MIN_WIDTH,
-} from "../lib/panelBounds";
 import { useMediaQuery } from "../hooks/effectPrimitives";
+import { useFocusRestore } from "../hooks/useFocusRestore";
 import { useTranslationBatch } from "../hooks/useTranslationBatch";
-import { useResizablePanel } from "../hooks/useResizablePanel";
+import { useColumnWidth } from "../store/columnWidthStore";
+import { COLUMN_BOUNDS, fittedColumnStyles } from "../lib/panelBounds";
 import { getApiErrorResponse } from "../utils/apiErrorResponse";
 import { getPublicPersonalSettingsTabIds } from "../utils/translationContract";
 import type { Channel } from "../store/channelStore";
@@ -45,6 +42,7 @@ import type { Message } from "../store/messageStore";
 import { useTranslationStore } from "../store/translationStore";
 import { getServerSurfaceCapabilities } from "@botiverse/raft-shared";
 import type { PublicVisitorIdMode } from "@botiverse/raft-shared";
+import { ReleaseNotesPanel, SettingsPanel } from "./publicServerSettingsPanels";
 
 const PUBLIC_PANEL_RESIZE_QUERY = "(min-width: 640px)";
 
@@ -55,12 +53,23 @@ const CHANNEL_SIDEBAR_NAV = <nav />;
 // it collapses to one character per line.
 // Floating notices are overlays, so they take the DS float shadow.
 const FLOATING_NOTICE_WIDTH_CLASS = "w-[min(30rem,calc(100vw-2rem))] shadow-float";
-const FLOATING_NOTICE_CLASS_TOP = `fixed left-1/2 top-4 z-50 -translate-x-1/2 ${FLOATING_NOTICE_WIDTH_CLASS}`;
-const FLOATING_NOTICE_CLASS_BOTTOM = `fixed bottom-4 left-1/2 z-50 -translate-x-1/2 ${FLOATING_NOTICE_WIDTH_CLASS}`;
+// One place for the page's floating notices: the top centre (cindyz). A join
+// failure is not one of them; it shows inside the join dialog.
+// pr-10 leaves the top-right corner to the notice's close button.
+const FLOATING_NOTICE_CLASS_TOP = `fixed left-1/2 top-4 z-app -translate-x-1/2 pr-10 ${FLOATING_NOTICE_WIDTH_CLASS}`;
+// The close button sits in the notice's top-right corner, not in the action
+// row under the text: a lone × on its own line reads as a second action.
+// top-px centres the 32px button on the first text line (py-2 + half of 18px).
+const FLOATING_NOTICE_CLOSE_CLASS = "absolute right-1 top-px";
+
+function focusedControl(): HTMLElement | null {
+  const active = document.activeElement;
+  return active instanceof HTMLElement && active !== document.body ? active : null;
+}
+
 const noopLoadNewer = () => undefined;
 const SETTINGS_SIDEBAR_ASIDE = <aside />;
 const EMPTY_PUBLIC_CHANNELS: PublicChannel[] = [];
-const ReleaseNotesPanel = lazy(() => import("../components/settings/ReleaseNotesPanel"));
 type PublicSettingsView = SettingsTabId | "release-notes";
 
 interface PublicChannel {
@@ -72,7 +81,6 @@ interface PublicChannel {
 interface PublicServerReadback {
   server: { id: string; name: string; slug: string; avatarUrl: string | null; translationEnabled?: boolean };
   channels: PublicChannel[];
-  canJoinAsGuest: boolean;
   translationAvailable?: boolean;
   /**
    * Present when a visitor id would be kept here: `ask` shows the cookie
@@ -203,7 +211,12 @@ function publicPageReducer(state: PublicPageState, action: PublicPageAction): Pu
         ?? action.readback.channels[0]?.id
         ?? null,
     };
-    case "selectChannel": return { ...state, selectedChannelId: action.channelId, messages: [], hasOlder: false };
+    // Picking the channel already on screen keeps its messages: they are only
+    // fetched when the selected id changes, so clearing them here left the
+    // channel empty ("No messages yet") until a reload (task #134).
+    case "selectChannel": return state.selectedChannelId === action.channelId
+      ? state
+      : { ...state, selectedChannelId: action.channelId, messages: [], hasOlder: false };
     case "loadMessages": return { ...state, loadingMessages: true, error: "" };
     case "messagesLoaded": return { ...state, loadingMessages: false, messages: action.messages, hasOlder: action.messages.length === 50 };
     case "olderLoaded": return state.selectedChannelId === action.channelId
@@ -220,7 +233,6 @@ export default function PublicServerPage({
   onRegister,
   onUnavailable,
   authenticated = false,
-  onJoined,
 }: {
   slug: string;
   /** Channel from a `/s/<slug>/channel/<id>` link; ignored unless it is public. */
@@ -229,7 +241,6 @@ export default function PublicServerPage({
   onRegister: () => void;
   onUnavailable: () => void;
   authenticated?: boolean;
-  onJoined?: () => Promise<void> | void;
 }) {
   const { formatMessage } = useIntl();
   const [state, dispatch] = useReducer(publicPageReducer, {
@@ -251,8 +262,6 @@ export default function PublicServerPage({
       pdfPreview: (attachmentId) => `${base}/${encodeURIComponent(attachmentId)}?disposition=inline`,
     };
   }, [slug]);
-  const [joinConfirmOpen, setJoinConfirmOpen] = useState(false);
-  const [joining, setJoining] = useState(false);
   const visitorChoice = usePublicVisitorConsent();
   const [cookieSettingsOpen, setCookieSettingsOpen] = useState(false);
   // Read when the server's answer arrives, without refetching on sign-in.
@@ -260,8 +269,6 @@ export default function PublicServerPage({
   useEffect(() => {
     authenticatedRef.current = authenticated;
   }, [authenticated]);
-  const [joinError, setJoinError] = useState("");
-  const [agreement, setAgreement] = useState<CommunityAgreement | null>(null);
   const [surfaceMode, setSurfaceMode] = useState<"chat" | "settings">("chat");
   const [settingsTab, setSettingsTab] = useState<PublicSettingsView>(authenticated ? "account" : "about");
   const [serverSelectionNotice, setServerSelectionNotice] = useState(false);
@@ -287,47 +294,10 @@ export default function PublicServerPage({
     return { "data-testid": "public-server-phone-back", "aria-label": label, title: label };
   }, [formatMessage]);
 
-  // Same hook, same bounds and same persistence shape as the signed-in shell — the bounds now come from the shared
-  // panelBounds module so the two surfaces cannot drift apart again (they had: this page allowed wider sidebars and a
-  // narrower thread panel, so the same control behaved differently depending on whether you were signed in).
-  // Keys stay namespaced to this page so a width set here never bleeds into the signed-in widths.
-  const {
-    width: channelSidebarWidth,
-    handleResizeStart: handleChannelSidebarResizeStart,
-    handleResizeMove: handleChannelSidebarResizeMove,
-    handleResizeEnd: handleChannelSidebarResizeEnd,
-  } = useResizablePanel({ storageKey: "slock:publicServer:channelSidebarWidth", ...SIDEBAR_PANEL_BOUNDS });
-  const {
-    width: settingsSidebarWidth,
-    handleResizeStart: handleSettingsSidebarResizeStart,
-    handleResizeMove: handleSettingsSidebarResizeMove,
-    handleResizeEnd: handleSettingsSidebarResizeEnd,
-  } = useResizablePanel({ storageKey: "slock:publicServer:settingsSidebarWidth", ...SIDEBAR_PANEL_BOUNDS });
-  // The thread column mirrors the signed-in one exactly, including the viewport-derived max recomputed at drag start
-  // and the live width measurement — matching only the numbers would still drift in behaviour.
-  const threadPanelRef = useRef<HTMLElement | null>(null);
-  const [threadPanelDynamicMax, setThreadPanelDynamicMax] = useState(() => getThreadPanelDynamicMax());
-  const getThreadPanelDragStartWidth = useCallback(() => {
-    const measured = threadPanelRef.current?.getBoundingClientRect().width;
-    return measured && measured > 0 ? measured : undefined;
-  }, []);
-  const {
-    width: threadPanelWidth,
-    handleResizeStart: beginThreadPanelResize,
-    handleResizeMove: handleThreadPanelResizeMove,
-    handleResizeEnd: handleThreadPanelResizeEnd,
-  } = useResizablePanel({
-    storageKey: "slock:publicServer:threadPanelWidth",
-    min: THREAD_PANEL_MIN_WIDTH,
-    max: threadPanelDynamicMax,
-    defaultWidth: THREAD_PANEL_DEFAULT_WIDTH,
-    direction: "left",
-    getDragStartWidth: getThreadPanelDragStartWidth,
-  });
-  const handleThreadPanelResizeStart = useCallback((event: React.PointerEvent) => {
-    setThreadPanelDynamicMax(getThreadPanelDynamicMax());
-    beginThreadPanelResize(event);
-  }, [beginThreadPanelResize]);
+  // The same remembered widths as the signed-in shell (lib/panelBounds.ts): the channel and settings sidebars are
+  // the one left sidebar, and the thread is the one thread column, wherever they are shown.
+  const sidebarWidth = useColumnWidth("sidebar");
+  const threadPanelWidth = useColumnWidth("thread");
   const [openThread, setOpenThread] = useState<OpenPublicThread | null>(null);
   const [threadMessages, setThreadMessages] = useState<PublicMessage[]>([]);
   const [threadLoading, setThreadLoading] = useState(false);
@@ -427,48 +397,6 @@ export default function PublicServerPage({
     }
   }, [formatMessage, messages, selectedChannelId, slug]);
 
-  const joinAsGuest = useCallback(async (agreementId?: string) => {
-    setJoining(true);
-    setJoinError("");
-    try {
-      // The visitor id from an earlier logged-out cookie consent, if any; the
-      // server links it only for a joiner who shares usage data.
-      const anonymousId = publicVisitorId();
-      await api.post(`/public/servers/${encodeURIComponent(slug)}/join-as-guest`, {
-        agreementId: agreementId ?? null,
-        ...(anonymousId ? { anonymous_id: anonymousId } : {}),
-      });
-      setJoinConfirmOpen(false);
-      setAgreement(null);
-    } catch (err: unknown) {
-      const response = getApiErrorResponse(err);
-      const raw = (err as { response?: { data?: { error?: string; agreement?: CommunityAgreement } } })?.response?.data;
-      if ((raw?.error === "agreement_required" || raw?.error === "agreement_changed") && raw.agreement) {
-        setJoinConfirmOpen(false);
-        setAgreement(raw.agreement);
-        setJoining(false);
-        return;
-      }
-      setJoinError(response?.error || formatMessage({ id: "pages.publicServer.failedJoin" }));
-      setJoining(false);
-      throw err;
-    }
-
-    try {
-      await onJoined?.();
-    } catch {
-      // Membership is already durable. Do not tell the visitor the join failed
-      // and invite an unsafe retry just because the local server-list refresh
-      // or route transition failed.
-      setJoinError(formatMessage({ id: "pages.publicServer.joinedRefresh" }));
-    } finally {
-      setJoining(false);
-    }
-  }, [formatMessage, onJoined, slug]);
-  const confirmJoinAsGuest = useCallback(() => joinAsGuest(), [joinAsGuest]);
-  const openJoinConfirm = useCallback(() => setJoinConfirmOpen(true), []);
-  const closeJoinConfirm = useCallback(() => setJoinConfirmOpen(false), []);
-  const closeAgreement = useCallback(() => setAgreement(null), []);
 
   const selected = readback?.channels.find((channel) => channel.id === selectedChannelId) ?? null;
   const displayChannels = useMemo<Channel[]>(() => (readback?.channels ?? []).map((channel) => ({
@@ -480,12 +408,13 @@ export default function PublicServerPage({
     guestVisible: true,
   })), [readback?.channels, readback?.server.id]);
   const selectPublicChannel = useCallback((channel: Channel) => {
-    pickedChannelId.current = channel.id;
+    // Re-picking the open channel loads nothing, so it is not a channel open.
+    if (channel.id !== selectedChannelId) pickedChannelId.current = channel.id;
     dispatch({ type: "selectChannel", channelId: channel.id });
     setOpenThread(null);
     setSurfaceMode("chat");
     setPhoneView("channel");
-  }, []);
+  }, [selectedChannelId]);
   const selectPublicChannelById = useCallback((channelId: string) => {
     const channel = displayChannels.find((item) => item.id === channelId);
     if (channel) selectPublicChannel(channel);
@@ -533,7 +462,17 @@ export default function PublicServerPage({
     setSettingsTab(tab);
     setSurfaceMode("settings");
   }, []);
-  const showServerSelectionNotice = useCallback(() => setServerSelectionNotice(true), []);
+  const serverSelectionNoticeOpenerRef = useRef<HTMLElement | null>(null);
+  const showServerSelectionNotice = useCallback(() => {
+    serverSelectionNoticeOpenerRef.current = focusedControl();
+    setServerSelectionNotice(true);
+  }, []);
+  // Closing the notice hands keyboard focus back to the control that led to it, instead of dropping it on the page.
+  const restoreNoticeOpenerFocus = useFocusRestore(serverSelectionNoticeOpenerRef);
+  const dismissServerSelectionNotice = useCallback(() => {
+    setServerSelectionNotice(false);
+    restoreNoticeOpenerFocus();
+  }, [restoreNoticeOpenerFocus]);
   const readbackServer = readback?.server;
   const publicProjection = useMemo(() => (readbackServer ? {
     server: readbackServer,
@@ -551,11 +490,6 @@ export default function PublicServerPage({
     surfaceCapabilities.showHelp,
     surfaceMode,
   ]);
-  // Column widths apply only where the columns sit side by side (sm and up).
-  const channelSidebarStyle = useMemo(
-    () => (isSmUp ? { width: channelSidebarWidth } : undefined),
-    [channelSidebarWidth, isSmUp],
-  );
   const settingsLoadingFallback = useMemo(
     () => (
       <div className="flex justify-center p-6">
@@ -563,14 +497,6 @@ export default function PublicServerPage({
       </div>
     ),
     [formatMessage],
-  );
-  const settingsSidebarStyle = useMemo(
-    () => (isSmUp ? { width: settingsSidebarWidth } : undefined),
-    [isSmUp, settingsSidebarWidth],
-  );
-  const threadPanelStyle = useMemo(
-    () => (isSmUp ? { width: threadPanelWidth } : undefined),
-    [isSmUp, threadPanelWidth],
   );
   const loadOlderThreadMessages = useCallback(async () => {
     if (!openThread || threadLoading || threadMessages.length === 0) return;
@@ -662,6 +588,16 @@ export default function PublicServerPage({
       loadOlder: loadOlderThreadMessages,
     };
   }, [adaptedMessages, adaptedThreadMessages, displayChannels, loadOlderThreadMessages, openThread, threadError, threadHasOlder, threadLoading, threadSenderByMessageId]);
+  // Column widths apply only where the columns sit side by side (sm and up, the `sm:w-[...]` rule on each column).
+  // When the window is too narrow for the remembered widths, the thread gives way first, then the sidebar, so the
+  // conversation keeps 360px (lib/panelBounds.ts fitColumnWidths); the columns grid is the size container that rule
+  // measures, so a window resize stays CSS-only.
+  // The thread column renders whenever there is thread data, in Settings too (switching there does not close it).
+  const threadColumnOpen = readOnlyThreadData !== null;
+  const [sidebarColumnStyle, threadPanelStyle] = useMemo(() => fittedColumnStyles([
+    { width: sidebarWidth, min: COLUMN_BOUNDS.sidebar.min },
+    ...(threadColumnOpen ? [{ width: threadPanelWidth, min: Math.min(threadPanelWidth, COLUMN_BOUNDS.thread.contentMin) }] : []),
+  ]), [sidebarWidth, threadColumnOpen, threadPanelWidth]);
   // Logged-out visitors only, and only where the server would keep the id.
   // Asked up front only where the law requires it; elsewhere the id is on by
   // default and Cookie settings opens the same banner to turn it off.
@@ -690,7 +626,7 @@ export default function PublicServerPage({
         { id: "about", label: formatMessage({ id: "layout.sidebar.settingsAbout" }), icon: <SidebarItemIcon><BadgeInfo /></SidebarItemIcon>, onClick: () => setSettingsTab("about"), testId: "workspace-settings-nav-about" },
         { id: "documentation", label: formatMessage({ id: "layout.sidebar.settingsDocumentation" }), icon: <SidebarItemIcon><BookOpenText /></SidebarItemIcon>, href: "https://docs.raft.build", testId: "workspace-settings-nav-documentation" },
         ...(surfaceCapabilities.settingsScope === "account-and-resources" ? [
-          { id: "feedback", label: formatMessage({ id: "settings.about.feedbackTitle" }), icon: <SidebarItemIcon><MessageSquare /></SidebarItemIcon>, onClick: () => setSettingsTab("feedback"), testId: "workspace-settings-nav-feedback" },
+          { id: "feedback", label: formatMessage({ id: "settings.about.feedbackTitle" }), icon: <SidebarItemIcon><FeedbackIcon /></SidebarItemIcon>, onClick: () => setSettingsTab("feedback"), testId: "workspace-settings-nav-feedback" },
           { id: "release-notes", label: formatMessage({ id: "layout.sidebar.settingsReleaseNotes" }), icon: <SidebarItemIcon><FileText /></SidebarItemIcon>, onClick: () => setSettingsTab("release-notes"), testId: "workspace-settings-nav-release-notes" },
         ] : []),
         ...(offerCookieConsent ? [
@@ -706,10 +642,31 @@ export default function PublicServerPage({
     translationAvailable: readback.translationAvailable === true,
     browserLocalPreferences: !authenticated,
   }) : undefined, [authenticated, readback]);
-  const joinable = readback?.canJoinAsGuest === true;
+  // Deep links v1 (item d): a message link into a public server this person
+  // is not in. A link into a public channel keeps the read-only preview of
+  // that channel; the page's own bottom bar (Sign In / Join) is the way to
+  // the message, and the link (query kept, App's handlePublicServerJoined)
+  // opens it once in. Only a link the preview can't show at all (a DM, a
+  // channel that isn't public or doesn't exist, a thread naming another
+  // channel) gets the shared "Message not found" state, with Join to View.
+  // A non-member can't read the server's flag, so this follows the
+  // before-login answer.
+  const location = useLocation();
+  const landedLink = isMessageLinkLanding(location.pathname, location.search)
+    ? parseMessageLink(location.pathname, location.search)
+    : null;
+  const deepLinksOn = usePublicDeepLinksFlag(landedLink !== null);
+  const previewCanShowLink = landedLink !== null
+    && landedLink.routeKind === "channel"
+    && !isThreadMismatch(landedLink)
+    && (readback?.channels ?? EMPTY_PUBLIC_CHANNELS).some((channel) => channel.id === landedLink.channelId);
+  const showLinkUnavailable = landedLink !== null && deepLinksOn && readback !== null && !previewCanShowLink;
+  // Public Guest join is retired (#wg-rbac:#47): a signed-in visitor who is
+  // not a member only reads; a signed-out one can sign in or register.
+  const joinToView = authenticated ? undefined : onSignIn;
   const bottomBannerMessageId = authenticated
-    ? joinable ? "pages.publicServer.joinableAuthenticatedBanner" : "pages.publicServer.viewOnlyAuthenticatedBanner"
-    : joinable ? "pages.publicServer.joinableAnonymousBanner" : "pages.publicServer.viewOnlyAnonymousBanner";
+    ? "pages.publicServer.viewOnlyAuthenticatedBanner"
+    : "pages.publicServer.viewOnlyAnonymousBanner";
 
   // Rendered as the last row of the columns grid, under the conversation and
   // the thread panel, starting at the channel column's right edge (Cindy,
@@ -721,49 +678,28 @@ export default function PublicServerPage({
   <Banner
     intent="info"
     density="sm"
-    // The Banner is a CSS grid: copy at
-    // col-start-1 row-start-1, actions at col-start-2 row-start-1. Its own rule
-    // stacks them below roughly 400px. On phones (below sm) this keeps them on
-    // one row instead, with small text and small buttons: stacked, the banner
-    // was ~105px tall on a 390px phone; side by side it is ~50px with the
-    // sentence on two lines in ~175px (Cindy, #wg-rbac task #123).
-    //
-    // Targets the recipe's published `data-slot` hook rather than :last-child.
-    // These root-level child rules, (0,2,0), outrank the recipe's own
-    // container-query placement on the action, (0,1,0).
+    // The Banner is a CSS grid: copy at col-start-1 row-start-1, actions at
+    // col-start-2 row-start-1, and its own container rule moves the actions
+    // under the copy below roughly 400px. On a phone this banner keeps that
+    // rule and raft-ui's 14px sm text (stdrc, 2026-10-22, option B of the
+    // raft-ui 0.22.0 review): the sentence reads at full width and the buttons
+    // sit below it. Earlier (Cindy, #wg-rbac task #123) phones forced the
+    // buttons onto the text row with footnote text to keep the banner ~50px
+    // tall; that squeezed the sentence into ~175px and shrank it below its
+    // own buttons.
     //
     // Why a grid at all: #7347 replaced slock's own hand-rolled flex Banner
-    // wrapper with a delegation to raft-ui's Banner, whose recipe is a grid. The
-    // raft-ui 0.5.11 -> 0.5.14 bump rode along in the same PR and is NOT the
-    // cause — the recipe's banner layout is identical across those two versions.
-    // A revert of #7347 therefore returns the wrapper to flex and makes every
-    // rule below inert, with no test turning red.
-    //
-    // NOT here on purpose: `max-sm:grid-cols-1`. The recipe declares its columns
-    // via `…:has(>[data-slot=banner-action])`, specificity (0,2,0); a plain
-    // utility is (0,1,0) and a media query adds none, so it loses regardless of
-    // order. It was in an earlier revision doing nothing at all.
-    className="z-10 col-span-full col-start-1 row-start-2 w-full shrink-0 sm:col-span-2 sm:col-start-2 !items-center rounded-none border-x-0 border-b-0 !px-5 max-sm:!px-3 max-sm:!py-2 max-sm:gap-x-2 max-sm:[&>[data-slot=banner-action]]:col-start-2 max-sm:[&>[data-slot=banner-action]]:col-end-auto max-sm:[&>[data-slot=banner-action]]:row-start-1 max-sm:[&>[data-slot=banner-action]]:mt-0 max-sm:[&>[data-slot=banner-action]]:justify-self-end"
+    // wrapper with a delegation to raft-ui's Banner, whose recipe is a grid.
+    className="z-chrome col-span-full col-start-1 row-start-2 w-full shrink-0 sm:col-span-2 sm:col-start-2 !items-center rounded-none border-x-0 border-b-0 !px-5 max-sm:!px-3 max-sm:!py-2 max-sm:gap-x-2"
     data-testid="public-server-bottom-action"
-    actions={authenticated ? (
-      joinable ? (
-        <Button size="sm" variant="accent" onClick={openJoinConfirm} disabled={joining} data-testid="public-server-join-guest">
-          <UserPlus className="size-4" />{formatMessage({ id: "pages.publicServer.joinAsGuest" })}
-        </Button>
-      ) : null
-    ) : joinable ? (
+    actions={authenticated ? null : (
       <div className="flex items-center gap-2">
-        <Button size="sm" variant="accent" onClick={onSignIn}><LogIn className="size-4" />{formatMessage({ id: "pages.publicServer.signIn" })}</Button>
-        <Button size="sm" variant="outline" onClick={onRegister}><UserPlus className="size-4" />{formatMessage({ id: "pages.publicServer.join" })}</Button>
-      </div>
-    ) : (
-      <div className="flex items-center gap-2">
-        <Button size="sm" variant="accent" onClick={onRegister}><UserPlus className="size-4" />{formatMessage({ id: "pages.publicServer.join" })}</Button>
-        <Button size="sm" variant="outline" onClick={onSignIn}><LogIn className="size-4" />{formatMessage({ id: "pages.publicServer.signIn" })}</Button>
+        <Button size="md" variant="accent" onClick={onRegister}><UserPlus className="size-4" />{formatMessage({ id: "pages.publicServer.join" })}</Button>
+        <Button size="md" variant="outline" onClick={onSignIn}><LogIn className="size-4" />{formatMessage({ id: "pages.publicServer.signIn" })}</Button>
       </div>
     )}
   >
-    <span className="text-callout font-bold max-sm:text-footnote" data-testid="public-server-bottom-action-copy">
+    <span className="font-bold" data-testid="public-server-bottom-action-copy">
       {formatMessage({ id: bottomBannerMessageId }, { server: readback?.server.name ?? slug })}
     </span>
   </Banner>
@@ -805,18 +741,10 @@ export default function PublicServerPage({
             On phones the banner keeps the full width and the thread panel
             overlays the first row by grid placement instead of absolute
             positioning, so it still stops above the banner. */}
-        <div className="relative grid min-h-0 flex-1 grid-cols-[auto_minmax(0,1fr)_auto] grid-rows-[minmax(0,1fr)_auto]" data-testid="public-server-columns">
+        <div className="@container relative grid min-h-0 flex-1 grid-cols-[auto_minmax(0,1fr)_auto] grid-rows-[minmax(0,1fr)_auto]" data-testid="public-server-columns">
 
-        {surfaceMode === "chat" ? <AppShellSidebarSlot render={CHANNEL_SIDEBAR_NAV} className={`relative col-start-1 row-start-1 flex shrink-0 flex-col sm:row-span-2 sm:w-[240px] ${phoneShowsList ? "col-span-full w-full" : ""} ${phoneShowsChannel ? "hidden" : ""}`} style={channelSidebarStyle} aria-label={formatMessage({ id: "pages.publicServer.channelsLabel" })} data-testid="public-server-channel-sidebar">
-          <PanelResizeHandle
-            side="right"
-            visibleFrom="sm"
-            onPointerDown={handleChannelSidebarResizeStart}
-            onPointerMove={handleChannelSidebarResizeMove}
-            onPointerUp={handleChannelSidebarResizeEnd}
-            onPointerCancel={handleChannelSidebarResizeEnd}
-            data-testid="public-server-channel-sidebar-resize-handle"
-          />
+        {surfaceMode === "chat" ? <AppShellSidebarSlot render={CHANNEL_SIDEBAR_NAV} className={`relative col-start-1 row-start-1 flex shrink-0 flex-col sm:row-span-2 sm:w-[max(var(--column-min),min(var(--column-width),calc(100cqw_-_var(--column-allowance))))] ${phoneShowsList ? "col-span-full w-full" : ""} ${phoneShowsChannel ? "hidden" : ""}`} style={sidebarColumnStyle} aria-label={formatMessage({ id: "pages.publicServer.channelsLabel" })} data-testid="public-server-channel-sidebar">
+          <ColumnResizeHandle column="sidebar" edge="right" visibleFrom="sm" data-testid="public-server-channel-sidebar-resize-handle" />
           {/* The scroll lives INSIDE the column: an overflow container clips an absolutely positioned handle that
               straddles its edge, so the divider existed but could not be grabbed (caught in a real browser —
               elementFromPoint at the handle's own centre returned the nav). */}
@@ -832,15 +760,17 @@ export default function PublicServerPage({
             // menu are not shown, so this is the way back to the choice there.
             // Same breakpoint as the rail, or 640-767px had neither (John, #9872).
             <div className="shrink-0 px-3 py-2 md:hidden" data-testid="public-server-cookie-settings-phone-slot">
-              <Button size="sm" variant="ghost" onClick={openCookieSettings} data-testid="public-server-cookie-settings-phone">
+              <Button size="md" variant="ghost" onClick={openCookieSettings} data-testid="public-server-cookie-settings-phone">
                 <Cookie className="size-4" />{formatMessage({ id: "pages.publicServer.cookieSettings" })}
               </Button>
             </div>
           ) : null}
         </AppShellSidebarSlot> : null}
 
-        {surfaceMode === "chat" ? <AppShellMainSlot className={`col-start-2 row-start-1 min-h-0 min-w-0 bg-layer-canvas ${phoneShowsChannel ? "col-span-full col-start-1" : ""} ${phoneShowsList ? "hidden" : ""}`} data-testid="public-server-channel-panel">
-          {selected ? (
+        {surfaceMode === "chat" ? <AppShellMainSlot className={`col-start-2 row-start-1 min-h-0 min-w-0 bg-layer-canvas ${phoneShowsChannel ? "col-span-full col-start-1" : ""} ${phoneShowsList ? "hidden" : ""}`} data-testid="public-server-channel-panel" data-main-column="">
+          {showLinkUnavailable && landedLink ? (
+            <MessageLinkUnavailable backTo={conversationPathOf(landedLink)} onJoin={joinToView} />
+          ) : selected ? (
             <ConversationPanelRoot edge="inset" className="relative">
               <PanelHeader
                 title={selected.name}
@@ -856,7 +786,11 @@ export default function PublicServerPage({
                 mobileBackProps={phoneBackProps}
               />
               <ConversationPanelContent>
-              {error ? <Banner intent="warning" className="m-3 shrink-0">{error}</Banner> : null}
+              {error ? (
+                <div className="shrink-0 p-3">
+                  <Banner intent="warning">{error}</Banner>
+                </div>
+              ) : null}
               <div className="relative min-h-0 flex-1 overflow-hidden" aria-live="polite">
                 {messages.length > 0 ? (
                   <MessageTimeline
@@ -872,7 +806,7 @@ export default function PublicServerPage({
                 {!loadingMessages && messages.length === 0 ? (
                   <EmptyState
                     className="flex h-full flex-col items-center justify-center"
-                    icon={<MessageSquare size={36} />}
+                    icon={<MessageIcon width={36} height={36} />}
                     title={formatMessage({ id: "pages.publicServer.emptyMessages" })}
                     data-testid="public-server-empty-messages"
                   />
@@ -895,16 +829,8 @@ export default function PublicServerPage({
           )}
         </AppShellMainSlot> : (
           <>
-            <AppShellSidebarSlot render={SETTINGS_SIDEBAR_ASIDE} className="relative col-start-1 row-start-1 flex w-36 shrink-0 flex-col sm:row-span-2 sm:w-[240px]" style={settingsSidebarStyle} data-testid="public-server-settings-sidebar">
-              <PanelResizeHandle
-                side="right"
-                visibleFrom="sm"
-                onPointerDown={handleSettingsSidebarResizeStart}
-                onPointerMove={handleSettingsSidebarResizeMove}
-                onPointerUp={handleSettingsSidebarResizeEnd}
-                onPointerCancel={handleSettingsSidebarResizeEnd}
-                data-testid="public-server-settings-sidebar-resize-handle"
-              />
+            <AppShellSidebarSlot render={SETTINGS_SIDEBAR_ASIDE} className="relative col-start-1 row-start-1 flex w-36 shrink-0 flex-col sm:row-span-2 sm:w-[max(var(--column-min),min(var(--column-width),calc(100cqw_-_var(--column-allowance))))]" style={sidebarColumnStyle} data-testid="public-server-settings-sidebar">
+              <ColumnResizeHandle column="sidebar" edge="right" visibleFrom="sm" data-testid="public-server-settings-sidebar-resize-handle" />
               <PublicServerSidebarFrame
                 title={formatMessage({ id: "layout.sidebar.headerSettings" })}
                 testIdPrefix="public-server-settings-sidebar"
@@ -915,32 +841,37 @@ export default function PublicServerPage({
                 </nav>
               </PublicServerSidebarFrame>
             </AppShellSidebarSlot>
-            <AppShellMainSlot className="col-start-2 row-start-1 min-h-0 min-w-0 bg-layer-canvas" data-testid="public-server-settings-surface">
+            <AppShellMainSlot className="col-start-2 row-start-1 min-h-0 min-w-0 bg-layer-canvas" data-testid="public-server-settings-surface" data-main-column="">
               {/* A flex column, as the member layout gives it: the settings panel frame
                   then fills the height and its left edge runs to the bottom (cindyz,
                   #wg-rbac:dadde6b1). As a plain block it stopped where the content did. */}
-              <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-y-auto">
+              {/* A raft-ui ScrollArea; its gutters layer is a zero-height first row of the column. */}
+              <ScrollArea className="flex min-h-0 min-w-0 flex-1 flex-col" data-testid="public-server-settings-scroll">
                 {settingsTab === "release-notes" ? (
                   <Suspense fallback={settingsLoadingFallback}>
                     <ReleaseNotesPanel />
                   </Suspense>
-                ) : <SettingsPanel
-                  tab={settingsTab}
-                  showAboutWorkspace={false}
-                  publicTranslationContext={publicTranslationContext}
-                  publicSurface
-                />}
-              </div>
+                ) : (
+                  <Suspense fallback={settingsLoadingFallback}>
+                    <SettingsPanel
+                      tab={settingsTab}
+                      showAboutWorkspace={false}
+                      publicTranslationContext={publicTranslationContext}
+                      publicSurface
+                    />
+                  </Suspense>
+                )}
+              </ScrollArea>
             </AppShellMainSlot>
           </>
         )}
         {/* `sm:relative` (not `sm:static`) gives the resize handle below its positioning context. Side effect worth
-            knowing: it also makes the `z-20` — previously mobile-only, when this panel was a full-screen overlay —
+            knowing: it also makes the `z-cover` — previously mobile-only, when this panel was a full-screen overlay —
             apply at sm and above, so this column now stacks above the main column. That is what the -left-1 handle
             needs, but a future floating element on the main column's right edge would collide here
             (@Bugen, review of PR #7983). */}
-        {/* `max-md:z-40`, the same breakpoint as the channel column's
-            PanelHeader (`max-md:sticky max-md:z-30`). At z-20 that header
+        {/* `z-cover`, over the channel column's PanelHeader
+            (`max-md:sticky max-md:z-chrome`). Under it, that header
             painted over the thread's own header: on phones the thread covers
             the channel (its title read "Thread — # general" with the channel
             name on top), and from 640px the squeezed channel column's header
@@ -950,15 +881,8 @@ export default function PublicServerPage({
             as in the signed-in app. One here as well doubled it into two
             1px lines (cindyz, #wg-rbac task #126). */}
         {readOnlyThreadData ? (
-          <AppShellPanelSlot ref={threadPanelRef} className="relative z-20 max-md:z-40 col-span-full col-start-1 row-start-1 flex min-h-0 bg-layer-canvas sm:col-span-1 sm:col-start-3 sm:w-[380px]" style={threadPanelStyle} data-testid="public-server-thread-panel">            <PanelResizeHandle
-              side="left"
-              visibleFrom="sm"
-              onPointerDown={handleThreadPanelResizeStart}
-              onPointerMove={handleThreadPanelResizeMove}
-              onPointerUp={handleThreadPanelResizeEnd}
-              onPointerCancel={handleThreadPanelResizeEnd}
-              data-testid="public-server-thread-panel-resize-handle"
-            />
+          <AppShellPanelSlot className="relative z-cover col-span-full col-start-1 row-start-1 flex min-h-0 bg-layer-canvas sm:col-span-1 sm:col-start-3 sm:w-[max(var(--column-min),min(var(--column-width),calc(100cqw_-_var(--column-allowance))))]" style={threadPanelStyle} data-testid="public-server-thread-panel">
+            <ColumnResizeHandle column="thread" edge="left" visibleFrom="sm" data-testid="public-server-thread-panel-resize-handle" />
             <ThreadPanel
               presentation="side"
               onClose={closeThread}
@@ -973,7 +897,7 @@ export default function PublicServerPage({
           // time. Choosing brings the join / sign-in actions straight back.
           // It is in the grid, not floating, so it never covers the
           // conversation (John, #9870).
-          <div className="z-10 col-span-full col-start-1 row-start-2 flex min-w-0 flex-col sm:col-span-2 sm:col-start-2" data-testid="public-server-bottom-slot">
+          <div className="z-chrome col-span-full col-start-1 row-start-2 flex min-w-0 flex-col sm:col-span-2 sm:col-start-2" data-testid="public-server-bottom-slot">
             <PublicCookieConsent onDone={closeCookieConsent} />
           </div>
         ) : bottomBanner}
@@ -982,29 +906,12 @@ export default function PublicServerPage({
       </div>
 
       {serverSelectionNotice ? (
-        <Banner intent="info" density="sm" className={FLOATING_NOTICE_CLASS_TOP} data-testid="public-server-selection-notice" actions={<Button size="sm" variant="outline" onClick={onSignIn}>{formatMessage({ id: "pages.publicServer.signIn" })}</Button>}>
+        <Banner intent="info" density="sm" className={FLOATING_NOTICE_CLASS_TOP} data-testid="public-server-selection-notice" actions={<Button size="md" variant="outline" onClick={onSignIn}>{formatMessage({ id: "pages.publicServer.signIn" })}</Button>}>
           {formatMessage({ id: "pages.publicServer.banner" })}
+          <Button type="button" size="icon-md" variant="ghost" className={FLOATING_NOTICE_CLOSE_CLASS} onClick={dismissServerSelectionNotice} aria-label={formatMessage({ id: "common.close" })} data-testid="public-server-selection-notice-close">
+            <X aria-hidden="true" />
+          </Button>
         </Banner>
-      ) : null}
-
-      {joinError ? <Banner intent="warning" density="sm" className={FLOATING_NOTICE_CLASS_BOTTOM} data-testid="public-server-join-error">{joinError}</Banner> : null}
-      {joinConfirmOpen ? (
-        <ConfirmDialog
-          title={formatMessage({ id: "pages.publicServer.joinConfirmTitle" })}
-          message={formatMessage({ id: "pages.publicServer.joinConfirmDescription" }, { server: readback?.server.name ?? slug })}
-          confirmLabel={formatMessage({ id: "pages.publicServer.joinAsGuest" })}
-          loadingLabel={formatMessage({ id: "server.communityAgreement.joining" })}
-          confirmVariant="accent"
-          onConfirm={confirmJoinAsGuest}
-          onClose={closeJoinConfirm}
-        />
-      ) : null}
-      {agreement ? (
-        <CommunityAgreementDialog
-          agreement={agreement}
-          onAgree={joinAsGuest}
-          onClose={closeAgreement}
-        />
       ) : null}
     </AppShellRoot>
     </ReadOnlyAttachmentUrlContext.Provider>

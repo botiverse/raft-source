@@ -75,6 +75,9 @@ export function getComputerAvailableVersion(
   latestComputerVersion: string | null | undefined,
 ): string | null {
   if (machine.isComputer !== true) return null;
+  // Raft Desktop updates its bundled Computer itself: nothing for the row to
+  // point at or mark as waiting for an upgrade.
+  if (machine.computerBroadcastPolicy?.reasonCode === "managed_by_desktop") return null;
   const fact = getComputerVersionFact(machine, latestComputerVersion);
   if (fact.kind === "outdated") return fact.availableVersion;
   const policy = machine.computerBroadcastPolicy;

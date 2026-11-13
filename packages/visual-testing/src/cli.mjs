@@ -35,6 +35,7 @@ const defaultManifestPath = path.join(artifactRoot, "visual-testing-cases.json")
 const inventoryPath = path.join(artifactRoot, "react-component-inventory.json");
 const providerSpecPath = path.join(artifactRoot, "provider-spec.json");
 const sharpImageDiffScriptPath = path.join(packageRoot, "src", "sharp-image-diff.mjs");
+const fullLengthTrimScriptPath = path.join(packageRoot, "src", "full-length-trim.mjs");
 const sharpImageOverlayScriptPath = path.join(packageRoot, "src", "sharp-image-overlay.mjs");
 const analysisRoot = path.join(resultRoot, "analysis");
 const analyzeConcurrencyLimit = 6;
@@ -128,7 +129,7 @@ const defaultCases = [
   {
     id: "home.sidebar.channels-expanded",
     surface: "home",
-    reactPathHint: "packages/web/src/components/layout/Sidebar.tsx",
+    reactPathHint: "packages/web/src/features/sidebar/Sidebar.tsx",
     androidCaseHint: "compose_home_sidebar_channels_expanded",
     selector: "[data-testid='sidebar-section-toggle-channels']",
   },
@@ -1111,6 +1112,15 @@ function diffPair(flags, pair) {
       entry.note = `Ignored non-real provider capture(s): ${ignoredProviders.join(", ")}`;
     }
     if (baselineImage && currentImage) {
+      if (visualCase.capture?.fullLength) {
+        // Same blank-tail margin on both sides before hashing and scoring (see
+        // full-length-trim.mjs). Rewrites the capture in place, so the site
+        // shows exactly what was scored; idempotent across pairs.
+        entry.fullLengthTrim = {
+          [baseline]: trimFullLengthTail(baselineImage, visualCase),
+          [current]: trimFullLengthTail(currentImage, visualCase),
+        };
+      }
       const baselineHash = hashFile(baselineImage);
       const currentHash = hashFile(currentImage);
       entry.baselineSha256 = baselineHash;
@@ -1127,7 +1137,9 @@ function diffPair(flags, pair) {
         entry.metrics = metrics;
         entry.status = comparisonStatusFromMetrics(entry.rawStatus, metrics, thresholds);
         if (entry.status !== entry.rawStatus) entry.acceptance = comparisonAcceptance(entry.status, metrics, thresholds);
-        entry.note = "Side-by-side and site raw captures preserve provider image sizes. Metrics use an in-memory comparison canvas: rgbSimilarity rescales for coarse color similarity, while pixelPerfectSimilarity pads the original images without cropping.";
+        entry.note = metrics.fullLength
+          ? "Full-length capture: raw long screenshots, never rescaled. Both metrics pad the shorter image to the taller canvas with a marker colour and count every padded pixel as a mismatch, so a missing or extra tail lowers the score."
+          : "Side-by-side and site raw captures preserve provider image sizes. Metrics use an in-memory comparison canvas: rgbSimilarity rescales for coarse color similarity, while pixelPerfectSimilarity pads the original images without cropping.";
       } else {
         entry.note = "File-level comparison only; PNG metrics require PNG inputs.";
       }
@@ -1173,6 +1185,22 @@ function comparisonAcceptance(status, metrics, thresholds) {
   return "";
 }
 
+function trimFullLengthTail(image, visualCase) {
+  if (path.extname(image).toLowerCase() !== ".png") return null;
+  const result = spawnSync("node", [fullLengthTrimScriptPath, image, String(visualCase.viewport?.width || 390)], {
+    cwd: repoRoot,
+    encoding: "utf8",
+  });
+  if (result.status !== 0) {
+    throw new Error(`full-length tail trim failed for ${path.basename(image)}: ${result.stderr || result.status}`);
+  }
+  try {
+    return JSON.parse(String(result.stdout).trim().split("\n").pop());
+  } catch {
+    return null;
+  }
+}
+
 function runImageDiff(baselineImage, currentImage, sideBySidePath, metricsPath, visualCase, baseline, current) {
   ensureDir(path.dirname(sideBySidePath));
   const result = spawnSync(
@@ -1187,6 +1215,7 @@ function runImageDiff(baselineImage, currentImage, sideBySidePath, metricsPath, 
       visualCase.title || visualCase.id,
       providerLabel(baseline),
       providerLabel(current),
+      ...(visualCase.capture?.fullLength ? ["full-length"] : []),
     ],
     { stdio: "inherit", cwd: repoRoot },
   );
@@ -1322,16 +1351,6 @@ function comparisonMetadataEntries(pairs) {
   }));
 }
 
-function pairSiteMetadata(metadata, pair) {
-  return {
-    ...metadata,
-    current: pair.current,
-    comparison: pair.comparison,
-    summary: pair.diffData.summary || {},
-    analysisSummary: pair.diffData.analysis?.summary || {},
-    componentMatrix: pair.componentMatrix,
-  };
-}
 
 async function report(flags) {
   const manifest = loadManifest(flags);
@@ -1352,12 +1371,11 @@ async function report(flags) {
     componentMatrix: primary.componentMatrix,
   };
   ensureDir(resultRoot);
-  for (const pair of pairs) {
-    const html = visualDetailHtml(pair.diffData, pairSiteMetadata(metadata, pair), "", "./");
-    const outputPath = path.join(resultRoot, pair.detailHref);
-    fs.writeFileSync(outputPath, html);
-    console.log(`report: ${path.relative(process.cwd(), outputPath)}`);
-  }
+  // The local report is the site's home page too (the yellow per-pair page is retired).
+  const homeCases = siteHomeCases(primary.diffData, metadata, manifest.cases || [], pairs.slice(1));
+  const outputPath = path.join(resultRoot, "index.html");
+  fs.writeFileSync(outputPath, siteHomeHtml(metadata, [], rebaseLatestPaths(homeCases)));
+  console.log(`report: ${path.relative(process.cwd(), outputPath)}`);
 }
 
 async function analyze(flags) {
@@ -1877,10 +1895,9 @@ async function site(flags) {
     componentMatrixSummary: summarizeComponentMatrix(primary.componentMatrix),
     componentMatrix: primary.componentMatrix,
   };
-  writeRunContent(latestDir, pairs, metadata, "../");
-  writeRunContent(runDir, pairs, metadata, "../../");
   const homeCases = siteHomeCases(primary.diffData, metadata, manifest.cases || [], pairs.slice(1));
-  writeJson(path.join(latestDir, "home-cases.json"), { generatedAt: metadata.generatedAt, runId, cases: homeCases });
+  writeRunContent(latestDir, pairs, metadata, "../", homeCases);
+  writeRunContent(runDir, pairs, metadata, "../../", homeCases);
   const runs = [runSummary(metadata, `runs/${runId}/`)];
   writeJson(path.join(targetRoot, "metadata.json"), metadata);
   writeJson(path.join(targetRoot, "index.json"), siteIndexJson(metadata, runs));
@@ -1895,14 +1912,16 @@ function shouldRunAnalysis(flags) {
   return !flags["skip-analysis"] && !flags["no-analysis"] && !flags["dry-run"];
 }
 
-function writeRunContent(targetDir, pairs, metadata, homeHref) {
+function writeRunContent(targetDir, pairs, metadata, homeHref, homeCases) {
   for (const pair of pairs) {
     copyFileIntoSite(path.join(resultRoot, "diff", `${pair.comparison}.json`), path.join(targetDir, "diff", `${pair.comparison}.json`));
     copyFileIntoSite(analysisPath(pair.comparison), path.join(targetDir, "analysis", `${pair.comparison}.json`));
     copyCurrentResultFiles(pair.diffData, targetDir, pair.comparison);
-    const html = siteIndexHtml(pair.diffData, pairSiteMetadata(metadata, pair), "", homeHref);
-    fs.writeFileSync(path.join(targetDir, pair.detailHref), html);
   }
+  // One report (artin 2026-11-02: the yellow per-run page is retired): the directory's
+  // index.html is the same home page as the site root, showing this run.
+  writeJson(path.join(targetDir, "home-cases.json"), { generatedAt: metadata.generatedAt, runId: metadata.runId, cases: homeCases });
+  fs.writeFileSync(path.join(targetDir, "index.html"), siteHomeHtmlForDir(metadata, homeCases, homeHref));
   writeJson(path.join(targetDir, "component-matrix.json"), {
     generatedAt: metadata.generatedAt,
     runId: metadata.runId,
@@ -2069,365 +2088,17 @@ function copyRelativeResultFile(relativePath, latestDir) {
   copyFileIntoSite(absolutePath, path.join(latestDir, path.relative(resultRoot, absolutePath)));
 }
 
-function siteIndexHtml(diffData, metadata, latestPrefix, homeHref = "./") {
-  return visualDetailHtml(diffData, metadata, latestPrefix, homeHref);
-}
 
-function comparisonNavHtml(metadata) {
-  const comparisons = metadata.comparisons || [];
-  if (comparisons.length < 2) return "";
-  const links = comparisons.map((pair) => {
-    const label = `${providerLabel(pair.baseline)} vs ${providerLabel(pair.current)}`;
-    return pair.comparison === metadata.comparison
-      ? `<strong>${xmlEscape(label)}</strong>`
-      : `<a href="${xmlEscape(pair.detailHref || `${pair.comparison}.html`)}">${xmlEscape(label)}</a>`;
-  });
-  return `<p class="runMeta">Comparisons: ${links.join(" · ")}</p>`;
-}
 
-function visualDetailHtml(diffData, metadata, latestPrefix, homeHref = "./") {
-  const matrixHref = `${latestPrefix}component-matrix.json`;
-  const diffJsonHref = `${latestPrefix}diff/${metadata.comparison}.json`;
-  const metadataHref = `${latestPrefix}metadata.json`;
-  const tree = categoryTreeHtml(diffData.results || [], latestPrefix);
-  const groups = groupedCaseCards(diffData.results || [], latestPrefix);
-  const analysisSummary = diffData.analysis?.summary || metadata.analysisSummary || {};
-  const capturePills = captureTypeSummaryPills(metadata.componentMatrixSummary);
-  const rows = groups.map((group) => {
-    const cards = group.items.map((item) => caseCardHtml(item, latestPrefix)).join("\n");
-    return `<section class="caseGroup" id="group-${xmlEscape(anchorId(group.category))}">
-      <h2>${xmlEscape(group.category)}</h2>
-      <div class="grid">${cards}</div>
-    </section>`;
-  }).join("\n");
-  const matrixRows = componentMatrixHtml(metadata.componentMatrix || []);
-  const matrixSection = matrixRows
-    ? `<section class="machineData">
-      <details>
-        <summary>Visual coverage matrix</summary>
-        <div class="matrix">
-          <table>
-            <thead><tr><th>Type</th><th>Group</th><th>Case</th><th>Status</th><th>Providers</th><th>${xmlEscape(metadata.baseline)} vs ${xmlEscape(metadata.current)}</th></tr></thead>
-            <tbody>${matrixRows}</tbody>
-          </table>
-        </div>
-      </details>
-    </section>`
-    : "";
-  return `<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8"/>
-  <link rel="icon" type="image/png" href="data:image/png;base64,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"/>
-  <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <title>Raft Visual Testing</title>
-  <style>
-    body { margin: 24px; color: #141111; background: #fffaf0; font-family: system-ui, sans-serif; }
-    header { max-width: 1180px; margin: 0 auto 24px; }
-    h1 { margin: 0 0 8px; font-size: 32px; }
-    h1 a { text-decoration: none; }
-    h2 { margin: 0 0 12px; font-size: 20px; }
-    a { color: #141111; font-weight: 700; }
-    .summary { display: flex; flex-wrap: wrap; gap: 8px; margin: 16px 0; }
-    .pill { border: 2px solid #141111; background: #fff; padding: 6px 10px; box-shadow: 3px 3px 0 #141111; }
-    .layout { display: grid; grid-template-columns: 250px minmax(0, 1fr); gap: 18px; max-width: 1180px; margin: 0 auto; align-items: start; }
-    nav.tree { position: sticky; top: 16px; max-height: calc(100vh - 32px); overflow-y: auto; border: 2px solid #141111; background: #fff; padding: 12px; box-shadow: 4px 4px 0 #141111; }
-    nav.tree ul { list-style: none; margin: 0; padding-left: 12px; }
-    nav.tree > ul { padding-left: 0; }
-    nav.tree li { margin: 6px 0; }
-    nav.tree a { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 5px 6px; margin: 0 -6px; font-size: 12px; text-decoration: none; }
-    nav.tree a:hover { background: #fffaf0; outline: 1px solid #141111; }
-    nav.tree a code { color: #6b625f; font-size: 11px; }
-    .caseGroup { margin-bottom: 24px; scroll-margin-top: 16px; }
-    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 18px; }
-    .case { border: 2px solid #141111; background: #fff; padding: 12px; box-shadow: 4px 4px 0 #141111; scroll-margin-top: 16px; }
-    .caseHeader { display: flex; justify-content: space-between; gap: 12px; align-items: flex-start; margin-bottom: 10px; }
-    /* Long dotted case ids must wrap on narrow (phone) viewports instead of
-       pushing the status badge past the right edge of the document. */
-    .caseHeader > div { min-width: 0; }
-    .caseHeader code { overflow-wrap: anywhere; }
-    .caseHeader span { display: block; margin-top: 4px; color: #6b625f; font-size: 13px; }
-    .case img { width: 100%; display: block; border: 1px solid #141111; background: #fff; }
-    .case img.sideBySide { width: 100%; height: auto; object-fit: contain; }
-    .overlayComparison { margin-top: 10px; border: 1px solid #141111; background: #fffaf0; padding: 8px; }
-    .overlayComparison summary { cursor: pointer; font-weight: 800; }
-    .overlayControls { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin: 8px 0; font-size: 12px; }
-    .overlayControls label { display: inline-flex; align-items: center; gap: 6px; font-weight: 700; }
-    .overlayControls select, .overlayControls input { accent-color: #FFD440; }
-    .overlayControls button { border: 1px solid #141111; background: #fff; padding: 3px 6px; font-size: 12px; font-weight: 800; box-shadow: 2px 2px 0 #141111; cursor: pointer; }
-    .overlayCanvasWrap { overflow: auto; border: 1px solid #cfc7c2; background: #fff; }
-    .overlayCanvasWrap canvas { display: block; width: 100%; height: auto; image-rendering: auto; touch-action: none; cursor: crosshair; }
-    .overlayComparison[data-overlay-mode='split'] .overlayCanvasWrap canvas { cursor: ew-resize; }
-    .overlayComparison[data-overlay-mode='align'] .overlayCanvasWrap canvas { cursor: move; }
-    .rawCaptures { margin-top: 10px; }
-    .rawCaptures summary { cursor: pointer; font-weight: 800; }
-    .rawGrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px; margin-top: 8px; }
-    .rawPanel { border: 1px solid #141111; background: #fffaf0; padding: 8px; overflow: auto; }
-    .rawPanel strong { display: block; margin-bottom: 6px; font-size: 12px; }
-    .rawPanel img { width: auto; max-width: 100%; height: auto; border: 1px solid #cfc7c2; }
-    .visualMetadata { border: 1px solid #141111; background: #fffaf0; margin: 10px 0; padding: 8px; }
-    .visualMetadata summary { cursor: pointer; font-weight: 800; }
-    .metadataSection { margin-top: 8px; }
-    .metadataSection h3 { margin: 0 0 6px; font-size: 13px; }
-    .metadataGrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 8px; }
-    .metadataPanel { border: 1px solid #cfc7c2; background: #fff; padding: 8px; min-width: 0; }
-    .metadataPanel strong { display: block; margin-bottom: 6px; font-size: 12px; }
-    .metadataPanel pre { margin: 0; white-space: pre-wrap; word-break: break-word; font-size: 11px; }
-    .caseMeta { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px; margin: 10px 0; }
-    .caseMeta div { border: 1px solid #141111; background: #fffaf0; padding: 6px; font-size: 12px; }
-    .caseLinks { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
-    .caseLinks a { border: 1px solid #141111; background: #fff; padding: 4px 6px; font-size: 12px; text-decoration: none; }
-    .aiNotes { border: 1px solid #141111; background: #fffaf0; margin-top: 10px; padding: 8px; font-size: 13px; }
-    .aiNotes summary { cursor: pointer; font-weight: 800; }
-    .aiNotes ul { margin: 8px 0 0; padding-left: 18px; }
-    .aiNotes li { margin: 4px 0; }
-    .aiPending { color: #8a5f00; }
-    .cropInfo { color: #6b625f; font-size: 12px; }
-    .machineData { max-width: 1180px; margin: 24px auto; }
-    .machineData details { border: 2px solid #141111; background: #fff; padding: 12px; box-shadow: 4px 4px 0 #141111; }
-    .machineData summary { cursor: pointer; font-weight: 700; }
-    .downloads { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 8px; margin-top: 10px; }
-    .downloads a { border: 2px solid #141111; background: #fff; padding: 8px; box-shadow: 3px 3px 0 #141111; text-decoration: none; }
-    .matrix { overflow-x: auto; margin-top: 12px; }
-    .matrix table { width: 100%; border-collapse: collapse; min-width: 860px; }
-    .matrix th, .matrix td { border: 1px solid #141111; padding: 8px; text-align: left; vertical-align: top; font-size: 13px; }
-    .matrix th { background: #FFD440; }
-    .runMeta { color: #514946; margin: 0 0 10px; }
-    .captureTime { display: block; margin-top: 4px; color: #514946; }
-    .providerStatus { display: inline-block; border: 1px solid #141111; padding: 2px 5px; margin: 2px 4px 2px 0; background: #fffaf0; }
-    .same { color: #2f6f1f; }
-    .pass { color: #2f6f1f; }
-    .basic-pass { color: #6f681f; }
-    .different { color: #9d214a; }
-    .missing { color: #b33224; }
-    .pending { color: #8a5f00; }
-    .active { color: #2f6f1f; }
-    .unsupported { color: #6b625f; }
-    code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
-    @media (max-width: 760px) { .layout { grid-template-columns: 1fr; } nav.tree { position: static; max-height: none; } }
-  </style>
-</head>
-<body>
-  <header>
-    <h1><a href="${xmlEscape(homeHref)}">Raft Visual Testing</a></h1>
-    <p class="runMeta"><code>${xmlEscape(metadata.runId || "local")}</code> · <strong>${xmlEscape(metadata.baseline)}</strong> vs <strong>${xmlEscape(metadata.current)}</strong> · ${localizedTimestampHtml(metadata.generatedAt, { label: "Generated" })}</p>
-    ${comparisonNavHtml(metadata)}
-    <div class="summary">
-      <span class="pill">Total ${Number(metadata.summary.total || 0)}</span>
-      <span class="pill">Same ${Number(metadata.summary.same || 0)}</span>
-      <span class="pill">Pass ${Number(metadata.summary.pass || 0)}</span>
-      <span class="pill">Basic pass ${Number(metadata.summary["basic-pass"] || 0)}</span>
-      <span class="pill">Different ${Number(metadata.summary.different || 0)}</span>
-      <span class="pill">Missing ${Number(metadata.summary.missing || 0)}</span>
-      <span class="pill">AI ${Number(analysisSummary.ready || 0)}/${Number(analysisSummary.total || 0)} ready</span>
-      ${metadata.componentMatrixSummary?.total ? `<span class="pill">Matrix ${Number(metadata.componentMatrixSummary?.active || 0)}/${Number(metadata.componentMatrixSummary?.total || 0)} active</span>` : ""}
-      ${capturePills}
-    </div>
-  </header>
-  <div class="layout">
-    <nav class="tree" aria-label="Visual case categories">
-      <strong>Cases</strong>
-      ${tree}
-    </nav>
-    <main>${rows}</main>
-  </div>
-  <section class="machineData">
-    <details>
-      <summary>Downloads / machine data</summary>
-      <div class="downloads">
-        <a href="${xmlEscape(diffJsonHref)}">diff JSON</a>
-        <a href="${xmlEscape(matrixHref)}">coverage matrix JSON</a>
-        <a href="${xmlEscape(metadataHref)}">run metadata JSON</a>
-      </div>
-    </details>
-  </section>
-  ${matrixSection}
-  ${localizedTimeScript()}
-  ${overlayComparisonScript()}
-</body>
-</html>
-`;
-}
 
-function caseCardHtml(item, latestPrefix) {
-    const image = item.sideBySideImage
-      ? `${latestPrefix}${path.relative(resultRoot, path.join(repoRoot, item.sideBySideImage))}`
-      : "";
-    const cropInfo = cropContractPreview(item);
-    const baselineRaw = rawSizeText(item.baselineMetadata);
-    const currentRaw = rawSizeText(item.currentMetadata);
-    const baselineCaptured = providerCapturedHtml(item.baselineMetadata);
-    const currentCaptured = providerCapturedHtml(item.currentMetadata);
-    const baselineImage = item.baselineImage ? `${latestPrefix}${path.relative(resultRoot, path.join(repoRoot, item.baselineImage))}` : "";
-    const currentImage = item.currentImage ? `${latestPrefix}${path.relative(resultRoot, path.join(repoRoot, item.currentImage))}` : "";
-    const sideBySide = item.sideBySideImage ? `${latestPrefix}${path.relative(resultRoot, path.join(repoRoot, item.sideBySideImage))}` : "";
-    const acceptance = item.acceptance ? `<p class="cropInfo">${xmlEscape(item.acceptance)}${item.rawStatus && item.rawStatus !== item.status ? ` · raw ${xmlEscape(item.rawStatus)}` : ""}</p>` : "";
-    const captureType = normalizeCaptureType(item.captureType, item.id);
-    return `<article class="case" id="case-${xmlEscape(anchorId(item.id))}">
-      <div class="caseHeader">
-        <div><code>${xmlEscape(item.id)}</code><span>${xmlEscape(captureTypeLabel(captureType))} · ${xmlEscape(casePath(item))}</span></div>
-        <strong class="${xmlEscape(item.status)}">${xmlEscape(item.status)}</strong>
-      </div>
-      ${image ? `<a href="${xmlEscape(image)}"><img class="sideBySide" src="${xmlEscape(image)}" alt="${xmlEscape(item.id)} side by side"/></a>` : ""}
-      <div class="caseMeta">
-        <div><strong>${xmlEscape(providerLabel(item.baseline))}</strong><br/><code>${xmlEscape(baselineRaw)}</code>${baselineCaptured}</div>
-        <div><strong>${xmlEscape(providerLabel(item.current))}</strong><br/><code>${xmlEscape(currentRaw)}</code>${currentCaptured}</div>
-      </div>
-      ${componentMetadataHtml(item)}
-      <p>${similarityPreview(item.metrics)}</p>
-      ${acceptance}
-      ${cropInfo ? `<p class="cropInfo">${cropInfo}</p>` : ""}
-      ${analysisHtml(item.analysis, latestPrefix)}
-      ${overlayComparisonHtml(item, baselineImage, currentImage)}
-      ${rawCapturesHtml(item, baselineImage, currentImage, baselineRaw, currentRaw)}
-      <div class="caseLinks">
-        ${baselineImage ? `<a href="${xmlEscape(baselineImage)}">${xmlEscape(providerLabel(item.baseline))} PNG</a>` : ""}
-        ${currentImage ? `<a href="${xmlEscape(currentImage)}">${xmlEscape(providerLabel(item.current))} PNG</a>` : ""}
-        ${sideBySide ? `<a href="${xmlEscape(sideBySide)}">Side-by-side PNG</a>` : ""}
-      </div>
-    </article>`;
-}
 
-function overlayComparisonHtml(item, baselineImage, currentImage) {
-  if (!baselineImage || !currentImage) return "";
-  const width = Number(item.metrics?.comparisonWidth || item.metrics?.baselineWidth || item.metrics?.currentWidth || 0);
-  const height = Number(item.metrics?.comparisonHeight || item.metrics?.baselineHeight || item.metrics?.currentHeight || 0);
-  const dimensions = width > 0 && height > 0 ? `data-overlay-width="${width}" data-overlay-height="${height}"` : "";
-  const baselineLabel = providerLabel(item.baseline);
-  const currentLabel = providerLabel(item.current);
-  return `<details class="overlayComparison" open data-overlay-comparison data-baseline-src="${xmlEscape(baselineImage)}" data-current-src="${xmlEscape(currentImage)}" ${dimensions}>
-    <summary>Overlay comparison · ${xmlEscape(baselineLabel)} under ${xmlEscape(currentLabel)}</summary>
-    <div class="overlayControls">
-      <label>Mode
-        <select data-overlay-mode>
-          <option value="blend">Blend</option>
-          <option value="difference">Difference</option>
-          <option value="split">Split drag</option>
-          <option value="align">Align drag</option>
-        </select>
-      </label>
-      <label>${xmlEscape(baselineLabel)} opacity
-        <input data-overlay-baseline-opacity type="range" min="0" max="100" value="100" />
-      </label>
-      <code data-overlay-baseline-opacity-value>100%</code>
-      <label>${xmlEscape(currentLabel)} opacity
-        <input data-overlay-opacity type="range" min="0" max="100" value="50" />
-      </label>
-      <code data-overlay-opacity-value>50%</code>
-      <label>Snap
-        <input data-overlay-snap type="checkbox" checked />
-      </label>
-      <button type="button" data-overlay-reset>Reset</button>
-      <span class="cropInfo">Split <code data-overlay-split-value>50%</code></span>
-      <span class="cropInfo">Offset <code data-overlay-offset-value>0px, 0px</code></span>
-      <span class="cropInfo" data-overlay-status>${width > 0 && height > 0 ? `Canvas ${width}x${height}` : "Canvas auto"}</span>
-    </div>
-    <div class="overlayCanvasWrap">
-      <canvas data-overlay-canvas aria-label="${xmlEscape(item.id)} overlay comparison"></canvas>
-    </div>
-  </details>`;
-}
 
-function providerCapturedHtml(metadata) {
-  return metadata?.capturedAt
-    ? `<span class="captureTime">${localizedTimestampHtml(metadata.capturedAt, { label: "Captured" })}</span>`
-    : "";
-}
 
-function componentMetadataHtml(item) {
-  if (normalizeCaptureType(item.captureType, item.id) !== componentFixtureCaptureType) return "";
-  const sections = [
-    ["typography", "Typography"],
-    ["styleTokens", "Style tokens"],
-    ["computedStyles", "Computed styles"],
-  ].map(([field, label]) => metadataComparisonSection(field, label, item.baseline, item.current, item.baselineMetadata, item.currentMetadata))
-    .filter(Boolean)
-    .join("");
-  if (!sections) {
-    return `<details class="visualMetadata">
-      <summary>Component metadata</summary>
-      <p class="cropInfo">No typography/style metadata captured yet. Providers can emit <code>typography</code>, <code>styleTokens</code>, or <code>computedStyles</code> in their metadata JSON.</p>
-    </details>`;
-  }
-  return `<details class="visualMetadata" open>
-    <summary>Component metadata</summary>
-    ${sections}
-  </details>`;
-}
 
-function metadataComparisonSection(field, label, baseline, current, baselineMetadata, currentMetadata) {
-  const baselineValue = baselineMetadata?.[field];
-  const currentValue = currentMetadata?.[field];
-  if (baselineValue === undefined && currentValue === undefined) return "";
-  return `<section class="metadataSection">
-    <h3>${xmlEscape(label)}</h3>
-    <div class="metadataGrid">
-      ${metadataValuePanel(providerLabel(baseline), baselineValue)}
-      ${metadataValuePanel(providerLabel(current), currentValue)}
-    </div>
-  </section>`;
-}
 
-function metadataValuePanel(label, value) {
-  const content = value === undefined
-    ? "not captured"
-    : JSON.stringify(value, null, 2);
-  return `<div class="metadataPanel">
-    <strong>${xmlEscape(label)}</strong>
-    <pre>${xmlEscape(content)}</pre>
-  </div>`;
-}
 
-function analysisHtml(analysis, latestPrefix) {
-  if (!analysis) {
-    return `<div class="aiNotes aiPending"><strong>AI diff notes</strong><br/>analysis pending</div>`;
-  }
-  if (analysis.status !== "ready") {
-    return `<div class="aiNotes aiPending"><strong>AI diff notes</strong><br/>${xmlEscape(analysis.error || "analysis unavailable")}</div>`;
-  }
-  const notes = (analysis.summary || []).slice(0, 3).map((note) => `<li>${xmlEscape(note)}</li>`).join("");
-  const fixes = (analysis.suggestedFixes || []).map((fix) => `<li>${xmlEscape(fix)}</li>`).join("");
-  return `<details class="aiNotes" open>
-    <summary>AI diff notes · ${xmlEscape(analysis.severity || "unknown")}${analysis.suggestedOwner ? ` · ${xmlEscape(analysis.suggestedOwner)}` : ""}</summary>
-    <ul>${notes || "<li>No concise notes returned.</li>"}</ul>
-    ${fixes ? `<strong>Suggested fixes</strong><ul>${fixes}</ul>` : ""}
-    <p><a href="${xmlEscape(`${latestPrefix}analysis-summary.json`)}">analysis summary</a></p>
-  </details>`;
-}
 
-function rawCapturesHtml(item, baselineImage, currentImage, baselineRaw, currentRaw) {
-  if (!baselineImage && !currentImage) return "";
-  const baselineLabel = providerLabel(item.baseline);
-  const currentLabel = providerLabel(item.current);
-  const panels = [
-    baselineImage
-      ? `<div class="rawPanel"><strong>${xmlEscape(baselineLabel)} raw · ${xmlEscape(baselineRaw)}</strong><a href="${xmlEscape(baselineImage)}"><img src="${xmlEscape(baselineImage)}" alt="${xmlEscape(item.id)} ${xmlEscape(baselineLabel)} raw capture"/></a></div>`
-      : "",
-    currentImage
-      ? `<div class="rawPanel"><strong>${xmlEscape(currentLabel)} raw · ${xmlEscape(currentRaw)}</strong><a href="${xmlEscape(currentImage)}"><img src="${xmlEscape(currentImage)}" alt="${xmlEscape(item.id)} ${xmlEscape(currentLabel)} raw capture"/></a></div>`
-      : "",
-  ].filter(Boolean).join("");
-  return `<details class="rawCaptures">
-    <summary>Raw captures · original provider size</summary>
-    <div class="rawGrid">${panels}</div>
-  </details>`;
-}
 
-function groupedCaseCards(results, latestPrefix) {
-  const groups = [];
-  const byCategory = new Map();
-  for (const item of results || []) {
-    const captureType = normalizeCaptureType(item.captureType, item.id);
-    const category = `${captureTypeLabel(captureType)} / ${caseCategory(item)}`;
-    if (!byCategory.has(category)) {
-      const group = { category, items: [] };
-      byCategory.set(category, group);
-      groups.push(group);
-    }
-    byCategory.get(category).items.push(item);
-  }
-  return groups;
-}
 
 function rawSizeText(metadata) {
   const rect = metadata?.crop?.rect;
@@ -2437,20 +2108,6 @@ function rawSizeText(metadata) {
   return "n/a";
 }
 
-function categoryTreeHtml(results, hrefPrefix = "") {
-  const root = { children: new Map(), cases: [] };
-  for (const item of results || []) {
-    const parts = casePath(item).split("/").filter(Boolean);
-    const leaf = parts.pop() || item.id;
-    let node = root;
-    for (const part of parts) {
-      if (!node.children.has(part)) node.children.set(part, { children: new Map(), cases: [] });
-      node = node.children.get(part);
-    }
-    node.cases.push({ ...item, label: leaf });
-  }
-  return treeNodeHtml(root, hrefPrefix);
-}
 
 function treeNodeHtml(node, hrefPrefix) {
   const groups = [...node.children.entries()];
@@ -2462,38 +2119,7 @@ function treeNodeHtml(node, hrefPrefix) {
   return `<ul>${children}</ul>`;
 }
 
-function componentMatrixHtml(matrix) {
-  return (matrix || []).map((row) => {
-    const captureType = normalizeCaptureType(row.captureType, row.id);
-    const providers = Object.entries(row.providers || {}).map(([provider, entry]) => {
-      const components = entry.components?.length ? ` ${entry.components.join(", ")}` : "";
-      const reason = entry.reason ? `<br/><small>${xmlEscape(entry.reason)}</small>` : "";
-      return `<span class="providerStatus ${xmlEscape(entry.status)}"><strong>${xmlEscape(provider)}</strong>: ${xmlEscape(entry.status)}${xmlEscape(components)}</span>${reason}`;
-    }).join("<br/>");
-    const acceptance = row.comparison?.acceptance ? `<br/><small>${xmlEscape(row.comparison.acceptance)}</small>` : "";
-    const rawStatus = row.comparison?.rawStatus && row.comparison.rawStatus !== row.comparison.status ? `<br/><small>raw ${xmlEscape(row.comparison.rawStatus)}</small>` : "";
-    const comparison = row.comparison
-      ? `${xmlEscape(row.comparison.status)}${rawStatus}${acceptance}${row.comparison.rgbSimilarity !== null ? `<br/><code>RGB ${(Number(row.comparison.rgbSimilarity) * 100).toFixed(1)}%</code><br/><code>Pixel ${(Number(row.comparison.pixelPerfectSimilarity || 0) * 100).toFixed(2)}%</code>` : ""}`
-      : "pending";
-    return `<tr>
-      <td><strong>${xmlEscape(captureTypeLabel(captureType))}</strong><br/><code>${xmlEscape(captureType)}</code></td>
-      <td>${xmlEscape(row.category || row.group || "")}</td>
-      <td><code>${xmlEscape(row.id)}</code><br/>${xmlEscape(row.title || "")}</td>
-      <td class="${xmlEscape(row.status || "")}">${xmlEscape(row.status || "")}</td>
-      <td>${providers}</td>
-      <td>${comparison}</td>
-    </tr>`;
-  }).join("\n");
-}
 
-function captureTypeSummaryPills(summary = {}) {
-  const rows = Object.entries(summary.captureTypes || {})
-    .filter(([, value]) => Number(value.total || 0) > 0)
-    .map(([captureType, value]) =>
-      `<span class="pill">${xmlEscape(captureTypeLabel(captureType))} ${Number(value.active || 0)}/${Number(value.total || 0)} active</span>`,
-    );
-  return rows.join("");
-}
 
 function siteIndexJson(metadata, runs) {
   const latest = runs[0] || null;
@@ -2733,6 +2359,16 @@ function siteHomeCases(diffData, metadata, manifestCases = [], additionalPairs =
       .filter(Boolean);
     entry.providers = providers;
     entry.pairs = pairsIndex;
+    // Providers the case's matrix row declares (react-only cases list just
+    // react). The site shows an undeclared provider as n/a, not missing.
+    // The case's own providerMatrix stands in when the matrix came from a raw
+    // manifest without a row for it. Omitted when neither declares any, so
+    // the site keeps its old reading.
+    const rowProviders = Object.keys(normalizeProviderMatrix(row?.providers));
+    const declaredProviders = rowProviders.length > 0
+      ? rowProviders
+      : Object.keys(normalizeProviderMatrix(manifestCase?.providerMatrix));
+    if (declaredProviders.length > 0) entry.declaredProviders = declaredProviders;
     if (comparisons.length > 0) entry.comparisons = comparisons;
     const rawNote = String(item.note || "");
     const note = isBoilerplateNote(rawNote) ? String(row?.notes || "") : rawNote || String(row?.notes || "");
@@ -2790,7 +2426,7 @@ function siteHomePairDef(entry) {
   };
 }
 
-function siteHomeHtml(metadata, runs, cases = []) {
+function siteHomeHtml(metadata, runs, cases = [], siteRootHref = "") {
   const summary = metadata.summary || {};
   const analysisSummary = metadata.analysisSummary || {};
   const comparisons = metadataComparisons(metadata);
@@ -2838,9 +2474,12 @@ function siteHomeHtml(metadata, runs, cases = []) {
   // JSON, so the published page makes zero extra requests beyond the images.
   return renderSiteTemplate(readSiteAsset("home.html"), {
     HOME_CSS: readSiteAsset("home.css").trimEnd(),
+    APPLICABILITY_JS: readSiteAsset("applicability.js").trimEnd(),
     HOME_JS: readSiteAsset("home.js").trimEnd(),
     VT_DATA_JSON: JSON.stringify(payload).replace(/</g, "\\u003c"),
     OVERLAY_SCRIPT: overlayComparisonScript(),
+    // The site-wide data links (index.json, llms.txt, latest/…) from a page in latest/ or runs/<id>/.
+    SITE_ROOT: xmlEscape(siteRootHref),
     LOCALIZED_TIME_SCRIPT: localizedTimeScript(),
     RUN_ID: xmlEscape(metadata.runId),
     BASELINE: xmlEscape(metadata.baseline),
@@ -2882,6 +2521,49 @@ function mergeSiteIntoPublishWorktree(sourceRoot, targetSubdir, runId, options =
   writeJson(existingIndexPath, siteIndexJson(latestMetadata, runs));
   fs.writeFileSync(path.join(targetSubdir, "llms.txt"), siteLlmsText(latestMetadata, runs));
   fs.writeFileSync(path.join(targetSubdir, "index.html"), siteHomeHtml(latestMetadata, runs, readSiteHomeCases(latestTarget, latestMetadata)));
+  retireLegacyRunReports(targetSubdir);
+}
+
+/**
+ * The home page for one directory of the site (latest/ or runs/<id>/): its cases' image
+ * paths become relative to that directory (they are site-root relative, `latest/…`, and
+ * every run directory holds the same files), and its run link goes back up by [homeHref].
+ */
+function siteHomeHtmlForDir(metadata, homeCases, homeHref) {
+  const run = runSummary(metadata, `runs/${metadata.runId}/`);
+  return siteHomeHtml(metadata, [{ ...run, href: `${homeHref}${run.href}` }], rebaseLatestPaths(homeCases), homeHref);
+}
+
+function rebaseLatestPaths(value) {
+  if (typeof value === "string") return value.startsWith("latest/") ? value.slice("latest/".length) : value;
+  if (Array.isArray(value)) return value.map(rebaseLatestPaths);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).map(([key, entry]) => [key, rebaseLatestPaths(entry)]));
+  }
+  return value;
+}
+
+/**
+ * Every published run directory gets the current home page in place of the retired yellow
+ * report (its other pair pages are removed), rebuilt from the data the run kept.
+ */
+function retireLegacyRunReports(targetSubdir) {
+  for (const dir of [path.join(targetSubdir, "latest"), ...listRunDirs(targetSubdir)]) {
+    const metadataPath = path.join(dir, "metadata.json");
+    if (!fs.existsSync(metadataPath)) continue;
+    const metadata = { ...readJson(metadataPath), runId: readJson(metadataPath).runId || path.basename(dir) };
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      if (entry.isFile() && entry.name.endsWith(".html") && entry.name !== "index.html") fs.rmSync(path.join(dir, entry.name), { force: true });
+    }
+    const homeHref = path.basename(dir) === "latest" && path.dirname(dir) === targetSubdir ? "../" : "../../";
+    fs.writeFileSync(path.join(dir, "index.html"), siteHomeHtmlForDir(metadata, readSiteHomeCases(dir, metadata), homeHref));
+  }
+}
+
+function listRunDirs(targetSubdir) {
+  const runsRoot = path.join(targetSubdir, "runs");
+  if (!fs.existsSync(runsRoot)) return [];
+  return fs.readdirSync(runsRoot, { withFileTypes: true }).filter((entry) => entry.isDirectory()).map((entry) => path.join(runsRoot, entry.name));
 }
 
 function readSiteHomeCases(latestDir, metadata) {
@@ -3206,41 +2888,8 @@ function inferPagesUrl(remote, subdir, publishRepoRoot = repoRoot) {
   return `https://${match[1]}.github.io/${match[2]}/${subdir}/`;
 }
 
-function similarityPreview(metrics) {
-  if (!metrics) return "";
-  const rgb = Number(metrics.rgbSimilarity || 0) * 100;
-  const pixel = Number(metrics.pixelPerfectSimilarity || 0) * 100;
-  const mismatch = Number(metrics.pixelMismatchRatio || 0) * 100;
-  const rawSize =
-    Number.isFinite(Number(metrics.baselineWidth)) && Number.isFinite(Number(metrics.currentWidth))
-      ? `<br/><code>Raw ${Number(metrics.baselineWidth)}×${Number(metrics.baselineHeight)} / ${Number(metrics.currentWidth)}×${Number(metrics.currentHeight)}</code>`
-      : "";
-  const canvasSize =
-    Number.isFinite(Number(metrics.comparisonWidth))
-      ? `<br/><code>Canvas ${Number(metrics.comparisonWidth)}×${Number(metrics.comparisonHeight)}</code>`
-      : "";
-  const compositor = metrics.compositor ? `<br/><code>Compositor ${xmlEscape(metrics.compositor)}</code>` : "";
-  const displayMode = metrics.displayMode ? `<br/><code>Display ${xmlEscape(metrics.displayMode)}</code>` : "";
-  const metricMode = metrics.metricMode ? `<br/><code>Metrics ${xmlEscape(metrics.metricMode)}</code>` : "";
-  return `<code>RGB ${rgb.toFixed(1)}%</code><br/><code>Pixel ${pixel.toFixed(2)}%</code><br/><code>Mismatch ${mismatch.toFixed(2)}%</code>${rawSize}${canvasSize}${compositor}${displayMode}${metricMode}`;
-}
 
-function cropContractPreview(item) {
-  const baseline = item?.baselineMetadata?.crop;
-  const current = item?.currentMetadata?.crop;
-  if (!baseline && !current) return "";
-  const baselineContract = baseline?.contract || "unknown";
-  const currentContract = current?.contract || "unknown";
-  const baselineRect = baseline?.rect ? `${Math.round(Number(baseline.rect.width))}×${Math.round(Number(baseline.rect.height))}` : "n/a";
-  const currentRect = current?.rect ? `${Math.round(Number(current.rect.width))}×${Math.round(Number(current.rect.height))}` : "n/a";
-  return `<code>Crop ${xmlEscape(baselineContract)} ${xmlEscape(baselineRect)} / ${xmlEscape(currentContract)} ${xmlEscape(currentRect)}</code>`;
-}
 
-function imagePreview(relativePath) {
-  if (!relativePath) return "";
-  const previewPath = path.relative(resultRoot, path.join(repoRoot, relativePath));
-  return `<br/><img src="${xmlEscape(previewPath)}" alt="capture"/>`;
-}
 
 function anchorId(value) {
   return String(value || "case").replace(/[^a-zA-Z0-9_-]+/g, "-");
@@ -3278,6 +2927,14 @@ function validate(flags) {
       errors.push(`${visualCase.id}: viewport must include width, height, density`);
     }
     if (!visualCase.capture?.selector && !visualCase.selector) errors.push(`${visualCase.id}: missing capture selector`);
+    const fullLength = visualCase.capture?.fullLength;
+    if (
+      fullLength !== undefined &&
+      typeof fullLength !== "boolean" &&
+      !(fullLength && typeof fullLength === "object" && (fullLength.maxHeight === undefined || (Number.isFinite(fullLength.maxHeight) && fullLength.maxHeight > 0)))
+    ) {
+      errors.push(`${visualCase.id}: capture.fullLength must be a boolean or { maxHeight: <positive dp> }`);
+    }
     if (!visualCase.tolerance?.pixelRatio) errors.push(`${visualCase.id}: missing tolerance.pixelRatio`);
   }
   if (errors.length > 0) {
@@ -3557,6 +3214,11 @@ function kotlinLiteral(value) {
   throw new Error(`unsupported fixture scalar: ${JSON.stringify(value)}`);
 }
 
+function isFlatScalarObject(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    && Object.values(value).every((item) => item === null || typeof item !== "object");
+}
+
 function emitKotlinObject(name, value, indent) {
   const pad = "    ".repeat(indent);
   const lines = [`${pad}object ${kotlinObjectName(name)} {`];
@@ -3571,6 +3233,17 @@ function emitKotlinObject(name, value, indent) {
         item.forEach((entry, index) => {
           lines.push(emitKotlinObject(`${key}${index + 1}`, entry, indent + 1));
         });
+        // Rows of flat scalar objects also come as one list, so a fixture page
+        // can iterate them and the row count/order stays in fixtureData.json.
+        if (item.every(isFlatScalarObject)) {
+          const rows = item.map((entry) => {
+            const fields = Object.entries(entry).map(([field, scalar]) => `${JSON.stringify(field)} to ${kotlinLiteral(scalar)}`);
+            return `${"    ".repeat(indent + 2)}mapOf<String, Any?>(${fields.join(", ")}),`;
+          });
+          lines.push(`${"    ".repeat(indent + 1)}val ${kotlinConstName(key)}: List<Map<String, Any?>> = listOf(`);
+          lines.push(...rows);
+          lines.push(`${"    ".repeat(indent + 1)})`);
+        }
       }
     } else if (item === null) {
       lines.push(`${"    ".repeat(indent + 1)}val ${kotlinConstName(key)}: String? = null`);
@@ -3589,7 +3262,7 @@ function emitKotlinObject(name, value, indent) {
 }
 
 function renderFixtureDataKotlin(fixtureData) {
-  const body = ["server", "humans", "agents", "machines", "latestVersions", "channels", "locale", "times", "registerForm", "messages", "files"]
+  const body = ["server", "humans", "agents", "machines", "latestVersions", "channels", "locale", "times", "registerForm", "messages", "files", "homeChannelList"]
     .filter((key) => fixtureData[key] !== undefined)
     .map((key) => emitKotlinObject(key, fixtureData[key], 1))
     .join("\n\n");
@@ -3612,7 +3285,9 @@ function generateFixtureData(flags) {
   const rendered = renderFixtureDataKotlin(fixtureData);
   const outPath = flags.out
     ? path.resolve(String(flags.out))
-    : path.join(defaultAndroidRepoRoot, "compose", "shared", "src", "visualFixtures", "kotlin", "build", "raft", "app", "VisualFixtureData.kt");
+    // src/visualFixtureData: compiled into commonMain for the gated visual pages and into
+    // commonTest otherwise, so JVM unit tests can render fixtures from it too.
+    : path.join(defaultAndroidRepoRoot, "compose", "shared", "src", "visualFixtureData", "kotlin", "build", "raft", "app", "VisualFixtureData.kt");
   if (flags.check) {
     const existing = fs.existsSync(outPath) ? fs.readFileSync(outPath, "utf8") : null;
     if (existing === rendered) {

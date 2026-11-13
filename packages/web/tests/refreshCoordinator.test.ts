@@ -440,3 +440,36 @@ test("refresh coordinator emits urgent cross-tab timeout evidence before surfaci
     __resetAuthTraceForTest();
   }
 });
+
+test("a session stored while a refresh is out wins: the old session's answer is not written back (login callback race)", async () => {
+  let storedAccessToken = "at_old";
+  let storedRefreshToken = "rt_old";
+  let writes = 0;
+  let answer: () => void = () => undefined;
+  const coordinator = createRefreshCoordinator({
+    readAccessToken: () => storedAccessToken,
+    readRefreshToken: () => storedRefreshToken,
+    writeTokens: (tokens) => {
+      writes += 1;
+      storedAccessToken = tokens.accessToken;
+      storedRefreshToken = tokens.refreshToken;
+    },
+    requestRefresh: async () => {
+      await new Promise<void>((resolve) => { answer = resolve; });
+      return { accessToken: "at_old_2", refreshToken: "rt_old_2" };
+    },
+    createAuthRefreshAttemptId: () => "arf_0000000000000001",
+  });
+
+  const refresh = coordinator.refresh();
+  await Promise.resolve();
+  // The social callback signs in as someone else meanwhile.
+  storedAccessToken = "at_new";
+  storedRefreshToken = "rt_new";
+  answer();
+  const result = await refresh;
+
+  assert.equal(writes, 0, "the old session's tokens are not written");
+  assert.deepEqual(result, { accessToken: "at_new", refreshToken: "rt_new" });
+  assert.equal(storedRefreshToken, "rt_new");
+});

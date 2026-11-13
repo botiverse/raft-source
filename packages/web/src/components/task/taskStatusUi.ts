@@ -1,7 +1,8 @@
 import type { TaskStatusId } from "@botiverse/raft-ui";
 import type { MessageId } from "../../i18n/messages";
-import type { ServerRole } from "@botiverse/raft-shared";
+import { TASK_STATUSES } from "@botiverse/raft-shared";
 import type { Task, TaskStatus } from "../../store/taskStore";
+import { opensAsTaskConversation } from "../../utils/taskConversation";
 
 /**
  * The task-status vocabulary — the app's canonical status set. This module owns
@@ -25,6 +26,7 @@ export interface TaskStatusUi {
 }
 
 export const TASK_STATUS_UI: Record<TaskStatus, TaskStatusUi> = {
+  backlog: { labelId: "task.status.backlog" },
   todo: { labelId: "task.status.todo" },
   in_progress: { labelId: "task.status.inProgress" },
   in_review: { labelId: "task.status.inReview" },
@@ -49,16 +51,6 @@ export function toRuiTaskStatus(status: TaskStatus): TaskStatusId {
   return status.replace(/_/g, "-") as TaskStatusId;
 }
 
-// Mirror of taskService.VALID_TRANSITIONS — kept in sync so the menu only
-// surfaces server-allowed transitions.
-const VALID_TRANSITIONS: Record<TaskStatus, TaskStatus[]> = {
-  todo: ["in_progress", "closed"],
-  in_progress: ["in_review", "done", "closed"],
-  in_review: ["done", "in_progress", "closed"],
-  done: ["todo", "in_progress", "in_review", "closed"],
-  closed: ["todo", "in_progress"],
-};
-
 /**
  * Status is a member-level action: any member who can see the task may move it.
  *
@@ -69,27 +61,30 @@ const VALID_TRANSITIONS: Record<TaskStatus, TaskStatus[]> = {
  * to offer it, so the rule would look intact to every human and only agents on
  * the CLI would get the new behavior.
  *
- * `canManageServer` is kept: admins additionally bypass transition validity.
+ * There are no transition limits either (stdrc 2026-10-31, #wg-task-v2
+ * msg=ad820421): any status can be set from any status.
  */
 export function canEditTaskStatus(
   task: Task,
   _currentUserId: string | undefined,
   _canManageServer: boolean,
-  serverRole?: ServerRole | null,
 ): boolean {
-  return !task.readOnlyReason && serverRole !== "guest";
+  // A Guest sees only its own channel's tasks and moves them like a member (matrix §1).
+  return !task.readOnlyReason;
 }
 
-export function getTaskStatusOptions(task: Task, _currentUserId: string | undefined, canManageServer: boolean) {
+export function getTaskStatusOptions(task: Task, _currentUserId: string | undefined, _canManageServer: boolean, taskV2: boolean) {
   const current = task.status;
-
-  // Members get the legal transitions from where the task is now; admins keep
-  // their existing ability to force any status regardless of transition rules.
-  const allowed: TaskStatus[] = canManageServer
-    ? ["todo", "in_progress", "in_review", "done", "closed"]
-    : [current, ...VALID_TRANSITIONS[current]];
-
-  return allowed.map((status) => ({
+  const v2Task = opensAsTaskConversation(task, taskV2);
+  // in_review is retired for task v2 (#wg-task-v2:f7043517): the server stores
+  // in_progress when asked for it. A task still in it keeps it as its current option.
+  const retiredInReview = v2Task && current !== "in_review";
+  // Backlog is task v2 only: the server refuses it on a pre-v2 task with the flag
+  // off (task_status_not_available). A task already in it keeps it, as above.
+  const noBacklog = !v2Task && current !== "backlog";
+  // Every other status, from any status, for members and admins alike: the server
+  // has no transition table (taskService.getTaskStatusTransitionError).
+  return TASK_STATUSES.filter((status) => !(retiredInReview && status === "in_review") && !(noBacklog && status === "backlog")).map((status) => ({
     id: status,
     labelId: current === "closed" && status === "todo"
       ? ("task.status.reopenToTodo" satisfies MessageId)

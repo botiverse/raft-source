@@ -1,5 +1,5 @@
 import type { MessageId } from "../../i18n/messages";
-import { Button, InlineCode, SegmentedControl, SegmentedControlItem, SegmentedControlLabel, Separator, Spinner } from "@botiverse/raft-ui";
+import { Button, InlineCode, SegmentedControl, SegmentedControlItem, SegmentedControlLabel, Separator, Spinner, MarkdownLink, ScrollArea } from "@botiverse/raft-ui";
 import { useEffect, useState, useCallback, useRef } from "react";
 import {
   ChevronRight,
@@ -7,6 +7,7 @@ import {
   FolderOpen,
   FileText,
   File,
+  FileSymlink,
   RefreshCw,
   ArrowLeft,
   AlertTriangle,
@@ -17,11 +18,13 @@ import { useIntl } from "react-intl";
 import ReactMarkdown from "react-markdown";
 import type { Components, Options } from "react-markdown";
 import remarkGfm from "remark-gfm";
+import remarkCjkFriendly from "remark-cjk-friendly";
 import api from "../../api/client";
 import EmptyState from "../ui/EmptyState";
 import SectionEyebrow from "../ui/SectionEyebrow";
 import Tooltip from "../ui/Tooltip";
-import { useResizablePanel } from "../../hooks/useResizablePanel";
+import { useColumnWidth } from "../../store/columnWidthStore";
+import ColumnResizeHandle from "../ui/ColumnResizeHandle";
 import { useTimeFormatter } from "../../hooks/useTimeFormatter";
 import { transparentImageBackgroundClass } from "../../utils/imagePreviewStyles";
 import { MARKDOWN_BLOCKQUOTE_BASE_CLASS } from "../markdown/MarkdownContent";
@@ -30,6 +33,7 @@ import CopyIconButton from "../ui/CopyIconButton";
 import { useAgentStore } from "../../store/agentStore";
 import type { AgentRuntimeProfileRef } from "../../store/agentStore";
 import type { FileNode } from "@botiverse/raft-shared";
+import { ICON_SM_END_PULL, ICON_SM_START_PULL } from "../ui/headEdges";
 
 interface FileContent {
   content: string | null;
@@ -75,10 +79,10 @@ function workspaceViewPreferenceKey(agentId: string) {
 
 // Stable plugin list / component map for the workspace markdown preview —
 // passing fresh literals would re-mount ReactMarkdown's AST on every render.
-const WORKSPACE_MARKDOWN_REMARK_PLUGINS: NonNullable<Options["remarkPlugins"]> = [remarkGfm];
+const WORKSPACE_MARKDOWN_REMARK_PLUGINS: NonNullable<Options["remarkPlugins"]> = [remarkGfm, remarkCjkFriendly];
 const WORKSPACE_MARKDOWN_COMPONENTS: Components = {
   pre: ({ children }) => (
-    <CodeBlock className="overflow-x-auto rounded-container border border-line-hairline bg-layer-code px-3 py-2 pr-12 font-mono text-mono-code text-foreground [&>code]:border-0 [&>code]:bg-transparent [&>code]:p-0">
+    <CodeBlock className="text-foreground [&>code]:border-0 [&>code]:bg-transparent [&>code]:p-0">
       {children}
     </CodeBlock>
   ),
@@ -93,14 +97,13 @@ const WORKSPACE_MARKDOWN_COMPONENTS: Components = {
     return <code className={className}>{children}</code>;
   },
   a: ({ href, children }) => (
-    <a
+    <MarkdownLink
       href={href}
       target="_blank"
       rel="noopener noreferrer"
-      className="text-foreground-link underline decoration-2 underline-offset-2 hover:decoration-attention"
     >
       {children}
-    </a>
+    </MarkdownLink>
   ),
   p: ({ children }) => <p className="mb-2 last:mb-0">{children}</p>,
   ul: ({ children, className, ...props }) => (
@@ -132,12 +135,13 @@ const WORKSPACE_MARKDOWN_COMPONENTS: Components = {
       {children}
     </blockquote>
   ),
+  // A wide table scrolls sideways in a horizontal raft-ui ScrollArea, as raft-ui's Markdown tables do.
   table: ({ children }) => (
-    <div className="my-2 overflow-x-auto">
+    <ScrollArea orientation="horizontal" className="my-2">
       <table className="border-collapse border border-line-hairline text-callout">
         {children}
       </table>
-    </div>
+    </ScrollArea>
   ),
   th: ({ children }) => (
     <th className="border border-line-hairline bg-fill-muted px-2 py-1 text-left font-bold whitespace-nowrap text-foreground">
@@ -161,8 +165,6 @@ const WORKSPACE_MARKDOWN_COMPONENTS: Components = {
 
 // --- File tree node component ---
 
-// Small (32px) icon-only buttons in the workspace headers.
-const TREE_ICON_BUTTON_CLASS = "flex size-8 shrink-0 items-center justify-center rounded-control transition-colors hover:bg-fill-pressed hover:text-foreground";
 // File names are machine text (Space Mono 13/20); the open file is the
 // selected item of a content list (cyan-soft). Rows run edge to edge inside a
 // scroller, so focus is drawn inset.
@@ -175,6 +177,7 @@ function TreeNode({
   expandedDirs,
   loadingDirs,
   loadingLabel,
+  symlinkLabel,
   getChildren,
   getTruncation,
   onSelectFile,
@@ -186,6 +189,7 @@ function TreeNode({
   expandedDirs: Set<string>;
   loadingDirs: Set<string>;
   loadingLabel: string;
+  symlinkLabel: string;
   getChildren: (dirPath: string) => FileNode[] | undefined;
   getTruncation: (dirPath: string) => DirTruncation | undefined;
   onSelectFile: (path: string) => void;
@@ -205,7 +209,7 @@ function TreeNode({
         <button
           type="button"
           onClick={() => onToggleDir(node.path)}
-          className={`${TREE_ROW_CLASS} ${isSelected ? "bg-info-soft" : "hover:bg-fill-pressed"}`}
+          className={`${TREE_ROW_CLASS} ${isSelected ? "bg-info-soft" : "hover:bg-fill-subtle"}`}
           style={{ paddingLeft: `${depth * 16 + 8}px` }}
         >
           <ChevronRight
@@ -240,6 +244,7 @@ function TreeNode({
                     expandedDirs={expandedDirs}
                     loadingDirs={loadingDirs}
                     loadingLabel={loadingLabel}
+                    symlinkLabel={symlinkLabel}
                     getChildren={getChildren}
                     getTruncation={getTruncation}
                     onSelectFile={onSelectFile}
@@ -255,11 +260,28 @@ function TreeNode({
     );
   }
 
+  if (node.isSymlink) {
+    // The daemon never follows a link in a workspace (it could point anywhere
+    // on the Computer), so a link is shown but cannot be opened.
+    return (
+      <div
+        data-testid="workspace-symlink-row"
+        className={`${TREE_ROW_CLASS} cursor-default`}
+        style={{ paddingLeft: `${depth * 16 + 22}px` }}
+        title={symlinkLabel}
+      >
+        <FileSymlink size={14} className="shrink-0 text-foreground-hint" aria-hidden="true" />
+        <span className={`truncate ${hiddenTextClass}`}>{node.name}</span>
+        <span className="sr-only">{symlinkLabel}</span>
+      </div>
+    );
+  }
+
   return (
     <button
       type="button"
       onClick={() => onSelectFile(node.path)}
-      className={`${TREE_ROW_CLASS} ${isSelected ? "bg-info-soft" : "hover:bg-fill-pressed"}`}
+      className={`${TREE_ROW_CLASS} ${isSelected ? "bg-info-soft" : "hover:bg-fill-subtle"}`}
       style={{ paddingLeft: `${depth * 16 + 22}px` }}
     >
       <FileText size={14} className="shrink-0 text-foreground-muted" />
@@ -307,12 +329,13 @@ function getFileReadErrorMessage(error: unknown, fallback: string) {
 function loadErrorMessageId(code: string | null): MessageId {
   if (code === "archive_workspace_unavailable") return "agent.workspace.archivedUnavailable";
   if (code === "machine_offline" || code === "daemon_offline") return "agent.workspace.computerOffline";
+  if (code === "computer_access_revoked") return "agent.status.computerAccessRevoked";
   return "agent.workspace.filesLoadFailed";
 }
 
 /** Load errors that a retry cannot fix and that leave no Computer path to show. */
 function isFinalLoadError(code: string | null): boolean {
-  return code === "archive_workspace_unavailable";
+  return code === "archive_workspace_unavailable" || code === "computer_access_revoked";
 }
 
 export default function AgentWorkspace({ agentId, compact, hosted }: { agentId: string; compact?: boolean; hosted?: boolean }) {
@@ -524,14 +547,15 @@ export default function AgentWorkspace({ agentId, compact, hosted }: { agentId: 
     setFileError(null);
     setExpandedDirs(new Set());
   }, [agentId]);
+  const handleHiddenFilesClick = useCallback(() => handleToggleHiddenFiles(!showHiddenFiles), [handleToggleHiddenFiles, showHiddenFiles]);
+  const handleCloseFile = useCallback(() => {
+    setSelectedPath(null);
+    setFileContent(null);
+    setFileError(null);
+  }, []);
 
   // Resizable file tree panel (desktop only, not in compact mode)
-  const {
-    width: treeWidth,
-    handleResizeStart,
-    handleResizeMove,
-    handleResizeEnd,
-  } = useResizablePanel({ storageKey: "slock:workspaceTreeWidth", min: 160, max: 600, defaultWidth: 256 });
+  const treeWidth = useColumnWidth("workspaceTree");
 
   const workspacePath = runtimeWorkspacePath ?? `~/.slock/agents/${agentId}/`;
   const [copied, setCopied] = useState(false);
@@ -556,65 +580,64 @@ export default function AgentWorkspace({ agentId, compact, hosted }: { agentId: 
           copiedLabel={formatMessage({ id: "agent.workspace.copiedPath" })}
           copyLabel={formatMessage({ id: "agent.workspace.copyPath" })}
           surface="light"
-          iconSize={14}
           className="shrink-0"
         />
       </div>}
 
-      <div className="flex min-h-0 flex-1">
-      {/* Left pane: file tree — full width when compact/mobile and no file selected, resizable on desktop */}
+      {/* Tree and file side by side once the workspace itself is 36rem wide
+          (the tree's 256px and a readable file), whatever the window; below
+          that, one pane at a time (raft-ui 0.23: switch on the region). */}
+      <div className="@container/workspace flex min-h-0 flex-1">
+      {/* Left pane: file tree — full width when compact/narrow and no file selected, resizable when wide */}
       <div
-        className={`${selectedPath ? (compact ? "hidden" : "hidden md:flex") : "flex"} relative ${compact ? "min-w-full" : "min-w-full md:min-w-0"} shrink-0 flex-col ${compact ? "" : "border-r border-line-seam"} bg-layer-canvas`}
+        className={`${selectedPath ? (compact ? "hidden" : "hidden @xl/workspace:flex") : "flex"} relative ${compact ? "min-w-full" : "min-w-full @xl/workspace:min-w-0"} shrink-0 flex-col ${compact ? "" : "border-r border-line-seam"} bg-layer-canvas`}
         style={compact ? undefined : { width: treeWidth }}
       >
         {/* Resize handle (desktop only, not in compact mode) */}
         {!compact && (
-        <div
-          className="hidden md:block absolute right-0 top-0 bottom-0 w-2 -mr-1 z-10 cursor-col-resize touch-none select-none"
-          onPointerDown={handleResizeStart}
-          onPointerMove={handleResizeMove}
-          onPointerUp={handleResizeEnd}
-          onPointerCancel={handleResizeEnd}
-        />
+        <ColumnResizeHandle column="workspaceTree" edge="right" className="hidden @xl/workspace:block" />
         )}
         {/* Tree header */}
-        <div className="flex items-center justify-between border-b border-line-seam py-1.5 pr-1.5 pl-3">
+        {/* 12px each side; the last icon-md button is pulled out by its icon
+            inset ((32 - 18) / 2) so its 18px icon box ends on the 12px line,
+            mirroring the eyebrow's letters (headEdges.ts). */}
+        <div className="flex items-center justify-between border-b border-line-seam px-3 py-1.5">
           <SectionEyebrow>
             {formatMessage({ id: "agent.workspace.title" })}
           </SectionEyebrow>
-          <div className="flex items-center gap-1">
+          <div className={`${ICON_SM_END_PULL} flex items-center gap-2`}>
             <Tooltip content={showHiddenFiles
               ? formatMessage({ id: "agent.workspace.hiddenFilesShown" })
               : formatMessage({ id: "agent.workspace.hiddenFilesHidden" })}>
-              <button
-                type="button"
-                onClick={() => handleToggleHiddenFiles(!showHiddenFiles)}
-                className={`${TREE_ICON_BUTTON_CLASS} ${
-                  showHiddenFiles ? "text-foreground" : "text-foreground-hint"
-                }`}
+              <Button
+                variant="ghost"
+                size="icon-md"
+                onClick={handleHiddenFilesClick}
+                className={showHiddenFiles ? "text-foreground" : "text-foreground-hint"}
                 aria-label={showHiddenFiles
                   ? formatMessage({ id: "agent.workspace.hiddenFilesShown" })
                   : formatMessage({ id: "agent.workspace.hiddenFilesHidden" })}
                 aria-pressed={showHiddenFiles}
               >
-                {showHiddenFiles ? <Eye size={16} /> : <EyeOff size={16} />}
-              </button>
+                {showHiddenFiles ? <Eye /> : <EyeOff />}
+              </Button>
             </Tooltip>
             <Tooltip content={formatMessage({ id: "agent.workspace.refresh" })}>
-              <button
-                type="button"
+              <Button
+                variant="ghost"
+                size="icon-md"
                 onClick={handleRefresh}
-                className={`${TREE_ICON_BUTTON_CLASS} text-foreground-muted`}
+                className="text-foreground-muted"
                 aria-label={formatMessage({ id: "agent.workspace.refresh" })}
               >
-                <RefreshCw size={16} />
-              </button>
+                <RefreshCw />
+              </Button>
             </Tooltip>
           </div>
         </div>
 
-        {/* Tree content */}
-        <div className="flex-1 overflow-y-auto py-1">
+        {/* Tree content: each entry is a button, so its raft-ui ScrollArea is no tab stop. */}
+        <ScrollArea tabIndex={-1} className="flex-1" contentClassName="py-1">
           {loading ? (
             <div className="px-3 py-4 text-center text-callout text-foreground-hint">
               {formatMessage({ id: "agent.workspace.loading" })}
@@ -626,7 +649,7 @@ export default function AgentWorkspace({ agentId, compact, hosted }: { agentId: 
                 {formatMessage({ id: loadErrorMessageId(loadErrorCode) })}
               </div>
               {!isFinalLoadError(loadErrorCode) && (
-                <Button variant="outline" size="sm"
+                <Button variant="outline" size="md"
                   type="button"
                   onClick={handleRefresh}
                 >
@@ -649,6 +672,7 @@ export default function AgentWorkspace({ agentId, compact, hosted }: { agentId: 
                   expandedDirs={expandedDirs}
                   loadingDirs={loadingDirs}
                   loadingLabel={formatMessage({ id: "agent.workspace.loading" })}
+                  symlinkLabel={formatMessage({ id: "agent.workspace.symlinkNotOpened" })}
                   getChildren={getChildren}
                   getTruncation={getTruncation}
                   onSelectFile={handleSelectFile}
@@ -660,11 +684,11 @@ export default function AgentWorkspace({ agentId, compact, hosted }: { agentId: 
               )}
             </>
           )}
-        </div>
+        </ScrollArea>
       </div>
 
-      {/* Right pane: file content viewer — hidden on mobile/compact when no file selected */}
-      <div className={`${!selectedPath ? (compact ? "hidden" : "hidden md:flex") : "flex"} min-w-0 flex-1 flex-col`}>
+      {/* Right pane: file content viewer — hidden when compact/narrow and no file selected */}
+      <div className={`${!selectedPath ? (compact ? "hidden" : "hidden @xl/workspace:flex") : "flex"} min-w-0 flex-1 flex-col`}>
         {!selectedPath ? (
           <EmptyState
             className="flex flex-1 flex-col items-center justify-center"
@@ -682,14 +706,16 @@ export default function AgentWorkspace({ agentId, compact, hosted }: { agentId: 
         ) : (
           <>
             {/* File header — name + back + view mode toggle */}
-            <div className="flex items-center gap-2 border-b border-line-seam bg-layer-canvas px-4 py-2">
-              <button
-                type="button"
-                onClick={() => { setSelectedPath(null); setFileContent(null); setFileError(null); }}
-                className={`${compact ? "" : "md:hidden"} -ml-2 ${TREE_ICON_BUTTON_CLASS} text-foreground-muted`}
+            <div className="flex items-center gap-2 border-b border-line-seam bg-layer-canvas px-4 py-2 md:pointer-fine:min-h-(--header-height) md:pointer-fine:py-[2.5px]">
+              <Button
+                variant="ghost"
+                size="icon-md"
+                onClick={handleCloseFile}
+                aria-label={formatMessage({ id: "common.announcement.back" })}
+                className={`${compact ? "" : "@xl/workspace:hidden"} ${ICON_SM_START_PULL} text-foreground-muted`}
               >
-                <ArrowLeft size={18} />
-              </button>
+                <ArrowLeft />
+              </Button>
               {/* min-w-0 wrapper so truncate engages in flex context. Without
                   it, a long unbreakable path keeps its intrinsic width and
                   pushes the right-side toggle/buttons past the panel edge.
@@ -702,22 +728,25 @@ export default function AgentWorkspace({ agentId, compact, hosted }: { agentId: 
                   value={viewMode}
                   onValueChange={setViewMode}
                   aria-label={formatMessage({ id: "agent.workspace.viewMode" })}
-                  className="ml-auto shrink-0"
+                  className="ml-auto"
                 >
-                  <SegmentedControlItem value="raw" data-testid="workspace-file-view-raw">
-                    <SegmentedControlLabel>{formatMessage({ id: "agent.workspace.raw" })}</SegmentedControlLabel>
-                  </SegmentedControlItem>
                   <SegmentedControlItem value="preview" data-testid="workspace-file-view-preview">
                     <SegmentedControlLabel>{formatMessage({ id: "agent.workspace.preview" })}</SegmentedControlLabel>
+                  </SegmentedControlItem>
+                  <SegmentedControlItem value="raw" data-testid="workspace-file-view-raw">
+                    <SegmentedControlLabel>{formatMessage({ id: "agent.workspace.raw" })}</SegmentedControlLabel>
                   </SegmentedControlItem>
                 </SegmentedControl>
               )}
             </div>
 
-            {/* Content */}
-            <div className="flex-1 overflow-y-auto p-4">
+            {/* Content. The file scrolls in a raft-ui ScrollArea named after its path (a
+                tab stop once it overflows). The padding stays on the area, so
+                the image and binary notes still fill its height. */}
+            <ScrollArea role="region" aria-label={fileContent.path} className="flex-1 p-4">
               {isWorkspaceImagePreview(fileContent) ? (
-                <div className="flex h-full min-h-0 items-center justify-center overflow-auto">
+                // Fitted to the area and centred in it; the area around it is the scroller.
+                <div className="flex h-full min-h-0 items-center justify-center">
                   <img
                     src={`data:${fileContent.mimeType};base64,${fileContent.content}`}
                     alt={fileContent.path}
@@ -742,7 +771,7 @@ export default function AgentWorkspace({ agentId, compact, hosted }: { agentId: 
                   {fileContent.content || ""}
                 </pre>
               )}
-            </div>
+            </ScrollArea>
 
             {/* Bottom bar — file size + modified date */}
             <div className="flex items-center gap-3 border-t border-line-seam bg-layer-canvas px-4 py-1.5 font-mono text-mono-meta text-foreground-hint">

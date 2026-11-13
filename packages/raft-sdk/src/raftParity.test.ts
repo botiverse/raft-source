@@ -1,9 +1,12 @@
 // What `createRaftClient` (deprecated) offered that `createRaft` must also
 // cover, so nobody migrating loses a capability: avatar upload, built-in app
 // config, and creating the client from a credential store. Also: the held
-// text a hosted agent sees is the one a Computer agent sees.
+// text a hosted agent sees is the one a Computer agent sees, and so is the rule
+// for a message delivered more than once.
 import assert from "node:assert/strict";
-import { formatAgentHold } from "@botiverse/raft-shared";
+import { readFileSync } from "node:fs";
+import { buildRaftCliGuideSections, formatAgentHold, formatAgentMessages, type AgentMessageLike } from "@botiverse/raft-shared";
+import { RAFT_OPERATIONS, REPEAT_DELIVERY_RULE } from "./agent";
 import { createRaft, createRaftFromStore, RaftCredentialError, type RaftCredentialStore, type StoredRaftCredential } from "./index";
 
 const credential = "sk_agent_parity_sentinel";
@@ -130,7 +133,7 @@ const heldResponse = {
   threadParentMessage: { seq: 30, senderName: "sample-human", createdAt: "2026-10-15T08:00:00.000Z", content: "Deploy plan" },
   heldMessages: [
     { id: "00000041-0000-0000-0000-000000000000", seq: 41, sender_type: "human", sender_name: "sample-human", timestamp: "2026-10-15T09:00:00.000Z", content: "deploy at 5?" },
-    { id: "00000042-0000-0000-0000-000000000000", seq: 42, sender_type: "agent", sender_name: "sample-agent", timestamp: "2026-10-15T09:02:00.000Z", content: "canary is green" },
+    { id: "00000042-0000-0000-0000-000000000000", seq: 42, sender_type: "agent", sender_name: "sample-agent", timestamp: "2026-10-15T09:02:00.000Z", content: `canary is green ${"and the dashboards agree ".repeat(8)}` },
   ],
 };
 
@@ -142,7 +145,7 @@ test("a held send reads the same as the CLI's held text, with tool-style command
     if (!outcome.ok || outcome.state !== "interrupted") return;
     const expected = formatAgentHold("#ops:1a2b3c4d", heldResponse as never, {
       heldAction: "Your message was not sent.",
-      draftInstructions: 'To send it unchanged, send it again with idempotencyKey "k-held". To change it, send the revised content instead. You can also choose not to send anything.\n',
+      draftInstructions: 'If what you just read already says what you meant to say (for example, someone already answered), or makes your message unnecessary, send nothing. Otherwise, to send it unchanged, send it again with idempotencyKey "k-held". To change it, send the revised content instead.\n',
     }, hints).trimEnd();
     assert.equal(outcome.interrupt.context, expected);
     assert.equal(outcome.text, expected);
@@ -151,7 +154,7 @@ test("a held send reads the same as the CLI's held text, with tool-style command
     assert.match(expected, /│ @sample-human 09:00 {2}deploy at 5\?/);
     if (hints === "tool") {
       assert.match(expected, /Full text: messages_read\(\{ target: "#ops:1a2b3c4d" \}\)/);
-      assert.match(expected, /Older exist: messages_read\(\{ target: "#ops:1a2b3c4d", before: 41 \}\)\./);
+      assert.match(expected, /Older: messages_read\(\{ target: "#ops:1a2b3c4d", before: 41 \}\) ⋯/);
       assert.doesNotMatch(expected, /\braft [a-z]+ /, "no CLI command under tool hints");
     } else {
       assert.match(expected, /Full text: raft message read --target "#ops:1a2b3c4d"/);
@@ -171,5 +174,74 @@ test("a held task claim shows the same window, not just a count, in either hint 
     }, hints).trimEnd());
     assert.match(outcome.text, /│ @sample-agent 09:02 {2}canary is green/);
     if (hints === "tool") assert.doesNotMatch(outcome.text, /\braft [a-z]+ /);
+  }
+});
+
+test("a message delivered twice: every surface that teaches delivery gives the same one rule, keyed on the id alone", () => {
+  // A cloud agent read a message by id before /events had it, acted, and got
+  // it again minutes later as new. Hosted tools, the export cloud prompts
+  // embed, the Computer prompt, External Agents' guide and the manual say the
+  // same words: one sentence (a tool description holds at most three), with
+  // no condition on how the message was read, which the agent can't tell
+  // afterwards.
+  for (const name of ["inbox.check", "inbox.drain"]) {
+    const op = RAFT_OPERATIONS.find((candidate) => candidate.name === name);
+    assert.ok(op?.description.endsWith(` ${REPEAT_DELIVERY_RULE}`), name);
+  }
+  for (const audience of ["managed-runner", "self-hosted-runner"] as const) {
+    const guide = buildRaftCliGuideSections({ audience, identity: { handle: "alice", displayName: "Alice" } });
+    assert.ok(guide.readingHistory.endsWith(`\n\n${REPEAT_DELIVERY_RULE}`), audience);
+  }
+  for (const topic of ["inbox", "external-agent"]) {
+    const manual = readFileSync(new URL(`../../../manual/agent-knowledge/${topic}.md`, import.meta.url), "utf8");
+    assert.ok(manual.includes(REPEAT_DELIVERY_RULE), `${topic} manual topic`);
+  }
+});
+
+test("a message read by id and then delivered shows the same msg= id both times, the one the rule keys on", async () => {
+  const id = "5e1f0a2b-3c4d-4e5f-8a6b-7c8d9e0f1a2b";
+  const envelope = { channel_type: "channel", channel_name: "ops", message_id: id, timestamp: "2026-10-23T01:00:00.000Z", sender_type: "human", sender_name: "richard", content: "rotate the key", seq: 42 };
+  const { fetch } = recorder((call) => {
+    const path = new URL(call.url).pathname;
+    if (path === `/internal/agent-api/messages/${id}/resolve`) return Response.json({ message: envelope });
+    if (path === "/internal/agent-api/events") return Response.json({ events: [envelope], last_seen_msgId: id, last_seen_seq: 42, reply_target: "#ops", has_more: false, ack_mode: "cursor" });
+    return Response.json({ error: `not in this fake: ${path}` }, { status: 500 });
+  });
+  for (const hints of ["cli", "tool"] as const) {
+    const raft = createRaft({ serverUrl: "https://raft.example", credential, hints, fetch });
+    const resolved = await raft.invoke("messages.resolve", { messageId: id });
+    const delivered = await raft.invoke("inbox.check", {});
+    assert.ok(resolved.ok && delivered.ok, hints);
+    if (!resolved.ok || !delivered.ok) return;
+    for (const outcome of [resolved, delivered]) assert.deepEqual(outcome.text.match(/\bmsg=[0-9a-f-]+/g), [`msg=${id.slice(0, 8)}`], hints);
+  }
+});
+
+test("a third-party app event delivered twice shows the same msg=, exactly the first 8 characters of its event_id", () => {
+  // Shaped like the Server's buildThirdPartyAgentMessage (oauthService.ts):
+  // message_id is the event id and the body repeats it in full as
+  // `event_id:`. The rule's short-id clause rests on the header carrying
+  // exactly that prefix; a path that put the full id (or another id) in the
+  // header would break dedupe without any error.
+  const eventId = "5f7e9c21-0d4b-4a6e-9b3c-2e1f0a9d8c7b";
+  const event: AgentMessageLike = {
+    channel_type: "dm", channel_name: "third-party-agent-events:agent-1", sender_type: "third_party_app", sender_name: "stamp",
+    message_id: eventId, timestamp: "2026-10-23T01:41:02.000Z",
+    content: ["Third-party notification: checks finished", "", `event_id: ${eventId}`, "payload_hash: 2da8", "resource: urn:raft:server:s-1:agent-inbound"].join("\n"),
+    third_party_event: { id: eventId, kind: "notification", client_id: "stamp", client_name: "Stamp", payload_hash: "2da8", expires_at: "2026-10-30T01:41:02.000Z" },
+  };
+  // The same event delivered again, and once through a path without message_id.
+  const { message_id: _withoutId, ...noMessageId } = event;
+  for (const style of ["cli", "tool"] as const) {
+    const renders = [event, structuredClone(event), noMessageId].map((delivery) => formatAgentMessages([delivery], style));
+    for (const text of renders) {
+      const header = /^\[target=agent-event:(\S+) msg=(\S+) /.exec(text);
+      const body = /^event_id: (\S+)$/m.exec(text);
+      assert.ok(header && body, `${style}: header and event_id line`);
+      if (!header || !body) return;
+      assert.equal(body[1], eventId);
+      assert.equal(header[2], body[1].slice(0, 8), `${style}: msg= is the event_id's first 8 characters`);
+      assert.equal(header[1], header[2], `${style}: the agent-event target names the same id`);
+    }
   }
 });

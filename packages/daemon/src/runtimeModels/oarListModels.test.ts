@@ -39,6 +39,21 @@ test("ok with models maps to live, keeping tiers and the runtime's effort menu",
   });
 });
 
+test("the entry OAR marks default is the set's default only when the caller asks for it", async () => {
+  const lister = listerReturning({ kind: "ok", models: [{ id: "a/one" }, { id: "a/two", default: true }] });
+  const reported = await detectModelSourceViaOar({ ...BASE, lister, reportDefault: true });
+  assert.equal(reported.kind === "live" ? reported.value.default : null, "a/two");
+  const plain = await detectModelSourceViaOar({ ...BASE, lister });
+  assert.equal(plain.kind === "live" ? plain.value.default : null, undefined);
+  // A disabled default is not offered, so it is not the default either.
+  const disabled = await detectModelSourceViaOar({
+    ...BASE,
+    lister: listerReturning({ kind: "ok", models: [{ id: "a/one" }, { id: "a/two", default: true, disabled: { reason: "plan" } }] }),
+    reportDefault: true,
+  });
+  assert.equal(disabled.kind === "live" ? disabled.value.default : null, undefined);
+});
+
 test("ok with an empty list maps to no_models", async () => {
   assert.deepEqual(
     await detectModelSourceViaOar({ ...BASE, lister: listerReturning({ kind: "ok", models: [] }) }),
@@ -51,6 +66,30 @@ test("ok whose only entries are disabled maps to no_models, not a live list of u
     await detectModelSourceViaOar({ ...BASE, lister: listerReturning({ kind: "ok", models: [{ id: "a/x", disabled: { reason: "plan" } }] }) }),
     { kind: "no_models" },
   );
+});
+
+test("disabled entries are reported as unavailable with the runtime's reason, never as selectable models", async () => {
+  const outcome = await detectModelSourceViaOar({
+    ...BASE,
+    lister: listerReturning({
+      kind: "ok",
+      models: [
+        { id: "a/one", displayName: "One" },
+        { id: "a/new", displayName: "New", disabled: { reason: `  Update\n the CLI ${"x".repeat(300)}` } },
+        // Listed usable and disabled: usable wins, not repeated.
+        { id: "a/one", disabled: { reason: "dup" } },
+      ],
+    }),
+  });
+  assert.equal(outcome.kind, "live");
+  if (outcome.kind !== "live") return;
+  assert.deepEqual(outcome.value.models.map((model) => model.id), ["a/one"]);
+  assert.equal(outcome.value.unavailable?.length, 1);
+  const [entry] = outcome.value.unavailable!;
+  assert.equal(entry!.id, "a/new");
+  assert.equal(entry!.label, "New");
+  assert.ok(entry!.reason.startsWith("Update the CLI x"), "whitespace collapsed and trimmed");
+  assert.ok(entry!.reason.length <= 200, "length-capped");
 });
 
 test("unauthenticated maps to a retryable runtime_not_authenticated error", async () => {

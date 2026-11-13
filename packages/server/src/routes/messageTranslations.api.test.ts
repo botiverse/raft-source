@@ -1,3 +1,4 @@
+import { fillJointMembersFromChannelHumans } from "../test/jointMemberFill";
 import { fixturePasswordHash, tokenForHuman } from "../test/integration/credentials";
 import { createApiTest } from "../test/integration/apiTest";
 import assert from "node:assert/strict";
@@ -11,11 +12,13 @@ import {
   jointChannels,
   jointChannelServers,
   messageTranslations,
+  messages,
   serverMembers,
   servers,
   users,
 } from "../db/schema";
-import { assignMachine, createAgent } from "../services/agentService";
+import { createAgent } from "../services/agentService";
+import { placeAgentOnMachine } from "../test/agentMachineFixture";
 import { createChannel, getOrCreateThread } from "../services/channelService";
 import { registerMachine } from "../services/machineService";
 import {
@@ -34,7 +37,7 @@ import {
 } from "../services/translation/index";
 import { openTestApp } from "../test/integration/app";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 const TEST_PROVIDER_VERSION: TranslationProviderVersion = {
   provider: "fake",
@@ -43,12 +46,6 @@ const TEST_PROVIDER_VERSION: TranslationProviderVersion = {
 };
 const TEST_PROVIDER_VERSION_KEY = "fake@v0+fake-v0";
 const TEST_PLACEHOLDER_POLICY_VERSION = "placeholder-v0";
-const OPENAI_COMPATIBLE_TEST_PROVIDER_VERSION: TranslationProviderVersion = {
-  provider: "openai-compatible",
-  apiVersion: "v1",
-  policyVersion: "openai-compatible-translation-v1:test-model",
-};
-
 class FakeApiTranslationProvider implements TranslationProvider {
   constructor(readonly providerVersion: TranslationProviderVersion = TEST_PROVIDER_VERSION) {}
 
@@ -84,9 +81,6 @@ async function withTranslationProviderEnv(
 ): Promise<void> {
   const keys = new Set([
     "TRANSLATION_PROVIDER",
-    "TRANSLATION_OPENAI_COMPATIBLE_API_KEY",
-    "TRANSLATION_OPENAI_COMPATIBLE_MODEL",
-    "TRANSLATION_OPENAI_COMPATIBLE_ENDPOINT",
     "TRANSLATION_SSM_ENVIRONMENT",
   ]);
   const previous = new Map([...keys].map((key) => [key, process.env[key]]));
@@ -234,6 +228,42 @@ test("public translation generates anonymously only for messages still on the pu
     const revokedServer = await post([publicMessage.id]);
     assert.equal(revokedServer.status, 404);
   });
+});
+
+test("PATCH /api/auth/me stores the rail tab order complete, and null resets it", async ({ app }) => {
+  const user = await seedUser("rail-tab-order@slock.test", "rail-tab-order");
+  const token = await tokenForHuman(user.email);
+  const patch = (body: unknown) => fetch(`${app.baseUrl}/api/auth/me`, {
+    method: "PATCH",
+    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const me = async () => (await (await fetch(`${app.baseUrl}/api/auth/me`, {
+    headers: { Authorization: `Bearer ${token}` },
+  })).json() as { railTabOrder: string[] | null }).railTabOrder;
+
+  assert.equal(await me(), null, "no saved order reads as the default (null)");
+
+  // Unknown ids drop, repeats keep their first place, missing tabs follow in
+  // their default order.
+  const saved = await patch({ railTabOrder: ["tasks", "wiki", "chat", "tasks"] });
+  assert.equal(saved.status, 200);
+  // artifacts is left out, so it goes right after tasks (INSERTED_AFTER).
+  const expected = ["tasks", "artifacts", "chat", "search", "activity", "members", "computers", "apps", "assistant"];
+  assert.deepEqual((await saved.json() as { railTabOrder: string[] }).railTabOrder, expected);
+  assert.deepEqual(await me(), expected);
+  const [row] = await getDb().select({ railTabOrder: users.railTabOrder }).from(users).where(eq(users.id, user.id));
+  assert.deepEqual(row.railTabOrder, expected);
+
+  for (const invalid of ["tasks", [1, 2], { tasks: 0 }]) {
+    const res = await patch({ railTabOrder: invalid });
+    assert.equal(res.status, 400, `railTabOrder ${JSON.stringify(invalid)} is rejected`);
+  }
+  assert.deepEqual(await me(), expected, "a rejected order leaves the saved one");
+
+  const reset = await patch({ railTabOrder: null });
+  assert.equal(reset.status, 200);
+  assert.equal(await me(), null);
 });
 
 test("PATCH /api/auth/me updates account display preferences", async ({ app }) => {
@@ -432,36 +462,6 @@ test("PATCH /api/auth/me records referral source or referral skip", async ({ app
   assert.equal(invalidRes.status, 400);
 });
 
-test("POST /api/message-translations:batch gates the OpenAI-compatible provider to Pro servers", async ({ app }) => {
-  await withTranslationProviderEnv({
-    TRANSLATION_PROVIDER: "openai-compatible",
-    TRANSLATION_OPENAI_COMPATIBLE_API_KEY: "test-gate-key",
-    TRANSLATION_OPENAI_COMPATIBLE_MODEL: "test-model",
-  }, async () => {
-    const freeFixture = await seedFixture("openai-compatible-free");
-    const freeMessage = await createMessage(freeFixture.channel.id, "agent", freeFixture.agent.id, "你好 gated translation");
-    const freeToken = await tokenForHuman(freeFixture.owner.email);
-    setTestProvider(new FakeApiTranslationProvider(OPENAI_COMPATIBLE_TEST_PROVIDER_VERSION));
-    const denied = await postBatch(app.baseUrl, freeToken, freeFixture.server.id, {
-      targetLanguage: "en", mode: "manual", messageIds: [freeMessage.id],
-    });
-    assert.equal(denied.status, 403);
-    assert.deepEqual(await denied.json(), { error: "LLM translation is not available for this server" });
-
-    const proFixture = await seedFixture("openai-compatible-pro");
-    await proFixture.db.update(servers).set({ plan: "pro" }).where(eq(servers.id, proFixture.server.id));
-    const proMessage = await createMessage(proFixture.channel.id, "agent", proFixture.agent.id, "你好 pro translation");
-    const proToken = await tokenForHuman(proFixture.owner.email);
-    const allowed = await postBatch(app.baseUrl, proToken, proFixture.server.id, {
-      targetLanguage: "en", mode: "manual", messageIds: [proMessage.id],
-    });
-    assert.equal(allowed.status, 200);
-    const body = await allowed.json() as { results: Array<Record<string, unknown>> };
-    assert.equal(body.results[0]?.status, "translated");
-    assert.equal(body.results[0]?.provider, "openai-compatible");
-  });
-});
-
 test("POST /api/message-translations:batch translates visible messages and keeps history original-only", async ({ app }) => {
   const { db, owner, server, channel, agent } = await seedFixture("visible");
   const message = await createMessage(channel.id, "agent", agent.id, "你好 translation phase one");
@@ -624,6 +624,7 @@ test("POST /api/message-translations:batch resolves joint storage through the ac
       joinedByUserId: guestOwner.id,
     },
   ]);
+  await fillJointMembersFromChannelHumans();
 
   const visibleMessage = await createMessage(canonical.id, "user", hostOwner.id, "你好 joint translation");
   const guestToken = await tokenForHuman(guestOwner.email);
@@ -708,7 +709,7 @@ test("POST /api/message-translations:batch canonicalizes browser locale target b
   }
 
   setTestProvider(new FailingProvider());
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const { owner, server, channel, agent } = await seedFixture("locale-same-language");
     const englishMessage = await createMessage(channel.id, "agent", agent.id, "hello browser locale");
@@ -788,7 +789,7 @@ test("POST /api/message-translations:batch releases reserve on transient provide
   }
 
   setTestProvider(new TransientFailureProvider());
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const { db, owner, server, channel, agent } = await seedFixture("transient-failure");
     const message = await createMessage(channel.id, "agent", agent.id, "会触发瞬时失败的中文消息");
@@ -843,7 +844,7 @@ test("POST /api/message-translations:batch retains reserve and writes failed led
   }
 
   setTestProvider(new ContentDrivenFailureProvider());
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const { db, owner, server, channel, agent } = await seedFixture("content-failure");
     const message = await createMessage(channel.id, "agent", agent.id, "会触发内容失败的中文消息");
@@ -917,7 +918,7 @@ test("POST /api/message-translations:batch manual retry bypasses failed ledger r
 
   const provider = new FlakyProvider();
   setTestProvider(provider);
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const { db, owner, server, channel, agent } = await seedFixture("manual-retry-failed-ledger");
     const message = await createMessage(channel.id, "agent", agent.id, "重试应该重新调用 provider");
@@ -983,7 +984,7 @@ test("POST /api/message-translations:batch splits provider calls by source langu
 
   const provider = new SingleSourceProvider();
   setTestProvider(provider);
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const { owner, server, channel, agent } = await seedFixture("mixed-source-provider-split");
     const zhMessage = await createMessage(channel.id, "agent", agent.id, "你好，需要翻译");
@@ -1026,7 +1027,7 @@ test("POST /api/message-translations:batch keeps placeholder mismatch output out
   }
 
   setTestProvider(new PlaceholderMismatchProvider());
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const { db, owner, server, channel, agent } = await seedFixture("placeholder-failure");
     const message = await createMessage(channel.id, "agent", agent.id, "你好 {USER_NAME}");
@@ -1060,7 +1061,7 @@ test("POST /api/message-translations:batch keeps placeholder mismatch output out
 test("agent receive returns orchestrator original content even when a translation ledger row exists", async ({ app }) => {
   const { owner, member, server, channel, agent } = await seedFixture("agent-original");
   const { machine, apiKey } = await registerMachine(server.id, owner.id, "translation-agent-original-machine");
-  await assignMachine(agent.id, machine.id);
+  await placeAgentOnMachine(agent.id, machine.id);
   const message = await createMessage(channel.id, "user", owner.id, "agent must see original");
   const memberToken = await tokenForHuman(member.email);
   const translationRes = await postBatch(app.baseUrl, memberToken, server.id, {
@@ -1099,4 +1100,22 @@ test("agent receive returns orchestrator original content even when a translatio
   assert.equal(receiveRes.status, 200);
   const receiveBody = await receiveRes.json() as { messages: Array<{ content: string }> };
   assert.equal(receiveBody.messages[0].content, "agent must see original");
+});
+
+test("POST /api/message-translations:batch answers not_found for a message behind a Free server's 30-day window", async ({ app }) => {
+  const { db, owner, server, channel, agent } = await seedFixture("history-window");
+  const old = await createMessage(channel.id, "agent", agent.id, "你好 an old message");
+  const recent = await createMessage(channel.id, "agent", agent.id, "你好 a recent message");
+  await db.update(messages).set({ createdAt: new Date(Date.now() - 40 * 24 * 60 * 60 * 1000) }).where(eq(messages.id, old.id));
+  await db.update(servers).set({ plan: "free" }).where(eq(servers.id, server.id));
+  const ownerToken = await tokenForHuman(owner.email);
+
+  const res = await postBatch(app.baseUrl, ownerToken, server.id, {
+    targetLanguage: "en",
+    mode: "manual",
+    messageIds: [old.id, recent.id],
+  });
+  assert.equal(res.status, 200);
+  const results = (await res.json() as { results: Array<{ messageId: string; status: string }> }).results;
+  assert.deepEqual(results.map((row) => [row.messageId, row.status]), [[old.id, "not_found"], [recent.id, "translated"]]);
 });

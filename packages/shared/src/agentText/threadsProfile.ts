@@ -6,6 +6,7 @@
 import type { AgentApiThreadListItem } from "../agentApiContract";
 import type { AgentProfileView, HumanProfileView, ProfileCreatedAgentSummary, ProfileView } from "../index";
 import { getRuntimeDisplayName, isRuntimeDeprecated } from "../runtimeCatalog";
+import { foldAgentOneLineText, indentAgentBodyContinuationLines } from "../agentMessageText";
 
 /** Renders a runtime id for display; defaults to the product name plus a deprecation suffix. */
 export type AgentRuntimeLabel = (runtimeId: string) => string;
@@ -58,8 +59,8 @@ function formatHumanProfile(profile: HumanProfileView, runtimeLabel: AgentRuntim
     "",
     "- Type: human",
     `- Handle: @${profile.name}`,
-    `- Display Name: ${profile.displayName ?? "(none)"}`,
-    `- Description: ${profile.description ?? "(none)"}`,
+    `- Display Name: ${profile.displayName ? foldAgentOneLineText(profile.displayName) : "(none)"}`,
+    `- Description: ${profile.description ? indentAgentBodyContinuationLines(profile.description) : "(none)"}`,
     `- Membership: ${profile.membershipStatus}`,
   ];
 
@@ -73,7 +74,7 @@ function formatHumanProfile(profile: HumanProfileView, runtimeLabel: AgentRuntim
 function formatCreator(profile: AgentProfileView): string | null {
   if (!profile.creator) return null;
   return profile.creator.displayName
-    ? `${profile.creator.displayName} (@${profile.creator.name})`
+    ? `${foldAgentOneLineText(profile.creator.displayName)} (@${profile.creator.name})`
     : `@${profile.creator.name}`;
 }
 
@@ -83,8 +84,8 @@ function formatAgentProfileCard(profile: AgentProfileView, runtimeLabel: AgentRu
     "",
     "- Type: agent",
     `- Handle: @${profile.name}`,
-    `- Display Name: ${profile.displayName ?? "(none)"}`,
-    `- Description: ${profile.description ?? "(none)"}`,
+    `- Display Name: ${profile.displayName ? foldAgentOneLineText(profile.displayName) : "(none)"}`,
+    `- Description: ${profile.description ? indentAgentBodyContinuationLines(profile.description) : "(none)"}`,
     `- Status: ${profile.status}`,
     `- Role: ${profile.serverRole}`,
     `- Runtime: ${runtimeLabel(profile.runtime)}`,

@@ -2,10 +2,7 @@
   "protocolVersion": 2,
   "runtimeId": "grok",
   "schemaVersion": "grok.create.v1",
-  "requiredClientCapabilities": [
-    "choice.labels",
-    "option_source.status"
-  ],
+  "requiredClientCapabilities": [],
   "dataSchema": {
     "type": "object",
     "additionalProperties": false,
@@ -58,6 +55,14 @@
         "label": "Reasoning",
         "hint": "Available values depend on the selected model.",
         "choices": {
+          "off": {
+            "label": "No reasoning",
+            "description": "Answers directly, without a thinking phase"
+          },
+          "minimal": {
+            "label": "Minimal",
+            "description": "Very light reasoning for the fastest responses"
+          },
           "low": {
             "label": "Low",
             "description": "Fast responses with lighter reasoning"
@@ -71,7 +76,7 @@
             "description": "Greater reasoning depth for complex problems"
           },
           "xhigh": {
-            "label": "Extra High",
+            "label": "Extra high",
             "description": "Extra high reasoning depth for complex problems"
           },
           "max": {

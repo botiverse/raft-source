@@ -84,7 +84,7 @@ export function AgentArchiveSection({ agent, canManage }: { agent: Agent; canMan
   return (
     <section
       aria-labelledby="agent-archive-section-title"
-      className="px-5 py-4 border-t border-line-hairline"
+      className="px-(--surface-inset) py-4 border-t border-line-hairline"
       data-testid="agent-archive-section"
     >
       <h3 id="agent-archive-section-title" className="mb-3">
@@ -134,7 +134,7 @@ export function AgentArchiveSection({ agent, canManage }: { agent: Agent; canMan
           button lives in the confirm dialog (DS Button › danger). */}
       {canDeleteWorkspace && (
         <div className="mt-3">
-          <Button variant="outline" size="sm" className="w-full" onClick={openDeleteWorkspace} data-testid="agent-archive-delete-workspace-button">
+          <Button variant="outline" size="md" className="w-full" onClick={openDeleteWorkspace} data-testid="agent-archive-delete-workspace-button">
             {formatMessage({ id: "agent.archive.action.deleteWorkspace" })}
           </Button>
         </div>

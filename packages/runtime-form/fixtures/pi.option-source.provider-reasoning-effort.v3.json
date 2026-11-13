@@ -1,0 +1,84 @@
+{
+  "protocolVersion": 1,
+  "runtimeId": "pi",
+  "schemaVersion": "pi.create.v1",
+  "sourceId": "providerReasoningEffort",
+  "kind": "dependent_select",
+  "pointer": "/providerReasoningEffort",
+  "dependsOn": "/providerModel",
+  "optionsByValue": {
+    "deepseek/deepseek-v4-pro": [
+      {
+        "value": "",
+        "label": "Default"
+      },
+      {
+        "value": "off",
+        "label": "No reasoning"
+      },
+      {
+        "value": "minimal",
+        "label": "Minimal"
+      },
+      {
+        "value": "low",
+        "label": "Low"
+      },
+      {
+        "value": "medium",
+        "label": "Medium"
+      },
+      {
+        "value": "high",
+        "label": "High"
+      },
+      {
+        "value": "xhigh",
+        "label": "Extra high"
+      },
+      {
+        "value": "max",
+        "label": "Max"
+      }
+    ],
+    "deepseek/deepseek-flash": [
+      {
+        "value": "",
+        "label": "Default"
+      },
+      {
+        "value": "off",
+        "label": "No reasoning"
+      },
+      {
+        "value": "minimal",
+        "label": "Minimal"
+      },
+      {
+        "value": "low",
+        "label": "Low"
+      },
+      {
+        "value": "medium",
+        "label": "Medium"
+      },
+      {
+        "value": "high",
+        "label": "High"
+      },
+      {
+        "value": "xhigh",
+        "label": "Extra high"
+      },
+      {
+        "value": "max",
+        "label": "Max"
+      }
+    ]
+  },
+  "defaultValueByValue": {
+    "deepseek/deepseek-v4-pro": "",
+    "deepseek/deepseek-flash": ""
+  },
+  "customValueAllowedByValue": {}
+}

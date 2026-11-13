@@ -3,6 +3,7 @@
 // the server's External Agent inbox notice push, so both render the same rows.
 import type { AgentInboxFlag, AgentInboxTargetRow } from "./agentInbox";
 import type { AttentionHint } from "./attentionDependencyOracle";
+import { formatAgentMessageTaskRef } from "./agentMessageText";
 
 export type AgentInboxProjectionMessage = {
   seq?: number;
@@ -20,11 +21,108 @@ export type AgentInboxProjectionMessage = {
   senderName?: string;
   task_number?: number | null;
   task_status?: string | null;
+  /** Task v2: tasks hanging under the message (servers with task v2 conversations only). */
+  source_tasks?: readonly unknown[] | null;
+  /** Task v2: the message is in this task's own conversation (its target is the task ref). */
+  task_conversation_number?: number | null;
   mentioned?: boolean;
   non_member_mention?: boolean;
   attention_hint?: AttentionHint;
-  third_party_event?: { id?: string; kind?: string } | null;
+  /**
+   * `inbox_item_unread` (#wg-ax:#24): how many unread events the Server counts
+   * on that inbox item when it pushed this one. Events that joined the item
+   * without a wake are never pushed, so the row's count comes from here.
+   */
+  third_party_event?: { id?: string; kind?: string; client_id?: string; client_name?: string; inbox_item_target?: string; inbox_item_unread?: number } | null;
+  /** Message body; read only by the latest-message previews below. */
+  content?: string;
+  /** A preview shows text only, so a message with attachments is never shown whole. */
+  attachments?: readonly unknown[] | null;
 };
+
+/**
+ * Task #387: the start of the latest pending message of a target, so an agent
+ * woken by a notice can see an un-@'d "stop" without opening the target.
+ *
+ * It is a PREVIEW, not a read: rendering it advances no cursor and the message
+ * stays pending. Only a preview that shows the whole message counts as seen
+ * (projectAgentInboxWholePreviewMessages). It is computed at render time for
+ * the managed runtime notice only and is never put on AgentInboxTargetRow, so
+ * the row wire schema and the external inbox push stay content-free.
+ */
+export type AgentInboxLatestPreview = {
+  senderName?: string;
+  text: string;
+  truncated: boolean;
+};
+
+export const AGENT_INBOX_LATEST_PREVIEW_MAX_CHARS = 80;
+
+// C0/C1 controls, line/paragraph separators and bidi overrides/isolates: none
+// may reach the notice, where they could forge lines or reorder what is shown.
+const PREVIEW_UNSAFE_CHARS = /[\u0000-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069]+/gu;
+
+export function formatAgentInboxPreviewText(
+  content: string,
+  maxChars: number = AGENT_INBOX_LATEST_PREVIEW_MAX_CHARS,
+): { text: string; truncated: boolean } | null {
+  const flat = content.replace(PREVIEW_UNSAFE_CHARS, " ").replace(/\s+/gu, " ").trim();
+  if (!flat) return null;
+  // Latin sentence ends need a following space (so "v1.2" is not an end);
+  // CJK ones (。！？) do not.
+  const sentence = /^(.+?(?:[.!?](?=\s|$)|[\u3002\uff01\uff1f]))/u.exec(flat)?.[1] ?? flat;
+  const chars = [...sentence];
+  const text = chars.length > maxChars ? chars.slice(0, maxChars).join("").trimEnd() : sentence;
+  return { text, truncated: text.length < flat.length };
+}
+
+function latestPreviewedMessageByTarget<T extends AgentInboxProjectionMessage>(
+  messages: readonly T[],
+): Map<string, T> {
+  const latestByTarget = new Map<string, T>();
+  for (const message of messages) {
+    if (message.third_party_event) continue;
+    const target = formatInboxMessageTarget(message);
+    if (!target) continue;
+    const current = latestByTarget.get(target);
+    if (!current || compareInboxMessages(current, message) < 0) latestByTarget.set(target, message);
+  }
+  return latestByTarget;
+}
+
+export function projectAgentInboxLatestPreviews(
+  messages: readonly AgentInboxProjectionMessage[],
+): Map<string, AgentInboxLatestPreview> {
+  const previews = new Map<string, AgentInboxLatestPreview>();
+  for (const [target, message] of latestPreviewedMessageByTarget(messages)) {
+    if (typeof message.content !== "string") continue;
+    const preview = formatAgentInboxPreviewText(message.content);
+    if (!preview) continue;
+    const senderName = message.sender_name ?? message.senderName;
+    previews.set(target, { ...(senderName ? { senderName } : {}), ...preview });
+  }
+  return previews;
+}
+
+/**
+ * The messages a notice's previews show whole: each target's latest message
+ * when its preview is not cut and it has no attachments. The model has read
+ * all of such a message, so the daemon records it as seen (exact id only),
+ * and the agent's reply is not held for the message it is answering. It stays
+ * pending and unread: the notice still names it and `--unread` still returns it.
+ */
+export function projectAgentInboxWholePreviewMessages<T extends AgentInboxProjectionMessage>(
+  messages: readonly T[],
+): T[] {
+  const whole: T[] = [];
+  for (const message of latestPreviewedMessageByTarget(messages).values()) {
+    if (typeof message.content !== "string") continue;
+    if ((message.attachments?.length ?? 0) > 0) continue;
+    const preview = formatAgentInboxPreviewText(message.content);
+    if (preview && !preview.truncated) whole.push(message);
+  }
+  return whole;
+}
 
 /**
  * Suppressed counts arrive as a SIBLING of the message list, never inside it.
@@ -65,13 +163,60 @@ function usableCount(value: number | undefined): number | undefined {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : undefined;
 }
 
+export const AGENT_INBOX_ITEM_TARGET_MAX_CHARS = 512;
+
+// Whitespace, C0/C1 controls, line/paragraph separators, zero-width and bidi marks, overrides and
+// isolates, and what would break out of the double-quoted `--target "..."`
+// the read line prints (`"`, `\`, `` ` ``, `$`).
+const ITEM_TARGET_UNSAFE = String.raw`\s\u0000-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069\u200b-\u200f\ufeff"\\$` + "`";
+
+/** `app:<key>` or `app:<key>/<ref>`, nothing empty, nothing unsafe. */
+const APP_INBOX_ITEM_TARGET = new RegExp(String.raw`^app:([^/${ITEM_TARGET_UNSAFE}]+)(?:/([^${ITEM_TARGET_UNSAFE}]+))?$`, "u");
+
+export type ThirdPartyEventInboxItemTarget = {
+  /** `app:<key>/<ref>` or `app:<key>`, as the Server sent it. */
+  target: string;
+  /** The `<ref>` part; absent for an app's fallback item. */
+  objectRef?: string;
+};
+
+/**
+ * RFC 081: the inbox item a third-party event is listed under, from the
+ * Server's `third_party_event.inbox_item_target`. It is server data rendered
+ * into agent text, so anything but a well-formed `app:` target (a string, at
+ * most AGENT_INBOX_ITEM_TARGET_MAX_CHARS, no whitespace or control
+ * characters, non-empty key and ref) counts as absent: the event then stays
+ * in the grouped third-party events row.
+ */
+export function thirdPartyEventInboxItemTarget(
+  message: Pick<AgentInboxProjectionMessage, "third_party_event">,
+): ThirdPartyEventInboxItemTarget | null {
+  const raw: unknown = message.third_party_event?.inbox_item_target;
+  if (typeof raw !== "string" || raw.length > AGENT_INBOX_ITEM_TARGET_MAX_CHARS) return null;
+  const match = APP_INBOX_ITEM_TARGET.exec(raw);
+  if (!match) return null;
+  return match[2] ? { target: raw, objectRef: match[2] } : { target: raw };
+}
+
+export type AgentInboxSnapshotOptions = {
+  /**
+   * RFC 081, inbox items on (the daemon passes it only then): a third-party
+   * event listed as an inbox item (thirdPartyEventInboxItemTarget) is bucketed
+   * under its `app:` item instead of the grouped third-party events row. Off
+   * (default, and the server's External Agent push): the field is ignored.
+   */
+  appInboxItemTargets?: boolean;
+};
+
 export function projectAgentInboxSnapshot(
   messages: readonly AgentInboxProjectionMessage[],
   suppressedByTarget?: SuppressedByTarget,
+  options: AgentInboxSnapshotOptions = {},
 ): AgentInboxTargetRow[] {
   const buckets = new Map<string, AgentInboxProjectionMessage[]>();
   for (const message of messages) {
-    const target = formatInboxMessageTarget(message);
+    const target = (options.appInboxItemTargets === true ? thirdPartyEventInboxItemTarget(message)?.target : undefined)
+      ?? formatInboxMessageTarget(message);
     if (!target) continue;
     const bucket = buckets.get(target) ?? [];
     bucket.push(message);
@@ -79,7 +224,7 @@ export function projectAgentInboxSnapshot(
   }
 
   const rows = [...buckets.entries()].map(([target, bucket]) => {
-    const row = projectBucket(target, bucket);
+    const row = withServerUnread(projectBucket(target, bucket), bucket, options);
     const suppressed = usableCount(suppressedByTarget?.get(target));
     return suppressed === undefined ? row : { ...row, suppressedCount: suppressed };
   });
@@ -99,15 +244,58 @@ export function projectAgentInboxSnapshot(
     .sort((a, b) => (b.latestSeq ?? 0) - (a.latestSeq ?? 0) || a.target.localeCompare(b.target));
 }
 
+/**
+ * An app inbox item's count is the Server's (#wg-ax:#24): later events on an
+ * unread item join it without being pushed, so the pushed ones under-count
+ * it. The largest well-formed `inbox_item_unread` among them, never below
+ * what is here, so the wake notice reads as `inbox check` does.
+ */
+function withServerUnread(row: AgentInboxTargetRow, bucket: readonly AgentInboxProjectionMessage[], options: AgentInboxSnapshotOptions): AgentInboxTargetRow {
+  if (options.appInboxItemTargets !== true || !row.target.startsWith("app:")) return row;
+  let unread = row.pendingCount;
+  for (const message of bucket) {
+    const raw: unknown = message.third_party_event?.inbox_item_unread;
+    if (typeof raw === "number" && Number.isInteger(raw) && raw > unread && raw <= AGENT_INBOX_ITEM_UNREAD_MAX) unread = raw;
+  }
+  return unread === row.pendingCount ? row : { ...row, pendingCount: unread };
+}
+
+/** No item holds more unread events than this (an agent keeps at most 7 days of them); anything above is not believed. */
+const AGENT_INBOX_ITEM_UNREAD_MAX = 100_000;
+
+/** A row the snapshot buckets under an app inbox item (only with `appInboxItemTargets`). */
+export function isAppInboxItemTargetRow(row: Pick<AgentInboxTargetRow, "target">): boolean {
+  return row.target.startsWith("app:");
+}
+
+/**
+ * RFC 081, inbox items on, for a list that sits beside the Server's own (the
+ * daemon's `inbox check` snapshot): the Server lists every third-party event
+ * it marks with an inbox item, so they leave both the rows and the pending
+ * messages, and the grouped third-party row counts only the events the
+ * Server does not list. The same projection the wake-up notice renders its
+ * rows from, so the two grouped counts cannot drift.
+ */
+export function projectAgentInboxSnapshotWithoutAppItems<T extends AgentInboxProjectionMessage>(
+  messages: readonly T[],
+): { rows: AgentInboxTargetRow[]; pending: T[] } {
+  return {
+    rows: projectAgentInboxSnapshot(messages, undefined, { appInboxItemTargets: true }).filter((row) => !isAppInboxItemTargetRow(row)),
+    pending: messages.filter((message) => thirdPartyEventInboxItemTarget(message) === null),
+  };
+}
+
 function projectBucket(target: string, messages: readonly AgentInboxProjectionMessage[]): AgentInboxTargetRow {
   const sorted = [...messages].sort(compareInboxMessages);
   const first = sorted[0];
   const latest = sorted[sorted.length - 1];
   const flags = new Set<AgentInboxFlag>();
   for (const message of messages) {
-    if (message.channel_type === "thread") flags.add("thread");
+    // Task v2: a task's own conversation is a task row, not a thread row.
+    if (message.channel_type === "thread" && !message.task_conversation_number) flags.add("thread");
+    if (message.task_conversation_number) flags.add("task");
     if (message.channel_type === "dm") flags.add("dm");
-    if (message.task_number || message.task_status) flags.add("task");
+    if (message.task_number || message.task_status || message.source_tasks?.length) flags.add("task");
     if (message.mentioned === true) flags.add("mention");
     if (message.non_member_mention === true) flags.add("non_member_mention");
   }
@@ -140,6 +328,9 @@ function compareInboxMessages(a: AgentInboxProjectionMessage, b: AgentInboxProje
  * Null when the message has no conversation name (e.g. third-party events).
  */
 export function formatInboxMessageTarget(message: AgentInboxProjectionMessage): string | null {
+  // Task v2: a task's own conversation is addressed by its ref (`#name:#7`).
+  const taskRef = formatAgentMessageTaskRef(message);
+  if (taskRef) return taskRef;
   if (message.channel_type === "thread" && message.parent_channel_name && message.channel_name) {
     const shortId = shortMessageId(String(message.channel_name).startsWith("thread-")
       ? String(message.channel_name).slice("thread-".length)

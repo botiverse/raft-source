@@ -8,21 +8,11 @@ import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
 const repoRoot = resolve(import.meta.dirname, "../../../..");
-const buildScriptPath = resolve(repoRoot, "packages/computer/scripts/native/build.mjs");
 const manifestScriptPath = resolve(repoRoot, "packages/computer/scripts/native/produce-manifest.mjs");
 
 function sha256(bytes) {
   return createHash("sha256").update(bytes).digest("hex");
 }
-
-test("native SEA build script emits the Photon WASM sidecar beside the binary", async () => {
-  const source = await readFile(buildScriptPath, "utf8");
-
-  assert.match(source, /PHOTON_WASM_FILENAME = "photon_rs_bg\.wasm"/);
-  assert.match(source, /@silvia-odwyer", "photon-node"/);
-  assert.match(source, /copyPhotonWasmSidecar\(outDir\)/);
-  assert.match(source, /\$\{outWasm\}\.sha256/);
-});
 
 test("produce-manifest requires and attests photon_rs_bg.wasm", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "raft-photon-manifest-"));

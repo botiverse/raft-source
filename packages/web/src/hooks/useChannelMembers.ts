@@ -1,11 +1,12 @@
 import { useEffect, useState, useCallback, useMemo, useRef } from "react";
-import type { AgentActivity, ChannelAdminBasis, ChannelRole, ServerRole } from "@botiverse/raft-shared";
+import type { AgentActivity, ChannelAdminBasis, ChannelRole, RuntimeErrorCode, ServerRole } from "@botiverse/raft-shared";
 import type { Agent } from "../store/agentStore";
 import { useAgentStore } from "../store/agentStore";
 import api from "../api/client";
 import type { ChannelMemberServer } from "../utils/channelLocalMembership";
 import { getSocket } from "../api/socket";
 import { notifyChannelMembersChanged, subscribeChannelMembersChanged } from "../store/channelMemberEvents";
+import { agentActorRow, currentActorScope, humanActorRow, upsertActorsIfCurrent } from "../store/localTables/actorResolve";
 
 // oxlint-disable react-doctor/no-event-handler -- effect-as-subscription bridge (subscribeChannelMembersChanged); structure pinned by channelMemberEvents.test.ts, cannot inline-disable inside. YMNNE-family grandfathered; rule gates new code elsewhere. See docs/frontend/render-cost-contract.md.
 
@@ -17,27 +18,38 @@ export interface ChannelHuman {
   /** Joint channels only (RFC 075 phase 1): every server this person
    *  participates through, the viewed server first. */
   servers?: ChannelMemberServer[];
+  /** Joint rosters only: whether the
+   *  person belongs to the viewed server, any role including guest. There
+   *  `servers` is their sources minus the viewed server. */
+  inViewerServer?: boolean;
   name: string;
   displayName: string | null;
   description: string | null;
   avatarUrl: string | null;
-  gravatarHash: string;
-  role: ServerRole;
-  serverRole: ServerRole;
-  channelRole: ChannelRole;
+  /** Null for another server's person in a joint channel: their roles stay
+   *  with their organization, and they read as a plain member. */
+  role: ServerRole | null;
+  serverRole: ServerRole | null;
+  channelRole: ChannelRole | null;
   effectiveChannelRole: "owner" | "admin" | "member" | "guest";
   channelAdminBasis: ChannelAdminBasis;
   canChangeChannelRole: boolean;
+  canRemoveFromChannel?: boolean;
 }
 
 export type ChannelAgent = Agent & {
+  /** Computed joint rosters only: the agent's one server is the viewed one. */
+  inViewerServer?: boolean;
   activity?: AgentActivity;
   activityDetail?: string;
+  /** #wg-rbac:#57: the error's code while `activity` is "error". */
+  activityErrorCode?: RuntimeErrorCode;
   serverRole?: ServerRole | null;
   channelRole?: ChannelRole | null;
   effectiveChannelRole?: "admin" | "member";
   channelAdminBasis?: ChannelAdminBasis;
   canChangeChannelRole?: boolean;
+  canRemoveFromChannel?: boolean;
 };
 
 export interface ChannelExternalMember {
@@ -46,6 +58,7 @@ export interface ChannelExternalMember {
   displayName: string;
   handles: string[];
   actorKind: "human" | "guest" | "remote" | "bot" | "unknown";
+  mentionable?: boolean;
   avatarUrl: string | null;
   /** Slack workspace display name for the external-identity panel
    *  ("from <workspace>" line). Provider-side ids stay server-side. */
@@ -83,12 +96,25 @@ function requestChannelMembers(channelId: string): Promise<ChannelMembersPayload
   const existing = inFlightMemberRequests.get(channelId);
   if (existing) return existing;
 
+  const actorScope = currentActorScope();
   const request = api.get(`/channels/${channelId}/members`)
-    .then(({ data }) => ({
-      agents: (data.agents ?? []) as ChannelAgent[],
-      humans: (data.humans ?? []) as ChannelHuman[],
-      externalMembers: (data.externalMembers ?? []) as ChannelExternalMember[],
-    }))
+    .then(({ data }) => {
+      const payload = {
+        agents: (data.agents ?? []) as ChannelAgent[],
+        humans: (data.humans ?? []) as ChannelHuman[],
+        externalMembers: (data.externalMembers ?? []) as ChannelExternalMember[],
+      };
+      // A joint channel's roster names the other server's people and agents
+      // with their own serverId: the one place their faces arrive in bulk.
+      // Entries without a serverId are skipped rather than guessed.
+      if (actorScope) {
+        upsertActorsIfCurrent(actorScope, [
+          ...payload.humans.map((human) => humanActorRow(human.id, human)),
+          ...payload.agents.map((agent) => agentActorRow(agent)),
+        ]);
+      }
+      return payload;
+    })
     .finally(() => {
       if (inFlightMemberRequests.get(channelId) === request) {
         inFlightMemberRequests.delete(channelId);
@@ -99,10 +125,14 @@ function requestChannelMembers(channelId: string): Promise<ChannelMembersPayload
 }
 
 function hydrateChannelAgentActivities(agents: ChannelAgent[]) {
-  const updateActivity = useAgentStore.getState().updateActivity;
+  const { updateActivity, seedExternalSeenFromRoster } = useAgentStore.getState();
+  // A joint channel's other-server external agents: presence is in no agent
+  // list the viewer has, so the roster's lastSeenAt seeds it.
+  seedExternalSeenFromRoster(agents);
   for (const agent of agents) {
     if (typeof agent.activity === "string") {
-      updateActivity(agent.id, agent.activity, agent.activityDetail || "");
+      // #wg-rbac:#57: the roster's code, so a member's status reads its catalog copy.
+      updateActivity(agent.id, agent.activity, agent.activityDetail || "", undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, agent.activityErrorCode);
     }
   }
 }

@@ -58,7 +58,8 @@ SELECT 'serving v8 threads below an unavailable parent (mention-only)' AS check_
       AND (pc.deleted_at IS NOT NULL OR pc.archived_at IS NOT NULL
            OR (pc.type <> 'channel' AND pch.user_id IS NULL AND pca.agent_id IS NULL))) AS n;
 
--- 4. The sidebar (rw_conversation_unread_v3, unchanged by 077) already drops them:
+-- 4. (Skip where rw_conversation_unread_v3 is not built.)
+--    The sidebar (rw_conversation_unread_v3, unchanged by 077) already drops them:
 --    a thread there needs a live, unarchived parent the receiver can see.
 SELECT 'sidebar threads below an unavailable parent' AS check_name,
   (SELECT COUNT(*) FROM rw_conversation_unread_v3 AS u

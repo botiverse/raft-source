@@ -1,7 +1,7 @@
 import { defineConfig } from "tsdown";
 
 export default defineConfig({
-  entry: ["src/index.ts", "src/core.ts", "src/bundledRaftCli.ts", "src/runtimeDetectionChild.ts"],
+  entry: ["src/index.ts", "src/core.ts", "src/bundledRaftCli.ts", "src/runtimeDetectionChild.ts", "src/agentContextView/contextViewRestoreChild.ts"],
   format: "esm",
   target: "node20",
   platform: "node",
@@ -11,4 +11,7 @@ export default defineConfig({
   fixedExtension: false,
   clean: true,
   dts: false,
+  // #oar-raft:#10: the Cursor SDK is a daemon dependency that OAR's child
+  // imports by file URL, never bundled (native binaries; oarLoader.ts).
+  deps: { neverBundle: ["@cursor/sdk"] },
 });

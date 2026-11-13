@@ -1,5 +1,8 @@
+import { useInboxStore } from "./inboxStore";
 import { useTaskStore } from "./taskStore";
 import type { Task } from "./taskStore";
+import { useThreadStore } from "./threadStore";
+import { forgetDeletedTaskRef } from "../components/task/useTaskRefTask";
 
 export type TaskRealtimeSocket = {
   on: (event: string, handler: (data: any) => void) => unknown;
@@ -8,6 +11,33 @@ export type TaskRealtimeSocket = {
 
 export function applyTaskRealtimeUpdate(task: Task) {
   useTaskStore.getState().upsertTask(task);
+}
+
+/** `task:deleted`; `conversationChannelId` is the conversation as this surface saw it (task v2). */
+export type TaskDeletedEvent = { channelId: string; taskId: string; conversationChannelId?: string | null };
+
+/**
+ * A deleted task (`task:deleted`): drop it from the boards and, for a task v2
+ * task, everything that still shows its conversation (deleted server-side with
+ * it): the Activity and Unfollowed rows, the followed-list row, the task
+ * dialog open on it, and a `#channel:#N` chip that fetched it.
+ */
+export function applyTaskDeleted(data: TaskDeletedEvent) {
+  useTaskStore.getState().removeTask(data.taskId);
+  forgetDeletedTaskRef(data.taskId);
+  const conversationChannelId = typeof data.conversationChannelId === "string" ? data.conversationChannelId : null;
+  useThreadStore.getState().dropDeletedTaskConversation({ taskId: data.taskId, conversationChannelId });
+  if (conversationChannelId) useInboxStore.getState().removeConversation(conversationChannelId);
+}
+
+/** Whether a `task:deleted` names the task (or the conversation) a task window shows. */
+export function isTaskDeletedForTarget(
+  data: TaskDeletedEvent | null | undefined,
+  target: { taskId: string | null; conversationChannelId: string | null },
+): boolean {
+  if (!data || typeof data.taskId !== "string") return false;
+  if (target.taskId !== null && data.taskId === target.taskId) return true;
+  return !!data.conversationChannelId && data.conversationChannelId === target.conversationChannelId;
 }
 
 export function registerTaskRealtimeHandlers(socket: TaskRealtimeSocket): () => void {
@@ -19,8 +49,8 @@ export function registerTaskRealtimeHandlers(socket: TaskRealtimeSocket): () => 
   const handleTaskUpdated = (data: { channelId: string; task: Task }) => {
     applyTaskRealtimeUpdate(data.task);
   };
-  const handleTaskDeleted = (data: { channelId: string; taskId: string }) => {
-    useTaskStore.getState().removeTask(data.taskId);
+  const handleTaskDeleted = (data: TaskDeletedEvent) => {
+    applyTaskDeleted(data);
   };
   // When the socket drops, the server-tasks list can no longer be assumed
   // complete: task:created/updated/deleted events during the gap are lost (the

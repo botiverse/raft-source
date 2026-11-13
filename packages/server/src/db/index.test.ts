@@ -4,15 +4,19 @@ import { BasicTracer, MemoryTraceSink, noopTracer, traceSpanFactRowForSpan } fro
 import type pg from "pg";
 import { dbQueryDuration, dbQueryErrorsTotal, pgPoolReadOnlyClientRecycledTotal } from "../metrics";
 import { traceQuerySpan } from "../tracing/queryTrace";
-import { runWithTraceSpan } from "../tracing/semanticTrace";
+import { runWithTraceSpan, setDefaultTraceTracer } from "../tracing/semanticTrace";
 import {
   executeCancellablePgPoolSql,
+  executeSearchSqlWithPrimaryFallback,
   getSqlTraceHash,
   instrumentPool,
   isReadOnlyTransactionError,
+  searchReplicaFallbackReason,
   setDbTracer,
   withDbTraceAttributes,
 } from "./index";
+import { withLockOrderRecording } from "./lockOrderRecorder";
+import { withStatementStats } from "./statementStats";
 
 const realDateNow = Date.now;
 const TRACE_EVENT_ROW_TEST_RESOURCE = {
@@ -23,6 +27,7 @@ const TRACE_EVENT_ROW_TEST_RESOURCE = {
 afterEach(() => {
   Date.now = realDateNow;
   setDbTracer(noopTracer);
+  setDefaultTraceTracer(null);
 });
 
 test("getSqlTraceHash shares the pool instrumentation's parameter-insensitive SQL identity", () => {
@@ -989,4 +994,212 @@ test("a statement that fails with a lock conflict records db.lock_conflict befor
     assert.equal(JSON.stringify(event.attrs).includes("paused"), false, "no literal values");
     assert.equal(JSON.stringify(event.attrs).includes("b-secret"), false, "no parameters");
   }
+});
+
+test("db.lock_order lists a deadlocked attempt's explicit locks in order, with row roles and no values", async () => {
+  let now = 0;
+  Date.now = () => now;
+  const sink = new MemoryTraceSink();
+  setDbTracer(new BasicTracer({ sink, clock: () => now }));
+  setDefaultTraceTracer(new BasicTracer({ sink, clock: () => now }));
+  const client = new FakeClient();
+  const pool = new FakePool(client) as unknown as pg.Pool;
+  instrumentPool("primary", pool);
+  const deadlock = Object.assign(new Error("deadlock"), { code: "40P01" });
+
+  await assert.rejects(withLockOrderRecording({
+    transaction: "test.tx",
+    serverId: "server-1",
+    rowRoles: { permission: "chan-a", request: "chan-a", stored: "chan-b" },
+  }, async () => {
+    const checkedOut = await pool.connect();
+    await checkedOut.query("begin");
+    now = 5;
+    await checkedOut.query('select "id" from "channels" where "id" = $1 for no key update', ["chan-a"]);
+    await checkedOut.query('insert into "messages" ("id") values ($1)', ["secret-body"]);
+    now = 7;
+    await checkedOut.query('update "channels" set "seq" = $1 where "id" = $2', [1, "chan-b"]);
+    client.queryError = deadlock;
+    now = 9;
+    await checkedOut.query('select "id" from "channels" where "id" = $1 for no key update', ["chan-b"]).finally(() => {
+      client.queryError = undefined;
+      checkedOut.release();
+    });
+  }), deadlock);
+
+  const [event] = sink.getAllLogEvents().filter((candidate) => candidate.name === "db.lock_order");
+  assert.equal(event?.attrs?.trigger, "deadlock");
+  assert.equal(event?.attrs?.transaction, "test.tx");
+  assert.equal(event?.attrs?.server_id, "server-1");
+  assert.equal(event?.attrs?.step_count, 3);
+  const steps = JSON.parse(String(event?.attrs?.steps)) as Array<Record<string, unknown>>;
+  assert.deepEqual(
+    steps.map(({ seq, ms, table, lock, role, sqlstate }) => ({ seq, ms, table, lock, role, sqlstate })),
+    [
+      { seq: 1, ms: 5, table: "channels", lock: "FOR NO KEY UPDATE", role: "permission+request", sqlstate: undefined },
+      { seq: 2, ms: 7, table: "channels", lock: "UPDATE", role: "stored", sqlstate: undefined },
+      { seq: 3, ms: 9, table: "channels", lock: "FOR NO KEY UPDATE", role: "stored", sqlstate: "40P01" },
+    ],
+  );
+  for (const value of ["chan-a", "chan-b", "secret-body"]) {
+    assert.equal(JSON.stringify(event?.attrs).includes(value), false, "no parameters");
+  }
+});
+
+test("db.lock_order records a transaction over 1 s and stays silent for a fast one", async () => {
+  let now = 0;
+  Date.now = () => now;
+  const sink = new MemoryTraceSink();
+  setDefaultTraceTracer(new BasicTracer({ sink, clock: () => now }));
+  const client = new FakeClient();
+  const pool = new FakePool(client) as unknown as pg.Pool;
+  instrumentPool("primary", pool);
+  const run = (durationMs: number) => withLockOrderRecording({ transaction: "test.tx", rowRoles: {} }, async () => {
+    const checkedOut = await pool.connect();
+    await checkedOut.query("begin");
+    const start = now;
+    await checkedOut.query('update "agents" set "x" = 1');
+    now = start + durationMs;
+    checkedOut.release();
+  });
+
+  await run(1_000);
+  assert.equal(sink.getAllLogEvents().filter((event) => event.name === "db.lock_order").length, 0);
+  await run(1_001);
+  const events = sink.getAllLogEvents().filter((event) => event.name === "db.lock_order");
+  assert.deepEqual(events.map((event) => event.attrs?.trigger), ["slow"]);
+});
+
+test("db.statement_stats totals a many-statement unit per statement hash, without text or values", async () => {
+  let now = 0;
+  Date.now = () => now;
+  const sink = new MemoryTraceSink();
+  setDefaultTraceTracer(new BasicTracer({ sink, clock: () => now }));
+  const client = new FakeClient();
+  const pool = new FakePool(client) as unknown as pg.Pool;
+  instrumentPool("primary", pool);
+  client.beforeQueryReturn = () => { now += 5; };
+
+  await withStatementStats("test.unit", async () => {
+    const checkedOut = await pool.connect();
+    for (let index = 0; index < 9; index += 1) {
+      await checkedOut.query("UPDATE read_cursors SET seq = $1 WHERE id = $2", [index, "secret-id"]);
+    }
+    await checkedOut.query("DELETE FROM read_mutations WHERE id = $1", ["secret-id"]);
+    checkedOut.release();
+  });
+
+  const [event] = sink.getAllLogEvents().filter((candidate) => candidate.name === "db.statement_stats");
+  assert.equal(event?.attrs?.unit, "test.unit");
+  assert.equal(event?.attrs?.statement_count, 10);
+  assert.equal(event?.attrs?.distinct_statement_count, 2);
+  const statements = JSON.parse(String(event?.attrs?.statements)) as Array<{ count: number; total_ms: number; max_ms: number }>;
+  assert.deepEqual(statements.map(({ count, total_ms, max_ms }) => ({ count, total_ms, max_ms })), [
+    { count: 9, total_ms: 45, max_ms: 5 },
+    { count: 1, total_ms: 5, max_ms: 5 },
+  ]);
+  for (const value of ["secret-id", "read_cursors", "read_mutations"]) {
+    assert.equal(JSON.stringify(event?.attrs).includes(value), false, "only hashes");
+  }
+});
+
+test("db.statement_stats stays silent for a short unit and reports a slow one", async () => {
+  let now = 0;
+  Date.now = () => now;
+  const sink = new MemoryTraceSink();
+  setDefaultTraceTracer(new BasicTracer({ sink, clock: () => now }));
+  const client = new FakeClient();
+  const pool = new FakePool(client) as unknown as pg.Pool;
+  instrumentPool("primary", pool);
+  const run = (durationMs: number) => withStatementStats("test.unit", async () => {
+    const checkedOut = await pool.connect();
+    await checkedOut.query("SELECT 1");
+    now += durationMs;
+    checkedOut.release();
+  });
+
+  await run(999);
+  assert.equal(sink.getAllLogEvents().filter((event) => event.name === "db.statement_stats").length, 0);
+  await run(1_000);
+  assert.equal(sink.getAllLogEvents().filter((event) => event.name === "db.statement_stats").length, 1);
+});
+
+test("db.statement_stats carries attributes taken from the unit's result", async () => {
+  let now = 0;
+  Date.now = () => now;
+  const sink = new MemoryTraceSink();
+  setDefaultTraceTracer(new BasicTracer({ sink, clock: () => now }));
+
+  await withStatementStats(
+    "test.unit",
+    async () => {
+      now += 1_000;
+      return { compacted: 7, candidates: 9 };
+    },
+    (result) => result,
+  );
+
+  const [event] = sink.getAllLogEvents().filter((candidate) => candidate.name === "db.statement_stats");
+  assert.equal(event?.attrs?.compacted, 7);
+  assert.equal(event?.attrs?.candidates, 9);
+});
+
+test("searchReplicaFallbackReason retries replica connection failures and recovery conflicts only", () => {
+  const pgError = (code: string, message = "x") => Object.assign(new Error(message), { code });
+  assert.equal(searchReplicaFallbackReason(pgError("40001", "canceling statement due to conflict with recovery")), "recovery_conflict");
+  for (const code of ["ECONNREFUSED", "ECONNRESET", "ENOTFOUND", "57P01", "57P03", "08006", "53300"]) {
+    assert.equal(searchReplicaFallbackReason(pgError(code)), "connection", code);
+  }
+  assert.equal(searchReplicaFallbackReason(new Error("Connection terminated unexpectedly")), "connection");
+  assert.equal(searchReplicaFallbackReason(new Error("Connection terminated due to connection timeout")), "connection");
+  assert.equal(searchReplicaFallbackReason(new Error("Client has encountered a connection error and is not queryable")), "connection");
+  // Not retried: statement timeout, query errors, a busy search pool, caller aborts.
+  assert.equal(searchReplicaFallbackReason(pgError("57014", "canceling statement due to statement timeout")), null);
+  assert.equal(searchReplicaFallbackReason(pgError("42601", "syntax error")), null);
+  assert.equal(searchReplicaFallbackReason(new Error("timeout exceeded when trying to connect")), null);
+  assert.equal(searchReplicaFallbackReason(Object.assign(new Error("aborted"), { name: "SearchQueryAbortedError", code: "SEARCH_QUERY_ABORTED" })), null);
+});
+
+test("executeSearchSqlWithPrimaryFallback runs a failed replica query once on the primary and records the fallback", async () => {
+  const sink = new MemoryTraceSink();
+  setDefaultTraceTracer(new BasicTracer({ sink }));
+  const replica = { name: "replica" } as unknown as pg.Pool;
+  const primary = { name: "primary" } as unknown as pg.Pool;
+  const calls: unknown[] = [];
+  const execute = (async (pool: pg.Pool) => {
+    calls.push(pool);
+    if (pool === replica) throw Object.assign(new Error("canceling statement due to conflict with recovery"), { code: "40001" });
+    return { rows: [{ id: "m1" }] };
+  }) as Parameters<typeof executeSearchSqlWithPrimaryFallback>[4];
+
+  const result = await executeSearchSqlWithPrimaryFallback(replica, primary, sql`SELECT 1`, {}, execute);
+
+  assert.deepEqual(result.rows, [{ id: "m1" }]);
+  assert.deepEqual(calls, [replica, primary]);
+  const events = sink.getAllLogEvents().filter((event) => event.name === "server.db.search_replica_fallback");
+  assert.equal(events.length, 1);
+  assert.equal(events[0]!.attrs?.reason, "recovery_conflict");
+  assert.equal(events[0]!.attrs?.error_code, "40001");
+});
+
+test("executeSearchSqlWithPrimaryFallback does not retry statement timeouts or aborted searches", async () => {
+  const replica = {} as unknown as pg.Pool;
+  const primary = {} as unknown as pg.Pool;
+  let primaryCalls = 0;
+  const failWith = (error: Error) => (async (pool: pg.Pool) => {
+    if (pool === primary) primaryCalls += 1;
+    throw error;
+  }) as Parameters<typeof executeSearchSqlWithPrimaryFallback>[4];
+
+  const timeout = Object.assign(new Error("canceling statement due to statement timeout"), { code: "57014" });
+  await assert.rejects(executeSearchSqlWithPrimaryFallback(replica, primary, sql`SELECT 1`, {}, failWith(timeout)), timeout);
+
+  const abort = new AbortController();
+  abort.abort();
+  const reset = Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" });
+  await assert.rejects(
+    executeSearchSqlWithPrimaryFallback(replica, primary, sql`SELECT 1`, { signal: abort.signal }, failWith(reset)),
+    reset,
+  );
+  assert.equal(primaryCalls, 0);
 });

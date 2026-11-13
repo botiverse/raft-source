@@ -1,6 +1,9 @@
 import { ambientProcessEnv } from "../processEnvPatch";
 import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
 import { logger } from "../logger";
+import { raiseRuntimeOomScore } from "./oomScore";
+import { AGENT_STOP_KILL_GRACE_MS } from "./processStop";
+import { defaultProcessTreeOps } from "./processTree";
 
 /**
  * Task #366. A runtime child can report its end before anyone listens:
@@ -55,19 +58,32 @@ const ORPHAN_AFTER_MS = 10_000;
  */
 const MAX_EARLY_OUTPUT_BYTES = 4 * 1024 * 1024;
 
-/** After SIGTERM, an abandoned child that is still alive gets SIGKILL. */
-const ABANDON_KILL_AFTER_MS = 5_000;
+/**
+ * Reconciler step 5: a runtime child leads its own process group on POSIX
+ * (`detached`, never unref'd: stdio and exit tracking are unchanged), so a
+ * stop's SIGKILL reaches everything it started in one signal (MCP servers,
+ * tool shells), not only the runtime. It also leaves the terminal's job
+ * control: a Ctrl-C reaches the daemon only, which stops its agents itself.
+ * Windows has no groups (and a detached child there gets its own console):
+ * `taskkill /T /F` walks the tree instead.
+ */
+export function runtimeChildProcessGroupOptions(platform: NodeJS.Platform = process.platform): Pick<SpawnOptions, "detached"> {
+  return { detached: platform !== "win32" };
+}
 
 /** `spawn()` for runtime children: the child is guarded before it is returned. */
 export function spawnRuntimeChild(command: string, args: readonly string[], options: SpawnOptions): ChildProcess {
   // Never inherit a Pi session-create patch in flight (task #28).
-  const child = spawn(command, args, { ...options, env: options.env ?? ambientProcessEnv() });
-  guardRuntimeChild(child);
+  const child = spawn(command, args, { ...runtimeChildProcessGroupOptions(), ...options, env: options.env ?? ambientProcessEnv() });
+  guardRuntimeChild(child, { killTree: (pid) => defaultProcessTreeOps.forceKill(pid, { descendants: [], rootLeadsGroup: runtimeChildProcessGroupOptions().detached === true }) });
+  // Linux: under memory exhaustion the kernel kills this runtime (and the
+  // tools it starts) before the Computer service (#triage:#169).
+  raiseRuntimeOomScore(child.pid);
   return child;
 }
 
-/** Attach the recording listeners. Idempotent. */
-export function guardRuntimeChild(child: ChildProcess): void {
+/** Attach the recording listeners. Idempotent. `killTree` ends an abandoned child's tree (its group); the child alone by default. */
+export function guardRuntimeChild(child: ChildProcess, deps: { killTree?: (pid: number) => void } = {}): void {
   if (recorders.has(child)) return;
   const events: EarlyChildEvent[] = [];
   const stdinErrors: Error[] = [];
@@ -119,15 +135,21 @@ export function guardRuntimeChild(child: ChildProcess): void {
     } catch {
       // Already gone.
     }
+    // The same grace and tree kill as every other stop (reconciler step 5).
     const killTimer = setTimeout(() => {
       if (child.exitCode == null && child.signalCode == null) {
+        try {
+          if (typeof child.pid === "number") deps.killTree?.(child.pid);
+        } catch {
+          // Already gone.
+        }
         try {
           child.kill?.("SIGKILL");
         } catch {
           // Already gone.
         }
       }
-    }, ABANDON_KILL_AFTER_MS);
+    }, AGENT_STOP_KILL_GRACE_MS);
     killTimer.unref?.();
   };
 

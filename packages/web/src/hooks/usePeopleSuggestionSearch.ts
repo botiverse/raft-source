@@ -1,5 +1,5 @@
 import { useMemo } from "react";
-import { useRankedComposerSuggestions } from "./useRankedComposerSuggestions";
+import { useRankedComposerSuggestionsOrPending } from "./useRankedComposerSuggestions";
 import {
   createPeopleSuggestionSearchEntries,
 } from "../utils/peopleSuggestionSearch";
@@ -15,6 +15,7 @@ export function usePeopleSuggestionSearch<T>(
     () => createPeopleSuggestionSearchEntries(candidates),
     [candidates],
   );
-  const ranked = useRankedComposerSuggestions(query, entries);
+  // `null` while a worker ranks the first query (useRankedComposerSuggestionsOrPending).
+  const ranked = useRankedComposerSuggestionsOrPending(query, entries);
   return { entries, ranked };
 }

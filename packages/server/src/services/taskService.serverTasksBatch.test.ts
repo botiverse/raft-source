@@ -1,15 +1,15 @@
+import { fillJointMembersFromChannelHumans } from "../test/jointMemberFill";
 import { dbTest as test } from "../test/integration/dbTest";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 
 import { and, asc, eq, isNull, or } from "drizzle-orm";
-import { SERVER_GUEST_FEATURE_FLAG_KEY, type ServerId, type TaskStatus } from "@botiverse/raft-shared";
+import { type ServerId, type TaskStatus } from "@botiverse/raft-shared";
 import { fixturePasswordHash } from "../test/integration/credentials";
 import { getDb } from "../db/index";
 import {
   channelConversionJobs,
   channels,
-  featureFlagRules,
   jointChannels,
   jointChannelServers,
   serverMembers,
@@ -20,6 +20,7 @@ import * as channelService from "./channelService";
 import { createServer } from "./serverService";
 import { resolveTaskChannelSurface } from "./taskChannelSurface";
 import * as taskService from "./taskService";
+import { seedBoundGuest } from "../test/guestFixture";
 
 /**
  * GET /api/tasks/server used to fan out per channel (access check, surface
@@ -68,14 +69,19 @@ async function seedUser(name: string) {
   return user!;
 }
 
-/** The pre-batch per-channel algorithm, kept here as the equivalence oracle. */
+/**
+ * The pre-batch per-channel algorithm, kept here as the equivalence oracle.
+ * The board's candidates are public, private and joint channels (private
+ * joined the board with the visibility entry; DMs stay off it), the same for
+ * guests.
+ */
 async function perChannelOracle(serverId: string, statusFilter: TaskStatus | undefined, userId: string) {
   const serverChannels = await getDb()
     .select({ id: channels.id })
     .from(channels)
     .where(and(
       eq(channels.serverId, serverId),
-      or(eq(channels.type, "channel"), eq(channels.type, "joint")),
+      or(eq(channels.type, "channel"), eq(channels.type, "private"), eq(channels.type, "joint")),
       isNull(channels.archivedAt),
     ))
     .orderBy(asc(channels.name), asc(channels.id));
@@ -96,7 +102,7 @@ async function perChannelOracle(serverId: string, statusFilter: TaskStatus | und
 
 async function walkPages(serverId: string, statusFilter: TaskStatus | undefined, userId: string, limit: number) {
   const items: unknown[] = [];
-  let cursor: taskService.ServerTasksPageCursor | null = null;
+  let cursor: taskService.ServerTasksPageCursor | taskService.ServerTasksSortedCursor | null = null;
   for (let pages = 0; ; pages++) {
     assert.ok(pages < 100, "pagination did not terminate");
     const page = await taskService.listServerTasksPage(serverId, statusFilter, userId, { limit, cursor, detail: "full" });
@@ -119,27 +125,20 @@ async function buildFixture() {
   const peer = await createServer("Batch Peer", `batch-peer-${randomUUID().slice(0, 8)}`, peerOwner.id);
   await db.insert(serverMembers).values([
     { serverId: host.id, userId: reader.id, role: "member" },
-    { serverId: host.id, userId: guest.id, role: "guest" },
     { serverId: peer.id, userId: reader.id, role: "member" },
   ]).onConflictDoNothing();
-  await db.insert(featureFlagRules).values({
-    id: randomUUID(),
-    flagKey: SERVER_GUEST_FEATURE_FLAG_KEY,
-    stage: "server",
-    priority: 0,
-    decision: "allow",
-    values: [host.id],
-  });
-
   const create = async (serverId: string, name: string, type: "channel" | "private" | "joint" = "channel") =>
     channelService.createChannel(serverId, name, undefined, type);
   const open = await create(host.id, "b-open");
   const guestOpen = await create(host.id, "a-guest-open");
-  await channelService.updateChannel(guestOpen.id, { guestVisible: true, guestJoinable: true });
+  await channelService.updateChannel(guestOpen.id, { guestVisible: true });
   const priv = await create(host.id, "c-private", "private");
   const archived = await create(host.id, "d-archived");
   const deleted = await create(host.id, "e-deleted");
   for (const channel of [open, guestOpen, priv, archived, deleted]) await channelService.addHuman(channel.id, owner.id);
+  // A guest of a private channel, its one channel (#wg-rbac:#15): its tasks are on the guest's board, as canView allows.
+  await seedBoundGuest({ serverId: host.id, userId: guest.id, channelId: priv.id });
+  // A guest in a guest-visible public channel that is not its own: nothing of it on its board.
   await channelService.addHuman(guestOpen.id, guest.id);
 
   // Joint: canonical storage row on the host server (itself a `channel`, so
@@ -160,6 +159,7 @@ async function buildFixture() {
     { jointChannelId: joint!.id, serverId: host.id, localChannelId: hostJoint.id, role: "host", joinedByUserId: owner.id },
     { jointChannelId: joint!.id, serverId: peer.id, localChannelId: peerJoint.id, role: "participant", joinedByUserId: peerOwner.id },
   ]);
+  await fillJointMembersFromChannelHumans();
   await db.insert(channelConversionJobs).values({
     serverId: host.id,
     sourceChannelId: hostJoint.id,
@@ -221,6 +221,11 @@ test("server task lists equal the per-channel algorithm across channel shapes, l
   }
   assert.ok(sawParticipantReadOnly, "fixture must exercise the participant historical cutoff");
   assert.ok(sawJointProjection, "fixture must exercise joint projection to the local channel");
+  const otherPrivate = await channelService.createChannel(f.host.id, "z-private-no-guest", undefined, "private");
+  await channelService.addHuman(otherPrivate.id, f.owner.id);
+  await taskService.createTasks(otherPrivate.id, "user", f.owner.id, [{ title: "private-no-guest-1" }]);
+  const guestTitles = (await taskService.listServerTasks(f.host.id, undefined, f.guest.id)).map((task) => task.title);
+  assert.deepEqual(guestTitles, ["private-1"], "a guest's board lists only the tasks of its one channel, not of a guest-visible one it is in nor of a private channel it is not in");
 
   // Cursor semantics: a hidden joint is not a valid position; a visible one is.
   const hidden = await taskService.listServerTasksPage(f.host.id, undefined, f.reader.id, {
@@ -243,6 +248,8 @@ test("server task lists issue a statement count independent of the channel count
   const measure = async () => ({
     legacy: await countQueries(() => taskService.listServerTasks(f.host.id, undefined, f.owner.id)),
     page: await countQueries(() => taskService.listServerTasksPage(f.host.id, "todo", f.owner.id, { limit: 50, cursor: null, detail: "summary" })),
+    // The sorted walk merges every channel's top rows in one statement too.
+    sorted: await countQueries(() => taskService.listServerTasksPage(f.host.id, "todo", f.owner.id, { limit: 50, cursor: null, detail: "summary", sort: "activity" })),
   });
   const before = await measure();
   assert.ok(before.legacy > 0, "the counting seam must observe queries");

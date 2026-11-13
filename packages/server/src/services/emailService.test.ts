@@ -8,13 +8,22 @@ import {
   type EmailDelivery,
   parseAppReviewNotificationRecipients,
   renderAppReviewRequestEmailHtml,
+  renderDeviceLoginEmailHtml,
+  renderAccountDeletionEmail,
+  renderSubscriptionEndingAfterDeletionEmail,
+  renderExternalChannelInviteEmailHtml,
+  renderExternalConnectResultEmailHtml,
   renderInviteEmailHtml,
   renderJointChannelInviteEmailHtml,
   renderMobileAppDownloadEmailHtml,
   renderOnboardingDayOneCheckInEmailHtml,
   renderOnboardingWelcomeEmailHtml,
   renderPasswordResetEmailHtml,
+  renderSecondFactorBackupCodeUsedEmail,
+  renderSecondFactorSignInLockedEmail,
+  renderServerConnectApprovalEmailHtml,
   renderVerificationEmailHtml,
+  verificationEmailUrl,
   sendAppReviewRequestEmail,
   sendMobileAppDownloadEmail,
   sendInviteEmail,
@@ -69,7 +78,6 @@ function renderDefaultFooterTemplates(): string[] {
   return [
     renderVerificationEmailHtml("Avery", "verify-token"),
     renderPasswordResetEmailHtml("Avery", "reset-token"),
-    renderInviteEmailHtml("Cindy", "Raft HQ", "invite-token"),
     renderAppReviewRequestEmailHtml({
       requestKind: "publish",
       appName: "Example App",
@@ -125,75 +133,52 @@ function renderOnboardingTemplates(): string[] {
   ];
 }
 
-test("transactional email templates place the current brand lockup in the card header", () => {
-  for (const html of renderAllTemplates()) {
-    assert.match(html, new RegExp(`src="${LOGO_URL.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}"`));
-    assert.match(html, /width="162" height="40" alt="Raft"/);
-    assert.match(html, /alt="Raft"/);
-    assert.match(html, /class="slock-email-bar"/);
-    assert.match(html, /class="slock-brand"/);
-    assert.match(html, /class="slock-card"[^>]*padding: 0/);
-    assert.match(html, /border-bottom: 2px solid #141111; padding: 16px 24px; text-align: center/);
-    assert.match(html, /<td class="slock-content" style="background-color: #FFFFFF; color: #141111; padding: 32px 24px;">/);
-    assert.match(html, /display: block; margin: 0 auto;/);
-    assert.doesNotMatch(html, /WHERE HUMANS AND AI AGENTS COLLABORATE/);
-    assert.doesNotMatch(html, />Slock<\/p>/);
-    assert.ok(
-      html.indexOf("class=\"slock-card\"") < html.indexOf("class=\"slock-email-bar\""),
-      "brand bar should live inside the email card so header and body share one shadow",
-    );
-    assert.doesNotMatch(html, /class="slock-banner"/);
-    assert.doesNotMatch(html, /Courier New[^>]*>Slock</);
+test("system emails use a flat readable Raft frame with pink actions", () => {
+  for (const html of [...renderAllTemplates(), ...renderOnboardingTemplates()]) {
+    assert.doesNotMatch(html, /box-shadow:/);
+    assert.match(html, /font-size: 16px/);
+    assert.match(html, /max-width: 520px/);
+    assert.match(html, /color: #FF99C3/);
+    assert.match(html, /prefers-color-scheme: dark/);
+    assert.match(html, /color: #FF99C3 !important/);
+    assert.doesNotMatch(html, /font-size:10px|light only/);
   }
-
+  for (const html of renderAllTemplates()) {
+    assert.ok(html.includes('src="' + LOGO_URL + '"'));
+    assert.match(html, /width="114" height="28" alt="Raft"/);
+    assert.match(html, /class="slock-email-bar" align="center"/);
+    assert.doesNotMatch(html, /slock-card|border: 1px solid #DCDCDC|border-radius: 10px/);
+  }
+  for (const html of renderButtonTemplates()) {
+    assert.match(html, /background-color: #FF99C3/);
+    assert.match(html, /border: 1px solid #141111/);
+    assert.match(html, /border-radius: 6px/);
+  }
   for (const html of renderDefaultFooterTemplates()) {
     assert.match(html, /You're receiving this because this email is tied to your Raft account\./);
   }
 });
 
-test("transactional email templates match the newsletter dark-mode strategy", () => {
-  for (const html of renderAllTemplates()) {
-    assert.doesNotMatch(html, /<meta name="color-scheme" content="light only">/);
-    assert.doesNotMatch(html, /<meta name="supported-color-schemes" content="light">/);
-    assert.doesNotMatch(html, /color-scheme: light/);
-    assert.doesNotMatch(html, /background-image: linear-gradient\(#FFFAEF, #FFFAEF\)/);
-    assert.doesNotMatch(html, /background-image: linear-gradient\(#FFFFFF, #FFFFFF\)/);
-    assert.doesNotMatch(html, /background-color: #FFFFFF !important; color: #141111 !important/);
-    assert.doesNotMatch(html, /<h1 class="slock-content"/);
-    assert.doesNotMatch(html, /<p class="slock-content"/);
-    assert.doesNotMatch(html, /<span style="color: #141111;">/);
-    assert.match(html, /class="slock-email-bar" style="background-color: #FFD440; background-image: linear-gradient\(#FFD440, #FFD440\); color: #141111;/);
-    assert.match(html, /class="slock-card"/);
-    assert.match(html, /class="slock-content"/);
-  }
-
-  for (const html of renderButtonTemplates()) {
-    assert.match(html, /class="slock-button" href="[^"]+" target="_blank" style="display: inline-block; background-color: #FFD440; color: #141111;/);
-    assert.match(html, /<a class="slock-link" href="[^"]+" style="color: #FE7DA8; word-break: break-all;">/);
-    assert.match(html, /class="slock-button"/);
+test("an invite to an address that may have no account says why it came, not that the address is tied to an account", () => {
+  const invites = [
+    renderInviteEmailHtml("Cindy <b>", "Raft HQ", "invite-token"),
+    renderExternalChannelInviteEmailHtml({ inviterName: "Cindy <b>", channelName: "partners", serverName: "Acme", token: "t", expiresInDays: 14 }),
+  ];
+  for (const html of invites) {
+    assert.match(html, /You're receiving this because Cindy &lt;b&gt; invited this email address to Raft\. If you weren't expecting it, you can ignore this email\./);
+    assert.doesNotMatch(html, /tied to your Raft account/);
+    assert.doesNotMatch(html, /Cindy <b>/, "the inviter's name is escaped in the footer too");
   }
 });
 
-test("onboarding emails use a plain founder shell instead of the transactional card", () => {
+test("onboarding stays a personal letter with its original legal footer", () => {
   for (const html of renderOnboardingTemplates()) {
-    assert.doesNotMatch(html, /class="slock-email-bar"/);
-    assert.doesNotMatch(html, /class="slock-brand"/);
-    assert.doesNotMatch(html, /class="slock-card"/);
-    assert.doesNotMatch(html, /class="slock-content"/);
-    assert.doesNotMatch(html, /border: 2px solid #141111/);
-    assert.doesNotMatch(html, /box-shadow: 4px 4px 0 #141111/);
-    assert.doesNotMatch(html, /background-color: #FFD440/);
-    assert.doesNotMatch(html, new RegExp(`src="${LOGO_URL.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}"`));
-    assert.match(html, /max-width: 560px; width: 100%;/);
+    assert.doesNotMatch(html, /class="slock-brand"|class="slock-email-bar"/);
+    assert.match(html, /class="slock-content slock-personal"/);
     assert.match(html, /Privacy Policy/);
-    // Onboarding welcome/day-1 are relationship emails, not marketing: no unsubscribe link.
-    assert.doesNotMatch(html, /Unsubscribe/i);
-    assert.doesNotMatch(html, /\{\{\{RESEND_UNSUBSCRIBE_URL\}\}\}/);
-    assert.match(html, /class="slock-footer-links"/);
-    assert.match(html, /a\[x-apple-data-detectors\]/);
     assert.match(html, /Botiverse, Inc\. · 1111B S Governors Ave, Suite 95905, Dover, DE 19904, US/);
-    assert.doesNotMatch(html, /<hr/i);
-    assert.doesNotMatch(html, /border-top/i);
+    assert.doesNotMatch(html, /Unsubscribe|RESEND_UNSUBSCRIBE_URL/);
+    assert.doesNotMatch(html, /class="slock-button"/);
   }
 });
 
@@ -383,12 +368,12 @@ test("mobile-app lifecycle email has one download action and no founder identity
 
   assert.match(html, /Check in on your agents from anywhere/);
   assert.match(html, /See what your agents are doing, answer questions, and approve the next step/);
-  assert.match(html, /display: none; max-height: 0;[^>]+>Android and iOS beta are both live\.<\/div>/);
-  assert.match(html, /Android download, or join the iOS beta/);
+  assert.match(html, /display: none; max-height: 0;[^>]+>Raft is on Google Play and the App Store\.<\/div>/);
+  assert.match(html, /Android on Google Play or as a download, iOS on the App Store/);
   assert.match(html, />Get the mobile app<\/a>/);
-  assert.match(html, /font-family: 'Space Grotesk', Arial, sans-serif; font-size: 20px/);
+  assert.match(html, /font-family: 'Space Grotesk', Arial, sans-serif; font-size: 22px/);
   assert.match(html, /font-family: 'Space Grotesk', Arial, sans-serif; font-size: 16px/);
-  assert.match(html, /background-color: #FE7DA8;[^>]+font-size: 14px/);
+  assert.match(html, /background-color: #FF99C3;[^>]+font-size: 15px/);
   assert.equal((html.match(new RegExp(MOBILE_APP_DOWNLOAD_URL.replaceAll(".", "\\."), "g")) ?? []).length, 1);
   assert.match(
     html,
@@ -396,22 +381,36 @@ test("mobile-app lifecycle email has one download action and no founder identity
   );
   assert.match(html, />Unsubscribe from mobile-app emails<\/a>/);
   assert.doesNotMatch(html, /RC|Founder|Cindy/);
-  assert.doesNotMatch(renderedBody, /App Store|Google Play/);
+  // Google Play is live since 10-27 (#triage:#96); iOS is on the App Store, so
+  // the email no longer sends people to the TestFlight beta.
+  assert.doesNotMatch(renderedBody, /TestFlight|iOS beta/);
 });
 
-test("mobile-app lifecycle email has complete English and Simplified Chinese catalogs", () => {
+test("mobile-app lifecycle email has complete catalogs for every display locale", () => {
   assert.deepEqual(Object.keys(MOBILE_APP_EMAIL_COPY).sort(), [...MOBILE_APP_EMAIL_LOCALES].sort());
 
   const chinese = renderMobileAppDownloadEmailHtml("zh-CN", MOBILE_APP_UNSUBSCRIBE_URL);
   assert.match(chinese, /随时随地查看你的 Agent/);
   assert.match(chinese, /无论身在何处，你都可以用手机查看 Agent 正在做什么、回答问题，并批准下一步操作。/);
   assert.match(chinese, />获取移动端应用<\/a>/);
-  assert.match(chinese, /下载 Android 版，或加入 iOS 测试版。/);
+  assert.match(chinese, /Android 版可在 Google Play 获取或直接下载，iOS 版可在 App Store 下载。/);
   assert.match(chinese, /你会收到这封邮件，是因为它与你的 Raft 账户相关。/);
   assert.match(chinese, />退订移动端应用邮件<\/a>/);
-  assert.match(chinese, /display: none; max-height: 0;[^>]+>Android 和 iOS 测试版现已上线。<\/div>/);
+  assert.match(chinese, /display: none; max-height: 0;[^>]+>Raft 已在 Google Play 和 App Store 上线。<\/div>/);
   assert.doesNotMatch(chinese, /You're receiving this because this email is tied to your Raft account\./);
   assert.equal((chinese.match(new RegExp(MOBILE_APP_DOWNLOAD_URL.replaceAll(".", "\\."), "g")) ?? []).length, 1);
+
+  const japanese = renderMobileAppDownloadEmailHtml("ja-JP", MOBILE_APP_UNSUBSCRIBE_URL);
+  assert.match(japanese, /どこからでもエージェントの様子を確認/);
+  assert.match(japanese, />モバイルアプリを入手<\/a>/);
+  assert.match(japanese, />モバイルアプリに関するメールの配信を停止<\/a>/);
+  assert.equal((japanese.match(new RegExp(MOBILE_APP_DOWNLOAD_URL.replaceAll(".", "\\."), "g")) ?? []).length, 1);
+
+  const korean = renderMobileAppDownloadEmailHtml("ko", MOBILE_APP_UNSUBSCRIBE_URL);
+  assert.match(korean, /어디서나 에이전트의 상황을 확인하세요/);
+  assert.match(korean, />모바일 앱 받기<\/a>/);
+  assert.match(korean, />모바일 앱 관련 이메일 수신 거부<\/a>/);
+  assert.equal((korean.match(new RegExp(MOBILE_APP_DOWNLOAD_URL.replaceAll(".", "\\."), "g")) ?? []).length, 1);
 
   const unsupportedFallback = renderMobileAppDownloadEmailHtml("fr-FR", MOBILE_APP_UNSUBSCRIBE_URL);
   assert.match(unsupportedFallback, /Check in on your agents from anywhere/);
@@ -478,7 +477,7 @@ test("onboarding emails use Hi there fallback, here booking href, and newsletter
       assert.match(html, /href="https:\/\/cal\.example\.com\/cindy\?source=welcome&amp;team=raft"[^>]*>here<\/a>/);
       assert.match(
         html,
-        /<a href="https:\/\/raft\.build\/privacy" style="color:#9A9A9A;text-decoration:underline;">Privacy Policy<\/a> · <span style="color:#9A9A9A;text-decoration:none;">Botiverse, Inc\. · 1111B S Governors Ave, Suite 95905, Dover, DE 19904, US<\/span>/,
+        /<a href="https:\/\/raft\.build\/privacy" style="color:#605D5D;text-decoration:underline;">Privacy Policy<\/a> · <span style="color:#605D5D;text-decoration:none;">Botiverse, Inc\. · 1111B S Governors Ave, Suite 95905, Dover, DE 19904, US<\/span>/,
       );
       assert.doesNotMatch(html, /Unsubscribe/i);
       assert.doesNotMatch(html, /\{\{\{RESEND_UNSUBSCRIBE_URL\}\}\}/);
@@ -500,6 +499,21 @@ test("verification email explains what to do if the recipient did not sign up", 
   assert.doesNotMatch(html, /If you didn't create a Slock account/);
 });
 
+test("verification link carries an app-local returnTo and drops anything else (#88)", () => {
+  assert.equal(verificationEmailUrl("tok"), "http://localhost:5173?verify=tok");
+  assert.equal(verificationEmailUrl("tok", "/"), "http://localhost:5173?verify=tok", "landing on / needs no returnTo");
+  assert.equal(
+    verificationEmailUrl("tok", "/artifacts/pt_abc/v/2?c=1#top"),
+    "http://localhost:5173?verify=tok&returnTo=%2Fartifacts%2Fpt_abc%2Fv%2F2%3Fc%3D1%23top",
+  );
+  for (const hostile of ["//evil.com", "https://evil", "/\\evil", "/%5Cevil", "javascript:alert(1)", "/a\nb", 42, `/${"a".repeat(3000)}`]) {
+    assert.equal(verificationEmailUrl("tok", hostile), "http://localhost:5173?verify=tok", String(hostile).slice(0, 40));
+  }
+  const html = renderVerificationEmailHtml("Avery", "tok", "/artifacts/pt_abc");
+  assert.match(html, /href="http:\/\/localhost:5173\?verify=tok&amp;returnTo=%2Fartifacts%2Fpt_abc"/, "the & is escaped in the attribute");
+  assert.doesNotMatch(html, /&amp;amp;/, "escaped once");
+});
+
 test("joint channel invite email uses a direct accept link instead of My invitations", () => {
   const html = renderJointChannelInviteEmailHtml({
     recipientName: "Avery",
@@ -514,6 +528,45 @@ test("joint channel invite email uses a direct accept link instead of My invitat
   assert.match(html, /href="http:\/\/localhost:5173\/s\/target\?jointInvite=joint-invite-id"/);
   assert.match(html, />Accept Invite</);
   assert.doesNotMatch(html, /My invitations/);
+});
+
+test("the external channel invite email says both ways in, and both invite emails say Accept invite", () => {
+  const external = renderExternalChannelInviteEmailHtml({ inviterName: "Ada Lin", channelName: "launch", serverName: "Acme <b>", token: "t", expiresInDays: 14 });
+  assert.match(external, /Join on your own as a guest to work with Acme &lt;b&gt;, or connect a server you're in to bring in your teammates and agents\./);
+  assert.match(external, />Accept invite</);
+  const server = renderInviteEmailHtml("Ada Lin", "Acme", "invite-token");
+  assert.match(server, />Accept invite</);
+  for (const html of [external, server]) assert.doesNotMatch(html, />Accept Invite</);
+});
+
+test("connect result emails: canceled in American spelling, and a failed connect offers another way in", () => {
+  const input = { targetServerName: "Globex", channelName: "launch", hostServerName: "Acme" };
+  const canceled = renderExternalConnectResultEmailHtml({ ...input, outcome: "cancelled" });
+  assert.match(canceled, />Request canceled</);
+  assert.doesNotMatch(canceled, /cancelled/);
+  const failed = renderExternalConnectResultEmailHtml({ ...input, outcome: "failed" });
+  assert.match(failed, /<strong>Globex<\/strong> couldn't be connected to <strong>#launch<\/strong>\. Your invite is still open: open the link in your invite email to try again, or choose another way to join\./);
+});
+
+test("server connect approval email greets the approver, names who asked for what, and says when the request ends", () => {
+  const html = renderServerConnectApprovalEmailHtml({
+    approverName: "Grace <Kim>",
+    requesterName: "Lena Park",
+    targetServerName: "Fabrikam",
+    channelName: "launch-plan",
+    hostServerName: "Acme",
+    requestId: "3c9e",
+    // Late in the day UTC: the date printed is the UTC one.
+    expiresAt: new Date("2026-11-04T23:30:00.000Z"),
+  });
+
+  assert.match(html, />Approve connecting Fabrikam</);
+  assert.match(html, />Hey Grace &lt;Kim&gt;,</);
+  assert.match(html, /<strong>Lena Park<\/strong> wants to connect <strong>Fabrikam<\/strong> to <strong>#launch-plan<\/strong>, an external channel in <strong>Acme<\/strong>\. As a Fabrikam admin, you can approve or decline\./);
+  assert.doesNotMatch(html, /Joint Channel|while signed in/);
+  assert.match(html, />Review request</);
+  assert.match(html, /href="http:\/\/localhost:5173\/server-connect-requests\/3c9e"/);
+  assert.match(html, /The request ends with the invite on November 4, 2026 \(UTC\)\./);
 });
 
 test("transactional email links and brand asset use configured APP_URL", () => {
@@ -726,4 +779,45 @@ test("replyTo is only sent when set, so transactional mail is unchanged", async 
   assert.equal(Object.hasOwn(deliveries[0] ?? {}, "replyTo"), false);
   assert.equal(Object.hasOwn(deliveries[1] ?? {}, "replyTo"), false);
   assert.equal(deliveries[2]?.replyTo, "contact@raft.build");
+});
+
+test("the device login email says what a password change also stops", () => {
+  const html = renderDeviceLoginEmailHtml("Ada", "approved", { requestedAt: new Date("2026-10-29T00:00:00.000Z"), requester: { ip: null, location: null } }, "dvr_test");
+  assert.match(html, /Then change or reset your password\. That signs you out everywhere, and the computers and agent credentials any device login set up stop working too/);
+  assert.doesNotMatch(html, /signs every device out/);
+});
+
+test("two-step lock email links to the forgot-password page, escaped name, plain copy", () => {
+  const { html, text } = renderSecondFactorSignInLockedEmail("<b>Ada</b>", 15);
+  assert.match(text, /Reset your password by email: http:\/\/localhost:5173\/forgot-password$/m);
+  assert.match(html, /href="http:\/\/localhost:5173\/forgot-password"/);
+  assert.equal(html.includes("<b>Ada</b>"), false);
+});
+
+test("backup code used email: codes left, asks for a new set at 2 or fewer, and says so when none are left", () => {
+  const many = renderSecondFactorBackupCodeUsedEmail("Ada", { context: "sign_in", remaining: 5 }).text;
+  assert.match(many, /used to sign in to your account/);
+  assert.match(many, /You have 5 backup codes left\.$/m);
+  assert.equal(/Create a new set/.test(many), false);
+  assert.match(renderSecondFactorBackupCodeUsedEmail("Ada", { context: "step_up", remaining: 1 }).text, /You have 1 backup code left\. Create a new set in Settings soon\./);
+  const none = renderSecondFactorBackupCodeUsedEmail("Ada", { context: "step_up", remaining: 0 }).text;
+  assert.match(none, /You have no backup codes left\. Create a new set in Settings/);
+  assert.match(none, /If this wasn't you, change your password now/);
+  const off = renderSecondFactorBackupCodeUsedEmail("Ada", { context: "disable", remaining: 0 }).text;
+  assert.match(off, /turned off with it/);
+  assert.equal(/Create a new set/.test(off), false);
+});
+
+test("account deletion distinguishes scheduled renewal cancellation from unconfirmed cancellation", () => {
+  const event = { kind: "requested" as const, scheduledFor: new Date("2026-12-01T00:00:00Z"), paidServersEnding: [{ name: "Shared server", periodEnd: new Date("2099-12-10T00:00:00Z") }] };
+  const confirmed = renderAccountDeletionEmail("Person", event);
+  assert.match(confirmed.text, /subscription was scheduled to end with the current period/);
+  assert.doesNotMatch(confirmed.text, /card is not charged again|2099/);
+  const afterDeletion = renderSubscriptionEndingAfterDeletionEmail("Owner", { deletedName: "Person", server: { name: "Shared server", slug: "shared" } });
+  assert.doesNotMatch(`${afterDeletion.subject} ${afterDeletion.text}`, /card is not charged again|subscription.*ends on|subscription stops on|subscribe again/);
+  assert.match(afterDeletion.text, /current status in Plan & Billing before making changes/);
+  const unconfirmed = renderAccountDeletionEmail("Person", { ...event, subscriptionCancellationUnconfirmed: true });
+  assert.doesNotMatch(unconfirmed.text, /card is not charged again|subscription was scheduled to end/);
+  assert.match(unconfirmed.text, /could not confirm cancellation of subscription renewal/i);
+  assert.match(unconfirmed.text, /cancel account deletion first, then open Plan & Billing/i);
 });

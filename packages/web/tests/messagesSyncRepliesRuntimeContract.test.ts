@@ -1,6 +1,5 @@
+import type { Message } from "../src/store/messageStore";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
 import {
   CANONICAL_NESTED_WIRE_SHAPES,
 } from "../../shared/src/canonicalMessageManifest";
@@ -21,6 +20,7 @@ import type {
 } from "../src/store/threadRepliesReadModel";
 import {
   consumeThreadUpdatedWithSyncCore,
+  consumeThreadReplyUpdateWithSyncCore,
   hydrateThreadRepliesRebaselineSnapshotWithSyncCore,
   hydrateThreadRepliesSnapshotWithSyncCore,
   readThreadRepliesSyncCoreScopeForTests,
@@ -32,20 +32,6 @@ import {
   useMessageStore,
 } from "../src/store/messageStore";
 import { useServerStore } from "../src/store/serverStore";
-
-const repoRoot = resolve(import.meta.dirname, "..");
-
-function readSource(path: string): string {
-  return readFileSync(resolve(repoRoot, path), "utf8");
-}
-
-function assertSourceMatches(source: string, pattern: RegExp, message: string): void {
-  assert.equal(pattern.test(source), true, message);
-}
-
-function assertSourceDoesNotMatch(source: string, pattern: RegExp, message: string): void {
-  assert.equal(pattern.test(source), false, message);
-}
 
 function reply(seq: number, overrides: Partial<ThreadReplyPreview> = {}): ThreadReplyPreview {
   return {
@@ -219,27 +205,6 @@ test("replies/commentRef neutral vector skeleton keeps message commentRef separa
       }
     }
   }
-});
-
-test("sync-core replies runtime: eligible thread updates have no rollout gate or legacy direct authority", () => {
-  const socketBridge = readSource("src/store/socketBridge.ts");
-  const replyDomain = readSource("src/store/threadRepliesSyncDomain.ts");
-
-  assertSourceMatches(
-    socketBridge,
-    /consumeThreadUpdatedWithSyncCore\(/,
-    "thread:updated must enter the replies Sync Core consumer before mutating reply scope or summaries",
-  );
-  assertSourceDoesNotMatch(
-    socketBridge,
-    /InlineThreadRepliesFlag|inline_thread_replies_v0/,
-    "inline replies are the default surface; runtime authority must not depend on a retired second flag",
-  );
-  assertSourceDoesNotMatch(
-    replyDomain,
-    /syncCoreMessagesEnabled|isSyncCoreMessagesFlagEnabled|flag_off/,
-    "the replies domain must ship without inheriting the broader messages rollout gate",
-  );
 });
 
 test("sync-core replies runtime: pure consumer fail-opens ineligible wire and strictly applies eligible wire", () => {
@@ -891,12 +856,51 @@ test("sync-core replies runtime: empty-preview compatibility watermark is explic
   );
 });
 
-test("sync-core replies runtime: commentRef remains a message canonical field with shared-null-preserve", () => {
-  const manifest = readSource("../shared/src/canonicalMessageManifest.ts");
 
-  assertSourceMatches(
-    manifest,
-    /\{ name: "commentRef"[\s\S]*?mergePolicy: "shared-null-preserve"/,
-    "commentRef is a message canonical field, not part of the typed replies read cache",
-  );
+test("reply edits update retained content without advancing arrival order and survive stale snapshots", () => {
+  setCurrentServerForContract();
+  useMessageStore.getState().setCurrentUserId("user-1");
+  const identity = { serverId: "server-1", principalId: "user-1", parentMessageId: "parent-1", threadChannelId: "thread-1" };
+  const baseline = hydrateThreadRepliesSnapshotWithSyncCore({ ...identity, replies: [reply(10), reply(11)], replyCount: 2,
+    historyLimited: false, watermark: 11, epoch: null });
+  const update = { id: "reply-10", channelId: "thread-1", seq: 10, content: "edited reply",
+    updatedAt: "2026-07-13T00:01:00.000Z", conversationContext: {
+      channelType: "thread", parentMessageId: "parent-1", parentChannelId: "channel-1", parentChannelType: "channel",
+    } } as Message;
+  const applied = consumeThreadReplyUpdateWithSyncCore(update, receiverContext());
+  assert.ok(applied);
+  assert.equal(applied.scope.replyCount, 2);
+  assert.equal(applied.scope.snapshotSeq, baseline.scope!.snapshotSeq);
+  assert.deepEqual(applied.scope.replies.map((row) => row.seq), [10, 11]);
+  assert.equal(applied.scope.replies[0].preview, "edited reply");
+  assert.equal(consumeThreadReplyUpdateWithSyncCore(update, receiverContext()), null);
+  assert.equal(consumeThreadReplyUpdateWithSyncCore({ ...update, content: "stale", updatedAt: "2026-07-13T00:00:30.000Z" }, receiverContext()), null);
+  assert.equal(consumeThreadReplyUpdateWithSyncCore({ ...update, id: "uncached", seq: 9 }, receiverContext()), null);
+  const snapshot = hydrateThreadRepliesSnapshotWithSyncCore({ ...identity, replies: [reply(10), reply(11)], replyCount: 2,
+    historyLimited: false, watermark: 11, epoch: null });
+  assert.equal(snapshot.scope!.replies[0].preview, "edited reply");
+  const arrival = consumeThreadUpdatedWithSyncCore(canonicalThreadUpdatedPayload(12), receiverContext());
+  assert.equal(arrival.kind, "applied");
+  const afterArrival = readThreadRepliesSyncCoreScopeForTests(identity)!;
+  assert.equal(afterArrival.replies[0].preview, "edited reply");
+  const delayed = hydrateThreadRepliesSnapshotWithSyncCore({ ...identity, replies: [reply(10), reply(11), reply(12)], replyCount: 12,
+    historyLimited: false, watermark: 12, epoch: null });
+  assert.equal(delayed.scope!.replies[0].preview, "edited reply", "the HTTP compatibility epoch cannot restore pre-edit text after a live arrival");
+  const fresh = hydrateThreadRepliesSnapshotWithSyncCore({ ...identity,
+    replies: [reply(10, { preview: "newer HTTP edit", updatedAt: "2026-07-13T00:02:00.000Z" }), reply(11), reply(12)],
+    replyCount: 12, historyLimited: false, watermark: 12, epoch: null });
+  assert.equal(fresh.scope!.replies[0].preview, "newer HTTP edit");
+});
+
+test("reply edits reject a retired receiver and a different thread scope", () => {
+  setCurrentServerForContract();
+  useMessageStore.getState().setCurrentUserId("user-1");
+  hydrateThreadRepliesSnapshotWithSyncCore({ serverId: "server-1", principalId: "user-1", parentMessageId: "parent-1", threadChannelId: "thread-1",
+    replies: [reply(10)], replyCount: 1, historyLimited: false, watermark: 10, epoch: null });
+  const context = receiverContext();
+  const update = { id: "reply-10", channelId: "thread-other", seq: 10, content: "wrong scope", updatedAt: "2026-07-13T00:01:00.000Z",
+    conversationContext: { channelType: "thread", parentMessageId: "parent-1", parentChannelId: "channel-1", parentChannelType: "channel" } } as Message;
+  assert.equal(consumeThreadReplyUpdateWithSyncCore(update, context), null);
+  useMessageStore.getState().setCurrentUserId("user-2");
+  assert.equal(consumeThreadReplyUpdateWithSyncCore({ ...update, channelId: "thread-1" }, context), null);
 });

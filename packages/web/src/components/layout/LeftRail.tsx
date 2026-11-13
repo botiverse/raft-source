@@ -1,21 +1,17 @@
-import { forwardRef, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { ComponentProps } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { isHostShell } from "../../embed";
 import { useIntl } from "react-intl";
-import { useNavigate } from "react-router-dom";
 import {
   Activity,
-  ArrowUpRight,
-  BookOpenText,
-  CheckSquare,
+  Blocks,
   CircleHelp,
-  MessageSquare,
   Monitor,
+  PanelLeftClose,
+  PanelLeftOpen,
   Search,
   Settings,
   Users,
-  UsersRound,
-  Smartphone,
+  ListTodo,
 } from "lucide-react";
 import { useFeedbackUnread } from "../../feedback/useFeedbackUnread";
 import { useAuthStore } from "../../store/authStore";
@@ -30,15 +26,19 @@ import type { RailMode } from "../../hooks/useSidebarTab";
 import { useRailMode } from "../../hooks/useSidebarTab";
 import { trackActivityOpen } from "../../analytics/activity";
 import { trackNavEntrySelected } from "../../analytics/navigation";
+import { OttieRailAvatar } from "../../assistant/OttieRailAvatar";
+import { useRememberedAssistantShown } from "./useRememberedSidebarEntry";
 import {
   hasCurrentServerActivityUnread,
   hasOtherServerActivityUnread,
 } from "../../utils/serverUnreadSummary";
 import { countMachinesNeedingAttention } from "../../utils/computerUpgradeIndicator";
-import AttentionDot from "../ui/AttentionDot";
+import { useComputerAttentionDot, useMarkComputerAttentionSeen } from "../../hooks/useComputerAttentionDot";
+import { useAppsPageAttention } from "./serverPagesAttention";
+import { useArtifactsRailShown } from "./artifactsRailEntry";
+import { PublicServerSwitcherTrigger } from "./PublicServerSwitcherTrigger";
+import { RailTabButton } from "./RailTabButton";
 import AvatarSlot from "../ui/AvatarSlot";
-import MenuItem from "../ui/MenuItem";
-import SectionEyebrow from "../ui/SectionEyebrow";
 import ServerSwitcherMenu from "../ui/ServerSwitcherMenu";
 import {
   AppRailFooter,
@@ -46,25 +46,28 @@ import {
   AppRailItem,
   AppRailItemAttention,
   AppRailItemIcon,
-  AppRailItemLabel,
   AppRailNav,
   AppRailRoot,
+  AppShellSidebarTrigger,
   Popover,
-  PopoverContent,
   PopoverTrigger,
-  Spinner,
 } from "@botiverse/raft-ui";
+import { MessageIcon, ArtifactIcon } from "@botiverse/ricons";
 import Tooltip from "../ui/Tooltip";
-import NotificationTrigger from "./NotificationTrigger";
+import { labelWithShortcut } from "../ui/LabelWithShortcut";
+import { HelpMenu } from "./HelpMenu";
+import { HELP_MENU_TRIGGER_ID } from "../../features/keyboard-shortcuts/shortcutHelpStore";
+import { useFirstScreenDone } from "../../boot/deferredUi";
+import NotificationTrigger, { PendingNotificationTrigger } from "./NotificationTrigger";
+import { useShellPending } from "./shellPending";
+import { SortableRailTabs } from "./SortableRailTabs";
+import type { RailTab, RailTabDrag } from "./SortableRailTabs";
 import { hasChatAttentionUnread, selectChatAttentionChannelIds } from "../../utils/chatAttentionUnread";
 import { useShallow } from "zustand/react/shallow";
-import { useJoinCommunityFlow } from "../../hooks/useJoinCommunityFlow";
+import { useShortcutBinding } from "../../features/shortcuts/useShortcutBinding";
+import { SIDEBAR_TOGGLE_ID, useSidebarSlotHidden } from "./sidebarToggle";
+import type { SidebarSlotColumn } from "./sidebarToggle";
 import { markMobileAppSeen, shouldShowMobileAppBadge } from "./mobileAppBadge";
-import {
-  CHINESE_COMMUNITY_PAGE_PATH,
-  DEFAULT_COMMUNITY_SERVER_SLUG,
-  shouldShowChineseCommunityEntry,
-} from "../../utils/communityServers";
 
 // Narrow vertical rail to the left of the Sidebar. Hosts, top to bottom:
 // 1. Server avatar / switcher button (clicking opens a flyout to switch servers)
@@ -86,33 +89,20 @@ const TOOLTIP_CONTENT_PROPS = {
   right: { side: "right" },
 } as const;
 
-// The public rail's workspace block: a rail item filled by the workspace
-// avatar. It opens the switcher for a signed-in visitor and asks an anonymous
-// one to sign in, so it renders both as a PopoverTrigger and on its own.
-function PublicServerSwitcherTrigger(props: ComponentProps<typeof AppRailItem>) {
-  return (
-    <AppRailItem
-      {...props}
-      className="group size-10 overflow-hidden p-0 md:[@media(max-height:600px)]:size-9"
-      data-testid="public-server-switcher-trigger"
-    />
-  );
-}
-
-function initialFocusForKeyboardOpen(openType: string) {
-  return openType === "keyboard";
-}
-
 // Double-clicking Activity jumps straight to the first unread entry.
 export function focusFirstUnreadActivity() {
   useInboxStore.getState().setPendingFocusKind("first-unread");
-  void useInboxStore.getState().loadInbox({ reset: true });
+  void useInboxStore.getState().loadInbox({ reset: true, reason: "manual" });
 }
 
 interface LeftRailProps {
   hidden?: boolean;
   /** The top bar owns the server switcher, search and notifications, so the rail drops them. */
   topBar?: boolean;
+  /** The column in the shell's sidebar slot can collapse here (desktop, a route
+   *  with a sidebar, or Activity's list beside an opened conversation): show
+   *  its toggle, which reads and flips that column's own remembered state. */
+  sidebarToggle?: SidebarSlotColumn | null;
   publicProjection?: PublicLeftRailProjection;
 }
 
@@ -126,12 +116,16 @@ export interface PublicLeftRailProjection {
   onAnonymousServerSelection: () => void;
 }
 
-export function LeftRail({ hidden, topBar = false, publicProjection }: LeftRailProps) {
+export function LeftRail({ hidden, topBar = false, sidebarToggle = null, publicProjection }: LeftRailProps) {
   // Display-language (react-intl) — layout namespace. Rail tab labels feed both
   // raft-ui Tooltip content and `aria-label`, so they must come from the catalog,
   // not literals.
   const { formatMessage } = useIntl();
-  const feedbackUnread = useFeedbackUnread(!hidden && !publicProjection);
+  // A server still being resolved: the rail draws, but asks for and marks nothing.
+  const pending = useShellPending();
+  // Read once the first screen is done (boot/deferredUi).
+  const firstScreenDone = useFirstScreenDone();
+  const feedbackUnread = useFeedbackUnread(!hidden && !publicProjection && !pending && firstScreenDone);
   const currentUserId = useAuthStore((s) => s.user?.id ?? null);
   const server = useServerStore((s) => s.current);
   const isGuest = server?.role === "guest";
@@ -152,20 +146,34 @@ export function LeftRail({ hidden, topBar = false, publicProjection }: LeftRailP
   // a pre-load hint and cannot resurrect a read dot.
   const [hasAcceptedActivityWindow, hasActivityTotalUnread, hasPreloadActivityUnread] = useInboxStore(useShallow((s) => [
     s.hasAcceptedWindow,
-    s.totalUnreadCount > 0,
+    // Object rows (Artifacts) count apart from the conversations' (shared activityObjectsContract).
+    s.totalUnreadCount + s.objectUnreadCount > 0,
     s.activeUnreadCount > 0,
   ] as const));
   const [computerAttentionCount, machineCount] = useMachineStore(useShallow((s) => [
     countMachinesNeedingAttention(s.machines),
     s.machines.length,
   ] as const));
-  const computerAttentionTooltip = computerAttentionCount > 0
+  // Raft DS › Attention dots (raft-design #620): the dot marks an unseen
+  // change; opening Computers sees it. The tooltip still counts the state.
+  const showComputerAttentionDot = useComputerAttentionDot();
+  const computerAttentionTooltip = showComputerAttentionDot && computerAttentionCount > 0
     ? formatMessage(
         { id: "layout.leftRail.computersNeedAttentionSummary" },
         { count: computerAttentionCount, total: machineCount },
       )
     : undefined;
   const { railMode, currentMode, selectRailMode } = useRailMode();
+  // The Computers list is in view whenever the rail is in Computers mode
+  // (the /computers root or a computer's detail): that sees its attention.
+  useMarkComputerAttentionSeen(railMode === "computers" && !isGuest && !pending);
+  // Apps (#proj-apps task #22): owners and admins see a dot while an App waits
+  // for them; it goes out once that is handled (server computed), not on a visit.
+  const appsAttention = useAppsPageAttention({ enabled: !hidden && !publicProjection && !pending && !isGuest });
+  // Personal assistant (RFC 075): only where the server's flag is on; until
+  // the assistant API answers, as last time here, so the icon does not land late.
+  const showAssistant = useRememberedAssistantShown({ ask: !pending });
+  const showArtifacts = useArtifactsRailShown(pending);
 
   const [showServerMenu, setShowServerMenu] = useState(false);
   const [showHelpMenu, setShowHelpMenu] = useState(false);
@@ -205,7 +213,7 @@ export function LeftRail({ hidden, topBar = false, publicProjection }: LeftRailP
   const _pathBase = useMemo(() => (server ? `/s/${server.slug}` : ""), [server]);
 
   useEffect(() => {
-    if (publicProjection) return;
+    if (publicProjection || pending) return;
     // No mount fetch here: App owns the single boot entry for the summary;
     // this effect keeps only the event triggers (prefs change, local-unread
     // edge via the dep below).
@@ -218,7 +226,7 @@ export function LeftRail({ hidden, topBar = false, publicProjection }: LeftRailP
     };
     // The store coalesces concurrent calls, so this is a cheap trigger rather
     // than a second fetch. Refresh when local unread appears/clears (flip).
-  }, [hasLocalChatUnread, publicProjection, loadServerUnreadSummary]);
+  }, [hasLocalChatUnread, publicProjection, pending, loadServerUnreadSummary]);
 
   const hasOtherServerUnread = useMemo(
     () => hasOtherServerActivityUnread(servers, server, serverUnreadCounts),
@@ -258,7 +266,10 @@ export function LeftRail({ hidden, topBar = false, publicProjection }: LeftRailP
       tasks: select("tasks"),
       members: select("members"),
       computers: select("computers"),
+      apps: select("apps"),
       settings: select("settings"),
+      assistant: select("assistant"),
+      artifacts: select("artifacts"),
     };
   }, [currentMode, selectRailMode]);
   const handleClassicActivityClick = useCallback((event: React.MouseEvent) => {
@@ -267,6 +278,88 @@ export function LeftRail({ hidden, topBar = false, publicProjection }: LeftRailP
     trackNavEntrySelected("activity", "rail", currentMode === "activity");
     selectRailMode("activity");
   }, [currentMode, selectRailMode]);
+  // The navigation tabs this person can see, in no particular order:
+  // SortableRailTabs lays them out in the person's saved order.
+  const railTabs = useMemo<RailTab[]>(() => {
+    const tab = (id: RailTab["id"], label: string, button: (drag: RailTabDrag) => React.ReactNode): RailTab => ({ id, label, render: button });
+    const tabs: RailTab[] = [];
+    if (!topBar) {
+      const label = formatMessage({ id: "layout.leftRail.tabSearch" });
+      tabs.push(tab("search", label, ({ dragProps, guardClick }) => (
+        <RailTabButton {...dragProps} icon={<Search size={18} />} label={label} active={railMode === "search"} onClick={guardClick(railModeSelectors.search)} testId="left-rail-tab-search" />
+      )));
+    }
+    const chatLabel = formatMessage({ id: "layout.leftRail.tabChat" });
+    tabs.push(tab("chat", chatLabel, ({ dragProps, guardClick }) => (
+      <RailTabButton {...dragProps} icon={<MessageIcon width={18} height={18} />} label={chatLabel} active={railMode === "chat"} onClick={guardClick(railModeSelectors.chat)} showDot={hasChatUnread} dotInactiveOnly testId="left-rail-tab-chat" />
+    )));
+    const activityLabel = formatMessage({ id: "layout.leftRail.tabActivity" });
+    tabs.push(tab("activity", activityLabel, ({ dragProps, guardClick }) => (
+      <RailTabButton
+        {...dragProps}
+        icon={<Activity size={18} />}
+        label={activityLabel}
+        active={railMode === "activity"}
+        showDot={hasActivityUnread}
+        dotInactiveOnly
+        onClick={guardClick(handleClassicActivityClick)}
+        onDoubleClick={focusFirstUnreadActivity}
+        testId="left-rail-tab-activity"
+      />
+    )));
+    const tasksLabel = formatMessage({ id: "layout.leftRail.tabTasks" });
+    tabs.push(tab("tasks", tasksLabel, ({ dragProps, guardClick }) => (
+      <RailTabButton {...dragProps} icon={<ListTodo size={18} />} label={tasksLabel} active={railMode === "tasks"} onClick={guardClick(railModeSelectors.tasks)} testId="left-rail-tab-tasks" />
+    )));
+    if (showArtifacts) {
+      const artifactsLabel = formatMessage({ id: "layout.leftRail.tabArtifacts" });
+      tabs.push(tab("artifacts", artifactsLabel, ({ dragProps, guardClick }) => (
+        <RailTabButton {...dragProps} icon={<ArtifactIcon width={18} height={18} />} label={artifactsLabel} active={railMode === "artifacts"} onClick={guardClick(railModeSelectors.artifacts)} testId="left-rail-tab-artifacts" />
+      )));
+    }
+    if (!isGuest) {
+      const membersLabel = formatMessage({ id: "layout.leftRail.tabMembers" });
+      tabs.push(tab("members", membersLabel, ({ dragProps, guardClick }) => (
+        <RailTabButton {...dragProps} icon={<Users size={18} />} label={membersLabel} active={railMode === "members"} onClick={guardClick(railModeSelectors.members)} testId="left-rail-tab-members" />
+      )));
+      const computersLabel = formatMessage({ id: "layout.leftRail.tabComputers" });
+      tabs.push(tab("computers", computersLabel, ({ dragProps, guardClick }) => (
+        <RailTabButton
+          {...dragProps}
+          icon={<Monitor size={18} />}
+          label={computersLabel}
+          active={railMode === "computers"}
+          showDot={showComputerAttentionDot}
+          dotInactiveOnly
+          dotTooltip={computerAttentionTooltip}
+          onClick={guardClick(railModeSelectors.computers)}
+          testId="left-rail-tab-computers"
+        />
+      )));
+      // The server's Apps, after Computers; guests have none (#proj-apps task #22).
+      const appsLabel = formatMessage({ id: "apps.page.title" });
+      tabs.push(tab("apps", appsLabel, ({ dragProps, guardClick }) => (
+        <RailTabButton
+          {...dragProps}
+          icon={<Blocks size={18} />}
+          label={appsLabel}
+          active={railMode === "apps"}
+          showDot={appsAttention.lit}
+          dotInactiveOnly
+          dotTooltip={appsAttention.lit ? formatMessage({ id: "apps.page.needsReviewSummary" }) : undefined}
+          onClick={guardClick(railModeSelectors.apps)}
+          testId="left-rail-tab-apps"
+        />
+      )));
+    }
+    if (showAssistant) {
+      const assistantLabel = formatMessage({ id: "layout.leftRail.tabAssistant" });
+      tabs.push(tab("assistant", assistantLabel, ({ dragProps, guardClick }) => (
+        <RailTabButton {...dragProps} icon={<OttieRailAvatar />} label={assistantLabel} active={railMode === "assistant"} onClick={guardClick(railModeSelectors.assistant)} testId="left-rail-tab-assistant" />
+      )));
+    }
+    return tabs;
+  }, [appsAttention.lit, computerAttentionTooltip, formatMessage, handleClassicActivityClick, hasActivityUnread, hasChatUnread, isGuest, railMode, railModeSelectors, showArtifacts, showAssistant, showComputerAttentionDot, topBar]);
   const selectPublicChatMode = useCallback(() => publicProjection?.onSelectMode("chat"), [publicProjection]);
   const selectPublicSettingsMode = useCallback(() => publicProjection?.onSelectMode("settings"), [publicProjection]);
   const openPublicFeedback = useCallback(() => publicProjection?.onSelectSettingsTab("feedback"), [publicProjection]);
@@ -301,6 +394,7 @@ export function LeftRail({ hidden, topBar = false, publicProjection }: LeftRailP
       <AppRailRoot
         className="hidden shrink-0 pb-2 md:flex"
         data-testid="workspace-left-rail"
+        data-otter-dock="rail"
         data-public-server-rail="true"
       >
         <AppRailHeader ref={railHeaderRef}>
@@ -334,7 +428,7 @@ export function LeftRail({ hidden, topBar = false, publicProjection }: LeftRailP
         </AppRailHeader>
         <AppRailNav>
           <RailTabButton
-            icon={<MessageSquare size={18} />}
+            icon={<MessageIcon width={18} height={18} />}
             label={formatMessage({ id: "layout.leftRail.tabChat" })}
             active={publicProjection.activeMode === "chat"}
             onClick={selectPublicChatMode}
@@ -404,6 +498,7 @@ export function LeftRail({ hidden, topBar = false, publicProjection }: LeftRailP
       <AppRailRoot
         className="hidden md:flex"
         data-testid="workspace-left-rail"
+        data-otter-dock="rail"
       >
       {topBar ? null : (
       <>
@@ -427,11 +522,11 @@ export function LeftRail({ hidden, topBar = false, publicProjection }: LeftRailP
                   // image, and the other-workspace unread dot sits on the
                   // button's corner. `group` lets the avatar read the item's
                   // selected state.
-                  className="group size-10 p-0 md:[@media(max-height:600px)]:size-9"
+                  className="group size-(--rail-item) p-0 md:[@media(max-height:600px)]:size-9"
                 />
               )}
             >
-              <AppRailItemIcon className="[&_[data-slot=app-rail-item-attention-mask]]:z-[2] [&_[data-slot=app-rail-item-indicator]]:z-[2]">
+              <AppRailItemIcon className="[&_[data-slot=app-rail-item-attention-mask]]:z-raised [&_[data-slot=app-rail-item-indicator]]:z-raised">
                 {/* The avatar fills the button, so on selected it shrinks a
                     step and the selected card shows round it as a frame. */}
                 <AvatarSlot
@@ -465,30 +560,7 @@ export function LeftRail({ hidden, topBar = false, publicProjection }: LeftRailP
       {/* Rail buttons (middle). Mutually-exclusive — at most one is
           highlighted at a time. */}
       <AppRailNav className="relative w-full">
-        {topBar ? null : <RailTabButton icon={<Search size={18} />} label={formatMessage({ id: "layout.leftRail.tabSearch" })} active={railMode === "search"} onClick={railModeSelectors.search} testId="left-rail-tab-search" />}
-        <RailTabButton icon={<MessageSquare size={18} />} label={formatMessage({ id: "layout.leftRail.tabChat" })} active={railMode === "chat"} onClick={railModeSelectors.chat} showDot={hasChatUnread} dotInactiveOnly testId="left-rail-tab-chat" />
-        <RailTabButton
-          icon={<Activity size={18} />}
-          label={formatMessage({ id: "layout.leftRail.tabActivity" })}
-          active={railMode === "activity"}
-          showDot={hasActivityUnread}
-          dotInactiveOnly
-          onClick={handleClassicActivityClick}
-          onDoubleClick={focusFirstUnreadActivity}
-          testId="left-rail-tab-activity"
-        />
-        <RailTabButton icon={<CheckSquare size={18} />} label={formatMessage({ id: "layout.leftRail.tabTasks" })} active={railMode === "tasks"} onClick={railModeSelectors.tasks} testId="left-rail-tab-tasks" />
-        {!isGuest && <RailTabButton icon={<Users size={18} />} label={formatMessage({ id: "layout.leftRail.tabMembers" })} active={railMode === "members"} onClick={railModeSelectors.members} testId="left-rail-tab-members" />}
-        {!isGuest && <RailTabButton
-          icon={<Monitor size={18} />}
-          label={formatMessage({ id: "layout.leftRail.tabComputers" })}
-          active={railMode === "computers"}
-          showDot={computerAttentionCount > 0}
-          dotInactiveOnly
-          dotTooltip={computerAttentionTooltip}
-          onClick={railModeSelectors.computers}
-          testId="left-rail-tab-computers"
-        />}
+        <SortableRailTabs tabs={railTabs} />
       </AppRailNav>
 
       {/* Notification Center trigger — the permanent Bell sits above Help.
@@ -497,9 +569,14 @@ export function LeftRail({ hidden, topBar = false, publicProjection }: LeftRailP
           notices collect there instead of stacking warning bars on the page.
           The popup floats to the right of the rail. */}
       <AppRailFooter>
+      {/* Collapse / expand the sidebar: an action on the shell, not a
+          destination, so it heads the footer tools rather than joining the
+          sortable tabs. */}
+      {sidebarToggle ? <SidebarToggleRailItem column={sidebarToggle} /> : null}
+
       {/* With the top bar, the Bell lives in its right region; Help stays here
           above Settings. */}
-      {topBar ? null : <NotificationTrigger flavor="rail-bottom" />}
+      {topBar ? null : pending ? <PendingNotificationTrigger flavor="rail-bottom" /> : <NotificationTrigger flavor="rail-bottom" />}
 
       {/* Each footer item is the bare 40px rail button: the footer's 6px gap
           spaces them like the items above (Raft DS › Rail). */}
@@ -516,6 +593,7 @@ export function LeftRail({ hidden, topBar = false, publicProjection }: LeftRailP
                 active={showHelpMenu}
                 onClick={closeServerMenu}
                 testId="left-rail-help"
+                id={HELP_MENU_TRIGGER_ID}
                 ariaHasPopup="menu"
                 ariaExpanded={showHelpMenu}
                 showTooltip={false}
@@ -528,6 +606,7 @@ export function LeftRail({ hidden, topBar = false, publicProjection }: LeftRailP
             onClose={closeHelpMenu}
             showMobileAppBadge={showMobileAppBadge}
             onMobileAppOpened={dismissMobileAppBadge}
+            keyboardShortcuts={!pending}
           />
         </div>
       </Popover>
@@ -542,259 +621,39 @@ export function LeftRail({ hidden, topBar = false, publicProjection }: LeftRailP
   );
 }
 
-export function HelpMenu({
-  servers,
-  serverSlugOverride,
-  side = "right",
-  onClose,
-  showMobileAppBadge,
-  onMobileAppOpened,
-  onOpenFeedback,
-  onOpenMobileApp,
-}: {
-  servers: Server[];
-  serverSlugOverride?: string;
-  /** Where the menu opens from its trigger: beside the rail, or under the top bar. */
-  side?: "right" | "bottom";
-  onClose: () => void;
-  showMobileAppBadge: boolean;
-  onMobileAppOpened: () => void;
-  onOpenFeedback?: () => void;
-  onOpenMobileApp?: () => void;
-}) {
-  const { formatMessage, locale } = useIntl();
-  const navigate = useNavigate();
-  const storedServerSlug = useServerStore((state) => state.current?.slug ?? null);
-  const serverSlug = serverSlugOverride ?? storedServerSlug;
-  const onCloseRef = useRef(onClose);
-  useEffect(() => {
-    onCloseRef.current = onClose;
-  }, [onClose]);
-
-  const communityJoinFlow = useJoinCommunityFlow({
-    onJoined: () => {
-      onCloseRef.current();
-    },
-    onError: (_error, _slug, message) => {
-      onCloseRef.current();
-      // Surfacing via alert matches the existing ServerSwitcherMenu join flow
-      // until the app has one shared toast surface for low-frequency failures.
-      // eslint-disable-next-line no-alert
-      alert(message);
-    },
-  });
-  const showChineseCommunityEntry = shouldShowChineseCommunityEntry(locale);
-
-  const openDocumentation = useCallback(() => {
-    onCloseRef.current();
-    window.open("https://docs.raft.build", "_blank", "noopener,noreferrer");
-  }, []);
-
-  const openFeedback = useCallback(() => {
-    if (!serverSlug) return;
-    onCloseRef.current();
-    if (onOpenFeedback) {
-      onOpenFeedback();
-      return;
-    }
-    navigate(`/s/${serverSlug}/settings/feedback`);
-  }, [navigate, onOpenFeedback, serverSlug]);
-  const openMobileApp = useCallback(() => {
-    if (!serverSlug) return;
-    // Mark seen on open, not on menu-open: the dot is announcing the mobile app,
-    // and someone who opened Help to reach Feedback has not been told about it.
-    onMobileAppOpened();
-    onCloseRef.current();
-    if (onOpenMobileApp) {
-      onOpenMobileApp();
-      return;
-    }
-    navigate(`/s/${serverSlug}/settings/about`);
-  }, [navigate, onMobileAppOpened, onOpenMobileApp, serverSlug]);
-
-  const { joinCommunity } = communityJoinFlow;
-  const openCommunity = useCallback(async () => {
-    if (showChineseCommunityEntry) {
-      onCloseRef.current();
-      navigate(`${CHINESE_COMMUNITY_PAGE_PATH}?from=help-menu`);
-      return;
-    }
-    const joinedDefault = servers.find((candidate) => candidate.slug === DEFAULT_COMMUNITY_SERVER_SLUG);
-    if (joinedDefault) {
-      onCloseRef.current();
-      navigate(`/s/${joinedDefault.slug}`);
-      return;
-    }
-    const outcome = await joinCommunity(DEFAULT_COMMUNITY_SERVER_SLUG);
-    if (outcome.status === "agreement_required") onCloseRef.current();
-  }, [joinCommunity, navigate, servers, showChineseCommunityEntry]);
-  const handleCommunityClick = useCallback(() => {
-    void openCommunity();
-  }, [openCommunity]);
-
+// raft-ui's AppShellSidebarTrigger owns the toggle (aria-expanded, aria-controls
+// naming the sidebar slot, the shell's open state); rendered as an AppRailItem
+// it sits in the rail like the other footer tools. Its built-in English label
+// and native `title` are replaced by the catalog's words and the rail's
+// tooltip, which also shows the shortcut.
+function SidebarToggleRailItem({ column }: { column: SidebarSlotColumn }) {
+  const { formatMessage } = useIntl();
+  const sidebarHidden = useSidebarSlotHidden(column);
+  const label = formatMessage({ id: sidebarHidden ? "layout.leftRail.expandSidebar" : "layout.leftRail.collapseSidebar" });
+  // The person's keys (the shortcuts panel); none set, the tooltip is the label alone.
+  const shortcut = useShortcutBinding("sidebar");
   return (
-    <>
-      <PopoverContent
-        side={side}
-        align="end"
-        sideOffset={8}
-        initialFocus={initialFocusForKeyboardOpen}
-        role="menu"
-        aria-label={formatMessage({ id: "layout.leftRail.helpMenuTitle" })}
-        data-testid="left-rail-help-menu"
-        className="w-80 overflow-hidden p-0"
-      >
-          <div className="flex items-center border-b border-line-hairline px-3 py-2">
-            <SectionEyebrow>
-              {formatMessage({ id: "layout.leftRail.helpMenuTitle" })}
-            </SectionEyebrow>
-          </div>
-          <MenuItem
-            icon={<BookOpenText size={14} className="shrink-0" />}
-            trailing={<ArrowUpRight size={14} className="shrink-0" />}
-            onClick={openDocumentation}
-          >
-            {formatMessage({ id: "layout.leftRail.helpDocumentation" })}
-          </MenuItem>
-          {/* Signpost only — the content lives in Settings so there is one host
-              to keep current, not two that can drift. */}
-          {serverSlug ? (
-            <MenuItem
-              icon={<Smartphone size={14} className="shrink-0" />}
-              // `lg` is the canonical dot; `sm` is compact-only, for parents
-              // that physically cannot fit 10×10. A menu row fits it easily —
-              // I reached for `sm` to make it feel less shouty, which is the
-              // priority axis the design system explicitly does not have. At
-              // 4×4 it rendered as a speck that read as a rendering artefact
-              // rather than a signal (@wenyi, preview review).
-              trailing={showMobileAppBadge
-                ? (
-                  <AttentionDot
-                    className="shrink-0"
-                    aria-hidden="true"
-                    data-testid="help-menu-mobile-app-badge"
-                  />
-                )
-                : undefined}
-              onClick={openMobileApp}
-              data-testid="help-menu-mobile-app"
-            >
-              {formatMessage({ id: "layout.leftRail.helpMobileApp" })}
-            </MenuItem>
-          ) : null}
-          {serverSlug ? (
-            <MenuItem
-              icon={<MessageSquare size={14} className="shrink-0" />}
-              onClick={openFeedback}
-            >
-              {formatMessage({ id: "settings.about.feedbackTitle" })}
-            </MenuItem>
-          ) : null}
-          <MenuItem
-            icon={communityJoinFlow.joiningCommunitySlug
-              ? <Spinner size="sm" aria-hidden="true"  aria-label={formatMessage({ id: "common.loadingLabel" })} />
-              : <UsersRound size={14} className="shrink-0" />}
-            onClick={handleCommunityClick}
-            disabled={communityJoinFlow.joiningCommunitySlug !== null}
-          >
-            {communityJoinFlow.joiningCommunitySlug
-              ? formatMessage({ id: "layout.leftRail.helpCommunityJoining" })
-              : formatMessage({
-                  id: showChineseCommunityEntry
-                    ? "layout.leftRail.helpChineseCommunity"
-                    : "layout.leftRail.helpCommunity",
-                })}
-          </MenuItem>
-      </PopoverContent>
-      {communityJoinFlow.agreementDialog}
-    </>
-  );
-}
-
-type RailTabButtonProps = Omit<
-  React.ComponentPropsWithoutRef<"button">,
-  "children" | "onClick" | "onDoubleClick" | "aria-label" | "aria-haspopup" | "aria-expanded"
-> & {
-  icon: React.ReactNode;
-  label: string;
-  active: boolean;
-  showDot?: boolean;
-  dotInactiveOnly?: boolean;
-  dotTooltip?: string;
-  tooltipSide?: "left" | "right";
-  onClick: (event: React.MouseEvent) => void;
-  onDoubleClick?: () => void;
-  testId?: string;
-  buttonRef?: React.Ref<HTMLButtonElement>;
-  ariaHasPopup?: "menu";
-  ariaExpanded?: boolean;
-  showTooltip?: boolean;
-};
-
-export const RailTabButton = forwardRef<HTMLButtonElement, RailTabButtonProps>(function RailTabButton({
-  icon,
-  label,
-  active,
-  showDot,
-  dotInactiveOnly,
-  dotTooltip,
-  tooltipSide = "right",
-  onClick,
-  onDoubleClick,
-  testId,
-  onPointerDown,
-  buttonRef,
-  ariaHasPopup,
-  ariaExpanded,
-  showTooltip = true,
-  className = "",
-  ...buttonProps
-}, forwardedRef) {
-  const dotVisible = Boolean(showDot && (!dotInactiveOnly || !active));
-  const setButtonRefs = useCallback((node: HTMLButtonElement | null) => {
-    setReactRef(buttonRef, node);
-    setReactRef(forwardedRef, node);
-  }, [buttonRef, forwardedRef]);
-  const button = (
-    <AppRailItem
-      {...buttonProps}
-      ref={setButtonRefs}
-      selected={active}
-      onClick={onClick}
-      onDoubleClick={onDoubleClick}
-      aria-label={label}
-      aria-haspopup={ariaHasPopup}
-      aria-expanded={ariaExpanded}
-      data-testid={testId}
-      onPointerDown={onPointerDown}
-      // Raft Design System › Rail: 40×40 items, 36×36 when the window is
-      // under 600 tall (the heads shrink to 48 with them).
-      className={`size-10 [@media(max-height:600px)]:h-9 [@media(max-height:600px)]:w-9 ${className}`}
-    >
-      <AppRailItemIcon className="relative">
-        {icon}
-        {dotVisible ? (
-          <AppRailItemAttention title={dotTooltip ?? label} />
-        ) : null}
-      </AppRailItemIcon>
-      <AppRailItemLabel>{label}</AppRailItemLabel>
-    </AppRailItem>
-  );
-
-  return showTooltip ? (
     <Tooltip
-      content={dotVisible && dotTooltip ? dotTooltip : label}
-      contentProps={TOOLTIP_CONTENT_PROPS[tooltipSide]}
+      content={shortcut.combos[0] ? labelWithShortcut(label, shortcut.combos[0], formatMessage) : label}
+      contentProps={TOOLTIP_CONTENT_PROPS.right}
     >
-      {button}
+      <AppShellSidebarTrigger
+        render={<AppRailItem className="size-(--rail-item) [@media(max-height:600px)]:h-9 [@media(max-height:600px)]:w-9" />}
+        id={SIDEBAR_TOGGLE_ID}
+        aria-label={label}
+        aria-keyshortcuts={shortcut.ariaKeyShortcuts || undefined}
+        title={undefined}
+        data-testid="left-rail-sidebar-toggle"
+        data-sidebar-column={column}
+      >
+        <AppRailItemIcon>
+          {sidebarHidden
+            ? <PanelLeftOpen size={18} aria-hidden="true" />
+            : <PanelLeftClose size={18} aria-hidden="true" />}
+        </AppRailItemIcon>
+      </AppShellSidebarTrigger>
     </Tooltip>
-  ) : button;
-});
-
-function setReactRef<T>(ref: React.Ref<T> | undefined, value: T | null) {
-  if (!ref) return;
-  if (typeof ref === "function") ref(value);
-  else ref.current = value;
+  );
 }
 
 export default LeftRail;

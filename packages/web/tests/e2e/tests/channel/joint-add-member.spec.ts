@@ -58,7 +58,9 @@ test.describe("Joint channel member management", () => {
 
     await addMember.click();
     await page.getByPlaceholder("Name").fill(seedState.agent.name);
-    await page.getByRole("button", { name: new RegExp(seedState.agent.name) }).click();
+    // The agent's candidate row is a ChoiceList checkbox under the Agents
+    // heading (#11067), not a button; the search for its handle ranks it first.
+    await page.getByRole("group", { name: "Agents" }).getByRole("checkbox").first().click();
     await page.getByTestId("add-member-confirm").click();
     await expect(page.getByTestId("member-page-count")).toHaveText("2");
   });

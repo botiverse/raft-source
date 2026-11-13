@@ -8,6 +8,7 @@ import { announcements, channels, servers, serverMembers, users, userAnnouncemen
 import { addMember, createServer } from "../services/serverService";
 import { getOrCreateThread } from "../services/channelService";
 import { createMessage } from "../services/messageService";
+import { shapeEstablishedServerForTest } from "./allChannelFixture";
 
 /** Per-attempt tenants in the disposable Playwright database. No production mount. */
 export function playwrightScenarios(capability: string): RouterType {
@@ -51,6 +52,8 @@ export function playwrightScenarios(capability: string): RouterType {
       userIds = [owner.id, peer.id];
       const server = await createServer(name, name, owner.id);
       serverId = server.id;
+      // An established server: #all live, no onboarding-owner channel.
+      await shapeEstablishedServerForTest(server.id);
       owned.set(server.id, userIds);
       await addMember(server.id, peer.id, "member");
       // Match the established legacy owner fixture. Onboarding has its own
@@ -115,6 +118,27 @@ export function playwrightScenarios(capability: string): RouterType {
         newerReplyId, totalMessageRows: replyCount + 1 });
     } catch (error) {
       console.error("[playwright-scenario] thread seed failed", error);
+      res.sendStatus(500);
+    }
+  });
+  router.post("/__playwright/scenarios/:id/channel-history", async (req, res) => {
+    const userIds = owned.get(req.params.id);
+    if (!userIds) { res.sendStatus(404); return; }
+    const count = Number(req.query.count ?? 60);
+    if (!Number.isInteger(count) || count < 1 || count > 500) { res.sendStatus(400); return; }
+    try {
+      const [channel] = await getDb().select({ id: channels.id }).from(channels)
+        .where(eq(channels.serverId, req.params.id));
+      // Timeline tests need a known history in a channel nobody else posts
+      // to; the real message service, not `count` HTTP sends.
+      const messages: Array<{ id: string; content: string }> = [];
+      for (let i = 1; i <= count; i += 1) {
+        const message = await createMessage(channel.id, "user", userIds[0], `History message ${String(i).padStart(3, "0")}`);
+        messages.push({ id: message.id, content: message.content });
+      }
+      res.json({ messages });
+    } catch (error) {
+      console.error("[playwright-scenario] channel history seed failed", error);
       res.sendStatus(500);
     }
   });

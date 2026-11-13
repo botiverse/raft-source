@@ -9,8 +9,6 @@ html, body, #root { height: 100%; margin: 0; }
 
 @source "../../../node_modules/@botiverse/hands-feedback-react/dist";
 
-.feedback-entry .hands-feedback-ticket-card { min-width: 0; max-width: 100%; }
-.feedback-entry .hands-feedback-ticket-card > * { min-width: 0; }
 .feedback-entry .hands-feedback-ticket-title { white-space: normal; overflow-wrap: anywhere; }
 .feedback-host-status { margin: 0; padding: 24px; min-height: 100vh; height: 100dvh; box-sizing: border-box; font-family: var(--font-sans, sans-serif); color: var(--foreground); background: var(--layer-canvas); }
 .feedback-auth-status { position: fixed; inset: 0; min-height: 0; background: var(--layer-canvas); display: grid; place-content: center; }
@@ -18,4 +16,5 @@ html, body, #root { height: 100%; margin: 0; }
 .feedback-diagnostics-status { position: fixed; inset: 0; z-index: 100; display: grid; place-content: center; padding: 20px; background: var(--layer-canvas); color: var(--foreground); font-family: var(--font-sans, sans-serif); }
 .feedback-diagnostics-card { max-width: 360px; display: grid; gap: 16px; }
 .feedback-diagnostics-card progress { width: 100%; }
+.feedback-card-entry { box-sizing: border-box; height: 100%; overflow-y: auto; display: grid; align-content: start; gap: 16px; padding: 20px 20px max(20px, env(safe-area-inset-bottom)); color: var(--foreground); }
 .feedback-diagnostics-notice { margin: 0; padding: 12px 16px; color: var(--foreground); font-family: var(--font-sans, sans-serif); }

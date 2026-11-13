@@ -7,7 +7,10 @@ import { getDb } from "../db/index";
 import { agents, machines, reminders, servers, users } from "../db/schema";
 import {
   createReminder,
+  fireReminder,
   getReminderById,
+  listReminderEvents,
+  markReminderMigrated,
   recordReminderArmed,
   type ReminderRow,
   type TimeProvider,
@@ -78,6 +81,7 @@ test("arm watchdog marks missing receipt not_armed and only re-pushes the schedu
     clock: createFakeClock(FIXED_NOW),
     horizonMs: 15_000,
     orchestrator: {
+      pushReminderCancel: async () => true,
       pushReminderUpsert: async (_agentId, row) => {
         pushed.push(row);
         return true;
@@ -115,6 +119,7 @@ test("armed exact revision is healthy and watchdog performs no fallback action",
     clock: createFakeClock(FIXED_NOW),
     horizonMs: 15_000,
     orchestrator: {
+      pushReminderCancel: async () => true,
       pushReminderUpsert: async () => {
         pushes += 1;
         return true;
@@ -153,6 +158,7 @@ test("armed state without an exact armed revision is not healthy", async ({ db }
     clock: createFakeClock(FIXED_NOW),
     horizonMs: 15_000,
     orchestrator: {
+      pushReminderCancel: async () => true,
       pushReminderUpsert: async () => {
         pushes += 1;
         return true;
@@ -219,6 +225,7 @@ test("task #441: a reminder on an offline machine is not re-pushed or stamped, a
     horizonMs: 15_000,
     batchSize: 1,
     orchestrator: {
+      pushReminderCancel: async () => true,
       pushReminderUpsert: async (_agentId, row) => {
         pushed.push(row.id);
         return true;
@@ -252,6 +259,7 @@ test("task #441: a machine that comes back online rejoins the arm watchdog", asy
     clock: createFakeClock(FIXED_NOW),
     horizonMs: 15_000,
     orchestrator: {
+      pushReminderCancel: async () => true,
       pushReminderUpsert: async (_agentId, row) => {
         pushed.push(row.id);
         return true;
@@ -265,4 +273,60 @@ test("task #441: a machine that comes back online rejoins the arm watchdog", asy
   await watchdog.tick();
   watchdog.stop();
   assert.deepEqual(pushed, [reminder.id]);
+});
+
+test("a migrated reminder never fires, and the watchdog tells its Computer to drop the copy once", async ({ db }) => {
+  const { server, agent, user } = await seedServerAndAgent();
+  const reminder = await createReminder({
+    serverId: server.id,
+    ownerAgentId: agent.id,
+    msgId: null,
+    title: "moved to the Reminder App",
+    fireAt: new Date("2026-04-20T13:00:00.000Z"),
+    payload: null,
+    createdBy: { type: "human", id: user.id },
+  }, { clock: FIXED_CLOCK });
+  assert.ok(await recordReminderArmed(reminder.id, agent.id, reminder.version, { clock: FIXED_CLOCK }));
+
+  const migrated = await markReminderMigrated(reminder.id, { appReminderId: "app-rem-1", batchId: "b1" }, {
+    expectedVersion: reminder.version,
+    clock: FIXED_CLOCK,
+  });
+  assert.ok(migrated);
+  assert.equal(migrated.status, "migrated");
+  assert.equal(migrated.version, reminder.version + 1);
+  assert.equal(migrated.armState, "pending");
+  // CAS: a stale version or a second mark does nothing.
+  assert.equal(await markReminderMigrated(reminder.id, { appReminderId: "x" }, { expectedVersion: reminder.version, clock: FIXED_CLOCK }), null);
+  // The Computer's armed copy is at the old version: its fire is refused.
+  const late = new Date("2026-04-20T13:00:01.000Z");
+  const fire = await fireReminder(reminder.id, reminder.version, { clock: { now: () => late } });
+  assert.equal(fire.ok, false, JSON.stringify(fire));
+  assert.equal(fire.ok ? null : fire.reason, "not_scheduled");
+  const events = await listReminderEvents(reminder.id);
+  assert.deepEqual(events.filter((e) => e.eventType === "migrated").map((e) => e.metadata), [{ appReminderId: "app-rem-1", batchId: "b1" }]);
+
+  const cancels: Array<[string, string, number]> = [];
+  const watchdog = startReminderArmWatchdog({
+    clock: createFakeClock(FIXED_NOW),
+    horizonMs: 15_000,
+    orchestrator: {
+      pushReminderUpsert: async () => {
+        throw new Error("a migrated reminder must never be re-armed");
+      },
+      pushReminderCancel: async (agentId, reminderId, version) => {
+        cancels.push([agentId, reminderId, version]);
+        return false; // owner offline: still marked, the reconnect snapshot drops it
+      },
+    },
+  });
+  await watchdog.tick();
+  await watchdog.tick();
+  watchdog.stop();
+
+  assert.deepEqual(cancels, [[agent.id, reminder.id, migrated.version]], "one cancel at the migrated revision");
+  const persisted = await getReminderById(reminder.id);
+  assert.equal(persisted?.status, "migrated");
+  assert.equal(persisted?.armState, "not_armed");
+  assert.equal(persisted?.firedAt, null);
 });

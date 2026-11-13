@@ -28,7 +28,8 @@ import {
   setAgentRuntimeError,
   unregisterMachineReplica,
 } from "./replicaRouter";
-import { redisReplicaStateStore } from "./services/replicaStateStore";
+import { redisAgentContextViewRequestStore, redisReplicaStateStore, type AgentContextViewRequestRecord } from "./services/replicaStateStore";
+import { asMachineId, mintAgentContextViewRequestId } from "@botiverse/raft-shared";
 import { WakeCrashLoopBreaker, type WakeCrashLoopEpisodeState } from "./services/wakeCrashLoopBreaker";
 
 const REAL_REDIS_URL = process.env.WAKE_CRASH_LOOP_REAL_REDIS_URL;
@@ -85,6 +86,12 @@ test("real Redis: every episode field written through the store reads back equal
     startFailureOwnedLaunchId: "launch-owned",
     blockedByLaunchId: "launch-blocker",
     actionRequiredNotifiedFingerprint: "0123456789abcdef",
+    pauseRetryAtMs: 1_700_001_800_000,
+    pauseRetryCooldownMs: 1_800_000,
+    pauseRetryLaunchId: "launch-try",
+    pauseRetryReadyLaunchId: "launch-ready-try",
+    pauseRetryReadyCooldownMs: 3_600_000,
+    pauseRetryCapNotified: true,
   };
   assert.equal(await compareAndSetWakeCrashLoopState(agentId, 0, state), true);
   assert.deepEqual(await getWakeCrashLoopState(agentId), { state, version: 1 });
@@ -229,5 +236,36 @@ test("real Redis: task #374 the holder's daemon identity is returned only for th
   } finally {
     await getRedis().del(`slock:machine:${machine}:replica_instance`);
     await unregisterMachineReplica(machine, generation);
+  }
+});
+
+test("real Redis: a View Context request record round-trips branded, is claimed once and only by its Computer", async () => {
+  if (skipUnlessRealRedis()) return;
+  const store = redisAgentContextViewRequestStore;
+  const record: AgentContextViewRequestRecord = {
+    requestId: mintAgentContextViewRequestId(),
+    viewerUserId: "viewer-1",
+    agentId: "agent-1",
+    serverId: "server-1",
+    messageId: "message-1",
+    machineId: asMachineId(`machine-${Math.random().toString(36).slice(2)}`),
+    viewerReplicaId: "replica-a",
+    viewerEndpoint: null,
+    createdAt: new Date().toISOString(),
+  };
+  const keys = [`slock:context-view:${record.requestId}`, `slock:context-view:${record.requestId}:claimed`];
+  try {
+    await store.create(record, 5_000);
+    assert.deepEqual(await store.get(record.requestId), { record, claimed: false });
+    assert.deepEqual(await store.claim(record.requestId, asMachineId("another-machine"), 5_000), { kind: "wrong_computer" });
+    assert.deepEqual(await store.claim(record.requestId, record.machineId, 5_000), { kind: "claimed", record });
+    assert.deepEqual(await store.claim(record.requestId, record.machineId, 5_000), { kind: "already_claimed" });
+    assert.deepEqual(await store.get(record.requestId), { record, claimed: true });
+    assert.deepEqual(await store.claim(mintAgentContextViewRequestId(), record.machineId, 5_000), { kind: "unknown" });
+    // A stored record whose id is not a request id reads as unknown.
+    await getRedis().set(keys[0]!, JSON.stringify({ ...record, requestId: "not-a-request-id" }), "PX", 5_000);
+    assert.equal(await store.get(record.requestId), null);
+  } finally {
+    await getRedis().del(...keys);
   }
 });

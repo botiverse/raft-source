@@ -1,14 +1,15 @@
 {
   "name": "@botiverse/raft-event-buffer",
   "version": "0.1.0",
-  "license": "FSL-1.1-ALv2",
+  "license": "LicenseRef-Raft-License",
   "private": true,
   "type": "module",
   "main": "src/index.ts",
   "types": "src/index.ts",
   "scripts": {
     "test": "vitest run",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsrs --noEmit",
+    "typecheck:tsc": "tsc --noEmit"
   },
   "dependencies": {
     "@botiverse/raft-shared": "workspace:*"

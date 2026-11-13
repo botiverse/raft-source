@@ -1,9 +1,11 @@
 import type { ReactElement, ReactNode } from "react";
+import { useCallback, useState } from "react";
 import { User } from "lucide-react";
 import { Avatar, AvatarBadge, AvatarFallback } from "@botiverse/raft-ui";
 import type { AvatarBadgeOffset, AvatarSize, Presence } from "@botiverse/raft-ui";
 import { AgentAvatar } from "../agent/PixelAvatar";
-import GravatarAvatar from "../member/GravatarAvatar";
+import { PersonAvatar } from "../member/PersonAvatar";
+import { useMediaQuery } from "../../hooks/effectPrimitives";
 
 /**
  * Product identity adapter. A context names where an identity sits and maps
@@ -24,15 +26,21 @@ const CONTEXT_SIZE = {
   "account-tile": "lg",
   /** The profile hover card: lg 51. */
   "mention-card": "lg",
+  /** A panel head's avatar: 35 on a phone and a touch screen (a 56px head);
+   *  27 with a mouse on a desktop, in a 44px head beside its 28px tiles
+   *  (raft-design panel.md: a head's avatar is `sm`; stdrc, 2026-11-04). */
   "panel-header": "md",
+  /** A row of the server switcher: 35 on a touch screen; with a mouse on a
+   *  desktop 27, the size of the workspace avatar on the switcher's trigger
+   *  (stdrc, 2026-11-04). */
+  "switcher-row": "md",
   /** The message row's own avatar: raft-ui's `messageItem.avatarSlot` recipe
    *  sizes it (36, 24 on narrow viewports). */
   "message-row": "md",
   /** A row in a list — channel members, the people and agents on a profile
    *  or computer page, the workspace switcher: the DS ListRow avatar, 35. */
   "list-row": "md",
-  /** A dense row — search results, forward targets, the compact member graph,
-   *  Working now: 27. */
+  /** A dense row — search results, forward targets, Working now: 27. */
   "compact-row": "sm",
   "creator-link": "xs",
   "sidebar-list": "2xs",
@@ -40,20 +48,36 @@ const CONTEXT_SIZE = {
   /** A face in the stack of agents at work (DS AgentActivity): 19. */
   "face-stack": "xs",
   "preview-mini": "3xs",
+  /** A leading identity in a picker trigger, at raft-ui PickerTriggerButton's
+   *  14px leading-icon size: the Forward dialog's server switch. */
+  "picker-trigger": "3xs",
+  /** A leading identity in a menu item (raft-ui DropdownMenu): the Forward
+   *  dialog's list of servers. 19px: raft-ui's Avatar has no 16px step to
+   *  match the menu's 16px icons, and its 2xs is the smallest above 14. */
+  "menu-item": "2xs",
+  /** The author of a comment in a document's comment card (raft-ui
+   *  CommentEntryHeader): 19. */
+  "comment-entry": "xs",
+  /** The authors on a comment marker beside a passage (raft-ui
+   *  CommentMarker's AvatarGroup): 19. */
+  "comment-marker": "2xs",
+  /** The face of the assistant that sent a message for its owner, on the
+   *  corner of the owner's message-row avatar (raft-ui
+   *  MessageItemDelegatedAvatar; DS Identity and presence). */
+  "delegated-face": "2xs",
 } as const satisfies Record<string, AvatarSize>;
 
 export type AvatarContext = keyof typeof CONTEXT_SIZE;
 
-/** What GravatarAvatar asks for at each step: the image size to request and
- *  the placeholder icon shown while it loads. */
-const GRAVATAR_LEAF: Record<AvatarSize, { size: number; icon: number }> = {
-  xl: { size: 96, icon: 48 },
-  lg: { size: 52, icon: 24 },
-  md: { size: 36, icon: 16 },
-  sm: { size: 24, icon: 14 },
-  xs: { size: 16, icon: 12 },
-  "2xs": { size: 16, icon: 10 },
-  "3xs": { size: 11, icon: 9 },
+/** The size of a person's User placeholder icon at each step. */
+const PERSON_PLACEHOLDER_ICON: Record<AvatarSize, number> = {
+  xl: 48,
+  lg: 24,
+  md: 16,
+  sm: 14,
+  xs: 12,
+  "2xs": 10,
+  "3xs": 9,
 };
 
 export interface AvatarSlotProps {
@@ -63,9 +87,8 @@ export interface AvatarSlotProps {
   /** Agent's avatarUrl (`pixel:*` key or uploaded image URL). Used when
    *  `type="agent"`. */
   agentAvatarUrl?: string | null;
-  /** Human's gravatar hash. Used when `type="human"`. */
-  gravatarHash?: string | null;
-  /** Human's uploaded avatar URL. Used before Gravatar when `type="human"`. */
+  /** Human's avatar URL; only an avatar Raft stores is drawn, else the User
+   *  placeholder. Used when `type="human"`. */
   humanAvatarUrl?: string | null;
   /** Server's uploaded avatar URL. Used when `type="server"`. */
   serverAvatarUrl?: string | null;
@@ -75,16 +98,17 @@ export interface AvatarSlotProps {
   appAvatarUrl?: string | null;
   /** App initials placeholder. Used when `type="app"` has no logo. */
   appInitials?: string | null;
-  /** Optional email — GravatarAvatar derives a hash client-side when
-   *  `gravatarHash` is missing. Used when `type="human"`. */
-  email?: string | null;
-  /** When `type="human"`, render a static User-icon placeholder instead of
-   *  attempting a Gravatar lookup. Use when no gravatar identity is known. */
+  /** When `type="human"`, render the static User-icon placeholder without
+   *  looking at `humanAvatarUrl` (the person is not known here). */
   humanPlaceholder?: boolean;
   /** Optional corner indicator. When present, the identity frame is rendered
    *  by raft-ui Avatar and the indicator is mounted through AvatarBadge so
    *  size and bottom-right placement stay canonical across call sites. */
   badge?: ReactElement;
+  /** Classes for the badge's own box when `badge` is set: a badge that is not
+   *  a status light (an Agent Lounge's mark) sizes its box per avatar size
+   *  with raft-ui's `group-data-[size=…]/avatar:` steps. */
+  badgeClassName?: string;
   /** A fixed status light on the corner: raft-ui AvatarBadge's own dot
    *  (`presence`). For a light that subscribes to one agent's activity or
    *  carries a tooltip (AgentActivityDot), pass it as `badge` instead.
@@ -93,6 +117,12 @@ export interface AvatarSlotProps {
   /** Where the badge's centre sits, from the avatar's top-left (raft-ui
    *  AvatarBadge `offset`). Omit for the theme's default bottom-right spot. */
   badgeOffset?: AvatarBadgeOffset;
+  /** Another sticker in the avatar's corner, mounted as the Avatar's own
+   *  child: raft-ui MessageItemDelegatedAvatar places itself bottom-right (a
+   *  person has no presence light, so it never sits with `badge` or
+   *  `presence`); another server's tile (AvatarOriginCorner) places itself
+   *  top-left, clear of the light, and may sit with either. */
+  corner?: ReactNode;
   /** Trusted preview content can supply an uncommitted upload without replacing the themed frame. */
   children?: ReactNode;
   /** Additional classes — appended to the outer container. Useful for
@@ -102,33 +132,47 @@ export interface AvatarSlotProps {
   className?: string;
 }
 
-export function AvatarImageWithFallback({
-  src,
-  fallback,
-  alt = "",
-  className = "h-full w-full object-cover",
-}: {
+interface AvatarImageWithFallbackProps {
   src?: string | null;
   fallback: ReactNode;
   alt?: string;
   className?: string;
-}) {
+}
+
+export function AvatarImageWithFallback(props: AvatarImageWithFallbackProps) {
+  // Loading/error state belongs to one URL, including when a previous URL is reused.
+  return <AvatarImageContent key={props.src ?? ""} {...props} />;
+}
+
+function AvatarImageContent({
+  src,
+  fallback,
+  alt = "",
+  className = "h-full w-full object-cover",
+}: AvatarImageWithFallbackProps) {
+  const [loaded, setLoaded] = useState(false);
+  const imageRef = useCallback((image: HTMLImageElement | null) => {
+    if (image?.complete && image.naturalWidth > 0) setLoaded(true);
+  }, []);
   return (
     <>
-      {/* Positioned fallbacks paint above ordinary in-flow children. Give both
-          layers an explicit stack order so a valid avatar always covers its
-          placeholder; hiding the broken image reveals the fallback again. */}
-      <span className="pointer-events-none absolute inset-0 z-0 flex items-center justify-center">
-        {fallback}
-      </span>
+      {/* Transparent logos must not reveal the placeholder through their artwork. */}
+      {!loaded && (
+        <span className="pointer-events-none absolute inset-0 z-base flex items-center justify-center">
+          {fallback}
+        </span>
+      )}
       {src ? (
         <img
           key={src}
+          ref={imageRef}
           src={src}
           alt={alt}
-          className={`relative z-[1] ${className}`}
+          className={`relative z-raised ${className}`}
+          onLoad={() => setLoaded(true)}
           onError={(event) => {
             event.currentTarget.hidden = true;
+            setLoaded(false);
           }}
         />
       ) : null}
@@ -136,25 +180,43 @@ export function AvatarImageWithFallback({
   );
 }
 
-export default function AvatarSlot({
+/** Where a panel-header or switcher-row avatar is `sm` (27): the desktop query of raft-ui's size chain. */
+const DESKTOP_MOUSE_QUERY = "(width >= 48rem) and (pointer: fine)";
+
+/** The contexts that step down to `sm` with a mouse on a desktop. */
+const DESKTOP_SM_CONTEXTS: ReadonlySet<AvatarContext> = new Set(["panel-header", "switcher-row"]);
+
+function DesktopSmAvatarSlot(props: AvatarSlotProps) {
+  const desktop = useMediaQuery(DESKTOP_MOUSE_QUERY);
+  return <AvatarSlotFrame {...props} size={desktop ? "sm" : CONTEXT_SIZE[props.context]} />;
+}
+
+export default function AvatarSlot(props: AvatarSlotProps) {
+  // Only these follow the window, so only they listen to the query.
+  return DESKTOP_SM_CONTEXTS.has(props.context)
+    ? <DesktopSmAvatarSlot {...props} />
+    : <AvatarSlotFrame {...props} size={CONTEXT_SIZE[props.context]} />;
+}
+
+function AvatarSlotFrame({
+  size,
   context,
   type,
   agentAvatarUrl,
-  gravatarHash,
   humanAvatarUrl,
   serverAvatarUrl,
   serverInitial,
   appAvatarUrl,
   appInitials,
-  email,
   humanPlaceholder,
   badge,
+  badgeClassName,
   presence,
   badgeOffset,
+  corner,
   children,
   className = "",
-}: AvatarSlotProps) {
-  const size = CONTEXT_SIZE[context];
+}: AvatarSlotProps & { size: AvatarSize }) {
   let content: ReactNode;
   if (children !== undefined) {
     content = children;
@@ -167,16 +229,7 @@ export default function AvatarSlot({
   } else if (humanPlaceholder) {
     content = <User />;
   } else {
-    const leaf = GRAVATAR_LEAF[size];
-    content = (
-      <GravatarAvatar
-        avatarUrl={humanAvatarUrl ?? null}
-        gravatarHash={gravatarHash ?? null}
-        email={email ?? undefined}
-        size={leaf.size}
-        iconSize={leaf.icon}
-      />
-    );
+    content = <PersonAvatar avatarUrl={humanAvatarUrl ?? null} iconSize={PERSON_PLACEHOLDER_ICON[size]} />;
   }
 
   // A workspace tile is the ink square with yellow initials ("your
@@ -198,12 +251,13 @@ export default function AvatarSlot({
         {content}
       </AvatarFallback>
       {badge ? (
-        <AvatarBadge render={<span />} offset={badgeOffset} className="flex rounded-[2px] [&>span]:h-full [&>span]:w-full">
+        <AvatarBadge render={<span />} offset={badgeOffset} className={["flex rounded-[2px] [&>span]:h-full [&>span]:w-full", badgeClassName].filter(Boolean).join(" ")}>
           {badge}
         </AvatarBadge>
       ) : presence ? (
         <AvatarBadge presence={presence} offset={badgeOffset} />
       ) : null}
+      {corner}
     </Avatar>
   );
 }

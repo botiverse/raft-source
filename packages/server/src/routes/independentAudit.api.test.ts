@@ -1,12 +1,14 @@
 import assert from "node:assert/strict";
-import { and, eq } from "drizzle-orm";
+import { eq } from "drizzle-orm";
 import argon2 from "argon2";
 import { createApiTest } from "../test/integration/apiTest";
-import { signAccessToken, verifyToken } from "../middleware/auth";
-import { attachments, machines, serverMembers } from "../db/schema";
+import { seedBoundGuest } from "../test/guestFixture";
+import { verifyToken } from "../middleware/auth";
+import { accessTokenForTest } from "../test/integration/credentials";
+import { machines } from "../db/schema";
 import { clearAuthCache, findMachineByApiKey, registerMachine } from "../services/machineService";
 
-const test = createApiTest({ onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest();
 
 for (const change of ["migration", "rotation", "deletion"] as const) {
   test(`machine auth rechecks ${change} committed during key verification`, async ({ seed, db }) => {
@@ -43,14 +45,10 @@ for (const change of ["migration", "rotation", "deletion"] as const) {
 test("migration rejects a legacy machine key even when another worker's cache is warm", async ({ app, seed, db }) => {
   const owner = await seed.human();
   const server = await seed.server({ owner });
-  const channel = await seed.channel({ server, members: [owner], visibility: "private" });
   const { machine, apiKey } = await registerMachine(server.id, owner.id, "audit-cache-machine");
-  const [attachment] = await db.insert(attachments).values({
-    channelId: channel.id, uploaderId: owner.id, uploaderType: "user",
-    filename: "audit-private.txt", mimeType: "text/plain", sizeBytes: 20,
-    storageKey: `${server.id}/audit-private.txt`, contentHash: "audit-cache-fixture",
-  }).returning();
-  const read = () => fetch(`${app.baseUrl}/api/attachments/${attachment.id}/url`, {
+  // Machine keys no longer read attachments at all (#proj-raft-computer:8e6a4629);
+  // the legacy machine surface goes through the same requireMachineAuth cache.
+  const read = () => fetch(`${app.baseUrl}/internal/machine/agents`, {
     headers: { Authorization: `Bearer ${apiKey}` },
   });
   try {
@@ -68,7 +66,7 @@ test("migration rejects a legacy machine key even when another worker's cache is
     const cold = await read();
     assert.equal(cold.status, 401, "control: authoritative migrated state must reject this key");
     await cold.json();
-    assert.equal(staleStatus, 401, "a cached pre-migration identity must not authorize an attachment URL");
+    assert.equal(staleStatus, 401, "a cached pre-migration identity must not authorize the machine surface");
   } finally {
     clearAuthCache(machine.id);
   }
@@ -89,7 +87,12 @@ test("logging out a device-issued token prevents it from creating a fresh sessio
       return await response.json() as { userCode: string; deviceCode: string };
     };
     const grant = await authorize();
-    const approved = await post("device/approve", { userCode: grant.userCode }, signAccessToken(owner.id));
+    // Approving takes describe's ticket, as the approval page does.
+    const ownerToken = await accessTokenForTest(owner.id);
+    const described = await post("device/describe", { userCode: grant.userCode }, ownerToken);
+    assert.equal(described.status, 200);
+    const { approvalTicket } = await described.json() as { approvalTicket: string };
+    const approved = await post("device/approve", { userCode: grant.userCode, approvalTicket }, ownerToken);
     assert.equal(approved.status, 200);
     await approved.json();
     const issued = await post("device/token", { deviceCode: grant.deviceCode });
@@ -129,12 +132,11 @@ test("guest global sync cannot return a channel denied by scoped history", async
   const owner = await seed.human();
   const guest = await seed.human();
   const server = await seed.server({ owner, members: [guest] });
-  await db.update(serverMembers).set({ role: "guest" }).where(and(
-    eq(serverMembers.serverId, server.id), eq(serverMembers.userId, guest.id),
-  ));
+  // Bound to its own private channel, never the hidden one.
+  await seedBoundGuest({ serverId: server.id, userId: guest.id }, db);
   const hidden = await seed.channel({ server, members: [owner], visibility: "channel" });
   const message = await seed.message({ channel: hidden, author: owner, content: "audit-hidden-from-guest" });
-  const headers = { Authorization: `Bearer ${signAccessToken(guest.id)}`, "X-Server-Id": server.id };
+  const headers = { Authorization: `Bearer ${await accessTokenForTest(guest.id)}`, "X-Server-Id": server.id };
   const scoped = await fetch(`${app.baseUrl}/api/messages/channel/${hidden.id}`, { headers });
   assert.ok([403, 404].includes(scoped.status), `control: guest must be denied, got ${scoped.status}`);
   await scoped.json();

@@ -1,4 +1,4 @@
-import { fixturePasswordHash } from "../test/integration/credentials";
+import { accessTokenForTest, fixturePasswordHash } from "../test/integration/credentials";
 import { createApiTest } from "../test/integration/apiTest";
 // One unread rule for every transport (services/inboxUnreadEligibility.ts).
 //
@@ -32,15 +32,14 @@ import {
   __setExternalAgentInboxChainSelectorForTests,
 } from "../services/messageService";
 import { mintAgentCredential } from "../services/agentCredentialService";
-import { signAccessToken } from "../middleware/auth";
 import { AgentOrchestrator } from "../services/agentOrchestrator";
 import { __setAppWebhookEncryptionKeyForTests } from "../services/appWebhookConfigService";
 import { startAgentInboxPushWorker, type AgentInboxNotice } from "../services/agentInboxPushService";
 import type { WebhookPost } from "../services/appNotificationDeliveryService";
-import { INBOX_NOISE_SYSTEM_SUBTYPES, isMessageUnreadEligibleForReceiver } from "../services/inboxUnreadEligibility";
+import { INBOX_NOISE_SYSTEM_SUBTYPES, countsTowardTaskConversationUnread, isMessageUnreadEligibleForReceiver } from "../services/inboxUnreadEligibility";
 import { referenceAgentInboxChain } from "../test/agentInboxChainReference";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 __setExternalAgentInboxChainSelectorForTests(async (agentId: string): Promise<AgentInboxChainSelection> => (
   { source: "chain", rows: await referenceAgentInboxChain(agentId) }
@@ -69,7 +68,7 @@ async function seed(runtime: "external" | "claude") {
     : { runtime: "claude", model: "sonnet" });
   const channel = await createChannel(server.id, `elig-room-${suffix.slice(0, 6)}`);
   await addHuman(channel.id, owner!.id);
-  const minted = await mintAgentCredential({ agentId: agent.id, scopes: ["send", "read"], name: "elig-test", createdByUserId: null });
+  const minted = await mintAgentCredential({ agentId: agent.id, scopes: ["send", "read"], name: "elig-test", issuedVia: "computer", createdByUserId: null });
   return { ownerId: owner!.id, serverId: server.id, channelId: channel.id, agentId: agent.id, agentName: agent.name, apiKey: minted.apiKey };
 }
 
@@ -210,7 +209,7 @@ for (const route of ["/members", "/members/batch"] as const) {
     try {
       const res = await fetch(`${app.baseUrl}/api/channels/${f.channelId}${route}`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${signAccessToken(f.ownerId)}`, "X-Server-Id": f.serverId },
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${await accessTokenForTest(f.ownerId)}`, "X-Server-Id": f.serverId },
         body: JSON.stringify(route === "/members" ? { agentId: f.agentId } : { agentIds: [f.agentId] }),
       });
       assert.equal(res.status, 200, await res.text());
@@ -248,11 +247,42 @@ test("the rule: born-read for the causal actor only, noise for everyone, a perso
 // Reads private infra SQL that the source-available snapshot does not carry;
 // skipped when an exported snapshot's RELEASE_SOURCE marker is present.
 const inSourceSnapshot = existsSync(new URL("../../../../RELEASE_SOURCE", import.meta.url));
+const chainSql = (file: string) => readFileSync(new URL(`../../../../infra/risingwave/sql/${file}`, import.meta.url), "utf8");
+
 test.skipIf(inSourceSnapshot)("the chain SQL's noise subtypes are exactly the registry's skip producers", () => {
-  const chain = readFileSync(new URL("../../../../infra/risingwave/sql/063-unified-inbox-chain.sql", import.meta.url), "utf8");
-  const lists = [...chain.matchAll(/system_subtype NOT IN \(([^)]*)\)/g)].map((match) => (
-    match[1]!.split(",").map((item) => item.trim().replace(/^'|'$/g, "")).sort()
-  ));
-  assert.ok(lists.length > 0);
-  for (const list of lists) assert.deepEqual(list, [...INBOX_NOISE_SYSTEM_SUBTYPES]);
+  // 063 (the v4 arms) and 075 (the cursor-decoupled arms the server's views
+  // read; 078 builds on them): every literal list in each.
+  for (const file of ["063-unified-inbox-chain.sql", "075-inbox-cursor-decouple.sql"]) {
+    const lists = [...chainSql(file).matchAll(/system_subtype NOT IN \(([^)]*)\)/g)].map((match) => (
+      match[1]!.split(",").map((item) => item.trim().replace(/^'|'$/g, "")).sort()
+    ));
+    assert.ok(lists.length > 0, file);
+    for (const list of lists) assert.deepEqual(list, [...INBOX_NOISE_SYSTEM_SUBTYPES], file);
+  }
+});
+
+test("a task conversation's unread is on the reply basis; the transport rule is unchanged", () => {
+  // Lifecycle lines ("moved to In Review", the assignment receipt) are system
+  // messages: not replies, so not "new" on the task's row either.
+  const lifecycle = { senderType: "user", senderId: "u1", messageType: "system" as const, causalActorType: "user", causalActorId: "u1", systemSubtype: "task.lifecycle_thread" };
+  assert.equal(countsTowardTaskConversationUnread(lifecycle), false);
+  assert.equal(countsTowardTaskConversationUnread({ messageType: "chat" }), true);
+  assert.equal(countsTowardTaskConversationUnread({ messageType: null }), true, "column default is chat");
+  // Agent delivery and the inbox facts keep the transport rule: an agent is
+  // still woken by a status change it did not cause, and the assignee's
+  // personal mention on the assignment notice still pierces.
+  assert.equal(isMessageUnreadEligibleForReceiver(lifecycle, { type: "agent", id: "a1" }), true);
+  const receipt = { ...lifecycle, systemSubtype: "task.assignment_receipt" };
+  assert.equal(isMessageUnreadEligibleForReceiver(receipt, { type: "agent", id: "a1" }, { personallyMentioned: true }), true);
+});
+
+test.skipIf(inSourceSnapshot)("078's task conversation unread counts chat messages only, in serving and conversation unread", () => {
+  const sql = chainSql("078-task-conversations.sql");
+  const view = sql.match(/CREATE MATERIALIZED VIEW rw_task_conversation_unread_v1 AS([\s\S]*?);/)?.[1] ?? "";
+  assert.match(view, /COUNT\(u\.seq\) FILTER \(WHERE u\.message_type = 'chat'/);
+  assert.match(view, /c\.type = 'task'/);
+  assert.match(sql, /CASE WHEN c\.type = 'task' THEN tu\.unread_count ELSE p\.unread_count END/, "serving v9");
+  assert.match(sql, /CASE WHEN c\.type = 'task' THEN COALESCE\(tu\.unread_count, 0\) ELSE u\.unread_count END/, "conversation unread v4");
+  // The mention arm is untouched: the assignment notice still reaches the assignee.
+  assert.doesNotMatch(sql.match(/CREATE MATERIALIZED VIEW rw_inbox_mention_v7 AS([\s\S]*?);/)?.[1] ?? "", /message_type/);
 });

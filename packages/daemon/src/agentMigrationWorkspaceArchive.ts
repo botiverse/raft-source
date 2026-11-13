@@ -1,12 +1,24 @@
 import { createHash, randomUUID } from "node:crypto";
-import { cp, lstat, mkdir, readdir, readlink, realpath, rename, rm, stat, statfs, utimes } from "node:fs/promises";
+import { cp, lstat, mkdir, readdir, readlink, realpath, rename, rm, stat, utimes } from "node:fs/promises";
 import path from "node:path";
 import { currentDate } from "@botiverse/raft-shared";
 import { sha256File } from "./agentMigrationExport";
+import { readVolumeCapacity } from "./volumeCapacity";
 
 export const AGENT_MIGRATION_WORKSPACE_BACKUP_DIRECTORY = "migration-workspace-backups";
 export const AGENT_MIGRATION_WORKSPACE_BACKUP_MAX_PER_AGENT = 3;
-export const AGENT_MIGRATION_WORKSPACE_BACKUP_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1_000;
+/**
+ * Seven days: what moved is on the target, and what was left out is by
+ * definition regenerable. The backup only exists to recover a path the agent
+ * wrongly ignored, which shows up within a day or two of the move.
+ */
+export const AGENT_MIGRATION_WORKSPACE_BACKUP_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1_000;
+/**
+ * Total size kept per agent when the caller can measure backups (the daily
+ * janitor). The newest backup is always kept, whatever its size: it is the
+ * only copy someone can recover files from.
+ */
+export const AGENT_MIGRATION_WORKSPACE_BACKUP_MAX_BYTES_PER_AGENT = 20 * 1024 * 1024 * 1024;
 
 export type AgentMigrationWorkspaceArchiveOutcome =
   | "archived"
@@ -73,13 +85,19 @@ export interface AgentMigrationWorkspaceBackupEntry {
 
 /**
  * Keeps the newest AGENT_MIGRATION_WORKSPACE_BACKUP_MAX_PER_AGENT backups that
- * are younger than AGENT_MIGRATION_WORKSPACE_BACKUP_MAX_AGE_MS. Removals run one
- * at a time so a sweep never deletes several workspaces concurrently.
+ * are younger than AGENT_MIGRATION_WORKSPACE_BACKUP_MAX_AGE_MS. With
+ * `measureBytes`, also removes older backups once the kept ones (newest first)
+ * exceed AGENT_MIGRATION_WORKSPACE_BACKUP_MAX_BYTES_PER_AGENT, together with
+ * every backup older than the first one removed for size; the newest is never
+ * removed for size. A short (bounded) measurement only keeps more.
+ * Removals run one at a time so a sweep never deletes several workspaces
+ * concurrently.
  */
 export async function pruneAgentMigrationWorkspaceBackups(input: {
   agentBackupRoot: string;
   now: Date;
-  beforeRemove?: (entry: AgentMigrationWorkspaceBackupEntry) => Promise<void>;
+  measureBytes?: (backupPath: string) => Promise<number>;
+  beforeRemove?: (entry: AgentMigrationWorkspaceBackupEntry, measuredBytes: number | null) => Promise<void>;
 }): Promise<void> {
   const entries = await readdir(input.agentBackupRoot, { withFileTypes: true });
   const directories: AgentMigrationWorkspaceBackupEntry[] = await Promise.all(entries
@@ -90,10 +108,23 @@ export async function pruneAgentMigrationWorkspaceBackups(input: {
     })));
   directories.sort((left, right) => right.modifiedAtMs - left.modifiedAtMs || right.name.localeCompare(left.name));
   const cutoffMs = input.now.getTime() - AGENT_MIGRATION_WORKSPACE_BACKUP_MAX_AGE_MS;
+  let keptBytes = 0;
+  // Once one backup goes for size, every older one goes too (oldest first).
+  let overCap = false;
   for (const [index, entry] of directories.entries()) {
-    if (index < AGENT_MIGRATION_WORKSPACE_BACKUP_MAX_PER_AGENT && entry.modifiedAtMs >= cutoffMs) continue;
-    await input.beforeRemove?.(entry);
-    await rm(path.join(input.agentBackupRoot, entry.name), { recursive: true, force: true });
+    const entryPath = path.join(input.agentBackupRoot, entry.name);
+    let measuredBytes: number | null = null;
+    if (!overCap && index < AGENT_MIGRATION_WORKSPACE_BACKUP_MAX_PER_AGENT && entry.modifiedAtMs >= cutoffMs) {
+      if (!input.measureBytes) continue;
+      measuredBytes = await input.measureBytes(entryPath);
+      if (index === 0 || keptBytes + measuredBytes <= AGENT_MIGRATION_WORKSPACE_BACKUP_MAX_BYTES_PER_AGENT) {
+        keptBytes += measuredBytes;
+        continue;
+      }
+      overCap = true;
+    }
+    await input.beforeRemove?.(entry, measuredBytes);
+    await rm(entryPath, { recursive: true, force: true });
   }
 }
 
@@ -235,7 +266,8 @@ async function treeSizeBytes(root: string): Promise<number> {
  * migration, move it into the same per-agent backup root the source archive
  * uses (`preexisting-<migrationId>`), which shares its retention: newest
  * AGENT_MIGRATION_WORKSPACE_BACKUP_MAX_PER_AGENT, at most
- * AGENT_MIGRATION_WORKSPACE_BACKUP_MAX_AGE_MS.
+ * AGENT_MIGRATION_WORKSPACE_BACKUP_MAX_AGE_MS, and (in the daily janitor) at
+ * most AGENT_MIGRATION_WORKSPACE_BACKUP_MAX_BYTES_PER_AGENT.
  *
  * The caller must have established that the agent is not live on this
  * computer (the server holds authority on the source until the flip).
@@ -265,8 +297,9 @@ export async function quarantinePreexistingAgentWorkspace(input: {
   // copy must fit, with headroom, before anything is touched.
   const [workspaceInfo, backupInfo] = await Promise.all([stat(workspacePath), stat(agentBackupRoot)]);
   if (workspaceInfo.dev !== backupInfo.dev) {
-    const [needed, fs] = await Promise.all([treeSizeBytes(workspacePath), statfs(agentBackupRoot)]);
-    if (fs.bavail * fs.bsize < needed + AGENT_MIGRATION_QUARANTINE_DISK_HEADROOM_BYTES) {
+    const [needed, capacity] = await Promise.all([treeSizeBytes(workspacePath), readVolumeCapacity(agentBackupRoot)]);
+    if (!capacity) throw new Error("MIGRATION_WORKSPACE_QUARANTINE_DISK_UNREADABLE");
+    if (capacity.availableBytes < needed + AGENT_MIGRATION_QUARANTINE_DISK_HEADROOM_BYTES) {
       throw new Error("MIGRATION_WORKSPACE_QUARANTINE_INSUFFICIENT_DISK");
     }
   }

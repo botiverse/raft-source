@@ -41,13 +41,13 @@ describe("renderChannelCard", () => {
   });
 
   it("marks archived, joint and private channels and a missing description", () => {
-    expect(renderChannelCard({ id: "c", name: "old", type: "private", archived: true })).toEqual(["Channel #old (private, archived): no description."]);
+    expect(renderChannelCard({ id: "c", name: "old", type: "private", archived: true })).toEqual(["Channel #old (private, archived, read-only): no description."]);
     expect(renderChannelCard({ id: "c", name: "shared", type: "joint", description: "x" })[0]).toBe("Channel #shared (joint): x");
   });
 
   it("gives an archived channel its whole description and no pointer: no command shows it", () => {
     const long = "字".repeat(CHANNEL_CARD_DESCRIPTION_CHARS + 20);
-    expect(renderChannelCard({ id: "c", name: "old", type: "channel", archived: true, description: long })).toEqual([`Channel #old (public, archived): ${long}`]);
+    expect(renderChannelCard({ id: "c", name: "old", type: "channel", archived: true, description: long })).toEqual([`Channel #old (public, archived, read-only): ${long}`]);
   });
 
   it("collapses whitespace and caps the description by code point", () => {

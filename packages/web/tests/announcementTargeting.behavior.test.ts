@@ -43,6 +43,9 @@ test("failed writes cannot advance the next workspace's queue", async () => {
   context(b);
   const get = vi.mocked(api.get).mockResolvedValue({ data: { announcements: [] } });
   await useAnnouncementStore.getState().load();
+  assert.equal(get.mock.calls.length, 1, "closing in A prevents a second announcement in B during this entry");
+  useAnnouncementStore.getState().reset();
+  await useAnnouncementStore.getState().load();
   const last = get.mock.calls.at(-1)?.[1]?.params;
   assert.equal(last.server_id, b);
   assert.equal(last.after, undefined);

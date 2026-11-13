@@ -9,7 +9,9 @@
 // credential hygiene, and lifecycle invariants.
 //
 // §X.4 setup picker (RFC v9.9 — post Jianwei FAIL `msg=ecc2e57e`):
-//   - After login, fetch `GET /api/computer/legacy-machines` for the
+//   - With a one-time `computer_migrate` approval's migrate token (in a
+//     terminal), or a saved user session (without one) (ensureLegacyAuth), fetch
+//     `GET /api/computer/legacy-machines` for the
 //     target server and intersect with local
 //     `<installRoot>/machines/machine-<fp>/owner.json` evidence on
 //     `apiKeyFingerprint` (`detectLegacyMigration`).
@@ -67,7 +69,8 @@ import {
   type ZeroMatchDismissalIdentity,
 } from "./lib/migrationDismissals";
 import type { LegacyMachineCandidate } from "./lib/types";
-import { runLogin } from "./login";
+import { runSessionLogin } from "./login";
+import { presentAttachEvent, presentDeviceCode } from "./deviceApprovalPrompt";
 import { CliExit, info, present } from "./output";
 import { ComputerError } from "./lib/errors";
 import type { ComputerTraceContext, ComputerTracer } from "./lib/traceTypes";
@@ -77,7 +80,9 @@ import { formatServerSlugDisplay, migrateKnownServerUrl, normalizeServerSlug, re
 import {
   adoptLegacyByDaemonId as adoptLegacyByDaemonIdService,
   adoptLegacyByFingerprint as adoptLegacyByFingerprintService,
+  type AdoptCredential,
 } from "./services/adoptLegacy";
+import { requestMigrateApproval } from "./services/migrateGrant";
 import {
   diagnosticsPush as diagnosticsPushService,
   type DiagnosticsPushResult,
@@ -89,6 +94,7 @@ import { stop as stopService, type StopDeps } from "./services/stop";
 import { runStart, runStop } from "./startStop";
 import { readTerminalUnlinked } from "./health";
 import { attach as attachService } from "./services/attach";
+import { attachWithApproval as attachWithApprovalService } from "./services/attachGrant";
 import { createComputerApi } from "./lib/api";
 import { createComputerTracer } from "./lib/computerTracer";
 import {
@@ -128,12 +134,21 @@ export interface SetupOptions {
 
 export interface SetupDeps {
   isTty?: boolean;
-  runLogin?: typeof runLogin;
+  /**
+   * The user-session login: the legacy-daemon migration branch runs it only
+   * on a server too old for a computer_migrate approval.
+   */
+  runLogin?: typeof runSessionLogin;
+  /** The legacy-daemon migration branch's one-time computer_migrate approval. */
+  requestMigrateApproval?: typeof requestMigrateApproval;
   runAttach?: typeof runAttach;
   runStart?: typeof runStart;
   runStop?: typeof runStop;
   startService?: typeof startService;
+  /** User-session attach (legacy-daemon migration branch only). */
   attachService?: typeof attachService;
+  /** One-time-approval attach (every other fresh attach). */
+  attachWithApprovalService?: typeof attachWithApprovalService;
   stopService?: typeof stopService;
   startDeps?: StartDeps;
   stopDeps?: StopDeps;
@@ -144,14 +159,18 @@ export interface SetupDeps {
    * Tests stub this to feed a fake roster without booting undici.
    */
   buildRosterClient?: (baseUrl: string, accessToken: string) => {
+    targetServerUrl?: string;
     list: LegacyMachinesClient["list"];
     listAll?: LegacyMachinesClient["listAll"];
   };
   /**
    * Signed-in user server list client — defaults to `new ServersClient(...)`.
-   * Setup uses this immediately after login to prove the target server is in
-   * the user's accessible server list and that the user can attach before
-   * migration/adoption work starts.
+   * Only the legacy-daemon migration branch with a user session uses this
+   * (a migrate token's server was picked on the approval page), right after
+   * login, to prove the target server is in the user's accessible server list
+   * and that the user can attach before migration/adoption work starts. A
+   * one-time-approval attach never lists servers: the person picks the server
+   * on the approval page.
    */
   buildServersClient?: (baseUrl: string, accessToken: string) => {
     list: ServersClient["list"];
@@ -358,7 +377,7 @@ function shortDate(raw: string | null | undefined): string {
 }
 
 function appServerUrl(serverSlug: string): string {
-  return `https://app.raft.build/${normalizeServerSlug(serverSlug)}`;
+  return `https://app.raft.build/s/${encodeURIComponent(normalizeServerSlug(serverSlug))}/`;
 }
 
 function serverUrlHost(raw: unknown): string | null {
@@ -840,6 +859,7 @@ async function runRosterAdoption(
   emit: (line: string) => void,
   tracer: ComputerTracer = noopTracer,
   migrationAttemptId?: string,
+  credential?: AdoptCredential,
 ): Promise<void> {
   const span = tracer.startSpan("computer.migration.adopt", {
     surface: "computer",
@@ -852,9 +872,9 @@ async function runRosterAdoption(
   });
   const where = candidate.hostname ? ` (${candidate.hostname})` : "";
   const seen = candidate.lastSeenAt ? ` last seen ${candidate.lastSeenAt}` : "";
-  emit(`Migration: adopting legacy daemon "${candidate.machineName}"${where}${seen} using logged-in user authorization.`);
+  emit(`Migration: adopting legacy daemon "${candidate.machineName}"${where}${seen} with your authorization.`);
   emit(`  local owner.json: ${candidate.localPath}`);
-  emit("  legacy api key: not required for setup after user login.");
+  emit("  legacy api key: not required for setup.");
 
   try {
     const result = await adoptLegacyByFingerprintImpl(
@@ -865,6 +885,7 @@ async function runRosterAdoption(
         legacyMachineId: candidate.daemonId,
         apiKeyFingerprint: candidate.apiKeyFingerprint,
         legacyOwnerPath: candidate.localPath,
+        ...(credential ? { credential } : {}),
       },
       {
         onEvent: (event) => {
@@ -888,7 +909,9 @@ async function runRosterAdoption(
                 emit("  legacy daemon: not detected on this Computer (no local lock file)");
                 break;
               case "already_dead":
-                emit(`  legacy daemon: already stopped (pid ${event.legacyStop.pid} not running)`);
+                emit(event.legacyStop.reason === "pid_reused"
+                  ? `  legacy daemon: already stopped (pid ${event.legacyStop.pid} is another program now and was not signalled)`
+                  : `  legacy daemon: already stopped (pid ${event.legacyStop.pid} not running)`);
                 break;
               case "stopped":
                 emit(`  legacy daemon: stopped (pid ${event.legacyStop.pid}, SIGTERM)`);
@@ -931,6 +954,7 @@ async function runRosterDaemonIdAdoption(
   emit: (line: string) => void,
   tracer: ComputerTracer = noopTracer,
   migrationAttemptId?: string,
+  credential?: AdoptCredential,
 ): Promise<void> {
   const span = tracer.startSpan("computer.migration.adopt", {
     surface: "computer",
@@ -941,9 +965,9 @@ async function runRosterDaemonIdAdoption(
       candidate_already_migrated: Boolean(candidate.legacyKeyMigratedAt),
     },
   });
-  emit(`Migration: adopting server legacy daemon "${candidateDisplayName(candidate)}" using logged-in user authorization.`);
+  emit(`Migration: adopting server legacy daemon "${candidateDisplayName(candidate)}" with your authorization.`);
   emit("  local owner.json: not required for server-row adoption.");
-  emit("  legacy api key: not required for setup after user login.");
+  emit("  legacy api key: not required for setup.");
 
   try {
     const result = await adoptLegacyByDaemonIdImpl(
@@ -952,6 +976,7 @@ async function runRosterDaemonIdAdoption(
         ...(opts.serverUrl ? { serverUrl: opts.serverUrl } : {}),
         ...(opts.name ? { name: opts.name } : {}),
         legacyMachineId: candidate.daemonId,
+        ...(credential ? { credential } : {}),
       },
       {
         onEvent: (event) => {
@@ -1107,6 +1132,17 @@ async function isComputerMachineUnlinkedStartFailure(
     if (err.code === "COMPUTER_MACHINE_UNLINKED") return true;
     if (err.code === "START_DAEMON_TIMEOUT" && mentionsComputerMachineUnlinked(err)) return true;
   }
+  // A runner held off by another daemon's machine lock ends start's wait with
+  // START_RUNNER_LOCK_CONFLICT where it used to time out, and that message
+  // names the lock, not an unlinked handshake. Whether this server's state
+  // is unlinked is then only told by its terminal-unlinked record, as for a
+  // timeout below; the lock conflict itself never archives anything.
+  if (
+    (err instanceof ComputerServiceError || err instanceof ComputerError || err instanceof CliExit) &&
+    err.code === "START_RUNNER_LOCK_CONFLICT"
+  ) {
+    return attachment !== null && Boolean(await readTerminalUnlinked(slockHome, attachment.serverId, attachment.serverMachineId));
+  }
   if (err instanceof CliExit) {
     if (err.code === "COMPUTER_MACHINE_UNLINKED") return true;
     if (err.code === "START_DAEMON_TIMEOUT" && attachment) {
@@ -1165,6 +1201,12 @@ async function attachFromSetup(
   slockHome: string,
   opts: SetupOptions,
   deps: SetupDeps,
+  // When the legacy-daemon migration branch used a user session (no terminal,
+  // or a server too old for the one-time approval), a fresh attach there keeps
+  // using that session instead of asking for an approval. Every other fresh
+  // attach is a one-time approval.
+  auth: "approval" | "user-session",
+  onEvent: (event: ComputerApiEvent) => void,
 ): Promise<void> {
   if (deps.runAttach) {
     await deps.runAttach({
@@ -1173,16 +1215,32 @@ async function attachFromSetup(
       name: opts.name,
       start: false,
       orchestrated: true,
+      ...(auth === "user-session" ? { useUserSession: true } : {}),
     });
     return;
   }
   try {
-    await (deps.attachService ?? attachService)({
+    const input = {
       slockHome,
       serverSlug: opts.serverSlug,
       ...(opts.serverUrl ? { serverUrl: opts.serverUrl } : {}),
       ...(opts.name ? { name: opts.name } : {}),
-    });
+    };
+    if (auth === "user-session") {
+      await (deps.attachService ?? attachService)(input);
+    } else {
+      // The approval prompt (link + code) and the older-server fallback go
+      // to setup's sink; the presenter prints them. Attach progress lines
+      // stay quiet (setup prints its own "Connecting… done").
+      await (deps.attachWithApprovalService ?? attachWithApprovalService)(
+        { ...input, retryCommand: `raft-computer setup ${formatServerSlugDisplay(opts.serverSlug)}` },
+        {
+          onEvent: (event) => {
+            if (event.kind === "login.device-code" || event.kind === "attach.session-fallback") onEvent(event);
+          },
+        },
+      );
+    }
   } catch (err) {
     if (err instanceof ComputerServiceError) {
       throw new ComputerError(err.code, err.message);
@@ -1240,13 +1298,13 @@ export async function setupCore(
   // event so the unified `ComputerApiEvent` sink carries it byte-identical.
   const emit = (line: string): void => onEvent({ kind: "log.line", line });
   const isTty = deps.isTty ?? Boolean(process.stdin.isTTY && process.stdout.isTTY);
-  const login = deps.runLogin ?? runLogin;
+  const login = deps.runLogin ?? runSessionLogin;
   const attach = deps.runAttach ?? runAttach;
   const refreshSession = deps.refreshUserSession ?? refreshUserSession;
   const detectMigration = deps.detectLegacyMigration ?? detectLegacyMigration;
   const buildRoster =
     deps.buildRosterClient ??
-    ((baseUrl: string, accessToken: string) => new LegacyMachinesClient(baseUrl, accessToken));
+    ((baseUrl: string, accessToken: string): ReturnType<NonNullable<SetupDeps["buildRosterClient"]>> => new LegacyMachinesClient(baseUrl, accessToken));
   const buildServers =
     deps.buildServersClient ??
     ((baseUrl: string, accessToken: string) => new ServersClient(baseUrl, accessToken));
@@ -1264,7 +1322,7 @@ export async function setupCore(
   if (!isTty && !opts.yes) {
     throw new ComputerError(
       "NON_INTERACTIVE_SETUP_REQUIRES_FLAGS",
-      "Non-interactive setup requires --yes after you have confirmed the login/attach/start actions. Run `raft-computer login`, `raft-computer attach`, and `raft-computer start` separately for fully explicit automation.",
+      "Non-interactive setup requires --yes after you have confirmed the attach/start actions. Run `raft-computer attach /<server>` and `raft-computer start /<server>` separately for fully explicit automation.",
     );
   }
 
@@ -1281,54 +1339,162 @@ export async function setupCore(
 
   const label = formatServerSlugDisplay(opts.serverSlug);
 
-  if (!(await hasUnexpiredUserSessionShape(slockHome))) {
-    if (await refreshSession(slockHome, opts.serverUrl)) {
-      emit("Logging in… done (session refreshed).");
-    } else {
-      if (!isTty) {
-        throw new ComputerError(
-          "NON_INTERACTIVE_SETUP_REQUIRES_FLAGS",
-          "No valid user session is available and setup is running non-interactively. Run `raft-computer login` in a terminal first, then re-run setup with --yes.",
-        );
-      }
-      await login({ serverUrl: opts.serverUrl, orchestrated: true });
-      emit("Logging in… done.");
+  // The legacy-daemon migration branch is the only one that needs more than a
+  // one-time attach approval: reading the legacy roster and adopting an old
+  // daemon. Its credential, asked for the first time that branch needs it (an
+  // already-attached server or a plain fresh attach never asks):
+  //   - in a terminal, a one-time `computer_migrate` approval: a migrate token that
+  //     reads this person's legacy roster on the server picked on the page and
+  //     adopts one of those daemons. No session, nothing written to disk; a
+  //     fresh attach chosen later is its own one-time approval;
+  //   - only on a server too old for that approval (it refuses the grant kind,
+  //     or predates one-time grants), the user-session sign-in it had before.
+  //   - without a terminal, a saved user session (from an older `login`) that
+  //     still works, refreshed if it can be; one the server no longer accepts
+  //     → USER_SESSION_EXPIRED; none → refused before any approval.
+  type LegacyAuth =
+    | { mode: "session"; baseUrl: string; accessToken: string }
+    | { mode: "grant"; baseUrl: string; accessToken: string; serverId: string };
+  const legacy: { auth: LegacyAuth | null } = { auth: null };
+  const sessionAuthForTarget = async (
+    session: { accessToken: string; serverUrl?: string },
+  ): Promise<LegacyAuth | "auth_required"> => {
+    const baseUrl = resolveServerUrl(opts.serverUrl, session.serverUrl, resolveServerUrlEnv());
+    const serversResult = await buildServers(baseUrl, session.accessToken).list();
+    if (serversResult.status === "auth_required") return "auth_required";
+    if (serversResult.status !== "success") {
+      throw new ComputerError(
+        "SETUP_SERVER_LIST_FAILED",
+        `Could not list your servers (${serversResult.code}). Check --server-url / network connectivity, then retry.`,
+      );
     }
-  } else {
-    emit("Logging in… done (already logged in).");
-  }
-
-  const session = await readUserSessionAuth(slockHome);
-  const baseUrl = resolveServerUrl(
-    opts.serverUrl,
-    session.serverUrl,
-    resolveServerUrlEnv(),
-  );
-  const serversResult = await buildServers(baseUrl, session.accessToken).list();
-  if (serversResult.status === "auth_required") {
+    const targetServer = serversResult.servers.find((server) => normalizeServerSlug(server.slug) === opts.serverSlug);
+    if (!targetServer) {
+      throw new ComputerError(
+        "SETUP_SERVER_UNAVAILABLE_TO_ACCOUNT",
+        buildAccountUnavailableMessage({
+          serverLabel: label,
+          serverSlug: opts.serverSlug,
+          slockHome,
+          identity: await readUserSessionIdentity(slockHome),
+        }),
+      );
+    }
+    if (targetServer.role !== "owner" && targetServer.role !== "admin") {
+      throw new ComputerError(
+        "SETUP_REQUIRES_ADMIN",
+        setupRequiresAdminMessage(label),
+      );
+    }
+    return { mode: "session", baseUrl, accessToken: session.accessToken };
+  };
+  const requireTtyForApproval = (): never => {
     throw new ComputerError(
-      "USER_SESSION_EXPIRED",
-      "Your login session expired. Run `raft-computer login`, then retry setup.",
+      "NON_INTERACTIVE_SETUP_REQUIRES_FLAGS",
+      `Setup has to ask for your approval to move this machine's old Raft daemon over, and it is running non-interactively. Run \`raft-computer setup ${label}\` in a terminal.`,
     );
-  }
-  if (serversResult.status !== "success") {
-    throw new ComputerError(
-      "SETUP_SERVER_LIST_FAILED",
-      `Could not list your servers (${serversResult.code}). Check --server-url / network connectivity, then retry.`,
-    );
-  }
-  const targetServer = serversResult.servers.find((server) => normalizeServerSlug(server.slug) === opts.serverSlug);
-  if (!targetServer) {
-    throw new ComputerError(
-      "SETUP_SERVER_UNAVAILABLE_TO_ACCOUNT",
-      buildAccountUnavailableMessage({
-        serverLabel: label,
-        serverSlug: opts.serverSlug,
+  };
+  // A one-time computer_migrate approval (terminal only: ensureLegacyAuth is
+  // its one caller); on a server too old for it, the user-session sign-in it
+  // had before.
+  const approveLegacyMigration = async (): Promise<LegacyAuth> => {
+    const approval = await (deps.requestMigrateApproval ?? requestMigrateApproval)(
+      {
         slockHome,
-        identity: await readUserSessionIdentity(slockHome),
-      }),
-    );
-  }
+        serverSlug: opts.serverSlug,
+        ...(opts.serverUrl ? { serverUrl: opts.serverUrl } : {}),
+        ...(opts.name ? { name: opts.name } : {}),
+        retryCommand: `raft-computer setup ${label}`,
+      },
+      {
+        onEvent: (event) => {
+          if (event.kind === "login.device-code") onEvent(event);
+        },
+      },
+    ).catch((err: unknown) => {
+      if (err instanceof ComputerServiceError) throw new ComputerError(err.code, err.message);
+      throw err;
+    });
+    if (approval.outcome === "approved") {
+      emit("Approving the move… done.");
+      return {
+        mode: "grant",
+        baseUrl: approval.credential.baseUrl,
+        accessToken: approval.credential.migrateToken,
+        serverId: approval.credential.serverId,
+      };
+    }
+    if (approval.outcome === "grant-unsupported") {
+      emit("This server is too old to approve moving an old daemon over in one step; signing in with a user session instead.");
+      // Sign in at the server the approval was asked from (it may come from
+      // the saved session's URL, which `login` alone would not resolve).
+      await login({ serverUrl: approval.baseUrl, orchestrated: true });
+      emit("Logging in… done.");
+    } else {
+      emit("This server does not support one-time approvals yet, so this machine signed in with a user session instead.");
+    }
+    const signedIn = await sessionAuthForTarget(await readUserSessionAuth(slockHome));
+    if (signedIn === "auth_required") {
+      throw new ComputerError(
+        "USER_SESSION_EXPIRED",
+        `Your login session expired. Run \`raft-computer setup ${label}\` in a terminal to sign in again.`,
+      );
+    }
+    return signedIn;
+  };
+  const ensureLegacyAuth = async (): Promise<LegacyAuth> => {
+    if (legacy.auth) return legacy.auth;
+    // In a terminal the approval is always asked for: a saved session is not
+    // used as the credential and not refreshed (only its server URL is read,
+    // to know where to ask; a server too old for the approval signs in again).
+    // Without a terminal (the web's Migrate command run as `curl … | sh`), a
+    // saved session that still works is used as before, until the retirement
+    // removes it (#wg-device-auth:#1, Tenny 207eca94).
+    if (isTty) return (legacy.auth = await approveLegacyMigration());
+    let saved = false;
+    if (await hasUnexpiredUserSessionShape(slockHome)) {
+      emit("Logging in… done (already logged in).");
+      saved = true;
+    } else if (await refreshSession(slockHome, opts.serverUrl)) {
+      emit("Logging in… done (session refreshed).");
+      saved = true;
+    }
+    if (saved) {
+      const signedIn = await sessionAuthForTarget(await readUserSessionAuth(slockHome));
+      if (signedIn !== "auth_required") return (legacy.auth = signedIn);
+      throw new ComputerError(
+        "USER_SESSION_EXPIRED",
+        `Your login session expired. Run \`raft-computer setup ${label}\` in a terminal to approve the move there.`,
+      );
+    }
+    // No terminal and no usable session: refused before any approval is asked for.
+    return requireTtyForApproval();
+  };
+  let realRosterClient: ReturnType<typeof buildRoster> | null = null;
+  // The migrate token is good for minutes: when the server no longer takes it,
+  // ask for one new approval (never a user-session sign-in).
+  const renewLegacyGrant = async (): Promise<{ baseUrl: string; bearer: string } | null> => {
+    if (legacy.auth?.mode !== "grant") return null;
+    legacy.auth = null;
+    realRosterClient = null;
+    const renewed = await ensureLegacyAuth();
+    return renewed.mode === "grant" ? { baseUrl: renewed.baseUrl, bearer: renewed.accessToken } : null;
+  };
+  const adoptCredential = (): AdoptCredential | undefined =>
+    legacy.auth?.mode === "grant"
+      ? { baseUrl: legacy.auth.baseUrl, bearer: legacy.auth.accessToken, renew: renewLegacyGrant }
+      : undefined;
+  const legacyRosterClient = async (): Promise<ReturnType<typeof buildRoster>> => {
+    const signedIn = await ensureLegacyAuth();
+    return (realRosterClient ??= buildRoster(signedIn.baseUrl, signedIn.accessToken));
+  };
+  // A roster read refused with a migrate token is retried once with a new approval.
+  const withRenewedGrant = async <T extends { status: string }>(read: (client: ReturnType<typeof buildRoster>) => Promise<T>): Promise<T> => {
+    const result = await read(await legacyRosterClient());
+    if (result.status !== "auth_required" || legacy.auth?.mode !== "grant") return result;
+    if (!(await renewLegacyGrant())) return result;
+    return read(await legacyRosterClient());
+  };
 
   let shouldPushMigrationDiagnosticsAfterStart = false;
   let migratedDuringSetup = false;
@@ -1350,18 +1516,18 @@ export async function setupCore(
       }
       emit(`Attachment: already attached to ${label}.`);
     } else {
-      if (targetServer.role !== "owner" && targetServer.role !== "admin") {
-        throw new ComputerError(
-          "SETUP_REQUIRES_ADMIN",
-          setupRequiresAdminMessage(label),
-        );
-      }
 
     // §X.4 migration decision — RFC v9.9.
     //
     // Managed-only/no-local/--machine setup must not create a client or issue a roster request.
-    let rosterClient: ReturnType<typeof buildRoster> | null = null;
-    const getRosterClient = () => (rosterClient ??= buildRoster(baseUrl, session.accessToken));
+    // Detection only lists the roster when local legacy evidence exists; that
+    // first list asks for the credential (ensureLegacyAuth).
+    const getRosterClient = () => ({
+      get targetServerUrl() {
+        return realRosterClient?.targetServerUrl;
+      },
+      list: async (serverSlug: string) => withRenewedGrant((client) => client.list(serverSlug)),
+    });
 
     let migrated = false;
 
@@ -1376,9 +1542,10 @@ export async function setupCore(
     try {
       if (typeof opts.machine === "string" && opts.machine.length > 0) {
         // Identity-carried entry (v2.3 §19): carry the web machine row id and
-        // skip fingerprint matching. Server-side authority is `manageMachines`
-        // plus target-Server row binding; caller ownership and local evidence are
-        // not required, so wiped state and brand-new checkouts remain supported.
+        // skip fingerprint matching. Local evidence is not required, so wiped
+        // state and brand-new checkouts remain supported. Server-side authority:
+        // the row is bound to the target Server and is the caller's own, or the
+        // caller has `registerMachines` there (owner / admin).
         const machineId = opts.machine.trim();
         if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(machineId)) {
           throw new ComputerError(
@@ -1390,6 +1557,7 @@ export async function setupCore(
           decision: "adopt",
           reason: "machine-flag",
         });
+        await ensureLegacyAuth();
         try {
           await runRosterDaemonIdAdoption(
             opts,
@@ -1398,6 +1566,7 @@ export async function setupCore(
             emit,
             migrationTracer,
             migrationAttemptId,
+            adoptCredential(),
           );
         } catch (err) {
           await forceMigrationDiagnosticsQuietly(slockHome, diagnosticsPush, emit, migrationAttemptId);
@@ -1474,6 +1643,7 @@ export async function setupCore(
             candidate_count: 0,
           });
         } else if (adjudication.kind === "zero_match") {
+          const { baseUrl } = await ensureLegacyAuth();
           const evidenceFromExcluded = (candidate: SetupExcludedCandidate): MigrationDismissalEvidence => ({
             effectiveFingerprint: candidate.effectiveFingerprint,
             ownerFingerprint: candidate.ownerFingerprint,
@@ -1534,13 +1704,13 @@ export async function setupCore(
               });
               throw new ComputerError(
                 "MIGRATION_LOCAL_EVIDENCE_UNMATCHED",
-                `This computer has traces of a ${label} connection, but the server does not recognize any of them. Common causes: you are signed in as a different account than the one that set up this computer, the traces belong to a different server, the computer's connect command was regenerated on the web (which rotates its key), or the computer was removed on the server. Setting up a new computer now could leave your agents stranded.`,
+                `This computer has traces of a ${label} connection, but the server does not recognize any of them. Common causes: you are using a different account than the one that set up this computer, the traces belong to a different server, the computer's connect command was regenerated on the web (which rotates its key), or the computer was removed on the server. Setting up a new computer now could leave your agents stranded.`,
               );
             } else {
               let serverCandidates: LegacyMachineManualEntry[] = [];
-              const activeRosterClient = getRosterClient();
+              const activeRosterClient = await legacyRosterClient();
               if (typeof activeRosterClient.listAll === "function") {
-                const manualRoster: LegacyMachineManualRosterResult = await activeRosterClient.listAll(opts.serverSlug);
+                const manualRoster: LegacyMachineManualRosterResult = await withRenewedGrant((client) => client.listAll!(opts.serverSlug));
                 if (manualRoster.status === "success") {
                   serverCandidates = manualRoster.entries;
                 } else if (manualRoster.status === "disabled" || manualRoster.status === "error") {
@@ -1576,7 +1746,7 @@ export async function setupCore(
                   candidate_already_migrated: Boolean(candidate.legacyKeyMigratedAt),
                 });
                 try {
-                  await runRosterDaemonIdAdoption(opts, candidate, adoptLegacyByDaemonId, emit, migrationTracer, migrationAttemptId);
+                  await runRosterDaemonIdAdoption(opts, candidate, adoptLegacyByDaemonId, emit, migrationTracer, migrationAttemptId, adoptCredential());
                 } catch (err) {
                   await forceMigrationDiagnosticsQuietly(slockHome, diagnosticsPush, emit, migrationAttemptId);
                   throw err;
@@ -1607,6 +1777,7 @@ export async function setupCore(
             `Migration: ${adjudication.candidates.length} legacy daemon(s) match this server but setup is non-interactive. Refusing to fresh attach because that would create a duplicate Computer identity. Re-run on a TTY to choose a legacy daemon, or pass --migrate-from <path> to adopt a specific install.`,
           );
         } else {
+          await ensureLegacyAuth();
           if (adjudication.excluded.length > 0) {
             emitExcludedTable(
               emit,
@@ -1638,7 +1809,7 @@ export async function setupCore(
                 candidate_already_migrated: Boolean(candidate.legacyKeyMigratedAt),
               });
               try {
-                await runRosterAdoption(opts, candidate, adoptLegacyByFingerprint, emit, migrationTracer, migrationAttemptId);
+                await runRosterAdoption(opts, candidate, adoptLegacyByFingerprint, emit, migrationTracer, migrationAttemptId, adoptCredential());
               } catch (err) {
                 await forceMigrationDiagnosticsQuietly(slockHome, diagnosticsPush, emit, migrationAttemptId);
                 throw err;
@@ -1681,7 +1852,9 @@ export async function setupCore(
     }
 
     if (!migrated) {
-      await attachFromSetup(slockHome, opts, deps);
+      // Only a user session attaches without asking again; a migrate token
+      // cannot attach, so a fresh attach after it is its own approval.
+      await attachFromSetup(slockHome, opts, deps, legacy.auth?.mode === "session" ? "user-session" : "approval", onEvent);
       emit(`Connecting this computer to ${label}… done.`);
     }
 
@@ -1751,9 +1924,26 @@ export async function setupCore(
 export async function runSetup(opts: SetupOptions, deps: SetupDeps = {}): Promise<void> {
   const slockHome = resolveRaftHome();
   const api = createComputerApi(slockHome, { tracer: createComputerTracer(slockHome, "computer.cli") });
+  let cleanupEnterToOpen: (() => void) | undefined;
   await present(async () => {
-    await api.setup(opts, deps, (event) => {
-      if (event.kind === "log.line") info(event.line);
-    });
+    try {
+      await api.setup(opts, deps, (event) => {
+        if (event.kind === "log.line") {
+          // Anything setup prints after the prompt means the approval is done.
+          cleanupEnterToOpen?.();
+          cleanupEnterToOpen = undefined;
+          info(event.line);
+        } else if (event.kind === "login.device-code") {
+          cleanupEnterToOpen?.();
+          cleanupEnterToOpen = presentDeviceCode(event, { purpose: "approval", serverSlug: opts.serverSlug });
+        } else if (event.kind === "attach.session-fallback") {
+          cleanupEnterToOpen?.();
+          cleanupEnterToOpen = undefined;
+          presentAttachEvent(event);
+        }
+      });
+    } finally {
+      cleanupEnterToOpen?.();
+    }
   });
 }

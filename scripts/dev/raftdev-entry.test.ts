@@ -13,7 +13,7 @@ import { dirname, join } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-import { computeOffset, replicaServerPort } from "./raftdev";
+import { computeOffset, janitorStopCommand, replicaServerPort, waitForQueryReady, webWindowCommand } from "./raftdev";
 
 const projectDir = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
 const raftdev = join(projectDir, "raftdev");
@@ -175,6 +175,14 @@ add() { has "$1" || printf '%s\n' "$1" >> "$state"; }
 remove() { grep -vx "$1" "$state" > "$state.next" 2>/dev/null || true; mv "$state.next" "$state"; }
 
 case "$1" in
+  info)
+    if [ "\${RAFTDEV_FAKE_DOCKER_INFO_EXIT:-0}" != "0" ]; then
+      printf 'Cannot connect to the Docker daemon at unix:///var/run/docker.sock\n' >&2
+      exit "$RAFTDEV_FAKE_DOCKER_INFO_EXIT"
+    fi
+    printf '29.0.0\n'
+    exit 0
+    ;;
   ps)
     for item in $(cat "$state"); do
       case "$item" in C:*) printf '%s\n' "$item" | sed 's/^C://' ;; esac
@@ -199,7 +207,16 @@ case "$1" in
     [ -z "$name" ] || add "C:$name"
     exit 0
     ;;
-  start|exec)
+  start)
+    exit 0
+    ;;
+  exec)
+    # raftdev's migration-state probe of Postgres: "<public tables>,<has
+    # drizzle.__drizzle_migrations>", then that table's row count.
+    case "$*" in
+      *pg_tables*) printf '%s\n' "\${RAFTDEV_FAKE_PG_SCHEMA:-0,false}" ;;
+      *"FROM drizzle.__drizzle_migrations"*) printf '%s\n' "\${RAFTDEV_FAKE_PG_APPLIED:-0}" ;;
+    esac
     exit 0
     ;;
   rm)
@@ -305,6 +322,9 @@ exit 0
     `#!/bin/sh
 if [ -n "\${RAFTDEV_FAKE_PNPM_LOG:-}" ]; then
   printf '%s\n' "$*" >> "$RAFTDEV_FAKE_PNPM_LOG"
+fi
+if [ "$1" = "exec" ] && [ "$5" = "\${RAFTDEV_FAKE_FAIL_SCRIPT:-}" ]; then
+  exit 9
 fi
 if [ "$1" = "exec" ] && [ "$5" = "scripts/seed.ts" ]; then
   if [ "\${RAFTDEV_FAKE_SEED_KILL_PARENT:-0}" = "1" ]; then
@@ -494,6 +514,50 @@ exit 1
     assert.doesNotMatch(child.stdout, /Runtime\s+: running/);
   });
 });
+
+// The C-c that `stop` sends can end the session before kill-session runs; a
+// session that is gone is stopped. One that is still there is not.
+for (const outcome of ["gone", "alive"] as const) {
+  test(`stop after kill-session fails: session ${outcome}`, () => {
+    withFakeBin((root, bin) => {
+      writeExecutable(join(bin, "docker"), "#!/bin/sh\n[ \"$1\" = network ] && exit 1\nexit 0\n");
+      writeExecutable(
+        join(bin, "tmux"),
+        `#!/bin/sh
+case "$1" in
+  has-session) [ -e "${root}/gone" ] && exit 1; exit 0 ;;
+  list-windows) printf 'server\\n'; exit 0 ;;
+  send-keys) exit 0 ;;
+  kill-session)
+    ${outcome === "gone" ? `touch "${root}/gone"` : ":"}
+    echo "kill-session failed" >&2
+    exit 1 ;;
+esac
+exit 1
+`,
+      );
+
+      const child = spawnSync(
+        process.execPath,
+        ["--import", "@oxc-node/core/register", raftdevScript, "stop", `stop-race-${outcome}`],
+        {
+          cwd: projectDir,
+          encoding: "utf8",
+          env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ""}` },
+        },
+      );
+
+      if (outcome === "gone") {
+        assert.equal(child.status, 0, child.stdout + child.stderr);
+        assert.match(child.stdout, /tmux session 'slock-stop-race-gone' stopped\./);
+        assert.match(child.stdout, /Done\./);
+      } else {
+        assert.equal(child.status, 1, child.stdout + child.stderr);
+        assert.match(child.stdout, /ERROR: Failed to stop tmux session 'slock-stop-race-alive'\./);
+      }
+    });
+  });
+}
 
 test("status accepts a listening external Redis with running PostgreSQL and RustFS", () => {
   withFakeBin((_root, bin) => {
@@ -773,6 +837,8 @@ test("a seed failure preserves its exit code and removes every managed resource 
             RAFTDEV_FAKE_SEED_EXIT: "7",
             SLOCKDEV_TRACE_WORKER: "0",
             SLOCKDEV_TUNNEL: "0",
+            // Backend-only start (fake Docker cannot run RisingWave).
+            RAFTDEV_RISINGWAVE: "0",
             SLOCKDEV_IDLE_TTL_SECONDS: "0",
           },
         },
@@ -793,6 +859,146 @@ test("a seed failure preserves its exit code and removes every managed resource 
       });
     }
   });
+});
+
+test("start refuses an unreachable Docker daemon before any port check or container", () => {
+  withFakeBin((root, bin) => {
+    const state = join(root, "docker.state");
+    writeFileSync(state, "");
+    writeFakeStartTools(bin);
+    const child = spawnSync(
+      process.execPath,
+      ["--import", "@oxc-node/core/register", raftdevScript, "start", "daemon-down", "--no-risingwave"],
+      {
+        cwd: projectDir,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          PATH: `${bin}:${process.env.PATH ?? ""}`,
+          RAFTDEV_FAKE_DOCKER_STATE: state,
+          RAFTDEV_FAKE_DOCKER_INFO_EXIT: "1",
+          SLOCKDEV_TRACE_WORKER: "0",
+          SLOCKDEV_TUNNEL: "0",
+          SLOCKDEV_IDLE_TTL_SECONDS: "0",
+        },
+      },
+    );
+    assert.equal(child.status, 1, `${child.stdout}\n${child.stderr}`);
+    assert.match(child.stdout, /needs a reachable Docker daemon/);
+    assert.match(child.stdout, /Cannot connect to the Docker daemon/);
+    assert.match(child.stdout, /No containers or local processes were started/);
+    assert.equal(readFileSync(state, "utf8").trim(), "");
+    rmSync(join(projectDir, ".slockdev", "daemon-down"), { recursive: true, force: true });
+  });
+});
+
+test("Postgres readiness waits for a passing query and reports the last error at the deadline", () => {
+  let clock = 0;
+  let probes = 0;
+  const failing = waitForQueryReady({
+    timeoutMs: 3_000,
+    probe: () => { probes += 1; return { ok: false, error: `refused ${probes}` }; },
+    now: () => clock,
+    sleep: () => { clock += 1_000; },
+  });
+  assert.deepEqual(failing, { ready: false, lastError: "refused 4" });
+
+  clock = 0;
+  probes = 0;
+  const passing = waitForQueryReady({
+    timeoutMs: 3_000,
+    probe: () => { probes += 1; return probes < 3 ? { ok: false, error: "refused" } : { ok: true, error: "" }; },
+    now: () => clock,
+    sleep: () => { clock += 1_000; },
+  });
+  assert.deepEqual(passing, { ready: true, lastError: "" });
+  assert.equal(probes, 3);
+});
+
+function startWithFakeDatabase(name: string, env: Record<string, string>): { status: number | null; stdout: string; pnpmLog: string; dockerState: string } {
+  let result: { status: number | null; stdout: string; pnpmLog: string; dockerState: string } | undefined;
+  withFakeBin((root, bin) => {
+    const dockerState = join(root, "docker.state");
+    const pnpmLog = join(root, "pnpm.log");
+    writeFileSync(dockerState, "");
+    writeFileSync(pnpmLog, "");
+    writeFakeStartTools(bin);
+    try {
+      const child = spawnSync(raftdev, ["start", name, "--no-risingwave"], {
+        cwd: projectDir,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          PATH: `${bin}:${process.env.PATH ?? ""}`,
+          RAFTDEV_FAKE_DOCKER_STATE: dockerState,
+          RAFTDEV_FAKE_PNPM_LOG: pnpmLog,
+          SLOCKDEV_TRACE_WORKER: "0",
+          SLOCKDEV_TUNNEL: "0",
+          SLOCKDEV_IDLE_TTL_SECONDS: "0",
+          ...env,
+        },
+      });
+      result = {
+        status: child.status,
+        stdout: `${child.stdout}\n${child.stderr}`,
+        pnpmLog: readFileSync(pnpmLog, "utf8"),
+        dockerState: readFileSync(dockerState, "utf8").trim(),
+      };
+    } finally {
+      rmSync(join(projectDir, ".slockdev", name), { recursive: true, force: true });
+      rmSync(join(projectDir, `.dev-env-${name}.json`), { force: true });
+    }
+  });
+  return result!;
+}
+
+test("start builds Postgres with the deploy migrator and its index steps before seeding", () => {
+  const run = startWithFakeDatabase("migrate-order-tooth", { RAFTDEV_FAKE_SEED_EXIT: "7" });
+  assert.equal(run.status, 7, run.stdout);
+  const scripts = run.pnpmLog.split("\n").filter((line) => line.startsWith("exec node")).map((line) => line.split(" ")[4]);
+  const migrate = scripts.indexOf("scripts/migrate-deploy.ts");
+  const verify = scripts.indexOf("scripts/verify-post-migration-indexes.ts");
+  const seed = scripts.indexOf("scripts/seed.ts");
+  assert.ok(migrate !== -1 && migrate < verify && verify < seed, run.pnpmLog);
+  assert.ok(!scripts.includes("scripts/migration-preflight.ts"), run.pnpmLog);
+  assert.doesNotMatch(run.pnpmLog, /drizzle-kit|apply-change-log/);
+  assert.match(run.stdout, /Migrating database from empty\.\.\.[\s\S]*Database migrated \(/);
+  // --no-risingwave: no RisingWave container, and the opt-out names what breaks.
+  assert.match(run.stdout, /RisingWave : disabled \(--no-risingwave\)/);
+  assert.match(run.stdout, /Activity endpoints \(inbox, followed threads, unread summary, channel unread\)\s+will return 503/);
+  assert.doesNotMatch(run.stdout, /Creating RisingWave/);
+});
+
+test("a failed migration step stops start before seeding, without reporting a migrated database", () => {
+  const run = startWithFakeDatabase("migrate-failure-tooth", { RAFTDEV_FAKE_FAIL_SCRIPT: "scripts/migrate-deploy.ts" });
+  assert.equal(run.status, 1, run.stdout);
+  assert.match(run.stdout, /ERROR: Database migration step scripts\/migrate-deploy\.ts failed \(exit 9\)/);
+  assert.doesNotMatch(run.stdout, /Database migrated|Schema is up to date|Seeding test data/);
+  assert.doesNotMatch(run.pnpmLog, /scripts\/seed\.ts|verify-post-migration-indexes/);
+  assert.match(run.stdout, /Partial environment cleanup complete/);
+  assert.equal(run.dockerState, "");
+});
+
+test("a failed post-migration index check also stops start before seeding", () => {
+  const run = startWithFakeDatabase("migrate-index-failure-tooth", { RAFTDEV_FAKE_FAIL_SCRIPT: "scripts/verify-post-migration-indexes.ts" });
+  assert.equal(run.status, 1, run.stdout);
+  assert.match(run.stdout, /ERROR: Database migration step scripts\/verify-post-migration-indexes\.ts failed/);
+  assert.doesNotMatch(run.stdout, /Database migrated|Seeding test data/);
+});
+
+test("start refuses a Postgres built by drizzle-kit push and names the command that recreates it", () => {
+  const run = startWithFakeDatabase("pushed-db-tooth", { RAFTDEV_FAKE_PG_SCHEMA: "307,false" });
+  assert.equal(run.status, 1, run.stdout);
+  assert.match(run.stdout, /ERROR: Postgres in 'slock-dev-pushed-db-tooth-pg' was built by `drizzle-kit push`/);
+  assert.match(run.stdout, /Recovery: \.\/raftdev stop pushed-db-tooth && \.\/raftdev start pushed-db-tooth/);
+  assert.doesNotMatch(run.pnpmLog, /scripts\/(migrate-deploy|seed)\.ts/);
+  assert.doesNotMatch(run.stdout, /Database migrated|Seeding test data/);
+});
+
+test("start on an already migrated Postgres applies only pending migrations", () => {
+  const run = startWithFakeDatabase("migrated-db-tooth", { RAFTDEV_FAKE_PG_SCHEMA: "318,true", RAFTDEV_FAKE_PG_APPLIED: "508", RAFTDEV_FAKE_SEED_EXIT: "7" });
+  assert.equal(run.status, 7, run.stdout);
+  assert.match(run.stdout, /Applying pending database migrations\.\.\.[\s\S]*Database migrated \(/);
 });
 
 test("a successful start disarms failure cleanup and retains its owned environment", () => {
@@ -817,6 +1023,8 @@ test("a successful start disarms failure cleanup and retains its owned environme
           RAFTDEV_FAKE_TMUX_STATE: tmuxState,
           SLOCKDEV_TRACE_WORKER: "0",
           SLOCKDEV_TUNNEL: "0",
+          // Backend-only start (fake Docker cannot run RisingWave).
+          RAFTDEV_RISINGWAVE: "0",
           SLOCKDEV_IDLE_TTL_SECONDS: "0",
         },
       });
@@ -825,6 +1033,11 @@ test("a successful start disarms failure cleanup and retains its owned environme
       assert.match(
         child.stdout,
         /=== Environment 'success-retention-tooth' is running ===/,
+      );
+      // RAFTDEV_RISINGWAVE=0: the final summary repeats the 503 warning.
+      assert.match(
+        child.stdout.slice(child.stdout.indexOf("is running ===")),
+        /RisingWave: disabled \(--no-risingwave\)[\s\S]*will return 503/,
       );
       assert.doesNotMatch(child.stdout, /Start failed; cleaning/);
       assert.deepEqual(
@@ -874,6 +1087,8 @@ test("start --with-onboarding forwards the deliberate fresh-owner fixture to see
           RAFTDEV_FAKE_PNPM_LOG: pnpmLog,
           SLOCKDEV_TRACE_WORKER: "0",
           SLOCKDEV_TUNNEL: "0",
+          // Backend-only start (fake Docker cannot run RisingWave).
+          RAFTDEV_RISINGWAVE: "0",
           SLOCKDEV_IDLE_TTL_SECONDS: "0",
         },
       });
@@ -916,6 +1131,8 @@ test("start forwards the managed MCP credential key to the server process", () =
           SLOCK_MCP_CREDENTIAL_KEY: credentialKey,
           SLOCKDEV_TRACE_WORKER: "0",
           SLOCKDEV_TUNNEL: "0",
+          // Backend-only start (fake Docker cannot run RisingWave).
+          RAFTDEV_RISINGWAVE: "0",
           SLOCKDEV_IDLE_TTL_SECONDS: "0",
         },
       });
@@ -932,6 +1149,40 @@ test("start forwards the managed MCP credential key to the server process", () =
     }
   });
 });
+
+test("the web window pre-bundles Vite deps in a separate process, then starts the dev server with the same env", () => {
+  const env = "VITE_DEV_PORT=15221 VITE_SLOCKDEV_ENV_NAME='a b' ";
+  const command = webWindowCommand(env);
+  assert.ok(command.includes(`; ${env}pnpm --filter @botiverse/raft-web exec vite optimize; `), command);
+  assert.ok(command.includes(`${env}pnpm --filter @botiverse/raft-web dev; fi`), command);
+  const run = (optimizeExit: number | "interrupted") => {
+    const bin = mkFakeBin(optimizeExit);
+    const result = spawnSync("bash", ["-c", webWindowCommand("").replaceAll("pnpm --filter @botiverse/raft-web", "fake")], {
+      encoding: "utf8",
+      env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ""}` },
+    });
+    rmSync(bin, { recursive: true, force: true });
+    return { stdout: result.stdout, status: result.status };
+  };
+  // The window's exit status is the dev server's.
+  assert.deepEqual(run(0), { stdout: "exec vite optimize\ndev\n", status: 7 });
+  // A failed optimize is not fatal: the dev server pre-bundles itself.
+  assert.deepEqual(run(1), {
+    stdout: "exec vite optimize\n[raftdev] vite optimize failed; the dev server will pre-bundle dependencies itself\ndev\n",
+    status: 7,
+  });
+  // Ctrl-C during optimize stops the window instead of starting the dev server.
+  // pnpm exits 1 on SIGINT, so this is told apart by the interrupt, not the status.
+  assert.deepEqual(run("interrupted"), { stdout: "exec vite optimize\n", status: 130 });
+});
+
+function mkFakeBin(optimizeExit: number | "interrupted"): string {
+  const dir = mkdtempSync(join(tmpdir(), "raftdev-web-window-"));
+  const exit = optimizeExit === "interrupted" ? "kill -INT $PPID; exit 1" : `exit ${optimizeExit}`;
+  writeFileSync(join(dir, "fake"), `#!/bin/sh\necho "$*"\n[ "$1" = dev ] && exit 7\n${exit}\n`);
+  chmodSync(join(dir, "fake"), 0o755);
+  return dir;
+}
 
 test("a required tmux launch failure is not reported as running and is cleaned", () => {
   withFakeBin((root, bin) => {
@@ -954,6 +1205,8 @@ test("a required tmux launch failure is not reported as running and is cleaned",
             RAFTDEV_FAKE_TMUX_START_EXIT: "9",
             SLOCKDEV_TRACE_WORKER: "0",
             SLOCKDEV_TUNNEL: "0",
+            // Backend-only start (fake Docker cannot run RisingWave).
+            RAFTDEV_RISINGWAVE: "0",
             SLOCKDEV_IDLE_TTL_SECONDS: "0",
           },
         },
@@ -1042,6 +1295,7 @@ while :; do sleep 1; done
           RAFTDEV_FAKE_DOCKER_LABELS: "0",
           RAFTDEV_FAKE_TMUX_KILL_PARENT: "1",
           RAFTDEV_FAKE_TUNNEL_STOPPED: tunnelStopped,
+          RAFTDEV_RISINGWAVE: "0",
           SLOCKDEV_TRACE_WORKER: "0",
           SLOCKDEV_IDLE_TTL_SECONDS: "0",
         },
@@ -1090,6 +1344,8 @@ test("SIGTERM during a blocked start exits 143 and cleans managed partial resour
           RAFTDEV_FAKE_SEED_PAUSE_FILE: pauseFile,
           SLOCKDEV_TRACE_WORKER: "0",
           SLOCKDEV_TUNNEL: "0",
+          // Backend-only start (fake Docker cannot run RisingWave).
+          RAFTDEV_RISINGWAVE: "0",
           SLOCKDEV_IDLE_TTL_SECONDS: "0",
         },
       });
@@ -1167,6 +1423,8 @@ test("SIGHUP during a blocked start exits 129 and cleans managed partial resourc
           RAFTDEV_FAKE_SEED_PAUSE_FILE: pauseFile,
           SLOCKDEV_TRACE_WORKER: "0",
           SLOCKDEV_TUNNEL: "0",
+          // Backend-only start (fake Docker cannot run RisingWave).
+          RAFTDEV_RISINGWAVE: "0",
           SLOCKDEV_IDLE_TTL_SECONDS: "0",
         },
       });
@@ -1224,4 +1482,14 @@ test("SIGHUP during a blocked start exits 129 and cleans managed partial resourc
       });
     });
   });
+});
+
+test("the idle janitor's stop command is raftdev stop with the repo's TS loader", () => {
+  assert.deepEqual(
+    janitorStopCommand({ nodePath: "/usr/bin/node", raftdevScript: "/w/scripts/dev/raftdev.ts", name: "feat-x" }),
+    {
+      command: "/usr/bin/node",
+      args: ["--import", "@oxc-node/core/register", "/w/scripts/dev/raftdev.ts", "stop", "feat-x"],
+    },
+  );
 });

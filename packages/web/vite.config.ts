@@ -1,10 +1,18 @@
-import { defineConfig, type Rolldown, type ViteDevServer } from "vite";
+import { defineConfig } from "vite";
+import type { Plugin, ViteDevServer } from "vite";
 import react from "@vitejs/plugin-react";
+import tailwindcss from "@tailwindcss/vite";
 import { copyFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { applyPwaAppName } from "./scripts/pwaManifestName";
+import { bootShellPlugin } from "./scripts/bootShellPlugin";
+import { catalogPartsPlugin } from "./scripts/catalogPartsPlugin";
+import { startupCodeSplittingGroups } from "./scripts/startupChunkGroups";
+import { registeredVarFallbacksPlugin } from "./scripts/registeredVarFallbacks";
 import { resolveWebProxyTarget } from "./scripts/webProxyTarget";
+import { applyWorkerApiOrigin, workerApiOrigin } from "./scripts/workerApiOrigin";
+import { webVersionFilePlugin } from "./scripts/webVersionFile";
 import {
   createDesktopManifestContractAdapter,
   createFrontendReleaseIdentityDefines,
@@ -37,91 +45,24 @@ const extraAllowedHosts = (process.env.VITE_DEV_ALLOWED_HOSTS ?? "")
 
 // Serve/ship the canonical pixel-avatar JSON at a stable public URL
 // (/config/pixelAvatars.json) without a committed duplicate: the single
-// source stays at assets/avatars/pixelAvatars.json (imported by
-// PixelAvatar.tsx); build copies it into dist/config/, dev serves it via
-// middleware. The mobile app downloads this URL at runtime (task #352).
+// source is packages/shared/assets/pixelAvatars.json (imported by
+// PixelAvatar.tsx and the server's pixelAvatarService); build copies it into
+// dist/config/, dev serves it via middleware. The mobile app downloads this
+// URL at runtime (task #352), so the URL must not change.
+const pixelAvatarsSource = resolve(webRoot, "../shared/assets/pixelAvatars.json");
 const pixelAvatarsConfigPlugin = () => ({
   name: "raft-pixel-avatars-config",
   configureServer(server: ViteDevServer) {
     server.middlewares.use("/config/pixelAvatars.json", async (_req, res) => {
-      const body = await readFile(resolve(webRoot, "assets/avatars/pixelAvatars.json"), "utf8");
+      const body = await readFile(pixelAvatarsSource, "utf8");
       res.setHeader("Content-Type", "application/json");
       res.end(body);
     });
   },
   async closeBundle() {
-    const source = resolve(webRoot, "assets/avatars/pixelAvatars.json");
     const targetDir = resolve(webRoot, "dist/config");
     await mkdir(targetDir, { recursive: true });
-    await copyFile(source, resolve(targetDir, "pixelAvatars.json"));
-  },
-});
-
-// Rollup module ids are absolute build-machine paths (some NUL-prefixed
-// virtual ids). Publish them repo-relative so the dist artifacts are
-// deterministic across machines and leak no local directory layout.
-const repoRoot = `${resolve(webRoot, "../..").replaceAll("\\", "/")}/`;
-const toRepoRelativeModuleId = (id: string) => {
-  const posixId = id.replaceAll("\\", "/");
-  const virtualPrefix = posixId.startsWith("\u0000") ? "\u0000" : "";
-  const path = virtualPrefix ? posixId.slice(1) : posixId;
-  return path.startsWith(repoRoot)
-    ? `${virtualPrefix}${path.slice(repoRoot.length)}`
-    : posixId;
-};
-
-type RollupishBundle = Record<string, { type: string; facadeModuleId?: string | null; modules?: Record<string, unknown> }>;
-
-// Web workers are SEPARATE Rollup sub-builds: their chunks never appear in the
-// main build's manifest or bundle, so the main-graph artifact below is blind
-// to them (review finding by Aiden on the third head: a worker statically
-// importing the activity consumer shipped +42KB brotli to gate-off users with
-// every check green). This collector runs inside each worker sub-build (wired
-// via `worker.plugins`) and records worker-graph module ids into module scope;
-// worker sub-builds complete while the main build processes the importing
-// module, i.e. before the main build's generateBundle writes the artifacts.
-const collectedWorkerModules: Record<string, string[]> = {};
-const workerModulesCollectorPlugin = () => ({
-  name: "raft-worker-modules-collector",
-  apply: "build" as const,
-  generateBundle(_options: unknown, bundle: RollupishBundle) {
-    for (const [fileName, output] of Object.entries(bundle)) {
-      if (output.type !== "chunk") continue;
-      const graph = output.facadeModuleId
-        ? toRepoRelativeModuleId(output.facadeModuleId)
-        : fileName;
-      const modules = Object.keys(output.modules ?? {}).map(toRepoRelativeModuleId);
-      collectedWorkerModules[graph] = [...(collectedWorkerModules[graph] ?? []), ...modules];
-    }
-  },
-});
-
-// Emits dist/.vite/chunk-modules.json (main graph: emitted JS chunk file ->
-// bundled Rollup module ids) and dist/.vite/worker-modules.json (worker
-// graphs: worker entry module -> bundled module ids). Consumed by
-// scripts/check-activity-chunk-split.mjs to assert MODULE IDENTITY (which
-// source modules reached which graph), not just chunk/file identity — a heavy
-// module can be inlined into any chunk without changing file names, and only
-// these maps make that visible.
-const chunkModulesManifestPlugin = () => ({
-  name: "raft-chunk-modules-manifest",
-  apply: "build" as const,
-  async generateBundle(_options: unknown, bundle: RollupishBundle) {
-    const map: Record<string, string[]> = {};
-    for (const [fileName, output] of Object.entries(bundle)) {
-      if (output.type !== "chunk") continue;
-      map[fileName] = Object.keys(output.modules ?? {}).map(toRepoRelativeModuleId);
-    }
-    const targetDir = resolve(webRoot, "dist/.vite");
-    await mkdir(targetDir, { recursive: true });
-    await writeFile(
-      resolve(targetDir, "chunk-modules.json"),
-      `${JSON.stringify(map, null, 2)}\n`,
-    );
-    await writeFile(
-      resolve(targetDir, "worker-modules.json"),
-      `${JSON.stringify(collectedWorkerModules, null, 2)}\n`,
-    );
+    await copyFile(pixelAvatarsSource, resolve(targetDir, "pixelAvatars.json"));
   },
 });
 
@@ -136,119 +77,37 @@ const pwaManifestNamePlugin = () => ({
   },
 });
 
-// Match a module id that belongs to one of the named npm packages (pnpm layout
-// nests them as .../node_modules/<name>/...).
-function vendorPackages(names: string[]): RegExp {
-  const escaped = names.map((name) => name.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&"));
-  return new RegExp(`[\\\\/]node_modules[\\\\/](?:${escaped.join("|")})[\\\\/]`);
+// dist/_worker.js asks the API for public Artifacts' preview meta: write the
+// build's API origin into it (scripts/workerApiOrigin.ts).
+const workerApiOriginPlugin = () => ({
+  name: "raft-worker-api-origin",
+  apply: "build" as const,
+  async closeBundle() {
+    const workerPath = resolve(webRoot, "dist/_worker.js");
+    const worker = await readFile(workerPath, "utf8");
+    await writeFile(workerPath, applyWorkerApiOrigin(worker, workerApiOrigin(process.env.VITE_API_URL)));
+  },
+});
+
+// packages/shared is consumed through its barrel (src/index.ts) and has no
+// import-time side effects the web app relies on: its modules only declare
+// exports (lazySchema registers a schema for warmContractSchemas, which only
+// the server calls). Marking them side-effect free lets the build drop the
+// ones the app never uses (Agent API contracts, tracing fields, ...: ~45 KB
+// gzip of the first screen). Scoped to this build, not packages/shared's
+// package.json, so the CLI / daemon / desktop bundles keep their behaviour.
+const SHARED_SRC = /[\\/]packages[\\/]shared[\\/]src[\\/]/;
+function sharedWithoutSideEffectsPlugin(): Plugin {
+  return {
+    name: "raft-shared-without-side-effects",
+    transform: {
+      filter: { id: SHARED_SRC },
+      handler: () => ({ moduleSideEffects: false }),
+    },
+  };
 }
 
-// Modules the entry loads at startup, computed once per build. Rolldown 1.2
-// emits such a module as its own common chunk whenever a lazy route also
-// imports it, even though the entry has already loaded it
-// (rolldown/rolldown#10731), which turned the first paint into ~100 requests.
-// Grouping this closure restores what Rollup produced: the entry plus a few files.
-//
-// The import graph is not tree-shaken, so a plain walk would pass through
-// re-export barrels (e.g. @botiverse/raft-shared -> @botiverse/raft-sync-core)
-// and pull lazy-only modules such as the Activity runtime into startup. A
-// barrel's re-export edge is followed only when its target is itself a barrel
-// or declares (not merely re-exports) a name that some startup module imports.
 const webEntry = resolve(webRoot, "src/main.tsx");
-const REEXPORT_STATEMENT = /^export\s+(?:\*(?:\s+as\s+[\w$]+)?|\{[^}]*\})\s+from\s+["'][^"']+["'];?$/;
-const NAMED_IMPORT = /import\s*(?:[\w$]+\s*,\s*)?\{([^}]*)\}\s*from\s*["']/g;
-const NAMESPACE_IMPORT = /import\s*(?:[\w$]+\s*,\s*)?\*\s*as\s/;
-
-function isReexportBarrel(code: string | null): boolean {
-  if (!code) return false;
-  const statements = code
-    .replace(/\/\*[\s\S]*?\*\//g, "")
-    .replace(/^\s*\/\/.*$/gm, "")
-    .split(/;\s*|\n/)
-    .map((statement) => statement.trim())
-    .filter(Boolean);
-  return statements.length > 0 && statements.every((statement) => REEXPORT_STATEMENT.test(statement));
-}
-
-const LOCAL_EXPORT_LIST = /export\s*\{([^}]*)\}\s*(?!\s*from)(?:;|$)/gm;
-
-// Names a module declares itself. `import { x } from "./y"; export { x };` is a
-// re-export in disguise, so exported bindings that were imported are skipped.
-function declaredExports(code: string): Set<string> {
-  const importedBindings = new Set<string>();
-  for (const [, list] of code.matchAll(NAMED_IMPORT)) {
-    for (const part of list.split(",")) {
-      const local = part.trim().split(/\s+as\s+/).pop();
-      if (local) importedBindings.add(local);
-    }
-  }
-  const names = new Set<string>();
-  for (const [, name] of code.matchAll(/export\s+(?:default\s+)?(?:async\s+)?(?:function\*?|const|let|var|class)\s+([\w$]+)/g)) {
-    names.add(name);
-  }
-  if (/export\s+default\b/.test(code)) names.add("default");
-  for (const [, list] of code.matchAll(LOCAL_EXPORT_LIST)) {
-    for (const part of list.split(",")) {
-      const [local, exported = local] = part.trim().split(/\s+as\s+/);
-      if (local && !importedBindings.has(local)) names.add(exported);
-    }
-  }
-  return names;
-}
-
-let entryStartupClosure: Set<string> | null = null;
-function computeStartupClosure(ctx: Rolldown.ChunkingContext): Set<string> {
-  const importedNames = new Set<string>(["default"]);
-  // Barrels imported by a module that uses `import * as`: every re-export counts.
-  const wholeBarrels = new Set<string>();
-  for (;;) {
-    const closure = new Set<string>();
-    const sizeBefore = importedNames.size + wholeBarrels.size;
-    const pending = [webEntry];
-    while (pending.length > 0) {
-      const id = pending.pop()!;
-      if (closure.has(id)) continue;
-      closure.add(id);
-      const info = ctx.getModuleInfo(id);
-      if (!info) continue;
-      if (!isReexportBarrel(info.code)) {
-        const code = info.code ?? "";
-        const namespaceImport = NAMESPACE_IMPORT.test(code);
-        for (const [, list] of code.matchAll(NAMED_IMPORT)) {
-          for (const part of list.split(",")) {
-            const name = part.trim().split(/\s+as\s+/)[0];
-            if (name) importedNames.add(name);
-          }
-        }
-        for (const target of info.importedIds) {
-          if (namespaceImport && isReexportBarrel(ctx.getModuleInfo(target)?.code ?? null)) wholeBarrels.add(target);
-          pending.push(target);
-        }
-        continue;
-      }
-      for (const target of info.importedIds) {
-        const code = ctx.getModuleInfo(target)?.code ?? null;
-        if (wholeBarrels.has(id) || code === null || isReexportBarrel(code)) {
-          if (wholeBarrels.has(id) && isReexportBarrel(code)) wholeBarrels.add(target);
-          pending.push(target);
-          continue;
-        }
-        for (const name of declaredExports(code)) {
-          if (importedNames.has(name)) {
-            pending.push(target);
-            break;
-          }
-        }
-      }
-    }
-    if (importedNames.size + wholeBarrels.size === sizeBefore) return closure;
-  }
-}
-
-function inEntryStartupClosure(moduleId: string, ctx: Rolldown.ChunkingContext): boolean {
-  entryStartupClosure ??= computeStartupClosure(ctx);
-  return moduleId !== webEntry && entryStartupClosure.has(moduleId);
-}
 
 export default defineConfig({
   define: {
@@ -257,13 +116,22 @@ export default defineConfig({
   },
   plugins: [
     react(),
-    chunkModulesManifestPlugin(),
+    // Resolve imported asset URLs before Tailwind optimizes the CSS.
+    tailwindcss({ optimize: true }),
+    // Rings, shadows and filters in a Chromium 111-118 WebView (#triage:#322).
+    registeredVarFallbacksPlugin(),
     createFrontendReleaseIdentityPlugin(
       frontendReleaseIdentity,
       desktopManifestContract,
     ),
     pwaManifestNamePlugin(),
+    workerApiOriginPlugin(),
+    webVersionFilePlugin(frontendReleaseIdentity),
     pixelAvatarsConfigPlugin(),
+    bootShellPlugin(),
+    // Each catalog in a first-screen part and the rest (docs/frontend/i18n/README.md).
+    catalogPartsPlugin(),
+    sharedWithoutSideEffectsPlugin(),
   ],
   server: {
     host: true,
@@ -326,9 +194,6 @@ export default defineConfig({
       "/daemon": { target: serverTarget, ws: true },
     },
   },
-  worker: {
-    plugins: () => [workerModulesCollectorPlugin()],
-  },
   build: {
     outDir: "dist",
     manifest: true,
@@ -337,17 +202,9 @@ export default defineConfig({
     rolldownOptions: {
       output: {
         codeSplitting: {
-          groups: [
-            // react-router-dom only re-exports react-router, so name the package that
-            // holds the code.
-            { name: "vendor-react", test: vendorPackages(["react", "react-dom", "react-router", "react-router-dom"]) },
-            {
-              name: "vendor-markdown",
-              test: vendorPackages(["react-markdown", "remark-breaks", "remark-gfm", "rehype-raw", "rehype-sanitize"]),
-            },
-            { name: "vendor-socketio", test: vendorPackages(["socket.io-client"]) },
-            { name: (moduleId, ctx) => (inEntryStartupClosure(moduleId, ctx) ? "app-shell" : null), debugName: "app-shell" },
-          ],
+          // The startup chunk groups (scripts/startupChunkGroups.ts, shared with
+          // Raft Desktop's renderer build).
+          groups: startupCodeSplittingGroups(webEntry, { appStable: true }),
         },
       },
     },

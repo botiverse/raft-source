@@ -1,9 +1,11 @@
-import { lazy, Suspense } from "react";
+import { Suspense } from "react";
 import type { ComponentType, LazyExoticComponent } from "react";
 import { useIntl } from "react-intl";
 import { Spinner } from "@botiverse/raft-ui";
+import { lazyPanel } from "../../boot/deferredUi";
 
-const AboutFeedbackPanel = lazy(async () => {
+// The feedback workspace and its stylesheet; a failed download of either shows Try again in its place.
+const AboutFeedbackPanel = lazyPanel(async () => {
   const [, panel] = await Promise.all([
     import.meta.env
       ? import("@botiverse/hands-feedback-react/styles.css")

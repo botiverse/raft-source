@@ -33,6 +33,7 @@
 //   store that can compare inside a transaction throws on mismatch, others
 //   ignore it and the later save wins. No lock is held across awaits.
 
+import { canonicalMessageCardJson } from "../messageCard";
 import { SeenFrontier, type SeenFrontierSnapshot } from "./frontier";
 
 export const RAFT_STATE_SCHEMA = "raft-sdk-state.v1" as const;
@@ -105,9 +106,14 @@ export function parseRaftState(value: unknown): RaftState | null {
   };
 }
 
-/** Hex SHA-256 identifying one logical message (WebCrypto; Workers-safe). */
-export async function hashRaftSendContent(target: string, content: string, attachmentIds: readonly string[] = []): Promise<string> {
-  const bytes = new TextEncoder().encode(`${target}\n${[...attachmentIds].sort().join(",")}\n${content}`);
+/**
+ * Hex SHA-256 identifying one logical message (WebCrypto; Workers-safe). A
+ * card message's card is part of it (RFC 082), by value whatever its key
+ * order; a message without one hashes the bytes it always did.
+ */
+export async function hashRaftSendContent(target: string, content: string, attachmentIds: readonly string[] = [], card?: unknown): Promise<string> {
+  const cardPart = card === undefined ? "" : `\ncard:${canonicalMessageCardJson(card)}`;
+  const bytes = new TextEncoder().encode(`${target}\n${[...attachmentIds].sort().join(",")}\n${content}${cardPart}`);
   const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
   return [...digest].map((b) => b.toString(16).padStart(2, "0")).join("");
 }

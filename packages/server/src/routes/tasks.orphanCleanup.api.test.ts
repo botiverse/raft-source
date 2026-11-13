@@ -10,7 +10,7 @@ import { createServer } from "../services/serverService";
 import * as taskService from "../services/taskService";
 import { deleteAgent } from "../services/agentService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 // Force is an admin override; the actor is now required so the audit trail can
 // name who overrode the state machine. These call sites are arrangement, not

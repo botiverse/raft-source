@@ -2,8 +2,9 @@ import { vi } from "vitest";
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
 import { Readable } from "node:stream";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { openTestApp } from "../test/integration/app";
+import { insertAttachmentsWithObjects } from "../test/attachmentObjectFixture";
 import { getDb } from "../db/index";
 import {
   agents,
@@ -18,7 +19,6 @@ import {
   messages,
   serverMembers,
   serverInvites,
-  serverMembershipAgreementAudit,
   servers,
   users,
 } from "../db/schema";
@@ -29,8 +29,8 @@ import type { DbQueryTracer } from "../tracing/dbQueryTrace";
 import { createServer, seedUser, headers } from "./channels.api.fixtures";
 import { tokenForHuman } from "../test/integration/credentials";
 import { addMember } from "../services/serverService";
+import { seedBoundGuest } from "../test/guestFixture";
 import { createMessage } from "../services/messageService";
-import * as serverAgreementService from "../services/serverAgreementService";
 import { PUBLIC_SERVER_FEATURE_FLAG_KEY, SERVER_GUEST_FEATURE_FLAG_KEY } from "@botiverse/raft-shared";
 
 async function enablePublicServerFeature() {
@@ -39,7 +39,7 @@ async function enablePublicServerFeature() {
     .where(eq(featureFlags.key, PUBLIC_SERVER_FEATURE_FLAG_KEY));
 }
 
-async function enablePublicGuestJoinFeatures() {
+async function enablePublicAndGuestFeatures() {
   await enablePublicServerFeature();
   await getDb().update(featureFlags)
     .set({ enabled: true, killSwitch: false, defaultEnabled: true })
@@ -56,7 +56,7 @@ async function enablePublicGuestJoinFeatures() {
  * running app before and after, with nothing in between but the column change.
  */
 test("public server: a logged-out reader loses access the moment the toggle goes off", async () => {
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const db = getDb();
     await enablePublicServerFeature();
@@ -94,7 +94,7 @@ test("public server: a logged-out reader loses access the moment the toggle goes
 });
 
 test("public server: rollout flag defaults closed at owner and anonymous boundaries", async () => {
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const db = getDb();
     const owner = await seedUser("public-gate-owner@slock.test", "public-gate-owner");
@@ -128,11 +128,11 @@ test("public server: rollout flag defaults closed at owner and anonymous boundar
   }
 });
 
-test("public translation shares the member endpoint's one-hundred-twenty-per-minute request budget", async () => {
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+test("public translation has its own thirty-per-minute IP budget, a quarter of the member endpoint's", async () => {
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const url = `${app.baseUrl}/api/public/servers/rate-limit-probe/message-translations:batch`;
-    for (let index = 0; index < 120; index += 1) {
+    for (let index = 0; index < 30; index += 1) {
       const response = await fetch(url, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -159,7 +159,7 @@ test("public translation shares the member endpoint's one-hundred-twenty-per-min
  * separate way the surface could widen without anyone intending it.
  */
 test("public server: the anonymous surface is only guest-visible ordinary channels", async () => {
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const db = getDb();
     await enablePublicServerFeature();
@@ -198,26 +198,25 @@ test("public server: the anonymous surface is only guest-visible ordinary channe
   }
 });
 
-test("public server: making an ordinary channel private clears both Guest audience flags", async () => {
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+test("public server: making an ordinary channel private clears its public-reading flag", async () => {
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const owner = await seedUser("public-private-policy-owner@slock.test", "public-private-policy-owner");
     const server = await createServer("Policy", "public-private-policy-70", owner.id);
     const channel = await createChannel(server.id, "before-private", undefined, "channel", { type: "user", id: owner.id });
 
-    await updateChannel(channel.id, { guestVisible: true, guestJoinable: true });
+    await updateChannel(channel.id, { guestVisible: true });
     const updated = await updateChannel(channel.id, { type: "private" });
 
     assert.equal(updated.type, "private");
     assert.equal(updated.guestVisible, false, "a private channel must not retain the anonymous audience marker");
-    assert.equal(updated.guestJoinable, false, "a private channel must not retain Guest join authority");
   } finally {
     await app.close();
   }
 });
 
 test("public server: anonymous message history is a narrow public projection", async () => {
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const db = getDb();
     await enablePublicServerFeature();
@@ -371,7 +370,7 @@ test("public server: anonymous message history is a narrow public projection", a
       return { names, tracer };
     };
     const publicRead = recordQueries();
-    const publicSummaries = await loadPublicThreadPreviews(channel.id, [message.id], publicRead.tracer);
+    const publicSummaries = await loadPublicThreadPreviews(channel.id, server.id, [message.id], publicRead.tracer);
     assert.ok(publicRead.names.includes("channel_threads.latest_replies_by_threads"), "the public path reads the latest replies");
     assert.equal(publicRead.names.includes("channel_threads.participants_by_threads"), false, "the public path must not issue the participants read");
     assert.equal(publicRead.names.includes("channel_threads.unread_by_threads"), false, "the public path has no viewer, so no unread read");
@@ -397,6 +396,18 @@ test("public server: anonymous message history is a narrow public projection", a
     for (const id of [externalAgent.id, storedAgent.id]) {
       assert.equal(JSON.stringify(agentPreviewBody).includes(id), false, "reply previews must not expose agent ids");
     }
+    // wg-rbac #56: a reply by another server's agent resolves like that agent's
+    // parent row above ("Unknown agent", no avatar), not by its real profile.
+    const otherServerAgentReply = await createMessage(agentThread.id, "agent", otherServerAgent.id, "reply from another server's agent");
+    const crossServerPreviewBody = await (await fetch(`${app.baseUrl}/api/public/servers/public-projection-70/channels/${channel.id}/messages`)).json() as {
+      messages: Array<{ id: string; latestReplies: Array<{ messageId: string; senderName: string; senderAvatarUrl: string | null }> }>;
+    };
+    const crossServerPreview = crossServerPreviewBody.messages.find((row) => row.id === storedAgentMessage.id)!.latestReplies
+      .find((item) => item.messageId === otherServerAgentReply.id);
+    assert.deepEqual(crossServerPreview && [crossServerPreview.senderName, crossServerPreview.senderAvatarUrl], ["Unknown agent", null],
+      "a reply preview by another server's agent gets the parent row's fallback");
+    assert.equal(JSON.stringify(crossServerPreviewBody).includes("Other Server Secret Agent"), false, "the other server's agent name must not leak through a preview");
+    assert.equal(JSON.stringify(crossServerPreviewBody).includes(otherServerAvatar), false);
     const threadResponse = await fetch(`${app.baseUrl}/api/public/servers/public-projection-70/threads/${thread.id}/messages`);
     assert.equal(threadResponse.status, 200);
     const threadBody = await threadResponse.json() as { messages: Array<Record<string, unknown>> };
@@ -438,6 +449,100 @@ test("public server: anonymous message history is a narrow public projection", a
 });
 
 /**
+ * Agents' default avatar is a client-rendered pixel key, not an image URL:
+ * `pixel:<key>` (a sprite in packages/shared/assets/pixelAvatars.json) or
+ * `pixel:random:<seed>`. It references no URL and carries no personal data, so
+ * signed-out pages show it (Warden; redo of #9991). Only keys the pixel avatar
+ * service can draw project: an unknown key, an oversize seed or a seed with a
+ * control character stays null, on parent rows, latestReplies and the public
+ * thread endpoint alike.
+ */
+test("public server: agents' valid pixel avatar keys project on every anonymous message surface", async () => {
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
+  try {
+    const db = getDb();
+    await enablePublicServerFeature();
+    const owner = await seedUser("public-pixel-owner@slock.test", "public-pixel-owner");
+    const server = await createServer("Pixel Projection", "public-pixel-avatars", owner.id);
+    const channel = await createChannel(server.id, "public-pixel", undefined, "channel", { type: "user", id: owner.id });
+    await db.update(channels).set({ guestVisible: true }).where(eq(channels.id, channel.id));
+    await db.update(servers).set({ publiclyVisible: true }).where(eq(servers.id, server.id));
+    // A human with a pixel-shaped avatarUrl stays null: human avatars are stored uploads only.
+    await db.update(users).set({ avatarUrl: "pixel:robot" }).where(eq(users.id, owner.id));
+
+    const cases = [
+      { name: "pixel-preset-agent", avatarUrl: "pixel:robot", expected: "pixel:robot" as string | null },
+      { name: "pixel-random-agent", avatarUrl: "pixel:random:seed-42", expected: "pixel:random:seed-42" },
+      { name: "pixel-unknown-agent", avatarUrl: "pixel:not-a-real-key", expected: null },
+      { name: "pixel-oversize-agent", avatarUrl: `pixel:random:${"x".repeat(300)}`, expected: null },
+      { name: "pixel-control-agent", avatarUrl: "pixel:random:seed\u0007bad", expected: null },
+      { name: "pixel-empty-agent", avatarUrl: "pixel:", expected: null },
+    ];
+    const seeded = [];
+    for (const item of cases) {
+      const [agent] = await db.insert(agents).values({
+        serverId: server.id,
+        name: item.name,
+        displayName: item.name,
+        avatarUrl: item.avatarUrl,
+      }).returning();
+      seeded.push({ ...item, agent: agent! });
+    }
+    const humanMessage = await createMessage(channel.id, "user", owner.id, "human with a pixel-shaped avatarUrl");
+    const thread = await getOrCreateThread(humanMessage.id, owner.id, "user");
+    const parents = [];
+    const replies = [];
+    for (const item of seeded) {
+      parents.push(await createMessage(channel.id, "agent", item.agent.id, `${item.name} parent`));
+      replies.push(await createMessage(thread.id, "agent", item.agent.id, `${item.name} reply`));
+    }
+    const expected = seeded.map((item) => [item.name, item.expected]);
+
+    const channelBody = await (await fetch(`${app.baseUrl}/api/public/servers/public-pixel-avatars/channels/${channel.id}/messages`)).json() as {
+      messages: Array<{
+        id: string;
+        sender: { displayName: string; avatarUrl: string | null };
+        latestReplies: Array<{ messageId: string; senderName: string; senderAvatarUrl: string | null }>;
+      }>;
+    };
+    assert.deepEqual(
+      parents.map((parent) => channelBody.messages.find((row) => row.id === parent.id)!.sender).map((sender) => [sender.displayName, sender.avatarUrl]),
+      expected,
+      "parent rows project valid pixel keys and null everything else",
+    );
+    assert.equal(channelBody.messages.find((row) => row.id === humanMessage.id)!.sender.avatarUrl, null, "a human's pixel-shaped avatarUrl is not projected");
+    const threadRow = channelBody.messages.find((row) => row.id === humanMessage.id)!;
+    assert.ok(threadRow.latestReplies.length >= 2);
+    assert.deepEqual(
+      threadRow.latestReplies.map((reply) => [reply.senderName, reply.senderAvatarUrl]),
+      expected.slice(-threadRow.latestReplies.length),
+      "latestReplies follow the same pixel rule (the newest replies: unknown key, oversize seed, control char, empty)",
+    );
+
+    const threadBody = await (await fetch(`${app.baseUrl}/api/public/servers/public-pixel-avatars/threads/${thread.id}/messages`)).json() as {
+      messages: Array<{ id: string; sender: { displayName: string; avatarUrl: string | null } }>;
+    };
+    assert.deepEqual(
+      replies.map((reply) => threadBody.messages.find((row) => row.id === reply.id)!.sender).map((sender) => [sender.displayName, sender.avatarUrl]),
+      expected,
+      "the public thread endpoint follows the same pixel rule",
+    );
+
+    // latestReplies is the newest few; make the valid keys the newest to cover them projecting there too.
+    const presetReply = await createMessage(thread.id, "agent", seeded[0]!.agent.id, "preset again");
+    const randomReply = await createMessage(thread.id, "agent", seeded[1]!.agent.id, "random again");
+    const refreshed = await (await fetch(`${app.baseUrl}/api/public/servers/public-pixel-avatars/channels/${channel.id}/messages`)).json() as typeof channelBody;
+    assert.deepEqual(
+      refreshed.messages.find((row) => row.id === humanMessage.id)!.latestReplies.slice(-2).map((reply) => [reply.messageId, reply.senderAvatarUrl]),
+      [[presetReply.id, "pixel:robot"], [randomReply.id, "pixel:random:seed-42"]],
+      "latestReplies project valid pixel keys",
+    );
+  } finally {
+    await app.close();
+  }
+});
+
+/**
  * The toggle is OWNER-only, and that is the whole reason it is its own endpoint.
  *
  * The obvious implementation — a field on `PATCH /servers/:id` — is gated on
@@ -446,7 +551,7 @@ test("public server: anonymous message history is a narrow public projection", a
  * in that route would have looked wrong. This test is the thing that would go red.
  */
 test("public server: only the owner can flip the toggle, not an admin", async () => {
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const db = getDb();
     await enablePublicServerFeature();
@@ -499,171 +604,109 @@ test("public server: only the owner can flip the toggle, not an admin", async ()
   }
 });
 
-test("public Guest admission is owner-only, depends on Public, and is cleared when Public turns off", async () => {
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+// Guest joining is retired (#wg-rbac:#47); public reading stays. The legacy
+// guestVisible field (now visitorVisible, no longer behind server_guest_v0,
+// #wg-rbac:#51; channels.visitorVisible.api.test.ts) puts a channel on the public page.
+test("public reading stays: an owner makes a channel visible with the legacy field, and a signed-out visitor reads it until it is hidden", async () => {
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const db = getDb();
-    await enablePublicGuestJoinFeatures();
+    await enablePublicServerFeature();
+    const owner = await seedUser("public-visible-owner@slock.test", "public-visible-owner");
+    const server = await createServer("Visible Setting", "public-visible-47", owner.id);
+    await db.update(servers).set({ publiclyVisible: true }).where(eq(servers.id, server.id));
+    const channel = await createChannel(server.id, "readable", undefined, "channel", { type: "user", id: owner.id });
+    const posted = await createMessage(channel.id, "user", owner.id, "public-visible-47 hello");
+    const ownerHeaders = headers(await tokenForHuman(owner.email), server.id);
+    const setVisible = (guestVisible: boolean) => fetch(`${app.baseUrl}/api/channels/${channel.id}`, {
+      method: "PATCH",
+      headers: ownerHeaders,
+      body: JSON.stringify({ guestVisible }),
+    });
+    const listUrl = `${app.baseUrl}/api/public/servers/public-visible-47`;
+    const msgsUrl = `${app.baseUrl}/api/public/servers/public-visible-47/channels/${channel.id}/messages`;
+
+    assert.equal((await fetch(msgsUrl)).status, 404, "not readable before the owner makes it visible");
+
+    const shown = await setVisible(true);
+    assert.equal(shown.status, 200, await shown.clone().text());
+    assert.equal((await shown.json() as { guestVisible: boolean }).guestVisible, true);
+
+    // No Authorization header: a signed-out visitor.
+    const listed = await fetch(listUrl);
+    assert.equal(listed.status, 200);
+    const listedBody = await listed.json() as Record<string, unknown> & { channels: { id: string }[] };
+    assert.deepEqual(listedBody.channels.map((c) => c.id), [channel.id]);
+    assert.equal("canJoinAsGuest" in listedBody, false, "the public page offers no Guest join");
+    const read = await fetch(msgsUrl);
+    assert.equal(read.status, 200, await read.clone().text());
+    assert.ok((await read.text()).includes(posted.id), "the visitor reads the channel's messages");
+
+    const hidden = await setVisible(false);
+    assert.equal(hidden.status, 200);
+    assert.equal((await fetch(msgsUrl)).status, 404, "hidden again: the visitor's next read fails");
+  } finally {
+    await app.close();
+  }
+});
+
+test("public Guest join is gone: its owner switch and its join route 404, and servers.public_guest_join_enabled is dropped", async () => {
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
+  try {
+    const db = getDb();
+    await enablePublicAndGuestFeatures();
     const owner = await seedUser("public-join-owner@slock.test", "public-join-owner");
-    const admin = await seedUser("public-join-admin@slock.test", "public-join-admin");
-    const server = await createServer("Join Controls", "public-join-controls-74", owner.id);
-    await addMember(server.id, admin.id, "admin");
-    const ownerToken = await tokenForHuman(owner.email);
-    const adminToken = await tokenForHuman(admin.email);
-    const url = `${app.baseUrl}/api/servers/${server.id}/public-guest-join`;
-
-    const beforePublic = await fetch(url, {
-      method: "PATCH",
-      headers: headers(ownerToken, server.id),
-      body: JSON.stringify({ publicGuestJoinEnabled: true }),
-    });
-    assert.equal(beforePublic.status, 409, "Guest admission cannot open before Public access");
-
-    const adminAttempt = await fetch(url, {
-      method: "PATCH",
-      headers: headers(adminToken, server.id),
-      body: JSON.stringify({ publicGuestJoinEnabled: true }),
-    });
-    assert.equal(adminAttempt.status, 403, "admin must not control public admission");
-
+    const visitor = await seedUser("public-join-visitor@slock.test", "public-join-visitor");
+    const server = await createServer("Join Retired", "public-join-retired-47", owner.id);
     await db.update(servers).set({ publiclyVisible: true, translationEnabled: true }).where(eq(servers.id, server.id));
-    const opened = await fetch(url, {
+    const ownerHeaders = headers(await tokenForHuman(owner.email), server.id);
+
+    // Both rollout flags on, owner caller: still gone.
+    const ownerSwitch = await fetch(`${app.baseUrl}/api/servers/${server.id}/public-guest-join`, {
       method: "PATCH",
-      headers: headers(ownerToken, server.id),
+      headers: ownerHeaders,
       body: JSON.stringify({ publicGuestJoinEnabled: true }),
     });
-    assert.equal(opened.status, 200, await opened.clone().text());
+    assert.equal(ownerSwitch.status, 404, "PATCH /servers/:id/public-guest-join is removed");
 
-    const publicReadback = await (await fetch(`${app.baseUrl}/api/public/servers/public-join-controls-74`)).json() as {
-      server: { translationEnabled: boolean };
-      canJoinAsGuest: boolean;
-      translationAvailable: boolean;
-    };
-    assert.equal(publicReadback.canJoinAsGuest, true);
-    assert.equal(publicReadback.server.translationEnabled, true, "public Settings must receive the viewed server's translation switch");
-    assert.equal(typeof publicReadback.translationAvailable, "boolean");
+    const joinUrl = `${app.baseUrl}/api/public/servers/public-join-retired-47/join-as-guest`;
+    const membership = () => db.select().from(serverMembers).where(and(eq(serverMembers.serverId, server.id), eq(serverMembers.userId, visitor.id)));
+    const anonymous = await fetch(joinUrl, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+    assert.equal(anonymous.status, 404, "POST /public/servers/:slug/join-as-guest is removed");
+    const signedIn = await fetch(joinUrl, { method: "POST", headers: headers(await tokenForHuman(visitor.email), server.id), body: "{}" });
+    assert.equal(signedIn.status, 404);
+    assert.deepEqual(await membership(), [], "no membership is created");
 
+    const readback = await (await fetch(`${app.baseUrl}/api/public/servers/public-join-retired-47`)).json() as Record<string, unknown> & { server: Record<string, unknown> };
+    assert.equal("canJoinAsGuest" in readback, false);
+    assert.equal("publicGuestJoinEnabled" in readback.server, false);
+    assert.equal(readback.server.translationEnabled, true, "public Settings still receive the server's translation switch");
+
+    const settings = await fetch(`${app.baseUrl}/api/servers/${server.id}/public-visibility`, { headers: ownerHeaders });
+    assert.equal(settings.status, 200);
+    assert.equal("publicGuestJoinEnabled" in (await settings.json() as Record<string, unknown>), false);
+
+    // The retired column is gone (migration guest_join_public_column_drop):
+    // turning Public off works on a table without it.
+    const { rows } = await db.execute<{ column_name: string }>(sql`
+      SELECT column_name FROM information_schema.columns
+      WHERE table_schema = 'public' AND table_name = 'servers' AND column_name = 'public_guest_join_enabled'
+    `);
+    assert.deepEqual(rows, [], "servers.public_guest_join_enabled is dropped");
     const closed = await fetch(`${app.baseUrl}/api/servers/${server.id}/public-visibility`, {
       method: "PATCH",
-      headers: headers(ownerToken, server.id),
+      headers: ownerHeaders,
       body: JSON.stringify({ publiclyVisible: false }),
     });
     assert.equal(closed.status, 200, await closed.clone().text());
-    const closedBody = await closed.json() as { publicGuestJoinEnabled: boolean };
-    assert.equal(closedBody.publicGuestJoinEnabled, false, "Public OFF must clear public Guest admission in the same write");
-    const [stored] = await db.select({ publiclyVisible: servers.publiclyVisible, publicGuestJoinEnabled: servers.publicGuestJoinEnabled })
-      .from(servers).where(eq(servers.id, server.id));
-    assert.deepEqual(stored, { publiclyVisible: false, publicGuestJoinEnabled: false });
+    assert.deepEqual(await closed.json(), { publiclyVisible: false, publicSearchEnabled: true });
   } finally {
     await app.close();
   }
 });
 
-test("authenticated public self-join is explicit Guest-only, agreement-gated, and idempotent", async () => {
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
-  try {
-    const db = getDb();
-    await enablePublicGuestJoinFeatures();
-    const owner = await seedUser("public-join2-owner@slock.test", "public-join2-owner");
-    const visitor = await seedUser("public-join-visitor@slock.test", "public-join-visitor");
-    const server = await createServer("Join Target", "public-join-target-74", owner.id);
-    await db.update(servers).set({ publiclyVisible: true, publicGuestJoinEnabled: true }).where(eq(servers.id, server.id));
-    const agreement = await serverAgreementService.configureAgreement(server.id, owner.id, {
-      enabled: true,
-      title: "Guest rules",
-      bodyMarkdown: "Be kind.",
-    });
-    assert.ok(agreement);
-    const url = `${app.baseUrl}/api/public/servers/public-join-target-74/join-as-guest`;
-
-    const anonymous = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
-    assert.equal(anonymous.status, 401);
-    let rows = await db.select().from(serverMembers).where(and(eq(serverMembers.serverId, server.id), eq(serverMembers.userId, visitor.id)));
-    assert.equal(rows.length, 0, "anonymous refusal must leave no membership side effect");
-
-    const token = await tokenForHuman(visitor.email);
-    const needsAgreement = await fetch(url, { method: "POST", headers: headers(token, server.id), body: "{}" });
-    assert.equal(needsAgreement.status, 409);
-    const agreementBody = await needsAgreement.json() as { error: string; agreement: { id: string } };
-    assert.equal(agreementBody.error, "agreement_required");
-    assert.equal(agreementBody.agreement.id, agreement.id);
-    rows = await db.select().from(serverMembers).where(and(eq(serverMembers.serverId, server.id), eq(serverMembers.userId, visitor.id)));
-    assert.equal(rows.length, 0, "agreement refusal must happen before membership creation");
-
-    const attempts = await Promise.all([
-      fetch(url, {
-        method: "POST",
-        headers: headers(token, server.id),
-        body: JSON.stringify({ agreementId: agreement.id, role: "member", source: "invite" }),
-      }),
-      fetch(url, {
-        method: "POST",
-        headers: headers(token, server.id),
-        body: JSON.stringify({ agreementId: agreement.id }),
-      }),
-    ]);
-    assert.ok(attempts.every((response) => response.status === 200), await attempts[0]!.clone().text());
-    const outcomes = await Promise.all(attempts.map((response) => response.json() as Promise<{ role: string; joined: boolean }>));
-    assert.ok(outcomes.every((outcome) => outcome.role === "guest"), "client role/source fields must not widen this endpoint");
-    assert.deepEqual(outcomes.map((outcome) => outcome.joined).sort(), [false, true], "concurrent clicks create one membership");
-
-    rows = await db.select().from(serverMembers).where(and(eq(serverMembers.serverId, server.id), eq(serverMembers.userId, visitor.id)));
-    assert.equal(rows.length, 1);
-    assert.equal(rows[0]!.role, "guest");
-    const audit = await db.select({ source: serverMembershipAgreementAudit.source, agreementId: serverMembershipAgreementAudit.agreementId })
-      .from(serverMembershipAgreementAudit)
-      .where(and(eq(serverMembershipAgreementAudit.serverId, server.id), eq(serverMembershipAgreementAudit.subjectId, visitor.id)));
-    assert.deepEqual(audit, [{ source: "join", agreementId: agreement.id }]);
-  } finally {
-    await app.close();
-  }
-});
-
-test("public self-join rechecks every gate and leaves no membership when admission is closed", async () => {
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
-  try {
-    const db = getDb();
-    await enablePublicGuestJoinFeatures();
-    const owner = await seedUser("public-closed-owner@slock.test", "public-closed-owner");
-    const visitor = await seedUser("public-closed-visitor@slock.test", "public-closed-visitor");
-    const server = await createServer("Closed Join", "public-closed-join-74", owner.id);
-    await db.update(servers).set({ publiclyVisible: true, publicGuestJoinEnabled: false }).where(eq(servers.id, server.id));
-    const token = await tokenForHuman(visitor.email);
-    const refused = await fetch(`${app.baseUrl}/api/public/servers/public-closed-join-74/join-as-guest`, {
-      method: "POST",
-      headers: headers(token, server.id),
-      body: "{}",
-    });
-    assert.equal(refused.status, 404, "closed admission must not reveal a distinct server-existence response");
-    let rows = await db.select().from(serverMembers).where(and(eq(serverMembers.serverId, server.id), eq(serverMembers.userId, visitor.id)));
-    assert.equal(rows.length, 0, "a refused join must have no membership side effect");
-
-    await db.update(servers).set({ publicGuestJoinEnabled: true }).where(eq(servers.id, server.id));
-    await db.update(featureFlags).set({ killSwitch: true }).where(eq(featureFlags.key, SERVER_GUEST_FEATURE_FLAG_KEY));
-    const guestFlagClosed = await fetch(`${app.baseUrl}/api/public/servers/public-closed-join-74/join-as-guest`, {
-      method: "POST",
-      headers: headers(token, server.id),
-      body: "{}",
-    });
-    assert.equal(guestFlagClosed.status, 404, "the Guest rollout kill switch is authoritative at write time");
-
-    await db.update(featureFlags).set({ killSwitch: false }).where(eq(featureFlags.key, SERVER_GUEST_FEATURE_FLAG_KEY));
-    await db.update(featureFlags).set({ killSwitch: true }).where(eq(featureFlags.key, PUBLIC_SERVER_FEATURE_FLAG_KEY));
-    const publicFlagClosed = await fetch(`${app.baseUrl}/api/public/servers/public-closed-join-74/join-as-guest`, {
-      method: "POST",
-      headers: headers(token, server.id),
-      body: "{}",
-    });
-    assert.equal(publicFlagClosed.status, 404, "the Public rollout kill switch is authoritative at write time");
-    rows = await db.select().from(serverMembers).where(and(eq(serverMembers.serverId, server.id), eq(serverMembers.userId, visitor.id)));
-    assert.equal(rows.length, 0, "neither rollout gate may fail after creating membership");
-  } finally {
-    await app.close();
-  }
-});
-
-test("a valid Guest email invite remains independent of Public self-admission settings", async () => {
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+test("a stored Guest server invite from before the one-channel model is refused, never turned into a membership (#wg-rbac:#15)", async () => {
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const db = getDb();
     const owner = await seedUser("source-invite-owner@slock.test", "source-invite-owner");
@@ -678,11 +721,9 @@ test("a valid Guest email invite remains independent of Public self-admission se
       tokenHash: createHash("sha256").update(rawToken).digest("hex"),
       expiresAt: new Date(Date.now() + 60_000),
     });
-    const [precondition] = await db.select({
-      publiclyVisible: servers.publiclyVisible,
-      publicGuestJoinEnabled: servers.publicGuestJoinEnabled,
-    }).from(servers).where(eq(servers.id, server.id));
-    assert.deepEqual(precondition, { publiclyVisible: false, publicGuestJoinEnabled: false });
+    const [precondition] = await db.select({ publiclyVisible: servers.publiclyVisible })
+      .from(servers).where(eq(servers.id, server.id));
+    assert.deepEqual(precondition, { publiclyVisible: false });
 
     const token = await tokenForHuman(invitee.email);
     const accepted = await fetch(`${app.baseUrl}/api/auth/accept-invite`, {
@@ -690,10 +731,14 @@ test("a valid Guest email invite remains independent of Public self-admission se
       headers: headers(token, server.id),
       body: JSON.stringify({ token: rawToken }),
     });
-    assert.equal(accepted.status, 200, await accepted.clone().text());
-    const [membership] = await db.select({ role: serverMembers.role }).from(serverMembers)
+    assert.equal(accepted.status, 400, await accepted.clone().text());
+    assert.deepEqual(await accepted.json(), { error: "This invite has been revoked" });
+    const memberships = await db.select({ role: serverMembers.role }).from(serverMembers)
       .where(and(eq(serverMembers.serverId, server.id), eq(serverMembers.userId, invitee.id)));
-    assert.deepEqual(membership, { role: "guest" }, "invite source keeps its stored role and does not consult Public admission");
+    assert.deepEqual(memberships, [], "no Guest without a channel, and no Member either");
+    const [invite] = await db.select({ status: serverInvites.status }).from(serverInvites)
+      .where(eq(serverInvites.serverId, server.id));
+    assert.equal(invite?.status, "expired");
   } finally {
     await app.close();
   }
@@ -711,7 +756,7 @@ test("a valid Guest email invite remains independent of Public self-admission se
  * would look identical from outside.
  */
 test("public server: a logged-out visitor has no write path and leaves no state behind", async () => {
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const db = getDb();
     await enablePublicServerFeature();
@@ -756,7 +801,7 @@ test("the member server list says whether the public page is live, and only that
   // cindyz, #wg-rbac:cbca4ee7: members get an at-a-glance mark when their
   // server is public. Live means public AND rolled out; the owner-only stored
   // setting itself is not sent.
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const db = getDb();
     const owner = await seedUser("public-live-owner@slock.test", "public-live-owner");
@@ -789,7 +834,7 @@ test("the member server list says whether the public page is live, and only that
 
     // A Guest of the server receives the same boolean.
     const guest = await seedUser("public-live-guest@slock.test", "public-live-guest");
-    await addMember(server.id, guest.id, "guest");
+    await seedBoundGuest({ serverId: server.id, userId: guest.id });
     const guestToken = await tokenForHuman(guest.email);
     const guestRes = await fetch(`${app.baseUrl}/api/servers`, { headers: headers(guestToken, server.id) });
     const guestRow = (await guestRes.json() as Array<Record<string, unknown>>).find((r) => r.id === server.id);
@@ -806,7 +851,7 @@ test("the member server list says whether the public page is live, and only that
 
 test("the member server list evaluates the public-page gate once for all public servers", async () => {
   // Ark: one batch evaluation (fixed query count), not one per server.
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const db = getDb();
     await enablePublicServerFeature();
@@ -885,7 +930,7 @@ async function insertAttachment(input: {
   const id = randomUUID();
   const messagePosition = input.messageId ? nextMessagePosition.get(input.messageId) ?? 0 : null;
   if (input.messageId) nextMessagePosition.set(input.messageId, (messagePosition ?? 0) + 1);
-  await getDb().insert(attachments).values({
+  await insertAttachmentsWithObjects(getDb(), {
     id,
     channelId: input.channelId,
     messageId: input.messageId,
@@ -911,7 +956,7 @@ async function insertAttachment(input: {
  * reactor identity and no long-lived thumbnail capability URL.
  */
 test("public server: attachments, mentions and reactions are display-only projections", async () => {
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const db = getDb();
     const { owner, server, channel } = await seedPublicAttachmentServer("public-rich-128");
@@ -976,7 +1021,7 @@ test("public server: attachments, mentions and reactions are display-only projec
 });
 
 test("public server: a typed @name with no stored fact is highlighted only when it names a current member or agent", async () => {
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const db = getDb();
     const { owner, server, channel } = await seedPublicAttachmentServer("public-typed-128");
@@ -1074,7 +1119,7 @@ test("public server: a typed @name with no stored fact is highlighted only when 
 });
 
 test("public attachment download: anonymous reads follow the public message authority on every request", async () => {
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const db = getDb();
     const { owner, server, channel, creator } = await seedPublicAttachmentServer("public-download-128");
@@ -1200,8 +1245,46 @@ test("public attachment download: anonymous reads follow the public message auth
   }
 });
 
+// Storage step 2b: the public page and the public download read size, type and
+// key from the attachment object only. Step 2c: a projection without an object
+// cannot exist any more (attachments.object_id is NOT NULL).
+test("public attachments read the object, and the database refuses a projection without one", async () => {
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
+  try {
+    const db = getDb();
+    const { owner, server, channel } = await seedPublicAttachmentServer("public-objects-2b");
+    const message = await createMessage(channel.id, "user", owner.id, "files");
+    const imageId = await insertAttachment({
+      channelId: channel.id, uploaderId: owner.id, messageId: message.id,
+      filename: "photo.png", mimeType: "image/png", storageKey: `${server.id}/photo.png`,
+    });
+    await assert.rejects(db.insert(attachments).values({
+      id: randomUUID(), objectId: null as unknown as string, channelId: channel.id, messageId: message.id, messagePosition: 1,
+      uploaderId: owner.id, uploaderType: "user", filename: "objectless.png",
+    }));
+    __setStorageForTests(memoryStorage({
+      [`${server.id}/photo.png`]: "PNG!!",
+    }));
+
+    const page = await fetch(`${app.baseUrl}/api/public/servers/public-objects-2b/channels/${channel.id}/messages`);
+    assert.equal(page.status, 200);
+    const [row] = (await page.json() as { messages: Array<{ attachments: unknown[] }> }).messages;
+    assert.deepEqual(row!.attachments, [
+      { id: imageId, filename: "photo.png", mimeType: "image/png", sizeBytes: 5, width: 64, height: 48 },
+    ]);
+
+    const image = await fetch(`${app.baseUrl}/api/public/servers/public-objects-2b/attachments/${imageId}`);
+    assert.equal(image.status, 200);
+    assert.equal(await image.text(), "PNG!!");
+    assert.equal(image.headers.get("content-type"), "image/png");
+  } finally {
+    resetStorageForTests();
+    await app.close();
+  }
+});
+
 test("public attachment download: object storage gets a one-minute presigned redirect", async () => {
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const { owner, server, channel } = await seedPublicAttachmentServer("public-presign-128");
     const message = await createMessage(channel.id, "user", owner.id, "file");
@@ -1245,7 +1328,7 @@ test("public attachment download: object storage gets a one-minute presigned red
  * reauthorizes. HTML and SVG stay downloads whatever the query says.
  */
 test("public attachment preview: only a PDF is served inline on request, with the member preview headers", async () => {
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const { owner, server, channel } = await seedPublicAttachmentServer("public-pdf-preview");
     const message = await createMessage(channel.id, "user", owner.id, "files");
@@ -1304,7 +1387,7 @@ test("public attachment preview: only a PDF is served inline on request, with th
 });
 
 test("public attachment preview: an inline PDF presigns an inline disposition, still for one minute", async () => {
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const { owner, server, channel } = await seedPublicAttachmentServer("public-pdf-presign");
     const message = await createMessage(channel.id, "user", owner.id, "file");
@@ -1342,7 +1425,7 @@ test("public attachment preview: an inline PDF presigns an inline disposition, s
 });
 
 test("public attachment downloads have their own one-hundred-twenty-per-minute IP budget", async () => {
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const url = `${app.baseUrl}/api/public/servers/rate-limit-probe/attachments/${randomUUID()}`;
     for (let index = 0; index < 120; index += 1) {

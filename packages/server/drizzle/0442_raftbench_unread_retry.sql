@@ -1,0 +1,1 @@
+ALTER TABLE "raftbench_latest_runs" ADD COLUMN "unread_retries" jsonb DEFAULT '{}'::jsonb NOT NULL;

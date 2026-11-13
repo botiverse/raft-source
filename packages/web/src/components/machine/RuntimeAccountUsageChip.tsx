@@ -1,29 +1,47 @@
-import { Card, Badge, Status, Button, Progress, ProgressTrack, ProgressIndicator, Separator, Spinner } from "@botiverse/raft-ui";
-import CloseButton from "../ui/CloseButton";
+import { Card, Badge, Drawer, DrawerContent, Status, ScrollArea } from "@botiverse/raft-ui";
+import { usageProviderForRuntime } from "../../utils/runtimeUsageProvider";
 import {
   clearClockTimeout,
+  getRuntimeDisplayName,
+  isRuntimeAuthServerGated,
+  runtimeAuthRuntimeFor,
+  runtimeAuthSignsInPerProvider,
   setClockTimeout,
 } from "@botiverse/raft-shared";
-import type { RuntimeAccountUsageProvider } from "@botiverse/raft-shared";
-import { AlertCircle, RefreshCw, X } from "lucide-react";
-import { Fragment, useCallback, useEffect, useRef, useState } from "react";
-import type { ComponentProps, ReactNode } from "react";
+import type { RuntimeAccountUsageProvider, RuntimeAuthSignedInProvider, RuntimeLimitResetIdempotencyKey } from "@botiverse/raft-shared";
+import { formatReadiness, readinessHolds, useMachineRuntimeReadiness } from "../../utils/readinessCopy";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { ComponentProps, ReactNode, RefObject } from "react";
 import { createPortal } from "react-dom";
 import { useIntl } from "react-intl";
-
 import { useMediaQuery } from "../../hooks/effectPrimitives";
-import { formatRelativeTime } from "../../utils/relativeTime";
-import {
-  runtimeAccountUsageClient,
-} from "../../utils/runtimeAccountUsageClient";
+import { runtimeAccountUsageClient } from "../../utils/runtimeAccountUsageClient";
 import type {
   RuntimeAccountUsageClient,
   RuntimeAccountUsageReadResult,
-  RuntimeAccountUsageRefreshResult,
 } from "../../utils/runtimeAccountUsageClient";
-import BottomSheet from "../ui/BottomSheet";
+import { runtimeAuthClient, runtimeAuthComputerSupports, runtimeAuthStatusOf } from "../../utils/runtimeAuthClient";
+import type { RuntimeAuthClient } from "../../utils/runtimeAuthClient";
 import { useViewportClamp } from "../layout/useViewportClamp";
 import { dismissLayerProps, notDismissLayerProps } from "../ui/dismissLayer";
+import { RuntimeProviderConnectDialog } from "../../features/computer/RuntimeProviderConnectDialog";
+import { RuntimeSignInDialog } from "../../features/computer/RuntimeSignInDialog";
+import { PiSignInDialog } from "../../features/computer/PiSignInDialog";
+import { RuntimeSignOutDialog } from "../../features/computer/RuntimeSignOutDialog";
+import { RuntimeLimitResetDialog } from "../../features/computer/RuntimeLimitResetDialog";
+import { limitResetNoteMessageId, limitResetOutcomeIsSettled } from "../../features/computer/limitResetOutcome";
+import type { RuntimeLimitResetOutcome } from "../../features/computer/limitResetOutcome";
+import { forgetLimitResetAttemptKey, limitResetAttemptKey } from "../../features/computer/limitResetAttemptKey";
+import { useClaudeLimitResets } from "../../features/computer/useClaudeLimitResets";
+import { useShortcutLayer } from "../../features/shortcuts/useShortcutLayer";
+import { useOverlayLayer } from "../ui/useOverlayLayer";
+import { hasProviderKey } from "./runtimeProviderKey";
+import { useRuntimeAuthView } from "./useRuntimeAuthView";
+
+export { useRuntimeAuthView };
+import { RuntimeUsageSurface } from "./RuntimeUsageSurface";
+import type { SurfaceAuth, SurfaceLimitReset, SurfaceRefreshState } from "./RuntimeUsageSurface";
+
 
 const HOVER_OPEN_DELAY_MS = 200;
 const HOVER_CLOSE_DELAY_MS = 160;
@@ -32,23 +50,8 @@ const POST_REFRESH_MAX_READ_ATTEMPTS = 8;
 
 type RuntimeBadgeAppearance = Pick<ComponentProps<typeof Badge>, "appearance" | "variant">;
 
-type SurfaceRefreshState = RuntimeAccountUsageRefreshResult["state"] | "idle" | "requesting" | "unconfirmed";
-
-function usageProviderForRuntime(runtimeId: string): RuntimeAccountUsageProvider | null {
-  if (runtimeId === "claude" || runtimeId === "codex" || runtimeId === "grok") return runtimeId;
-  if (runtimeId === "kimi" || runtimeId === "kimi-sdk") return "kimi";
-  return null;
-}
-
-function providerName(provider: RuntimeAccountUsageProvider): string {
-  if (provider === "claude") return "Claude";
-  if (provider === "codex") return "Codex";
-  if (provider === "grok") return "Grok";
-  return "Kimi";
-}
-
 function isAttention(result: RuntimeAccountUsageReadResult): boolean {
-  if (result.state === "missing" || result.state === "stale") return result.state === "stale";
+  if (result.snapshot === null || result.state === "stale") return result.state === "stale";
   return result.snapshot.accounts.some((account) =>
     account.health !== "ok" || account.windows.some((window) => window.status !== "ok"),
   );
@@ -63,245 +66,64 @@ function runtimeBadgeClassName(className: string): string {
   return `${className} inline-flex items-center`;
 }
 
-function RuntimeUsageContents({
-  result,
-  loading,
-  loadError,
-}: {
-  result: RuntimeAccountUsageReadResult | null;
-  loading: boolean;
-  loadError: boolean;
-}) {
-  const { formatMessage, locale } = useIntl();
-  if (loading && !result) {
-    return <div className="px-4 py-5 text-callout text-foreground-muted">{formatMessage({ id: "machine.runtimeUsage.reading" })}</div>;
-  }
-  if (loadError && !result) {
-    return (
-      <div className="flex items-start gap-2 px-4 py-5 text-callout text-warning-strong">
-        <AlertCircle size={16} className="mt-0.5 shrink-0" />
-        {formatMessage({ id: "machine.runtimeUsage.readFailed" })}
-      </div>
-    );
-  }
-  if (!result || result.state === "missing") {
-    return (
-      <div className="px-4 py-5">
-        <div className="text-callout font-bold text-foreground">{formatMessage({ id: "machine.runtimeUsage.noSnapshot" })}</div>
-        <p className="mt-1 text-footnote text-foreground-muted">
-          {formatMessage({ id: "machine.runtimeUsage.noSnapshotDescription" })}
-        </p>
-      </div>
-    );
-  }
-
-  const stale = result.state === "stale";
-  return (
-    // A stale snapshot sits on the sunken surface under an orange-soft notice
-    // (ink text): recoverable, so warning, never red.
-    <div className={stale ? "bg-fill-muted" : undefined}>
-      {stale && (
-        <div className="border-b border-line-hairline bg-warning-soft px-4 py-2 text-caption font-bold text-foreground">
-          {formatMessage({ id: "machine.runtimeUsage.stale" })}
-        </div>
-      )}
-      <div>
-        {result.snapshot.accounts.map((account, index) => {
-          const reauth = account.health === "reauth_required";
-          return (
-            <Fragment key={account.accountKey}>
-            {index > 0 ? <Separator /> : null}
-            <div className="px-4 py-3">
-              <div className="flex items-start justify-between gap-3">
-                <div className="min-w-0">
-                  <div className="truncate text-callout font-bold text-foreground">
-                    {account.planLabel ?? formatMessage({ id: "machine.runtimeUsage.accountFallback" })}
-                  </div>
-                  {(account.maskedLabel ?? account.displayName) && (
-                    <div className="mt-0.5 truncate font-mono text-mono-meta text-foreground-hint" data-testid="runtime-account-masked-label">
-                      {account.maskedLabel ?? account.displayName}
-                    </div>
-                  )}
-                </div>
-                {/* Raft DS StatusChip: soft wash, a square pixel, one word. */}
-                <Badge
-                  appearance="soft"
-                  variant={account.health === "ok" ? "success" : "warning"}
-                >
-                  <Status size="md" variant={account.health === "ok" ? "success" : "warning"} aria-hidden="true" />
-                  {formatMessage({ id: `machine.runtimeUsage.health.${account.health}` })}
-                </Badge>
-              </div>
-              {account.health === "unsupported" || account.health === "error" ? (
-                <p className="mt-3 text-footnote text-foreground-muted">
-                  {formatMessage({ id: account.health === "unsupported"
-                    ? "machine.runtimeUsage.unsupportedDescription"
-                    : "machine.runtimeUsage.readFailed" })}
-                </p>
-              ) : reauth ? (
-                <p className="mt-3 text-footnote text-foreground-muted">
-                  {formatMessage({ id: "machine.runtimeUsage.reauthDescription" })}
-                </p>
-              ) : (
-                <div className="mt-3 space-y-3">
-                  {account.windows.map((window) => (
-                    <div key={window.id}>
-                      <div className="flex flex-col gap-0.5 text-footnote sm:flex-row sm:items-center sm:justify-between sm:gap-3">
-                        <span className="font-semibold text-foreground">{window.label}</span>
-                        {window.status === "parse_unavailable" ? (
-                          <span className="text-warning-strong">{formatMessage({ id: "machine.runtimeUsage.parseUnavailable" })}</span>
-                        ) : (
-                          <span className="text-foreground-muted sm:text-right">
-                            {window.resetsAt
-                              ? formatMessage(
-                                  { id: "machine.runtimeUsage.windowSummary" },
-                                  {
-                                    percent: Math.round((window.usedRatio ?? 0) * 100),
-                                    reset: formatRelativeTime(window.resetsAt, locale) ?? formatMessage({ id: "machine.runtimeUsage.later" }),
-                                  },
-                                )
-                              : formatMessage(
-                                  { id: "machine.runtimeUsage.windowSummaryResetUnavailable" },
-                                  { percent: Math.round((window.usedRatio ?? 0) * 100) },
-                                )}
-                          </span>
-                        )}
-                      </div>
-                      {window.status !== "parse_unavailable" && (
-                        <Progress
-                          value={Math.round((window.usedRatio ?? 0) * 100)}
-                          size="sm"
-                          // Raft DS Progress: cyan, orange once at/over 90% of the limit.
-                          variant={window.status === "limit_reached" || (window.usedRatio ?? 0) >= 0.9 ? "warning" : "information"}
-                          className="mt-1.5"
-                          aria-label={window.label}
-                        >
-                          <ProgressTrack>
-                            <ProgressIndicator />
-                          </ProgressTrack>
-                        </Progress>
-                      )}
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
-            </Fragment>
-          );
-        })}
-      </div>
-      <Separator />
-      <div className="px-4 py-2 text-caption text-foreground-hint">
-        {formatMessage(
-          { id: "machine.runtimeUsage.metadata" },
-          {
-            updated: formatRelativeTime(result.snapshot.collectedAt, locale) ?? formatMessage({ id: "machine.runtimeUsage.recently" }),
-          },
-        )}
-      </div>
-    </div>
-  );
-}
-
-function Surface({
-  provider,
-  runtimeVersion,
-  result,
-  loading,
-  loadError,
-  refreshState,
-  cooldownLeftMs,
-  onRefresh,
-  onClose,
-}: {
-  provider: RuntimeAccountUsageProvider;
-  runtimeVersion?: string | null;
-  result: RuntimeAccountUsageReadResult | null;
-  loading: boolean;
-  loadError: boolean;
-  refreshState: SurfaceRefreshState;
-  /** Task #704: ms left in the refresh window; > 0 disables the button and
-   *  replaces the refused-click copy with a countdown. */
-  cooldownLeftMs: number;
-  onRefresh: () => void;
-  onClose: () => void;
-}) {
-  const { formatMessage } = useIntl();
-  return (
-    <div data-testid={`runtime-usage-surface-${provider}`}>
-      <div className="flex items-center justify-between gap-3 border-b border-line-hairline px-4 py-3">
-        <div className="min-w-0">
-          <div className="text-headline text-foreground">{formatMessage({ id: "machine.runtimeUsage.title" }, { provider: providerName(provider) })}</div>
-          <div data-testid={`runtime-version-${provider}`} className="font-mono text-mono-meta text-foreground-hint">
-            {runtimeVersion?.trim()
-              ? formatMessage({ id: "machine.runtimeUsage.version" }, { version: runtimeVersion.trim() })
-              : formatMessage({ id: "machine.runtimeUsage.versionUnavailable" })}
-          </div>
-          <div className="text-caption text-foreground-hint">{formatMessage({ id: "machine.runtimeUsage.private" })}</div>
-        </div>
-        <CloseButton type="button" className="" onClick={onClose} aria-label={formatMessage({ id: "machine.runtimeUsage.close" })}>
-          <X size={16} />
-        </CloseButton>
-      </div>
-      <RuntimeUsageContents result={result} loading={loading} loadError={loadError} />
-      <div className="flex items-center justify-between gap-3 border-t border-line-hairline px-4 py-2.5">
-        <span className="text-caption text-foreground-hint">
-          {refreshState === "requested"
-            ? formatMessage({ id: "machine.runtimeUsage.refreshRequested" })
-            : refreshState === "unconfirmed"
-              ? formatMessage({ id: "machine.runtimeUsage.refreshUnconfirmed" })
-            : refreshState === "timeout"
-              ? formatMessage({ id: "machine.runtimeUsage.refreshTimeout" })
-            : cooldownLeftMs > 0
-              ? formatMessage(
-                  { id: "machine.runtimeUsage.refreshCooldownCountdown" },
-                  { seconds: Math.ceil(cooldownLeftMs / 1000) },
-                )
-            : refreshState === "computer_offline"
-              ? formatMessage({ id: "machine.runtimeUsage.computerOffline" })
-              : formatMessage({ id: "machine.runtimeUsage.cacheOnly" })}
-        </span>
-        <Button size="sm"
-          variant="outline"
-          type="button"
-          onClick={onRefresh}
-          disabled={refreshState === "requesting" || cooldownLeftMs > 0}
-          className="shrink-0"
-        >
-          {/* Waiting with no known end: the pixel spinner (Raft DS Loading). */}
-          {refreshState === "requesting"
-            ? <Spinner size="xs" aria-hidden="true" />
-            : <RefreshCw size={16} aria-hidden="true" />}
-          {formatMessage({ id: "machine.runtimeUsage.refresh" })}
-        </Button>
-      </div>
-    </div>
-  );
-}
-
-export default function RuntimeAccountUsageChip({
-  runtimeId,
-  runtimeVersion,
-  serverId,
-  machineId,
-  children,
-  className = "",
-  appearance = "solid",
-  variant = "default",
-  client = runtimeAccountUsageClient,
-}: {
+interface RuntimeUsageCardSubject {
   runtimeId: string;
+  /** Null for a runtime with no usage to read (Qoder): the card shows its sign-in alone. */
+  provider: RuntimeAccountUsageProvider | null;
   runtimeVersion?: string | null;
   serverId: string;
   machineId: string;
-  children: ReactNode;
-  className?: string;
+  client: RuntimeAccountUsageClient;
+  authClient: RuntimeAuthClient;
+}
+
+type RuntimeUsageCardProps = Omit<RuntimeUsageCardSubject, "client" | "authClient"> & {
   client?: RuntimeAccountUsageClient;
-} & RuntimeBadgeAppearance) {
+  authClient?: RuntimeAuthClient;
+};
+
+/**
+ * The usage card's own state for one runtime on one Computer: the cached
+ * snapshot (read on mount, a bounded refresh when it is stale or missing),
+ * the manual Refresh and its follow-up reads, and the sign-in state with its
+ * dialogs. Every place that shows the card (the runtime chip, a rack meter,
+ * the rack's list of cards) draws it from here, so they all behave alike.
+ */
+function useRuntimeUsageCard({
+  runtimeId,
+  provider,
+  runtimeVersion,
+  serverId,
+  machineId,
+  client,
+  authClient,
+  visible,
+  onClose,
+  onAuthDialog,
+}: RuntimeUsageCardSubject & {
+  /** The card is on screen: only then does the refresh countdown tick. */
+  visible: boolean;
+  /** The card's close button; a card without one has no close of its own. */
+  onClose?: () => void;
+  /** A sign-in or sign-out dialog takes over from the card. */
+  onAuthDialog?: () => void;
+}) {
+  const authRuntime = runtimeAuthRuntimeFor(runtimeId);
+  const readiness = useMachineRuntimeReadiness(machineId, runtimeId);
+  const { view: authView, reread: rereadAuth } = useRuntimeAuthView(authClient, serverId, machineId, authRuntime !== null);
+  const authStatus = authRuntime ? runtimeAuthStatusOf(authView, authRuntime) : null;
+  const [authDialog, setAuthDialog] = useState<"signIn" | "signOut" | "connectProvider" | "limitReset" | null>(null);
+  /** The one provider a per-provider runtime's (Pi's) Sign Out is for. */
+  const [signOutProvider, setSignOutProvider] = useState<RuntimeAuthSignedInProvider | null>(null);
+  const perProvider = authRuntime !== null && runtimeAuthSignsInPerProvider(authRuntime);
   const { formatMessage } = useIntl();
-  const provider = usageProviderForRuntime(runtimeId);
-  const mobile = useMediaQuery("(max-width: 767px)");
-  const [open, setOpen] = useState(false);
+  // The subject a limit-reset key or note belongs to: another Computer or
+  // provider in the same card never inherits either. The attempt's key
+  // (limitResetAttemptKey) is kept while its outcome is unknown, so a retry
+  // sends it again and never spends a second reset.
+  const limitResetSubject = `${serverId}\0${machineId}\0${provider ?? ""}`;
+  const [limitResetNote, setLimitResetNote] = useState<{ subject: string; text: string } | null>(null);
+  const [limitResetTarget, setLimitResetTarget] = useState<{ subject: string; key: RuntimeLimitResetIdempotencyKey; account: string | null; resets: number } | null>(null);
   const [result, setResult] = useState<RuntimeAccountUsageReadResult | null>(null);
   const [loading, setLoading] = useState(false);
   const [loadError, setLoadError] = useState(false);
@@ -309,55 +131,18 @@ export default function RuntimeAccountUsageChip({
   // Task #704: the refresh window (2 minutes, shared by the panel's own
   // auto-refresh) drives the footer countdown. The remaining time is derived
   // during render from the client's window; the ticker only forces the
-  // re-render that makes it drain.
+  // re-render that makes it drain, so it runs only while the card is shown.
   const [, setCooldownTick] = useState(0);
   useEffect(() => {
-    if (!provider) return;
+    if (!visible) return;
     const ticker = setInterval(() => setCooldownTick((tick) => tick + 1), 1_000);
     return () => clearInterval(ticker);
-  }, [provider, serverId, machineId]);
-  const cooldownLeftMs = provider
-    ? client.refreshCooldownRemainingMs(serverId, machineId, provider)
-    : 0;
-  const triggerRef = useRef<HTMLButtonElement | null>(null);
-  const popoverRef = useRef<HTMLDivElement | null>(null);
-  const openTimerRef = useRef<ReturnType<typeof setClockTimeout> | null>(null);
-  const closeTimerRef = useRef<ReturnType<typeof setClockTimeout> | null>(null);
+  }, [visible, provider, serverId, machineId]);
+  const cooldownLeftMs = provider ? client.refreshCooldownRemainingMs(serverId, machineId, provider) : 0;
   const rereadTimerRef = useRef<ReturnType<typeof setClockTimeout> | null>(null);
   const mountedRef = useRef(true);
-  const pinnedRef = useRef(false);
-  // Render-side mirror of pinnedRef: only a PINNED card is an outside-press
-  // dismiss layer. Hover / focus-open closes on mouse-out, and the card keeps
-  // role="dialog" in both states, so the unpinned card must opt OUT explicitly
-  // (data-dismiss-layer="false") or a host's role fallback would treat it as an
-  // open layer while the user merely hovers.
-  //
-  // The pin's identity is the SUBJECT the effect below re-keys on — client,
-  // machineId, provider, serverId (the transitive deps of readSnapshot /
-  // requestBackgroundRefresh) — the very same rule that resets pinnedRef there.
-  // The pin stores the subject it was made under; during render any difference
-  // (a machine switch, an A→B→A round trip, a client swap alone) invalidates it
-  // and clears the stored pin (React's documented "adjust state during render"
-  // for prop-driven resets), so a stale pin can never come back and the marker
-  // and the ref never disagree. No Effect adjusts state.
-  const [pinnedFor, setPinnedFor] = useState<{ client: typeof client; machineId: string; provider: typeof provider; serverId: string } | null>(null);
-  const pinned =
-    pinnedFor !== null &&
-    pinnedFor.client === client &&
-    pinnedFor.machineId === machineId &&
-    pinnedFor.provider === provider &&
-    pinnedFor.serverId === serverId;
-  if (pinnedFor !== null && !pinned) setPinnedFor(null);
   const pollGenerationRef = useRef(0);
   const subjectGenerationRef = useRef(0);
-
-  const { style: popoverStyle } = useViewportClamp({
-    triggerRef,
-    popoverRef,
-    placement: "vertical-smart",
-    open: open && !mobile,
-    gutter: 8,
-  });
 
   const readSnapshot = useCallback(async (subjectGeneration = subjectGenerationRef.current) => {
     if (!provider) return null;
@@ -376,7 +161,6 @@ export default function RuntimeAccountUsageChip({
   }, [client, machineId, provider, serverId]);
 
   const startFollowUpReads = useCallback((subjectGeneration = subjectGenerationRef.current) => {
-    if (!provider) return;
     const generation = ++pollGenerationRef.current;
     let attempt = 0;
 
@@ -394,7 +178,7 @@ export default function RuntimeAccountUsageChip({
       rereadTimerRef.current = setClockTimeout(() => {
         rereadTimerRef.current = null;
         attempt += 1;
-        client.invalidate(serverId, machineId, provider);
+        if (provider) client.invalidate(serverId, machineId, provider);
         void readSnapshot(subjectGeneration).then((next) => {
           if (
             !next
@@ -431,7 +215,6 @@ export default function RuntimeAccountUsageChip({
   useEffect(() => {
     const subjectGeneration = ++subjectGenerationRef.current;
     mountedRef.current = true;
-    pinnedRef.current = false;
     void readSnapshot(subjectGeneration).then((next) => {
       if (subjectGenerationRef.current !== subjectGeneration) return;
       if (next?.state === "stale" || next?.state === "missing") {
@@ -442,62 +225,10 @@ export default function RuntimeAccountUsageChip({
       mountedRef.current = false;
       subjectGenerationRef.current += 1;
       pollGenerationRef.current += 1;
-      if (openTimerRef.current) clearClockTimeout(openTimerRef.current);
-      if (closeTimerRef.current) clearClockTimeout(closeTimerRef.current);
       if (rereadTimerRef.current) clearClockTimeout(rereadTimerRef.current);
     };
   }, [readSnapshot, requestBackgroundRefresh]);
 
-  const cancelClose = useCallback(() => {
-    if (closeTimerRef.current) clearClockTimeout(closeTimerRef.current);
-    closeTimerRef.current = null;
-  }, []);
-  const cancelHoverOpen = useCallback(() => {
-    if (openTimerRef.current) clearClockTimeout(openTimerRef.current);
-    openTimerRef.current = null;
-  }, []);
-  const closeSoon = useCallback(() => {
-    cancelClose();
-    closeTimerRef.current = setClockTimeout(() => {
-      if (!pinnedRef.current) setOpen(false);
-    }, HOVER_CLOSE_DELAY_MS);
-  }, [cancelClose]);
-  const openNow = useCallback(() => {
-    cancelClose();
-    setOpen(true);
-    void readSnapshot();
-  }, [cancelClose, readSnapshot]);
-  const pinOpen = useCallback(() => {
-    pinnedRef.current = true;
-    setPinnedFor({ client, machineId, provider, serverId });
-    openNow();
-  }, [client, machineId, openNow, provider, serverId]);
-  const closeSurface = useCallback(() => {
-    pinnedRef.current = false;
-    setPinnedFor(null);
-    cancelClose();
-    cancelHoverOpen();
-    setOpen(false);
-  }, [cancelClose, cancelHoverOpen]);
-  const openAfterHover = useCallback(() => {
-    cancelClose();
-    if (openTimerRef.current) clearClockTimeout(openTimerRef.current);
-    openTimerRef.current = setClockTimeout(openNow, HOVER_OPEN_DELAY_MS);
-  }, [cancelClose, openNow]);
-  const handleMouseEnter = useCallback(() => {
-    if (!mobile) openAfterHover();
-  }, [mobile, openAfterHover]);
-  const handleMouseLeave = useCallback(() => {
-    if (mobile) return;
-    cancelHoverOpen();
-    closeSoon();
-  }, [cancelHoverOpen, closeSoon, mobile]);
-  const handleFocus = useCallback(() => {
-    if (!mobile) openNow();
-  }, [mobile, openNow]);
-  const handleBlur = useCallback(() => {
-    if (!mobile) closeSoon();
-  }, [closeSoon, mobile]);
   const refresh = useCallback(async () => {
     if (!provider) return;
     const subjectGeneration = subjectGenerationRef.current;
@@ -528,8 +259,317 @@ export default function RuntimeAccountUsageChip({
     }
   }, [client, machineId, provider, serverId, startFollowUpReads]);
   const handleRefresh = useCallback(() => {
+    setLimitResetNote(null);
     void refresh();
   }, [refresh]);
+
+  // The account whose reset the button spends (Codex reports one account).
+  // Claude's resets are used by kind (useClaudeLimitResets), never through this kind-less action.
+  const resetAccount = provider && provider !== "claude" && result && result.snapshot !== null
+    ? result.snapshot.accounts.find((account) => (account.limitResetsAvailable ?? 0) > 0) ?? null
+    : null;
+  const openLimitReset = useCallback(() => {
+    if (!resetAccount) return;
+    // Fixed for the dialog's life: the usage read after an outcome may change the count under it.
+    setLimitResetTarget({
+      subject: limitResetSubject,
+      key: limitResetAttemptKey(limitResetSubject),
+      account: resetAccount.maskedLabel ?? resetAccount.displayName ?? null,
+      resets: resetAccount.limitResetsAvailable ?? 0,
+    });
+    onAuthDialog?.();
+    setAuthDialog("limitReset");
+  }, [limitResetSubject, onAuthDialog, resetAccount]);
+  // Never assume the limits recovered: show the usage the Computer read
+  // right after the redeem, or read it again.
+  const showUsageAfterReset = useCallback((outcome: RuntimeLimitResetOutcome) => {
+    if (!provider) return;
+    if (outcome.snapshot) {
+      client.storeSnapshot(serverId, machineId, provider, outcome.snapshot);
+      pollGenerationRef.current += 1;
+      setLoadError(false);
+      setResult({ state: "fresh", snapshot: outcome.snapshot });
+      setRefreshState("idle");
+    } else {
+      void refresh();
+    }
+  }, [client, machineId, provider, refresh, serverId]);
+  const handleLimitResetOutcome = useCallback((outcome: RuntimeLimitResetOutcome) => {
+    if (limitResetOutcomeIsSettled(outcome.result)) forgetLimitResetAttemptKey(limitResetSubject);
+    const noteId = outcome.result ? limitResetNoteMessageId(outcome.result) : null;
+    setLimitResetNote(noteId ? { subject: limitResetSubject, text: formatMessage({ id: noteId }) } : null);
+    showUsageAfterReset(outcome);
+  }, [formatMessage, limitResetSubject, showUsageAfterReset]);
+  const canActOnRuntimes = authView?.canAct === true && authView.availability === "ok";
+  const noteClaude = useCallback((text: string) => setLimitResetNote({ subject: limitResetSubject, text }), [limitResetSubject]);
+  // Claude limit resets by kind (claude_limit_reset): the card's actions and their dialogs.
+  const claude = useClaudeLimitResets({
+    serverId, machineId, provider, result, authView, authStatus, canActOnRuntimes,
+    limitResetSubject, authClient, onAuthDialog, refresh, showUsageAfterReset, onNote: noteClaude,
+  });
+
+  const surfaceLimitReset = useMemo<SurfaceLimitReset | null>(
+    () => (resetAccount && canActOnRuntimes && authStatus?.kind !== "logged_out"
+      ? {
+          primary: resetAccount.health === "rate_limited" || resetAccount.windows.some((window) => window.status === "limit_reached"),
+          onUse: openLimitReset,
+        }
+      : null),
+    [authStatus?.kind, canActOnRuntimes, openLimitReset, resetAccount],
+  );
+  const note = limitResetNote?.subject === limitResetSubject ? limitResetNote.text : null;
+  // The dialog takes over from the card: close the card so it does not float above it.
+  const openSignIn = useCallback(() => {
+    onAuthDialog?.();
+    setAuthDialog("signIn");
+  }, [onAuthDialog]);
+  const openSignOut = useCallback(() => {
+    onAuthDialog?.();
+    setSignOutProvider(null);
+    setAuthDialog("signOut");
+  }, [onAuthDialog]);
+  const openSignOutProvider = useCallback((target: RuntimeAuthSignedInProvider) => {
+    onAuthDialog?.();
+    setSignOutProvider(target);
+    setAuthDialog("signOut");
+  }, [onAuthDialog]);
+  const openConnectProvider = useCallback(() => {
+    onAuthDialog?.();
+    setAuthDialog("connectProvider");
+  }, [onAuthDialog]);
+  const closeAuthDialog = useCallback(() => setAuthDialog(null), []);
+  const surfaceAuth = useMemo<SurfaceAuth | null>(
+    () => (authRuntime && authView
+      ? { runtime: authRuntime, status: authStatus, view: authView, onSignIn: openSignIn, onSignOut: openSignOut, onConnectProvider: openConnectProvider, onSignOutProvider: openSignOutProvider }
+      : null),
+    [authRuntime, authStatus, authView, openConnectProvider, openSignIn, openSignOut, openSignOutProvider],
+  );
+
+  const surface = (
+    <RuntimeUsageSurface
+      runtimeId={runtimeId}
+      provider={provider}
+      runtimeVersion={runtimeVersion}
+      result={result}
+      loading={loading}
+      loadError={loadError}
+      refreshState={refreshState}
+      cooldownLeftMs={cooldownLeftMs}
+      onRefresh={handleRefresh}
+      onClose={onClose}
+      auth={surfaceAuth}
+      runtimeName={getRuntimeDisplayName(runtimeId)}
+      limitReset={surfaceLimitReset}
+      claudeLimitReset={claude.surface}
+      note={note}
+      readiness={readiness}
+    />
+  );
+  const authDialogs = authRuntime ? (
+    <>
+      {authDialog === "signIn" && perProvider && (
+        <PiSignInDialog
+          serverId={serverId}
+          machineId={machineId}
+          runtimeId={runtimeId}
+          runtime={authRuntime}
+          client={authClient}
+          onClose={closeAuthDialog}
+        />
+      )}
+      {authDialog === "signIn" && !perProvider && (
+        <RuntimeSignInDialog
+          serverId={serverId}
+          machineId={machineId}
+          runtimeId={runtimeId}
+          runtime={authRuntime}
+          client={authClient}
+          onClose={closeAuthDialog}
+        />
+      )}
+      {authDialog === "signOut" && (!perProvider || signOutProvider) && (
+        <RuntimeSignOutDialog
+          serverId={serverId}
+          machineId={machineId}
+          runtimeId={runtimeId}
+          runtime={authRuntime}
+          client={authClient}
+          onClose={closeAuthDialog}
+          {...(perProvider && signOutProvider ? { provider: signOutProvider } : {})}
+        />
+      )}
+      {authDialog === "connectProvider" && (
+        <RuntimeProviderConnectDialog
+          serverId={serverId}
+          machineId={machineId}
+          runtimeId={runtimeId}
+          runtime={authRuntime}
+          client={authClient}
+          onClose={closeAuthDialog}
+        />
+      )}
+      {authDialog === "limitReset" && provider && limitResetTarget?.subject === limitResetSubject && (
+        <RuntimeLimitResetDialog
+          serverId={serverId}
+          machineId={machineId}
+          runtimeId={runtimeId}
+          provider={provider}
+          account={limitResetTarget.account}
+          resetsAvailable={limitResetTarget.resets}
+          idempotencyKey={limitResetTarget.key}
+          client={authClient}
+          onOutcome={handleLimitResetOutcome}
+          onClose={closeAuthDialog}
+        />
+      )}
+      {claude.dialogs}
+    </>
+  ) : null;
+  // Signed out on the Computer; a provider-key runtime's presence-only "not configured" does not count,
+  // nor Pi with no stored sign-in (a key in the environment or its models.json may still serve it).
+  const signedOut = authStatus?.kind === "logged_out" && authRuntime !== null && !hasProviderKey(authRuntime) && !perProvider;
+  return { result, authRuntime, authStatus, signedOut, readSnapshot, rereadAuth, surface, authDialogs };
+}
+
+/** What a card's trigger gets: wire these onto the trigger element. */
+export interface RuntimeUsageTriggerProps {
+  ref: RefObject<HTMLButtonElement | null>;
+  "aria-haspopup": "dialog";
+  "aria-expanded": boolean;
+  onMouseEnter: () => void;
+  onMouseLeave: () => void;
+  onFocus: () => void;
+  onBlur: () => void;
+  onClick: () => void;
+}
+
+/** What the card knows, for a trigger that shows it. */
+export interface RuntimeUsageTriggerState {
+  result: RuntimeAccountUsageReadResult | null;
+  /** Signed out on the Computer. */
+  signedOut: boolean;
+  /** Signed out, stale, or an account or window not ok. */
+  attention: boolean;
+}
+
+/**
+ * The usage card as a hover card on a trigger the caller draws: hover opens
+ * it after 200ms and leaving closes it 160ms later, focus opens it, a click
+ * pins it (outside press or Escape closes). On a phone a tap opens it as a
+ * bottom sheet. The runtime chip and the rack's usage meters are its triggers.
+ */
+export function RuntimeUsageHoverCard({
+  renderTrigger,
+  client = runtimeAccountUsageClient,
+  authClient = runtimeAuthClient,
+  ...rest
+}: RuntimeUsageCardProps & {
+  renderTrigger: (props: RuntimeUsageTriggerProps, state: RuntimeUsageTriggerState) => ReactNode;
+}) {
+  const { formatMessage } = useIntl();
+  const subject = { ...rest, client, authClient };
+  const { machineId, provider, serverId, runtimeId } = subject;
+  const mobile = useMediaQuery("(max-width: 767px)");
+  const [open, setOpen] = useState(false);
+  const triggerRef = useRef<HTMLButtonElement | null>(null);
+  const popoverRef = useRef<HTMLDivElement | null>(null);
+  const openTimerRef = useRef<ReturnType<typeof setClockTimeout> | null>(null);
+  const closeTimerRef = useRef<ReturnType<typeof setClockTimeout> | null>(null);
+  const pinnedRef = useRef(false);
+  // Render-side mirror of pinnedRef: only a PINNED card is an outside-press
+  // dismiss layer. Hover / focus-open closes on mouse-out, and the card keeps
+  // role="dialog" in both states, so the unpinned card must opt OUT explicitly
+  // (data-dismiss-layer="false") or a host's role fallback would treat it as an
+  // open layer while the user merely hovers.
+  //
+  // The pin's identity is the SUBJECT the effect below re-keys on — client,
+  // machineId, provider, serverId (the transitive deps of the card's reads) —
+  // the very same rule that resets pinnedRef there.
+  // The pin stores the subject it was made under; during render any difference
+  // (a machine switch, an A→B→A round trip, a client swap alone) invalidates it
+  // and clears the stored pin (React's documented "adjust state during render"
+  // for prop-driven resets), so a stale pin can never come back and the marker
+  // and the ref never disagree. No Effect adjusts state.
+  const [pinnedFor, setPinnedFor] = useState<{ client: typeof client; machineId: string; provider: typeof provider; serverId: string } | null>(null);
+  const pinned =
+    pinnedFor !== null &&
+    pinnedFor.client === client &&
+    pinnedFor.machineId === machineId &&
+    pinnedFor.provider === provider &&
+    pinnedFor.serverId === serverId;
+  if (pinnedFor !== null && !pinned) setPinnedFor(null);
+
+  const { style: popoverStyle } = useViewportClamp({
+    triggerRef,
+    popoverRef,
+    placement: "vertical-smart",
+    open: open && !mobile,
+    gutter: 8,
+  });
+
+  const cancelClose = useCallback(() => {
+    if (closeTimerRef.current) clearClockTimeout(closeTimerRef.current);
+    closeTimerRef.current = null;
+  }, []);
+  const cancelHoverOpen = useCallback(() => {
+    if (openTimerRef.current) clearClockTimeout(openTimerRef.current);
+    openTimerRef.current = null;
+  }, []);
+  const closeSurface = useCallback(() => {
+    pinnedRef.current = false;
+    setPinnedFor(null);
+    cancelClose();
+    cancelHoverOpen();
+    setOpen(false);
+  }, [cancelClose, cancelHoverOpen]);
+
+  const card = useRuntimeUsageCard({ ...subject, visible: open, onClose: closeSurface, onAuthDialog: closeSurface });
+  const { readSnapshot, rereadAuth } = card;
+
+  useEffect(() => {
+    pinnedRef.current = false;
+    return () => {
+      if (openTimerRef.current) clearClockTimeout(openTimerRef.current);
+      if (closeTimerRef.current) clearClockTimeout(closeTimerRef.current);
+    };
+  }, [client, machineId, provider, serverId]);
+
+  const closeSoon = useCallback(() => {
+    cancelClose();
+    closeTimerRef.current = setClockTimeout(() => {
+      if (!pinnedRef.current) setOpen(false);
+    }, HOVER_CLOSE_DELAY_MS);
+  }, [cancelClose]);
+  const openNow = useCallback(() => {
+    cancelClose();
+    setOpen(true);
+    void readSnapshot();
+    rereadAuth();
+  }, [cancelClose, readSnapshot, rereadAuth]);
+  const pinOpen = useCallback(() => {
+    pinnedRef.current = true;
+    setPinnedFor({ client, machineId, provider, serverId });
+    openNow();
+  }, [client, machineId, openNow, provider, serverId]);
+  const openAfterHover = useCallback(() => {
+    cancelClose();
+    if (openTimerRef.current) clearClockTimeout(openTimerRef.current);
+    openTimerRef.current = setClockTimeout(openNow, HOVER_OPEN_DELAY_MS);
+  }, [cancelClose, openNow]);
+  const handleMouseEnter = useCallback(() => {
+    if (!mobile) openAfterHover();
+  }, [mobile, openAfterHover]);
+  const handleMouseLeave = useCallback(() => {
+    if (mobile) return;
+    cancelHoverOpen();
+    closeSoon();
+  }, [cancelHoverOpen, closeSoon, mobile]);
+  const handleFocus = useCallback(() => {
+    if (!mobile) openNow();
+  }, [mobile, openNow]);
+  const handleBlur = useCallback(() => {
+    if (!mobile) closeSoon();
+  }, [closeSoon, mobile]);
 
   useEffect(() => {
     if (!open || mobile) return;
@@ -540,57 +580,145 @@ export default function RuntimeAccountUsageChip({
       if (triggerRef.current?.contains(target) || popoverRef.current?.contains(target)) return;
       closeSurface();
     };
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && pinnedRef.current) closeSurface();
-    };
     document.addEventListener("pointerdown", onPointerDown);
-    // keydown-global-exempt: Escape closes only this pinned runtime-usage surface.
-    document.addEventListener("keydown", onKeyDown);
     return () => {
       document.removeEventListener("pointerdown", onPointerDown);
-      document.removeEventListener("keydown", onKeyDown);
     };
   }, [closeSurface, mobile, open]);
+  // Esc closes only this surface, and only while it is pinned: a layer on the registry's stack while open.
+  useShortcutLayer("menu", open && !mobile, { onEscape: () => (pinnedRef.current ? void closeSurface() : false), ignoreDefaultPrevented: true });
+  // On a phone the card is a raft-ui bottom sheet (Drawer): Base UI's Esc, scrim press, swipe down, focus trap and
+  // return; a modal layer of the shortcut registry while it is open.
+  const sheetOpen = open && mobile;
+  useOverlayLayer(sheetOpen);
+  const sheetRef = useRef<HTMLDivElement | null>(null);
+  const handleSheetOpenChange = useCallback((next: boolean) => { if (!next) closeSurface(); }, [closeSurface]);
 
-  if (!provider) {
-    return <Badge appearance={appearance} variant={variant} className={runtimeBadgeClassName(className)}>{children}</Badge>;
-  }
+  // Signed out on the Computer is attention even when the last usage looked fine.
+  const { signedOut } = card;
+  const attention = signedOut || (card.result ? isAttention(card.result) : false);
 
-  const surface = (
-    <Surface
-      provider={provider}
-      runtimeVersion={runtimeVersion}
-      result={result}
-      loading={loading}
-      loadError={loadError}
-      refreshState={refreshState}
-      cooldownLeftMs={cooldownLeftMs}
-      onRefresh={handleRefresh}
-      onClose={closeSurface}
-    />
-  );
-  const attention = result ? isAttention(result) : false;
-  const hasKnownState = result?.state !== "missing" && result !== null;
-
+  const dialogLabel = formatMessage(
+    {
+      id: provider
+        ? "machine.runtimeUsage.dialogLabel"
+        : card.authRuntime && hasProviderKey(card.authRuntime) ? "machine.runtimeAuth.provider.dialogLabel" : "machine.runtimeAuth.dialogLabel",
+    }, { runtime: getRuntimeDisplayName(runtimeId) });
   return (
     <>
+      {renderTrigger({
+        ref: triggerRef,
+        "aria-haspopup": "dialog",
+        "aria-expanded": open,
+        onMouseEnter: handleMouseEnter,
+        onMouseLeave: handleMouseLeave,
+        onFocus: handleFocus,
+        onBlur: handleBlur,
+        onClick: pinOpen,
+      }, { result: card.result, signedOut, attention })}
+      {card.authDialogs}
+      <Drawer open={sheetOpen} swipeDirection="down" onOpenChange={handleSheetOpenChange}>
+        {/* Named by the card's label, once, on the sheet (the card has its own head and close). Focus starts on the sheet itself, as
+            before, not on the card's first button. The card scrolls in a raft-ui ScrollArea under the sheet's
+            handle, as the desktop popover's does. */}
+        <DrawerContent ref={sheetRef} initialFocus={sheetRef} aria-label={dialogLabel} data-testid="runtime-usage-sheet">
+          <ScrollArea className="min-h-0 flex-1">{card.surface}</ScrollArea>
+        </DrawerContent>
+      </Drawer>
+      {open && !mobile && createPortal(
+        <Card
+          ref={popoverRef}
+          {...(pinned ? dismissLayerProps : notDismissLayerProps)}
+          role="dialog"
+          aria-label={dialogLabel}
+          // A floating surface (Raft DS Popover): popover layer, seam edge, float shadow (the
+          // card recipe alone is an in-flow card). It frames the ScrollArea that scrolls.
+          className="z-popup w-[min(390px,calc(100vw-16px))] border-line-seam bg-layer-popover shadow-float"
+          style={popoverStyle}
+          onMouseEnter={cancelClose}
+          onMouseLeave={closeSoon}
+        >
+          <ScrollArea role="region" aria-label={dialogLabel} className="min-h-0 flex-1">{card.surface}</ScrollArea>
+        </Card>,
+        document.body,
+      )}
+    </>
+  );
+}
+
+/**
+ * The usage card in place, without a trigger or a close of its own: the
+ * rack's list of every runtime's card on a Computer.
+ */
+export function RuntimeUsageCard({
+  client = runtimeAccountUsageClient,
+  authClient = runtimeAuthClient,
+  ...subject
+}: RuntimeUsageCardProps) {
+  const card = useRuntimeUsageCard({ ...subject, client, authClient, visible: true });
+  return (
+    <>
+      {card.surface}
+      {card.authDialogs}
+    </>
+  );
+}
+
+export default function RuntimeAccountUsageChip({
+  runtimeId,
+  runtimeVersion,
+  serverId,
+  machineId,
+  children,
+  className = "",
+  appearance = "solid",
+  variant = "default",
+  client = runtimeAccountUsageClient,
+  authClient = runtimeAuthClient,
+}: {
+  runtimeId: string;
+  runtimeVersion?: string | null;
+  serverId: string;
+  machineId: string;
+  children: ReactNode;
+  className?: string;
+  client?: RuntimeAccountUsageClient;
+  authClient?: RuntimeAuthClient;
+} & RuntimeBadgeAppearance) {
+  const { formatMessage } = useIntl();
+  // A runtime the server offers only where its flag revives it (Antigravity)
+  // gets a card (its usage too) only once the server lists it for this
+  // Computer: elsewhere its badge stays as it was. The read is the card's own, cached per Computer.
+  const authRuntime = runtimeAuthRuntimeFor(runtimeId);
+  const serverGated = authRuntime !== null && isRuntimeAuthServerGated(authRuntime);
+  const { view: gateView } = useRuntimeAuthView(authClient, serverId, machineId, serverGated);
+  const offered = authRuntime !== null && (!serverGated || (gateView !== null && runtimeAuthComputerSupports(gateView, authRuntime)));
+  const provider = serverGated && !offered ? null : usageProviderForRuntime(runtimeId);
+  // #proj-raft-computer:#68: a runtime that can't work here reads its readiness first; usage stays in the card.
+  const readiness = useMachineRuntimeReadiness(machineId, runtimeId);
+  const held = readinessHolds(readiness);
+  const readinessSuffix = held ? formatMessage({ id: "readiness.runtimeSuffix" }, { title: formatReadiness(formatMessage, readiness, runtimeId).title }) : "";
+  const renderTrigger = useCallback((trigger: RuntimeUsageTriggerProps, { result, signedOut, attention }: RuntimeUsageTriggerState) => {
+    const name = typeof children === "string" ? children : getRuntimeDisplayName(runtimeId);
+    // Signed out on the Computer: an orange chip that says so in words. A
+    // status light is for presence and task status, not for a runtime's
+    // sign-in (Raft DS Status), so this chip carries no dot.
+    const signedOutSuffix = readinessSuffix ? "" : signedOut ? formatMessage({ id: "runtime.availability.notSignedIn" }) : "";
+    const warn = Boolean(readinessSuffix) || signedOut;
+    return (
       <Badge
-        ref={triggerRef}
+        {...trigger}
         render={<button type="button" />}
         appearance={appearance}
-        variant={variant}
+        variant={warn ? "warning" : variant}
         className={`${runtimeBadgeClassName(className)} relative cursor-help outline-none focus-visible:shadow-focus`}
-        aria-haspopup="dialog"
-        aria-expanded={open}
-        aria-label={typeof children === "string" ? children : providerName(provider)}
-        onMouseEnter={handleMouseEnter}
-        onMouseLeave={handleMouseLeave}
-        onFocus={handleFocus}
-        onBlur={handleBlur}
-        onClick={pinOpen}
+        aria-label={name + (readinessSuffix || signedOutSuffix)}
+        data-signed-out={signedOut ? "" : undefined}
+        data-readiness-code={held ? readiness.primary?.code ?? "hidden" : undefined}
       >
         {children}
-        {hasKnownState && (
+        {readinessSuffix || signedOutSuffix}
+        {!warn && result !== null && result.snapshot !== null && (
           <Status
             data-testid={`runtime-usage-health-${provider}`}
             size="sm"
@@ -600,29 +728,23 @@ export default function RuntimeAccountUsageChip({
           />
         )}
       </Badge>
-      {open && mobile && (
-        <BottomSheet onClose={closeSurface} sheetClassName="max-h-[82vh] overflow-y-auto">
-          {surface}
-        </BottomSheet>
-      )}
-      {open && !mobile && createPortal(
-        <Card
-          ref={popoverRef}
-          {...(pinned ? dismissLayerProps : notDismissLayerProps)}
-          role="dialog"
-          aria-label={formatMessage({ id: "machine.runtimeUsage.dialogLabel" }, { provider: providerName(provider) })}
-          // A floating surface (Raft DS Popover): popover layer, seam edge,
-          // float shadow — the card recipe alone is an in-flow card.
-          className="z-[70] w-[min(390px,calc(100vw-16px))] overflow-y-auto border-line-seam bg-layer-popover shadow-float"
-          style={popoverStyle}
-          onMouseEnter={cancelClose}
-          onMouseLeave={closeSoon}
-        >
-          {surface}
-        </Card>,
-        document.body,
-      )}
-    </>
+    );
+  }, [appearance, children, className, formatMessage, held, provider, readiness, readinessSuffix, runtimeId, variant]);
+  // A runtime with neither usage nor a sign-in offered here has no card.
+  if (!provider && !offered) {
+    return <Badge appearance={appearance} variant={held ? "warning" : variant} className={runtimeBadgeClassName(className)} data-readiness-code={held ? readiness.primary?.code ?? "hidden" : undefined}>{children}{readinessSuffix}</Badge>;
+  }
+  return (
+    <RuntimeUsageHoverCard
+      runtimeId={runtimeId}
+      provider={provider}
+      runtimeVersion={runtimeVersion}
+      serverId={serverId}
+      machineId={machineId}
+      client={client}
+      authClient={authClient}
+      renderTrigger={renderTrigger}
+    />
   );
 }
 
@@ -637,6 +759,7 @@ export function RuntimeAccountUsageGateChip({
   appearance = "solid",
   variant = "default",
   client,
+  authClient,
 }: {
   enabled: boolean;
   runtimeId: string;
@@ -646,6 +769,7 @@ export function RuntimeAccountUsageGateChip({
   children: ReactNode;
   className?: string;
   client?: RuntimeAccountUsageClient;
+  authClient?: RuntimeAuthClient;
 } & RuntimeBadgeAppearance) {
   if (!enabled || !serverId) {
     return (
@@ -664,10 +788,10 @@ export function RuntimeAccountUsageGateChip({
       appearance={appearance}
       variant={variant}
       client={client}
+      authClient={authClient}
     >
       {children}
     </RuntimeAccountUsageChip>
   );
 }
 
-export { usageProviderForRuntime };

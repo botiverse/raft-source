@@ -5,13 +5,12 @@ import { normalizeTranslationLanguageCode, visitOutsideMarkdownCode, type Server
 import { getDb } from "../db/index";
 import { channels, messages, messageTranslations, servers } from "../db/schema";
 import * as channelService from "./channelService";
-import { evaluateFeatureFlag, LLM_TRANSLATION_FEATURE_FLAG_KEY } from "./featureFlagService";
+import { getServerHistoryWindowForRead, isBehindHistoryWindow } from "./historyWindow";
 import { addTraceEvent, errorClassOf } from "../tracing/semanticTrace";
 import {
   AzureTranslationProvider,
   bracePlaceholderPolicy,
   GoogleTranslationProvider,
-  OpenAICompatibleTranslationProvider,
   parseGoogleServiceAccountJson,
   TranslationPlaceholderValidationError,
   TranslationProviderError,
@@ -20,11 +19,6 @@ import {
   type TranslationProviderVersion,
   VolcengineTranslationProvider,
 } from "./translation/index";
-import {
-  CachedTranslationSsmConfig,
-  createAwsTranslationSsmReader,
-  translationSsmIsConfigured,
-} from "./translation/ssmConfig";
 
 export type TranslationMode = "auto" | "manual";
 export type TranslationStatus = "translated" | "skipped" | "pending" | "failed" | "not_found";
@@ -81,55 +75,9 @@ export type ResolvedTranslationProvider = {
   placeholderPolicyVersion: string;
 };
 
-export class TranslationFeatureUnavailableError extends Error {
-  override readonly name = "TranslationFeatureUnavailableError";
-
-  constructor(readonly reason: "feature_disabled" | "plan_required") {
-    super("LLM translation is not available for this server");
-  }
-}
-
 type MessageTranslationServiceDeps = {
   resolveProvider(): ResolvedTranslationProvider | Promise<ResolvedTranslationProvider>;
 };
-
-const translationSsmConfig = new CachedTranslationSsmConfig(createAwsTranslationSsmReader());
-
-function openAICompatibleProviderFromSsm(config: { apiKey: string; endpoint: string; model: string }): ResolvedTranslationProvider {
-  return {
-    provider: new OpenAICompatibleTranslationProvider({
-      apiKey: config.apiKey,
-      model: config.model,
-      endpoint: config.endpoint,
-      placeholderPolicy: bracePlaceholderPolicy,
-    }),
-    placeholderPolicyVersion: bracePlaceholderPolicy.name,
-  };
-}
-
-export async function initializeTranslationProviderConfig(): Promise<void> {
-  if (!translationSsmIsConfigured()) return;
-  const config = await translationSsmConfig.get();
-  if (config.provider !== "openai-compatible") {
-    throw new Error("translation SSM provider must be openai-compatible");
-  }
-  openAICompatibleProviderFromSsm(config);
-}
-
-export function invalidateTranslationProviderConfigForTests(): void {
-  translationSsmConfig.invalidate();
-}
-
-export async function resolveProviderFromRuntimeConfig(): Promise<ResolvedTranslationProvider> {
-  if (translationSsmIsConfigured()) {
-    const config = await translationSsmConfig.get();
-    if (config.provider !== "openai-compatible") {
-      throw new Error("translation SSM provider must be openai-compatible");
-    }
-    return openAICompatibleProviderFromSsm(config);
-  }
-  return resolveProviderFromEnv();
-}
 
 type ProviderQueueItem = {
   resultIndex: number;
@@ -215,6 +163,9 @@ export function providerInfoFromResolved(input: ResolvedTranslationProvider): Le
 }
 
 export function resolveProviderFromEnv(): ResolvedTranslationProvider {
+  if (process.env.TRANSLATION_SSM_ENVIRONMENT?.trim()) {
+    throw new Error("Translation SSM configuration is no longer supported");
+  }
   const configuredProvider = process.env.TRANSLATION_PROVIDER?.trim().toLowerCase();
   if (configuredProvider === "fake") {
     return {
@@ -272,24 +223,8 @@ export function resolveProviderFromEnv(): ResolvedTranslationProvider {
     };
   }
 
-  if (configuredProvider === "openai-compatible") {
-    if (process.env.NODE_ENV === "production") {
-      throw new Error("OpenAICompatible translation in production requires TRANSLATION_SSM_ENVIRONMENT");
-    }
-    const apiKey = process.env.TRANSLATION_OPENAI_COMPATIBLE_API_KEY?.trim();
-    const model = process.env.TRANSLATION_OPENAI_COMPATIBLE_MODEL?.trim();
-    if (!apiKey || !model) {
-      throw new Error("OpenAICompatible translation provider is not configured. Set TRANSLATION_OPENAI_COMPATIBLE_API_KEY and TRANSLATION_OPENAI_COMPATIBLE_MODEL.");
-    }
-    return {
-      provider: new OpenAICompatibleTranslationProvider({
-        apiKey,
-        model,
-        endpoint: process.env.TRANSLATION_OPENAI_COMPATIBLE_ENDPOINT?.trim(),
-        placeholderPolicy: bracePlaceholderPolicy,
-      }),
-      placeholderPolicyVersion: bracePlaceholderPolicy.name,
-    };
+  if (configuredProvider && configuredProvider !== "azure") {
+    throw new Error("Unsupported translation provider");
   }
 
   const endpoint = process.env.TRANSLATION_AZURE_ENDPOINT?.trim();
@@ -310,7 +245,7 @@ export function resolveProviderFromEnv(): ResolvedTranslationProvider {
 }
 
 export function isTranslationProviderConfigured(env: NodeJS.ProcessEnv = process.env): boolean {
-  if (translationSsmIsConfigured(env)) return true;
+  if (env.TRANSLATION_SSM_ENVIRONMENT?.trim()) return false;
   const configuredProvider = env.TRANSLATION_PROVIDER?.trim().toLowerCase();
   if (configuredProvider === "fake") {
     return true;
@@ -327,16 +262,13 @@ export function isTranslationProviderConfigured(env: NodeJS.ProcessEnv = process
     return Boolean(env.TRANSLATION_GOOGLE_PROJECT_ID?.trim()
       && (env.TRANSLATION_GOOGLE_ACCESS_TOKEN?.trim() || hasServiceAccountJson || hasServiceAccountFields));
   }
-  if (configuredProvider === "openai-compatible") {
-    if (env.NODE_ENV === "production") return false;
-    return Boolean(env.TRANSLATION_OPENAI_COMPATIBLE_API_KEY?.trim() && env.TRANSLATION_OPENAI_COMPATIBLE_MODEL?.trim());
-  }
+  if (configuredProvider && configuredProvider !== "azure") return false;
 
   return Boolean(env.TRANSLATION_AZURE_ENDPOINT?.trim() && env.TRANSLATION_AZURE_API_KEY?.trim());
 }
 
 const defaultMessageTranslationServiceDeps: MessageTranslationServiceDeps = {
-  resolveProvider: resolveProviderFromRuntimeConfig,
+  resolveProvider: resolveProviderFromEnv,
 };
 
 let messageTranslationServiceDeps: MessageTranslationServiceDeps = defaultMessageTranslationServiceDeps;
@@ -704,11 +636,20 @@ export async function translateMessagesBatch(input: {
   mode: TranslationMode;
   messageIds: string[];
 }): Promise<MessageTranslationBatchResult[]> {
-  return translateVisibleMessagesBatch(input, await listVisibleMessages(input));
+  const visible = await listVisibleMessages(input);
+  // A message behind the plan's history window is not this reader's to see,
+  // so not to translate either: it answers like a message that isn't there.
+  const historyWindow = await getServerHistoryWindowForRead(input.serverId);
+  for (const [messageId, message] of visible) {
+    if (isBehindHistoryWindow(message.createdAt, historyWindow)) visible.delete(messageId);
+  }
+  return translateVisibleMessagesBatch(input, visible);
 }
 
 /**
- * Public translation deliberately has its own visibility resolver. It never
+ * Public translation deliberately has its own visibility resolver. Public
+ * server pages are the one marked exception to the plan's history window
+ * (cindyz, task #8: not considered for now). It never
  * calls the member/channel authorization helpers: every request rechecks the
  * public server toggle plus the ordinary-channel (or public parent-thread)
  * predicate in the same query that loads the requested messages.
@@ -782,24 +723,6 @@ async function translateVisibleMessagesBatch(input: {
     mode: input.mode,
     requested_count: input.messageIds.length,
   });
-
-  if (process.env.TRANSLATION_PROVIDER?.trim().toLowerCase() === "openai-compatible" || translationSsmIsConfigured()) {
-    const gate = await evaluateFeatureFlag({
-      key: LLM_TRANSLATION_FEATURE_FLAG_KEY,
-      ...(input.userId ? { userId: input.userId } : {}),
-      serverId: input.serverId,
-    });
-    if (!gate.enabled) {
-      addTraceEvent("translation.skipped", {
-        reason: "feature_gate",
-        target_language: targetLanguage,
-        mode: input.mode,
-        requested_count: input.messageIds.length,
-        feature_flag_reason: gate.reason,
-      });
-      throw new TranslationFeatureUnavailableError(gate.reason === "plan_rule" ? "plan_required" : "feature_disabled");
-    }
-  }
 
   let resolvedProvider: ResolvedTranslationProvider;
   try {

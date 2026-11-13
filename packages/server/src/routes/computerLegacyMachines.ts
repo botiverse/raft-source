@@ -27,16 +27,21 @@
  * (RFC v9.9 §X.4 fresh-attach trigger #1: empty intersection).
  * Already-migrated rows are still returned so an interrupted migration can
  * resume the existing linked Computer through fingerprint adoption.
+ *
+ * Second principal: a computer_migrate grant's migrate token
+ * (`Authorization: Bearer dvmt_*`, migrateTokenAuth.ts). The roster is then
+ * the approver's, for the server they picked only (another `serverSlug`
+ * answers 403 `migrate_token_server_mismatch`); the token is not consumed.
  */
 import { Router, type Router as RouterType } from "express";
-import { requireAuth } from "../middleware/auth";
+import { migrateGrantAllowsServer, migrateGrantOf, migrateTokenOrUserAuth } from "./migrateTokenAuth";
 import { listLegacyMachineRoster } from "../services/legacyMachineService";
 import { isDeviceAuthSurfaceEnabled } from "../services/deviceAuthService";
 import { sendJsonServerError } from "./errorResponse";
 
 export const computerLegacyMachinesRouter: RouterType = Router();
 
-computerLegacyMachinesRouter.get("/legacy-machines", requireAuth, async (req, res) => {
+computerLegacyMachinesRouter.get("/legacy-machines", migrateTokenOrUserAuth, async (req, res) => {
   if (!isDeviceAuthSurfaceEnabled()) {
     res.status(404).json({
       error: "Computer legacy roster is not enabled",
@@ -45,7 +50,8 @@ computerLegacyMachinesRouter.get("/legacy-machines", requireAuth, async (req, re
     return;
   }
   try {
-    const userId = req.userId;
+    const grant = migrateGrantOf(req);
+    const userId = grant ? grant.approverUserId : req.userId;
     if (!userId) {
       res.status(401).json({ error: "Authentication required", code: "auth_required" });
       return;
@@ -58,6 +64,7 @@ computerLegacyMachinesRouter.get("/legacy-machines", requireAuth, async (req, re
       });
       return;
     }
+    if (grant && !migrateGrantAllowsServer(res, grant, serverSlug)) return;
 
     const includeAll = req.query.includeAll === "1" || req.query.includeAll === "true";
     const result = await listLegacyMachineRoster({ userId, serverSlug, includeAll });

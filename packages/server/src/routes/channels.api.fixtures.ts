@@ -10,9 +10,7 @@ import { getDb } from "../db/index";
 import { legacyDoneFrontierFallbacksTotal } from "../metrics";
 import {
   users, servers as serversTable,
-  serverMembers, messages, threadFollows, subscriptions,
-  featureFlags,
-  featureFlagRules
+  serverMembers, messages, threadFollows, subscriptions
 } from "../db/schema";
 import { createServer as createServerService } from "../services/serverService";
 import { createAgent } from "../services/agentService";
@@ -23,7 +21,6 @@ import {
 import {
   recordInboxNotificationFacts
 } from "../services/inboxNotificationService";
-import { READ_RECEIPTS_FEATURE_FLAG_KEY } from "../services/featureFlagService";
 import {
   resolveChannelSuppressionTarget,
   resolveThreadSuppressionTarget,
@@ -143,36 +140,6 @@ export function installFakeIo(app: { set: (key: string, value: unknown) => void 
     },
   });
   return events;
-}
-
-
-export async function enableReadReceiptsForServer(serverId: string): Promise<void> {
-  const db = getDb();
-  await db.insert(featureFlags).values({
-    key: READ_RECEIPTS_FEATURE_FLAG_KEY,
-    description: "test read receipts",
-    enabled: true,
-    killSwitch: false,
-    randomizationUnit: "server",
-    defaultEnabled: false,
-    salt: "read-receipts-test",
-  }).onConflictDoUpdate({
-    target: featureFlags.key,
-    set: {
-      enabled: true,
-      killSwitch: false,
-      randomizationUnit: "server",
-      defaultEnabled: false,
-      salt: "read-receipts-test",
-    },
-  });
-  await db.insert(featureFlagRules).values({
-    flagKey: READ_RECEIPTS_FEATURE_FLAG_KEY,
-    stage: "server",
-    priority: 0,
-    decision: "allow",
-    values: [serverId],
-  });
 }
 
 

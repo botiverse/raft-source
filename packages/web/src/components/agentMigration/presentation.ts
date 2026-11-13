@@ -1,9 +1,10 @@
 import type { IntlShape } from "react-intl";
 import { currentTimeMs } from "@botiverse/raft-shared";
+import type { AgentMigrationSourceDrain, AgentMigrationSourceDrainWaitingFor } from "@botiverse/raft-shared";
 import type { Machine } from "../../store/machineStore";
-import { formatFileSizeBytes } from "../../utils/fileSizePresentation";
 import {
   conventionalAgentWorkspacePath,
+  formatMigrationSize,
   migrationAbortDetailMessageId,
   migrationErrorPresentation,
   migrationFailureCopyCode,
@@ -13,7 +14,13 @@ import {
 import type { MigrationErrorPresentation } from "./errors";
 import type { MessageId } from "../../i18n/messages";
 import type { AgentMigrationNotice } from "./realtime";
-import { isHostedMigration, isHostedReviewPending } from "./state";
+import {
+  isCanceledMigrationState,
+  isCompletedMigrationState,
+  isFailedMigrationState,
+  isHostedMigration,
+  isHostedReviewPending,
+} from "./state";
 
 export function migrationTargetLabel(formatMessage: IntlShape["formatMessage"], machines: Machine[], targetMachineId: string | null | undefined): string {
   if (!targetMachineId) return formatMessage({ id: "agent.detail.unknownComputer" });
@@ -47,6 +54,36 @@ export function hostedArrivalAttentionReason(notice: {
 
 /** The cloud never set the agent up, so Raft put it back on its Computer (terminal `failed`). */
 const HOSTED_AGENT_NOT_CREATED = "HOSTED_AGENT_NOT_CREATED";
+
+/**
+ * How a move between computers ended, when it has: the profile then drops the
+ * Steps for one short line. Moves to the cloud and cancellations that need
+ * attention keep the full panel.
+ */
+export function endedComputerMigration(notice: AgentMigrationNotice): "completed" | "failed" | "canceled" | null {
+  if (isHostedMigration(notice) || notice.cancelNeedsAttention) return null;
+  if (isCompletedMigrationState(notice.state)) return "completed";
+  if (isFailedMigrationState(notice.state)) return "failed";
+  if (isCanceledMigrationState(notice.state)) return "canceled";
+  return null;
+}
+
+/** The pieces of an ended move between computers: where from and to, who started it, and when it ended. */
+export function lastMigrationFacts(
+  formatMessage: IntlShape["formatMessage"],
+  machines: Machine[],
+  notice: AgentMigrationNotice,
+  formatTimestamp: (value: string) => string,
+): { source: string; target: string; startedBy: string | null; endedAt: string | null } {
+  const failed = isFailedMigrationState(notice.state);
+  const endedAt = (failed ? notice.abortedAt : notice.completedAt) ?? notice.updatedAt;
+  return {
+    source: migrationTargetLabel(formatMessage, machines, notice.sourceMachineId),
+    target: migrationNoticeTargetLabel(formatMessage, machines, notice),
+    startedBy: notice.initiatedBy ? notice.initiatedBy.displayName || notice.initiatedBy.name : null,
+    endedAt: endedAt ? formatTimestamp(endedAt) : null,
+  };
+}
 
 /** Where the migration goes: the target computer's name, or the cloud for a move to the cloud. */
 export function migrationNoticeTargetLabel(
@@ -188,11 +225,39 @@ function migrationFailureReasonPresentation(
   }, formatMessage);
 }
 
+/** What the viewer sees the agent as, and their own clock, for copy that names both. */
+export type MigrationViewerCopy = {
+  agentName: string;
+  formatClock: (value: string) => string;
+};
+
+/** Per thing the draining source waits for: the copy with its stop time, and once that time has passed. */
+const SOURCE_DRAIN_MESSAGE_IDS = {
+  turn: { until: "agent.detail.migrationDrainTurn", now: "agent.detail.migrationDrainTurnNow" },
+  background_tasks: { until: "agent.detail.migrationDrainBackgroundTasks", now: "agent.detail.migrationDrainBackgroundTasksNow" },
+  queued_input: { until: "agent.detail.migrationDrainQueuedInput", now: "agent.detail.migrationDrainQueuedInputNow" },
+  other: { until: "agent.detail.migrationDrainOther", now: "agent.detail.migrationDrainOtherNow" },
+} as const satisfies Record<AgentMigrationSourceDrainWaitingFor, { until: MessageId; now: MessageId }>;
+
+/** Why the source has not stopped the agent yet, and by when it will (server-clamped to the drain deadline). */
+function migrationSourceDrainMessage(
+  formatMessage: IntlShape["formatMessage"],
+  drain: AgentMigrationSourceDrain,
+  viewer: MigrationViewerCopy,
+): string {
+  const ids = SOURCE_DRAIN_MESSAGE_IDS[drain.waitingFor ?? "other"];
+  const untilMs = Date.parse(drain.until);
+  // An unparseable `until` reads as passed: the source stops at its deadline anyway.
+  if (!(untilMs > currentTimeMs())) return formatMessage({ id: ids.now }, { agent: viewer.agentName });
+  return formatMessage({ id: ids.until }, { agent: viewer.agentName, time: viewer.formatClock(drain.until) });
+}
+
 function migrationSourceStageMessage(
   formatMessage: IntlShape["formatMessage"],
   notice: AgentMigrationNotice,
   source: string,
   target: string,
+  viewer: MigrationViewerCopy,
 ): string {
   if (notice.transportControlRegisteredAt) {
     return isHostedMigration(notice)
@@ -200,6 +265,14 @@ function migrationSourceStageMessage(
       : formatMessage({ id: "agent.detail.migrationUploading" }, { source, target });
   }
   if (!notice.sourceQuiescedAt) {
+    if (notice.sourceDrain) return migrationSourceDrainMessage(formatMessage, notice.sourceDrain, viewer);
+    // The source first waits (up to the drain deadline) for the agent to be
+    // quiet; after that, or without a deadline, it stops the agent at once.
+    const remainingMs = notice.sourceDrainUntil ? Date.parse(notice.sourceDrainUntil) - currentTimeMs() : Number.NaN;
+    if (remainingMs > 0) {
+      const minutes = Math.max(1, Math.ceil(remainingMs / 60_000));
+      return formatMessage({ id: "agent.detail.migrationWaitingForAgent" }, { source, minutes });
+    }
     return formatMessage({ id: "agent.detail.migrationStoppingSource" }, { source });
   }
   const progress = notice.sourceBuildProgress;
@@ -207,7 +280,7 @@ function migrationSourceStageMessage(
     return formatMessage({ id: "agent.detail.migrationPackingProgress" }, {
       source,
       files: progress.files,
-      size: formatFileSizeBytes(progress.bytes, formatMessage),
+      size: formatMigrationSize(progress.bytes),
     });
   }
   const elapsedMinutes = Math.floor((currentTimeMs() - Date.parse(notice.sourceQuiescedAt)) / 60_000);
@@ -215,6 +288,29 @@ function migrationSourceStageMessage(
     return formatMessage({ id: "agent.detail.migrationPackingElapsed" }, { source, minutes: elapsedMinutes });
   }
   return formatMessage({ id: "agent.detail.migrationPacking" }, { source });
+}
+
+// `ready`: the upload is done and the target downloads chunk by chunk; once it
+// has them all it unpacks, which `in_transit` then reports too.
+function migrationDownloadStageMessage(
+  formatMessage: IntlShape["formatMessage"],
+  notice: AgentMigrationNotice,
+  target: string,
+): string {
+  const progress = notice.transferProgress;
+  if (!progress || progress.totalChunks === 0 || progress.totalBytes <= 0) {
+    return formatMessage({ id: "agent.detail.migrationReady" }, { target });
+  }
+  if (progress.receivedChunks >= progress.totalChunks) {
+    return formatMessage({ id: "agent.detail.migrationUnpacking" }, { target });
+  }
+  return formatMessage({ id: "agent.detail.migrationDownloading" }, {
+    target,
+    // Floor, so it never reads 100% before the last chunk lands.
+    percent: Math.min(99, Math.floor(progress.receivedBytes / progress.totalBytes * 100)),
+    received: formatMigrationSize(progress.receivedBytes),
+    total: formatMigrationSize(progress.totalBytes),
+  });
 }
 
 /**
@@ -257,6 +353,7 @@ export function migrationNoticePresentation(
   notice: AgentMigrationNotice,
   machines: Machine[],
   formatTimestamp: (value: string) => string,
+  viewer: MigrationViewerCopy,
 ): MigrationNoticePresentation {
   const source = migrationTargetLabel(formatMessage, machines, notice.sourceMachineId);
   const target = migrationNoticeTargetLabel(formatMessage, machines, notice);
@@ -337,13 +434,13 @@ export function migrationNoticePresentation(
         message: formatMessage({ id: "agent.migration.canceledPostMessage" }),
       };
     case "provisioning":
-      return status(migrationSourceStageMessage(formatMessage, notice, source, target));
+      return status(migrationSourceStageMessage(formatMessage, notice, source, target, viewer));
     case "prep":
       return status(formatMessage({ id: "agent.detail.migrationPacking" }, { source }));
     case "ready":
-      return status(formatMessage({ id: "agent.detail.migrationReady" }, { target }));
+      return status(migrationDownloadStageMessage(formatMessage, notice, target));
     case "in_transit":
-      return status(formatMessage({ id: "agent.detail.migrationTransferring" }, { target }));
+      return status(formatMessage({ id: "agent.detail.migrationUnpacking" }, { target }));
     case "arriving":
       return status(formatMessage({ id: "agent.detail.migrationArriving" }, { target }));
     case "starting":

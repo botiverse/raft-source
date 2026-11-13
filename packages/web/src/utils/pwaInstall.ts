@@ -1,4 +1,5 @@
 import { trackEvent } from "../analytics/track";
+import { isElectronDesktopShell } from "./desktopShell";
 
 export type PwaInstallPlatform =
   | "ios_safari"
@@ -86,6 +87,10 @@ export function getPwaInstallDisplayMode(win: Window): PwaInstallDisplayMode {
   const nav = win.navigator as Navigator & { standalone?: boolean };
   if (nav.standalone === true) return "standalone";
   if (win.matchMedia?.("(display-mode: standalone)").matches) return "standalone";
+  // An installed window whose title bar is the app's own top bar (manifest
+  // display_override, Window Controls Overlay) no longer matches standalone.
+  // Not the desktop app, whose Electron window may match the same query.
+  if (!isElectronDesktopShell() && win.matchMedia?.("(display-mode: window-controls-overlay)").matches) return "standalone";
   if (win.matchMedia?.("(display-mode: fullscreen)").matches) return "fullscreen";
   if (win.matchMedia?.("(display-mode: minimal-ui)").matches) return "minimal-ui";
   if (win.matchMedia?.("(display-mode: browser)").matches) return "browser";

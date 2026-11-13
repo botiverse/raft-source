@@ -1,8 +1,12 @@
 import {
   Lightbox,
+  LightboxActions,
   LightboxClose,
   LightboxContent,
-  LightboxStage, Spinner
+  LightboxStage,
+  LightboxTitle,
+  LightboxToolbar,
+  Spinner,
 } from "@botiverse/raft-ui";
 import { useOptionalAppTheme } from "../../hooks/useAppTheme";
 import Banner from "../ui/Banner";
@@ -14,8 +18,10 @@ import {
   PROGRAMMATIC_ZOOM_ANIMATION_MS,
   useImageZoom,
 } from "../ImageZoom";
-import { MessageTimelinePreserveViewportContext } from "../message/MessageTimeline";
+import { MessageTimelinePreserveViewportContext, MessageTimelineRowMessageIdContext } from "../message/MessageTimeline";
+import { mermaidViewKey, recallMermaidView, rememberMermaidView } from "./mermaidViewMemory";
 import CodeBlock from "../markdown/CodeBlock";
+import { OVERLAY_TITLEBAR_ATTR, useOverlayTitleBar } from "../topbar/overlayTitleBar";
 import { MermaidDiagramViewer } from "./MermaidDiagramViewer";
 import { MermaidToolbar } from "./MermaidToolbar";
 import type { MermaidView } from "./MermaidToolbar";
@@ -84,7 +90,10 @@ export function MermaidDiagram({ code }: { code: string }) {
     key: renderKey,
     status: "loading",
   });
-  const [view, setView] = useState<MermaidView>("diagram");
+  // Remembered per message (mermaidViewMemory): a timeline row that remounts
+  // shows the view the reader left it on.
+  const viewKey = mermaidViewKey(useContext(MessageTimelineRowMessageIdContext), code);
+  const [view, setView] = useState<MermaidView>(() => recallMermaidView(viewKey) ?? "diagram");
   // The Diagram and Code views have different heights by design, and the
   // message timeline re-anchors (or bottom-sticks) on any layout change — a
   // raw scrollTop compensation loses that race. Arm the timeline's own
@@ -95,9 +104,16 @@ export function MermaidDiagram({ code }: { code: string }) {
   const preserveTimelineViewport = useContext(MessageTimelinePreserveViewportContext);
   const changeView = useCallback((next: MermaidView) => {
     preserveTimelineViewport?.();
+    rememberMermaidView(viewKey, next, "diagram");
     setView(next);
-  }, [preserveTimelineViewport]);
+  }, [preserveTimelineViewport, viewKey]);
   const [fullscreen, setFullscreen] = useState(false);
+  // Desktop: the fullscreen view covers the window, title bar included, and
+  // its bare top-right Close sat under the Windows caption buttons (the
+  // diagram's corner under the macOS traffic lights). There it gets a title
+  // bar row like the file viewer's; the web keeps the floating Close.
+  const fullscreenTitleBar = useOverlayTitleBar();
+  const fullscreenHasTitleBar = OVERLAY_TITLEBAR_ATTR in fullscreenTitleBar;
   const [exportErrorState, setExportErrorState] = useState<{ key: string; message: string } | null>(null);
 
   // A source change reads as loading immediately without an effect-driven
@@ -226,13 +242,26 @@ export function MermaidDiagram({ code }: { code: string }) {
         >
           <LightboxContent
             data-testid="mermaid-fullscreen"
-            className="r-mermaid-fullscreen"
+            className={fullscreenHasTitleBar ? "r-mermaid-fullscreen r-mermaid-fullscreen--titlebar" : "r-mermaid-fullscreen"}
           >
-            <LightboxClose
-              aria-label={formatMessage({ id: "message.mermaid.closeFullscreenAria" })}
-            >
-              <X size={16} />
-            </LightboxClose>
+            {fullscreenHasTitleBar ? (
+              <LightboxToolbar {...fullscreenTitleBar} data-testid="mermaid-fullscreen-header">
+                <LightboxTitle>{formatMessage({ id: "message.mermaid.diagramFrameTitle" })}</LightboxTitle>
+                <LightboxActions>
+                  <LightboxClose
+                    aria-label={formatMessage({ id: "message.mermaid.closeFullscreenAria" })}
+                  >
+                    <X size={16} />
+                  </LightboxClose>
+                </LightboxActions>
+              </LightboxToolbar>
+            ) : (
+              <LightboxClose
+                aria-label={formatMessage({ id: "message.mermaid.closeFullscreenAria" })}
+              >
+                <X size={16} />
+              </LightboxClose>
+            )}
             <LightboxStage className="r-mermaid-fullscreen__stage">
               <MermaidDiagramViewer result={result} zoom={fullscreenZoom} fullscreen />
             </LightboxStage>

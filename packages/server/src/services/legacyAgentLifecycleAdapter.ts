@@ -26,6 +26,7 @@ import {
   RUNTIME_ERROR_REASONS,
   RUNTIME_ERROR_REASON_PROVENANCES,
   RUNTIME_ERROR_REQUIRED_ACTIONS,
+  isReadinessCode,
   runtimeErrorReasonForClass,
   type AgentActivity,
   type MachineShutdownReason,
@@ -92,12 +93,12 @@ export interface AdaptStartInput extends LegacyLifecycleEventFactoryOptions {
   previousStatus?: string | null;
   serverId: string;
   /** `internal`: the task #365 spawn-error retry sweep re-serving a refused wake. */
-  startCause: "manual" | "message" | "resume" | "app_inbox_wake" | "internal";
+  startCause: "manual" | "message" | "resume" | "app_inbox_wake" | "internal" | "ready_owed";
 }
 
 export function adaptStartLifecycleEvent(input: AdaptStartInput): AdaptedLifecycleEvent {
   const reason: AgentLifecycleReason =
-    input.startCause === "message" || input.startCause === "app_inbox_wake" || input.startCause === "internal" ? "lazy_wake"
+    input.startCause === "message" || input.startCause === "app_inbox_wake" || input.startCause === "internal" || input.startCause === "ready_owed" ? "lazy_wake"
       : input.startCause === "resume" ? "runtime_starting"
         : "manual_start";
 
@@ -221,6 +222,8 @@ export function normalizeRuntimeErrorActivityDiagnostic(
       && (RUNTIME_ERROR_REQUIRED_ACTIONS as readonly string[]).includes(candidate.requiredAction)
       ? { requiredAction: candidate.requiredAction as RuntimeErrorRequiredAction }
       : {}),
+    // #proj-raft-computer:#68: a code this build does not know is dropped, not the carrier.
+    ...(isReadinessCode(candidate.readinessCode) ? { readinessCode: candidate.readinessCode } : {}),
   };
 }
 

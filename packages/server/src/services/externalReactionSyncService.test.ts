@@ -99,7 +99,9 @@ async function fixture() {
   return { db, actor, root, reply, links, now };
 }
 
-async function event(state: Awaited<ReturnType<typeof fixture>>, providerEventId: string) {
+type EventAuthorityOverride = Partial<Pick<typeof externalInboundEvents.$inferInsert, "installId" | "appRegistrationId" | "connectionEpoch" | "bindingId">>;
+
+async function event(state: Awaited<ReturnType<typeof fixture>>, providerEventId: string, bindingEpoch = 1, authority: EventAuthorityOverride = {}) {
   const [created] = await state.db.insert(externalInboundEvents).values({
     provider: "slack",
     environment: "test",
@@ -110,7 +112,7 @@ async function event(state: Awaited<ReturnType<typeof fixture>>, providerEventId
     providerConversationId: "C_CHANNEL",
     providerEventId,
     bindingId: "binding-1",
-    bindingEpoch: 1,
+    bindingEpoch,
     connectionEpoch: 1,
     runtimeRevision: "runtime-1",
     raftChannelId: state.root.channelId,
@@ -125,6 +127,7 @@ async function event(state: Awaited<ReturnType<typeof fixture>>, providerEventId
     payloadExpiresAt: new Date(state.now.getTime() + 60_000),
     receivedAt: state.now,
     updatedAt: state.now,
+    ...authority,
   }).returning();
   return created;
 }
@@ -136,8 +139,10 @@ async function apply(state: Awaited<ReturnType<typeof fixture>>, input: {
   providerMessageId?: string;
   actorId?: string;
   reaction?: string;
+  bindingEpoch?: number;
+  authority?: EventAuthorityOverride;
 }) {
-  const inbound = await event(state, input.id);
+  const inbound = await event(state, input.id, input.bindingEpoch, input.authority);
   return state.db.transaction((tx) => applyExternalReactionObservation({
     tx,
     inboundEventId: inbound.id,
@@ -347,4 +352,89 @@ test.each(["current", "expired"])("reaction actor read model exposes only %s add
     if (priorSecret === undefined) delete process.env.JWT_SECRET;
     else process.env.JWT_SECRET = priorSecret;
   }
+});
+
+test("historical receipt applies current-epoch reactions without rewriting its original identity", async () => {
+  const state = await fixture();
+  await state.db.update(externalAddressabilityProjections).set({ bindingEpoch: 2 });
+  assert.equal((await apply(state, { id: "new-binding-reaction", operation: "add", sequence: 100, bindingEpoch: 2 })).outcome, "applied");
+  const [fact] = await state.db.select().from(externalReactionFacts);
+  assert.equal(fact.bindingEpoch, 2);
+  assert.equal(fact.messageLinkId, state.links[0].id);
+  const [historical] = await state.db.select().from(externalMessageLinks).where(eq(externalMessageLinks.id, state.links[0].id));
+  assert.equal(historical.bindingEpoch, 1);
+});
+
+test("reaction presence and causal order survive a binding update after an existing add", async () => {
+  const state = await fixture();
+  const count = async () => (await listMessagesByIds([state.root.id]))[0].reactions?.[0]?.count ?? 0;
+  await apply(state, { id: "old-add", operation: "add", sequence: 100 });
+  assert.equal(await count(), 1);
+  const [original] = await state.db.select().from(externalReactionStates);
+  await state.db.update(externalAddressabilityProjections).set({ bindingEpoch: 2 });
+  assert.equal((await apply(state, { id: "new-duplicate-add", operation: "add", sequence: 200, bindingEpoch: 2 })).outcome, "noop");
+  assert.equal(await count(), 1, "re-adding after a version change must not duplicate the actor");
+  assert.equal((await state.db.select().from(externalReactionStates)).length, 1);
+  assert.equal((await apply(state, { id: "new-remove", operation: "remove", sequence: 400, bindingEpoch: 2 })).outcome, "applied");
+  assert.equal(await count(), 0, "removal must clear the existing visible reaction");
+  assert.equal((await apply(state, { id: "late-old-add", operation: "add", sequence: 300, bindingEpoch: 2 })).outcome, "stale");
+  assert.equal(await count(), 0, "a delayed older add must not resurrect the reaction");
+  assert.equal((await apply(state, { id: "new-readd", operation: "add", sequence: 500, bindingEpoch: 2 })).outcome, "applied");
+  assert.equal((await apply(state, { id: "equal-sequence-remove", operation: "remove", sequence: 500, bindingEpoch: 2 })).outcome, "quarantined");
+  assert.equal(await count(), 1);
+  const rows = await state.db.select().from(externalReactionStates);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].id, original.id, "one mutable presence row continues across binding versions");
+  assert.equal(rows[0].bindingEpoch, 2);
+  const facts = await state.db.select().from(externalReactionFacts);
+  assert.equal(facts.find((fact) => fact.providerEventId === "old-add")?.bindingEpoch, 1, "event provenance remains immutable");
+  await assert.rejects(apply(state, { id: "unaddressable-remove", operation: "remove", sequence: 600, bindingEpoch: 3 }), /addressability/);
+  assert.equal(await count(), 1, "historical state cannot authorize a new unaddressable operation");
+});
+
+test("reaction removal survives a new binding, installation, credential epoch and actor projection", async () => {
+  const state = await fixture();
+  await apply(state, { id: "prior-install-add", operation: "add", sequence: 100 });
+  const [currentActor] = await state.db.insert(externalActorProjections).values({ ...state.actor,
+    id: randomUUID(), installId: "new-install", appRegistrationId: "new-registration" }).returning();
+  await state.db.insert(externalAddressabilityProjections).values({
+    projectionId: currentActor.id, provider: "slack", appRegistrationId: "new-registration", installId: "new-install",
+    workspaceId: "T_WORKSPACE", connectionEpoch: 2, bindingId: "new-binding", bindingEpoch: 1,
+    conversationId: "C_CHANNEL", memberRevision: 1, contextRevision: 1, state: "active",
+    observedAt: state.now, expiresAt: new Date(state.now.getTime() + 60_000),
+  });
+  await state.db.update(externalMessageLinks).set({ authorityState: "stale" }).where(eq(externalMessageLinks.id, state.links[0].id));
+  const changed = await apply({ ...state, actor: currentActor }, { id: "new-install-remove", operation: "remove", sequence: 200,
+    authority: { installId: "new-install", appRegistrationId: "new-registration", bindingId: "new-binding", connectionEpoch: 2 } });
+  assert.equal(changed.outcome, "applied");
+  assert.deepEqual((await listMessagesByIds([state.root.id]))[0].reactions, []);
+  const rows = await state.db.select().from(externalReactionStates);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].projectionId, currentActor.id);
+  assert.equal(rows[0].bindingId, "new-binding");
+});
+
+test("queued reaction uses the reauthorized current actor while retaining original event custody", async () => {
+  const state = await fixture();
+  const queued = await enqueueWorkerReaction(state, { id: "EvQueuedBeforeReauth", operation: "add", sequence: 800 });
+  const [actor] = await state.db.insert(externalActorProjections).values({ ...state.actor,
+    id: randomUUID(), installId: "current-install" }).returning();
+  const [oldAddress] = await state.db.select().from(externalAddressabilityProjections);
+  await state.db.insert(externalAddressabilityProjections).values({ ...oldAddress, id: randomUUID(), projectionId: actor.id,
+    installId: actor.installId, bindingId: "current-binding", bindingEpoch: 2, connectionEpoch: 2 });
+  await state.db.update(externalActorProjections).set({ state: "tombstoned" }).where(eq(externalActorProjections.id, state.actor.id));
+  const result = await processExternalInboundEventOnce({ db: state.db, leaseOwner: "current-reaction-worker",
+    dependencies: { now: () => state.now,
+      async decryptNormalizedPayload() { return queued.payload; },
+      async resolveCurrentRuntime({ frozenAuthority }) { return { ...frozenAuthority,
+        operationAuthority: { ...frozenAuthority, installId: actor.installId, bindingId: "current-binding",
+          bindingEpoch: 2, connectionEpoch: 2, runtimeRevision: "current-runtime" } }; },
+    },
+  });
+  assert.equal(result.kind, "committed");
+  const [presence] = await state.db.select().from(externalReactionStates);
+  assert.equal(presence.projectionId, actor.id);
+  assert.equal(presence.present, true);
+  const [custody] = await state.db.select().from(externalInboundEvents).where(eq(externalInboundEvents.id, queued.inbound.id));
+  assert.equal(custody.installId, "install-1");
 });

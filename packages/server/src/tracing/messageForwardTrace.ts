@@ -1,6 +1,7 @@
 import type { NextFunction, Request, RequestHandler, Response } from "express";
 import { noopTracer, type ActiveSpan, type Tracer } from "@botiverse/raft-shared";
 import { getCurrentTraceContext, safeAddTraceEvent } from "./semanticTrace";
+import { traceIdentityHash } from "./traceIdentity";
 
 export type ForwardDiagnosticPhase =
   | "gate"
@@ -13,10 +14,18 @@ export type ForwardDiagnosticPhase =
 export type ForwardCommitState = "pre_commit" | "unknown" | "committed";
 export type ForwardAdmissionStage = "auth" | "verified" | "server" | "limiter" | "handler";
 
+type ForwardTargetAttrs = {
+  destination_count: number;
+  source_count: number;
+  conversation_id_hash?: string;
+  message_id_hash?: string;
+};
+
 type ForwardTraceState = {
   admissionStage: ForwardAdmissionStage;
   terminalRecorded: boolean;
   attemptSpan: ActiveSpan;
+  targets?: ForwardTargetAttrs;
 };
 
 declare global {
@@ -31,6 +40,28 @@ export function forwardCommitState(phase: ForwardDiagnosticPhase): ForwardCommit
   if (phase === "persist_broadcast") return "unknown";
   if (phase === "response") return "committed";
   return "pre_commit";
+}
+
+/**
+ * Once a forward request is valid, its terminal event names what it forwarded:
+ * counts, and for a single destination / single source message their keyed
+ * trace hashes (traceIdentity.ts), never the raw ids. Lets a forward trace be
+ * matched to the conversation and message it concerned (#proj-o11y:#29).
+ */
+export function noteForwardTargets(req: Request, input: { destinationChannelIds: readonly string[]; sourceMessageIds: readonly string[] }): void {
+  if (!req.forwardTraceState) return;
+  const conversationIdHash = input.destinationChannelIds.length === 1
+    ? traceIdentityHash("conversation_id_hash", input.destinationChannelIds[0])
+    : null;
+  const messageIdHash = input.sourceMessageIds.length === 1
+    ? traceIdentityHash("message_id_hash", input.sourceMessageIds[0])
+    : null;
+  req.forwardTraceState.targets = {
+    destination_count: input.destinationChannelIds.length,
+    source_count: input.sourceMessageIds.length,
+    ...(conversationIdHash ? { conversation_id_hash: conversationIdHash } : {}),
+    ...(messageIdHash ? { message_id_hash: messageIdHash } : {}),
+  };
 }
 
 export function recordForwardTerminal(req: Request, input: {
@@ -51,6 +82,7 @@ export function recordForwardTerminal(req: Request, input: {
     stable_code: input.stableCode,
     error_class: input.errorClass,
     commit_state: input.commitState ?? forwardCommitState(input.phase),
+    ...req.forwardTraceState?.targets,
   };
   if (req.forwardTraceState) {
     req.forwardTraceState.terminalRecorded = true;

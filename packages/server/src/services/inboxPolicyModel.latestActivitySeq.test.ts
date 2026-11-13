@@ -1,18 +1,8 @@
 import assert from "node:assert/strict";
 import { mapInboxPolicyRowsToItems } from "./inboxPolicyModel";
-import { normalizeRowForTest } from "./activitySyncService";
 import type { InboxItem } from "./channelService";
 
-// Gate B1 P1 successor teeth (John/赵梓淇 independent repro): the SQL projects
-// latestActivitySeq, but every real inbox row flows through the shared
-// mapInboxPolicyRowsToItems() mapper before getInboxItems() casts to InboxItem
-// and activitySyncService.normalizeRow() runs requireLatestActivitySeq(). These
-// teeth drive the REAL exported mapper (no hand-crafted post-map InboxItem) and
-// prove the canonical decimal latestActivitySeq survives raw-row -> mapper ->
-// normalize as one same-source tuple for all four row-kinds, fails closed when
-// the frontier is absent, and REDs if the mapper stops copying the field.
-
-const readStates = new Map<string, { maxReadSeq: string; readStateVersion: string }>();
+// The serving mapper must preserve exact content frontiers for read/Done actions.
 
 function rawChannel(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
@@ -65,7 +55,7 @@ function rawThread(overrides: Record<string, unknown> = {}): Record<string, unkn
   };
 }
 
-test("P1: real shared mapper threads latestActivitySeq for channel/dm/mention -> normalize keeps the same-source tuple", () => {
+test("P1: real shared mapper threads latestActivitySeq for channel/dm/mention preserves the same-source tuple", () => {
   const rawRows = [
     rawChannel({ kind: "channel" }),
     rawChannel({ kind: "dm", channelId: "dm-1", channelType: "dm" }),
@@ -78,26 +68,18 @@ test("P1: real shared mapper threads latestActivitySeq for channel/dm/mention ->
     assert.equal(Object.hasOwn(item, "latestActivitySeq"), true, "mapper must copy latestActivitySeq");
   }
 
-  const channel = normalizeRowForTest(items[0]!, readStates);
-  assert.equal(channel.type, "channel");
-  assert.equal(channel.latestActivitySeq, "100");
-
-  const dm = normalizeRowForTest(items[1]!, readStates);
-  assert.equal(dm.type, "dm");
-  assert.equal(dm.latestActivitySeq, "100");
-
-  const mention = normalizeRowForTest(items[2]!, readStates);
-  assert.equal(mention.type, "channel");
-  assert.equal(mention.hasMention, true);
-  assert.equal(mention.latestActivitySeq, "100");
+  assert.equal(items[0]!.latestActivitySeq, "100");
+  assert.equal(items[1]!.latestActivitySeq, "100");
+  assert.equal(items[2]!.latestActivitySeq, "100");
 });
 
-test("P1: real shared mapper threads latestActivitySeq for thread -> normalize keeps latestActivityMessageId+seq paired", () => {
+test("P1: real shared mapper threads latestActivitySeq for thread preserves latestActivityMessageId+seq paired", () => {
   const items = mapInboxPolicyRowsToItems([rawThread()]) as unknown as InboxItem[];
   assert.equal(Object.hasOwn(items[0]!, "latestActivitySeq"), true, "mapper must copy latestActivitySeq");
 
-  const thread = normalizeRowForTest(items[0]!, readStates);
-  assert.equal(thread.type, "thread");
+  const thread = items[0]!;
+  assert.equal(thread.kind, "thread");
+  if (thread.kind !== "thread") throw new Error("expected thread");
   assert.equal(thread.latestActivityMessageId, "msg-200");
   assert.equal(thread.latestActivitySeq, "200");
 });
@@ -115,45 +97,37 @@ test("P1: zero-reply thread falls back to the parent via PAIRED COALESCE through
     }),
   ]) as unknown as InboxItem[];
 
-  const thread = normalizeRowForTest(items[0]!, readStates);
-  assert.equal(thread.type, "thread");
+  const thread = items[0]!;
+  assert.equal(thread.kind, "thread");
+  if (thread.kind !== "thread") throw new Error("expected thread");
   assert.equal(thread.latestActivityMessageId, "parent-1");
   assert.equal(thread.latestActivitySeq, "50");
   assert.equal(thread.parentMessageId, "parent-1");
 });
 
-test("P1: a raw row missing the frontier fails closed after the real mapper (no silent drop, no 0)", () => {
+test("P1: a raw row missing the frontier stays missing after the mapper (no fabricated frontier)", () => {
   // Join-miss / missing frontier: the raw row has no latestActivitySeq, the mapper
-  // yields null, and normalizeRow hard-rejects the whole row before serialization.
+  // preserves null so mutation callers cannot invent a content frontier.
   const channelItems = mapInboxPolicyRowsToItems([
     rawChannel({ latestActivitySeq: null }),
   ]) as unknown as InboxItem[];
   assert.equal(channelItems[0]!.latestActivitySeq, null);
-  assert.throws(
-    () => normalizeRowForTest(channelItems[0]!, readStates),
-    /no provable latestActivitySeq/,
-  );
 
   const threadItems = mapInboxPolicyRowsToItems([
     rawThread({ latestActivitySeq: null }),
   ]) as unknown as InboxItem[];
-  assert.throws(
-    () => normalizeRowForTest(threadItems[0]!, readStates),
-    /no provable latestActivitySeq/,
-  );
+  assert.equal(threadItems[0]!.latestActivitySeq, null);
 });
 
 test("P1 RED guard: deleting the mapper's latestActivitySeq copy must break the chain", () => {
   // This tooth pins the mapper source so a future deletion/non-copy of the field
   // is caught: the mapped item must own latestActivitySeq AND it must equal the raw
   // canonical decimal. If the mapper stops copying the field, hasOwn flips false and
-  // normalizeRow would throw — exactly the P1 this successor closes.
+  // the value would be lost before a read/Done action can use it.
   const raw = rawChannel({ latestActivitySeq: "10938105" });
   const items = mapInboxPolicyRowsToItems([raw]) as unknown as InboxItem[];
   assert.equal(Object.hasOwn(items[0]!, "latestActivitySeq"), true);
   assert.equal(items[0]!.latestActivitySeq, "10938105");
-  const normalized = normalizeRowForTest(items[0]!, readStates);
-  assert.equal(normalized.latestActivitySeq, "10938105");
 });
 
 test("Done frontier stays in storage space when the incident display pair diverges", () => {

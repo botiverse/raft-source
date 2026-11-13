@@ -125,7 +125,7 @@ function dmRow(page: Page, channelId: string) {
 async function openRowMenu(row: Locator, page: Page) {
   await expect(row).toBeVisible();
   await row.scrollIntoViewIfNeeded();
-  const markAction = page.getByRole("menuitem", { name: /Mark as (Read|Unread)/ });
+  const markAction = page.getByRole("menuitem", { name: /Mark as (read|unread)/ });
   for (let attempt = 0; attempt < 2; attempt += 1) {
     await row.click({ button: "right" });
     try {
@@ -144,7 +144,17 @@ async function expectUnreadBadge(row: Locator, count: number) {
   const unreadBadge = row.locator('[data-slot="sidebar-item-count"]');
   if (count > 0) {
     await expect(unreadBadge).toHaveText(String(count));
-    await expectCssColor(row.page(), await unreadBadge.evaluate((el) => getComputedStyle(el).backgroundColor), "#FF99C3", 2);
+    // Read the color until it settles: one read just as the badge appears can
+    // see no background yet (staging e2e(4), run 43151880055). Same tolerance.
+    await expect.poll(async () => {
+      const color = await unreadBadge.evaluate((el) => getComputedStyle(el).backgroundColor);
+      try {
+        await expectCssColor(row.page(), color, "#FF99C3", 2);
+        return "#FF99C3";
+      } catch {
+        return color;
+      }
+    }).toBe("#FF99C3");
     return;
   }
   await expect(unreadBadge).toHaveCount(0);
@@ -257,8 +267,8 @@ async function exerciseUnreadScenario(
     response.request().method() === "POST"
     && response.url().includes(`/api/channels/${conversation.id}/unread`)
   );
-  await page.getByRole("menuitem", { name: "Mark as Unread" }).click();
-  await expect(page.getByRole("menuitem", { name: "Mark as Unread" })).toHaveCount(0);
+  await page.getByRole("menuitem", { name: "Mark as unread" }).click();
+  await expect(page.getByRole("menuitem", { name: "Mark as unread" })).toHaveCount(0);
   await expectUnreadBadge(row, 1);
 
   const unreadResponse = await unreadResponsePromise;
@@ -341,13 +351,6 @@ test("sidebar All Read clears thread-only unread and a later reply becomes unrea
   await createMessage(request, seed, login.accessToken, seed.channel.id, "Anchor while clearing another conversation");
   await postReply("Unread before explicit All Read");
   await markChannelRead(request, seed, login.accessToken, target.id);
-  await page.route("**/api/feature-flags/evaluate", async (route) => {
-    const response = await route.fetch();
-    const body = await response.json() as { evaluations: Array<{ key: string; enabled: boolean }> };
-    body.evaluations = body.evaluations.filter((item: { key: string }) => item.key !== "thread_unread_badge_v0");
-    body.evaluations.push({ key: "thread_unread_badge_v0", enabled: true });
-    await route.fulfill({ status: response.status(), json: body });
-  });
   await navigateToMessageScrollerWithReadinessEvidence(page, testInfo, { consumer: "unread-click-read", channelId: seed.channel.id }, () => page.goto(channelPath(seed, seed.channel.id), { waitUntil: "domcontentloaded" }));
   const row = page.locator(`button[data-sidebar-channel-id="${target.id}"]`).first();
   const threadBadge = row.getByTestId("sidebar-thread-unread");
@@ -356,7 +359,7 @@ test("sidebar All Read clears thread-only unread and a later reply becomes unrea
   await row.click({ button: "right" });
   const receipt = page.waitForResponse((response) =>
     response.url().endsWith(`/channels/${target.id}/conversation-read-all`) && response.request().method() === "POST");
-  await page.getByRole("menuitem", { name: "Mark All as Read", exact: true }).click();
+  await page.getByRole("menuitem", { name: "Mark all as read", exact: true }).click();
   expect((await receipt).ok()).toBe(true);
   await expect(threadBadge).toHaveCount(0);
   await postReply("New reply after All Read must remain unread");

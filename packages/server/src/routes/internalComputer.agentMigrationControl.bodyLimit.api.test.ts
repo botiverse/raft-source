@@ -19,7 +19,7 @@ import { generateComputerApiKeyMaterial } from "../services/computerCredentialSe
 /** Manifest limit (512 KB) + 64 KB envelope headroom. Stated here, not imported, so the test pins the number. */
 const CONTROL_REQUEST_MAX_BYTES = 512 * 1024 + 64 * 1024;
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 async function seed() {
   const db = getDb();
@@ -69,7 +69,7 @@ function post(baseUrl: string, pathName: string, body: string, apiKey?: string) 
 }
 
 async function withApp<T>(fn: (app: Awaited<ReturnType<typeof openTestApp>>) => Promise<T>): Promise<T> {
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     return await fn(app);
   } finally {

@@ -1,0 +1,98 @@
+{
+  "formatVersion": 1,
+  "id": "R3-hold-until-leave",
+  "rule": "R3",
+  "title": "Mark as Unread inside an open thread holds auto-read until the person leaves the thread",
+  "why": "The person asked for the thread to stay unread while they are in it; a visible new reply must not read it. Leaving ends the hold without reading.",
+  "status": "agreed",
+  "sources": {
+    "web": [
+      "packages/web/src/components/message/threadUnreadHold.ts",
+      "packages/web/src/components/thread/inboxRowActions.ts (markThreadUnreadFromThread)",
+      "packages/web/src/store/autoReadHold.ts"
+    ],
+    "app": [
+      "compose/shared/src/commonMain/kotlin/build/raft/app/SharedThreadStore.kt"
+    ]
+  },
+  "given": {
+    "conversation": {
+      "id": "thread-1",
+      "kind": "thread"
+    },
+    "openThread": "thread-1"
+  },
+  "steps": [
+    {
+      "act": "markUnread",
+      "surface": "threadMenu"
+    },
+    {
+      "act": "serverResponds",
+      "status": 200,
+      "body": {
+        "ok": true,
+        "unreadCount": 0,
+        "maxReadSeq": 40,
+        "readStateVersion": 7,
+        "markedUnread": true,
+        "outcome": "marked"
+      }
+    },
+    {
+      "act": "replyArrives",
+      "visible": true
+    },
+    {
+      "act": "leaveThread"
+    }
+  ],
+  "checkpoints": [
+    {
+      "afterStep": 1,
+      "requests": [
+        {
+          "method": "POST",
+          "path": "/api/channels/thread-1/unread"
+        }
+      ],
+      "state": {
+        "holdActive": true
+      }
+    },
+    {
+      "afterStep": 2,
+      "state": {
+        "outcome": "marked",
+        "unreadState": {
+          "kind": "dot"
+        },
+        "toast": null,
+        "holdActive": true
+      }
+    },
+    {
+      "afterStep": 3,
+      "requests": [
+        {
+          "method": "POST",
+          "path": "/api/channels/thread-1/unread"
+        }
+      ],
+      "state": {
+        "holdActive": true
+      }
+    }
+  ],
+  "expect": {
+    "requests": [
+      {
+        "method": "POST",
+        "path": "/api/channels/thread-1/unread"
+      }
+    ],
+    "state": {
+      "holdActive": false
+    }
+  }
+}

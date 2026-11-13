@@ -420,7 +420,7 @@ test("real DB: inbox items carry the authority union — absent / present-at-zer
 
     const inbox = await getInboxItems(server.id, owner.id, { filter: "all" });
     const byScope = new Map(inbox.items.map((item) => [
-      item.kind === "thread" ? item.threadChannelId : item.channelId,
+      (item.kind === "thread" || item.kind === "task") ? item.threadChannelId : item.channelId,
       item,
     ]));
 

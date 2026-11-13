@@ -24,11 +24,23 @@ import {
   setAgentRuntimeError,
   getAgentRuntimeError,
   getAgentRuntimeErrors,
+  setAgentContextViewAvailability,
+  getAgentContextViewAvailability,
+  clearAgentContextViewAvailability,
+  setReadyOwedWakeAt,
+  getReadyOwedWakeAt,
+  claimDiskCredentialLift,
+  createAgentContextViewRequest,
+  getAgentContextViewRequest,
+  claimAgentContextViewRequest,
   setMachineMeta,
   getMachineMeta,
   clearMachineMeta,
   type MachineMeta,
+  type AgentContextViewRequestRecord,
+  type AgentContextViewRequestClaim,
   type AgentRuntimeErrorMirror,
+  type AgentContextViewAvailabilityRecord,
   type MachineReplicaRefreshResult,
   type MachineReplicaLease,
   type MachineDuplicateHold,
@@ -41,6 +53,8 @@ import type {
   DeliveryConsumptionActivityDiagnostic,
   WakeCrashLoopActivityDiagnostic,
   SpawnFailureActivityDiagnostic,
+  ToolStuckActivityDiagnostic,
+  CredentialHoldActivityDiagnostic,
 } from "@botiverse/raft-shared";
 
 /**
@@ -55,6 +69,10 @@ export interface PersistedActivityTypedCarriers {
   wakeCrashLoop?: WakeCrashLoopActivityDiagnostic;
   /** task #1123: rides a runtime_unavailable write from a failed start. */
   spawnFailure?: SpawnFailureActivityDiagnostic;
+  /** task #25: the daemon's stuck-tool state, whatever the detail kind. */
+  toolStuck?: ToolStuckActivityDiagnostic;
+  /** Reconciler step 4b: the held notice's typed reason, when the snapshot is an idle write showing it. */
+  credentialHold?: CredentialHoldActivityDiagnostic;
 }
 
 export interface PersistedAgentActivity {
@@ -65,11 +83,11 @@ export interface PersistedAgentActivity {
   updatedAt: number;
   carriers?: PersistedActivityTypedCarriers;
 }
-import type { AgentRuntimeErrorState } from "@botiverse/raft-shared";
+import type { AgentContextViewRequestId, AgentRuntimeErrorState, MachineId } from "@botiverse/raft-shared";
 import type { WakeCrashLoopEpisodeState, WakeCrashLoopStateRecord } from "./wakeCrashLoopBreaker";
 import type { MachineConnectTraceContext } from "../tracing/migrationTraceContext";
 
-export type { MachineMeta, AgentRuntimeErrorMirror };
+export type { MachineMeta, AgentRuntimeErrorMirror, AgentContextViewAvailabilityRecord, AgentContextViewRequestRecord, AgentContextViewRequestClaim };
 
 export interface ReplicaStateStore {
   isAvailable(): boolean;
@@ -111,12 +129,29 @@ export interface ReplicaStateStore {
   getAgentActivity(agentId: string): Promise<PersistedAgentActivity | null>;
   setAgentRuntimeError(agentId: string, error: AgentRuntimeErrorState | null): Promise<void>;
   getAgentRuntimeError(agentId: string): Promise<AgentRuntimeErrorMirror | null>;
+  /** View Context: the latest availability report per agent (7-day TTL, refreshed on write). */
+  setAgentContextViewAvailability(agentId: string, record: AgentContextViewAvailabilityRecord): Promise<void>;
+  getAgentContextViewAvailability(agentId: string): Promise<AgentContextViewAvailabilityRecord | null>;
+  clearAgentContextViewAvailability(agentId: string): Promise<void>;
   /**
    * task #1119: wake crash-loop breaker episode state, shared across replicas.
    * `compareAndSet` writes only when the stored version equals `expectedVersion`
    * (0 when absent) so read→apply→write is atomic against concurrent writers.
    */
   getWakeCrashLoopState(agentId: string): Promise<WakeCrashLoopStateRecord | null>;
+  /**
+   * Reconciler step 13 F9: when a daemon `ready` last dispatched an owed wake
+   * for the agent (epoch ms; 24 h TTL), shared by every replica. Optional for
+   * hand-built stores: without it the owed wake is not dispatched (fail closed).
+   */
+  setReadyOwedWakeAt?(agentId: string, atMs: number): Promise<void>;
+  getReadyOwedWakeAt?(agentId: string): Promise<number | null>;
+  /**
+   * Reconciler step 15: claim the one disk-sign-in lift a Computer and runtime
+   * get per window (15 min), shared by every replica. Optional for hand-built
+   * stores: without it a disk lift is dropped (fail closed; a web login still lifts).
+   */
+  claimDiskCredentialLift?(machineId: string, runtime: string): Promise<boolean>;
   compareAndSetWakeCrashLoopState(agentId: string, expectedVersion: number, state: WakeCrashLoopEpisodeState): Promise<boolean>;
   setMachineMeta(machineId: string, meta: MachineMeta): Promise<void>;
   getMachineMeta(machineId: string): Promise<MachineMeta | null>;
@@ -157,7 +192,30 @@ export const redisReplicaStateStore: ReplicaStateStore = {
   setAgentRuntimeError,
   getAgentRuntimeError,
   getAgentRuntimeErrors,
+  setAgentContextViewAvailability,
+  getAgentContextViewAvailability,
+  clearAgentContextViewAvailability,
+  setReadyOwedWakeAt,
+  getReadyOwedWakeAt,
+  claimDiskCredentialLift,
   setMachineMeta,
   getMachineMeta,
   clearMachineMeta,
+};
+
+/**
+ * View Context: open view requests, shared across replicas (Redis, or
+ * in-process with no Redis). Kept apart from ReplicaStateStore: only the
+ * context view relay reads it, never the orchestrator.
+ */
+export interface AgentContextViewRequestStore {
+  create(record: AgentContextViewRequestRecord, ttlMs: number): Promise<void>;
+  get(requestId: AgentContextViewRequestId): Promise<{ record: AgentContextViewRequestRecord; claimed: boolean } | null>;
+  claim(requestId: AgentContextViewRequestId, callerMachineId: MachineId, ttlMs: number): Promise<AgentContextViewRequestClaim>;
+}
+
+export const redisAgentContextViewRequestStore: AgentContextViewRequestStore = {
+  create: createAgentContextViewRequest,
+  get: getAgentContextViewRequest,
+  claim: claimAgentContextViewRequest,
 };

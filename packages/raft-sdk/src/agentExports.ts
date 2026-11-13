@@ -26,6 +26,8 @@ export {
   assignTaskRequestSchema,
   attachmentCommentsRequestSchema,
   channelInfoRequestSchema,
+  channelLeaveRequestSchema,
+  channelMemberRemoveRequestSchema,
   channelMemberRequestSchema,
   channelMembersRequestSchema,
   createChannelRequestSchema,
@@ -56,6 +58,8 @@ export {
   searchMessagesRequestSchema,
   sendMessageRequestSchema,
   senderMentionDeliveriesRequestSchema,
+  updateMessageCardRequestSchema,
+  withdrawQuestionCardRequestSchema,
   serverInfoRequestSchema,
   showProfileRequestSchema,
   taskRefSchema,
@@ -132,6 +136,7 @@ export type {
   RaftInboxBatch,
   RaftInboxConversation,
   RaftInboxDrainSummary,
+  RaftInboxItem,
   RaftInboxListing,
   RaftInboxNotice,
   RaftMessage,
@@ -156,6 +161,8 @@ export type {
   SeenFrontierSnapshot,
   SendMessageOutcome,
   SendMessageRequest,
+  UpdateMessageCardRequest,
+  RaftCardUpdate,
   VerifyNoticeInput,
   VerifyNoticeRejection,
   VerifyNoticeResult,
@@ -168,6 +175,8 @@ export type {
   RaftChannelArchiveState,
   RaftChannelSummary,
   RaftChannelVisibility,
+  ChannelLeaveRequest,
+  ChannelMemberRemoveRequest,
   ChannelMemberRequest,
   CreateChannelRequest,
   UpdateChannelRequest,
@@ -192,6 +201,9 @@ export type {
   RaftMentionActionOutcome,
   PrepareActionCardRequest,
   RaftPreparedCard,
+  RaftQuestionAsked,
+  RaftQuestionWithdrawal,
+  WithdrawQuestionCardRequest,
   ManualContext,
   RaftAttachmentBytes,
   RaftAttachmentDownloadUrl,
@@ -208,5 +220,21 @@ export type {
   ReplyToRequest,
 } from "@botiverse/raft-shared/src/agentOps/index";
 export { inferAttachmentMimeType } from "@botiverse/raft-shared/src/agentOps/index";
+// The rule for a message delivered more than once, word for word as Raft's own prompts and tool descriptions carry it.
+export { REPEAT_DELIVERY_RULE } from "@botiverse/raft-shared/src/agentText/index";
 
 export type { RaftbenchContextResponse, RaftbenchReport, RaftbenchRunAssigned, RaftbenchSubmitResponse } from "@botiverse/raft-shared/src/agentOps/index";
+
+export { createMemoryIntegrationSessionStore } from "./integrations";
+export type {
+  RaftIntegrationAction,
+  RaftIntegrationActionParameter,
+  RaftIntegrationActions,
+  RaftIntegrationCallData,
+  RaftIntegrationCallRequest,
+  RaftIntegrationService,
+  RaftIntegrationSession,
+  RaftIntegrationSessionKey,
+  RaftIntegrationSessionStore,
+} from "./integrations";
+export type { IntegrationSessionCookie } from "@botiverse/raft-shared/src/integrations/index";

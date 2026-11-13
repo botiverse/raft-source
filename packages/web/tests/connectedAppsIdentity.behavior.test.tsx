@@ -1,13 +1,16 @@
 import assert from "node:assert/strict";
+import { assertScrollAreaRailsOn } from "./helpers/scrollAreaRails";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 // SettingsPanel → ConnectedApps mounts the react-intl-migrated ConfirmDialog
 // (client-secret regen confirm), which needs an <IntlProvider> ancestor.
 import { TestIntlProvider, renderWithIntl } from "./helpers/intl";
+import { chooseRegisterAppMenuItem } from "./helpers/registerAppMenu";
 import { OAUTH_CLIENT_CATEGORIES } from "@botiverse/raft-shared";
 import api from "../src/api/client";
 import RequestedScopeConsent from "../src/components/oauth/RequestedScopeConsent";
-import SettingsPanel, { matchesConnectedAppFilter } from "../src/components/settings/SettingsPanel";
+import { SettingsPanel } from "../src/components/settings/SettingsPanel";
+import { CONNECTED_APP_CATEGORY_LABEL_ID, matchesConnectedAppFilter } from "../src/features/apps/connected-apps/connectedAppCatalog";
 import {
   toggleAppNotificationEvent,
   toggleAppNotificationGroup,
@@ -29,12 +32,18 @@ import {
   scopeGroupLabelId,
 } from "../src/lib/oauthScopePresentation";
 import { en as enMessages } from "../src/i18n/messages/en";
-import HumanLoginSetupPage, { initialsForApp } from "../src/pages/HumanLoginSetupPage";
+import HumanLoginSetupPage from "../src/pages/HumanLoginSetupPage";
+import { initialsForApp } from "../src/features/login-with-raft/appInitials";
+import { authorizationErrorRedirectUrl } from "../src/features/login-with-raft/loginErrors";
 import IntegrationInvitePage from "../src/pages/IntegrationInvitePage";
 import { useAuthStore } from "../src/store/authStore";
 import { resetServerFeatureFlagsForTests } from "../src/store/serverFeatureFlags";
 import { useServerStore } from "../src/store/serverStore";
 import type { Server } from "../src/store/serverStore";
+import { serveMarketplaceListingsFromAppRecords } from "./helpers/marketplaceListings";
+
+// The Marketplace tab reads pages of listings; these tests answer the App records.
+serveMarketplaceListingsFromAppRecords();
 
 const originalApiGet = api.get;
 const originalApiPost = api.post;
@@ -62,7 +71,6 @@ function resetStores() {
     user: {
       id: "user-1",
       email: "owner@example.com",
-      gravatarHash: "",
       name: "Owner",
       displayName: "Owner",
       description: null,
@@ -147,13 +155,13 @@ test("AvatarSlot renders app logos full-frame and deterministic app/server fallb
 
   const logo = document.querySelector("img");
   assert.equal(logo?.getAttribute("src"), "https://cdn.example.com/orbital.png");
-  assert.equal(logo?.getAttribute("class"), "relative z-[1] h-full w-full object-cover");
+  assert.equal(logo?.getAttribute("class"), "relative z-raised h-full w-full object-cover");
   const fallbackLayer = logo?.previousElementSibling;
   assert.equal(fallbackLayer?.tagName, "SPAN");
   assert.equal(fallbackLayer?.classList.contains("absolute"), true);
-  assert.equal(fallbackLayer?.classList.contains("z-0"), true);
+  assert.equal(fallbackLayer?.classList.contains("z-base"), true);
   assert.equal(logo?.classList.contains("relative"), true);
-  assert.equal(logo?.classList.contains("z-[1]"), true);
+  assert.equal(logo?.classList.contains("z-raised"), true);
   // Raft Design System › Avatar: initials are Grotesk 700 (raft-ui's fallback
   // slot sets them); an app keeps the default identity sticker (only a
   // workspace is the ink tile).
@@ -329,10 +337,10 @@ test("RequestedScopeConsent renders default spacing and identity-only grant copy
     assert.equal(row.classList.contains("border"), false);
     assert.equal(row.classList.contains("bg-white"), false);
   }
-  assert.equal(within(requested).queryByText("Agent messaging"), null);
-  assert.equal(within(requested).queryByText(enMessages["oauth.consent.agentLoginRequiredNotice"]), null);
-  assert.equal(within(requested).queryByText("No recognized Raft scopes were requested."), null);
-  assert.equal(within(requested).queryByText("Unrecognized scopes:"), null);
+  assert.ok(within(requested).queryByText("Agent messaging") === null);
+  assert.ok(within(requested).queryByText(enMessages["oauth.consent.agentLoginRequiredNotice"]) === null);
+  assert.ok(within(requested).queryByText("No recognized Raft scopes were requested.") === null);
+  assert.ok(within(requested).queryByText("Unrecognized scopes:") === null);
 });
 
 test("RequestedScopeConsent keeps the localized identity meaning visible while collapsed", () => {
@@ -358,8 +366,8 @@ test("RequestedScopeConsent trims and dedupes unrecognized scopes", () => {
   assert.ok(within(requested).getByText("Unrecognized scopes:"));
   assert.equal(within(requested).getAllByText("unknown").length, 1);
   assert.ok(within(requested).getByText("agent:action_request:write"));
-  assert.equal(within(requested).queryByText(enMessages["oauth.consent.agentLoginRequiredNotice"]), null);
-  assert.equal(within(requested).queryByText("Stryker was here"), null);
+  assert.ok(within(requested).queryByText(enMessages["oauth.consent.agentLoginRequiredNotice"]) === null);
+  assert.ok(within(requested).queryByText("Stryker was here") === null);
 });
 
 test("RequestedScopeConsent expands only agent messaging for mixed scopes", () => {
@@ -372,8 +380,8 @@ test("RequestedScopeConsent expands only agent messaging for mixed scopes", () =
   assert.ok(within(requested).getByText("agent:event:write"));
   assert.ok(within(requested).getByText("Sends structured event messages to the one agent you authorize."));
   assert.ok(within(requested).getByText(enMessages["oauth.consent.agentLoginRequiredNotice"]));
-  assert.equal(within(requested).queryByText("No recognized Raft scopes were requested."), null);
-  assert.equal(within(requested).queryByText("Unrecognized scopes:"), null);
+  assert.ok(within(requested).queryByText("No recognized Raft scopes were requested.") === null);
+  assert.ok(within(requested).queryByText("Unrecognized scopes:") === null);
 
   const details = Array.from(requested.querySelectorAll("details")) as HTMLDetailsElement[];
   assert.equal(details.length, 2);
@@ -415,6 +423,8 @@ test("Connected Apps loads registered surfaces without depending on the retired 
             allowedScopes: ["openid", "profile", "identity", "agent:event:write"],
             createdAt: "2026-06-25T00:00:00.000Z",
             updatedAt: "2026-06-25T00:00:00.000Z",
+            installationId: "private-install",
+            installStatus: "active",
           },
           {
             id: "pending-client",
@@ -447,6 +457,8 @@ test("Connected Apps loads registered surfaces without depending on the retired 
             agentManifestUrl: null,
             createdAt: "2026-06-25T00:00:00.000Z",
             updatedAt: "2026-06-25T00:00:00.000Z",
+            installationId: "published-install",
+            installStatus: "active",
           },
           {
             id: "offline-client",
@@ -557,6 +569,18 @@ test("Connected Apps loads registered surfaces without depending on the retired 
     throw new Error(`unexpected GET ${url}`);
   }) as typeof api.get;
 
+  const sharePosts: string[] = [];
+  const accidentalEditorPatches: string[] = [];
+  api.post = (async (url: string) => {
+    if (url === "/feature-flags/evaluate") return { data: { enabled: false } };
+    if (url !== "/integrations/clients/private-client/share-links") throw new Error(`unexpected POST ${url}`);
+    sharePosts.push(url);
+    return { data: { client: { id: "private-client", clientId: "private-client", appType: "third_party_global",
+      name: "Private Reports", publishStatus: "private", allowedScopes: ["openid", "profile"] },
+      link: { id: "link-1", targetServerSlug: "target-team" }, token: "synthetic-test-token" } };
+  }) as typeof api.post;
+  api.patch = (async (url: string) => { accidentalEditorPatches.push(url); return { data: {} }; }) as typeof api.patch;
+
   render(
     <TestIntlProvider>
       <MemoryRouter>
@@ -565,56 +589,29 @@ test("Connected Apps loads registered surfaces without depending on the retired 
     </TestIntlProvider>,
   );
 
-  assert.ok(await screen.findByTestId("connected-apps-marketplace-tab"));
-  assert.equal(screen.queryByTestId("connected-apps-built-in-band"), null);
+  // Installed is the tab the page opens on, in the grid view by default; the
+  // switch at the toolbar's end turns every tab into a list, remembered.
+  const installedTab = await screen.findByTestId("connected-apps-installed-tab");
+  assert.ok(screen.queryByTestId("connected-apps-built-in-band") === null);
   assert.equal(getCalls.includes("/integrations/built-in"), false);
   const viewToggle = screen.getByTestId("connected-apps-view-toggle");
-  const gridViewButton = within(viewToggle).getByRole("button", { name: "Grid view" });
-  const listViewButton = within(viewToggle).getByRole("button", { name: "List view" });
-  const categoryFilter = screen.getByRole("combobox", { name: "Filter connected apps by category" });
-  const searchFilter = screen.getByTestId("connected-apps-search");
-  const filters = screen.getByTestId("connected-apps-filters");
-  // The filter row's controls share the DS control height (44).
-  assert.ok(categoryFilter.classList.contains("h-11"));
-  assert.ok(categoryFilter.classList.contains("min-h-11"));
-  assert.ok(searchFilter.classList.contains("box-border"));
-  assert.ok(searchFilter.classList.contains("h-11"));
-  assert.ok(filters.classList.contains("items-stretch"));
-  assert.ok(viewToggle.classList.contains("box-border"));
-  assert.ok(within(viewToggle).getByRole("button", { name: "Grid view" }).classList.contains("h-8"));
-  assert.equal(gridViewButton.getAttribute("aria-pressed"), "true");
-  const marketplaceCollection = screen.getByTestId("connected-apps-marketplace-collection");
-  assert.equal(marketplaceCollection.getAttribute("data-view"), "grid");
-  assert.ok(within(marketplaceCollection).getByText("100+ installs"));
-  assert.ok(within(marketplaceCollection).getByText("New"));
-  assert.equal(within(marketplaceCollection).queryByText("Reviewed shared notes."), null);
-  fireEvent.click(listViewButton);
-  assert.equal(listViewButton.getAttribute("aria-pressed"), "true");
-  assert.equal(marketplaceCollection.getAttribute("data-view"), "list");
-  assert.ok(Array.from(marketplaceCollection.children).every((card) => card.classList.contains("w-full")));
-  assert.ok(within(marketplaceCollection).getByText("Reviewed shared notes."));
-  assert.equal(window.localStorage.getItem("raft:connected-apps:view-mode"), "list");
-  fireEvent.click(gridViewButton);
-  assert.equal(gridViewButton.getAttribute("aria-pressed"), "true");
-  assert.equal(within(marketplaceCollection).queryByText("Reviewed shared notes."), null);
-  assert.equal(window.localStorage.getItem("raft:connected-apps:view-mode"), "grid");
-
-  fireEvent.click(screen.getByRole("combobox", { name: "Filter connected apps by category" }));
-  assert.ok(await screen.findByRole("option", { name: "All categories" }));
-  for (const category of OAUTH_CLIENT_CATEGORIES) {
-    assert.ok(screen.getByRole("option", { name: category }));
-  }
-  fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
-
-  fireEvent.click(screen.getByTestId("connected-apps-tab-installed"));
-  const installedTab = await screen.findByTestId("connected-apps-installed-tab");
+  const gridViewButton = within(viewToggle).getByRole("radio", { name: "Grid view" });
+  const listViewButton = within(viewToggle).getByRole("radio", { name: "List view" });
+  assert.equal(gridViewButton.getAttribute("aria-checked"), "true");
+  assert.ok(await within(installedTab).findByText("Marketplace Notes"));
   assert.equal(within(installedTab).getByTestId("connected-apps-installed-collection").getAttribute("data-view"), "grid");
-  assert.equal(within(installedTab).queryByText("Experimental"), null);
-  assert.ok(within(installedTab).getByText("Marketplace Notes"));
-  assert.equal(within(installedTab).queryByText("Reviewed shared notes."), null);
+  assert.ok(within(installedTab).queryByText("Reviewed shared notes.") === null, "a grid card has no description");
+  fireEvent.click(listViewButton);
+  assert.equal(listViewButton.getAttribute("aria-checked"), "true");
+  assert.equal(window.localStorage.getItem("raft:connected-apps:view-mode"), "list");
+  assert.equal(within(installedTab).getByTestId("connected-apps-installed-collection").getAttribute("data-view"), "list");
+  assert.ok(within(installedTab).queryByText("Experimental") === null);
+  assert.ok(within(installedTab).getByText("Reviewed shared notes."), "a row shows its description");
   assert.ok(within(installedTab).getByText("Private Reports"));
   assert.equal(within(installedTab).getAllByText("Published Reports").length, 1);
-  assert.equal(within(installedTab).getAllByRole("button", { name: "Edit" }).length, 3);
+  // Apps v4 D3: an App built here and not installed here is under Developer only.
+  assert.ok(within(installedTab).queryByText("Reviewing Reports") === null, "the uninstalled own App is not in Installed");
+  assert.equal(within(installedTab).getAllByRole("button", { name: "Edit" }).length, 2);
   assert.equal(within(installedTab).getAllByRole("button", { name: "Uninstall" }).length, 1);
   fireEvent.click(within(installedTab).getByRole("button", { name: "Uninstall" }));
   const uninstallDialog = await screen.findByRole("dialog");
@@ -622,62 +619,46 @@ test("Connected Apps loads registered surfaces without depending on the retired 
   fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
   assert.ok(within(installedTab).getAllByText("This server").length >= 1);
   assert.ok(within(installedTab).getByText("Infrastructure"));
-  const installedLink = within(installedTab).getByRole("link", { name: "notes.example.com" });
-  assert.equal(installedLink.getAttribute("href"), "https://notes.example.com/app");
-  assert.equal(installedLink.getAttribute("target"), "_blank");
-  assert.equal(installedLink.getAttribute("rel"), "noreferrer");
-  assert.ok(installedLink.classList.contains("inline-flex"));
-  assert.ok(installedLink.classList.contains("font-mono"));
-  assert.ok(installedLink.classList.contains("mt-1"));
-  fireEvent.click(listViewButton);
-  assert.ok(
-    Array.from(within(installedTab).getByTestId("connected-apps-installed-collection").children)
-      .every((card) => card.classList.contains("w-full")),
-  );
-  assert.ok(within(installedTab).getByText("Reviewed shared notes."));
-  fireEvent.click(gridViewButton);
-  assert.equal(within(installedTab).queryByText("Reviewed shared notes."), null);
+
+  // The toolbar: search, then Type and Category; Sort orders only the Marketplace.
+  assert.ok(screen.getByTestId("connected-apps-search"));
+  assert.ok(screen.getByRole("combobox", { name: "All types" }));
+  assert.ok(screen.queryByTestId("apps-filter-sort") === null);
+  fireEvent.click(screen.getByRole("combobox", { name: "All categories" }));
+  assert.ok(await screen.findByRole("option", { name: "All categories" }));
+  for (const category of OAUTH_CLIENT_CATEGORIES) {
+    // Each category value is shown as its catalog label (AI & automation).
+    assert.ok(screen.getByRole("option", { name: enMessages[CONNECTED_APP_CATEGORY_LABEL_ID[category]!] }));
+  }
+  fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
+
+  fireEvent.click(screen.getByTestId("connected-apps-tab-marketplace"));
+  const marketplaceCollection = await screen.findByTestId("connected-apps-marketplace-collection");
+  assert.ok(within(marketplaceCollection).getByText("100+ installs"));
+  assert.ok(within(marketplaceCollection).getByText("New"));
+  assert.ok(within(marketplaceCollection).getByText("Reviewed shared notes."));
+  assert.ok(screen.getByTestId("apps-filter-sort"), "the Marketplace has a Sort");
 
   fireEvent.click(screen.getByTestId("connected-apps-tab-my-apps"));
   const myAppsTab = await screen.findByTestId("connected-apps-my-apps-tab");
-  assert.equal(within(myAppsTab).getByTestId("connected-apps-my-apps-collection").getAttribute("data-view"), "grid");
   assert.ok(within(myAppsTab).getByText("Private Reports"));
   assert.ok(within(myAppsTab).getByText("Infrastructure"));
-  assert.equal(within(myAppsTab).queryByText("Shared private reporting workflows."), null);
-  assert.ok(
-    within(myAppsTab)
-      .getAllByRole("link", { name: "reports.example.com" })
-      .some((link) => link.getAttribute("href") === "https://reports.example.com/private"),
-  );
+  assert.ok(within(myAppsTab).getByText("Shared private reporting workflows."));
   assert.ok(within(myAppsTab).getByText("Reviewing Reports"));
-  assert.equal(within(myAppsTab).queryByText("Source-owned app waiting on marketplace review."), null);
-  assert.ok(within(myAppsTab).getByText("Marketplace review is pending. You can edit this app while it waits, or delete it to withdraw the request."));
+  assert.ok(within(myAppsTab).getByText("Source-owned app waiting on marketplace review."));
   assert.ok(within(myAppsTab).getByText("Published Reports"));
-  assert.equal(within(myAppsTab).queryByText("Source-owned published marketplace listing."), null);
+  assert.ok(within(myAppsTab).getByText("Source-owned published marketplace listing."));
   assert.ok(within(myAppsTab).getByText("Offline Reports"));
   assert.ok(within(myAppsTab).getByText("Offline requested"));
-  assert.ok(within(myAppsTab).getByText("Marketplace offline review is pending. The app stays listed and installable until App Admin approves removal. Approval preserves the source Server’s installation and access, but removes them on other Servers."));
-  assert.equal(within(myAppsTab).getAllByRole("button", { name: "Edit" }).length, 3);
-  assert.equal(within(myAppsTab).queryByRole("button", { name: "Delete" }), null);
-  assert.equal(within(myAppsTab).queryByRole("button", { name: "Request Offline" }), null);
-
-  fireEvent.click(listViewButton);
-  assert.equal(within(myAppsTab).getByTestId("connected-apps-my-apps-collection").getAttribute("data-view"), "list");
-  assert.ok(
-    Array.from(within(myAppsTab).getByTestId("connected-apps-my-apps-collection").children)
-      .every((card) => card.classList.contains("w-full")),
-  );
-  assert.ok(within(myAppsTab).getByText("Shared private reporting workflows."));
-  assert.ok(within(myAppsTab).getByText("Source-owned app waiting on marketplace review."));
-  assert.ok(within(myAppsTab).getByText("Source-owned published marketplace listing."));
-  assert.equal(within(myAppsTab).queryByRole("link", { name: "reports.example.com" }), null);
-  assert.ok(within(myAppsTab).getByText("Private Reports"));
   assert.ok(within(myAppsTab).getByText("Private"));
-  assert.ok(within(myAppsTab).getAllByRole("button", { name: "Edit" }).length > 0);
-  fireEvent.click(gridViewButton);
+  assert.equal(within(myAppsTab).getAllByRole("button", { name: "Edit" }).length, 3);
+  assert.ok(within(myAppsTab).queryByRole("button", { name: "Delete" }) === null);
+  assert.ok(within(myAppsTab).queryByRole("button", { name: "Request Offline" }) === null);
 
   fireEvent.click(within(myAppsTab).getAllByRole("button", { name: "Edit" })[0]);
   const editor = await screen.findByTestId("connected-app-editor");
+  // An existing App's logo field is its picture and Upload: no hint line (HelperText step 1, as an MCP App's).
+  assert.ok(!editor.textContent?.includes("Upload a square logo"), "no logo hint once the App exists");
   // A wide centred dialog: the section list beside the scrolling sections,
   // each section's status a quiet tag beside its heading, and the commit in
   // the footer (Cancel, then the one pink button), never in the head.
@@ -736,14 +717,23 @@ test("Connected Apps loads registered surfaces without depending on the retired 
   assert.ok(deleteButton.classList.contains("bg-danger"));
   assert.ok(deleteButton.classList.contains("border-sticker-ink"));
   assert.ok(deleteButton.classList.contains("h-8"));
-  assert.ok(deleteButton.classList.contains("text-footnote"));
+  assert.ok(deleteButton.classList.contains("text-control"));
   assert.equal(deleteButton.classList.contains("border-danger"), false);
+  // The share controls live inside the actual editor form. Creating a link
+  // must not submit the outer form or close the editor before revealing it.
+  const shareTarget = within(editor).getByTestId("connected-app-share-target-input");
+  fireEvent.change(shareTarget, { target: { value: "target-team" } });
+  fireEvent.click(within(editor).getByTestId("connected-app-share-create-button"));
+  await waitFor(() => assert.deepEqual(sharePosts, ["/integrations/clients/private-client/share-links"]));
+  assert.deepEqual(accidentalEditorPatches, []);
+  assert.ok(await within(editor).findByTestId("connected-app-share-created"));
+  assert.ok(screen.getByTestId("connected-app-editor"));
   fireEvent.click(within(editor).getByRole("button", { name: "Close app form" }));
 
   fireEvent.click(screen.getByTestId("connected-apps-tab-marketplace"));
   fireEvent.click(await screen.findByText("Marketplace Notes"));
   const privateDetail = await screen.findByText("Requestable (declared)");
-  const privateModal = privateDetail.closest('[data-slot="dialog-surface"]');
+  const privateModal = privateDetail.closest('[role="dialog"]');
   assert.ok(privateModal, "marketplace app detail should open in a modal card");
   assert.ok(within(privateModal as HTMLElement).getByText("100+ installs"));
   assert.ok(within(privateModal as HTMLElement).getByText("Profile"));
@@ -752,10 +742,10 @@ test("Connected Apps loads registered surfaces without depending on the retired 
   assert.ok(within(privateModal as HTMLElement).getByText("Danger zone"));
   assert.ok(within(privateModal as HTMLElement).getByText("Scopes this app may ask for when a human or agent connects."));
   assert.equal(within(privateModal as HTMLElement).getAllByText("Declared access").length, 1);
-  assert.equal(within(privateModal as HTMLElement).queryByText("Read note metadata."), null);
-  assert.ok(within(privateModal as HTMLElement).getByText("Productivity & Collaboration · by Notes Workspace"));
+  assert.ok(within(privateModal as HTMLElement).queryByText("Read note metadata.") === null);
+  assert.ok(within(privateModal as HTMLElement).getByText("Productivity & collaboration · by Notes Workspace"));
   assert.equal(within(privateModal as HTMLElement).getAllByText("Notes Workspace").length, 1);
-  assert.equal(within(privateModal as HTMLElement).queryByText("Notes Inc"), null);
+  assert.ok(within(privateModal as HTMLElement).queryByText("Notes Inc") === null);
   assert.ok(within(privateModal as HTMLElement).getByText("openid"));
   assert.ok(within(privateModal as HTMLElement).getByText("profile"));
   assert.ok(within(privateModal as HTMLElement).getByText("identity"));
@@ -773,11 +763,11 @@ test("Connected Apps loads registered surfaces without depending on the retired 
   fireEvent.click(screen.getByTestId("connected-apps-tab-installed"));
   const filteredInstalledTab = await screen.findByTestId("connected-apps-installed-tab");
   assert.ok(within(filteredInstalledTab).getByText("Private Reports"));
-  assert.equal(within(filteredInstalledTab).queryByText("Marketplace Notes"), null);
+  assert.ok(within(filteredInstalledTab).queryByText("Marketplace Notes") === null);
   fireEvent.click(screen.getByTestId("connected-apps-tab-my-apps"));
   const filteredMyAppsTab = await screen.findByTestId("connected-apps-my-apps-tab");
   assert.ok(within(filteredMyAppsTab).getByText("Private Reports"));
-  assert.equal(within(filteredMyAppsTab).queryByText("Published Reports"), null);
+  assert.ok(within(filteredMyAppsTab).queryByText("Published Reports") === null);
 });
 
 test("Connected Apps detail modal renders cataloged zh-cn headings and App Notifications authority copy", async () => {
@@ -842,24 +832,16 @@ test("Connected Apps detail modal renders cataloged zh-cn headings and App Notif
     </TestIntlProvider>,
   );
 
+  fireEvent.click(await screen.findByTestId("connected-apps-tab-marketplace"));
   fireEvent.click(await screen.findByText("Approved Notes"));
-  const approvedModal = (await screen.findByText("可请求（已声明）")).closest('[data-slot="dialog-surface"]') as HTMLElement;
+  const approvedModal = (await screen.findByText("可请求（已声明）")).closest('[role="dialog"]') as HTMLElement;
   assert.ok(approvedModal, "approved marketplace app detail should open in a modal card");
-  assert.ok(within(approvedModal).getByText("资料"));
-  assert.ok(within(approvedModal).getByText("使用 Raft 登录"));
-  assert.ok(within(approvedModal).getAllByText("应用权限").length >= 1);
-  assert.ok(within(approvedModal).getByText("分发"));
-  assert.ok(within(approvedModal).getByText("危险区"));
-  assert.ok(within(approvedModal).getByText("此应用在人类或 Agent 连接时可请求的 scope。"));
-  assert.ok(within(approvedModal).getByText("已声明访问"));
-  assert.ok(within(approvedModal).getByText("此安装请求的应用权限。读取数据不需要登录或启用 webhook。"));
-  assert.equal(within(approvedModal).queryByText("Permissions this app receives when installed."), null);
+  assert.ok(within(approvedModal).queryByText("Permissions this app receives when installed.") === null);
   fireEvent.click(within(approvedModal).getByRole("button", { name: "关闭应用详情" }));
 
   fireEvent.click(await screen.findByText("Pending Notes"));
-  const pendingModal = (await screen.findByText("新增的应用权限正在等待审核，原有已批准的访问保持可用。")).closest('[data-slot="dialog-surface"]') as HTMLElement;
+  const pendingModal = (await screen.findByText("新增的应用权限正在等待审核，原有已批准的访问保持可用。")).closest('[role="dialog"]') as HTMLElement;
   assert.ok(pendingModal, "pending marketplace app detail should open in a modal card");
-  assert.ok(within(pendingModal).getByText("权限更新待审核"));
 });
 
 test("Connected Apps gives members the full read surface without management actions", async () => {
@@ -897,6 +879,8 @@ test("Connected Apps gives members the full read surface without management acti
           allowedScopes: ["openid", "profile"],
           createdAt: "2026-06-25T00:00:00.000Z",
           updatedAt: "2026-06-25T00:00:00.000Z",
+          installationId: "member-visible-install",
+          installStatus: "active",
         }],
       };
     }
@@ -924,6 +908,10 @@ test("Connected Apps gives members the full read surface without management acti
       };
     }
     if (url === "/integrations/overview") return { data: [] };
+    // MCP Apps are Apps too: members read their list (and see them in Installed / My apps).
+    if (url === "/mcp/apps") return { data: { apps: [] } };
+    // The person's own link-preview answers (the Link Previews row after the Apps).
+    if (url === "/integrations/link-preview-consents") return { data: { allowed: [], declined: [] } };
     throw new Error(`unexpected GET ${url}`);
   }) as typeof api.get;
 
@@ -935,42 +923,48 @@ test("Connected Apps gives members the full read surface without management acti
     </TestIntlProvider>,
   );
 
+  // A member reads the same page: the note says who can change it.
+  assert.ok(await screen.findByTestId("apps-admin-only-note"));
+  fireEvent.click(await screen.findByTestId("connected-apps-tab-marketplace"));
   await screen.findByText("Marketplace Notes");
   const marketplaceTab = screen.getByTestId("connected-apps-marketplace-tab");
   assert.deepEqual(new Set(getCalls), new Set([
     "/integrations/clients",
+    "/integrations/link-preview-consents",
     "/integrations/marketplace",
+    "/integrations/marketplace/listings",
     "/integrations/overview",
+    "/mcp/apps",
   ]));
-  assert.equal(within(marketplaceTab).queryByText("Raft Survey"), null);
-  assert.equal(within(marketplaceTab).queryByTestId("connected-apps-built-in-band"), null);
+  assert.ok(within(marketplaceTab).queryByText("Raft Survey") === null);
+  assert.ok(within(marketplaceTab).queryByTestId("connected-apps-built-in-band") === null);
   assert.ok(within(marketplaceTab).getByText("Marketplace Notes"));
   assert.ok(within(marketplaceTab).getByText("Available"));
-  assert.equal(screen.queryByRole("button", { name: "Register App" }), null);
-  assert.equal(within(marketplaceTab).queryByText("Install", { exact: true }), null);
+  assert.ok(screen.queryByRole("button", { name: "Add app" }) === null);
+  assert.ok(within(marketplaceTab).queryByText("Install", { exact: true }) === null);
 
   fireEvent.click(within(marketplaceTab).getByText("Marketplace Notes"));
-  const detail = (await screen.findByText("Profile")).closest('[data-slot="dialog-surface"]');
+  const detail = (await screen.findByText("Profile")).closest('[role="dialog"]');
   assert.ok(detail);
   assert.ok(within(detail as HTMLElement).getByText("Login with Raft"));
   assert.ok(within(detail as HTMLElement).getByText("Distribution"));
   assert.ok(within(detail as HTMLElement).getByRole("button", { name: "Close" }));
-  assert.equal(within(detail as HTMLElement).queryByRole("button", { name: "Install to this server" }), null);
+  assert.ok(within(detail as HTMLElement).queryByRole("button", { name: "Install to this server" }) === null);
 
   fireEvent.click(within(detail as HTMLElement).getByRole("button", { name: "Close" }));
   fireEvent.click(screen.getByTestId("connected-apps-tab-installed"));
   const installedTab = await screen.findByTestId("connected-apps-installed-tab");
   assert.ok(within(installedTab).getByText("Server Reports"));
-  assert.equal(within(installedTab).queryByRole("button", { name: "Edit" }), null);
-  assert.equal(within(installedTab).queryByRole("button", { name: "Uninstall" }), null);
+  assert.ok(within(installedTab).queryByRole("button", { name: "Edit" }) === null);
+  assert.ok(within(installedTab).queryByRole("button", { name: "Uninstall" }) === null);
 
   fireEvent.click(screen.getByTestId("connected-apps-tab-my-apps"));
   const myAppsTab = await screen.findByTestId("connected-apps-my-apps-tab");
   assert.ok(within(myAppsTab).getByText("Server Reports"));
-  assert.ok(within(myAppsTab).getByText("Apps registered by this server are shown here. Only server owners and admins can change them."));
-  assert.equal(within(myAppsTab).queryByRole("button", { name: "Edit" }), null);
-  assert.equal(within(myAppsTab).queryByRole("button", { name: "Request Offline" }), null);
-  assert.equal(within(myAppsTab).queryByRole("button", { name: "Delete" }), null);
+  assert.ok(within(myAppsTab).getByText("Raft Apps this server builds. Only server owners and admins can change them."));
+  assert.ok(within(myAppsTab).queryByRole("button", { name: "Edit" }) === null);
+  assert.ok(within(myAppsTab).queryByRole("button", { name: "Request Offline" }) === null);
+  assert.ok(within(myAppsTab).queryByRole("button", { name: "Delete" }) === null);
 });
 
 test("Connected Apps edit drawer regenerates a client secret and reveals it once", async () => {
@@ -1000,7 +994,7 @@ test("Connected Apps edit drawer regenerates a client secret and reveals it once
     if (url === "/integrations/built-in") return { data: [] };
     if (url === "/integrations/marketplace") return { data: [] };
     if (url === "/integrations/overview") return { data: [] };
-    if (url === "/integrations/clients/private-client/share-link") {
+    if (url === "/integrations/clients/private-client/share-links") {
       throw { response: { status: 404, data: { error: "not found" } } };
     }
     throw new Error(`unexpected GET ${url}`);
@@ -1038,7 +1032,7 @@ test("Connected Apps edit drawer regenerates a client secret and reveals it once
   fireEvent.click(within(myAppsTab).getByRole("button", { name: "Edit" }));
 
   const regenerateButton = await screen.findByTestId("connected-app-regenerate-secret-button");
-  assert.equal(regenerateButton.textContent, "Regenerate Client Secret");
+  assert.equal(regenerateButton.textContent, "Regenerate client secret");
   fireEvent.click(regenerateButton);
 
   const confirmButton = await screen.findByTestId("connected-app-regenerate-secret-confirm-button");
@@ -1118,6 +1112,7 @@ test("Connected Apps renders reviewed App Notifications state for developers and
     approved_request_revision_id: "revision-1",
     requested_groups: ["agent", "server"],
     requested_events: ["agent.model_changed", "server.plan_changed"],
+    requested_scopes: ["openid", "profile"],
     approved_groups: ["server"],
     subscribed_events: ["server.plan_changed"],
     effective_groups: ["server"],
@@ -1134,7 +1129,7 @@ test("Connected Apps renders reviewed App Notifications state for developers and
     if (url === "/integrations/built-in") return { data: [] };
     if (url === "/integrations/marketplace") return { data: [installedClient] };
     if (url === "/integrations/overview") return { data: [] };
-    if (url === "/integrations/clients/developer-client/share-link") {
+    if (url === "/integrations/clients/developer-client/share-links") {
       throw { response: { status: 404, data: { error: "not found" } } };
     }
     if (url === "/integrations/clients/developer-client/app-notifications") {
@@ -1147,7 +1142,8 @@ test("Connected Apps renders reviewed App Notifications state for developers and
   }) as typeof api.get;
   api.put = (async (url: string, body?: unknown) => {
     if (url === "/integrations/marketplace/installed-client/install/app-notifications/grant") {
-      assert.equal(body, undefined);
+      // Approving sends back exactly the set the page showed.
+      assert.deepEqual(body, { expected_scopes: ["openid", "profile"], expected_groups: ["agent", "server"] });
       installationState.approved_request_revision_id = "revision-2";
       installationState.approved_groups = ["agent", "server"];
       installationState.effective_groups = ["agent", "server"];
@@ -1190,11 +1186,12 @@ test("Connected Apps renders reviewed App Notifications state for developers and
     </TestIntlProvider>,
   );
 
+  fireEvent.click(await screen.findByTestId("connected-apps-tab-marketplace"));
   fireEvent.click(await screen.findByRole("button", { name: /Installed Alerts/ }));
   const installSummary = await screen.findByTestId("app-notifications-request-summary");
   assert.ok(within(installSummary).getByText("Server · read"));
   assert.ok(within(installSummary).getByText("Plan status changed"));
-  assert.equal(within(installSummary).queryByRole("checkbox"), null);
+  assert.ok(within(installSummary).queryByRole("checkbox") === null);
   fireEvent.click(screen.getByRole("button", { name: "Close app detail" }));
 
   fireEvent.click(await screen.findByTestId("connected-apps-tab-my-apps"));
@@ -1212,56 +1209,63 @@ test("Connected Apps renders reviewed App Notifications state for developers and
   assert.equal(installationInput.selectionStart, 0);
   assert.equal(installationInput.selectionEnd, installationInput.value.length);
   assert.ok(within(sourceInstallation).getByText("Installed", { exact: true }));
-  assert.ok(within(developerPanel).getByText("Pending App Review"));
+  assert.ok(within(developerPanel).getByText("Pending app review"));
   assert.ok(within(developerPanel).getByTestId("app-notifications-delivery"));
   assert.match(notificationsRailButton.textContent ?? "", /Off/);
   assert.ok(within(notificationsSection).getByText("Off", { exact: true }));
-  assert.equal(within(developerPanel).queryByTestId("app-notifications-permissions"), null);
-  const enableSwitch = within(developerPanel).getByRole("switch", { name: "Enable Webhook" });
-  assert.equal(enableSwitch.getAttribute("aria-checked"), "false");
-  assert.equal(within(developerPanel).queryByTestId("app-notifications-permission-picker"), null);
-  assert.equal(within(developerPanel).queryByPlaceholderText("https://example.com/raft/events"), null);
-  fireEvent.click(enableSwitch);
+  assert.ok(within(developerPanel).queryByTestId("app-notifications-permissions") === null);
+  // Sending events needs an endpoint first: a checkbox, the endpoint under it
+  // and one Save for both. Checking it only opens the draft.
+  const enableBox = within(developerPanel).getByRole("checkbox", { name: "Enable webhook" });
+  assert.equal(enableBox.getAttribute("aria-checked"), "false");
+  assert.ok(within(developerPanel).queryByRole("switch") === null);
+  assert.ok(within(developerPanel).queryByTestId("app-notifications-permission-picker") === null);
+  assert.ok(within(developerPanel).queryByPlaceholderText("https://example.com/raft/events") === null);
+  fireEvent.click(enableBox);
   assert.match(notificationsRailButton.textContent ?? "", /Setup/);
   assert.ok(within(notificationsSection).getByText("Setup", { exact: true }));
   assert.ok(within(developerPanel).getByTestId("app-notifications-permissions"));
   assert.ok(within(developerPanel).getByText("Revision 2 is pending App Review. Current approved permissions remain active until review completes."));
   assert.ok(within(developerPanel).getByText("Plan status changed"));
+  const saveButton = within(developerPanel).getByTestId("app-notifications-save") as HTMLButtonElement;
+  assert.equal(saveButton.textContent, "Save");
+  assert.equal(saveButton.disabled, true, "nothing to save until there is an endpoint");
   fireEvent.change(within(developerPanel).getByPlaceholderText("https://example.com/raft/events"), {
     target: { value: "https://alerts.example.com/raft/events" },
   });
-  const saveEndpointButton = within(developerPanel).getByRole("button", { name: "Save endpoint" });
-  // The button takes the large control size so it matches the endpoint field
-  // beside it (44px in the raft family; this harness renders the default
-  // family, whose large size is h-10).
-  assert.match(saveEndpointButton.className, /(?:^|\s)h-1[01](?:\s|$)/);
-  fireEvent.click(saveEndpointButton);
+  assert.equal(saveButton.disabled, false);
+  fireEvent.click(saveButton);
   assert.ok(await within(developerPanel).findByText("raft_webhook_secret_shown_once"));
   assert.ok(within(developerPanel).getByText("Signing secret · shown once"));
   await waitFor(() => {
-    const currentSwitch = within(developerPanel).getByRole("switch", { name: "Enable Webhook" });
-    assert.equal(currentSwitch.getAttribute("aria-checked"), "true");
-    assert.equal(currentSwitch.hasAttribute("data-disabled"), false);
+    const currentBox = within(developerPanel).getByRole("checkbox", { name: "Enable webhook" });
+    assert.equal(currentBox.getAttribute("aria-checked"), "true");
+    assert.equal(currentBox.hasAttribute("data-disabled"), false);
     assert.match(notificationsRailButton.textContent ?? "", /Enabled/);
     assert.ok(within(notificationsSection).getByText("Enabled", { exact: true }));
   });
+  // Unchecking stops nothing by itself: deliveries stop once it is saved.
+  fireEvent.click(within(developerPanel).getByRole("checkbox", { name: "Enable webhook" }));
+  assert.equal(disableWebhookCount, 0);
+  assert.ok(within(developerPanel).queryByTestId("app-notifications-configuration") === null);
+  assert.ok(within(developerPanel).getByTestId("app-notifications-disable-pending"));
+  assert.match(notificationsRailButton.textContent ?? "", /Enabled/);
   await act(async () => {
-    fireEvent.click(within(developerPanel).getByRole("switch", { name: "Enable Webhook" }));
+    fireEvent.click(within(developerPanel).getByTestId("app-notifications-save"));
     await new Promise((resolve) => window.setTimeout(resolve, 0));
   });
-  assert.equal(within(developerPanel).queryByTestId("app-notifications-configuration"), null);
   assert.equal(disableWebhookCount, 1);
-  assert.match(notificationsRailButton.textContent ?? "", /Off/);
+  await waitFor(() => assert.match(notificationsRailButton.textContent ?? "", /Off/));
   assert.ok(within(notificationsSection).getByText("Off", { exact: true }));
   fireEvent.click(screen.getByRole("button", { name: "Close app form" }));
 
   fireEvent.click(screen.getByTestId("connected-apps-tab-installed"));
   const installedTab = await screen.findByTestId("connected-apps-installed-tab");
-  assert.equal(within(installedTab).queryByRole("button", { name: /App Notifications/ }), null);
+  assert.ok(within(installedTab).queryByRole("button", { name: /App notifications/ }) === null);
   const installedDetailsTrigger = within(installedTab).getByRole("button", { name: "Installed Alerts" });
   assert.equal(installedDetailsTrigger.getAttribute("tabindex"), "0");
   installedDetailsTrigger.focus();
-  assert.equal(document.activeElement, installedDetailsTrigger);
+  assert.ok(document.activeElement === installedDetailsTrigger);
   fireEvent.keyDown(installedDetailsTrigger, { key: "Enter" });
   let installedPanel = await screen.findByTestId("installed-app-notifications");
   assert.ok(within(installedPanel).getByText("Approved data"));
@@ -1272,19 +1276,31 @@ test("Connected Apps renders reviewed App Notifications state for developers and
   assert.ok(within(installedPanel).getByText("Developer subscriptions"));
   assert.ok(within(installedPanel).getByText("Active events"));
   assert.equal(within(installedPanel).getAllByText("Plan status changed").length, 2);
-  assert.equal(within(installedPanel).queryByRole("checkbox"), null);
-  assert.equal(within(installedPanel).queryByText("Manage server approval"), null);
-  assert.ok(within(installedPanel).getByText("Permissions granted to this app on this Server are independent of user login and webhook delivery. Review and approve any additional access here."));
+  assert.ok(within(installedPanel).queryByRole("checkbox") === null);
+  assert.ok(within(installedPanel).queryByText("Manage server approval") === null);
+  // No summary of the permission model under the heading (HelperText step 1); the approval banner below names the consequence.
+  assert.ok(!installedPanel.textContent?.includes("independent of user login"), installedPanel.textContent ?? "");
   const approvalBanner = within(installedPanel).getByTestId("app-notifications-approval-required");
-  assert.ok(within(approvalBanner).getByText("This app requests new data access. Review the new data groups before approving the update."));
-  assert.ok(within(approvalBanner).getByText("New data group: Agent · read"));
-  assert.equal(within(approvalBanner).queryByText("New data group: Server · read"), null);
+  assert.ok(within(approvalBanner).getByText("This app requests new access. Review it before approving the update; until then it keeps the access you approved."));
+  // The banner lists the whole set Approve Update sends back,
+  // the groups and login scopes, with only the additions marked New.
+  const approvalSet = within(approvalBanner).getByTestId("app-permission-set");
+  const groupRow = (group: string) => approvalSet.querySelector(`[data-app-permission-kind="group"][data-app-permission-value="${group}"]`);
+  const agentRow = groupRow("agent");
+  const serverRow = groupRow("server");
+  assert.ok(agentRow !== null && serverRow !== null);
+  assert.ok(within(agentRow as HTMLElement).getByText("Agent · read"));
+  assert.ok(within(agentRow as HTMLElement).getByText("New in this update"));
+  assert.ok(within(serverRow as HTMLElement).getByText("Server · read"));
+  assert.ok(within(serverRow as HTMLElement).queryByText("New in this update") === null);
+  assert.ok(approvalSet.querySelector('[data-app-permission-kind="scope"][data-app-permission-value="openid"]') !== null);
+  assert.ok(approvalSet.querySelector('[data-app-permission-kind="scope"][data-app-permission-value="profile"]') !== null);
   fireEvent.click(within(installedPanel).getByRole("button", { name: "Approve update" }));
-  await waitFor(() => assert.equal(within(installedPanel).queryByRole("button", { name: "Approve update" }), null));
+  await waitFor(() => assert.ok(within(installedPanel).queryByRole("button", { name: "Approve update" }) === null));
   fireEvent.click(screen.getByRole("button", { name: "Close installed app details" }));
   fireEvent.click(within(installedTab).getByRole("button", { name: "Uninstall" }));
   assert.ok(await screen.findByText("Uninstall Installed Alerts?"));
-  assert.equal(screen.queryByTestId("installed-app-notifications"), null);
+  assert.ok(screen.queryByTestId("installed-app-notifications") === null);
 });
 
 test("Connected Apps saves category and declared scopes before requesting marketplace review", async () => {
@@ -1314,7 +1330,7 @@ test("Connected Apps saves category and declared scopes before requesting market
     if (url === "/integrations/built-in") return { data: [] };
     if (url === "/integrations/marketplace") return { data: [] };
     if (url === "/integrations/overview") return { data: [] };
-    if (url === "/integrations/clients/publish-client/share-link") {
+    if (url === "/integrations/clients/publish-client/share-links") {
       throw { response: { status: 404, data: { error: "not found" } } };
     }
     throw new Error(`unexpected GET ${url}`);
@@ -1325,6 +1341,8 @@ test("Connected Apps saves category and declared scopes before requesting market
     return { data: client };
   }) as typeof api.patch;
   api.post = (async (url: string, body?: unknown) => {
+    // The editor reads this Server's feature flags; not part of the flow under test.
+    if (url === "/feature-flags/evaluate") return { data: { evaluations: [] } };
     postCalls.push({ url, body });
     return { data: { ...client, publishStatus: "publish_requested", dataAccessSummary: null } };
   }) as typeof api.post;
@@ -1339,11 +1357,11 @@ test("Connected Apps saves category and declared scopes before requesting market
 
   fireEvent.click(await screen.findByTestId("connected-apps-tab-my-apps"));
   fireEvent.click(within(await screen.findByTestId("connected-apps-my-apps-tab")).getByRole("button", { name: "Edit" }));
-  assert.equal(screen.queryByText("Declared data access"), null);
-  assert.equal(screen.queryByText("Legacy free-text that must not be rendered or resubmitted."), null);
+  assert.ok(screen.queryByText("Declared data access") === null);
+  assert.ok(screen.queryByText("Legacy free-text that must not be rendered or resubmitted.") === null);
   assert.ok(screen.getByText("Category and data access come from the app metadata and declared scopes above. Requesting review saves those changes first."));
 
-  fireEvent.click(screen.getByRole("button", { name: "Request Publish" }));
+  fireEvent.click(screen.getByRole("button", { name: "Request publish" }));
   await waitFor(() => assert.equal(postCalls.length, 1));
   assert.deepEqual(patchBodies, [{
     name: "Storage Publisher",
@@ -1354,8 +1372,61 @@ test("Connected Apps saves category and declared scopes before requesting market
     whenToUse: null,
     allowedScopes: ["openid", "profile", "agent:event:write"],
     category: "Infrastructure",
+    enableBot: false,
   }]);
   assert.deepEqual(postCalls, [{ url: "/integrations/clients/publish-client/request-publish", body: undefined }]);
+});
+
+test("Connected Apps withdraws a publish request still waiting for review, keeping the app", async () => {
+  resetStores();
+  const client = {
+    id: "pending-client",
+    clientId: "pending-client",
+    appType: "server_local",
+    name: "Pending Publisher",
+    description: "Waits for marketplace review.",
+    homepageUrl: "https://pending.example.com",
+    returnUrl: "https://pending.example.com/callback",
+    logoUrl: null,
+    publishStatus: "publish_requested",
+    category: "Infrastructure",
+    dataAccessSummary: null,
+    agentManifestUrl: null,
+    allowedScopes: ["openid", "profile"],
+    createdAt: "2026-10-20T00:00:00.000Z",
+    updatedAt: "2026-10-20T00:00:00.000Z",
+  };
+  const postCalls: string[] = [];
+  api.get = (async (url: string) => {
+    if (url === "/integrations/clients") return { data: [client] };
+    if (url === "/integrations/built-in") return { data: [] };
+    if (url === "/integrations/marketplace") return { data: [] };
+    if (url === "/integrations/overview") return { data: [] };
+    throw { response: { status: 404, data: { error: "not found" } } };
+  }) as typeof api.get;
+  api.post = (async (url: string) => {
+    if (url === "/feature-flags/evaluate") return { data: { evaluations: [] } };
+    postCalls.push(url);
+    return { data: { ...client, publishStatus: "private" } };
+  }) as typeof api.post;
+
+  render(
+    <TestIntlProvider>
+      <MemoryRouter>
+        <SettingsPanel tab="integrations" />
+      </MemoryRouter>
+    </TestIntlProvider>,
+  );
+
+  fireEvent.click(await screen.findByTestId("connected-apps-tab-my-apps"));
+  fireEvent.click(within(await screen.findByTestId("connected-apps-my-apps-tab")).getByRole("button", { name: "Edit" }));
+  const card = await screen.findByTestId("connected-app-withdraw-publish-card");
+  assert.ok(within(card).getByText("Withdrawing returns the app to private. Its registration, credentials and installations stay, and you can request review again later."));
+
+  fireEvent.click(within(card).getByRole("button", { name: "Withdraw request" }));
+  await waitFor(() => assert.deepEqual(postCalls, ["/integrations/clients/pending-client/withdraw-publish"]));
+  await waitFor(() => assert.ok(screen.queryByTestId("connected-app-withdraw-publish-card") === null));
+  assert.ok(screen.getByRole("button", { name: "Request publish" }), "the app can request review again");
 });
 
 test("Connected Apps register form locks identity scopes and toggles agent messaging declarations", async () => {
@@ -1376,7 +1447,7 @@ test("Connected Apps register form locks identity scopes and toggles agent messa
     </TestIntlProvider>,
   );
 
-  fireEvent.click(await screen.findByRole("button", { name: "Register App" }));
+  await chooseRegisterAppMenuItem("own-service");
   const newAppEditor = screen.getByTestId("connected-app-editor");
   assert.equal(
     within(newAppEditor).getByTestId("connected-app-editor-section-notifications").querySelector('[data-slot="form-section-status"]')?.textContent,
@@ -1388,7 +1459,7 @@ test("Connected Apps register form locks identity scopes and toggles agent messa
   assert.ok(within(newAppEditor).queryByTestId("connected-app-editor-section-danger") === null);
   assert.deepEqual(
     within(within(newAppEditor).getByTestId("connected-app-editor-footer")).getAllByRole("button").map((button) => button.textContent),
-    ["Cancel", "Register App"],
+    ["Cancel", "Create"],
   );
   const picker = await screen.findByTestId("connected-app-declared-scopes");
   assert.ok(within(picker).getByText("Identity"));
@@ -1402,7 +1473,7 @@ test("Connected Apps register form locks identity scopes and toggles agent messa
   assert.ok(within(picker).getByText("Agent messaging"));
   assert.ok(within(picker).getByRole("checkbox", { name: "agent:event:write" }));
   assert.ok(within(picker).getByRole("checkbox", { name: "agent:notification:write" }));
-  assert.equal(within(picker).queryByText("The user chooses the target agent when authorizing."), null);
+  assert.ok(within(picker).queryByText("The user chooses the target agent when authorizing.") === null);
 
   fireEvent.click(within(picker).getByRole("checkbox", { name: "agent:event:write" }));
   assert.ok(await within(picker).findByText("The user chooses the target agent when authorizing."));
@@ -1414,7 +1485,7 @@ test("Connected Apps register form locks identity scopes and toggles agent messa
   assert.ok(within(picker).getByText("The user chooses the target agent when authorizing."));
 
   fireEvent.click(within(picker).getByRole("checkbox", { name: "agent:notification:write" }));
-  assert.equal(within(picker).queryByText("The user chooses the target agent when authorizing."), null);
+  assert.ok(within(picker).queryByText("The user chooses the target agent when authorizing.") === null);
 });
 
 test("Connected Apps creates Agent read without webhook and retries permission failure without duplicating the app", async () => {
@@ -1445,7 +1516,7 @@ test("Connected Apps creates Agent read without webhook and retries permission f
     if (url === "/integrations/built-in") return { data: [] };
     if (url === "/integrations/marketplace") return { data: [] };
     if (url === "/integrations/overview") return { data: [] };
-    if (url === "/integrations/clients/created-client/share-link") {
+    if (url === "/integrations/clients/created-client/share-links") {
       throw { response: { status: 404, data: { error: "not found" } } };
     }
     if (url === "/integrations/clients/created-client/app-notifications") {
@@ -1491,20 +1562,20 @@ test("Connected Apps creates Agent read without webhook and retries permission f
     </TestIntlProvider>,
   );
 
-  fireEvent.click(await screen.findByRole("button", { name: "Register App" }));
+  await chooseRegisterAppMenuItem("own-service");
   fireEvent.change(screen.getByPlaceholderText("db9 Cloud Drive"), { target: { value: "Created Alerts" } });
   const registrationPanel = screen.getByTestId("developer-app-notifications");
-  const unavailableSwitch = within(registrationPanel).getByRole("switch", { name: "Enable Webhook" });
+  const unavailableSwitch = within(registrationPanel).getByRole("checkbox", { name: "Enable webhook" });
   assert.equal(unavailableSwitch.hasAttribute("data-disabled"), true);
   assert.ok(within(registrationPanel).getByText("Save the app before enabling its webhook."));
-  assert.equal(within(registrationPanel).queryByTestId("app-notifications-permission-picker"), null);
+  assert.ok(within(registrationPanel).queryByTestId("app-notifications-permission-picker") === null);
   const permissionPanel = screen.getByTestId("developer-app-permissions");
   fireEvent.click(within(permissionPanel).getByRole("combobox", { name: "Agent · read" }));
   fireEvent.pointerDown(screen.getByRole("option", { name: "Read-only" }), { pointerType: "mouse" });
   fireEvent.click(screen.getByRole("option", { name: "Read-only" }));
   const registrationForm = registrationPanel.closest("form");
   assert.ok(registrationForm);
-  fireEvent.click(within(registrationForm).getByRole("button", { name: "Register App" }));
+  fireEvent.click(within(registrationForm).getByRole("button", { name: "Create" }));
 
   assert.ok(await screen.findByText("permission write failed"));
   assert.ok(screen.getByText("raft_secret_create_once"));
@@ -1547,24 +1618,28 @@ test("Login with Raft setup page renders fetched app identity details", async ()
   const darkModeLogo = raftLogo?.closest("picture")?.querySelector("source");
   assert.equal(darkModeLogo?.getAttribute("srcset"), "/brand/raft-logo-mono-light.svg");
   assert.equal(darkModeLogo?.getAttribute("media"), "(prefers-color-scheme: dark)");
-  assert.ok(screen.getByText("Login with"));
-  assert.equal(screen.queryByText("Experimental"), null);
+  // "Login with [Raft]": the logo is an image named Raft, read as the sentence's last word.
+  const lockup = within(screen.getByRole("banner")).getByRole("img", { name: "Raft" });
+  const heading = screen.getByTestId("login-setup-heading");
+  assert.equal([...heading.childNodes].map((node) => (node === lockup ? "Raft" : node.textContent?.trim())).join(" "), "Login with Raft");
+  assert.ok(screen.queryByText("Experimental") === null);
 
   assert.ok((await screen.findAllByText("Orbital Notes")).length >= 2);
   const description = screen.getByText("Review launch notes from Raft.");
   assert.equal(description.getAttribute("class"), "text-footnote text-foreground-muted");
-  assert.equal(screen.queryByText("https://orbital.example.com/docs"), null);
-  const detailLink = screen.getByRole("link", { name: "Open Orbital Notes" });
+  assert.ok(screen.queryByText("https://orbital.example.com/docs") === null);
+  const detailLink = screen.getByRole("link", { name: "Open Orbital Notes (opens in a new tab)" });
   assert.equal(detailLink.getAttribute("href"), "https://orbital.example.com/docs");
   assert.equal(detailLink.getAttribute("target"), "_blank");
-  assert.equal(detailLink.getAttribute("rel"), "noreferrer");
+  assert.equal(detailLink.getAttribute("rel"), "noopener noreferrer");
+  assert.equal(detailLink.querySelector("svg.lucide-arrow-up-right")?.classList.contains("text-foreground-hint"), true, "↗ at the card's top right");
   assert.equal(detailLink.getAttribute("title"), null);
-  // A clickable card: the pressed overlay on hover, no lift or shadow (DS).
-  assert.equal(detailLink.classList.contains("hover:press-overlay"), true);
+  // A readable clickable card: the subtle tier on hover, no lift or shadow (DS).
+  assert.equal(detailLink.classList.contains("hover:overlay-subtle"), true);
   assert.equal(detailLink.classList.contains("hover:shadow-raft-md"), false);
 
   const logo = document.querySelector('img[src="https://cdn.example.com/orbital-notes.png"]');
-  assert.equal(logo?.getAttribute("class"), "relative z-[1] h-full w-full object-cover");
+  assert.equal(logo?.getAttribute("class"), "relative z-raised h-full w-full object-cover");
 
   const loginButton = screen.getByRole("button", { name: "Login with Raft" }) as HTMLButtonElement;
   await waitFor(() => assert.equal(loginButton.disabled, false));
@@ -1573,21 +1648,23 @@ test("Login with Raft setup page renders fetched app identity details", async ()
   assert.ok(loginButton.classList.contains("bg-attention-400"));
   assert.ok(loginButton.classList.contains("border-sticker-ink"));
   assert.equal(loginButton.classList.contains("bg-brand-soft"), false);
-  assert.equal(document.querySelector('button img[src="/brand/raft-logo.svg"]'), null);
-  assert.equal(document.querySelector('button source[srcset="/brand/raft-logo-mono-light.svg"]'), null);
+  assert.ok(document.querySelector('button img[src="/brand/raft-logo.svg"]') === null);
+  assert.ok(document.querySelector('button source[srcset="/brand/raft-logo-mono-light.svg"]') === null);
   assert.equal(loginButton.parentElement?.classList.contains("justify-end"), true);
 
   const backLink = screen.getByRole("link", { name: "Back" });
   // A real link drawn as the DS ghost button: no underline, no frame.
   assert.equal(backLink.getAttribute("href"), "/");
-  assert.equal(backLink.classList.contains("hover:bg-fill-pressed"), true);
+  assert.equal(backLink.classList.contains("hover:bg-fill-medium"), true);
   assert.equal(backLink.classList.contains("underline"), false);
-  const logoutButton = screen.getByRole("button", { name: "Log out" });
+  const logoutButton = screen.getByRole("button", { name: "Sign out" });
   assert.equal(logoutButton.getAttribute("data-slot"), "button");
 
   api.post = (async () => new Promise(() => {})) as typeof api.post;
   fireEvent.click(screen.getByRole("button", { name: "Login with Raft" }));
-  assert.ok(await screen.findByRole("button", { name: "Continuing..." }));
+  // raft-ui Button `loading`: the spinner, named by what is happening.
+  await waitFor(() => assert.equal(loginButton.getAttribute("data-loading"), "true"));
+  assert.equal(loginButton.querySelector("[data-slot=button-loading-indicator] [role=status]")?.getAttribute("aria-label"), "Continuing...");
 });
 
 test("standard OIDC setup preserves redirect, state, nonce, PKCE, and email scope at consent", async () => {
@@ -1706,6 +1783,113 @@ test("standard OIDC setup explains client-disallowed scopes before authorization
   assert.equal(postCount, 0);
 });
 
+test("an unapproved openid refusal goes back to the app's registered callback with invalid_scope and state", () => {
+  const callback = "https://vault.example.test/oauth/callback?source=raft";
+  const url = authorizationErrorRedirectUrl({
+    error: "invalid_scope",
+    errorCode: "OAUTH_SCOPE_NOT_APPROVED",
+    error_description: "This Server's admin has not approved these scopes for the app: openid.",
+    unapprovedScopes: ["openid"],
+    returnUrl: callback,
+  }, "oidc-state");
+  assert.ok(url);
+  const parsed = new URL(url);
+  assert.equal(`${parsed.origin}${parsed.pathname}`, "https://vault.example.test/oauth/callback");
+  assert.equal(parsed.searchParams.get("source"), "raft");
+  assert.equal(parsed.searchParams.get("error"), "invalid_scope");
+  assert.equal(parsed.searchParams.get("error_description"), "This Server's admin has not approved these scopes for the app: openid.");
+  assert.equal(parsed.searchParams.get("state"), "oidc-state");
+  assert.equal(parsed.searchParams.has("code"), false);
+  // Every other refusal stays on Raft's page, and an unsafe callback never navigates.
+  for (const body of [
+    { error: "invalid_scope", errorCode: "OAUTH_SCOPE_NOT_ALLOWED", returnUrl: callback },
+    { error: "installation_suspended", errorCode: "OAUTH_INSTALLATION_SUSPENDED" },
+    { errorCode: "OAUTH_SCOPE_NOT_APPROVED", returnUrl: null },
+    { errorCode: "OAUTH_SCOPE_NOT_APPROVED", returnUrl: "javascript:alert(1)" },
+    null,
+    "invalid_scope",
+  ]) {
+    assert.equal(authorizationErrorRedirectUrl(body, "oidc-state"), null, JSON.stringify(body));
+  }
+});
+
+test("Login with Raft shows a suspended installation as unavailable with its reason, and never continues there", async () => {
+  resetStores();
+  const suspendedServer: Server = { ...ownerServer, id: "server-2", name: "Paused Server", slug: "paused", role: "member" };
+  useServerStore.setState({ servers: [ownerServer, suspendedServer], current: ownerServer, members: [], loading: false } as never);
+  window.history.pushState({}, "", "/login-with-raft/setup?client_id=orbital-notes&return_to=https%3A%2F%2Forbital.example.com%2Freturn");
+  const baseClient = {
+    id: "app-1",
+    clientId: "orbital-notes",
+    appType: "third_party_global",
+    name: "Orbital Notes",
+    description: "Review launch notes from Raft.",
+    homepageUrl: "https://orbital.example.com/docs",
+    returnUrl: "https://orbital.example.com/return",
+    logoUrl: null,
+  };
+  api.get = (async (url: string, config?: { params?: { server_id?: string } }) => {
+    if (url !== "/oauth/clients/lookup") throw new Error(`unexpected GET ${url}`);
+    return config?.params?.server_id === suspendedServer.id
+      ? { data: { ...baseClient, availability: "suspended" } }
+      : { data: { ...baseClient, marketplace: true, availability: "ready" } };
+  }) as typeof api.get;
+  const postUrls: string[] = [];
+  api.post = (async (url: string) => {
+    if (url === "/feature-flags/evaluate") return { data: { evaluations: [] } };
+    postUrls.push(url);
+    return new Promise(() => {});
+  }) as typeof api.post;
+
+  render(<TestIntlProvider><HumanLoginSetupPage /></TestIntlProvider>);
+  assert.ok((await screen.findAllByText("Orbital Notes")).length >= 2);
+  const ready = screen.getByTestId("login-server-status-server-1");
+  assert.equal(ready.hasAttribute("data-selected"), true, "the ready Server ranks first");
+  const suspended = screen.getByTestId("login-server-status-server-2");
+  assert.ok(within(suspended).getByText("Suspended"));
+  fireEvent.click(suspended);
+  const commitZone = screen.getByTestId("marketplace-login-commit-zone");
+  assert.match(commitZone.textContent ?? "", /installation on this Server is suspended/);
+  const continueButton = screen.getByRole("button", { name: "Continue login" }) as HTMLButtonElement;
+  assert.equal(continueButton.disabled, true);
+  fireEvent.click(continueButton);
+  assert.deepEqual(postUrls, []);
+});
+
+test("Login with Raft explains a suspension when it is the app's only Server, instead of calling the app inaccessible", async () => {
+  resetStores();
+  useServerStore.setState({ servers: [ownerServer], current: ownerServer, members: [], loading: false } as never);
+  window.history.pushState({}, "", "/login-with-raft/setup?client_id=private-notes&return_to=https%3A%2F%2Fnotes.example.com%2Freturn");
+  api.get = (async (url: string) => {
+    if (url !== "/oauth/clients/lookup") throw new Error(`unexpected GET ${url}`);
+    return {
+      data: {
+        clientId: "private-notes",
+        appType: "third_party_global",
+        name: "Private Notes",
+        description: null,
+        homepageUrl: null,
+        returnUrl: "https://notes.example.com/return",
+        logoUrl: null,
+        availability: "suspended",
+      },
+    };
+  }) as typeof api.get;
+  let postCount = 0;
+  api.post = (async () => {
+    postCount += 1;
+    throw new Error("authorization must not be attempted");
+  }) as typeof api.post;
+
+  render(<TestIntlProvider><HumanLoginSetupPage /></TestIntlProvider>);
+  assert.ok(await screen.findByText("This App's installation on this Server is suspended. Ask a Server owner or admin to restore it."));
+  assert.ok(screen.queryByText("This app isn't available to you") === null);
+  const loginButton = screen.getByRole("button", { name: "Login with Raft" }) as HTMLButtonElement;
+  assert.equal(loginButton.disabled, true);
+  fireEvent.click(loginButton);
+  assert.equal(postCount, 0);
+});
+
 test("public Marketplace setup always lists installed and uninstalled Servers together", async () => {
   resetStores();
   const adminServer: Server = {
@@ -1766,19 +1950,25 @@ test("public Marketplace setup always lists installed and uninstalled Servers to
     return {
       data: {
         ...baseClient,
+        allowedScopes: ["openid", "profile", "email"],
+        appNotificationGroups: ["channel"],
         availability: "install_required",
         installation: { serverId, canInstall: serverId === adminServer.id },
       },
     };
   }) as typeof api.get;
   const postUrls: string[] = [];
+  const installBodies: unknown[] = [];
   let resolveInstall!: () => void;
   const pendingInstall = new Promise<{ data: { installed: true } }>((resolve) => {
     resolveInstall = () => resolve({ data: { installed: true } });
   });
-  api.post = (async (url: string) => {
+  api.post = (async (url: string, body?: unknown) => {
+    // The page reads the install target's feature flags; not part of the flow under test.
+    if (url === "/feature-flags/evaluate") return { data: { evaluations: [] } };
     postUrls.push(url);
     if (url === "/integrations/marketplace/app-1/install") {
+      installBodies.push(body);
       return pendingInstall;
     }
     if (url === "/oauth/authorize/human") {
@@ -1794,8 +1984,8 @@ test("public Marketplace setup always lists installed and uninstalled Servers to
   const installed = screen.getByTestId("login-server-status-server-1");
   assert.equal(installed.getAttribute("title"), null);
   assert.ok(installed.hasAttribute("data-base-ui-tooltip-trigger"), "status hint now rides the RUI tooltip trigger");
-  assert.equal(within(installed).queryByText("Installed"), null);
-  assert.equal(installed.getAttribute("aria-label"), "Use this Server: Launch Server");
+  assert.ok(within(installed).queryByText("Installed") === null);
+  assert.equal(installed.getAttribute("aria-label"), "Use this server: Launch Server");
   // The picked server is the raft-ui ListRow selection (cyan-soft).
   assert.equal(installed.hasAttribute("data-selected"), true);
   assert.match(screen.getByTestId("marketplace-login-commit-zone").textContent ?? "", /Selected Launch Server\./);
@@ -1807,17 +1997,32 @@ test("public Marketplace setup always lists installed and uninstalled Servers to
   fireEvent.click(installable);
   assert.equal(installed.hasAttribute("data-selected"), false);
   assert.equal(installable.hasAttribute("data-selected"), true);
-  assert.match(screen.getByTestId("marketplace-login-commit-zone").textContent ?? "", /Build Server has not installed Orbital Notes/);
-  assert.ok(screen.getByText("Access granted: openid · profile"));
+  // Whether it can be installed, never the viewer's role (copy item 6, #proj-apps msg e9b17287).
+  const commitZoneText = screen.getByTestId("marketplace-login-commit-zone").textContent ?? "";
+  assert.match(commitZoneText, /Build Server hasn't installed Orbital Notes\. You can install it here; continuing installs it as you\./);
+  assert.doesNotMatch(commitZoneText, /admin/i);
+  // The commit zone lists what installing approves: the app's whole set,
+  // email and the channel group included, not just this login's scopes.
+  const commitSet = within(screen.getByTestId("marketplace-login-commit-zone")).getByTestId("app-permission-set");
+  assert.deepEqual(
+    [...commitSet.querySelectorAll("[data-app-permission-value]")].map((row) => row.getAttribute("data-app-permission-value")),
+    ["openid", "profile", "email", "channel"],
+  );
   fireEvent.click(screen.getByRole("button", { name: "Install and continue" }));
   await waitFor(() => assert.deepEqual(postUrls, ["/integrations/marketplace/app-1/install"]));
+  // Installing approves the app's whole set, not just the scopes this login asks for.
+  assert.deepEqual(installBodies, [{ expected_scopes: ["openid", "profile", "email"], expected_groups: ["channel"] }]);
   const pendingCommitZone = screen.getByTestId("marketplace-login-commit-zone");
   assert.equal(pendingCommitZone.getAttribute("aria-busy"), "true");
-  const pendingButton = screen.getByRole("button", { name: "Installing and continuing..." }) as HTMLButtonElement;
-  assert.equal(pendingButton.disabled, true);
+  const pendingButton = screen.getByTestId("marketplace-login-commit") as HTMLButtonElement;
+  // raft-ui 0.58.1: busy is aria-disabled (it keeps focus), never native disabled; a press does nothing.
+  assert.equal(pendingButton.getAttribute("aria-disabled"), "true");
+  assert.equal(pendingButton.disabled, false);
   assert.ok(screen.getByTestId("marketplace-install-pending-row-spinner"));
-  assert.ok(screen.getByTestId("marketplace-install-pending-button-spinner"));
-  assert.equal((screen.getByRole("searchbox", { name: "Search Servers" }) as HTMLInputElement).disabled, true);
+  // raft-ui Button `loading`: the spinner, named by what is happening.
+  assert.equal(pendingButton.getAttribute("data-loading"), "true");
+  assert.equal(pendingButton.querySelector("[data-slot=button-loading-indicator] [role=status]")?.getAttribute("aria-label"), "Installing and continuing...");
+  assert.equal((screen.getByRole("searchbox", { name: "Search servers" }) as HTMLInputElement).disabled, true);
   assert.equal(installed.getAttribute("aria-disabled"), "true");
   assert.equal((installed as HTMLButtonElement).disabled, true);
   fireEvent.click(installed);
@@ -1834,8 +2039,8 @@ test("public Marketplace setup always lists installed and uninstalled Servers to
   });
   assert.equal(postUrls.filter((url) => url === "/oauth/authorize/human").length, 1);
   const installedAfterClick = screen.getByTestId("login-server-status-server-2");
-  assert.equal(within(installedAfterClick).queryByText("Not installed"), null);
-  assert.equal(installedAfterClick.getAttribute("aria-label"), "Use this Server: Build Server");
+  assert.ok(within(installedAfterClick).queryByText("Not installed") === null);
+  assert.equal(installedAfterClick.getAttribute("aria-label"), "Use this server: Build Server");
   const memberOnly = screen.getByTestId("login-server-status-server-3");
   assert.equal(memberOnly.getAttribute("title"), null);
   assert.ok(memberOnly.hasAttribute("data-base-ui-tooltip-trigger"), "status hint now rides the RUI tooltip trigger");
@@ -1843,7 +2048,7 @@ test("public Marketplace setup always lists installed and uninstalled Servers to
   fireEvent.click(memberOnly);
   assert.match(screen.getByTestId("marketplace-login-commit-zone").textContent ?? "", /Only an owner or admin of this Server can install it/);
   assert.equal(screen.queryAllByRole("button", { name: "Continue login" }).length, 0);
-  const findAdmin = screen.getByRole("link", { name: "Find a Server admin" });
+  const findAdmin = screen.getByRole("link", { name: "Find a server admin" });
   assert.equal(findAdmin.getAttribute("href"), "/s/member/members");
   // Still a link, drawn as the DS ink-line (paper) button.
   assert.ok(findAdmin.classList.contains("border-line-strong"));
@@ -1854,15 +2059,84 @@ test("public Marketplace setup always lists installed and uninstalled Servers to
   assert.ok(unavailable.hasAttribute("data-base-ui-tooltip-trigger"), "status hint now rides the RUI tooltip trigger");
   assert.ok(within(unavailable).getByText("Unavailable"));
   assert.equal(screen.getAllByTestId(/^login-server-status-/).length, 22);
-  const search = screen.getByRole("searchbox", { name: "Search Servers" });
+  // The rows scroll in a raft-ui ScrollArea with the same max height; each row is a button, so no tab stop.
+  const serverList = screen.getByTestId("login-server-status-server-4").closest<HTMLElement>(".r-scroll-area");
+  assert.ok(serverList && serverList.classList.contains("max-h-72") && serverList.tabIndex === -1);
+  const search = screen.getByRole("searchbox", { name: "Search servers" });
   fireEvent.change(search, { target: { value: "member" } });
   assert.ok(screen.getByTestId("login-server-status-server-3"));
-  assert.equal(screen.queryByTestId("login-server-status-server-1"), null);
+  assert.ok(screen.queryByTestId("login-server-status-server-1") === null);
   fireEvent.change(search, { target: { value: "missing" } });
-  assert.ok(screen.getByText("No Servers match your search."));
+  assert.ok(screen.getByText("No Servers match your search"));
   assert.ok(screen.getByText("All Raft Servers you can access are shown here. Continue with an installed Server, or install the App where you have permission."));
-  assert.equal(screen.queryByText(/none of your accessible Servers has installed/), null);
-  assert.equal(screen.queryByRole("button", { name: "Login with Raft" }), null);
+  assert.ok(screen.queryByText(/none of your accessible Servers has installed/) === null);
+  assert.ok(screen.queryByRole("button", { name: "Login with Raft" }) === null);
+});
+
+test("Login with Raft install shows the app's new set after a 409 and sends that set next", async () => {
+  resetStores();
+  const adminServer: Server = { ...ownerServer, id: "server-2", name: "Build Server", slug: "build", role: "admin" };
+  useServerStore.setState({ servers: [adminServer], current: adminServer, members: [], loading: false } as never);
+  window.history.pushState({}, "", "/login-with-raft/setup?client_id=orbital-notes&return_to=https%3A%2F%2Forbital.example.com%2Freturn");
+  api.get = (async (url: string, config?: { params?: { server_id?: string } }) => {
+    if (url !== "/oauth/clients/lookup") throw new Error(`unexpected GET ${url}`);
+    return {
+      data: {
+        id: "app-1",
+        clientId: "orbital-notes",
+        appType: "third_party_global",
+        name: "Orbital Notes",
+        returnUrl: "https://orbital.example.com/return",
+        logoUrl: null,
+        marketplace: true,
+        // A reserved scope (not offered anywhere in the UI) is still listed.
+        allowedScopes: ["openid", "profile", "agent:action_request:write"],
+        appNotificationGroups: [],
+        availability: "install_required",
+        installation: { serverId: config?.params?.server_id, canInstall: true },
+      },
+    };
+  }) as typeof api.get;
+  const installBodies: unknown[] = [];
+  api.post = (async (url: string, body?: unknown) => {
+    if (url !== "/integrations/marketplace/app-1/install") throw new Error(`unexpected POST ${url}`);
+    installBodies.push(body);
+    if (installBodies.length === 1) {
+      throw {
+        response: {
+          status: 409,
+          data: {
+            code: "APP_PERMISSIONS_CHANGED",
+            current_scopes: ["openid", "profile", "agent:action_request:write", "email"],
+            current_groups: ["server"],
+          },
+        },
+      };
+    }
+    throw { response: { status: 400, data: { code: "EXPECTED_PERMISSIONS_REQUIRED", error: "server text" } } };
+  }) as typeof api.post;
+
+  render(<TestIntlProvider><HumanLoginSetupPage /></TestIntlProvider>);
+
+  const commitZone = await screen.findByTestId("marketplace-login-commit-zone");
+  const shownValues = () => [...within(commitZone).getByTestId("app-permission-set").querySelectorAll("[data-app-permission-value]")]
+    .map((row) => row.getAttribute("data-app-permission-value"));
+  await waitFor(() => assert.deepEqual(shownValues(), ["openid", "profile", "agent:action_request:write"]));
+  assert.ok(within(commitZone).getByText("Lets the app ask the one agent you authorize to take an action. Reserved: Raft doesn't use it yet."));
+
+  fireEvent.click(screen.getByRole("button", { name: "Install and continue" }));
+  assert.ok(await screen.findByText("This app's permissions just changed. Review the current permissions below, then install again."));
+  // The list now shows the set the server reported, without a reload.
+  assert.deepEqual(shownValues(), ["openid", "profile", "agent:action_request:write", "email", "server"]);
+
+  fireEvent.click(screen.getByRole("button", { name: "Install and continue" }));
+  await waitFor(() => assert.equal(installBodies.length, 2));
+  assert.deepEqual(installBodies, [
+    { expected_scopes: ["openid", "profile", "agent:action_request:write"], expected_groups: [] },
+    { expected_scopes: ["openid", "profile", "agent:action_request:write", "email"], expected_groups: ["server"] },
+  ]);
+  // A 400 means this page predates the check: only a reload fixes it.
+  assert.ok(await screen.findByText("This page is out of date. Reload it, review the app's permissions, then try again."));
 });
 
 test("Login with Raft setup page blocks agent messaging scopes and shows exact requested access", async () => {
@@ -1904,7 +2178,7 @@ test("Login with Raft setup page blocks agent messaging scopes and shows exact r
   assert.ok(within(requested).getByText("agent:notification:write"));
   assert.ok(within(requested).getByText("Sends structured event messages to the one agent you authorize."));
   assert.ok(within(requested).getByText("Sends notification messages to the one agent you authorize."));
-  assert.equal(within(requested).queryByText(/Treated as untrusted/), null);
+  assert.ok(within(requested).queryByText(/Treated as untrusted/) === null);
   assert.ok(within(requested).getByText(enMessages["oauth.consent.agentLoginRequiredNotice"]));
   assert.ok(within(requested).getByText("Unrecognized scopes:"));
   assert.ok(within(requested).getByText("agent:action_request:write"));
@@ -1913,7 +2187,7 @@ test("Login with Raft setup page blocks agent messaging scopes and shows exact r
   const button = await screen.findByRole("button", { name: "Login with Raft" }) as HTMLButtonElement;
   assert.equal(button.disabled, true);
   fireEvent.click(button);
-  assert.equal(screen.queryByText("Agent messaging access requires Raft Agent Login."), null);
+  assert.ok(screen.queryByText("Agent messaging access requires Raft Agent Login.") === null);
 });
 
 test("Login with Raft setup page renders empty requested-scope fallback for unrecognized-only requests", async () => {
@@ -1955,43 +2229,38 @@ test("Login with Raft setup page renders empty requested-scope fallback for unre
   assert.equal((screen.getByRole("button", { name: "Login with Raft" }) as HTMLButtonElement).disabled, true);
 });
 
-test("private app invite page shows requested scopes like Login with Raft setup", async () => {
-  resetStores();
+function inviteResponse(overrides: { allowedScopes?: string[] | null; appNotificationGroups?: string[] } = {}) {
+  return {
+    client: {
+      id: "client-1",
+      clientId: "orbital-notes",
+      name: "Orbital Notes",
+      description: "Review launch notes from Raft.",
+      homepageUrl: "https://orbital.example.com/docs",
+      returnUrl: "https://orbital.example.com/return",
+      allowedScopes: ["openid", "profile", "identity", "agent:event:write", "agent:notification:write"],
+      appNotificationGroups: ["channel"],
+      logoUrl: null,
+      publisherName: "Orbital",
+      sourceServerName: "Publisher Server",
+      installedAt: null,
+      ...overrides,
+    },
+    link: {
+      id: "link-1",
+      expiresAt: null,
+    },
+    manageableServers: [{
+      id: ownerServer.id,
+      name: ownerServer.name,
+      slug: ownerServer.slug,
+      role: "owner",
+      installedAt: null,
+    }],
+  };
+}
 
-  api.get = (async (url: string) => {
-    if (url === "/integration-invites/share-token") {
-      return {
-        data: {
-          client: {
-            id: "client-1",
-            clientId: "orbital-notes",
-            name: "Orbital Notes",
-            description: "Review launch notes from Raft.",
-            homepageUrl: "https://orbital.example.com/docs",
-            returnUrl: "https://orbital.example.com/return",
-            allowedScopes: ["openid", "profile", "identity", "agent:event:write", "agent:notification:write"],
-            logoUrl: null,
-            publisherName: "Orbital",
-            sourceServerName: "Publisher Server",
-            installedAt: null,
-          },
-          link: {
-            id: "link-1",
-            expiresAt: null,
-          },
-          manageableServers: [{
-            id: ownerServer.id,
-            name: ownerServer.name,
-            slug: ownerServer.slug,
-            role: "owner",
-            installedAt: null,
-          }],
-        },
-      };
-    }
-    throw new Error(`unexpected GET ${url}`);
-  }) as typeof api.get;
-
+function renderInvitePage() {
   render(
     <TestIntlProvider>
       <MemoryRouter initialEntries={["/integration-invites/share-token"]}>
@@ -2001,22 +2270,183 @@ test("private app invite page shows requested scopes like Login with Raft setup"
       </MemoryRouter>
     </TestIntlProvider>,
   );
+}
+
+function listedPermissions(kind: "scope" | "group") {
+  return [...screen.getByTestId("app-permission-set").querySelectorAll(`[data-app-permission-kind="${kind}"]`)]
+    .map((row) => row.getAttribute("data-app-permission-value"));
+}
+
+test("private app invite page lists the app's whole permission set and sends it back on install", async () => {
+  resetStores();
+  api.get = (async (url: string) => {
+    if (url === "/integration-invites/share-token") return { data: inviteResponse() };
+    throw new Error(`unexpected GET ${url}`);
+  }) as typeof api.get;
+  const posts: Array<{ url: string; body: unknown }> = [];
+  api.post = (async (url: string, body?: unknown) => {
+    posts.push({ url, body });
+    return { data: { ...inviteResponse(), manageableServers: [{ ...inviteResponse().manageableServers[0]!, installedAt: "2026-10-20T00:00:00.000Z" }] } };
+  }) as typeof api.post;
+
+  renderInvitePage();
 
   const page = await screen.findByTestId("integration-invite-page");
   assert.ok(page.className.includes("h-full"));
-  assert.ok(page.className.includes("overflow-y-auto"));
-  const requested = await screen.findByTestId("login-with-raft-requested-scopes");
-  assert.ok(within(requested).getByText("Requested access"));
-  assert.ok(within(requested).getByText("Identity"));
-  assert.ok(within(requested).getByText("Agent messaging"));
-  assert.ok(within(requested).getByText("openid"));
-  assert.ok(within(requested).getByText("profile"));
-  assert.ok(within(requested).getByText("identity"));
-  assert.ok(within(requested).getByText("agent:event:write"));
-  assert.ok(within(requested).getByText("agent:notification:write"));
-  assert.ok(within(requested).getByText("Sends structured event messages to the one agent you authorize."));
-  assert.ok(within(requested).getByText("Sends notification messages to the one agent you authorize."));
-  assert.equal(within(requested).queryByText(/Treated as untrusted/), null);
+  // The page scrolls itself, in a raft-ui ScrollArea.
+  assertScrollAreaRailsOn(page, { ownContainer: false, trigger: "hover" });
+  assert.ok(await screen.findByText("Installing approves for this Server:"));
+  assert.deepEqual(listedPermissions("scope"), ["openid", "profile", "identity", "agent:event:write", "agent:notification:write"]);
+  assert.deepEqual(listedPermissions("group"), ["channel"]);
+
+  fireEvent.click(screen.getByRole("button", { name: "Install app" }));
+  await waitFor(() => assert.equal(posts.length, 1));
+  assert.equal(posts[0]!.url, "/integration-invites/share-token/install");
+  assert.deepEqual(posts[0]!.body, {
+    serverId: ownerServer.id,
+    expected_scopes: ["openid", "profile", "identity", "agent:event:write", "agent:notification:write"],
+    expected_groups: ["channel"],
+  });
+});
+
+test("private app invite page with no declared scopes shows and sends the default identity scopes", async () => {
+  resetStores();
+  api.get = (async (url: string) => {
+    if (url === "/integration-invites/share-token") return { data: inviteResponse({ allowedScopes: null, appNotificationGroups: [] }) };
+    throw new Error(`unexpected GET ${url}`);
+  }) as typeof api.get;
+  const posts: unknown[] = [];
+  api.post = (async (_url: string, body?: unknown) => {
+    posts.push(body);
+    return { data: inviteResponse() };
+  }) as typeof api.post;
+
+  renderInvitePage();
+
+  await screen.findByText("Installing approves for this Server:");
+  assert.deepEqual(listedPermissions("scope"), ["openid", "profile", "identity"]);
+  assert.deepEqual(listedPermissions("group"), []);
+  fireEvent.click(screen.getByRole("button", { name: "Install app" }));
+  await waitFor(() => assert.equal(posts.length, 1));
+  assert.deepEqual(posts[0], { serverId: ownerServer.id, expected_scopes: ["openid", "profile", "identity"], expected_groups: [] });
+});
+
+test("private app invite page shows the app's new set after a permissions-changed 409, and the next install sends it", async () => {
+  resetStores();
+  api.get = (async (url: string) => {
+    if (url === "/integration-invites/share-token") return { data: inviteResponse({ allowedScopes: ["openid", "profile"], appNotificationGroups: ["channel"] }) };
+    throw new Error(`unexpected GET ${url}`);
+  }) as typeof api.get;
+  const posts: unknown[] = [];
+  api.post = (async (_url: string, body?: unknown) => {
+    posts.push(body);
+    if (posts.length === 1) {
+      throw {
+        response: {
+          status: 409,
+          data: { code: "APP_PERMISSIONS_CHANGED", current_scopes: ["openid", "profile", "email"], current_groups: ["channel", "agent"] },
+        },
+      };
+    }
+    return { data: inviteResponse() };
+  }) as typeof api.post;
+
+  renderInvitePage();
+
+  await screen.findByText("Installing approves for this Server:");
+  fireEvent.click(screen.getByRole("button", { name: "Install app" }));
+  assert.ok(await screen.findByText("This app's permissions just changed. Review the current permissions below, then install again."));
+  assert.deepEqual(listedPermissions("scope"), ["openid", "profile", "email"]);
+  assert.deepEqual(listedPermissions("group"), ["channel", "agent"]);
+
+  fireEvent.click(screen.getByRole("button", { name: "Install app" }));
+  await waitFor(() => assert.equal(posts.length, 2));
+  assert.deepEqual(posts[1], { serverId: ownerServer.id, expected_scopes: ["openid", "profile", "email"], expected_groups: ["channel", "agent"] });
+});
+
+test("private app invite page names the link's one target server instead of offering a picker", async () => {
+  resetStores();
+  api.get = (async (url: string) => {
+    if (url === "/integration-invites/share-token") return { data: inviteResponse() };
+    throw new Error(`unexpected GET ${url}`);
+  }) as typeof api.get;
+  const posts: unknown[] = [];
+  api.post = (async (_url: string, body?: unknown) => {
+    posts.push(body);
+    return { data: { ...inviteResponse(), manageableServers: [{ ...inviteResponse().manageableServers[0]!, installedAt: "2026-10-20T00:00:00.000Z" }] } };
+  }) as typeof api.post;
+
+  renderInvitePage();
+
+  const target = await screen.findByTestId("integration-invite-target");
+  assert.ok(within(target).getByText(ownerServer.name));
+  assert.ok(within(target).getByText(`/${ownerServer.slug}`));
+  assert.ok(screen.queryByRole("combobox") === null, "one target: nothing to choose");
+  assert.ok(screen.getByText(enMessages["pages.integrationInvite.singleUseNote"]));
+  fireEvent.click(screen.getByRole("button", { name: "Install app" }));
+  await waitFor(() => assert.equal(posts.length, 1));
+  assert.equal((posts[0] as { serverId: string }).serverId, ownerServer.id);
+  assert.ok(await screen.findByRole("button", { name: "Open Settings" }));
+});
+
+test("private app invite page answers an invalid link with one explanation, on load and on install", async () => {
+  resetStores();
+  const invalid = { response: { status: 404, data: { error: "This private app invite is invalid or has expired", code: "private_app_invite_invalid" } } };
+  api.get = (async (url: string) => {
+    if (url === "/integration-invites/share-token") throw invalid;
+    throw new Error(`unexpected GET ${url}`);
+  }) as typeof api.get;
+
+  renderInvitePage();
+  assert.ok(await screen.findByText(enMessages["pages.integrationInvite.inviteInvalid"]));
+  assert.ok(screen.queryByRole("button", { name: "Install app" }) === null);
+  cleanup();
+
+  // Spent (or revoked) between loading the page and clicking Install.
+  api.get = (async (url: string) => {
+    if (url === "/integration-invites/share-token") return { data: inviteResponse() };
+    throw new Error(`unexpected GET ${url}`);
+  }) as typeof api.get;
+  api.post = (async () => { throw invalid; }) as typeof api.post;
+  renderInvitePage();
+  fireEvent.click(await screen.findByRole("button", { name: "Install app" }));
+  assert.ok(await screen.findByText(enMessages["pages.integrationInvite.inviteInvalid"]));
+  assert.ok(screen.queryByRole("button", { name: "Install app" }) === null, "nothing left to install");
+});
+
+test("private app invite page tells a member of the target server whom to ask, on load and on install", async () => {
+  resetStores();
+  const adminRequired = {
+    response: {
+      status: 403,
+      data: {
+        error: "An owner or admin of Launch Server needs to install this app",
+        code: "private_app_invite_admin_required",
+        targetServer: { name: "Launch Server", slug: "launch" },
+      },
+    },
+  };
+  const expected = "An owner or admin of Launch Server needs to install this app. Send this link to one of them.";
+  api.get = (async (url: string) => {
+    if (url === "/integration-invites/share-token") throw adminRequired;
+    throw new Error(`unexpected GET ${url}`);
+  }) as typeof api.get;
+
+  renderInvitePage();
+  assert.ok(await screen.findByText(expected));
+  assert.ok(screen.queryByRole("button", { name: "Install app" }) === null);
+  cleanup();
+
+  // Demoted between loading the page and clicking Install.
+  api.get = (async (url: string) => {
+    if (url === "/integration-invites/share-token") return { data: inviteResponse() };
+    throw new Error(`unexpected GET ${url}`);
+  }) as typeof api.get;
+  api.post = (async () => { throw adminRequired; }) as typeof api.post;
+  renderInvitePage();
+  fireEvent.click(await screen.findByRole("button", { name: "Install app" }));
+  assert.ok(await screen.findByText(expected));
+  assert.ok(screen.queryByRole("button", { name: "Install app" }) === null);
 });
 
 test("Login with Raft setup page shows app initials when no logo is available", async () => {
@@ -2043,7 +2473,7 @@ test("Login with Raft setup page shows app initials when no logo is available", 
   render(<TestIntlProvider><HumanLoginSetupPage /></TestIntlProvider>);
 
   assert.ok(await screen.findByText("ON"));
-  assert.equal(document.querySelector('img[src="https://cdn.example.com/orbital-notes.png"]'), null);
+  assert.ok(document.querySelector('img[src="https://cdn.example.com/orbital-notes.png"]') === null);
   await waitFor(() => assert.equal((screen.getByRole("button", { name: "Login with Raft" }) as HTMLButtonElement).disabled, false));
 });
 
@@ -2074,12 +2504,16 @@ test("Login with Raft setup page shows failed authorization status only after su
   render(<TestIntlProvider><HumanLoginSetupPage /></TestIntlProvider>);
 
   await waitFor(() => assert.equal((screen.getByRole("button", { name: "Login with Raft" }) as HTMLButtonElement).disabled, false));
-  assert.equal(document.querySelector("pre"), null);
+  assert.ok(document.querySelector("pre") === null);
   fireEvent.click(screen.getByRole("button", { name: "Login with Raft" }));
 
   const status = await screen.findByText("Failed to continue with Raft.");
   assert.equal(status.tagName, "PRE");
-  assert.equal(status.getAttribute("class"), "mt-4 min-h-16 overflow-auto rounded-container border border-line-hairline bg-layer-code p-3 font-mono text-mono-code text-foreground");
+  // The <pre> is a raft-ui ScrollArea (a long line scrolls sideways), a region named for the status.
+  assert.ok(status === screen.getByRole("region", { name: "Login status" }));
+  for (const token of ["r-scroll-area", "r-scroll-area--horizontal-orientation", "mt-4", "min-h-16", "rounded-container", "border", "bg-layer-code", "p-3", "font-mono"]) {
+    assert.ok(status.classList.contains(token), token);
+  }
 });
 
 
@@ -2093,14 +2527,421 @@ test("registration persists setup URL and instructions through the real form sub
     return { data: { client: { id: "setup-client", name: "Setup App", ...body }, clientSecret: "synthetic" } };
   }) as typeof api.post;
   render(<TestIntlProvider><MemoryRouter><SettingsPanel tab="integrations" /></MemoryRouter></TestIntlProvider>);
-  fireEvent.click(await screen.findByRole("button", { name: "Register App" }));
+  await chooseRegisterAppMenuItem("own-service");
   fireEvent.change(screen.getByRole("textbox", { name: "App name" }), { target: { value: "Setup App" } });
   fireEvent.click(screen.getByRole("checkbox", { name: "Requires configuration after installation" }));
   fireEvent.change(screen.getByRole("textbox", { name: "Setup page URL*" }), { target: { value: "https://setup.example.test/configure" } });
   fireEvent.change(screen.getByRole("textbox", { name: /Configuration instructions/ }), { target: { value: "Choose a repository" } });
   const form = screen.getByRole("textbox", { name: "App name" }).closest("form");
   assert.ok(form);
-  fireEvent.click(within(form).getByRole("button", { name: "Register App" }));
+  fireEvent.click(within(form).getByRole("button", { name: "Create" }));
   await waitFor(() => assert.equal(submitted?.setupUrl, "https://setup.example.test/configure"));
   assert.equal(submitted?.setupDescription, "Choose a repository");
+});
+
+test("editor mutations returning bare rows keep the bot grant state", async () => {
+  resetStores();
+  resetServerFeatureFlagsForTests();
+  const client = {
+    id: "bot-client",
+    clientId: "bot-client",
+    appType: "server_local",
+    name: "Bot App",
+    description: null,
+    homepageUrl: null,
+    returnUrl: null,
+    logoUrl: null,
+    publishStatus: "publish_requested",
+    category: "Other",
+    dataAccessSummary: null,
+    agentManifestUrl: null,
+    allowedScopes: ["openid", "profile"],
+    enableBot: true,
+    installationId: "install-1",
+    installStatus: "active",
+    botGrant: "granted",
+    bot: { offered: true, grant: "granted", handle: "bot-client", agentId: "agent-1" },
+    createdAt: "2026-06-25T00:00:00.000Z",
+    updatedAt: "2026-06-25T00:00:00.000Z",
+  };
+  const bareRow = () => {
+    // What regenerate-secret / share-link / withdraw-publish / request-unpublish
+    // actually return: OAUTH_CLIENT_PUBLIC_COLUMNS only, no install join.
+    const { installationId: _i, installStatus: _s, botGrant: _b, bot: _bot, ...bare } = client as Record<string, unknown>;
+    return bare;
+  };
+  api.get = (async (url: string) => {
+    if (url === "/integrations/clients") return { data: [client] };
+    if (url === "/integrations/built-in") return { data: [] };
+    if (url === "/integrations/marketplace") return { data: [] };
+    if (url === "/integrations/overview") return { data: [] };
+    if (url === "/integrations/clients/bot-client/share-links") {
+      throw { response: { status: 404, data: { error: "not found" } } };
+    }
+    if (url === "/integrations/clients/bot-client/app-notifications") {
+      return { data: { revision: null, selection: { groups: [], events: [] } } };
+    }
+    throw new Error(`unexpected GET ${url}`);
+  }) as typeof api.get;
+  api.post = (async (url: string) => {
+    if (url === "/feature-flags/evaluate") {
+      return { data: { evaluations: [] } };
+    }
+    if (url === "/integrations/clients/bot-client/withdraw-publish") {
+      client.publishStatus = "private";
+      return { data: { ...bareRow(), publishStatus: "private" } };
+    }
+    if (url === "/integrations/clients/bot-client/regenerate-secret") {
+      return { data: { client: bareRow(), clientSecret: "new-secret" } };
+    }
+    throw new Error(`unexpected POST ${url}`);
+  }) as typeof api.post;
+
+  render(
+    <TestIntlProvider>
+      <MemoryRouter>
+        <SettingsPanel tab="integrations" />
+      </MemoryRouter>
+    </TestIntlProvider>,
+  );
+
+  fireEvent.click(await screen.findByTestId("connected-apps-tab-my-apps"));
+  fireEvent.click(within(await screen.findByTestId("connected-apps-my-apps-tab")).getByRole("button", { name: "Edit" }));
+
+  // The editor's bot hint reads the install-joined `bot`; a bare-row mutation
+  // (withdraw publish) must not erase it.
+  await screen.findByTestId("connected-app-bot-editor-hint");
+  fireEvent.click(await screen.findByTestId("connected-app-withdraw-publish-button"));
+  await waitFor(() => assert.ok(screen.queryByTestId("connected-app-withdraw-publish-button") === null, "withdraw applied"));
+  assert.ok(screen.getByTestId("connected-app-bot-editor-hint"));
+
+  // regenerate-secret returns {client: bare, clientSecret} — same rule.
+  fireEvent.click(screen.getByRole("button", { name: "Regenerate client secret" }));
+  fireEvent.click(await screen.findByRole("button", { name: "Regenerate" }));
+  await screen.findByText("new-secret");
+  assert.ok(screen.getByTestId("connected-app-bot-editor-hint"));
+});
+
+test("Connected Apps editor toggles enableBot; the bot is added from the installed detail, not the editor", async () => {
+  resetStores();
+  resetServerFeatureFlagsForTests();
+  const client = {
+    id: "bot-client",
+    clientId: "bot-client",
+    appType: "server_local",
+    name: "Bot App",
+    description: null,
+    homepageUrl: null,
+    returnUrl: null,
+    logoUrl: null,
+    publishStatus: "private",
+    category: "Other",
+    dataAccessSummary: null,
+    agentManifestUrl: null,
+    allowedScopes: ["openid", "profile"],
+    enableBot: false,
+    botGrant: null as "pending" | "granted" | "revoked" | null,
+    createdAt: "2026-06-25T00:00:00.000Z",
+    updatedAt: "2026-06-25T00:00:00.000Z",
+  };
+  // The server's install-joined row: `bot` while the App ships one (GET /clients and PATCH).
+  const joinedRow = () => ({
+    ...client,
+    installationId: client.botGrant ? "install-1" : null,
+    installStatus: client.botGrant ? "active" : null,
+    botGrant: client.botGrant ?? null,
+    ...(client.enableBot ? { bot: {
+      offered: true,
+      grant: client.botGrant ?? "pending",
+      handle: "bot-client",
+      ...(client.botGrant === "granted" ? { agentId: "agent-1" } : {}),
+    } } : {}),
+  });
+  const patchBodies: unknown[] = [];
+  const postCalls: Array<{ url: string; body: unknown }> = [];
+
+  api.get = (async (url: string) => {
+    if (url === "/integrations/clients") return { data: [joinedRow()] };
+    if (url === "/integrations/built-in") return { data: [] };
+    if (url === "/integrations/marketplace") return { data: [] };
+    if (url === "/integrations/overview") return { data: [] };
+    if (url === "/mcp/apps") return { data: { apps: [] } };
+    if (url === "/integrations/clients/bot-client/share-links") {
+      throw { response: { status: 404, data: { error: "not found" } } };
+    }
+    if (url === "/integrations/clients/bot-client/app-notifications") {
+      return { data: { revision: null, selection: { groups: [], events: [] } } };
+    }
+    throw new Error(`unexpected GET ${url}`);
+  }) as typeof api.get;
+  api.patch = (async (url: string, body: unknown) => {
+    assert.equal(url, "/integrations/clients/bot-client");
+    patchBodies.push(body);
+    client.enableBot = (body as { enableBot?: boolean }).enableBot === true;
+    // Server cascade: turning the capability off disables a live bot and puts
+    // the install back to "pending", so a re-enable asks again.
+    if (client.enableBot === false && client.botGrant === "granted") client.botGrant = "pending";
+    // The route returns the install-joined editor row (same shape as GET /clients).
+    return { data: joinedRow() };
+  }) as typeof api.patch;
+  api.post = (async (url: string, body?: unknown) => {
+    postCalls.push({ url, body });
+    if (url === "/feature-flags/evaluate") {
+      return { data: { evaluations: [] } };
+    }
+    if (url === "/integrations/clients/bot-client/install/bot") {
+      const action = (body as { action: string }).action;
+      client.botGrant = action === "grant" ? "granted" : "revoked";
+      return { data: { installationId: "install-1", botGrant: client.botGrant, bot: action === "grant" ? { agentId: "agent-1", state: "active", handle: "bot-client" } : null } };
+    }
+    throw new Error(`unexpected POST ${url}`);
+  }) as typeof api.post;
+
+  render(
+    <TestIntlProvider>
+      <MemoryRouter>
+        <SettingsPanel tab="integrations" />
+      </MemoryRouter>
+    </TestIntlProvider>,
+  );
+
+  fireEvent.click(await screen.findByTestId("connected-apps-tab-my-apps"));
+  fireEvent.click(within(await screen.findByTestId("connected-apps-my-apps-tab")).getByRole("button", { name: "Edit" }));
+
+  // The Bot checkbox exists and starts unchecked; there is no hint yet.
+  const botToggle = await screen.findByTestId("connected-app-enable-bot");
+  const checkedAttr = botToggle.getAttribute("aria-checked") ?? botToggle.getAttribute("data-state");
+  assert.ok(checkedAttr === "false" || checkedAttr === "unchecked", `checkbox starts unchecked (got ${checkedAttr})`);
+  assert.ok(screen.queryByTestId("connected-app-bot-editor-hint") === null, "no hint while the app has no bot");
+
+  // Check it, then save — PATCH must carry enableBot: true.
+  fireEvent.click(botToggle);
+  const saveButton = screen.getAllByRole("button").find((b) => /save|save changes/i.test(b.textContent ?? ""));
+  assert.ok(saveButton);
+  fireEvent.click(saveButton);
+  await waitFor(() => assert.equal(patchBodies.length, 1));
+  assert.equal((patchBodies[0] as { enableBot?: boolean }).enableBot, true);
+
+  // Save closes the editor; reopened, the saved and checked box shows the hint,
+  // and the editor has no Enable / Disable bot buttons any more.
+  fireEvent.click(within(await screen.findByTestId("connected-apps-my-apps-tab")).getByRole("button", { name: "Edit" }));
+  const hint = await screen.findByTestId("connected-app-bot-editor-hint");
+  assert.ok(screen.queryByRole("button", { name: /enable bot|disable bot/i }) === null);
+  assert.ok(screen.queryByText("Bot enabled") === null);
+
+  // The hint opens this App's installed detail, where the bot is added.
+  fireEvent.click(within(hint).getByRole("button", { name: "Installed apps" }));
+  const section = await screen.findByTestId("connected-app-bot-section");
+  fireEvent.click(within(section).getByRole("button", { name: "Add @bot-client to Launch Server" }));
+  await waitFor(() => assert.ok(postCalls.some((c) => c.url === "/integrations/clients/bot-client/install/bot" && (c.body as { action?: string }).action === "grant")));
+  await waitFor(() => assert.equal(screen.getByTestId("connected-app-bot-section").getAttribute("data-bot-grant"), "granted"));
+  fireEvent.click(screen.getByRole("button", { name: "Close" }));
+
+  // Turning the capability off cascades on the server.
+  fireEvent.click(await screen.findByTestId("connected-apps-tab-my-apps"));
+  fireEvent.click(within(await screen.findByTestId("connected-apps-my-apps-tab")).getByRole("button", { name: "Edit" }));
+  const botToggleAgain = await screen.findByTestId("connected-app-enable-bot");
+  fireEvent.click(botToggleAgain);
+  await waitFor(() => assert.ok(screen.queryByTestId("connected-app-bot-editor-hint") === null, "unchecked: no hint"));
+  const saveOff = screen.getAllByRole("button").find((b) => /save|save changes/i.test(b.textContent ?? ""));
+  assert.ok(saveOff);
+  fireEvent.click(saveOff);
+  await waitFor(() => assert.equal(patchBodies.length, 2));
+  assert.equal((patchBodies[1] as { enableBot?: boolean }).enableBot, false);
+  assert.equal(client.botGrant, "pending", "disable cascade puts the grant back to pending");
+});
+
+function mockPendingInstalledPermissionUpdate({ failApproval = false, pending = true } = {}) {
+  const installed = {
+    id: "permission-update-app", serverId: "publisher-server", clientId: "permission-update",
+    name: "Directory App", description: "Read the team's Agent directory", category: "Developer Tools",
+    appType: "third_party_global", publishStatus: "published", enabled: true,
+    humanMarketplaceVisible: true, publisherServerName: "App publisher", logoUrl: null,
+    homepageUrl: "https://directory.example.test", returnUrl: "https://directory.example.test/callback",
+    installedAt: "2026-10-01T00:00:00Z", privateShared: false,
+    allowedScopes: ["openid", "profile"], appNotificationGroups: ["agent"], appNotificationEvents: [],
+    appNotificationReviewPending: false, permissionApprovalRequired: pending,
+  };
+  const state = {
+    installation_id: "permission-install", status: "active", approved_request_revision_id: null,
+    requested_groups: ["agent"], requested_events: [], requested_scopes: ["openid", "profile"],
+    approved_groups: [] as string[], subscribed_events: [], effective_groups: [] as string[], effective_events: [],
+    grant_revision: 0, subscription_revision: 0, app_review_pending: false, approval_required: pending,
+  };
+  let writes = 0;
+  const reads: string[] = [];
+  api.get = (async (url: string) => {
+    reads.push(url);
+    if (url === "/integrations/marketplace") return { data: [{ ...installed }] };
+    if (url === "/integrations/marketplace/permission-update-app/install/app-notifications") return { data: { ...state } };
+    if (url === "/mcp/apps") return { data: { apps: [] } };
+    return { data: [] };
+  }) as typeof api.get;
+  api.put = (async (url: string, body?: unknown) => {
+    assert.equal(url, "/integrations/marketplace/permission-update-app/install/app-notifications/grant");
+    assert.deepEqual(body, { expected_scopes: ["openid", "profile"], expected_groups: ["agent"] });
+    writes += 1;
+    if (failApproval) throw { response: { status: 403, data: { error: "Approval refused" } } };
+    state.approved_groups = ["agent"]; state.effective_groups = ["agent"]; state.approval_required = false;
+    installed.permissionApprovalRequired = false;
+    return { data: {} };
+  }) as typeof api.put;
+  return { writes: () => writes, reads: () => reads };
+}
+
+for (const locale of ["en", "zh-cn"] as const) {
+  test(`installed permission update is visible and reviewable without granting until confirmation (${locale})`, async () => {
+    resetStores();
+    const probe = mockPendingInstalledPermissionUpdate();
+    render(<TestIntlProvider locale={locale}><MemoryRouter><SettingsPanel tab="integrations" /></MemoryRouter></TestIntlProvider>);
+    const notice = await screen.findByTestId("connected-apps-permission-updates");
+    // A prior filter must not hide the Apps the notice sends the user to.
+    fireEvent.change(screen.getByTestId("connected-apps-search"), { target: { value: "unrelated search" } });
+    // #triage:#156: the notice's button opens the waiting app's review itself
+    // (it used to switch to Installed, where the notice already is: nothing happened).
+    fireEvent.click(within(notice).getByRole("button"));
+    const permissionPanel = await screen.findByTestId("installed-app-notifications");
+    const item = await screen.findByTestId("connected-app-item-permission-update-app");
+    assert.ok(within(item).getByTestId("app-permission-approval-required"));
+    assert.equal(probe.writes(), 0, "opening the pending-permission review must not grant anything");
+    const banner = within(permissionPanel).getByTestId("app-notifications-approval-required");
+    fireEvent.click(within(banner).getByRole("button", { name: locale === "en" ? "Approve update" : "批准更新" }));
+    await waitFor(() => assert.ok(screen.queryByTestId("connected-apps-permission-updates") === null));
+    assert.equal(probe.writes(), 1);
+    assert.ok(within(item).queryByTestId("app-permission-approval-required") === null, "successful approval refreshes the list immediately");
+  });
+}
+
+test("failed permission approval keeps the installed notice; members get no approval action and no owner-or-admin read", async () => {
+  resetStores();
+  const probe = mockPendingInstalledPermissionUpdate({ failApproval: true });
+  render(<TestIntlProvider><MemoryRouter><SettingsPanel tab="integrations" /></MemoryRouter></TestIntlProvider>);
+  fireEvent.click(within(await screen.findByTestId("connected-apps-permission-updates")).getByRole("button"));
+  const panel = await screen.findByTestId("installed-app-notifications");
+  fireEvent.click(within(panel).getByRole("button", { name: "Approve update" }));
+  await waitFor(() => assert.ok(screen.getAllByText("Approval refused").length > 0));
+  assert.ok(screen.getByTestId("connected-apps-permission-updates"));
+  assert.equal(probe.writes(), 1);
+  cleanup();
+  useServerStore.setState({ current: { ...ownerServer, role: "member" } } as never);
+  render(<TestIntlProvider><MemoryRouter><SettingsPanel tab="integrations" /></MemoryRouter></TestIntlProvider>);
+  // A member's notice opens the App's detail, but not its App Notifications review: the server
+  // lets only owners and admins read it, so the member's detail neither shows nor requests it.
+  const readsBefore = probe.reads().length;
+  fireEvent.click(within(await screen.findByTestId("connected-apps-permission-updates")).getByRole("button"));
+  await screen.findByText("Login with Raft access");
+  const item = await screen.findByTestId("connected-app-item-permission-update-app");
+  assert.equal(within(item).queryByRole("button", { name: "Review permissions" }) === null, true);
+  assert.ok(screen.queryByTestId("installed-app-notifications") === null, "no App Notifications review for a member");
+  assert.deepEqual(probe.reads().slice(readsBefore).filter((url) => url.includes("/app-notifications")), []);
+  assert.ok(screen.queryByRole("button", { name: "Approve update" }) === null);
+  assert.equal(probe.writes(), 1);
+});
+
+
+// #triage:59b61529: this Server's own non-public App installed here is in the
+// list GET /integrations/marketplace returns (the notice counts it), so the
+// Installed tab reviews it like any other App; the Marketplace tab still shows
+// only public listings and other Servers' Apps.
+function mockOwnAppPermissionUpdate() {
+  const app = (id: string, name: string, fields: Record<string, unknown>) => ({
+    id, serverId: ownerServer.id, clientId: id, name, description: `${name} description`, category: "Developer Tools",
+    appType: "third_party_global", publishStatus: "private", enabled: true, humanMarketplaceVisible: false,
+    homepageUrl: null, returnUrl: "https://own.example.test/callback", logoUrl: null, allowedScopes: ["openid", "profile", "email"],
+    enableBot: false, createdByUserId: "user-1", createdAt: "2026-10-01T00:00:00Z", updatedAt: "2026-10-01T00:00:00Z",
+    ...fields,
+  });
+  const listed = (row: ReturnType<typeof app>, fields: Record<string, unknown>) => ({
+    ...row, official: false, purpose: "", installationId: `${row.id}-install`, installStatus: "active",
+    installedAt: "2026-10-01T00:00:00Z", botGrant: null, marketplaceInstallBadge: { kind: "none" },
+    publisherName: "Owner", publisherServerName: ownerServer.name, privateShared: false,
+    appNotificationGroups: [], appNotificationEvents: [], appNotificationReviewPending: false,
+    appNotificationPendingRevisionId: null, appNotificationPendingGroups: [], appNotificationPendingEvents: [],
+    permissionApprovalRequired: false, ...fields,
+  });
+  const ownApp = app("own-app", "Own Tool", {});
+  const ownUnlisted = app("own-unlisted", "Own Unlisted", { publishStatus: "published" });
+  const ownLocal = app("own-local", "Own Local", { appType: "server_local" });
+  const sharedToUs = app("shared-to-us", "Shared To Us", { serverId: "publisher-server" });
+  const publicApp = app("public-app", "Public App", { serverId: "publisher-server", publishStatus: "published", humanMarketplaceVisible: true });
+  const ownListing = listed(ownApp, { privateShared: true, permissionApprovalRequired: true });
+  const marketplace = [
+    ownListing,
+    listed(ownUnlisted, {}),
+    listed(sharedToUs, { privateShared: true }),
+    listed(publicApp, { installationId: null, installStatus: null, installedAt: null }),
+  ];
+  const state = {
+    installation_id: "own-app-install", status: "active", approved_request_revision_id: null,
+    requested_groups: [], requested_events: [], requested_scopes: ["openid", "profile", "email"],
+    approved_scopes: ["openid", "profile"], new_scopes: ["email"],
+    approved_groups: [] as string[], subscribed_events: [], effective_groups: [] as string[], effective_events: [],
+    grant_revision: 0, subscription_revision: 0, app_review_pending: false, approval_required: true,
+  };
+  const puts: Array<{ url: string; body: unknown }> = [];
+  api.get = (async (url: string) => {
+    // GET /integrations/clients joins this Server's installation: the two listed ones are installed here.
+    if (url === "/integrations/clients") {
+      return { data: [
+        { ...ownApp, installationId: "own-app-install", installStatus: "active" },
+        { ...ownUnlisted, installationId: "own-unlisted-install", installStatus: "active" },
+        ownLocal,
+      ] };
+    }
+    if (url === "/integrations/marketplace") return { data: marketplace.map((row) => ({ ...row })) };
+    if (url === "/integrations/marketplace/own-app/install/app-notifications") return { data: { ...state } };
+    if (url === "/mcp/apps") return { data: { apps: [] } };
+    return { data: [] };
+  }) as typeof api.get;
+  api.put = (async (url: string, body?: unknown) => {
+    puts.push({ url, body });
+    state.approved_scopes = ["openid", "profile", "email"]; state.new_scopes = []; state.approval_required = false;
+    ownListing.permissionApprovalRequired = false;
+    return { data: {} };
+  }) as typeof api.put;
+  return { puts };
+}
+
+test("this Server's own non-public installed App opens its detail with the Review block; the Marketplace tab hides it", async () => {
+  resetStores();
+  const probe = mockOwnAppPermissionUpdate();
+  render(<TestIntlProvider><MemoryRouter><SettingsPanel tab="integrations" /></MemoryRouter></TestIntlProvider>);
+
+  // The server leaves them off the Marketplace's listings (the test helper does as it does).
+  fireEvent.click(await screen.findByTestId("connected-apps-tab-marketplace"));
+  const marketplaceTab = await screen.findByTestId("connected-apps-marketplace-tab");
+  await within(marketplaceTab).findByText("Public App");
+  for (const hidden of ["Own Tool", "Own Unlisted", "Shared To Us"]) {
+    assert.ok(within(marketplaceTab).queryByText(hidden) === null, `${hidden} is not a Marketplace listing`);
+  }
+
+  fireEvent.click(within(await screen.findByTestId("connected-apps-permission-updates")).getByRole("button"));
+  const item = await screen.findByTestId("connected-app-item-own-app");
+  assert.ok(within(item).getByTestId("app-permission-approval-required"));
+  // The review opened the update's detail, a modal dialog: the list under it is hidden from assistive tech meanwhile.
+  assert.ok(within(item).getByRole("button", { name: "Edit", hidden: true }), "still edited from its row");
+  // Not installed here (server-local): under Developer only, not in Installed (Apps v4 D3).
+  assert.ok(screen.queryByTestId("connected-app-item-own-local") === null);
+  assert.ok(within(await screen.findByTestId("connected-app-item-own-unlisted")).getByRole("button", { name: "Own Unlisted", hidden: true }));
+
+  fireEvent.click(within(item).getByRole("button", { name: "Own Tool", hidden: true }));
+  const panel = await screen.findByTestId("installed-app-notifications");
+  assert.equal(probe.puts.length, 0, "opening the detail grants nothing");
+  const banner = within(panel).getByTestId("app-notifications-approval-required");
+  fireEvent.click(within(banner).getByRole("button", { name: "Approve update" }));
+  await waitFor(() => assert.ok(screen.queryByTestId("connected-apps-permission-updates") === null));
+  assert.deepEqual(probe.puts, [{
+    url: "/integrations/marketplace/own-app/install/app-notifications/grant",
+    body: { expected_scopes: ["openid", "profile", "email"], expected_groups: [] },
+  }]);
+  assert.ok(within(item).queryByTestId("app-permission-approval-required") === null);
+});
+
+test("notification review link opens installed Apps without another tab selection", async () => {
+  resetStores(); mockPendingInstalledPermissionUpdate();
+  render(<TestIntlProvider><MemoryRouter initialEntries={["/s/launch/settings/applications?permission_updates=1"]}><SettingsPanel tab="integrations" /></MemoryRouter></TestIntlProvider>);
+  assert.ok(await screen.findByTestId("connected-app-item-permission-update-app"));
+  assert.ok(screen.getByTestId("connected-apps-installed-tab"));
+  // Arriving from elsewhere, the review opens once the apps have loaded (#triage:#156).
+  await waitFor(() => assert.equal(screen.queryByTestId("installed-app-notifications") !== null, true));
 });

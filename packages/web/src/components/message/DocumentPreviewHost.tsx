@@ -1,9 +1,16 @@
-import { useCallback, useMemo } from "react";
+import { useCallback, useEffect, useMemo } from "react";
 import { useIntl } from "react-intl";
 import { showToast } from "../toastBridge";
 import { useDocumentPreviewStore } from "../../store/documentPreviewStore";
-import { DocumentAttachmentPreviewModal } from "./attachmentPreviewSurfaces";
+import { DocumentAttachmentPreviewModal } from "./attachmentPreviewChunk";
 import { downloadAttachmentById } from "./downloadAttachment";
+import type { DocumentPreviewUnavailableReason } from "../../store/documentPreviewStore";
+
+const UNAVAILABLE_NOTICE_TITLE_ID = {
+  too_large: "message.messageItem.previewUnavailableTooLarge",
+  unavailable: "message.messageItem.previewUnavailableTemporarily",
+  unsupported: "message.messageItem.previewUnavailable",
+} as const satisfies Record<DocumentPreviewUnavailableReason, string>;
 
 /**
  * Single app-level host for the document preview, mounted beside
@@ -18,6 +25,19 @@ export default function DocumentPreviewHost() {
   const { formatMessage } = useIntl();
   const entry = useDocumentPreviewStore((s) => s.entry);
   const close = useDocumentPreviewStore((s) => s.close);
+  const unavailableNotice = useDocumentPreviewStore((s) => s.unavailableNotice);
+  const clearUnavailableNotice = useDocumentPreviewStore((s) => s.clearUnavailableNotice);
+  // A preview that cannot open says so before its download starts (task
+  // #164); the opener records the notice, this host owns the localized copy.
+  useEffect(() => {
+    if (!unavailableNotice) return;
+    showToast({
+      title: formatMessage({ id: UNAVAILABLE_NOTICE_TITLE_ID[unavailableNotice.reason] }, { filename: unavailableNotice.filename }),
+      description: formatMessage({ id: "message.messageItem.previewUnavailableDownloading" }),
+      type: "warning",
+    });
+    clearUnavailableNotice();
+  }, [unavailableNotice, clearUnavailableNotice, formatMessage]);
   // Hooks stay above the !entry early return; entry identity is stable from
   // the store selector, so these memoize on it directly.
   const onDownload = useCallback(() => {

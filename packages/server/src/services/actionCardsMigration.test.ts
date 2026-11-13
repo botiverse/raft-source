@@ -12,7 +12,7 @@ import { prepareActionCard } from "./actionCardsService";
 import { addAgent, addHuman, createChannel } from "./channelService";
 import { createServer } from "./serverService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 async function seedUser(email: string, name: string) {
   const db = getDb();

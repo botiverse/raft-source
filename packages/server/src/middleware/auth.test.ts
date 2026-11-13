@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
 import { dbTest } from "../test/integration/dbTest";
-import { requireFlexAuth, respondInvalidOrExpiredToken, signAccessToken } from "./auth";
+import { accessTokenForTest } from "../test/integration/credentials";
+import { requireFlexAuth, respondInvalidOrExpiredToken } from "./auth";
 
 dbTest("requireFlexAuth accepts access token from query string fallback", async ({ seed }) => {
   process.env.JWT_SECRET = "test-secret";
 
   const human = await seed.human();
-  const token = signAccessToken(human.id);
+  const token = await accessTokenForTest(human.id);
   const req: any = {
     headers: {},
     query: { token },

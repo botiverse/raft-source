@@ -1,5 +1,7 @@
 import {
   currentTimeMs,
+  isRuntimeAuthRuntime,
+  runtimeAuthSignsInPerProvider,
   safeParseRuntimeModelCatalogEntries,
   type MachineRuntimeModelCatalog,
 } from "@botiverse/raft-shared";
@@ -128,9 +130,46 @@ export class MachineRuntimeModelCatalogService {
     );
     return true;
   }
+
+  /**
+   * The runtime has no models now (its own detection said so after a sign-in
+   * change: Pi with no provider left). Its slice is replaced by an empty one,
+   * which every read drops, so no surface offers the old models. A single
+   * HSET like a write; no field delete is needed by the backends.
+   */
+  async clearRuntime(machineId: string, runtime: string): Promise<boolean> {
+    const runtimeId = runtime.trim();
+    if (!runtimeId) return false;
+    await this.backend.hSet(cacheKey(machineId), runtimeId, JSON.stringify({ models: [], updatedAt: new Date(this.now()).toISOString() }));
+    return true;
+  }
 }
 
 export const machineRuntimeModelCatalogService = new MachineRuntimeModelCatalogService();
+
+/**
+ * One `machine:runtime_models:catalog` frame from a Computer. An empty list
+ * clears the runtime's copy only when the daemon marks it authoritative and
+ * the runtime signs in per provider (Pi: its last provider signed out from
+ * the web, docs/contracts/runtime-auth.md §6b). Every other report is a
+ * whole-list write, and an empty or malformed one keeps the previous copy.
+ */
+export async function applyRuntimeModelCatalogReport(
+  service: Pick<MachineRuntimeModelCatalogService, "writeRuntime" | "clearRuntime">,
+  machineId: string,
+  report: { runtime: string; models: unknown; authoritative?: unknown },
+): Promise<"written" | "cleared" | "kept"> {
+  const runtime = typeof report.runtime === "string" ? report.runtime.trim() : "";
+  if (
+    report.authoritative === true
+    && Array.isArray(report.models) && report.models.length === 0
+    && isRuntimeAuthRuntime(runtime) && runtimeAuthSignsInPerProvider(runtime)
+  ) {
+    return (await service.clearRuntime(machineId, runtime)) ? "cleared" : "kept";
+  }
+  if (typeof report.runtime !== "string") return "kept";
+  return (await service.writeRuntime(machineId, report.runtime, report.models)) ? "written" : "kept";
+}
 
 export function __clearMachineRuntimeModelCatalogLocalCacheForTests(): void {
   localHashes.clear();

@@ -5,43 +5,44 @@ import {
   validateScreenshotPng,
 } from "./screenshotBudget";
 import type { ValidatedScreenshot } from "./screenshotBudget";
-import { clearClockTimeout, errorClassOf, setClockTimeout } from "@botiverse/raft-shared";
-import { DEFAULT_AVATAR_KEY, pixelAvatarDataUrl } from "../components/agent/PixelAvatar";
-import { useServerStore } from "../store/serverStore";
-import { assertValidDesktopRuntimeEnvironment, RUNTIME_API_BASE } from "../desktopRuntimeEnvironment";
+import { clearClockTimeout, setClockTimeout } from "@botiverse/raft-shared";
 import { materializeDomCaptureSnapshots } from "./domCaptureSnapshot";
+import {
+  planScreenshotPages,
+} from "./selectScreenshotPagination";
+import type { ScreenshotMessageMeasure, ScreenshotPageSegment } from "./selectScreenshotPagination";
+import { requestAllTimelineRowsMounted } from "./timelineMountAll";
+import {
+  SHARE_PREVIEW_MAX_WIDTH,
+  SelectScreenshotRowsMissingError,
+  SelectScreenshotTimeoutError,
+  SelectScreenshotTransientContentError,
+} from "./selectScreenshotShared";
+import { inlineImagesForScreenshot } from "./selectScreenshotImages";
+import type { ScreenshotImageReads } from "./selectScreenshotImages";
+import { getScreenshotFontEmbedCss } from "./selectScreenshotFonts";
 
-const TRANSPARENT_GIF =
-  "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7";
+export {
+  getDefaultAvatarDataUrl,
+  inlineImagesForScreenshot,
+  resolveAvatarImageFetchTargetUrl,
+} from "./selectScreenshotImages";
+export type { ScreenshotImageReads } from "./selectScreenshotImages";
 
-const API_BASE = RUNTIME_API_BASE;
+export {
+  downloadDataUrl,
+  SHARE_PREVIEW_MAX_WIDTH,
+  SelectScreenshotRowsMissingError,
+  SelectScreenshotTimeoutError,
+  SelectScreenshotTransientContentError,
+} from "./selectScreenshotShared";
 
 const DEFAULT_CAPTURE_TIMEOUT_MS = 20_000;
 // Keep exports crisp on high-DPR/mobile screens without letting very long
 // selections explode memory on 4x+ displays.
 const MIN_CAPTURE_PIXEL_RATIO = 2;
 const MAX_CAPTURE_PIXEL_RATIO = 3;
-const IMAGE_INLINE_TIMEOUT_MS = 1_000;
 const FONT_READY_TIMEOUT_MS = 1_000;
-export const SHARE_PREVIEW_MAX_WIDTH = 768;
-
-export class SelectScreenshotTimeoutError extends Error {
-  readonly timeoutSeconds: number;
-
-  constructor(timeoutMs: number) {
-    const timeoutSeconds = Math.max(1, Math.ceil(timeoutMs / 1000));
-    super(`Rendering timed out after ${timeoutSeconds}s`);
-    this.name = "SelectScreenshotTimeoutError";
-    this.timeoutSeconds = timeoutSeconds;
-  }
-}
-
-class SelectScreenshotImageInlineTimeoutError extends Error {
-  constructor(timeoutMs: number) {
-    super(`Image inlining timed out after ${Math.max(1, Math.ceil(timeoutMs / 1000))}s`);
-    this.name = "SelectScreenshotImageInlineTimeoutError";
-  }
-}
 
 export function withCaptureTimeout<T>(
   promise: Promise<T>,
@@ -139,17 +140,46 @@ export interface CaptureOptions {
    */
   maxWidth?: number;
   /**
-   * Set of message ids that should render with one-step left indent — used
-   * for thread replies under their selected parent. Pure padding indent, no
-   * connector line, per huxijin's v1.4 spec ("纯 padding 缩紧").
-   */
-  threadChildIds?: ReadonlySet<string>;
-  /**
    * Panel the selection was made in. A thread's parent message also renders
    * in the channel timeline, so a document-wide id lookup can pick that copy
    * and size the export to the wrong column.
    */
   scope?: ParentNode | null;
+  /** Internal page slices used after the full selection exceeds the budget. */
+  pageSegments?: readonly ScreenshotPageSegment[];
+  pageNumber?: number;
+  pageCount?: number;
+  /** Internal: image reads shared by every page of one capture. */
+  imageReads?: ScreenshotImageReads;
+}
+
+export type ScreenshotCapturePhase = "preparing" | "rendering" | "validating";
+
+export interface ScreenshotCaptureProgress {
+  phase: ScreenshotCapturePhase;
+  pageNumber: number;
+  pageCount: number;
+}
+
+export interface CaptureSelectedMessageImagesOptions extends CaptureOptions {
+  signal?: AbortSignal;
+  onProgress?: (progress: ScreenshotCaptureProgress) => void;
+}
+
+class MeasuredScreenshotNeedsPaginationError extends ScreenshotNeedsPaginationError {
+  readonly messageMeasures: readonly ScreenshotMessageMeasure[];
+  readonly pageChromeCssHeight: number;
+
+  constructor(
+    plan: ConstructorParameters<typeof ScreenshotNeedsPaginationError>[0],
+    messageMeasures: readonly ScreenshotMessageMeasure[],
+    pageChromeCssHeight: number,
+  ) {
+    super(plan);
+    this.name = "MeasuredScreenshotNeedsPaginationError";
+    this.messageMeasures = messageMeasures;
+    this.pageChromeCssHeight = pageChromeCssHeight;
+  }
 }
 
 /**
@@ -171,6 +201,33 @@ const STRIP_SELECTORS = [
   // overlay. Attribute is set on the affordance root in MessageItem.tsx
   // so renames of Tailwind chrome don't break the strip pass.
   "[data-message-affordance]",
+  // Reactions are useful live conversation state, but Cindy explicitly keeps
+  // them out of the durable share artifact. The semantic marker lives on the
+  // whole chip so both interactive and read-only variants are removed.
+  '[data-select-screenshot-reaction="true"]',
+  // A human's server role is useful live workspace chrome, but Cindy keeps it
+  // out of the exported share artifact. Human-authored profile descriptions
+  // remain; only the role fallback receives this marker.
+  '[data-select-screenshot-human-role="true"]',
+  // Viewer-only previews. A share image is public, so it never includes what
+  // was resolved for this viewer about something the message names: what this
+  // viewer may see is not what everyone who sees the image may see. Inline
+  // chips go back to the author's link (`data-app-link-chip-url` below); any
+  // other such preview marks its root `data-select-screenshot-viewer-only`
+  // and is removed whole: first-party object cards (an Artifact's card under
+  // a message, its "Saved as Artifact" lines) and the quote preview of a
+  // linked message (MessageItem's wrapper, so every state of it and its margin
+  // go). App link previews predate the marker and keep their own (the next
+  // three).
+  '[data-select-screenshot-viewer-only="true"]',
+  // App link hover cards are third-party data resolved for this viewer only
+  // (e.g. a private issue title). Share artifacts are public; the chips go
+  // back to the message's own links first (sanitizeClonedMessageForScreenshot).
+  "[data-app-link-preview]",
+  // The same viewer-only slot: the viewer's own consent prompt for an App, and
+  // the placeholder of a card loading after they allowed it.
+  "[data-app-link-preview-prompt]",
+  "[data-app-link-preview-pending]",
 ];
 
 const FREEZE_RENDERED_BOX_SELECTORS = [
@@ -194,14 +251,13 @@ function queryMatchingElements(root: HTMLElement, selector: string): HTMLElement
 export function expandClonedMessageContentForScreenshot(clone: HTMLElement): void {
   for (const content of queryMatchingElements(clone, '[data-message-collapsible-content="true"]')) {
     content.dataset.messageCollapsed = "false";
-    content.classList.remove("relative", "overflow-clip");
+    content.classList.remove("relative", "overflow-clip", "mask-fade-b");
     content.style.removeProperty("max-height");
   }
 
   clone.querySelectorAll([
     "[data-message-content-toggle]",
     "[data-message-content-toggle-placeholder]",
-    "[data-message-collapse-fade]",
   ].join(",")).forEach((node) => node.remove());
 }
 
@@ -257,7 +313,71 @@ const WIDE_CONTENT_SELECTORS = [
  * hits the rasterizer. Keeps the clone static (no hover transitions,
  * no cursor changes, no group-hover bleed).
  */
-function sanitizeClone(clone: HTMLElement): void {
+function replaceInteractiveElementWithStaticSpan(element: HTMLElement): void {
+  const replacement = document.createElement("span");
+  const visibleText = (element.textContent ?? "").trim();
+  const taskNumber = visibleText.match(/^#?(\d+)$/)?.[1];
+  replacement.textContent = taskNumber ? `task #${taskNumber}` : visibleText;
+  replacement.className = "font-mono font-bold text-foreground";
+  replacement.setAttribute("data-select-screenshot-static-ref", "true");
+  element.replaceWith(replacement);
+}
+
+/**
+ * Normalize a cloned MessageItem into a durable reading artifact.
+ *
+ * Keep readable message content, but remove reactions and source-surface state
+ * (task status, saved/read/thread badges and interactive chrome). Attachments
+ * become a compact filename list so a gallery/player/document preview cannot
+ * dominate the exported pages or introduce another asynchronous render path.
+ */
+export function sanitizeClonedMessageForScreenshot(clone: HTMLElement): void {
+  clone.querySelectorAll<HTMLElement>('[data-select-screenshot-attachment-content="true"]')
+    .forEach((node) => node.remove());
+  clone.querySelectorAll<HTMLElement>('[data-select-screenshot-attachment-summary="true"]')
+    .forEach((summary) => {
+      summary.classList.remove("hidden");
+      summary.removeAttribute("aria-hidden");
+      summary.style.display = "flex";
+      summary.style.flexWrap = "wrap";
+      summary.style.gap = "6px";
+      summary.style.marginTop = "6px";
+    });
+
+  // Action cards are executable UI on the live message surface. A durable
+  // image keeps only the header's action title and completed-result sentence;
+  // runtime status, collapse controls, scopes, properties, errors, and action
+  // buttons are interaction state rather than message content.
+  clone.querySelectorAll<HTMLElement>('[data-select-screenshot-action-detail="true"], [data-select-screenshot-action-control="true"]')
+    .forEach((node) => node.remove());
+
+  // Footer task chips carry runtime status and are excluded. Inline task refs
+  // use the same affordance marker, so preserve their visible `task #N` text
+  // as a static span before the generic affordance strip runs.
+  clone.querySelectorAll<HTMLElement>('[data-message-affordance="open-linked-task"]')
+    .forEach((node) => {
+      if (node.querySelector('[data-testid="message-task-badge"]')) {
+        node.remove();
+      } else {
+        replaceInteractiveElementWithStaticSpan(node);
+      }
+    });
+
+  // A link chip names what the link points to as this viewer resolved it: an
+  // App link chip the App's data (its title), a Raft message link the
+  // conversation (a private channel's name, a DM peer's). The public artifact
+  // shows the link the author wrote instead: its address, or the words the
+  // author gave it (`data-select-screenshot-author-text`).
+  clone.querySelectorAll<HTMLElement>("[data-app-link-chip-url], [data-select-screenshot-author-link]")
+    .forEach((chip) => {
+      const url = chip.getAttribute("data-select-screenshot-author-link") ?? chip.getAttribute("data-app-link-chip-url") ?? "";
+      const link = document.createElement("a");
+      link.href = url;
+      link.textContent = chip.getAttribute("data-select-screenshot-author-text") || url;
+      link.className = "text-foreground-link underline decoration-2 underline-offset-2 decoration-foreground-link/40";
+      chip.replaceWith(link);
+    });
+
   // Drop transient UI.
   for (const sel of STRIP_SELECTORS) {
     clone.querySelectorAll(sel).forEach((n) => n.remove());
@@ -271,6 +391,56 @@ function sanitizeClone(clone: HTMLElement): void {
   clone.style.border = "2px solid transparent";
   clone.style.marginBottom = "4px";
   clone.style.background = "transparent";
+}
+
+function sanitizeClone(clone: HTMLElement): void {
+  sanitizeClonedMessageForScreenshot(clone);
+}
+
+function createContinuationMarker(direction: "previous" | "next"): HTMLElement {
+  const marker = document.createElement("div");
+  marker.setAttribute("data-select-screenshot-continuation", direction);
+  marker.textContent = direction === "previous" ? "↑ …" : "… ↓";
+  marker.style.height = "24px";
+  marker.style.display = "flex";
+  marker.style.alignItems = "center";
+  marker.style.justifyContent = "center";
+  marker.style.fontFamily = "'Space Mono', ui-monospace, monospace";
+  marker.style.fontSize = "11px";
+  marker.style.fontWeight = "700";
+  marker.style.color = "#141111";
+  marker.style.letterSpacing = "0.08em";
+  return marker;
+}
+
+function appendScreenshotSegment(
+  contentArea: HTMLElement,
+  clone: HTMLElement,
+  segment: ScreenshotPageSegment | undefined,
+): void {
+  if (!segment || (!segment.continuedFromPrevious && !segment.continuesOnNext)) {
+    contentArea.appendChild(clone);
+    return;
+  }
+
+  const segmentRoot = document.createElement("div");
+  segmentRoot.setAttribute("data-select-screenshot-segment", segment.messageId);
+  if (segment.continuedFromPrevious) {
+    segmentRoot.appendChild(createContinuationMarker("previous"));
+  }
+  const viewport = document.createElement("div");
+  viewport.style.height = `${segment.cssHeight}px`;
+  viewport.style.overflow = "hidden";
+  viewport.style.position = "relative";
+  clone.style.marginBottom = "0";
+  clone.style.transform = `translateY(-${segment.sourceOffsetTop}px)`;
+  clone.style.transformOrigin = "top left";
+  viewport.appendChild(clone);
+  segmentRoot.appendChild(viewport);
+  if (segment.continuesOnNext) {
+    segmentRoot.appendChild(createContinuationMarker("next"));
+  }
+  contentArea.appendChild(segmentRoot);
 }
 
 function freezeTextLineBoxesForScreenshot(root: HTMLElement): void {
@@ -310,245 +480,62 @@ function constrainWideContentForScreenshot(root: HTMLElement): void {
   });
 }
 
-function blobToDataUrl(blob: Blob): Promise<string> {
-  const reader = new FileReader();
-  return new Promise<string>((resolve, reject) => {
-    reader.onload = () => resolve(reader.result as string);
-    reader.onerror = () => reject(reader.error || new Error("FileReader failed"));
-    reader.readAsDataURL(blob);
+function findSelectedMessageRow(id: string, scope?: ParentNode | null): HTMLElement | null {
+  return scope?.querySelector<HTMLElement>(`[id="message-${id}"]`) ?? document.getElementById(`message-${id}`);
+}
+
+function missingSelectedMessageIds(messageIds: readonly string[], scope?: ParentNode | null): string[] {
+  return messageIds.filter((id) => !findSelectedMessageRow(id, scope));
+}
+
+const ROWS_MOUNT_TIMEOUT_MS = 2_000;
+
+function nextFrame(): Promise<void> {
+  return new Promise((resolve) => {
+    requestAnimationFrame(() => resolve());
   });
 }
-
-function getAuthHeaders(): HeadersInit {
-  assertValidDesktopRuntimeEnvironment();
-
-  const headers: Record<string, string> = {};
-  const token = localStorage.getItem("slock_access_token");
-  const serverId = useServerStore.getState().current?.id;
-  if (token) headers.Authorization = `Bearer ${token}`;
-  if (serverId) headers["X-Server-Id"] = serverId;
-  return headers;
-}
-
-export function resolveAvatarImageFetchTargetUrl(src: string, baseHref = window.location.href): string | null {
-  const url = new URL(src, baseHref);
-  const avatarMatch = url.pathname.match(/(?:^|\/)avatars\/([^/]+)\/([0-9a-f]+\.webp)$/i);
-  if (!avatarMatch) return null;
-  const [, namespace, filename] = avatarMatch;
-  return `${API_BASE}/avatars/${encodeURIComponent(namespace)}/${encodeURIComponent(filename)}`;
-}
-
-function getPublicAvatarFetchInit(): RequestInit {
-  return {
-    cache: "no-cache",
-    mode: "cors",
-    credentials: "omit",
-  };
-}
-
-type ScreenshotImageFetchTarget = {
-  url: string;
-  init: RequestInit;
-  preserveOriginalOnFailure: boolean;
-  avatarFallbackKind?: string;
-};
-
-function getImageFetchTarget(img: HTMLImageElement): ScreenshotImageFetchTarget | null {
-  const attachmentId = img.dataset.selectScreenshotAttachmentId;
-  if (attachmentId) {
-    return {
-      preserveOriginalOnFailure: false,
-      url: `${API_BASE}/attachments/${encodeURIComponent(attachmentId)}?disposition=inline&selectScreenshot=1`,
-      init: {
-        headers: getAuthHeaders(),
-        cache: "no-cache",
-      },
-    };
-  }
-
-  const src = img.currentSrc || img.src || img.getAttribute("src") || "";
-  if (!src || src.startsWith("data:") || src.startsWith("blob:")) return null;
-
-  const avatarFallbackKind = img.closest<HTMLElement>("[data-avatar-kind]")?.dataset.avatarKind;
-  const url = new URL(src, window.location.href);
-  const avatarApiUrl = resolveAvatarImageFetchTargetUrl(url.toString());
-  if (avatarApiUrl) {
-    return {
-      preserveOriginalOnFailure: true,
-      avatarFallbackKind: avatarFallbackKind ?? "human",
-      url: avatarApiUrl,
-      init: getPublicAvatarFetchInit(),
-    };
-  }
-
-  const sameOrigin = url.origin === window.location.origin;
-  return {
-    preserveOriginalOnFailure: Boolean(avatarFallbackKind),
-    avatarFallbackKind,
-    url: url.toString(),
-    init: sameOrigin
-      ? {
-          headers: getAuthHeaders(),
-          cache: "no-cache",
-        }
-      : {
-          credentials: "omit",
-          mode: "cors",
-          cache: "no-cache",
-        },
-  };
-}
-
-async function fetchImageForScreenshot(
-  url: string,
-  init: RequestInit,
-  timeoutMs = IMAGE_INLINE_TIMEOUT_MS,
-): Promise<Response> {
-  const controller = new AbortController();
-  let timeoutId: ReturnType<typeof setTimeout> | undefined;
-  const timeout = new Promise<Response>((_, reject) => {
-    timeoutId = setTimeout(() => {
-      controller.abort();
-      reject(new SelectScreenshotImageInlineTimeoutError(timeoutMs));
-    }, timeoutMs);
-  });
-
-  try {
-    return await Promise.race([
-      fetch(url, {
-        ...init,
-        signal: controller.signal,
-      }),
-      timeout,
-    ]);
-  } finally {
-    if (timeoutId) clearTimeout(timeoutId);
-  }
-}
-
-function freezeRenderedImageBox(img: HTMLImageElement): void {
-  const rect = img.getBoundingClientRect();
-  if (rect.width > 16 && rect.height > 16) {
-    img.style.width = `${rect.width}px`;
-    img.style.height = `${rect.height}px`;
-    return;
-  }
-
-  const sourceWidth = Number(img.dataset.selectScreenshotAttachmentWidth);
-  const sourceHeight = Number(img.dataset.selectScreenshotAttachmentHeight);
-  if (!Number.isFinite(sourceWidth) || !Number.isFinite(sourceHeight) || sourceWidth <= 0 || sourceHeight <= 0) {
-    return;
-  }
-
-  const maxWidth = Math.min(416, img.parentElement?.parentElement?.getBoundingClientRect().width || 416);
-  const maxHeight = 288;
-  const scale = Math.min(1, maxWidth / sourceWidth, maxHeight / sourceHeight);
-  img.style.width = `${Math.max(1, Math.round(sourceWidth * scale))}px`;
-  img.style.height = `${Math.max(1, Math.round(sourceHeight * scale))}px`;
-}
-
-async function decodeImage(img: HTMLImageElement): Promise<void> {
-  if (img.complete && img.naturalWidth > 0) return;
-  try {
-    await Promise.race([
-      img.decode(),
-      new Promise<void>((r) => setTimeout(r, 2000)),
-    ]);
-  } catch {
-    /* image failed to decode; rasterize whatever the browser has */
-  }
-}
-
-function svgDataUrl(svg: string): string {
-  return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
-}
-
-const DEFAULT_HUMAN_AVATAR_SVG =
-  '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><rect width="24" height="24" fill="#BBAFE6"/><path d="M20 21a8 8 0 0 0-16 0" fill="none" stroke="#141111" stroke-linecap="round" stroke-linejoin="round" stroke-width="2"/><circle cx="12" cy="7" r="4" fill="none" stroke="#141111" stroke-width="2"/></svg>';
-
-// The agent default is the same robot sprite AgentAvatar renders when a custom
-// image is unavailable — built by the single pixel-avatar SVG builder, so a
-// failed image never depends on React state.
-const DEFAULT_AGENT_AVATAR_DATA_URL = pixelAvatarDataUrl(DEFAULT_AVATAR_KEY) ?? "";
 
 /**
- * Return the same visible default-avatar treatment used by AvatarSlot when a
- * cloned share image cannot load an avatar. Unknown callers use the human
- * placeholder because it is the neutral AvatarSlot fallback.
+ * Make sure every selected message has its row in the DOM before a capture:
+ * the virtual timeline mounts only the rows near the view, so a selection the
+ * reader scrolled through has rows that are not mounted. While any is
+ * missing, every timeline mounts all of its rows (timelineMountAll) until the
+ * returned release is called. A message whose row is still missing after that
+ * fails the capture (SelectScreenshotRowsMissingError): never a partial image.
  */
-export function getDefaultAvatarDataUrl(kind?: string): string {
-  return kind === "agent" ? DEFAULT_AGENT_AVATAR_DATA_URL : svgDataUrl(DEFAULT_HUMAN_AVATAR_SVG);
-}
-
-function inlineDefaultAvatarForScreenshot(img: HTMLImageElement): void {
-  const kind = img.closest<HTMLElement>("[data-avatar-kind]")?.dataset.avatarKind;
-  // srcset can otherwise win URL selection again after assigning the data URL.
-  img.removeAttribute("srcset");
-  img.removeAttribute("sizes");
-  img.hidden = false;
-  img.style.display = "block";
-  img.style.visibility = "visible";
-  img.style.opacity = "1";
-  img.dataset.selectScreenshotAvatarFallback = kind ?? "human";
-  img.src = getDefaultAvatarDataUrl(kind);
-}
-
-function canRasterizeOriginalImage(src: string): boolean {
-  if (src.startsWith("data:") || src.startsWith("blob:")) return true;
+export async function ensureSelectedMessageRowsMounted(
+  messageIds: readonly string[],
+  scope?: ParentNode | null,
+  signal?: AbortSignal,
+): Promise<() => void> {
+  if (missingSelectedMessageIds(messageIds, scope).length === 0) return () => {};
+  const release = requestAllTimelineRowsMounted();
   try {
-    // A foreignObject rasterizer cannot reliably re-read a cross-origin image
-    // that was not converted to a data URL. Keep a same-origin original only;
-    // CDN capability URLs must use the API/data-url path or a safe placeholder.
-    return new URL(src, window.location.href).origin === window.location.origin;
-  } catch {
-    return false;
+    const deadline = performance.now() + ROWS_MOUNT_TIMEOUT_MS;
+    let missing = missingSelectedMessageIds(messageIds, scope);
+    while (missing.length > 0 && performance.now() < deadline) {
+      await nextFrame();
+      throwIfCaptureAborted(signal);
+      missing = missingSelectedMessageIds(messageIds, scope);
+    }
+    if (missing.length > 0) throw new SelectScreenshotRowsMissingError(missing, messageIds.length);
+    // One more frame: the rows mounted in the last one are laid out and
+    // their images have started loading.
+    await nextFrame();
+    throwIfCaptureAborted(signal);
+    return release;
+  } catch (error) {
+    release();
+    throw error;
   }
 }
 
-async function inlineImageForScreenshot(img: HTMLImageElement): Promise<void> {
-  freezeRenderedImageBox(img);
-  const target = getImageFetchTarget(img);
-  if (!target) {
-    await decodeImage(img);
-    return;
-  }
-
-  const originalSrc = img.currentSrc || img.src || img.getAttribute("src") || target.url;
-  try {
-    const response = await fetchImageForScreenshot(target.url, target.init);
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    img.src = await blobToDataUrl(await response.blob());
-    await decodeImage(img);
-  } catch (err) {
-    // The live browser may already have decoded an uploaded avatar from its
-    // capability URL even when the API fallback is unavailable. Keep that
-    // source for html-to-image's best-effort pass instead of exposing the
-    // AvatarSlot placeholder background in the generated image.
-    if (target.preserveOriginalOnFailure && canRasterizeOriginalImage(originalSrc)) {
-      img.src = originalSrc;
-      await decodeImage(img);
-      if (img.complete && img.naturalWidth > 0) return;
-    }
-
-    // Keep the already-frozen rendered dimensions so one bad image cannot
-    // collapse the whole message into a tiny placeholder in the export.
-    console.warn(
-      "captureSelectedMessages: image inlining failed, using placeholder",
-      {
-        src: originalSrc,
-        fetchUrl: target.url,
-        error: err,
-        errMessage: err instanceof Error ? err.message : String(err),
-        errName: errorClassOf(err),
-      },
-    );
-    if (target.avatarFallbackKind) {
-      inlineDefaultAvatarForScreenshot(img);
-    } else {
-      img.src = TRANSPARENT_GIF;
-    }
-    await decodeImage(img);
-  }
+// The message ids of the rows the last share capture rendered (its input,
+// every page), for the e2e hook (window.__SLOCK_E2E__.readLastCaptureMessageIds).
+let lastCaptureMessageIds = new Set<string>();
+export function readLastCaptureMessageIds(): string[] {
+  return [...lastCaptureMessageIds];
 }
 
 /**
@@ -558,7 +545,7 @@ async function inlineImageForScreenshot(img: HTMLImageElement): Promise<void> {
 export function findSelectedMessageRows(messageIds: readonly string[], scope?: ParentNode | null): HTMLElement[] {
   const nodes: HTMLElement[] = [];
   for (const id of messageIds) {
-    const el = scope?.querySelector<HTMLElement>(`[id="message-${id}"]`) ?? document.getElementById(`message-${id}`);
+    const el = findSelectedMessageRow(id, scope);
     if (el) nodes.push(el);
   }
   return nodes.sort((a, b) => {
@@ -582,6 +569,102 @@ export async function captureSelectedMessageImage(
   return withCaptureTimeout(captureSelectedMessagesUnsafe(messageIds, options), options.timeoutMs);
 }
 
+function throwIfCaptureAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) throw new DOMException("Capture cancelled", "AbortError");
+}
+
+/**
+ * Capture one or more validated PNG pages. The first attempt keeps the legacy
+ * single-image path; only a selection that cannot fit at 1x is paginated.
+ * Page breaks prefer message boundaries. A single oversize row is clipped into
+ * complete ordered slices with visible continuation markers.
+ */
+export async function captureSelectedMessageImages(
+  messageIds: string[],
+  options: CaptureSelectedMessageImagesOptions = {},
+): Promise<ValidatedScreenshot[]> {
+  const { signal, onProgress, ...captureOptions } = options;
+  throwIfCaptureAborted(signal);
+  onProgress?.({ phase: "preparing", pageNumber: 0, pageCount: 1 });
+  throwIfCaptureAborted(signal);
+  lastCaptureMessageIds = new Set();
+  const releaseRows = await ensureSelectedMessageRowsMounted(messageIds, captureOptions.scope, signal);
+  try {
+    return await captureSelectedMountedMessageImages(messageIds, captureOptions, signal, onProgress);
+  } finally {
+    releaseRows();
+  }
+}
+
+async function captureSelectedMountedMessageImages(
+  messageIds: string[],
+  pageOptions: CaptureOptions,
+  signal: AbortSignal | undefined,
+  onProgress: CaptureSelectedMessageImagesOptions["onProgress"],
+): Promise<ValidatedScreenshot[]> {
+  // The single-page attempt and every page read each image once between them.
+  const captureOptions: CaptureOptions = { ...pageOptions, imageReads: pageOptions.imageReads ?? new Map() };
+  try {
+    onProgress?.({ phase: "rendering", pageNumber: 1, pageCount: 1 });
+    throwIfCaptureAborted(signal);
+    const single = await captureSelectedMessageImage(messageIds, captureOptions);
+    throwIfCaptureAborted(signal);
+    onProgress?.({ phase: "validating", pageNumber: 1, pageCount: 1 });
+    return [single];
+  } catch (error) {
+    if (!(error instanceof ScreenshotNeedsPaginationError)) throw error;
+
+    const nodes = findSelectedMessageRows(messageIds, captureOptions.scope);
+    if (nodes.length === 0) throw error;
+    const fallbackChromeCssHeight = 80;
+    let pageChromeCssHeight = fallbackChromeCssHeight;
+    let measures: readonly ScreenshotMessageMeasure[];
+    if (error instanceof MeasuredScreenshotNeedsPaginationError) {
+      pageChromeCssHeight = error.pageChromeCssHeight;
+      measures = error.messageMeasures;
+    } else {
+      const liveHeights = nodes.map((node) => Math.max(
+        1,
+        node.getBoundingClientRect().height,
+        node.scrollHeight,
+        node.offsetHeight,
+      ));
+      const totalLiveHeight = liveHeights.reduce((sum, height) => sum + height, 0);
+      const measuredContentHeight = Math.max(1, error.plan.cssHeight - pageChromeCssHeight);
+      measures = nodes.map((node, index) => ({
+        id: node.id.replace(/^message-/, ""),
+        cssHeight: measuredContentHeight * ((liveHeights[index] ?? 1) / totalLiveHeight),
+      }));
+    }
+    const pages = planScreenshotPages(measures, {
+      cssWidth: error.plan.cssWidth,
+      pageChromeCssHeight,
+      continuationChromeCssHeight: 24,
+      preferredPixelRatio: resolveCapturePixelRatio(captureOptions.pixelRatio),
+    });
+
+    const images: ValidatedScreenshot[] = [];
+    for (const page of pages) {
+      throwIfCaptureAborted(signal);
+      onProgress?.({ phase: "rendering", pageNumber: page.pageNumber, pageCount: page.pageCount });
+      throwIfCaptureAborted(signal);
+      const image = await captureSelectedMessageImage(
+        page.segments.map((segment) => segment.messageId),
+        {
+          ...captureOptions,
+          pageSegments: page.segments,
+          pageNumber: page.pageNumber,
+          pageCount: page.pageCount,
+        },
+      );
+      throwIfCaptureAborted(signal);
+      onProgress?.({ phase: "validating", pageNumber: page.pageNumber, pageCount: page.pageCount });
+      images.push(image);
+    }
+    return images;
+  }
+}
+
 /** Data-URL form of `captureSelectedMessageImage`, for the e2e test hook. */
 export async function captureSelectedMessages(
   messageIds: string[],
@@ -601,6 +684,13 @@ async function captureSelectedMessagesUnsafe(
   const nodes = findSelectedMessageRows(messageIds, options.scope);
   if (nodes.length === 0) {
     throw new Error("captureSelectedMessages: no DOM matches");
+  }
+  for (const node of nodes) lastCaptureMessageIds.add(node.id.replace(/^message-/, ""));
+  const transientMessageIds = nodes
+    .filter((node) => node.querySelector('[data-select-screenshot-transient-state="true"]'))
+    .map((node) => node.id.replace(/^message-/, ""));
+  if (transientMessageIds.length > 0) {
+    throw new SelectScreenshotTransientContentError(transientMessageIds);
   }
 
   // Match the live surface so cloned dark-theme text keeps its original contrast.
@@ -649,7 +739,7 @@ async function captureSelectedMessagesUnsafe(
   container.style.left = "-99999px";
   container.style.top = "0";
   container.style.pointerEvents = "none";
-  container.style.zIndex = "-1";
+  container.style.zIndex = "var(--z-index-below)";
   container.style.width = `${liveWidth}px`;
   container.style.padding = "0";
   container.style.background = bg;
@@ -689,7 +779,9 @@ async function captureSelectedMessagesUnsafe(
   lockup.appendChild(lockupIcon);
 
   const domain = document.createElement("span");
-  domain.textContent = "raft.build";
+  domain.textContent = options.pageCount && options.pageCount > 1
+    ? `raft.build · ${options.pageNumber ?? 1}/${options.pageCount}`
+    : "raft.build";
   domain.style.fontFamily =
     "'Space Mono', ui-monospace, monospace";
   domain.style.fontSize = "12px";
@@ -706,7 +798,9 @@ async function captureSelectedMessagesUnsafe(
   const contentArea = document.createElement("div");
   contentArea.style.padding = "12px 16px 16px";
 
-  const childIds = options.threadChildIds ?? new Set<string>();
+  const pageSegments = new Map(
+    (options.pageSegments ?? []).map((segment) => [segment.messageId, segment]),
+  );
   const disposeSnapshots: Array<() => void> = [];
   try {
     for (const node of nodes) {
@@ -716,8 +810,7 @@ async function captureSelectedMessagesUnsafe(
       expandClonedMessageContentForScreenshot(clone);
       freezeCloneRenderedBoxes(node, clone);
       disposeSnapshots.push(await materializeDomCaptureSnapshots(node, clone));
-      if (childIds.has(id)) clone.style.paddingLeft = "32px";
-      contentArea.appendChild(clone);
+      appendScreenshotSegment(contentArea, clone, pageSegments.get(id));
     }
   } catch (error) {
     for (const dispose of disposeSnapshots.reverse()) dispose();
@@ -732,10 +825,13 @@ async function captureSelectedMessagesUnsafe(
     container.offsetHeight;
     await new Promise<void>((r) => requestAnimationFrame(() => r()));
 
-    // Wait briefly for page fonts, but never let third-party font loading own
-    // the share action. html-to-image also has its own web-font embedding pass;
-    // we disable it below so a stalled Google Fonts/GStatic request cannot keep
-    // the toolbar on "Rendering..." until the outer capture timeout fires.
+    // The image document cannot reach the page's web fonts, so the app's own
+    // faces are embedded as data URLs (selectScreenshotFonts.ts; built once a
+    // session, bounded, and optional). Start it now, use it at rasterization.
+    const fontEmbedCss = getScreenshotFontEmbedCss();
+
+    // Wait briefly for page fonts (the live layout the clone copies), but
+    // never let font loading own the share action.
     await waitForDocumentFontsForScreenshot();
 
     // html-to-image serializes the off-screen subtree into SVG foreignObject.
@@ -759,7 +855,7 @@ async function captureSelectedMessagesUnsafe(
     // Pixel avatars are already <img> data URLs (PixelAvatar), so they go
     // through the same image inlining as everything else.
     const imgs = Array.from(container.querySelectorAll("img")) as HTMLImageElement[];
-    await Promise.all(imgs.map((img) => inlineImageForScreenshot(img)));
+    await inlineImagesForScreenshot(imgs, options.imageReads);
 
     // Root needs an explicit height so the SVG wrapper knows how tall
     // to make its viewBox. Without it, some browsers clip to content
@@ -771,7 +867,21 @@ async function captureSelectedMessagesUnsafe(
     // empty. Pick the highest ratio that fits the shared budget, and never
     // attempt a render that does not fit (task #1302).
     const plan = planScreenshotPixelRatio(liveWidth, liveHeight, resolveCapturePixelRatio(options.pixelRatio));
-    if (plan.kind === "needsPagination") throw new ScreenshotNeedsPaginationError(plan);
+    if (plan.kind === "needsPagination") {
+      const messageMeasures = Array.from(contentArea.children).map((child, index) => {
+        const element = child as HTMLElement;
+        const style = getComputedStyle(element);
+        const marginTop = Number.parseFloat(style.marginTop) || 0;
+        const marginBottom = Number.parseFloat(style.marginBottom) || 0;
+        return {
+          id: nodes[index]?.id.replace(/^message-/, "") ?? String(index),
+          cssHeight: Math.max(1, element.getBoundingClientRect().height, element.offsetHeight) + marginTop + marginBottom,
+        };
+      });
+      const measuredMessagesCssHeight = messageMeasures.reduce((sum, message) => sum + message.cssHeight, 0);
+      const pageChromeCssHeight = Math.max(1, liveHeight - measuredMessagesCssHeight);
+      throw new MeasuredScreenshotNeedsPaginationError(plan, messageMeasures, pageChromeCssHeight);
+    }
 
     const dataUrl = await toPng(container, {
       backgroundColor: bg,
@@ -781,6 +891,10 @@ async function captureSelectedMessagesUnsafe(
       // URL gets a fresh pending fetch). Turn it off — we've already
       // waited for the live images to decode.
       cacheBust: false,
+      // Our embedded faces. html-to-image's own pass (skipFonts) stays off: it
+      // fetches every stylesheet, third-party ones included (#7024). Without
+      // embedded CSS the image falls back to system fonts, as before.
+      fontEmbedCSS: (await fontEmbedCss) ?? undefined,
       skipFonts: true,
       skipAutoScale: true,
       width: liveWidth,
@@ -801,16 +915,4 @@ async function captureSelectedMessagesUnsafe(
     container.remove();
     for (const dispose of disposeSnapshots.reverse()) dispose();
   }
-}
-
-/**
- * Trigger a browser download for a `data:image/png;base64,...` URL.
- */
-export function downloadDataUrl(dataUrl: string, filename: string): void {
-  const a = document.createElement("a");
-  a.href = dataUrl;
-  a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
 }

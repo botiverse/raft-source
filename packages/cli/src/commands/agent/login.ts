@@ -2,12 +2,18 @@
  * Ordinary login accepts an existing sk_agent_* through a hidden prompt or
  * stdin, verifies its identity, and atomically saves a mode-0600 profile.
  * It does not request device authorization or mint another credential.
- * Explicit `login start` / `login wait` retain the legacy browser flow.
+ * Explicit `login start` / `login wait` are the browser flow: `start` asks
+ * the server for an `agent_key` grant, a person approves it and picks the
+ * agent, and `wait` saves the `sk_agent_*` the token poll returns, then has
+ * the key the profile held before revoke itself. No user session is
+ * requested or kept on that path. `raft agent logout` (logout.ts) revokes the
+ * profile's key the same way and removes the file.
  * `login status` verifies an existing profile. Subsequent commands select
  * it with `raft --profile <slug>` or RAFT_PROFILE. Tokens are never printed.
  */
 
 import { mkdir, mkdtemp, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { hostname as osHostname } from "node:os";
 import path from "node:path";
 import { createInterface } from "node:readline";
 import { Writable } from "node:stream";
@@ -17,9 +23,12 @@ import { undiciFetch } from "../../proxy";
 
 import {
   authorizeDeviceCode,
+  DEFAULT_DEVICE_LOGIN_CLIENT_NAME,
   DeviceCodeLoginError,
   describeDeviceCodeLoginError,
-  pollDeviceToken,
+  pollAgentKey,
+  type AgentKeyGrantRequest,
+  type AgentKeyTokenResult,
   type DeviceAuthorization,
 } from "../../agentLogin/deviceAuthClient";
 import { resolveProfileDir } from "../../auth/env";
@@ -39,7 +48,9 @@ import {
   startCommandLine,
   waitCommandLine,
   type LoginProfilePaths as ProfilePaths,
+  type PreviousKeyOutcome,
 } from "./_format";
+import { selfRevokeAgentKey } from "../../agentLogin/selfRevoke";
 
 // Re-export for existing test imports; canonical home is agent/_format.ts.
 export { formatAuthorizedLoginReport } from "./_format";
@@ -216,7 +227,7 @@ export const agentLoginStartCommand = defineCommand(
   {
     name: "start",
     description:
-      "Begin device-code login and print the browser handoff, then exit (does not wait for approval).",
+      "Ask for an agent key through browser approval and print the handoff, then exit (does not wait for approval).",
     options: [SERVER_OPTION, AGENT_OPTION, CLIENT_NAME_OPTION, PROFILE_SLUG_OPTION, PROFILE_DIR_OPTION],
   },
   async (ctx, rawOptions: BaseLoginOptions & { clientName?: string }, command?: Command) => {
@@ -229,6 +240,7 @@ export const agentLoginStartCommand = defineCommand(
       authorization = await authorizeDeviceCode({
         serverUrl: options.server,
         ...(options.clientName ? { clientName: options.clientName } : {}),
+        grant: agentKeyGrantRequest(options),
       });
     } catch (err) {
       throw asCliError(err);
@@ -239,14 +251,14 @@ export const agentLoginStartCommand = defineCommand(
 );
 
 // ---------------------------------------------------------------------------
-// `raft agent login wait` — resume polling + mint
+// `raft agent login wait` — resume polling + save the issued agent key
 // ---------------------------------------------------------------------------
 
 export const agentLoginWaitCommand = defineCommand(
   {
     name: "wait",
     description:
-      "Wait for the user to approve a `login start` request, then mint and save the credential.",
+      "Wait for the user to approve a `login start` request, then save the agent key it gives.",
     options: [SERVER_OPTION, AGENT_OPTION, DEVICE_CODE_OPTION, PROFILE_SLUG_OPTION, PROFILE_DIR_OPTION],
   },
   async (ctx, rawOptions: BaseLoginOptions & { deviceCode: string }, command?: Command) => {
@@ -257,9 +269,9 @@ export const agentLoginWaitCommand = defineCommand(
     }
     const paths = resolveProfilePaths(options);
 
-    let userSession: { accessToken: string; refreshToken: string; userId: string };
+    let answer: AgentKeyTokenResult;
     try {
-      userSession = await pollDeviceToken({
+      answer = await pollAgentKey({
         serverUrl: options.server,
         deviceCode: options.deviceCode,
         pollIntervalMs: 5000,
@@ -269,9 +281,71 @@ export const agentLoginWaitCommand = defineCommand(
       throw asCliError(err);
     }
 
-    await mintAndPersist(ctx, options, userSession.accessToken, paths);
+    if (answer.kind === "legacy_session") {
+      // A server older than one-time grants ignored the grant and answered
+      // with a device session: mint with it as before (rotating this
+      // profile's key), then drop it. It is never written or signed out on
+      // the server: revoking it revokes the credential it just minted
+      // (server deviceSessionKeys.ts).
+      await mintAndPersist(ctx, options, answer.session.accessToken, paths);
+      return;
+    }
+
+    const { credential } = answer;
+    // The person picks the agent on the approval page; `--agent` only asks.
+    // A key for another agent never lands in this profile.
+    if (credential.agentId.toLowerCase() !== options.agent.toLowerCase()) {
+      throw cliError(
+        "AGENT_IDENTITY_MISMATCH",
+        `The approval gave a key for a different agent ('${credential.agentName}'), not ${options.agent}. The profile was not changed.`,
+        {
+          suggestedNextAction: `Ask the user to revoke the new key in the token list on the External setup card of '${credential.agentName}', then run \`${startCommandLine(options, paths)}\` and have them pick agent ${options.agent} on the approval page.`,
+        },
+      );
+    }
+    // The grant cannot rotate. Once the new key is saved, the key this
+    // profile held revokes itself (it is the bearer, so only it can end);
+    // the report says once what became of it. A failed revoke never fails
+    // the login: the new key stays saved and the user is asked to revoke.
+    const previous = await readReplaceableCredential(paths.credentialPath, options);
+    const replaced = previous && previous.credentialId !== credential.credentialId ? previous : null;
+    await writeCredentialFile(options, credential, paths);
+    let previousKey: { credentialId: string; outcome: PreviousKeyOutcome } | undefined;
+    if (replaced) {
+      const outcome = replaced.apiKey && replaced.apiKey !== credential.apiKey
+        ? await selfRevokeAgentKey(ctx, {
+          serverUrl: replaced.serverUrl,
+          agentId: replaced.agentId,
+          serverId: replaced.serverId,
+          apiKey: replaced.apiKey,
+        })
+        : "failed";
+      previousKey = {
+        credentialId: replaced.credentialId,
+        outcome: outcome === "revoked" || outcome === "already_inactive" ? outcome : "still_active",
+      };
+    }
+    writeAuthorizedLoginReport(ctx, options, credential, paths, previousKey);
   },
 );
+
+/**
+ * The `agent_key` grant `login start` asks for. `agentId` is sent only when
+ * it is a UUID (the server refuses anything else); the approval page shows
+ * the machine fields as this machine's own account of itself.
+ */
+function agentKeyGrantRequest(options: { agent: string; clientName?: string }): AgentKeyGrantRequest {
+  const label = (value: string): string | null => value.trim().slice(0, 200) || null;
+  return {
+    kind: "agent_key",
+    machineName: label(options.clientName ?? "") ?? DEFAULT_DEVICE_LOGIN_CLIENT_NAME,
+    hostname: label(osHostname()),
+    os: process.platform === "darwin" ? "macOS" : process.platform === "win32" ? "Windows" : process.platform === "linux" ? "Linux" : process.platform,
+    ...(UUID_RE.test(options.agent) ? { agentId: options.agent } : {}),
+  };
+}
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 // ---------------------------------------------------------------------------
 // `raft agent login status` — classify the existing profile credential
@@ -391,7 +465,18 @@ export async function readReplaceableCredentialId(
   credentialPath: string,
   options: { server: string; agent: string },
 ): Promise<string | null> {
-  let credential: { agentId?: unknown; serverUrl?: unknown; credentialId?: unknown };
+  return (await readReplaceableCredential(credentialPath, options))?.credentialId ?? null;
+}
+
+/**
+ * The credential this profile already holds for the same agent + server
+ * (id, and the key `login wait` revokes it with), or null.
+ */
+async function readReplaceableCredential(
+  credentialPath: string,
+  options: { server: string; agent: string },
+): Promise<{ credentialId: string; apiKey: string | null; agentId: string; serverUrl: string; serverId: string | null } | null> {
+  let credential: { agentId?: unknown; serverUrl?: unknown; serverId?: unknown; credentialId?: unknown; apiKey?: unknown };
   try {
     credential = JSON.parse(await readFile(credentialPath, "utf-8"));
   } catch {
@@ -401,11 +486,19 @@ export async function readReplaceableCredentialId(
   const sameServer = typeof credential.serverUrl === "string"
     && credential.serverUrl.replace(/\/+$/, "") === options.server.replace(/\/+$/, "");
   if (credential.agentId !== options.agent || !sameServer) return null;
-  return typeof credential.credentialId === "string" && credential.credentialId ? credential.credentialId : null;
+  if (typeof credential.credentialId !== "string" || !credential.credentialId) return null;
+  return {
+    credentialId: credential.credentialId,
+    apiKey: typeof credential.apiKey === "string" && credential.apiKey ? credential.apiKey : null,
+    agentId: options.agent,
+    serverUrl: credential.serverUrl as string,
+    serverId: typeof credential.serverId === "string" && credential.serverId ? credential.serverId : null,
+  };
 }
 
 /**
- * Legacy `login wait`: mint using the approved user session, then save.
+ * `login wait` against a server older than one-time grants: mint using the
+ * device session it answered with, then save.
  * Mints with the server's least-privilege default scopes.
  */
 async function mintAndPersist(
@@ -446,7 +539,22 @@ async function mintAndPersist(
   await persistCredential(ctx, options, minted, paths);
 }
 
-async function persistCredential(ctx: CommandContext, options: { server: string }, minted: AgentCredentialResponse, paths: ProfilePaths): Promise<void> {
+async function persistCredential(
+  ctx: CommandContext,
+  options: { server: string },
+  minted: AgentCredentialResponse,
+  paths: ProfilePaths,
+): Promise<void> {
+  await writeCredentialFile(options, minted, paths);
+  writeAuthorizedLoginReport(ctx, options, minted, paths);
+}
+
+/** Atomically replace the profile's credential.json (mode 0600). */
+async function writeCredentialFile(
+  options: { server: string },
+  minted: AgentCredentialResponse,
+  paths: ProfilePaths,
+): Promise<void> {
   await mkdir(paths.profileDir, { recursive: true, mode: 0o700 });
   const tempDir = await mkdtemp(path.join(paths.profileDir, ".credential-"));
   try {
@@ -469,7 +577,15 @@ async function persistCredential(ctx: CommandContext, options: { server: string 
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }
+}
 
+function writeAuthorizedLoginReport(
+  ctx: CommandContext,
+  options: { server: string },
+  minted: AgentCredentialResponse,
+  paths: ProfilePaths,
+  previousKey?: { credentialId: string; outcome: PreviousKeyOutcome },
+): void {
   // Authorized report — never print the apiKey. Point the agent at the
   // running-reference guide (SHA-V0-006C / 007). The report is read by two
   // audiences (one-shot login = human at a terminal; login wait = usually an
@@ -480,6 +596,7 @@ async function persistCredential(ctx: CommandContext, options: { server: string 
     server: options.server,
     credentialPath: paths.credentialPath,
     profileSlug: paths.profileSlug,
+    ...(previousKey ? { previousKey } : {}),
   }));
 }
 

@@ -7,6 +7,7 @@ import { createMessage } from "../services/messageService";
 import { createAgent } from "../services/agentService";
 import { registerMachine } from "../services/machineService";
 import * as announcementService from "../services/announcementService";
+import { shapeEstablishedServerForTest } from "./allChannelFixture";
 
 export type PlaywrightSeedState = {
   user: {
@@ -132,6 +133,8 @@ export async function seedPlaywrightScenario(
   }).returning();
 
   const server = await createServer("Playwright Server", "playwright-server", user.id);
+  // An established server: #all live, no onboarding-owner channel.
+  await shapeEstablishedServerForTest(server.id);
   await db.update(servers).set({ plan: "founder" }).where(eq(servers.id, server.id));
   await db.update(serverMembers).set({
     setupModalReminderOptOut: true,

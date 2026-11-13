@@ -76,6 +76,8 @@ test("observed POSIX operations preserve Pi spawn semantics and surface payload-
     observeProcessSpawned: () => lifecycle.push("spawned"),
     observeProcessProgress: (bytes) => lifecycle.push(`progress:${bytes}`),
     observeProcessExit: ({ code, signal }) => lifecycle.push(`exited:${code}:${signal}`),
+    observeTimeout: () => undefined,
+    observeAbortRequested: () => undefined,
     emitDiagnosticSnapshots: () => [],
   };
   let capturedCommand = "";
@@ -295,6 +297,33 @@ test("PowerShell operations abort the whole child tree", async () => {
   assert.deepEqual(killed, [2_000_004_242]);
 });
 
+test("PowerShell operations report their own timeout to the observer as failure_reason timeout", async () => {
+  const child = new FakeChildProcess();
+  const sink = new MemoryTraceSink();
+  const observer = createPiToolExecutionObserver({
+    tracer: createSpanAttrContractTracer(new BasicTracer({ sink }), DAEMON_CORE_TRACE_ATTR_CONTRACTS),
+    serverId: "11111111-1111-4111-8111-111111111111",
+    machineId: "22222222-2222-4222-8222-222222222222",
+    agentId: "33333333-3333-4333-8333-333333333333",
+    launchId: "44444444-4444-4444-8444-444444444444",
+    runtimeVersion: "0.82.1",
+  });
+  observer.beginRuntimeTurn();
+  const operations = createPiPowerShellOperations({
+    spawn: (() => child as unknown as ChildProcessWithoutNullStreams) as unknown as typeof spawn,
+    killProcessTree: () => child.emit("close", 1, null),
+    observer,
+  });
+
+  await assert.rejects(
+    observer.runToolExecution("call-ps-timeout", undefined, () =>
+      operations.exec("Start-Sleep -Seconds 30", "C:\\workspace", { env: {}, onData: () => undefined, timeout: 0.05 })),
+    /timeout:0.05/,
+  );
+  const finished = traceRows(sink).find((row) => row.name === "daemon.runtime.tool.execution.finished");
+  assert.equal(finished?.attrs?.failure_reason, "timeout");
+});
+
 const longCjkText = "长".repeat(65_536);
 
 test("PowerShell operations keep a 64 KiB CJK command off argv", async () => {
@@ -488,3 +517,147 @@ test("Windows CLI guide uses PowerShell here-strings instead of Bash heredocs", 
   assert.doesNotMatch(sections.sendingMessages, /<<'RAFTMSG'/);
   assert.match(sections.threads, /PowerShell single-quoted here-string/);
 });
+
+function processAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function readPid(file: string): Promise<number> {
+  const { readFile } = await import("node:fs/promises");
+  for (let i = 0; i < 50; i += 1) {
+    const text = await readFile(file, "utf8").catch(() => "");
+    if (text.trim()) return Number(text.trim());
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error(`no pid in ${file}`);
+}
+
+test("Pi command tool documents its default timeout", () => {
+  const tool = createPiCommandTool("/workspace", {}, { platform: "linux" });
+
+  assert.match(tool.description, /without a timeout are stopped after 600 seconds/);
+  assert.match(String((tool.parameters.properties.timeout as { description?: unknown }).description), /default 600/);
+});
+
+for (const variant of ["built-in (Pi SDK operations)", "pi (observed operations)"] as const) {
+  test(
+    `Pi command tool stops a command without a timeout at the default, kills its process group and tells the model (${variant})`,
+    { skip: process.platform === "win32" },
+    async () => {
+      const { mkdtemp } = await import("node:fs/promises");
+      const { tmpdir } = await import("node:os");
+      const { join } = await import("node:path");
+      const dir = await mkdtemp(join(tmpdir(), "pi-default-timeout-"));
+      const pidFile = join(dir, "child.pid");
+      const observer = variant === "pi (observed operations)"
+        ? createPiToolExecutionObserver({
+          tracer: new BasicTracer({ sink: new MemoryTraceSink() }),
+          serverId: "11111111-1111-4111-8111-111111111111",
+          machineId: "22222222-2222-4222-8222-222222222222",
+          agentId: "33333333-3333-4333-8333-333333333333",
+          launchId: "44444444-4444-4444-8444-444444444444",
+          runtimeVersion: "0.82.1",
+        })
+        : undefined;
+      if (observer) observer.beginRuntimeTurn();
+      const tool = createPiCommandTool(dir, process.env, {
+        platform: process.platform,
+        defaultTimeoutSeconds: 1,
+        ...(observer ? { observer } : {}),
+      });
+
+      const startedAt = Date.now();
+      await assert.rejects(
+        tool.execute("call-1", { command: `sleep 60 & echo $! > ${pidFile}; wait` }),
+        (err: Error) => {
+          assert.match(err.message, /Command timed out after 1 seconds/);
+          assert.match(err.message, /default limit of 1 seconds for commands run without a timeout/);
+          assert.match(err.message, /explicit timeout/);
+          return true;
+        },
+      );
+      assert.ok(Date.now() - startedAt < 10_000, "the default must end the call, not the command finishing");
+      const childPid = await readPid(pidFile);
+      for (let i = 0; i < 50 && processAlive(childPid); i += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      assert.equal(processAlive(childPid), false, "the command's process group must be killed");
+    },
+  );
+
+  test(
+    `Pi command tool keeps an explicit timeout as passed (${variant})`,
+    { skip: process.platform === "win32" },
+    async () => {
+      const observer = variant === "pi (observed operations)"
+        ? createPiToolExecutionObserver({
+          tracer: new BasicTracer({ sink: new MemoryTraceSink() }),
+          serverId: "11111111-1111-4111-8111-111111111111",
+          machineId: "22222222-2222-4222-8222-222222222222",
+          agentId: "33333333-3333-4333-8333-333333333333",
+          launchId: "44444444-4444-4444-8444-444444444444",
+          runtimeVersion: "0.82.1",
+        })
+        : undefined;
+      if (observer) observer.beginRuntimeTurn();
+      const tool = createPiCommandTool(process.cwd(), process.env, {
+        platform: process.platform,
+        defaultTimeoutSeconds: 0.2,
+        ...(observer ? { observer } : {}),
+      });
+
+      const result = await tool.execute("call-2", { command: "sleep 0.6; printf 'explicit-ok'", timeout: 30 });
+
+      assert.match(result.content[0]?.type === "text" ? result.content[0].text : "", /explicit-ok/);
+    },
+  );
+}
+
+for (const variant of ["built-in", "pi (observed operations)"] as const) {
+  test(
+    `task #25 step 2: an aborted command's setsid child is killed with its process group (${variant})`,
+    { skip: process.platform === "win32" },
+    async () => {
+      const { mkdtemp } = await import("node:fs/promises");
+      const { tmpdir } = await import("node:os");
+      const { join } = await import("node:path");
+      const dir = await mkdtemp(join(tmpdir(), "pi-abort-setsid-"));
+      const groupPidFile = join(dir, "group.pid");
+      const setsidPidFile = join(dir, "setsid.pid");
+      const observer = variant === "pi (observed operations)"
+        ? createPiToolExecutionObserver({
+          tracer: new BasicTracer({ sink: new MemoryTraceSink() }),
+          serverId: "11111111-1111-4111-8111-111111111111",
+          machineId: "22222222-2222-4222-8222-222222222222",
+          agentId: "33333333-3333-4333-8333-333333333333",
+          launchId: "44444444-4444-4444-8444-444444444444",
+          runtimeVersion: "0.82.1",
+        })
+        : undefined;
+      observer?.beginRuntimeTurn();
+      const tool = createPiCommandTool(dir, process.env, { platform: process.platform, ...(observer ? { observer } : {}) });
+      const abort = new AbortController();
+
+      const run = tool.execute(
+        "call-abort",
+        { command: `sleep 70 & echo $! > ${groupPidFile}; setsid sleep 71 & echo $! > ${setsidPidFile}; wait`, timeout: 60 },
+        abort.signal,
+      ).catch((err: Error) => err.message);
+      const groupPid = await readPid(groupPidFile);
+      const setsidPid = await readPid(setsidPidFile);
+      abort.abort();
+
+      assert.match(String(await run), /Command aborted/);
+      for (let i = 0; i < 100 && (processAlive(groupPid) || processAlive(setsidPid)); i += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      assert.equal(processAlive(groupPid), false, "the command's group is killed");
+      assert.equal(processAlive(setsidPid), false, "a child that left the group is killed too");
+    },
+  );
+}

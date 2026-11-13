@@ -1,5 +1,5 @@
 import { expect, test } from "@playwright/test";
-import type { APIRequestContext } from "@playwright/test";
+import type { APIRequestContext, Page } from "@playwright/test";
 import { loginViaApi } from "../../fixtures/auth";
 import { waitForSeedState } from "../../fixtures/seedState";
 import { dismissOwnerOnboarding } from "../../fixtures/session";
@@ -9,6 +9,20 @@ import { dismissOwnerOnboarding } from "../../fixtures/session";
 // grants on the agent's behalf, and pages through the app events.
 
 type Created = { client: { id: string; clientId: string }; clientSecret: string };
+
+/**
+ * Switch the Agent panel to a tab and wait until it is the selected one. The
+ * tabs are sortable, so a click that lands while the strip re-renders can
+ * focus the tab without selecting it (the panel then keeps the old tab);
+ * click again until the tab reports selected.
+ */
+async function openPanelTab(page: Page, id: "integrations" | "profile") {
+  const tab = page.getByTestId(`panel-tab-${id}`);
+  await expect(async () => {
+    await tab.click();
+    await expect(tab).toHaveAttribute("aria-selected", "true", { timeout: 2_000 });
+  }).toPass({ timeout: 30_000 });
+}
 
 async function createApp(request: APIRequestContext, api: string, token: string, serverId: string, key: string): Promise<Created> {
   const res = await request.post(`${api}/api/integrations/clients`, {
@@ -33,6 +47,14 @@ async function requestAgent(request: APIRequestContext, api: string, app: Create
   expect(res.status()).toBe(200);
   return await res.json() as { status: string; requestId: string };
 }
+
+// No retry: the test registers fixed client ids and revokes, denies and grants
+// against the shared seed agent, so a second attempt starts from the first
+// attempt's state and fails at createApp instead of re-testing anything. With
+// retries off, a failure reports only the first attempt's real cause, and its
+// trace is kept (the config records traces only on a retry).
+test.describe.configure({ retries: 0 });
+test.use({ trace: "retain-on-failure" });
 
 test("apps tab: events, revoke, deny, approve, grant on the agent's behalf", async ({ page, request }) => {
   test.setTimeout(240_000);
@@ -74,7 +96,7 @@ test("apps tab: events, revoke, deny, approve, grant on the agent's behalf", asy
 
   await page.setViewportSize({ width: 1280, height: 1000 });
   await page.goto(`/s/${seed.server.slug}/agent/${seed.agent.id}`);
-  await page.getByTestId("panel-tab-integrations").click();
+  await openPanelTab(page, "integrations");
 
   // Grant source and the newest events.
   await expect(page.getByText("Granted automatically to the app")).toBeVisible();
@@ -91,18 +113,23 @@ test("apps tab: events, revoke, deny, approve, grant on the agent's behalf", asy
   await expect(events.getByRole("button", { name: "Load more" })).toHaveCount(0);
 
   // Revoke sticks: the app's next request waits for a person.
+  // Revoking an App grant can't be undone (#12107), so it asks first.
   await page.getByRole("button", { name: "Revoke" }).click();
+  const confirm = page.getByRole("dialog", { name: "Revoke app access" });
+  await expect(confirm).toBeVisible();
+  await page.getByTestId("agent-app-revoke-confirm").click();
+  await expect(confirm).toHaveCount(0);
   await expect(page.getByText("Granted automatically to the app")).toHaveCount(0);
   expect((await requestAgent(request, api, reminders, seed.server.slug, seed.agent.id)).status).toBe("pending");
-  await page.getByTestId("panel-tab-profile").click();
-  await page.getByTestId("panel-tab-integrations").click();
+  await openPanelTab(page, "profile");
+  await openPanelTab(page, "integrations");
   await page.getByRole("button", { name: "Deny" }).click();
   await expect(page.getByTestId("agent-app-pending")).toHaveCount(0);
 
   // Asked again; this time approve.
   expect((await requestAgent(request, api, reminders, seed.server.slug, seed.agent.id)).status).toBe("pending");
-  await page.getByTestId("panel-tab-profile").click();
-  await page.getByTestId("panel-tab-integrations").click();
+  await openPanelTab(page, "profile");
+  await openPanelTab(page, "integrations");
   await page.getByRole("button", { name: "Approve" }).click();
   await expect(page.getByText("Granted by a person")).toBeVisible();
 

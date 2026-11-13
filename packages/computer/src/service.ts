@@ -20,7 +20,12 @@
 import { readChannel } from "./lib/channelState";
 import { startServiceMemorySampler } from "./serviceMemory";
 import type { UpgradeStartParams, UpgradeStartResult } from "./lib/types";
-import { installerArgs, launchInstallerDetached, readLastRemoteUpgradeReceipt, recordRemoteUpgradeLaunch, recordRemoteUpgradeRefusal, waitForRemoteUpgradeFailureReceipt } from "./externalInstaller";
+import { compareComputerVersions } from "./computerVersionOrder";
+import { readInstallerRepairHint } from "./installerRepairHint";
+import { acknowledgeMigratedFrom, readMigratedFromForServer } from "./migratedFromMarker";
+import { installerArgs, launchInstallerDetached, scrubInstallerOperationEnv, readInstallerVersion, readLastRemoteUpgradeReceipt, REMOTE_UPGRADE_FAILURE_WATCH_MS, UNIT_ESCAPING_INSTALLER_VERSION, type InstallerDownloadStats, recordRemoteUpgradeLaunch, recordRemoteUpgradeRefusal, waitForRemoteUpgradeFailureReceipt, watchRemoteUpgradeOutcome } from "./externalInstaller";
+import { clearUpgradeDrainRequests, waitForUpgradeDrain, writeUpgradeDrainRequest, type UpgradeDrainRunner } from "./upgradeDrain";
+import { appendRemoteUpgradeStep, collectRemoteUpgradeSteps, noteServiceTransitionForRemoteUpgrade, upgradeErrorCode, type RemoteUpgradeStepRecord } from "./remoteUpgradeTrace";
 import {
   SUPERVISED_RELAUNCH_EXIT_CODE,
   UPGRADE_SAFE_KILL_MODES,
@@ -46,12 +51,16 @@ import {
   servicePidPath,
   serviceLogPath,
   serverRunnerPidPath,
+  serverRunnerLockConflictPath,
   serverRunnerLogPath,
   assertValidServerId,
   serverConnectedMarkerPath,
   serverRunnerMemoryPath,
+  serverActivityPath,
   serviceMemoryPath,
   serverRunnerStopIntentPath,
+  serverUpgradeDrainRequestPath,
+  serverUpgradeDrainStatePath,
 } from "./paths";
 import {
   listManagedServerIds,
@@ -93,13 +102,15 @@ import {
   ServiceClientError,
 } from "./lib/types";
 import { resetService, resetRunner } from "./reset";
-import { currentDate } from "@botiverse/raft-shared";
+import { clampComputerUpgradeDrain, currentDate, privacyModeFromEnv } from "@botiverse/raft-shared";
+import { resolveSelfExec, selfExecHostFromProcess, type SelfExecHost } from "@botiverse/raft-shared/src/selfExec";
 import { liveSeaExecutablePath } from "./liveExecutable";
 export { executableFileIdentity, liveSeaExecutablePath } from "./liveExecutable";
 import type { DaemonCoreOptions } from "@botiverse/raft-daemon/core";
 import { enqueueLifecycleOperation } from "./lifecycleOperations";
 import { shutdownService } from "./lib/serviceShutdown";
 import { takeResidentStopIntent, writeResidentStopIntent, type ResidentStopSource } from "./residentStopIntent";
+import { stopAfterMachineKeyRevoked, type MachineKeyRevokedStopResult } from "./residentRevokedStop";
 import { createReplacementHandoff, type ReplacementHandoffRequest } from "./lib/replacementHandoff";
 import {
   clearPendingRestartMarker,
@@ -117,12 +128,15 @@ import {
   type ServiceIdentityPublishDeps,
 } from "./lib/serviceIdentity";
 import { retireCliLoginCarrier } from "./macosLoginCarrier";
+import { claimDeviceSessionRetireReport, scheduleDeviceSessionRetire } from "./deviceSessionRetire";
 import { OS_SUPERVISOR_KIND_ENV_VAR } from "./osSupervisorLifecycle";
 import { SHELL_ENV_STATE_ENV_VAR } from "./shellEnvCapture";
 import { buildRunnerChildEnv, PARENT_LOCK_HELD_ENV_VAR, pinRaftHomeEnv, SOURCE_SERVICE_PID_ENV_VAR } from "./runnerChildEnv";
-import { handleRunnerLockConflict } from "./runnerLockConflict";
+import { claimRunnerLockConflictReports, clearRunnerLockConflictMarker, handleRunnerLockConflict, releaseDeferredLockOwner } from "./runnerLockConflict";
 import {
+  awaitRestartOutcomeAfterConnectionLoss,
   checkServiceControlAvailability,
+  isServiceConnectionLoss,
   performServiceSelfRestart,
   requestServiceRestartViaIpc,
   requestServiceUpgradeStartViaIpc,
@@ -175,18 +189,30 @@ export function buildResidentSpawn(
   execArgv: string[] = process.execArgv,
   isSea = isSeaBinary(),
   seaExecutable = process.execPath,
+  electron: ResidentElectronFacts = currentResidentElectronFacts(),
 ): { command: string; args: string[] } {
-  // Carry parent execArgv so the dev-mode TS loader survives re-exec.
   const tail = serverId ? [mode, serverId] : [mode];
-  // In a SEA binary, process.execPath IS the bundled app — there is no script
-  // entry to pass, and `process.argv[1]` is the first user arg (not a script
-  // path). Re-exec the binary directly with the mode flag, which the commander
-  // `__service`/`__run` commands dispatch. Passing the SEA argv[1] would corrupt
-  // the child argv.
-  if (isSea) {
-    return { command: seaExecutable, args: [...execArgv, ...tail] };
-  }
-  return { command: process.execPath, args: [...execArgv, selfEntry, ...tail] };
+  // One host-aware rule for every self re-exec (resolveSelfExec in shared):
+  // Node keeps execArgv (the dev TS loader) + the entry script; a SEA re-execs
+  // its live binary with no script, since its argv[1] is a user arg; the
+  // Electron app launcher gets only the mode, which its argv guard routes —
+  // its argv[1] is not a script either (empty, or a deep link it was opened
+  // with) and is kept only for a dev `electron <appPath>` launch.
+  const { command, args } = resolveSelfExec(tail, {
+    execPath: isSea ? seaExecutable : process.execPath,
+    execArgv,
+    argv: [process.execPath, selfEntry],
+    isSea,
+    ...electron,
+  });
+  return { command, args };
+}
+
+export type ResidentElectronFacts = Pick<SelfExecHost, "electronVersion" | "electronProcessType" | "electronDefaultApp">;
+
+export function currentResidentElectronFacts(): ResidentElectronFacts {
+  const { electronVersion, electronProcessType, electronDefaultApp } = selfExecHostFromProcess(process, false);
+  return { electronVersion, electronProcessType, electronDefaultApp };
 }
 
 /**
@@ -237,8 +263,20 @@ export function buildDetachedServiceEnv(
   // report the incumbent's result as their own; replacements that import
   // overwrite it anyway.
   delete env[SHELL_ENV_STATE_ENV_VAR];
+  // The bootstrap's version pin (`RAFT_COMPUTER_VERSION=… sh`, from pinned
+  // setup commands) only chooses what install.sh installs. A service started
+  // from that shell would pass it to every runner and agent, so a later
+  // `install.sh` run by an agent silently pins to the old version again
+  // (Shared-EC2 stayed on 1.0.36, 2026-10-20). Computer itself never reads it.
+  delete env[INSTALL_VERSION_PIN_ENV_VAR];
+  // A service the installer started carries that installer run's operation
+  // variables; a replacement must not pass them on (#proj-raft-computer:#32).
+  scrubInstallerOperationEnv(env);
   return env;
 }
+
+/** install.sh's version pin; see buildDetachedServiceEnv. */
+export const INSTALL_VERSION_PIN_ENV_VAR = "RAFT_COMPUTER_VERSION";
 
 /**
  * Spawn a detached `raft-computer __service` child. The detached child
@@ -333,16 +371,24 @@ export const requestServiceSelfRestartAfterUpgrade = requestServiceSelfRestart;
 export interface ResidentCore {
   start: () => void | Promise<void>;
   stop: (options?: {
-    source?: ResidentStopSource | "external_signal";
+    source?: ResidentStopSource | "external_signal" | "machine_key_revoked";
     signal?: NodeJS.Signals;
   }) => void | Promise<void>;
+  getRunningAgentIds?: () => string[];
+  recordMachineKeyRevokedStop?: (result: MachineKeyRevokedStopResult) => void;
+}
+/** The runner's reactions to its connection, handed to the core it creates (DaemonCore `lifecycleHooks`). */
+export interface ResidentLifecycleHooks {
+  onConnect: () => void;
+  onDisconnect: () => void;
+  onHandshakeRejected: (event: { statusCode: number; reason: string | null }) => void;
 }
 export type ResidentCoreFactory = (creds: {
   serverId: string;
   serverMachineId: string;
   apiKey: string;
   serverUrl: string;
-}) => ResidentCore | Promise<ResidentCore>;
+}, hooks: ResidentLifecycleHooks) => ResidentCore | Promise<ResidentCore>;
 
 /**
  * Stable exit code for "the per-server daemon child can't even start
@@ -363,6 +409,17 @@ export type ResidentCoreFactory = (creds: {
  */
 export const EX_CONFIG_EXIT_CODE = 78;
 export const COMPUTER_MACHINE_UNLINKED_EXIT_CODE = 77;
+/**
+ * Runner exit code for a stop signal the service did not send. Every service
+ * stop writes a stop intent first (`writeResidentStopIntent`) and sets
+ * `rec.stopping`, so "no intent" means someone else signalled the runner
+ * (another Computer service on the same data directory, a tool that kills
+ * processes, an OS-level stop). Exiting 0 here would read as graceful and the
+ * service would respawn forever; this code makes the service charge it to the
+ * repeated-crash budget instead. 79: just past the sysexits range (64-78) and
+ * not used by the runner, the daemon core or the service.
+ */
+export const EXTERNAL_STOP_EXIT_CODE = 79;
 
 /**
  * The bundled `pi` runtime (`@earendil-works/pi-coding-agent`) reads its OWN
@@ -409,7 +466,26 @@ export function resolveResidentSlockCliPath(
   return typeof override === "string" && override.length > 0 ? override : undefined;
 }
 
-const defaultCoreFactory: ResidentCoreFactory = async (creds) => {
+/**
+ * This runner's own RAFT_PRIVACY_MODE (packages/shared/src/privacyMode.ts),
+ * read once at runner start. An invalid value is a configuration error, not a
+ * crash: exit EX_CONFIG so the service marks the server degraded instead of
+ * restarting it every few seconds on the crash budget.
+ */
+export function residentPrivacyModeOrExit(
+  env: NodeJS.ProcessEnv = process.env,
+  exit: (code: number) => never = (code) => process.exit(code),
+): boolean {
+  try {
+    return privacyModeFromEnv(env);
+  } catch (err) {
+    process.stderr.write(`raft-computer: ${err instanceof Error ? err.message : String(err)}\n`);
+    return exit(EX_CONFIG_EXIT_CODE);
+  }
+}
+
+const defaultCoreFactory: ResidentCoreFactory = async (creds, hooks) => {
+  const privacyMode = residentPrivacyModeOrExit();
   // Run before the dynamic core import, which eager-loads pi (see ensureSeaRuntimePackageDir).
   await ensureSeaRuntimePackageDir();
   let coreMod: { DaemonCore: new (o: DaemonCoreOptions) => ResidentCore };
@@ -437,29 +513,29 @@ const defaultCoreFactory: ResidentCoreFactory = async (creds) => {
   // Computer bundle version distinctly from the underlying daemon version.
   // Pass both identities explicitly; inherited environment is not identity.
   const slockHome = resolveRaftHome();
-  const markerPath = serverConnectedMarkerPath(slockHome, creds.serverId);
   const liveService = await readLiveServiceSnapshot(slockHome);
   const lifecycleBridge = await prepareResidentLifecycleBridge(slockHome, creds.serverId);
+  // Restarts this runner is still requesting (task #924); their outcome is
+  // not proven yet.
+  const inFlightRestartRequestIds = new Set<string>();
   return new coreMod.DaemonCore({
     ...residentCoreIdentity(creds),
     localTrace: true,
+    // RAFT_PRIVACY_MODE, read once per runner start (residentPrivacyModeOrExit).
+    privacyMode,
     processMemorySamplePath: serverRunnerMemoryPath(slockHome, creds.serverId),
-    serviceMemorySamplePath: serviceMemoryPath(slockHome),
-    lifecycleHooks: {
-      onConnect: () => { writeResidentConnectedMarker(markerPath); },
-      onDisconnect: () => { try { clearResidentConnectedMarker(markerPath); } catch {} },
-      onHandshakeRejected: (event) => {
-        const terminalReason = classifyTerminalHandshakeRejection(event.statusCode, event.reason);
-        if (!terminalReason) return;
-        const slockHome = resolveRaftHome();
-        process.stderr.write(`raft-computer: server rejected this runner as ${terminalReason}; marking ${creds.serverId} terminal and stopping retries.\n`);
-        void markTerminalUnlinked(slockHome, creds.serverId, creds.serverMachineId, event.statusCode, terminalReason)
-          .catch(() => {})
-          .finally(() => {
-            process.exit(COMPUTER_MACHINE_UNLINKED_EXIT_CODE);
-          });
-      },
+    // How many agents are mid-turn, for a quiet point (Raft Desktop's Stop
+    // and its move to the official install wait for it). One tiny private
+    // file per server (computer/servers/<id>/activity.json).
+    turnActivitySnapshotPath: serverActivityPath(slockHome, creds.serverId),
+    // Reconciler step 13: the service drains this runner's agents before a
+    // web upgrade's installer runs (upgradeDrain.ts).
+    computerUpgradeDrainPaths: {
+      requestPath: serverUpgradeDrainRequestPath(slockHome, creds.serverId),
+      statePath: serverUpgradeDrainStatePath(slockHome, creds.serverId),
     },
+    serviceMemorySamplePath: serviceMemoryPath(slockHome),
+    lifecycleHooks: hooks,
     // CLI path resolution for the agent runtime (cliTransport):
     //   - SEA single-binary: inject the `__cli` sentinel — the agent CLI
     //     wrapper execs `<exe> __cli "$@"`, re-execing this binary in CLI mode
@@ -475,10 +551,22 @@ const defaultCoreFactory: ResidentCoreFactory = async (creds) => {
     //     daemon resolves the bundled CLI dist relative to its own dist, as before.
     slockCliPath: resolveResidentSlockCliPath(isSeaBinary()),
     getComputerLastUpgradeReceipt: () => readLastRemoteUpgradeReceipt(resolveRaftHome()),
+    // task #34: advisory hint that the installer needs a repair run on the machine.
+    getComputerInstallerRepairHint: () => readInstallerRepairHint(resolveRaftHome()),
+    // Raft Desktop moved this home from its embedded Computer: the first ready
+    // to each server says so (`migratedFrom`), then the note goes (migratedFromMarker.ts).
+    getComputerMigratedFrom: () => readMigratedFromForServer(resolveRaftHome(), creds.serverId),
+    onComputerMigratedFromSent: () => acknowledgeMigratedFrom(resolveRaftHome(), creds.serverId),
+    collectComputerDeviceSessionRetire: () => claimDeviceSessionRetireReport(resolveRaftHome()),
+    collectComputerMachineLockConflicts: () => claimRunnerLockConflictReports(resolveRaftHome()),
+    collectComputerUpgradeSteps: ({ relayedInReady }) =>
+      collectRemoteUpgradeSteps(resolveRaftHome(), { serverId: creds.serverId, relayedInReady }),
+    watchComputerUpgradeOutcome: () => watchRemoteUpgradeOutcome(resolveRaftHome(), creds.serverId),
     getComputerLifecycleAcks: lifecycleBridge.getAcknowledgements,
     getComputerLifecycleReadyAcks: lifecycleBridge.getReadyAcknowledgements,
     onComputerLifecycleReceipt: lifecycleBridge.acknowledgeReceipt,
     computerControlViaSupervisor: lifecycleBridge.supervisorMutationsAttested,
+    computerServiceIpcUnreachable: lifecycleBridge.serviceIpcUnreachable,
     // Managed-Computer remote control (server → WS → runner). This runner
     // is the service's in-process `__run` child, so:
     //   restart → ask the supervisor IPC seam to spawn a replacement service
@@ -501,10 +589,18 @@ const defaultCoreFactory: ResidentCoreFactory = async (creds) => {
         if (!ctx.requestId) {
           throw new Error("managed restart requires a requestId for terminal readback");
         }
-        await requestServiceRestartViaIpc(resolveRaftHome(), {
-          requestId: ctx.requestId,
-          originServerId: creds.serverId,
-        });
+        inFlightRestartRequestIds.add(ctx.requestId);
+        try {
+          await requestServiceRestartViaIpc(resolveRaftHome(), {
+            requestId: ctx.requestId,
+            originServerId: creds.serverId,
+          });
+        } catch (error) {
+          if (!isServiceConnectionLoss(error)) throw error;
+          await awaitRestartOutcomeAfterConnectionLoss(resolveRaftHome(), creds.serverId, ctx.requestId);
+        } finally {
+          inFlightRestartRequestIds.delete(ctx.requestId);
+        }
         return;
       }
       if (ctx.requestId) {
@@ -516,9 +612,14 @@ const defaultCoreFactory: ResidentCoreFactory = async (creds) => {
           requestId: ctx.requestId,
           originServerId: creds.serverId,
           ...(ctx.targetVersion ? { targetVersion: ctx.targetVersion } : {}),
+          ...(ctx.drain ? { drain: ctx.drain } : {}),
         });
+        // received / download / installer_spawned, while this runner is still connected.
+        ctx.flushUpgradeSteps?.();
         const failure = await waitForRemoteUpgradeFailureReceipt(resolveRaftHome(), ctx.requestId, {
           ...(ctx.targetVersion ? { targetVersion: ctx.targetVersion } : {}),
+          // A drained upgrade spawns its installer only after the drain.
+          timeoutMs: REMOTE_UPGRADE_FAILURE_WATCH_MS + (ctx.drain?.deadlineMs ?? 0),
         });
         if (failure) throw new Error(`UPGRADE_INSTALLER_FAILED: ${failure.reason ?? `installer_${failure.outcome}`}`);
         return;
@@ -533,7 +634,9 @@ const defaultCoreFactory: ResidentCoreFactory = async (creds) => {
       const marker = await readPendingRestartMarker(slockHome);
       if (!marker) return;
       const requestId = pendingRestartRequestIdForServer(marker, creds.serverId);
-      if (requestId === null) return;
+      // A reconnect while this runner still waits on the handoff must not
+      // report success before the takeover is proven.
+      if (requestId === null || inFlightRestartRequestIds.has(requestId)) return;
       emitDone({ requestId, ok: true });
       await retirePendingRestartForServer(slockHome, marker, creds.serverId);
     },
@@ -544,9 +647,16 @@ const defaultCoreFactory: ResidentCoreFactory = async (creds) => {
  * Classify a per-server daemon child exit so the service's restart
  * loop can react proportionally.
  *
- *   `graceful`     — code 0, or terminated by SIGTERM/SIGINT. Treat as
- *                    an expected stop (service itself, external user
- *                    kill, or daemon's own clean shutdown). Don't count
+ *   `external-stop` — code 79 (EXTERNAL_STOP_EXIT_CODE), or killed by
+ *                    SIGTERM before the runner installed its handler. The
+ *                    runner was stopped by a SIGTERM the service did not
+ *                    send (service-sent stops set `rec.stopping` and never
+ *                    reach classification). Counts toward the crash budget
+ *                    so an external killer cannot drive an endless respawn
+ *                    loop; under budget it restarts like `graceful`.
+ *   `graceful`     — code 0, or terminated by SIGINT. Treat as
+ *                    an expected stop (service itself, or the
+ *                    daemon's own clean shutdown). Don't count
  *                    toward crash budget; service still restarts if
  *                    the server is still in the MANAGED set.
  *   `config-error` — code 78 (EX_CONFIG_EXIT_CODE). Daemon child gave
@@ -578,6 +688,31 @@ export function parseDaemonLockConflictOwnerPid(text: string): number | null {
   return Number.isInteger(pid) && pid > 0 ? pid : null;
 }
 
+const DAEMON_LOCK_PATH_RE = /\bLock: (.+?)\. Stop the existing daemon\b/;
+
+const DAEMON_LOCK_OWNER_STARTED_AT_RE = /\bstartedAt=([^,)\s]+)/;
+const DAEMON_LOCK_OWNER_START_RE = /\bownerStart=(readable|unreadable)\b/;
+
+/** The owner's `startedAt` a daemon's machine-lock conflict error names, if any. */
+export function parseDaemonLockConflictOwnerStartedAt(text: string): string | null {
+  if (!DAEMON_ALREADY_RUNNING_RE.test(text)) return null;
+  return DAEMON_LOCK_OWNER_STARTED_AT_RE.exec(text)?.[1] ?? null;
+}
+
+/** Whether the conflicting daemon could read the owner pid's start; null when its error does not say (older daemon). */
+export function parseDaemonLockConflictOwnerStartReadable(text: string): boolean | null {
+  if (!DAEMON_ALREADY_RUNNING_RE.test(text)) return null;
+  const value = DAEMON_LOCK_OWNER_START_RE.exec(text)?.[1];
+  return value === undefined ? null : value === "readable";
+}
+
+/** The lock directory a daemon's machine-lock conflict error names, if any. */
+export function parseDaemonLockConflictLockPath(text: string): string | null {
+  if (!DAEMON_ALREADY_RUNNING_RE.test(text)) return null;
+  const lockPath = DAEMON_LOCK_PATH_RE.exec(text)?.[1]?.trim();
+  return lockPath ? lockPath : null;
+}
+
 export function classifyRunnerExit(
   code: number | null,
   signal: NodeJS.Signals | null,
@@ -586,7 +721,8 @@ export function classifyRunnerExit(
   if (DAEMON_ALREADY_RUNNING_RE.test(diagnosticText)) return "already-running";
   if (code === COMPUTER_MACHINE_UNLINKED_EXIT_CODE) return "unlinked-terminal";
   if (code === EX_CONFIG_EXIT_CODE) return "config-error";
-  if (signal === "SIGTERM" || signal === "SIGINT") return "graceful";
+  if (code === EXTERNAL_STOP_EXIT_CODE || signal === "SIGTERM") return "external-stop";
+  if (signal === "SIGINT") return "graceful";
   if (code === 0) return "graceful";
   return "crash";
 }
@@ -611,6 +747,36 @@ export interface HandleRunnerExitForSupervisorOptions {
   nowMs?: () => number;
 }
 
+/**
+ * A server left the managed set (detach, sign-out): stop its runner. Only a
+ * child of this service is signalled. A lock owner the service deferred to
+ * (`externalPid`) is released without a signal (runnerLockConflict.ts).
+ */
+export async function stopUnmanagedRunner({
+  slockHome,
+  rec,
+  emitTransition,
+  writeStderr = (text) => { process.stderr.write(text); },
+}: {
+  slockHome: string;
+  rec: RunnerRecord;
+  emitTransition: Parameters<typeof releaseDeferredLockOwner>[0]["emitTransition"];
+  writeStderr?: (text: string) => void;
+}): Promise<void> {
+  if (rec.child) {
+    rec.stopping = true;
+    if (rec.child.pid !== undefined) {
+      writeResidentStopIntent(serverRunnerStopIntentPath(slockHome, rec.serverId), { pid: rec.child.pid, source: "service_unmanaged" });
+    }
+    try {
+      rec.child.kill("SIGTERM");
+    } catch {
+      /* ignore */
+    }
+  }
+  await releaseDeferredLockOwner({ slockHome, rec, emitTransition, writeStderr });
+}
+
 export async function handleRunnerExitForSupervisor({
   slockHome,
   serverId,
@@ -628,8 +794,10 @@ export async function handleRunnerExitForSupervisor({
   nowMs = () => Date.now(),
 }: HandleRunnerExitForSupervisorOptions): Promise<void> {
   // Operator stop / service shutdown asked this child to exit (managed.flag
-  // cleared, killChild set `stopping`) → terminal `stopped`, no restart.
-  if (rec.stopping) {
+  // cleared, stopUnmanagedRunner set `stopping`) → terminal `stopped`, no restart.
+  // A service already shutting down never charges an exit (see the inline
+  // exit handler for the group-wide SIGTERM race).
+  if (rec.stopping || shuttingDown) {
     const trigger = shuttingDown
       ? RUNNER_TRIGGER.shutdownStop
       : RUNNER_TRIGGER.operatorStop;
@@ -669,6 +837,9 @@ export async function handleRunnerExitForSupervisor({
       serverId,
       rec,
       ownerPid,
+      lockPath: parseDaemonLockConflictLockPath(diagnosticText),
+      ownerStartedAt: parseDaemonLockConflictOwnerStartedAt(diagnosticText),
+      ownerStartReadable: parseDaemonLockConflictOwnerStartReadable(diagnosticText),
       isOwnerProcessAlive,
       emitTransition,
       scheduleReconcile,
@@ -702,21 +873,38 @@ export async function handleRunnerExitForSupervisor({
     return;
   }
 
-  // Crash: record toward the budget first so the threshold check sees it.
-  if (exitClass === "crash") {
+  // Crash / external stop: record toward the budget first so the threshold
+  // check sees it.
+  const countsTowardBudget = exitClass === "crash" || exitClass === "external-stop";
+  if (countsTowardBudget) {
     try {
-      await recordCrash(slockHome, serverId, code, signal);
+      await recordCrash(
+        slockHome,
+        serverId,
+        code,
+        signal,
+        nowMs(),
+        exitClass === "external-stop" ? "external_signal" : undefined,
+      );
     } catch {
       /* health logging best-effort; never blocks recovery */
     }
   }
-  const budgetBreached =
-    exitClass === "crash" ? await isDegraded(slockHome, serverId) : false;
+  const budgetBreached = countsTowardBudget ? await isDegraded(slockHome, serverId, nowMs()) : false;
   const prev = rec.lifecycle;
   const to = nextRunnerStateOnExit(exitClass, budgetBreached);
   rec.lifecycle = to;
   emitTransition(serverId, prev, to, exitTrigger(exitClass, budgetBreached));
 
+  if (to === "degraded" && exitClass === "external-stop") {
+    writeStderr(
+      `Service: server ${serverId} marked degraded: its runner was repeatedly stopped by a SIGTERM ` +
+        `that this Computer did not send (>=3 in 60s); skipping auto-restart. ` +
+        `Check for another Computer service running on the same data directory, ` +
+        `or another tool that kills processes. Then run \`raft-computer restart ${serverId}\` to try again.\n`,
+    );
+    return;
+  }
   if (to === "degraded") {
     writeStderr(
       `Service: server ${serverId} marked degraded (>=3 crashes in 60s); ` +
@@ -740,8 +928,13 @@ export async function handleRunnerExitForSupervisor({
  */
 export async function runResident(
   serverId: string,
-  deps: { coreFactory?: ResidentCoreFactory } = {},
+  deps: {
+    coreFactory?: ResidentCoreFactory;
+    exit?: (code: number) => void;
+    machineKeyRevokedStopDeadlineMs?: number;
+  } = {},
 ): Promise<void> {
+  const exit = deps.exit ?? ((code: number) => process.exit(code));
   assertValidServerId(serverId);
   const slockHome = resolveRaftHome();
   const a = await readServerAttachment(slockHome, serverId);
@@ -751,21 +944,51 @@ export async function runResident(
       `No attachment for server ${serverId}. Run \`raft-computer attach ${serverId}\` first.`,
     );
   }
-  const core = await (deps.coreFactory ?? defaultCoreFactory)({
+  const markerPath = serverConnectedMarkerPath(slockHome, a.serverId);
+  // One stop per runner: a signal during the revoked stop below must not
+  // start a second one (or turn its exit 77 into 0), and vice versa.
+  let stopping = false;
+  const hooks: ResidentLifecycleHooks = {
+    onConnect: () => { writeResidentConnectedMarker(markerPath); },
+    // A socket close (4004 `credential_revoked`, 4001 `computer_machine_unlinked`,
+    // a deploy, a key rotation) is not proof of revocation: agents keep running
+    // and the reconnect handshake decides (reconciler step 15, Q-6).
+    onDisconnect: () => { try { clearResidentConnectedMarker(markerPath); } catch {} },
+    onHandshakeRejected: (event) => {
+      const terminalReason = classifyTerminalHandshakeRejection(event.statusCode, event.reason);
+      if (!terminalReason || stopping) return;
+      stopping = true;
+      process.stderr.write(`raft-computer: server rejected this runner as ${terminalReason}; marking ${a.serverId} terminal, stopping its agents and stopping retries.\n`);
+      void stopAfterMachineKeyRevoked({
+        core,
+        reason: terminalReason,
+        markTerminal: () => markTerminalUnlinked(slockHome, a.serverId, a.serverMachineId, event.statusCode, terminalReason),
+        exit,
+        exitCode: COMPUTER_MACHINE_UNLINKED_EXIT_CODE,
+        ...(deps.machineKeyRevokedStopDeadlineMs !== undefined ? { deadlineMs: deps.machineKeyRevokedStopDeadlineMs } : {}),
+      });
+    },
+  };
+  const core: ResidentCore = await (deps.coreFactory ?? defaultCoreFactory)({
     serverId: a.serverId,
     serverMachineId: a.serverMachineId,
     apiKey: a.apiKey,
     serverUrl: a.serverUrl,
-  });
-  let stopping = false;
+  }, hooks);
   const stopIntentPath = serverRunnerStopIntentPath(slockHome, serverId);
   const shutdown = async (signal: NodeJS.Signals) => {
     if (stopping) return;
     stopping = true;
+    // No intent = the service did not send this SIGTERM; say so in the exit
+    // code so the service charges it to the crash budget instead of
+    // respawning forever. (SIGINT stays 0: a terminal Ctrl-C, not a killer.)
+    let exitCode = 0;
     try {
-      await core.stop({ source: takeResidentStopIntent(stopIntentPath) ?? "external_signal", signal });
+      const source = takeResidentStopIntent(stopIntentPath) ?? "external_signal";
+      if (source === "external_signal" && signal === "SIGTERM") exitCode = EXTERNAL_STOP_EXIT_CODE;
+      await core.stop({ source, signal });
     } finally {
-      process.exit(0);
+      exit(exitCode);
     }
   };
   process.on("SIGTERM", () => void shutdown("SIGTERM"));
@@ -818,6 +1041,15 @@ export async function runServiceStartupRecovery(slockHome: string): Promise<void
       `Service startup recovery pass failed: ${msg}. Continuing; cleanup will retry on next service restart.\n`,
     );
   }
+  // Reconciler step 13: a drain request left by a service that is gone
+  // (crashed, or replaced while it drained) must not hold the new runners.
+  try {
+    const cleared = await clearUpgradeDrainRequests(slockHome, { onlyStale: true });
+    if (cleared > 0) process.stderr.write(`Service startup recovery: removed ${cleared} upgrade drain request(s) left by an earlier service.\n`);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    process.stderr.write(`Service startup recovery: could not remove old upgrade drain requests: ${msg}. Continuing.\n`);
+  }
   // The CLI no longer autostarts at login. An auto-upgraded Mac may never run
   // `start`/`stop` again, so the first service boot of the new build deletes
   // the leftover CLI LaunchAgent file (file only; see macosLoginCarrier.ts).
@@ -849,6 +1081,7 @@ export interface RunServiceDeps {
   detectSystemdSupervisorFn?: typeof detectSystemdSupervisor;
   externalSupervisorOptInFn?: typeof externalSupervisorOptIn;
   systemctl?: typeof runSystemctl;
+  readInstallerVersionFn?: typeof readInstallerVersion;
   /** How the supervised hand-off asks this process to shut down (default: SIGTERM to self). */
   signalSelfForRelaunch?: () => void;
   serviceSelfRestartDeps?: Omit<
@@ -861,7 +1094,13 @@ export interface RunServiceDeps {
   readKRunnerHoldFn?: unknown;
   onMutationsReady?: (mutations: ServiceIpcMutations) => void | Promise<void>;
   stopAfterMutationsReady?: boolean;
+  /** Device-auth §4 step 2 seam: how the background session retire is started (never awaited). */
+  scheduleDeviceSessionRetireFn?: (slockHome: string) => { cancel(): void };
   shutdownServiceFn?: typeof shutdownService;
+  /** Reconciler step 13 seam: the runners a web upgrade drains (default: every live runner this service supervises). */
+  upgradeDrainRunnersFn?: () => UpgradeDrainRunner[];
+  /** Reconciler step 13 seam: how the service waits for them (upgradeDrain.ts). */
+  waitForUpgradeDrainFn?: typeof waitForUpgradeDrain;
   afterIpcReady?: (shutdown: () => Promise<void>) => void | Promise<void>;
 }
 
@@ -884,6 +1123,9 @@ export async function runService(deps: RunServiceDeps = {}): Promise<void> {
   const slockHome = resolveRaftHome();
   await mkdir(serviceRunDir(slockHome), { recursive: true });
   await runServiceStartupRecovery(slockHome);
+  // A start while a web upgrade waits for its receipt is the installer
+  // bringing up the new (or the restored) version.
+  await noteServiceTransitionForRemoteUpgrade(slockHome, "service_started", COMPUTER_VERSION);
   const sourceServicePid = await resolveSourceServicePid(
     slockHome,
     process.env[SOURCE_SERVICE_PID_ENV_VAR],
@@ -896,6 +1138,12 @@ export async function runService(deps: RunServiceDeps = {}): Promise<void> {
   let shuttingDown = false;
   let inFlightControl: InFlightServiceControl | null = null;
   let inFlightControlOwner: symbol | null = null;
+  // Reconciler step 13: one upgrade at a time, from its receipt to its
+  // installer's spawn (a drain included). A second one is answered
+  // `already-running` (Tenny Q-G: a no-op). A restart is not refused by it:
+  // it replaces the service (stop·kill), and the next service's startup
+  // recovery removes the drain request.
+  let inFlightUpgrade: { requestId: string; targetVersion?: string; channel?: string } | null = null;
   let kRecoveryChild: ChildProcess | null = null;
   // task #917: who owns this process's lifecycle. Under systemd (or an
   // opted-in supervisor) restart and upgrade must EXIT and let the supervisor
@@ -1002,6 +1250,8 @@ export async function runService(deps: RunServiceDeps = {}): Promise<void> {
     runners.set(serverId, record);
     emitTransition(serverId, fromState, "starting", RUNNER_TRIGGER.spawn);
 
+    // A new attempt: a lock conflict the previous one hit is no longer current.
+    await clearRunnerLockConflictMarker(serverRunnerLockConflictPath(slockHome, serverId)).catch(() => undefined);
     const logPath = serverRunnerLogPath(slockHome, serverId);
     await mkdir(dirname(logPath), { recursive: true });
     // Rotate this runner's log if over the cap before the child inherits the
@@ -1044,8 +1294,11 @@ export async function runService(deps: RunServiceDeps = {}): Promise<void> {
         await clearPidfileAt(serverRunnerPidPath(slockHome, serverId)); // PID-bound stale connection evidence fails closed.
 
         // Operator stop / service shutdown asked this child to exit (managed.flag
-        // cleared, killChild set `stopping`) → terminal `stopped`, no restart.
-        if (rec.stopping) {
+        // cleared, stopUnmanagedRunner set `stopping`) → terminal `stopped`, no restart.
+        // `shuttingDown` too: a group-wide SIGTERM (OS shutdown, systemd
+        // control-group stop) can reach the runner before shutdownService marks
+        // it stopping, and that exit must not be charged as an external stop.
+        if (rec.stopping || shuttingDown) {
           const trigger = shuttingDown
             ? RUNNER_TRIGGER.shutdownStop
             : RUNNER_TRIGGER.operatorStop;
@@ -1071,25 +1324,6 @@ export async function runService(deps: RunServiceDeps = {}): Promise<void> {
     });
   };
 
-  const killChild = (rec: RunnerRecord): void => {
-    rec.stopping = true;
-    const pid = rec.child?.pid ?? rec.externalPid;
-    if (pid !== undefined) {
-      writeResidentStopIntent(serverRunnerStopIntentPath(slockHome, rec.serverId), { pid, source: "service_unmanaged" });
-    }
-    try {
-      rec.child?.kill("SIGTERM");
-    } catch {
-      /* ignore */
-    }
-    if (rec.externalPid !== undefined) {
-      try {
-        process.kill(rec.externalPid, "SIGTERM");
-      } catch {
-        /* ignore */
-      }
-    }
-  };
 
   const reconcile = async (): Promise<void> => {
     if (shuttingDown) return;
@@ -1120,8 +1354,7 @@ export async function runService(deps: RunServiceDeps = {}): Promise<void> {
       if (!holdRunnersForK && canSpawn(runners.get(id), true, now)) await spawnChild(id);
     }
     for (const [id, rec] of runners) {
-      if (!wanted.has(id) && rec.child) killChild(rec);
-      if (!wanted.has(id) && rec.externalPid !== undefined) killChild(rec);
+      if (!wanted.has(id)) await stopUnmanagedRunner({ slockHome, rec, emitTransition });
     }
     if (hasPendingReadyProbe || holdRunnersForK) scheduleReconcile(RUNNER_READY_POLL_INTERVAL_MS);
   };
@@ -1134,41 +1367,199 @@ export async function runService(deps: RunServiceDeps = {}): Promise<void> {
   // outlives this service. The outcome is the installer's receipt and the
   // live readback, not this acknowledgement.
   const upgradeStart = async (params: UpgradeStartParams): Promise<UpgradeStartResult> => {
+    if (inFlightUpgrade) {
+      // Q-G: a second upgrade while one is under way (draining) is a no-op;
+      // the same request again is answered as itself.
+      const current = inFlightUpgrade;
+      return {
+        status: "already-running",
+        upgradeId: current.requestId,
+        ...(current.targetVersion ? { targetVersion: current.targetVersion } : current.channel ? { channel: current.channel } : {}),
+      };
+    }
+    const claim = { requestId: params.requestId, ...(params.targetVersion ? { targetVersion: params.targetVersion } : {}) };
+    inFlightUpgrade = claim;
+    let releaseClaim = true;
+    try {
+      const result = await startUpgrade(params, claim);
+      if (result.status === "draining") releaseClaim = false;
+      return result;
+    } finally {
+      if (releaseClaim && inFlightUpgrade === claim) inFlightUpgrade = null;
+    }
+  };
+  /** The runners a drain waits for: every live runner of this service. */
+  const upgradeDrainRunners = (): UpgradeDrainRunner[] => deps.upgradeDrainRunnersFn?.()
+    ?? [...runners.entries()].flatMap(([serverId, record]) => {
+      const pid = record.child?.pid ?? record.externalPid;
+      return pid ? [{ serverId, pid }] : [];
+    });
+  const startUpgrade = async (params: UpgradeStartParams, claim: { requestId: string; channel?: string }): Promise<UpgradeStartResult> => {
     const upgradeId = params.requestId;
+    const receivedAtMs = Date.now();
+    // Reconciler step 13: the Server asked for a drain (clamped here too).
+    const drain = params.scope === "remote" ? clampComputerUpgradeDrain(params.drain) : null;
+    // Steps of a web upgrade go to the step log the next connected runner of
+    // the origin server reports (remoteUpgradeTrace.ts); local upgrades are not traced.
+    const supervisor = systemdSupervisor ? `systemd-${systemdSupervisor.scope}` : relaunchOnExit ? "external" : "none";
+    const traceStep = (record: Omit<RemoteUpgradeStepRecord, "requestId" | "originServerId" | "fromVersion" | "targetVersion">) =>
+      params.scope === "remote"
+        ? appendRemoteUpgradeStep(slockHome, {
+          requestId: upgradeId,
+          originServerId: params.originServerId,
+          fromVersion: COMPUTER_VERSION,
+          ...(params.targetVersion ? { targetVersion: params.targetVersion } : {}),
+          ...record,
+        })
+        : Promise.resolve();
     // No exact version means the saved channel's current release; the
     // installer resolves it and the receipt records what it became.
     const channel = params.targetVersion ? undefined : await readChannel(slockHome);
+    if (channel) claim.channel = channel;
     if (params.scope === "remote") {
-      await recordRemoteUpgradeLaunch(slockHome, { requestId: upgradeId, ...(params.targetVersion ? { targetVersion: params.targetVersion } : {}) });
+      await recordRemoteUpgradeLaunch(slockHome, {
+        requestId: upgradeId,
+        originServerId: params.originServerId,
+        ...(params.targetVersion ? { targetVersion: params.targetVersion } : {}),
+        ...(drain ? { drainMs: drain.deadlineMs } : {}),
+      });
     }
-    // task #917: the installer stops and restarts the service through
-    // `raft-computer stop`/`start`, which under systemd delegate to the unit.
-    // The detached installer lives in that unit's control group, so the unit
-    // must not kill the whole group on stop (KillMode=process|mixed). A
+    // task #917: the detached installer starts inside the service's systemd
+    // unit, so an installer older than 0.3.21 (which stops the service through
+    // `raft-computer stop`) is killed with the unit unless KillMode is
+    // process|mixed. 0.3.21+ moves itself into its own scope first and stops
+    // the unit with systemctl, or refuses (`held`) before stopping anything,
+    // so it is let through whatever the KillMode; the installer's version is
+    // only known once it is resolved, hence the check right before spawn. A
     // generic opted-in supervisor relaunches on every exit, which the
     // installer would read as "the service never stopped". Either way the
     // refusal is settled as this request's receipt so the server closes the
-    // request now instead of waiting out its deadline (archer, #9526).
-    const refuseUpgrade = async (reason: string): Promise<never> => {
+    // request now instead of waiting for its deadline (archer, #9526).
+    const refuseUpgrade = async (reason: string, errorCode: string): Promise<never> => {
       if (params.scope === "remote") {
         await recordRemoteUpgradeRefusal(slockHome, { requestId: upgradeId, targetVersion: params.targetVersion, reason }).catch(() => undefined);
       }
+      await traceStep({ step: "received", outcome: "failed", atMs: receivedAtMs, errorCode, supervisor });
       throw new ServiceClientError("UPGRADE_START_REJECTED", reason);
     };
+    let killMode: string | undefined;
+    let unsafeKillModeRefusal: string | null = null;
     if (systemdSupervisor) {
-      const killMode = await showUnitProperty(deps.systemctl ?? runSystemctl, systemdSupervisor.scope, systemdSupervisor.unit, "KillMode");
-      if (killMode === null || !UPGRADE_SAFE_KILL_MODES.includes(killMode)) {
-        await refuseUpgrade(describeKillModeRequirement(systemdSupervisor.unit, killMode));
+      const unitKillMode = await showUnitProperty(deps.systemctl ?? runSystemctl, systemdSupervisor.scope, systemdSupervisor.unit, "KillMode");
+      killMode = unitKillMode ?? "unknown";
+      if (unitKillMode === null || !UPGRADE_SAFE_KILL_MODES.includes(unitKillMode)) {
+        unsafeKillModeRefusal = describeKillModeRequirement(systemdSupervisor.unit, unitKillMode);
       }
     } else if (relaunchOnExit) {
       await refuseUpgrade(
         "The Computer service runs under an external supervisor (RAFT_COMPUTER_EXTERNAL_SUPERVISOR) that relaunches it on every exit, "
         + "so the installer cannot stop it for an upgrade. Upgrade from the host: stop the supervisor, run `raft-computer upgrade`, start it again.",
+        "external_supervisor",
       );
     }
-    const pid = await launchInstallerDetached(slockHome, installerArgs({ targetVersion: params.targetVersion, channel }), upgradeId);
-    if (pid === null) throw new Error("external_installer_launch_failed");
-    return { status: "started", upgradeId, ...(params.targetVersion ? { targetVersion: params.targetVersion } : { channel }) };
+    await traceStep({ step: "received", outcome: "ok", atMs: receivedAtMs, supervisor, ...(killMode !== undefined ? { killMode } : {}) });
+    // Resolving (and, when not cached, downloading) the installer happens
+    // inside the launch; `download.resolved` splits a failure between the two.
+    const downloadStartedAtMs = Date.now();
+    const download: InstallerDownloadStats = {};
+    const installerVeto: { reason: string | null } = { reason: null };
+    const vetoOldInstaller = unsafeKillModeRefusal === null ? undefined : async (command: string) => {
+      const version = await (deps.readInstallerVersionFn ?? readInstallerVersion)(command);
+      let escapesUnit = false;
+      try { escapesUnit = version !== null && compareComputerVersions(version, UNIT_ESCAPING_INSTALLER_VERSION) >= 0; } catch { /* unparsable: treat as old */ }
+      if (!escapesUnit) {
+        installerVeto.reason = `${unsafeKillModeRefusal} (The installer this upgrade would use is ${version ?? "of unknown version"}; installer ${UNIT_ESCAPING_INSTALLER_VERSION} and later handle this unit without the change.)`;
+        throw new ServiceClientError("UPGRADE_START_REJECTED", installerVeto.reason);
+      }
+    };
+    // Reconciler step 13: with a drain, the installer is resolved, verified
+    // and vetoed first (a refused or failed launch never drains); then every
+    // runner drains, and only then is it spawned. The caller is answered
+    // `draining` once the drain begins.
+    let drainBegun!: () => void;
+    const drainBegins = new Promise<"draining">((resolve) => { drainBegun = () => resolve("draining"); });
+    const runDrain = async (): Promise<void> => {
+      if (!drain || params.scope !== "remote") return;
+      await traceStep({ step: "download", outcome: download.cached ? "skipped" : "ok", atMs: downloadStartedAtMs, durationMs: Date.now() - downloadStartedAtMs, bytes: download.bytes ?? 0 });
+      const drainStartedAtMs = Date.now();
+      const request = { requestId: upgradeId, originServerId: params.originServerId, deadlineAtMs: drainStartedAtMs + drain.deadlineMs, servicePid: process.pid };
+      for (const runner of upgradeDrainRunners()) await writeUpgradeDrainRequest(slockHome, runner, request).catch(() => undefined);
+      drainBegun();
+      const outcome = await (deps.waitForUpgradeDrainFn ?? waitForUpgradeDrain)(slockHome, { request, runners: upgradeDrainRunners });
+      await traceStep({
+        step: "drain",
+        outcome: "ok",
+        atMs: drainStartedAtMs,
+        durationMs: outcome.durationMs,
+        phase: outcome.finished,
+        ...(outcome.notQuietAtEnd > 0 ? { reason: `${outcome.notQuietAtEnd} agent(s) still working` } : {}),
+      });
+    };
+    const beforeSpawn = vetoOldInstaller === undefined && !drain ? undefined : async (command: string) => {
+      await vetoOldInstaller?.(command);
+      await runDrain();
+    };
+    const launch = async (): Promise<number> => {
+      let pid: number | null;
+      try {
+        pid = await launchInstallerDetached(slockHome, installerArgs({ targetVersion: params.targetVersion, channel }), upgradeId, undefined, download, beforeSpawn);
+      } catch (error) {
+        if (installerVeto.reason !== null) {
+          if (params.scope === "remote") {
+            await recordRemoteUpgradeRefusal(slockHome, { requestId: upgradeId, targetVersion: params.targetVersion, reason: installerVeto.reason }).catch(() => undefined);
+          }
+          await traceStep({ step: "download", outcome: download.cached ? "skipped" : "ok", atMs: downloadStartedAtMs, durationMs: Date.now() - downloadStartedAtMs, bytes: download.bytes ?? 0 });
+          await traceStep({ step: "installer_spawned", outcome: "failed", atMs: Date.now(), errorCode: "unsafe_kill_mode", supervisor, ...(killMode !== undefined ? { killMode } : {}) });
+          throw error;
+        }
+        const errorCode = upgradeErrorCode(error);
+        if (!download.resolved) {
+          await traceStep({
+            step: "download",
+            outcome: "failed",
+            atMs: downloadStartedAtMs,
+            durationMs: Date.now() - downloadStartedAtMs,
+            errorCode,
+            // e.g. "installer_download_failed: ECONNRESET after 3 attempts"
+            reason: error instanceof Error ? error.message : String(error),
+            ...(download.bytes !== undefined ? { bytes: download.bytes } : {}),
+          });
+        } else {
+          await traceStep({ step: "installer_spawned", outcome: "failed", atMs: Date.now(), errorCode, supervisor });
+        }
+        throw error;
+      }
+      // With a drain the download step was traced when the drain began.
+      if (!drain) await traceStep({ step: "download", outcome: download.cached ? "skipped" : "ok", atMs: downloadStartedAtMs, durationMs: Date.now() - downloadStartedAtMs, bytes: download.bytes ?? 0 });
+      await traceStep({ step: "installer_spawned", outcome: pid === null ? "failed" : "ok", atMs: Date.now(), supervisor, ...(killMode !== undefined ? { killMode } : {}), ...(pid === null ? { errorCode: "external_installer_launch_failed" } : {}) });
+      if (pid === null) throw new Error("external_installer_launch_failed");
+      return pid;
+    };
+    const target = params.targetVersion ? { targetVersion: params.targetVersion } : { channel };
+    if (!drain || params.scope !== "remote") {
+      await launch();
+      return { status: "started", upgradeId, ...target };
+    }
+    const launched = launch();
+    const first = await Promise.race([launched.then(() => "started" as const), drainBegins]);
+    const releaseClaim = () => { if (inFlightUpgrade?.requestId === upgradeId) inFlightUpgrade = null; };
+    if (first === "started") return { status: "started", upgradeId, ...target };
+    void launched.then(() => {
+      releaseClaim();
+      // An installer that gives up without stopping this service leaves the
+      // runners holding: its failure receipt lets them go now.
+      void waitForRemoteUpgradeFailureReceipt(slockHome, upgradeId, { ...(params.targetVersion ? { targetVersion: params.targetVersion } : {}) })
+        .then((failure) => (failure ? clearUpgradeDrainRequests(slockHome) : 0))
+        .catch(() => undefined);
+    }, async (error: unknown) => {
+      releaseClaim();
+      // After the early answer the runner reads this outcome as the
+      // request's receipt (waitForRemoteUpgradeFailureReceipt).
+      const reason = `The installer could not be started after the drain: ${error instanceof Error ? error.message : String(error)}`;
+      await recordRemoteUpgradeRefusal(slockHome, { requestId: upgradeId, targetVersion: params.targetVersion, reason, refusal: "launch_after_drain" }).catch(() => undefined);
+      await clearUpgradeDrainRequests(slockHome).catch(() => undefined);
+    });
+    return { status: "draining", upgradeId, ...target };
   };
   const mutations: ServiceIpcMutations = {
     restartService: async (params) => {
@@ -1237,9 +1628,21 @@ export async function runService(deps: RunServiceDeps = {}): Promise<void> {
     deps.serviceIdentityPublishDeps,
   );
 
+  // Device-auth design v2 §4 step 2: retire the device session this machine
+  // once logged in with. Background and best effort: scheduled on a timer,
+  // never awaited, so it cannot delay IPC, the runners or the reconcile loop.
+  let deviceSessionRetire: { cancel(): void } | null = null;
+  try {
+    deviceSessionRetire = (deps.scheduleDeviceSessionRetireFn ?? scheduleDeviceSessionRetire)(slockHome);
+  } catch {
+    // never a reason to stop the service
+  }
+
   const shutdown = async (): Promise<void> => {
     if (shuttingDown) return;
     shuttingDown = true;
+    deviceSessionRetire?.cancel();
+    await noteServiceTransitionForRemoteUpgrade(slockHome, "service_stopped", COMPUTER_VERSION);
     await (deps.shutdownServiceFn ?? shutdownService)({
       runners,
       beforeSignal: (rec, pid) =>

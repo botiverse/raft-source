@@ -17,4 +17,21 @@ export function registerServerReset(cb: ResetCallback): void {
 
 export function triggerServerReset(): void {
   callbacks.forEach((cb) => cb());
+  triggerAfterServerReset();
+}
+
+const afterCallbacks: ResetCallback[] = [];
+
+/**
+ * Runs after every store has reset, for work that fills the fresh slices
+ * (task #164: seeding the last saved counts of the new server). Order among
+ * the reset callbacks is import order, so a seed there could be wiped by a
+ * store that resets after it.
+ */
+export function registerAfterServerReset(cb: ResetCallback): void {
+  afterCallbacks.push(cb);
+}
+
+export function triggerAfterServerReset(): void {
+  afterCallbacks.forEach((cb) => cb());
 }

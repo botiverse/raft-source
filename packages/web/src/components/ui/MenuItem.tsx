@@ -18,7 +18,7 @@ import type { ButtonHTMLAttributes, ReactNode } from "react";
  * current state ("Mark as Read ↔ Mark as Unread", "Pin ↔ Unpin") only changes
  * its label; it is not a toggle.
  *
- * Raft Design System › Menu (`rf-menu__item`): 36 tall, 8px radius, 14/20
+ * Raft Design System › Menu (`rf-menu__item`): 36 tall, `radius-chip` (6px), 14/20
  * 500 ink, a 16px ink-2 icon, 10px gap; pointer hover and keyboard focus are
  * the yellow-soft highlight, disabled is the disabled ink. Destructive rows
  * are NOT coloured — every irreversible action is gated by a `ConfirmDialog`
@@ -30,7 +30,7 @@ import type { ButtonHTMLAttributes, ReactNode } from "react";
  * mirror raft-ui's raft menu-item recipe so both kinds of menu read the same.
  */
 export type MenuItemProps = ButtonHTMLAttributes<HTMLButtonElement> & {
-  /** Optional leading icon. Conventionally a lucide icon at `size={14}`–`16`. */
+  /** Optional leading icon, a Lucide icon; the row draws it at 16px. */
   icon?: ReactNode;
   /** Optional right-aligned slot (e.g. shortcut hint). */
   trailing?: ReactNode;
@@ -41,10 +41,12 @@ export type MenuItemProps = ButtonHTMLAttributes<HTMLButtonElement> & {
 // context menus visually uniform in small viewports without per-callsite
 // opt-in.
 const MENU_ITEM_CLASS = [
-  "flex min-h-9 w-full items-center gap-2.5 rounded-control px-2.5 py-1.5 text-left [@media(max-height:600px)]:min-h-8 [@media(max-height:600px)]:py-1",
+  "flex min-h-option w-full items-center gap-2.5 rounded-chip px-2.5 py-option-inset text-left [@media(max-height:600px)]:min-h-8 [@media(max-height:600px)]:py-1",
   "font-sans text-callout font-medium text-foreground",
   "outline-none transition-colors enabled:hover:bg-brand-soft enabled:focus-visible:bg-brand-soft",
-  "[&>svg]:shrink-0 [&>svg:first-child]:text-foreground-muted",
+  // The leading icon is 16px whatever size a caller passes: a menu's icons are
+  // 16px (raft-design iconography.md, Sizes), so callers can't drift to 14px.
+  "[&>svg]:shrink-0 [&>svg:first-child]:size-4 [&>svg:first-child]:text-foreground-muted",
   "disabled:cursor-not-allowed disabled:text-foreground-disabled disabled:[&>svg:first-child]:text-foreground-disabled",
 ].join(" ");
 

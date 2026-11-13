@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { ELECTRON_NODE_SCRIPT_EXEC_ARGV } from "./nodeHostLaunch";
 import { createHash } from "node:crypto";
 import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import os from "node:os";
@@ -9,7 +10,8 @@ import {
   MemoryTraceSink,
   createSpanAttrContractTracer,
 } from "@botiverse/raft-shared";
-import { buildCodexAppServerArgs, CODEX_NPM_ROOT_TIMEOUT_MS, CodexDriver, clearCodexProbeCacheForTests, codexThreadName, detectCodexModels, detectCodexModelsFromAppServer, probeCodex, compareCodexVersions, parseCodexVersion, resolveCodexCommand, resolveCodexSpawn, resolveCodexSpawnAsync } from "./codex";
+import { buildCodexAppServerArgs, buildCodexThreadRequest, codexThreadFields, CODEX_MANAGED_MCP_TOKEN_ENV, withCodexManagedMcpToken,
+  CODEX_NPM_ROOT_TIMEOUT_MS, CodexDriver, clearCodexProbeCacheForTests, codexThreadName, detectCodexModels, detectCodexModelsFromAppServer, probeCodex, compareCodexVersions, parseCodexVersion, resolveCodexCommand, resolveCodexSpawn, resolveCodexSpawnAsync } from "./codex";
 import type { execFileSync } from "node:child_process";
 import { ProbeChildError, type runProbeChild } from "./probeChild";
 
@@ -54,21 +56,26 @@ function codexToolingObservation(
   };
 }
 
-test("codex app-server receives only the launch-scoped managed MCP loopback URL", () => {
-  assert.deepEqual(buildCodexAppServerArgs({
-    name: "raft_managed",
-    url: "http://127.0.0.1:43123/mcp/opaque",
-  }), [
+test("codex app-server gets the managed MCP endpoint without its token: the token is read from its own environment", () => {
+  const args = buildCodexAppServerArgs({ name: "raft_managed", endpointUrl: "http://127.0.0.1:43123/mcp" });
+  assert.deepEqual(args, [
     "app-server",
     "-c",
-    'mcp_servers.raft_managed.url="http://127.0.0.1:43123/mcp/opaque"',
+    'mcp_servers.raft_managed.url="http://127.0.0.1:43123/mcp"',
+    "-c",
+    `mcp_servers.raft_managed.bearer_token_env_var="${CODEX_MANAGED_MCP_TOKEN_ENV}"`,
     "--listen",
     "stdio://",
   ]);
-  assert.doesNotMatch(JSON.stringify(buildCodexAppServerArgs({
-    name: "raft_managed",
-    url: "http://127.0.0.1:43123/mcp/opaque",
-  })), /Authorization|private\.example/);
+  // #proj-runtime:#40: other OS users can read a process's arguments.
+  assert.doesNotMatch(JSON.stringify(args), /\/mcp\/|Authorization|private\.example/);
+});
+
+test("only the app-server's own environment gets the managed MCP token", () => {
+  const base = { PATH: "/usr/bin" };
+  assert.deepEqual(withCodexManagedMcpToken(base, { token: "tok" }), { PATH: "/usr/bin", [CODEX_MANAGED_MCP_TOKEN_ENV]: "tok" });
+  assert.deepEqual(base, { PATH: "/usr/bin" }, "the shared spawn env (discovery probes) stays without it");
+  assert.equal(withCodexManagedMcpToken(base, null), base);
 });
 
 async function waitFor(condition: () => boolean, label: string): Promise<void> {
@@ -430,6 +437,7 @@ test("codex launch trace records only derived host facts and launch generation",
       launchId: "launch-1",
       runtime: "codex",
       candidate_source: "path",
+      rejected_candidate_count: 0,
       host_kind: "node",
       electron_run_as_node: false,
     });
@@ -692,6 +700,7 @@ test("codex scripted app-server harness starts a fresh thread and initial turn",
             "model": "gpt-5.3-codex",
             "sandbox": "danger-full-access",
             "sandbox_mode": "danger-full-access",
+            "serviceTier": null,
           },
         },
         {
@@ -762,6 +771,7 @@ test("codex resume success starts the initial turn on the resumed thread", async
             "model": "gpt-5.3-codex",
             "sandbox": "danger-full-access",
             "sandbox_mode": "danger-full-access",
+            "serviceTier": null,
             "threadId": "existing-thread-1",
           },
         },
@@ -864,6 +874,7 @@ test("codex resume missing rollout falls back to fresh thread/start", async () =
             "model": "gpt-5.3-codex",
             "sandbox": "danger-full-access",
             "sandbox_mode": "danger-full-access",
+            "serviceTier": null,
             "threadId": "missing-thread-1",
           },
         },
@@ -877,6 +888,7 @@ test("codex resume missing rollout falls back to fresh thread/start", async () =
             "model": "gpt-5.3-codex",
             "sandbox": "danger-full-access",
             "sandbox_mode": "danger-full-access",
+            "serviceTier": null,
           },
         },
         {
@@ -1495,6 +1507,10 @@ test("codex driver does not surface commentary-phase agent text as user-visible 
   assert.equal(deltaEvents.length, 1);
   assert.equal(deltaEvents[0]?.kind, "internal_progress");
   assert.equal(deltaEvents[0]?.itemType, "agent_message_non_final_delta");
+  // Category and size only: the trace can tell commentary happened, never what it said.
+  assert.equal((deltaEvents[0] as any)?.phase, "commentary");
+  assert.equal((deltaEvents[0] as any)?.payloadBytes, Buffer.byteLength("assistant to=functions.exec_command {...}", "utf8"));
+  assert.doesNotMatch(JSON.stringify(deltaEvents), /exec_command/);
 
   const completedEvents = driver.parseLine(JSON.stringify({
     method: "item/completed",
@@ -1950,85 +1966,57 @@ test("codex driver emits review lifecycle events for review mode items", () => {
   assert.deepEqual(completed, [{ kind: "review_finished" }]);
 });
 
-test("codex driver: steering gate prevents unsafe stdin writes (regression #238)", () => {
+// Regression #238 used to close busy steering from a tool's item/completed
+// until the next progress event (a May-2026 app-server wedge). Codex 0.155.1
+// took 207 steers in that window with no wedge (#proj-runtime:15c1492a,
+// tmp/codex-gate238/RESULT.md), so the daemon no longer holds them.
+test("codex driver steers a busy turn right after a tool item/completed (regression #238 window)", () => {
   const driver = new CodexDriver();
+  driver.parseLine(JSON.stringify({ method: "thread/started", params: { thread: { id: "thread-1" } } }));
+  driver.parseLine(JSON.stringify({ method: "turn/started", params: { threadId: "thread-1", turn: { id: "turn-1" } } }));
 
-  // 1. Thread and turn starts
-  driver.parseLine(JSON.stringify({
-    method: "thread/started",
-    params: { thread: { id: "thread-1" } }
-  }));
-  driver.parseLine(JSON.stringify({
-    method: "turn/started",
-    params: { threadId: "thread-1", turn: { id: "turn-1" } }
-  }));
-
-  // 2. Tool starts and completes
-  // Invariants check: tool_output must emit IMMEDIATELY for APM visibility
   driver.parseLine(JSON.stringify({
     method: "item/started",
-    params: { item: { id: "tool-1", type: "commandExecution", command: "ls" } }
+    params: { item: { id: "tool-1", type: "commandExecution", command: "ls" } },
   }));
   const events = driver.parseLine(JSON.stringify({
     method: "item/completed",
-    params: { item: { id: "tool-1", type: "commandExecution", command: "ls" } }
+    params: { item: { id: "tool-1", type: "commandExecution", command: "ls" } },
   }));
-  assert.deepEqual(events, [{ kind: "tool_output", name: "shell" }], "tool_output must be immediate");
+  assert.deepEqual(events, [{ kind: "tool_output", name: "shell", callId: "tool-1" }], "tool_output must be immediate");
 
-  // 3. Busy-mode delivery attempt during the vulnerable window
-  // Invariants check: must return null to prevent crash-inducing turn/steer
-  const busyResult = driver.encodeStdinMessage("notification", "thread-1", { mode: "busy" });
-  assert.equal(busyResult, null, "Must gate busy steering during vulnerable window");
+  // No progress event between the tool's end and the steer.
+  const busy = driver.encodeStdinMessage("notification", "thread-1", { mode: "busy" });
+  assert.ok(busy, "a busy steer right after a tool end is written");
+  const request = JSON.parse(busy!);
+  assert.equal(request.method, "turn/steer");
+  assert.equal(request.params.expectedTurnId, "turn-1");
 
-  // 4. Progress arrives (e.g. reasoning delta or text)
-  // Should open the gate
-  driver.parseLine(JSON.stringify({
-    method: "item/reasoning/textDelta",
-    params: { itemId: "reason-1", delta: "thinking..." }
-  }));
-  const unblockedResult = driver.encodeStdinMessage("urgent", "thread-1", { mode: "busy" });
-  assert.ok(unblockedResult, "Progress should unblock steering gate");
-  assert.match(unblockedResult!, /turn\/steer/);
-
-  // 5. Turn completes
-  // Should definitely be open for next idle start
   driver.parseLine(JSON.stringify({
     method: "turn/completed",
-    params: { threadId: "thread-1", turn: { id: "turn-1", status: "completed" } }
+    params: { threadId: "thread-1", turn: { id: "turn-1", status: "completed" } },
   }));
-  const idleResult = driver.encodeStdinMessage("new task", "thread-1", { mode: "idle" });
-  assert.ok(idleResult);
-  assert.match(idleResult!, /turn\/start/);
+  assert.equal(driver.encodeStdinMessage("late", "thread-1", { mode: "busy" }), null, "no busy steer without a running turn");
+  const idle = driver.encodeStdinMessage("new task", "thread-1", { mode: "idle" });
+  assert.match(idle!, /turn\/start/);
 });
 
-test("codex driver: steering gate unblocks on fallback completed progress", () => {
-  const driver = new CodexDriver();
-  driver.parseLine(JSON.stringify({
-    method: "thread/started",
-    params: { thread: { id: "thread-1" } }
-  }));
-  driver.parseLine(JSON.stringify({
-    method: "turn/started",
-    params: { threadId: "thread-1", turn: { id: "turn-1" } }
-  }));
-
-  // 1. Tool completes -> Gated
-  driver.parseLine(JSON.stringify({
-    method: "item/completed",
-    params: { item: { id: "tool-1", type: "commandExecution", command: "ls" } }
-  }));
-  assert.equal(driver.encodeStdinMessage("msg", "thread-1", { mode: "busy" }), null);
-
-  // 2. agentMessage completes without prior delta (fallback progress) -> Unblocked
-  driver.parseLine(JSON.stringify({
-    method: "item/completed",
-    params: {
-      item: { id: "item-1", type: "agentMessage", text: "Fallback text" }
-    }
-  }));
-  const result = driver.encodeStdinMessage("steer", "thread-1", { mode: "busy" });
-  assert.ok(result, "Fallback completed progress should unblock steering gate");
-  assert.match(result!, /turn\/steer/);
+test("codex driver: no tool kind's end closes busy steering", () => {
+  const completedItems = [
+    { id: "cmd-1", type: "commandExecution", command: "ls" },
+    { id: "fc-1", type: "fileChange", changes: [{ path: "a.ts", kind: "update" }] },
+    { id: "mcp-1", type: "mcpToolCall", server: "raft", tool: "send", arguments: {} },
+    { id: "collab-1", type: "collabAgentToolCall", tool: "spawn", prompt: "p" },
+    { id: "web-1", type: "webSearch", query: "q" },
+  ];
+  for (const item of completedItems) {
+    const driver = new CodexDriver();
+    driver.parseLine(JSON.stringify({ method: "thread/started", params: { thread: { id: "thread-1" } } }));
+    driver.parseLine(JSON.stringify({ method: "turn/started", params: { threadId: "thread-1", turn: { id: "turn-1" } } }));
+    const events = driver.parseLine(JSON.stringify({ method: "item/completed", params: { item } }));
+    assert.ok(events.some((event) => event.kind === "tool_output"), `${item.type} ends a tool`);
+    assert.match(driver.encodeStdinMessage("steer", "thread-1", { mode: "busy" }) ?? "", /turn\/steer/, item.type);
+  }
 });
 
 test("codex driver emits tool output events for completed tool items", () => {
@@ -2061,8 +2049,8 @@ test("codex driver emits tool output events for completed tool items", () => {
     },
   }));
 
-  assert.deepEqual(commandCompleted, [{ kind: "tool_output", name: "shell" }]);
-  assert.deepEqual(mcpCompleted, [{ kind: "tool_output", name: "mcp_github_search_issues" }]);
+  assert.deepEqual(commandCompleted, [{ kind: "tool_output", name: "shell", callId: "item-command-1" }]);
+  assert.deepEqual(mcpCompleted, [{ kind: "tool_output", name: "mcp_github_search_issues", callId: "item-mcp-1" }]);
 });
 
 test("codex driver emits matching outputs for tool-like item completions", () => {
@@ -2174,36 +2162,62 @@ test("codex driver emits matching outputs for tool-like item completions", () =>
   }));
 
   assert.deepEqual(fileChangeStarted, [
-    { kind: "tool_call", name: "file_change", input: { path: "a.ts", kind: "modify" } },
-    { kind: "tool_call", name: "file_change", input: { path: "b.ts", kind: "create" } },
+    { kind: "tool_call", name: "file_change", input: { path: "a.ts", kind: "modify" }, callId: "item-file-1:0" },
+    { kind: "tool_call", name: "file_change", input: { path: "b.ts", kind: "create" }, callId: "item-file-1:1" },
   ]);
   assert.deepEqual(fileChangeCompleted, [
-    { kind: "tool_output", name: "file_change" },
-    { kind: "tool_output", name: "file_change" },
+    { kind: "tool_output", name: "file_change", callId: "item-file-1:0" },
+    { kind: "tool_output", name: "file_change", callId: "item-file-1:1" },
   ]);
   assert.deepEqual(fileChangeOmittedCompletionStarted, [
-    { kind: "tool_call", name: "file_change", input: { path: "c.ts", kind: "modify" } },
-    { kind: "tool_call", name: "file_change", input: { path: "d.ts", kind: "delete" } },
+    { kind: "tool_call", name: "file_change", input: { path: "c.ts", kind: "modify" }, callId: "item-file-2:0" },
+    { kind: "tool_call", name: "file_change", input: { path: "d.ts", kind: "delete" }, callId: "item-file-2:1" },
   ]);
   assert.deepEqual(fileChangeOmittedCompletionCompleted, [
-    { kind: "tool_output", name: "file_change" },
-    { kind: "tool_output", name: "file_change" },
+    { kind: "tool_output", name: "file_change", callId: "item-file-2:0" },
+    { kind: "tool_output", name: "file_change", callId: "item-file-2:1" },
   ]);
+  // No start announced this change, so its completion announces it first:
+  // every end has its own start.
   assert.deepEqual(fileChangeCompletionOnly, [
-    { kind: "tool_output", name: "file_change" },
+    { kind: "tool_call", name: "file_change", input: { path: "e.ts", kind: "modify" }, callId: "item-file-3:0" },
+    { kind: "tool_output", name: "file_change", callId: "item-file-3:0" },
   ]);
   assert.deepEqual(collabStarted, [{
     kind: "tool_call",
     name: "collab_tool_call",
     input: { tool: "delegate", prompt: "inspect this" },
+    callId: "item-collab-1",
   }]);
-  assert.deepEqual(collabCompleted, [{ kind: "tool_output", name: "collab_tool_call" }]);
+  assert.deepEqual(collabCompleted, [{ kind: "tool_output", name: "collab_tool_call", callId: "item-collab-1" }]);
   assert.deepEqual(webSearchStarted, [{
     kind: "tool_call",
     name: "web_search",
     input: { query: "Codex app-server" },
+    callId: "item-web-1",
   }]);
-  assert.deepEqual(webSearchCompleted, [{ kind: "tool_output", name: "web_search" }]);
+  assert.deepEqual(webSearchCompleted, [{ kind: "tool_output", name: "web_search", callId: "item-web-1" }]);
+});
+
+test("codex driver: a file change whose start listed no changes never ends another open call", () => {
+  const driver = new CodexDriver();
+  const line = (method: string, item: Record<string, unknown>) => driver.parseLine(JSON.stringify({ method, params: { item } }));
+
+  const commandStarted = line("item/started", { type: "commandExecution", id: "call-cmd", command: "sleep 9999" });
+  const patchStarted = line("item/started", { type: "fileChange", id: "call-patch", changes: [] });
+  const patchCompleted = line("item/completed", {
+    type: "fileChange",
+    id: "call-patch",
+    changes: [{ path: "a.ts", kind: "modify" }, { path: "b.ts", kind: "modify" }],
+  });
+
+  assert.deepEqual(commandStarted, [{ kind: "tool_call", name: "shell", input: { command: "sleep 9999" }, callId: "call-cmd" }]);
+  assert.deepEqual(patchStarted, []);
+  const outputs = patchCompleted.filter((event) => event.kind === "tool_output");
+  const calls = patchCompleted.filter((event) => event.kind === "tool_call");
+  assert.equal(outputs.length, 2);
+  assert.deepEqual(calls.map((event) => event.kind === "tool_call" ? event.callId : null), ["call-patch:0", "call-patch:1"]);
+  assert.deepEqual(outputs.map((event) => event.kind === "tool_output" ? event.callId : null), ["call-patch:0", "call-patch:1"]);
 });
 
 test("codex driver emits token usage telemetry without lifecycle progress events", () => {
@@ -2219,6 +2233,12 @@ test("codex driver emits token usage telemetry without lifecycle progress events
           cachedInputTokens: 200,
           outputTokens: 150,
           reasoningOutputTokens: 50,
+        },
+        last: {
+          totalTokens: 500,
+          inputTokens: 450,
+          cachedInputTokens: 100,
+          outputTokens: 50,
         },
         modelContextWindow: 2000,
       },
@@ -2236,11 +2256,37 @@ test("codex driver emits token usage telemetry without lifecycle progress events
       cachedInputTokens: 200,
       outputTokens: 150,
       reasoningOutputTokens: 50,
+      lastInputTokens: 450,
+      lastCachedInputTokens: 100,
+      lastOutputTokens: 50,
       modelContextWindow: 2000,
       cachedInputRatio: 0.25,
-      contextUtilization: 0.5,
+      contextUtilization: 0.25,
     },
   }]);
+});
+
+test("codex token usage: context utilization follows the last call, not the session totals", () => {
+  const driver = new CodexDriver();
+
+  const [event] = driver.parseLine(JSON.stringify({
+    method: "thread/tokenUsage/updated",
+    params: {
+      tokenUsage: {
+        total: { totalTokens: 2_668_060, inputTokens: 2_600_000, outputTokens: 68_060 },
+        last: { totalTokens: 72_500, inputTokens: 71_990, outputTokens: 510 },
+        modelContextWindow: 2000 * 1000,
+      },
+    },
+  }));
+  assert.equal(event?.kind, "telemetry");
+  assert.equal(event?.kind === "telemetry" ? event.attrs.contextUtilization : undefined, 0.03625);
+
+  const [withoutLast] = driver.parseLine(JSON.stringify({
+    method: "thread/tokenUsage/updated",
+    params: { tokenUsage: { total: { totalTokens: 1000 }, modelContextWindow: 2000 } },
+  }));
+  assert.equal(withoutLast?.kind === "telemetry" ? withoutLast.attrs.contextUtilization : null, undefined);
 });
 
 test("codex driver adopts telemetry event thread id as session identity", () => {
@@ -2641,6 +2687,23 @@ test("codex driver emits raw response items as payload-free internal progress", 
   }]);
 });
 
+test("codex driver records a raw message item's role and phase as categories, never its content", () => {
+  const driver = new CodexDriver();
+  const rawItem = { type: "message", role: "assistant", phase: "commentary", content: [{ type: "output_text", text: "private words" }] };
+  const events = driver.parseLine(JSON.stringify({ method: "rawResponseItem/completed", params: rawItem }));
+  assert.deepEqual(events, [{
+    kind: "internal_progress",
+    source: "codex_raw_response_item",
+    itemType: "message",
+    payloadBytes: Buffer.byteLength(JSON.stringify(rawItem), "utf8"),
+    role: "assistant",
+    phase: "commentary",
+  }]);
+
+  const odd = driver.parseLine(JSON.stringify({ method: "rawResponseItem/completed", params: { type: "message", role: "not a category!" } }));
+  assert.equal((odd[0] as any)?.role, "other");
+});
+
 test("codex driver treats retryable app-server errors as non-terminal liveness", () => {
   const driver = new CodexDriver();
   const events = driver.parseLine(JSON.stringify({
@@ -2824,6 +2887,37 @@ test("codex driver treats interrupted turns as non-success terminal outcomes", (
   ]);
 });
 
+test("codex driver interrupts the running turn natively and ends it as interrupted, not failed", { skip: process.platform === "win32" }, () => {
+  const driver = new CodexDriver();
+  driver.parseLine(JSON.stringify({ method: "thread/started", params: { thread: { id: "thread-1" } } }));
+  assert.equal(driver.encodeInterruptRequest(), null, "no turn yet: the daemon takes its restart path");
+  driver.parseLine(JSON.stringify({ method: "turn/started", params: { threadId: "thread-1", turn: { id: "turn-1" } } }));
+
+  const line = driver.encodeInterruptRequest();
+  assert.ok(line);
+  const request = JSON.parse(line);
+  assert.equal(request.method, "turn/interrupt");
+  assert.deepEqual(request.params, { threadId: "thread-1", turnId: "turn-1" });
+  // Its response is the interrupt's own, not a delivery result.
+  assert.deepEqual(driver.parseLine(JSON.stringify({ id: request.id, result: {} })), []);
+
+  const events = driver.parseLine(JSON.stringify({
+    method: "turn/completed",
+    params: { threadId: "thread-1", turn: { id: "turn-1", status: "interrupted" } },
+  }));
+  assert.deepEqual(events, [{ kind: "turn_end", sessionId: "thread-1", interrupted: true }]);
+
+  // The mark belongs to that turn only: a later interruption Codex reports on its own is still an error.
+  driver.parseLine(JSON.stringify({ method: "turn/started", params: { threadId: "thread-1", turn: { id: "turn-2" } } }));
+  assert.deepEqual(driver.parseLine(JSON.stringify({
+    method: "turn/completed",
+    params: { threadId: "thread-1", turn: { id: "turn-2", status: "interrupted" } },
+  })), [
+    { kind: "error", message: "Codex turn interrupted" },
+    { kind: "turn_end", sessionId: "thread-1" },
+  ]);
+});
+
 test("codex thread request passes model, reasoning effort, and fast service tier", () => {
   const driver = new CodexDriver();
   const request = driver.buildThreadRequest({
@@ -2848,6 +2942,38 @@ test("codex thread request passes model, reasoning effort, and fast service tier
   assert.equal(request.params.model, "gpt-5.5");
   assert.deepEqual(request.params.config, { model_reasoning_effort: "low" });
   assert.equal(request.params.serviceTier, "fast");
+});
+
+test("codex start and resume send the fast tier in fast mode and clear it otherwise, so neither a saved session tier nor a config tier overrides Raft's mode", () => {
+  const driver = new CodexDriver();
+  const resume = (mode: { kind: string }, sessionId: string | null = "thread-1") => driver.buildThreadRequest({
+    agentId: "agent-1",
+    config: {
+      ...codexConfig,
+      sessionId,
+      runtimeConfig: { version: 1, runtime: "codex", model: { kind: "preset", id: "gpt-5.5" }, mode },
+    } as any,
+    standingPrompt: "SP1",
+    prompt: "dynamic",
+    workingDirectory: "/tmp/agent",
+    slockCliPath: "/tmp/cli.js",
+    daemonApiKey: "token",
+  });
+
+  const fast = resume({ kind: "fast" });
+  assert.equal(fast.method, "thread/resume");
+  assert.equal(fast.params.serviceTier, "fast");
+
+  const normal = resume({ kind: "default" });
+  assert.equal(normal.method, "thread/resume");
+  assert.ok("serviceTier" in normal.params, "sent explicitly: an absent tier keeps the session's saved one on Codex 0.164+");
+  assert.equal(normal.params.serviceTier, null);
+
+  const fresh = resume({ kind: "default" }, null);
+  assert.equal(fresh.method, "thread/start");
+  assert.ok("serviceTier" in fresh.params, "sent explicitly on start too");
+  assert.equal(fresh.params.serviceTier, null);
+  assert.equal(resume({ kind: "fast" }, null).params.serviceTier, "fast");
 });
 
 test("codex driver reads nested error.message from app-server error notifications", () => {
@@ -3174,7 +3300,7 @@ test("resolveCodexSpawn runs the Windows npm entry through packaged Electron's N
     execFileSyncFn: ((command: string, args?: readonly string[], options?: { env?: NodeJS.ProcessEnv }) => {
       if (command === "npm") return Buffer.from(`${globalRoot}\r\n`);
       if (command === electronExecutable) {
-        assert.deepEqual(args, [npmEntry, "app-server", "--help"]);
+        assert.deepEqual(args, [...ELECTRON_NODE_SCRIPT_EXEC_ARGV, npmEntry, "app-server", "--help"]);
         assert.equal(options?.env?.BASE_ENV, "present");
         assert.equal(options?.env?.ELECTRON_RUN_AS_NODE, "1");
         return Buffer.from("Usage: codex app-server\r\n");
@@ -3188,7 +3314,7 @@ test("resolveCodexSpawn runs the Windows npm entry through packaged Electron's N
   } as any);
 
   assert.equal(result.command, electronExecutable);
-  assert.deepEqual(result.args, [npmEntry, "app-server", "--listen", "stdio://"]);
+  assert.deepEqual(result.args, [...ELECTRON_NODE_SCRIPT_EXEC_ARGV, npmEntry, "app-server", "--listen", "stdio://"]);
   assert.equal(result.shell, false);
   assert.equal(result.env?.BASE_ENV, "present");
   assert.equal(result.env?.ELECTRON_RUN_AS_NODE, "1");
@@ -3272,8 +3398,82 @@ test("resolveCodexSpawn in a Windows SEA runs the PATH wrapper's entry with the 
     args: [npmEntry, "app-server", "--listen", "stdio://"],
     shell: false,
     source: "path",
+    // The OAR host launches the shim itself (oarCodexLaunch.ts).
+    windowsShim: shim,
+    rejectedCandidateCount: 1,
+    rejectionKind: "node_host",
   });
   assert.ok(!invoked.includes(seaExecutable));
+  clearCodexProbeCacheForTests();
+});
+
+// npm's shim (OAR recognises it: one `%dp0%`-relative script) and a scoop-style
+// one naming its target by absolute path (Raft resolves it; OAR would go through cmd.exe).
+const NPM_CODEX_SHIM = 'CALL :find_dp0\r\nendLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%\\node_modules\\@openai\\codex\\bin\\codex.js" %*\r\n';
+const ABSOLUTE_CODEX_SHIM = '@"C:\\Program Files\\nodejs\\node.exe" "C:\\Users\\bot\\AppData\\Roaming\\npm\\node_modules\\@openai\\codex\\bin\\codex.js" %*\r\n';
+
+test("the Windows npm entry's launch names npm's global shim beside `npm root -g` for the OAR host, only a shim OAR runs without cmd.exe (sync and async)", async () => {
+  const nodeExecutable = String.raw`C:\Program Files\nodejs\node.exe`;
+  const globalRoot = String.raw`C:\Users\bot\AppData\Roaming\npm\node_modules`;
+  const npmEntry = String.raw`C:\Users\bot\AppData\Roaming\npm\node_modules\@openai\codex\bin\codex.js`;
+  const shim = String.raw`C:\Users\bot\AppData\Roaming\npm\codex.cmd`;
+  const stand = ((command: string, args?: readonly string[]) => {
+    if (command === "npm") return Buffer.from(`${globalRoot}\r\n`);
+    if (command === nodeExecutable) return Buffer.from(args?.includes("--version") ? "codex-cli 0.149.0\r\n" : "Usage: codex app-server\r\n");
+    if (command === "powershell.exe") throw new Error("codex is not on PATH");
+    throw new Error(`unexpected command ${command}`);
+  }) as unknown as typeof execFileSync;
+  const deps = (shimText: string | null) => ({
+    platform: "win32" as const,
+    env: { BASE_ENV: "present" },
+    execPath: nodeExecutable,
+    execIsElectron: false,
+    execIsSea: false,
+    hasNodeRuntime: true,
+    windowsEnvironmentReaderFn: () => ({}),
+    existsSyncFn: (candidate: string) => candidate === npmEntry || (shimText !== null && candidate === shim),
+    readFileSyncFn: (file: string) => {
+      assert.equal(file, shim);
+      return shimText ?? "";
+    },
+    execFileSyncFn: stand,
+    runProbeChildFn: viaProbeChild(stand),
+  });
+  for (const [shimText, expected] of [[NPM_CODEX_SHIM, shim], [ABSOLUTE_CODEX_SHIM, undefined], [null, undefined]] as const) {
+    clearCodexProbeCacheForTests();
+    const viaSync = resolveCodexSpawn(["app-server"], deps(shimText));
+    assert.equal(viaSync.source, "npm_global");
+    assert.deepEqual([viaSync.command, ...viaSync.args], [nodeExecutable, npmEntry, "app-server"]);
+    assert.equal(viaSync.windowsShim, expected, String(shimText));
+    clearCodexProbeCacheForTests();
+    const viaAsync = await resolveCodexSpawnAsync(["app-server"], deps(shimText));
+    assert.deepEqual(viaAsync, viaSync);
+  }
+  clearCodexProbeCacheForTests();
+});
+
+test("CODEX_BIN naming a .cmd: the launch names it for the OAR host only when OAR runs it without cmd.exe", () => {
+  const shim = String.raw`C:\Users\bot\AppData\Roaming\npm\codex.cmd`;
+  const siblingNode = String.raw`C:\Users\bot\AppData\Roaming\npm\node.exe`;
+  const npmEntry = String.raw`C:\Users\bot\AppData\Roaming\npm\node_modules\@openai\codex\bin\codex.js`;
+  for (const [shimText, expected] of [[NPM_CODEX_SHIM, shim], [ABSOLUTE_CODEX_SHIM, undefined]] as const) {
+    clearCodexProbeCacheForTests();
+    const result = resolveCodexSpawn(["app-server"], {
+      platform: "win32",
+      env: { CODEX_BIN: shim },
+      existsSyncFn: (candidate) => [shim, siblingNode, npmEntry].includes(candidate),
+      readFileSyncFn: () => shimText,
+      windowsEnvironmentReaderFn: () => ({}),
+      execFileSyncFn: ((command: string, args?: readonly string[]) => {
+        // The node the driver picks for the shim (the daemon's own Node host here).
+        if (args?.includes(npmEntry)) return Buffer.from(args.includes("--version") ? "codex-cli 0.149.0\r\n" : "Usage: codex app-server\r\n");
+        throw new Error(`unexpected command ${command}`);
+      }) as any,
+    });
+    assert.equal(result.source, "explicit_bin");
+    assert.deepEqual(result.args.slice(-2), [npmEntry, "app-server"]);
+    assert.equal(result.windowsShim, expected, shimText);
+  }
   clearCodexProbeCacheForTests();
 });
 
@@ -3311,7 +3511,103 @@ test("resolveCodexSpawn skips an npm JS entry in a Windows SEA and selects the n
     args: ["app-server", "--listen", "stdio://"],
     shell: false,
     source: "desktop_install",
+    rejectedCandidateCount: 1,
+    rejectionKind: "node_host",
   });
+  clearCodexProbeCacheForTests();
+});
+
+/**
+ * Windows discovery with OAR listing the Desktop build CLIs (OAR's own
+ * `desktopBuildExecutables`, which reads and orders the build folders, is
+ * tested in OAR): `builds` is what it answers per `bin` folder, newest first.
+ */
+function windowsDesktopBuildDeps(options: {
+  existing: readonly string[];
+  builds: Record<string, string[]>;
+  versions: Record<string, string>;
+}) {
+  return {
+    platform: "win32" as const,
+    env: {
+      PATH: String.raw`C:\Windows\System32`,
+      LOCALAPPDATA: String.raw`C:\Users\bot\AppData\Local`,
+    },
+    execIsElectron: false,
+    existsSyncFn: (candidate: string) => options.existing.includes(candidate),
+    codexDesktopBuildsFn: (bin: string) => options.builds[bin] ?? [],
+    windowsEnvironmentReaderFn: () => ({}),
+    execFileSyncFn: ((command: string, args?: readonly string[]) => {
+      if (command === "npm") throw new Error("npm is not installed");
+      if (command === "powershell.exe") throw new Error("codex is not on PATH");
+      const version = options.versions[command];
+      if (version === undefined) throw new Error(`${command} is broken`);
+      if (args?.[0] === "app-server") return Buffer.from("Usage: codex app-server\r\n");
+      if (args?.[0] === "--version") return Buffer.from(`codex-cli ${version}\r\n`);
+      throw new Error(`unexpected command ${command}`);
+    }) as any,
+  };
+}
+
+const DESKTOP_BIN = String.raw`C:\Users\bot\AppData\Local\OpenAI\Codex\bin`;
+const DESKTOP_OLD_BUILD = String.raw`C:\Users\bot\AppData\Local\OpenAI\Codex\bin\0a1b2c3d4e5f6071\codex.exe`;
+const DESKTOP_NEW_BUILD = String.raw`C:\Users\bot\AppData\Local\OpenAI\Codex\bin\5449c1f0f26f1f98\codex.exe`;
+
+test("Codex Desktop builds under bin\\<build hash> are discovery candidates; arbitration takes the newest version", () => {
+  clearCodexProbeCacheForTests();
+  const result = resolveCodexSpawn(["app-server", "--listen", "stdio://"], windowsDesktopBuildDeps({
+    existing: [DESKTOP_OLD_BUILD, DESKTOP_NEW_BUILD],
+    // Listed oldest first: arbitration, not the listing order, picks the newest version.
+    builds: { [DESKTOP_BIN]: [DESKTOP_OLD_BUILD, DESKTOP_NEW_BUILD] },
+    versions: { [DESKTOP_OLD_BUILD]: "0.149.0", [DESKTOP_NEW_BUILD]: "0.150.0" },
+  }));
+  assert.equal(result?.command, DESKTOP_NEW_BUILD);
+  assert.equal(result?.source, "desktop_install");
+  clearCodexProbeCacheForTests();
+});
+
+test("a broken newest Codex Desktop build falls through to an older working one", () => {
+  clearCodexProbeCacheForTests();
+  const result = resolveCodexSpawn(["app-server", "--listen", "stdio://"], windowsDesktopBuildDeps({
+    existing: [DESKTOP_OLD_BUILD, DESKTOP_NEW_BUILD],
+    builds: { [DESKTOP_BIN]: [DESKTOP_NEW_BUILD, DESKTOP_OLD_BUILD] },
+    // The newest build is half-installed: it answers no probe.
+    versions: { [DESKTOP_OLD_BUILD]: "0.149.0" },
+  }));
+  assert.equal(result?.command, DESKTOP_OLD_BUILD);
+  assert.equal(result?.source, "desktop_install");
+  assert.equal(result?.rejectedCandidateCount, 1);
+  clearCodexProbeCacheForTests();
+});
+
+test("the fixed Codex Desktop bin\\codex.exe is still found, and no Desktop install gives no command", () => {
+  clearCodexProbeCacheForTests();
+  const fixed = String.raw`C:\Users\bot\AppData\Local\OpenAI\Codex\bin\codex.exe`;
+  assert.equal(resolveCodexCommand(windowsDesktopBuildDeps({
+    existing: [fixed, DESKTOP_NEW_BUILD],
+    builds: { [DESKTOP_BIN]: [DESKTOP_NEW_BUILD] },
+    versions: { [fixed]: "0.150.0", [DESKTOP_NEW_BUILD]: "0.150.0" },
+  })), fixed);
+  assert.equal(resolveCodexCommand(windowsDesktopBuildDeps({
+    existing: [],
+    builds: {},
+    versions: {},
+  })), null);
+  clearCodexProbeCacheForTests();
+});
+
+test("only OAR's Desktop codex.exe entries are Desktop candidates, not its npm codex.cmd shim", () => {
+  clearCodexProbeCacheForTests();
+  // OAR lists `%APPDATA%\npm\codex.cmd` first; Raft finds npm installs through `npm root -g` and PATH.
+  const npmShim = String.raw`C:\Users\bot\AppData\Roaming\npm\codex.cmd`;
+  const deps = windowsDesktopBuildDeps({
+    existing: [npmShim, DESKTOP_NEW_BUILD],
+    builds: { [DESKTOP_BIN]: [DESKTOP_NEW_BUILD] },
+    versions: { [npmShim]: "0.151.0", [DESKTOP_NEW_BUILD]: "0.150.0" },
+  });
+  const result = resolveCodexSpawn(["app-server", "--listen", "stdio://"], { ...deps, env: { ...deps.env, APPDATA: String.raw`C:\Users\bot\AppData\Roaming` } });
+  assert.equal(result?.command, DESKTOP_NEW_BUILD);
+  assert.equal(result?.source, "desktop_install");
   clearCodexProbeCacheForTests();
 });
 
@@ -3435,6 +3731,7 @@ test("Codex inventory and spawn fall back to the native Windows install when the
       args: ["app-server", "--listen", "stdio://"],
       shell: false,
       source: "desktop_install",
+      rejectedCandidateCount: 0,
     },
   );
   assert.equal(pathProbeCount, 4);
@@ -3630,20 +3927,6 @@ test("resolveCodexSpawn selects higher version among PATH and desktop candidates
   });
   assert.equal(result.command, desktop);
   assert.equal(result.source, "desktop_bundle");
-});
-
-test("resolveCodexSpawn error mentions PATH and daemon restart", () => {
-  assert.throws(
-    () => resolveCodexSpawn(["app-server"], {
-      platform: "darwin",
-      env: { PATH: "/no/codex/here" },
-      existsSyncFn: () => false,
-      execFileSyncFn: ((() => {
-        throw new Error("should not run");
-      }) as typeof import("node:child_process").execFileSync),
-    }),
-    /PATH=.*Restart the Raft daemon/s,
-  );
 });
 
 test("codex probe cache reuses exec on same path mtime/size and re-probes on change", () => {
@@ -4164,4 +4447,61 @@ test("task #1277 (launch): a codex launch cancelled while the candidate search r
     if (previous.SCRIPTED_CODEX_LOG === undefined) delete process.env.SCRIPTED_CODEX_LOG; else process.env.SCRIPTED_CODEX_LOG = previous.SCRIPTED_CODEX_LOG;
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("#proj-runtime:#41: codex driver stops one sub-agent's running turn, leaving the agent's turn alone", () => {
+  const driver = new CodexDriver();
+  driver.parseLine(JSON.stringify({ method: "thread/started", params: { thread: { id: "thread-1" } } }));
+  driver.parseLine(JSON.stringify({ method: "turn/started", params: { threadId: "thread-1", turn: { id: "turn-1" } } }));
+  driver.parseLine(JSON.stringify({
+    method: "item/completed",
+    params: { threadId: "thread-1", item: { type: "collabAgentToolCall", id: "call_2", tool: "spawnAgent", status: "completed", receiverThreadIds: ["child-1"], agentsStates: { "child-1": { status: "pendingInit" } } } },
+  }));
+  assert.equal(driver.encodeSubagentInterruptRequest("child-1"), null, "its turn has not started yet");
+  driver.parseLine(JSON.stringify({ method: "turn/started", params: { threadId: "child-1", turn: { id: "child-turn-1" } } }));
+  assert.equal(driver.encodeSubagentInterruptRequest("other"), null, "no such sub-agent");
+
+  const line = driver.encodeSubagentInterruptRequest("child-1");
+  assert.ok(line);
+  const request = JSON.parse(line);
+  assert.equal(request.method, "turn/interrupt");
+  assert.deepEqual(request.params, { threadId: "child-1", turnId: "child-turn-1" });
+  // Its answer, even a refusal, is not the agent's error or a delivery result.
+  assert.deepEqual(driver.parseLine(JSON.stringify({ id: request.id, error: { message: "no such turn" } })), []);
+  // The sub-agent's turn ends as stopped; the agent's turn is still running.
+  const ended = driver.parseLine(JSON.stringify({ method: "turn/completed", params: { threadId: "child-1", turn: { id: "child-turn-1", status: "interrupted" } } }));
+  assert.deepEqual(ended.map((event) => [event.kind, (event as { taskStatus?: string }).taskStatus]), [["subagent_progress", "stopped"]]);
+  assert.equal(driver.hasLiveTurn, true);
+});
+
+test("#wg-ax:#3: Codex thread fields are Raft's decisions before any wire shape; the legacy request is built from them", () => {
+  const fresh = makeSpawnContext("/work", { model: "gpt-5.5", reasoningEffort: "high" } as never);
+  assert.deepEqual(codexThreadFields(fresh), { cwd: "/work", developerInstructions: "stand still", model: "gpt-5.5", reasoningEffort: "high", fast: false });
+  const freshRequest = buildCodexThreadRequest(fresh);
+  assert.equal(freshRequest.method, "thread/start");
+  assert.equal(freshRequest.params.serviceTier, null, "the default tier is an explicit clear");
+  assert.deepEqual(freshRequest.params.config, { model_reasoning_effort: "high" });
+
+  const resumed = makeSpawnContext("/work", { sessionId: "thread-9" } as never);
+  assert.equal(codexThreadFields(resumed).resumeThreadId, "thread-9");
+  const resumeRequest = buildCodexThreadRequest(resumed);
+  assert.equal(resumeRequest.method, "thread/resume");
+  assert.equal(resumeRequest.params.threadId, "thread-9");
+  assert.equal(resumeRequest.params.excludeTurns, true);
+  assert.equal(resumeRequest.params.developerInstructions, "stand still", "re-sent on resume");
+  // The driver's own method is the same request.
+  assert.deepEqual(new CodexDriver().buildThreadRequest(resumed), resumeRequest);
+});
+
+test("#oar-raft:#7: on Windows anything under .codex\\.sandbox-bin is a sandbox helper, whatever its file name", async () => {
+  const helper = "C:\\Users\\user\\.codex\\.sandbox-bin\\codex.exe";
+  const deps = {
+    platform: "win32" as const,
+    env: { CODEX_BIN: helper, PATH: "" },
+    existsSyncFn: (p: string) => String(p) === helper,
+    execFileSyncFn: (() => Buffer.from("")) as unknown as typeof execFileSync,
+    runProbeChildFn: (async () => ({ stdout: "", stderr: "" })) as typeof runProbeChild,
+  };
+  assert.throws(() => resolveCodexSpawn(["app-server"], deps), /CODEX_BIN.*sandbox helper \(codex-command-runner or \.sandbox-bin\)/s);
+  await assert.rejects(resolveCodexSpawnAsync(["app-server"], deps), /CODEX_BIN.*sandbox helper \(codex-command-runner or \.sandbox-bin\)/s);
 });

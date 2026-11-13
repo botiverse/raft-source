@@ -22,7 +22,8 @@ export function messageReactionParentScopeKey(
 ): SyncScopeKey {
   return {
     serverId,
-    scopeKind: message.conversationContext?.channelType === "thread" ? "thread" : "channel",
+    // A task conversation (task v2) is a sub-conversation like a thread.
+    scopeKind: message.conversationContext?.channelType === "thread" || message.conversationContext?.channelType === "task" ? "thread" : "channel",
     scopeId: message.channelId,
   };
 }

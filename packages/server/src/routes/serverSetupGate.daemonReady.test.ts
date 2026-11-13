@@ -22,7 +22,7 @@ import {
   resolveServerSetupLiveFacts,
 } from "../services/serverSetupStateService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 // task #207 — the setup gate must be proven to OPEN, not only to stay shut.
 //
@@ -95,6 +95,9 @@ function makeAvailableReplicaStateStore(): ReplicaStateStore {
     compareAndSetWakeCrashLoopState: async () => true,
     setAgentRuntimeError: async () => {},
     getAgentRuntimeError: async () => null,
+    setAgentContextViewAvailability: async () => {},
+    getAgentContextViewAvailability: async () => null,
+    clearAgentContextViewAvailability: async () => {},
     setMachineMeta: async () => {},
     getMachineMeta: async () => null,
     clearMachineMeta: async () => {},

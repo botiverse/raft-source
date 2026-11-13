@@ -17,7 +17,7 @@ import pg from "pg";
 import { migrateRealPgTestDatabase } from "../test/integration/realPgMigrate";
 import type { ServerRole } from "@botiverse/raft-shared";
 import { closeDatabase, getDb, initDatabase } from "../db/index";
-import { agentMigrations, agents, machines, serverMembers, servers, users } from "../db/schema";
+import { agentMigrations, agents, channels, machines, serverMembers, servers, users } from "../db/schema";
 import {
   agentMigrationGeneration,
   beginAgentMigrationProvisioning,
@@ -220,8 +220,11 @@ async function raceWriteAgainst<T>(
 
 type MembershipChange = "removal" | "demotion" | "demotion in transitionMemberRole's lock order";
 
-/** The uncommitted change, and the lock the fenced write must be seen waiting on while it is held. */
-function membershipChange(change: MembershipChange, seeded: Seeded, demotedRole: ServerRole) {
+/**
+ * The uncommitted change, and the lock the fenced write must be seen waiting on while it is held. A demotion to Guest
+ * binds the actor to `guestChannelId`, as every Guest is bound to its one channel (#wg-rbac:#15).
+ */
+function membershipChange(change: MembershipChange, seeded: Seeded, demotedRole: ServerRole, guestChannelId: string | null = null) {
   const { server, actor } = seeded;
   if (change === "removal") {
     return {
@@ -235,7 +238,7 @@ function membershipChange(change: MembershipChange, seeded: Seeded, demotedRole:
     return {
       waitsOn: MEMBER_ROW_WAIT,
       prepare: async (session: pg.PoolClient) => {
-        await session.query("UPDATE server_members SET role = $3 WHERE server_id = $1 AND user_id = $2", [server.id, actor.id, demotedRole]);
+        await session.query("UPDATE server_members SET role = $3, guest_channel_id = $4 WHERE server_id = $1 AND user_id = $2", [server.id, actor.id, demotedRole, guestChannelId]);
       },
     };
   }
@@ -244,7 +247,7 @@ function membershipChange(change: MembershipChange, seeded: Seeded, demotedRole:
     waitsOn: SERVERS_ROW_WAIT,
     prepare: async (session: pg.PoolClient) => {
       await session.query("SELECT id FROM servers WHERE id = $1 FOR UPDATE", [server.id]);
-      await session.query("UPDATE server_members SET role = $3 WHERE server_id = $1 AND user_id = $2", [server.id, actor.id, demotedRole]);
+      await session.query("UPDATE server_members SET role = $3, guest_channel_id = $4 WHERE server_id = $1 AND user_id = $2", [server.id, actor.id, demotedRole, guestChannelId]);
     },
   };
 }
@@ -326,9 +329,10 @@ for (const change of CHANGES) {
     await withRealPg(async (observer) => {
       // Members hold controlAgentRuntime; only guests lose it.
       const seeded = await seed("member");
+      const [guestHome] = await getDb().insert(channels).values({ serverId: seeded.server.id, name: `guest-home-${randomUUID().slice(0, 8)}`, type: "private" }).returning();
       const migration = await seedStarting(seeded);
       const before = await migrationSnapshot(observer, migration.id, seeded.agent.id);
-      const { waitsOn, prepare } = membershipChange(change, seeded, "guest");
+      const { waitsOn, prepare } = membershipChange(change, seeded, "guest", guestHome!.id);
       const outcome = await raceWriteAgainst(observer, waitsOn, prepare, () => completeAgentMigrationAutoStart({
         migrationId: migration.id,
         agentId: seeded.agent.id,
@@ -391,7 +395,6 @@ async function writeFirstAgainstTransition<T>(
       actorUserId: seeded.owner.id,
       targetUserId: seeded.actor.id,
       nextRole,
-      guestTransitionsEnabled: true,
     }));
     // Behind the frozen write on `servers` (this order) or on the actor's member row (an order without the `servers` lock).
     await waitForLockWaiter(observer, "%for update%", writePid);

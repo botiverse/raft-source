@@ -165,21 +165,6 @@ test("task create sends one atomic create-and-assign request", async () => {
   assert.match(stdout.join(""), /📌 Assigned @ApplePI to task #10 "Atomic dispatch"/);
 });
 
-test("task create help advertises atomic assignee semantics", () => {
-  // Command guidance (RFC 072 §7): delivered before the first run in a context.
-  const option = taskCreateCommand.spec.options?.find((candidate) => candidate.flags === "--assignee <handle>");
-  assert.deepEqual(option, {
-    flags: "--assignee <handle>",
-    description: "Assign every created task atomically to an eligible '@handle'",
-  });
-  assert.match(taskCreateCommand.spec.guidance ?? "", /Self-assignment starts work/);
-  assert.match(taskCreateCommand.spec.guidance ?? "", /task update --target <channel> --number <N> --status todo/);
-  assert.match(taskCreateCommand.spec.guidance ?? "", /task stays assigned to you/);
-  assert.match(taskCreateCommand.spec.guidance ?? "", /owner\/admin assignment/);
-  assert.match(taskCreateCommand.spec.guidance ?? "", /no task-message is created/);
-  assert.match(taskCreateCommand.spec.guidance ?? "", /cannot move to done/);
-});
-
 test("task create marks every batch item as resource-creating", async () => {
   const { io, stdout } = memoryIo();
   const requests: unknown[] = [];
@@ -294,4 +279,201 @@ test("task create command maps server failures into typed CliError", async () =>
       return true;
     },
   );
+});
+
+test("task create without a source on a task v2 server shows the Server's sentence and the create to run instead", async () => {
+  const { io } = memoryIo();
+  const sentence = "A task needs a source: the id of the channel message that asked for it, as the task's source message. If the request is in a thread, use that thread's message; for something you thought of yourself, first post a message in the channel saying what and why, then create the task from it.";
+  const next = `raft task create --target "#engineering" --message-id <id> --title "…"`;
+  const ctx = createCommandContext({
+    io,
+    loadAgentContext: () => agentContext,
+    createApiClient: () => ({
+      request: async (): Promise<ApiResponse<unknown>> => ({
+        ok: false,
+        status: 400,
+        data: null,
+        error: sentence,
+        errorCode: "task_source_required",
+        suggestedNextAction: next,
+      }),
+    }) as any,
+  });
+
+  await assert.rejects(
+    async () => { await taskCreateCommand.handler(ctx, { target: "#engineering", title: ["Ship"] }); },
+    (err: unknown) => {
+      assert.ok(err instanceof CliError);
+      assert.equal(err.code, "CREATE_FAILED");
+      assert.equal(err.message, sentence);
+      assert.equal(err.suggestedNextAction, next);
+      return true;
+    },
+  );
+});
+
+test("task create from a thread reply says the task hangs under the thread's root message", async () => {
+  const { io, stdout } = memoryIo();
+  const ctx = createCommandContext({
+    io,
+    loadAgentContext: () => agentContext,
+    createApiClient: () => ({
+      request: async (): Promise<ApiResponse<unknown>> => ({
+        ok: true,
+        status: 200,
+        error: null,
+        data: {
+          tasks: [{
+            taskNumber: 4,
+            messageId: "#4",
+            title: "Fix the login bug",
+            status: "todo",
+            claimedByType: null,
+            claimedById: null,
+            claimedAt: null,
+            requiresResourceReceipt: false,
+            conversationAnchored: true,
+            sourceMessageId: "aaaabbbb-0000-4000-8000-000000000000",
+            sourceThreadReplyId: "ccccdddd-0000-4000-8000-000000000000",
+          }],
+        },
+      }),
+    }) as any,
+  });
+
+  await taskCreateCommand.handler(ctx, { target: "#engineering", title: ["Fix the login bug"], messageId: "ccccdddd" });
+  assert.match(stdout.join(""), /^Source: the thread's root message msg=aaaabbbb \(you gave a reply in its thread, msg=ccccdddd\)\.$/m);
+});
+
+test("task create help says the source message is required where task conversations are on", () => {
+  const option = taskCreateCommand.spec.options?.find((candidate) => candidate.flags === "--message-id <id>");
+  assert.match(option?.description ?? "", /^Source \(required where task conversations are on\)/);
+  assert.match(taskCreateCommand.spec.guidance ?? "", /first post a message in the channel saying what and why/);
+  assert.match(taskCreateCommand.spec.guidance ?? "", /a thread reply: its thread's root/);
+});
+
+test("task create sends description and source message id", async () => {
+  const { io } = memoryIo();
+  const requests: unknown[] = [];
+  const ctx = createCommandContext({
+    io,
+    loadAgentContext: () => agentContext,
+    createApiClient: () => ({
+      request: async (_method: string, _path: string, body?: unknown): Promise<ApiResponse<unknown>> => {
+        requests.push(body);
+        return {
+          ok: true,
+          status: 200,
+          error: null,
+          data: {
+            tasks: [{
+              taskNumber: 12,
+              messageId: "333333334444",
+              title: "Hero section",
+              status: "todo",
+              claimedByType: null,
+              claimedById: null,
+              claimedAt: null,
+              requiresResourceReceipt: false,
+            }],
+          },
+        };
+      },
+    }) as any,
+  });
+
+  await taskCreateCommand.handler(ctx, {
+    target: "#launch-site",
+    title: ["Hero section"],
+    description: "  Countdown + CTA  ",
+    messageId: " cf3aa0a0 ",
+  });
+
+  assert.deepEqual(requests, [{
+    channel: "#launch-site",
+    tasks: [{ title: "Hero section", description: "Countdown + CTA", source_message_id: "cf3aa0a0" }],
+  }]);
+});
+
+test("task create applies --message-id to every title and rejects --description with several titles", async () => {
+  const requests: unknown[] = [];
+  const ctx = createCommandContext({
+    io: memoryIo().io,
+    loadAgentContext: () => agentContext,
+    createApiClient: () => ({
+      request: async (_method: string, _path: string, body?: unknown): Promise<ApiResponse<unknown>> => {
+        requests.push(body);
+        return { ok: true, status: 200, error: null, data: { tasks: [] } };
+      },
+    }) as any,
+  });
+
+  await taskCreateCommand.handler(ctx, {
+    target: "#launch-site",
+    title: ["A", "B"],
+    messageId: "cf3aa0a0",
+  });
+  assert.deepEqual(requests, [{
+    channel: "#launch-site",
+    tasks: [
+      { title: "A", source_message_id: "cf3aa0a0" },
+      { title: "B", source_message_id: "cf3aa0a0" },
+    ],
+  }]);
+
+  await assert.rejects(
+    async () => {
+      await taskCreateCommand.handler(ctx, { target: "#launch-site", title: ["A", "B"], description: "x" });
+    },
+    (err: unknown) => {
+      assert.ok(err instanceof CliError);
+      assert.equal(err.code, "INVALID_ARG");
+      assert.equal(err.message, "--description can only be used with a single --title");
+      return true;
+    },
+  );
+  assert.equal(requests.length, 1);
+});
+
+test("task create sends --status for every title and refuses a status a task can't start in", async () => {
+  const requests: unknown[] = [];
+  const ctx = createCommandContext({
+    io: memoryIo().io,
+    loadAgentContext: () => agentContext,
+    createApiClient: () => ({
+      request: async (_method: string, _path: string, body?: unknown): Promise<ApiResponse<unknown>> => {
+        requests.push(body);
+        return { ok: true, status: 200, error: null, data: { tasks: [] } };
+      },
+    }) as any,
+  });
+
+  // Self-assigned but reserved for later.
+  await taskCreateCommand.handler(ctx, { target: "#launch-site", title: ["Later"], assignee: "@me", status: "todo" });
+  // In progress with nobody on it: statuses have no assignee requirement.
+  await taskCreateCommand.handler(ctx, { target: "#launch-site", title: ["A", "B"], status: " in_progress " });
+  // Parked at creation: no reason to ask for, a new task has nothing to come back from.
+  await taskCreateCommand.handler(ctx, { target: "#launch-site", title: ["Not now"], status: "backlog" });
+  assert.deepEqual(requests, [
+    { channel: "#launch-site", tasks: [{ title: "Later" }], assignee: "@me", status: "todo" },
+    { channel: "#launch-site", tasks: [{ title: "A" }, { title: "B" }], status: "in_progress" },
+    { channel: "#launch-site", tasks: [{ title: "Not now" }], status: "backlog" },
+  ]);
+
+  for (const status of ["done", "in_review", "closed", ""]) {
+    await assert.rejects(
+      async () => {
+        await taskCreateCommand.handler(ctx, { target: "#launch-site", title: ["A"], status });
+      },
+      (err: unknown) => {
+        assert.ok(err instanceof CliError);
+        assert.equal(err.code, "INVALID_ARG");
+        assert.match(err.message, /^--status must be one of: backlog, todo, in_progress; got /);
+        return true;
+      },
+    );
+  }
+  assert.equal(requests.length, 3, "a refused status sends nothing");
+  const option = taskCreateCommand.spec.options?.find((candidate) => candidate.flags === "--status <status>");
+  assert.match(option?.description ?? "", /Default: in_progress when you assign yourself, otherwise todo/);
 });

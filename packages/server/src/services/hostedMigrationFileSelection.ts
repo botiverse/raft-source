@@ -20,6 +20,8 @@ import type { AgentMigrationHostedImportLimits, AgentMigrationHostedImportSummar
 const HOSTED_IMPORT_PATH = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/;
 /** Names the provider keeps for its own state files. */
 const HOSTED_RESERVED_PATHS = new Set(["memory", "todo", "journal"]);
+/** The workspace ignore files a Computer reads; they mean nothing to the provider. */
+const HOSTED_RAFT_IGNORE_FILES = new Set([".raftmigrateignore", ".raftbackupignore", ".raftbackupignore.user"]);
 /** How many skipped paths a summary names per reason. */
 export const HOSTED_IMPORT_SUMMARY_PATHS_PER_REASON = 20;
 
@@ -42,7 +44,7 @@ export function classifyHostedImportEntry(
   if (
     segments[0] === ".raft"
     || segments[0] === ".raft-migration"
-    || entry.path === ".raftmigrateignore"
+    || HOSTED_RAFT_IGNORE_FILES.has(entry.path)
   ) {
     return "raft_state";
   }

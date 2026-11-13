@@ -39,7 +39,7 @@ const CASES: Case[] = [
       reasoningEffort: "high", fastMode: true, command: "/usr/local/bin/claude", envVars: { A: "1" },
     },
     declared: { provider: "default", apiUrl: "https://other.example.test" },
-    undeclared: { model: "opus", reasoningEffort: "low", fastMode: false, command: "claude", envVars: { B: "2" } },
+    undeclared: { authType: "auth_token", model: "opus", reasoningEffort: "low", fastMode: false, command: "claude", envVars: { B: "2" } },
     equivalent: [{ apiUrl: "https://gw.example.test/" }, { apiUrl: "  https://gw.example.test//  " }],
   },
   {
@@ -61,7 +61,7 @@ const CASES: Case[] = [
       loadLocalPlugins: false, model: "example-model", envVars: { A: "1" },
     },
     declared: { providerId: "anthropic-compatible", baseUrl: "https://other.example.test/v1" },
-    undeclared: { supportsImageInput: true, loadLocalPlugins: true, model: "other-model", envVars: { B: "2" } },
+    undeclared: { reasoningEffort: "xhigh", supportsImageInput: true, loadLocalPlugins: true, model: "other-model", envVars: { B: "2" }, contextWindow: "64000", maxOutputTokens: "16000" },
     equivalent: [{ baseUrl: "https://gw.example.test/v1/" }, { baseUrl: " https://gw.example.test/v1 " }],
   },
 ];

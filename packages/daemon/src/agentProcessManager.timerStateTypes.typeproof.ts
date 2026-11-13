@@ -30,13 +30,10 @@ const readyStartupWithTimer: AgentProcessStartupState = {
 // @ts-expect-error Inactive compaction cannot retain a watchdog handle.
 const inactiveCompactionWithWatchdog: AgentProcessCompactionState = { kind: "none", watchdog: timeoutHandle };
 
-const exitedWithStalledRecoveryTimer: AgentProcessExitState = {
-  kind: "exited",
-  code: null,
-  signal: null,
-  // @ts-expect-error Exited process cannot retain the stalled-recovery escalation timer.
-  stalledRecoverySigtermTimer: timeoutHandle,
-};
+// Reconciler step 5: no process state holds a stop-escalation timer; the
+// escalation lives in RuntimeSession.stop.
+// @ts-expect-error A live process cannot retain a stop-escalation timer.
+const liveWithStopTimer: AgentProcessExitState = { kind: "live", stalledRecoverySigtermTimer: timeoutHandle };
 
 // @ts-expect-error Pending trajectory state cannot exist without a live coalescing timer.
 const pendingTrajectoryWithoutTimer: PendingTrajectoryState = { kind: "text", text: "queued", timer: null };
@@ -53,6 +50,6 @@ const idleRuntimeErrorBackoffWithTimer: RuntimeErrorDeliveryBackoffState = {
 void detachedHeartbeat;
 void readyStartupWithTimer;
 void inactiveCompactionWithWatchdog;
-void exitedWithStalledRecoveryTimer;
+void liveWithStopTimer;
 void pendingTrajectoryWithoutTimer;
 void idleRuntimeErrorBackoffWithTimer;

@@ -16,6 +16,7 @@ import {
   Separator,
   Spinner,
   Textarea,
+  TextLink,
   ListRowGroup,
 } from "@botiverse/raft-ui";
 import { Fragment, useCallback, useEffect, useMemo, useState } from "react";
@@ -38,7 +39,9 @@ import type {
 } from "@botiverse/raft-shared";
 import api from "../../api/client";
 import { useProviderConnections } from "../../hooks/useProviderConnections";
+import { useAuthStore } from "../../store/authStore";
 import { useMachineStore } from "../../store/machineStore";
+import { orderMachinesLikeSidebar } from "../layout/sidebarMachineOrder";
 import { useProfileStore } from "../../store/profileStore";
 import { useServerPermissions } from "../../hooks/useServerPermissions";
 import Tooltip from "../ui/Tooltip";
@@ -51,6 +54,8 @@ import SectionHeader from "../ui/SectionHeader";
 import EditProviderConnectionModal from "./EditProviderConnectionModal";
 import { ManagedConnectionRow } from "./ManagedConnectionRow";
 import { AssignedAgentRow } from "./AssignedAgentRow";
+import { DialogCardFooter, DialogCommit } from "../ui/NarrowDialog";
+import { useLocalComputerMachineId } from "../machine/localComputer/localComputerStore";
 
 function labelForProviderId(
   providerId: ProviderConnectionProviderId,
@@ -143,11 +148,13 @@ export default function ProviderConnectionsSettings() {
   if (!featureEnabled) return null;
 
   return (
-    <div className="mx-auto max-w-3xl space-y-4" data-testid="provider-connections-settings">
-      <div className="flex items-center justify-between gap-3">
-        <SectionHeader label={formatMessage({ id: "settings.providers.sectionTitle" })} icon={<KeyRound size={16} />} />
+    <div id="ai-providers" className="mx-auto max-w-3xl stack-y-4" data-testid="provider-connections-settings">
+      {/* In a narrow settings column Add wraps under the title instead of
+          pushing it off the row. */}
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <SectionHeader className="min-w-0" label={formatMessage({ id: "settings.providers.sectionTitle" })} icon={<KeyRound size={16} />} />
         {capabilities.manageExternalAuth && (
-          <Button type="button" variant="primary" size="sm" disabled={providerOptions.length === 0} onClick={openCreate}>
+          <Button type="button" variant="primary" size="md" disabled={providerOptions.length === 0} onClick={openCreate}>
             <Plus size={16} />
             {formatMessage({ id: "settings.providers.add" })}
           </Button>
@@ -284,14 +291,14 @@ export function ConnectionRow({
   // The assignment list is read once per row and reused across collapse/reopen:
   // it is bounded by the Agents of one Server, and the catalog refresh that
   // follows any mutation already re-reads the authoritative count.
-  const toggleExpanded = () => {
+  const toggleExpanded = useCallback(() => {
     if (expanded) {
       setExpanded(false);
       return;
     }
     setExpanded(true);
     if (assignedAgents === null && !loadingAssignedAgents) void loadAssignedAgents();
-  };
+  }, [expanded, assignedAgents, loadingAssignedAgents, loadAssignedAgents]);
 
   const detachAgent = useCallback(async (agentId: string) => {
     await onDetachAgent?.(agentId);
@@ -304,7 +311,7 @@ export function ConnectionRow({
     <div data-testid={`provider-connection-${connection.id}`}>
       <div className="flex flex-col gap-3 px-4 py-3 sm:flex-row sm:items-center">
         <div className="flex min-w-0 flex-1 items-start gap-3">
-          <span className={`flex size-[35px] shrink-0 items-center justify-center rounded-sticker bg-fill-muted ${ready ? "text-foreground-muted" : "text-foreground-hint"}`}>
+          <span className={`flex size-[35px] shrink-0 items-center justify-center rounded-control bg-fill-muted ${ready ? "text-foreground-muted" : "text-foreground-hint"}`}>
             {ready ? <CheckCircle2 size={18} /> : <XCircle size={18} />}
           </span>
           <div className="min-w-0 flex-1">
@@ -319,9 +326,9 @@ export function ConnectionRow({
               {" · "}
               {assigned ? (
                 <Tooltip content={formatMessage({ id: "settings.providers.assignedAgentsExpand" })}>
-                <button
-                  type="button"
-                  className="inline-flex items-center gap-1 rounded-sticker font-semibold text-foreground underline decoration-[1.5px] underline-offset-[3px] outline-none focus-visible:shadow-focus disabled:cursor-not-allowed disabled:text-foreground-disabled"
+                <TextLink
+                  variant="strong"
+                  className="inline-flex items-center gap-1"
                   aria-expanded={expanded}
                   aria-controls={assignedAgentsId}
                   disabled={busy}
@@ -331,7 +338,7 @@ export function ConnectionRow({
                     ? formatMessage({ id: "settings.providers.agentCountOne" })
                     : formatMessage({ id: "settings.providers.agentCount" }, { count: connection.assignedAgentCount })}
                   <ChevronDown size={14} className={expanded ? "rotate-180" : ""} aria-hidden="true" />
-                </button>
+                </TextLink>
                 </Tooltip>
               ) : formatMessage({ id: "settings.providers.agentCount" }, { count: 0 })}
             </div>
@@ -340,13 +347,13 @@ export function ConnectionRow({
         {canManage && (
           <div className="flex shrink-0 items-center gap-2">
             {legacyTestVisible && (
-              <Button type="button" variant="outline" size="icon-sm" aria-label={formatMessage({ id: "settings.providers.test" })} disabled={busy} onClick={onTest}><Send size={16} /></Button>
+              <Button type="button" variant="outline" size="icon-md" aria-label={formatMessage({ id: "settings.providers.test" })} disabled={busy} onClick={onTest}><Send size={16} /></Button>
             )}
             {onVerify && (
               <Button
                 type="button"
                 variant="outline"
-                size="icon-sm"
+                size="icon-md"
                 aria-label={formatMessage({ id: "settings.providers.verify" })}
                 disabled={busy}
                 onClick={onVerify}
@@ -355,13 +362,13 @@ export function ConnectionRow({
               </Button>
             )}
             {handleEdit && (
-              <Button type="button" variant="outline" size="icon-sm" aria-label={formatMessage({ id: "settings.providers.edit" })} disabled={busy} onClick={handleEdit}><Pencil size={16} /></Button>
+              <Button type="button" variant="outline" size="icon-md" aria-label={formatMessage({ id: "settings.providers.edit" })} disabled={busy} onClick={handleEdit}><Pencil size={16} /></Button>
             )}
-            <Button type="button" variant="outline" size="icon-sm" aria-label={connection.enabled ? formatMessage({ id: "settings.providers.disable" }) : formatMessage({ id: "settings.providers.enable" })} disabled={busy} onClick={onToggle}><Power size={16} /></Button>
+            <Button type="button" variant="outline" size="icon-md" aria-label={connection.enabled ? formatMessage({ id: "settings.providers.disable" }) : formatMessage({ id: "settings.providers.enable" })} disabled={busy} onClick={onToggle}><Power size={16} /></Button>
             <Tooltip content={deleteDisabledReason || formatMessage({ id: "settings.providers.delete" })}>
             <Button
               type="button"
-              size="icon-sm"
+              size="icon-md"
               variant="danger"
               data-slot="button"
               // Keep the "disabled but focusable, with a reason" shape: RUI's
@@ -448,7 +455,7 @@ function AssignedAgentsPanel({
           intent="warning"
           density="sm"
           actions={(
-            <Button type="button" variant="outline" size="sm" disabled={busy} onClick={onRetry}>
+            <Button type="button" variant="outline" size="md" disabled={busy} onClick={onRetry}>
               <RefreshCw size={16} />
               {formatMessage({ id: "settings.providers.assignedAgentsRetry" })}
             </Button>
@@ -574,8 +581,9 @@ function ProviderConnectionTestModal({
       onClose={onClose}
       title={formatMessage({ id: "settings.providers.testTitle" }, { name: connection.name })}
       testId="provider-connection-test-dialog"
+      narrow="sheet"
     >
-      <form onSubmit={submit} className="space-y-4" data-testid="provider-connection-test-form">
+      <form onSubmit={submit} className="stack-y-4 md:pointer-fine:stack-y-3" data-testid="provider-connection-test-form">
         <FormField
           label={formatMessage({ id: "settings.providers.testModel" })}
           htmlFor={isCustom || models.length === 0 ? modelInputId : modelSelectId}
@@ -620,10 +628,9 @@ function ProviderConnectionTestModal({
           )}
         </FormField>
         <div className="flex items-center justify-between gap-3">
-          <p className={`text-caption ${modelError ? "text-danger-strong" : "text-foreground-hint"}`}>
-            {modelError || formatMessage({ id: "settings.providers.testModelHint" })}
-          </p>
-          <Button type="button" variant="outline" size="sm" disabled={loadingModels || submitting} onClick={loadModels}>
+          {/* Only the error: no fill-in hint (HelperText step 1); the empty line keeps Refresh at the end. */}
+          <p className="text-caption text-danger-strong">{modelError}</p>
+          <Button type="button" variant="outline" size="md" disabled={loadingModels || submitting} onClick={loadModels}>
             <RefreshCw size={16} className={loadingModels ? "animate-spin" : ""} />
             {formatMessage({ id: "settings.providers.refreshModels" })}
           </Button>
@@ -642,13 +649,17 @@ function ProviderConnectionTestModal({
           />
         </FormField>
         {error && <Banner intent="warning" density="sm">{error}</Banner>}
-        <div className="flex justify-end gap-2">
+        <DialogCardFooter>
           <Button size="lg" type="button" variant="ghost" onClick={onClose}>{formatMessage({ id: "settings.common.cancel" })}</Button>
-          <Button size="lg" type="submit" variant="primary" disabled={submitting || !model.trim() || !message.trim()}>
-            {submitting ? <Spinner size="sm" aria-hidden="true" /> : <Send size={16} />}
-            {formatMessage({ id: "settings.providers.sendTest" })}
-          </Button>
-        </div>
+          <DialogCommit>
+            {(inHead) => (
+              <Button size={inHead ? "md" : "lg"} type="submit" variant="primary" disabled={submitting || !model.trim() || !message.trim()}>
+                {submitting ? <Spinner size="sm" aria-hidden="true" /> : <Send size={16} />}
+                {formatMessage({ id: "settings.providers.sendTest" })}
+              </Button>
+            )}
+          </DialogCommit>
+        </DialogCardFooter>
       </form>
     </DialogCard>
   );
@@ -711,8 +722,8 @@ function CreateProviderConnectionModal({
   };
 
   return (
-    <DialogCard onClose={onClose} title={formatMessage({ id: "settings.providers.createTitle" })} testId="provider-connection-create-dialog">
-      <form onSubmit={submit} className="space-y-4" data-testid="provider-connection-create-form">
+    <DialogCard onClose={onClose} title={formatMessage({ id: "settings.providers.createTitle" })} testId="provider-connection-create-dialog" narrow="sheet">
+      <form onSubmit={submit} className="stack-y-4 md:pointer-fine:stack-y-3" data-testid="provider-connection-create-form">
         <FormField label={formatMessage({ id: "settings.providers.name" })}>
           <Input className="w-full" value={name} onChange={handleNameChange} maxLength={120} required />
         </FormField>
@@ -753,13 +764,17 @@ function CreateProviderConnectionModal({
           </label>
         )}
         {error && <Banner intent="warning" density="sm">{error}</Banner>}
-        <div className="flex justify-end gap-2">
+        <DialogCardFooter>
           <Button size="lg" type="button" variant="ghost" onClick={onClose}>{formatMessage({ id: "settings.common.cancel" })}</Button>
-          <Button size="lg" type="submit" variant="primary" disabled={submitting || !name.trim() || !apiKey.trim() || (gateway && !endpointUrl.trim())}>
-            {submitting ? <Spinner size="sm" aria-hidden="true" /> : <Plus size={16} />}
-            {formatMessage({ id: "settings.providers.create" })}
-          </Button>
-        </div>
+          <DialogCommit>
+            {(inHead) => (
+              <Button size={inHead ? "md" : "lg"} type="submit" variant="primary" disabled={submitting || !name.trim() || !apiKey.trim() || (gateway && !endpointUrl.trim())}>
+                {submitting ? <Spinner size="sm" aria-hidden="true" /> : <Plus size={16} />}
+                {formatMessage({ id: "settings.providers.create" })}
+              </Button>
+            )}
+          </DialogCommit>
+        </DialogCardFooter>
       </form>
     </DialogCard>
   );
@@ -803,9 +818,12 @@ function VerifyProviderConnectionModal({
 }) {
   const { formatMessage } = useIntl();
   const machines = useMachineStore((state) => state.machines);
+  const pinnedMachineId = useLocalComputerMachineId();
+  const userId = useAuthStore((state) => state.user?.id ?? null);
+  // Same order as the Computers list (this device, then mine, then the rest).
   const candidates = useMemo(
-    () => machines.filter((machine) => machine.status === "online" && machine.runtimes.includes("builtin")),
-    [machines],
+    () => orderMachinesLikeSidebar(machines.filter((machine) => machine.status === "online" && machine.runtimes.includes("builtin")), pinnedMachineId, userId),
+    [machines, pinnedMachineId, userId],
   );
   const [computerId, setComputerId] = useState(candidates[0]?.id ?? "");
   const [model, setModel] = useState(() => defaultTestModel(connection.providerId));
@@ -881,8 +899,9 @@ function VerifyProviderConnectionModal({
       onClose={onClose}
       title={formatMessage({ id: "settings.providers.verifyTitle" }, { name: connection.name })}
       testId="provider-connection-verify-dialog"
+      narrow="sheet"
     >
-      <div className="space-y-4" data-testid="provider-connection-verify-body">
+      <div className="stack-y-4" data-testid="provider-connection-verify-body">
         <FormField label={formatMessage({ id: "settings.providers.verifyComputer" })}>
           <Select
             value={computerId}
@@ -965,7 +984,7 @@ function VerifyProviderConnectionModal({
           </p>
         )}
         {phase === "done" && result && outcome === "success" && (
-          <div className="space-y-3" data-testid="provider-connection-verify-success">
+          <div className="stack-y-3" data-testid="provider-connection-verify-success">
             <Banner intent="success" density="sm" role="status">
               {formatMessage({ id: "settings.providers.verifySuccess" }, { computer: computerName })}
               {" · "}
@@ -1002,19 +1021,23 @@ function VerifyProviderConnectionModal({
             </Banner>
           </div>
         )}
-        <div className="flex justify-end gap-2">
+        <DialogCardFooter>
           <Button size="lg" type="button" variant="ghost" onClick={onClose}>{formatMessage({ id: "settings.common.close" })}</Button>
-          <Button size="lg"
-            type="button"
-            variant="primary"
-            disabled={phase === "running" || candidates.length === 0}
-            onClick={start}
-          >
-            {phase === "done"
-              ? formatMessage({ id: "settings.providers.verifyAgain" })
-              : formatMessage({ id: "settings.providers.verifyStart" })}
-          </Button>
-        </div>
+          <DialogCommit>
+            {(inHead) => (
+              <Button size={inHead ? "md" : "lg"}
+                type="button"
+                variant="primary"
+                disabled={phase === "running" || candidates.length === 0}
+                onClick={start}
+              >
+                {phase === "done"
+                  ? formatMessage({ id: "settings.providers.verifyAgain" })
+                  : formatMessage({ id: "settings.providers.verifyStart" })}
+              </Button>
+            )}
+          </DialogCommit>
+        </DialogCardFooter>
       </div>
     </DialogCard>
   );

@@ -1,20 +1,19 @@
-import { createHash } from "node:crypto";
-import { makeIsMember, type ServerId } from "@botiverse/raft-shared";
+import { DEPRECATED_GRAVATAR_HASH, isSubConversationType, makeIsMember, type ServerId } from "@botiverse/raft-shared";
 import type { Server as SocketServer } from "socket.io";
 import { eq, inArray, sql, asc } from "drizzle-orm";
 import { getDb } from "../db/index";
 import { attachmentCommentRefs, attachments, messages, messageReactions, users, agents } from "../db/schema";
 import * as channelService from "./channelService";
 import * as messageService from "./messageService";
+import { isShownUserAvatarUrl } from "./avatarService";
 import {
   projectAgentCommentScope,
   renderAgentCommentScopeBlock,
   renderAnchorLabel,
 } from "./attachmentCommentAnchorLabel";
 import { normalizeAttachmentFilename } from "../routes/attachments";
-import { isChannelReadOnlyByBillingFeature, isChannelReadOnlyByQuota } from "./planService";
+import { channelBillingReadOnlyBody, getChannelBillingReadOnly, isChannelReadOnlyByQuota } from "./planService";
 import type { AgentOrchestrator } from "./agentOrchestrator";
-import { ATTACHMENT_COMMENTS_FEATURE_FLAG_KEY, evaluateFeatureFlag } from "./featureFlagService";
 import { resolveReadableAttachmentAuthorityContext } from "./attachmentAuthorityService";
 
 // Attachment comments — service layer (attachment-comments MVP spec §4).
@@ -37,28 +36,6 @@ import { resolveReadableAttachmentAuthorityContext } from "./attachmentAuthority
 
 // Single length contract for BOTH transports (user route + agent-api route).
 export const MAX_COMMENT_LENGTH = 32_000;
-
-// Feature flag gate. It is checked at every user/agent API entry AND in the
-// create pipeline so no present or future transport bypasses it.
-export async function attachmentCommentsEnabledForServer(
-  serverId: string,
-  actorUserId?: string | null,
-): Promise<boolean> {
-  const evaluation = await evaluateFeatureFlag({
-    key: ATTACHMENT_COMMENTS_FEATURE_FLAG_KEY,
-    userId: actorUserId ?? null,
-    serverId,
-  });
-  return evaluation.enabled;
-}
-
-export function attachmentCommentsDisabledError(): AttachmentCommentError {
-  return new AttachmentCommentError(
-    403,
-    "attachment_comments_disabled",
-    "Attachment comments are not enabled on this server",
-  );
-}
 
 // Structural anchors (spec §3, enabled for native renderers per cindyz 6/10).
 // The discriminator is allowlisted server-side so anchor_type stays a closed
@@ -220,12 +197,6 @@ export async function createAttachmentComment(
 ): Promise<{ message: Record<string, unknown>; threadChannelId: string }> {
   const db = getDb();
 
-  // Feature flag gate dominates everything: outside enabled scope the feature
-  // does not exist, regardless of sender type/state.
-  if (!(await attachmentCommentsEnabledForServer(opts.serverId, opts.senderType === "user" ? opts.senderId : null))) {
-    throw attachmentCommentsDisabledError();
-  }
-
   // Product descope (spec v3.5, cindyz 6/10): agents do not CREATE comments
   // for now — they read scoped lists and reply in-thread as ordinary
   // discussion. Gated here, not per-transport, so every present and future
@@ -260,21 +231,20 @@ export async function createAttachmentComment(
   if (!attachment) {
     throw new AttachmentCommentError(404, "attachment_not_found", "Attachment not found");
   }
-  const readable = attachment.objectId ? await resolveReadableAttachmentAuthorityContext({
+  const readable = await resolveReadableAttachmentAuthorityContext({
     projectionId: attachment.id,
     requestServerId: opts.serverId as ServerId,
     principal: { type: opts.senderType, id: opts.senderId },
-  }) : null;
-  if (attachment.objectId && !readable) {
+  });
+  if (!readable) {
     throw new AttachmentCommentError(404, "attachment_not_found", "Attachment not found");
   }
 
   // Server-scope boundary FIRST (before any state-revealing branch): a
   // cross-server attachment UUID must be indistinguishable from a nonexistent
-  // one, matching the existing attachment routes. The attachment's own
-  // channelId is the anchor here because unlinked attachments have no message.
-  const attachmentChannel = readable?.localHostChannel ?? await channelService.getChannel(attachment.channelId);
-  if (!attachmentChannel || attachmentChannel.serverId !== opts.serverId) {
+  // one, matching the existing attachment routes.
+  const parentChannel = readable.localHostChannel;
+  if (parentChannel.serverId !== opts.serverId) {
     throw new AttachmentCommentError(404, "attachment_not_found", "Attachment not found");
   }
 
@@ -296,19 +266,12 @@ export async function createAttachmentComment(
     throw new AttachmentCommentError(404, "parent_message_not_found", "Parent message not found");
   }
 
-  const parentChannel = readable?.localHostChannel ?? await channelService.getChannel(parentMessage.channelId);
-  if (!parentChannel || parentChannel.serverId !== opts.serverId) {
-    throw new AttachmentCommentError(404, "attachment_not_found", "Attachment not found");
-  }
   if (parentChannel.archivedAt) {
     throw new AttachmentCommentError(409, "channel_archived", "This channel is archived");
   }
-  if (await isChannelReadOnlyByBillingFeature(parentChannel.id, opts.serverId)) {
-    throw new AttachmentCommentError(
-      403,
-      "channel_read_only",
-      "This joint channel is read-only because it has more than 2 free servers. It becomes writable again when a server upgrades or a free server leaves.",
-    );
+  const billingReadOnly = await getChannelBillingReadOnly(parentChannel.id, opts.serverId);
+  if (billingReadOnly) {
+    throw new AttachmentCommentError(403, "channel_read_only", channelBillingReadOnlyBody(billingReadOnly).error);
   }
   // Plan gates live in the shared pipeline so user and agent transports cannot
   // diverge (PR3 review parity gate).
@@ -328,7 +291,9 @@ export async function createAttachmentComment(
   // - host on a THREAD REPLY -> the existing thread itself. There is no
   //   thread-in-thread in Slock; calling getOrCreateThreadForChannel on a
   //   thread-hosted message would attempt exactly that.
-  const reviewChannelId = parentChannel.type === "thread"
+  // A task's own conversation is a sub-conversation too (task v2): no
+  // thread inside it.
+  const reviewChannelId = isSubConversationType(parentChannel.type)
     ? parentChannel.id
     : (await channelService.getOrCreateThreadForChannel(
         parentChannel.id,
@@ -380,25 +345,20 @@ export async function createAttachmentComment(
   // The ref row now exists but shared channel-room updates cannot carry
   // viewer-scoped metadata: user-deny rules are per viewer, while this socket
   // payload is shared by every subscriber in the room.
-  const isThreadHosted = parentChannel.type === "thread";
+  const isThreadHosted = isSubConversationType(parentChannel.type);
   let hostSource: Record<string, unknown> | null;
   if (isThreadHosted) {
-    const threadParentMsgId = parentChannel.parentMessageId;
-    if (threadParentMsgId) {
-      const [threadParentMsg] = await db
-        .select({ channelId: messages.channelId })
-        .from(messages)
-        .where(eq(messages.id, threadParentMsgId))
-        .limit(1);
-      const threadParentChannel = threadParentMsg
-        ? await channelService.getChannel(threadParentMsg.channelId)
-        : null;
+    // parentChannel is the commenter's local thread; for a joint thread that is
+    // this server's projection, routed via its local parent joint channel.
+    const threadParent = await channelService.resolveThreadParent(parentChannel, db);
+    if (threadParent) {
+      const threadParentChannel = await channelService.getChannel(threadParent.parentChannelId);
       hostSource = threadParentChannel
         ? {
             type: "thread",
             routeKind: threadParentChannel.type === "dm" ? "dm" : "channel",
             channelId: threadParentChannel.id,
-            parentMessageId: threadParentMsgId,
+            parentMessageId: threadParent.parentMessageId,
             threadChannelId: parentChannel.id,
           }
         : null;
@@ -440,7 +400,9 @@ export async function createAttachmentComment(
 
 export async function listAttachmentComments(
   attachmentId: string,
-  opts: { limit?: number } = {},
+  opts: {
+    limit?: number;
+  },
 ): Promise<{
   comments: Array<Record<string, unknown> & { reactions: Array<{ emoji: string; reactorType: string; reactorId: string; createdAt: Date }> }>;
   threadChannelId: string | null;
@@ -476,14 +438,16 @@ export async function listAttachmentComments(
   const agentIds = [...new Set(commentMessages.filter((m) => m.senderType === "agent").map((m) => m.senderId))];
   if (userIds.length > 0) {
     const rows = await db
-      .select({ id: users.id, name: users.name, displayName: users.displayName, avatarUrl: users.avatarUrl, email: users.email })
+      .select({ id: users.id, name: users.name, displayName: users.displayName, avatarUrl: users.avatarUrl })
       .from(users)
       .where(inArray(users.id, userIds));
     for (const u of rows) {
       nameMap.set(u.id, u.displayName || u.name);
       avatarMap.set(u.id, {
-        avatarUrl: u.avatarUrl ?? null,
-        gravatarHash: u.email ? createHash("sha256").update(u.email.trim().toLowerCase()).digest("hex") : null,
+        // A person's avatar only when Raft stores it or it is a built pixel
+        // avatar (as on Activity rows); the web draws no other one for a person.
+        avatarUrl: isShownUserAvatarUrl(u.avatarUrl) ? u.avatarUrl : null,
+        gravatarHash: DEPRECATED_GRAVATAR_HASH,
       });
     }
   }

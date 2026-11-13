@@ -3,6 +3,7 @@ import { useSearchContentStore } from "../src/store/searchContentStore";
 import { isThreadMaximized, useUIStore } from "../src/store/uiStore";
 import { useThreadStore } from "../src/store/threadStore";
 import { useMessageStore } from "../src/store/messageStore";
+import { holdAutoRead, releaseAutoRead } from "../src/store/autoReadHold";
 import assert from "node:assert/strict";
 import {
   canAutoMarkLiveAppendRead,
@@ -124,7 +125,7 @@ test("maximized thread suppresses channel auto-read until the channel is restore
   }
 });
 
-test("profile and content navigation restore the shared layout/read state", () => {
+test("a profile suspends Focus Mode until it closes; content navigation restores the layout", () => {
   const ui = useUIStore.getState();
   const thread = useThreadStore.getState();
   const messages = useMessageStore.getState();
@@ -137,10 +138,15 @@ test("profile and content navigation restore the shared layout/read state", () =
     useUIStore.setState({ threadMaximized: true });
     assert.equal(isThreadMaximized(true, "parent", "channel", "channel"), true);
     assert.equal(canAutoMarkCurrentChannelRead(doc, () => true), false);
-    useProfileStore.getState().openProfile("human", "person", { openSource: "thread" });
-    assert.equal(useUIStore.getState().threadMaximized, false);
+    // The channel shows beside the profile, so it is readable meanwhile.
+    useProfileStore.getState().openProfile("agent", "agent-1", { openSource: "thread" });
+    assert.equal(useUIStore.getState().threadMaximized, true);
     assert.equal(canAutoMarkCurrentChannelRead(doc, () => true), true);
-    useUIStore.getState().toggleThreadMaximized();
+    useProfileStore.getState().closeProfile();
+    assert.equal(canAutoMarkCurrentChannelRead(doc, () => true), false);
+    useProfileStore.getState().openExternalProfile("ext", {} as never, { channelId: "channel" });
+    assert.equal(useUIStore.getState().threadMaximized, true);
+    useProfileStore.getState().closeProfile();
     useSearchContentStore.getState().open({ kind: "channel", id: "channel" });
     assert.equal(useUIStore.getState().threadMaximized, false);
     assert.equal(canAutoMarkCurrentChannelRead(doc, () => true), true);
@@ -150,5 +156,35 @@ test("profile and content navigation restore the shared layout/read state", () =
   } finally {
     useUIStore.setState(ui); useThreadStore.setState(thread); useMessageStore.setState(messages);
     useProfileStore.setState(profile); useSearchContentStore.setState(search);
+  }
+});
+
+test("a conversation Activity reopened on its own is not auto-read until released; others still are", () => {
+  const previousChannel = useMessageStore.getState().currentChannelId;
+  const previousUnread = useMessageStore.getState().unreadCounts;
+  const previousMessages = useMessageStore.getState().messages;
+  let readCalls = 0;
+  let ended = 0;
+  try {
+    holdAutoRead("reopened", { read: () => { readCalls += 1; }, end: () => { ended += 1; } });
+    useMessageStore.setState({
+      currentChannelId: "reopened",
+      unreadCounts: { reopened: 3, another: 2 },
+      messages: [{ id: "m1", channelId: "reopened", seq: 7 } as never],
+      hasNewer: false,
+    });
+    useMessageStore.getState().markCurrentChannelRead();
+    assert.equal(useMessageStore.getState().unreadCounts.reopened, 3, "the held conversation keeps its unread");
+    releaseAutoRead({ read: true });
+    assert.equal(readCalls, 1);
+    assert.equal(ended, 1);
+    useMessageStore.getState().markCurrentChannelRead();
+    assert.equal(useMessageStore.getState().unreadCounts.reopened, undefined, "released, it reads as usual");
+    holdAutoRead("reopened", { read: () => { readCalls += 1; } });
+    releaseAutoRead({ read: false });
+    assert.equal(readCalls, 1, "leaving it does not read it");
+  } finally {
+    releaseAutoRead({ read: false });
+    useMessageStore.setState({ currentChannelId: previousChannel, unreadCounts: previousUnread, messages: previousMessages });
   }
 });

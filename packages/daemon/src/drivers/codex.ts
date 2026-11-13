@@ -2,6 +2,7 @@ import { ambientProcessEnv } from "../processEnvPatch";
 import { RuntimeExecutableNotFoundError } from "../spawnFailureErrors";
 import { spawn, execFileSync } from "node:child_process";
 import { spawnRuntimeChild } from "./runtimeChild";
+import { codexInstalledExecutableCandidates } from "@botiverse/oar/runtimes/codex/installation-candidates";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -22,14 +23,14 @@ import {
   type ProbeDeps,
 } from "./probe";
 import { killProbeTreeAndSettle, ProbeChildError, runProbeChild } from "./probeChild";
-import { resolveWindowsDirectLaunch, resolveWindowsDirectLaunchAsync } from "./windowsLaunch";
+import { isWindowsBatchFile, resolveWindowsDirectLaunch, resolveWindowsDirectLaunchAsync } from "./windowsLaunch";
 import {
   CodexEventNormalizer,
   parseCodexJsonRpcLine,
   type JsonRpcMessage,
   type JsonRpcId,
 } from "./codexEventNormalizer";
-import { prepareManagedMcpRuntimeProxy } from "../managedMcpRuntimeProxy";
+import { prepareManagedMcpRuntimeProxy, type ManagedMcpRuntimeEndpoint } from "../managedMcpRuntimeProxy";
 import {
   buildCodexInstructionShapeAttrs,
   buildCodexInstructionShapeStaticAttrs,
@@ -38,7 +39,9 @@ import {
   type CodexThreadRequestMethod,
 } from "./codexInstructionShape";
 
-export { parseCodexJsonRpcLine } from "./codexEventNormalizer";
+export { codexBlankFinalAnswerDiagnostic, codexMcpToolName, codexNotificationDiagnostics, parseCodexJsonRpcLine } from "./codexEventNormalizer";
+export { parseCodexTelemetryEvent } from "./codexTelemetrySidecar";
+export { buildCodexInstructionShapeAttrs, buildCodexInstructionShapeStaticAttrs, type CodexInstructionObservationPhase, type CodexThreadRequestMethod } from "./codexInstructionShape";
 
 /**
  * macOS desktop-bundled Codex CLI locations that are still real install surfaces.
@@ -62,15 +65,139 @@ const CODEX_BIN_ENV = "CODEX_BIN";
  */
 export const CODEX_NPM_ROOT_TIMEOUT_MS = 5000;
 
+/** Budget for each probe child (`app-server --help`, `--version`). */
+const CODEX_PROBE_CHILD_TIMEOUT_MS = 5000;
+/**
+ * A candidate whose app-server check timed out gets one longer check before a
+ * start settles for another candidate (#oar-raft:#7): right after a Computer
+ * restart a busy Windows machine timed out the PATH Codex 0.165 and started
+ * agents on Codex Desktop's 0.130, which cannot read the newer config.
+ */
+const CODEX_PROBE_RETRY_TIMEOUT_MS = 15_000;
+
+/**
+ * task #1358 — how long a failed probe result (or a success whose version read
+ * failed) may be reused for an unchanged file. A failure is not proof about the
+ * file: a timeout or a signal is about this moment, and a non-zero exit or
+ * EACCES/EPERM can clear without the mtime or size changing (chmod, a config
+ * or environment fix). Long enough that the detection probe and the launch
+ * that follows it do not each wait out the same slow child; short enough that
+ * a manual retry soon after re-probes. Only a full success (app-server check
+ * passed and the version read) is reused until the file's mtime or size
+ * changes.
+ */
+export const CODEX_PROBE_FAILURE_TTL_MS = 10_000;
+
 type CodexProbeCacheEntry = {
   mtimeMs: number;
   size: number;
   appServerOk: boolean;
   version: string | null;
   failure: string | null;
+  /** True when the app-server failure was a timeout (the typed `probe_timeout` outcome). */
+  timedOut: boolean;
+  /** The app-server check's time budget; a timeout under a shorter budget than a caller asks for is not reused. */
+  probeTimeoutMs: number;
+  /** True when the entry expires after {@link CODEX_PROBE_FAILURE_TTL_MS}: every result except a full success. */
+  transient: boolean;
+  /** Monotonic time ({@link probeNow}) the result was recorded. */
+  storedAt: number;
 };
 
 const codexProbeCache = new Map<string, CodexProbeCacheEntry>();
+
+type CodexProbeOutcome = {
+  failure: string | null;
+  version: string | null;
+  timedOut: boolean;
+  /** Present when the result came from the cache: its age and whether it expires. */
+  cached?: { ageMs: number; transient: boolean };
+};
+
+function probeNow(deps: ProbeDeps): number {
+  return deps.nowFn ? deps.nowFn() : performance.now();
+}
+
+/**
+ * task #1358 — a timeout is checked before the signal: execFileSync reports a
+ * child killed at its budget as `code: ETIMEDOUT, signal: SIGTERM`, and the
+ * async runner as `code: ETIMEDOUT`; both are the same "timed out".
+ */
+function classifyCodexProbeError(error: unknown): { failure: string; timedOut: boolean } {
+  if ((error as { code?: unknown } | null)?.code === "ETIMEDOUT") return { failure: "ETIMEDOUT", timedOut: true };
+  return { failure: describeCodexProbeFailure(error), timedOut: false };
+}
+
+function readCodexProbeCache(
+  cacheKey: string,
+  stat: { mtimeMs: number; size: number } | null,
+  deps: ProbeDeps,
+  probeTimeoutMs: number = CODEX_PROBE_CHILD_TIMEOUT_MS,
+): CodexProbeOutcome | null {
+  if (!stat) return null;
+  const cached = codexProbeCache.get(cacheKey);
+  if (!cached || cached.mtimeMs !== stat.mtimeMs || cached.size !== stat.size) return null;
+  if (cached.timedOut && cached.probeTimeoutMs < probeTimeoutMs) return null;
+  const ageMs = probeNow(deps) - cached.storedAt;
+  if (cached.transient && (ageMs < 0 || ageMs >= CODEX_PROBE_FAILURE_TTL_MS)) {
+    codexProbeCache.delete(cacheKey);
+    return null;
+  }
+  return {
+    failure: cached.failure,
+    version: cached.version,
+    timedOut: cached.timedOut,
+    cached: { ageMs: Math.max(0, ageMs), transient: cached.transient },
+  };
+}
+
+function writeCodexProbeCache(
+  cacheKey: string,
+  stat: { mtimeMs: number; size: number } | null,
+  deps: ProbeDeps,
+  result: { failure: string | null; version: string | null; timedOut: boolean; transient: boolean; probeTimeoutMs?: number },
+): void {
+  if (!stat) return;
+  codexProbeCache.set(cacheKey, {
+    mtimeMs: stat.mtimeMs,
+    size: stat.size,
+    appServerOk: result.failure === null,
+    version: result.version,
+    failure: result.failure,
+    timedOut: result.timedOut,
+    probeTimeoutMs: result.probeTimeoutMs ?? CODEX_PROBE_CHILD_TIMEOUT_MS,
+    transient: result.transient,
+    storedAt: probeNow(deps),
+  });
+}
+
+/** Path- and environment-free note on a rejection whose result came from the cache. */
+function codexCachedRejectionNote(outcome: CodexProbeOutcome): string {
+  if (!outcome.cached) return "";
+  const ageS = Math.round(outcome.cached.ageMs / 1000);
+  return ` (cached result from ${ageS} s ago; checked again after ${CODEX_PROBE_FAILURE_TTL_MS / 1000} s)`;
+}
+
+function codexRejection(prefix: string, outcome: CodexProbeOutcome): string {
+  return `${prefix} rejected: app-server probe ${outcome.failure}${codexCachedRejectionNote(outcome)}`;
+}
+
+/**
+ * task #1358 — every candidate was found but its app-server check timed out.
+ * The message is shown to the user (classifySpawnFailure), so it names no
+ * path and no environment.
+ */
+function codexProbeTimeoutError(explicitOverride: boolean): RuntimeExecutableNotFoundError {
+  const subject = explicitOverride ? `The Codex CLI named by ${CODEX_BIN_ENV}` : "Codex";
+  return new RuntimeExecutableNotFoundError({
+    runtimeId: "codex",
+    reason: "probe_timeout",
+    message:
+      `${subject} was found on this Computer, but its \`app-server\` check did not finish within ${CODEX_PROBE_CHILD_TIMEOUT_MS} ms. ` +
+      `This is not evidence that Codex is missing; Raft checks it again on a start after ${CODEX_PROBE_FAILURE_TTL_MS / 1000} seconds. ` +
+      "If it keeps happening, check that `codex app-server --help` runs in a new terminal, then restart Raft Computer.",
+  });
+}
 
 function hasNonEmptyCodexTextInput(input: unknown): boolean {
   return Array.isArray(input) && input.some((item) =>
@@ -94,6 +221,12 @@ interface CodexSpawnCandidate {
   /** Runtimes are never started through a shell; see windowsLaunch.ts. */
   shell: false;
   env?: NodeJS.ProcessEnv;
+  /**
+   * Windows: the npm/pnpm `.cmd` shim this launch was resolved from, only
+   * when OAR runs that shim's target itself without cmd.exe
+   * (oarRunnableShim), for the OAR host.
+   */
+  windowsShim?: string;
 }
 
 interface CodexSpawnCandidateDiscovery {
@@ -111,11 +244,46 @@ type ExplicitCodexBinResolution =
   | { status: "resolved"; candidate: CodexSpawnCandidate }
   | { status: "invalid"; raw: string; reason: string };
 
+/**
+ * Codex's Windows sandbox helpers: `codex-command-runner*`, and anything under
+ * a `.sandbox-bin` directory (#oar-raft:#7), where a helper can carry a
+ * `codex.exe`-like name and an old version (0.130.0-alpha.5).
+ */
+/** Path-free: the first `codex` on PATH is a sandbox helper, so PATH gives no candidate. */
+const CODEX_PATH_SANDBOX_HELPER_REJECTION = "path codex rejected: the first codex on PATH is a Codex sandbox helper (codex-command-runner or .sandbox-bin); put the Codex CLI ahead of it on PATH";
+
 function isWindowsSandboxRunner(commandPath: string): boolean {
-  return path.basename(commandPath).toLowerCase().startsWith("codex-command-runner");
+  const segments = commandPath.split(/[\\/]+/).map((segment) => segment.toLowerCase());
+  return (segments.at(-1) ?? "").startsWith("codex-command-runner") || segments.slice(0, -1).includes(".sandbox-bin");
 }
 
-function resolveWindowsNpmCodexEntry(deps: ProbeDeps = {}): { entry: string | null; note?: string } {
+/**
+ * `shim` when OAR runs it without cmd.exe, else undefined (the OAR host then
+ * hands the start back to the driver). OAR's `parseWindowsShim`
+ * (windows-shim.ts, OAR 0.101.1; not exported) takes a shim that forwards
+ * `%*` to exactly one shim-relative (`%dp0%` / `%~dp0`) Node script or native
+ * program, as npm and pnpm write them; anything else it runs through cmd.exe.
+ */
+function oarRunnableShim(shim: string, deps: ProbeDeps): string | undefined {
+  const readFileSyncFn = deps.readFileSyncFn ?? ((filePath: string) => readFileSync(filePath, "utf8"));
+  let text: string;
+  try {
+    text = String(readFileSyncFn(shim, "utf8"));
+  } catch {
+    return undefined;
+  }
+  if (!text.includes("%*")) return undefined;
+  const dir = path.win32.dirname(shim);
+  const targets = [...new Set([...text.matchAll(/"([^"]*)"/g)]
+    .map((match) => match[1] ?? "")
+    .filter((token) => /%(?:~)?dp0%?/i.test(token))
+    .map((token) => path.win32.normalize(token.replaceAll(/%dp0%|%~dp0/gi, `${dir}\\`))))];
+  const scripts = targets.filter((target) => /\.(?:c|m)?js$/i.test(target)).length;
+  const natives = targets.filter((target) => /\.(?:exe|com)$/i.test(target) && !/(?:^|[\\/])node\.exe$/i.test(target)).length;
+  return (scripts === 1 && natives === 0) || (natives === 1 && scripts === 0) ? shim : undefined;
+}
+
+function resolveWindowsNpmCodexEntry(deps: ProbeDeps = {}): { entry: string | null; shim?: string; note?: string } {
   const existsSyncFn = deps.existsSyncFn ?? existsSync;
   const execFileSyncFn = deps.execFileSyncFn ?? execFileSync;
   const env = deps.env ?? ambientProcessEnv();
@@ -130,7 +298,9 @@ function resolveWindowsNpmCodexEntry(deps: ProbeDeps = {}): { entry: string | nu
       timeout: CODEX_NPM_ROOT_TIMEOUT_MS,
     })).trim();
     const candidate = winPath.join(globalRoot, "@openai", "codex", "bin", "codex.js");
-    if (existsSyncFn(candidate)) return { entry: candidate };
+    // npm's global shims sit in the prefix, one level above `npm root -g`.
+    const shim = winPath.join(winPath.dirname(globalRoot), "codex.cmd");
+    if (existsSyncFn(candidate)) return { entry: candidate, shim: existsSyncFn(shim) ? oarRunnableShim(shim, deps) : undefined };
   } catch (error) {
     // A missing or failing npm is an expected state and stays silent; only a
     // child killed at the budget is worth a (path-free) note, because the global
@@ -143,32 +313,38 @@ function resolveWindowsNpmCodexEntry(deps: ProbeDeps = {}): { entry: string | nu
   const cmdPath = resolveCommandOnPath("codex", deps);
   if (cmdPath) {
     const candidate = winPath.join(winPath.dirname(cmdPath), "node_modules", "@openai", "codex", "bin", "codex.js");
-    if (existsSyncFn(candidate)) return { entry: candidate, ...(note ? { note } : {}) };
+    if (existsSyncFn(candidate)) return { entry: candidate, shim: isWindowsBatchFile(cmdPath) ? oarRunnableShim(cmdPath, deps) : undefined, ...(note ? { note } : {}) };
   }
 
   return { entry: null, ...(note ? { note } : {}) };
 }
 
-function resolveWindowsCodexDesktopEntry(deps: ProbeDeps = {}): string | null {
+/**
+ * The Codex Desktop CLIs on this machine, as OAR lists them
+ * (`codexInstalledExecutableCandidates`, OAR 0.101.1): per Desktop `bin`
+ * folder, the fixed `bin\codex.exe`, then the newest three
+ * `bin\<build hash>\codex.exe` builds (#proj-raft-computer:#66), most
+ * recently written first, sandbox helpers' dot folders excluded. Each that
+ * exists is its own discovery candidate, so the normal probe and version
+ * arbitration choose among them and a half-installed or broken build falls
+ * through to the next. OAR's list also names npm's `%APPDATA%\npm\codex.cmd`
+ * shim; Raft finds npm installs through `npm root -g` and PATH instead
+ * (resolveWindowsNpmCodexEntry), so only the Desktop `codex.exe` entries are
+ * taken. PATH and `CODEX_BIN` stay Raft's own, as OAR leaves them out too.
+ */
+function windowsCodexDesktopEntries(deps: ProbeDeps = {}): string[] {
   const existsSyncFn = deps.existsSyncFn ?? existsSync;
   const env = deps.env ?? ambientProcessEnv();
-  const homeDir = deps.homeDir;
-  const winPath = path.win32;
-  const localAppDataRoots = [
-    env.LOCALAPPDATA,
-    env.USERPROFILE ? winPath.join(env.USERPROFILE, "AppData", "Local") : null,
-    homeDir ? winPath.join(homeDir, "AppData", "Local") : null,
-  ].filter((candidate): candidate is string => Boolean(candidate));
-  const candidates = [...new Set(localAppDataRoots.flatMap((root) => [
-    winPath.join(root, "Programs", "OpenAI", "Codex", "bin", "codex.exe"),
-    winPath.join(root, "OpenAI", "Codex", "bin", "codex.exe"),
-  ]))];
+  // OAR searches LOCALAPPDATA, then USERPROFILE and `<home>` AppData\Local, deduplicated.
+  const home = deps.homeDir ?? env.USERPROFILE ?? os.homedir();
+  const listed = codexInstalledExecutableCandidates("win32", home, env, deps.codexDesktopBuildsFn);
+  return [...new Set(listed.filter((candidate) => path.win32.basename(candidate).toLowerCase() === "codex.exe"
+    && !isWindowsSandboxRunner(candidate)
+    && existsSyncFn(candidate)))];
+}
 
-  for (const candidate of candidates) {
-    if (existsSyncFn(candidate)) return candidate;
-  }
-
-  return null;
+function resolveWindowsCodexDesktopEntry(deps: ProbeDeps = {}): string | null {
+  return windowsCodexDesktopEntries(deps)[0] ?? null;
 }
 
 /**
@@ -196,9 +372,10 @@ function codexSpawnCandidates(deps: ProbeDeps = {}): CodexSpawnCandidateDiscover
         candidates.push({
           source: "npm_global",
           command: nodeHost.command,
-          argsPrefix: [npmEntry],
+          argsPrefix: [...nodeHost.execArgv, npmEntry],
           shell: false,
           env: nodeHost.env,
+          ...(npm.shim ? { windowsShim: npm.shim } : {}),
         });
       } catch (error) {
         if (!(error instanceof NodeHostUnavailableError)) throw error;
@@ -213,14 +390,15 @@ function codexSpawnCandidates(deps: ProbeDeps = {}): CodexSpawnCandidateDiscover
     }
 
     const { command, missReason: pathMissReason } = lookupCommandOnPath("codex", deps);
+    if (command && isWindowsSandboxRunner(command)) rejected.push(CODEX_PATH_SANDBOX_HELPER_REJECTION);
     if (command && !isWindowsSandboxRunner(command)) {
       const direct = windowsDirectCodexCandidate("path", command, deps);
       if (typeof direct === "string") rejected.push(direct);
       else candidates.push(direct);
     }
 
-    const desktopEntry = resolveWindowsCodexDesktopEntry(deps);
-    if (desktopEntry && !candidates.some((candidate) => candidate.command === desktopEntry)) {
+    for (const desktopEntry of windowsCodexDesktopEntries(deps)) {
+      if (candidates.some((candidate) => candidate.command === desktopEntry)) continue;
       candidates.push({
         source: "desktop_install",
         command: desktopEntry,
@@ -301,9 +479,9 @@ function readCandidateStat(candidate: CodexSpawnCandidate, deps: ProbeDeps): { m
     const st = statSync(filePath);
     return { mtimeMs: st.mtimeMs, size: st.size };
   });
-  const statPath = candidate.argsPrefix[0] && candidate.command !== candidate.argsPrefix[0]
-    ? candidate.argsPrefix[0]
-    : candidate.command;
+  // A JS entry is the last prefix element; Node options may come before it.
+  const entry = candidate.argsPrefix.at(-1);
+  const statPath = entry && candidate.command !== entry ? entry : candidate.command;
   if (!existsSyncFn(statPath)) return null;
   try {
     return statSyncFn(statPath);
@@ -421,7 +599,7 @@ function resolveExplicitCodexBin(deps: ProbeDeps): ExplicitCodexBinResolution {
     return {
       status: "invalid",
       raw,
-      reason: "points at codex-command-runner sandbox helper, not the Codex CLI",
+      reason: "points at a Codex sandbox helper (codex-command-runner or .sandbox-bin), not the Codex CLI",
     };
   }
 
@@ -460,6 +638,7 @@ function windowsDirectCodexCandidate(
       argsPrefix: launch.args,
       shell: false,
       ...(launch.env ? { env: launch.env } : {}),
+      ...(isWindowsBatchFile(command) && oarRunnableShim(command, deps) ? { windowsShim: command } : {}),
     };
   } catch (error) {
     if (!(error instanceof RuntimeExecutableNotFoundError)) throw error;
@@ -484,28 +663,26 @@ function describeCodexProbeFailure(error: unknown): string {
 function probeCodexCandidate(
   candidate: CodexSpawnCandidate,
   deps: ProbeDeps = {},
-): { failure: string | null; version: string | null } {
+): CodexProbeOutcome {
   const execFileSyncFn = deps.execFileSyncFn ?? execFileSync;
   const env = withWindowsUserEnvironment(candidate.env ?? deps.env ?? ambientProcessEnv(), deps);
   const stat = readCandidateStat(candidate, deps);
   const cacheKey = codexCandidateCacheKey(candidate);
-  if (stat) {
-    const cached = codexProbeCache.get(cacheKey);
-    if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
-      return { failure: cached.failure, version: cached.version };
-    }
-  }
+  const cached = readCodexProbeCache(cacheKey, stat, deps);
+  if (cached) return cached;
 
   let failure: string | null = null;
+  let versionFailed = false;
+  let timedOut = false;
   try {
     execFileSyncFn(candidate.command, [...candidate.argsPrefix, ...CODEX_APP_SERVER_PROBE_ARGS], {
       stdio: ["ignore", "pipe", "pipe"],
       env,
-      timeout: 5000,
+      timeout: CODEX_PROBE_CHILD_TIMEOUT_MS,
       shell: candidate.shell,
     });
   } catch (error) {
-    failure = describeCodexProbeFailure(error);
+    ({ failure, timedOut } = classifyCodexProbeError(error));
   }
 
   let version: string | null = null;
@@ -514,25 +691,20 @@ function probeCodexCandidate(
       const output = execFileSyncFn(candidate.command, [...candidate.argsPrefix, "--version"], {
         stdio: ["ignore", "pipe", "pipe"],
         env,
-        timeout: 5000,
+        timeout: CODEX_PROBE_CHILD_TIMEOUT_MS,
         shell: candidate.shell,
       });
       version = (Buffer.isBuffer(output) ? output.toString("utf8") : String(output ?? "")).trim().split(/\r?\n/)[0] || null;
     } catch {
       version = null;
+      // A failed version read must not pin "unknown" (it ranks this candidate
+      // in version arbitration).
+      versionFailed = true;
     }
   }
 
-  if (stat) {
-    codexProbeCache.set(cacheKey, {
-      mtimeMs: stat.mtimeMs,
-      size: stat.size,
-      appServerOk: failure === null,
-      version,
-      failure,
-    });
-  }
-  return { failure, version };
+  writeCodexProbeCache(cacheKey, stat, deps, { failure, version, timedOut, transient: failure !== null || versionFailed });
+  return { failure, version, timedOut };
 }
 
 function validateCodexAppServer(candidate: CodexSpawnCandidate, deps: ProbeDeps = {}): string | null {
@@ -552,6 +724,8 @@ function resolveCompatibleCodexCandidate(deps: ProbeDeps = {}): {
   explicitOverrideFailed: boolean;
   /** Automatic discovery only: why the `codex` PATH lookup resolved nothing. */
   pathMissReason?: RuntimeProbeUnavailableReason;
+  /** task #1358 — no candidate, and every rejection was an app-server check that timed out. */
+  allRejectionsTimedOut?: true;
 } {
   const rejected: string[] = [];
   const notes: string[] = [];
@@ -568,16 +742,16 @@ function resolveCompatibleCodexCandidate(deps: ProbeDeps = {}): {
     };
   }
   if (explicit.status === "resolved") {
-    const { failure, version } = probeCodexCandidate(explicit.candidate, deps);
+    const outcome = probeCodexCandidate(explicit.candidate, deps);
+    const { failure, version } = outcome;
     if (failure) {
       return {
         candidate: null,
-        rejected: [
-          `${CODEX_BIN_ENV}=${formatCodexCandidate(explicit.candidate)} rejected: app-server probe ${failure}`,
-        ],
+        rejected: [codexRejection(`${CODEX_BIN_ENV}=${formatCodexCandidate(explicit.candidate)}`, outcome)],
         version: null,
         notes: [],
         explicitOverrideFailed: true,
+        ...(outcome.timedOut ? { allRejectionsTimedOut: true as const } : {}),
       };
     }
     notes.push(
@@ -600,10 +774,13 @@ function resolveCompatibleCodexCandidate(deps: ProbeDeps = {}): {
   const discovery = codexSpawnCandidates(deps);
   rejected.push(...discovery.rejected);
   notes.push(...discovery.notes);
+  let timedOutRejections = 0;
   for (const candidate of discovery.candidates) {
-    const { failure, version } = probeCodexCandidate(candidate, deps);
+    const outcome = probeCodexCandidate(candidate, deps);
+    const { failure, version } = outcome;
     if (failure) {
-      rejected.push(`${candidate.source} ${formatCodexCandidate(candidate)} rejected: app-server probe ${failure}`);
+      rejected.push(codexRejection(`${candidate.source} ${formatCodexCandidate(candidate)}`, outcome));
+      if (outcome.timedOut) timedOutRejections += 1;
       continue;
     }
     if (!best) {
@@ -627,11 +804,12 @@ function resolveCompatibleCodexCandidate(deps: ProbeDeps = {}): {
     notes,
     explicitOverrideFailed: false,
     ...(discovery.pathMissReason ? { pathMissReason: discovery.pathMissReason } : {}),
+    ...(!best && rejected.length > 0 && timedOutRejections === rejected.length ? { allRejectionsTimedOut: true as const } : {}),
   };
 }
 
 export function probeCodex(deps: ProbeDeps = {}): RuntimeProbeResult {
-  const { candidate, rejected, version, notes, explicitOverrideFailed, pathMissReason } = resolveCompatibleCodexCandidate(deps);
+  const { candidate, rejected, version, notes, explicitOverrideFailed, pathMissReason, allRejectionsTimedOut } = resolveCompatibleCodexCandidate(deps);
   const parts = [
     ...rejected,
     ...notes,
@@ -646,7 +824,8 @@ export function probeCodex(deps: ProbeDeps = {}): RuntimeProbeResult {
     const nothingDiscovered = !explicitOverrideFailed && rejected.length === 0;
     return {
       available: false,
-      unavailableReason: (nothingDiscovered ? pathMissReason : undefined) ?? "probe_failed",
+      unavailableReason: (nothingDiscovered ? pathMissReason : undefined) ??
+        (allRejectionsTimedOut ? "probe_timeout" : "probe_failed"),
       diagnostic: parts.length > 0
         ? parts.join("; ")
         : "No Codex CLI app-server candidate was found.",
@@ -659,8 +838,37 @@ export function probeCodex(deps: ProbeDeps = {}): RuntimeProbeResult {
   };
 }
 
-export function resolveCodexSpawn(commandArgs: string[], deps: ProbeDeps = {}): { command: string; args: string[]; shell: false; source: CodexSpawnCandidate["source"]; env?: NodeJS.ProcessEnv } {
-  const { candidate, rejected, explicitOverrideFailed } = resolveCompatibleCodexCandidate(deps);
+/**
+ * Path-free category of one candidate rejection, for telemetry
+ * (`node_host_launch` `rejection_kind`, #oar-raft:#7).
+ */
+export function codexRejectionKind(rejection: string): "timeout" | "node_host" | "batch_wrapper" | "probe_failed" | "other" {
+  if (/app-server probe ETIMEDOUT/.test(rejection)) return "timeout";
+  if (/JavaScript entry rejected/.test(rejection)) return "node_host";
+  if (/batch wrapper rejected/.test(rejection)) return "batch_wrapper";
+  if (/app-server probe /.test(rejection)) return "probe_failed";
+  return "other";
+}
+
+/** The rejections of a resolution that still picked a candidate: count and sorted kinds joined by `+`. */
+function codexRejectionSummary(rejected: readonly string[]): { rejectedCandidateCount: number; rejectionKind?: string } {
+  const kinds = [...new Set(rejected.map(codexRejectionKind))].sort();
+  return { rejectedCandidateCount: rejected.length, ...(kinds.length > 0 ? { rejectionKind: kinds.join("+") } : {}) };
+}
+
+export function resolveCodexSpawn(commandArgs: string[], deps: ProbeDeps = {}): {
+  command: string;
+  args: string[];
+  shell: false;
+  source: CodexSpawnCandidate["source"];
+  env?: NodeJS.ProcessEnv;
+  /** Windows: the `.cmd` shim the launch was resolved from (CodexSpawnCandidate.windowsShim). */
+  windowsShim?: string;
+  /** Candidates rejected before this one was picked (automatic discovery). */
+  rejectedCandidateCount?: number;
+  rejectionKind?: string;
+} {
+  const { candidate, rejected, explicitOverrideFailed, allRejectionsTimedOut } = resolveCompatibleCodexCandidate(deps);
   if (candidate) {
     return {
       command: candidate.command,
@@ -668,8 +876,13 @@ export function resolveCodexSpawn(commandArgs: string[], deps: ProbeDeps = {}): 
       shell: candidate.shell,
       source: candidate.source,
       ...(candidate.env ? { env: candidate.env } : {}),
+      ...(candidate.windowsShim ? { windowsShim: candidate.windowsShim } : {}),
+      ...codexRejectionSummary(rejected),
     };
   }
+
+  // task #1358: found, but the check timed out — a typed timeout, not "not found".
+  if (allRejectionsTimedOut) throw codexProbeTimeoutError(explicitOverrideFailed);
 
   const search = describeSearchPath(deps);
   const rejectedNote = rejected.length > 0 ? ` Rejected candidates: ${rejected.join("; ")}.` : "";
@@ -703,13 +916,28 @@ export function resolveCodexSpawn(commandArgs: string[], deps: ProbeDeps = {}): 
     restartNote });
 }
 
-export function buildCodexAppServerArgs(managedMcp?: { name: string; url: string } | null): string[] {
-  const args = ["app-server"];
-  if (managedMcp) {
-    args.push("-c", `mcp_servers.${managedMcp.name}.url=${JSON.stringify(managedMcp.url)}`);
-  }
-  args.push("--listen", "stdio://");
-  return args;
+/** Holds the managed MCP token for Codex, so it is not in the app-server's arguments (#proj-runtime:#40). */
+export const CODEX_MANAGED_MCP_TOKEN_ENV = "RAFT_MANAGED_MCP_TOKEN";
+
+export function withCodexManagedMcpToken(
+  env: NodeJS.ProcessEnv,
+  managedMcp: { token: string } | null | undefined,
+): NodeJS.ProcessEnv {
+  return managedMcp ? { ...env, [CODEX_MANAGED_MCP_TOKEN_ENV]: managedMcp.token } : env;
+}
+
+/** The app-server's `-c` overrides that attach the managed MCP endpoint (both hosts pass these). */
+export function codexManagedMcpConfigArgs(managedMcp?: { name: string; endpointUrl: string } | null): string[] {
+  if (!managedMcp) return [];
+  // Other OS users can read a process's arguments; only its owner can read its environment.
+  return [
+    "-c", `mcp_servers.${managedMcp.name}.url=${JSON.stringify(managedMcp.endpointUrl)}`,
+    "-c", `mcp_servers.${managedMcp.name}.bearer_token_env_var=${JSON.stringify(CODEX_MANAGED_MCP_TOKEN_ENV)}`,
+  ];
+}
+
+export function buildCodexAppServerArgs(managedMcp?: { name: string; endpointUrl: string } | null): string[] {
+  return ["app-server", ...codexManagedMcpConfigArgs(managedMcp), "--listen", "stdio://"];
 }
 
 function isCodexMissingRolloutError(message: string): boolean {
@@ -872,6 +1100,165 @@ function unsupportedInitializeResultMessage(): string {
   return "Codex app-server initialize response is missing the expected userAgent handshake field; upgrade Codex CLI to a compatible app-server build.";
 }
 
+export type CodexThreadRequest = { method: "thread/start" | "thread/resume"; params: Record<string, any> };
+
+/**
+ * What a Codex app-server launch needs before its child exists: the CLI
+ * transport env, the managed MCP endpoint (its URL in argv, its token in the
+ * env only), the resolved command, and the env the app-server itself gets.
+ * The legacy driver spawns from it; the OAR host's Codex launch reuses it, so
+ * both hosts start the same app-server (#wg-ax:#3).
+ */
+export interface CodexLaunchPreparation {
+  /** The CLI transport env (discovery probes run with it, without the MCP token). */
+  spawnEnv: NodeJS.ProcessEnv;
+  managedMcp: ManagedMcpRuntimeEndpoint | null;
+  /** `app-server …` before candidate resolution. */
+  appServerArgs: string[];
+  command: string;
+  args: string[];
+  shell: ReturnType<typeof resolveCodexSpawn>["shell"];
+  source: ReturnType<typeof resolveCodexSpawn>["source"];
+  /** #oar-raft:#7: candidates rejected before this one, and their path-free kinds (`timeout+probe_failed`). */
+  rejectedCandidateCount: number;
+  rejectionKind: string | undefined;
+  /** The env the candidate resolution chose for the child, if any (a Windows npm node host); else undefined. */
+  candidateEnv: NodeJS.ProcessEnv | undefined;
+  /** Windows: the `.cmd` shim the command was resolved from, if any (the OAR host launches it). */
+  windowsShim: string | undefined;
+  /** The env the app-server child gets: the candidate's (or the transport's) plus the managed MCP token. */
+  appServerEnv: NodeJS.ProcessEnv;
+  codexHomeRoot: string | null;
+}
+
+/**
+ * Which Codex install a launch picked, path-free (#14189, #oar-raft:#7): the
+ * chosen candidate's source, how many candidates were rejected before it, and
+ * their kinds. Both hosts record it on `daemon.runtime.node_host_launch`.
+ */
+export function codexCandidateTraceAttrs(
+  prep: Pick<CodexLaunchPreparation, "source" | "rejectedCandidateCount" | "rejectionKind">,
+): { candidate_source: CodexLaunchPreparation["source"]; rejected_candidate_count: number; rejection_kind?: string } {
+  return {
+    candidate_source: prep.source,
+    rejected_candidate_count: prep.rejectedCandidateCount,
+    ...(prep.rejectionKind ? { rejection_kind: prep.rejectionKind } : {}),
+  };
+}
+
+export async function prepareCodexLaunch(ctx: SpawnContext): Promise<CodexLaunchPreparation> {
+  const { spawnEnv } = await prepareCliTransport(ctx, { NO_COLOR: "1" });
+  const managedMcp = await prepareManagedMcpRuntimeProxy({
+    agentId: ctx.agentId,
+    launchId: ctx.launchId,
+    processInstanceId: ctx.processInstanceId,
+    readTurnOrigin: ctx.readTurnOrigin,
+    serverUrl: ctx.config.serverUrl,
+    agentCredentialKey: ctx.config.agentCredentialKey,
+  });
+  const codexHomeRoot = resolveCodexHomeRootFromEnv(spawnEnv, {
+    defaultHomeDir: os.homedir(),
+    cwd: ctx.workingDirectory,
+  });
+  const appServerArgs = buildCodexAppServerArgs(managedMcp);
+  // task #1277: candidate discovery and the app-server probes run as bounded
+  // probe children under this start attempt's signal; a cancelled lookup is
+  // rethrown, never a verdict, and nothing is written to the probe cache.
+  const { command, args, shell, source, env, windowsShim, rejectedCandidateCount, rejectionKind } = await resolveCodexSpawnAsync(appServerArgs, { env: spawnEnv, signal: ctx.launchSignal });
+  return {
+    spawnEnv,
+    managedMcp,
+    appServerArgs,
+    command,
+    args,
+    shell,
+    source,
+    rejectedCandidateCount: rejectedCandidateCount ?? 0,
+    rejectionKind,
+    candidateEnv: env,
+    windowsShim,
+    // Only the app-server itself needs the token, not the discovery probes.
+    appServerEnv: withCodexManagedMcpToken(env ?? spawnEnv, managedMcp),
+    codexHomeRoot,
+  };
+}
+
+/**
+ * What Raft decides about a Codex thread, before any wire shape: the OAR
+ * host's Codex launch maps these to OAR's session options, the legacy driver
+ * to its JSON-RPC params (buildCodexThreadRequest).
+ */
+export interface CodexThreadFields {
+  cwd: string;
+  /** The standing prompt, sent as `developerInstructions` (additive, not `baseInstructions`). */
+  developerInstructions: string;
+  model?: string;
+  reasoningEffort?: string;
+  /** Raft's mode decides the tier on start and resume alike (#11175). */
+  fast: boolean;
+  /** The thread to resume; absent for a fresh thread. */
+  resumeThreadId?: string;
+}
+
+export function codexThreadFields(ctx: Pick<SpawnContext, "workingDirectory" | "standingPrompt" | "config">): CodexThreadFields {
+  const launchRuntimeFields = runtimeConfigToLaunchFields(hydrateRuntimeConfig(ctx.config));
+  return {
+    cwd: ctx.workingDirectory,
+    developerInstructions: ctx.standingPrompt,
+    ...(launchRuntimeFields.model ? { model: launchRuntimeFields.model } : {}),
+    ...(launchRuntimeFields.reasoningEffort ? { reasoningEffort: launchRuntimeFields.reasoningEffort } : {}),
+    fast: launchRuntimeFields.mode.kind === "fast",
+    ...(ctx.config.sessionId ? { resumeThreadId: ctx.config.sessionId } : {}),
+  };
+}
+
+export function buildCodexThreadRequest(ctx: Pick<SpawnContext, "workingDirectory" | "standingPrompt" | "config">): CodexThreadRequest {
+  // We pass the standing prompt as `developerInstructions` (additive, injected
+  // as a developer-role message per turn) rather than `baseInstructions`
+  // (replaces Codex's default base). Resume works because we always re-send
+  // on start/resume. Compaction/session-level persistence is less certain
+  // than `baseInstructions` and needs follow-up validation.
+  const fields = codexThreadFields(ctx);
+  const threadParams: Record<string, any> = {
+    cwd: fields.cwd,
+    approvalPolicy: "never",
+    sandbox: "danger-full-access",
+    sandbox_mode: "danger-full-access",
+    developerInstructions: fields.developerInstructions,
+    // Raw response items are used only as payload-free liveness signals in
+    // the daemon. They replace the previous transcript-mtime heuristic.
+    experimentalRawEvents: true,
+  };
+  if (fields.model) {
+    threadParams.model = fields.model;
+  }
+  if (fields.reasoningEffort) {
+    threadParams.config = { model_reasoning_effort: fields.reasoningEffort };
+  }
+  // Codex 0.164+ resumes with the tier saved in the session when none is sent
+  // (a session started fast stayed fast after fast mode was turned off), and a
+  // fresh start would follow a tier set in the Codex config. `null` clears it
+  // to the default tier (an explicit clear in the 0.163 and 0.164 protocol).
+  threadParams.serviceTier = fields.fast ? "fast" : null;
+
+  if (fields.resumeThreadId) {
+    return {
+      method: "thread/resume",
+      params: {
+        threadId: fields.resumeThreadId,
+        ...threadParams,
+        // Resume model context without returning history the daemon does not consume.
+        excludeTurns: true,
+      },
+    };
+  }
+
+  return {
+    method: "thread/start",
+    params: threadParams,
+  };
+}
+
 export class CodexDriver implements RuntimeDriver {
   readonly id = "codex";
   readonly lifecycle = {
@@ -886,6 +1273,9 @@ export class CodexDriver implements RuntimeDriver {
   readonly stdoutChannel = "structured_protocol" as const;
   readonly session = {
     recovery: "resume_or_fresh",
+    // CodexEventNormalizer emits the compaction events.
+    compaction: "reported",
+    compactionFailure: "does_not_stick",
   } as const;
   readonly model = {
     detectedModelsVerifiedAs: "launchable",
@@ -896,61 +1286,26 @@ export class CodexDriver implements RuntimeDriver {
   readonly supportsStdinNotification = true;
   readonly busyDeliveryMode = "direct" as const;
   readonly supportsNativeStandingPrompt = true;
+  // A sub-agent that finishes after the turn ended is queued for the next turn, never woken.
+  readonly needsWakeAfterSubagents = true;
+  // Codex's `spawn_agent` (`multi_agent`, on by default) tells the model not to
+  // spawn unless the user or AGENTS.md explicitly asks for sub-agents; the
+  // delegation section is that ask (#proj-raft-computer:#41).
+  readonly supportsSubagents = true;
 
   probe(): RuntimeProbeResult {
     return probeCodex();
   }
 
-  buildThreadRequest(ctx: SpawnContext): { method: "thread/start" | "thread/resume"; params: Record<string, any> } {
-    // We pass the standing prompt as `developerInstructions` (additive, injected
-    // as a developer-role message per turn) rather than `baseInstructions`
-    // (replaces Codex's default base). Resume works because we always re-send
-    // on start/resume. Compaction/session-level persistence is less certain
-    // than `baseInstructions` and needs follow-up validation.
-    const threadParams: Record<string, any> = {
-      cwd: ctx.workingDirectory,
-      approvalPolicy: "never",
-      sandbox: "danger-full-access",
-      sandbox_mode: "danger-full-access",
-      developerInstructions: ctx.standingPrompt,
-      // Raw response items are used only as payload-free liveness signals in
-      // the daemon. They replace the previous transcript-mtime heuristic.
-      experimentalRawEvents: true,
-    };
-    const launchRuntimeFields = runtimeConfigToLaunchFields(hydrateRuntimeConfig(ctx.config));
-    if (launchRuntimeFields.model) {
-      threadParams.model = launchRuntimeFields.model;
-    }
-    if (launchRuntimeFields.reasoningEffort) {
-      threadParams.config = { model_reasoning_effort: launchRuntimeFields.reasoningEffort };
-    }
-    if (launchRuntimeFields.mode.kind === "fast") {
-      threadParams.serviceTier = "fast";
-    }
-
-    if (ctx.config.sessionId) {
-      return {
-        method: "thread/resume",
-        params: {
-          threadId: ctx.config.sessionId,
-          ...threadParams,
-          // Resume model context without returning history the daemon does not consume.
-          excludeTurns: true,
-        },
-      };
-    }
-
-    return {
-      method: "thread/start",
-      params: threadParams,
-    };
+  buildThreadRequest(ctx: SpawnContext): CodexThreadRequest {
+    return buildCodexThreadRequest(ctx);
   }
 
   private process: ChildProcess | null = null;
   private requestId = 0;
   private pendingInitialPrompt: string | null = null;
   private initializeRequestId: JsonRpcId | null = null;
-  private pendingThreadRequest: { method: "thread/start" | "thread/resume"; params: Record<string, any> } | null = null;
+  private pendingThreadRequest: CodexThreadRequest | null = null;
   private pendingThreadRequestId: JsonRpcId | null = null;
   private pendingThreadRequestMethod: "thread/start" | "thread/resume" | null = null;
   private lastThreadRequestMethod: "thread/start" | "thread/resume" | null = null;
@@ -995,13 +1350,8 @@ export class CodexDriver implements RuntimeDriver {
   }
 
   async spawn(ctx: SpawnContext): Promise<SpawnResult> {
-    const { spawnEnv } = await prepareCliTransport(ctx, { NO_COLOR: "1" });
-    const managedMcp = await prepareManagedMcpRuntimeProxy({
-      agentId: ctx.agentId,
-      launchId: ctx.launchId,
-      serverUrl: ctx.config.serverUrl,
-      agentCredentialKey: ctx.config.agentCredentialKey,
-    });
+    const launch = await prepareCodexLaunch(ctx);
+    const { managedMcp } = launch;
 
     this.process = null;
     this.requestId = 0;
@@ -1046,17 +1396,8 @@ export class CodexDriver implements RuntimeDriver {
     this.instructionShapeCompactionStarts = 0;
     this.instructionShapeCompactionFinishes = 0;
     this.instructionShapePostCompactionRequestPending = false;
-    this.codexHomeRoot = resolveCodexHomeRootFromEnv(spawnEnv, {
-      defaultHomeDir: os.homedir(),
-      cwd: ctx.workingDirectory,
-    });
-
-    const args = buildCodexAppServerArgs(managedMcp);
-
-    // task #1277: candidate discovery and the app-server probes run as bounded
-    // probe children under this start attempt's signal; a cancelled lookup is
-    // rethrown, never a verdict, and nothing is written to the probe cache.
-    const { command, args: spawnArgs, shell, source, env } = await resolveCodexSpawnAsync(args, { env: spawnEnv, signal: ctx.launchSignal });
+    this.codexHomeRoot = launch.codexHomeRoot;
+    const { command, args: spawnArgs, shell, candidateEnv, appServerEnv } = launch;
     const launchSpan = ctx.tracer?.startSpan("daemon.runtime.node_host_launch", {
       surface: "daemon",
       kind: "internal",
@@ -1064,7 +1405,7 @@ export class CodexDriver implements RuntimeDriver {
         agentId: ctx.agentId,
         launchId: ctx.launchId || undefined,
         runtime: this.id,
-        candidate_source: source,
+        ...codexCandidateTraceAttrs(launch),
         // Reports the host we actually detected. The previous attribute was
         // `exec_path_is_node: !versions.electron`, which inferred "is node"
         // from "is not Electron" — so on the official SEA installs, where
@@ -1072,7 +1413,7 @@ export class CodexDriver implements RuntimeDriver {
         // that the exec path WAS node. The one shape most likely to be broken
         // was the one it called healthy.
         host_kind: detectNodeHostKind(),
-        electron_run_as_node: env?.ELECTRON_RUN_AS_NODE === "1",
+        electron_run_as_node: candidateEnv?.ELECTRON_RUN_AS_NODE === "1",
       },
     });
     // task #365: after the last await, right before the child exists.
@@ -1084,7 +1425,7 @@ export class CodexDriver implements RuntimeDriver {
       proc = spawnRuntimeChild(command, spawnArgs, {
         cwd: ctx.workingDirectory,
         stdio: ["pipe", "pipe", "pipe"],
-        env: env ?? spawnEnv,
+        env: appServerEnv,
         shell,
       });
       launchSpan?.end("ok");
@@ -1291,6 +1632,17 @@ export class CodexDriver implements RuntimeDriver {
       return events;
     }
 
+    if (isResponse && message.id !== undefined && this.pendingSubagentInterruptRequests.delete(message.id)) {
+      // A refused sub-agent stop leaves that sub-agent running; nothing else to do.
+      return events;
+    }
+
+    if (isResponse && message.id !== undefined && this.pendingInterruptRequests.delete(message.id)) {
+      // A refused interrupt leaves the turn running: the daemon's interrupt
+      // timeout restarts the runtime (daemon.agent.turn_interrupt.native_fallback).
+      return events;
+    }
+
     if (isResponse && message.id !== undefined && this.pendingDeliveryRequests.has(message.id)) {
       const deliveryRequest = this.pendingDeliveryRequests.get(message.id)!;
       this.pendingDeliveryRequests.delete(message.id);
@@ -1393,9 +1745,45 @@ export class CodexDriver implements RuntimeDriver {
     return encoded;
   }
 
+  /**
+   * Codex's native `turn/interrupt` for the running turn. Codex answers with
+   * `turn/completed` status `interrupted`; the daemon falls back to a restart
+   * when no turn has started yet or the turn does not end in time.
+   */
+  encodeInterruptRequest(): string | null {
+    // Codex leaves the interrupted command running and the daemon cannot kill a
+    // turn's processes on Windows, so a Stop there keeps restarting the runtime.
+    if (process.platform === "win32") return null;
+    const threadId = this.normalizer.threadId;
+    const turnId = this.normalizer.activeTurnId;
+    if (!threadId || !turnId) return null;
+    this.normalizer.noteInterruptRequested();
+    const id = this.nextRequestId();
+    this.pendingInterruptRequests.add(id);
+    return JSON.stringify({ jsonrpc: "2.0", id, method: "turn/interrupt", params: { threadId, turnId } });
+  }
+
+  private readonly pendingInterruptRequests = new Set<JsonRpcId>();
+
+  /**
+   * #proj-runtime:#41: `turn/interrupt` for one sub-agent's running turn.
+   * Verified on Codex 0.166: that thread's turn ends `interrupted`; the
+   * agent's turn and its other sub-agents carry on. Its answer is ignored.
+   */
+  encodeSubagentInterruptRequest(subagentTaskId: string): string | null {
+    const turn = this.normalizer.runningSubagentTurn(subagentTaskId);
+    if (!turn) return null;
+    const id = this.nextRequestId();
+    this.pendingSubagentInterruptRequests.add(id);
+    return JSON.stringify({ jsonrpc: "2.0", id, method: "turn/interrupt", params: turn });
+  }
+
+  private readonly pendingSubagentInterruptRequests = new Set<JsonRpcId>();
+
   buildSystemPrompt(config: AgentConfig, _agentId: string): AxSurfaceText {
     return buildCliTransportSystemPrompt(config, {
       extraCriticalRules: [],
+      supportsSubagents: this.supportsSubagents,
     });
   }
 
@@ -1697,7 +2085,7 @@ function codexModelSetFromAppServerEntries(entries: unknown[]): RuntimeModelSet 
 // of execFileSync. The synchronous resolver stays for the launch path and the
 // detection child until their own PRs.
 
-async function resolveWindowsNpmCodexEntryAsync(deps: ProbeDeps = {}): Promise<{ entry: string | null; note?: string }> {
+async function resolveWindowsNpmCodexEntryAsync(deps: ProbeDeps = {}): Promise<{ entry: string | null; shim?: string; note?: string }> {
   const existsSyncFn = deps.existsSyncFn ?? existsSync;
   const runChild = deps.runProbeChildFn ?? runProbeChild;
   const env = deps.env ?? ambientProcessEnv();
@@ -1713,7 +2101,9 @@ async function resolveWindowsNpmCodexEntryAsync(deps: ProbeDeps = {}): Promise<{
       signal: deps.signal,
     })).stdout.trim();
     const candidate = winPath.join(globalRoot, "@openai", "codex", "bin", "codex.js");
-    if (existsSyncFn(candidate)) return { entry: candidate };
+    // npm's global shims sit in the prefix, one level above `npm root -g`.
+    const shim = winPath.join(winPath.dirname(globalRoot), "codex.cmd");
+    if (existsSyncFn(candidate)) return { entry: candidate, shim: existsSyncFn(shim) ? oarRunnableShim(shim, deps) : undefined };
   } catch (error) {
     // A cancelled discovery stops here, with the runner's cleanup evidence
     // intact (an unconfirmed cleanup must not be replaced by a later, cleaner
@@ -1727,7 +2117,7 @@ async function resolveWindowsNpmCodexEntryAsync(deps: ProbeDeps = {}): Promise<{
   const cmdPath = await resolveCommandOnPathAsync("codex", deps);
   if (cmdPath) {
     const candidate = winPath.join(winPath.dirname(cmdPath), "node_modules", "@openai", "codex", "bin", "codex.js");
-    if (existsSyncFn(candidate)) return { entry: candidate, ...(note ? { note } : {}) };
+    if (existsSyncFn(candidate)) return { entry: candidate, shim: isWindowsBatchFile(cmdPath) ? oarRunnableShim(cmdPath, deps) : undefined, ...(note ? { note } : {}) };
   }
 
   return { entry: null, ...(note ? { note } : {}) };
@@ -1746,6 +2136,7 @@ async function windowsDirectCodexCandidateAsync(
       argsPrefix: launch.args,
       shell: false,
       ...(launch.env ? { env: launch.env } : {}),
+      ...(isWindowsBatchFile(command) && oarRunnableShim(command, deps) ? { windowsShim: command } : {}),
     };
   } catch (error) {
     if (!(error instanceof RuntimeExecutableNotFoundError)) throw error;
@@ -1771,7 +2162,7 @@ async function resolveExplicitCodexBinAsync(deps: ProbeDeps): Promise<ExplicitCo
   }
 
   if (platform === "win32" && isWindowsSandboxRunner(command)) {
-    return { status: "invalid", raw, reason: "points at codex-command-runner sandbox helper, not the Codex CLI" };
+    return { status: "invalid", raw, reason: "points at a Codex sandbox helper (codex-command-runner or .sandbox-bin), not the Codex CLI" };
   }
 
   if (platform === "win32") {
@@ -1801,7 +2192,7 @@ async function codexSpawnCandidatesAsync(deps: ProbeDeps = {}): Promise<CodexSpa
           execIsSea: deps.execIsSea,
           hasNodeRuntime: deps.hasNodeRuntime,
         });
-        candidates.push({ source: "npm_global", command: nodeHost.command, argsPrefix: [npmEntry], shell: false, env: nodeHost.env });
+        candidates.push({ source: "npm_global", command: nodeHost.command, argsPrefix: [...nodeHost.execArgv, npmEntry], shell: false, env: nodeHost.env, ...(npm.shim ? { windowsShim: npm.shim } : {}) });
       } catch (error) {
         if (!(error instanceof NodeHostUnavailableError)) throw error;
         rejected.push(`npm_global JavaScript entry rejected: ${error.kind} (host_kind=${error.hostKind})`);
@@ -1809,14 +2200,15 @@ async function codexSpawnCandidatesAsync(deps: ProbeDeps = {}): Promise<CodexSpa
     }
 
     const { command, missReason: pathMissReason } = await lookupCommandOnPathAsync("codex", deps);
+    if (command && isWindowsSandboxRunner(command)) rejected.push(CODEX_PATH_SANDBOX_HELPER_REJECTION);
     if (command && !isWindowsSandboxRunner(command)) {
       const direct = await windowsDirectCodexCandidateAsync("path", command, deps);
       if (typeof direct === "string") rejected.push(direct);
       else candidates.push(direct);
     }
 
-    const desktopEntry = resolveWindowsCodexDesktopEntry(deps);
-    if (desktopEntry && !candidates.some((candidate) => candidate.command === desktopEntry)) {
+    for (const desktopEntry of windowsCodexDesktopEntries(deps)) {
+      if (candidates.some((candidate) => candidate.command === desktopEntry)) continue;
       candidates.push({ source: "desktop_install", command: desktopEntry, argsPrefix: [], shell: false });
     }
 
@@ -1843,24 +2235,23 @@ async function codexSpawnCandidatesAsync(deps: ProbeDeps = {}): Promise<CodexSpa
 async function probeCodexCandidateAsync(
   candidate: CodexSpawnCandidate,
   deps: ProbeDeps = {},
-): Promise<{ failure: string | null; version: string | null }> {
+  probeTimeoutMs: number = CODEX_PROBE_CHILD_TIMEOUT_MS,
+): Promise<CodexProbeOutcome> {
   const runChild = deps.runProbeChildFn ?? runProbeChild;
   const platform = deps.platform ?? process.platform;
   const env = await withWindowsUserEnvironmentAsync(candidate.env ?? deps.env ?? ambientProcessEnv(), deps);
   const stat = readCandidateStat(candidate, deps);
   const cacheKey = codexCandidateCacheKey(candidate);
-  if (stat) {
-    const cached = codexProbeCache.get(cacheKey);
-    if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
-      return { failure: cached.failure, version: cached.version };
-    }
-  }
+  const cached = readCodexProbeCache(cacheKey, stat, deps, probeTimeoutMs);
+  if (cached) return cached;
 
   let failure: string | null = null;
+  let versionFailed = false;
+  let timedOut = false;
   try {
     await runChild(candidate.command, [...candidate.argsPrefix, ...CODEX_APP_SERVER_PROBE_ARGS], {
       env,
-      timeoutMs: 5000,
+      timeoutMs: probeTimeoutMs,
       shell: candidate.shell,
       platform,
       signal: deps.signal,
@@ -1870,7 +2261,7 @@ async function probeCodexCandidateAsync(
     // classified, and above all not written to the shared cache, where it
     // would reject this candidate for every later resolution.
     if (error instanceof ProbeChildError && error.code === "ABORT_ERR") throw error;
-    failure = describeCodexProbeFailure(error);
+    ({ failure, timedOut } = classifyCodexProbeError(error));
   }
 
   let version: string | null = null;
@@ -1878,7 +2269,8 @@ async function probeCodexCandidateAsync(
     try {
       const { stdout } = await runChild(candidate.command, [...candidate.argsPrefix, "--version"], {
         env,
-        timeoutMs: 5000,
+        // The same budget as the app-server check: a slow machine's retry must not lose its version.
+        timeoutMs: probeTimeoutMs,
         shell: candidate.shell,
         platform,
         signal: deps.signal,
@@ -1888,13 +2280,12 @@ async function probeCodexCandidateAsync(
       // Same rule for the version read: a cancel is not "unknown version".
       if (error instanceof ProbeChildError && error.code === "ABORT_ERR") throw error;
       version = null;
+      versionFailed = true;
     }
   }
 
-  if (stat) {
-    codexProbeCache.set(cacheKey, { mtimeMs: stat.mtimeMs, size: stat.size, appServerOk: failure === null, version, failure });
-  }
-  return { failure, version };
+  writeCodexProbeCache(cacheKey, stat, deps, { failure, version, timedOut, transient: failure !== null || versionFailed, probeTimeoutMs });
+  return { failure, version, timedOut };
 }
 
 async function resolveCompatibleCodexCandidateAsync(deps: ProbeDeps = {}): Promise<ReturnType<typeof resolveCompatibleCodexCandidate>> {
@@ -1906,14 +2297,16 @@ async function resolveCompatibleCodexCandidateAsync(deps: ProbeDeps = {}): Promi
     return { candidate: null, rejected: [`${CODEX_BIN_ENV}=${explicit.raw} rejected: ${explicit.reason}`], version: null, notes: [], explicitOverrideFailed: true };
   }
   if (explicit.status === "resolved") {
-    const { failure, version } = await probeCodexCandidateAsync(explicit.candidate, deps);
+    const outcome = await probeCodexCandidateAsync(explicit.candidate, deps);
+    const { failure, version } = outcome;
     if (failure) {
       return {
         candidate: null,
-        rejected: [`${CODEX_BIN_ENV}=${formatCodexCandidate(explicit.candidate)} rejected: app-server probe ${failure}`],
+        rejected: [codexRejection(`${CODEX_BIN_ENV}=${formatCodexCandidate(explicit.candidate)}`, outcome)],
         version: null,
         notes: [],
         explicitOverrideFailed: true,
+        ...(outcome.timedOut ? { allRejectionsTimedOut: true as const } : {}),
       };
     }
     notes.push(
@@ -1924,18 +2317,51 @@ async function resolveCompatibleCodexCandidateAsync(deps: ProbeDeps = {}): Promi
     return { candidate: explicit.candidate, rejected: [], version, notes, explicitOverrideFailed: false };
   }
 
-  let best: { candidate: CodexSpawnCandidate; version: string | null } | null = null;
   const discovery = await codexSpawnCandidatesAsync(deps);
   rejected.push(...discovery.rejected);
   notes.push(...discovery.notes);
+  let timedOutRejections = 0;
+  /** Discovery order; `version` is set for a candidate whose check passed. */
+  const results: Array<{ candidate: CodexSpawnCandidate; passed: boolean; version: string | null; rejection?: string }> = [];
   // Candidates are probed one after another, as the synchronous resolver does,
   // so version arbitration sees them in the same order.
   for (const candidate of discovery.candidates) {
-    const { failure, version } = await probeCodexCandidateAsync(candidate, deps);
-    if (failure) {
-      rejected.push(`${candidate.source} ${formatCodexCandidate(candidate)} rejected: app-server probe ${failure}`);
+    const outcome = await probeCodexCandidateAsync(candidate, deps);
+    if (outcome.failure) {
+      const rejection = codexRejection(`${candidate.source} ${formatCodexCandidate(candidate)}`, outcome);
+      rejected.push(rejection);
+      if (outcome.timedOut) {
+        timedOutRejections += 1;
+        results.push({ candidate, passed: false, version: null, rejection });
+      }
       continue;
     }
+    results.push({ candidate, passed: true, version: outcome.version });
+  }
+
+  // #oar-raft:#7: a timed-out candidate does not simply lose to whatever else
+  // passed. One longer check each (cached, so once per failure TTL); one that
+  // passes competes by version in its discovery place, as if it had passed first time.
+  for (const entry of results) {
+    if (entry.passed || entry.rejection === undefined) continue;
+    const retry = await probeCodexCandidateAsync(entry.candidate, deps, CODEX_PROBE_RETRY_TIMEOUT_MS);
+    const label = `${entry.candidate.source} ${formatCodexCandidate(entry.candidate)}`;
+    const index = rejected.indexOf(entry.rejection);
+    if (retry.failure) {
+      if (index >= 0) rejected[index] = codexRejection(label, retry);
+      if (!retry.timedOut) timedOutRejections -= 1;
+      continue;
+    }
+    if (index >= 0) rejected.splice(index, 1);
+    timedOutRejections -= 1;
+    notes.push(`${label} (${retry.version ?? "unknown"}) passed a longer app-server check after timing out`);
+    entry.passed = true;
+    entry.version = retry.version;
+  }
+
+  let best: { candidate: CodexSpawnCandidate; version: string | null } | null = null;
+  for (const { candidate, passed, version } of results) {
+    if (!passed) continue;
     if (!best) {
       best = { candidate, version };
       continue;
@@ -1957,12 +2383,13 @@ async function resolveCompatibleCodexCandidateAsync(deps: ProbeDeps = {}): Promi
     notes,
     explicitOverrideFailed: false,
     ...(discovery.pathMissReason ? { pathMissReason: discovery.pathMissReason } : {}),
+    ...(!best && rejected.length > 0 && timedOutRejections === rejected.length ? { allRejectionsTimedOut: true as const } : {}),
   };
 }
 
 /** task #1277 — {@link resolveCodexSpawn} off the event loop; same selection and the same error texts. */
 export async function resolveCodexSpawnAsync(commandArgs: string[], deps: ProbeDeps = {}): Promise<ReturnType<typeof resolveCodexSpawn>> {
-  const { candidate, rejected, explicitOverrideFailed } = await resolveCompatibleCodexCandidateAsync(deps);
+  const { candidate, rejected, explicitOverrideFailed, allRejectionsTimedOut } = await resolveCompatibleCodexCandidateAsync(deps);
   if (candidate) {
     return {
       command: candidate.command,
@@ -1970,8 +2397,13 @@ export async function resolveCodexSpawnAsync(commandArgs: string[], deps: ProbeD
       shell: candidate.shell,
       source: candidate.source,
       ...(candidate.env ? { env: candidate.env } : {}),
+      ...(candidate.windowsShim ? { windowsShim: candidate.windowsShim } : {}),
+      ...codexRejectionSummary(rejected),
     };
   }
+
+  // task #1358: found, but the check timed out — a typed timeout, not "not found".
+  if (allRejectionsTimedOut) throw codexProbeTimeoutError(explicitOverrideFailed);
 
   const search = describeSearchPath(deps);
   const rejectedNote = rejected.length > 0 ? ` Rejected candidates: ${rejected.join("; ")}.` : "";

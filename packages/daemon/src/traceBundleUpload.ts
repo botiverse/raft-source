@@ -4,7 +4,8 @@ import { mkdir, open, readFile, readdir, rename, rm, stat, writeFile } from "nod
 import path from "node:path";
 import { errorClassOf, errorCodeOf } from "@botiverse/raft-shared";
 import type { Tracer } from "@botiverse/raft-shared";
-import { uploadWithSignedCapability } from "./directUploadCapability";
+import { DirectUploadTargetOriginError, uploadWithSignedCapability } from "./directUploadCapability";
+import { logger } from "./logger";
 import { bucketDelayMs, computeTraceJitter, NO_JITTER, traceFileFamily, type TraceJitter } from "@botiverse/raft-trace-client";
 
 const TRACE_UPLOAD_SCOPE = "daemon-trace-bundle:create";
@@ -241,7 +242,22 @@ export interface DaemonTraceBundleUploaderOptions {
   machineDir: string;
   serverUrl: string;
   apiKey: string;
-  workerUrl: string;
+  /**
+   * Machine-level upload URL (env or default; see traceUploadUrl.ts). Used for
+   * the Computer's diagnostics markers (`daemon-trace-diag-*`), which carry
+   * every runner's log tail and so must never go to one server's receiver.
+   */
+  /** Machine-level receiver; null when this runner has none (a server that is not Raft's, nothing configured). */
+  workerUrl: string | null;
+  /**
+   * Upload URL for this runner's own bundles, read per upload so it follows
+   * the attached server's `machine:context`. Falls back to `workerUrl`.
+   * `serverProvided` pins every hop to that URL's origin (no redirects, PUT
+   * target on the same origin): the daemon did not choose that receiver.
+   */
+  runnerWorkerUrl?: () => RunnerWorkerTarget;
+  /** RAFT_PRIVACY_MODE, read per upload (the server can turn it on after start): nothing is uploaded. */
+  privacyMode?: () => boolean;
   tracer?: Tracer;
   fetchImpl?: FetchLike;
   intervalMs?: number;
@@ -286,6 +302,12 @@ export interface DaemonTraceBundleUploaderOptions {
   timers?: Timers;
 }
 
+export interface RunnerWorkerTarget {
+  /** Null: no receiver for this runner (a server that is not Raft's, nothing configured); nothing is uploaded. */
+  url: string | null;
+  serverProvided: boolean;
+}
+
 export class DaemonTraceBundleUploader {
   private readonly options: DaemonTraceBundleUploaderOptions;
   private readonly jitter: TraceJitter;
@@ -297,6 +319,7 @@ export class DaemonTraceBundleUploader {
   /** A scheduled pass still uploading; at most one runs at a time. */
   private scheduledPassInFlight = false;
   private stopped = false;
+  private warnedTargetOrigin = false;
 
   constructor(options: DaemonTraceBundleUploaderOptions) {
     this.options = options;
@@ -507,7 +530,10 @@ export class DaemonTraceBundleUploader {
       try {
         const info = await stat(file);
         if (!info.isFile() || info.size <= 0) continue;
-        if (now - info.mtimeMs < minAgeMs) continue;
+        // `minAgeMs: 0` means no age check: `Date.now()` is whole
+        // milliseconds and `mtimeMs` is not, so a file written in the same
+        // millisecond reads as slightly in the future.
+        if (minAgeMs > 0 && now - info.mtimeMs < minAgeMs) continue;
         candidates.push(file);
       } catch {
         // Trace upload must stay fail-open.
@@ -583,13 +609,26 @@ export class DaemonTraceBundleUploader {
     }
   }
 
+  /** Diag markers are machine-level; everything else this runner wrote is per-server. */
+  private workerTargetFor(file: string): RunnerWorkerTarget {
+    if (this.options.privacyMode?.()) return { url: null, serverProvided: false };
+    const machineLevel = { url: this.options.workerUrl, serverProvided: false };
+    if (traceFileFamily(path.basename(file)) === "diag") return machineLevel;
+    const runner = this.options.runnerWorkerUrl?.();
+    return runner?.url ? runner : machineLevel;
+  }
+
   private async uploadFile(file: string, trigger: UploadTrigger): Promise<boolean> {
+    const { url: workerUrl, serverProvided } = this.workerTargetFor(file);
+    // No receiver for this runner (traceUploadUrl.ts): nothing leaves the
+    // machine, and no span per file per tick says so.
+    if (!workerUrl) return false;
     const span = this.options.tracer?.startSpan("daemon.bundle.upload", {
       surface: "daemon",
       kind: "producer",
       attrs: {
         file_present: true,
-        worker_url_present: Boolean(this.options.workerUrl),
+        worker_url_present: Boolean(workerUrl),
         upload_trigger: trigger,
         initial_delay_ms_bucket: bucketDelayMs(this.jitter.initialUploadDelayMs),
         interval_jitter_ms_bucket: bucketDelayMs(this.jitter.uploadIntervalJitterMs),
@@ -607,7 +646,7 @@ export class DaemonTraceBundleUploader {
       const { capability } = await uploadWithSignedCapability({
         serverUrl: this.options.serverUrl,
         apiKey: this.options.apiKey,
-        workerUrl: this.options.workerUrl,
+        workerUrl,
         scope: TRACE_UPLOAD_SCOPE,
         createPath: "/api/trace-bundles",
         attestationMetadata: {
@@ -625,6 +664,7 @@ export class DaemonTraceBundleUploader {
         },
         uploadBody: new Blob([new Uint8Array(gzipped)], { type: "application/x-ndjson" }),
         fetchImpl: this.options.fetchImpl,
+        pinWorkerOrigin: serverProvided,
       });
       // The server mints the uploadId and derives the object key from it
       // (`trace-bundles/<serverId>/<machineId>/<uploadId>.jsonl.gz`), and hands
@@ -660,6 +700,10 @@ export class DaemonTraceBundleUploader {
       });
       return true;
     } catch (err) {
+      if (err instanceof DirectUploadTargetOriginError && !this.warnedTargetOrigin) {
+        this.warnedTargetOrigin = true;
+        logger.warn("[Daemon] Trace upload refused: the server-named receiver returned an upload target on another origin");
+      }
       span?.end("error", {
         attrs: {
           error_class: err instanceof Error ? err.name : "Error",

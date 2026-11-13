@@ -19,7 +19,7 @@ import {
   setNewsletterContactClientForTest,
 } from "../services/newsletterService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 async function register(baseUrl: string, suffix: string, name?: string) {
   const response = await fetch(`${baseUrl}/api/auth/register`, {
@@ -56,7 +56,7 @@ test("identity setup creates a pending account, gates business writes, and compl
       return { id: "identity-contact" };
     },
   });
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const { response, body } = await register(app.baseUrl, "pending-flow");
     assert.equal(response.status, 200);

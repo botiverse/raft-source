@@ -36,6 +36,7 @@ FROM unread AS x
 LEFT JOIN rw_target_latest_v4 AS tl ON tl.target_id = x.target_id;
 
 -- Muted, full count (sidebar). Same as normal_v5 over rw_muted_subs_v1.
+-- Not every environment keeps it.
 CREATE MATERIALIZED VIEW rw_inbox_muted_full_v2 AS
 WITH unread AS (
   SELECT s.kind, s.receiver_type, s.receiver_id, s.target_id, s.server_id, s.done_at, s.joined_at,

@@ -181,3 +181,83 @@ test("an OAR snapshot ABOVE the wire's window ceiling becomes an explicit error,
   );
   assertOnWire(snapshot); // and the result must itself be wire-valid
 });
+
+test("OAR's count of limit resets is carried per account; detail rows and odd counts never are", () => {
+  const withResets = project({
+    kind: "available",
+    email: "someone@example.com",
+    rateLimited: true,
+    windows: [{ label: "5 hours", usedRatio: 1 }],
+    limitResets: { available: 2, resets: [{ id: "credit-1", status: "available", title: "Reset" }] },
+  } satisfies OarAccountUsageSnapshot);
+  assert.equal(withResets.accounts[0]?.limitResetsAvailable, 2);
+  assert.ok(!JSON.stringify(withResets).includes("credit-1"), "reset ids and details stay on the Computer");
+  assertOnWire(withResets);
+
+  const none = project({ kind: "available", rateLimited: false, windows: [], limitResets: { available: 0 } } satisfies OarAccountUsageSnapshot);
+  assert.equal(none.accounts[0]?.limitResetsAvailable, 0, "zero is a reading, not an absence");
+  assertOnWire(none);
+
+  const absent = project({ kind: "available", rateLimited: false, windows: [] } satisfies OarAccountUsageSnapshot);
+  assert.equal("limitResetsAvailable" in absent.accounts[0]!, false, "a runtime that reports none sends nothing");
+
+  for (const available of [-1, 1.5, 1000, Number.NaN]) {
+    const odd = project({ kind: "available", rateLimited: false, windows: [], limitResets: { available } } satisfies OarAccountUsageSnapshot);
+    assert.equal("limitResetsAvailable" in odd.accounts[0]!, false, `count ${available} is not carried`);
+    assertOnWire(odd);
+  }
+});
+
+test("OAR's window scope is forwarded as given; an absent one stays absent, an unsafe model name is dropped", () => {
+  const snapshot = projectOarAccountUsageSnapshot({
+    provider: "claude",
+    snapshot: {
+      kind: "available",
+      rateLimited: false,
+      windows: [
+        { label: "Current session", usedRatio: 0.2, id: "five_hour", scope: { kind: "account" } },
+        { label: "Current week (all models)", usedRatio: 0.6, id: "seven_day", scope: { kind: "account" } },
+        { label: "Current week (OAuth apps)", usedRatio: 0.1, id: "seven_day_oauth_apps" },
+        { label: "Current week (Opus)", usedRatio: 1, id: "model_scoped:Opus", scope: { kind: "model", name: "Opus" } },
+        { label: "Current week (Odd)", usedRatio: 0.3, scope: { kind: "model", name: "bad\u0007name" } },
+      ],
+    } satisfies OarAccountUsageSnapshot,
+    ...BASE,
+  });
+  const windows = snapshot.accounts[0]!.windows;
+  assert.deepEqual(windows.map((window) => window.scope), [
+    { kind: "account" },
+    { kind: "account" },
+    undefined,
+    { kind: "model", name: "Opus" },
+    undefined,
+  ]);
+  assert.equal("scope" in windows[2]!, false, "no scope is not sent as an account scope");
+  assert.equal(windows[3]!.status, "limit_reached");
+  assertOnWire(snapshot);
+});
+
+test("OAR 0.103's models scope (Antigravity's model groups) is forwarded with the group's name; an unsafe one is dropped", () => {
+  const snapshot = projectOarAccountUsageSnapshot({
+    provider: "antigravity",
+    snapshot: {
+      kind: "available",
+      rateLimited: false,
+      windows: [
+        { label: "Gemini Models · Weekly", usedRatio: 1, id: "gemini_weekly", scope: { kind: "models", name: "Gemini Models" } },
+        { label: "Claude and GPT models · 5h", usedRatio: 0.25, id: "claude_5h", scope: { kind: "models", name: "Claude and GPT models" } },
+        { label: "Odd · Weekly", usedRatio: 0.1, scope: { kind: "models", name: "bad\u0007group" } },
+      ],
+    } satisfies OarAccountUsageSnapshot,
+    ...BASE,
+  });
+  const account = snapshot.accounts[0]!;
+  assert.deepEqual(account.windows.map((window) => window.scope), [
+    { kind: "models", name: "Gemini Models" },
+    { kind: "models", name: "Claude and GPT models" },
+    undefined,
+  ]);
+  assert.equal(account.windows[0]!.status, "limit_reached", "one group used up shows on its own window");
+  assert.equal(account.health, "ok", "the account is rate limited only as OAR says (every group used up, no credits)");
+  assertOnWire(snapshot);
+});

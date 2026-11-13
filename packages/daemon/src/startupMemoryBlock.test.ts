@@ -19,22 +19,18 @@ function workspaceWithMemory(content: string | null): string {
   return dir;
 }
 
-test("the block runs only with the server flag; env can turn it off but never on; per-agent env beats process env", () => {
-  assert.equal(resolveStartupMemoryBlockConfig(undefined, null, {}).enabled, false, "older server: no field means off");
-  assert.equal(resolveStartupMemoryBlockConfig(false, null, {}).enabled, false);
-  assert.equal(resolveStartupMemoryBlockConfig(false, { RAFT_STARTUP_MEMORY_BLOCK: "1" }, { RAFT_STARTUP_MEMORY_BLOCK: "1" }).enabled, false, "env cannot turn it on");
-
-  const defaults = resolveStartupMemoryBlockConfig(true, null, {});
-  assert.equal(defaults.enabled, true);
-  assert.equal(resolveStartupMemoryBlockConfig(true, null, { RAFT_STARTUP_MEMORY_BLOCK: "0" }).enabled, false);
+test("the block is on by default, independent of the retired server field; env =0 turns it off; per-agent env beats process env", () => {
+  const defaults = resolveStartupMemoryBlockConfig(null, {});
+  assert.equal(defaults.enabled, true, "no env: on");
   assert.equal(defaults.budgetTokens, 4_000);
+  assert.equal(resolveStartupMemoryBlockConfig(null, { RAFT_STARTUP_MEMORY_BLOCK: "0" }).enabled, false, "daemon process env =0 turns it off");
+  assert.equal(resolveStartupMemoryBlockConfig({ RAFT_STARTUP_MEMORY_BLOCK: "0" }, {}).enabled, false, "per-agent env =0 turns it off");
 
-  const fromProcess = resolveStartupMemoryBlockConfig(true, null, { RAFT_STARTUP_MEMORY_BLOCK: "1", RAFT_STARTUP_MEMORY_BLOCK_TOKENS: "2000" });
+  const fromProcess = resolveStartupMemoryBlockConfig(null, { RAFT_STARTUP_MEMORY_BLOCK: "1", RAFT_STARTUP_MEMORY_BLOCK_TOKENS: "2000" });
   assert.equal(fromProcess.enabled, true);
   assert.equal(fromProcess.budgetTokens, 2_000);
 
   const agentWins = resolveStartupMemoryBlockConfig(
-    true,
     { RAFT_STARTUP_MEMORY_BLOCK: "0" },
     { RAFT_STARTUP_MEMORY_BLOCK: "1" },
   );
@@ -130,8 +126,7 @@ test("recycled briefing orders chrome, then memory block, then constructed panel
   const config = {
     runtime: "claude",
     sessionId,
-    constructedWakeContext: true,
-    envVars: { RAFT_WAKE_RECYCLE: "1", RAFT_STARTUP_MEMORY_BLOCK: "1" },
+    envVars: null,
     runtimeContext: { workspacePath },
   } as unknown as AgentConfig;
   const plan = await planWakeSessionRecycle({ config, hasResumePrompt: false, homeDir: home, processEnv: {} });
@@ -145,7 +140,7 @@ test("recycled briefing orders chrome, then memory block, then constructed panel
 
   // Kill switch => briefing unchanged apart from the panel.
   const offPlan = await planWakeSessionRecycle({
-    config: { ...config, envVars: { RAFT_WAKE_RECYCLE: "1", RAFT_STARTUP_MEMORY_BLOCK: "0" } } as unknown as AgentConfig,
+    config: { ...config, envVars: { RAFT_STARTUP_MEMORY_BLOCK: "0" } } as unknown as AgentConfig,
     hasResumePrompt: false,
     homeDir: home,
     processEnv: {},

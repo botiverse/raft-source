@@ -2,7 +2,6 @@ import assert from "node:assert/strict";
 import {
   hasCurrentServerActivityUnread,
   hasOtherServerActivityUnread,
-  hasOtherServerLoudUnread,
   parseServerUnreadSummaryRows,
   retainServerUnreadSummary,
 } from "../src/utils/serverUnreadSummary";
@@ -77,35 +76,6 @@ test("hasOtherServerActivityUnread ignores current server and unknown counts", (
       unknown: { unreadCount: 9, serverPushMuted: false },
     }),
     false,
-  );
-});
-
-test("hasOtherServerLoudUnread ignores current and muted servers", () => {
-  const servers = [{ id: "current" }, { id: "muted" }, { id: "quiet" }, { id: "loud" }];
-
-  assert.equal(
-    hasOtherServerLoudUnread(servers, { id: "current" }, {
-      current: { unreadCount: 4, serverPushMuted: false },
-      muted: { unreadCount: 7, serverPushMuted: true },
-      quiet: { unreadCount: 0, serverPushMuted: false },
-    }),
-    false,
-  );
-
-  assert.equal(
-    hasOtherServerLoudUnread(servers, { id: "current" }, {
-      current: { unreadCount: 4, serverPushMuted: false },
-      muted: { unreadCount: 7, serverPushMuted: true },
-      quiet: { unreadCount: 0, serverPushMuted: false },
-      loud: { unreadCount: 1, serverPushMuted: false },
-    }),
-    true,
-  );
-  assert.equal(
-    hasOtherServerLoudUnread(servers, undefined, {
-      current: { unreadCount: 4, serverPushMuted: false },
-    }),
-    true,
   );
 });
 

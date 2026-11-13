@@ -10,7 +10,6 @@ function user(overrides: Partial<User> = {}): User {
   return {
     id: "user-1",
     email: "cindy@example.com",
-    gravatarHash: "hash",
     name: "pending_1234567890abcdef",
     displayName: null,
     description: null,

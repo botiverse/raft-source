@@ -1,4 +1,6 @@
+import type { ExternalFreezeFields } from "../utils/jointChannelLimit";
 import { channelConversionState, conversionResponseState } from "./channelConversionState";
+import { isAxiosError } from "axios";
 import { create } from "zustand";
 import api from "../api/client";
 import {
@@ -6,6 +8,7 @@ import {
   applyMessageDisplayPrefsState,
   hydrateChannels,
   hydrateDmChannels,
+  nextPatchSeq,
   patchChannel,
   refreshExistingDm,
   removeChannel,
@@ -13,19 +16,29 @@ import {
   toChannel,
   touchChannelActivity as reduceChannelActivity,
 } from "./channelDomain";
-import type { ChannelConversionCommandView, ChannelConversionJobView, ChannelConversionState, ChannelAdminBasis, ChannelRole, InboxScopeReadFrontier, ServerCapability } from "@botiverse/raft-shared";
-import { coalesce, useServerStore } from "./serverStore";
+import type { ChannelConversionCommandView, ChannelConversionJobView, ChannelConversionState, ChannelAdminBasis, ChannelRole, ChannelThreadSort, ChannelThreadSortFields, InboxScopeReadFrontier, ServerCapability } from "@botiverse/raft-shared";
+import { bootListKey, coalesce, noteFreshLoad, useServerStore } from "./serverStore";
 import { consumeReadStateSnapshotRows, getReadStateLedgerGeneration } from "./readStateSync";
 import { registerServerReset } from "./serverResetRegistry";
+import { channelDetailRequestConfig } from "./channelDetailReason";
+import type { ChannelDetailReason } from "./channelDetailReason";
+import { useReadReceiptStore } from "./readReceiptStore";
+import { localTableSession, writeChannelList } from "./localTables/storeWriters";
 import { emitStateTransitionTrace } from "../utils/stateTransitionTrace";
+import { joinChannelOnce, joinRealtimeChannel, withJoining } from "./channelJoin";
+import type { ChannelJoinSource } from "./channelJoin";
 import { channelTraceStateChanged, transitionOutcomeDetail } from "../utils/stateTransitionChange";
+import { findStoredChannel } from "./storedChannel";
+import { noteChannelOpenResult } from "./channelAccessLoss";
 
-export interface Channel {
+export interface Channel extends ExternalFreezeFields, ChannelThreadSortFields {
   id: string;
   serverId?: string;
   name: string;
   description: string | null;
   type: "channel" | "private" | "joint" | "dm" | "thread";
+  /** The member's explicit notification level here (contract §2.2; absent = default or an older server). */
+  notificationLevel?: "default" | "all" | "mentions" | "none" | null;
   createdAt: string;
   // NOTE: `lastMessageAt` deliberately does NOT live here. It is high-frequency
   // (bumped on EVERY inbound message) and storing it on the channel identity
@@ -39,9 +52,27 @@ export interface Channel {
     provider: "slack";
     providerConversationId: string;
     state: "active" | "paused" | "quarantined";
+    /** Why sync stopped; present only while the binding is not active. */
+    stateReason?: string;
+    /** Present only while Raft messages for Slack are held (server channelService). */
+    outbound?:
+      | {
+          status: "waiting";
+          reason: "connection" | "credentials" | "configuration" | "invite_app" | "reauthorize" | "unarchive" | "check_channel";
+          /** Why Raft cannot yet confirm whether the held message reached Slack; absent from an older server. */
+          detail?: "history_limited" | "metadata_missing" | "marker_unconfirmed";
+          since: string;
+        }
+      | { status: "stalled"; since: string };
+    /** The Slack installation's state, present only while it is not active. */
+    installState?: "pending" | "reauth_required" | "disconnected" | "revoked" | "quarantined";
   };
+  /** Legacy mirror of `visitorVisible`, still sent for one release. */
   guestVisible?: boolean;
-  guestJoinable?: boolean;
+  /** Signed-out visitors of the server's public page can read this channel
+   *  (#wg-rbac:#51). Set with PATCH `{ visitorVisible }`, server owners and
+   *  admins only (`channelCapabilities.manageVisitorAccess`). */
+  visitorVisible?: boolean;
   // Joint-channel metadata. Host projections show a pending/active peer
   // server; participant projections show the host peer.
   jointChannelId?: string | null;
@@ -59,6 +90,8 @@ export interface Channel {
     isCurrentServer?: boolean;
     /** Free or paid as the joint's free-server cap counts it; absent from older servers. */
     plan?: "free" | "paid";
+    /** Active servers: the channel's name on that server (names are per server). */
+    channelName?: string;
   }>;
   jointPendingInvites?: Array<{
     id: string;
@@ -70,6 +103,13 @@ export interface Channel {
     status: "pending";
   }>;
   jointBillingLocked?: boolean | null;
+  /**
+   * The channel has a Guest or an open external invite (#wg-rbac:#16, server
+   * #12190). Sent only to non-guest members of the channel's own Server and
+   * left out of broadcast rows and joint projections: a patch without the key
+   * keeps the value the row had (patchChannel merges).
+   */
+  hasExternalRelation?: boolean;
   /** Contract v0.3 §18.8: grace deadline while over the free-server cap; null otherwise. */
   jointOverLimitGraceEndsAt?: string | null;
   conversionState?: ChannelConversionState;
@@ -96,8 +136,33 @@ export interface Channel {
   peerName?: string;
   peerDisplayName?: string | null;
   peerDescription?: string | null;
-  peerGravatarHash?: string | null;
   peerAvatarUrl?: string | null;
+  /**
+   * Agent Lounge v0: the agent this channel is the Lounge of. A Lounge is a
+   * public channel on the wire, but it lives in its own slice
+   * (`loungeChannels`), never in `channels`, so no channel list, ⌘K, forward
+   * target or browse view shows it. Absent or null: not a Lounge.
+   */
+  loungeAgentId?: string | null;
+  /** Agent Lounge v0: from POST /agents/:id/lounge; false = may read, not post. Absent = may post. */
+  canPost?: boolean;
+  /** Agent Lounge v0, on an agent DM row of GET /channels/dm: that agent's Lounge, present only once it exists. */
+  lounge?: AgentLoungeSummary;
+}
+
+/** The Lounge an agent DM row carries (GET /channels/dm, Agent Lounge v0). */
+export interface AgentLoungeSummary {
+  channelId: string;
+  joined: boolean;
+  unreadCount: number;
+  mentionCount?: number;
+}
+
+/** POST /agents/:agentId/lounge: the agent's Lounge, opened (made the first time). */
+export interface AgentLoungeOpenResult {
+  channel: Channel;
+  joined: boolean;
+  canPost: boolean;
 }
 
 /** Shape returned by the API (type may be missing for legacy data). The API
@@ -113,19 +178,17 @@ export type ApiChannel = Omit<Channel, "type"> & {
 
 export { activityFrom, toChannel } from "./channelDomain";
 
-function joinRealtimeChannel(channelId: string) {
-  void import("../api/socket")
-    .then(({ getSocket }) => {
-      getSocket().emit("join:channel", channelId);
-    })
-    .catch((err) => {
-      console.error("Failed to join socket channel:", err);
-    });
-}
-
 const ensureChannelInFlight = new Map<string, Promise<Channel | null>>();
+/**
+ * Per channel, bumped by every refresh. A refresh is asked because something
+ * changed: it never joins a request already in flight (that answer may be
+ * from before the change), and an answer that comes back after a newer
+ * refresh was sent is dropped, so an older row never overwrites a newer one.
+ */
+const ensureChannelGeneration = new Map<string, number>();
 const openAgentDmInFlight = new Map<string, Promise<Channel>>();
 const openUserDmInFlight = new Map<string, Promise<Channel>>();
+const openLoungeInFlight = new Map<string, Promise<AgentLoungeOpenResult>>();
 
 function reduceChannelWithTrace(
   state: ChannelState,
@@ -149,15 +212,23 @@ function reduceChannelWithTrace(
 interface ChannelState {
   channels: Channel[];
   dmChannels: Channel[];
+  /** Agent Lounges (Agent Lounge v0), kept apart from `channels`: see `Channel.loungeAgentId`. */
+  loungeChannels: Channel[];
   /** Per-channel last-message timestamp, separated from the channel identity
    *  objects so an activity bump never churns the `channels`/`dmChannels`
    *  array references. Only recency-sorting consumers subscribe this. */
   channelActivity: Record<string, string | null>;
   channelLocalMembership: Record<string, boolean>;
+  /** Per row, the patch-clock value its data was observed at: see `ChannelDomainState` (#239). */
+  channelPatchStamps: Record<string, number>;
+  joiningChannelIds: Record<string, true>; // join in flight: the Join button shows it
   loading: boolean;
+  /** Like `loading`, for the DM list (GET /channels/dm answers on its own). */
+  dmsLoading: boolean;
   loadChannels: () => Promise<void>;
   loadDMChannels: () => Promise<void>;
-  ensureChannel: (channelId: string, opts?: { refresh?: boolean }) => Promise<Channel | null>;
+  /** `reason` labels the request for the server span (default `refresh` / `ensure`). */
+  ensureChannel: (channelId: string, opts?: { refresh?: boolean; reason?: ChannelDetailReason }) => Promise<Channel | null>;
   addOrRefreshDM: (channelId: string) => Promise<void>;
   touchChannelActivity: (channelId: string, lastMessageAt?: string | null) => void;
   applyChannelPatch: (channel: ApiChannel, defaultType?: Channel["type"]) => void;
@@ -171,7 +242,7 @@ interface ChannelState {
     actionCardMessageId?: string;
     actionCardConfirmationVersion?: number;
   }) => Promise<Channel>;
-  updateChannel: (channelId: string, updates: { name?: string; description?: string; visibility?: "public" | "private"; guestVisible?: boolean; guestJoinable?: boolean }) => Promise<Channel>;
+  updateChannel: (channelId: string, updates: { name?: string; description?: string; visibility?: "public" | "private"; visitorVisible?: boolean; threadSort?: ChannelThreadSort; announcement?: string | null }) => Promise<Channel>;
   restoreAllChannel: () => Promise<Channel>;
   hideAllChannel: () => Promise<Channel>;
   convertChannelToJoint: (channelId: string, opts?: { observeProgress?: boolean; commandId?: string }) => Promise<Channel>;
@@ -188,7 +259,9 @@ interface ChannelState {
   unarchiveChannel: (channelId: string) => Promise<Channel>;
   openDM: (agentId: string) => Promise<Channel>;
   openUserDM: (userId: string) => Promise<Channel>;
-  joinChannel: (channelId: string) => Promise<boolean>;
+  /** Agent Lounge v0: open the agent's Lounge (the server makes it the first time). */
+  openLounge: (agentId: string) => Promise<AgentLoungeOpenResult>;
+  joinChannel: (channelId: string, source?: ChannelJoinSource) => Promise<boolean>;
   leaveChannel: (channelId: string) => Promise<void>;
 }
 
@@ -200,9 +273,13 @@ interface ChannelState {
 export const useChannelStore = create<ChannelState>((set, get) => ({
   channels: [],
   dmChannels: [],
+  loungeChannels: [],
   channelActivity: {},
   channelLocalMembership: {},
+  channelPatchStamps: {},
+  joiningChannelIds: {},
   loading: true,
+  dmsLoading: true,
 
   loadChannels: async () => {
     const epoch = useServerStore.getState().serverEpoch;
@@ -215,6 +292,8 @@ export const useChannelStore = create<ChannelState>((set, get) => ({
     // starts as true (store init / server reset) and goes to false after the
     // first successful fetch, keeping existing data visible during refreshes.
     return coalesce(`channels:${serverId}:${epoch}`, async () => {
+      const session = localTableSession();
+      const requestSeq = nextPatchSeq(); // rows observed after this are newer than the answer (#239)
       try {
         const { data } = await api.get("/channels", { params: { archived: "include" } });
         if (useServerStore.getState().serverEpoch !== epoch) return;
@@ -227,8 +306,10 @@ export const useChannelStore = create<ChannelState>((set, get) => ({
           state,
           "hydrate",
           "channel-list",
-          (current) => ({ ...hydrateChannels(current, apiChannels), loading: false }),
+          (current) => ({ ...hydrateChannels(current, apiChannels, requestSeq), loading: false }),
         ));
+        writeChannelList(session, serverId, get().channels);
+        noteFreshLoad(bootListKey.channels(serverId, epoch));
       } catch (err) {
         console.error("Failed to load channels:", err);
         if (useServerStore.getState().serverEpoch !== epoch) return;
@@ -254,17 +335,18 @@ export const useChannelStore = create<ChannelState>((set, get) => ({
           state,
           "hydrate:dm",
           "dm-list",
-          (current) => hydrateDmChannels(current, apiDms),
+          (current) => ({ ...hydrateDmChannels(current, apiDms), dmsLoading: false }),
         ));
       } catch (err) {
         console.error("Failed to load DM channels:", err);
+        if (useServerStore.getState().serverEpoch !== epoch) return;
+        set({ dmsLoading: false });
       }
     });
   },
 
   ensureChannel: async (channelId, opts) => {
-    const existing = get().channels.find((c) => c.id === channelId)
-      ?? get().dmChannels.find((c) => c.id === channelId);
+    const existing = findStoredChannel(get(), channelId);
     if (existing && !opts?.refresh) return existing;
 
     const epoch = useServerStore.getState().serverEpoch;
@@ -272,14 +354,29 @@ export const useChannelStore = create<ChannelState>((set, get) => ({
     const readLedgerGeneration = getReadStateLedgerGeneration();
     if (!serverId) return null;
 
-    const pending = ensureChannelInFlight.get(channelId);
-    if (pending) return pending;
+    if (!opts?.refresh) {
+      const pending = ensureChannelInFlight.get(channelId);
+      if (pending) return pending;
+    }
+    const generation = (ensureChannelGeneration.get(channelId) ?? 0) + (opts?.refresh ? 1 : 0);
+    ensureChannelGeneration.set(channelId, generation);
+    const superseded = () => ensureChannelGeneration.get(channelId) !== generation;
+    const currentRow = () => findStoredChannel(get(), channelId) ?? null;
+    const observedSeq = nextPatchSeq(); // the answer is as of now, not when it lands (#239)
 
-    const request = (async () => {
+    let request!: Promise<Channel | null>;
+    request = (async () => {
       try {
-        const { data } = await api.get(`/channels/${channelId}`);
+        const reason = opts?.reason ?? (opts?.refresh ? "refresh" : "ensure");
+        const { data } = await api.get(`/channels/${channelId}`, channelDetailRequestConfig(reason));
         if (useServerStore.getState().serverEpoch !== epoch) return null;
+        if (superseded()) return currentRow();
+        noteChannelOpenResult(channelId, null);
         const apiChannel = data as ApiChannel;
+        // Opening it next loads its read receipts from this same endpoint:
+        // hand over this answer. A thread joins its room only when it opens,
+        // so its receipts are loaded then.
+        if (apiChannel.type !== "thread") useReadReceiptStore.getState().offerChannelDetail(channelId, data);
         const channel = toChannel(apiChannel);
         // #632 C1: same adapter for the single-channel authority hydrate.
         consumeReadStateSnapshotRows(serverId, [{ scopeId: apiChannel.id, readState: apiChannel.readState }], { ledgerGenerationAtRequest: readLedgerGeneration });
@@ -288,14 +385,38 @@ export const useChannelStore = create<ChannelState>((set, get) => ({
           state,
           "ensure",
           channelId,
-          (current) => patchChannel(current, apiChannel),
+          (current) => patchChannel(current, apiChannel, "channel", observedSeq),
         ));
         return channel;
       } catch (err) {
+        // A link to a conversation this person can't open says so (MainLayout's
+        // ChannelById / DmById). Not from an answer a newer request superseded:
+        // an older 404 must not undo the newer success that cleared the mark.
+        if (useServerStore.getState().serverEpoch === epoch && !superseded()) noteChannelOpenResult(channelId, err);
+        // A refresh answered 404: this person can no longer read it (removed
+        // from a private channel, deleted, another server). Drop it as
+        // deleteChannel does, so nothing keeps showing it (the sidebar,
+        // Activity's kept rows). Only the row this request was about: one
+        // patched in meanwhile (re-added, `channel:updated`) is newer than
+        // the 404. Not listed (a non-member's room-wide event): nothing to do.
+        if (opts?.refresh && isAxiosError(err) && err.response?.status === 404
+          && useServerStore.getState().serverEpoch === epoch && !superseded()) {
+          set((state) => {
+            const current = findStoredChannel(state, channelId);
+            if (!current || current !== existing) return state;
+            return reduceChannelWithTrace(
+              state,
+              "access-lost",
+              channelId,
+              (domain) => removeChannel(domain, channelId, { observedSeq }),
+            );
+          });
+          return null;
+        }
         console.error("Failed to load channel:", err);
         return null;
       } finally {
-        ensureChannelInFlight.delete(channelId);
+        if (ensureChannelInFlight.get(channelId) === request) ensureChannelInFlight.delete(channelId);
       }
     })();
     ensureChannelInFlight.set(channelId, request);
@@ -343,7 +464,8 @@ export const useChannelStore = create<ChannelState>((set, get) => ({
         state,
         "hydrate:dm",
         "dm-list",
-        (current) => hydrateDmChannels({ ...current, dmChannels: [] }, apiDms),
+        // The whole list is in, as from loadDMChannels: the DM section is loaded.
+        (current) => ({ ...hydrateDmChannels({ ...current, dmChannels: [] }, apiDms), dmsLoading: false }),
       ));
     } catch (err) {
       console.error("Failed to refresh DM channels:", err);
@@ -491,6 +613,7 @@ export const useChannelStore = create<ChannelState>((set, get) => ({
   },
 
   getChannelConversionJob: async (jobId) => {
+    const observedSeq = nextPatchSeq(); // a poll answer is as of now (#239)
     const { data } = await api.get(`/channels/conversion-jobs/${jobId}`);
     const payload = data as { conversionState?: ChannelConversionState; channel?: ApiChannel; conversionJob: NonNullable<Channel["conversionJob"]> };
     payload.conversionState = conversionResponseState(payload);
@@ -511,7 +634,7 @@ export const useChannelStore = create<ChannelState>((set, get) => ({
           state,
           "conversion-progress",
           apiChannel.id,
-          (currentState) => patchChannel(currentState, apiChannel),
+          (currentState) => patchChannel(currentState, apiChannel, "channel", observedSeq),
         ));
       }
     }
@@ -670,24 +793,46 @@ export const useChannelStore = create<ChannelState>((set, get) => ({
     return request;
   },
 
-  joinChannel: async (channelId) => {
-    try {
-      await api.post(`/channels/${channelId}/join`);
-      set((state) => reduceChannelWithTrace(
-        state,
-        "join",
-        channelId,
-        (current) => setLocalChannelMembership(current, channelId, true),
-        "joined",
-      ));
-      // Join the socket room so we receive real-time messages
-      joinRealtimeChannel(channelId);
-      return true;
-    } catch (err) {
-      console.error("Failed to join channel:", err);
-      return false;
-    }
+  openLounge: (agentId) => {
+    const requestKey = `${useServerStore.getState().current?.id ?? "no-server"}:${agentId}`;
+    const pending = openLoungeInFlight.get(requestKey);
+    if (pending) return pending;
+
+    const request = (async () => {
+      try {
+        const { data } = await api.post(`/agents/${agentId}/lounge`);
+        const payload = data as { channel: ApiChannel; joined?: boolean; canPost?: boolean };
+        // The answer's own `joined` / `canPost` win over the row's; the row
+        // always lands in the Lounge slice, even from a server that left
+        // `loungeAgentId` off it.
+        const apiChannel: ApiChannel = {
+          ...payload.channel,
+          loungeAgentId: payload.channel.loungeAgentId ?? agentId,
+          ...(typeof payload.joined === "boolean" ? { joined: payload.joined } : {}),
+          ...(typeof payload.canPost === "boolean" ? { canPost: payload.canPost } : {}),
+        };
+        set((state) => reduceChannelWithTrace(
+          state,
+          "open-lounge",
+          apiChannel.id,
+          (current) => patchChannel(current, apiChannel),
+        ));
+        joinRealtimeChannel(apiChannel.id);
+        const channel = findStoredChannel(get(), apiChannel.id) ?? toChannel(apiChannel);
+        return {
+          channel,
+          joined: channel.joined === true,
+          canPost: channel.canPost !== false,
+        };
+      } finally {
+        openLoungeInFlight.delete(requestKey);
+      }
+    })();
+    openLoungeInFlight.set(requestKey, request);
+    return request;
   },
+
+  joinChannel: (channelId, source) => channelJoiner.join(channelId, source),
 
   leaveChannel: async (channelId) => {
     try {
@@ -705,8 +850,18 @@ export const useChannelStore = create<ChannelState>((set, get) => ({
   },
 }));
 
+const channelJoiner = joinChannelOnce({
+  post: (channelId) => api.post(`/channels/${channelId}/join`),
+  onJoined: (channelId) => {
+    useChannelStore.setState((state) => reduceChannelWithTrace(state, "join", channelId, (current) => setLocalChannelMembership(current, channelId, true), "joined"));
+    joinRealtimeChannel(channelId); // the socket room delivers real-time messages
+  },
+  setJoining: (channelId, joining) => useChannelStore.setState((state) => ({ joiningChannelIds: withJoining(state.joiningChannelIds, channelId, joining) })),
+});
+
 // Reset all server-scoped state when the user switches servers.
+registerServerReset(() => channelJoiner.reset());
 registerServerReset(() =>
-  useChannelStore.setState({ channels: [], dmChannels: [], channelActivity: {}, channelLocalMembership: {}, loading: true })
+  useChannelStore.setState({ channels: [], dmChannels: [], loungeChannels: [], channelActivity: {}, channelLocalMembership: {}, channelPatchStamps: {}, joiningChannelIds: {}, loading: true, dmsLoading: true })
 );
 // Stryker restore all

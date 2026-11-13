@@ -61,24 +61,32 @@ async function createAgentFixture(
   return response.json() as Promise<{ id: string; displayName: string | null; name: string }>;
 }
 
-// Rail mode is now path-derived (path /agent/<id> means members mode); the
-// legacy `?sidebarTab=` and `?tab=` params are normalized away on entry by
-// useRailLegacyRedirect. The contract here is therefore: those rail-mode
-// query keys are absent from any URL we observe, and the path keeps its
-// /agent/<id> shape (so the rail still highlights Members).
-function assertScopedMembersContract(page: Page, expectedAgentTab: "activity" | "workspace") {
+// Rail mode is path-derived, and the legacy `?sidebarTab=` and `?tab=` params
+// are normalized away on entry by useRailLegacyRedirect. Members is a full page
+// with no sidebar (#13127): on desktop a profile URL (/agent/<id>) opens the
+// Members page with that profile in the side panel (useMembersProfileRedirect).
+// The contract here is therefore: those rail-mode query keys are absent from
+// any URL we observe, the path is /members, and `profile=agent:<id>` keeps the
+// agent open while its tabs change (so the rail still highlights Members).
+function assertScopedMembersContract(
+  page: Page,
+  agentId: string,
+  expectedAgentTab: "activity" | "workspace",
+) {
   return expect
     .poll(() => {
       const url = new URL(page.url());
       return {
-        agentDetail: /\/agent\/[^/?#]+$/.test(url.pathname),
+        membersPage: /\/members$/.test(url.pathname),
+        profile: url.searchParams.get("profile"),
         sidebarTab: url.searchParams.get("sidebarTab"),
         agentTab: url.searchParams.get("agentTab"),
         legacyTab: url.searchParams.get("tab"),
       };
     })
     .toEqual({
-      agentDetail: true,
+      membersPage: true,
+      profile: `agent:${agentId}`,
       sidebarTab: null,
       agentTab: expectedAgentTab,
       legacyTab: null,
@@ -94,26 +102,28 @@ async function expectMembersRailSelected(page: Page) {
   await expect(members).toHaveAttribute("data-selected", "true");
 }
 
-test.describe("Sidebar query contract", () => {
-  test("members sidebar stays active when agent detail tabs change", async ({ page, request }) => {
+test.describe("Members query contract", () => {
+  test("the Members page stays active when agent profile tabs change", async ({ page, request }) => {
     const { seedState, login } = await getSeedAndLogin(request);
     await dismissOwnerOnboarding(request, seedState, login.accessToken);
     const agentName = `sidebar-contract-${Date.now()}`;
     const agent = await createAgentFixture(request, seedState, login.accessToken, agentName);
 
     await page.goto(`/s/${seedState.server.slug}/agent/${agent.id}?sidebarTab=members`);
+    await expect(page.getByTestId("members-page")).toBeVisible();
     await expectMembersRailSelected(page);
 
     await page.getByTestId("panel-tab-activity").click();
-    await assertScopedMembersContract(page, "activity");
+    await assertScopedMembersContract(page, agent.id, "activity");
     await expectMembersRailSelected(page);
 
     await page.getByTestId("panel-tab-workspace").click();
-    await assertScopedMembersContract(page, "workspace");
+    await assertScopedMembersContract(page, agent.id, "workspace");
+    await expect(page.getByTestId("members-page")).toBeVisible();
     await expectMembersRailSelected(page);
   });
 
-  test("legacy tab=machines links still load members and normalize to sidebarTab on interaction", async ({
+  test("legacy tab=machines profile links land on the Members page with the profile open", async ({
     page,
     request,
   }) => {
@@ -123,10 +133,11 @@ test.describe("Sidebar query contract", () => {
     const agent = await createAgentFixture(request, seedState, login.accessToken, agentName);
 
     await page.goto(`/s/${seedState.server.slug}/agent/${agent.id}?tab=machines`);
+    await expect(page.getByTestId("members-page")).toBeVisible();
     await expectMembersRailSelected(page);
     await page.getByTestId("panel-tab-activity").click();
 
-    await assertScopedMembersContract(page, "activity");
+    await assertScopedMembersContract(page, agent.id, "activity");
     await expectMembersRailSelected(page);
   });
 });

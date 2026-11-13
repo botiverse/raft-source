@@ -1,4 +1,5 @@
 import { fixturePasswordHash } from "../test/integration/credentials";
+import { insertLinkedAttachmentsWithObjects } from "../test/attachmentObjectFixture";
 import { createApiTest } from "../test/integration/apiTest";
 import assert from "node:assert/strict";
 
@@ -9,14 +10,14 @@ import path from "node:path";
 
 import { openTestApp } from "../test/integration/app";
 import { getDb } from "../db/index";
-import { attachments, users } from "../db/schema";
+import { users } from "../db/schema";
 import { createServer } from "../services/serverService";
 import { addHuman, createChannel } from "../services/channelService";
 import { createMessage } from "../services/messageService";
 import { resetStorageForTests } from "../services/storageService";
 import { ATTACHMENT_PREVIEW_BRIDGE_SCRIPT } from "../services/attachmentPreviewBridge";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 /**
  * Hostile-preview bridge injection on the HTML preview serve path (attachment
@@ -37,7 +38,7 @@ test("html-preview appends the inert measurement bridge; download stays byte-ide
   const prevUploadsDir = process.env.UPLOADS_DIR;
   process.env.UPLOADS_DIR = uploadsDir;
   resetStorageForTests();
-  const { baseUrl, close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const { baseUrl, close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const db = getDb();
     const [owner] = await db.insert(users).values({
@@ -58,7 +59,7 @@ test("html-preview appends the inert measurement bridge; download stays byte-ide
     mkdirSync(path.dirname(filePath), { recursive: true });
     writeFileSync(filePath, html);
 
-    const [attachment] = await db.insert(attachments).values({
+    const [attachment] = await insertLinkedAttachmentsWithObjects({
       messageId: message.id,
       channelId: channel.id,
       uploaderId: owner.id,
@@ -67,7 +68,7 @@ test("html-preview appends the inert measurement bridge; download stays byte-ide
       mimeType: "text/html",
       sizeBytes: Buffer.byteLength(html),
       storageKey,
-    }).returning();
+    });
 
     const loginRes = await fetch(`${baseUrl}/api/auth/login`, {
       method: "POST",

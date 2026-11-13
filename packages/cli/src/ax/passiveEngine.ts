@@ -43,14 +43,14 @@ export type AttachReason = "no_compaction_reports" | "ledger_unwritable";
 
 export type PassiveDelivery =
   /** Act normally: already delivered in this context, or no policy host (no agent, no daemon). */
-  | { deliver: "pass" }
+  | { deliver: "pass"; contextId?: string }
   /** Deliver it and do not act; confirm with the `contextId` of this decision. */
   | { deliver: "hold"; contextId: string }
   /**
    * Act, and deliver it alongside, every time: delivery cannot be tracked or
    * recorded, and a hold that can never be released would never release.
    */
-  | { deliver: "attach"; reason: AttachReason };
+  | { deliver: "attach"; reason: AttachReason; contextId?: string };
 
 /** The agent the ledger is kept for, when the environment names a valid one. */
 export function passiveAgentId(env: NodeJS.ProcessEnv = process.env): string | undefined {
@@ -114,11 +114,11 @@ export function decidePassiveDelivery(
       // The feature gate comes first.
       const signal = enabledContextSignal(env);
       if (!signal) return { deliver: "pass" };
-      if (!signal.compactionReported) return { deliver: "attach", reason: "no_compaction_reports" };
+      if (!signal.compactionReported) return { deliver: "attach", reason: "no_compaction_reports", contextId: signal.contextId };
       const seen = readObservation(agentId, touch.type, touch.id, env);
-      if (seen?.rev === touch.rev && seen.contextId === signal.contextId) return { deliver: "pass" };
+      if (seen?.rev === touch.rev && seen.contextId === signal.contextId) return { deliver: "pass", contextId: signal.contextId };
       // Only hold when the release can be recorded afterwards.
-      if (!probeLedgerWritable(agentId, env)) return { deliver: "attach", reason: "ledger_unwritable" };
+      if (!probeLedgerWritable(agentId, env)) return { deliver: "attach", reason: "ledger_unwritable", contextId: signal.contextId };
       return { deliver: "hold", contextId: signal.contextId };
     }
     // "once" resources never gate an action; see `senderClaimForContext`.

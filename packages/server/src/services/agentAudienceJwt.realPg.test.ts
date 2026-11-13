@@ -86,7 +86,7 @@ test.skipIf(!url && !required)("JWT issuer waits for committed target installati
       const [agent] = await getDb().insert(agents).values({ serverId: target.id, name: "target-agent" }).returning();
       await getDb().insert(serverAgentMembers).values({ serverId: target.id, agentId: agent.id });
       const [client] = await getDb().insert(oauthClients).values({ serverId: publisher.id, createdByUserId: owner.id, name: "Shared JWT App", clientId: `jwt-policy-${suffix.slice(0, 8)}`, clientSecretHash: "fixture", allowedScopes: ["openid", "profile"], enabled: true, appType: "third_party_global" }).returning();
-      const [installation] = await getDb().insert(oauthClientInstalls).values({ serverId: target.id, clientId: client.id, installedByUserId: owner.id }).returning();
+      const [installation] = await getDb().insert(oauthClientInstalls).values({ serverId: target.id, clientId: client.id, installedByUserId: owner.id, approvedScopes: ["openid", "profile"] }).returning();
       const input = { serverId: target.id, agentId: agent.id, service: client.clientId };
       assert.ok((await issueAgentAudienceJwt(input)).access_token);
       const blocker = await pool.connect();

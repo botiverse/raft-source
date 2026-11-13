@@ -1,6 +1,7 @@
 import pg from "pg";
 
-// Partial index for the mobile push outbox drain (migration 0359). Built
+// Partial index for the outbox drain (migration 0359; the table is
+// notification_outbox since migration notification_outbox). Built
 // CONCURRENTLY before the migration runs, so the migration's same-name
 // CREATE INDEX IF NOT EXISTS is a no-op in staging/prod.
 // Run it against the DIRECT (non "-pooler") DATABASE_URL: timeouts are set with
@@ -14,11 +15,18 @@ export const ACTIVE_INDEX_STATEMENT_TIMEOUT =
 export const ACTIVE_INDEX_LOCK_TIMEOUT =
   process.env.MOBILE_PUSH_OUTBOX_ACTIVE_INDEX_LOCK_TIMEOUT?.trim() || "30s";
 
-export const CREATE_ACTIVE_INDEX_SQL = `
+// The outbox table was renamed to notification_outbox (migration
+// notification_outbox); `mobile_push_outbox` is a compatibility view since.
+// The index lives on whichever of the two is the table.
+export type OutboxTableName = "notification_outbox" | "mobile_push_outbox";
+
+export function createActiveIndexSql(table: OutboxTableName): string {
+  return `
 CREATE INDEX CONCURRENTLY IF NOT EXISTS "${ACTIVE_INDEX_NAME}"
-  ON "mobile_push_outbox" USING btree ("created_at")
+  ON "${table}" USING btree ("created_at")
   WHERE "status" IN ('pending', 'processing')
 `;
+}
 
 export type ActiveIndexStatus = {
   exists: boolean;
@@ -51,17 +59,32 @@ export function createPool(databaseUrl = getDatabaseUrl()): pg.Pool {
   return new pg.Pool({ connectionString: databaseUrl, max: 1 });
 }
 
-export async function assertMobilePushOutboxTableExists(client: pg.PoolClient) {
-  const result = await client.query<{ exists: boolean }>(
-    `SELECT to_regclass('public.mobile_push_outbox') IS NOT NULL AS "exists"`,
+/** The outbox table (not the compatibility view): notification_outbox once renamed. */
+export async function resolveOutboxTable(client: pg.PoolClient): Promise<OutboxTableName | null> {
+  const result = await client.query<{ relname: OutboxTableName }>(
+    `SELECT c.relname
+       FROM pg_class c
+       JOIN pg_namespace ns ON ns.oid = c.relnamespace
+      WHERE ns.nspname = 'public'
+        AND c.relkind IN ('r', 'p')
+        AND c.relname IN ('notification_outbox', 'mobile_push_outbox')
+      ORDER BY c.relname = 'notification_outbox' DESC
+      LIMIT 1`,
   );
-  if (!result.rows[0]?.exists) {
-    throw new Error(`mobile_push_outbox is missing; run db:migrate before ${ACTIVE_INDEX_NAME}`);
+  return result.rows[0]?.relname ?? null;
+}
+
+export async function assertMobilePushOutboxTableExists(client: pg.PoolClient): Promise<OutboxTableName> {
+  const table = await resolveOutboxTable(client);
+  if (!table) {
+    throw new Error(`notification_outbox (formerly mobile_push_outbox) is missing; run db:migrate before ${ACTIVE_INDEX_NAME}`);
   }
+  return table;
 }
 
 export async function readActiveIndexStatus(
   client: pg.PoolClient,
+  table: OutboxTableName,
 ): Promise<ActiveIndexStatus> {
   const result = await client.query<IndexRow>(
     `
@@ -80,11 +103,11 @@ export async function readActiveIndexStatus(
         ON true
       JOIN pg_attribute a ON a.attrelid = tbl.oid AND a.attnum = key.attnum
       WHERE ns.nspname = 'public'
-        AND tbl.relname = 'mobile_push_outbox'
+        AND tbl.relname = $2
         AND idx.relname = $1
       GROUP BY i.indisunique, i.indisvalid, i.indisready, i.indpred, i.indrelid, idx.oid
     `,
-    [ACTIVE_INDEX_NAME],
+    [ACTIVE_INDEX_NAME, table],
   );
 
   const row = result.rows[0];

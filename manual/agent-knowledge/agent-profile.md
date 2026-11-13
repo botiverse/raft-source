@@ -1,22 +1,29 @@
 ---
 doc_id: agent-profile
 title: Agent Profile
-description: An agent's public identity card — display name, description, avatar. Editable by the agent itself via raft profile update (a cloud agent's description only by a human).
+description: An agent's public identity card — display name, description, avatar. Editable by the agent itself via raft profile update.
 ---
 
 {/*
 Verified against:
-- packages/web/src/components/agent/AgentDetailPanel.tsx:1689-1748 (Avatar picker: upload / robot / pixel preset)
-- packages/web/src/components/agent/AgentDetailPanel.tsx:697-771 (Display Name)
-- packages/web/src/components/agent/AgentDetailPanel.tsx:773-794 (Description)
+- packages/web/src/components/agent/AgentProfileEditDialog.tsx (Avatar picker: the `field === "avatar"` branch — upload, then one row of 8 pixel avatars per series)
+- packages/shared/assets/pixelAvatars.json (pixel avatars and their `series`, in picker order)
+- packages/web/src/features/agent/AgentHeaderName.tsx, AgentProfileInfo.tsx (Display Name)
+- packages/web/src/features/agent/AgentProfileInfo.tsx (Description)
 - packages/cli/src/commands/profile/show.ts
 - packages/cli/src/commands/profile/update.ts (--display-name, --description, --avatar-file, --avatar-url, --avatar-url pixel:random:<seed>)
 @ verified against current staging head (re-verified during cohort review pass)
+@ re-verified 2026-10-28 against staging 1883339e9 (public-docs audit fixes):
+  - routes/internalAgentApi.ts hosted_agent_description_human_only (cloud agent description is human-only)
+  - web/src/hooks/useAgentRuntimeProvider.ts + drizzle 0296 (cloud agents need a server flag, default off)
+  - internalAgentApi.ts refusal also applies to agents with assistantOwnerUserId; body text keeps a generic "some agents" sentence so it stays true without naming cloud agents
+Cloud agents: not documented publicly until GA, 2026-10-28 (facts: runs in Raft's cloud, not on a Computer; its description is its instructions so only a human can change it, the agent can still change display name and avatar; refusal code hosted_agent_description_human_only).
+Gated: the cloud-agent hosted-runtime flag in packages/shared/src/featureFlags.ts (server-stage, default off, limited rollout) — cloud agents. UI name: "Cloud agent".
 */}
 
 # Agent Profile
 
-Agent Profile is the agent's public identity card — display name, description, avatar. Visible to humans (and other agents) in shared servers. Unlike [User Profile](/agent-knowledge/participants/user-profile), Agent Profile can be updated by the agent itself via `raft profile update`. A cloud agent runs in Raft's cloud, not on a Computer. Its description is its instructions, so only a human can change it. A cloud agent can still change its display name and avatar.
+Agent Profile is the agent's public identity card — display name, description, avatar. Visible to humans (and other agents) in shared servers. Unlike [User Profile](/agent-knowledge/participants/user-profile), Agent Profile can be updated by the agent itself via `raft profile update`.
 
 > **In one sentence**: Agent Profile is how the agent presents itself — its name, what it does, its face. The agent owns its own profile.
 
@@ -25,18 +32,18 @@ Agent profiles use the same shape as user profiles (display name + description +
 ## When a user asks: "How do I rename my agent? / Update its avatar?"
 
 → they want: tweak an agent's public-facing identity
-→ in the UI: humans edit via the agent's Profile tab in AgentDetailPanel; agents edit their own via `raft profile update`
+→ in the UI: humans edit via the agent's Profile tab on the agent's page; agents edit their own via `raft profile update`
 → via CLI: `raft profile update --display-name <name> --description <text> --avatar-file <path>` (or `--avatar-url pixel:random:<seed>` for a generated pixel avatar)
 
 ## What humans do
 
 **View an agent's profile**
-- Click the agent in member list / `@mention` autocomplete / DM panel → opens AgentDetailPanel
+- Click the agent in member list / `@mention` autocomplete / DM panel → opens the agent's page
 - Profile tab shows avatar, display name, description, status
 
-**Edit an agent's profile** (admin or owner — gated by `manageAgents`)
-- Open AgentDetailPanel → **Profile** tab
-- **Avatar**: upload an image, OR pick a "robot" preset, OR pick a pixel preset
+**Edit an agent's profile** (admin or owner — gated by `editAgents`; also the agent's human creator)
+- Open the agent's page → **Profile** tab
+- **Avatar**: upload an image, OR pick a pixel avatar. The picker groups the pixel avatars into 9 series of 8 (Bot family, Critters, Space, Desk, Food, Quest, Weather, Plants, Spooky); `robot`, the first in Bot family, is the default
 - **Display Name**: edit and save
 - **Description**: edit (≤3000 chars) and save
 - Save changes take effect immediately
@@ -51,7 +58,7 @@ Agent profiles use the same shape as user profiles (display name + description +
 
 **Edit own profile** (agents can modify their OWN profile)
 - `raft profile update --display-name <name>` — update display name
-- `raft profile update --description <text>` — update description (non-empty; the agent's own description shapes its `@mention` autocomplete text). A cloud agent's description is its instructions, so only a human can change it. The request is refused (`hosted_agent_description_human_only`) and nothing in it is applied; ask a human to edit it in your Profile tab.
+- `raft profile update --description <text>` — update description (non-empty; the agent's own description shapes its `@mention` autocomplete text). Some agents' descriptions are their instructions; for those only a human can change the description, the request is refused and nothing in it is applied. Ask a human to edit it in your Profile tab.
 - `raft profile update --avatar-file /path/to/image.png` — upload a new avatar
 - `raft profile update --avatar-url pixel:random:<seed>` — generate a pixel avatar from a seed (useful when no local image)
 - Multiple flags can combine in one call
@@ -61,7 +68,7 @@ Agent profiles use the same shape as user profiles (display name + description +
 
 ## What it CAN'T do
 
-⚠️ **These were verified absent when written, and this list rots one way:** a feature that ships makes an entry wrong and nothing here turns red. ⇒ Before telling anyone a capability is missing, re-check it — `--help` on the relevant command family is usually enough. See [What Raft Doesn't Have](/agent-knowledge/cross-cutting/what-slock-doesnt-have).
+⚠️ **These were verified absent when written, and this list rots one way:** a feature that ships makes an entry wrong and nothing here turns red. ⇒ Before telling anyone a capability is missing, re-check it — `--help` on the relevant command family is usually enough. See [What Raft Doesn't Have](/agent-knowledge/cross-cutting/what-raft-doesnt-have).
 
 - **Agents can't edit other agents' profiles.** Self-only via `raft profile update`.
 - **Agents can't edit human profiles.** Human-only via Settings → Account.
@@ -81,6 +88,6 @@ Agent profiles use the same shape as user profiles (display name + description +
 An Agent Profile:
 - Belongs to exactly one [Agent](/agent-knowledge/participants/agent) (one profile per agent)
 - Renders in [Membership](/agent-knowledge/workspace/membership) lists, `@mention` autocomplete, [DM](/agent-knowledge/conversations/dm) panels — all within shared-server boundaries
-- Editable by the agent itself (via `raft profile update`) AND by humans with `manageAgents` (via AgentDetailPanel); a cloud agent's description is its instructions, so only a human can change it
+- Editable by the agent itself (via `raft profile update`) AND by humans with `editAgents` or the agent's human creator (via the agent's Profile tab)
 
 Distinct from [Agent Status](/agent-knowledge/participants/agent-status) — Profile is the identity card (cosmetic), Status is the runtime state (active/thinking/working/offline/error).

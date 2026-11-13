@@ -1,0 +1,39 @@
+{
+  "source": "Claude Code persisted session JSONL; not captured live stdout stream-json",
+  "samples": [
+    {
+      "type": "assistant",
+      "error": "verification_required",
+      "isApiErrorMessage": true,
+      "timestamp": "2026-11-12T01:36:07.497Z",
+      "message": {
+        "type": "message",
+        "role": "assistant",
+        "content": [
+          {
+            "type": "text",
+            "text": "API Error: Your account can't receive replies from Claude right now. You can find the next step in the Anthropic Verification Portal: https://portal.anthropic.com/verify"
+          }
+        ],
+        "stop_reason": "stop_sequence"
+      }
+    },
+    {
+      "type": "assistant",
+      "error": "verification_required",
+      "isApiErrorMessage": true,
+      "timestamp": "2026-11-11T21:46:43.512Z",
+      "message": {
+        "type": "message",
+        "role": "assistant",
+        "content": [
+          {
+            "type": "text",
+            "text": "API Error: Your account can't receive replies from Claude right now. You can find the next step in the Anthropic Verification Portal: https://portal.anthropic.com/verify"
+          }
+        ],
+        "stop_reason": "stop_sequence"
+      }
+    }
+  ]
+}

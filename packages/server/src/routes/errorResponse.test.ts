@@ -5,7 +5,7 @@ import type { AddressInfo } from "node:net";
 import express from "express";
 
 import { RisingWaveOverloadedError } from "../db/risingwave";
-import { globalJsonServerErrorHandler, respondToRisingWaveOverload, sendJsonServerError } from "./errorResponse";
+import { globalJsonServerErrorHandler, respondToRisingWaveOverload, routeFailureAttrs, sendJsonServerError } from "./errorResponse";
 
 async function withErrorBoundaryApp<T>(fn: (baseUrl: string) => Promise<T>): Promise<T> {
   const app = express();
@@ -90,4 +90,43 @@ test("a saturated RisingWave pool answers 503 + Retry-After, not 500, on every e
       }, path);
     }
   });
+});
+
+test("routeFailureAttrs reads the pg error under drizzle's wrapper and never the message", () => {
+  // pg names its own errors "error".
+  const pg = Object.assign(new Error('insert violates "secret@example.com"'), {
+    name: "error",
+    code: "23503",
+    constraint: "read_mutations_channel_id_fk",
+  });
+  const attrs = routeFailureAttrs(new Error("Failed query: params: secret@example.com", { cause: pg }));
+  assert.deepEqual(attrs, {
+    error_class: "Error",
+    cause_class: "error",
+    sqlstate: "23503",
+    error_code: "none",
+    constraint: "read_mutations_channel_id_fk",
+  });
+  assert.doesNotMatch(JSON.stringify(attrs), /secret/);
+});
+
+test("routeFailureAttrs separates connection codes from SQLSTATEs and drops anything else", () => {
+  const reset = Object.assign(new Error("reset"), { code: "ECONNRESET", constraint: "not an identifier; drop" });
+  assert.deepEqual(routeFailureAttrs(reset), {
+    error_class: "Error",
+    cause_class: "Error",
+    sqlstate: "none",
+    error_code: "ECONNRESET",
+    constraint: "none",
+  });
+  const pipe = routeFailureAttrs(Object.assign(new Error("pipe"), { code: "EPIPE" }));
+  assert.equal(pipe.sqlstate, "none");
+  assert.equal(pipe.error_code, "EPIPE");
+  assert.equal(routeFailureAttrs(Object.assign(new Error("odd"), { code: "secret value" })).error_code, "none");
+  assert.equal(routeFailureAttrs("boom").sqlstate, "none");
+});
+
+test("routeFailureAttrs names a pool that gave no connection in time", () => {
+  const attrs = routeFailureAttrs(new Error("wrapped", { cause: new Error("timeout exceeded when trying to connect") }));
+  assert.equal(attrs.error_code, "acquire_timeout");
 });

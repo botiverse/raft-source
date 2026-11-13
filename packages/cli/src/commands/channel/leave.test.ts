@@ -7,7 +7,6 @@ import { CliError } from "../../core/errors";
 import type { CliIo } from "../../core/io";
 import {
   channelLeaveCommand,
-  formatAlreadyNotJoined,
   formatLeaveChannelResult,
   parseRegularChannelTarget,
 } from "./leave";
@@ -46,10 +45,6 @@ test("parseRegularChannelTarget accepts only top-level channel targets", () => {
 
 test("leave channel output explains post-leave access", () => {
   assert.equal(
-    formatLeaveChannelResult("#engineering"),
-    "Left #engineering. You can still inspect visible public channel history there, but you can no longer send or receive ordinary channel delivery until you join the public channel again or a human re-adds you to a private channel.",
-  );
-  assert.equal(
     formatLeaveChannelResult("#engineering", {
       ok: true,
       attention: {
@@ -74,7 +69,6 @@ test("leave channel output explains post-leave access", () => {
       "Agent API: POST /internal/agent-api/threads/unfollow",
     ].join("\n"),
   );
-  assert.equal(formatAlreadyNotJoined("#engineering"), "Already not joined in #engineering.");
 });
 
 test("leave channel command uses injected ApiClient and writes leave result", async () => {
@@ -141,4 +135,41 @@ test("leave channel command maps invalid target into typed CliError", async () =
       return true;
     },
   );
+});
+
+test("leave: a private channel's last member is refused with the --delete-if-last command; with the flag it sends deleteIfLast and says the channel went", async () => {
+  const { io, stdout } = memoryIo();
+  const requests: Array<{ method: string; path: string; body: unknown }> = [];
+  const ctx = createCommandContext({
+    io,
+    loadAgentContext: () => agentContext,
+    createApiClient: () => ({
+      request: async (method: string, path: string, body: unknown): Promise<ApiResponse<unknown>> => {
+        requests.push({ method, path, body });
+        if (method === "GET") {
+          return { ok: true, status: 200, error: null, data: { runtimeContext: { agentId: "agent-1", serverId: "server-1" }, channels: [{ id: "channel-1", name: "scratch", joined: true }], agents: [], humans: [] } };
+        }
+        if ((body as { deleteIfLast?: boolean }).deleteIfLast !== true) {
+          return { ok: false, status: 409, data: null, error: "You are the last member of #scratch, …", errorCode: "last_member_deletes_channel", suggestedNextAction: "(the Server's)" };
+        }
+        return { ok: true, status: 200, error: null, data: { ok: true, channelDeleted: true } };
+      },
+    }) as any,
+  });
+
+  await assert.rejects(
+    async () => { await channelLeaveCommand.handler(ctx, { target: "#scratch" }); },
+    (err: unknown) => {
+      assert.ok(err instanceof CliError);
+      assert.equal(err.code, "LAST_MEMBER");
+      assert.equal(err.message, "You are the last member of #scratch, a private channel: leaving would delete the channel and all its messages, and that can't be undone. Nothing changed.");
+      assert.equal(err.suggestedNextAction, `Only if the channel and all its messages should go: raft channel leave --target "#scratch" --delete-if-last. Otherwise stay in it, or ask a person to add someone else first.`);
+      return true;
+    },
+  );
+  assert.deepEqual(requests.at(-1)?.body, {});
+
+  await channelLeaveCommand.handler(ctx, { target: "#scratch", deleteIfLast: true });
+  assert.deepEqual(requests.at(-1), { method: "POST", path: "/internal/agent-api/channels/channel-1/leave", body: { deleteIfLast: true } });
+  assert.equal(stdout.join(""), "You were the last member of #scratch, a private channel, so it and all its messages were deleted. That can't be undone.\n");
 });

@@ -3,6 +3,7 @@ import AvatarListRow from "../ui/AvatarListRow";
 import AvatarSlot from "../ui/AvatarSlot";
 import StatusDot from "../ui/StatusDot";
 import { formatRuntimeLabelWithStatus } from "../../utils/runtimeAvailabilityLabel";
+import { useRuntimeDeprecatedHere } from "../../hooks/useServerRuntimeCatalog";
 import { useCallback } from "react";
 import { useIntl } from "react-intl";
 import { useProfileStore } from "../../store/profileStore";
@@ -23,6 +24,7 @@ export function CreatedAgentRow({
   onOpenProfile?: (type: "agent" | "human", id: string) => void;
 }) {
   const { formatMessage } = useIntl();
+  const deprecatedHere = useRuntimeDeprecatedHere();
   const agentId = createdAgent.id;
   const handleClick = useCallback(() => {
     if (onOpenProfile) {
@@ -42,7 +44,7 @@ export function CreatedAgentRow({
         />
       }
       name={createdAgent.displayName || createdAgent.name}
-      subtitle={formatRuntimeLabelWithStatus(createdAgent.runtime, formatMessage)}
+      subtitle={formatRuntimeLabelWithStatus(createdAgent.runtime, formatMessage, deprecatedHere(createdAgent.runtime))}
       rightContent={
         <StatusDot
           activity={displayState.activity}

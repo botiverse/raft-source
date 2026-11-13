@@ -93,5 +93,8 @@ test("admin settings remove action follows server role transition policy", () =>
   assert.equal(canRemoveAdminMember("owner", { role: "owner" }, 2), true);
   assert.equal(canRemoveAdminMember("owner", { role: "owner" }, 1), false);
   assert.equal(canRemoveAdminPrincipal("owner", { kind: "agent", role: "admin" }), true);
-  assert.equal(canRemoveAdminPrincipal("admin", { kind: "agent", role: "admin" }), false);
+  // An admin may demote an admin agent (not a peer admin: canChangeAgentMemberRole), never a person who is one.
+  assert.equal(canRemoveAdminPrincipal("admin", { kind: "agent", role: "admin" }), true);
+  assert.equal(canRemoveAdminPrincipal("admin", { kind: "human", role: "admin" }), false);
+  assert.equal(canRemoveAdminPrincipal("member", { kind: "agent", role: "admin" }), false);
 });

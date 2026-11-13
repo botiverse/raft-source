@@ -77,7 +77,11 @@ export const SYSTEM_MESSAGE_BORN_READ_CLASSIFICATION = {
   "channel.agent_membership": "born-read",
   "channel.human_membership": "born-read",
   "channel.rename": "born-read",
+  // Setting, replacing or removing a channel's announcement (channel_announcement_v0): the actor reads it.
+  "channel.announcement": "born-read",
   "channel.archive": "born-read",
+  "channel.joint_disconnect": "born-read",
+  "channel.joint_connect": "born-read",
   "channel.unarchive": "born-read",
   "task.created_summary": "born-read",
   "task.assignment_receipt": "born-read",
@@ -92,6 +96,12 @@ export const SYSTEM_MESSAGE_BORN_READ_CLASSIFICATION = {
   // Action-card result reply in the card thread: @mentions the preparing
   // agent (unread for it); born-read for the human who executed the card.
   "action_card.result_reply": "born-read",
+  // RFC 077 PR 2b: the receipt of a message an assistant sent as its owner,
+  // in their DM. Caused by the assistant (born-read for it); unread for the owner.
+  "assistant.delegated_receipt": "born-read",
+  // An admin stopped someone's assistant: unread for the owner, in their DM
+  // with it; born-read for the admin who stopped it (not normally a reader).
+  "assistant.stopped_by_admin": "born-read",
 
   // No fact recorded (mode:"skip"): lifecycle churn / zero-audience.
   "channel.self_unfollow_thread": "skip",
@@ -104,6 +114,19 @@ export const SYSTEM_MESSAGE_BORN_READ_CLASSIFICATION = {
   "onboarding.member_instruction": "notify-exclude",
   "onboarding.all_channel_unlock": "notify-exclude",
   "onboarding.cross_channel_hint": "notify-exclude",
+  // A Slack Bridge pair paused on its first blocked send. No human caused it
+  // at that moment; the configurer it mentions must see it unread.
+  "slack_bridge.binding_paused": "notify-exclude",
+  // A notice to a server's owners and admins in their own DM with themselves
+  // (#13746; retired by #wg-rbac:#42, no longer sent, kept for the rows it
+  // wrote): someone else, often on another server, caused it.
+  "server.admin_notice": "notify-exclude",
+  // WeChat was bound to the owner's assistant (wechatBridgeService). The owner
+  // scanned, but the notice is for the case they did not: it stays unread.
+  "assistant.wechat_connected": "notify-exclude",
+  // The WeChat bridge's token went stale (iLink -14; wechatBridgeWorker). No
+  // one caused it; the owner must see it unread to reconnect.
+  "assistant.wechat_reconnect_required": "notify-exclude",
   // Not broadcastSystemMessage — real sender already drives the born-read gate.
   "action_card.carrier": "real-sender",
   "task.body": "real-sender",
@@ -135,3 +158,75 @@ export type RequiresCausalActorProducer = {
   [P in ProductionSystemMessageProducer]:
     (typeof SYSTEM_MESSAGE_BORN_READ_CLASSIFICATION)[P] extends "born-read" ? P : never;
 }[ProductionSystemMessageProducer];
+
+/**
+ * Which system-message producers are notification events (every transport,
+ * through the notification outbox: services/notifications/enqueue.ts).
+ * Same forced declaration as the born-read registry: a new producer fails
+ * `tsc` until it is classified here. `none`: the message counts as unread
+ * activity and notifies only the people it @mentions (design D10); a
+ * `real-sender` producer above notifies like any message.
+ *
+ * - `task_status`           — task thread followers; plus the task creator and
+ *                             human assignee; never the actor.
+ * - `task_assigned`         — the personal-attention target (the assignee).
+ * - `agent_action_required` — the human in the owner↔agent DM.
+ *
+ * A persisted message whose producer is no longer listed (e.g. the retired
+ * `agent.tool_stuck` owner notice) classifies as `none`.
+ */
+export type SystemMessageNotificationEvent =
+  | "task_status"
+  | "task_assigned"
+  | "agent_action_required"
+  | "none";
+
+export const SYSTEM_MESSAGE_NOTIFICATION_EVENT = {
+  "agent.join_channel": "none",
+  "agent.server_role_changed": "none",
+  "agent.runtime_action_required": "agent_action_required",
+  "agent.migration_completed_receipt": "none",
+  "agent.migration_canceled_receipt": "none",
+  "agent.migration_failed_receipt": "none",
+  "agent.migration_aborted_receipt": "none",
+  // The reminder's agent is the reader; the human creator is notified from the
+  // fire path instead (reminderFiredNotification).
+  "app.agent_reminder": "none",
+  "channel.agent_membership": "none",
+  "channel.human_membership": "none",
+  "channel.rename": "none",
+  // Like a rename: unread activity (a muted channel's stays out), no push (tygg, #proj-chat:#29).
+  "channel.announcement": "none",
+  "channel.archive": "none",
+  "channel.joint_disconnect": "none",
+  "channel.joint_connect": "none",
+  "channel.unarchive": "none",
+  "task.created_summary": "none",
+  "task.assignment_receipt": "task_assigned",
+  "task.converted_summary": "none",
+  "task.lifecycle_thread": "task_status",
+  "onboarding.hosted_recap_wake": "none",
+  "action_card.result_reply": "none",
+  "assistant.delegated_receipt": "none",
+  "assistant.stopped_by_admin": "none",
+  "assistant.wechat_connected": "none",
+  "assistant.wechat_reconnect_required": "none",
+  "channel.self_unfollow_thread": "none",
+  "task.deleted_summary": "none",
+  "onboarding.owner_instruction": "none",
+  "onboarding.owner_opener_v2_ledger": "none",
+  "onboarding.member_instruction": "none",
+  "onboarding.all_channel_unlock": "none",
+  "onboarding.cross_channel_hint": "none",
+  "action_card.carrier": "none",
+  "task.body": "none",
+  "external_projection.inbound": "none",
+  // Reaches the configurer as a personal mention in the channel's inbox.
+  "slack_bridge.binding_paused": "none",
+  // Retired (#wg-rbac:#42): it notified through its own `system_notice` outbox row.
+  "server.admin_notice": "none",
+} satisfies Record<ProductionSystemMessageProducer, SystemMessageNotificationEvent>;
+
+export function systemMessageNotificationEvent(producer: string): SystemMessageNotificationEvent {
+  return (SYSTEM_MESSAGE_NOTIFICATION_EVENT as Record<string, SystemMessageNotificationEvent | undefined>)[producer] ?? "none";
+}

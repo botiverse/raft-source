@@ -14,6 +14,7 @@
  * to external and records the hosted provisioning in the same transaction,
  * conditioned on the migration revision the review was shown at.
  */
+import { agentConfigValues, recordAgentConfigChange } from "./agentConfigChangeEvents";
 import { randomUUID } from "node:crypto";
 import { and, eq, isNull, lt, or, sql } from "drizzle-orm";
 import {
@@ -23,7 +24,7 @@ import {
   currentDate,
   type AgentMigrationHostedImportSummary,
 } from "@botiverse/raft-shared";
-import { getDb } from "../db/index";
+import { getDb, type DatabaseExecutor } from "../db/index";
 import {
   agentMigrationHostedTargets,
   agentMigrations,
@@ -35,6 +36,9 @@ import { lockAgentMigrationActorAuthority, type AgentMigrationRow } from "./agen
 import { enqueueAgentMigrationFailedReceipt } from "./agentMigrationReceiptService";
 import { encryptProviderSecret } from "./agentRuntimeProviderService";
 import { recordAgentProvisioning } from "./agentRuntimeProvisionService";
+import { revokeRunnerCredentialsOffMachine } from "./agentCredentialService";
+import { recordTraceEvent } from "../tracing/semanticTrace";
+import { readPositionLatestTargets, settleUnowedReadBacklog, type UnowedReadBacklogSettled } from "./unowedReadBacklog";
 
 export const HOSTED_MIGRATION_IMPORT_SOURCE = "computer_migration";
 /** How long one importer run may hold a migration before another worker may take it over. */
@@ -234,7 +238,7 @@ export async function confirmHostedAgentMigration(input: {
   now?: Date;
 }): Promise<AgentMigrationRow> {
   const now = input.now ?? currentDate();
-  return await getDb().transaction(async (tx) => {
+  const confirmed = await getDb().transaction(async (tx) => {
     await lockAgentMigrationActorAuthority(tx, input.agentId, { serverId: input.serverId, userId: input.userId, capability: "migrateAgents" });
     const [row] = await tx.select({ migration: agentMigrations, hosted: agentMigrationHostedTargets })
       .from(agentMigrations)
@@ -304,10 +308,22 @@ export async function confirmHostedAgentMigration(input: {
         updatedAt: now,
       })
       .where(and(eq(agents.id, agent.id), eq(agents.machineId, migration.sourceMachineId), isNull(agents.deletedAt)))
-      .returning({ id: agents.id, serverId: agents.serverId, name: agents.name, displayName: agents.displayName, description: agents.description });
+      .returning({ id: agents.id, serverId: agents.serverId, name: agents.name, displayName: agents.displayName, description: agents.description, runtime: agents.runtime, model: agents.model, reasoningEffort: agents.reasoningEffort });
     if (!switched) {
       throw new HostedMigrationConfirmError("MIGRATION_SOURCE_MACHINE_MISMATCH", "The agent is no longer on the migration's source computer");
     }
+    // Off its Computer: the source's runner credentials go; the cloud runtime's
+    // own (issued_via 'provision', minted just below) is never one of them.
+    await revokeRunnerCredentialsOffMachine(tx, { agentIds: [switched.id], machineId: null, now });
+    await recordAgentConfigChange(tx, {
+      serverId: switched.serverId,
+      agentId: switched.id,
+      source: "hosted_migration",
+      actor: { kind: "user", id: input.userId },
+      before: agentConfigValues(agent),
+      after: agentConfigValues(switched),
+      changedAt: now,
+    });
     await recordAgentProvisioning(tx, {
       agent: switched,
       provider: hosted.provider,
@@ -330,8 +346,31 @@ export async function confirmHostedAgentMigration(input: {
       ))
       .returning();
     if (!arriving) throw new HostedMigrationConfirmError("MIGRATION_REVISION_STALE", "The migration changed since this review was shown");
-    return arriving;
+    const backlog = await settleMigratedAgentReadBacklog(tx, agent.id);
+    return { arriving, backlog };
   });
+  recordTraceEvent("server.agent_migration.hosted_read_backlog_settled", {
+    agent_id: confirmed.arriving.agentId,
+    server_id: confirmed.arriving.serverId,
+    outcome: "ok",
+    conversation_count: confirmed.backlog.conversations,
+    message_count: confirmed.backlog.messages,
+    kept_conversation_count: confirmed.backlog.keptConversations,
+  });
+  return confirmed.arriving;
+}
+
+export type MigratedReadBacklog = UnowedReadBacklogSettled;
+
+/**
+ * At the switch to the cloud every conversation the agent has a read position
+ * in is settled through its latest message, except what it still owes (see
+ * unowedReadBacklog.ts). A cloud agent's pull acks what it reads and its wake
+ * asks it to read until nothing is left, so the backlog a Computer never
+ * advanced would otherwise be replayed on arrival (#raft-antiproton:9f9d85b0).
+ */
+export async function settleMigratedAgentReadBacklog(executor: DatabaseExecutor, agentId: string): Promise<MigratedReadBacklog> {
+  return settleUnowedReadBacklog(executor, agentId, await readPositionLatestTargets(executor, agentId));
 }
 
 /**

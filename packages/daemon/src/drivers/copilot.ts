@@ -2,6 +2,7 @@ import { spawnRuntimeChild } from "./runtimeChild";
 import { hydrateRuntimeConfig, runtimeConfigToLaunchFields, type AgentConfig , type AxSurfaceText } from "@botiverse/raft-shared";
 import type { RuntimeDriver, SpawnContext, SpawnResult, ParsedEvent } from "./types";
 import { buildCliTransportSystemPrompt, prepareCliTransport } from "./cliTransport";
+import { OpenToolCalls } from "./openToolCalls";
 import {
   prepareManagedMcpRuntimeProxy,
   writeManagedMcpRuntimeConfigFile,
@@ -83,6 +84,9 @@ export class CopilotDriver implements RuntimeDriver {
   } as const;
   readonly session = {
     recovery: "resume_or_fresh",
+    // Never emits a compaction event.
+    compaction: "unreported",
+    compactionFailure: "does_not_stick",
   } as const;
   readonly model = {
     detectedModelsVerifiedAs: "launchable",
@@ -93,14 +97,18 @@ export class CopilotDriver implements RuntimeDriver {
 
   private sessionId: string | null = null;
   private sessionAnnounced = false;
+  private readonly openTools = new OpenToolCalls();
 
   async spawn(ctx: SpawnContext): Promise<SpawnResult> {
     this.sessionId = ctx.config.sessionId || null;
     this.sessionAnnounced = false;
+    this.openTools.clear();
 
     const managedMcp = await prepareManagedMcpRuntimeProxy({
       agentId: ctx.agentId,
       launchId: ctx.launchId,
+      processInstanceId: ctx.processInstanceId,
+      readTurnOrigin: ctx.readTurnOrigin,
       serverUrl: ctx.config.serverUrl,
       agentCredentialKey: ctx.config.agentCredentialKey,
     });
@@ -174,10 +182,14 @@ export class CopilotDriver implements RuntimeDriver {
         // Final assembled message — extract tool calls if any
         if (Array.isArray(data.toolRequests)) {
           for (const req of data.toolRequests) {
+            const name = req.name || req.toolName || "unknown_tool";
+            const callId = typeof req.toolCallId === "string" && req.toolCallId ? req.toolCallId : undefined;
+            if (callId && !this.openTools.start(callId, name)) continue;
             events.push({
               kind: "tool_call",
-              name: req.name || req.toolName || "unknown_tool",
+              name,
               input: req.arguments || req.parameters || req.input || {},
+              ...(callId ? { callId } : {}),
             });
           }
         }
@@ -192,7 +204,34 @@ export class CopilotDriver implements RuntimeDriver {
         break;
       }
 
+      case "tool.execution_complete": {
+        // Paired with the request by `toolCallId`. A completion the driver never
+        // opened (Copilot's advisor path sends one without a request) is dropped.
+        const callId = typeof data.toolCallId === "string" ? data.toolCallId : "";
+        const name = callId ? this.openTools.end(callId) : undefined;
+        if (name === undefined) break;
+        const exitCode = data.shellExecution?.exitCode;
+        events.push({
+          kind: "tool_output",
+          name,
+          callId,
+          // A shell command that ran and exited non-zero is a finished call;
+          // a timed-out or cancelled one is not, even with an exit code.
+          ok: data.success === true || (data.error?.code === "failure" && Number.isInteger(exitCode)),
+          ...(Number.isInteger(exitCode) ? { exitCode } : {}),
+        });
+        break;
+      }
+
+      case "abort":
+        // An aborted call may never get its completion.
+        for (const call of this.openTools.drain()) {
+          events.push({ kind: "tool_output", name: call.name, callId: call.callId });
+        }
+        break;
+
       case "assistant.turn_end":
+        this.openTools.clear();
         events.push({ kind: "turn_end", sessionId: this.sessionId || undefined });
         break;
 
@@ -209,6 +248,7 @@ export class CopilotDriver implements RuntimeDriver {
           events.push({ kind: "error", message: `Copilot exited with code ${exitCode}` });
         }
         // Result is the final event — emit turn_end if not already emitted by turn_end event
+        this.openTools.clear();
         events.push({ kind: "turn_end", sessionId: this.sessionId || undefined });
         break;
       }

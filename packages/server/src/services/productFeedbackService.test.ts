@@ -9,6 +9,9 @@ import {
   productFeedbackReporterId,
   submitProductFeedback,
 } from "./productFeedbackService";
+import { setPrivacyModeForTest } from "../config/privacyMode";
+import { isProductFeedbackConversationConfigured } from "./productFeedbackConversationService";
+import { isProductFeedbackRouteConfigured } from "./productFeedbackRouteBindingService";
 
 const ENV = {
   HANDS_FEEDBACK_BASE_URL: "https://hands.example/",
@@ -239,6 +242,32 @@ test("submitProductFeedback fails closed when Hands is not configured", async ()
     }, { env: {} }),
     ProductFeedbackConfigurationError,
   );
+});
+
+test("RAFT_PRIVACY_MODE: fully configured Hands feedback reports not configured and sends nothing", async () => {
+  setPrivacyModeForTest(true);
+  try {
+    assert.equal(isProductFeedbackConfigured(ENV), false);
+    assert.equal(isProductFeedbackConversationConfigured(ENV), false);
+    assert.equal(isProductFeedbackRouteConfigured(ENV), false);
+    let calls = 0;
+    await assert.rejects(
+      submitProductFeedback({
+        submissionId: "44444444-4444-4444-8444-444444444444",
+        kind: "idea",
+        message: "Hello",
+        contact: null,
+        userId: "user-4",
+        metadata: normalizeProductFeedbackMetadata({}),
+        attachments: [],
+      }, { env: ENV, fetchImpl: async () => { calls += 1; return new Response("{}"); } }),
+      ProductFeedbackConfigurationError,
+    );
+    assert.equal(calls, 0);
+  } finally {
+    setPrivacyModeForTest(false);
+  }
+  assert.equal(isProductFeedbackConfigured(ENV), true, "off: unchanged");
 });
 
 test("submitProductFeedback preserves status and one bounded controlled upstream JSON error", async () => {

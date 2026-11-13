@@ -1,36 +1,86 @@
-import { projectConversionState } from "@botiverse/raft-shared";
+import { AGENT_LOUNGE_OUTSIDER_ADD_REFUSAL, AgentLoungeImmutableError, filterLoungeOutsiderAgents, getLoungeAgentIds, isLoungeOutsiderAgent } from "../services/agentLoungeService";
+import { projectRuntimeErrorActivityDetail } from "../services/agentRuntimeErrorVisibility";
+import { isRuntimeErrorDetailActivity } from "@botiverse/raft-shared";
+import { refuse, RefusalError, type RefusalInput } from "../lib/refusal";
+import { isJointHostSideMember } from "../services/jointHumanMembershipAccess";
+import { JointActorUnavailableError } from "../services/jointHumanMembershipMirror";
+import { hideUnfindableAgentsByParam } from "./unfindableAgentGate";
+import { DEPRECATED_GRAVATAR_HASH, isExternalAgentRuntime, isSubConversationType } from "@botiverse/raft-shared";
+import { getProductEventSink } from "../services/productEventIngest";
+import { recordServerProductEvent } from "../services/serverProductEvents";
+import { getAgentsLastSeenAt } from "../services/agentCredentialService";
+import { type MarkConversationUnreadResponse } from "@botiverse/raft-shared";
 import { emitChannelConversionCardUpdates } from "../services/channelConversionRealtimeService";
 import { emitJointProjectionUpdates, publishChannelUpdate } from "../services/channelRealtimeEvents";
+import { finishChannelArchive } from "../services/channelArchiveEffects";
+import { isLastJointHostSideMember } from "../services/jointHostSideArchive";
 import { serializeErrorForLog } from "../tracing/safeErrorLog";
 import { revokeSocketAccess } from "../socket/accessRevocation";
 import { socketUserServerRoom } from "../socket/platformScope";
 import { Router, type Request, type Response, type Router as RouterType } from "express";
+import { createHash } from "node:crypto";
 import { hostname } from "node:os";
 import * as channelService from "../services/channelService";
-import { readWithStaleOnOverload, resolveSoftTimeoutMs, STALE_RESPONSE_HEADER } from "./rwStaleRead";
+import { archivedNameCollisionBody } from "./archivedNameCollision";
+import { finishHumanChannelListItems, loadHumanChannelList, resolveExternalRelationViewer, withHumanChannelAuthorization } from "../services/channelListItems";
+import { noteInboxWriteBeforeReply, readWithStaleOnOverload, resolveSoftTimeoutMs, STALE_RESPONSE_HEADER } from "./rwStaleRead";
+import { admitJointInvite } from "../services/jointInviteRateLimit";
 import { getActiveJointProjectionLocalChannelId, JointChannelLimitError } from "../services/jointChannelLimitService";
+import { AttributedJointChannelLimitError, ExternalChannelLimitError } from "../services/externalChannelLimitService";
 import { resolveGatingParentJointId } from "../services/jointChannelLimitState";
 import * as channelConversionService from "../services/channelConversionService";
-import { admitConversionCommand, executeConversionCommand, runConversionCommand, conversionCommandId } from "../services/channelConversionCommandService";
+import { runConversionCommand, conversionCommandId } from "../services/channelConversionCommandService";
 import * as agentService from "../services/agentService";
 import * as serverService from "../services/serverService";
+import { recordIntegrationAuditEvent, serverAuditContextMetadata } from "../services/integrationAuditService";
+import { withVisitorVisible } from "../services/channelVisitorVisibility";
+import { canView } from "../services/visibilityService";
+import { attachChannelAnnouncement, channelAnnouncementChange } from "../services/channelAnnouncements";
+import { postChannelAnnouncementChange } from "../services/channelAnnouncementMessages";
 import * as messageService from "../services/messageService";
 import * as userService from "../services/userService";
 import * as savedService from "../services/savedService";
-import * as activitySyncService from "../services/activitySyncService";
-import { applyActivityContractHandshake } from "./activityContractHeader";
-import { CHANNEL_MANAGEMENT_CAPABILITIES, MAX_JOINT_CHANNEL_SERVERS, SIDEBAR_MARK_ALL_READ_FEATURE_FLAG_KEY, SERVER_GUEST_FEATURE_FLAG_KEY, channelTypeSupportsActivityMute, noopTracer, validateName, type ServerCapability, type ActiveSpan, type ServerId, type TraceAttributes, type Tracer } from "@botiverse/raft-shared";
-import { getServerPlan, getHistoryCutoff, isChannelReadOnlyByBillingFeature, isChannelReadOnlyByQuota } from "../services/planService";
+import * as externalInviteService from "../services/externalInviteService";
+import { inviteEmailRecorder } from "../services/externalInviteProductEvents";
+import * as jointMemberConnectService from "../services/jointMemberConnectService";
+import * as externalInviteConnectService from "../services/externalInviteConnectService";
 import {
-  CHANNEL_TO_JOINT_CONVERSION_FEATURE_FLAG_KEY,
+  choseSeveral,
+  noteServerConnectPaywallHits,
+  publishExternalConnections,
+  recordConnectFinished,
+  recordServerConnectOutcomes,
+  serializeServerConnectOutcome,
+} from "./externalInvites";
+import { refusedOutcome, type ConnectFinishedOutcome } from "../services/externalConnectProductEvents";
+import { asServerId, CHANNEL_THREAD_SORT_FEATURE_FLAG_KEY, channelTypeSupportsThreadSort, isChannelThreadSort, EXTERNAL_CHANNELS_FEATURE_FLAG_KEY, MAX_JOINT_CHANNEL_SERVERS, PUBLIC_SERVER_FEATURE_FLAG_KEY, channelTypeSupportsActivityMute, noopTracer, validateName, type ServerCapability, type ActiveSpan, type ServerId, type TraceAttributes, type Tracer } from "@botiverse/raft-shared";
+import { getServerPlan, getHistoryCutoff, channelBillingReadOnlyBody, getChannelBillingReadOnly, isChannelReadOnlyByQuota } from "../services/planService";
+import { setRequestTraceErrorCode, setRequestTraceLimitSide } from "../middleware/requestObservability";
+import { noteLimitPaywallHit, notePaywallHit } from "./paywallHit";
+import { getServerHistoryWindowForRead, isBehindHistoryWindow } from "../services/historyWindow";
+import {
   evaluateFeatureFlag,
 } from "../services/featureFlagService";
 import { isReceiverStatePushEnabled } from "../services/receiverStatePushService";
+import { onConversationsRead } from "../services/notifications/retraction";
 import { emitScopeReadUpdated, getPeerReadHydrate } from "../services/readReceiptService";
 import { emitThreadFollowersUpdated } from "../services/threadFollowerRealtimeService";
 import {
+  NotificationLevelError,
+  emitLevelChange,
+  loadConversationLevelSettings,
+  setLevel as setNotificationLevel,
+  withNotificationLevels,
+} from "../services/notifications/settings";
+import { assistantsAmong, stopAssistant } from "../services/assistantLifecycleService";
+import { openDirectMessageForUser } from "../services/directMessageOpenService";
+import { joinChannelAsUser } from "../services/channelJoinService";
+import { isActionCardConversionError } from "../services/actionCardConversionService";
+import {
   actorHasServerCapabilityInServer,
+  actorRoleHasServerCapability,
   canHumanOperateAgentReadState,
+  decideAgentResourceAuthority,
   getActorServerRoleInServer,
   type ReadStateDelegationBasis,
 } from "../lib/actorPermissions";
@@ -38,23 +88,28 @@ import {
   actorHasChannelCapability,
   channelActorHasCapability,
   resolveChannelActorContext,
-  resolveChannelActorContextsMany,
-  type ChannelActorContext,
   withLockedChannelActorCapability,
   withLockedChannelActorCapabilities,
 } from "../lib/channelActorPermissions";
 import type { AgentOrchestrator } from "../services/agentOrchestrator";
 import type { Server as SocketServer } from "socket.io";
 import { addTraceEvent, createTraceDbQueryTracer, getCurrentTraceContext, tracePhase, withTraceChildSpan } from "../tracing/semanticTrace";
+import {
+  activityListFetchTraceAttrs,
+  CHANNEL_FETCH_REASON_HEADER,
+  channelGetTargetTraceAttrs,
+  INBOX_FETCH_COALESCED_HEADER,
+  INBOX_FETCH_TRIGGER_HEADER,
+  inboxFetchTriggerTraceAttrs,
+} from "./channelGetTrace";
 import { getThumbnailUrl, normalizeAttachmentFilename, resolveAttachmentMimeType } from "./attachments";
 import { CHANNEL_NOT_FOUND_BODY, denyChannelAccess } from "./channelAccessDenial";
 import { MAX_MESSAGE_LENGTH } from "./messages";
-import { respondToRisingWaveOverload, respondToRisingWaveUnavailable, sendJsonServerError } from "./errorResponse";
+import { addRouteFailureEvent, respondToRisingWaveUnavailable, sendJsonServerError } from "./errorResponse";
 import { UUID_RE as ANY_UUID_RE } from "../lib/messageId";
 import { guardUuidPathParams } from "../lib/uuidPathParams";
 import {
   assertChannelConversionWritable,
-  ChannelConversionFenceConflictError,
   ChannelConversionInProgressError,
   resolveChannelConversionLockTarget,
 } from "../services/channelConversionFenceService";
@@ -69,7 +124,17 @@ import {
   DoneFrontierRequiredError,
 } from "../services/inboxSuppressionWriters";
 import { getInboxRouteBackpressureAdmission } from "../middleware/inboxRouteBackpressure";
+import { firstPartyApp } from "../apps/firstPartyApps";
+import { getActivityInboxItems, getObjectKindInboxItems, type ActivityInboxItem, type ActivityInboxResult } from "../services/objectActivityInbox";
+import { markAllObjectActivityRead } from "../services/objectActivity";
+import { announceActivityChanged } from "../services/activityRealtime";
 import { getDb, getPoolMetrics, type DatabaseExecutor } from "../db/index";
+import { parseOffsetQueryParam } from "../lib/offsetQueryParam";
+
+/** Another person's personal assistant: answered as an id that names no agent (agentFindableBy). */
+function isOthersAssistant(agent: { assistantOwnerUserId?: string | null } | null | undefined, userId: string): boolean {
+  return Boolean(agent?.assistantOwnerUserId) && agent!.assistantOwnerUserId !== userId;
+}
 
 export const channelRouter: RouterType = Router();
 
@@ -84,6 +149,9 @@ guardUuidPathParams(channelRouter, {
   threadChannelId: "Thread",
   agentId: "Agent",
 });
+// Another person's personal assistant reads as an unknown agent (agentFindableBy).
+hideUnfindableAgentsByParam(channelRouter, "agentId");
+hideUnfindableAgentsByParam(channelRouter, "memberId");
 
 async function attachHumanChannelAuthorization<T extends { id: string }>(
   channel: T,
@@ -92,34 +160,6 @@ async function attachHumanChannelAuthorization<T extends { id: string }>(
 ) {
   const context = await resolveChannelActorContext(serverId, channel.id, "user", userId);
   return withHumanChannelAuthorization(channel, context);
-}
-
-/**
- * attachHumanChannelAuthorization for a whole list: the actor contexts in three
- * queries total (resolveChannelActorContextsMany) instead of three per channel.
- */
-async function attachHumanChannelAuthorizations<T extends { id: string }>(
-  channelList: readonly T[],
-  serverId: string,
-  userId: string,
-) {
-  const contexts = await resolveChannelActorContextsMany(serverId, channelList.map((channel) => channel.id), "user", userId);
-  return channelList.map((channel) => withHumanChannelAuthorization(channel, contexts.get(channel.id) ?? null));
-}
-
-function withHumanChannelAuthorization<T extends { id: string }>(channel: T, context: ChannelActorContext | null) {
-  return {
-    ...channel,
-    channelRole: context?.channelRole ?? null,
-    channelAdminBasis: context?.channelAdminBasis ?? null,
-    channelCapabilities: Object.fromEntries(
-      CHANNEL_MANAGEMENT_CAPABILITIES.map((capability) => [
-        capability,
-        context ? channelActorHasCapability(context, capability) : false,
-      ]),
-    ),
-    channelAuthorityRevision: context?.channelAuthorityRevision ?? null,
-  };
 }
 
 /**
@@ -198,7 +238,6 @@ const THREAD_SUMMARY_PARENT_IDS_MAX = 500;
 // parent_message_scope_source=compat_recent disappears across prod clients,
 // remove this fallback and require parentMessageIds.
 const THREAD_SUMMARY_COMPAT_PARENT_IDS_LIMIT = 100;
-const UINT64_RE = /^(0|[1-9][0-9]*)$/;
 const receiverStatePushWarned = new Set<string>();
 const receiverStatePushHost = hostname();
 
@@ -262,6 +301,7 @@ function emitReadStateUpdated(req: Request, state: channelService.ReadStateMutat
     logReadStatePush(req, state, { outcome: "no_change", enabled, io_present: ioPresent });
     return;
   }
+  retractReadNotifications(req, [state]);
   if (!enabled) {
     logReadStatePush(req, state, { outcome: "disabled", enabled, io_present: ioPresent });
     warnReceiverStatePushOnce("disabled", {
@@ -299,11 +339,47 @@ function emitReadStateUpdated(req: Request, state: channelService.ReadStateMutat
     maxReadSeq: state.maxReadSeq,
     readStateVersion: state.readStateVersion,
     ...(typeof state.unreadCount === "number" ? { unreadCount: state.unreadCount } : {}),
+    // Additive: present only when the scope is marked unread (absent = not marked).
+    ...(state.markedUnread === true ? { markedUnread: true } : {}),
   });
+}
+
+/**
+ * The read position moved forward: withdraw that conversation's notifications
+ * on the reader's other devices (services/notifications/retraction.ts). Not
+ * behind the receiver-state switch: it is a notification, not a state fanout.
+ */
+function retractReadNotifications(req: Request, scopes: readonly channelService.ReadStateMutationResult[]): void {
+  if (!req.userId || !req.serverId) return;
+  const advanced = scopes.filter((scope) => scope.changed && scope.markedUnread !== true);
+  if (advanced.length === 0) return;
+  onConversationsRead(
+    req.app.get("io") as SocketServer | undefined,
+    req.userId,
+    req.serverId,
+    advanced.map((scope) => ({ conversationId: scope.channelId, throughSeq: scope.maxReadSeq })),
+  );
+}
+
+/**
+ * Done moves the read position too (the sequencer's cursor + Done composite):
+ * withdraw the notifications it covered, as a read does, so a notification
+ * already shown and a held phone alert (isNotificationReadThrough) agree.
+ */
+function retractDoneNotifications(req: Request, ack: { scopes: ReadonlyArray<{ scopeId: string; maxReadSeq: number; readStateVersion: number; changed: boolean; markedUnread?: true }> } | null | undefined): void {
+  if (!ack) return;
+  retractReadNotifications(req, ack.scopes.map((scope) => ({
+    channelId: scope.scopeId,
+    maxReadSeq: scope.maxReadSeq,
+    readStateVersion: scope.readStateVersion,
+    changed: scope.changed,
+    ...(scope.markedUnread ? { markedUnread: true } : {}),
+  })));
 }
 
 function emitReadStateUpdatedBulk(req: Request, scopes: channelService.ReadStateMutationResult[]): void {
   if (scopes.length === 0) return;
+  retractReadNotifications(req, scopes);
   if (!isReceiverStatePushEnabled()) {
     warnReceiverStatePushOnce("disabled", { event: "read_state:updated_bulk", serverId: req.serverId });
     return;
@@ -320,6 +396,7 @@ function emitReadStateUpdatedBulk(req: Request, scopes: channelService.ReadState
       maxReadSeq: scope.maxReadSeq,
       readStateVersion: scope.readStateVersion,
       ...(typeof scope.unreadCount === "number" ? { unreadCount: scope.unreadCount } : {}),
+      ...(scope.markedUnread === true ? { markedUnread: true } : {}),
     })),
   });
 }
@@ -493,14 +570,53 @@ async function shouldFilterChannelHumansForRequester(
     const parentChannel = await channelService.getChannel(parentMessage.channelId);
     return parentChannel ? channelService.isAllSystemChannel(parentChannel) : false;
   }
+  // Task v2: a task conversation lists its task channel's members, so it hides
+  // them exactly as that channel does (a task can live in #all).
+  if (channel.type === "task") {
+    if (!channel.parentChannelId) return false;
+    const parentChannel = await channelService.getChannel(channel.parentChannelId);
+    return parentChannel ? channelService.isAllSystemChannel(parentChannel) : false;
+  }
   return false;
 }
 
 // Contract v0.3 §18.7: over-limit admissions are rejected with a stable code
 // the web client maps to its own copy (free-server cap vs. 30-server cap).
-function sendJointLimitError(res: Response, error: unknown): boolean {
+/**
+ * A Joint Channel limit refused the request. The two Free limits are paywalls
+ * (paywall_hit): too many Free servers in one channel, and a Free server's own
+ * hosting limit, except when accepting an invite, where the hosting limit is
+ * the host's plan, not this server's. The 30-server cap applies on every plan.
+ */
+function sendJointLimitError(res: Response, error: unknown, req: Request, opts: { acceptingInvite?: boolean } = {}): boolean {
   if (!(error instanceof JointChannelLimitError)) return false;
-  res.status(403).json({ error: error.message, code: error.code });
+  setRequestTraceErrorCode(res, error.code);
+  if (error instanceof AttributedJointChannelLimitError) setRequestTraceLimitSide(res, error.limitSide);
+  if (error.code === "joint_free_server_limit") notePaywallHit(req, "joint_channel_free_cap");
+  else if (error.code === "joint_channel_free_limit_reached" && !opts.acceptingInvite) notePaywallHit(req, "joint_channel_host_limit");
+  res.status(403).json({
+    error: error.message,
+    code: error.code,
+    ...(error.details.blockingChannelName ? { blockingChannel: { name: error.details.blockingChannelName } } : {}),
+  });
+  return true;
+}
+
+/**
+ * The free plan's one external channel refused a joint invite accept (the
+ * accepting server is free and already in one; its host has external
+ * channels on): 409 with the body an external invite's connection answers
+ * (routes/externalInvites.ts), naming whose limit it is. Also the host's own
+ * send-time refusals and a person's unarchive. The free plan's refusal is a
+ * paywall (paywall_hit), counted for the server whose limit it is and only
+ * when the caller is its member (noteLimitPaywallHit); a full channel is not.
+ */
+function sendExternalLimitError(res: Response, error: unknown, req: Request): boolean {
+  if (!(error instanceof ExternalChannelLimitError)) return false;
+  setRequestTraceErrorCode(res, error.code);
+  setRequestTraceLimitSide(res, error.limitSide);
+  noteLimitPaywallHit(req, error);
+  res.status(409).json({ error: error.message, code: error.code, limitSide: error.limitSide, limitServerId: error.limitServerId });
   return true;
 }
 
@@ -520,9 +636,16 @@ function sendJointInviteValidationError(res: Response, error: unknown): boolean 
   return true;
 }
 
+/** 403 body for a refused #all leave/removal: #all's audience is the whole server. */
+function allChannelMembershipRefusal(msg: string): { error: string; code: string } | null {
+  return msg === channelService.ALL_CHANNEL_LEAVE_MESSAGE || msg === channelService.ALL_CHANNEL_REMOVE_MEMBERS_MESSAGE
+    ? { error: msg, code: "all_channel_membership_fixed" }
+    : null;
+}
+
 function assertAgentCanBeRemovedFromChannel(channel: NonNullable<Awaited<ReturnType<typeof channelService.getChannel>>>) {
   if (channelService.isAllSystemChannel(channel)) {
-    throw new Error("Cannot remove members from the #all channel");
+    throw new Error(channelService.ALL_CHANNEL_REMOVE_MEMBERS_MESSAGE);
   }
 }
 
@@ -612,6 +735,45 @@ async function broadcastMembershipSystemMessage(
   });
 }
 
+/**
+ * Tell the servers still connected that one left. Posted on the canonical
+ * channel after the disconnect commits, so it reaches every remaining copy and
+ * is never shown for a disconnect that rolled back.
+ */
+async function broadcastJointDisconnectSystemMessage(
+  req: { app: { get(key: string): unknown } },
+  canonicalChannelId: string,
+  serverId: string,
+  actorUserId: string,
+  /** The host, when it disconnected the server (POST /:id/joint-servers/:serverId/disconnect). */
+  byHostServerId?: string,
+) {
+  const io = req.app.get("io") as SocketServer | undefined;
+  const agentOrchestrator = req.app.get("agentOrchestrator") as AgentOrchestrator | undefined;
+  if (!io || !agentOrchestrator) {
+    return;
+  }
+  const server = await serverService.getServer(serverId);
+  const serverName = server?.name ?? "A server";
+  const host = byHostServerId ? await serverService.getServer(byHostServerId) : null;
+  await messageService.broadcastSystemMessageToLocalSurfaces(
+    io,
+    agentOrchestrator,
+    canonicalChannelId,
+    byHostServerId
+      ? `${host?.name ?? "The host"} disconnected ${serverName} from this channel.`
+      : `${serverName} disconnected from this channel.`,
+    {
+      inboxFactPolicy: {
+        mode: "record",
+        producer: "channel.joint_disconnect",
+        reason: "a server leaving a joint channel is shared channel activity",
+        causalActor: { type: "user", id: actorUserId },
+      },
+    },
+  );
+}
+
 async function broadcastChannelRenameSystemMessage(
   req: { app: { get(key: string): unknown } },
   channel: NonNullable<Awaited<ReturnType<typeof channelService.getChannel>>>,
@@ -653,21 +815,36 @@ async function canSeeChannel(
 }
 
 async function filterGuestInboxResult<T extends {
-  items: channelService.InboxItem[];
+  items: ActivityInboxItem[];
   groups: channelService.InboxGroupCount[];
   totalCount: number;
   totalUnreadCount: number;
   activeUnreadCount: number;
 }>(result: T, userId: string, serverId: ServerId): Promise<T> {
   if (await getActorServerRoleInServer(serverId, "user", userId) !== "guest") return result;
+  const conversationItems = result.items.filter(isConversationInboxItem);
   const visible = await guestVisibleChannelIds([
-    ...result.items.map(inboxItemAccessChannelId),
+    ...conversationItems.map(inboxItemAccessChannelId),
     ...result.groups.map((group) => group.channelId),
   ], userId, serverId);
-  const items = result.items.filter((item) => visible.has(inboxItemAccessChannelId(item)));
+  // Object rows were kept by the object's own visibility (services/objectActivity.ts), a guest's included.
+  const items = result.items.filter((item) => !isConversationInboxItem(item) || visible.has(inboxItemAccessChannelId(item)));
   const groups = result.groups.filter((group) => visible.has(group.channelId));
-  const totalUnreadCount = items.reduce((sum, item) => sum + item.unreadCount, 0);
-  return { ...result, items, groups, totalCount: items.length, totalUnreadCount, activeUnreadCount: totalUnreadCount };
+  const kept = items.filter(isConversationInboxItem);
+  const totalUnreadCount = kept.reduce((sum, item) => sum + item.unreadCount, 0);
+  return { ...result, items, groups, totalCount: kept.length, totalUnreadCount, activeUnreadCount: totalUnreadCount };
+}
+
+/** A channel, DM, thread or task row (not an object row). */
+function isConversationInboxItem(item: ActivityInboxItem): item is channelService.InboxItem {
+  return item.kind !== "object";
+}
+
+/** RFC 077's facts on each conversation row's latest message; object rows as they are, in place. */
+async function withLatestMessageFactsOnConversations(items: readonly ActivityInboxItem[]) {
+  const withFacts = await messageService.withLatestMessageFacts(items.filter(isConversationInboxItem));
+  let next = 0;
+  return items.map((item) => (isConversationInboxItem(item) ? withFacts[next++]! : item));
 }
 
 async function filterGuestHistoryResult<T extends { items: channelService.InboxItem[]; totalCount: null }>(
@@ -681,7 +858,7 @@ async function filterGuestHistoryResult<T extends { items: channelService.InboxI
 }
 
 function inboxItemAccessChannelId(item: channelService.InboxItem): string {
-  return item.kind === "thread" ? item.parentChannelId : item.channelId;
+  return (item.kind === "thread" || item.kind === "task") ? item.parentChannelId : item.channelId;
 }
 
 /** The channels among these a guest can access, in one batched check. */
@@ -689,15 +866,38 @@ async function guestVisibleChannelIds(channelIds: readonly string[], userId: str
   return channelService.filterUserAccessibleChannelIds([...new Set(channelIds)], userId, serverId);
 }
 
+/**
+ * A conversion job (read, Retry, Cancel) is followed where external_channels_v1
+ * is on for the Server: the flag that lets an external invite convert a
+ * channel (#wg-rbac:#50; there is no separate conversion flag). Off: 404.
+ */
 async function requireChannelConversionEnabled(req: Request, res: Response): Promise<boolean> {
-  const flag = await evaluateFeatureFlag({
-    key: CHANNEL_TO_JOINT_CONVERSION_FEATURE_FLAG_KEY,
-    serverId: req.serverId!,
-    userId: req.userId!,
-  });
-  if (flag.enabled) return true;
+  if (await externalInviteService.externalChannelsEnabled(req.serverId!, req.userId!)) return true;
   res.status(404).json({ error: "Channel to Joint conversion is not enabled", code: "channel_to_joint_conversion_disabled" });
   return false;
+}
+
+/** The answer of a retired way of making a joint channel: 404, nothing written. */
+function refuseRetiredJointEntry(res: Response,
+  code: "joint_conversion_retired" | "joint_creation_retired" | "joint_server_invite_retired"): void {
+  res.status(404).json({ error: "This way of sharing a channel is retired. Invite people outside the server to the channel instead.", code });
+}
+
+/**
+ * With external_channels_v1 on for the Server, the old Create Joint Channel
+ * does not exist (design v5.0 A1/E1; the web hides it since #12672): people
+ * outside are invited to the channel instead. Answers itself (404) and
+ * returns true. Following a conversion already under way (its job, Retry,
+ * Cancel) stays open. Inviting another Server into an existing joint channel
+ * (and re-sending those invites) is retired the same way (cindyz, #wg-rbac
+ * 45b37df9); accepting an invite already sent and managing connected Servers
+ * stay open. Convert to joint is retired on every Server (#wg-rbac:#50).
+ */
+async function refuseRetiredJointEntryWithExternalChannels(req: Request, res: Response,
+  code: "joint_creation_retired" | "joint_server_invite_retired"): Promise<boolean> {
+  if (!await externalInviteService.externalChannelsEnabled(req.serverId!, req.userId!)) return false;
+  refuseRetiredJointEntry(res, code);
+  return true;
 }
 
 // Read, Retry and Cancel resolve the same visible receipt. Mutation-specific
@@ -719,9 +919,94 @@ async function requireVisibleChannelConversionJob(req: Request, res: Response) {
   return job;
 }
 
-function countInboxItemsByKind(list: readonly channelService.InboxItem[], kind: channelService.InboxItem["kind"]): number {
+function countInboxItemsByKind(list: readonly ActivityInboxItem[], kind: ActivityInboxItem["kind"]): number {
   return list.filter((item) => item.kind === kind).length;
 }
+
+const INBOX_ROW_IDS_MAX = 50;
+
+/**
+ * Activity `ids` query param: comma-separated row ids (a channel/DM row's
+ * channelId, a thread/task row's threadChannelId), 1..50 distinct UUIDs.
+ * Undefined when absent; a string error when malformed.
+ */
+function parseInboxRowIdsParam(raw: unknown): string[] | undefined | { error: string } {
+  if (raw === undefined) return undefined;
+  if (typeof raw !== "string") return { error: "ids must be a single comma-separated list" };
+  const ids = [...new Set(raw.split(",").map((part) => part.trim().toLowerCase()).filter(Boolean))];
+  if (ids.length === 0) return { error: "ids must list at least one id" };
+  if (ids.length > INBOX_ROW_IDS_MAX) return { error: `ids accepts at most ${INBOX_ROW_IDS_MAX} distinct ids` };
+  if (ids.some((id) => !ANY_UUID_RE.test(id))) return { error: "ids must be UUIDs" };
+  return ids;
+}
+
+/** An Activity scope that is one registered app's object rows (`scope=<its id>`, e.g. Activity's Artifacts filter). */
+type AppInboxScope = { app: string; kinds: readonly string[] };
+
+/**
+ * Activity `scope` query param: "dms", "pinned", "saved", or the id of a registered app with object
+ * kinds (that app's rows only; derived from the registry, core names no app); anything else is ignored (unscoped).
+ */
+function parseInboxScopeParam(raw: unknown): "dms" | "pinned" | "saved" | AppInboxScope | undefined {
+  if (raw === "dms" || raw === "pinned" || raw === "saved") return raw;
+  const app = typeof raw === "string" ? firstPartyApp(raw) : undefined;
+  return app && app.objectKinds.length > 0 ? { app: app.id, kinds: app.objectKinds.map((entry) => entry.kind) } : undefined;
+}
+
+/**
+ * Activity "Pinned" scope: the channel ids of every conversation the user
+ * pinned in this server's sidebar. A channel ref pins that channel id; an
+ * agent/human ref pins the user's DM(s) with that peer (resolved through
+ * dm_channel_identities, removed peers included). Members whose pinned_refs
+ * were never written fall back to the legacy fields the sidebar synthesizes
+ * pins from. Ids the user cannot see are harmless: the Activity read only
+ * restricts by this set. Lowercased, deduplicated and sorted, so the list is
+ * also a stable cache-key input.
+ */
+async function resolvePinnedConversationChannelIds(serverId: string, userId: string): Promise<string[]> {
+  const traceQuery = createTraceDbQueryTracer("inbox.pinned_scope.resolved");
+  const [order, dmTargets] = await Promise.all([
+    serverService.getMemberSidebarOrder(serverId, userId, { traceQuery }),
+    channelService.listUserDMPinTargetsIncludingRemoved(serverId, userId, { traceQuery }),
+  ]);
+  if (!order) return [];
+  const dmChannelIdsByPeer = new Map<string, string[]>();
+  for (const target of dmTargets) {
+    const key = `${target.peerType}:${target.peerId}`;
+    dmChannelIdsByPeer.set(key, [...(dmChannelIdsByPeer.get(key) ?? []), target.channelId]);
+  }
+  const ids = new Set<string>();
+  const addPeerDm = (kind: "agent" | "human", peerId: string) => {
+    for (const channelId of dmChannelIdsByPeer.get(`${kind}:${peerId}`) ?? []) ids.add(channelId);
+  };
+  if (order.pinned) {
+    for (const ref of order.pinned) {
+      if (ref.kind === "channel") ids.add(ref.id);
+      else addPeerDm(ref.kind, ref.id);
+    }
+  } else {
+    // Legacy ids are channel ids (DM channel ids included) or agent ids.
+    for (const id of [...order.pinnedOrder, ...order.pinnedChannelIds]) {
+      ids.add(id);
+      addPeerDm("agent", id);
+    }
+    for (const id of order.pinnedAgentIds) addPeerDm("agent", id);
+  }
+  return [...new Set([...ids].map((id) => id.toLowerCase()))].sort();
+}
+
+function scopeIdsCacheKey(scope: "pinned" | "saved", ids: readonly string[]): string {
+  return `${scope}-${createHash("sha256").update(ids.join(",")).digest("hex").slice(0, 16)}`;
+}
+
+const EMPTY_SCOPED_INBOX_RESULT = {
+  items: [] as channelService.InboxItem[],
+  groups: [] as channelService.InboxGroupCount[],
+  hasMore: false,
+  totalCount: 0,
+  totalUnreadCount: 0,
+  activeUnreadCount: 0,
+};
 
 function parseChannelVisibility(raw: unknown): "public" | "private" | "joint" | null {
   if (raw === undefined || raw === "public") return "public";
@@ -772,6 +1057,23 @@ function parseJointInviteRequests(raw: {
   return rawRequests;
 }
 
+/**
+ * Joint invites spend the inviter's hourly budget of invited people
+ * (jointInviteRateLimit), refused ones included. Answers 429 and returns false
+ * once it is spent.
+ */
+async function admitJointInviteOrRefuse(req: Request, res: Response, people: number): Promise<boolean> {
+  const admission = await admitJointInvite(req.userId!, people);
+  if (admission.admitted) return true;
+  res.setHeader("Retry-After", String(admission.retryAfterSeconds));
+  res.status(429).json({
+    error: "Too many joint channel invites. Try again later.",
+    code: "joint_invite_rate_limited",
+    retryAfterSeconds: admission.retryAfterSeconds,
+  });
+  return false;
+}
+
 // List all channels (excludes DMs), includes `joined` status for the requesting user.
 // Supports `?archived=exclude|include|only` (default: exclude).
 channelRouter.get("/", async (req, res) => {
@@ -789,14 +1091,10 @@ channelRouter.get("/", async (req, res) => {
       archived_filter: archivedFilter,
     });
     const list = await tracePhase(
-      async () => {
-        const traceQuery = createTraceDbQueryTracer("channels.loaded");
-        const channels = await channelService.listChannels(req.serverId!, req.userId!, {
-          archived,
-          traceQuery,
-        });
-        return channelService.attachExternalBridgeMetadata(channels, traceQuery);
-      },
+      () => loadHumanChannelList(req.serverId!, req.userId!, {
+        archived,
+        traceQuery: createTraceDbQueryTracer("channels.loaded"),
+      }),
       (durationMs, result) => ({
         name: "channels.loaded",
         attrs: {
@@ -812,11 +1110,8 @@ channelRouter.get("/", async (req, res) => {
       channels_count: list.length,
       joined_channels_count: countJoinedChannels(list),
     });
-    res.json(await attachHumanChannelAuthorizations(
-      await channelConversionService.attachLatestChannelConversionJobs(list),
-      req.serverId!,
-      req.userId!,
-    ));
+    // Items carry notificationLevel (finishHumanChannelListItems, shared with sync).
+    res.json(await finishHumanChannelListItems(list, req.serverId!, req.userId!));
   } catch {
     res.status(500).json({ error: "Failed to list channels" });
   }
@@ -846,7 +1141,7 @@ channelRouter.get("/dm", async (req, res) => {
       agent_dm_channels_count: countDmPeerType(list, "agent"),
       user_dm_channels_count: countDmPeerType(list, "user"),
     });
-    res.json(list);
+    res.json(await withNotificationLevels(req.userId!, list));
   } catch {
     res.status(500).json({ error: "Failed to list DM channels" });
   }
@@ -865,63 +1160,30 @@ channelRouter.post("/dm", async (req, res) => {
       return;
     }
 
-    const requesterRole = await getActorServerRoleInServer(req.serverId!, "user", req.userId!);
-    if (requesterRole === "guest") {
-      const guestGate = await evaluateFeatureFlag({
-        key: SERVER_GUEST_FEATURE_FLAG_KEY,
-        serverId: req.serverId!,
-        userId: req.userId!,
-      });
-      const existingDm = guestGate.enabled
-        ? (await channelService.listDMChannels(req.serverId!, req.userId!)).some((dm) =>
-            agentId
-              ? dm.peerType === "agent" && dm.peerId === agentId
-              : dm.peerType === "user" && dm.peerId === userId)
-        : false;
-      if (!existingDm) {
-        res.status(403).json({ error: "Guests cannot create direct messages" });
-        return;
-      }
+    // The same rules as an assistant sending as its owner to a new DM (RFC 077 `dmWith`).
+    const opened = await openDirectMessageForUser(req.serverId!, req.userId!, agentId ? { agentId } : { userId });
+    if (!opened.ok) {
+      res.status(opened.status).json({ error: opened.error, code: opened.code });
+      return;
     }
-
-    let channel;
-    if (agentId) {
-      channel = await channelService.findOrCreateDM(req.serverId!, req.userId!, agentId);
-      if (!channel) {
-        res.status(404).json({ error: "Agent not found in this server" });
-        return;
-      }
-    } else {
-      if (
-        userId !== req.userId
-        && await serverService.shouldHideHumanDirectoryFromRequester(req.serverId!, req.userId!)
-      ) {
-        const existingDm = (await channelService.listDMChannels(req.serverId!, req.userId!))
-          .some((dm) => dm.peerType === "user" && dm.peerId === userId);
-        if (!existingDm) {
-          res.status(404).json({ error: "DM target not found" });
-          return;
-        }
-      }
-      // Verify target user is a member of this server (self-DM always OK)
-      const targetRole = await getActorServerRoleInServer(req.serverId!, "user", userId);
-      if (!targetRole) {
-        res.status(400).json({ error: "User is not a member of this server" });
-        return;
-      }
-      if (targetRole === "guest") {
-        const existingDm = (await channelService.listDMChannels(req.serverId!, req.userId!))
-          .some((dm) => dm.peerType === "user" && dm.peerId === userId);
-        if (!existingDm) {
-          res.status(403).json({ error: "Guests cannot be added to new direct messages" });
-          return;
-        }
-      }
-      channel = await channelService.findOrCreateUserDM(req.serverId!, req.userId!, userId, {
-        hidePassivePeerOnCreate: true,
-      });
+    const channel = opened.channel;
+    if (!channel) {
+      res.json(null);
+      return;
     }
-    res.json(channel);
+    // As GET /:id: the client replaces its DM row with this response, so an
+    // existing DM keeps its mute state.
+    const [activityMuteState, activityMuteSupported] = await Promise.all([
+      channelService.getInboxTargetActivityMuteState("user", req.userId!, channel.id),
+      channelService.userActivityMuteSupported(channel),
+    ]);
+    res.json({
+      ...channel,
+      activityMuted: activityMuteState.activityMuted,
+      muteFromSeq: activityMuteState.muteFromSeq,
+      prefsVersion: activityMuteState.prefsVersion,
+      activityMuteSupported,
+    });
   } catch (err: any) {
     sendJsonServerError(req, res, {
       error: "Failed to create DM",
@@ -945,7 +1207,13 @@ channelRouter.post("/", async (req, res) => {
       return;
     }
     const channelType: channelService.RegularChannelType = parsedVisibility === "private" ? "private" : "channel";
+    if (parsedVisibility === "joint" && await refuseRetiredJointEntryWithExternalChannels(req, res, "joint_creation_retired")) return;
     const selectedJointInviteRequests = parseJointInviteRequests({ targetServerSlug, invitedPeople, sameAdmin, jointInvites });
+    if (parsedVisibility === "joint" && !await admitJointInviteOrRefuse(
+      req,
+      res,
+      selectedJointInviteRequests.reduce((sum, request) => sum + request.invitedPeople.length, 0),
+    )) return;
     const nameError = validateName(name, "Channel name");
     if (nameError) {
       res.status(400).json({ error: nameError });
@@ -985,7 +1253,9 @@ channelRouter.post("/", async (req, res) => {
     // admin membership exists.
     for (const agentId of selectedAgentIds) {
       const agent = await agentService.getAgent(agentId);
-      if (!agent || agent.serverId !== req.serverId) {
+      // Only its owner finds a personal assistant; for anyone else it is
+      // answered exactly as an id that names no agent here.
+      if (!agent || agent.serverId !== req.serverId || isOthersAssistant(agent, req.userId!)) {
         res.status(400).json({ error: "Agent not found in this server" });
         return;
       }
@@ -1049,7 +1319,7 @@ channelRouter.post("/", async (req, res) => {
         }
       : {};
     const readState = await channelService.getReadStateSnapshot(req.userId!, channel.id);
-    const peerReadHydrate = channel.type === "channel" || channel.type === "private" || channel.type === "dm"
+    const peerReadHydrate = channel.type === "channel" || channel.type === "private" || channel.type === "joint" || channel.type === "dm"
       ? await getPeerReadHydrate({
           serverId: req.serverId!,
           channelId: channel.id,
@@ -1068,30 +1338,21 @@ channelRouter.post("/", async (req, res) => {
     });
   } catch (err: any) {
     if (err instanceof channelService.ArchivedNameCollisionError) {
-      const canUnarchiveArchivedChannel = err.archivedChannelType === "channel" || err.archivedChannelType === "private"
-        ? await actorHasChannelCapability(
-            req.serverId!,
-            err.archivedChannelId,
-            "user",
-            req.userId!,
-            "archiveChannels",
-          )
-        : err.archivedChannelType === "joint"
-          && await actorHasServerCapabilityInServer(req.serverId!, "user", req.userId!, "archiveChannels");
-      res.status(409).json({
-        error: `Channel name "${err.channelName}" is held by an archived channel`,
-        code: "archived_name_collision",
-        archivedChannelId: err.archivedChannelId,
-        archivedChannelName: err.channelName,
-        archivedChannelType: err.archivedChannelType,
-        canUnarchiveArchivedChannel,
-      });
+      res.status(409).json(await humanArchivedNameCollisionBody(req, err));
       return;
     }
     if (sendJointInviteValidationError(res, err)) return;
-    if (sendJointLimitError(res, err)) return;
+    if (sendJointLimitError(res, err, req)) return;
+    // The creator's account retired or being deleted meanwhile (createJointChannel): as one who may not federate.
+    if (err instanceof JointActorUnavailableError) {
+      res.status(403).json({ error: "You do not have permission to federate channels" });
+      return;
+    }
     const msg = err?.message || "";
-    if (msg.includes("already taken")) {
+    if (isActionCardConversionError(err)) {
+      // The source action card is frozen or needs reconfirmation: an expected 409, not a server fault.
+      res.status(err.status).json({ error: err.message, code: err.code });
+    } else if (msg.includes("already taken")) {
       res.status(409).json({ error: msg });
     } else if (msg.includes("Channel limit reached")) {
       res.status(403).json({ error: msg });
@@ -1128,12 +1389,93 @@ async function emitSameAdminJointProjections(
   }
 }
 
+// Owners and admins see every joint copy their server holds, including ones
+// none of them is a member of, so an orphaned copy can still be disconnected.
+// Metadata only (#raft-architecture task #22).
+channelRouter.get("/joint-connections", async (req, res) => {
+  try {
+    if (!(await actorHasServerCapabilityInServer(req.serverId!, "user", req.userId!, "federateChannels"))) {
+      res.status(403).json({ error: "Only admins can manage joint channel connections" });
+      return;
+    }
+    const connections = await channelService.listServerJointConnections(req.serverId!, req.userId!);
+    res.json({ connections });
+  } catch {
+    res.status(500).json({ error: "Failed to list joint channel connections" });
+  }
+});
+
+// Whether this Server's owner/admin may start another external channel
+// (Create Channel's External): 404 while external_channels_v1 is off for it.
+channelRouter.get("/external-availability", async (req, res) => {
+  try {
+    const flag = await evaluateFeatureFlag({ key: EXTERNAL_CHANNELS_FEATURE_FLAG_KEY, serverId: req.serverId!, userId: req.userId! });
+    if (!flag.enabled) {
+      res.status(404).json({ error: "Not found" });
+      return;
+    }
+    res.json(await externalInviteService.getExternalChannelAvailability(req.serverId!, req.userId!));
+  } catch (err) {
+    sendExternalInviteError(req, res, err, "read external channel availability");
+  }
+});
+
+// "Your servers" (Create Channel's External, Invite People Outside): the
+// servers this Server's owner/admin owns or administers that could connect
+// to one of its channels. 404 while external_channels_v1 is off for it.
+channelRouter.get("/external-connect-servers", async (req, res) => {
+  try {
+    const flag = await evaluateFeatureFlag({ key: EXTERNAL_CHANNELS_FEATURE_FLAG_KEY, serverId: req.serverId!, userId: req.userId! });
+    if (!flag.enabled) {
+      res.status(404).json({ error: "Not found" });
+      return;
+    }
+    res.json({ servers: await externalInviteService.listOwnConnectableServers(req.serverId!, req.userId!) });
+  } catch (err) {
+    sendExternalInviteError(req, res, err, "list servers to connect");
+  }
+});
+
 channelRouter.get("/joint-invites", async (req, res) => {
   try {
     const invites = await channelService.listPendingJointChannelInvites(req.serverId!, req.userId!);
     res.json({ invites });
   } catch {
     res.status(500).json({ error: "Failed to list joint channel invites" });
+  }
+});
+
+// One user-selected connection operation: sources are frozen before the first
+// accept, so a new member may have every selected source without later accepts
+// silently adding sources to an existing member.
+channelRouter.post("/joint-invites/accept-many",async(req,res)=>{
+  try {
+    const inviteIds=req.body?.inviteIds;
+    if(!Array.isArray(inviteIds) || inviteIds.length===0 || inviteIds.length>=MAX_JOINT_CHANNEL_SERVERS
+      || inviteIds.some((id:unknown)=>typeof id!=="string" || !channelService.isJointChannelInviteId(id))) {
+      res.status(400).json({error:"Select valid joint invitations"});return;
+    }
+    const channels=await channelService.acceptJointChannelInvites({inviteIds,acceptedByUserId:req.userId!});
+    const projected=await channelService.attachJointChannelMetadata(channels.map(channel=>({...channel,joined:true})));
+    const io=req.app.get("io") as SocketServer|undefined;
+    if(channels[0]) await emitJointProjectionUpdates(io,channels[0].id);
+    for(const channel of projected) io?.to(socketUserServerRoom(req.userId!,channel.serverId)).emit("channel:updated",{channel});
+    const orchestrator=req.app.get("agentOrchestrator") as AgentOrchestrator|undefined;
+    if(io && orchestrator && channels[0]) {
+      const servers = await serverService.getServersByIds(channels.map(channel => channel.serverId));
+      const serverNames = new Map(servers.map(server => [server.id, server.name]));
+      const names = channels.map(channel => serverNames.get(channel.serverId) ?? "A server").join(", ");
+      await messageService.broadcastSystemMessageToLocalSurfaces(io,orchestrator,channels[0].id,`${names} connected to this channel.`,{
+        inboxFactPolicy:{mode:"record",producer:"channel.joint_connect",reason:"one multi-server connection operation",
+          causalActor:{type:"user",id:req.userId!}},
+      });
+    }
+    res.json({channels:projected});
+  } catch(error) {
+    if(sendJointLimitError(res,error,req,{acceptingInvite:true}) || sendExternalLimitError(res,error,req)) return;
+    if(error instanceof channelService.JointChannelArchivedError){res.status(409).json({error:error.message,code:error.code});return;}
+    const message=error instanceof Error?error.message:"Failed to accept joint invitations";
+    res.status(message.includes("not found")?404:message.includes("Only target server admins")?403:409).json({error:message});
   }
 });
 
@@ -1156,7 +1498,11 @@ channelRouter.post("/joint-invites/:inviteId/accept", async (req, res) => {
     io?.to(socketUserServerRoom(req.userId!, req.serverId!)).emit("channel:updated", { channel: channelWithMetadata });
     res.json(channelWithMetadata);
   } catch (err: any) {
-    if (sendJointLimitError(res, err)) return;
+    if (sendJointLimitError(res, err, req, { acceptingInvite: true }) || sendExternalLimitError(res, err, req)) return;
+    if (err instanceof channelService.JointChannelArchivedError) {
+      res.status(409).json({ error: err.message, code: err.code });
+      return;
+    }
     const msg = err?.message || "";
     if (msg.includes("not found")) {
       res.status(404).json({ error: msg });
@@ -1232,98 +1578,13 @@ channelRouter.get("/unread", async (req, res) => {
   }
 });
 
-// Server-authoritative Activity v1 successor. Existing socket events remain
-// wake signals; clients hydrate/repair through these exact snapshot/difference
-// reads rather than treating socket payloads as a second source of truth.
-channelRouter.get("/activity/snapshot", async (req, res) => {
-  applyActivityContractHandshake(req, res, "snapshot");
-  const requestId = typeof req.query.requestId === "string" ? req.query.requestId.trim() : "";
-  const windowId = req.query.windowId;
-  if (!requestId || (windowId !== undefined && windowId !== "main")) {
-    res.status(400).json({ error: "requestId is required and windowId must be main" });
-    return;
-  }
-  const filter = req.query.filter === "unread" || req.query.filter === "mentions"
-    ? req.query.filter
-    : req.query.filter === undefined || req.query.filter === "all"
-      ? "all"
-      : null;
-  if (!filter) {
-    res.status(400).json({ error: "filter must be all, unread, or mentions" });
-    return;
-  }
-  try {
-    const plan = await getServerPlan(req.serverId!);
-    const body = await activitySyncService.getActivitySnapshot({
-      serverId: req.serverId!,
-      principalId: req.userId!,
-      requestId,
-      filter,
-      historyCutoff: getHistoryCutoff(plan),
-    }, { now: () => resolveNow(req) });
-    res.setHeader("Cache-Control", "no-store");
-    res.json(body);
-  } catch (error) {
-    sendJsonServerError(req, res, {
-      error: "Failed to get Activity snapshot",
-      logPrefix: "[ActivitySync] snapshot failed",
-      err: error,
-    });
-  }
-});
-
-channelRouter.get("/activity/difference", async (req, res) => {
-  applyActivityContractHandshake(req, res, "difference");
-  const requestId = typeof req.query.requestId === "string" ? req.query.requestId.trim() : "";
-  const epoch = typeof req.query.epoch === "string" ? req.query.epoch : "";
-  const afterWatermark = typeof req.query.afterWatermark === "string"
-    ? req.query.afterWatermark
-    : "";
-  const windowId = req.query.windowId;
-  if (
-    !requestId
-    || !UINT64_RE.test(epoch)
-    || !UINT64_RE.test(afterWatermark)
-    || (windowId !== undefined && windowId !== "main")
-  ) {
-    res.status(400).json({
-      error: "requestId, canonical uint64 epoch/afterWatermark, and windowId=main are required",
-    });
-    return;
-  }
-  const filter = req.query.filter === "unread" || req.query.filter === "mentions"
-    ? req.query.filter
-    : req.query.filter === undefined || req.query.filter === "all"
-      ? "all"
-      : null;
-  if (!filter) {
-    res.status(400).json({ error: "filter must be all, unread, or mentions" });
-    return;
-  }
-  try {
-    const plan = await getServerPlan(req.serverId!);
-    const result = await activitySyncService.getActivityDifference({
-      serverId: req.serverId!,
-      principalId: req.userId!,
-      requestId,
-      filter,
-      epoch,
-      afterWatermark,
-      historyCutoff: getHistoryCutoff(plan),
-    }, { now: () => resolveNow(req) });
-    res.setHeader("Cache-Control", "no-store");
-    res.status(result.status).json(result.body);
-  } catch (error) {
-    sendJsonServerError(req, res, {
-      error: "Failed to get Activity difference",
-      logPrefix: "[ActivitySync] difference failed",
-      err: error,
-    });
-  }
-});
-
 // Unified Inbox: regular channels, DMs, and followed threads that are not done.
 channelRouter.get("/inbox", async (req, res) => {
+  addTraceEvent("activity.list.fetch", {
+    ...activityListFetchTraceAttrs("inbox", req.headers[CHANNEL_FETCH_REASON_HEADER], req.query.ids),
+    // #triage:#229: the realtime event behind a realtime_fallback re-read.
+    ...inboxFetchTriggerTraceAttrs(req.headers[INBOX_FETCH_TRIGGER_HEADER], req.headers[INBOX_FETCH_COALESCED_HEADER]),
+  });
   const admission = getInboxRouteBackpressureAdmission(res);
   if (!admission) {
     throw new Error("Inbox route backpressure admission is missing");
@@ -1334,22 +1595,58 @@ channelRouter.get("/inbox", async (req, res) => {
       filterParam === "unread" || filterParam === "mentions" || filterParam === "unread_mentions"
         ? filterParam
         : "all";
-    const limit = Math.min(Number(req.query.limit) || 30, 100);
-    const offset = Math.max(Number(req.query.offset) || 0, 0);
+    const offset = parseOffsetQueryParam(req.query.offset);
     const channelIdParam = typeof req.query.channelId === "string" ? req.query.channelId : undefined;
     const channelId = channelIdParam && ANY_UUID_RE.test(channelIdParam) ? channelIdParam : undefined;
     const qParam = typeof req.query.q === "string" ? req.query.q.trim().slice(0, 200) : "";
     const q = qParam || undefined;
+    // `ids`: refresh just these rows (after a sync `conversation` change), with
+    // the list's row shape and visibility. Not a list: the response is
+    // `{ items }` only (no totals, groups, unread counts or hasMore), so a
+    // client cannot mistake it for list-level state.
+    const rowIds = parseInboxRowIdsParam(req.query.ids);
+    if (rowIds && !Array.isArray(rowIds)) {
+      res.status(400).json({ error: rowIds.error });
+      return;
+    }
+    if (rowIds && (channelIdParam !== undefined || q || req.query.scope !== undefined || offset > 0 || (filterParam !== undefined && filterParam !== "all"))) {
+      res.status(400).json({ error: "ids cannot be combined with channelId, q, scope, offset or a filter other than all" });
+      return;
+    }
+    const limit = rowIds ? rowIds.length : Math.min(Number(req.query.limit) || 30, 100);
     const sort = req.query.sort === "asc" ? "asc" as const : "desc" as const;
-    const scope = req.query.scope === "dms" ? "dms" as const : undefined;
+    const scopeParam = parseInboxScopeParam(req.query.scope);
+    const scope = scopeParam === "dms" ? "dms" as const : undefined;
+    const pinnedChannelIds = scopeParam === "pinned"
+      ? await resolvePinnedConversationChannelIds(req.serverId!, req.userId!)
+      : undefined;
+    // Saved: the threads followed through a save, as the rows' own ids (the
+    // `ids` restriction), so each read source narrows rows, totals and paging.
+    const savedThreadChannelIds = scopeParam === "saved"
+      ? await savedService.listSavedFollowThreadChannelIds(req.userId!, req.serverId!)
+      : undefined;
     addTraceEvent("inbox.load.started", {
       filter,
       limit,
       offset,
       channel_id_present: Boolean(channelId),
       query_present: Boolean(q),
-      scope: scope ?? "all",
+      scope: typeof scopeParam === "object" ? scopeParam.app : scopeParam ?? "all",
+      ...(pinnedChannelIds ? { pinned_channel_count: pinnedChannelIds.length } : {}),
+      ...(savedThreadChannelIds ? { saved_thread_count: savedThreadChannelIds.length } : {}),
+      ...(rowIds ? { row_id_count: rowIds.length } : {}),
     });
+    if (pinnedChannelIds?.length === 0 || savedThreadChannelIds?.length === 0) {
+      // Nothing pinned / saved: the scope is empty by definition; skip the read model.
+      addTraceEvent("response.ready", {
+        filter,
+        inbox_items_count: 0,
+        total_count: 0,
+        ...(pinnedChannelIds ? { pinned_channel_count: 0 } : { saved_thread_count: 0 }),
+      });
+      res.json(EMPTY_SCOPED_INBOX_RESULT);
+      return;
+    }
     // Only the first page without a search: the view a fresh load opens on.
     const load = async () => {
       const plan = await tracePhase(
@@ -1362,19 +1659,35 @@ channelRouter.get("/inbox", async (req, res) => {
         }),
       );
       const historyCutoff = getHistoryCutoff(plan);
+      const reader = { userId: req.userId!, serverId: req.serverId!, sessionFamilyId: req.sessionFamilyId ?? null };
       const loadedResult = await tracePhase(
-        () => channelService.getInboxItems(req.serverId!, req.userId!, {
-          filter,
-          limit,
-          offset,
-          channelId,
-          q,
-          scope,
-          sort,
-          historyCutoff,
-          includeUnfollowedThreads: filter === "all",
-          traceQuery: createTraceDbQueryTracer("inbox.loaded"),
-        }),
+        // An app's filter (`scope=<app id>`, e.g. Artifacts): that app's object rows only, none for a search or
+        // a channel (object rows aren't searched). Otherwise object rows merged in while an object app is on for
+        // the server; else exactly getInboxItems.
+        async (): Promise<ActivityInboxResult> => {
+          if (typeof scopeParam === "object") {
+            return q || channelId
+              ? EMPTY_SCOPED_INBOX_RESULT
+              : getObjectKindInboxItems(reader, scopeParam.kinds, { filter, limit, offset, sort, historyCutoff });
+          }
+          return getActivityInboxItems(reader, {
+            filter,
+            limit,
+            offset,
+            channelId,
+            q,
+            scope,
+            pinnedChannelIds,
+            // `ids` within Saved: both restrictions hold, as `ids` within Pinned.
+            rowIds: savedThreadChannelIds && rowIds
+              ? rowIds.filter((id) => savedThreadChannelIds.includes(id))
+              : rowIds ?? savedThreadChannelIds,
+            sort,
+            historyCutoff,
+            includeUnfollowedThreads: filter === "all",
+            traceQuery: createTraceDbQueryTracer("inbox.loaded"),
+            });
+        },
         (durationMs, loaded) => ({
           name: "inbox.loaded",
           attrs: {
@@ -1391,17 +1704,32 @@ channelRouter.get("/inbox", async (req, res) => {
             channel_items_count: countInboxItemsByKind(loaded.items, "channel"),
             dm_items_count: countInboxItemsByKind(loaded.items, "dm"),
             thread_items_count: countInboxItemsByKind(loaded.items, "thread"),
+            task_items_count: countInboxItemsByKind(loaded.items, "task"),
+            object_items_count: countInboxItemsByKind(loaded.items, "object"),
             has_more: loaded.hasMore,
           },
         }),
       );
-      return await filterGuestInboxResult(loadedResult, req.userId!, req.serverId!);
+      const filtered = await filterGuestInboxResult(loadedResult, req.userId!, req.serverId!);
+      // RFC 077: the "sent by an assistant for its owner" label on each row's latest message.
+      return { ...filtered, items: await withLatestMessageFactsOnConversations(filtered.items) };
     };
-    const { value: result, stale, staleReason, traceAttrs: staleTraceAttrs } = offset === 0 && !q
+    // An ids read is never served from the first-page cache: it must be fresh.
+    // Uncached, a RisingWave overload still answers the standard 503 (catch below).
+    const { value: result, stale, staleReason, traceAttrs: staleTraceAttrs } = offset === 0 && !q && !rowIds
       ? await readWithStaleOnOverload({
         surface: "inbox_first_page",
         userId: req.userId!,
-        scope: [req.serverId!, filter, limit, sort, scope ?? "", channelId ?? ""].join(":"),
+        scope: [
+          req.serverId!,
+          filter,
+          limit,
+          sort,
+          pinnedChannelIds
+            ? scopeIdsCacheKey("pinned", pinnedChannelIds)
+            : savedThreadChannelIds ? scopeIdsCacheKey("saved", savedThreadChannelIds) : typeof scopeParam === "object" ? `app:${scopeParam.app}` : scope ?? "",
+          channelId ?? "",
+        ].join(":"),
         load,
         softTimeoutMs: resolveSoftTimeoutMs(),
       })
@@ -1419,12 +1747,17 @@ channelRouter.get("/inbox", async (req, res) => {
       stale_served: stale,
       ...staleTraceAttrs,
     });
+    if (rowIds) {
+      res.json({ items: result.items });
+      return;
+    }
     res.json(stale ? { ...result, stale: true } : result);
   } catch (err) {
     sendJsonServerError(req, res, {
       error: "Failed to get inbox",
       logPrefix: "Failed to get inbox:",
       err,
+      risingWaveUnconfiguredAs503: true,
     });
   } finally {
     admission.release();
@@ -1434,9 +1767,10 @@ channelRouter.get("/inbox", async (req, res) => {
 // Durable Done history for Activity v2. Kept out of the active Inbox serving
 // contract so rollout can be feature-gated without changing legacy clients.
 channelRouter.get("/inbox/done", async (req, res) => {
+  addTraceEvent("activity.list.fetch", activityListFetchTraceAttrs("done", req.headers[CHANNEL_FETCH_REASON_HEADER]));
   try {
     const limit = Math.min(Number(req.query.limit) || 30, 100);
-    const offset = Math.max(Number(req.query.offset) || 0, 0);
+    const offset = parseOffsetQueryParam(req.query.offset);
     const channelIdParam = typeof req.query.channelId === "string" ? req.query.channelId : undefined;
     const channelId = channelIdParam && ANY_UUID_RE.test(channelIdParam) ? channelIdParam : undefined;
     const qParam = typeof req.query.q === "string" ? req.query.q.trim().slice(0, 200) : "";
@@ -1466,19 +1800,30 @@ channelRouter.get("/inbox/done", async (req, res) => {
 // Activity All now includes not-Done unfollowed rows directly, while this
 // endpoint retains the frozen history projection across completion states.
 channelRouter.get("/inbox/unfollowed", async (req, res) => {
+  addTraceEvent("activity.list.fetch", activityListFetchTraceAttrs("unfollowed", req.headers[CHANNEL_FETCH_REASON_HEADER]));
   try {
     const limit = Math.min(Number(req.query.limit) || 30, 100);
-    const offset = Math.max(Number(req.query.offset) || 0, 0);
+    const offset = parseOffsetQueryParam(req.query.offset);
     const channelIdParam = typeof req.query.channelId === "string" ? req.query.channelId : undefined;
     const channelId = channelIdParam && ANY_UUID_RE.test(channelIdParam) ? channelIdParam : undefined;
     const qParam = typeof req.query.q === "string" ? req.query.q.trim().slice(0, 200) : "";
     const q = qParam || undefined;
     const sort = req.query.sort === "asc" ? "asc" as const : "desc" as const;
+    const scopeParam = parseInboxScopeParam(req.query.scope);
+    const pinnedChannelIds = scopeParam === "pinned"
+      ? await resolvePinnedConversationChannelIds(req.serverId!, req.userId!)
+      : undefined;
+    // Saved lists followed threads only: it has no unfollowed rows.
+    if (pinnedChannelIds?.length === 0 || scopeParam === "saved" || typeof scopeParam === "object") {
+      res.json({ items: [], hasMore: false, totalCount: null });
+      return;
+    }
     const plan = await getServerPlan(req.serverId!);
     const loadedResult = await channelService.getUnfollowedInboxItems(req.serverId!, req.userId!, {
       limit,
       offset,
       channelId,
+      pinnedChannelIds,
       q,
       sort,
       historyCutoff: getHistoryCutoff(plan),
@@ -1494,7 +1839,7 @@ channelRouter.get("/inbox/unfollowed", async (req, res) => {
   }
 });
 
-channelRouter.post("/inbox/done", async (req, res) => {
+channelRouter.post("/inbox/done", noteInboxWriteBeforeReply, async (req, res) => {
   try {
     const { channelId, throughActivitySeq, frontierSpace: requestedFrontierSpace } = req.body;
     if (!channelId) {
@@ -1521,14 +1866,13 @@ channelRouter.post("/inbox/done", async (req, res) => {
       return;
     }
     const channel = await channelService.getChannel(channelId);
-    if (!channel || channel.type === "thread") {
+    if (!channel || isSubConversationType(channel.type)) {
       res.status(404).json({ error: "Chat not found" });
       return;
     }
     const canonicalServerId = channel.serverId as ServerId;
-    // canUserAccessChannel assumes its serverId is already an authenticated
-    // user scope. Here the item may belong to a server other than the active
-    // request server, so re-establish canonical membership before using it.
+    // This item may belong to a server other than the active request server;
+    // resolve its canonical membership before applying conversation policy.
     const isCanonicalServerMember = await serverService.isMember(canonicalServerId, req.userId!);
     if (!isCanonicalServerMember) {
       res.status(404).json({ error: "Chat not found" });
@@ -1539,7 +1883,8 @@ channelRouter.post("/inbox/done", async (req, res) => {
       res.status(404).json({ error: "Chat not found" });
       return;
     }
-    await channelService.markChannelInboxDone(req.userId!, channelId, throughActivitySeq);
+    const ack = await channelService.markChannelInboxDone(req.userId!, channelId, throughActivitySeq);
+    retractDoneNotifications(req, ack);
     res.json({ ok: true });
   } catch (err) {
     if (err instanceof DoneFrontierRequiredError) {
@@ -1555,7 +1900,7 @@ channelRouter.post("/inbox/done", async (req, res) => {
   }
 });
 
-channelRouter.post("/inbox/undone", async (req, res) => {
+channelRouter.post("/inbox/undone", noteInboxWriteBeforeReply, async (req, res) => {
   try {
     const { channelId } = req.body;
     if (!channelId) {
@@ -1563,7 +1908,7 @@ channelRouter.post("/inbox/undone", async (req, res) => {
       return;
     }
     const channel = await channelService.getChannel(channelId);
-    if (!channel || channel.type === "thread") {
+    if (!channel || isSubConversationType(channel.type)) {
       res.status(404).json({ error: "Chat not found" });
       return;
     }
@@ -1589,7 +1934,7 @@ channelRouter.post("/inbox/undone", async (req, res) => {
   }
 });
 
-channelRouter.post("/inbox/read-all", async (req, res) => {
+channelRouter.post("/inbox/read-all", noteInboxWriteBeforeReply, async (req, res) => {
   try {
     // Phase span + pool gauges: the read-all incident showed end-to-end times
     // (avg 7.3s, 30s upstream-timeout p-attempts) with no visibility into
@@ -1638,6 +1983,9 @@ channelRouter.post("/inbox/read-all", async (req, res) => {
     );
     samplePool("post_mutation");
     emitReadStateUpdatedBulk(req, result.scopes);
+    // Object rows too (a no-op while no object app is on for the server); their apps move their read positions.
+    const objectsMarked = await markAllObjectActivityRead({ userId: req.userId!, serverId: req.serverId!, sessionFamilyId: req.sessionFamilyId ?? null });
+    if (objectsMarked > 0) announceActivityChanged(req.serverId!, [req.userId!]);
     // No per-scope emitScopeReadUpdated here: this route is human-only and
     // human reads are never broadcast to peers. The fan-out used to run ~6
     // queries per changed scope concurrently, only to drop every one.
@@ -1660,6 +2008,7 @@ channelRouter.post("/inbox/read-all", async (req, res) => {
 const FOLLOWED_THREADS_MAX_LIMIT = 200;
 
 channelRouter.get("/threads/followed", async (req, res) => {
+  addTraceEvent("activity.list.fetch", activityListFetchTraceAttrs("followed_threads", req.headers[CHANNEL_FETCH_REASON_HEADER]));
   try {
     addTraceEvent("followed_threads.load.started");
     // `limit` pages the list (newest activity first) and returns `next`;
@@ -1679,20 +2028,27 @@ channelRouter.get("/threads/followed", async (req, res) => {
     }
     const unreadOnly = req.query.unreadOnly === "1" || req.query.unreadOnly === "true";
     const load = async () => {
-      const plan = await tracePhase(
-        () => getServerPlan(req.serverId!),
+      // The window the paywall reads (getServerHistoryWindowForRead), so
+      // the history flags below agree with what opening the thread shows.
+      const historyWindow = await tracePhase(
+        () => getServerHistoryWindowForRead(req.serverId!),
         (durationMs, result) => ({
           name: "history.policy.checked",
           attrs: {
-            plan: result,
+            plan: result.plan,
           },
         }),
       );
-      const historyCutoff = getHistoryCutoff(plan);
-      return await tracePhase(
+      const historyCutoff = historyWindow.cutoff;
+      const loaded = await tracePhase(
         () => channelService.loadFollowedThreads(req.serverId!, req.userId!, historyCutoff, {
           traceQuery: createTraceDbQueryTracer("followed_threads.loaded"),
           unreadOnly,
+          // Task v2: followed task conversations are listed (kind "task")
+          // whatever the reader's flag (per-task mode: a v2 task keeps its
+          // conversation after a rollback / on the flag-off side of a joint
+          // channel). Without task conversations this is the thread list.
+          includeTaskConversations: true,
           ...(limit === undefined ? {} : { page: { limit, cursor } }),
         }),
         (durationMs, result) => ({
@@ -1707,6 +2063,21 @@ channelRouter.get("/threads/followed", async (req, res) => {
           },
         }),
       );
+      // Where the thread sits against the history cutoff, from the same window
+      // the paywall reads, so the web neither compares times nor reads the plan:
+      // parentInHistory, the parent message is after the cutoff; repliesInHistory,
+      // a reply is. Both true when the plan keeps all history. The web opens the
+      // thread panel directly only for an old parent with a recent reply.
+      const inHistory = (at: Date | string | null | undefined) =>
+        historyCutoff === undefined || (at != null && !isBehindHistoryWindow(at, historyWindow));
+      return {
+        ...loaded,
+        threads: loaded.threads.map((thread) => ({
+          ...thread,
+          parentInHistory: inHistory(thread.parentMessageCreatedAt),
+          repliesInHistory: inHistory(thread.lastReplyAt),
+        })),
+      };
     };
     // Only first pages are remembered for the stale fallback (like the Inbox).
     const { value: loaded, stale, staleReason, traceAttrs: staleTraceAttrs } = cursor === null
@@ -1728,14 +2099,20 @@ channelRouter.get("/threads/followed", async (req, res) => {
     const body = limit === undefined ? { threads } : { threads, next };
     res.json(stale ? { ...body, stale: true } : body);
   } catch (err) {
-    if (respondToRisingWaveOverload(err, res)) return;
-    res.status(500).json({ error: "Failed to get followed threads" });
+    sendJsonServerError(req, res, {
+      error: "Failed to get followed threads",
+      logPrefix: "Failed to get followed threads:",
+      err,
+      risingWaveUnconfiguredAs503: true,
+    });
   }
 });
 
+// Thread follower management also covers task conversations (task v2): a
+// task conversation is a sub-conversation whose parent is the task.
 async function resolveManagedThread(req: Request, res: Response, threadChannelId: string) {
   const channel = await channelService.getChannel(threadChannelId);
-  if (!channel || channel.type !== "thread" || channel.serverId !== req.serverId) {
+  if (!channel || !isSubConversationType(channel.type) || channel.serverId !== req.serverId) {
     res.status(404).json({ error: "Thread not found" });
     return null;
   }
@@ -1746,19 +2123,102 @@ async function resolveManagedThread(req: Request, res: Response, threadChannelId
   return channel;
 }
 
-async function canManageThreadFollowers(
+/**
+ * Who may remove or restore an Agent follower of a thread / task conversation.
+ * The thread's author (a task's creator) may manage their own server's
+ * Agents. Beyond that it is the parent channel's member-removal rule for an
+ * Agent target (channelActorHasCapability "removeChannelMembers", "agent"):
+ * a server owner/admin or a channel admin of the parent channel; in a joint
+ * channel the host's owner/admin or appointed manager for any server's Agent,
+ * another server's owner/admin for its own server's Agents only.
+ */
+type ThreadFollowerManagement = {
+  canManage: boolean;
+  canManageAgentOf: (agentServerId: string) => boolean;
+};
+
+async function resolveThreadFollowerManagement(
+  req: Request,
+  channel: NonNullable<Awaited<ReturnType<typeof channelService.getChannel>>>,
+): Promise<ThreadFollowerManagement> {
+  const [isAuthor, authorityChannelId] = await Promise.all([
+    isManagedThreadAuthor(req, channel),
+    channelService.getChannelMembershipAuthorityChannelId(channel.id),
+  ]);
+  const authority = authorityChannelId
+    ? await resolveChannelActorContext(req.serverId!, authorityChannelId, "user", req.userId!)
+    : null;
+  const channelManager = authority !== null && channelActorHasCapability(authority, "removeChannelMembers", "agent");
+  // Only the host entry of a joint channel manages another server's Agents.
+  const managesAnyServer = channelManager
+    && (authority.channelType !== "joint" || authority.jointAuthority?.isHostEntry === true);
+  const canManageAgentOf = (agentServerId: string) => agentServerId === req.serverId
+    ? isAuthor || channelManager
+    : managesAnyServer;
+  return { canManage: isAuthor || channelManager, canManageAgentOf };
+}
+
+async function isManagedThreadAuthor(
   req: Request,
   channel: NonNullable<Awaited<ReturnType<typeof channelService.getChannel>>>,
 ): Promise<boolean> {
-  if (await actorHasServerCapabilityInServer(req.serverId!, "user", req.userId!, "removeChannelMembers")) {
-    return true;
+  // A task conversation's "author" is the task's creator.
+  if (channel.type === "task") {
+    const task = await channelService.resolveTaskConversationFollowerManagement(channel);
+    return task?.createdByType === "user" && task.createdById === req.userId;
   }
-  if (!channel.parentMessageId) return false;
-  const parent = await channelService.getMessage(channel.parentMessageId);
+  // resolveManagedThread scoped the thread to req.serverId, so a joint thread
+  // resolves through this server's projection to its canonical parent.
+  const threadParent = await channelService.resolveThreadParent(channel);
+  if (!threadParent) return false;
+  const parent = await channelService.getMessage(threadParent.parentMessageId);
   return parent?.senderType === "user" && parent.senderId === req.userId;
 }
 
+/**
+ * Authorize an Agent-follower write and find the projection holding the
+ * follower row. Sends the response and returns null when refused.
+ */
+async function authorizeManagedFollowerWrite(
+  req: Request,
+  res: Response,
+  channel: NonNullable<Awaited<ReturnType<typeof channelService.getChannel>>>,
+  agentId: string,
+  verb: "remove" | "restore",
+): Promise<{ followerThreadChannelId: string } | null> {
+  const management = await resolveThreadFollowerManagement(req, channel);
+  const author = channel.type === "task" ? "task creator" : "thread author";
+  if (!management.canManage) {
+    res.status(403).json({ error: `Only the ${author} or a channel manager can ${verb} followers` });
+    return null;
+  }
+  const agent = await agentService.getAgent(agentId);
+  const followerThreadChannelId = agent
+    ? await channelService.getManagedFollowerThreadChannelIdForServer(channel.id, agent.serverId)
+    : null;
+  if (!agent || !followerThreadChannelId) {
+    res.status(404).json({ error: "Agent follower not found" });
+    return null;
+  }
+  if (!management.canManageAgentOf(agent.serverId)) {
+    res.status(403).json({ error: `Only a channel manager of the host server can ${verb} another server's Agent followers` });
+    return null;
+  }
+  return { followerThreadChannelId };
+}
+
 const THREAD_FOLLOWER_ROSTER_MAX = 100;
+
+/** How the follower receipt names the conversation: the thread's channel name, or the task's ref. */
+async function managedFollowerConversationLabel(
+  channel: NonNullable<Awaited<ReturnType<typeof channelService.getChannel>>>,
+): Promise<{ threadLabel: string; conversationKind: channelService.ManagedFollowerConversationKind }> {
+  if (channel.type === "task") {
+    const task = await channelService.resolveTaskConversationFollowerManagement(channel);
+    return { threadLabel: task?.label ?? "task", conversationKind: "task" };
+  }
+  return { threadLabel: channel.name || "thread", conversationKind: "thread" };
+}
 
 async function resolveManagedFollowerActivity(
   orchestrator: AgentOrchestrator | undefined,
@@ -1795,7 +2255,7 @@ async function emitManagedFollowerActivity(
 }
 
 // Current Agent followers for thread cards/detail headers. Historical followers
-// are deliberately excluded by channelService.getThreadFollowers().
+// (unfollowed) are deliberately excluded.
 channelRouter.get("/threads/followers", async (req, res) => {
   try {
     const raw = typeof req.query.threadChannelIds === "string" ? req.query.threadChannelIds : "";
@@ -1808,18 +2268,18 @@ channelRouter.get("/threads/followers", async (req, res) => {
     for (const threadChannelId of ids) {
       const channel = await resolveManagedThread(req, res, threadChannelId);
       if (!channel) return;
-      const [followers, canManage] = await Promise.all([
+      const [followers, management] = await Promise.all([
         channelService.getManagedThreadAgentFollowers(threadChannelId),
-        canManageThreadFollowers(req, channel),
+        resolveThreadFollowerManagement(req, channel),
       ]);
       threads.push({
         threadChannelId,
         agents: followers.map((agent) => ({
           ...agent,
           isCurrentServer: agent.serverId === req.serverId,
-          canRemove: canManage && agent.serverId === req.serverId,
+          canRemove: management.canManageAgentOf(agent.serverId),
         })),
-        canManage,
+        canManage: management.canManage,
       });
     }
     res.json({ threads });
@@ -1842,23 +2302,16 @@ channelRouter.delete("/threads/:threadChannelId/followers/agents/:agentId", asyn
     }
     const channel = await resolveManagedThread(req, res, threadChannelId);
     if (!channel) return;
-    if (!await canManageThreadFollowers(req, channel)) {
-      res.status(403).json({ error: "Only the thread author or a channel manager can remove followers" });
-      return;
-    }
-    const agent = await agentService.getAgent(agentId);
-    if (!agent || agent.serverId !== req.serverId) {
-      res.status(404).json({ error: "Agent follower not found" });
-      return;
-    }
+    const authorized = await authorizeManagedFollowerWrite(req, res, channel, agentId, "remove");
+    if (!authorized) return;
     const actor = await userService.getUser(req.userId!);
     const orchestrator = req.app.get("agentOrchestrator") as AgentOrchestrator | undefined;
     const currentActivity = await resolveManagedFollowerActivity(orchestrator, agentId);
     const result = await channelService.removeManagedAgentThreadFollower({
-      threadChannelId,
+      threadChannelId: authorized.followerThreadChannelId,
       agentId,
       actorLabel: actor?.name ? `@${actor.name}` : actor?.displayName || "A channel manager",
-      threadLabel: channel.name || "thread",
+      ...await managedFollowerConversationLabel(channel),
       ...currentActivity,
     });
     if (result.changed && result.activityEvent) {
@@ -1892,23 +2345,16 @@ channelRouter.post("/threads/:threadChannelId/followers/agents/:agentId/restore"
     }
     const channel = await resolveManagedThread(req, res, threadChannelId);
     if (!channel) return;
-    if (!await canManageThreadFollowers(req, channel)) {
-      res.status(403).json({ error: "Only the thread author or a channel manager can restore followers" });
-      return;
-    }
-    const agent = await agentService.getAgent(agentId);
-    if (!agent || agent.serverId !== req.serverId) {
-      res.status(404).json({ error: "Agent follower not found" });
-      return;
-    }
+    const authorized = await authorizeManagedFollowerWrite(req, res, channel, agentId, "restore");
+    if (!authorized) return;
     const actor = await userService.getUser(req.userId!);
     const orchestrator = req.app.get("agentOrchestrator") as AgentOrchestrator | undefined;
     const currentActivity = await resolveManagedFollowerActivity(orchestrator, agentId);
     const result = await channelService.restoreManagedAgentThreadFollower({
-      threadChannelId,
+      threadChannelId: authorized.followerThreadChannelId,
       agentId,
       actorLabel: actor?.name ? `@${actor.name}` : actor?.displayName || "A channel manager",
-      threadLabel: channel.name || "thread",
+      ...await managedFollowerConversationLabel(channel),
       removalToken,
       ...currentActivity,
     });
@@ -1929,9 +2375,29 @@ channelRouter.post("/threads/:threadChannelId/followers/agents/:agentId/restore"
 });
 
 // Follow a thread (manual follow)
-channelRouter.post("/threads/follow", async (req, res) => {
+channelRouter.post("/threads/follow", noteInboxWriteBeforeReply, async (req, res) => {
   try {
-    const { parentMessageId } = req.body;
+    const { parentMessageId, threadChannelId } = req.body;
+    // Task v2: a task conversation has no parent message; the web bell names
+    // the conversation itself (the reader's local one; joint: its projection).
+    if (!parentMessageId && typeof threadChannelId === "string" && threadChannelId) {
+      const conversation = await channelService.getChannel(threadChannelId).catch(() => null);
+      if (!conversation || conversation.type !== "task" || conversation.serverId !== req.serverId) {
+        res.status(404).json({ error: "Thread not found" });
+        return;
+      }
+      if (!await channelService.canUserAccessChannel(conversation.id, req.userId!, req.serverId!)) {
+        res.status(404).json({ error: "Thread not found" });
+        return;
+      }
+      // The Follow button: the thread scope moves only the follow state (a thread has no level).
+      const followed = await setNotificationLevel({ userId: req.userId!, scope: "thread", id: conversation.id, level: "all", accessChecked: true, button: true });
+      await emitLevelChange(req.app.get("io") as SocketServer | undefined, req.userId!, { ...followed, followChanged: false });
+      if (followed.pendingRead) throw followed.pendingRead;
+      await emitThreadFollowersUpdated(req.app.get("io") as SocketServer | undefined, conversation.id);
+      res.json({ ok: true, threadChannelId: conversation.id });
+      return;
+    }
     if (!parentMessageId) {
       res.status(400).json({ error: "parentMessageId is required" });
       return;
@@ -1966,10 +2432,17 @@ channelRouter.post("/threads/follow", async (req, res) => {
 
     // Find thread channel for this message
     const thread = await channelService.getOrCreateThreadForChannel(localParentChannelId, parentMessageId, req.userId!, "user");
-    await channelService.followThread(req.userId!, thread.id, parentMessageId);
+    // The Follow button: the thread scope moves only the follow state (a thread has no level).
+    const followed = await setNotificationLevel({ userId: req.userId!, scope: "thread", id: thread.id, level: "all", accessChecked: true, button: true });
+    await emitLevelChange(req.app.get("io") as SocketServer | undefined, req.userId!, { ...followed, followChanged: false });
+    if (followed.pendingRead) throw followed.pendingRead;
     await emitThreadFollowersUpdated(req.app.get("io") as SocketServer | undefined, thread.id);
     res.json({ ok: true, threadChannelId: thread.id });
   } catch (err: any) {
+    if (err instanceof NotificationLevelError) {
+      res.status(404).json({ error: "Thread not found" });
+      return;
+    }
     if (sendCompatibilityReadPending(res, err, { primaryOutcomeCommitted: true })) return;
     sendJsonServerError(req, res, {
       error: "Failed to follow thread",
@@ -1980,7 +2453,7 @@ channelRouter.post("/threads/follow", async (req, res) => {
 });
 
 // Unfollow a thread
-channelRouter.post("/threads/unfollow", async (req, res) => {
+channelRouter.post("/threads/unfollow", noteInboxWriteBeforeReply, async (req, res) => {
   try {
     const { threadChannelId } = req.body;
     if (!threadChannelId) {
@@ -1998,17 +2471,24 @@ channelRouter.post("/threads/unfollow", async (req, res) => {
       res.status(404).json({ error: "Thread not found" });
       return;
     }
-    await channelService.unfollowThread(req.userId!, threadChannelId);
+    // The Unfollow button: the thread scope moves only the follow state (a thread has no level).
+    const unfollowed = await setNotificationLevel({ userId: req.userId!, scope: "thread", id: threadChannelId, level: "mentions", accessChecked: true, button: true });
+    await emitLevelChange(req.app.get("io") as SocketServer | undefined, req.userId!, { ...unfollowed, followChanged: false });
+    if (unfollowed.pendingRead) throw unfollowed.pendingRead;
     await emitThreadFollowersUpdated(req.app.get("io") as SocketServer | undefined, threadChannelId);
     res.json({ ok: true });
   } catch (err) {
+    if (err instanceof NotificationLevelError) {
+      res.status(404).json({ error: "Thread not found" });
+      return;
+    }
     if (sendCompatibilityReadPending(res, err, { primaryOutcomeCommitted: true })) return;
     res.status(500).json({ error: "Failed to unfollow thread" });
   }
 });
 
 // Mark a thread as done (hide from active list, auto-restores on new messages)
-channelRouter.post("/threads/done", async (req, res) => {
+channelRouter.post("/threads/done", noteInboxWriteBeforeReply, async (req, res) => {
   try {
     const { threadChannelId, throughActivitySeq, frontierSpace } = req.body;
     if (!threadChannelId) {
@@ -2072,7 +2552,8 @@ channelRouter.post("/threads/done", async (req, res) => {
     // A non-thread scope is a caller bug worth naming -- but only to someone who
     // can already see the channel. To anyone else it stays in the merged 404,
     // because "wrong type" still reveals that the id is real.
-    if (channel.type !== "thread") {
+    // Task v2: a task conversation is sub-conversation Done like a thread.
+    if (channel.type !== "thread" && channel.type !== "task") {
       if (await authorize()) {
         res.status(400).json({ error: "Not a thread", code: "NOT_A_THREAD" });
       } else {
@@ -2123,7 +2604,8 @@ channelRouter.post("/threads/done", async (req, res) => {
       res.status(404).json({ error: "Thread not found" });
       return;
     }
-    await channelService.markThreadDone(req.userId!, threadChannelId, throughActivitySeq);
+    const ack = await channelService.markThreadDone(req.userId!, threadChannelId, throughActivitySeq);
+    retractDoneNotifications(req, ack);
     res.json({ ok: true });
   } catch (err) {
     if (err instanceof DoneFrontierRequiredError) {
@@ -2144,7 +2626,7 @@ channelRouter.post("/threads/done", async (req, res) => {
 });
 
 // Un-done a thread (restore to active list)
-channelRouter.post("/threads/undone", async (req, res) => {
+channelRouter.post("/threads/undone", noteInboxWriteBeforeReply, async (req, res) => {
   try {
     const { threadChannelId } = req.body;
     if (!threadChannelId) {
@@ -2174,38 +2656,64 @@ channelRouter.post("/threads/undone", async (req, res) => {
 channelRouter.get("/saved", async (req, res) => {
   try {
     const limit = Math.min(Number(req.query.limit) || 20, 50);
-    const offset = Math.max(Number(req.query.offset) || 0, 0);
+    const offset = parseOffsetQueryParam(req.query.offset);
     const channelIdParam = typeof req.query.channelId === "string" ? req.query.channelId : undefined;
     const channelId = channelIdParam && ANY_UUID_RE.test(channelIdParam) ? channelIdParam : undefined;
     const qParam = typeof req.query.q === "string" ? req.query.q.trim().slice(0, 200) : "";
     const q = qParam || undefined;
     const sort = req.query.sort === "asc" ? "asc" as const : "desc" as const;
-    const filteredTotalPromise = savedService.countSaved(req.userId!, req.serverId!, { channelId, q });
+    // The plan's history window (services/historyWindow.ts): saved messages
+    // behind it are not listed or counted in the totals; the first page says
+    // how many there are, for the list's card (cindyz, task #8, frame 16).
+    // Not for a search: counting old matches would search what is hidden.
+    const { cutoff: historyCutoff } = await getServerHistoryWindowForRead(req.serverId!);
+    const inside = historyCutoff ? { cutoff: historyCutoff, side: "inside" as const } : undefined;
+    const filteredTotalPromise = savedService.countSaved(req.userId!, req.serverId!, { channelId, q, history: inside });
     const globalTotalPromise = channelId || q
-      ? savedService.countSaved(req.userId!, req.serverId!)
+      ? savedService.countSaved(req.userId!, req.serverId!, { history: inside })
       : filteredTotalPromise;
-    const [saved, total, globalTotal] = await Promise.all([
-      savedService.listSaved(req.userId!, req.serverId!, { limit, offset, channelId, q, sort }),
+    const historyHiddenPromise = historyCutoff && !q && offset === 0
+      ? savedService.countSaved(req.userId!, req.serverId!, { channelId, history: { cutoff: historyCutoff, side: "behind" } })
+      : Promise.resolve(0);
+    const [saved, total, globalTotal, historyHiddenCount] = await Promise.all([
+      savedService.listSaved(req.userId!, req.serverId!, { limit, offset, channelId, q, sort, history: inside }),
       filteredTotalPromise,
       globalTotalPromise,
+      historyHiddenPromise,
     ]);
     // `total` = true saved count (drives the sidebar/panel badge, which used to
     // be capped at the loaded page size); `saved` is one page. Derive hasMore
     // from the true total — `saved.length >= limit` over-reports when the count
     // is an exact multiple of limit (a full last page wrongly looks like there's
     // more), so a `total`-exact check is both correct and simpler.
-    res.json({ saved, hasMore: offset + saved.length < total, total, globalTotal });
+    res.json({
+      saved,
+      hasMore: offset + saved.length < total,
+      total,
+      globalTotal,
+      ...(historyHiddenCount > 0 && { historyHidden: { count: historyHiddenCount } }),
+    });
   } catch {
     res.status(500).json({ error: "Failed to list saved messages" });
   }
 });
 
-// Save a message
+// Save a message; with `saved: false`, unsave it (the owner's assistant's save_message, #proj-assistant:#19).
 channelRouter.post("/saved", async (req, res) => {
   try {
-    const { messageId } = req.body;
+    const { messageId, saved } = req.body;
     if (!messageId || typeof messageId !== "string") {
       res.status(400).json({ error: "messageId is required" });
+      return;
+    }
+    if (saved !== undefined && typeof saved !== "boolean") {
+      res.status(400).json({ error: "saved must be true or false" });
+      return;
+    }
+    if (saved === false) {
+      const { unfollowedThreadChannelId } = await savedService.unsaveMessage(req.userId!, messageId);
+      if (unfollowedThreadChannelId) await emitThreadFollowersUpdated(req.app.get("io") as SocketServer | undefined, unfollowedThreadChannelId);
+      res.json({ ok: true, saved: false });
       return;
     }
     // Verify the message is visible in this server. Joint messages live under
@@ -2215,9 +2723,13 @@ channelRouter.post("/saved", async (req, res) => {
       res.status(404).json({ error: "Message not found" });
       return;
     }
-    await savedService.saveMessage(req.userId!, messageId, req.serverId!);
-    res.json({ ok: true });
-  } catch {
+    // Saving also follows the message's thread (thread contract D, db/schema.ts).
+    const { followedThreadChannelId } = await savedService.saveMessage(req.userId!, messageId, req.serverId!);
+    if (followedThreadChannelId) await emitThreadFollowersUpdated(req.app.get("io") as SocketServer | undefined, followedThreadChannelId);
+    res.json({ ok: true, saved: true });
+  } catch (err) {
+    // The save and its follow committed; only the follow's read-position move is pending.
+    if (sendCompatibilityReadPending(res, err, { primaryOutcomeCommitted: true })) return;
     res.status(500).json({ error: "Failed to save message" });
   }
 });
@@ -2225,7 +2737,8 @@ channelRouter.post("/saved", async (req, res) => {
 // Unsave a message
 channelRouter.delete("/saved/:messageId", async (req, res) => {
   try {
-    await savedService.unsaveMessage(req.userId!, req.params.messageId);
+    const { unfollowedThreadChannelId } = await savedService.unsaveMessage(req.userId!, req.params.messageId);
+    if (unfollowedThreadChannelId) await emitThreadFollowersUpdated(req.app.get("io") as SocketServer | undefined, unfollowedThreadChannelId);
     res.json({ ok: true });
   } catch {
     res.status(500).json({ error: "Failed to unsave message" });
@@ -2310,8 +2823,8 @@ channelRouter.post("/system/all/hide", async (req, res) => {
     // regression test covering it drives the PATCH route, so it would have kept
     // passing against a path nothing uses any more.
     // Unconditional on purpose. Guarding this with `!alreadyHidden` meant an #all
-    // that was ALREADY hidden never got the claim -- and under onboarding_opener_v2
-    // that is the birth state of every new server, instruction unclaimed. The owner
+    // that was ALREADY hidden never got the claim -- and that is the birth state
+    // of every new server (#all is born hidden), instruction unclaimed. The owner
     // who hides an already-hidden #all expresses the same intent as one who hides a
     // visible one, and used to get a different durable outcome: team growth
     // re-revealed it. The claim is idempotent (it writes only when the column is
@@ -2363,6 +2876,79 @@ channelRouter.post("/system/all/restore", async (req, res) => {
 });
 
 // Update channel (name / description / visibility)
+/** A person's 409 for a name an archived channel holds: specific only if they can see it (archivedNameCollision.ts). */
+function humanArchivedNameCollisionBody(req: Request, err: channelService.ArchivedNameCollisionError) {
+  return archivedNameCollisionBody(
+    err,
+    { type: "user", id: req.userId!, serverId: req.serverId! },
+    async () => err.archivedChannelType === "channel" || err.archivedChannelType === "private"
+      ? actorHasChannelCapability(req.serverId!, err.archivedChannelId, "user", req.userId!, "archiveChannels")
+      : err.archivedChannelType === "joint"
+        && actorHasServerCapabilityInServer(req.serverId!, "user", req.userId!, "archiveChannels"),
+  );
+}
+
+/** PATCH /api/channels/:id visitorVisible refusals (#wg-rbac:#51). */
+const VISITOR_VISIBILITY_FORBIDDEN: RefusalInput = {
+  error: "Only server owners and admins can change whether a channel is visible to visitors",
+  code: "visitor_visibility_forbidden",
+};
+const VISITOR_VISIBILITY_UNSUPPORTED_CHANNEL: RefusalInput = {
+  error: "Visitor visibility is supported only for ordinary channels",
+  code: "visitor_visibility_unsupported_channel",
+};
+const VISITOR_VISIBILITY_REQUIRES_PUBLIC_CHANNEL: RefusalInput = {
+  error: "Only a public channel can be visible to visitors",
+  code: "visitor_visibility_requires_public_channel",
+};
+const VISITOR_VISIBILITY_REQUIRES_PUBLIC_SERVER: RefusalInput = {
+  error: "Make the server public before making its channels visible to visitors",
+  code: "visitor_visibility_requires_public_server",
+};
+
+/**
+ * `visitorVisible`, or `guestVisible`, the legacy name older clients still
+ * send (accepted for one release). Both sent and different is a 400.
+ */
+function parseVisitorVisibleRequest(body: Record<string, unknown>):
+  { ok: true; value: boolean | undefined } | { ok: false; refusal: RefusalInput } {
+  const { visitorVisible, guestVisible } = body;
+  if (visitorVisible !== undefined && typeof visitorVisible !== "boolean") {
+    return { ok: false, refusal: { error: "visitorVisible must be a boolean", code: "visitor_visible_invalid" } };
+  }
+  if (guestVisible !== undefined && typeof guestVisible !== "boolean") {
+    return { ok: false, refusal: { error: "guestVisible must be a boolean", code: "visitor_visible_invalid" } };
+  }
+  if (visitorVisible !== undefined && guestVisible !== undefined && visitorVisible !== guestVisible) {
+    return { ok: false, refusal: { error: "visitorVisible and guestVisible disagree; send visitorVisible only", code: "visitor_visible_conflict" } };
+  }
+  return { ok: true, value: visitorVisible ?? guestVisible };
+}
+
+/**
+ * Why visitorVisible may not be turned on, or null. The same conditions the
+ * anonymous read path applies (publicServer.ts anonymousReadableChannel and
+ * its server gate): the server is publicly visible with public_server_v0 on
+ * (evaluated as that path does, per server, platform web), and the channel is
+ * a plain public channel, after any visibility change in the same request.
+ * #all is not one: its audience is managed only through its own surfaces.
+ */
+async function visitorVisibilityTurnOnRefusal(
+  serverId: string,
+  channel: Parameters<typeof channelService.isAllSystemChannel>[0],
+  nextType: channelService.RegularChannelType | undefined,
+): Promise<RefusalInput | null> {
+  const [server, publicGate] = await Promise.all([
+    serverService.getServer(serverId),
+    evaluateFeatureFlag({ key: PUBLIC_SERVER_FEATURE_FLAG_KEY, serverId, platform: "web" }),
+  ]);
+  if (!server?.publiclyVisible || !publicGate.enabled) return VISITOR_VISIBILITY_REQUIRES_PUBLIC_SERVER;
+  if ((nextType ?? channel.type) !== "channel" || channelService.isAllSystemChannel(channel)) {
+    return VISITOR_VISIBILITY_REQUIRES_PUBLIC_CHANNEL;
+  }
+  return null;
+}
+
 channelRouter.patch("/:id", async (req, res) => {
   try {
     const channel = await channelService.getChannel(req.params.id);
@@ -2370,12 +2956,14 @@ channelRouter.patch("/:id", async (req, res) => {
       res.status(404).json({ error: "Channel not found" });
       return;
     }
-    const [canEditChannelMetadata, canChangeChannelVisibility, canManageGuestAccess] = await Promise.all([
+    const [canEditChannelMetadata, canChangeChannelVisibility, canManageVisitorAccess] = await Promise.all([
       actorHasChannelCapability(req.serverId!, channel.id, "user", req.userId!, "editChannelMetadata"),
       actorHasServerCapabilityInServer(req.serverId!, "user", req.userId!, "changeChannelVisibility"),
-      actorHasChannelCapability(req.serverId!, channel.id, "user", req.userId!, "manageGuestAccess"),
+      // Server owner/admin only: a channel admin role never grants it
+      // (not in CHANNEL_ADMIN_CAPABILITIES).
+      actorHasServerCapabilityInServer(req.serverId!, "user", req.userId!, "manageVisitorAccess"),
     ]);
-    const canManageRequestedChange = canEditChannelMetadata || canChangeChannelVisibility || canManageGuestAccess;
+    const canManageRequestedChange = canEditChannelMetadata || canChangeChannelVisibility || canManageVisitorAccess;
     const isHiddenAllChannel = channelService.isAllSystemChannel(channel)
       && !channelService.isEnabledAllChannel(channel);
     if (isHiddenAllChannel && !canManageRequestedChange) {
@@ -2395,8 +2983,55 @@ channelRouter.patch("/:id", async (req, res) => {
       res.status(409).json({ error: "This channel is archived", code: "channel_archived" });
       return;
     }
-    const { name, description, visibility, guestVisible, guestJoinable } = req.body;
-    const guestPolicyRequested = guestVisible !== undefined || guestJoinable !== undefined;
+    // guestJoinable is retired (#wg-rbac:#47): a Guest never joins a channel
+    // itself, so the field is no longer read. visitorVisible (legacy alias
+    // guestVisible) puts the channel on its public server's page for
+    // signed-out visitors (cindyz, #wg-rbac:#51, msg 4987425b).
+    const { name, description, visibility, threadSort } = req.body;
+    const visitorVisibilityRequested = req.body.visitorVisible !== undefined || req.body.guestVisible !== undefined;
+    // Forum-style channels (#proj-chat:#24): behind channel_thread_sort_v0
+    // (404 while off, like an unknown field), editChannelMetadata like the name,
+    // regular channels only (not joint, DM, thread or task).
+    if (threadSort !== undefined) {
+      const threadSortGate = await evaluateFeatureFlag({
+        key: CHANNEL_THREAD_SORT_FEATURE_FLAG_KEY,
+        serverId: req.serverId!,
+        userId: req.userId!,
+      });
+      if (!threadSortGate.enabled) {
+        res.status(404).json({ error: "Thread sort is not enabled" });
+        return;
+      }
+      if (!canEditChannelMetadata) {
+        res.status(403).json({ error: "You do not have permission to edit channel metadata" });
+        return;
+      }
+      if (!isChannelThreadSort(threadSort)) {
+        res.status(400).json({ error: "threadSort must be one of: time, activity" });
+        return;
+      }
+      if (!channelTypeSupportsThreadSort(channel.type)) {
+        res.status(400).json({ error: "Thread sort is supported only for ordinary channels", code: "thread_sort_unsupported" });
+        return;
+      }
+    }
+    // Channel announcements (#proj-chat:#29): behind channel_announcement_v0,
+    // editChannelMetadata like the name, an Artifact homed in this channel
+    // (channelAnnouncements.ts; null removes it).
+    let announcementArtifactId: string | null | undefined;
+    if (req.body.announcement !== undefined) {
+      const change = await channelAnnouncementChange({
+        actor: { type: "user", id: req.userId!, serverId: asServerId(req.serverId!) },
+        channel,
+        raw: req.body.announcement,
+        canEditChannelMetadata,
+      });
+      if (!change.ok) {
+        refuse(res, change.status, change.refusal);
+        return;
+      }
+      announcementArtifactId = change.artifactId;
+    }
     if ((name !== undefined || description !== undefined) && !canEditChannelMetadata) {
       res.status(403).json({ error: "You do not have permission to edit channel metadata" });
       return;
@@ -2405,31 +3040,17 @@ channelRouter.patch("/:id", async (req, res) => {
       res.status(403).json({ error: "You do not have permission to change channel visibility" });
       return;
     }
-    if (guestPolicyRequested && !canManageGuestAccess) {
-      res.status(403).json({ error: "You do not have permission to manage guest access" });
+    if (visitorVisibilityRequested && !canManageVisitorAccess) {
+      refuse(res, 403, VISITOR_VISIBILITY_FORBIDDEN);
       return;
     }
-    if (guestPolicyRequested) {
-      const guestGate = await evaluateFeatureFlag({
-        key: SERVER_GUEST_FEATURE_FLAG_KEY,
-        serverId: req.serverId!,
-        userId: req.userId!,
-      });
-      if (!guestGate.enabled) {
-        res.status(404).json({ error: "Guest access is not enabled" });
-        return;
-      }
-      if ((guestVisible !== undefined && typeof guestVisible !== "boolean")
-        || (guestJoinable !== undefined && typeof guestJoinable !== "boolean")) {
-        res.status(400).json({ error: "guestVisible and guestJoinable must be booleans" });
-        return;
-      }
-      if (channelService.isAllSystemChannel(channel) && guestJoinable !== undefined) {
-        res.status(400).json({ error: "The #all channel does not support Guest joining" });
-        return;
-      }
+    const parsedVisitorVisible = parseVisitorVisibleRequest(req.body);
+    if (!parsedVisitorVisible.ok) {
+      refuse(res, 400, parsedVisitorVisible.refusal);
+      return;
     }
-    if (name === undefined && description === undefined && visibility === undefined && !guestPolicyRequested && !canEditChannelMetadata) {
+    const visitorVisible = parsedVisitorVisible.value;
+    if (name === undefined && description === undefined && visibility === undefined && !visitorVisibilityRequested && !canEditChannelMetadata) {
       res.status(403).json({ error: "You do not have permission to update channels" });
       return;
     }
@@ -2482,40 +3103,68 @@ channelRouter.patch("/:id", async (req, res) => {
       });
       return;
     }
-    if (guestPolicyRequested) {
-      if (channel.type !== "channel" && channel.type !== "private") {
-        res.status(400).json({ error: "Guest access is supported only for ordinary channels" });
-        return;
-      }
-      const nextType = type ?? channel.type;
-      const privateGuestPolicyDisabled = nextType === "private" && !channelService.isAllSystemChannel(channel);
-      const nextGuestVisible = privateGuestPolicyDisabled ? false : guestVisible ?? channel.guestVisible;
-      const nextGuestJoinable = channelService.isAllSystemChannel(channel)
-        ? false
-        : privateGuestPolicyDisabled ? false : guestJoinable ?? channel.guestJoinable;
-      if (nextGuestJoinable && !nextGuestVisible) {
-        res.status(400).json({ error: "Guest-joinable channels must also be guest-visible" });
+    if (visitorVisible !== undefined && channel.type !== "channel" && channel.type !== "private") {
+      refuse(res, 400, VISITOR_VISIBILITY_UNSUPPORTED_CHANNEL);
+      return;
+    }
+    // Turning it on needs a reader on both sides: the public read path
+    // (routes/publicServer.ts) serves only plain public channels of a server
+    // that is publicly visible with public_server_v0 on. Off is always allowed.
+    if (visitorVisible === true) {
+      const refusal = await visitorVisibilityTurnOnRefusal(req.serverId!, channel, type);
+      if (refusal) {
+        refuse(res, 400, refusal);
         return;
       }
     }
     const requiredCapabilities: ServerCapability[] = [];
-    if (name !== undefined || description !== undefined) requiredCapabilities.push("editChannelMetadata");
+    if (name !== undefined || description !== undefined || threadSort !== undefined || announcementArtifactId !== undefined) requiredCapabilities.push("editChannelMetadata");
     if (visibility !== undefined) requiredCapabilities.push("changeChannelVisibility");
-    if (guestPolicyRequested) requiredCapabilities.push("manageGuestAccess");
+    if (visitorVisible !== undefined) requiredCapabilities.push("manageVisitorAccess");
+    // The announcement as it was under the lock: which change the event line names (set, replaced, removed).
+    let announcementBefore: string | null = channel.announcementArtifactId ?? null;
     const updated = await withLockedChannelActorCapabilities({
       serverId: req.serverId!,
       channelId: channel.id,
       actorType: "user",
       actorId: req.userId!,
       capabilities: requiredCapabilities,
-    }, (tx) => channelService.updateChannel(req.params.id, {
-      name: name?.trim(),
-      description,
-      type,
-      guestVisible,
-      guestJoinable: channelService.isAllSystemChannel(channel) && guestPolicyRequested ? false : guestJoinable,
-    }, tx));
-    await channelService.revokeChannelAccessAfterUpdate({ type, guestVisible }, updated);
+    }, async (tx, actor) => {
+      // Under the channel row lock, which sending and accepting an external
+      // invite take first: no relation can appear beside this check.
+      if (visitorVisible === true
+        && (await channelService.channelIdsWithExternalRelation([channel.id], tx)).has(channel.id)) {
+        throw new RefusalError(400, VISITOR_VISIBILITY_UNSUPPORTED_CHANNEL);
+      }
+      const before = await channelService.getChannel(channel.id, { executor: tx });
+      if (before) announcementBefore = before.announcementArtifactId ?? null;
+      const result = await channelService.updateChannel(req.params.id, {
+        name: name?.trim(),
+        description,
+        type,
+        guestVisible: visitorVisible,
+        threadSort,
+        announcementArtifactId,
+      }, tx);
+      // Also when making the channel private turned it off.
+      if (before && before.guestVisible !== result.guestVisible) {
+        await recordIntegrationAuditEvent({
+          serverId: req.serverId!,
+          eventType: "channel.visitor_visibility_changed",
+          outcome: "success",
+          source: "web",
+          actor: { type: "human", id: req.userId! },
+          target: { type: "channel", id: channel.id },
+          metadata: {
+            channelId: channel.id,
+            visitorVisible: result.guestVisible,
+            ...serverAuditContextMetadata({ actorRole: actor.serverRole }),
+          },
+        }, tx);
+      }
+      return result;
+    });
+    await channelService.revokeChannelAccessAfterUpdate({ type, guestVisible: visitorVisible }, updated);
     const renamed = updated.name !== channel.name;
 
     // Notify clients about channel update
@@ -2543,17 +3192,36 @@ channelRouter.patch("/:id", async (req, res) => {
         console.error("channel rename: failed to broadcast system message:", err);
       });
     }
+    // Set, replaced or removed (not a new version of it): one event line (tygg, #proj-chat:#29).
+    if (announcementArtifactId !== undefined) {
+      await postChannelAnnouncementChange({
+        io,
+        agentOrchestrator: req.app.get("agentOrchestrator") as AgentOrchestrator | undefined,
+        channelId: updated.id,
+        actor: { type: "user", id: req.userId! },
+        before: announcementBefore,
+        after: updated.announcementArtifactId ?? null,
+      });
+    }
 
-    res.json(updated);
+    res.json(withVisitorVisible(await attachChannelAnnouncement({ type: "user", id: req.userId!, serverId: asServerId(req.serverId!) }, updated)));
   } catch (err: any) {
     const msg = err?.message || "";
-    if (err instanceof channelService.GuestJoinableChannelLimitError) {
-      res.status(409).json({ error: err.message, code: err.code, limit: err.limit });
+    if (err instanceof RefusalError) {
+      refuse(res, err.status, err.refusal);
+    } else if (err instanceof channelService.ExternalMembersKeepPrivateError) {
+      res.status(409).json({ error: err.message, code: err.code });
+    } else if (err instanceof AgentLoungeImmutableError) {
+      res.status(409).json({ error: err.message, code: err.code });
     } else if (msg === "Channel capability required") {
       res.status(403).json({ error: "You do not have permission to update channels" });
+    } else if (err instanceof channelService.ArchivedNameCollisionError) {
+      res.status(409).json(await humanArchivedNameCollisionBody(req, err));
     } else if (msg.includes("already taken")) {
       res.status(409).json({ error: msg });
-    } else if (msg.includes("Cannot rename") || msg.includes("Cannot edit") || msg.includes("Cannot change visibility") || msg.includes("reserved")) {
+    } else if (msg === "Thread sort is supported only for ordinary channels") {
+      res.status(400).json({ error: msg, code: "thread_sort_unsupported" });
+    } else if (msg.includes("Cannot rename") || msg.includes("Cannot edit") || msg === channelService.JOINT_VISIBILITY_FIXED_MESSAGE || msg.includes("reserved")) {
       res.status(403).json({ error: msg });
     } else {
       res.status(500).json({ error: "Failed to update channel" });
@@ -2587,11 +3255,20 @@ channelRouter.get("/:id/files", async (req, res) => {
       res.status(400).json({ error: "Invalid cursor" });
       return;
     }
-    const files = await channelService.listChannelFiles(channel.id, { historyCutoff, limit: limit + 1, cursor });
+    // Task v2: attachments posted in the channel's task conversations are
+    // listed too, whatever the reader's flag (per-task mode).
+    const files = await channelService.listChannelFiles(channel.id, { historyCutoff, limit: limit + 1, cursor, includeTaskConversations: true });
     const pageFiles = files.slice(0, limit);
     const nextCursor = files.length > limit && pageFiles.length > 0
       ? encodeChannelFilesCursor(pageFiles[pageFiles.length - 1])
       : null;
+    // On a plan with a history window, the first page says whether the
+    // window hides any of the channel's files, so the panel says so only
+    // then. A channel younger than the window has none to hide.
+    const historyLimited = cursor !== null || historyCutoff === undefined
+      ? undefined
+      : new Date(channel.createdAt) < historyCutoff
+        && await channelService.hasChannelFilesBehindHistory(channel.id, historyCutoff, { includeTaskConversations: true });
     res.json({
       files: pageFiles.map((file) => {
         const filename = normalizeAttachmentFilename(file.filename);
@@ -2616,6 +3293,7 @@ channelRouter.get("/:id/files", async (req, res) => {
         };
       }),
       nextCursor,
+      ...(historyLimited !== undefined && { historyLimited }),
     });
   } catch (err) {
     sendJsonServerError(req, res, {
@@ -2633,7 +3311,7 @@ async function resolveActivityMuteTarget(req: Request, res: Response) {
     res.status(404).json({ error: "Channel not found" });
     return null;
   }
-  if (channel.type === "thread") {
+  if (isSubConversationType(channel.type)) {
     res.status(400).json({ error: "Thread notification settings are managed via follow/unfollow" });
     return null;
   }
@@ -2652,7 +3330,7 @@ async function resolveMessageDisplayPrefsTarget(req: Request, res: Response) {
     res.status(404).json({ error: "Channel not found" });
     return null;
   }
-  if (channel.type === "thread") {
+  if (isSubConversationType(channel.type)) {
     res.status(400).json({ error: "Thread message display settings are managed by the parent channel" });
     return null;
   }
@@ -2677,7 +3355,10 @@ channelRouter.get("/:id/notification-settings", async (req, res) => {
   try {
     const channel = await resolveActivityMuteTarget(req, res);
     if (!channel) return;
-    const state = await channelService.getInboxTargetActivityMuteState("user", req.userId!, channel.id);
+    const [state, activityMuteSupported] = await Promise.all([
+      channelService.getInboxTargetActivityMuteState("user", req.userId!, channel.id),
+      channelService.userActivityMuteSupported(channel),
+    ]);
     addTraceEvent("activity_mute.setting.loaded", {
       server_id: req.serverId,
       source_channel_id: channel.id,
@@ -2691,19 +3372,27 @@ channelRouter.get("/:id/notification-settings", async (req, res) => {
       activityMuted: state.activityMuted,
       muteFromSeq: state.muteFromSeq,
       prefsVersion: state.prefsVersion,
-      activityMuteSupported: channelTypeSupportsActivityMute(channel.type),
+      activityMuteSupported,
     });
   } catch {
     res.status(500).json({ error: "Failed to get channel notification settings" });
   }
 });
 
-channelRouter.patch("/:id/notification-settings", async (req, res) => {
+channelRouter.patch("/:id/notification-settings", noteInboxWriteBeforeReply, async (req, res) => {
   try {
     const channel = await resolveActivityMuteTarget(req, res);
     if (!channel) return;
     if (typeof req.body?.activityMuted !== "boolean") {
       res.status(400).json({ error: "activityMuted must be a boolean" });
+      return;
+    }
+    const activityMuteSupported = await channelService.userActivityMuteSupported(channel);
+    // Muting is refused where the person cannot mute (a DM with a person or an
+    // ordinary agent, or a removed bot's DM). Unmuting is always accepted, so a
+    // mute stored before the DM stopped qualifying can still be undone.
+    if (req.body.activityMuted && !activityMuteSupported) {
+      res.status(400).json({ error: "This conversation can't be muted", code: "ACTIVITY_MUTE_NOT_SUPPORTED" });
       return;
     }
     const state = await channelService.setInboxTargetActivityMuteState({
@@ -2723,14 +3412,47 @@ channelRouter.patch("/:id/notification-settings", async (req, res) => {
       negative_evidence_bucket: "does_not_prove_future_message_suppression",
     });
     emitNotificationPrefsUpdated(req, channel.id, state);
+    // How often people mute a conversation (#proj-analytics:#17): every client writes here; only a real change counts.
+    if (state.changed) {
+      void recordServerProductEvent(getProductEventSink(req.app), {
+        event: "conversation_mute_changed",
+        userId: req.userId!,
+        serverId: req.serverId!,
+        properties: { muted: state.activityMuted, kind: channel.type === "dm" ? "dm" : "channel" },
+      });
+    }
     res.json({
       activityMuted: state.activityMuted,
       muteFromSeq: state.muteFromSeq,
       prefsVersion: state.prefsVersion,
-      activityMuteSupported: channelTypeSupportsActivityMute(channel.type),
+      activityMuteSupported,
     });
   } catch {
     res.status(500).json({ error: "Failed to update channel notification settings" });
+  }
+});
+
+/**
+ * Channel announcements: the channel's announcement as this person sees it
+ * (`{ announcement }`: ChannelAnnouncementForPerson, null for none, also
+ * while channel_announcement_v0 is off). What the web's strip reads, without
+ * the whole channel payload: GET /channels (the list) doesn't carry it, and
+ * it changes with a new version, which changes no channel row.
+ */
+channelRouter.get("/:id/announcement", async (req, res) => {
+  try {
+    const viewer = { type: "user" as const, id: req.userId!, serverId: asServerId(req.serverId!) };
+    const channel = await channelService.getChannel(req.params.id as string);
+    // The unified visibility entry (visibilityService canView on the conversation); one 404 for missing and not visible.
+    const [visible] = channel && channel.serverId === req.serverId ? await canView(viewer, [{ kind: "conversation", channelId: channel.id }]) : [false];
+    if (!channel || !visible) {
+      refuse(res, 404, { code: "channel_not_found", error: "Not found, or you don't have access to this channel." });
+      return;
+    }
+    const withAnnouncement = await attachChannelAnnouncement(viewer, channel);
+    res.json({ announcement: withAnnouncement.announcement ?? null });
+  } catch {
+    res.status(500).json({ error: "Failed to read the channel announcement" });
   }
 });
 
@@ -2783,7 +3505,7 @@ channelRouter.get("/conversion-jobs/:jobId", async (req, res) => {
     const [channelWithMetadata] = converted
       ? await channelConversionService.attachLatestChannelConversionJobs(await channelService.attachJointChannelMetadata([{ ...converted, joined: true }]))
       : [];
-    res.json({ channel: channelWithMetadata ?? converted, conversionJob: job });
+    res.json({ channel: channelWithMetadata ?? converted, conversionJob: channelConversionService.conversionJobView(job) });
   } catch (error) {
     sendJsonServerError(req, res, {
       error: "Failed to read conversion progress",
@@ -2847,7 +3569,7 @@ channelRouter.post("/conversion-jobs/:jobId/retry", async (req, res) => {
     const [channelWithMetadata] = refreshed
       ? await channelConversionService.attachLatestChannelConversionJobs(await channelService.attachJointChannelMetadata([{ ...refreshed, joined: true }]))
       : [];
-    res.status(202).json({ channel: channelWithMetadata ?? refreshed, conversionJob: retried });
+    res.status(202).json({ channel: channelWithMetadata ?? refreshed, conversionJob: channelConversionService.conversionJobView(retried) });
   } catch (err: unknown) {
     console.error("[ChannelConversion] command request failed", { path: req.path, jobId: req.params.jobId, error: err });
     if (err instanceof channelConversionService.ChannelConversionError) {
@@ -2881,7 +3603,7 @@ channelRouter.post("/conversion-jobs/:jobId/cancel", async (req, res) => {
     const { converted: restored, channelWithMetadata } = await emitChannelConversionCompletion(
       req.app.get("io") as SocketServer | undefined, canceled.id, canceled.sourceChannelId,
     );
-    res.json({ channel: channelWithMetadata ?? restored, conversionJob: canceled });
+    res.json({ channel: channelWithMetadata ?? restored, conversionJob: channelConversionService.conversionJobView(canceled) });
   } catch (err: unknown) {
     console.error("[ChannelConversion] command request failed", { path: req.path, jobId: req.params.jobId, error: err });
     if (err instanceof channelConversionService.ChannelConversionError) {
@@ -2913,6 +3635,7 @@ channelRouter.get("/:id", async (req, res) => {
       res.status(404).json({ error: "Channel not found" });
       return;
     }
+    addTraceEvent("channels.get.target", channelGetTargetTraceAttrs(channel.type, req.headers[CHANNEL_FETCH_REASON_HEADER]));
     // Include `joined` to align response shape with `/channels` list. Without
     // this, first-paint hydration via `ensureChannel()` (added in PR #1549)
     // treats `joined === undefined` as not-joined and flashes a "Join channel"
@@ -2928,9 +3651,17 @@ channelRouter.get("/:id", async (req, res) => {
     const readableDm = channel.type === "dm"
       ? await channelService.getReadableDMChannelForUser(channel.id, req.userId!)
       : null;
+    // A joint thread's local projection has no parent columns; expose this
+    // server's projection of the parent joint channel and the canonical parent
+    // message, as thread pushes do. No projection leaves them null.
+    const jointThreadParent = channel.type === "thread" && !channel.parentMessageId
+      ? await channelService.resolveThreadParent(channel)
+      : null;
     const channelForResponse = readableDm
       ? { ...channel, ...readableDm, serverId: channel.serverId }
-      : channel;
+      : jointThreadParent
+        ? { ...channel, parentMessageId: jointThreadParent.parentMessageId, parentChannelId: jointThreadParent.parentChannelId }
+        : channel;
     const requesterRole = await getActorServerRoleInServer(req.serverId!, "user", req.userId!);
     const joined = channel.type === "dm"
       ? true
@@ -2939,15 +3670,18 @@ channelRouter.get("/:id", async (req, res) => {
         : channelService.isAllSystemChannel(channel) && requesterRole === "guest"
           ? false
           : await channelService.isChannelHuman(channel.id, req.userId!);
-    const activityMuteSupported = channelTypeSupportsActivityMute(channel.type);
-    const activityMuteState = activityMuteSupported
+    const activityMuteSupported = await channelService.userActivityMuteSupported(channel);
+    // A DM carries its stored mute even when it can no longer be muted (its
+    // App bot was removed), so a mute is always undoable; the client replaces
+    // its DM row with this response.
+    const activityMuteState = activityMuteSupported || channel.type === "dm"
       ? await channelService.getInboxTargetActivityMuteState("user", req.userId!, channel.id)
       : {};
     const messageDisplayPrefs = channel.type !== "thread"
       ? await channelService.getUserChannelMessageDisplayPrefs(req.userId!, channel.id)
-      : { collapseLongMessages: true, prefsVersion: 0 };
+      : { collapseLongMessages: false, prefsVersion: 0 };
     const readState = await channelService.getReadStateSnapshot(req.userId!, channel.id);
-    const peerReadHydrate = channel.type === "channel" || channel.type === "private" || channel.type === "dm"
+    const peerReadHydrate = channel.type === "channel" || channel.type === "private" || channel.type === "joint" || channel.type === "dm" || channel.type === "thread"
       ? await getPeerReadHydrate({
           serverId: req.serverId!,
           channelId: channel.id,
@@ -2955,8 +3689,12 @@ channelRouter.get("/:id", async (req, res) => {
           viewerId: req.userId!,
         })
       : null;
+    const loungeAgentId = channel.type === "channel"
+      ? (await getLoungeAgentIds([channel.id])).get(channel.id) ?? null
+      : null;
     const [channelWithJointMetadata] = await channelService.attachJointChannelMetadata([{
       ...channelForResponse,
+      loungeAgentId,
       joined,
       ...activityMuteState,
       collapseLongMessages: messageDisplayPrefs.collapseLongMessages,
@@ -2964,10 +3702,21 @@ channelRouter.get("/:id", async (req, res) => {
       ...readState,
       ...(peerReadHydrate ?? {}),
       activityMuteSupported,
+      // For the leave confirmation: this person is the joint's last member
+      // from the host, so leaving archives it for every side.
+      ...(channel.type === "joint" && joined ? { leaveArchivesJoint: await isLastJointHostSideMember(channel.id, req.userId!) } : {}),
     }]);
     const [channelWithMetadata] = await channelService.attachExternalBridgeMetadata([channelWithJointMetadata]);
     const [channelWithConversionJob] = await channelConversionService.attachLatestChannelConversionJobs([channelWithMetadata]);
-    res.json(await attachHumanChannelAuthorization(channelWithConversionJob, req.serverId!, req.userId!));
+    // Same rule as the list row (a Guest gets it on its own channel only).
+    const [channelWithExternalRelation] = await channelService.attachExternalRelations(
+      [channelWithConversionJob!],
+      await resolveExternalRelationViewer(req.serverId!, req.userId!, requesterRole),
+    );
+    const [withLevel] = await withNotificationLevels(req.userId!, [channelWithExternalRelation!]);
+    // Channel announcements: `announcement` (an Artifact homed here, null for none) only while channel_announcement_v0 is on.
+    const withAnnouncement = await attachChannelAnnouncement({ type: "user", id: req.userId!, serverId: asServerId(req.serverId!) }, withLevel!);
+    res.json(withVisitorVisible(await attachHumanChannelAuthorization(withAnnouncement, req.serverId!, req.userId!)));
   } catch {
     res.status(500).json({ error: "Failed to get channel" });
   }
@@ -2989,46 +3738,37 @@ channelRouter.post("/:id/archive", async (req, res) => {
       res.status(404).json({ error: "Channel not found" });
       return;
     }
-    const canArchive = channel.type === "channel" || channel.type === "private"
-      ? await actorHasChannelCapability(req.serverId!, channel.id, "user", req.userId!, "archiveChannels")
-      : await actorHasServerCapabilityInServer(req.serverId!, "user", req.userId!, "archiveChannels");
+    const canArchive = await actorHasChannelCapability(req.serverId!, channel.id, "user", req.userId!, "archiveChannels");
     if (!canArchive) {
       res.status(403).json({ error: "Only admins can archive channels" });
       return;
     }
 
     const wasArchived = !!channel.archivedAt;
-    const updated = channel.type === "joint"
-      ? await channelService.archiveChannel(req.params.id, req.userId!)
-      : await withLockedChannelActorCapability({
+    // Archiving ends its Guests' server membership in the same commit; their
+    // sockets, notifications and credentials are finished after it.
+    const endedGuests: channelService.EndedChannelGuest[] = [];
+    const updated = await withLockedChannelActorCapability({
           serverId: req.serverId!,
           channelId: channel.id,
           actorType: "user",
           actorId: req.userId!,
           capability: "archiveChannels",
-        }, (tx) => channelService.archiveChannel(req.params.id, req.userId!, tx));
-
-    const io = req.app.get("io");
-    if (updated.type === "joint") {
-      await emitJointProjectionUpdates(io, updated.id);
-    } else {
-      await publishChannelUpdate(io, updated);
-    }
-
+          // The Guests the archive removes: their users rows first, with the archiver's.
+          guessUserIds: () => channelService.archiveBoundGuestIds(channel.id),
+        }, (tx, _context, lockedUserIds) => {
+          endedGuests.length = 0; // A restarted attempt starts over.
+          return channelService.archiveChannel(req.params.id, req.userId!, tx, { endedGuests, lockedUserIds });
+        });
+    let systemMessage: { content: string; causalActor: { type: "user"; id: string } } | undefined;
     if (!wasArchived) {
       const user = await userService.getUser(req.userId!);
       const userName = user?.displayName || user?.name || "Someone";
-      const agentOrchestrator = req.app.get("agentOrchestrator") as AgentOrchestrator;
-      messageService.broadcastSystemMessage(io, agentOrchestrator, req.params.id,
-        `📦 ${userName} archived this channel`, {
-          inboxFactPolicy: {
-            mode: "record",
-            producer: "channel.archive",
-            reason: "channel archive is shared channel activity",
-            causalActor: { type: "user", id: req.userId! },
-          },
-        }).catch(() => {});
+      systemMessage = { content: `📦 ${userName} archived this channel`, causalActor: { type: "user", id: req.userId! } };
     }
+    // After commit: the ended Guests, their sockets, every projection's update
+    // and the system message (shared with the joint host-side archive).
+    await finishChannelArchive(req.app.get("io"), req.app.get("agentOrchestrator") as AgentOrchestrator, updated, { endedGuests, systemMessage });
 
     res.json(updated);
   } catch (err: any) {
@@ -3057,28 +3797,55 @@ channelRouter.post("/:id/unarchive", async (req, res) => {
       res.status(400).json({ error: "Only regular channels can be unarchived" });
       return;
     }
-    if (!await canSeeChannel(channel, req.userId!, req.serverId!)) {
+    // A host owner/admin may bring back the host's archived joint copy when
+    // nobody from the host is left in it (channelActorHasCapability); the
+    // unarchive rejoins them. Anyone else gets today's refusal.
+    if (!await canSeeChannel(channel, req.userId!, req.serverId!)
+      && !(channel.type === "joint" && await actorHasChannelCapability(req.serverId!, channel.id, "user", req.userId!, "archiveChannels"))) {
       res.status(404).json({ error: "Channel not found" });
       return;
     }
-    const canUnarchive = channel.type === "channel" || channel.type === "private"
-      ? await actorHasChannelCapability(req.serverId!, channel.id, "user", req.userId!, "archiveChannels")
-      : await actorHasServerCapabilityInServer(req.serverId!, "user", req.userId!, "archiveChannels");
+    const canUnarchive = await actorHasChannelCapability(req.serverId!, channel.id, "user", req.userId!, "archiveChannels");
     if (!canUnarchive) {
       res.status(403).json({ error: "Only admins can unarchive channels" });
       return;
     }
 
     const wasArchived = !!channel.archivedAt;
-    const updated = channel.type === "joint"
-      ? await channelService.unarchiveChannel(req.params.id)
-      : await withLockedChannelActorCapability({
+    let rejoined = false;
+    const updated = await withLockedChannelActorCapability({
           serverId: req.serverId!,
           channelId: channel.id,
           actorType: "user",
           actorId: req.userId!,
           capability: "archiveChannels",
-        }, (tx) => channelService.unarchiveChannel(req.params.id, tx));
+          // The free plan's external channel rule is checked under them (ADMISSION_LOCK_ORDER).
+          admissionServerIds: wasArchived ? await channelService.unarchiveAdmissionServerIds(channel.id) : [],
+        }, async (tx, context) => {
+          const unarchived = await channelService.unarchiveChannel(req.params.id, tx);
+          // The host admin outside it (its host side was empty) rejoins in the
+          // same commit, admitted by themself through the host: the host side
+          // is no longer empty and they see the channel at once.
+          if (context.jointAuthority && !context.canAccessChannel) {
+            // Only with them on the host side again. A removal of theirs still
+            // pending (an old membership not yet cleaned up) keeps them off it
+            // and would end it after this commit (addHuman then either refuses
+            // or finds the old row): refuse, and roll back the unarchive.
+            const cleanupPending = new RefusalError(409, {
+              code: "joint_cleanup_pending",
+              error: "This channel is still finishing removing a member. Try again in a moment.",
+              retryAfterSeconds: 5,
+            });
+            try {
+              rejoined = await channelService.addHuman(channel.id, req.userId!, { executor: tx, actorUserId: req.userId!, jointChannelLock: "no key update" });
+            } catch (error) {
+              if (error instanceof Error && error.message === "Joint membership cleanup in progress") throw cleanupPending;
+              throw error;
+            }
+            if (!rejoined || !await isJointHostSideMember(channel.id, req.userId!, tx)) throw cleanupPending;
+          }
+          return unarchived;
+        });
 
     const io = req.app.get("io");
     if (updated.type === "joint") {
@@ -3086,6 +3853,7 @@ channelRouter.post("/:id/unarchive", async (req, res) => {
     } else {
       await publishChannelUpdate(io, updated);
     }
+    if (rejoined) emitChannelMembersUpdated(io, req.serverId!, updated, req.userId!);
 
     if (wasArchived) {
       const user = await userService.getUser(req.userId!);
@@ -3104,6 +3872,12 @@ channelRouter.post("/:id/unarchive", async (req, res) => {
 
     res.json(updated);
   } catch (err: any) {
+    if (err instanceof RefusalError) {
+      refuse(res, err.status, err.refusal);
+      return;
+    }
+    // Unarchiving would put a free server in a second external channel.
+    if (sendExternalLimitError(res, err, req)) return;
     const msg = err?.message || "";
     if (msg === "Channel capability required") {
       res.status(403).json({ error: "Only admins can unarchive channels" });
@@ -3140,11 +3914,14 @@ channelRouter.delete("/:id", async (req, res) => {
         return;
       }
     }
-    await channelService.deleteChannel(req.params.id);
+    await channelService.deleteChannel(req.params.id, { deletedByUserId: req.userId! });
     res.json({ ok: true });
   } catch (err: any) {
     const msg = err?.message || "";
-    if (msg.includes("cannot be deleted")) {
+    // The deleter's account retired or being deleted meanwhile (deleteChannel): as one who may not delete it.
+    if (err instanceof JointActorUnavailableError) {
+      res.status(403).json({ error: "Only admins can delete channels" });
+    } else if (msg.includes("cannot be deleted")) {
       res.status(403).json({ error: msg });
     } else {
       res.status(500).json({ error: "Failed to delete channel" });
@@ -3163,11 +3940,14 @@ channelRouter.post("/:id/disconnect", async (req, res) => {
       res.status(400).json({ error: "Only joint channels can be disconnected" });
       return;
     }
-    if (!await canSeeChannel(channel, req.userId!, req.serverId!)) {
-      res.status(404).json({ error: "Channel not found" });
-      return;
-    }
+    // The server capability is checked here; disconnectJointChannel also requires the admin to be able to open the
+    // channel. A non-host copy whose last member left is disconnected
+    // automatically (jointHumanMembershipMirror), so none is stranded.
     if (!(await actorHasServerCapabilityInServer(req.serverId!, "user", req.userId!, "federateChannels"))) {
+      if (!await canSeeChannel(channel, req.userId!, req.serverId!)) {
+        res.status(404).json({ error: "Channel not found" });
+        return;
+      }
       res.status(403).json({ error: "Only admins can disconnect joint channels" });
       return;
     }
@@ -3176,9 +3956,12 @@ channelRouter.post("/:id/disconnect", async (req, res) => {
     // resolves, and the remaining participants still need the update (their
     // server list changed, and the joint may be back within its limit).
     const parentJointId = await resolveGatingParentJointId(getDb(), req.params.id, req.serverId!);
-    await channelService.disconnectJointChannel(req.params.id, req.userId!);
+    const { canonicalChannelId } = await channelService.disconnectJointChannel(req.params.id, req.userId!);
     const io = req.app.get("io");
     io?.to(`server:${req.serverId}`).emit("channel:updated", { channelId: req.params.id });
+    await broadcastJointDisconnectSystemMessage(req, canonicalChannelId, req.serverId!, req.userId!).catch((err: unknown) => {
+      console.error("joint disconnect: failed to post the system message:", err);
+    });
     if (parentJointId) {
       await emitJointLimitStateChange(io, parentJointId).catch((err: unknown) => {
         console.error("joint disconnect: failed to notify remaining participants:", err);
@@ -3187,7 +3970,11 @@ channelRouter.post("/:id/disconnect", async (req, res) => {
     res.json({ ok: true });
   } catch (err: any) {
     const msg = err?.message || "";
-    if (msg === "Joint channel not found" || msg === "Channel not found") {
+    if (err instanceof channelService.JointHostDisconnectError) {
+      res.status(403).json({ error: err.message, code: err.code });
+    } else if (err instanceof channelService.JointGuestsPresentError) {
+      refuse(res, 409, { code: err.code, error: err.message });
+    } else if (msg === "Joint channel not found" || msg === "Channel not found") {
       res.status(404).json({ error: "Channel not found" });
     } else if (msg.includes("Only joint")) {
       res.status(400).json({ error: msg });
@@ -3197,8 +3984,193 @@ channelRouter.post("/:id/disconnect", async (req, res) => {
   }
 });
 
+/** The 404 every channel route here answers for a channel that is missing or
+ * hidden from the caller: byte-identical, so the two can't be told apart. */
+function channelNotFound(res: Response) {
+  // refusal-ok: must stay byte-identical to this router's other "Channel not found" 404s (no existence oracle)
+  res.status(404).json({ error: "Channel not found" });
+}
+
+/**
+ * The host's owner/admin disconnects a participant server from a joint channel
+ * (external_channels_v1 on for the host; off, the route answers as an
+ * unknown channel). `:id` is the host's copy; `:serverId` the participant.
+ * A server disconnecting itself stays POST /:id/disconnect.
+ */
+channelRouter.post("/:id/joint-servers/:serverId/disconnect", async (req, res) => {
+  try {
+    const channel = await channelService.getChannel(req.params.id);
+    if (!channel || channel.serverId !== req.serverId || !await canSeeChannel(channel, req.userId!, req.serverId!)) {
+      channelNotFound(res);
+      return;
+    }
+    if (!(await evaluateFeatureFlag({ key: EXTERNAL_CHANNELS_FEATURE_FLAG_KEY, serverId: req.serverId!, userId: req.userId! })).enabled) {
+      channelNotFound(res);
+      return;
+    }
+    if (channel.type !== "joint") {
+      refuse(res, 400, { code: "not_joint_host", error: new channelService.JointNotHostError().message });
+      return;
+    }
+    if (!(await actorHasServerCapabilityInServer(req.serverId!, "user", req.userId!, "federateChannels"))) {
+      refuse(res, 403, { code: "forbidden", error: "Only admins of the host server can disconnect another server." });
+      return;
+    }
+    const targetServerId = req.params.serverId;
+    if (!ANY_UUID_RE.test(targetServerId)) {
+      const notConnected = new channelService.JointServerNotConnectedError();
+      refuse(res, 404, { code: notConnected.code, error: notConnected.message });
+      return;
+    }
+    if (targetServerId === req.serverId) {
+      refuse(res, 400, { code: "host_cannot_be_disconnected", error: "The host server can't disconnect from its own channel. Archive the channel instead." });
+      return;
+    }
+
+    const result = await channelService.disconnectParticipantServerByHost(req.params.id, targetServerId, req.userId!);
+    const io = req.app.get("io");
+    // Both sides refresh: the participant's copy is gone, the host's server list changed.
+    io?.to(`server:${targetServerId}`).emit("channel:updated", { channelId: result.targetChannelId });
+    io?.to(`server:${req.serverId}`).emit("channel:updated", { channelId: req.params.id });
+    await broadcastJointDisconnectSystemMessage(req, result.canonicalChannelId, targetServerId, req.userId!, req.serverId!).catch((err: unknown) => {
+      console.error("joint host disconnect: failed to post the system message:", err);
+    });
+    await emitJointLimitStateChange(io, result.jointChannelId).catch((err: unknown) => {
+      console.error("joint host disconnect: failed to notify remaining participants:", err);
+    });
+    res.json({ ok: true });
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : "";
+    if (err instanceof channelService.JointNotHostError || err instanceof channelService.JointServerNotConnectedError
+      || err instanceof channelService.JointGuestsPresentError) {
+      const status = err instanceof channelService.JointNotHostError ? 400 : err instanceof channelService.JointServerNotConnectedError ? 404 : 409;
+      refuse(res, status, { code: err.code, error: err.message });
+    } else if (msg === "Channel capability required") {
+      refuse(res, 403, { code: "forbidden", error: "Only admins of the host server can disconnect another server." });
+    } else if (msg === "Channel not found") {
+      channelNotFound(res);
+    } else {
+      sendJsonServerError(req, res, {
+        error: "Couldn't disconnect the server. Try again.",
+        logPrefix: "joint host disconnect failed:",
+        err,
+      });
+    }
+  }
+});
+
+/**
+ * A channel member connects servers they own or administer to the channel,
+ * no host approval (jointMemberConnectService; design v3). `:id` is the
+ * caller's own server's copy; the host's copy is resolved from it. The host's
+ * external_channels_v1 decides first: off, and for anyone not a member, the
+ * same 404 as an unknown
+ * channel. A public channel: channel_not_invitable. Each chosen server is
+ * answered on its own, as Your servers answers (connected, connecting while a
+ * private channel is converted, or refused with why).
+ */
+/**
+ * Connect your servers, on opening (design v3 F): the caller's servers that
+ * could connect to the channel (they own or administer it, not yet in it),
+ * each with its own Free external-channel limit (`atLimit`), whether the
+ * caller may upgrade it (`canUpgrade`: manageBilling, an owner) and its
+ * owners for "Ask an owner". The same gates and the same 404 as the POST.
+ */
+channelRouter.get("/:id/connect-my-servers", async (req, res) => {
+  try {
+    const channel = await channelService.getChannel(req.params.id);
+    if (!channel || channel.serverId !== req.serverId || !await canSeeChannel(channel, req.userId!, req.serverId!)) {
+      channelNotFound(res);
+      return;
+    }
+    const hostServerId = await jointMemberConnectService.memberConnectHostServerId(channel);
+    if (!hostServerId || !await jointMemberConnectService.memberConnectEnabled(hostServerId, req.userId!)) {
+      channelNotFound(res);
+      return;
+    }
+    const entry = await jointMemberConnectService.resolveMemberConnectEntry(channel, req.userId!);
+    if (!entry) {
+      channelNotFound(res);
+      return;
+    }
+    res.json({ servers: await jointMemberConnectService.listMemberConnectableServers(entry, req.userId!) });
+  } catch (err) {
+    if (err instanceof jointMemberConnectService.MemberConnectRefusal) {
+      refuse(res, err.status, { code: err.code, error: err.message });
+    } else {
+      sendJsonServerError(req, res, {
+        error: "Failed to list your servers to connect",
+        code: "internal_server_error",
+        logPrefix: "[Channels] Failed to list a member's servers to connect",
+        err,
+      });
+    }
+  }
+});
+
+channelRouter.post("/:id/connect-my-servers", async (req, res) => {
+  const serverIds = (req.body as { serverIds?: unknown } | null)?.serverIds;
+  // Set once the attempt is made (the 404s before it are not attempts): the host whose switch and plan the rows take.
+  let attemptHost: string | null = null;
+  try {
+    const channel = await channelService.getChannel(req.params.id);
+    if (!channel || channel.serverId !== req.serverId || !await canSeeChannel(channel, req.userId!, req.serverId!)) {
+      channelNotFound(res);
+      return;
+    }
+    const hostServerId = await jointMemberConnectService.memberConnectHostServerId(channel);
+    if (!hostServerId || !await jointMemberConnectService.memberConnectEnabled(hostServerId, req.userId!)) {
+      channelNotFound(res);
+      return;
+    }
+    const entry = await jointMemberConnectService.resolveMemberConnectEntry(channel, req.userId!);
+    if (!entry) {
+      channelNotFound(res);
+      return;
+    }
+    // From here on the attempt is made: each way it ends is a row (the 404s above are not attempts).
+    attemptHost = entry.hostChannel.serverId;
+    const result = await jointMemberConnectService.connectMyServersToChannel(entry, req.userId!, serverIds, {
+      revalidateExternalPrivacy: req.app.get("slackBridgePrivacyRevalidator"),
+    });
+    await publishExternalConnections(req, result.connections);
+    if (result.servers.some((server) => server.state !== "refused")) emitExternalRelationChanged(req, entry.hostChannel.id);
+    noteServerConnectPaywallHits(req, result.servers);
+    res.json({ servers: result.servers.map(serializeServerConnectOutcome) });
+    recordServerConnectOutcomes(req, res, {
+      path: "self_connect", outcomes: result.servers, multi: choseSeveral(serverIds), server: req.serverId!, host: { hostServerId: entry.hostChannel.serverId },
+    });
+  } catch (err) {
+    // The not_found answered as the channel-not-found 404 is not an attempt either.
+    const answeredNotFound = err instanceof externalInviteService.ExternalInviteError && err.code === "not_found";
+    if (attemptHost !== null && !answeredNotFound) {
+      const outcome: ConnectFinishedOutcome = err instanceof jointMemberConnectService.MemberConnectRefusal || err instanceof externalInviteService.ExternalInviteError
+        ? refusedOutcome(err.code)
+        : err instanceof externalInviteConnectService.ExternalConnectError && err.code === "invalid_server" ? refusedOutcome("invalid_input") : { result: "error" };
+      recordConnectFinished(req, [{ path: "self_connect", outcome, multi: choseSeveral(serverIds), server: req.serverId!, host: { hostServerId: attemptHost } }]);
+    }
+    if (err instanceof jointMemberConnectService.MemberConnectRefusal) {
+      refuse(res, err.status, { code: err.code, error: err.message });
+    } else if (err instanceof externalInviteConnectService.ExternalConnectError && err.code === "invalid_server") {
+      refuse(res, 400, { code: "invalid_input", error: "serverIds must be a list of 1 to 29 servers" });
+    } else if (err instanceof externalInviteService.ExternalInviteError && err.code === "not_found") {
+      channelNotFound(res);
+    } else if (err instanceof externalInviteService.ExternalInviteError) {
+      refuse(res, 409, { code: err.code, error: err.message });
+    } else {
+      sendJsonServerError(req, res, {
+        error: "Failed to connect your servers",
+        code: "internal_server_error",
+        logPrefix: "[Channels] Failed to connect a member's servers",
+        err,
+      });
+    }
+  }
+});
+
 channelRouter.post("/:id/joint-invite/resend", async (req, res) => {
   try {
+    if (await refuseRetiredJointEntryWithExternalChannels(req, res, "joint_server_invite_retired")) return;
     const channel = await channelService.getChannel(req.params.id);
     if (!channel || channel.serverId !== req.serverId) {
       res.status(404).json({ error: "Channel not found" });
@@ -3217,15 +4189,28 @@ channelRouter.post("/:id/joint-invite/resend", async (req, res) => {
       return;
     }
 
+    // A resend re-emails every pending invitee: it spends the same hourly
+    // budget of invited people as the invites themselves (jointInviteRateLimit).
     const result = await channelService.resendPendingJointChannelInvites({
       localChannelId: req.params.id,
       fromServerId: req.serverId!,
       requestedByUserId: req.userId!,
+      admitResend: async (people) => {
+        const admission = await admitJointInvite(req.userId!, people);
+        if (admission.admitted) return;
+        throw new RefusalError(429, {
+          code: "joint_invite_rate_limited",
+          error: "Too many joint channel invites. Try again later.",
+          retryAfterSeconds: admission.retryAfterSeconds,
+        });
+      },
     });
     res.json(result);
   } catch (err: any) {
     const msg = err?.message || "";
-    if (msg === "Joint channel not found" || msg === "Channel not found") {
+    if (err instanceof RefusalError) {
+      refuse(res, err.status, err.refusal);
+    } else if (msg === "Joint channel not found" || msg === "Channel not found") {
       res.status(404).json({ error: "Channel not found" });
     } else if (msg.includes("No pending")) {
       res.status(409).json({ error: msg });
@@ -3237,170 +4222,16 @@ channelRouter.post("/:id/joint-invite/resend", async (req, res) => {
   }
 });
 
-channelRouter.post("/:id/convert-to-joint", async (req, res) => {
-  let failedPreJobPhase: channelConversionService.ChannelConversionPreJobPhase | null = null;
-  try {
-    if (!await requireChannelConversionEnabled(req, res)) return;
-    const channel = await channelService.getChannel(req.params.id);
-    if (!channel || channel.serverId !== req.serverId) {
-      res.status(404).json({ error: "Channel not found" });
-      return;
-    }
-    if (!await canSeeChannel(channel, req.userId!, req.serverId!)) {
-      res.status(404).json({ error: "Channel not found" });
-      return;
-    }
-    if (!(await actorHasServerCapabilityInServer(req.serverId!, "user", req.userId!, "federateChannels"))) {
-      res.status(403).json({ error: "Only admins can convert channels to joint channels" });
-      return;
-    }
-
-    const tracePreJobPhase = ({ phase, outcome, errorClass, eligibilitySubcheck }: Parameters<channelConversionService.ChannelConversionPreJobTrace>[0]) => {
-      if (outcome === "failed") failedPreJobPhase = phase;
-      addTraceEvent("server.channel_conversion.pre_job", {
-        event_kind: "channel_conversion", channel_id: req.params.id, phase, outcome,
-        ...(eligibilitySubcheck ? { eligibility_subcheck: eligibilitySubcheck } : {}),
-        ...(errorClass ? { error_class: errorClass } : {}),
-      });
-    };
-    // Reject an already-running upload before publishing a conversion command.
-    // The start service repeats the same check after its source fence to cover
-    // a transfer that races this read-only admission preflight.
-    await channelConversionService.assertNoActiveAttachmentTransfersBeforeAdmission({
-      serverId: req.serverId!,
-      sourceChannelId: req.params.id,
-    });
-    const admittedCommand = await admitConversionCommand({
-      id: conversionCommandId(req.body?.commandId), serverId: req.serverId!, sourceChannelId: req.params.id,
-      requestedByUserId: req.userId!, kind: "start",
-    });
-    if (req.body?.observeProgress === true || req.query.observeProgress === "true") {
-      await emitChannelConversionState(req.app.get("io") as SocketServer | undefined, req.params.id);
-      void executeConversionCommand(admittedCommand.id, true, tracePreJobPhase, req.app.get("slackBridgePrivacyRevalidator")).then(async (settled) => {
-        if (!settled?.jobId) return;
-        const tracer = (req.app.get("serverTracer") as Tracer | undefined) ?? noopTracer;
-        const completed = await channelConversionService.runChannelConversionJob(settled.jobId, {
-          io: req.app.get("io") as SocketServer | undefined, tracer,
-        });
-        if (completed.status === "done" || completed.status === "canceled" || completed.status === "failed") {
-          await emitChannelConversionCompletion(req.app.get("io") as SocketServer | undefined, completed.id, completed.sourceChannelId);
-        }
-      }).catch((error: unknown) => console.error("[ChannelConversion] admitted start failed", { channelId: req.params.id, error }))
-        .finally(() => emitChannelConversionState(req.app.get("io") as SocketServer | undefined, req.params.id))
-        .catch((error: unknown) => console.error("[ChannelConversion] state broadcast failed", { channelId: req.params.id, error }));
-      res.status(202).json({ conversionCommand: admittedCommand, conversionJob: null,
-        conversionState: projectConversionState(channelConversionService.conversionCommandView(admittedCommand), null) });
-      return;
-    }
-    const command = await executeConversionCommand(admittedCommand.id, true, tracePreJobPhase, req.app.get("slackBridgePrivacyRevalidator"));
-    if (command?.status !== "completed" || !command.jobId) {
-      throw new channelConversionService.ChannelConversionError(command?.error ?? "Conversion command is still pending", command?.errorCode ?? "conversion_command_pending");
-    }
-    const job = await channelConversionService.getChannelConversionJob(command.jobId);
-    if (!job) throw new channelConversionService.ChannelConversionError("Conversion job not found", "job_not_found");
-    await emitChannelConversionCardUpdates(req.app.get("io") as SocketServer | undefined, job.id);
-    const tracer = (req.app.get("serverTracer") as Tracer | undefined) ?? noopTracer;
-    const rootAttrs = {
-      event_kind: "channel_conversion",
-      job_id: job.id,
-      channel_id: job.sourceChannelId,
-      phase: job.phase,
-      outcome: "ok",
-    };
-    const jobSpan = startChannelConversionJobSpan(tracer, rootAttrs);
-    // Observable requests returned immediately after durable command admission
-    // above. Only synchronous callers reach this job execution path.
-    let completedJob;
-    try {
-      completedJob = await channelConversionService.runChannelConversionJob(job.id, {
-        io: req.app.get("io") as SocketServer | undefined,
-        tracer,
-        traceParent: jobSpan.context,
-      });
-    } finally {
-      const currentJob = await channelConversionService.getChannelConversionJob(job.id);
-      jobSpan.end(currentJob?.status === "failed" ? "error" : "ok", {
-        attrs: {
-          event_kind: "channel_conversion",
-          job_id: currentJob?.id ?? job.id,
-          channel_id: currentJob?.sourceChannelId ?? job.sourceChannelId,
-          phase: currentJob?.phase ?? job.phase,
-          outcome: currentJob?.status === "failed" ? "failed" : "ok",
-        },
-      });
-    }
-    const { converted, channelWithMetadata } = await emitChannelConversionCompletion(
-      req.app.get("io") as SocketServer | undefined,
-      completedJob.id,
-      req.params.id,
-    );
-
-    if (completedJob.status === "failed") {
-      const progress = completedJob.progress && typeof completedJob.progress === "object" && !Array.isArray(completedJob.progress)
-        ? completedJob.progress as Record<string, unknown>
-        : {};
-      const retainedErrorCode = typeof progress.errorCode === "string" ? progress.errorCode : null;
-      if (retainedErrorCode === "channel_conversion_uploads_in_flight") {
-        res.status(409).json({
-          error: completedJob.error ?? "Attachment uploads are still in flight",
-          code: retainedErrorCode,
-          uploadScope: progress.uploadScope ?? null,
-          uploadCount: typeof progress.uploadCount === "number" ? progress.uploadCount : null,
-          conversionJob: completedJob,
-        });
-        return;
-      }
-      const awaitingRetry = progress.retryState === "awaiting_retry";
-      res.status(409).json({
-        error: completedJob.error ?? "Channel conversion failed",
-        code: awaitingRetry ? "channel_conversion_awaiting_retry" : "channel_conversion_failed",
-        conversionJob: completedJob,
-      });
-      return;
-    }
-    res.json({ channel: channelWithMetadata ?? converted, conversionJob: completedJob });
-  } catch (err: unknown) {
-    console.error("[ChannelConversion] start request failed", { channelId: req.params.id, phase: failedPreJobPhase, error: err });
-    if (err instanceof channelConversionService.ChannelConversionUploadsInFlightError) {
-      res.status(409).json({
-        error: err.message,
-        code: err.code,
-        uploadScope: err.uploadScope,
-        uploadCount: err.uploadCount,
-      });
-      return;
-    }
-    if (err instanceof ChannelConversionFenceConflictError) {
-      res.status(409).json({ error: err.message, code: err.code });
-      return;
-    }
-    if (err instanceof channelConversionService.ChannelConversionError) {
-      if (err.code === "channel_not_found") {
-        res.status(404).json({ error: err.message, code: err.code });
-      } else if (err.code === "reserved_channel" || err.code === "unsupported_channel_type") {
-        res.status(400).json({ error: err.message, code: err.code });
-      } else if (err.code === "job_not_found") {
-        res.status(404).json({ error: err.message, code: err.code });
-      } else {
-        res.status(409).json({ error: err.message, code: err.code });
-      }
-      return;
-    }
-    if (failedPreJobPhase) {
-      const failure = channelConversionService.describeChannelConversionPreJobFailure(failedPreJobPhase, err);
-      res.status(failure.status).json(failure);
-      return;
-    }
-    sendJsonServerError(req, res, {
-      error: "Failed to convert channel to joint channel",
-      logPrefix: "[ChannelConversion] start request failed",
-      err,
-    });
-  }
+channelRouter.post("/:id/convert-to-joint", (_req, res) => {
+  // Retired on every Server (#wg-rbac:#50; cindyz: the old conversion entry
+  // should not exist): a channel becomes joint only by inviting people outside
+  // the Server, which external_channels_v1 allows. Before any lookup.
+  refuseRetiredJointEntry(res, "joint_conversion_retired");
 });
 
 channelRouter.post("/:id/joint-invites", async (req, res) => {
   try {
+    if (await refuseRetiredJointEntryWithExternalChannels(req, res, "joint_server_invite_retired")) return;
     const { targetServerSlug, invitedPeople, sameAdmin } = req.body || {};
     if (typeof targetServerSlug !== "string" || !targetServerSlug.trim()) {
       res.status(400).json({ error: "Invite server slug is required" });
@@ -3411,6 +4242,7 @@ channelRouter.post("/:id/joint-invites", async (req, res) => {
       res.status(400).json({ error: "At least one invited person is required" });
       return;
     }
+    if (!await admitJointInviteOrRefuse(req, res, selectedInvitedPeople.length)) return;
 
     const channel = await channelService.getChannel(req.params.id);
     if (!channel || channel.serverId !== req.serverId) {
@@ -3445,7 +4277,12 @@ channelRouter.post("/:id/joint-invites", async (req, res) => {
     res.json({ ...channelWithMetadata, jointInvites: result.invites, jointInvite: result.invites[0] ?? null });
   } catch (err: any) {
     if (sendJointInviteValidationError(res, err)) return;
-    if (sendJointLimitError(res, err)) return;
+    if (sendJointLimitError(res, err, req)) return;
+    // The inviter's account retired or being deleted meanwhile (inviteServerToJointChannel): as one who may not federate.
+    if (err instanceof JointActorUnavailableError) {
+      res.status(403).json({ error: "Only admins can invite servers to joint channels" });
+      return;
+    }
     const msg = err?.message || "";
     if (msg === "Joint channel not found" || msg === "Channel not found") {
       res.status(404).json({ error: msg === "Joint channel not found" ? "Channel not found" : msg });
@@ -3457,6 +4294,277 @@ channelRouter.post("/:id/joint-invites", async (req, res) => {
         err,
       });
     }
+  }
+});
+
+// ── External channel invites (#wg-rbac:#16, P2a-1) ──
+// A host Server's owner or admin invites people outside the Server to a
+// channel by email. Starting something new (preview, send, resend) is 404
+// while external_channels_v1 is off for the host Server (the channel's, which
+// must be the request's Server); listing and revoking open invites are not
+// gated, so turning the flag off never strands one (plan §2a).
+
+const EXTERNAL_INVITE_ERROR_STATUS: Record<externalInviteService.ExternalInviteErrorCode, number> = {
+  not_found: 404,
+  forbidden: 403,
+  channel_membership_required: 403,
+  invalid_input: 400,
+  channel_not_invitable: 400,
+  make_private_required: 400,
+  channel_archived: 409,
+  invite_not_pending: 409,
+  connecting: 409,
+  daily_cap: 429,
+  invite_open: 409,
+};
+
+/**
+ * The flag (unless `ungated`: list and revoke), then the channel in this
+ * Server that the caller can see; answers 404 itself and returns false
+ * otherwise. Who may act (host owner/admin) is the service's check either way.
+ */
+async function admitExternalInviteRequest(req: Request, res: Response, opts: { ungated?: true } = {}): Promise<boolean> {
+  if (!opts.ungated) {
+    const flag = await evaluateFeatureFlag({ key: EXTERNAL_CHANNELS_FEATURE_FLAG_KEY, serverId: req.serverId!, userId: req.userId! });
+    if (!flag.enabled) {
+      res.status(404).json({ error: "Not found" });
+      return false;
+    }
+  }
+  const channel = await channelService.getChannel(String(req.params.id));
+  if (!channel || channel.serverId !== req.serverId || !await canSeeChannel(channel, req.userId!, req.serverId!)) {
+    res.status(404).json({ error: "Channel not found" });
+    return false;
+  }
+  return true;
+}
+
+/** `emails`: 1 to 20 strings, one address each (the client splits pasted text). */
+function parseExternalInviteEmails(body: unknown): string[] | null {
+  const emails = (body as { emails?: unknown } | null)?.emails;
+  if (!Array.isArray(emails) || emails.length === 0 || emails.length > externalInviteService.EXTERNAL_INVITE_MAX_ENTRIES) return null;
+  return emails.every((email): email is string => typeof email === "string") ? emails : null;
+}
+
+function sendExternalInviteError(req: Request, res: Response, err: unknown, action: string): void {
+  if (err instanceof externalInviteService.ExternalInviteError) {
+    setRequestTraceErrorCode(res, err.code);
+    res.status(EXTERNAL_INVITE_ERROR_STATUS[err.code]).json({ error: err.message, code: err.code });
+    return;
+  }
+  // The send-time limits (free plan, slots): the host's own, as the accept's body names them.
+  if (sendExternalLimitError(res, err, req)) return;
+  sendJsonServerError(req, res, {
+    error: `Failed to ${action}`,
+    code: "internal_server_error",
+    logPrefix: `[Channels] Failed to ${action}`,
+    err,
+  });
+}
+
+/**
+ * `hasExternalRelation` may have changed: an id-only `channel:updated` makes
+ * each client in the channel re-read its own row (GET /channels/:id), so the
+ * field reaches only the viewers it is for (a broadcast row cannot carry it).
+ */
+function emitExternalRelationChanged(req: Request, channelId: string): void {
+  (req.app.get("io") as SocketServer | undefined)?.to(`channel:${channelId}`).emit("channel:updated", { channelId });
+}
+
+const INVALID_EXTERNAL_INVITE_EMAILS = {
+  error: `emails must be a list of 1 to ${externalInviteService.EXTERNAL_INVITE_MAX_ENTRIES} email addresses`,
+  code: "invalid_input",
+};
+
+// The review before Create Channel's External creates the channel (design
+// E1): the same preview, for the request's Server, with no channel yet.
+channelRouter.post("/external-invites/preview", async (req, res) => {
+  try {
+    const flag = await evaluateFeatureFlag({ key: EXTERNAL_CHANNELS_FEATURE_FLAG_KEY, serverId: req.serverId!, userId: req.userId! });
+    if (!flag.enabled) {
+      res.status(404).json({ error: "Not found" });
+      return;
+    }
+    const emails = parseExternalInviteEmails(req.body);
+    if (!emails) {
+      res.status(400).json(INVALID_EXTERNAL_INVITE_EMAILS);
+      return;
+    }
+    res.json(await externalInviteService.previewExternalInvitesForNewChannel(req.serverId!, req.userId!, emails));
+  } catch (err) {
+    sendExternalInviteError(req, res, err, "preview external invites");
+  }
+});
+
+/**
+ * Members of the host Server among a send's addresses join the channel
+ * (design A2 "will be added"), as the inviter adding them with Add Member
+ * would: the addChannelMembers capability, the membership notice and the
+ * same events. One that can't be added stays in `skipped.alreadyMembers`; the
+ * invites are sent either way. Returns the addresses added.
+ */
+async function addInvitedServerMembers(
+  req: Request,
+  channelId: string,
+  members: ReadonlyArray<{ userId: string; email: string }>,
+): Promise<string[]> {
+  if (members.length === 0) return [];
+  const channel = await channelService.getChannel(channelId);
+  if (!channel || channel.archivedAt) return [];
+  if (!await actorHasChannelCapability(req.serverId!, channel.id, "user", req.userId!, "addChannelMembers")) return [];
+  const io = req.app.get("io") as SocketServer | undefined;
+  const added: string[] = [];
+  // In turn, at most 20 per send (EXTERNAL_INVITE_MAX_ENTRIES), each under its own capability lock as POST /:id/members adds one.
+  for (const member of members) {
+    try {
+      const targetUser = await userService.getUser(member.userId);
+      if (!targetUser) continue;
+      const persisted = await withLockedChannelActorCapability({
+        serverId: req.serverId!,
+        channelId: channel.id,
+        actorType: "user",
+        actorId: req.userId!,
+        capability: "addChannelMembers",
+        humanSubjectIds: [member.userId],
+      }, (tx) => messageService.addHumanWithMembershipSystemMessage({
+        channel,
+        userId: member.userId,
+        userName: targetUser.name,
+        causalActor: { type: "user", id: req.userId! },
+        executor: tx,
+      }));
+      if (persisted.added) {
+        await broadcastMembershipSystemMessage(
+          req,
+          channel,
+          { type: "human", id: targetUser.id, name: targetUser.name },
+          "added",
+          req.userId!,
+          persisted.message,
+        );
+      }
+      emitChannelMembersUpdated(io, req.serverId!, channel, member.userId);
+      added.push(member.email);
+    } catch (err) {
+      console.error("[Channels] Failed to add an invited server member to the channel:", err);
+    }
+  }
+  return added;
+}
+
+channelRouter.post("/:id/external-invites/preview", async (req, res) => {
+  try {
+    if (!await admitExternalInviteRequest(req, res)) return;
+    const emails = parseExternalInviteEmails(req.body);
+    if (!emails) {
+      res.status(400).json(INVALID_EXTERNAL_INVITE_EMAILS);
+      return;
+    }
+    res.json(await externalInviteService.previewExternalInvites(req.params.id, req.userId!, emails));
+  } catch (err) {
+    sendExternalInviteError(req, res, err, "preview external invites");
+  }
+});
+
+channelRouter.post("/:id/external-invites", async (req, res) => {
+  try {
+    if (!await admitExternalInviteRequest(req, res)) return;
+    const emails = parseExternalInviteEmails(req.body);
+    const makePrivate = (req.body as { makePrivate?: unknown } | null)?.makePrivate;
+    if (!emails || (makePrivate !== undefined && typeof makePrivate !== "boolean")) {
+      res.status(400).json(emails ? { error: "makePrivate must be a boolean", code: "invalid_input" } : INVALID_EXTERNAL_INVITE_EMAILS);
+      return;
+    }
+    const result = await externalInviteService.sendExternalInvites(req.params.id, req.userId!, emails, {
+      makePrivate,
+      onEmails: inviteEmailRecorder(req, req.userId!, "send"),
+    });
+    if (result.madePrivate) await publishChannelUpdate(req.app.get("io"), result.madePrivate);
+    if (result.sent.length > 0) emitExternalRelationChanged(req, req.params.id);
+    const added = await addInvitedServerMembers(req, req.params.id, result.membersToAdd);
+    const notAdded = result.skipped.alreadyMembers.filter((email) => !added.includes(email));
+    res.json({ sent: result.sent, added, skipped: { ...result.skipped, alreadyMembers: notAdded } });
+  } catch (err) {
+    sendExternalInviteError(req, res, err, "send external invites");
+  }
+});
+
+// "Your servers": the host owner/admin connects servers of theirs they own
+// or administer, now (no email, no approval; Create Joint Channel's direct
+// connect). Each server is answered on its own (connected, connecting while
+// the channel is converted, or refused with why). A public channel becomes
+// private with it (makePrivate), as with a send.
+channelRouter.post("/:id/external-connect-servers", async (req, res) => {
+  const body = req.body as { serverIds?: unknown; makePrivate?: unknown } | null;
+  // The caller's own server, the host (its owner or admin decides each server).
+  // The host (the request's server): the row's server when the caller is its full member, and the switch and plan.
+  const row = { path: "host_direct", multi: choseSeveral(body?.serverIds), server: req.serverId!, host: { hostServerId: req.serverId! } } as const;
+  let attempted = false;
+  try {
+    // A channel they cannot see, or the feature off: not an attempt.
+    if (!await admitExternalInviteRequest(req, res)) return;
+    attempted = true;
+    if (body?.makePrivate !== undefined && typeof body.makePrivate !== "boolean") {
+      recordConnectFinished(req, [{ ...row, outcome: refusedOutcome("invalid_input") }]);
+      res.status(400).json({ error: "makePrivate must be a boolean", code: "invalid_input" });
+      return;
+    }
+    const result = await externalInviteConnectService.connectOwnServersToChannel(
+      req.params.id, req.userId!, body?.serverIds, { makePrivate: body?.makePrivate }, { revalidateExternalPrivacy: req.app.get("slackBridgePrivacyRevalidator") },
+    );
+    if (result.madePrivate) await publishChannelUpdate(req.app.get("io"), result.madePrivate);
+    await publishExternalConnections(req, result.connections);
+    // As the revoke route: an open invite replaced by this one was revoked.
+    if (result.replacedInviteId || result.servers.some((server) => server.state !== "refused")) emitExternalRelationChanged(req, req.params.id);
+    noteServerConnectPaywallHits(req, result.servers);
+    res.json({ servers: result.servers.map(serializeServerConnectOutcome) });
+    recordServerConnectOutcomes(req, res, { ...row, outcomes: result.servers });
+  } catch (err) {
+    if (attempted) {
+      const outcome: ConnectFinishedOutcome = err instanceof externalInviteConnectService.ExternalConnectError ? refusedOutcome("invalid_input")
+        : err instanceof externalInviteService.ExternalInviteError ? refusedOutcome(err.code)
+        : err instanceof ExternalChannelLimitError ? refusedOutcome(err.code, err.limitSide)
+        : { result: "error" };
+      recordConnectFinished(req, [{ ...row, outcome }]);
+    }
+    if (err instanceof externalInviteConnectService.ExternalConnectError) {
+      res.status(400).json({ error: "serverIds must be a list of 1 to 29 servers", code: "invalid_input" });
+      return;
+    }
+    sendExternalInviteError(req, res, err, "connect servers");
+  }
+});
+
+channelRouter.get("/:id/external-invites", async (req, res) => {
+  try {
+    // Not flag-gated: admins see (and can revoke) open invites with the flag off.
+    if (!await admitExternalInviteRequest(req, res, { ungated: true })) return;
+    res.json(await externalInviteService.listChannelExternalInvites(req.params.id, req.userId!));
+  } catch (err) {
+    sendExternalInviteError(req, res, err, "list external invites");
+  }
+});
+
+channelRouter.post("/:id/external-invites/:inviteId/resend", async (req, res) => {
+  try {
+    if (!await admitExternalInviteRequest(req, res)) return;
+    res.json(await externalInviteService.resendExternalInvite(req.params.id, req.params.inviteId, req.userId!, {
+      onEmails: inviteEmailRecorder(req, req.userId!, "resend"),
+    }));
+  } catch (err) {
+    sendExternalInviteError(req, res, err, "resend external invite");
+  }
+});
+
+channelRouter.delete("/:id/external-invites/:inviteId", async (req, res) => {
+  try {
+    // Not flag-gated (plan §2a: admins can still revoke pending invites).
+    if (!await admitExternalInviteRequest(req, res, { ungated: true })) return;
+    await externalInviteService.revokeExternalInvite(req.params.id, req.params.inviteId, req.userId!);
+    emitExternalRelationChanged(req, req.params.id);
+    res.json({ ok: true });
+  } catch (err) {
+    sendExternalInviteError(req, res, err, "revoke external invite");
   }
 });
 
@@ -3482,6 +4590,9 @@ channelRouter.get("/:id/agents", async (req, res) => {
 // Stop all agents in channel (emergency stop)
 channelRouter.post("/:id/stop-all-agents", async (req, res) => {
   try {
+    // Stopping agents is a server owner/admin's call (cindyz, 2026-10-29); a
+    // member's stop-all reaches only the agents that member may stop alone
+    // (ones they created, their own assistant).
     if (!await actorHasServerCapabilityInServer(req.serverId!, "user", req.userId!, "controlAgentRuntime")) {
       res.status(403).json({ error: "The `controlAgentRuntime` capability is required to stop all agents in a channel" });
       return;
@@ -3497,11 +4608,42 @@ channelRouter.post("/:id/stop-all-agents", async (req, res) => {
     }
     const agents = await channelService.getChannelAgents(req.params.id);
     const agentOrchestrator = req.app.get("agentOrchestrator") as AgentOrchestrator;
-    const results: { agentId: string; ok: boolean; error?: string }[] = [];
+    // A personal assistant is decided on its own: only its owner, or a server
+    // owner/admin (who then notifies the owner), may stop it.
+    const callerRole = await getActorServerRoleInServer(req.serverId!, "user", req.userId!);
+    const assistants = await assistantsAmong(agents.map((agent) => agent.id));
+    const creators = actorRoleHasServerCapability(callerRole, "stopAgents")
+      ? null
+      : new Map((await agentService.getAgentsByIds(agents.map((agent) => agent.id))).map((row) => [row.id, row]));
+    const results: { agentId: string; ok: boolean; reason?: string; error?: string }[] = [];
     await Promise.allSettled(
       agents.map(async (agent) => {
+        const assistant = assistants.get(agent.id);
+        if (assistant && decideAgentResourceAuthority(callerRole, req.userId!, assistant, "stopAgents", { stop: true }) !== "allowed") {
+          results.push({ agentId: agent.id, ok: false, reason: "assistant_owner_only" });
+          return;
+        }
+        const row = creators?.get(agent.id);
+        if (!assistant && creators && !(row?.creatorType === "user" && row.creatorId === req.userId)) {
+          results.push({ agentId: agent.id, ok: false, reason: "forbidden" });
+          return;
+        }
         try {
-          await agentOrchestrator.stopAgent(agent.id);
+          if (assistant) {
+            // The assistant Stop path: an admin pauses it and its owner is told.
+            const stopped = await stopAssistant({
+              io: req.app.get("io") as SocketServer | undefined,
+              orchestrator: agentOrchestrator,
+              serverId: req.serverId!,
+              agent: assistant,
+              actorUserId: req.userId!,
+            });
+            results.push(stopped.ok ? { agentId: agent.id, ok: true } : { agentId: agent.id, ok: false, reason: stopped.code });
+            return;
+          }
+          // A person's Stop on the channel's agents: `owner_stop` (it also ends
+          // the agent's `raft proc` jobs), as for a single agent's Stop.
+          await agentOrchestrator.stopAgent(agent.id, "manual", { daemonReason: "owner_stop" });
           results.push({ agentId: agent.id, ok: true });
         } catch (err: unknown) {
           results.push({ agentId: agent.id, ok: false, error: (err as Error).message });
@@ -3545,9 +4687,17 @@ channelRouter.post("/:id/resume-all-agents", async (req, res) => {
     const agents = (await channelService.getChannelAgents(req.params.id))
       .filter((agent) => !requested || requested.has(agent.id));
     const agentOrchestrator = req.app.get("agentOrchestrator") as AgentOrchestrator;
+    // Only its owner may start a personal assistant.
+    const callerRole = await getActorServerRoleInServer(req.serverId!, "user", req.userId!);
+    const assistants = await assistantsAmong(agents.map((agent) => agent.id));
     const results: { agentId: string; ok: boolean; reason?: string; error?: string }[] = [];
     await Promise.allSettled(
       agents.map(async (agent) => {
+        const assistant = assistants.get(agent.id);
+        if (assistant && decideAgentResourceAuthority(callerRole, req.userId!, assistant, "controlAgentRuntime") !== "allowed") {
+          results.push({ agentId: agent.id, ok: false, reason: "assistant_owner_only" });
+          return;
+        }
         try {
           // RFC 071 §5: a person resumed the channel's agents: human starts (E3).
           const result = await agentOrchestrator.startAgent(agent.id, { resumePrompt: prompt, control: "human_start" });
@@ -3570,6 +4720,214 @@ channelRouter.post("/:id/resume-all-agents", async (req, res) => {
   }
 });
 
+/**
+ * A joint channel's roster lists people from every server in it. What a
+ * reader learns about another server's people is what their joint profile
+ * shows (`toChannelScopedHumanProfile`):
+ * - their roles (server role, channel role on their own projection) stay
+ *   with their organization: a row from another server, person or agent,
+ *   carries none, so it reads as a plain member.
+ * A row from the reader's own server is a member of it (its projection
+ * requires that), so it is unchanged and only the other servers' rows are
+ * checked.
+ */
+type ChannelRoster = Awaited<ReturnType<typeof channelService.getChannelMembers>>;
+type ViewerRosterHuman = Omit<ChannelRoster["humans"][number], "role" | "serverRole" | "channelRole">
+  & { role: string | null; serverRole?: string | null; channelRole?: string | null };
+type ViewerRosterAgent = Omit<ChannelRoster["agents"][number], "serverRole" | "channelRole">
+  & { serverRole?: string | null; channelRole?: string | null };
+function projectJointRosterForViewer(
+  rawMembers: ChannelRoster,
+  viewerServerId: string,
+): { agents: ViewerRosterAgent[]; humans: ViewerRosterHuman[] } {
+  // Another server's agent: likewise no roles (as `toJointAgentProfile`).
+  const members = {
+    ...rawMembers,
+    agents: rawMembers.agents.map((agent): ViewerRosterAgent => (
+      agent.serverId === viewerServerId ? agent : { ...agent, serverRole: null, channelRole: null }
+    )),
+  };
+  // Computed rows say directly whether the person is in the viewer's server
+  // (their `serverId` is only the first display source); legacy rows are the
+  // viewer's own when they come from its projection.
+  const isViewerServerHuman = (human: ChannelRoster["humans"][number]) =>
+    human.inViewerServer ?? human.serverId === viewerServerId;
+  return {
+    ...members,
+    humans: members.humans.map((human): ViewerRosterHuman => (
+      isViewerServerHuman(human)
+        ? human
+        : {
+          ...human,
+          role: null,
+          serverRole: null,
+          channelRole: human.isManager ? "admin" : null,
+        }
+    )),
+  };
+}
+
+/**
+ * The GET /api/channels/:id/members body for one human viewer of a channel
+ * they can see (the caller checks). `only` (GET /api/sync/changes rebuilding
+ * changed member rows) reads just these members (in the roster query, so a
+ * join to #all reads one member, not the server) and leaves the external
+ * members out; each row is the row the full roster shows that viewer.
+ */
+export async function buildChannelMembersView(
+  channel: NonNullable<Awaited<ReturnType<typeof channelService.getChannel>>>,
+  viewer: { serverId: ServerId; userId: string },
+  agentOrchestrator: AgentOrchestrator,
+  only?: channelService.ChannelMemberFilter,
+) {
+  const [rawMembers, externalMembers] = await Promise.all([
+    channelService.getChannelMembers(channel.id, only),
+    // GET /api/sync/changes rebuilds member rows only; it never reads these.
+    only ? Promise.resolve([]) : channelService.getChannelExternalMembers(channel.id),
+  ]);
+  const members = projectJointRosterForViewer(rawMembers, viewer.serverId);
+  const viewerContext = await resolveChannelActorContext(
+    viewer.serverId,
+    channel.id,
+    "user",
+    viewer.userId,
+  );
+  const viewerCanChangeRoles = viewerContext
+    ? channelActorHasCapability(viewerContext, "changeChannelMemberRoles")
+    : false;
+  // A joint roster merges every server's projection, but a role can only be
+  // set on this server's own members (their rows are on this projection).
+  const localMemberIds = channel.type === "joint" && viewerCanChangeRoles
+    ? await channelService.getLocalChannelMemberIds(channel.id)
+    : null;
+  const computedCandidates=viewerCanChangeRoles && channel.type==="joint"
+    ? await channelService.getJointHumanManagerCandidateIds(channel.id,rawMembers.humans.map(row=>row.id)) : null;
+  const humanIds=new Set(rawMembers.humans.map(row=>row.id));
+  const isRoleTargetable = (id: string) => (computedCandidates && humanIds.has(id) ? computedCandidates.has(id) : !localMemberIds
+    || localMemberIds.userIds.has(id)
+    || localMemberIds.agentIds.has(id));
+  const projectMemberRole = <T extends { id: string; serverId?: string; serverRole?: string | null; role?: string | null; channelRole?: string | null; isManager?: boolean }>(member: T) => {
+    // Human roster rows historically expose the server role as `role`,
+    // while Agent rows use `serverRole`. Normalize before projecting the
+    // effective channel role; otherwise every human in #all appears to be a
+    // plain Member even when they inherit Owner/Admin authority.
+    const serverRole = member.serverRole ?? member.role ?? "member";
+    return {
+      ...member,
+      // Another server's member carries no role (projectJointRosterForViewer):
+      // they read as a plain member, without a made-up server role.
+      serverRole: member.serverId !== undefined && member.serverId !== viewer.serverId ? null : serverRole,
+      effectiveChannelRole: member.isManager ? "admin" : serverRole === "owner"
+        ? "owner"
+        : serverRole === "admin" || member.channelRole === "admin"
+          ? "admin"
+          : serverRole === "guest" ? "guest" : "member",
+      channelAdminBasis: member.isManager !== undefined ? null : serverRole === "owner" || serverRole === "admin"
+        ? member.channelRole === "admin" ? "both" : "server_role"
+        : member.channelRole === "admin" ? "channel_role" : null,
+      canChangeChannelRole: viewerCanChangeRoles
+        && isRoleTargetable(member.id)
+        && member.id !== viewer.userId
+        && serverRole !== "owner"
+        && serverRole !== "admin"
+        && serverRole !== "guest",
+    };
+  };
+  if (viewerContext?.serverRole === "guest") {
+    return {
+      agents: members.agents.map((agent) => ({
+        id: agent.id,
+        // A joint channel (P3, decision A): each agent's own server, as for
+        // people, so the Guest sees "from <server>" on other servers' agents.
+        serverId: channel.type === "joint" ? agent.serverId : viewer.serverId,
+        ...(channel.type === "joint" && "serverName" in agent ? { serverName: agent.serverName } : {}),
+        ...(channel.type === "joint" && "serverSlug" in agent ? { serverSlug: agent.serverSlug } : {}),
+        name: agent.name,
+        displayName: agent.displayName,
+        avatarUrl: agent.avatarUrl,
+        status: agent.status,
+        profileProjection: "channel_summary",
+        effectiveChannelRole: "member",
+        canChangeChannelRole: false,
+      })),
+      humans: members.humans.map((human) => ({
+        id: human.id,
+        name: human.name,
+        displayName: human.displayName,
+        avatarUrl: human.avatarUrl,
+        gravatarHash: DEPRECATED_GRAVATAR_HASH,
+        effectiveChannelRole: human.role === "guest" ? "guest" : "member",
+        canChangeChannelRole: false,
+        // A joint channel (P3, cindyz decision A): a Guest sees which server
+        // each person comes from, as members do. Source tags and grouping
+        // only: never their email, role or other memberships.
+        ...(channel.type === "joint" ? {
+          serverId: human.serverId,
+          serverName: human.serverName,
+          serverSlug: human.serverSlug,
+          ...(human.servers !== undefined ? { servers: human.servers } : {}),
+          ...(human.inViewerServer !== undefined ? { inViewerServer: human.inViewerServer } : {}),
+        } : {}),
+      })),
+    };
+  }
+  // Every member's activity in one batch (#all lists the whole server):
+  // one agent row read, then getActivities, instead of a read per agent.
+  let activityById = new Map<string, { activity: string; activityDetail: string }>();
+  // External agents' presence, as `GET /agents` serves it: a joint
+  // channel's other-server agents are in no viewer's agent list, so their
+  // `lastSeenAt` arrives here (and then by `agent:seen` pushes).
+  const presenceById = new Map<string, { external: true; lastSeenAt: string | null }>();
+  try {
+    const rows = await agentService.getAgentsByIds(members.agents.map((agent) => agent.id));
+    const externalIds = rows.filter((row) => isExternalAgentRuntime(row.runtime)).map((row) => row.id);
+    const [activities, lastSeenByAgent] = await Promise.all([
+      agentOrchestrator.getActivities(rows),
+      externalIds.length > 0 ? getAgentsLastSeenAt(externalIds) : Promise.resolve(new Map<string, Date>()),
+    ]);
+    // #wg-rbac:#57: a member list is read by every viewer of the channel, so
+    // an error activity reads as it does for a member: code and fixed sentence.
+    const otherServerAgentIds = new Set(members.agents.filter((agent) => agent.serverId !== viewer.serverId).map((agent) => agent.id));
+    activityById = new Map(rows.map((row, index) => {
+      const resolved = activities[index]!;
+      // A joint channel's other-server agent: its state only, as the joint
+      // projection rooms get it (`agent:activity` with `detail: ""`), never its
+      // work summary, typed diagnostics (spawn failure and model, stuck tool,
+      // credential hold, ...) or error detail.
+      if (otherServerAgentIds.has(row.id)) return [row.id, { activity: resolved.activity, activityDetail: "" }];
+      const shown = { activity: resolved.activity, detailKind: resolved.activityDetailKind ?? null, detail: resolved.activityDetail };
+      if (!isRuntimeErrorDetailActivity(shown)) return [row.id, resolved];
+      const { detail, errorCode } = projectRuntimeErrorActivityDetail({ ...shown, lastRuntimeError: row.lastRuntimeError ?? null }, "member");
+      return [row.id, { ...resolved, activityDetail: detail, ...(errorCode ? { activityErrorCode: errorCode } : {}) }];
+    }));
+    for (const id of externalIds) {
+      presenceById.set(id, { external: true, lastSeenAt: lastSeenByAgent.get(id)?.toISOString() ?? null });
+    }
+  } catch {
+    // As before, a failed activity read lists the member without activity.
+  }
+  const agents = members.agents.map((agent) => {
+    const resolved = activityById.get(agent.id);
+    const presence = presenceById.get(agent.id);
+    return { ...projectMemberRole({ ...agent, ...resolved, ...presence }),
+      ...(viewerContext?.jointAuthority && { canRemoveFromChannel: channelActorHasCapability(viewerContext, "removeChannelMembers", "agent")
+        && (viewerContext.jointAuthority.isHostEntry || agent.serverId === viewer.serverId) }),
+    };
+  });
+  const humans = members.humans.map(human => ({ ...projectMemberRole(human),
+    ...(viewerContext?.jointAuthority && { canRemoveFromChannel: channelActorHasCapability(viewerContext, "removeChannelMembers") }),
+  }));
+  if (await shouldFilterChannelHumansForRequester(channel, viewer.userId)) {
+    return {
+      ...members,
+      agents,
+      humans: humans.filter((human) => shouldExposeHumanInHiddenChannelDirectory(human, viewer.userId)),
+      externalMembers,
+    };
+  }
+  return { ...members, agents, humans, externalMembers };
+}
+
 // Get all members (agents + humans) of a channel
 channelRouter.get("/:id/members", async (req, res) => {
   try {
@@ -3582,103 +4940,8 @@ channelRouter.get("/:id/members", async (req, res) => {
       res.status(404).json({ error: "Channel not found" });
       return;
     }
-    const [members, externalMembers] = await Promise.all([
-      channelService.getChannelMembers(req.params.id),
-      channelService.getChannelExternalMembers(req.params.id),
-    ]);
-    const viewerContext = await resolveChannelActorContext(
-      req.serverId!,
-      channel.id,
-      "user",
-      req.userId!,
-    );
-    const viewerCanChangeRoles = viewerContext
-      ? channelActorHasCapability(viewerContext, "changeChannelMemberRoles")
-      : false;
-    // A joint roster merges every server's projection, but a role can only be
-    // set on this server's own members (their rows are on this projection).
-    const localMemberIds = channel.type === "joint" && viewerCanChangeRoles
-      ? await channelService.getLocalChannelMemberIds(channel.id)
-      : null;
-    const isRoleTargetable = (id: string) => !localMemberIds
-      || localMemberIds.userIds.has(id)
-      || localMemberIds.agentIds.has(id);
-    const projectMemberRole = <T extends { id: string; serverRole?: string | null; role?: string | null; channelRole?: string | null }>(member: T) => {
-      // Human roster rows historically expose the server role as `role`,
-      // while Agent rows use `serverRole`. Normalize before projecting the
-      // effective channel role; otherwise every human in #all appears to be a
-      // plain Member even when they inherit Owner/Admin authority.
-      const serverRole = member.serverRole ?? member.role ?? "member";
-      return {
-        ...member,
-        serverRole,
-        effectiveChannelRole: serverRole === "owner"
-          ? "owner"
-          : serverRole === "admin" || member.channelRole === "admin"
-            ? "admin"
-            : serverRole === "guest" ? "guest" : "member",
-        channelAdminBasis: serverRole === "owner" || serverRole === "admin"
-          ? member.channelRole === "admin" ? "both" : "server_role"
-          : member.channelRole === "admin" ? "channel_role" : null,
-        canChangeChannelRole: viewerCanChangeRoles
-          && isRoleTargetable(member.id)
-          && member.id !== req.userId
-          && serverRole !== "owner"
-          && serverRole !== "admin"
-          && serverRole !== "guest",
-      };
-    };
-    if (viewerContext?.serverRole === "guest") {
-      res.json({
-        agents: members.agents.map((agent) => ({
-          id: agent.id,
-          serverId: req.serverId,
-          name: agent.name,
-          displayName: agent.displayName,
-          avatarUrl: agent.avatarUrl,
-          status: agent.status,
-          profileProjection: "channel_summary",
-          effectiveChannelRole: "member",
-          canChangeChannelRole: false,
-        })),
-        humans: members.humans.map((human) => ({
-          id: human.id,
-          name: human.name,
-          displayName: human.displayName,
-          avatarUrl: human.avatarUrl,
-          gravatarHash: human.gravatarHash,
-          effectiveChannelRole: human.role === "guest" ? "guest" : "member",
-          canChangeChannelRole: false,
-        })),
-      });
-      return;
-    }
     const agentOrchestrator = req.app.get("agentOrchestrator") as AgentOrchestrator;
-    // Every member's activity in one batch (#all lists the whole server):
-    // one agent row read, then getActivities, instead of a read per agent.
-    let activityById = new Map<string, { activity: string; activityDetail: string }>();
-    try {
-      const rows = await agentService.getAgentsByIds(members.agents.map((agent) => agent.id));
-      const activities = await agentOrchestrator.getActivities(rows);
-      activityById = new Map(rows.map((row, index) => [row.id, activities[index]!]));
-    } catch {
-      // As before, a failed activity read lists the member without activity.
-    }
-    const agents = members.agents.map((agent) => {
-      const resolved = activityById.get(agent.id);
-      return projectMemberRole(resolved ? { ...agent, ...resolved } : agent);
-    });
-    const humans = members.humans.map(projectMemberRole);
-    if (await shouldFilterChannelHumansForRequester(channel, req.userId!)) {
-      res.json({
-        ...members,
-        agents,
-        humans: humans.filter((human) => shouldExposeHumanInHiddenChannelDirectory(human, req.userId!)),
-        externalMembers,
-      });
-      return;
-    }
-    res.json({ ...members, agents, humans, externalMembers });
+    res.json(await buildChannelMembersView(channel, { serverId: req.serverId!, userId: req.userId! }, agentOrchestrator));
   } catch {
     res.status(500).json({ error: "Failed to get members" });
   }
@@ -3719,7 +4982,7 @@ channelRouter.post("/:id/members/batch", async (req, res) => {
       res.status(404).json({ error: "Channel not found" });
       return;
     }
-    if (channel.type === "thread") {
+    if (isSubConversationType(channel.type)) {
       res.status(400).json({ error: "Thread membership is managed via follow/unfollow" });
       return;
     }
@@ -3727,16 +4990,21 @@ channelRouter.post("/:id/members/batch", async (req, res) => {
       res.status(409).json({ error: "This channel is archived", code: "channel_archived" });
       return;
     }
-    if (channel.type === "dm") {
-      if (!await channelService.isChannelHuman(channel.id, req.userId!)) {
-        res.status(404).json({ error: "Channel not found" });
-        return;
-      }
-    } else if (!(await actorHasChannelCapability(req.serverId!, channel.id, "user", req.userId!, "addChannelMembers"))) {
+    // A DM has two fixed parties (canAddChannelMembers): a participant gets the
+    // shared rule's refusal below; anyone else the same 404 as before.
+    if (channel.type === "dm" && !await channelService.isChannelHuman(channel.id, req.userId!)) {
+      res.status(404).json({ error: "Channel not found" });
+      return;
+    }
+    if (!(await actorHasChannelCapability(req.serverId!, channel.id, "user", req.userId!, "addChannelMembers"))) {
       res.status(403).json({ error: "You do not have permission to add channel members" });
       return;
     }
 
+    if ((await filterLoungeOutsiderAgents(channel.id, batch.agentIds)).size > 0) {
+      res.status(403).json({ error: AGENT_LOUNGE_OUTSIDER_ADD_REFUSAL, code: "agent_lounge_outsider" });
+      return;
+    }
     // Every target in two queries, not one or two per id.
     const [agentRows, memberUsers] = await Promise.all([
       agentService.getAgentsByIds(batch.agentIds),
@@ -3745,7 +5013,7 @@ channelRouter.post("/:id/members/batch", async (req, res) => {
     const agentById = new Map(agentRows.map((agent) => [agent.id, agent]));
     const targetAgents = batch.agentIds.map((agentId) => agentById.get(agentId) ?? null);
     const targetUsers = batch.userIds.map((userId) => memberUsers.get(userId) ?? null);
-    const invalidAgentIds = batch.agentIds.filter((_, index) => targetAgents[index]?.serverId !== req.serverId);
+    const invalidAgentIds = batch.agentIds.filter((_, index) => targetAgents[index]?.serverId !== req.serverId || isOthersAssistant(targetAgents[index], req.userId!));
     if (invalidAgentIds.length > 0) {
       res.status(400).json({
         error: "One or more agents are not members of this server",
@@ -3809,15 +5077,15 @@ channelRouter.post("/:id/members/batch", async (req, res) => {
       return { addedUserIds, addedAgentIds, userMessages, agentMessages };
     };
 
-    const result = channel.type === "dm"
-      ? await getDb().transaction(applyBatch)
-      : await withLockedChannelActorCapability({
-          serverId: req.serverId!,
-          channelId: channel.id,
-          actorType: "user",
-          actorId: req.userId!,
-          capability: "addChannelMembers",
-        }, applyBatch);
+    const result = await withLockedChannelActorCapability({
+      serverId: req.serverId!,
+      channelId: channel.id,
+      actorType: "user",
+      actorId: req.userId!,
+      capability: "addChannelMembers",
+      // The people added: their users rows are taken first, with the actor's.
+      humanSubjectIds: batch.userIds,
+    }, applyBatch);
 
     for (const userId of result.addedUserIds) {
       const user = targetUsers[batch.userIds.indexOf(userId)]!;
@@ -3858,7 +5126,10 @@ channelRouter.post("/:id/members/batch", async (req, res) => {
       },
     });
   } catch (err: unknown) {
-    if (err instanceof Error && err.message === "Guest cannot be added to the #all channel") {
+    if (isActionCardConversionError(err)) {
+      // The source action card is frozen or needs reconfirmation: an expected 409, not a server fault.
+      res.status(err.status).json({ error: err.message, code: err.code });
+    } else if (err instanceof Error && err.message === channelService.GUEST_ALL_CHANNEL_MESSAGE) {
       res.status(403).json({ error: err.message });
     } else if (err instanceof Error && err.message === "Channel capability required") {
       res.status(403).json({ error: "You do not have permission to add channel members" });
@@ -3891,7 +5162,7 @@ channelRouter.post("/:id/members", async (req, res) => {
       res.status(404).json({ error: "Channel not found" });
       return;
     }
-    if (channel.type === "thread") {
+    if (isSubConversationType(channel.type)) {
       res.status(400).json({ error: "Thread membership is managed via follow/unfollow" });
       return;
     }
@@ -3899,16 +5170,14 @@ channelRouter.post("/:id/members", async (req, res) => {
       res.status(409).json({ error: "This channel is archived", code: "channel_archived" });
       return;
     }
-    // DMs retain participant semantics. Ordinary public/private channels use
-    // the object-aware add policy; server owner/admin may therefore manage a
-    // private channel without first joining it.
-    if (channel.type === "dm") {
-      const isParticipant = await channelService.isChannelHuman(channel.id, req.userId!);
-      if (!isParticipant) {
-        res.status(404).json({ error: "Channel not found" });
-        return;
-      }
-    } else if (!(await actorHasChannelCapability(req.serverId!, channel.id, "user", req.userId!, "addChannelMembers"))) {
+    // The object-aware add policy decides; server owner/admin may therefore
+    // manage a private channel without first joining it. A DM has two fixed
+    // parties: a participant gets its refusal, anyone else the same 404.
+    if (channel.type === "dm" && !await channelService.isChannelHuman(channel.id, req.userId!)) {
+      res.status(404).json({ error: "Channel not found" });
+      return;
+    }
+    if (!(await actorHasChannelCapability(req.serverId!, channel.id, "user", req.userId!, "addChannelMembers"))) {
       res.status(403).json({ error: "You do not have permission to add channel members" });
       return;
     }
@@ -3917,10 +5186,16 @@ channelRouter.post("/:id/members", async (req, res) => {
       res.status(400).json({ error: "Either agentId or userId is required" });
       return;
     }
+    if (agentId && await isLoungeOutsiderAgent(channel.id, agentId)) {
+      res.status(403).json({ error: AGENT_LOUNGE_OUTSIDER_ADD_REFUSAL, code: "agent_lounge_outsider" });
+      return;
+    }
     if (agentId) {
       // Validate agent belongs to this server
       const agent = await agentService.getAgent(agentId);
-      if (!agent || agent.serverId !== req.serverId) {
+      // Only its owner finds a personal assistant; for anyone else it is
+      // answered exactly as an id that names no agent here.
+      if (!agent || agent.serverId !== req.serverId || isOthersAssistant(agent, req.userId!)) {
         res.status(400).json({ error: "Agent not found in this server" });
         return;
       }
@@ -3929,17 +5204,13 @@ channelRouter.post("/:id/members", async (req, res) => {
         actionCardMessageId: typeof req.body?.actionCardMessageId === "string" ? req.body.actionCardMessageId : undefined,
         actionCardConfirmationVersion: typeof req.body?.actionCardConfirmationVersion === "number" ? req.body.actionCardConfirmationVersion : undefined,
       };
-      if (channel.type === "dm") {
-        await channelService.addAgent(req.params.id, agentId, actionCardContext);
-      } else {
-        await withLockedChannelActorCapability({
-          serverId: req.serverId!,
-          channelId: channel.id,
-          actorType: "user",
-          actorId: req.userId!,
-          capability: "addChannelMembers",
-        }, (tx) => channelService.addAgent(req.params.id, agentId, { ...actionCardContext, executor: tx }));
-      }
+      await withLockedChannelActorCapability({
+        serverId: req.serverId!,
+        channelId: channel.id,
+        actorType: "user",
+        actorId: req.userId!,
+        capability: "addChannelMembers",
+      }, (tx) => channelService.addAgent(req.params.id, agentId, { ...actionCardContext, executor: tx }));
       if (!wasAgentMember) {
         await broadcastMembershipSystemMessage(req, channel, { type: "agent", ...agent }, "added", req.userId!);
       }
@@ -3965,15 +5236,14 @@ channelRouter.post("/:id/members", async (req, res) => {
           actionCardMessageId: typeof req.body?.actionCardMessageId === "string" ? req.body.actionCardMessageId : undefined,
           actionCardConfirmationVersion: typeof req.body?.actionCardConfirmationVersion === "number" ? req.body.actionCardConfirmationVersion : undefined,
         });
-      const persisted = channel.type === "dm"
-        ? await addHumanWithNotice()
-        : await withLockedChannelActorCapability({
-          serverId: req.serverId!,
-          channelId: channel.id,
-          actorType: "user",
-          actorId: req.userId!,
-          capability: "addChannelMembers",
-        }, (tx) => addHumanWithNotice(tx));
+      const persisted = await withLockedChannelActorCapability({
+        serverId: req.serverId!,
+        channelId: channel.id,
+        actorType: "user",
+        actorId: req.userId!,
+        capability: "addChannelMembers",
+        humanSubjectIds: [userId],
+      }, (tx) => addHumanWithNotice(tx));
       if (persisted.added) {
         await broadcastMembershipSystemMessage(
           req,
@@ -3992,7 +5262,10 @@ channelRouter.post("/:id/members", async (req, res) => {
 
     res.json({ ok: true });
   } catch (err: unknown) {
-    if (err instanceof Error && err.message === "Guest cannot be added to the #all channel") {
+    if (isActionCardConversionError(err)) {
+      // The source action card is frozen or needs reconfirmation: an expected 409, not a server fault.
+      res.status(err.status).json({ error: err.message, code: err.code });
+    } else if (err instanceof Error && err.message === channelService.GUEST_ALL_CHANNEL_MESSAGE) {
       res.status(403).json({ error: err.message });
     } else if (err instanceof Error && err.message === "Channel capability required") {
       res.status(403).json({ error: "You do not have permission to add channel members" });
@@ -4093,7 +5366,7 @@ channelRouter.delete("/:id/members/agent/:memberId", async (req, res) => {
       res.status(404).json({ error: "Channel not found" });
       return;
     }
-    if (channel.type === "thread") {
+    if (isSubConversationType(channel.type)) {
       res.status(400).json({ error: "Thread membership is managed via follow/unfollow" });
       return;
     }
@@ -4103,7 +5376,7 @@ channelRouter.delete("/:id/members/agent/:memberId", async (req, res) => {
         res.status(404).json({ error: "Channel not found" });
         return;
       }
-    } else if (!(await actorHasChannelCapability(req.serverId!, channel.id, "user", req.userId!, "removeChannelMembers"))) {
+    } else if (!(await actorHasChannelCapability(req.serverId!, channel.id, "user", req.userId!, "removeChannelMembers", getDb(), "agent"))) {
       res.status(403).json({ error: "Only admins can remove channel agents" });
       return;
     }
@@ -4113,11 +5386,17 @@ channelRouter.delete("/:id/members/agent/:memberId", async (req, res) => {
     }
     assertAgentCanBeRemovedFromChannel(channel);
     const agent = await agentService.getAgent(req.params.memberId);
-    const wasAgentMember = await channelService.isChannelAgent(req.params.id, req.params.memberId);
-    if (wasAgentMember && agent && agent.serverId === req.serverId) {
+    const targetChannel = await channelService.getJointAgentRemovalChannel(channel.id, req.params.memberId);
+    const actorContext = await resolveChannelActorContext(req.serverId!, channel.id, "user", req.userId!);
+    if (actorContext?.jointAuthority && !actorContext.jointAuthority.isHostEntry && agent?.serverId !== req.serverId) {
+      res.status(403).json({ error: "Channel capability required" });
+      return;
+    }
+    const wasAgentMember = targetChannel ? await channelService.isChannelAgent(targetChannel.id, req.params.memberId) : false;
+    if (wasAgentMember && agent && targetChannel) {
       // Preserve the established audience ordering: the removed Agent must
       // receive the durable notice while its membership is still active.
-      await broadcastMembershipSystemMessage(req, channel, { type: "agent", ...agent }, "removed", req.userId!);
+      await broadcastMembershipSystemMessage(req, targetChannel, { type: "agent", ...agent }, "removed", req.userId!);
     }
     if (channel.type === "dm") {
       await channelService.removeAgent(req.params.id, req.params.memberId);
@@ -4128,13 +5407,14 @@ channelRouter.delete("/:id/members/agent/:memberId", async (req, res) => {
         actorType: "user",
         actorId: req.userId!,
         capability: "removeChannelMembers",
-      }, (tx) => channelService.removeAgent(req.params.id, req.params.memberId, tx));
+        memberTargetType: "agent",
+      }, (tx, context) => channelService.removeAgent(req.params.id, req.params.memberId, tx, context));
     }
-    if (wasAgentMember && agent && agent.serverId === req.serverId && channel.type !== "channel") {
+    if (wasAgentMember && agent && targetChannel && channel.type !== "channel") {
       const agentOrchestrator = req.app.get("agentOrchestrator") as AgentOrchestrator;
       await agentOrchestrator.purgeAgentInboxForChannelTree(
         req.params.memberId,
-        channel.id,
+        targetChannel.id,
         "channel_membership_removed",
       );
     }
@@ -4142,11 +5422,19 @@ channelRouter.delete("/:id/members/agent/:memberId", async (req, res) => {
     // Notify clients about membership change
     const io = req.app.get("io") as SocketServer | undefined;
     emitChannelMembersUpdated(io, req.serverId!, channel);
+    if (channel.type === "joint") {
+      for (const projection of await channelService.getActiveJointChannelProjectionsByLocalChannel(channel.id)) {
+        if (projection.localChannelId !== channel.id) io?.to(`channel:${projection.localChannelId}`).emit("channel:members-updated", { channelId: projection.localChannelId });
+      }
+    }
 
     res.json({ ok: true });
   } catch (err: any) {
     const msg = err?.message || "";
-    if (msg.includes("Cannot remove") || msg === "Channel capability required") {
+    const allRefusal = allChannelMembershipRefusal(msg);
+    if (allRefusal) {
+      res.status(403).json(allRefusal);
+    } else if (msg === "Channel capability required") {
       res.status(403).json({ error: msg });
     } else {
       res.status(500).json({ error: "Failed to remove member" });
@@ -4166,7 +5454,7 @@ channelRouter.delete("/:id/members/user/:memberId", async (req, res) => {
       res.status(404).json({ error: "Channel not found" });
       return;
     }
-    if (channel.type === "thread") {
+    if (isSubConversationType(channel.type)) {
       res.status(400).json({ error: "Thread membership is managed via follow/unfollow" });
       return;
     }
@@ -4190,16 +5478,18 @@ channelRouter.delete("/:id/members/user/:memberId", async (req, res) => {
       return;
     }
     if (channel.type === "dm") {
-      await channelService.removeHuman(req.params.id, req.params.memberId);
+      // A DM participant removes only themselves (checked above).
+      await channelService.removeHuman(req.params.id, req.params.memberId, { self: true });
     } else {
-      await withLockedChannelActorCapability({
+      const removal = await withLockedChannelActorCapability({
         serverId: req.serverId!,
         channelId: channel.id,
         actorType: "user",
         actorId: req.userId!,
         capability: "removeChannelMembers",
-      }, (tx) => channelService.removeHuman(req.params.id, req.params.memberId, tx));
-      await revokeSocketAccess({ userId: req.params.memberId });
+        humanSubjectIds: [req.params.memberId],
+      }, (tx, context) => channelService.removeHuman(req.params.id, req.params.memberId, context, tx));
+      await channelService.finishChannelMemberRemoval(removal, req.params.memberId);
     }
 
     // Notify clients about membership change
@@ -4209,7 +5499,10 @@ channelRouter.delete("/:id/members/user/:memberId", async (req, res) => {
     res.json({ ok: true });
   } catch (err: any) {
     const msg = err?.message || "";
-    if (msg.includes("Cannot remove") || msg === "Channel capability required") {
+    const allRefusal = allChannelMembershipRefusal(msg);
+    if (allRefusal) {
+      res.status(403).json(allRefusal);
+    } else if (msg === "Channel capability required") {
       res.status(403).json({ error: msg });
     } else {
       res.status(500).json({ error: "Failed to remove member" });
@@ -4217,64 +5510,17 @@ channelRouter.delete("/:id/members/user/:memberId", async (req, res) => {
   }
 });
 
-// Join a channel (self)
+// Join a channel (self). The rules are channelJoinService's, shared with an
+// assistant's forward with `join: true` (RFC 077).
 channelRouter.post("/:id/join", async (req, res) => {
   try {
     const channel = await channelService.getChannel(req.params.id);
-    if (!channel || channel.serverId !== req.serverId) {
-      res.status(404).json({ error: "Channel not found" });
+    const joined = await joinChannelAsUser(req.app.get("io"), req.serverId!, req.userId!, channel);
+    if (!joined.ok) {
+      // `code` is new; status and error are as before. Archived always had its code.
+      res.status(joined.status).json({ error: joined.error, code: joined.code });
       return;
     }
-    if (channel.type === "thread") {
-      res.status(400).json({ error: "Thread membership is managed via follow/unfollow" });
-      return;
-    }
-    if (channel.type === "dm") {
-      res.status(403).json({ error: "Cannot join DM channels" });
-      return;
-    }
-    if (channel.type === "private") {
-      res.status(403).json({ error: "Private channels require an invitation" });
-      return;
-    }
-    if (channel.type === "joint") {
-      res.status(403).json({ error: "Joint channels require an admin invitation" });
-      return;
-    }
-    if (channel.archivedAt) {
-      res.status(409).json({ error: "This channel is archived", code: "channel_archived" });
-      return;
-    }
-    const actorRole = await getActorServerRoleInServer(req.serverId!, "user", req.userId!);
-    const isGuest = actorRole === "guest";
-    const alreadyMember = (!isGuest && channelService.isEnabledAllChannel(channel))
-      || await channelService.isChannelHuman(channel.id, req.userId!);
-    if (alreadyMember) {
-      res.json({ ok: true });
-      return;
-    }
-    if (isGuest) {
-      const guestJoin = await channelService.addGuestHumanIfAllowed(channel.id, req.userId!);
-      if (guestJoin === "forbidden") {
-        res.status(403).json({ error: "Guest policy does not allow joining this channel" });
-        return;
-      }
-      if (guestJoin === "joined") {
-        const io = req.app.get("io");
-        io?.to(`server:${req.serverId}`).emit("channel:members-updated", { channelId: req.params.id });
-      }
-      res.json({ ok: true });
-      return;
-    }
-    if (!(await actorHasServerCapabilityInServer(req.serverId!, "user", req.userId!, "joinPublicChannels"))) {
-      res.status(403).json({ error: "Server role cannot join public channels" });
-      return;
-    }
-    await channelService.addHuman(req.params.id, req.userId!);
-
-    const io = req.app.get("io");
-    io?.to(`server:${req.serverId}`).emit("channel:members-updated", { channelId: req.params.id });
-
     res.json({ ok: true });
   } catch {
     res.status(500).json({ error: "Failed to join channel" });
@@ -4293,7 +5539,7 @@ channelRouter.post("/:id/leave", async (req, res) => {
       res.status(404).json({ error: "Channel not found" });
       return;
     }
-    if (channel.type === "thread") {
+    if (isSubConversationType(channel.type)) {
       res.status(400).json({ error: "Thread membership is managed via follow/unfollow" });
       return;
     }
@@ -4305,7 +5551,7 @@ channelRouter.post("/:id/leave", async (req, res) => {
       res.status(409).json({ error: "This channel is archived", code: "channel_archived" });
       return;
     }
-    await channelService.removeHuman(req.params.id, req.userId!);
+    await channelService.removeHuman(req.params.id, req.userId!, { self: true });
 
     const io = req.app.get("io");
     io?.to(`server:${req.serverId}`).emit("channel:members-updated", { channelId: req.params.id });
@@ -4313,8 +5559,9 @@ channelRouter.post("/:id/leave", async (req, res) => {
     res.json({ ok: true });
   } catch (err: any) {
     const msg = err?.message || "";
-    if (msg.includes("Cannot remove")) {
-      res.status(403).json({ error: msg });
+    const allRefusal = allChannelMembershipRefusal(msg);
+    if (allRefusal) {
+      res.status(403).json(allRefusal);
     } else {
       res.status(500).json({ error: "Failed to leave channel" });
     }
@@ -4322,7 +5569,7 @@ channelRouter.post("/:id/leave", async (req, res) => {
 });
 
 // Mark a channel as read
-channelRouter.post("/:id/read", async (req, res) => {
+channelRouter.post("/:id/read", noteInboxWriteBeforeReply, async (req, res) => {
   try {
     const channel = await channelService.getChannel(req.params.id);
     if (!channel || channel.serverId !== req.serverId) {
@@ -4352,12 +5599,13 @@ channelRouter.post("/:id/read", async (req, res) => {
     res.json({ ok: true, maxReadSeq: state.maxReadSeq, readStateVersion: state.readStateVersion });
   } catch (err) {
     if (sendCompatibilityReadPending(res, err)) return;
+    addRouteFailureEvent("channel_read", err);
     res.status(500).json({ error: "Failed to mark as read" });
   }
 });
 
 // Mark a channel as fully read
-channelRouter.post("/:id/read-all", async (req, res) => {
+channelRouter.post("/:id/read-all", noteInboxWriteBeforeReply, async (req, res) => {
   let receiver: ReadAllReceiver = { kind: "human", id: req.userId! };
   let delegationBasis: ReadStateDelegationBasis | null = null;
   try {
@@ -4477,21 +5725,15 @@ channelRouter.post("/:id/read-all", async (req, res) => {
       res.status(404).json({ error: "Channel not found" });
       return;
     }
+    addRouteFailureEvent("channel_read_all", err);
     res.status(500).json({ error: "Failed to mark as read" });
   }
 });
 
 // Explicit sidebar action: channel messages plus active followed threads.
 // The existing /read-all contract remains a single-scope read.
-channelRouter.post("/:id/conversation-read-all", async (req, res) => {
+channelRouter.post("/:id/conversation-read-all", noteInboxWriteBeforeReply, async (req, res) => {
   try {
-    const flag = await evaluateFeatureFlag({
-      key: SIDEBAR_MARK_ALL_READ_FEATURE_FLAG_KEY, serverId: req.serverId!, userId: req.userId!,
-    });
-    if (!flag.enabled) {
-      res.status(404).json({ error: "Conversation read-all is not enabled", code: "sidebar_mark_all_read_disabled" });
-      return;
-    }
     if (!await channelService.canUserAccessChannel(req.params.id, req.userId!, req.serverId!)) {
       res.status(404).json({ error: "Conversation not found" });
       return;
@@ -4519,7 +5761,7 @@ channelRouter.post("/:id/conversation-read-all", async (req, res) => {
 });
 
 // Mark a channel as unread
-channelRouter.post("/:id/unread", async (req, res) => {
+channelRouter.post("/:id/unread", noteInboxWriteBeforeReply, async (req, res) => {
   try {
     const channel = await channelService.getChannel(req.params.id)
       ?? await channelService.getChannel(req.params.id, { includeDeleted: true });
@@ -4533,7 +5775,21 @@ channelRouter.post("/:id/unread", async (req, res) => {
     }
     const state = await channelService.markUnread(req.userId!, channel.id);
     emitReadStateUpdated(req, state);
-    res.json({ ok: true, unreadCount: state.unreadCount, maxReadSeq: state.maxReadSeq, readStateVersion: state.readStateVersion });
+    // markedUnread: nothing countable to rewind over, so the scope is marked
+    // unread with no count (always sent here, so a client can tell this server
+    // from one that answers unreadCount 0 for "nothing to mark"). outcome:
+    // counted / marked / nothing, decided in the read-state transaction.
+    // Shape checked at compile time against the registered contract
+    // (readStateContract.markUnread), not parsed: the write has committed, and
+    // a 500 here would only make the client retry it.
+    res.json({
+      ok: true,
+      unreadCount: state.unreadCount,
+      maxReadSeq: state.maxReadSeq,
+      readStateVersion: state.readStateVersion,
+      markedUnread: state.markedUnread,
+      outcome: state.outcome,
+    } satisfies MarkConversationUnreadResponse);
   } catch (err) {
     if (sendCompatibilityReadPending(res, err)) return;
     sendJsonServerError(req, res, {
@@ -4578,7 +5834,7 @@ channelRouter.post("/:id/threads", async (req, res) => {
 
     // Prevent nested threads: cannot create a thread inside a thread channel.
     // Only reported to a caller who can already see the channel.
-    if (channel.type === "thread") {
+    if (isSubConversationType(channel.type)) {
       res.status(400).json({ error: "Cannot create a thread inside a thread" });
       return;
     }
@@ -4608,8 +5864,10 @@ channelRouter.post("/:id/threads", async (req, res) => {
       if (conversionTarget) {
         await assertChannelConversionWritable(conversionTarget.sourceChannelId);
       }
-      if (await isChannelReadOnlyByBillingFeature(channel.id, req.serverId!)) {
-        res.status(403).json({ error: "This joint channel is read-only because it has more than 2 free servers. It becomes writable again when a server upgrades or a free server leaves." });
+      const billingReadOnly = await getChannelBillingReadOnly(channel.id, req.serverId!);
+      if (billingReadOnly) {
+        if (billingReadOnly.reason === "joint_over_limit") notePaywallHit(req, "joint_channel_read_only");
+        res.status(403).json(channelBillingReadOnlyBody(billingReadOnly));
         return;
       }
       if (await isChannelReadOnlyByQuota(channel.id, req.serverId!)) {
@@ -4722,11 +5980,15 @@ channelRouter.get("/:id/threads", async (req, res) => {
     );
     const parentMessageScopeSource = requestedParentMessageIds === undefined ? "compat_recent" : "client";
 
+    // The parents are the caller's to name (any message id): the replies a
+    // summary previews stay inside the plan's history window.
+    const { cutoff: historyCutoff } = await getServerHistoryWindowForRead(req.serverId!);
     const summaries = await tracePhase(
       () => channelService.getThreadSummaries(req.params.id, {
         userId: req.userId!,
         parentMessageIds,
         parentMessageScopeSource,
+        historyCutoff,
         traceQuery: createTraceDbQueryTracer("channel_threads.loaded"),
       }),
       (durationMs, result) => {
@@ -4749,7 +6011,13 @@ channelRouter.get("/:id/threads", async (req, res) => {
       parent_message_scope_count: parentMessageIds.length,
       parent_message_scope_source: parentMessageScopeSource,
     });
-    res.json(summaries);
+    const threadLevels = (await loadConversationLevelSettings(req.userId!, {
+      threadChannelIds: Object.values(summaries).map((summary) => summary.threadChannelId),
+    })).thread;
+    res.json(Object.fromEntries(Object.entries(summaries).map(([parentId, summary]) => [
+      parentId,
+      { ...summary, notificationLevel: threadLevels.get(summary.threadChannelId) ?? "default" },
+    ])));
   } catch {
     res.status(500).json({ error: "Failed to get thread summaries" });
   }
@@ -4816,7 +6084,8 @@ channelRouter.get("/:id/threads/:messageId", async (req, res) => {
       history_limit_scope: "all_replies",
       reply_count: info.replyCount,
     });
-    res.json(info);
+    const threadLevel = (await loadConversationLevelSettings(req.userId!, { threadChannelIds: [info.threadChannelId] })).thread;
+    res.json({ ...info, notificationLevel: threadLevel.get(info.threadChannelId) ?? "default" });
   } catch {
     res.status(500).json({ error: "Failed to get thread info" });
   }

@@ -37,7 +37,13 @@ dbTest("triggers keep one timeline row per message, following channel moves and 
   const [message] = await db.insert(messages).values({
     channelId: chanA!.id, senderType: "user", senderId: owner!.id, content: "hello", searchText: "hello", createdAt,
   }).returning();
-  const row = async () => (await db.select().from(messageServerTimeline).where(eq(messageServerTimeline.messageId, message!.id)))[0];
+  // The placement columns only; search_vector (0658) is pinned in messageServerTimelineBackfill.test.ts.
+  const row = async () => (await db.select({
+    messageId: messageServerTimeline.messageId,
+    serverId: messageServerTimeline.serverId,
+    createdAt: messageServerTimeline.createdAt,
+    channelId: messageServerTimeline.channelId,
+  }).from(messageServerTimeline).where(eq(messageServerTimeline.messageId, message!.id)))[0];
 
   // Insert: the channel's server, the message's time.
   assert.deepEqual(await row(), { messageId: message!.id, serverId: serverA!.id, createdAt, channelId: chanA!.id });

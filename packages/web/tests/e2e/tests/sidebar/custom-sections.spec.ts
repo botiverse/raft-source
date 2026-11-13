@@ -185,6 +185,31 @@ function collectReactUpdateDepthErrors(page: Page) {
   return errors;
 }
 
+// dnd-kit auto-scrolls a scroller while the pointer is held in the outer 20%
+// of its height (its default threshold). A pause there scrolls the list under
+// a still pointer, so the drag legitimately ends over whatever section scrolls
+// in (Pinned, above Joint Channels), not over the row the test aimed at.
+const DND_KIT_AUTO_SCROLL_THRESHOLD = 0.2;
+
+async function requirePointerPointBelowAutoScrollBand(
+  itemInScroller: Locator,
+  point: { x: number; y: number },
+  label: string,
+) {
+  const bandBottom = await itemInScroller.evaluate((element, threshold) => {
+    for (let node = element.parentElement; node; node = node.parentElement) {
+      if (node.scrollHeight > node.clientHeight) {
+        const rect = node.getBoundingClientRect();
+        return rect.top + rect.height * threshold;
+      }
+    }
+    return null;
+  }, DND_KIT_AUTO_SCROLL_THRESHOLD);
+  if (bandBottom !== null && point.y <= bandBottom) {
+    throw new Error(`${label} is inside the sidebar's top autoscroll band (y ${point.y} <= ${bandBottom})`);
+  }
+}
+
 function requirePointerPointInViewport(
   page: Page,
   point: { x: number; y: number },
@@ -373,92 +398,6 @@ async function stubSetupSurfaces(page: Page) {
   });
 }
 
-test("activates a distant-target sortable drag before scrolling the source away", async ({ page }) => {
-  await page.setContent(`
-    <div id="scroller" style="height: 120px; width: 240px; overflow: auto">
-      <button id="source" aria-pressed="false" style="display: block; height: 40px">Source</button>
-      <div style="height: 480px"></div>
-      <button id="target" style="display: block; height: 40px">Target</button>
-    </div>
-    <script>
-      window.__dragEvents = [];
-      let pointerDown = false;
-      let downX = 0;
-      const recordOnce = (event) => {
-        if (!window.__dragEvents.includes(event)) window.__dragEvents.push(event);
-      };
-      document.querySelector("#source").addEventListener("mousedown", (event) => {
-        downX = event.clientX;
-        pointerDown = true;
-        recordOnce("source-down");
-      });
-      document.addEventListener("mousemove", (event) => {
-        if (pointerDown && Math.abs(event.clientX - downX) > 6) {
-          document.querySelector("#source").setAttribute("aria-pressed", "true");
-          recordOnce("drag-activated");
-        }
-      });
-      document.querySelector("#scroller").addEventListener("scroll", () => {
-        if (pointerDown) recordOnce("scroll-after-down");
-      });
-      document.querySelector("#target").addEventListener("mousemove", (event) => {
-        if (event.buttons === 1) recordOnce("target-move-with-button");
-      });
-      window.addEventListener("mouseup", () => {
-        pointerDown = false;
-        recordOnce("mouse-up");
-      });
-    </script>
-  `);
-
-  await dragCenterToCenter(page, page.locator("#source"), page.locator("#target"), { activateSortable: true });
-
-  await expect.poll(() => page.evaluate(() => (
-    globalThis as typeof globalThis & { __dragEvents: string[] }
-  ).__dragEvents)).toEqual([
-    "source-down",
-    "drag-activated",
-    "scroll-after-down",
-    "target-move-with-button",
-    "mouse-up",
-  ]);
-});
-
-test("recognizes production-style React update-depth pageerror messages", async ({ page }) => {
-  const updateDepthErrors = collectReactUpdateDepthErrors(page);
-
-  // This calibrates the pageerror listener only. Boundary-caught render errors
-  // are covered in the drag tests by asserting the error-boundary title stays
-  // absent from the page.
-  await page.setContent(`
-    <script>
-      setTimeout(() => {
-        throw new Error("Minified React error #185; visit https://react.dev/errors/185 for the full message");
-      }, 0);
-    </script>
-  `);
-
-  await expect.poll(() => updateDepthErrors.length).toBe(1);
-});
-
-test("routes render-phase errors to the root error boundary", async ({ page }) => {
-  const updateDepthErrors = collectReactUpdateDepthErrors(page);
-
-  await page.goto("/");
-  await expect.poll(() =>
-    page.evaluate(() => typeof window.__SLOCK_E2E__?.triggerRenderError === "function"),
-  ).toBe(true);
-  await page.evaluate(() => {
-    window.__SLOCK_E2E__!.triggerRenderError?.(
-      "Minified React error #185; visit https://react.dev/errors/185 for the full message",
-    );
-  });
-
-  await expect(page.getByText("Something went wrong")).toBeVisible();
-  await page.waitForTimeout(100);
-  expect(updateDepthErrors).toEqual([]);
-});
-
 test("keeps a regular channel stable while crossing Joint Channels", async ({ page, request }) => {
   const updateDepthErrors = collectReactUpdateDepthErrors(page);
 
@@ -480,8 +419,11 @@ test("keeps a regular channel stable while crossing Joint Channels", async ({ pa
   );
   // Keep the source row just below the pointer viewport. A locator can still be
   // "visible" there, but raw page.mouse coordinates cannot reach its center.
+  // Only just: once the source is scrolled into reach, the Joint target above
+  // it has to stay below the scroller's autoscroll band (see
+  // requirePointerPointBelowAutoScrollBand), so add no more rows than needed.
   const transitFillerIds = Array.from(
-    { length: 10 },
+    { length: 8 },
     (_, index) => `7f0a7f0a-0000-4000-8000-${String(index + 100).padStart(12, "0")}`,
   );
   await patchSidebarOrder(request, seedState, login.accessToken, {
@@ -626,6 +568,7 @@ test("keeps a regular channel stable while crossing Joint Channels", async ({ pa
   };
   requirePointerPointInViewport(page, sourcePoint, "Sidebar Joint Channels transit source");
   requirePointerPointInViewport(page, jointPoint, "Sidebar Joint Channels transit target");
+  await requirePointerPointBelowAutoScrollBand(sourceItem, jointPoint, "Sidebar Joint Channels transit target");
 
   await page.mouse.move(sourcePoint.x, sourcePoint.y);
   await page.mouse.down();
@@ -814,7 +757,9 @@ test("keeps drag stable when Pinned appears while crossing Joint to custom", asy
   await expect(sourceItem).toBeVisible();
   await expect(customSection).toBeVisible();
   await expect(pinnedSection).toHaveCount(0);
-  await expect(jointSection).toHaveCount(0);
+  // The owner can create joint channels, so the empty Joint Channels section
+  // keeps its "+" entry point even with hide-empty-sections on.
+  await expect(jointSection).toBeVisible();
   await expect(dmsSection).toHaveCount(0);
 
   await dragCenterAlongLocatorsAfterStart(page, sourceItem, [jointSection, pinnedSection, customDropTarget], async () => {
@@ -1056,26 +1001,35 @@ test("creates a personal section and moves a channel into it", async ({ page, re
     clientY: 700,
   });
   const sidebarMenu = page.getByRole("menu", { name: "Sidebar options" });
-  await expect(sidebarMenu.getByRole("menuitem", { name: "Create Channel" })).toBeVisible();
-  await expect(sidebarMenu.getByRole("menuitem", { name: "Create Joint Channel" })).toBeVisible();
-  await expect(sidebarMenu.getByRole("menuitem", { name: "New section…" })).toBeVisible();
+  await expect(sidebarMenu.getByRole("menuitem", { name: "Create channel" })).toBeVisible();
+  await expect(sidebarMenu.getByRole("menuitem", { name: "Create joint channel" })).toBeVisible();
+  await expect(sidebarMenu.getByRole("menuitem", { name: "New section" })).toBeVisible();
   await expect(sidebarMenu.getByRole("menuitem", { name: "Manage sections…" })).toHaveCount(0);
   await expect(sidebarMenu.getByRole("menuitem", { name: "Move to section" })).toHaveCount(0);
   await page.keyboard.press("Escape");
-  await channelsHeader.click({ button: "right" });
-  await page.getByRole("menuitem", { name: "New section…" }).click();
+  // A new section lands right above the section whose menu created it; start
+  // from Direct Messages so the later drag still moves it above Channels.
+  await page.getByTestId("sidebar-section-toggle-dms").click({ button: "right" });
+  await page.getByRole("menuitem", { name: "New section" }).click();
   await page.getByPlaceholder("My Project").fill(sectionName);
   await page.getByRole("button", { name: "Choose section emoji" }).click();
   const emojiPicker = page.getByRole("dialog", { name: "Choose section emoji" });
   await emojiPicker.getByRole("textbox", { name: "Type to search for an emoji" }).fill("rocket");
   await emojiPicker.getByRole("button", { name: "rocket" }).click();
-  await page.getByRole("button", { name: "Create section" }).click();
+  // Step 1's commit is "Create" (#12730 made it "Next", #13249 "Create"): it saves the section.
+  await page.getByRole("button", { name: "Create", exact: true }).click();
+  // Step 2 (add conversations) is optional: the section already exists.
+  await page.getByTestId("sidebar-section-add-skip").click();
 
   const customSection = page.locator('[data-testid^="sidebar-custom-section-"]', { hasText: sectionName });
   await expect(customSection).toBeVisible();
   const customSectionTestId = await customSection.getAttribute("data-testid");
   const customSectionId = customSectionTestId?.slice("sidebar-custom-section-".length);
   if (!customSectionId) throw new Error("Created sidebar section is missing its persisted id");
+  await expect.poll(async () => {
+    const order = (await getSidebarOrder(request, seedState, login.accessToken)).sectionOrder;
+    return order.indexOf(customSectionId) === order.indexOf("system:dms") - 1;
+  }).toBe(true);
   await expect(customSection.getByText("🚀")).toBeVisible();
   const channelRow = page.locator(`button[data-sidebar-channel-id="${seedState.channel.id}"]`);
   await expect(channelRow).toBeVisible();

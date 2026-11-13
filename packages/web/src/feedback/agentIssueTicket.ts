@@ -1,10 +1,12 @@
 import api from "../api/client";
 import { isElectronDesktopShell } from "../utils/desktopShell";
+import { getDesktopBridge } from "../utils/desktopBridge";
+import { productFeedbackForm } from "./productFeedbackForm";
 
 // Kept apart from handsFeedbackTransport.ts on purpose: that module imports
 // @botiverse/hands-feedback-react, and the agent Report Issue dialog is in the
 // startup bundle, which must not pull the feedback workspace in
-// (scripts/check-feedback-workspace-split.mjs).
+// (scripts/check-feedback-workspace-split.ts).
 
 // When feedback is submitted from the desktop shell, attribute it via the server's
 // structured feedback `metadata` channel (routes/productFeedback.ts parses a JSON
@@ -17,9 +19,7 @@ import { isElectronDesktopShell } from "../utils/desktopShell";
 // below still sends `locale`). Exported for tests.
 export async function desktopFeedbackMetadata(): Promise<Record<string, string> | null> {
   if (!isElectronDesktopShell()) return null;
-  const raftDesktop = (window as {
-    raftDesktop?: { platform?: string; getAppVersion?: () => Promise<string> };
-  }).raftDesktop;
+  const raftDesktop = getDesktopBridge();
   let version = "";
   try {
     version = (await raftDesktop?.getAppVersion?.()) ?? "";
@@ -48,13 +48,13 @@ export async function createAgentIssueTicket(input: {
   submissionId: string;
   locale: string;
 }): Promise<{ id: string }> {
-  const form = new FormData();
-  form.set("type", "problem");
-  form.set("message", input.message);
   const desktopMetadata = await desktopFeedbackMetadata();
-  form.set("metadata", JSON.stringify({ ...desktopMetadata, locale: input.locale }));
-  form.set("submission_id", input.submissionId);
-  form.set("may_contact", "false");
+  const form = productFeedbackForm({
+    type: "problem",
+    message: input.message,
+    submissionId: input.submissionId,
+    metadata: { ...desktopMetadata, locale: input.locale },
+  });
   form.set("feedback_report_id", input.feedbackReportId);
   const { data } = await api.post<{ id: string }>("/product-feedback", form);
   return { id: data.id };

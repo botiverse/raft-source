@@ -1,0 +1,2 @@
+ALTER TABLE "mcp_app_templates" ADD COLUMN "oauth_client_mode" text DEFAULT 'either' NOT NULL;--> statement-breakpoint
+ALTER TABLE "mcp_app_templates" ADD CONSTRAINT "mcp_app_templates_oauth_client_mode_valid" CHECK ("mcp_app_templates"."oauth_client_mode" IN ('automatic', 'registered', 'either'));

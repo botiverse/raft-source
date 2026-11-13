@@ -17,8 +17,11 @@
  *   shape clients must handle rather than a response Codex sends now).
  * - batch 3b (Claude, Cursor, Copilot): `claude.edit.json` is a Custom provider
  *   (its stored API key is never in `values`), `claude.option-source.provider.json`
- *   the static provider select, `claude.option-source.fallback.json` Claude's
- *   bundled list while the Computer is offline, `cursor.option-source.fallback.json` Cursor's
+ *   the static provider select, `claude.option-source.auth-type.json` the static
+ *   Custom authentication select, `claude.option-source.fallback.json` Claude's
+ *   bundled list while the Computer is offline, `claude.option-source.live.json` Claude
+ *   Code's own list with `unavailableOptions` (a disabled model with its reason, then
+ *   bundled models it did not list), `cursor.option-source.fallback.json` Cursor's
  *   bundled list when its probe is not live, and `copilot.option-source.live.json`
  *   Copilot's declared static catalog as the Computer reports it. Copilot CLI is
  *   deprecated (edit-only, like the batch 2 deprecated runtimes), so it has
@@ -30,6 +33,9 @@
  *   `pi.option-source.provider-model.json` the built-in providers' model lists
  *   (a dependent_select), and `pi.option-source.fallback.json` the Configured
  *   model list when the Pi probe says missing_config.
+ * - Antigravity (revived on the OAR host): `antigravity.edit.json` and
+ *   `antigravity.option-source.live.json`, the Computer's agy models after the
+ *   configured default, with efforts only for a model agy lists levels for.
  *
  * Clients test against these files instead of converting v1 samples themselves,
  * so all of them follow one source. A red here means the server's v2 output
@@ -76,8 +82,9 @@ async function nonLiveOptionSource(runtimeId: string, outcome: unknown = { kind:
 const editFixture = (runtimeId: string, runtimeConfig: Record<string, unknown>) =>
   buildRuntimeFormV2EditBody(runtimeId, { runtime: runtimeId, ...runtimeConfig });
 
-// Batch 2: OpenCode (create and edit) and the deprecated, edit-only Kimi CLI,
-// Gemini CLI and Antigravity CLI.
+// Batch 2: OpenCode (create and edit) and the deprecated, edit-only Kimi CLI and
+// Gemini CLI; Antigravity's edit fixture (now a live-list model form with an
+// effort) stays here: a stored "default" model with a Default (null) effort.
 const batch2Fixtures = async (): Promise<Record<string, unknown>> => ({
   "opencode.form.json": buildRuntimeFormV2("opencode"),
   "opencode.edit.json": editFixture("opencode", {
@@ -117,6 +124,18 @@ const batch3aFixtures = async (): Promise<Record<string, unknown>> => ({
   "codex.option-source.unavailable.json": reasoningModelOptionSource("codex", [], undefined, "machine_offline", { customModel: true }),
 });
 
+/** Antigravity's agy models as the Computer reports them: levels only for the current model. */
+const AGY_LIVE = {
+  kind: "live",
+  value: {
+    models: [
+      { id: "gemini-3.8-flash", label: "Gemini 3.8 Flash", supportedReasoningEfforts: ["low", "medium", "high"], defaultReasoningEffort: "medium" },
+      { id: "gemini-4-carbon-medium", label: "Gemini 4 Carbon (Medium)" },
+    ],
+    default: "gemini-3.8-flash",
+  },
+};
+
 /** The option source the server answers for `sourceId` with a probe that must not run. */
 async function staticOptionSource(runtimeId: string, sourceId: string): Promise<unknown> {
   const context = {
@@ -144,7 +163,21 @@ const batch3bFixtures = async (): Promise<Record<string, unknown>> => ({
     command: "/usr/local/bin/claude",
   }),
   "claude.option-source.provider.json": await staticOptionSource("claude", "provider"),
+  "claude.option-source.auth-type.json": await staticOptionSource("claude", "authType"),
   "claude.option-source.fallback.json": await nonLiveOptionSource("claude", { kind: "error", retryable: true, code: "computer_offline" }),
+  // Claude Code's own list on this Computer: a disabled model with its reason
+  // in `unavailableOptions` (never `options`).
+  "claude.option-source.live.json": await nonLiveOptionSource("claude", {
+    kind: "live",
+    value: {
+      models: [
+        { id: "opus", label: "Claude Opus (Opus 5.5)", supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "max"] },
+        { id: "claude-opus-5-5", label: "Claude Opus 5.5", supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "max"] },
+        { id: "claude-sonnet-5-5", label: "Claude Sonnet 5.5", supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "max"] },
+      ],
+      unavailable: [{ id: "claude-opus-9", label: "Claude Opus 9", reason: "Update Claude Code to use this model" }],
+    },
+  }),
   "cursor.form.json": buildRuntimeFormV2("cursor"),
   "cursor.edit.json": editFixture("cursor", {
     model: { kind: "custom", name: "my-org/cursor-custom" },
@@ -156,6 +189,7 @@ const batch3bFixtures = async (): Promise<Record<string, unknown>> => ({
     reasoningEffort: "high",
     envVars: { EXAMPLE_FLAG: "1" },
   }),
+  "antigravity.option-source.live.json": await nonLiveOptionSource("antigravity", AGY_LIVE),
   "copilot.option-source.live.json": await nonLiveOptionSource("copilot", {
     kind: "live",
     value: getStaticRuntimeModelSourceSet("copilot"),
@@ -186,6 +220,7 @@ const batch4Fixtures = async (): Promise<Record<string, unknown>> => ({
 
 const fixtures: Record<string, unknown> = {
   "builtin.form.json": builtinForm,
+  "builtin.option-source.reasoning-effort.json": await staticOptionSource("builtin", "reasoningEffort"),
   "kimi-sdk.form.json": kimiForm,
   "builtin.edit.json": editFixture("builtin", {
     provider: {

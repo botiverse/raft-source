@@ -3,9 +3,12 @@
  * hosted (Antiproton) agent, briefed once its workspace import lands instead
  * of when a computer comes online.
  */
+import { AssistantCannotUseComputerError, lockMachineTakingAgents } from "./computerAgents";
+import { revokeRunnerCredentialsOffMachine } from "./agentCredentialService";
+import { agentConfigValues, recordAgentConfigChange } from "./agentConfigChangeEvents";
 import type { Server as SocketServer } from "socket.io";
 import { and, count, eq, gte, isNotNull, isNull, lte, ne, notInArray, or, sql } from "drizzle-orm";
-import { clearClockInterval, currentDate, EXTERNAL_AGENT_RUNTIME_ID, EXTERNAL_AGENT_RUNTIME_MODEL, noopTracer, setClockInterval, type ReasoningEffort, type RuntimeConfig, type Tracer } from "@botiverse/raft-shared";
+import { clearClockInterval, currentDate, EXTERNAL_AGENT_RUNTIME_ID, EXTERNAL_AGENT_RUNTIME_MODEL, noopTracer, setClockInterval, type ReasoningEffort, type LegacyColumnReasoningEffort, type RuntimeConfig, type Tracer } from "@botiverse/raft-shared";
 import { getDb } from "../db/index";
 import { agentRuntimeProvisions, agents, inboxNotificationFacts, reminders, serverMembers, servers } from "../db/schema";
 import { fireReminder } from "../apps/reminder/service";
@@ -39,6 +42,28 @@ export async function isHostedCindyEnabled(serverId: string): Promise<boolean> {
     return cindy.enabled === true && await isAgentRuntimeProviderEnabledForServer(serverId, "antiproton");
   } catch (error) {
     console.warn(`[HostedCindy] ${ANTIPROTON_CINDY_FEATURE_FLAG_KEY} evaluation failed; leaving it off`, error instanceof Error ? error.message : error);
+    return false;
+  }
+}
+
+/**
+ * The staging-only test entry (tygg, #raft-antiproton:f5f3e410): the setup
+ * screen's "Use cloud agent" link creates a hosted Cindy on a server whose
+ * `antiproton_cindy` is off. Never on any other deployment, so production
+ * cannot reach it whatever its flags say.
+ */
+export function isHostedCindyTestEntryDeployment(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.DEPLOYMENT_ENV === "staging";
+}
+
+/** Whether the test entry applies to this server for this user: owner, no onboarding agent yet, hosted runtime on. */
+export async function isHostedCindyTestEntryAvailable(input: { serverId: string; userId: string }): Promise<boolean> {
+  if (!isHostedCindyTestEntryDeployment()) return false;
+  const server = await serverService.getServer(input.serverId);
+  if (!server || server.ownerId !== input.userId || server.onboardingAgentId) return false;
+  try {
+    return await isAgentRuntimeProviderEnabledForServer(input.serverId, "antiproton");
+  } catch {
     return false;
   }
 }
@@ -170,7 +195,7 @@ export async function convertFailedHostedCindyToComputer(input: {
   runtime: string;
   model: string;
   runtimeConfig: RuntimeConfig;
-  reasoningEffort: ReasoningEffort | null;
+  reasoningEffort: LegacyColumnReasoningEffort | null;
   envVars: Record<string, string> | null;
   machineId: string | null;
   tracer?: Tracer;
@@ -181,15 +206,27 @@ export async function convertFailedHostedCindyToComputer(input: {
     importErrorCode: agentRuntimeProvisions.importErrorCode,
     setupRetryAt: agentRuntimeProvisions.setupRetryAt,
   }).from(agentRuntimeProvisions).where(eq(agentRuntimeProvisions.agentId, input.agentId)).limit(1);
+  // Never a personal assistant (agents_assistant_not_on_machine; Cindy is not
+  // one): refused before anything is deleted. assistant_owner_user_id is only
+  // ever set when an assistant is created, so it cannot appear afterwards.
+  if (input.machineId) {
+    const [subject] = await getDb().select({ assistantOwnerUserId: agents.assistantOwnerUserId }).from(agents).where(eq(agents.id, input.agentId)).limit(1);
+    if (subject?.assistantOwnerUserId) throw new AssistantCannotUseComputerError();
+  }
   // The provider side goes first, and must be confirmed gone: never both sides alive.
   if (!await deleteProviderAgentNow(input.agentId, input.serverId)) {
     throw new HostedCindyConversionError("The cloud runtime did not confirm the delete; nothing was changed, try again");
   }
   await getDb().transaction(async (tx) => {
     await settleProvisionDeleted(tx, input.agentId, input.actorUserId);
+    const [before] = await tx.select({ serverId: agents.serverId, runtime: agents.runtime, model: agents.model, reasoningEffort: agents.reasoningEffort })
+      .from(agents).where(and(eq(agents.id, input.agentId), isNull(agents.deletedAt))).limit(1).for("update");
+    // Not onto a computer whose key was revoked (computerAgents.ts).
+    if (input.machineId) await lockMachineTakingAgents(tx, input.machineId);
     // Runtime columns only (her profile, name and role stay): the computer runtime and
     // seed the owner picked, on the computer they picked.
-    await tx.update(agents).set({
+    const now = currentDate();
+    const converted = await tx.update(agents).set({
       runtime: input.runtime,
       model: input.model,
       runtimeConfig: input.runtimeConfig,
@@ -197,8 +234,22 @@ export async function convertFailedHostedCindyToComputer(input: {
       envVars: input.envVars,
       sessionId: null,
       machineId: input.machineId,
-      updatedAt: currentDate(),
-    }).where(and(eq(agents.id, input.agentId), isNull(agents.deletedAt)));
+      ...(input.machineId ? { machineReleaseReason: null, machineReleasedAt: null } : {}),
+      updatedAt: now,
+    }).where(and(eq(agents.id, input.agentId), isNull(agents.deletedAt)))
+      .returning({ runtime: agents.runtime, model: agents.model, reasoningEffort: agents.reasoningEffort });
+    await revokeRunnerCredentialsOffMachine(tx, { agentIds: [input.agentId], machineId: input.machineId, now });
+    if (before && converted[0]) {
+      await recordAgentConfigChange(tx, {
+        serverId: before.serverId,
+        agentId: input.agentId,
+        source: "hosted_cindy_convert_to_computer",
+        actor: { kind: "user", id: input.actorUserId },
+        before: agentConfigValues(before),
+        after: agentConfigValues(converted[0]),
+        changedAt: now,
+      });
+    }
   });
   recordTraceEvent("onboarding.hosted_cindy.converted_to_computer", {
     server_id: input.serverId,
@@ -432,8 +483,13 @@ export async function provisionHostedCindy(input: {
   ownerUserId: string;
   tracer?: Tracer;
   now?: Date;
+  /** The staging test entry: `antiproton_cindy` is not required, the hosted runtime still is. */
+  testEntry?: boolean;
 }): Promise<HostedCindyProvisionOutcome> {
-  if (!await isHostedCindyEnabled(input.serverId)) return { outcome: "disabled" };
+  const enabled = input.testEntry
+    ? isHostedCindyTestEntryDeployment() && await isAgentRuntimeProviderEnabledForServer(input.serverId, "antiproton")
+    : await isHostedCindyEnabled(input.serverId);
+  if (!enabled) return { outcome: "disabled" };
   const server = await serverService.getServer(input.serverId);
   if (!server) return { outcome: "unavailable" };
   if (server.onboardingAgentId) return { outcome: "exists" };
@@ -445,8 +501,7 @@ export async function provisionHostedCindy(input: {
   )).limit(1);
   if (orphan) {
     await getDb().transaction(async (tx) => {
-      await serverService.updateServerOnboardingAgent(input.serverId, orphan.agentId, { executor: tx });
-      await serverService.updateAgentMemberRole(input.serverId, orphan.agentId, OFFICIAL_ONBOARDING_AGENT_IDENTITY.serverRole, { executor: tx });
+      await serverService.grantOnboardingAgentRole(input.serverId, orphan.agentId, OFFICIAL_ONBOARDING_AGENT_IDENTITY.serverRole, { executor: tx });
     });
     recordTraceEvent("onboarding.hosted_cindy.relinked", { server_id: input.serverId, agent_id: orphan.agentId }, input.tracer);
     return { outcome: "exists" };
@@ -476,6 +531,7 @@ export async function provisionHostedCindy(input: {
       avatarUrl: OFFICIAL_ONBOARDING_AGENT_IDENTITY.avatarUrl,
       creatorType: "user",
       creatorId: input.ownerUserId,
+      configChangeSource: "hosted_cindy_create",
       afterInsert: async (tx, created) => {
         const [existing] = await tx.select({ agentId: agentRuntimeProvisions.agentId }).from(agentRuntimeProvisions).where(and(
           eq(agentRuntimeProvisions.serverId, input.serverId),
@@ -507,8 +563,7 @@ export async function provisionHostedCindy(input: {
             eq(serverMembers.role, "owner"),
             ne(serverMembers.setupStatus, "complete"),
           ));
-        await serverService.updateServerOnboardingAgent(input.serverId, created.id, { executor: tx });
-        await serverService.updateAgentMemberRole(input.serverId, created.id, OFFICIAL_ONBOARDING_AGENT_IDENTITY.serverRole, { executor: tx });
+        await serverService.grantOnboardingAgentRole(input.serverId, created.id, OFFICIAL_ONBOARDING_AGENT_IDENTITY.serverRole, { executor: tx });
       },
     });
     agentId = agent.id;
@@ -536,16 +591,16 @@ export async function provisionHostedCindy(input: {
  * backstop (a server that committed without its Cindy, e.g. a crash or a failed
  * create). Idempotent through provisionHostedCindy; never throws.
  */
-export async function ensureHostedCindy(input: { serverId: string; ownerUserId: string; tracer?: Tracer; site: "server_create" | "setup_backstop" }): Promise<HostedCindyProvisionOutcome | null> {
+export async function ensureHostedCindy(input: { serverId: string; ownerUserId: string; tracer?: Tracer; site: "server_create" | "setup_backstop" | "test_entry" }): Promise<HostedCindyProvisionOutcome | null> {
   try {
-    const result = await provisionHostedCindy(input);
+    const result = await provisionHostedCindy({ ...input, testEntry: input.site === "test_entry" });
     if (result.outcome === "created") {
       recordTraceEvent("onboarding.hosted_cindy.created", { server_id: input.serverId, agent_id: result.agentId, site: input.site }, input.tracer);
     } else if (
       result.outcome === "name_taken"
       || result.outcome === "unavailable"
       // Once per server: the backstop runs on every owner setup load of a flag-off server.
-      || (result.outcome === "disabled" && input.site === "server_create")
+      || (result.outcome === "disabled" && input.site !== "setup_backstop")
     ) {
       // The owner keeps the "connect a computer" flow (cap_reached has its own event).
       recordTraceEvent("onboarding.hosted_cindy.skipped", { server_id: input.serverId, reason: result.outcome, site: input.site }, input.tracer);

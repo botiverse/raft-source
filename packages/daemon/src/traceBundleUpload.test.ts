@@ -292,4 +292,122 @@ test("stop prevents further uploads after startup", async () => {
   }
 });
 
+test("this runner's bundles follow runnerWorkerUrl; Computer diag markers keep the machine-level workerUrl", async () => {
+  const machineDir = await mkdtemp(path.join(os.tmpdir(), "slock-daemon-trace-upload-per-server-"));
+  try {
+    const traceDir = path.join(machineDir, "traces");
+    await mkdir(traceDir, { recursive: true });
+    const rotating = "daemon-trace-2026-05-08T00-00-00-000Z-1000-0000.jsonl";
+    const cliTransport = "daemon-trace-cli-transport-agent-1.jsonl";
+    const diag = "daemon-trace-diag-correlation-1.jsonl";
+    for (const name of [rotating, cliTransport, diag]) {
+      await writeFile(path.join(traceDir, name), `{"type":"span","name":"${name}"}\n`);
+    }
+    const workerCalls: Array<{ url: string; sha: string }> = [];
+    let n = 0;
+    const uploader = new DaemonTraceBundleUploader({
+      machineDir,
+      serverUrl: "https://server-a.test",
+      apiKey: "sk_machine_test",
+      workerUrl: "https://default-worker.test",
+      runnerWorkerUrl: () => ({ url: "http://localhost:18787", serverProvided: false }),
+      minFileAgeMs: 0,
+      fetchImpl: async (url, init) => {
+        const body = typeof init?.body === "string" ? JSON.parse(init.body) as { metadata?: { bundleSha256: string }; bundleSha256?: string } : null;
+        if (url === "https://server-a.test/internal/machine/scope-attestation") {
+          n += 1;
+          return jsonResponse({ attestation: `token-${n}`, metadata: { ...body!.metadata, uploadId: `upload-${n}` } });
+        }
+        if (url.endsWith("/api/trace-bundles")) {
+          workerCalls.push({ url, sha: body!.bundleSha256! });
+          return jsonResponse({ upload: { method: "PUT", url: `https://storage.test/${workerCalls.length}` } });
+        }
+        if (url.startsWith("https://storage.test/")) return new Response(null, { status: 200 });
+        return jsonResponse({ error: `unexpected ${url}` }, 500);
+      },
+    });
+    assert.deepEqual(await uploader.uploadOnce(), { attempted: 3, uploaded: 3, deferred: 0 });
+    const shaOf = async (name: string) => {
+      const { gzipSync } = await import("node:zlib");
+      return sha256Hex(gzipSync(await readFile(path.join(traceDir, name))));
+    };
+    const urlFor = new Map(workerCalls.map((call) => [call.sha, call.url]));
+    assert.equal(urlFor.get(await shaOf(rotating)), "http://localhost:18787/api/trace-bundles");
+    assert.equal(urlFor.get(await shaOf(cliTransport)), "http://localhost:18787/api/trace-bundles");
+    assert.equal(urlFor.get(await shaOf(diag)), "https://default-worker.test/api/trace-bundles");
+  } finally {
+    await rm(machineDir, { recursive: true, force: true });
+  }
+});
+
+// #proj-raft-computer:#54: a runner attached to a server that is not Raft's
+// has no receiver unless its owner sets one or its server names one: nothing
+// leaves the machine, not even the attestation request.
+test("with no receiver for this runner, nothing is sent and the files stay", async () => {
+  const machineDir = await mkdtemp(path.join(os.tmpdir(), "slock-daemon-trace-upload-none-"));
+  try {
+    const traceDir = path.join(machineDir, "traces");
+    await mkdir(traceDir, { recursive: true });
+    const names = ["daemon-trace-2026-05-08T00-00-00-000Z-1000-0000.jsonl", "daemon-trace-diag-correlation-1.jsonl"];
+    for (const name of names) await writeFile(path.join(traceDir, name), `{"type":"span","name":"${name}"}\n`);
+    const calls: string[] = [];
+    const uploader = new DaemonTraceBundleUploader({
+      machineDir,
+      serverUrl: "https://raft.example.org",
+      apiKey: "sk_machine_test",
+      workerUrl: null,
+      runnerWorkerUrl: () => ({ url: null, serverProvided: false }),
+      minFileAgeMs: 0,
+      fetchImpl: async (url) => {
+        calls.push(String(url));
+        return jsonResponse({ error: "unexpected" }, 500);
+      },
+    });
+    const outcome = await uploader.uploadOnce();
+    assert.equal(outcome.uploaded, 0);
+    assert.deepEqual(calls, [], "no request at all");
+    for (const name of names) assert.ok((await readFile(path.join(traceDir, name), "utf8")).length > 0, `${name} stays`);
+  } finally {
+    await rm(machineDir, { recursive: true, force: true });
+  }
+});
+
+test("a server-named receiver that hands back an off-origin PUT target gets no bytes, and the file stays pending", async () => {
+  const machineDir = await mkdtemp(path.join(os.tmpdir(), "slock-daemon-trace-upload-pinned-"));
+  try {
+    const traceDir = path.join(machineDir, "traces");
+    await mkdir(traceDir, { recursive: true });
+    const name = "daemon-trace-2026-05-08T00-00-00-000Z-1000-0000.jsonl";
+    await writeFile(path.join(traceDir, name), '{"type":"span"}\n');
+    const urls: string[] = [];
+    const uploader = new DaemonTraceBundleUploader({
+      machineDir,
+      serverUrl: "https://server-a.test",
+      apiKey: "sk_machine_test",
+      workerUrl: "https://default-worker.test",
+      runnerWorkerUrl: () => ({ url: "http://localhost:18787", serverProvided: true }),
+      minFileAgeMs: 0,
+      fetchImpl: async (url, init) => {
+        urls.push(`${url} redirect=${init?.redirect ?? "follow"}`);
+        if (url.endsWith("/internal/machine/scope-attestation")) {
+          const body = JSON.parse(String(init?.body)) as { metadata: Record<string, unknown> };
+          return jsonResponse({ attestation: "token", metadata: body.metadata });
+        }
+        if (url === "http://localhost:18787/api/trace-bundles") {
+          return jsonResponse({ upload: { method: "PUT", url: "https://elsewhere.test/object" } });
+        }
+        return new Response(null, { status: 200 });
+      },
+    });
+    assert.deepEqual(await uploader.uploadOnce(), { attempted: 1, uploaded: 0, deferred: 0 });
+    assert.deepEqual(urls, [
+      "https://server-a.test/internal/machine/scope-attestation redirect=follow",
+      "http://localhost:18787/api/trace-bundles redirect=error",
+    ]);
+    await assert.rejects(readFile(path.join(machineDir, "trace-uploads", `${name}.uploaded.json`)));
+  } finally {
+    await rm(machineDir, { recursive: true, force: true });
+  }
+});
+
 });

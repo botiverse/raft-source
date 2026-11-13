@@ -1,6 +1,6 @@
 // Generated directly from activity-sync.tsp via the TypeSpec compiler semantic graph.
 // DO NOT EDIT. JSON Schema and OpenAPI are parallel outputs, not inputs.
-// Source SHA-256: e47e0d12055c37c01c522f608e5d1b2e56378a588b24894f450468353791bdad
+// Source SHA-256: 1cbe55c751b86871408f84e9c98c7fcbe2dcd7b02214b64d66de574c8f72b263
 @file:OptIn(ExperimentalSerializationApi::class)
 
 package build.raft.app.network.sync.activity.contract.v1
@@ -54,13 +54,13 @@ object ActivitySyncContractJson {
 
 }
 
-const val ACTIVITY_SYNC_TYPESPEC_SHA256: String = "e47e0d12055c37c01c522f608e5d1b2e56378a588b24894f450468353791bdad"
+const val ACTIVITY_SYNC_TYPESPEC_SHA256: String = "1cbe55c751b86871408f84e9c98c7fcbe2dcd7b02214b64d66de574c8f72b263"
 
-/** Wire contract identity, compared with the server-reported contract (X-Raft-Contract header, follow-up to task #3). */
+/** Identity of the retained library contract and binding fixtures. */
 const val ACTIVITY_SYNC_CONTRACT: String = "raft.activity-sync"
 
-/** Contract revision from revisions.json; enable the sync engine only when the server reports exactly this revision. */
-const val ACTIVITY_SYNC_CONTRACT_REVISION: Int = 2
+/** Contract revision from revisions.json; this metadata does not enable a serving endpoint. */
+const val ACTIVITY_SYNC_CONTRACT_REVISION: Int = 3
 
 typealias OpaqueId = String
 

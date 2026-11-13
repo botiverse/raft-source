@@ -42,10 +42,11 @@ export async function resolveExternalConversationTarget(input: {
   executor: DatabaseExecutor;
   authorityChannelId: string;
   expectedStorageChannelId?: string;
+  allowArchivedForQueuedDelivery?: boolean;
 }): Promise<ExternalConversationTarget | null> {
   const [local] = await input.executor.select().from(channels)
     .where(eq(channels.id, input.authorityChannelId)).limit(1);
-  if (!local || local.deletedAt || local.archivedAt) return null;
+  if (!local || local.deletedAt || (local.archivedAt && !input.allowArchivedForQueuedDelivery)) return null;
 
   const canonicalChannel = alias(channels, "external_conversation_canonical_channel");
   const [projection] = await input.executor.select({
@@ -111,7 +112,7 @@ export async function resolveExternalConversationTarget(input: {
   if (
     projection.jointStatus !== "active"
     || projection.storageDeletedAt
-    || projection.storageArchivedAt
+    || (projection.storageArchivedAt && !input.allowArchivedForQueuedDelivery)
     || (input.expectedStorageChannelId
       && input.expectedStorageChannelId !== projection.storageChannelId)
   ) return null;

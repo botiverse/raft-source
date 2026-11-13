@@ -6,8 +6,11 @@ import { join } from "node:path";
 import { eq, sql } from "drizzle-orm";
 import { getDb, getRootDb } from "./index";
 import {
+  afterAmbientCommit,
   afterAmbientTransaction,
+  ExecutorOnlyDatabaseAccessError,
   isInTransaction,
+  runExecutorOnly,
   recordExternalSinkInsideTransaction,
   installAuditedGlobalFetch,
   setSavepointDrainTimeoutMsForTests,
@@ -308,6 +311,30 @@ test("afterAmbientTransaction work runs after the commit, outside the transactio
   assert.deepEqual(afterRollback, [false]);
 });
 
+test("afterAmbientCommit work runs once per key after the commit, outside it; nothing after a rollback", async ({ db: _db }) => {
+  const root = getDb();
+  const ran: Array<{ key: string; inTx: boolean }> = [];
+  const note = (key: string) => () => ran.push({ key, inTx: isInTransaction() });
+  await root.transaction(async () => {
+    afterAmbientCommit("a", note("a"));
+    // A savepoint registers on the outer transaction; the same key again is dropped.
+    await root.transaction(async () => { afterAmbientCommit("a", note("a-again")); afterAmbientCommit("b", note("b")); });
+    assert.deepEqual(ran, [], "nothing while the transaction is open");
+  });
+  assert.deepEqual(ran, [{ key: "a", inTx: false }, { key: "b", inTx: false }]);
+
+  ran.length = 0;
+  afterAmbientCommit("now", note("now"));
+  assert.deepEqual(ran, [{ key: "now", inTx: false }], "with no transaction open it runs now");
+
+  ran.length = 0;
+  await assert.rejects(root.transaction(async () => {
+    afterAmbientCommit("rolled-back", note("rolled-back"));
+    throw new Error("roll back");
+  }));
+  assert.deepEqual(ran, [], "a rolled-back transaction runs none of it");
+});
+
 test("a failing statement swallowed in a savepoint leaves the transaction usable; swallowed bare, it aborts it", async ({ db: _db }) => {
   // The rule behind the 10-15 fixes: inside a transaction, a caught DB error is
   // only safe to continue past if the statement ran in a savepoint.
@@ -328,4 +355,49 @@ test("a failing statement swallowed in a savepoint leaves the transaction usable
       ?? (error as { cause?: { code?: string } }).cause?.code;
     return code === "25P02";
   });
+});
+
+test("runExecutorOnly: inside it the root database is off limits (the ambient transaction too); the handed executor works", async ({ db: _db }) => {
+  const root = getDb();
+  const ran: string[] = [];
+  await root.transaction(async (tx) => {
+    const user = await insertUser(tx as never, "executor-only@test.com");
+    const answer = await runExecutorOnly("the test section", async () => {
+      // The executor it was handed: the transaction, its own uncommitted row included.
+      const [seen] = await tx.select().from(users).where(eq(users.id, user.id));
+      assert.equal(seen?.id, user.id);
+      assert.equal(isInTransaction(), true);
+      // getDb(), a handle taken earlier, a transaction of the root, the escape hatch: all refused.
+      const refused = (error: unknown) => error instanceof ExecutorOnlyDatabaseAccessError && error.section === "the test section";
+      assert.throws(() => getDb().select(), refused);
+      assert.throws(() => root.insert(users), refused);
+      assert.throws(() => getDb().transaction(async () => undefined), refused);
+      assert.throws(() => getRootDb(), refused);
+      // In what it awaits as well, however deep.
+      await assert.rejects((async () => {
+        await Promise.resolve();
+        return getDb().select().from(users);
+      })(), /the test section may use the database only through the executor it is handed, not getDb\(\)\.select/);
+      // The outer transaction's own bookkeeping is shared.
+      afterAmbientTransaction(() => ran.push("after"));
+      return "done";
+    });
+    assert.equal(answer, "done");
+    assert.deepEqual(ran, [], "registered inside the section, run with the outer transaction");
+    // Past the section the ambient transaction is back.
+    const [again] = await getDb().select().from(users).where(eq(users.id, user.id));
+    assert.equal(again?.id, user.id);
+  });
+  assert.deepEqual(ran, ["after"]);
+});
+
+test("runExecutorOnly with no transaction open refuses the root too, and only inside", async ({ db: _db }) => {
+  await assert.rejects(runExecutorOnly("a section", async () => getDb().select().from(users)), ExecutorOnlyDatabaseAccessError);
+  await runExecutorOnly("a section", async () => {
+    assert.equal(isInTransaction(), false);
+    let ranNow = false;
+    afterAmbientTransaction(() => { ranNow = true; });
+    assert.equal(ranNow, true, "no transaction: run at once");
+  });
+  assert.equal((await getDb().select().from(users).limit(1)).length >= 0, true);
 });

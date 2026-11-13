@@ -1,0 +1,146 @@
+{
+  "protocolVersion": 1,
+  "runtimeId": "builtin",
+  "schemaVersion": "builtin-pi.create.v3",
+  "sourceId": "provider",
+  "kind": "select",
+  "pointer": "/providerId",
+  "options": [
+    {
+      "value": "connection:conn-deepseek",
+      "label": "DeepSeek · Team",
+      "providerKind": "preset",
+      "connectionId": "conn-deepseek",
+      "underlyingProviderId": "deepseek",
+      "group": "saved"
+    },
+    {
+      "value": "connection:conn-gateway",
+      "label": "OpenAI Compatible · Team gateway",
+      "providerKind": "gateway",
+      "connectionId": "conn-gateway",
+      "underlyingProviderId": "openai-compatible",
+      "group": "saved"
+    },
+    {
+      "value": "deepseek",
+      "label": "DeepSeek",
+      "providerKind": "preset",
+      "group": "direct"
+    },
+    {
+      "value": "minimax",
+      "label": "MiniMax",
+      "providerKind": "preset",
+      "group": "direct"
+    },
+    {
+      "value": "minimax-cn",
+      "label": "MiniMax CN",
+      "providerKind": "preset",
+      "group": "direct"
+    },
+    {
+      "value": "zai",
+      "label": "Z.AI",
+      "providerKind": "preset",
+      "group": "direct"
+    },
+    {
+      "value": "zai-coding-cn",
+      "label": "Z.AI Coding CN",
+      "providerKind": "preset",
+      "group": "direct"
+    },
+    {
+      "value": "moonshotai",
+      "label": "Moonshot AI",
+      "providerKind": "preset",
+      "group": "direct"
+    },
+    {
+      "value": "moonshotai-cn",
+      "label": "Moonshot AI CN",
+      "providerKind": "preset",
+      "group": "direct"
+    },
+    {
+      "value": "kimi-coding",
+      "label": "Kimi For Coding",
+      "providerKind": "preset",
+      "group": "direct"
+    },
+    {
+      "value": "qwen-token-plan",
+      "label": "Qwen Token Plan",
+      "providerKind": "preset",
+      "group": "direct"
+    },
+    {
+      "value": "qwen-token-plan-cn",
+      "label": "Qwen Token Plan CN",
+      "providerKind": "preset",
+      "group": "direct"
+    },
+    {
+      "value": "openrouter",
+      "label": "OpenRouter",
+      "providerKind": "preset",
+      "group": "direct"
+    },
+    {
+      "value": "openai",
+      "label": "OpenAI",
+      "providerKind": "preset",
+      "group": "direct"
+    },
+    {
+      "value": "anthropic",
+      "label": "Anthropic",
+      "providerKind": "preset",
+      "group": "direct"
+    },
+    {
+      "value": "google",
+      "label": "Google",
+      "providerKind": "preset",
+      "group": "direct"
+    },
+    {
+      "value": "xai",
+      "label": "xAI",
+      "providerKind": "preset",
+      "group": "direct"
+    },
+    {
+      "value": "xiaomi",
+      "label": "Xiaomi",
+      "providerKind": "preset",
+      "group": "direct"
+    },
+    {
+      "value": "openai-compatible",
+      "label": "OpenAI Compatible",
+      "providerKind": "gateway",
+      "group": "direct"
+    },
+    {
+      "value": "anthropic-compatible",
+      "label": "Anthropic Compatible",
+      "providerKind": "gateway",
+      "group": "direct"
+    }
+  ],
+  "defaultValue": "deepseek",
+  "unavailableOptions": [
+    {
+      "value": "connection:conn-off",
+      "label": "DeepSeek · Old",
+      "reason": "This saved provider is disabled.",
+      "connectionId": "conn-off",
+      "underlyingProviderId": "deepseek",
+      "group": "saved",
+      "providerKind": "preset"
+    }
+  ]
+}

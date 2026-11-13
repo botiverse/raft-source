@@ -40,7 +40,6 @@ const PUBLIC_FIXTURE = {
     { id: "parity-channel-1", name: "announcements", description: null },
     { id: "parity-channel-2", name: "general", description: null },
   ],
-  canJoinAsGuest: false,
 };
 
 type Surface = "signed-in" | "public";
@@ -260,7 +259,27 @@ function expectReadableFloatingNotice(notice: ReturnType<typeof measureFloatingN
   expect(notice.textLines, `${what}: text wraps to a few lines at most`).toBeLessThanOrEqual(3);
 }
 
-test.describe("public server page floating notices keep a readable width", () => {
+// The close button sits in the notice's top-right corner: inside the notice,
+// a clickable size, and clear of the text (pr-10 keeps the text out of it).
+async function expectCloseButtonInside(page: Page, noticeTestId: string) {
+  const notice = await page.getByTestId(noticeTestId).boundingBox();
+  const close = await page.getByTestId(`${noticeTestId}-close`).boundingBox();
+  if (!notice || !close) throw new Error(`${noticeTestId}: notice or its close button has no box`);
+  expect(close.width, "close button has a clickable size").toBeGreaterThanOrEqual(24);
+  expect(close.x, "close button starts inside the notice").toBeGreaterThanOrEqual(notice.x);
+  expect(close.x + close.width, "close button ends inside the notice").toBeLessThanOrEqual(notice.x + notice.width + 0.5);
+  expect(close.y, "close button top inside the notice").toBeGreaterThanOrEqual(notice.y);
+  expect(close.y + close.height, "close button bottom inside the notice").toBeLessThanOrEqual(notice.y + notice.height + 0.5);
+  expect(close.y - notice.y, "close button sits at the top, not on a row of its own").toBeLessThanOrEqual(12);
+  // The text column, not the current text: a longer message (a server's own
+  // error) wraps inside this box, so the box must end before the button.
+  const textRight = await page.getByTestId(noticeTestId).evaluate((el) =>
+    el.querySelector('[data-slot="banner-description"]')?.getBoundingClientRect().right ?? null);
+  expect(textRight, "the notice text is measurable").not.toBeNull();
+  expect(textRight!, "the text column ends before the close button").toBeLessThanOrEqual(close.x + 0.5);
+}
+
+test.describe("public server page floating notices keep a readable width and can be closed", () => {
   const json = (body: unknown, status = 200) => ({ status, contentType: "application/json", body: JSON.stringify(body) });
 
   for (const [themeName, theme] of Object.entries(THEMES)) {
@@ -284,32 +303,19 @@ test.describe("public server page floating notices keep a readable width", () =>
           const notice = await page.evaluate(measureFloatingNotice, "public-server-selection-notice");
           expectReadableFloatingNotice(notice, "sign-in notice");
           expect(notice.actionInside, "the Sign in button sits inside the notice").toBe(true);
+
+          await expectCloseButtonInside(page, "public-server-selection-notice");
+          await page.getByTestId("public-server-selection-notice-close").click();
+          await expect(page.getByTestId("public-server-selection-notice")).toHaveCount(0);
+          await expect(page.getByTestId("public-server-switcher-trigger"), "focus returns to the server cell").toBeFocused();
+          // Closing is not permanent: the same click brings it back.
+          await page.getByTestId("public-server-switcher-trigger").click();
+          await expect(page.getByTestId("public-server-selection-notice")).toBeVisible();
         } finally {
           await context.close();
         }
       });
     }
-
-    test(`${themeName}: join error`, async ({ page, scenario }) => {
-      await page.addInitScript((prefs) => {
-        localStorage.setItem("slock-theme-preferences-v2", JSON.stringify(prefs));
-      }, theme);
-      await page.route(`**/api/public/servers/${PUBLIC_SLUG}`, (route) =>
-        route.fulfill(json({ ...PUBLIC_FIXTURE, canJoinAsGuest: true })));
-      await page.route(`**/api/public/servers/${PUBLIC_SLUG}/channels/*/messages*`, (route) =>
-        route.fulfill(json({ messages: [] })));
-      await page.route(`**/api/public/servers/${PUBLIC_SLUG}/join-as-guest`, (route) =>
-        route.fulfill(json({ error: "This server is not accepting guests right now. Try again later." }, 409)));
-      await page.goto(`${scenario.seed.urls.web}/s/${PUBLIC_SLUG}`);
-      await expect(page.getByTestId("public-server-page")).toBeVisible({ timeout: 20_000 });
-      await page.getByTestId("public-server-join-guest").click();
-      await page.getByRole("dialog").getByRole("button", { name: /join/i }).click();
-      await expect(page.getByTestId("public-server-join-error")).toBeVisible();
-      await settle(page);
-
-      const notice = await page.evaluate(measureFloatingNotice, "public-server-join-error");
-      expectReadableFloatingNotice(notice, "join error");
-    });
   }
 });
 
@@ -410,7 +416,7 @@ test.describe("public server page on a phone shows one column at a time", () => 
   }
 
   for (const [themeName, theme] of Object.entries(THEMES)) {
-    test(`${themeName} 390: the bottom banner keeps its copy and buttons on one row`, async ({ browser, scenario }) => {
+    test(`${themeName} 390: the bottom banner puts its buttons under the copy, at the end`, async ({ browser, scenario }) => {
       const context = await browser.newContext({ storageState: undefined, viewport: { width: 390, height: 844 }, hasTouch: true, isMobile: true });
       try {
         await context.addInitScript((prefs) => {
@@ -427,19 +433,26 @@ test.describe("public server page on a phone shows one column at a time", () => 
           const copy = el.querySelector("[data-testid=public-server-bottom-action-copy]")!.getBoundingClientRect();
           const buttons = [...el.querySelectorAll("button")].map((b) => b.getBoundingClientRect());
           return {
-            height: r.height,
-            copyHeight: copy.height,
             buttons: buttons.length,
-            buttonsBesideCopy: buttons.every((b) => b.left >= copy.right && b.top < copy.bottom && b.bottom > copy.top),
+            copyWidth: copy.width,
+            width: r.width,
+            buttonsBelowCopy: buttons.every((b) => b.top >= copy.bottom),
+            endsAtRight: Math.max(...buttons.map((b) => b.right)),
+            right: r.right,
+            fontSize: getComputedStyle(el.querySelector("[data-testid=public-server-bottom-action-copy]")!).fontSize,
             inside: buttons.every((b) => b.right <= r.right + 0.5),
           };
         });
         expect(m.buttons).toBe(2);
-        expect(m.buttonsBesideCopy, "both buttons sit to the right of the copy, on its row").toBe(true);
+        // stdrc (option B of the raft-ui 0.22.0 review): the Banner's own rule
+        // on a phone. The sentence, 14px like every sm banner, takes the full
+        // width and the buttons go on a row under it, at the end. Forced beside
+        // the copy (task #123) the sentence was squeezed into ~175px at 12px.
+        expect(m.fontSize).toBe("14px");
+        expect(m.buttonsBelowCopy, "both buttons sit under the copy").toBe(true);
+        expect(m.copyWidth, "the copy takes the banner's width").toBeGreaterThan(m.width * 0.6);
         expect(m.inside).toBe(true);
-        // The buttons add no row of their own: the banner is the copy plus its
-        // padding. Stacked, it was the copy, a gap and a 32px button row (~105px).
-        expect(m.height - m.copyHeight, "the buttons add no row").toBeLessThanOrEqual(24);
+        expect(m.right - m.endsAtRight, "the buttons end at the banner's padding").toBeLessThanOrEqual(24);
       } finally {
         await context.close();
       }
@@ -513,8 +526,10 @@ test.describe("public server page draws one divider before the thread", () => {
         });
         expect(lines, `lines at the thread edge: ${lines.join(", ")}`).toHaveLength(1);
 
-        // Hovering a divider changes only the cursor, as in the signed-in app:
-        // no line appears or darkens (cindyz: "hover的处理呢").
+        // Hovering a divider shows the Raft DS Resizable hover state, as in the
+        // signed-in app (task #139): the resize cursor and a 1px line over the
+        // seam. At rest the handle draws nothing (the "idle" shot equals a page
+        // without hover); the hover shot must differ from it.
         await page.addStyleTag({ content: "*,*::before,*::after{transition:none!important}" });
         for (const testId of ["public-server-channel-sidebar-resize-handle", "public-server-thread-panel-resize-handle"]) {
           const handle = page.getByTestId(testId);
@@ -525,7 +540,7 @@ test.describe("public server page draws one divider before the thread", () => {
           await page.mouse.move(box.x + box.width / 2, box.y + 260);
           expect(await handle.evaluate((el) => getComputedStyle(el).cursor)).toBe("col-resize");
           const hovered = await page.screenshot({ clip });
-          expect(Buffer.compare(idle, hovered), `${testId}: hovering changes no pixels`).toBe(0);
+          expect(Buffer.compare(idle, hovered), `${testId}: hovering darkens the seam`).not.toBe(0);
         }
       } finally {
         await context.close();
@@ -537,7 +552,7 @@ test.describe("public server page draws one divider before the thread", () => {
 // Hands task #72 / task #754: on a phone, mobile Chrome's 100vh (toolbar hidden)
 // is taller than the visible height while the toolbar shows. The page root had
 // `min-h-screen` next to `h-dvh`, so it grew past the visible height and its
-// overflow-hidden clipped the bottom banner's "Join as Guest". Headless
+// overflow-hidden clipped the bottom banner's "Join as guest". Headless
 // Chromium keeps 100vh equal to the visible height (measured: 100vh, 100dvh,
 // 100svh, 100lvh and visualViewport all 700 at 390x700 with a taller screen),
 // so the toolbar state itself cannot be reproduced here. What is pinned:
@@ -552,7 +567,7 @@ test.describe("public server page fits the visible viewport on phones", () => {
       const context = await browser.newContext({ storageState: undefined, viewport, hasTouch: true, isMobile: true });
       try {
         const page = await context.newPage();
-        await page.route(`**/api/public/servers/${PUBLIC_SLUG}`, (route) => route.fulfill(json({ ...PUBLIC_FIXTURE, canJoinAsGuest: true })));
+        await page.route(`**/api/public/servers/${PUBLIC_SLUG}`, (route) => route.fulfill(json(PUBLIC_FIXTURE)));
         await page.route(`**/api/public/servers/${PUBLIC_SLUG}/channels/*/messages*`, (route) => route.fulfill(json({ messages: [] })));
         await page.goto(`${scenario.seed.urls.web}/s/${PUBLIC_SLUG}`);
         const root = page.getByTestId("public-server-page");

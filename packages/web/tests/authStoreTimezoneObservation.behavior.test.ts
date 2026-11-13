@@ -11,7 +11,6 @@ function user(overrides: Partial<User> = {}): User {
   return {
     id: "timezone-user",
     email: "timezone@example.com",
-    gravatarHash: "hash",
     name: "timezone-user",
     displayName: "Timezone User",
     description: null,

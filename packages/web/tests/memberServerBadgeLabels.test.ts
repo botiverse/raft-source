@@ -27,3 +27,9 @@ test("no viewer server or no server facts means no badge", () => {
   assert.deepEqual(memberServerBadgeLabels({ servers: [peer] }, null), []);
   assert.deepEqual(memberServerBadgeLabels({}, "home"), []);
 });
+
+test("an empty servers list is the server's answer: no badge, not the single fields", () => {
+  // #wg-rbac:#58: a profile opened from a channel that lists the person
+  // through no server.
+  assert.deepEqual(memberServerBadgeLabels({ serverId: "peer", serverName: "Peer", servers: [] }, "home"), []);
+});

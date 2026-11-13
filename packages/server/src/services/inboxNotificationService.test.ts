@@ -8,7 +8,7 @@ import {
   inboxNotificationFacts,
   inboxTargetMuteStates,
   messages,
-  mobilePushOutbox,
+  notificationOutbox,
   serverMembers,
   servers,
   userChannelReadCursors,
@@ -20,17 +20,17 @@ import {
   type InboxNotificationFactInput,
 } from "./inboxNotificationService";
 import { runWithTraceSpan } from "../tracing/semanticTrace";
-import { __resetMobilePushDeliveryRuntimeForTests, __setMobilePushDeliveryRuntimeForTests } from "./pushService";
+import { __resetNotificationDispatchRuntimeForTests, __setNotificationDispatchRuntimeForTests } from "./notifications/dispatcher";
 
 
 beforeEach(() => {
-  __setMobilePushDeliveryRuntimeForTests({
+  __setNotificationDispatchRuntimeForTests({
     schedule: () => {},
   });
 });
 
 afterEach(() => {
-  __resetMobilePushDeliveryRuntimeForTests();
+  __resetNotificationDispatchRuntimeForTests();
 });
 
 async function seedInboxNotificationFixture() {
@@ -185,8 +185,8 @@ test("recordInboxNotificationFacts skips muted ordinary activity while personal 
   ]));
 
   const outboxRows = await getDb()
-    .select({ messageId: mobilePushOutbox.messageId })
-    .from(mobilePushOutbox);
+    .select({ messageId: notificationOutbox.messageId })
+    .from(notificationOutbox);
   assert.deepEqual(new Set(outboxRows.map((row) => row.messageId)), new Set([
     parent.id,
     mention.id,

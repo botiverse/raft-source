@@ -54,6 +54,7 @@ export interface ThreadUpdatedPayload {
     senderDisplayName?: unknown;
     senderAvatarUrl?: unknown;
     createdAt?: unknown;
+    updatedAt?: unknown;
     conversationContext?: unknown;
   } | null;
 }
@@ -100,6 +101,7 @@ export function projectThreadReplyFrame(
         : (typeof latest.senderName === "string" ? latest.senderName : ""),
       senderAvatarUrl: typeof latest.senderAvatarUrl === "string" ? latest.senderAvatarUrl : null,
       createdAt: typeof latest.createdAt === "string" ? latest.createdAt : "",
+      ...(typeof latest.updatedAt === "string" ? { updatedAt: latest.updatedAt } : {}),
     },
   };
 }

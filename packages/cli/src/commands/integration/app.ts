@@ -7,6 +7,7 @@ import type { Command } from "commander";
 import { basename, extname } from "node:path";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import type {
+  AgentApiIntegrationAppManageResponse,
   AgentApiIntegrationAppPrepareResponse,
   AgentApiOwnedIntegrationApp,
   OAuthClientCategory,
@@ -18,6 +19,7 @@ import {
 
 import { defineCommand, registerCliCommand } from "../../core/command";
 import type { CommandContext, CommandRuntimeOptions } from "../../core/context";
+import { rateLimitedResponseError } from "../../core/apiFailure";
 import { cliError } from "../../core/errors";
 import { writeJson, writeText, NL, adoptCliReplyText } from "../../core/renderer";
 import { createAgentApiSurfaceClient } from "../../agentApiPath";
@@ -154,6 +156,8 @@ async function prepareApp(
   }
 
   const res = await createAgentApiSurfaceClient(client).integrations.prepareApp(body);
+  const rateLimited = res.ok ? null : rateLimitedResponseError(res);
+  if (rateLimited) throw rateLimited;
   if (!res.ok || !res.data) {
     const code = res.status >= 500 ? "SERVER_5XX" : "INTEGRATION_APP_PREPARE_FAILED";
     throw cliError(code, res.error ?? `HTTP ${res.status}`);
@@ -287,6 +291,7 @@ export const integrationAppTransferOwnerCommand = defineCommand(
 
 interface AppUpdateOptions {
   client: string;
+  clientKey?: string;
   name?: string;
   description?: string;
   whenToUse?: string;
@@ -315,6 +320,7 @@ async function updateApp(ctx: CommandContext, opts: AppUpdateOptions): Promise<v
   const scopes = opts.clearScopes ? [] : normalizeScopes([...(opts.scope ?? []), ...(opts.scopes ?? [])]);
   const body = {
     clientKey,
+    ...(opts.clientKey !== undefined ? { newClientKey: opts.clientKey.trim() } : {}),
     name: opts.name === undefined ? undefined : opts.name.trim(),
     description: opts.description === undefined ? undefined : opts.description.trim(),
     whenToUse: opts.whenToUse === undefined ? undefined : opts.whenToUse.trim(),
@@ -349,6 +355,7 @@ export const integrationAppUpdateCommand = defineCommand(
     description: "Update an app you own or administer without human approval",
     options: [
       { flags: "--client <key>", description: "App client key / OAuth client_id" },
+      { flags: "--client-key <new>", description: "New client key for an unpublished app; the old one keeps working as an alias of this app" },
       { flags: "--name <name>", description: "New app display name" },
       { flags: "--description <text>", description: "New description; pass an empty value to clear" },
       { flags: "--when-to-use <text>", description: "When agents should use this app (one line, ≤160 chars); pass an empty value to clear" },
@@ -386,7 +393,15 @@ type AppManageAction =
 interface AppManageOptions {
   client: string;
   expiresDays?: string;
+  /** Share links: the slug of the one Server the link installs on. */
+  targetServer?: string;
   json?: boolean;
+}
+
+type ShareLinkReceipt = NonNullable<AgentApiIntegrationAppManageResponse["link"]>;
+
+function shareLinkLine(link: ShareLinkReceipt): string {
+  return `- ${link.targetServerSlug ?? "(no target)"}: expires ${link.expiresAt ?? "never"}`;
 }
 
 async function manageApp(
@@ -395,6 +410,11 @@ async function manageApp(
   action: AppManageAction,
 ): Promise<void> {
   const clientKey = requiredTrimmed(opts.client, "--client");
+  // A share link installs on one Server, named by slug; Raft never says
+  // whether the slug names a Server (#proj-apps:769a57d4).
+  const targetServerSlug = action === "share_link_create"
+    ? requiredTrimmed(opts.targetServer, "--target-server")
+    : optionalTrimmed(opts.targetServer);
   let expiresInDays: number | undefined;
   if (opts.expiresDays !== undefined) {
     expiresInDays = Number(opts.expiresDays);
@@ -408,6 +428,7 @@ async function manageApp(
     clientKey,
     action,
     expiresInDays,
+    ...(targetServerSlug ? { targetServerSlug } : {}),
   });
   if (!res.ok || !res.data) {
     const code = res.status >= 500 ? "SERVER_5XX" : "INTEGRATION_APP_MANAGE_FAILED";
@@ -425,23 +446,39 @@ async function manageApp(
     return;
   }
   if (action === "share_link_create") {
+    const target = receipt.link?.targetServerSlug ?? targetServerSlug;
     writeText(ctx.io, adoptCliReplyText([
       `Private share link created for ${receipt.clientName} (${receipt.clientKey})`,
+      `target server: ${target}`,
       `URL: ${receipt.shareUrl}`,
       `expires: ${receipt.link?.expiresAt ?? "never"}`,
-      "The URL contains a credential-like token; share it only with intended server admins.",
+      `It installs the app once, only on ${target}, for an owner or admin of that server. Raft does not say whether that slug names a server: check it, or the link will never work.`,
+      "The URL contains a credential-like token; share it only with that server's owners or admins.",
       "",
     ].join("\n")));
     return;
   }
+  const links = receipt.links ?? (receipt.link ? [receipt.link] : []);
   if (action === "share_link_get") {
-    writeText(ctx.io, adoptCliReplyText(receipt.link
-      ? `Active private share link for ${receipt.clientName} expires ${receipt.link.expiresAt ?? "never"}; regenerate it to receive a usable URL.\n`
+    writeText(ctx.io, adoptCliReplyText(links.length > 0
+      ? [
+        `Active private share links for ${receipt.clientName} (${receipt.clientKey}), one per target server:`,
+        ...links.map(shareLinkLine),
+        "A link's URL is shown only when it is created; create a new link for that target to get a usable URL.",
+        "",
+      ].join("\n")
       : `No active private share link for ${receipt.clientName} (${receipt.clientKey}).\n`));
     return;
   }
-  const labels: Record<Exclude<AppManageAction, "share_link_create" | "share_link_get">, string> = {
-    share_link_revoke: "Private share link revoked",
+  if (action === "share_link_revoke") {
+    writeText(ctx.io, adoptCliReplyText([
+      `Private share link revoked for ${receipt.clientName} (${receipt.clientKey}):`,
+      ...links.map(shareLinkLine),
+      "",
+    ].join("\n")));
+    return;
+  }
+  const labels: Record<Exclude<AppManageAction, "share_link_create" | "share_link_get" | "share_link_revoke">, string> = {
     request_publish: `Marketplace review requested (${receipt.publishStatus})`,
     request_unpublish: `Marketplace removal requested (${receipt.publishStatus})`,
     clear_logo: "App logo reset",
@@ -472,19 +509,23 @@ function appManageCommand(
 
 export const integrationAppShareLinkStatusCommand = appManageCommand(
   "share-link-status",
-  "Show active private share-link metadata without revealing its token",
+  "Show active private share links (one per target server) without revealing their tokens",
   "share_link_get",
 );
 export const integrationAppShareLinkCreateCommand = appManageCommand(
   "share-link",
-  "Create or regenerate a private app share link",
+  "Create a single-use private share link that installs the app on one target server (replaces that target's previous link)",
   "share_link_create",
-  [{ flags: "--expires-days <days>", description: "Link lifetime from 1 to 365 days (default 30)" }],
+  [
+    { flags: "--target-server <slug>", description: "Slug of the one server the link installs on (required); Raft does not say whether it exists" },
+    { flags: "--expires-days <days>", description: "Link lifetime from 1 to 365 days (default 30)" },
+  ],
 );
 export const integrationAppShareLinkRevokeCommand = appManageCommand(
   "revoke-share-link",
-  "Revoke the active private app share link",
+  "Revoke private share links: one target server's, or every active one",
   "share_link_revoke",
+  [{ flags: "--target-server <slug>", description: "Revoke only this target server's link (default: every active link)" }],
 );
 export const integrationAppRequestPublishCommand = appManageCommand(
   "request-publish",
@@ -696,6 +737,8 @@ async function prepareRecoverOwner(ctx: CommandContext, opts: AppRecoverOwnerOpt
       draftHint: `Admin recovery for orphaned or retired-owner app ${clientKey}. Execution must fail while an active owner exists.`,
     },
   });
+  const rateLimited = res.ok ? null : rateLimitedResponseError(res);
+  if (rateLimited) throw rateLimited;
   if (!res.ok || !res.data) {
     const code = res.status >= 500 ? "SERVER_5XX" : "INTEGRATION_APP_RECOVER_OWNER_PREPARE_FAILED";
     throw cliError(code, res.error ?? `HTTP ${res.status}`);
@@ -723,7 +766,7 @@ export const integrationAppPrepareRecoverOwnerCommand = defineCommand(
 );
 
 const sharedOptions = [
-  { flags: "--client-key <key>", description: "Stable app client key / OAuth client_id to reserve or update; register defaults to server-generated" },
+  { flags: "--client-key <key>", description: "App client key / OAuth client_id to reserve or update; register defaults to the app name, and refuses if that is taken" },
   { flags: "--name <name>", description: "App display name" },
   { flags: "--redirect-url <url>", description: "OAuth redirect/callback URL" },
   { flags: "--app-url <url>", description: "App homepage URL" },

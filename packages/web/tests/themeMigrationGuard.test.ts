@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
+import { isTestPath } from "../scripts/testLocations";
 
 const root = resolve(import.meta.dirname, "..");
 
@@ -44,6 +45,8 @@ function rawPaletteClasses(path: string): string[] {
 test("app surfaces paint with semantic tokens, not raw palette classes", () => {
   for (const fullPath of walkSourceFiles(resolve(root, "src"))) {
     const path = relative(root, fullPath);
+    // Feature tests (src/features/<feature>/tests/) are not app surfaces.
+    if (isTestPath(path)) continue;
     const found = rawPaletteClasses(path);
     const allowed = ALLOWED[path] ?? 0;
     assert.ok(

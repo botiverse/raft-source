@@ -39,22 +39,19 @@ test("runtime turn state blocks stale active-turn steering while a new turn is p
   assert.equal(state.canSteerBusy, true);
 });
 
-test("runtime turn state gates busy steering after a tool boundary until progress", () => {
+test("runtime turn state keeps busy steering open after a tool boundary", () => {
   const state = new RuntimeTurnState();
   state.markTurnStarted("turn-1");
 
   state.markToolBoundary();
 
   assert.equal(state.activeTurnId, "turn-1");
-  assert.equal(state.canSteerBusy, false);
-
-  state.markProgress();
-
-  assert.equal(state.activeTurnId, "turn-1");
   assert.equal(state.canSteerBusy, true);
+  // The boundary still counts as runtime activity for the turn.
+  assert.equal(state.completedWithoutRuntimeActivity(), false);
 });
 
-test("runtime turn state clears turn and gate on completion", () => {
+test("runtime turn state clears the turn on completion", () => {
   const state = new RuntimeTurnState();
   state.markTurnStarted("turn-1");
   state.markToolBoundary();

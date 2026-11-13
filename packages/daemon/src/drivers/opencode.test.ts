@@ -1,9 +1,14 @@
 import assert from "node:assert/strict";
+import { ELECTRON_NODE_SCRIPT_EXEC_ARGV } from "./nodeHostLaunch";
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { buildOpenCodeConfig, buildOpenCodeLaunchOptions, decideOpenCodeSessionResume, detectOpenCodeModelSource, detectOpenCodeModels, isOpenCodeV2Launch, isSupportedOpenCodeVersion, MIN_SUPPORTED_OPENCODE_VERSION, OPENCODE_V2_MIN_VERSION, openCodeMajor, openCodeSessionRecordPath, OpenCodeDriver, parseOpenCodeModelsOutput, readOpenCodeSessionRecord, requiresAgentCliFlag, resolveOpenCodeSpawn, runOpenCodeModelsCommand, unsupportedOpenCodeVersionMessage, writeOpenCodeSessionRecord } from "./opencode";
-import { RuntimeSessionRuntimeMismatchError } from "../spawnFailureErrors";
+import { RuntimeExecutableNotFoundError, RuntimeSessionRuntimeMismatchError } from "../spawnFailureErrors";
+import { classifySpawnFailure } from "../spawnFailureClassification";
+import { NON_RETRYABLE_SPAWN_FAILURE_REASONS } from "@botiverse/raft-shared";
+import { readCommandVersionAsync, readCommandVersionDetailedAsync } from "./probe";
+import { ProbeChildError } from "./probeChild";
 import { readFileSync, existsSync, readdirSync } from "node:fs";
 import type { ParsedEvent, SpawnContext } from "./types";
 
@@ -234,7 +239,7 @@ test("resolveOpenCodeSpawn enables Node mode for a packaged Electron JS entry", 
   });
 
   assert.equal(spec.command, electronExecutable);
-  assert.deepEqual(spec.args, [packageJs, "run", "--", "hello"]);
+  assert.deepEqual(spec.args, [...ELECTRON_NODE_SCRIPT_EXEC_ARGV, packageJs, "run", "--", "hello"]);
   assert.equal(spec.shell, false);
   assert.equal(spec.env?.BASE_ENV, "present");
   assert.equal(spec.env?.ELECTRON_RUN_AS_NODE, "1");
@@ -780,13 +785,47 @@ test("parseLine: tool_use event emits completed tool_call", () => {
       },
     },
   }));
-  assert.equal(events.length, 2);
-  assert.deepEqual(events[0], { kind: "session_init", sessionId: "ses_tool" });
-  assert.deepEqual(events[1], {
-    kind: "tool_call",
-    name: "glob",
-    input: { pattern: "*", path: "." },
-  });
+  // task #26: OpenCode prints a call only once it has finished, so the one
+  // event is both its start and its end; it used to leave the call open.
+  assert.deepEqual(events, [
+    { kind: "session_init", sessionId: "ses_tool" },
+    { kind: "tool_call", name: "glob", input: { pattern: "*", path: "." }, callId: "call_1" },
+    { kind: "tool_output", name: "glob", callId: "call_1", ok: true },
+  ]);
+});
+
+test("parseLine: tool_use carries the exit code and duration, 1.x and 2.x shapes, once per call", () => {
+  const driver = new OpenCodeDriver();
+  const v1 = {
+    type: "tool_use",
+    part: {
+      type: "tool", tool: "bash", callID: "call_1",
+      state: { status: "completed", input: { command: "false" }, metadata: { exit: 1 }, time: { start: 1000, end: 1250 } },
+    },
+  };
+  assert.deepEqual(driver.parseLine(JSON.stringify(v1)), [
+    { kind: "tool_call", name: "bash", input: { command: "false" }, callId: "call_1" },
+    { kind: "tool_output", name: "bash", callId: "call_1", ok: true, exitCode: 1, durationMs: 250 },
+  ]);
+  assert.deepEqual(driver.parseLine(JSON.stringify(v1)), [], "the same call printed twice is reported once");
+
+  // 2.x: the call id is `part.id` and the exit code sits one level deeper.
+  assert.deepEqual(driver.parseLine(JSON.stringify({
+    type: "tool_use",
+    part: {
+      type: "tool", tool: "bash", id: "call_2", partID: "prt_2",
+      state: { status: "completed", input: { command: "true" }, metadata: { metadata: { exit: 0 } }, time: { start: 5, end: 9 } },
+    },
+  })), [
+    { kind: "tool_call", name: "bash", input: { command: "true" }, callId: "call_2" },
+    { kind: "tool_output", name: "bash", callId: "call_2", ok: true, exitCode: 0, durationMs: 4 },
+  ]);
+
+  // An aborted or rejected call is printed with status "error".
+  assert.deepEqual(driver.parseLine(JSON.stringify({
+    type: "tool_use",
+    part: { type: "tool", tool: "edit", callID: "call_3", state: { status: "error", input: {}, error: "Tool execution aborted" } },
+  })).at(-1), { kind: "tool_output", name: "edit", callId: "call_3", ok: false });
 });
 
 test("parseLine: tool-calls step_finish is an internal boundary, final stop ends the turn", () => {
@@ -933,7 +972,11 @@ test("task #1258: decideOpenCodeSessionResume never carries a session across maj
   assert.deepEqual(decideOpenCodeSessionResume("", rec("", 1), "2.0.27"), { kind: "fresh" });
   // No record: a 1.x CLI resumes as it always did; a 2.x CLI refuses rather than assume.
   assert.deepEqual(decideOpenCodeSessionResume("ses_a", missing, "1.19.0"), { kind: "resume" });
-  assert.deepEqual(decideOpenCodeSessionResume("ses_a", missing, null), { kind: "resume" }, "unreadable version follows the 1.x launch path");
+  // task #1365: an unknown installed version decides nothing (it used to be read as 1.x).
+  assert.deepEqual(decideOpenCodeSessionResume("ses_a", missing, null), { kind: "version_unknown" });
+  assert.deepEqual(decideOpenCodeSessionResume("ses_a", missing, "garbage"), { kind: "version_unknown" });
+  assert.deepEqual(decideOpenCodeSessionResume("ses_a", rec("ses_a", 2), null), { kind: "version_unknown" }, "a recorded 2.x session is not a major mismatch when the version is unknown");
+  assert.deepEqual(decideOpenCodeSessionResume("ses_a", rec("ses_a", 1), null), { kind: "version_unknown" });
   assert.deepEqual(decideOpenCodeSessionResume("ses_a", missing, "2.0.27"), { kind: "refuse", reason: "unrecorded", recordedMajor: null });
   // A record for another session id is no evidence for this one.
   assert.deepEqual(decideOpenCodeSessionResume("ses_a", rec("ses_b", 2), "2.0.27"), { kind: "refuse", reason: "unrecorded", recordedMajor: null });
@@ -1377,4 +1420,162 @@ test("task #1277 (launch): an opencode launch cancelled while the lookup runs cr
       fake.restore();
     }
   });
+});
+
+
+// ── task #1365: an unknown OpenCode version is not a major mismatch ──
+
+/** A fake `opencode` whose `--version` runs `versionScript`; any other call records its argv (the session process). */
+function installScriptedOpenCode(root: string, versionScript: string, argvFile: string): { setVersionScript: (script: string) => void; restore: () => void } {
+  const binDir = path.join(root, "bin");
+  mkdirSync(binDir, { recursive: true });
+  const bin = path.join(binDir, "opencode");
+  const write = (script: string) => {
+    writeFileSync(bin, `#!/bin/sh\nif [ "$1" = "--version" ]; then\n${script}\nfi\nprintf '%s\\n' "$@" > '${argvFile}'\nexit 0\n`, "utf8");
+    chmodSync(bin, 0o755);
+  };
+  write(versionScript);
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}${path.delimiter}${oldPath ?? ""}`;
+  return {
+    setVersionScript: write,
+    restore: () => {
+      if (oldPath === undefined) delete process.env.PATH;
+      else process.env.PATH = oldPath;
+    },
+  };
+}
+
+function assertVersionUnknownStartFailure(error: unknown, reason: string, cause: RegExp): true {
+  assert.ok(error instanceof RuntimeExecutableNotFoundError, `expected the retryable version-unknown failure, got ${String(error)}`);
+  assert.ok(!(error instanceof RuntimeSessionRuntimeMismatchError));
+  assert.equal(error.reason, reason);
+  assert.match(error.message, /could not confirm the installed OpenCode version/);
+  assert.match(error.message, /cannot yet tell whether this agent's session can be resumed/);
+  assert.match(error.message, cause);
+  const classification = classifySpawnFailure(error);
+  assert.equal(classification.reason, "runtime_not_found");
+  assert.ok(!NON_RETRYABLE_SPAWN_FAILURE_REASONS.includes(classification.reason), "not a reason that stops automatic restarts");
+  assert.equal(classification.userMessage, error.message);
+  return true;
+}
+
+test("task #1365: a failed version read does not refuse a recorded 2.x session as a major mismatch; the next read resumes it", async () => {
+  if (process.platform === "win32") return;
+  await withTempDirAsync(async (root) => {
+    const argvFile = path.join(root, "session-argv.txt");
+    const fake = installScriptedOpenCode(root, "echo 'boom' >&2; exit 1", argvFile);
+    try {
+      const slockHome = process.env.SLOCK_HOME!;
+      const recordPath = openCodeSessionRecordPath(slockHome, "agent-1");
+      writeOpenCodeSessionRecord(recordPath, { version: 1, sessionId: "ses_x", opencodeMajor: 2, opencodeVersion: "2.1.3", recordedAt: "2026-11-01T00:00:00.000Z" });
+      const before = readFileSync(recordPath, "utf8");
+      const ctx = makeSpawnContext(root, "ses_x");
+      ctx.slockHome = slockHome;
+
+      await assert.rejects(new OpenCodeDriver().spawn(ctx), (error: unknown) => {
+        assertVersionUnknownStartFailure(error, "probe_failed", /exit status 1/);
+        assert.doesNotMatch((error as Error).message, /boom/, "raw stderr is not carried into the message");
+        return true;
+      });
+      assert.equal(existsSync(argvFile), false, "no session process was started");
+      assert.equal(ctx.config.sessionId, "ses_x", "the server's session id is not touched");
+      assert.equal(readFileSync(recordPath, "utf8"), before, "the record is not touched");
+
+      // The version reads again on the next start: the original session resumes.
+      fake.setVersionScript("echo '2.1.3'; exit 0");
+      const { process: child } = await new OpenCodeDriver().spawn(ctx);
+      await new Promise<void>((resolve) => child.once("exit", () => resolve()));
+      const argv = readFileSync(argvFile, "utf8").split("\n");
+      assert.equal(argv[argv.indexOf("--session") + 1], "ses_x", "resumed the original session");
+    } finally {
+      fake.restore();
+    }
+  });
+});
+
+test("task #1365: unparseable version output stops the start, with or without a session, and never launches with 1.x arguments", async () => {
+  if (process.platform === "win32") return;
+  await withTempDirAsync(async (root) => {
+    const argvFile = path.join(root, "session-argv.txt");
+    const fake = installScriptedOpenCode(root, "echo 'opencode: not a version'; exit 0", argvFile);
+    try {
+      const slockHome = process.env.SLOCK_HOME!;
+      mkdirSync(slockHome, { recursive: true });
+      for (const sessionId of ["ses_x", null]) {
+        const ctx = makeSpawnContext(root, sessionId);
+        ctx.slockHome = slockHome;
+        await assert.rejects(new OpenCodeDriver().spawn(ctx), (error: unknown) =>
+          assertVersionUnknownStartFailure(error, "probe_failed", /printed no recognisable version number/));
+        assert.equal(existsSync(argvFile), false, `no session process was started (session ${sessionId ?? "none"})`);
+      }
+      assert.equal(existsSync(openCodeSessionRecordPath(slockHome, "agent-1")), false, "no record is written");
+    } finally {
+      fake.restore();
+    }
+  });
+});
+
+test("task #1365: known versions keep every existing refusal (negative controls)", async () => {
+  if (process.platform === "win32") return;
+  await withTempDirAsync(async (root) => {
+    const argvFile = path.join(root, "session-argv.txt");
+    const fake = installScriptedOpenCode(root, "echo '2.1.3'; exit 0", argvFile);
+    try {
+      const slockHome = process.env.SLOCK_HOME!;
+      const recordPath = openCodeSessionRecordPath(slockHome, "agent-1");
+      const ctx = makeSpawnContext(root, "ses_x");
+      ctx.slockHome = slockHome;
+
+      writeOpenCodeSessionRecord(recordPath, { version: 1, sessionId: "ses_x", opencodeMajor: 1, opencodeVersion: "1.18.35", recordedAt: "2026-11-01T00:00:00.000Z" });
+      await assert.rejects(new OpenCodeDriver().spawn(ctx), (error: unknown) =>
+        error instanceof RuntimeSessionRuntimeMismatchError && error.reason === "major_mismatch" && error.recordedMajor === 1);
+
+      rmSync(recordPath);
+      await assert.rejects(new OpenCodeDriver().spawn(ctx), (error: unknown) =>
+        error instanceof RuntimeSessionRuntimeMismatchError && error.reason === "unrecorded");
+
+      writeFileSync(recordPath, "{not json", "utf8");
+      await assert.rejects(new OpenCodeDriver().spawn(ctx), (error: unknown) =>
+        error instanceof RuntimeSessionRuntimeMismatchError && error.reason === "record_unreadable");
+
+      // A corrupt record stays refused when the version is unknown too: the version gate does not open it.
+      fake.setVersionScript("exit 1");
+      await assert.rejects(new OpenCodeDriver().spawn(ctx), (error: unknown) => error instanceof RuntimeExecutableNotFoundError);
+      assert.equal(readFileSync(recordPath, "utf8"), "{not json");
+      assert.equal(existsSync(argvFile), false, "no session process was started by any refusal");
+    } finally {
+      fake.restore();
+    }
+  });
+});
+
+test("task #1365: the version read keeps its failure class and a structured cause; the generic read keeps its contract", async () => {
+  const failWith = (fields: ConstructorParameters<typeof ProbeChildError>[1]) => async () => {
+    throw new ProbeChildError("probe failed: /home/someone/secret path", fields);
+  };
+  const deps = (runProbeChildFn: unknown) => ({ runProbeChildFn: runProbeChildFn as any, platform: "linux" as const, env: {} });
+
+  assert.deepEqual(await readCommandVersionDetailedAsync("opencode", [], deps(failWith({ code: "ETIMEDOUT" }))),
+    { kind: "failed", reason: "probe_timeout", detail: "did not finish within 5000 ms" });
+  assert.deepEqual(await readCommandVersionDetailedAsync("opencode", [], deps(failWith({ code: "EACCES" }))),
+    { kind: "failed", reason: "permission_denied", detail: "error EACCES" });
+  assert.deepEqual(await readCommandVersionDetailedAsync("opencode", [], deps(failWith({ status: 2, stderr: "/home/someone: boom" }))),
+    { kind: "failed", reason: "probe_failed", detail: "exit status 2" });
+  assert.deepEqual(await readCommandVersionDetailedAsync("opencode", [], deps(failWith({ signal: "SIGKILL" }))),
+    { kind: "failed", reason: "probe_failed", detail: "signal SIGKILL" });
+  assert.deepEqual(await readCommandVersionDetailedAsync("opencode", [], deps(async () => ({ stdout: "\n", stderr: "" }))),
+    { kind: "failed", reason: "probe_failed", detail: "exited 0 without printing a version" });
+
+  // The generic wrapper still returns any first line (other runtimes decide what a version is) and null on failure.
+  assert.equal(await readCommandVersionAsync("x", [], deps(async () => ({ stdout: "not semver\n", stderr: "" }))), "not semver");
+  assert.equal(await readCommandVersionAsync("x", [], deps(failWith({ status: 1 }))), null);
+
+  // A cancel is still rethrown, never classified.
+  const controller = new AbortController();
+  controller.abort();
+  await assert.rejects(
+    readCommandVersionDetailedAsync("opencode", [], { ...deps(failWith({ code: "ABORT_ERR" })), signal: controller.signal }),
+    (error: unknown) => error instanceof ProbeChildError && error.code === "ABORT_ERR",
+  );
 });

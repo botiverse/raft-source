@@ -5,7 +5,7 @@ import { getDb } from "../db/index";
 import { tasks, users, serverMembers } from "../db/schema";
 import { createChannel, addHuman } from "../services/channelService";
 import { createServer } from "../services/serverService";
-const test = createApiTest({ onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest();
 test("period metrics aggregate beyond the page cap, preserve admin/channel ACL and reject invalid windows", async ({ app }) => {
   const db = getDb();
   const [owner] = await db.insert(users).values({ email: "period-owner@slock.test", name: "period-owner", passwordHash: await fixturePasswordHash("password123"), emailVerified: true }).returning();

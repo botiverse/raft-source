@@ -73,7 +73,7 @@ export async function searchManual(
   const results = (data as { results: Array<{ slug: string; title: string; firstScreen: string }> }).results;
   const first = results[0];
   const next: RaftNextStep | null = first
-    ? hintStep("read_manual_topic", RAFT_HINTS.manualGet(first.slug), "Open the best-matching topic.", options.hints, { topic: first.slug })
+    ? hintStep("read_manual_topic", RAFT_HINTS.manualGet(first.slug, { intent: request.intent.trim(), reason: request.reason.trim() }), "Open the best-matching topic.", options.hints, { topic: first.slug })
     : null;
   return {
     ok: true,

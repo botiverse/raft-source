@@ -1,11 +1,20 @@
 // `raft-computer login` / `logout` — CLI presenters over the ComputerApi
-// (CLI-over-lib convergence). The pure logic lives in `lib/api.ts`
-// (`api.login` drives the device-code LoginService; `api.logout` clears the
-// user session). These presenters supply the EVENT SINK (`onEvent`) that maps
-// the device-code/approved events to `info()` lines, and `present()` maps a
-// thrown `ComputerError` → the shared stderr error contract.
+// (CLI-over-lib convergence).
+//
+// Device-auth design v2 §3.2: a machine no longer keeps a user session. It
+// joins each server with a one-time approval (`raft-computer attach`).
+//   - `login` stays so old docs and scripts keep working: it says so, then
+//     runs the approval flow (the server is picked on the approval page). On
+//     a server older than one-time approvals that flow signs in with a user
+//     session exactly as `login` did before.
+//   - `logout` changes nothing (no session to end, nothing revoked, nothing
+//     stopped): turning an existing command into one that takes the machine
+//     offline would break old scripts.
+//   - `runSessionLogin` is the user-session login itself, kept for setup's
+//     legacy-daemon migration branch on a server too old for its one-time
+//     `computer_migrate` approval (services/migrateGrant.ts).
 // §6 closed-set error codes stay byte-identical.
-import { canInstallEnterToOpenUrl, installEnterToOpenUrl, openUrlInBrowser } from "./browserHandoff";
+import { presentAttachEvent, presentDeviceCode } from "./deviceApprovalPrompt";
 import { info, present } from "./output";
 import { resolveRaftHome } from "./paths";
 import { createComputerApi } from "./lib/api";
@@ -17,50 +26,67 @@ export type RunLoginOptions = {
   openUrl?: (url: string) => void;
 };
 
-export async function runLogin(opts: RunLoginOptions): Promise<void> {
+/** `raft-computer login`: points at `attach`, then runs its approval flow. */
+export async function runLogin(opts: Omit<RunLoginOptions, "orchestrated">): Promise<void> {
   const api = createComputerApi(resolveRaftHome());
-  const input = opts.input ?? process.stdin;
-  const openUrl = opts.openUrl ?? openUrlInBrowser;
+  let cleanupEnterToOpen: (() => void) | undefined;
+  info("Note: `raft-computer login` is no longer a separate step. Use `raft-computer attach /<server>`: it asks for one approval and connects this machine to that server.");
+  info("Continuing as attach; choose the server on the approval page.");
+  const signedIn: { sessionPath: string | null } = { sessionPath: null };
+  await present(async () => {
+    try {
+      const result = await api.approveMachine({ serverUrl: opts.serverUrl }, (event) => {
+        if (event.kind === "login.device-code") {
+          cleanupEnterToOpen = presentDeviceCode(event, {
+            purpose: "approval",
+            ...(opts.input ? { input: opts.input } : {}),
+            ...(opts.openUrl ? { openUrl: opts.openUrl } : {}),
+          });
+          return;
+        }
+        if (event.kind === "attach.attaching" || event.kind === "attach.session-fallback") {
+          // Approved: the Enter-to-open listener is no longer useful.
+          cleanupEnterToOpen?.();
+          cleanupEnterToOpen = undefined;
+        }
+        if (event.kind === "attach.session-fallback") {
+          // An older server: this is the old login, word it as before.
+          signedIn.sessionPath = event.sessionPath;
+          return;
+        }
+        presentAttachEvent(event);
+      });
+      if (result.outcome === "signed-in") signedIn.sessionPath = result.sessionPath;
+    } finally {
+      cleanupEnterToOpen?.();
+    }
+  });
+  if (signedIn.sessionPath) {
+    info("This server does not support one-time approvals yet, so this machine signed in with a user session instead.");
+    info(`Logged in. User session written to ${signedIn.sessionPath}`);
+    info(`Next: run \`raft-computer attach <serverSlug>\` to attach this machine.`);
+    return;
+  }
+  info("Next: run `raft-computer start` (background) — closing the terminal is fine.");
+}
+
+/**
+ * The user-session device login (writes user-session.json). Only setup's
+ * legacy-daemon migration branch still runs it, and only against a server
+ * that refuses the `computer_migrate` grant kind (older than it).
+ */
+export async function runSessionLogin(opts: RunLoginOptions): Promise<void> {
+  const api = createComputerApi(resolveRaftHome());
   let cleanupEnterToOpen: (() => void) | undefined;
   await present(async () => {
     try {
       await api.login({ serverUrl: opts.serverUrl }, (event) => {
         if (event.kind === "login.device-code") {
-          let browserOpenRequested = false;
-          try {
-            openUrl(event.verifyUrl);
-            browserOpenRequested = true;
-          } catch {
-            // Best-effort convenience only. The URL/code are still printed.
-          }
-
-          // Action-first ordering (ghostex case: user skimmed past the URL
-          // to "Waiting…"). The sign-in URL leads; the code is the "if the
-          // page asks" secondary; keep-running comes last. The URL lands on
-          // the account-level /login/device page — device approval is
-          // user-scoped, so we never point at a server-scoped surface (e.g. a
-          // Connect Computer dialog) to approve it.
-          const enterOpensBrowser = canInstallEnterToOpenUrl(input);
-          info("To finish signing in, open this link in a browser:");
-          info(`  ${event.verifyUrl}`);
-          if (browserOpenRequested) {
-            info(
-              enterOpensBrowser
-                ? "  (opened automatically — if it didn't, press Enter to open it again)"
-                : "  (opened automatically — open it on any device, including your phone, if it didn't)",
-            );
-          } else {
-            info(
-              enterOpensBrowser
-                ? "  (press Enter to open it, or open it on any device including your phone)"
-                : "  (open it on any device, including your phone)",
-            );
-          }
-          info(`If the page asks for a code: ${event.userCode}`);
-          info(`Keep this command running — sign-in completes here automatically (expires in ${event.expiresInSeconds}s).`);
-          if (enterOpensBrowser) {
-            cleanupEnterToOpen = installEnterToOpenUrl({ input, url: event.verifyUrl, openUrl });
-          }
+          cleanupEnterToOpen = presentDeviceCode(event, {
+            purpose: "sign-in",
+            ...(opts.input ? { input: opts.input } : {}),
+            ...(opts.openUrl ? { openUrl: opts.openUrl } : {}),
+          });
         } else if (event.kind === "login.approved" && !opts.orchestrated) {
           info(`Logged in. User session written to ${event.sessionPath}`);
           info(`Next: run \`raft-computer attach <serverSlug>\` to attach this machine.`);
@@ -72,24 +98,11 @@ export async function runLogin(opts: RunLoginOptions): Promise<void> {
   });
 }
 
-// `raft-computer logout` — sign out this Computer's user identity (one user
-// identity per SLOCK_HOME). Clears the user-session.json file AND stops the
-// service so every per-server runner exits — sign-out disconnects every
-// workspace Computer (the web shows them offline). Per-server attachments (and
-// their sk_computer_* credentials) are NEVER deleted, so a later re-login
-// resumes the SAME Computers. Idempotent: a missing session file
-// (ENOENT) means "already logged out" and is treated as success.
+// `raft-computer logout` — there is no session to end in the one-time
+// approval model, so it changes nothing: no file is deleted, nothing is
+// revoked on the server, the service keeps running. Taking this machine off
+// one server is done on that server's Computers page (per-Computer revoke).
 export async function runLogout(): Promise<void> {
-  const api = createComputerApi(resolveRaftHome());
-  await present(async () => {
-    const result = await api.logout();
-    if (result.status === "logged-out") {
-      info(`Logged out. Cleared user session at ${result.sessionPath}.`);
-    } else {
-      info("Already logged out (no saved user session).");
-    }
-    if (result.runnersStopped === "stopped") {
-      info("Stopped the service — every workspace Computer is now offline. Re-login to bring them back online.");
-    }
-  });
+  info("Nothing to log out of: this machine joins each server with a one-time approval and keeps no sign-in. Nothing was changed, and every connected server stays connected.");
+  info("To take this machine off a server, run `raft-computer detach /<server>`.");
 }

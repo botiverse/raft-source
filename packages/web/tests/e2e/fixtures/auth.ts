@@ -1,8 +1,5 @@
 import { mkdir } from "node:fs/promises";
-import { test } from "@playwright/test";
 import type { APIRequestContext, Browser, Page } from "@playwright/test";
-import { evidenceConfig, observeLogin } from "../../../../../scripts/e2e/transportEvidence";
-import type { LoginAttempt } from "../../../../../scripts/e2e/transportEvidence";
 import { AUTH_STATE_PATH, STATE_DIR } from "./seedState";
 import type { PlaywrightSeedState } from "./seedState";
 
@@ -23,21 +20,13 @@ export async function loginViaApiWithCredentials(
   seedState: PlaywrightSeedState,
   credentials: { email: string; password: string },
 ): Promise<LoginResult> {
-  let attempt: LoginAttempt | undefined;
-  try {
-    const info = test.info();
-    attempt = { retry: info.retry, workerIndex: info.workerIndex, parallelIndex: info.parallelIndex };
-  } catch { /* global setup runs outside a test */ }
-  return observeLogin(evidenceConfig(), attempt, async (headers) => {
-    const response = await request.post(`${seedState.urls.api}/api/auth/login`, {
-      data: credentials,
-      ...(headers ? { headers } : {}),
-    });
-    if (!response.ok()) {
-      throw new Error(`Playwright login failed: ${response.status()} ${response.statusText()}`);
-    }
-    return await response.json() as LoginResult;
+  const response = await request.post(`${seedState.urls.api}/api/auth/login`, {
+    data: credentials,
   });
+  if (!response.ok()) {
+    throw new Error(`Playwright login failed: ${response.status()} ${response.statusText()}`);
+  }
+  return await response.json() as LoginResult;
 }
 
 export async function writeAuthStorageState(

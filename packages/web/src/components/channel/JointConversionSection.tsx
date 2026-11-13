@@ -1,4 +1,4 @@
-import { Check, CircleAlert, GitBranch, X } from "lucide-react";
+import { Check, TriangleAlert, GitBranch, X } from "lucide-react";
 import { useCallback } from "react";
 import { useIntl } from "react-intl";
 import type { IntlShape } from "react-intl";
@@ -107,7 +107,7 @@ export default function JointConversionSection({
               button, so the screen keeps one pink action. */}
           <Button
             type="button"
-            size="sm"
+            size="md"
             variant="outline"
             onClick={onStart}
             disabled={disabled || busy}
@@ -131,8 +131,8 @@ export default function JointConversionSection({
             {connectionWarning}
           </BannerDescription>
           {onCheckStatus && (
-            <BannerAction className="!col-span-full !col-start-1 !row-start-3 mt-2 w-full justify-end">
-              <Button type="button" size="sm" variant="outline" onClick={onCheckStatus} data-testid="channel-settings-joint-conversion-check-status">
+            <BannerAction>
+              <Button type="button" size="md" variant="default" onClick={onCheckStatus} data-testid="channel-settings-joint-conversion-check-status">
                 {formatMessage({ id: "channel.edit.checkConversionStatus" })}
               </Button>
             </BannerAction>
@@ -140,7 +140,7 @@ export default function JointConversionSection({
         </Banner>
       )}
       {showProgress && (
-        <div className="space-y-3" data-testid="channel-settings-joint-conversion-progress">
+        <div className="stack-y-3" data-testid="channel-settings-joint-conversion-progress">
           <div data-testid="channel-settings-joint-conversion-progress-bar">
             <Progress
               value={conversionComplete ? 100 : !conversionJob && admissionPending ? 0 : conversionProgress(progressPhase)}
@@ -155,7 +155,7 @@ export default function JointConversionSection({
             </Progress>
           </div>
           <ol
-            className="space-y-2"
+            className="stack-y-2"
             aria-label={formatMessage({ id: "channel.edit.convertProgressTitle" })}
             data-testid="channel-settings-joint-conversion-stages"
           >
@@ -202,7 +202,7 @@ export default function JointConversionSection({
               className="min-w-0 items-start"
               data-testid="channel-settings-joint-conversion-error"
             >
-              <CircleAlert aria-hidden="true" className="shrink-0" />
+              <TriangleAlert aria-hidden="true" className="shrink-0" />
               {isUploadsInFlightError(error, conversionJob?.progress) && (
                 <BannerTitle className="min-w-0 whitespace-normal break-words [overflow-wrap:anywhere]">
                   {formatMessage({ id: "channel.edit.convertUploadsInFlightTitle" })}
@@ -212,8 +212,8 @@ export default function JointConversionSection({
                 {displayError}
               </BannerDescription>
               {onOpenChannel && isUploadsInFlightError(error, conversionJob?.progress) && (
-                <BannerAction className="!col-span-full !col-start-1 !row-start-3 mt-2 w-full justify-end">
-                  <Button type="button" size="sm" variant="outline" onClick={onOpenChannel}>
+                <BannerAction>
+                  <Button type="button" size="md" variant="default" onClick={onOpenChannel}>
                     {formatMessage({ id: "channel.edit.returnToChannel" })}
                   </Button>
                 </BannerAction>
@@ -224,7 +224,7 @@ export default function JointConversionSection({
             <div className="flex justify-end">
               <Button
                 type="button"
-                size="sm"
+                size="md"
                 variant="outline"
                 onClick={onDismissProgress}
                 data-testid="channel-settings-joint-conversion-done"
@@ -237,14 +237,14 @@ export default function JointConversionSection({
             <div className="flex justify-end">
               <div className="flex flex-wrap justify-end gap-2">
                 {canCancel && onCancel && (
-                  <Button type="button" size="sm" variant="ghost" onClick={onCancel} disabled={cancelBusy} loading={cancelBusy} loadingLabel={formatMessage({ id: "channel.edit.cancelingConversion" })} data-testid="channel-settings-joint-conversion-cancel">
+                  <Button type="button" size="md" variant="ghost" onClick={onCancel} disabled={cancelBusy} loading={cancelBusy} loadingLabel={formatMessage({ id: "channel.edit.cancelingConversion" })} data-testid="channel-settings-joint-conversion-cancel">
                     {formatMessage({ id: "channel.edit.cancelConversion" })}
                   </Button>
                 )}
                 {conversionFailed && onRetry && (
                   <Button
                     type="button"
-                    size="sm"
+                    size="md"
                     variant="warning"
                     onClick={onRetry}
                     disabled={busy || cancelBusy}
@@ -270,7 +270,7 @@ export default function JointConversionSection({
       {displayError && !showProgress && (
         <div>
           <Banner status="warning" size="sm" className="min-w-0 items-start" data-testid="channel-settings-joint-conversion-error">
-            <CircleAlert aria-hidden="true" className="shrink-0" />
+            <TriangleAlert aria-hidden="true" className="shrink-0" />
             {isUploadsInFlightError(error, conversionJob?.progress) && (
               <BannerTitle className="min-w-0 whitespace-normal break-words [overflow-wrap:anywhere]">
                 {formatMessage({ id: "channel.edit.convertUploadsInFlightTitle" })}
@@ -280,8 +280,8 @@ export default function JointConversionSection({
               {displayError}
             </BannerDescription>
             {onOpenChannel && isUploadsInFlightError(error, conversionJob?.progress) && (
-              <BannerAction className="!col-span-full !col-start-1 !row-start-3 mt-2 w-full justify-end">
-                <Button type="button" size="sm" variant="outline" onClick={onOpenChannel}>
+              <BannerAction>
+                <Button type="button" size="md" variant="default" onClick={onOpenChannel}>
                   {formatMessage({ id: "channel.edit.returnToChannel" })}
                 </Button>
               </BannerAction>
@@ -323,7 +323,12 @@ export function JointConversionConfirmDialog({
           <DialogClose
             disabled={busy}
             render={
-              <Button variant="ghost" size="icon-sm" aria-label={formatMessage({ id: "common.close" })}>
+              <Button
+                variant="ghost"
+                size="icon-md"
+                aria-label={formatMessage({ id: "common.close" })}
+                className="-my-1.5"
+              >
                 <X className="size-[18px]" aria-hidden="true" />
               </Button>
             }
@@ -361,9 +366,9 @@ export function JointConversionConfirmContent({
   const { formatMessage } = useIntl();
 
   return (
-    <div className="space-y-3" data-testid="channel-settings-joint-conversion-confirm-content">
+    <div className="stack-y-3" data-testid="channel-settings-joint-conversion-confirm-content">
       <p>{formatMessage({ id: "channel.edit.convertConfirmIntro" }, { name: channelName })}</p>
-      <ul className="list-disc space-y-1 pl-5">
+      <ul className="list-disc stack-y-1 pl-5">
         <li>{formatMessage({ id: "channel.edit.convertConfirmHistory" })}</li>
         <li>{formatMessage({ id: "channel.edit.convertConfirmMembers" })}</li>
         <li>{formatMessage({ id: "channel.edit.convertConfirmSharedHistory" })}</li>

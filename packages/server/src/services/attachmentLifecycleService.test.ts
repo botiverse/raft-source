@@ -530,9 +530,6 @@ test("historical shared artifacts remain blocked while any sibling object is act
       uploaderId: USER_ID,
       uploaderType: "user",
       filename: "sibling.txt",
-      mimeType: "text/plain",
-      sizeBytes: 42,
-      storageKey: `${SERVER_ID}/${id}`,
       createdAt: COMPLETED_AT,
     });
     await expireAttachmentReservation(id, EXPIRED_AT, db);
@@ -561,7 +558,7 @@ test.skipIf(inSourceSnapshot)("staging integration CI pins the attachment lifecy
   const workflow = await readFile(new URL("../../../../.github/workflows/test.yml", import.meta.url), "utf8");
   const integrationJob = workflow.match(/\n  integration-contracts:\n(?<body>[\s\S]*?)(?=\n  [a-z][a-z0-9-]+:\n)/)?.groups?.body;
   assert.ok(integrationJob, "integration job must remain present");
-  assert.match(integrationJob, /services:\s*\n\s+postgres:\s*\n\s+image: postgres:16-alpine/);
+  assert.match(integrationJob, /services:\s*\n\s+postgres:\s*\n\s+image: postgres:17-alpine/);
   assert.match(integrationJob, /--health-cmd "pg_isready -U read_mutation_ci -d postgres"/);
   const focusedStep = integrationJob.match(
     /- name: Attachment lifecycle real PostgreSQL object-first lock contract(?<body>[\s\S]*?)(?=\n\s+- name:)/,
@@ -578,5 +575,6 @@ test.skipIf(inSourceSnapshot)("staging integration CI pins the attachment lifecy
     focusedStep,
     /pnpm exec vitest run src\/services\/attachmentLifecycleService\.realPg\.test\.ts/,
   );
+  assert.match(focusedStep, /src\/services\/attachmentObjectHoldService\.realPg\.test\.ts/, "the hold-vs-cleanup race runs too");
   assert.doesNotMatch(focusedStep, /continue-on-error/);
 });

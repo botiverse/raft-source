@@ -34,6 +34,13 @@ type TransactionScope = {
   openSavepoints: Set<OpenSavepoint>;
   /** afterAmbientTransaction work, run once the outer has committed or rolled back. */
   afterSettled: Array<() => void>;
+  /** afterAmbientCommit work by key (one per key), run only once the outer has committed. */
+  afterCommitted: Map<string, () => void>;
+  /**
+   * Set (to what the section is, for the error) while runExecutorOnly's callback
+   * runs: the root database is off limits there, the ambient transaction included.
+   */
+  executorOnly?: string;
 };
 const transactionScope = new AsyncLocalStorage<TransactionScope>();
 
@@ -101,6 +108,47 @@ function activeTransaction(): DatabaseTransaction | null {
   return scope?.active ? scope.tx : null;
 }
 
+/** A use of the root database inside runExecutorOnly: the section may read and write only through the executor it was handed. */
+export class ExecutorOnlyDatabaseAccessError extends Error {
+  constructor(readonly section: string, readonly source: string) {
+    super(`${section} may use the database only through the executor it is handed, not ${source}`);
+    this.name = "ExecutorOnlyDatabaseAccessError";
+  }
+}
+
+/**
+ * Run `fn` with the root database off limits: inside it (and everything it
+ * awaits), any use of getDb() (a query, a transaction; a handle taken earlier
+ * too), getRootDb() or the search database throws
+ * ExecutorOnlyDatabaseAccessError. Only a handle passed in explicitly, the
+ * executor the caller hands `fn`, still works.
+ *
+ * For code another module's transaction runs on its behalf (a first-party
+ * app's write inside a reaction's transaction): what it reads and writes is
+ * then visible at its call sites, and nothing it calls can quietly add
+ * statements to the caller's transaction through the ambient connection, or
+ * reach a second connection while that transaction is open. `section` names
+ * it in the error.
+ *
+ * The transaction's own bookkeeping is shared with the section
+ * (afterAmbientTransaction / afterAmbientCommit registered inside still run
+ * with the outer transaction). Works with no transaction open as well.
+ */
+export function runExecutorOnly<T>(section: string, fn: () => Promise<T>): Promise<T> {
+  const outer = transactionScope.getStore();
+  // Derived, not copied: `active`, `finishing` and the collections stay the outer scope's own.
+  const scope = outer
+    ? Object.create(outer, { executorOnly: { value: section, enumerable: true } }) as TransactionScope
+    : { ...newTransactionScope(null as never), active: false, executorOnly: section };
+  return transactionScope.run(scope, fn);
+}
+
+/** Throws inside runExecutorOnly; `source` names what was reached for (getRootDb, getSearchDb). */
+export function refuseInsideExecutorOnly(source: string): void {
+  const section = transactionScope.getStore()?.executorOnly;
+  if (section) throw new ExecutorOnlyDatabaseAccessError(section, source);
+}
+
 /** Waits for savepoints the outer callback left running. Returns false on timeout. */
 async function drainOpenSavepoints(scope: TransactionScope): Promise<boolean> {
   if (scope.openSavepoints.size === 0) return true;
@@ -125,7 +173,7 @@ async function drainOpenSavepoints(scope: TransactionScope): Promise<boolean> {
 
 /** The live transaction scope, consumed by scopeTransactions in index.ts. */
 function newTransactionScope(tx: DatabaseTransaction): TransactionScope {
-  return { tx, active: true, finishing: false, openSavepoints: new Set(), afterSettled: [] };
+  return { tx, active: true, finishing: false, openSavepoints: new Set(), afterSettled: [], afterCommitted: new Map() };
 }
 
 function runInTransactionScope<T>(scope: TransactionScope, fn: () => Promise<T>): Promise<T> {
@@ -188,26 +236,37 @@ export function scopeTransactions(root: Database): Database {
       ownScope = newTransactionScope(tx);
       return await runInTransactionScope(ownScope, () => callback(tx));
     }, config as never);
-    const runAfterSettled = () => {
-      for (const work of (ownScope as TransactionScope | null)?.afterSettled ?? []) {
+    const runOutside = (works: Iterable<() => void>, label: string) => {
+      for (const work of works) {
         transactionScope.exit(() => {
           try {
             work();
           } catch (error) {
-            console.error("[db] afterAmbientTransaction work failed:", error);
+            console.error(`[db] ${label} work failed:`, error);
           }
         });
       }
     };
+    const runAfterSettled = () => runOutside((ownScope as TransactionScope | null)?.afterSettled ?? [], "afterAmbientTransaction");
     return settled.then(
-      (value) => { runAfterSettled(); return value; },
+      (value) => {
+        runOutside((ownScope as TransactionScope | null)?.afterCommitted.values() ?? [], "afterAmbientCommit");
+        runAfterSettled();
+        return value;
+      },
       (error: unknown) => { runAfterSettled(); throw error; },
     );
   }) as Database["transaction"];
   return new Proxy(root, {
     get(target, prop, receiver) {
+      // One scope lookup for both questions: is the root off limits here, and is a transaction open.
+      const scope = transactionScope.getStore();
+      // Symbols are inspection (console.log of the handle) and `then` is a promise asking whether the handle is one: neither is a query.
+      if (scope?.executorOnly && typeof prop === "string" && prop !== "then") {
+        throw new ExecutorOnlyDatabaseAccessError(scope.executorOnly, `getDb().${prop}`);
+      }
       if (prop === "transaction") return scopedTransaction;
-      const source = activeTransaction() ?? target;
+      const source = (scope?.active ? scope.tx : null) ?? target;
       const value = Reflect.get(source, prop, source === target ? receiver : source);
       return typeof value === "function" ? value.bind(source) : value;
     },
@@ -232,6 +291,33 @@ export function afterAmbientTransaction(work: () => void): void {
   const scope = transactionScope.getStore();
   if (scope?.active) scope.afterSettled.push(work);
   else work();
+}
+
+/**
+ * Run `work` once the ambient transaction (if any) has COMMITTED, outside its
+ * context; never after a rollback; with none open, run it now. For a hint to
+ * other processes that must describe committed state only (a socket
+ * "changed" ping). Work is kept per `key`: a second call with the same key in
+ * the same transaction is dropped, so one transaction announces a thing once.
+ * Work that throws is logged, after a commit or now, never thrown.
+ *
+ * Limits: a savepoint that rolls back inside an outer transaction that then
+ * commits does not take back what it registered (a spurious hint, never a
+ * missed one); work lost to a crash between COMMIT and the call is lost.
+ */
+export function afterAmbientCommit(key: string, work: () => void): void {
+  const scope = transactionScope.getStore();
+  if (!scope?.active) {
+    // The write has committed (autocommit): as after a commit, a failing
+    // hint is logged, never thrown into the writer.
+    try {
+      work();
+    } catch (error) {
+      console.error("[db] afterAmbientCommit work failed:", error);
+    }
+    return;
+  }
+  if (!scope.afterCommitted.has(key)) scope.afterCommitted.set(key, work);
 }
 
 /**

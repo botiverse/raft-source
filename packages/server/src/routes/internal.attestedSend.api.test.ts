@@ -9,7 +9,8 @@ import { desc, eq } from "drizzle-orm";
 import { openTestApp } from "../test/integration/app";
 import { getDb } from "../db/index";
 import { agentActivityEvents, attestedSendEvents, messages, users } from "../db/schema";
-import { createAgent, assignMachine } from "../services/agentService";
+import { createAgent } from "../services/agentService";
+import { placeAgentOnMachine } from "../test/agentMachineFixture";
 import {
   addAgent,
   addHuman,
@@ -27,7 +28,7 @@ import { listRecentAgentTrajectory } from "../services/agentActivityLogService";
 import { createServer } from "../services/serverService";
 import { withChannelDelivery } from "../test/orchestratorStub";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 type Fixture = {
   serverId: string;
@@ -76,7 +77,7 @@ async function seedFixture(baseUrl: string): Promise<Fixture> {
   await addAgent(channel.id, agent.id);
 
   const { machine, apiKey } = await registerMachine(server.id, owner.id, "attested-send-daemon");
-  await assignMachine(agent.id, machine.id);
+  await placeAgentOnMachine(agent.id, machine.id);
 
   const loginRes = await fetch(`${baseUrl}/api/auth/login`, {
     method: "POST",
@@ -162,7 +163,7 @@ async function sendAgentAs(baseUrl: string, fixture: Fixture, agentId: string, b
 async function createPeerAgent(fixture: Fixture, name = "AttestedPeer") {
   const peer = await createAgent(fixture.serverId, name, { runtime: "claude", model: "sonnet" });
   await addAgent(fixture.channelId, peer.id);
-  await assignMachine(peer.id, fixture.machineId);
+  await placeAgentOnMachine(peer.id, fixture.machineId);
   return peer;
 }
 
@@ -270,7 +271,7 @@ for (const malformed of malformedLegacySendBodies) {
 
 test("attested send: default-off mode preserves normal send behavior", async () => {
   process.env.SLOCK_ATTESTED_SEND_MODE = "off";
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const fixture = await seedFixture(app.baseUrl);
     const baseline = await sendHumanMessage(app.baseUrl, fixture, "baseline");
@@ -291,6 +292,7 @@ test("attested send: default-off mode preserves normal send behavior", async () 
     });
     assert.equal(explicitFreshnessAttempt.status, 403);
     assert.match(explicitFreshnessAttempt.body.error, /not enabled/);
+    assert.equal(explicitFreshnessAttempt.body.code, "send_freshness_disabled");
 
     const events = await getDb().select().from(attestedSendEvents);
     assert.equal(events.length, 0);
@@ -301,7 +303,7 @@ test("attested send: default-off mode preserves normal send behavior", async () 
 
 test("attested send: default-on interface does not gate legacy sends without a freshness marker", async () => {
   delete process.env.SLOCK_ATTESTED_SEND_MODE;
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const fixture = await seedFixture(app.baseUrl);
     const baseline = await sendHumanMessage(app.baseUrl, fixture, "baseline");
@@ -801,7 +803,8 @@ test("attested send: deprecated continue is rejected and normal send replaces lo
     content: "2",
   });
   assert.equal(rejectedContinue.status, 400);
-  assert.match(rejectedContinue.body.error, /--continue is no longer supported/);
+  assert.equal(rejectedContinue.body.code, "send_continue_unsupported");
+  assert.match(rejectedContinue.body.suggestedNextAction, /--send-draft/);
 
   const [latestAfterRejectedContinue] = await latestChannelMessages(thread.id, 1);
   assert.equal(latestAfterRejectedContinue?.id, firstReply.body.messageId);

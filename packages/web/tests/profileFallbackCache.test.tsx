@@ -39,7 +39,7 @@ test("profile fallback cache stores peer agent and human summaries for instant p
   assert.deepEqual(getCachedAgentProfile("host-server", agent.id), agent);
   assert.equal(getCachedAgentProfile("other-server", agent.id), null);
 
-  primeHumanProfileFromChannelMember("host-server", {
+  primeHumanProfileFromChannelMember("host-server", "channel-1", {
     id: "human-peer-1",
     serverId: "peer-server",
     serverName: "Peer Server",
@@ -48,15 +48,16 @@ test("profile fallback cache stores peer agent and human summaries for instant p
     displayName: "Peer Human",
     description: "remote person",
     avatarUrl: null,
-    gravatarHash: "",
   });
-  assert.deepEqual(getCachedHumanProfile("host-server", "human-peer-1"), {
+  // Keyed per channel: another channel (or none) has its own entry.
+  assert.equal(getCachedHumanProfile("host-server", "human-peer-1"), null);
+  assert.equal(getCachedHumanProfile("host-server", "human-peer-1", "channel-2"), null);
+  assert.deepEqual(getCachedHumanProfile("host-server", "human-peer-1", "channel-1"), {
     userId: "human-peer-1",
     serverId: "peer-server",
     serverName: "Peer Server",
     serverSlug: "peer",
     email: null,
-    gravatarHash: "",
     name: "peer-human",
     displayName: "Peer Human",
     description: "remote person",

@@ -1,3 +1,4 @@
+import type { NextFunction, Request, Response } from "express";
 import { getBoundedRedis } from "../redis";
 import { risingWaveStaleCacheSkippedTotal, risingWaveStaleCacheWriteBytes, risingWaveStaleResponsesTotal } from "../metrics";
 import { traceIdentityHash } from "../tracing/traceIdentity";
@@ -21,6 +22,14 @@ import { findRisingWaveOverload } from "./errorResponse";
 // Entries live STALE_TTL_SECONDS, longer than either age limit, so a miss can
 // say whether there was never a body or only a too old one.
 //
+// A remembered body is never served to a user if it was read before that
+// user's own latest inbox write (done, read, unread, follow, mute, ...):
+// otherwise the item they just marked reappears for up to OVERLOAD_MAX_AGE_MS
+// (Tenny, #proj-data task #7). Each such write records its time per user
+// (noteInboxWriteBeforeReply) before it answers, and a body's writtenAtMs is
+// when its read started. A body read after the write can still miss it by RW's
+// own lag; that is the same as a live read, and the client's overlay covers it.
+//
 // While RisingWave is overloaded (an rw_overloaded seen in this process in the
 // last COALESCE_WINDOW_MS), identical reads already in flight share one RW read:
 // a client retry plus a few tabs otherwise queue the same read several times in
@@ -42,6 +51,9 @@ export const SOFT_MAX_AGE_MS = 60_000;
 const REDIS_DEADLINE_MS = 200;
 // v2 stores { writtenAtMs, value }; v1 entries are simply never read again.
 const KEY_PREFIX = "rw-stale:v2";
+// Per user: when they last changed their own inbox state. Kept STALE_TTL_SECONDS,
+// past OVERLOAD_MAX_AGE_MS, so it outlives every body it could reject.
+const INBOX_WRITE_KEY_PREFIX = "rw-stale:inbox-write-at";
 
 /** `RW_STALE_MAX_VALUE_BYTES` (default 256 KiB): larger bodies are not remembered. */
 export function resolveMaxValueBytes(env: NodeJS.ProcessEnv = process.env): number {
@@ -96,6 +108,29 @@ function inOverloadWindow(): boolean {
   return Date.now() - lastOverloadAtMs < COALESCE_WINDOW_MS;
 }
 
+/**
+ * This process saw an rw_overloaded in the last COALESCE_WINDOW_MS: the "RW is
+ * overloaded right now" signal for callers that would otherwise add optional
+ * reads (`/events?wait_for=` skips its wait while it holds).
+ */
+export function isRisingWaveOverloadRecent(): boolean {
+  return inOverloadWindow();
+}
+
+/**
+ * This process saw an rw_overloaded within the last `ms` (the closed-server
+ * purge stops its run on one in the last 5 minutes). Process-local, like the
+ * window above: another replica's overloads are not seen here.
+ */
+export function isRisingWaveOverloadSeenWithin(ms: number, nowMs: number = Date.now()): boolean {
+  return nowMs - lastOverloadAtMs < ms;
+}
+
+/** Record an rw_overloaded seen outside readWithStaleOnOverload (opens the same window). */
+export function noteRisingWaveOverloadSeen(atMs: number = Date.now()): void {
+  lastOverloadAtMs = Math.max(lastOverloadAtMs, atMs);
+}
+
 const inFlight = new Map<string, Promise<unknown>>();
 
 // Slow reads a soft timeout stopped waiting for, still running, by key. At most
@@ -114,6 +149,7 @@ export type StaleReadResult<T> = {
   traceAttrs: Record<string, string | number>;
 };
 
+/** `writtenAtMs`: when the read that produced `value` started. */
 type Remembered = { writtenAtMs: number; value: unknown };
 
 /**
@@ -134,8 +170,8 @@ export async function readWithStaleOnOverload<T>(input: {
   const keyAttrs: Record<string, string> = keyHash ? { stale_cache_key_hash: keyHash } : {};
   const background = backgroundReads.get(key) as Promise<T> | undefined;
   if (background && (input.softTimeoutMs ?? 0) > 0) {
-    const remembered = await recall(key);
-    if (remembered && Date.now() - remembered.writtenAtMs <= SOFT_MAX_AGE_MS) {
+    const { remembered } = await recallServable(key, input.userId, SOFT_MAX_AGE_MS);
+    if (remembered) {
       risingWaveStaleResponsesTotal.labels(input.surface).inc();
       addTraceEvent("rw_slow.stale_served", {
         surface: input.surface,
@@ -148,6 +184,7 @@ export async function readWithStaleOnOverload<T>(input: {
   const coalescing = inOverloadWindow();
   let pending = background ?? (coalescing ? inFlight.get(key) as Promise<T> | undefined : undefined);
   const joined = pending !== undefined;
+  const readStartedAtMs = Date.now();
   if (pending === undefined) {
     const started = input.load();
     pending = started;
@@ -165,7 +202,7 @@ export async function readWithStaleOnOverload<T>(input: {
   // this request still waits for it.
   const settled = pending.then(
     (value) => {
-      const bytes = joined ? undefined : remember(input.surface, key, value);
+      const bytes = joined ? undefined : remember(input.surface, key, value, readStartedAtMs);
       return { ok: true as const, value, bytes };
     },
     (error: unknown) => ({ ok: false as const, error }),
@@ -180,8 +217,8 @@ export async function readWithStaleOnOverload<T>(input: {
     ]);
     clearTimeout(timer);
     if (timedOut) {
-      const remembered = await recall(key);
-      if (remembered && Date.now() - remembered.writtenAtMs <= SOFT_MAX_AGE_MS) {
+      const { remembered, missReason } = await recallServable(key, input.userId, SOFT_MAX_AGE_MS);
+      if (remembered) {
         if (!joined) {
           const running = pending;
           backgroundReads.set(key, running);
@@ -194,7 +231,7 @@ export async function readWithStaleOnOverload<T>(input: {
         addTraceEvent("rw_slow.stale_served", { surface: input.surface, stale_age_ms: Date.now() - remembered.writtenAtMs });
         return { value: remembered.value as T, stale: true, staleReason: "rw_slow", traceAttrs: keyAttrs };
       }
-      addTraceEvent("rw_slow.stale_missed", { surface: input.surface, reason: remembered ? "too_old" : "never" });
+      addTraceEvent("rw_slow.stale_missed", { surface: input.surface, reason: missReason! });
     }
   }
 
@@ -210,11 +247,11 @@ export async function readWithStaleOnOverload<T>(input: {
   const overload = findRisingWaveOverload(error);
   if (!overload) throw error;
   lastOverloadAtMs = Date.now();
-  const remembered = await recall(key);
+  const { remembered, missReason } = await recallServable(key, input.userId, OVERLOAD_MAX_AGE_MS);
   // Which overload (pool_acquire_timeout / rw_internal_resets / rw_unreachable), so a restart window is countable.
   const overloadReason = overload.reason;
-  if (!remembered || Date.now() - remembered.writtenAtMs > OVERLOAD_MAX_AGE_MS) {
-    addTraceEvent("rw_overload.stale_missed", { surface: input.surface, reason: remembered ? "too_old" : "never", overload_reason: overloadReason });
+  if (!remembered) {
+    addTraceEvent("rw_overload.stale_missed", { surface: input.surface, reason: missReason!, overload_reason: overloadReason });
     throw error;
   }
   risingWaveStaleResponsesTotal.labels(input.surface).inc();
@@ -223,12 +260,12 @@ export async function readWithStaleOnOverload<T>(input: {
 }
 
 /** Stores the body in the background; returns its size in bytes (or undefined with no store). */
-function remember(surface: StaleReadSurface, key: string, value: unknown): number | undefined {
+function remember(surface: StaleReadSurface, key: string, value: unknown, readStartedAtMs: number): number | undefined {
   const store = staleStore();
   if (!store) return undefined;
   let body: string;
   try {
-    body = JSON.stringify({ writtenAtMs: Date.now(), value } satisfies Remembered);
+    body = JSON.stringify({ writtenAtMs: readStartedAtMs, value } satisfies Remembered);
   } catch {
     return undefined;
   }
@@ -260,4 +297,60 @@ async function recall(key: string): Promise<Remembered | undefined> {
   } catch {
     return undefined;
   }
+}
+
+type StaleMissReason = "never" | "too_old" | "before_own_write";
+
+/** The remembered body if it may be served: young enough and read after the user's latest inbox write. */
+async function recallServable(
+  key: string,
+  userId: string,
+  maxAgeMs: number,
+): Promise<{ remembered?: Remembered; missReason?: StaleMissReason }> {
+  const [remembered, lastWriteAtMs] = await Promise.all([recall(key), recallInboxWriteAt(userId)]);
+  if (!remembered) return { missReason: "never" };
+  if (Date.now() - remembered.writtenAtMs > maxAgeMs) return { missReason: "too_old" };
+  if (lastWriteAtMs !== undefined && remembered.writtenAtMs <= lastWriteAtMs) return { missReason: "before_own_write" };
+  return { remembered };
+}
+
+async function recallInboxWriteAt(userId: string): Promise<number | undefined> {
+  const store = staleStore();
+  if (!store) return undefined;
+  try {
+    const raw = await store.get(`${INBOX_WRITE_KEY_PREFIX}:${userId}`);
+    const parsed = raw === null ? Number.NaN : Number(raw);
+    return Number.isFinite(parsed) ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Records that `userId` changed their own inbox state now. Best effort, bounded by the Redis deadline. */
+export async function noteInboxWrite(userId: string, atMs: number = Date.now()): Promise<void> {
+  const store = staleStore();
+  if (!store) return;
+  try {
+    await store.set(`${INBOX_WRITE_KEY_PREFIX}:${userId}`, String(atMs), STALE_TTL_SECONDS);
+  } catch {
+    // Without the mark a fallback may serve a pre-write body, as before.
+  }
+}
+
+/**
+ * Middleware for routes that change the caller's own inbox state: a successful
+ * reply is sent only after the write is noted, so the client's next read cannot
+ * be answered from a body read before it. It hooks `res.json` only: a route that
+ * replies another way (`res.status(204).end()`, `res.send`) silently stops
+ * noting its writes, so keep these routes on `res.json` or note explicitly.
+ */
+export function noteInboxWriteBeforeReply<P>(req: Request<P>, res: Response, next: NextFunction): void {
+  const json = res.json.bind(res);
+  res.json = ((body?: unknown) => {
+    const userId = req.userId;
+    if (!userId || res.statusCode >= 400) return json(body);
+    void noteInboxWrite(userId).finally(() => json(body));
+    return res;
+  }) as Response["json"];
+  next();
 }

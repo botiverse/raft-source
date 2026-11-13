@@ -1,6 +1,6 @@
 import { create } from "zustand";
 import api from "../api/client";
-import type { TaskStatus } from "@botiverse/raft-shared";
+import type { TaskCreateStatus, TaskStatus } from "@botiverse/raft-shared";
 import {
   updateTaskMetadataCache,
   updateTaskMetadataCacheBatch,
@@ -9,6 +9,16 @@ import type {
   TaskMetadataUpdate,
 } from "../utils/taskMetadata";
 import { registerServerReset } from "./serverResetRegistry";
+import {
+  beginSummaryPageLoad,
+  endSummaryPageLoad,
+  mergeServerTaskPage,
+  mergeServerTasksSnapshot,
+  mergeTaskFields,
+  noteSummaryPageTouched,
+} from "./serverTaskMerge";
+
+export { mergeTaskFields };
 import { emitStateTransitionTrace } from "../utils/stateTransitionTrace";
 import { taskTraceStateChanged, transitionOutcomeDetail } from "../utils/stateTransitionChange";
 
@@ -26,8 +36,29 @@ export interface TaskHistoryEvent {
 export interface Task {
   readOnlyReason?: "historical_joint_task" | null;
   id: string;
-  /** Same as id for message-based tasks; legacy tasks use their own ID */
+  /** Parent of the task's own conversation (its hidden anchor message; for
+   *  tasks from before task v2, the visible host message). */
   messageId: string;
+  /** The chat message the task hangs under, if any (task v2: many tasks per
+   *  message, or none — a task may belong to the channel only). */
+  sourceMessageId?: string | null;
+  /** False: no real source (none, or a pre-v2 task's own echo), "Not recorded"; absent from older servers. */
+  sourceRecorded?: boolean;
+  /** Messages in the task's own conversation. */
+  conversationReplyCount?: number;
+  /** Task v2: the task's own conversation exists. False for a pre-v2 task
+   *  until something is first written there (spec §4). */
+  conversationAnchored?: boolean;
+  /** Task v2: the task's own conversation (channels.type = 'task'), as its
+   *  CANONICAL channel id; a joint channel's local conversation differs and is
+   *  resolved through POST /tasks/:id/conversation. Null until it exists. */
+  conversationChannelId?: string | null;
+  /** Task v2: the real pre-v2 host message (`tasks.message_id`); null for a
+   *  task v2 task, whose `messageId` is only a compatibility fallback. */
+  hostMessageId?: string | null;
+  /** Task v2 (flag on): whether the reader follows the task's conversation,
+   *  through this surface's local conversation. Absent with the flag off. */
+  conversationFollowed?: boolean;
   channelId: string;
   channelName?: string | null;
   channelType?: "channel" | "private" | "joint" | "dm" | "thread";
@@ -57,6 +88,17 @@ export interface Task {
   createdByName?: string | null;
   createdAt: string;
   updatedAt: string;
+  /** When the task last moved (created, status, assignee, wording, a message
+   *  in its conversation), as stored: null before the server wrote one. */
+  lastActivityAt?: string | null;
+  /** lastActivityAt ?? updatedAt: what the Tasks page shows and sorts by
+   *  (tasksPageApi.taskActivityAt); moved locally by a live conversation message. */
+  activityAt?: string;
+  /** Who sent the task v2 source message (summary rows): what the server's
+   *  `from_my_message` relation reads. Null without one; absent when the row
+   *  did not say. */
+  sourceSenderType?: "user" | "agent" | "external_projection" | null;
+  sourceSenderId?: string | null;
   /** True for tasks from the deprecated tasks table (not message-based) */
   isLegacy?: boolean;
   /** Storage source reported by server-list rows (full and summary shapes). */
@@ -97,7 +139,7 @@ interface TaskState {
   serverTasksGeneration: number;
   /** Per-status pagination for the summary panel reads (see
    *  loadActiveTaskSummaries / loadServerTaskStatusPage). The active statuses
-   *  (todo/in_progress/in_review) are fetched on panel mount; done/closed
+   *  (todo/in_progress/in_review) are fetched on panel mount; backlog/done/closed
    *  lazily on section expand, with further pages via "Load more". */
   serverTaskPages: Record<TaskStatus, ServerTaskPageState>;
   taskMetadataByMessageId: Record<string, TaskMetadataUpdate>;
@@ -108,6 +150,9 @@ interface TaskState {
   taskHistoryErrorByTaskId: Record<string, boolean>;
   taskHistoryConsumersByTaskId: Record<string, number>;
   taskHistoryGeneration: number;
+  /** Bumped by every live task change (socket upsert / removal): a view
+   *  that shows server totals (the Tasks page's counts) refreshes on it. */
+  liveRevision: number;
   loadTasks: (channelId: string) => Promise<void>;
   loadServerTasks: () => Promise<void>;
   /** Tasks-panel first screen: one small summary page per ACTIVE status
@@ -135,14 +180,30 @@ interface TaskState {
    *  reconnect instead of staying stale until the next mount. Does NOT fetch on
    *  the initial app connect (generation 0) or when no Tasks view is open. */
   catchUpServerTasksOnReconnect: () => void;
-  createTasks: (channelId: string, titles: string[]) => Promise<Task[]>;
+  /** Task v2: `sourceMessageId` is the source (none: the server posts yours; `sourceRandomId` reuses it on retry). */
+  /** Each task a title, or a title and its description. */
+  createTasks: (channelId: string, titles: Array<string | TaskCreateDraft>, sourceMessageId?: string, status?: TaskCreateStatus, sourceRandomId?: string) => Promise<Task[]>;
   claimTask: (channelId: string, taskId: string) => Promise<void>;
   unclaimTask: (channelId: string, taskId: string) => Promise<void>;
-  updateTaskStatus: (channelId: string, taskId: string, status: TaskStatus) => Promise<void>;
+  /** `reason`: what would bring a task moved to backlog back. Blank is no reason. */
+  /**
+   * `claimUnassigned` (default true): an unassigned To-do moved to In progress is the viewer's claim (claimTask). The
+   * Tasks page's batch passes false: one status for many tasks claims none of them for the viewer.
+   */
+  updateTaskStatus: (channelId: string, taskId: string, status: TaskStatus, reason?: string, options?: { claimUnassigned?: boolean }) => Promise<void>;
   updateTaskAssignee: (
     channelId: string,
     taskId: string,
     assignee: { type: "user" | "agent"; id: string } | null,
+    expectedRevision?: number, reason?: string, // reason: a hand-off's "what it waits on them for" (blank: none)
+  ) => Promise<void>;
+  /**
+   * Edit a task's title and/or description (PATCH /tasks/:taskId). The server
+   * writes the `amended` event and the line in the task's discussion.
+   */
+  amendTask: (
+    taskId: string,
+    patch: TaskAmendInput,
     expectedRevision?: number,
   ) => Promise<void>;
   loadTaskHistory: (taskId: string) => Promise<void>;
@@ -151,7 +212,25 @@ interface TaskState {
   convertMessage: (messageId: string) => Promise<Task>;
   // Called by socket events to update a single task in place
   upsertTask: (task: Task) => void;
+  /** Task v2: a reply (person or agent, not a lifecycle line) landed in the
+   *  task's own conversation; its row counts it live. `at` (the message's
+   *  time) also moves the task's activityAt, as the server stamps it without
+   *  a task event, so it rises under the Tasks page's activity sort. */
+  bumpTaskConversationReplyCount: (taskId: string, at?: string) => void;
   removeTask: (taskId: string) => void;
+}
+
+/** A task to create: its title and, if any, its description. */
+export interface TaskCreateDraft {
+  title: string;
+  description?: string;
+}
+
+/** What an edit of a task's wording sends; `clearDescription` removes the description. */
+export interface TaskAmendInput {
+  title?: string;
+  description?: string;
+  clearDescription?: boolean;
 }
 
 const ACTIVE_TASK_STATUSES: TaskStatus[] = ["todo", "in_progress", "in_review"];
@@ -160,34 +239,12 @@ const ACTIVE_TASK_STATUSES: TaskStatus[] = ["todo", "in_progress", "in_review"];
 const SERVER_TASKS_PAGE_LIMIT = 100;
 
 function createEmptyServerTaskPages(): Record<TaskStatus, ServerTaskPageState> {
-  return {
-    todo: { nextCursor: null, loading: false, loaded: false },
-    in_progress: { nextCursor: null, loading: false, loaded: false },
-    in_review: { nextCursor: null, loading: false, loaded: false },
-    done: { nextCursor: null, loading: false, loaded: false },
-    closed: { nextCursor: null, loading: false, loaded: false },
-  };
+  const empty = (): ServerTaskPageState => ({ nextCursor: null, loading: false, loaded: false });
+  return { backlog: empty(), todo: empty(), in_progress: empty(), in_review: empty(), done: empty(), closed: empty() };
 }
 
 function shouldIncludeInServerTasks(task: Task): boolean {
   return task.channelType === "channel" || task.channelType === "private" || task.channelType === "joint";
-}
-
-/**
- * Upgrade-only field merge: an incoming field that is undefined (absent from
- * a summary projection) never overwrites an existing defined value; defined
- * incoming values (including null) always win. Socket task events carry the
- * full task shape and stay authoritative, while detail=summary rows cannot
- * clobber fields they don't project (e.g. a fetched description).
- */
-export function mergeTaskFields(existing: Task, incoming: Task): Task {
-  const merged = { ...incoming };
-  for (const [key, value] of Object.entries(existing)) {
-    if (value !== undefined && (merged as Record<string, unknown>)[key] === undefined) {
-      (merged as Record<string, unknown>)[key] = value;
-    }
-  }
-  return merged;
 }
 
 function upsertTaskInList(list: Task[], task: Task): Task[] {
@@ -221,6 +278,8 @@ function taskProjectionChanged(previous: Task, next: Task): boolean {
 }
 
 function patchTaskState(state: TaskState, task: Task): Partial<TaskState> {
+  // The client's own write landing (claim, status, assignee, wording) is a live change too: placed at once (Tasks page).
+  noteSummaryPageTouched(task.id);
   const taskExists = state.tasks.some((item) => item.id === task.id);
   const tasks = taskExists
     ? state.tasks.map((item) => (item.id === task.id ? mergeTaskFields(item, task) : item))
@@ -325,6 +384,13 @@ function reduceTaskWithTrace(
 // own fetch.
 let inFlightServerLoad: { generation: number; promise: Promise<void> } | null = null;
 
+// In-flight /tasks/channel/:id loads. A caller that arrives while the channel's
+// load is running awaits that same request instead of returning at once: a
+// consumer that reads tasksByChannelId right after `await loadTasks(id)` (the
+// task window resolving `?task=<ch>:task:<id>`) must see the landed list, not
+// the pre-load empty bucket.
+const inFlightChannelLoads = new Map<string, Promise<void>>();
+
 // Task history is fetched only while a task dialog is mounted. Keep one
 // request per task and queue a single follow-up when a realtime task update
 // arrives during the current request, so a stale response cannot hide the
@@ -347,75 +413,6 @@ function requestTaskHistoryRefreshIfObserved(taskId: string, get: () => TaskStat
 // them — otherwise a GET that raced a live event would silently drop it.
 let loadTouchedIds: Set<string> | null = null;
 
-// Merge a /tasks/server snapshot with the live task mutations that landed while
-// it was in flight. The snapshot is the authoritative base; for any id touched
-// live during the fetch, the live store value wins (updated -> live value,
-// removed -> dropped, created -> appended). With no live mutations the snapshot
-// is returned unchanged. This makes committing the snapshot lossless w.r.t.
-// concurrent socket events.
-function mergeServerTasksSnapshot(snapshot: Task[], touched: Set<string>, liveNow: Task[]): Task[] {
-  if (touched.size === 0) return snapshot;
-  const liveById = new Map(liveNow.map((t) => [t.id, t]));
-  const emitted = new Set<string>();
-  const result: Task[] = [];
-  for (const t of snapshot) {
-    emitted.add(t.id);
-    if (!touched.has(t.id)) {
-      result.push(t);
-      continue;
-    }
-    const live = liveById.get(t.id);
-    if (live) result.push(live); // updated live; if absent -> removed live, drop
-  }
-  for (const id of touched) {
-    if (!emitted.has(id)) {
-      const live = liveById.get(id); // created live during the fetch, not in snapshot
-      if (live) result.push(live);
-    }
-  }
-  return result;
-}
-
-// Live task mutations that land while one or more summary page loads are in
-// flight. Refcounted so the parallel active-status first pages share one set; a
-// committing page skips touched ids (the live store value is newer) instead of
-// rolling them back to the pre-event snapshot — the same lossless rule
-// loadTouchedIds gives the legacy full load.
-let summaryLoadTouchedIds: Set<string> | null = null;
-let summaryLoadsInFlight = 0;
-
-function beginSummaryPageLoad(): Set<string> {
-  summaryLoadsInFlight += 1;
-  if (!summaryLoadTouchedIds) summaryLoadTouchedIds = new Set();
-  return summaryLoadTouchedIds;
-}
-
-function endSummaryPageLoad(): void {
-  summaryLoadsInFlight -= 1;
-  if (summaryLoadsInFlight === 0) summaryLoadTouchedIds = null;
-}
-
-// Merge a fetched summary page into serverTasks: upsert-only (a page never
-// shrinks the list — lanes outside this page and live-created tasks stay),
-// field-merged so summary rows can't clobber unprojected fields, and skipped
-// for ids touched live during the fetch (the live value is newer; a live
-// deletion is simply absent and must not be resurrected).
-function mergeServerTaskPage(current: Task[], page: Task[], touched: Set<string>): Task[] {
-  const indexById = new Map(current.map((task, index) => [task.id, index]));
-  const next = [...current];
-  for (const item of page) {
-    if (touched.has(item.id)) continue;
-    const index = indexById.get(item.id);
-    if (index === undefined) {
-      indexById.set(item.id, next.length);
-      next.push(item);
-    } else {
-      next[index] = mergeTaskFields(next[index], item);
-    }
-  }
-  return next;
-}
-
 export const useTaskStore = create<TaskState>((set, get) => ({
   tasks: [],
   loading: false,
@@ -436,55 +433,65 @@ export const useTaskStore = create<TaskState>((set, get) => ({
   taskHistoryErrorByTaskId: {},
   taskHistoryConsumersByTaskId: {},
   taskHistoryGeneration: 0,
+  liveRevision: 0,
 
-  loadTasks: async (channelId) => {
-    if (get().loadingByChannelId[channelId]) return;
-    set((state) => ({
-      loading: true,
-      currentChannelId: channelId,
-      loadingByChannelId: {
-        ...state.loadingByChannelId,
-        [channelId]: true,
-      },
-    }));
-    try {
-      const { data } = await api.get(`/tasks/channel/${channelId}`);
-      const tasks = (data as { tasks: Task[] }).tasks;
-      set((state) => reduceTaskWithTrace(
-        state,
-        "hydrate:channel",
-        channelId,
-        (current) => ({
-          ...(current.currentChannelId === channelId ? { tasks, loading: false } : {}),
-          tasksByChannelId: {
-            ...current.tasksByChannelId,
-            [channelId]: tasks,
-          },
-          loadingByChannelId: {
-            ...current.loadingByChannelId,
-            [channelId]: false,
-          },
-          loadedByChannelId: {
-            ...current.loadedByChannelId,
-            [channelId]: true,
-          },
-          ...hydrateTaskMetadataState(current, tasks),
-        }),
-      ));
-    } catch (err) {
-      console.error("Failed to load tasks:", err);
+  loadTasks: (channelId) => {
+    const inFlight = inFlightChannelLoads.get(channelId);
+    if (inFlight) return inFlight;
+    if (get().loadingByChannelId[channelId]) return Promise.resolve();
+    const promise = (async () => {
       set((state) => ({
-        ...(state.currentChannelId === channelId ? { loading: false } : {}),
+        loading: true,
+        currentChannelId: channelId,
         loadingByChannelId: {
           ...state.loadingByChannelId,
-          [channelId]: false,
-        },
-        loadedByChannelId: {
-          ...state.loadedByChannelId,
           [channelId]: true,
         },
       }));
-    }
+      try {
+        const { data } = await api.get(`/tasks/channel/${channelId}`);
+        const tasks = (data as { tasks: Task[] }).tasks;
+        set((state) => reduceTaskWithTrace(
+          state,
+          "hydrate:channel",
+          channelId,
+          (current) => ({
+            ...(current.currentChannelId === channelId ? { tasks, loading: false } : {}),
+            tasksByChannelId: {
+              ...current.tasksByChannelId,
+              [channelId]: tasks,
+            },
+            loadingByChannelId: {
+              ...current.loadingByChannelId,
+              [channelId]: false,
+            },
+            loadedByChannelId: {
+              ...current.loadedByChannelId,
+              [channelId]: true,
+            },
+            ...hydrateTaskMetadataState(current, tasks),
+          }),
+        ));
+      } catch (err) {
+        console.error("Failed to load tasks:", err);
+        set((state) => ({
+          ...(state.currentChannelId === channelId ? { loading: false } : {}),
+          loadingByChannelId: {
+            ...state.loadingByChannelId,
+            [channelId]: false,
+          },
+          loadedByChannelId: {
+            ...state.loadedByChannelId,
+            [channelId]: true,
+          },
+        }));
+      }
+    })();
+    inFlightChannelLoads.set(channelId, promise);
+    void promise.finally(() => {
+      if (inFlightChannelLoads.get(channelId) === promise) inFlightChannelLoads.delete(channelId);
+    });
+    return promise;
   },
 
   loadServerTasks: async () => {
@@ -561,7 +568,7 @@ export const useTaskStore = create<TaskState>((set, get) => ({
   loadActiveTaskSummaries: async () => {
     // Tasks-panel first screen: one small summary page per ACTIVE status
     // (?detail=summary&status=<one>&limit=N — the API takes exactly one status
-    // per call) instead of the legacy unbounded full-row load. done/closed
+    // per call) instead of the legacy unbounded full-row load. backlog/done/closed
     // stay lazy: their first page is fetched when the user expands that
     // section, further pages via the section's "Load more" affordance.
     //
@@ -668,9 +675,13 @@ export const useTaskStore = create<TaskState>((set, get) => ({
     }
   },
 
-  createTasks: async (channelId, titles) => {
+  createTasks: async (channelId, titles, sourceMessageId, status, sourceRandomId) => {
     const { data } = await api.post(`/tasks/channel/${channelId}`, {
-      tasks: titles.map((title) => ({ title })),
+      tasks: titles.map((item) => {
+        const { title, description } = typeof item === "string" ? { title: item, description: undefined } : item;
+        return { title, ...(description && { description }), ...(sourceMessageId && { sourceMessageId }) };
+      }),
+      ...(status && { status }), ...(!sourceMessageId && sourceRandomId && { sourceRandomId }),
     });
     const created = (data as { tasks: Task[] }).tasks;
     // Don't add to state here — the socket task:created event will upsert them.
@@ -704,7 +715,7 @@ export const useTaskStore = create<TaskState>((set, get) => ({
     requestTaskHistoryRefreshIfObserved(taskId, get);
   },
 
-  updateTaskStatus: async (channelId, taskId, status) => {
+  updateTaskStatus: async (channelId, taskId, status, reason, options) => {
     const state = get();
     const currentTask = state.tasks.find((task) => task.id === taskId)
       ?? state.serverTasks.find((task) => task.id === taskId);
@@ -715,13 +726,15 @@ export const useTaskStore = create<TaskState>((set, get) => ({
     // user's claim/start intent and use the authoritative claim CAS instead of
     // weakening the invariant through the admin force-status path.
     if (status === "in_progress"
+      && options?.claimUnassigned !== false
       && currentTask?.status === "todo"
       && !currentTask.claimedById) {
       await get().claimTask(channelId, taskId);
       return;
     }
 
-    const { data } = await api.patch(`/tasks/${taskId}/status`, { status });
+    const trimmedReason = reason?.trim();
+    const { data } = await api.patch(`/tasks/${taskId}/status`, trimmedReason ? { status, reason: trimmedReason } : { status });
     const updated = (data as { task: Task }).task;
     set((state) => reduceTaskWithTrace(
       state,
@@ -745,10 +758,10 @@ export const useTaskStore = create<TaskState>((set, get) => ({
    * 409 with the current one otherwise, so a stale view loses instead of
    * silently clobbering a concurrent assignment.
    */
-  updateTaskAssignee: async (_channelId, taskId, assignee, expectedRevision) => {
+  updateTaskAssignee: async (_channelId, taskId, assignee, expectedRevision, reason) => {
     const { data } = await api.patch(`/tasks/${taskId}/assignee`, {
       assignee,
-      ...(expectedRevision !== undefined ? { expectedRevision } : {}),
+      ...(expectedRevision !== undefined ? { expectedRevision } : {}), ...(reason?.trim() ? { reason } : {}),
     });
     const updated = (data as { task: Task }).task;
     set((state) => reduceTaskWithTrace(
@@ -757,6 +770,32 @@ export const useTaskStore = create<TaskState>((set, get) => ({
       taskId,
       (current) => patchTaskState(current, updated),
       assignee ? `${assignee.type}:${assignee.id}` : "unassigned",
+    ));
+    requestTaskHistoryRefreshIfObserved(taskId, get);
+  },
+
+  /**
+   * Edit a task's title and/or description.
+   *
+   * `expectedRevision` is optimistic concurrency, as on `updateTaskAssignee`:
+   * the server applies the edit only if the task is still at that revision and
+   * otherwise answers 409 with `currentRevision`, which rejects this promise
+   * (the store is left as it was) so the editor can re-read instead of
+   * overwriting someone else's edit.
+   */
+  amendTask: async (taskId, patch, expectedRevision) => {
+    const { data } = await api.patch(`/tasks/${taskId}`, {
+      ...(patch.title !== undefined ? { title: patch.title } : {}),
+      ...(patch.description !== undefined ? { description: patch.description } : {}),
+      ...(patch.clearDescription ? { clearDescription: true } : {}),
+      ...(expectedRevision !== undefined ? { expectedRevision } : {}),
+    });
+    const updated = (data as { task: Task }).task;
+    set((state) => reduceTaskWithTrace(
+      state,
+      "amend",
+      taskId,
+      (current) => patchTaskState(current, updated),
     ));
     requestTaskHistoryRefreshIfObserved(taskId, get);
   },
@@ -849,35 +888,99 @@ export const useTaskStore = create<TaskState>((set, get) => ({
     return task;
   },
 
+  bumpTaskConversationReplyCount: (taskId, at) => set((state) => {
+    noteSummaryPageTouched(taskId);
+    const bump = (list: Task[]) => {
+      let hit = false;
+      const next = list.map((task) => {
+        if (task.id !== taskId) return task;
+        hit = true;
+        const moved = at && Date.parse(at) > Date.parse(task.activityAt ?? task.lastActivityAt ?? task.updatedAt);
+        return { ...task, conversationReplyCount: (task.conversationReplyCount ?? 0) + 1, ...(moved ? { activityAt: at } : {}) };
+      });
+      return hit ? next : list;
+    };
+    const tasks = bump(state.tasks);
+    const serverTasks = bump(state.serverTasks);
+    let byChannelChanged = false;
+    const tasksByChannelId: Record<string, Task[]> = {};
+    for (const [channelId, list] of Object.entries(state.tasksByChannelId)) {
+      const next = bump(list);
+      if (next !== list) byChannelChanged = true;
+      tasksByChannelId[channelId] = next;
+    }
+    if (tasks === state.tasks && serverTasks === state.serverTasks && !byChannelChanged) return state;
+    return {
+      ...(tasks !== state.tasks ? { tasks } : {}),
+      ...(serverTasks !== state.serverTasks ? { serverTasks } : {}),
+      ...(byChannelChanged ? { tasksByChannelId } : {}),
+    };
+  }),
+
   upsertTask: (task) => {
     // Record the live mutation so an in-flight loadServerTasks merges rather
     // than overwrites it (lossless snapshot commit).
     loadTouchedIds?.add(task.id);
-    summaryLoadTouchedIds?.add(task.id);
+    noteSummaryPageTouched(task.id);
     const existing = findKnownTask(get(), task.id);
     const changed = !existing || taskProjectionChanged(existing, task);
-    set((state) => reduceTaskWithTrace(
-      state,
-      "upsert",
-      task.id,
-      (current) => patchTaskState(current, task),
-      task.status,
-    ));
+    set((state) => ({
+      ...reduceTaskWithTrace(
+        state,
+        "upsert",
+        task.id,
+        (current) => patchTaskState(current, task),
+        task.status,
+      ),
+      liveRevision: state.liveRevision + 1,
+    }));
     if (changed) requestTaskHistoryRefreshIfObserved(task.id, get);
   },
 
   removeTask: (taskId) => {
     loadTouchedIds?.add(taskId);
-    summaryLoadTouchedIds?.add(taskId);
-    set((state) => reduceTaskWithTrace(
-      state,
-      "remove",
-      taskId,
-      (current) => removeTaskState(current, taskId),
-      "removed",
-    ));
+    noteSummaryPageTouched(taskId);
+    set((state) => ({
+      ...reduceTaskWithTrace(
+        state,
+        "remove",
+        taskId,
+        (current) => removeTaskState(current, taskId),
+        "removed",
+      ),
+      liveRevision: state.liveRevision + 1,
+    }));
   },
 }));
+
+/**
+ * One page of a filtered, sorted /tasks/server read (the Tasks page's
+ * groups and columns, tasksPageStore), merged into `serverTasks` by the same
+ * rules as the status lanes' pages: upsert only, field-merged (a summary row
+ * keeps a description a full row brought), and skipping tasks changed live
+ * while it was in flight. Null when the connection or the server changed
+ * meanwhile: the page predates the gap and is dropped.
+ */
+export async function ingestServerTaskQueryPage<T extends { tasks: Task[] }>(fetchPage: () => Promise<T>): Promise<T | null> {
+  const startGeneration = useTaskStore.getState().serverTasksGeneration;
+  const touched = beginSummaryPageLoad();
+  try {
+    const page = await fetchPage();
+    if (useTaskStore.getState().serverTasksGeneration !== startGeneration) return null;
+    useTaskStore.setState((state) => reduceTaskWithTrace(
+      state,
+      "hydrate:server-query",
+      "server-tasks",
+      (current) => ({
+        serverTasks: mergeServerTaskPage(current.serverTasks, page.tasks, touched),
+        ...hydrateTaskMetadataState(current, page.tasks),
+      }),
+    ));
+    return page;
+  } finally {
+    endSummaryPageLoad();
+  }
+}
 
 registerServerReset(() => {
   // Bump (not zero) the generation so a /tasks/server load that began under the
@@ -886,6 +989,7 @@ registerServerReset(() => {
   // before the mounted consumer re-registers against the new generation.
   inFlightTaskHistory.clear();
   pendingTaskHistoryRefresh.clear();
+  inFlightChannelLoads.clear();
   useTaskStore.setState((s) => ({
     tasks: [],
     loading: false,

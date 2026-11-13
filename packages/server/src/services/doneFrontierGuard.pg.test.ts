@@ -1,3 +1,4 @@
+import { fillJointMembersFromChannelHumans } from "../test/jointMemberFill";
 import { dbTest as test } from "../test/integration/dbTest";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
@@ -249,9 +250,9 @@ test("writer-first Done keeps post-frontier channel activity visible while bound
     forceCanonicalPostgres: true,
     humanActivityMuteEnabled: false,
   });
-  const active = inbox.items.find((item) => item.kind !== "thread" && item.channelId === withMessages.id);
+  const active = inbox.items.find((item) => item.kind !== "thread" && item.kind !== "task" && item.channelId === withMessages.id);
   assert.ok(active, "canonical Inbox must retain the row containing post-S activity");
-  if (active.kind === "thread") throw new Error("channel visibility tooth resolved a thread row");
+  if (active.kind === "thread" || active.kind === "task") throw new Error("channel visibility tooth resolved a thread row");
   assert.equal(active.lastMessageId, postFrontier.id);
   assert.equal(active.latestActivitySeq, String(postFrontier.seq));
 });
@@ -349,6 +350,7 @@ test("joint channel and joint thread Done keep local state while locking canonic
     role: "host",
     status: "active",
   });
+  await fillJointMembersFromChannelHumans();
   const [parent] = await getDb().insert(messages).values({
     channelId: canonicalParent.id,
     senderType: "user",
@@ -378,6 +380,7 @@ test("joint channel and joint thread Done keep local state while locking canonic
     role: "host",
     status: "active",
   });
+  await fillJointMembersFromChannelHumans();
   await getDb().insert(threadFollows).values({
     threadChannelId: localThread.id,
     followerType: "user",
@@ -463,6 +466,7 @@ test("joint-thread Done guard never translates a receiver-local display fact", a
     role: "host",
     status: "active",
   });
+  await fillJointMembersFromChannelHumans();
   await getDb().insert(threadFollows).values({
     threadChannelId: localThread.id,
     followerType: "user",
@@ -557,6 +561,7 @@ test("joint-channel Done guard accepts only the incident's canonical storage fro
     role: "host",
     status: "active",
   });
+  await fillJointMembersFromChannelHumans();
 
   const [canonicalMessage] = await getDb().insert(messages).values({
     channelId: canonical.id,

@@ -2,6 +2,7 @@ import { basename } from "node:path";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import type { Command } from "commander";
 import type { ProfileView } from "@botiverse/raft-shared";
+import { MAX_PROFILE_AVATAR_BYTES } from "@botiverse/raft-shared/src/agentCliSurface";
 
 import { defineCommand, registerCliCommand } from "../../core/command";
 import type { CommandRuntimeOptions } from "../../core/context";
@@ -10,7 +11,6 @@ import { writeJson, writeText, NL } from "../../core/renderer";
 import { createAgentApiSurfaceClient } from "../../agentApiPath";
 import { formatProfile } from "./_format";
 
-const MAX_PROFILE_AVATAR_BYTES = 2 * 1024 * 1024;
 const PROFILE_AVATAR_MIME_TYPES = new Set([
   "image/jpeg",
   "image/png",

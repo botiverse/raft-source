@@ -12,6 +12,7 @@ import { afterEach, beforeEach, test } from "vitest";
 
 import { createCommandContext } from "../../core/context";
 import { readObservation, recordObservation } from "../../state/agentLedger";
+import { readPassiveRenderCountsForTest } from "../../state/passiveRenderCountsTestReader";
 import { messageReadCommand } from "./read";
 import { messageSendCommand } from "./send";
 
@@ -145,4 +146,17 @@ test("a card that only reached JSON output is recorded, so JSON-mode sends are h
   }]);
   await assert.rejects(async () => { await messageSendCommand.handler(run.ctx, [], { target: "dm:@richard", json: true }); }, { code: "SEND_HELD_AS_DRAFT" });
   assert.equal(readObservation(AGENT, "sender", senderObservationId("human", "richard"))?.rev, peerCardRev(richard));
+});
+
+test("the peer card on read and in a send's reply is counted for the daemon's turn report", async () => {
+  const read = harness([history([own])]);
+  await messageReadCommand.handler(read.ctx, { target: "dm:@richard" });
+  assert.ok(read.out().startsWith(CARD), read.out());
+  const send = harness([{ ok: true, status: 200, error: null, data: { ok: true, state: "sent", messageId: "m-1", peerCard: richard } }]);
+  await messageSendCommand.handler(send.ctx, [], { target: "dm:@richard" });
+  const replyCard = "\nDM peer @richard (human, Asia/Shanghai): Founder. Prefers short updates.\nEquivalent: raft user info @richard\n";
+  assert.ok(send.out().endsWith(replyCard), send.out());
+  assert.deepEqual(readPassiveRenderCountsForTest(AGENT), [
+    { contextId: "ctx-A", kind: "peer_card", renders: 2, chars: CARD.length + replyCard.length, bytes: CARD.length + replyCard.length },
+  ]);
 });

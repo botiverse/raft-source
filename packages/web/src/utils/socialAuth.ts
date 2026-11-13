@@ -1,12 +1,13 @@
 import type { SocialAuthProviderId } from "../hooks/useAuthProviders";
 import { sanitizeAppLocalReturnPath } from "@botiverse/raft-shared";
-import { assertValidDesktopRuntimeEnvironment, RUNTIME_API_BASE } from "../desktopRuntimeEnvironment";
+import { RUNTIME_API_BASE } from "../runtimeEndpoints";
+import { shareableWebOrigin } from "./desktopShell";
+
+export { isEmbeddedBrowser, isEmbeddedBrowserUserAgent } from "./embeddedBrowser";
 
 export const PENDING_INVITE_STORAGE_KEY = "slock_pending_invite";
 
 function getApiBaseUrl(): string {
-  assertValidDesktopRuntimeEnvironment();
-
   return RUNTIME_API_BASE;
 }
 
@@ -25,32 +26,11 @@ export function buildSocialAuthStartUrl(provider: SocialAuthProviderId, returnTo
   return url.toString();
 }
 
-const EMBEDDED_BROWSER_USER_AGENT_PATTERNS = [
-  /MicroMessenger/i,
-  /DingTalk/i,
-  /Lark|Feishu/i,
-  /FBAN|FBAV|FB_IAB/i,
-  /Instagram/i,
-  /Line\//i,
-  /Weibo/i,
-  /Twitter/i,
-  /;\s*wv\)/i,
-];
-
-export function isEmbeddedBrowserUserAgent(userAgent: string | null | undefined): boolean {
-  if (!userAgent) return false;
-  return EMBEDDED_BROWSER_USER_AGENT_PATTERNS.some((pattern) => pattern.test(userAgent));
-}
-
-export function isEmbeddedBrowser(): boolean {
-  if (typeof navigator === "undefined") return false;
-  return isEmbeddedBrowserUserAgent(navigator.userAgent);
-}
-
 export function getExternalBrowserLoginUrl(returnTo = getCurrentReturnTo()): string {
-  const url = new URL(window.location.origin);
-  url.pathname = sanitizeReturnTo(returnTo);
-  url.search = "";
+  // The return path keeps its query: a message link's ?msg= / ?thread= must
+  // reach the system browser too. Setting `pathname` to it would escape the
+  // "?" (%3F). The sanitized path is app-local, so it cannot change the origin.
+  const url = new URL(sanitizeReturnTo(returnTo), shareableWebOrigin());
   url.hash = "";
   return url.toString();
 }

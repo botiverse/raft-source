@@ -1,4 +1,5 @@
 import { fixturePasswordHash } from "../test/integration/credentials";
+import { insertAttachmentsWithObjects } from "../test/attachmentObjectFixture";
 import { createApiTest } from "../test/integration/apiTest";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
@@ -6,7 +7,7 @@ import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 
 import { getDb } from "../db/index";
-import { attachmentCommentRefs, attachments, messageReactions, users } from "../db/schema";
+import { attachmentCommentRefs, messageReactions, users } from "../db/schema";
 import { openTestApp } from "../test/integration/app";
 import { createServer } from "../services/serverService";
 import { createAgent } from "../services/agentService";
@@ -14,7 +15,7 @@ import { createChannel, addAgent, addHuman } from "../services/channelService";
 import { createMessage } from "../services/messageService";
 import { mintAgentCredential } from "../services/agentCredentialService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 /**
  * Agent transport for attachment comments (attachment-comments MVP, PR3 /
@@ -53,7 +54,7 @@ async function seedFixture() {
   const parentMessage = await createMessage(channel.id, "user", owner.id, "daily artifact", "chat");
 
   const mkAttachment = async (filename: string, messageId: string | null) => {
-    const [row] = await db.insert(attachments).values({
+    const [row] = await insertAttachmentsWithObjects(db, {
       messageId,
       channelId: channel.id,
       uploaderId: owner.id,
@@ -62,7 +63,7 @@ async function seedFixture() {
       mimeType: "text/html",
       sizeBytes: 10,
       storageKey: `${server.id}/${filename}`,
-    }).returning();
+    });
     return row;
   };
 
@@ -73,6 +74,7 @@ async function seedFixture() {
     agentId: agent.id,
     scopes: ["send", "read"],
     name: "ac-full",
+    issuedVia: "computer",
     createdByUserId: null,
   });
 
@@ -83,6 +85,7 @@ async function seedFixture() {
     agentId: sendOnlyAgent.id,
     scopes: ["send"],
     name: "ac-send-only",
+    issuedVia: "computer",
     createdByUserId: null,
   });
 
@@ -112,7 +115,7 @@ async function loginUser(baseUrl: string, email: string) {
 }
 
 test("agent-api attachment comments: agent create is descoped (403, nothing written); scoped reads stay first-class", async () => {
-  const { baseUrl, close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const { baseUrl, close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const fx = await seedFixture();
 
@@ -180,7 +183,7 @@ test("agent-api attachment comments: agent create is descoped (403, nothing writ
 });
 
 test("agent-api attachment comments: descope dominates state rules; read capability still gates the list", async () => {
-  const { baseUrl, close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const { baseUrl, close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const fx = await seedFixture();
 
@@ -226,7 +229,7 @@ test("agent-api attachment comments: descope dominates state rules; read capabil
 });
 
 test("agent-api attachment comments: ✅ from valid resolver marks comment resolved", async () => {
-  const { baseUrl, close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const { baseUrl, close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const fx = await seedFixture();
     const db = fx.db;
@@ -271,7 +274,7 @@ test("agent-api attachment comments: ✅ from valid resolver marks comment resol
 });
 
 test("agent-api attachment comments: viewer.canResolve + resolveAction present only when agent is parent-message author", async () => {
-  const { baseUrl, close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const { baseUrl, close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const fx = await seedFixture();
     const db = fx.db;
@@ -280,7 +283,7 @@ test("agent-api attachment comments: viewer.canResolve + resolveAction present o
     const agentMessage = await createMessage(fx.channel.id, "agent", fx.agent.id, "agent artifact", "chat");
 
     // Attach a file to the agent's message.
-    const [agentAttachment] = await db.insert(attachments).values({
+    const [agentAttachment] = await insertAttachmentsWithObjects(db, {
       messageId: agentMessage.id,
       channelId: fx.channel.id,
       uploaderId: fx.agent.id,
@@ -289,7 +292,7 @@ test("agent-api attachment comments: viewer.canResolve + resolveAction present o
       mimeType: "text/html",
       sizeBytes: 10,
       storageKey: `${fx.server.id}/agent-report.html`,
-    }).returning();
+    });
 
     // Human comments on the agent's attachment.
     const token = await loginUser(baseUrl, fx.ownerEmail);

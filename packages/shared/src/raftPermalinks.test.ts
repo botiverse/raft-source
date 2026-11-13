@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { parseRaftPermalink } from "./raftPermalinks";
+import { isRaftAppHostname, parseRaftPermalink } from "./raftPermalinks";
 
 test("parseRaftPermalink parses standard app.slock.ai permalinks", () => {
   const parsed = parseRaftPermalink(
@@ -130,4 +130,11 @@ test("parseRaftPermalink rejects message ids that are not a UUID or short id", (
   // An id that runs on into more id characters is not silently truncated.
   assert.equal(parseRaftPermalink(`${base}?msg=7556f881-a5f8-4b0d-88dc-8b5af28e8f05abc`), null);
   assert.equal(parseRaftPermalink(`${base}?msg=abc123456789`), null);
+});
+
+test("isRaftAppHostname: the page's and the deployment's hosts and the fixed defaults, exact hostnames only", () => {
+  assert.equal(isRaftAppHostname("app.raft.build"), true);
+  assert.equal(isRaftAppHostname("raft.example.com", ["raft.example.com"]), true);
+  assert.equal(isRaftAppHostname("example.com", ["raft.example.com"]), false);
+  assert.equal(isRaftAppHostname("app.raft.build.evil.test"), false);
 });

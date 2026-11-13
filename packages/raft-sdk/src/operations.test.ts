@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { z } from "zod";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
@@ -6,6 +7,7 @@ import { AGENT_API_ROUTE_META } from "@botiverse/raft-shared/src/agentApiRouteMe
 import { buildRaftOperationsDocument, lookupRaftOperation, raftOperationRoutes } from "./operations";
 import { RAFT_JSON_SCHEMA_KEYWORDS, type RaftJsonSchema } from "./toolSchema";
 import { RAFT_OPERATIONS, RAFT_OPERATIONS_VERSION, raftToolNameFor } from "./index";
+import { toRaftToolInputSchema } from "./toolSchema";
 import { OPERATION_SAMPLES } from "./operationSamples.testkit";
 
 // Name stability: a rename must add a new entry and mark the old one
@@ -17,6 +19,7 @@ const NAME_PAIRS: Array<[string, string]> = [
   ["inbox.drain", "inbox_drain"],
   ["inbox.commit", "inbox_commit"],
   ["inbox.list", "inbox_list"],
+  ["inbox.read", "inbox_read"],
   ["messages.read", "messages_read"],
   ["messages.send", "messages_send"],
   ["messages.reply", "messages_reply"],
@@ -24,13 +27,31 @@ const NAME_PAIRS: Array<[string, string]> = [
   ["messages.resolve", "messages_resolve"],
   ["messages.react", "messages_react"],
   ["messages.unreact", "messages_unreact"],
+  ["messages.updateCard", "messages_update_card"],
   ["attachments.downloadUrl", "attachments_download_url"],
   ["attachments.comments", "attachments_comments"],
+  ["artifacts.list", "artifacts_list"],
+  ["artifacts.read", "artifacts_read"],
+  ["artifacts.comments", "artifacts_comments"],
+  ["artifacts.fileContent", "artifacts_file_content"],
+  ["artifacts.push", "artifacts_push"],
+  ["artifacts.comment", "artifacts_comment"],
+  ["artifacts.review", "artifacts_review"],
+  ["artifacts.resolve", "artifacts_resolve"],
+  ["artifacts.reopen", "artifacts_reopen"],
+  ["artifacts.follow", "artifacts_follow"],
+  ["artifacts.unfollow", "artifacts_unfollow"],
+  ["artifacts.move", "artifacts_move"],
+  ["artifacts.delete", "artifacts_delete"],
+  ["artifacts.saveAttachment", "artifacts_save_attachment"],
+  ["artifacts.check", "artifacts_check"],
+
   ["mentions.pending", "mentions_pending"],
   ["mentions.notify", "mentions_notify"],
   ["mentions.add", "mentions_add"],
   ["mentions.delivery", "mentions_delivery"],
   ["actions.prepare", "actions_prepare"],
+  ["actions.withdraw", "actions_withdraw"],
   ["manual.get", "manual_get"],
   ["manual.search", "manual_search"],
   ["tasks.claim", "tasks_claim"],
@@ -67,6 +88,7 @@ const NAME_PAIRS: Array<[string, string]> = [
   ["users.info", "users_info"],
   ["profile.show", "profile_show"],
   ["profile.update", "profile_update"],
+  ["raftbench.findings", "raftbench_findings"],
 ];
 
 test("manifest snapshot: every (name, toolName) pair is pinned", () => {
@@ -75,6 +97,10 @@ test("manifest snapshot: every (name, toolName) pair is pinned", () => {
     assert.match(op.toolName, /^[a-z0-9_]+$/);
     assert.equal(op.toolName, raftToolNameFor(op.name), `${op.name}: toolName is the snake form of the name`);
     assert.ok(op.description.length > 0 && op.description.split(/(?<=\.)\s/).length <= 3, `${op.name}: 1–3 sentences`);
+    // A model only knows what a field means from its description.
+    for (const [field, schema] of Object.entries(op.inputSchema.properties ?? {})) {
+      assert.ok(typeof (schema as RaftJsonSchema).description === "string" && (schema as RaftJsonSchema).description!.length > 0, `${op.name}.${field}: has a description`);
+    }
   }
   assert.equal(new Set(RAFT_OPERATIONS.map((op) => op.toolName)).size, RAFT_OPERATIONS.length);
 });
@@ -100,21 +126,41 @@ const DERIVED: Record<string, [string, string, string, string]> = {
   "inbox.drain": ["write", "none", "read", "events"],
   "inbox.commit": ["write", "natural", "", ""],
   "inbox.list": ["read", "natural", "read", "inboxList"],
+  "inbox.read": ["write", "none", "read", "inboxRead"],
   "messages.read": ["read", "natural", "read", "historyRead"],
   "messages.send": ["write", "key:idempotencyKey", "send", "messageSendV2"],
   "messages.reply": ["write", "key:idempotencyKey", "send", "messageSendV2"],
-  "messages.search": ["read", "natural", "read", "messageSearch"],
+  "messages.search": ["read", "natural", "read", "messageSearch+artifactList"],
   "messages.resolve": ["read", "natural", "read", "messageResolve"],
   "messages.react": ["write", "natural", "reactions", "messageReactionAdd"],
   "messages.unreact": ["write", "natural", "reactions", "messageReactionRemove"],
+  "messages.updateCard": ["write", "key:idempotencyKey", "send", "messageCardUpdate"],
   "attachments.downloadUrl": ["read", "natural", "read", "attachmentDownloadUrl"],
   "attachments.comments": ["read", "natural", "read", "attachmentCommentsList"],
+  "artifacts.list": ["read", "natural", "read", "artifactList"],
+  "artifacts.read": ["read", "natural", "read", "artifactRead"],
+  "artifacts.comments": ["read", "natural", "read", "artifactComments"],
+  "artifacts.fileContent": ["read", "natural", "read", "artifactFileContent"],
+  "artifacts.push": ["write", "natural", "send", "artifactPublish"],
+  "artifacts.comment": ["write", "none", "send", "artifactComment"],
+  "artifacts.review": ["write", "key:idempotencyKey", "send", "artifactReview"],
+  "artifacts.resolve": ["write", "natural", "send", "artifactCommentResolve"],
+  "artifacts.reopen": ["write", "natural", "send", "artifactCommentReopen"],
+  "artifacts.follow": ["write", "natural", "send", "artifactSubscribe"],
+  "artifacts.unfollow": ["write", "natural", "send", "artifactUnsubscribe"],
+  "artifacts.move": ["write", "none", "send", "artifactMove"],
+  "artifacts.delete": ["write", "none", "send", "artifactDelete"],
+  "artifacts.saveAttachment": ["write", "natural", "send", "artifactSaveAttachment"],
+  "artifacts.check": ["read", "natural", "read", "artifactCheck"],
+
   "mentions.pending": ["read", "natural", "mentions", "mentionActionsPending"],
   "mentions.notify": ["write", "none", "mentions", "mentionActionsExecute"],
   "mentions.add": ["write", "none", "mentions", "mentionActionsExecute"],
   "mentions.delivery": ["read", "natural", "mentions", "senderMentionDeliveries"],
   "actions.prepare": ["write", "key:idempotencyKey", "tasks", "actionPrepare"],
+  "actions.withdraw": ["write", "natural", "tasks", "actionWithdraw"],
   "manual.get": ["read", "natural", "knowledge", "knowledgeGet"],
+  "raftbench.findings": ["read", "natural", "read", "raftbenchFindings"],
   "manual.search": ["read", "natural", "knowledge", "knowledgeSearch"],
   "tasks.claim": ["write", "none", "tasks", "taskClaim"],
   "tasks.list": ["read", "natural", "tasks", "taskList"],
@@ -171,7 +217,7 @@ test("derived fields: sideEffect / idempotency / capability per operation, from 
 
 test("modelOnly is exactly consumes.code === \"refused\"; interrupts and consumption are declared as designed", () => {
   for (const op of RAFT_OPERATIONS) assert.equal(op.modelOnly, op.consumes.code === "refused", op.name);
-  assert.deepEqual(RAFT_OPERATIONS.filter((op) => op.modelOnly).map((op) => op.name), ["inbox.check", "inbox.drain", "inbox.commit"]);
+  assert.deepEqual(RAFT_OPERATIONS.filter((op) => op.modelOnly).map((op) => op.name), ["inbox.check", "inbox.drain", "inbox.commit", "inbox.read"]);
   assert.deepEqual(
     RAFT_OPERATIONS.filter((op) => op.mayInterrupt).map((op) => op.name),
     ["messages.send", "messages.reply", "tasks.claim", "tasks.updateStatus", "tasks.amend"],
@@ -283,4 +329,33 @@ test("operations.json is fresh (pnpm generate:operations) and RAFT_OPERATIONS_VE
   const committed = JSON.parse(readFileSync(resolve(import.meta.dirname, "../operations.json"), "utf8")) as unknown;
   assert.deepEqual(committed, JSON.parse(JSON.stringify(buildRaftOperationsDocument())), "operations.json is stale: run `pnpm --filter @botiverse/raft-sdk generate:operations`");
   assert.match(RAFT_OPERATIONS_VERSION, /^[0-9a-f]{16}$/);
+});
+
+test("app names the first-party app of exactly the artifacts.* operations, by its enabledApps id; Raft's own carry none", () => {
+  for (const op of RAFT_OPERATIONS) {
+    if (op.name.startsWith("artifacts.")) assert.equal(op.app, "artifacts", op.name);
+    else assert.equal("app" in op, false, op.name);
+  }
+  assert.ok(RAFT_OPERATIONS.some((op) => op.app === "artifacts"), "fixture: the manifest has Artifacts operations");
+});
+
+test("a nullable field projects to its non-null type (zod 4.6 emits type: [T, \"null\"])", () => {
+  // zod 4.6's toJSONSchema emits a nullable as a type ARRAY — the projector
+  // accepts the two-member ["T","null"] form and advertises T (omitted = null).
+  const amend = RAFT_OPERATIONS.find((op) => op.name === "tasks.amend")!.inputSchema;
+  assert.equal(amend.properties!.description!.type, "string");
+  assert.ok(!amend.required!.includes("description"));
+});
+
+test("a REQUIRED nullable field is rejected, not silently projected as its non-null type", () => {
+  // Regression guard for the projector's required-nullable rule: a required
+  // `z.string().nullable()` has no tool-schema form (omitted = null only works
+  // for OPTIONAL fields). zod 4.6 emits it as `type: ["string","null"]`, and
+  // the projector's isNullable must read that form as nullable or the field
+  // would be silently accepted as a required string.
+  const schema = z.object({ description: z.string().nullable() });
+  assert.throws(
+    () => toRaftToolInputSchema(schema as never),
+    /required nullable field has no tool-schema form/,
+  );
 });

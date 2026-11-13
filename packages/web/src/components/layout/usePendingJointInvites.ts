@@ -1,8 +1,16 @@
 import { useCallback, useEffect, useState } from "react";
 import api from "../../api/client";
 import { useServerStore } from "../../store/serverStore";
+import { createVisiblePoll, PINGED_LIST_SAFETY_POLL_MS } from "../../utils/visiblePoll";
 
-const POLL_MS = 60_000;
+const CHANGE_EVENT = "raft:joint-invites-changed";
+
+/** The invites to this user on `serverId` changed (the joint-invites:changed ping): read them again now. */
+export function notifyPendingJointInvitesChanged(serverId: string | undefined): void {
+  if (serverId && typeof window !== "undefined") {
+    window.dispatchEvent(new window.CustomEvent(CHANGE_EVENT, { detail: { serverId } }));
+  }
+}
 
 /** One row of `GET /channels/joint-invites`: invites to the current server
  *  addressed to the current user. */
@@ -17,7 +25,10 @@ export interface PendingJointInvite {
 /**
  * RFC 075 §4.5: pending joint invites for the current user on the current
  * server, so they can be accepted in-app instead of only from the email link.
- * Only owners/admins can be invited (and accept), so nobody else polls.
+ * Only owners/admins can be invited (and accept), so nobody else reads. Read
+ * on mount, on the joint-invites:changed ping, once after a reconnect, and the
+ * 5-minute safety poll while visible. None of them reads while the page is
+ * hidden: one read when it shows again.
  */
 export function usePendingJointInvites(): {
   invites: PendingJointInvite[];
@@ -26,11 +37,13 @@ export function usePendingJointInvites(): {
   const serverId = useServerStore((state) => state.current?.id ?? null);
   const role = useServerStore((state) => state.current?.role ?? null);
   const canBeInvited = role === "owner" || role === "admin";
-  const [invites, setInvites] = useState<PendingJointInvite[]>([]);
+  // Tagged with its server: after a switch (also one while hidden, whose
+  // read waits for show) the old server's list is never shown for the new one.
+  const [snapshot, setSnapshot] = useState<{ serverId: string; invites: PendingJointInvite[] } | null>(null);
 
   const refresh = useCallback(async () => {
     if (!serverId || !canBeInvited) {
-      setInvites([]);
+      setSnapshot(null);
       return;
     }
     try {
@@ -39,23 +52,33 @@ export function usePendingJointInvites(): {
       });
       // Drop a response that lands after the user switched servers.
       if (useServerStore.getState().current?.id !== serverId) return;
-      setInvites(Array.isArray(data?.invites) ? data.invites : []);
+      setSnapshot({ serverId, invites: Array.isArray(data?.invites) ? data.invites : [] });
     } catch {
       // Keep the last known list; the email link remains a fallback.
     }
   }, [canBeInvited, serverId]);
 
   useEffect(() => {
-    void refresh();
-    if (!serverId || !canBeInvited || typeof window === "undefined") return;
-    const timer = window.setInterval(() => void refresh(), POLL_MS);
-    const onFocus = () => void refresh();
-    window.addEventListener("focus", onFocus);
+    if (!serverId || !canBeInvited || typeof window === "undefined") {
+      void refresh();
+      return;
+    }
+    // Reads on the joint-invites:changed ping (CHANGE_EVENT); the poll is only
+    // the safety poll (an invite expiring), paused while hidden. The mount
+    // read and the ping's (a reconnect's too) wait for show.
+    const poll = createVisiblePoll(() => void refresh(), { intervalMs: PINGED_LIST_SAFETY_POLL_MS });
+    poll.request();
+    const onChanged = (event: Event) => {
+      if ((event as CustomEvent<{ serverId: string }>).detail?.serverId === serverId) poll.request();
+    };
+    window.addEventListener(CHANGE_EVENT, onChanged);
     return () => {
-      window.clearInterval(timer);
-      window.removeEventListener("focus", onFocus);
+      poll.stop();
+      window.removeEventListener(CHANGE_EVENT, onChanged);
     };
   }, [canBeInvited, refresh, serverId]);
 
-  return { invites, refresh };
+  return { invites: canBeInvited && snapshot?.serverId === serverId ? snapshot.invites : NO_INVITES, refresh };
 }
+
+const NO_INVITES: PendingJointInvite[] = [];

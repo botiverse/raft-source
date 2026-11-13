@@ -2,7 +2,7 @@ import assert from "node:assert";
 import { renderToStaticMarkup } from "react-dom/server";
 import { createElement } from "react";
 import { Skeleton } from "@botiverse/raft-ui";
-import { SkeletonRow, ConversationCardSkeleton } from "../src/components/ui/Skeleton";
+import { SkeletonRow, ListRowSkeletonList } from "../src/components/ui/Skeleton";
 
 // Contract for the loading placeholders. Keeps the idiom consistent:
 // animate-pulse, the Raft Design System `rf-skel` look (the sunken fill, the
@@ -84,35 +84,19 @@ describe("SkeletonRow layout-shift composition", () => {
   });
 });
 
-/** The class lists of the raft-ui Cards in the markup. */
-function cardClassLists(html: string): string[][] {
-  return [...html.matchAll(/<div\b[^>]*\bdata-slot="card"[^>]*>/g)].map((match) =>
-    (match[0].match(/\bclass="([^"]*)"/)?.[1] ?? "").split(/\s+/),
-  );
-}
-
-describe("ConversationCardSkeleton (inbox/saved shared ~96px card)", () => {
-  it("uses themed card surfaces and standard RUI loading bars", () => {
-    const html = renderToStaticMarkup(createElement(ConversationCardSkeleton));
-    const cards = cardClassLists(html);
-    assert.equal(cards.length, 6);
-    for (const classes of cards) {
-      // raft-ui Card: the card fill, a hairline, the container radius; the
-      // real card's 12px padding so the list does not jump.
-      for (const token of ["rounded-container", "border", "border-line-hairline", "bg-layer-card", "p-3"]) {
-        assert.ok(classes.includes(token), `card skeleton must carry ${token}: ${classes.join(" ")}`);
-      }
-    }
-    assert.doesNotMatch(html, /bg-white|bg-black\/|border-black|theme-brutal:/);
-    assert.equal((html.match(/data-slot="skeleton"/g) ?? []).length, 30);
-    assert.match(html, /aria-busy="true"/);
+describe("ListRowSkeletonList (flat ListRow skeletons after the 1s wait)", () => {
+  it("renders nothing before the wait passes, so a fast load never flashes it", () => {
+    const html = renderToStaticMarkup(createElement(ListRowSkeletonList, { count: 3, variant: "plain", description: true }));
+    assert.equal(html, "");
   });
 
-  it("renders the requested number of cards", () => {
-    const html = renderToStaticMarkup(createElement(ConversationCardSkeleton, { count: 3 }));
-    // 3 cards, each carrying the card box padding.
-    const cards = cardClassLists(html);
-    assert.equal(cards.length, 3);
-    assert.ok(cards.every((classes) => classes.includes("p-3")));
+  it("renders flat ListRow skeleton rows, never bordered cards", () => {
+    const html = renderToStaticMarkup(
+      createElement(ListRowSkeletonList, { count: 3, delay: 0, variant: "plain", description: true }),
+    );
+    assert.equal((html.match(/data-slot="list-row"/g) ?? []).length, 3);
+    assert.equal((html.match(/data-skeleton=""/g) ?? []).length, 3);
+    assert.match(html, /data-variant="plain"/);
+    assert.doesNotMatch(html, /data-slot="card"/);
   });
 });

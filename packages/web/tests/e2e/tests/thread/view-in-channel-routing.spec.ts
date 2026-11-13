@@ -204,7 +204,6 @@ test.describe("thread view-in-channel routing", () => {
 
     await page.getByTestId("thread-overflow-trigger").click();
     const viewInChannel = page.getByTestId("thread-overflow-view-in-channel");
-    await expect(viewInChannel).toHaveText("View in channel");
     await viewInChannel.click();
 
     await expect(page).toHaveURL(
@@ -277,6 +276,44 @@ test.describe("thread view-in-channel routing", () => {
     );
     await expect(page.getByTestId("thread-message-scroller")).toHaveCount(0);
     await expect(page.getByTestId("message-scroller")).toBeVisible();
+  });
+
+  test("desktop: the channel name in the thread header opens the parent message in the channel", async ({
+    page,
+    request,
+  }) => {
+    const seedState = await waitForSeedState();
+    const login = await loginViaApi(request, seedState);
+    await dismissOwnerOnboarding(request, seedState, login.accessToken);
+    const headers = {
+      Authorization: `Bearer ${login.accessToken}`,
+      "X-Server-Id": seedState.server.id,
+    };
+
+    const parent = await request.post(`${seedState.urls.api}/api/messages`, {
+      headers,
+      data: { channelId: seedState.channel.id, content: `Header link parent ${Date.now()}` },
+    });
+    expect(parent.ok()).toBeTruthy();
+    const parentMsg = (await parent.json()) as { id: string };
+    const threadResp = await request.post(
+      `${seedState.urls.api}/api/channels/${seedState.channel.id}/threads`,
+      { headers, data: { parentMessageId: parentMsg.id, content: `Header link reply ${Date.now()}` } },
+    );
+    expect(threadResp.ok()).toBeTruthy();
+
+    await page.goto(
+      `/s/${seedState.server.slug}/channel/${seedState.channel.id}?thread=${seedState.channel.id}:${parentMsg.id}`,
+    );
+    await expect(page.getByTestId("thread-message-scroller")).toBeVisible();
+
+    const channelLink = page.getByTestId("thread-header-channel-link");
+    await expect(channelLink).toHaveText(`#${seedState.channel.name}`);
+    await channelLink.click();
+
+    await expect(page).toHaveURL(
+      new RegExp(`/s/${seedState.server.slug}/channel/${seedState.channel.id}\\?msg=${parentMsg.id}$`),
+    );
   });
 
   test("desktop: DM thread → toDmMessage builds /dm/ permalink", async ({

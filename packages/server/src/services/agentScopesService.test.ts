@@ -9,7 +9,7 @@ import { loadAgentScopes, resetAgentScopesToDefault, updateAgentScopes } from ".
 import { createServer } from "./serverService";
 import { AGENT_GRANTABLE_SCOPES } from "@botiverse/raft-shared";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 async function seedScopeAgent(slug: string) {
   const db = getDb();

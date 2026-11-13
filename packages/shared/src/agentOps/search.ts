@@ -7,7 +7,9 @@ import { lazySchema } from "../lazySchema";
 import type { AgentApiClient } from "../agentApiClient";
 import type { AgentApiMessageSearchResponse } from "../agentApiContract";
 import { formatAgentMessages } from "../agentMessageText";
+import { formatArtifactsAlsoMatch } from "../agentText/artifacts";
 import { formatAgentSearchResults } from "../agentText/search";
+import { artifactsMatchQuery, probeWithin } from "./artifacts";
 import { hintStep, RAFT_HINTS, type RaftHintOptions } from "./hint";
 import { projectRaftMessage, toAgentMessageLike, type RaftMessage } from "./message";
 import { failureFromClientResult, failureOutcome, opError, validateOpRequest, type RaftNextStep, type RaftOutcome } from "./outcome";
@@ -35,7 +37,7 @@ export const searchMessagesRequestSchema = lazySchema("searchMessagesRequestSche
   query: z.string().optional().describe("Free-text query; may be omitted when filtering by target or sender."),
   target: z.string().optional().describe("Only this channel, DM, or thread."),
   sender: z.string().optional().describe("Only messages from this handle."),
-  sort: z.enum(["relevance", "recent"]).optional(),
+  sort: z.enum(["relevance", "recent"]).optional().describe("relevance (the default with a query; needs one) or recent (newest first; filter-only searches always use it)."),
   before: z.string().optional().describe("ISO timestamp; only messages at or before it."),
   after: z.string().optional().describe("ISO timestamp; only messages at or after it."),
   limit: z.number().int().positive().optional().describe("Results per page, 1..50 (Server default 20)."),
@@ -64,10 +66,25 @@ export interface RaftSearchPage {
   searchedThrough: string | null;
   /** incomplete only: how many messages were read before the search stopped. */
   searchedMessages: number | null;
+  /** No message matched every word; matching any word was skipped because too many match. */
+  relaxedSkipped: "too_broad" | null;
+  /** The plan's history window hid matches: how many and why (absent when it hid none or wasn't counted). */
+  historyLimitMessage?: string;
+  /** Relevance only: too many matches to rank, so the results are newest first (as recent). */
+  relevanceFallback: "too_broad" | null;
+}
+
+/**
+ * Whether a message search also asks if Artifacts match: a first page of a
+ * text search, filtered by conversation at most (Artifacts have no sender
+ * or message time).
+ */
+export function messageSearchProbesArtifacts(request: Pick<SearchMessagesRequest, "query" | "sender" | "before" | "after" | "offset" | "cursor">): boolean {
+  return Boolean(request.query?.trim()) && !request.sender && !request.before && !request.after && !request.offset && !request.cursor;
 }
 
 export async function searchMessages(
-  client: Pick<AgentApiClient, "messages">,
+  client: Pick<AgentApiClient, "messages" | "artifacts">,
   request: SearchMessagesRequest,
   options: RaftHintOptions = {},
 ): Promise<RaftOutcome<RaftSearchPage, "results" | "empty" | "incomplete">> {
@@ -75,7 +92,7 @@ export async function searchMessages(
   if (!request.query?.trim() && !request.target && !request.sender) {
     return failureOutcome(opError("INVALID_REQUEST", { message: "Pass a query, or filter by target or sender." }));
   }
-  const result = await client.messages.search({
+  const searched = client.messages.search({
     ...(request.query?.trim() ? { q: request.query.trim() } : {}),
     ...(request.target ? { channel: request.target } : {}),
     ...(request.sender ? { sender: request.sender } : {}),
@@ -86,6 +103,11 @@ export async function searchMessages(
     ...(request.offset === undefined ? {} : { offset: String(request.offset) }),
     ...(request.cursor ? { cursor: request.cursor } : {}),
   });
+  // Asked alongside the search (after it), never instead of it.
+  const artifactsMatch = messageSearchProbesArtifacts(request)
+    ? artifactsMatchQuery(client, { query: request.query!, target: request.target })
+    : Promise.resolve(false);
+  const result = await searched;
   if (!result.ok) return failureFromClientResult(result);
   const data = result.data;
   const hasMore = typeof data.hasMore === "boolean" ? data.hasMore : null;
@@ -93,7 +115,23 @@ export async function searchMessages(
   const nextCursor = typeof data.nextCursor === "string" && data.nextCursor ? data.nextCursor : null;
   const searchedThrough = typeof data.searchedThrough === "string" ? data.searchedThrough : null;
   const searchedMessages = typeof data.searchedMessages === "number" ? data.searchedMessages : null;
-  const page: RaftSearchPage = { query: request.query?.trim() ?? "", results: data.results, hasMore, incomplete, nextCursor, searchedThrough, searchedMessages };
+  const relaxedSkipped = data.relaxedSkipped === "too_broad" ? "too_broad" : null;
+  const relevanceFallback = data.relevanceFallback === "too_broad" ? "too_broad" : null;
+  const historyLimitMessage = data.historyLimited === true
+    ? (typeof data.historyLimitMessage === "string" && data.historyLimitMessage ? data.historyLimitMessage : undefined)
+    : undefined;
+  const page: RaftSearchPage = {
+    query: request.query?.trim() ?? "",
+    results: data.results,
+    hasMore,
+    incomplete,
+    nextCursor,
+    searchedThrough,
+    searchedMessages,
+    relaxedSkipped,
+    relevanceFallback,
+    ...(historyLimitMessage ? { historyLimitMessage } : {}),
+  };
   const { offset: _offset, ...requestWithoutOffset } = request;
   const nextArgs = nextCursor
     ? { ...requestWithoutOffset, sort: "recent" as const, cursor: nextCursor }
@@ -143,12 +181,15 @@ export async function searchMessages(
       ...(nextCursor ? { nextCursor } : {}),
       ...(searchedThrough ? { searchedThrough } : {}),
       ...(searchedMessages === null ? {} : { searchedMessages }),
+      ...(relaxedSkipped ? { relaxedSkipped } : {}),
+      ...(data.historyLimited === true ? { historyLimited: true, ...(historyLimitMessage ? { historyLimitMessage } : {}) } : {}),
+      ...(relevanceFallback ? { relevanceFallback } : {}),
     }, request.offset, request.sort, request.limit, options.hints, {
       target: request.target,
       sender: request.sender,
       after: request.after,
       before: request.before,
-    }),
+    }) + (await probeWithin(artifactsMatch) ? `\n${formatArtifactsAlsoMatch(page.query, request.target, options.hints)}` : ""),
   };
 }
 

@@ -4,11 +4,12 @@ export function accountBootstrapPreviewUser(provider: "google" | "github" | "app
   return {
     id: "account-preview-user",
     email: "cindy@example.com",
-    gravatarHash: "preview",
     name: "pending_1234567890abcdef",
     displayName: provider ? "Cindy Rui" : null,
     description: null,
-    avatarUrl: provider ? "https://api.dicebear.com/9.x/notionists-neutral/png?seed=Cindy" : null,
+    // A new email account starts with a random built pixel avatar (the server
+    // stores one at sign-up); a social one with the provider's photo.
+    avatarUrl: provider ? "https://api.dicebear.com/9.x/notionists-neutral/png?seed=Cindy" : "pixel-human:v1:mint.3.side.brown.happy.headphones.none",
     emailVerified: true,
     profileSetupCompletedAt: null,
     profileSetupSuggestedHandle: provider ? "cindyrui2" : null,

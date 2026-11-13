@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 
-import { displayText } from "../scripts/build-glossary-manifest.mjs";
+import { displayText } from "../scripts/build-glossary-manifest";
 import { zhCn as zhMessages } from "../src/i18n/messages/zh-cn";
 
 // COPY SWEEP TERM CONTRACT — transcript→记录 / credential key→密钥.

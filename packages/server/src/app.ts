@@ -1,10 +1,24 @@
+import { appSumoHandlers } from "./routes/appSumo";
+import { ssoRouter } from "./routes/sso";
+import {
+  RUNTIME_AUTH_CODE_PATH,
+  RUNTIME_AUTH_CONNECT_PROVIDER_PATH,
+  runtimeAuthCodeBodyErrorHandler,
+  runtimeAuthCodeBodyParser,
+  runtimeAuthConnectProviderBodyErrorHandler,
+  runtimeAuthConnectProviderBodyParser,
+} from "./routes/runtimeAuthRoutes";
 import express, { type Express, type Request, type RequestHandler } from "express";
 import helmet from "helmet";
 import cors from "cors";
-import rateLimit, { ipKeyGenerator } from "express-rate-limit";
+import { AGENT_CONTEXT_VIEW_RESULT_ROUTE, aiTrainingCrawlerRobotsLines } from "@botiverse/raft-shared";
+import { sharedRateLimit } from "./services/sharedRateLimitStore";
+import rateLimit, { ipKeyGenerator, type Store } from "express-rate-limit";
 import { channelRouter } from "./routes/channels";
+import { syncRouter } from "./routes/sync";
 import { publicServerRouter } from "./routes/publicServer";
 import { publicFeatureFlagsRouter } from "./routes/publicFeatureFlags";
+import { publicClientConfigRouter } from "./routes/publicClientConfig";
 import { publicSearchRouter } from "./routes/publicSearch";
 import { createPublicSearchAccess, type PublicSearchServiceBucketStore, type PublicSearchServiceKeySource } from "./lib/publicSearchServiceAccess";
 import {
@@ -14,11 +28,20 @@ import {
   publicVisitsRouter,
 } from "./routes/publicVisits";
 import { countIngest } from "./services/productEventIngest";
-import { messageRouter, messageV2Router } from "./routes/messages";
+import { SYNC_HORIZON_HEADER, SYNC_HORIZON_RESET_HEADER } from "./services/syncHorizon";
+import { getPublicContentBaseUrl } from "./services/storageService";
+import { STALE_RESPONSE_HEADER } from "./routes/rwStaleRead";
+import { isLinkCardReadRequest, LINK_CARD_READ_PATH, linkCardReadBodyErrorHandler, linkCardReadBodyParser, messageRouter, messageV2Router } from "./routes/messages";
+import {
+  LINK_CARD_EXECUTE_PATH, LINK_CARD_PREPARE_PATH, LINK_CARD_STATUS_PATH, LINK_CARD_UPDATES_PATH, linkCardBodyErrorHandler, linkCardExecuteBodyParser,
+  linkCardPrepareBodyParser, linkCardRouter, linkCardStatusBodyParser, linkCardUpdatesBodyParser,
+} from "./routes/linkCards";
 import { agentRouter, agentAvatarRouter } from "./routes/agents";
+import { agentMigrationLogRouter } from "./routes/agentMigrationLog";
 import { agentCredentialsHandler, listAgentCredentialsHandler, revokeAgentCredentialHandler } from "./routes/agentCredentials";
 import { listManageableAgentsHandler } from "./routes/agentDiscovery";
 import { internalRouter } from "./routes/internal";
+import { createOpsCpuProfileRouter, type OpsCpuProfileDeps } from "./routes/opsCpuProfile";
 import {
   SCOPE_ATTESTATION_PATH,
   SCOPE_ATTESTATION_REQUEST_MAX_BYTES,
@@ -29,19 +52,27 @@ import {
   AGENT_MIGRATION_CONTROL_REQUEST_MAX_BYTES,
   agentMigrationControlBodyErrorHandler,
 } from "./routes/agentMigrationControlRequestLimits";
-import { authRouter } from "./routes/auth";
+import { authRouter, invitesRouter, secondFactorVerifyHandler } from "./routes/auth";
+import { secondFactorRecoveryRouter, secondFactorRouter, signInPasskeyAssertionOptions } from "./routes/secondFactor";
+import { accountDeletionCancelLinkHandler, accountDeletionRouter } from "./routes/accountDeletion";
+import { externalInviteRouter, serverConnectRequestRouter } from "./routes/externalInvites";
 import { agentLoginRouter } from "./routes/agentLogin";
-import { deviceAuthRouter } from "./routes/deviceAuth";
+import { deviceAuthRouter, deviceLoginRevokeHandler } from "./routes/deviceAuth";
 import { appLoginRouter } from "./routes/appLogin";
 import { computerAttachRouter } from "./routes/computerAttach";
+import { computerRetireSessionHandler } from "./routes/computerRetireSession";
 import { computerAdoptRouter } from "./routes/computerAdopt";
 import { computerLegacyMachinesRouter } from "./routes/computerLegacyMachines";
 import { isDeviceAuthSurfaceEnabled } from "./services/deviceAuthService";
 import { internalComputerRouter } from "./routes/internalComputer";
-import { internalAgentApiRouter } from "./routes/internalAgentApi";
+import { firstPartyAppAgentApiLargeBodies, internalAgentApiRouter } from "./routes/internalAgentApi";
+import { appBodyErrorHandler, appEnabledBeforeBody, appWebLimitAcrossReplicas, mountFirstPartyAppInternals, mountFirstPartyAppPublicApis, mountFirstPartyAppPublicPages, mountFirstPartyAppWebApis } from "./routes/firstPartyAppRoutes";
+import { objectsRouter } from "./routes/objects";
+import { mentionsRouter } from "./routes/mentions";
+import { searchRouter } from "./routes/search";
 import { agentApiErrorTrace } from "./routes/agentApiErrorTrace";
 import { serverRouter } from "./routes/servers";
-import { billingRouter, stripeWebhookHandler } from "./routes/billing";
+import { billingRouter, isBillingPreviewPath, stripeWebhookHandler } from "./routes/billing";
 import { resendNewsletterWebhookHandler } from "./routes/newsletterWebhooks";
 import { raftbenchRouter } from "./routes/raftbench";
 import { taskRouter } from "./routes/tasks";
@@ -56,15 +87,19 @@ import {
 import { shareArtifactPublicRouter, shareArtifactRouter } from "./routes/shareArtifacts";
 import { pushRouter } from "./routes/push";
 import { notificationRouter } from "./routes/notifications";
+import { notificationLevelsRouter } from "./routes/notificationLevels";
+import { meRouter } from "./routes/me";
 import { announcementRouter } from "./routes/announcements";
 import { integrationInviteRouter, integrationLogoPublicRouter, integrationRouter } from "./routes/integrations";
 import { appInstallationRouter } from "./routes/appInstallations";
-import { actionsRouter } from "./routes/actions";
+import { actionsRouter, PRODUCT_FEEDBACK_LIMITER, QUESTION_ANSWER_LIMITER, QUESTION_ANSWER_RATE_LIMIT_PER_HOUR } from "./routes/actions";
+import { ACTOR_RESOLVE_PATH, actorResolveBodyErrorHandler, actorResolveBodyParser, actorRouter } from "./routes/actors";
 import { productEventsRouter } from "./routes/productEvents";
 import { managedMcpOAuthCallbackRouter, managedMcpRouter } from "./routes/managedMcp";
 import { agentConnectionCallbackRouter } from "./routes/agentConnectionCallback";
 import { providerConnectionRouter } from "./routes/providerConnections";
 import { agentRuntimeProviderRouter } from "./routes/agentRuntimeProviders";
+import { runtimeProviderControlRouter } from "./routes/runtimeProviderControl";
 import { productFeedbackRouter } from "./routes/productFeedback";
 import { releaseNotesRouter } from "./routes/releaseNotes";
 import { mobileDownloadRouter } from "./routes/mobileDownload";
@@ -72,7 +107,7 @@ import { desktopDownloadRouter } from "./routes/desktopDownload";
 import { mobileAppEmailUnsubscribeRouter } from "./routes/mobileAppEmailUnsubscribe";
 import { featureFlagsRouter } from "./routes/featureFlags";
 import { readMutationRouter } from "./routes/readMutations";
-import { oauthRouter, oidcDiscoveryHandler, oidcScopedMountGuard } from "./routes/oauth";
+import { oauthIdentityTokenRateLimitKey, oauthRouter, oidcDiscoveryHandler, oidcScopedMountGuard } from "./routes/oauth";
 import { messageTranslationBatchHandler } from "./routes/messageTranslations";
 import { otlpRelayHandler } from "./routes/otlpRelay";
 import {
@@ -81,19 +116,24 @@ import {
 } from "./routes/slackBridge";
 import { requireAuth, requireVerified, requireServer, requireMachineAuth, requireFlexAuth, requireServerForFlex } from "./middleware/auth";
 import { authFromRegistry } from "./middleware/authFromRegistry";
+import { agentContextViewForwardHandler, agentContextViewResultHandler } from "./routes/agentContextViewResult";
+import { AGENT_CONTEXT_VIEW_FORWARD_ROUTE } from "./services/agentContextViewRelay";
+import { createAgentContextViewRelay } from "./services/agentContextViewService";
 import { perfAttributionMiddleware } from "./middleware/perfAttribution";
-import { requestObservabilityMiddleware } from "./middleware/requestObservability";
+import { requestObservabilityMiddleware, TRACE_ID_RESPONSE_HEADER } from "./middleware/requestObservability";
 import {
   forwardAdmissionTraceMiddleware,
   markForwardAdmissionStage,
 } from "./tracing/messageForwardTrace";
+import { withMiddlewarePhaseTrace } from "./tracing/semanticTrace";
 import { raftdevActivityMiddleware } from "./middleware/raftdevActivity";
 import { inboxRouteBackpressureMiddleware } from "./middleware/inboxRouteBackpressure";
 import { AGENT_BOOTSTRAP_SURFACE_ENABLED_ENV, isAgentBootstrapSurfaceEnabled } from "./services/agentCredentialService";
-import { getWebCorsOriginOption } from "./config/appUrl";
+import { getWebCorsOriginOption, getWebCorsOrigins } from "./config/appUrl";
 import { globalJsonServerErrorHandler } from "./routes/errorResponse";
 import { readBuildIdentityStatus } from "./version";
 import { clientIpForRateLimit } from "./lib/clientIpForRateLimit";
+import { receiveAntiprotonApprovalHint } from "./routes/antiprotonApprovals";
 
 
 export const CORS_PREFLIGHT_MAX_AGE_SECONDS = 7200;
@@ -129,9 +169,95 @@ export function shouldSkipAuthRateLimit(input: {
   isTestEnv: boolean;
   skipInTestHarness: boolean;
   path: string;
+  /** The OAuth identity endpoints' per-token limit counted this request (oauthIdentityTokenLimiter). */
+  countedPerAccessToken?: boolean;
 }): boolean {
+  if (input.countedPerAccessToken) return true;
   if (input.path === "/invite-info" || input.path === "/accept-invite") return true;
   return input.isTestEnv && input.skipInTestHarness;
+}
+
+/** The auth limiter's requests per IP a minute; the OAuth identity endpoints' invalid tokens get the same, on their own counter. */
+const AUTH_RATE_LIMIT_PER_MINUTE = 200;
+
+/** The auth limiter's 429 body; the OAuth identity endpoints' limits answer the same. */
+const AUTH_RATE_LIMITED_BODY = { error: "Too many requests, please try again later" };
+
+/**
+ * Requests per access token a minute, per replica, on the OAuth identity
+ * endpoints (RFC 079 1a follow-up; Tenny, #proj-apps:769a57d4: tune after
+ * launch from real hits).
+ */
+export const OAUTH_IDENTITY_TOKEN_RATE_LIMIT_PER_MINUTE = 600;
+
+/** res.locals: the per-token key a request was counted by; the auth limiter then skips it. */
+const OAUTH_IDENTITY_TOKEN_RATE_LIMIT_KEY = "oauthIdentityTokenRateLimitKey";
+
+/**
+ * Mounted ahead of the auth limiter on both OAuth mounts. A request for one of
+ * the five Bearer identity endpoints that carries a Bearer token
+ * (oauthIdentityTokenRateLimitKey) is counted here, before the token is looked
+ * up, and the auth limiter then skips it: Apps call these from their own
+ * backend, so all of an App's users share one IP. Two limits, in this order:
+ *
+ * - Invalid tokens per IP (`invalidTokensPerIp`, the auth limit's 200 a minute
+ *   in production, on its own counter): every such request is counted on
+ *   entry and given back once the route answers anything but 401, so a valid
+ *   token never spends it, while a spray of new invalid tokens from one IP is
+ *   refused here, before their lookups, once it is spent. Being checked before
+ *   the lookup, a spent budget also holds back that IP's valid tokens until
+ *   the window resets.
+ * - Per access token (`perToken`), keyed by the token's hash; its RateLimit-*
+ *   headers replace the first limit's on a request that passes both.
+ *
+ * Any other request passes uncounted to the auth limiter, as before. Past
+ * either limit: the auth limiter's 429 body, with Retry-After and the
+ * RateLimit-* headers. `enforce` false (the pglite harness unless a test sets
+ * the limit): nothing is counted here, so the auth limiter counts these routes
+ * per IP. `store` (the per-token limit's) is for tests.
+ */
+export function oauthIdentityTokenLimiter(input: {
+  perToken: number;
+  invalidTokensPerIp: number;
+  enforce: boolean;
+  validate: false | undefined;
+  store?: Store;
+}): RequestHandler {
+  // replica-local: abuse guard only, per-replica budget is acceptable
+  const invalidTokenLimiter = rateLimit({
+    keyGenerator: (req) => ipKeyGenerator(clientIpForRateLimit(req)),
+    windowMs: 60 * 1000, // 1 minute
+    max: input.invalidTokensPerIp,
+    validate: input.validate,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: AUTH_RATE_LIMITED_BODY,
+    skipSuccessfulRequests: true,
+    requestWasSuccessful: (_req, res) => res.statusCode !== 401,
+  });
+  // replica-local: abuse guard only, per-replica budget is acceptable
+  const tokenLimiter = rateLimit({
+    keyGenerator: (_req, res) => res.locals[OAUTH_IDENTITY_TOKEN_RATE_LIMIT_KEY] as string,
+    windowMs: 60 * 1000, // 1 minute
+    max: input.perToken,
+    validate: input.validate,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: AUTH_RATE_LIMITED_BODY,
+    ...(input.store ? { store: input.store } : {}),
+  });
+  return (req, res, next) => {
+    const key = input.enforce ? oauthIdentityTokenRateLimitKey(req) : null;
+    if (key === null) {
+      next();
+      return;
+    }
+    res.locals[OAUTH_IDENTITY_TOKEN_RATE_LIMIT_KEY] = key;
+    return invalidTokenLimiter(req, res, (error?: unknown) => {
+      if (error) next(error);
+      else void tokenLimiter(req, res, next);
+    });
+  };
 }
 
 export type CreateAppOptions = Readonly<{
@@ -139,10 +265,33 @@ export type CreateAppOptions = Readonly<{
     skipAuthRateLimit?: boolean;
     enforceMessageRateLimit?: boolean;
     messageRateLimitMax?: number;
+    /**
+     * Enforce first-party apps' web rate limits (skipped in the pglite harness
+     * otherwise) at this many a minute, by `<app id>.<limit name>`; core's
+     * object summaries by `objects.summaries`; core's mention audience by
+     * `mentions.audience`. (Their agent API writes are core's agent write
+     * budgets: __setAgentApiWriteBudgetsForTests.)
+     */
+    appRateLimitMax?: Readonly<Record<string, number>>;
+    /** Apply the product feedback limit in the pglite harness, which otherwise skips it. */
+    enforceProductFeedbackRateLimit?: boolean;
+    /** Apply the per-person question-card answer limit in the pglite harness, at this many an hour (skipped otherwise). */
+    questionAnswerRateLimitMax?: number;
+    /**
+     * Enforce the OAuth identity endpoints' limits (skipped in the pglite
+     * harness otherwise): this many a minute per access token, and invalid
+     * tokens per IP at `oauthIdentityInvalidTokenRateLimitMax` (default: the
+     * production 200).
+     */
+    oauthIdentityTokenRateLimitMax?: number;
+    oauthIdentityInvalidTokenRateLimitMax?: number;
     publicSearchKeySource?: PublicSearchServiceKeySource;
     publicSearchBucketStore?: PublicSearchServiceBucketStore;
+    opsCpuProfile?: Partial<OpsCpuProfileDeps>;
   };
   attachmentUploadSessionService?: AttachmentUploadSessionService;
+  /** The process's `service.instance.id`, named in ops CPU profile keys. */
+  serviceInstanceId?: string;
   slackBridge?: SlackBridgeRouteDependencies;
 }>;
 
@@ -193,9 +342,10 @@ export function createApp(options: CreateAppOptions = {}): Express {
   }
 
   // Configure Helmet with CSP that allows public derived images: legacy keys are
-  // served via CDN_BASE_URL and content/v2 keys via PUBLIC_CONTENT_BASE_URL.
+  // served via CDN_BASE_URL and content/v2 keys via getPublicContentBaseUrl()
+  // (CDN_BASE_URL too, else the deprecated PUBLIC_CONTENT_BASE_URL).
   const imgSrc = ["'self'"];
-  for (const publicBaseUrl of [process.env.CDN_BASE_URL, process.env.PUBLIC_CONTENT_BASE_URL]) {
+  for (const publicBaseUrl of [process.env.CDN_BASE_URL, getPublicContentBaseUrl()]) {
     if (!publicBaseUrl) continue;
     try {
       const publicHost = new URL(publicBaseUrl).origin;
@@ -218,24 +368,65 @@ export function createApp(options: CreateAppOptions = {}): Express {
   // every request needs a preflight. Without Access-Control-Max-Age Chrome
   // caches each one for 5s (per URL + method + headers): on prod a channel
   // switch sent 13 OPTIONS round trips ahead of its GETs. 7200s is Chrome's cap.
-  app.use(cors({ origin: corsOrigin, credentials: true, maxAge: CORS_PREFLIGHT_MAX_AGE_SECONDS }));
+  // A cross-origin script reads only the safelisted response headers unless
+  // they are exposed: the web client reads the sync horizon of /messages/sync,
+  // and X-Raft-Stale / Retry-After of the unread and Activity reads to say
+  // they may be out of date and to pace its retries (routes/rwStaleRead.ts),
+  // and X-Trace-Id to show a reportable id on errors (#proj-o11y:#18).
+  app.use(cors({
+    origin: corsOrigin,
+    credentials: true,
+    maxAge: CORS_PREFLIGHT_MAX_AGE_SECONDS,
+    exposedHeaders: [SYNC_HORIZON_HEADER, SYNC_HORIZON_RESET_HEADER, STALE_RESPONSE_HEADER, "Retry-After", TRACE_ID_RESPONSE_HEADER],
+  }));
+  // Resource Timing gives a cross-origin page only the total duration of a
+  // request unless the response allows its origin: echo the request's Origin
+  // when it is one of ours (the web, Raft Desktop's app://raft), never `*`, so
+  // the web's view-switch and HTTP spans get queue / ttfb / download segments
+  // and nobody else does (AndyLok, #triage:8c0d2318). cors() already varies on Origin.
+  const timingOrigins = new Set(getWebCorsOrigins().filter((origin) => origin !== "*"));
+  app.use((req, res, next) => {
+    const origin = req.headers.origin;
+    if (typeof origin === "string" && timingOrigins.has(origin)) res.setHeader("Timing-Allow-Origin", origin);
+    next();
+  });
   app.use((_req, res, next) => {
     res.setHeader("X-Robots-Tag", "noindex, nofollow");
     next();
   });
   app.get("/robots.txt", (_req, res) => {
     res.type("text/plain").send([
-      "# Raft API host: authenticated API surface with no indexable public pages.",
+      "# Raft API host: authenticated API surface. Only public Artifacts' Markdown versions may be fetched by crawlers (they carry noindex).",
+      "# AI training crawlers may fetch nothing (shared aiTrainingCrawlers.ts).",
+      ...aiTrainingCrawlerRobotsLines(),
       "User-agent: *",
+      "Allow: /api/public/artifacts/",
       "Disallow: /",
       "",
     ].join("\n"));
   });
 
+  app.post("/api/appsumo/webhook", express.raw({ type: "application/json", limit: "64kb" }), appSumoHandlers.webhook);
   // Stripe webhook must be registered BEFORE express.json() to preserve raw body for signature verification
   app.post("/api/webhooks/stripe", express.raw({ type: "application/json" }), stripeWebhookHandler);
   // Resend webhook must also use the raw body because Svix signatures are payload-sensitive.
   app.post("/api/webhooks/resend", express.raw({ type: "application/json" }), resendNewsletterWebhookHandler);
+  // antiproton's signed approval hints (routes/antiprotonApprovals.ts): ids
+  // only, each one at most a pull; the raw body is what the signature covers.
+  const antiprotonApprovalHintLimiter = rateLimit({
+    keyGenerator: (req) => ipKeyGenerator(clientIpForRateLimit(req)),
+    windowMs: 60 * 1000,
+    max: 600,
+    standardHeaders: true,
+    legacyHeaders: false,
+    skip: () => isTestEnv,
+  });
+  app.post(
+    "/api/integrations/antiproton/approvals",
+    antiprotonApprovalHintLimiter,
+    express.raw({ type: "application/json", limit: "16kb" }),
+    receiveAntiprotonApprovalHint,
+  );
   app.post(
     "/api/slack-bridge/events",
     slackBridgeHandlers.observeEventsArrival,
@@ -279,6 +470,100 @@ export function createApp(options: CreateAppOptions = {}): Express {
     express.json({ limit: AGENT_MIGRATION_CONTROL_REQUEST_MAX_BYTES }),
     agentMigrationControlBodyErrorHandler,
   );
+  // First-party apps' routes whose JSON body is over the global limit
+  // (apps/firstPartyApps.ts; files sent inline): the caller's
+  // auth first (the agent), then the app's client gate and the route's write
+  // budget (refused: the body never read), then the app's flag for its server
+  // (off: the app's refusal, the body never read), then a route-scoped parser
+  // the global one then skips.
+  for (const body of firstPartyAppAgentApiLargeBodies()) {
+    app[body.method.toLowerCase() as "post"](
+      body.path,
+      authFromRegistry(),
+      body.clientGate,
+      ...(body.limit ? [body.limit] : []),
+      appEnabledBeforeBody(body.flag, body.notEnabled),
+      express.json({ limit: body.maxBytes }),
+      appBodyErrorHandler(body.onBodyError),
+    );
+  }
+  // Rate limiter for message sending (120 writes/minute/user, counted across
+  // replicas); first-party apps' routes that post messages are behind it too
+  // (`messageLimit`). The fleet-wide peak of a real person's writes here
+  // (messages, thread replies, task writes) was 46 a minute over 7 days
+  // (2026-11-08), so 60 left too little room once it is counted as written.
+  const skipMessageLimit = (req: Request) => (!options.testHarness?.enforceMessageRateLimit && isTestEnv) || req.method === "GET" || isLinkCardReadRequest(req);
+  const countingMessageLimiter = rateLimit({
+    // Counted across replicas (SharedRateLimitStore; memory if Redis is down); a 429 names the limiter on the span.
+    ...sharedRateLimit("message"),
+    windowMs: 60 * 1000,
+    max: options.testHarness?.messageRateLimitMax ?? 120,
+    validate: rateLimitValidate,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: "Too many messages, please slow down" },
+    // e2e seeds many messages quickly (it exercises UI, not rate-limiting). Under
+    // the prod-like vite-preview e2e webServer the faster page loads burst past
+    // 60/min and 429 the thread specs (dev mode's slower loads stayed under). The
+    // limit is irrelevant to what e2e tests, so skip it in the pglite test
+    // harness; prod (postgres) keeps the 60/min limit unchanged.
+    // The link-card read is a POST but sends nothing: it has its own limiters.
+    skip: skipMessageLimit,
+    keyGenerator: rateLimitUserOrIpKey,
+  });
+  // A request the limiter counts (a shared-store round trip) records the
+  // `rate_limit.message` middleware phase; a skipped one records nothing.
+  const tracedMessageLimiter = withMiddlewarePhaseTrace("rate_limit.message", countingMessageLimiter);
+  const messageLimiter: RequestHandler = (req, res, next) =>
+    (skipMessageLimit(req) ? countingMessageLimiter : tracedMessageLimiter)(req, res, next);
+
+  const firstPartyAppWeb = mountFirstPartyAppWebApis((key, limit) => {
+    const max = options.testHarness?.appRateLimitMax?.[key];
+    // Skipped in the pglite harness (shared by Playwright shards) unless a test sets the limit.
+    const skip = () => isTestEnv && max === undefined;
+    // A person's writes (Artifacts' `write`, `commentImages`): one count across replicas.
+    if (limit.acrossReplicas) return appWebLimitAcrossReplicas(key, max ?? limit.perMinute, limit.message, rateLimitUserOrIpKey, skip);
+    // replica-local: abuse guard only, per-replica budget is acceptable
+    return rateLimit({
+      windowMs: 60 * 1000,
+      max: max ?? limit.perMinute,
+      validate: rateLimitValidate,
+      standardHeaders: true,
+      legacyHeaders: false,
+      message: { error: limit.message, code: "RATE_LIMITED" },
+      keyGenerator: rateLimitUserOrIpKey,
+      skip,
+    });
+  }, messageLimiter, [requireAuth, requireVerified]);
+  // task #17: the runtime login code route parses its own small body, so a
+  // malformed one is answered without the parser's error text (it can quote
+  // the body, and the body is a one-time code).
+  app.post(RUNTIME_AUTH_CODE_PATH, runtimeAuthCodeBodyParser, runtimeAuthCodeBodyErrorHandler);
+  // So does the Qwen provider connect route: its body is a provider's API key.
+  app.post(RUNTIME_AUTH_CONNECT_PROVIDER_PATH, runtimeAuthConnectProviderBodyParser, runtimeAuthConnectProviderBodyErrorHandler);
+  // The batched link-card read refuses a body over its own bound before parsing
+  // it (Tenny, RFC 076 §6.1); the global parser then skips the parsed body.
+  app.post(LINK_CARD_READ_PATH, linkCardReadBodyParser, linkCardReadBodyErrorHandler);
+  // The batched actor resolve read is bounded the same way (routes/actors.ts).
+  app.post(ACTOR_RESOLVE_PATH, actorResolveBodyParser, actorResolveBodyErrorHandler);
+  // So do the link-card actions and status (RFC 076 §6.2-§6.4), and the App's
+  // terminal update (§6.5), kept as raw bytes for the strict parser (the
+  // /api/oauth form parser then skips it too).
+  app.post(LINK_CARD_PREPARE_PATH, linkCardPrepareBodyParser, linkCardBodyErrorHandler);
+  app.post(LINK_CARD_EXECUTE_PATH, linkCardExecuteBodyParser, linkCardBodyErrorHandler);
+  app.post(LINK_CARD_STATUS_PATH, linkCardStatusBodyParser, linkCardBodyErrorHandler);
+  app.post(LINK_CARD_UPDATES_PATH, linkCardUpdatesBodyParser, linkCardBodyErrorHandler);
+  // View Context: the daemon's result POST and its hop to the viewer's
+  // replica stream the raw body through (agentContextViewRelay.ts); no parser
+  // may read it first, so both are registered before the global one.
+  app.set("agentContextViewRelay", createAgentContextViewRelay());
+  app.post(
+    AGENT_CONTEXT_VIEW_RESULT_ROUTE,
+    experimentalInternalSurfaceContract("computer"),
+    authFromRegistry(),
+    agentContextViewResultHandler,
+  );
+  app.post(AGENT_CONTEXT_VIEW_FORWARD_ROUTE, agentContextViewForwardHandler);
   app.use(express.json());
   // Default freshness policy for the whole authenticated API surface (human
   // /api and agent /internal alike): per-user JSON with no explicit policy is
@@ -295,32 +580,54 @@ export function createApp(options: CreateAppOptions = {}): Express {
   app.use(requestObservabilityMiddleware);
   app.use(perfAttributionMiddleware);
 
-  // Public-unlisted share pages for external crawlers (X/Twitter cards).
-  // Creation stays auth/member-gated under `/api/share-artifacts`.
+  // Public-unlisted share pages made by the retired Share to X: existing links
+  // answer 410 "no longer available" while SHARE_ARTIFACTS_RETIRED is on
+  // (docs/contracts/share-artifacts.md).
   app.use("/share", shareArtifactPublicRouter);
 
   // Rate limiter for auth endpoints (general)
   const authLimiter = rateLimit({
+    // replica-local for now: keyed by IP, and spans carry no client IP to
+    // check a shared budget against (many Computers or an office behind one
+    // address). Moves to sharedRateLimit once that can be measured.
     keyGenerator: (req) => ipKeyGenerator(clientIpForRateLimit(req)),
     windowMs: 60 * 1000, // 1 minute
-    max: 200,
+    max: AUTH_RATE_LIMIT_PER_MINUTE,
     standardHeaders: true,
     legacyHeaders: false,
-    message: { error: "Too many requests, please try again later" },
+    message: AUTH_RATE_LIMITED_BODY,
     // Invite join flow can legitimately burst from one IP (e.g. admin onboarding multiple users).
     // Keep auth brute-force protection strict for login/register/etc, but exclude invite routes.
     // Playwright explicitly opts out because every shard shares one pglite API
     // process and IP bucket; production cannot take this branch, even if the
     // test-harness option is accidentally passed there.
-    skip: (req) => shouldSkipAuthRateLimit({
+    // The OAuth identity endpoints' requests counted per access token
+    // (oauthIdentityLimiter, below) are not counted again here.
+    skip: (req, res) => shouldSkipAuthRateLimit({
       isTestEnv,
       skipInTestHarness: options.testHarness?.skipAuthRateLimit ?? false,
       path: req.path,
+      countedPerAccessToken: typeof res.locals[OAUTH_IDENTITY_TOKEN_RATE_LIMIT_KEY] === "string",
     }),
+  });
+
+  // The OAuth identity endpoints' limits, ahead of authLimiter on both OAuth
+  // mounts: per access token, and invalid tokens per IP. Skipped in the
+  // pglite harness unless a test sets the per-token limit; authLimiter then
+  // counts those routes per IP, as before.
+  const oauthIdentityTokenRateLimitMax = options.testHarness?.oauthIdentityTokenRateLimitMax;
+  const oauthIdentityLimiter = oauthIdentityTokenLimiter({
+    perToken: oauthIdentityTokenRateLimitMax ?? OAUTH_IDENTITY_TOKEN_RATE_LIMIT_PER_MINUTE,
+    invalidTokensPerIp: options.testHarness?.oauthIdentityInvalidTokenRateLimitMax ?? AUTH_RATE_LIMIT_PER_MINUTE,
+    enforce: !isTestEnv || oauthIdentityTokenRateLimitMax !== undefined,
+    validate: rateLimitValidate,
   });
 
   // Separate (more lenient) limiter for join-link invite flow endpoints.
   const inviteFlowLimiter = rateLimit({
+    // replica-local for now: keyed by IP, and spans carry no client IP to
+    // check a shared budget against (many Computers or an office behind one
+    // address). Moves to sharedRateLimit once that can be measured.
     keyGenerator: (req) => ipKeyGenerator(clientIpForRateLimit(req)),
     windowMs: 60 * 1000, // 1 minute
     max: 120,
@@ -331,12 +638,29 @@ export function createApp(options: CreateAppOptions = {}): Express {
 
   // Stricter rate limiter for forgot-password (5 requests/hour/IP)
   const forgotPasswordLimiter = rateLimit({
+    // Counted across replicas (SharedRateLimitStore; memory if Redis is down); a 429 names the limiter on the span.
+    ...sharedRateLimit("forgot-password"),
     keyGenerator: (req) => ipKeyGenerator(clientIpForRateLimit(req)),
     windowMs: 60 * 60 * 1000, // 1 hour
     max: 5,
     standardHeaders: true,
     legacyHeaders: false,
     message: { error: "Too many password reset requests. Please try again later." },
+  });
+
+  // Starting a two-step verification recovery by email (PR 6): per address,
+  // like forgot-password; the answer is the same for every email, so a 429
+  // here says nothing about any account. Per person: services/secondFactor/recovery.ts.
+  const secondFactorRecoveryStartLimiter = rateLimit({
+    // Counted across replicas (SharedRateLimitStore; memory if Redis is down); a 429 names the limiter on the span.
+    ...sharedRateLimit("second-factor-recovery"),
+    keyGenerator: (req) => ipKeyGenerator(clientIpForRateLimit(req)),
+    windowMs: 60 * 60 * 1000, // 1 hour
+    max: 10,
+    standardHeaders: true,
+    legacyHeaders: false,
+    skip: (req) => req.method !== "POST" || req.path !== "/",
+    message: { error: "Too many requests. Please try again later.", code: "rate_limited" },
   });
 
   // Auth routes (rate limited, no auth required)
@@ -355,6 +679,17 @@ export function createApp(options: CreateAppOptions = {}): Express {
   // code back to the app. Same pre-credential, rate-limited shape as the
   // device grant; mounted before the generic `/api/auth` router.
   app.use("/api/auth/app-login", authLimiter, appLoginRouter);
+  // A device login's revoke link (mailed on approval) works even with the
+  // device surface switched off: a link already in someone's inbox must
+  // still sign that program out.
+  app.post("/api/auth/device/revoke", authLimiter, deviceLoginRevokeHandler);
+  // The one-time link in the "scheduled for deletion" email: cancels that
+  // request without signing in (routes/accountDeletion.ts).
+  app.post("/api/auth/account-deletion/cancel", authLimiter, accountDeletionCancelLinkHandler);
+  // A Computer with its own key retiring the device session it logged in
+  // with (device-auth design v2 §4 step 2): ending a session is allowed with
+  // the device surface switched off too.
+  app.post("/api/computer/retire-session", authLimiter, computerRetireSessionHandler);
   if (isDeviceAuthSurfaceEnabled()) {
     app.use("/api/auth/device", authLimiter, deviceAuthRouter);
     // task #30 PR-B 3/n: user-authed Computer attach. Same Computer-login
@@ -374,15 +709,41 @@ export function createApp(options: CreateAppOptions = {}): Express {
   } else {
     console.warn("[device-login-disabled] SLOCK_DEVICE_LOGIN_ENABLED is explicitly off — Computer attach + device authorize are disabled");
   }
+  // The second step of a password or social sign-in (design v8 §3, PR 3):
+  // unauthenticated, rate-limited like /login. Ahead of the management
+  // router below, which requires a session for everything under it.
+  app.post("/api/auth/second-factor/verify", authLimiter, secondFactorVerifyHandler);
+  // Its passkey options (PR 4a): `{ challenge }` (a sign-in's) is answered
+  // here without a session; without one it falls through to the signed-in
+  // route of the same path in the router below.
+  app.use("/api/auth/second-factor/passkeys/assertion/options", signInPasskeyAssertionOptions(authLimiter));
+  // Email recovery of two-step verification (PR 6): POST /, /confirm and
+  // /cancel without a session; GET and DELETE fall through to the signed-in
+  // routes of the router below.
+  app.use("/api/auth/second-factor/recovery", authLimiter, secondFactorRecoveryStartLimiter, secondFactorRecoveryRouter);
+  // A person managing their own two-step verification (design v8, PR 2) and
+  // stepping up a session (PR 3). Mounted before the generic `/api/auth` router; one
+  // authLimiter, like the device and app-login sub-paths.
+  app.use("/api/auth/second-factor", authLimiter, secondFactorRouter);
+  // SSO sign-in (rfcs/083-server-sso.md §5): ahead of authRouter, whose /:provider/start would see "sso".
+  app.use("/api/auth/sso", authLimiter, ssoRouter);
   app.use("/api/auth", authLimiter, authRouter);
+  app.get("/api/appsumo/oauth/callback", authLimiter, appSumoHandlers.callback);
+  app.get("/api/appsumo/redemption", authLimiter, requireAuth, requireVerified, appSumoHandlers.status);
+  app.post("/api/appsumo/redemption/bind", authLimiter, requireAuth, requireVerified, appSumoHandlers.bind);
+  app.use("/api/invites", inviteFlowLimiter, authLimiter, invitesRouter);
+  // The invitee's side of an external channel invite (#wg-rbac:#16): by token, before they are a member.
+  app.use("/api/external-invites", inviteFlowLimiter, authLimiter, externalInviteRouter);
+  // An owner/admin approving another member's request to connect their server to an external channel (P2a-3).
+  app.use("/api/server-connect-requests", inviteFlowLimiter, authLimiter, serverConnectRequestRouter);
   app.get("/.well-known/openid-configuration", authLimiter, oidcDiscoveryHandler);
-  app.use("/api/oauth", authLimiter, express.urlencoded({ extended: false }), oauthRouter);
+  app.use("/api/oauth", oauthIdentityLimiter, authLimiter, express.urlencoded({ extended: false }), oauthRouter);
   // Server-scoped OIDC (task #150): clients that reject query components cannot
   // carry `?server=`, so the server rides in the path and the whole endpoint
   // family is mounted a second time beneath it. The unscoped mounts above stay
   // live for existing integrations; retiring them is a separate cutover.
   app.get("/oidc/:server/.well-known/openid-configuration", authLimiter, oidcDiscoveryHandler);
-  app.use("/oidc/:server/api/oauth", authLimiter, oidcScopedMountGuard, express.urlencoded({ extended: false }), oauthRouter);
+  app.use("/oidc/:server/api/oauth", oauthIdentityLimiter, authLimiter, oidcScopedMountGuard, express.urlencoded({ extended: false }), oauthRouter);
   app.post(
     "/api/slack-bridge/oauth/start",
     authLimiter,
@@ -447,6 +808,22 @@ export function createApp(options: CreateAppOptions = {}): Express {
     requireServer,
     slackBridgeHandlers.enable,
   );
+  app.post(
+    "/api/slack-bridge/provisioning/retry-delivery",
+    authLimiter,
+    requireAuth,
+    requireVerified,
+    requireServer,
+    slackBridgeHandlers.retryDelivery,
+  );
+  app.post(
+    "/api/slack-bridge/provisioning/replay-inbound",
+    authLimiter,
+    requireAuth,
+    requireVerified,
+    requireServer,
+    slackBridgeHandlers.replayInbound,
+  );
   app.get(
     "/api/slack-bridge/oauth/callback",
     authLimiter,
@@ -479,8 +856,26 @@ export function createApp(options: CreateAppOptions = {}): Express {
     res.json(status.identity);
   });
 
+  // Ops-only CPU profile capture (docs/operations/server-cpu-profile.md).
+  // Holds the request for the capture (at most 60s), well inside the server's
+  // default 300s requestTimeout and the ALB's 300s idle timeout. Refusals
+  // fall through to the JSON 404 below.
+  app.use("/api/ops", createOpsCpuProfileRouter({
+    serviceInstanceId: options.serviceInstanceId,
+    ...options.testHarness?.opsCpuProfile,
+  }));
+
   // Server routes (auth + verified required, no server context needed)
   app.use("/api/servers", requireAuth, requireVerified, serverRouter);
+  // A person deleting their own account (routes/accountDeletion.ts). Ahead of
+  // /api/me and without requireVerified: any account may be deleted, and a
+  // person whose deletion is scheduled reaches only GET / DELETE here
+  // (requireAuth). Rate-limited like the other re-authentication routes.
+  app.use("/api/me/account/deletion", authLimiter, requireAuth, accountDeletionRouter);
+  // Unified notification settings (docs/contracts/notifications.md §2) and
+  // the person's account-mode app logins (docs/raft-app/README.md).
+  app.use("/api/me", requireAuth, requireVerified, meRouter);
+  app.use("/api/notification-levels", requireAuth, requireVerified, notificationLevelsRouter);
   app.use("/api/feature-flags", requireAuth, requireVerified, featureFlagsRouter);
 
   const productFeedbackLimiter = rateLimit({
@@ -489,14 +884,32 @@ export function createApp(options: CreateAppOptions = {}): Express {
     validate: rateLimitValidate,
     standardHeaders: true,
     legacyHeaders: false,
-    message: { error: "Too many feedback submissions. Please try again later.", code: "feedback_rate_limited" },
+    // `code` for the dialog's readers; `errorCode` too, as every other refusal of
+    // /api/actions/:messageId/execute (a feedback card's form submit runs this
+    // limiter, routes/actions.ts), so one field serves both paths (Tenny, L3).
+    message: { error: "Too many feedback submissions. Please try again later.", code: "feedback_rate_limited", errorCode: "feedback_rate_limited" },
     keyGenerator: rateLimitUserOrIpKey,
     skip: (req) => shouldSkipProductFeedbackRateLimit({
       isSlockdev,
-      isTestEnv,
+      isTestEnv: isTestEnv && !options.testHarness?.enforceProductFeedbackRateLimit,
       method: req.method,
     }),
   });
+  // A feedback card's form submit (POST /api/actions/:messageId/execute) runs
+  // this same instance, so the dialog and the form share one budget.
+  app.set(PRODUCT_FEEDBACK_LIMITER, productFeedbackLimiter);
+  // A question card's answer (POST /api/actions/:messageId/execute with its
+  // form) per person, run before execute (routes/actions.ts).
+  app.set(QUESTION_ANSWER_LIMITER, rateLimit({
+    windowMs: 60 * 60 * 1000,
+    max: options.testHarness?.questionAnswerRateLimitMax ?? QUESTION_ANSWER_RATE_LIMIT_PER_HOUR,
+    validate: rateLimitValidate,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: "Too many answers to question cards. Please try again later.", code: "question_answers_rate_limited", errorCode: "question_answers_rate_limited" },
+    keyGenerator: rateLimitUserOrIpKey,
+    skip: () => isTestEnv && options.testHarness?.questionAnswerRateLimitMax === undefined,
+  }));
   // Public by design: the desktop Settings surface shows a QR code, and the
   // phone scanning it has no session. Requiring auth would land every scan on a
   // login wall. Artifacts behind it are public app builds.
@@ -519,12 +932,28 @@ export function createApp(options: CreateAppOptions = {}): Express {
     standardHeaders: true,
     legacyHeaders: false,
     message: { error: "Too many billing requests, please try again later" },
-    skip: (req) => req.method === "GET", // Allow reads (subscription info)
+    // Allow reads (subscription info); seat price previews have their own budget below.
+    skip: (req) => req.method === "GET" || isBillingPreviewPath(req.path),
+  });
+  // A seat price preview only asks Stripe for an estimate (no session, no
+  // charge), and the add-seats dialog asks again each time the owner changes
+  // the count, so it gets a larger budget than the mutations.
+  const billingPreviewLimiter = rateLimit({
+    keyGenerator: (req) => ipKeyGenerator(clientIpForRateLimit(req)),
+    windowMs: 60 * 1000, // 1 minute
+    max: 30,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: "Too many billing requests, please try again later" },
+    skip: (req) => req.method === "GET" || !isBillingPreviewPath(req.path),
   });
 
   // Rate limiter for file uploads (10 uploads/minute/IP to prevent abuse).
   // This covers both human `/api/attachments/upload` and agent `/internal/.../upload`.
   const uploadLimiter = rateLimit({
+    // replica-local for now: keyed by IP, and spans carry no client IP to
+    // check a shared budget against (many Computers or an office behind one
+    // address). Moves to sharedRateLimit once that can be measured.
     keyGenerator: (req) => ipKeyGenerator(clientIpForRateLimit(req)),
     windowMs: 60 * 1000, // 1 minute
     max: 10,
@@ -539,6 +968,8 @@ export function createApp(options: CreateAppOptions = {}): Express {
   });
 
   const directUploadLimiter = rateLimit({
+    // Counted across replicas (SharedRateLimitStore; memory if Redis is down); a 429 names the limiter on the span.
+    ...sharedRateLimit("direct-upload"),
     windowMs: 60 * 1000,
     max: 10,
     validate: rateLimitValidate,
@@ -586,24 +1017,9 @@ export function createApp(options: CreateAppOptions = {}): Express {
   app.use("/api/external-avatars", externalAvatarPublicRouter);
   app.use("/api/integration-logos", integrationLogoPublicRouter);
 
-  // Rate limiter for message sending (60 messages/minute/user)
-  const messageLimiter = rateLimit({
-    windowMs: 60 * 1000,
-    max: options.testHarness?.messageRateLimitMax ?? 60,
-    validate: rateLimitValidate,
-    standardHeaders: true,
-    legacyHeaders: false,
-    message: { error: "Too many messages, please slow down" },
-    // e2e seeds many messages quickly (it exercises UI, not rate-limiting). Under
-    // the prod-like vite-preview e2e webServer the faster page loads burst past
-    // 60/min and 429 the thread specs (dev mode's slower loads stayed under). The
-    // limit is irrelevant to what e2e tests, so skip it in the pglite test
-    // harness; prod (postgres) keeps the 60/min limit unchanged.
-    skip: (req) => (!options.testHarness?.enforceMessageRateLimit && isTestEnv) || req.method === "GET",
-    keyGenerator: rateLimitUserOrIpKey,
-  });
-
   const translationLimiter = rateLimit({
+    // replica-local for now: no traffic on this route in the last 7 days to
+    // check a shared budget against.
     windowMs: 60 * 1000,
     max: 120,
     validate: rateLimitValidate,
@@ -615,10 +1031,13 @@ export function createApp(options: CreateAppOptions = {}): Express {
 
   // Public translation can invoke the provider without a principal. Keep a
   // separate IP-only bucket so signing in cannot multiply the public allowance.
-  // Its numeric budget matches the member endpoint by product decision.
+  // A quarter of the member endpoint's budget (Tenny, 2026-11-08): a logged-out
+  // reader translating a page stays well under it.
   const publicTranslationLimiter = rateLimit({
+    // Counted across replicas (SharedRateLimitStore; memory if Redis is down); a 429 names the limiter on the span.
+    ...sharedRateLimit("public-translation"),
     windowMs: 60 * 1000,
-    max: 120,
+    max: 30,
     validate: rateLimitValidate,
     standardHeaders: true,
     legacyHeaders: false,
@@ -679,6 +1098,39 @@ export function createApp(options: CreateAppOptions = {}): Express {
   }), publicSearchRouter);
   // Before-login feature flags (task #205): pre_auth_evaluable flags only, no credentials read.
   app.use("/api/public/feature-flags", authLimiter, publicFeatureFlagsRouter);
+  // Per-deploy client config (Raft's app hosts): no credentials read, the same answer for everyone.
+  app.use("/api/public/client-config", authLimiter, publicClientConfigRouter);
+  // First-party apps' signed-out routes (apps/firstPartyApps.ts), each at
+  // /api/public/<id>, before /api/public so the guest router never sees them
+  // and they don't spend its authLimiter budget: no auth, no credential read,
+  // each route behind its own per-client-address limit (the
+  // publicAttachmentLimiter pattern; routes/firstPartyAppRoutes.ts).
+  // replica-local: abuse guard only, per-replica budget is acceptable
+  const appPublicRateLimit = (key: string, limit: { perMinute: number; message: string }) => {
+    const max = options.testHarness?.appRateLimitMax?.[key];
+    return rateLimit({
+      windowMs: 60 * 1000,
+      max: max ?? limit.perMinute,
+      validate: rateLimitValidate,
+      standardHeaders: true,
+      legacyHeaders: false,
+      message: { error: limit.message, code: "RATE_LIMITED" },
+      keyGenerator: (req) => ipKeyGenerator(clientIpForRateLimit(req)),
+      // Skipped in the pglite harness (shared by Playwright shards, one address) unless a test sets the limit.
+      skip: () => isTestEnv && max === undefined,
+    });
+  };
+  for (const { path, router } of mountFirstPartyAppPublicApis(appPublicRateLimit)) {
+    app.use(path, router);
+  }
+  // First-party apps' signed-out pages (the public Artifact page at
+  // /artifacts/*, which app.raft.build's CloudFront sends here): each at
+  // /<id>, answering only requests that carry the app edge marker, a plain
+  // 404 to the rest (routes/firstPartyAppRoutes.ts), each behind its own
+  // per-client-address limit as above.
+  for (const { path, router } of mountFirstPartyAppPublicPages(appPublicRateLimit)) {
+    app.use(path, router);
+  }
   app.use("/api/public", authLimiter, publicServerRouter);
   // Count-only visit beacons from public server pages: unauthenticated, always
   // 204 (routes/publicVisits.ts). Outside authLimiter so visits do not spend
@@ -703,14 +1155,24 @@ export function createApp(options: CreateAppOptions = {}): Express {
   });
   app.use("/api/public-visits", publicVisitsLimiter, publicVisitsRouter);
 
+  // Creating a thread with its first reply (POST /api/channels/:id/threads)
+  // posts a message: it spends the same message budget as /api/messages.
+  const threadReplyLimiter: RequestHandler = (req, res, next) => {
+    if (req.method === "POST" && /^\/[^/]+\/threads\/?$/.test(req.path)) {
+      return messageLimiter(req, res, next);
+    }
+    return next();
+  };
   app.use(
     "/api/channels",
     inboxRouteBackpressureMiddleware,
     requireAuth,
     requireVerified,
     requireServer,
+    threadReplyLimiter,
     channelRouter,
   );
+  app.use("/api/sync", requireAuth, requireVerified, requireServer, syncRouter);
   app.use("/api/read-mutations", requireAuth, requireVerified, requireServer, readMutationRouter);
   app.use(
     "/api/messages",
@@ -740,11 +1202,15 @@ export function createApp(options: CreateAppOptions = {}): Express {
   app.delete("/api/agents/:id/credentials/:credentialId", requireAuth, requireVerified, revokeAgentCredentialHandler);
   app.use("/api/raftbench", requireAuth, requireVerified, requireServer, raftbenchRouter);
   app.use("/api/agents", requireAuth, requireVerified, requireServer, agentRouter);
-  app.use("/api/billing", requireAuth, requireVerified, requireServer, billingLimiter, billingRouter);
-  app.use("/api/tasks", requireAuth, requireVerified, requireServer, taskRouter);
+  app.use("/api/agent-migrations", requireAuth, requireVerified, requireServer, agentMigrationLogRouter);
+  app.use("/api/billing", requireAuth, requireVerified, requireServer, billingLimiter, billingPreviewLimiter, billingRouter);
+  // Task writes post messages (a created task's system message, claim and
+  // status notices) and wake agents: they spend the message budget too. The
+  // limiter skips GETs, so reading the board is not counted.
+  app.use("/api/tasks", requireAuth, requireVerified, requireServer, messageLimiter, taskRouter);
   app.use("/api/reminders", requireAuth, requireVerified, requireServer, reminderRouter);
   // Attachment-comment creation is MESSAGE-shaped traffic, not an upload:
-  // it must ride the message limiter (60/min/user, skipped in the pglite
+  // it must ride the message limiter (120/min/user, skipped in the pglite
   // harness), not the 10/min/IP upload limiter — otherwise a review session
   // hits 429 after ten comments (surfaced by the task #15 anchor tests).
   const attachmentWriteLimiter: RequestHandler = (req, res, next) => {
@@ -754,10 +1220,76 @@ export function createApp(options: CreateAppOptions = {}): Express {
     return uploadLimiter(req, res, next);
   };
   app.use("/api/attachments", requireAuth, requireVerified, requireServer, attachmentWriteLimiter, attachmentRouter);
-  app.use("/api/share-artifacts", requireAuth, requireVerified, requireServer, uploadLimiter, shareArtifactRouter);
+  // Only the retired create route is left, a 410 for older clients.
+  app.use("/api/share-artifacts", requireAuth, shareArtifactRouter);
+  // First-party apps' web APIs (apps/firstPartyApps.ts), each at /api/<id>, with
+  // their own per-user limits (routes/firstPartyAppRoutes.ts). An app's account
+  // routes first: each behind requireAuth and requireVerified of its own, no
+  // requireServer (the person across their servers); any other request passes
+  // through to the server-scoped router.
+  for (const { path, router } of firstPartyAppWeb.accountRouters) {
+    app.use(path, router);
+  }
+  for (const { path, router } of firstPartyAppWeb.routers) {
+    app.use(path, requireAuth, requireVerified, requireServer, router);
+  }
+  // First-party objects of any app (routes/objects.ts): core decides who sees
+  // what by the objects' homes, the app summarizes what is left; core serves
+  // the objects' files by the same rule (one budget for both).
+  // replica-local: abuse guard only, per-replica budget is acceptable
+  const objectSummariesMax = options.testHarness?.appRateLimitMax?.["objects.summaries"];
+  const objectSummariesLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: objectSummariesMax ?? 300,
+    validate: rateLimitValidate,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: "Too many object summary lookups", code: "RATE_LIMITED" },
+    keyGenerator: rateLimitUserOrIpKey,
+    // Skipped in the pglite harness unless a test sets the limit.
+    skip: () => isTestEnv && objectSummariesMax === undefined,
+  });
+  app.use("/api/objects", requireAuth, requireVerified, requireServer, objectSummariesLimiter, objectsRouter);
+  // Who can be @-mentioned in a conversation or on an app's object
+  // (routes/mentions.ts, platform/mentions.ts): asked as the picker opens and
+  // as a name is typed, limited per user like summaries.
+  // replica-local: abuse guard only, per-replica budget is acceptable
+  const mentionAudienceMax = options.testHarness?.appRateLimitMax?.["mentions.audience"];
+  const mentionAudienceLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: mentionAudienceMax ?? 300,
+    validate: rateLimitValidate,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: "Too many mention lookups", code: "RATE_LIMITED" },
+    keyGenerator: rateLimitUserOrIpKey,
+    // Skipped in the pglite harness unless a test sets the limit.
+    skip: () => isTestEnv && mentionAudienceMax === undefined,
+  });
+  app.use("/api/mentions", requireAuth, requireVerified, requireServer, mentionAudienceLimiter, mentionsRouter);
+  // Search across the first-party apps (routes/search.ts): one group per app
+  // that searches, in the reader's current server. Each request holds a
+  // primary connection per app searching: limited per user like summaries.
+  // replica-local: abuse guard only, per-replica budget is acceptable
+  const searchMax = options.testHarness?.appRateLimitMax?.["search"];
+  const searchLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: searchMax ?? 300,
+    validate: rateLimitValidate,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: "Too many searches", code: "RATE_LIMITED" },
+    keyGenerator: rateLimitUserOrIpKey,
+    // Skipped in the pglite harness unless a test sets the limit.
+    skip: () => isTestEnv && searchMax === undefined,
+  });
+  app.use("/api/search", requireAuth, requireVerified, requireServer, searchLimiter, searchRouter);
   app.use("/api/integration-invites", requireAuth, requireVerified, integrationInviteRouter);
   app.use("/api/integrations", requireAuth, requireVerified, requireServer, integrationRouter);
   app.use("/api/actions", requireAuth, requireVerified, requireServer, actionsRouter);
+  app.use("/api/actors", requireAuth, requireVerified, requireServer, actorRouter);
+  // Interactive link card actions: their own cross-replica limits (services/linkCardActionLimits.ts).
+  app.use("/api/link-cards", requireAuth, requireVerified, requireServer, linkCardRouter);
   // RFC-067 client events: a tab flushes about every 10s, so this only stops
   // runaway or abusive senders.
   // replica-local: abuse guard only, per-replica budget is acceptable
@@ -808,24 +1340,19 @@ export function createApp(options: CreateAppOptions = {}): Express {
   // agentApiErrorTrace before auth: auth refusals (401/403) are classified too.
   app.use("/internal/agent-api", experimentalInternalSurfaceContract("agent-api"), agentApiErrorTrace, authFromRegistry(), internalAgentApiRouter);
 
-  // App-side endpoint: installed Apps exchange their OAuth access token for
-  // the managed bot's sk_agent_* key. No user session, no X-Server-Id —
-  // server is derived from the oauth_access_tokens row. Mounted before
-  // requireMachineAuth because the caller's credential is OAuth, not
-  // sk_machine_*.
-  const appBotTokenLimiter = rateLimit({
-    windowMs: 60 * 1000,
-    max: 20,
-    keyGenerator: (req) => ipKeyGenerator(clientIpForRateLimit(req)),
-    validate: rateLimitValidate,
-    standardHeaders: true,
-    legacyHeaders: false,
-    message: { error: "Too many bot token requests" },
-  });
-  app.post("/api/app-bot/token", appBotTokenLimiter, async (req, res) => {
-    const { handleAppBotTokenExchange } = await import("./routes/integrations");
-    await handleAppBotTokenExchange(req, res);
-  });
+  // First-party apps' internal routes (apps/firstPartyApps.ts): callers the app
+  // authenticates itself (its own bearer tokens, never a machine, agent or
+  // user credential). Before the generic `/internal` machine-auth route so
+  // the more specific prefix wins.
+  for (const { path, router } of mountFirstPartyAppInternals()) {
+    app.use(path, router);
+  }
+
+  // The hosted runtime provider's own control routes (routes/runtimeProviderControl.ts):
+  // authenticated by the provider's provisioning token, never by an agent,
+  // machine or user credential. Before the generic `/internal` machine-auth
+  // route so the more specific prefix wins.
+  app.use("/internal/runtime-provider", runtimeProviderControlRouter);
 
   // Internal routes (machine auth)
   app.use("/internal", requireMachineAuth, internalRouter);
@@ -836,6 +1363,14 @@ export function createApp(options: CreateAppOptions = {}): Express {
     const { getDbLivenessTracker, livezStatus } = await import("./dbLiveness");
     const verdict = getDbLivenessTracker().verdict();
     const status = livezStatus(verdict);
+    // The ALB polls this route, not /health, so the int4 seq-headroom tripwire
+    // rides here too or it would stop running. Same contract as on /health:
+    // throttled, fail-open, fire-and-forget, never part of the verdict. Its
+    // one MAX(seq) query per ten minutes runs off the request path.
+    if (status === 200) {
+      const { probeSeqHeadroom } = await import("./services/seqHeadroomTripwire");
+      probeSeqHeadroom();
+    }
     res.status(status).json({ status: status === 200 ? "ok" : "error", ...verdict });
   });
 

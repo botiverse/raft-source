@@ -43,13 +43,6 @@ export const BUILT_IN_APP_CONFIG_PROJECTORS: readonly BuiltInAppConfigProjector[
 
 export interface BuiltInRapAppDefinition {
   readonly appId: AppId;
-  /**
-   * Explicit opt-in for user-facing composer references. Registry membership
-   * alone is not presentation authority: internal fixtures and operational
-   * apps stay out of the picker unless their product definition supplies a
-   * stable display name here.
-   */
-  readonly composerReference: { readonly displayName: string } | null;
   readonly manifest: {
     readonly app_id: AppId;
     readonly hooks: readonly HookName[];
@@ -80,7 +73,6 @@ export const BUILT_IN_RAP_APPS = [
   BUILT_IN_MEMORY_CLEANER_APP,
   {
     appId: "system.canary" as AppId,
-    composerReference: null,
     manifest: {
       app_id: "system.canary" as AppId,
       hooks: [],
@@ -91,7 +83,3 @@ export const BUILT_IN_RAP_APPS = [
     grant: "all_server_agents",
   },
 ] as const satisfies readonly BuiltInRapAppDefinition[];
-
-export function getBuiltInComposerReference(appId: AppId): { readonly displayName: string } | null {
-  return BUILT_IN_RAP_APPS.find((definition) => definition.appId === appId)?.composerReference ?? null;
-}

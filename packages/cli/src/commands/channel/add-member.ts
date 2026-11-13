@@ -6,6 +6,7 @@ import type { Command } from "commander";
 import { createAgentApiSurfaceClient } from "../../agentApiPath";
 import { defineCommand, registerCliCommand } from "../../core/command";
 import type { CommandRuntimeOptions } from "../../core/context";
+import { rateLimitedResponseError } from "../../core/apiFailure";
 import { CliError } from "../../core/errors";
 import { adoptCliReplyText, writeText, NL } from "../../core/renderer";
 import { parseRegularChannelTarget } from "./leave";
@@ -95,6 +96,8 @@ export const channelAddMemberCommand = defineCommand(
     const body = user ? { user } : { agent };
     const addRes = await createAgentApiSurfaceClient(client).channels.addMember({ channelId: channel.id as never }, body);
     if (!addRes.ok) {
+      const rateLimited = rateLimitedResponseError(addRes);
+      if (rateLimited) throw rateLimited;
       throw new CliError({
         code: addRes.status >= 500 ? "SERVER_5XX" : "MEMBERS_FAILED",
         message: addRes.error ?? `HTTP ${addRes.status}`,

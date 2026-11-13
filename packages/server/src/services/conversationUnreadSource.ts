@@ -1,6 +1,6 @@
 /**
- * Row shapes of the sidebar unread reader (rw_conversation_unread_v3, see
- * infra/risingwave/sql/076-cursor-decouple-consumers.sql) and its test seam.
+ * Row shapes of the sidebar unread reader (rw_conversation_unread_v4, see
+ * infra/risingwave/sql/078-task-conversations.sql) and its test seam.
  *
  * This module is deliberately tiny and dependency-free so the server test setup
  * can install the Postgres reference (src/test/conversationUnreadReference.ts)
@@ -14,7 +14,8 @@ export type ConversationUnreadRow = {
   serverId: string;
   /** The LOCAL channel id (joint storage mapping is done upstream in the chain). */
   targetId: string;
-  kind: "channel" | "dm" | "thread";
+  /** "task": a task conversation (task v2), a sub-conversation like a thread. */
+  kind: "channel" | "dm" | "thread" | "task";
   /** False for a mention-only row and for a public-channel `hasNew` row. */
   subscribed: boolean;
   unreadCount: number;

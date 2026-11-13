@@ -9,10 +9,7 @@ import {
   externalAppInstalls,
   externalAppRegistrations,
 } from "../db/schema";
-import {
-  SLACK_BRIDGE_CORE_BOT_SCOPES,
-  SLACK_BRIDGE_REQUIRED_BOT_SCOPES,
-} from "./slackBridgeProductionAppContract";
+import { SLACK_BRIDGE_CORE_BOT_SCOPES } from "./slackBridgeProductionAppContract";
 import type {
   SlackBridgeProvisioningInstallGrant,
   SlackBridgeProvisioningProvider,
@@ -230,6 +227,7 @@ export async function refreshSlackBridgeInstallGrantReceipts(input: {
   provider: SlackBridgeProvisioningProvider;
   now: Date;
   onError?(error: unknown): void;
+  isRunHeld?(): Promise<boolean>;
   onScopeDrift?(event: {
     source: "renewal" | "enable";
     installId: string;
@@ -263,6 +261,7 @@ export async function refreshSlackBridgeInstallGrantReceipts(input: {
     .where(eq(externalAppInstalls.state, "active"));
 
   for (const candidate of candidates) {
+    if (input.isRunHeld && !await input.isRunHeld()) break;
     result.considered += 1;
     const renewBefore = new Date(
       input.now.getTime()
@@ -315,6 +314,10 @@ export async function refreshSlackBridgeInstallGrantReceipts(input: {
         result.skipped += 1;
         continue;
       }
+      if (input.isRunHeld && !await input.isRunHeld()) {
+        result.skipped += 1;
+        continue;
+      }
       const observation = await input.provider.readInstallGrant({
         installId: candidate.install.id,
         providerAppId: candidate.install.providerAppId,
@@ -323,7 +326,12 @@ export async function refreshSlackBridgeInstallGrantReceipts(input: {
         connectionEpoch: candidate.install.connectionEpoch,
         credentialRevision: candidate.install.credentialRevision,
         now: input.now,
+        isRunHeld: input.isRunHeld,
       });
+      if (input.isRunHeld && !await input.isRunHeld()) {
+        result.skipped += 1;
+        continue;
+      }
       if (
         observation.kind !== "fact"
         || classifySlackInstallGrantObservation(candidate.install, observation.fact) === "mismatch"

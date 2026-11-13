@@ -8,18 +8,21 @@ export const MANAGEABLE_SERVER_ROLES = ["owner", "admin", "member"] as const sat
 /**
  * Server-wide capabilities are intentionally action-specific. Channel access,
  * posting, object ownership, and actor-type policy remain separate
- * authorization axes and must not be inferred from this matrix.
+ * authorization axes and must not be inferred from this matrix. Seeing a
+ * conversation (and its members) is not a capability either: the server's
+ * visibility entry (visibilityService.canView) decides it.
  */
 export const SERVER_CAPABILITY_KEYS = [
-  "viewChannel",
   "createChannels",
   "editChannelMetadata",
   "archiveChannels",
   "deleteChannels",
   "changeChannelVisibility",
-  "manageGuestAccess",
+  // Whether a public channel of a public server is visible to signed-out
+  // visitors (channels.guest_visible). Owner and admin only: it decides what
+  // the whole internet reads, so a channel admin role never grants it.
+  "manageVisitorAccess",
   "federateChannels",
-  "viewChannelMembers",
   "joinPublicChannels",
   "addChannelMembers",
   "removeChannelMembers",
@@ -38,6 +41,7 @@ export const SERVER_CAPABILITY_KEYS = [
   "createAgents",
   "editAgents",
   "controlAgentRuntime",
+  "stopAgents",
   "resetAgentWorkspace",
   "deleteAgents",
   "migrateAgents",
@@ -52,6 +56,9 @@ export const SERVER_CAPABILITY_KEYS = [
   "deleteAnyTask",
   "viewBilling",
   "manageBilling",
+  // SSO connection and sign-in rules (rfcs/083-server-sso.md §7): owner only,
+  // since a broken connection or "require SSO" can lock a whole company out.
+  "manageSso",
 ] as const;
 
 export type ServerCapability = typeof SERVER_CAPABILITY_KEYS[number];
@@ -80,13 +87,11 @@ function capabilitiesFrom(granted: readonly ServerCapability[]): ServerCapabilit
 
 const EMPTY_SERVER_CAPABILITIES = capabilitiesFrom([]);
 const ADMIN_SERVER_CAPABILITIES = capabilitiesFrom(
-  SERVER_CAPABILITY_KEYS.filter((capability) => capability !== "manageBilling")
+  SERVER_CAPABILITY_KEYS.filter((capability) => capability !== "manageBilling" && capability !== "manageSso")
 );
 const MEMBER_SERVER_CAPABILITIES = capabilitiesFrom([
   "viewServerProfile",
-  "viewChannel",
   "createChannels",
-  "viewChannelMembers",
   "joinPublicChannels",
   "addChannelMembers",
   "viewMembers",
@@ -196,6 +201,25 @@ export function canChangeMemberRole(
   }
 
   return false;
+}
+
+/**
+ * Role changes on an agent's server membership (member <-> admin). As
+ * canChangeMemberRole, plus one more for an admin: demoting an admin agent
+ * back to member. The "admins can't demote peer admins" rule protects people
+ * from each other; an agent is not a peer, and without this an admin who
+ * promoted an agent could not undo it (artin, #triage:64b3b725). People are
+ * unchanged: this is only for agent targets.
+ */
+export function canChangeAgentMemberRole(
+  actorRole: ServerRole | null | undefined,
+  targetRole: ServerRole | null | undefined,
+  nextRole: ManageableServerRole
+): boolean {
+  if (canChangeMemberRole(actorRole, targetRole, nextRole)) {
+    return true;
+  }
+  return actorRole === "admin" && targetRole === "admin" && nextRole === "member";
 }
 
 export interface ServerRoleTransitionInput {

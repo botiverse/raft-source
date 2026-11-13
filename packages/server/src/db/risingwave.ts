@@ -36,40 +36,61 @@ export const RISINGWAVE_UNREAD_INBOX_CONTRACT_VERSION = 2;
  * offered_unread / activity_seq), and the app reads its columns without
  * re-deriving them.
  *
- * conversationUnread (rw_conversation_unread_v3; rw_inbox_muted_full_v2 in
- * infra/risingwave/sql/075-inbox-cursor-decouple.sql) is the sidebar's unread
- * source -- GET /channels/unread (bare and summary) and the per-server pink badge
- * (GET /servers/unread-summary).
+ * conversationUnread (rw_conversation_unread_v4; 066's rw_inbox_muted_full_v1
+ * arm, consumers in infra/risingwave/sql/078-task-conversations.sql) is the
+ * sidebar's unread source -- GET /channels/unread (bare and summary) and the
+ * per-server pink badge (GET /servers/unread-summary).
  *
  * The set is the cursor-decoupled generation (075 arms, 076 consumers): same
  * columns and semantics as 068's, but a read-cursor move no longer rewrites
  * every message of the conversation in the arm views.
+ *
+ * Since 078 (infra/risingwave/sql/078-task-conversations.sql) a task
+ * conversation (channels.type = 'task') is a sub-conversation like a thread
+ * in every view of the set: its parent is its task's channel
+ * (rw_conversation_parent_v1), and the reader-facing rows carry kind 'task'
+ * (serving, agent inbox, conversation unread). Columns are unchanged, except
+ * that serving v9 adds first_mention_message_id and mention_done_through_seq
+ * (a query reads them only when it resolved to v9: UnifiedChainQuery).
  */
-export const CONVERSATION_UNREAD_VIEW = "rw_conversation_unread_v3";
+export const CONVERSATION_UNREAD_VIEW = "rw_conversation_unread_v4";
 export const UNIFIED_CHAIN_VIEWS = {
-  serving: "rw_inbox_serving_v8",
-  totals: "rw_activity_totals_v6",
-  agentInbox: "rw_agent_inbox_v6",
+  serving: "rw_inbox_serving_v9",
+  totals: "rw_activity_totals_v7",
+  agentInbox: "rw_agent_inbox_v7",
   conversationUnread: CONVERSATION_UNREAD_VIEW,
 } as const;
 /**
  * TRANSITION: a read that finds a current view missing reads the newest older
  * generation that exists instead of failing the endpoint
- * (withUnifiedChainTransition); the columns are identical across generations.
- * Each entry lists the older generations, newest first.
- *   - serving/totals: 077 (task #333) -> 076 -> 068. An environment that has not
- *     built 077 reads 076's serving v7 / totals v5, which still show threads
- *     below a deleted parent, as before 077; one that has not built 076 either
- *     reads 068's v6 / v4. Drop the 068 step once 076 is built everywhere, and
- *     the whole entry once 077 is built everywhere and traces show no fallback.
- *   - agent inbox/conversation unread (076): 068's v5 / v2. Remove with the 068
- *     views.
+ * (withUnifiedChainTransition). The columns a generation shares with its
+ * predecessors are identical; a column only the current generation has
+ * (serving v9's first_mention_message_id / mention_done_through_seq) is read
+ * through a query builder that asks which generation it resolved to
+ * (UnifiedChainQuery). Each entry lists the older generations, newest first.
+ *   - 078 (task conversations as sub-conversations) -> the previous generation
+ *     of every entry. An environment that has not built 078 reads the 077/076
+ *     views, where a task conversation is in no row (as before 078). Remove the
+ *     078 step's predecessors (and drop them, leaf-first: the retirement list
+ *     in the 078 file) once 078 is built everywhere and traces show no
+ *     fallback.
+ *   - serving/totals: 077 -> 076. An environment that has not built 077
+ *     reads 076's serving v7 / totals v5, which still show threads below a
+ *     deleted parent. Drop the 076 step once 077 is built everywhere.
+ *   - conversation unread: 076's v3.
+ *   - agent inbox: none left. 076's v6 (the 078 step) and 068's v5 are
+ *     retired; production drops them with the 068 generation (see below).
+ * The 068 generation (serving v6, totals v4, agent inbox v5, conversation
+ * unread v2) and agent inbox v6 are no longer fallbacks: 078 serves production
+ * since 2026-10-25 and staging since 2026-10-23, and production drops those
+ * views. This list must not ship before that drop runs (until then they are
+ * the rename's rollback path).
  */
 export const UNIFIED_CHAIN_TRANSITION_VIEWS: ReadonlyMap<string, readonly string[]> = new Map([
-  [UNIFIED_CHAIN_VIEWS.serving, ["rw_inbox_serving_v7", "rw_inbox_serving_v6"]],
-  [UNIFIED_CHAIN_VIEWS.totals, ["rw_activity_totals_v5", "rw_activity_totals_v4"]],
-  [UNIFIED_CHAIN_VIEWS.agentInbox, ["rw_agent_inbox_v5"]],
-  [UNIFIED_CHAIN_VIEWS.conversationUnread, ["rw_conversation_unread_v2"]],
+  [UNIFIED_CHAIN_VIEWS.serving, ["rw_inbox_serving_v8", "rw_inbox_serving_v7"]],
+  [UNIFIED_CHAIN_VIEWS.totals, ["rw_activity_totals_v6", "rw_activity_totals_v5"]],
+  [UNIFIED_CHAIN_VIEWS.agentInbox, []],
+  [UNIFIED_CHAIN_VIEWS.conversationUnread, ["rw_conversation_unread_v3"]],
 ]);
 // A missing generation is remembered for this long, so the read path does not pay
 // a failed round-trip per request while an environment is still building it.
@@ -109,22 +130,38 @@ function unifiedChainReadName(view: string, at: number): string | null {
 }
 
 /**
+ * A unified-chain query: its text, or a builder that is given the generation
+ * each view resolved to (`resolved(UNIFIED_CHAIN_VIEWS.serving)` is
+ * "rw_inbox_serving_v8" while 078 is unbuilt), so it can read a column only the
+ * current generation has and project NULL on older ones. The builder may name
+ * the views by their current names; they are rewritten like a plain text.
+ */
+export type UnifiedChainQuery = string | ((resolved: (view: string) => string) => string);
+
+/**
  * Runs `run` with `queryText`; if that fails because a view of the unified chain
  * is missing, remembers that generation as missing for a minute and reruns with
  * the next older one, until a run succeeds, fails for another reason, or a view
- * has no older generation left (then the last error is thrown). Every rerun on
- * older generations reports to `onFallback`: the current views it replaced and
- * the names it read instead (for a trace event).
+ * has no older generation left (then the last error is thrown). A run that had to
+ * find a generation missing (about once a minute per process while one is) and
+ * then succeeded on older ones reports to `onFallback`: the current views it
+ * replaced and the names it read instead (for a trace event). Reads served from
+ * the remembered fallback do not report: prod logged every inbox read
+ * (70-120k/h) while 077 was unbuilt.
  */
 export async function withUnifiedChainTransition<T>(
-  queryText: string,
+  query: UnifiedChainQuery,
   run: (queryText: string) => Promise<T>,
   onFallback: (missingViews: string[], readViews: string[]) => void = () => {},
   now: () => number = Date.now,
 ): Promise<T> {
+  const build = typeof query === "string" ? () => query : query;
+  // The views a query names are those its current-generation text names.
+  const currentText = build((view) => view);
   const named = [...UNIFIED_CHAIN_TRANSITION_VIEWS.keys()]
-    .filter((view) => new RegExp(`\\b${view}\\b`).test(queryText));
-  if (named.length === 0) return run(queryText);
+    .filter((view) => new RegExp(`\\b${view}\\b`).test(currentText));
+  if (named.length === 0) return run(currentText);
+  let foundMissing = false;
   for (;;) {
     const at = now();
     const chosen = named.map((view) => [view, unifiedChainReadName(view, at)] as const);
@@ -134,14 +171,19 @@ export async function withUnifiedChainTransition<T>(
       throw new UnifiedChainViewUnavailableError(view, [view, ...UNIFIED_CHAIN_TRANSITION_VIEWS.get(view)!]);
     }
     const swapped = chosen.filter(([view, name]) => name !== view);
-    let text = queryText;
+    const resolvedNames = new Map(chosen);
+    let text = build((view) => resolvedNames.get(view) ?? view);
     for (const [view, name] of swapped) text = text.replace(new RegExp(`\\b${view}\\b`, "g"), name!);
-    if (swapped.length > 0) onFallback(swapped.map(([view]) => view), swapped.map(([, name]) => name!));
     try {
-      return await run(text);
+      const result = await run(text);
+      if (foundMissing && swapped.length > 0) {
+        onFallback(swapped.map(([view]) => view), swapped.map(([, name]) => name!));
+      }
+      return result;
     } catch (error) {
       const missing = chosen.map(([, name]) => name!).filter((name) => isMissingRelationError(error, name));
       if (missing.length === 0) throw error;
+      foundMissing = true;
       for (const name of missing) unifiedChainViewMissingUntil.set(name, at + UNIFIED_CHAIN_TRANSITION_MEMO_MS);
       if (named.some((view) => unifiedChainReadName(view, at) === null)) throw error;
     }

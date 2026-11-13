@@ -98,7 +98,7 @@ test("credential-mint denial names the action capability and human-creator recov
 import { Command } from "commander";
 import { registerAgentLoginCommand } from "./login";
 import { PassThrough, Readable } from "node:stream";
-import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
@@ -383,12 +383,17 @@ test("login start parses --server/--agent written after the subcommand (parent-s
   const err = stderr.join("");
   assert.doesNotMatch(err, /--server is required/, `start must see --server written after the subcommand; stderr: ${err}`);
   assert.match(out, /dev-code-1|USER-CODE|approve/, `start should print the device-code handoff; stdout: ${out}`);
-  assert.match(out, /Browser authorization URL \(code pre-filled\)/, `start should print a browser authorization URL; stdout: ${out}`);
+  // Never the pre-filled link an older server still sends: the page and the code to type.
+  assert.match(out, /Browser authorization URL: http:\/\/127\.0\.0\.1:\d+\/approve\n/, `start should print a browser authorization URL; stdout: ${out}`);
+  assert.match(out, /Enter code USER-CODE, choose this agent as the one the key is for, and approve\./, `start should print the code to type; stdout: ${out}`);
+  assert.doesNotMatch(out, /code=USER-CODE|pre-filled/, `start must not hand out a link with the code in it; stdout: ${out}`);
 });
 
-// Re-login through `login wait` rotates: the mint names the credential this
-// profile held (same agent + server), so the server revokes it in the same
-// transaction. A fresh profile, or one bound to another agent, names nothing.
+// A server older than one-time grants ignores the agent_key grant and answers
+// the poll with a device session: `login wait` then mints with it as before.
+// That re-login rotates: the mint names the credential this profile held
+// (same agent + server), so the server revokes it in the same transaction.
+// A fresh profile, or one bound to another agent, names nothing.
 test("login wait sends the profile's previous credential as replacesCredentialId (rotation)", async (t) => {
   const { io } = loginMemoryIo();
   const agentId = "11111111-2222-3333-4444-555555555555";
@@ -450,4 +455,228 @@ test("login wait sends the profile's previous credential as replacesCredentialId
   assert.equal(await readReplaceableCredentialId(path.join(profileDir, "credential.json"), { server: serverUrl, agent: "other-agent" }), null);
   assert.equal(await readReplaceableCredentialId(path.join(profileDir, "credential.json"), { server: "https://elsewhere.example", agent: agentId }), null);
   assert.equal(await readReplaceableCredentialId(path.join(profileDir, "missing.json"), { server: serverUrl, agent: agentId }), null);
+});
+
+// --- agent_key grant (device-auth PR 1 #12116): `login start` asks for the
+// agent's own key and `login wait` saves the sk_agent_* the token poll
+// returns. No user session is requested, used or written. ---
+
+const GRANT_AGENT_ID = "11111111-2222-3333-4444-555555555555";
+
+type SelfRevokeAnswer = { status: number; body: unknown } | "drop";
+
+async function startGrantServer(
+  token: (call: number) => { status: number; body: unknown },
+  options: { selfRevoke?: (authorization: string | undefined) => SelfRevokeAnswer | Promise<SelfRevokeAnswer> } = {},
+) {
+  const http = await import("node:http");
+  const requests: Array<{ method?: string; url?: string; body: unknown; authorization?: string }> = [];
+  let tokenCalls = 0;
+  const server = http.createServer((req, res) => {
+    let raw = "";
+    req.on("data", (chunk) => { raw += chunk; });
+    req.on("end", async () => {
+      requests.push({ method: req.method, url: req.url, body: raw ? JSON.parse(raw) : null, authorization: req.headers.authorization });
+      res.setHeader("content-type", "application/json");
+      if (options.selfRevoke && req.method === "POST" && req.url === "/internal/agent-api/credentials/self/revoke") {
+        const answer = await options.selfRevoke(req.headers.authorization);
+        if (answer === "drop") { req.socket.destroy(); return; }
+        res.writeHead(answer.status).end(JSON.stringify(answer.body));
+        return;
+      }
+      if (req.method === "POST" && req.url === "/api/auth/device/authorize") {
+        res.writeHead(201).end(JSON.stringify({ deviceCode: "dev-grant", userCode: "GRNT-CODE", verificationUri: "/login/device", expiresIn: 600, interval: 5 }));
+        return;
+      }
+      if (req.method === "POST" && req.url === "/api/auth/device/token") {
+        tokenCalls += 1;
+        const answer = token(tokenCalls);
+        res.writeHead(answer.status).end(JSON.stringify(answer.body));
+        return;
+      }
+      res.writeHead(404).end(JSON.stringify({ code: "unexpected_route" }));
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const { port } = server.address() as { port: number };
+  const profileDir = await mkdtemp(path.join(tmpdir(), "raft-login-grant-"));
+  onTestFinished(async () => {
+    await rm(profileDir, { recursive: true, force: true });
+    await new Promise<void>((resolve, reject) => server.close((err) => err ? reject(err) : resolve()));
+  });
+  return { serverUrl: `http://127.0.0.1:${port}`, requests, profileDir };
+}
+
+async function runLogin(args: string[]) {
+  const { io, stdout, stderr } = loginMemoryIo();
+  const program = new Command();
+  program.exitOverride();
+  registerAgentLoginCommand(program.command("agent"), { io });
+  let error: unknown = null;
+  try {
+    await program.parseAsync(["agent", "login", ...args], { from: "user" });
+  } catch (err) {
+    error = err;
+  }
+  return { stdout: stdout.join(""), stderr: stderr.join(""), error };
+}
+
+function agentKeyAnswer(n: number, agentId = GRANT_AGENT_ID) {
+  return {
+    status: 200,
+    body: { kind: "agent_key", credentialId: `cred-${n}`, apiKey: `sk_agent_granted${n}`, scopes: ["read", "send"], agentId, agentName: "Keyed", serverId: "server-1" },
+  };
+}
+
+test("login start asks the server for an agent_key grant for the requested agent", async () => {
+  const { serverUrl, requests, profileDir } = await startGrantServer(() => ({ status: 500, body: {} }));
+  const result = await runLogin(["start", "--server", serverUrl, "--agent", GRANT_AGENT_ID, "--client-name", "ci-runner", "--profile-dir", profileDir]);
+  assert.equal(result.error, null, result.stderr);
+  assert.equal(requests.length, 1);
+  const body = requests[0]!.body as { clientName: string; grant: Record<string, unknown> };
+  assert.equal(body.clientName, "ci-runner");
+  assert.equal(body.grant.kind, "agent_key");
+  assert.equal(body.grant.agentId, GRANT_AGENT_ID);
+  assert.equal(body.grant.machineName, "ci-runner");
+  assert.equal(typeof body.grant.hostname, "string");
+  assert.equal(typeof body.grant.os, "string");
+  assert.match(result.stdout, /^state: pending_human_action\n/);
+  assert.match(result.stdout, /Next: after the user approves, run `raft agent login wait --server \S+ --agent \S+ --device-code dev-grant`/);
+  // A non-UUID --agent is not sent as the grant's agentId (the server refuses one).
+  const other = await runLogin(["start", "--server", serverUrl, "--agent", "agent_abc", "--profile-dir", profileDir]);
+  assert.equal(other.error, null, other.stderr);
+  const otherGrant = (requests[1]!.body as { grant: Record<string, unknown> }).grant;
+  assert.equal(otherGrant.kind, "agent_key");
+  assert.equal("agentId" in otherGrant, false);
+  assert.equal(otherGrant.machineName, "raft-cli");
+});
+
+test("login wait saves the key an agent_key grant returns, with no session and no mint", async () => {
+  const { serverUrl, requests, profileDir } = await startGrantServer((n) => agentKeyAnswer(n));
+  const wait = ["wait", "--server", serverUrl, "--agent", GRANT_AGENT_ID, "--device-code", "dev-grant", "--profile-dir", profileDir];
+
+  const first = await runLogin(wait);
+  assert.equal(first.error, null, first.stderr);
+  const file = path.join(profileDir, "credential.json");
+  const saved = JSON.parse(await readFile(file, "utf8"));
+  assert.equal(saved.apiKey, "sk_agent_granted1");
+  assert.equal(saved.credentialId, "cred-1");
+  assert.equal(saved.agentId, GRANT_AGENT_ID);
+  assert.equal(saved.serverUrl, serverUrl);
+  assert.equal((await stat(file)).mode & 0o777, 0o600);
+  assert.deepEqual(await readdir(profileDir), ["credential.json"], "only the key is written: no session file");
+  assert.doesNotMatch(JSON.stringify(saved), /accessToken|refreshToken/);
+  assert.deepEqual(requests.map((r) => `${r.method} ${r.url}`), ["POST /api/auth/device/token"], "no mint, no session-authenticated call");
+  assert.match(first.stdout, /^state: authorized\nLogged in as 'Keyed'/);
+  assert.doesNotMatch(first.stdout, /still active/);
+  assert.ok(!(first.stdout + first.stderr).includes("sk_agent_granted1"), "the key is never printed");
+
+  // A re-login cannot rotate through the grant: the report names the key this
+  // profile held, once, and the profile now holds the new one.
+  const second = await runLogin(wait);
+  assert.equal(second.error, null, second.stderr);
+  assert.equal(JSON.parse(await readFile(file, "utf8")).apiKey, "sk_agent_granted2");
+  assert.match(second.stdout, /The key this profile held before \(credential cred-1\) is still active/);
+  assert.equal(second.stdout.match(/still active/g)?.length, 1);
+  assert.match(second.stdout, /\nNext \(if you are the agent\): [^\n]+\n$/, "Next lines stay last");
+  assert.deepEqual(await readdir(profileDir), ["credential.json"]);
+});
+
+test("login wait refuses a key for a different agent and leaves the profile unchanged", async () => {
+  const { serverUrl, profileDir } = await startGrantServer((n) => agentKeyAnswer(n, "99999999-2222-3333-4444-555555555555"));
+  const file = path.join(profileDir, "credential.json");
+  const original = JSON.stringify({ apiKey: "sk_agent_prior", agentId: GRANT_AGENT_ID, serverUrl, credentialId: "cred-prior" });
+  await writeFile(file, original, { mode: 0o600 });
+  const result = await runLogin(["wait", "--server", serverUrl, "--agent", GRANT_AGENT_ID, "--device-code", "dev-grant", "--profile-dir", profileDir]);
+  assert.ok(result.error);
+  assert.match(result.stderr, /AGENT_IDENTITY_MISMATCH/);
+  assert.match(result.stderr, /The profile was not changed/);
+  assert.equal(await readFile(file, "utf8"), original);
+  assert.ok(!(result.stdout + result.stderr).includes("sk_agent_granted"), "the refused key is never printed");
+});
+
+for (const scenario of [
+  { name: "denied", status: 403, code: "access_denied", copy: /denied the login request/ },
+  { name: "expired", status: 410, code: "expired_token", copy: /login code expired/ },
+  { name: "malformed key answer", status: 200, code: "token_response_invalid", copy: /not a usable agent key/ },
+] as const) {
+  test(`login wait on ${scenario.name} saves nothing`, async () => {
+    const { serverUrl, profileDir } = await startGrantServer(() => scenario.status === 200
+      ? { status: 200, body: { kind: "agent_key", apiKey: "not-an-agent-key", agentId: GRANT_AGENT_ID } }
+      : { status: scenario.status, body: { code: scenario.code } });
+    const result = await runLogin(["wait", "--server", serverUrl, "--agent", GRANT_AGENT_ID, "--device-code", "dev-grant", "--profile-dir", profileDir]);
+    assert.ok(result.error);
+    assert.match(result.stderr, new RegExp(scenario.code));
+    assert.match(result.stderr, scenario.copy);
+    assert.deepEqual(await readdir(profileDir), []);
+  });
+}
+
+// --- Re-login revokes the key it replaced (#wg-device-auth:#1): once the new
+// key is saved, `wait` calls self-revoke with the PREVIOUS key as the bearer
+// (a key can only revoke itself). Any failure keeps the login and asks the
+// user to revoke; 401 means the old key is already gone. ---
+
+const SELF_REVOKE = "POST /internal/agent-api/credentials/self/revoke";
+
+async function reloginWithSelfRevoke(selfRevoke: (authorization: string | undefined, savedApiKey: string) => SelfRevokeAnswer) {
+  let profileFile = "";
+  const grant = await startGrantServer((n) => agentKeyAnswer(n), {
+    selfRevoke: async (authorization) => selfRevoke(authorization, JSON.parse(await readFile(profileFile, "utf8")).apiKey),
+  });
+  profileFile = path.join(grant.profileDir, "credential.json");
+  const wait = ["wait", "--server", grant.serverUrl, "--agent", GRANT_AGENT_ID, "--device-code", "dev-grant", "--profile-dir", grant.profileDir];
+  const first = await runLogin(wait);
+  assert.equal(first.error, null, first.stderr);
+  assert.ok(!grant.requests.some((r) => `${r.method} ${r.url}` === SELF_REVOKE), "a first login has no previous key to revoke");
+  const second = await runLogin(wait);
+  return { ...grant, profileFile, second };
+}
+
+test("login wait revokes the previous key with that key, after the new key is saved", async () => {
+  const seen: Array<{ authorization: string | undefined; savedApiKey: string }> = [];
+  const { requests, profileFile, second } = await reloginWithSelfRevoke((authorization, savedApiKey) => {
+    seen.push({ authorization, savedApiKey });
+    return authorization === "Bearer sk_agent_granted1"
+      ? { status: 200, body: { revoked: true, credentialId: "cred-1" } }
+      : { status: 401, body: { error: "Invalid agent credential" } };
+  });
+  assert.equal(second.error, null, second.stderr);
+  assert.deepEqual(seen, [{ authorization: "Bearer sk_agent_granted1", savedApiKey: "sk_agent_granted2" }],
+    "one self-revoke, authenticated by the previous key, sent after the new key was saved");
+  assert.deepEqual(requests.slice(-2).map((r) => `${r.method} ${r.url}`), ["POST /api/auth/device/token", SELF_REVOKE]);
+  assert.equal(JSON.parse(await readFile(profileFile, "utf8")).apiKey, "sk_agent_granted2");
+  assert.match(second.stdout, /^state: authorized\nLogged in as 'Keyed'/);
+  assert.match(second.stdout, /\nThe key this profile held before \(credential cred-1\) was revoked\.\n/);
+  assert.equal(second.stdout.match(/credential cred-1/g)?.length, 1);
+  assert.doesNotMatch(second.stdout, /still active|ask the user to revoke/);
+  assert.match(second.stdout, /\nNext \(if you are the agent\): [^\n]+\n$/, "Next lines stay last");
+  assert.ok(!/sk_agent_/.test(second.stdout + second.stderr), "no key material is printed");
+});
+
+for (const scenario of [
+  { name: "an older server without the route (404)", answer: { status: 404, body: { error: "Not found" } } },
+  { name: "a server error (500)", answer: { status: 500, body: { error: "boom" } } },
+  { name: "a key that cannot revoke itself (403)", answer: { status: 403, body: { code: "credential_not_self_revocable", error: "managed" } } },
+  { name: "a dropped connection", answer: "drop" },
+] as const) {
+  test(`login wait keeps the new key and asks the user to revoke the previous one on ${scenario.name}`, async () => {
+    const { requests, profileFile, second } = await reloginWithSelfRevoke(() => scenario.answer);
+    assert.equal(second.error, null, second.stderr);
+    assert.equal(requests.filter((r) => `${r.method} ${r.url}` === SELF_REVOKE).length, 1);
+    assert.equal(JSON.parse(await readFile(profileFile, "utf8")).apiKey, "sk_agent_granted2");
+    assert.match(second.stdout, /^state: authorized\n/);
+    assert.match(second.stdout, /The key this profile held before \(credential cred-1\) is still active; if nothing else uses it, ask the user to revoke it/);
+    assert.doesNotMatch(second.stdout, /was revoked|already not active/);
+    assert.match(second.stdout, /\nNext \(if you are the agent\): [^\n]+\n$/);
+    assert.ok(!/sk_agent_/.test(second.stdout + second.stderr), "no key material is printed");
+  });
+}
+
+test("login wait says the previous key was already not active when self-revoke answers 401", async () => {
+  const { profileFile, second } = await reloginWithSelfRevoke(() => ({ status: 401, body: { error: "Invalid agent credential" } }));
+  assert.equal(second.error, null, second.stderr);
+  assert.equal(JSON.parse(await readFile(profileFile, "utf8")).apiKey, "sk_agent_granted2");
+  assert.match(second.stdout, /The key this profile held before \(credential cred-1\) was already not active on the server; nothing to revoke\.\n/);
+  assert.doesNotMatch(second.stdout, /still active|ask the user to revoke|was revoked/);
 });

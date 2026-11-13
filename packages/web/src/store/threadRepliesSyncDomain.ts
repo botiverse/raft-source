@@ -13,6 +13,9 @@ import type {
 } from "@botiverse/raft-shared";
 import {
   applyThreadReplyFrame,
+  applyThreadReplyUpdate,
+  retainNewerThreadReplyContent,
+  threadReplyContentVersion,
   emptyThreadRepliesScope,
   hydrateThreadRepliesScope,
   INLINE_REPLY_CAP,
@@ -29,6 +32,7 @@ import type {
 } from "./threadRepliesSocket";
 import api from "../api/client";
 import type { Message } from "./messageStore";
+import { messageCardRevision } from "./messageCardRevision";
 import {
   isReceiverPrivateIngressContextCurrent,
 } from "./receiverPrivateIngress";
@@ -116,6 +120,18 @@ function createThreadRepliesDomain(): SyncDomainConfig<ThreadRepliesScope, Threa
       // latest-N projection; at the same watermark it may replace that
       // provisional state only when it is strictly richer and does not carry
       // an older authoritative count.
+      // Existing replies can change without allocating a new message seq.
+      // A content-only snapshot keeps the window/count fixed and advances a
+      // retained row's content revision; it cannot undo a newer row version.
+      if (incoming.replyCount === currentState.replyCount
+        && incoming.replies.length === currentState.replies.length
+        && incoming.replies.every((reply, index) => {
+          const current = currentState.replies[index];
+          return current?.messageId === reply.messageId && current.seq === reply.seq
+            && threadReplyContentVersion(reply) >= threadReplyContentVersion(current);
+        })
+        && incoming.replies.some((reply, index) => threadReplyContentVersion(reply)
+          > threadReplyContentVersion(currentState.replies[index]!))) return true;
       if (incoming.replyCount < currentState.replyCount) return false;
       if (incoming.replies.length > currentState.replies.length) return true;
       if (incoming.replies.length < currentState.replies.length) return false;
@@ -229,7 +245,7 @@ export function hydrateThreadRepliesSnapshotWithSyncCore(input: {
   const effectiveEpoch = input.epoch
     ?? canonicalEpochByScopeId.get(scopeId)
     ?? null;
-  const scope = hydrateThreadRepliesScope(input.replies, input.replyCount, {
+  let scope = hydrateThreadRepliesScope(input.replies, input.replyCount, {
     historyLimited: input.historyLimited,
     principalId: input.principalId,
     parentMessageId: input.parentMessageId,
@@ -237,6 +253,10 @@ export function hydrateThreadRepliesSnapshotWithSyncCore(input: {
     epoch: effectiveEpoch,
   });
   const core = getThreadRepliesSyncCore();
+  const current = core.state<ThreadRepliesScope>(THREAD_REPLIES_SYNC_DOMAIN, scopeId) ?? null;
+  if (core.scopeSyncState(THREAD_REPLIES_SYNC_DOMAIN, scopeId)?.epoch === effectiveEpoch) {
+    scope = retainNewerThreadReplyContent(scope, current);
+  }
   const outcome = core.ingestSnapshot(THREAD_REPLIES_SYNC_DOMAIN, {
     scopeId,
     watermark: BigInt(input.watermark),
@@ -620,6 +640,7 @@ function projectThreadReplySnapshotMessage(message: Message): ThreadRepliesDomai
       : (typeof message.senderName === "string" ? message.senderName : ""),
     senderAvatarUrl: null,
     createdAt: typeof message.createdAt === "string" ? message.createdAt : "",
+    ...(typeof message.updatedAt === "string" ? { updatedAt: message.updatedAt } : {}),
   };
 }
 
@@ -652,4 +673,49 @@ export async function requestThreadRepliesRebaselineSnapshot(input: {
     watermark,
     epoch: input.epoch,
   };
+}
+
+
+/** Merge a body edit into a known reply scope without advancing its arrival cursor. */
+export function consumeThreadReplyUpdateWithSyncCore(
+  message: Message,
+  context: ThreadRepliesSyncContext,
+  legacyScope?: ThreadRepliesScope,
+): { parentMessageId: string; scope: ThreadRepliesScope } | null {
+  if (!isReceiverPrivateIngressContextCurrent(context.ingressContext)
+    || !context.serverId || !context.principalId
+    || message.conversationContext?.channelType !== "thread"
+    || !message.conversationContext.parentMessageId
+    || typeof message.seq !== "number" || !Number.isSafeInteger(message.seq)
+    || typeof message.updatedAt !== "string" || typeof message.content !== "string") return null;
+  const parentMessageId = message.conversationContext.parentMessageId;
+  const identity = { serverId: context.serverId, principalId: context.principalId,
+    parentMessageId, threadChannelId: message.channelId };
+  const scopeId = threadRepliesScopeId(identity);
+  const core = getThreadRepliesSyncCore();
+  let current = core.state<ThreadRepliesScope>(THREAD_REPLIES_SYNC_DOMAIN, scopeId);
+  if (!current && legacyScope
+    && (!legacyScope.principalId || legacyScope.principalId === context.principalId)
+    && (!legacyScope.parentMessageId || legacyScope.parentMessageId === parentMessageId)
+    && (!legacyScope.threadChannelId || legacyScope.threadChannelId === message.channelId)
+    && legacyScope.replies.some((reply) => reply.messageId === message.id && reply.seq === message.seq)) {
+    current = hydrateThreadRepliesSnapshotWithSyncCore({ ...identity,
+      replies: legacyScope.replies, replyCount: legacyScope.replyCount,
+      historyLimited: legacyScope.historyLimited ?? false,
+      watermark: Math.max(legacyScope.snapshotSeq, ...legacyScope.replies.map((reply) => reply.seq)),
+      epoch: legacyScope.epoch ?? null,
+    }).scope ?? undefined;
+  }
+  if (!current) return null;
+  const updated = applyThreadReplyUpdate(current, {
+    messageId: message.id, seq: message.seq, preview: message.content, updatedAt: message.updatedAt,
+    cardRevision: messageCardRevision(message.actionMetadata),
+  });
+  if (updated === current) return null;
+  const sync = core.scopeSyncState(THREAD_REPLIES_SYNC_DOMAIN, scopeId);
+  if (!sync) return null;
+  const outcome = core.ingestSnapshot(THREAD_REPLIES_SYNC_DOMAIN, {
+    scopeId, watermark: sync.appliedSeq, epoch: sync.epoch, state: updated,
+  });
+  return outcome.kind === "applied" ? { parentMessageId, scope: updated } : null;
 }

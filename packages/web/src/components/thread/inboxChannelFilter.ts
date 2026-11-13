@@ -1,4 +1,4 @@
-import type { InboxItem } from "../../store/inboxStore";
+import type { ConversationInboxItem } from "../../store/inboxStore";
 
 export type ChannelLike = {
   id: string;
@@ -9,13 +9,13 @@ export type ChannelLike = {
   peerName?: string | null;
 };
 
-export function itemFilterChannelId(item: InboxItem): string {
+export function itemFilterChannelId(item: ConversationInboxItem): string {
   if (item.kind === "thread") return item.parentChannelId;
   return item.channelId;
 }
 
 export function itemFilterChannelLabel(
-  item: InboxItem,
+  item: ConversationInboxItem,
   channels: ChannelLike[],
   dmChannels: ChannelLike[],
 ): string {

@@ -12,11 +12,13 @@
 
 import type {
   AgentActivityDetailKind,
+  CredentialHoldActivityDiagnostic,
   AgentActivityKind,
   DeliveryConsumptionActivityDiagnostic,
   MachineToServerMessage,
   ProviderRequestActivity,
   RuntimeErrorActivityDiagnostic,
+  ToolStuckActivityDiagnostic,
   TrajectoryEntry,
 } from "@botiverse/raft-shared";
 import {
@@ -56,6 +58,13 @@ export interface ActivityFact {
   runtimeError?: RuntimeErrorActivityDiagnostic;
   providerRequest?: ProviderRequestActivity;
   deliveryConsumption?: DeliveryConsumptionActivityDiagnostic;
+  /** task #25: present on every frame while the agent is stuck on a tool call. */
+  toolStuck?: ToolStuckActivityDiagnostic;
+  /**
+   * Reconciler step 4b: present only on the idle frame whose detail is the
+   * credential-invalid held notice; every other frame omits it.
+   */
+  credentialHold?: CredentialHoldActivityDiagnostic;
 }
 
 /** The last known activity, re-sent by a heartbeat or a probe reply. */
@@ -66,6 +75,10 @@ export interface ActivitySnapshot {
   detailKind: AgentActivityDetailKind;
   launchId: string | undefined;
   providerRequest?: ProviderRequestActivity;
+  /** task #25: the stuck state is current truth, so re-sent frames carry it too. */
+  toolStuck?: ToolStuckActivityDiagnostic;
+  /** Reconciler step 4b: a re-sent held notice carries its reason too. */
+  credentialHold?: CredentialHoldActivityDiagnostic;
 }
 
 /** Where the process manager hands activity facts. */
@@ -125,6 +138,8 @@ export class LegacyActivitySink implements ActivitySink {
       runtimeError: fact.runtimeError,
       providerRequest: fact.providerRequest,
       deliveryConsumption: fact.deliveryConsumption,
+      toolStuck: fact.toolStuck,
+      credentialHold: fact.credentialHold,
     });
     if (!sentDetailKind) return false;
     this.recordProduced(fact.agentId, fact.activityKind, fact.detail, sentDetailKind, fact.entries, producer, fact.launchId, clientSeq, producerFactId, false);
@@ -155,6 +170,8 @@ export class LegacyActivitySink implements ActivitySink {
       // The one knowing site: this timer re-broadcasts stale
       // lastActivity, so it declares its replay provenance.
       isHeartbeat: true,
+      toolStuck: snapshot.toolStuck,
+      credentialHold: snapshot.credentialHold,
     });
     this.recordProduced(snapshot.agentId, snapshot.activityKind, snapshot.detail, snapshot.detailKind, [], producer, snapshot.launchId, clientSeq, producerFactId, true);
   }
@@ -177,6 +194,8 @@ export class LegacyActivitySink implements ActivitySink {
       clientSeq,
       producerFactId,
       isHeartbeat: false,
+      toolStuck: snapshot.toolStuck,
+      credentialHold: snapshot.credentialHold,
     });
     this.recordProduced(snapshot.agentId, snapshot.activityKind, snapshot.detail, snapshot.detailKind, [], producer, snapshot.launchId, clientSeq, producerFactId, false);
   }

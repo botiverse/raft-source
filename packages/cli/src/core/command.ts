@@ -2,6 +2,11 @@ import { Option, type Command } from "commander";
 
 import type { CommandContext, CommandRuntimeOptions } from "./context";
 import { createCommandContext } from "./context";
+import { createHmac, randomBytes } from "node:crypto";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import path from "node:path";
+import { passiveAgentId } from "../ax/passiveEngine";
+import { resolveStateDbPath } from "../state/agentLedger";
 import { renderError } from "./renderer";
 import { CliExit, cliError, toCliError } from "./errors";
 import { assertGuidanceWithinLimits, attachGuidanceToHelp, commandPath, gateCommandGuidance } from "../ax/commandGuidance";
@@ -17,6 +22,12 @@ export interface CommandSpec {
   name: string;
   description: string;
   arguments?: string[];
+  /** Replaces the generated usage line, e.g. when a declared argument only exists to reject misuse. */
+  usage?: string;
+  /** Left out of `--help` listings; it still runs. */
+  hidden?: boolean;
+  /** Other names that run it (commander aliases), e.g. `raft cont` for `raft __continue`. */
+  aliases?: string[];
   options?: CommandOptionSpec[];
   helpAfter?: string;
   /**
@@ -37,15 +48,55 @@ export function defineCommand(spec: CommandSpec, handler: CommandHandler): {
   return { spec, handler };
 }
 
+/**
+ * A short hash of a run's arguments (positionals and options, keys sorted; not
+ * stdin), for the guidance trace: the same hash means the agent ran the same
+ * command again. Keyed with a random value kept in the agent's own state
+ * directory, so a short title or id can't be confirmed by guessing it.
+ * Undefined when that key can't be read or made.
+ */
+function argsHashOf(args: readonly unknown[], env: NodeJS.ProcessEnv): string | undefined {
+  try {
+    const key = guidanceTraceKey(env);
+    if (!key) return undefined;
+    // Commander passes the positionals, the options object, then the Command itself.
+    const values = args.slice(0, -1).map((value) => (
+      value && typeof value === "object" && !Array.isArray(value)
+        ? Object.fromEntries(Object.entries(value as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b)))
+        : value
+    ));
+    return createHmac("sha256", key).update(JSON.stringify(values)).digest("hex").slice(0, 16);
+  } catch {
+    return undefined;
+  }
+}
+
+function guidanceTraceKey(env: NodeJS.ProcessEnv): string | undefined {
+  const agentId = passiveAgentId(env);
+  if (!agentId) return undefined;
+  const file = path.join(path.dirname(resolveStateDbPath(agentId, env)), "guidance-trace-key");
+  try {
+    return readFileSync(file, "utf8").trim() || undefined;
+  } catch {
+    mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+    const key = randomBytes(16).toString("hex");
+    // `wx`: a concurrent first run that already wrote one wins; read it back.
+    try { writeFileSync(file, key, { mode: 0o600, flag: "wx" }); } catch { return readFileSync(file, "utf8").trim() || undefined; }
+    return key;
+  }
+}
+
 export function registerCliCommand(
   parent: Command,
   command: ReturnType<typeof defineCommand>,
   runtimeOptions: CommandRuntimeOptions = {},
 ): void {
-  const child = parent.command(command.spec.name).description(command.spec.description);
+  const child = parent.command(command.spec.name, command.spec.hidden ? { hidden: true } : {}).description(command.spec.description);
+  for (const alias of command.spec.aliases ?? []) child.alias(alias);
   for (const arg of command.spec.arguments ?? []) {
     child.argument(arg);
   }
+  if (command.spec.usage) child.usage(command.spec.usage);
   for (const option of command.spec.options ?? []) {
     const commanderOption = option.hidden ? new Option(option.flags, option.description).hideHelp() : null;
     if (option.parse) {
@@ -71,7 +122,7 @@ export function registerCliCommand(
   child.action(async (...args: any[]) => {
     const ctx = createCommandContext(runtimeOptions);
     try {
-      if (command.spec.guidance && gateCommandGuidance(commandPath(child), command.spec.guidance, ctx.io.stdout, ctx.env) === "held") {
+      if (command.spec.guidance && gateCommandGuidance(commandPath(child), command.spec.guidance, ctx.io.stdout, ctx.env, argsHashOf(args, ctx.env)) === "held") {
         throw cliError("GUIDANCE_DELIVERED", "Not executed; the command's guidance was delivered instead.", {
           effect: "not_executed",
           retryable: true,

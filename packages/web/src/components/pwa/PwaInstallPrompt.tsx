@@ -1,9 +1,23 @@
-import CloseButton from "../ui/CloseButton";
 import { useCallback, useEffect, useState } from "react";
 import { useIntl } from "react-intl";
-import { Smartphone, X } from "lucide-react";
-import { Button, Card } from "@botiverse/raft-ui";
-import BottomSheet from "../ui/BottomSheet";
+import { Smartphone } from "lucide-react";
+import {
+  Button,
+  Card,
+  Drawer,
+  DrawerActions,
+  DrawerBody,
+  DrawerClose,
+  DrawerContent,
+  DrawerDescription,
+  DrawerFooter,
+  DrawerHeader,
+  DrawerTitle,
+} from "@botiverse/raft-ui";
+import { useMediaQuery } from "../../hooks/effectPrimitives";
+import { PHONE_MEDIA_QUERY } from "../ui/NarrowDialog";
+import { useOverlayLayer } from "../ui/useOverlayLayer";
+import { shareableWebUrl } from "../../utils/desktopShell";
 import {
   PWA_INSTALL_OPEN_EVENT,
   PWA_INSTALL_SESSION_DISMISSED_KEY,
@@ -39,98 +53,86 @@ function IosInstructionSheet({
 }) {
   const { formatMessage } = useIntl();
   const isSafari = variant === "safari";
-  // Raft Design System › Sheet (`rf-sheet`): the head row (17/22 title, a
-  // ghost close), a 14/20 ink-2 line under it, then full-width actions with
-  // one pink primary.
+  // A phone sheet only: nothing on a wider window (it was md:hidden).
+  const phone = useMediaQuery(PHONE_MEDIA_QUERY);
+  useOverlayLayer(phone);
+  const handleOpenChange = useCallback((open: boolean) => { if (!open) onClose(); }, [onClose]);
+  // Raft Design System › Drawer, the bottom sheet: the grab handle, the head
+  // (17/22 title, × at its end), the body (a 15/20 ink-2 line, then the
+  // steps), then full-width actions with one pink primary. Base UI traps focus, closes on Esc, a scrim
+  // press or a swipe down, and gives focus back to the control that opened it.
   return (
-    <BottomSheet
-      role="dialog"
-      aria-modal="true"
-      aria-label={formatMessage({ id: "pwa.install.addToHomeScreen" })}
-      onClose={onClose}
-      className="md:hidden"
-      sheetClassName="px-4"
-    >
-      <div className="mb-3 flex items-start justify-between gap-2">
-        <div className="min-w-0 pt-2.5">
-          <div className="text-headline text-foreground">
-            {formatMessage({ id: "pwa.install.addToYourHomeScreen" })}
-          </div>
-          <div className="mt-1 text-callout text-foreground-muted">
+    <Drawer open={phone} swipeDirection="down" onOpenChange={handleOpenChange}>
+      <DrawerContent data-testid="pwa-install-sheet">
+        {/* The head is one line, the title and ×; the line that was under it opens the body (Raft DS › Drawer). */}
+        <DrawerHeader className="flex-row items-center justify-between gap-2">
+          <DrawerTitle className="min-w-0">{formatMessage({ id: "pwa.install.addToYourHomeScreen" })}</DrawerTitle>
+          <DrawerClose aria-label={formatMessage({ id: "pwa.install.closeInstructionsAria" })} />
+        </DrawerHeader>
+
+        <DrawerBody className="gap-3">
+          <DrawerDescription>
             {isSafari
               ? formatMessage({ id: "pwa.install.safariSubtitle" })
               : formatMessage({ id: "pwa.install.openInSafariSettingsHint" })}
-          </div>
-        </div>
-        <CloseButton
-          type="button"
-          size="icon-lg"
-          onClick={onClose}
-          className="-mr-2 shrink-0"
-          aria-label={formatMessage({ id: "pwa.install.closeInstructionsAria" })}
-        >
-          <X size={22} />
-        </CloseButton>
-      </div>
+          </DrawerDescription>
+          {isSafari ? (
+            <div className="rounded-container border border-line-hairline bg-fill-muted p-2">
+              <img
+                src="/pwa/ios-add-to-home-screen-3step.svg"
+                alt={formatMessage({ id: "pwa.install.threeStepsAlt" })}
+                className="block w-full"
+              />
+            </div>
+          ) : (
+            // DS Banner (info): the cyan-soft wash, ink text, a hairline. Hand-rolled
+            // because raft-ui's Banner announces itself as role="alert", and this
+            // static note never did.
+            <div className="rounded-container bg-info-soft px-3.5 py-3 text-callout text-foreground ring-1 ring-inset ring-line-hairline">
+              {formatMessage({ id: "pwa.install.iosSafariOnly" })}
+            </div>
+          )}
+        </DrawerBody>
 
-      {isSafari ? (
-        <div className="rounded-container border border-line-hairline bg-fill-muted p-2">
-          <img
-            src="/pwa/ios-add-to-home-screen-3step.svg"
-            alt={formatMessage({ id: "pwa.install.threeStepsAlt" })}
-            className="block w-full"
-          />
-        </div>
-      ) : (
-        // DS Banner (info): the cyan-soft wash, ink text, a hairline. Hand-rolled
-        // because raft-ui's Banner announces itself as role="alert", and this
-        // static note never did.
-        <div className="rounded-container bg-info-soft px-3.5 py-3 text-callout text-foreground ring-1 ring-inset ring-line-hairline">
-          {formatMessage({ id: "pwa.install.iosSafariOnly" })}
-        </div>
-      )}
-
-      <div className="mt-4 flex flex-col gap-2">
-        {!isSafari && (
-          <Button type="button" onClick={onCopyLink} size="lg" variant="primary" className="w-full">
-            {formatMessage({ id: "pwa.install.copyLink" })}
-          </Button>
-        )}
-        <Button type="button" onClick={onClose} size="lg" variant={isSafari ? "primary" : "ghost"} className="w-full">
-          {isSafari
-            ? formatMessage({ id: "pwa.install.gotIt" })
-            : formatMessage({ id: "common.close" })}
-        </Button>
-      </div>
-    </BottomSheet>
+        <DrawerFooter>
+          <DrawerActions>
+            {!isSafari && (
+              <Button type="button" onClick={onCopyLink} size="lg" variant="primary">
+                {formatMessage({ id: "pwa.install.copyLink" })}
+              </Button>
+            )}
+            <DrawerClose render={<Button type="button" size="lg" variant={isSafari ? "primary" : "ghost"} />}>
+              {isSafari
+                ? formatMessage({ id: "pwa.install.gotIt" })
+                : formatMessage({ id: "common.close" })}
+            </DrawerClose>
+          </DrawerActions>
+        </DrawerFooter>
+      </DrawerContent>
+    </Drawer>
   );
 }
 
 export function PwaInstallSettingsCard() {
   const { formatMessage } = useIntl();
-  const [platform, setPlatform] = useState<PwaInstallPlatform>("other");
-  const [standalone, setStandalone] = useState(false);
-  const [isMobile, setIsMobile] = useState(false);
-  const [sessionCount, setSessionCount] = useState(1);
-  const [cooldownState, setCooldownState] = useState<PwaInstallCooldownState>("not_dismissed");
-
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-    // oxlint-disable-next-line react-doctor/no-initialize-state -- YMNNE-family: pre-existing non-bug site grandfathered; rule now gates new code (see docs/frontend/render-cost-contract.md)
-    setPlatform(getPwaInstallPlatform(window.navigator.userAgent));
-    // oxlint-disable-next-line react-doctor/no-initialize-state -- YMNNE-family: pre-existing non-bug site grandfathered; rule now gates new code (see docs/frontend/render-cost-contract.md)
-    setStandalone(isPwaStandalone(window));
-    // oxlint-disable-next-line react-doctor/no-initialize-state -- YMNNE-family: pre-existing non-bug site grandfathered; rule now gates new code (see docs/frontend/render-cost-contract.md)
-    setIsMobile(isMobileViewportNow());
-    // oxlint-disable-next-line react-doctor/no-initialize-state -- YMNNE-family: pre-existing non-bug site grandfathered; rule now gates new code (see docs/frontend/render-cost-contract.md)
-    setSessionCount(readNumberStorage(window.localStorage, PWA_INSTALL_SESSION_COUNT_KEY) ?? 1);
-    // oxlint-disable-next-line react-doctor/no-initialize-state -- YMNNE-family: pre-existing non-bug site grandfathered; rule now gates new code (see docs/frontend/render-cost-contract.md)
-    setCooldownState(
-      window.sessionStorage.getItem(PWA_INSTALL_SESSION_DISMISSED_KEY) === "1"
-        ? "dismissed_active"
-        : getCooldownState(Date.now(), null),
-    );
-  }, []);
+  // Read before the first paint, not in an effect: the card renders nothing
+  // until it knows it is on a phone, so reading these a frame late made it pop
+  // in and push Settings down (task #157; Raft DS › Responsive layout, "The
+  // first frame is the settled one").
+  const [platform] = useState<PwaInstallPlatform>(() => (
+    typeof window === "undefined" ? "other" : getPwaInstallPlatform(window.navigator.userAgent)
+  ));
+  const [standalone] = useState(() => typeof window !== "undefined" && isPwaStandalone(window));
+  const [isMobile] = useState(() => typeof window !== "undefined" && isMobileViewportNow());
+  const [sessionCount] = useState(() => (
+    typeof window === "undefined" ? 1 : readNumberStorage(window.localStorage, PWA_INSTALL_SESSION_COUNT_KEY) ?? 1
+  ));
+  const [cooldownState] = useState<PwaInstallCooldownState>(() => {
+    if (typeof window === "undefined") return "not_dismissed";
+    return window.sessionStorage.getItem(PWA_INSTALL_SESSION_DISMISSED_KEY) === "1"
+      ? "dismissed_active"
+      : getCooldownState(Date.now(), null);
+  });
 
   // oxlint-disable-next-line react-doctor/no-effect-chain -- YMNNE-family: pre-existing non-bug site grandfathered; rule now gates new code (see docs/frontend/render-cost-contract.md)
   useEffect(() => {
@@ -180,7 +182,7 @@ export function PwaInstallSettingsCard() {
           </div>
           <Button
             type="button"
-            size="sm"
+            size="md"
             variant="outline"
             onClick={openInstallSheet}
             className="shrink-0"
@@ -261,7 +263,7 @@ export default function PwaInstallPrompt() {
 
   const copyLink = useCallback(() => {
     if (typeof window === "undefined") return;
-    void navigator.clipboard?.writeText(window.location.href);
+    void navigator.clipboard?.writeText(shareableWebUrl());
     track("pwa_install_cta_clicked", "ios_instruction_sheet");
   }, [track]);
 

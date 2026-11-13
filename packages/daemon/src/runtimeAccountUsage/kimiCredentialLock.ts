@@ -1,4 +1,4 @@
-import { mkdirSync, writeFileSync } from "node:fs";
+import { closeSync, constants, lstatSync, mkdirSync, openSync } from "node:fs";
 import { dirname } from "node:path";
 
 import lockfile from "proper-lockfile";
@@ -44,6 +44,25 @@ export interface KimiLockHandle {
 }
 
 /**
+ * Creates the lock sentinel the way it is safe to: a home this daemon creates first (the user never ran Kimi) is
+ * private (0700), and the sentinel is never reached through a symbolic link:
+ * an existing link is refused, and the open itself does not follow one.
+ */
+export function prepareKimiLockSentinel(target: string): void {
+  mkdirSync(dirname(target), { recursive: true, mode: 0o700 });
+  let existing: ReturnType<typeof lstatSync> | undefined;
+  try {
+    existing = lstatSync(target);
+  } catch {
+    existing = undefined;
+  }
+  if (existing?.isSymbolicLink()) throw new Error("lock sentinel is a symbolic link");
+  if (existing !== undefined && !existing.isFile()) throw new Error("lock sentinel is not a regular file");
+  const noFollow = constants.O_NOFOLLOW ?? 0;
+  closeSync(openSync(target, constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT | noFollow, 0o600));
+}
+
+/**
  * Runs `fn` while holding the client's refresh lock. Returns `unavailable`
  * (without running `fn`) when the lock cannot be prepared or taken in time.
  * The lock is released after `fn` settles, never before. The library's
@@ -52,8 +71,7 @@ export interface KimiLockHandle {
  */
 export async function withKimiRefreshLock<T>(target: string, fn: (handle: KimiLockHandle) => Promise<T>, options: KimiLockOptions = {}): Promise<KimiLockResult<T>> {
   try {
-    mkdirSync(dirname(target), { recursive: true });
-    writeFileSync(target, "", { flag: "a" });
+    prepareKimiLockSentinel(target);
   } catch (error) {
     return { kind: "unavailable", reason: `cannot prepare lock sentinel: ${error instanceof Error ? error.message : String(error)}` };
   }

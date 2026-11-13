@@ -1,0 +1,83 @@
+{
+  "formatVersion": 1,
+  "id": "R2-optimistic-badge",
+  "rule": "R2",
+  "title": "The row shows 1 at once while Mark as Unread waits for its answer, then the answer's count",
+  "why": "Mark as Unread shows the unread state at once (1) and corrects it with the server's answer. Decided by artin (#proj-mobile:966d7abd, 2026-10-29): the app's behaviour.",
+  "status": "agreed",
+  "sources": {
+    "web": [
+      "packages/web/src/store/messageStore.ts (markUnread: no badge before the answer)"
+    ],
+    "app": [
+      "compose/shared/src/commonMain/kotlin/build/raft/app/data/SharedHomeStore.kt (count ?: 1)"
+    ]
+  },
+  "knownGaps": [
+    {
+      "client": "web",
+      "reason": "adopt decision (artin 10-29): web shows no unread state until the answer arrives.",
+      "followUp": "#proj-mobile:#70 (decision #proj-mobile:966d7abd)"
+    }
+  ],
+  "given": {
+    "conversation": {
+      "id": "channel-1",
+      "kind": "channel"
+    },
+    "row": {
+      "joined": true,
+      "muted": false,
+      "unread": 0
+    }
+  },
+  "steps": [
+    {
+      "act": "markUnread",
+      "surface": "conversationRow"
+    },
+    {
+      "act": "serverResponds",
+      "status": 200,
+      "body": {
+        "ok": true,
+        "unreadCount": 3,
+        "maxReadSeq": 37,
+        "readStateVersion": 7,
+        "markedUnread": false,
+        "outcome": "counted"
+      }
+    }
+  ],
+  "checkpoints": [
+    {
+      "afterStep": 1,
+      "requests": [
+        {
+          "method": "POST",
+          "path": "/api/channels/channel-1/unread"
+        }
+      ],
+      "state": {
+        "unreadState": {
+          "kind": "count",
+          "count": 1
+        }
+      }
+    }
+  ],
+  "expect": {
+    "requests": [
+      {
+        "method": "POST",
+        "path": "/api/channels/channel-1/unread"
+      }
+    ],
+    "state": {
+      "unreadState": {
+        "kind": "count",
+        "count": 3
+      }
+    }
+  }
+}

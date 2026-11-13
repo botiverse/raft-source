@@ -127,9 +127,6 @@ function ReplyAvatar({
       context="compact-list"
       type="human"
       humanAvatarUrl={member?.avatarUrl ?? reply.senderAvatarUrl}
-      gravatarHash={member?.gravatarHash ?? null}
-      email={member?.email ?? null}
-      humanPlaceholder={!member?.avatarUrl && !member?.gravatarHash && !member?.email && !reply.senderAvatarUrl}
     />
   );
 }
@@ -201,7 +198,7 @@ export const InlineThreadReplies = memo(function InlineThreadReplies({
       // mb-px: the card frame's bottom sits one pixel above the text baseline
       // that the 24 rhythm is measured from; Josh's measure of the followed
       // case reads 23 without it. The DS replies block (fill-muted, 13/18,
-      // 480 max) is the recipe's.
+      // a content card's width, 560 max) is the recipe's.
       className="mb-px"
     >
       {countLabel}

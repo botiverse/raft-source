@@ -1,3 +1,4 @@
+import { lockJointHumanMembershipChannel, prepareJointHumanMembershipMirror } from "./jointHumanMembershipMirror";
 import { currentDate } from "@botiverse/raft-shared";
 import { and, eq, inArray, isNull, sql, type SQL } from "drizzle-orm";
 import { type AnyPgTable } from "drizzle-orm/pg-core";
@@ -11,16 +12,19 @@ import {
   agentChannelReadCursors,
   channelAgents,
   channelConversionJobs,
+  channelExternalInvites,
   channelHumans,
   channels,
   inboxNotificationFacts,
   inboxSuppressionStates,
   inboxTargetMuteStates,
-  mobilePushOutbox,
+  jointChannelServers,
+  notificationOutbox,
   serverMembers,
   threadFollows,
   userChannelDisplayPrefs,
   userChannelInboxStates,
+  userChannelNotificationPrefs,
   userChannelReadCursors
 } from "../db/schema";
 import {
@@ -205,6 +209,10 @@ export async function audienceCutover(
       FROM ${userChannelDisplayPrefs}
      WHERE channel_id IN (${sql.join(scopeIds.map((id) => sql`${id}::uuid`), sql`, `)})
     UNION
+    SELECT DISTINCT user_id::text, 'user'::text
+      FROM ${userChannelNotificationPrefs}
+     WHERE channel_id IN (${sql.join(scopeIds.map((id) => sql`${id}::uuid`), sql`, `)})
+    UNION
     SELECT DISTINCT receiver_id::text, receiver_type::text
       FROM ${inboxSuppressionStates}
      WHERE target_channel_id IN (${sql.join(scopeIds.map((id) => sql`${id}::uuid`), sql`, `)})
@@ -215,7 +223,7 @@ export async function audienceCutover(
      WHERE source_channel_id IN (${sql.join(scopeIds.map((id) => sql`${id}::uuid`), sql`, `)})
     UNION
     SELECT DISTINCT receiver_id::text, receiver_type::text
-      FROM ${mobilePushOutbox}
+      FROM ${notificationOutbox}
      WHERE source_channel_id IN (${sql.join(scopeIds.map((id) => sql`${id}::uuid`), sql`, `)})
     UNION
     SELECT DISTINCT principal_id::text, 'user'::text
@@ -280,7 +288,6 @@ export async function audienceCutover(
   if (applyMutations) await tx.update(channels).set({
     type: "joint",
     guestVisible: false,
-    guestJoinable: false,
   }).where(eq(channels.id, job.sourceChannelId));
   if (options.advanceJob !== false) {
     await advance(tx, job.id, "residual_cleanup", {
@@ -328,7 +335,8 @@ export async function residualCleanup(
   let agentReadCursorRows = 0;
 
   if (applyMutations && lostUserIds.length > 0 && audienceCleanupMutationForTest !== "follow_resurrection") {
-    const updated = await tx.update(threadFollows).set({ unfollowedAt: now, doneAt: null }).where(boundedCleanupRows(threadFollows, and(
+    // An explicit thread notification level goes with the follow (NULL: derived from it again).
+    const updated = await tx.update(threadFollows).set({ unfollowedAt: now, doneAt: null, notificationLevel: null }).where(boundedCleanupRows(threadFollows, and(
       eq(threadFollows.followerType, "user"),
       inArray(threadFollows.followerId, lostUserIds),
       inArray(threadFollows.threadChannelId, scopeIds),
@@ -361,6 +369,9 @@ export async function residualCleanup(
       readCursorRows = (await tx.delete(userChannelReadCursors).where(boundedCleanupRows(userChannelReadCursors, and(inArray(userChannelReadCursors.userId, lostUserIds), inArray(userChannelReadCursors.channelId, scopeIds)))).returning({ userId: userChannelReadCursors.userId })).length;
     }
     displayPrefRows = (await tx.delete(userChannelDisplayPrefs).where(boundedCleanupRows(userChannelDisplayPrefs, and(inArray(userChannelDisplayPrefs.userId, lostUserIds), inArray(userChannelDisplayPrefs.channelId, scopeIds)))).returning({ userId: userChannelDisplayPrefs.userId })).length;
+    // The channel notification level is per-user channel state too; counted
+    // with the display prefs (same ledger counter, same batching).
+    displayPrefRows += (await tx.delete(userChannelNotificationPrefs).where(boundedCleanupRows(userChannelNotificationPrefs, and(inArray(userChannelNotificationPrefs.userId, lostUserIds), inArray(userChannelNotificationPrefs.channelId, scopeIds)))).returning({ userId: userChannelNotificationPrefs.userId })).length;
     notificationFactRows = (await tx.delete(inboxNotificationFacts).where(boundedCleanupRows(inboxNotificationFacts, and(eq(inboxNotificationFacts.receiverType, "user"), inArray(inboxNotificationFacts.receiverId, lostUserIds), inArray(inboxNotificationFacts.sourceChannelId, scopeIds)))).returning({ id: inboxNotificationFacts.id })).length;
     // A suppression can be keyed by a canonical target while retaining the
     // converted source in `source_channel_id` (or vice versa for a projected
@@ -425,7 +436,7 @@ export async function residualCleanup(
   }
 
   if (applyMutations && lostUserIds.length > 0 && audienceCleanupMutationForTest !== "pending_push_socket_leak") {
-    const push = await tx.update(mobilePushOutbox).set({ status: "revoked", revokedCount: sql`${mobilePushOutbox.revokedCount} + 1`, processedAt: now, updatedAt: now, lastError: "channel_conversion_audience_cutover" }).where(boundedCleanupRows(mobilePushOutbox, and(eq(mobilePushOutbox.receiverType, "user"), inArray(mobilePushOutbox.receiverId, lostUserIds), inArray(mobilePushOutbox.sourceChannelId, scopeIds), inArray(mobilePushOutbox.status, ["pending", "processing"])))).returning({ id: mobilePushOutbox.id });
+    const push = await tx.update(notificationOutbox).set({ status: "revoked", processedAt: now, updatedAt: now, lastError: "channel_conversion_audience_cutover" }).where(boundedCleanupRows(notificationOutbox, and(eq(notificationOutbox.receiverType, "user"), inArray(notificationOutbox.receiverId, lostUserIds), inArray(notificationOutbox.sourceChannelId, scopeIds), inArray(notificationOutbox.status, ["pending", "processing"])))).returning({ id: notificationOutbox.id });
     pushRows = push.length;
   }
 
@@ -545,6 +556,8 @@ export async function finalize(
   if (!progress.audienceCutoverAt || !progress.residualCleanupAt) {
     throw new Error("conversion cutover and residual cleanup must commit before completion");
   }
+  await lockJointHumanMembershipChannel(tx, job.sourceChannelId);
+  const mirrorHumans = await prepareJointHumanMembershipMirror(tx, { channelIds: [job.sourceChannelId] }, "join");
   const [updated] = await tx
     .update(channels)
     .set({
@@ -560,6 +573,7 @@ export async function finalize(
     .returning({ id: channels.id, serverId: channels.serverId });
   if (!updated) throw new Error("source channel missing during finalize");
   if (updated.serverId !== job.serverId) throw new Error("source channel server mismatch during finalize");
+  await mirrorHumans.apply();
 
   await tx
     .update(channelConversionJobs)
@@ -581,5 +595,95 @@ export async function finalize(
     conversionEpoch: job.conversionEpoch,
   });
   await releaseChannelConversionFence(tx, job.id, "succeeded");
+  // An external invite connecting a server once this channel is joint
+  // (#wg-rbac:#16, P2a-3) moves to its connection step in this same commit:
+  // the worker connects the server from that row, also after a crash right
+  // here. The invite row is the last lock this transaction takes.
+  // Only the reservation this run converts for (its generation): never a
+  // later reservation of the same invite on a reused job.
+  // A self_connect operation's reservation (self_connecting, design v3 §10)
+  // moves the same way, and its actor's membership is resolved from what this
+  // transaction wrote (resolveSelfConnectCreation); an older release's
+  // finalize moves `connecting` ones only, which the worker then makes up for.
+  if (job.externalConnectGeneration) {
+    const moved = await tx.update(channelExternalInvites)
+      .set({ connectPhase: "connection", connectNextAttemptAt: null })
+      .where(and(
+        eq(channelExternalInvites.connectConversionJobId, job.id),
+        eq(channelExternalInvites.connectGeneration, job.externalConnectGeneration),
+        inArray(channelExternalInvites.status, ["connecting", "self_connecting"]),
+        eq(channelExternalInvites.connectPhase, "conversion"),
+      ))
+      .returning({ id: channelExternalInvites.id, status: channelExternalInvites.status });
+    await resolveJointCreationSources(tx, job.id, job.externalConnectGeneration, job.sourceChannelId);
+    for (const invite of moved) if (invite.status === "self_connecting") await resolveSelfConnectCreation(tx, invite.id);
+  }
   span?.addEvent("server.channel_conversion.phase.finished", conversionTraceAttrs(job, { outcome: "ok" }));
+}
+
+/**
+ * The actor's own direct-connect invite whose operation this conversion is
+ * (awaiting_joint_creation; externalInviteConnectService "Membership
+ * sources"): resolved from the membership this transaction just wrote, under
+ * its J lock and the invite row (locked by the move above). The actor a
+ * member now: member_at_start at exactly that generation, so every server
+ * the operation connects is a source of it. Not one (an owner/admin who was
+ * not in the private channel): awaiting_first_join with their counter now,
+ * so its first connection admits them as an ordinary first join.
+ */
+/**
+ * A self_connect operation on a private channel (design v3 §4), once the
+ * conversion it reserved committed: the joint this conversion made (the source
+ * channel is now the host's projection of it) and its actor's membership of
+ * it, which must be the stint the reservation bound: their joint membership's
+ * joined_at is the channel_humans joined_at the reservation read (the mirror
+ * carries it over, and nobody could be added back to the channel under the
+ * conversion fence before the finalize; a later rejoin has a later joined_at).
+ * Then member_at_start at that generation: each server the operation connects
+ * is a source of exactly it. Anything else (they left, the joint is not this
+ * conversion's, the stint differs) leaves it unresolved: the worker refuses
+ * the connection (planInviteSources), never a first join. True when resolved.
+ * Called under the invite row's lock (the finalize's move above, or
+ * recoverSelfConnectFinalize).
+ */
+export async function resolveSelfConnectCreation(tx: DatabaseExecutor, inviteId: string): Promise<boolean> {
+  const [resolved] = (await tx.execute<{ generation: number }>(sql`
+    SELECT m.generation
+    FROM channel_external_invites i
+    JOIN joint_channel_servers p ON p.local_channel_id = i.channel_id AND p.server_id = i.host_server_id AND p.role = 'host' AND p.status = 'active'
+    JOIN joint_channels j ON j.id = p.joint_channel_id AND j.created_by_server_id = i.host_server_id AND j.status = 'active'
+    JOIN joint_channel_members m ON m.joint_channel_id = p.joint_channel_id AND m.user_id = i.connect_joiner_user_id
+    WHERE i.id = ${inviteId}::uuid AND i.origin = 'self_connect' AND i.status = 'self_connecting'
+      AND i.source_state = 'awaiting_joint_creation' AND i.self_member_joined_at IS NOT NULL
+      AND m.joined_at = i.self_member_joined_at`)).rows;
+  if (!resolved) return false;
+  await tx.update(channelExternalInvites)
+    .set({ sourceState: "member_at_start", sourceStartGeneration: null, sourceGeneration: Number(resolved.generation) })
+    .where(eq(channelExternalInvites.id, inviteId));
+  return true;
+}
+
+async function resolveJointCreationSources(tx: DatabaseExecutor, jobId: string, generation: string, sourceChannelId: string): Promise<void> {
+  const [invite] = await tx.select({ id: channelExternalInvites.id, joinerUserId: channelExternalInvites.connectJoinerUserId })
+    .from(channelExternalInvites)
+    .where(and(
+      eq(channelExternalInvites.connectConversionJobId, jobId),
+      eq(channelExternalInvites.connectGeneration, generation),
+      eq(channelExternalInvites.status, "connecting"),
+      eq(channelExternalInvites.sourceState, "awaiting_joint_creation"),
+    ));
+  if (!invite?.joinerUserId) return;
+  const [projection] = await tx.select({ jointChannelId: jointChannelServers.jointChannelId }).from(jointChannelServers)
+    .where(eq(jointChannelServers.localChannelId, sourceChannelId));
+  if (!projection) return;
+  const membership = await tx.execute<{ generation: number | null; counter: number | null }>(sql`SELECT
+      (SELECT generation FROM joint_channel_members WHERE joint_channel_id = ${projection.jointChannelId}::uuid AND user_id = ${invite.joinerUserId}::uuid) AS generation,
+      (SELECT last_generation FROM joint_membership_generations WHERE joint_channel_id = ${projection.jointChannelId}::uuid
+        AND principal_kind = 'user' AND principal_id = ${invite.joinerUserId}::uuid) AS counter`);
+  const row = membership.rows[0];
+  const memberGeneration = row?.generation == null ? null : Number(row.generation);
+  await tx.update(channelExternalInvites).set(memberGeneration === null
+    ? { sourceState: "awaiting_first_join", sourceStartGeneration: Number(row?.counter ?? 0), sourceGeneration: null }
+    : { sourceState: "member_at_start", sourceStartGeneration: null, sourceGeneration: memberGeneration })
+    .where(eq(channelExternalInvites.id, invite.id));
 }

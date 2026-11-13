@@ -2,6 +2,8 @@ import { Lock } from "lucide-react";
 import { useIntl } from "react-intl";
 import { getHistoryTopState } from "../../utils/historyTopState";
 import type { MessageId } from "../../i18n/messages";
+import { ContentLoading } from "../ui/ContentLoading";
+import { TIMELINE_NOTICE_ROW } from "./composerHost";
 
 // The history-top copy differs by list noun (channel/DM "messages" vs thread
 // "replies"). zh grammar changes the noun's position per sentence, so each
@@ -35,8 +37,8 @@ export default function HistoryTopState({
   const state = getHistoryTopState({ hasMore, historyLimited });
 
   if (state === "load_older") {
-    // MessageTimeline's geometric sentinel is the single pagination owner for
-    // channels, DMs, and threads. Keep progress visible while it fetches, but
+    // MessageTimeline (loading pages near the loaded edges) is the single
+    // pagination owner for channels, DMs, and threads. Keep progress visible while it fetches, but
     // never expose a second manual pagination path at the top of the list.
     if (loadingOlder) {
       // Stable hook for tests that must observe the CONVERSATION list's own
@@ -47,9 +49,9 @@ export default function HistoryTopState({
       return (
         <div
           data-testid={noun === "messages" ? "list-loading-older" : "thread-loading-older"}
-          className="pb-2 text-center font-mono text-mono-meta text-foreground-hint"
+          className={TIMELINE_NOTICE_ROW}
         >
-          {formatMessage({ id: keys.loadingOlder })}
+          <ContentLoading>{formatMessage({ id: keys.loadingOlder })}</ContentLoading>
         </div>
       );
     }
@@ -58,7 +60,7 @@ export default function HistoryTopState({
 
   if (state === "history_limited") {
     return (
-      <div className="pb-2 text-center font-mono text-mono-meta text-foreground-hint">
+      <div className={`${TIMELINE_NOTICE_ROW} text-center font-mono text-mono-meta text-foreground-hint`}>
         <span className="inline-flex items-center gap-1.5 rounded-chip border border-line-hairline bg-layer-canvas px-2 py-1">
           <Lock size={12} />
           {formatMessage({ id: keys.limited })}
@@ -68,7 +70,7 @@ export default function HistoryTopState({
   }
 
   return (
-    <div className="pb-2 text-center font-mono text-mono-meta text-foreground-hint">
+    <div className={`${TIMELINE_NOTICE_ROW} text-center font-mono text-mono-meta text-foreground-hint`}>
       {formatMessage({ id: keys.beginning })}
     </div>
   );

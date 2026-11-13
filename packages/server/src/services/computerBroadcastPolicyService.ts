@@ -1,10 +1,15 @@
 import { z } from "zod";
 import { isDeepStrictEqual } from "node:util";
-import { clearClockTimeout, compareComputerVersions, isComputerSemver, setClockTimeout } from "@botiverse/raft-shared";
 import {
-  evaluateFeatureFlag,
-  REMOTE_COMPUTER_UPGRADE_V2_FEATURE_FLAG_KEY,
-} from "./featureFlagService";
+  clearClockTimeout,
+  compareComputerVersions,
+  type DaemonInstallKind,
+  isComputerSemver,
+  REMOTE_COMPUTER_UPGRADE_PLATFORM_HOLD_FEATURE_FLAG_KEYS,
+  setClockTimeout,
+} from "@botiverse/raft-shared";
+import { evaluateFeatureFlag } from "./featureFlagService";
+import { isPrivacyModeOn } from "../config/privacyMode";
 
 // Keep the existing response/snapshot field names for older Web/Computer clients.
 // They describe a Hands release selection now, not a Server-maintained allowlist.
@@ -36,13 +41,21 @@ export interface ComputerBroadcastPolicyDecision {
   reasonCode: "eligible" | "source_missing" | "source_unparseable" | "platform_unknown"
     | "hands_unavailable" | "hands_response_invalid" | "hands_artifact_missing"
     | "already_current" | "requested_target_mismatch"
-    // Broadcast gate (task #804). Deliberately two codes, not one: "an operator
-    // turned this off" and "the gate itself could not be read" both stop the
-    // broadcast, but they are different incidents and must stay distinguishable
-    // in stored receipts.
-    | "broadcast_disabled" | "broadcast_gate_unavailable"
+    // A per-platform hold flag could not be read: fail closed.
+    | "broadcast_gate_unavailable"
+    // An operator held web upgrades for this machine's OS
+    // (remote_computer_upgrade_hold_<os>).
+    | "platform_held"
+    // The Computer said it cannot reach its own service, which relays web
+    // upgrades (COMPUTER_CAPABILITY_SERVICE_IPC_UNREACHABLE): manual commands.
+    | "service_unreachable"
+    // The Computer runs inside Raft Desktop (`ready.installKind` "electron"):
+    // Desktop updates its bundled Computer itself, and the standalone
+    // installer a web upgrade drives cannot replace it.
+    | "managed_by_desktop"
     // Historical reason codes remain readable in stored receipts and clients.
-    | "policy_row_missing" | "policy_expired";
+    // broadcast_disabled: the retired remote_computer_upgrade_v2 gate was off.
+    | "broadcast_disabled" | "policy_row_missing" | "policy_expired";
   policyRevision: string | null;
   sourceVersion: string | null;
   sourceObservedAt: string | null;
@@ -60,22 +73,33 @@ export interface EvaluateComputerBroadcastPolicyInput {
   requestedTargetVersion?: string | null;
   now: Date;
   /**
-   * Server the machine belongs to. Required for the broadcast gate to be
-   * openable: the flag evaluator resolves a randomization unit before it can
-   * reach the flag default, so a null serverId evaluates to `false` even for a
-   * flag whose default is on. Omitting it yields a switch that can be closed
-   * but never opened.
+   * Server the machine belongs to; the per-platform hold flags are evaluated
+   * for it. Required: without it a hold flag cannot be evaluated and the
+   * platform would read as not held.
    */
-  serverId?: string | null;
+  serverId: string;
+  /**
+   * The connected Computer reported that its runner cannot reach its service
+   * (`COMPUTER_CAPABILITY_SERVICE_IPC_UNREACHABLE`). Absent or false: offered
+   * as before (older Computers never report it).
+   */
+  serviceUnreachable?: boolean;
+  /**
+   * How the Computer's daemon runs, from its latest `ready` (machine row
+   * `install_kind`). "electron" (Raft Desktop's bundled Computer) is never
+   * offered a web upgrade; null/absent (older daemons) and "sea"/"node" are
+   * evaluated as before.
+   */
+  installKind?: DaemonInstallKind | null;
 }
 export interface ComputerHandsResolutionDependencies {
   fetchFn?: typeof fetch;
   timeoutMs?: number;
   /**
-   * Override for the broadcast gate. Tests inject this; production leaves it
-   * unset and the real feature flag is read.
+   * Override for the per-platform hold. Tests inject this; production leaves
+   * it unset and the real feature flags are read.
    */
-  isBroadcastEnabled?: (serverId: string | null) => boolean | Promise<boolean>;
+  isPlatformHeld?: (serverId: string | null, os: ComputerPlatform["os"]) => boolean | Promise<boolean>;
 }
 // Task #805 (artin, 2026-09-13): the Server-driven check that users see on the
 // Computer page always resolves the STABLE channel (`main`). Alpha is a manual
@@ -122,6 +146,8 @@ async function fetchRelease(deps: ComputerHandsResolutionDependencies): Promise<
   }
 }
 function readRelease(deps: ComputerHandsResolutionDependencies): Promise<HandsRelease> {
+  // RAFT_PRIVACY_MODE: Hands is never asked; the decision is `hands_unavailable`.
+  if (isPrivacyModeOn()) return Promise.reject(new Error("Hands not contacted (privacy mode)"));
   if (deps.fetchFn || deps.timeoutMs !== undefined) return fetchRelease(deps);
   pendingRelease ??= fetchRelease(deps).finally(() => { pendingRelease = null; });
   return pendingRelease;
@@ -146,31 +172,33 @@ export function normalizeComputerPlatform(rawOs: string | null | undefined): Com
   return os ? { os, architecture } : null;
 }
 
-type BroadcastGate =
-  | { enabled: true }
-  | { enabled: false; reasonCode: "broadcast_disabled" | "broadcast_gate_unavailable" };
+/**
+ * Refusal code of a web upgrade request for a Computer whose OS is held
+ * (`platform_held`). Informative (not in REFUSAL_CODES): clients show the
+ * Server's sentence and refresh the machine list, which shows the commands.
+ */
+export const COMPUTER_UPGRADE_PAUSED_FOR_PLATFORM_CODE = "COMPUTER_UPGRADE_PAUSED_FOR_PLATFORM";
 
-async function readBroadcastFlag(serverId: string | null): Promise<boolean> {
+async function readPlatformHoldFlag(serverId: string | null, os: ComputerPlatform["os"]): Promise<boolean> {
   return (await evaluateFeatureFlag({
-    key: REMOTE_COMPUTER_UPGRADE_V2_FEATURE_FLAG_KEY,
+    key: REMOTE_COMPUTER_UPGRADE_PLATFORM_HOLD_FEATURE_FLAG_KEYS[os],
     serverId,
   })).enabled;
 }
 
-async function readBroadcastGate(
+/** `null`: not held. An unreadable hold is not permission to broadcast. */
+async function readPlatformHold(
   serverId: string | null,
+  os: ComputerPlatform["os"],
   deps: ComputerHandsResolutionDependencies,
-): Promise<BroadcastGate> {
+): Promise<"platform_held" | "broadcast_gate_unavailable" | null> {
   try {
-    const enabled = deps.isBroadcastEnabled
-      ? await deps.isBroadcastEnabled(serverId)
-      : await readBroadcastFlag(serverId);
-    return enabled ? { enabled: true } : { enabled: false, reasonCode: "broadcast_disabled" };
+    const held = deps.isPlatformHeld
+      ? await deps.isPlatformHeld(serverId, os)
+      : await readPlatformHoldFlag(serverId, os);
+    return held ? "platform_held" : null;
   } catch {
-    // An unreadable gate is not permission to broadcast. It gets its own reason
-    // code so that "someone turned this off" stays distinguishable from "the
-    // flag store was unreachable" in receipts and dispatch-failure reasons.
-    return { enabled: false, reasonCode: "broadcast_gate_unavailable" };
+    return "broadcast_gate_unavailable";
   }
 }
 
@@ -185,31 +213,18 @@ export async function evaluateBroadcastPolicy(
     sourceProvenance: input.source?.provenance ?? null,
     platform: input.platform, targetVersion: null, targetRole: null, migrationClass: null, policyRow: null,
   };
-  // Broadcast gate (task #804). This runs FIRST, before the source/platform
-  // checks and before Hands is contacted at all: a closed gate must not cause
-  // an outbound request, and must not depend on the machine being well-formed.
-  //
-  // One flag gates every Server-initiated upgrade send: this gate reads
-  // `remote_computer_upgrade_v2`, the same flag the v2 upgrade route checks
-  // up front. It used to read a separate broadcast-only flag; two
-  // flags for one action meant a server with only v2 enabled still had the
-  // Upgrade button hidden. Every caller of this policy (machine list
-  // projection, v2 upgrade route, lifecycle-operation creation, orchestrator
-  // dispatch revalidation) therefore opens and closes together.
-  //
-  // Fail-closed by construction. A missing flag evaluates to `enabled: false`
-  // (`missing_flag`), so the default state of this system is dark and turning
-  // upgrades on requires someone to deliberately create and enable the flag.
-  // That restores the property the deleted policy artifact used to provide:
-  // publishing code is not broadcast authorization. The reason codes
-  // (`broadcast_disabled` / `broadcast_gate_unavailable`) keep their names
-  // because they are stored in receipts and read by clients.
-  const gate = await readBroadcastGate(input.serverId ?? null, deps);
-  if (!gate.enabled) return { ...decision, reasonCode: gate.reasonCode };
+  // Raft Desktop's bundled Computer: Desktop updates it, so it is never
+  // offered a web upgrade. It reads one input and contacts nothing.
+  if (input.installKind === "electron") return { ...decision, reasonCode: "managed_by_desktop" };
 
   if (!input.source?.version) return { ...decision, reasonCode: "source_missing" };
   if (!versionSchema.safeParse(input.source.version).success) return { ...decision, reasonCode: "source_unparseable" };
   if (!input.platform) return { ...decision, reasonCode: "platform_unknown" };
+  // Per-platform emergency hold (10-24): before Hands is contacted, so a held
+  // platform causes no outbound request. A missing flag is not held.
+  const hold = await readPlatformHold(input.serverId ?? null, input.platform.os, deps);
+  if (hold) return { ...decision, reasonCode: hold };
+  if (input.serviceUnreachable) return { ...decision, reasonCode: "service_unreachable" };
   let release: HandsRelease;
   try {
     release = await readRelease(deps);
@@ -240,26 +255,26 @@ export async function evaluateBroadcastPolicy(
 
 /**
  * Evaluator for callers that decide many machines in one request (the machine
- * list). The gate depends only on serverId, so it is read once per serverId
- * and shared; per-machine evaluation used to cost two flag queries per
- * Computer. A failed read is shared too, so every machine of that server
- * reports `broadcast_gate_unavailable`, as it would have one by one.
+ * list). A platform hold depends only on serverId and OS, so it is read once
+ * per pair and shared. A failed read is shared too, so every machine of that
+ * server and OS reports `broadcast_gate_unavailable`, as it would one by one.
  * Not a cache: create one per request so a flag change is seen next request.
  */
 export function createBatchBroadcastPolicyEvaluator(
   deps: ComputerHandsResolutionDependencies = {},
 ): (input: EvaluateComputerBroadcastPolicyInput) => Promise<ComputerBroadcastPolicyDecision> {
-  const gates = new Map<string | null, Promise<boolean>>();
-  const readGate = deps.isBroadcastEnabled ?? readBroadcastFlag;
-  const isBroadcastEnabled = (serverId: string | null): Promise<boolean> => {
-    let gate = gates.get(serverId);
-    if (!gate) {
-      gate = (async () => readGate(serverId))();
-      gates.set(serverId, gate);
+  const holds = new Map<string, Promise<boolean>>();
+  const readHold = deps.isPlatformHeld ?? readPlatformHoldFlag;
+  const isPlatformHeld = (serverId: string | null, os: ComputerPlatform["os"]): Promise<boolean> => {
+    const key = `${serverId ?? ""}\0${os}`;
+    let hold = holds.get(key);
+    if (!hold) {
+      hold = (async () => readHold(serverId, os))();
+      holds.set(key, hold);
     }
-    return gate;
+    return hold;
   };
-  return (input) => evaluateBroadcastPolicy(input, { ...deps, isBroadcastEnabled });
+  return (input) => evaluateBroadcastPolicy(input, { ...deps, isPlatformHeld });
 }
 
 export function projectComputerBroadcastPolicyDecision(

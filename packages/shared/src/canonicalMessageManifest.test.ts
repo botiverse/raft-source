@@ -22,14 +22,14 @@ test("canonical message manifest: generated JSON snapshot matches the typed sour
   );
 });
 
-test("canonical message manifest: field counts are pinned (10 + 10 = 20)", () => {
+test("canonical message manifest: field counts are pinned (10 + 11 = 21)", () => {
   assert.equal(CANONICAL_REQUIRED_MESSAGE_FIELDS.length, 10);
-  assert.equal(OPTIONAL_AGGREGATE_MESSAGE_FIELDS.length, 10);
+  assert.equal(OPTIONAL_AGGREGATE_MESSAGE_FIELDS.length, 11);
   const all = new Set<string>([
     ...CANONICAL_REQUIRED_MESSAGE_FIELDS,
     ...OPTIONAL_AGGREGATE_MESSAGE_FIELDS,
   ]);
-  assert.equal(all.size, 20, "canonical field classes must be disjoint and total 20");
+  assert.equal(all.size, 21, "canonical field classes must be disjoint and total 21");
 });
 
 test("canonical message manifest: task-status family present set is producer-realistic", () => {
@@ -52,7 +52,7 @@ test("canonical message manifest: classes are declaration-sorted for stable JSON
     const names = fields.map((f) => f.name);
     assert.deepEqual(names, [...names].sort());
   }
-  assert.equal(CANONICAL_MESSAGE_MANIFEST.version, 6);
+  assert.equal(CANONICAL_MESSAGE_MANIFEST.version, 7);
 });
 
 test("canonical message manifest v2: descriptors carry type/nullability/family presence", () => {
@@ -87,6 +87,8 @@ test("canonical message manifest v2: raw string unions are marked unknown-preser
     "conversationContext.channelType",
     "conversationContext.parentChannelType",
     "externalAuthor.actorKind",
+    "externalAuthor.identityKind",
+    "externalAuthor.profileFallback",
     "mention.type",
   ]);
 });
@@ -101,10 +103,25 @@ test("canonical message manifest v4: merge policies and exclusion ledger are com
   assert.deepEqual([...ex.taskDomainProjection.fields].sort(), [
     "taskAssigneeId", "taskAssigneeName", "taskAssigneeType", "taskClaimedAt", "taskCompletedAt", "taskCurrentProjection", "taskNumber", "taskStatus",
   ]);
-  assert.deepEqual([...ex.emittedUnconsumed.fields], ["updatedAt"]);
+  assert.deepEqual([...ex.emittedUnconsumed.fields], ["updatedAt", "delegatedBy", "delegatedByAgentId"]);
   assert.deepEqual([...ex.storageOnlySealed.fields].sort(), ["agentSendKey", "searchText", "searchVector"]);
   for (const entry of Object.values(ex)) {
     assert.ok(entry.migrationStatus.length > 0, "every exclusion entry carries migration status");
   }
   assert.match(CANONICAL_MESSAGE_MANIFEST.producerRegistryAnchor, /^slock#4593@b0fcdfd9/);
+});
+
+test("canonical message manifest v7: RFC 077 deletedAt is a canonical optional aggregate, not an exclusion", () => {
+  const deletedAt = CANONICAL_MESSAGE_MANIFEST.fields.find((d) => d.name === "deletedAt");
+  assert.deepEqual(deletedAt, {
+    name: "deletedAt",
+    class: "optionalAggregate",
+    wireType: "string",
+    nullable: true,
+    mergePolicy: "present-overwrite",
+    presence: { messageNew: "present", enrichedUpdated: "present", taskStatusUpdated: "absent" },
+  });
+  for (const entry of Object.values(CANONICAL_MESSAGE_MANIFEST.exclusions)) {
+    assert.ok(!entry.fields.includes("deletedAt"), "a field is canonical or excluded, never both");
+  }
 });

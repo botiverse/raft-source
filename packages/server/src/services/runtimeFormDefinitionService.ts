@@ -2,6 +2,7 @@ import {
   BUILTIN_RUNTIME_GATEWAY_PROVIDER_ENV_KEYS,
   BUILTIN_RUNTIME_PROVIDER_ENV_KEYS,
   getRuntimeProviderDisplayName,
+  isBuiltInRuntimeCustomModelPresetProviderId,
   PI_BUILTIN_PROVIDER_DEFAULT_MODELS,
   PI_BUILTIN_PROVIDER_MODELS,
   RUNTIME_CONFIG_VERSION,
@@ -138,13 +139,35 @@ export function buildBuiltInPiFormOptionSource(sourceId: string): AgentCreateFor
         providerId,
         PI_BUILTIN_PROVIDER_DEFAULT_MODELS[providerId as keyof typeof PI_BUILTIN_PROVIDER_DEFAULT_MODELS] ?? "",
       ])),
+      // A gateway, and a preset provider that also takes a typed id (task #10:
+      // OpenRouter). A Computer that cannot run one turns it back off
+      // (filterBuiltInPiFormOptionSourceForCatalog).
       customValueAllowedByValue: Object.fromEntries(allProviderIds.map((providerId) => [
         providerId,
-        gatewayProviderIds.includes(providerId),
+        gatewayProviderIds.includes(providerId) || isBuiltInRuntimeCustomModelPresetProviderId(providerId),
       ])),
     };
   }
   return null;
+}
+
+/**
+ * The list-only projection: a preset provider that takes a typed id (task #10:
+ * OpenRouter) stays list-only. Served on v1 (v1 clients build runtimeConfig
+ * themselves and only ever build a custom model for a gateway) and on v2 to a
+ * client without `dependent_select.custom_value_with_options`.
+ */
+export function builtInPiListOnlyOptionSource(source: AgentCreateFormOptionSource): AgentCreateFormOptionSource {
+  if (source.kind !== "dependent_select" || source.pointer !== "/model") return source;
+  return {
+    ...source,
+    customValueAllowedByValue: Object.fromEntries(
+      Object.entries(source.customValueAllowedByValue).map(([providerId, allowed]) => [
+        providerId,
+        allowed && !isBuiltInRuntimeCustomModelPresetProviderId(providerId),
+      ]),
+    ),
+  };
 }
 
 export function buildBuiltInPiResolvedFormDefinition(): ResolvedAgentCreateFormDefinition {
@@ -309,6 +332,9 @@ export function runtimeConfigIssue(error: string): AgentCreateFormIssue {
   if (error.includes("provider.baseUrl")) return { code: "invalid", pointer: "/runtimeConfig/provider/baseUrl" };
   if (error.includes("provider.supportsImageInput")) return { code: "invalid", pointer: "/runtimeConfig/provider/supportsImageInput" };
   if (error.includes("provider.providerId")) return { code: "invalid_option", pointer: "/runtimeConfig/provider/providerId" };
+  if (error.includes("model.contextWindow")) return { code: "invalid", pointer: "/runtimeConfig/model/contextWindow" };
+  if (error.includes("model.maxOutputTokens")) return { code: "invalid", pointer: "/runtimeConfig/model/maxOutputTokens" };
+  if (error.includes("runtimeConfig.model limits")) return { code: "invalid", pointer: "/runtimeConfig/model" };
   if (error.includes("runtimeConfig.model")) return { code: "invalid_option", pointer: "/runtimeConfig/model" };
   return { code: "invalid_runtime_config", pointer: "/runtimeConfig" };
 }
@@ -405,7 +431,7 @@ export function validateBuiltInPiDefinitionProjection(
         pointer: `/optionSources/model/defaultValueByValue/${providerId}`,
       });
     }
-    if (modelSource.customValueAllowedByValue[providerId] !== false) {
+    if (modelSource.customValueAllowedByValue[providerId] !== isBuiltInRuntimeCustomModelPresetProviderId(providerId)) {
       issues.push({
         code: "definition_preset_custom_model_drift",
         pointer: `/optionSources/model/customValueAllowedByValue/${providerId}`,

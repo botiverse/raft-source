@@ -53,7 +53,9 @@ export interface ServerLabSettingsAuthority {
 export type ServerLabsMessageId = Extract<MessageId, `settings.labs.${string}`>;
 
 const SERVER_LAB_DESCRIPTION_MESSAGE_IDS: Partial<Record<string, ServerLabsMessageId>> = {};
-const RETIRED_SERVER_LAB_KEYS = new Set(["inline_thread_replies_v0"]);
+// Retired experiments whose flag record still exists (older mobile apps read
+// attachment_comments_v0): never show them as Labs entries.
+const RETIRED_SERVER_LAB_KEYS = new Set(["attachment_comments_v0"]);
 
 export function getServerLabSettingsAuthority(
   role: ServerRole | null | undefined,

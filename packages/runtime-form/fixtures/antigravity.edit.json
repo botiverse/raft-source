@@ -2,11 +2,31 @@
   "protocolVersion": 2,
   "runtimeId": "antigravity",
   "schemaVersion": "antigravity.edit.v1",
+  "requiredClientCapabilities": [
+    "select.custom_value"
+  ],
   "dataSchema": {
     "type": "object",
     "additionalProperties": false,
-    "required": [],
+    "required": [
+      "model"
+    ],
     "properties": {
+      "model": {
+        "type": "string",
+        "title": "Model",
+        "minLength": 1,
+        "x-optionSource": "model"
+      },
+      "reasoningEffort": {
+        "type": "string",
+        "title": "Reasoning",
+        "x-optionsFrom": {
+          "field": "model",
+          "attribute": "supportedReasoningEfforts",
+          "defaultAttribute": "defaultReasoningEffort"
+        }
+      },
       "envVars": {
         "type": "object",
         "title": "Environment Variables",
@@ -18,6 +38,8 @@
   },
   "uiSchema": {
     "order": [
+      "model",
+      "reasoningEffort",
       "envVars"
     ],
     "layout": {
@@ -27,6 +49,48 @@
     },
     "visibility": [],
     "localization": {
+      "model": {
+        "label": "Model",
+        "hint": "Models available to this computer's Antigravity login. AGY configured default lets Antigravity choose. You can also type a model ID."
+      },
+      "reasoningEffort": {
+        "label": "Reasoning",
+        "hint": "Available values depend on the selected model.",
+        "choices": {
+          "off": {
+            "label": "No reasoning",
+            "description": "Answers directly, without a thinking phase"
+          },
+          "minimal": {
+            "label": "Minimal",
+            "description": "Very light reasoning for the fastest responses"
+          },
+          "low": {
+            "label": "Low",
+            "description": "Fast responses with lighter reasoning"
+          },
+          "medium": {
+            "label": "Medium",
+            "description": "Balances speed and reasoning depth for everyday tasks"
+          },
+          "high": {
+            "label": "High",
+            "description": "Greater reasoning depth for complex problems"
+          },
+          "xhigh": {
+            "label": "Extra high",
+            "description": "Extra high reasoning depth for complex problems"
+          },
+          "max": {
+            "label": "Max",
+            "description": "Maximum reasoning depth for the hardest problems"
+          },
+          "ultra": {
+            "label": "Ultra",
+            "description": "Maximum reasoning with automatic task delegation"
+          }
+        }
+      },
       "envVars": {
         "label": "Environment Variables",
         "hint": "These will be injected into the runtime command environment."
@@ -40,8 +104,19 @@
       "/hostUserState"
     ]
   },
-  "optionSources": {},
+  "optionSources": {
+    "model": {
+      "protocolVersion": 1,
+      "runtimeId": "antigravity",
+      "schemaVersion": "antigravity.edit.v1",
+      "sourceId": "model",
+      "kind": "select",
+      "pointer": "/model"
+    }
+  },
   "values": {
+    "model": "default",
+    "reasoningEffort": "",
     "envVars": {
       "EXAMPLE_FLAG": "1"
     }

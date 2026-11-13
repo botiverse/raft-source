@@ -44,6 +44,8 @@ export interface ServerInfoRequest {
   limit?: number;
   /** Channels only: restrict to joined channels. */
   joined?: boolean;
+  /** Channels only: list archived (read-only) channels instead of live ones. */
+  archived?: boolean;
   /** Sections only: keep rows whose visible text contains this (case-insensitive), like the CLI's `--query`. */
   query?: string;
 }
@@ -53,6 +55,7 @@ export const serverInfoRequestSchema = lazySchema("serverInfoRequestSchema", () 
   offset: z.number().optional().describe("Section paging: rows to skip."),
   limit: z.number().optional().describe("Section paging: rows per page (default 50)."),
   joined: z.boolean().optional().describe("channels view only: only channels you have joined."),
+  archived: z.boolean().optional().describe("channels view only: list archived channels (read-only: their history can be read, nothing new can be posted) instead of live ones."),
   query: z.string().optional().describe("channels / agents / humans view only: keep rows whose name, description, or other visible text contains this (case-insensitive)."),
 })));
 
@@ -76,14 +79,16 @@ function nextPageArgs(section: ServerInfoSection, request: ServerInfoRequest, of
   if (nextOffset >= total) return null;
   const query = request.query?.trim() || undefined;
   const joined = section === "channels" && request.joined === true ? true : undefined;
-  return { view: section, offset: nextOffset, limit, ...(query === undefined ? {} : { query }), ...(joined ? { joined } : {}) };
+  const archived = section === "channels" && request.archived === true ? true : undefined;
+  return { view: section, offset: nextOffset, limit, ...(query === undefined ? {} : { query }), ...(joined ? { joined } : {}), ...(archived ? { archived } : {}) };
 }
 
 /** The CLI's `--query` match: any string field contains the needle, case-insensitively. */
 function includesQuery(row: object, query: string | undefined): boolean {
   const needle = query?.trim().toLowerCase();
   if (!needle) return true;
-  return Object.values(row).some((value) => typeof value === "string" && value.toLowerCase().includes(needle));
+  // A channel's last-post time is a timestamp, not text to match ("10" would match every date).
+  return Object.entries(row).some(([key, value]) => key !== "lastPostAt" && typeof value === "string" && value.toLowerCase().includes(needle));
 }
 
 export async function serverInfo(
@@ -93,10 +98,21 @@ export async function serverInfo(
 ): Promise<RaftOutcome<RaftServerInfo, "info">> {
   const invalid = validateOpRequest(serverInfoRequestSchema, request); if (invalid) return invalid;
   const style: RaftHintStyle = options.hints ?? "cli";
-  const result = await client.server.info();
+  const view = request.view ?? "summary";
+  const query = request.query?.trim() || undefined;
+  // Archived channels come back only when asked for: `--archived` lists them,
+  // and a `--query` search covers them too (so a name is never "not found"
+  // just because the channel was archived).
+  const wantsArchived = view === "channels" && (request.archived === true || query !== undefined);
+  const result = await client.server.info(wantsArchived ? { archived: "include" } : undefined);
   if (!result.ok) return failureFromClientResult(result);
   const server = result.data;
-  const view = request.view ?? "summary";
+  if (view === "channels" && request.archived === true && server.archivedChannelCount === undefined) {
+    return failureOutcome(opError("UNAVAILABLE", {
+      message: "This Server does not list archived channels yet; read one by name (its history is still readable).",
+    }));
+  }
+  const archivedRows = (server.archivedChannels ?? []).map((c) => ({ ...c, archived: true as const }));
   if (view === "summary") {
     const next = hintStep("list_channels", RAFT_HINTS.serverInfo({ view: "channels" }), "The summary only counts; list a section to see names.", style);
     return { ok: true, state: "info", data: { view, server, page: null }, next, text: formatAgentServerSummary(server, style) };
@@ -106,8 +122,11 @@ export async function serverInfo(
   }
   const limit = Math.max(1, Math.trunc(request.limit ?? 50));
   const offset = Math.max(0, Math.trunc(request.offset ?? 0));
+  const channelRows = request.archived === true
+    ? archivedRows
+    : query !== undefined ? [...server.channels, ...archivedRows] : server.channels;
   const sectionRows: object[] = view === "channels"
-    ? server.channels.filter((c) => !request.joined || c.joined)
+    ? channelRows.filter((c) => !request.joined || c.joined)
     : view === "agents" ? server.agents : server.humans;
   const rows = sectionRows.filter((row) => includesQuery(row, request.query));
   const pageRows = rows.slice(offset, offset + limit);
@@ -120,8 +139,14 @@ export async function serverInfo(
     limit,
     nextCommand: nextHint ? formatHint(nextHint, style) : undefined,
   };
+  // The default listing leaves archived channels out; say how many, once (last page).
+  // Not with --joined: the count covers every visible archived channel, joined or not.
+  const archivedNotShown = view === "channels" && request.archived !== true && query === undefined && !request.joined
+    && (server.archivedChannelCount ?? 0) > 0
+    ? { count: server.archivedChannelCount ?? 0, listCommand: formatHint(RAFT_HINTS.serverInfo({ view: "channels", archived: true }), style) }
+    : undefined;
   const text = view === "channels"
-    ? formatAgentServerChannels(pageRows as never, page)
+    ? formatAgentServerChannels(pageRows as never, page, undefined, archivedNotShown)
     : view === "agents"
       ? formatAgentServerAgents(pageRows as never, page)
       : formatAgentServerHumans(pageRows as never, page);

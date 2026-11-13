@@ -84,3 +84,10 @@ test("RFC 071 §9: a terminal-failure pause shows the server's detail (until whe
     "运行时连续失败，自动唤醒已暂停——手动启动可解除",
   );
 });
+
+test("Claude root crash guidance is localized instead of collapsed to Offline", () => {
+  const detail = "Display wording changed without changing the diagnostic code";
+  const descriptor = getActivityTextDescriptor("offline", detail, "claude_root_privileges");
+  const intl = createIntl({ locale: "zh-CN", messages: mergedMessages("zh-cn") });
+  assert.match(formatActivityTextDescriptor(intl.formatMessage, descriptor), /非 root 用户/);
+});

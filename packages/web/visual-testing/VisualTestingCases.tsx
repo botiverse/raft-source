@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type { ComponentProps } from "react";
 
 import { en as EN_MESSAGES } from "../src/i18n/messages/en";
@@ -19,7 +19,6 @@ import {
   SegmentedControlItem,
   SegmentedControlLabel,
   Button,
-  Spinner,
   Textarea,
   TextareaCounter,
   Checkbox,
@@ -29,48 +28,56 @@ import {
   ListRowGroup,
 } from "@botiverse/raft-ui";
 import LoginPage from "../src/components/auth/LoginPage";
-import RegisterPage from "../src/components/auth/RegisterPage";
-import AccountIdentitySetupPage from "../src/components/auth/AccountIdentitySetupPage";
-import AgentDetailPanel from "../src/components/agent/AgentDetailPanel";
-import CreateAgentDialog from "../src/components/agent/CreateAgentDialog";
-import ChannelMembers from "../src/components/agent/ChannelMembers";
+import { AgentDetailPanel } from "../src/features/agent/AgentDetailPanel";
+import { CreateAgentDialog } from "../src/features/agent/CreateAgentDialog";
+import { ChannelMembers } from "../src/features/channel/ChannelMembers";
 import CreateChannelDialog from "../src/components/channel/CreateChannelDialog";
 import InviteHumanDialog from "../src/components/member/InviteHumanDialog";
-import EditChannelDialog from "../src/components/channel/EditChannelDialog";
 import ForwardComposerDialog from "../src/components/message/ForwardComposerDialog";
 import { AttachmentCommentsPanel } from "../src/components/message/AttachmentCommentsPanel";
-import Sidebar from "../src/components/layout/Sidebar";
+import { Sidebar } from "../src/features/sidebar/Sidebar";
+import NotificationTrigger from "../src/components/layout/NotificationTrigger";
+import type { NotificationEntry } from "../src/components/layout/useSystemNotifications";
 import MainLayout, { MobileTabBar } from "../src/components/layout/MainLayout";
-import ChatPanel from "../src/components/message/ChatPanel";
+import { ChatPanel } from "../src/features/channel/ChatPanel";
 import ChannelFilesPanel from "../src/components/message/ChannelFilesPanel";
 import MessageItem, { buildMentionMap } from "../src/components/message/MessageItem";
-import MessageInput from "../src/components/message/MessageInput";
+import { MessageInput } from "../src/features/composer/MessageInput";
 import ExternalIdentityDetailPanel from "../src/components/profile/ExternalIdentityDetailPanel";
 import NotificationActivationBanner from "../src/components/message/NotificationActivationBanner";
 import SelectModeToolbar from "../src/components/message/SelectModeToolbar";
-import MessageSearchPage from "../src/components/search/MessageSearchPage";
-import AttentionDot from "../src/components/ui/AttentionDot";
+import { MessageSearchPage } from "../src/features/search/MessageSearchPage";
 import AvatarListRow from "../src/components/ui/AvatarListRow";
 import AvatarSlot from "../src/components/ui/AvatarSlot";
 import FormField from "../src/components/ui/FormField";
 import MenuItem from "../src/components/ui/MenuItem";
-import ProgressBar from "../src/components/ui/ProgressBar";
-import SectionHeader from "../src/components/ui/SectionHeader";
-import SectionEyebrow from "../src/components/ui/SectionEyebrow";
 import { SelectionPopoverPanel } from "../src/components/ui/SelectionPopover";
 import { SkeletonRow } from "../src/components/ui/Skeleton";
 import SlugInput from "../src/components/ui/SlugInput";
-import StatusDot from "../src/components/ui/StatusDot";
 import SurfaceListItem from "../src/components/ui/SurfaceListItem";
 import InlineBadgeEditor from "../src/components/InlineBadgeEditor";
 import TasksPanel from "../src/components/task/TasksPanel";
 import FeedbackSdkTrial from "./FeedbackSdkTrial";
 import { VisualMessageRow } from "./VisualMessageRow";
+import SelectSharePreviewPrototype from "./SelectSharePreviewPrototype";
+import { FILE_VIEWER_CASE_IDS, FileViewerCase } from "./FileViewerCases";
+import { MESSAGE_CARD_CASE_IDS, MessageCardCase } from "./MessageCardCases";
+import { AGENT_READ_LINE_CASE_IDS, AgentReadLineCase } from "./AgentReadLineCases";
+import { ACTION_CARD_CASE_IDS, ActionCardCase } from "./ActionCardCases";
+import { ASSISTANT_OTTER_CASE_IDS, AssistantOtterCase } from "./AssistantOtterCases";
+import { EXTERNAL_AGENT_CREATE_CASE_IDS, ExternalAgentCreateCase } from "./ExternalAgentCreateCases";
+import { EXTERNAL_AGENT_PAGE_CASE_IDS, ExternalAgentPageCase } from "./ExternalAgentPageCases";
+import { AGENT_CONTEXT_VIEW_CASE_IDS, AgentContextViewCase } from "./AgentContextViewCases";
+import { AGENT_ACTIVITY_LOG_CASE_IDS, AgentActivityLogCase } from "./AgentActivityLogCases";
+import { ARTIFACT_FILTER_CASE_IDS, ArtifactFilterCase } from "./ArtifactFilterCases";
+import { COMPUTERS_RACK_CASE_PATH, ComputersRackCase, isComputersRackCase } from "./ComputersRackCases";
+import { isOpenInAppOfferCase, OPEN_IN_APP_OFFER_CASE_PATH, OpenInAppOfferCase } from "./OpenInAppOfferCases";
 import { STATUS_STYLES } from "../src/components/task/taskStatusUi";
-import SettingsPanel, { IntegrationsSection } from "../src/components/settings/SettingsPanel";
+import { SettingsPanel } from "../src/components/settings/SettingsPanel";
+import { IntegrationsSection } from "../src/features/apps/IntegrationsSection";
 import PaletteAuditPage from "../src/pages/PaletteAuditPage";
 import SavedPanel from "../src/components/saved/SavedPanel";
-import ThreadsInbox from "../src/components/thread/ThreadsInbox";
+import { ThreadsInbox } from "../src/features/thread/ThreadsInbox";
 import { useAuthStore } from "../src/store/authStore";
 import { useAgentStore } from "../src/store/agentStore";
 import { useChannelStore } from "../src/store/channelStore";
@@ -82,19 +89,25 @@ import { useMessageStore } from "../src/store/messageStore";
 import type { Message } from "../src/store/messageStore";
 import { useSavedStore } from "../src/store/savedStore";
 import {
+  getModelLabel,
   PROVIDER_CONNECTIONS_FEATURE_FLAG_KEY,
+  RUNTIME_ERROR_CODE_SENTENCES,
   SERVER_GUEST_FEATURE_FLAG_KEY,
 } from "@botiverse/raft-shared";
+import { useModelLabelCatalogStore } from "../src/store/modelLabelCatalogStore";
 import { setServerFeatureFlagForTests } from "../src/store/serverFeatureFlags";
 import { useServerStore } from "../src/store/serverStore";
 import { useSelectionStore } from "../src/store/selectionStore";
 import { useTaskStore } from "../src/store/taskStore";
 import type { Task } from "../src/store/taskStore";
+import { useThreadStore } from "../src/store/threadStore";
 import type { ThreadSummary } from "../src/store/threadStore";
 import fixtureData from "../../visual-testing/shared/fixtureData.json";
+import sharedCases from "../../visual-testing/shared/sharedCases.json";
 import savedMessagesFixture from "../../visual-testing/shared/savedMessagesFixture.json";
 import activityResultsFixture from "../../visual-testing/shared/activityResultsFixture.json";
 import tasksFixture from "../../visual-testing/shared/tasksFixture.json";
+import { homeChannelListFollowedThreads } from "./homeChannelList";
 
 const fxOwner = fixtureData.humans.owner;
 const fxDesigner = fixtureData.humans.designer;
@@ -154,7 +167,7 @@ type ComposerVisualCase = {
 
 type AuthVisualCase = {
   id: string;
-  mode: "login" | "register" | "profile-setup";
+  mode: "login";
 };
 
 const AUTH_CASES: Record<string, AuthVisualCase> = {
@@ -169,14 +182,6 @@ const AUTH_CASES: Record<string, AuthVisualCase> = {
   "auth.login.inputs.invalid": {
     id: "auth.login.inputs.invalid",
     mode: "login",
-  },
-  "components.auth.register.inputs": {
-    id: "components.auth.register.inputs",
-    mode: "register",
-  },
-  "screens.auth.profile-setup": {
-    id: "screens.auth.profile-setup",
-    mode: "profile-setup",
   },
 };
 
@@ -212,8 +217,10 @@ const COMPOSER_CASES: Record<string, ComposerVisualCase> = {
     visualCaseAttr: "components.thread.composer.member-suggestions",
     draft: "",
     placeholder: fxMessages.composerPlaceholder,
-    height: 320,
-    composerOffsetTop: 210,
+    // The suggestion list opens above the composer; the old 320px box with
+    // the composer 210px down cut the list's top section off. Leave room for
+    // the whole list and let the height follow the content.
+    composerOffsetTop: 250,
   },
   "components.thread.composer.channel-suggestions": {
     id: "components.thread.composer.channel-suggestions",
@@ -273,8 +280,6 @@ type CreateAgentVisualCase = {
   machineRuntimes: string[];
   /** Seed the name field so the inline validation error renders (error-state baseline). */
   prefilledName?: string;
-  /** Onboarding mode locks name + description to read-only (locked-state baseline). */
-  onboarding?: boolean;
   /** Render with nothing pre-filled: no name, no description. The empty state
    *  had no coverage — every existing case seeds values, so a field's empty
    *  rendering was never captured. */
@@ -312,6 +317,17 @@ type AgentDetailVisualCase = {
       that is the known-wrong reference, so this cell is expected to differ
       until both ends implement the rule. */
   machinesLoading?: boolean;
+  /** #proj-raft-computer:#48 (reconciler step 4b): the profile's status chip
+      for an agent whose provider credential is invalid, with Retry.
+        held-sign-in  held for another agent's rejected sign-in (credentialHold)
+        own-billing   its own BillingError (stored lastRuntimeError, live error)
+        member-view   held, seen by a member who may restart it but not see its
+                      details: plain Error + Retry */
+  credentialStatus?: "held-sign-in" | "own-billing" | "member-view";
+  /** #wg-rbac:#57: an agent in a coded runtime error (usage_limit), as a
+      member (no error text, the code's sentence) or a manager (the code's
+      sentence over the scrubbed detail) sees it. */
+  runtimeErrorView?: "member" | "manager";
 };
 
 /** How a fixture agent's machineKey becomes the store's machineId. "missing"
@@ -333,7 +349,7 @@ type DirectVisualCase = {
   id: string;
   kind:
     | "tokens"
-    | "ui-attention-dot"
+    | "ui-typography-specimen"
     | "ui-avatar-list-row"
     | "ui-badge"
     | "ui-button"
@@ -341,17 +357,12 @@ type DirectVisualCase = {
     | "ui-check-marker"
     | "ui-checkbox"
     | "ui-form-field"
-    | "ui-progress-bar"
-    | "ui-section-header"
-    | "ui-section-eyebrow"
     | "ui-select"
     | "ui-selection-popover"
     | "ui-menu-item"
     | "ui-segmented-control"
     | "ui-skeleton"
     | "ui-slug-input"
-    | "ui-spinner"
-    | "ui-status-dot"
     | "ui-surface-list-item"
     | "ui-textarea"
     | "navigation-tabbar"
@@ -363,6 +374,7 @@ type DirectVisualCase = {
     | "thread-message-deleted-human"
     | "thread-message-menu"
     | "thread-message-share-selection"
+    | "thread-message-share-preview"
     | "thread-message-rich"
     | "thread-message-long-inline-code"
     | "thread-message-md-link-ref"
@@ -372,6 +384,7 @@ type DirectVisualCase = {
     | "thread-message-md-wrap-adjacent"
     | "thread-message-md-wrap-status606"
     | "thread-message-md-wrap-task607"
+    | "thread-message-agent-read-line"
     | "thread-forward-modal"
     | "thread-comment-anchor"
     | "channel-members"
@@ -380,6 +393,7 @@ type DirectVisualCase = {
     | "saved-results"
     | "activity-results"
     | "tasks-panel"
+    | "tasks-toolbar-row"
     | "tasks-status-menu"
     | "external-identity-detail";
 };
@@ -388,6 +402,8 @@ type SettingsVisualCase = {
   id: string;
   tab?: "account" | "server" | "administration" | "billing" | "language-region" | "appearance" | "notifications" | "integrations";
   root?: boolean;
+  // Phone tab root rendered as the inline Sidebar at this route (default: settings).
+  rootRoute?: "settings" | "members" | "home";
   // full-height (task #388): render the whole Settings route at content height
   // (unclamped chrome) and capture it fullPage, pairing with the Android eager
   // full-height capture instead of the viewport-clipped scroll container.
@@ -408,16 +424,6 @@ const CREATE_AGENT_CASES: Record<string, CreateAgentVisualCase> = {
     runtime: "codex",
     machineRuntimes: ["codex", "claude"],
     prefilledName: "bad name!!",
-  },
-  // Onboarding variant baseline. NOTE: this is NOT a "locked input" baseline —
-  // onboarding renders a different layout ("Meet Cindy") that does not show the
-  // name/description fields at all, so `lockedFieldClass` on those two controls
-  // has no reachable trigger. Captured for what it actually is.
-  "components.members.create-agent.dialog-onboarding": {
-    id: "components.members.create-agent.dialog-onboarding",
-    runtime: "codex",
-    machineRuntimes: ["codex", "claude"],
-    onboarding: true,
   },
   // Empty state: no name, no description — the placeholder rendering of every
   // field, which no other case exercises.
@@ -512,8 +518,9 @@ const AGENT_DETAIL_CASES: Record<string, AgentDetailVisualCase> = {
   },
   /* Batch 2 (task #535 / #259 / #261), oracles fixed by artin on 2026-09-03:
        daemon-only    bare daemon (isComputer false): web version segment is exactly
-                      "daemon v0.65.0" next to the separate "Connected" span
-                      (machineRunLabel.ts picks daemonVersion for non-computers)
+                      "legacy v0.65.0" next to the separate "Connected" span
+                      (machineRunLabel.ts picks daemonVersion for non-computers;
+                      #7823 renamed the kind from "daemon" to "legacy")
        no-membership  serverRole omitted (no membership row): role chip hidden
        loading-state  machines not loaded yet: Computer row absent (甲) */
   "screens.members.agent-detail.profile.daemon-only": {
@@ -541,6 +548,46 @@ const AGENT_DETAIL_CASES: Record<string, AgentDetailVisualCase> = {
   "screens.members.agent-detail.workspace": {
     id: "screens.members.agent-detail.workspace",
     route: "members-agent-detail",
+  },
+  "components.members.agent-detail.status.credential-held-sign-in": {
+    id: "components.members.agent-detail.status.credential-held-sign-in",
+    credentialStatus: "held-sign-in",
+  },
+  "components.members.agent-detail.status.credential-held-sign-in.dark": {
+    id: "components.members.agent-detail.status.credential-held-sign-in.dark",
+    credentialStatus: "held-sign-in",
+  },
+  "components.members.agent-detail.status.credential-own-billing": {
+    id: "components.members.agent-detail.status.credential-own-billing",
+    credentialStatus: "own-billing",
+  },
+  "components.members.agent-detail.status.credential-own-billing.dark": {
+    id: "components.members.agent-detail.status.credential-own-billing.dark",
+    credentialStatus: "own-billing",
+  },
+  "components.members.agent-detail.status.runtime-error-code-member": {
+    id: "components.members.agent-detail.status.runtime-error-code-member",
+    runtimeErrorView: "member",
+  },
+  "components.members.agent-detail.status.runtime-error-code-member.dark": {
+    id: "components.members.agent-detail.status.runtime-error-code-member.dark",
+    runtimeErrorView: "member",
+  },
+  "components.members.agent-detail.status.runtime-error-code-manager": {
+    id: "components.members.agent-detail.status.runtime-error-code-manager",
+    runtimeErrorView: "manager",
+  },
+  "components.members.agent-detail.status.runtime-error-code-manager.dark": {
+    id: "components.members.agent-detail.status.runtime-error-code-manager.dark",
+    runtimeErrorView: "manager",
+  },
+  "components.members.agent-detail.status.credential-member-view": {
+    id: "components.members.agent-detail.status.credential-member-view",
+    credentialStatus: "member-view",
+  },
+  "components.members.agent-detail.status.credential-member-view.dark": {
+    id: "components.members.agent-detail.status.credential-member-view.dark",
+    credentialStatus: "member-view",
   },
   "screens.members.agent-detail.apps": {
     id: "screens.members.agent-detail.apps",
@@ -599,20 +646,19 @@ const HOME_LOADING_CASES: Record<string, HomeLoadingVisualCase> = {
   },
 };
 
-type LoginSigningVisualCase = {
+// screens.home.channel-list (+ .dark): the whole phone Home root — the
+// Sidebar's mobileInline top bar (workspace pill + bell), Saved, Pinned, Joint
+// Channels, Channels and Direct Messages, over the MobileTabBar — from the
+// `homeChannelList` block of the shared fixtureData.json, which Android reads
+// through the generated VisualFixtureData.HomeChannelList. The dark case
+// is the same view under `?theme=dark` (its manifest variant prop).
+type HomeChannelListVisualCase = {
   id: string;
 };
 
-// screens.auth.login.signing — the in-flight sign-in state (task #372): the
-// user has filled email + password and clicked Sign In, and the auth request
-// is still pending. The auth store is primed to loading:true so the submit
-// button renders "Signing in…" at disabled:opacity-50; the inputs stay
-// enabled with normal white styling because React never disables them during
-// login. The manifest's fill interactions type the email/password values.
-const LOGIN_SIGNING_CASES: Record<string, LoginSigningVisualCase> = {
-  "screens.auth.login.signing": {
-    id: "screens.auth.login.signing",
-  },
+const HOME_CHANNEL_LIST_CASES: Record<string, HomeChannelListVisualCase> = {
+  "screens.home.channel-list": { id: "screens.home.channel-list" },
+  "screens.home.channel-list.dark": { id: "screens.home.channel-list.dark" },
 };
 
 const DIRECT_CASES: Record<string, DirectVisualCase> = {
@@ -648,33 +694,17 @@ const DIRECT_CASES: Record<string, DirectVisualCase> = {
     id: "components.ui.check-marker.states",
     kind: "ui-check-marker",
   },
-  "components.ui.attention-dot.states": {
-    id: "components.ui.attention-dot.states",
-    kind: "ui-attention-dot",
-  },
-  "components.ui.status-dot.states": {
-    id: "components.ui.status-dot.states",
-    kind: "ui-status-dot",
-  },
-  "components.ui.progress-bar.states": {
-    id: "components.ui.progress-bar.states",
-    kind: "ui-progress-bar",
+  "components.ui.typography.specimen": {
+    id: "components.ui.typography.specimen",
+    kind: "ui-typography-specimen",
   },
   "components.ui.skeleton.states": {
     id: "components.ui.skeleton.states",
     kind: "ui-skeleton",
   },
-  "components.ui.spinner.states": {
-    id: "components.ui.spinner.states",
-    kind: "ui-spinner",
-  },
   "components.ui.slug-input.states": {
     id: "components.ui.slug-input.states",
     kind: "ui-slug-input",
-  },
-  "components.ui.section-eyebrow.states": {
-    id: "components.ui.section-eyebrow.states",
-    kind: "ui-section-eyebrow",
   },
   "components.ui.selection-popover.states": {
     id: "components.ui.selection-popover.states",
@@ -691,10 +721,6 @@ const DIRECT_CASES: Record<string, DirectVisualCase> = {
   "components.ui.badge.states": {
     id: "components.ui.badge.states",
     kind: "ui-badge",
-  },
-  "components.ui.section-header.states": {
-    id: "components.ui.section-header.states",
-    kind: "ui-section-header",
   },
   "components.ui.surface-list-item.states": {
     id: "components.ui.surface-list-item.states",
@@ -744,6 +770,14 @@ const DIRECT_CASES: Record<string, DirectVisualCase> = {
     id: "components.thread.message-share.selection",
     kind: "thread-message-share-selection",
   },
+  "components.thread.message-share.preview.desktop": {
+    id: "components.thread.message-share.preview.desktop",
+    kind: "thread-message-share-preview",
+  },
+  "components.thread.message-share.preview.mobile": {
+    id: "components.thread.message-share.preview.mobile",
+    kind: "thread-message-share-preview",
+  },
   "components.thread.message-row.rich-content": {
     id: "components.thread.message-row.rich-content",
     kind: "thread-message-rich",
@@ -780,6 +814,7 @@ const DIRECT_CASES: Record<string, DirectVisualCase> = {
     id: "components.thread.message-row.md-wrap-task607",
     kind: "thread-message-md-wrap-task607",
   },
+  ...Object.fromEntries(AGENT_READ_LINE_CASE_IDS.map((id) => [id, { id, kind: "thread-message-agent-read-line" as const }])),
   "components.thread.forward-modal": {
     id: "components.thread.forward-modal",
     kind: "thread-forward-modal",
@@ -824,10 +859,20 @@ const DIRECT_CASES: Record<string, DirectVisualCase> = {
     id: "components.tasks.status-menu",
     kind: "tasks-status-menu",
   },
+  "components.tasks.toolbar-row.desktop": {
+    id: "components.tasks.toolbar-row.desktop",
+    kind: "tasks-toolbar-row",
+  },
+  "components.tasks.toolbar-row.mid": {
+    id: "components.tasks.toolbar-row.mid",
+    kind: "tasks-toolbar-row",
+  },
 };
 
 const SETTINGS_CASES: Record<string, SettingsVisualCase> = {
   "components.settings.root.page": { id: "components.settings.root.page", root: true },
+  "components.members.root.page": { id: "components.members.root.page", root: true, rootRoute: "members" },
+  "components.home.root.page": { id: "components.home.root.page", root: true, rootRoute: "home" },
   "components.settings.account.page": { id: "components.settings.account.page", tab: "account" },
   "components.settings.account.error-state": { id: "components.settings.account.error-state", tab: "account" },
   "components.settings.server.profile": { id: "components.settings.server.profile", tab: "server" },
@@ -838,21 +883,9 @@ const SETTINGS_CASES: Record<string, SettingsVisualCase> = {
   "screens.settings.server-danger-modal": { id: "screens.settings.server-danger-modal", tab: "server" },
 };
 
-// Cases may still be addressed as "<base-id>.elegant": the capture harness pairs
-// registers by id. The suffix no longer selects anything (the app has one
-// visual family) and is stripped so the case dispatches to its base view.
-const ELEGANT_CASE_SUFFIX = ".elegant";
-
-function requestedRawCaseId(): string {
+function requestedCaseId(): string {
   const params = new URLSearchParams(window.location.search);
   return params.get("case") || "components.thread.composer.empty";
-}
-
-function requestedCaseId(): string {
-  const raw = requestedRawCaseId();
-  return raw.endsWith(ELEGANT_CASE_SUFFIX)
-    ? raw.slice(0, -ELEGANT_CASE_SUFFIX.length)
-    : raw;
 }
 
 // The capture's mode (`?theme=dark`, light otherwise), applied at the app root
@@ -861,6 +894,15 @@ function requestedCaseId(): string {
 export function requestedMode(): "light" | "dark" {
   const params = new URLSearchParams(window.location.search);
   return params.get("theme") === "dark" ? "dark" : "light";
+}
+
+// The language of the case's content: the manifest's `locale`, else the
+// fixture's. Not the UI language (that follows the case's own `?lang=`).
+export function requestedContentLang(): string {
+  const id = new URLSearchParams(window.location.search).get("case");
+  const visualCase = (sharedCases.cases as Array<{ id: string; locale?: string }>)
+    .find((item) => item.id === id);
+  return visualCase?.locale || fixtureData.locale.language;
 }
 
 function primeVisualStores(caseConfig: ComposerVisualCase) {
@@ -944,7 +986,6 @@ function primeVisualStores(caseConfig: ComposerVisualCase) {
     user: {
       id: fxOwner.id,
       email: fxOwner.email,
-      gravatarHash: "",
       name: fxOwner.name,
       displayName: fxOwner.displayName,
       description: null,
@@ -979,10 +1020,9 @@ function primeVisualStores(caseConfig: ComposerVisualCase) {
     },
     members: [
       {
-        userId: fxOwner.memberId,
+        userId: fxOwner.id,
         serverId: fxServer.id,
         email: fxOwner.email,
-        gravatarHash: "",
         name: fxOwner.name,
         displayName: fxOwner.displayName,
         description: "Owner",
@@ -1064,7 +1104,6 @@ function primeCreateAgentStores(caseConfig: CreateAgentVisualCase) {
     user: {
       id: fxOwner.id,
       email: fxOwner.email,
-      gravatarHash: "",
       name: fxOwner.name,
       displayName: fxOwner.displayName,
       description: null,
@@ -1188,7 +1227,6 @@ function primeAgentDetailStores(caseId = "") {
   const visualUser = {
     id: fxOwner.id,
     email: fxOwner.email,
-    gravatarHash: "",
     name: fxOwner.name,
     displayName: fxOwner.displayName,
     description: null,
@@ -1254,7 +1292,6 @@ function primeAgentDetailStores(caseId = "") {
       name: visualUser.name,
       displayName: visualUser.displayName,
       avatarUrl: null,
-      gravatarHash: "",
     },
     createdAgents: [
       {
@@ -1269,6 +1306,35 @@ function primeAgentDetailStores(caseId = "") {
     deletedAt: null,
     createdAt: fxTimes.entityCreatedAtIso,
   };
+  // The Model row reads the server's shared model-label catalog first; without
+  // it the label waits on the async runtime-models request and a capture that
+  // lands mid-flight shows "Loading…" (screens.members.agent-detail.profile in
+  // mobile run 40999051412). Seed the catalog the server would serve for the
+  // agent's machine so the label is there on the first render. Only that case:
+  // loading-state must stay loading, and runtime-connection (builtin) is a
+  // runtime the server never sends a catalog for.
+  if (caseId === "screens.members.agent-detail.profile" && agentMachineId) {
+    useModelLabelCatalogStore.setState((state) => ({
+      byServer: {
+        ...state.byServer,
+        [fxServer.id]: {
+          fetchedAt: Date.now(),
+          catalog: {
+            machines: {
+              [agentMachineId]: {
+                runtimes: {
+                  [visualAgent.runtime]: {
+                    models: [{ id: visualAgent.model, label: getModelLabel(visualAgent.runtime, visualAgent.model) }],
+                    updatedAt: fxTimes.entityCreatedAtIso,
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+    }));
+  }
   useAuthStore.setState({
     initialized: true,
     loading: false,
@@ -1307,19 +1373,7 @@ function primeAgentDetailStores(caseId = "") {
     },
     members: [
       {
-        userId: visualUser.id,
-        serverId: fxServer.id,
-        name: visualUser.name,
-        displayName: visualUser.displayName,
-        description: null,
-        email: visualUser.email,
-        role: "owner",
-        avatarUrl: null,
-        gravatarHash: "",
-        joinedAt: fxTimes.memberJoinedAtIso,
-      },
-      {
-        userId: fxOwner.memberId,
+        userId: fxOwner.id,
         serverId: fxServer.id,
         name: fxOwner.name,
         displayName: fxOwner.displayName,
@@ -1327,7 +1381,6 @@ function primeAgentDetailStores(caseId = "") {
         email: fxOwner.email,
         role: fxOwner.role as "owner",
         avatarUrl: null,
-        gravatarHash: "",
         joinedAt: fxTimes.memberJoinedAtIso,
       },
     ],
@@ -1346,6 +1399,7 @@ function primeAgentDetailStores(caseId = "") {
       hiddenDmIds: [],
       channelPanelTabOrder: [],
       agentPanelTabOrder: [],
+      channelSideLayout: null,
       customSections: [],
       sectionOrder: ["system:pinned", "system:joint", "system:channels", "system:dms"],
       sectionPlacements: [],
@@ -1505,6 +1559,8 @@ function primeAgentDetailStores(caseId = "") {
       ],
     },
   });
+  primeCredentialStatus(AGENT_DETAIL_CASES[caseId]?.credentialStatus, visualAgent.id);
+  primeRuntimeErrorView(AGENT_DETAIL_CASES[caseId]?.runtimeErrorView, visualAgent.id);
   useChannelStore.setState({
     channels: [],
     dmChannels: [
@@ -1524,6 +1580,69 @@ function primeAgentDetailStores(caseId = "") {
   });
 }
 
+const CREDENTIAL_HELD_DETAIL = "Codex CLI is not logged in on this computer. Sign in again, then restart the agent. (Reported by another agent on the same sign-in.)";
+const CREDENTIAL_BILLING_DETAIL = "Codex CLI reported that the provider's billing or credit balance is exhausted. Raft stopped retrying because retries cannot succeed until the balance is restored. Messages that were waiting are kept and will be delivered when the agent starts again. Add credits or switch this agent to another model or provider, then restart the agent.";
+
+/** #proj-raft-computer:#48: seed the invalid-credential states over the primed agent. */
+function primeCredentialStatus(state: AgentDetailVisualCase["credentialStatus"], agentId: string) {
+  if (!state) return;
+  const held = state !== "own-billing";
+  useAgentStore.setState((store) => ({
+    agents: store.agents.map((agent) => agent.id !== agentId ? agent : {
+      ...agent,
+      lastRuntimeError: held ? null : {
+        message: CREDENTIAL_BILLING_DETAIL,
+        at: fxTimes.recentActivityAtIso,
+        actionRequired: true,
+        errorClass: "BillingError" as const,
+        errorReason: "billing_exhausted" as const,
+        fingerprint: "0123456789abcdef",
+        reasonProvenance: "runtime_error_event" as const,
+      },
+      // A member who did not create it: may restart it, may not see its details.
+      ...(state === "member-view" ? { creatorId: fxDesigner.id } : {}),
+    }),
+    agentActivities: {
+      ...store.agentActivities,
+      [agentId]: held
+        ? { activity: "online" as const, activityDetail: CREDENTIAL_HELD_DETAIL, detailKind: "idle" as const, credentialHold: { reason: "user_reauth" as const } }
+        : { activity: "error" as const, activityDetail: CREDENTIAL_BILLING_DETAIL, detailKind: "runtime_error" as const },
+    },
+  }));
+  if (state === "member-view") {
+    useServerStore.setState((store) => ({
+      servers: store.servers.map((server) => ({ ...server, role: "member" as const })),
+      current: store.current ? { ...store.current, role: "member" as const } : store.current,
+    }));
+  }
+}
+
+const RUNTIME_ERROR_SCRUBBED_DETAIL = "429 Too Many Requests: You have hit your usage limit for this billing period (account [redacted]). Try again after the limit resets.";
+
+/** #wg-rbac:#57: seed a usage_limit runtime error the way the server sends it to each viewer. */
+function primeRuntimeErrorView(view: AgentDetailVisualCase["runtimeErrorView"], agentId: string) {
+  if (!view) return;
+  // A member gets the code's fixed English sentence in place of the text; a manager the scrubbed text.
+  const text = view === "member" ? RUNTIME_ERROR_CODE_SENTENCES.usage_limit : RUNTIME_ERROR_SCRUBBED_DETAIL;
+  useAgentStore.setState((store) => ({
+    agents: store.agents.map((agent) => agent.id !== agentId ? agent : {
+      ...agent,
+      lastRuntimeError: { message: text, code: "usage_limit" as const, at: fxTimes.recentActivityAtIso, actionRequired: false },
+      ...(view === "member" ? { creatorId: fxDesigner.id } : {}),
+    }),
+    agentActivities: {
+      ...store.agentActivities,
+      [agentId]: { activity: "error" as const, activityDetail: text, detailKind: "runtime_error" as const, errorCode: "usage_limit" as const },
+    },
+  }));
+  if (view === "member") {
+    useServerStore.setState((store) => ({
+      servers: store.servers.map((server) => ({ ...server, role: "member" as const })),
+      current: store.current ? { ...store.current, role: "member" as const } : store.current,
+    }));
+  }
+}
+
 // screens.home.loading (task #372): reuse the signed-in user/server/session
 // fixtures from primeAgentDetailStores, then rewind the data stores to the
 // moment right after login succeeds — channel/DM/agent/computer lists empty
@@ -1537,6 +1656,7 @@ function primeHomeLoadingStores() {
     dmChannels: [],
     channelActivity: {},
     loading: true,
+    dmsLoading: true,
   });
   useAgentStore.setState({
     agents: [],
@@ -1549,16 +1669,114 @@ function primeHomeLoadingStores() {
   });
 }
 
-// screens.auth.login.signing (task #372): pin the auth store to the moment
-// right after the user clicks Sign In — signed out (user:null) with the
-// login request still in flight (loading:true). LoginPage reads loading from
-// the store, so priming it is enough to render the disabled "Signing in…"
-// submit button; no API stubs need delaying because login() is never called.
-function primeLoginSigningStores() {
-  useAuthStore.setState({
-    initialized: true,
-    loading: true,
-    user: null,
+// screens.home.channel-list (+ .dark): seed exactly the rows of
+// fixtureData.json `homeChannelList` — one server (so the pill carries no
+// other-server dot), no activity unread (no Activity tab dot), no live agent
+// activity bar, and only the fixture's channels / DMs / agents. The playwright
+// spec answers the mount-time loads (inbox, saved, followed threads, unread
+// summary) with the same data.
+function primeHomeChannelListStores() {
+  primeDirectVisualStores();
+  const fixture = fixtureData.homeChannelList;
+  const server = {
+    id: fxServer.id,
+    name: fixture.serverName,
+    avatarUrl: null,
+    slug: fxServer.slug,
+    ownerId: fxOwner.id,
+    onboardingAgentId: null,
+    hideHumansFromMembers: false,
+    plan: "free" as const,
+    planDowngradedAt: null,
+    role: "owner" as const,
+    createdAt: fxTimes.entityCreatedAtIso,
+  };
+  const current = useServerStore.getState();
+  useServerStore.setState({
+    current: server,
+    servers: [server],
+    serverUnreadCounts: {},
+    sidebarOrder: {
+      ...current.sidebarOrder,
+      pinned: fixture.pinnedChannelIds.map((id) => ({ kind: "channel" as const, id })),
+    },
+    loading: false,
+  });
+  useChannelStore.setState({
+    channels: fixture.channels.map((channel) => ({
+      id: channel.id,
+      serverId: fxServer.id,
+      name: channel.name,
+      description: null,
+      type: channel.type as Channel["type"],
+      createdAt: fxTimes.entityCreatedAtIso,
+      joined: true,
+      activityMuted: channel.muted,
+      activityMuteSupported: true,
+    })),
+    dmChannels: fixture.directMessages.map((dm) => ({
+      id: dm.id,
+      serverId: fxServer.id,
+      name: dm.id,
+      description: null,
+      type: "dm" as const,
+      createdAt: fxTimes.entityCreatedAtIso,
+      joined: true,
+      peerType: dm.peerType as "agent" | "user",
+      peerId: dm.peerId,
+      peerName: dm.name,
+      peerDisplayName: dm.name,
+    })),
+    channelActivity: {},
+    loading: false,
+    dmsLoading: false,
+  });
+  const agentDms = fixture.directMessages.filter((dm) => dm.peerType === "agent");
+  useAgentStore.setState({
+    agents: agentDms.map((dm) => ({
+      ...visualAgents[0],
+      id: dm.peerId,
+      name: dm.name,
+      displayName: dm.name,
+      avatarUrl: null,
+      description: null,
+      runtime: dm.runtime ?? "",
+      sessionId: `session-${dm.peerId}`,
+    })),
+    agentActivities: Object.fromEntries(agentDms.map((dm) => [
+      dm.peerId,
+      { activity: dm.activity, activityDetail: dm.activityDetail ?? "", detailKind: "other" },
+    ])) as never,
+    loading: false,
+  });
+  const conversations = [...fixture.channels, ...fixture.directMessages];
+  useMessageStore.setState({
+    currentChannelId: null,
+    currentUserId: fxOwner.id,
+    unreadCounts: Object.fromEntries(conversations.filter((item) => item.unread > 0).map((item) => [item.id, item.unread])),
+    mentionFlags: Object.fromEntries(fixture.channels.filter((channel) => channel.mention).map((channel) => [channel.id, true])),
+    newFlags: {},
+    drafts: Object.fromEntries(fixture.channels.filter((channel) => channel.draft).map((channel) => [channel.id, "Draft for the roadmap review"])),
+    messages: [],
+    loading: false,
+  });
+  useThreadStore.setState({
+    followedThreads: homeChannelListFollowedThreads(
+      fixture.channels,
+      fxOwner.id,
+      fxTimes.entityCreatedAtIso,
+      fxTimes.recentActivityAtIso,
+    ) as never,
+  });
+  useSavedStore.setState({ total: fixture.savedTotal });
+  // No computers: the fixture computers' attention states would light the More
+  // tab dot and the Bell's pixel, which Android's Home has no source for here.
+  useMachineStore.setState({ machines: [], machineWorkspaces: {}, selectedMachineId: null });
+  useInboxStore.setState({
+    items: [],
+    hasMore: false,
+    totalCount: 0,
+    totalUnreadCount: fixture.activityUnreadCount,
   });
 }
 
@@ -1566,7 +1784,6 @@ function primeCreateChannelStores() {
   const visualUser = {
     id: fxOwner.id,
     email: fxOwner.email,
-    gravatarHash: "",
     name: fxOwner.name,
     displayName: fxOwner.displayName,
     description: null,
@@ -1613,7 +1830,6 @@ function primeCreateChannelStores() {
         email: visualUser.email,
         role: "owner",
         avatarUrl: null,
-        gravatarHash: "",
         joinedAt: fxTimes.memberJoinedAtIso,
       },
       {
@@ -1625,7 +1841,6 @@ function primeCreateChannelStores() {
         email: fxDesigner.email,
         role: "member",
         avatarUrl: null,
-        gravatarHash: "",
         joinedAt: fxTimes.memberJoinedAtIso,
       },
     ],
@@ -1658,7 +1873,6 @@ function primeCreateChannelStores() {
           name: visualUser.name,
           displayName: visualUser.displayName,
           avatarUrl: null,
-          gravatarHash: "",
         },
         createdAgents: [],
         deletedAt: null,
@@ -1689,7 +1903,6 @@ function primeCreateChannelStores() {
           name: visualUser.name,
           displayName: visualUser.displayName,
           avatarUrl: null,
-          gravatarHash: "",
         },
         createdAgents: [],
         deletedAt: null,
@@ -1717,7 +1930,6 @@ function primeCreateChannelStores() {
 const visualUser = {
   id: fxOwner.id,
   email: fxOwner.email,
-  gravatarHash: "",
   name: fxOwner.name,
   displayName: fxOwner.displayName,
   description: null,
@@ -1762,7 +1974,6 @@ export const visualAgents = [
       name: visualUser.name,
       displayName: visualUser.displayName,
       avatarUrl: null,
-      gravatarHash: "",
     },
     createdAgents: [],
     deletedAt: null,
@@ -1793,7 +2004,6 @@ export const visualAgents = [
       name: visualUser.name,
       displayName: visualUser.displayName,
       avatarUrl: null,
-      gravatarHash: "",
     },
     createdAgents: [],
     deletedAt: null,
@@ -1843,7 +2053,6 @@ const visualMembers = [
     userId: visualUser.id,
     serverId: fxServer.id,
     email: visualUser.email,
-    gravatarHash: "",
     name: visualUser.name,
     displayName: visualUser.displayName,
     description: "Owner",
@@ -1855,7 +2064,6 @@ const visualMembers = [
     userId: fxDesigner.id,
     serverId: fxServer.id,
     email: fxDesigner.email,
-    gravatarHash: "",
     name: fxDesigner.name,
     displayName: fxDesigner.displayName,
     description: fxDesigner.description,
@@ -1918,6 +2126,7 @@ function primeDirectVisualStores(caseId?: string) {
     ],
     dmChannels: [],
     loading: false,
+    dmsLoading: false,
   });
   useAgentStore.setState({
     agents: visualAgents,
@@ -1944,8 +2153,6 @@ function primeDirectVisualStores(caseId?: string) {
     loading: false,
     selectedMachineId: VISUAL_MACHINE_ID,
     showAddMachine: false,
-    pendingApiKey: null,
-    pendingMachineId: null,
     machineWorkspaces: {
       [VISUAL_MACHINE_ID]: [
         {
@@ -2022,10 +2229,13 @@ function primeDirectVisualStores(caseId?: string) {
 
 function primeNavigationVisualStores() {
   primeDirectVisualStores();
+  // The shared fixture's server (fixtureData.json `server`): the Android
+  // provider names it the same, so "On {server}" and other server labels
+  // compare like for like.
   useServerStore.setState({
     current: {
       id: fxServer.id,
-      name: "Raft Design",
+      name: fxServer.name,
       avatarUrl: null,
       slug: fxServer.slug,
       ownerId: fxOwner.id,
@@ -2039,7 +2249,7 @@ function primeNavigationVisualStores() {
     servers: [
       {
         id: fxServer.id,
-        name: "Raft Design",
+        name: fxServer.name,
         avatarUrl: null,
         slug: fxServer.slug,
         ownerId: fxOwner.id,
@@ -2120,6 +2330,11 @@ function useVisualRoute(path: string, caseId: string, extraParams?: Record<strin
   return window.location.pathname === path;
 }
 
+function settingsRootPath(caseConfig: SettingsVisualCase): string {
+  const route = caseConfig.rootRoute ?? "settings";
+  return route === "home" ? `/s/${fxServer.slug}` : `/s/${fxServer.slug}/${route}`;
+}
+
 function visualRoutePathForCase(caseId: string): { path: string; params?: Record<string, string> } | null {
   const agentDetail = AGENT_DETAIL_CASES[caseId];
   if (agentDetail?.route === "members-agent-detail") {
@@ -2127,9 +2342,11 @@ function visualRoutePathForCase(caseId: string): { path: string; params?: Record
     return { path: `/s/${fxServer.slug}/agent/${agentId}`, params: { agentTab: agentDetailTab(agentDetail) } };
   }
   if (agentDetail?.route === "members-human-detail") {
-    return { path: `/s/${fxServer.slug}/human/${fxOwner.memberId}` };
+    return { path: `/s/${fxServer.slug}/human/${fxOwner.id}` };
   }
-  if (HOME_LOADING_CASES[caseId]) {
+  if (isComputersRackCase(caseId)) return { path: COMPUTERS_RACK_CASE_PATH };
+  if (isOpenInAppOfferCase(caseId)) return { path: OPEN_IN_APP_OFFER_CASE_PATH };
+  if (HOME_LOADING_CASES[caseId] || HOME_CHANNEL_LIST_CASES[caseId]) {
     return { path: `/s/${fxServer.slug}` };
   }
   const direct = DIRECT_CASES[caseId];
@@ -2138,7 +2355,7 @@ function visualRoutePathForCase(caseId: string): { path: string; params?: Record
   }
   const settingsCase = SETTINGS_CASES[caseId];
   if (settingsCase?.root) {
-    return { path: `/s/${fxServer.slug}/settings` };
+    return { path: settingsRootPath(settingsCase) };
   }
   return null;
 }
@@ -2238,7 +2455,7 @@ function InviteHumanVisualCaseView({ caseConfig }: { caseConfig: InviteHumanVisu
   return (
     <main className="min-h-screen bg-layer-canvas p-0 font-display text-foreground">
       <div data-visual-case={caseConfig.id} style={{ width: 390, height: 844, overflow: "hidden" }}>
-        <InviteHumanDialog onClose={noop} />
+        <InviteHumanDialog onClose={noop} surface="sidebar" />
       </div>
     </main>
   );
@@ -2250,6 +2467,17 @@ export default function VisualTestingCases() {
   if (caseId === "screens.feedback-sdk.inbox.narrow") return <FeedbackSdkTrial narrow />;
   if (caseId === "screens.feedback-sdk.detail") return <FeedbackSdkTrial detail />;
   if (caseId === "screens.feedback-sdk.detail.narrow") return <FeedbackSdkTrial detail narrow />;
+  if ((FILE_VIEWER_CASE_IDS as readonly string[]).includes(caseId)) return <FileViewerCase caseId={caseId} />;
+  if ((MESSAGE_CARD_CASE_IDS as readonly string[]).includes(caseId)) return <MessageCardCase caseId={caseId} />;
+  if ((ACTION_CARD_CASE_IDS as readonly string[]).includes(caseId)) return <ActionCardCase caseId={caseId as (typeof ACTION_CARD_CASE_IDS)[number]} />;
+  if ((ASSISTANT_OTTER_CASE_IDS as readonly string[]).includes(caseId)) return <AssistantOtterCase caseId={caseId} />;
+  if ((EXTERNAL_AGENT_CREATE_CASE_IDS as readonly string[]).includes(caseId)) return <ExternalAgentCreateCase caseId={caseId} />;
+  if ((EXTERNAL_AGENT_PAGE_CASE_IDS as readonly string[]).includes(caseId)) return <ExternalAgentPageCase caseId={caseId} />;
+  if ((AGENT_CONTEXT_VIEW_CASE_IDS as readonly string[]).includes(caseId)) return <AgentContextViewCase caseId={caseId} />;
+  if ((AGENT_ACTIVITY_LOG_CASE_IDS as readonly string[]).includes(caseId)) return <AgentActivityLogCase caseId={caseId} />;
+  if ((ARTIFACT_FILTER_CASE_IDS as readonly string[]).includes(caseId)) return <ArtifactFilterCase caseId={caseId} />;
+  if (isComputersRackCase(caseId)) return <ComputersRackCase caseId={caseId} primeShell={primeNavigationVisualStores} />;
+  if (isOpenInAppOfferCase(caseId)) return <OpenInAppOfferCase caseId={caseId} primeShell={primeNavigationVisualStores} />;
 
   const authCase = AUTH_CASES[caseId];
   if (authCase) return <AuthVisualCaseView caseConfig={authCase} />;
@@ -2269,8 +2497,9 @@ export default function VisualTestingCases() {
   const homeLoadingCase = HOME_LOADING_CASES[caseId];
   if (homeLoadingCase) return <HomeLoadingRouteVisualCaseView caseConfig={homeLoadingCase} />;
 
-  const loginSigningCase = LOGIN_SIGNING_CASES[caseId];
-  if (loginSigningCase) return <LoginSigningVisualCaseView caseConfig={loginSigningCase} />;
+  const homeChannelListCase = HOME_CHANNEL_LIST_CASES[caseId];
+  if (homeChannelListCase) return <HomeChannelListVisualCaseView caseConfig={homeChannelListCase} />;
+
 
   const directCase = DIRECT_CASES[caseId];
   if (directCase) return <DirectVisualCaseView caseConfig={directCase} />;
@@ -2303,7 +2532,10 @@ function ComposerVisualCaseView({ caseConfig }: { caseConfig: ComposerVisualCase
         data-visual-case-id={caseConfig.id}
         style={{
           width: caseConfig.width || 342,
-          height: caseConfig.height || 100,
+          // Unset height follows the composer: a fixed 100px cut the two-line
+          // draft's bottom row, and after the As Task click scrolled the
+          // clipped box, its top border too.
+          height: caseConfig.height ?? "auto",
           overflow: "hidden",
           paddingTop: caseConfig.composerOffsetTop || 0,
           boxSizing: "border-box",
@@ -2315,26 +2547,17 @@ function ComposerVisualCaseView({ caseConfig }: { caseConfig: ComposerVisualCase
           showTaskButton
           placeholder={caseConfig.placeholder}
           activationBanner={caseConfig.activationPlacement === "mobile"
-            ? <NotificationActivationBanner placement="mobile" />
+            ? <NotificationActivationBanner placement="mobile" composerChannelId={VISUAL_CHANNEL_ID} />
             : undefined}
           {...(caseConfig.pendingMentionActionsAfterSend ? {} : { onSendOverride: asyncNoop })}
         />
         {caseConfig.activationPlacement === "desktop" ? (
-          <NotificationActivationBanner placement="desktop" />
+          <NotificationActivationBanner placement="desktop" composerChannelId={VISUAL_CHANNEL_ID} />
         ) : null}
       </div>
     </main>
   );
 }
-
-const PROFILE_SETUP_PREVIEW_USER = {
-  ...visualUser,
-  name: "pending_new_designer",
-  displayName: null,
-  profileSetupCompletedAt: null,
-  profileSetupSuggestedHandle: "new_designer",
-  profileSetupProvider: null,
-};
 
 function AuthVisualCaseView({ caseConfig }: { caseConfig: AuthVisualCase }) {
   useMemo(() => {
@@ -2347,16 +2570,7 @@ function AuthVisualCaseView({ caseConfig }: { caseConfig: AuthVisualCase }) {
   return (
     <main className="min-h-screen bg-layer-canvas p-0 font-display text-foreground">
       <div data-visual-case={caseConfig.id} style={{ width: 390, height: 844, overflow: "hidden" }}>
-        {caseConfig.mode === "register" ? (
-          <RegisterPage onSwitchToLogin={noop} />
-        ) : caseConfig.mode === "profile-setup" ? (
-          <AccountIdentitySetupPage
-            previewUser={PROFILE_SETUP_PREVIEW_USER}
-            onPreviewComplete={asyncNoop}
-          />
-        ) : (
-          <LoginPage onSwitchToRegister={noop} onForgotPassword={noop} />
-        )}
+        <LoginPage onSwitchToRegister={noop} onForgotPassword={noop} />
       </div>
     </main>
   );
@@ -2381,7 +2595,7 @@ function AgentDetailVisualCaseView({ caseConfig }: { caseConfig: AgentDetailVisu
 }
 
 function MembersHumanDetailRouteVisualCaseView({ caseConfig }: { caseConfig: AgentDetailVisualCase }) {
-  const ready = useVisualRoute(`/s/${fxServer.slug}/human/${fxOwner.memberId}`, caseConfig.id);
+  const ready = useVisualRoute(`/s/${fxServer.slug}/human/${fxOwner.id}`, caseConfig.id);
   if (!ready) return null;
 
   return (
@@ -2417,22 +2631,24 @@ function HomeLoadingRouteVisualCaseView({ caseConfig }: { caseConfig: HomeLoadin
   );
 }
 
-function LoginSigningVisualCaseView({ caseConfig }: { caseConfig: LoginSigningVisualCase }) {
-  useMemo(() => primeLoginSigningStores(), []);
+function HomeChannelListVisualCaseView({ caseConfig }: { caseConfig: HomeChannelListVisualCase }) {
+  useMemo(() => primeHomeChannelListStores(), []);
+  const ready = useVisualRoute(`/s/${fxServer.slug}`, caseConfig.id);
+  if (!ready) return null;
 
-  // App.tsx renders LoginPage directly (no route) for signed-out users inside
-  // the #root flex column, so mount it the same way. The wrapper is a flex
-  // column so AuthBrandShell's `flex-1` root stretches to the full 844px
-  // viewport and the sign-in card stays vertically centered like the real
-  // login screen. The email/password values come from the manifest's fill
-  // interactions; loading:true comes from primeLoginSigningStores.
+  // MainLayout's phone root without its route fetches: the Sidebar's
+  // mobileInline list fills the column and the MobileTabBar sits in flow at
+  // the bottom, as on a 390x844 phone.
   return (
     <main className="min-h-screen bg-layer-canvas p-0 font-display text-foreground">
       <div
         data-visual-case={caseConfig.id}
-        style={{ width: 390, height: 844, overflow: "hidden", display: "flex", flexDirection: "column" }}
+        style={{ width: 390, height: 844, overflow: "hidden", display: "flex", flexDirection: "column", background: "var(--layer-canvas)" }}
       >
-        <LoginPage onSwitchToRegister={noop} onForgotPassword={noop} />
+        <div className="flex min-h-0 flex-1">
+          <Sidebar mobileInline />
+        </div>
+        <MobileTabBar />
       </div>
     </main>
   );
@@ -2469,19 +2685,10 @@ function CreateAgentVisualCaseView({ caseConfig }: { caseConfig: CreateAgentVisu
   return (
     <main className="min-h-screen bg-layer-canvas p-0 font-display text-foreground">
       <div data-visual-case={caseConfig.id} data-visual-runtime={caseConfig.runtime}>
-        {/* `onboardingShell` is not optional in practice. Production never renders
-            `onboarding` without it: the real setup gate (ServerSetupProjectionGate)
-            and the setup preview page both pass "step", and the only other caller
-            feeds `onboarding` from a store flag nothing sets true. Omitting it here
-            produced a modal-wrapped shell with a close X no user can reach — and I
-            reported screenshots of that shape as if it were real
-            (@cindyz caught it, 2026-08-29). */}
         <CreateAgentDialog
           defaultMachineId={VISUAL_MACHINE_ID}
           prefilledName={caseConfig.empty ? "" : (caseConfig.prefilledName ?? "Product-QA-Bot")}
           prefilledDescription={caseConfig.empty ? "" : "Watches release screenshots and reports visual regressions before merge."}
-          onboarding={caseConfig.onboarding}
-          onboardingShell={caseConfig.onboarding ? "step" : undefined}
           onClose={noop}
         />
       </div>
@@ -2542,7 +2749,11 @@ const EXTERNAL_IDENTITY_PROFILE: ComponentProps<typeof ExternalIdentityDetailPan
 
 const SKELETON_LINE_WIDTHS = ["w-32", "w-20"];
 
-const STILL_SPINNER_STYLE = { animation: "none" };
+// raft-ui Skeleton pulses (animate-pulse), so an unfrozen capture lands on a
+// random opacity and the fill reads 243, 244 or 245 run to run. Hold it at
+// full opacity so the case measures only shape and fill.
+const STILL_SKELETON_CSS =
+  "[data-visual-case='components.ui.skeleton.states'] [data-slot='skeleton'] { animation: none; }";
 
 const SELECTION_POPOVER_OPTIONS = [
   { key: "design", checked: true, label: "design", onClick: noop, reserveLeadingSlot: true },
@@ -2570,6 +2781,12 @@ export type VisualMessageRowFixture = {
   hideThreadActions?: boolean;
   threadSummary?: ThreadSummary;
   linkedTask?: Task;
+  /** A thread reply: the thread's parent conversation and message. */
+  parentChannelId?: string;
+  parentMessageId?: string;
+  /** Agent read progress (AgentReadLineCases): the line under your latest message, and the faces. */
+  showAgentReadStatus?: boolean;
+  agentReadFaces?: boolean;
 };
 
 const THREAD_MESSAGE: Message = {
@@ -3215,6 +3432,20 @@ function DirectVisualCaseView({ caseConfig }: { caseConfig: DirectVisualCase }) 
     );
   }
 
+  if (caseConfig.kind === "tasks-toolbar-row") {
+    // Server-mode TasksPanel at a desktop width, or as wide as the page's column
+    // in an 820px window (`.mid`) (#proj-workspace:dc3c9fc9), so
+    // packages/visual-testing/tests/toolbarRowAlignment.spec.ts can measure its
+    // toolbar row beside the Artifacts one (ArtifactFilterCases' toolbar-row cases).
+    return (
+      <main className="min-h-screen bg-layer-canvas p-0 font-display text-foreground">
+        <div data-visual-case={caseConfig.id} style={{ width: caseConfig.id.endsWith(".mid") ? 771 : 1100, background: "var(--layer-canvas)" }}>
+          <TasksPanel />
+        </div>
+      </main>
+    );
+  }
+
   if (caseConfig.kind === "tasks-status-menu") {
     // InlineBadgeEditor (the status chip menu TaskCard opens) supports a
     // controlled `open`, so the menu renders open statically. Its dropdown
@@ -3311,14 +3542,14 @@ function DirectVisualCaseView({ caseConfig }: { caseConfig: DirectVisualCase }) 
         >
           <div className="flex flex-col gap-3">
             <div className="flex items-center gap-3">
-              <Button size="sm" variant="outline">Save</Button>
-              <Button size="sm" variant="primary">Sync</Button>
-              <Button size="sm" variant="accent">Delete</Button>
+              <Button size="md" variant="outline">Save</Button>
+              <Button size="md" variant="primary">Sync</Button>
+              <Button size="md" variant="accent">Delete</Button>
             </div>
             <div className="flex items-center gap-3">
-              <Button size="sm" variant="information">Add</Button>
-              <Button size="sm" variant="success">Continue</Button>
-              <Button size="sm" variant="muted" disabled>Disabled</Button>
+              <Button size="md" variant="information">Add</Button>
+              <Button size="md" variant="success">Continue</Button>
+              <Button size="md" variant="muted" disabled>Disabled</Button>
             </div>
           </div>
         </div>
@@ -3354,7 +3585,7 @@ function DirectVisualCaseView({ caseConfig }: { caseConfig: DirectVisualCase }) 
               >
                 Control who can post and how the channel appears to members.
               </div>
-              <Button size="sm" variant="primary">Save changes</Button>
+              <Button size="md" variant="primary">Save changes</Button>
             </div>
           </div>
         </div>
@@ -3500,75 +3731,40 @@ function DirectVisualCaseView({ caseConfig }: { caseConfig: DirectVisualCase }) 
     );
   }
 
-  if (caseConfig.kind === "ui-attention-dot") {
+  if (caseConfig.kind === "ui-typography-specimen") {
+    // artin 2026-11-02: the app's type reads heavier than the web's. Every raft-ui text style,
+    // and the body face at 400 / 500 / 600 / 700, one line each (Latin, digits, Han); the
+    // Android fixture (UiTypographySpecimenVisualContent) draws the same lines in the same order.
+    const lines: Array<[string, string]> = [
+      ["Headline 17", "text-headline"],
+      ["Body 16 400", "text-body font-normal"],
+      ["Body 16 500", "text-body font-medium"],
+      ["Body 16 600", "text-body font-semibold"],
+      ["Body 16 700", "text-body font-bold"],
+      ["Subhead 15", "text-subhead"],
+      ["Callout 14", "text-callout"],
+      ["Footnote 13", "text-footnote"],
+      ["Caption 12 500", "text-caption"],
+      ["Label 11 600", "text-label"],
+      ["Mono meta 12", "font-mono text-mono-meta"],
+      ["Mono code 13", "font-mono text-mono-code"],
+    ];
     return (
-      <main className="min-h-screen bg-layer-canvas p-0 font-display text-foreground">
+      <main className="min-h-screen bg-layer-canvas p-0 font-sans text-foreground">
         <div
           data-visual-case={caseConfig.id}
           style={{
             width: 342,
-            height: 80,
+            height: 300,
             boxSizing: "border-box",
             overflow: "hidden",
             background: "var(--layer-canvas)",
             padding: "16px",
           }}
         >
-          <div className="flex items-center gap-5 text-sm font-bold">
-            <span className="flex items-center gap-2"><AttentionDot />Unread</span>
-            <span className="flex items-center gap-2"><AttentionDot size="sm" />Compact</span>
-            <span className="flex items-center gap-2"><AttentionDot tone="bg-presence-error" />Warning</span>
-          </div>
-        </div>
-      </main>
-    );
-  }
-
-  if (caseConfig.kind === "ui-status-dot") {
-    return (
-      <main className="min-h-screen bg-layer-canvas p-0 font-display text-foreground">
-        <div
-          data-visual-case={caseConfig.id}
-          style={{
-            width: 342,
-            height: 92,
-            boxSizing: "border-box",
-            overflow: "hidden",
-            background: "var(--layer-canvas)",
-            padding: "16px",
-          }}
-        >
-          <div className="flex flex-col gap-3 text-sm font-bold">
-            <div className="flex items-center gap-3">
-              <StatusDot presence="online" />
-              <StatusDot presence="error" size="sm" />
-              <StatusDot presence="offline" size="lg" />
-              <StatusDot external />
-            </div>
-          </div>
-        </div>
-      </main>
-    );
-  }
-
-  if (caseConfig.kind === "ui-progress-bar") {
-    return (
-      <main className="min-h-screen bg-layer-canvas p-0 font-display text-foreground">
-        <div
-          data-visual-case={caseConfig.id}
-          style={{
-            width: 342,
-            height: 124,
-            boxSizing: "border-box",
-            overflow: "hidden",
-            background: "var(--layer-canvas)",
-            padding: "16px",
-          }}
-        >
-          <div className="flex flex-col gap-4">
-            <ProgressBar value={64} label="Downloading update" showPercent />
-            <ProgressBar value={28} label="Verifying package" showPercent tone="cyan" />
-          </div>
+          {lines.map(([label, className]) => (
+            <div key={label} className={`whitespace-nowrap ${className}`}>{label} 排版 Aa 0123</div>
+          ))}
         </div>
       </main>
     );
@@ -3588,6 +3784,7 @@ function DirectVisualCaseView({ caseConfig }: { caseConfig: DirectVisualCase }) 
             padding: "16px",
           }}
         >
+          <style>{STILL_SKELETON_CSS}</style>
           <div className="flex flex-col gap-3">
             <SkeletonRow avatar avatarClassName="size-5" className="gap-3" lineWidths={SKELETON_LINE_WIDTHS} />
             <Skeleton variant="block" className="h-12 w-full" />
@@ -3595,34 +3792,6 @@ function DirectVisualCaseView({ caseConfig }: { caseConfig: DirectVisualCase }) 
               <Skeleton variant="block" className="size-8" />
               <Skeleton variant="line" className="w-40" />
             </div>
-          </div>
-        </div>
-      </main>
-    );
-  }
-
-  if (caseConfig.kind === "ui-spinner") {
-    return (
-      <main className="min-h-screen bg-layer-canvas p-0 font-display text-foreground">
-        <div
-          data-visual-case={caseConfig.id}
-          style={{
-            width: 342,
-            height: 92,
-            boxSizing: "border-box",
-            overflow: "hidden",
-            background: "var(--layer-canvas)",
-            padding: "16px",
-          }}
-        >
-          <div className="flex items-center gap-5">
-            <Spinner size="xs" style={STILL_SPINNER_STYLE} />
-            <Spinner size="sm" style={STILL_SPINNER_STYLE} />
-            <Spinner size="md" style={STILL_SPINNER_STYLE} />
-            <Spinner size="lg" style={STILL_SPINNER_STYLE} />
-            <span className="bg-black p-2">
-              <Spinner variant="inverse" size="sm" style={STILL_SPINNER_STYLE} />
-            </span>
           </div>
         </div>
       </main>
@@ -3646,32 +3815,6 @@ function DirectVisualCaseView({ caseConfig }: { caseConfig: DirectVisualCase }) 
           <div className="flex flex-col gap-4">
             <SlugInput value="design-lab" readOnly />
             <SlugInput value="partner-workspace" readOnly className="opacity-60" />
-          </div>
-        </div>
-      </main>
-    );
-  }
-
-  if (caseConfig.kind === "ui-section-eyebrow") {
-    return (
-      <main className="min-h-screen bg-layer-canvas p-0 font-display text-foreground">
-        <div
-          data-visual-case={caseConfig.id}
-          style={{
-            width: 342,
-            height: 92,
-            boxSizing: "border-box",
-            overflow: "hidden",
-            background: "var(--layer-canvas)",
-            padding: "16px",
-          }}
-        >
-          <div className="flex flex-col gap-3">
-            <SectionEyebrow as="div">Recent Activity</SectionEyebrow>
-            <SectionEyebrow as="div" tone="ink">Applications</SectionEyebrow>
-            <SectionEyebrow as="label" htmlFor="visual-eyebrow-field" className="bg-fill-muted px-2 py-1">
-              Choose Avatar
-            </SectionEyebrow>
           </div>
         </div>
       </main>
@@ -3814,31 +3957,6 @@ function DirectVisualCaseView({ caseConfig }: { caseConfig: DirectVisualCase }) 
     );
   }
 
-  if (caseConfig.kind === "ui-section-header") {
-    return (
-      <main className="min-h-screen bg-layer-canvas p-0 font-display text-foreground">
-        <div
-          data-visual-case={caseConfig.id}
-          style={{
-            width: 342,
-            height: 88,
-            boxSizing: "border-box",
-            overflow: "hidden",
-            background: "var(--layer-canvas)",
-            padding: "16px",
-          }}
-        >
-          <SectionHeader
-            label="Applications"
-            count={3}
-            action={<Button size="sm" variant="outline">Add</Button>}
-            className="border-b border-line-seam pb-2"
-          />
-        </div>
-      </main>
-    );
-  }
-
   if (caseConfig.kind === "ui-surface-list-item") {
     return (
       <main className="min-h-screen bg-layer-canvas p-0 font-display text-foreground">
@@ -3894,7 +4012,7 @@ function DirectVisualCaseView({ caseConfig }: { caseConfig: DirectVisualCase }) 
               avatar={<AvatarSlot context="list-row" type="human" humanPlaceholder />}
               name="Product UX Designer"
               subtitle="product@slock.ai"
-              rightContent={<Button size="sm" variant="outline">Open</Button>}
+              rightContent={<Button size="md" variant="outline">Open</Button>}
               selected
             />
           </ListRowGroup>
@@ -3904,28 +4022,16 @@ function DirectVisualCaseView({ caseConfig }: { caseConfig: DirectVisualCase }) 
   }
 
   if (caseConfig.kind === "notification-center") {
-    return (
-      <main className="min-h-screen bg-layer-canvas p-0 font-display text-foreground">
-        <div
-          data-visual-case={caseConfig.id}
-          style={{
-            width: 390,
-            height: 844,
-            boxSizing: "border-box",
-            overflow: "hidden",
-            background: "var(--layer-canvas)",
-            padding: "48px 16px 0",
-          }}
-        >
-        </div>
-      </main>
-    );
+    return <NotificationCenterVisualCaseView caseConfig={caseConfig} />;
   }
 
   if (caseConfig.kind === "thread-message") {
     return (
       <main className="min-h-screen bg-layer-canvas p-4 font-display text-foreground">
-        <div data-visual-case={caseConfig.id} style={{ width: 390, overflow: "hidden" }}>
+        {/* 374 = the 390 viewport minus the 16px inset: the Android crop is
+            (16,16,374w). At 390 the row ran past the viewport and the capture
+            clamp cut its right edge (the timestamp read "10:3"). */}
+        <div data-visual-case={caseConfig.id} style={{ width: 374, overflow: "hidden" }}>
           <VisualMessageRow fixture={THREAD_MESSAGE_FIXTURE} />
         </div>
       </main>
@@ -3935,7 +4041,10 @@ function DirectVisualCaseView({ caseConfig }: { caseConfig: DirectVisualCase }) 
   if (caseConfig.kind === "thread-message-deleted-human") {
     return (
       <main className="min-h-screen bg-layer-canvas p-4 font-display text-foreground">
-        <div data-visual-case={caseConfig.id} style={{ width: 390, overflow: "hidden" }}>
+        {/* 374 = the 390 viewport minus the 16px inset: the Android crop is
+            (16,16,374w). At 390 the row ran past the viewport and the capture
+            clamp cut its right edge (the timestamp read "10:3"). */}
+        <div data-visual-case={caseConfig.id} style={{ width: 374, overflow: "hidden" }}>
           <VisualMessageRow fixture={THREAD_MESSAGE_DELETED_HUMAN_FIXTURE} />
         </div>
       </main>
@@ -3955,6 +4064,10 @@ function DirectVisualCaseView({ caseConfig }: { caseConfig: DirectVisualCase }) 
 
   if (caseConfig.kind === "thread-message-share-selection") {
     return <ThreadMessageShareSelectionVisualCaseView caseConfig={caseConfig} />;
+  }
+
+  if (caseConfig.kind === "thread-message-share-preview") {
+    return <SelectSharePreviewPrototype mobile={caseConfig.id.endsWith(".mobile")} />;
   }
 
   if (caseConfig.kind === "thread-message-rich") {
@@ -4056,6 +4169,10 @@ function DirectVisualCaseView({ caseConfig }: { caseConfig: DirectVisualCase }) 
     );
   }
 
+  if (caseConfig.kind === "thread-message-agent-read-line") {
+    return <AgentReadLineCase caseId={caseConfig.id} />;
+  }
+
   if (caseConfig.kind === "thread-forward-modal") {
     return <ThreadForwardModalVisualCaseView caseConfig={caseConfig} />;
   }
@@ -4083,25 +4200,21 @@ function DirectVisualCaseView({ caseConfig }: { caseConfig: DirectVisualCase }) 
   }
 
   if (caseConfig.kind === "channel-settings") {
-    return (
-      <main className="min-h-screen bg-layer-canvas p-0 font-display text-foreground">
-        <div data-visual-case={caseConfig.id} style={{ width: 390, height: 844, overflow: "hidden" }}>
-          <EditChannelDialog
-            channelId="channel-design"
-            initialName={fxChannels.design.name}
-            initialDescription={fxChannels.design.description}
-            onClose={noop}
-          />
-        </div>
-      </main>
-    );
+    return <ChannelDrawerVisualCaseView caseConfig={caseConfig} />;
   }
 
   if (caseConfig.kind === "channel-members") {
+    // Phone-width members page as the channel overflow drawer hosts it
+    // (bare full-screen sheet body, presentation="page"); the capture taps
+    // the bottom-pinned Add Member entry to open the add-member view.
     return (
-      <main className="min-h-screen bg-layer-canvas p-4 font-display text-foreground">
-        <div data-visual-case={caseConfig.id}>
-          <ChannelMembers channelId="channel-design" />
+      <main className="min-h-screen bg-layer-canvas p-0 font-display text-foreground">
+        <div
+          data-visual-case={caseConfig.id}
+          className="flex flex-col"
+          style={{ width: 390, height: 844, overflow: "hidden" }}
+        >
+          <ChannelMembers channelId="channel-design" presentation="page" />
         </div>
       </main>
     );
@@ -4182,7 +4295,6 @@ function ThreadMessageShareSelectionVisualCaseView({ caseConfig }: { caseConfig:
         <SelectModeToolbar
           channelId={fxChannels.design.id}
           onSavePic={noop}
-          onShareX={noop}
           onCopyMd={noop}
           onForward={noop}
           onCopyLinks={noop}
@@ -4209,10 +4321,221 @@ function NavigationTabbarVisualCaseView({ caseConfig }: { caseConfig: DirectVisu
   );
 }
 
+// The two entries the Android fixture renders (warning agent disconnect,
+// info release-gate review), each with its primary action and Dismiss.
+const VISUAL_NOTIFICATION_CENTER_ENTRIES: NotificationEntry[] = [
+  {
+    id: "visual-agent-offline",
+    kind: "warning",
+    title: "Android-Developer lost connection",
+    body: "Last heartbeat was 4 minutes ago.",
+    action: { label: "View", onClick: noop },
+    dismissalKey: "visual-agent-offline",
+  },
+  {
+    id: "visual-release-blocker",
+    kind: "info",
+    title: "Release gate needs review",
+    body: "Two visual cases changed in the latest run.",
+    action: { label: "Open", onClick: noop },
+    dismissalKey: "visual-release-blocker",
+  },
+];
+
+// The real phone Bell (NotificationTrigger) with the fixture entries; the
+// manifest's capture interaction clicks it, so the open center is the product
+// popover anchored under the Bell, not a hand-placed copy. Until #7347 this
+// rendered a removed ui/NotificationCenter and then nothing at all.
+function NotificationCenterVisualCaseView({ caseConfig }: { caseConfig: DirectVisualCase }) {
+  return (
+    <main className="min-h-screen bg-layer-canvas p-0 font-display text-foreground">
+      <div
+        data-visual-case={caseConfig.id}
+        style={{
+          width: 390,
+          height: 844,
+          boxSizing: "border-box",
+          overflow: "hidden",
+          background: "var(--layer-canvas)",
+        }}
+      >
+        <div className="flex h-14 items-center justify-end px-2">
+          <NotificationTrigger flavor="mobile-navbar" notifications={VISUAL_NOTIFICATION_CENTER_ENTRIES} />
+        </div>
+      </div>
+    </main>
+  );
+}
+
+type HomeTitlebarVisualState = {
+  id: string;
+  name: string;
+  props: {
+    serverName: string;
+    /** "image": the server has an uploaded avatar; otherwise its initial. */
+    serverAvatar?: "image";
+    otherServerUnread?: boolean;
+    otherServerName?: string;
+    switcherOpen?: boolean;
+  };
+};
+
+const HOME_TITLEBAR_CASE_ID = "components.home.titlebar.states";
+const HOME_TITLEBAR_PROP_KEYS = new Set(["serverName", "serverAvatar", "otherServerUnread", "otherServerName", "switcherOpen"]);
+
+// Checks one manifest variant against HomeTitlebarVisualState and throws on
+// anything else, so a misspelled or mistyped field fails the capture loudly
+// instead of silently rendering a default bar.
+function parseHomeTitlebarState(value: unknown): HomeTitlebarVisualState {
+  const fail = (reason: string): never => {
+    throw new Error(`${HOME_TITLEBAR_CASE_ID} variant ${JSON.stringify(value)}: ${reason}`);
+  };
+  if (!value || typeof value !== "object") return fail("not an object");
+  const { id, name, props } = value as Record<string, unknown>;
+  if (typeof id !== "string" || !id) return fail("id must be a non-empty string");
+  if (typeof name !== "string" || !name) return fail("name must be a non-empty string");
+  if (!props || typeof props !== "object") return fail("props must be an object");
+  const record = props as Record<string, unknown>;
+  for (const key of Object.keys(record)) {
+    if (!HOME_TITLEBAR_PROP_KEYS.has(key)) fail(`unknown prop "${key}"`);
+  }
+  if (typeof record.serverName !== "string" || !record.serverName) fail("props.serverName must be a non-empty string");
+  if (record.serverAvatar !== undefined && record.serverAvatar !== "image") fail('props.serverAvatar must be "image" when set');
+  if (record.otherServerName !== undefined && typeof record.otherServerName !== "string") fail("props.otherServerName must be a string");
+  for (const key of ["otherServerUnread", "switcherOpen"]) {
+    if (record[key] !== undefined && typeof record[key] !== "boolean") fail(`props.${key} must be a boolean`);
+  }
+  return { id, name, props: record as HomeTitlebarVisualState["props"] };
+}
+
+// The states come from the manifest's variants, so React renders exactly the
+// board the case declares (Android's KMP page renders the same four). Parsed
+// when the titlebar case renders, so a bad variant fails that case only.
+let homeTitlebarStatesCache: HomeTitlebarVisualState[] | null = null;
+function homeTitlebarStates(): HomeTitlebarVisualState[] {
+  homeTitlebarStatesCache ??= parseHomeTitlebarStates();
+  return homeTitlebarStatesCache;
+}
+function parseHomeTitlebarStates(): HomeTitlebarVisualState[] {
+  const variants = (sharedCases.cases as Array<{ id: string; variants?: unknown }>)
+    .find((visualCase) => visualCase.id === HOME_TITLEBAR_CASE_ID)?.variants;
+  if (!Array.isArray(variants) || variants.length === 0) {
+    throw new Error(`${HOME_TITLEBAR_CASE_ID}: the manifest declares no variants`);
+  }
+  return variants.map(parseHomeTitlebarState);
+}
+// Web server avatars are uploaded images (no pixel keys); a fixed inline image
+// stands in for one so no network fetch is involved.
+const VISUAL_SERVER_AVATAR_URL = `data:image/svg+xml,${encodeURIComponent(
+  '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 8 8" shape-rendering="crispEdges">'
+  + '<rect width="8" height="8" fill="#141111"/><rect x="1" y="1" width="2" height="2" fill="#27C6F0"/>'
+  + '<rect x="5" y="1" width="2" height="2" fill="#27C6F0"/><rect x="2" y="5" width="4" height="2" fill="#FFFFFF"/></svg>',
+)}`;
+const TITLEBAR_BAR_HEIGHT = 62;
+const TITLEBAR_SWITCHER_FRAME_HEIGHT = 340;
+// Each state runs in an iframe as tall as the case's phone viewport, clipped
+// to the part the board shows. A frame only as tall as the visible bar (62px,
+// or 340px open) is a window under 600px, so the shell's short-window rules
+// applied (the 48px `--shell-header-height`, the switcher's compact
+// `max-height:600px` rows) and the bar was not the 56px one a phone draws.
+const TITLEBAR_FRAME_VIEWPORT_HEIGHT = 844;
+
+function requestedTitlebarState(): HomeTitlebarVisualState | null {
+  const id = new URLSearchParams(window.location.search).get("titlebarState");
+  return homeTitlebarStates().find((state) => state.id === id) ?? null;
+}
+
+function primeHomeTitlebarState(state: HomeTitlebarVisualState) {
+  primeNavigationVisualStores();
+  const { current, servers } = useServerStore.getState();
+  if (!current) return;
+  const nextCurrent = {
+    ...current,
+    name: state.props.serverName,
+    avatarUrl: state.props.serverAvatar === "image" ? VISUAL_SERVER_AVATAR_URL : null,
+  };
+  // Other-server unread needs another server; the other states keep a list
+  // without it so no unread dot can ride the avatar.
+  const otherServer = servers.find((server) => server.id !== current.id);
+  const otherServers = otherServer && (state.props.otherServerUnread || state.props.otherServerName)
+    ? [{
+        ...otherServer,
+        // A separate id from the one the unread-summary mock marks unread,
+        // so the switcher row carries no unread count.
+        ...(state.props.otherServerName
+          ? {
+              id: "visual-community-server",
+              name: state.props.otherServerName,
+              slug: state.props.otherServerName.toLowerCase().replace(/\s+/g, "-"),
+            }
+          : {}),
+      }]
+    : [];
+  useServerStore.setState({
+    current: nextCurrent,
+    servers: [nextCurrent, ...otherServers],
+    serverUnreadCounts: state.props.otherServerUnread && otherServer
+      ? { [otherServer.id]: { unreadCount: 3, serverPushMuted: false, activityUnreadCount: 3 } }
+      : {},
+  });
+}
+
+// One state, rendered by the real phone Sidebar in its own document (an
+// iframe of this host): the bar reads the server and unread state from global
+// stores, so each state needs its own copy of them.
+function HomeTitlebarStateFrame({ state }: { state: HomeTitlebarVisualState }) {
+  useMemo(() => primeHomeTitlebarState(state), [state]);
+  const routeReady = useVisualRoute(`/s/${fxServer.slug}`, HOME_TITLEBAR_CASE_ID);
+  const [settled, setSettled] = useState(false);
+  useEffect(() => {
+    if (!routeReady) return;
+    if (state.props.switcherOpen) {
+      document.querySelector<HTMLElement>("[data-testid='mobile-workspace-trigger']")?.click();
+    }
+    let cancelled = false;
+    void document.fonts.ready.then(() => {
+      requestAnimationFrame(() => {
+        if (cancelled) return;
+        setSettled(true);
+        window.parent.postMessage({ titlebarStateReady: state.id }, window.location.origin);
+      });
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [routeReady, state]);
+  if (!routeReady) return null;
+
+  return (
+    <main className="min-h-screen bg-layer-canvas p-0 font-display text-foreground">
+      <div
+        data-titlebar-state={state.id}
+        data-titlebar-state-ready={settled ? "true" : undefined}
+        style={{ width: 342, height: TITLEBAR_BAR_HEIGHT, overflow: "hidden", background: "var(--layer-canvas)" }}
+      >
+        <Sidebar mobileInline />
+      </div>
+    </main>
+  );
+}
+
 function HomeTitlebarVisualCaseView({ caseConfig }: { caseConfig: DirectVisualCase }) {
-  useMemo(() => primeNavigationVisualStores(), []);
-  const ready = useVisualRoute(`/s/${fxServer.slug}`, caseConfig.id);
-  if (!ready) return null;
+  const frameState = useMemo(() => requestedTitlebarState(), []);
+  // Frames load one after another: four copies of the dev-served app at once
+  // exhaust the browser's request budget (ERR_INSUFFICIENT_RESOURCES), while a
+  // later frame reuses the modules the first one cached.
+  const [readyFrames, setReadyFrames] = useState<string[]>([]);
+  useEffect(() => {
+    if (frameState) return;
+    const onMessage = (event: MessageEvent) => {
+      const id = (event.data as { titlebarStateReady?: unknown } | null)?.titlebarStateReady;
+      if (event.origin !== window.location.origin || typeof id !== "string") return;
+      setReadyFrames((ready) => (ready.includes(id) ? ready : [...ready, id]));
+    };
+    window.addEventListener("message", onMessage);
+    return () => window.removeEventListener("message", onMessage);
+  }, [frameState]);
+  if (frameState) return <HomeTitlebarStateFrame state={frameState} />;
 
   return (
     <main className="min-h-screen bg-layer-canvas p-0 font-display text-foreground">
@@ -4225,20 +4548,137 @@ function HomeTitlebarVisualCaseView({ caseConfig }: { caseConfig: DirectVisualCa
           background: "var(--layer-canvas)",
         }}
       >
-        <div
-          style={{
-            width: 342,
-            height: 110,
-            overflow: "hidden",
-            background: "var(--layer-canvas)",
-            boxSizing: "border-box",
-            paddingTop: 48,
-          }}
-        >
-          <div style={{ width: 342, height: 62, overflow: "hidden" }}>
-            <Sidebar mobileInline />
-          </div>
+        <div className="flex flex-col gap-1.5" style={{ width: 342, paddingTop: 12 }}>
+          {homeTitlebarStates().map((state, index) => (
+            <div key={state.id} className="flex flex-col gap-1.5">
+              <div className="px-3 font-display text-xs font-medium uppercase text-foreground-muted">{state.name}</div>
+              <div
+                style={{
+                  width: 342,
+                  height: state.props.switcherOpen ? TITLEBAR_SWITCHER_FRAME_HEIGHT : TITLEBAR_BAR_HEIGHT,
+                  overflow: "hidden",
+                }}
+              >
+                {/* oxlint-disable-next-line react-doctor/iframe-missing-sandbox -- the frame is this same-origin visual host running the app (storage, module loads, postMessage); a sandbox would only break it */}
+                <iframe
+                  title={state.name}
+                  data-titlebar-frame={state.id}
+                  src={index <= readyFrames.length
+                    ? `/visual-testing.html?${new URLSearchParams({ case: caseConfig.id, titlebarState: state.id }).toString()}`
+                    : "about:blank"}
+                  style={{
+                    display: "block",
+                    width: 342,
+                    height: TITLEBAR_FRAME_VIEWPORT_HEIGHT,
+                    border: 0,
+                  }}
+                />
+              </div>
+            </div>
+          ))}
         </div>
+      </div>
+    </main>
+  );
+}
+
+// components.channel.settings.panel: the channel drawer as people get it —
+// ChatPanel's settings trigger opens ChannelOverflowMenu's OverflowSheet (the
+// one-line head over Members / Info / Preferences / Actions). The viewport
+// decides phone vs desktop. Query params pick the place: `channel` =
+// design (public, the default) | private | joint | dm, `view=members` opens
+// the members page, `role=member` seeds a member who can't edit (read-only
+// description).
+const CHANNEL_DRAWER_VISUAL_CHANNELS: Record<string, Channel> = {
+  design: {
+    id: fxChannels.design.id,
+    serverId: fxServer.id,
+    name: fxChannels.design.name,
+    description: fxChannels.design.description,
+    type: "channel",
+    createdAt: fxTimes.entityCreatedAtIso,
+    joined: true,
+  },
+  private: {
+    id: "channel-roadmap",
+    serverId: fxServer.id,
+    name: "roadmap",
+    description: "Quarter plans and launch dates",
+    type: "private",
+    createdAt: fxTimes.entityCreatedAtIso,
+    joined: true,
+  },
+  joint: {
+    id: "channel-partner-launch",
+    serverId: fxServer.id,
+    name: "partner-launch",
+    description: "Shared with Android Lab for the launch",
+    type: "joint",
+    createdAt: fxTimes.entityCreatedAtIso,
+    joined: true,
+  },
+  dm: {
+    id: "dm-visual-friday",
+    serverId: fxServer.id,
+    name: "dm-visual-friday",
+    description: null,
+    type: "dm",
+    peerType: "user",
+    peerId: "visual-peer-friday",
+    peerDisplayName: "Friday",
+    createdAt: fxTimes.entityCreatedAtIso,
+    joined: true,
+  },
+};
+
+function primeChannelDrawerVisualStores(params: URLSearchParams): Channel {
+  primeNavigationVisualStores();
+  const channel = CHANNEL_DRAWER_VISUAL_CHANNELS[params.get("channel") ?? "design"] ?? CHANNEL_DRAWER_VISUAL_CHANNELS.design;
+  const others = Object.values(CHANNEL_DRAWER_VISUAL_CHANNELS).filter((item) => item.type !== "dm");
+  useChannelStore.setState((state) => ({
+    channels: [...state.channels.filter((item) => !others.some((o) => o.id === item.id)), ...others],
+    dmChannels: [CHANNEL_DRAWER_VISUAL_CHANNELS.dm],
+  }));
+  if (params.get("role") === "member") {
+    useServerStore.setState((state) => ({
+      current: state.current ? { ...state.current, role: "member" } : state.current,
+    }));
+  }
+  return channel;
+}
+
+function clickWhenReady(testId: string, then?: () => void) {
+  let tries = 0;
+  const tick = () => {
+    const target = document.querySelector<HTMLElement>(`[data-testid="${testId}"]`);
+    if (target) {
+      target.click();
+      then?.();
+    } else if (tries < 100) {
+      tries += 1;
+      window.setTimeout(tick, 50);
+    }
+  };
+  tick();
+}
+
+function ChannelDrawerVisualCaseView({ caseConfig }: { caseConfig: DirectVisualCase }) {
+  const params = useMemo(() => new URLSearchParams(window.location.search), []);
+  const channel = useMemo(() => primeChannelDrawerVisualStores(params), [params]);
+  useEffect(() => {
+    clickWhenReady("channel-overflow-trigger", () => {
+      if (params.get("view") === "members") clickWhenReady("channel-overflow-members-entry");
+    });
+  }, [params]);
+
+  return (
+    <main className="min-h-screen bg-layer-canvas p-0 font-display text-foreground">
+      <div
+        data-visual-case={caseConfig.id}
+        className="flex flex-col"
+        style={{ width: "100vw", height: "100vh", overflow: "hidden" }}
+      >
+        <ChatPanel channel={channel} showComposer={false} />
       </div>
     </main>
   );
@@ -4270,7 +4710,7 @@ function ThreadHeaderVisualCaseView({ caseConfig }: { caseConfig: DirectVisualCa
 
 function SettingsVisualCaseView({ caseConfig }: { caseConfig: SettingsVisualCase }) {
   useMemo(() => primeSettingsVisualStores(caseConfig), [caseConfig]);
-  const rootReady = useVisualRoute(`/s/${fxServer.slug}/settings`, caseConfig.id);
+  const rootReady = useVisualRoute(settingsRootPath(caseConfig), caseConfig.id);
 
   if (caseConfig.root) {
     if (!rootReady) return null;

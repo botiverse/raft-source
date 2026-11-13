@@ -8,7 +8,7 @@ import { mintAgentCredential } from "../services/agentCredentialService";
 import { createAgent } from "../services/agentService";
 import { createServer } from "../services/serverService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 function headers(apiKey: string): Record<string, string> {
   return {
@@ -34,18 +34,21 @@ async function seed() {
     agentId: agentA.id,
     scopes: ["read", "tasks"],
     name: "app-config-write-a",
+    issuedVia: "computer",
     createdByUserId: null,
   });
   const readA = await mintAgentCredential({
     agentId: agentA.id,
     scopes: ["read"],
     name: "app-config-read-a",
+    issuedVia: "computer",
     createdByUserId: null,
   });
   const writeB = await mintAgentCredential({
     agentId: agentB.id,
     scopes: ["read", "tasks"],
     name: "app-config-write-b",
+    issuedVia: "computer",
     createdByUserId: null,
   });
   return {

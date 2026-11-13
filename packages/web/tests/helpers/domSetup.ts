@@ -1,12 +1,45 @@
 // DOM test setup for jsdom/RTL behavioral component tests.
 // Vitest loads this before every `*.test.tsx` file through vitest.config.ts.
 import "global-jsdom/register";
+import { mountAllTimelineRowsInDomTests } from "./timelineRowsInDomTests";
 
 // jsdom performs no layout and ships no `scrollIntoView`; component code is
 // allowed to call it unguarded (every real browser has it), so the shared DOM
 // harness provides a no-op. Suites asserting scroll behavior override this
-// per file (e.g. agentRouteLocatesSidebarRow, attachmentCommentsPanelAnchor).
+// per file (e.g. attachmentCommentsPanelAnchor).
 Element.prototype.scrollIntoView = function scrollIntoView() {};
+// Same for element `scrollTo` / `scrollBy` (raft-ui VirtualList, the
+// timeline's scroller, calls them to jump to a row and to keep rows in place).
+if (typeof Element.prototype.scrollTo !== "function") {
+  Element.prototype.scrollTo = function scrollTo() {} as typeof Element.prototype.scrollTo;
+}
+if (typeof Element.prototype.scrollBy !== "function") {
+  Element.prototype.scrollBy = function scrollBy() {} as typeof Element.prototype.scrollBy;
+}
+
+// jsdom has no viewport geometry or IntersectionObserver. Keep unobserved
+// content unobserved: an eager "everything is visible" fake would trigger
+// preview/network work in unrelated message tests. Visibility-specific tests
+// install their own controllable observer (e.g. appLinkPreviews.behavior (removed in the 2026-11 web DOM test prune)).
+if (typeof globalThis.IntersectionObserver === "undefined") {
+  class NoLayoutIntersectionObserver implements IntersectionObserver {
+    readonly root: Element | Document | null;
+    readonly rootMargin: string;
+    readonly thresholds: readonly number[];
+    readonly scrollMargin = "0px";
+    constructor(_callback: IntersectionObserverCallback, options?: IntersectionObserverInit) {
+      this.root = options?.root ?? null;
+      this.rootMargin = options?.rootMargin ?? "0px";
+      this.thresholds = Array.isArray(options?.threshold) ? options.threshold : [options?.threshold ?? 0];
+    }
+    observe(_target: Element) {}
+    unobserve(_target: Element) {}
+    disconnect() {}
+    takeRecords(): IntersectionObserverEntry[] { return []; }
+  }
+  globalThis.IntersectionObserver = NoLayoutIntersectionObserver;
+  window.IntersectionObserver = NoLayoutIntersectionObserver;
+}
 
 // jsdom before 30 shipped no `CSS.escape` (browsers do; jsdom 30 does too, so
 // this is now a fallback). Minimal spec-shaped polyfill: escape everything
@@ -127,3 +160,16 @@ if (typeof globalThis.localStorage?.getItem !== "function") {
     value: storage,
   });
 }
+
+// Every virtual timeline mounts all of its rows: jsdom has no layout to
+// window them by (timelineRowsInDomTests.ts).
+mountAllTimelineRowsInDomTests();
+
+// A press's click guard (useRowSwipe `swallowClickAfterPress`) waits on the
+// document for that press's click, until the next press. A real click always
+// follows a press, but a test's `fireEvent.click` comes without one, so a
+// guard a swipe left in the last case would swallow it. A cancelled press
+// disarms every guard: end each case with one.
+afterEach(() => {
+  document.dispatchEvent(new window.Event("pointercancel"));
+});

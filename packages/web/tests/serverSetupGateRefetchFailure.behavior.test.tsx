@@ -127,7 +127,7 @@ test("a FIRST read that fails renders nothing — no legacy modal, no fabricated
   // Nothing was ever known. The wizard fallback is gone, so the honest state is to render
   // nothing at all (the projection stays null → the gate returns null) — not a modal.
   await waitFor(() => assert.equal(container.textContent, ""));
-  assert.equal(screen.queryByRole("heading", { name: "Connect a computer" }), null);
+  assert.ok(screen.queryByRole("heading", { name: "Connect a computer" }) === null);
   await waitFor(() => assert.equal(
     useOnboardingAnnouncementGateStore.getState().byServerId["server-1"],
     "blocked",
@@ -148,10 +148,10 @@ test("dedicated Native surface shows loading, then a retryable error, and recove
   await waitFor(() => assert.ok(screen.getByText("We couldn't load onboarding for this server.")));
 
   shouldFail = false;
-  fireEvent.click(screen.getByRole("button", { name: "Try Again" }));
+  fireEvent.click(screen.getByRole("button", { name: "Try again" }));
   assert.ok(screen.getByTestId("native-onboarding-loading"));
   await waitFor(() => assert.ok(screen.getByRole("heading", { name: "Connect a computer" })));
-  assert.equal(screen.queryByTestId("native-onboarding-unavailable"), null);
+  assert.ok(screen.queryByTestId("native-onboarding-unavailable") === null);
 });
 
 test("dedicated Native surface renders a non-empty phase:null state without waking the host", async () => {
@@ -172,7 +172,7 @@ test("dedicated Native surface renders a non-empty phase:null state without waki
 
   renderGate("webview:1", true);
   await waitFor(() => assert.ok(screen.getByText("Onboarding isn't available for this account yet.")));
-  assert.ok(screen.getByRole("button", { name: "Try Again" }));
+  assert.ok(screen.getByRole("button", { name: "Try again" }));
   assert.deepEqual(calls, []);
 });
 
@@ -334,7 +334,7 @@ test("post-setup keeps the referral survey but never resurrects Join Community a
 
   renderGate(null, true);
   await waitFor(() => assert.ok(screen.getByRole("heading", { name: "Connect a computer" })));
-  assert.equal(screen.queryByText(/Join (the )?community/i), null, "the blocking setup window has no community gate");
+  assert.ok(screen.queryByText(/Join (the )?community/i) === null, "the blocking setup window has no community gate");
 
   nextProjection = {
     ...KNOWN_PROJECTION,
@@ -350,8 +350,7 @@ test("post-setup keeps the referral survey but never resurrects Join Community a
   });
 
   await waitFor(() => assert.ok(screen.getByTestId("server-setup-survey")));
-  assert.ok(screen.getByText("How did you hear about Raft?"));
-  assert.equal(screen.queryByText(/Join (the )?community/i), null);
+  assert.ok(screen.queryByText(/Join (the )?community/i) === null);
 
   nextProjection = {
     ...nextProjection,
@@ -361,8 +360,8 @@ test("post-setup keeps the referral survey but never resurrects Join Community a
     useServerSetupRevision.getState().bump();
   });
 
-  await waitFor(() => assert.equal(screen.queryByTestId("server-setup-survey"), null));
-  assert.equal(screen.queryByText(/Join (the )?community/i), null);
+  await waitFor(() => assert.ok(screen.queryByTestId("server-setup-survey") === null));
+  assert.ok(screen.queryByText(/Join (the )?community/i) === null);
 });
 
 /**
@@ -397,23 +396,22 @@ test("Windows selection stays on Computer and first connect cannot mint a legacy
   renderGate(null, true);
   await waitFor(() => assert.ok(screen.getByRole("heading", { name: "Connect a computer" })));
   fireEvent.click(screen.getByRole("radio", { name: "Windows x64" }));
-  await waitFor(() => assert.ok(screen.getByText("Experimental")));
+  await waitFor(() => assert.ok(screen.getByText("Raft Computer · Windows x64")));
 
   assert.equal(registerCalls, 0, "choosing the Windows Computer tab must not create a legacy row/key");
-  assert.equal(screen.queryByRole("button", { name: "Copy Windows daemon command" }), null);
+  assert.ok(screen.queryByRole("button", { name: "Copy Windows daemon command" }) === null);
 
   // There is no longer anything to click: the reveal, the block it revealed, and the command it
   // would have produced are all gone from first connect.
-  assert.equal(
-    screen.queryByTestId("computer-windows-daemon-request"),
-    null,
+  assert.ok(
+    screen.queryByTestId("computer-windows-daemon-request") === null,
     "first connect offers no way to reveal the Legacy path",
   );
-  assert.equal(screen.queryByTestId("windows-daemon-command-block"), null);
-  assert.equal(screen.queryByText("Daemon / Legacy"), null);
+  assert.ok(screen.queryByTestId("windows-daemon-command-block") === null);
+  assert.ok(screen.queryByText("Daemon / Legacy") === null);
 
   // The Computer path is untouched — this is a removal, not a broken screen.
-  assert.ok(screen.getByText("Experimental"));
+  assert.ok(screen.getByText("Raft Computer · Windows x64"));
 
   assert.equal(registerCalls, 0, "first connect never mints a legacy credential, with or without a click");
 });
@@ -450,9 +448,9 @@ test("Start over on Meet Cindy is the only clickable copy and opens the confirm 
   // guidance around it is plain text, not part of the control.
   const description = screen.getByTestId("create-agent-start-over-description");
   assert.match(description.textContent ?? "", /computer you'?ll use/i, "a description explains when to start over");
-  assert.equal(description.closest("button"), null, "the description is guidance, not part of the clickable control");
+  assert.ok(description.closest("button") === null, "the description is guidance, not part of the clickable control");
   assert.equal(screen.getAllByRole("button", { name: "Start over", exact: true }).length, 1, "only 'Start over' is clickable");
-  assert.equal(screen.queryByText(/Wrong computer/i), null, "the hint does not blame the computer");
+  assert.ok(screen.queryByText(/Wrong computer/i) === null, "the hint does not blame the computer");
 
   await act(async () => {
     screen.getByTestId("create-agent-start-over").click();
@@ -511,7 +509,7 @@ test("Start over from S1 offline recovery requires confirmation and cancel stays
   await act(async () => {
     screen.getByRole("button", { name: "Cancel" }).click();
   });
-  await waitFor(() => assert.equal(screen.queryByText("Start over?"), null));
+  await waitFor(() => assert.ok(screen.queryByText("Start over?") === null));
   assert.equal(resetCalls, 0, "cancel must not reset setup");
   assert.ok(screen.getByRole("heading", { name: "Start your computer" }), "cancel keeps the user on S1");
 

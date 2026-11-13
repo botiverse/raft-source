@@ -2,7 +2,7 @@ import { expect, test } from "@playwright/test";
 import { loginViaApi } from "../../fixtures/auth";
 import { waitForSeedState } from "../../fixtures/seedState";
 import { dismissOwnerOnboarding } from "../../fixtures/session";
-import { clickShareMessagesMenu } from "../../fixtures/contextMenu";
+import { atTextStart, clickShareMessagesMenu } from "../../fixtures/contextMenu";
 
 // v1.4 contract (scope option A — "what you see is what you share"):
 //   - Channel timeline share is anchored to the single message the user
@@ -119,7 +119,10 @@ test("ThreadPanel select mode mounts toolbar in the thread, not in the channel",
 
   // Right-click a reply inside the thread → Share messages… enters thread
   // mode anchored at the parent, but only the clicked reply is pre-selected.
-  await clickShareMessagesMenu(page, threadScroller.getByText(`${tag} reply 0`));
+  // At the text's start: reply 1's hover toolbar reaches 21px up over the end
+  // of reply 0's line (wider with a mouse since #12730), where the centre of the
+  // row-wide paragraph lands in a 400px thread.
+  await clickShareMessagesMenu(page, threadScroller.getByText(`${tag} reply 0`), atTextStart);
 
   // Toolbar appears inside the thread. ChatPanel below should *not* render its
   // own toolbar in thread mode.
@@ -127,9 +130,12 @@ test("ThreadPanel select mode mounts toolbar in the thread, not in the channel",
   await expect(toolbars).toHaveCount(1);
   await expect(page.getByTestId("select-mode-count")).toHaveText("1 selected");
 
-  // Thread mode offers an explicit Select all for parent + replies.
+  // Thread mode leads with a select-all checkbox: [-] clears, [ ] selects
+  // the parent + every reply.
   await page.getByTestId("select-mode-select-all").click();
-  await expect(page.getByTestId("select-mode-count")).toHaveText("3 selected");
+  await expect(page.getByTestId("select-mode-count")).toHaveText("0 selected");
+  await page.getByTestId("select-mode-select-all").click();
+  await expect(page.getByTestId("select-mode-count")).toHaveText("All 3 selected");
 
   await page.getByTestId("select-mode-cancel").click();
   await expect(toolbars).toHaveCount(0);

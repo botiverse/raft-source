@@ -1,4 +1,6 @@
 export interface AnnouncementPresentation {
+  /** Omitted legacy announcements keep the centered modal. */
+  displayMode?: "modal" | "sidebar";
   label?: string;
   cta?: { label: string; href: string };
   image?: { assetId: string; alt: string };
@@ -14,6 +16,10 @@ export function validateAnnouncementPresentation(value: unknown): AnnouncementPr
   if (!value || typeof value !== "object") return {};
   const raw = value as Record<string, unknown>;
   const result: AnnouncementPresentation = {};
+  if (raw.displayMode !== undefined) {
+    if (raw.displayMode !== "modal" && raw.displayMode !== "sidebar") throw new Error("invalid announcement display mode");
+    result.displayMode = raw.displayMode;
+  }
   if (raw.label !== undefined) {
     if (typeof raw.label !== "string" || raw.label.length > 100) throw new Error("announcement label must contain at most 100 characters");
     if (raw.label.trim()) result.label = raw.label.trim();

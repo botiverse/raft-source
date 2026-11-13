@@ -35,7 +35,7 @@ export function ActiveUploadRow({
         <div className="flex shrink-0 flex-wrap justify-end gap-2">
           <Button
             type="button"
-            size="sm"
+            size="md"
             variant="outline"
             onClick={onOpenChannel}
             data-testid={`channel-settings-joint-upload-open-${uploadId}`}
@@ -44,7 +44,7 @@ export function ActiveUploadRow({
           </Button>
           <Button
             type="button"
-            size="sm"
+            size="md"
             variant="outline"
             onClick={handleCancel}
             disabled={cancelBusy}

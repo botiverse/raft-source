@@ -27,7 +27,7 @@ export default function SettingsProfileCard({
   return (
     <Card
       data-testid={testId}
-      className="space-y-4 p-4"
+      className="stack-y-4 p-4"
     >
       <div className="flex items-start gap-4">
         <div className="flex size-16 shrink-0 items-center justify-center">
@@ -50,7 +50,7 @@ export default function SettingsProfileCard({
         </div>
       </div>
 
-      <div className="space-y-3">
+      <div className="stack-y-3">
         <Separator className="mb-4" />
         {children}
       </div>

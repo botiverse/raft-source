@@ -181,7 +181,10 @@ export type InboxPolicyApiItem =
       /** SSOT per-scope read state (#632); same field name as the other exits. */
       readState: InboxScopeReadFrontier;
     }
-  | {
+  | InboxPolicyThreadApiItem
+  | InboxPolicyTaskApiItem;
+
+export type InboxPolicyThreadApiItem = {
       kind: "thread";
       threadChannelId: string;
       parentMessageId: string;
@@ -212,6 +215,26 @@ export type InboxPolicyApiItem =
       /** SSOT per-scope read state (#632); same field name as the other exits. */
       readState: InboxScopeReadFrontier;
     };
+
+/**
+ * Task v2: a task conversation (channels.type = 'task') row. Thread-shaped
+ * (it is a sub-conversation, followed and read like a thread), keyed by its
+ * LOCAL conversation channel (`threadChannelId`), with no parent message: its
+ * parent is the task (`taskId`, `taskNumber`, `taskTitle`) in the channel
+ * `parentChannelId`. parentMessageId is null, parentMessagePreview is the task
+ * title and the parent sender fields are empty.
+ */
+export type InboxPolicyTaskApiItem = Omit<InboxPolicyThreadApiItem, "kind" | "parentMessageId"> & {
+  kind: "task";
+  parentMessageId: null;
+  taskId: string | null;
+  taskTitle: string | null;
+};
+
+/** A sub-conversation row kind: a thread or a task conversation. */
+export function isSubConversationInboxKind(kind: unknown): kind is "thread" | "task" {
+  return kind === "thread" || kind === "task";
+}
 
 export type InboxPolicySqlRow = Record<string, unknown> & {
   kind?: string | null;
@@ -293,7 +316,7 @@ function asTime(value: unknown): number {
 
 function sqlRowKey(row: InboxPolicySqlRow): string {
   const kind = asString(row.kind);
-  if (kind === "thread") return `thread:${asString(row.threadChannelId)}`;
+  if (isSubConversationInboxKind(kind)) return `${kind}:${asString(row.threadChannelId)}`;
   return `${kind}:${asString(row.channelId)}`;
 }
 
@@ -410,7 +433,42 @@ export function mapInboxPolicyRowsToItems(
   onCorrupt?: (scopeId: string, corruption: InboxScopeCursorCorruption) => void | PromiseLike<void>,
   frontierSource: InboxReadStateFrontierSource = "servingPair",
 ): InboxPolicyApiItem[] {
-  return rows.map((row) => {
+  return rows.map((row): InboxPolicyApiItem => {
+    if (row.kind === "task") {
+      const threadChannelId = asString(row.threadChannelId);
+      return {
+        kind: "task",
+        threadChannelId,
+        parentMessageId: null,
+        parentChannelId: asString(row.parentChannelId),
+        parentChannelName: asString(row.parentChannelName),
+        parentChannelType: asString(row.parentChannelType),
+        // No parent message: the task's title stands in for its preview.
+        parentMessagePreview: truncatePreview(row.taskTitle, 100),
+        parentMessageSenderType: "",
+        parentMessageSenderId: "",
+        latestActivityPreview: truncatePreview(row.latestActivityPreview, 140),
+        latestActivitySenderType: asString(row.latestActivitySenderType),
+        latestActivitySenderId: asString(row.latestActivitySenderId),
+        latestActivitySenderName: asNullableString(row.latestActivitySenderName),
+        latestActivityMessageId: asString(row.latestActivityMessageId),
+        latestActivitySeq: asNullableString(row.latestActivitySeq),
+        doneFrontierSeq: doneFrontierSeqFromRow(row, frontierSource),
+        firstUnreadMessageId: asNullableString(row.firstUnreadMessageId),
+        firstMentionMessageId: asNullableString(row.firstMentionMessageId),
+        lastActivityAt: asString(row.lastActivityAt),
+        lastReplyAt: asNullableString(row.lastReplyAt),
+        replyCount: asNumber(row.replyCount),
+        unreadCount: asNumber(row.unreadCount),
+        hasMention: row.hasMention === true,
+        taskId: asNullableString(row.taskId),
+        taskNumber: typeof row.taskNumber === "number" ? row.taskNumber : null,
+        taskTitle: asNullableString(row.taskTitle),
+        taskStatus: asNullableString(row.taskStatus),
+        taskClaimedByName: asNullableString(row.taskClaimedByName),
+        readState: buildReadState(row, threadChannelId, onCorrupt, frontierSource),
+      };
+    }
     if (row.kind === "thread") {
       const parentMessagePreview = asString(row.parentMessagePreview);
       const latestActivityPreview = asString(row.latestActivityPreview) || parentMessagePreview;
@@ -545,6 +603,8 @@ function inboxScopeCursorFromRow(
     maxReadSeq: row.maxReadSeq as string,
     latestActivityMessageId,
     latestActivitySeq,
+    // Stamped from Postgres on both paths (the RW serving views do not carry it).
+    markedUnread: row.markedUnread === true,
   };
 }
 

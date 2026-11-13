@@ -2,16 +2,16 @@
 // /internal/agent-api/events`, and its acknowledgement (immediate or cursor).
 import {
   currentDate,
-  renderThirdPartyInertText,
   type AgentMessage,
 } from "@botiverse/raft-shared";
 import { eq } from "drizzle-orm";
 import { getDb, type DatabaseExecutor } from "../db/index";
 import { agentInboxEventsPendingAcks } from "../db/schema";
 import type { AgentOrchestrator } from "./agentOrchestrator";
-import * as agentPermalinkRenderService from "./agentPermalinkRenderService";
+import { renderAgentFacingContents } from "./agentFacingContent";
 import * as channelService from "./channelService";
 import { refreshQueuedAgentTaskProjections } from "./messageTaskProjection";
+import { partitionDeliverableSystemAppEventMessages } from "./systemAppDeliveryGuards";
 
 // Agent API response contracts describe the JSON wire payload. Server handlers
 // may still hand us DB/domain objects containing Date instances, which Express
@@ -61,15 +61,23 @@ export async function canAgentAccessQueuedMessageTarget(
   }
 }
 
-/** Splits queued items into those the agent may receive now and those it may not. */
+/**
+ * Splits queued items into those the agent may receive now and those it may
+ * not (to drop from the buffer), including system-app events their app's
+ * delivery guard vetoes. A system-app event the guard withholds (fail closed)
+ * is in neither: not handed over, but left in the buffer. `guardedEventIds`:
+ * events the caller just guarded, not guarded again.
+ */
 export async function partitionDeliverableInboxMessages(
   messages: readonly AgentMessage[],
   agentId: string,
   serverId: string,
+  options: { guardedEventIds?: ReadonlySet<string> } = {},
 ): Promise<{ deliverable: AgentMessage[]; undeliverable: AgentMessage[] }> {
+  const guarded = await partitionDeliverableSystemAppEventMessages(messages, agentId, { guardedEventIds: options.guardedEventIds });
   const deliverable: AgentMessage[] = [];
-  const undeliverable: AgentMessage[] = [];
-  for (const message of messages) {
+  const undeliverable: AgentMessage[] = [...guarded.vetoed];
+  for (const message of guarded.deliverable) {
     const canAccess = await canAgentAccessQueuedMessageTarget(queuedMessageChannelId(message), agentId, serverId, message);
     if (canAccess) deliverable.push(message);
     else undeliverable.push(message);
@@ -102,12 +110,11 @@ export type AgentInboxQueuedEvent = AgentMessage & {
 export async function projectAgentInboxEvents(
   messages: readonly AgentMessage[],
   serverId: string,
+  agentId: string,
 ): Promise<AgentInboxQueuedEvent[]> {
   const refreshed = await refreshQueuedAgentTaskProjections(messages);
-  const renderedContents = await agentPermalinkRenderService.renderAgentReadablePermalinksInTexts(
-    refreshed.map((m) => m.content ?? ""),
-    serverId,
-  );
+  // Raft's own system apps' events read as ordinary messages; an external app's inert (agentFacingContent.ts).
+  const contents = await renderAgentFacingContents(refreshed, agentId, serverId);
   return (refreshed as AgentInboxQueuedEvent[]).map((m, index) => {
     const fallbackSenderType = m.messageType === "system"
       ? "system"
@@ -121,11 +128,7 @@ export async function projectAgentInboxEvents(
       // camelCase `m.senderType` (always undefined here), so this echo field
       // was stuck at "agent" for every event regardless of the real sender.
       senderType: m.sender_type ?? fallbackSenderType,
-      content: m.sender_type === "third_party_app"
-        ? m.external_message
-          ? m.content
-          : renderThirdPartyInertText({ field: "tool_result", value: m.content })
-        : renderedContents[index],
+      content: contents[index]!,
     };
   });
 }
@@ -140,11 +143,11 @@ export async function acknowledgeExternalAgentInboxSeqs(
   agentOrchestrator: Pick<AgentOrchestrator, "acknowledgeDeliveredMessages">,
   agentId: string,
   seqs: readonly number[],
-): Promise<void> {
+): Promise<channelService.AgentReadPositionAdvance[]> {
   const normalized = [...new Set(seqs.filter((seq) => Number.isInteger(seq) && seq > 0))];
-  if (normalized.length === 0) return;
+  if (normalized.length === 0) return [];
   agentOrchestrator.acknowledgeDeliveredMessages(agentId, normalized);
-  await channelService.markAgentLegacyAckCheckpoint(agentId, normalized);
+  return channelService.markAgentLegacyAckCheckpoint(agentId, normalized);
 }
 
 /**
@@ -152,14 +155,15 @@ export async function acknowledgeExternalAgentInboxSeqs(
  * response handed over with seq <= `sinceSeq`. The pending set is trimmed in the
  * same transaction that reads it, so two requests cannot both acknowledge the
  * same rows; the read-position write follows the commit (if it fails the rows
- * are simply delivered again). Returns the acknowledged seqs.
+ * are simply delivered again). Returns the acknowledged seqs and the read
+ * positions they moved.
  */
 export async function acknowledgeAgentInboxEventsCursor(
   agentOrchestrator: Pick<AgentOrchestrator, "acknowledgeDeliveredMessages">,
   agentId: string,
   sinceSeq: number,
   executor: DatabaseExecutor = getDb(),
-): Promise<number[]> {
+): Promise<{ acked: number[]; advances: channelService.AgentReadPositionAdvance[] }> {
   const ackable = await executor.transaction(async (tx) => {
     const [row] = await tx.select({ seqs: agentInboxEventsPendingAcks.seqs })
       .from(agentInboxEventsPendingAcks)
@@ -175,8 +179,8 @@ export async function acknowledgeAgentInboxEventsCursor(
     }).where(eq(agentInboxEventsPendingAcks.agentId, agentId));
     return acked;
   });
-  await acknowledgeExternalAgentInboxSeqs(agentOrchestrator, agentId, ackable);
-  return ackable;
+  const advances = await acknowledgeExternalAgentInboxSeqs(agentOrchestrator, agentId, ackable);
+  return { acked: ackable, advances };
 }
 
 /** Record the durable rows a cursor-mode `/events` response hands over, unacknowledged. */

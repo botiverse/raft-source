@@ -2,6 +2,7 @@ import { expect, test } from "@playwright/test";
 import { loginViaApi } from "../../fixtures/auth";
 import { waitForSeedState } from "../../fixtures/seedState";
 import { dismissOwnerOnboarding } from "../../fixtures/session";
+import { expectTimelineRendered } from "../../fixtures/timeline";
 import { clickShareMessagesMenu, shareMessagesMenu } from "../../fixtures/contextMenu";
 
 // Once select mode is active, a second right-click on any message should NOT
@@ -16,8 +17,9 @@ test("right-click on a message while select mode is active does not re-open cont
 
   // Wait until the channel is rendered so the socket.io per-channel room is
   // joined before we POST messages (see "socket.io rooms have no buffer").
-  await expect(page.getByTestId("message-scroller")).toBeVisible();
-  await expect(page.getByText(seedState.messages.latestContent)).toBeVisible();
+  // Any rendered row: other tests post to this channel, so its seeded
+  // latest message may be far above the tail (and not mounted).
+  await expectTimelineRendered(page);
 
   // Seed two messages so there's something to right-click.
   const tag = `rightclick-suppress-${Date.now()}`;

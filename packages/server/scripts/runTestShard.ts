@@ -28,6 +28,7 @@ import { readFileSync } from "node:fs";
 import { readdir } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { SERVER_SHARD_TIMINGS_ENV } from "./serverShardTimings";
 
 interface ShardSummary {
   shard: number;
@@ -97,6 +98,13 @@ async function listAllTestFiles(): Promise<string[]> {
   }
   await walk(SRC_DIR);
   return out;
+}
+
+export function buildVitestArguments(files: string[], env: NodeJS.ProcessEnv = process.env): string[] {
+  const reporters = env[SERVER_SHARD_TIMINGS_ENV]
+    ? ["--reporter=default", `--reporter=${fileURLToPath(new URL("./serverShardTimingReporter.ts", import.meta.url))}`]
+    : [];
+  return ["run", ...files, ...reporters];
 }
 
 async function main() {
@@ -170,7 +178,7 @@ async function main() {
     `[runTestShard] shard ${shardIndex}/${manifest.shardCount}: ${present.length} files (expected ~${(myShard.expectedDurationMs / 1000).toFixed(1)}s)`,
   );
 
-  const child = spawn(process.execPath, [VITEST_CLI, "run", ...present], {
+  const child = spawn(process.execPath, [VITEST_CLI, ...buildVitestArguments(present)], {
     cwd: SERVER_DIR,
     env: { ...process.env, TZ: process.env.TZ || "Asia/Singapore" },
     stdio: "inherit",

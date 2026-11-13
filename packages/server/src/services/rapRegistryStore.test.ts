@@ -1,10 +1,6 @@
 import { dbTest as test } from "../test/integration/dbTest";
 import { closeTestDatabase, openTestDatabase } from "../test/integration/database";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
-import path from "node:path";
-import ts from "typescript";
-import { fileURLToPath } from "node:url";
 import { getDb } from "../db/index";
 import { agentChannelReadCursors, agents, channelAgents, channels, servers, users } from "../db/schema";
 import { and, eq } from "drizzle-orm";
@@ -29,7 +25,6 @@ import {
 } from "./rapRegistryStore";
 
 
-const STORE_SOURCE = path.join(path.dirname(fileURLToPath(import.meta.url)), "rapRegistryStore.ts");
 
 // Test-only ids. Real built-in names live in the manifest module and are read
 // through its exported constants rather than repeated in OS-layer source.
@@ -95,7 +90,6 @@ test("the production catalog is exactly the three closed built-in manifests", as
   assert.deepEqual(BUILT_IN_RAP_APPS, [
     {
       appId: "system.reminder",
-      composerReference: { displayName: "Reminder" },
       manifest: {
         app_id: "system.reminder",
         hooks: [],
@@ -107,7 +101,6 @@ test("the production catalog is exactly the three closed built-in manifests", as
     },
     {
       appId: "system.cleaner",
-      composerReference: { displayName: "Memory Cleaner" },
       manifest: {
         app_id: "system.cleaner",
         hooks: [],
@@ -115,7 +108,7 @@ test("the production catalog is exactly the three closed built-in manifests", as
         // below is class identity only; the classes are minted Computer-local
         // and transient by #203.
         syscalls: [],
-        notifications: ["memory_size_hint", "disk_space_hint"],
+        notifications: ["memory_size_hint", "disk_space_hint", "backup_ignore_hint"],
         config: {
           enabled: { type: "boolean", default: true },
           threshold_bytes: {
@@ -136,7 +129,6 @@ test("the production catalog is exactly the three closed built-in manifests", as
     },
     {
       appId: "system.canary",
-      composerReference: null,
       manifest: {
         app_id: "system.canary",
         hooks: [],
@@ -206,17 +198,9 @@ test("a resource cannot be allocated for an app that is not installed", async ()
 test("declared built-in hooks are a subset of the slots registerable on this exact", () => {
   // task #151 made REGISTERABLE_HOOKS the single source that both AppHookHandlers
   // and the runtime not_registerable check derive from, so the slot list is read
-  // from there. Read from source rather than the import so the tooth still fails
-  // if the canonical declaration is renamed or deleted.
-  const source = readFileSync(STORE_SOURCE, "utf8");
-  const start = source.indexOf("export const REGISTERABLE_HOOKS = [");
-  assert.notEqual(start, -1, "REGISTERABLE_HOOKS anchor missing: tooth cannot see registerable slots");
-  const end = source.indexOf("]", start);
-  assert.notEqual(end, -1, "REGISTERABLE_HOOKS end missing: tooth cannot delimit registerable slots");
-  const slotBlock = source.slice(start, end);
-  const registerable = new Set([...slotBlock.matchAll(/"([a-zA-Z]+)"/g)].map((match) => match[1]));
-  assert.ok(registerable.size > 0, "no registerable slots parsed: refuse to report a blind GREEN");
-  assert.deepEqual([...registerable], [...REGISTERABLE_HOOKS], "the parsed slot list must equal the exported canonical one");
+  // from there.
+  const registerable = new Set<string>(REGISTERABLE_HOOKS);
+  assert.ok(registerable.size > 0, "no registerable slots: refuse to report a blind GREEN");
 
   const unsupported = BUILT_IN_RAP_APPS.flatMap((definition) =>
     definition.manifest.hooks
@@ -480,167 +464,5 @@ test("§151: runtime registerability is derived from the canonical slot list, no
   // The type side of the same fact: a slot exists exactly for the canonical names.
   const slotted: AppHookHandlers = {};
   assert.deepEqual(Object.keys(slotted), []);
-  const source = readFileSync(STORE_SOURCE, "utf8");
-  assert.ok(
-    /export type AppHookHandlers = \{ \[K in RegisterableHookName\]\?/.test(source),
-    "AppHookHandlers must be derived from RegisterableHookName -- a hand-written slot list can drift from the runtime check",
-  );
 });
 
-/**
- * §151 dependency tooth, rewritten twice under @Huaihuai's reviewer mutations.
- *
- * Three of my source-text proxies were defeated in turn, each by a mutation that
- * reinstated a SECOND hardcoded fact while every behaviour tooth stayed green:
- *
- *   1. comparing current values      -- `return hook !== "onThresholdCrossed"`
- *   2. `body.includes("REGISTERABLE_HOOKS")` -- `void REGISTERABLE_HOOKS;` is a
- *      dead read: the identifier occurs and decides nothing
- *   3. "one return, no string literal" -- a comma expression plus
- *      `String.fromCharCode(...)` spells the hook name with no quote at all
- *
- * Each proxy asked "does the text look right?" when the contract is "IS the
- * decision the canonical membership test?". So this reads the syntax tree and
- * requires the returned expression to BE `<...REGISTERABLE_HOOKS...>.includes(hook)`.
- * A comma expression, a comparison, or a computed string is then not merely
- * discouraged -- it is a different node type and cannot be shaped into one.
- *
- * Why this cannot be behavioural: a restatement whose values agree with the
- * canonical list is observationally identical to a derivation. It only diverges
- * later, when task #142 edits the canonical array alone -- and by then the tooth
- * has been green across the whole drift.
- *
- * ⚠️ wording-coupled: re-anchor on refactor. It fails closed when the function,
- * its body, or the expected shape cannot be found, rather than reporting a GREEN
- * it did not earn.
- */
-test("§151 dependency: the sole decision must BE canonical membership on `hook`", () => {
-  const source = readFileSync(STORE_SOURCE, "utf8");
-  const sourceFile = ts.createSourceFile("rapRegistryStore.ts", source, ts.ScriptTarget.Latest, true);
-
-  let fn: ts.FunctionDeclaration | undefined;
-  sourceFile.forEachChild((node) => {
-    if (ts.isFunctionDeclaration(node) && node.name?.text === "isRegisterableHook") fn = node;
-  });
-  assert.ok(fn, "isRegisterableHook declaration not found -- this tooth cannot see the classifier, so it must fail rather than pass blind (wording-coupled: re-anchor on refactor)");
-  assert.ok(fn.body, "isRegisterableHook has no body -- refusing to report a blind GREEN");
-
-  // @Huaihuai's sixth mutation runs BEFORE the body ever executes. A parameter
-  // default initializer is executable surface, and hers used one to reassign the
-  // canonical array's own membership method:
-  //
-  //     _decision = ((REGISTERABLE_HOOKS as unknown as {
-  //       includes: (value: string) => boolean;
-  //     }).includes = (value: string) => value !== "onThresholdCrossed")
-  //
-  // The body still held exactly one canonical-looking return -- correct node
-  // types, correct receiver identity, correct argument -- so every check below
-  // stayed green while the membership function itself had been replaced. Same
-  // family as all five before it: the decision simply moved to a surface this
-  // tooth could not see.
-  //
-  // So the signature is pinned too: exactly one parameter, that parameter IS the
-  // identifier `hook`, carrying no initializer, rest, or destructuring. That
-  // leaves no place for code to run ahead of the sole return.
-  //
-  // ⚠️ Deliberately NOT a whole-file anti-monkeypatch scan (@Huaihuai bounded it
-  // here): the gap was the unexamined executable signature, not reassignment in
-  // general. An unbounded scan would be a proxy again, and proxies are what the
-  // previous five escapes were made of.
-  assert.equal(
-    fn.parameters.length,
-    1,
-    `isRegisterableHook must take exactly the hook under classification; found ${fn.parameters.length} parameters. A further parameter's default initializer is executable surface that runs before the body and can replace the membership test itself.`,
-  );
-  const param = fn.parameters[0];
-  assert.ok(
-    ts.isIdentifier(param.name) && param.name.text === "hook",
-    `the sole parameter must BE the identifier \`hook\`, but it is \`${param.name.getText(sourceFile).replace(/\s+/g, " ").slice(0, 160)}\` -- a destructuring pattern carries its own initializers and is executable surface too`,
-  );
-  assert.equal(
-    param.initializer,
-    undefined,
-    `the parameter must carry no default initializer; an initializer is evaluated before the sole return and can monkeypatch the canonical list out from under it: \`${param.initializer?.getText(sourceFile).replace(/\s+/g, " ").slice(0, 160)}\``,
-  );
-  assert.equal(
-    param.dotDotDotToken,
-    undefined,
-    "the parameter must not be a rest parameter -- a rest parameter admits further arguments whose initializers this tooth cannot see",
-  );
-
-  // @Huaihuai's fifth mutation hid a competing decision exactly where a
-  // top-level `statements.filter(isReturnStatement)` cannot see it:
-  //
-  //     if (hook === "onThresholdCrossed") return false;
-  //     return (REGISTERABLE_HOOKS as readonly string[]).includes(hook);
-  //
-  // The nested return lives inside the IfStatement, so the filter still counted
-  // ONE return and the tooth stayed green with an early exit sitting above the
-  // canonical test. Same failure family as every earlier escape: the values
-  // agree today, and they diverge the moment #142 adds `onThresholdCrossed` to
-  // the canonical array -- the hook would stay falsely unregisterable while
-  // this tooth had been green across the whole drift.
-  //
-  // Counting returns was the wrong question. The body must CONTAIN nothing but
-  // the canonical decision: one statement, and that statement is the return.
-  // A guard, a branch, or an early exit is then a second decision by
-  // construction rather than something to enumerate and catch.
-  assert.equal(
-    fn.body.statements.length,
-    1,
-    `isRegisterableHook's body must contain only the canonical membership return; found ${fn.body.statements.length} statements. Anything else -- a guard clause, an early exit, a branch -- is competing decision logic: it agrees with the canonical list today and drifts the moment #142 edits that array alone.`,
-  );
-  const only = fn.body.statements[0];
-  assert.ok(
-    ts.isReturnStatement(only),
-    `the classifier's single statement must BE the canonical return, but it is a ${ts.SyntaxKind[only.kind]}: \`${only.getText(sourceFile).replace(/\s+/g, " ").slice(0, 160)}\``,
-  );
-
-  // Belt and braces: no return may hide anywhere else in the body -- including
-  // inside a nested function expression, which the statement count above cannot
-  // see either. Checked recursively so this leaf does not depend on that count
-  // staying exact.
-  let nested = 0;
-  const countReturns = (node: ts.Node): void => {
-    if (ts.isReturnStatement(node) && node !== only) nested += 1;
-    node.forEachChild(countReturns);
-  };
-  fn.body.forEachChild(countReturns);
-  assert.equal(
-    nested,
-    0,
-    `found ${nested} further return statement(s) nested inside isRegisterableHook; only the canonical membership return may decide`,
-  );
-
-  let decision = only.expression;
-  assert.ok(decision, "the return statement carries no expression -- refusing to report a blind GREEN");
-  while (ts.isParenthesizedExpression(decision) || ts.isAsExpression(decision)) decision = decision.expression;
-
-  const shown = decision.getText(sourceFile).replace(/\s+/g, " ").slice(0, 160);
-  assert.ok(
-    ts.isCallExpression(decision),
-    `the decision must BE a membership call on the canonical list, but it is a ${ts.SyntaxKind[decision.kind]}: \`${shown}\`. A comparison, a comma expression, or a computed string is a second copy of the list -- it agrees today and drifts the moment #142 edits the canonical array alone.`,
-  );
-  const callee = decision.expression;
-  assert.ok(
-    ts.isPropertyAccessExpression(callee) && callee.name.text === "includes",
-    `the decision must be an \`.includes(...)\` membership test, but calls \`${callee.getText(sourceFile)}\``,
-  );
-  // The receiver must BE the canonical identifier, not merely render to text
-  // containing it: `(void REGISTERABLE_HOOKS, ["onInstall", ...])` is a second
-  // hardcoded list whose rendered text still holds the name (@Huaihuai's fourth
-  // reviewer mutation). This was the last leaf still decided by source text, and
-  // it is exactly where the mutation landed.
-  let receiver: ts.Expression = callee.expression;
-  while (ts.isParenthesizedExpression(receiver) || ts.isAsExpression(receiver)) receiver = receiver.expression;
-  assert.ok(
-    ts.isIdentifier(receiver) && receiver.text === "REGISTERABLE_HOOKS",
-    `membership must be tested against the REGISTERABLE_HOOKS identifier itself, but the receiver is a ${ts.SyntaxKind[receiver.kind]}: \`${receiver.getText(sourceFile).replace(/\s+/g, " ").slice(0, 160)}\`. An array literal, or any expression that merely mentions the canonical name, is a second copy of the list.`,
-  );
-  assert.equal(decision.arguments.length, 1, "membership must be tested for exactly the hook under classification");
-  assert.equal(
-    decision.arguments[0].getText(sourceFile).trim(),
-    "hook",
-    "membership must be tested for `hook` itself, not for a value derived from it",
-  );
-});

@@ -1,0 +1,15 @@
+{
+  "protocolVersion": 1,
+  "runtimeId": "kimi-sdk",
+  "schemaVersion": "kimi-sdk.create.v1",
+  "sourceId": "reasoningEffort",
+  "kind": "dependent_select",
+  "pointer": "/reasoningEffort",
+  "dependsOn": "/model",
+  "optionsByValue": {},
+  "defaultValueByValue": {},
+  "customValueAllowedByValue": {},
+  "status": "fallback",
+  "reason": "missing_config",
+  "retryable": false
+}

@@ -3,6 +3,7 @@ import type {
   RuntimeSendResult,
   RuntimeSession,
 } from "./drivers/index";
+import type { RuntimeTurnOrigin } from "./runtimeTurnOrigin";
 
 export interface RuntimeBindingProcess {
   readonly runtime: RuntimeSession;
@@ -93,6 +94,10 @@ function requireImmediateRuntimeSendResult(
   return result as RuntimeSendResult;
 }
 
+function runtimeMismatch(binding: RuntimeProcessBinding, process: RuntimeBindingProcess, runtimeId: string): boolean {
+  return binding.configuredRuntimeId !== runtimeId || binding.driverId !== process.driver.id;
+}
+
 export class RuntimeProcessBindingFence {
   private readonly bindings = new WeakMap<RuntimeSession, RuntimeProcessBinding>();
   private readonly getCurrentProcess: RuntimeProcessBindingFenceOptions["getCurrentProcess"];
@@ -116,6 +121,17 @@ export class RuntimeProcessBindingFence {
 
   getBinding(runtime: RuntimeSession): RuntimeProcessBinding | null {
     return this.bindings.get(runtime) ?? null;
+  }
+
+  /**
+   * Whether a config naming `runtimeId` makes this process's input and
+   * output refused as `runtime_mismatch`: it names another runtime than the
+   * one the process was bound to at its spawn (or the process runs another
+   * driver). By default the process's own config.
+   */
+  refusesRuntime(process: RuntimeBindingProcess, runtimeId: string = process.config.runtime): boolean {
+    const binding = this.bindings.get(process.runtime);
+    return binding !== undefined && runtimeMismatch(binding, process, runtimeId);
   }
 
   rebindLaunch(
@@ -182,6 +198,7 @@ export class RuntimeProcessBindingFence {
       mode: "idle" | "busy";
       text: string;
       sessionId?: string | null;
+      origin?: RuntimeTurnOrigin | null;
     },
     source: string,
   ): RuntimeSendResult {
@@ -222,7 +239,7 @@ export class RuntimeProcessBindingFence {
   async start(
     agentId: string,
     process: RuntimeBindingProcess,
-    input: { text: string; sessionId?: string | null },
+    input: { text: string; sessionId?: string | null; origin?: RuntimeTurnOrigin | null },
   ): Promise<RuntimeSendResult> {
     const validation = this.validate(agentId, process, process.runtime);
     if (!validation.ok) {
@@ -344,10 +361,7 @@ export class RuntimeProcessBindingFence {
     if (binding.machineId !== (runtimeContext?.machineId ?? null)) {
       return { ok: false, reason: "machine_mismatch", binding, current };
     }
-    if (
-      binding.configuredRuntimeId !== process.config.runtime
-      || binding.driverId !== process.driver.id
-    ) {
+    if (runtimeMismatch(binding, process, process.config.runtime)) {
       return { ok: false, reason: "runtime_mismatch", binding, current };
     }
     if (binding.activeLaunchId !== process.launchId) {

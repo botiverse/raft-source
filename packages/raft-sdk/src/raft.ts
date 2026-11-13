@@ -1,3 +1,4 @@
+import type { RaftbenchFindingsQuery, RaftbenchFindingsResponse } from "@botiverse/raft-shared";
 // `createRaft`: the 1.0 client. Operations are organised by what an agent
 // wants to do (identity, wake, inbox, messages, tasks) and return outcomes with
 // a structured next step and the canonical text; `routes` is the typed
@@ -18,6 +19,8 @@ import {
   unarchiveChannel,
   updateChannel,
   updateServer,
+  type ChannelLeaveRequest,
+  type ChannelMemberRemoveRequest,
   type ChannelMemberRequest,
   type CreateChannelRequest,
   type RaftChannelArchiveState,
@@ -29,6 +32,7 @@ import {
   unassignTask,
   type UnassignTaskRequest,
   prepareActionCard,
+  withdrawQuestionCard,
   attachmentComments,
   channelInfo,
   channelMembers,
@@ -45,6 +49,7 @@ import {
   joinChannel,
   leaveChannel,
   listInbox,
+  readInboxItem,
   listTasks,
   listThreads,
   muteChannel,
@@ -63,6 +68,7 @@ import {
   senderMentionDeliveries,
   sendMessage,
   serverInfo,
+  updateMessageCard,
   showProfile,
   showTask,
   taskHistory,
@@ -83,6 +89,7 @@ import {
   listMcpTools,
   readAllRaftbenchContext,
   readRaftbenchContext,
+  readRaftbenchFindings,
   raftbenchFailedReport,
   submitRaftbenchReport,
   type ReadRaftbenchContextRequest,
@@ -105,6 +112,8 @@ import {
   type AmendTaskOutcome,
   type PrepareActionCardRequest,
   type RaftPreparedCard,
+  type RaftQuestionWithdrawal,
+  type WithdrawQuestionCardRequest,
   type AmendTaskRequest,
   type AssignTaskRequest,
   type MentionResolutionIdsRequest,
@@ -137,6 +146,8 @@ import {
   type UpdateTaskStatusRequest,
   type DrainInboxRequest,
   type ListInboxRequest,
+  type RaftInboxItemPage,
+  type ReadInboxItemRequest,
   type RaftInboxBatch,
   type RaftInboxDrainSummary,
   type RaftInboxListing,
@@ -150,6 +161,8 @@ import {
   type SeenFrontierSnapshot,
   type SendMessageOutcome,
   type SendMessageRequest,
+  type RaftCardUpdate,
+  type UpdateMessageCardRequest,
   type VerifyNoticeInput,
   type VerifyNoticeResult,
 } from "@botiverse/raft-shared/src/agentOps/index";
@@ -168,19 +181,30 @@ import type {
   AgentApiAppConfigResponse,
   AgentApiProfileView,
   AgentApiTaskAmendSuccessResponse,
-  AgentApiTaskCreateResponse,
+  AgentApiTaskCreateSuccessResponse,
   AgentApiTaskEnvelope,
   AgentApiTaskHistoryResponse,
   AgentApiThreadListItem,
 } from "@botiverse/raft-shared/src/agentApiContract";
 
 import type { RaftbenchContextResponse, RaftbenchReport } from "@botiverse/raft-shared/src/agentOps/index";
-import { requireAgentCredential, requireServerUrl, type CreateRaftClientOptions } from "./client";
+import { requireAgentCredential, requireServerUrl, sdkRequestHeaders, type CreateRaftClientOptions } from "./client";
+import { createRaftAssistantOwnerActions, type RaftAssistantOwnerActions } from "./assistantOwnerActions";
 import { getRaftContext, type RaftContextData, type RaftContextResult } from "./context";
 import { uploadRaftAvatar, type RaftApiResult, type RaftAvatarUpload } from "./manage";
 import { formatAgentProfile } from "@botiverse/raft-shared/src/agentText/index";
 import { createRaftRouteClient, raftRoutesFromClient, type RaftRoutes } from "./routes";
+import { createRaftArtifacts, raftArtifactsHandlers, type RaftArtifacts } from "./apps/artifacts";
 import { lookupRaftOperation, type RaftOperationName } from "./operations";
+import {
+  createMemoryIntegrationSessionStore,
+  createRaftIntegrations,
+  type RaftIntegrationActions,
+  type RaftIntegrationCallData,
+  type RaftIntegrationCallRequest,
+  type RaftIntegrationService,
+  type RaftIntegrationSessionStore,
+} from "./integrations";
 
 export interface CreateRaftOptions {
   /** Raft Server origin, for example `https://api.raft.build`. */
@@ -189,7 +213,7 @@ export interface CreateRaftOptions {
   credential: string;
   /** Optional fetch implementation (network policy wrappers, tests). */
   fetch?: typeof fetch;
-  /** Static request headers; `authorization` always comes from `credential`. */
+  /** Static request headers, over the SDK's own `X-Raft-Client: sdk` and `X-Raft-Client-Capabilities`; `authorization` always comes from `credential`. */
   headers?: Record<string, string>;
   /** Bounded attempts for retry-safe routes only. Defaults to 1; capped at 5. */
   retry?: { attempts?: number };
@@ -240,6 +264,13 @@ export interface CreateRaftOptions {
    *   send is followed by the conversation's cards and latest messages.
    */
   conversationCards?: boolean;
+  /**
+   * Where `integrations.call` keeps each app's session cookies, keyed by agent
+   * id and app client id. The cookies are this agent's credential at the app:
+   * persist them like one, and never hand one agent's to another. Default: in
+   * memory for the life of this client (one login per app per process).
+   */
+  integrationSessions?: RaftIntegrationSessionStore;
 }
 
 export interface RaftInboxCommitResult {
@@ -313,10 +344,27 @@ export interface Raft {
      * an async iterator: the pull that acknowledges a batch is only sent when
      * you ask for the next one, so process a batch before continuing. Stopping
      * midway leaves the current batch unacknowledged.
+     *
+     * @deprecated Reads the whole inbox at once, which RFC 081 (D15) retires
+     * with `raft message check`. List with `inbox.list()` and read one
+     * conversation at a time with `messages.read({ target, unread: true })`.
      */
     drain(request?: DrainInboxRequest): AsyncGenerator<RaftInboxBatch, RaftInboxDrainSummary, void>;
-    /** The Activity panel: unread conversations with the command that opens each. Consumes nothing. */
+    /**
+     * The Activity panel (`raft inbox check`): unread conversations with the
+     * command that opens each. Where the Server lists inbox items (RFC 081),
+     * also `items`: conversations, app items and reminders, each read with
+     * `inbox.read`. Consumes nothing.
+     */
     list(request?: ListInboxRequest): Promise<RaftOutcome<RaftInboxListing, "listed" | "empty">>;
+    /**
+     * One page of one inbox item (`raft inbox read`, RFC 081): what it gives
+     * out is read and is not given again, so it is sent once and never
+     * retried. `remaining` says how much is left; read again for the rest. A
+     * reminder is shown but stays until it is acked. Needs a Server with
+     * inbox items; to re-read something, use `messages.read`.
+     */
+    read(request: ReadInboxItemRequest): Promise<RaftOutcome<RaftInboxItemPage, "read" | "empty">>;
   };
   messages: {
     /** Read a conversation like `raft message read`; advances the seen frontier by the CLI's rules. */
@@ -336,6 +384,13 @@ export interface Raft {
     resolve(request: { messageId: string }): Promise<RaftOutcome<RaftMessage, "message">>;
     react(request: ReactRequest): Promise<RaftOutcome<ReactRequest, "added" | "removed">>;
     unreact(request: ReactRequest): Promise<RaftOutcome<ReactRequest, "added" | "removed">>;
+    /**
+     * Replace the card (and its text) of a card message this agent sent, within
+     * 14 days (RFC 082). Notifies no one: `text` says so and names each
+     * @mention of the new text. Keyed like `send`: one `idempotencyKey` per
+     * logical update (generated when omitted, returned as `data.idempotencyKey`).
+     */
+    updateCard(request: UpdateMessageCardRequest): Promise<RaftOutcome<RaftCardUpdate, "updated">>;
   };
   attachments: {
     /** Small-file multipart upload into a conversation; the upload alone posts nothing. */
@@ -350,6 +405,14 @@ export interface Raft {
     downloadUrl(request: { attachmentId: string }): Promise<RaftOutcome<RaftAttachmentDownloadUrl, "url">>;
     comments(request: { attachmentId: string; limit?: number }): Promise<RaftOutcome<AgentApiAttachmentCommentsResponse & { attachmentId: string }, "comments" | "empty">>;
   };
+  /**
+   * Workspace Artifacts (servers whose deployment runs Artifacts): versioned
+   * pages and files in Raft. `artifact` takes an id (either form: the
+   * `pt_…` the API answers with, or the short one in a link), a name or a
+   * link. The Server remembers what you have seen: `read` of the current
+   * version and `comments` move that position.
+   */
+  artifacts: RaftArtifacts;
   mentions: {
     /** @mentions you sent that reached nobody, with the recovery commands. */
     pending(request?: { limit?: number }): Promise<RaftOutcome<RaftPendingMentions, "pending" | "empty">>;
@@ -364,9 +427,22 @@ export interface Raft {
     /**
      * Post an action card for a human to confirm (channel:create,
      * channel:add_member, agent:create, and the integration card types). The
-     * human who clicks it executes it as themselves.
+     * human who clicks it executes it as themselves. A `plan:upgrade` card
+     * executes nothing (its button opens the upgrade dialog, no reply
+     * follows); a repeat within a day returns the card already there with
+     * `data.existing: true`.
      */
     prepare(request: PrepareActionCardRequest): Promise<RaftOutcome<RaftPreparedCard, "prepared">>;
+    /**
+     * Withdraw a question card (`question:ask`) this agent posted, while
+     * nobody has answered it: `messageId` is its id as `prepare` returned it,
+     * or its first 8 characters or more. No reply is posted; the outcome's
+     * text is the receipt (`withdrawn`, or `already_withdrawn` when nothing
+     * changed). Answered first: a failure with `serverCode:
+     * "ALREADY_ANSWERED"` whose text and `next.args.result` carry the
+     * answers. Expired: `serverCode: "QUESTION_EXPIRED"`.
+     */
+    withdraw(request: WithdrawQuestionCardRequest): Promise<RaftOutcome<RaftQuestionWithdrawal, "withdrawn" | "already_withdrawn">>;
   };
   manual: {
     /** Fetch a Manual topic; `intent` and `reason` are required and must never carry prompts, credentials, or message payloads. */
@@ -384,20 +460,20 @@ export interface Raft {
     assign(request: AssignTaskRequest): Promise<RaftOutcome<{ target: string; taskNumber: number; assignee: string | null; revision: number }, "assigned" | "unassigned">>;
     /** Clear a task's assignee. */
     unassign(request: UnassignTaskRequest): Promise<RaftOutcome<{ target: string; taskNumber: number; assignee: null; revision: number }, "unassigned">>;
-    /** todo → in_progress → in_review → done; `closed` from anywhere. A hold comes back as `state: "interrupted"` (resume = the same update). */
+    /** Set any status from any status (todo → in_progress → done is the usual path; `backlog` = not now, with an optional `reason`; `closed` = won't do). A hold comes back as `state: "interrupted"` (resume = the same update). */
     updateStatus(request: UpdateTaskStatusRequest): Promise<UpdateTaskStatusOutcome>;
     amend(request: AmendTaskRequest): Promise<AmendTaskOutcome>;
     history(request: TaskRef): Promise<RaftOutcome<AgentApiTaskHistoryResponse & { target: string }, "history">>;
     /** One task's current title and description (`raft task show`). */
     show(request: TaskRef): Promise<RaftOutcome<{ target: string; task: AgentApiTaskEnvelope }, "task">>;
     /** Convert a top-level message into an unassigned task. */
-    convert(request: { target: string; messageId: string }): Promise<RaftOutcome<{ target: string; task: AgentApiTaskCreateResponse["tasks"][number] }, "converted">>;
+    convert(request: { target: string; messageId: string }): Promise<RaftOutcome<{ target: string; task: AgentApiTaskCreateSuccessResponse["tasks"][number] }, "converted">>;
     delete(request: TaskRef): Promise<RaftOutcome<TaskRef, "deleted">>;
   };
   channels: {
     /** Explicit, idempotent. Never a side effect of sending. */
     join(request: { target: string }): Promise<RaftOutcome<RaftChannelRef, "joined" | "already_joined">>;
-    leave(request: { target: string }): Promise<RaftOutcome<RaftChannelRef, "left" | "not_joined">>;
+    leave(request: ChannelLeaveRequest): Promise<RaftOutcome<RaftChannelRef & { channelDeleted?: true }, "left" | "not_joined">>;
     /** Mute ordinary Activity delivery; @mentions, DMs, and followed threads still arrive. */
     mute(request: { target: string }): Promise<RaftOutcome<RaftChannelMuteState, "muted" | "unmuted">>;
     unmute(request: { target: string }): Promise<RaftOutcome<RaftChannelMuteState, "muted" | "unmuted">>;
@@ -415,7 +491,7 @@ export interface Raft {
     unarchive(request: { target: string }): Promise<RaftOutcome<RaftChannelArchiveState, "archived" | "unarchived">>;
     /** Exactly one of `user` (a human) and `agent`. */
     addMember(request: ChannelMemberRequest): Promise<RaftOutcome<AgentApiChannelMemberAddResponse, "added" | "already_member">>;
-    removeMember(request: ChannelMemberRequest): Promise<RaftOutcome<AgentApiChannelMemberRemoveResponse, "removed" | "not_member">>;
+    removeMember(request: ChannelMemberRemoveRequest): Promise<RaftOutcome<AgentApiChannelMemberRemoveResponse, "removed" | "not_member">>;
   };
   threads: {
     list(): Promise<RaftOutcome<AgentApiThreadListItem[], "threads" | "empty">>;
@@ -470,14 +546,46 @@ export interface Raft {
     call(request: CallMcpToolRequest): Promise<RaftOutcome<RaftMcpResult, "result" | "tool_error">>;
   };
   /**
-   * RaftBench (staging pilot), for the hosted harness of the read-only
-   * service agent: the harness reads its assigned run's material, gives it to
-   * the model (which has no tools), and submits the model's result. Not an
-   * `invoke` operation. Needs `raftbench`. On a failure,
-   * `raftbenchFailureKind(outcome)` says whether to read again (`reread`),
-   * end the run (`stop`) or repeat the same request later (`retry_identical`).
+   * Raft apps that agents log in to (Agent Login integrations, such as the
+   * Reminder app), for runtimes without the `raft` CLI. v0 app manifests only.
+   * `call` logs in through Raft when needed (the app gets a one-time code,
+   * never this credential), keeps the app's session in `integrationSessions`,
+   * and calls the action. Only public https apps on their registered origin
+   * are called; redirects are not followed. Not `invoke` operations.
+   */
+  integrations: {
+    /** The apps available to this agent on this server. */
+    list(): Promise<RaftOutcome<{ services: RaftIntegrationService[] }, "services" | "empty">>;
+    /** An app's actions and their parameters, from its manifest. Does not log in. */
+    actions(service: string): Promise<RaftOutcome<RaftIntegrationActions, "actions">>;
+    /**
+     * Call one action. `approval_required` / `install_required`: a person has
+     * to approve this agent's access or install the app first (the outcome
+     * says where); then call again. An app's refusal is an `APP_ERROR` failure.
+     */
+    call(request: RaftIntegrationCallRequest): Promise<RaftOutcome<RaftIntegrationCallData, "result" | "approval_required" | "install_required">>;
+  };
+  /**
+   * RaftBench (staging pilot). `context` / `readAll` / `submit` /
+   * `submitFailure` are for the hosted harness of the read-only service
+   * agent: the harness reads its assigned run's material, gives it to the
+   * model (which has no tools), and submits the model's result. They are not
+   * `invoke` operations and need `raftbench`. On a failure, `raftbenchFailureKind(outcome)` says whether to
+   * read again (`reread`), end the run (`stop`) or repeat the same request
+   * later (`retry_identical`).
    */
   raftbench: {
+    /**
+     * Findings for an ordinary agent an administrator allowed in RaftBench
+     * settings (the `raftbench.findings` operation; needs `read`). Only
+     * findings whose every cited channel this agent can read; evidence is
+     * `{ target, messageId }`, to open with `messages.read`. `next` pages on
+     * while `nextCursor` is set. A failure's `raftbenchFailureKind` is
+     * `reread` (start again from the first page), `stop` (tell the person
+     * who asked; an administrator has to act), `retry_identical` (repeat the
+     * same read later), or null (a bug in the request).
+     */
+    findings(request?: Partial<RaftbenchFindingsQuery>): Promise<RaftOutcome<RaftbenchFindingsResponse, "page" | "last_page">>;
     /** One page of the run's material (`nextCursor` for the next one). */
     context(request?: ReadRaftbenchContextRequest): Promise<RaftOutcome<RaftbenchContextResponse, "page" | "last_page">>;
     /**
@@ -514,6 +622,14 @@ export interface Raft {
     /** The current state value, as it would be saved. */
     snapshot(): import("@botiverse/raft-shared/src/agentOps/index").RaftState;
   };
+  /**
+   * A personal assistant acting as its owner (#proj-assistant:#19): the actions
+   * its context lists (`ownerActions.list()`), each run on the owner's own route
+   * (`ownerActions.run(tool, args)`). Empty for any other agent.
+   */
+  assistant: {
+    ownerActions: RaftAssistantOwnerActions;
+  };
   /** Every Agent API route, typed from the shared contract. */
   routes: RaftRoutes;
 }
@@ -540,15 +656,20 @@ export type CreateRaftAgentOptions = CreateRaftOptions;
 /** The agent-layer client `createRaftAgent` returns. */
 export type RaftAgent = Raft;
 
+/** How long a search stops asking whether artifacts match after Raft refused the ask (403). */
+const ARTIFACTS_PROBE_PAUSE_MS = 10 * 60_000;
+
 /**
  * Create the agent-layer client (`@botiverse/raft-sdk/agent`): identity,
  * inbox, read, reply, tasks, interrupts, next steps and model-readable `text`,
  * built on the program-layer client (`raft.routes`).
  */
+
 export function createRaftAgent(options: CreateRaftAgentOptions): RaftAgent {
   const serverUrl = requireServerUrl(options.serverUrl);
   const credential = requireAgentCredential(options.credential);
   const authorization = `Bearer ${credential}`;
+  const headers = sdkRequestHeaders(options.headers);
   const frontier = SeenFrontier.fromSnapshot(options.frontier);
   if (options.hints !== undefined && options.hints !== "cli" && options.hints !== "tool") {
     throw new TypeError('createRaftAgent: hints must be "cli" or "tool".');
@@ -570,19 +691,44 @@ export function createRaftAgent(options: CreateRaftAgentOptions): RaftAgent {
   const api = createRaftRouteClient({
     serverUrl,
     fetch: options.fetch,
-    headers: options.headers,
+    headers,
     authorization,
     readAttempts: options.retry?.attempts,
     beforeRequest: options.throttle?.beforeRequest,
   });
   // Operations use the internal positional client; `raft.routes` is the named-object facade.
   const routes = raftRoutesFromClient(api);
+  // Raw-body uploads (attachments' multipart, artifacts' bytes) go over fetch, not the JSON transport.
+  const artifactTransport = {
+    serverUrl,
+    fetch: options.fetch ?? fetch,
+    headers,
+    authorization,
+  };
+  // A first-page text search also asks whether an artifact matches (searchMessages). Where Raft refuses that ask
+  // (Artifacts off for the Server, or a credential that can't reach it, such as a personal assistant's), the
+  // search stops asking for a while: one refused ask per pause, not one per search.
+  let artifactsProbeRefusedAt: number | null = null;
+  const searchApi: typeof api = {
+    ...api,
+    artifacts: {
+      ...api.artifacts,
+      list: async (...args: Parameters<typeof api.artifacts.list>) => {
+        if (artifactsProbeRefusedAt !== null && Date.now() - artifactsProbeRefusedAt < ARTIFACTS_PROBE_PAUSE_MS) {
+          throw new Error("artifacts probe paused after a refusal");
+        }
+        const result = await api.artifacts.list(...args);
+        artifactsProbeRefusedAt = !result.ok && result.status === 403 ? Date.now() : null;
+        return result;
+      },
+    },
+  };
   // Inbox pulls acknowledge (immediately, or on the next call): never cached, never redirected, never retried.
   const inboxApi: AgentApiClient = createAgentApiClient({
     fetch: {
       baseUrl: serverUrl,
       fetch: (input, init) => (options.fetch ?? fetch)(input, { ...init, cache: "no-store", redirect: "error" }),
-      headers: Object.fromEntries(new Headers(options.headers)),
+      headers,
       retry: { attempts: 1 },
       throttle: options.throttle,
       auth: { authorization },
@@ -599,7 +745,7 @@ export function createRaftAgent(options: CreateRaftAgentOptions): RaftAgent {
    * the thread-target check runs; direct method calls and origin "code" skip it.
    */
   const sendWithState = (request: SendMessageRequest, seen: SeenFrontier, fromModel = false) => withState(async () => {
-    const contentHash = await hashRaftSendContent(request.target, request.content ?? "", request.attachmentIds ?? []);
+    const contentHash = await hashRaftSendContent(request.target, request.content ?? "", request.attachmentIds ?? [], request.card);
     const pending = request.idempotencyKey ? undefined : session.findContinuation(request.target, contentHash);
     const outcome = await sendMessage(api, pending ? { ...request, idempotencyKey: pending.idempotencyKey } : request, seen, { ...style, threadTargetCheck: fromModel });
     if (outcome.ok && outcome.state === "interrupted" && outcome.interrupt.resume.idempotencyKey) {
@@ -643,6 +789,13 @@ export function createRaftAgent(options: CreateRaftAgentOptions): RaftAgent {
   };
 
   /** `seen` undefined: read without recording anything (a code read). */
+  // Inbox items consume what they give out: the single-attempt inbox client, and the page booked as seen.
+  const readItemWithState = (request: ReadInboxItemRequest, seen: SeenFrontier | undefined) => withState(async () => {
+    const outcome = await readInboxItem(inboxApi, request, { ...style, seen });
+    if (outcome.ok && seen) session.markDirty();
+    return outcome;
+  });
+
   const readWithState = (request: ReadHistoryRequest, seen: SeenFrontier | undefined) => withState(async () => {
     const outcome = await readHistory(api, request, seen, style);
     if (outcome.ok && seen) session.markDirty();
@@ -666,27 +819,30 @@ export function createRaftAgent(options: CreateRaftAgentOptions): RaftAgent {
       commit: (target) => commitInbox(target),
       drain: (request = {}) => drainWithState(request, frontier),
       list: (request) => listInbox(api, request, style).then(styled),
+      read: (request) => readItemWithState(request, frontier),
     },
     messages: {
       read: (request) => readWithState(request, frontier),
       send: (request) => sendWithState(request, frontier),
       reply: (message, request) => sendWithState({ ...request, target: message.target }, frontier),
-      search: (request) => searchMessages(api, request, style).then(styled),
+      search: (request) => searchMessages(searchApi, request, style).then(styled),
       resolve: (request) => resolveMessage(api, request, style).then(styled),
       react: (request) => reactToMessage(api, request, "add").then(styled),
       unreact: (request) => reactToMessage(api, request, "remove").then(styled),
+      updateCard: (request) => updateMessageCard(api, request).then(styled),
     },
     attachments: {
       upload: (request) => uploadAttachment(api, {
         serverUrl,
         fetch: options.fetch ?? fetch,
-        headers: Object.fromEntries(new Headers(options.headers)),
+        headers,
         authorization,
       }, request, style).then(styled),
       download: (request) => downloadAttachment(api, request).then(styled),
       downloadUrl: (request) => downloadAttachmentUrl(api, request, style).then(styled),
       comments: (request) => attachmentComments(api, request).then(styled),
     },
+    artifacts: createRaftArtifacts({ api, style, styled, transport: artifactTransport }),
     mentions: {
       pending: (request) => pendingMentionActions(api, request, style).then(styled),
       notify: (request) => notifyMentions(api, request).then(styled),
@@ -695,6 +851,7 @@ export function createRaftAgent(options: CreateRaftAgentOptions): RaftAgent {
     },
     actions: {
       prepare: (request) => prepareActionCard(api, request, style).then(styled),
+      withdraw: (request) => withdrawQuestionCard(api, request, style).then(styled),
     },
     manual: {
       get: (request) => getManualTopic(api, request).then(styled),
@@ -750,7 +907,7 @@ export function createRaftAgent(options: CreateRaftAgentOptions): RaftAgent {
       updateAvatar: async (upload) => avatarOutcome(await uploadRaftAvatar({
         serverUrl,
         fetch: options.fetch ?? fetch,
-        headers: Object.fromEntries(new Headers(options.headers)),
+        headers,
         authorization,
         beforeRequest: options.throttle?.beforeRequest,
       }, upload)),
@@ -759,11 +916,17 @@ export function createRaftAgent(options: CreateRaftAgentOptions): RaftAgent {
       getConfig: (request) => getAppConfig(api, request).then(styled),
       patchConfig: (request) => patchAppConfig(api, request).then(styled),
     },
+    integrations: createRaftIntegrations({
+      api,
+      fetch: options.fetch ?? fetch,
+      sessions: options.integrationSessions ?? createMemoryIntegrationSessionStore(),
+    }),
     mcp: {
       tools: () => listMcpTools(api).then(styled),
       call: (request) => callMcpTool(api, request).then(styled),
     },
     raftbench: {
+      findings: (request = {}) => readRaftbenchFindings(api, request).then(styled),
       context: (request) => readRaftbenchContext(api, request).then(styled),
       readAll: (request) => readAllRaftbenchContext(api, request).then(styled),
       submit: (report) => submitRaftbenchReport(api, report).then(styled),
@@ -778,6 +941,9 @@ export function createRaftAgent(options: CreateRaftAgentOptions): RaftAgent {
       },
       load: () => session.ensureLoaded(),
       snapshot: () => session.snapshot(session.version ?? 0),
+    },
+    assistant: {
+      ownerActions: createRaftAssistantOwnerActions({ api, serverUrl, fetch: options.fetch ?? fetch, headers, authorization }),
     },
     routes,
   };
@@ -812,6 +978,8 @@ export function createRaftAgent(options: CreateRaftAgentOptions): RaftAgent {
       };
     },
     "inbox.list": (args: ListInboxRequest) => raft.inbox.list(args),
+    // Consuming: refused from code (operations.ts), so what it gives out always reaches the model.
+    "inbox.read": (args: ReadInboxItemRequest, call) => readItemWithState(args, call.seen),
     // From code, a read never consumes and records nothing: its output may never reach the model.
     "messages.read": (args: ReadHistoryRequest, call) => call.origin === "code"
       ? readWithState({ ...args, consume: false }, undefined)
@@ -822,14 +990,18 @@ export function createRaftAgent(options: CreateRaftAgentOptions): RaftAgent {
     "messages.resolve": (args: { messageId: string }) => raft.messages.resolve(args),
     "messages.react": (args: ReactRequest) => raft.messages.react(args),
     "messages.unreact": (args: ReactRequest) => raft.messages.unreact(args),
+    "messages.updateCard": (args: UpdateMessageCardRequest) => raft.messages.updateCard(args),
     "attachments.downloadUrl": (args: { attachmentId: string }) => raft.attachments.downloadUrl(args),
     "attachments.comments": (args: { attachmentId: string; limit?: number }) => raft.attachments.comments(args),
+    ...raftArtifactsHandlers(raft),
     "mentions.pending": (args: { limit?: number }) => raft.mentions.pending(args),
     "mentions.notify": (args: MentionResolutionIdsRequest) => raft.mentions.notify(args),
     "mentions.add": (args: MentionResolutionIdsRequest) => raft.mentions.add(args),
     "mentions.delivery": (args: { messageId: string }) => raft.mentions.delivery(args),
     "actions.prepare": (args: PrepareActionCardRequest) => raft.actions.prepare(args),
+    "actions.withdraw": (args: WithdrawQuestionCardRequest) => raft.actions.withdraw(args),
     "manual.get": (args: { topic: string } & ManualContext) => raft.manual.get(args),
+    "raftbench.findings": (args: Partial<RaftbenchFindingsQuery>) => raft.raftbench.findings(args),
     "manual.search": (args: { query: string; scope?: string } & ManualContext) => raft.manual.search(args),
     // Task writes attest what the context saw (G2-2): load the saved state first, as a send does.
     "tasks.claim": (args: ClaimTasksRequest, call) => withState(() => claimTasks(api, args, call.seen, style)),
@@ -845,7 +1017,7 @@ export function createRaftAgent(options: CreateRaftAgentOptions): RaftAgent {
     "tasks.convert": (args: { target: string; messageId: string }) => raft.tasks.convert(args),
     "tasks.delete": (args: TaskRef) => raft.tasks.delete(args),
     "channels.join": (args: { target: string }) => raft.channels.join(args),
-    "channels.leave": (args: { target: string }) => raft.channels.leave(args),
+    "channels.leave": (args: ChannelLeaveRequest) => raft.channels.leave(args),
     "channels.mute": (args: { target: string }) => raft.channels.mute(args),
     "channels.unmute": (args: { target: string }) => raft.channels.unmute(args),
     "channels.members": (args: { target: string }) => raft.channels.members(args),
@@ -855,7 +1027,7 @@ export function createRaftAgent(options: CreateRaftAgentOptions): RaftAgent {
     "channels.archive": (args: { target: string }) => raft.channels.archive(args),
     "channels.unarchive": (args: { target: string }) => raft.channels.unarchive(args),
     "channels.addMember": (args: ChannelMemberRequest) => raft.channels.addMember(args),
-    "channels.removeMember": (args: ChannelMemberRequest) => raft.channels.removeMember(args),
+    "channels.removeMember": (args: ChannelMemberRemoveRequest) => raft.channels.removeMember(args),
     "threads.list": () => raft.threads.list(),
     "threads.unfollow": (args: { target: string; reason?: string }) => raft.threads.unfollow(args),
     "server.info": (args: ServerInfoRequest) => raft.server.info(args),

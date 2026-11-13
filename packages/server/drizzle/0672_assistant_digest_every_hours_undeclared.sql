@@ -1,0 +1,15 @@
+-- Retire assistant_contact_settings.digest_every_hours (#proj-assistant:f5822b76,
+-- artin), step 1 of 2: this release no longer declares the column (so this
+-- migration's snapshot no longer has it), and nothing in it reads or writes it.
+-- The summary interval was dropped long ago: summaries are the assistant's own
+-- repeating reminder.
+--
+-- The column stays: the release serving now and the rollback image still
+-- declare it, so they name it in every INSERT and plain SELECT on the table
+-- (docs/operations/server-release.md; a DROP COLUMN they reference is a NO-GO).
+-- A later release drops it, once no serving or rollback image declares it,
+-- with `ALTER TABLE "assistant_contact_settings" DROP COLUMN IF EXISTS
+-- "digest_every_hours"` and `-- schema-snapshot: unchanged`.
+--
+-- No data to clear: nothing has written the column since the interval went.
+SELECT 1;

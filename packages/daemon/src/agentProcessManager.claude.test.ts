@@ -21,19 +21,27 @@
 // behavior. Helpers are duplicated (slimmed) to avoid touching codex.test.ts.
 
 import assert from "node:assert/strict";
+import { assertBodyOnlyInInboxPreview } from "./testing/inboxPreview";
 import { EventEmitter } from "node:events";
 import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import type { ChildProcess } from "node:child_process";
 import { asAxSurfaceText, type AxSurfaceText,
   BasicTracer,
   CONTEXT_GENERATION_FILENAME,
+  DAEMON_LOG_TURN_BOUNDARIES,
+  EMPTY_WAKE_CONTINUATION_MS,
   MemoryTraceSink,
+  PASSIVE_RENDER_COUNTS_DDL,
+  PASSIVE_RENDER_COUNTS_UPSERT,
+  summarizeTurnsFromLog,
   type AgentConfig,
   type AgentMessage,
   type MachineToServerMessage,
   type Tracer,
+  type TrajectoryEntry,
 } from "@botiverse/raft-shared";
 import {
   ApmTraceRecorder,
@@ -66,17 +74,23 @@ import type {
   ApmTraceArtifactBundle,
   PredicateFixtureResult,
 } from "./apmStateMachineTrace";
-import { AgentProcessManager } from "./agentProcessManager";
+import { AgentProcessManager, providerLimitBackoffDelayMs, QUOTA_RESET_BACKOFF_MAX_MS } from "./agentProcessManager";
 import { writeContextGeneration } from "./contextGeneration";
+import { senderLedgerPath } from "./senderLedger";
 import { buildCliTransportDir } from "./drivers/cliTransport";
 import { installManagedRunnerCredentialFetch } from "./testing/managedRunnerCredentialFetch";
 import { createAgentAppInboxStore, type AgentAppInboxStore } from "./agentAppInbox";
 import { REMINDER_AGENT_INBOX_REGISTRY } from "./apps/reminder/inboxDefinition";
+import { exampleThirdPartyEvent } from "./axExampleFixtures";
+import { createSystemCleanerAppRegistry } from "./apps/cleaner/definition";
+import { formatAgentInboxAppItems, type AgentInboxAppItem } from "@botiverse/raft-shared";
 import { installDaemonFetchMockForTests } from "./daemonFetch";
 import type { RuntimeDriver, SpawnContext, SpawnResult, ParsedEvent } from "./drivers/index";
 import type { RuntimeLaunchVersionPolicy } from "./drivers/types";
 import { RuntimeVersionTooOldError } from "./runtimeLaunchVersion";
 import { traceRows } from "./testing/traceRows";
+import { CREDENTIAL_PROBLEM_MESSAGES } from "./runtimeErrorDiagnostics";
+import { ClaudeEventNormalizer } from "./drivers/claudeEventNormalizer";
 import { makeDeterministicTracer } from "./testing/deterministicTracer";
 import { releaseAgentManagerForTests } from "./testing/agentManagerTeardown";
 
@@ -117,7 +131,7 @@ class FakeClaudeDriver implements RuntimeDriver {
     chat: "slock_cli",
     runtimeControl: "none",
   } as const;
-  readonly session = { recovery: "resume_or_fresh" } as const;
+  readonly session = { recovery: "resume_or_fresh", compaction: "reported", compactionFailure: "does_not_stick" } as const;
   readonly model = { detectedModelsVerifiedAs: "launchable" } as const;
   readonly supportsStdinNotification = true;
   readonly busyDeliveryMode = "direct" as const;
@@ -370,6 +384,240 @@ test("stopAgent revokes the managed runner credential through the injected fetch
   }, { fetchImpl });
 });
 
+// #wg-rbac:#27: a start rebound onto a process or start the host already has
+// keeps that one's runner credential; the credential the start brought is
+// revoked once (it was left valid on the server for good), and the running
+// one is revoked only when the process ends.
+// Teeth: drop the carryRunnerCredential calls in agentProcessManager.ts -> no
+// revoke of cred-new (running, queued) or of cred-old's replacement -> RED.
+function credentialRevokes() {
+  const revoked: string[] = [];
+  const fetchImpl = async (input: string, init?: RequestInit) => {
+    if (init?.method === "DELETE") revoked.push(new URL(input).pathname.split("/").at(-1)!);
+    return new Response(null, { status: 204 });
+  };
+  return { revoked, fetchImpl };
+}
+
+test("a start rebound onto the running process revokes its own credential, never the running one", async () => {
+  const { revoked, fetchImpl } = credentialRevokes();
+  await withManager(async ({ manager, driver }) => {
+    await manager.startAgent("agent-1", makeConfig({ sessionId: "s1", agentCredentialKey: "sk_agent_old", agentCredentialId: "cred-old" }), undefined, undefined, undefined, "L-1");
+    await manager.startAgent("agent-1", makeConfig({ sessionId: "s1", agentCredentialKey: "sk_agent_new", agentCredentialId: "cred-new" }), undefined, undefined, undefined, "L-2");
+    await flush();
+    assert.equal(driver.spawnCalls.length, 1);
+    assert.equal((manager as any).agents.get("agent-1")?.launchId, "L-2", "the process carries the rebound launch");
+    assert.equal((manager as any).agents.get("agent-1")?.config.agentCredentialId, "cred-old", "the process keeps its credential");
+    assert.deepEqual(revoked, ["cred-new"], "only the rebound start's unused credential is revoked");
+
+    await manager.stopAgent("agent-1");
+    await flush();
+    assert.deepEqual(revoked, ["cred-new", "cred-old"], "stop revokes the running credential once");
+  }, { fetchImpl });
+});
+
+test("a start rebound onto a queued start keeps the queued start's credential and revokes its own", async () => {
+  const { revoked, fetchImpl } = credentialRevokes();
+  await withManager(async ({ manager, driver }) => {
+    setAgentStartCapacityFull(manager);
+    const queued = manager.startAgent("agent-1", makeConfig({ sessionId: "s1", agentCredentialKey: "sk_agent_old", agentCredentialId: "cred-old" }), undefined, undefined, undefined, "L-1");
+    await flush();
+    await manager.startAgent("agent-1", makeConfig({ sessionId: "s1", agentCredentialKey: "sk_agent_new", agentCredentialId: "cred-new" }), undefined, undefined, undefined, "L-2");
+    await flush();
+    assert.deepEqual(revoked, ["cred-new"]);
+    (manager as any).releaseAgentStartSlot("test-slot", "test: slot freed");
+    await queued;
+    assert.equal(driver.spawnCalls.length, 1);
+    assert.equal(driver.spawnCalls[0]?.config.agentCredentialId, "cred-old", "the queued start spawns with its own credential");
+    assert.equal(driver.spawnCalls[0]?.config.agentCredentialKey, "sk_agent_old");
+    await manager.stopAgent("agent-1");
+    await flush();
+    assert.deepEqual(revoked, ["cred-new", "cred-old"]);
+  }, { fetchImpl });
+});
+
+test("a start that lands mid-spawn revokes its own credential; the spawn keeps the first start's", async () => {
+  const { revoked, fetchImpl } = credentialRevokes();
+  await withManager(async ({ manager, driver }) => {
+    const realBuildSpawnConfig = (manager as any).buildSpawnConfig.bind(manager);
+    let releaseSpawnConfig!: () => void;
+    const spawnConfigGate = new Promise<void>((resolve) => { releaseSpawnConfig = resolve; });
+    let spawnConfigEntered!: () => void;
+    const enteredSpawnConfig = new Promise<void>((resolve) => { spawnConfigEntered = resolve; });
+    (manager as any).buildSpawnConfig = async (agentId: string, config: AgentConfig) => {
+      spawnConfigEntered();
+      await spawnConfigGate;
+      return realBuildSpawnConfig(agentId, config);
+    };
+
+    const first = manager.startAgent("agent-1", makeConfig({ sessionId: "s1", agentCredentialKey: "sk_agent_old", agentCredentialId: "cred-old" }), undefined, undefined, undefined, "L-1");
+    await enteredSpawnConfig;
+    await manager.startAgent("agent-1", makeConfig({ sessionId: "s1", agentCredentialKey: "sk_agent_new", agentCredentialId: "cred-new" }), undefined, undefined, undefined, "L-2");
+    assert.deepEqual(revoked, ["cred-new"], "the deferred rebind's credential is revoked when deferred");
+    releaseSpawnConfig();
+    await first;
+    await flush();
+
+    assert.equal((manager as any).agents.get("agent-1")?.launchId, "L-2");
+    assert.equal(driver.spawnCalls[0]?.config.agentCredentialId, "cred-old");
+    assert.equal((manager as any).agents.get("agent-1")?.config.agentCredentialId, "cred-old");
+    assert.deepEqual(revoked, ["cred-new"], "the running credential is not revoked by the late rebind");
+    await manager.stopAgent("agent-1");
+    await flush();
+    assert.deepEqual(revoked, ["cred-new", "cred-old"]);
+  }, { fetchImpl });
+});
+
+// #wg-rbac:#27: a start that never gets a process (queued start cancelled by
+// a stop, spawn failed before or after the process record) revokes the
+// credential it brought exactly once.
+// Teeth: drop releaseUnheldRunnerCredential in cancelQueuedAgentStart / the
+// spawn's finally, or the revoke dedupe -> RED.
+test("a queued start cancelled by a stop revokes its credential once", async () => {
+  const { revoked, fetchImpl } = credentialRevokes();
+  await withManager(async ({ manager, driver }) => {
+    setAgentStartCapacityFull(manager);
+    const queued = manager.startAgent("agent-1", makeConfig({ sessionId: "s1", agentCredentialKey: "sk_agent_q", agentCredentialId: "cred-q" }), undefined, undefined, undefined, "L-1");
+    await flush();
+    await manager.stopAgent("agent-1");
+    await queued;
+    await flush();
+    assert.equal(driver.spawnCalls.length, 0);
+    assert.deepEqual(revoked, ["cred-q"]);
+  }, { fetchImpl });
+});
+
+// #wg-rbac:#27: the daemon's ready lists the runner credentials this host
+// holds: a queued start's, a spawn's in progress, a running process's; none
+// once the process stopped.
+// Teeth: drop the queued or the spawning part of getHeldRunnerCredentialIds -> RED.
+test("getHeldRunnerCredentialIds: a queued start, a spawn in progress and a running process hold their credential", async () => {
+  const { fetchImpl } = credentialRevokes();
+  await withManager(async ({ manager }) => {
+    assert.deepEqual(manager.getHeldRunnerCredentialIds(), []);
+    const realBuildSpawnConfig = (manager as any).buildSpawnConfig.bind(manager);
+    let releaseSpawnConfig!: () => void;
+    const spawnConfigGate = new Promise<void>((resolve) => { releaseSpawnConfig = resolve; });
+    let spawnConfigEntered!: () => void;
+    const enteredSpawnConfig = new Promise<void>((resolve) => { spawnConfigEntered = resolve; });
+    (manager as any).buildSpawnConfig = async (agentId: string, config: AgentConfig) => {
+      spawnConfigEntered();
+      await spawnConfigGate;
+      return realBuildSpawnConfig(agentId, config);
+    };
+    setAgentStartCapacityFull(manager);
+    const queued = manager.startAgent("agent-1", makeConfig({ sessionId: "s1", agentCredentialKey: "sk_agent_q", agentCredentialId: "cred-q" }), undefined, undefined, undefined, "L-1");
+    await flush();
+    assert.deepEqual(manager.getHeldRunnerCredentialIds(), ["cred-q"], "a queued start holds its credential");
+    (manager as any).releaseAgentStartSlot("test-slot", "test: slot freed");
+    await enteredSpawnConfig;
+    assert.deepEqual(manager.getHeldRunnerCredentialIds(), ["cred-q"], "a spawn in progress holds its credential");
+    releaseSpawnConfig();
+    await queued;
+    await flush();
+    assert.deepEqual(manager.getHeldRunnerCredentialIds(), ["cred-q"], "the running process holds its credential");
+    await manager.stopAgent("agent-1");
+    await flush();
+    assert.deepEqual(manager.getHeldRunnerCredentialIds(), [], "a stopped process holds none");
+  }, { fetchImpl });
+});
+
+test("a start whose spawn fails before a process exists revokes its credential once", async () => {
+  const { revoked, fetchImpl } = credentialRevokes();
+  await withManager(async ({ manager, driver }) => {
+    (manager as any).buildSpawnConfig = async () => { throw new Error("spawn config failed"); };
+    await assert.rejects(manager.startAgent("agent-1", makeConfig({ sessionId: "s1", agentCredentialKey: "sk_agent_f", agentCredentialId: "cred-f" }), undefined, undefined, undefined, "L-1"));
+    await flush();
+    assert.equal(driver.spawnCalls.length, 0);
+    assert.deepEqual(revoked, ["cred-f"]);
+  }, { fetchImpl });
+});
+
+test("a start whose driver spawn throws revokes its credential once, not twice", async () => {
+  const { revoked, fetchImpl } = credentialRevokes();
+  await withManager(async ({ manager, driver }) => {
+    driver.spawn = () => { throw new Error("spawn exploded"); };
+    await manager.startAgent("agent-1", makeConfig({ sessionId: "s1", agentCredentialKey: "sk_agent_d", agentCredentialId: "cred-d" }), undefined, undefined, undefined, "L-1").catch(() => {});
+    await flush();
+    assert.equal((manager as any).agents.has("agent-1"), false);
+    assert.deepEqual(revoked, ["cred-d"]);
+  }, { fetchImpl });
+});
+
+// Warden review of #wg-rbac:#27: the spawn's `finally` releases only a
+// credential no process holds. A successful spawn registers its process (with
+// the start's or the spawn-minted key) before the `finally` runs, so it never
+// revokes its own key; only the process's end does, once.
+// Teeth: make releaseUnheldRunnerCredential skip the `this.agents` check -> RED.
+test("a successful spawn with the core's credential revokes nothing; the stop revokes it once", async () => {
+  const { revoked, fetchImpl } = credentialRevokes();
+  await withManager(async ({ manager, driver }) => {
+    await manager.startAgent("agent-1", makeConfig({ sessionId: "s1", agentCredentialKey: "sk_agent_core", agentCredentialId: "cred-core" }), undefined, undefined, undefined, "L-1");
+    await flush();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(driver.spawnCalls.length, 1);
+    assert.equal(driver.spawnCalls[0]?.config.agentCredentialKey, "sk_agent_core");
+    assert.equal((manager as any).agents.get("agent-1")?.config.agentCredentialKey, "sk_agent_core");
+    assert.deepEqual(revoked, [], "a spawned process keeps its credential");
+    await manager.stopAgent("agent-1");
+    await flush();
+    assert.deepEqual(revoked, ["cred-core"]);
+  }, { fetchImpl });
+});
+
+test("a spawn that mints its credential (daemon-local start, no core key) keeps it; the stop revokes it once", async () => {
+  const { revoked, fetchImpl } = credentialRevokes();
+  await withManager(async ({ manager, driver }) => {
+    let mints = 0;
+    (manager as any).requestManagedRunnerCredentialOnce = async () => {
+      mints += 1;
+      return { apiKey: "sk_agent_spawn", credentialId: "cred-spawn" };
+    };
+    await manager.startAgent("agent-1", makeConfig({ sessionId: "s1", agentCredentialKey: null, agentCredentialId: null }));
+    await flush();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(mints, 1);
+    assert.equal(driver.spawnCalls[0]?.config.agentCredentialKey, "sk_agent_spawn", "the runtime is launched with the minted key");
+    assert.equal((manager as any).agents.get("agent-1")?.config.agentCredentialKey, "sk_agent_spawn", "the live process holds it");
+    assert.deepEqual(revoked, []);
+    // The process keeps working on it: a message is still delivered.
+    driver.processes[0]!.stdout.emit("data", Buffer.from("noop\n"));
+    assert.equal(await manager.deliverMessage("agent-1", makeMessage("still alive")), true);
+    await flush();
+    assert.deepEqual(revoked, []);
+    await manager.stopAgent("agent-1");
+    await flush();
+    assert.deepEqual(revoked, ["cred-spawn"]);
+  }, { fetchImpl });
+});
+
+test("the spawn registers its process before the runtime starts; when the spawn's cleanup runs, a live process holds each key", async () => {
+  const { revoked, fetchImpl } = credentialRevokes();
+  await withManager(async ({ manager, driver }) => {
+    const atSpawn: Array<{ registered: boolean; revokes: number }> = [];
+    const realSpawn = driver.spawn.bind(driver);
+    driver.spawn = (ctx) => {
+      atSpawn.push({ registered: (manager as any).agents.has("agent-1"), revokes: revoked.length });
+      return realSpawn(ctx);
+    };
+    const releases: Array<{ key: string | null | undefined; heldBy: Array<string | null | undefined> }> = [];
+    const realRelease = (manager as any).releaseUnheldRunnerCredential.bind(manager);
+    (manager as any).releaseUnheldRunnerCredential = (agentId: string, config: AgentConfig, launchId: string | null) => {
+      releases.push({ key: config.agentCredentialKey, heldBy: [...(manager as any).agents.values()].map((ap: any) => ap.config.agentCredentialKey) });
+      realRelease(agentId, config, launchId);
+    };
+    await manager.startAgent("agent-1", makeConfig({ sessionId: "s1", agentCredentialKey: "sk_agent_core", agentCredentialId: "cred-core" }), undefined, undefined, undefined, "L-1");
+    await flush();
+    assert.deepEqual(atSpawn, [{ registered: true, revokes: 0 }]);
+    assert.ok(releases.length >= 1, "the spawn's cleanup ran");
+    for (const release of releases) assert.ok(release.heldBy.includes(release.key), `held when released: ${JSON.stringify(release)}`);
+    assert.deepEqual(revoked, []);
+    await manager.stopAgent("agent-1");
+    await flush();
+    assert.deepEqual(revoked, ["cred-core"]);
+  }, { fetchImpl });
+});
+
 test("Claude APM baseline: tool_call event increments outstandingToolUses", async () => {
   await withManager(async ({ driver, manager }) => {
     await manager.startAgent("agent-1", makeConfig({ sessionId: "session-1" }));
@@ -488,6 +736,236 @@ test("task #17: a turn ends with one turn_summary entry folding its trigger, act
   });
 });
 
+test("task #17: a turn's summary carries the runtime's last output text, not the daemon's diagnostic text", async () => {
+  await withManager(async ({ driver, manager, sent }) => {
+    await manager.startAgent("agent-1", makeConfig({ sessionId: "session-1" }));
+    driver.parsedLines.set("bash", [{ kind: "tool_call", name: "Bash", input: { command: "ls" }, callId: "t1" }]);
+    driver.parsedLines.set("bash-end", [{ kind: "tool_output", name: "t1", callId: "t1", ok: true }]);
+    driver.parsedLines.set("text", [{ kind: "text", text: "Listed the files; the message said no reply needed, so I didn't reply." }]);
+    driver.parsedLines.set("turn-end", [{ kind: "turn_end", sessionId: "session-1" }]);
+    await wakeIdleAgent(manager, driver, "msg-wake", "Tenny");
+    await emitLines(driver, ["bash", "bash-end", "text"]);
+    (manager as any).flushPendingTrajectory("agent-1");
+    // A reconnect notice's text row (stderr) after the reply: the daemon's, not the runtime's output.
+    (manager as any).broadcastActivity("agent-1", "working", "Codex reconnecting to provider…", [{ kind: "text", text: "stream disconnected, retrying" }], undefined, "runtime_reconnecting");
+    await emitLines(driver, ["turn-end"]);
+    const [summary, ...rest] = publishedTurnSummaries(sent);
+    assert.equal(rest.length, 0);
+    assert.equal(summary?.lastText, "Listed the files; the message said no reply needed, so I didn't reply.");
+  });
+});
+
+function publishedTurnSummaries(sent: MachineToServerMessage[]) {
+  return activityMessages(sent).flatMap((msg) => msg.entries ?? []).flatMap((entry) => entry.kind === "turn_summary" ? [entry.summary] : []);
+}
+
+/** Hand an idle agent one message (an idle-mode write, which opens a turn). */
+async function wakeIdleAgent(manager: AgentProcessManager, driver: FakeClaudeDriver, messageId: string, senderName: string) {
+  const ap = getProcess(manager, "agent-1");
+  (manager as any).commitApmIdleState("agent-1", ap, true);
+  const writes = driver.encodedCalls.length;
+  const accepted = await manager.deliverMessage(
+    "agent-1",
+    makeMessage("please look", { channel_name: "proj-runtime", message_id: messageId, sender_name: senderName }),
+    { deliveryId: `delivery-${messageId}` },
+  );
+  assert.equal(accepted, true);
+  await waitFor(() => driver.encodedCalls.length === writes + 1, "idle delivery written");
+}
+
+async function emitLines(driver: FakeClaudeDriver, lines: readonly string[]) {
+  for (const line of lines) {
+    driver.processes[0].stdout.emit("data", Buffer.from(`${line}\n`));
+    await flush();
+  }
+}
+
+test("task #17: a wake the next Claude `result` ends before any work is one turn with the work that follows", async () => {
+  await withManager(async ({ driver, manager, sent }) => {
+    await manager.startAgent("agent-1", makeConfig({ sessionId: "session-1" }));
+    driver.parsedLines.set("turn-end", [{ kind: "turn_end", sessionId: "session-1" }]);
+    driver.parsedLines.set("text", [{ kind: "text", text: "picking the notice up" }]);
+    driver.parsedLines.set("bash", [{ kind: "tool_call", name: "Bash", input: { command: "npx vitest run src/a.test.ts" }, callId: "t1" }]);
+    driver.parsedLines.set("bash-end", [{ kind: "tool_output", name: "t1", callId: "t1", ok: true }]);
+    driver.parsedLines.set("grep", [{ kind: "tool_call", name: "Bash", input: { command: "grep -rn x src" }, callId: "t2" }]);
+    driver.parsedLines.set("grep-end", [{ kind: "tool_output", name: "t2", callId: "t2", ok: true }]);
+
+    await wakeIdleAgent(manager, driver, "msg-wake", "Tenny");
+    const trigger = { target: "#proj-runtime", channelId: "channel-1", sender: "Tenny", messageId: "msg-wake" };
+    const received = activityMessages(sent).filter((msg) => msg.detail === "Message received").flatMap((msg) => msg.entries ?? []);
+    assert.deepEqual(received.map((entry) => entry.kind === "status" ? entry.trigger : entry.kind), [trigger], "the frame that opens the turn names its trigger for the server's running turn");
+    // Claude was still on a queued notice: its `result` ends the daemon's turn at once.
+    await emitLines(driver, ["turn-end"]);
+    assert.equal(activityMessages(sent).at(-1)?.detail, "Idle");
+    assert.deepEqual(publishedTurnSummaries(sent), [], "the empty wake is held");
+
+    await emitLines(driver, ["text", "bash", "bash-end", "grep", "grep-end", "turn-end"]);
+    const summaries = publishedTurnSummaries(sent);
+    assert.equal(summaries.length, 1, "one turn, not an empty wake and a turn with no trigger");
+    assert.deepEqual(summaries[0]!.trigger, trigger);
+    assert.equal(summaries[0]!.toolCalls, 2);
+    assert.deepEqual(summaries[0]!.actions, [{ kind: "run_checks", count: 1 }, { kind: "search", count: 1 }]);
+  });
+});
+
+for (const { label, turnEnd, outcome } of [
+  { label: "completed", turnEnd: { kind: "turn_end", sessionId: "session-1" }, outcome: "completed" },
+  { label: "interrupted", turnEnd: { kind: "turn_end", sessionId: "session-1", interrupted: true }, outcome: "interrupted" },
+] as const) test(`task #17: messages queued during a turn and handed over at its end close it as it ended (${label}), not unknown`, async () => {
+  await withManager(async ({ driver, manager, sent }) => {
+    await manager.startAgent("agent-1", makeConfig({ sessionId: "session-1" }));
+    // Hold the message until the turn ends, as for a runtime that cannot take messages mid-turn.
+    Object.defineProperty(driver, "busyDeliveryMode", { value: "none" });
+    driver.parsedLines.set("bash", [{ kind: "tool_call", name: "Bash", input: { command: "ls" }, callId: "t1" }]);
+    driver.parsedLines.set("bash-end", [{ kind: "tool_output", name: "t1", callId: "t1", ok: true }]);
+    driver.parsedLines.set("turn-end", [turnEnd]);
+
+    await wakeIdleAgent(manager, driver, "msg-1", "xxchan");
+    await emitLines(driver, ["bash"]);
+    const writes = driver.encodedCalls.length;
+    assert.equal(await manager.deliverMessage("agent-1", makeMessage("one more", { message_id: "msg-2", sender_name: "xxchan" }), { deliveryId: "delivery-msg-2" }), true);
+    assert.equal(driver.encodedCalls.length, writes, "queued while the turn runs");
+    await emitLines(driver, ["bash-end", "turn-end"]);
+    await waitFor(() => driver.encodedCalls.length === writes + 1, "queued message handed over at the turn end");
+    assert.equal(driver.encodedCalls.at(-1)?.mode, "idle");
+    assert.notEqual(activityMessages(sent).at(-1)?.detail, "Idle", "no idle frame between the two turns");
+
+    const summaries = publishedTurnSummaries(sent);
+    assert.equal(summaries.length, 1, "the first turn closes with the second one's start");
+    assert.equal(summaries[0]!.outcome, outcome);
+    assert.equal(summaries[0]!.trigger?.messageId, "msg-1");
+  });
+});
+
+test("task #17: work after an empty wake that waits on a background task without a status still joins the wake", async () => {
+  await withManager(async ({ driver, manager, sent }) => {
+    await manager.startAgent("agent-1", makeConfig({ sessionId: "session-1" }));
+    driver.parsedLines.set("turn-end", [{ kind: "turn_end", sessionId: "session-1" }]);
+    driver.parsedLines.set("agent", [{ kind: "tool_call", name: "Agent", input: { description: "review" }, callId: "toolu_task_a" }]);
+    driver.parsedLines.set("agent-end", [{ kind: "tool_output", name: "toolu_task_a", callId: "toolu_task_a", ok: true }]);
+    driver.parsedLines.set("a-start", subagentLine("started", "task_a"));
+    driver.parsedLines.set("a-unknown", subagentLine("notification", "task_a"));
+    driver.parsedLines.set("a-done", subagentLine("notification", "task_a", { taskStatus: "completed" }));
+
+    await wakeIdleAgent(manager, driver, "msg-wake", "Tenny");
+    await emitLines(driver, ["turn-end", "agent", "a-start", "agent-end", "turn-end", "a-unknown"]);
+    assert.equal(activityMessages(sent).at(-1)?.detail, "Waiting for 1 background task");
+    assert.deepEqual(publishedTurnSummaries(sent), [], "still one turn, running");
+
+    await emitLines(driver, ["a-done"]);
+    assert.equal(activityMessages(sent).at(-1)?.detail, "Idle");
+    const summaries = publishedTurnSummaries(sent);
+    assert.equal(summaries.length, 1);
+    assert.equal(summaries[0]!.trigger?.messageId, "msg-wake");
+    assert.equal(summaries[0]!.toolCalls, 1);
+  });
+});
+
+test("task #17: a wake left unanswered is still a turn: the next wake publishes it, a stop publishes the last", async () => {
+  await withManager(async ({ driver, manager, sent }) => {
+    await manager.startAgent("agent-1", makeConfig({ sessionId: "session-1" }));
+    driver.parsedLines.set("turn-end", [{ kind: "turn_end", sessionId: "session-1" }]);
+
+    await wakeIdleAgent(manager, driver, "msg-1", "Tenny");
+    await emitLines(driver, ["turn-end"]);
+    await wakeIdleAgent(manager, driver, "msg-2", "alice");
+    const [first, ...none] = publishedTurnSummaries(sent);
+    assert.equal(none.length, 0);
+    assert.deepEqual({ messageId: first?.trigger?.messageId, outcome: first?.outcome, toolCalls: first?.toolCalls }, { messageId: "msg-1", outcome: "completed", toolCalls: 0 });
+
+    await emitLines(driver, ["turn-end"]);
+    await manager.stopAgent("agent-1");
+    await flush();
+    const summaries = publishedTurnSummaries(sent);
+    assert.deepEqual(summaries.map((summary) => [summary.trigger?.messageId, summary.outcome, summary.toolCalls]), [
+      ["msg-1", "completed", 0],
+      ["msg-2", "completed", 0],
+    ]);
+  });
+});
+
+test("task #17: work after the bound releases a held empty wake ahead of its own entries, and the server's fold starts the new turn at its first tool call", async () => {
+  await withManager(async ({ driver, manager, sent }) => {
+    await manager.startAgent("agent-1", makeConfig({ sessionId: "session-1" }));
+    driver.parsedLines.set("turn-end", [{ kind: "turn_end", sessionId: "session-1" }]);
+    driver.parsedLines.set("bash", [{ kind: "tool_call", name: "Bash", input: { command: "ls" }, callId: "t1" }]);
+    driver.parsedLines.set("bash-end", [{ kind: "tool_output", name: "t1", callId: "t1", ok: true }]);
+    await wakeIdleAgent(manager, driver, "msg-wake", "Tenny");
+    await emitLines(driver, ["turn-end"]);
+    assert.deepEqual(publishedTurnSummaries(sent), []);
+
+    const realNow = Date.now;
+    const late = realNow() + EMPTY_WAKE_CONTINUATION_MS + 1_000;
+    Date.now = () => late;
+    try {
+      await emitLines(driver, ["bash", "bash-end"]);
+      assert.deepEqual(publishedTurnSummaries(sent).map((summary) => [summary.trigger?.messageId, summary.toolCalls]), [["msg-wake", 0]], "the wake is published as the empty turn it was");
+
+      // The rows the server stores from these frames (status entries get
+      // their activity back on ingest), folded as the running-turn read does.
+      const rows = activityMessages(sent).flatMap((msg) => (msg.entries ?? []).map((entry) => ({
+        timestamp: msg.observedAtMs!,
+        entry: (entry.kind === "status" ? { ...entry, activity: msg.activityKind ?? msg.activity } : entry) as TrajectoryEntry,
+      })));
+      const { open } = summarizeTurnsFromLog(rows, DAEMON_LOG_TURN_BOUNDARIES);
+      assert.deepEqual(open && [open.summary.startedAt, open.summary.toolCalls, open.summary.trigger], [late, 1, undefined]);
+
+      await emitLines(driver, ["turn-end"]);
+    } finally {
+      Date.now = realNow;
+    }
+    assert.deepEqual(publishedTurnSummaries(sent).map((summary) => [summary.trigger?.messageId, summary.toolCalls, summary.startedAt === late]), [
+      ["msg-wake", 0, false],
+      [undefined, 1, true],
+    ]);
+  });
+});
+
+test("task #17: an orderly daemon stop publishes a held empty wake under the launch the server expects", async () => {
+  await withManager(async ({ driver, manager, sent }) => {
+    await manager.startAgent("agent-1", makeConfig({ sessionId: "session-1" }));
+    driver.parsedLines.set("turn-end", [{ kind: "turn_end", sessionId: "session-1" }]);
+    await wakeIdleAgent(manager, driver, "msg-wake", "Tenny");
+    await emitLines(driver, ["turn-end"]);
+    const launchId = getProcess(manager, "agent-1").launchId || undefined;
+    assert.deepEqual(publishedTurnSummaries(sent), []);
+
+    await manager.stopAll();
+    const carrying = activityMessages(sent).filter((msg) => (msg.entries ?? []).some((entry) => entry.kind === "turn_summary"));
+    assert.equal(carrying.length, 1);
+    assert.deepEqual([carrying[0]!.launchId, carrying[0]!.detail, carrying[0]!.detailKind], [launchId, "Idle", "idle"], "a re-statement of the current activity");
+    assert.deepEqual(publishedTurnSummaries(sent).map((summary) => [summary.trigger?.messageId, summary.toolCalls]), [["msg-wake", 0]]);
+  });
+});
+
+test("task #17: an orderly stop does not re-state a typed runtime error to carry a held empty wake", async () => {
+  await withManager(async ({ driver, manager, sent }) => {
+    await manager.startAgent("agent-1", makeConfig({ sessionId: "session-1" }));
+    driver.parsedLines.set("turn-end", [{ kind: "turn_end", sessionId: "session-1" }]);
+    driver.parsedLines.set("error", [{ kind: "error", message: "Budget limit exceeded" }]);
+    await wakeIdleAgent(manager, driver, "msg-wake", "Tenny");
+    await emitLines(driver, ["turn-end", "error"]);
+    const errorFrame = activityMessages(sent).at(-1)!;
+    assert.equal(errorFrame.detailKind, "runtime_error");
+    assert.ok(errorFrame.runtimeError, "the error frame carries its typed diagnostic");
+    const framesBefore = activityMessages(sent).length;
+
+    await manager.stopAll();
+    assert.equal(activityMessages(sent).length, framesBefore, "no re-statement without the error's carrier");
+    assert.deepEqual(publishedTurnSummaries(sent), [], "the held wake is lost, as before holding");
+  });
+});
+
+test("task #17: an explicit stop of an agent with no process forgets what the turn tracker holds for it", async () => {
+  await withManager(async ({ manager }) => {
+    const tracker = (manager as any).turnSummaries;
+    tracker.begin("agent-gone", 1_000, { target: "#general", messageId: "m1" });
+    tracker.finish("agent-gone", "completed", 2_000);
+    await manager.stopAgent("agent-gone");
+    assert.deepEqual(tracker.begin("agent-gone", 3_000, undefined), [], "nothing held is left for the next start");
+  });
+});
+
 test("Claude APM baseline: compaction_started sets compacting=true; compaction_finished clears it", async () => {
   await withManager(async ({ driver, manager }) => {
     await manager.startAgent("agent-1", makeConfig({ sessionId: "session-1" }));
@@ -519,7 +997,7 @@ test("Claude APM: compaction_started replaces the context id; compaction_finishe
     // prepareCliTransport, so seed its spawn write.
     ap.cliTransportDir = path.join(dataDir, "cli-transport");
     await mkdir(ap.cliTransportDir, { recursive: true });
-    const spawnId = writeContextGeneration(ap.cliTransportDir, { reason: "spawn", runtime: "claude", passiveAx: false });
+    const spawnId = writeContextGeneration(ap.cliTransportDir, { reason: "spawn", runtime: "claude", compaction: ap.driver.session.compaction, passiveAx: false });
     const file = path.join(ap.cliTransportDir, CONTEXT_GENERATION_FILENAME);
     const readId = async () => JSON.parse(await readFile(file, "utf8")).contextId as string;
 
@@ -558,6 +1036,83 @@ test("Claude APM: compaction writes carry the passive AX gate from the spawn con
       assert.equal(record.passiveAx, passiveAx === true, "an older Server's config (no field) publishes the gate off");
     });
   }
+});
+
+// Glimpse layer 2: each turn end takes what the agent's CLI printed of
+// passive AX out of its ledger onto the turn span; nothing with passive AX off.
+test("Claude APM: the turn span carries and clears the CLI's passive render counts, only with passive AX on", async () => {
+  for (const passiveAx of [true, false]) {
+    const { sink, tracer } = makeDeterministicTracer();
+    await withManager(async ({ driver, manager, dataDir }) => {
+      (manager as any).slockHome = dataDir;
+      await manager.startAgent("agent-1", { ...makeConfig({ sessionId: "session-1" }), passiveAx } as AgentConfig);
+      const ap = getProcess(manager, "agent-1");
+      const dbPath = senderLedgerPath(dataDir, "agent-1")!;
+      await mkdir(path.dirname(dbPath), { recursive: true });
+      const db = new DatabaseSync(dbPath);
+      db.exec("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+      db.exec("INSERT INTO meta (key, value) VALUES ('version', '1')");
+      db.exec(PASSIVE_RENDER_COUNTS_DDL);
+      db.close();
+      assert.equal(ap.agentLedgerPath, dbPath, "the spawn names the agent's ledger");
+
+      (manager as any).commitApmIdleState("agent-1", ap, true);
+      assert.equal(await manager.deliverMessage("agent-1", makeMessage("ship it", { message_id: "msg-wake", seq: 7 }), { deliveryId: "delivery-wake" }), true);
+      await waitFor(() => driver.encodedCalls.length === 1, "idle delivery written");
+      // The CLI prints a card during the turn.
+      const cli = new DatabaseSync(dbPath);
+      cli.prepare(PASSIVE_RENDER_COUNTS_UPSERT).run(ap.contextId, "channel_card", 320, 350);
+      cli.prepare(PASSIVE_RENDER_COUNTS_UPSERT).run(ap.contextId, "channel_card", 320, 350);
+      cli.close();
+      driver.parsedLines.set("turn-end", [{ kind: "turn_end", sessionId: "session-1" }]);
+      driver.processes[0].stdout.emit("data", Buffer.from("turn-end\n"));
+      await flush();
+
+      const turns = traceRows(sink).filter((row) => row.name === "daemon.runtime.turn");
+      assert.equal(turns.length, 1, "one turn span");
+      const attrs = turns[0]!.attrs ?? {};
+      const check = new DatabaseSync(dbPath);
+      const left = Number((check.prepare("SELECT COUNT(*) AS n FROM passive_render_counts").get() as { n: number }).n);
+      check.close();
+      if (!passiveAx) {
+        assert.equal(Object.keys(attrs).some((key) => key.startsWith("passive_render_")), false, "passive AX off: no attributes");
+        assert.equal(left, 1, "passive AX off: the ledger is not touched (both prints are one row)");
+        return;
+      }
+      assert.equal(attrs.passive_render_outcome, "taken");
+      assert.equal(attrs.passive_render_carried_over, false);
+      assert.equal(attrs.model_context_id, ap.contextId);
+      assert.equal(attrs.passive_render_count, 2);
+      assert.equal(attrs.passive_render_char_count, 640);
+      assert.equal(attrs.passive_render_channel_card_byte_count, 700);
+      assert.equal(attrs.passive_render_other_context_render_count, 0);
+      assert.equal(left, 0, "taken counts are cleared");
+    }, { tracer });
+  }
+});
+
+// #botiverse-raft-deployment:#208: the turn span's events go through the byte
+// budget, and its end says how many were left off.
+test("Claude APM: the turn span keeps its events and reports none dropped for a normal turn", async () => {
+  const { sink, tracer } = makeDeterministicTracer();
+  await withManager(async ({ driver, manager }) => {
+    await manager.startAgent("agent-1", makeConfig({ sessionId: "session-1" }));
+    const ap = getProcess(manager, "agent-1");
+    (manager as any).commitApmIdleState("agent-1", ap, true);
+    assert.equal(await manager.deliverMessage("agent-1", makeMessage("ship it", { message_id: "msg-wake", seq: 7 }), { deliveryId: "delivery-wake" }), true);
+    await waitFor(() => driver.encodedCalls.length === 1, "idle delivery written");
+    driver.parsedLines.set("tool", [{ kind: "tool_call", name: "Bash", input: { command: "ls" } } as any]);
+    driver.processes[0].stdout.emit("data", Buffer.from("tool\n"));
+    driver.parsedLines.set("turn-end", [{ kind: "turn_end", sessionId: "session-1" }]);
+    driver.processes[0].stdout.emit("data", Buffer.from("turn-end\n"));
+    await flush();
+
+    const turns = traceRows(sink).filter((row) => row.name === "daemon.runtime.turn");
+    assert.equal(turns.length, 1, "one turn span");
+    assert.equal(turns[0]!.attrs?.runtime_span_events_dropped_count, 0);
+    assert.equal(turns[0]!.attrs?.runtime_span_event_bytes_dropped, undefined);
+    assert.ok((turns[0]!.events ?? []).length > 0, "events still reach the span");
+  }, { tracer });
 });
 
 test("Claude APM invariant: fresh-session parked pending input schedules retry without turn_end", async () => {
@@ -675,13 +1230,15 @@ test("Claude APM delivery: activity probe does not let pending debt mask sticky 
     (manager as any).commitApmIdleState("agent-1", ap, true);
     ap.recentStderr = ["model is not supported"];
 
+    // Reconciler step 12: the delivery acts on the sticky failure first (the
+    // process ends, the agent is the server's), so nothing is left pending.
     const accepted = await manager.deliverMessage(
       "agent-1",
       makeMessage("sticky terminal pending delivery", { message_id: "msg-sticky-probe", seq: 104 }),
       { deliveryId: "delivery-sticky-probe" },
     );
-    assert.equal(accepted, true);
-    assert.equal(ap.inbox.length, 1);
+    assert.equal(accepted, false, "no process takes it: the server's start does");
+    assert.equal(ap.inbox.length, 0);
 
     manager.respondToActivityProbe("agent-1", "probe-sticky-pending-delivery");
 
@@ -690,56 +1247,7 @@ test("Claude APM delivery: activity probe does not let pending debt mask sticky 
     );
     assert.ok(activity, "activity probe should receive a response");
     assert.equal(activity.activity, undefined);
-    assert.equal(activity.detailKind, "runtime_error");
     assert.notEqual(activity.detailKind, "message_received");
-  }, { tracer });
-});
-
-test.skip("RETIRED 2026-08-03 (task #524): Claude APM invariant: turn_end re-arms write-only pending input into a new turn", async () => {
-  // RETIRED WITH ITS PRODUCTION CODE, not silenced. This tooth pinned the
-  // turn_end delivery-debt re-arm from #5911, which was proven to be an
-  // unbounded fixpoint (re-delivered already-contributed messages on every
-  // turn_end; see the RETIRED note in agentProcessManager.ts). Tenny authorized
-  // removing behavior + tooth together on 2026-08-03. A correct bounded version
-  // — at-least-once anchored on "debt genuinely unconsumed" with a suppression
-  // memo surviving the turn boundary — is task #70's redesign; this tooth must
-  // be REPLACED by that design's teeth, never merely re-enabled.
-  const sink = new MemoryTraceSink();
-  const tracer = new BasicTracer({ sink });
-  await withManager(async ({ driver, manager }) => {
-    await manager.startAgent("agent-1", makeConfig({ sessionId: "session-1" }));
-    const ap = getProcess(manager, "agent-1");
-    (manager as any).commitApmIdleState("agent-1", ap, false);
-
-    const message = makeMessage("delivered while active turn is about to end", { message_id: "msg-midturn", seq: 102 });
-    const accepted = await manager.deliverMessage(
-      "agent-1",
-      message,
-      { deliveryId: "delivery-midturn" },
-    );
-    assert.equal(accepted, true);
-    assert.equal(ap.inbox.length, 1);
-    assert.equal(driver.encodedCalls.length, 0, "active-turn queue must wait for boundary flush");
-    assertPendingInputInvariant(manager, ap, driver.encodedCalls.length, "active-turn pending input");
-
-    ap.notifications.recordNoticeWritten(
-      computeInboxNoticeFingerprint([message]),
-      "session-1",
-      [message],
-    );
-
-    driver.parsedLines.set("turn-end", [{ kind: "turn_end", sessionId: "session-1" }]);
-    driver.processes[0].stdout.emit("data", Buffer.from("turn-end\n"));
-
-    await waitFor(() => driver.encodedCalls.length === 1, "turn_end inbox flush");
-    assertPendingInputInvariant(manager, ap, driver.encodedCalls.length, "turn_end re-arm");
-    assert.equal(driver.encodedCalls[0].mode, "idle");
-    assert.equal(driver.encodedCalls[0].sessionId, "session-1");
-    assert.match(driver.encodedCalls[0].text, /Raft inbox notice/);
-    assert.ok(
-      traceRows(sink).some((span) => span.name === "daemon.agent.delivery_debt.rearmed_on_turn_end"),
-      "turn_end flush must record that write-only debt was re-armed",
-    );
   }, { tracer });
 });
 
@@ -1280,7 +1788,10 @@ test("APM reducer seam: expected termination reason is owned by reducer transiti
       hasDirectStdinRecoveryEvidence: false,
       runtimeProgressIsStale: true,
       staleForMs: 20 * 60_000,
-      staleThresholdMs: 15 * 60_000,
+      turnInProgress: true,
+      deliveryHold: null,
+      openToolHoldsNoLiveWork: false,
+      processAlive: undefined,
     },
   );
   assert.equal(blockedToolWait.shouldTerminate, false);
@@ -1295,7 +1806,10 @@ test("APM reducer seam: expected termination reason is owned by reducer transiti
     hasDirectStdinRecoveryEvidence: false,
     runtimeProgressIsStale: true,
     staleForMs: 20 * 60_000,
-    staleThresholdMs: 15 * 60_000,
+    turnInProgress: true,
+    deliveryHold: null,
+    openToolHoldsNoLiveWork: false,
+    processAlive: undefined,
   });
   assert.equal(staleRecovery.shouldTerminate, true);
   assert.equal(staleRecovery.nextState.expectedTerminationReason, "stalled_recovery");
@@ -1308,7 +1822,10 @@ test("APM reducer seam: expected termination reason is owned by reducer transiti
     hasDirectStdinRecoveryEvidence: false,
     runtimeProgressIsStale: true,
     staleForMs: 20 * 60_000,
-    staleThresholdMs: 15 * 60_000,
+    turnInProgress: true,
+    deliveryHold: null,
+    openToolHoldsNoLiveWork: false,
+    processAlive: undefined,
   });
   assert.equal(alreadyRecovering.alreadyRecovering, true);
   assert.equal(alreadyRecovering.shouldTerminate, false);
@@ -1441,175 +1958,6 @@ test("APM held-envelope projector keeps non-send held actions non-executable ret
       "action: review the synced context, then retry this action",
     ].join("\n"),
   });
-});
-
-test("APM manager mutation gate: reducer-owned gated state writes go through one commit seam", async () => {
-  const source = await readFile(new URL("./agentProcessManager.ts", import.meta.url), "utf8");
-  const reducerOwnedFields = [
-    "isIdle",
-    "expectedTerminationReason",
-    "outstandingToolUses",
-    "compacting",
-  ];
-
-  for (const field of reducerOwnedFields) {
-    const pattern = new RegExp(`ap\\.gatedSteering\\.${field}\\s*=(?!=)`, "g");
-    const matches = [...source.matchAll(pattern)];
-    assert.equal(
-      matches.length,
-      0,
-      `${field} must not be written field-by-field in AgentProcessManager`,
-    );
-  }
-
-  const wholeStateWrites = [...source.matchAll(/ap\.gatedSteering\s*=(?!=)/g)];
-  assert.equal(wholeStateWrites.length, 1, "gated steering state must have one whole-state manager write seam");
-  assert.equal(
-    source.includes("ap.gatedSteering = commitApmGatedSteeringDecisionState(nextState);"),
-    true,
-    "manager whole-state write must go through the APM state-machine commit primitive",
-  );
-
-  assert.equal(
-    source.includes("ap.isIdle"),
-    false,
-    "idle state must not be mirrored on AgentProcess",
-  );
-  assert.equal(
-    source.includes("isIdle: boolean"),
-    false,
-    "AgentProcess must not declare a separate isIdle source of truth",
-  );
-
-  assert.equal(
-    source.includes("ap.expectedTerminationReason"),
-    false,
-    "expected termination reason must not be mirrored on AgentProcess",
-  );
-  assert.equal(
-    source.includes("expectedTerminationReason: ApmExpectedTerminationReason"),
-    false,
-    "AgentProcess must not declare a separate expectedTerminationReason source of truth",
-  );
-  assert.equal(
-    source.includes("startupTimedOut"),
-    false,
-    "startup timeout expected termination must be represented by the reducer-owned expectedTerminationReason",
-  );
-
-  assert.match(
-    source,
-    /private readonly lifecycleRecords = new AgentLifecycleRecords</,
-    "manager must keep lifecycle facts behind the AgentLifecycleRecords owner",
-  );
-  const lifecycleFactFields = [
-    "activityClientSeqByAgent",
-    "terminalRuntimeFailures",
-    "runtimeErrorFingerprintFences",
-    "pendingStartRebinds",
-    "idleAgentConfigs",
-    "pendingSpawnCause",
-    "agentSpawnFailBackoff",
-  ];
-  for (const field of lifecycleFactFields) {
-    assert.equal(
-      new RegExp(`private(?: readonly)? ${field}\\s*=\\s*new Map`).test(source),
-      false,
-      `${field} must not be reintroduced as an independent manager Map`,
-    );
-    assert.equal(
-      new RegExp(`private get ${field}\\s*\\(`).test(source),
-      false,
-      `${field} must not be reintroduced as an APM map-shaped lifecycle shim`,
-    );
-  }
-
-  assert.equal(
-    /runtimeExitTraceAttrs\.set\(ap\.runtime,\s*\{[\s\S]*?stop_source:\s*"turn_end"[\s\S]*?expectedTerminationReason:\s*"turn_end"[\s\S]*?\}\)/.test(source),
-    false,
-    "turn_end process-exit attrs must come from the APM termination projection helper",
-  );
-  assert.match(
-    source,
-    /projectApmRuntimeTerminationTrace\(\{\s*reason:\s*"turn_end"\s*\}\)/,
-    "turn_end process-stop termination must use the APM termination projection helper",
-  );
-  assert.match(
-    source,
-    /markRuntimeProgressStaleIfNeeded[\s\S]*projectApmRuntimeProgressStalledTrace\(/,
-    "non-terminating runtime-stall trace attrs must come from the APM projection helper",
-  );
-  assert.match(
-    source,
-    /function buildRuntimeStallDiagnostic[\s\S]*projectApmRuntimeStallDiagnostic\(/,
-    "runtime-stall diagnostic detail and attrs must come from the APM projection helper",
-  );
-  assert.equal(
-    source.includes("recentDecisionStderr"),
-    false,
-    "progress-bounded stderr evidence must live inside DecisionErrorWindow, not AgentProcess raw fields",
-  );
-  assert.equal(
-    source.includes("runtimeErrorSinceProgress"),
-    false,
-    "progress-bounded runtime errors must live inside DecisionErrorWindow, not AgentProcess raw fields",
-  );
-  assert.match(
-    source,
-    /private invalidateRecoveryErrorView\(ap: AgentProcess\) \{\s*ap\.decisionErrorWindow\.noteRuntimeProgress\(\);\s*\}/,
-    "runtime progress must invalidate recovery error evidence through the DecisionErrorWindow seam",
-  );
-  assert.equal(
-    /function classify(?:RuntimeStallReason|ActivityDetailForTrace)\(/.test(source),
-    false,
-    "runtime-stall reason and activity-detail classification must stay out of AgentProcessManager",
-  );
-});
-
-test("APM manager effect gate: gated effects execute through a typed switch", async () => {
-  const source = await readFile(new URL("./agentProcessManager.ts", import.meta.url), "utf8");
-  assert.match(
-    source,
-    /private executeApmGatedSteeringEffect\([\s\S]*?effect: ApmGatedSteeringEffect[\s\S]*?switch \(effect\.kind\)/,
-    "gated effects must be executed through the typed effect executor",
-  );
-  assert.match(
-    source,
-    /case "notify_stdin":[\s\S]*?sendStdinNotification\(agentId\)/,
-    "notify_stdin must be the executor path that sends stdin notification",
-  );
-  assert.match(
-    source,
-    /case "deliver_stdin":[\s\S]*?const ordinaryMessageCandidates = messages\.filter[\s\S]*?(?:const|let) ordinaryMessages = ap\.notifications\.filterUncontributedMessages[\s\S]*?deliverInboxUpdateViaStdin\([\s\S]*?ordinaryMessages[\s\S]*?effect\.stdinMode/,
-    "deliver_stdin must split runtime-profile controls from ordinary queued inbox updates",
-  );
-  assert.match(
-    source,
-    /case "deliver_stdin":[\s\S]*?const messages = \[\.\.\.ap\.inbox\][\s\S]*?ap\.notifications\.clearPending\(\)[\s\S]*?ap\.notifications\.clearTimer\(\)/,
-    "deliver_stdin executor must own queued-message snapshotting",
-  );
-  assert.match(
-    source,
-    /default:[\s\S]*?assertNeverApmEffect\(effect\)/,
-    "effect executor must fail compile-time exhaustiveness when the union grows",
-  );
-  assert.doesNotMatch(
-    source,
-    /readiness\.effects\.some\(\(effect\) => effect\.kind === "notify_stdin"\)/,
-    "manager must not collapse typed effects back into a boolean kind check",
-  );
-  const compactionFlush = /private flushCompactionBoundaryMessages[\s\S]*?private startRuntimeStartupTimeout/.exec(source)?.[0];
-  assert.ok(compactionFlush, "compaction-boundary flush method must exist");
-  assert.match(
-    compactionFlush,
-    /reduceApmGatedCompactionBoundaryFlush/,
-    "compaction-boundary flush decisions must come from the APM reducer",
-  );
-  assert.doesNotMatch(
-    compactionFlush,
-    /sendStdinNotification\(agentId\)/,
-    "compaction-boundary flush must execute typed effects instead of sending directly",
-  );
 });
 
 test("APM reducer seam: assistant continuation preserves tool and compaction state", () => {
@@ -2268,7 +2616,7 @@ test("Claude APM trace oracle: direct busy stdin no longer waits for a tool boun
         assert.match(driver.encodedCalls[before].text, /Inbox update:/);
         assert.match(driver.encodedCalls[before].text, /Raft inbox notice/);
         assert.doesNotMatch(driver.encodedCalls[before].text, /System notification/);
-        assert.doesNotMatch(driver.encodedCalls[before].text, /compaction body must stay queued/);
+        assertBodyOnlyInInboxPreview(driver.encodedCalls[before].text, /compaction body must stay queued/);
       },
     );
 
@@ -2450,6 +2798,176 @@ test("Claude APM: provider context-overflow error is recoverable and bounded in 
   }, { tracer });
 });
 
+test("Claude APM: a runtime error after the failed turn's span ended joins that turn's trace", async () => {
+  const { sink, tracer } = makeDeterministicTracer();
+  await withManager(async ({ driver, manager }) => {
+    await manager.startAgent("agent-1", makeConfig({ sessionId: "session-1" }));
+    await flush();
+
+    // The first error ends the turn span; the runtime reports a second one
+    // before its turn end.
+    driver.parsedLines.set("first-error", [{ kind: "error", message: "API Error: 500 Internal server error" }]);
+    driver.processes[0].stdout.emit("data", Buffer.from("first-error\n"));
+    await flush();
+    driver.parsedLines.set("second-error", [{ kind: "error", message: "API Error: 529 Overloaded" }]);
+    driver.processes[0].stdout.emit("data", Buffer.from("second-error\n"));
+    await flush();
+
+    const turnSpan = sink.getAllSpans().find((span) => span.name === "daemon.runtime.turn");
+    assert.ok(turnSpan, "the failed turn's span ended");
+    assert.equal(turnSpan.status, "error");
+    const standaloneError = sink.getAllLogEvents().find((event) => event.name === "daemon.runtime.error");
+    assert.ok(standaloneError, "the second error is a standalone daemon.runtime.error record");
+    assert.equal(standaloneError.context?.traceId, turnSpan.context.traceId, "it carries the turn's trace id");
+    assert.equal(standaloneError.context?.spanId, turnSpan.context.spanId, "its parent is the turn span");
+
+    // After the turn end, an error is outside any turn: no turn context.
+    driver.parsedLines.set("turn-end", [{ kind: "turn_end", sessionId: "session-1" }]);
+    driver.processes[0].stdout.emit("data", Buffer.from("turn-end\n"));
+    await flush();
+    driver.parsedLines.set("late-error", [{ kind: "error", message: "API Error: 503 Service unavailable" }]);
+    driver.processes[0].stdout.emit("data", Buffer.from("late-error\n"));
+    await flush();
+    const lateError = sink.getAllLogEvents().filter((event) => event.name === "daemon.runtime.error")[1];
+    assert.ok(lateError, "the late error is recorded");
+    assert.notEqual(lateError.context?.spanId, turnSpan.context.spanId, "an error after the turn end does not join the ended turn");
+  }, { tracer });
+});
+
+// AndyLok: a Claude turn that failed on a rate limit carried the generic
+// RuntimeError and no status on its turn span (fingerprint 35d114d1), so
+// dashboards could not tell a rate limit from a real runtime failure. The
+// class and status come from Claude's typed API error, as the normalizer
+// reports it; only an error with nothing typed or recognisable stays RuntimeError.
+async function failedClaudeTurnSpanAttrs(error: Extract<ParsedEvent, { kind: "error" }>): Promise<{ span: Record<string, unknown>; event: Record<string, unknown> }> {
+  const { sink, tracer } = makeDeterministicTracer();
+  let attrs: { span: Record<string, unknown>; event: Record<string, unknown> } | null = null;
+  await withManager(async ({ driver, manager }) => {
+    await manager.startAgent("agent-1", makeConfig({ sessionId: "session-1" }));
+    await flush();
+    driver.parsedLines.set("failed-turn", [error, { kind: "turn_end", sessionId: "session-1" }]);
+    driver.processes[0].stdout.emit("data", Buffer.from("failed-turn\n"));
+    await flush();
+    const turnSpan = sink.getAllSpans().find((span) => span.name === "daemon.runtime.turn");
+    assert.ok(turnSpan, "the failed turn's span ended");
+    assert.equal(turnSpan.status, "error");
+    const runtimeError = traceRows(sink).flatMap((span) => span.events).find((event) => event.name === "runtime.error");
+    assert.ok(runtimeError, "the error is recorded on the turn");
+    attrs = { span: turnSpan.attrs as Record<string, unknown>, event: runtimeError.attrs as Record<string, unknown> };
+  }, { tracer });
+  assert.ok(attrs);
+  return attrs;
+}
+
+// Claude Code's stream-json line for an API rate limit (2.1.3xx, snake_case).
+function claudeRateLimitLine(text: string): string {
+  return JSON.stringify({
+    type: "assistant",
+    message: { model: "<synthetic>", role: "assistant", content: [{ type: "text", text }] },
+    parent_tool_use_id: null,
+    session_id: "session-1",
+    error: "rate_limit",
+    is_api_error_message: true,
+    api_error_status: 429,
+    api_error_code: "rate_limit_error",
+    api_error_origin: "first_party",
+  });
+}
+
+test("Claude APM: a turn that failed on a Claude rate_limit carries RateLimitError and 429 on its span", async () => {
+  // Through the real normalizer, as the host receives it.
+  const [error, ...rest] = new ClaudeEventNormalizer().normalizeLine(claudeRateLimitLine("You've hit your limit · resets 1pm (UTC)"));
+  assert.equal(rest.length, 0);
+  assert.equal(error?.kind, "error");
+  const { span, event } = await failedClaudeTurnSpanAttrs(error as Extract<ParsedEvent, { kind: "error" }>);
+  for (const attrs of [span, event]) {
+    assert.equal(attrs.runtime_error_class, "RateLimitError");
+    assert.equal(attrs.turn_reason, "rate_limited");
+    assert.equal(attrs.runtime_error_http_status, 429);
+  }
+  assert.doesNotMatch(JSON.stringify(span), /hit your limit/, "no error text on the span");
+});
+
+// The fingerprint ignores reset times, so a run of limit errors now shares one.
+// A limit is a wait (the provider-limit backoff), not a failure repeating: it
+// must never trip the same-fingerprint fence and stop the agent.
+test("Claude APM: repeated rate-limit errors with different reset times never trip the same-fingerprint fence", async () => {
+  const { sink, tracer } = makeDeterministicTracer();
+  await withManager(async ({ driver, manager, sent }) => {
+    await manager.startAgent("agent-1", makeConfig({ sessionId: "session-1" }));
+    await flush();
+    const normalizer = new ClaudeEventNormalizer();
+    for (const [i, reset] of ["1pm (UTC)", "2:30pm (UTC)", "4pm (Europe/London)", "5pm (UTC)"].entries()) {
+      driver.parsedLines.set(`limit-${i}`, normalizer.normalizeLine(claudeRateLimitLine(`You've hit your limit · resets ${reset}`)));
+      driver.processes[0].stdout.emit("data", Buffer.from(`limit-${i}\n`));
+      await flush();
+    }
+    assert.ok(getProcess(manager, "agent-1"), "the runtime keeps running");
+    assert.equal((manager as any).lifecycleRecords.getRuntimeErrorFingerprintFence("agent-1"), undefined, "limit errors are not counted");
+    assert.equal(traceRows(sink).some((row) => row.name === "daemon.agent.runtime_error_fingerprint_fence.tripped"), false);
+    assert.equal(sent.some((msg) => msg.type === "agent:runtime:outcome" && (msg as any).outcome?.kind === "terminal_failure"), false);
+  }, { tracer });
+});
+
+test("Claude APM: the same real error three times still trips the fence, and its records carry the typed class, the turn's trace and the fingerprint", async () => {
+  const { sink, tracer } = makeDeterministicTracer();
+  await withManager(async ({ driver, manager }) => {
+    await manager.startAgent("agent-1", makeConfig({ sessionId: "session-1" }));
+    await flush();
+    for (let i = 0; i < 3; i += 1) {
+      driver.parsedLines.set(`server-error-${i}`, [{
+        kind: "error",
+        message: "Internal server error",
+        nativeReasonPresent: true,
+        reasonProvenance: "runtime_error_event",
+        providerError: { codes: ["server_error"], httpStatus: 500 },
+      }]);
+      driver.processes[0].stdout.emit("data", Buffer.from(`server-error-${i}\n`));
+      await flush();
+    }
+    assert.equal(getProcess(manager, "agent-1"), undefined, "the fence stopped the runtime");
+    const tripped = traceRows(sink).filter((row) => row.name === "daemon.agent.runtime_error_fingerprint_fence.tripped");
+    assert.equal(tripped.length, 1);
+    // The text alone says RuntimeError; the fence's records agree with the span.
+    assert.equal(tripped[0]!.attrs?.runtime_error_class, "ProviderServerError");
+    const counted = traceRows(sink).filter((row) => row.name === "daemon.agent.runtime_error_fingerprint_fence");
+    assert.ok(counted.length >= 3);
+    assert.ok(counted.every((row) => row.attrs?.runtime_error_class === "ProviderServerError"));
+    // The counted, tripped and reset records join the failed turn's trace and
+    // name the fingerprint (a hash, never the text) under both spellings.
+    const turnTraceIds = new Set(sink.getAllSpans().filter((span) => span.name === "daemon.runtime.turn").map((span) => span.context.traceId));
+    const reset = traceRows(sink).filter((row) => row.name === "daemon.agent.runtime_error_fingerprint_fence.reset");
+    assert.equal(reset.length, 1);
+    assert.equal(reset[0]!.attrs?.reset_source, "tripped");
+    const fingerprint = tripped[0]!.attrs?.fingerprint;
+    assert.match(String(fingerprint), /^[0-9a-f]{16}$/);
+    for (const row of [...counted, ...tripped, ...reset]) {
+      assert.ok(turnTraceIds.has(row.context.traceId), `${row.name} carries the turn's trace id (got "${row.context.traceId}")`);
+      assert.equal(row.attrs?.fingerprint, fingerprint, `${row.name} carries the fingerprint`);
+      assert.equal(row.attrs?.runtime_error_fingerprint, fingerprint, `${row.name} carries runtime_error_fingerprint`);
+    }
+  }, { tracer });
+});
+
+test("Claude APM: a turn that failed on verification_required carries AuthError and 403 on its span", async () => {
+  const { span } = await failedClaudeTurnSpanAttrs({
+    kind: "error",
+    message: CREDENTIAL_PROBLEM_MESSAGES.verification_required,
+    nativeReasonPresent: true,
+    reasonProvenance: "runtime_error_event",
+    providerError: { codes: ["verification_required"], httpStatus: 403 },
+  });
+  assert.equal(span.runtime_error_class, "AuthError");
+  assert.equal(span.runtime_error_http_status, 403);
+});
+
+test("Claude APM: a failed turn with no typed or recognisable error stays RuntimeError with no status", async () => {
+  const { span } = await failedClaudeTurnSpanAttrs({ kind: "error", message: "Execution failed" });
+  assert.equal(span.runtime_error_class, "RuntimeError");
+  assert.equal(span.turn_reason, "unclassified_runtime_error");
+  assert.equal(span.runtime_error_http_status, undefined);
+});
+
 test("Claude APM: repeated provider context-overflow fingerprint fence stays bounded in Activity", async () => {
   await withManager(async ({ driver, manager, sent }) => {
     await manager.startAgent("agent-1", makeConfig({ sessionId: "session-1" }));
@@ -2568,33 +3086,30 @@ test("B.5: user message to an agent latched by a stale prior-turn sticky termina
   });
 });
 
-// B.5 churn protection (test ③, per tygg + Kai): a transient/autonomous wake
-// (reminder / system nudge — isTransientDelivery) hitting an auth-class sticky
-// agent must stay SUPPRESSED. Only a user-driven (non-transient) turn re-evaluates
-// and un-sticks (test ② above); autonomous wakes must NOT trigger a recovery turn
-// or clear the sticky source, so the fix cannot regress into a retry-storm.
-test("B.5 churn: a transient/autonomous wake on an auth-class sticky agent stays suppressed (no recovery turn, sticky source preserved)", async () => {
+// #proj-raft-computer:#46, reconciler step 4a replaces the B.5 churn rule:
+// an auth error makes the agent's CREDENTIAL invalid (the ledger both hosts
+// share), not the process. A transient/autonomous wake is still dropped (it
+// would only hit the same rejection: no retry storm), and a user message is
+// now held in the inbox too, instead of a recovery turn into the same
+// rejection; the credential's change (login), model output or a person's stop
+// releases them. Stale error text alone (above) gates nothing any more.
+test("reconciler 4a: on an invalid credential a transient/autonomous wake is dropped and a user message is held; nothing is stopped", async () => {
   await withManager(async ({ driver, manager }) => {
     await manager.startAgent("agent-1", makeConfig({ sessionId: "session-1" }));
     const ap = getProcess(manager, "agent-1");
     (manager as any).commitApmIdleState("agent-1", ap, true);
-    ap.recentStderr = ["Invalid API key · authentication failed"];
-
-    const encodedBefore = driver.encodedCalls.length;
-    // Transient = autonomous wake (reminder / system), not a user turn.
-    await manager.deliverMessage("agent-1", makeMessage("autonomous wake"), { transient: true });
+    driver.parsedLines.set("auth-error", [{ kind: "error", message: "Invalid API key · authentication failed" }]);
+    driver.processes[0].stdout.emit("data", Buffer.from("auth-error\n"));
     await flush();
 
-    assert.equal(
-      driver.encodedCalls.length,
-      encodedBefore,
-      "autonomous/transient wake must not start a recovery turn on a sticky agent (churn protection)",
-    );
-    assert.deepEqual(
-      ap.recentStderr,
-      ["Invalid API key · authentication failed"],
-      "autonomous/transient wake must not clear the sticky source (only a user-driven turn re-evaluates)",
-    );
+    const encodedBefore = driver.encodedCalls.length;
+    await manager.deliverMessage("agent-1", makeMessage("autonomous wake"), { transient: true });
+    await manager.deliverMessage("agent-1", makeMessage("user message"));
+    await flush();
+
+    assert.equal(driver.encodedCalls.length, encodedBefore, "no turn into the same rejection");
+    assert.equal(getProcess(manager, "agent-1"), ap, "the process is kept");
+    assert.deepEqual(ap.inbox.map((message: AgentMessage) => message.content), ["user message"]);
   });
 });
 
@@ -2634,7 +3149,7 @@ test("startup-timeout termination that exits code 0 must not be masked by a clea
   });
 });
 
-test("startup-timeout cleanup keeps a retryable idle config for the next user delivery", async () => {
+test("startup-timeout cleanup keeps a retryable config: the next user delivery waits out the short local backoff, then restarts", async () => {
   const { sink, tracer } = makeDeterministicTracer();
   await withManager(async ({ driver, manager }) => {
     await manager.startAgent("agent-1", makeConfig({ sessionId: "session-1" }));
@@ -2654,13 +3169,21 @@ test("startup-timeout cleanup keeps a retryable idle config for the next user de
 
     cached.config.agentCredentialKey = "sk_agent_retry";
     cached.config.agentCredentialId = "cred-retry";
+    // The timeout counts toward the spawn-fail backoff (first step: 1s), so
+    // the delivery is buffered, never dropped, and starts the agent after it.
     const result = await manager.deliverMessage("agent-1", makeMessage("retry after timeout"));
     assert.equal(result, true);
-    assert.equal(lastDeliveryOutcome(sink), "auto_restart_from_idle");
+    assert.equal(lastDeliveryOutcome(sink), "spawn_fail_cooldown_active");
+    const deadline = Date.now() + 4_000;
+    while (driver.processes.length < 2 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 25));
+    assert.equal(driver.processes.length, 2, "restarted once the backoff ended");
   }, { tracer });
-});
+}, 10_000);
 
-test("runtime error fingerprint fence is cleared when a process exits without recovery residency", async () => {
+// Reconciler step 10a (D5): a crash keeps the restart snapshot, so the agent
+// keeps its idle residency and the fence keeps counting across the restart
+// (a loop guard); it is cleared once no residency is left (an explicit stop).
+test("runtime error fingerprint fence stays across a crash that keeps the snapshot, and is cleared with the residency", async () => {
   await withManager(async ({ driver, manager }) => {
     await manager.startAgent(
       "agent-1",
@@ -2683,10 +3206,16 @@ test("runtime error fingerprint fence is cleared when a process exits without re
     driver.processes[0].emit("close", 1, null);
     await flush();
 
+    assert.ok((manager as any).lifecycleRecords.getRestartSnapshot("agent-1"), "D5: the snapshot stays");
+    assert.ok(
+      (manager as any).lifecycleRecords.getRuntimeErrorFingerprintFence("agent-1"),
+      "the fence stays while the crashed agent keeps its idle residency",
+    );
+    await manager.stopAgent("agent-1");
     assert.equal(
       (manager as any).lifecycleRecords.getRuntimeErrorFingerprintFence("agent-1"),
       undefined,
-      "a fingerprint fence must not remain after the process is gone with no idle or terminal residency",
+      "a fingerprint fence must not remain after the agent has no idle or terminal residency",
     );
 
     await manager.startAgent("agent-2", makeConfig({ sessionId: "session-2" }));
@@ -2888,39 +3417,41 @@ test("rejected_no_process reports a typed rejection once through onRejectedNoPro
   }, { tracer });
 });
 
-test("delivery-gating baseline: ap + auth-sticky + transient → transient_dropped_terminal_runtime_error (suppressed)", async () => {
+// Reconciler step 4a: the auth gate is the credential's invalid record (no
+// longer the process's error history, nor B.5's clear-on-user-turn).
+async function startWithInvalidCredential(manager: any, driver: any) {
+  await manager.startAgent("agent-1", makeConfig({ sessionId: "s1" }));
+  const ap = getProcess(manager, "agent-1");
+  (manager as any).commitApmIdleState("agent-1", ap, true);
+  driver.parsedLines.set("auth-error", [{ kind: "error", message: "Invalid API key · authentication failed" }]);
+  driver.processes[0].stdout.emit("data", Buffer.from("auth-error\n"));
+  await flush();
+  return ap;
+}
+
+test("delivery-gating baseline: ap + invalid credential + transient → transient_dropped_credential_invalid (suppressed)", async () => {
   const { sink, tracer } = makeDeterministicTracer();
-  await withManager(async ({ manager }) => {
-    await manager.startAgent("agent-1", makeConfig({ sessionId: "s1" }));
-    const ap = getProcess(manager, "agent-1");
-    (manager as any).commitApmIdleState("agent-1", ap, true);
-    ap.recentStderr = ["Invalid API key · authentication failed"];
+  await withManager(async ({ driver, manager }) => {
+    await startWithInvalidCredential(manager, driver);
     const r = await manager.deliverMessage("agent-1", makeMessage("x"), { transient: true });
     assert.equal(r, true);
-    assert.equal(lastDeliveryOutcome(sink), "transient_dropped_terminal_runtime_error");
+    assert.equal(lastDeliveryOutcome(sink), "transient_dropped_credential_invalid");
   }, { tracer });
 });
 
-test("delivery-gating baseline: ap + auth-sticky + user → user_turn_recover_from_sticky_terminal_error (un-stick)", async () => {
+test("delivery-gating baseline: ap + invalid credential + user → queued_credential_invalid (held, no turn)", async () => {
   const { sink, tracer } = makeDeterministicTracer();
-  await withManager(async ({ manager }) => {
-    await manager.startAgent("agent-1", makeConfig({ sessionId: "s1" }));
-    const ap = getProcess(manager, "agent-1");
-    (manager as any).commitApmIdleState("agent-1", ap, true);
-    ap.recentStderr = ["Invalid API key · authentication failed"];
+  await withManager(async ({ driver, manager }) => {
+    const ap = await startWithInvalidCredential(manager, driver);
+    const encodedBefore = driver.encodedCalls.length;
     await manager.deliverMessage("agent-1", makeMessage("x"));
-    // A recovery is a TWO-event linear trace: it emits the recover outcome, then
-    // FALLS THROUGH to the idle delivery that starts the recovery turn.
-    assert.deepEqual(
-      deliveryOutcomes(sink),
-      ["user_turn_recover_from_sticky_terminal_error", "stdin_idle_delivery"],
-      "auth-class recover emits the recover outcome then falls through to the recovery turn delivery",
-    );
-    assert.deepEqual(ap.recentStderr, [], "auth-class sticky source cleared on user-driven recover");
+    assert.deepEqual(deliveryOutcomes(sink), ["queued_credential_invalid"]);
+    assert.equal(driver.encodedCalls.length, encodedBefore);
+    assert.deepEqual(ap.inbox.map((message: AgentMessage) => message.content), ["x"]);
   }, { tracer });
 });
 
-test("delivery-gating baseline: ap + model-not-supported sticky + user → queued_terminal_runtime_error (stays gated + inactive + error)", async () => {
+test("delivery-gating baseline: ap + model-not-supported sticky + user → rejected_no_process (handed to the server: inactive + error)", async () => {
   const { sink, tracer } = makeDeterministicTracer();
   await withManager(async ({ manager, sent }) => {
     await manager.startAgent("agent-1", makeConfig({ sessionId: "s1" }));
@@ -2928,8 +3459,8 @@ test("delivery-gating baseline: ap + model-not-supported sticky + user → queue
     (manager as any).commitApmIdleState("agent-1", ap, true);
     ap.recentStderr = ["model is not supported"];
     const r = await manager.deliverMessage("agent-1", makeMessage("x"));
-    assert.equal(r, true);
-    assert.equal(lastDeliveryOutcome(sink), "queued_terminal_runtime_error");
+    assert.equal(r, false);
+    assert.equal(lastDeliveryOutcome(sink), "rejected_no_process");
     assert.ok(sent.some((m) => m.type === "agent:status" && (m as any).status === "inactive"));
     assert.ok(activityEvents(sent).some((a) => a.activity === "error"));
   }, { tracer });
@@ -3243,6 +3774,34 @@ test("delivery-gating seam ①: re-delivering an already-consumed seq to a busy 
       pendingBefore,
       "already-consumed re-delivery must not increment pendingCount (no re-notify)",
     );
+    assert.equal(lastDeliveryOutcome(sink), "dropped_already_consumed");
+  }, { tracer });
+});
+
+test("[D1] an inbox read page drops its messages from the local queue by id and seq, and a re-push of them is dropped; an unprinted one stays", async () => {
+  const { sink, tracer } = makeDeterministicTracer();
+  await withManager(async ({ manager }) => {
+    await manager.startAgent("agent-1", makeConfig({ sessionId: "s1" }));
+    const ap = getProcess(manager, "agent-1");
+    (manager as any).commitApmIdleState("agent-1", ap, false);
+    ap.sessionId = "s1";
+    const queued = (seq: number) => makeMessage(`m-${seq}`, { seq, message_id: `m-${seq}`, channel_name: "general", channel_type: "channel" });
+    ap.inbox.push(queued(41), queued(42), queued(43));
+
+    // What the credential proxy hands over for an `inbox read` page that printed 41 and 42.
+    (manager as any).consumeVisibleMessages("agent-1", {
+      messages: [
+        { seq: 41, id: "m-41", message_id: "m-41", channel_type: "channel", channel_name: "general" },
+        { seq: 42, id: "m-42", message_id: "m-42", channel_type: "channel", channel_name: "general" },
+      ],
+      source: "agent_api_inbox_read",
+    });
+    assert.deepEqual(ap.inbox.map((m: any) => m.message_id), ["m-43"], "printed messages leave the queue; the unprinted one stays");
+    assert.equal((manager as any).getVisibleBoundary("agent-1", "#general"), undefined, "exact ids and seqs only, no boundary");
+
+    // A server re-push of a printed message is not queued again.
+    await manager.deliverMessage("agent-1", queued(42));
+    assert.deepEqual(ap.inbox.map((m: any) => m.message_id), ["m-43"]);
     assert.equal(lastDeliveryOutcome(sink), "dropped_already_consumed");
   }, { tracer });
 });
@@ -4312,6 +4871,37 @@ test("runtime rate-limit telemetry remains diagnostic without publishing account
   }, { tracer });
 });
 
+test("a Claude quota reading reaches the manager's provider quota store, traces its change, and goes with the workspace", async () => {
+  const { sink, tracer } = makeDeterministicTracer();
+  const nowMs = 1_791_800_000_000;
+  await withManager(async ({ driver, manager, dataDir }) => {
+    (manager as unknown as { readWallClock: () => number }).readWallClock = () => nowMs;
+    await manager.startAgent("agent-1", makeConfig());
+    driver.parsedLines.set("quota-warning", [{
+      kind: "telemetry",
+      name: "rate_limits",
+      source: "claude_rate_limit_event",
+      attrs: { status: "allowed_warning", rateLimitType: "seven_day" },
+      providerQuota: { status: "allowed_warning", utilization: 0.94, rateLimitType: "seven_day", resetsAtMs: nowMs + 86_400_000 },
+    }]);
+    driver.processes[0].stdout.emit("data", Buffer.from("quota-warning\n"));
+    await flush();
+    assert.deepEqual(manager.providerQuota.quotaFor("agent-1"), { state: "near_exhausted", utilization: 0.94 });
+    assert.equal(manager.providerQuota.reading("agent-1")?.observedAtMs, nowMs, "read on the manager's clock");
+    const changed = traceRows(sink).filter((row) => row.name === "daemon.provider_quota.changed");
+    assert.equal(changed.length, 1);
+    assert.equal(changed[0]?.attrs?.state, "near_exhausted");
+    assert.equal(changed[0]?.attrs?.previous_state, "none");
+    assert.equal(changed[0]?.attrs?.rate_limit_type, "seven_day");
+
+    await manager.stopAgent("agent-1");
+    assert.deepEqual(manager.providerQuota.quotaFor("agent-1"), { state: "near_exhausted", utilization: 0.94 }, "account quota outlives the process");
+    await mkdir(path.join(dataDir, "agent-1"), { recursive: true });
+    assert.equal(await manager.deleteWorkspaceDirectory("agent-1"), true);
+    assert.equal(manager.providerQuota.quotaFor("agent-1"), undefined, "forgotten with the agent's workspace");
+  }, { tracer });
+});
+
 // ─────────────────────────────────────────────────────────────────────────────
 // task #1114 — delivery consumption observation. A stdin write is not a
 // consumption signal; only model-driven runtime events are. The daemon must
@@ -4570,6 +5160,33 @@ test("task #1116 daemon: the third unconsumed write in an episode emits one deli
   }, { tracer });
 });
 
+test("#triage:eedc43fe: writes during a running turn or while a background task runs are normal queueing, not delivery_unconsumed", async () => {
+  const { tracer } = makeDeterministicTracer();
+  await withManager(async ({ manager, sent }) => {
+    await manager.startAgent("agent-1", makeConfig({ sessionId: "s1" }));
+    const ap = getProcess(manager, "agent-1");
+    ap.sessionId = "s1";
+
+    // A turn is running: busy notifications.
+    for (const n of [1, 2, 3]) (manager as any).observeDeliveryWrite("agent-1", ap, `m-${n}`, "busy_stdin_notification", true);
+    assert.equal(ap.deliveryConsumption.snapshot().unconsumedDeliveries, 3, "the writes are still counted");
+    assert.equal(deliveryUnconsumedActivities(sent).length, 0, "a running turn explains them");
+
+    // The turn is over but the agent waits on its own background task.
+    ap.backgroundTasks.set("task-bg", { startedAtMs: Date.now() });
+    for (const n of [4, 5, 6]) await idleDeliver(manager, ap, n);
+    assert.equal(deliveryUnconsumedActivities(sent).length, 0, "a background task explains them");
+
+    // Nothing explains these: the real signal still fires, on its own count.
+    ap.backgroundTasks.delete("task-bg");
+    await idleDeliver(manager, ap, 7);
+    await idleDeliver(manager, ap, 8);
+    assert.equal(deliveryUnconsumedActivities(sent).length, 0, "explained writes did not count toward the threshold");
+    await idleDeliver(manager, ap, 9);
+    assert.equal(deliveryUnconsumedActivities(sent).length, 1);
+  }, { tracer });
+});
+
 test("task #1116 daemon: after a consumption signal a new episode may project again, numbered as episode 2", async () => {
   const { tracer } = makeDeterministicTracer();
   await withManager(async ({ manager, sent, driver }) => {
@@ -4608,6 +5225,107 @@ test("task #1119 daemon: a crash-marked inactive status carries the exit code an
     ) as Array<Extract<MachineToServerMessage, { type: "agent:status" }>>;
     assert.ok(inactive.length >= 1, "a non-recoverable crash reports inactive");
     assert.deepEqual(inactive.at(-1)!.exit, { code: null, signal: "SIGTERM" }, "the inactive frame carries how the process ended");
+  });
+});
+
+// ===========================================================================
+// pi session rotation (plan §1): APM offers a due rotation at every turn end,
+// and the hold the runtime reads right before rotating is the one idle
+// definition (agentIdle.ts): a busy turn, a background task still running, a
+// delivery not yet told to the session or not yet read from stdin, a tracked
+// mention occurrence not yet settled. The runtime side (a hold means no
+// rotation) is drivers/piSessionRotation.test.ts.
+// ===========================================================================
+
+test("session rotation: offered at every turn end, held until the agent is idle (turn, background tasks, deliveries, tracked mentions)", async () => {
+  await withManager(async ({ driver, manager }) => {
+    await manager.startAgent("agent-1", makeConfig({ sessionId: "session-1" }), undefined, undefined, undefined, "launch-rotation");
+    const ap = getProcess(manager, "agent-1");
+    ap.sessionReadyForDelivery = true;
+    const offers: Array<() => string | null> = [];
+    ap.runtime.rotateSessionIfDue = (hold: () => string | null) => { offers.push(hold); };
+    const turnEnd = async (line: string) => {
+      driver.parsedLines.set(line, [{ kind: "turn_end", sessionId: "session-1" }]);
+      driver.processes[0].stdout.emit("data", Buffer.from(`${line}\n`));
+      for (let i = 0; i < 20; i += 1) await new Promise((resolve) => setImmediate(resolve));
+    };
+
+    await turnEnd("turn-end-1");
+    assert.equal(offers.length, 1, "offered at the turn end");
+    const hold = offers[0]!;
+    assert.equal(hold(), null, "idle with nothing in flight");
+
+    (manager as any).commitApmIdleState("agent-1", ap, false);
+    assert.equal(hold(), "agent_busy");
+    (manager as any).commitApmIdleState("agent-1", ap, true);
+
+    // task #1260: the turn ended, but a background task it started still runs.
+    ap.backgroundTasks.set("task-bg", { startedAtMs: Date.now() });
+    assert.equal(hold(), "background_tasks");
+    ap.backgroundTasks.delete("task-bg");
+    assert.equal(hold(), null);
+
+    // Written to stdin near the turn end, not yet read by any turn.
+    ap.deliveryConsumption.recordWrite("late", "stdin_turn_end_delivery", Date.now());
+    assert.equal(hold(), "delivery_in_flight");
+    ap.deliveryConsumption.recordConsumption("turn_end", Date.now());
+    assert.equal(hold(), null);
+
+    const untold = makeMessage("not told to the session yet", { message_id: "m-untold", seq: 501 });
+    ap.inbox.push(untold);
+    assert.equal(hold(), "delivery_in_flight");
+    ap.inbox.splice(ap.inbox.indexOf(untold), 1);
+    assert.equal(hold(), null);
+
+    // A tracked mention lands during a turn and is told to the session; until
+    // the turn end settles the occurrence, it is in flight.
+    (manager as any).commitApmIdleState("agent-1", ap, false);
+    const mention = makeMessage("tracked mention", { message_id: "m-rotation", seq: 502 });
+    let acks = 0;
+    assert.equal(await manager.deliverMessage("agent-1", mention, {
+      deliveryId: "occ-rotation",
+      mentionDelivery: { occurrenceId: "occ-rotation", messageId: "m-rotation", launchId: ap.launchId, sessionId: ap.sessionId },
+      onMentionAck: () => { acks += 1; },
+    } as any), true);
+    ap.notifications.recordNoticeWritten(computeInboxNoticeFingerprint([mention]), "session-1", [mention]);
+    ap.notifications.clearPending();
+    (manager as any).commitApmIdleState("agent-1", ap, true);
+    assert.equal(hold(), "mention_in_flight");
+
+    await turnEnd("turn-end-2");
+    assert.equal(acks, 1, "the turn end settled the occurrence");
+    assert.equal(offers.length, 2);
+    assert.equal(offers[1]!(), null, "nothing in flight once it is settled");
+  });
+});
+
+test("session rotation: held at a turn end whose turn had input written into it, until the turn the runtime runs on it ends", async () => {
+  await withManager(async ({ driver, manager }) => {
+    await manager.startAgent("agent-1", makeConfig({ sessionId: "session-1" }), undefined, undefined, undefined, "launch-rotation-queued");
+    const ap = getProcess(manager, "agent-1");
+    ap.sessionReadyForDelivery = true;
+    const offers: Array<() => string | null> = [];
+    ap.runtime.rotateSessionIfDue = (hold: () => string | null) => { offers.push(hold); };
+    const emit = async (line: string, events: ParsedEvent[]) => {
+      driver.parsedLines.set(line, events);
+      driver.processes[0].stdout.emit("data", Buffer.from(`${line}\n`));
+      for (let i = 0; i < 20; i += 1) await new Promise((resolve) => setImmediate(resolve));
+    };
+
+    // A busy write into the running turn (a busy inbox notice), "consumed" by that turn's own events.
+    (manager as any).observeDeliveryWrite("agent-1", ap, "m-busy", "busy_stdin_notification", true);
+    await emit("text-1", [{ kind: "text", text: "still in the first turn", sessionId: "session-1" } as ParsedEvent]);
+    assert.equal(ap.deliveryConsumption.snapshot().unconsumedDeliveries, 0);
+    await emit("turn-end-1", [{ kind: "turn_end", sessionId: "session-1" }]);
+    assert.equal(offers.length, 1);
+    assert.equal(offers[0]!(), "delivery_in_flight", "the runtime may run it as its next turn");
+
+    // It does: a turn of its own, held until it ends.
+    await emit("text-2", [{ kind: "text", text: "the queued turn", sessionId: "session-1" } as ParsedEvent]);
+    assert.notEqual(offers[0]!(), null, "held while that turn runs");
+    await emit("turn-end-2", [{ kind: "turn_end", sessionId: "session-1" }]);
+    assert.equal(offers.length, 2);
+    assert.equal(offers[1]!(), null, "a turn with nothing written into it: idle at its end");
   });
 });
 
@@ -4668,6 +5386,47 @@ test("task #285: a busy tracked mention whose notice already contributed is ACKe
     // A server redelivery of the same occurrence must be answered, never swallowed.
     assert.equal(await manager.deliverMessage("agent-1", message, context()), true);
     assert.equal(ackCount + terminalErrors.length, 2, "a redelivery must produce an ACK or a terminal error, not silence");
+  });
+});
+
+test("a tracked mention to a busy fresh Claude session that is not yet resumable waits in the inbox and is ACKed when written, never refused", async () => {
+  // Bencher's repro under CPU load: the mention arrived after session_init
+  // but before the first turn_end (a fresh Claude session is resumable only
+  // then). It was refused as UNSUPPORTED_DELIVERY_PATH and nothing redelivered it.
+  await withManager(async ({ driver, manager }) => {
+    await manager.startAgent("agent-1", makeConfig({ sessionId: "session-fresh" }), undefined, undefined, undefined, "launch-fresh");
+    const ap = getProcess(manager, "agent-1");
+    ap.sessionReadyForDelivery = false;
+    (manager as any).commitApmIdleState("agent-1", ap, false);
+    assert.equal((manager as any).canDeliverToRuntimeSession(ap), false, "precondition: session known, not yet resumable");
+
+    const message = makeMessage("tracked mention before the first turn end", { message_id: "m-fresh", seq: 7 });
+    const transitions: string[] = [];
+    const terminalErrors: string[] = [];
+    let ackCount = 0;
+    const accepted = await manager.deliverMessage("agent-1", message, {
+      deliveryId: "occ-fresh",
+      mentionDelivery: { occurrenceId: "occ-fresh", messageId: "m-fresh", launchId: ap.launchId, sessionId: ap.sessionId },
+      onMentionTransition: (state: string) => { transitions.push(state); },
+      onMentionAck: () => { ackCount += 1; },
+      onMentionTerminalError: (code: string) => { terminalErrors.push(code); },
+    } as any);
+
+    assert.equal(accepted, true);
+    assert.deepEqual(transitions, ["daemon_received", "daemon_pending"]);
+    assert.deepEqual(terminalErrors, []);
+    assert.ok(ap.inbox.some((queued: { message_id?: string }) => queued.message_id === "m-fresh"), "held in the inbox");
+    assert.equal(ap.sessionReadyDeliveryRetry.kind, "scheduled", "the session-ready retry will write it");
+
+    const before = driver.processes[0].stdinWrites.length;
+    driver.parsedLines.set("turn-end-fresh", [{ kind: "turn_end", sessionId: "session-fresh" }]);
+    driver.processes[0].stdout.emit("data", Buffer.from("turn-end-fresh\n"));
+    for (let i = 0; i < 50; i += 1) await new Promise((resolve) => setImmediate(resolve));
+
+    assert.deepEqual(terminalErrors, []);
+    assert.equal(ackCount, 1, "written at the turn end and ACKed once");
+    assert.ok(driver.processes[0].stdinWrites.length > before, "the turn end wrote it to the runtime");
+    assert.match(driver.processes[0].stdinWrites.slice(before).join(""), /m-fresh|before the first turn end|inbox/);
   });
 });
 
@@ -4997,6 +5756,8 @@ test("task #355: cooldown expiring between routing and invariant repair does not
       "provider_stream",
       makeMessage("queued wake", { message_id: "m-wake", seq: 970 }),
       [makeMessage("buffered", { message_id: "m-buf", seq: 971 })],
+      1,
+      10_000,
     );
     const untilMs = m.lifecycleRecords.getSpawnFailBackoff("agent-1").untilMs;
 
@@ -5132,7 +5893,7 @@ test("Claude live delivery: a sender's description is shown once per context, ag
     (manager as any).slockHome = dataDir;
     ap.cliTransportDir = path.join(dataDir, "cli-transport");
     await mkdir(ap.cliTransportDir, { recursive: true });
-    writeContextGeneration(ap.cliTransportDir, { reason: "spawn", runtime: "claude", passiveAx: true });
+    writeContextGeneration(ap.cliTransportDir, { reason: "spawn", runtime: "claude", compaction: ap.driver.session.compaction, passiveAx: true });
     // The ledger exists because the agent's CLI created it.
     const dbDir = path.join(dataDir, "agent-state", "agent-1");
     await mkdir(dbDir, { recursive: true });
@@ -5170,7 +5931,7 @@ test("Claude live delivery: a ledger write lock held by the CLI never delays del
     (manager as any).slockHome = dataDir;
     ap.cliTransportDir = path.join(dataDir, "cli-transport");
     await mkdir(ap.cliTransportDir, { recursive: true });
-    writeContextGeneration(ap.cliTransportDir, { reason: "spawn", runtime: "claude", passiveAx: true });
+    writeContextGeneration(ap.cliTransportDir, { reason: "spawn", runtime: "claude", compaction: ap.driver.session.compaction, passiveAx: true });
     const dbDir = path.join(dataDir, "agent-state", "agent-1");
     await mkdir(dbDir, { recursive: true });
     const { DatabaseSync } = await import("node:sqlite");
@@ -5247,6 +6008,299 @@ test("task #1260: a turn ending with a background task outstanding shows waiting
     assert.deepEqual(lastActivity(sent), { detail: "Idle", detailKind: "idle" });
     const details = activityMessages(sent).map((m) => m.detail);
     assert.ok(details.includes("Subagent completed (general-purpose)"), details.join(" | "));
+    // #proj-runtime:#41: how it ended rides on the marker, so the web never reads the detail text.
+    const ended = activityMessages(sent).flatMap((m) => (m as { entries?: Array<{ subagent?: { phase?: string; outcome?: string } }> }).entries ?? [])
+      .map((entry) => entry.subagent).filter((lineage) => lineage?.phase === "notification");
+    assert.deepEqual(ended.map((lineage) => lineage?.outcome), ["done"]);
+  });
+});
+
+test("#proj-runtime:#43: a shell command Claude runs as a task is background work, never a sub-agent row", async () => {
+  await withManager(async ({ driver, manager, sent }) => {
+    await manager.startAgent("agent-1", makeConfig({ sessionId: "session-1" }));
+    await flush();
+    driver.parsedLines.set("bash-start", subagentLine("started", "bash_1", { taskKind: "command", subagentType: undefined }));
+    driver.parsedLines.set("turn-end", [{ kind: "turn_end", sessionId: "session-1" }]);
+    driver.parsedLines.set("bash-done", subagentLine("notification", "bash_1", { taskKind: "command", subagentType: undefined, taskStatus: "completed" }));
+
+    const proc = driver.processes[0];
+    proc.stdout.emit("data", Buffer.from("bash-start\n"));
+    proc.stdout.emit("data", Buffer.from("turn-end\n"));
+    await flush();
+    const ap = (manager as any).agents.get("agent-1");
+    assert.equal(ap.backgroundTasks.size, 1, "a backgrounded command is still work the quiet turn waits for");
+    assert.deepEqual(lastActivity(sent), { detail: "Waiting for 1 background task", detailKind: "subagent_activity" });
+
+    proc.stdout.emit("data", Buffer.from("bash-done\n"));
+    await flush();
+    assert.equal(ap.backgroundTasks.size, 0);
+    assert.deepEqual(lastActivity(sent), { detail: "Idle", detailKind: "idle" });
+    const lineage = activityMessages(sent).flatMap((m) => (m as { entries?: Array<{ subagent?: unknown }> }).entries ?? []).filter((entry) => entry.subagent);
+    assert.deepEqual(lineage, [], "no entry marks it as a sub-agent");
+    assert.ok(!activityMessages(sent).some((m) => /Subagent/.test(m.detail ?? "")));
+
+    // One that starts while the agent is already quiet says so at once.
+    driver.parsedLines.set("bash-2-start", subagentLine("started", "bash_2", { taskKind: "command", subagentType: undefined }));
+    proc.stdout.emit("data", Buffer.from("bash-2-start\n"));
+    await flush();
+    assert.deepEqual(lastActivity(sent), { detail: "Waiting for 1 background task", detailKind: "subagent_activity" });
+  });
+});
+
+test("#proj-runtime:#41: a subagent's output and tools after the main turn ended keep the agent idle", async () => {
+  // Codex subagents keep writing on their own thread after the agent's turn
+  // ended; none of it is the agent's turn, so delivery must still see it idle.
+  await withManager(async ({ driver, manager, sent }) => {
+    await manager.startAgent("agent-1", makeConfig({ sessionId: "session-1" }));
+    await flush();
+    const subagent = { parentToolUseId: "call_2", taskId: "thread-child" };
+    driver.parsedLines.set("child-start", [{ kind: "subagent_progress", source: "codex_subagent_thread", phase: "started", ...subagent } as ParsedEvent]);
+    driver.parsedLines.set("turn-end", [{ kind: "turn_end", sessionId: "session-1" }]);
+    driver.parsedLines.set("child-work", [
+      { kind: "thinking", text: "looking", subagent },
+      { kind: "tool_call", name: "shell", input: { command: "ls" }, callId: "thread-child:call_1", subagent },
+    ] as ParsedEvent[]);
+    driver.parsedLines.set("child-work-end", [
+      { kind: "tool_output", name: "shell", callId: "thread-child:call_1", subagent },
+      { kind: "text", text: "child done", subagent },
+    ] as ParsedEvent[]);
+    driver.parsedLines.set("child-done", [{ kind: "subagent_progress", source: "codex_subagent_thread", phase: "notification", taskStatus: "completed", ...subagent } as ParsedEvent]);
+
+    const proc = driver.processes[0];
+    proc.stdout.emit("data", Buffer.from("child-start\n"));
+    proc.stdout.emit("data", Buffer.from("turn-end\n"));
+    await flush();
+    const ap = (manager as any).agents.get("agent-1");
+    assert.equal(ap.gatedSteering.isIdle, true);
+
+    proc.stdout.emit("data", Buffer.from("child-work\n"));
+    await flush();
+    assert.equal(ap.gatedSteering.isIdle, true, "the subagent's work does not reopen the agent's turn");
+    assert.equal(ap.gatedSteering.outstandingToolUses, 0, "the subagent's tool is not one of the agent's open tool uses");
+    assert.equal(ap.runtimeTraceSpan, null, "nor does it open a turn of the agent's");
+    assert.equal(ap.openToolCallIds?.has("thread-child:call_1") ?? false, false, "nor is its open tool one of the agent's open calls");
+
+    proc.stdout.emit("data", Buffer.from("child-work-end\n"));
+    await flush();
+    assert.equal(ap.gatedSteering.isIdle, true);
+    assert.equal(ap.gatedSteering.outstandingToolUses, 0);
+    assert.equal(ap.runtimeTraceSpan, null);
+
+    proc.stdout.emit("data", Buffer.from("child-done\n"));
+    await flush();
+    assert.equal(ap.backgroundTasks.size, 0);
+    assert.deepEqual(lastActivity(sent), { detail: "Idle", detailKind: "idle" });
+  });
+});
+
+test("#proj-runtime:#41: a subagent's output does not end the agent's context compaction", async () => {
+  await withManager(async ({ driver, manager }) => {
+    await manager.startAgent("agent-1", makeConfig({ sessionId: "session-1" }));
+    await flush();
+    const subagent = { parentToolUseId: "call_2", taskId: "thread-child" };
+    driver.parsedLines.set("compact-start", [{ kind: "compaction_started" }]);
+    driver.parsedLines.set("child-work", [
+      { kind: "text", text: "child output", subagent },
+      { kind: "tool_call", name: "shell", input: { command: "ls" }, callId: "thread-child:call_1", subagent },
+    ] as ParsedEvent[]);
+    driver.parsedLines.set("main-text", [{ kind: "text", text: "back" }]);
+    const proc = driver.processes[0];
+    proc.stdout.emit("data", Buffer.from("compact-start\n"));
+    await flush();
+    const ap = (manager as any).agents.get("agent-1");
+    assert.equal(ap.compaction.kind, "active");
+    proc.stdout.emit("data", Buffer.from("child-work\n"));
+    await flush();
+    assert.equal(ap.compaction.kind, "active", "the agent is still compacting");
+    assert.equal(ap.gatedSteering.compacting, true);
+    proc.stdout.emit("data", Buffer.from("main-text\n"));
+    await flush();
+    assert.notEqual(ap.compaction.kind, "active", "the agent's own output still ends it");
+  });
+});
+
+function codexSubagentLine(phase: "started" | "notification", taskId: string, extra: Record<string, unknown> = {}) {
+  return [{ kind: "subagent_progress", source: "codex_subagent_thread", phase, taskId, parentToolUseId: `call_${taskId}`, ...extra } as ParsedEvent];
+}
+
+const SUBAGENTS_FINISHED_WAKE = "Your sub-agents have finished. Their results are above. Continue your work with them. Complete all your work before stopping.";
+
+test("#proj-runtime:#41: on a runtime that does not wake itself, the last subagent finishing after the turn ended starts the agent's next turn", async () => {
+  await withManager(async ({ driver, manager }) => {
+    Object.assign(driver, { needsWakeAfterSubagents: true });
+    await manager.startAgent("agent-1", makeConfig({ sessionId: "session-1" }));
+    await flush();
+    driver.parsedLines.set("a-start", codexSubagentLine("started", "a"));
+    driver.parsedLines.set("b-start", codexSubagentLine("started", "b"));
+    driver.parsedLines.set("turn-end", [{ kind: "turn_end", sessionId: "session-1" }]);
+    driver.parsedLines.set("a-done", codexSubagentLine("notification", "a", { taskStatus: "completed" }));
+    driver.parsedLines.set("a-done-again", codexSubagentLine("notification", "a", { taskStatus: "completed" }));
+    driver.parsedLines.set("b-done", codexSubagentLine("notification", "b", { taskStatus: "failed" }));
+
+    const proc = driver.processes[0];
+    for (const line of ["a-start", "b-start", "turn-end"]) proc.stdout.emit("data", Buffer.from(`${line}\n`));
+    await flush();
+    const ap = (manager as any).agents.get("agent-1");
+    const writes = driver.encodedCalls.length;
+
+    proc.stdout.emit("data", Buffer.from("a-done\n"));
+    await flush();
+    assert.equal(driver.encodedCalls.length, writes, "one subagent is still running: no wake yet");
+
+    proc.stdout.emit("data", Buffer.from("b-done\n"));
+    await flush();
+    assert.deepEqual(driver.encodedCalls.slice(writes), [{ text: SUBAGENTS_FINISHED_WAKE, mode: "idle", sessionId: "session-1" }]);
+    assert.equal(ap.gatedSteering.isIdle, false, "the wake claimed the turn");
+
+    // The woken turn ends; a repeated notification then changes nothing, so it wakes nothing.
+    proc.stdout.emit("data", Buffer.from("turn-end\n"));
+    await flush();
+    assert.equal(ap.gatedSteering.isIdle, true);
+    proc.stdout.emit("data", Buffer.from("a-done-again\n"));
+    await flush();
+    assert.equal(driver.encodedCalls.length, writes + 1, "a repeated notification changes nothing, so it wakes nothing");
+  });
+});
+
+test("#proj-runtime:#41: no wake after a user stopped the turn, or while a runtime error is showing", async () => {
+  for (const variant of ["stopped", "error"] as const) {
+    await withManager(async ({ driver, manager }) => {
+      Object.assign(driver, { needsWakeAfterSubagents: true });
+      await manager.startAgent("agent-1", makeConfig({ sessionId: "session-1" }));
+      await flush();
+      driver.parsedLines.set("a-start", codexSubagentLine("started", "a"));
+      driver.parsedLines.set("turn-end", [{ kind: "turn_end", sessionId: "session-1", ...(variant === "stopped" ? { interrupted: true as const } : {}) }]);
+      driver.parsedLines.set("a-done", codexSubagentLine("notification", "a", { taskStatus: "completed" }));
+      const proc = driver.processes[0];
+      for (const line of ["a-start", "turn-end"]) proc.stdout.emit("data", Buffer.from(`${line}\n`));
+      await flush();
+      const ap = (manager as any).agents.get("agent-1");
+      if (variant === "error") ap.lastRuntimeError = "Codex turn failed";
+      const writes = driver.encodedCalls.length;
+      proc.stdout.emit("data", Buffer.from("a-done\n"));
+      await flush();
+      assert.equal(driver.encodedCalls.length, writes, `${variant}: the agent is not started again`);
+      assert.equal(ap.gatedSteering.isIdle, true, `${variant}: the turn was not claimed`);
+    });
+  }
+});
+
+test("#proj-runtime:#41: no wake when the runtime wakes itself, or while the agent's turn is still running", async () => {
+  await withManager(async ({ driver, manager }) => {
+    // Claude Code opens the next turn by itself.
+    await manager.startAgent("agent-1", makeConfig({ sessionId: "session-1" }));
+    await flush();
+    driver.parsedLines.set("a-start", codexSubagentLine("started", "a"));
+    driver.parsedLines.set("turn-end", [{ kind: "turn_end", sessionId: "session-1" }]);
+    driver.parsedLines.set("a-done", codexSubagentLine("notification", "a", { taskStatus: "completed" }));
+    const proc = driver.processes[0];
+    for (const line of ["a-start", "turn-end"]) proc.stdout.emit("data", Buffer.from(`${line}\n`));
+    await flush();
+    const writes = driver.encodedCalls.length;
+    proc.stdout.emit("data", Buffer.from("a-done\n"));
+    await flush();
+    assert.equal(driver.encodedCalls.length, writes);
+  });
+  await withManager(async ({ driver, manager }) => {
+    Object.assign(driver, { needsWakeAfterSubagents: true });
+    await manager.startAgent("agent-1", makeConfig({ sessionId: "session-1" }));
+    await flush();
+    driver.parsedLines.set("a-start", codexSubagentLine("started", "a"));
+    driver.parsedLines.set("a-done", codexSubagentLine("notification", "a", { taskStatus: "completed" }));
+    const proc = driver.processes[0];
+    const writes = driver.encodedCalls.length;
+    // The subagent ends inside the agent's turn: the runtime hands the result over in that turn.
+    for (const line of ["a-start", "a-done"]) proc.stdout.emit("data", Buffer.from(`${line}\n`));
+    await flush();
+    assert.equal(driver.encodedCalls.length, writes);
+  });
+});
+
+test("#proj-runtime:#41: a person stops one sub-agent; its end then wakes nothing", async () => {
+  await withManager(async ({ driver, manager }) => {
+    await manager.startAgent("agent-1", makeConfig({ sessionId: "session-1" }));
+    await flush();
+    // The fake runtime has no way to stop one sub-agent.
+    assert.equal(await manager.interruptSubagent("agent-1", "a"), "unsupported");
+    assert.equal(await manager.interruptSubagent("agent-2", "a"), "not_running");
+
+    Object.assign(driver, {
+      needsWakeAfterSubagents: true,
+      encodeSubagentInterruptRequest: (taskId: string) => (taskId === "a" ? JSON.stringify({ stop: taskId }) : null),
+    });
+    driver.parsedLines.set("a-start", codexSubagentLine("started", "a"));
+    driver.parsedLines.set("turn-end", [{ kind: "turn_end", sessionId: "session-1" }]);
+    driver.parsedLines.set("a-stopped", codexSubagentLine("notification", "a", { taskStatus: "stopped" }));
+    const proc = driver.processes[0];
+    for (const line of ["a-start", "turn-end"]) proc.stdout.emit("data", Buffer.from(`${line}\n`));
+    await flush();
+
+    assert.equal(await manager.interruptSubagent("agent-1", "b"), "not_running", "no such sub-agent running");
+    assert.equal(await manager.interruptSubagent("agent-1", "a"), "interrupted");
+    assert.ok(proc.stdinWrites.some((chunk) => chunk.includes(JSON.stringify({ stop: "a" }))), "the stop went to the runtime");
+
+    const writes = driver.encodedCalls.length;
+    proc.stdout.emit("data", Buffer.from("a-stopped\n"));
+    await flush();
+    const ap = (manager as any).agents.get("agent-1");
+    assert.equal(ap.backgroundTasks.size, 0);
+    assert.equal(driver.encodedCalls.length, writes, "stopped on purpose: no 'your sub-agents have finished' wake");
+    assert.equal(ap.gatedSteering.isIdle, true);
+  });
+});
+
+test("#proj-runtime:#41: a stop that raced a sub-agent finishing on its own still wakes; so does one that finished before another was stopped", async () => {
+  for (const variant of ["race", "two"] as const) {
+    await withManager(async ({ driver, manager }) => {
+      Object.assign(driver, {
+        needsWakeAfterSubagents: true,
+        encodeSubagentInterruptRequest: (taskId: string) => JSON.stringify({ stop: taskId }),
+      });
+      await manager.startAgent("agent-1", makeConfig({ sessionId: "session-1" }));
+      await flush();
+      driver.parsedLines.set("a-start", codexSubagentLine("started", "a"));
+      driver.parsedLines.set("b-start", codexSubagentLine("started", "b"));
+      driver.parsedLines.set("turn-end", [{ kind: "turn_end", sessionId: "session-1" }]);
+      driver.parsedLines.set("a-completed", codexSubagentLine("notification", "a", { taskStatus: "completed" }));
+      driver.parsedLines.set("a-stopped", codexSubagentLine("notification", "a", { taskStatus: "stopped" }));
+      driver.parsedLines.set("b-completed", codexSubagentLine("notification", "b", { taskStatus: "completed" }));
+      const proc = driver.processes[0];
+      const lines = variant === "race" ? ["a-start", "turn-end"] : ["a-start", "b-start", "turn-end"];
+      for (const line of lines) proc.stdout.emit("data", Buffer.from(`${line}\n`));
+      await flush();
+      assert.equal(await manager.interruptSubagent("agent-1", "a"), "interrupted");
+      const writes = driver.encodedCalls.length;
+      // race: Codex refused the stop, the sub-agent had finished on its own.
+      // two: B finishes on its own, then A ends as the person stopped it.
+      for (const line of variant === "race" ? ["a-completed"] : ["b-completed", "a-stopped"]) proc.stdout.emit("data", Buffer.from(`${line}\n`));
+      await flush();
+      assert.equal(driver.encodedCalls.length, writes + 1, `${variant}: a finished sub-agent's result wakes the agent`);
+      const ap = (manager as any).agents.get("agent-1");
+      assert.equal(ap.userStoppedSubagents.size, 0, `${variant}: the stopped id is forgotten`);
+    });
+  }
+});
+
+test("#proj-runtime:#41: a stop names only a subagent this process saw start and not end; nothing is written otherwise", async () => {
+  await withManager(async ({ driver, manager }) => {
+    // A runtime that does not track subagents itself (Claude Code): it would encode any id.
+    Object.assign(driver, { encodeSubagentInterruptRequest: (taskId: string) => JSON.stringify({ stop_task: taskId }) });
+    await manager.startAgent("agent-1", makeConfig({ sessionId: "session-1" }));
+    await flush();
+    driver.parsedLines.set("a-start", codexSubagentLine("started", "a"));
+    driver.parsedLines.set("a-done", codexSubagentLine("notification", "a", { taskStatus: "completed" }));
+    const proc = driver.processes[0];
+    const wrote = (id: string) => proc.stdinWrites.some((chunk) => chunk.includes(JSON.stringify({ stop_task: id })));
+
+    assert.equal(await manager.interruptSubagent("agent-1", "a"), "not_running", "not started yet");
+    proc.stdout.emit("data", Buffer.from("a-start\n"));
+    await flush();
+    assert.equal(await manager.interruptSubagent("agent-1", "unknown"), "not_running");
+    assert.equal(wrote("unknown"), false);
+    proc.stdout.emit("data", Buffer.from("a-done\n"));
+    await flush();
+    assert.equal(await manager.interruptSubagent("agent-1", "a"), "not_running", "already ended");
+    assert.equal(wrote("a"), false, "no stop was ever written");
   });
 });
 
@@ -5445,6 +6499,25 @@ test("task #379: a runtime-reported reset time reaches the visible error", async
   });
 });
 
+test("dm:@xxchan:#3: a quota-limited turn's summary carries the reset and ends when the runtime ended it, not at the next attempt", async () => {
+  await withManager(async ({ driver, manager }) => {
+    await manager.startAgent("agent-1", makeConfig({ sessionId: "session-1" }));
+    await flush();
+    (manager as any).broadcastMessageReceivedActivity("agent-1", [makeMessage("hi", { message_id: "m-quota", seq: 1 })]);
+    const beforeError = Date.now();
+    await emitTurn(driver as never, "quota-turn", [
+      { kind: "error", message: QUOTA_TEXT_379, providerLimit: { kind: "quota_exhausted", resetsAt: "2026-11-08T07:00:00.000Z" } },
+      { kind: "turn_end", sessionId: "session-1" },
+    ]);
+    const afterTurnEnd = Date.now();
+    // The next attempt an hour later closes it.
+    const [entry] = (manager as any).turnSummaries.begin("agent-1", afterTurnEnd + 3_600_000, undefined, "failed");
+    assert.equal(entry?.kind, "turn_summary");
+    assert.deepEqual(entry.summary.usageLimit, { resetsAt: Date.parse("2026-11-08T07:00:00.000Z") });
+    assert.ok(entry.summary.endedAt >= beforeError && entry.summary.endedAt <= afterTurnEnd, "ended at the runtime's turn end, not an hour later");
+  });
+});
+
 test("task #379: a transient throttle takes the same recoverable backoff and never goes terminal", async () => {
   await withManager(async ({ driver, manager, sent }) => {
     await manager.startAgent("agent-1", makeConfig({ sessionId: "session-1" }));
@@ -5484,4 +6557,1062 @@ test("task #379: an unclassified runtime error keeps today's backoff that turn_e
     ]);
     assert.equal(getProcess(manager, "agent-1").runtimeErrorDeliveryBackoff.kind, "idle", "without the structured limit the same text keeps the old runtime_error behaviour");
   });
+});
+
+// task #379 (prod readback 10-19, 1.0.50): Claude emits `status: requesting`
+// and stream events as `internal_progress` at the start of every turn,
+// including a turn that immediately hits the same limit. That used to clear
+// the rate_limited backoff, so attempts never grew past 1 and a quota-
+// exhausted agent started a turn per incoming message (96 turns/day).
+test("task #379: turn-start internal progress does not clear a rate-limit backoff, so it keeps growing", async () => {
+  await withManager(async ({ driver, manager }) => {
+    await manager.startAgent("agent-1", makeConfig({ sessionId: "session-1" }));
+    await flush();
+    const quotaError = { kind: "error", message: QUOTA_TEXT_379, providerLimit: { kind: "quota_exhausted" } };
+    const turnStart = { kind: "internal_progress", source: "claude_system_status", itemType: "requesting", payloadBytes: 0 };
+    await emitTurn(driver as never, "quota-1", [quotaError, { kind: "turn_end", sessionId: "session-1" }]);
+    assert.equal(getProcess(manager, "agent-1").runtimeErrorDeliveryBackoff.attempts, 1);
+    await emitTurn(driver as never, "quota-2", [turnStart, quotaError, { kind: "turn_end", sessionId: "session-1" }]);
+    await emitTurn(driver as never, "quota-3", [turnStart, { kind: "runtime_diagnostic", name: "status", attrs: {} }, quotaError, { kind: "turn_end", sessionId: "session-1" }]);
+    const backoff = getProcess(manager, "agent-1").runtimeErrorDeliveryBackoff;
+    assert.equal(backoff.kind, "backing_off", "the next turn's start must not clear the backoff");
+    assert.equal(backoff.reason, "rate_limited");
+    assert.equal(backoff.attempts, 3, "each further limited turn grows the backoff instead of restarting at 1");
+  });
+});
+
+// task #386 (prod 1.0.50): Codex (turn/started), Copilot, Kimi and OpenCode
+// mark the start of a turn or step with an empty `thinking` event before the
+// model has produced anything. It is the same turn-start bookkeeping as
+// Claude's internal_progress above and must not count as recovery.
+test("task #386: an empty turn-start thinking marker does not clear a rate-limit backoff, so it keeps growing", async () => {
+  await withManager(async ({ driver, manager }) => {
+    await manager.startAgent("agent-1", makeConfig({ sessionId: "session-1" }));
+    await flush();
+    const quotaError = { kind: "error", message: QUOTA_TEXT_379, providerLimit: { kind: "quota_exhausted" } };
+    const turnStartMarker = { kind: "thinking", text: "" };
+    await emitTurn(driver as never, "quota-1", [turnStartMarker, quotaError, { kind: "turn_end", sessionId: "session-1" }]);
+    await emitTurn(driver as never, "quota-2", [turnStartMarker, quotaError, { kind: "turn_end", sessionId: "session-1" }]);
+    await emitTurn(driver as never, "quota-3", [turnStartMarker, quotaError, { kind: "turn_end", sessionId: "session-1" }]);
+    const backoff = getProcess(manager, "agent-1").runtimeErrorDeliveryBackoff;
+    assert.equal(backoff.kind, "backing_off", "the next turn's empty thinking marker must not clear the backoff");
+    assert.equal(backoff.reason, "rate_limited");
+    assert.equal(backoff.attempts, 3, "each further limited turn grows the backoff instead of restarting at 1");
+  });
+});
+
+test("task #379: real model output after a rate-limit backoff still clears it (control)", async () => {
+  await withManager(async ({ driver, manager }) => {
+    await manager.startAgent("agent-1", makeConfig({ sessionId: "session-1" }));
+    await flush();
+    await emitTurn(driver as never, "quota", [
+      { kind: "error", message: QUOTA_TEXT_379, providerLimit: { kind: "quota_exhausted" } },
+      { kind: "turn_end", sessionId: "session-1" },
+    ]);
+    await emitTurn(driver as never, "recovered", [
+      { kind: "internal_progress", source: "claude_system_status", itemType: "requesting", payloadBytes: 0 },
+      { kind: "text", text: "Back to work." },
+    ]);
+    assert.equal(getProcess(manager, "agent-1").runtimeErrorDeliveryBackoff.kind, "idle");
+  });
+});
+
+test("task #379: tool_output, subagent progress and diagnostics do not clear a rate-limit backoff", async () => {
+  await withManager(async ({ driver, manager }) => {
+    await manager.startAgent("agent-1", makeConfig({ sessionId: "session-1" }));
+    await flush();
+    await emitTurn(driver as never, "quota", [
+      { kind: "error", message: QUOTA_TEXT_379, providerLimit: { kind: "quota_exhausted" } },
+      { kind: "turn_end", sessionId: "session-1" },
+    ]);
+    await emitTurn(driver as never, "late", [
+      { kind: "tool_output", name: "Bash", output: "a tool started before the limit finished late" },
+      { kind: "subagent_progress", source: "claude_subagent", phase: "running", parentToolUseId: "t1", payloadBytes: 10 },
+      { kind: "runtime_diagnostic", name: "status", attrs: {} },
+    ]);
+    const backoff = getProcess(manager, "agent-1").runtimeErrorDeliveryBackoff;
+    assert.equal(backoff.kind, "backing_off");
+    assert.equal(backoff.attempts, 1);
+  });
+});
+
+test("task #379: a used-up quota with a reported future reset waits until the reset, at most 60 minutes", async () => {
+  await withManager(async ({ driver, manager }) => {
+    await manager.startAgent("agent-1", makeConfig({ sessionId: "session-1" }));
+    await flush();
+    const before = Date.now();
+    await emitTurn(driver as never, "quota-reset-far", [
+      { kind: "error", message: QUOTA_TEXT_379, providerLimit: { kind: "quota_exhausted", resetsAt: new Date(before + 2 * 60 * 60_000).toISOString() } },
+      { kind: "turn_end", sessionId: "session-1" },
+    ]);
+    const after = Date.now();
+    const untilMs = getProcess(manager, "agent-1").runtimeErrorDeliveryBackoff.untilMs;
+    assert.ok(untilMs >= before + QUOTA_RESET_BACKOFF_MAX_MS && untilMs <= after + QUOTA_RESET_BACKOFF_MAX_MS, `holds for 60 minutes, not 2 hours (untilMs - now = ${untilMs - after})`);
+  });
+});
+
+// #proj-raft-computer:#46: the limit belongs to the credential. A manual
+// restart (explicit stop, then start) is a human "try again" and releases it,
+// on the shared sign-in for every agent on it (the next request re-arms it if
+// the account is still limited).
+test("task #379: restarting the agent is a manual recovery that starts with no backoff, on its own credentials or the shared sign-in", async () => {
+  for (const envVars of [{ CLAUDE_CONFIG_DIR: "/srv/claude-agent-1" }, null]) {
+    await withManager(async ({ driver, manager }) => {
+      await manager.startAgent("agent-1", makeConfig({ sessionId: "session-1", envVars }));
+      await flush();
+      await emitTurn(driver as never, "quota", [
+        { kind: "error", message: QUOTA_TEXT_379, providerLimit: { kind: "quota_exhausted", resetsAt: new Date(Date.now() + 30 * 60_000).toISOString() } },
+        { kind: "turn_end", sessionId: "session-1" },
+      ]);
+      assert.equal(getProcess(manager, "agent-1").runtimeErrorDeliveryBackoff.kind, "backing_off");
+      // Another agent on the shared sign-in: it waits for the same limit.
+      await manager.startAgent("agent-2", makeConfig({ name: "claude-agent-2", sessionId: "session-2" }));
+      await flush();
+      assert.equal(getProcess(manager, "agent-2").runtimeErrorDeliveryBackoff.kind, envVars ? "idle" : "backing_off", `envVars=${JSON.stringify(envVars)}`);
+      await manager.stopAgent("agent-1");
+      await manager.startAgent("agent-1", makeConfig({ sessionId: "session-1", envVars }));
+      await flush();
+      assert.equal(getProcess(manager, "agent-1").runtimeErrorDeliveryBackoff.kind, "idle", `envVars=${JSON.stringify(envVars)}`);
+      assert.equal(getProcess(manager, "agent-2").runtimeErrorDeliveryBackoff.kind, "idle", "the shared sign-in's other agent is released too");
+    });
+  }
+});
+
+test("task #379: providerLimitBackoffDelayMs only waits for a valid future quota reset, capped at 60 minutes", () => {
+  const now = Date.parse("2026-10-20T00:00:00.000Z");
+  const exp = 10_000;
+  const at = (ms: number) => new Date(now + ms).toISOString();
+  const quota = (resetsAt?: string) => ({ kind: "quota_exhausted" as const, ...(resetsAt !== undefined ? { resetsAt } : {}) });
+  assert.equal(providerLimitBackoffDelayMs({ providerLimit: quota(at(5 * 60_000)), exponentialDelayMs: exp, nowMs: now }), 5 * 60_000, "future reset within the cap");
+  assert.equal(providerLimitBackoffDelayMs({ providerLimit: quota(at(60 * 60_000)), exponentialDelayMs: exp, nowMs: now }), 60 * 60_000, "exactly at the cap");
+  assert.equal(providerLimitBackoffDelayMs({ providerLimit: quota(at(60 * 60_000 + 1)), exponentialDelayMs: exp, nowMs: now }), QUOTA_RESET_BACKOFF_MAX_MS, "just past the cap is capped");
+  assert.equal(providerLimitBackoffDelayMs({ providerLimit: quota(at(7 * 24 * 60 * 60_000)), exponentialDelayMs: exp, nowMs: now }), QUOTA_RESET_BACKOFF_MAX_MS, "a weekly reset is capped");
+  assert.equal(providerLimitBackoffDelayMs({ providerLimit: quota(at(0)), exponentialDelayMs: exp, nowMs: now }), exp, "a reset at now is not in the future");
+  assert.equal(providerLimitBackoffDelayMs({ providerLimit: quota(at(-60_000)), exponentialDelayMs: exp, nowMs: now }), exp, "a past reset falls back");
+  assert.equal(providerLimitBackoffDelayMs({ providerLimit: quota("not-a-time"), exponentialDelayMs: exp, nowMs: now }), exp, "an invalid reset falls back");
+  assert.equal(providerLimitBackoffDelayMs({ providerLimit: quota(), exponentialDelayMs: exp, nowMs: now }), exp, "a missing reset falls back");
+  assert.equal(providerLimitBackoffDelayMs({ providerLimit: { kind: "transient_rate_limit", resetsAt: at(5 * 60_000) }, exponentialDelayMs: exp, nowMs: now }), exp, "a transient throttle never waits for a reset");
+  assert.equal(providerLimitBackoffDelayMs({ providerLimit: undefined, exponentialDelayMs: exp, nowMs: now }), exp, "an unclassified error keeps the exponential delay");
+  // #proj-raft-computer:#46 Q3: any single provider-limit wait, with or without a reported reset.
+  const longExp = 2 * QUOTA_RESET_BACKOFF_MAX_MS;
+  assert.equal(providerLimitBackoffDelayMs({ providerLimit: quota(), exponentialDelayMs: longExp, nowMs: now }), QUOTA_RESET_BACKOFF_MAX_MS, "an exponential quota wait is capped too");
+  assert.equal(providerLimitBackoffDelayMs({ providerLimit: { kind: "transient_rate_limit" }, exponentialDelayMs: longExp, nowMs: now }), QUOTA_RESET_BACKOFF_MAX_MS, "so is a throttle's");
+  assert.equal(providerLimitBackoffDelayMs({ providerLimit: undefined, exponentialDelayMs: longExp, nowMs: now }), longExp, "not a provider limit: untouched");
+});
+
+test("task #379: a subagent's own text, thinking or tool call does not clear the main agent's rate-limit backoff (Huaihuai counterexample)", async () => {
+  await withManager(async ({ driver, manager }) => {
+    await manager.startAgent("agent-1", makeConfig({ sessionId: "session-1" }));
+    await flush();
+    await emitTurn(driver as never, "quota", [
+      { kind: "error", message: QUOTA_TEXT_379, providerLimit: { kind: "quota_exhausted" } },
+      { kind: "turn_end", sessionId: "session-1" },
+    ]);
+    const lineage = { subagent: { parentToolUseId: "toolu_sub", subagentType: "general-purpose", phase: "active" } };
+    await emitTurn(driver as never, "subagent-output", [
+      { kind: "thinking", text: "subagent reasoning", ...lineage },
+      { kind: "text", text: "subagent reply", ...lineage },
+      { kind: "tool_call", name: "Read", input: { file_path: "/tmp/x" }, ...lineage },
+    ]);
+    const backoff = getProcess(manager, "agent-1").runtimeErrorDeliveryBackoff;
+    assert.equal(backoff.kind, "backing_off", "subagent output may come from a different, unlimited model");
+    assert.equal(backoff.attempts, 1);
+  });
+});
+
+for (const recovery of [
+  { kind: "thinking", text: "main model reasoning" },
+  { kind: "tool_call", name: "Read", input: { file_path: "/tmp/x" } },
+  { kind: "text", text: "main model reply" },
+]) {
+  test(`task #379: the main model's own ${recovery.kind} after a quota error clears the backoff (control)`, async () => {
+    await withManager(async ({ driver, manager }) => {
+      await manager.startAgent("agent-1", makeConfig({ sessionId: "session-1" }));
+      await flush();
+      await emitTurn(driver as never, "quota", [
+        { kind: "error", message: QUOTA_TEXT_379, providerLimit: { kind: "quota_exhausted" } },
+        { kind: "turn_end", sessionId: "session-1" },
+      ]);
+      await emitTurn(driver as never, `main-${recovery.kind}`, [recovery]);
+      assert.equal(getProcess(manager, "agent-1").runtimeErrorDeliveryBackoff.kind, "idle");
+    });
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Task #25: a tool call that never returns kept the agent "busy" with nothing
+// to say which command it was on. The heartbeat now reports a call quiet for
+// the threshold once per quiet episode, with the tool and the queued count.
+// ─────────────────────────────────────────────────────────────────────────────
+
+test("task #25: a tool call with no output for 10 minutes is reported once as stuck, with the tool and the queued messages", async () => {
+  const sink = new MemoryTraceSink();
+  const tracer = new BasicTracer({ sink });
+  await withManager(async ({ driver, manager, sent }) => {
+    await manager.startAgent("agent-1", makeConfig({ sessionId: "session-1" }));
+    const ap = getProcess(manager, "agent-1");
+    driver.parsedLines.set("hung-tool", [
+      { kind: "tool_call", name: "Bash", input: { command: "pnpm dev" }, callId: "toolu_hung" },
+    ]);
+    driver.processes[0].stdout.emit("data", Buffer.from("hung-tool\n"));
+    await flush();
+    await manager.deliverMessage("agent-1", makeMessage("queued behind the command", { message_id: "m-stuck-1", seq: 990 }));
+    const stuckEvents = () => traceRows(sink).filter((span) => span.name === "daemon.runtime.tool.stuck");
+    const report = () => (manager as any).reportStuckToolCallIfNeeded("agent-1", ap);
+
+    await withNowOffset(9 * 60_000, async () => report());
+    assert.equal(stuckEvents().length, 0, "not before the threshold");
+
+    await withNowOffset(10 * 60_000 + 1_000, async () => report());
+    await withNowOffset(20 * 60_000, async () => report());
+    assert.equal(stuckEvents().length, 1, "once per quiet episode");
+    const stuck = stuckEvents()[0]!;
+    assert.match(String(stuck.attrs?.tool), /bash/i);
+    assert.equal(stuck.attrs?.tool_detail_kind, "running_command");
+    assert.equal(stuck.attrs?.queued_messages, ap.inbox.length);
+    assert.equal(stuck.attrs?.threshold_ms, 10 * 60_000);
+    assert.doesNotMatch(JSON.stringify(stuck), /pnpm dev/, "the command itself is not traced");
+    const last = activitySequence(sent).at(-1);
+    assert.deepEqual(last, { activity: "working", detail: "Stuck: running command, no output for 10+ min" });
+    assert.equal(ap.lastActivityDetail, last?.detail, "the heartbeat keeps sending the stuck detail");
+  }, { tracer });
+});
+
+test("task #25: a finished tool call or a turn end leaves nothing to report", async () => {
+  const sink = new MemoryTraceSink();
+  const tracer = new BasicTracer({ sink });
+  await withManager(async ({ driver, manager }) => {
+    await manager.startAgent("agent-1", makeConfig({ sessionId: "session-1" }));
+    const ap = getProcess(manager, "agent-1");
+    driver.parsedLines.set("tool-done", [
+      { kind: "tool_call", name: "Bash", input: { command: "ls" }, callId: "toolu_done" },
+      { kind: "tool_output", name: "Bash", callId: "toolu_done" },
+    ]);
+    driver.parsedLines.set("tool-open-then-turn-end", [
+      { kind: "tool_call", name: "Bash", input: { command: "ls" }, callId: "toolu_open" },
+      { kind: "turn_end", sessionId: "session-1" },
+    ]);
+    driver.processes[0].stdout.emit("data", Buffer.from("tool-done\ntool-open-then-turn-end\n"));
+    await flush();
+
+    await withNowOffset(60 * 60_000, async () => (manager as any).reportStuckToolCallIfNeeded("agent-1", ap));
+
+    assert.equal(traceRows(sink).filter((span) => span.name === "daemon.runtime.tool.stuck").length, 0);
+  }, { tracer });
+});
+
+test("task #25: the working heartbeat runs the stuck-tool check", async () => {
+  await withManager(async ({ driver, manager }) => {
+    const check = vi.spyOn(manager as any, "reportStuckToolCallIfNeeded");
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    try {
+      await manager.startAgent("agent-1", makeConfig({ sessionId: "session-1" }));
+      driver.parsedLines.set("tool-start-heartbeat", [
+        { kind: "tool_call", name: "Bash", input: { command: "sleep 1" }, callId: "toolu_hb" },
+      ]);
+      driver.processes[0].stdout.emit("data", Buffer.from("tool-start-heartbeat\n"));
+      await flush();
+      vi.advanceTimersByTime(60_000);
+      assert.ok(check.mock.calls.some(([agentId]) => agentId === "agent-1"), "a heartbeat tick checks for a stuck tool");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+test("task #25: while stuck, every activity frame (heartbeats and probe replies included) carries toolStuck, and the first runtime event drops it", async () => {
+  await withManager(async ({ driver, manager, sent }) => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    try {
+      await manager.startAgent("agent-1", makeConfig({ sessionId: "session-1" }));
+      const ap = getProcess(manager, "agent-1");
+      driver.parsedLines.set("hung-tool-carrier", [
+        { kind: "tool_call", name: "Bash", input: { command: "pnpm dev" }, callId: "toolu_carrier" },
+      ]);
+      driver.processes[0].stdout.emit("data", Buffer.from("hung-tool-carrier\n"));
+      await flush();
+      await manager.deliverMessage("agent-1", makeMessage("queued", { message_id: "m-carrier-1", seq: 995 }));
+      const frames = () => activityMessages(sent);
+      assert.equal(frames().some((frame) => frame.toolStuck), false, "nothing is stuck before the threshold");
+
+      const startedAtMs = (ap.toolStuck as any).open.values().next().value.startedAtMs as number;
+      await withNowOffset(10 * 60_000 + 1_000, async () => {
+        vi.advanceTimersByTime(60_000); // heartbeat: reports, then re-sends
+        vi.advanceTimersByTime(60_000);
+        manager.respondToActivityProbe("agent-1", "probe-1");
+      });
+      const stuckFrames = frames().filter((frame) => frame.toolStuck);
+      assert.ok(stuckFrames.some((frame) => !frame.isHeartbeat && !frame.probeId), "the stuck report frame");
+      assert.ok(stuckFrames.some((frame) => frame.isHeartbeat), "heartbeats keep carrying it");
+      assert.ok(stuckFrames.some((frame) => frame.probeId === "probe-1"), "probe replies carry it");
+      assert.deepEqual(stuckFrames[0]!.toolStuck, {
+        toolName: stuckFrames[0]!.toolStuck!.toolName,
+        toolDetailKind: "running_command",
+        startedAtMs,
+        quietSinceMs: startedAtMs,
+        thresholdMs: 10 * 60_000,
+        queuedMessages: ap.inbox.length,
+      });
+      assert.match(stuckFrames[0]!.toolStuck!.toolName, /bash/i);
+
+      const before = frames().length;
+      driver.parsedLines.set("tool-prints", [{ kind: "text", text: "still going" }]);
+      await withNowOffset(10 * 60_000 + 2_000, async () => {
+        driver.processes[0].stdout.emit("data", Buffer.from("tool-prints\n"));
+        await flush();
+        vi.advanceTimersByTime(60_000);
+      });
+      const after = frames().slice(before);
+      assert.ok(after.length > 0, "precondition: frames after the output");
+      assert.equal(after.some((frame) => frame.toolStuck), false, "any runtime event ends the stuck state on every later frame");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Task #25 step 2: a person stops the current turn, not the agent.
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function busyOnHungTool(driver: FakeClaudeDriver, manager: any) {
+  await manager.startAgent("agent-1", makeConfig({ sessionId: "session-1" }));
+  const ap = getProcess(manager, "agent-1");
+  manager.commitApmIdleState("agent-1", ap, false);
+  driver.parsedLines.set("hung-tool-interrupt", [
+    { kind: "tool_call", name: "Bash", input: { command: "pnpm dev" }, callId: "toolu_interrupt" },
+  ]);
+  driver.processes[0].stdout.emit("data", Buffer.from("hung-tool-interrupt\n"));
+  await flush();
+  return ap;
+}
+
+test("task #25 step 2: a native interrupt of a first turn with no open tool kills nothing the runtime started at launch", async () => {
+  const sink = new MemoryTraceSink();
+  const tracer = new BasicTracer({ sink });
+  await withManager(async ({ driver, manager }) => {
+    (driver as unknown as { encodeInterruptRequest: () => string }).encodeInterruptRequest = () => "{\"type\":\"interrupt\"}";
+    await manager.startAgent("agent-1", makeConfig({ sessionId: "session-1" }));
+    const ap = getProcess(manager, "agent-1");
+    (manager as unknown as { commitApmIdleState: (agentId: string, ap: unknown, idle: boolean) => void }).commitApmIdleState("agent-1", ap, false);
+    driver.parsedLines.set("thinking", [{ kind: "thinking", text: "hm" }]);
+    driver.processes[0].stdout.emit("data", Buffer.from("thinking\n"));
+    await flush();
+
+    const pending = manager.interruptTurn("agent-1");
+    await flush();
+    driver.parsedLines.set("interrupted-turn-end", [{ kind: "turn_end", sessionId: "session-1", interrupted: true }]);
+    driver.processes[0].stdout.emit("data", Buffer.from("interrupted-turn-end\n"));
+    assert.equal((await pending).outcome, "interrupted");
+
+    // The first turn rides the spawn: its start would also cover MCP servers the runtime launched.
+    const treeKill = traceRows(sink).find((span) => span.name === "daemon.agent.turn_interrupt.tree_kill");
+    assert.equal(treeKill?.attrs?.skip_reason, "first_turn_without_open_tool");
+  }, { tracer });
+});
+
+test("task #25 step 2: a native interrupt ends the turn and keeps the process", async () => {
+  const sink = new MemoryTraceSink();
+  const tracer = new BasicTracer({ sink });
+  await withManager(async ({ driver, manager }) => {
+    const interruptLine = JSON.stringify({ type: "control_request", request_id: "raft-interrupt-1", request: { subtype: "interrupt" } });
+    (driver as unknown as { encodeInterruptRequest: () => string }).encodeInterruptRequest = () => interruptLine;
+    const ap = await busyOnHungTool(driver, manager);
+
+    const pending = manager.interruptTurn("agent-1");
+    await flush();
+    assert.ok(driver.processes[0].stdinWrites.includes(`${interruptLine}\n`), "the interrupt goes to the runtime's stdin");
+
+    driver.parsedLines.set("interrupted-turn-end", [{ kind: "turn_end", sessionId: "session-1", interrupted: true }]);
+    driver.processes[0].stdout.emit("data", Buffer.from("interrupted-turn-end\n"));
+    const result = await pending;
+
+    assert.equal(result.outcome, "interrupted");
+    assert.match(String(result.toolName), /bash/i);
+    assert.equal(getProcess(manager, "agent-1"), ap, "the same process keeps running");
+    assert.equal(driver.processes.length, 1, "nothing was restarted");
+    const event = traceRows(sink).find((span) => span.name === "daemon.agent.turn_interrupt");
+    assert.equal(event?.attrs?.outcome, "interrupted");
+    assert.equal(event?.attrs?.method, "native");
+    const treeKill = traceRows(sink).find((span) => span.name === "daemon.agent.turn_interrupt.tree_kill");
+    assert.equal(treeKill?.attrs?.method, "native", "what the turn started is cleaned up after a native interrupt too");
+    assert.equal(treeKill?.attrs?.skip_reason, undefined, "the open tool dates what this first turn started");
+    assert.doesNotMatch(JSON.stringify(traceRows(sink)), /pnpm dev/);
+  }, { tracer });
+});
+
+test("task #25 step 2: a runtime without a native interrupt is restarted and resumes its session for the queued message", async () => {
+  onTestFinished(installManagedRunnerCredentialFetch());
+  const sink = new MemoryTraceSink();
+  const tracer = new BasicTracer({ sink });
+  await withManager(async ({ driver, manager }) => {
+    const ap = await busyOnHungTool(driver, manager);
+    await manager.deliverMessage("agent-1", makeMessage("waiting behind the command", { message_id: "m-interrupt-1", seq: 1001 }));
+    const killSignals: Array<NodeJS.Signals | number | undefined> = [];
+    const proc = driver.processes[0];
+    const originalKill = proc.kill.bind(proc);
+    proc.kill = (signal?: NodeJS.Signals | number) => {
+      killSignals.push(signal);
+      return originalKill(signal);
+    };
+
+    const result = await manager.interruptTurn("agent-1");
+
+    assert.equal(result.outcome, "restarted");
+    assert.deepEqual(killSignals, ["SIGTERM"]);
+    assert.equal(ap.gatedSteering.expectedTerminationReason, "turn_interrupt");
+    await waitFor(() => driver.spawnCalls.length === 2, "the runtime restarts for the queued message");
+    assert.equal(driver.spawnCalls[1]!.config.sessionId, "session-1", "and resumes the same session");
+    assert.equal(traceRows(sink).find((span) => span.name === "daemon.agent.turn_interrupt")?.attrs?.outcome, "restarted");
+    assert.equal(
+      traceRows(sink).some((span) => span.name === "daemon.runtime.process.exit" && span.attrs?.outcome === "process-crash"),
+      false,
+      "the interrupt is not a crash",
+    );
+  }, { tracer });
+});
+
+test("task #25 step 2: with no turn running there is nothing to stop", async () => {
+  await withManager(async ({ manager }) => {
+    assert.deepEqual(await manager.interruptTurn("agent-missing"), { outcome: "not_running" });
+    await manager.startAgent("agent-1", makeConfig({ sessionId: "session-1" }));
+    const ap = getProcess(manager, "agent-1");
+    (manager as any).commitApmIdleState("agent-1", ap, true);
+    assert.deepEqual(await manager.interruptTurn("agent-1"), { outcome: "not_running" });
+  });
+});
+
+test("task #25 step 2: a native interrupt that does not end the turn in time falls back to the restart", async () => {
+  onTestFinished(installManagedRunnerCredentialFetch());
+  const sink = new MemoryTraceSink();
+  const tracer = new BasicTracer({ sink });
+  await withManager(async ({ driver, manager }) => {
+    (driver as unknown as { encodeInterruptRequest: () => string }).encodeInterruptRequest = () => "{\"type\":\"control_request\"}";
+    const ap = await busyOnHungTool(driver, manager);
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    let result: Awaited<ReturnType<typeof manager.interruptTurn>>;
+    try {
+      const pending = manager.interruptTurn("agent-1");
+      await vi.advanceTimersByTimeAsync(10_000);
+      result = await pending;
+    } finally {
+      vi.useRealTimers();
+    }
+
+    assert.equal(result.outcome, "restarted");
+    assert.equal(ap.gatedSteering.expectedTerminationReason, "turn_interrupt");
+    assert.equal(traceRows(sink).find((span) => span.name === "daemon.agent.turn_interrupt.native_fallback")?.attrs?.reason, "turn_did_not_end");
+  }, { tracer });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Task #26: the onboarding owner-facts context ("onboarding-context" is a
+// label, not a channel) became an inbox row whose `open:` command could not
+// resolve and that never cleared. The daemon holds it and writes it as its
+// body ahead of the next input each runtime process gets.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const OWNER_FACTS = "Onboarding context for this server (re-sent on every start; not a message to reply to):\nowner_name=Ada";
+
+function ownerFactsMessage(content = OWNER_FACTS): AgentMessage {
+  return makeMessage(content, {
+    channel_id: "onboarding-context",
+    channel_name: "onboarding-context",
+    sender_id: "system",
+    sender_name: "system",
+    sender_type: "system",
+    seq: 0,
+    message_id: "onboarding-owner-facts-server-1",
+  });
+}
+
+test("task #26: a running agent gets the owner facts ahead of its next input, once, with no inbox row and no turn of their own", async () => {
+  await withManager(async ({ driver, manager }) => {
+    await manager.startAgent("agent-1", makeConfig({ sessionId: "session-1" }));
+    const ap = getProcess(manager, "agent-1");
+    (manager as any).commitApmIdleState("agent-1", ap, true);
+
+    assert.equal(await manager.deliverMessage("agent-1", ownerFactsMessage()), true);
+    await flush();
+    assert.equal(driver.encodedCalls.length, 0, "context alone starts no turn");
+    assert.deepEqual((manager as any).allPendingVisibleMessages("agent-1"), [], "and leaves no inbox row to open");
+
+    await manager.deliverMessage("agent-1", makeMessage("hi Cindy", { message_id: "m-1", seq: 7 }));
+    await waitFor(() => driver.encodedCalls.length === 1, "the message is written");
+    const first = driver.encodedCalls[0]!.text;
+    assert.ok(first.startsWith(OWNER_FACTS), "the facts ride ahead of the message");
+    assert.match(first, /hi Cindy/);
+    assert.doesNotMatch(first, /#onboarding-context|msg=onboardi/, "as their body, not as a message to open");
+
+    // A re-send on reconnect does not repeat them into the same session.
+    await manager.deliverMessage("agent-1", ownerFactsMessage());
+    driver.parsedLines.set("turn-end-1", [{ kind: "turn_end", sessionId: "session-1" }]);
+    driver.processes[0].stdout.emit("data", Buffer.from("turn-end-1\n"));
+    await waitFor(() => (manager as any).isApmIdle(ap), "turn ends");
+    await manager.deliverMessage("agent-1", makeMessage("one more", { message_id: "m-2", seq: 8 }));
+    await waitFor(() => driver.encodedCalls.length === 2, "the second message is written");
+    assert.doesNotMatch(driver.encodedCalls[1]!.text, /owner_name=Ada/);
+  });
+});
+
+test("task #26: the owner facts never wake or start an agent; its next start carries them in the first prompt", async () => {
+  await withManager(async ({ driver, manager }) => {
+    assert.equal(await manager.deliverMessage("agent-1", ownerFactsMessage()), true);
+    await flush();
+    assert.equal(driver.spawnCalls.length, 0, "no start for context alone");
+
+    await manager.startAgent("agent-1", makeConfig(), makeMessage("hello", { message_id: "m-wake", seq: 3 }));
+    assert.equal(driver.spawnCalls.length, 1);
+    const prompt = String(driver.spawnCalls[0]!.prompt);
+    assert.ok(prompt.startsWith(OWNER_FACTS), "the first prompt opens with the facts");
+    assert.equal(prompt.split("owner_name=Ada").length - 1, 1, "once");
+    assert.doesNotMatch(prompt, /#onboarding-context/);
+  });
+});
+
+test("task #26: a server start woken by the owner facts holds them and starts without a wake message", async () => {
+  await withManager(async ({ driver, manager }) => {
+    await manager.startAgent("agent-1", makeConfig({ sessionId: "session-1" }), ownerFactsMessage());
+    assert.equal(driver.spawnCalls.length, 1);
+    const prompt = String(driver.spawnCalls[0]!.prompt);
+    assert.ok(prompt.startsWith(OWNER_FACTS), "the facts ride the first prompt");
+    assert.doesNotMatch(prompt, /#onboarding-context/, "no row naming the label");
+    assert.deepEqual((manager as any).allPendingVisibleMessages("agent-1"), [], "and none left to open");
+  });
+});
+
+test("task #26: a fresh start's session counts as having the facts only once the runtime reports it", async () => {
+  await withManager(async ({ driver, manager }) => {
+    await manager.deliverMessage("agent-1", ownerFactsMessage());
+    await manager.startAgent("agent-1", makeConfig());
+    assert.ok(String(driver.spawnCalls[0]!.prompt).startsWith(OWNER_FACTS));
+    const ap = getProcess(manager, "agent-1");
+    const ledger = (manager as any).serverContext;
+    assert.ok(ledger.pending("agent-1", { processInstanceId: "a-later-process", sessionId: "session-new" }) !== null, "not yet: the session is unknown");
+
+    driver.parsedLines.set("turn-end-new", [{ kind: "turn_end", sessionId: "session-new" }]);
+    driver.processes[0].stdout.emit("data", Buffer.from("turn-end-new\n"));
+    await waitFor(() => ap.sessionId === "session-new", "the runtime reports its session");
+    assert.equal(driver.encodedCalls.length, 0, "no later write taught it the session");
+    assert.equal(ledger.pending("agent-1", { processInstanceId: "a-later-process", sessionId: "session-new" }), null, "a resume of that session has them");
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Agent typing line (shared agentTyping.ts): `agent:send_intent` frames from
+// the driver's early `send_intent` event or the complete tool call, ended by
+// the call's output, the turn end or the process stop; only to a server that
+// advertised the capability.
+// ─────────────────────────────────────────────────────────────────────────────
+
+function sendIntentFrames(sent: MachineToServerMessage[]) {
+  return sent
+    .filter((msg): msg is Extract<MachineToServerMessage, { type: "agent:send_intent" }> => msg.type === "agent:send_intent")
+    .map(({ callId, phase, target, early }) => ({ callId, phase, ...(target ? { target } : {}), ...(early !== undefined ? { early } : {}) }));
+}
+
+const TYPING_SEND_COMMAND = "raft message send --target '#general' <<'EOF'\nhello\nEOF";
+
+test("agent typing line: early intent, no duplicate from the tool_call, end on its output; late intent ends on turn end", async () => {
+  await withManager(async ({ manager, driver, sent }) => {
+    manager.setServerSendIntentCapable(true);
+    await manager.startAgent("agent-1", makeConfig({ sessionId: "s1" }));
+    const ap = getProcess(manager, "agent-1");
+    const emit = async (line: string, events: ParsedEvent[]) => {
+      driver.parsedLines.set(line, events);
+      driver.processes[0].stdout.emit("data", Buffer.from(`${line}\n`));
+      await flush();
+    };
+    await emit("typing-early", [{ kind: "send_intent", callId: "toolu_1", target: "#general", early: true }]);
+    const first = sent.find((msg) => msg.type === "agent:send_intent");
+    assert.equal((first as { launchId?: string } | undefined)?.launchId, ap.launchId || undefined);
+    await emit("typing-call", [{ kind: "tool_call", name: "Bash", input: { command: TYPING_SEND_COMMAND }, callId: "toolu_1" }]);
+    await emit("typing-sub-output", [{ kind: "tool_output", name: "Bash", subagent: { parentToolUseId: "toolu_x", phase: "active" } }]);
+    await emit("typing-output", [{ kind: "tool_output", name: "Bash", callId: "toolu_1", ok: true }]);
+    await emit("typing-late", [{ kind: "tool_call", name: "Bash", input: { command: TYPING_SEND_COMMAND }, callId: "toolu_2" }]);
+    await emit("typing-sub-call", [{ kind: "tool_call", name: "Bash", input: { command: TYPING_SEND_COMMAND }, callId: "toolu_3", subagent: { parentToolUseId: "toolu_x", phase: "active" } }]);
+    await emit("typing-turn-end", [{ kind: "turn_end", sessionId: "s1" }]);
+    assert.deepEqual(sendIntentFrames(sent), [
+      { callId: "toolu_1", phase: "start", target: "#general", early: true },
+      { callId: "toolu_1", phase: "end" },
+      { callId: "toolu_2", phase: "start", target: "#general", early: false },
+      { callId: "toolu_2", phase: "end" },
+    ]);
+  });
+});
+
+test("agent typing line: stopping the agent ends a live intent; no frames without the capability", async () => {
+  await withManager(async ({ manager, driver, sent }) => {
+    manager.setServerSendIntentCapable(true);
+    await manager.startAgent("agent-1", makeConfig({ sessionId: "s1" }));
+    driver.parsedLines.set("typing-early", [{ kind: "send_intent", callId: "toolu_1", target: "dm:@sam", early: true }]);
+    driver.processes[0].stdout.emit("data", Buffer.from("typing-early\n"));
+    await flush();
+    await manager.stopAgent("agent-1", { wait: true, silent: true });
+    assert.deepEqual(sendIntentFrames(sent), [
+      { callId: "toolu_1", phase: "start", target: "dm:@sam", early: true },
+      { callId: "toolu_1", phase: "end" },
+    ]);
+  });
+
+  await withManager(async ({ manager, driver, sent }) => {
+    await manager.startAgent("agent-1", makeConfig({ sessionId: "s1" }));
+    driver.parsedLines.set("typing", [
+      { kind: "send_intent", callId: "toolu_1", target: "#general", early: true },
+      { kind: "tool_call", name: "Bash", input: { command: TYPING_SEND_COMMAND }, callId: "toolu_2" },
+    ]);
+    driver.processes[0].stdout.emit("data", Buffer.from("typing\n"));
+    await flush();
+    assert.deepEqual(sendIntentFrames(sent), []);
+  });
+});
+
+test("Claude root refusal is visible on the actual crash activity without exposing other stderr", async () => {
+  await withManager(async ({ driver, manager, sent }) => {
+    await manager.startAgent("agent-1", makeConfig({ sessionId: "session-1" }));
+    const ap = getProcess(manager, "agent-1");
+    (manager as any).commitApmIdleState("agent-1", ap, true);
+    ap.recentStderr = [
+      "private diagnostic context",
+      "--dangerously-skip-permissions cannot be used with root/sudo privileges for security reasons",
+    ];
+    driver.processes[0].emit("exit", 1, null);
+    driver.processes[0].emit("close", 1, null);
+    await flush();
+    const crash = sent.filter((m) => m.type === "agent:activity" && m.detailKind === "claude_root_privileges").at(-1);
+    assert.ok(crash && crash.type === "agent:activity");
+    assert.equal(crash.runtimeError?.errorReason, "root_privileges");
+    assert.equal(crash.runtimeError?.errorClass, "RootPrivilegesError");
+    assert.match(crash.detail ?? "", /Run Raft Computer as a non-root user/);
+    assert.ok(!JSON.stringify(crash).includes("private diagnostic context"));
+    assert.equal(driver.processes.length, 1, "diagnostic must not add a restart");
+  });
+});
+
+test("Claude root stderr cannot turn a clean exit into an actionable crash", async () => {
+  await withManager(async ({ driver, manager, sent }) => {
+    await manager.startAgent("agent-1", makeConfig({ sessionId: "session-1" }));
+    const ap = getProcess(manager, "agent-1");
+    (manager as any).commitApmIdleState("agent-1", ap, true);
+    ap.recentStderr = ["--dangerously-skip-permissions cannot be used with root/sudo privileges for security reasons"];
+    driver.processes[0].emit("exit", 0, null);
+    driver.processes[0].emit("close", 0, null);
+    await flush();
+    assert.ok(!sent.some((m) => m.type === "agent:activity" && m.detail?.includes("non-root user")));
+  });
+});
+
+test("Claude root detailKind alone projects offline, not working", () => {
+  const result = reduceAgentActivityProjection(createInitialApmDecisionState(), {
+    transitionSeq: 1, scenario: "root-refusal", correlationId: "root-refusal", inputId: "input-1", inputKind: "ParsedEvent", inputSummary: "crash",
+    message: { type: "agent:activity", agentId: "agent-1", detail: "Changed display text", detailKind: "claude_root_privileges" },
+  });
+  assert.equal(result.snapshotEntry.activityKind, "offline");
+});
+
+// task #1362: a compaction started after the run's end (compaction_started.afterRunEnd)
+// releases what waited only once both its own end and the turn end are in.
+describe("task #1362: compaction after the run end", () => {
+  async function heldCompaction(fn: (ctx: { driver: FakeClaudeDriver; manager: AgentProcessManager; emit: (...lines: string[]) => Promise<void> }) => Promise<void>) {
+    await withManager(async ({ driver, manager }) => {
+      (driver as any).acceptsStdinDuringCompaction = false;
+      await manager.startAgent("agent-1", makeConfig({ sessionId: "session-1" }));
+      driver.parsedLines.set("end", [{ kind: "turn_end", sessionId: "session-1" }]);
+      driver.parsedLines.set("start-1", [{ kind: "compaction_started", cycleId: 1, afterRunEnd: true }]);
+      driver.parsedLines.set("finish-1", [{ kind: "compaction_finished", cycleId: 1 }]);
+      driver.parsedLines.set("finish-2", [{ kind: "compaction_finished", cycleId: 2 }]);
+      driver.parsedLines.set("aborted-1", [{ kind: "compaction_interrupted", cycleId: 1, outcome: "aborted", reason: "manual" }]);
+      driver.parsedLines.set("output", [{ kind: "text", text: "retried run output" }]);
+      const emit = async (...lines: string[]) => {
+        driver.processes[0].stdout.emit("data", Buffer.from(lines.map((line) => `${line}\n`).join("")));
+        await flush();
+      };
+      await fn({ driver, manager, emit });
+    });
+  }
+
+  test("finish first: another cycle's finish, a repeated finish and turn output release nothing; the turn end delivers once, idle", async () => {
+    await heldCompaction(async ({ driver, manager, emit }) => {
+      await emit("start-1");
+      manager.deliverMessage("agent-1", makeMessage("arrives while compacting"));
+      await flush();
+      const before = driver.encodedCalls.length;
+      await emit("finish-2");
+      await emit("finish-1");
+      await emit("finish-1");
+      await emit("output");
+      assert.equal(driver.encodedCalls.length, before, "nothing goes before the turn end");
+      assert.equal(getProcess(manager, "agent-1").gatedSteering.compacting, true, "the gate stays shut");
+      await emit("end");
+      await waitFor(() => driver.encodedCalls.length > before, "the delivery at the turn end");
+      assert.deepEqual(driver.encodedCalls.slice(before).map((call) => call.mode), ["idle"]);
+      assert.equal(getProcess(manager, "agent-1").compactionAfterRunEnd, undefined);
+    });
+  });
+
+  test("turn end first: nothing goes and the agent is not idle until the compaction's own finish, which delivers once, idle", async () => {
+    await heldCompaction(async ({ driver, manager, emit }) => {
+      await emit("start-1");
+      manager.deliverMessage("agent-1", makeMessage("arrives while compacting"));
+      await flush();
+      const before = driver.encodedCalls.length;
+      await emit("end");
+      assert.equal(driver.encodedCalls.length, before, "the turn end does not deliver into a running compaction");
+      assert.equal(getProcess(manager, "agent-1").gatedSteering.isIdle, false);
+      manager.deliverMessage("agent-1", makeMessage("arrives after the turn end"));
+      await flush();
+      await emit("finish-2");
+      assert.equal(driver.encodedCalls.length, before, "another cycle's finish does not release");
+      await emit("finish-1");
+      await waitFor(() => driver.encodedCalls.length > before, "the delivery at the finish");
+      assert.deepEqual(driver.encodedCalls.slice(before).map((call) => call.mode), ["idle"]);
+      await emit("finish-1");
+      assert.equal(driver.encodedCalls.length, before + 1, "a repeated finish delivers nothing more");
+    });
+  });
+
+  test("an interruption ends the held compaction like a finish: released by the turn end", async () => {
+    await heldCompaction(async ({ driver, manager, emit }) => {
+      await emit("start-1");
+      manager.deliverMessage("agent-1", makeMessage("arrives while compacting"));
+      await flush();
+      const before = driver.encodedCalls.length;
+      await emit("aborted-1");
+      assert.equal(driver.encodedCalls.length, before, "an interruption alone does not release before the turn end");
+      await emit("end");
+      await waitFor(() => driver.encodedCalls.length > before, "the delivery at the turn end");
+      assert.deepEqual(driver.encodedCalls.slice(before).map((call) => call.mode), ["idle"]);
+    });
+  });
+
+  /** Reconcile keeps the process (returns false); count the session rotation checks. */
+  function countRotationChecks(manager: AgentProcessManager): () => number {
+    let rotations = 0;
+    (manager as any).reconcile = () => false;
+    (manager as any).rotateRuntimeSessionIfDue = () => { rotations += 1; };
+    return () => rotations;
+  }
+
+  test("turn end first, nothing queued: the rotation check the turn end left goes at the compaction's finish, once", async () => {
+    await heldCompaction(async ({ manager, emit }) => {
+      const rotations = countRotationChecks(manager);
+      await emit("start-1", "end");
+      assert.equal(rotations(), 0, "no rotation while the session still compacts");
+      await emit("finish-1");
+      assert.equal(rotations(), 1);
+      await emit("finish-1");
+      assert.equal(rotations(), 1, "a repeated finish checks nothing more");
+    });
+  });
+
+  test("turn end first, a message queued: its delivery starts a new turn, so the finish starts no rotation", async () => {
+    await heldCompaction(async ({ driver, manager, emit }) => {
+      const rotations = countRotationChecks(manager);
+      await emit("start-1");
+      manager.deliverMessage("agent-1", makeMessage("arrives while compacting"));
+      await flush();
+      const before = driver.encodedCalls.length;
+      await emit("end", "finish-1");
+      await waitFor(() => driver.encodedCalls.length > before, "the delivery at the finish");
+      assert.equal(rotations(), 0);
+    });
+  });
+
+  test("finish first: the turn end runs its own rotation check, once", async () => {
+    await heldCompaction(async ({ manager, emit }) => {
+      const rotations = countRotationChecks(manager);
+      await emit("start-1", "finish-1");
+      assert.equal(rotations(), 0);
+      await emit("end");
+      assert.equal(rotations(), 1);
+    });
+  });
+
+  test("with nothing queued, both ends leave the agent idle, and the next message is an idle delivery", async () => {
+    await heldCompaction(async ({ driver, manager, emit }) => {
+      await emit("start-1", "end", "finish-1");
+      assert.equal(getProcess(manager, "agent-1").gatedSteering.isIdle, true);
+      assert.equal(getProcess(manager, "agent-1").gatedSteering.compacting, false);
+      const before = driver.encodedCalls.length;
+      manager.deliverMessage("agent-1", makeMessage("next message"));
+      await waitFor(() => driver.encodedCalls.length > before, "the next delivery");
+      assert.deepEqual(driver.encodedCalls.slice(before).map((call) => call.mode), ["idle"]);
+    });
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// RFC 081 D3/D16: the notice written into a running turn (busy) is the same
+// text as the notice that starts a turn (idle): the same header, item rows and
+// footer, through the one wake-up formatter. Pinned for a conversation item,
+// an app item and a reminder (with its `ack:` line); with inbox items off the
+// app Inbox notice stays the count notice.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const PARITY_REMINDER_ID = "1598ee1a-81c7-4aba-a76b-c75aab407097";
+
+const PARITY_INBOX_REGISTRY = {
+  ...REMINDER_AGENT_INBOX_REGISTRY,
+  ...createSystemCleanerAppRegistry(() => ({ thresholdBytes: 1024, maximumThresholdBytes: 4096 })),
+};
+
+async function noticeTextFor(
+  mode: "idle" | "busy",
+  deliver: (manager: AgentProcessManager, store: AgentAppInboxStore) => Promise<void>,
+  config: Partial<AgentConfig> = { inboxItems: true },
+): Promise<string> {
+  const store = createAgentAppInboxStore({ registry: PARITY_INBOX_REGISTRY });
+  let text = "";
+  await withManager(async ({ driver, manager }) => {
+    await manager.startAgent("agent-1", makeConfig({ sessionId: "s1", ...config }));
+    const ap = getProcess(manager, "agent-1");
+    ap.sessionId = "s1";
+    (manager as any).commitApmIdleState("agent-1", ap, mode === "idle");
+    const before = driver.encodedCalls.length;
+    await deliver(manager, store);
+    if (mode === "busy" && driver.encodedCalls.length === before) {
+      assert.equal((manager as any).sendStdinNotification("agent-1"), true);
+    }
+    const written = driver.encodedCalls.slice(before);
+    assert.equal(written.length, 1, `one ${mode} notice`);
+    assert.equal(written[0]!.mode, mode);
+    text = written[0]!.text;
+  }, { appInboxForAgent: () => store });
+  return text;
+}
+
+function deliverMessageOnce(message: AgentMessage) {
+  return async (manager: AgentProcessManager) => {
+    assert.equal(await manager.deliverMessage("agent-1", message), true);
+  };
+}
+
+async function notifyReminderOnce(manager: AgentProcessManager, store: AgentAppInboxStore): Promise<void> {
+  const minted = store.mint({
+    appId: "system.reminder",
+    notificationClass: "due",
+    sourceRef: { kind: "reminder", id: PARITY_REMINDER_ID, revision: "1" },
+    title: "查看「今日待办」页面有没有新评论",
+    summary: "Reminder due",
+  });
+  assert.equal(minted.ok, true);
+  if (!minted.ok) return;
+  assert.equal(await manager.notifyAgentAppInbox("agent-1", minted.item), true);
+}
+
+test("RFC 081 inbox items: a conversation item's mid-turn notice is the between-turn notice", async () => {
+  const message = makeMessage("can you look at this?", { message_id: "11111111-2222-4333-8444-555555555555", seq: 7 });
+  const idle = await noticeTextFor("idle", deliverMessageOnce(message));
+  const busy = await noticeTextFor("busy", deliverMessageOnce(message));
+  assert.equal(busy, idle);
+  assert.match(idle, /^\[Raft inbox notice:\nInbox update: 1 message pending/);
+  assert.match(idle, /\n#general · 1 unread/);
+  assert.match(idle, /\n {2}read: raft inbox read --target "#general"\n/);
+});
+
+test("RFC 081 inbox items: an app item's (app:<key>/<ref>) mid-turn notice is the between-turn notice", async () => {
+  const message = exampleThirdPartyEvent(201, "app:stamp/pr-13754");
+  const idle = await noticeTextFor("idle", deliverMessageOnce(message));
+  const busy = await noticeTextFor("busy", deliverMessageOnce(message));
+  assert.equal(busy, idle);
+  assert.match(idle, /\napp:stamp\/pr-13754 · 1 unread · from Stamp/);
+  assert.match(idle, /\n {2}read: raft inbox read --target "app:stamp\/pr-13754"\n/);
+});
+
+// RFC 081 D9: the host reads when inbox items launched from the config whose
+// `inboxItems` it reads (AgentConfig.inboxItemsLaunchAt). A reminder fired at
+// or after it is its `reminder:` row with its `ack:` line; one fired before
+// it, or any reminder while the launch time is unknown, is in the daemon
+// section, never a `reminder:` row its read could not find.
+const PARITY_REMINDER_ROW_NOTICE = [
+  "[Raft inbox notice:",
+  "Inbox update: 1 message pending your read across all conversations; 1 changed target",
+  "reminder:1598ee1a · 1 fired, not acked · latest just now",
+  "  \"查看「今日待办」页面有没有新评论\" (preview)",
+  "  read: raft inbox read --target \"reminder:1598ee1a\"",
+  `  ack: raft reminder ack --id ${PARITY_REMINDER_ID} --revision 1`,
+  "]",
+].join("\n");
+
+const PARITY_REMINDER_DAEMON_SECTION_NOTICE = [
+  "[Raft inbox notice:",
+  "Inbox update: 1 message pending your read across all conversations; 1 changed target",
+  "",
+  "App items: 1",
+  "",
+  `app=system.reminder · class=due · item=reminder · retention=until_explicit_ack · sourceRef=reminder:${PARITY_REMINDER_ID}:1 · action=raft reminder ack --id 1598ee1a --revision 1 · title=查看「今日待办」页面有没有新评论 · summary=Reminder due`,
+  "]",
+].join("\n");
+
+test("RFC 081 inbox items: a reminder fired after the Server's inbox-items launch time is its reminder: row, mid-turn as between-turn", async () => {
+  const config = { inboxItems: true, inboxItemsLaunchAt: "2026-01-01T00:00:00.000Z" };
+  const idle = await noticeTextFor("idle", notifyReminderOnce, config);
+  const busy = await noticeTextFor("busy", notifyReminderOnce, config);
+  assert.equal(busy, idle);
+  assert.equal(idle, PARITY_REMINDER_ROW_NOTICE);
+});
+
+test("RFC 081 inbox items: a reminder fired before the Server's inbox-items launch time is in the daemon section, mid-turn as between-turn", async () => {
+  const config = { inboxItems: true, inboxItemsLaunchAt: "2999-01-01T00:00:00.000Z" };
+  const idle = await noticeTextFor("idle", notifyReminderOnce, config);
+  const busy = await noticeTextFor("busy", notifyReminderOnce, config);
+  assert.equal(busy, idle);
+  assert.equal(idle, PARITY_REMINDER_DAEMON_SECTION_NOTICE);
+});
+
+// A busy agent takes a server:features answer at once (its stop waits for the
+// turn end), so a notice written into that turn reads the refreshed launch time.
+test("RFC 081 inbox items: a server:features refresh's launch time reaches the mid-turn notice", async () => {
+  const busy = await noticeTextFor("busy", async (manager, store) => {
+    manager.applyServerFeatures({ inboxItems: true, inboxItemsLaunchAt: "2026-01-01T00:00:00.000Z" });
+    await notifyReminderOnce(manager, store);
+  }, { inboxItems: true, inboxItemsLaunchAt: "2999-01-01T00:00:00.000Z" });
+  assert.equal(busy, PARITY_REMINDER_ROW_NOTICE);
+});
+
+test("RFC 081 inbox items: a reminder's mid-turn notice is the between-turn notice, in the daemon section while the launch time is unknown", async () => {
+  const idle = await noticeTextFor("idle", notifyReminderOnce);
+  const busy = await noticeTextFor("busy", notifyReminderOnce);
+  assert.equal(busy, idle);
+  assert.equal(idle, PARITY_REMINDER_DAEMON_SECTION_NOTICE);
+});
+
+test("RFC 081 inbox items off: the app Inbox notice stays the count notice, idle and busy", async () => {
+  const legacy = "[Raft Inbox notice:\nApp items pending: 1\nRun `raft inbox check` to inspect them.]";
+  assert.equal(await noticeTextFor("idle", notifyReminderOnce, {}), legacy);
+  assert.equal(await noticeTextFor("busy", notifyReminderOnce, {}), legacy);
+});
+
+test("RFC 081 inbox items: a mixed batch (a reminder and a local-only cleaner item) mid-turn is the between-turn notice, as inbox check's daemon section prints them", async () => {
+  let pending: readonly AgentInboxAppItem[] = [];
+  const notifyMixed = async (manager: AgentProcessManager, store: AgentAppInboxStore) => {
+    const reminder = store.mint({
+      appId: "system.reminder",
+      notificationClass: "due",
+      sourceRef: { kind: "reminder", id: PARITY_REMINDER_ID, revision: "1" },
+      title: "查看「今日待办」页面有没有新评论",
+    });
+    const cleaner = store.mint({
+      appId: "system.cleaner",
+      notificationClass: "disk_space_hint",
+      sourceRef: { kind: "disk_hint", agentId: "agent-1" },
+      title: "Disk is low",
+    });
+    assert.equal(reminder.ok && cleaner.ok, true);
+    if (!reminder.ok || !cleaner.ok) return;
+    pending = store.list();
+    assert.equal(await manager.notifyAgentAppInbox("agent-1", cleaner.item), true);
+  };
+  const idle = await noticeTextFor("idle", notifyMixed);
+  const busy = await noticeTextFor("busy", notifyMixed);
+  assert.equal(busy, idle);
+  // Launch time unknown: both are what `inbox check` prints in its daemon section (shared formatAgentInboxAppItems).
+  const localSection = formatAgentInboxAppItems(pending);
+  assert.match(localSection, /^App items: 2\n\n/);
+  assert.match(localSection, /app=system\.reminder · class=due/);
+  assert.match(localSection, /app=system\.cleaner · class=disk_space_hint/);
+  assert.equal(idle, [
+    "[Raft inbox notice:",
+    "Inbox update: 2 messages pending your read across all conversations; 2 changed targets",
+    "",
+    localSection,
+    "]",
+  ].join("\n"));
+});
+
+test("RFC 081 inbox items: in the notice a local-only cleaner item's row is followed by its dismiss command; a reminder's is not", async () => {
+  let cleanerItemId = "";
+  const notice = await noticeTextFor("idle", async (manager, store) => {
+    const reminder = store.mint({
+      appId: "system.reminder",
+      notificationClass: "due",
+      sourceRef: { kind: "reminder", id: PARITY_REMINDER_ID, revision: "1" },
+    });
+    const cleaner = store.mint({
+      appId: "system.cleaner",
+      notificationClass: "disk_space_hint",
+      sourceRef: { kind: "backup_ignore_hint", agentId: "agent-1" },
+      title: "Review .raftbackupignore",
+    });
+    assert.equal(reminder.ok && cleaner.ok, true);
+    if (!reminder.ok || !cleaner.ok) return;
+    cleanerItemId = cleaner.item.itemId;
+    assert.equal(await manager.notifyAgentAppInbox("agent-1", cleaner.item), true);
+  });
+  const lines = notice.split("\n");
+  const cleanerRow = lines.findIndex((line) => line.startsWith("app=system.cleaner · class=disk_space_hint · "));
+  assert.ok(cleanerRow >= 0, notice);
+  assert.equal(lines[cleanerRow + 1], `  dismiss: raft inbox dismiss --target "app:system.cleaner/${cleanerItemId.slice(0, 8)}"`);
+  assert.equal(lines.filter((line) => line.startsWith("  dismiss: ")).length, 1, "the reminder is acked, never dismissed");
+});
+
+// A Computer-local item's id is stable per (app, class, source): a reminder
+// the Cleaner mints again after its item was dismissed or withdrawn has the id
+// of the one before. The notice memo keeps the item's createdAtMs beside its
+// id (appInboxItemNoticed), so the one that came back is announced, in whatever
+// order the removal, the mint and the host's reads of the store came. An item
+// still pending is not announced twice, also when it is updated in place.
+test("app Inbox notice: an item removed and minted again is announced again, also when both happen between two reads of the store; a pending item is not announced twice", async () => {
+  const { sink, tracer } = makeDeterministicTracer();
+  // Every mint is a minute after the one before, as the Cleaner's are hours apart.
+  let now = Date.parse("2026-11-12T08:00:00.000Z");
+  const store = createAgentAppInboxStore({ registry: PARITY_INBOX_REGISTRY, nowMs: () => now });
+  const mint = (summary: string) => {
+    now += 60_000;
+    const minted = store.mint({
+      appId: "system.cleaner",
+      notificationClass: "disk_space_hint",
+      sourceRef: { kind: "backup_ignore_hint", agentId: "agent-1" },
+      title: "Review .raftbackupignore",
+      summary,
+    });
+    if (!minted.ok) throw new Error(`mint failed: ${minted.message}`);
+    return minted.item;
+  };
+  const outcomes = () => traceRows(sink)
+    .filter((span) => span.name === "daemon.agent.app_inbox_notice")
+    .map((span) => span.attrs?.outcome);
+  await withManager(async ({ driver, manager }) => {
+    await manager.startAgent("agent-1", makeConfig({ sessionId: "s1", inboxItems: true }));
+    const ap = getProcess(manager, "agent-1");
+    ap.sessionId = "s1";
+    const notices = () => driver.encodedCalls.filter((call) => call.text.startsWith("[Raft inbox notice:"));
+    const goIdle = () => (manager as any).commitApmIdleState("agent-1", ap, true);
+
+    goIdle();
+    const first = mint("first");
+    assert.equal(await manager.notifyAgentAppInbox("agent-1", first), true);
+    assert.equal(notices().length, 1);
+
+    // Still pending, and minted again as the same identity (an update): no second notice,
+    // from the app's own wake or from the idle drain.
+    goIdle();
+    const updated = mint("updated");
+    assert.equal(updated.itemId, first.itemId);
+    assert.equal(await manager.notifyAgentAppInbox("agent-1", updated), true);
+    goIdle();
+    await flush();
+    assert.equal(notices().length, 1, "one notice for an item that is still there");
+    assert.equal(outcomes().at(-1), "already_delivered");
+
+    // Dismissed, then minted again before the host read the store in between.
+    assert.equal(store.dismiss(first.itemId), true);
+    const again = mint("again");
+    assert.equal(again.itemId, first.itemId, "the same id as the item before");
+    assert.equal(await manager.notifyAgentAppInbox("agent-1", again), true);
+    assert.equal(notices().length, 2, "the item that came back is announced");
+    assert.equal(outcomes().at(-1), "written");
+    assert.match(notices()[1]!.text, /summary=again/);
+
+    // Withdrawn by its app (an ack) and minted again with no wake of its own: the next idle drain offers it.
+    assert.equal(store.ack(first.itemId), true);
+    mint("third");
+    goIdle();
+    await waitFor(() => notices().length === 3, "the idle drain's notice");
+    assert.match(notices()[2]!.text, /summary=third/);
+
+    goIdle();
+    await flush();
+    assert.equal(notices().length, 3, "and once only");
+  }, { tracer, appInboxForAgent: () => store });
 });

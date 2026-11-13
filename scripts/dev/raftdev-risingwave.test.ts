@@ -7,7 +7,15 @@ import { fileURLToPath } from "node:url";
 import {
   DEFAULT_RISINGWAVE_IMAGE,
   hasRisingWaveSeedPostgresOwnershipProof,
+  ORPHAN_RISINGWAVE_GRACE_MS,
+  orphanRisingWaveContainers,
+  parseRisingWaveMemoryBytes,
+  RISINGWAVE_CONFIG,
+  RISINGWAVE_CONFIG_IN_CONTAINER,
+  RAFTDEV_OWNER_LABEL,
+  raftdevOwner,
   parseRisingWaveLocalProfile,
+  RISINGWAVE_DISABLED_WARNING,
   postgresDockerRunArgs,
   RAFTDEV_MANAGED_LABEL,
   replicaMetricsPort,
@@ -52,10 +60,10 @@ function loadActualBootstrapArtifacts(): Record<string, string> {
   ]));
 }
 
-test("RisingWave is default-off and parses full/process-only profiles explicitly", () => {
+test("the RisingWave switch parses unset, the 0 opt-out, and full/process-only profiles", () => {
   assert.equal(parseRisingWaveLocalProfile(undefined), null);
   assert.equal(parseRisingWaveLocalProfile(""), null);
-  assert.equal(parseRisingWaveLocalProfile(" 0 "), null);
+  assert.equal(parseRisingWaveLocalProfile(" 0 "), "off");
   assert.equal(parseRisingWaveLocalProfile(" 1 "), "full");
   assert.equal(parseRisingWaveLocalProfile(" full "), "full");
   assert.equal(parseRisingWaveLocalProfile(" process-only "), "process-only");
@@ -67,10 +75,28 @@ test("RisingWave is default-off and parses full/process-only profiles explicitly
   }
 });
 
-test("dependency resolution keeps default mode disabled", () => {
-  assert.deepEqual(
-    resolveRisingWaveDependency(undefined, undefined, "postgresql://root@127.0.0.1:17666/dev", undefined),
-    { mode: "disabled" },
+test("dependency resolution starts managed local full by default; 0 / --no-risingwave opts out", () => {
+  const local = {
+    mode: "local",
+    profile: "full",
+    databaseUrl: "postgresql://root@127.0.0.1:17666/dev",
+    image: DEFAULT_RISINGWAVE_IMAGE,
+  };
+  // Unset and blank both mean the default.
+  assert.deepEqual(resolveRisingWaveDependency(undefined, undefined, "postgresql://root@127.0.0.1:17666/dev", undefined), local);
+  assert.deepEqual(resolveRisingWaveDependency(" ", undefined, "postgresql://root@127.0.0.1:17666/dev", undefined), local);
+  // --risingwave stays accepted and means the default.
+  assert.deepEqual(resolveRisingWaveDependency("1", undefined, "postgresql://root@127.0.0.1:17666/dev", undefined), local);
+  assert.deepEqual(resolveRisingWaveDependency("0", undefined, "postgresql://root@127.0.0.1:17666/dev", undefined), { mode: "disabled" });
+});
+
+test("the CLI maps --no-risingwave to 0 and keeps --risingwave as the default alias", () => {
+  const source = readFileSync(new URL("./raftdev.ts", import.meta.url), "utf8");
+  assert.match(source, /a === "--no-risingwave"\) \{\s*risingWaveLocalRaw = "0";/);
+  assert.match(source, /a === "--risingwave"\) \{[^}]*risingWaveLocalRaw = "1";/);
+  assert.match(
+    RISINGWAVE_DISABLED_WARNING.join(" "),
+    /Activity endpoints \(inbox, followed threads, unread summary, channel unread\)\s+will return 503/,
   );
 });
 
@@ -128,8 +154,14 @@ test("dependency resolution supports an external URL without exposing a local co
     resolveRisingWaveDependency(undefined, " postgresql://rw.example:4566/dev ", "unused", undefined),
     { mode: "external", databaseUrl: "postgresql://rw.example:4566/dev" },
   );
+  // The 0 opt-out only skips the managed container; an explicit external URL
+  // is still used.
   assert.deepEqual(
-    resolveRisingWaveDependency(undefined, "   ", "unused", undefined),
+    resolveRisingWaveDependency("0", "postgresql://rw.example:4566/dev", "unused", undefined),
+    { mode: "external", databaseUrl: "postgresql://rw.example:4566/dev" },
+  );
+  assert.deepEqual(
+    resolveRisingWaveDependency("0", "   ", "unused", undefined),
     { mode: "disabled" },
   );
 });
@@ -281,6 +313,52 @@ test("RisingWave host ports occupy deterministic disjoint bands", () => {
   }
 });
 
+test("an environment's RisingWave is orphaned only when it is this checkout's, its tmux session is gone, and it has run past the grace", () => {
+  const now = Date.parse("2026-10-23T08:00:00Z");
+  const old = now - ORPHAN_RISINGWAVE_GRACE_MS - 1;
+  const running = new Set(["slock-alive"]);
+  assert.deepEqual(
+    orphanRisingWaveContainers([
+      { name: "slock-dev-alive-risingwave", startedAt: old, owner: "me" },
+      { name: "slock-dev-gone-risingwave", startedAt: old, owner: "me" },
+      { name: "slock-dev-starting-risingwave", startedAt: now - 60_000, owner: "me" },
+      { name: "slock-dev-gone-pg", startedAt: old, owner: "me" },
+      // Another agent's or user's: its tmux session isn't visible from here.
+      { name: "slock-dev-theirs-risingwave", startedAt: old, owner: "someone-else" },
+      // No owner (started before owner labels): never touched.
+      { name: "slock-dev-legacy-risingwave", startedAt: old },
+    ], "me", (session) => running.has(session), now),
+    ["slock-dev-gone-risingwave"],
+  );
+});
+
+test("RisingWave carries the owner label when given, and owners differ per checkout", () => {
+  const args = risingWaveDockerRunArgs({
+    RISINGWAVE_CONTAINER: "slock-dev-demo-risingwave",
+    RISINGWAVE_PORT: 17734,
+    RISINGWAVE_DASHBOARD_PORT: 17934,
+  }, "risingwave:test", undefined, { owner: "abc123" });
+  assert.ok(args.includes(`${RAFTDEV_OWNER_LABEL}=abc123`));
+  assert.equal(raftdevOwner("/a").length, 16);
+  assert.notEqual(raftdevOwner("/a"), raftdevOwner("/b"));
+});
+
+test("RisingWave's memory: 2 GiB by default, the Docker limit 1 GiB above, the compactor's limit from a mounted config", () => {
+  assert.equal(parseRisingWaveMemoryBytes(undefined), 2147483648);
+  assert.equal(parseRisingWaveMemoryBytes("4294967296"), 4294967296);
+  assert.equal(parseRisingWaveMemoryBytes("2147483648"), 2147483648);
+  const args = risingWaveDockerRunArgs({
+    RISINGWAVE_CONTAINER: "slock-dev-demo-risingwave",
+    RISINGWAVE_PORT: 17734,
+    RISINGWAVE_DASHBOARD_PORT: 17934,
+  }, "risingwave:test", undefined, { memoryBytes: 4294967296, configFile: "/env/risingwave.toml" });
+  assert.deepEqual(args.slice(args.indexOf("--memory"), args.indexOf("--memory") + 6), [
+    "--memory", "5368709120", "--memory-swap", "5368709120", "-v", `/env/risingwave.toml:${RISINGWAVE_CONFIG_IN_CONTAINER}:ro`,
+  ]);
+  assert.deepEqual(args.slice(-4), ["--total-memory-bytes", "4294967296", "--config-path", RISINGWAVE_CONFIG_IN_CONTAINER]);
+  assert.match(RISINGWAVE_CONFIG, /^\[storage\]\ncompactor_memory_limit_mb = 768$/m);
+});
+
 test("process-only RisingWave Docker args bind pgwire/dashboard without a CDC network", () => {
   assert.deepEqual(
     risingWaveDockerRunArgs({
@@ -293,8 +371,11 @@ test("process-only RisingWave Docker args bind pgwire/dashboard without a CDC ne
       "--label", `${RAFTDEV_MANAGED_LABEL}=true`,
       "-p", "127.0.0.1:17734:4566",
       "-p", "127.0.0.1:17934:5691",
+      "--memory", "3221225472",
+      "--memory-swap", "3221225472",
       "risingwave:test",
       "single_node",
+      "--total-memory-bytes", "2147483648",
     ],
   );
 });
@@ -312,8 +393,11 @@ test("full RisingWave Docker args join the per-environment CDC network", () => {
       "--network", "slock-dev-demo-risingwave-net",
       "-p", "127.0.0.1:17734:4566",
       "-p", "127.0.0.1:17934:5691",
+      "--memory", "3221225472",
+      "--memory-swap", "3221225472",
       DEFAULT_RISINGWAVE_IMAGE,
       "single_node",
+      "--total-memory-bytes", "2147483648",
     ],
   );
 });
@@ -462,6 +546,7 @@ test("explicit CDC statements preserve upstream PKs and exclude unsupported mess
   assert.deepEqual(mentions?.primaryKey, ["id"]);
   assert.deepEqual(mentions?.columns, [
     "id varchar",
+    "message_id varchar",
     "message_seq bigint",
     "channel_id varchar",
     "target_type varchar",
@@ -538,17 +623,35 @@ test("actual RFC bootstrap preserves dependency order and excludes superseded ge
   before("rw_target_eligible_v1", "rw_inbox_normal_v5");
   before("rw_target_latest_v4", "rw_inbox_normal_v5");
   before("rw_receiver_cursors_v1", "rw_inbox_muted_prefix_v2");
-  before("rw_muted_subs_v1", "rw_inbox_muted_full_v2");
-  before("rw_thread_parent_v3", "rw_inbox_mention_v6");
-  before("rw_inbox_mention_v6", "rw_inbox_items_v11");
-  before("rw_inbox_muted_prefix_v2", "rw_inbox_items_v11");
-  before("rw_inbox_items_v11", "rw_inbox_items_v12");
-  before("rw_thread_parent_v3", "rw_inbox_items_v12");
-  before("rw_thread_parent_v3", "rw_activity_watermark_v6");
-  before("rw_activity_watermark_v6", "rw_inbox_serving_v8");
-  before("rw_inbox_items_v12", "rw_inbox_serving_v8");
-  before("rw_inbox_serving_v8", "rw_activity_totals_v6");
-  before("rw_inbox_muted_full_v2", "rw_conversation_unread_v3");
+  before("rw_muted_subs_v1", "rw_inbox_muted_full_v1");
+  before("rw_receiver_cursors_v1", "rw_inbox_muted_full_v1");
+  before("rw_thread_parent_v3", "rw_conversation_parent_v1");
+  before("rw_conversation_parent_v1", "rw_inbox_mention_v7");
+  before("rw_target_eligible_v1", "rw_inbox_mention_v7");
+  before("rw_inbox_mention_v7", "rw_inbox_items_v13");
+  before("rw_inbox_muted_prefix_v2", "rw_inbox_items_v13");
+  before("rw_conversation_parent_v1", "rw_inbox_items_v13");
+  before("rw_conversation_parent_v1", "rw_activity_watermark_v7");
+  before("rw_activity_watermark_v7", "rw_inbox_serving_v9");
+  before("rw_inbox_items_v13", "rw_inbox_serving_v9");
+  before("rw_inbox_items_v13", "rw_inbox_preview_need_v1");
+  before("rw_task_conversation_unread_v1", "rw_inbox_preview_need_v1");
+  before("rw_inbox_preview_need_v1", "rw_inbox_preview_seq_v1");
+  before("rw_conversation_parent_v1", "rw_inbox_preview_parent_v1");
+  before("rw_inbox_preview_seq_v1", "rw_inbox_serving_v9");
+  before("rw_inbox_preview_parent_v1", "rw_inbox_serving_v9");
+  before("rw_inbox_preview_seq_v1", "rw_conversation_unread_v4");
+  before("rw_tasks", "rw_inbox_serving_v9");
+  before("rw_message_target_v3", "rw_task_conversation_replies_v1");
+  before("rw_task_conversation_replies_v1", "rw_inbox_serving_v9");
+  before("rw_receiver_cursors_v1", "rw_task_conversation_unread_v1");
+  before("rw_task_conversation_unread_v1", "rw_inbox_serving_v9");
+  before("rw_task_conversation_unread_v1", "rw_conversation_unread_v4");
+  before("rw_inbox_serving_v9", "rw_activity_totals_v7");
+  before("rw_inbox_normal_v5", "rw_agent_inbox_v7");
+  before("rw_conversation_parent_v1", "rw_agent_inbox_v7");
+  before("rw_inbox_muted_full_v1", "rw_conversation_unread_v4");
+  before("rw_conversation_parent_v1", "rw_conversation_unread_v4");
   before("rw_receiver_cursors_v1", "rw_followed_threads_v5");
   before("rw_tasks", "rw_followed_threads_v5");
 
@@ -580,7 +683,8 @@ test("actual RFC bootstrap preserves dependency order and excludes superseded ge
     "rw_conversation_unread_v2",
     "rw_inbox_normal_v4",
     "rw_inbox_muted_prefix_v1",
-    "rw_inbox_muted_full_v1",
+    // 078's conversation unread reads 066's rw_inbox_muted_full_v1 instead.
+    "rw_inbox_muted_full_v2",
     "rw_inbox_items_v10",
     "rw_inbox_serving_v6",
     "rw_activity_totals_v4",
@@ -588,6 +692,22 @@ test("actual RFC bootstrap preserves dependency order and excludes superseded ge
     "rw_inbox_serving_v7",
     "rw_activity_totals_v5",
     "rw_activity_watermark_v5",
+    // Superseded by 078 (task conversations as sub-conversations).
+    "rw_inbox_mention_v6",
+    "rw_inbox_items_v11",
+    "rw_inbox_items_v12",
+    "rw_activity_watermark_v6",
+    "rw_inbox_serving_v8",
+    "rw_activity_totals_v6",
+    "rw_agent_inbox_v6",
+    "rw_conversation_unread_v3",
+    // The retired task-anchor generation of 078 (never deployed).
+    "rw_message_target_v4",
+    "rw_target_latest_v5",
+    "rw_target_eligible_v2",
+    "rw_inbox_normal_v6",
+    "rw_inbox_muted_full_v3",
+    "rw_inbox_muted_prefix_v3",
     "rw_followed_thread_stats_v1",
     "rw_followed_thread_stats_v2",
     "rw_followed_thread_stats_v3",
@@ -625,19 +745,40 @@ test("actual RFC bootstrap creates every server-read relation and required relat
   }
 });
 
-test("release-QA emitter uses the exact raftdev/real-RW relation contract", { skip: inSourceSnapshot }, () => {
+test("release-QA uses production CDC columns while retaining the raftdev view graph", { skip: inSourceSnapshot }, () => {
   const sourceRoot = fileURLToPath(new URL("../../", import.meta.url));
   const rendered = renderReleaseQaRisingWaveBootstrap(sourceRoot);
-  assert.deepEqual(rendered.contract.publication_tables, [...RISINGWAVE_PUBLICATION_TABLES]);
-  assert.deepEqual(rendered.contract.cdc_relations, RISINGWAVE_CDC_TABLES.map((table) => table.name));
-  assert.deepEqual(rendered.contract.artifact_cdc_relations, RISINGWAVE_ARTIFACT_CDC_TABLES.map((table) => table.name));
-  assert.deepEqual(rendered.contract.required_relations, [...RISINGWAVE_REQUIRED_RELATIONS]);
+  const productionMirrors = [
+    "rw_agent_channel_read_cursors", "rw_channel_agents", "rw_channel_humans",
+    "rw_channels", "rw_inbox_suppression_states", "rw_inbox_target_mute_states_v2",
+    "rw_joint_channel_servers", "rw_joint_channels", "rw_message_mentions_v2",
+    "rw_messages", "rw_read_mutation_authorities_v1", "rw_server_members",
+    "rw_servers", "rw_tasks", "rw_thread_follows", "rw_user_channel_inbox_states",
+    "rw_user_channel_read_cursors", "rw_user_channel_read_cursors_v2",
+  ];
+  assert.deepEqual([...rendered.contract.publication_tables].sort(),
+    [...RISINGWAVE_PUBLICATION_TABLES, "read_mutation_authorities"].sort());
+  assert.deepEqual(rendered.contract.cdc_relations, productionMirrors);
+  assert.deepEqual(rendered.contract.artifact_cdc_relations, []);
+  assert.deepEqual(rendered.contract.required_relations,
+    [...new Set([...RISINGWAVE_REQUIRED_RELATIONS, ...productionMirrors])]);
   assert.deepEqual(rendered.contract.server_read_relations, [...RISINGWAVE_SERVER_READ_RELATIONS]);
   assert.match(rendered.cdcSql, /CREATE SOURCE :"rw_source_name"/);
   assert.doesNotMatch(rendered.cdcSql, /\bslockdev_pg_cdc\b|\bslock_neon_cdc\b/);
-  for (const table of RISINGWAVE_CDC_TABLES) {
-    assert.equal((rendered.cdcSql.match(new RegExp(`CREATE TABLE ${table.name}\\b`, "g")) ?? []).length, 1);
-    assert.doesNotMatch(rendered.manifestSql, new RegExp(`CREATE TABLE ${table.name}\\b`));
+  for (const name of productionMirrors) {
+    assert.equal((rendered.cdcSql.match(new RegExp(`CREATE TABLE ${name}\\b`, "g")) ?? []).length, 1);
+    assert.doesNotMatch(rendered.manifestSql, new RegExp(`CREATE TABLE ${name}\\b`));
+  }
+  assert.doesNotMatch(rendered.cdcSql, /CREATE TABLE rw_message_mentions\s*\(/);
+  assert.match(rendered.cdcSql, /auto\.schema\.change = 'false'/);
+  assert.doesNotMatch(rendered.cdcSql, /\(\s*\*\s*\)/);
+  const catalog = readFileSync(new URL(
+    "../../infra/aws-server/envs/release-qa/sql/risingwave-cdc-bootstrap.sql", import.meta.url), "utf8");
+  for (const statement of splitSqlStatements(catalog)) {
+    const name = createdRelationName(statement);
+    if (!name || name === "rw_message_mentions") continue;
+    const ddl = statement.slice(statement.indexOf("CREATE TABLE")).trim();
+    assert.ok(rendered.cdcSql.includes(ddl), `${name}: preserve every production column, type, PK and order`);
   }
   for (const relation of RISINGWAVE_SERVER_READ_RELATIONS) {
     assert.match(`${rendered.cdcSql}\n${rendered.manifestSql}`, new RegExp(`CREATE (?:TABLE|MATERIALIZED VIEW) ${relation}\\b`));
@@ -649,17 +790,38 @@ test("release-QA emitter uses the exact raftdev/real-RW relation contract", { sk
 
 test("bootstrap composition rejects out-of-order, unknown-source, and missing relations", { skip: inSourceSnapshot }, () => {
   const actual = loadActualBootstrapArtifacts();
-  const chain076 = "infra/risingwave/sql/076-cursor-decouple-consumers.sql";
-  const mention067 = "infra/risingwave/sql/067-mention-v6.sql";
-  // 076 without 067: rw_inbox_items_v11 reads rw_inbox_mention_v6, not yet created.
+  const chain078 = "infra/risingwave/sql/078-task-conversations.sql";
+  const chain075 = "infra/risingwave/sql/075-inbox-cursor-decouple.sql";
+  // A selected relation that the artifact no longer creates (the mention arm,
+  // the conversation parent renamed away).
   assert.throws(
-    () => buildRisingWaveBootstrapStatements({ ...actual, [mention067]: "", [chain076]: actual[chain076] }),
-    /rw_inbox_mention_v6 exactly once/,
+    () => buildRisingWaveBootstrapStatements({
+      ...actual,
+      [chain078]: actual[chain078].replace("CREATE MATERIALIZED VIEW rw_inbox_mention_v7 ", "CREATE MATERIALIZED VIEW rw_inbox_mention_v7_gone "),
+    }),
+    /rw_inbox_mention_v7 exactly once/,
   );
   assert.throws(
     () => buildRisingWaveBootstrapStatements({
       ...actual,
-      [mention067]: actual[mention067].replace("FROM rw_message_mentions_v2", "FROM rw_message_mentions_v9"),
+      [chain078]: actual[chain078].replace("CREATE MATERIALIZED VIEW rw_conversation_parent_v1 ", "CREATE MATERIALIZED VIEW rw_conversation_parent_v1_gone "),
+    }),
+    /rw_conversation_parent_v1 exactly once/,
+  );
+  // 078 without 075: rw_inbox_items_v13 reads rw_inbox_normal_v5, not yet created.
+  assert.throws(
+    () => buildRisingWaveBootstrapStatements({ ...actual, [chain075]: "" }),
+    /rw_inbox_normal_v5 exactly once/,
+  );
+  // 078's conversation unread reads 066's muted arm; without 066 the arm is missing.
+  assert.throws(
+    () => buildRisingWaveBootstrapStatements({ ...actual, "infra/risingwave/sql/066-conversation-unread-v1.sql": "" }),
+    /rw_inbox_muted_full_v1 exactly once/,
+  );
+  assert.throws(
+    () => buildRisingWaveBootstrapStatements({
+      ...actual,
+      [chain078]: actual[chain078].replace("FROM rw_message_mentions_v2", "FROM rw_message_mentions_v9"),
     }),
     /reads rw_message_mentions_v9, which is not created before it/,
   );
@@ -672,7 +834,7 @@ test("bootstrap composition rejects out-of-order, unknown-source, and missing re
     /unknown CDC source other_prod_cdc/,
   );
   assert.throws(
-    () => buildRisingWaveBootstrapStatements({ ...actual, [chain076]: `${actual[chain076]}\nDROP MATERIALIZED VIEW rw_x;` }),
+    () => buildRisingWaveBootstrapStatements({ ...actual, [chain078]: `${actual[chain078]}\nDROP MATERIALIZED VIEW rw_x;` }),
     /unsupported executable statement/,
   );
   assert.deepEqual(
@@ -726,7 +888,7 @@ test("ports CLI exposes the deterministic clustertest pgwire/dashboard anchors",
   });
   assert.equal(child.status, 0, child.stderr);
   assert.match(child.stdout, /Ports for 'clustertest' \(offset: 68\):/);
-  assert.match(child.stdout, /RisingWave : localhost:17734 \(dashboard: http:\/\/localhost:17934; reserved; opt in with --risingwave\)/);
+  assert.match(child.stdout, /RisingWave : localhost:17734 \(dashboard: http:\/\/localhost:17934; reserved; not running \(started with --no-risingwave, or not started\)\)/);
   assert.match(child.stdout, /RW pgwire  : postgresql:\/\/root@127\.0\.0\.1:17734\/dev \(reserved\)/);
 });
 

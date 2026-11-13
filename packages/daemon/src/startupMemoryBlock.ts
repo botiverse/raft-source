@@ -10,10 +10,10 @@ import { axSurface, axSurfaceLiteral, composeAxSurfaces } from "./agentRuntimeIn
  * sessions never get it: their transcript already carries an earlier read and
  * re-injecting would duplicate content into a cached prefix.
  *
- * Rationale: MEMORY.md is the one workspace file every session is instructed
- * to read unconditionally (standing prompt step 2), so pushing it saves a
- * guaranteed round trip and removes the compliance risk of the agent skipping
- * the read. The injected view is capped; the file itself is never truncated.
+ * Rationale: MEMORY.md is the one workspace file every session needs
+ * (standing prompt step 2: use this block when it is there, else read the
+ * file), so pushing it saves a guaranteed round trip and removes the
+ * compliance risk of the agent skipping the read. The injected view is capped; the file itself is never truncated.
  *
  * The footer reports size facts ONLY (what the file weighs, how much is
  * shown). Growth back-pressure deliberately lives elsewhere — the CLI guide's
@@ -43,19 +43,18 @@ function parsePositiveInteger(value: string | undefined): number | undefined {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
 }
 
-/** Same knob semantics as the wake-recycle family: the block runs only when
- * the server's `constructed_wake_context` flag is on for this agent
- * (`AgentConfig.constructedWakeContext`); per-agent `agents.env_vars` beat
- * daemon process env for tuning, and RAFT_STARTUP_MEMORY_BLOCK=0 stays a local
- * kill switch that cannot turn the block on by itself. */
+/** Same knob semantics as the wake-recycle family: the block is on by default
+ * (the `constructed_wake_context` server flag was retired on 2026-10-23 and
+ * `AgentConfig.constructedWakeContext` is no longer read here); per-agent
+ * `agents.env_vars` beat daemon process env, and RAFT_STARTUP_MEMORY_BLOCK=0
+ * stays the local per-machine (or per-agent) off switch. */
 export function resolveStartupMemoryBlockConfig(
-  serverEnabled: boolean | null | undefined,
   agentEnvVars: Record<string, string> | null | undefined,
   processEnv: NodeJS.ProcessEnv = process.env,
 ): StartupMemoryBlockConfig {
   const pick = (key: string): string | undefined => agentEnvVars?.[key] ?? processEnv[key];
   return {
-    enabled: serverEnabled === true && parseBooleanFlag(pick("RAFT_STARTUP_MEMORY_BLOCK")) !== false,
+    enabled: parseBooleanFlag(pick("RAFT_STARTUP_MEMORY_BLOCK")) !== false,
     budgetTokens: parsePositiveInteger(pick("RAFT_STARTUP_MEMORY_BLOCK_TOKENS")) ?? DEFAULT_BLOCK_BUDGET_TOKENS,
   };
 }

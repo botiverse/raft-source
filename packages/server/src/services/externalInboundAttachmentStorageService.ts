@@ -3,7 +3,6 @@ import path from "node:path";
 import { currentDate } from "@botiverse/raft-shared";
 import { and, eq } from "drizzle-orm";
 
-import { isAttachmentOriginalStorageV2EnabledForServer } from "../config/attachmentOriginalStorage";
 import type { Database, DatabaseTransaction } from "../db/index";
 import {
   attachmentObjects,
@@ -24,6 +23,7 @@ import {
 import {
   buildLegacyServerAttachmentStorageKey,
   buildServerAttachmentStorageKey,
+  canWriteDedicatedAttachmentKeys,
   type StorageBackend,
 } from "./storageService";
 
@@ -142,11 +142,10 @@ export async function storeExternalInboundAttachment(
   ) {
     throw new Error("External inbound attachment replay conflicts with its storage route");
   }
-  const storageKey = persistedOriginal?.storageKey ?? (
-    await isAttachmentOriginalStorageV2EnabledForServer(input.serverId, input.db)
-      ? currentStorageKey
-      : legacyStorageKey
-  );
+  // A replay keeps the key its first attempt persisted. A fresh write takes a
+  // v2 key only where the dedicated attachment bucket exists.
+  const storageKey = persistedOriginal?.storageKey
+    ?? (canWriteDedicatedAttachmentKeys() ? currentStorageKey : legacyStorageKey);
   const existing = await input.db.select({
     projection: attachments,
     object: attachmentObjects,

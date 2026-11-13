@@ -1,5 +1,5 @@
 import type { ExternalMessageAuthorProjection } from "@botiverse/raft-shared";
-import { PanelAction, ProfilePanelBody, Separator } from "@botiverse/raft-ui";
+import { PanelAction, ProfilePanelBody, Separator, ScrollArea } from "@botiverse/raft-ui";
 import { X } from "lucide-react";
 import { useMemo } from "react";
 import { useIntl } from "react-intl";
@@ -10,6 +10,9 @@ import {
   EXTERNAL_ACTOR_KIND_MESSAGE_IDS,
   formatExternalProviderLabel,
 } from "../message/externalIdentityPresentation";
+import { RowExpandAction } from "../layout/RowExpandAction";
+import { RowMoveMenu } from "../layout/ColumnMoveMenu";
+import { RowRegionBody } from "../layout/RowRegionBody";
 
 const HEADER_CONTAINER_PROPS = { "data-testid": "external-identity-header" };
 
@@ -24,11 +27,13 @@ export default function ExternalIdentityDetailPanel({
 }) {
   const { formatMessage } = useIntl();
   const headerBack = onBack ?? onClose;
+  const displayName = profile.actorKind === "bot" ? profile.profileDisplayName || profile.displayName : profile.displayName;
+  const avatarUrl = profile.actorKind === "bot" && profile.profileAvatarUrl !== undefined ? profile.profileAvatarUrl : profile.avatarUrl;
   const providerLabel = formatExternalProviderLabel(profile.provider, formatMessage);
   const actorKindLabel = formatMessage({
     id: EXTERNAL_ACTOR_KIND_MESSAGE_IDS[profile.actorKind ?? "unknown"],
   });
-  const subtitle = providerLabel
+  const subtitle = profile.actorKind === "bot" && profile.appName ? actorKindLabel : providerLabel
     ? formatMessage(
         { id: "message.externalIdentity.providerAndKind" },
         { provider: providerLabel, kind: actorKindLabel },
@@ -42,14 +47,14 @@ export default function ExternalIdentityDetailPanel({
   return (
     <>
       <PanelHeader
-        title={profile.displayName}
+        title={displayName}
         subtitle={subtitle}
         iconSlot={
           <AvatarSlot
             context="panel-header"
             type="app"
-            appAvatarUrl={profile.avatarUrl}
-            appInitials={profile.displayName}
+            appAvatarUrl={avatarUrl}
+            appInitials={displayName}
           />
         }
         iconAlwaysVisible
@@ -59,24 +64,38 @@ export default function ExternalIdentityDetailPanel({
         mobileBackProps={mobileBackProps}
         containerProps={HEADER_CONTAINER_PROPS}
         actions={
-          // DS header icon button, as on the human and agent profiles.
-          <PanelAction
-            onClick={onClose}
-            className={onBack ? "flex" : "hidden md:flex"}
-            aria-label={formatMessage({ id: "common.close" })}
-            title={formatMessage({ id: "common.close" })}
-          >
-            <X size={22} aria-hidden="true" />
-          </PanelAction>
+          <>
+            {/* The profile's Expand (#189 rule 5), a window control against Close; none outside the planned row. */}
+            <RowMoveMenu />
+            <RowExpandAction />
+            {/* DS header icon button, as on the human and agent profiles. */}
+            <PanelAction
+              onClick={onClose}
+              className={onBack ? "flex" : "hidden md:flex"}
+              aria-label={formatMessage({ id: "common.close" })}
+              title={formatMessage({ id: "common.close" })}
+            >
+              <X size={22} aria-hidden="true" />
+            </PanelAction>
+          </>
         }
       />
 
-      <ProfilePanelBody className="flex-1 overflow-y-auto bg-layer-canvas">
-        {profile.workspaceName ? (
+      {/* Hidden while a region expanded in its column shows the profile as its head alone (#189 rule 5). */}
+      <RowRegionBody>
+      {/* The body renders as a raft-ui ScrollArea (its column layout kept):
+          a region named after the profile, a tab stop once it overflows. */}
+      {/* raft-ui: native-scroll restates the ScrollArea's own overflow, which PanelBody's recipe (overflow-hidden) would otherwise override */}
+      <ProfilePanelBody render={<ScrollArea role="region" aria-label={displayName} />} className="flex-1 overflow-x-hidden overflow-y-auto bg-layer-canvas">
+        {(profile.actorKind === "bot" && profile.appName && providerLabel) ? (
+          <div data-testid="external-identity-source" className="px-(--surface-inset) py-3 text-callout font-semibold text-foreground">
+            {formatMessage({ id: "message.externalIdentity.fromWorkspace" }, { workspace: `${providerLabel} · ${profile.appName}` })}
+          </div>
+        ) : profile.workspaceName ? (
           <div>
           <div
             data-testid="external-identity-source"
-            className="px-5 py-3"
+            className="px-(--surface-inset) py-3"
           >
             <SectionEyebrow as="div" className="mb-1">
               {formatMessage({ id: "member.detail.from" })}
@@ -89,26 +108,32 @@ export default function ExternalIdentityDetailPanel({
           </div>
         ) : null}
 
-        <div className="flex items-start gap-4 px-5 py-5">
+        <div className="flex items-start gap-4 px-(--surface-inset) py-5">
           <AvatarSlot
             context="profile-hero"
             type="app"
-            appAvatarUrl={profile.avatarUrl}
-            appInitials={profile.displayName}
+            appAvatarUrl={avatarUrl}
+            appInitials={displayName}
           />
           <div className="min-w-0 flex-1 pt-0.5">
             <div className="truncate text-headline text-foreground">
-              {profile.displayName}
+              {displayName}
             </div>
             <div className="mt-0.5 truncate text-caption text-foreground-hint">
               {subtitle}
             </div>
+            {profile.actorKind === "bot" && displayName !== profile.displayName ? (
+              <div className="mt-1 truncate text-footnote text-foreground-muted">
+                {formatMessage({ id: "message.externalIdentity.postedAs" }, { name: profile.displayName })}
+              </div>
+            ) : null}
             <div className="mt-2 text-callout text-foreground-muted">
               {formatMessage({ id: "message.externalIdentity.externalProjection" })}
             </div>
           </div>
         </div>
       </ProfilePanelBody>
+      </RowRegionBody>
     </>
   );
 }

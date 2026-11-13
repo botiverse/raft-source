@@ -1,24 +1,28 @@
 import { useCallback } from "react";
 import type { MouseEvent, ReactNode } from "react";
 import { useIntl } from "react-intl";
-import { Badge, Button, Card } from "@botiverse/raft-ui";
+import { Badge, Button, Card, ScrollArea } from "@botiverse/raft-ui";
 import type { AgentActivity, ServerRole } from "@botiverse/raft-shared";
 import { UserMinus, X } from "lucide-react";
 import AvatarSlot from "../ui/AvatarSlot";
 import SectionEyebrow from "../ui/SectionEyebrow";
 import Tooltip from "../ui/Tooltip";
 import AgentActivityDot from "../agent/AgentActivityDot";
+import AppBadge from "../agent/AppBadge";
+import { useAppBotAgent } from "../../store/agentStore";
 
 // DS ListRow for a member: 35px identity, the name 15/20 600, the role or
-// handle 12/16 ink-3; rows press like content rows and are separated by a
+// handle 12/16 ink-3; rows hover with fill-subtle and are separated by a
 // hairline that starts where the text starts (16 + 35 + 12 = 63px).
 const MEMBER_ROW_CLASS = [
-  "group relative flex min-h-16 items-center gap-3 px-4 py-2.5 transition-colors md:min-h-14",
-  "hover:bg-fill-pressed [@media(max-height:600px)]:min-h-0 [@media(max-height:600px)]:py-1.5",
+  "group relative flex min-h-16 items-center gap-3 px-4 py-2.5 transition-colors md:pointer-coarse:min-h-14",
+  "hover:bg-fill-subtle [@media(max-height:600px)]:min-h-0 [@media(max-height:600px)]:py-1.5",
   "[[data-member-row]+&]:before:pointer-events-none [[data-member-row]+&]:before:absolute [[data-member-row]+&]:before:top-0 [[data-member-row]+&]:before:right-0 [[data-member-row]+&]:before:left-[63px] [[data-member-row]+&]:before:border-t [[data-member-row]+&]:before:border-line-hairline",
   "[li+li>&]:before:pointer-events-none [li+li>&]:before:absolute [li+li>&]:before:top-0 [li+li>&]:before:right-0 [li+li>&]:before:left-[63px] [li+li>&]:before:border-t [li+li>&]:before:border-line-hairline",
 ].join(" ");
 const MEMBER_ROW_TITLE_CLASS = "truncate text-subhead font-semibold text-foreground";
+// The title with the App badge after the name: the name truncates, the badge stays.
+const MEMBER_ROW_TITLE_WITH_BADGE_CLASS = "flex min-w-0 items-center gap-1.5 text-subhead font-semibold text-foreground";
 const MEMBER_ROW_SUB_CLASS = "truncate text-caption text-foreground-hint";
 
 export function ChannelMemberListShell({
@@ -29,14 +33,18 @@ export function ChannelMemberListShell({
 }: {
   children: ReactNode;
   className?: string;
-  /** Framed = bordered box with its own scroll (dialogs). Unframed = flat
-      sections that scroll with the surrounding sheet (drawer panel). */
+  /** Framed = bordered box with its own scroll (dialogs): the card is the
+      frame, the rows scroll in a raft-ui ScrollArea that fills it, no tab stop
+      (each row is one), a scroll at its end carrying on to the dialog.
+      Unframed = flat sections that scroll with the surrounding sheet (drawer panel). */
   framed?: boolean;
   "data-testid"?: string;
 }) {
   return framed ? (
-    <Card className={`max-h-72 overflow-y-auto ${className}`} data-testid={dataTestId}>
-      {children}
+    <Card className={`max-h-72 ${className}`} data-testid={dataTestId}>
+      <ScrollArea tabIndex={-1} overscroll="auto" className="min-h-0 flex-1">
+        {children}
+      </ScrollArea>
     </Card>
   ) : (
     <div className={className} data-testid={dataTestId}>
@@ -75,17 +83,17 @@ function ChannelMemberActivityBadge({
 /** Channel membership only needs one visible distinction: whether the actor
  *  effectively administers this channel. Server owner/admin inheritance and
  *  an explicit channel grant intentionally share the same user-facing label. */
-export function MemberRoleTag({ role }: { role: ServerRole }) {
+export function MemberRoleTag({ role }: { role: ServerRole | null }) {
   const { formatMessage } = useIntl();
-  if (role === "member") return null;
+  // No role sent (another server's person): a plain member, no tag.
+  if (role !== "owner" && role !== "admin" && role !== "guest") return null;
   const isGuest = role === "guest";
-  // Admin is a neutral label (DS `rf-tag`); a guest comes from outside the
-  // workspace, so it reads as the cyan-soft external chip.
+  // Both are a role in this channel, so both are the same neutral label (DS `rf-tag`): a guest's
+  // cyan-soft chip read as a different kind of thing beside Channel admin (cindyz, #wg-rbac:2ee0381d).
   return (
     <Badge
       data-testid={isGuest ? "member-page-role-channel-guest" : "member-page-role-channel-admin"}
-      appearance={isGuest ? "soft" : "outline"}
-      variant={isGuest ? "information" : undefined}
+      appearance="outline"
       className="shrink-0"
     >
       {formatMessage({ id: isGuest
@@ -99,21 +107,21 @@ export function ChannelMemberRoleAndActions({
   role,
   actions,
 }: {
-  role: ServerRole;
+  role: ServerRole | null;
   actions: ReactNode;
 }) {
   return (
     <span
-      className="flex shrink-0 self-center items-center gap-2 md:grid"
+      className="flex shrink-0 self-center items-center gap-2 md:pointer-fine:grid"
       data-testid="member-page-trailing"
     >
       <span
-        className={`flex shrink-0 items-center md:col-start-1 md:row-start-1 md:justify-self-end ${actions ? "md:group-hover:invisible md:group-focus-within:invisible" : ""}`}
+        className={`flex shrink-0 items-center md:pointer-fine:col-start-1 md:pointer-fine:row-start-1 md:pointer-fine:justify-self-end ${actions ? "md:pointer-fine:group-hover:invisible md:pointer-fine:group-focus-within:invisible" : ""}`}
       >
         <MemberRoleTag role={role} />
       </span>
       {actions ? (
-        <span className="shrink-0 self-center md:invisible md:col-start-1 md:row-start-1 md:justify-self-end md:group-hover:visible md:group-focus-within:visible">
+        <span className="shrink-0 self-center md:pointer-fine:invisible md:pointer-fine:col-start-1 md:pointer-fine:row-start-1 md:pointer-fine:justify-self-end md:pointer-fine:group-hover:visible md:pointer-fine:group-focus-within:visible">
           {actions}
         </span>
       ) : null}
@@ -129,10 +137,11 @@ export function ChannelMemberRow({
   agentAvatarUrl,
   agentFallbackActivity,
   humanAvatarUrl,
-  gravatarHash,
   onAvatarClick,
   onRowClick,
   trailing,
+  media,
+  avatarCorner,
 }: {
   type: "agent" | "human";
   name: ReactNode;
@@ -141,32 +150,47 @@ export function ChannelMemberRow({
   agentAvatarUrl?: string | null;
   agentFallbackActivity?: AgentActivity;
   humanAvatarUrl?: string | null;
-  gravatarHash?: string | null;
   onAvatarClick?: () => void;
   /** Whole-row click (member page: row → profile). Mutually exclusive
    *  with onAvatarClick — a button cannot nest inside a button, so the
    *  avatar renders inert when the row itself is the click target. */
   onRowClick?: () => void;
   trailing?: ReactNode;
+  /** Replaces the avatar in the same 35px slot, for a row that isn't a
+   *  person or an agent yet (an external invite's Mail tile). */
+  media?: ReactNode;
+  /** A mark on the avatar's top-left corner: another server's tile
+   *  (AvatarOriginCorner). The bottom-right stays the agent's status light. */
+  avatarCorner?: ReactNode;
 }) {
-  const avatar = (
+  // An App bot (the agent list's record; member, follower and picker rows
+  // carry only its id) has no presence: the App badge follows its name.
+  const appBot = useAppBotAgent(type === "agent" ? agentId : null);
+  const avatar = media ?? (
     <AvatarSlot
       context="list-row"
       type={type}
       agentAvatarUrl={agentAvatarUrl}
       humanAvatarUrl={humanAvatarUrl}
-      gravatarHash={gravatarHash}
-      badge={type === "agent" && agentId ? (
+      badge={type === "agent" && agentId && !appBot ? (
         <ChannelMemberActivityBadge agentId={agentId} fallbackActivity={agentFallbackActivity} />
       ) : undefined}
+      corner={avatarCorner}
     />
   );
 
   const text = (
     <div className="min-w-0 flex-1">
-      <div className={MEMBER_ROW_TITLE_CLASS}>
-        {name}
-      </div>
+      {appBot ? (
+        <div className={MEMBER_ROW_TITLE_WITH_BADGE_CLASS}>
+          <span className="min-w-0 truncate">{name}</span>
+          <AppBadge className="shrink-0" appName={appBot.managedByApp?.name} botName={appBot.displayName || appBot.name} />
+        </div>
+      ) : (
+        <div className={MEMBER_ROW_TITLE_CLASS}>
+          {name}
+        </div>
+      )}
       {secondary ? (
         <div className={MEMBER_ROW_SUB_CLASS}>
           {secondary}
@@ -230,8 +254,8 @@ export function ChannelMemberRemoveButton({
   onClick: () => void;
   /** Desktop hover-reveal. Uses visibility (not display) so the button's
    *  space is always reserved — the trailing badge never shifts when the
-   *  control appears (Artea 2026-08-05: reveal jitter). Mobile always
-   *  shows it (no hover). */
+   *  control appears (Artea 2026-08-05: reveal jitter). Mobile and touch
+   *  tablets always show it (no hover): gated on `pointer-fine`, not width. */
   revealOnRowHover?: boolean;
   /** Member-management rows render icon-only with a suitable icon (Artea,
    *  2026-09-17); other compact lists keep the bare icon affordance. */
@@ -240,14 +264,16 @@ export function ChannelMemberRemoveButton({
 }) {
   return (
     <Tooltip content={label}>
-      <button
+      <Button
         type="button"
+        variant="ghost"
+        size={visibleLabel ? "md" : "icon-md"}
         onClick={onClick}
-        className={`${revealOnRowHover ? "flex md:invisible md:group-hover:visible md:group-focus-within:visible" : "flex"} ${visibleLabel ? "h-8 px-2.5 text-footnote font-bold" : "size-8"} shrink-0 items-center justify-center rounded-control text-foreground-muted outline-none transition-colors hover:bg-fill-pressed hover:text-foreground active:bg-fill-pressed focus-visible:shadow-focus`}
+        className={`flex ${revealOnRowHover ? "md:pointer-fine:invisible md:pointer-fine:group-hover:visible md:pointer-fine:group-focus-within:visible" : ""} text-foreground-muted hover:text-foreground`}
         aria-label={label}
       >
-        {visibleLabel ?? icon ?? <X size={16} aria-hidden="true" />}
-      </button>
+        {visibleLabel ?? icon ?? <X aria-hidden="true" />}
+      </Button>
     </Tooltip>
   );
 }
@@ -282,7 +308,7 @@ export function ChannelMemberHoverActions({
           type="button"
           onClick={handleRoleActionClick}
           disabled={roleAction.disabled}
-          size="sm"
+          size="md"
           variant="outline"
           className="whitespace-nowrap"
           data-testid="channel-member-role-action"
@@ -296,7 +322,7 @@ export function ChannelMemberHoverActions({
           label={removeAction.label}
           onClick={removeAction.onClick}
           revealOnRowHover={false}
-          icon={<UserMinus size={16} aria-hidden />}
+          icon={<UserMinus aria-hidden />}
         />
       )}
     </span>

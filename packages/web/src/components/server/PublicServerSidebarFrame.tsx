@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import { SidebarHeader, SidebarHeaderTitle, SidebarRoot } from "@botiverse/raft-ui";
+import { ScrollArea, SidebarHeader, SidebarHeaderTitle, SidebarRoot } from "@botiverse/raft-ui";
 
 /** Frame shared by the two side columns of the public server page (channels
  *  and settings): the rui SidebarRoot, a header row and a scroll surface.
@@ -28,12 +28,17 @@ export default function PublicServerSidebarFrame({
       <SidebarHeader data-testid={`${testIdPrefix}-header`}>
         <SidebarHeaderTitle render={<h1>{title}</h1>} />
       </SidebarHeader>
-      {/* The list starts 8px below the head's seam, level with the rail's
-          first button below the rail's server cell, as the signed-in list
-          does under the top bar. */}
-      <div className="scrollbar-quiet min-h-0 flex-1 overflow-x-hidden overflow-y-auto p-2" data-testid={scrollTestId}>
+      {/* No padding of its own: the rows are list cells that inset their
+          own shape 8px and their content 12px inside it, and their list
+          (a gap-0.5 py-2 column) puts the first shape 8px below the
+          head's seam, level with the rail's first button below the rail's
+          server cell, as the signed-in list does (raft-design patterns/lists.md).
+          A raft-ui ScrollArea shown while it scrolls, as the signed-in
+          Sidebar's and raft-ui's SidebarContent; the bottom room is the
+          content's. */}
+      <ScrollArea trigger="scroll" className="min-h-0 flex-1" contentClassName="pb-2" data-testid={scrollTestId}>
         {children}
-      </div>
+      </ScrollArea>
     </SidebarRoot>
   );
 }

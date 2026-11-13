@@ -1,3 +1,6 @@
+import { createHash, createHmac } from "node:crypto";
+import { classifyRequesterUserAgent } from "../middleware/publicRequester";
+import { raftVersionFromUserAgent } from "../services/productEventContext";
 import { addTraceEvent } from "../tracing/semanticTrace";
 import type { AuthRefreshReplayTrace } from "../services/sessionService";
 
@@ -5,6 +8,7 @@ export type AuthRefreshOutcome = { userId: string; sessionId: string; replayedRo
 export type AuthSessionIssuedFlow =
   | "email_register"
   | "email_login"
+  | "passkey_login"
   | "device_auth"
   | "app_login"
   | "mobile_oauth"
@@ -50,14 +54,37 @@ export function authRefreshInstallationIdFromHeader(headerValue: unknown): strin
 }
 
 /**
+ * Counts retries of one rejected refresh token without recording it (#triage:#241).
+ * Keyed for this use only, so it can't be matched to `token_hash` in the database.
+ * Long enough to count repeats, too short to stand in for the token.
+ */
+export function rejectedRefreshFingerprint(refreshToken: unknown): string | undefined {
+  const secret = process.env.JWT_SECRET;
+  if (!secret || typeof refreshToken !== "string") return undefined;
+  const key = createHash("sha256").update(`raft:auth-refresh-rejected-fingerprint:v1:${secret}`).digest();
+  return createHmac("sha256", key).update(refreshToken, "utf8").digest("hex").slice(0, 16);
+}
+
+/** Who sent a rejected refresh, as a fixed class. The raw User-Agent is never recorded. */
+export function refreshRequesterClass(userAgent: string | undefined): string {
+  return classifyRequesterUserAgent(userAgent);
+}
+
+/**
  * `count(replayed_rotation=true)` over this event is the direct positive health
  * metric for #3349.
  */
 export function recordAuthRefreshTrace(
   refreshed: AuthRefreshOutcome,
   replayTrace?: AuthRefreshReplayTrace,
-  opts: { authRefreshAttemptId?: string } = {},
+  opts: {
+    authRefreshAttemptId?: string;
+    authRefreshInstallationId?: string;
+    refreshToken?: unknown;
+    userAgent?: string;
+  } = {},
 ): void {
+  const superseded = replayTrace?.superseded;
   addTraceEvent("auth.refresh.completed", {
     outcome: refreshed ? (refreshed.replayedRotation ? "replayed" : "rotated") : "rejected",
     replayed_rotation: refreshed?.replayedRotation === true,
@@ -68,6 +95,15 @@ export function recordAuthRefreshTrace(
     ...(refreshed ? {
       user_id: refreshed.userId,
       session_id: refreshed.sessionId,
+    } : {
+      rejected_refresh_fp: rejectedRefreshFingerprint(opts.refreshToken),
+      requester_class: refreshRequesterClass(opts.userAgent),
+    }),
+    // A lost rotation (task #72): who, from which installation, how late.
+    ...(superseded ? {
+      user_id: superseded.userId,
+      session_family_id: superseded.familyId,
+      auth_refresh_installation_id: opts.authRefreshInstallationId,
     } : {}),
   });
 }

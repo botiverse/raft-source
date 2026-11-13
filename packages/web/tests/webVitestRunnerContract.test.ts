@@ -1,15 +1,17 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { globSync } from "node:fs";
 import { resolve } from "node:path";
+import { defaultTestIncludes } from "../scripts/testLocations";
+import { OXC_NODE_ARGS } from "./helpers/oxcNode";
 
 const webRoot = resolve(import.meta.dirname, "..");
 const repoRoot = resolve(webRoot, "../..");
-const runner = resolve(webRoot, "scripts/run-vitest-tests.mjs");
+const runner = resolve(webRoot, "scripts/run-vitest-tests.ts");
 const target = "tests/richTextChunkKeys.test.ts";
 
 function runRunner(args: string[], cwd = webRoot) {
-  return spawnSync(process.execPath, [runner, ...args], {
+  return spawnSync(process.execPath, [...OXC_NODE_ARGS, runner, ...args], {
     cwd,
     encoding: "utf8",
     timeout: 60_000,
@@ -20,31 +22,6 @@ function runRunner(args: string[], cwd = webRoot) {
     env: { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" },
   });
 }
-
-test("web test scripts use the cwd-independent Vitest runner", () => {
-  const rootPackageJson = JSON.parse(readFileSync(resolve(repoRoot, "package.json"), "utf8"));
-  const webPackageJson = JSON.parse(readFileSync(resolve(webRoot, "package.json"), "utf8"));
-
-  assert.equal(rootPackageJson.scripts["test:web"], "node packages/web/scripts/run-vitest-tests.mjs");
-  assert.equal(
-    rootPackageJson.scripts["test:web:dom"],
-    "node packages/web/scripts/run-vitest-tests.mjs --dom",
-  );
-  assert.equal(webPackageJson.scripts.test, "node scripts/run-vitest-tests.mjs");
-  assert.equal(webPackageJson.scripts["test:dom"], "node scripts/run-vitest-tests.mjs --dom");
-});
-
-test("Vitest keeps file isolation and restores per-test mocks and timers", () => {
-  const source = readFileSync(resolve(webRoot, "vitest.config.ts"), "utf8");
-
-  // The node:test compatibility alias is gone: suites import vitest directly.
-  assert.doesNotMatch(source, /find: \/\^node:test/);
-  assert.match(source, /restoreMocks: true/);
-  assert.match(source, /realTimersAfterEach\.ts/);
-  assert.match(source, /pool: "forks"/);
-  assert.match(source, /isolate: true/);
-  assert.match(source, /dom \? \{ maxWorkers: "50%" \}/);
-});
 
 test("the Vitest runner applies the same JSX transform from repo root and package cwd", () => {
   // Vitest 5's default reporter no longer lists passing files when not attached to a TTY;
@@ -86,4 +63,15 @@ test("a Vitest flag value is not mistaken for a path", () => {
 test("a glob is never path-checked", () => {
   const result = runRunner(["tests/richTextChunk*.test.ts"]);
   assert.equal(result.status, 0, `globs must pass through, got:\n${result.stderr}`);
+});
+
+test("the default selection covers tests/ and src/features/<feature>/tests/, unit and DOM apart", () => {
+  const selected = (dom: boolean) => new Set(defaultTestIncludes(dom).flatMap((pattern) => globSync(pattern, { cwd: webRoot })));
+  const unit = selected(false);
+  const dom = selected(true);
+  assert.ok(unit.has(target), "tests/ unit test");
+  assert.ok(unit.has("src/features/computer/tests/computerBetaCommand.test.ts"), "feature unit test");
+  assert.ok(dom.has("src/features/computer/tests/computerSidePanel.behavior.test.tsx"), "feature DOM test");
+  assert.ok(![...unit].some((file) => file.endsWith(".tsx")), "no DOM test in the unit selection");
+  assert.ok(![...dom].some((file) => file.endsWith(".ts")), "no unit test in the DOM selection");
 });

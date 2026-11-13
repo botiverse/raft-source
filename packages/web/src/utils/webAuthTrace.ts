@@ -26,7 +26,10 @@
 import type { AuthVerdict, AuthVerdictSignal } from "./authVerdict";
 import type { AuthRestoreState, AuthRestoreEvent } from "./authRestoreMachine";
 import type { TraceStatus } from "@botiverse/raft-shared";
-import { assertValidDesktopRuntimeEnvironment, RUNTIME_API_BASE } from "../desktopRuntimeEnvironment";
+import { RUNTIME_API_BASE } from "../runtimeEndpoints";
+import { clientPlatformHint } from "./clientPlatformHint";
+import { WEB_APP_VERSION } from "./webAppVersion";
+import { createPrivacyHold, privacyAllowsQueue, privacyAllowsSend, waitForUrgentTraceSend } from "./webTelemetryPrivacyHold";
 
 const API_BASE = RUNTIME_API_BASE;
 
@@ -39,7 +42,10 @@ let TRACE_URL: string = TRACE_URL_FROM_ENV;
 let ENABLED: boolean = Boolean(TRACE_URL);
 const DEPLOYMENT_ENV = (import.meta.env?.VITE_DEPLOYMENT_ENV as string | undefined) || "unknown";
 const RELEASE_SHA = ((import.meta.env?.VITE_COMMIT_SHA as string | undefined) ?? "").trim() || "unknown";
-const APP_VERSION = ((import.meta.env?.VITE_APP_VERSION as string | undefined) ?? "").trim() || "unknown";
+// The running build's version: the desktop app stamps its own release version
+// on the bundle it ships, so this tells desktop releases apart. The package
+// version is the fallback (it used to be "unknown", AndyLok #triage:1683c617).
+const APP_VERSION = WEB_APP_VERSION;
 
 const WEB_TRACE_SCOPE = "web-trace-batch:create";
 // Stay well under the worker contract ceilings (1000 records / 512KB per batch).
@@ -56,7 +62,7 @@ export type AuthTraceEventName =
   | "slock.auth.session_cleared"
   | "slock.auth.cross_tab_sync"
   | "slock.auth.socket_auth"
-  | "slock.auth.protected_request";
+  | "slock.auth.protected_request" | "slock.auth.passkey_autofill_failed";
 
 // Auth work with a real start and end. Each one is sent as a span, and the
 // auth events emitted while it runs carry its trace_id and span_id.
@@ -89,9 +95,19 @@ export type WebHttpClientTraceEventName = "web.http.client";
 // forever while silently leaving the registry.
 export type UploadCapabilityFallbackTraceEventName = "slock.attachment.upload_capability_fallback";
 
+// Failed direct R2 object PUT (#triage:#327) — see utils/directPutFailureTrace.ts.
+export type DirectPutFailureTraceEventName = "slock.attachment.direct_put_failed";
+
 // Inline media preview load failures (bug-triage task #14) — see
 // utils/mediaPreviewErrorTrace.ts.
 export type MediaPreviewErrorTraceEventName = "slock.media_preview.error";
+
+// One per page load: how long the boot took to each milestone (task #3 in
+// #proj-frontend) — see boot/bootTiming.ts.
+export type BootTimingTraceEventName = "slock.web.boot_timing";
+
+// View Context's menu, click and answer (#wg-ax:#28) — see utils/contextViewTrace.ts.
+export type ContextViewTraceEventName = "slock.context_view";
 
 // Names the web may emit as point in time events.
 export type WebEventName =
@@ -101,11 +117,13 @@ export type WebEventName =
   | StateViolationTraceEventName
   | ClientErrorTraceEventName
   | UpdateGateTraceEventName
-  | UploadCapabilityFallbackTraceEventName
-  | MediaPreviewErrorTraceEventName;
+  | UploadCapabilityFallbackTraceEventName | DirectPutFailureTraceEventName
+  | MediaPreviewErrorTraceEventName
+  | BootTimingTraceEventName | "slock.web.shell_keep_failed"
+  | ContextViewTraceEventName;
 
-// Names the web may emit as spans with a real duration.
-export type WebSpanName = AuthTraceSpanName | WebHttpClientTraceEventName;
+// Spans with a real duration. `slock.channel.join`: Join clicked to the channel on screen; `web.view.switch`: observability/viewSwitchSpan.ts.
+export type WebSpanName = AuthTraceSpanName | WebHttpClientTraceEventName | "slock.channel.join" | "web.view.switch";
 
 export type WebTraceEventName = WebEventName | WebSpanName;
 
@@ -264,7 +282,7 @@ export interface BuildWebTraceRecordOptions {
 export interface WebSpanHandle {
   readonly traceId: string;
   readonly spanId: string;
-  end(status: TraceStatus, attrs?: Record<string, unknown>): void;
+  end(status: TraceStatus, attrs?: Record<string, unknown>, endTimeMs?: number): void;
 }
 
 /** Map an HTTP-ish status to the contract's bounded statusBucket. */
@@ -502,7 +520,7 @@ export function startWebSpan(name: WebSpanName): WebSpanHandle {
   return {
     traceId,
     spanId,
-    end(status: TraceStatus, attrs: Record<string, unknown> = {}): void {
+    end(status: TraceStatus, attrs: Record<string, unknown> = {}, endTimeMs?: number): void {
       if (ended) return;
       ended = true;
       try {
@@ -511,7 +529,7 @@ export function startWebSpan(name: WebSpanName): WebSpanHandle {
           spanId,
           status,
           startTime,
-          endTime: new Date().toISOString(),
+          endTime: new Date(endTimeMs ?? Date.now()).toISOString(),
         }));
       } catch {
         // Swallow: ending a span must never affect the work it measured.
@@ -545,6 +563,7 @@ function withDefaultWebAttrs(attrs: Record<string, unknown>): Record<string, unk
     releaseSha: RELEASE_SHA,
     deploymentEnv: DEPLOYMENT_ENV,
     appVersion: APP_VERSION,
+    clientPlatform: clientPlatformHint(),
     webAssetId: loadedWebAssetId(),
   });
 }
@@ -611,6 +630,11 @@ const MAX_ELIGIBILITY_ATTEMPTS = 8;
 // doubled the trace request rate. The receiver verifies signature + exp only.
 const ATTESTATION_REUSE_MARGIN_MS = 60_000;
 let cachedAttestation: { serverId: string; principalId: string; attestation: string; expiresAtMs: number } | null = null;
+function reusableAttestation(serverId: string, principalId: string): string | null {
+  const c = cachedAttestation;
+  return c && c.serverId === serverId && c.principalId === principalId
+    && c.expiresAtMs - Date.now() > ATTESTATION_REUSE_MARGIN_MS ? c.attestation : null;
+}
 
 // Registered synchronously by serverStore at startup. We do NOT import
 // serverStore here (that would re-create the webAuthTrace -> serverStore ->
@@ -667,6 +691,7 @@ export async function flushAuthTraces(): Promise<void> {
   if (flushing) return;
   try {
     if (!ENABLED || queue.length === 0) return;
+    if (!privacyAllowsSend()) return; // RAFT_PRIVACY_MODE: held (the answer flushes or drops it)
 
     // Capture auth context SYNCHRONOUSLY, before any await. Tokens are never
     // retained in the queue: every attempt reads only the current credential.
@@ -712,17 +737,9 @@ export async function flushAuthTraces(): Promise<void> {
     // keepalive buffer, and repeated best-effort trace failures can otherwise
     // spam the console with "Reached maximum amount of queued data" errors.
     // Navigation-critical records use the urgent path below.
-    assertValidDesktopRuntimeEnvironment();
-
     const fetchImpl = getFetch();
-    let attestation: string;
-    const reusable = cachedAttestation
-      && cachedAttestation.serverId === serverId
-      && cachedAttestation.principalId === principalId
-      && cachedAttestation.expiresAtMs - Date.now() > ATTESTATION_REUSE_MARGIN_MS;
-    if (reusable) {
-      attestation = cachedAttestation!.attestation;
-    } else {
+    let attestation = reusableAttestation(serverId, principalId);
+    if (!attestation) {
       cachedAttestation = null;
       const attestationResponse = await fetchImpl(`${API_BASE}/servers/${serverId}/scope-attestation`, {
         method: "POST",
@@ -762,7 +779,7 @@ export async function flushAuthTraces(): Promise<void> {
   } finally {
     flushing = false;
     // If more accumulated while flushing, schedule another pass.
-    if (ENABLED && queue.length > 0) scheduleFlush();
+    if (ENABLED && queue.length > 0 && privacyAllowsSend()) scheduleFlush();
   }
 }
 
@@ -792,11 +809,19 @@ async function sendUrgentAuthTraceBatch(
   event: WebEventRecord,
   serverId: string,
   token: string,
+  principalId?: string,
 ): Promise<void> {
   try {
-    assertValidDesktopRuntimeEnvironment();
-
     const fetchImpl = getFetch();
+    // Web events (the crash page): a still-valid scheduled-path attestation of
+    // the same server + principal makes this one request; rejected -> two-step.
+    const cached = principalId ? reusableAttestation(serverId, principalId) : null;
+    if (cached) {
+      const res = await fetchImpl(`${TRACE_URL}/api/web-traces`, { method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ attestation: cached, records: [], events: [event] }), keepalive: true });
+      if (res.status !== 401 && res.status !== 403) return;
+      cachedAttestation = null;
+    }
     const attestationResponse = await fetchImpl(`${API_BASE}/servers/${serverId}/scope-attestation`, {
       method: "POST",
       headers: {
@@ -827,21 +852,22 @@ interface CapturedUrgentAuthTrace {
   record: WebEventRecord;
   serverId: string;
   token: string;
+  principalId?: string; // set for web events only: auth events skip the cached attestation (always two-step)
 }
+
+// RAFT_PRIVACY_MODE (webTelemetryPrivacyHold.ts): up to 20 urgent sends wait for the answer, which also flushes or drops the queue.
+const urgentHold = createPrivacyHold(20, (c: CapturedUrgentAuthTrace) => sendUrgentAuthTraceBatch(c.record, c.serverId, c.token, c.principalId),
+  (on) => { if (on) queue = []; else if (ENABLED && queue.length > 0) void flushAuthTraces(); });
 
 function captureUrgentWebEvent(
   name: WebEventName,
-  attrs: Record<string, unknown>,
+  attrs: Record<string, unknown>, options: EmitWebEventOptions,
 ): CapturedUrgentAuthTrace | null {
-  if (!ENABLED) return null;
+  if (!ENABLED || !privacyAllowsQueue(0)) return null;
   const serverId = serverIdGetter();
   const token = localStorage.getItem("slock_access_token");
   if (!serverId || !token) return null;
-  return {
-    record: buildWebEventRecord(name, attrs),
-    serverId,
-    token,
-  };
+  return { record: buildWebEventRecord(name, attrs, options), serverId, token, principalId: principalIdGetter() };
 }
 
 function captureUrgentAuthTrace(
@@ -849,7 +875,7 @@ function captureUrgentAuthTrace(
   attrs: AuthTraceAttrs,
   options: EmitWebEventOptions,
 ): CapturedUrgentAuthTrace | null {
-  if (!ENABLED) return null;
+  if (!ENABLED || !privacyAllowsQueue(0)) return null;
 
   // Capture credentials SYNCHRONOUSLY, before constructing/sending. Caller
   // may removeItem(token) immediately after this capture; only values read
@@ -878,25 +904,6 @@ function captureUrgentAuthTrace(
     serverId,
     token,
   };
-}
-
-async function waitForUrgentTraceSend(promise: Promise<void>, timeoutMs: number): Promise<void> {
-  if (timeoutMs <= 0) {
-    await promise;
-    return;
-  }
-
-  let timeout: ReturnType<typeof setTimeout> | null = null;
-  try {
-    await Promise.race([
-      promise,
-      new Promise<void>((resolve) => {
-        timeout = setTimeout(resolve, timeoutMs);
-      }),
-    ]);
-  } finally {
-    if (timeout !== null) clearTimeout(timeout);
-  }
 }
 
 /**
@@ -937,7 +944,7 @@ export function emitWebTraceRecord(record: WebTraceRecord): void {
 
 function enqueueWebRecord(record: WebTraceRecord | WebEventRecord): void {
   try {
-    if (!ENABLED) return;
+    if (!ENABLED || !privacyAllowsQueue(queue.length)) return;
     queue.push({
       record,
       serverId: serverIdGetter() ?? null,
@@ -990,7 +997,7 @@ export function emitAuthTraceAndFlush(
   try {
     const captured = captureUrgentAuthTrace(name, attrs, options);
     if (!captured) return;
-    void sendUrgentAuthTraceBatch(captured.record, captured.serverId, captured.token);
+    void urgentHold.send(captured);
   } catch {
     // Swallow: emitting a trace must never affect auth control flow.
   }
@@ -1014,7 +1021,7 @@ export async function emitAuthTraceAndFlushBeforeUnload(
     const captured = captureUrgentAuthTrace(name, attrs, {});
     if (!captured) return;
     await waitForUrgentTraceSend(
-      sendUrgentAuthTraceBatch(captured.record, captured.serverId, captured.token),
+      urgentHold.send(captured),
       opts.timeoutMs ?? 500,
     );
   } catch {
@@ -1022,17 +1029,17 @@ export async function emitAuthTraceAndFlushBeforeUnload(
   }
 }
 
-/** Urgent non-auth event for a control path that is about to navigate away. */
+/** Urgent non-auth event (keepalive, never queued), before a likely navigation; signed out: dropped. */
 export async function emitWebEventAndFlushBeforeUnload(
   name: Exclude<WebEventName, AuthTraceEventName>,
   attrs: Record<string, unknown> = {},
-  opts: { timeoutMs?: number } = {},
+  opts: { timeoutMs?: number } & EmitWebEventOptions = {},
 ): Promise<void> {
   try {
-    const captured = captureUrgentWebEvent(name, attrs);
+    const captured = captureUrgentWebEvent(name, attrs, opts);
     if (!captured) return;
     await waitForUrgentTraceSend(
-      sendUrgentAuthTraceBatch(captured.record, captured.serverId, captured.token),
+      urgentHold.send(captured),
       opts.timeoutMs ?? 500,
     );
   } catch {

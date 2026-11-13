@@ -1,65 +1,98 @@
-import { isThreadMaximized, useUIStore } from "../../store/uiStore";
-import FeedbackUnreadDot from "../../feedback/FeedbackUnreadDot";
+import { deferredDialog, deferredPanel, lazyPanel } from "../../boot/deferredUi";
+import { loadComputersRack } from "../../features/computer/computersRackChunk";
+import { loadMachineDetailPanel } from "../../features/computer/machineDetailChunk";
+import { COMPUTER_PANEL_QUERY, computerProfileParam } from "../../utils/computerPanel";
+import { PanelLoading } from "./PanelLoading";
+import { MOBILE_TAB_BAR_CLASS, MOBILE_TAB_ICON_BOX_CLASS } from "./PendingMobileChrome";
 import Tooltip from "../ui/Tooltip";
-import { useContext, useState, useEffect, useEffectEvent, useLayoutEffect, useCallback, useMemo, useRef, Suspense, lazy } from "react";
+import AppEmptyState from "../ui/EmptyState";
+import { ConversationLoading } from "../../boot/bootSkeletons";
+import { markBootMilestone } from "../../boot/bootTiming";
+import MessageLinkUnavailable from "../deeplinks/MessageLinkUnavailable";
+import { OpenInAppOffers } from "../deeplinks/OpenInAppOffers";
+import { useOtherServerMessageLink } from "../deeplinks/otherServerMessageLink";
+import { conversationPathOf, serverPathOf, useDeepLinksFlag, useLandedMessageLink, useLandingHoldsAnnouncements, useMessageLinkLandingLifetime } from "../deeplinks/deepLinksFlag";
+import { isMessageLinkLanding, isThreadMismatch, parseMessageLink } from "../../utils/messageLinkLanding";
+import { movePageLanding } from "../../utils/pageLanding";
+import { useContext, useState, useEffect, useEffectEvent, useCallback, useMemo, useRef, Suspense } from "react";
+import type { ReactNode } from "react";
 import {
-  AppShellMainSlot,
-  AppShellRailSlot,
-  AppShellRoot,
   AppShellSidebarSlot,
-  Badge,
   DialogSurface,
   PanelAction,
   PanelActions,
   PanelHeader as PanelHead,
-  ThreadIcon,
   MobileNavItem,
   MobileNavLabel,
   MobileNavRoot,
   Skeleton,
+  ProfilePanel as ProfilePanelFrame,
   toast,
 } from "@botiverse/raft-ui";
-import {
-  getThreadPanelDynamicMax,
-  SIDEBAR_PANEL_BOUNDS,
-  THREAD_PANEL_DEFAULT_WIDTH,
-  THREAD_PANEL_MIN_WIDTH,
-} from "../../lib/panelBounds";
-import { useResizablePanel } from "../../hooks/useResizablePanel";
-import { MASTER_DETAIL_COMPACT_PANEL_BOUNDS, resolveMasterDetailPanelWidth } from "./masterDetailPanelSizing";
-import { Routes, Route, Navigate, UNSAFE_NavigationContext as NavigationContext, useParams, useNavigate, useLocation } from "react-router-dom";
-import { useRecordRecentConversation } from "../search/useRecordRecentConversation";
+import { ThreadIcon, MessageIcon } from "@botiverse/ricons";
+import { PROFILE_PANEL_OVERLAY_CLASS, profilePanelDesktopStyle } from "../profile/profilePanelGeometry";
+import { LEGACY_TASK_SIDE_PANEL_CLASS, legacyTaskSidePanelDesktopStyle } from "../task/legacyTaskPanelGeometry";
+import { COLUMN_BOUNDS } from "../../lib/panelBounds";
+import { useColumnWidth } from "../../store/columnWidthStore";
+import ChannelSideArea, { SideSectionPortal, ThreadColumnSections, useThreadColumnSide } from "../task/ChannelSideArea";
+import { ThreadCollapseChevron } from "../task/ThreadCollapseChevron";
+import { AgentContextViewPageSlot } from "../agentContextView/AgentContextViewSlots";
+import { useRowPlanned } from "./rowPlanStore";
+import { RowRegionChrome } from "./RowRegionChrome";
+import { SideSectionDnd, useSideSectionHead } from "../task/sideSectionDrag";
+import { useStackEndHead } from "../task/stackEnd";
+import ColumnResizeHandle from "../ui/ColumnResizeHandle";
+import ShellSidebarColumn from "./ShellSidebarColumn";
+import ShellArtifactHost from "./ShellArtifactHost";
+import { useMediaQuery } from "../../hooks/effectPrimitives";
+import { Routes, Route, Navigate, UNSAFE_NavigationContext as NavigationContext, useParams, useNavigate, useLocation, useNavigationType } from "react-router-dom";
+import { directTaskConversationChannelId, isTaskV2Task, opensAsTaskConversation, parseTaskConversationParam } from "../../utils/taskConversation";
+import { dismissTaskConversationDialog, TaskConversationDialog } from "../task/taskConversationDialogChunk";
+import { DRAFTS_SECTION_FLAG_KEY, TASK_V2_CONVERSATIONS_FLAG_KEY, useServerFeatureFlag } from "../../store/serverFeatureFlags";
+import { WORKSPACE_ARTIFACTS_FEATURE_FLAG_KEY } from "@botiverse/raft-shared";
+import type { ArtifactReviewId } from "@botiverse/raft-shared";
+import { useRecordRecentConversation } from "../../features/search/useRecordRecentConversation";
 import { useIntl } from "react-intl";
 import { useChannelStore } from "../../store/channelStore";
 import { useAgentStore } from "../../store/agentStore";
-import { useMessageStore } from "../../store/messageStore";
 import { useInboxStore } from "../../store/inboxStore";
+import { useShallow } from "zustand/react/shallow";
+import AttentionDot from "../ui/AttentionDot";
+import { hasCurrentServerActivityUnread } from "../../utils/serverUnreadSummary";
 import { useTaskStore, selectChannelTaskBucket } from "../../store/taskStore";
 import { loadThreadParentTasksIfNeeded, resolveThreadHostTask } from "./threadHostTask";
 import type { Task } from "../../store/taskStore";
 import { useMachineStore } from "../../store/machineStore";
 import { watchModelLabelCatalog } from "../../store/modelLabelCatalogStore";
 import { useServerStore } from "../../store/serverStore";
+import { rememberRootConversation, ROOT_REDIRECT_MEDIA_QUERY } from "../../store/rootConversation";
+import { useAuthStore } from "../../store/authStore";
 import { shouldSuppressAnnouncements, useOnboardingAnnouncementGateStore } from "../../store/onboardingAnnouncementGateStore";
 import { mainLayoutRealtimeBridgeDriver } from "../../store/mainLayoutRealtimeBridgeDriver";
 import { useMainLayoutRealtimeBridge } from "../../store/socketBridge";
-import Sidebar from "./Sidebar";
+import { Sidebar } from "../../features/sidebar/Sidebar";
 import { isHostShell } from "../../embed";
 import { useEmbedParamsKeeper } from "../../hooks/useEmbedParamsKeeper";
 import { LeftRail } from "./LeftRail";
-import { ShellTopBar } from "../topbar/ShellTopBar";
-import { useTopBarHost } from "../topbar/topBarHostContext";
-import { shouldShowTopBar } from "../topbar/topBarVisibility";
-import { isElectronDesktopShell } from "../../utils/desktopShell";
+import { ShellFrame, useIsDesktopShell, useShowsTopBar } from "./ShellFrame";
+import { useThreadRowState } from "./threadRowState";
+import { isGuestHomePath, isTasksPagePath, shellRouteLayout } from "./shellRouteLayout";
+import { useGuestHome, useGuestUnreadableRedirect, useIsGuest } from "./guestShell";
 import { useTabRouteMemory } from "../../hooks/useTabRouteMemory";
 import { useRailLegacyRedirect } from "../../hooks/useRailLegacyRedirect";
 import { useMobileNav } from "../../hooks/useMobileNav";
-import ChatPanel from "../message/ChatPanel";
+import { ChatPanel } from "../../features/channel/ChatPanel";
+import { ChannelAccessLost } from "../../features/channel/ChannelAccessLost";
+import { GuestNoChannel, NoConversation } from "../../features/channel/NoConversation";
+import { useChannelAccessLost, useChannelUnavailable } from "../../store/channelAccessLoss";
 import MobileComputersPanel from "../machine/MobileComputersPanel";
-import ThreadPanel from "../message/ThreadPanel";
+import { MobileServerTab } from "./MobileServerTab";
+import { useMarkComputerAttentionSeen } from "../../hooks/useComputerAttentionDot";
+import { ThreadPanel } from "../../features/thread/DeferredThreadPanel";
 import { useProfileStore } from "../../store/profileStore";
+import { ComputerPanelRedirect } from "../machine/ComputerPanelRedirect";
 import { useThreadStore } from "../../store/threadStore";
-import { useAuthStore } from "../../store/authStore";
+import { loadThreadRefContext } from "../../utils/threadRefContext";
 import { useLegacyTaskPanelStore } from "../../store/legacyTaskPanelStore";
 import {
   useSearchContentStore,
@@ -69,32 +102,53 @@ import {
 import type {
   SearchContentSlot,
 } from "../../store/searchContentStore";
+import { useSearchHitMarkLifetime } from "../../features/search/useSearchHitMarkLifetime";
 import {
   isCurrentRightPanelSearchSnapshot,
   subscribeRightPanelThreadAnchor,
   syncRightPanelStoresFromSearch,
   syncRightPanelUrlFromStores,
 } from "./rightPanelUrlSync";
-import {
-  blurFocusedControlForScreenshotShortcut,
-  isGlobalSearchShortcut,
-} from "../../utils/keyboardShortcuts";
-import {
-  routeGlobalSearchShortcut,
-  SEARCH_FOCUS_REQUEST_EVENT,
-} from "../../utils/searchFocusRequest";
-import { ArrowLeft, CheckSquare, Home, Settings, Users, X } from "lucide-react";
+import { blurFocusedControlForScreenshotShortcut } from "../../utils/keyboardShortcuts";
+import { SIDEBAR_REGION_ID, setSidebarSlotHidden, toggleSidebarFromKeyboard, useSidebarSlotHidden } from "./sidebarToggle";
+import { LegacyMemberGraphRedirect, LegacyThreadsRedirect, LegacyWorkspaceGridRedirect } from "./LegacyRedirects";
+import { ShortcutHelpColumn } from "../../features/keyboard-shortcuts/ShortcutHelpColumn";
+import "../../features/shortcuts/shortcutAccountBridge";
+import { ShortcutHelpPage } from "../../features/keyboard-shortcuts/ShortcutHelpPage";
+import { useShortcutHelpStore } from "../../features/keyboard-shortcuts/shortcutHelpStore";
+import { useShortcut } from "../../features/shortcuts/useShortcut";
+import { focusMountedSearch, routeGlobalSearchShortcut } from "../../utils/searchFocusRequest";
+import { retapTabRoot } from "../../hooks/useTabRootScroll";
+import { Activity, ArrowLeft, Home, ListTodo, MonitorX, Search, UserX, X } from "lucide-react";
+import { MembersEmptyRoute } from "../../features/members/MembersEmptyRoute";
+import { useMembersProfileRedirect } from "../../features/members/useMembersProfileRedirect";
 import api from "../../api/client";
 import type { HumanProfile } from "../member/HumanDetailPanel";
 import { resolveHumanProfile } from "../member/resolveHumanProfile";
 import { canRenderAgentDetail } from "../agent/agentDetailAvailability";
 import { getCachedAgentProfile } from "../profile/profileFallbackCache";
-import { useAppNavigate, useMobileBack } from "../../hooks/useAppNavigate";
+import type { ProfilePanelProps } from "../profile/ProfilePanel";
+import { recordSynchronousMobileBackNavigation, useAppNavigate, useMobileBack } from "../../hooks/useAppNavigate";
+import { useOwnAssistantDmId, useOwnAssistantPageForDm } from "../../assistant/assistantClient";
+import { AssistantOtterLayer } from "../../assistant/AssistantOtterShortcut";
+import { loadArtifactActivityViewer, loadArtifactsDashboard } from "../../apps/artifacts";
+import { artifactAddressTidying, artifactOpenEntryOf, artifactSlotInAddress, liveArtifactAddressEntry, readArtifactAddress, useArtifactOpenAddress, withArtifactAddress, writeArtifactAddress, writeArtifactSlotAddress } from "./artifactOpenAddress";
+import { useArtifactViewerAddress } from "./artifactViewerAddress";
+import { useBesideMemory } from "./useBesideMemory";
 import PanelHeader from "../ui/PanelHeader";
 import { ContentSlotThreadPanel } from "./ContentSlotThreadPanel";
+import { CONTENT_SLOT_ENTRY_MARK, historyEntryIndex, isContentSlotEntry, stampContentSlotEntry } from "./contentSlotEntry";
+import { TaskContentSlot } from "./TaskContentSlot";
+import { TasksRoute } from "./TasksRoute";
+import { RowColumnSlotContext } from "./rowColumnSlot";
+import { DetailSlotThreadContext, useThreadInDetailSlotOpener } from "./detailSlotThread";
+import { ContentSlotBackContext, useContentSlotBack } from "./contentSlotBack";
+import { ACTIVITY_MASTER_DETAIL_QUERY, isActivityMasterDetailViewport } from "../thread/activityLayout";
+import { useActivityVisitSurface } from "../thread/activityVisit";
+import { focusActivityRowAfterClose } from "../thread/activityRowFocus";
 import { useClearLiveAgentActivityOnServerChange } from "./WorkingNowSummary";
-import Modal from "../Modal";
-import { legacySettingsRouteRedirectSlug } from "../settings/settingsNavigation";
+import { TaskDialogShell } from "../task/TaskDialogShell";
+import { isSettingsApplicationsSlug, legacySettingsRouteRedirectSlug } from "../settings/settingsNavigation";
 import { isChangePasswordSettingsIntent } from "../../utils/changePasswordNavigation";
 import ServerSetupProjectionGate from "../onboarding/ServerSetupProjectionGate";
 import {
@@ -105,113 +159,185 @@ import {
   resolveThreadTargetByShortId,
 } from "../../utils/threadRefNavigation";
 import { buildSidebarDisclosureRestoreState } from "./sidebarChannelFocus";
-import { useAppTheme } from "../../hooks/useAppTheme";
-import {
-  RAFT_DARK_PAPER_CHROME_COLOR,
-  RAFT_DARK_THEME_CHROME_COLOR,
-  RAFT_LIGHT_PAPER_CHROME_COLOR,
-  RAFT_LIGHT_THEME_CHROME_COLOR,
-} from "../../theme/appThemeChrome";
 import { observeProfileOpenE2eImport } from "../../utils/profileOpenE2eTimeline";
 
-const MOBILE_TAB_BAR_SAFE_BOTTOM = "min(env(safe-area-inset-bottom, 0px), 34px)";
-const IN_FLOW_TAB_BAR_STYLE = { paddingBottom: MOBILE_TAB_BAR_SAFE_BOTTOM };
 const SHRINK_PANEL_HEADER_CONTAINER_PROPS = { className: "shrink-0" };
 const LG_VIEWPORT_QUERY = "(min-width: 1024px)";
+const THREAD_SPLIT_VIEWPORT_QUERY = "(orientation: landscape), (min-width: 1280px)";
 
-// Lazy-loaded route panels (code splitting)
-const AgentDetailPanel = lazy(() => observeProfileOpenE2eImport(
+// Lazy-loaded route panels (code splitting), each with Try again in place of a
+// failed download (lazyPanel). The detail panels the workspace opens first
+// (agent, computer, member) are also fetched in the background after the first
+// screen (deferredPanel); ChatPanel is in the entry, ThreadPanel deferred too.
+const AgentDetailPanel = deferredPanel(() => observeProfileOpenE2eImport(
   "agent-detail",
-  () => import("../agent/AgentDetailPanel"),
+  () => import("../../features/agent/AgentDetailPanel").then((module) => ({ default: module.AgentDetailPanel })),
 ));
-const AgentUnavailablePanel = lazy(() => import("../agent/AgentUnavailablePanel"));
-const MachineDetailPanel = lazy(() => import("../machine/MachineDetailPanel"));
-const HumanDetailPanel = lazy(() => import("../member/HumanDetailPanel"));
-const RaftBenchPage = lazy(() => import("../../raftbench/RaftBenchPage"));
-const SettingsPanel = lazy(() => import("../settings/SettingsPanel"));
-const MemberGraphSection = lazy(() => import("../settings/MemberGraphSection"));
-const ReleaseNotesPanel = lazy(() => import("../settings/ReleaseNotesPanel"));
-const ThreadsInbox = lazy(() => import("../thread/ThreadsInbox"));
-const TasksPanel = lazy(() => import("../task/TasksPanel"));
-const SavedPanel = lazy(() => import("../saved/SavedPanel"));
-const ProfilePanel = lazy(() => observeProfileOpenE2eImport(
+const MessageSearchPage = deferredPanel(() => import("../../features/search/MessageSearchPage").then((module) => ({ default: module.MessageSearchPage })));
+const SearchOverlay = deferredDialog(() => import("../../features/search/SearchOverlay").then((module) => ({ default: module.SearchOverlay })));
+const AddMachineDialog = deferredDialog(() => import("../machine/AddMachineDialog"));
+const AgentUnavailablePanel = lazyPanel(() => import("../agent/AgentUnavailablePanel"));
+const ArtifactActivityViewer = lazyPanel(loadArtifactActivityViewer);
+// One load with the side panel's (machineDetailChunk), which the Computers page starts on hover.
+const MachineDetailPanel = deferredPanel(loadMachineDetailPanel);
+// The rack's one shared load (computersRackChunk: the phone page and the boot's
+// start for this route use it too); a failed download shows Try again here.
+const ComputersRackOverview = deferredPanel(loadComputersRack);
+const ThisDevicePanel = lazyPanel(() => import("../machine/localComputer/ThisDevicePanel").then((m) => ({ default: m.ThisDevicePanel })));
+const HumanDetailPanel = deferredPanel(() => import("../member/HumanDetailPanel"));
+const RaftBenchPage = lazyPanel(() => import("../../raftbench/RaftBenchPage"));
+const AssistantRoute = lazyPanel(() => import("../../assistant/AssistantRoute"));
+const SettingsPanel = lazyPanel(() => import("../settings/SettingsPanel").then((m) => ({ default: m.SettingsPanel })));
+const AppsPage = lazyPanel(() => import("../apps/AppsPage"));
+const MigrationLogPage = lazyPanel(() => import("../agentMigration/log/MigrationLogPage").then((m) => ({ default: m.MigrationLogPage })));
+const ReleaseNotesPanel = lazyPanel(() => import("../settings/ReleaseNotesPanel"));
+const ThreadsInbox = lazyPanel(() => import("../../features/thread/ThreadsInbox").then((m) => ({ default: m.ThreadsInbox })));
+const SavedPanel = lazyPanel(() => import("../saved/SavedPanel"));
+const DraftsPanel = lazyPanel(() => import("../drafts/DraftsPanel"));
+const ArtifactsDashboard = lazyPanel(loadArtifactsDashboard);
+const ProfilePanel = lazyPanel<ProfilePanelProps>(() => observeProfileOpenE2eImport(
   "profile-panel",
   () => import("../profile/ProfilePanel"),
 ));
-const LegacyTaskPanel = lazy(() => import("../task/LegacyTaskPanel"));
-const TaskModalHead = lazy(() => import("../task/TaskModalHead"));
+const LegacyTaskPanel = lazyPanel(() => import("../task/LegacyTaskPanel"));
+const TaskModalHead = lazyPanel(() => import("../task/TaskModalHead"));
 
 /** Returns true when the mobile bottom tab bar should be visible on the
  *  current route. Used by both the bar itself and its in-flow spacer so that
  *  detail views (which return null from MobileTabBar) don't leave a stray
  *  empty strip below the page content.
  *
- *  iOS NavigationView model (per @stdrc 2026-04-30 #proj-uiux:c8711d2a):
- *  the tab bar lives at the root of each tab's stack only. When the user
- *  pushes to a detail (channel / dm / agent / human / computer / settings
- *  detail / search) the new view covers the full screen including the tab
- *  bar — there is no concept of "switch tabs from inside a detail". To
- *  switch tabs the user pops back to the tab home first via the back button.
+ *  The phone rule (design lead, 2026-10-21): a page with a Back at the top has
+ *  no tab bar; a page without one is a tab root and shows it. The tab bar says
+ *  which part of the product you are in, Back says where you came from —
+ *  never both. Same iOS NavigationView model as @stdrc 2026-04-30
+ *  #proj-uiux:c8711d2a: the tab bar lives at the root of each tab's stack
+ *  only (Home, Activity, Tasks, Search). When the user pushes to a detail
+ *  (channel / dm / agent / human / computer, a search result, a task /
+ *  profile sheet over a tab root, or one of the server's own pages the server
+ *  tab opens: Members, Computers, Settings) the new view covers the full
+ *  screen including the tab bar. To switch tabs the user pops back to the tab
+ *  root first.
  */
 function useMobileTabBarVisible(): boolean {
   const location = useLocation();
   const serverSlug = useServerStore((s) => s.current?.slug);
   const threadOpen = useThreadStore((s) => !!s.openParentMessageId);
+  const taskModalOpen = useThreadStore((s) => s.taskModal !== null);
+  const profileOpen = useProfileStore((s) => !!s.profileId);
+  const legacyTaskOpen = useLegacyTaskPanelStore((s) => !!s.task);
   const searchSlotOpen = useSearchContentStore((s) => !!s.slot);
-
+  const { guest, overlayOpen: guestOverlayOpen } = useGuestHome(serverSlug ? `/s/${serverSlug}` : null);
   if (!serverSlug) return false;
 
   const pathBase = `/s/${serverSlug}`;
   const path = location.pathname;
+  const trimmedPath = path.replace(/\/+$/, "");
 
   if (threadOpen) return false;
+  // A picked Search result (or Activity item) is a pushed page with a Back.
   if (searchSlotOpen) return false;
 
-  // Hide on detail routes: channel, DM, search, agent, human, computer,
-  // settings sub-pages.
-  // /computers and /release-notes are level-2 pushes under the Settings tab per
-  // @stdrc 2026-04-30 #proj-uiux:c8711d2a ("tabbar is level-1; any view you push
-  // into covers the navbar and shows a back button top-left").
-  const isChannelDetail = path.startsWith(`${pathBase}/channel/`);
+  // Sheets with a Back that RightPanel lays over the main column: the task
+  // sheet (any route), a profile, and a legacy task (only on /tasks). Home
+  // renders the sidebar inline and hides the main column, so a stray store
+  // value there draws nothing and must not take the bar away.
+  const mainColumnHidden = trimmedPath === pathBase;
+  const isTasksRoot = trimmedPath === `${pathBase}/tasks`;
+  if (!mainColumnHidden && (taskModalOpen || profileOpen || (legacyTaskOpen && isTasksRoot))) return false;
+
+  if (guestOverlayOpen) return false; // a card or an Artifact over a Guest's Home (guestShell)
+
+  // Hide on detail routes: channel, DM, agent, human, computer, and the
+  // server's own pages the server tab's popover pushes (Members, Computers,
+  // Settings, each settings section and everything under them).
+  // Per @stdrc 2026-04-30 #proj-uiux:c8711d2a ("tabbar is level-1; any view
+  // you push into covers the navbar and shows a back button top-left").
+  // /search itself is the Search tab's root (design lead 2026-10-21): no
+  // Back, the bar shows with Search selected.
+  const isChannelDetail = path.startsWith(`${pathBase}/channel/`) && !(guest && isGuestHomePath(path, pathBase)); // a Guest's Home
   const isDMDetail = path.startsWith(`${pathBase}/dm/`);
-  const isSearchDetail = path === `${pathBase}/search` || path.startsWith(`${pathBase}/search/`);
+  const isSearchDetail = path.startsWith(`${pathBase}/search/`);
   const isAgentDetail = path.startsWith(`${pathBase}/agent/`);
   const isHumanDetail = path.startsWith(`${pathBase}/human/`);
-  const isMembersDetail = path.startsWith(`${pathBase}/members/`);
+  // Members was a tab root until 2026-10-20; now the server tab pushes it.
+  const isMembersPage = path === `${pathBase}/members` || path.startsWith(`${pathBase}/members/`);
   const isComputerDetail = path.startsWith(`${pathBase}/computer/`) || path.startsWith(`${pathBase}/machine/`);
   const isComputersList = path === `${pathBase}/computers` || path.startsWith(`${pathBase}/computers/`);
-  const isSettingsDetail = path.startsWith(`${pathBase}/settings/`) || path.startsWith(`${pathBase}/release-notes`) || path.replace(/\/$/, "") === `${pathBase}/raftbench`;
-  // Inbox/legacy Threads + Saved are level-2 pushes from Chat tab — same iOS NavigationView
+  // Apps is pushed from the server tab's popover too.
+  const isAppsPage = path === `${pathBase}/apps` || path.startsWith(`${pathBase}/apps/`);
+  // /settings (the list) was More's root until 2026-10-22; now it is pushed
+  // from the server tab like its sections.
+  const isSettingsPage = trimmedPath === `${pathBase}/settings` || path.startsWith(`${pathBase}/settings/`) || path.startsWith(`${pathBase}/release-notes`) || path.startsWith(`${pathBase}/keyboard-shortcuts`) || trimmedPath === `${pathBase}/raftbench`;
+  // Legacy Threads + Saved are level-2 pushes from Chat tab — same iOS NavigationView
   // model as channel/DM detail. stdrc 2026-05-02 #proj-uiux:648f8735 0a4084eb:
   // "在移动端点击 Threads 和 Saved 出来的页面，没有覆盖掉 Tab Bar" — fix to
-  // match the channel/DM/agent detail behavior.
-  const isInboxList = path === `${pathBase}/activity` || path.startsWith(`${pathBase}/activity/`);
+  // match the channel/DM/agent detail behavior. /activity itself is the
+  // Activity tab root (as in the mobile app), so only pushes under it hide the bar.
+  const isInboxDetail = path.startsWith(`${pathBase}/activity/`);
   const isThreadsList = path === `${pathBase}/threads` || path.startsWith(`${pathBase}/threads/`);
   const isSavedList = path === `${pathBase}/saved` || path.startsWith(`${pathBase}/saved/`);
+  // Drafts is a Home row on a phone, under Saved: its page is a push like Saved's.
+  const isDraftsList = path === `${pathBase}/drafts` || path.startsWith(`${pathBase}/drafts/`);
+  // The Artifacts home page has no phone tab: the server tab's popover pushes it (#proj-workspace:#203), like Apps.
+  const isArtifactsPage = path === `${pathBase}/artifacts` || path.startsWith(`${pathBase}/artifacts/`);
+  // The assistant is a Home row on a phone, so its page is a push like Saved.
+  const isAssistantPage = path === `${pathBase}/assistant` || path.startsWith(`${pathBase}/assistant/`);
 
   if (
-    isChannelDetail || isDMDetail || isSearchDetail || isAgentDetail || isHumanDetail || isMembersDetail ||
-    isComputerDetail || isComputersList || isSettingsDetail ||
-    isInboxList || isThreadsList || isSavedList
+    isChannelDetail || isDMDetail || isSearchDetail || isAgentDetail || isHumanDetail || isMembersPage ||
+    isComputerDetail || isComputersList || isAppsPage || isSettingsPage ||
+    isInboxDetail || isThreadsList || isSavedList || isDraftsList || isArtifactsPage || isAssistantPage
   ) {
     return false;
   }
 
-  // Show on tab home routes only: chat root, /tasks, /members, /settings.
+  // Show on tab home routes only: chat root, /activity, /tasks, /search.
   return true;
 }
+
+/** Attention dot on the Activity tab: the same signal as the desktop rail's
+ *  Activity dot (LeftRail) — the accepted Activity window once loaded,
+ *  otherwise the server unread summary's activityUnreadCount. Raft DS ›
+ *  MobileNav / Badge: tab bar icons carry the attention dot, never a number,
+ *  and never on the selected tab. */
+function ActivityTabUnreadDot({ className }: { className?: string }) {
+  const { formatMessage } = useIntl();
+  const summaryUnreadCount = useServerStore((s) => {
+    const id = s.current?.id;
+    return id ? s.serverUnreadCounts[id]?.activityUnreadCount : undefined;
+  });
+  const [hasAcceptedWindow, hasTotalUnread, hasPreloadActiveUnread] = useInboxStore(useShallow((s) => [
+    s.hasAcceptedWindow,
+    // Object rows (Artifacts) count apart from the conversations' (shared activityObjectsContract).
+    s.totalUnreadCount + s.objectUnreadCount > 0,
+    s.activeUnreadCount > 0,
+  ] as const));
+  const unread = hasCurrentServerActivityUnread({ hasAcceptedWindow, hasTotalUnread, hasPreloadActiveUnread, summaryUnreadCount });
+  if (!unread) return null;
+  return (
+    <AttentionDot
+      className={className}
+      role="img"
+      aria-label={formatMessage({ id: "layout.leftRail.unreadActivity" })}
+      data-testid="mobile-tab-activity-unread-dot"
+    />
+  );
+}
+
+const MOBILE_TAB_DOT_CLASS = "absolute -top-0.5 -right-1";
 
 /** Mobile bottom tab bar — shown only on root-level views (md:hidden).
  *  Hidden when user drills into a detail view (channel, DM, thread, member detail). */
 export function MobileTabBar() {
-  const location = useLocation();
   const serverSlug = useServerStore((s) => s.current?.slug);
-  const serverRole = useServerStore((s) => s.current?.role);
   const visible = useMobileTabBarVisible();
-  const { selectTab } = useMobileNav();
+  const { selectTab, mobileTab } = useMobileNav();
   // Display-language (react-intl) — layout namespace. Called BEFORE the
   // host-shell / visibility early-returns below so the hook order is stable.
   const { formatMessage } = useIntl();
+  // A toast sits above the bar (toastViewportBottom.ts).
+  const toastFloorRef = useToastViewportFloor();
 
   // HOST-SHELL EMBED: the native WebView owns its own chrome. The app's global
   // navigation must not render inside it — checked on the RENDER PATH, not in an
@@ -221,45 +347,40 @@ export function MobileTabBar() {
   if (isHostShell()) return null;
   if (!visible || !serverSlug) return null;
 
-  const pathBase = `/s/${serverSlug}`;
-  const path = location.pathname;
-  // 4-tab mobile bar (per @stdrc 2026-04-30 #proj-uiux:c8711d2a):
-  // Home / Tasks / Members / Settings. Search is a Home drill-in on mobile,
-  // not a top-level tab. Computers is reachable from inside Settings; it is
-  // not a top-level tab on mobile.
-  const isSettings = path.replace(/\/$/, "") === `${pathBase}/raftbench`
-    || path.startsWith(`${pathBase}/settings`)
-    || path.startsWith(`${pathBase}/release-notes`)
-    || path === `${pathBase}/computers`
-    || path.startsWith(`${pathBase}/computers/`)
-    || path.startsWith(`${pathBase}/computer/`)
-    || path.startsWith(`${pathBase}/machine/`); // legacy
-  const isTasks = !isSettings && (path === `${pathBase}/tasks` || path.startsWith(`${pathBase}/tasks/`));
-  const isMembers = !isSettings && !isTasks && (
-    path === `${pathBase}/members`
-      || path.startsWith(`${pathBase}/members/`)
-      || path.startsWith(`${pathBase}/agent/`)
-      || path.startsWith(`${pathBase}/human/`)
-  );
-  const isChat = !isSettings && !isTasks && !isMembers;
+  // Phone bar (stdrc 2026-10-21, 2026-10-22): Home / Activity / Tasks /
+  // Search, then the current server, in raft-ui's edge bar. The server tab
+  // (MobileServerTab) took More's slot: it opens a popover, not a page, and
+  // is never selected; the server's own pages open from it.
+  // Search is a tab like the others (design lead 2026-10-21, "like Slack"):
+  // /search is its root, it shows selected there, and it never carries a dot.
 
-  // selectTab (see useMobileNav): every tab tap navigates to that tab's
-  // root, regardless of active state. Per-tab sub-page memory is dropped.
-  // (stdrc 2026-05-09 #proj-mobile:b1c622e5 task #11 — sub-pages hide the
-  // tab bar; restoring sub-page on tab tap traps the user without a path
-  // back to root.)
+  // An unselected tab lands on its root as the user left it, filters and
+  // scroll position included (useMobileNav.selectTab, useTabRootScroll);
+  // pushed pages are not kept (stdrc 2026-05-09: they hide the bar).
+  //
+  // The selected tab (the bar shows only on roots, so its root is on screen)
+  // scrolls that root to the top and does nothing else: no navigation, no
+  // reset (design lead 2026-10-21). Search, at the top, focuses its field.
+  // Activity is the one exception (artin 2026-10-21): it goes to the next
+  // unread item below, then back to the top (ThreadsInbox, activityRetap).
+  //
+  // Activity also sends activity_open (stdrc's Activity question; the Home row
+  // that sent it on the phone is gone).
   const tapTab = (tab: MobileTabId, active: boolean) => () => {
     trackNavEntrySelected(tab === "chat" ? "home" : tab, "mobile_tab_bar", active);
+    if (tab === "activity") trackActivityOpen("mobile_tab_bar");
+    if (active) {
+      retapTabRoot(tab);
+      return;
+    }
     selectTab(tab);
   };
   const tabs = [
-    { id: "chat", label: formatMessage({ id: "layout.mobileTabBar.home" }), icon: Home, active: isChat, onClick: tapTab("chat", isChat) },
-    { id: "tasks", label: formatMessage({ id: "layout.mobileTabBar.tasks" }), icon: CheckSquare, active: isTasks, onClick: tapTab("tasks", isTasks) },
-    ...(serverRole === "guest" ? [] : [
-      { id: "members", label: formatMessage({ id: "layout.mobileTabBar.members" }), icon: Users, active: isMembers, onClick: tapTab("members", isMembers) },
-    ]),
-    { id: "settings", label: formatMessage({ id: "layout.mobileTabBar.settings" }), icon: Settings, active: isSettings, onClick: tapTab("settings", isSettings) },
-  ];
+    { id: "chat", label: formatMessage({ id: "layout.mobileTabBar.home" }), icon: Home },
+    { id: "activity", label: formatMessage({ id: "layout.mobileTabBar.activity" }), icon: Activity },
+    { id: "tasks", label: formatMessage({ id: "layout.mobileTabBar.tasks" }), icon: ListTodo },
+    { id: "search", label: formatMessage({ id: "layout.mobileTabBar.search" }), icon: Search },
+  ] as const satisfies readonly { id: MobileTabId; label: string; icon: typeof Home }[];
 
   // In-flow (not fixed): the bar is the last child of the MainLayout flex
   // column, which is itself pinned to the visual viewport via #root. This
@@ -267,61 +388,99 @@ export function MobileTabBar() {
   // bottom in PWA standalone because the layout viewport is taller than the
   // visible area, and (2) the fixed bar being covered by the keyboard in
   // mobile Safari because `fixed; bottom:0` anchors to layout viewport which
-  // doesn't shrink with the keyboard. Safe-area is added via padding-bottom,
+  // doesn't shrink with the keyboard. MobileNavRoot pads the safe area itself,
   // capped at the iPhone home-indicator inset so bad PWA/browser reports do
-  // not create a large blank strip below the tabs. (Raft Design System ›
-  // TabBar: an edge bar on the card surface with a seam on top; nothing is
-  // stacked above it.)
+  // not create a large blank strip below the tabs.
   return (
-    <MobileNavRoot className="md:hidden shrink-0" style={IN_FLOW_TAB_BAR_STYLE}>
-      {tabs.map((tab) => (
-        <MobileNavItem
-          key={tab.id}
-          className="relative"
-          selected={tab.active}
-          onClick={tab.onClick}
-          aria-label={tab.label}
-        >
-          {/* The icon stays in short windows too: Raft DS › TabBar marks the
-              selected tab by the yellow sticker around its icon, so hiding
-              the icon (the old Brutal short-viewport adaptation) would hide
-              which tab you are on. */}
-          <tab.icon />
-          <MobileNavLabel>{tab.label}</MobileNavLabel>
-          {tab.id === "settings" && <FeedbackUnreadDot className="absolute top-1 right-2" />}
-        </MobileNavItem>
-      ))}
+    <MobileNavRoot
+      aria-label={formatMessage({ id: "layout.mobileTabBar.navLabel" })}
+      ref={toastFloorRef}
+      className={MOBILE_TAB_BAR_CLASS}
+      data-testid="mobile-tab-bar"
+    >
+      {tabs.map((tab) => {
+        const active = mobileTab === tab.id;
+        return (
+          <MobileNavItem
+            key={tab.id}
+            selected={active}
+            onClick={tapTab(tab.id, active)}
+            aria-label={tab.label}
+            data-testid={tab.id === "search" ? "mobile-tab-search" : undefined}
+          >
+            {/* The icon stays in short windows too: Raft DS › TabBar marks the
+                selected tab by the yellow sticker around its icon, so hiding
+                the icon (the old Brutal short-viewport adaptation) would hide
+                which tab you are on. */}
+            <span className={MOBILE_TAB_ICON_BOX_CLASS}>
+              <tab.icon />
+              {/* Raft DS › MobileNav: an attention dot, never a number, and
+                  never on the selected tab. Search never has one. */}
+              {tab.id === "activity" && !active && <ActivityTabUnreadDot className={MOBILE_TAB_DOT_CLASS} />}
+            </span>
+            <MobileNavLabel>{tab.label}</MobileNavLabel>
+          </MobileNavItem>
+        );
+      })}
+      <MobileServerTab mobileTab={mobileTab} />
     </MobileNavRoot>
   );
 }
 
-import AddMachineDialog from "../machine/AddMachineDialog";
-import CreateAgentDialog from "../agent/CreateAgentDialog";
+import { CreateAgentDialog } from "../agent/DeferredCreateAgentDialog";
 import { usePageViewTracking } from "../../analytics/pageViews";
+import { useComputerMigrationReporting } from "../../analytics/computerMigration";
 import { trackNavEntrySelected } from "../../analytics/navigation";
+import { trackActivityOpen } from "../../analytics/activity";
 import type { MobileTabId } from "../../store/mobileNavStore";
 import JointChannelLinkIntent from "../channel/JointChannelLinkIntent";
 import AnnouncementModal from "../AnnouncementModal";
-import MessageSearchPage from "../search/MessageSearchPage";
-import SearchOverlay from "../search/SearchOverlay";
-import { isSearchOverlayEnabled, overlayCloseTarget, rememberNonSearchLocation, resolveSearchOverlayBackground } from "../search/searchOverlayLocation";
-import PwaInstallPrompt from "../pwa/PwaInstallPrompt";
+import UpgradeDialogHost from "../billing/DeferredUpgradeDialogHost";
+import SeatJoinDialogHost from "../billing/SeatJoinDialog";
+import { SearchScopeContext } from "../../features/search/searchScope";
+import { isSearchOverlayEnabled, overlayCloseTarget, rememberNonSearchLocation, resolveSearchOverlayBackground } from "../../features/search/searchOverlayLocation";
+import { useToastViewportFloor } from "../toastViewportBottom";
+
+/**
+ * Deep links v1 (item d): what a message link this page landed on shows
+ * instead of the conversation, or null to show the conversation. A `thread`
+ * naming another conversation rejects the whole link (waiting for the flag
+ * rather than opening it first); a conversation that can't be read shows the
+ * same "Message not found" as a missing message. Flag off: null, as before.
+ */
+function useMessageLinkLandingBlock(channelId: string, conversationMissing: boolean): ReactNode | null {
+  const location = useLocation();
+  const { formatMessage } = useIntl();
+  const link = useLandedMessageLink(location.pathname, location.search);
+  const target = link.target?.channelId === channelId ? link.target : null;
+  if (!target) return null;
+  if (isThreadMismatch(target)) {
+    if (!link.resolved) return <ConversationLoading label={formatMessage({ id: "layout.main.loadingChannel" })} />;
+    return link.enabled ? <MessageLinkUnavailable backTo={conversationPathOf(target)} /> : null;
+  }
+  if (conversationMissing && link.enabled) return <MessageLinkUnavailable backTo={serverPathOf(target)} />;
+  return null;
+}
 
 /** Channel content body — used by both /channel/:channelId AND the
  *  /search master/detail layout (col 3 when slot.kind === "channel").
  *  Pulling the lookup-and-hydrate logic out of the route component lets the
  *  search-slot path render the same content without faking URL params. */
-function ChannelById({ channelId }: { channelId: string }) {
+export function ChannelById({ channelId }: { channelId: string }) {
   const { formatMessage } = useIntl();
   const channels = useChannelStore((s) => s.channels);
   const dmChannels = useChannelStore((s) => s.dmChannels);
+  // Agent Lounge v0: a Lounge opens on the channel route; its row lives in
+  // its own slice, never in `channels`.
+  const lounge = useChannelStore((s) => s.loungeChannels?.find((c) => c.id === channelId));
   const ensureChannel = useChannelStore((s) => s.ensureChannel);
   const [missingChannelId, setMissingChannelId] = useState<string | null>(null);
   const all = [...channels, ...dmChannels];
-  const channel = all.find((c) => c.id === channelId);
+  const channel = all.find((c) => c.id === channelId) ?? lounge;
   // ⌘K "recent conversations" (task #113): a resolved, non-thread conversation
-  // the user is looking at is by definition the most recent one.
-  useRecordRecentConversation(channel && channel.type !== "thread" ? channel.id : null);
+  // the user is looking at is by definition the most recent one. Not a
+  // Lounge: ⌘K lists no Lounges (Agent Lounge v0).
+  useRecordRecentConversation(channel && channel.type !== "thread" && !channel.loungeAgentId ? channel.id : null);
 
   // Async resolution: when `channelId` is new and not yet in stores, ensure
   // it (server fetch) and set `missingChannelId` sentinel if it can't be
@@ -356,15 +515,20 @@ function ChannelById({ channelId }: { channelId: string }) {
   // row as hydrating — which manifested as a flicker + layout shift when
   // opening a thread search hit whose channel row wasn't yet in the store
   // (stdrc msg=71334a2d 2026-05-27 "闪一下然后错位").
-  if (!channel && missingChannelId !== channelId) {
-    return (
-      <div className="flex flex-1 flex-col items-center justify-center text-foreground-muted font-display text-lg font-bold uppercase">
-        {formatMessage({ id: "layout.main.loadingChannel" })}
-      </div>
-    );
+  const askingOtherServers = useOtherServerMessageLink(channelId, !channel && missingChannelId === channelId);
+  const linkBlock = useMessageLinkLandingBlock(channelId, !channel && missingChannelId === channelId);
+  const accessLost = useChannelAccessLost(channelId);
+  const unavailable = useChannelUnavailable(channelId);
+  if (askingOtherServers) {
+    return <ConversationLoading label={formatMessage({ id: "layout.main.loadingChannel" })} />;
   }
+  if (linkBlock) return linkBlock;
+  // Removed from it while it was open: say so, not "Select a channel".
+  if (accessLost) return <ChannelAccessLost />;
 
-  return <ChatPanel channel={channel ?? null} />;
+  if (!channel && missingChannelId !== channelId) return <ConversationLoading label={formatMessage({ id: "layout.main.loadingChannel" })} />;
+
+  return channel ? <ChatPanel channel={channel} /> : <NoConversation unavailable={unavailable} />;
 }
 
 /** Route: /channel/:channelId */
@@ -376,7 +540,7 @@ function ChannelRoute() {
 
 /** DM body — same pattern as ChannelById, used by both the route and the
  *  /search col-3 slot. */
-function DmById({ dmId }: { dmId: string }) {
+export function DmById({ dmId }: { dmId: string }) {
   const { formatMessage } = useIntl();
   const dmChannels = useChannelStore((s) => s.dmChannels);
   const ensureChannel = useChannelStore((s) => s.ensureChannel);
@@ -406,22 +570,43 @@ function DmById({ dmId }: { dmId: string }) {
     };
   }, [dmId, channel, ensureChannel]);
 
+  const linkBlock = useMessageLinkLandingBlock(dmId, !channel && missingDmId === dmId);
+  const unavailable = useChannelUnavailable(dmId);
+  if (linkBlock) return linkBlock;
+
   if (!channel && missingDmId !== dmId) {
     return (
-      <div className="flex flex-1 flex-col items-center justify-center text-foreground-muted font-display text-lg font-bold uppercase">
-        {formatMessage({ id: "layout.main.loadingChannel" })}
-      </div>
+      <ConversationLoading label={formatMessage({ id: "layout.main.loadingChannel" })} />
     );
   }
 
-  return <ChatPanel channel={channel ?? null} />;
+  return channel ? <ChatPanel channel={channel} /> : <NoConversation unavailable={unavailable} />;
 }
 
-/** Route: /dm/:dmId */
+/** Route: /dm/:dmId. The viewer's own assistant's DM is its page (replace, not a push). */
 function DmRoute() {
   const { dmId } = useParams<{ dmId: string }>();
+  const assistantPage = useOwnAssistantPageForDm(dmId);
+  if (assistantPage) return <Navigate to={assistantPage} replace />;
   if (!dmId) return <ChatPanel channel={null} />;
   return <DmById dmId={dmId} />;
+}
+
+/** A conversation's own search (its header's Search button on a phone): a
+ *  pushed page over the conversation, with Back to it. Keyed by the
+ *  conversation, so each one keeps its own query and results. */
+function ConversationSearchRoute({ kind }: { kind: "channel" | "dm" }) {
+  const { channelId, dmId } = useParams<{ channelId?: string; dmId?: string }>();
+  const id = kind === "channel" ? channelId : dmId;
+  const scope = useMemo(() => (id ? { kind, id } : null), [id, kind]);
+  const guestRedirect = useGuestUnreadableRedirect(kind, id);
+  if (!scope) return <Navigate to=".." replace />;
+  if (guestRedirect) return <Navigate to={guestRedirect} replace />; // guestShell
+  return (
+    <SearchScopeContext value={scope}>
+      <Suspense fallback={<PanelFallback />}><MessageSearchPage key={`${scope.kind}:${scope.id}`} /></Suspense>
+    </SearchScopeContext>
+  );
 }
 
 /** Suspense fallback for lazy-loaded main-area panels (routed full-page views:
@@ -429,30 +614,59 @@ function DmRoute() {
  *  `flex-1` fills the routes container column. */
 function PanelFallback() {
   const { formatMessage } = useIntl();
-  return (
-    <div className="flex flex-1 items-center justify-center text-foreground-muted font-display text-lg font-bold">
-      {formatMessage({ id: "layout.main.loading" })}
-    </div>
-  );
+  return <PanelLoading label={formatMessage({ id: "layout.main.loading" })} />;
 }
 
-/** Suspense fallback for lazy-loaded OVERLAY panels (ProfilePanel, LegacyTaskPanel).
- *  These render alongside the main content in the same flex row; a `flex-1` fallback
- *  would split the mobile viewport 50/50 with the main panel, producing the
- *  "half-loaded agent detail" bug reported in `#proj-uiux:c8711d2a` msg=f4f07d15
- *  (2026-05-01). On mobile the panel itself uses `absolute inset-0 z-30` to cover
- *  the main content, so its fallback must use the same geometry — otherwise during
- *  the few hundred ms of lazy chunk load we flash the split. On desktop the
- *  overlay panel is inline (`md:relative`), so `md:flex-1` restores the normal
- *  sidebar-like fill. */
+/** Suspense fallback for the legacy task panel inside the task dialog (tasks route).
+ *  On mobile the panel itself uses `absolute inset-0 z-cover` to cover the main
+ *  content, so its fallback uses the same geometry: a `flex-1` fallback would
+ *  split the mobile viewport 50/50 with the main panel, the "half-loaded agent
+ *  detail" bug reported in `#proj-uiux:c8711d2a` msg=f4f07d15 (2026-05-01). */
 function OverlayPanelFallback({ testId }: { testId?: string } = {}) {
   const { formatMessage } = useIntl();
   return (
-    <div
-      className="absolute inset-0 z-30 flex items-center justify-center bg-layer-canvas text-foreground-muted font-display text-lg font-bold md:relative md:inset-auto md:z-auto md:flex-1 md:border-l md:border-line-seam"
+    <PanelLoading
+      className="absolute inset-0 z-cover flex bg-layer-canvas md:relative md:inset-auto md:z-auto md:flex-1 md:border-l md:border-line-seam"
+      label={formatMessage({ id: "layout.main.loading" })}
+      testId={testId}
+    />
+  );
+}
+
+/** While the profile panel's code loads: the panel's own box (raft-ui
+ *  ProfilePanel, the same classes and remembered width), holding a spinner.
+ *  It used to fill the rest of the row and then snap to the saved width when
+ *  the panel arrived (task #157; Raft DS › Responsive layout, "The first frame
+ *  is the settled one"). index.css folds the row around it as around the panel
+ *  (`[data-profile-panel-fallback]`). */
+function ProfilePanelFallback({ testId }: { testId?: string } = {}) {
+  const { formatMessage } = useIntl();
+  const width = useColumnWidth("detail");
+  const isLg = useMediaQuery(LG_VIEWPORT_QUERY);
+  const style = useMemo(() => (isLg ? profilePanelDesktopStyle(width) : undefined), [isLg, width]);
+  return (
+    <ProfilePanelFrame
+      data-profile-panel-fallback=""
       data-testid={testId}
+      edge="attached"
+      className={PROFILE_PANEL_OVERLAY_CLASS}
+      style={style}
     >
-      {formatMessage({ id: "layout.main.loading" })}
+      <PanelLoading label={formatMessage({ id: "layout.main.loading" })} />
+    </ProfilePanelFrame>
+  );
+}
+
+/** While the legacy task side panel's code loads: its own box at the
+ *  remembered width, as for the profile panel above (task #157). */
+function LegacyTaskSidePanelFallback() {
+  const { formatMessage } = useIntl();
+  const width = useColumnWidth("detail");
+  const isLg = useMediaQuery(LG_VIEWPORT_QUERY);
+  const style = useMemo(() => (isLg ? legacyTaskSidePanelDesktopStyle(width) : undefined), [isLg, width]);
+  return (
+    <div data-legacy-task-panel-fallback="" className={LEGACY_TASK_SIDE_PANEL_CLASS} style={style}>
+      <PanelLoading label={formatMessage({ id: "layout.main.loading" })} />
     </div>
   );
 }
@@ -474,7 +688,7 @@ function OverlayPanelFallback({ testId }: { testId?: string } = {}) {
  * A direct route hit with no bounded projection still falls through to
  * unavailable, as do same-server incomplete/deleted agents. (task #19)
  */
-function AgentById({ agentId, onBack }: { agentId: string; onBack?: () => void }) {
+function AgentById({ agentId, onBack, activityOnly }: { agentId: string; onBack?: () => void; activityOnly?: boolean }) {
   // Fine-grained selector: only re-renders when THIS agent's data changes,
   // not when other agents update (which would create a new agents array reference).
   const agent = useAgentStore(
@@ -485,38 +699,58 @@ function AgentById({ agentId, onBack }: { agentId: string; onBack?: () => void }
   if (!canRenderAgentDetail(projectedAgent, currentServerId)) {
     return <Suspense fallback={<PanelFallback />}><AgentUnavailablePanel /></Suspense>;
   }
-  return <Suspense fallback={<PanelFallback />}><AgentDetailPanel agent={projectedAgent} onBack={onBack} /></Suspense>;
+  return <Suspense fallback={<PanelFallback />}><AgentDetailPanel agent={projectedAgent} onBack={onBack} activityOnly={activityOnly} /></Suspense>;
 }
 
 /** Route: /agent/:agentId */
 function AgentRoute() {
   const { agentId } = useParams<{ agentId: string }>();
-  if (!agentId) return null;
-  return <AgentById agentId={agentId} />;
+  const membersPanel = useMembersProfileRedirect("agent", agentId);
+  return agentId ? membersPanel ?? <AgentById agentId={agentId} /> : null;
 }
 
-/** Computer body — used by both /computer/:machineId and the /search col-3 slot. */
+/** Route: /agent/:agentId/activity — the activity log alone for the mobile app's Activity tab (embedded WebView,
+ *  which draws the header and tabs natively); on desktop, the Members page's panel on its Activity tab. */
+function AgentActivityRoute() {
+  const { agentId } = useParams<{ agentId: string }>();
+  const membersPanel = useMembersProfileRedirect("agent", agentId, "activity");
+  return agentId ? membersPanel ?? <AgentById agentId={agentId} activityOnly /> : null;
+}
+
+/** Computer body — used by both the computer's own page (/computer/:machineId) and the /search col-3 slot. */
 function MachineById({ machineId }: { machineId: string }) {
   const { formatMessage } = useIntl();
   const machines = useMachineStore((s) => s.machines);
   const machine = machines.find((m) => m.id === machineId);
   if (!machine) {
     return (
-      <div className="flex flex-1 items-center justify-center text-foreground-muted font-display text-lg font-bold uppercase">
-        {formatMessage({ id: "layout.main.computerNotFound" })}
-      </div>
+      <AppEmptyState className="flex-1" icon={<MonitorX />} title={formatMessage({ id: "layout.main.computerNotFound" })} />
     );
   }
   return <Suspense fallback={<PanelFallback />}><MachineDetailPanel machine={machine} /></Suspense>;
 }
 
-/** Route: /machine/:machineId */
+/** Route: /computer/:machineId (and the legacy /machine/:machineId).
+ *  From 768px and outside the host app's WebView, a computer opens in the
+ *  side panel beside the card wall (Raft DS › Navigation, "Opening an item"),
+ *  so an old link or bookmark lands there: /computers?profile=computer:<id>.
+ *  Otherwise it is the computer's own page: on a phone with Back, and in the
+ *  host WebView under the native shell's own header, which has its Back
+ *  (PanelHeader draws none there). */
 function MachineRoute() {
   const { machineId } = useParams<{ machineId: string }>();
+  const location = useLocation();
   const server = useServerStore((s) => s.current);
+  const wide = useMediaQuery(COMPUTER_PANEL_QUERY);
+  const hostShell = isHostShell();
   if (!machineId) return null;
   if (server?.role === "guest") {
     return <Navigate to={server.slug ? `/s/${server.slug}` : "/"} replace />;
+  }
+  if (wide && !hostShell && server?.slug) {
+    const params = new URLSearchParams(location.search);
+    params.set("profile", computerProfileParam(machineId));
+    return <ComputerPanelRedirect to={`/s/${server.slug}/computers?${params.toString()}`} machineId={machineId} />;
   }
   return <MachineById machineId={machineId} />;
 }
@@ -572,23 +806,30 @@ function HumanById({ userId, onBack }: { userId: string; onBack?: () => void }) 
   }
   if (fallbackLoading) return <PanelFallback />;
   return (
-    <div className="flex flex-1 items-center justify-center text-foreground-muted font-display text-lg font-bold uppercase">
-      {formatMessage({ id: "layout.main.humanNotFound" })}
-    </div>
+    <AppEmptyState className="flex-1" icon={<UserX />} title={formatMessage({ id: "layout.main.humanNotFound" })} />
   );
 }
 
 /** Route: /human/:userId */
 function HumanRoute() {
   const { userId } = useParams<{ userId: string }>();
-  if (!userId) return null;
-  return <HumanById userId={userId} />;
+  const membersPanel = useMembersProfileRedirect("human", userId);
+  return userId ? membersPanel ?? <HumanById userId={userId} /> : null;
 }
 
 /** Route: /settings/:tab?/* */
 function SettingsRoute() {
   const { tab } = useParams<{ tab: string }>();
   const location = useLocation();
+  const server = useServerStore((s) => s.current);
+  // The server's Apps moved out of Settings into their own page (#proj-apps
+  // task #22): an old Applications link, deep links included
+  // (?permission_updates=1, ?marketplace_app=), opens it. A guest's
+  // Applications holds only their own link previews and stays, and so does the
+  // native host shell's embedded settings page.
+  if (isSettingsApplicationsSlug(tab) && server && server.role !== "guest" && !isHostShell()) {
+    return <Navigate to={`/s/${server.slug}/apps${location.search}${location.hash}`} replace />;
+  }
   const canonicalSlug = legacySettingsRouteRedirectSlug(tab);
   if (canonicalSlug) {
     return (
@@ -608,32 +849,29 @@ function SettingsRoute() {
   );
 }
 
-/** Route: /members/graph */
-function MemberGraphRoute() {
+/**
+ * Route: /migrations. The server's agent migration log (owners and admins):
+ * every move between computers as a chord diagram,
+ * with filters kept in the address.
+ */
+function MigrationLogRoute() {
   const server = useServerStore((s) => s.current);
   const serverSlug = server?.slug;
-  const onMobileBack = useMobileBack(serverSlug ? `/s/${serverSlug}/members` : "/");
+  const onMobileBack = useMobileBack(serverSlug ? `/s/${serverSlug}` : "/");
   const { formatMessage } = useIntl();
   const mobileBackProps = useMemo(() => ({
-    "data-testid": "member-graph-mobile-back",
-    title: formatMessage({ id: "layout.memberGraph.back" }),
+    "data-testid": "migration-log-mobile-back",
+    title: formatMessage({ id: "agent.migrationLog.back" }),
   }), [formatMessage]);
-
-  if (server?.role === "guest") {
+  if (server && server.role !== "owner" && server.role !== "admin") {
     return <Navigate to={serverSlug ? `/s/${serverSlug}` : "/"} replace />;
   }
-
   return (
-    <div className="flex min-h-0 flex-1 flex-col">
-      <PanelHeader
-        title={formatMessage({ id: "layout.memberGraph.title" })}
-        titleSuffix={<Badge.Experimental />}
-        onMobileBack={onMobileBack}
-        mobileBackProps={mobileBackProps}
-      />
-      <div className="flex-1 overflow-y-auto bg-layer-canvas px-5 py-4">
+    <div className="flex min-h-0 flex-1 flex-col" data-testid="migration-log-route">
+      <PanelHeader title={formatMessage({ id: "agent.migrationLog.title" })} onMobileBack={onMobileBack} mobileBackProps={mobileBackProps} />
+      <div className="flex min-h-0 flex-1 flex-col bg-layer-canvas">
         <Suspense fallback={<PanelFallback />}>
-          <MemberGraphSection sectionLabel={formatMessage({ id: "layout.memberGraph.connectionsSectionLabel" })} />
+          <MigrationLogPage />
         </Suspense>
       </div>
     </div>
@@ -645,27 +883,53 @@ function ReleaseNotesRoute() {
   return <Suspense fallback={<PanelFallback />}><ReleaseNotesPanel /></Suspense>;
 }
 
-function LegacyWorkspaceGridRedirect() {
-  const slug = useServerStore((s) => s.current?.slug);
-  return <Navigate to={slug ? `/s/${slug}` : "/"} replace />;
-}
-
-
-function LegacyThreadsRedirect() {
-  const slug = useServerStore((s) => s.current?.slug);
-  return <Navigate to={slug ? `/s/${slug}/activity` : "/"} replace />;
-}
-
 /** Route: /saved */
 function SavedRoute() {
   return <Suspense fallback={<PanelFallback />}><SavedPanel /></Suspense>;
 }
 
-/** Route: /tasks */
-function TasksRoute() {
-  return <Suspense fallback={<PanelFallback />}><TasksPanel /></Suspense>;
+/** Route: /drafts, behind drafts_section_v0 (off: back to the server's home). */
+function DraftsRoute() {
+  const serverSlug = useServerStore((s) => s.current?.slug);
+  const drafts = useServerFeatureFlag(DRAFTS_SECTION_FLAG_KEY);
+  if (drafts.resolved && !drafts.enabled) {
+    return <Navigate to={serverSlug ? `/s/${serverSlug}` : "/"} replace />;
+  }
+  if (!drafts.enabled) return <PanelFallback />;
+  return <Suspense fallback={<PanelFallback />}><DraftsPanel /></Suspense>;
 }
 
+/**
+ * Route: /artifacts — the Artifacts home page (S7), behind workspace_artifacts_v0 (the page says so when it is off).
+ * `?artifact=<id>` is the Artifact open over the page, `&version=<n>` at a
+ * pinned version (useArtifactOpenAddress, #proj-workspace:#237): a row of the
+ * page pushes it, Back and the viewer's close take it away, and a reload or a
+ * copied address opens it again. The canonical link `/artifacts/<id>` of a
+ * server not in the reader's list yet replaces itself with it, adding
+ * `&from=link`, which is replaced away once read. An Activity row or a Search
+ * hit opens it in that page's detail slot, a message's card beside its channel,
+ * each at the same address on its page (artifactOpenAddress.ts).
+ */
+function ArtifactsRoute() {
+  const serverId = useServerStore((s) => s.current?.id ?? null);
+  const serverSlug = useServerStore((s) => s.current?.slug);
+  const onMobileBack = useMobileBack(serverSlug ? `/s/${serverSlug}` : "/");
+  const address = useArtifactOpenAddress();
+  return (
+    <Suspense fallback={<PanelFallback />}>
+      <ArtifactsDashboard serverId={serverId} onMobileBack={onMobileBack} address={address} />
+    </Suspense>
+  );
+}
+
+/** Route: /apps — the server's Apps (#proj-apps task #22). Not for guests, like Members and Computers. */
+function AppsRoute() {
+  const server = useServerStore((s) => s.current);
+  if (server?.role === "guest") {
+    return <Navigate to={server.slug ? `/s/${server.slug}` : "/"} replace />;
+  }
+  return <Suspense fallback={<PanelFallback />}><AppsPage /></Suspense>;
+}
 
 
 /** Route: /search col-3 host. When the search slot is open, MainLayout puts
@@ -691,6 +955,9 @@ function renderContentSlot(slot: SearchContentSlot, closeSlot: () => void) {
   if (slot.kind === "agent") return <AgentById agentId={slot.id} onBack={closeSlot} />;
   if (slot.kind === "human") return <HumanById userId={slot.id} onBack={closeSlot} />;
   if (slot.kind === "machine") return <MachineById machineId={slot.id} />;
+  // Activity and Search draw an Artifact's slot themselves (ArtifactContentSlot).
+  if (slot.kind === "artifact") return null;
+  if (slot.kind === "task") return <TaskContentSlot slot={slot} closeSlot={closeSlot} />;
   // kind === "thread" — first-principles fix per stdrc 2026-05-28 (msg=41f5c906
   // / msg=138867ba). A thread is NOT a channel — it's a parent-message-anchored
   // sub-conversation. Rendering ChannelById/ChatPanel for the thread channel
@@ -705,32 +972,135 @@ function renderContentSlot(slot: SearchContentSlot, closeSlot: () => void) {
   return <ContentSlotThreadPanel closeSlot={closeSlot} />;
 }
 
+/**
+ * An Artifact opened from its Activity row (xxchan, Remy), or from a Search
+ * hit (#proj-workspace:#104): its viewer in the
+ * main area beside the list, as a conversation row opens its conversation; on
+ * a phone a page pushed in place of the list, its Back returning to it
+ * (useSearchContentUrlSync pushes and pops the entry). Its address is the
+ * Artifact address (`?artifact=<id>`, `&version=`, `&review=`; artifactOpenAddress.ts):
+ * a version picked in the viewer replaces `&version=` in the same entry.
+ */
+function ArtifactContentSlot({ slot, closeSlot, nothingOpen = <ActivityNothingOpen />, source = "activity" }: {
+  slot: SearchContentSlot;
+  closeSlot: () => void;
+  /** Desktop, with Artifacts off: what the main area says instead. */
+  nothingOpen?: ReactNode;
+  source?: "activity" | "search";
+}) {
+  const masterDetail = useMediaQuery(ACTIVITY_MASTER_DETAIL_QUERY);
+  const artifacts = useServerFeatureFlag(WORKSPACE_ARTIFACTS_FEATURE_FLAG_KEY);
+  const close = useCallback(() => {
+    closeSlot();
+    if (!masterDetail) return;
+    // Closed beside the list (Esc, its X): focus goes back to the Artifact's row.
+    focusActivityRowAfterClose(`object:artifact:${slot.id}`);
+  }, [closeSlot, masterDetail, slot.id]);
+  // Show All Comments: the same Artifact open without its review (`&review=` leaves the address).
+  const showAllComments = useCallback(() => {
+    useSearchContentStore.setState((state) => {
+      if (state.slot?.kind !== "artifact" || state.slot.review === undefined) return state;
+      const { review: _shown, ...rest } = state.slot;
+      return { slot: rest };
+    });
+  }, []);
+  // The review again, from the comment list's Filter button: back in the slot (`&review=`).
+  const showReview = useCallback((review: ArtifactReviewId) => useSearchContentStore.setState((state) => (
+    state.slot?.kind === "artifact" && state.slot.id === slot.id ? { slot: { ...state.slot, review } } : state)), [slot.id]);
+  // A version picked in the viewer: the slot's (the store → URL sync replaces `&version=`, the entry kept).
+  const showVersion = useCallback((version: number | null) => {
+    useSearchContentStore.setState((state) => {
+      if (state.slot?.kind !== "artifact" || state.slot.id !== slot.id) return state;
+      const { version: _shown, ...rest } = state.slot;
+      return { slot: version === null ? rest : { ...rest, version } };
+    });
+  }, [slot.id]);
+  // workspace_artifacts_v0: an address naming an Artifact on a server where they are off opens nothing.
+  if (!artifacts.resolved) return <PanelFallback />;
+  if (!artifacts.enabled) return masterDetail ? nothingOpen : null;
+  return (
+    <Suspense fallback={<PanelFallback />}>
+      <ArtifactActivityViewer id={slot.id} version={slot.version} review={slot.review} comment={slot.comment} onShowAllComments={showAllComments} onShowReview={showReview} onShowVersion={showVersion} covering={!masterDetail} onClose={close} source={source} />
+    </Suspense>
+  );
+}
+
 function SearchContentRoute() {
   const slot = useSearchContentStore((s) => s.slot);
   const closeSlot = useSearchContentStore((s) => s.close);
-  if (!slot) return <MessageSearchPage />;
-  return renderContentSlot(slot, closeSlot);
+  const openThreadHere = useThreadInDetailSlotOpener();
+  if (!slot) return <Suspense fallback={<PanelFallback />}><MessageSearchPage /></Suspense>;
+  // An Artifact hit: its viewer beside the results, as Activity's Artifact rows open beside its list.
+  if (slot.kind === "artifact") return <ArtifactContentSlot slot={slot} closeSlot={closeSlot} nothingOpen={null} source="search" />;
+  return <DetailSlotThreadContext.Provider value={opensThreadsInPlace(slot) ? openThreadHere : null}>{renderContentSlot(slot, closeSlot)}</DetailSlotThreadContext.Provider>;
+}
+
+/** A thread link in a thread or a task shown in the detail slot opens there, in its place (detailSlotThread.ts). */
+function opensThreadsInPlace(slot: SearchContentSlot): boolean {
+  return slot.kind === "thread" || slot.kind === "task";
 }
 
 /** Route: /activity — Activity surface, rendered as the search-style
  *  master/detail (no slot → full-width list; slot → picked entity in col 3,
  *  with the list hosted in col 2 by the master/detail layout). The
  *  rail-vs-sidebar placement A/B was dropped 2026-06-30 (stdrc) — Activity is
- *  always the rail master/detail surface now. */
+ *  always the rail master/detail surface now.
+ *
+ *  On a phone (below ACTIVITY_MASTER_DETAIL_QUERY, the desktop width) the
+ *  picked entity is a page pushed in place of the list, still on /activity:
+ *  its header Back closes the slot and returns to the list
+ *  (ContentSlotBackContext for a conversation; ThreadPanel and the profiles
+ *  already take closeSlot). */
 function InboxContentRoute() {
   const slot = useSearchContentStore((s) => s.slot);
   const closeSlot = useSearchContentStore((s) => s.close);
+  const masterDetail = useMediaQuery(ACTIVITY_MASTER_DETAIL_QUERY);
+  const openThreadHere = useThreadInDetailSlotOpener();
+  // The route stays mounted for the whole visit to Activity, whichever of the
+  // list and the opened conversation it shows (the list may sit beside it in
+  // col 2, or on a phone not be mounted at all): a hold on a reopened
+  // conversation still on screen survives the layout switching under it.
+  useActivityVisitSurface();
   if (!slot) {
+    // Desktop: the list sits in col 2 (MainLayout) even with nothing open, so
+    // the main area says so (stdrc). A phone's list is the page itself.
+    if (masterDetail) return <ActivityNothingOpen />;
     return <Suspense fallback={<PanelFallback />}><ThreadsInbox /></Suspense>;
   }
-  if (slot.kind === "thread") {
-    return <ActivityThreadContentRoute slot={slot} closeSlot={closeSlot} />;
-  }
-  return renderContentSlot(slot, closeSlot);
+  // `data-activity-detail`: acting in here reads a conversation Activity reopened on its own (autoReadHold).
+  const detail = slot.kind === "thread"
+    ? <ActivityThreadContentRoute slot={slot} closeSlot={closeSlot} />
+    : slot.kind === "artifact"
+      ? <ArtifactContentSlot slot={slot} closeSlot={closeSlot} />
+      : renderContentSlot(slot, closeSlot);
+  return (
+    <ContentSlotBackContext.Provider value={masterDetail ? null : closeSlot}>
+      <DetailSlotThreadContext.Provider value={opensThreadsInPlace(slot) ? openThreadHere : null}>
+        <div data-activity-detail className="contents">{detail}</div>
+      </DetailSlotThreadContext.Provider>
+    </ContentSlotBackContext.Provider>
+  );
+}
+
+/** Desktop Activity's main area while nothing is open beside the list. */
+function ActivityNothingOpen() {
+  const { formatMessage } = useIntl();
+  return (
+    <AppEmptyState
+      className="flex-1"
+      icon={<MessageIcon />}
+      title={formatMessage({ id: "layout.main.activityNothingOpenTitle" })}
+      // The main area's only content, so its title is a heading (Raft DS › EmptyState).
+      titleHeading="h2"
+      description={formatMessage({ id: "layout.main.activityNothingOpenDescription" })}
+      data-testid="activity-nothing-open"
+    />
+  );
 }
 
 export function ActivityThreadContentRoute({ slot, closeSlot }: { slot: SearchContentSlot; closeSlot: () => void }) {
   const { formatMessage } = useIntl();
+  const singlePaneBack = useContentSlotBack();
   const consumeMessageFocus = useSearchContentStore((s) => s.consumeMessageFocus);
   type ActivityThreadIdentity = {
     parentChannelId: string;
@@ -759,7 +1129,7 @@ export function ActivityThreadContentRoute({ slot, closeSlot }: { slot: SearchCo
 
   useEffect(() => {
     if (!loaded && !loading) {
-      void loadInbox({ reset: true });
+      void loadInbox({ reset: true, reason: "initial" });
     }
   }, [loadInbox, loaded, loading]);
 
@@ -781,11 +1151,14 @@ export function ActivityThreadContentRoute({ slot, closeSlot }: { slot: SearchCo
   const parentMessageId = threadIdentity?.parentMessageId;
   const threadChannelId = threadIdentity?.threadChannelId;
   const focusedMessageId = slot.messageId ?? null;
+  // Each open of the slot is a jump of its own (a second open of the same
+  // message locates it again).
+  const focusNonce = useSearchContentStore((s) => s.openNonce);
   const panelThreadIdentity = useMemo(() => (
     parentChannelId !== undefined && parentMessageId !== undefined && threadChannelId !== undefined
-      ? { parentChannelId, parentMessageId, threadChannelId, focusedMessageId }
+      ? { parentChannelId, parentMessageId, threadChannelId, focusedMessageId, focusNonce }
       : null
-  ), [focusedMessageId, parentChannelId, parentMessageId, threadChannelId]);
+  ), [focusNonce, focusedMessageId, parentChannelId, parentMessageId, threadChannelId]);
   const handleFocusedMessageConsumed = useCallback(
     () => consumeMessageFocus("thread", slot.id),
     [consumeMessageFocus, slot.id],
@@ -794,14 +1167,21 @@ export function ActivityThreadContentRoute({ slot, closeSlot }: { slot: SearchCo
   if (!panelThreadIdentity) {
     return (
       <div className="flex h-full min-h-0 w-full flex-col bg-layer-canvas">
-        <PanelHeader title={formatMessage({ id: "message.threadPanel.thread" })} containerProps={SHRINK_PANEL_HEADER_CONTAINER_PROPS} />
-        <div className="flex flex-1 items-center justify-center p-6">
-          <div className="text-foreground-muted font-mono text-sm">
-            {loaded
-              ? formatMessage({ id: "layout.main.threadNotInActivity" })
-              : formatMessage({ id: "common.loading" })}
-          </div>
-        </div>
+        <PanelHeader
+          title={formatMessage({ id: "message.threadPanel.thread" })}
+          containerProps={SHRINK_PANEL_HEADER_CONTAINER_PROPS}
+          onMobileBack={singlePaneBack ?? undefined}
+          backButtonVisibility="always"
+        />
+        {loaded ? (
+          <AppEmptyState
+            className="flex-1"
+            icon={<ThreadIcon />}
+            title={formatMessage({ id: "layout.main.threadNotInActivity" })}
+          />
+        ) : (
+          <PanelLoading label={formatMessage({ id: "common.loading" })} />
+        )}
       </div>
     );
   }
@@ -809,6 +1189,8 @@ export function ActivityThreadContentRoute({ slot, closeSlot }: { slot: SearchCo
   return (
     <ThreadPanel
       presentation="side"
+      // The Activity list on the left draws the column divider (task #110).
+      edge="inset"
       threadIdentity={panelThreadIdentity}
       onFocusedMessageConsumed={handleFocusedMessageConsumed}
       onClose={closeSlot}
@@ -816,7 +1198,7 @@ export function ActivityThreadContentRoute({ slot, closeSlot }: { slot: SearchCo
   );
 }
 
-/** Route: * — redirect to first channel */
+/** Route: * — redirect to first channel (a Guest's only one) */
 function DefaultRoute() {
   const location = useLocation();
   const navigate = useNavigate();
@@ -824,17 +1206,26 @@ function DefaultRoute() {
   const channels = useChannelStore((s) => s.channels);
   const loading = useChannelStore((s) => s.loading);
   const slug = useServerStore((s) => s.current?.slug);
-  const [isDesktop] = useState(() => window.matchMedia("(min-width: 768px)").matches);
+  const guest = useIsGuest(); // no channel list to show instead: always into its channel
+  // A window opened narrow (channel list as the page) and then widened with a
+  // mouse must still enter the first channel instead of staying on an empty
+  // "Select a channel". A phone rotated to landscape (>= 768px too) must not:
+  // the reader is on their channel list, so only a fine pointer follows the
+  // width live; otherwise the width at mount decides.
+  const [isDesktopAtMount] = useState(() => window.matchMedia(ROOT_REDIRECT_MEDIA_QUERY).matches);
+  const isDesktopNow = useMediaQuery(ROOT_REDIRECT_MEDIA_QUERY);
+  const finePointer = useMediaQuery("(pointer: fine)");
+  const isDesktop = isDesktopAtMount || (isDesktopNow && finePointer);
   const disclosureRestoreState = useMemo(() => buildSidebarDisclosureRestoreState(), []);
   const suppressDefaultRouteRedirect =
     (location.state as { suppressDefaultRouteRedirect?: unknown } | null)?.suppressDefaultRouteRedirect === true;
-  const defaultChannelPath = slug && channels[0]
-    ? `/s/${slug}/channel/${channels[0].id}`
-    : null;
+  // From the list only: a row ensured before it (the root's guess, preloadServerRoute) is not where it lands.
+  const defaultChannelId = !loading ? channels[0]?.id ?? null : null;
+  const defaultChannelPath = slug && defaultChannelId ? `/s/${slug}/channel/${defaultChannelId}` : null;
   // On mobile, don't auto-redirect — the sidebar (channel list) is shown inline
   // as the main content via the master-detail layout in MainLayout.
   const shouldRedirect = Boolean(
-    isDesktop
+    (isDesktop || guest)
     && defaultChannelPath
     && !suppressDefaultRouteRedirect
     && location.pathname !== defaultChannelPath,
@@ -852,38 +1243,26 @@ function DefaultRoute() {
     // would suppress every redirect. BrowserRouter's history reads the URL.
     const live = (navigator as { location?: { pathname?: string } }).location?.pathname;
     if (live !== undefined && live !== location.pathname) return;
+    if (defaultChannelId) rememberRootConversation(useAuthStore.getState().user?.id, useServerStore.getState().current?.id, defaultChannelId);
+    movePageLanding(location.pathname, defaultChannelPath); // a landing on /s/<slug> keeps its open-in-app offer
     navigate(defaultChannelPath, { replace: true, state: disclosureRestoreState });
-  }, [shouldRedirect, defaultChannelPath, location.pathname, navigator, navigate, disclosureRestoreState]);
+  }, [shouldRedirect, defaultChannelPath, defaultChannelId, location.pathname, navigator, navigate, disclosureRestoreState]);
   if (shouldRedirect) return null;
   // A wildcard test harness (or an embedding shell) can keep this element
   // mounted after the redirect reaches the canonical channel route. Do not
   // render a second ChatPanel in that settled state; the real channel route
   // owns the surface, and returning null also prevents the redirect effect
   // from retriggering on every location update.
-  if (isDesktop && defaultChannelPath && location.pathname === defaultChannelPath && !suppressDefaultRouteRedirect) {
+  if ((isDesktop || guest) && defaultChannelPath && location.pathname === defaultChannelPath && !suppressDefaultRouteRedirect) {
     return null;
   }
-  if (loading) {
-    return null;
-  }
-  // Desktop: show empty state. Mobile: this won't be visible (sidebar is shown instead).
-  return <ChatPanel channel={null} />;
-}
-
-// Empty placeholder for /members and /computers root routes. Unlike
-// DefaultRoute, these MUST NOT auto-redirect to the first channel — that
-// would silently flip the URL into chat mode (and re-highlight the Chat
-// rail button) the moment the user clicks Members or Computers.
-function EmptyRoute() {
-  const server = useServerStore((s) => s.current);
-  if (server?.role === "guest") {
-    return <Navigate to={server.slug ? `/s/${server.slug}` : "/"} replace />;
-  }
+  if (loading) return null;
+  if (guest) return defaultChannelPath ? null : <GuestNoChannel />; // no sidebar: told only when it has no channel
   return <ChatPanel channel={null} />;
 }
 
 // Computers route — on desktop the Sidebar owns the Computers rail with
-// the list of machines, and the main panel shows the empty ChatPanel.
+// the list of machines, and the main panel shows the Computers empty state.
 // On mobile the Sidebar is not rendered for /computers (removed from
 // isMobileMasterRoute 2026-05-01 per stdrc msg 2a500cb7), so the main
 // panel here IS the page the user sees: MobileComputersPanel renders a
@@ -891,6 +1270,10 @@ function EmptyRoute() {
 // other mobile panels (Tasks / Saved / Threads / Settings sub-pages).
 function ComputersRoute() {
   const server = useServerStore((s) => s.current);
+  // Opening Computers (desktop rail list or the phone page) sees every
+  // computer's current attention state: the rail / popover dots go out, the
+  // rows keep showing the state (raft-design #620 "Attention dots").
+  useMarkComputerAttentionSeen(server?.role !== "guest");
   const [isDesktop, setIsDesktop] = useState(() => window.matchMedia("(min-width: 768px)").matches);
   useEffect(() => {
     const mq = window.matchMedia("(min-width: 768px)");
@@ -908,7 +1291,18 @@ function ComputersRoute() {
   // reliably fake a narrow viewport from its side, so the host-shell decision must be
   // authoritative in web — see PR #4799.
   const forceMobilePanel = isHostShell() || !isDesktop;
-  return forceMobilePanel ? <MobileComputersPanel /> : <ChatPanel channel={null} />;
+  if (forceMobilePanel) return <MobileComputersPanel />;
+  // The rack overview, a full page beside the rail (no sidebar: shellRouteLayout).
+  return <Suspense fallback={<PanelFallback />}><ComputersRackOverview /></Suspense>;
+}
+
+// /more — the phone's More tab (2026-10-20 to 2026-10-22). The server tab took
+// its place, and what More held (Members, Computers, Settings) opens from the
+// server tab's popover, so an old /more link lands on the server's Home, on a
+// phone and on desktop alike.
+export function MoreRoute() {
+  const serverSlug = useServerStore((s) => s.current?.slug);
+  return <Navigate to={serverSlug ? `/s/${serverSlug}` : "/"} replace />;
 }
 
 /** Thread panel wrapper — only renders if a thread is open. Owns the column
@@ -921,8 +1315,8 @@ function ComputersRoute() {
  *                     both pane minimums; otherwise an inline column with a
  *                     persisted width and left-edge resize handle.
  *  - "modal"        — bordered card with standard shadow-float, fixed centered size.
- *                     Caller wraps in <Modal> for backdrop + ESC.
- *  - "mobile-modal" — full-screen overlay (no Modal wrapper); back chevron is
+ *                     Caller wraps in TaskDialogShell for the scrim + Esc.
+ *  - "mobile-modal" — full-screen overlay (no dialog wrapper); back chevron is
  *                     the close affordance.
  */
 /** The task whose host message anchors this thread, if any.
@@ -1007,8 +1401,8 @@ function TaskModalBar({
   const { formatMessage } = useIntl();
   return (
     // raft-ui PanelHeader owns the edges, as on every other panel head: the
-    // last glyph 20px from the edge on desktop, and on a phone the Back
-    // mirrors the last action, 3px from the edge. Its row is centred, so the X is
+    // first and last icon boxes sit on the content margin and mirror
+    // (headEdges.ts). Its row is centred, so the X is
     // weighed against the whole two-line block, not its first line.
     <PanelHead>
       {mobile && (
@@ -1024,10 +1418,10 @@ function TaskModalBar({
           Both are stable facts — the task's own title stays in the scrolling
           body, because a long one cannot be bounded by a fixed bar. */}
       <div className="min-w-0 flex-1">
-        <div className="truncate text-xs font-bold text-foreground-muted">
+        <div className="truncate text-caption font-bold text-foreground-muted">
           {channelSigil(task.channelName || formatMessage({ id: "task.properties.unknownChannel" }))}
         </div>
-        <div className="truncate text-sm font-bold" data-testid="task-modal-bar-label">
+        <div className="truncate text-subhead font-bold" data-testid="task-modal-bar-label">
           {formatMessage({ id: "task.modal.taskWithNumber" }, { taskNumber: task.taskNumber })}
         </div>
       </div>
@@ -1065,12 +1459,35 @@ function TaskModalBar({
   );
 }
 
-function ThreadPanelWrapper({ presentation = "side", allowMaximize = true }: { presentation?: "side" | "modal" | "mobile-modal"; allowMaximize?: boolean }) {
+function ThreadPanelWrapper({ presentation = "side" }: { presentation?: "side" | "modal" | "mobile-modal" }) {
+  // Task v2: a dialog keyed by the task (its own conversation, no parent
+  // message). Only `openTaskConversation` fills that slot, behind the flag.
+  const taskConversationOpen = useThreadStore((s) => !!s.taskModal?.taskId && !s.taskModal.parentMessageId);
+  if (presentation !== "side" && taskConversationOpen) {
+    return <TaskConversationDialogHost presentation={presentation} />;
+  }
+  return <MessageThreadPanelWrapper presentation={presentation} />;
+}
+
+/** Task v2 dialog host: closes the slot (desktop) or consumes the history
+ *  entry that opened it (phone), as the message-keyed task sheet does. */
+function TaskConversationDialogHost({ presentation }: { presentation: "modal" | "mobile-modal" }) {
+  const closeTaskModal = useThreadStore((s) => s.closeTaskModal);
+  const mobileTaskBack = useMobileBack(closeTaskModal, closeTaskModal);
+  return (
+    <TaskConversationDialog
+      presentation={presentation}
+      onClose={presentation === "mobile-modal" ? mobileTaskBack : closeTaskModal}
+    />
+  );
+}
+
+function MessageThreadPanelWrapper({ presentation = "side" }: { presentation?: "side" | "modal" | "mobile-modal" }) {
   const openParentMessageId = useThreadStore((s) => s.openParentMessageId);
   const taskModal = useThreadStore((s) => s.taskModal);
   const closeThread = useThreadStore((s) => s.closeThread);
   const closeTaskModal = useThreadStore((s) => s.closeTaskModal);
-  // Modal presentations render the task surface, whose identity lives in the
+  // Dialog presentations render the task surface, whose identity lives in the
   // independent taskModal slot (task #699) — or, on the /tasks route, an
   // ordinary intent=thread open rendered as a modal, which keeps the store's
   // open* fields. The slot wins when present.
@@ -1084,6 +1501,7 @@ function ThreadPanelWrapper({ presentation = "side", allowMaximize = true }: { p
         parentChannelId: taskModal.parentChannelId ?? "",
         threadChannelId: taskModal.threadChannelId,
         focusedMessageId: taskModal.focusedMessageId,
+        focusNonce: taskModal.focusNonce,
       }
     : undefined, [isTaskSurface, taskModal]);
   const closeSurface = isTaskSurface && taskModal ? closeTaskModal : closeThread;
@@ -1107,7 +1525,24 @@ function ThreadPanelWrapper({ presentation = "side", allowMaximize = true }: { p
       intent: "thread",
     });
   }, [closeSurface, hostTask, nav, openThread, threadChannelId]);
-  const canViewInThread = !!hostTask && !hostTask.isLegacy && hostTask.channelType !== "thread";
+  const taskV2 = useServerFeatureFlag(TASK_V2_CONVERSATIONS_FLAG_KEY).enabled;
+  // Task v2: a task's conversation is its own, not a message's thread, so a
+  // task sheet keyed by its message (an older `task=<ch>:<msg>` link) moves
+  // onto the task-keyed dialog as soon as the task is known. Decided per task:
+  // a task made the v2 way moves whatever the flag says (its `messageId` is
+  // only the task id, so a flag-off sheet on it would show no message).
+  const openTaskConversation = useThreadStore((s) => s.openTaskConversation);
+  const redirectToTaskConversation = isTaskSurface && !!taskModal && !!hostTask && opensAsTaskConversation(hostTask, taskV2);
+  useEffect(() => {
+    if (!redirectToTaskConversation || !hostTask) return;
+    openTaskConversation({
+      taskId: hostTask.id,
+      parentChannelId: hostTask.channelId,
+      conversationChannelId: directTaskConversationChannelId(hostTask),
+    });
+  }, [hostTask, openTaskConversation, redirectToTaskConversation]);
+  // Only a pre-v2 task has a host message whose thread to view.
+  const canViewInThread = !taskV2 && !!hostTask && !hostTask.isLegacy && !isTaskV2Task(hostTask) && hostTask.channelType !== "thread";
   // The task sheet owns the current history entry. Close the store first so
   // the panel disappears synchronously, then consume the PUSH that opened it.
   // On a cold deep link there is no safe entry to pop, so the callback fallback
@@ -1128,77 +1563,66 @@ function ThreadPanelWrapper({ presentation = "side", allowMaximize = true }: { p
         {hostTask && <TaskModalBar task={hostTask} onClose={closeSurface} onViewInThread={canViewInThread ? viewInThread : undefined} />}
         <div className="flex min-h-0 flex-1 flex-col">
           <ThreadPanel key={parentMessageId} presentation="modal" threadIdentity={surfaceThreadIdentity} hideHeader={!!hostTask} hideParentMessage={!!hostTask}
-            parentSlot={hostTask ? <Suspense fallback={<div className="space-y-3 border-b border-line-hairline bg-layer-canvas p-4"><Skeleton className="h-6 w-2/3" /><Skeleton className="h-4 w-full" /><Skeleton className="h-4 w-4/5" /></div>}><TaskModalHead task={hostTask} /></Suspense> : undefined} />
+            parentSlot={hostTask ? <Suspense fallback={<div className="stack-y-3 border-b border-line-hairline bg-layer-canvas p-4"><Skeleton className="h-6 w-2/3" /><Skeleton className="h-4 w-full" /><Skeleton className="h-4 w-4/5" /></div>}><TaskModalHead task={hostTask} /></Suspense> : undefined} />
         </div>
       </DialogSurface>
     );
   }
   if (presentation === "mobile-modal") {
     return (
-      <div className="absolute inset-0 z-30 flex flex-col bg-layer-canvas" data-testid="task-thread-modal">
+      <div className="absolute inset-0 z-cover flex flex-col bg-layer-canvas" data-testid="task-thread-modal">
         {hostTask && (
           <TaskModalBar task={hostTask} onClose={mobileTaskBack} onViewInThread={canViewInThread ? viewInThread : undefined} mobile />
         )}
         <div className="flex min-h-0 flex-1 flex-col">
           <ThreadPanel key={parentMessageId} presentation="mobile-modal" threadIdentity={surfaceThreadIdentity} hideHeader={!!hostTask} hideParentMessage={!!hostTask}
-            parentSlot={hostTask ? <Suspense fallback={<div className="space-y-3 border-b border-line-hairline bg-layer-canvas p-4"><Skeleton className="h-6 w-2/3" /><Skeleton className="h-4 w-full" /><Skeleton className="h-4 w-4/5" /></div>}><TaskModalHead task={hostTask} /></Suspense> : undefined} />
+            parentSlot={hostTask ? <Suspense fallback={<div className="stack-y-3 border-b border-line-hairline bg-layer-canvas p-4"><Skeleton className="h-6 w-2/3" /><Skeleton className="h-4 w-full" /><Skeleton className="h-4 w-4/5" /></div>}><TaskModalHead task={hostTask} /></Suspense> : undefined} />
         </div>
       </div>
     );
   }
-  return <SideThreadColumn key={parentMessageId} allowMaximize={allowMaximize} />;
+  return <SideThreadColumn key={parentMessageId} />;
 }
 
 /** Chat-side col-4 thread column container. Owns persisted width + resize +
  *  desktop/mobile chrome. Renders ThreadPanel for the surface content. */
-function SideThreadColumn({ allowMaximize }: { allowMaximize: boolean }) {
-  const channelCollapsed = useUIStore((s) => s.threadMaximized);
-  const toggleChannel = useUIStore((s) => s.toggleThreadMaximized);
-  const panelRef = useRef<HTMLDivElement | null>(null);
-  // Read the actual CSS result only when the user opens the menu. There is
-  // no resize subscription and no second copy of the responsive breakpoint.
-  const canToggleChannel = useCallback(() => {
-    const channel = panelRef.current?.parentElement?.querySelector<HTMLElement>(":scope > .thread-main-column");
-    return !useProfileStore.getState().profileId && !!channel && getComputedStyle(channel).display !== "none"
-      && useMessageStore.getState().currentChannelId === useThreadStore.getState().openParentChannelId;
-  }, []);
-  const [dynamicMax, setDynamicMax] = useState(() =>
-    getThreadPanelDynamicMax(),
-  );
-  const getThreadDragStartWidth = useCallback(() => {
-    const measuredWidth = panelRef.current?.getBoundingClientRect().width;
-    return measuredWidth && measuredWidth > 0 ? measuredWidth : undefined;
-  }, []);
-  const { width, handleResizeStart, handleResizeMove, handleResizeEnd } = useResizablePanel({
-    storageKey: "slock:threadPanelWidth",
-    min: THREAD_PANEL_MIN_WIDTH,
-    max: dynamicMax,
-    defaultWidth: THREAD_PANEL_DEFAULT_WIDTH,
-    direction: "left",
-    getDragStartWidth: getThreadDragStartWidth,
-  });
-  const handleThreadResizeStart = useCallback((e: React.PointerEvent) => {
-    // Browser window resize already forces layout and Timeline anchor repair.
-    // Keep that path CSS-only; refresh the drag bounds only when the user
-    // intentionally resizes this panel.
-    setDynamicMax(getThreadPanelDynamicMax());
-    handleResizeStart(e);
-  }, [handleResizeStart]);
+function SideThreadColumn() {
+  // The remembered width; the row's plan shows it at its share (#189, rowLayout).
+  const width = useColumnWidth("thread");
+  // Task v2 (task #165): the column's place among the side columns, and the sections stacked with the thread in it.
+  // (Its Expand, Focus Mode, is the row's: the head's button or Escape, #189 rule 5; no snap past the seam's end.)
+  const [columnElement, setColumnElement] = useState<HTMLDivElement | null>(null);
+  const side = useThreadColumnSide(columnElement);
+  // Standing in the row, the thread's head moves it among the side columns (its grip on its own head, not the column's: a section can stand above it).
+  const head = useStackEndHead("thread", useSideSectionHead("thread", side.inRow));
   return (
     <div
-      ref={panelRef}
+      ref={setColumnElement}
       className="thread-side-column flex flex-col bg-layer-canvas"
       data-testid="thread-side-column"
-      style={{ "--thread-panel-width": `${width}px` } as React.CSSProperties}
+      data-otter-dock="thread"
+      // With the channel folded (Thread | Profile, index.css), the thread is the conversation the profile takes its
+      // width from (ColumnResizeHandle); elsewhere it is hidden or is the column being resized, and does not count.
+      data-main-column=""
+      data-side-col={side.sideCol}
+      data-side-stacked={side.stacked ? "true" : undefined}
+      data-thread-collapsed={side.threadFold}
+      // Folded into the conversation's column, over the chat (#189 rule 3, rowPlan): Back instead of × (index.css).
+      data-covers={side.covers}
+      // Its remembered width; the row's plan shows it at its share (rowLayout `--row-width`).
+      style={{ "--thread-panel-width": `${width}px`, "--side-thread-flex": side.threadFlex, order: side.order } as React.CSSProperties}
     >
-      <div
-        className="thread-side-column-resizer absolute left-0 top-0 bottom-0 w-2 -ml-1 z-10 cursor-col-resize touch-none select-none"
-        onPointerDown={handleThreadResizeStart}
-        onPointerMove={handleResizeMove}
-        onPointerUp={handleResizeEnd}
-        onPointerCancel={handleResizeEnd}
+      {/* Shown only where it stands in the row (index.css), not folded. */}
+      {/* Stacked with sections, the column draws the left seam itself (index.css), not the thread's panel. */}
+      <ColumnResizeHandle column="thread" edge="left" className="thread-side-column-resizer" ownBorder={side.stacked} highlight={side.seamHighlight} />
+      <ThreadColumnSections side={side} part="before" />
+      <ThreadPanel
+        presentation="side"
+        allowExpand
+        headerLeading={side.stacked ? <ThreadCollapseChevron side={side} /> : undefined}
+        headerDrag={head}
       />
-      <ThreadPanel presentation="side" channelCollapsed={channelCollapsed} onToggleChannel={allowMaximize ? toggleChannel : undefined} canToggleChannel={canToggleChannel} />
+      <ThreadColumnSections side={side} part="after" />
     </div>
   );
 }
@@ -1206,7 +1630,17 @@ function SideThreadColumn({ allowMaximize }: { allowMaximize: boolean }) {
 /** Profile panel wrapper — only renders if a profile is open */
 function ProfilePanelWrapper({ collapseChannel = false, collapseThread = false }: { collapseChannel?: boolean; collapseThread?: boolean } = {}) {
   const isOpen = useProfileStore((s) => !!s.profileId);
+  const planned = useRowPlanned();
+  const { formatMessage } = useIntl();
   if (!isOpen) return null;
+  // A desktop's planned row (#189 rule 7): a section of the side layout, moved among the columns like Tasks.
+  if (planned) {
+    return (
+      <SideSectionPortal section="profile" title={formatMessage({ id: "agent.detail.tab.profile" })}>
+        <RowRegionChrome region="profile"><Suspense fallback={<ProfilePanelFallback />}><ProfilePanel presentation="column" /></Suspense></RowRegionChrome>
+      </SideSectionPortal>
+    );
+  }
   // Keep this marker as a direct child of the thread layout while flattening
   // its box.  That lets CSS switch the existing three-column flex row to
   // Thread | Profile without moving/unmounting the ThreadPanel element.
@@ -1218,7 +1652,7 @@ function ProfilePanelWrapper({ collapseChannel = false, collapseThread = false }
       data-collapse-thread={collapseThread ? "true" : "false"}
     >
       <Suspense fallback={(
-        <OverlayPanelFallback
+        <ProfilePanelFallback
           testId={import.meta.env.VITE_E2E === "true" ? "profile-panel-fallback" : undefined}
         />
       )}><ProfilePanel /></Suspense>
@@ -1230,7 +1664,11 @@ function ProfilePanelWrapper({ collapseChannel = false, collapseThread = false }
 function LegacyTaskPanelWrapper({ presentation = "side" }: { presentation?: "side" | "modal" | "mobile-modal" }) {
   const isOpen = useLegacyTaskPanelStore((s) => !!s.task);
   if (!isOpen) return null;
-  return <Suspense fallback={<OverlayPanelFallback />}><LegacyTaskPanel presentation={presentation} /></Suspense>;
+  return (
+    <Suspense fallback={presentation === "side" ? <LegacyTaskSidePanelFallback /> : <OverlayPanelFallback />}>
+      <LegacyTaskPanel presentation={presentation} />
+    </Suspense>
+  );
 }
 
 /** Right panel — renders the open views in their overlay-stack order.
@@ -1249,10 +1687,9 @@ function RightPanel() {
   const profileOpenSource = useProfileStore((s) => s.openSource);
   const legacyTaskOpen = useLegacyTaskPanelStore((s) => !!s.task);
   const closeThread = useThreadStore((s) => s.closeThread);
-  const closeTaskModal = useThreadStore((s) => s.closeTaskModal);
   const closeLegacyTask = useLegacyTaskPanelStore((s) => s.closeLegacyTask);
   const isTasksRoute = /\/tasks\/?$/.test(location.pathname);
-  // Tasks-route: rail-visible (md+) wraps the thread / legacy task in <Modal>
+  // Tasks-route: rail-visible (md+) wraps the thread / legacy task in TaskDialogShell
   // (bounded centered card with backdrop). Mobile (no Rail, <md) renders the
   // panel directly so it behaves like a regular full-screen thread overlay.
   // The md threshold matches LeftRail's own `hidden md:flex` — stdrc
@@ -1277,7 +1714,7 @@ function RightPanel() {
   // visual top layer (mobile uses the shared absolute/z-index overlay; desktop
   // lays the two relative columns out side by side). This is intentionally
   // limited to ordinary threads: task threads are centered/modal surfaces and
-  // must continue to be owned by their Modal wrapper.
+  // must continue to be owned by their dialog wrapper (TaskDialogShell).
   // Every branch that renders a side thread goes through this SAME shape —
   // fragment [thread, profile|null] — so closing the profile reconciles to the
   // identical mounted thread node instead of remounting it.
@@ -1301,6 +1738,8 @@ function RightPanel() {
   // surface is underneath — a side thread it was opened over keeps its
   // identity, mount, and scroll; closing the modal just empties the slot.
   const taskModalOpen = useThreadStore((s) => s.taskModal !== null);
+  // A task keyed by the task (task v2) is the task slot's own: it follows a task ref there (TaskContentSlot).
+  const taskModalTaskKeyed = useThreadStore((s) => !!s.taskModal?.taskId && !s.taskModal.parentMessageId);
 
   // /search 4-column layout (stdrc #proj-uiux:c2313b1d msg=a19e7a44 2026-05-28):
   // when col 3 hosts a channel/dm/agent/human surface, clicking thread / replies
@@ -1320,27 +1759,33 @@ function RightPanel() {
   // In search-overlay mode the URL is /search but this panel must behave for the
   // frozen background channel, so key off the background location when present.
   const rightPanelPath = (resolveSearchOverlayBackground(location) ?? location).pathname;
+  const rightPanelServerSlug = useServerStore((s) => s.current?.slug);
   const isSearchRoute = /\/search(\/|$)/.test(rightPanelPath);
   const isActivityRoute = /\/activity(\/|$)/.test(rightPanelPath);
-  const isContentRoute = isSearchRoute || isActivityRoute;
   const searchSlotKind = useSearchContentStore((s) => s.slot?.kind ?? null);
+  // The Tasks page (task v2) with a task, or a thread linked from it, in its
+  // own detail slot is a content route too: the slot's thread is no col-4
+  // panel, and no task modal draws over it.
+  const isContentRoute = isSearchRoute || isActivityRoute
+    || (isTasksPagePath(rightPanelPath, rightPanelServerSlug) && (searchSlotKind === "task" || searchSlotKind === "thread"));
   // The task modal is an overlay surface: it renders ON TOP of the base
   // decision below instead of replacing it (task #699 — the base used to be
-  // dropped because both shared the one open slot). Its close handler empties
-  // the taskModal slot; the /tasks-route open* modal keeps closeThread.
+  // dropped because both shared the one open slot). Its close handler shuts the
+  // dialog's profile first, then the slot; the /tasks-route modal: closeThread.
   const renderTaskThreadPanel = (onClose: () => void) => {
     if (railVisible) {
-      // Centered modal with backdrop. Backdrop click + ESC close it; no
-      // inline X (back chevron handles close at md-lg, ESC/backdrop at lg+).
+      // The task dialog (raft-ui Dialog, TaskDialogShell): its scrim and Esc close it, as does the card's ×.
       return (
-        <Modal onClose={onClose} closeOnBackdrop>
+        <TaskDialogShell onClose={onClose}>
           <ThreadPanelWrapper presentation="modal" />
-        </Modal>
+        </TaskDialogShell>
       );
     }
     return <ThreadPanelWrapper presentation="mobile-modal" />;
   };
-  const taskModalOverlay = taskModalOpen ? renderTaskThreadPanel(closeTaskModal) : null;
+  // The task slot shows its task in place (TaskContentSlot): no dialog over it. A message-keyed task
+  // (pre-v2, a linked task's badge) opened from inside it is no task of the slot's: the dialog, as ever.
+  const taskModalOverlay = taskModalOpen && !(searchSlotKind === "task" && taskModalTaskKeyed) ? renderTaskThreadPanel(dismissTaskConversationDialog) : null;
   if (isContentRoute) {
     let base = null;
     if (
@@ -1350,10 +1795,10 @@ function RightPanel() {
       && searchSlotKind !== "thread"
       && profileOpen
     ) {
-      base = renderStackedSidePanels(<ThreadPanelWrapper allowMaximize={false} />, profileOpenSource);
+      base = renderStackedSidePanels(<ThreadPanelWrapper />, profileOpenSource);
     } else if (profileIsTop) base = <ProfilePanelWrapper />;
     else if (threadIsTop && searchSlotKind && searchSlotKind !== "thread") {
-      base = renderStackedSidePanels(<ThreadPanelWrapper allowMaximize={false} />, profileOpenSource);
+      base = renderStackedSidePanels(<ThreadPanelWrapper />, profileOpenSource);
     }
     return <>{base}{taskModalOverlay}</>;
   }
@@ -1373,9 +1818,9 @@ function RightPanel() {
   if (isTasksRoute && legacyTaskOpen) {
     if (railVisible) {
       return (
-        <Modal onClose={closeLegacyTask} closeOnBackdrop>
+        <TaskDialogShell onClose={closeLegacyTask}>
           <LegacyTaskPanelWrapper presentation="modal" />
-        </Modal>
+        </TaskDialogShell>
       );
     }
     return <LegacyTaskPanelWrapper presentation="mobile-modal" />;
@@ -1413,14 +1858,28 @@ function useRightPanelUrlSync() {
   // to a different thread (which calls navigate() and only changes the query
   // string) reopens the panel to the new target instead of staying on the
   // previously opened thread.
+  // Deep links v1: a landed message link whose `thread` names another
+  // conversation is rejected whole, so its thread never opens (and waits for
+  // the flag instead of opening first). Any other address syncs as before.
+  const deepLinks = useDeepLinksFlag();
+  const rejectsLandedThread = (() => {
+    if (!isMessageLinkLanding(location.pathname, location.search)) return false;
+    const target = parseMessageLink(location.pathname, location.search);
+    return !!target && isThreadMismatch(target) && (!deepLinks.resolved || deepLinks.enabled);
+  })();
+  // The store→URL direction must leave the rejected link alone too: with no
+  // thread open it would drop `thread=` and turn the link into a plain ?msg=.
+  const rejectsLandedThreadRef = useRef(rejectsLandedThread);
+  rejectsLandedThreadRef.current = rejectsLandedThread;
   useEffect(() => {
     // React can still flush an older URL→store effect after a fast close has
     // already replaced the live URL. Ignore those stale snapshots so a removed
     // ?thread= param cannot reopen the just-closed panel.
     if (isSearchOverlay) return;
+    if (rejectsLandedThread) return;
     if (!isCurrentRightPanelSearchSnapshot(location.search)) return;
     syncRightPanelStoresFromSearch(location.search);
-  }, [location.pathname, location.search, isSearchOverlay]);
+  }, [location.pathname, location.search, isSearchOverlay, rejectsLandedThread]);
 
   // Store → URL: update query params when panel state changes.
   // Panels stack: both ?thread= and ?profile= can coexist. Adding a panel
@@ -1429,6 +1888,7 @@ function useRightPanelUrlSync() {
     mode: "auto" | "replace" = "auto",
     options: { resetAgentTabForProfileReopen?: boolean } = {},
   ) => {
+      if (rejectsLandedThreadRef.current) return;
       // Sync locationRef synchronously after navigate(). React-router's
       // navigate() calls history.pushState under the hood, which updates
       // window.history synchronously, but the useEffect at line 413 only
@@ -1490,7 +1950,9 @@ function useRightPanelUrlSync() {
 }
 
 // Two-way URL sync for the content master/detail (task #311 stdrc msg=b61ab472).
-// `?open=<kind>:<id>` <-> searchContentStore.slot. The same slot store + URL
+// `?open=<kind>:<id>` <-> searchContentStore.slot; an Artifact's slot is the
+// one Artifact address (artifactOpenAddress.ts, #proj-workspace:#240): `?artifact=<id>`, `&version=`,
+// `&review=`; the retired `?open=artifact:<id>` is read, and replaced with it. The same slot store + URL
 // param back BOTH the /search master/detail AND the /inbox (Activity) one
 // (stdrc #proj-activity:171042a3 2026-06-23: "Activity 的展示方式应该跟搜索
 // 结果页面一致 … 点进去后的交互行为也和搜索结果点进去的行为类似"). Scoped to
@@ -1499,9 +1961,12 @@ function useRightPanelUrlSync() {
 // slot is shared, switching between /search and /inbox is also a route change —
 // the new route's URL carries no `?open=` on a fresh entry, so the URL→Store
 // branch clears the prior route's slot rather than letting it bleed across.
+type SearchContentSlotState = { slot: SearchContentSlot | null };
+
 function useSearchContentUrlSync() {
   const location = useLocation();
   const navigate = useNavigate();
+  const navigationType = useNavigationType();
   const serverSlug = useServerStore((s) => s.current?.slug ?? null);
   // Search-overlay mode: the URL is /search (the overlay's own query) but the
   // background — which may itself be an Activity/Search WITH a picked col-3 slot —
@@ -1510,44 +1975,122 @@ function useSearchContentUrlSync() {
   // the background's slot, or write the overlay URL. Only fully leaving the overlay
   // resumes the sync.
   const isSearchOverlay = resolveSearchOverlayBackground(location) !== null;
+  // The Tasks page (task v2) opens a task in a detail slot of its own, and a
+  // thread linked from that task in its place (detailSlotThread.ts).
+  const taskV2 = useServerFeatureFlag(TASK_V2_CONVERSATIONS_FLAG_KEY).enabled;
+  const onTasksRoute = taskV2 && isTasksPagePath(location.pathname, serverSlug);
   const onContentRoute =
     !!serverSlug
     && (location.pathname === `/s/${serverSlug}/search`
         || location.pathname.startsWith(`/s/${serverSlug}/search/`)
         || location.pathname === `/s/${serverSlug}/activity`
-        || location.pathname.startsWith(`/s/${serverSlug}/activity/`));
+        || location.pathname.startsWith(`/s/${serverSlug}/activity/`)
+        || onTasksRoute);
+  // The result's own entry keeps its mark through in-place rewrites of that
+  // entry while the result stays open: a conversation's tab (?chatTab=), its
+  // focused message (?msg= cleared on send / back to bottom) and other
+  // replaces write the URL without our state. When a REPLACE lands on the
+  // entry the previous commit saw marked, with the result still showing, the
+  // mark goes back on, so closing the result still pops it.
+  const lastCommitRef = useRef<{ index: number | null; marked: boolean } | null>(null);
+  useEffect(() => {
+    if (isSearchOverlay || !onContentRoute) {
+      lastCommitRef.current = null;
+      return;
+    }
+    const index = historyEntryIndex();
+    const previous = lastCommitRef.current;
+    if (
+      navigationType === "REPLACE"
+      && !isContentSlotEntry()
+      && previous?.marked
+      && index !== null
+      && previous.index === index
+      && new URLSearchParams(window.location.search).has("open")
+    ) {
+      stampContentSlotEntry();
+    }
+    lastCommitRef.current = { index, marked: isContentSlotEntry() };
+  }, [location.key, navigationType, isSearchOverlay, onContentRoute]);
 
   // URL → Store. Clears the slot when leaving the content routes or when ?open
   // is removed.
   useEffect(() => {
     if (isSearchOverlay) return;
     if (!onContentRoute) {
-      if (useSearchContentStore.getState().slot) {
+      const slot = useSearchContentStore.getState().slot;
+      if (slot) {
         useSearchContentStore.getState().close();
+        // Its task goes with it, not on to the next page as the dialog. Kept
+        // where the page's own address names it (a link to a message in it:
+        // the channel with the task open) or another task was opened on the
+        // way out. Read before the stale-commit check below: the address the
+        // navigation carried, not the one the panels' sync rewrites it to.
+        const named = parseTaskConversationParam(new URLSearchParams(location.search).get("task"))?.taskId;
+        if (slot.kind === "task" && named !== slot.id && useThreadStore.getState().taskModal?.taskId === slot.id) useThreadStore.getState().closeTaskModal();
       }
       return;
     }
+    // A stale commit: Router is still rendering a location the browser has
+    // already left (a result opened, then Back before the result's render
+    // committed). Acting on it would reopen the result just closed; the
+    // current location's own commit runs this effect again.
+    if (location.search !== window.location.search && location.pathname === window.location.pathname) return;
     const params = new URLSearchParams(location.search);
     const openParam = params.get("open");
     const msgParam = params.get("msg");
-    const parsed = parseSearchOpenParam(openParam);
+    const parsedParam = parseSearchOpenParam(openParam);
+    // An Artifact opens in Activity's slot and in Search's (#proj-workspace:#104), as any result, at its address
+    // (`?artifact=`, or the retired `?open=artifact:` replaced with it in place, its entry kept).
+    const artifactAddress = onTasksRoute || (parsedParam && parsedParam.kind !== "artifact") ? null : readArtifactAddress(params);
+    if (artifactAddress?.legacy) writeArtifactAddress(navigate, artifactAddressTidying({ pathname: location.pathname, search: location.search, state: location.state }, "activity"));
+    const parsed: SearchContentSlot | null = artifactAddress
+      ? { kind: "artifact", id: artifactAddress.id }
+      // The Tasks page's slot is only ever a task or a thread opened from one.
+      : onTasksRoute && parsedParam?.kind !== "task" && parsedParam?.kind !== "thread" ? null : parsedParam;
     const current = useSearchContentStore.getState().slot;
     if (!parsed) {
       if (current) useSearchContentStore.getState().close();
       return;
     }
-    const nextMessageId = (parsed.kind === "channel" || parsed.kind === "dm" || parsed.kind === "thread")
+    const nextMessageId = (parsed.kind === "channel" || parsed.kind === "dm" || parsed.kind === "thread" || parsed.kind === "task")
       ? (msgParam ?? undefined)
       : undefined;
+    const nextVersion = artifactAddress ? artifactAddress.version ?? undefined : undefined;
+    const nextReview = artifactAddress ? artifactAddress.review : undefined;
     if (
       !current
       || current.kind !== parsed.kind
       || current.id !== parsed.id
       || current.messageId !== nextMessageId
+      || current.version !== nextVersion
+      || current.review !== nextReview
     ) {
-      useSearchContentStore.getState().open({ ...parsed, messageId: nextMessageId });
+      useSearchContentStore.getState().open({
+        ...parsed,
+        messageId: nextMessageId,
+        ...(nextVersion === undefined ? {} : { version: nextVersion }),
+        ...(nextReview === undefined ? {} : { review: nextReview }),
+      });
     }
-  }, [location.pathname, location.search, onContentRoute, isSearchOverlay]);
+  }, [location.pathname, location.search, location.state, onContentRoute, onTasksRoute, isSearchOverlay, navigate]);
+
+  // Back / Forward away from an opened result closes it on the spot. The
+  // URL→Store effect above does the same once Router commits the popped
+  // location, but a result page that is still settling (lazy panels, a
+  // pending transition) can leave that commit without the effect re-running,
+  // and the result stayed up over a results URL. Reading the live URL on
+  // popstate does not depend on that commit.
+  useEffect(() => {
+    if (isSearchOverlay || !onContentRoute) return;
+    const closeSlotWhenUrlDropsIt = () => {
+      const live = new URLSearchParams(window.location.search);
+      if (live.has("open") || readArtifactAddress(live)) return;
+      if (useSearchContentStore.getState().slot) useSearchContentStore.getState().close();
+    };
+    window.addEventListener("popstate", closeSlotWhenUrlDropsIt);
+    return () => window.removeEventListener("popstate", closeSlotWhenUrlDropsIt);
+  }, [onContentRoute, isSearchOverlay]);
 
   // Store → URL. Only writes when on a content route; off-route the URL→Store
   // branch above is authoritative.
@@ -1562,12 +2105,58 @@ function useSearchContentUrlSync() {
   // `?thread=` and calls `closeThread()`, leaving ThreadPanel with
   // `parentMessageId === null` — which renders blank for one click and is
   // why task #330's "first-click col-3 blank" repro'd on thread hits.
+  //
+  // Phone /search (design lead 2026-10-21): Search is a tab, and a result
+  // opened from it is a pushed page whose Back returns to the results. Opening
+  // the first result therefore PUSHES a history entry (a thread hit's entry
+  // was already pushed by the ?thread= sync, so it merges into that one), and
+  // closing the result from the store — an agent/human page's Back calls
+  // closeSlot — pops it instead of leaving a duplicate results entry behind.
+  // Phone Activity does the same: the opened conversation is a page pushed in
+  // place of the list, so system/browser Back returns to the list. Desktop
+  // master/detail (col 3 beside the list) keeps replacing.
   useEffect(() => {
     if (isSearchOverlay || !onContentRoute) return;
-    return useSearchContentStore.subscribe((state, prev) => {
-      if (state.slot === prev.slot) return;
+    // True when it popped the result's entry rather than writing the URL.
+    const writeSlot = (state: SearchContentSlotState, prev: SearchContentSlotState): boolean => {
       const params = new URLSearchParams(window.location.search);
+      const livePath = window.location.pathname.replace(/\/+$/, "");
+      const phoneSearch = !!serverSlug
+        && livePath === `/s/${serverSlug}/search`
+        && typeof window.matchMedia === "function"
+        && !window.matchMedia("(min-width: 768px)").matches;
+      const phoneActivity = !!serverSlug
+        && livePath === `/s/${serverSlug}/activity`
+        && !isActivityMasterDetailViewport();
+      // The Tasks page's task on a phone: a page pushed in place of the list, as Activity's.
+      const phoneTasks = !!serverSlug
+        && livePath === `/s/${serverSlug}/tasks`
+        && !isActivityMasterDetailViewport();
+      const pushesResultPage = phoneSearch || phoneActivity || phoneTasks;
+      // The entry on screen is one a result opened on its own (marked when it
+      // was pushed; the mark lives on the history entry, so it survives
+      // leaving for another page and coming Back to it). Closing it pops that
+      // entry at any width: one opened on a phone and closed after the window
+      // widened must not leave a duplicate list entry either. (An Artifact's: its address's mark.)
+      const live = liveArtifactAddressEntry();
+      const slotEntry = isContentSlotEntry() || artifactOpenEntryOf(live.state)?.pushed === true;
+      const liveAddress = readArtifactAddress(params);
+      // A slot opened FROM the URL (a cold link, Back/Forward) is already in
+      // history; only a result the user opens adds an entry.
+      const openedFromUrl = !!state.slot && (state.slot.kind === "artifact"
+        ? artifactSlotInAddress(liveAddress, state.slot) : params.get("open") === formatSearchOpenParam(state.slot));
+      const opensResultPage = pushesResultPage && !!state.slot && !prev.slot && !openedFromUrl;
+      // An Artifact's slot: the Artifact address's writes, with this master/detail's push rule.
+      if (state.slot?.kind === "artifact" || (!state.slot && prev.slot?.kind === "artifact" && liveAddress)) {
+        writeArtifactSlotAddress(navigate, live, state.slot, { source: livePath.endsWith("/search") ? "search" : "activity", push: opensResultPage, pushed: slotEntry });
+        return false;
+      }
       if (!state.slot) {
+        const resultEntryShowing = params.has("open");
+        if (slotEntry && resultEntryShowing) {
+          navigate(-1);
+          return true;
+        }
         params.delete("open");
         params.delete("msg");
       } else {
@@ -1575,7 +2164,8 @@ function useSearchContentUrlSync() {
         if (
           (state.slot.kind === "channel"
             || state.slot.kind === "dm"
-            || state.slot.kind === "thread")
+            || state.slot.kind === "thread"
+            || state.slot.kind === "task")
           && state.slot.messageId
         ) {
           params.set("msg", state.slot.messageId);
@@ -1583,34 +2173,68 @@ function useSearchContentUrlSync() {
           params.delete("msg");
         }
       }
-      const search = params.toString();
+      // Another result in its place: the Artifact open with the one before (its slot, or beside its conversation) goes.
+      const sameResult = !!state.slot && !!prev.slot && state.slot.kind === prev.slot.kind && state.slot.id === prev.slot.id;
+      const written = sameResult ? params : withArtifactAddress(params, null);
+      const search = written.toString();
+      const pathname = window.location.pathname;
+      // A task's entry was pushed by its ?task= the same way (TaskContentSlot).
+      const threadEntryAlreadyPushed = (state.slot?.kind === "thread" && params.has("thread"))
+        || (state.slot?.kind === "task" && params.has("task"));
+      const push = opensResultPage && !threadEntryAlreadyPushed;
+      // Mark the result's own entry (a thread hit's was pushed by the
+      // ?thread= sync just before; this replace marks it) and keep the mark
+      // while the result stays open on it. Otherwise these rewrites stay
+      // stateless, as they always were (searchFullPagePreviewSync).
+      const nextState = state.slot && (opensResultPage || slotEntry)
+        ? { [CONTENT_SLOT_ENTRY_MARK]: true }
+        : undefined;
       navigate(
-        { pathname: window.location.pathname, search: search ? `?${search}` : "" },
-        { replace: true },
+        { pathname, search: search ? `?${search}` : "" },
+        // flushSync: the result page renders from the store at once, so the
+        // router must commit its entry now too. Left to a transition (which a
+        // suspending result page can hold back), a quick Back would pop to the
+        // location React still had committed and never close the result.
+        push ? { flushSync: true, state: nextState } : { replace: true, state: nextState },
       );
+      // The result page's Back renders before Router commits the new entry;
+      // record the push now so that Back pops back to the results.
+      if (push) recordSynchronousMobileBackNavigation("PUSH", `${pathname}${search ? `?${search}` : ""}`);
+      return false;
+    };
+    return useSearchContentStore.subscribe((state, prev) => {
+      if (state.slot === prev.slot) return;
+      const popped = writeSlot(state, prev);
+      // A task slot's task (TaskContentSlot) closes as the slot leaves it,
+      // after the slot's own write. A popped entry takes its ?task= along
+      // and the URL closes the task; writing it now would land on the entry
+      // being left before the pop.
+      if (prev.slot?.kind === "task" && state.slot?.kind !== "task" && !popped) useThreadStore.getState().closeTaskModal();
     });
-  }, [onContentRoute, navigate, isSearchOverlay]);
+  }, [onContentRoute, navigate, isSearchOverlay, serverSlug]);
 }
 
 
 export default function MainLayout() {
+  const [announcementHost, setAnnouncementHost] = useState<HTMLDivElement | null>(null);
   // Shared model-label catalog (task #700): the shell owns the load trigger
   // (server changes while the app is up); rows and panels only subscribe, so
   // every surface switches to the reported names together.
   useEffect(() => watchModelLabelCatalog(), []);
+  useEffect(() => markBootMilestone("frame"), []);
   const { formatMessage } = useIntl();
-  const { resolvedMode } = useAppTheme();
   useEmbedParamsKeeper();
   useRightPanelUrlSync();
   useSearchContentUrlSync();
+  useArtifactViewerAddress();
+  useBesideMemory();
+  useSearchHitMarkLifetime();
   useRailLegacyRedirect();
-  useTabRouteMemory();
+  useTabRouteMemory(useOwnAssistantDmId());
 
-  const currentUserId = useAuthStore((s) => s.user?.id ?? null);
   const channels = useChannelStore((s) => s.channels);
   const dmChannels = useChannelStore((s) => s.dmChannels);
   const channelsLoading = useChannelStore((s) => s.loading);
-  const setMessageStoreCurrentUserId = useMessageStore((s) => s.setCurrentUserId);
   const showAddMachine = useMachineStore((s) => s.showAddMachine);
   const setShowAddMachine = useMachineStore((s) => s.setShowAddMachine);
   const showCreateAgent = useAgentStore((s) => s.showCreateAgent);
@@ -1631,90 +2255,27 @@ export default function MainLayout() {
   const backgroundLocation = resolveSearchOverlayBackground(location);
   // The content column the web search overlay sits at the top of (SearchOverlay).
   const contentColumnRef = useRef<HTMLDivElement | null>(null);
+  // A page's own column beside the conversation in the row (the Tasks page's task; rowColumnSlot).
+  const [rowColumnSlot, setRowColumnSlot] = useState<HTMLElement | null>(null);
   usePageViewTracking(location.pathname);
+  // Raft Desktop: its move to the official Computer, as product events (analytics/computerMigration.ts).
+  useComputerMigrationReporting();
+  useMessageLinkLandingLifetime(location.pathname, location.search);
   useEffect(() => {
     rememberNonSearchLocation({ pathname: location.pathname, search: location.search });
   }, [location.pathname, location.search]);
-  // Pushes the current user id into the external messageStore — write-to-
-  // external-store sync, not derived local state. FP for no-derived-state-effect.
-  // oxlint-disable-next-line react-doctor/no-derived-state-effect
-  useEffect(() => {
-    setMessageStoreCurrentUserId(currentUserId);
-  }, [currentUserId, setMessageStoreCurrentUserId]);
-
   // Detect mobile vs desktop (matches Tailwind's md: breakpoint at 768px)
-  const [isDesktop, setIsDesktop] = useState(() => window.matchMedia("(min-width: 768px)").matches);
-  useEffect(() => {
-    const mq = window.matchMedia("(min-width: 768px)");
-    const handler = (e: MediaQueryListEvent) => setIsDesktop(e.matches);
-    mq.addEventListener("change", handler);
-    return () => mq.removeEventListener("change", handler);
-  }, []);
+  const isDesktop = useIsDesktopShell();
+  // A stable element: the Sidebar is memoised, and a fresh slot per render
+  // re-rendered every sidebar row after each unrelated update (web perf).
+  const sidebarAnnouncementSlot = useMemo(
+    () => (isDesktop ? <div ref={setAnnouncementHost} className="shrink-0" data-testid="sidebar-announcement-slot" /> : undefined),
+    [isDesktop],
+  );
 
-  const [isLg, setIsLg] = useState(() => window.matchMedia(LG_VIEWPORT_QUERY).matches);
-  useEffect(() => {
-    const mq = window.matchMedia(LG_VIEWPORT_QUERY);
-    const handler = (e: MediaQueryListEvent) => setIsLg(e.matches);
-    mq.addEventListener("change", handler);
-    return () => mq.removeEventListener("change", handler);
-  }, []);
-
-  // Desktop shell: the native menu's "Settings…" (⌘,) asks the renderer to open
-  // settings. Only present in the Electron shell; Web/PWA never subscribes.
-  useEffect(() => {
-    const onOpenSettings = (window as {
-      raftDesktop?: { onOpenSettings?: (cb: () => void) => () => void };
-    }).raftDesktop?.onOpenSettings;
-    if (!onOpenSettings) return;
-    return onOpenSettings(() => {
-      const slug = useServerStore.getState().current?.slug;
-      if (slug) navigate(`/s/${slug}/settings`);
-    });
-  }, [navigate]);
-
-  // Search master/detail responsive col-2 width per stdrc #proj-uiux:c2313b1d
-  // msg=1351abcf (3c, 2026-05-26): at ≥1024 use the search-specific wider
-  // panel (480 default, 360-720 range) for high-info-density result rows; at
-  // 768-1023 collapse to chat-sidebar-shape (240 default, 180-320 range) so
-  // col 3 picked-entity isn't squeezed to ~232px at 768. Two persisted widths
-  // never conflict.
-  // Resizable sidebar (desktop only)
-  // Chat sidebar is a navigation rail, not a content pane. Keep the
-  // resizable max compact so persisted wide values do not create an empty
-  // right gutter around short labels and badges.
-  const {
-    width: sidebarWidth,
-    handleResizeStart: handleSidebarResizeStart,
-    handleResizeMove: handleSidebarResizeMove,
-    handleResizeEnd: handleSidebarResizeEnd,
-  } = useResizablePanel({ storageKey: "slock:sidebarWidth", ...SIDEBAR_PANEL_BOUNDS });
-
-  // Search master/detail col-2 (MessageSearchPage when slot is open) — much
-  // wider than the Sidebar rail because it hosts search input + filter row
-  // + results, and per stdrc msg=b61ab472 should feel roughly half-width.
-  // Persisted separately so resizing in search mode doesn't affect chat.
-  const {
-    width: searchPanelWidth,
-    handleResizeStart: handleSearchPanelResizeStart,
-    handleResizeMove: handleSearchPanelResizeMove,
-    handleResizeEnd: handleSearchPanelResizeEnd,
-  } = useResizablePanel({ storageKey: "slock:searchPanelWidth", min: 400, max: 720, defaultWidth: 560 });
-
-  // Search master/detail col-2 compact width — used when col 4 thread overlay
-  // is open so col 2 + col 3 + col 4 all fit at 1280-1366 viewports without
-  // squeezing col 3. Persisted independently from searchPanelWidth so user can
-  // resize each mode separately (stdrc #proj-uiux:c2313b1d msg=0ed291ab
-  // 2026-05-28). 240 felt too narrow (msg=6fa799a7); default 320 keeps
-  // search-result rows readable while leaving col 3 ~580px at 1366.
-  const {
-    width: searchPanelCompactWidth,
-    handleResizeStart: handleSearchPanelCompactResizeStart,
-    handleResizeMove: handleSearchPanelCompactResizeMove,
-    handleResizeEnd: handleSearchPanelCompactResizeEnd,
-  } = useResizablePanel({
-    storageKey: "slock:searchPanelCompactWidth",
-    ...MASTER_DETAIL_COMPACT_PANEL_BOUNDS,
-  });
+  const isLg = useMediaQuery(LG_VIEWPORT_QUERY);
+  // index.css shows Channel | Thread side by side only in a landscape or xl window.
+  const threadSplitViewport = useMediaQuery(THREAD_SPLIT_VIEWPORT_QUERY);
 
   const serverSlug = useServerStore((s) => s.current?.slug);
   const currentServerId = useServerStore((s) => s.current?.id);
@@ -1724,6 +2285,8 @@ export default function MainLayout() {
   const sawOnboardingThisSession = useOnboardingAnnouncementGateStore((state) => (
     currentServerId ? state.sawOnboardingServerIds.includes(currentServerId) : false
   ));
+  // A page a link landed on, with the open-in-app offer: the announcement waits (one app prompt at a time).
+  const landingHoldsAnnouncements = useLandingHoldsAnnouncements();
   const threadRefHandoff = useMemo(
     () => serverSlug ? parseThreadRefHandoff(serverSlug, location.search) : null,
     [location.search, serverSlug],
@@ -1752,19 +2315,17 @@ export default function MainLayout() {
         shortId: threadRefHandoff.shortId,
         summaries: useThreadStore.getState().summaries,
         followedThreads: useThreadStore.getState().followedThreads,
-        loadContext: async (channelId, targetShortId) => {
-          const { data } = await api.get(`/messages/context/${targetShortId}`, {
-            params: { channelId },
-          });
-          return data;
-        },
+        // A thread behind the plan's history window opens on its paywall, as in the app.
+        loadContext: loadThreadRefContext,
       }),
       getAuthority: () => {
         const activeServer = useServerStore.getState();
         return { serverSlug: activeServer.current?.slug, serverEpoch: activeServer.serverEpoch };
       },
-      onFailure: () => {
-        toast.error(formatMessage({ id: "message.messageItem.threadUnavailable" }));
+      onFailure: (reason) => {
+        // channel_not_listed is decided locally, with no request: say why, as there is no trace id to send.
+        if (reason === "channel_not_listed") toast.error(formatMessage({ id: "message.messageItem.threadChannelUnavailable" }));
+        else toast.error(formatMessage({ id: "message.messageItem.threadUnavailable" }));
         navigate(`/s/${serverSlug}`, { replace: true });
       },
       onOpen: (target, parentChannel) => {
@@ -1780,37 +2341,35 @@ export default function MainLayout() {
   useClearLiveAgentActivityOnServerChange(currentServerId);
 
   useEffect(() => {
-    const onKeyDown = (event: KeyboardEvent) => {
-      blurFocusedControlForScreenshotShortcut(event);
-      if (isGlobalSearchShortcut(event)) {
-        event.preventDefault();
-        if (!serverSlug) return;
-        const searchPath = `/s/${serverSlug}/search`;
-        const outcome = routeGlobalSearchShortcut({
-          pathname: location.pathname,
-          searchPath,
-          focusMountedSearch: () => document.dispatchEvent(new Event(SEARCH_FOCUS_REQUEST_EVENT)),
-          navigateToSearch: () => navigate(`/s/${serverSlug}/search`, {
-            state: {
-              searchFrom: `${location.pathname}${location.search}`,
-              // Float the search over the current view (⌘K overlay) wherever the
-              // overlay is on (desktop shell, desktop-width web); phones keep the
-              // full-page /search. A minimal {pathname,search} avoids nesting the
-              // location.state chain.
-              ...(isSearchOverlayEnabled()
-                ? { backgroundLocation: { pathname: location.pathname, search: location.search } }
-                : {}),
-            },
-          }),
-        });
-        trackNavEntrySelected("search", "keyboard_shortcut", outcome === "focused");
-        return;
-      }
-    };
-    // keydown-global-exempt: cmdk search and system screenshot focus cleanup
+    const onKeyDown = (event: KeyboardEvent) => { blurFocusedControlForScreenshotShortcut(event); };
+    // keydown-global-exempt: system screenshot focus cleanup, observed only (never preventDefault)
     document.addEventListener("keydown", onKeyDown);
     return () => document.removeEventListener("keydown", onKeyDown);
-  }, [location.pathname, location.search, navigate, serverSlug]);
+  }, []);
+
+  // ⌘K / Ctrl+K, through the shortcut registry's dispatcher (which calls preventDefault).
+  useShortcut("search", () => {
+    if (!serverSlug) return;
+    const searchPath = `/s/${serverSlug}/search`;
+    const outcome = routeGlobalSearchShortcut({
+      pathname: location.pathname,
+      searchPath,
+      focusMountedSearch,
+      navigateToSearch: () => navigate(`/s/${serverSlug}/search`, {
+        state: {
+          searchFrom: `${location.pathname}${location.search}`,
+          // Float the search over the current view (⌘K overlay) wherever the
+          // overlay is on (desktop shell, desktop-width web); phones keep the
+          // full-page /search. A minimal {pathname,search} avoids nesting the
+          // location.state chain.
+          ...(isSearchOverlayEnabled()
+            ? { backgroundLocation: { pathname: location.pathname, search: location.search } }
+            : {}),
+        },
+      }),
+    });
+    trackNavEntrySelected("search", "keyboard_shortcut", outcome === "focused");
+  });
 
   // One-time hash migration: redirect old hash URLs to new paths. Runs when the
   // server slug resolves or changes, not on every navigation.
@@ -1841,80 +2400,45 @@ export default function MainLayout() {
   const path = (backgroundLocation ?? location).pathname;
   const pathBase = serverSlug ? `/s/${serverSlug}` : "";
 
-  // Show sidebar inline as main content on mobile when the URL is one of
-  // the per-rail-mode master pages — chat root, members root, or settings
-  // root. Detail URLs (/channel/<id>, /agent/<id>, /settings/account, etc.)
-  // instead show the main panel and hide the sidebar. /computers renders a
-  // dedicated MobileComputersPanel on mobile (stdrc msg 2a500cb7 2026-05-01)
-  // and /tasks has no sidebar at all (handled separately below).
-  const isDefaultRoute = path === pathBase || path === `${pathBase}/`;
-  const isMembersRoot = path === `${pathBase}/members` || path === `${pathBase}/members/`;
-  const isSettingsRoot = path === `${pathBase}/settings` || path === `${pathBase}/settings/`;
-  const isMobileMasterRoute = isDefaultRoute || isMembersRoot || isSettingsRoot;
-  const mobileShowSidebarInline = !isDesktop && isMobileMasterRoute;
-
-  // Tasks rail mode is single-page: TasksPanel owns its own filtering UI
-  // and there is no master/detail navigation inside Tasks, so we skip the
-  // Sidebar entirely and let the panel take the full width next to LeftRail.
-  // Search rail mode (task #311 stdrc #proj-uiux:c2313b1d 2026-05-25) starts
-  // single-page (full-width MessageSearchPage next to LeftRail). Once the
-  // user picks a result and `searchContentStore.slot` opens, we flip into a
-  // 3-column master/detail (LeftRail | MessageSearchPage | picked-entity)
-  // by reusing the Sidebar slot to host MessageSearchPage and rendering the
-  // picked entity in the routes container via SearchContentRoute.
-  const isTasksRoute = path === `${pathBase}/tasks` || path.startsWith(`${pathBase}/tasks/`);
-  const isSearchRoute = path === `${pathBase}/search` || path.startsWith(`${pathBase}/search/`);
-  // Inbox (Activity) is the second content master/detail route. It reuses the
-  // exact same slot store, URL sync, column assembly, widths, and resize
-  // handlers as /search — only col-2's content differs (ThreadsInbox vs
-  // MessageSearchPage). stdrc #proj-activity:171042a3 2026-06-23.
-  // /activity always gets the search-style master/detail (the rail-vs-sidebar
-  // placement A/B was dropped 2026-06-30 — rail is the default).
-  const isActivityRoute = path === `${pathBase}/activity` || path.startsWith(`${pathBase}/activity/`);
-  const isInboxRoute = isActivityRoute;
-  const isContentRoute = isSearchRoute || isInboxRoute;
   const searchSlotOpen = useSearchContentStore((s) => !!s.slot);
   const searchSlotKind = useSearchContentStore((s) => s.slot?.kind ?? null);
-  const currentConversationId = useMessageStore((s) => s.currentChannelId);
-  const threadParentConversationId = useThreadStore((s) => s.openParentChannelId);
-  const threadMaximized = useUIStore((s) => s.threadMaximized);
+  const guest = useIsGuest();
+  // Which panes this URL gets (shellRouteLayout.ts, shared with PendingServerLayout).
+  const {
+    assistantPageOtter,
+    mobileShowSidebarInline,
+    isInboxRoute,
+    searchMasterDetail,
+    hideSidebar,
+    collapseColumn,
+    sidebarCollapsible,
+    topEdgeSurface,
+  } = shellRouteLayout(path, pathBase, { isDesktop, searchSlotOpen, guest });
+  const threadRow = useThreadRowState();
   const threadParentMessageIdForLayout = useThreadStore((s) => s.openParentMessageId);
   const threadOpenForLayout = !!threadParentMessageIdForLayout;
   const profileOpenForLayout = useProfileStore((s) => !!s.profileId);
-  // Desktop only: when the slot is open we want a real 3-col layout. Mobile
-  // keeps the single-page surface — the picked entity uses the same
-  // mobile-detail-route mechanism as a normal channel push (the slot's
-  // kind→route fallback is reserved for desktop in this iteration; mobile path
-  // is tracked as 311c follow-up).
-  const searchMasterDetail = isContentRoute && searchSlotOpen && isDesktop;
   const masterDetailShellClassName = searchMasterDetail
-    ? "flex flex-col border-r border-line-seam"
+    ? "flex flex-col"
     : "";
-  // When a content route has three visible work panes, col 2 swaps from
-  // searchPanelWidth (wide master) to searchPanelCompactWidth (independent
-  // persisted compact width) so col 3 is not squeezed by col-2 + right-panel
-  // stacking (stdrc msg=ea3dd8b3 + msg=6fa799a7 + msg=0ed291ab 2026-05-28).
-  // Thread overlay compacting only applies when col 3 is not already a thread;
-  // profile overlay compacting applies even when col 3 is a thread, because
-  // Activity/Search can show List | Thread | Profile.
-  const contentRouteThreadOverlayOpen =
-    searchMasterDetail && threadOpenForLayout && !!searchSlotKind && searchSlotKind !== "thread";
-  const contentRouteProfileOverlayOpen = searchMasterDetail && profileOpenForLayout;
-  const searchColTwoCompact = contentRouteThreadOverlayOpen || contentRouteProfileOverlayOpen;
-  const hideSidebar = isTasksRoute || (isContentRoute && !searchMasterDetail);
-  const isMobileTabRoot = mobileShowSidebarInline || (!isDesktop && isTasksRoute);
-  // iOS-standalone chrome buckets (Raft Design System › NavBar): a tab root's
-  // top bar is the frame (yellow in light, #0d0d0b in dark), a pushed detail's
-  // header is paper. The shell wrapper paints the same surface above the
-  // safe-area inset and `meta[theme-color]` follows it.
-  const mobileDetailChrome = !isDesktop && !isMobileTabRoot;
-  const browserChromeColor = mobileDetailChrome
-    ? (resolvedMode === "dark" ? RAFT_DARK_PAPER_CHROME_COLOR : RAFT_LIGHT_PAPER_CHROME_COLOR)
-    : (resolvedMode === "dark" ? RAFT_DARK_THEME_CHROME_COLOR : RAFT_LIGHT_THEME_CHROME_COLOR);
-  const shellBackgroundColor = isDesktop ? undefined : mobileDetailChrome ? "var(--layer-canvas)" : "var(--layer-frame)";
-  const shellStyle = useMemo(
-    () => ({ paddingTop: "env(safe-area-inset-top, 0px)", backgroundColor: shellBackgroundColor }),
-    [shellBackgroundColor],
+  const legacyTaskOpenForLayout = useLegacyTaskPanelStore((s) => !!s.task);
+  const shortcutHelpOpenForLayout = useShortcutHelpStore((s) => s.open);
+  // Room a right panel needs for the sidebar column to give way to it (ShellSidebarColumn), 0 in the planned row
+  // (#189): the sidebar is not in the row, which folds the thread instead, so it never moves when one opens or folds.
+  // Elsewhere (a legacy task's row) index.css splits at the conversation's 360px plus the thread's minimum: a profile,
+  // a legacy task or the shortcuts panel sits beside the conversation from lg; a thread in a landscape or xl window,
+  // unless it is picked.
+  const rowPlanned = useRowPlanned();
+  const rightPanelBeside = isDesktop && !rowPlanned && (
+    ((profileOpenForLayout || legacyTaskOpenForLayout || shortcutHelpOpenForLayout) && isLg)
+    || (threadOpenForLayout && threadSplitViewport && !(searchMasterDetail && searchSlotKind === "thread"))
+  );
+  const rightColumnMin = rightPanelBeside ? COLUMN_BOUNDS.thread.contentMin : 0;
+  const sidebarHidden = useSidebarSlotHidden(collapseColumn);
+  const sidebarCollapsed = sidebarCollapsible && sidebarHidden;
+  const handleSidebarOpenChange = useCallback(
+    (open: boolean) => setSidebarSlotHidden(collapseColumn, !open),
+    [collapseColumn],
   );
   const closeAddMachine = useCallback(() => setShowAddMachine(false), [setShowAddMachine]);
   const closeCreateAgent = useCallback(() => setShowCreateAgent(false), [setShowCreateAgent]);
@@ -1922,73 +2446,64 @@ export default function MainLayout() {
     if (backgroundLocation) navigate(overlayCloseTarget(backgroundLocation));
   }, [backgroundLocation, navigate]);
 
-  useLayoutEffect(() => {
-    const themeColor = document.querySelector<HTMLMetaElement>('meta[name="theme-color"]');
-    if (!themeColor) return;
-    themeColor.content = browserChromeColor;
-  }, [browserChromeColor]);
+  // ⌘\ / Ctrl+\ (or the person's own keys), through the registry: held down it toggles once;
+  // toggleSidebarFromKeyboard moves focus out of a collapsing sidebar itself.
+  useShortcut("sidebar", () => { toggleSidebarFromKeyboard(document, collapseColumn); }, { enabled: sidebarCollapsible });
 
   // The top bar (workspace switcher + search) spans the window at desktop
   // width. The desktop shell draws its own title bar, and the host-shell embed
   // owns its chrome, so neither gets a second one. A shell that instead hands
   // its chrome to this bar (topBarHostContext.ts) gets it at any width: the
   // row is then the window's title bar and drag region.
-  const topBarHosted = useTopBarHost() !== null;
-  const showTopBar = shouldShowTopBar({
-    hosted: topBarHosted,
-    desktopWidth: isDesktop,
-    hostShell: isHostShell(),
-    electronShell: isElectronDesktopShell(),
-  });
+  const showTopBar = useShowsTopBar(isDesktop);
 
   return (
-    <AppShellRoot
-      // iOS standalone first-principles contract:
-      // - browsers/PWA manifests default to theme yellow when route-level chrome
-      //   cannot be applied reliably
-      // - mobile detail routes still update theme-color and this wrapper to match
-      //   their white top surface
-      className="min-h-0 flex-1 flex-col font-display"
-      // iOS standalone: the wrapper above the safe-area inset paints the
-      // route's chrome colour itself, so the status-bar strip matches
-      // `meta[theme-color]` (task #638, ios-standalone-chrome spec).
-      style={shellStyle}
-    >
-      {/* System notifications live in the Notification Center popup, hung off the LeftRail
-          (desktop) and the Chat-tab navbar (mobile). The previous global
-          top banner stack covered itself when multiple conditions fired at
-          once; collecting them into a notification-center popover (per
-          stdrc 2026-05-02 #proj-uiux:f87f6eb9 task #94) makes the full
-          list visible without stealing layout height. */}
-      <PwaInstallPrompt />
-
-      {showTopBar ? <ShellTopBar /> : null}
-
-      <div className="flex min-h-0 flex-1">
-        {/* Left rail — desktop only. Hosts server switcher (top), sidebar tab
-            icons (Chat/Members), and Settings (bottom). On mobile the
-            equivalent surfaces live in the in-Sidebar server header and the
-            bottom MobileTabBar. */}
-        <AppShellRailSlot>
-          <LeftRail
-            hidden={mobileShowSidebarInline}
-            topBar={showTopBar}
-          />
-        </AppShellRailSlot>
-
-        {/* Sidebar container:
-            - Mobile root: relative, full width, inline as main content (the "Chat tab")
-            - Mobile detail: hidden (no drawer on mobile — detail views cover everything)
-            - Desktop: always relative inline at resizable width
-            - Tasks rail mode: hidden (TasksPanel takes the full main area). */}
-        {!hideSidebar && <AppShellSidebarSlot
+    <ShellFrame
+      isDesktop={isDesktop}
+      showTopBar={showTopBar}
+      topEdgeSurface={topEdgeSurface}
+      sidebarCollapsible={sidebarCollapsible}
+      sidebarOpen={!sidebarHidden}
+      onSidebarOpenChange={handleSidebarOpenChange}
+      topStrip={<OpenInAppOffers slot="top" />}
+      bottomStrip={<OpenInAppOffers slot="bottom" />}
+      rail={(
+        <LeftRail
+          hidden={mobileShowSidebarInline}
+          topBar={showTopBar}
+          sidebarToggle={sidebarCollapsible ? collapseColumn : null}
+        />
+      )}
+      // Sidebar container:
+      // - Mobile root: relative, full width, inline as main content (the "Chat tab")
+      // - Mobile detail: hidden (no drawer on mobile — detail views cover everything)
+      // - Desktop: always relative inline at resizable width
+      // - Tasks rail mode: hidden (TasksPanel takes the full main area).
+      sidebar={hideSidebar ? null : (
+        <AppShellSidebarSlot
+          id={SIDEBAR_REGION_ID}
+          // Collapsed, the column stays mounted under the main area; raft-ui
+          // makes it inert and aria-hidden, and while expanded stacks it just
+          // above the main area so its resize handle's outer half stays
+          // grabbable (no z-index here, so that stacking applies).
           className={
             mobileShowSidebarInline
               ? "relative z-auto flex min-w-0 flex-1"
-              : "hidden md:relative md:flex md:z-auto"
+              // A phone's detail page has no sidebar beside it, also where it
+              // is wide (a host-shell embed: useIsDesktopShell); `md:hidden`
+              // overrides raft-ui's own `md:flex` on the slot.
+              : isDesktop ? "hidden md:relative md:flex" : "hidden md:hidden"
           }
         >
-          <div
+          <ShellSidebarColumn
+            column={searchMasterDetail ? "list" : "sidebar"}
+            // Activity with an item open: the list never renders wider than
+            // the conversation (stdrc), at most half the room right of the rail.
+            maxShare={searchMasterDetail && isInboxRoute && searchSlotOpen ? 0.5 : undefined}
+            inline={mobileShowSidebarInline}
+            rightColumnMin={rightColumnMin}
+            collapseColumn={sidebarCollapsible && !mobileShowSidebarInline ? collapseColumn : null}
+            ownBorder={searchMasterDetail}
             // stdrc 2026-05-02 #proj-uiux:95e25b5b ec1523d9: invert
             // sidebar/main relationship — sidebar uses warm cream
             // (`bg-palette-cream`), main panel uses bright white. After
@@ -2014,20 +2529,6 @@ export default function MainLayout() {
             // wrapper doesn't change its layout — but we still scope it to
             // master-detail to keep the non-search wrapper byte-identical.
             className={`relative h-full min-w-0 ${mobileShowSidebarInline ? "flex-1 bg-layer-canvas" : "shrink-0 bg-layer-sidebar"} ${masterDetailShellClassName}`}
-            style={
-              mobileShowSidebarInline
-                ? undefined
-                : {
-                    width: searchMasterDetail
-                      ? resolveMasterDetailPanelWidth({
-                          isLargeViewport: isLg,
-                          isCompactLayout: searchColTwoCompact,
-                          wideWidth: searchPanelWidth,
-                          compactWidth: searchPanelCompactWidth,
-                        })
-                      : sidebarWidth,
-                  }
-            }
           >
             {searchMasterDetail ? (
               // Col 2 master list: the Activity list on /inbox, the search
@@ -2035,147 +2536,154 @@ export default function MainLayout() {
               isInboxRoute ? (
                 <Suspense fallback={<PanelFallback />}><ThreadsInbox /></Suspense>
               ) : (
-                <MessageSearchPage />
+                <Suspense fallback={<PanelFallback />}><MessageSearchPage /></Suspense>
               )
             ) : (
               <Sidebar
                 mobileInline={mobileShowSidebarInline}
+                announcementSlot={sidebarAnnouncementSlot}
                 hideTitle={showTopBar}
               />
             )}
-            {/* Resize handle (desktop only). Search master/detail at lg+
-                resizes the search-specific width; at md (768-1023) it
-                resizes the chat-sidebar-shape width that's currently shown
-                (per (3c) responsive policy above). Non-search uses
-                sidebarWidth as before. Two persisted widths never bleed
-                across (slock:searchPanelWidth vs slock:sidebarWidth). */}
-              <div
-                className="hidden md:block absolute right-0 top-0 bottom-0 w-2 -mr-1 z-10 cursor-col-resize touch-none select-none"
-                onPointerDown={
-                  searchMasterDetail
-                    ? (isLg
-                        ? (searchColTwoCompact ? handleSearchPanelCompactResizeStart : handleSearchPanelResizeStart)
-                        : handleSearchPanelCompactResizeStart)
-                    : handleSidebarResizeStart
-                }
-                onPointerMove={
-                  searchMasterDetail
-                    ? (isLg
-                        ? (searchColTwoCompact ? handleSearchPanelCompactResizeMove : handleSearchPanelResizeMove)
-                        : handleSearchPanelCompactResizeMove)
-                    : handleSidebarResizeMove
-                }
-                onPointerUp={
-                  searchMasterDetail
-                    ? (isLg
-                        ? (searchColTwoCompact ? handleSearchPanelCompactResizeEnd : handleSearchPanelResizeEnd)
-                        : handleSearchPanelCompactResizeEnd)
-                    : handleSidebarResizeEnd
-                }
-                onPointerCancel={
-                  searchMasterDetail
-                    ? (isLg
-                        ? (searchColTwoCompact ? handleSearchPanelCompactResizeEnd : handleSearchPanelResizeEnd)
-                        : handleSearchPanelCompactResizeEnd)
-                    : handleSidebarResizeEnd
-                }
-              />
-          </div>
-        </AppShellSidebarSlot>}
-
-        {/* Main content — hidden on mobile root views (sidebar is the content),
-            visible on mobile detail views and always on desktop.
-            stdrc 2026-05-02 #proj-uiux:95e25b5b ec1523d9: bg-white on
-            desktop so the whole main column reads as bright white,
-            inverted with sidebar's warm cream. Mobile keeps the
-            inherited cream so sidebar↔main aren't visually separated
-            on small screens where they aren't side-by-side. */}
-        <AppShellMainSlot
-          overlay
-          className={`relative ${mobileShowSidebarInline ? "hidden" : "flex"}`}
+          </ShellSidebarColumn>
+        </AppShellSidebarSlot>
+      )}
+      // Main content — hidden on mobile root views (sidebar is the content),
+      // visible on mobile detail views and always on desktop.
+      mainHidden={mobileShowSidebarInline}
+      main={(
+        <div
+          ref={contentColumnRef}
+          className="thread-layout-container relative flex min-h-0 min-w-0 flex-1"
+          data-testid="thread-layout-container"
+          // The thread's Expand (#189 rule 5); a profile is a column like the others on a desktop, so it doesn't undo it.
+          data-thread-maximized={threadRow.maximized ? "true" : "false"}
+          // Workspace Artifacts (F41): the thread stepped behind its channel, see index.css.
+          data-thread-behind={threadRow.behind ? "true" : undefined}
         >
+          {/* Task v2: the side sections' heads, wherever they render in the row, move them among its columns (no DOM of its own). */}
+          <SideSectionDnd>
+          {/* overflow-clip, not overflow-hidden: a hidden box is still a
+              scroll container, so focusing anything that pokes past it
+              (scrollIntoView, an autofocused field) slid the whole page
+              sideways. A clipped box cannot scroll at all. */}
           <div
-            ref={contentColumnRef}
-            className="thread-layout-container flex min-h-0 min-w-0 flex-1"
-            data-testid="thread-layout-container"
-            data-thread-maximized={isThreadMaximized(threadMaximized, threadParentMessageIdForLayout, threadParentConversationId, currentConversationId, profileOpenForLayout) ? "true" : "false"}
+            className="thread-main-column flex min-h-0 min-w-0 flex-1 flex-col overflow-clip outline-none keyboard:focus-visible:outline-2 keyboard:focus-visible:outline-solid keyboard:focus-visible:-outline-offset-2 keyboard:focus-visible:outline-foreground"
+            data-testid="thread-main-column"
+            // The conversation a thread or detail column takes its width from (ColumnResizeHandle).
+            data-main-column=""
+            data-otter-dock="conversation"
           >
-            {/* overflow-clip, not overflow-hidden: a hidden box is still a
-                scroll container, so focusing anything that pokes past it
-                (scrollIntoView, an autofocused field) slid the whole page
-                sideways. A clipped box cannot scroll at all. */}
-            <div
-              className="thread-main-column flex min-h-0 min-w-0 flex-1 flex-col overflow-clip"
-              data-testid="thread-main-column"
-            >
-              <Routes location={backgroundLocation ?? location}>
-                <Route path="channel/:channelId" element={<ChannelRoute />} />
-                <Route path="dm/:dmId" element={<DmRoute />} />
-                <Route path="agent/:agentId" element={<AgentRoute />} />
-                <Route path="computer/:machineId" element={<MachineRoute />} />
-                {/* Legacy /machine/:id — kept so external links and bookmarks
-                    still work; redirected to /computer/:id by RailNavCompat. */}
-                <Route path="machine/:machineId" element={<MachineRoute />} />
-                <Route path="human/:userId" element={<HumanRoute />} />
-                <Route path="members/graph" element={<MemberGraphRoute />} />
-                <Route path="members" element={<EmptyRoute />} />
-                <Route path="computers" element={<ComputersRoute />} />
-                <Route path="search" element={<SearchContentRoute />} />
-                <Route path="raftbench" element={<Suspense fallback={<PanelFallback />}><RaftBenchPage /></Suspense>} />
-                <Route path="settings/:tab?/*" element={<SettingsRoute />} />
-                <Route path="activity" element={<InboxContentRoute />} />
-                {/* Legacy /inbox + /threads → /activity (stdrc renamed the route
-                    #proj-activity:171042a3 2026-06-23). Keep redirects so old
-                    links/bookmarks resolve. */}
-                <Route path="inbox" element={<LegacyThreadsRedirect />} />
-                <Route path="threads" element={<LegacyThreadsRedirect />} />
-                <Route path="tasks" element={<TasksRoute />} />
-                <Route path="saved" element={<SavedRoute />} />
-                <Route path="release-notes" element={<ReleaseNotesRoute />} />
-                {/* Legacy /workspace from the removed Workspace grid layout. */}
-                <Route path="workspace" element={<LegacyWorkspaceGridRedirect />} />
-                <Route path="*" element={<DefaultRoute />} />
-              </Routes>
-            </div>
-            <RightPanel />
+            <RowColumnSlotContext.Provider value={rowColumnSlot}>
+            <Routes location={backgroundLocation ?? location}>
+              <Route path="channel/:channelId" element={<ChannelRoute />} />
+              <Route path="channel/:channelId/search" element={<ConversationSearchRoute kind="channel" />} />
+              <Route path="dm/:dmId" element={<DmRoute />} />
+              <Route path="dm/:dmId/search" element={<ConversationSearchRoute kind="dm" />} />
+              <Route path="agent/:agentId" element={<AgentRoute />} />
+              <Route path="agent/:agentId/activity" element={<AgentActivityRoute />} />
+              <Route path="computer/:machineId" element={<MachineRoute />} />
+              {/* Legacy /machine/:id — kept so external links and bookmarks
+                  still work; redirected to /computer/:id by RailNavCompat. */}
+              <Route path="machine/:machineId" element={<MachineRoute />} />
+              <Route path="human/:userId" element={<HumanRoute />} />
+              {/* Retired member graph: old links and bundles land on Members. */}
+              <Route path="members/graph" element={<LegacyMemberGraphRedirect />} />
+              <Route path="migrations" element={<MigrationLogRoute />} />
+              <Route path="members" element={<MembersEmptyRoute />} />
+              <Route path="computers" element={<ComputersRoute />} />
+              <Route path="computers/this-device" element={<Suspense fallback={<PanelFallback />}><ThisDevicePanel /></Suspense>} />
+              <Route path="apps" element={<AppsRoute />} />
+              <Route path="more" element={<MoreRoute />} />
+              <Route path="search" element={<SearchContentRoute />} />
+              <Route path="raftbench" element={<Suspense fallback={<PanelFallback />}><RaftBenchPage /></Suspense>} />
+              <Route path="assistant" element={<Suspense fallback={<PanelFallback />}><AssistantRoute /></Suspense>} />
+              <Route path="settings/:tab?/*" element={<SettingsRoute />} />
+              <Route path="activity" element={<InboxContentRoute />} />
+              {/* Legacy /inbox + /threads → /activity (stdrc renamed the route
+                  #proj-activity:171042a3 2026-06-23). Keep redirects so old
+                  links/bookmarks resolve. */}
+              <Route path="inbox" element={<LegacyThreadsRedirect />} />
+              <Route path="threads" element={<LegacyThreadsRedirect />} />
+              <Route path="tasks" element={<TasksRoute />} />
+              <Route path="saved" element={<SavedRoute />} />
+              <Route path="drafts" element={<DraftsRoute />} />
+              <Route path="artifacts" element={<ArtifactsRoute />} />
+              <Route path="release-notes" element={<ReleaseNotesRoute />} />
+              <Route path="keyboard-shortcuts" element={<ShortcutHelpPage />} />
+              {/* Legacy /workspace from the removed Workspace grid layout. */}
+              <Route path="workspace" element={<LegacyWorkspaceGridRedirect />} />
+              <Route path="*" element={<DefaultRoute />} />
+            </Routes>
+            </RowColumnSlotContext.Provider>
+            {/* Workspace Artifacts: where one clicked outside a channel panel opens (the opening rule). */}
+            <ShellArtifactHost />
+            <AssistantOtterLayer pageOtter={assistantPageOtter && !mobileShowSidebarInline} />
           </div>
-
-        </AppShellMainSlot>
-      </div>
-
-      <MobileTabBar />
-      {currentServerId && serverSlug ? (
-        <ServerSetupProjectionGate
-          serverId={currentServerId}
-          serverSlug={serverSlug}
-        />
-      ) : null}
-      {showAddMachine && (
-        <AddMachineDialog onClose={closeAddMachine} />
+          {/* A page's own column right of the conversation, a column of the row (rowColumnSlot): the Tasks page's
+              task beside its list. `contents`: the column is the row's flex item, right after the conversation. */}
+          <div ref={setRowColumnSlot} className="contents" data-testid="row-column-slot" />
+          <RightPanel />
+          <ShortcutHelpColumn />
+          {/* Task v2's Tasks and Files columns, at the row's level beside the
+              thread when the row fits them (ChannelSideArea; task #165).
+              `contents`: each column is the row's flex item. */}
+          <div className="contents" data-testid="channel-side-slot"><ChannelSideArea /></div>
+          {/* Always the row's last child. Opening or closing a thread or a
+              profile adds and removes columns before it, so neither the
+              channel column nor the thread column ever turns into (or stops
+              being) the last child: WebKit restyles that column's whole
+              subtree when it does (~180ms for a long chat on an iPhone). */}
+          <div hidden data-slot="thread-layout-end" />
+          </SideSectionDnd>
+        </div>
       )}
-      {showCreateAgent && (
-        <CreateAgentDialog
-          onboarding={createAgentOnboarding}
-          onClose={closeCreateAgent}
-        />
+      after={(
+        <>
+          <MobileTabBar />
+          {currentServerId && serverSlug ? (
+            <ServerSetupProjectionGate
+              serverId={currentServerId}
+              serverSlug={serverSlug}
+            />
+          ) : null}
+          {showAddMachine && <AddMachineDialog onClose={closeAddMachine} />}
+          {showCreateAgent && (
+            <CreateAgentDialog
+              onboarding={createAgentOnboarding}
+              onClose={closeCreateAgent}
+            />
+          )}
+          <JointChannelLinkIntent />
+          <AgentContextViewPageSlot />
+          <UpgradeDialogHost />
+          <SeatJoinDialogHost />
+          <AnnouncementModal suppressed={shouldSuppressAnnouncements(announcementGateState, sawOnboardingThisSession) || landingHoldsAnnouncements} preferSidebar={isDesktop && !hideSidebar && !searchMasterDetail && !sidebarCollapsed} sidebarContainer={announcementHost} />
+          {/* Desktop ⌘K search overlay: floats the real /search over the frozen
+              background channel. Dismiss (Esc/backdrop) navigates back to it. A hit
+              selection navigates away on its own (clearing backgroundLocation). */}
+          {backgroundLocation ? (
+            <SearchOverlay onClose={closeSearchOverlay} contentColumnRef={showTopBar ? null : contentColumnRef} />
+          ) : null}
+        </>
       )}
-      <JointChannelLinkIntent />
-      <AnnouncementModal suppressed={shouldSuppressAnnouncements(announcementGateState, sawOnboardingThisSession)} />
-      {/* Desktop ⌘K search overlay: floats the real /search over the frozen
-          background channel. Dismiss (Esc/backdrop) navigates back to it. A hit
-          selection navigates away on its own (clearing backgroundLocation). */}
-      {backgroundLocation ? (
-        <SearchOverlay onClose={closeSearchOverlay} contentColumnRef={showTopBar ? null : contentColumnRef} />
-      ) : null}
-    </AppShellRoot>
+    />
   );
 }
 
 export const __testInternals = {
+  AgentActivityRoute, AgentRoute, ArtifactsRoute, HumanRoute,
+  DmRoute,
   ComputersRoute,
+  LegacyTaskSidePanelFallback,
+  ProfilePanelFallback,
   RightPanel,
   AgentById,
   DefaultRoute,
+  InboxContentRoute,
+  MachineRoute,
+  SearchContentRoute,
+  SettingsRoute,
   renderContentSlot,
   useRightPanelUrlSync,
   useSearchContentUrlSync,

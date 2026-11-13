@@ -8,7 +8,7 @@
 //
 // Security invariants encoded here:
 // - probe ids and client idempotency keys are branded; minting happens only in
-//   this file (see scripts/ci/check-branded-mint-sites.mjs).
+//   this file (see scripts/ci/check-branded-mint-sites.ts).
 // - every digest is a SHA-256 over canonical JSON, so intent / materialization
 //   / result form a tamper-evident chain without storing secrets.
 // - the closed category enum is complete: transport, carrier, authority and

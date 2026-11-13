@@ -1,7 +1,16 @@
 import { test } from "vitest";
 import assert from "node:assert/strict";
 import { RisingWaveOverloadedError, RisingWaveReadError } from "../db/risingwave";
-import { __resetStaleReadOverloadForTests, __setStaleReadStoreForTests, OVERLOAD_MAX_AGE_MS, readWithStaleOnOverload, SOFT_MAX_AGE_MS } from "./rwStaleRead";
+import type { NextFunction, Request, Response } from "express";
+import {
+  __resetStaleReadOverloadForTests,
+  __setStaleReadStoreForTests,
+  noteInboxWrite,
+  noteInboxWriteBeforeReply,
+  OVERLOAD_MAX_AGE_MS,
+  readWithStaleOnOverload,
+  SOFT_MAX_AGE_MS,
+} from "./rwStaleRead";
 
 function memoryStore() {
   const entries = new Map<string, string>();
@@ -340,6 +349,80 @@ test("RisingWave briefly unreachable (restart) serves the remembered body like a
       surface: "channels_unread_summary", userId: "u9", scope: "s1",
       load: async () => { throw unreachable; },
     }), (err: unknown) => err === unreachable);
+  } finally {
+    __setStaleReadStoreForTests(undefined);
+  }
+});
+
+test("a body read before the user's own latest inbox write is never served; other users still fall back", async () => {
+  __resetStaleReadOverloadForTests();
+  const overloaded = async () => { throw new RisingWaveOverloadedError(new Error("pool timeout")); };
+  const memory = storeWith("rw-stale:v2:inbox_first_page:u1:s", { beforeDone: true }, 10_000);
+  memory.entries.set("rw-stale:v2:inbox_first_page:u2:s", JSON.stringify({ writtenAtMs: Date.now() - 10_000, value: { other: true } }));
+  __setStaleReadStoreForTests(memory.store);
+  try {
+    // u1 marked something done 5 s ago, after their body was read.
+    await noteInboxWrite("u1", Date.now() - 5_000);
+    await assert.rejects(
+      readWithStaleOnOverload({ surface: "inbox_first_page", userId: "u1", scope: "s", load: overloaded }),
+      RisingWaveOverloadedError,
+    );
+    // rw_slow does not serve it either: the request waits for the read.
+    const slow = await readWithStaleOnOverload({
+      surface: "inbox_first_page", userId: "u1", scope: "s", softTimeoutMs: 20,
+      load: async () => { await sleep(80); return { fresh: true }; },
+    });
+    assert.deepEqual(pick(slow), { value: { fresh: true }, stale: false });
+    // Another user's fallback is untouched.
+    const other = await readWithStaleOnOverload({ surface: "inbox_first_page", userId: "u2", scope: "s", load: overloaded });
+    assert.deepEqual(pick(other), { value: { other: true }, stale: true });
+    // A body read after the write is served again.
+    await flush();
+    const after = await readWithStaleOnOverload({ surface: "inbox_first_page", userId: "u1", scope: "s", load: overloaded });
+    assert.deepEqual(pick(after), { value: { fresh: true }, stale: true });
+  } finally {
+    __setStaleReadStoreForTests(undefined);
+  }
+});
+
+test("a remembered body is stamped with when its read started, not when it finished", async () => {
+  __resetStaleReadOverloadForTests();
+  const memory = memoryStore();
+  __setStaleReadStoreForTests(memory.store);
+  try {
+    const before = Date.now();
+    await readWithStaleOnOverload({
+      surface: "channels_unread", userId: "u1", scope: "s",
+      load: async () => { await sleep(60); return { n: 1 }; },
+    });
+    await flush();
+    const stored = JSON.parse(memory.entries.get("rw-stale:v2:channels_unread:u1:s")!);
+    assert.ok(stored.writtenAtMs >= before && stored.writtenAtMs < before + 50, `stamped at ${stored.writtenAtMs - before} ms`);
+  } finally {
+    __setStaleReadStoreForTests(undefined);
+  }
+});
+
+test("an inbox write route notes the write before its successful reply, and not on an error reply", async () => {
+  const memory = memoryStore();
+  __setStaleReadStoreForTests(memory.store);
+  try {
+    const reply = (statusCode: number, userId: string) => {
+      let sent: unknown;
+      const res = { statusCode, json: (body: unknown) => { sent = body; return res; } };
+      noteInboxWriteBeforeReply({ userId } as unknown as Request, res as unknown as Response, (() => {}) as NextFunction);
+      (res as unknown as Response).json({ ok: true });
+      return () => sent;
+    };
+    const ok = reply(200, "u1");
+    await flush();
+    assert.deepEqual(ok(), { ok: true });
+    assert.ok(Number(memory.entries.get("rw-stale:inbox-write-at:u1")) > 0);
+
+    const failed = reply(404, "u2");
+    assert.deepEqual(failed(), { ok: true }, "an error reply is sent at once");
+    await flush();
+    assert.equal(memory.entries.has("rw-stale:inbox-write-at:u2"), false);
   } finally {
     __setStaleReadStoreForTests(undefined);
   }

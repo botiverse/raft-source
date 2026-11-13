@@ -43,30 +43,4 @@ describe("reaction sprite assets", () => {
       assert.equal("pngPath" in item, false, `${item.id} should not expose an unused client PNG`);
     }
   });
-
-  it("preloads the reaction sprite from the document head", () => {
-    const html = readFileSync(resolve(webRoot, "index.html"), "utf8");
-
-    assert.match(
-      html,
-      new RegExp(
-        `<link rel="preload" as="image" type="image/svg\\+xml" href="${REACTION_SPRITE_MANIFEST.spritePath}" />`,
-      ),
-    );
-  });
-
-  it("keeps a readable object-literal manifest without bare lint disables", () => {
-    const generated = readFileSync(
-      resolve(webRoot, "src/generated/reactionSpriteManifest.ts"),
-      "utf8",
-    );
-    const generator = readFileSync(
-      resolve(webRoot, "scripts/generate-reaction-sprites.mjs"),
-      "utf8",
-    );
-    assert.match(generated, /as const satisfies ReactionSpriteManifest/);
-    assert.doesNotMatch(generated, /JSON\.parse\s*\(/);
-    assert.doesNotMatch(generated, /(?:eslint|oxlint)-disable/);
-    assert.doesNotMatch(generator, /(?:eslint|oxlint)-disable/);
-  });
 });

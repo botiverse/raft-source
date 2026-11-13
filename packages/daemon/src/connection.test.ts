@@ -495,6 +495,48 @@ test("DaemonConnection logs Slock-Reason for rejected WebSocket handshakes", asy
   assert.equal(traceEvents.some((event) => event.name === "daemon.connection.reconnect_stopped"), false);
 });
 
+test("a 429 before the WebSocket opens backs the daemon off exponentially (the backoff is only reset by an open)", async () => {
+  const backoffs: number[] = [];
+  class RateLimitedWebSocket extends EventEmitter {
+    readyState: number = WebSocket.CONNECTING;
+    send() {}
+    close() { this.terminate(); }
+    terminate() {
+      if (this.readyState === WebSocket.CLOSED) return;
+      this.readyState = WebSocket.CLOSED;
+      this.emit("close", 1006, Buffer.from(""));
+    }
+  }
+  const conn = new DaemonConnection({
+    reconnectDelayFor: () => 1,
+    serverUrl: "http://localhost:9999",
+    apiKey: "sk_machine_rate_limited",
+    onMessage: () => {},
+    onConnect: () => {},
+    onDisconnect: () => {},
+    onTraceEvent: (name, attrs) => {
+      if (name === "daemon.connection.reconnect_scheduled") backoffs.push(Number(attrs?.backoff_ms));
+    },
+    minReconnectDelayMs: 1000,
+    wsFactory: () => {
+      const ws = new RateLimitedWebSocket();
+      setImmediate(() => {
+        ws.emit("unexpected-response", {}, {
+          statusCode: 429,
+          headers: { "retry-after": "30", "slock-reason": "connect_rate_limited" },
+          resume() {},
+        });
+      });
+      return ws as unknown as WebSocket;
+    },
+  });
+  conn.connect();
+  const deadline = Date.now() + 2_000;
+  while (backoffs.length < 6 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5));
+  conn.disconnect();
+  assert.deepEqual(backoffs.slice(0, 6), [1000, 2000, 4000, 8000, 16000, 30000], "each refused handshake doubles the wait up to the 30 s cap");
+});
+
 test("DaemonConnection stops retrying a migrated legacy key and prints setup recovery guidance", async () => {
   const logs: string[] = [];
   const traceEvents: Array<{ name: string; attrs?: Record<string, unknown>; status?: TraceStatus }> = [];
@@ -1443,6 +1485,110 @@ test("replays each agent's latest status and activity only after ready, in clien
   );
 });
 
+type ReplayFrame = { type: string; agentId?: string; launchId?: string; status?: string; detailKind?: string };
+const replayShape = (sent: string[]) => sent.map((payload) => JSON.parse(payload) as ReplayFrame)
+  .map((msg) => [msg.type, msg.agentId ?? null, msg.launchId ?? null, msg.status ?? msg.detailKind ?? null]);
+
+// A daemon-local restart and a per-turn continuation reuse the launch, so the
+// server's failed-start streak depends on whether ready(L) or a failure of L
+// came first: the replay must keep the order they were produced in.
+test("replays a ready frame sent while disconnected in causal order with the agent's failure frames", async () => {
+  const { conn, getWs } = makeConnection({});
+  conn.send({ type: "agent:status", agentId: "agent-1", status: "active", launchId: "launch-1", daemonInstanceId: "d-1", clientSeq: 1 });
+  conn.send({ type: "agent:runtime:ready", agentId: "agent-1", launchId: "launch-1" });
+  conn.send({ type: "agent:status", agentId: "agent-1", status: "inactive", launchId: "launch-1", daemonInstanceId: "d-1", clientSeq: 2 });
+  conn.send({ type: "agent:activity", agentId: "agent-1", activity: "offline", detail: "start failed", detailKind: "runtime_unavailable", launchId: "launch-1", clientSeq: 3 });
+  // Coalesced: only the latest ready of an agent is kept.
+  conn.send({ type: "agent:runtime:ready", agentId: "agent-2", launchId: "launch-2a" });
+  conn.send({ type: "agent:runtime:ready", agentId: "agent-2", launchId: "launch-2b" });
+
+  conn.connect();
+  await waitForOpen();
+  sendReady(conn);
+
+  assert.deepEqual(replayShape(getWs().sent), [
+    ["ready", null, null, null],
+    ["agent:runtime:ready", "agent-1", "launch-1", null],
+    ["agent:status", "agent-1", "launch-1", "inactive"],
+    ["agent:activity", "agent-1", "launch-1", "runtime_unavailable"],
+    ["agent:runtime:ready", "agent-2", "launch-2b", null],
+  ]);
+  conn.disconnect();
+});
+
+test("a failure followed by readiness while disconnected replays as failure, then ready", async () => {
+  const { conn, getWs } = makeConnection({});
+  conn.send({ type: "agent:status", agentId: "agent-1", status: "inactive", launchId: "launch-1", daemonInstanceId: "d-1", clientSeq: 1 });
+  conn.send({ type: "agent:activity", agentId: "agent-1", activity: "offline", detail: "start failed", detailKind: "runtime_unavailable", launchId: "launch-1", clientSeq: 2 });
+  conn.send({ type: "agent:status", agentId: "agent-1", status: "active", launchId: "launch-1", daemonInstanceId: "d-1", clientSeq: 3 });
+  conn.send({ type: "agent:runtime:ready", agentId: "agent-1", launchId: "launch-1" });
+
+  conn.connect();
+  await waitForOpen();
+  sendReady(conn);
+
+  assert.deepEqual(replayShape(getWs().sent), [
+    ["ready", null, null, null],
+    ["agent:activity", "agent-1", "launch-1", "runtime_unavailable"],
+    ["agent:status", "agent-1", "launch-1", "active"],
+    ["agent:runtime:ready", "agent-1", "launch-1", null],
+  ]);
+  conn.disconnect();
+});
+
+test("a ready frame sent after the socket opens but before the daemon's ready is held in order with status and activity", async () => {
+  const { conn, getWs } = makeConnection({});
+  conn.connect();
+  await waitForOpen();
+  conn.send({ type: "agent:status", agentId: "agent-1", status: "active", launchId: "launch-1", daemonInstanceId: "d-1", clientSeq: 1 });
+  conn.send({ type: "agent:runtime:ready", agentId: "agent-1", launchId: "launch-1" });
+  conn.send({ type: "agent:status", agentId: "agent-1", status: "inactive", launchId: "launch-1", daemonInstanceId: "d-1", clientSeq: 2 });
+  assert.deepEqual(getWs().sent, [], "nothing before the daemon's ready");
+
+  sendReady(conn);
+  assert.deepEqual(replayShape(getWs().sent), [
+    ["ready", null, null, null],
+    ["agent:runtime:ready", "agent-1", "launch-1", null],
+    ["agent:status", "agent-1", "launch-1", "inactive"],
+  ]);
+  conn.disconnect();
+});
+
+// #proj-raft-computer:#48 (reconciler step 4b): the server lifts a wake block
+// on `agent:credential:restored`, and the runtime error that set the block may
+// itself be held or replayed: the restore is held and replayed with them, in
+// the order produced, one per agent and reason.
+test("a credential restore sent while disconnected replays after the error it ends and before a later one, one per agent and reason", async () => {
+  const { conn, getWs } = makeConnection({});
+  const restoredShape = (sent: string[]) => sent.map((payload) => JSON.parse(payload) as { type: string; agentId?: string; reason?: string; releaseCause?: string; detailKind?: string })
+    .map((msg) => [msg.type, msg.agentId ?? null, msg.reason ?? msg.detailKind ?? null, msg.releaseCause ?? null]);
+  conn.send({ type: "agent:activity", agentId: "agent-1", activity: "error", detail: "not logged in", detailKind: "runtime_error", launchId: "launch-1", clientSeq: 1 });
+  conn.send({ type: "agent:credential:restored", agentId: "agent-1", reason: "user_reauth", releaseCause: "explicit_stop", launchId: "launch-1" });
+  conn.send({ type: "agent:credential:restored", agentId: "agent-1", reason: "user_reauth", releaseCause: "model_output", launchId: "launch-1" });
+  conn.send({ type: "agent:credential:restored", agentId: "agent-1", reason: "billing", releaseCause: "model_output", launchId: "launch-1" });
+  conn.send({ type: "agent:credential:restored", agentId: "agent-2", reason: "user_model_access", releaseCause: "credentials_changed" });
+
+  conn.connect();
+  await waitForOpen();
+  conn.send({ type: "agent:credential:restored", agentId: "agent-3", reason: "user_reauth", releaseCause: "credentials_changed" });
+  assert.deepEqual(getWs().sent, [], "nothing before the daemon's ready");
+  sendReady(conn);
+
+  assert.deepEqual(restoredShape(getWs().sent), [
+    ["ready", null, null, null],
+    ["agent:activity", "agent-1", "runtime_error", null],
+    ["agent:credential:restored", "agent-1", "user_reauth", "model_output"],
+    ["agent:credential:restored", "agent-1", "billing", "model_output"],
+    ["agent:credential:restored", "agent-2", "user_model_access", "credentials_changed"],
+    ["agent:credential:restored", "agent-3", "user_reauth", "credentials_changed"],
+  ]);
+
+  // After ready it goes straight out.
+  conn.send({ type: "agent:credential:restored", agentId: "agent-1", reason: "user_reauth", releaseCause: "explicit_stop" });
+  assert.deepEqual(restoredShape(getWs().sent).at(-1), ["agent:credential:restored", "agent-1", "user_reauth", "explicit_stop"]);
+  conn.disconnect();
+});
+
 test("holds status again on a new socket until that socket's ready (RFC 069 §8)", async () => {
   const { conn, getWs } = makeConnection({});
 
@@ -1675,6 +1821,77 @@ test("task #374: after being closed as the duplicate, later refusals keep the lo
     DaemonConnection.DUPLICATE_RECONNECT_DELAY_MS,
     DaemonConnection.DUPLICATE_RECONNECT_DELAY_MS,
   ]);
+});
+
+// A server that refuses a held duplicate during the handshake answers 409
+// (Slock-Reason duplicate_machine_connection_held); the socket never opens and
+// the daemon terminates it (close 1006). Steps are either an opened socket the
+// server closes, or a rejected handshake.
+type DuplicateStep = { close: [number, string] } | { reject: [number, string] };
+
+async function reconnectDelayAfterSteps(steps: DuplicateStep[]): Promise<{
+  delays: unknown[];
+  duplicateEvents: Array<Record<string, unknown> | undefined>;
+}> {
+  const traceEvents: Array<{ name: string; attrs?: Record<string, unknown> }> = [];
+  const clock = new FakeClock();
+  const { conn, getWs } = makeConnection({
+    onTraceEvent: (name, attrs) => traceEvents.push({ name, attrs }),
+    minReconnectDelayMs: 1000,
+    clock,
+    autoOpen: false,
+  });
+  conn.connect();
+  for (const step of steps) {
+    const ws = getWs();
+    if ("close" in step) {
+      ws.emit("open");
+      ws.close(step.close[0], step.close[1]);
+    } else {
+      ws.emit("unexpected-response", {}, {
+        statusCode: step.reject[0],
+        headers: { "slock-reason": step.reject[1] },
+        resume() {},
+      });
+    }
+    const scheduled = traceEvents.filter((event) => event.name === "daemon.connection.reconnect_scheduled").at(-1);
+    clock.advanceBy(Number(scheduled?.attrs?.delay_ms ?? 0));
+  }
+  conn.disconnect();
+  return {
+    delays: traceEvents.filter((event) => event.name === "daemon.connection.reconnect_scheduled").map((event) => event.attrs?.delay_ms),
+    duplicateEvents: traceEvents.filter((event) => event.name === "daemon.connection.duplicate_machine_close").map((event) => event.attrs),
+  };
+}
+
+test("task #374: a 409 held-duplicate handshake refusal keeps the five-minute delay after being closed as the duplicate", async () => {
+  const { delays, duplicateEvents } = await reconnectDelayAfterSteps([
+    { close: [4003, "duplicate_machine_connection"] },
+    { reject: [409, "duplicate_machine_connection_held"] },
+    { reject: [409, "duplicate_machine_connection_held"] },
+  ]);
+  assert.deepEqual(delays, [
+    DaemonConnection.DUPLICATE_RECONNECT_DELAY_MS,
+    DaemonConnection.DUPLICATE_RECONNECT_DELAY_MS,
+    DaemonConnection.DUPLICATE_RECONNECT_DELAY_MS,
+  ]);
+  assert.deepEqual(duplicateEvents.map((event) => event?.close_reason), ["closed_as_duplicate", "refused_held", "refused_held"]);
+});
+
+test("task #374: a 409 held refusal without a recent duplicate close keeps the normal backoff (a winner whose socket dropped)", async () => {
+  const { delays, duplicateEvents } = await reconnectDelayAfterSteps([{ reject: [409, "duplicate_machine_connection_held"] }]);
+  assert.deepEqual(delays, [1000]);
+  assert.deepEqual(duplicateEvents, [{ close_reason: "refused_held", long_delay: false }]);
+});
+
+test("task #374: other handshake rejections are not treated as duplicate refusals", async () => {
+  const { delays, duplicateEvents } = await reconnectDelayAfterSteps([
+    { close: [4003, "duplicate_machine_connection"] },
+    { reject: [409, "something_else"] },
+  ]);
+  assert.equal(delays.length, 2);
+  assert.notEqual(delays[1], DaemonConnection.DUPLICATE_RECONNECT_DELAY_MS, "an unrelated 409 keeps the normal backoff");
+  assert.deepEqual(duplicateEvents.map((event) => event?.close_reason), ["closed_as_duplicate"]);
 });
 
 test("task #374: other server close codes keep the normal backoff", async () => {

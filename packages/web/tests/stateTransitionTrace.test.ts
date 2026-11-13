@@ -1,7 +1,4 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
 import api from "../src/api/client";
 import { __setStateTransitionEmitterForTest, emitStateTransitionTrace } from "../src/utils/stateTransitionTrace";
 import {
@@ -13,21 +10,10 @@ import { useChannelStore } from "../src/store/channelStore";
 import type { ApiChannel } from "../src/store/channelStore";
 import { useTaskStore } from "../src/store/taskStore";
 import type { Task } from "../src/store/taskStore";
-import { createInboxDomain } from "../src/store/inboxDomain";
-import { inboxReadPatch } from "../src/store/transport/inboxTransport";
-import type { InboxItem } from "../src/store/inboxStore";
 import { triggerServerReset } from "../src/store/serverResetRegistry";
-
-const SRC = join(dirname(fileURLToPath(import.meta.url)), "..", "src");
-const read = (p: string) => readFileSync(join(SRC, p), "utf8");
-const compact = (source: string) => source.replace(/\s+/g, " ").trim();
-
-function assertSourceIncludes(source: string, snippet: string) {
-  assert.ok(
-    compact(source).includes(compact(snippet)),
-    `expected source to include:\n${snippet}`,
-  );
-}
+// Server reset loads announcements (the task store test below answers that GET once);
+// this used to come in through the inbox skeleton's imports.
+import "../src/store/announcementStore";
 
 function captureStateTransitions() {
   const records: Array<{ name: string; attrs: Record<string, unknown> }> = [];
@@ -110,26 +96,6 @@ function fullTask(overrides: Partial<Task> = {}): Task {
     createdByType: "user",
     createdAt: "2026-07-07T00:00:00.000Z",
     updatedAt: "2026-07-07T00:00:00.000Z",
-    ...overrides,
-  };
-}
-
-function inboxChannelItem(overrides: Partial<Extract<InboxItem, { kind: "channel" }>> = {}): Extract<InboxItem, { kind: "channel" }> {
-  return {
-    kind: "channel",
-    channelId: "channel-1",
-    channelName: "general",
-    channelType: "channel",
-    lastMessageId: "message-1",
-    firstUnreadMessageId: null,
-    firstMentionMessageId: null,
-    lastMessageAt: "2026-07-07T00:00:00.000Z",
-    lastMessagePreview: "hello",
-    lastMessageSenderType: "user",
-    lastMessageSenderId: "user-1",
-    lastMessageSenderName: "User",
-    unreadCount: 0,
-    hasMention: false,
     ...overrides,
   };
 }
@@ -694,118 +660,4 @@ test("task store non-trace loading and create paths stay pinned for mutation gat
     "Failed to load tasks:",
     "Failed to load server tasks:",
   ]);
-});
-
-test("inbox transition traces expose closed detail and persist-failure conflict metadata", async () => {
-  const records = captureStateTransitions();
-  const domain = createInboxDomain();
-
-  domain.store.dispatch({
-    kind: "hydrate",
-    filter: "all",
-    reset: true,
-    items: [inboxChannelItem()],
-    hasMore: false,
-    totalCount: null,
-    totalUnreadCount: null,
-  });
-  domain.store.dispatch({
-    kind: "patch",
-    patch: "item-upsert",
-    item: inboxChannelItem({
-      lastMessageId: "message-2",
-      firstUnreadMessageId: "message-2",
-      unreadCount: 2,
-      lastMessageAt: "2026-07-07T00:02:00.000Z",
-    }),
-    marker: "message-2",
-  });
-
-  vi.spyOn(api, "post").mockImplementation(async () => {
-    throw new Error("persist failed");
-  });
-  inboxReadPatch("channel:channel-1", "channel-1");
-  await Promise.resolve();
-  await Promise.resolve();
-
-  __setStateTransitionEmitterForTest(null);
-  assert.deepEqual(records.map((record) => record.attrs), [
-    {
-      key: {
-        domain: "inbox",
-        event: "hydrate",
-        outcome: "applied",
-        entityId: "inbox",
-      },
-      meta: {
-        outcomeDetail: "unread_stable",
-        touched: 1,
-        reconcileSuggested: false,
-      },
-    },
-    {
-      key: {
-        domain: "inbox",
-        event: "patch:item-upsert",
-        outcome: "applied",
-        entityId: "inbox",
-      },
-      meta: {
-        outcomeDetail: "unread_changed",
-        touched: 1,
-        reconcileSuggested: false,
-      },
-    },
-    {
-      key: {
-        domain: "inbox",
-        event: "persist:item-read-failed",
-        outcome: "conflict",
-        entityId: "channel:channel-1",
-      },
-      meta: {
-        outcomeDetail: "persist_failed",
-        touched: 0,
-        reconcileSuggested: true,
-      },
-    },
-  ]);
-});
-
-test("state transition emission uses the shared helper instead of ad-hoc flat attrs", () => {
-  const sources = [
-    read("store/channelStore.ts"),
-    read("store/taskStore.ts"),
-    read("store/inboxDomain.ts"),
-    read("store/machineStore.ts"),
-    read("store/agentStore.ts"),
-    read("store/transport/inboxTransport.ts"),
-  ].join("\n");
-
-  assert.match(sources, /emitStateTransitionTrace\(/, "stores must emit through the RFC 040 helper");
-  assert.doesNotMatch(sources, /emitWebEvent\(\"slock\.state\.transition\"/, "state transition attrs must not bypass key/meta schema");
-});
-
-test("state transition source contract keeps low-cardinality event labels visible", () => {
-  const taskStore = read("store/taskStore.ts");
-  const inboxDomain = read("store/inboxDomain.ts");
-  const inboxTransport = read("store/transport/inboxTransport.ts");
-
-  const labels = [
-    "hydrate:channel",
-    "hydrate:server",
-    "claimed",
-    "unclaimed",
-    "deleted",
-    "converted",
-    "removed",
-    "unread_stable",
-    "unread_changed",
-    "persist:item-read-failed",
-    "persist_failed",
-  ];
-  const sources = `${taskStore}\n${inboxDomain}\n${inboxTransport}`;
-  for (const label of labels) {
-    assertSourceIncludes(sources, label);
-  }
 });

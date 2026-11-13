@@ -1,37 +1,35 @@
-import { isElectronDesktopShell } from "./desktopShell";
+import { getSocket } from "../api/socket";
+import { runTestNotification } from "../notifications/notificationApi";
+import type { TestNotificationOutcome } from "../notifications/notificationApi";
+import { getDesktopBridge } from "./desktopBridge";
 
-// Raft Desktop notifications go through the renderer's Notification API, which
-// Electron maps to OS notifications (see DesktopNativeBridge).
+// Raft Desktop notifications are posted by the shell's main process
+// (raftDesktop.notifications.show): the web decides what to show
+// (notifications/desktopNative), main owns the OS notification, its grouping
+// and its click.
 //
-// What the app can and cannot know here, honestly: the desktop main process
-// grants the Chromium `notifications` permission outright, so
-// `Notification.permission` is always "granted" in the shell and says NOTHING
-// about the macOS authorization switch (System Settings → Notifications → Raft
-// Desktop). Electron exposes no API for that switch. The only truthful check is
-// to post a notification and let the user see whether it appears — the first
-// one also triggers macOS's own permission prompt. Settings therefore offers a
-// test notification plus guidance, not a fabricated enabled/blocked status.
-type DesktopBridge = { focusWindow?: () => void };
-
-function desktopBridge(): DesktopBridge | undefined {
-  return (window as { raftDesktop?: DesktopBridge }).raftDesktop;
-}
+// The shell exposes no API for the OS authorization switch (System Settings →
+// Notifications → Raft Desktop), and the Chromium `Notification.permission`
+// in the shell says nothing about it. The test notification is therefore a
+// real one: the server sends it through `notification:desktop` to this
+// socket, the consumer posts it and acks the shell's show result
+// (docs/contracts/notifications.md §6).
 
 export function isDesktopNativeNotificationsAvailable(): boolean {
-  return typeof window !== "undefined" && isElectronDesktopShell() && typeof Notification !== "undefined";
+  return typeof window !== "undefined" && typeof getDesktopBridge()?.notifications?.show === "function";
 }
 
-// Posts a notification that behaves exactly like a real one (click focuses the
-// window). Returns false only if the API is missing or throws — it cannot tell
-// whether the OS actually displayed it.
-export function showDesktopTestNotification(input: { title: string; body: string }): boolean {
-  if (!isDesktopNativeNotificationsAvailable()) return false;
-  try {
-    const notification = new Notification(input.title, { body: input.body });
-    notification.onclick = () => desktopBridge()?.focusWindow?.();
-    return true;
-  } catch (err) {
-    console.warn("[DesktopNotifications] Test notification failed:", err);
-    return false;
-  }
+/**
+ * Sends a test notification to this desktop's socket and waits for the
+ * outcome: shown / sent but not shown / failed. `no_socket` when this page has
+ * no connected socket to receive it.
+ */
+export async function runDesktopTestNotification(deps: {
+  run?: typeof runTestNotification;
+  socket?: () => { connected: boolean; id?: string | undefined };
+} = {}): Promise<TestNotificationOutcome> {
+  const socket = (deps.socket ?? getSocket)();
+  const socketId = socket.connected ? socket.id : undefined;
+  if (!socketId) return { state: "failed", reason: "no_socket" };
+  return (deps.run ?? runTestNotification)({ kind: "desktop", socketId });
 }

@@ -3,7 +3,7 @@ import { useCallback, useMemo } from "react";
 import { useIntl } from "react-intl";
 import type { PendingMentionAction } from "../../store/messageStore";
 import { Button, Card, Separator } from "@botiverse/raft-ui";
-import { PendingMentionActionStripRow, pendingMentionCanAdd } from "./PendingMentionActionStripRow";
+import { LOUNGE_AGENT_EXCLUDED_REASON, PendingMentionActionStripRow, pendingMentionCanAdd } from "./PendingMentionActionStripRow";
 
 export type PendingMentionActionLocalState = "notified" | "added";
 
@@ -36,6 +36,7 @@ export function PendingMentionActionStrip({
   const addableResolutionIds = useMemo(() => actions
     .filter((action) => (
       pendingMentionCanAdd(action)
+      && action.reason !== LOUNGE_AGENT_EXCLUDED_REASON
       && !actionState[action.resolutionId]
       && !actionRemoving[action.resolutionId]
     ))
@@ -49,7 +50,7 @@ export function PendingMentionActionStrip({
 
   return (
     <Card
-      className="mb-2 w-full px-3 py-2.5"
+      className="@container mb-2 w-full px-3 py-2.5"
       data-testid="pending-mention-action-strip"
     >
       <div className="flex flex-col gap-2" data-testid="pending-mention-action-rows">
@@ -76,7 +77,7 @@ export function PendingMentionActionStrip({
           <Button
             type="button"
             variant="outline"
-            size="sm"
+            size="md"
             disabled={isAddingAll}
             onClick={handleAddAllActions}
           >

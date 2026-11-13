@@ -15,6 +15,10 @@ const expectedExports = {
     types: "./announcement-audience.ts",
     default: "./announcement-audience.ts",
   },
+  "./announcement-priority": {
+    types: "./src/announcementPriority.ts",
+    default: "./src/announcementPriority.ts",
+  },
   "./announcement-presentation": {
     types: "./announcement-presentation.ts",
     default: "./announcement-presentation.ts",
@@ -46,6 +50,57 @@ const expectedExports = {
   "./src/agentApiClient": {
     types: "./src/agentApiClient.ts",
     default: "./src/agentApiClient.ts",
+  },
+  "./src/selfExec": {
+    types: "./src/selfExec.ts",
+    default: "./src/selfExec.ts",
+  },
+  // The SDK's ./app subpath reads ServerId without loading the root (and its agent chunk).
+  "./src/brandedIds": {
+    types: "./src/brandedIds.ts",
+    default: "./src/brandedIds.ts",
+  },
+  "./src/displayLocales": {
+    types: "./src/displayLocales.ts",
+    default: "./src/displayLocales.ts",
+  },
+  // The web's Settings search reads its index without loading the root.
+  "./src/settingsSearch": {
+    types: "./src/settingsSearch.ts",
+    default: "./src/settingsSearch.ts",
+  },
+  // Raft Desktop's main process applies the Raft home rule without loading the root.
+  "./src/agentOps/raftHome": {
+    types: "./src/agentOps/raftHome.ts",
+    default: "./src/agentOps/raftHome.ts",
+  },
+  // Raft Desktop's main process validates outside routes without loading the root.
+  "./src/desktopRoutes": {
+    types: "./src/desktopRoutes.ts",
+    default: "./src/desktopRoutes.ts",
+  },
+  // Raft Desktop's main process checks notification routes and window attention without loading the root.
+  "./src/desktopNotifications": {
+    types: "./src/desktopNotifications.ts",
+    default: "./src/desktopNotifications.ts",
+  },
+  // Raft Desktop's main process checks external-link schemes without loading the root.
+  "./src/externalLinkSchemes": {
+    types: "./src/externalLinkSchemes.ts",
+    default: "./src/externalLinkSchemes.ts",
+  },
+  "./src/sameSite": {
+    types: "./src/sameSite.ts",
+    default: "./src/sameSite.ts",
+  },
+  // Raft Desktop's main process refuses Raft's own hosts in the web preview view without loading the root.
+  "./src/raftPermalinks": {
+    types: "./src/raftPermalinks.ts",
+    default: "./src/raftPermalinks.ts",
+  },
+  "./src/feedbackSubmit": {
+    types: "./src/feedbackSubmit.ts",
+    default: "./src/feedbackSubmit.ts",
   },
   "./src/agentApiContract": {
     types: "./src/agentApiContract.ts",
@@ -87,6 +142,10 @@ const expectedExports = {
     types: "./src/agentOps/index.ts",
     default: "./src/agentOps/index.ts",
   },
+  "./src/integrations/index": {
+    types: "./src/integrations/index.ts",
+    default: "./src/integrations/index.ts",
+  },
   "./src/agentOps/seenPolicy/index": {
     types: "./src/agentOps/seenPolicy/index.ts",
     default: "./src/agentOps/seenPolicy/index.ts",
@@ -95,13 +154,52 @@ const expectedExports = {
     types: "./src/agentText/index.ts",
     default: "./src/agentText/index.ts",
   },
+  "./src/agentText/continuations": {
+    types: "./src/agentText/continuations.ts",
+    default: "./src/agentText/continuations.ts",
+  },
+  "./src/continuations/index": {
+    types: "./src/continuations/index.ts",
+    default: "./src/continuations/index.ts",
+  },
+  "./src/continuations/store.testkit": {
+    types: "./src/continuations/store.testkit.ts",
+    default: "./src/continuations/store.testkit.ts",
+  },
   "./src/generated/agentApiRoutes": {
     types: "./src/generated/agentApiRoutes.ts",
     default: "./src/generated/agentApiRoutes.ts",
   },
+  "./src/appObjectKey": {
+    types: "./src/appObjectKey.ts",
+    default: "./src/appObjectKey.ts",
+  },
+  "./src/artifactContentTicket": {
+    types: "./src/artifactContentTicket.ts",
+    default: "./src/artifactContentTicket.ts",
+  },
+  // The content Worker reads a file's kind and its page's path without loading the root.
+  "./src/artifactFiles": {
+    types: "./src/artifactFiles.ts",
+    default: "./src/artifactFiles.ts",
+  },
+  // The content Worker's Markdown page and config read their colours without loading the root.
+  "./src/artifactPageTheme": {
+    types: "./src/artifactPageTheme.ts",
+    default: "./src/artifactPageTheme.ts",
+  },
+  // And what the page's calls run under, for the same three sides.
+  "./src/artifactCheckContract": {
+    types: "./src/artifactCheckContract.ts",
+    default: "./src/artifactCheckContract.ts",
+  },
   "./src/appConfigTransport": {
     types: "./src/appConfigTransport.ts",
     default: "./src/appConfigTransport.ts",
+  },
+  "./src/appLinkPreview": {
+    types: "./src/appLinkPreview.ts",
+    default: "./src/appLinkPreview.ts",
   },
   "./src/appRuntimeTrace": {
     types: "./src/appRuntimeTrace.ts",
@@ -127,17 +225,29 @@ const expectedExports = {
     types: "./src/tracing/eventRows.ts",
     default: "./src/tracing/eventRows.ts",
   },
-  "./unread-activity-diagnostic": {
-    types: "./src/unreadActivityDiagnostic.ts",
-    default: "./src/unreadActivityDiagnostic.ts",
-  },
   "./src/clock": {
     types: "./src/clock.ts",
     default: "./src/clock.ts",
   },
-  "./src/unreadActivityDiagnostic": {
-    types: "./src/unreadActivityDiagnostic.ts",
-    default: "./src/unreadActivityDiagnostic.ts",
+  "./src/noProxy": {
+    types: "./src/noProxy.ts",
+    default: "./src/noProxy.ts",
+  },
+  "./src/traceUploadUrl": {
+    types: "./src/traceUploadUrl.ts",
+    default: "./src/traceUploadUrl.ts",
+  },
+  "./src/pixelAvatarGenerator": {
+    types: "./src/pixelAvatarGenerator.ts",
+    default: "./src/pixelAvatarGenerator.ts",
+  },
+  "./src/humanAvatar": {
+    types: "./src/humanAvatar.ts",
+    default: "./src/humanAvatar.ts",
+  },
+  "./src/humanAvatarArt": {
+    types: "./src/humanAvatarArt.ts",
+    default: "./src/humanAvatarArt.ts",
   },
   "./src/generated/openapi": {
     types: "./src/generated/openapi.ts",
@@ -147,6 +257,11 @@ const expectedExports = {
     "./src/testVectors/messageRepliesDiscussionGraph.vectors.json",
   "./src/testVectors/threadRepliesReadModel.vectors.json":
     "./src/testVectors/threadRepliesReadModel.vectors.json",
+  "./src/testVectors/appObjectKeys.vectors.json":
+    "./src/testVectors/appObjectKeys.vectors.json",
+  "./assets/pixelAvatars.json": "./assets/pixelAvatars.json",
+  "./assets/humanAvatarLayers.json": "./assets/humanAvatarLayers.json",
+  "./src/settingsSearch.v1.json": "./src/settingsSearch.v1.json",
   "./package.json": "./package.json",
 } as const;
 
@@ -273,6 +388,13 @@ test("public exports preserve every tracked raft-shared consumer", (context) => 
       () => resolvedTarget(value),
       `${key} must target a real file`,
     );
+  }
+});
+
+test("continuations, their runtime and their agent text, stay off the package root", async () => {
+  const root = await import("./index");
+  for (const name of ["formatContinuationPaused", "formatContinuationRefusal", "formatContinuationSpan", "parseContinuationId", "CONTINUATION_FORMAT_VERSION"]) {
+    assert.equal(name in root, false, `${name} is exported from the package root`);
   }
 });
 

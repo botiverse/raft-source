@@ -32,17 +32,14 @@ test("workspace-install server grants backfill authority without copying credent
   assert.doesNotMatch(sql, /encrypted_material|access_token|credential_revision/u);
 });
 
-test.skipIf(inSourceSnapshot)("the migration tag is present in the journal and both deploy allowlists", async () => {
+// The deploy runs every migration the journal lists (scripts/deploy/
+// aws-run-server-migrations.sh reads drizzle/meta/_journal.json); the deploy
+// workflows no longer carry a tag list, so the journal entry is the contract.
+test.skipIf(inSourceSnapshot)("the migration tag is present in the journal, which the deploy runs", async () => {
   const tag = "0288_external_install_server_grants";
-  const [journal, staging, production] = await Promise.all([
-    readFile(new URL("drizzle/meta/_journal.json", serverRoot), "utf8"),
-    readFile(new URL(".github/workflows/deploy-aws-staging.yml", repositoryRoot), "utf8"),
-    readFile(new URL(".github/workflows/deploy-aws-prod.yml", repositoryRoot), "utf8"),
-  ]);
+  const journal = await readFile(new URL("drizzle/meta/_journal.json", serverRoot), "utf8");
   assert.equal(
     JSON.parse(journal).entries.filter((entry: { tag?: unknown }) => entry.tag === tag).length,
     1,
   );
-  assert.equal(staging.split(tag).length - 1, 1);
-  assert.equal(production.split(tag).length - 1, 1);
 });

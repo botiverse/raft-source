@@ -98,20 +98,57 @@
       "declaredAt": "2026-07-17"
     },
     {
-      "caseId": "screens.auth.login.signing",
-      "area": "GitHub social button color (black vs white)",
-      "direction": "react-adopts-later",
-      "note": "Android renders Continue with GitHub as a black button; react's SocialProviderButton is bg-white for every provider. artin ruled the android black button is correct ('github 按钮不需要换，我觉得我们的对的', #wg-nightly-visual-fix 2026-07-17, re mobile#962). Do NOT change android; whether react adopts black is a web-lane decision.",
-      "declaredBy": "artin",
-      "declaredAt": "2026-07-17"
-    },
-    {
       "caseId": "components.thread.message-row.md-link-ref",
       "area": "channel/mention refs inside Markdown link labels",
       "direction": "platform-difference",
       "note": "Web renders channel/mention refs inside a Markdown link label as chips (splitting the link visually); Android's Raft dialect keeps the whole label inside one external link. artin ruled 2026-07-25 (#proj-visual-testing:58e605e1) that Web stays as-is — do not re-report this case's label-chip delta as a bug. Task refs in labels already match (both keep the link).",
       "declaredBy": "artin",
       "declaredAt": "2026-07-25"
+    },
+    {
+      "caseId": "components.thread.message-row.md-wrap-clarify",
+      "area": "CJK full-width punctuation width and line wrap",
+      "direction": "platform-difference",
+      "appliesTo": "baselineOnly",
+      "note": "Chrome trims full-width CJK punctuation (text-spacing-trim: normal); Compose renders each full-width punctuation at a full em, so lines wrap differently. Accepted by artin 2026-11-05.",
+      "declaredBy": "artin",
+      "declaredAt": "2026-11-05"
+    },
+    {
+      "caseId": "components.thread.message-row.md-wrap-status606",
+      "area": "CJK full-width punctuation width and line wrap",
+      "direction": "platform-difference",
+      "appliesTo": "baselineOnly",
+      "note": "Chrome trims full-width CJK punctuation (text-spacing-trim: normal); Compose renders each full-width punctuation at a full em, so lines wrap differently. Accepted by artin 2026-11-05.",
+      "declaredBy": "artin",
+      "declaredAt": "2026-11-05"
+    },
+    {
+      "caseId": "components.thread.message-row.md-wrap-task607",
+      "area": "CJK full-width punctuation width and line wrap",
+      "direction": "platform-difference",
+      "appliesTo": "baselineOnly",
+      "note": "Chrome trims full-width CJK punctuation (text-spacing-trim: normal); Compose renders each full-width punctuation at a full em, so lines wrap differently. Accepted by artin 2026-11-05.",
+      "declaredBy": "artin",
+      "declaredAt": "2026-11-05"
+    },
+    {
+      "caseId": "components.thread.message-row.md-latest-release",
+      "area": "CJK full-width punctuation width and line wrap",
+      "direction": "platform-difference",
+      "appliesTo": "baselineOnly",
+      "note": "Chrome trims full-width CJK punctuation (text-spacing-trim: normal); Compose renders each full-width punctuation at a full em, so lines wrap differently. Accepted by artin 2026-11-05.",
+      "declaredBy": "artin",
+      "declaredAt": "2026-11-05"
+    },
+    {
+      "caseId": "components.thread.message-row.md-wrap-adjacent",
+      "area": "CJK full-width punctuation width and line wrap",
+      "direction": "platform-difference",
+      "appliesTo": "baselineOnly",
+      "note": "Chrome trims full-width CJK punctuation (text-spacing-trim: normal); Compose renders each full-width punctuation at a full em, so lines wrap differently. Accepted by artin 2026-11-05.",
+      "declaredBy": "artin",
+      "declaredAt": "2026-11-05"
     }
   ]
 }

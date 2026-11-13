@@ -204,6 +204,23 @@ test("invalid raster leaves the prior artifact and projection revision unchanged
   assert.equal(artifacts[0]!.state, "active");
 });
 
+test("additional pair authority is rechecked after avatar upload and stale bytes are removed", async () => {
+  const state = await externalFixture();
+  const locator = "https://avatars.slack-edge.com/synthetic-pair-avatar.png";
+  const provider = source({ [locator]: await raster({ r: 22, g: 33, b: 44 }) });
+  let checks = 0;
+  const result = await materializeExternalProjectionAvatar({ db: state.db, storage: state.storage, source: provider.adapter,
+    projectionId: state.projection.id, expectedProjectionRevision: 1, sourceLocator: locator,
+    publicOrigin: "https://api.raft.test", now: () => NOW, async lockAdditionalAuthority() { checks++; return checks === 1; } });
+  assert.equal(result.kind, "authority_stale");
+  assert.equal(checks, 2);
+  const [actor] = await state.db.select().from(externalActorProjections).where(eq(externalActorProjections.id, state.projection.id));
+  assert.equal(actor.avatarArtifactId, null);
+  assert.equal(state.storage.objects.size, 0);
+  const artifacts = await state.db.select().from(externalProjectionAvatarArtifacts);
+  assert.ok(artifacts.every(artifact => artifact.state === "revoked"));
+});
+
 test.each(["revision", "observation"])("projection %s drift during fetch creates no artifact or storage residue", async (drift) => {
   const state = await externalFixture();
   const image = await raster({ r: 44, g: 55, b: 66 });

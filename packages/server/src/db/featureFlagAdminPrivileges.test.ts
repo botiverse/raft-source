@@ -78,6 +78,10 @@ function oracle(options: {
         "server_lab_access",
         "lab_definitions",
         "agents",
+        "official_app_registry",
+        "oauth_clients",
+        "integration_audit_events",
+        "link_card_operations",
       ]);
       assert.deepEqual(values[2], [
         "SELECT",
@@ -125,6 +129,7 @@ function oracle(options: {
       assert.equal(values[0], FEATURE_FLAG_ADMIN_OPERATOR_ROLE);
       assert.match(text, /has_schema_privilege\(\$1, checks\.object, checks\.privilege\)/);
       assert.match(text, /has_table_privilege\(\$1, checks\.object, checks\.privilege\)/);
+      assert.match(text, /has_function_privilege\(\$1, checks\.object, checks\.privilege\)/);
       assert.match(text, /has_column_privilege\(\$1, checks\.object, checks\.column_name, checks\.privilege\)/);
       const kinds = values[1] as string[];
       const objects = values[2] as string[];
@@ -149,6 +154,11 @@ function oracle(options: {
       : `${String(values[1])}:${String(values[2])}`;
     return { rows: [{ allowed: answer(key) }] };
   };
+}
+
+// Function signatures carry ( ) [ ], which RegExp would read as syntax.
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 test("privilege verifier accepts only the complete operator route matrix", async () => {
@@ -280,7 +290,7 @@ for (const entry of REQUIRED_FEATURE_FLAG_ADMIN_PRIVILEGES) {
   test(`privilege verifier rejects missing ${key}`, async () => {
     await assert.rejects(
       verifyFeatureFlagAdminPrivileges(oracle({ missing: key })),
-      new RegExp(`missing:${key}`),
+      new RegExp(`missing:${escapeRegExp(key)}`),
     );
   });
 }
@@ -311,7 +321,7 @@ for (const entry of FORBIDDEN_FEATURE_FLAG_ADMIN_PRIVILEGES) {
   test(`privilege verifier rejects unexpected ${key}`, async () => {
     await assert.rejects(
       verifyFeatureFlagAdminPrivileges(oracle({ unexpected: key })),
-      new RegExp(`unexpected:${key}`),
+      new RegExp(`unexpected:${escapeRegExp(key)}`),
     );
   });
 }

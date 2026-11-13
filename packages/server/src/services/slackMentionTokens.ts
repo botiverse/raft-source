@@ -100,13 +100,12 @@ export function slackAgentHandleCandidates(input: {
   return slackPrincipalHandleCandidates(input.name, input.serverSlug, input.agentId);
 }
 
-/** Same handle rules as Agents: bare Raft name, then server slug, then id prefix. */
+/** Workspace-wide human candidates do not vary with reservation provenance. */
 export function slackHumanHandleCandidates(input: {
   name: string;
-  serverSlug: string;
   userId: string;
 }): string[] {
-  return slackPrincipalHandleCandidates(input.name, input.serverSlug, input.userId);
+  return slackPrincipalHandleCandidates(input.name, "raft", input.userId);
 }
 
 /**

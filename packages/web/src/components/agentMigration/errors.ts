@@ -161,9 +161,26 @@ function wireString(rawMessage: string | null | undefined, key: string): string 
   return match?.[1] ?? null;
 }
 
+function formatBinaryUnit(bytes: number, unitBytes: number, unit: string): string {
+  const value = bytes / unitBytes;
+  return `${Number.isInteger(value) ? value.toFixed(0) : value.toFixed(1)} ${unit}`;
+}
+
 function formatGib(bytes: number): string {
-  const value = bytes / GIB;
-  return `${Number.isInteger(value) ? value.toFixed(0) : value.toFixed(1)} GiB`;
+  return formatBinaryUnit(bytes, GIB, "GiB");
+}
+
+/**
+ * A workspace size in the binary units the size-limit copy uses ("10 GiB"),
+ * so sizes on the migration card read in the same unit as its limit: GiB from
+ * 1 GiB (exactly as formatGib), MiB or KiB below, so a trimmed workspace never
+ * reads as "0.0 GiB".
+ */
+export function formatMigrationSize(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes < 1024) return `${Math.max(0, Math.round(Number.isFinite(bytes) ? bytes : 0))} B`;
+  if (bytes < 1024 ** 2) return formatBinaryUnit(bytes, 1024, "KiB");
+  if (bytes < GIB) return formatBinaryUnit(bytes, 1024 ** 2, "MiB");
+  return formatGib(bytes);
 }
 
 function hasControlCharacters(value: string): boolean {
@@ -341,7 +358,6 @@ function insufficientDiskMessage(fm: Format, rawMessage: string | null | undefin
 // because some codes use builders below; exhaustiveness is checked over all
 // tables after MIGRATION_INPUT_BUILDERS.
 const MIGRATION_ERROR_IDS = {
-  agent_migration_ui_disabled: "migration.error.uiDisabled",
   not_supported: "migration.error.notSupported",
   AGENT_NOT_FOUND: "migration.error.agentNotFound",
   TARGET_COMPUTER_REQUIRED: "migration.error.targetRequired",
@@ -362,6 +378,11 @@ const MIGRATION_ERROR_IDS = {
   MIGRATION_TRANSPORT_PROVISION_FAILED: "migration.error.transportProvisionFailed",
   MIGRATION_WORKSPACE_ALREADY_EXISTS: "migration.error.workspaceAlreadyExists",
   MIGRATION_WORKSPACE_COMPLETE_OLD_COPY: "migration.error.workspaceCompleteOldCopy",
+  MIGRATION_OBJECT_STORE_UNREACHABLE: "migration.error.objectStoreUnreachable",
+  MIGRATION_COMPUTER_OWNER_DELETED: "migration.error.computerOwnerDeleted",
+  MIGRATION_TARGET_COMPUTER_DETACHED: "migration.error.targetComputerDetached",
+  MIGRATION_TRANSFER_SUMMARY_INVALID: "migration.error.transferSummaryInvalid",
+  MIGRATION_USER_IGNORE_WRITE_FAILED: "migration.error.userIgnoreWriteFailed",
   // Transient transfer faults: the user can only retry, so they share one line.
   MIGRATION_CHUNK_DIGEST_MISMATCH: "migration.error.failedGeneric",
   MIGRATION_WHOLE_BUNDLE_DIGEST_MISMATCH: "migration.error.failedGeneric",

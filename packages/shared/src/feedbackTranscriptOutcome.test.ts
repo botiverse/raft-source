@@ -81,3 +81,26 @@ test("the result-frame reader never throws: typed / untyped / invalid", async ()
     }
   }
 });
+
+test("the session-record answer: stored → attached; any other typed upload → not_attached; untyped → null", async () => {
+  const { feedbackSessionRecordAnswer, isFeedbackSessionRecordAnswer, FEEDBACK_SESSION_RECORD_ANSWERS } = await import("./index");
+  assert.deepEqual([...FEEDBACK_SESSION_RECORD_ANSWERS], ["attached", "not_attached"]);
+  const typed = (upload: Record<string, unknown>) => ({ outcomeVersion: 1 as const, upload: { ...UPLOAD, ...upload } as any });
+
+  assert.equal(feedbackSessionRecordAnswer(typed({ status: "stored", reason: null, uploadId: "upload-1", contentLabel: "signed" })), "attached");
+  // Not attached, whatever the reason: the reason is not something the Computer verified for the reporter.
+  assert.equal(feedbackSessionRecordAnswer(typed({ status: "not_attempted", reason: "lookup_failed" })), "not_attached");
+  assert.equal(feedbackSessionRecordAnswer(typed({ status: "not_attempted", reason: "worker_not_configured" })), "not_attached");
+  assert.equal(feedbackSessionRecordAnswer(typed({ status: "not_attempted", reason: null })), "not_attached");
+  assert.equal(feedbackSessionRecordAnswer(typed({ status: "failed", reason: "upload_failed", stage: "put", httpStatus: 503, httpClass: "5xx" })), "not_attached");
+
+  // An older Computer: no typed outcome, so nothing is claimed.
+  assert.equal(feedbackSessionRecordAnswer({}), null);
+  assert.equal(feedbackSessionRecordAnswer({ outcomeVersion: 1 }), null);
+  assert.equal(feedbackSessionRecordAnswer({ upload: { ...UPLOAD, status: "stored", reason: null } }), null);
+
+  for (const answer of FEEDBACK_SESSION_RECORD_ANSWERS) assert.equal(isFeedbackSessionRecordAnswer(answer), true);
+  for (const other of ["stored", "not_found", "not_uploaded", "requested", "", "ATTACHED", null, undefined, 1, {}, ["attached"]]) {
+    assert.equal(isFeedbackSessionRecordAnswer(other), false, JSON.stringify(other));
+  }
+});

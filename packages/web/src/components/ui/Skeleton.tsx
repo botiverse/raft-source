@@ -1,5 +1,8 @@
 import type { HTMLAttributes } from "react";
-import { Card, Skeleton } from "@botiverse/raft-ui";
+import { Skeleton } from "@botiverse/raft-ui";
+import { ListRowSkeleton } from "@botiverse/raft-ui/wip";
+import type { ListRowSkeletonProps } from "@botiverse/raft-ui/wip";
+import { useListSkeletonShown } from "./useListSkeletonShown";
 
 /**
  * Loading-placeholder compositions built from raft-ui's Skeleton.
@@ -16,6 +19,15 @@ import { Card, Skeleton } from "@botiverse/raft-ui";
  * SkeletonRow + each panel's row classes), so loaded content swaps in without
  * the page jumping.
  */
+
+/**
+ * A bar inside a line of text (raft-ui ListRowSkeleton's bar): put it in the
+ * element that holds that text in the real row, so the line's own type gives
+ * the placeholder its height and the row is the loaded row's size.
+ */
+export function SkeletonTextBar({ className }: { className: string }) {
+  return <Skeleton variant="line" className={`inline-block h-[0.75em] max-w-full align-middle ${className}`} />;
+}
 
 export interface SkeletonRowProps extends HTMLAttributes<HTMLDivElement> {
   /** Render an avatar/icon stand-in on the left (sized via avatarClassName). */
@@ -58,28 +70,22 @@ export function SkeletonRow({
   );
 }
 
+export interface ListRowSkeletonListProps extends ListRowSkeletonProps {
+  /** How many rows: about a screenful. */
+  count: number;
+  /** Milliseconds before the rows show; until then nothing does. */
+  delay?: number;
+}
+
 /**
- * ConversationCardSkeleton — the loading placeholder for ConversationPreviewCard
- * list rows (Inbox + Saved panels, ~96px cards). Mirrors the real card box
- * (header line + multi-line preview) so
- * the list does not jump when items load. Shared so inbox/saved stay identical.
+ * ListRowSkeletonList — `count` raft-ui `ListRowSkeleton` rows that show once
+ * the load passes 1 second, so a fast load goes straight to the rows
+ * (raft-design Feedback, "Empty, loading and failed"). `InboxItemSkeletonList`
+ * waits on its own; `ListRowSkeleton` doesn't, so the wait lives here. Put it
+ * where the rows will be, and mark the region that stays `aria-busy`.
  */
-export function ConversationCardSkeleton({ count = 6 }: { count?: number }) {
-  return (
-    <div className="flex flex-col gap-2" aria-busy="true">
-      {Array.from({ length: count }, (_, i) => (
-        <Card key={i} className="w-full flex-row items-start gap-3 p-3">
-          <div className="flex min-w-0 flex-1 flex-col gap-2">
-            <div className="flex items-center gap-2.5">
-              <Skeleton variant="line" className="w-20" />
-              <Skeleton variant="line" className="w-16" />
-              <Skeleton variant="line" className="w-10" />
-            </div>
-            <Skeleton variant="line" className="w-full" />
-            <Skeleton variant="line" className="w-3/5" />
-          </div>
-        </Card>
-      ))}
-    </div>
-  );
+export function ListRowSkeletonList({ count, delay, ...rowProps }: ListRowSkeletonListProps) {
+  const shown = useListSkeletonShown(delay);
+  if (!shown) return null;
+  return Array.from({ length: count }, (_, index) => <ListRowSkeleton key={index} {...rowProps} />);
 }

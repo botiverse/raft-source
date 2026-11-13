@@ -7,7 +7,12 @@ import type { CompletedTraceSpan, TraceAttributes, TraceEvent, TraceLogEvent, Tr
 const DEFAULT_MAX_FILE_BYTES = 5 * 1024 * 1024;
 const DEFAULT_MAX_FILE_AGE_MS = 5 * 60 * 1000;
 const DEFAULT_MAX_FILES = 8;
-const DEFAULT_MAX_CLI_TRANSPORT_FILES = 8;
+// CLI span files (one per `raft` process that wrote a span: transport errors,
+// `cli.draft.resolved`) are ~0.5 KB each, and the uploader drains at most ~19
+// of them per 5-minute interval. Keeping only 8 dropped spans whenever more
+// than 8 waited at a rotation (they are counts the telemetry reads); 64 keeps
+// a few intervals of backlog for ~32 KB.
+const DEFAULT_MAX_CLI_TRANSPORT_FILES = 64;
 const DEFAULT_MAX_DIAG_FILES = 8;
 const DEFAULT_MAX_OTHER_FILES = 8;
 
@@ -212,7 +217,8 @@ const DEFAULT_FS_OPS: TraceSinkFsOps = { appendFileSync, writeFileSync, statSync
  * Families sharing the `daemon-trace-` prefix but NOT the rotation lifecycle.
  *
  * They are written by other producers entirely — `packages/cli/src/transportTrace.ts`
- * (one file per CLI process that hits a transport error) and the diagnostics push
+ * (one file per CLI process that writes a span: a transport error, or a held
+ * draft resolved as `cli.draft.resolved`) and the diagnostics push
  * path (one file per correlation id) — and neither producer prunes. Before this
  * split, `pruneOldFiles` matched them with the shared prefix and ordered every
  * candidate lexicographically, which is why they mattered:
@@ -246,11 +252,13 @@ const DEFAULT_FS_OPS: TraceSinkFsOps = { appendFileSync, writeFileSync, statSync
  *
  * It is NOT a design guarantee, and specifically these producers do not "write
  * once": `packages/cli/src/transportTrace.ts` memoises one path per process and
- * appends on every normalized transport error, so one long-lived or
- * error-looping process grows a single file without bound. The files are small
- * because CLI processes are short and usually fail once — a usage pattern, not
- * an invariant. A byte budget per family is the real fix whenever that pattern
- * stops holding.
+ * appends on every span it emits, so one long-lived or error-looping process
+ * grows a single file without bound. The files are small because CLI processes
+ * are short and usually write one span (fail once, or resolve one held draft) —
+ * a usage pattern, not an invariant. A byte budget per family is the real fix
+ * whenever that pattern stops holding. Held-draft spans also make the file
+ * COUNT follow held sends, not only transport errors: past the family budget,
+ * prune deletes files whether or not they were uploaded.
  *
  * Recorded here rather than only in review because the change that would break
  * it gets made in the producer, where this constraint is invisible.
@@ -338,6 +346,13 @@ const DIAGNOSTIC_ID_ATTRS = new Set([
   "source_id",
   "item_id",
   "app_correlation_id",
+  // 2026-10-21, ruled by @Tenny (#wg-ax:d98f2a2c, PR #10675): the RFC 072
+  // model context id on `daemon.runtime.turn` (glimpse layer 2). Daemon-minted
+  // randomUUID, replaced at spawn, compaction and session rebind; it names no
+  // user, channel or message and carries no content. Spelled `model_context_id`
+  // on purpose: the bare `context_id` on `daemon.agent.server_context.*`
+  // events holds a server-context message id and stays dropped.
+  "model_context_id",
 ]);
 
 /**

@@ -94,9 +94,11 @@ type ReadStateProjectionListener = (serverId: string, scopeId: string, projectio
 
 const channelReadListeners = new Set<ChannelReadListener>();
 const persistedChannelReadListeners = new Set<PersistedChannelReadListener>();
-const acceptedReadStates = new Map<string, { maxReadSeq: number; readStateVersion: number; generation: number }>();
+const acceptedReadStates = new Map<string, { maxReadSeq: number; readStateVersion: number; markedUnread: boolean; generation: number }>();
 const acceptedReadStateProjections = new Map<string, ReadStateProjection>();
 const readStateProjectionListeners = new Set<ReadStateProjectionListener>();
+type MarkedUnreadListener = (serverId: string, scopeId: string, markedUnread: boolean) => void;
+const markedUnreadListeners = new Set<MarkedUnreadListener>();
 let acceptedReadStateGeneration = 0;
 
 export type ReadStateUpdate = {
@@ -106,6 +108,12 @@ export type ReadStateUpdate = {
   readStateVersion: number;
   /** Unread left after the read, when the server computed it (older servers omit it). */
   unreadCount?: number;
+  /**
+   * Marked unread with nothing countable (Mark as Unread on a conversation
+   * whose messages after the read point are all the person's own): shown
+   * unread with no number. Sent only when true; absent means not marked.
+   */
+  markedUnread?: true;
 };
 
 export type ReadStateApplyResult = "accepted" | "stale";
@@ -145,6 +153,19 @@ export function registerPersistedChannelReadListener(listener: PersistedChannelR
   return () => persistedChannelReadListeners.delete(listener);
 }
 
+/**
+ * Told whenever an accepted read state says the scope is, or is no longer,
+ * marked unread (store/markedUnreadStore keeps the shown flags).
+ */
+export function registerMarkedUnreadListener(listener: MarkedUnreadListener) {
+  markedUnreadListeners.add(listener);
+  return () => markedUnreadListeners.delete(listener);
+}
+
+function notifyMarkedUnread(serverId: string, scopeId: string, markedUnread: boolean) {
+  for (const listener of markedUnreadListeners) listener(serverId, scopeId, markedUnread);
+}
+
 export function registerReadStateProjectionListener(listener: ReadStateProjectionListener) {
   readStateProjectionListeners.add(listener);
   // Stryker disable next-line ArrowFunction: unsubscribe identity is lifecycle glue; projection listener behavior is covered by inbox/thread integration tests.
@@ -169,11 +190,16 @@ function normalizeReadStateScope(payload: unknown): ReadStateScope | null {
   if (!isNonNegativeSafeInteger(readStateVersion)) {
     return reportReadStateIngressCorrupt("readStateVersion", "read_state_version_invalid");
   }
-  // Optional hint: a malformed count is dropped, never the read fact it rides on.
-  const { unreadCount } = payload as Record<string, unknown>;
-  return isNonNegativeSafeInteger(unreadCount)
-    ? { scopeId, maxReadSeq, readStateVersion, unreadCount }
-    : { scopeId, maxReadSeq, readStateVersion };
+  // Optional hints: a malformed count is dropped, never the read fact it rides
+  // on; the mark is true or absent.
+  const { unreadCount, markedUnread } = payload as Record<string, unknown>;
+  return {
+    scopeId,
+    maxReadSeq,
+    readStateVersion,
+    ...(isNonNegativeSafeInteger(unreadCount) ? { unreadCount } : {}),
+    ...(markedUnread === true ? { markedUnread: true as const } : {}),
+  };
 }
 
 export function normalizeReadStateUpdated(payload: unknown): ReadStateUpdate | null {
@@ -212,19 +238,40 @@ export function normalizeReadStateUpdatedBulk(payload: unknown): ReadStateUpdate
     .filter((scope): scope is ReadStateUpdate => scope !== null);
 }
 
+/**
+ * At the version already held, a mark is the honest value: every change of the
+ * flag moves the version, so one carrier that says "marked" at version v (the
+ * server's write) outranks another that omits it at v (a reader that does not
+ * carry the flag, or carries it as absent). The read point itself is unchanged.
+ */
+function upgradeMarkAtSameVersion(
+  serverId: string,
+  scopeId: string,
+  previous: { readStateVersion: number; markedUnread: boolean },
+  readStateVersion: number,
+  markedUnread: boolean,
+): void {
+  if (readStateVersion !== previous.readStateVersion || !markedUnread || previous.markedUnread) return;
+  previous.markedUnread = true;
+  notifyMarkedUnread(serverId, scopeId, true);
+}
+
 export function consumeReadStateUpdate(update: ReadStateUpdate): ReadStateApplyResult {
   const key = readStateKey(update.serverId, update.scopeId);
   const previous = acceptedReadStates.get(key);
   if (previous && update.readStateVersion <= previous.readStateVersion) {
+    upgradeMarkAtSameVersion(update.serverId, update.scopeId, previous, update.readStateVersion, update.markedUnread === true);
     return "stale";
   }
 
   acceptedReadStates.set(key, {
     maxReadSeq: update.maxReadSeq,
     readStateVersion: update.readStateVersion,
+    markedUnread: update.markedUnread === true,
     generation: ++acceptedReadStateGeneration,
   });
   acceptedReadStateProjections.delete(key);
+  notifyMarkedUnread(update.serverId, update.scopeId, update.markedUnread === true);
   return "accepted";
 }
 
@@ -320,9 +367,11 @@ export function consumeReadStateSnapshot(
 
   if (frontier.kind === "absent") {
     if (supersededBySocket) return { kind: "stale", latestActivitySeq: null };
-    if (!acceptedReadStates.has(key)) return { kind: "cleared", latestActivitySeq: null };
+    const cleared = acceptedReadStates.get(key);
+    if (!cleared) return { kind: "cleared", latestActivitySeq: null };
     acceptedReadStates.delete(key);
     acceptedReadStateProjections.delete(key);
+    if (cleared.markedUnread) notifyMarkedUnread(serverId, scopeId, false);
     return { kind: "cleared", latestActivitySeq: null };
   }
 
@@ -343,15 +392,18 @@ export function consumeReadStateSnapshot(
   if (supersededBySocket) return { kind: "stale", latestActivitySeq: rowEvidence };
   const previous = acceptedReadStates.get(key);
   if (previous && frontier.readStateVersion <= previous.readStateVersion) {
+    upgradeMarkAtSameVersion(serverId, scopeId, previous, frontier.readStateVersion, frontier.markedUnread === true);
     return { kind: "stale", latestActivitySeq: rowEvidence };
   }
 
   acceptedReadStates.set(key, {
     maxReadSeq: Number(parsed),
     readStateVersion: frontier.readStateVersion,
+    markedUnread: frontier.markedUnread === true,
     generation: ++acceptedReadStateGeneration,
   });
   acceptedReadStateProjections.delete(key);
+  notifyMarkedUnread(serverId, scopeId, frontier.markedUnread === true);
   return { kind: "accepted", latestActivitySeq: frontier.latestActivity?.seq ?? null };
 }
 
@@ -386,7 +438,7 @@ export function consumeReadStateSnapshotRows(
   });
 }
 
-export function getAcceptedReadState(serverId: string | null | undefined, scopeId: string): { maxReadSeq: number; readStateVersion: number } | null {
+export function getAcceptedReadState(serverId: string | null | undefined, scopeId: string): { maxReadSeq: number; readStateVersion: number; markedUnread: boolean } | null {
   // Stryker disable next-line ConditionalExpression: no-server is a defensive reset-time guard; normal server filtering is covered by other-server tests.
   if (!serverId) return null;
   return acceptedReadStates.get(readStateKey(serverId, scopeId)) ?? null;

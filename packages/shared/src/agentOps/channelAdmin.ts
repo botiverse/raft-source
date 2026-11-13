@@ -24,6 +24,8 @@ import { formatHintName, hintStep, RAFT_HINTS, type RaftHintOptions } from "./hi
 import type { AgentApiClientFailure } from "../agentApiClient";
 import { failureFromClientResult, failureOutcome, opError, validateOpRequest, type RaftFailure, type RaftOutcome } from "./outcome";
 import { requestSchema } from "./requestSchema";
+import { formatAgentChannelUpdated, formatChannelDeletedWithLastMember, formatLastMemberRefusal, LAST_MEMBER_DELETES_CHANNEL } from "../agentText/server";
+import { CHANNEL_ANNOUNCEMENT_REF_INVALID, channelAnnouncementArtifactId } from "../channelAnnouncement";
 
 export type RaftChannelVisibility = "public" | "private";
 
@@ -54,6 +56,8 @@ export interface UpdateChannelRequest {
   name?: string;
   description?: string;
   visibility?: RaftChannelVisibility;
+  /** An Artifact homed in the channel (`pt_…` id or link) to make its announcement; null removes it. */
+  announcement?: string | null;
 }
 
 export const updateChannelRequestSchema = lazySchema("updateChannelRequestSchema", () => requestSchema<UpdateChannelRequest>()(z.object({
@@ -61,6 +65,7 @@ export const updateChannelRequestSchema = lazySchema("updateChannelRequestSchema
   name: z.string().optional().describe("New name, with or without a leading `#`."),
   description: descriptionSchema.optional().describe("New description (at most 500 characters)."),
   visibility: visibilitySchema.optional().describe("`public` or `private`. Needs your server role (a channel-admin role is not enough), and you must be in the channel."),
+  announcement: z.string().nullable().optional().describe("An Artifact homed in this channel (`pt_…` id or link) to make the channel's announcement, replacing any other; `null` removes it. The channel's owner (channel admin) or a server owner or admin only."),
 })));
 
 export interface ChannelMemberRequest {
@@ -75,6 +80,18 @@ export const channelMemberRequestSchema = lazySchema("channelMemberRequestSchema
   target: z.string().describe("The channel, `#channel-name`."),
   user: z.string().optional().describe("A human, `@handle`. Pass exactly one of user and agent."),
   agent: z.string().optional().describe("An agent, `@handle`. Pass exactly one of user and agent."),
+})));
+
+export interface ChannelMemberRemoveRequest extends ChannelMemberRequest {
+  /** They may be the private channel's last member: removing them then deletes it and all its messages. Without it that removal is refused and nothing changes. */
+  deleteIfLast?: boolean;
+}
+
+export const channelMemberRemoveRequestSchema = lazySchema("channelMemberRemoveRequestSchema", () => requestSchema<ChannelMemberRemoveRequest>()(z.object({
+  target: z.string().describe("The channel, `#channel-name`."),
+  user: z.string().optional().describe("A human, `@handle`. Pass exactly one of user and agent."),
+  agent: z.string().optional().describe("An agent, `@handle`. Pass exactly one of user and agent."),
+  deleteIfLast: z.boolean().optional().describe("Only when the channel and all its messages should go: if they are a private channel's last member, removing them deletes it, which can't be undone. Without it that removal is refused and nothing changes."),
 })));
 
 export interface UpdateServerRequest {
@@ -155,8 +172,14 @@ export async function updateChannel(
   const invalid = validateOpRequest(updateChannelRequestSchema, request); if (invalid) return invalid;
   const name = request.name === undefined ? undefined : bareChannelName(request.name);
   if (name === "") return failureOutcome(opError("INVALID_REQUEST", { message: "The new name is empty. Nothing was sent." }));
-  if (name === undefined && request.description === undefined && request.visibility === undefined) {
-    return failureOutcome(opError("INVALID_REQUEST", { message: "Pass a name, description, or visibility to change. Nothing was sent." }));
+  if (name === undefined && request.description === undefined && request.visibility === undefined && request.announcement === undefined) {
+    return failureOutcome(opError("INVALID_REQUEST", { message: "Pass a name, description, visibility, or announcement to change. Nothing was sent." }));
+  }
+  let channelAnnouncementId: string | null | undefined;
+  if (request.announcement === null) channelAnnouncementId = null;
+  else if (request.announcement !== undefined) {
+    channelAnnouncementId = channelAnnouncementArtifactId(request.announcement) ?? undefined;
+    if (channelAnnouncementId === undefined) return failureOutcome(opError("INVALID_REQUEST", { message: CHANNEL_ANNOUNCEMENT_REF_INVALID }));
   }
   const channel = await resolveRegularChannel(client, request.target, options);
   if ("ok" in channel) return channel;
@@ -164,6 +187,7 @@ export async function updateChannel(
     ...(name !== undefined ? { name } : {}),
     ...(request.description !== undefined ? { description: request.description } : {}),
     ...(request.visibility !== undefined ? { visibility: request.visibility } : {}),
+    ...(channelAnnouncementId !== undefined ? { announcement: channelAnnouncementId } : {}),
   });
   if (!result.ok) return adminFailure(result, options);
   const target = `#${result.data.name}`;
@@ -173,7 +197,7 @@ export async function updateChannel(
     state: "updated",
     data: { target, channelId: result.data.id, visibility },
     next: null,
-    text: `Updated ${target} (${visibility}).`,
+    text: formatAgentChannelUpdated(result.data, { channelAnnouncementChanged: channelAnnouncementId !== undefined }, options.hints),
   };
 }
 
@@ -256,20 +280,28 @@ interface MemberRemovalAttention {
 
 export async function removeChannelMember(
   client: Pick<AgentApiClient, "server" | "channels">,
-  request: ChannelMemberRequest,
+  request: ChannelMemberRemoveRequest,
   options: RaftHintOptions = {},
 ): Promise<RaftOutcome<AgentApiChannelMemberRemoveResponse, "removed" | "not_member">> {
-  const invalid = validateOpRequest(channelMemberRequestSchema, request); if (invalid) return invalid;
+  const invalid = validateOpRequest(channelMemberRemoveRequestSchema, request); if (invalid) return invalid;
   const body = memberBody(request);
   if (!body) return failureOutcome(opError("INVALID_REQUEST", { message: MEMBER_REQUIRED }));
   const channel = await resolveRegularChannel(client, request.target, options);
   if ("ok" in channel) return channel;
-  const result = await client.channels.removeMember({ channelId: channel.id as never }, body);
-  if (!result.ok) return adminFailure(result, options);
   const target = `#${channel.name}`;
+  const result = await client.channels.removeMember({ channelId: channel.id as never }, request.deleteIfLast ? { ...body, deleteIfLast: true } : body);
+  if (!result.ok) {
+    const failure = adminFailure(result, options);
+    if (failure.error.serverCode !== LAST_MEMBER_DELETES_CHANNEL) return failure;
+    const member = "user" in body ? { user: `@${body.user}` } : { agent: `@${body.agent}` };
+    return failureOutcome({ ...failure.error, ...formatLastMemberRefusal({ target, member }, options.hints) });
+  }
   const member = `@${result.data.member.name}`;
   if (!result.data.wasMember) {
     return { ok: true, state: "not_member", data: result.data, next: null, text: `${member} was not in ${target}.` };
+  }
+  if (result.data.channelDeleted) {
+    return { ok: true, state: "removed", data: result.data, next: null, text: formatChannelDeletedWithLastMember(target, member) };
   }
   const lines = [`Removed ${member} from ${target}.`];
   const attention = (result.data.attention ?? {}) as MemberRemovalAttention;

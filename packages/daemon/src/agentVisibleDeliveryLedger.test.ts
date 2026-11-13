@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import type { AgentMessage } from "@botiverse/raft-shared";
-import { AgentVisibleDeliveryLedger } from "./agentVisibleDeliveryLedger";
+import { AgentVisibleDeliveryLedger, isThreadVisibleTarget } from "./agentVisibleDeliveryLedger";
+import { normalizeInboxVisibleMessages } from "./agentInboxStateMachine";
 
 function pendingMessage(overrides: Partial<AgentMessage> = {}): AgentMessage {
   return {
@@ -74,6 +75,31 @@ test("AgentVisibleDeliveryLedger proof-of-catch: set-only sources cannot advance
   assert.equal(ledger.getMessageIdSet("agent-1", "#general")?.has("m-50"), true);
   assert.equal(ledger.isModelSeen("agent-1", "#general", { seq: 49, message_id: "m-49" }), false);
   assert.equal(ledger.isModelSeen("agent-1", "#general", { message_id: "m-50" }), true);
+});
+
+// The credential proxy books a `raft task read` page under the task ref
+// (AGENT_API_HISTORY_WINDOW_TARGETS); the same messages wait in the pending
+// inbox as deliveries keyed by their task_conversation_number. The two keys
+// must agree, or a task message the agent read stays pending and
+// `raft message check` delivers it again.
+test("a task read booked under the task ref suppresses the same messages pending as task-conversation deliveries", () => {
+  for (const [ref, delivery] of [
+    ["#board:#7", { channel_type: "thread", channel_name: "task-conv-7", parent_channel_type: "channel", parent_channel_name: "board", task_conversation_number: 7 }],
+    ["dm:@tygg:#3", { channel_type: "thread", channel_name: "task-conv-3", parent_channel_type: "dm", parent_channel_name: "tygg", task_conversation_number: 3 }],
+  ] as const) {
+    const ledger = new AgentVisibleDeliveryLedger();
+    // As the Server answers a task read: message envelopes carry no channel fields.
+    const consumed = ledger.recordConsumed("agent-1", {
+      target: ref,
+      messages: normalizeInboxVisibleMessages([{ seq: 21, id: "task-21" }, { seq: 23, id: "task-23" }], ref),
+      source: "agent_api_history",
+    });
+    assert.ok(consumed);
+    assert.deepEqual(consumed.targets, [ref]);
+    assert.equal(consumed.shouldSuppress(pendingMessage({ ...delivery, message_id: "task-23", seq: 23 })), true, `${ref}: a message the read returned is no longer pending`);
+    assert.equal(consumed.shouldSuppress(pendingMessage({ ...delivery, message_id: "task-25", seq: 25 })), false, `${ref}: one it didn't return still is`);
+    assert.equal(consumed.shouldSuppress(pendingMessage({ message_id: "board-23", seq: 23 })), false, `${ref}: another conversation's message with the same seq still is`);
+  }
 });
 
 test("AgentVisibleDeliveryLedger proof-of-catch: explicit target mismatch is rejected", () => {
@@ -420,4 +446,75 @@ test("clearAgent drops the context scope too", () => {
   renderThreadPackage(ledger, "ctx-1", [40, 41]);
   ledger.clearAgent("agent-1");
   assert.equal(ledger.freshnessView("agent-1", { contextId: "ctx-1" }).getBoundary(THREAD), undefined);
+});
+
+// #wg-ax:#6: a notice that showed a message whole is freshness evidence only.
+test("a whole notice preview counts for freshness but never for delivery dedup or as a boundary", () => {
+  const ledger = new AgentVisibleDeliveryLedger();
+  const previewed = pendingMessage({ message_id: "m-50", seq: 50, content: "Please hold the rollout." });
+  ledger.recordWholePreviewSeen("agent-1", { messages: [previewed] });
+
+  const view = ledger.freshnessView("agent-1", undefined);
+  assert.deepEqual(view.getExactSeenSeqs("#general"), [50], "a reply to #general is not held for it");
+  assert.equal(view.isModelSeen("#general", previewed), true);
+  assert.equal(view.getBoundary("#general"), undefined, "never a boundary");
+  assert.equal(ledger.isModelSeen("agent-1", "#general", previewed), false, "a redelivery is not dropped as consumed");
+  assert.deepEqual(ledger.getExactSeenSeqs("agent-1", "#general"), []);
+  assert.equal(ledger.getMessageIdSet("agent-1", "#general"), undefined);
+
+  ledger.recordConsumed("agent-1", { messages: [pendingMessage({ message_id: "m-40", seq: 40 })], source: "agent_api_history" });
+  assert.deepEqual(ledger.freshnessView("agent-1", undefined).getExactSeenSeqs("#general"), [40, 50], "merged with consumed seqs");
+
+  ledger.clearAgent("agent-1");
+  assert.deepEqual(ledger.freshnessView("agent-1", undefined).getExactSeenSeqs("#general"), []);
+});
+
+test("a whole notice preview recorded under a context stops counting after the context changes", () => {
+  const ledger = new AgentVisibleDeliveryLedger();
+  const previewed = pendingMessage({ message_id: "m-60", seq: 60 });
+  ledger.recordWholePreviewSeen("agent-1", { messages: [previewed], contextId: "ctx-1" });
+  assert.deepEqual(ledger.freshnessView("agent-1", { contextId: "ctx-1" }).getExactSeenSeqs("#general"), [60]);
+  assert.equal(ledger.freshnessView("agent-1", { contextId: "ctx-1" }).isModelSeen("#general", previewed), true);
+
+  ledger.recordConsumed("agent-1", { messages: [pendingMessage({ message_id: "m-61", seq: 61 })], source: "agent_api_history", contextId: "ctx-2" });
+  const afterCompaction = ledger.freshnessView("agent-1", { contextId: "ctx-2" });
+  assert.deepEqual(afterCompaction.getExactSeenSeqs("#general"), [61], "the preview left the model's context");
+  assert.equal(afterCompaction.isModelSeen("#general", previewed), false);
+});
+
+test("AgentVisibleDeliveryLedger counts messages the model had already seen before the batch", () => {
+  const ledger = new AgentVisibleDeliveryLedger();
+  const thread = { channel_type: "thread", channel_name: "thread-aaaabbbb", parent_channel_name: "general", parent_channel_type: "channel" };
+
+  const delivered = ledger.recordConsumed("agent-1", {
+    messages: [{ ...thread, seq: 10, message_id: "m-10" }, { ...thread, seq: 11, message_id: "m-11" }],
+    source: "thread_join_context_rendered",
+    contextId: "ctx-1",
+  });
+  assert.equal(delivered?.alreadySeenCount, 0, "a batch never counts itself");
+
+  const reread = ledger.recordConsumed("agent-1", {
+    target: "#general:aaaabbbb",
+    messages: [{ ...thread, seq: 9, message_id: "m-9" }, { ...thread, seq: 10, message_id: "m-10" }, { ...thread, seq: 11, message_id: "m-11" }],
+    source: "agent_api_history",
+    contextId: "ctx-1",
+  });
+  assert.equal(reread?.alreadySeenCount, 2, "the re-read repeats the two delivered messages and adds one");
+
+  const afterCompaction = ledger.recordConsumed("agent-1", {
+    target: "#general:aaaabbbb",
+    messages: [{ ...thread, seq: 10, message_id: "m-10" }],
+    source: "agent_api_history",
+    contextId: "ctx-2",
+  });
+  assert.equal(afterCompaction?.alreadySeenCount, 0, "a new context no longer holds what the old one saw");
+});
+
+test("isThreadVisibleTarget recognises channel and DM threads but not task refs", () => {
+  assert.equal(isThreadVisibleTarget("#general:aaaabbbb"), true);
+  assert.equal(isThreadVisibleTarget("dm:@richard:aaaabbbb"), true);
+  assert.equal(isThreadVisibleTarget("#general"), false);
+  assert.equal(isThreadVisibleTarget("dm:@richard"), false);
+  assert.equal(isThreadVisibleTarget("#general:#7"), false);
+  assert.equal(isThreadVisibleTarget("agent-event:aaaabbbb"), false);
 });

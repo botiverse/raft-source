@@ -63,7 +63,7 @@ test("DM task and started receipt expose a readable recipient target and are con
     { type: "agent", id: a.id },
     { assigneeName: a.name },
   );
-  assert.equal(created.assignmentReceipt.state, "started");
+  assert.equal(created.assignmentReceipt!.state, "started");
   const deliveries: { agentId: string; message: any }[] = [];
   const orchestrator = withChannelDelivery({
     deliverMessage: async (agentId: string, message: any) => {
@@ -80,7 +80,7 @@ test("DM task and started receipt expose a readable recipient target and are con
     io,
     orchestrator,
     dm.id,
-    created.assignmentReceipt.content,
+    created.assignmentReceipt!.content,
     {
       inboxFactPolicy: {
         mode: "record",
@@ -88,7 +88,7 @@ test("DM task and started receipt expose a readable recipient target and are con
         reason: "synthetic regression",
         causalActor: { type: "agent", id: a.id },
       },
-      persistedMessage: created.assignmentReceipt.message,
+      persistedMessage: created.assignmentReceipt!.message,
       personalAttentionTargets: [{ type: "agent", id: a.id, name: a.name }],
       awaitAgentDelivery: true,
     },
@@ -103,7 +103,7 @@ test("DM task and started receipt expose a readable recipient target and are con
   );
   const ids = [
     created.hostMessages[0].id,
-    created.assignmentReceipt.message.id,
+    created.assignmentReceipt!.message.id,
   ];
   assert.deepEqual(
     pending.map((x) => x.message_id),

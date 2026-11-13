@@ -12,7 +12,7 @@
 import crypto from "node:crypto";
 import { MachineResponseRelay, redisMachineReplyStore } from "./machineResponseRelay";
 import type Redis from "ioredis";
-import { getRedis, getRedisReplicaSub, isRedisAvailable, resetRedisReplicaSub } from "./redis";
+import { getBoundedRedis, getRedis, getRedisReplicaSub, isRedisAvailable, resetRedisReplicaSub } from "./redis";
 import { notifyLocalAgentCredentialRevocation } from "./services/agentCredentialRevocationBus";
 import {
   normalizeActivity,
@@ -25,13 +25,25 @@ import {
   type AgentActivityDetailKind,
   type AgentActivityKind,
   type AgentRuntimeErrorState,
+  AGENT_CONTEXT_VIEW_AVAILABILITY_TYPE,
+  readAgentContextViewAvailability,
+  asAgentContextViewGrantId,
+  asAgentContextViewRequestId,
+  asMachineId,
+  type AgentContextViewAvailabilityMessage,
+  type AgentContextViewGrantId,
+  type AgentContextViewRequestId,
+  type MachineId,
   type ServerToMachineMessage,
   type AgentMessage,
+  type AgentStopReason,
   type Tracer,
 } from "@botiverse/raft-shared";
 import type { PersistedActivityTypedCarriers, PersistedAgentActivity } from "./services/replicaStateStore";
 import { normalizeDeliveryConsumptionActivityDiagnostic } from "./services/deliveryConsumptionActivityDiagnostic";
 import { normalizeSpawnFailureActivityDiagnostic } from "./services/spawnFailureActivityDiagnostic";
+import { normalizeToolStuckActivityDiagnostic } from "./services/toolStuckActivityDiagnostic";
+import { normalizeCredentialHoldActivityDiagnostic } from "./services/credentialHoldActivityDiagnostic";
 import {
   InMemoryWakeCrashLoopStateStore,
   freshWakeCrashLoopEpisode,
@@ -43,7 +55,7 @@ import {
   buildRuntimeTraceContext,
   type MachineConnectTraceContext,
 } from "./tracing/migrationTraceContext";
-import { errorClassOf, getCurrentTraceContext, runWithTraceSpan } from "./tracing/semanticTrace";
+import { addTraceEvent, errorClassOf, getCurrentTraceContext, runWithTraceSpan } from "./tracing/semanticTrace";
 
 // Each server instance gets a unique ID
 export const REPLICA_ID = crypto.randomUUID();
@@ -147,6 +159,24 @@ let _inboxDeliveryReceiptPublisherForTests: InboxDeliveryReceiptPublisher | null
 let _inboxDeliveryReceiptRouteRuntimeForTests: InboxDeliveryReceiptRouteRuntime | null = null;
 let _externalWakeSignalHandler: ExternalWakeSignalHandler | null = null;
 let _machinePrincipalFenceHandler: MachinePrincipalFenceHandler | null = null;
+/** Agent typing line: "this agent's message landed here" (see publishAgentTypingPosted). */
+export type AgentTypingPostedSignal = {
+  agentId: string;
+  channelId: string | null;
+  parentMessageId: string | null;
+  target?: string;
+};
+type AgentTypingPostedHandler = (signal: AgentTypingPostedSignal) => void;
+let _agentTypingPostedHandler: AgentTypingPostedHandler | null = null;
+
+/** Why a machine's live connection is being dropped on every replica. */
+export const MACHINE_CONNECTION_DROP_REASONS = ["credential_rotated", "credential_revoked"] as const;
+export type MachineConnectionDropReason = (typeof MACHINE_CONNECTION_DROP_REASONS)[number];
+function isMachineConnectionDropReason(value: unknown): value is MachineConnectionDropReason {
+  return typeof value === "string" && (MACHINE_CONNECTION_DROP_REASONS as readonly string[]).includes(value);
+}
+type MachineConnectionDropHandler = (machineId: string, reason: MachineConnectionDropReason) => void | Promise<void>;
+let _machineConnectionDropHandler: MachineConnectionDropHandler | null = null;
 let _replicaReplayEndpoint: string | null = null;
 
 // Cross-replica wake signal for EXTERNAL agents (option C, #wg-external-agent
@@ -164,6 +194,12 @@ const MACHINE_PRINCIPAL_FENCE_CHANNEL = "slock:replica:machine-principal-fence";
 // their open wake-hint streams re-check the database. See
 // services/agentCredentialRevocationBus.ts.
 const AGENT_CREDENTIAL_REVOCATION_CHANNEL = "slock:replica:agent-credential-revocation";
+// Agent typing line: an agent's message landed in a conversation. The typing
+// registry lives on the replica holding the agent's machine socket, which is
+// usually not the one that served the send. Ids (and the target as written)
+// only; a lost signal just leaves the line to its own end / expiry.
+const AGENT_TYPING_POSTED_CHANNEL = "slock:replica:agent-typing-posted";
+const MACHINE_CONNECTION_DROP_CHANNEL = "slock:replica:machine-connection-drop";
 
 const MACHINE_REPLICA_TTL = 300; // 5 minutes, refreshed on heartbeat
 const STALE_OWNER_CLEANUP_MIN_AGE_MS = 60_000;
@@ -304,7 +340,18 @@ export interface StartIntentOptions {
 }
 export type OwnerIntent =
   | { kind: "start"; options: StartIntentOptions }
-  | { kind: "stop"; reason: "manual" | "internal" }
+  /**
+   * `daemonReason`: the `agent:stop` reason the owner sends its daemon. An
+   * owner on an older build ignores it and sends no reason.
+   */
+  | { kind: "stop"; reason: "manual" | "internal"; daemonReason?: AgentStopReason }
+  /**
+   * Reconciler step 11b: push the agent's current config to its daemon. Only
+   * the kind crosses Redis: the owner reads the database, builds the config
+   * (env vars may hold secrets) and sends it on its own socket. An owner on an
+   * older build answers it with no result (START_INTENT_UNANSWERED).
+   */
+  | { kind: "config" }
   | {
       kind: "reset";
       mode: "restart" | "session" | "full";
@@ -328,12 +375,22 @@ export type StartIntentResult =
     reason:
       | "manual_stop"
       | "wake_lock_held"
+      | "computer_version_unsupported"
+      | "computer_access_revoked"
       | "wake_crash_loop_blocked"
       | "terminal_failure_paused"
       | "terminal_failure_probe_in_flight"
       | "terminal_failure_needs_manual";
   }
-  | { outcome: "done" };
+  | { outcome: "done" }
+  /** A `config` intent: whether the owner sent `agent:config`. */
+  | { outcome: "config"; pushed: boolean };
+/**
+ * The owner answered with neither a result nor a failure: an owner on an
+ * older build that does not know the intent's kind (its switch falls through)
+ * and therefore ran nothing.
+ */
+export const START_INTENT_UNANSWERED = "StartIntentUnansweredError";
 /** An owner-side failure, carried back so the requester can rethrow it with its original class. */
 export interface StartIntentFailure { name: string; message: string; subkind?: string }
 export class StartIntentRemoteError extends Error {
@@ -454,11 +511,22 @@ function settleStartIntent(requestId: string, result?: StartIntentResult, failur
   if (!pending) return;
   clearTimeout(pending.timer);
   pendingStartIntents.delete(requestId);
-  if (result && (result.outcome === "dispatched" || result.outcome === "skipped" || result.outcome === "done")) pending.resolve(result);
-  else pending.reject(new StartIntentRemoteError(failure ?? { name: "Error", message: "Invalid start intent result" }));
+  const settled = startIntentReply(result, failure);
+  if (settled instanceof StartIntentRemoteError) pending.reject(settled);
+  else pending.resolve(settled);
+}
+
+/** What a requester makes of an owner's reply. Exported for tests. */
+export function startIntentReply(result?: StartIntentResult, failure?: StartIntentFailure): StartIntentResult | StartIntentRemoteError {
+  if (result && (result.outcome === "dispatched" || result.outcome === "skipped" || result.outcome === "done" || result.outcome === "config")) return result;
+  if (failure) return new StartIntentRemoteError(failure);
+  return new StartIntentRemoteError(result
+    ? { name: "Error", message: "Invalid start intent result" }
+    : { name: START_INTENT_UNANSWERED, message: "The owner did not answer this intent (an older build)" });
 }
 
 type ReplicaMessage =
+  | ({ type: "agent:typing:posted" } & Partial<AgentTypingPostedSignal>)
   | { type: "agent:start:intent"; request: StartIntentRequest; replyReplicaId: string }
   | { type: "agent:start:intent:result"; requestId: string; result?: StartIntentResult; failure?: StartIntentFailure }
   | { type: "machine:response:ready"; requestId: string }
@@ -574,7 +642,7 @@ async function subscribeReplicaRouter(reason: "startup" | "health_check" | "rese
   let sub = getRedisReplicaSub();
   bindReplicaSubscriber(sub);
   try {
-    await sub.subscribe(replicaChannel(REPLICA_ID), EXTERNAL_WAKE_CHANNEL, MACHINE_PRINCIPAL_FENCE_CHANNEL, AGENT_CREDENTIAL_REVOCATION_CHANNEL);
+    await sub.subscribe(replicaChannel(REPLICA_ID), EXTERNAL_WAKE_CHANNEL, MACHINE_PRINCIPAL_FENCE_CHANNEL, AGENT_CREDENTIAL_REVOCATION_CHANNEL, AGENT_TYPING_POSTED_CHANNEL, MACHINE_CONNECTION_DROP_CHANNEL);
   } catch (err) {
     console.warn(
       `[ReplicaRouter] Subscribe failed (${reason}); resetting replica subscriber:`,
@@ -583,7 +651,7 @@ async function subscribeReplicaRouter(reason: "startup" | "health_check" | "rese
     traceReplicaRouterError({ site: "subscriber_subscribe", reason: "subscribe_threw", error: err });
     sub = resetRedisReplicaSub();
     bindReplicaSubscriber(sub);
-    await sub.subscribe(replicaChannel(REPLICA_ID), EXTERNAL_WAKE_CHANNEL, MACHINE_PRINCIPAL_FENCE_CHANNEL, AGENT_CREDENTIAL_REVOCATION_CHANNEL);
+    await sub.subscribe(replicaChannel(REPLICA_ID), EXTERNAL_WAKE_CHANNEL, MACHINE_PRINCIPAL_FENCE_CHANNEL, AGENT_CREDENTIAL_REVOCATION_CHANNEL, AGENT_TYPING_POSTED_CHANNEL, MACHINE_CONNECTION_DROP_CHANNEL);
   }
 
   const subscriberCount = await getReplicaSubscriberCount();
@@ -593,7 +661,7 @@ async function subscribeReplicaRouter(reason: "startup" | "health_check" | "rese
     console.warn(`[ReplicaRouter] Replica ${REPLICA_ID.slice(0, 8)} subscriber missing after ${reason}; resetting`);
     sub = resetRedisReplicaSub();
     bindReplicaSubscriber(sub);
-    await sub.subscribe(replicaChannel(REPLICA_ID), EXTERNAL_WAKE_CHANNEL, MACHINE_PRINCIPAL_FENCE_CHANNEL, AGENT_CREDENTIAL_REVOCATION_CHANNEL);
+    await sub.subscribe(replicaChannel(REPLICA_ID), EXTERNAL_WAKE_CHANNEL, MACHINE_PRINCIPAL_FENCE_CHANNEL, AGENT_CREDENTIAL_REVOCATION_CHANNEL, AGENT_TYPING_POSTED_CHANNEL, MACHINE_CONNECTION_DROP_CHANNEL);
     return getReplicaSubscriberCount();
   }
   return subscriberCount;
@@ -691,6 +759,27 @@ export function handleReplicaMessage(channel: string, raw: string): void {
       }
       return;
     }
+    if (channel === AGENT_TYPING_POSTED_CHANNEL) {
+      // The broadcast form, still published by replicas from before targeted
+      // routing (rolling deploys). New replicas send to the owner only.
+      const signal = JSON.parse(raw) as Partial<AgentTypingPostedSignal> & { from?: string };
+      // Self-published signals are skipped: the local end already ran.
+      if (signal.from === REPLICA_ID) return;
+      handleAgentTypingPostedSignal(signal);
+      return;
+    }
+    if (channel === MACHINE_CONNECTION_DROP_CHANNEL) {
+      const signal = JSON.parse(raw) as { machineId?: string; reason?: string; from?: string };
+      if (
+        typeof signal.machineId === "string"
+        && isMachineConnectionDropReason(signal.reason)
+        && signal.from !== REPLICA_ID
+        && _machineConnectionDropHandler
+      ) {
+        void _machineConnectionDropHandler(signal.machineId, signal.reason);
+      }
+      return;
+    }
     if (channel === MACHINE_PRINCIPAL_FENCE_CHANNEL) {
       const signal = JSON.parse(raw) as {
         machineId?: string;
@@ -708,7 +797,9 @@ export function handleReplicaMessage(channel: string, raw: string): void {
       return;
     }
     const msg: ReplicaMessage = JSON.parse(raw);
-    if (msg.type === "agent:start:intent" && msg.request && typeof msg.replyReplicaId === "string") {
+    if (msg.type === "agent:typing:posted") {
+      handleAgentTypingPostedSignal(msg);
+    } else if (msg.type === "agent:start:intent" && msg.request && typeof msg.replyReplicaId === "string") {
       void handleStartIntent(msg.request, msg.replyReplicaId);
     } else if (msg.type === "agent:start:intent:result" && typeof msg.requestId === "string") {
       settleStartIntent(msg.requestId, msg.result, msg.failure);
@@ -872,6 +963,45 @@ export async function broadcastAgentCredentialRevocation(agentId: string): Promi
     await getRedis().publish(AGENT_CREDENTIAL_REVOCATION_CHANNEL, JSON.stringify({ agentId, from: REPLICA_ID }));
   } catch (err) {
     console.error("[ReplicaRouter] Failed to publish agent credential revocation:", err);
+  }
+}
+
+export function setAgentTypingPostedHandler(handler: AgentTypingPostedHandler | null): void {
+  _agentTypingPostedHandler = handler;
+}
+
+function handleAgentTypingPostedSignal(signal: Partial<AgentTypingPostedSignal>): void {
+  if (!_agentTypingPostedHandler) return;
+  if (typeof signal.agentId !== "string" || !signal.agentId) return;
+  const channelId = typeof signal.channelId === "string" ? signal.channelId : null;
+  const parentMessageId = typeof signal.parentMessageId === "string" ? signal.parentMessageId : null;
+  if (!channelId && !parentMessageId) return;
+  _agentTypingPostedHandler({
+    agentId: signal.agentId,
+    channelId,
+    parentMessageId,
+    ...(typeof signal.target === "string" ? { target: signal.target } : {}),
+  });
+}
+
+/**
+ * Agent typing line: tell the replica holding the agent's machine socket that
+ * the agent's message landed, so it closes the agent's lines there and ignores
+ * the refreshes that follow. Only that replica holds typing state for the
+ * agent, so the signal goes to it alone (fan-out doesn't grow with replicas);
+ * nothing is sent when this replica owns the machine (the caller already ended
+ * the lines locally) or no replica does (no machine, no live line).
+ * Fire-and-forget.
+ */
+export async function publishAgentTypingPosted(signal: AgentTypingPostedSignal, machineId: string | null): Promise<void> {
+  if (!isRedisAvailable() || !machineId) return;
+  try {
+    const owner = await getMachineReplicaOwner(machineId);
+    if (!owner || owner === REPLICA_ID) return;
+    const message: ReplicaMessage = { type: "agent:typing:posted", ...signal };
+    await getRedis().publish(replicaChannel(owner), JSON.stringify(message));
+  } catch (err) {
+    console.error("[ReplicaRouter] Failed to send agent typing posted signal:", err);
   }
 }
 
@@ -1675,6 +1805,8 @@ function encodeActivityTypedCarriers(carriers: PersistedActivityTypedCarriers | 
     ...(carriers.deliveryConsumption ? { deliveryConsumption: carriers.deliveryConsumption } : {}),
     ...(carriers.wakeCrashLoop ? { wakeCrashLoop: carriers.wakeCrashLoop } : {}),
     ...(carriers.spawnFailure ? { spawnFailure: carriers.spawnFailure } : {}),
+    ...(carriers.toolStuck ? { toolStuck: carriers.toolStuck } : {}),
+    ...(carriers.credentialHold ? { credentialHold: carriers.credentialHold } : {}),
   };
   return Object.keys(encoded).length > 0 ? JSON.stringify(encoded) : null;
 }
@@ -1705,6 +1837,10 @@ export function decodeActivityTypedCarriers(raw: string | undefined): PersistedA
     { source: "server" },
   );
   if (spawnFailure) carriers.spawnFailure = spawnFailure;
+  const toolStuck = normalizeToolStuckActivityDiagnostic(record.toolStuck as Record<string, unknown> | null | undefined);
+  if (toolStuck) carriers.toolStuck = toolStuck;
+  const credentialHold = normalizeCredentialHoldActivityDiagnostic(record.credentialHold as Record<string, unknown> | null | undefined);
+  if (credentialHold) carriers.credentialHold = credentialHold;
   return Object.keys(carriers).length > 0 ? carriers : undefined;
 }
 
@@ -1914,6 +2050,15 @@ export function decodeWakeCrashLoopState(raw: unknown): DecodedWakeCrashLoopStat
     blockedByLaunchId: optionalStringOrNull(record, "blockedByLaunchId", repaired),
     // Needs-action notice dedupe; absent on older records, which is not a repair.
     actionRequiredNotifiedFingerprint: optionalStringOrNull(record, "actionRequiredNotifiedFingerprint", repaired),
+    // Self-retrying pause; absent on older records, which is not a repair.
+    pauseRetryAtMs: record.pauseRetryAtMs === undefined ? null : finiteOrNull(record, "pauseRetryAtMs", repaired),
+    pauseRetryCooldownMs: record.pauseRetryCooldownMs === undefined ? null : finiteOrNull(record, "pauseRetryCooldownMs", repaired),
+    pauseRetryLaunchId: optionalStringOrNull(record, "pauseRetryLaunchId", repaired),
+    // Reconciler step 12: the ready try of a self-retrying pause; absent on older records, which is not a repair.
+    pauseRetryReadyLaunchId: optionalStringOrNull(record, "pauseRetryReadyLaunchId", repaired),
+    pauseRetryReadyCooldownMs: record.pauseRetryReadyCooldownMs === undefined ? null : finiteOrNull(record, "pauseRetryReadyCooldownMs", repaired),
+    // Reconciler step 12 follow-up: the owner was told the tries reached the cap; absent on older records (= not told), which is not a repair.
+    pauseRetryCapNotified: optionalBoolean(record, "pauseRetryCapNotified", repaired),
   };
   return { state, repaired };
 }
@@ -2077,6 +2222,305 @@ export async function getAgentRuntimeError(agentId: string): Promise<AgentRuntim
   return projectAgentRuntimeErrorFromRedisHash(await redis.hgetall(agentRuntimeErrorKey(agentId)));
 }
 
+// --- Agent View Context availability in Redis ---
+
+const AGENT_CONTEXT_VIEW_AVAILABILITY_TTL_SEC = 7 * 86_400;
+const agentContextViewAvailabilityKey = (agentId: string) => `slock:agent:${agentId}:context_view`;
+
+/**
+ * The latest `agent:context_view_availability` report for an agent and the
+ * Computer that sent it. A reader ignores a record from a machine other than
+ * the agent's current one, so a move or unbind needs no clear.
+ */
+export interface AgentContextViewAvailabilityRecord {
+  machineId: string;
+  report: Omit<AgentContextViewAvailabilityMessage, "type">;
+  /** ISO 8601, when the Server received the report. */
+  receivedAt: string;
+}
+
+/** Stored JSON back to a record; anything malformed (or a report the parser now refuses) reads as none. */
+export function parseAgentContextViewAvailabilityRecord(raw: string | null | undefined): AgentContextViewAvailabilityRecord | null {
+  if (!raw) return null;
+  let value: unknown;
+  try {
+    value = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (!value || typeof value !== "object") return null;
+  const { machineId, report, receivedAt } = value as Record<string, unknown>;
+  if (typeof machineId !== "string" || !machineId || typeof receivedAt !== "string" || !report || typeof report !== "object") return null;
+  const parsed = readAgentContextViewAvailability({ ...report, type: AGENT_CONTEXT_VIEW_AVAILABILITY_TYPE });
+  if (!parsed) return null;
+  const { type: _type, ...rest } = parsed;
+  return { machineId, report: rest, receivedAt };
+}
+
+/** No-Redis fallback: a single replica keeps the records in-process, with the same TTL. */
+const localAgentContextViewAvailability = new Map<string, { raw: string; expiresAtMs: number }>();
+
+/** Store the latest report for an agent; every write refreshes the 7-day TTL. */
+export async function setAgentContextViewAvailability(agentId: string, record: AgentContextViewAvailabilityRecord): Promise<void> {
+  const raw = JSON.stringify(record);
+  if (!isRedisAvailable()) {
+    localAgentContextViewAvailability.set(agentId, { raw, expiresAtMs: currentTimeMs() + AGENT_CONTEXT_VIEW_AVAILABILITY_TTL_SEC * 1000 });
+    return;
+  }
+  await getRedis().set(agentContextViewAvailabilityKey(agentId), raw, "EX", AGENT_CONTEXT_VIEW_AVAILABILITY_TTL_SEC);
+}
+
+export async function getAgentContextViewAvailability(agentId: string): Promise<AgentContextViewAvailabilityRecord | null> {
+  if (!isRedisAvailable()) {
+    const local = localAgentContextViewAvailability.get(agentId);
+    if (!local) return null;
+    if (local.expiresAtMs <= currentTimeMs()) {
+      localAgentContextViewAvailability.delete(agentId);
+      return null;
+    }
+    return parseAgentContextViewAvailabilityRecord(local.raw);
+  }
+  return parseAgentContextViewAvailabilityRecord(await getRedis().get(agentContextViewAvailabilityKey(agentId)));
+}
+
+export async function clearAgentContextViewAvailability(agentId: string): Promise<void> {
+  if (!isRedisAvailable()) {
+    localAgentContextViewAvailability.delete(agentId);
+    return;
+  }
+  await getRedis().del(agentContextViewAvailabilityKey(agentId));
+}
+
+// --- Reconciler step 13 F9: the last ready owed wake per agent ---
+//
+// When a daemon `ready` last dispatched an owed wake for the agent (epoch ms),
+// shared by every replica so a daemon that reconnects to another replica does
+// not wake the agent again for the same messages. Written only for a
+// dispatched start; expires after 24 h, the owed wake's own time floor.
+
+const READY_OWED_WAKE_TTL_SEC = 24 * 60 * 60;
+export const readyOwedWakeKey = (agentId: string) => `slock:agent:${agentId}:ready_owed_wake_at`;
+
+/** No-Redis fallback: a single replica keeps the marks in-process, with the same TTL. */
+const localReadyOwedWakes = new Map<string, { atMs: number; expiresAtMs: number }>();
+
+export async function setReadyOwedWakeAt(agentId: string, atMs: number): Promise<void> {
+  if (!isRedisAvailable()) {
+    localReadyOwedWakes.set(agentId, { atMs, expiresAtMs: currentTimeMs() + READY_OWED_WAKE_TTL_SEC * 1000 });
+    return;
+  }
+  await getRedis().set(readyOwedWakeKey(agentId), String(atMs), "EX", READY_OWED_WAKE_TTL_SEC);
+}
+
+/** Null when there is none (or it expired, or is malformed). Throws when Redis cannot be read. */
+export async function getReadyOwedWakeAt(agentId: string): Promise<number | null> {
+  if (!isRedisAvailable()) {
+    const local = localReadyOwedWakes.get(agentId);
+    if (!local) return null;
+    if (local.expiresAtMs <= currentTimeMs()) {
+      localReadyOwedWakes.delete(agentId);
+      return null;
+    }
+    return local.atMs;
+  }
+  const raw = await getRedis().get(readyOwedWakeKey(agentId));
+  const atMs = raw === null ? Number.NaN : Number(raw);
+  return Number.isSafeInteger(atMs) && atMs > 0 ? atMs : null;
+}
+
+// --- Reconciler step 15: at most one disk-sign-in lift per Computer and runtime ---
+//
+// A daemon's `machine:runtime_credentials:changed` lifts sign-in pauses, and
+// every lift starts a fresh wake crash-loop episode. A credential file that
+// keeps changing while the account is still unusable (a refresh that keeps
+// writing while the server keeps getting 401) would cycle lift → start → 401
+// → block → lift and defeat the breaker, so a disk lift is claimed once per
+// machine and runtime per window, shared by every replica (SET NX EX).
+
+export const DISK_CREDENTIAL_LIFT_WINDOW_SEC = 15 * 60;
+export const diskCredentialLiftKey = (machineId: string, runtime: string) => `slock:machine:${machineId}:runtime:${runtime}:disk_credential_lift`;
+
+/** No-Redis fallback: a single replica keeps the claims in-process, with the same window. */
+const localDiskCredentialLifts = new Map<string, number>();
+
+/** True when this call claimed the window (the lift may go ahead). Throws when Redis cannot be written. */
+export async function claimDiskCredentialLift(machineId: string, runtime: string): Promise<boolean> {
+  const key = diskCredentialLiftKey(machineId, runtime);
+  if (!isRedisAvailable()) {
+    const nowMs = currentTimeMs();
+    const expiresAtMs = localDiskCredentialLifts.get(key);
+    if (expiresAtMs !== undefined && expiresAtMs > nowMs) return false;
+    localDiskCredentialLifts.set(key, nowMs + DISK_CREDENTIAL_LIFT_WINDOW_SEC * 1000);
+    return true;
+  }
+  return (await getRedis().set(key, String(currentTimeMs()), "EX", DISK_CREDENTIAL_LIFT_WINDOW_SEC, "NX")) === "OK";
+}
+
+// --- Agent View Context requests in Redis ---
+//
+// One record per open view request (`slock:context-view:<requestId>`), written
+// by the replica holding the viewer's HTTP request and read by whichever
+// replica the daemon's result POST lands on. The record never changes after it
+// is written; the first result POST claims it with a separate SET NX key, so a
+// claim is atomic without a script and a POST with another Computer's
+// credential never consumes it.
+
+/** What the result POST is checked against and where the viewer waits. */
+export interface AgentContextViewRequestRecord {
+  requestId: AgentContextViewRequestId;
+  /** The person who views; for an agent's search or read (`viewerKind: "agent"`), the agent's id. */
+  viewerUserId: string;
+  /**
+   * #wg-ax:#15: an agent searching or reading a context. Absent for a person's
+   * view. A replica that predates the field rechecks such a record as a
+   * person's and refuses it (no user has that id), so it fails closed.
+   */
+  viewerKind?: "agent";
+  /** The answer this request takes: `query` only an agent's search or read answer, never a view. */
+  mode?: "query";
+  /**
+   * The View Context grant an agent used to view another agent's context
+   * (agentContextViewGrantService.ts); absent for a person's view and for an
+   * agent viewing its own. Additive: a replica that predates it rechecks an
+   * agent viewer as viewing only itself, so a record naming another agent is
+   * refused (fails closed), and a replica that predates `viewerKind` refuses
+   * it as a person's view.
+   */
+  grantId?: AgentContextViewGrantId;
+  agentId: string;
+  serverId: string;
+  messageId: string;
+  /**
+   * The agent's machine when the request was sent. Both credentials a Computer
+   * may present on /internal/computer (its sk_computer_* key, or the Phase 1
+   * sk_machine_* alias) resolve to one machine, so the POST is checked against it.
+   */
+  machineId: MachineId;
+  /** The replica holding the viewer's request (REPLICA_ID) and its replay endpoint, when it has one. */
+  viewerReplicaId: string;
+  viewerEndpoint: string | null;
+  /** ISO 8601. */
+  createdAt: string;
+}
+
+export type AgentContextViewRequestClaim =
+  | { kind: "claimed"; record: AgentContextViewRequestRecord }
+  /** No such request, or its TTL ran out. */
+  | { kind: "unknown" }
+  /** The caller is not the Computer the request was sent to; nothing was consumed. */
+  | { kind: "wrong_computer" }
+  | { kind: "already_claimed" };
+
+const agentContextViewRequestKey = (requestId: AgentContextViewRequestId) => `slock:context-view:${requestId}`;
+const agentContextViewClaimKey = (requestId: AgentContextViewRequestId) => `slock:context-view:${requestId}:claimed`;
+
+function parseAgentContextViewRequestRecord(raw: string | null | undefined): AgentContextViewRequestRecord | null {
+  if (!raw) return null;
+  let value: unknown;
+  try {
+    value = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (!value || typeof value !== "object") return null;
+  const v = value as Record<string, unknown>;
+  const strings = ["requestId", "viewerUserId", "agentId", "serverId", "messageId", "machineId", "viewerReplicaId", "createdAt"] as const;
+  if (!strings.every((key) => typeof v[key] === "string" && v[key] !== "")) return null;
+  if (v.viewerEndpoint !== null && typeof v.viewerEndpoint !== "string") return null;
+  // Redis is a boundary: the id is checked again when read back.
+  const requestId = asAgentContextViewRequestId(v.requestId as string);
+  if (!requestId) return null;
+  // An agent's search or read keeps what it is: dropped, its result would be
+  // rechecked as a person's view (and refused). A value this replica doesn't
+  // know makes the whole record unknown, so it fails closed.
+  if (v.viewerKind !== undefined && v.viewerKind !== "agent") return null;
+  if (v.mode !== undefined && v.mode !== "query") return null;
+  // The relay writes both for an agent's query and neither for a person's view.
+  if ((v.viewerKind === "agent") !== (v.mode === "query")) return null;
+  let grantId: AgentContextViewGrantId | null = null;
+  if (v.grantId !== undefined) {
+    grantId = typeof v.grantId === "string" ? asAgentContextViewGrantId(v.grantId) : null;
+    if (!grantId) return null;
+  }
+  return {
+    requestId,
+    viewerUserId: v.viewerUserId as string,
+    ...(v.viewerKind === "agent" ? { viewerKind: "agent" as const } : {}),
+    ...(v.mode === "query" ? { mode: "query" as const } : {}),
+    ...(grantId ? { grantId } : {}),
+    agentId: v.agentId as string,
+    serverId: v.serverId as string,
+    messageId: v.messageId as string,
+    machineId: asMachineId(v.machineId as string),
+    viewerReplicaId: v.viewerReplicaId as string,
+    viewerEndpoint: v.viewerEndpoint as string | null,
+    createdAt: v.createdAt as string,
+  };
+}
+
+/** No-Redis fallback: a single replica keeps the records and claims in-process, with the same TTL. */
+const localAgentContextViewRequests = new Map<AgentContextViewRequestId, { raw: string; claimed: boolean; expiresAtMs: number }>();
+
+function liveLocalAgentContextViewRequest(requestId: AgentContextViewRequestId) {
+  const local = localAgentContextViewRequests.get(requestId);
+  if (!local) return null;
+  if (local.expiresAtMs <= currentTimeMs()) {
+    localAgentContextViewRequests.delete(requestId);
+    return null;
+  }
+  return local;
+}
+
+export async function createAgentContextViewRequest(record: AgentContextViewRequestRecord, ttlMs: number): Promise<void> {
+  const raw = JSON.stringify(record);
+  if (!isRedisAvailable()) {
+    localAgentContextViewRequests.set(record.requestId, { raw, claimed: false, expiresAtMs: currentTimeMs() + ttlMs });
+    return;
+  }
+  await getRedis().set(agentContextViewRequestKey(record.requestId), raw, "PX", ttlMs);
+}
+
+/** The record and whether a result POST has claimed it; null when unknown or expired. */
+export async function getAgentContextViewRequest(requestId: AgentContextViewRequestId): Promise<{ record: AgentContextViewRequestRecord; claimed: boolean } | null> {
+  if (!isRedisAvailable()) {
+    const local = liveLocalAgentContextViewRequest(requestId);
+    const record = parseAgentContextViewRequestRecord(local?.raw);
+    return local && record ? { record, claimed: local.claimed } : null;
+  }
+  const [raw, claimed] = await getRedis().mget(agentContextViewRequestKey(requestId), agentContextViewClaimKey(requestId));
+  const record = parseAgentContextViewRequestRecord(raw);
+  return record ? { record, claimed: claimed !== null } : null;
+}
+
+/**
+ * The first result POST from the Computer the request was sent to claims it,
+ * whatever its body. The record is immutable, so reading it and then SET NX
+ * on the claim key is atomic for the claim; the claim key lives at most as
+ * long as the request (`ttlMs`).
+ */
+export async function claimAgentContextViewRequest(requestId: AgentContextViewRequestId, callerMachineId: MachineId, ttlMs: number): Promise<AgentContextViewRequestClaim> {
+  if (!isRedisAvailable()) {
+    const local = liveLocalAgentContextViewRequest(requestId);
+    const record = parseAgentContextViewRequestRecord(local?.raw);
+    if (!local || !record) return { kind: "unknown" };
+    if (record.machineId !== callerMachineId) return { kind: "wrong_computer" };
+    if (local.claimed) return { kind: "already_claimed" };
+    local.claimed = true;
+    return { kind: "claimed", record };
+  }
+  const redis = getRedis();
+  const record = parseAgentContextViewRequestRecord(await redis.get(agentContextViewRequestKey(requestId)));
+  if (!record) return { kind: "unknown" };
+  if (record.machineId !== callerMachineId) return { kind: "wrong_computer" };
+  const won = await redis.set(agentContextViewClaimKey(requestId), "1", "PX", ttlMs, "NX");
+  return won === "OK" ? { kind: "claimed", record } : { kind: "already_claimed" };
+}
+
+/** This replica's replay endpoint (null when it has none), for a record a result on another replica must reach. */
+export function getLocalReplicaReplayEndpoint(): string | null {
+  return _replicaReplayEndpoint;
+}
+
 // --- Machine meta in Redis ---
 //
 // Live machine fields that are reported by the daemon's `ready` message and
@@ -2130,6 +2574,11 @@ export interface MachineMeta {
   /** Latest `machine:disk_status`, decimal strings. */
   diskAvailableBytes?: string | null;
   diskTotalBytes?: string | null;
+  /** Latest `machine:memory_status`, decimal strings. */
+  memoryAvailableBytes?: string | null;
+  memoryTotalBytes?: string | null;
+  /** #proj-raft-computer task #34: JSON of `ready.installerRepairHint` / its later change; null when there is nothing to hint. */
+  installerRepairHint?: string | null;
 }
 
 // 1h TTL: long enough that brief Redis hiccups don't drop live metadata,
@@ -2245,3 +2694,35 @@ export async function getFlyInstanceForMachine(machineId: string): Promise<strin
   if (!flyId || flyId === FLY_INSTANCE) return null;
   return flyId;
 }
+
+export function setMachineConnectionDropHandler(handler: MachineConnectionDropHandler | null): void {
+  _machineConnectionDropHandler = handler;
+}
+
+/**
+ * Closes a machine's live connection wherever it is held, after its credential
+ * changed (rotated, revoked). A rotated or revoked key is checked at the next
+ * handshake; without this the open socket kept working until it dropped on its
+ * own. The local replica runs first; the content-free broadcast reaches the rest.
+ */
+export async function dropMachineConnectionEverywhere(
+  machineId: string,
+  reason: MachineConnectionDropReason,
+): Promise<void> {
+  await _machineConnectionDropHandler?.(machineId, reason);
+  // Runs after the caller committed the credential change: the broadcast must
+  // neither hang the request (the shared client retries without limit while
+  // Redis reconnects) nor turn a committed change into a 500. A failure leaves
+  // the socket open on another replica until it reconnects, so it is recorded
+  // as a named event that o11y alerts on.
+  const redis = getBoundedRedis(MACHINE_CONNECTION_DROP_PUBLISH_TIMEOUT_MS);
+  if (!redis) return;
+  try {
+    await redis.publish(MACHINE_CONNECTION_DROP_CHANNEL, JSON.stringify({ machineId, reason, from: REPLICA_ID }));
+  } catch (err) {
+    addTraceEvent("machine_connection.drop_broadcast_failed", { reason, error_class: errorClassOf(err) });
+    console.error(`[ReplicaRouter] Failed to publish the connection drop for ${machineId}:`, err);
+  }
+}
+
+const MACHINE_CONNECTION_DROP_PUBLISH_TIMEOUT_MS = 2_000;

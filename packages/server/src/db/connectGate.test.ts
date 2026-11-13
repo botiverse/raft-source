@@ -3,13 +3,16 @@ import net from "node:net";
 import pg from "pg";
 import { afterEach, test } from "vitest";
 import {
+  CONNECT_TRANSPORT_TIMEOUT,
   DEFAULT_PG_CONNECT_CONCURRENCY,
+  DEFAULT_PG_CONNECT_TRANSPORT_TIMEOUT_MS,
   connectErrorCategory,
   connectPermitWaitMs,
   type ConnectAttemptFailure,
   createConnectGate,
   gatedClientClass,
   resolveConnectConcurrency,
+  resolveConnectTransportTimeoutMs,
 } from "./connectGate";
 
 // A TCP server that accepts connections and never answers the startup packet,
@@ -25,6 +28,10 @@ async function hangingServer() {
     maxOpen = Math.max(maxOpen, sockets.size);
     socket.on("error", () => {});
     socket.on("close", () => sockets.delete(socket));
+    // Read (and drop) what the client sends without ever answering: a socket
+    // never read does not see the client's FIN, so it would not notice a
+    // client that gave up and closed.
+    socket.resume();
   });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const port = (server.address() as net.AddressInfo).port;
@@ -250,4 +257,139 @@ test("connect error categories are codes or fixed labels, never message text", (
   assert.equal(connectErrorCategory(new Error("remaining connection slots are reserved")), "too_many_connections");
   assert.equal(connectErrorCategory(new Error("something with a secret host db.internal")), "other");
   assert.equal(connectErrorCategory("not an error"), "other");
+});
+
+test("PG_CONNECT_TRANSPORT_TIMEOUT_MS defaults to 2500 and 0 disables the deadline", () => {
+  assert.equal(resolveConnectTransportTimeoutMs({}), DEFAULT_PG_CONNECT_TRANSPORT_TIMEOUT_MS);
+  assert.equal(resolveConnectTransportTimeoutMs({ PG_CONNECT_TRANSPORT_TIMEOUT_MS: "0" }), 0);
+  assert.equal(resolveConnectTransportTimeoutMs({ PG_CONNECT_TRANSPORT_TIMEOUT_MS: "1500" }), 1500);
+  assert.equal(resolveConnectTransportTimeoutMs({ PG_CONNECT_TRANSPORT_TIMEOUT_MS: "nope" }), DEFAULT_PG_CONNECT_TRANSPORT_TIMEOUT_MS);
+});
+
+test("a handshake stuck in its transport (TLS never answered) gives up at the transport deadline, its socket closed before the permit moves on", async () => {
+  // #triage:e17fe621 (10-29): one task opened no connection for 4 minutes;
+  // hung handshakes held every permit for the full pool timeout.
+  const server = await hangingServer();
+  cleanups.push(server.close);
+  const failures: ConnectAttemptFailure[] = [];
+  const clients: pg.Client[] = [];
+  // A socket that dialed (connecting, or connected to the server) and is not
+  // destroyed. A queued client's socket was never dialed: no remote address.
+  type Stream = { destroyed?: boolean; connecting?: boolean; remoteAddress?: string };
+  const liveSockets = () => clients.filter((client) => {
+    const stream = (client as unknown as { connection?: { stream?: Stream } }).connection?.stream;
+    return stream && !stream.destroyed && (stream.connecting || stream.remoteAddress !== undefined);
+  }).length;
+  // Checked at every permit grant, before that client dials: with a gate of 1
+  // no other handshake's socket may still be open. (The server's own count
+  // can lag: it may accept the next connection before reading the old FIN.)
+  const liveAtGrant: number[] = [];
+  const Gated = gatedClientClass(createConnectGate(1), () => liveAtGrant.push(liveSockets()), (failure) => failures.push(failure), 200);
+  class Recorded extends Gated {
+    constructor(...args: ConstructorParameters<typeof pg.Client>) {
+      super(...args);
+      clients.push(this);
+    }
+  }
+  const pool = new pg.Pool({
+    connectionString: server.url,
+    ssl: { rejectUnauthorized: false },
+    max: 10,
+    connectionTimeoutMillis: 5_000,
+    Client: Recorded,
+  });
+  cleanups.push(() => pool.end().catch(() => {}));
+
+  const startedAt = Date.now();
+  const errors = await Promise.all(Array.from({ length: 3 }, () => pool.connect().then(() => null, (err: Error) => err)));
+  const elapsed = Date.now() - startedAt;
+  assert.ok(errors.every((err) => err instanceof Error));
+  // Three in a row at ~200 ms each, far below the 5 s pool timeout.
+  assert.ok(elapsed < 2_000, `took ${elapsed} ms`);
+  await until(() => failures.length === 3);
+  for (const failure of failures) {
+    assert.equal(failure.stage, "handshake");
+    assert.equal(failure.errorCategory, CONNECT_TRANSPORT_TIMEOUT);
+    assert.equal(failure.handshakeStage, "tls");
+    assert.equal(typeof failure.phases?.tcpMs, "number", "TCP had connected");
+  }
+  assert.equal(server.stats().accepted, 3);
+  assert.deepEqual(liveAtGrant, [0, 0, 0], "each socket was destroyed before its permit went to the next connect");
+  await until(() => server.stats().open === 0);
+});
+
+test("a handshake slow after its transport (startup/auth) is not cut by the transport deadline", async () => {
+  // 11-02: Neon slow but handshakes completing; the deadline must not turn
+  // slow into failed. Without TLS the transport is done at TCP connect.
+  const server = await hangingServer();
+  cleanups.push(server.close);
+  const failures: ConnectAttemptFailure[] = [];
+  const pool = new pg.Pool({
+    connectionString: server.url,
+    max: 10,
+    connectionTimeoutMillis: 600,
+    Client: gatedClientClass(createConnectGate(1), () => {}, (failure) => failures.push(failure), 100),
+  });
+  cleanups.push(() => pool.end().catch(() => {}));
+
+  const err = await pool.connect().then(() => null, (error: Error) => error);
+  assert.ok(err instanceof Error);
+  await until(() => failures.length === 1);
+  const [failure] = failures;
+  assert.equal(failure!.handshakeStage, "auth");
+  assert.notEqual(failure!.errorCategory, CONNECT_TRANSPORT_TIMEOUT, "the pool timeout ended it, not the transport deadline");
+  assert.ok(failure!.handshakeMs >= 500, `ran to the pool timeout, ${failure!.handshakeMs} ms`);
+});
+
+test("a handshake whose TLS stalls after the server accepted it gives up at the transport deadline, closing the TLS socket", async () => {
+  // The server answers the SSLRequest with 'S' and then never speaks TLS: pg
+  // has swapped in its TLS socket, and that is the one destroyed at the
+  // deadline (Tenny's review of #12970, #proj-data:#10).
+  const sockets = new Set<net.Socket>();
+  let closedOnServer = 0;
+  // A TLS ClientHello (record type 0x16) after the 'S': pg had built its TLS
+  // socket, so the socket the deadline destroyed was that one, not the raw
+  // TCP socket (which the test above covers).
+  let sawClientHello = false;
+  const server = net.createServer((socket) => {
+    sockets.add(socket);
+    socket.on("error", () => {});
+    socket.on("close", () => { sockets.delete(socket); closedOnServer += 1; });
+    let answered = false;
+    socket.on("data", (chunk: Buffer) => {
+      if (!answered) {
+        answered = true;
+        socket.write("S");
+      } else if (chunk[0] === 0x16) {
+        sawClientHello = true;
+      }
+    });
+    // Read (and drop) the rest without answering, so the client's FIN is seen.
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  cleanups.push(async () => {
+    for (const socket of sockets) socket.destroy();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+  const port = (server.address() as net.AddressInfo).port;
+  const failures: ConnectAttemptFailure[] = [];
+  const pool = new pg.Pool({
+    connectionString: `postgres://gate-test@127.0.0.1:${port}/none`,
+    ssl: { rejectUnauthorized: false },
+    max: 4,
+    connectionTimeoutMillis: 5_000,
+    Client: gatedClientClass(createConnectGate(1), () => {}, (failure) => failures.push(failure), 200),
+  });
+  cleanups.push(() => pool.end().catch(() => {}));
+
+  const startedAt = Date.now();
+  const err = await pool.connect().then(() => null, (error: Error) => error);
+  assert.ok(err instanceof Error);
+  assert.ok(Date.now() - startedAt < 2_000, "gave up at the transport deadline, not the pool timeout");
+  await until(() => failures.length === 1);
+  assert.equal(failures[0]!.errorCategory, CONNECT_TRANSPORT_TIMEOUT);
+  assert.equal(failures[0]!.handshakeStage, "tls");
+  assert.ok(sawClientHello, "pg had switched to its TLS socket before the deadline");
+  // The connection is gone on the server side too.
+  await until(() => closedOnServer === 1 && sockets.size === 0);
 });

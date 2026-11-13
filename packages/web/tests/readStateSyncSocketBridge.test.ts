@@ -247,7 +247,6 @@ function resetThreadStore(threads: FollowedThread[] = []) {
     followedThreads: threads,
     followOverrides: {},
     taskUpdatesByMessageId: {},
-    focusedThreadChannelId: null,
   });
 }
 
@@ -2168,4 +2167,18 @@ test("conversation All Read clears an unopened root despite a lagging positive s
     api.get = originalGet;
     useThreadStore.setState({ loadFollowedThreads: originalLoadThreads });
   }
+});
+
+test("a catch-up batch that carries the same message twice stores and counts it once", () => {
+  resetAll();
+  const channelId = "channel-batch-duplicates";
+
+  useMessageStore.getState().batchAddMessages([
+    makeMessage({ id: "dup-1", seq: 11, channelId }),
+    makeMessage({ id: "dup-1", seq: 11, channelId }),
+    makeMessage({ id: "dup-2", seq: 12, channelId }),
+  ]);
+
+  assert.deepEqual(useMessageStore.getState().channelMessages[channelId]?.map((m) => m.id), ["dup-1", "dup-2"]);
+  assert.equal(useMessageStore.getState().unreadCounts[channelId], 2);
 });

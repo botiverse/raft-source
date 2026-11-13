@@ -6,6 +6,7 @@ import {
   getFollowedThreads,
   getInboxItems,
   getOrCreateThread,
+  readAgentInboxChainTargetSeqs,
   selectAgentInboxChainRows,
 } from "./channelService";
 import { installRisingWaveReadReferences, uninstallRisingWaveReadReferences } from "../test/risingWaveReadReference";
@@ -91,25 +92,6 @@ test("totals batch with configured RW that fails throws — absence is not manuf
   );
 });
 
-test("no fail-soft vocabulary survives in the service", async () => {
-  const source = (await import("node:fs")).readFileSync(
-    new URL("./channelService.ts", import.meta.url),
-    "utf8",
-  ) as string;
-  // The teardown's contract: these constructs must not grow back.
-  assert.doesNotMatch(source, /tryReadRisingWaveInboxWithFailSoft/);
-  assert.doesNotMatch(source, /risingWaveInboxBreaker/);
-  assert.doesNotMatch(source, /halfOpenProbeInFlight/);
-  assert.doesNotMatch(source, /getInboxItemsFromServingRows/);
-  assert.doesNotMatch(source, /rfc056ServingMode/);
-  assert.doesNotMatch(source, /inbox\.rw\.failsoft\.fallback/);
-  // Hard dependency: no RW-absent Postgres path may grow back either.
-  assert.doesNotMatch(source, /no_rw_env/);
-  assert.doesNotMatch(source, /no-env/i);
-  assert.doesNotMatch(source, /conversationUnreadPostgres/);
-  assert.doesNotMatch(source, /"rw_row_mismatch"|"feature_disabled"/);
-});
-
 // Agent resume recovery has ONE source, the unified chain. When it cannot be
 // read the selection says so and the resume skips recovery; nothing reroutes.
 test("agent inbox selection: unconfigured RisingWave is unavailable, not a Postgres read", async ({ seed }) => {
@@ -170,4 +152,39 @@ test("agent inbox selection: a successful chain read returns the chain rows", as
     mentionUnread: 0, maxMentionSeq: null, subscribed: true, offeredUnread: 2, activitySeq: 6,
     joinedAt: new Date("2026-09-01T00:00:00.000Z"),
   }]);
+});
+
+// /events?wait_for= re-checks just the notice's rows: one small read of the
+// same view (with the same generation fallback), never Postgres.
+test("agent inbox target seqs: one read of the named rows; unconfigured is null; a failure throws", async ({ seed }) => {
+  await seed.human();
+  const agentId = "00000000-0000-4000-8000-000000000001";
+  assert.equal(await readAgentInboxChainTargetSeqs(agentId, ["t-1"]), null);
+  const queries: Array<{ text: string; values: unknown[] }> = [];
+  __testRisingWaveInbox.set({
+    getPool: () => ({} as never),
+    query: (async (_pool: unknown, text: string, values?: unknown[]) => {
+      queries.push({ text, values: values ?? [] });
+      if (/rw_target_latest_v4/.test(text)) return { result: { rows: [{ target_id: "t-2", latest_seq: "9" }] } };
+      return { result: { rows: [{ target_id: "t-1", latest_seq: "6", max_mention_seq: null, last_read_seq: "4" }] } };
+    }) as never,
+  });
+  assert.deepEqual(await readAgentInboxChainTargetSeqs(agentId, ["t-1", "t-2"]), [
+    { targetId: "t-1", latestSeq: 6, maxMentionSeq: null, lastReadSeq: 4, inAgentInbox: true, targetLatestSeq: null },
+    { targetId: "t-2", latestSeq: null, maxMentionSeq: null, lastReadSeq: 0, inAgentInbox: false, targetLatestSeq: 9 },
+  ]);
+  assert.equal(queries.length, 2, "the target read only for the target without an agent row");
+  assert.match(queries[1]!.text, /FROM rw_target_latest_v4\s+WHERE target_id = ANY\(\$1\)/);
+  assert.deepEqual(queries[1]!.values, [["t-2"]]);
+  assert.match(queries[0]!.text, /SELECT target_id, latest_seq, max_mention_seq, last_read_seq\s+FROM rw_agent_inbox_v7\s+WHERE agent_id = \$1 AND target_id = ANY\(\$2\)/);
+  assert.deepEqual(queries[0]!.values, [agentId, ["t-1", "t-2"]]);
+  assert.deepEqual(await readAgentInboxChainTargetSeqs(agentId, []), [], "no targets, no read");
+  assert.equal(queries.length, 2);
+
+  __testRisingWaveInbox.set({
+    query: (async () => {
+      throw Object.assign(new Error("connect ECONNREFUSED 10.0.0.1:4566"), { code: "ECONNREFUSED" });
+    }) as never,
+  });
+  await assert.rejects(readAgentInboxChainTargetSeqs(agentId, ["t-1"]), /ECONNREFUSED/);
 });

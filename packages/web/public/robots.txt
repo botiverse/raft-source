@@ -1,9 +1,58 @@
-# app.slock.ai — robots.txt
-# The web app is an authenticated SPA with no public content worth indexing.
-# Block all crawlers to prevent share-link pages (/s/{slug}/) and other
-# app routes from appearing in search results.
+# app.raft.build — robots.txt
+# The web app is an authenticated SPA. Crawlers may fetch only public
+# Artifact pages (/artifacts/), the preview image their link cards name
+# (/android-chrome-512x512.png: X and others fetch it under robots.txt, so
+# a disallowed image leaves the card blank) and /llms.txt, so that AI tools
+# and link previews can read what anyone with the link can already open. Robots does
+# not decide indexing: every Artifact page says noindex (a robots meta tag
+# and an X-Robots-Tag header), and allowing the fetch is what lets a crawler
+# see that noindex. Everything else stays disallowed.
 #
-# Search engines should index slock.ai (the landing/marketing site) instead.
+# Search engines should index raft.build (the landing/marketing site) instead.
+#
+# AI training crawlers may fetch nothing: public Artifacts are users' content
+# (huxijin, #proj-seo:ba1b65bd). Fetchers a person triggers (ChatGPT-User,
+# Claude-User, Perplexity-User) follow the `*` rules. The list is shared
+# aiTrainingCrawlers.ts; a web test checks this file matches it.
+
+User-agent: GPTBot
+Disallow: /
+
+User-agent: ClaudeBot
+Disallow: /
+
+User-agent: anthropic-ai
+Disallow: /
+
+User-agent: Claude-Web
+Disallow: /
+
+User-agent: Google-Extended
+Disallow: /
+
+User-agent: CCBot
+Disallow: /
+
+User-agent: Applebot-Extended
+Disallow: /
+
+User-agent: meta-externalagent
+Disallow: /
+
+User-agent: Bytespider
+Disallow: /
+
+User-agent: cohere-ai
+Disallow: /
+
+User-agent: Amazonbot
+Disallow: /
+
+User-agent: MistralAI-Training
+Disallow: /
 
 User-agent: *
+Allow: /artifacts/
+Allow: /android-chrome-512x512.png
+Allow: /llms.txt
 Disallow: /

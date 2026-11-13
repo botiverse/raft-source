@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { isInTransaction } from "../db/ambientTransaction";
 import { asc, eq, inArray, sql, and, or } from "drizzle-orm";
+import { deploymentAnswerOf } from "./deploymentAnsweredFlags";
 import { getDb, type DatabaseExecutor, type DatabaseTransaction } from "../db/index";
 import {
   featureFlagConfigVersions,
@@ -15,15 +16,15 @@ import {
 } from "../db/schema";
 import { getServerBillingEntitlements, type ServerBillingEntitlement } from "./planService";
 import {
-  AGENT_MIGRATION_FEATURE_FLAG_KEY as SHARED_AGENT_MIGRATION_FEATURE_FLAG_KEY,
-  APPLE_WEB_LOGIN_FEATURE_FLAG_KEY as SHARED_APPLE_WEB_LOGIN_FEATURE_FLAG_KEY,
-  CHANNEL_TO_JOINT_CONVERSION_FEATURE_FLAG_KEY as SHARED_CHANNEL_TO_JOINT_CONVERSION_FEATURE_FLAG_KEY,
-  COMPOSER_RESOURCE_REFERENCES_FEATURE_FLAG_KEY as SHARED_COMPOSER_RESOURCE_REFERENCES_FEATURE_FLAG_KEY,
+  AGENT_READ_PROGRESS_FEATURE_FLAG_KEY as SHARED_AGENT_READ_PROGRESS_FEATURE_FLAG_KEY,
+  AGENT_INBOX_ITEMS_FEATURE_FLAG_KEY as SHARED_AGENT_INBOX_ITEMS_FEATURE_FLAG_KEY,
+  APP_PROMPT_TEXT_CONSENT_FEATURE_FLAG_KEY as SHARED_APP_PROMPT_TEXT_CONSENT_FEATURE_FLAG_KEY,
+  CLAUDE_LIMIT_RESET_FEATURE_FLAG_KEY as SHARED_CLAUDE_LIMIT_RESET_FEATURE_FLAG_KEY,
+  WORKSPACE_ARTIFACTS_FEATURE_FLAG_KEY as SHARED_WORKSPACE_ARTIFACTS_FEATURE_FLAG_KEY,
   PROVIDER_CONNECTIONS_FEATURE_FLAG_KEY as SHARED_PROVIDER_CONNECTIONS_FEATURE_FLAG_KEY,
   PUBLIC_SERVER_FEATURE_FLAG_KEY as SHARED_PUBLIC_SERVER_FEATURE_FLAG_KEY,
   SERVER_LABS_UI_FEATURE_FLAG_KEY as SHARED_SERVER_LABS_UI_FEATURE_FLAG_KEY,
   SERVER_GUEST_FEATURE_FLAG_KEY as SHARED_SERVER_GUEST_FEATURE_FLAG_KEY,
-  REMOTE_COMPUTER_UPGRADE_V2_FEATURE_FLAG_KEY as SHARED_REMOTE_COMPUTER_UPGRADE_V2_FEATURE_FLAG_KEY,
   canUseProBillingFeatures,
   clientRuleConstraintsSatisfied,
   clientRuleShapeError,
@@ -36,43 +37,52 @@ import {
 } from "@botiverse/raft-shared";
 
 export const FEATURE_FLAG_CONFIG_SCOPE_GLOBAL = "global";
-export const ATTACHMENT_COMMENTS_FEATURE_FLAG_KEY = "attachment_comments_v0";
-export const ATTACHMENT_DIRECT_UPLOAD_FEATURE_FLAG_KEY = "attachment_direct_upload_v0";
+/** Task #4 (#proj-apps): see APP_PROMPT_TEXT_CONSENT_FEATURE_FLAG_KEY in packages/shared. */
+export const APP_PROMPT_TEXT_CONSENT_FEATURE_FLAG_KEY = SHARED_APP_PROMPT_TEXT_CONSENT_FEATURE_FLAG_KEY;
+/** Claude limit resets on the Computer usage card: see CLAUDE_LIMIT_RESET_FEATURE_FLAG_KEY in packages/shared. */
+export const CLAUDE_LIMIT_RESET_FEATURE_FLAG_KEY = SHARED_CLAUDE_LIMIT_RESET_FEATURE_FLAG_KEY;
 /**
- * Recent search on a dense term walks only the caller's server
- * (message_server_timeline). Absent = off (global walk); turn on only after the
- * timeline verified 0/0; kill_switch reverts to the global walk without a deploy.
+ * The server's switch for GET /api/sync/changes (#triage:458d78f1). The web
+ * always pulls (from its first reconnect); the mobile flag
+ * (mobile_sync_changes_v0) only stops a client at its next reconnect, and
+ * older clients never read it. This is the one switch that stops the web. Server-scoped; absent =
+ * served. The flag's kill_switch, or the flag turned off, answers 404 to every
+ * client on that server, which then falls back to its full reloads. Read
+ * through the per-process flag cache, so it adds no query per request.
  */
-export const SEARCH_SERVER_TIMELINE_WALK_FEATURE_FLAG_KEY = "search_server_timeline_walk";
-export const ATTACHMENT_ORIGINAL_STORAGE_V2_FEATURE_FLAG_KEY = "attachment_original_storage_v2";
+export const SYNC_CHANGES_API_FEATURE_FLAG_KEY = "sync_changes_api";
+/**
+ * #raft-architecture:#29: the text match of a search reads only the searched
+ * server's matches (plus the joint storage server's, for visible joint
+ * conversations) through idx_message_server_timeline_server_search instead of
+ * every server's through idx_messages_search_vector_gin. Absent = off; turn on
+ * only after the 0658 vector backfill verified 0 and that index is valid;
+ * kill_switch reverts to the corpus-wide match without a deploy.
+ */
+export const SEARCH_SERVER_GIN_FEATURE_FLAG_KEY = "search_server_gin_v0";
+/**
+ * Closed-server purge (services/closedServerPurge.ts), randomization unit
+ * `server`, evaluated per closed server by the hourly job. On with no variant
+ * or variant `count`: the server is counted (nothing is deleted). Variant
+ * `delete` from a server rule naming it (evaluation reason `server_rule`),
+ * and only that: the server is purged for good
+ * (services/closedServerPurgeDelete.ts); `delete` as the default variant or
+ * from any other rule is counted, not purged. Missing, disabled, kill
+ * switch, or any other variant: not touched.
+ */
+export const CLOSED_SERVER_PURGE_FEATURE_FLAG_KEY = "closed_server_purge";
 export const ATTACHMENT_PREVIEW_UNIFIED_FEATURE_FLAG_KEY = "attachment_preview_unified_v0";
-export const PUBLIC_DERIVED_STORAGE_V2_FEATURE_FLAG_KEY = "public_derived_storage_v2";
-export const ONBOARDING_OPENER_V2_FEATURE_FLAG_KEY = "onboarding_opener_v2";
 export const ONBOARDING_OWNER_WIZARD_FEATURE_FLAG_KEY = "onboarding_owner_wizard_v0";
-export const AGENT_MIGRATION_FEATURE_FLAG_KEY = SHARED_AGENT_MIGRATION_FEATURE_FLAG_KEY;
-export const APPLE_WEB_LOGIN_FEATURE_FLAG_KEY = SHARED_APPLE_WEB_LOGIN_FEATURE_FLAG_KEY;
-export const CHANNEL_TO_JOINT_CONVERSION_FEATURE_FLAG_KEY = SHARED_CHANNEL_TO_JOINT_CONVERSION_FEATURE_FLAG_KEY;
-export const COMPOSER_RESOURCE_REFERENCES_FEATURE_FLAG_KEY = SHARED_COMPOSER_RESOURCE_REFERENCES_FEATURE_FLAG_KEY;
-export const READ_RECEIPTS_FEATURE_FLAG_KEY = "read_receipts_v0";
-// Android (FCM) delivery rollout. Sends only when FCM is configured
-// (FCM_CREDENTIALS_JSON + FCM_PROJECT_ID, fcmPushProvider.ts).
-export const MOBILE_PUSH_FCM_FEATURE_FLAG_KEY = "mobile_push_fcm_v0";
-export const GROK_RUNTIME_FEATURE_FLAG_KEY = "grok_runtime_v0";
-export const LLM_TRANSLATION_FEATURE_FLAG_KEY = "llm_translation_v0";
+/** Workspace Artifacts: see WORKSPACE_ARTIFACTS_FEATURE_FLAG_KEY in packages/shared. */
+export const WORKSPACE_ARTIFACTS_FEATURE_FLAG_KEY = SHARED_WORKSPACE_ARTIFACTS_FEATURE_FLAG_KEY;
+/** Agent read progress pushed to a conversation's viewers: see AGENT_READ_PROGRESS_FEATURE_FLAG_KEY in packages/shared. */
+export const AGENT_READ_PROGRESS_FEATURE_FLAG_KEY = SHARED_AGENT_READ_PROGRESS_FEATURE_FLAG_KEY;
+/** RFC 081 inbox items: see AGENT_INBOX_ITEMS_FEATURE_FLAG_KEY in packages/shared. */
+export const AGENT_INBOX_ITEMS_FEATURE_FLAG_KEY = SHARED_AGENT_INBOX_ITEMS_FEATURE_FLAG_KEY;
 export const PROVIDER_CONNECTIONS_FEATURE_FLAG_KEY = SHARED_PROVIDER_CONNECTIONS_FEATURE_FLAG_KEY;
 export const PUBLIC_SERVER_FEATURE_FLAG_KEY = SHARED_PUBLIC_SERVER_FEATURE_FLAG_KEY;
 export const SERVER_LABS_UI_FEATURE_FLAG_KEY = SHARED_SERVER_LABS_UI_FEATURE_FLAG_KEY;
 export const SERVER_GUEST_FEATURE_FLAG_KEY = SHARED_SERVER_GUEST_FEATURE_FLAG_KEY;
-export const REMOTE_COMPUTER_UPGRADE_V2_FEATURE_FLAG_KEY = SHARED_REMOTE_COMPUTER_UPGRADE_V2_FEATURE_FLAG_KEY;
-/**
- * RFC 070 constructed wake context (at-wake session recycling with a
- * constructed briefing, the cold-idle sweep, and the startup MEMORY.md block).
- * Server-scoped, default OFF: evaluated at each agent start and sent to the
- * daemon as `AgentConfig.constructedWakeContext`; a missing flag or any
- * evaluation failure leaves the behavior off.
- */
-export const CONSTRUCTED_WAKE_CONTEXT_FEATURE_FLAG_KEY = "constructed_wake_context";
-
 /**
  * Sub-agent delegation prompt: named agents whose runtime can start sub-agents
  * are told to stay on Raft (think, reply fast, coordinate) and hand hands-on
@@ -93,11 +103,126 @@ export const SUBAGENT_DELEGATION_FEATURE_FLAG_KEY = "subagent_delegation_prompt"
 export const PASSIVE_AX_FEATURE_FLAG_KEY = "passive_ax";
 
 /**
- * RFC 074 §2 personal assistant v0 (identity borrowing). Server-scoped,
- * default OFF: a missing flag or any evaluation failure keeps every
- * assistant-only read refused and the assistant link unsettable.
+ * pi session rotation (pi#10642, #wg-memory-usage:f66a5385). Server-scoped,
+ * default OFF: evaluated at each agent start and sent to the daemon as
+ * `AgentConfig.piSessionRotation`; a missing flag or any evaluation failure
+ * leaves it off. Only pi and Built-in agents act on it: after a compaction
+ * they move a session file over the size threshold to a new file from the
+ * latest compaction, under the same session id. The daemon's
+ * `RAFT_PI_SESSION_ROTATION=0` stays a local off switch.
  */
-export const IDENTITY_BORROWING_FEATURE_FLAG_KEY = "identity_borrowing";
+export const PI_SESSION_ROTATION_FEATURE_FLAG_KEY = "pi_session_rotation";
+
+/**
+ * Wake recycle on the OAR host (#proj-runtime:#54). Server-scoped, default
+ * OFF: evaluated at each agent start and sent to the daemon as
+ * `AgentConfig.wakeRecycleOar` (also answered by `server:features`). One
+ * switch for both halves: the OAR host reads Codex and Grok sessions' resume
+ * facts from its session summary, and stops a cold idle session so the next
+ * wake can start fresh. The daemon's `RAFT_WAKE_RECYCLE=0` stays a local off
+ * switch.
+ */
+export const WAKE_RECYCLE_OAR_FEATURE_FLAG_KEY = "wake_recycle_oar";
+
+/**
+ * Wake recycle gated on the cache tier (#proj-runtime:#54 phase 2).
+ * Server-scoped, default OFF: evaluated at each agent start and sent as
+ * `AgentConfig.wakeRecycleTierGate` (also answered by `server:features`).
+ * With it on, a session whose last cache write was the 5-minute tier is cold
+ * after a short gap, and a session past its tier's lifetime recycles from a
+ * 64k context instead of 128k. Rolled out per server and measured as cost
+ * per agent per day against today before it becomes the default.
+ */
+export const WAKE_RECYCLE_TIER_GATE_FEATURE_FLAG_KEY = "wake_recycle_tier_gate";
+
+/**
+ * Native compaction at a turn end past a size threshold (#proj-runtime:#54
+ * phase 3). Server-scoped, default OFF: evaluated at each agent start and
+ * sent as `AgentConfig.turnEndCompaction` (also answered by
+ * `server:features`). With it on, a session whose last model request carried
+ * more than 250k tokens, on a model with a window of at least 400k, compacts
+ * with the runtime's own compaction at a turn end where nothing is running,
+ * held or queued. Rolled out per server and checked against the bench chain
+ * before it becomes the default.
+ */
+export const TURN_END_COMPACTION_FEATURE_FLAG_KEY = "turn_end_compaction";
+
+/**
+ * Warm wake recycle (#proj-runtime:#54, RFC 070 §6.5). Server-scoped, default
+ * OFF: evaluated at each agent start and sent as `AgentConfig.wakeRecycleWarm`
+ * (also answered by `server:features`). With it on, a session whose last
+ * model request carried more than 250k tokens, on a model with a window of
+ * at least 400k, is stopped at a clean turn end (after two quiet minutes; at
+ * once past 500k) and starts fresh with a briefing at its next wake, whatever
+ * the gap. Independent of `wake_recycle_oar`, the tier gate and
+ * `turn_end_compaction`. The daemon's `RAFT_WAKE_RECYCLE=0` stays a local off
+ * switch.
+ */
+export const WAKE_RECYCLE_WARM_FEATURE_FLAG_KEY = "wake_recycle_warm";
+
+/**
+ * RFC 060 OAR host, one flag per runtime that also has a legacy driver
+ * (antigravity, grok), so each runtime rolls out on its own. Codex no longer
+ * has one (retired, #raft-architecture:#32): it runs on the OAR host wherever
+ * the Computer advertises `runtime-host:oar:codex`. Server-scoped,
+ * default OFF: a missing flag or any evaluation failure leaves it off.
+ * Evaluated at each agent start for the agent's runtime and sent as
+ * `AgentConfig.runtimeHost = "oar"`, and only to a daemon that advertised
+ * `runtime-host:oar` (an older Computer keeps its drivers); the daemon still
+ * runs a start it cannot host on its drivers. A flag change takes effect at
+ * the agent's next start, never on a running session.
+ * `RAFT_AGENT_RUNTIME_OAR_DISABLED` turns every runtime off on this server.
+ */
+export const AGENT_RUNTIME_OAR_FEATURE_FLAG_KEYS = {
+  antigravity: "agent_runtime_oar_antigravity",
+  grok: "agent_runtime_oar_grok",
+  // #oar-raft:#10: Cursor through the Cursor SDK, only from a Computer that
+  // advertises `runtime-host:oar:cursor` (Linux, non-SEA, SDK present). Keep
+  // it off until OAR runs Cursor in a per-session child process that takes
+  // the launch environment (daemon/src/agentHost/README.md, "Cursor").
+  cursor: "agent_runtime_oar_cursor",
+  // A flag on a DEPRECATED runtime (antigravity) also reopens creating and
+  // switching to it where it is on (runtimeAdmissionService.ts
+  // FLAG_REVIVED_RUNTIME_IDS, tygg #oar-raft:e9798673). Adding a flag for
+  // Kimi CLI, Copilot or Gemini would do the same for them.
+  // No flag for the runtimes that run only on the OAR host (Qwen Code,
+  // Qoder): whether one can be used is what the agent's Computer reports, not
+  // a server switch (xxchan, #proj-runtime:a5762001).
+} as const;
+export type AgentRuntimeOarFeatureFlagKey = (typeof AGENT_RUNTIME_OAR_FEATURE_FLAG_KEYS)[keyof typeof AGENT_RUNTIME_OAR_FEATURE_FLAG_KEYS];
+export const AGENT_RUNTIME_OAR_DISABLED_ENV = "RAFT_AGENT_RUNTIME_OAR_DISABLED";
+
+/** The OAR host flag for a runtime, or null for a runtime the OAR host does not run. */
+export function agentRuntimeOarFeatureFlagKey(runtime: string | null | undefined): AgentRuntimeOarFeatureFlagKey | null {
+  return Object.prototype.hasOwnProperty.call(AGENT_RUNTIME_OAR_FEATURE_FLAG_KEYS, runtime ?? "")
+    ? AGENT_RUNTIME_OAR_FEATURE_FLAG_KEYS[runtime as keyof typeof AGENT_RUNTIME_OAR_FEATURE_FLAG_KEYS]
+    : null;
+}
+
+/** The server-wide kill switch: any value but empty, 0, false or off. */
+export function agentRuntimeOarDisabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const raw = env[AGENT_RUNTIME_OAR_DISABLED_ENV]?.trim().toLowerCase();
+  return raw !== undefined && raw !== "" && raw !== "0" && raw !== "false" && raw !== "off";
+}
+
+/**
+ * RFC 075 v4 personal assistant. Server-scoped, default OFF: a missing flag or
+ * any evaluation failure hides "my assistant", refuses creating one, and keeps
+ * every assistant-only read refused. (Replaces RFC 074's never-configured
+ * `identity_borrowing`.)
+ */
+export const PERSONAL_ASSISTANT_FEATURE_FLAG_KEY = "personal_assistant";
+
+/**
+ * The personal assistant's WeChat bridge (design "微信接入 Ottie" v8,
+ * services/wechatBridgeService.ts). User-scoped (evaluated with the person and
+ * the server), default OFF, effective only while `personal_assistant` is also
+ * on for the server and WECHAT_BRIDGE_CREDENTIAL_ENCRYPTION_KEY is set. Not
+ * seeded. While off, /api/servers/:id/assistant/wechat answers
+ * `available: false` and refuses a new binding (404). A missing flag or any
+ * evaluation failure reads as off.
+ */
+export const ASSISTANT_WECHAT_FEATURE_FLAG_KEY = "assistant_wechat_v0";
 
 /**
  * Reminder app gray rollout. Server-scoped, default OFF. When on, the legacy
@@ -133,6 +258,67 @@ export const ANTIPROTON_CINDY_FEATURE_FLAG_KEY = "antiproton_cindy";
  * A missing flag or any evaluation failure reads as off.
  */
 export const ANTIPROTON_MODEL_PICKER_FEATURE_FLAG_KEY = "antiproton_model_picker";
+
+/**
+ * #wg-rbac:#27 runner credential reconcile on reconnect: a daemon's first
+ * `ready` (runner-credential-reconcile:v1) revokes its Machine's runner
+ * credentials it does not hold (revokeRunnerCredentialsNotHeld). Server-scoped
+ * (the Machine's server), default OFF: the kill switch for a path that
+ * revokes credentials on every reconnect. Missing or failing reads as off.
+ * While off, a claiming first `ready` only counts what it would revoke
+ * (countRunnerCredentialsNotHeld) and logs the counts per Machine.
+ */
+export const RUNNER_CREDENTIAL_RECONCILE_FEATURE_FLAG_KEY = "runner_credential_reconcile";
+
+/**
+ * Account-mode Login with Raft (RFC 079 phase 3a, decision Q12): the kill
+ * switch, the only rollback once an App has switched (an App never leaves
+ * account mode, D16). An account-mode token has no Server, so the flag is
+ * evaluated with the token's person only (randomization unit `user`), never
+ * a Server: on for everyone through its default, for testers through user
+ * rules, off for everyone through its kill switch. Default OFF, not seeded: a
+ * missing flag or any evaluation failure reads as off. While off for a person,
+ * every account-mode token of theirs is invalid (each identity endpoint
+ * answers the 401 of an unknown token; services/oauthAccountLogin.ts), and
+ * account-mode logins are refused (phase 3a PR 3). Server-mode logins and
+ * tokens never read it.
+ */
+export const OAUTH_ACCOUNT_LOGIN_FEATURE_FLAG_KEY = "oauth_account_login";
+
+/**
+ * SSO v1 (rfcs/083-server-sso.md §8). Server-randomized, default OFF, not
+ * seeded: a missing flag or any evaluation failure reads as off. While off
+ * for a Server, its /api/servers/:id/sso routes answer 404 and no SSO
+ * connection of it signs anyone in. The v2 offboarding needs account
+ * deletion, which is always on (`account_deletion_v0` retired, #raft-architecture:#32).
+ */
+export const SERVER_SSO_FEATURE_FLAG_KEY = "server_sso_v1";
+
+/**
+ * "Require SSO" reviewed by the platform (RFC 083 §6.2): requiring SSO manages
+ * the whole account of everyone on the Server's verified domains, so it is
+ * open only to an organization a human at Raft has checked owns those people
+ * (Warden, #proj-sso:44d9831f). Server-randomized, default OFF, not seeded:
+ * reviewing a Server is a server allow rule. While off for a Server, its owner
+ * cannot turn `required` on, and a `required` already on manages no one; SSO
+ * sign-in, domains and auto-join are untouched. An unreadable flag keeps an
+ * existing requirement enforced, as `server_sso_v1` does. The review covers
+ * the domains the Server has then; one it verifies later is re-checked by hand.
+ */
+export const SERVER_SSO_REQUIRED_FEATURE_FLAG_KEY = "server_sso_required_v1";
+
+/**
+ * Reconciler step 13 (F9): after a daemon `ready`, the server wakes the agents
+ * on that Computer whose wake a restart lost (AgentOrchestrator
+ * `startReadyOwedWakePass`). Server-scoped (the Computer's server, create it
+ * with randomization unit `server`), DEFAULT ON and not seeded: no flag row
+ * reads as on, as `attachment_preview_unified_v0` does, because it is a kill
+ * switch over behaviour that ships on. A row that evaluates off (disabled,
+ * kill switch, a server rule) turns the wake off on the next `ready` without a
+ * deploy; every `ready` reads it. Any evaluation failure reads as off, so a
+ * broken flag store never adds wakes.
+ */
+export const READY_WAKE_LOST_DELIVERIES_FEATURE_FLAG_KEY = "ready_wake_lost_deliveries";
 
 const FEATURE_FLAG_LOCK_NAMESPACE = 0x46464c47; // "FFLG"
 const FEATURE_FLAG_CONFIG_VERSION_LOCK_NAMESPACE = 0x46464356; // "FFCV"
@@ -244,6 +430,12 @@ export async function acquireFeatureFlagConfigVersionLock(tx: DatabaseTransactio
 /** Shared per-flag lock used by both legacy mutations and the rollout writer. */
 export async function acquireFeatureFlagLock(tx: DatabaseTransaction, flagKey: string): Promise<void> {
   await tx.execute(sql`SELECT pg_advisory_xact_lock(${FEATURE_FLAG_LOCK_NAMESPACE}, ${featureFlagLockKey(flagKey)})`);
+}
+
+/** Pin an authority-affecting flag while a transaction writes its data. Shared
+ * readers coexist; rollout mutations use the exclusive counterpart above. */
+export async function acquireFeatureFlagReadLock(tx: DatabaseExecutor, flagKey: string): Promise<void> {
+  await tx.execute(sql`SELECT pg_advisory_xact_lock_shared(${FEATURE_FLAG_LOCK_NAMESPACE}, ${featureFlagLockKey(flagKey)})`);
 }
 
 export async function withFeatureFlagLock<T>(
@@ -749,6 +941,18 @@ export async function evaluateFeatureFlags(
   inputs: EvaluateFeatureFlagInput[],
   executor: DatabaseExecutor = getDb(),
 ): Promise<FeatureFlagEvaluation[]> {
+  // Keys the deployment answers itself (deploymentAnsweredFlags.ts): never read from Feature Flag Admin.
+  const answered = inputs.map((input) => deploymentAnswerOf(input.key));
+  if (answered.some((enabled) => enabled !== undefined)) {
+    const asked = inputs.filter((_, index) => answered[index] === undefined);
+    const evaluated = asked.length > 0 ? await evaluateFeatureFlags(asked, executor) : [];
+    let next = 0;
+    // `default`: a reason clients already know (they decode it), and the nearest: no rule decided.
+    return inputs.map((input, index) => {
+      const enabled = answered[index];
+      return enabled === undefined ? evaluated[next++]! : { key: input.key, enabled, reason: "default" as const };
+    });
+  }
   const keys = [...new Set(inputs.map((input) => input.key).filter(Boolean))];
   if (keys.length === 0) {
     return inputs.map((input) => ({ key: input.key, enabled: false, reason: "missing_flag" as const }));
@@ -946,6 +1150,10 @@ export async function createFirstServerAllowFeatureFlagRule(input: {
   expectedConfigVersion: number;
   actor: FeatureFlagOperatorActor;
   auditEventId?: string | null;
+  /** Runs under this writer's exclusive flag lock, before anything is written;
+   * throwing refuses the rule. For a flag whose data writers pin it with
+   * acquireFeatureFlagReadLock, the check sees no in-flight writer. */
+  preflight?: (tx: DatabaseTransaction, serverIds: readonly string[]) => Promise<void>;
 }) {
   const db = getDb();
   const serverIds = [...new Set(input.serverIds)].sort();
@@ -968,6 +1176,7 @@ export async function createFirstServerAllowFeatureFlagRule(input: {
       .limit(1)
       .for("update");
     if (!flag) return null;
+    await input.preflight?.(tx, serverIds);
 
     const existingRules = await tx
       .select()

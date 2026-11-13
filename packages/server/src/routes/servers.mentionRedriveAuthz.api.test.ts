@@ -6,11 +6,12 @@ import argon2 from "argon2";
 
 import { getDb } from "../db/index";
 import { serverMembers, users } from "../db/schema";
-import { assignMachine, createAgent } from "../services/agentService";
+import { createAgent } from "../services/agentService";
+import { placeAgentOnMachine } from "../test/agentMachineFixture";
 import { registerMachine } from "../services/machineService";
 import { createServer } from "../services/serverService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 /**
  * ARM ① of @Kabi's CHANGES REQUIRED on PR #6700 — the authorize layer.
@@ -64,7 +65,7 @@ test("redrive refuses a caller without agent-inspection rights, and says NOT_ACC
     .onConflictDoNothing();
   const machine = await registerMachine(server.id, owner.id, `redrive-machine-${suffix}`);
   const agent = await createAgent(server.id, `redrive-agent-${suffix}`, { runtime: "codex" });
-  await assignMachine(agent.id, machine.machine.id);
+  await placeAgentOnMachine(agent.id, machine.machine.id);
 
   // The harness stubs agentOrchestrator and the stub has no redriveMentionDelivery, so an
   // AUTHORIZED call 500s with no `status` field. That would make the positive control read

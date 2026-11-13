@@ -84,21 +84,16 @@ export function AgentMigrationCancelDialog({
       onClose={onClose}
       onConfirm={submit}
       message={
-        <div className="space-y-3">
-          <div>
-            <p className="font-semibold text-foreground">{formatMessage({ id: "agent.migration.cancelDialogSafetyTitle" })}</p>
-            <p>
-              {hosted
-                ? formatMessage({ id: "agent.migration.hosted.cancelDialogSafeMessage" }, { source })
-                : formatMessage({ id: "agent.migration.cancelDialogSafeMessage" }, { source, target })}
-            </p>
-          </div>
+        <div className="stack-y-3">
+          {hosted ? (
+            <>
+              <p>{formatMessage({ id: "agent.migration.hosted.cancelDialogSafeMessage" }, { source })}</p>
+              <p>{formatMessage({ id: "agent.migration.hosted.cancelDialogExplanation" }, { source })}</p>
+            </>
+          ) : (
+            <p>{formatMessage({ id: "agent.migration.cancelDialogMessage" }, { source, target })}</p>
+          )}
           <MigrationReference notice={notice} />
-          <p className="text-callout">
-            {hosted
-              ? formatMessage({ id: "agent.migration.hosted.cancelDialogExplanation" }, { source })
-              : formatMessage({ id: "agent.migration.cancelDialogExplanation" })}
-          </p>
         </div>
       }
     />

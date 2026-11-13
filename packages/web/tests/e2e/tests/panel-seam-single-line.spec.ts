@@ -17,16 +17,17 @@ test("settings: the sidebar owns the seam; the settings panel draws no left edge
   const sidebar = page.getByTestId("sidebar-root");
   await expect(sidebar).toBeVisible();
 
-  // The settings panel is lazy; wait until a panel sits right of the sidebar.
+  // The settings panel is lazy; wait until a panel sits right of the sidebar. Probed 20px in: the sidebar's
+  // resize handle covers the first 12px past its seam (DS Resizable: off the sidebar's scrollbar).
   await expect.poll(() => sidebar.evaluate((el) => {
     const r = el.getBoundingClientRect();
-    return !!document.elementFromPoint(r.right + 6, r.top + r.height / 2)?.closest('[data-slot="panel"]');
+    return !!document.elementFromPoint(r.right + 20, r.top + r.height / 2)?.closest('[data-slot="panel"]');
   })).toBe(true);
   const seam = await sidebar.evaluate((el) => {
     const r = el.getBoundingClientRect();
     const sidebarRight = parseFloat(getComputedStyle(el).borderRightWidth);
     // The pane immediately to the right of the sidebar.
-    const pane = document.elementFromPoint(r.right + 6, r.top + r.height / 2)?.closest('[data-slot="panel"]');
+    const pane = document.elementFromPoint(r.right + 20, r.top + r.height / 2)?.closest('[data-slot="panel"]');
     return { sidebarRight, paneLeft: pane ? parseFloat(getComputedStyle(pane).borderLeftWidth) : null, paneX: pane?.getBoundingClientRect().left ?? null, sidebarX: r.right };
   });
   expect(seam.paneLeft, "found the settings panel next to the sidebar").not.toBeNull();

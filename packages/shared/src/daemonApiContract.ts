@@ -139,6 +139,16 @@ export const daemonApiInboxCheckResponseSchema = lazySchema("daemonApiInboxCheck
 
 export const daemonApiInboxAckBodySchema = lazySchema("daemonApiInboxAckBodySchema", () => z.object({
   itemId: z.string().trim().min(1),
+  /**
+   * The exact source, for an item the daemon does not hold (a lost store):
+   * a server-authority source (a fired reminder) is then acked on the Server.
+   * A daemon that does not read it answers item_not_found.
+   */
+  source: z.object({
+    appId: z.string().trim().min(1),
+    notificationClass: z.string().trim().min(1),
+    sourceRef: daemonApiInboxSourceRefSchema,
+  }).strict().optional(),
 }).strict());
 
 export const daemonApiInboxAckResponseSchema = lazySchema("daemonApiInboxAckResponseSchema", () => passthroughObject({
@@ -190,6 +200,88 @@ export const daemonApiRuntimeVersionResponseSchema = lazySchema("daemonApiRuntim
   daemonVersion: z.string().trim().min(1),
   computerVersion: z.string().trim().min(1).nullable(),
   observation: z.literal("live_daemon_process"),
+  /** What this daemon build runs for its agents (e.g. `proc@1`); absent from older daemons. */
+  capabilities: z.array(z.string()).optional(),
+}));
+
+// `raft proc` (procJobs.ts). Every response a daemon that runs jobs sends
+// carries `capability: "proc@1"`; an older daemon forwards the path to the
+// Server, whose answer has none, so the CLI tells the two apart.
+const daemonApiProcCapabilitySchema = lazySchema("daemonApiProcCapabilitySchema", () => z.literal("proc@1"));
+
+export const daemonApiProcJobSchema = lazySchema("daemonApiProcJobSchema", () => passthroughObject({
+  name: z.string(),
+  pid: z.number().int(),
+  state: z.enum(["running", "exited"]),
+  /** The command's basename, never its arguments. */
+  command: z.string(),
+  startedAt: z.string(),
+  exitedAt: z.string().nullable(),
+  /** Null when the exit could not be collected (an adopted job, a signal). */
+  exitCode: z.number().int().nullable(),
+  exitSignal: z.string().nullable(),
+  logPath: z.string(),
+  scope: z.enum(["none", "agent", "created"]),
+  adopted: z.boolean(),
+}));
+
+export const daemonApiProcListResponseSchema = lazySchema("daemonApiProcListResponseSchema", () => passthroughObject({
+  capability: daemonApiProcCapabilitySchema,
+  jobs: z.array(daemonApiProcJobSchema),
+  maxJobs: z.number().int().positive(),
+}));
+
+export const daemonApiProcStartBodySchema = lazySchema("daemonApiProcStartBodySchema", () => passthroughObject({
+  name: z.string().optional(),
+  argv: z.array(z.string()).min(1),
+  /** Absolute: the CLI resolves `--cwd` against its own working directory. */
+  cwd: z.string().min(1),
+  /** The CLI's own environment; the daemon swaps the per-session CLI variables for the agent's stable entry. */
+  env: z.record(z.string(), z.string()),
+  /** The CLI's pid: on Linux, the cgroup the agent's commands run in is read from it. */
+  callerPid: z.number().int().positive().optional(),
+}));
+
+export const daemonApiProcStartResponseSchema = lazySchema("daemonApiProcStartResponseSchema", () => passthroughObject({
+  capability: daemonApiProcCapabilitySchema,
+  job: daemonApiProcJobSchema,
+  /** The name was made from the command (no `--name`). */
+  autoNamed: z.boolean(),
+  /**
+   * The job shares the Computer service's cgroup (Linux without user
+   * systemd), so a restart of the service ends it. Absent: it doesn't, or an
+   * older daemon didn't say.
+   */
+  stopsWithService: z.boolean().optional(),
+}));
+
+export const daemonApiProcStopBodySchema = lazySchema("daemonApiProcStopBodySchema", () => passthroughObject({
+  name: z.string(),
+  force: z.boolean().optional(),
+}));
+
+export const daemonApiProcStopResponseSchema = lazySchema("daemonApiProcStopResponseSchema", () => passthroughObject({
+  capability: daemonApiProcCapabilitySchema,
+  job: daemonApiProcJobSchema,
+  /** `exited` after SIGTERM, `killed` by the SIGKILL that ends the grace (or at once with --force), `already_exited`. */
+  outcome: z.enum(["exited", "killed", "already_exited"]),
+  graceMs: z.number().int().nonnegative(),
+}));
+
+export const daemonApiProcLogsQuerySchema = lazySchema("daemonApiProcLogsQuerySchema", () => passthroughObject({
+  name: z.string(),
+  tail: optionalQueryIntSchema,
+  /** Read from this byte offset on (`--follow`); the answer's `offset` is the next one. */
+  offset: optionalQueryIntSchema,
+}));
+
+export const daemonApiProcLogsResponseSchema = lazySchema("daemonApiProcLogsResponseSchema", () => passthroughObject({
+  capability: daemonApiProcCapabilitySchema,
+  job: daemonApiProcJobSchema,
+  text: z.string(),
+  offset: z.number().int().nonnegative(),
+  /** The log was rotated since the given offset; `text` starts at the new file's beginning. */
+  rotated: z.boolean(),
 }));
 
 export const daemonApiWakeHintsQuerySchema = lazySchema("daemonApiWakeHintsQuerySchema", () => passthroughObject({
@@ -341,6 +433,42 @@ export const daemonApiContract = {
     description: "Remove local seals from one or more app source identities.",
     request: { body: daemonApiInboxUnsealBodySchema },
     response: { body: daemonApiInboxSealResponseSchema },
+  }),
+  procList: route({
+    key: "procList",
+    method: "GET",
+    path: "/proc",
+    client: { resource: "proc", method: "list" },
+    description: "List the calling agent's background jobs; answered by the daemon itself (proc@1).",
+    request: {},
+    response: { body: daemonApiProcListResponseSchema },
+  }),
+  procStart: route({
+    key: "procStart",
+    method: "POST",
+    path: "/proc/start",
+    client: { resource: "proc", method: "start" },
+    description: "Start a background job the daemon owns for the calling agent (proc@1).",
+    request: { body: daemonApiProcStartBodySchema },
+    response: { body: daemonApiProcStartResponseSchema },
+  }),
+  procStop: route({
+    key: "procStop",
+    method: "POST",
+    path: "/proc/stop",
+    client: { resource: "proc", method: "stop" },
+    description: "Stop one of the calling agent's background jobs: group SIGTERM, the stop grace, then SIGKILL (proc@1).",
+    request: { body: daemonApiProcStopBodySchema },
+    response: { body: daemonApiProcStopResponseSchema },
+  }),
+  procLogs: route({
+    key: "procLogs",
+    method: "GET",
+    path: "/proc/logs",
+    client: { resource: "proc", method: "logs" },
+    description: "Read the tail of, or what follows an offset in, one of the calling agent's job logs (proc@1).",
+    request: { query: daemonApiProcLogsQuerySchema },
+    response: { body: daemonApiProcLogsResponseSchema },
   }),
   wakeHintsFetch: route({
     key: "wakeHintsFetch",

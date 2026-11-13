@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
 import { eq } from "drizzle-orm";
 import { createApiTest } from "../test/integration/apiTest";
-import { signAccessToken } from "../middleware/auth";
+import { accessTokenForTest } from "../test/integration/credentials";
 import { oauthClients } from "../db/schema";
 import { createOAuthClient, updateOAuthClient } from "../services/oauthService";
 
-const test = createApiTest({ onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest();
 
 for (const scenario of ["unregistered", "legacy-javascript", "mismatch", "valid"] as const) {
   test(`human OAuth callback rejects unsafe redirects: ${scenario}`, async ({ app, seed, db }) => {
@@ -24,7 +24,7 @@ for (const scenario of ["unregistered", "legacy-javascript", "mismatch", "valid"
       await db.update(oauthClients).set({ returnUrl }).where(eq(oauthClients.id, client.id));
     }
     const response = await fetch(`${app.baseUrl}/api/oauth/authorize/human`, {
-      method: "POST", headers: { Authorization: `Bearer ${signAccessToken(owner.id)}`, "Content-Type": "application/json" },
+      method: "POST", headers: { Authorization: `Bearer ${await accessTokenForTest(owner.id)}`, "Content-Type": "application/json" },
       body: JSON.stringify({ clientId: client.clientId, serverId: server.id, returnUrl, scopes: ["openid", "profile"] }),
     });
     const body = await response.json() as { code?: string; returnUrl?: string };

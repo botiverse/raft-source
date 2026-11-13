@@ -1,6 +1,6 @@
-import { useCallback } from "react";
+import { useCallback, useState } from "react";
 import { useIntl } from "react-intl";
-import { Download } from "lucide-react";
+import { Download, ImageOff } from "lucide-react";
 import {
   MessageImageGalleryAction,
   MessageImageGalleryItem,
@@ -40,6 +40,12 @@ export function GalleryImageItem({
       useImageLightboxStore.getState().open(lightboxImages, imageIndex);
     }
   }, [isOptimistic, imageIndex, lightboxImages]);
+  // A source that fails to load (a dead thumbnail URL, a format this browser
+  // can't decode) shows a placeholder, never a broken-image glyph. The tile
+  // stays: opening it lets the lightbox fall back to the full image.
+  const [failedSrc, setFailedSrc] = useState<string | null>(null);
+  const previewFailed = failedSrc === previewSrc;
+  const handlePreviewError = useCallback(() => setFailedSrc(previewSrc), [previewSrc]);
   const handleDownloadImage = useCallback((event: React.MouseEvent<HTMLButtonElement>) => {
     event.preventDefault();
     event.stopPropagation();
@@ -48,6 +54,14 @@ export function GalleryImageItem({
   return (
     <Tooltip content={att.filename}>
     <MessageImageGalleryItem layout={layout}>
+      {previewFailed ? (
+        <span
+          data-testid="gallery-image-placeholder"
+          className="flex size-full items-center justify-center bg-fill-muted text-foreground-hint"
+        >
+          <ImageOff size={20} aria-hidden="true" />
+        </span>
+      ) : (
       <img
         src={previewSrc}
         alt={att.filename}
@@ -57,10 +71,12 @@ export function GalleryImageItem({
         width={att.width ?? undefined}
         height={att.height ?? undefined}
         loading="lazy"
+        onError={handlePreviewError}
       />
+      )}
       {isOptimistic && (
         <MessageImageGalleryOverlay>
-          <Spinner size="md" variant="inverse" aria-label={formatMessage({ id: "common.loadingLabel" })} />
+          <Spinner size="md" aria-label={formatMessage({ id: "common.loadingLabel" })} />
         </MessageImageGalleryOverlay>
       )}
       {!isOptimistic && (

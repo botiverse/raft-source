@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+import { CODEX_LIVE, mockRuntimeFormsV2 } from "./runtimeFormV2Mock";
 
 /**
  * Computed field metrics for the Create Agent dialog.
@@ -29,6 +30,10 @@ import { expect, test } from "@playwright/test";
  * which of the two moves is a design-system decision.
  *
  * The Description textarea is covered by createAgentTextareaFieldAxis.spec.ts.
+ *
+ * The runtime fields are the protocol v2 form (task #8), served from the real
+ * Codex fixtures: Model (searchable combobox), Reasoning (select) and Fast mode
+ * (a boolean option card with no field label of its own, so not counted below).
  */
 
 type Metrics = { fontSize: string; fontWeight: string; lineHeight: string };
@@ -40,9 +45,10 @@ const RAFT_LABEL: Metrics = { fontSize: "13px", fontWeight: "600", lineHeight: "
 /** DS Select / Menu: the checked option is bold (`rf-menu__item.is-checked`). */
 const CHECKED_OPTION_WEIGHT = "700";
 
-// Computer and Runtime remain selects; Model is now a searchable combobox.
-// Pin both counts so dropping either kind cannot silently shrink coverage.
-const SELECT_VALUE_COUNT = 2;
+// Computer, Runtime and the v2 form's Reasoning are selects; Model is a
+// searchable combobox. Pin both counts so dropping either kind cannot silently
+// shrink coverage.
+const SELECT_VALUE_COUNT = 3;
 const MODEL_INPUT = '[data-slot="combobox-input"]';
 const MODEL_INPUT_COUNT = 1;
 /**
@@ -57,15 +63,23 @@ const INPUT_COUNT = 1;
 const REAL_INPUT = 'input[data-slot="field-control"]';
 /** Options in the opened Computer select — the fixture provides 2, one of them current. Measured. */
 const OPTION_COUNT = 2;
-/** Computer, Name, Description, Runtime, Model. */
-const LABEL_COUNT = 5;
+/** Computer, Name, Description, Runtime, Model, Reasoning. The Fast mode option
+ *  card's field renders an EMPTY label element (its title is the card's), which
+ *  carries no text to measure and is excluded. */
+const LABEL_COUNT = 6;
 
 const CASE = "/visual-testing.html?case=components.members.create-agent.dialog";
 
 const settle = async (page: import("@playwright/test").Page) => {
   await page.waitForSelector('[data-slot="field"]');
+  // The v2 form renders once its admission row, form and option source loaded.
+  await page.waitForSelector('[data-testid="runtime-form-v2-model"]');
   await page.waitForTimeout(600);
 };
+
+test.beforeEach(async ({ page }) => {
+  await mockRuntimeFormsV2(page, [CODEX_LIVE]);
+});
 
 /** The field metric tokens as the browser actually resolves them. */
 async function fieldTokens(page: import("@playwright/test").Page): Promise<Metrics> {
@@ -172,7 +186,13 @@ test("text inputs obey the field metrics", async ({ page }) => {
 test("field labels read the DS label type", async ({ page }) => {
   await page.goto(CASE);
   await settle(page);
-  const labels = await metrics(page, '[data-slot="field-label"]');
+  const labels = await page.evaluate(() =>
+    [...document.querySelectorAll('[data-slot="field-label"]')]
+      .filter((el) => (el.textContent ?? "").trim() !== "")
+      .map((el) => {
+        const s = getComputedStyle(el);
+        return { fontSize: s.fontSize, fontWeight: s.fontWeight, lineHeight: s.lineHeight };
+      }));
   expect(labels.length, `expected exactly ${LABEL_COUNT} field labels`).toBe(LABEL_COUNT);
   for (const m of labels) expect(m, "label 13/18 600").toEqual(RAFT_LABEL);
 });

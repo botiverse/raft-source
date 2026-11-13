@@ -1,6 +1,8 @@
+import { lockAssistantDelegatedMessageAuthority } from "./assistantDelegatedMessageAuthority";
+import { assertDmHumanPeersAreMembers } from "./dmSendPolicy";
 import { randomUUID, createHash } from "node:crypto";
 import { and, asc, eq, inArray, isNotNull } from "drizzle-orm";
-import { currentDate } from "@botiverse/raft-shared";
+import { currentDate, isSubConversationType, type ForwardedBundleAttachmentSnapshot } from "@botiverse/raft-shared";
 import { getDb } from "../db/index";
 import {
   attachmentObjects,
@@ -13,8 +15,13 @@ import {
   serverMembers,
   userChannelInboxStates,
 } from "../db/schema";
-import { buildSearchText } from "./searchService";
+import { buildSearchText } from "./searchTokenizer";
 import { withChannelWriterFence } from "./channelConversionFenceService";
+import { addAttachmentObjectHoldsWithExecutor } from "./attachmentObjectHoldService";
+import { lockJointPostingAuthority } from "../lib/channelActorPermissions";
+import { lockOrdinaryMessageExternalDeliveryAdmission } from "./externalDeliveryOutboxService";
+import { classifyOrdinaryMessageExternalProjection } from "./ordinaryMessageExternalProjection";
+import { mayAssistantReadOwnerConversation, readableOwnerDmPolicy } from "./assistantDmScope";
 
 type InternalForwardAttachmentSnapshot = {
   sourceProjectionId: string;
@@ -68,17 +75,29 @@ function metadataFingerprint(value: unknown): string | null {
  * and immutable objects are locked and revalidated immediately before the
  * destination rows are inserted; a revoked, rebound, missing, or non-active
  * source fails the whole transaction. Projection-only forwarding never writes
- * an attachment_object_charge row.
+ * an attachment_object_charge row. Each destination's transaction takes a
+ * reply's outbound admission locks: Joint posting authority, then the
+ * external delivery admission right before the insert. The latter holds
+ * nothing while the shared classifier keeps action-metadata messages (a
+ * bundle) out of the external outbox.
  */
 export async function persistForwardBundle(input: {
   destinationStorageChannelId: string;
   destinationRequestChannelId: string;
+  /**
+   * Set when the destination is a thread or task conversation: the channel
+   * that holds it (this server's local face). Post authority is that
+   * channel's, as for a reply; the conversation itself has no membership.
+   */
+  destinationParentChannelId?: string | null;
   senderId: string;
   content: string;
   randomId: string;
   sourceMessageIds: string[];
   requestServerId: string;
   metadata: InternalForwardBundleMetadata;
+  /** RFC 077: an assistant forwarded this for its owner (`senderId`). */
+  delegatedByAgentId?: string;
 }): Promise<{ message: typeof messages.$inferSelect; replayed: boolean }> {
   const fingerprint = fingerprintForward({
     destinationChannelId: input.destinationRequestChannelId,
@@ -103,14 +122,31 @@ export async function persistForwardBundle(input: {
       return { message: existing, replayed: true };
     }
 
+    const destinationParentChannelId = input.destinationParentChannelId ?? null;
     const authorityChannelIds = [...new Set([
       ...input.metadata.sourceAuthorityChannelIds,
       input.destinationRequestChannelId,
+      ...(destinationParentChannelId ? [destinationParentChannelId] : []),
     ])];
     const authorityChannels = await tx.select().from(channels)
       .where(inArray(channels.id, authorityChannelIds))
       .for("update");
     const channelById = new Map(authorityChannels.map((channel) => [channel.id, channel]));
+    const destination = channelById.get(input.destinationRequestChannelId);
+    // The channel whose membership admits the post: the destination itself,
+    // or the channel holding a destination thread / task conversation.
+    const postingScope = destinationParentChannelId ? channelById.get(destinationParentChannelId) : destination;
+    // A reply's re-authorization of a Joint sender at the persistence boundary
+    // (messageService.broadcastAndDeliver takes it before anything else it
+    // locks). Here it follows the channel rows (already FOR UPDATE, so its
+    // FOR SHARE re-lock waits on nothing) and precedes the joint projection,
+    // member and channel membership rows below: the global order channel ->
+    // server -> member -> joint (J) -> channel membership. It is given the
+    // local root, not the destination: a Joint thread's local face carries no
+    // parent pointer, so a walk up from it would stop before the joint row.
+    if (destination && postingScope?.type === "joint") {
+      await lockJointPostingAuthority(postingScope.id, "user", input.senderId, tx);
+    }
     const jointAuthorityChannelIds = authorityChannels
       .filter((channel) => channel.type === "joint")
       .map((channel) => channel.id);
@@ -129,13 +165,21 @@ export async function persistForwardBundle(input: {
       ))
       .for("update");
     const activeJointByLocalId = new Map(activeJointRows.map((row) => [row.localChannelId, row]));
-    const serverMember = await tx.select({ userId: serverMembers.userId }).from(serverMembers)
-      .where(and(
-        eq(serverMembers.serverId, input.requestServerId),
-        eq(serverMembers.userId, input.senderId),
-      )).limit(1).for("update");
-    if (serverMember.length !== 1) {
-      throw new ForwardPersistenceError("authority_changed");
+    if (input.delegatedByAgentId) {
+      // The delegation fence takes Server -> member -> Agent before channel
+      // membership rows. In particular, do not take member before Server.
+      await lockAssistantDelegatedMessageAuthority(tx, {
+        serverId: input.requestServerId, ownerUserId: input.senderId, agentId: input.delegatedByAgentId,
+      });
+    } else {
+      // FOR SHARE, as lockJointPostingAuthority takes this row: upgrading to
+      // FOR UPDATE would deadlock concurrent forwards by the same person.
+      const serverMember = await tx.select({ userId: serverMembers.userId }).from(serverMembers)
+        .where(and(
+          eq(serverMembers.serverId, input.requestServerId),
+          eq(serverMembers.userId, input.senderId),
+        )).limit(1).for("share");
+      if (serverMember.length !== 1) throw new ForwardPersistenceError("authority_changed");
     }
     const memberships = await tx.select().from(channelHumans).where(and(
       eq(channelHumans.userId, input.senderId),
@@ -155,16 +199,35 @@ export async function persistForwardBundle(input: {
         throw new ForwardPersistenceError("authority_changed");
       }
     }
-    const destination = channelById.get(input.destinationRequestChannelId);
+    // RFC 077: an assistant forwarding for its owner reads its sources as the
+    // delegated actor (buildForwardedBundleMetadata); re-checked here, so a
+    // DM switch turned off since then refuses a DM source.
+    if (input.delegatedByAgentId) {
+      const policy = await readableOwnerDmPolicy({ agentId: input.delegatedByAgentId, serverId: input.requestServerId, ownerUserId: input.senderId });
+      for (const sourceChannelId of input.metadata.sourceAuthorityChannelIds) {
+        if (!await mayAssistantReadOwnerConversation(policy, channelById.get(sourceChannelId)!)) {
+          throw new ForwardPersistenceError("authority_changed");
+        }
+      }
+    }
     if (
       !destination
+      || !postingScope
       || destination.serverId !== input.requestServerId
       || destination.deletedAt
       || destination.archivedAt
-      || (destination.name !== "all" && !joinedChannelIds.has(destination.id))
-      || (destination.name === "all" && destination.type !== "channel")
-      || (destination.type === "joint"
-        && activeJointByLocalId.get(destination.id)?.canonicalChannelId !== input.destinationStorageChannelId)
+      || postingScope.serverId !== input.requestServerId
+      || postingScope.deletedAt
+      || postingScope.archivedAt
+      || isSubConversationType(destination.type) !== (destinationParentChannelId !== null)
+      || isSubConversationType(postingScope.type)
+      || (postingScope.name !== "all" && !joinedChannelIds.has(postingScope.id))
+      || (postingScope.name === "all" && postingScope.type !== "channel")
+      || (postingScope.type === "joint" && (destinationParentChannelId
+        // A joint thread: its storage is the canonical thread, checked by the
+        // route; here the local parent projection must still be active.
+        ? !activeJointByLocalId.has(postingScope.id)
+        : activeJointByLocalId.get(postingScope.id)?.canonicalChannelId !== input.destinationStorageChannelId))
     ) {
       throw new ForwardPersistenceError("authority_changed");
     }
@@ -225,7 +288,7 @@ export async function persistForwardBundle(input: {
       const { sourceHostMessageId, ...publicItem } = item;
       const attachmentSnapshots = (item.attachmentSnapshots ?? []).map((snapshot) => {
         const source = sourceById.get(snapshot.sourceProjectionId);
-        const object = source?.objectId ? objectById.get(source.objectId) : null;
+        const object = source ? objectById.get(source.objectId) : null;
         if (
           !source
           || !source.messageId
@@ -250,13 +313,6 @@ export async function persistForwardBundle(input: {
           uploaderId: object.uploaderId,
           uploaderType: object.uploaderType,
           filename: snapshot.filename,
-          mimeType: object.mimeType,
-          sizeBytes: object.sizeBytes,
-          storageKey: object.storageKey,
-          thumbnailKey: object.thumbnailKey,
-          contentHash: object.contentHash,
-          width: object.width,
-          height: object.height,
         });
         return {
           id: projectionId,
@@ -265,7 +321,7 @@ export async function persistForwardBundle(input: {
           sizeBytes: object.sizeBytes,
           width: object.width,
           height: object.height,
-        };
+        } satisfies ForwardedBundleAttachmentSnapshot;
       });
       return {
         ...publicItem,
@@ -280,6 +336,22 @@ export async function persistForwardBundle(input: {
       forwardRequestFingerprint: fingerprint,
     };
 
+    // A reply's outbound (Slack Bridge) admission, right before the insert as
+    // a reply takes it, with the decision the shared classifier gives this
+    // message. Its authority row is a Joint thread's local parent, otherwise
+    // the requested conversation (messageService.broadcastAndDeliver).
+    await lockOrdinaryMessageExternalDeliveryAdmission({
+      executor: tx,
+      authorityChannelId: destinationParentChannelId && input.destinationStorageChannelId !== input.destinationRequestChannelId
+        ? destinationParentChannelId
+        : input.destinationRequestChannelId,
+      requestedChannelId: input.destinationRequestChannelId,
+      canonicalConversationId: input.destinationStorageChannelId,
+      decision: classifyOrdinaryMessageExternalProjection({ senderType: "user", messageType: "chat", actionMetadata: publicMetadata }),
+    });
+    if (postingScope.type === "dm") {
+      await assertDmHumanPeersAreMembers(tx, input.destinationStorageChannelId, "user", input.senderId);
+    }
     const insertRows = await tx.insert(messages).values({
       channelId: input.destinationStorageChannelId,
       senderType: "user",
@@ -289,6 +361,7 @@ export async function persistForwardBundle(input: {
       messageType: "chat",
       searchText: buildSearchText(input.content),
       actionMetadata: publicMetadata,
+      ...(input.delegatedByAgentId ? { delegatedByAgentId: input.delegatedByAgentId } : {}),
     }).onConflictDoNothing().returning();
     const [message] = insertRows;
     if (!message) {
@@ -300,6 +373,13 @@ export async function persistForwardBundle(input: {
         ...projection,
         messageId: message.id,
         pendingChannelId: null,
+      })));
+      // Each forwarded copy holds the shared bytes on its own; the source
+      // objects are locked FOR UPDATE and checked active above.
+      await addAttachmentObjectHoldsWithExecutor(tx, destinationProjectionRows.map((projection) => ({
+        holderType: "attachment" as const,
+        holderId: projection.id!,
+        objectId: projection.objectId,
       })));
     }
     await tx.update(userChannelInboxStates)

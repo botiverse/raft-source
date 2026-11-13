@@ -14,6 +14,7 @@
  * The APM owns the sending (it holds launchId, sessionId and the per-agent
  * clientSeq); nothing here reads daemon state.
  */
+import { RUNTIME_ERROR_CLASSES } from "@botiverse/raft-shared";
 import type {
   AgentRuntimeOutcome,
   AgentRuntimeTerminalFailureKind,
@@ -23,7 +24,7 @@ import type {
 import type { ParsedEvent } from "./drivers/index";
 import { buildRuntimeErrorActivityDiagnostic } from "./runtimeErrorDiagnostics";
 
-/** The required failure argument of `cleanupTerminalRuntimeFailure` (RFC §7 "Where E1 is emitted"). */
+/** The required failure argument of `releaseFailedProcess` / `actOnStickyFailure` (RFC §7 "Where E1 is emitted"). */
 export interface TerminalRuntimeFailureEvidence {
   failureKind: AgentRuntimeTerminalFailureKind;
   /** 16 hex, from the raw runtime text. */
@@ -35,8 +36,11 @@ export interface TerminalRuntimeFailureEvidence {
 export function terminalFailureFromRawText(
   failureKind: AgentRuntimeTerminalFailureKind,
   rawText: string,
+  /** The class the error's turn span carries, when it is known (a typed provider error). */
+  errorClass?: string,
 ): TerminalRuntimeFailureEvidence {
-  const diagnostic = buildRuntimeErrorActivityDiagnostic(rawText);
+  const knownClass = errorClass && (RUNTIME_ERROR_CLASSES as readonly string[]).includes(errorClass) ? errorClass as RuntimeErrorClass : undefined;
+  const diagnostic = buildRuntimeErrorActivityDiagnostic(rawText, knownClass ? { errorClass: knownClass } : {});
   return { failureKind, fingerprint: diagnostic.fingerprint, errorClass: diagnostic.errorClass };
 }
 

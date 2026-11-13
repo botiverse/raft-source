@@ -153,7 +153,7 @@ function inboxSummary(result: Awaited<ReturnType<typeof getInboxItems>>) {
     totalCount: result.totalCount,
     totalUnreadCount: result.totalUnreadCount,
     rows: result.items.map((item) => ({
-      key: item.kind === "thread" ? `thread:${item.threadChannelId}` : `${item.kind}:${item.channelId}`,
+      key: (item.kind === "thread" || item.kind === "task") ? `${item.kind}:${item.threadChannelId}` : `${item.kind}:${item.channelId}`,
       unreadCount: item.unreadCount,
       hasMention: item.hasMention,
       firstUnreadMessageId: item.firstUnreadMessageId,
@@ -581,15 +581,15 @@ test("applyInboxPolicyFilterPageRows centralizes unread and mentions filter poli
   ];
 
   assert.deepEqual(
-    applyInboxPolicyFilterPageRows(rawRows, { filter: "all", limit: 10 }).rows.map((row) => row.kind === "thread" ? row.threadChannelId : row.channelId),
+    applyInboxPolicyFilterPageRows(rawRows, { filter: "all", limit: 10 }).rows.map((row) => (row.kind === "thread" || row.kind === "task") ? row.threadChannelId : row.channelId),
     ["c-quiet", "c-unread", "t-mention-only", "c-read-mentioned"],
   );
   assert.deepEqual(
-    applyInboxPolicyFilterPageRows(rawRows, { filter: "unread", limit: 10 }).rows.map((row) => row.kind === "thread" ? row.threadChannelId : row.channelId),
+    applyInboxPolicyFilterPageRows(rawRows, { filter: "unread", limit: 10 }).rows.map((row) => (row.kind === "thread" || row.kind === "task") ? row.threadChannelId : row.channelId),
     ["c-unread"],
   );
   assert.deepEqual(
-    applyInboxPolicyFilterPageRows(rawRows, { filter: "mentions", limit: 10 }).rows.map((row) => row.kind === "thread" ? row.threadChannelId : row.channelId),
+    applyInboxPolicyFilterPageRows(rawRows, { filter: "mentions", limit: 10 }).rows.map((row) => (row.kind === "thread" || row.kind === "task") ? row.threadChannelId : row.channelId),
     ["t-mention-only", "c-read-mentioned"],
   );
 });
@@ -606,7 +606,7 @@ test("applyInboxPolicyFilterPageRows owns totals, offset, and hasMore over candi
   assert.equal(page.hasMore, true);
   assert.equal(page.totalCount, 3);
   assert.equal(page.totalUnreadCount, 4);
-  assert.deepEqual(page.rows.map((row) => row.kind === "thread" ? row.threadChannelId : row.channelId), ["c2"]);
+  assert.deepEqual(page.rows.map((row) => (row.kind === "thread" || row.kind === "task") ? row.threadChannelId : row.channelId), ["c2"]);
 });
 
 test("PGlite differential: getInboxItems SQL matches current pure policy projection", async () => {
@@ -1121,7 +1121,7 @@ test("PGlite differential: server push mute does not suppress activity rows", as
       serverId: fixture.server.id,
       userId: fixture.owner.id,
       role: "owner",
-      serverPushMuted: true,
+      serverPushMode: "none",
     });
 
     const model: InboxPolicyModel = {

@@ -1,5 +1,6 @@
 import { MERMAID_PALETTES } from "./mermaidTheme";
 import type { MermaidRenderResult } from "./mermaidRenderer";
+import { reportClientError } from "../../utils/clientErrorTrace";
 
 function contentHash(content: string) {
   let hash = 0x811c9dc5;
@@ -42,7 +43,13 @@ export async function svgToPngBlob(
     canvas.width = width;
     canvas.height = height;
     const context = canvas.getContext("2d");
-    if (!context) throw new Error(messages.canvasUnavailable);
+    if (!context) {
+      // Rare (a browser without a 2D canvas), so the user gets a plain error,
+      // but it must be traceable (#proj-raft-ui:#245): the fixed site name
+      // only, never the diagram or the localized message.
+      reportClientError({ source: "mermaid_export", site: "mermaid.png_canvas_unavailable", error: new Error("canvas_unavailable") });
+      throw new Error(messages.canvasUnavailable);
+    }
     context.fillStyle = MERMAID_PALETTES[result.theme].background;
     context.fillRect(0, 0, width, height);
     context.drawImage(image, 0, 0, width, height);

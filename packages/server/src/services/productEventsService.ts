@@ -19,9 +19,17 @@
 // product flow. The canonical transaction-aware action-card path opts into
 // rollback-coupled audit writes; all other funnel data remains best-effort.
 
-import { sql } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
+import {
+  isProductEventActionCardType,
+  asServerId,
+  type StoredActionCardAction,
+  type ClientPlatform,
+} from "@botiverse/raft-shared";
 import { getDb, type DatabaseExecutor, type DatabaseTransaction } from "../db/index";
-import { productEvents } from "../db/schema";
+import { actionCards, productEvents } from "../db/schema";
+import type { ProductEventSink } from "./productEventScopeDbWriter";
+import { recordServerProductEvent } from "./serverProductEvents";
 
 /**
  * Action-card-specific event type. Mirrors the day-1 whitelist enforced by
@@ -98,7 +106,10 @@ export type ActionCardErrorClass =
  *   submit roundtrip). Reserved.
  */
 export interface ActionCardEventMetadata {
-  action_type?: "channel:create" | "agent:create" | "channel:add_member" | "integration:approve_agent_login" | "integration:install_marketplace_app" | "integration:register_app" | "integration:update_app_registration" | "integration:recover_app_owner";
+  /** Derived from the card contract rather than restated. This list used to be written out by
+   *  hand, so every new card type silently drifted from it until a typecheck caught the mismatch
+   *  somewhere unrelated -- which is how `integration:connect_mcp` surfaced. */
+  action_type?: StoredActionCardAction["type"];
   dismiss_reason?: "close_button" | "esc" | "backdrop" | "route_change";
   error_class?: ActionCardErrorClass;
   error_code?: string;
@@ -116,7 +127,7 @@ export interface OnboardingWizardEventMetadata {
   latency_ms?: number;
 }
 
-export interface RecordActionCardEventArgs {
+interface RecordActionCardEventBase {
   /**
    * Canonical action card id (`action_cards.id`). Per Dozy + meichen 2026-
    * 05-13 (msg=9d0f10bd / msg=174ba78c) `subject_id` is the product entity,
@@ -132,13 +143,23 @@ export interface RecordActionCardEventArgs {
   /** At-most-once write within (cardId, eventType) when set. */
   idempotencyKey?: string;
   metadata?: ActionCardEventMetadata;
-  /**
-   * Optional caller-owned transaction.  Conversion action-card execution
-   * supplies its canonical source-lock transaction here so the authoritative
-   * attempt/success audit cannot be written after that lock is released.
-   */
-  executor?: DatabaseExecutor;
+  /** The client a client-reported event came from (X-Raft-Client-Platform). */
+  platform?: ClientPlatform | "unknown";
 }
+
+/**
+ * Optional caller-owned transaction.  Conversion action-card execution
+ * supplies its canonical source-lock transaction here so the authoritative
+ * attempt/success audit cannot be written after that lock is released.
+ * `afterCommit` comes with it: the transaction owner runs it after commit, and
+ * the ScopeDB copy (`action_card_action`) waits there, so a row that rolls back
+ * is never copied.
+ */
+type ActionCardEventTransaction =
+  | { executor?: undefined; afterCommit?: undefined }
+  | { executor: DatabaseExecutor; afterCommit: Array<() => void> };
+
+export type RecordActionCardEventArgs = RecordActionCardEventBase & ActionCardEventTransaction;
 
 export interface RecordOnboardingWizardEventArgs {
   /** Current workspace/server id. This is the `subject_id` grain. */
@@ -179,18 +200,76 @@ function cleanShortField(value: string | undefined): string | undefined {
   return trimmed ? trimmed.slice(0, MAX_EVENT_FIELD_LENGTH) : undefined;
 }
 
+// ScopeDB copy of the funnel (`action_card_action`) while readers move off
+// this table (cindyz, 2026-10-26, #proj-analytics:69ac4304). Set once at
+// startup; null (tests, no ScopeDB) writes nothing.
+let actionCardScopeDbSink: ProductEventSink | null = null;
+
+export function setActionCardScopeDbSink(sink: ProductEventSink | null): void {
+  actionCardScopeDbSink = sink;
+}
+
+const ACTION_CARD_SCOPEDB_ACTIONS = {
+  "action_card.open": "open",
+  "action_card.dismiss": "dismiss",
+  "action_card.execute_attempt": "execute_attempt",
+  "action_card.execute_success": "execute_success",
+  "action_card.execute_fail": "execute_fail",
+  // No writer records `expired` yet: a card's expiry lives in action_cards.state.
+  "action_card.expired": null,
+} as const satisfies Record<ActionCardEventType, string | null>;
+
+/** Best effort, like every product event: never throws. The gate (workspace off, user not sharing) applies. */
+async function mirrorActionCardEvent(args: RecordActionCardEventArgs, meta: ActionCardEventMetadata): Promise<void> {
+  const sink = actionCardScopeDbSink;
+  const action = ACTION_CARD_SCOPEDB_ACTIONS[args.eventType];
+  if (sink === null || action === null) return;
+  try {
+    // The card row, not the event metadata, says which server and type: the
+    // route's metadata whitelist does not cover every card type.
+    const [card] = await getDb()
+      .select({ serverId: actionCards.serverId, actionType: actionCards.actionType })
+      .from(actionCards)
+      .where(eq(actionCards.id, args.cardId))
+      .limit(1);
+    if (!card || !isProductEventActionCardType(card.actionType)) return;
+    const reportedByClient = args.source === "web";
+    await recordServerProductEvent(sink, {
+      event: "action_card_action",
+      userId: args.actor?.type === "human" ? args.actor.id : null,
+      serverId: asServerId(card.serverId),
+      properties: {
+        action,
+        action_type: card.actionType,
+        reported_by: reportedByClient ? "client" : "server",
+        error_class: action === "execute_fail" ? meta.error_class ?? "unknown" : undefined,
+        platform: reportedByClient ? args.platform ?? "unknown" : undefined,
+      },
+    });
+  } catch (err) {
+    console.warn(`[productEvents] ${args.eventType} not copied to ScopeDB:`, err instanceof Error ? err.name : "unknown");
+  }
+}
+
 /**
  * Record an action-card lifecycle event. Standalone writes are best-effort:
  * failures are logged and swallowed so analytics cannot take down the
  * underlying product flow. When the caller supplies its authoritative
  * transaction, an insert failure is rethrown so the business transition and
  * its audit boundary roll back together.
+ *
+ * The funnel is the cards agents prepare: a person's card
+ * (`requester_user_id`: a seat request, a member's Pro request, the
+ * agent:create card an owner sends back; task #10) records nothing here.
  */
 export async function recordActionCardEvent(
   args: RecordActionCardEventArgs,
 ): Promise<void> {
   try {
     const db = args.executor ?? getDb();
+    const [card] = await db.select({ requesterUserId: actionCards.requesterUserId })
+      .from(actionCards).where(eq(actionCards.id, args.cardId)).limit(1);
+    if (card?.requesterUserId) return;
     // Defensive cap on `error_code` length — should always be a short
     // categorical code, but bound it so a buggy caller can't dump arbitrary
     // text into the funnel.
@@ -199,7 +278,7 @@ export async function recordActionCardEvent(
       meta.error_code = meta.error_code.slice(0, 64);
     }
 
-    await db
+    const inserted = await db
       .insert(productEvents)
       .values({
         subjectType: "action_card",
@@ -215,7 +294,15 @@ export async function recordActionCardEvent(
       // idempotency_key) we silently drop — the event is already recorded.
       // The partial unique index only triggers when idempotency_key is
       // non-null, so events without a key always insert.
-      .onConflictDoNothing();
+      .onConflictDoNothing()
+      .returning({ id: productEvents.id });
+    // The ScopeDB copy follows the Postgres row: none for a duplicate, and
+    // none for a transaction that rolls back.
+    if (inserted.length > 0) {
+      const copy = () => void mirrorActionCardEvent(args, meta);
+      if (args.executor) args.afterCommit.push(copy);
+      else copy();
+    }
   } catch (err) {
     console.error(
       `[productEvents] failed to record ${args.eventType} for card ${args.cardId}:`,
@@ -337,7 +424,9 @@ export function classifyExecuteError(err: unknown): ActionCardEventMetadata {
   if (typeof e.status === "number") out.http_status = e.status;
   if (typeof e.code === "string" && e.code.length > 0) out.error_code = e.code;
 
-  if (e.status === 400 || e.code === "INVALID_PAYLOAD" || e.code === "MALFORMED_ACTION") {
+  // 422: a submitted form failed its checks (FORM_INVALID) or a form card was
+  // executed without one (FORM_REQUIRED), spec §3.4.
+  if (e.status === 400 || e.status === 422 || e.code === "INVALID_PAYLOAD" || e.code === "MALFORMED_ACTION") {
     out.error_class = "validation";
     return out;
   }

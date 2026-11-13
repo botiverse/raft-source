@@ -1,12 +1,17 @@
-import { useLayoutEffect, useRef, useState } from "react";
+import { useLayoutEffect, useState } from "react";
 import { useIntl } from "react-intl";
-import { Button, Step, Steps } from "@botiverse/raft-ui";
+import { Button, DescriptionDetails, DescriptionItem, DescriptionList, DescriptionTerm, Spinner, Step, Steps } from "@botiverse/raft-ui";
 import type { StepStatus } from "@botiverse/raft-ui";
 import Banner from "../ui/Banner";
-import { useMediaQuery } from "../../hooks/effectPrimitives";
 import { useTimeFormatter } from "../../hooks/useTimeFormatter";
 import type { Machine } from "../../store/machineStore";
-import { hostedArrivalAttentionReason, migrationNoticePresentation, migrationNoticeTargetLabel, migrationTargetLabel } from "./presentation";
+import {
+  endedComputerMigration,
+  hostedArrivalAttentionReason,
+  migrationNoticePresentation,
+  migrationNoticeTargetLabel,
+  migrationTargetLabel,
+} from "./presentation";
 import type { AgentMigrationNotice } from "./realtime";
 import {
   HOSTED_MIGRATION_PROGRESS_STEPS,
@@ -23,7 +28,9 @@ import {
 } from "./state";
 import { HostedMigrationReview } from "./HostedMigrationReview";
 import { MigrationErrorContent } from "./MigrationErrorContent";
-import { MigrationReference } from "./MigrationReference";
+import { MigrationReference, MigrationReferenceValue } from "./MigrationReference";
+import { MigrationRetryComparisonItems, MigrationRetryNote } from "./MigrationRetry";
+import { hasMigrationRetryComparison, isAgentMigrationRetry } from "./retryComparison";
 
 // A move to the cloud names its target in the copy itself ("the cloud" reads
 // differently from a computer name in both locales), so it has its own headers.
@@ -48,30 +55,36 @@ const HOSTED_HEADER_IDS = {
 
 export function MigrationProgressPanel({
   notice,
+  agentName,
   machines,
   onShowCancel,
   onRefresh,
 }: {
   notice: AgentMigrationNotice;
+  /** The agent as its page names it, for the line on what the source waits for. */
+  agentName: string;
   machines: Machine[];
   onShowCancel: () => void;
   onRefresh: () => Promise<void>;
 }) {
   const { formatMessage } = useIntl();
-  const { formatShortDateTime } = useTimeFormatter();
+  const { formatShortDateTime, formatClock } = useTimeFormatter();
   // Steps lie in a row only when every label fits beside the others; otherwise
-  // (phones, narrow profile panels, longer translations) they stack.
-  const phone = useMediaQuery("(max-width: 767px)");
-  const stepsRef = useRef<HTMLOListElement>(null);
-  const rowFits = useStepsRowFits(stepsRef);
-  const narrow = phone || !rowFits;
+  // (phones, narrow profile panels, longer translations) they stack. The fit is
+  // measured against the panel, never the window (raft-ui 0.23).
+  // A callback ref, not a ref object: the panel can mount on an ended move
+  // (no Steps) and show Steps once a new move starts, and the fit must be
+  // measured whenever the list appears (Artea, task #62).
+  const [stepsList, setStepsList] = useState<HTMLOListElement | null>(null);
+  const rowFits = useStepsRowFits(stepsList);
+  const narrow = !rowFits;
   const hosted = isHostedMigration(notice);
   const headerIds = hosted ? HOSTED_HEADER_IDS : COMPUTER_HEADER_IDS;
   const steps = hosted ? HOSTED_MIGRATION_PROGRESS_STEPS : MIGRATION_PROGRESS_STEPS;
   const target = migrationNoticeTargetLabel(formatMessage, machines, notice);
   const source = migrationTargetLabel(formatMessage, machines, notice.sourceMachineId);
   const reviewSummary = isHostedReviewPending(notice) ? notice.hosted?.importSummary ?? null : null;
-  const presentation = migrationNoticePresentation(formatMessage, notice, machines, formatShortDateTime);
+  const presentation = migrationNoticePresentation(formatMessage, notice, machines, formatShortDateTime, { agentName, formatClock });
   const completed = isCompletedMigrationState(notice.state);
   // A switched move to the cloud that stalled is not over, but it needs attention like a failure.
   const failed = isFailedMigrationState(notice.state)
@@ -81,6 +94,7 @@ export function MigrationProgressPanel({
   const active = isActiveMigrationState(notice.state);
   const currentStep = hosted ? hostedMigrationProgressStep(notice) : migrationProgressStep(notice);
   const cancelRequested = notice.state.startsWith("cancel_requested_");
+  const agentRetry = isAgentMigrationRetry(notice);
   const stepStatus: StepStatus = completed
     ? "finish"
     : failed || notice.cancelNeedsAttention
@@ -88,6 +102,10 @@ export function MigrationProgressPanel({
       : canceled
         ? "wait"
         : "process";
+  // The step the move is working on spins in place of its number, as on
+  // mobile (AgentMigrationStepsModel); a move waiting for the user's review
+  // is not working, so it keeps the number.
+  const runningStep = active && !isHostedReviewPending(notice) && stepStatus === "process" ? currentStep : null;
   const headerMessageId = completed
     ? headerIds.completed
     : canceled
@@ -100,6 +118,53 @@ export function MigrationProgressPanel({
             ? headerIds.active
             : headerIds.idle;
 
+  const stepList = (
+    <Steps
+      ref={setStepsList}
+      vertical={narrow}
+      current={completed ? steps.length : currentStep + 1}
+      status={stepStatus}
+      finishLabel={formatMessage({ id: "agent.migration.stepDone" })}
+      errorLabel={formatMessage({ id: "agent.migration.stepFailed" })}
+      aria-label={formatMessage({ id: headerIds.progress }, { target })}
+    >
+      {steps.map((labelId, index) => (
+        <Step
+          key={labelId}
+          title={formatMessage({ id: labelId })}
+          icon={index === runningStep ? <Spinner size="xs" aria-hidden="true" data-testid="agent-migration-step-spinner" /> : undefined}
+        />
+      ))}
+    </Steps>
+  );
+
+  // A failed move between computers (the expanded "Last migration" section):
+  // the steps, stopped at the one that failed, then why, then the reference.
+  // The section's summary line already names the move, so the banner has no title.
+  if (endedComputerMigration(notice) === "failed") {
+    return (
+      <div className="flex flex-col gap-3" data-testid="agent-migration-ended">
+        {stepList}
+        <Banner intent="warning" density="sm" withIcon live={false}>
+          {/* Where the agent is now, then why: a late failure leaves it on the target. */}
+          {presentation.placement ? <p>{presentation.placement}</p> : null}
+          <p>{presentation.message}</p>
+          {/* The agent had one retry and this was it: the next move is a person's. */}
+          {agentRetry ? <p>{formatMessage({ id: "agent.migration.retry.alsoFailed" }, { agent: agentName })}</p> : null}
+        </Banner>
+        {/* The retry block: its line directly above the size rows. */}
+        {agentRetry ? <MigrationRetryNote notice={notice} agentName={agentName} /> : null}
+        <DescriptionList direction="horizontal">
+          <MigrationRetryComparisonItems notice={notice} />
+          <DescriptionItem>
+            <DescriptionTerm>{formatMessage({ id: "agent.migration.referenceLabel" })}</DescriptionTerm>
+            <DescriptionDetails><MigrationReferenceValue notice={notice} /></DescriptionDetails>
+          </DescriptionItem>
+        </DescriptionList>
+      </div>
+    );
+  }
+
   return (
     <section aria-label={formatMessage({ id: headerIds.idle }, { target })}>
       <div className="flex flex-col gap-3">
@@ -109,19 +174,7 @@ export function MigrationProgressPanel({
         </h3>
       </div>
 
-      <Steps
-        ref={stepsRef}
-        vertical={narrow}
-        current={completed ? steps.length : currentStep + 1}
-        status={stepStatus}
-        finishLabel={formatMessage({ id: "agent.migration.stepDone" })}
-        errorLabel={formatMessage({ id: "agent.migration.stepFailed" })}
-        aria-label={formatMessage({ id: headerIds.progress }, { target })}
-      >
-        {steps.map((labelId) => (
-          <Step key={labelId} title={formatMessage({ id: labelId })} />
-        ))}
-      </Steps>
+      {stepList}
 
       {/* Problems keep the warning banner; normal progress is plain text. */}
       {failed || notice.cancelNeedsAttention ? (
@@ -139,6 +192,13 @@ export function MigrationProgressPanel({
           <p>{presentation.message}</p>
         </div>
       )}
+      {/* The retry block, after the status line so the Steps stay under the title. */}
+      {agentRetry ? <MigrationRetryNote notice={notice} agentName={agentName} /> : null}
+      {agentRetry && hasMigrationRetryComparison(notice, formatMessage) ? (
+        <DescriptionList direction="horizontal" data-testid="agent-migration-retry-comparison">
+          <MigrationRetryComparisonItems notice={notice} />
+        </DescriptionList>
+      ) : null}
       {/* The reference is for support, so it only appears when something needs attention. */}
       {failed || notice.cancelNeedsAttention ? <MigrationReference notice={notice} /> : null}
       {reviewSummary ? (
@@ -154,7 +214,7 @@ export function MigrationProgressPanel({
       {/* While the review waits, its own Cancel sits beside Confirm. */}
       {active && !reviewSummary && canCancelMigration(notice) ? (
         <div className="flex justify-end">
-          <Button variant="outline" size="sm" type="button" onClick={onShowCancel}>
+          <Button variant="outline" size="md" type="button" onClick={onShowCancel}>
             {formatMessage({ id: "agent.detail.cancel" })}
           </Button>
         </div>
@@ -169,10 +229,9 @@ export function MigrationProgressPanel({
  * gaps and the minimum connectors, against the width available to the list.
  * Measured the same way in both layouts, so switching cannot oscillate.
  */
-function useStepsRowFits(ref: React.RefObject<HTMLOListElement | null>): boolean {
+function useStepsRowFits(list: HTMLOListElement | null): boolean {
   const [fits, setFits] = useState(true);
   useLayoutEffect(() => {
-    const list = ref.current;
     const host = list?.parentElement;
     if (!list || !host || typeof ResizeObserver === "undefined") return;
     const measure = () => {
@@ -199,6 +258,6 @@ function useStepsRowFits(ref: React.RefObject<HTMLOListElement | null>): boolean
     const observer = new ResizeObserver(measure);
     observer.observe(host);
     return () => observer.disconnect();
-  }, [ref]);
+  }, [list]);
   return fits;
 }

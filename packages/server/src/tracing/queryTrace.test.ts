@@ -3,8 +3,9 @@ import { PGlite } from "@electric-sql/pglite";
 import { sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/pglite";
 import { BasicTracer, MemoryTraceSink } from "@botiverse/raft-shared";
-import { boundedErrorClass, boundedErrorTypeName, queryFailureDiagnostics, queryFailureReason, queryFailureTraceAttrs, traceErrorMessage, traceQuerySpan } from "./queryTrace";
+import { boundedErrorClass, boundedErrorTypeName, errorDiagnosisAttrs, queryFailureDiagnostics, queryFailureReason, queryFailureTraceAttrs, traceErrorMessage, traceQuerySpan } from "./queryTrace";
 import { runWithTraceSpan } from "./semanticTrace";
+import { traceRouteFailure } from "./routeFailure";
 
 test("query failure attrs classify timeout and never emit raw database content", () => {
   const error = Object.assign(
@@ -372,4 +373,36 @@ test("traceErrorMessage redacts connection strings in every form", () => {
   assert.ok(String(spaced).includes("password="), `key was dropped: ${spaced}`);
 
   assert.equal(traceErrorMessage(new Error("connection refused")), "connection refused");
+});
+
+// #proj-o11y:#29: a route failure names the database cause by code and
+// constraint, never by its text (which carries the offending value).
+test("errorDiagnosisAttrs gives the SQLSTATE and constraint of a wrapped driver error, never its text", () => {
+  const driver = Object.assign(new Error('duplicate key value violates unique constraint "users_email_key" DETAIL: Key (email)=(secret@example.test) already exists.'),
+    { code: "23505", constraint: "users_email_key" });
+  const wrapped = Object.assign(new Error("Failed query: insert into users ..."), { cause: driver });
+  const attrs = errorDiagnosisAttrs(wrapped);
+  assert.equal(attrs.sqlstate, "23505");
+  assert.equal(attrs.db_constraint, "users_email_key");
+  assert.equal(attrs.error_type, "Error");
+  assert.ok(!JSON.stringify(attrs).includes("secret@example.test"));
+  // A transport code is not a SQLSTATE, and a constraint that is not an identifier is dropped.
+  assert.deepEqual(errorDiagnosisAttrs(Object.assign(new Error("x"), { code: "ECONNRESET", constraint: "a b" })), { error_type: "Error" });
+  assert.deepEqual(errorDiagnosisAttrs("not an error"), {});
+});
+
+test("traceRouteFailure records the SQLSTATE and constraint next to the collapsed message", () => {
+  const sink = new MemoryTraceSink();
+  const tracer = new BasicTracer({ sink });
+  const driver = Object.assign(new Error("Key (email)=(secret@example.test) already exists."), { code: "23505", constraint: "users_email_key" });
+  const root = tracer.startSpan("server.http.request", { surface: "server", kind: "server" });
+  runWithTraceSpan(root, () => {
+    traceRouteFailure("test.failed", Object.assign(new Error("Failed query: insert"), { cause: driver }), { route_action: "test" });
+  }, tracer);
+  root.end();
+  const event = sink.getAllSpans().flatMap((span) => span.events).find((e) => e.name === "test.failed");
+  assert.equal(event?.attrs?.sqlstate, "23505");
+  assert.equal(event?.attrs?.db_constraint, "users_email_key");
+  assert.equal(event?.attrs?.error_message, "Database query failed");
+  assert.ok(!JSON.stringify(sink.getAllSpans()).includes("secret@example.test"));
 });

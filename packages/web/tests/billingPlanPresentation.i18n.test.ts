@@ -156,11 +156,11 @@ test("Free and Pro render their distinct Joint Channel allowances in both locale
   assert.ok(pro.includedFeatures.includes("billing.unlimitedJointChannels"));
 
   // Contract v0.3: joint channels allow up to 2 free servers each; paid
-  // servers never count toward that cap.
-  assert.equal(render("en", "billing.limitedTimeFreeJointChannel"), "Use Joint Channels (each Joint Channel has 2 free-server slots)");
-  assert.equal(render("zh-cn", "billing.limitedTimeFreeJointChannel"), "使用联合频道（每个联合频道有连接 2 个免费版服务器的名额）");
-  assert.equal(render("en", "billing.unlimitedJointChannels"), "Use Joint Channels");
-  assert.equal(render("zh-cn", "billing.unlimitedJointChannels"), "使用联合频道");
+  // servers never count toward that cap. A free server hosts at most 1.
+  assert.equal(render("en", "billing.limitedTimeFreeJointChannel"), "Host 1 Joint Channel and join others (each Joint Channel has 2 free-server slots)");
+  assert.equal(render("zh-cn", "billing.limitedTimeFreeJointChannel"), "发起 1 个联合频道并加入其他联合频道（每个联合频道有连接 2 个免费版服务器的名额）");
+  assert.equal(render("en", "billing.unlimitedJointChannels"), "Use external channels");
+  assert.equal(render("zh-cn", "billing.unlimitedJointChannels"), "使用外部频道");
 });
 
 test("Agent migration is presented as a Pro benefit in both locales", () => {

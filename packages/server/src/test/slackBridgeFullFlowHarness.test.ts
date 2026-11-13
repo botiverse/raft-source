@@ -1,7 +1,7 @@
 import { createApiTest } from "./integration/apiTest";
 import assert from "node:assert/strict";
 import { createCipheriv, createHmac, randomBytes, randomUUID } from "node:crypto";
-import { chmod, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -36,7 +36,7 @@ import {
   jointChannels,
   jointChannelServers,
   messages,
-  mobilePushOutbox,
+  notificationOutbox,
   oauthClientInstalls,
   oauthClients,
   serverMembers,
@@ -60,12 +60,13 @@ import {
   type SlackBridgeFullFlowPreflightGate,
   type SlackBridgeFullFlowPreflightInput,
 } from "./slackBridgeFullFlowPreflight";
+import { insertAttachmentsWithObjects } from "./attachmentObjectFixture";
 
 
 // Built at runtime so secret scanners don't flag this test sample.
 const SLACK_XOXB = "xo" + "xb-";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 const APP_ID = "A_FULL_FLOW_TEST";
 const TEAM_ID = "T_FULL_FLOW_TEST";
@@ -372,7 +373,7 @@ test("full-flow preflight has a tooth for every declared input and authority gat
 });
 
 test("public register validators fail before any harness identity is created", async () => {
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false, skipAuthRateLimit: true });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, skipAuthRateLimit: true });
   try {
     const before = await getDb().select({ count: sql<number>`count(*)::int` }).from(users);
     const overlong = await register(app.baseUrl, {
@@ -402,7 +403,7 @@ test("public register validators fail before any harness identity is created", a
 });
 
 test("provider-disabled harness closes public register to HTTP message to worker and local sink", async () => {
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false, skipAuthRateLimit: true });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, skipAuthRateLimit: true });
   const key = randomBytes(32);
   let runtime: Awaited<ReturnType<typeof createSlackBridgeLocalRuntimeFromEnv>>;
   let runtimeFile: Awaited<ReturnType<typeof writeRuntimeConfig>> | undefined;
@@ -807,7 +808,7 @@ test("provider-disabled harness closes public register to HTTP message to worker
       senderId: seeded.ownerId,
       content: "attachment identity conservation seed",
     }).returning({ id: messages.id });
-    const [alreadyLinkedAttachment] = await db.insert(attachments).values({
+    const [alreadyLinkedAttachment] = await insertAttachmentsWithObjects(db, {
       messageId: alreadyLinkedMessage.id,
       messagePosition: 0,
       channelId: seeded.channel.id,
@@ -817,7 +818,7 @@ test("provider-disabled harness closes public register to HTTP message to worker
       mimeType: "text/plain",
       sizeBytes: 1,
       storageKey: `slack-full-flow/${suffix}/already-linked.txt`,
-    }).returning({ id: attachments.id });
+    });
     const assertAttachmentFailure = async (
       label: string,
       attachmentIds: string[],
@@ -897,11 +898,6 @@ test("provider-disabled harness closes public register to HTTP message to worker
         eq(externalChannelBindings.channelId, seeded.channel.id),
         eq(externalChannelBindings.state, "active"),
       ));
-    const serverBootstrapSource = await readFile(new URL("../server.ts", import.meta.url), "utf8");
-    assert.match(serverBootstrapSource, /onInboundMessageCommitted:\s*async/u);
-    assert.match(serverBootstrapSource, /emitExternalProjectionMessageToFrontend\(slackBridgeSocket, messageId\)/u);
-    assert.match(serverBootstrapSource, /onInboundReactionCommitted:\s*async/u);
-    assert.match(serverBootstrapSource, /emitExternalReactionMessageUpdateToFrontend\(slackBridgeSocket, messageId\)/u);
 
     const preflightInput: SlackBridgeFullFlowPreflightInput = {
       schema: SLACK_BRIDGE_FULL_FLOW_PREFLIGHT_SCHEMA,
@@ -1087,8 +1083,8 @@ test("provider-disabled harness closes public register to HTTP message to worker
       .where(eq(externalDeliveryPartitions.bindingId, seeded.binding.id));
     const facts = await db.select().from(inboxNotificationFacts)
       .where(eq(inboxNotificationFacts.messageId, posted.id));
-    const mobile = await db.select().from(mobilePushOutbox)
-      .where(eq(mobilePushOutbox.messageId, posted.id));
+    const mobile = await db.select().from(notificationOutbox)
+      .where(eq(notificationOutbox.messageId, posted.id));
     const [credentialAfter] = await db.select().from(externalAppCredentials)
       .where(eq(externalAppCredentials.installId, seeded.install.id));
 

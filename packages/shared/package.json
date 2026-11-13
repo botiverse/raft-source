@@ -1,7 +1,7 @@
 {
   "name": "@botiverse/raft-shared",
   "version": "0.1.0",
-  "license": "FSL-1.1-ALv2",
+  "license": "LicenseRef-Raft-License",
   "private": true,
   "type": "module",
   "main": "src/index.ts",
@@ -10,6 +10,42 @@
     ".": {
       "types": "./src/index.ts",
       "default": "./src/index.ts"
+    },
+    "./announcement-priority": {
+      "types": "./src/announcementPriority.ts",
+      "default": "./src/announcementPriority.ts"
+    },
+    "./src/displayLocales": {
+      "types": "./src/displayLocales.ts",
+      "default": "./src/displayLocales.ts"
+    },
+    "./src/settingsSearch": {
+      "types": "./src/settingsSearch.ts",
+      "default": "./src/settingsSearch.ts"
+    },
+    "./src/externalLinkSchemes": {
+      "types": "./src/externalLinkSchemes.ts",
+      "default": "./src/externalLinkSchemes.ts"
+    },
+    "./src/raftPermalinks": {
+      "types": "./src/raftPermalinks.ts",
+      "default": "./src/raftPermalinks.ts"
+    },
+    "./src/agentOps/raftHome": {
+      "types": "./src/agentOps/raftHome.ts",
+      "default": "./src/agentOps/raftHome.ts"
+    },
+    "./src/desktopRoutes": {
+      "types": "./src/desktopRoutes.ts",
+      "default": "./src/desktopRoutes.ts"
+    },
+    "./src/desktopNotifications": {
+      "types": "./src/desktopNotifications.ts",
+      "default": "./src/desktopNotifications.ts"
+    },
+    "./src/feedbackSubmit": {
+      "types": "./src/feedbackSubmit.ts",
+      "default": "./src/feedbackSubmit.ts"
     },
     "./feature-flag-admin-privileges": {
       "types": "./feature-flag-admin-privileges.ts",
@@ -34,6 +70,10 @@
     "./src/agentApiClient": {
       "types": "./src/agentApiClient.ts",
       "default": "./src/agentApiClient.ts"
+    },
+    "./src/selfExec": {
+      "types": "./src/selfExec.ts",
+      "default": "./src/selfExec.ts"
     },
     "./src/agentApiContract": {
       "types": "./src/agentApiContract.ts",
@@ -75,6 +115,10 @@
       "types": "./src/agentOps/index.ts",
       "default": "./src/agentOps/index.ts"
     },
+    "./src/integrations/index": {
+      "types": "./src/integrations/index.ts",
+      "default": "./src/integrations/index.ts"
+    },
     "./src/agentOps/seenPolicy/index": {
       "types": "./src/agentOps/seenPolicy/index.ts",
       "default": "./src/agentOps/seenPolicy/index.ts"
@@ -83,9 +127,45 @@
       "types": "./src/agentText/index.ts",
       "default": "./src/agentText/index.ts"
     },
+    "./src/agentText/continuations": {
+      "types": "./src/agentText/continuations.ts",
+      "default": "./src/agentText/continuations.ts"
+    },
+    "./src/continuations/index": {
+      "types": "./src/continuations/index.ts",
+      "default": "./src/continuations/index.ts"
+    },
+    "./src/continuations/store.testkit": {
+      "types": "./src/continuations/store.testkit.ts",
+      "default": "./src/continuations/store.testkit.ts"
+    },
     "./src/generated/agentApiRoutes": {
       "types": "./src/generated/agentApiRoutes.ts",
       "default": "./src/generated/agentApiRoutes.ts"
+    },
+    "./src/appObjectKey": {
+      "types": "./src/appObjectKey.ts",
+      "default": "./src/appObjectKey.ts"
+    },
+    "./src/artifactContentTicket": {
+      "types": "./src/artifactContentTicket.ts",
+      "default": "./src/artifactContentTicket.ts"
+    },
+    "./src/artifactFiles": {
+      "types": "./src/artifactFiles.ts",
+      "default": "./src/artifactFiles.ts"
+    },
+    "./src/artifactPageTheme": {
+      "types": "./src/artifactPageTheme.ts",
+      "default": "./src/artifactPageTheme.ts"
+    },
+    "./src/artifactCheckContract": {
+      "types": "./src/artifactCheckContract.ts",
+      "default": "./src/artifactCheckContract.ts"
+    },
+    "./src/sameSite": {
+      "types": "./src/sameSite.ts",
+      "default": "./src/sameSite.ts"
     },
     "./src/appConfigTransport": {
       "types": "./src/appConfigTransport.ts",
@@ -115,17 +195,33 @@
       "types": "./src/tracing/eventRows.ts",
       "default": "./src/tracing/eventRows.ts"
     },
-    "./unread-activity-diagnostic": {
-      "types": "./src/unreadActivityDiagnostic.ts",
-      "default": "./src/unreadActivityDiagnostic.ts"
-    },
     "./src/clock": {
       "types": "./src/clock.ts",
       "default": "./src/clock.ts"
     },
-    "./src/unreadActivityDiagnostic": {
-      "types": "./src/unreadActivityDiagnostic.ts",
-      "default": "./src/unreadActivityDiagnostic.ts"
+    "./src/noProxy": {
+      "types": "./src/noProxy.ts",
+      "default": "./src/noProxy.ts"
+    },
+    "./src/traceUploadUrl": {
+      "types": "./src/traceUploadUrl.ts",
+      "default": "./src/traceUploadUrl.ts"
+    },
+    "./src/pixelAvatarGenerator": {
+      "types": "./src/pixelAvatarGenerator.ts",
+      "default": "./src/pixelAvatarGenerator.ts"
+    },
+    "./src/humanAvatar": {
+      "types": "./src/humanAvatar.ts",
+      "default": "./src/humanAvatar.ts"
+    },
+    "./src/humanAvatarArt": {
+      "types": "./src/humanAvatarArt.ts",
+      "default": "./src/humanAvatarArt.ts"
+    },
+    "./src/brandedIds": {
+      "types": "./src/brandedIds.ts",
+      "default": "./src/brandedIds.ts"
     },
     "./src/generated/openapi": {
       "types": "./src/generated/openapi.ts",
@@ -133,6 +229,10 @@
     },
     "./src/testVectors/messageRepliesDiscussionGraph.vectors.json": "./src/testVectors/messageRepliesDiscussionGraph.vectors.json",
     "./src/testVectors/threadRepliesReadModel.vectors.json": "./src/testVectors/threadRepliesReadModel.vectors.json",
+    "./src/testVectors/appObjectKeys.vectors.json": "./src/testVectors/appObjectKeys.vectors.json",
+    "./assets/pixelAvatars.json": "./assets/pixelAvatars.json",
+    "./assets/humanAvatarLayers.json": "./assets/humanAvatarLayers.json",
+    "./src/settingsSearch.v1.json": "./src/settingsSearch.v1.json",
     "./package.json": "./package.json",
     "./announcement-presentation": {
       "types": "./announcement-presentation.ts",
@@ -141,6 +241,10 @@
     "./announcement-audience": {
       "types": "./announcement-audience.ts",
       "default": "./announcement-audience.ts"
+    },
+    "./src/appLinkPreview": {
+      "types": "./src/appLinkPreview.ts",
+      "default": "./src/appLinkPreview.ts"
     }
   },
   "scripts": {
@@ -148,26 +252,31 @@
     "check:openapi-fresh": "pnpm generate:openapi && git diff --exit-code openapi/openapi.json src/generated/openapi.ts",
     "check:openapi-deterministic": "node --import @oxc-node/core/register scripts/check-openapi-determinism.ts",
     "lint:openapi": "redocly lint openapi/openapi.json --extends=minimal --format=stylish",
-    "check:openapi-consumer": "tsc --noEmit --project tsconfig.openapi.json",
+    "check:openapi-consumer": "tsrs --noEmit --project tsconfig.openapi.json",
     "test:attachment-upload-contract": "vitest run src/attachmentUploadContract.test.ts",
-    "check:openapi": "pnpm check:openapi-fresh && pnpm check:openapi-deterministic && pnpm lint:openapi && pnpm check:openapi-consumer && pnpm test:attachment-upload-contract",
+    "test:read-state-contract": "vitest run src/readStateContract.test.ts",
+    "check:openapi": "pnpm check:openapi-fresh && pnpm check:openapi-deterministic && pnpm lint:openapi && pnpm check:openapi-consumer && pnpm test:attachment-upload-contract && pnpm test:read-state-contract",
     "generate:runtime-provider-display-names": "node --import @oxc-node/core/register scripts/generate-runtime-provider-display-names.ts",
     "check:runtime-provider-display-names-fresh": "pnpm generate:runtime-provider-display-names && git diff --exit-code src/generated/runtimeProviderDisplayNames.ts",
     "generate:agent-api-routes": "node --import @oxc-node/core/register scripts/generate-agent-api-routes.ts",
     "check:agent-api-routes-fresh": "pnpm generate:agent-api-routes && git diff --exit-code src/generated/agentApiRoutes.ts",
     "generate:agent-api-description": "node --import @oxc-node/core/register scripts/generate-agent-api-description.ts",
     "check:agent-api-description-fresh": "pnpm generate:agent-api-description && git diff --exit-code agent-api/agent-api.v1.json",
-    "typecheck": "tsc --noEmit",
-    "test:message-lockstep": "node scripts/check-agent-api-message-lockstep.mjs",
+    "typecheck": "tsrs --noEmit",
+    "typecheck:tsc": "tsc --noEmit",
+    "test:message-lockstep": "node --import @oxc-node/core/register scripts/check-agent-api-message-lockstep.ts",
     "test": "pnpm run test:message-lockstep && vitest run"
   },
   "dependencies": {
     "@botiverse/raft-sync-core": "workspace:*",
     "mdast-util-from-markdown": "^2.0.3",
     "mdast-util-gfm": "^3.1.0",
+    "mdast-util-math": "3.0.0",
+    "micromark-extension-cjk-friendly": "^2.0.2",
     "micromark-extension-gfm": "^3.0.0",
+    "micromark-extension-math": "3.1.0",
     "tar-stream": "2.2.0",
-    "zod": "^4.3.6"
+    "zod": "^4.6.6"
   },
   "devDependencies": {
     "@oxc-node/core": "^0.1.6",
@@ -175,6 +284,8 @@
     "@types/mdast": "^4.0.4",
     "@types/node": "^25.5.0",
     "@types/tar-stream": "3.1.4",
+    "ajv": "8.20.0",
+    "micromark-util-types": "2.0.2",
     "openapi-typescript": "7.13.0",
     "typescript": "^6.0.3",
     "vitest": "^5.0.3",

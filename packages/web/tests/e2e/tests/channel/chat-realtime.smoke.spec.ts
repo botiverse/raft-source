@@ -1,6 +1,7 @@
 import { expect, test } from "@playwright/test";
 import { loginViaApi } from "../../fixtures/auth";
 import { waitForSeedState } from "../../fixtures/seedState";
+import { expectTimelineRendered } from "../../fixtures/timeline";
 
 async function measureBottomGap(page: Parameters<typeof test>[0]["page"]) {
   const scroller = page.getByTestId("message-scroller");
@@ -15,8 +16,9 @@ test("seeded chat loads at the bottom and receives a realtime message", async ({
 
   await page.goto(`/s/${seedState.server.slug}`);
 
-  await expect(page.getByTestId("message-scroller")).toBeVisible();
-  await expect(page.getByText(seedState.messages.latestContent)).toBeVisible();
+  // Any rendered row: other specs post to this channel, so its seeded latest
+  // message may be far above the tail (and not mounted).
+  await expectTimelineRendered(page);
   // Allow up to one item height of slack here; scroll/layout settles asynchronously.
   await expect(measureBottomGap(page)).resolves.toBeLessThan(40);
 

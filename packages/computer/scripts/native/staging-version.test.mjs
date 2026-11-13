@@ -11,7 +11,14 @@ import { compareComputerVersions } from "../../src/computerVersionOrder";
 // deliberate release decision) does not silently invalidate these teeth.
 const [FLOOR_MAJOR, FLOOR_MINOR, FLOOR_PATCH] = STABLE_FLOOR.split(".").map(Number);
 const ABOVE_FLOOR = `${FLOOR_MAJOR}.${FLOOR_MINOR}.${FLOOR_PATCH + 1}`;
-const BELOW_FLOOR = `${FLOOR_MAJOR}.${FLOOR_MINOR}.${FLOOR_PATCH - 1}`;
+// The nearest valid version under the floor: a floor ending in .0 (1.22.0)
+// has no patch to step down from, and "1.22.-1" is not a version at all.
+const BELOW_FLOOR =
+  FLOOR_PATCH > 0
+    ? `${FLOOR_MAJOR}.${FLOOR_MINOR}.${FLOOR_PATCH - 1}`
+    : FLOOR_MINOR > 0
+      ? `${FLOOR_MAJOR}.${FLOOR_MINOR - 1}.0`
+      : `${FLOOR_MAJOR - 1}.0.0`;
 // A real commit time (UTC YYYYMMDDHHMMSS) used where order is not under test.
 const T = "20261003085512";
 

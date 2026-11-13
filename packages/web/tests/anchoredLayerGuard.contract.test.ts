@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
+import { isTestPath } from "../scripts/testLocations";
 
 // A layer hung under its trigger inline (`absolute … top-full`) cannot see the
 // screen edge: opened near the right it runs off the screen, and focusing
@@ -9,20 +10,22 @@ import path from "node:path";
 // Popups belong to raft-ui's Popover / Menu / Select, which portal the layer
 // and keep it on screen (shift, flip, never past the space it has).
 //
-// The only inline layers left are bounded on both sides by construction; a new
-// one fails here. State the bound when you add one, or use raft-ui instead.
+// An inline layer is allowed only when it is bounded on both sides by
+// construction (none is today); a new one fails here. State the bound in
+// BOUNDED when you add one, or use raft-ui instead.
 
 const SRC = path.resolve(__dirname, "../src");
 const INLINE_ANCHORED = /absolute[^"`]*\b(top-full|top-\[calc\(100%)|\b(top-full|top-\[calc\(100%)[^"`]*\babsolute\b/;
 const BOUNDED = new Map<string, string>([
-  ["components/layout/SidebarConversationFinder.tsx", "finder results: inset-x-2 inside the sidebar"],
+  ["components/task/TaskHeadPullDown.tsx", "a phone task bar's pull-down: inset-x-0 of the full-width bar (both sides on screen by construction), max-h-[70dvh] with its own scroll, no focusable box outside it to scroll into view"],
 ]);
 
 function walk(dir: string, out: string[] = []): string[] {
   for (const name of readdirSync(dir)) {
     const full = path.join(dir, name);
     if (statSync(full).isDirectory()) walk(full, out);
-    else if (full.endsWith(".tsx")) out.push(full);
+    // Feature tests (src/features/<feature>/tests/) are not app code.
+    else if (full.endsWith(".tsx") && !isTestPath(`src/${path.relative(SRC, full).split(path.sep).join("/")}`)) out.push(full);
   }
   return out;
 }

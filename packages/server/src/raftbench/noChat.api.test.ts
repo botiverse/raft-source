@@ -10,7 +10,7 @@ import { AgentOrchestrator } from "../services/agentOrchestrator";
 import { getAgentResumeCatchupMessages } from "../services/messageService";
 import type { AgentMessage } from "@botiverse/raft-shared";
 
-const test = createApiTest({ onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest();
 
 test("bound service identity never receives chat, mentions or DMs, even disabled; assignments survive", async ({ app, db, seed }) => {
   const owner = await seed.human();
@@ -56,7 +56,7 @@ test("bound service identity never receives chat, mentions or DMs, even disabled
   expect((await orchestrator.deliverMessage(service.id, event, { intrinsic: true })).status).toBe("queued");
   expect(pushed).toEqual([event]);
   expect((await orchestrator.deliverMessage(service.id, { ...event, third_party_event: { ...event.third_party_event!, client_id: "other-app" } }, { intrinsic: true })).status).toBe("dropped");
-  const credential = await mintAgentCredential({ agentId: sender.id, scopes: ["read", "send", "mentions"], name: "Synthetic sender", createdByUserId: owner.id });
+  const credential = await mintAgentCredential({ agentId: sender.id, scopes: ["read", "send", "mentions"], name: "Synthetic sender", issuedVia: "human", createdByUserId: owner.id });
   const headers = { Authorization: `Bearer ${credential.apiKey}`, "Content-Type": "application/json" };
   for (const [target, content] of [["#synthetic-qa", "Synthetic @raftbench-service"], ["dm:@raftbench-service", "Synthetic @raftbench-service"], ["dm:@raftbench-service", "Synthetic direct message"]]) {
     const response = await fetch(`${app.baseUrl}/internal/agent-api/send`, { method: "POST", headers, body: JSON.stringify({ target, content }) });

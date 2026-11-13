@@ -163,6 +163,21 @@ test("an EMPTY list with the completeness assertion is a definite not-found", as
   );
 });
 
+test("a different or incomplete scope cannot prove a task absent from this channel", async () => {
+  for (const body of [
+    { tasks: [], scope: "mine", pagination: { mode: "complete", truncated: false } },
+    { tasks: [], scope: "channel", pagination: { mode: "complete", truncated: false }, coverage: { status: "incomplete", visibleChannelTypes: ["channel"], includesArchived: true, inaccessibleScope: "not_asserted", reason: "scope omitted" } },
+  ]) {
+    const { ctx } = ctxReturningBody(body);
+    await assert.rejects(
+      async () => { await taskShowCommand.handler(ctx, { target: "#proj-daemon", number: "7" }); },
+      (error: unknown) => error instanceof CliError && error.code === "NOT_FOUND"
+        && /did not assert the list is complete/.test(error.message)
+        && !/server asserts this list is complete/.test(error.message),
+    );
+  }
+});
+
 test("a truncated:true body never reaches the completeness branch — the contract rejects it first", async () => {
   // Measured, not assumed: `truncated` is `z.literal(false)`, so a `true` fails shared-contract
   // parsing and surfaces as INVALID_JSON_RESPONSE — it is never seen as either branch here. This

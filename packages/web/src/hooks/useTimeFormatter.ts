@@ -5,6 +5,8 @@ import {
   formatClock,
   formatClock24,
   formatClockWithSeconds,
+  formatCompactDate,
+  formatGutterClock,
   formatMediumDateTime,
   formatMediumDateTime24,
   formatMessageTime,
@@ -31,10 +33,12 @@ export function useTimeFormatter() {
       options: base,
       formatClock: (value: Date | string | number | null | undefined) => formatClock(value, base),
       formatClock24: (value: Date | string | number | null | undefined) => formatClock24(value, base),
+      formatGutterClock: (value: Date | string | number | null | undefined) => formatGutterClock(value, base),
       formatClockWithSeconds: (value: Date | string | number | null | undefined) => formatClockWithSeconds(value, base),
       formatMediumDateTime24: (value: Date | string | number | null | undefined) => formatMediumDateTime24(value, base),
       formatMessageTime: (value: Date | string | number | null | undefined) => formatMessageTime(value, base),
       formatShortDateTime: (value: Date | string | number | null | undefined) => formatShortDateTime(value, base),
+      formatCompactDate: (value: Date | string | number | null | undefined) => formatCompactDate(value, base),
       formatMediumDateTime: (value: Date | string | number | null | undefined) => formatMediumDateTime(value, base),
     };
   }, [effectiveTimeFormat, effectiveTimezone, formatMessage, locale]);

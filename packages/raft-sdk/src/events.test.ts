@@ -136,6 +136,18 @@ test("third party provenance stays typed and inert; unknown senders are not huma
   assert.equal(forged.ok, false);
 });
 
+test("an anonymous Slack message without optional provenance remains readable by the existing SDK", async () => {
+  const result = await client(async () => Response.json(batch([
+    { sender_type: "third_party_app", sender_id: "", sender_name: "Slack", content: "anonymous body", mentioned: false },
+  ]))).events.receive();
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.equal(result.data.events[0].senderType, "third_party_app");
+  assert.equal(result.data.events[0].senderName, "Slack");
+  assert.equal(result.data.events[0].content, "anonymous body");
+  assert.equal(result.data.events[0].externalMessage, undefined);
+});
+
 test("cursor ack passes ack=cursor with the previous cursor and reports the Server's ack mode", async () => {
   const seen: Array<{ since: string | null; ack: string | null }> = [];
   const sdk = client(async (input) => {

@@ -81,7 +81,7 @@ test.describe("short channel anchors content to bottom", () => {
           return Math.round(scrollerRect.bottom - lastRect.bottom);
         });
       }, { timeout: 5000 })
-      // Allow up to one Footer-equivalent of slack (footer is ~24px: pb-3 + h-3).
+      // Allow up to one Footer-equivalent of slack (the list end is a section step, ~24px).
       .toBeLessThan(40);
   });
 });

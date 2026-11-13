@@ -42,6 +42,9 @@ test("an explicit lang parameter selects the locale", () => {
   assert.equal(resolveLangParamLocale("?lang=zh-Hans-CN", []), "zh-cn");
   assert.equal(resolveLangParamLocale("?lang=en", []), "en");
   assert.equal(resolveLangParamLocale("?lang=fr", []), "en", "unsupported falls back to English");
+  assert.equal(resolveLangParamLocale("?lang=ja", []), "ja");
+  assert.equal(resolveLangParamLocale("?lang=ja-JP", []), "ja");
+  assert.equal(resolveLangParamLocale("?lang=ko-KR", []), "ko");
 });
 
 test("lang=system follows the browser languages, and only then", () => {
@@ -50,6 +53,8 @@ test("lang=system follows the browser languages, and only then", () => {
   assert.equal(resolveLangParamLocale("?lang=system", ["zh-CN", "en"]), "zh-cn");
   assert.equal(resolveLangParamLocale("?lang=system", ["en-US"]), "en");
   assert.equal(resolveLangParamLocale("?lang=system", []), "en");
+  assert.equal(resolveLangParamLocale("?lang=system", ["ja-JP", "zh-CN"]), "ja", "the first shipped device language wins");
+  assert.equal(resolveLangParamLocale("?lang=system", ["en-US", "ko-KR"]), "en", "English first yields only to Chinese");
   assert.equal(resolveInitialLocale({ languages: ["zh-CN"] }), "zh-cn",
     "a Chinese browser selects zh-cn when no explicit choice exists");
 });
@@ -165,15 +170,37 @@ const BILLING_RESOLVER_PARITY: ReadonlyArray<readonly [string, readonly string[]
   ["?lang=zh&lang=en", ["fr-FR", "zh-TW"], "zh-CN"],
 ];
 
+/**
+ * Rows where a catalog that shipped after the freeze is now the better answer.
+ * The billing resolver only knew zh-CN, so a Traditional Chinese device got
+ * Simplified; with the zh-tw catalog it gets Traditional. Each entry is a
+ * decision, not drift: the corpus above stays exactly as captured.
+ */
+const NEW_CATALOG_DIVERGENCE: ReadonlyMap<string, string> = new Map([
+  ["?lang=system|fr-FR,zh-TW", "zh-tw"],
+]);
+
 test("matches the billing resolver one-for-one wherever lang is present", () => {
   assert.equal(BILLING_RESOLVER_PARITY.length, 60, "the frozen corpus lost rows");
   for (const [search, languages, billing] of BILLING_RESOLVER_PARITY) {
+    const key = `${search}|${languages.join(",")}`;
     assert.equal(
       resolveLangParamLocale(search, languages),
-      billing === "zh-CN" ? "zh-cn" : "en",
+      NEW_CATALOG_DIVERGENCE.get(key) ?? (billing === "zh-CN" ? "zh-cn" : "en"),
       `divergence for ${search} with languages [${languages.join(",")}]`,
     );
   }
+  for (const key of NEW_CATALOG_DIVERGENCE.keys()) {
+    assert.ok(BILLING_RESOLVER_PARITY.some(([search, languages]) => `${search}|${languages.join(",")}` === key), key);
+  }
+});
+
+test("lang=system: a second device language does not override English, except Chinese", () => {
+  // Frozen rows above keep the Chinese rule; languages added since follow the list order.
+  assert.equal(resolveLangParamLocale("?lang=system", ["en-US", "es-US"]), "en");
+  assert.equal(resolveLangParamLocale("?lang=system", ["en-US", "ko-KR"]), "en");
+  assert.equal(resolveLangParamLocale("?lang=system", ["pt-BR", "en-US"]), "pt-br");
+  assert.equal(resolveLangParamLocale("?lang=system", ["en-US", "zh-TW"]), "zh-tw");
 });
 
 test("the one deliberate divergence: no lang parameter", () => {

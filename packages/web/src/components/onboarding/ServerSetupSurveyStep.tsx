@@ -56,8 +56,8 @@ function OptionGrid<T extends string>({
               // Continue button right below), and a grid of pink chips read like a
               // row of buttons competing with it.
               selected
-                ? "border-sticker-ink bg-brand text-sticker-ink hover:press-overlay-sticker active:press-overlay-sticker"
-                : "border-line-strong bg-layer-card text-foreground hover:press-overlay active:press-overlay"
+                ? "border-sticker-ink bg-selected text-sticker-ink hover:overlay-sticker-medium active:overlay-sticker-medium"
+                : "border-line-strong bg-layer-card text-foreground hover:overlay-medium active:overlay-medium"
             }`}
             data-testid={`signup-${name}-${option.id}`}
           >
@@ -115,7 +115,7 @@ export default function ServerSetupSurveyStep({
       title={formatMessage({ id: "layout.onboarding.tellAboutYou" }, { agentName })}
       hint={formatMessage({ id: "layout.onboarding.surveyHint" })}
       onSubmit={handleSubmit}
-      bodyClassName="space-y-5"
+      bodyClassName="stack-y-5"
       footer={
         <>
           <SetupSessionFooter disabled={loading} />

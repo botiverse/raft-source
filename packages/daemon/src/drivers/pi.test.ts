@@ -36,6 +36,7 @@ import {
   withProcessEnvPatch,
   __piPromptsInFlightForTest,
 } from "./pi";
+import { piSessionMemoryAttrs } from "./piSessionMemory";
 import { waitForState } from "../testing/drydock";
 import type { ProviderRequestObserver } from "../providerRequestFetch";
 import {
@@ -54,6 +55,8 @@ import { resolveRuntimeSessionRef, writeRuntimeLifecycleDiagnosticRecord } from 
 import type { ParsedEvent, SpawnContext } from "./types";
 import { traceRows } from "../testing/traceRows";
 import { makeDeterministicTracer } from "../testing/deterministicTracer";
+import { answerGatewayModelListRead } from "../testing/gatewayModelListProbe";
+import { installDaemonFetchMockForTests } from "../daemonFetch";
 
 function makeSpawnContext(
   overrides: Partial<SpawnContext["config"]> = {},
@@ -190,13 +193,15 @@ test("Built-in driver is a separate preset runtime with static launchable models
       protocolVersion: 1,
       runtime: "builtin",
       runtimeVersion: driver.probe().version,
+      customModelProviderIds: ["openrouter"],
     });
     assert.equal(detected.value.models.some((model) => model.id === "deepseek/deepseek-v4-pro" && model.verified === "launchable"), true);
     // 0.86.0 renamed this entry: deepseek-v4-flash -> deepseek-flash ("DeepSeek V4.1 Flash").
     assert.equal(detected.value.models.some((model) => model.id === "deepseek/deepseek-flash" && model.verified === "launchable"), true);
     assert.equal(detected.value.models.some((model) => model.id === "openai/gpt-5.4" && model.verified === "launchable"), true);
     assert.equal(detected.value.models.some((model) => model.id === "moonshotai-cn/kimi-k2.7-code" && model.verified === "launchable"), true);
-    assert.equal(detected.value.models.some((model) => model.id === "xiaomi/mimo-v2.5-pro" && model.verified === "launchable"), true);
+    // 1.4.0 dropped the MiMo V2.5 ids; V2.6-Pro is the provider default now.
+    assert.equal(detected.value.models.some((model) => model.id === "xiaomi/mimo-v2.6-pro" && model.verified === "launchable"), true);
   } finally {
     restoreEnv("PI_CODING_AGENT_DIR", previousAgentDir);
     restoreEnv("TASK349_PI_API_KEY", previousTaskKey);
@@ -314,6 +319,23 @@ test("createPiAgentSessionForContext resolves explicit Pi package extension mode
   } finally {
     session.dispose();
   }
+});
+
+test("a live Pi session counts in the memory event until it is disposed", async () => {
+  const fixture = createPiExtensionModelFixture(onTestFinished);
+  const before = piSessionMemoryAttrs(Date.now()).pi_session_count ?? 0;
+
+  const session = await withPiExtensionEnv(fixture, () =>
+    createPiAgentSessionForContext(makeSpawnContext({ model: fixture.modelId }), "pi-memory-session"));
+  try {
+    const attrs = piSessionMemoryAttrs(Date.now());
+    assert.equal(attrs.pi_session_count, before + 1);
+    assert.equal(typeof attrs.pi_session_entry_count, "number");
+    assert.ok((attrs.pi_oldest_session_age_ms ?? -1) >= 0, "age comes from the session header");
+  } finally {
+    session.dispose();
+  }
+  assert.equal(piSessionMemoryAttrs(Date.now()).pi_session_count ?? 0, before);
 });
 
 test("createPiAgentSessionForContext persists an early startup failure without a native transcript", async () => {
@@ -882,6 +904,7 @@ test("daemon Pi provider requests traverse a real CONNECT proxy when the gateway
   mkdirSync(workingDirectory, { recursive: true });
 
   const provider = createServer((req, res) => {
+    if (answerGatewayModelListRead(req, res)) return;
     providerRequests.push(req.url ?? "");
     req.resume();
     res.writeHead(200, {
@@ -998,7 +1021,9 @@ test("daemon Pi provider requests traverse a real CONNECT proxy when the gateway
       { apiKey: "sk-proxy-proof", maxRetries: 0 },
     ).result();
     assert.equal(failedResult.stopReason, "error");
-    assert.equal(failedResult.errorMessage, "terminated");
+    // pi 1.5.1 appends the transport detail ("terminated: other side closed (UND_ERR_SOCKET)")
+    // to the same abort; the failure is still the terminated stream.
+    assert.match(String(failedResult.errorMessage), /^terminated\b/u);
     assert.equal(typeof failedResult.errorMessage, "string");
     assert.deepEqual(providerRequests, ["/v1/chat/completions", "/v1/chat/completions"]);
 
@@ -1023,6 +1048,7 @@ test("concurrent Pi sessions keep distinct proxy routes and dispose independentl
 
   function createProvider(label: string, requests: string[]): Server {
     return createServer((req, res) => {
+      if (answerGatewayModelListRead(req, res)) return;
       requests.push(req.url ?? "");
       req.resume();
       res.writeHead(200, {
@@ -1166,6 +1192,8 @@ test("Built-in gateway inherits Qwen Token Plan payload compatibility from the P
   const root = mkdtempSync(path.join(os.tmpdir(), "slock-builtin-qwen-token-plan-"));
   const workingDirectory = path.join(root, "workspace");
   mkdirSync(workingDirectory, { recursive: true });
+  // The session reads the gateway's model list first (#proj-runtime:#53); this real host is not reached.
+  const restoreFetch = installDaemonFetchMockForTests((async () => new Response("not found", { status: 404 })) as typeof fetch);
 
   try {
     const session = await createPiAgentSessionForContext(
@@ -1248,6 +1276,7 @@ test("Built-in gateway inherits Qwen Token Plan payload compatibility from the P
       session.dispose();
     }
   } finally {
+    restoreFetch();
     rmSync(root, { recursive: true, force: true });
   }
 });
@@ -2064,6 +2093,19 @@ test("SDK event mapping runtime-normalizes a malicious compaction reason before 
   assert.doesNotMatch(JSON.stringify(events), /reviewer|secret|provider\.example|private/iu);
 });
 
+test("SDK event mapping pairs each compaction start with its own end by cycle id", () => {
+  const state = createPiSdkEventMappingState();
+  const map = (event: Record<string, unknown>) => mapPiSdkEventToParsedEvents(event as unknown as AgentSessionEvent, state, undefined)
+    .filter((parsed) => parsed.kind.startsWith("compaction_"));
+  const end = { type: "compaction_end", reason: "manual", result: { summary: "s" }, aborted: false, willRetry: false };
+  assert.deepEqual(map({ type: "compaction_start", reason: "manual" }), [{ kind: "compaction_started", cycleId: 1 }]);
+  assert.deepEqual(map(end), [{ kind: "compaction_finished", cycleId: 1 }]);
+  // A repeated end has no open start, so it claims no cycle.
+  assert.deepEqual(map(end), [{ kind: "compaction_finished" }]);
+  assert.deepEqual(map({ type: "compaction_start", reason: "threshold" }), [{ kind: "compaction_started", cycleId: 2 }]);
+  assert.deepEqual(map({ ...end, result: undefined, aborted: true }), [{ kind: "compaction_interrupted", cycleId: 2, outcome: "aborted", reason: "manual", willRetry: false }]);
+});
+
 test("SDK event mapping distinguishes successful and aborted compaction outcomes", () => {
   const succeeded = mapPiSdkEventToParsedEvents({
     type: "compaction_end",
@@ -2435,6 +2477,39 @@ test("PiSdkRuntimeSession subscribes before prompt and routes prompt, steer, and
   assert.equal(calls.includes("dispose"), true);
 });
 
+// Task #1302: abort() waits for the run to go idle, so a tool that ignores the
+// abort used to hang every stop, including the stalled-recovery SIGKILL
+// escalation, and the agent never restarted.
+test("PiSdkRuntimeSession SIGKILL stop ends the session even when abort never settles", async () => {
+  const calls: string[] = [];
+  const fake = createFakeAgentSession("pi-session-hung-abort", calls);
+  (fake as unknown as { abort: () => Promise<void> }).abort = () => {
+    calls.push("abort");
+    return new Promise<void>(() => undefined);
+  };
+  const runtime = new PiSdkRuntimeSession(
+    makeSpawnContext(),
+    () => undefined,
+    async () => fake as unknown as AgentSession,
+  );
+  const closes: unknown[] = [];
+  runtime.on("close", (info) => closes.push(info));
+  await runtime.start({ text: "initial prompt" });
+  await new Promise((resolve) => setImmediate(resolve));
+  fake.__setStreaming(true);
+
+  let gracefulSettled = false;
+  void runtime.stop({ signal: "SIGTERM", reason: "stalled_recovery" }).then(() => { gracefulSettled = true; });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(gracefulSettled, false, "a graceful stop still waits for abort");
+  assert.deepEqual(closes, []);
+
+  await runtime.stop({ signal: "SIGKILL", reason: "stalled_recovery_sigterm_timeout" });
+  assert.equal(calls.includes("dispose"), true);
+  assert.equal(closes.length, 1);
+  assert.equal(runtime.closed, true);
+});
+
 test("PiSdkRuntimeSession queues initial prompt before session_init-triggered steering", async () => {
   const calls: string[] = [];
   const fake = createFakeAgentSession("pi-session-ready-debt", calls);
@@ -2594,7 +2669,7 @@ test("Pi library egress traverses both interception faces, and apiKey seeding pr
   } as never;
 
   try {
-    // --- POSITIVE CONTROL: real 1.3.0 OAuth flow, real fetch, pointed at loopback -------------
+    // --- POSITIVE CONTROL: real 1.5.2 OAuth flow, real fetch, pointed at loopback -------------
     process.env.KIMI_CODE_OAUTH_HOST = `http://127.0.0.1:${port}`;
     const { kimiCodingProvider } = await import("@earendil-works/pi-ai/providers/kimi-coding");
     const provider = kimiCodingProvider() as unknown as {
@@ -2794,10 +2869,34 @@ test("pi pin is the version this offline guarantee was verified against", () => 
   //   site (6 each) are unchanged. The 1.3.0 changes live elsewhere in the package (kimi-coding's
   //   Chat Completions move, catalog personalization), not on the credential/availability path.
   //
+  //   1.3.0 -> 1.4.0 was re-verified the same way: the whole model-runtime.js diff is 9 lines and
+  //   is confined to the outgoing-request header path -- `getOpenCodeSessionHeaders(requestModel,
+  //   sessionId)` is now merged into the provider headers and `requestModel` is computed before
+  //   the merge. `synchronizeCredentialState` and `refreshProviderAvailability` are
+  //   byte-identical, and `allowNetwork: false` still appears exactly 6 times in each, so the
+  //   seeding path is untouched and the offline guarantee holds.
+  //
+  //   1.4.0 -> 1.5.0 was re-verified and is the strongest form again: `diff` of
+  //   dist/core/model-runtime.js between the two packed artifacts is EMPTY (byte-identical),
+  //   so `synchronizeCredentialState`, `refreshProviderAvailability` and every
+  //   `allowNetwork: false` site (6 each) are unchanged. 1.5.0's changes (pi-schema tool
+  //   validation, the models.dev v2 catalog) live outside the credential/availability path.
+  //
+  //   1.5.1 -> 1.5.2 was re-verified and is the strongest form again: dist/core/model-runtime.js
+  //   is byte-identical between the packed artifacts, so every credential/seeding site is
+  //   unchanged (1.5.2 only touched session forking/import and an OAuth version string).
+  //
+  //   1.5.0 -> 1.5.1 was re-verified: the model-runtime.js diff is 15 lines -- a new
+  //   additive `settleCredentialWrites()` and `options?.signal` threaded into four
+  //   internal refreshes. `synchronizeCredentialState` and `refreshProviderAvailability`
+  //   are byte-identical and `allowNetwork: false` still appears exactly 6 times in
+  //   each, so the seeding path is untouched. (1.5.1 also turns Anthropic message
+  //   threads on by default, which the daemon keeps, see #runtime-watch:#1.)
+  //
   // Then update VERIFIED_AGAINST *and* the three sibling 0.8x.y labels below (the positive-control
   // comment, the "never triggers a remote model refresh (pi X)" test name, and its comment) --
   // otherwise they assert a version nobody re-checked.
-  const VERIFIED_AGAINST = "1.3.0";
+  const VERIFIED_AGAINST = "1.5.2";
   const pkg = JSON.parse(
     readFileSync(new URL("../../package.json", import.meta.url), "utf8"),
   ) as { dependencies: Record<string, string> };
@@ -2814,8 +2913,8 @@ test("pi pin is the version this offline guarantee was verified against", () => 
   }
 });
 
-test("Pi auth seeding never triggers a remote model refresh (pi 1.3.0)", async () => {
-  // Under 1.3.0 the offline guarantee lives inside the library: credential synchronization
+test("Pi auth seeding never triggers a remote model refresh (pi 1.5.2)", async () => {
+  // Under 1.5.2 the offline guarantee lives inside the library: credential synchronization
   // refreshes with allowNetwork:false and reconciles only local catalog/composition/availability.
   // Our side of the contract is that seeding issues NO refresh of its own — remote freshness is a
   // separate, deliberate caller decision. This counts refreshes rather than inspecting arguments,
@@ -3125,6 +3224,57 @@ test("PiSdkRuntimeSession does not serialize pi-builtin prompts across agents", 
     releaseFirst?.();
     await Promise.all([first.dispose(), second.dispose()]);
   }
+});
+
+test("#54 phase 3: PiSdkRuntimeSession reads Pi's context usage, compacts only an idle session, and reports a failure by class", async () => {
+  const calls: string[] = [];
+  const fake = createFakeAgentSession("pi-session-compact", calls);
+  let compactError: Error | null = null;
+  const session = Object.assign(fake, {
+    isCompacting: false,
+    getContextUsage: () => ({ tokens: 300_000, contextWindow: 1_000_000, percent: 30 }),
+    async compact() {
+      calls.push("compact");
+      if (compactError) throw compactError;
+      return {} as never;
+    },
+  });
+  const runtime = new PiSdkRuntimeSession(makeSpawnContext(), () => undefined, async () => session as unknown as AgentSession);
+  assert.deepEqual(await runtime.start({ text: "initial prompt" }), { ok: true, acceptedAs: "prompt" });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(await runtime.turnEndContextFacts(), { contextTokens: 300_000, windowTokens: 1_000_000 });
+  fake.__setStreaming(true);
+  assert.deepEqual(await runtime.compactAtTurnEnd(), { kind: "refused", reason: "busy" }, "compact() would abort the running turn");
+  assert.equal(calls.includes("compact"), false);
+  fake.__setStreaming(false);
+  assert.deepEqual(await runtime.compactAtTurnEnd(), { kind: "completed" });
+  compactError = new Error("Summarization failed: generation hit the token cap and the summary is incomplete");
+  assert.deepEqual(await runtime.compactAtTurnEnd(), { kind: "failed", reason: "summary_incomplete" }, "a class, never the provider text");
+  assert.equal(calls.filter((call) => call === "compact").length, 2);
+});
+
+test("#54 phase 3: cancelTurnEndCompaction aborts Pi's open compaction and resolves once the session takes prompts again", async () => {
+  const calls: string[] = [];
+  const fake = createFakeAgentSession("pi-session-cancel", calls);
+  const session = Object.assign(fake, {
+    isCompacting: false,
+    abortCompaction() {
+      calls.push("abortCompaction");
+      // Pi clears its compaction controller once the aborted summary call unwinds.
+      setTimeout(() => { session.isCompacting = false; }, 30);
+    },
+  });
+  const runtime = new PiSdkRuntimeSession(makeSpawnContext(), () => undefined, async () => session as unknown as AgentSession);
+  assert.deepEqual(await runtime.start({ text: "initial prompt" }), { ok: true, acceptedAs: "prompt" });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  await runtime.cancelTurnEndCompaction();
+  assert.equal(calls.includes("abortCompaction"), false, "nothing to cancel when no compaction is open");
+  session.isCompacting = true;
+  await runtime.cancelTurnEndCompaction();
+  assert.equal(calls.filter((call) => call === "abortCompaction").length, 1);
+  assert.equal(session.isCompacting, false, "resolves only once Pi would take a prompt again");
 });
 
 test("PiSdkRuntimeSession steers deferred idle input when Pi keeps streaming past grace window", async () => {
@@ -4408,6 +4558,9 @@ test("resolveBuiltInThinkingLevel: unset effort takes the contract's documented 
   assert.equal(resolveBuiltInThinkingLevel(undefined, thinkingContract), "max");
   assert.equal(resolveBuiltInThinkingLevel("high", thinkingContract), "high", "an explicit choice passes through");
   assert.equal(resolveBuiltInThinkingLevel("max", thinkingContract), "max");
+  // Pi's own off/minimal reach the SDK as chosen (Pi maps a level a model lacks).
+  assert.equal(resolveBuiltInThinkingLevel("off", thinkingContract), "off");
+  assert.equal(resolveBuiltInThinkingLevel("minimal", null), "minimal");
 
   const plain = await freshBuiltInModelRegistry();
   const plainConfig = anthropicGatewayConfig("https://gateway.example.test/anthropic", "MiniMax-M3.1-Flash-Preview");
@@ -4432,6 +4585,7 @@ function startFakeAnthropicServer(): { server: Server; bodies: Array<Record<stri
   const bodies: Array<Record<string, any>> = [];
   const paths: string[] = [];
   const server = createServer((req, res) => {
+    if (answerGatewayModelListRead(req, res)) return;
     const chunks: Buffer[] = [];
     req.on("data", (chunk) => chunks.push(chunk));
     req.on("end", () => {
@@ -4537,6 +4691,7 @@ test("real built-in chain, control: the same model id without a contract keeps t
 function startFakeAnthropicToolServer(): { server: Server; bodies: Array<Record<string, any>> } {
   const bodies: Array<Record<string, any>> = [];
   const server = createServer((req, res) => {
+    if (answerGatewayModelListRead(req, res)) return;
     const chunks: Buffer[] = [];
     req.on("data", (chunk) => chunks.push(chunk));
     req.on("end", () => {
@@ -4620,6 +4775,7 @@ test("real built-in chain: a relaunch resumes the Pi session and sends the earli
   mkdirSync(workingDirectory, { recursive: true });
   const bodies: Array<Record<string, any>> = [];
   const server = createServer((req, res) => {
+    if (answerGatewayModelListRead(req, res)) return;
     const chunks: Buffer[] = [];
     req.on("data", (chunk) => chunks.push(chunk));
     req.on("end", () => {

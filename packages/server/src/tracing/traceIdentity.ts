@@ -19,8 +19,21 @@ const ID_HASH_HEX_CHARS = 16;
 // stale_cache_key_hash: the rw-stale cache key (routes/rwStaleRead.ts), which
 // embeds a user id; counted per key, never resolved back.
 // conversation_id_hash: a channel/DM/thread id in the agent-context return
-// event (agentContextReturnTrace.ts); counted per conversation, never resolved.
-export type TraceIdentityKind = "agent_id_hash" | "server_id_hash" | "stale_cache_key_hash" | "conversation_id_hash" | "machine_id_hash";
+// event (agentContextReturnTrace.ts), the agent send's message.sent event
+// (routes/internal.ts), message forward's terminal event (messageForwardTrace.ts)
+// and the external agent inbox pull event (messageService.ts);
+// counted per conversation, never resolved.
+// message_id_hash: the message a link-preview read refused or failed on
+// (routes/messages.ts), and the message an agent send created (message.sent,
+// routes/internal.ts), and a forward's single source message (messageForwardTrace.ts);
+// found from a known id with trace:agent-id-hash --kind message.
+// job_id_hash: a channel conversion job, on the conversion worker's per-job
+// event (server.channel_conversion_worker.job, channelConversionWorker.ts);
+// found from a known id with trace:agent-id-hash --kind job.
+// feedback_reporter_hash: the user who submitted product feedback, as the
+// inbox object ref of the triage notice (productFeedbackTriageNotice.ts) so
+// one person's submissions share one inbox row; never the raw user id.
+export type TraceIdentityKind = "agent_id_hash" | "server_id_hash" | "stale_cache_key_hash" | "conversation_id_hash" | "machine_id_hash" | "message_id_hash" | "feedback_reporter_hash" | "job_id_hash";
 
 let cachedRoot: string | null = null;
 const cachedKeys = new Map<TraceIdentityKind, Buffer>();
@@ -88,6 +101,16 @@ export function traceMachineIdHash(machineId: string | null | undefined): string
 export function agentIdHashAttrs(agentId: string | null | undefined): { agent_id_hash?: string } {
   const hash = traceAgentIdHash(agentId);
   return hash ? { agent_id_hash: hash } : {};
+}
+
+/**
+ * `{ key_prefix_hash }` for a key that matched nothing. Under the agent hash key
+ * so the raw prefix stays out of traces; it resolves to nothing, it only groups
+ * requests by the key they presented.
+ */
+export function apiKeyPrefixHashAttrs(prefix: string): { key_prefix_hash?: string } {
+  const hash = traceAgentIdHash(prefix);
+  return hash ? { key_prefix_hash: hash } : {};
 }
 
 /** `{ server_id_hash }` when hashable, else `{}` — for spreading into attrs. */

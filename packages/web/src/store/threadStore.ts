@@ -1,6 +1,12 @@
 import { create } from "zustand";
+import { listFetchReasonHeaders } from "./listFetchReason";
+import type { ListFetchReason } from "./listFetchReason";
 import { useUIStore } from "./uiStore";
+import { forgetSkippedSeenRead } from "./seenReadCatchUp";
+import { applyThreadUnreadProjectionToSummaries, isReopenedTaskUnread, isReopenedThreadUnread, keepShownThreadsRead } from "./threadUnreadLocal";
 import api from "../api/client";
+import { getRwRead } from "../api/overloadRetry";
+import { saveLastCounts } from "./lastCounts";
 import { useServerStore } from "./serverStore";
 import { getCurrentPrincipalId } from "./principalRuntime";
 import { captureReadAllReceiver } from "./receiverPrivateIngress";
@@ -24,6 +30,10 @@ import {
 import type {
   TaskMetadataUpdate,
 } from "../utils/taskMetadata";
+import { isTaskConversationRow, normalizeTaskConversationRow } from "../utils/taskConversation";
+import type { SubConversationKind } from "../utils/taskConversation";
+import { beginViewSwitch, threadView } from "../observability/viewSwitchSpan";
+import { prefetchResolvedThreadReplies, prefetchThreadReplies } from "./threadRepliesPrefetch";
 
 // The reply-preview type is owned by the read model (the SDK contract surface),
 // NOT redefined here. One definition, one place — two copies of a contract type
@@ -32,6 +42,7 @@ import {
   applyThreadReplyFrame,
   emptyThreadRepliesScope,
   hydrateThreadRepliesScope,
+  retainNewerThreadReplyContent,
 } from "./threadRepliesReadModel";
 import type {
   ThreadRepliesScope,
@@ -58,6 +69,8 @@ export interface ThreadSummary {
 
 export interface FollowedThread {
   threadChannelId: string;
+  /** The thread's explicit notification level (contract §2.2; absent = default or an older server). */
+  notificationLevel?: "default" | "all" | "mentions" | "none" | null;
   parentMessageId: string;
   parentChannelId: string;
   parentChannelName: string;
@@ -67,6 +80,13 @@ export interface FollowedThread {
   parentMessageSenderId: string;
   /** When the parent message was posted (its place in the channel). Absent on older servers. */
   parentMessageCreatedAt?: string;
+  /**
+   * The server's answers, with the history paywall's own cutoff: whether the
+   * parent message is inside the plan's history window, and whether the
+   * thread has replies inside it. Absent on older servers.
+   */
+  parentInHistory?: boolean;
+  repliesInHistory?: boolean;
   /** Same-source frontier paired with the accepted row's latest activity. */
   latestActivitySeq: string | null;
   replyCount: number;
@@ -86,6 +106,15 @@ export interface FollowedThread {
   taskClaimedByType?: "agent" | "user" | null;
   taskClaimedById?: string | null;
   taskClaimedByName: string | null;
+  /** Task v2: a followed task conversation (no parent message; see
+   *  utils/taskConversation.ts) rather than a message's thread. */
+  conversationKind?: SubConversationKind;
+  /** Task v2: the task's title, on a followed task conversation. */
+  taskTitle?: string | null;
+  /** Task v2: the message the task hangs under and its time, its place in the
+   *  channel (null: under no message). Absent on older servers. */
+  sourceMessageId?: string | null;
+  sourceMessageCreatedAt?: string | null;
 }
 
 type ServedFollowedThread = FollowedThread & { maxReadSeq?: number | string | null; readStateVersion?: number | null };
@@ -100,9 +129,14 @@ type ServedFollowedThread = FollowedThread & { maxReadSeq?: number | string | nu
  * activity, or when it was cleared here and has no activity since.
  */
 function applyKnownReadStateProjectionsToFollowedThreads(
-  threads: ServedFollowedThread[],
+  servedThreads: ServedFollowedThread[],
   previous: readonly FollowedThread[] = [],
 ): FollowedThread[] {
+  // Task v2: followed task conversations arrive in the same list; fold them
+  // into the thread shape (no parent message) before anything keys them.
+  const threads = servedThreads.some(isTaskConversationRow)
+    ? servedThreads.map((thread) => normalizeTaskConversationRow(thread))
+    : servedThreads;
   const serverId = useServerStore.getState().current?.id;
   if (!serverId) return threads;
   const previousById = new Map(previous.map((thread) => [thread.threadChannelId, thread]));
@@ -130,32 +164,6 @@ function isServedThreadRowRead(serverId: string, thread: ServedFollowedThread, l
   return BigInt(ledger.maxReadSeq) >= BigInt(latestSeq);
 }
 
-function applyThreadUnreadProjectionToSummaries(
-  summaries: Record<string, ThreadSummary>,
-  threadChannelId: string,
-  unreadCount: number,
-  firstUnreadMessageId: string | null,
-): Record<string, ThreadSummary> {
-  let next = summaries;
-  for (const [parentMessageId, summary] of Object.entries(summaries)) {
-    if (
-      summary.threadChannelId !== threadChannelId
-      || (
-        summary.unreadCount === unreadCount
-        && summary.firstUnreadMessageId === firstUnreadMessageId
-      )
-    ) continue;
-    // Stryker disable next-line ConditionalExpression,EqualityOperator: copying once vs redundantly for several matching summaries is an equivalent final projection; source immutability is behavior-pinned.
-    if (next === summaries) next = { ...summaries };
-    next[parentMessageId] = {
-      ...summary,
-      unreadCount,
-      firstUnreadMessageId,
-    };
-  }
-  return next;
-}
-
 /**
  * `GET /channels/:id/threads/:messageId` 404s both when the message genuinely
  * has no thread yet (normal "no replies yet" state) and when the lookup itself
@@ -176,6 +184,20 @@ export function isThreadAbsentLookupError(err: unknown): boolean {
   const body = data as { code?: unknown; error?: unknown };
   if (body.code !== undefined) return body.code === THREAD_ABSENT_LOOKUP_CODE;
   return body.error === THREAD_ABSENT_LOOKUP_ERROR;
+}
+
+/**
+ * The lookup's answer that this server can't show the thread to this reader
+ * (403, or a 404 that isn't "no thread yet"): the channel isn't visible from
+ * the current server. A joint channel the reader takes part in only through
+ * another server answers this way. Retry can still help right after a
+ * private→public conversion (#417), so the panel keeps it; only the copy
+ * changes.
+ */
+export function isThreadUnavailableLookupError(err: unknown): boolean {
+  if (isThreadAbsentLookupError(err)) return false;
+  const status = (err as { response?: { status?: unknown } } | null)?.response?.status;
+  return status === 403 || status === 404;
 }
 
 export interface OpenThreadRequest {
@@ -205,13 +227,34 @@ export interface OpenThreadRequest {
  * nothing to re-render underneath.
  */
 interface TaskModalAnchor {
-  parentMessageId: string;
+  /** The message whose thread is the task's discussion (pre-v2 / flag off).
+   *  Null for a task v2 dialog, which is keyed by `taskId` instead. */
+  parentMessageId: string | null;
+  /** Task v2: the task whose own conversation the dialog shows. Set only by
+   *  `openTaskConversation`, so with the flag off it is always absent. */
+  taskId?: string | null;
   parentChannelId: string | null;
   threadChannelId: string | null;
   serverSlug: string | null;
   focusedMessageId: string | null;
+  /** Names the jump to `focusedMessageId`: new on every open with a focus, so
+   *  a second jump to the same reply restarts its located highlight. */
+  focusNonce: number;
   loading: boolean;
-  error: { parentChannelId: string | null; parentMessageId: string } | null;
+  error: { parentChannelId: string | null; parentMessageId: string | null; unavailable?: boolean } | null;
+}
+
+/** Task v2: open the task dialog for a task's own conversation. */
+export interface OpenTaskConversationRequest {
+  serverSlug?: string;
+  taskId: string;
+  /** The (local) channel the task belongs to. */
+  parentChannelId: string;
+  /** The task conversation as this server sees it (its LOCAL channel id; a
+   *  joint channel's canonical id differs). Null while unknown or when the
+   *  task has no conversation yet (a pre-v2 task): the first send creates it. */
+  conversationChannelId?: string | null;
+  focusedMessageId?: string | null;
 }
 
 interface ThreadState {
@@ -225,6 +268,10 @@ interface ThreadState {
   openServerSlug: string | null;
   /** Specific reply to focus/highlight when opening a thread from search */
   focusedMessageId: string | null;
+  /** Names the jump to `focusedMessageId` (states.md#located): new on every
+   *  focus, so a second jump to the same reply restarts its highlight; the
+   *  reply's own id can't, it is the same both times. */
+  focusNonce: number;
   /** Timestamp when the thread was last opened, used to decide view-stack ordering */
   openedAt: number;
   /** Thread summaries keyed by parent message ID */
@@ -253,14 +300,6 @@ interface ThreadState {
   /** Latest task metadata keyed by parent message ID, including DM-thread parents outside task boards */
   taskUpdatesByMessageId: Record<string, TaskMetadataUpdate>;
   /**
-   * One-shot focus signal for the Threads inbox surface — set by the Sidebar
-   * dblclick handler so the inbox can scroll the matching row to the top and
-   * highlight it without auto-opening the right thread panel.
-   */
-  focusedThreadChannelId: string | null;
-  /** Set or clear the focused thread channel id (consumed by ThreadsInbox). */
-  setFocusedThreadChannelId: (id: string | null) => void;
-  /**
    * Resolution failure for the currently-open thread permalink. `openThread`
    * sets the parent anchor optimistically *before* its read-only thread lookup,
    * so a failed lookup (e.g. the permalink was opened while the parent
@@ -274,7 +313,7 @@ interface ThreadState {
    * OR an actionable error — never an unbounded spinner. Originating bug:
    * #engineering task #417 (private→public channel thread permalink hang).
    */
-  openThreadError: { parentChannelId: string; parentMessageId: string } | null;
+  openThreadError: { parentChannelId: string; parentMessageId: string; unavailable?: boolean } | null;
   /** True only while the read-only existing-thread lookup is in flight. */
   openThreadLoading: boolean;
   /** Open a thread panel for a message */
@@ -289,10 +328,32 @@ interface ThreadState {
    */
   openTaskModal: (request: OpenThreadRequest) => Promise<void>;
   /**
+   * Task v2: open the task dialog keyed by the task (its conversation has no
+   * parent message). Like `openTaskModal`, never touches the side thread.
+   */
+  openTaskConversation: (request: OpenTaskConversationRequest) => void;
+  /** Task v2: bind the open task dialog to its (local) conversation channel. */
+  bindTaskConversationChannel: (taskId: string, conversationChannelId: string) => void;
+  /** Task v2: follow / unfollow overrides for task conversations done in this
+   *  session, keyed by the LOCAL conversation channel id. */
+  taskFollowOverrides: Record<string, boolean>;
+  /** Task v2: follow a task conversation by hand. */
+  followTaskConversation: (conversationChannelId: string) => Promise<void>;
+  /** Task v2: unfollow a task conversation. */
+  unfollowTaskConversation: (conversationChannelId: string) => Promise<void>;
+  /**
    * Close the task modal (X, backdrop, ESC, mobile back). Just empties the
    * slot; the side thread was never perturbed, so there is nothing to restore.
    */
   closeTaskModal: () => void;
+  /**
+   * Task v2: the task was deleted (`task:deleted`). Its conversation is gone
+   * server-side, so drop its followed-list row and follow override and close
+   * the task dialog open on it (keyed by the task, or bound to that
+   * conversation). A pre-v2 task's dialog is its host message's thread, which
+   * stays, so it is left alone.
+   */
+  dropDeletedTaskConversation: (input: { taskId: string; conversationChannelId?: string | null }) => void;
   /**
    * Re-run the task modal's thread lookup against the channel's current
    * accessibility — the slot twin of `retryOpenThread`.
@@ -321,8 +382,13 @@ interface ThreadState {
   retryOpenThread: () => Promise<void>;
   /** Close the thread panel */
   closeThread: () => void;
+  /** Focus a reply in the open side thread (a permalink to it): a new jump. */
+  focusMessage: (messageId: string) => void;
   /** Clear focused reply once the highlight animation completes */
   clearFocusedMessage: () => void;
+  /** The task modal's own focused reply, cleared the same way: a task modal
+   * jump never touches the side thread's focus (task #699). */
+  clearTaskModalFocusedMessage: () => void;
   /** Load thread summaries for a channel */
   loadSummaries: (channelId: string, parentMessageIds?: string[]) => Promise<void>;
   /**
@@ -339,7 +405,7 @@ interface ThreadState {
   /** Update a single thread summary (from socket event) */
   updateSummary: (parentMessageId: string, summary: ThreadSummary) => void;
   /** Load followed threads for the current server */
-  loadFollowedThreads: () => Promise<void>;
+  loadFollowedThreads: (reason?: ListFetchReason) => Promise<void>;
   /** Update a followed thread from socket event */
   updateFollowedThread: (threadChannelId: string, updates: Partial<Pick<FollowedThread, "replyCount" | "lastReplyAt" | "unreadCount" | "hasMention" | "firstUnreadMessageId">>) => void;
   /** Update followed-thread task metadata from task socket events */
@@ -367,6 +433,11 @@ interface ThreadState {
   applyReadStateProjection: (threadChannelId: string, projection: ReadStateProjection) => void;
   /** Server-reported unread for a thread whose replies are not loaded here. */
   applyServerThreadUnread: (threadChannelId: string, unreadCount: number) => void;
+  /**
+   * The server's count after Mark as Unread on a thread (a person's own word,
+   * so it raises the badge, where a served read only lowers it).
+   */
+  applyThreadMarkedUnread: (threadChannelId: string, unreadCount: number) => void;
   /** Follow a thread manually */
   followThread: (parentMessageId: string) => Promise<void>;
   /** Unfollow a thread */
@@ -378,6 +449,22 @@ interface ThreadState {
 }
 
 const FOLLOWED_UNREAD_ONLY_PARAMS = { unreadOnly: 1 } as const;
+
+/**
+ * The followed threads with unread replies, a RisingWave read like the unread
+ * counts: retried once on an overload 503 and recorded in store/rwFreshness
+ * (task #164). Every load of the list goes through here.
+ */
+async function fetchFollowedThreads(reason?: ListFetchReason): Promise<{ threads: FollowedThread[]; stale: boolean }> {
+  // Only the followed threads with unread replies: the full list is
+  // thousands of threads for some users (p99 4.7 MB). Servers without the
+  // filter ignore it and return the full list, which still works.
+  const { data, stale } = await getRwRead<{ threads: FollowedThread[] }>("followed", "/channels/threads/followed", {
+    params: FOLLOWED_UNREAD_ONLY_PARAMS,
+    headers: listFetchReasonHeaders(reason),
+  });
+  return { threads: data.threads, stale };
+}
 
 /** A summary without `followed` (live frame, older server) keeps the one already known. */
 function keepKnownFollowed(next: ThreadSummary, previous: ThreadSummary | undefined): ThreadSummary {
@@ -400,6 +487,24 @@ function withKnownFollowed(
 }
 
 /**
+ * Unfollowing a thread clears its unread: the server counts none for a thread
+ * the person doesn't follow, so every local count drops to 0 at once rather
+ * than on the next list load. This store clears its own (summaries, followed
+ * list); stores that import this one (Activity) clear theirs here.
+ */
+type ThreadUnfollowedListener = (threadChannelId: string) => void;
+const threadUnfollowedListeners = new Set<ThreadUnfollowedListener>();
+
+export function registerThreadUnfollowedListener(listener: ThreadUnfollowedListener): () => void {
+  threadUnfollowedListeners.add(listener);
+  return () => threadUnfollowedListeners.delete(listener);
+}
+
+function notifyThreadUnfollowed(threadChannelId: string): void {
+  for (const listener of threadUnfollowedListeners) listener(threadChannelId);
+}
+
+/**
  * Whether the user follows the thread under `parentMessageId`: a follow or
  * unfollow done in this session, else the summary's `followed`, else (older
  * server, no summary yet) whether it is in the followed-thread list.
@@ -415,25 +520,53 @@ export function isThreadFollowed(
   return state.followedThreads.some((thread) => thread.parentMessageId === parentMessageId);
 }
 
+/**
+ * Task v2: whether the user follows the task conversation `conversationChannelId`
+ * (its local channel id): a follow or unfollow done in this session, else the
+ * served answer (`served`, e.g. the task DTO), else whether it is in the
+ * followed-thread list.
+ */
+export function isTaskConversationFollowed(
+  state: Pick<ThreadState, "taskFollowOverrides" | "followedThreads">,
+  conversationChannelId: string | null,
+  served?: boolean,
+): boolean {
+  if (!conversationChannelId) return served ?? false;
+  const override = state.taskFollowOverrides[conversationChannelId];
+  if (override !== undefined) return override;
+  if (served !== undefined) return served;
+  return state.followedThreads.some((thread) => thread.threadChannelId === conversationChannelId);
+}
+
+/** Counts focus jumps (the side thread's and the task modal's alike), so each
+ * has a nonce of its own. */
+let focusSeq = 0;
+export function nextFocusNonce(): number {
+  focusSeq += 1;
+  return focusSeq;
+}
+
+let followedThreadsRequestSeq = 0;
+
 export const useThreadStore = create<ThreadState>((set, get) => ({
   openParentMessageId: null,
   openIntent: null,
   taskModal: null,
+  taskFollowOverrides: {},
   openThreadChannelId: null,
   openParentChannelId: null,
   openServerSlug: null,
   openThreadError: null,
   openThreadLoading: false,
   focusedMessageId: null,
+  focusNonce: 0,
   openedAt: 0,
   summaries: {},
   replyScopes: {},
   followedThreads: [],
   followOverrides: {},
   taskUpdatesByMessageId: {},
-  focusedThreadChannelId: null,
 
-  setFocusedThreadChannelId: (id) => set({ focusedThreadChannelId: id }),
 
   openThread: async ({
     serverSlug,
@@ -464,7 +597,10 @@ export const useThreadStore = create<ThreadState>((set, get) => ({
       console.error("Failed to open thread: route server is not active");
       return;
     }
-    if (get().openParentChannelId !== parentChannelId) useUIStore.getState().restoreThreadLayout();
+    const previousParentChannelId = get().openParentChannelId;
+    if (previousParentChannelId === null) useUIStore.getState().resumeThreadLayout(parentMessageId);
+    else if (previousParentChannelId !== parentChannelId) useUIStore.getState().restoreThreadLayout();
+    else useUIStore.getState().retargetThreadLayout(parentMessageId);
     const serverEpoch = useServerStore.getState().serverEpoch;
     // Look up threadChannelId from existing data so we can open the panel immediately
     const state = useThreadStore.getState();
@@ -475,6 +611,10 @@ export const useThreadStore = create<ThreadState>((set, get) => ({
       state.followedThreads.find((t) => t.parentMessageId === parentMessageId)?.threadChannelId ??
       null;
 
+    // The open thread picked again keeps its panel, whose open read won't re-run: read it below.
+    const reopenedUnread = isReopenedThreadUnread(state, parentMessageId, knownThreadChannelId);
+    // Opened by a click: the replies painted end it (observability/viewSwitchSpan.ts); a thread already on screen is not timed.
+    beginViewSwitch({ target: "thread", view: threadView(parentMessageId), matches: [parentMessageId, knownThreadChannelId], requireInput: true });
     // Set panel-open state immediately — don't wait for API. Clear any prior
     // resolution error so a retry/new-open starts from a clean state. Opening
     // a thread replaces whatever task modal was up.
@@ -487,9 +627,12 @@ export const useThreadStore = create<ThreadState>((set, get) => ({
       openThreadError: null,
       openThreadLoading: !knownThreadChannelId,
       focusedMessageId,
+      focusNonce: nextFocusNonce(),
       openedAt: Date.now(),
       taskModal: null,
     });
+    if (reopenedUnread) get().clearThreadUnread(knownThreadChannelId);
+    if (knownThreadChannelId && state.openThreadChannelId !== knownThreadChannelId) prefetchThreadReplies(knownThreadChannelId, parentMessageId, focusedMessageId);
     if (knownThreadChannelId) return;
 
     try {
@@ -502,6 +645,7 @@ export const useThreadStore = create<ThreadState>((set, get) => ({
         || (routeServerSlug && useServerStore.getState().current?.slug !== routeServerSlug)
       ) return;
       if (data?.threadChannelId) {
+        prefetchResolvedThreadReplies(get(), routeServerSlug, parentMessageId, data.threadChannelId);
         set((prev) => ({
           ...(prev.openServerSlug === routeServerSlug && prev.openParentMessageId === parentMessageId
             ? { openThreadChannelId: data.threadChannelId, openThreadError: null, openThreadLoading: false }
@@ -547,7 +691,10 @@ export const useThreadStore = create<ThreadState>((set, get) => ({
         prev.openServerSlug === routeServerSlug
           && prev.openParentMessageId === parentMessageId
           && !prev.openThreadChannelId
-          ? { openThreadError: { parentChannelId, parentMessageId }, openThreadLoading: false }
+          ? {
+            openThreadError: { parentChannelId, parentMessageId, unavailable: isThreadUnavailableLookupError(err) },
+            openThreadLoading: false,
+          }
           : {},
       );
     }
@@ -595,8 +742,31 @@ export const useThreadStore = create<ThreadState>((set, get) => ({
       throw new Error("No open task modal to resolve");
     }
     if (slot.threadChannelId) return slot.threadChannelId;
+    if (slot.taskId && !slot.parentMessageId) {
+      // Task v2: a task without its own conversation yet (a pre-v2 task) gets
+      // it on the first durable send. The answer is this server's LOCAL
+      // conversation; the panel binds the slot on durable accept.
+      const taskId = slot.taskId;
+      const taskServerSlug = slot.serverSlug;
+      const taskServerEpoch = useServerStore.getState().serverEpoch;
+      const { data } = await api.post(`/tasks/${taskId}/conversation`);
+      const conversationChannelId = (data as { conversationChannelId?: unknown } | null)?.conversationChannelId;
+      if (typeof conversationChannelId !== "string" || conversationChannelId.length === 0) {
+        throw new Error("Task conversation creation did not return a channel id");
+      }
+      const currentTaskSlot = get().taskModal;
+      if (
+        useServerStore.getState().serverEpoch !== taskServerEpoch
+        || !currentTaskSlot
+        || currentTaskSlot.taskId !== taskId
+        || currentTaskSlot.serverSlug !== taskServerSlug
+      ) {
+        throw new Error("Task context changed while creating its conversation");
+      }
+      return conversationChannelId;
+    }
     const { parentChannelId, parentMessageId, serverSlug } = slot;
-    if (!parentChannelId) {
+    if (!parentChannelId || !parentMessageId) {
       throw new Error("No open task modal to resolve");
     }
 
@@ -680,6 +850,8 @@ export const useThreadStore = create<ThreadState>((set, get) => ({
       state.summaries[parentMessageId]?.threadChannelId ??
       state.followedThreads.find((t) => t.parentMessageId === parentMessageId)?.threadChannelId ??
       null;
+    // The task already up picked again: its open read won't re-run (as openThread).
+    const reopenedUnread = isReopenedTaskUnread(state, knownThreadChannelId);
 
     set({
       taskModal: {
@@ -688,10 +860,12 @@ export const useThreadStore = create<ThreadState>((set, get) => ({
         threadChannelId: knownThreadChannelId,
         serverSlug: routeServerSlug,
         focusedMessageId,
+        focusNonce: nextFocusNonce(),
         loading: !knownThreadChannelId,
         error: null,
       },
     });
+    if (reopenedUnread) get().clearThreadUnread(knownThreadChannelId);
     if (knownThreadChannelId) return;
 
     try {
@@ -751,13 +925,107 @@ export const useThreadStore = create<ThreadState>((set, get) => ({
         prev.taskModal?.serverSlug === routeServerSlug
           && prev.taskModal.parentMessageId === parentMessageId
           && !prev.taskModal.threadChannelId
-          ? { taskModal: { ...prev.taskModal, error: { parentChannelId, parentMessageId }, loading: false } }
+          ? {
+            taskModal: {
+              ...prev.taskModal,
+              error: { parentChannelId, parentMessageId, unavailable: isThreadUnavailableLookupError(err) },
+              loading: false,
+            },
+          }
           : {},
       );
     }
   },
 
+  openTaskConversation: ({ serverSlug, taskId, parentChannelId, conversationChannelId = null, focusedMessageId = null }) => {
+    const currentServer = useServerStore.getState().current;
+    if (serverSlug && currentServer?.slug !== serverSlug) {
+      console.error("Failed to open task: route server is not active");
+      return;
+    }
+    const routeServerSlug = serverSlug ?? currentServer?.slug ?? null;
+    const current = get().taskModal;
+    // Re-opening the dialog that is already up keeps its bound conversation.
+    const keptChannelId = current?.taskId === taskId && current.serverSlug === routeServerSlug
+      ? current.threadChannelId
+      : null;
+    const threadChannelId = conversationChannelId ?? keptChannelId;
+    const reopenedUnread = isReopenedTaskUnread(get(), threadChannelId);
+    set({
+      taskModal: {
+        parentMessageId: null,
+        taskId,
+        parentChannelId,
+        threadChannelId,
+        serverSlug: routeServerSlug,
+        focusedMessageId,
+        focusNonce: nextFocusNonce(),
+        loading: false,
+        error: null,
+      },
+    });
+    if (reopenedUnread && threadChannelId) get().clearThreadUnread(threadChannelId);
+  },
+
+  bindTaskConversationChannel: (taskId, conversationChannelId) =>
+    set((prev) =>
+      prev.taskModal?.taskId === taskId && prev.taskModal.threadChannelId !== conversationChannelId
+        ? { taskModal: { ...prev.taskModal, threadChannelId: conversationChannelId } }
+        : {},
+    ),
+
+  followTaskConversation: async (conversationChannelId) => {
+    try {
+      // A task conversation is named by its (local) channel; thread follows
+      // keep sending `parentMessageId`.
+      await api.post("/channels/threads/follow", { threadChannelId: conversationChannelId });
+    } catch (err) {
+      console.error("Failed to follow task:", err);
+      throw err;
+    }
+    set((state) => ({ taskFollowOverrides: { ...state.taskFollowOverrides, [conversationChannelId]: true } }));
+    try {
+      const data = await fetchFollowedThreads("manual");
+      set({ followedThreads: applyKnownReadStateProjectionsToFollowedThreads(data.threads, get().followedThreads) });
+    } catch (err) {
+      console.error("Failed to refresh followed threads:", err);
+    }
+  },
+
+  unfollowTaskConversation: async (conversationChannelId) => {
+    try {
+      await api.post("/channels/threads/unfollow", { threadChannelId: conversationChannelId });
+    } catch (err) {
+      console.error("Failed to unfollow task:", err);
+      throw err;
+    }
+    set((state) => ({
+      followedThreads: state.followedThreads.filter((t) => t.threadChannelId !== conversationChannelId),
+      taskFollowOverrides: { ...state.taskFollowOverrides, [conversationChannelId]: false },
+      summaries: applyThreadUnreadProjectionToSummaries(state.summaries, conversationChannelId, 0, null),
+    }));
+    notifyThreadUnfollowed(conversationChannelId);
+  },
+
   closeTaskModal: () => set({ taskModal: null }),
+
+  dropDeletedTaskConversation: ({ taskId, conversationChannelId = null }) =>
+    set((state) => {
+      const modal = state.taskModal;
+      const closesModal = !!modal && !modal.parentMessageId && (
+        modal.taskId === taskId
+        || (conversationChannelId !== null && modal.threadChannelId === conversationChannelId)
+      );
+      if (!conversationChannelId) return closesModal ? { taskModal: null } : {};
+      const followedThreads = state.followedThreads.filter((thread) => thread.threadChannelId !== conversationChannelId);
+      const taskFollowOverrides = { ...state.taskFollowOverrides };
+      delete taskFollowOverrides[conversationChannelId];
+      return {
+        ...(followedThreads.length !== state.followedThreads.length ? { followedThreads } : {}),
+        ...(conversationChannelId in state.taskFollowOverrides ? { taskFollowOverrides } : {}),
+        ...(closesModal ? { taskModal: null } : {}),
+      };
+    }),
 
   /**
    * Re-run the task modal's thread lookup against the channel's current
@@ -765,7 +1033,8 @@ export const useThreadStore = create<ThreadState>((set, get) => ({
    */
   retryTaskModal: async () => {
     const slot = get().taskModal;
-    if (!slot || !slot.parentChannelId) return;
+    // A task v2 dialog has no lookup to retry: its conversation comes with the task.
+    if (!slot || !slot.parentChannelId || !slot.parentMessageId) return;
     await get().openTaskModal({
       parentChannelId: slot.parentChannelId,
       parentMessageId: slot.parentMessageId,
@@ -775,7 +1044,11 @@ export const useThreadStore = create<ThreadState>((set, get) => ({
     });
   },
 
+  focusMessage: (messageId) => set({ focusedMessageId: messageId, focusNonce: nextFocusNonce() }),
   clearFocusedMessage: () => set({ focusedMessageId: null }),
+  clearTaskModalFocusedMessage: () => set((state) => (
+    state.taskModal?.focusedMessageId ? { taskModal: { ...state.taskModal, focusedMessageId: null } } : {}
+  )),
 
   hydrateSummaries: (summaries) => {
     get().hydrateSummariesWithReplyScopes(summaries, {});
@@ -809,7 +1082,7 @@ export const useThreadStore = create<ThreadState>((set, get) => ({
           );
           if (existingMax > snapshotMax) continue;
         }
-        replyScopes[parentMessageId] = hydrateThreadRepliesScope(latest, summary.replyCount);
+        replyScopes[parentMessageId] = retainNewerThreadReplyContent(hydrateThreadRepliesScope(latest, summary.replyCount), existing ?? null);
       }
       // A 0→1 reply can enter through the Sync Core rebaseline path rather
       // than `updateSummary`. If the user already opened that previously-empty
@@ -823,7 +1096,7 @@ export const useThreadStore = create<ThreadState>((set, get) => ({
         && typeof openSummary?.threadChannelId === "string"
         && openSummary.threadChannelId.length > 0;
       return {
-        summaries: { ...state.summaries, ...withKnownFollowed(summaries, state.summaries) },
+        summaries: { ...state.summaries, ...withKnownFollowed(keepShownThreadsRead(summaries, state), state.summaries) },
         replyScopes,
         ...(adoptThreadId ? { openThreadChannelId: openSummary.threadChannelId } : {}),
       };
@@ -860,21 +1133,23 @@ export const useThreadStore = create<ThreadState>((set, get) => ({
       };
     }),
 
-  loadFollowedThreads: async () => {
+  loadFollowedThreads: async (reason) => {
     const epoch = useServerStore.getState().serverEpoch;
     const serverId = useServerStore.getState().current?.id;
     if (!serverId) return;
+    // Newest-started read wins: an older one landing late must not overwrite
+    // a list read after a change (sync/changes, #triage:458d78f1).
+    const request = ++followedThreadsRequestSeq;
     try {
-      // Stryker disable next-line StringLiteral: endpoint spelling is existing followed-thread load glue; projection behavior is tested after load.
-      // Only the followed threads with unread replies: the full list is
-      // thousands of threads for some users (p99 4.7 MB). Servers without the
-      // filter ignore it and return the full list, which still works.
-      const { data } = await api.get("/channels/threads/followed", { params: FOLLOWED_UNREAD_ONLY_PARAMS });
+      const data = await fetchFollowedThreads(reason);
       if (useServerStore.getState().serverEpoch !== epoch) return;
+      if (request !== followedThreadsRequestSeq) return;
       // Stryker disable next-line ObjectLiteral: followed-thread setter shape is Zustand glue; projection transform behavior is tested by read-state thread tests.
       set({ followedThreads: applyKnownReadStateProjectionsToFollowedThreads(data.threads, get().followedThreads) });
+      // Task #164: the last clean list is what a later boot shows while RW is unavailable.
+      if (!data.stale) saveLastCounts(getCurrentPrincipalId(), serverId, { followed: get().followedThreads });
     } catch {
-      // ignore
+      // Keep the list shown; store/rwFreshness says it may be out of date.
     }
   },
 
@@ -982,6 +1257,29 @@ export const useThreadStore = create<ThreadState>((set, get) => ({
     });
   },
 
+  applyThreadMarkedUnread: (threadChannelId, unreadCount) => {
+    if (!(unreadCount > 0)) return;
+    set((state) => {
+      let followedThreadsChanged = false;
+      const followedThreads = state.followedThreads.map((t) => {
+        if (t.threadChannelId !== threadChannelId || t.unreadCount >= unreadCount) return t;
+        followedThreadsChanged = true;
+        return { ...t, unreadCount };
+      });
+      let summaries = state.summaries;
+      for (const [parentMessageId, summary] of Object.entries(state.summaries)) {
+        if (summary.threadChannelId !== threadChannelId || summary.unreadCount >= unreadCount) continue;
+        if (summaries === state.summaries) summaries = { ...state.summaries };
+        summaries[parentMessageId] = { ...summary, unreadCount };
+      }
+      if (!followedThreadsChanged && summaries === state.summaries) return state;
+      return {
+        ...(followedThreadsChanged ? { followedThreads } : {}),
+        ...(summaries !== state.summaries ? { summaries } : {}),
+      };
+    });
+  },
+
   hydrateReplyScope: (parentMessageId, replies, replyCount) => {
     set((state) => ({
       replyScopes: {
@@ -1039,6 +1337,7 @@ export const useThreadStore = create<ThreadState>((set, get) => ({
         : receiverOverride ?? undefined,
     };
     notifyChannelReadLocally(threadChannelId);
+    forgetSkippedSeenRead(threadChannelId);
     get().clearThreadUnreadLocally(threadChannelId);
     // Persist to backend so it survives page refresh. A direct thread deep-link
     // starts with an empty Activity store, so its first hydration can race this
@@ -1075,7 +1374,7 @@ export const useThreadStore = create<ThreadState>((set, get) => ({
     // is best effort: a transient GET failure must not make Activity preserve
     // an Unfollowed badge after the server already committed the Follow.
     try {
-      const { data } = await api.get("/channels/threads/followed", { params: FOLLOWED_UNREAD_ONLY_PARAMS });
+      const data = await fetchFollowedThreads("manual");
       set({ followedThreads: applyKnownReadStateProjectionsToFollowedThreads(data.threads, get().followedThreads) });
     } catch (err) {
       console.error("Failed to refresh followed threads:", err);
@@ -1091,8 +1390,11 @@ export const useThreadStore = create<ThreadState>((set, get) => ({
         return {
           followedThreads: state.followedThreads.filter((t) => t.threadChannelId !== threadChannelId),
           ...(parentMessageId ? { followOverrides: { ...state.followOverrides, [parentMessageId]: false } } : {}),
+          // No unread once unfollowed (the server counts none): the channel's entry drops it now.
+          summaries: applyThreadUnreadProjectionToSummaries(state.summaries, threadChannelId, 0, null),
         };
       });
+      notifyThreadUnfollowed(threadChannelId);
     } catch (err) {
       console.error("Failed to unfollow thread:", err);
       // Callers that own another projection (for example Activity) must know
@@ -1109,7 +1411,7 @@ export const useThreadStore = create<ThreadState>((set, get) => ({
       || typeof acceptedThread.latestActivitySeq !== "string"
       || !/^[1-9][0-9]*$/.test(acceptedThread.latestActivitySeq)
     ) {
-      await get().loadFollowedThreads();
+      await get().loadFollowedThreads("manual");
       return;
     }
     const throughActivitySeq = acceptedThread.latestActivitySeq;
@@ -1128,7 +1430,7 @@ export const useThreadStore = create<ThreadState>((set, get) => ({
       console.error("Failed to mark thread as done:", err);
       // Reload on failure to restore correct state
       // Stryker disable next-line StringLiteral: failure-reload endpoint is legacy recovery glue outside read-state projection behavior.
-      const { data } = await api.get("/channels/threads/followed", { params: FOLLOWED_UNREAD_ONLY_PARAMS });
+      const data = await fetchFollowedThreads("manual");
       // Stryker disable next-line ObjectLiteral: done-failure reload setter is legacy recovery glue outside read-state projection behavior.
       set({ followedThreads: applyKnownReadStateProjectionsToFollowedThreads(data.threads, get().followedThreads) });
     }
@@ -1140,7 +1442,7 @@ export const useThreadStore = create<ThreadState>((set, get) => ({
       await api.post("/channels/threads/undone", { threadChannelId });
       // Reload to get the full thread data
       // Stryker disable next-line StringLiteral: undone reload endpoint is legacy recovery glue outside read-state projection behavior.
-      const { data } = await api.get("/channels/threads/followed", { params: FOLLOWED_UNREAD_ONLY_PARAMS });
+      const data = await fetchFollowedThreads("manual");
       // Stryker disable next-line ObjectLiteral: undone reload setter is legacy recovery glue outside read-state projection behavior.
       set({ followedThreads: applyKnownReadStateProjectionsToFollowedThreads(data.threads, get().followedThreads) });
     // Stryker disable next-line BlockStatement: diagnostic-only catch is outside read-state projection behavior.
@@ -1171,8 +1473,8 @@ registerServerReset(() =>
     replyScopes: {},
     followedThreads: [],
     followOverrides: {},
+    taskFollowOverrides: {},
     taskUpdatesByMessageId: {},
-    focusedThreadChannelId: null,
   })
 );
 

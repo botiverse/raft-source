@@ -55,7 +55,7 @@ export const formatFreshnessHoldOutput = axSurface(
           },
           {
             heldAction: "Your message has been saved as a draft.",
-            draftInstructions: "To update the draft, send revised content normally:\n  raft message send --target \"#general\" <<'RAFTMSG'\n  revised message\n  RAFTMSG\nTo send the current draft unchanged:\n  raft message send --send-draft --target \"#general\"\nYou can also choose not to send anything.\n",
+            draftInstructions: "If what you just read already says what you meant to say (for example, someone already answered), or makes your message unnecessary, send nothing. Delete the draft:\n  raft message send --discard-draft --target \"#general\"\nOtherwise, to update the draft, send revised content normally:\n  raft message send --target \"#general\" <<'RAFTMSG'\n  revised message\n  RAFTMSG\nTo send the current draft unchanged:\n  raft message send --send-draft --target \"#general\"\n",
           },
         ],
       },
@@ -72,7 +72,7 @@ export const formatFreshnessHoldOutput = axSurface(
         args: [
           "#ops",
           { newMessageCount: 0, heldMessages: [], holdReasons: ["channel_card"], channelCard: { id: "c-ops", name: "ops", type: "channel", description: "Release coordination. Post go/no-go here." } },
-          { heldAction: "Your message has been saved as a draft (kept for 10 minutes).", draftInstructions: "To send the current draft unchanged:\n  raft message send --send-draft --target \"#ops\"\nYou can also choose not to send anything.\n" },
+          { heldAction: "Your message has been saved as a draft (kept for 10 minutes).", draftInstructions: "If what you just read already says what you meant to say, or makes your message unnecessary, send nothing. Delete the draft:\n  raft message send --discard-draft --target \"#ops\"\nOtherwise, to send the current draft unchanged:\n  raft message send --send-draft --target \"#ops\"\n" },
         ],
       },
       {
@@ -80,7 +80,7 @@ export const formatFreshnessHoldOutput = axSurface(
         args: [
           "dm:@richard",
           { newMessageCount: 0, heldMessages: [], holdReasons: ["peer_card"], peerCard: { kind: "human", name: "richard", description: "Founder. Prefers short updates.", timezone: "Asia/Shanghai" } },
-          { heldAction: "Your message has been saved as a draft (kept for 10 minutes).", draftInstructions: "To send the current draft unchanged:\n  raft message send --send-draft --target \"dm:@richard\"\nYou can also choose not to send anything.\n" },
+          { heldAction: "Your message has been saved as a draft (kept for 10 minutes).", draftInstructions: "If what you just read already says what you meant to say, or makes your message unnecessary, send nothing. Delete the draft:\n  raft message send --discard-draft --target \"dm:@richard\"\nOtherwise, to send the current draft unchanged:\n  raft message send --send-draft --target \"dm:@richard\"\n" },
         ],
       },
       {

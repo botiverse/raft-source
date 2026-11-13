@@ -1,14 +1,21 @@
 import assert from "node:assert/strict";
 import {
   createRaftBareTaskRefRegex,
+  createRaftChannelTaskRefRegex,
+  createRaftDmTaskRefRegex,
+  formatRaftChannelTaskRef,
+  formatRaftDmTaskRef,
+  RAFT_TASK_REF_SEPARATOR,
   createRaftDmThreadRefRegex,
   createRaftUserRefRegex,
   extractRaftMentionHandles,
   extractRaftRefTargets,
   formatRaftRefTarget,
   parseRaftRefTarget,
+  taskRefConversationTarget,
   replaceOutsideMarkdownCode,
   resolveRaftMentionHandle,
+  structuredRaftMentionRanges,
   structuredRaftMentionStillAppears,
   type RaftTargetString,
 } from "./raftRefs";
@@ -33,10 +40,22 @@ void _okApp;
 const _badDm: RaftTargetString = "dm:alice";
 // @ts-expect-error — a bare name with no sigil is not a valid target
 const _badBare: RaftTargetString = "general";
+const _okChannelTask: RaftTargetString = formatRaftChannelTaskRef("proj", 7);
+const _okDmTask: RaftTargetString = formatRaftDmTaskRef("alice", 7);
+void _okChannelTask;
+void _okDmTask;
 void _okChannel;
 void _okDmThread;
 void _badDm;
 void _badBare;
+
+test("taskRefConversationTarget: a task ref names its conversation; nothing else does, the legacy task ref neither", () => {
+  assert.equal(taskRefConversationTarget("#wg-ax:#26"), "#wg-ax");
+  assert.equal(taskRefConversationTarget(" dm:@cody:#3 "), "dm:@cody");
+  for (const other of ["task #26", "#wg-ax", "#wg-ax:fde584d1", "dm:@cody", "dm:@cody:abcd1234", "#wg-ax:#0", "#wg-ax:#26\nx", ""]) {
+    assert.equal(taskRefConversationTarget(other), null, other);
+  }
+});
 
 test("parseRaftRefTarget parses v0.4 ref target kinds", () => {
   assert.deepEqual(parseRaftRefTarget("@alice"), { kind: "user", name: "alice" });
@@ -100,6 +119,10 @@ test("formatRaftRefTarget round-trips parsed targets", () => {
     "dm:@alice",
     "dm:@alice:abc12345",
     "task #42",
+    formatRaftChannelTaskRef("proj-slock", 7),
+    formatRaftChannelTaskRef("对话流专修", 12),
+    formatRaftDmTaskRef("alice", 3),
+    formatRaftDmTaskRef("skyzh~agent", 4),
     "computer:550e8400-e29b-41d4-a716-446655440000",
     "app:system.reminder",
     "#general msg=deadbeef",
@@ -195,6 +218,88 @@ test("extractRaftMentionHandles skips link labels and URLs", () => {
   assert.deepEqual(extractRaftMentionHandles("see https://x.com/@Url and @Yes"), ["Yes"]);
   assert.deepEqual(extractRaftMentionHandles("glued seehttps://x.com/@Glued and @Yes"), ["Yes"]);
   assert.deepEqual(extractRaftMentionHandles("<https://x.com/@Angle> and @Yes"), ["Yes"]);
+});
+
+test("extractRaftMentionHandles skips block quotes: quoting a message does not mention again", () => {
+  assert.deepEqual(extractRaftMentionHandles("> @botiverse 组织的 npm 发布权限\n\n好的"), []);
+  assert.deepEqual(extractRaftMentionHandles("> @Jasper said so\n\n@Yes agreed"), ["Yes"]);
+  assert.deepEqual(extractRaftMentionHandles("> outer\n> > @Nested inner\n\n@Yes"), ["Yes"]);
+  // An unquoted line after a quote is drawn after it by the web (which undoes
+  // CommonMark's lazy continuation), so it mentions; quoted lines do not.
+  assert.deepEqual(extractRaftMentionHandles("> first line\n@After the quote"), ["After"]);
+  assert.deepEqual(extractRaftMentionHandles("> first @Quoted\n> second\nthen @After\n> @Lazy"), ["After", "Lazy"]);
+  // The first unquoted line ends the quote after a hard break and inside
+  // emphasis too; a code span or link it starts inside stays whole in the quote.
+  assert.deepEqual(extractRaftMentionHandles("> a  \n@After"), ["After"]);
+  assert.deepEqual(extractRaftMentionHandles("> a\\\n@After"), ["After"]);
+  assert.deepEqual(extractRaftMentionHandles("> **note\n@After check**"), ["After"]);
+  assert.deepEqual(extractRaftMentionHandles("> *a\n> b*\n@After"), ["After"]);
+  assert.deepEqual(extractRaftMentionHandles("> [a\nb](<@Linked>)"), []);
+  assert.deepEqual(extractRaftMentionHandles("> `x\ny` @After"), ["After"]);
+  // Lazy lines of a nested quote stay quoted on the web too.
+  assert.deepEqual(extractRaftMentionHandles("> outer\n> > inner\n@StillQuoted"), []);
+  assert.deepEqual(extractRaftMentionHandles("> <@Angle> and [x](<@Linked>)\n\n@Yes"), ["Yes"]);
+  assert.deepEqual(extractRaftMentionHandles("> `@Code` in a quote\n\nthen `@Code` and @Yes"), ["Yes"]);
+  assert.deepEqual(extractRaftMentionHandles("- > @Listed quote\n- @Yes"), ["Yes"]);
+});
+
+test("structuredRaftMentionStillAppears does not count a token that is only quoted", () => {
+  assert.equal(structuredRaftMentionStillAppears("> @Mona wrote this", "Mona"), false);
+  assert.equal(structuredRaftMentionStillAppears("> quoted\n> @Mona", "Mona"), false);
+  assert.equal(structuredRaftMentionStillAppears("> @Mona wrote this\n\n@Mona see above", "Mona"), true);
+});
+
+// What draws a stored mention (an Artifact comment's parts) asks where it is
+// written as one, under the rule that counts it.
+const mentionTexts = (source: string, handle: string) => structuredRaftMentionRanges(source, handle).map((range) => source.slice(range.start, range.end));
+
+test("structuredRaftMentionRanges places a mention outside the quote, not inside it", () => {
+  const source = "> @Mona said so\n\n@Mona ok";
+  assert.deepEqual(structuredRaftMentionRanges(source, "Mona"), [{ start: 17, end: 22 }]);
+  assert.equal(source.slice(0, 17), "> @Mona said so\n\n");
+  assert.deepEqual(structuredRaftMentionRanges("> @Mona said so\n\nagreed", "Mona"), []);
+  // A lazily continued line is drawn below the quote, not in it (markdownRanges drawnQuoteEnd).
+  assert.deepEqual(mentionTexts("> quoted\n@Mona lazily continued", "Mona"), ["@Mona"]);
+});
+
+test("structuredRaftMentionRanges skips code, link labels, URLs and escaped refs", () => {
+  assert.deepEqual(mentionTexts("`@Mona` and @Mona", "Mona"), ["@Mona"]);
+  assert.deepEqual(structuredRaftMentionRanges("`@Mona` and @Mona", "Mona"), [{ start: 12, end: 17 }]);
+  assert.deepEqual(structuredRaftMentionRanges("```\n@Mona\n```", "Mona"), []);
+  assert.deepEqual(structuredRaftMentionRanges("[@Mona](https://example.com) wrote", "Mona"), []);
+  assert.deepEqual(structuredRaftMentionRanges("see https://example.com/@Mona", "Mona"), []);
+  assert.deepEqual(structuredRaftMentionRanges("literally \\<@Mona>", "Mona"), []);
+});
+
+test("structuredRaftMentionRanges keeps source offsets after an escaped ref or a bare URL in the same stretch", () => {
+  const source = "a \\<@Bob> then https://example.com/x and @Mona, draft@Mona and @Mona的";
+  const ranges = structuredRaftMentionRanges(source, "Mona");
+  assert.deepEqual(ranges.map((range) => source.slice(range.start, range.end)), ["@Mona", "@Mona", "@Mona"]);
+  assert.deepEqual(ranges.map((range) => range.start), [source.indexOf("@Mona,"), source.indexOf("@Mona and"), source.indexOf("@Mona的")]);
+  assert.deepEqual(structuredRaftMentionRanges(source, "Bob"), []);
+});
+
+test("structuredRaftMentionRanges reports a link to a user ref as the whole link, unless it is quoted", () => {
+  assert.deepEqual(mentionTexts("ask [the owner](<@Mona>) today", "Mona"), ["[the owner](<@Mona>)"]);
+  assert.deepEqual(mentionTexts("> ask [the owner](<@Mona>)\n\nok", "Mona"), []);
+  // `<@Mona>` alone is not a link to the parser: the name inside the brackets is the mention.
+  assert.deepEqual(mentionTexts("ask <@Mona> today", "Mona"), ["@Mona"]);
+  assert.deepEqual(mentionTexts("> ask <@Mona>\n\nthen <@Mona> and @Mona", "Mona"), ["@Mona", "@Mona"]);
+});
+
+test("structuredRaftMentionRanges draws nothing for a name pieced together, a longer name or a handle that is not one", () => {
+  assert.deepEqual(structuredRaftMentionRanges("@Mo\\<@x>na", "Mona"), []);
+  assert.deepEqual(structuredRaftMentionRanges("@Monaco and @Mona-2", "Mona"), []);
+  assert.deepEqual(structuredRaftMentionRanges("@Mona", "not a handle"), []);
+});
+
+test("structuredRaftMentionRanges finds a place exactly when structuredRaftMentionStillAppears counts the mention", () => {
+  for (const source of [
+    "@Mona", "hi @Mona.", "> @Mona", "> @Mona\n\n@Mona", "`@Mona`", "~~~\n@Mona\n~~~", "[@Mona](https://example.com)", "<@Mona>", "[x](<@Mona>)",
+    "> <@Mona>", "> [x](<@Mona>)", "> quoted\n@Mona lazily continued", "https://example.com/@Mona", "\\<@Mona>", "draft@Mona", "@Mona的", "@Monaco", "- @Mona\n- item", "**@Mona**", "| a |\n| - |\n| @Mona |",
+  ]) {
+    assert.equal(structuredRaftMentionRanges(source, "Mona").length > 0, structuredRaftMentionStillAppears(source, "Mona"), source);
+  }
 });
 
 test("extractRaftMentionHandles ignores package versions and email-like words", () => {
@@ -428,4 +533,71 @@ test("resolveRaftMentionHandle matches its rule for every short token and member
     }
   }
   assert.equal(checked, 1118480);
+});
+
+// Task refs: fixtures are built with the formatters, so switching
+// RAFT_TASK_REF_SEPARATOR needs no edits here.
+const T = formatRaftChannelTaskRef;
+const D = formatRaftDmTaskRef;
+const SEP = RAFT_TASK_REF_SEPARATOR;
+
+test("channel-qualified task refs parse and format (task v2 #channel:#7)", () => {
+  assert.equal(T("proj", 7), "#proj:#7", "current syntax (update with RAFT_TASK_REF_SEPARATOR)");
+  assert.deepEqual(parseRaftRefTarget(T("proj-slock", 7)), { kind: "task", channelName: "proj-slock", taskNumber: 7 });
+  assert.deepEqual(parseRaftRefTarget(D("alice", 3)), { kind: "task", peerName: "alice", taskNumber: 3 });
+  // Legacy form keeps its shape: no channel or peer key at all.
+  assert.deepEqual(parseRaftRefTarget("task #7"), { kind: "task", taskNumber: 7 });
+  for (const bad of [
+    `#proj${SEP}0`,
+    `#proj${SEP}07`,
+    `${T("proj", 7)}a`,
+    `${T("proj", 7)}/8`,
+    `${T("proj", 7)}${SEP}8`,
+    `#${SEP}7`,
+    `#proj${SEP}`,
+    `dm:alice${SEP}7`,
+  ]) {
+    assert.equal(parseRaftRefTarget(bad), null, bad);
+  }
+  assert.equal(formatRaftRefTarget({ kind: "task", channelName: "proj", taskNumber: 7 }), T("proj", 7));
+  assert.equal(formatRaftRefTarget({ kind: "task", peerName: "alice", taskNumber: 7 }), D("alice", 7));
+  assert.equal(formatRaftRefTarget({ kind: "task", taskNumber: 7 }), "task #7");
+});
+
+test("channel/DM task scanners need the number to end the token", () => {
+  const scan = (text: string, re: RegExp) => Array.from(text.matchAll(re)).map((m) => [m[0], m[1], m[2]]);
+  assert.deepEqual(
+    scan(`see ${T("proj", 7)}, ${T("a-b", 12)}. not ${T("proj", 7)}a or ${T("proj", 7)}/8`, createRaftChannelTaskRefRegex()),
+    [
+      [T("proj", 7), "proj", "7"],
+      [T("a-b", 12), "a-b", "12"],
+    ],
+  );
+  assert.deepEqual(scan(`in ${D("Bob", 2)} and ${D("bob~agent", 5)}.`, createRaftDmTaskRefRegex()), [
+    [D("Bob", 2), "Bob", "2"],
+    [D("bob~agent", 5), "bob~agent", "5"],
+  ]);
+});
+
+test("extractRaftRefTargets claims #channel:#7 before #channel and bare #N", () => {
+  const source = `see ${T("proj", 7)}, ${T("12", 3)}, ${D("bob", 4)} and task #9 in #proj; <${T("ops", 2)}>; \`${T("code", 1)}\``;
+  const refs = extractRaftRefTargets(source, { dedupe: false });
+  assert.deepEqual(
+    refs.map((ref) => ({ target: formatRaftRefTarget(ref.target), slice: source.slice(ref.start, ref.end) })),
+    [
+      { target: T("proj", 7), slice: T("proj", 7) },
+      { target: T("12", 3), slice: T("12", 3) },
+      { target: D("bob", 4), slice: D("bob", 4) },
+      { target: "task #9", slice: "task #9" },
+      { target: "#proj", slice: "#proj" },
+      { target: T("ops", 2), slice: T("ops", 2) },
+    ],
+  );
+  // A trailing path segment or second separator is not a task ref.
+  for (const text of [`${T("proj", 7)}/8`, `${T("proj", 7)}${SEP}8`]) {
+    const projTask = extractRaftRefTargets(text).find(
+      (ref) => ref.target.kind === "task" && ref.target.channelName === "proj",
+    );
+    assert.equal(projTask, undefined, text);
+  }
 });

@@ -1,13 +1,22 @@
 import { useEffect, useRef, useState } from "react";
 import { useIntl } from "react-intl";
 import { Link, useLocation } from "react-router-dom";
-import { Card } from "@botiverse/raft-ui";
+import { Card, ScrollArea, TextLink } from "@botiverse/raft-ui";
 import { AGENT_CONNECTION_PENDING_ID_RE, isAgentConnectionProvider } from "@botiverse/raft-shared";
 import type { AgentConnectionProvider, AgentConnectionStatusView } from "@botiverse/raft-shared";
 import api from "../api/client";
 import Banner from "../components/ui/Banner";
 import SectionEyebrow from "../components/ui/SectionEyebrow";
-import { agentConnectionPath, providerRefusalReason } from "../components/agent/AgentConnections";
+import {
+  ACCOUNT_MISMATCH_CODE,
+  agentConnectionPath,
+  CONNECTOR_FORBIDDEN_CODE,
+  CONNECTOR_NOT_FOUND_CODE,
+  errorCode,
+  PENDING_INVALID_CODE,
+  providerRefusalReason,
+  providerRefusalSentence,
+} from "../components/agent/agentConnectionApi";
 import { useAuthStore } from "../store/authStore";
 import { useServerStore } from "../store/serverStore";
 
@@ -51,8 +60,31 @@ const NO_PENDING_TARGET: NoTarget & { pending: null } = { ...NO_TARGET, pending:
 type ConfirmState =
   | { kind: "confirming" }
   | { kind: "connected"; account: string | null }
+  /** `agent_connection_pending_invalid`: the link expired, was used, or is someone else's; start again. */
   | { kind: "expired"; reason: string | null }
+  /** `agent_connection_connector_not_found`: the connection being reconnected was disconnected meanwhile. */
+  | { kind: "connector_gone" }
+  /** `agent_connection_account_mismatch`: another GitHub account authorized; the connection was kept. */
+  | { kind: "account_mismatch" }
+  /** `agent_connection_connector_forbidden`: only its creator or a server owner/admin may reconnect it. */
+  | { kind: "forbidden" }
   | { kind: "error"; reason: string | null };
+
+/** What a failed confirm means, by the server's code (REFUSAL_CODES). */
+function confirmFailure(err: unknown): ConfirmState {
+  switch (errorCode(err)) {
+    case PENDING_INVALID_CODE:
+      return { kind: "expired", reason: providerRefusalReason(err) };
+    case CONNECTOR_NOT_FOUND_CODE:
+      return { kind: "connector_gone" };
+    case ACCOUNT_MISMATCH_CODE:
+      return { kind: "account_mismatch" };
+    case CONNECTOR_FORBIDDEN_CODE:
+      return { kind: "forbidden" };
+    default:
+      return { kind: "error", reason: providerRefusalSentence(err) };
+  }
+}
 
 export default function AgentConnectionCallbackPage() {
   const { formatMessage } = useIntl();
@@ -85,11 +117,7 @@ export default function AgentConnectionCallbackPage() {
       { headers: { "X-Server-Id": pendingServerId } },
     )
       .then(({ data }) => setConfirm({ kind: "connected", account: data.supported ? data.account : null }))
-      .catch((err: unknown) => {
-        const httpStatus = (err as { response?: { status?: number } }).response?.status;
-        const reason = providerRefusalReason(err);
-        setConfirm(httpStatus === 404 ? { kind: "expired", reason } : { kind: "error", reason });
-      });
+      .catch((err: unknown) => setConfirm(confirmFailure(err)));
   }, [pendingAgentId, pendingId, pendingProvider, pendingServerId]);
 
   // A flow someone else started: re-read status so an unexpected connection can be flagged.
@@ -106,6 +134,7 @@ export default function AgentConnectionCallbackPage() {
       .catch(() => undefined);
     return () => { canceled = true; };
   }, [foreignAgentId, foreignProvider, foreignServerId]);
+
 
   const agentId = view.kind === "invalid" ? null : view.agentId;
   const agentHref = server && agentId ? `/s/${encodeURIComponent(server.slug)}/agent/${encodeURIComponent(agentId)}` : null;
@@ -137,6 +166,15 @@ export default function AgentConnectionCallbackPage() {
       } else if (confirm.kind === "expired") {
         message = formatMessage({ id: "pages.agentConnectionCallback.expired" });
         reason = confirm.reason;
+      } else if (confirm.kind === "connector_gone") {
+        intent = "warning";
+        message = formatMessage({ id: "pages.agentConnectionCallback.connectorGone" });
+      } else if (confirm.kind === "account_mismatch") {
+        intent = "warning";
+        message = formatMessage({ id: "pages.agentConnectionCallback.accountMismatch" });
+      } else if (confirm.kind === "forbidden") {
+        intent = "warning";
+        message = formatMessage({ id: "pages.agentConnectionCallback.forbidden" });
       } else if (confirm.kind === "error") {
         message = confirm.reason
           ? formatMessage({ id: "pages.agentConnectionCallback.providerRefused" }, { reason: confirm.reason })
@@ -149,14 +187,17 @@ export default function AgentConnectionCallbackPage() {
   }
 
   return (
-    <div
-      className="h-full min-h-0 overflow-y-auto bg-layer-sidebar font-display text-foreground safe-top safe-bottom"
+    // raft-ui ScrollArea: the page's scroller. The safe areas pad its
+    // full-height content; the card's column fills what they leave (flex-1).
+    <ScrollArea
+      className="h-full min-h-0 bg-layer-sidebar font-display text-foreground"
+      contentClassName="flex min-h-full flex-col safe-top safe-bottom"
       data-testid="agent-connection-callback-page"
       data-kind={view.kind}
       data-confirm={confirm.kind}
     >
-      <div className="mx-auto flex min-h-full w-full max-w-xl flex-col justify-center px-4 py-8">
-        <Card className="block space-y-4 p-5">
+      <div className="mx-auto flex w-full max-w-xl flex-1 flex-col justify-center px-4 py-8">
+        <Card className="block stack-y-4 p-5">
           <div>
             <SectionEyebrow as="div">{formatMessage({ id: "pages.agentConnectionCallback.eyebrow" })}</SectionEyebrow>
             <h1 className="mt-1 text-title">{formatMessage({ id: "pages.agentConnectionCallback.title" })}</h1>
@@ -175,12 +216,12 @@ export default function AgentConnectionCallbackPage() {
             </p>
           )}
           {agentHref && (
-            <Link to={agentHref} className="inline-block rounded-control text-footnote font-semibold text-foreground underline decoration-[1.5px] underline-offset-[3px] outline-none focus-visible:shadow-focus">
+            <TextLink render={<Link to={agentHref} />} className="inline-block text-footnote">
               {formatMessage({ id: "pages.agentConnectionCallback.backToAgent" })}
-            </Link>
+            </TextLink>
           )}
         </Card>
       </div>
-    </div>
+    </ScrollArea>
   );
 }

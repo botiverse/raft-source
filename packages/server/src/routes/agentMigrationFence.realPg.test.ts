@@ -22,13 +22,12 @@ import { createApiTest } from "../test/integration/apiTest";
 import { openTestApp } from "../test/integration/app";
 import { fixturePasswordHash, tokenForHuman } from "../test/integration/credentials";
 import { getDb } from "../db/index";
-import { agentMigrations, featureFlagRules, machines, serverMembers, servers, users } from "../db/schema";
+import { agentMigrations, machines, serverMembers, servers, users } from "../db/schema";
 import * as agentMigrationService from "../services/agentMigrationService";
 import { createAgent } from "../services/agentService";
-import { AGENT_MIGRATION_FEATURE_FLAG_KEY } from "../services/featureFlagService";
 import { createServer } from "../services/serverService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 const REAL_PG_URL = process.env.ACTOR_MEMBERSHIP_FENCE_REAL_PG_URL;
 const REAL_PG_REQUIRED = process.env.ACTOR_MEMBERSHIP_FENCE_REAL_PG_REQUIRED === "1";
@@ -54,7 +53,6 @@ async function withRealPgApp(run: (app: TestApp, observer: pg.Pool) => Promise<v
     await migrateRealPgTestDatabase(observer, MIGRATIONS_FOLDER);
     const app = await openTestApp(REAL_PG_URL, 0, {
       humanActivityMuteFlagDefaultEnabled: true,
-      onboardingOpenerFlagDefaultEnabled: false,
       skipAuthRateLimit: true,
     });
     try {
@@ -87,14 +85,6 @@ async function seedServer(actorRole: ServerRole) {
   const server = await createServer(`Migration Route Fence ${suffix}`, `migration-route-fence-${suffix}`, owner.id);
   await getDb().insert(serverMembers).values({ serverId: server.id, userId: actor.id, role: actorRole });
   await getDb().update(servers).set({ plan: "founder" }).where(eq(servers.id, server.id));
-  await getDb().insert(featureFlagRules).values({
-    id: randomUUID(),
-    flagKey: AGENT_MIGRATION_FEATURE_FLAG_KEY,
-    stage: "server",
-    priority: 0,
-    decision: "allow",
-    values: [server.id],
-  });
   const now = new Date();
   const [sourceMachine, targetMachine] = await getDb().insert(machines).values([
     { serverId: server.id, userId: owner.id, name: `route-source-${suffix}`, apiKeyHash: `route-source-${suffix}`, runtimes: ["codex"], daemonVersion: "0.72.7", lastHeartbeat: now },

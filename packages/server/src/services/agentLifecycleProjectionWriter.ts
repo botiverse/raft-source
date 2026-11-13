@@ -29,6 +29,7 @@ import {
   type LifecycleRuntimeState,
   type LifecycleShadowSignalSite,
 } from "./agentLifecycleReducer";
+import type { AgentSignalStatusWriteOutcome } from "./agentService";
 
 export type ActivityPersistenceOutcome = "applied" | "deduped" | "error";
 
@@ -100,7 +101,16 @@ export interface AgentLifecycleProjectionWriterDeps {
   clearLaunchGuard(agentId: string): void;
   maybeResolveStartingActivity(agentId: string, span?: ActiveSpan | null): void;
   persistAgentStatus(agentId: string, status: AgentStatus, sessionId?: string): Promise<void>;
-  persistAgentStatusFromSignal(agentId: string, status: AgentStatus, sessionId?: string): Promise<boolean>;
+  /**
+   * A daemon-signal write lands only while the agent still lives on
+   * `machineId`, the Computer the signal came from (null: unknown, never
+   * lands).
+   */
+  persistAgentStatusFromSignal(
+    agentId: string,
+    status: AgentStatus,
+    write: { machineId: string | null; sessionId?: string },
+  ): Promise<AgentSignalStatusWriteOutcome>;
   releaseWakeLock(agentId: string): void;
   sendBestEffortStopToMachine(machineId: string, agentId: string): void;
   sendStopToMachine(machineId: string, agentId: string): Promise<boolean>;
@@ -116,6 +126,12 @@ export interface AgentLifecycleProjectionWriterDeps {
 export interface AppliedAgentLifecycleProjection {
   activityOutcome?: ActivityPersistenceOutcome;
   dbStatusApplied?: boolean;
+  /**
+   * The signal write was dropped because the agent no longer lives on the
+   * signal's Computer: nothing that follows a status or session write
+   * (activity broadcast, starting resolve, caller follow-ups) may run.
+   */
+  dbStatusMachineFenced?: boolean;
   liveActivityResult?: LifecycleActivityBroadcastResult;
   stopSent?: boolean;
 }
@@ -127,6 +143,7 @@ export async function applyAgentLifecycleProjectionPlan(
 ): Promise<AppliedAgentLifecycleProjection> {
   const agentId = plan.event.agentId;
   let dbStatusApplied: boolean | undefined;
+  let dbStatusMachineFenced = false;
   let stopSent: boolean | undefined;
 
   if (plan.sideEffects?.sendStopToMachine && plan.event.machineId) {
@@ -140,13 +157,32 @@ export async function applyAgentLifecycleProjectionPlan(
   if (plan.sideEffects?.clearInbox) deps.clearInbox(agentId);
   if (plan.sideEffects?.updateCache) deps.updateCache(agentId, plan.sideEffects.updateCache);
   if (plan.sideEffects?.clearLaunchGuard) deps.clearLaunchGuard(agentId);
-  if (plan.sideEffects?.releaseWakeLock) deps.releaseWakeLock(agentId);
-  if (plan.sideEffects?.resolveStartingActivity) deps.maybeResolveStartingActivity(agentId, span);
+  // A signal write may be fenced by Machine. Two side effects wait for its
+  // outcome: the starting resolve (a visible broadcast), and the wake-lock
+  // release, because that lock is shared across replicas by agent id and a
+  // fenced frame from the old Computer must not free the new Computer's wake.
+  const signalWrite = plan.dbStatus.kind === "apply" && plan.dbStatus.writer === "signal";
+  if (plan.sideEffects?.releaseWakeLock && !signalWrite) deps.releaseWakeLock(agentId);
+  if (plan.sideEffects?.resolveStartingActivity && !signalWrite) deps.maybeResolveStartingActivity(agentId, span);
   if (plan.sideEffects?.terminalizeFreshnessHold) deps.terminalizeFreshnessHold(agentId, plan.sideEffects.terminalizeFreshnessHold, span);
 
   if (plan.dbStatus.kind === "apply") {
     if (plan.dbStatus.writer === "signal") {
-      dbStatusApplied = await deps.persistAgentStatusFromSignal(agentId, plan.dbStatus.status, plan.dbStatus.sessionId);
+      let outcome: Awaited<ReturnType<typeof deps.persistAgentStatusFromSignal>>;
+      try {
+        outcome = await deps.persistAgentStatusFromSignal(agentId, plan.dbStatus.status, {
+          machineId: plan.event.machineId ?? null,
+          ...(plan.dbStatus.sessionId !== undefined ? { sessionId: plan.dbStatus.sessionId } : {}),
+        });
+      } catch (error) {
+        // A failed write keeps the old behaviour: the lock is released, never left held.
+        if (plan.sideEffects?.releaseWakeLock) deps.releaseWakeLock(agentId);
+        throw error;
+      }
+      dbStatusApplied = outcome === "applied";
+      dbStatusMachineFenced = outcome === "machine_fenced";
+      if (plan.sideEffects?.releaseWakeLock && !dbStatusMachineFenced) deps.releaseWakeLock(agentId);
+      if (plan.sideEffects?.resolveStartingActivity && !dbStatusMachineFenced) deps.maybeResolveStartingActivity(agentId, span);
     } else {
       await deps.persistAgentStatus(agentId, plan.dbStatus.status, plan.dbStatus.sessionId);
       dbStatusApplied = true;
@@ -160,7 +196,10 @@ export async function applyAgentLifecycleProjectionPlan(
   let activityLogSkippedReason = plan.activityLog.skippedReason;
   let activityOutcome: ActivityPersistenceOutcome | undefined;
 
-  if (plan.liveActivity.kind === "ready_online") {
+  if (dbStatusMachineFenced) {
+    liveActivitySkippedReason = "machine_fenced";
+    activityLogSkippedReason = "machine_fenced";
+  } else if (plan.liveActivity.kind === "ready_online") {
     await deps.broadcastReadyOnline(agentId, span);
     liveActivityOutcome = "applied";
     activityLogSkippedReason ??= "online_recovery_may_be_persisted_by_broadcast_ready_online";
@@ -259,19 +298,27 @@ export async function applyAgentLifecycleProjectionPlan(
   }
 
   recordLifecycleProjectionTrace(span, plan, {
+    dbStatusMachineFenced,
     activityLogOutcome,
     activityLogSkippedReason,
     liveActivityOutcome,
     liveActivitySkippedReason,
   });
 
-  return { activityOutcome, dbStatusApplied, liveActivityResult, stopSent };
+  return {
+    activityOutcome,
+    dbStatusApplied,
+    ...(dbStatusMachineFenced ? { dbStatusMachineFenced } : {}),
+    liveActivityResult,
+    stopSent,
+  };
 }
 
 function recordLifecycleProjectionTrace(
   span: ActiveSpan | null | undefined,
   plan: AgentLifecycleProjectionPlan,
   outcomes: {
+    dbStatusMachineFenced: boolean;
     activityLogOutcome: CreateAgentLifecycleProjectionInput["outcome"];
     activityLogSkippedReason?: string;
     liveActivityOutcome: CreateAgentLifecycleProjectionInput["outcome"];
@@ -282,8 +329,10 @@ function recordLifecycleProjectionTrace(
   const projections: CreateAgentLifecycleProjectionInput[] = [
     {
       projectionKind: "db_status",
-      outcome: plan.dbStatus.kind === "apply" ? "applied" : "skipped",
-      ...(plan.dbStatus.kind === "skip" ? { skippedReason: plan.dbStatus.skippedReason } : {}),
+      outcome: plan.dbStatus.kind === "apply" && !outcomes.dbStatusMachineFenced ? "applied" : "skipped",
+      ...(plan.dbStatus.kind === "skip"
+        ? { skippedReason: plan.dbStatus.skippedReason }
+        : outcomes.dbStatusMachineFenced ? { skippedReason: "machine_fenced" } : {}),
       attrs: plan.dbStatus.attrs,
     },
     {

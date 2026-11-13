@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import path from "node:path";
 import {
   aggregateByFile,
@@ -12,10 +12,6 @@ import type {
   PlaywrightJsonReport,
 } from "../scripts/perf/profileE2eShards";
 import { assignOrphans } from "../scripts/runE2eShard";
-
-// Asserts on private CI/deploy files that the source-available snapshot does not
-// carry; skipped when an exported snapshot's RELEASE_SOURCE marker is present.
-const inSourceSnapshot = existsSync(path.join(path.resolve(import.meta.dirname, "../../.."), "RELEASE_SOURCE"));
 
 test("failed-but-timed specs remain usable and explicit", () => {
   const report: PlaywrightJsonReport = {
@@ -200,67 +196,4 @@ test("committed e2e shard duration totals reconcile with recorded file timings",
       `shard ${shard.shard} total must equal its assigned file timings`,
     );
   }
-});
-
-test("manifest refresh matches formal runner contracts and builds e2e dist first", { skip: inSourceSnapshot }, () => {
-  const webRoot = path.resolve(import.meta.dirname, "..");
-  const repoRoot = path.resolve(webRoot, "../..");
-  const refreshWorkflow = readFileSync(path.join(repoRoot, ".github/workflows/manifest-refresh.yml"), "utf8");
-  const testWorkflow = readFileSync(path.join(repoRoot, ".github/workflows/test.yml"), "utf8");
-
-  function jobBlock(workflow: string, jobName: string): string {
-    const marker = `  ${jobName}:\n`;
-    const start = workflow.indexOf(marker);
-    assert.notEqual(start, -1, `missing ${jobName} job`);
-    const tail = workflow.slice(start + marker.length);
-    const nextJob = tail.search(/^  [a-z0-9-]+:\n/m);
-    return nextJob === -1 ? tail : tail.slice(0, nextJob);
-  }
-
-  function exactRunnerContract(job: string) {
-    return {
-      runsOn: job.match(/^\s+runs-on:\s+(\S+)$/m)?.[1],
-      image: job.match(/^\s+image:\s+(\S+)$/m)?.[1],
-      build: job.match(/^\s+run:\s+(VITE_E2E=true VITE_API_URL=\S+ pnpm --filter @botiverse\/raft-web exec vite build)$/m)?.[1],
-    };
-  }
-
-  const profileJob = jobBlock(refreshWorkflow, "profile-e2e");
-  const formalJob = jobBlock(testWorkflow, "e2e");
-  const profileContract = exactRunnerContract(profileJob);
-  const formalContract = exactRunnerContract(formalJob);
-
-  assert.ok(profileContract.image);
-  assert.ok(profileContract.build);
-  assert.deepEqual(profileContract, formalContract);
-  assert.ok(profileJob.indexOf(profileContract.build) < profileJob.indexOf("pnpm exec node --import @oxc-node/core/register scripts/perf/profileE2eShards.ts"));
-  assert.match(profileJob, /E2E_PROFILE_SOURCE_COMMIT: \$\{\{ github\.sha \}\}/);
-  assert.match(profileJob, /- name: Report e2e profile verdict\n\s+shell: bash\n/);
-  // Browser failures can still produce timings; their first-attempt attachments
-  // must survive even when profiling or the later verdict step fails.
-  assert.match(profileJob, /- name: Upload e2e profile evidence\n\s+if: always\(\)\n\s+uses: actions\/upload-artifact@v6\n/);
-  assert.match(profileJob, /name: e2e-profile-evidence\n\s+path: packages\/web\/test-results\//);
-
-  const profileServerJob = jobBlock(refreshWorkflow, "profile-server");
-  const formalServerJob = jobBlock(testWorkflow, "unit-server");
-  const profileServerRunner = profileServerJob.match(/^\s+runs-on:\s+(\S+)$/m)?.[1];
-  const formalServerRunner = formalServerJob.match(/^\s+runs-on:\s+(\S+)$/m)?.[1];
-  assert.ok(profileServerRunner);
-  assert.equal(profileServerRunner, formalServerRunner);
-
-  const publishJob = jobBlock(refreshWorkflow, "publish");
-  assert.equal(publishJob.match(/^\s+runs-on:\s+(\S+)$/m)?.[1], profileServerRunner);
-  assert.match(publishJob, /- name: Upload paired manifest handoff\n/);
-  assert.match(publishJob, /name: manifest-refresh-handoff\n/);
-  assert.match(publishJob, /- name: Publish refresh branch when token allows\n/);
-  assert.ok(publishJob.indexOf("actions/setup-node@v5") < publishJob.indexOf("manifest-refresh-push.mjs"));
-  assert.match(publishJob, /manifest-refresh-push\.mjs --remote origin --branch/);
-  assert.match(
-    publishJob,
-    /steps\.diff\.outputs\.changed == 'true' && steps\.branch_transport\.outputs\.mode == 'push'/,
-  );
-  assert.match(
-    publishJob,
-    /steps\.diff\.outputs\.changed == 'true' && steps\.branch_transport\.outputs\.mode == 'artifact_handoff'/,
-  );
 });

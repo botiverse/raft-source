@@ -78,9 +78,6 @@
       "pointer": "/model"
     }
   },
-  "requiredClientCapabilities": [
-    "option_source.status"
-  ],
   "values": {
     "model": "kimi-k2",
     "reasoningEffort": "high",

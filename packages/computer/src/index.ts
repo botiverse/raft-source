@@ -26,6 +26,7 @@
  */
 import { realpathSync } from "node:fs";
 import { createRequire } from "node:module";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -38,6 +39,8 @@ import {
   SHELL_ENV_STATE_ENV_VAR,
 } from "./shellEnvCapture";
 import { compareRealFiles, type ResolveRealPath } from "./realFileIdentity";
+import { resolveSelfExec, selfExecHostFromProcess } from "@botiverse/raft-shared/src/selfExec";
+import { runContextViewRestoreChildEntry, runRuntimeDetectionChildEntry } from "./runtimeDetectionEntry";
 
 export { SHELL_ENV_STATE_ENV_VAR };
 
@@ -142,12 +145,8 @@ export function stripForwardedCarrierName(
  * execArgv + script) — see CaptureShellEnvDeps.selfExec.
  */
 export function buildSelfExecArgv(): string[] {
-  if (isSeaEntry()) return [process.execPath];
-  return [
-    process.execPath,
-    ...process.execArgv,
-    ...(process.argv[1] !== undefined ? [process.argv[1]] : []),
-  ];
+  const { command, args } = resolveSelfExec([], selfExecHostFromProcess(process, isSeaEntry()));
+  return [command, ...args];
 }
 
 export async function bootstrapSupervisedServiceEnv(
@@ -180,10 +179,7 @@ export async function bootstrapThenRun(
     const { runBundledRaftCli } = await import("@botiverse/raft-daemon/bundled-cli");
     await runBundledRaftCli(cliArgv);
   },
-  runRuntimeDetectionChild: () => Promise<number> = async () => {
-    const { runRuntimeDetectionChildMain } = await import("@botiverse/raft-daemon/runtime-detection-child");
-    return runRuntimeDetectionChildMain();
-  },
+  runRuntimeDetectionChild: () => Promise<number> = runRuntimeDetectionChildEntry,
 ): Promise<void> {
   const legacyInvocation = parseLegacyOsSupervisorInvocation(argv);
   if (legacyInvocation) {
@@ -208,6 +204,11 @@ export async function bootstrapThenRun(
   }
   // task #1268: `<exe> __detect-runtimes` is the runtime detection child the
   // hosted daemon spawns for one detection round (streams JSON lines, exits).
+  // `<exe> __restore-context-view`: one View Context restore, out of the daemon's heap.
+  if (argv[2] === "__restore-context-view") {
+    process.exitCode = await runContextViewRestoreChildEntry();
+    return;
+  }
   if (argv[2] === "__detect-runtimes") {
     process.exitCode = await runRuntimeDetectionChild();
     return;
@@ -238,6 +239,10 @@ function runEntryMainGuard(): void {
     (process.argv[1] !== undefined &&
       import.meta.url === pathToFileURL(process.argv[1]).href);
   if (invokedAsMain) {
+    // The daemon's per-address connect attempt (daemon connectAttemptTimeout.ts,
+    // #proj-raft-computer:#47) for this process too: attach, login, upgrade and
+    // installer calls to the server go out from here, not from a daemon.
+    if (net.getDefaultAutoSelectFamilyAttemptTimeout() < 2_500) net.setDefaultAutoSelectFamilyAttemptTimeout(2_500);
     runCliAsMain();
   }
 }

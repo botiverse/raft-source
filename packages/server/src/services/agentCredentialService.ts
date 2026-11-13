@@ -25,12 +25,15 @@
 
 import { randomBytes, createHmac, timingSafeEqual } from "node:crypto";
 import argon2 from "argon2";
-import { eq, and, isNull, desc, inArray, max } from "drizzle-orm";
-import { isExternalAgentRuntime, makeIsMember } from "@botiverse/raft-shared";
+import { eq, and, isNull, isNotNull, desc, inArray, like, lt, max, ne, notInArray, or, sql, type SQL } from "drizzle-orm";
+import { currentDate, isExternalAgentRuntime, makeIsMember } from "@botiverse/raft-shared";
 import { getDb, type DatabaseExecutor } from "../db/index";
-import { agentCredentials, agentBootstrapTokens, agents, servers, raftbenchServiceAgents } from "../db/schema";
+import { recordIntegrationAuditEvent, recordRunnerCredentialRenewed } from "./integrationAuditService";
+import { agentCredentials, agentBootstrapTokens, agents, servers, raftbenchServiceAgents, agentRuntimeProvisions, type AgentCredentialIssuedVia } from "../db/schema";
 import { hasExactRaftbenchServiceScopes } from "../raftbench/credentialScopes";
+import { assertAgentHumanCredentialCapacity } from "./agentCredentialMintLimits";
 import { addTraceEvent } from "../tracing/semanticTrace";
+import { apiKeyPrefixHashAttrs } from "../tracing/traceIdentity";
 import { agentCredentialVerifyTotal } from "../metrics";
 
 const API_KEY_PREFIX_LENGTH = 16;
@@ -105,6 +108,14 @@ export const HOSTED_RUNTIME_AGENT_CAPABILITIES: readonly AgentCapability[] = [
   "server",
   "mcp",
 ];
+
+/**
+ * A personal assistant's hosted credential (RFC 075 v4): only the scopes its
+ * route allowlist (assistantRouteAllowlist.ts) needs. No `mcp` or `server`:
+ * the runtime keys optional calls off these scopes, and every such call would
+ * be refused.
+ */
+export const ASSISTANT_AGENT_CAPABILITIES: readonly AgentCapability[] = ["read", "send", "reactions"];
 
 export type RequestedAgentCapabilities =
   | { ok: true; scopes: AgentCapability[] }
@@ -196,6 +207,8 @@ export interface AgentCredentialLookupResult {
   agentId: string;
   serverId: string;
   scopes: readonly string[];
+  /** Who minted it; `app` only for a managed App Bot's key (appBotIdentityService). */
+  issuedVia: AgentCredentialIssuedVia | null;
 }
 
 export interface LatestActiveAgentCredentialSummary {
@@ -232,7 +245,9 @@ export async function getLatestActiveAgentCredential(
  * Revoked rows are excluded by the query on every request — the middleware
  * never verifies against a revoked credential.
  *
- * Returns `null` for: unknown key, revoked credential, soft-deleted agent.
+ * Returns `null` for: unknown key, revoked credential, soft-deleted agent,
+ * a runner credential whose agent is no longer on the Machine that minted it,
+ * an expired credential (`authenticateAgentApiKey` tells that one apart).
  * The agent join ensures the credential's bound agent still exists.
  *
  * No in-memory caching in v0 — keep the current behavior and trace the
@@ -241,7 +256,40 @@ export async function getLatestActiveAgentCredential(
 export async function findAgentCredentialByApiKey(
   apiKey: string,
 ): Promise<AgentCredentialLookupResult | null> {
-  if (!isAgentApiKey(apiKey)) return null;
+  const outcome = await authenticateAgentApiKey(apiKey);
+  return outcome.ok ? outcome.credential : null;
+}
+
+/** 401 code of a key that verified but whose `expires_at` has passed (#wg-rbac:#27). */
+export const AGENT_CREDENTIAL_EXPIRED_CODE = "agent_credential_expired";
+
+export type AgentApiKeyAuthOutcome =
+  | { ok: true; credential: AgentCredentialLookupResult }
+  /**
+   * `expired`: the key verified, it is not revoked and would otherwise
+   * authenticate, but its `expires_at` has passed. Every other refusal
+   * (unknown, wrong, revoked, deleted agent, off its Machine) is `invalid`.
+   */
+  | { ok: false; reason: "invalid" | "expired" };
+
+/** Whether a credential's `expires_at` has passed at `now` (NULL never expires). */
+export function isAgentCredentialExpired(expiresAt: Date | null, now: Date = currentDate()): boolean {
+  return expiresAt !== null && expiresAt.getTime() <= now.getTime();
+}
+
+/**
+ * `findAgentCredentialByApiKey` that also says why a key was refused, so the
+ * agent-api middleware can answer an expired key with its own code: the
+ * daemon renews on `agent_credential_expired` and never on anything else.
+ * Expiry is checked only once the key has verified (by HMAC or argon2) and
+ * every other condition holds, so the code reveals nothing about a key the
+ * caller doesn't hold and never turns a terminal refusal into "renew me".
+ * There is no auth cache: every request reads the row, so a key is refused
+ * from the first request after its `expires_at`.
+ */
+export async function authenticateAgentApiKey(apiKey: string): Promise<AgentApiKeyAuthOutcome> {
+  const invalid = { ok: false, reason: "invalid" } as const;
+  if (!isAgentApiKey(apiKey)) return invalid;
   const db = getDb();
   const prefix = extractApiKeyPrefix(apiKey);
 
@@ -255,6 +303,9 @@ export async function findAgentCredentialByApiKey(
       apiKeyHash: agentCredentials.apiKeyHash,
       apiKeyHmac: agentCredentials.apiKeyHmac,
       scopes: agentCredentials.scopes,
+      issuedVia: agentCredentials.issuedVia,
+      issuedByMachineId: agentCredentials.issuedByMachineId,
+      expiresAt: agentCredentials.expiresAt,
     })
     .from(agentCredentials)
     .where(
@@ -266,6 +317,9 @@ export async function findAgentCredentialByApiKey(
   addTraceEvent("agent_credential_auth.credential_lookup.finished", {
     duration_ms: Date.now() - lookupStart,
     candidate_count: candidates.length,
+    // A key nothing matches has no agent to name, and a caller without x-agent-id
+    // claims none: this is all that tells one such caller from another.
+    ...(candidates.length === 0 ? apiKeyPrefixHashAttrs(prefix) : {}),
   });
 
   const verifyStart = Date.now();
@@ -310,7 +364,7 @@ export async function findAgentCredentialByApiKey(
     verify_path: verifyPath,
   });
   if (candidates.length > 0) agentCredentialVerifyTotal.inc({ path: verifyPath, outcome: verifyOutcome });
-  if (!verifiedCredential) return null;
+  if (!verifiedCredential) return invalid;
 
   if (presentedHmac && (!verifiedCredential.apiKeyHmac || staleHmac)) {
     await storeAgentApiKeyHmac(verifiedCredential.id, verifiedCredential.apiKeyHash, presentedHmac);
@@ -322,22 +376,69 @@ export async function findAgentCredentialByApiKey(
   // soft-deleted agent's credential is unusable.
   const agentLookupStart = Date.now();
   const [agentRow] = await db
-    .select({ id: agents.id, serverId: agents.serverId })
+    .select({ id: agents.id, serverId: agents.serverId, machineId: agents.machineId })
     .from(agents)
     .where(and(eq(agents.id, verifiedCredential.agentId), isNull(agents.deletedAt)));
   addTraceEvent("agent_credential_auth.agent_lookup.finished", {
     duration_ms: Date.now() - agentLookupStart,
     outcome: agentRow ? "found" : "missing",
   });
-  if (!agentRow) return null;
+  if (!agentRow) return invalid;
+  // A runner credential authenticates only while its agent is on the Machine
+  // that minted it. Refused like an unknown key (the caller answers the same
+  // 401); the event tells a leftover runner after a move apart in traces.
+  if (isRunnerCredentialOffMachine(verifiedCredential, agentRow.machineId)) {
+    addTraceEvent("agent_credential_auth.refused", {
+      reason: RUNNER_CREDENTIAL_WRONG_MACHINE,
+      credential_id: verifiedCredential.id,
+      agent_id: verifiedCredential.agentId,
+    });
+    return invalid;
+  }
+  if (isAgentCredentialExpired(verifiedCredential.expiresAt)) {
+    addTraceEvent("agent_credential_auth.refused", {
+      reason: AGENT_CREDENTIAL_EXPIRED_CODE,
+      credential_id: verifiedCredential.id,
+      agent_id: verifiedCredential.agentId,
+    });
+    return { ok: false, reason: "expired" };
+  }
 
   const result = {
     credentialId: verifiedCredential.id,
     agentId: verifiedCredential.agentId,
     serverId: agentRow.serverId,
     scopes: verifiedCredential.scopes,
+    issuedVia: verifiedCredential.issuedVia,
   } satisfies AgentCredentialLookupResult;
-  return result;
+  return { ok: true, credential: result };
+}
+
+/** Trace label of a runner credential refused because its agent is on another Machine (or none). */
+export const RUNNER_CREDENTIAL_WRONG_MACHINE = "runner_credential_wrong_machine";
+
+/**
+ * A Computer's runner credential (`issued_via = 'computer'`) is bound to the
+ * Machine that minted it: once its agent is on another Machine, or on none, it
+ * no longer authenticates. A computer row with no recorded Machine (minted
+ * before the column, or not attributable by the backfill) is not bound.
+ * Credentials of every other origin (human, provision, app) are never bound.
+ *
+ * Assumes a Machine uses a runner key only while it holds the agent. The mint
+ * route (POST /internal/computer/runners/:agentId/credentials) answers 404
+ * unless `agents.machine_id` is the caller, and a migration's target starts
+ * the agent only after the flip (start-transfer, stage/commit the workspace,
+ * flip-machine, arrived, start), so it mints and uses its key after
+ * `agents.machine_id` moved. If a target ever minted or ran the agent before
+ * the flip, this rule would refuse that key until the flip.
+ */
+function isRunnerCredentialOffMachine(
+  credential: { issuedVia: AgentCredentialIssuedVia | null; issuedByMachineId: string | null },
+  agentMachineId: string | null,
+): boolean {
+  return credential.issuedVia === "computer"
+    && credential.issuedByMachineId !== null
+    && credential.issuedByMachineId !== agentMachineId;
 }
 
 // Row verified by argon2: store its HMAC (filling a missing one, or replacing
@@ -395,6 +496,17 @@ export function __setAgentCredentialUseThrottleMsForTests(ms: number | null): vo
   lastCredentialUseWriteMs.clear();
 }
 
+/** How long the best-effort last-used write waits for its row before skipping. */
+export const AGENT_CREDENTIAL_USE_LOCK_TIMEOUT = "100ms";
+
+function isLockNotAvailable(error: unknown): boolean {
+  for (let current: unknown = error, depth = 0; current && depth < 4; depth += 1) {
+    if (typeof current === "object" && (current as { code?: unknown }).code === "55P03") return true;
+    current = typeof current === "object" ? (current as { cause?: unknown }).cause : undefined;
+  }
+  return false;
+}
+
 /**
  * Record observability triple (last_used_at, last_used_ip, last_used_user_agent)
  * for a successful credential auth. Best-effort: failure does not affect the
@@ -420,25 +532,40 @@ export async function recordAgentCredentialUse(input: {
   }
   const writeStart = Date.now();
   try {
-    const db = getDb();
     // A revoked credential is never "seen": an already-open stream or an
     // in-flight request must not refresh its presence after revocation.
-    const updated = await db
-      .update(agentCredentials)
-      .set({
-        lastUsedAt: now,
-        lastUsedIp: input.ip,
-        lastUsedUserAgent: input.userAgent,
-      })
-      .where(and(eq(agentCredentials.id, input.credentialId), isNull(agentCredentials.revokedAt)))
-      .returning({ id: agentCredentials.id });
+    // A short lock_timeout: while something else holds the row (a revoke, a
+    // bulk revocation, an account deletion's transaction), skip this window
+    // rather than hold a pooled connection waiting (#proj-o11y:058cb07b,
+    // 11 s behind a rolled-back deletion on 2026-11-05).
+    const updated = await getDb().transaction(async (tx) => {
+      await tx.execute(sql.raw(`SET LOCAL lock_timeout = '${AGENT_CREDENTIAL_USE_LOCK_TIMEOUT}'`));
+      return tx
+        .update(agentCredentials)
+        .set({
+          lastUsedAt: now,
+          lastUsedIp: input.ip,
+          lastUsedUserAgent: input.userAgent,
+        })
+        .where(and(eq(agentCredentials.id, input.credentialId), isNull(agentCredentials.revokedAt)))
+        .returning({ id: agentCredentials.id });
+    });
     const outcome = updated.length > 0 ? "updated" : "revoked";
     addTraceEvent("agent_credential_auth.last_used.finished", {
       duration_ms: Date.now() - writeStart,
       outcome,
     });
     return outcome === "updated" ? now : null;
-  } catch {
+  } catch (error) {
+    if (isLockNotAvailable(error)) {
+      // The row is busy: this window is skipped (the throttle stays claimed),
+      // the next one writes.
+      addTraceEvent("agent_credential_auth.last_used.finished", {
+        duration_ms: Date.now() - writeStart,
+        outcome: "lock_busy",
+      });
+      return null;
+    }
     // Let the next request retry instead of waiting out the window.
     lastCredentialUseWriteMs.delete(input.credentialId);
     addTraceEvent("agent_credential_auth.last_used.finished", {
@@ -452,19 +579,29 @@ export async function recordAgentCredentialUse(input: {
 
 /**
  * Re-validation for long-lived connections that authenticated once at open
- * (the wake-hint stream): the credential is still unrevoked and its agent and
- * server still exist. Same conditions as `findAgentCredentialByApiKey` plus
- * the middleware's server-liveness check, keyed by credential id.
+ * (the wake-hint stream), keyed by credential id: `active` while the
+ * credential is unrevoked and unexpired, its agent and server still exist, and
+ * a runner credential's agent is still on the Machine that minted it (the
+ * conditions of `authenticateAgentApiKey` plus the middleware's
+ * server-liveness check). Otherwise `expired` when only its `expires_at` has
+ * passed (its holder renews), `invalid` for everything else.
  */
-export async function isAgentCredentialActive(credentialId: string): Promise<boolean> {
+export async function agentCredentialStreamState(credentialId: string): Promise<"active" | "expired" | "invalid"> {
   const [row] = await getDb()
-    .select({ id: agentCredentials.id })
+    .select({
+      id: agentCredentials.id,
+      issuedVia: agentCredentials.issuedVia,
+      issuedByMachineId: agentCredentials.issuedByMachineId,
+      expiresAt: agentCredentials.expiresAt,
+      agentMachineId: agents.machineId,
+    })
     .from(agentCredentials)
     .innerJoin(agents, and(eq(agents.id, agentCredentials.agentId), isNull(agents.deletedAt)))
     .innerJoin(servers, and(eq(servers.id, agents.serverId), isNull(servers.deletedAt)))
     .where(and(eq(agentCredentials.id, credentialId), isNull(agentCredentials.revokedAt)))
     .limit(1);
-  return Boolean(row);
+  if (!row || isRunnerCredentialOffMachine(row, row.agentMachineId)) return "invalid";
+  return isAgentCredentialExpired(row.expiresAt) ? "expired" : "active";
 }
 
 /**
@@ -541,16 +678,42 @@ export function normalizeAgentCapabilities(input: readonly string[]): AgentCapab
   return Array.from(seen).sort();
 }
 
-export interface MintAgentCredentialInput {
+/** The origins a live write path can record; `unknown` is only for backfilled rows. */
+export type LiveAgentCredentialIssuedVia = Exclude<AgentCredentialIssuedVia, "unknown">;
+
+/**
+ * Where the credential comes from (`agent_credentials.issued_via`). Only a
+ * person's mint (directly, or by exchanging a bootstrap token they issued)
+ * names an issuer; a cloud runtime's provider-held key, a Computer's runner
+ * key and an App Bot's key have none.
+ */
+export type AgentCredentialIssuance =
+  | {
+      issuedVia: "human";
+      createdByUserId: string;
+      issuedByMachineId?: never;
+      /** A device login's session family when that session mints (revoking the session revokes the credential). */
+      issuedBySessionFamilyId?: string | null;
+      /**
+       * The person's web (full) session family when that session mints, or
+       * issued the bootstrap token exchanged for it (a security revoke of the
+       * session revokes the credential, webSessionIssuedKeys.ts).
+       */
+      issuedByWebSessionFamilyId?: string | null;
+    }
+  | {
+      issuedVia: "computer";
+      createdByUserId: null;
+      issuedByMachineId?: string | null;
+      /** The device login's family holding the minting Computer's key, if any (revoking that session revokes the credential). */
+      issuedBySessionFamilyId?: string | null;
+    }
+  | { issuedVia: "provision" | "app"; createdByUserId: null; issuedByMachineId?: never };
+
+export type MintAgentCredentialInput = AgentCredentialIssuance & {
   agentId: string;
   scopes: readonly AgentCapability[];
   name?: string | null;
-  // User id is set on the audit column when the mint is initiated by a
-  // human-authenticated path (web session or bootstrap-exchange tracing the
-  // human who issued the token). For sk_computer_*-initiated mints there is
-  // no user id; pass null and the audit lineage lives on the Computer
-  // attachment record instead.
-  createdByUserId: string | null;
   /**
    * Refuse (`agent_not_external`) unless the agent's runtime is external.
    * Set by every human-facing mint path (web session, bootstrap exchange):
@@ -566,7 +729,13 @@ export interface MintAgentCredentialInput {
    * Callers that need atomicity pass a transaction executor.
    */
   replacesCredentialId?: string | null;
-}
+  /**
+   * When the credential stops authenticating (`agent_credentials.expires_at`);
+   * omitted or null never expires. Set only for a runner credential minted
+   * for a daemon that renews (runnerCredentialExpiry).
+   */
+  expiresAt?: Date | null;
+};
 
 /**
  * Mint a fresh `sk_agent_*` credential bound to `agentId`. Returns the raw
@@ -577,6 +746,12 @@ export interface MintAgentCredentialInput {
  * revoked (each device/profile holds its own); only `replacesCredentialId`,
  * when given, is revoked in the same write.
  */
+let mintBeforeLockHookForTests: ((agentId: string) => Promise<void>) | null = null;
+/** Tests only: runs after the key is hashed, before the agent row is locked. */
+export function __setMintBeforeLockHookForTests(hook: ((agentId: string) => Promise<void>) | null): void {
+  mintBeforeLockHookForTests = hook;
+}
+
 export async function mintAgentCredential(
   input: MintAgentCredentialInput,
   options: { executor?: DatabaseExecutor } = {},
@@ -588,6 +763,8 @@ export async function mintAgentCredential(
   serverId: string;
   agentName: string;
   replacedCredentialId: string | null;
+  issuedVia: LiveAgentCredentialIssuedVia;
+  expiresAt: Date | null;
 }> {
   const db = options.executor ?? getDb();
 
@@ -616,40 +793,63 @@ export async function mintAgentCredential(
     throw new Error("raftbench_service_credential_scope_invalid");
   }
 
-  let replacedCredentialId: string | null = null;
-  if (input.replacesCredentialId) {
-    const [replaced] = await db
-      .select({ id: agentCredentials.id, revokedAt: agentCredentials.revokedAt })
-      .from(agentCredentials)
-      .where(and(eq(agentCredentials.id, input.replacesCredentialId), eq(agentCredentials.agentId, input.agentId)));
-    if (!replaced) throw new Error("replaces_credential_invalid");
-    if (!replaced.revokedAt) {
-      await db
-        .update(agentCredentials)
-        .set({
-          revokedAt: new Date(),
-          revokedReason: "rotated",
-          ...(input.createdByUserId ? { revokedByUserId: input.createdByUserId } : {}),
-        })
-        .where(and(eq(agentCredentials.id, replaced.id), isNull(agentCredentials.revokedAt)));
-      replacedCredentialId = replaced.id;
-    }
-  }
-
+  // Hashing is slow (argon2): before the lock, never under it.
   const material = await generateAgentApiKeyMaterial();
+  await mintBeforeLockHookForTests?.(input.agentId);
 
-  const [row] = await db
-    .insert(agentCredentials)
-    .values({
-      agentId: input.agentId,
-      apiKeyHash: material.apiKeyHash,
-      apiKeyHmac: material.apiKeyHmac,
-      apiKeyPrefix: material.apiKeyPrefix,
-      name: input.name ?? null,
-      scopes,
-      createdByUserId: input.createdByUserId,
-    })
-    .returning({ id: agentCredentials.id });
+  // The agent row, FOR SHARE, decides against a concurrent deleteAgent
+  // (#wg-rbac:#27): either this sees the deletion and refuses, or the deletion
+  // waits for this commit and then revokes the new key with the rest. Checking
+  // without the lock left a window across the hash: a Computer minted a runner
+  // key 3 s after its agent was deleted (production 2026-11-05).
+  const { replacedCredentialId, row } = await db.transaction(async (tx) => {
+    const [live] = await tx.select({ id: agents.id }).from(agents)
+      .where(and(eq(agents.id, input.agentId), isNull(agents.deletedAt)))
+      .for("share", { of: agents });
+    if (!live) throw new Error("agent_missing");
+    let replacedCredentialId: string | null = null;
+    if (input.replacesCredentialId) {
+      const [replaced] = await tx
+        .select({ id: agentCredentials.id, revokedAt: agentCredentials.revokedAt })
+        .from(agentCredentials)
+        .where(and(eq(agentCredentials.id, input.replacesCredentialId), eq(agentCredentials.agentId, input.agentId)));
+      if (!replaced) throw new Error("replaces_credential_invalid");
+      if (!replaced.revokedAt) {
+        await tx
+          .update(agentCredentials)
+          .set({
+            revokedAt: new Date(),
+            revokedReason: "rotated",
+            ...(input.createdByUserId ? { revokedByUserId: input.createdByUserId } : {}),
+          })
+          .where(and(eq(agentCredentials.id, replaced.id), isNull(agentCredentials.revokedAt)));
+        replacedCredentialId = replaced.id;
+      }
+    }
+
+    // A person's keys are capped per agent (agentCredentialMintLimits.ts),
+    // counted after a `replacesCredentialId` rotation's revoke above, so that rotation works at the cap. A device-grant re-login (`raft agent login`) mints without it and is refused at the cap; the existing key keeps working.
+    if (input.issuedVia === "human") await assertAgentHumanCredentialCapacity(tx, input.agentId);
+
+    const [row] = await tx
+      .insert(agentCredentials)
+      .values({
+        agentId: input.agentId,
+        apiKeyHash: material.apiKeyHash,
+        apiKeyHmac: material.apiKeyHmac,
+        apiKeyPrefix: material.apiKeyPrefix,
+        name: input.name ?? null,
+        scopes,
+        createdByUserId: input.issuedVia === "human" ? input.createdByUserId : null,
+        issuedVia: input.issuedVia,
+        issuedByMachineId: input.issuedVia === "computer" ? input.issuedByMachineId ?? null : null,
+        issuedBySessionFamilyId: input.issuedVia === "human" || input.issuedVia === "computer" ? input.issuedBySessionFamilyId ?? null : null,
+        issuedByWebSessionFamilyId: input.issuedVia === "human" ? input.issuedByWebSessionFamilyId ?? null : null,
+        expiresAt: input.expiresAt ?? null,
+      })
+      .returning({ id: agentCredentials.id });
+    return { replacedCredentialId, row };
+  });
 
   return {
     credentialId: row.id,
@@ -659,6 +859,8 @@ export async function mintAgentCredential(
     serverId: agentRow.serverId,
     agentName: agentRow.name,
     replacedCredentialId,
+    issuedVia: input.issuedVia,
+    expiresAt: input.expiresAt ?? null,
   };
 }
 
@@ -681,38 +883,508 @@ export async function listAgentCredentials(agentId: string) {
   }));
 }
 
-export async function revokeAgentCredential(input: {
+export interface RevokeAgentCredentialInput {
   credentialId: string;
   agentId?: string;
   serverId?: string;
   reason: string;
   revokedByUserId?: string;
-}, options: { executor?: DatabaseExecutor } = {}): Promise<boolean> {
+  /**
+   * A Computer revokes only what it issued: set to the calling Machine, a
+   * credential not minted by it (`issued_via = 'computer'` and
+   * `issued_by_machine_id` = this Machine) is refused with
+   * `not_issued_by_machine` and stays valid.
+   */
+  issuedByMachineId?: string;
+  /**
+   * The holder revokes its own key (`self_revoked`): a credential that is not
+   * self-revocable (isSelfRevocableAgentCredential) is refused with
+   * `not_self_revocable` and stays valid.
+   */
+  selfRevocableOnly?: boolean;
+}
+
+/** `revoked_reason` of a credential its holder revoked with the key itself. */
+export const SELF_REVOKED_REASON = "self_revoked";
+
+/**
+ * Whether the holder of a key may revoke it with the key alone
+ * (POST /internal/agent-api/credentials/self/revoke): only one a person
+ * minted (`issued_via = 'human'`: `raft agent login`, the web, a bootstrap
+ * exchange). A runner key (`computer`) belongs to its daemon, a cloud
+ * runtime's (`provision`) to its provider and an App Bot's (`app`) to its App:
+ * each is minted, renewed and revoked by the system that holds it, so killing
+ * it from inside would only break that system. Unclassified rows (NULL,
+ * `unknown`) could be any of those, so they are refused too.
+ */
+export function isSelfRevocableAgentCredential(issuedVia: AgentCredentialIssuedVia | null): boolean {
+  return issuedVia === "human";
+}
+
+export async function revokeAgentCredential(
+  input: RevokeAgentCredentialInput,
+  options: { executor?: DatabaseExecutor } = {},
+): Promise<boolean> {
+  const outcome = await revokeAgentCredentialWithOutcome(input, options);
+  return outcome === "revoked" || outcome === "already_revoked";
+}
+
+/**
+ * `revoked` when this call revoked it, `already_revoked` for an idempotent
+ * repeat (or a concurrent revoke that got there first), `not_issued_by_machine`
+ * when `issuedByMachineId` is set and the credential is not that Machine's,
+ * `not_self_revocable` when `selfRevocableOnly` is set and it is not, null when
+ * not found.
+ */
+export async function revokeAgentCredentialWithOutcome(
+  input: RevokeAgentCredentialInput,
+  options: { executor?: DatabaseExecutor } = {},
+): Promise<"revoked" | "already_revoked" | "not_issued_by_machine" | "not_self_revocable" | null> {
   const db = options.executor ?? getDb();
   const [row] = await db
     .select({
       id: agentCredentials.id,
       agentId: agentCredentials.agentId,
       revokedAt: agentCredentials.revokedAt,
+      issuedVia: agentCredentials.issuedVia,
+      issuedByMachineId: agentCredentials.issuedByMachineId,
       serverId: agents.serverId,
     })
     .from(agentCredentials)
     .innerJoin(agents, eq(agents.id, agentCredentials.agentId))
     .where(eq(agentCredentials.id, input.credentialId));
-  if (!row) return false;
-  if (input.agentId && row.agentId !== input.agentId) return false;
-  if (input.serverId && row.serverId !== input.serverId) return false;
-  if (row.revokedAt) return true;
+  if (!row) return null;
+  if (input.agentId && row.agentId !== input.agentId) return null;
+  if (input.serverId && row.serverId !== input.serverId) return null;
+  if (
+    input.issuedByMachineId
+    && (row.issuedVia !== "computer" || row.issuedByMachineId !== input.issuedByMachineId)
+  ) {
+    return "not_issued_by_machine";
+  }
+  if (input.selfRevocableOnly && !isSelfRevocableAgentCredential(row.issuedVia)) return "not_self_revocable";
+  if (row.revokedAt) return "already_revoked";
 
-  await db
+  // Conditional on still being live: of two concurrent revokes only one
+  // reports `revoked` (and so records the audit event).
+  const updated = await db
     .update(agentCredentials)
     .set({
       revokedAt: new Date(),
       revokedReason: input.reason,
       ...(input.revokedByUserId ? { revokedByUserId: input.revokedByUserId } : {}),
     })
+    .where(and(eq(agentCredentials.id, input.credentialId), isNull(agentCredentials.revokedAt)))
+    .returning({ id: agentCredentials.id });
+  return updated.length > 0 ? "revoked" : "already_revoked";
+}
+
+export const RUNNER_MACHINE_CHANGED_REVOKE_REASON = "runner_machine_changed";
+
+/**
+ * An agent moved to `machineId` (null: to no Machine, e.g. unbound or hosted):
+ * revoke its runner credentials minted by any other Machine, which no longer
+ * authenticate anyway (isRunnerCredentialOffMachine) and which the old Machine
+ * can no longer revoke itself (its DELETE needs the agent on it). Keys the new
+ * Machine minted stay (it can mint only while it holds the agent, so after the
+ * move; excluding them costs nothing), as do human, provision and app
+ * credentials and computer rows with no recorded Machine. Run in the transaction that writes `agents.machine_id`;
+ * open streams of a revoked credential close at their next re-validation, or
+ * sooner where the caller broadcasts the revocation after commit.
+ */
+export async function revokeRunnerCredentialsOffMachine(
+  executor: DatabaseExecutor,
+  input: { agentIds: readonly string[]; machineId: string | null; now: Date },
+): Promise<void> {
+  if (input.agentIds.length === 0) return;
+  await executor
+    .update(agentCredentials)
+    .set({ revokedAt: input.now, revokedReason: RUNNER_MACHINE_CHANGED_REVOKE_REASON })
+    .where(and(
+      inArray(agentCredentials.agentId, [...input.agentIds]),
+      eq(agentCredentials.issuedVia, "computer"),
+      isNotNull(agentCredentials.issuedByMachineId),
+      input.machineId ? ne(agentCredentials.issuedByMachineId, input.machineId) : undefined,
+      isNull(agentCredentials.revokedAt),
+    ));
+}
+
+// ============================================================================
+// Runner credential expiry and renewal (#wg-rbac:#27). A daemon that declares
+// `runner-credential-renew:v1` gets runner credentials that expire
+// RUNNER_CREDENTIAL_TTL_MS after they are issued, and renews them with its
+// Machine's own key (POST /internal/computer/runners/:agentId/credentials/renew)
+// before then, or after a 401 `agent_credential_expired`.
+// ============================================================================
+
+/** How long a runner credential minted or renewed for a renewing daemon lives. */
+export const RUNNER_CREDENTIAL_TTL_MS = 7 * 24 * 60 * 60_000;
+/**
+ * After a renewal the old key keeps working at most this long (its
+ * `expires_at` is pulled in, never pushed out): in-flight requests and a
+ * second process sharing the key finish instead of failing at once.
+ */
+export const RUNNER_CREDENTIAL_RENEW_OVERLAP_MS = 5 * 60_000;
+/** An expired runner credential may still be renewed this long after it expired; later, the daemon mints afresh. */
+export const RUNNER_CREDENTIAL_RENEW_AFTER_EXPIRY_MS = 7 * 24 * 60 * 60_000;
+
+/** `expires_at` for a runner credential issued at `now`: 7 days out for a renewing daemon, never otherwise. */
+export function runnerCredentialExpiresAt(daemonRenews: boolean, now: Date = currentDate()): Date | null {
+  return daemonRenews ? new Date(now.getTime() + RUNNER_CREDENTIAL_TTL_MS) : null;
+}
+
+export type RunnerCredentialRenewRefusal =
+  /** The agent is gone, on another server, or not on the calling Machine. */
+  | "agent_missing"
+  /** No such credential of this agent. */
+  | "credential_missing"
+  /** Not a Computer's runner credential (`issued_via = 'computer'`, name `runner:*`). */
+  | "credential_not_runner"
+  /** A runner credential another Machine (or none on record) minted. */
+  | "credential_not_issued_by_this_computer"
+  /** Revoked: never renewed. */
+  | "credential_revoked"
+  /** Expired more than RUNNER_CREDENTIAL_RENEW_AFTER_EXPIRY_MS ago. */
+  | "renew_window_passed"
+  /** Already renewed once; nothing new is issued. */
+  | "already_renewed";
+
+export type RunnerCredentialRenewal =
+  | {
+      ok: true;
+      credentialId: string;
+      apiKey: string;
+      expiresAt: Date;
+      scopes: AgentCapability[];
+      replacedCredentialId: string;
+      /** The old key's `expires_at` after the renewal. */
+      replacedExpiresAt: Date;
+    }
+  | { ok: false; refusal: RunnerCredentialRenewRefusal };
+
+const RUNNER_CREDENTIAL_NAME_PREFIX = "runner:";
+
+function runnerCredentialRenewRefusal(
+  row: {
+    agentId: string;
+    issuedVia: AgentCredentialIssuedVia | null;
+    name: string | null;
+    createdByUserId: string | null;
+    issuedByMachineId: string | null;
+    revokedAt: Date | null;
+    expiresAt: Date | null;
+    replacedByCredentialId: string | null;
+  } | undefined,
+  input: { agentId: string; machineId: string },
+  now: Date,
+): RunnerCredentialRenewRefusal | null {
+  if (!row || row.agentId !== input.agentId) return "credential_missing";
+  if (row.issuedVia !== "computer" || !row.name?.startsWith(RUNNER_CREDENTIAL_NAME_PREFIX) || row.createdByUserId !== null) {
+    return "credential_not_runner";
+  }
+  if (row.issuedByMachineId !== input.machineId) return "credential_not_issued_by_this_computer";
+  if (row.revokedAt) return "credential_revoked";
+  if (row.replacedByCredentialId) return "already_renewed";
+  if (row.expiresAt && row.expiresAt.getTime() <= now.getTime() - RUNNER_CREDENTIAL_RENEW_AFTER_EXPIRY_MS) {
+    return "renew_window_passed";
+  }
+  return null;
+}
+
+const runnerCredentialRenewColumns = {
+  id: agentCredentials.id,
+  agentId: agentCredentials.agentId,
+  name: agentCredentials.name,
+  scopes: agentCredentials.scopes,
+  issuedVia: agentCredentials.issuedVia,
+  createdByUserId: agentCredentials.createdByUserId,
+  issuedByMachineId: agentCredentials.issuedByMachineId,
+  revokedAt: agentCredentials.revokedAt,
+  expiresAt: agentCredentials.expiresAt,
+  replacedByCredentialId: agentCredentials.replacedByCredentialId,
+};
+
+let renewBeforeLockHookForTests: (() => Promise<void>) | null = null;
+/** Tests only: runs after the new key is hashed, before the rows are locked. */
+export function __setRenewBeforeLockHookForTests(hook: (() => Promise<void>) | null): void {
+  renewBeforeLockHookForTests = hook;
+}
+
+/**
+ * Renew a Computer's runner credential: issue a new one in its place (same
+ * agent, Machine, name and scopes, a fresh RUNNER_CREDENTIAL_TTL_MS, HMAC from
+ * the start) and pull the old key's `expires_at` in to at most
+ * RUNNER_CREDENTIAL_RENEW_OVERLAP_MS out. The old key is not revoked: it keeps
+ * working through the overlap. One transaction: the agent row FOR SHARE (as
+ * mintAgentCredential: a concurrent delete either sees the new key or waits
+ * and revokes it), the old credential FOR UPDATE (two renewals of it
+ * serialize; the second sees `replaced_by_credential_id` and is refused
+ * `already_renewed` without issuing anything), the insert, the old row's
+ * update and the audit event.
+ *
+ * The caller has authenticated `machineId` (the Machine's own key, never the
+ * old agent key) and checked that its daemon declared
+ * `runner-credential-renew:v1`. `issuedBySessionFamilyId`: the device login's
+ * family holding the Computer's key now, as for a mint.
+ */
+export async function renewRunnerCredential(
+  input: {
+    agentId: string;
+    serverId: string;
+    machineId: string;
+    credentialId: string;
+    issuedBySessionFamilyId?: string | null;
+  },
+  options: { executor?: DatabaseExecutor } = {},
+): Promise<RunnerCredentialRenewal> {
+  if (!CREDENTIAL_ID_PATTERN.test(input.credentialId)) return { ok: false, refusal: "credential_missing" };
+  const db = options.executor ?? getDb();
+
+  // Refuse what can be refused before paying for argon2; re-checked under the locks.
+  const [unlocked] = await db.select(runnerCredentialRenewColumns).from(agentCredentials)
     .where(eq(agentCredentials.id, input.credentialId));
-  return true;
+  const early = runnerCredentialRenewRefusal(unlocked, input, currentDate());
+  if (early) return { ok: false, refusal: early };
+
+  const material = await generateAgentApiKeyMaterial();
+  await renewBeforeLockHookForTests?.();
+
+  return db.transaction(async (tx): Promise<RunnerCredentialRenewal> => {
+    const [agent] = await tx.select({ id: agents.id, serverId: agents.serverId, machineId: agents.machineId })
+      .from(agents)
+      .where(and(eq(agents.id, input.agentId), isNull(agents.deletedAt)))
+      .for("share", { of: agents });
+    if (!agent || agent.serverId !== input.serverId || agent.machineId !== input.machineId) {
+      return { ok: false, refusal: "agent_missing" };
+    }
+    const [old] = await tx.select(runnerCredentialRenewColumns).from(agentCredentials)
+      .where(eq(agentCredentials.id, input.credentialId))
+      .for("update");
+    const now = currentDate();
+    const refusal = runnerCredentialRenewRefusal(old, input, now);
+    if (refusal || !old) return { ok: false, refusal: refusal ?? "credential_missing" };
+
+    const expiresAt = new Date(now.getTime() + RUNNER_CREDENTIAL_TTL_MS);
+    const overlapEnd = new Date(now.getTime() + RUNNER_CREDENTIAL_RENEW_OVERLAP_MS);
+    const replacedExpiresAt = old.expiresAt && old.expiresAt.getTime() < overlapEnd.getTime() ? old.expiresAt : overlapEnd;
+    const scopes = normalizeAgentCapabilities(old.scopes);
+    const [row] = await tx.insert(agentCredentials).values({
+      agentId: input.agentId,
+      apiKeyHash: material.apiKeyHash,
+      apiKeyHmac: material.apiKeyHmac,
+      apiKeyPrefix: material.apiKeyPrefix,
+      name: old.name,
+      scopes,
+      createdByUserId: null,
+      issuedVia: "computer",
+      issuedByMachineId: input.machineId,
+      issuedBySessionFamilyId: input.issuedBySessionFamilyId ?? null,
+      expiresAt,
+    }).returning({ id: agentCredentials.id });
+    await tx.update(agentCredentials)
+      .set({ expiresAt: replacedExpiresAt, replacedByCredentialId: row!.id })
+      .where(eq(agentCredentials.id, old.id));
+    await recordRunnerCredentialRenewed({
+      serverId: agent.serverId,
+      agentId: input.agentId,
+      credentialId: row!.id,
+      replacedCredentialId: old.id,
+      machineId: input.machineId,
+      scopes,
+      expiresAt,
+    }, tx);
+    return {
+      ok: true,
+      credentialId: row!.id,
+      apiKey: material.apiKey,
+      expiresAt,
+      scopes,
+      replacedCredentialId: old.id,
+      replacedExpiresAt,
+    };
+  });
+}
+
+export const RUNNER_NOT_HELD_REVOKE_REASON = "runner_not_held";
+/** A mint issued this long before a `ready` may still be on its way to the daemon. */
+export const RUNNER_CREDENTIAL_RECONCILE_GRACE_MS = 5 * 60_000;
+/** More held ids than this is not a believable claim (one per launch): reconcile nothing. */
+export const RUNNER_CREDENTIAL_RECONCILE_MAX_HELD = 4096;
+/**
+ * A key used this recently is spared whatever the list says: `last_used_at` is
+ * written at most once a minute while a key is used, so a process calling the
+ * server keeps its key even if a second daemon on the same Machine key (task
+ * #374 duplicates) sent this list, or the list missed it.
+ */
+export const RUNNER_CREDENTIAL_RECONCILE_RECENT_USE_MS = 15 * 60_000;
+/** Revoked per `ready` at most; a machine's older backlog goes on its next connection. */
+export const RUNNER_CREDENTIAL_RECONCILE_BATCH = 200;
+const CREDENTIAL_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * #wg-rbac:#27 reconcile: the daemon on `machineId` says (first `ready` of a
+ * connection, `runner-credential-reconcile:v1`) it holds `heldIds` and no
+ * other runner credential. Revoke this Machine's live runner credentials
+ * (issued_via 'computer', name `runner:*`, no person, not a cloud runtime's)
+ * that are not listed, were issued before `issuedBefore` (the ready's
+ * arrival minus RUNNER_CREDENTIAL_RECONCILE_GRACE_MS: a mint whose response
+ * had not reached the daemon when it built the frame is never listed), and
+ * were not used in the last RUNNER_CREDENTIAL_RECONCILE_RECENT_USE_MS. Ids
+ * the daemon lists that are not this Machine's, or not ids at all, change
+ * nothing. No broadcast: no process holds these keys. Returns how many were
+ * revoked, or null when the claim was refused as too large.
+ */
+export async function revokeRunnerCredentialsNotHeld(
+  input: { machineId: string; heldIds: readonly string[]; issuedBefore: Date; now: Date; limit?: number },
+  executor: DatabaseExecutor = getDb(),
+): Promise<number | null> {
+  const notHeldWhere = runnerCredentialsNotHeldWhere(input, executor);
+  if (!notHeldWhere) return null;
+  const notHeld = executor
+    .select({ id: agentCredentials.id })
+    .from(agentCredentials)
+    .where(notHeldWhere)
+    .limit(input.limit ?? RUNNER_CREDENTIAL_RECONCILE_BATCH);
+  const revoked = await executor
+    .update(agentCredentials)
+    .set({ revokedAt: input.now, revokedReason: RUNNER_NOT_HELD_REVOKE_REASON })
+    .where(and(inArray(agentCredentials.id, notHeld), isNull(agentCredentials.revokedAt)))
+    .returning({ id: agentCredentials.id });
+  return revoked.length;
+}
+
+/**
+ * Count-only twin of revokeRunnerCredentialsNotHeld (run while
+ * runner_credential_reconcile is off): what it would revoke, uncapped,
+ * and how many of those were used in the last 24 hours (a live but idle
+ * process, or a second daemon on the Machine key: the ones a real revoke
+ * could break). Writes nothing. Null when the claim is refused as too large.
+ */
+export async function countRunnerCredentialsNotHeld(
+  input: { machineId: string; heldIds: readonly string[]; issuedBefore: Date; now: Date },
+  executor: DatabaseExecutor = getDb(),
+): Promise<{ wouldRevoke: number; usedLast24h: number } | null> {
+  const notHeldWhere = runnerCredentialsNotHeldWhere(input, executor);
+  if (!notHeldWhere) return null;
+  const dayAgo = new Date(input.now.getTime() - 24 * 60 * 60_000);
+  const [row] = await executor
+    .select({
+      wouldRevoke: sql<number>`count(*)::int`,
+      usedLast24h: sql<number>`(count(*) filter (where ${agentCredentials.lastUsedAt} >= ${dayAgo}))::int`,
+    })
+    .from(agentCredentials)
+    .where(notHeldWhere);
+  return { wouldRevoke: Number(row?.wouldRevoke ?? 0), usedLast24h: Number(row?.usedLast24h ?? 0) };
+}
+
+function runnerCredentialsNotHeldWhere(
+  input: { machineId: string; heldIds: readonly string[]; issuedBefore: Date; now: Date },
+  executor: DatabaseExecutor,
+): SQL | undefined {
+  if (input.heldIds.length > RUNNER_CREDENTIAL_RECONCILE_MAX_HELD) return undefined;
+  const held = input.heldIds.filter((id) => CREDENTIAL_ID_PATTERN.test(id));
+  const providerHeld = executor
+    .select({ id: agentRuntimeProvisions.credentialId })
+    .from(agentRuntimeProvisions)
+    .where(isNotNull(agentRuntimeProvisions.credentialId));
+  return and(
+    eq(agentCredentials.issuedByMachineId, input.machineId),
+    eq(agentCredentials.issuedVia, "computer"),
+    like(agentCredentials.name, "runner:%"),
+    isNull(agentCredentials.createdByUserId),
+    isNull(agentCredentials.revokedAt),
+    lt(agentCredentials.createdAt, input.issuedBefore),
+    or(
+      isNull(agentCredentials.lastUsedAt),
+      lt(agentCredentials.lastUsedAt, new Date(input.now.getTime() - RUNNER_CREDENTIAL_RECONCILE_RECENT_USE_MS)),
+    ),
+    held.length > 0 ? notInArray(agentCredentials.id, held) : undefined,
+    notInArray(agentCredentials.id, providerHeld),
+  );
+}
+
+export const ISSUER_LEFT_SERVER_REVOKE_REASON = "issuer_left_server";
+
+/**
+ * A person's departure from a server takes back the Agent credentials they
+ * issued there (#wg-rbac B12): those whose issuer (`created_by_user_id`) they
+ * are and those exchanged from a bootstrap token they issued (rows exchanged
+ * before the exchange recorded the token's issuer carry none). Their
+ * unconsumed bootstrap tokens are revoked too. Left alone: credentials a
+ * Computer minted for its runner (no human issuer; the Machine's own
+ * revocation path) and a cloud runtime's credential held by its provider (no
+ * person ever saw that key) -- including one an older server build minted
+ * during rollout, which the insert trigger classed as 'human' with an issuer.
+ *
+ * Deliberately not keyed on `issued_via` yet: until the backfill
+ * (scripts/backfill-agent-credential-issued-via.ts) has run and the contract
+ * migration has set NOT NULL, existing rows may be NULL or misclassified. The
+ * contract PR simplifies this to
+ * `issued_via = 'human' AND created_by_user_id = <leaver>`.
+ *
+ * Runs on the caller's executor so it commits with the membership delete.
+ * Returns the revoked credentials; the caller audits them and broadcasts the
+ * revocation per agent after commit so open streams close.
+ */
+export async function revokeAgentCredentialsIssuedBy(input: {
+  serverId: string;
+  userId: string;
+  revokedAt: Date;
+}, executor: DatabaseExecutor): Promise<Array<{ credentialId: string; agentId: string }>> {
+  const viaToken = executor
+    .select({ id: agentBootstrapTokens.consumedCredentialId })
+    .from(agentBootstrapTokens)
+    .where(and(
+      eq(agentBootstrapTokens.serverId, input.serverId),
+      eq(agentBootstrapTokens.issuedByUserId, input.userId),
+      isNotNull(agentBootstrapTokens.consumedCredentialId),
+    ));
+  const serverAgents = executor
+    .select({ id: agents.id })
+    .from(agents)
+    .where(eq(agents.serverId, input.serverId));
+  // A cloud runtime's credential is minted under its creator's authority but
+  // handed, encrypted, to the provider: no person ever saw the key, so a
+  // departure takes nothing back by revoking it and would only stop the agent.
+  const providerHeld = executor
+    .select({ id: agentRuntimeProvisions.credentialId })
+    .from(agentRuntimeProvisions)
+    .where(and(
+      eq(agentRuntimeProvisions.serverId, input.serverId),
+      isNotNull(agentRuntimeProvisions.credentialId),
+    ));
+  // Two statements, not one with `issuer OR via token`: under that OR the
+  // planner gave up both the agent index and the primary key and scanned all of
+  // agent_credentials, which timed out a large server's removal (#wg-rbac:#18).
+  // Same transaction, so the revoke still commits or rolls back with the
+  // membership delete. A row both statements match is revoked by the first and
+  // skipped by the second's `revoked_at IS NULL`, so none is returned twice.
+  const revokeWhere = (issuedBy: SQL) => executor
+    .update(agentCredentials)
+    .set({ revokedAt: input.revokedAt, revokedReason: ISSUER_LEFT_SERVER_REVOKE_REASON })
+    .where(and(
+      isNull(agentCredentials.revokedAt),
+      inArray(agentCredentials.agentId, serverAgents),
+      issuedBy,
+      notInArray(agentCredentials.id, providerHeld),
+    ))
+    .returning({ credentialId: agentCredentials.id, agentId: agentCredentials.agentId });
+  const revoked = [
+    ...await revokeWhere(eq(agentCredentials.createdByUserId, input.userId)),
+    ...await revokeWhere(inArray(agentCredentials.id, viaToken)),
+  ];
+
+  await executor
+    .update(agentBootstrapTokens)
+    .set({ revokedAt: input.revokedAt })
+    .where(and(
+      eq(agentBootstrapTokens.serverId, input.serverId),
+      eq(agentBootstrapTokens.issuedByUserId, input.userId),
+      isNull(agentBootstrapTokens.consumedAt),
+      isNull(agentBootstrapTokens.revokedAt),
+    ));
+
+  return revoked;
 }
 
 // ----------------------------------------------------------------------------
@@ -723,6 +1395,8 @@ export interface IssueAgentBootstrapTokenInput {
   agentId: string;
   serverId: string;
   issuedByUserId: string;
+  /** The issuer's web (full) session family: copied onto the credential at exchange (webSessionIssuedKeys.ts). */
+  issuedByWebSessionFamilyId?: string | null;
   scopes: readonly AgentCapability[];
   ttlMs?: number;
 }
@@ -769,19 +1443,28 @@ export async function issueAgentBootstrapToken(
   const ttlMs = input.ttlMs ?? DEFAULT_BOOTSTRAP_TTL_MS;
   const ttlExpiresAt = new Date(Date.now() + ttlMs);
 
-  const [row] = await db
-    .insert(agentBootstrapTokens)
-    .values({
-      tokenLookupHash,
-      tokenHash,
-      tokenPrefix,
-      targetAgentId: input.agentId,
-      serverId: input.serverId,
-      issuedByUserId: input.issuedByUserId,
-      scopes,
-      ttlExpiresAt,
-    })
-    .returning({ id: agentBootstrapTokens.id });
+  // Same lock as mintAgentCredential: no token for an agent being deleted.
+  const row = await db.transaction(async (tx) => {
+    const [live] = await tx.select({ id: agents.id }).from(agents)
+      .where(and(eq(agents.id, input.agentId), isNull(agents.deletedAt)))
+      .for("share", { of: agents });
+    if (!live) throw new Error("agent_missing");
+    const [inserted] = await tx
+      .insert(agentBootstrapTokens)
+      .values({
+        tokenLookupHash,
+        tokenHash,
+        tokenPrefix,
+        targetAgentId: input.agentId,
+        serverId: input.serverId,
+        issuedByUserId: input.issuedByUserId,
+        issuedByWebSessionFamilyId: input.issuedByWebSessionFamilyId ?? null,
+        scopes,
+        ttlExpiresAt,
+      })
+      .returning({ id: agentBootstrapTokens.id });
+    return inserted;
+  });
 
   return {
     tokenId: row.id,
@@ -850,6 +1533,8 @@ export async function consumeAgentBootstrapToken(
       ttlExpiresAt: agentBootstrapTokens.ttlExpiresAt,
       consumedAt: agentBootstrapTokens.consumedAt,
       revokedAt: agentBootstrapTokens.revokedAt,
+      issuedByUserId: agentBootstrapTokens.issuedByUserId,
+      issuedByWebSessionFamilyId: agentBootstrapTokens.issuedByWebSessionFamilyId,
     })
     .from(agentBootstrapTokens)
     .where(eq(agentBootstrapTokens.tokenLookupHash, tokenLookupHash));
@@ -876,59 +1561,104 @@ export async function consumeAgentBootstrapToken(
     return { ok: false, error: "token_expired" };
   }
 
+  // Steps 2–4 run in one transaction: mint, claim, and the audit event of the
+  // credential commit together (or the race-lost revoke commits instead).
   // Step 2 — mint a fresh credential carrying the token's scopes. If the
   // bound agent has been soft-deleted between issue and exchange,
   // mintAgentCredential throws agent_missing and we map back to the public
   // error code.
-  let minted: Awaited<ReturnType<typeof mintAgentCredential>>;
-  try {
-    minted = await mintAgentCredential({
-      agentId: row.targetAgentId,
-      scopes: row.scopes as AgentCapability[],
-      createdByUserId: null, // bootstrap exchange: issuer is on the token row
-      name: null,
-      requireExternalRuntime: true,
-    });
-  } catch (err) {
-    if (err instanceof Error && err.message === "agent_missing") {
-      return { ok: false, error: "agent_missing" };
+  type Exchange =
+    | { ok: true; minted: Awaited<ReturnType<typeof mintAgentCredential>> }
+    | { ok: false; error: "agent_missing" | "agent_not_external" | "token_consumed" | "token_revoked" };
+  const exchange = await db.transaction(async (tx): Promise<Exchange> => {
+    let minted: Awaited<ReturnType<typeof mintAgentCredential>>;
+    try {
+      minted = await mintAgentCredential({
+        agentId: row.targetAgentId,
+        scopes: row.scopes as AgentCapability[],
+        // A person's mint: the token's issuer is the credential's issuer.
+        issuedVia: "human",
+        createdByUserId: row.issuedByUserId,
+        // The web session that issued the token: a security revoke of it
+        // revokes this credential (webSessionIssuedKeys.ts).
+        issuedByWebSessionFamilyId: row.issuedByWebSessionFamilyId,
+        name: null,
+        requireExternalRuntime: true,
+      }, { executor: tx });
+    } catch (err) {
+      if (err instanceof Error && err.message === "agent_missing") {
+        return { ok: false, error: "agent_missing" };
+      }
+      if (err instanceof Error && err.message === "agent_not_external") {
+        return { ok: false, error: "agent_not_external" };
+      }
+      throw err;
     }
-    if (err instanceof Error && err.message === "agent_not_external") {
-      return { ok: false, error: "agent_not_external" };
-    }
-    throw err;
-  }
 
-  // Step 3 — CAS-style claim. If another racer beat us, this returns 0
-  // rows; revoke the just-minted credential (otherwise we'd leak it) and
-  // surface token_consumed to the caller.
-  const claimResult = await db
-    .update(agentBootstrapTokens)
-    .set({
-      consumedAt: new Date(),
-      consumedCredentialId: minted.credentialId,
-      consumedIp: observe.ip ?? null,
-      consumedUserAgent: observe.userAgent ?? null,
-    })
-    .where(
-      and(
-        eq(agentBootstrapTokens.id, row.id),
-        isNull(agentBootstrapTokens.consumedAt),
-      ),
-    )
-    .returning({ id: agentBootstrapTokens.id });
-
-  if (claimResult.length === 0) {
-    // Race lost. Revoke the just-minted credential so it can't be used.
-    await db
-      .update(agentCredentials)
+    // Step 3 — CAS-style claim. If another racer beat us, this returns 0
+    // rows; revoke the just-minted credential (otherwise we'd leak it) and
+    // surface token_consumed to the caller. A revoke that landed since the
+    // read above wins too (token_revoked): a security revoke of the issuing
+    // web session revokes the token first and then the credentials minted
+    // from it, so an exchange either commits first (its credential is then
+    // found) or finds the token revoked here (webSessionIssuedKeys.ts).
+    const claimResult = await tx
+      .update(agentBootstrapTokens)
       .set({
-        revokedAt: new Date(),
-        revokedReason: "bootstrap_exchange_race_lost",
+        consumedAt: new Date(),
+        consumedCredentialId: minted.credentialId,
+        consumedIp: observe.ip ?? null,
+        consumedUserAgent: observe.userAgent ?? null,
       })
-      .where(eq(agentCredentials.id, minted.credentialId));
-    return { ok: false, error: "token_consumed" };
-  }
+      .where(
+        and(
+          eq(agentBootstrapTokens.id, row.id),
+          isNull(agentBootstrapTokens.consumedAt),
+          isNull(agentBootstrapTokens.revokedAt),
+        ),
+      )
+      .returning({ id: agentBootstrapTokens.id });
+
+    if (claimResult.length === 0) {
+      // Race lost. Revoke the just-minted credential so it can't be used.
+      await tx
+        .update(agentCredentials)
+        .set({
+          revokedAt: new Date(),
+          revokedReason: "bootstrap_exchange_race_lost",
+        })
+        .where(eq(agentCredentials.id, minted.credentialId));
+      const [lost] = await tx
+        .select({ revokedAt: agentBootstrapTokens.revokedAt, consumedAt: agentBootstrapTokens.consumedAt })
+        .from(agentBootstrapTokens)
+        .where(eq(agentBootstrapTokens.id, row.id));
+      return { ok: false, error: lost?.revokedAt && !lost.consumedAt ? "token_revoked" : "token_consumed" };
+    }
+
+    // Step 4 — the credential's audit event, in the claim's commit. The person
+    // who issued the token authorized it; ids and scopes only, never the key.
+    await recordIntegrationAuditEvent({
+      serverId: minted.serverId,
+      eventType: "agent_credential.issued",
+      outcome: "success",
+      source: "system",
+      actor: { type: "system" },
+      requester: { type: "human", id: row.issuedByUserId },
+      subject: { type: "agent", id: minted.agentId },
+      target: { type: "agent_credential", id: minted.credentialId },
+      metadata: {
+        agentId: minted.agentId,
+        credentialId: minted.credentialId,
+        scopes: minted.scopes,
+        issuedVia: minted.issuedVia,
+        viaBootstrapToken: true,
+        bootstrapTokenId: row.id,
+      },
+    }, tx);
+    return { ok: true, minted };
+  });
+  if (!exchange.ok) return { ok: false, error: exchange.error };
+  const { minted } = exchange;
 
   return {
     ok: true,
@@ -939,4 +1669,40 @@ export async function consumeAgentBootstrapToken(
     serverId: minted.serverId,
     scopes: minted.scopes,
   };
+}
+
+/**
+ * Where an external agent's setup stands (#wg-external-agent-ux:#2), from its
+ * credentials and login tokens, in this order:
+ * - `connected`: any credential not revoked has been used;
+ * - `credential_minted`: one not revoked exists but none has been used yet;
+ * - `disconnected`: none left, and one that was revoked had been used;
+ * - `login_token_expired`: never connected, and its newest login token expired unused;
+ * - `waiting_for_login`: nothing yet (or a login token still waiting to be used).
+ * `credentialLastUsedAt` is the newest use of a credential not revoked.
+ */
+export type ExternalAgentSetupState = "waiting_for_login" | "credential_minted" | "login_token_expired" | "connected" | "disconnected";
+
+export async function externalAgentSetupState(agentId: string, now: Date = new Date()): Promise<{ setupState: ExternalAgentSetupState; credentialLastUsedAt: Date | null }> {
+  const db = getDb();
+  const [credentials, [latestToken]] = await Promise.all([
+    db.select({ lastUsedAt: agentCredentials.lastUsedAt, revokedAt: agentCredentials.revokedAt })
+      .from(agentCredentials)
+      .where(eq(agentCredentials.agentId, agentId)),
+    db.select({ ttlExpiresAt: agentBootstrapTokens.ttlExpiresAt, consumedAt: agentBootstrapTokens.consumedAt, revokedAt: agentBootstrapTokens.revokedAt })
+      .from(agentBootstrapTokens)
+      .where(eq(agentBootstrapTokens.targetAgentId, agentId))
+      .orderBy(desc(agentBootstrapTokens.createdAt))
+      .limit(1),
+  ]);
+  const active = credentials.filter((credential) => credential.revokedAt === null);
+  const usedTimes = active.flatMap((credential) => (credential.lastUsedAt ? [credential.lastUsedAt.getTime()] : []));
+  const credentialLastUsedAt = usedTimes.length > 0 ? new Date(Math.max(...usedTimes)) : null;
+  if (credentialLastUsedAt) return { setupState: "connected", credentialLastUsedAt };
+  if (active.length > 0) return { setupState: "credential_minted", credentialLastUsedAt: null };
+  if (credentials.some((credential) => credential.lastUsedAt !== null)) return { setupState: "disconnected", credentialLastUsedAt: null };
+  if (latestToken && !latestToken.consumedAt && !latestToken.revokedAt && latestToken.ttlExpiresAt.getTime() <= now.getTime()) {
+    return { setupState: "login_token_expired", credentialLastUsedAt: null };
+  }
+  return { setupState: "waiting_for_login", credentialLastUsedAt: null };
 }

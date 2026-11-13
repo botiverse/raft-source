@@ -9,7 +9,7 @@ import { mintAgentCredential } from "../services/agentCredentialService";
 import { createChannel } from "../services/channelService";
 import { createServer } from "../services/serverService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 function headers(apiKey: string): Record<string, string> {
   return { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" };
@@ -70,6 +70,7 @@ async function seed() {
     agentId: agent.id,
     scopes: ["send", "read"],
     name: "feedback-locator-api-test",
+    issuedVia: "computer",
     createdByUserId: null,
   });
   return { server, agent, apiKey: credential.apiKey };

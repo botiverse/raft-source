@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { mobileDownloadUrl } from "../src/utils/mobileDownloadUrl";
-import { deriveRuntimeEndpoints } from "../src/desktopRuntimeEnvironment";
+import { deriveRuntimeEndpoints } from "../src/runtimeEndpoints";
 
 /**
  * Drives the PRODUCTION function with an injected base — not a lookalike.
@@ -58,10 +58,8 @@ test("the platformless form carries no query, so the QR stays UA-decided", () =>
  */
 test("the runtime base is derived from the API origin, not the page origin", () => {
   const endpoints = deriveRuntimeEndpoints(
-    null,
     "https://api-aws-staging.botiverse.dev",
     "https://raft-app-staging.botiverse.dev",
-    false,
   );
   assert.equal(endpoints.apiBase, "https://api-aws-staging.botiverse.dev/api");
   assert.notEqual(

@@ -1,4 +1,4 @@
-import { fixturePasswordHash } from "../test/integration/credentials";
+import { accessTokenForTest, fixturePasswordHash } from "../test/integration/credentials";
 import { createApiTest } from "../test/integration/apiTest";
 import assert from "node:assert/strict";
 
@@ -6,10 +6,9 @@ import { openTestApp } from "../test/integration/app";
 import { getDb } from "../db/index";
 import { users } from "../db/schema";
 import { createServer } from "../services/serverService";
-import { signAccessToken } from "../middleware/auth";
 import { verifyScopeAttestation } from "../lib/scopeAttestation";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 async function seedOwner() {
   const db = getDb();
@@ -28,10 +27,10 @@ async function seedOwner() {
 test("POST /api/servers/:id/scope-attestation signs web trace batch capability for server members", async () => {
   const previousSecret = process.env.SCOPE_ATTESTATION_SECRET;
   process.env.SCOPE_ATTESTATION_SECRET = "web-trace-scope-test-secret";
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const { owner, server } = await seedOwner();
-    const token = signAccessToken(owner.id);
+    const token = await accessTokenForTest(owner.id);
 
     const res = await fetch(`${app.baseUrl}/api/servers/${server.id}/scope-attestation`, {
       method: "POST",
@@ -74,10 +73,10 @@ test("POST /api/servers/:id/scope-attestation signs web trace batch capability f
 test("POST /api/servers/:id/scope-attestation signs feedback report capability for server owners", async () => {
   const previousSecret = process.env.SCOPE_ATTESTATION_SECRET;
   process.env.SCOPE_ATTESTATION_SECRET = "feedback-scope-test-secret";
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const { owner, server } = await seedOwner();
-    const token = signAccessToken(owner.id);
+    const token = await accessTokenForTest(owner.id);
 
     const res = await fetch(`${app.baseUrl}/api/servers/${server.id}/scope-attestation`, {
       method: "POST",

@@ -1,5 +1,7 @@
+import { v5 as uuidv5 } from "uuid";
 import { createHmac } from "node:crypto";
 import type { Brand } from "@botiverse/raft-shared";
+import { isPrivacyModeOn } from "../config/privacyMode";
 
 export type ProductFeedbackKind = "idea" | "problem";
 
@@ -81,6 +83,14 @@ export type ProductFeedbackReporterAttribution = {
   server_slug: string;
   user_id: string;
   handle: string;
+  /**
+   * `agent_card`: an agent drafted it in a `feedback:submit` action card and
+   * the reporter reviewed and sent it. Server-derived from the card, never
+   * from the client, and never with conversation content.
+   */
+  source?: "agent_card";
+  /** With `source: "agent_card"`: the agent that prepared the card. */
+  drafted_by_agent_id?: string;
 };
 
 export type ProductFeedbackMetadata = {
@@ -139,7 +149,36 @@ export type ProductFeedbackSubmission = {
   diagnostics?: ProductFeedbackPresignedAttachment;
   /** Set when the ticket is filed from an agent's Report Issue dialog. */
   feedbackReportId?: FeedbackReportId;
+  /** Set when it is sent from a `feedback:submit` action card's form. */
+  fromAgentFeedbackCard?: boolean;
 };
+
+/** Namespace for UUIDv5 submission ids of `feedback:submit` card sends. */
+const AGENT_FEEDBACK_CARD_SUBMISSION_NAMESPACE = "6f4c1f2e-7f1a-4b9e-9d4b-2a8f0c3e5b71";
+
+/**
+ * A `feedback:submit` card's Hands `submission_id`: fixed per card and sender,
+ * so Hands files one ticket per person per card. Two tabs, or a resend after a
+ * lost response, replay it (Hands answers the same ticket); two people each
+ * file their own (Hands keys a submission_id to one reporter).
+ */
+export function agentFeedbackCardSubmissionId(cardMessageId: string, userId: string): string {
+  return uuidv5(`feedback-card:${cardMessageId}:${userId}`, AGENT_FEEDBACK_CARD_SUBMISSION_NAMESPACE);
+}
+
+/**
+ * Hands' 409 for a submission_id that already filed a ticket with other
+ * content (botiverse/hands worker/src/routes/feedback.ts, `submission_id
+ * already used with a different payload`; public-api-reference.md,
+ * submission_id). Hands sends no code for it, so the documented text is
+ * matched exactly; a pinned test fails if it changes. Any other 409 stays an
+ * ordinary conflict.
+ */
+export const HANDS_SUBMISSION_REUSED_WITH_DIFFERENT_PAYLOAD = "submission_id already used with a different payload";
+
+export function isSubmissionAlreadyFiledWithOtherContent(error: ProductFeedbackUpstreamError): boolean {
+  return error.upstreamStatus === 409 && error.upstreamError === HANDS_SUBMISSION_REUSED_WITH_DIFFERENT_PAYLOAD;
+}
 
 export type ProductFeedbackReceipt = {
   id: string;
@@ -250,6 +289,8 @@ type ProductFeedbackServiceConfig = {
 };
 
 export function isProductFeedbackConfigured(env: NodeJS.ProcessEnv = process.env): boolean {
+  // RAFT_PRIVACY_MODE: feedback is never sent to Hands, so it is not configured.
+  if (isPrivacyModeOn()) return false;
   return Boolean(
     env.HANDS_FEEDBACK_BASE_URL?.trim()
     && env.HANDS_FEEDBACK_APP_SLUG?.trim()
@@ -260,6 +301,7 @@ export function isProductFeedbackConfigured(env: NodeJS.ProcessEnv = process.env
 }
 
 function readConfig(env: NodeJS.ProcessEnv): ProductFeedbackServiceConfig {
+  if (isPrivacyModeOn()) throw new ProductFeedbackConfigurationError();
   const baseUrl = env.HANDS_FEEDBACK_BASE_URL?.trim();
   const appSlug = env.HANDS_FEEDBACK_APP_SLUG?.trim();
   const clientKey = env.HANDS_FEEDBACK_CLIENT_KEY?.trim();
@@ -311,7 +353,16 @@ function disallowWebOnlyNativeFields(input: ProductFeedbackMetadata): void {
   }
 }
 
-export function normalizeProductFeedbackMetadata(input: ProductFeedbackMetadata): ProductFeedbackNormalizedMetadata {
+/**
+ * `nativeVersionOptional`: the server read these facts from the request
+ * itself (a feedback card's form send, feedbackCardForm.ts), where a native
+ * client's version comes from its User-Agent. One that names none is still
+ * that client, filed without a version; the dialog's metadata must have one.
+ */
+export function normalizeProductFeedbackMetadata(
+  input: ProductFeedbackMetadata,
+  options: { nativeVersionOptional?: boolean } = {},
+): ProductFeedbackNormalizedMetadata {
   const trustedClientKind = optionalClientKind(input.trustedClientKind) ?? "web";
   const clientKind = optionalClientKind(input.clientKind) ?? trustedClientKind;
   if (clientKind !== trustedClientKind) throw new ProductFeedbackValidationError();
@@ -338,7 +389,9 @@ export function normalizeProductFeedbackMetadata(input: ProductFeedbackMetadata)
   return {
     clientKind,
     platform,
-    clientVersion: requiredBounded(input.clientVersion, 128),
+    clientVersion: options.nativeVersionOptional
+      ? optionalBounded(input.clientVersion, 128)
+      : requiredBounded(input.clientVersion, 128),
     locale,
     osVersion,
   };
@@ -350,7 +403,9 @@ function buildMetadata(input: ProductFeedbackSubmission): Record<string, unknown
     product_type: attribution.clientKind,
     client_kind: attribution.clientKind,
     platform: attribution.platform,
-    surface: input.feedbackReportId ? "agent.report_issue" : "settings.feedback",
+    surface: input.fromAgentFeedbackCard
+      ? "agent.feedback_card"
+      : input.feedbackReportId ? "agent.report_issue" : "settings.feedback",
     feedback_type: input.kind,
     contact_consent: input.contact !== null,
   };

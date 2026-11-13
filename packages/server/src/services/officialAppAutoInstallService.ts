@@ -1,6 +1,6 @@
 import { and, asc, desc, eq, inArray, isNull, ne } from "drizzle-orm";
 import { validate as isUuid } from "uuid";
-import { currentDate } from "@botiverse/raft-shared";
+import { currentDate, effectiveAllowedOAuthScopes } from "@botiverse/raft-shared";
 import { getDb } from "../db/index";
 import {
   oauthClientInstalls,
@@ -10,7 +10,10 @@ import {
   officialAppAutoInstallTransitions,
   servers,
 } from "../db/schema";
+import { currentTextConfirmation } from "./appPromptTextService";
+import { announcePermissionUpdatesChanged } from "./listChangedRealtime";
 import { oauthClientIsUserManagedPredicate } from "./oauthClientManagementPolicy";
+import { oauthClientHasKey } from "./oauthClientKeys";
 
 type DbExecutor = ReturnType<typeof getDb>;
 type AutoInstallState = "default_auto" | "auto_suppressed";
@@ -19,22 +22,51 @@ type TransitionSource = "auto_install" | "user_install" | "user_uninstall" | "mi
 let autoInstallAttemptObserverForTests: ((serverId: string) => void) | null = null;
 let beforeAutoInstallWriteObserverForTests: ((serverId: string, tx: DbExecutor) => void | Promise<void>) | null = null;
 
-function parseProtectedOfficialServerId(): string | null {
-  const value = process.env.RAFT_OFFICIAL_PUBLISHER_SERVER_ID?.trim();
+/**
+ * `RAFT_OFFICIAL_PUBLISHER_SERVER_ID`: the primary trust root, the Raft Server
+ * itself (/raft in production). An official publisher, and the only Server
+ * whose official Apps are auto-installed.
+ */
+function parsePrimaryOfficialServerId(): string | null {
+  const value = process.env.RAFT_OFFICIAL_PUBLISHER_SERVER_ID?.trim().toLowerCase();
   return value && isUuid(value) ? value : null;
 }
 
-export function getProtectedOfficialAppPolicy(): {
-  publisherServerId: string | null;
-} {
-  return {
-    publisherServerId: parseProtectedOfficialServerId(),
-  };
+/**
+ * `RAFT_OFFICIAL_PUBLISHER_SERVER_IDS`: more official publisher Servers, as
+ * comma-separated Server ids. All or nothing: an empty item or one that is
+ * not a UUID makes the whole value invalid (null), so a typo never trusts part
+ * of a list. Unset or blank is an empty list.
+ */
+export function parseOfficialPublisherServerIds(raw: string | undefined): string[] | null {
+  if (!raw?.trim()) return [];
+  // Lower case, as Server ids are stored and compared.
+  const ids = raw.split(",").map((item) => item.trim().toLowerCase());
+  return ids.every((id) => isUuid(id)) ? ids : null;
 }
 
-export function isOfficialAppSourceServerId(sourceServerId: string): boolean {
-  const officialServerId = parseProtectedOfficialServerId();
-  return officialServerId !== null && sourceServerId === officialServerId;
+let extraPublishersMemo: { raw: string | undefined; ids: readonly string[] } | null = null;
+
+/** The extra list, parsed (and an invalid value warned about) once per raw value. */
+function extraOfficialPublisherServerIds(): readonly string[] {
+  const raw = process.env.RAFT_OFFICIAL_PUBLISHER_SERVER_IDS;
+  if (extraPublishersMemo && extraPublishersMemo.raw === raw) return extraPublishersMemo.ids;
+  const ids = parseOfficialPublisherServerIds(raw);
+  if (!ids) {
+    console.warn("[official-apps] RAFT_OFFICIAL_PUBLISHER_SERVER_IDS is not a comma-separated list of Server ids; it adds no official publishers");
+  }
+  extraPublishersMemo = { raw, ids: ids ?? [] };
+  return extraPublishersMemo.ids;
+}
+
+/**
+ * Servers whose Apps can be official: the primary root (if valid) and the
+ * extra list (if valid). Auto-install never reads this; it follows only the
+ * primary root.
+ */
+function officialPublisherServerIds(): ReadonlySet<string> {
+  const primary = parsePrimaryOfficialServerId();
+  return new Set([...(primary ? [primary] : []), ...extraOfficialPublisherServerIds()]);
 }
 
 export async function projectOfficialAppDiscovery(input: {
@@ -58,40 +90,52 @@ export async function projectOfficialAppDiscoveryMany(inputs: ReadonlyArray<{
   clientKey: string;
 }>, dbOrTx: DbExecutor = getDb()): Promise<Map<string, { official: boolean; purpose: string }>> {
   const result = new Map(inputs.map((input) => [input.clientId, { official: false, purpose: "" }]));
-  const trustRoot = parseProtectedOfficialServerId();
-  const candidates = trustRoot ? inputs.filter((input) => input.sourceServerId === trustRoot) : [];
-  if (!trustRoot || candidates.length === 0) return result;
+  const publishers = officialPublisherServerIds();
+  const candidates = inputs.filter((input) => publishers.has(input.sourceServerId));
+  if (candidates.length === 0) return result;
   const entries = await dbOrTx.select({
     clientId: officialAppRegistry.oauthClientId,
     clientKey: officialAppRegistry.clientKey,
+    publisherServerId: officialAppRegistry.publisherServerId,
     purpose: officialAppRegistry.purpose,
   })
     .from(officialAppRegistry)
     .where(and(
       inArray(officialAppRegistry.oauthClientId, candidates.map((input) => input.clientId)),
-      eq(officialAppRegistry.publisherServerId, trustRoot),
+      inArray(officialAppRegistry.publisherServerId, [...publishers]),
       eq(officialAppRegistry.status, "approved"),
     ));
   for (const input of candidates) {
-    const entry = entries.find((row) => row.clientId === input.clientId && row.clientKey === input.clientKey);
+    // Published from the App's own Server, not just from some official publisher.
+    const entry = entries.find((row) => row.clientId === input.clientId
+      && row.clientKey === input.clientKey
+      && row.publisherServerId === input.sourceServerId);
     if (entry) result.set(input.clientId, { official: true, purpose: entry.purpose ?? "" });
   }
   return result;
 }
 
 /**
- * Whether an OAuth client is an approved official (first-party) app: listed in
- * the official app registry with a matching identity, published from the
- * protected official server. Authority for official-only grants such as
+ * Whether an OAuth client is an approved official (first-party) app: an
+ * approved official app registry entry with the client's identity, published
+ * from the client's own Server, and that Server is an official publisher
+ * (officialPublisherServerIds). Authority for official-only grants such as
  * `agent_reminder_write`.
+ *
+ * `forShare` (inside a transaction): also takes FOR SHARE on the registry row,
+ * so a registry update (Feature Flag Admin takes FOR UPDATE on the same row)
+ * waits for the caller's commit, or the caller sees its result. The
+ * interactive link card execute decides eligibility this way at commit (RFC
+ * 076 §3.3).
  */
 export async function isApprovedOfficialAppClient(
   clientId: string,
   dbOrTx: DbExecutor = getDb(),
+  options: { forShare?: boolean } = {},
 ): Promise<boolean> {
-  const trustRoot = parseProtectedOfficialServerId();
-  if (!trustRoot) return false;
-  const [entry] = await dbOrTx.select({ id: officialAppRegistry.oauthClientId })
+  const publishers = officialPublisherServerIds();
+  if (publishers.size === 0) return false;
+  const query = dbOrTx.select({ id: officialAppRegistry.oauthClientId })
     .from(officialAppRegistry)
     .innerJoin(oauthClients, and(
       eq(oauthClients.id, officialAppRegistry.oauthClientId),
@@ -100,10 +144,11 @@ export async function isApprovedOfficialAppClient(
     ))
     .where(and(
       eq(officialAppRegistry.oauthClientId, clientId),
-      eq(officialAppRegistry.publisherServerId, trustRoot),
+      inArray(officialAppRegistry.publisherServerId, [...publishers]),
       eq(officialAppRegistry.status, "approved"),
     ))
     .limit(1);
+  const [entry] = options.forShare ? await query.for("share", { of: officialAppRegistry }) : await query;
   return Boolean(entry);
 }
 
@@ -178,8 +223,11 @@ async function writeTransition(tx: DbExecutor, input: {
   return true;
 }
 
+// Auto-install follows only the primary root: an approved App from an extra
+// official publisher (RAFT_OFFICIAL_PUBLISHER_SERVER_IDS) is never installed
+// by default.
 async function loadInstallableOfficialClient(tx: DbExecutor, clientKey: string, options?: { requireAutoInstall?: boolean }) {
-  const trustRoot = parseProtectedOfficialServerId();
+  const trustRoot = parsePrimaryOfficialServerId();
   if (!trustRoot) return null;
   const [client] = await tx.select({
     id: oauthClients.id,
@@ -187,6 +235,8 @@ async function loadInstallableOfficialClient(tx: DbExecutor, clientKey: string, 
     sourceServerId: oauthClients.serverId,
     outboundCurrentRevisionId: oauthClients.outboundCurrentRevisionId,
     outboundCurrentGroups: oauthClients.outboundCurrentGroups,
+    allowedScopes: oauthClients.allowedScopes,
+    enableBot: oauthClients.enableBot,
     registryRevision: officialAppRegistry.revision,
     registryAutoInstall: officialAppRegistry.autoInstall,
   }).from(oauthClients).innerJoin(
@@ -197,7 +247,7 @@ async function loadInstallableOfficialClient(tx: DbExecutor, clientKey: string, 
       eq(officialAppRegistry.publisherServerId, oauthClients.serverId),
     ),
   ).where(and(
-    eq(oauthClients.clientId, clientKey),
+    oauthClientHasKey(clientKey),
     eq(oauthClients.serverId, trustRoot),
     eq(oauthClients.appType, "third_party_global"),
     oauthClientIsUserManagedPredicate(),
@@ -269,6 +319,8 @@ async function autoInstallOneInTransaction(input: {
     approvedRequestRevisionId: writePointClient.outboundCurrentRevisionId,
     approvedGroups: writePointClient.outboundCurrentGroups,
     grantRevision: writePointClient.outboundCurrentRevisionId ? 1 : 0,
+    approvedScopes: effectiveAllowedOAuthScopes(writePointClient.allowedScopes),
+    ...await currentTextConfirmation(tx, client.id),
   }).onConflictDoNothing().returning({ id: oauthClientInstalls.id });
   if (!installation) return { status: "already_installed", clientId: client.id };
   const transitioned = await writeTransition(tx, {
@@ -290,6 +342,26 @@ async function autoInstallOneInTransaction(input: {
     await tx.delete(oauthClientInstalls).where(eq(oauthClientInstalls.id, installation.id));
     return { status: "suppressed", clientId: client.id };
   }
+  // Installed by the system: its server's admins may have it to review.
+  announcePermissionUpdatesChanged([input.serverId]);
+  // An official App that ships a bot comes with it (artin, #proj-apps
+  // 793ee49f): the system adds the bot as it installs the App. In a
+  // savepoint, as a person's install: a taken handle rolls back only the
+  // grant, and the App stays installed with its bot undecided, for an admin
+  // to add later from Settings > Apps.
+  if (writePointClient.enableBot) {
+    const { AppBotHandleConflictError, setInstallationBotGrant } = await import("./appBotIdentityService");
+    try {
+      await tx.transaction((savepoint) => setInstallationBotGrant(savepoint, {
+        install: { id: installation.id, clientId: client.id, serverId: input.serverId },
+        action: "grant",
+        actor: { type: "system" },
+      }));
+    } catch (err) {
+      if (!(err instanceof AppBotHandleConflictError)) throw err;
+      console.warn("[official-app-auto-install] bot handle taken; installed with the bot undecided", { serverId: input.serverId, clientId: client.id });
+    }
+  }
   return { status: "installed", clientId: client.id, installationId: installation.id };
 }
 
@@ -297,7 +369,7 @@ export async function autoInstallOfficialAppsForProvisionedServer(
   serverId: string,
   tx: DbExecutor,
 ): Promise<OfficialAutoInstallResult[]> {
-  const trustRoot = parseProtectedOfficialServerId();
+  const trustRoot = parsePrimaryOfficialServerId();
   if (!trustRoot) return [];
   const defaults = await tx.select({ clientKey: officialAppRegistry.clientKey })
     .from(officialAppRegistry)

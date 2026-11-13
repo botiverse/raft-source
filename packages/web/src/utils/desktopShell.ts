@@ -1,11 +1,11 @@
 // True only inside the Raft Desktop (electron) shell, which the desktop preload
 // marks with a `raftDesktop` global. Used for desktop-aware defaults in shared
-// web code (kept dependency-free so stores can import it without cycles).
+// web code (kept free of app imports so stores can use it without cycles).
+
+import { getDesktopBridge } from "./desktopBridge";
+
 export function isElectronDesktopShell(): boolean {
-  return (
-    typeof window !== "undefined" &&
-    (window as { raftDesktop?: { isDesktop?: boolean } }).raftDesktop?.isDesktop === true
-  );
+  return typeof window !== "undefined" && getDesktopBridge()?.isDesktop === true;
 }
 
 // The frontend origin compiled into the desktop build. The Electron frontend
@@ -40,4 +40,24 @@ export function shareableWebOrigin(
 ): string {
   if (desktop && compiledOrigin) return compiledOrigin;
   return pageOrigin;
+}
+
+/**
+ * The current page as a browser-openable URL: shareableWebOrigin() plus this
+ * page's path, query and hash. For URLs handed to the server or a third party
+ * that a browser will later open (Stripe checkout success/cancel and portal
+ * return URLs, copy-this-page links). On desktop the page URL is app://raft/...,
+ * which no browser can open and the server's redirect check rejects
+ * ("Invalid redirect URL" on Upgrade to Pro); the same path on the frontend
+ * origin is the web page the user lands on. On the Web it is the page URL.
+ */
+export function shareableWebUrl(
+  desktop: boolean = isElectronDesktopShell(),
+  pageHref: string = (typeof window !== "undefined" && window.location?.href) || "",
+  compiledOrigin: string = compiledFrontendOrigin,
+): string {
+  if (!pageHref) return pageHref;
+  const page = new URL(pageHref);
+  const origin = shareableWebOrigin(desktop, page.origin, compiledOrigin);
+  return origin === page.origin ? pageHref : `${origin}${page.pathname}${page.search}${page.hash}`;
 }

@@ -3,6 +3,7 @@ import { appSourceTraceAttrs } from "@botiverse/raft-shared/src/appRuntimeTrace"
 import type { BuiltInMachineMessageContext } from "../../registry.manifest";
 import { isReminderCatchup } from "./fireTiming";
 import * as reminderService from "./service";
+import { notifyReminderFired } from "./firedNotification";
 import { selectReminderDueProtocol } from "./protocolTransition";
 import { errorClassOf } from "../../tracing/semanticTrace";
 
@@ -111,6 +112,8 @@ export async function handleLegacyReminderFireAttempt(
         catchup: result.catchup,
         nextFireAt: result.nextFireAt?.toISOString() ?? null,
       });
+      // Notify the human who scheduled it (every device, through the outbox). Never blocks the receipt.
+      void notifyReminderFired({ reminderId: fired.id, firedAt: fired.firedAt?.toISOString() ?? message.firedAtClient });
     }
     const woke = result.fired
       ? await reminderService.deliverLegacyReminderWake(context.host, fired, {

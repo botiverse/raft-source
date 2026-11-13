@@ -8,6 +8,7 @@ import {
   applyRuntimeFormV2Change,
   initialRuntimeFormV2Values,
   isRuntimeFormV2FieldVisible,
+  runtimeFormV2AdvancedStartsOpen,
   runtimeFormV2Choices,
   runtimeFormV2SourceStatus,
   runtimeFormV2Submission,
@@ -99,6 +100,30 @@ test("edit starts from the agent's stored values, and dependents follow the stor
   assert.equal(values.apiKey, "", "writeOnly fields start blank (blank on edit keeps the stored secret)");
 });
 
+test("edit: a stored null or absent derived effort stays Default; the model's default applies on create and after a model change", () => {
+  const efforts: RuntimeFormV2Sources = {
+    model: {
+      sourceId: "model", kind: "select", pointer: "/model",
+      options: [
+        { value: "k2", label: "K2", supportedReasoningEfforts: ["low", "medium", "high"], defaultReasoningEffort: "medium" },
+        { value: "k3", label: "K3", supportedReasoningEfforts: ["low", "high"], defaultReasoningEffort: "high" },
+      ],
+      defaultValue: "k2",
+    },
+  };
+  assert.equal(initialRuntimeFormV2Values(kimi, efforts).reasoningEffort, "medium", "create starts at the model's default");
+  for (const stored of [{ reasoningEffort: null }, {}]) {
+    const edit = { ...kimi, values: { model: "k2", envVars: {}, ...stored } };
+    const values = initialRuntimeFormV2Values(edit, efforts);
+    assert.equal(values.reasoningEffort, "", "Default (the runtime's), not the model's default");
+    assert.deepEqual(validateRuntimeFormV2(edit, efforts, values, { editing: true }), {});
+    assert.equal(runtimeFormV2Submission(edit, values, efforts).reasoningEffort, null, "saved untouched: still Default");
+    assert.equal(applyRuntimeFormV2Change(edit, efforts, values, "model", "k3").reasoningEffort, "high", "a model change takes the new model's default");
+  }
+  const explicit = { ...kimi, values: { model: "k2", reasoningEffort: "low", envVars: {} } };
+  assert.equal(initialRuntimeFormV2Values(explicit, efforts).reasoningEffort, "low", "a stored effort is kept");
+});
+
 test("on edit a blank secret is valid (it keeps the stored value); on create it is required", () => {
   const values = initialRuntimeFormV2Values(pi, piSources);
   assert.deepEqual(validateRuntimeFormV2(pi, piSources, values), { apiKey: "required" });
@@ -168,7 +193,7 @@ test("choice.labels: choices label > option label > raw value; description only 
   // The served Codex/Grok effort labels come from choices.
   const codexValues = initialRuntimeFormV2Values(codex, codexSources("codex.option-source.live.json"));
   const codexEffort = runtimeFormV2Choices(field(codex, "reasoningEffort"), codexSources("codex.option-source.live.json"), codexValues);
-  assert.deepEqual(codexEffort?.kind === "select" && codexEffort.options.map((option) => option.label), ["Low", "Medium", "High", "Extra High", "Max", "Ultra"]);
+  assert.deepEqual(codexEffort?.kind === "select" && codexEffort.options.map((option) => option.label), ["Low", "Medium", "High", "Extra high", "Max", "Ultra"]);
   assert.equal(codexValues.reasoningEffort, "medium");
 });
 
@@ -202,11 +227,31 @@ test("option_source.status: fallback informs; unavailable blocks a required fiel
   assert.equal(runtimeFormV2SourceStatus(field(codex, "model"), oddReason)?.reason, "brand_new_reason");
 });
 
+test("option_source.status: a stale list (state stale) is a usable fallback that names when it was fetched", () => {
+  const fallback = codexSources("codex.option-source.fallback.json");
+  const stale = {
+    model: { ...fallback.model!, reason: "probe_timeout", retryable: true, state: "stale", fetchedAt: "2026-10-21T08:00:00.000Z" },
+  } as RuntimeFormV2Sources;
+  assert.deepEqual(runtimeFormV2SourceStatus(field(codex, "model"), stale), {
+    status: "fallback",
+    reason: "probe_timeout",
+    retryable: true,
+    stale: { fetchedAt: "2026-10-21T08:00:00.000Z" },
+  });
+  assert.deepEqual(validateRuntimeFormV2(codex, stale, initialRuntimeFormV2Values(codex, stale)), {}, "a stale list is usable");
+  // Any other state, an unknown one included, adds nothing.
+  for (const state of ["ok", "unavailable", "brand_new_state"]) {
+    const other = { model: { ...stale.model!, state } } as RuntimeFormV2Sources;
+    assert.equal("stale" in (runtimeFormV2SourceStatus(field(codex, "model"), other) ?? {}), false, state);
+  }
+});
+
 // Batch 3b: Claude's provider fields, against the shared fixtures the server sends.
 const claude = parseRuntimeFormV2(fixture("claude.form.json"))!;
 const claudeEdit = parseRuntimeFormV2(fixture("claude.edit.json"))!;
 const claudeSources: RuntimeFormV2Sources = {
   provider: fixture("claude.option-source.provider.json") as RuntimeFormV2Sources[string],
+  authType: fixture("claude.option-source.auth-type.json") as RuntimeFormV2Sources[string],
   model: fixture("claude.option-source.fallback.json") as RuntimeFormV2Sources[string],
 };
 
@@ -214,13 +259,14 @@ test("claude: API URL and key show only for a Custom provider and are not submit
   const values = initialRuntimeFormV2Values(claude, claudeSources);
   assert.equal(values.provider, "default");
   assert.equal(values.model, "opus");
-  for (const key of ["apiUrl", "apiKey"]) assert.equal(isRuntimeFormV2FieldVisible(field(claude, key), values, claudeSources), false, key);
+  for (const key of ["apiUrl", "authType", "apiKey"]) assert.equal(isRuntimeFormV2FieldVisible(field(claude, key), values, claudeSources), false, key);
   assert.deepEqual(validateRuntimeFormV2(claude, claudeSources, values), {});
   const submitted = runtimeFormV2Submission(claude, { ...values, apiUrl: "https://stale.example.test", apiKey: "stale" }, claudeSources);
   assert.equal("apiUrl" in submitted || "apiKey" in submitted, false);
 
   const custom = applyRuntimeFormV2Change(claude, claudeSources, values, "provider", "custom");
-  for (const key of ["apiUrl", "apiKey"]) assert.equal(isRuntimeFormV2FieldVisible(field(claude, key), custom, claudeSources), true, key);
+  for (const key of ["apiUrl", "authType", "apiKey"]) assert.equal(isRuntimeFormV2FieldVisible(field(claude, key), custom, claudeSources), true, key);
+  assert.equal(custom.authType, "api_key", "API key is the default");
   assert.equal(field(claude, "apiKey").kind, "secret");
   assert.deepEqual(validateRuntimeFormV2(claude, claudeSources, { ...custom, apiUrl: "gw.example.test" }), { apiUrl: "invalid_url" });
 });
@@ -391,4 +437,57 @@ test("review: saved gateway retains its endpoint and image-capability fields", (
     assert.equal(isRuntimeFormV2FieldVisible(field(conn, key), { ...values, providerId: "openai-compatible" }, sources), true);
     assert.equal(isRuntimeFormV2FieldVisible(field(conn, key), values, sources), true, `${key} must stay visible as a disabled managed field`);
   }
+});
+
+// task #10: a dependent value with listed options that also takes a typed id
+// (Built-in OpenRouter) is a combobox with its default, not a bare text box;
+// one with no options (a gateway) stays free text.
+test("dependent_select: listed options + custom allowed is a combobox keeping its default; no options stays free text", () => {
+  const form = parseRuntimeFormV2(fixture("builtin.form.json"))!;
+  const model = field(form, "model");
+  const sources: RuntimeFormV2Sources = {
+    provider: {
+      sourceId: "provider",
+      kind: "select",
+      pointer: "/providerId",
+      options: [{ value: "openrouter", label: "OpenRouter" }, { value: "openai-compatible", label: "OpenAI-compatible" }],
+      defaultValue: "openrouter",
+    },
+    model: {
+      sourceId: "model",
+      kind: "dependent_select",
+      pointer: "/model",
+      dependsOn: "/providerId",
+      optionsByValue: {
+        openrouter: [{ value: "openrouter/vendor/listed", label: "Listed" }, { value: "openrouter/vendor/other", label: "Other" }],
+        "openai-compatible": [],
+      },
+      defaultValueByValue: { openrouter: "openrouter/vendor/listed" },
+      customValueAllowedByValue: { openrouter: true, "openai-compatible": true },
+    },
+  };
+  const choices = runtimeFormV2Choices(model, sources, { providerId: "openrouter" });
+  assert.equal(choices?.kind, "select");
+  assert.equal(choices?.kind === "select" && choices.allowCustom, true);
+  assert.equal(choices?.kind === "select" && choices.options.length, 2);
+  const values = initialRuntimeFormV2Values(form, sources);
+  assert.equal(values.providerId, "openrouter");
+  assert.equal(values.model, "openrouter/vendor/listed", "the listed default is kept");
+  assert.equal(validateRuntimeFormV2(form, sources, { ...values, model: "vendor/typed" }).model, undefined, "a typed id is valid");
+  assert.deepEqual(runtimeFormV2Choices(model, sources, { providerId: "openai-compatible" }), { kind: "free_text" });
+});
+
+test("Advanced starts open when any visible advanced field has a non-blank value", () => {
+  const builtin = parseRuntimeFormV2(fixture("builtin.form.json"))!;
+  const builtinEdit = parseRuntimeFormV2(fixture("builtin.edit.json"))!;
+  const gateway = { providerId: "openai-compatible", contextWindow: "", maxOutputTokens: "", envVars: {}, loadLocalPlugins: false };
+  assert.equal(runtimeFormV2AdvancedStartsOpen(builtin, gateway), false, "all advanced fields empty");
+  assert.equal(runtimeFormV2AdvancedStartsOpen(builtin, { ...gateway, contextWindow: "  " }), false, "blank is not a value");
+  assert.equal(runtimeFormV2AdvancedStartsOpen(builtin, { ...gateway, contextWindow: "128000" }), true);
+  assert.equal(runtimeFormV2AdvancedStartsOpen(builtin, { ...gateway, envVars: { A: "1" } }), true, "envVars with a value opens it too");
+  assert.equal(runtimeFormV2AdvancedStartsOpen(builtin, { ...gateway, loadLocalPlugins: true }), true);
+  assert.equal(runtimeFormV2AdvancedStartsOpen(builtin, { ...gateway, providerId: "anthropic", maxOutputTokens: "8192" }), false, "hidden field");
+  // The edit fixture stores envVars: Advanced opens on edit.
+  assert.equal(runtimeFormV2AdvancedStartsOpen(builtinEdit, builtinEdit.values as Record<string, never>), true);
+  assert.equal(runtimeFormV2AdvancedStartsOpen(builtin, { ...gateway, model: "m" }), false, "main fields never open it");
 });

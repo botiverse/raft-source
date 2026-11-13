@@ -7,7 +7,8 @@ import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { MockAgent, setGlobalDispatcher, getGlobalDispatcher } from "undici";
 
-import { AuthClient, ServersClient } from "./apiClient";
+import { AuthClient, DeviceAuthClient, ServersClient } from "./apiClient";
+import { COMPUTER_VERSION } from "./version";
 import { ComputerLifecycleClient } from "./localLifecycleIntents";
 
 const SERVER_ID = "11111111-1111-4111-8111-111111111111";
@@ -305,4 +306,21 @@ test("ServersClient.list: unknown string role remains visible for forward compat
       });
     },
   );
+});
+
+test("device authorize names the Computer and its version in the User-Agent", async () => {
+  let userAgent: string | undefined;
+  const server = createServer((req, res) => {
+    userAgent = req.headers["user-agent"];
+    res.writeHead(201, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ deviceCode: "d", userCode: "U", verificationUri: "https://example.test/device", expiresIn: 600, interval: 5 }));
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address() as AddressInfo;
+  try {
+    await new DeviceAuthClient(`http://127.0.0.1:${address.port}`).authorize("raft-computer");
+    assert.equal(userAgent, `raft-computer/${COMPUTER_VERSION}`);
+  } finally {
+    await new Promise<void>((resolve, reject) => { server.close((error) => error ? reject(error) : resolve()); });
+  }
 });

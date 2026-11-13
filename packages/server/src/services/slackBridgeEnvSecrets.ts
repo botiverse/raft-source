@@ -1,6 +1,12 @@
-import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
-
+import {
+  aes256KeyFromBase64Env,
+  exactAes256Key,
+  isWellFormedAesGcmEnvelope,
+  openAesGcmEnvelope,
+  sealAesGcmEnvelope,
+} from "./aesGcmEnvelope";
 import type { ExternalInboundWorkerDependencies } from "./externalInboundWorkerService";
+import { SlackNormalizedEnvelopeInvalid } from "./slackNormalizedPayloadError";
 import type {
   ExternalInboundPayloadAad,
   ExternalIngressPayloadSealer,
@@ -21,13 +27,6 @@ export const SLACK_BRIDGE_OAUTH_CLIENT_SECRET_REF = "env:SLACK_BRIDGE_OAUTH_CLIE
 export const SLACK_BRIDGE_CREDENTIAL_KEY_ID = "env:SLACK_BRIDGE_CREDENTIAL_ENCRYPTION_KEY:v1";
 export const SLACK_BRIDGE_PAYLOAD_KEY_ID = "env:SLACK_BRIDGE_PAYLOAD_ENCRYPTION_KEY:v1";
 
-interface EncryptedEnvelope {
-  schema: string;
-  iv: string;
-  authTag: string;
-  ciphertext: string;
-}
-
 export interface SlackBridgeEnvSecretAuthority {
   registrationId: string;
   environment: "test" | "production";
@@ -37,6 +36,8 @@ export interface SlackBridgeEnvSecretAuthority {
   oauthClientSecret: string;
   credentialEncryptionKey: Buffer;
   payloadEncryptionKey: Buffer;
+  payloadKeyId?: string;
+  payloadDecryptionKeys?: ReadonlyMap<string, Buffer>;
 }
 
 export interface SlackBridgeCredentialCipher {
@@ -50,23 +51,6 @@ export interface SlackBridgeCredentialCipher {
     envelopeKeyId: string;
     aadVersion: number;
   }): { accessToken: string; tokenType: "bot" } | null;
-}
-
-function canonicalJson(value: unknown): string {
-  if (value === null || typeof value === "string" || typeof value === "boolean") {
-    return JSON.stringify(value);
-  }
-  if (typeof value === "number") {
-    if (!Number.isFinite(value)) throw new Error("Slack Bridge AAD contains a non-finite number");
-    return JSON.stringify(value);
-  }
-  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
-  if (typeof value === "object") {
-    const entries = Object.entries(value as Record<string, unknown>)
-      .sort(([left], [right]) => left.localeCompare(right));
-    return `{${entries.map(([key, item]) => `${JSON.stringify(key)}:${canonicalJson(item)}`).join(",")}}`;
-  }
-  throw new Error("Slack Bridge AAD contains an unsupported value");
 }
 
 function nonEmpty(value: unknown, max = 2_048): value is string {
@@ -83,22 +67,42 @@ function boundedText(value: unknown, max: number): value is string {
     && Buffer.byteLength(value, "utf8") <= max;
 }
 
+const LABEL = "Slack Bridge";
+
 function exactKey(value: Buffer, name: string): Buffer {
-  if (!Buffer.isBuffer(value) || value.byteLength !== 32) {
-    throw new Error(`Slack Bridge ${name} must be a 32-byte key`);
-  }
-  return Buffer.from(value);
+  return exactAes256Key(value, LABEL, name);
 }
 
 export function slackBridgeKeyFromEnv(value: string | undefined, name: string): Buffer {
-  const raw = value?.trim();
-  if (!raw) throw new Error(`Slack Bridge requires ${name}`);
-  const key = Buffer.from(raw, "base64");
-  if (
-    key.byteLength !== 32
-    || key.toString("base64").replace(/=+$/u, "") !== raw.replace(/=+$/u, "")
-  ) throw new Error(`Slack Bridge ${name} must be a base64-encoded 32-byte key`);
-  return key;
+  return aes256KeyFromBase64Env(value, LABEL, name);
+}
+
+/** The legacy env key always retains its original id for old ciphertext. */
+export function slackBridgePayloadKeyringFromEnv(legacyKey: Buffer, activeId?: string, raw?: string): {
+  activePayloadKey: Buffer; activePayloadKeyId: string; payloadReadKeys: ReadonlyMap<string, Buffer>;
+} {
+  const payloadReadKeys = new Map<string, Buffer>([[SLACK_BRIDGE_PAYLOAD_KEY_ID, exactKey(legacyKey, "payload encryption key")]]);
+  if (raw?.trim()) {
+    let parsed: unknown;
+    try { parsed = JSON.parse(raw); } catch { throw new Error("Slack Bridge payload keyring is invalid"); }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) || Object.keys(parsed).length > 15) {
+      throw new Error("Slack Bridge payload keyring is invalid");
+    }
+    for (const [id, value] of Object.entries(parsed)) {
+      if (!/^[A-Za-z0-9:_./-]{1,320}$/u.test(id) || typeof value !== "string") throw new Error("Slack Bridge payload keyring is invalid");
+      const key = slackBridgeKeyFromEnv(value, "payload decryption key");
+      const previous = payloadReadKeys.get(id);
+      if (previous && !previous.equals(key)) throw new Error("Slack Bridge payload keyring is invalid");
+      payloadReadKeys.set(id, key);
+    }
+  }
+  if (activeId !== undefined && !/^[A-Za-z0-9:_./-]{1,320}$/u.test(activeId)) {
+    throw new Error("Slack Bridge active payload key id is invalid");
+  }
+  const activePayloadKeyId = activeId ?? SLACK_BRIDGE_PAYLOAD_KEY_ID;
+  const activePayloadKey = payloadReadKeys.get(activePayloadKeyId);
+  if (!activePayloadKey) throw new Error("Slack Bridge active payload key is unavailable");
+  return { activePayloadKey, activePayloadKeyId, payloadReadKeys };
 }
 
 function encrypt(input: {
@@ -107,33 +111,13 @@ function encrypt(input: {
   aad: unknown;
   key: Buffer;
 }): string {
-  if (!input.plaintext || Buffer.byteLength(input.plaintext, "utf8") > MAX_PAYLOAD_BYTES) {
-    throw new Error("Slack Bridge plaintext is invalid");
-  }
-  const iv = randomBytes(12);
-  const cipher = createCipheriv("aes-256-gcm", input.key, iv);
-  cipher.setAAD(Buffer.from(canonicalJson(input.aad), "utf8"));
-  const ciphertext = Buffer.concat([cipher.update(input.plaintext, "utf8"), cipher.final()]);
-  const envelope: EncryptedEnvelope = {
-    schema: input.schema,
-    iv: iv.toString("base64url"),
-    authTag: cipher.getAuthTag().toString("base64url"),
-    ciphertext: ciphertext.toString("base64url"),
-  };
-  return `env-aes-256-gcm:v1:${Buffer.from(JSON.stringify(envelope), "utf8").toString("base64url")}`;
+  return sealAesGcmEnvelope({ ...input, label: LABEL, maxPlaintextBytes: MAX_PAYLOAD_BYTES });
 }
 
-function strictBytes(value: unknown, expectedBytes?: number): Buffer | null {
-  if (typeof value !== "string" || !value || !/^[A-Za-z0-9_-]+$/u.test(value)) return null;
-  try {
-    const decoded = Buffer.from(value, "base64url");
-    if (decoded.toString("base64url") !== value || (expectedBytes && decoded.byteLength !== expectedBytes)) {
-      return null;
-    }
-    return decoded;
-  } catch {
-    return null;
-  }
+/** Only malformed framing is definite single-event corruption; a valid frame
+ * that fails authentication may instead mean the runtime key has changed. */
+function validNormalizedPayloadEnvelope(value: string): boolean {
+  return isWellFormedAesGcmEnvelope(value, PAYLOAD_SCHEMA, MAX_PAYLOAD_BYTES);
 }
 
 function decrypt(input: {
@@ -143,38 +127,7 @@ function decrypt(input: {
   key: Buffer;
   maxBytes: number;
 }): string | null {
-  const prefix = "env-aes-256-gcm:v1:";
-  if (!input.envelope.startsWith(prefix)) return null;
-  const encoded = strictBytes(input.envelope.slice(prefix.length));
-  if (!encoded || encoded.byteLength > input.maxBytes * 2) return null;
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(encoded.toString("utf8"));
-  } catch {
-    return null;
-  }
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
-  const body = parsed as Record<string, unknown>;
-  if (
-    Object.keys(body).sort().join(",") !== "authTag,ciphertext,iv,schema"
-    || body.schema !== input.schema
-  ) return null;
-  const iv = strictBytes(body.iv, 12);
-  const authTag = strictBytes(body.authTag, 16);
-  const ciphertext = strictBytes(body.ciphertext);
-  if (!iv || !authTag || !ciphertext || ciphertext.byteLength === 0 || ciphertext.byteLength > input.maxBytes) {
-    return null;
-  }
-  try {
-    const decipher = createDecipheriv("aes-256-gcm", input.key, iv);
-    decipher.setAAD(Buffer.from(canonicalJson(input.aad), "utf8"));
-    decipher.setAuthTag(authTag);
-    const plaintext = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
-    if (plaintext.byteLength === 0 || plaintext.byteLength > input.maxBytes) return null;
-    return plaintext.toString("utf8");
-  } catch {
-    return null;
-  }
+  return openAesGcmEnvelope({ ...input, label: LABEL });
 }
 
 function credentialAad(input: {
@@ -196,7 +149,7 @@ function credentialAad(input: {
 function validPayloadAad(value: ExternalInboundPayloadAad): boolean {
   return value.purpose === "external-inbound-normalized-event"
     && value.aadVersion === 1
-    && (value.schemaVersion === 1 || value.schemaVersion === 2 || value.schemaVersion === 3)
+    && (value.schemaVersion === 1 || value.schemaVersion === 2 || value.schemaVersion === 3 || value.schemaVersion === 4)
     && value.provider === "slack"
     && (value.environment === "test" || value.environment === "production")
     && nonEmpty(value.appRegistrationId)
@@ -294,6 +247,16 @@ export function createSlackBridgeEnvSecretBackends(
   ) throw new Error("Slack Bridge env secret authority is invalid");
   const credentialCipher = createSlackBridgeEnvCredentialCipher({ key: authority.credentialEncryptionKey });
   const payloadKey = exactKey(authority.payloadEncryptionKey, "payload encryption key");
+  const payloadKeyId = authority.payloadKeyId ?? SLACK_BRIDGE_PAYLOAD_KEY_ID;
+  if (!/^[A-Za-z0-9:_./-]{1,320}$/u.test(payloadKeyId)) throw new Error("Slack Bridge payload key id is invalid");
+  const payloadReadKeys = new Map<string, Buffer>([[payloadKeyId, payloadKey]]);
+  if ((authority.payloadDecryptionKeys?.size ?? 0) > 16) throw new Error("Slack Bridge payload keyring is invalid");
+  for (const [id, candidate] of authority.payloadDecryptionKeys ?? []) {
+    if (!/^[A-Za-z0-9:_./-]{1,320}$/u.test(id)) throw new Error("Slack Bridge payload keyring is invalid");
+    const key = exactKey(candidate, "payload decryption key");
+    if (id === payloadKeyId && !key.equals(payloadKey)) throw new Error("Slack Bridge payload keyring is invalid");
+    payloadReadKeys.set(id, key);
+  }
   const appSecrets: SlackOAuthAppSecretLeaseProvider = {
     async lease(request) {
       if (
@@ -337,22 +300,24 @@ export function createSlackBridgeEnvSecretBackends(
           aad: request.aad,
           key: payloadKey,
         }),
-        envelopeKeyId: SLACK_BRIDGE_PAYLOAD_KEY_ID,
+        envelopeKeyId: payloadKeyId,
         aadVersion: 1,
       };
     },
   };
   const decryptNormalizedPayload: ExternalInboundWorkerDependencies["decryptNormalizedPayload"] = async (request) => {
+    const readKey = payloadReadKeys.get(request.envelopeKeyId);
     if (
-      request.envelopeKeyId !== SLACK_BRIDGE_PAYLOAD_KEY_ID
+      !readKey
       || !validPayloadAad(request.aad as ExternalInboundPayloadAad)
       || request.signal?.aborted
     ) throw new Error("Slack inbound payload cannot be decrypted");
+    if (!validNormalizedPayloadEnvelope(request.ciphertext)) throw new SlackNormalizedEnvelopeInvalid();
     const plaintext = decrypt({
       envelope: request.ciphertext,
       schema: PAYLOAD_SCHEMA,
       aad: request.aad,
-      key: payloadKey,
+      key: readKey,
       maxBytes: MAX_PAYLOAD_BYTES,
     });
     if (!plaintext) throw new Error("Slack inbound payload envelope is invalid");

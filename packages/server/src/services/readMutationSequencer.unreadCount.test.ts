@@ -1,3 +1,4 @@
+import { fillJointMembersFromChannelHumans } from "../test/jointMemberFill";
 import { dbTest as test } from "../test/integration/dbTest";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
@@ -89,6 +90,7 @@ test("row read on a joint thread counts the canonical thread's messages", async 
   await db.insert(jointChannelServers).values({
     jointChannelId: jointParent.id, serverId: server.id, localChannelId: localParent.id, role: "host", status: "active",
   });
+  await fillJointMembersFromChannelHumans();
   const [parentMessage] = await db.insert(messages).values({
     channelId: canonicalParent.id, senderType: "user", senderId: other.id, content: "parent", seq: 10,
   }).returning();
@@ -105,6 +107,7 @@ test("row read on a joint thread counts the canonical thread's messages", async 
   await db.insert(jointChannelServers).values({
     jointChannelId: jointThread.id, serverId: server.id, localChannelId: localThread.id, role: "host", status: "active",
   });
+  await fillJointMembersFromChannelHumans();
   await db.insert(messages).values([
     { channelId: canonicalThread.id, senderType: "user", senderId: other.id, content: "r1", seq: 11 },
     { channelId: canonicalThread.id, senderType: "user", senderId: other.id, content: "r2", seq: 12 },

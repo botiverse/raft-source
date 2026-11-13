@@ -1,28 +1,31 @@
 {
   "name": "raft",
   "version": "0.1.0",
-  "license": "FSL-1.1-ALv2",
+  "license": "LicenseRef-Raft-License",
   "private": true,
   "type": "module",
   "engines": {
     "node": ">=24.0.0"
   },
-  "packageManager": "pnpm@12.11.2",
+  "packageManager": "pnpm@12.15.0",
   "scripts": {
     "check:misc": "bash scripts/check-misc.sh",
     "perf:boot-profile": "node scripts/perf/boot-profile.cjs",
     "test:raftdev": "vitest run scripts/dev/",
     "test:computer-browser-upgrade": "vitest run scripts/e2e/computer-browser-upgrade/run-upgrade-e2e.test.mjs",
-    "test:source-available": "vitest run scripts/source-available/export-snapshot.test.mjs scripts/source-available/release.test.mjs",
-    "typecheck:raftdev": "tsc -p tsconfig.raftdev.json",
-    "test:web": "node packages/web/scripts/run-vitest-tests.mjs",
-    "test:web:dom": "node packages/web/scripts/run-vitest-tests.mjs --dom",
-    "test:ax-book": "vitest run scripts/visualize/ax-surfaces/book.test.mjs"
+    "test:source-available": "vitest run scripts/source-available/export-snapshot.test.ts scripts/source-available/release.test.ts",
+    "typecheck:raftdev": "tsrs -p tsconfig.raftdev.json",
+    "typecheck:raftdev:tsc": "tsc -p tsconfig.raftdev.json",
+    "test:web": "node --import @oxc-node/core/register packages/web/scripts/run-vitest-tests.ts",
+    "test:web:dom": "node --import @oxc-node/core/register packages/web/scripts/run-vitest-tests.ts --dom",
+    "test:ax-book": "vitest run scripts/visualize/ax-surfaces/book.test.ts"
   },
   "devDependencies": {
     "@oxc-node/core": "^0.1.6",
+    "libpg-query": "17.8.2",
     "marked": "^18.0.7",
     "playwright": "^1.64.0",
+    "tsrs": "0.18.0-ts7.1.0-dev.20260929",
     "typescript": "6.0.3",
     "vitest": "^5.0.3"
   }

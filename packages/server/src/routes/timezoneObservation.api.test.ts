@@ -7,7 +7,7 @@ import { eq } from "drizzle-orm";
 import { getDb } from "../db/index";
 import { users } from "../db/schema";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 async function seedUser(email: string) {
   const [user] = await getDb().insert(users).values({

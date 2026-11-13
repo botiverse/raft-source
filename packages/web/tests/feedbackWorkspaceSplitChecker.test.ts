@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { validateFeedbackWorkspaceSplit } from "../scripts/check-feedback-workspace-split.mjs";
+import { validateFeedbackWorkspaceSplit } from "../scripts/check-feedback-workspace-split";
 
 const manifest = {
   "src/main.tsx": { file: "assets/main.js", isEntry: true, imports: ["_vendor.js"], css: ["assets/main.css"] },

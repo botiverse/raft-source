@@ -1,5 +1,5 @@
 // Sidebar unread (GET /channels/unread, GET /servers/unread-summary) reads ONE
-// source: rw_conversation_unread_v3. Here the global test setup answers it from
+// source: rw_conversation_unread_v4. Here the global test setup answers it from
 // the Postgres reference (src/test/conversationUnreadReference.ts); the last cases
 // take the reference away to pin the RisingWave read itself and its no-fallback
 // contract.
@@ -109,7 +109,9 @@ test("without RisingWave (and no test reference) the readers fail; there is no P
   await assert.rejects(getSidebarUnreadSummaryCounts([server.id], owner.id), /RisingWave is not configured/);
 });
 
-test("the RisingWave read: one round trip, receiver-keyed, public arm only for the summary; rows merge per channel", async () => {
+// The summary also reads the person's marked-unread conversations from Postgres
+// (loadMarkedUnreadScopes): the db fixture gives it a database, with none marked.
+test("the RisingWave read: one round trip, receiver-keyed, public arm only for the summary; rows merge per channel", async ({ db: _db }) => {
   const userId = "11111111-1111-4111-8111-111111111111";
   const serverId = "22222222-2222-4222-8222-222222222222";
   const joined = "33333333-3333-4333-8333-333333333333";
@@ -137,10 +139,11 @@ test("the RisingWave read: one round trip, receiver-keyed, public arm only for t
 
   const summary = await getUnreadSummary(serverId, userId);
   assert.equal(reads.length, 1, "counts, mentions, read state and hasNew come from one RisingWave read");
-  assert.match(reads[0].text, /FROM rw_conversation_unread_v3/);
+  assert.match(reads[0].text, /FROM rw_conversation_unread_v4/);
   assert.match(reads[0].text, /receiver_type = 'user'/);
   assert.match(reads[0].text, /FROM rw_channels AS c/);
   assert.match(reads[0].text, /rw_target_latest_v4/);
+  assert.match(reads[0].text, /rw_target_eligible_v1/);
   assert.match(reads[0].text, /rw_user_channel_read_cursors_v2/);
   assert.deepEqual(reads[0].values, [userId, serverId]);
   assert.deepEqual(summary[joined], {
@@ -166,9 +169,9 @@ test("the RisingWave read: one round trip, receiver-keyed, public arm only for t
   answer = [{ server_id: serverId, unread_count: "7" }];
   const other = "55555555-5555-4555-8555-555555555555";
   assert.deepEqual(await getSidebarUnreadSummaryCounts([serverId, other], userId), { [serverId]: 7, [other]: 0 });
-  assert.match(reads[0].text, /FROM rw_conversation_unread_v3/);
+  assert.match(reads[0].text, /FROM rw_conversation_unread_v4/);
   assert.match(reads[0].text, /AND subscribed/);
-  assert.match(reads[0].text, /kind <> 'thread'/);
+  assert.match(reads[0].text, /kind NOT IN \('thread', 'task'\)/);
   assert.deepEqual(reads[0].values, [userId, [serverId, other]]);
 });
 

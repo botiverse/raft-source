@@ -5,6 +5,7 @@
   },
   "files": [
     "src/attachmentUploadApi.consumer.ts",
+    "src/readStateApi.consumer.ts",
     "src/generated/openapi.ts"
   ],
   "include": []

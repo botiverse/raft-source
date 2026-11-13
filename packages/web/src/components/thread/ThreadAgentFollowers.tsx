@@ -1,5 +1,5 @@
-import { Button, Popover, PopoverContent, PopoverTrigger, toast } from "@botiverse/raft-ui";
-import { AlertCircle } from "lucide-react";
+import { Button, Popover, PopoverContent, PopoverTrigger, ScrollArea, toast } from "@botiverse/raft-ui";
+import { TriangleAlert } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { useIntl } from "react-intl";
 import { getSocket } from "../../api/socket";
@@ -8,6 +8,7 @@ import {
   useThreadAgentFollowerStore,
 } from "../../store/threadAgentFollowerStore";
 import { useServerStore } from "../../store/serverStore";
+import { FaceStack } from "../layout/FaceStack";
 import AvatarSlot from "../ui/AvatarSlot";
 import Tooltip from "../ui/Tooltip";
 import { ThreadAgentFollowerRow } from "./ThreadAgentFollowerRow";
@@ -19,9 +20,23 @@ function stopEventPropagation(event: { stopPropagation: () => void }) {
 export default function ThreadAgentFollowers({
   threadChannelId,
   variant,
+  subject = "thread",
+  folded,
+  onOpenProfile,
 }: {
   threadChannelId: string;
   variant: "card" | "header";
+  /**
+   * The head too narrow for its button (#189 rule 6): no button; ⋯'s Following Agents opens the list (`open`), shown
+   * under `anchor` (the head).
+   */
+  folded?: { open: boolean; onOpenChange: (open: boolean) => void; anchor: HTMLElement | null };
+  /** "task": a task's own conversation (the task dialog) — the removal
+   *  notice names the task, not a thread. */
+  subject?: "thread" | "task";
+  /** The task dialog: a follower's profile opens beside its conversation
+   *  (the app's profile panel is behind the dialog). */
+  onOpenProfile?: (kind: "agent" | "human", id: string) => void;
 }) {
   const { formatMessage } = useIntl();
   const roster = useThreadAgentFollowerStore((state) => state.rosters[threadChannelId]);
@@ -31,6 +46,11 @@ export default function ThreadAgentFollowers({
   const currentServerId = useServerStore((state) => state.current?.id);
   const [open, setOpen] = useState(false);
   const [removingId, setRemovingId] = useState<string | null>(null);
+  const openFollowerProfile = useCallback((agentId: string) => {
+    if (folded) folded.onOpenChange(false);
+    else setOpen(false);
+    onOpenProfile?.("agent", agentId);
+  }, [folded, onOpenProfile]);
 
   useEffect(() => {
     requestThreadAgentFollowers(threadChannelId);
@@ -58,15 +78,17 @@ export default function ThreadAgentFollowers({
     try {
       const undoToken = await remove(threadChannelId, agentId);
       if (!undoToken) return;
-      toast.success(
-        formatMessage({ id: "thread.followers.removed" }, { agent: agentLabel }),
+      const removedToastId = toast.success(
+        formatMessage({ id: subject === "task" ? "task.followers.removed" : "thread.followers.removed" }, { agent: agentLabel }),
         {
-          timeout: 5_000,
           dismissible: false,
           contentClassName: "thread-follower-removal-toast",
           action: {
             label: formatMessage({ id: "thread.followers.undo" }),
             onClick: () => {
+              // Undo answers the notice: it goes, and "Restored …" replaces it
+              // rather than stacking beside it.
+              toast.dismiss(removedToastId);
               void restore(threadChannelId, agentId, undoToken).then((restored) => {
                 if (restored) toast.success(formatMessage({ id: "thread.followers.restored" }, { agent: agentLabel }));
               });
@@ -79,7 +101,7 @@ export default function ThreadAgentFollowers({
     } finally {
       setRemovingId(null);
     }
-  }, [formatMessage, remove, restore, threadChannelId]);
+  }, [formatMessage, remove, restore, subject, threadChannelId]);
 
   const retryLoad = useCallback(() => {
     void load([threadChannelId], true);
@@ -92,7 +114,8 @@ export default function ThreadAgentFollowers({
   if (roster.loaded && agents.length === 0) return null;
 
   return (
-    <Popover open={open} onOpenChange={setOpen}>
+    <Popover open={folded ? folded.open : open} onOpenChange={folded ? folded.onOpenChange : setOpen}>
+      {folded ? null : (
       <Tooltip content={label}>
       <PopoverTrigger
         render={(
@@ -100,51 +123,53 @@ export default function ThreadAgentFollowers({
             type="button"
             onClick={stopEventPropagation}
             onPointerDown={stopEventPropagation}
-            size={variant === "header" ? "sm" : undefined}
+            size={variant === "header" ? "md" : undefined}
             variant="ghost"
             className={variant === "header"
-              ? "gap-1.5 px-1.5"
-              : "h-[22px] gap-1 rounded-chip bg-fill-muted px-1.5 text-foreground-muted"}
+              // In a head, with a mouse, the box of the bar buttons beside it (28 at r6), not a 34px Button.
+              ? "gap-1.5 px-1.5 md:pointer-fine:h-(--bar-button-size) md:pointer-fine:rounded-(--bar-button-radius)"
+              : "h-[22px] gap-1 rounded-chip bg-fill-muted px-1.5 text-foreground-muted md:pointer-fine:h-5 md:pointer-fine:rounded-sticker"}
             aria-label={label}
             data-testid={`thread-followers-${variant}-trigger`}
           >
-            <span className="flex -space-x-[5px]" aria-hidden="true">
-              {roster.error ? (
-                <AlertCircle size={variant === "header" ? 14 : 12} />
-              ) : agents.slice(0, 3).map((agent) => (
-                <AvatarSlot key={agent.id} context={variant === "header" ? "sidebar-list" : "preview-mini"} type="agent" agentAvatarUrl={agent.avatarUrl} />
-              ))}
-            </span>
+            {/* The shared stack (raft-ui AvatarGroup as a span, inside the button): 19px faces in the header, 14px on
+                the chip, 5px over each other at both sizes; still: a follower's face has no entrance. */}
+            {roster.error ? (
+              <TriangleAlert size={variant === "header" ? 14 : 12} aria-hidden="true" />
+            ) : (
+              <FaceStack still testId={`thread-followers-${variant}-faces`}>
+                {agents.slice(0, 3).map((agent) => (
+                  <AvatarSlot key={agent.id} context={variant === "header" ? "sidebar-list" : "preview-mini"} type="agent" agentAvatarUrl={agent.avatarUrl} />
+                ))}
+              </FaceStack>
+            )}
             {roster.error ? null : <span className="font-mono text-mono-meta">{agents.length}</span>}
           </Button>
         )}
       />
       </Tooltip>
+      )}
       <PopoverContent
+        anchor={folded?.anchor ?? undefined}
         side="bottom"
         align="end"
         sideOffset={6}
-        // The trigger lives in a thread header that reflows when a profile
-        // panel opens or the pane is resized. raft-ui disables anchor
-        // tracking by default, which would leave this popover stranded at
-        // the trigger's old coordinates.
-        disableAnchorTracking={false}
         className="w-72 p-0"
         data-testid="thread-followers-popover"
       >
         <div className="flex min-h-11 items-center border-b border-line-seam px-4 text-headline">
           {formatMessage({ id: "thread.followers.title" })}
         </div>
-        <div className="max-h-72 overflow-y-auto p-2">
+        <ScrollArea tabIndex={-1} className="max-h-72" contentClassName="p-2">
           {roster?.loading && !roster.loaded ? (
             <div className="px-2 py-4 text-center text-callout text-foreground-hint" data-testid="thread-followers-loading">
               {formatMessage({ id: "thread.followers.loading" })}
             </div>
           ) : roster?.error ? (
             <div className="flex flex-col items-center gap-2 px-2 py-4 text-center text-callout text-foreground-muted" data-testid="thread-followers-error">
-              <AlertCircle size={18} />
+              <TriangleAlert size={18} />
               {formatMessage({ id: "thread.followers.loadFailed" })}
-              <Button variant="outline" size="sm" type="button" onClick={retryLoad}>
+              <Button variant="outline" size="md" type="button" onClick={retryLoad}>
                 {formatMessage({ id: "thread.followers.retry" })}
               </Button>
             </div>
@@ -160,9 +185,10 @@ export default function ThreadAgentFollowers({
               removing={removingId === agent.id}
               currentServerId={currentServerId}
               onRemove={handleRemove}
+              onOpenProfile={onOpenProfile ? openFollowerProfile : undefined}
             />
           ))}
-        </div>
+        </ScrollArea>
       </PopoverContent>
     </Popover>
   );

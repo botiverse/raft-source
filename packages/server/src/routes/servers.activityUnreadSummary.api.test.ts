@@ -26,7 +26,7 @@ import { addHuman, createChannel } from "../services/channelService";
 import { createMessage } from "../services/messageService";
 import { computeActivityUnreadCounts } from "../services/activityUnreadSummaryService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 const FIXTURE_PATH = join(
   dirname(fileURLToPath(import.meta.url)),
@@ -177,7 +177,7 @@ test("unread-summary activityUnreadCount: wire semantics, invariant, divergence,
 
   // Mute orthogonality (DoD #5): muting server A must not change the count.
   await db.update(serverMembers)
-    .set({ serverPushMuted: true })
+    .set({ serverPushMode: "none" })
     .where(and(eq(serverMembers.serverId, serverA.id), eq(serverMembers.userId, member.id)));
   const mutedSummary = await fetchSummary(app.baseUrl, token);
   const mutedEntryA = mutedSummary.find((entry) => entry.serverId === serverA.id);

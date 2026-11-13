@@ -1,0 +1,32 @@
+-- A Markdown version's excerpt as data (#proj-workspace:#220; apps/artifacts/
+-- excerptBlocks.ts, shared artifactExcerptBlocks.ts): a card draws the entry's
+-- first blocks with their hierarchy instead of plain words. A block list, never
+-- HTML or Markdown, beside `excerpt`, which stays for older clients and the
+-- Android App. A forward migration whether or not 0636 and 0637 have reached
+-- production: staging has run them.
+--
+-- Catalog-only on app_artifacts.versions, as 0636: a nullable column with no
+-- default rewrites nothing, and the CHECK is added NOT VALID, so nothing is
+-- scanned under the ACCESS EXCLUSIVE lock. Cards and pushes read this table, so
+-- give up after 2 s (the deploy retries) rather than queue them behind a long
+-- transaction.
+--
+-- This one file is the whole change. The CHECK stays NOT VALID for good, and no
+-- VALIDATE CONSTRAINT follows, unlike 0636's: that is deliberate, not a second
+-- step forgotten. The column is new in this file, so it held no non-null value
+-- before the constraint and there is nothing to validate. Every value it will
+-- ever hold comes from an insert or update after this, which the CHECK binds.
+-- pg_constraint.convalidated is false here, and that is correct.
+--
+-- The CHECK: an array, at most 12,288 bytes as text (twice what is made,
+-- ARTIFACT_EXCERPT_BLOCKS_MAX_BYTES, loose on purpose as versions_excerpt_length
+-- is), and never without `excerpt`, so what clears the text clears these.
+--
+-- No backfill: the words are in object storage, which a migration can't read,
+-- and nothing depends on it: a version without blocks draws its `excerpt`.
+--
+-- Rolling deploy: an older replica names its own columns, never this one, and
+-- every excerpt it writes has no blocks, which cards read as `excerpt` alone.
+SET LOCAL lock_timeout = '2s';--> statement-breakpoint
+ALTER TABLE "app_artifacts"."versions" ADD COLUMN "excerpt_blocks" jsonb;--> statement-breakpoint
+ALTER TABLE "app_artifacts"."versions" ADD CONSTRAINT "versions_excerpt_blocks_shape" CHECK ("app_artifacts"."versions"."excerpt_blocks" IS NULL OR ("app_artifacts"."versions"."excerpt" IS NOT NULL AND jsonb_typeof("app_artifacts"."versions"."excerpt_blocks") = 'array' AND octet_length("app_artifacts"."versions"."excerpt_blocks"::text) <= 12288)) NOT VALID;

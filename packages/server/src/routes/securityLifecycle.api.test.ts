@@ -9,6 +9,7 @@ import WebSocket from "ws";
 import { createApiTest } from "../test/integration/apiTest";
 import { signAccessToken, verifyActiveAccessToken } from "../middleware/auth";
 import * as session from "../services/sessionService";
+import { accessTokenForTest, signInForTest } from "../test/integration/credentials";
 import * as userService from "../services/userService";
 import * as serverService from "../services/serverService";
 import * as searchService from "../services/searchService";
@@ -17,6 +18,7 @@ import { ensureFamilyRevokeCapability } from "../services/pushService";
 import { serializeErrorForLog } from "../tracing/safeErrorLog";
 import { channels, featureFlagRules, passwordResets, serverMembers, sessionFamilies, users } from "../db/schema";
 import { SERVER_GUEST_FEATURE_FLAG_KEY } from "@botiverse/raft-shared";
+import { seedBoundGuest } from "../test/guestFixture";
 function disconnected(ws: WebSocket) {
   return new Promise<void>((resolve, reject) => {
     if (ws.readyState === WebSocket.CLOSED) {
@@ -27,7 +29,7 @@ function disconnected(ws: WebSocket) {
     ws.once("close", () => { clearTimeout(timeout); resolve(); });
   });
 }
-const test = createApiTest({ onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest();
 function deferred() { let resolve!: () => void; const promise = new Promise<void>(r => { resolve = r; }); return { promise, resolve }; }
 async function post(base: string, path: string, body: object) {
   return fetch(`${base}${path}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
@@ -64,7 +66,7 @@ async function openSocket(base: string, token: string, serverId: string) {
 test("family-revoke API closes the revoked family socket", async ({ app, seed }) => {
   const human = await seed.human();
   const server = await seed.server({ owner: human });
-  const auth = await session.createSession(human.id);
+  const auth = await signInForTest(human.id);
   const token = signAccessToken(human.id, auth.familyId);
   const cap = await ensureFamilyRevokeCapability({ userId: human.id, familyId: auth.familyId });
   assert.ok(cap);
@@ -84,7 +86,7 @@ test("family-revoke API closes the revoked family socket", async ({ app, seed })
 });
 test("legacy predecessor logout revokes the successor family", async ({ app, seed }) => {
   const human = await seed.human();
-  const first = await session.createSession(human.id);
+  const first = await signInForTest(human.id);
   const next = await session.refreshSession(first.refreshToken);
   assert.ok(next);
   const logout = await post(app.baseUrl, "/api/auth/logout", { refreshToken: first.refreshToken });
@@ -97,7 +99,7 @@ test("legacy predecessor logout revokes the successor family", async ({ app, see
 });
 test("logout lineage survives multiple rotations and a lost process replay cache", async ({ app, seed }) => {
   const human = await seed.human();
-  const first = await session.createSession(human.id);
+  const first = await signInForTest(human.id);
   const second = await session.refreshSession(first.refreshToken);
   assert.ok(second);
   const third = await session.refreshSession(second.refreshToken);
@@ -109,28 +111,26 @@ test("logout lineage survives multiple rotations and a lost process replay cache
   assert.equal(await verifyActiveAccessToken(signAccessToken(human.id, third.familyId)), null);
   assert.equal(await session.refreshSession(third.refreshToken), null);
 });
-for (const mode of ["guest-policy", "role-demotion", "public-to-private"] as const) {
+for (const mode of ["guest-removal", "public-to-private"] as const) {
   test(`${mode} revokes both HTTP access and old socket subscription`, async ({ app, seed, db, http }) => {
     const owner = await seed.human();
     const reader = await seed.human();
     const server = await seed.server({ owner, members: [reader] });
-    await db.insert(featureFlagRules).values({ flagKey: SERVER_GUEST_FEATURE_FLAG_KEY, stage: "server", priority: 0, decision: "allow", values: [server.id] });
     const channel = await seed.channel({ server, members: [owner] });
-    if (mode === "guest-policy") {
-      await db.update(serverMembers).set({ role: "guest" }).where(and(eq(serverMembers.serverId, server.id), eq(serverMembers.userId, reader.id)));
-      await db.update(channels).set({ guestVisible: true }).where(eq(channels.id, channel.id));
-    }
-    const { ws, packets } = await openSocket(app.baseUrl, signAccessToken(reader.id), server.id);
+    // A Guest reads its one channel while it is a member (#wg-rbac:#15).
+    if (mode === "guest-removal") await seedBoundGuest({ serverId: server.id, userId: reader.id, channelId: channel.id }, db);
+    const { ws, packets } = await openSocket(app.baseUrl, await accessTokenForTest(reader.id), server.id);
     try {
       app.io.to(`channel:${channel.id}`).emit("audit:control", "visible-before-change");
       await waitPacket(ws, packets, "visible-before-change");
-      const path = mode === "role-demotion" ? `/api/servers/${server.id}/members/${reader.id}` : `/api/channels/${channel.id}`;
-      const body = mode === "role-demotion" ? { role: "guest" } : mode === "guest-policy" ? { guestVisible: false, guestJoinable: false } : { visibility: "private" };
       const closed = disconnected(ws);
-      const changed = await http.as(owner, server).request(path, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+      const changed = mode === "guest-removal"
+        ? await http.as(owner, server).request(`/api/channels/${channel.id}/members/user/${reader.id}`, { method: "DELETE" })
+        : await http.as(owner, server).request(`/api/channels/${channel.id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ visibility: "private" }) });
       assert.equal(changed.status, 200, await changed.text());
       const denied = await http.as(reader, server).get(`/api/channels/${channel.id}`);
-      assert.equal(denied.status, 404);
+      // A Guest removed from its channel leaves the server with it (#wg-rbac:#15).
+      assert.equal(denied.status, mode === "guest-removal" ? 403 : 404);
       const sent = await http.as(owner, server).request("/api/messages", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ channelId: channel.id, content: `synthetic-private-after-${mode}` }) });
       assert.equal(sent.status, 200, await sent.text());
       await closed;
@@ -141,24 +141,45 @@ for (const mode of ["guest-policy", "role-demotion", "public-to-private"] as con
     }
   });
 }
+test("role-demotion to Guest is refused: HTTP access and the socket subscription stay", async ({ app, seed, http }) => {
+  const owner = await seed.human();
+  const reader = await seed.human();
+  const server = await seed.server({ owner, members: [reader] });
+  const channel = await seed.channel({ server, members: [owner] });
+  const { ws, packets } = await openSocket(app.baseUrl, await accessTokenForTest(reader.id), server.id);
+  try {
+    // Guests are invited to a channel (#wg-rbac:#15), never made from members.
+    const changed = await http.as(owner, server).request(`/api/servers/${server.id}/members/${reader.id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ role: "guest" }) });
+    assert.equal(changed.status, 403, await changed.text());
+    assert.equal((await http.as(reader, server).get(`/api/channels/${channel.id}`)).status, 200);
+    app.io.to(`channel:${channel.id}`).emit("audit:control", "visible-after-refused-demotion");
+    await waitPacket(ws, packets, "visible-after-refused-demotion");
+    assert.equal(ws.readyState, WebSocket.OPEN);
+  }
+  finally {
+    ws.terminate();
+  }
+});
 test("blast radius: channel visibility changes evict only sockets that lose access", async ({ app, seed, db, http }) => {
   const owner = await seed.human();
   const member = await seed.human();
   const outsider = await seed.human();
   const guest = await seed.human();
   const server = await seed.server({ owner, members: [member, outsider, guest] });
-  await db.insert(featureFlagRules).values({ flagKey: SERVER_GUEST_FEATURE_FLAG_KEY, stage: "server", priority: 0, decision: "allow", values: [server.id] });
-  await db.update(serverMembers).set({ role: "guest" }).where(and(eq(serverMembers.serverId, server.id), eq(serverMembers.userId, guest.id)));
+  await db.insert(featureFlagRules).values({ flagKey: SERVER_GUEST_FEATURE_FLAG_KEY, stage: "server", priority: 0, decision: "allow", values: [server.id],
+    });
+  // A Guest bound to its own channel (#wg-rbac:#15); hiding another channel from guests still evicts every guest connection.
+  await seedBoundGuest({ serverId: server.id, userId: guest.id }, db);
   const channel = await seed.channel({ server, members: [owner, member] });
   await db.update(channels).set({ guestVisible: true }).where(eq(channels.id, channel.id));
-  const memberSocket = await openSocket(app.baseUrl, signAccessToken(member.id), server.id);
-  const guestSocket = await openSocket(app.baseUrl, signAccessToken(guest.id), server.id);
-  const outsiderSocket = await openSocket(app.baseUrl, signAccessToken(outsider.id), server.id);
+  const memberSocket = await openSocket(app.baseUrl, await accessTokenForTest(member.id), server.id);
+  const guestSocket = await openSocket(app.baseUrl, await accessTokenForTest(guest.id), server.id);
+  const outsiderSocket = await openSocket(app.baseUrl, await accessTokenForTest(outsider.id), server.id);
   const headers = { "Content-Type": "application/json" };
   try {
     // Hiding the channel from guests closes guest connections only.
     const guestClosed = disconnected(guestSocket.ws);
-    const hidden = await http.as(owner, server).request(`/api/channels/${channel.id}`, { method: "PATCH", headers, body: JSON.stringify({ guestVisible: false, guestJoinable: false }) });
+    const hidden = await http.as(owner, server).request(`/api/channels/${channel.id}`, { method: "PATCH", headers, body: JSON.stringify({ guestVisible: false }) });
     assert.equal(hidden.status, 200, await hidden.text());
     await guestClosed;
     app.io.to(`user:${member.id}`).emit("audit:control", "member-survives-guest-policy");
@@ -215,7 +236,7 @@ test("reset token can complete only one concurrent password change", async ({ ap
 for (const mode of ["reset", "change"] as const) {
   test(`old-password login in flight cannot create a family after ${mode}`, async ({ app, seed, db, http }) => {
     const human = await seed.human();
-    const existing = await session.createSession(human.id);
+    const existing = await signInForTest(human.id);
     const token = "synthetic-reset-login-race";
     await db.insert(passwordResets).values({ userId: human.id, tokenHash: createHash("sha256").update(token).digest("hex"), expiresAt: new Date(Date.now() + 60000) });
     const original = argon2.verify.bind(argon2);
@@ -282,9 +303,10 @@ test("guest cannot receive hidden channel metadata via channel:updated", async (
   const owner = await seed.human();
   const guest = await seed.human();
   const server = await seed.server({ owner, members: [guest] });
-  await db.update(serverMembers).set({ role: "guest" }).where(and(eq(serverMembers.serverId, server.id), eq(serverMembers.userId, guest.id)));
-  await db.insert(featureFlagRules).values({ flagKey: SERVER_GUEST_FEATURE_FLAG_KEY, stage: "server", priority: 0, decision: "allow", values: [server.id] });
-  const { ws, packets } = await openSocket(app.baseUrl, signAccessToken(guest.id), server.id);
+  // The guest's one channel (#wg-rbac:#15): its metadata reaches the guest.
+  const visible = await seed.channel({ server, members: [owner] });
+  await seedBoundGuest({ serverId: server.id, userId: guest.id, channelId: visible.id }, db);
+  const { ws, packets } = await openSocket(app.baseUrl, await accessTokenForTest(guest.id), server.id);
   try {
     const created = await http.as(owner, server).request("/api/channels", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: "hidden-audit-channel", description: "synthetic-confidential-channel-description", visibility: "public" }) });
     assert.equal(created.status, 200);
@@ -296,8 +318,6 @@ test("guest cannot receive hidden channel metadata via channel:updated", async (
       body: JSON.stringify({ description: "synthetic-confidential-edited-description" }),
     });
     assert.equal(edited.status, 200);
-    const visible = await seed.channel({ server, members: [owner] });
-    await db.update(channels).set({ guestVisible: true }).where(eq(channels.id, visible.id));
     const permitted = await http.as(owner, server).request(`/api/channels/${visible.id}`, {
       method: "PATCH", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ description: "synthetic-permitted-guest-description" }),
@@ -317,7 +337,7 @@ test("regression: existing member socket receives tasks in a newly created publi
   const owner = await seed.human();
   const member = await seed.human();
   const server = await seed.server({ owner, members: [member] });
-  const { ws, packets } = await openSocket(app.baseUrl, signAccessToken(member.id), server.id);
+  const { ws, packets } = await openSocket(app.baseUrl, await accessTokenForTest(member.id), server.id);
   try {
     const created = await http.as(owner, server).request("/api/channels", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: "audit-new-public", visibility: "public" }) });
     assert.equal(created.status, 200);
@@ -361,7 +381,7 @@ test("regression: another user's logout preserves a valid in-flight handshake", 
   const owner = await seed.human();
   const other = await seed.human();
   const server = await seed.server({ owner });
-  const live = await session.createSession(owner.id);
+  const live = await signInForTest(owner.id);
   const token = signAccessToken(owner.id, live.familyId);
   const original = serverService.isMember;
   const spy = vi.spyOn(serverService, "isMember").mockImplementationOnce(async (...args) => {
@@ -422,10 +442,9 @@ for (const mode of ["visibility", "role", "logout", "capability"] as const) {
     const reader = await seed.human();
     const server = await seed.server({ owner, members: [reader] });
     const channel = await seed.channel({ server, members: [owner] });
-    await db.insert(featureFlagRules).values({
-      flagKey: SERVER_GUEST_FEATURE_FLAG_KEY, stage: "server", priority: 0, decision: "allow", values: [server.id],
-    });
-    const live = await session.createSession(reader.id);
+    // A role change revokes sockets: an admin demoted to member (no one becomes a Guest, #wg-rbac:#15).
+    if (mode === "role") await db.update(serverMembers).set({ role: "admin" }).where(and(eq(serverMembers.serverId, server.id), eq(serverMembers.userId, reader.id)));
+    const live = await signInForTest(reader.id);
     const capability = await ensureFamilyRevokeCapability({ userId: reader.id, familyId: live.familyId });
     const { ws } = await openSocket(app.baseUrl, signAccessToken(reader.id, live.familyId), server.id);
     const request = () => {
@@ -436,7 +455,7 @@ for (const mode of ["visibility", "role", "logout", "capability"] as const) {
       return http.as(owner, server).request(mode === "role"
         ? `/api/servers/${server.id}/members/${reader.id}` : `/api/channels/${channel.id}`, {
         method: "PATCH", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(mode === "role" ? { role: "guest" } : { visibility: "private" }),
+        body: JSON.stringify(mode === "role" ? { role: "member" } : { visibility: "private" }),
       });
     };
     const unavailable = vi.spyOn(revocations, "revokeSocketAccess")
@@ -461,8 +480,8 @@ test("member removal tells the removed connection before closing it, and only th
   const server = await seed.server({ owner, members: [removed] });
   const otherServer = await seed.server({ owner, members: [removed] });
   const channel = await seed.channel({ server, members: [owner, removed] });
-  const removedSocket = await openSocket(app.baseUrl, signAccessToken(removed.id), server.id);
-  const otherSocket = await openSocket(app.baseUrl, signAccessToken(removed.id), otherServer.id);
+  const removedSocket = await openSocket(app.baseUrl, await accessTokenForTest(removed.id), server.id);
+  const otherSocket = await openSocket(app.baseUrl, await accessTokenForTest(removed.id), otherServer.id);
   try {
     const removedClosed = disconnected(removedSocket.ws);
     const otherClosed = disconnected(otherSocket.ws);

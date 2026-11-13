@@ -6,6 +6,7 @@ import {
   errorClassOf,
   MACHINE_DUPLICATE_CONNECTION_CLOSE_CODE,
   MACHINE_DUPLICATE_CONNECTION_CLOSE_REASON,
+  MACHINE_DUPLICATE_CONNECTION_HELD_CLOSE_REASON,
   noopTracer,
   setClockTimeout,
   type ActiveSpan,
@@ -191,16 +192,15 @@ export function classifyDaemonConnectionTraceEvent(
   return null;
 }
 
+/** One held `agent:credential:restored` per agent and reason. */
+function credentialRestoredKey(msg: Extract<MachineToServerMessage, { type: "agent:credential:restored" }>): string {
+  return `${msg.agentId}\u0000${msg.reason}`;
+}
+
 type OutboundDisposition =
   | { kind: "queued"; agentId: string; launchIdPresent: boolean; replacedPending: boolean }
   | { kind: "superseded" }
   | { kind: "not_replayable" };
-
-function sequenceOf(msg: MachineToServerMessage): number {
-  return (msg.type === "agent:activity" || msg.type === "agent:status") && typeof msg.clientSeq === "number"
-    ? msg.clientSeq
-    : Number.NEGATIVE_INFINITY;
-}
 
 export class DaemonConnection {
   /** task #1268: server capabilities read from the current connection's 101 response header. */
@@ -252,6 +252,27 @@ export class DaemonConnection {
    */
   private readonly pendingStatusByAgent = new Map<string, Extract<MachineToServerMessage, { type: "agent:status" }>>();
   /**
+   * The latest `agent:runtime:ready` per agent (newest launch wins), held
+   * and replayed like status: the server ends a failed-start streak only on
+   * it, and the failures it would end are themselves replayed.
+   */
+  private readonly pendingRuntimeReadyByAgent = new Map<string, Extract<MachineToServerMessage, { type: "agent:runtime:ready" }>>();
+  /**
+   * Reconciler step 4b: `agent:credential:restored` per agent and reason
+   * (latest kept), held and replayed in order with that agent's status and
+   * activity: the server lifts a wake block on it, and the runtime error that
+   * set the block may itself be held or replayed.
+   */
+  private readonly pendingCredentialRestored = new Map<string, Extract<MachineToServerMessage, { type: "agent:credential:restored" }>>();
+  /**
+   * When each held frame was queued. A readiness frame has no client
+   * sequence, and a daemon-local restart or a per-turn continuation reuses
+   * the launch, so ready(L) and a failure of L can come in either order; the
+   * replay keeps the order they were produced.
+   */
+  private readonly enqueueOrder = new WeakMap<MachineToServerMessage, number>();
+  private nextEnqueueOrder = 0;
+  /**
    * RFC 069 §8: the socket this daemon has sent `ready` on. The server learns
    * the connection's daemon instance id and capabilities from `ready`; before
    * that it takes a status frame as unsequenced and lets activity drive agent
@@ -279,6 +300,8 @@ export class DaemonConnection {
     this.shouldConnect = false;
     this.pendingActivityByAgent.clear();
     this.pendingStatusByAgent.clear();
+    this.pendingRuntimeReadyByAgent.clear();
+    this.pendingCredentialRestored.clear();
     this.pendingSessionInvalidationByAgent.clear();
     this.clearWatchdog();
     this.clearConnectTimeout();
@@ -300,7 +323,7 @@ export class DaemonConnection {
   send(msg: MachineToServerMessage) {
     if (
       this.ws?.readyState === WebSocket.OPEN
-      && (msg.type === "agent:status" || msg.type === "agent:activity")
+      && (msg.type === "agent:status" || msg.type === "agent:activity" || msg.type === "agent:runtime:ready" || msg.type === "agent:credential:restored")
       && this.readySentOn !== this.ws
     ) {
       this.observeLaunchIdentity(msg);
@@ -326,6 +349,12 @@ export class DaemonConnection {
       }
       if (msg.type === "agent:status") {
         this.pendingStatusByAgent.delete(msg.agentId);
+      }
+      if (msg.type === "agent:runtime:ready") {
+        this.pendingRuntimeReadyByAgent.delete(msg.agentId);
+      }
+      if (msg.type === "agent:credential:restored") {
+        this.pendingCredentialRestored.delete(credentialRestoredKey(msg));
       }
       if (msg.type === "agent:session:invalidate") {
         this.pendingSessionInvalidationByAgent.delete(msg.agentId);
@@ -537,6 +566,12 @@ export class DaemonConnection {
           terminal: true,
         }, "error");
       }
+      // Task #374: a server that refuses a held duplicate during the handshake
+      // answers 409 instead of opening and closing with 4003; it gets the same
+      // duplicate handling, so a recently displaced loser keeps its long delay.
+      if (statusCode === 409 && reason !== null && reason === MACHINE_DUPLICATE_CONNECTION_HELD_CLOSE_REASON) {
+        this.noteDuplicateMachineClose(reason);
+      }
       this.options.onHandshakeRejected?.({ statusCode, reason });
       response.resume();
       try { ws.terminate(); } catch { /* ignore */ }
@@ -714,6 +749,7 @@ export class DaemonConnection {
   }
 
   private queueReplayableMessage(msg: MachineToServerMessage): OutboundDisposition {
+    this.enqueueOrder.set(msg, this.nextEnqueueOrder++);
     if (msg.type === "agent:session:invalidate") {
       const latestLaunchId = this.latestObservedLaunchIdByAgent.get(msg.agentId);
       if (msg.launchId && latestLaunchId && msg.launchId !== latestLaunchId) {
@@ -728,6 +764,18 @@ export class DaemonConnection {
       // server orders it against activity by the shared client sequence.
       const replacedPending = this.pendingStatusByAgent.has(msg.agentId);
       this.pendingStatusByAgent.set(msg.agentId, msg);
+      return { kind: "queued", agentId: msg.agentId, launchIdPresent: Boolean(msg.launchId), replacedPending };
+    }
+    if (msg.type === "agent:runtime:ready") {
+      // Latest wins, like status: a newer launch's readiness supersedes an older one's.
+      const replacedPending = this.pendingRuntimeReadyByAgent.has(msg.agentId);
+      this.pendingRuntimeReadyByAgent.set(msg.agentId, msg);
+      return { kind: "queued", agentId: msg.agentId, launchIdPresent: true, replacedPending };
+    }
+    if (msg.type === "agent:credential:restored") {
+      const key = credentialRestoredKey(msg);
+      const replacedPending = this.pendingCredentialRestored.has(key);
+      this.pendingCredentialRestored.set(key, msg);
       return { kind: "queued", agentId: msg.agentId, launchIdPresent: Boolean(msg.launchId), replacedPending };
     }
     if (msg.type !== "agent:activity") return { kind: "not_replayable" };
@@ -792,30 +840,50 @@ export class DaemonConnection {
   }
 
   private flushPendingActivity(ws: WebSocketLike) {
-    if (this.pendingActivityByAgent.size === 0 && this.pendingStatusByAgent.size === 0) return;
+    if (
+      this.pendingActivityByAgent.size === 0
+      && this.pendingStatusByAgent.size === 0
+      && this.pendingRuntimeReadyByAgent.size === 0
+      && this.pendingCredentialRestored.size === 0
+    ) return;
     if (this.ws !== ws || ws.readyState !== WebSocket.OPEN) return;
 
     const statuses = [...this.pendingStatusByAgent.values()];
     const activities = [...this.pendingActivityByAgent.values()];
+    const readies = [...this.pendingRuntimeReadyByAgent.values()];
+    const restored = [...this.pendingCredentialRestored.values()];
     this.pendingStatusByAgent.clear();
     this.pendingActivityByAgent.clear();
+    this.pendingRuntimeReadyByAgent.clear();
+    this.pendingCredentialRestored.clear();
     // Agents replay in the order their frames were first queued; within one
-    // agent, status and activity go out in the order they were produced (the
-    // shared client sequence), unsequenced frames first.
+    // agent, status, activity, readiness and credential restores go out in the order they were
+    // produced (queue order; for status and activity this is also the shared
+    // client sequence).
     const byAgent = new Map<string, MachineToServerMessage[]>();
-    for (const msg of [...activities, ...statuses]) {
+    for (const msg of [...activities, ...statuses, ...readies, ...restored]) {
       const agentId = (msg as { agentId: string }).agentId;
       const frames = byAgent.get(agentId) ?? [];
       frames.push(msg);
       byAgent.set(agentId, frames);
     }
-    const pending = [...byAgent.values()].flatMap((frames) => [...frames].sort((a, b) => {
-      const delta = sequenceOf(a) - sequenceOf(b);
-      return Number.isNaN(delta) ? 0 : delta;
-    }));
+    const pending = [...byAgent.values()].flatMap((frames) => [...frames].sort((a, b) =>
+      (this.enqueueOrder.get(a) ?? 0) - (this.enqueueOrder.get(b) ?? 0)));
     for (const msg of pending) {
       ws.send(JSON.stringify(msg));
       this.traceActivitySent(msg, "replay");
+    }
+    if (readies.length > 0) {
+      this.trace("daemon.connection.outbound_replayed", {
+        outbound_message_kind: "agent:runtime:ready",
+        message_count: readies.length,
+      });
+    }
+    if (restored.length > 0) {
+      this.trace("daemon.connection.outbound_replayed", {
+        outbound_message_kind: "agent:credential:restored",
+        message_count: restored.length,
+      });
     }
     if (activities.length > 0) {
       this.trace("daemon.connection.outbound_replayed", {

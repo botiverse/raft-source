@@ -42,7 +42,7 @@ import {
   markReadLatest,
 } from "../services/channelService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 async function seedUser(name: string) {
   const db = getDb();

@@ -62,7 +62,6 @@ test(
 
       app = await openTestApp(testUrl, 0, {
         humanActivityMuteFlagDefaultEnabled: true,
-        onboardingOpenerFlagDefaultEnabled: false,
         skipAuthRateLimit: true,
       });
       const scenario = await seedUserChannelsScenario();

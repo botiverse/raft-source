@@ -111,3 +111,14 @@ test("collapses generic adjacent system messages without specialized counts", ()
   assert.equal(states[0]?.kind === "summary" ? states[0].content : "", "There are 2 system messages");
   assert.equal(states[1]?.kind, "hide");
 });
+
+test("RFC 077: a delegated-send receipt never folds into a system-message group", () => {
+  const receipt = (id: string) => ({
+    id,
+    messageType: "system" as const,
+    content: 'Sent for you in #qa-x: "hi"',
+    actionMetadata: { kind: "delegated-receipt", delegatedReceipt: { messageId: `sent-${id}`, channelId: "c", deletedAt: null } },
+  });
+  const states = buildSystemMessageRenderStates([receipt("r1"), receipt("r2")], (descriptor) => String(descriptor.id));
+  assert.deepEqual(states, [null, null]);
+});

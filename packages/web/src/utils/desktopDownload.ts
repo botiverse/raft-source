@@ -1,4 +1,4 @@
-import { RUNTIME_API_BASE } from "../desktopRuntimeEnvironment";
+import { RUNTIME_API_BASE } from "../runtimeEndpoints";
 
 /**
  * Raft Desktop download targets, as `/api/desktop-download?target=` accepts
@@ -13,6 +13,12 @@ export function desktopDownloadUrl(target: DesktopTarget, apiBase: string = RUNT
 
 /** Which desktop OS this browser runs on, or null (a phone, a tablet, unknown). */
 export type DesktopOs = "mac" | "windows" | "linux";
+
+/** The OS a download target is a build for. */
+export function desktopTargetOs(target: DesktopTarget): DesktopOs {
+  if (target.startsWith("mac")) return "mac";
+  return target === "windows" ? "windows" : "linux";
+}
 
 type NavigatorLike = {
   userAgent?: string;
@@ -51,7 +57,10 @@ export function detectDesktopOs(nav: NavigatorLike | undefined): DesktopOs | nul
   if (/android|iphone|ipad|ipod|\bCrOS\b/i.test(ua)) return null;
   if (/Macintosh|Mac OS X/i.test(ua)) return (nav.maxTouchPoints ?? 0) > 1 ? null : "mac";
   if (/Windows NT/i.test(ua)) return "windows";
-  if (/Linux|X11/i.test(ua)) return linuxIfSupported(ua);
+  // A touch screen with a Linux UA and no client hints is most likely an
+  // Android tablet in desktop mode (Firefox, or Chrome without "Android"):
+  // don't hand it an AppImage. A touchscreen Linux laptop gets the list too.
+  if (/Linux|X11/i.test(ua)) return (nav.maxTouchPoints ?? 0) > 1 ? null : linuxIfSupported(ua);
   return null;
 }
 

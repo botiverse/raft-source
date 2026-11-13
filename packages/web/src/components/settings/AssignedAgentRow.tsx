@@ -1,9 +1,10 @@
 import { Badge, Button } from "@botiverse/raft-ui";
 import { useCallback, useMemo } from "react";
-import { Link2Off } from "lucide-react";
+import { Unplug } from "lucide-react";
 import { useIntl } from "react-intl";
 import type { ProviderConnectionAssignedAgent } from "@botiverse/raft-shared";
 import { formatRuntimeLabelWithStatus } from "../../utils/runtimeAvailabilityLabel";
+import { useRuntimeDeprecatedHere } from "../../hooks/useServerRuntimeCatalog";
 import AvatarListRow from "../ui/AvatarListRow";
 import AvatarSlot from "../ui/AvatarSlot";
 import StatusDot from "../ui/StatusDot";
@@ -23,11 +24,12 @@ export function AssignedAgentRow({
   onDetachAgent: (agentId: string) => Promise<void>;
 }) {
   const { formatMessage } = useIntl();
+  const deprecatedHere = useRuntimeDeprecatedHere();
   const label = agent.displayName || agent.name;
   const statusText = formatMessage({ id: `settings.providers.agentStatus.${agent.status}` });
   const subtitle = [
     formatMessage({ id: "settings.providers.assignedAgentHandle" }, { name: agent.name }),
-    formatRuntimeLabelWithStatus(agent.runtime, formatMessage),
+    formatRuntimeLabelWithStatus(agent.runtime, formatMessage, deprecatedHere(agent.runtime)),
     agent.computerName ?? formatMessage({ id: "settings.providers.assignedAgentNoComputer" }),
   ].join(" · ");
   const handleDetach = useCallback(() => {
@@ -49,7 +51,7 @@ export function AssignedAgentRow({
         // action slot, a sibling of the (absent) row button, so a
         // deleted Agent never nests one interactive target in another.
         <AvatarListRow
-          avatar={<AvatarSlot context="list-row" type="agent" agentAvatarUrl={null} className="grayscale opacity-60" />}
+          avatar={<AvatarSlot context="list-row" type="agent" agentAvatarUrl={null} className="grayscale opacity-dimmed" />}
           name={<span className="text-foreground-hint line-through">{label}</span>}
           subtitle={subtitle}
           rightContent={(
@@ -62,13 +64,13 @@ export function AssignedAgentRow({
             <Button
               type="button"
               variant="outline"
-              size="sm"
+              size="md"
               data-slot="button"
               disabled={busy}
               aria-label={formatMessage({ id: "settings.providers.assignedAgentDetach" })}
               onClick={handleDetach}
             >
-              <Link2Off size={15} />
+              <Unplug size={15} />
               {formatMessage({ id: "settings.providers.assignedAgentDetach" })}
             </Button>
             </Tooltip>
@@ -84,7 +86,7 @@ export function AssignedAgentRow({
             <>
               <StatusDot activity={agent.status === "active" ? "online" : "offline"} title={statusText} />
               <span
-                className="hidden max-w-[min(32rem,42vw)] truncate align-middle text-mono-meta font-mono text-foreground-hint sm:inline-block"
+                className="hidden max-w-[min(32rem,42cqw)] truncate align-middle text-mono-meta font-mono text-foreground-hint @md:inline-block"
               >
                 {statusText}
               </span>
@@ -92,6 +94,7 @@ export function AssignedAgentRow({
           )}
           onClick={handleOpen}
           buttonProps={openButtonProps}
+          className="@container"
         />
       )}
     </li>

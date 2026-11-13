@@ -35,7 +35,6 @@ async function withRealPgApp(run: (app: TestApp, observer: pg.Pool) => Promise<v
     await migrateRealPgTestDatabase(observer, MIGRATIONS_FOLDER);
     const app = await openTestApp(REAL_PG_URL, 0, {
       humanActivityMuteFlagDefaultEnabled: true,
-      onboardingOpenerFlagDefaultEnabled: false,
       skipAuthRateLimit: true,
     });
     try {

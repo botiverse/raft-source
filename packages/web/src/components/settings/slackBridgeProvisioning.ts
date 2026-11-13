@@ -9,6 +9,7 @@ import type {
 
 export type {
   SlackBridgeChannelPair,
+  SlackBridgeProvisioningFailureReason,
   SlackBridgePreflight,
   SlackBridgePreflightCheckId,
   SlackBridgeRawHealth,
@@ -36,7 +37,9 @@ export type SlackBridgeHealthReason =
   | "audience_unavailable"
   | "connection_failed"
   | "scope_mismatch"
-  | "verification_required";
+  | "verification_required"
+  | "delivery_blocked"
+  | "pair_waiting";
 export type SlackBridgeHealthAction =
   | "none"
   | "connect"
@@ -49,7 +52,8 @@ export type SlackBridgeHealthAction =
   | "resume_binding"
   | "repair_binding"
   | "repair_audience"
-  | "retry_verification";
+  | "retry_verification"
+  | "retry_delivery";
 
 export interface SlackBridgeHealthProjection {
   state: SlackBridgeHealthState;
@@ -129,6 +133,15 @@ export function projectSlackBridgeHealth(raw: SlackBridgeRawHealth): SlackBridge
   })) {
     return projected(raw, "unverified", "audience_unavailable", "retry_verification");
   }
+  if (raw.outboundPairBlocks?.length) {
+    return projected(raw, "degraded", "pair_waiting", "retry_verification");
+  }
+  if (raw.outboundDeliveries?.length) {
+    return projected(raw, "degraded", "delivery_blocked", "retry_delivery");
+  }
+  if (raw.failingSurface === "delivery") {
+    return projected(raw, "degraded", "delivery_blocked", "retry_verification");
+  }
   if (raw.failingSurface === "connection") {
     return projected(raw, "degraded", "connection_failed", "reconnect");
   }
@@ -199,6 +212,8 @@ export type SlackBridgeOAuthResult =
  */
 export interface SlackBridgeProvisioningProvider {
   load(): Promise<SlackBridgeProvisioningView>;
+  retryDelivery?(delivery: { bindingId: string; bindingEpoch: number; deliveryId: string; providerAttempts: number }): Promise<SlackBridgeProvisioningView>;
+  replayInbound?(event: { bindingId: string; bindingEpoch: number; eventId?: string; reason?: string }): Promise<SlackBridgeProvisioningView>;
   connect(): Promise<SlackBridgeProvisioningView>;
   beginOAuth(): Promise<SlackBridgeOAuthResult>;
   /** Re-runs Slack OAuth for a connected workspace; the server keeps its channel pairs. */

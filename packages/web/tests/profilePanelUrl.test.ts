@@ -78,6 +78,10 @@ test("conversation-flow ordered-first intent resolves the first persisted visibl
   );
 });
 
+test("ordered-first intent without the visible tabs keeps a saved Usage tab first", () => {
+  assert.equal(resolveOrderedFirstAgentTab([], ["usage", "activity", "profile"]), "usage");
+});
+
 test("ordered-first intent normalizes legacy channel tab names", () => {
   assert.equal(
     resolveOrderedFirstAgentTab(

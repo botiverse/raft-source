@@ -12,8 +12,8 @@ async function main() {
   const pool = createPool();
   const client = await pool.connect();
   try {
-    await assertMobilePushOutboxTableExists(client);
-    const status = await readActiveIndexStatus(client);
+    const table = await assertMobilePushOutboxTableExists(client);
+    const status = await readActiveIndexStatus(client, table);
     assertActiveIndexReady(status);
     console.error(describeActiveIndexStatus(status));
   } finally {

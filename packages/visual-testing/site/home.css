@@ -119,6 +119,9 @@ body.sb-foot-resizing { cursor: row-resize; user-select: none; }
 .sb-wcard { display: block; width: 100%; break-inside: avoid; margin: 0 0 14px; padding: 0; background: var(--bg); border: 1px solid var(--hairline); border-radius: 6px; overflow: hidden; cursor: pointer; font: inherit; color: var(--text); text-align: left; }
 .sb-wcard:hover { border-color: var(--accent); box-shadow: 0 1px 4px rgba(2, 156, 253, 0.18); }
 .sb-wcard img { display: block; width: 100%; height: auto; background: #fff; border-top: 1px solid var(--hairline); }
+/* Full-length (long screenshot) side-by-sides would make a card several screens
+   tall: show the top of it in the overview; the case stage shows it in full. */
+.sb-wcard img { max-height: 720px; object-fit: cover; object-position: top; }
 .sb-wcard .noimg { display: flex; align-items: center; justify-content: center; height: 72px; color: var(--faint); font-size: 12px; border-top: 1px solid var(--hairline); background: var(--canvas); }
 .sb-wcard .meta { display: flex; align-items: center; gap: 7px; padding: 8px 11px; }
 .sb-wcard .meta .name { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 12.5px; font-weight: 700; }

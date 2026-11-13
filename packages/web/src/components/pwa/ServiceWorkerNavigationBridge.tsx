@@ -1,25 +1,16 @@
 import { useEffect } from "react";
 import { useNavigate } from "react-router-dom";
-
-const PUSH_NOTIFICATION_NAVIGATE_MESSAGE = "RAFT_PUSH_NOTIFICATION_NAVIGATE";
-
-export function serviceWorkerNavigationPath(input: unknown, origin = window.location.origin): string | null {
-  if (!input || typeof input !== "object") return null;
-  const data = input as { type?: unknown; url?: unknown };
-  if (data.type !== PUSH_NOTIFICATION_NAVIGATE_MESSAGE || typeof data.url !== "string") return null;
-
-  try {
-    const url = new URL(data.url, origin);
-    if (url.origin !== origin) return null;
-    return `${url.pathname}${url.search}${url.hash}`;
-  } catch {
-    return null;
-  }
-}
+import { ackTestNotification } from "../../notifications/notificationApi";
+import { startWebPushLifecycle } from "../../notifications/webPushLifecycle";
+import { createNotificationShownAcker } from "../../notifications/webPushTestAck";
+import { useAuthStore } from "../../store/authStore";
+import { clientDisplayModeMessage, serviceWorkerNavigationPath } from "../../notifications/webPushServiceWorkerMessages";
 
 export default function ServiceWorkerNavigationBridge() {
   const navigate = useNavigate();
+  const signedInUserId = useAuthStore((state) => state.user?.id ?? null);
 
+  // A notification click routes this window in-app (no reload, state kept).
   useEffect(() => {
     if (!("serviceWorker" in navigator)) return;
 
@@ -34,6 +25,46 @@ export default function ServiceWorkerNavigationBridge() {
       navigator.serviceWorker.removeEventListener("message", handleMessage);
     };
   }, [navigate]);
+
+  // A test notification the worker displayed (or failed to): ack it once.
+  useEffect(() => {
+    if (!("serviceWorker" in navigator)) return;
+
+    const ackOnce = createNotificationShownAcker(ackTestNotification);
+    const handleMessage = (event: MessageEvent) => {
+      ackOnce(event.data);
+    };
+    navigator.serviceWorker.addEventListener("message", handleMessage);
+    return () => {
+      navigator.serviceWorker.removeEventListener("message", handleMessage);
+    };
+  }, []);
+
+  // The push subscription's upkeep needs a session: its requests are the user's.
+  useEffect(() => {
+    if (!signedInUserId) return;
+    return startWebPushLifecycle();
+  }, [signedInUserId]);
+
+  // Tell the worker whether this window is the installed app, so a notification
+  // click can come back to it. Re-sent when the mode changes or a new worker takes over.
+  useEffect(() => {
+    if (!("serviceWorker" in navigator)) return;
+
+    const announce = () => {
+      void navigator.serviceWorker.ready
+        .then((registration) => registration.active?.postMessage(clientDisplayModeMessage(window)))
+        .catch(() => {});
+    };
+    announce();
+    const standaloneQuery = window.matchMedia?.("(display-mode: standalone)");
+    standaloneQuery?.addEventListener?.("change", announce);
+    navigator.serviceWorker.addEventListener("controllerchange", announce);
+    return () => {
+      standaloneQuery?.removeEventListener?.("change", announce);
+      navigator.serviceWorker.removeEventListener("controllerchange", announce);
+    };
+  }, []);
 
   return null;
 }

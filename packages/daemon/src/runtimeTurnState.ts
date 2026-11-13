@@ -14,11 +14,6 @@ export class RuntimeTurnState {
   private currentTurnHadNonEmptyInput = false;
   private pendingNonEmptyInputTurnIds = new Set<string>();
   private completedTurnIds = new Set<string>();
-  /**
-   * Post-tool window where the app-server may not yet accept stdin steering.
-   * Gate busy-mode delivery until turn/completed or next progress.
-   */
-  private steeringGateActive = false;
 
   reset() {
     this.currentTurnId = null;
@@ -29,11 +24,15 @@ export class RuntimeTurnState {
     this.currentTurnHadNonEmptyInput = false;
     this.pendingNonEmptyInputTurnIds.clear();
     this.completedTurnIds.clear();
-    this.steeringGateActive = false;
   }
 
   get activeTurnId(): string | null {
     return this.currentTurnId;
+  }
+
+  /** A turn started and has not ended. */
+  get inProgress(): boolean {
+    return this.turnInProgress;
   }
 
   /** A turn was accepted (awaiting its start) or is running. */
@@ -42,7 +41,7 @@ export class RuntimeTurnState {
   }
 
   get canSteerBusy(): boolean {
-    return Boolean(this.currentTurnId && !this.pendingTurnId && !this.steeringGateActive);
+    return Boolean(this.currentTurnId && !this.pendingTurnId);
   }
 
   markTurnStarted(turnId?: string | null) {
@@ -55,7 +54,6 @@ export class RuntimeTurnState {
     this.currentTurnHadRuntimeActivity = false;
     this.currentTurnHadTokenUsage = false;
     this.currentTurnHadNonEmptyInput = startedTurnId ? this.pendingNonEmptyInputTurnIds.delete(startedTurnId) : false;
-    this.steeringGateActive = false;
   }
 
   noteTurnAccepted(turnId: string) {
@@ -64,12 +62,16 @@ export class RuntimeTurnState {
 
   markProgress() {
     this.currentTurnHadRuntimeActivity = true;
-    this.steeringGateActive = false;
   }
 
+  /**
+   * A tool ended. Runtime activity only: busy steering stays open. This used
+   * to close steering until the next progress event (regression #238, a
+   * May-2026 app-server wedge); Codex 0.155.1 took 207 steers in that window
+   * without a wedge (#proj-runtime:15c1492a).
+   */
   markToolBoundary() {
     this.currentTurnHadRuntimeActivity = true;
-    this.steeringGateActive = true;
   }
 
   markTokenUsage() {
@@ -107,6 +109,5 @@ export class RuntimeTurnState {
     this.currentTurnHadRuntimeActivity = false;
     this.currentTurnHadTokenUsage = false;
     this.currentTurnHadNonEmptyInput = false;
-    this.steeringGateActive = false;
   }
 }

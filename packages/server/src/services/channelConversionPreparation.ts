@@ -26,6 +26,8 @@ import {
 } from "./channelConversionFenceService";
 import { advance, ChannelConversionError, conversionTraceAttrs, persistResourceBatchProgress, requireCanonicalChannelId, requireStorageNamespaceId, stableStringify, type ChannelConversionJob, type ChannelConversionPhase } from "./channelConversionPhaseContext";
 import { CHANNEL_CONVERSION_BATCH_SIZE, conversionThreadMapping, moveConversionResources, verifyConversionResources } from "./channelConversionResources";
+import { taskConversationChannelName } from "./taskConversationService";
+import { RESERVATION_IN_FLIGHT, SESSION_IN_FLIGHT, TRANSFER_INTENT_IN_FLIGHT } from "./channelConversionUploadActivity";
 
 import type { ConversionPhaseContext } from "./channelConversionPhaseContext";
 export class ChannelConversionUploadsInFlightError extends ChannelConversionError {
@@ -173,6 +175,17 @@ export async function assertNoActiveAttachmentTransfers(
       UNION
       SELECT ${scopeInput.canonicalChannelId ?? scopeInput.sourceChannelId}::uuid
       UNION
+      -- Task v2 conversations under the source or canonical channel: the
+      -- host's conversations (before and after they become local
+      -- projections) and their canonical rows.
+      SELECT task_conversation.id
+        FROM ${channels} task_conversation
+       WHERE task_conversation.type = 'task'
+         AND task_conversation.deleted_at IS NULL
+         AND task_conversation.parent_channel_id IN (
+           ${scopeInput.sourceChannelId}, ${scopeInput.canonicalChannelId ?? scopeInput.sourceChannelId}
+         )
+      UNION
       SELECT joint_thread.canonical_channel_id
         FROM ${jointChannelServers} thread_projection
         JOIN ${jointChannels} joint_thread
@@ -206,17 +219,17 @@ export async function assertNoActiveAttachmentTransfers(
       SELECT 'session'::text AS kind, upload.id::text AS id, upload.attachment_id::text AS logical_id
         FROM ${attachmentUploadSessions} upload
         JOIN scope ON scope.channel_id = upload.channel_id
-       WHERE upload.state IN ('pending', 'verifying')
+       WHERE ${SESSION_IN_FLIGHT}
       UNION ALL
       SELECT 'transfer_intent'::text AS kind, intent.id::text AS id, intent.reservation_id::text AS logical_id
         FROM ${attachmentTransferIntents} intent
         JOIN scope ON scope.channel_id = intent.channel_id
-       WHERE intent.state = 'planned'
+       WHERE ${TRANSFER_INTENT_IN_FLIGHT}
       UNION ALL
       SELECT 'reservation'::text AS kind, reservation.id::text AS id, reservation.id::text AS logical_id
         FROM ${attachmentUploadReservations} reservation
         JOIN scope ON scope.channel_id = reservation.channel_id
-       WHERE reservation.state = 'pending'
+       WHERE ${RESERVATION_IN_FLIGHT}
     )
     SELECT kind, id, logical_id FROM active_rows ORDER BY kind, id
   `);
@@ -468,6 +481,18 @@ export async function prepareTasks(
 // Every batch commits its cursor and content checksum with the actual writes.
 export { CHANNEL_CONVERSION_BATCH_SIZE } from "./channelConversionResources";
 
+/** Raise `toChannelId`'s task-number high-water mark to at least `fromChannelId`'s. */
+export async function carryTaskNumberHighWater(tx: DatabaseExecutor, fromChannelId: string, toChannelId: string): Promise<void> {
+  await tx.execute(sql`
+    UPDATE ${channels} target
+       SET task_number_high_water = source.task_number_high_water
+      FROM ${channels} source
+     WHERE source.id = ${fromChannelId}::uuid
+       AND target.id = ${toChannelId}::uuid
+       AND target.task_number_high_water < source.task_number_high_water
+  `);
+}
+
 async function moveResources({ tx, job, progress }: ConversionPhaseContext, scope: "parent" | "thread", mapping: SQL, nextPhase: ChannelConversionPhase) {
   const resourceScope = scope;
   const before = progress.resources[resourceScope]?.messages?.moved ?? 0;
@@ -480,6 +505,10 @@ async function moveResources({ tx, job, progress }: ConversionPhaseContext, scop
 export async function moveParentMessages(
   { tx, job, progress, span }: ConversionPhaseContext) {
   const canonicalChannelId = await requireCanonicalChannelId(tx, job);
+  // The tasks move to the canonical channel, so its task numbering carries on
+  // past the source's high-water mark too (RFC 078: numbers are never reused,
+  // also not a deleted v2 task's). Idempotent across batches and retries.
+  await carryTaskNumberHighWater(tx, job.sourceChannelId, canonicalChannelId);
   const moved = await moveResources({ tx, job, progress }, "parent", sql`
     SELECT ${job.sourceChannelId}::uuid AS local_id, ${canonicalChannelId}::uuid AS canonical_id
   `, "prepare_threads");
@@ -568,6 +597,12 @@ export async function prepareThreads(
     await persistResourceBatchProgress(tx, job, progress);
     return;
   }
+  const preparedTaskConversations = await prepareTaskConversationProjections(tx, job, canonicalChannelId, storageNamespaceId);
+  progress.preparedTaskConversations = (progress.preparedTaskConversations ?? 0) + preparedTaskConversations;
+  if (preparedTaskConversations === CHANNEL_CONVERSION_BATCH_SIZE) {
+    await persistResourceBatchProgress(tx, job, progress);
+    return;
+  }
   const threadProjectionMap = await readThreadProjectionMap(tx, job, canonicalChannelId);
   await advance(tx, job.id, "move_thread_messages", {
     progress: { ...progress, preparedThreads, threadProjectionMap },
@@ -576,6 +611,105 @@ export async function prepareThreads(
     outcome: "ok",
     rowsCopied: preparedThreads,
   }));
+}
+
+/**
+ * Task v2: the host's existing task conversations become joint task
+ * conversations, mirroring what the thread loop above does for threads. By
+ * now the tasks have moved to the canonical channel (move_parent_messages),
+ * and the task_conversation_tasks migration trigger has pointed each canonical conversation's
+ * parent_channel_id at it. For each such conversation still on the host
+ * server without a projection:
+ *  - the existing row becomes the host's LOCAL projection (parent = the source
+ *    channel, which stays the host's local joint channel; follows, read
+ *    cursors and inbox state keyed on it stay valid),
+ *  - a new canonical conversation is created on the joint storage server and
+ *    `tasks.conversation_channel_id` points at it,
+ *  - joint_channels + joint_channel_servers link them; move_thread_messages
+ *    then moves the conversation's messages into the canonical row
+ *    (conversionThreadMapping's task arm).
+ * Re-selection is idempotent (a converted task's conversation is on the
+ * storage server). No task conversations exist with task v2 off: a no-op.
+ * Returns how many conversations this batch converted.
+ */
+async function prepareTaskConversationProjections(
+  tx: DatabaseExecutor,
+  job: ChannelConversionJob,
+  canonicalChannelId: string,
+  storageNamespaceId: string,
+): Promise<number> {
+  const result = await tx.execute(sql`
+    SELECT
+      conversation.id::text AS "oldConversationId",
+      conversation.description AS "description",
+      conversation.created_at AS "createdAt",
+      task.id::text AS "taskId"
+    FROM ${tasks} task
+    JOIN ${channels} conversation
+      ON conversation.id = task.conversation_channel_id
+     AND conversation.type = 'task'
+     AND conversation.deleted_at IS NULL
+    WHERE task.channel_id = ${canonicalChannelId}
+      AND conversation.server_id = ${job.serverId}
+      AND NOT EXISTS (
+        SELECT 1
+        FROM ${jointChannelServers} existing_projection
+        WHERE existing_projection.local_channel_id = conversation.id
+          AND existing_projection.status = 'active'
+      )
+    ORDER BY conversation.id LIMIT ${CHANNEL_CONVERSION_BATCH_SIZE}
+  `);
+  const sourceConversations = result.rows as Array<{
+    oldConversationId: string;
+    description: string | null;
+    createdAt: Date | string;
+    taskId: string;
+  }>;
+  for (const source of sourceConversations) {
+    // Detach first: (task_id, parent_channel_id) is unique per live task
+    // conversation, and the canonical row below takes the canonical parent.
+    await tx.update(channels)
+      .set({ parentChannelId: job.sourceChannelId })
+      .where(eq(channels.id, source.oldConversationId));
+    const canonicalConversationId = randomUUID();
+    await tx.insert(channels).values({
+      id: canonicalConversationId,
+      serverId: storageNamespaceId,
+      name: taskConversationChannelName(source.taskId),
+      description: source.description,
+      type: "task",
+      taskId: source.taskId,
+      parentMessageId: null,
+      parentChannelId: canonicalChannelId,
+      createdAt: source.createdAt instanceof Date ? source.createdAt : new Date(source.createdAt),
+    });
+    await tx.update(tasks)
+      .set({ conversationChannelId: canonicalConversationId })
+      .where(and(eq(tasks.id, source.taskId), eq(tasks.conversationChannelId, source.oldConversationId)));
+    const [jointConversation] = await tx
+      .insert(jointChannels)
+      .values({
+        canonicalChannelId: canonicalConversationId,
+        createdByServerId: job.serverId,
+        createdByUserId: job.createdByUserId,
+      })
+      .returning({ id: jointChannels.id });
+    await tx.insert(jointChannelServers).values({
+      jointChannelId: jointConversation.id,
+      serverId: job.serverId,
+      localChannelId: source.oldConversationId,
+      role: "host",
+      status: "active",
+      joinedByUserId: job.createdByUserId,
+    });
+  }
+  if (sourceConversations.length) await recordConversionPhaseCommit(tx, {
+    jobId: job.id, conversionEpoch: job.conversionEpoch, phase: job.phase,
+    batchKey: `task_conversations:${sourceConversations[0]!.oldConversationId}`,
+    sourceCount: sourceConversations.length, targetCount: sourceConversations.length,
+    checksumInput: stableStringify(sourceConversations.map(({ oldConversationId, taskId }) => ({ oldConversationId, taskId }))),
+  });
+  return sourceConversations.length;
 }
 
 export async function moveThreadMessages(

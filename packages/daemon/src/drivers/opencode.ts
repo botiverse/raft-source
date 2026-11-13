@@ -9,7 +9,7 @@ import path from "node:path";
 import { formatRuntimeProviderModelLabel, hydrateRuntimeConfig, runtimeConfigToLaunchFields, runtimeModelSourceOutcomeFromSet, type AgentConfig, type AgentMessage, type RuntimeModelInfo, type RuntimeModelSet, type RuntimeModelSourceOutcome , type AxSurfaceText } from "@botiverse/raft-shared";
 import { buildCliTransportSystemPrompt, prepareCliTransport } from "./cliTransport";
 import { resolveNodeHostLaunch } from "./nodeHostLaunch";
-import { lookupCommandOnPath, readCommandVersion, readCommandVersionAsync, resolveCommandOnPath, resolveCommandOnPathAsync, type ProbeDeps } from "./probe";
+import { lookupCommandOnPath, readCommandVersion, readCommandVersionDetailedAsync, resolveCommandOnPath, resolveCommandOnPathAsync, type CommandVersionRead, type ProbeDeps } from "./probe";
 import { ProbeChildError, runProbeChild } from "./probeChild";
 import type { ParsedEvent, RuntimeDriver, RuntimeProbeResult, SpawnContext, SpawnResult } from "./types";
 import { prepareManagedMcpRuntimeProxy } from "../managedMcpRuntimeProxy";
@@ -29,8 +29,16 @@ interface OpenCodeEvent {
     type?: string;
     text?: string;
     tool?: string;
+    /** 1.x: the provider's call id. */
+    callID?: string;
+    /** 2.x: the provider's call id (the part id moved to `partID`). */
+    id?: string;
     state?: {
+      status?: string;
       input?: unknown;
+      /** 1.x bash: `exit`; 2.x: `metadata.exit`. */
+      metadata?: { exit?: unknown; metadata?: { exit?: unknown } };
+      time?: { start?: unknown; end?: unknown };
     };
     reason?: string;
   };
@@ -234,6 +242,13 @@ export type OpenCodeSessionRefusalReason =
 export type OpenCodeSessionResumeDecision =
   | { kind: "fresh" }
   | { kind: "resume" }
+  /**
+   * task #1365 — the installed CLI's version could not be read or parsed, so
+   * whether this session may be resumed cannot be decided yet. Neither
+   * compatible nor incompatible: the start fails retryably and the record and
+   * session id are left alone.
+   */
+  | { kind: "version_unknown" }
   | { kind: "refuse"; reason: OpenCodeSessionRefusalReason; recordedMajor: number | null };
 
 /**
@@ -330,8 +345,9 @@ export function ensureOpenCodeSessionRecordWritable(filePath: string): void {
  * major. A missing record (or one for another session id) is "unknown": a 1.x
  * CLI resumes it as before (1.x behaviour unchanged), a 2.x CLI refuses it
  * rather than guessing. An unreadable record proves nothing either way and is
- * refused on every major. An unreadable installed version takes the 1.x
- * path, matching how the launch arguments are built for it.
+ * refused on every major. An unknown installed version decides nothing
+ * (task #1365): it used to be read as 1.x, which turned a failed version read
+ * into a permanent major mismatch for every 2.x session.
  */
 export function decideOpenCodeSessionResume(
   sessionId: string | null | undefined,
@@ -340,7 +356,8 @@ export function decideOpenCodeSessionResume(
 ): OpenCodeSessionResumeDecision {
   if (!sessionId) return { kind: "fresh" };
   if (read.kind === "unreadable") return { kind: "refuse", reason: "record_unreadable", recordedMajor: null };
-  const installedMajor = openCodeMajor(installedVersion) ?? 1;
+  const installedMajor = openCodeMajor(installedVersion);
+  if (installedMajor === null) return { kind: "version_unknown" };
   const recordedMajor = read.kind === "record" && read.record.sessionId === sessionId ? read.record.opencodeMajor : null;
   if (recordedMajor !== null) {
     return recordedMajor === installedMajor ? { kind: "resume" } : { kind: "refuse", reason: "major_mismatch", recordedMajor };
@@ -407,6 +424,8 @@ export async function buildOpenCodeLaunchOptions(ctx: SpawnContext, home: string
   const managedMcp = await prepareManagedMcpRuntimeProxy({
     agentId: ctx.agentId,
     launchId: ctx.launchId,
+    processInstanceId: ctx.processInstanceId,
+    readTurnOrigin: ctx.readTurnOrigin,
     serverUrl: ctx.config.serverUrl,
     agentCredentialKey: ctx.config.agentCredentialKey,
   });
@@ -613,14 +632,49 @@ export async function resolveOpenCodeSpawnAsync(commandArgs: string[], deps: Ope
     "node_modules/opencode-ai/bin/opencode.exe directly." });
 }
 
+/**
+ * task #1365 — the installed OpenCode version, or why it is unknown. The
+ * generic read keeps its contract (any first output line); deciding whether
+ * that line is an OpenCode version is done here. A cancel is rethrown, and so
+ * is a failure to resolve the CLI at all.
+ */
+export type OpenCodeVersionRead =
+  | { kind: "version"; version: string }
+  | { kind: "unknown"; reason: "probe_timeout" | "permission_denied" | "probe_failed" | "unparseable_output"; detail: string };
+
+export async function readOpenCodeVersionDetailedAsync(deps: OpenCodeProbeDeps & { readVersionFn?: typeof readCommandVersionDetailedAsync } = {}): Promise<OpenCodeVersionRead> {
+  // A CLI that cannot be resolved at all is the resolver's own error (not
+  // installed / lookup verdict), thrown as before; only a resolved CLI whose
+  // version cannot be read is "unknown".
+  const launch = await resolveOpenCodeSpawnAsync([], deps);
+  const read: CommandVersionRead = await (deps.readVersionFn ?? readCommandVersionDetailedAsync)(launch.command, launch.args, { ...deps, env: launch.env ?? deps.env });
+  if (read.kind === "failed") return { kind: "unknown", reason: read.reason, detail: `\`opencode --version\` ${read.detail}` };
+  if (openCodeMajor(read.version) === null) {
+    return { kind: "unknown", reason: "unparseable_output", detail: "`opencode --version` printed no recognisable version number" };
+  }
+  return { kind: "version", version: read.version };
+}
+
 async function readOpenCodeVersionAsync(deps: OpenCodeProbeDeps = {}): Promise<string | null> {
   try {
-    const launch = await resolveOpenCodeSpawnAsync([], deps);
-    return await readCommandVersionAsync(launch.command, launch.args, { ...deps, env: launch.env ?? deps.env });
+    const read = await readOpenCodeVersionDetailedAsync(deps);
+    return read.kind === "version" ? read.version : null;
   } catch (error) {
     if (isProbeAbort(error)) throw error;
     return null;
   }
+}
+
+/** task #1365 — a start whose OpenCode version could not be established; retryable (runtime_not_found with a lookup verdict). */
+export function openCodeVersionUnknownError(read: Extract<OpenCodeVersionRead, { kind: "unknown" }>): RuntimeExecutableNotFoundError {
+  return new RuntimeExecutableNotFoundError({
+    runtimeId: "opencode",
+    reason: read.reason === "probe_timeout" || read.reason === "permission_denied" ? read.reason : "probe_failed",
+    message:
+      `Raft could not confirm the installed OpenCode version (${read.detail}), so it cannot yet tell whether this agent's session can be resumed. ` +
+      "The session is kept as it is and Raft tries again on the next start. " +
+      "If this keeps happening, check that `opencode --version` runs in a new terminal, then restart Raft Computer.",
+  });
 }
 
 type OpenCodeModelsCommandAsync = (home: string) => Promise<OpenCodeModelsCommandResult>;
@@ -768,7 +822,7 @@ function openCodeSpecForEntry(entry: string, commandArgs: string[], deps: OpenCo
   });
   return {
     command: nodeHost.command,
-    args: [entry, ...commandArgs],
+    args: [...nodeHost.execArgv, entry, ...commandArgs],
     shell: false,
     env: nodeHost.env,
   };
@@ -908,6 +962,9 @@ export class OpenCodeDriver implements RuntimeDriver {
   } as const;
   readonly session = {
     recovery: "resume_or_fresh",
+    // Never emits a compaction event.
+    compaction: "unreported",
+    compactionFailure: "does_not_stick",
   } as const;
   readonly model = {
     detectedModelsVerifiedAs: "launchable" as const,
@@ -941,12 +998,16 @@ export class OpenCodeDriver implements RuntimeDriver {
   }
 
   private sessionId: string | null = null;
+  /** Tool calls already printed in this launch (see finishedToolEvents). */
+  private readonly seenToolCallIds = new Set<string>();
   /** The id last announced with session_init; re-announced when the persisted id changes. */
   private announcedId: string | null = null;
   /** The id whose provenance is on disk for this launch's major (or already was, for a matching resume). */
   private persistedSessionId: string | null = null;
   /** task #1258: where this launch records the session's OpenCode major once the id is known. */
   private sessionRecord: { path: string; major: number; version: string } | null = null;
+  /** The CLI version read for the last launch (see RuntimeDriver.launchedCliVersion). */
+  launchedCliVersion: string | null = null;
   /**
    * Provenance state of this launch's session. "persisted" is the only state
    * in which the session id leaves the driver (session_init, turn_end). A
@@ -994,13 +1055,19 @@ export class OpenCodeDriver implements RuntimeDriver {
   async spawn(ctx: SpawnContext): Promise<SpawnResult> {
     this.sessionId = ctx.config.sessionId || null;
     this.announcedId = null;
+    this.seenToolCallIds.clear();
     this.persistedSessionId = null;
     this.sessionRecordState = "pending";
 
     // task #1277: the version read and the launch resolution run as bounded
     // probe children under this start attempt's signal; a cancelled lookup is
     // rethrown, never a verdict.
-    const version = await readOpenCodeVersionAsync({ signal: ctx.launchSignal });
+    const versionRead = await readOpenCodeVersionDetailedAsync({ signal: ctx.launchSignal });
+    // task #1365: an unknown version is neither 1.x nor 2.x. Stop before the
+    // session record is consulted and before any launch arguments are built.
+    if (versionRead.kind === "unknown") throw openCodeVersionUnknownError(versionRead);
+    const version = versionRead.version;
+    this.launchedCliVersion = version;
     const unsupportedMessage = unsupportedOpenCodeVersionMessage(version);
     if (unsupportedMessage) {
       throw new Error(unsupportedMessage);
@@ -1013,6 +1080,9 @@ export class OpenCodeDriver implements RuntimeDriver {
     const recordPath = openCodeSessionRecordPath(slockHome, ctx.agentId);
     const read = readOpenCodeSessionRecord(recordPath);
     const decision = decideOpenCodeSessionResume(this.sessionId, read, version);
+    if (decision.kind === "version_unknown") {
+      throw openCodeVersionUnknownError({ kind: "unknown", reason: "unparseable_output", detail: "`opencode --version` printed no recognisable version number" });
+    }
     if (decision.kind === "refuse") {
       throw new RuntimeSessionRuntimeMismatchError({
         runtimeId: this.id,
@@ -1056,6 +1126,39 @@ export class OpenCodeDriver implements RuntimeDriver {
     proc.stdin?.end();
 
     return { process: proc };
+  }
+
+  /**
+   * task #26: `opencode run --format json` prints a tool call once, after it
+   * completed or failed (1.x and 2.x alike); there is no start event. So one
+   * `tool_use` is both the call's start and its end. A part seen twice is
+   * printed once.
+   */
+  private finishedToolEvents(part: OpenCodeEvent["part"]): ParsedEvent[] {
+    const name = part?.tool || "unknown_tool";
+    const state = part?.state;
+    const rawId = part?.callID ?? part?.id;
+    const callId = typeof rawId === "string" && rawId ? rawId : undefined;
+    if (callId) {
+      if (this.seenToolCallIds.has(callId)) return [];
+      this.seenToolCallIds.add(callId);
+    }
+    const exit = state?.metadata?.exit ?? state?.metadata?.metadata?.exit;
+    const start = state?.time?.start;
+    const end = state?.time?.end;
+    const durationMs = typeof start === "number" && typeof end === "number" && end >= start ? end - start : undefined;
+    const ids = callId ? { callId } : {};
+    return [
+      { kind: "tool_call", name, input: state?.input, ...ids },
+      {
+        kind: "tool_output",
+        name,
+        ...ids,
+        ...(state?.status === "completed" ? { ok: true } : state?.status === "error" ? { ok: false } : {}),
+        ...(typeof exit === "number" && Number.isInteger(exit) ? { exitCode: exit } : {}),
+        ...(durationMs !== undefined ? { durationMs } : {}),
+      },
+    ];
   }
 
   /** The session id as the daemon may learn it: only the id whose provenance is on disk. */
@@ -1144,11 +1247,7 @@ export class OpenCodeDriver implements RuntimeDriver {
         break;
 
       case "tool_use":
-        events.push({
-          kind: "tool_call",
-          name: event.part?.tool || "unknown_tool",
-          input: event.part?.state?.input,
-        });
+        events.push(...this.finishedToolEvents(event.part));
         break;
 
       case "step_finish":

@@ -96,8 +96,8 @@ test("Built-in Pi form lists Qwen Token Plan global and CN as first-class preset
   const modelSource = buildBuiltInPiFormOptionSource("model");
   assert.equal(modelSource?.kind, "dependent_select");
   if (!modelSource || modelSource.kind !== "dependent_select") return;
-  assert.equal(modelSource.defaultValueByValue["qwen-token-plan"], "qwen-token-plan/qwen3.7-max");
-  assert.equal(modelSource.defaultValueByValue["qwen-token-plan-cn"], "qwen-token-plan-cn/qwen3.7-max");
+  assert.equal(modelSource.defaultValueByValue["qwen-token-plan"], "qwen-token-plan/qwen3.8-max");
+  assert.equal(modelSource.defaultValueByValue["qwen-token-plan-cn"], "qwen-token-plan-cn/qwen3.8-max");
   assert.equal(modelSource.customValueAllowedByValue["qwen-token-plan"], false);
   assert.equal(modelSource.customValueAllowedByValue["qwen-token-plan-cn"], false);
   assert.ok(modelSource.optionsByValue["qwen-token-plan"]?.some(

@@ -1,3 +1,5 @@
+import { ConfirmedHistoricalReceiptMissing, externalMessageReceiptLocation, externalMessageReceiptScope, historicalProviderReceiptIsAbsent } from "./externalMessageReceiptScope";
+import { resolveExternalConversationTarget } from "./externalConversationTargetService";
 import { createHash } from "node:crypto";
 
 import { SLACK_BRIDGE_FEATURE_FLAG_KEYS } from "@botiverse/raft-shared";
@@ -5,7 +7,6 @@ import { and, desc, eq, inArray, sql } from "drizzle-orm";
 
 import type { Database, DatabaseTransaction } from "../db/index";
 import {
-  channels,
   externalActorProjections,
   externalAddressabilityProjections,
   externalAppInstalls,
@@ -61,6 +62,7 @@ export async function applyExternalReactionObservation(input: {
   eventSequence: number;
   botUserId: string;
   now: Date;
+  operationAuthority?: import("./externalInboundWorkerService").ExternalInboundRuntimeAuthority;
 }): Promise<{ outcome: "applied" | "noop" | "stale" | "quarantined" | "bot_echo" | "unsupported"; changed: boolean; raftMessageId: string }> {
   const [event] = await input.tx.select().from(externalInboundEvents).where(and(
     eq(externalInboundEvents.id, input.inboundEventId),
@@ -76,18 +78,15 @@ export async function applyExternalReactionObservation(input: {
   if (existingFact) {
     return { outcome: existingFact.outcome, changed: false, raftMessageId: existingFact.raftMessageId };
   }
+  const receiptTarget = await resolveExternalConversationTarget({ executor: input.tx, authorityChannelId: event.raftChannelId });
+  if (!receiptTarget) throw new Error("External reaction conversation is unavailable");
   const links = await input.tx.select().from(externalMessageLinks).where(and(
-    eq(externalMessageLinks.provider, event.provider),
-    eq(externalMessageLinks.installId, event.installId),
-    eq(externalMessageLinks.providerAuthorityId, event.providerAuthorityId),
-    eq(externalMessageLinks.providerConversationId, event.providerConversationId),
     eq(externalMessageLinks.providerMessageId, input.providerMessageId),
-    eq(externalMessageLinks.bindingId, event.bindingId),
-    eq(externalMessageLinks.bindingEpoch, event.bindingEpoch),
-    eq(externalMessageLinks.connectionEpoch, event.connectionEpoch),
-    eq(externalMessageLinks.outcomeState, "accepted"),
-    eq(externalMessageLinks.authorityState, "active"),
+    externalMessageReceiptScope(input.tx, { ...event, canonicalRaftChannelId: receiptTarget.storageChannelId }),
   )).for("update").limit(2);
+  if (links.length === 0 && await historicalProviderReceiptIsAbsent(input.tx, event, input.providerMessageId)) {
+    throw new ConfirmedHistoricalReceiptMissing();
+  }
   if (links.length !== 1) throw new Error("External reaction message link is unavailable");
   const link = links[0]!;
   const mapping = externalReactionFromSlack(input.providerReactionKey);
@@ -139,11 +138,12 @@ export async function applyExternalReactionObservation(input: {
     return { outcome, changed: false, raftMessageId: link.raftMessageId };
   }
 
+  const operation = { ...event, ...input.operationAuthority };
   const projections = await input.tx.select().from(externalActorProjections).where(and(
-    eq(externalActorProjections.provider, event.provider),
-    eq(externalActorProjections.appRegistrationId, event.appRegistrationId),
-    eq(externalActorProjections.installId, event.installId),
-    eq(externalActorProjections.workspaceId, event.workspaceId),
+    eq(externalActorProjections.provider, operation.provider),
+    eq(externalActorProjections.appRegistrationId, operation.appRegistrationId),
+    eq(externalActorProjections.installId, operation.installId),
+    eq(externalActorProjections.workspaceId, operation.workspaceId),
     eq(externalActorProjections.externalActorId, input.externalActorId),
     eq(externalActorProjections.state, "active"),
     eq(externalActorProjections.deactivated, false),
@@ -152,25 +152,33 @@ export async function applyExternalReactionObservation(input: {
   const projection = projections[0]!;
   const [address] = await input.tx.select().from(externalAddressabilityProjections).where(and(
     eq(externalAddressabilityProjections.projectionId, projection.id),
-    eq(externalAddressabilityProjections.provider, event.provider),
-    eq(externalAddressabilityProjections.appRegistrationId, event.appRegistrationId),
-    eq(externalAddressabilityProjections.installId, event.installId),
-    eq(externalAddressabilityProjections.workspaceId, event.workspaceId),
-    eq(externalAddressabilityProjections.connectionEpoch, event.connectionEpoch),
-    eq(externalAddressabilityProjections.bindingId, event.bindingId),
-    eq(externalAddressabilityProjections.bindingEpoch, event.bindingEpoch),
-    eq(externalAddressabilityProjections.conversationId, event.providerConversationId),
+    eq(externalAddressabilityProjections.provider, operation.provider),
+    eq(externalAddressabilityProjections.appRegistrationId, operation.appRegistrationId),
+    eq(externalAddressabilityProjections.installId, operation.installId),
+    eq(externalAddressabilityProjections.workspaceId, operation.workspaceId),
+    eq(externalAddressabilityProjections.connectionEpoch, operation.connectionEpoch),
+    eq(externalAddressabilityProjections.bindingId, operation.bindingId),
+    eq(externalAddressabilityProjections.bindingEpoch, operation.bindingEpoch),
+    eq(externalAddressabilityProjections.conversationId, operation.providerConversationId),
     eq(externalAddressabilityProjections.state, "active"),
   )).orderBy(desc(externalAddressabilityProjections.contextRevision)).limit(1);
-  if (!address || address.expiresAt <= input.now) throw new Error("External reaction actor addressability is unavailable");
+  if (!address) throw new Error("External reaction actor addressability is unavailable");
 
-  const [current] = await input.tx.select().from(externalReactionStates).where(and(
-    eq(externalReactionStates.bindingId, event.bindingId),
-    eq(externalReactionStates.bindingEpoch, event.bindingEpoch),
-    eq(externalReactionStates.messageLinkId, link.id),
-    eq(externalReactionStates.projectionId, projection.id),
-    eq(externalReactionStates.providerReactionKey, mapping.providerReactionKey),
-  )).for("update").limit(1);
+  // The locked message link above serializes updates to this provider
+  // message. Presence is mutable state for the same actor/message/emoji;
+  // its previous binding epoch is provenance, not a second reaction.
+  const states = await input.tx.select({ state: externalReactionStates }).from(externalReactionStates)
+    .innerJoin(externalActorProjections, and(
+      eq(externalActorProjections.id, externalReactionStates.projectionId),
+      eq(externalActorProjections.provider, event.provider),
+      eq(externalActorProjections.workspaceId, event.workspaceId),
+      eq(externalActorProjections.externalActorId, input.externalActorId),
+    )).where(and(
+      eq(externalReactionStates.messageLinkId, link.id),
+      eq(externalReactionStates.providerReactionKey, mapping.providerReactionKey),
+    )).for("update", { of: externalReactionStates }).limit(2);
+  if (states.length > 1) throw new Error("External reaction presence identity is ambiguous");
+  const current = states[0]?.state;
   const desiredPresent = input.operation === "add";
   let outcome: "applied" | "noop" | "stale" | "quarantined";
   let changed = false;
@@ -249,31 +257,42 @@ export async function enqueueSlackReactionAggregateTransition(input: {
     link: externalMessageLinks,
     binding: externalChannelBindings,
     install: externalAppInstalls,
-    serverId: channels.serverId,
+    serverId: externalChannelBindings.serverId,
   }).from(externalMessageLinks)
-    .innerJoin(externalChannelBindings, and(
-      sql`${externalChannelBindings.id}::text = ${externalMessageLinks.bindingId}`,
-      eq(externalChannelBindings.bindingEpoch, externalMessageLinks.bindingEpoch),
-      eq(externalChannelBindings.connectionEpoch, externalMessageLinks.connectionEpoch),
-      eq(externalChannelBindings.state, "active"),
-    ))
     .innerJoin(externalAppInstalls, and(
-      sql`${externalAppInstalls.id}::text = ${externalMessageLinks.installId}`,
-      eq(externalAppInstalls.connectionEpoch, externalMessageLinks.connectionEpoch),
+      eq(externalAppInstalls.providerAuthorityId, externalMessageLinks.providerAuthorityId),
       eq(externalAppInstalls.state, "active"),
     ))
+    .innerJoin(externalChannelBindings, and(
+      eq(externalChannelBindings.installId, externalAppInstalls.id),
+      eq(externalChannelBindings.providerConversationId, externalMessageLinks.providerConversationId),
+      eq(externalChannelBindings.connectionEpoch, externalAppInstalls.connectionEpoch),
+      eq(externalChannelBindings.state, "active"),
+    ))
     .innerJoin(messages, eq(messages.id, externalMessageLinks.raftMessageId))
-    .innerJoin(channels, eq(channels.id, messages.channelId))
     .where(and(
       eq(externalMessageLinks.raftMessageId, input.raftMessageId),
       eq(externalMessageLinks.provider, "slack"),
       eq(externalMessageLinks.outcomeState, "accepted"),
-      eq(externalMessageLinks.authorityState, "active"),
     ));
-  let created = 0;
+  const currentPairRows: typeof rows = [];
   for (const row of rows) {
+    const target = await resolveExternalConversationTarget({ executor: input.tx, authorityChannelId: row.binding.channelId });
+    if (!target || target.level !== "top_level" || (target.kind === "joint" && target.role !== "host")) continue;
+    const [samePair] = await input.tx.select({ id: externalMessageLinks.id }).from(externalMessageLinks).where(and(
+      eq(externalMessageLinks.id, row.link.id), externalMessageReceiptLocation(input.tx, target.storageChannelId),
+    )).limit(1);
+    if (samePair) currentPairRows.push(row);
+  }
+  const receiptsPerBinding = new Map<string, number>();
+  for (const row of currentPairRows) receiptsPerBinding.set(row.binding.id, (receiptsPerBinding.get(row.binding.id) ?? 0) + 1);
+  let created = 0;
+  for (const row of currentPairRows) {
+    // Conflicting historical provider identities are not a license to write
+    // reactions to both messages. Other, unambiguous pairs remain independent.
+    if (receiptsPerBinding.get(row.binding.id) !== 1) continue;
     const flag = await evaluateFeatureFlag({
-      key: SLACK_BRIDGE_FEATURE_FLAG_KEYS.reactionSync,
+      key: SLACK_BRIDGE_FEATURE_FLAG_KEYS.master,
       serverId: row.serverId,
     }, input.tx as unknown as Database);
     if (!flag.enabled) continue;

@@ -14,14 +14,15 @@ import {
   tasks,
   users,
 } from "../db/schema";
-import { assignMachine, createAgent } from "../services/agentService";
+import { createAgent } from "../services/agentService";
+import { placeAgentOnMachine } from "../test/agentMachineFixture";
 import { mintAgentCredential } from "../services/agentCredentialService";
 import { createChannel } from "../services/channelService";
 import { createCanonicalExternalMessage } from "../services/externalProjectionService";
 import { registerMachine } from "../services/machineService";
 import { createServer } from "../services/serverService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 const RAW_EXTERNAL_CONTENT = "hostile <result> @owner from Slack";
 const FORBIDDEN_AGENT_AUTHORITY_FIELDS = [
@@ -87,11 +88,12 @@ async function seedHostileExternalReactionFixture() {
     owner.id,
     `external-reaction-machine-${suffix}`,
   );
-  await assignMachine(agent.id, machine.id);
+  await placeAgentOnMachine(agent.id, machine.id);
   const { apiKey: agentApiKey } = await mintAgentCredential({
     agentId: agent.id,
     scopes: ["reactions"],
     name: `external-reaction-credential-${suffix}`,
+    issuedVia: "human",
     createdByUserId: owner.id,
   });
 
@@ -114,7 +116,8 @@ async function seedHostileExternalReactionFixture() {
   const created = await createCanonicalExternalMessage({
     channelId: channel.id,
     content: RAW_EXTERNAL_CONTENT,
-    createdAt: new Date("2026-07-31T01:02:03.000Z"),
+    // A day ago: inside the Free plan's 30-day history window.
+    createdAt: new Date(Math.floor(Date.now() / 1000) * 1000 - 24 * 60 * 60 * 1000),
     projectionId: actor.id,
     provider: actor.provider,
     appRegistrationId: actor.appRegistrationId,

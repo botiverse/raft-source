@@ -5,17 +5,16 @@ import { randomUUID } from "node:crypto";
 import { Readable } from "node:stream";
 import { eq } from "drizzle-orm";
 import type { ServerId } from "@botiverse/raft-shared";
-import type { AttachmentUploadSessionContext } from "../routes/attachmentUploadSessions";
 import { getDb } from "../db/index";
 import {
   attachmentObjectCharges,
+  attachmentObjects,
   attachmentTransferArtifacts,
   attachmentTransferIntents,
   attachmentUploadReservations,
   attachments,
   attachmentUploadSessions,
   messages,
-  featureFlags,
   servers,
   users,
 } from "../db/schema";
@@ -36,7 +35,6 @@ import {
   isAttachmentDirectUploadEnabled,
 } from "./attachmentUploadSessionService";
 import { linkAttachmentsToMessageWithExecutor } from "./attachmentLinkingService";
-import { ATTACHMENT_ORIGINAL_STORAGE_V2_FEATURE_FLAG_KEY } from "./featureFlagService";
 
 
 afterEach(async () => {
@@ -105,7 +103,7 @@ function createEnabledService(
   now: () => Date,
   hooks: AttachmentUploadSessionServiceHooks = {},
 ) {
-  return new DurableAttachmentUploadSessionService(storage, async () => true, now, hooks);
+  return new DurableAttachmentUploadSessionService(storage, now, hooks);
 }
 
 test("create reserves quota once and replays one write-once presigned session", async () => {
@@ -124,10 +122,6 @@ test("create reserves quota once and replays one write-once presigned session", 
   assert.deepEqual(created.upload.headers, { "Content-Type": "text/plain", "If-None-Match": "*" });
   assert.equal(storage.presigns[0]?.options.ifNoneMatch, "*");
   assert.equal(storage.presigns[0]?.options.contentType, "text/plain");
-
-  await getDb().update(featureFlags)
-    .set({ killSwitch: true })
-    .where(eq(featureFlags.key, ATTACHMENT_ORIGINAL_STORAGE_V2_FEATURE_FLAG_KEY));
 
   const replay = await service.create(context, request);
   assert.equal(replay.status, 201);
@@ -149,23 +143,6 @@ test("create reserves quota once and replays one write-once presigned session", 
   const quota = await getFileUploadQuotaSummary(server.id, new Date("2026-07-27T00:00:00Z"));
   assert.equal(quota.reservedBytes, request.sizeBytes);
   assert.equal(quota.usedBytes, 0);
-});
-
-test("the attachment-original kill switch returns fresh direct sessions to the stable v1 namespace", async () => {
-  const { server, channel, context } = await fixture();
-  await getDb().update(featureFlags)
-    .set({ killSwitch: true })
-    .where(eq(featureFlags.key, ATTACHMENT_ORIGINAL_STORAGE_V2_FEATURE_FLAG_KEY));
-  const storage = new FakeDirectStorage();
-  const service = createEnabledService(storage, () => new Date("2026-07-27T00:00:00Z"));
-
-  const created = await service.create(context, input(channel.id));
-  assert.equal(created.status, 201);
-  const body = created.body as { uploadId: string };
-  const [session] = await getDb().select().from(attachmentUploadSessions);
-  assert.ok(session.storageKey.startsWith(`attachments/v1/${server.id}/${body.uploadId}/`));
-  assert.equal(session.storageKey.startsWith(ATTACHMENT_STORAGE_KEY_PREFIX), false);
-  assert.equal(storage.presigns[0]?.key, session.storageKey);
 });
 
 test("complete HEAD-verifies, creates one attachment, and finalizes quota exactly once", async () => {
@@ -196,8 +173,9 @@ test("complete HEAD-verifies, creates one attachment, and finalizes quota exactl
 
   const rows = await getDb().select().from(attachments).where(eq(attachments.id, attachmentId));
   assert.equal(rows.length, 1);
-  assert.equal(rows[0]?.contentHash, null);
-  assert.equal(rows[0]?.thumbnailKey, null);
+  const [object] = await getDb().select().from(attachmentObjects).where(eq(attachmentObjects.id, rows[0]!.objectId));
+  assert.equal(object?.contentHash, null);
+  assert.equal(object?.thumbnailKey, null);
   const [intent] = await getDb().select().from(attachmentTransferIntents)
     .where(eq(attachmentTransferIntents.id, session.transferIntentId!));
   const [artifact] = await getDb().select().from(attachmentTransferArtifacts)
@@ -420,18 +398,14 @@ test("enabled direct-upload capability leaves no gap above the legacy transport 
   }
 });
 
-test("server feature flag fails closed across capability and every direct-session operation", async () => {
+test("disabled direct-upload admission advertises the legacy limit and refuses new sessions", async () => {
   const { channel, context } = await fixture();
   const storage = new FakeDirectStorage();
-  const evaluated: AttachmentUploadSessionContext[] = [];
   const service = new DurableAttachmentUploadSessionService(
     storage,
-    async (candidate) => {
-      evaluated.push(candidate);
-      return false;
-    },
     () => new Date("2026-07-27T00:00:00Z"),
     {},
+    { directUploadEnabled: false },
   );
 
   assert.deepEqual((await service.capabilities(context)).body, {
@@ -440,19 +414,9 @@ test("server feature flag fails closed across capability and every direct-sessio
     maxBytes: 50 * 1024 * 1024,
     sessionExpiresInSeconds: null,
   });
-  const request = input(channel.id);
-  const uploadId = randomUUID();
-  for (const result of [
-    await service.create(context, request),
-    await service.complete(context, uploadId),
-    await service.cancel(context, uploadId),
-    await service.status(context, uploadId),
-  ]) {
-    assert.equal(result.status, 403);
-    assert.equal((result.body as { code: string }).code, "UPLOAD_FORBIDDEN");
-  }
-  assert.equal(evaluated.length, 5);
-  assert.ok(evaluated.every((candidate) => candidate === context));
+  const created = await service.create(context, input(channel.id));
+  assert.equal(created.status, 403);
+  assert.equal((created.body as { code: string }).code, "UPLOAD_FORBIDDEN");
   assert.deepEqual(storage.presigns, []);
   assert.equal((await getDb().select().from(attachmentUploadSessions)).length, 0);
 });

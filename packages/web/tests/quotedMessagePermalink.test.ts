@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { vi } from "vitest";
 import {
   buildQuotedMessageAttachmentLabel,
   extractFirstQuotedMessagePermalink,
@@ -169,4 +170,20 @@ test("buildQuotedMessageAttachmentLabel summarizes image and file counts", () =>
     ),
     "2 attachments",
   );
+});
+
+test("a raft:// link to a message quotes like the web link it stands for (raft:///s/… and raft://s/…)", () => {
+  vi.stubGlobal("window", { location: { origin: "https://app.slock.ai" } });
+  try {
+    const route = FIRST_PERMALINK.replace("https://app.slock.ai", "");
+    for (const written of [`raft://${route}`, `raft:/${route}`]) {
+      const extracted = extractFirstQuotedMessagePermalink(`看 ${written}，然后`, CURRENT_HOSTNAME, CURRENT_SERVER_SLUG);
+      assert.ok(extracted, written);
+      assert.equal(extracted.rawUrl, FIRST_PERMALINK);
+      assert.equal(extracted.parsed.messageId, "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa");
+    }
+    assert.equal(extractFirstQuotedMessagePermalink("raft:///login?code=x", CURRENT_HOSTNAME, CURRENT_SERVER_SLUG), null);
+  } finally {
+    vi.unstubAllGlobals();
+  }
 });

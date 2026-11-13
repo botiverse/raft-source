@@ -11,6 +11,7 @@ import {
 } from "@botiverse/raft-shared";
 import { AgentProcessManager } from "./agentProcessManager";
 import { installDaemonFetchMockForTests } from "./daemonFetch";
+import { answerGatewayModelListRead } from "./testing/gatewayModelListProbe";
 import { BuiltInDriver } from "./drivers/pi";
 import { traceRows } from "./testing/traceRows";
 import { releaseAgentManagerForTests } from "./testing/agentManagerTeardown";
@@ -545,4 +546,123 @@ test("produced-span contract completeness: every emitted attr is either allowlis
     [],
     `silently scrubbed produced-span attrs (add to the contract or to DECIDED_SCRUBBED with an owner ruling): ${JSON.stringify(silent)}`,
   );
+});
+
+// pi session rotation through the daemon: a real Built-in session against a
+// loopback Anthropic-compatible provider, compacted by pi itself after its
+// second turn. The turn end APM sees afterwards must rotate it (nothing is in
+// flight), and the agent keeps working on the same session id.
+test("pi session rotation: after pi compacts a Built-in session, the daemon's turn end rotates it under the same session id", { timeout: 60_000 }, async () => {
+  const { BasicTracer, MemoryTraceSink, createSpanAttrContractTracer } = await import("@botiverse/raft-shared");
+  const { DAEMON_CORE_TRACE_ATTR_CONTRACTS } = await import("./core");
+  const { readdir } = await import("node:fs/promises");
+  const { planSpawnContextGeneration, readContextGeneration } = await import("./contextGeneration");
+  let agentTurns = 0;
+  const provider = http.createServer((req, res) => {
+    if (answerGatewayModelListRead(req, res)) return;
+    const chunks: Buffer[] = [];
+    req.on("data", (chunk: Buffer) => chunks.push(chunk));
+    req.on("end", () => {
+      const summary = Buffer.concat(chunks).toString("utf8").includes("You are a context summarization assistant");
+      if (!summary) agentTurns += 1;
+      // A near-full context after the second agent turn: pi compacts.
+      const inputTokens = !summary && agentTurns === 2 ? 195_000 : 1_000;
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      const send = (event: string, data: unknown) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+      send("message_start", { type: "message_start", message: { id: "m", type: "message", role: "assistant", model: "rotation-model", content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: inputTokens, output_tokens: 0 } } });
+      send("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } });
+      // Long answers, so the history is worth compacting.
+      send("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: `answer ${"lorem ipsum dolor ".repeat(6_000)}` } });
+      send("content_block_stop", { type: "content_block_stop", index: 0 });
+      send("message_delta", { type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: 200 } });
+      send("message_stop", { type: "message_stop" });
+      res.end();
+    });
+  });
+  await new Promise<void>((resolve) => provider.listen(0, "127.0.0.1", resolve));
+  const port = (provider.address() as { port: number }).port;
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "slock-builtin-rotation-e2e-"));
+  const sent: MachineToServerMessage[] = [];
+  const sink = new MemoryTraceSink();
+  const restoreFetch = installManagedRunnerMintFetch();
+  const manager = new AgentProcessManager(
+    (msg) => sent.push(msg),
+    "sk_machine_test",
+    {
+      dataDir,
+      serverUrl: "https://daemon.example.com",
+      slockHome: dataDir,
+      slockCliPath: "__cli",
+      runtimeSessionHomeDir: dataDir,
+      driverResolver: () => new BuiltInDriver(),
+      tracer: createSpanAttrContractTracer(new BasicTracer({ sink }), DAEMON_CORE_TRACE_ATTR_CONTRACTS),
+    },
+  );
+  const idle = () => (manager as any).agents.get("agent-1")?.gatedSteering.isIdle === true;
+  const waitUntil = async (condition: () => boolean, label: string) => {
+    const deadline = Date.now() + 30_000;
+    while (!condition()) {
+      if (Date.now() > deadline) assert.fail(`timed out waiting for ${label}; sent=${JSON.stringify(sent.slice(-3))}`);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+  };
+  const rows = (name: string) => traceRows(sink).filter((row) => row.name === name);
+  const message = (n: number) => ({
+    channel_id: "channel-1", channel_name: "general", channel_type: "channel" as const, sender_id: "user-1", sender_name: "richard",
+    sender_type: "human" as const, content: `message ${n}`, timestamp: "2026-10-21T10:00:00.000Z", message_id: `m-${n}`, seq: n,
+  });
+  const base = makeBuiltInGatewayConfig(`http://127.0.0.1:${port}/anthropic`);
+  try {
+    await manager.startAgent("agent-1", {
+      ...base,
+      model: "rotation-model",
+      envVars: { RAFT_PI_SESSION_ROTATION_MIN_BYTES: "1" },
+      piSessionRotation: true,
+      passiveAx: true,
+      runtimeConfig: {
+        version: RUNTIME_CONFIG_VERSION, runtime: "builtin",
+        provider: { kind: "gateway", providerId: "anthropic-compatible", baseUrl: `http://127.0.0.1:${port}/anthropic`, apiKey: "fake" },
+        hostUserState: "forbidden", model: { kind: "custom", name: "rotation-model" }, mode: { kind: "default" },
+      },
+    }, undefined, undefined, undefined, "launch-rotation-e2e");
+    await waitUntil(() => agentTurns === 1 && idle(), "the first turn");
+    const ap = () => (manager as any).agents.get("agent-1");
+    const spawnContextId = readContextGeneration(ap().cliTransportDir)?.contextId;
+    assert.ok(spawnContextId, "passive AX publishes a context id at spawn");
+    await manager.deliverMessage("agent-1", message(1));
+    await waitUntil(() => rows("pi.session.rotated").length === 1, "the rotation after pi's compaction");
+    await waitUntil(idle, "idle after the rotation");
+    await manager.deliverMessage("agent-1", message(2));
+    await waitUntil(() => agentTurns === 3 && idle(), "a turn on the rotated session");
+
+    assert.deepEqual(rows("pi.session.rotation_skipped"), [], "nothing held the rotation");
+    const { entries_before, entries_after, bytes_before, bytes_after, ...identity } = rows("pi.session.rotated")[0]!.attrs as Record<string, unknown>;
+    assert.deepEqual(identity, { agentId: "agent-1", launchId: "launch-rotation-e2e", runtime: "builtin" });
+    assert.ok(Number(entries_after) < Number(entries_before) && Number(bytes_after) < Number(bytes_before));
+    const sessionIds = new Set(sent.flatMap((msg) => msg.type === "agent:session" ? [msg.sessionId] : []));
+    assert.equal(sessionIds.size, 1, `one session id throughout: ${[...sessionIds].join(", ")}`);
+    const [sessionId] = [...sessionIds];
+
+    // RFC 072: the compaction issued a new context id; the rotation's reopen
+    // must neither publish the spawn's id again nor book it for a resume.
+    const published = readContextGeneration(ap().cliTransportDir)?.contextId;
+    assert.ok(published && published !== spawnContextId, `the post-compaction id stays published (spawn ${spawnContextId}, now ${published})`);
+    assert.equal(ap().contextId, published);
+    assert.deepEqual(
+      planSpawnContextGeneration(ap().cliTransportDir, { compaction: ap().driver.session.compaction, resumeSessionId: sessionId! }),
+      { contextId: published, reason: "resume", compaction: "reported" },
+      "a later resume of the session gets the post-compaction id",
+    );
+    const sessionDir = path.join(ap().runtime.ctx.workingDirectory, ".builtin-sessions");
+    const files = (await readdir(sessionDir)).sort();
+    assert.equal(files.filter((name) => name.endsWith(`_${sessionId}.jsonl`)).length, 1, JSON.stringify(files));
+    assert.equal(files.filter((name) => name.endsWith(`_${sessionId}.jsonl.rotated`)).length, 1, JSON.stringify(files));
+    assert.ok(!sent.some((msg) => msg.type === "agent:activity" && msg.detailKind === "runtime_error"), "no runtime error");
+  } finally {
+    await manager.stopAgent("agent-1").catch(() => {});
+    await releaseAgentManagerForTests(manager);
+    restoreFetch();
+    await new Promise<void>((resolve) => provider.close(() => resolve()));
+    await rm(dataDir, { recursive: true, force: true });
+  }
 });

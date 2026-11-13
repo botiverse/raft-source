@@ -22,7 +22,8 @@ export interface AppThemePreferences {
 
 export const DEFAULT_APP_THEME_PREFERENCES: AppThemePreferences = { mode: "system" };
 
-export const APP_APPEARANCE_MODES = ["light", "dark", "system"] as const satisfies readonly AppAppearanceMode[];
+// The default (system) first (stdrc, 2026-11-05).
+export const APP_APPEARANCE_MODES = ["system", "light", "dark"] as const satisfies readonly AppAppearanceMode[];
 
 /** Legacy mixed presets and the mode each one meant. */
 const LEGACY_PRESET_MODES: Record<string, AppAppearanceMode> = {

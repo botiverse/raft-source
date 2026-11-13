@@ -1,0 +1,26 @@
+{
+  "name": "@botiverse/raft-check-worker",
+  "version": "0.1.0",
+  "license": "LicenseRef-Raft-License",
+  "private": true,
+  "type": "module",
+  "description": "The check Worker for Raft's workspace Artifacts: on a cron, leases a publish check, opens the version top-level in Cloudflare's headless browser, and posts its screenshots and findings back.",
+  "main": "src/checkWorker.ts",
+  "scripts": {
+    "build": "wrangler deploy --dry-run --outdir dist --env=\"\"",
+    "test": "node --import tsx --test \"test/*.test.ts\"",
+    "typecheck": "tsrs --noEmit",
+    "typecheck:tsc": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@botiverse/raft-shared": "workspace:*",
+    "@cloudflare/puppeteer": "1.4.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "5.20260730.1",
+    "@types/node": "^25.5.0",
+    "tsx": "^4.21.0",
+    "typescript": "^6.0.3",
+    "wrangler": "4.114.0"
+  }
+}

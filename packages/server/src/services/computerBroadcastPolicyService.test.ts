@@ -1,9 +1,8 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
 import { dbTest } from "../test/integration/dbTest";
 import { featureFlagRules, featureFlags } from "../db/schema";
-import { REMOTE_COMPUTER_UPGRADE_V2_FEATURE_FLAG_KEY } from "./featureFlagService";
+import { REMOTE_COMPUTER_UPGRADE_PLATFORM_HOLD_FEATURE_FLAG_KEYS } from "@botiverse/raft-shared";
 import {
   COMPUTER_HANDS_MAIN_URL,
   createBatchBroadcastPolicyEvaluator,
@@ -13,15 +12,15 @@ import {
   type ComputerHandsResolutionDependencies,
   type EvaluateComputerBroadcastPolicyInput,
 } from "./computerBroadcastPolicyService";
+import { setPrivacyModeForTest } from "../config/privacyMode";
 
-// Every test that exercises Hands resolution now sits BEHIND the broadcast gate
-// (task #804). These open the gate explicitly so they remain tests of resolution
-// and nothing else; the gate itself is tested at the bottom of this file.
-function evaluateWithOpenGate(
+// Hands resolution with no platform held, so these stay tests of resolution and
+// nothing else; the holds are tested at the bottom of this file.
+function evaluateUnheld(
   input: EvaluateComputerBroadcastPolicyInput,
   deps: ComputerHandsResolutionDependencies,
 ) {
-  return evaluateBroadcastPolicy(input, { isBroadcastEnabled: () => true, ...deps });
+  return evaluateBroadcastPolicy(input, { isPlatformHeld: () => false, ...deps });
 }
 
 function release() {
@@ -35,7 +34,7 @@ function release() {
 }
 function input(overrides: Partial<EvaluateComputerBroadcastPolicyInput> = {}): EvaluateComputerBroadcastPolicyInput {
   return { source: { version: "1.0.23", observedAt: "2026-01-01T00:00:00Z", provenance: "owner_connection" },
-    platform: { os: "macos", architecture: "arm64" }, now: new Date("2026-09-10T00:00:00Z"), ...overrides };
+    platform: { os: "macos", architecture: "arm64" }, now: new Date("2026-09-10T00:00:00Z"), serverId: "server-test", ...overrides };
 }
 function respond(body = release()): typeof fetch {
   return async (url) => {
@@ -46,7 +45,7 @@ function respond(body = release()): typeof fetch {
 }
 
 test("legacy source with no Server matrix row resolves the current Hands stable (main) release", async () => {
-  const result = await evaluateWithOpenGate(input(), { fetchFn: respond() });
+  const result = await evaluateUnheld(input(), { fetchFn: respond() });
   assert.equal(result.eligibility, "eligible");
   assert.equal(result.targetVersion, "1.0.31");
   assert.equal(result.policyRow, null);
@@ -60,7 +59,7 @@ test("all five supported platform artifacts are selected by exact OS/architectur
     ["linux", "linux", "arm64"], ["linux", "linux", "x64"], ["windows", "win32", "x64"],
   ] as const) {
     const body = release(); body.assets[0]!.platform = platform; body.assets[0]!.arch = architecture;
-    assert.equal((await evaluateWithOpenGate(input({ platform: { os, architecture } }),
+    assert.equal((await evaluateUnheld(input({ platform: { os, architecture } }),
       { fetchFn: respond(body) })).eligibility, "eligible");
   }
 });
@@ -72,7 +71,7 @@ test("rejects missing, mismatched, and duplicate raw platform artifacts", async 
     (body: ReturnType<typeof release>) => { body.assets.push({ ...body.assets[0]! }); },
   ]) {
     const body = release(); change(body);
-    const result = await evaluateWithOpenGate(input(), { fetchFn: respond(body) });
+    const result = await evaluateUnheld(input(), { fetchFn: respond(body) });
     assert.equal(result.eligibility, "no_broadcast"); assert.equal(result.reasonCode, "hands_artifact_missing");
   }
 });
@@ -89,7 +88,7 @@ test("rejects malformed version, identity, size, origin channel and app", async 
     (body: ReturnType<typeof release>) => { body.app.slug = "other"; },
   ]) {
     const body = release(); change(body);
-    assert.equal((await evaluateWithOpenGate(input(), { fetchFn: respond(body) })).reasonCode, "hands_response_invalid");
+    assert.equal((await evaluateUnheld(input(), { fetchFn: respond(body) })).reasonCode, "hands_response_invalid");
   }
 });
 
@@ -99,7 +98,7 @@ test("Hands HTTP/network/JSON failures never fall back to a compiled target or C
     async () => { throw new Error("network unavailable"); },
     async () => new Response("not JSON"),
   ] satisfies Array<typeof fetch>) {
-    const result = await evaluateWithOpenGate(input(), { fetchFn });
+    const result = await evaluateUnheld(input(), { fetchFn });
     assert.equal(result.eligibility, "no_broadcast"); assert.equal(result.targetVersion, null);
   }
 });
@@ -109,7 +108,7 @@ test("deadline aborts the actual pending request", async () => {
   const fetchFn: typeof fetch = async (_url, init) => new Promise((_resolve, reject) => {
     init?.signal?.addEventListener("abort", () => { aborted = true; reject(new Error("aborted")); }, { once: true });
   });
-  const result = await evaluateWithOpenGate(input(), { fetchFn, timeoutMs: 10 });
+  const result = await evaluateUnheld(input(), { fetchFn, timeoutMs: 10 });
   assert.equal(aborted, true); assert.equal(result.reasonCode, "hands_unavailable");
 });
 
@@ -120,24 +119,36 @@ test("current or newer Computer is not downgraded, including prerelease preceden
     ["1.0.31-rc.9", "1.0.31-rc.10", true], ["1.0.31+build1", "1.0.31+build2", false],
   ] as const) {
     const body = release(); body.build.version = target;
-    const result = await evaluateWithOpenGate(input({ source: { version: source, observedAt: null, provenance: null } }), { fetchFn: respond(body) });
+    const result = await evaluateUnheld(input({ source: { version: source, observedAt: null, provenance: null } }), { fetchFn: respond(body) });
     assert.equal(result.eligibility === "eligible", eligible, `${source} -> ${target}`);
   }
 });
 
 test("requested target cannot override the active Hands stable release", async () => {
-  assert.equal((await evaluateWithOpenGate(input({ requestedTargetVersion: "1.0.28" }), { fetchFn: respond() })).reasonCode, "requested_target_mismatch");
+  assert.equal((await evaluateUnheld(input({ requestedTargetVersion: "1.0.28" }), { fetchFn: respond() })).reasonCode, "requested_target_mismatch");
 });
 
 test("unknown source/platform is rejected before fetching", async () => {
   for (const value of [input({ source: null }), input({ source: { version: "invalid", observedAt: null, provenance: null } }), input({ platform: null })]) {
-    const result = await evaluateWithOpenGate(value, { fetchFn: async () => { assert.fail("must not fetch"); } });
+    const result = await evaluateUnheld(value, { fetchFn: async () => { assert.fail("must not fetch"); } });
     assert.equal(result.eligibility, "no_broadcast");
   }
 });
 
+test("RAFT_PRIVACY_MODE: Hands is never contacted and the decision is hands_unavailable", async () => {
+  setPrivacyModeForTest(true);
+  try {
+    const result = await evaluateUnheld(input(), { fetchFn: async () => { assert.fail("must not fetch"); } });
+    assert.equal(result.eligibility, "no_broadcast");
+    assert.equal(result.reasonCode, "hands_unavailable");
+  } finally {
+    setPrivacyModeForTest(false);
+  }
+  assert.equal((await evaluateUnheld(input(), { fetchFn: respond() })).eligibility, "eligible", "off: unchanged");
+});
+
 test("queued dispatch preserves exact release identity, rejects old matrix receipts and changed assets", async () => {
-  const original = await evaluateWithOpenGate(input(), { fetchFn: respond() });
+  const original = await evaluateUnheld(input(), { fetchFn: respond() });
   const next = { ...original, sourceObservedAt: "2026-09-10T01:00:00Z" };
   assert.equal(isQueuedComputerUpgradePolicyCompatible(original, next), true);
   for (const changed of [
@@ -155,196 +166,123 @@ test("platform normalization understands existing daemon OS strings", () => {
   assert.equal(normalizeComputerPlatform("linux"), null);
 });
 
-// ---------------------------------------------------------------------------
-// Broadcast gate (task #804).
-//
-// Context that makes these tests load-bearing: the previous way to keep Computer
-// upgrades dark was a checked-in policy artifact holding zero rows. PR #7571
-// deleted that file while replacing the allowlist with Hands resolution, and with
-// it the only off switch — so the web Upgrade button came back on its own. These
-// tests exist so that the replacement switch cannot be deleted the same way
-// without something going red.
-// ---------------------------------------------------------------------------
-
-test("a closed gate blocks the broadcast without contacting Hands at all", async () => {
-  // Asserting only `no_broadcast` would not be enough: an implementation that
-  // fetched Hands first and discarded the result at the end would still pass.
-  // The fetchFn below is the tooth — it fails the test if it is ever called.
-  const result = await evaluateBroadcastPolicy(input(), {
-    isBroadcastEnabled: () => false,
-    fetchFn: async () => { assert.fail("a closed gate must not reach Hands"); },
+// Per-platform hold (10-24, #proj-o11y:ae66286a): the emergency stop for one OS.
+test("a held platform blocks its Computers without contacting Hands; other platforms still resolve", async () => {
+  const seen: string[] = [];
+  const isPlatformHeld = (_serverId: string | null, os: string) => { seen.push(os); return os === "windows"; };
+  const held = await evaluateBroadcastPolicy(input({ platform: { os: "windows", architecture: "x64" } }), {
+    isPlatformHeld,
+    fetchFn: async () => { assert.fail("a held platform must not reach Hands"); },
   });
-  assert.equal(result.eligibility, "no_broadcast");
-  assert.equal(result.reasonCode, "broadcast_disabled");
-  assert.equal(result.targetVersion, null);
-  assert.equal(result.handsRelease, undefined);
+  assert.equal(held.eligibility, "no_broadcast");
+  assert.equal(held.reasonCode, "platform_held");
+  assert.equal(held.targetVersion, null);
+
+  const other = await evaluateBroadcastPolicy(input(), { isPlatformHeld, fetchFn: respond() });
+  assert.equal(other.eligibility, "eligible");
+  assert.deepEqual(seen, ["windows", "macos"]);
 });
 
-test("the gate closes before source and platform validation, so a malformed machine still reports the gate", async () => {
-  // Ordering matters for diagnosis: if the gate ran after these checks, a closed
-  // gate would surface as `source_missing` and operators would chase the wrong
-  // thing. Positive control: the same inputs with the gate open report the
-  // input-shaped reasons instead.
-  for (const value of [input({ source: null }), input({ platform: null })]) {
-    const closed = await evaluateBroadcastPolicy(value, {
-      isBroadcastEnabled: () => false,
-      fetchFn: async () => { assert.fail("must not fetch"); },
-    });
-    assert.equal(closed.reasonCode, "broadcast_disabled");
-
-    const open = await evaluateWithOpenGate(value, {
-      fetchFn: async () => { assert.fail("must not fetch"); },
-    });
-    assert.notEqual(open.reasonCode, "broadcast_disabled");
-    assert.equal(open.eligibility, "no_broadcast");
-  }
-});
-
-test("an unreadable gate fails closed under its own reason code", async () => {
-  // "Someone turned this off" and "the flag store was unreachable" both stop the
-  // broadcast, but they are different incidents. Collapsing them into one code
-  // would make a database outage indistinguishable from a deliberate decision in
-  // stored receipts and dispatch-failure reasons.
-  const result = await evaluateBroadcastPolicy(input(), {
-    isBroadcastEnabled: () => { throw new Error("flag store unreachable"); },
-    fetchFn: async () => { assert.fail("an unreadable gate must not reach Hands"); },
+// A Computer whose runner cannot reach its own service (Windows pipe failures,
+// 10-27: 27 on 7 machines) gets the manual commands, not a doomed Upgrade.
+test("a Computer that cannot reach its service is not offered a web upgrade, without contacting Hands", async () => {
+  const unreachable = await evaluateBroadcastPolicy(input({ serviceUnreachable: true }), {
+    isPlatformHeld: () => false,
+    fetchFn: async () => { assert.fail("an unreachable service must not reach Hands"); },
   });
-  assert.equal(result.eligibility, "no_broadcast");
-  assert.equal(result.reasonCode, "broadcast_gate_unavailable");
-  assert.notEqual(result.reasonCode, "broadcast_disabled");
+  assert.equal(unreachable.eligibility, "no_broadcast");
+  assert.equal(unreachable.reasonCode, "service_unreachable");
+  const reachable = await evaluateBroadcastPolicy(input({ serviceUnreachable: false }), {
+    isPlatformHeld: () => false, fetchFn: respond(),
+  });
+  assert.equal(reachable.eligibility, "eligible");
 });
 
-test("the gate receives the serverId, so it can be opened per server rather than only globally", async () => {
-  // A gate evaluated without a serverId cannot reach a flag default at all — it
-  // would be closable but never openable. Asserting the value reaches the gate is
-  // what keeps that regression visible.
-  const seen: (string | null)[] = [];
-  const allowOnly = "95f993fa-2a68-4797-b8ae-7beb7d984ada";
-  for (const serverId of [allowOnly, "11111111-1111-4111-8111-111111111111", null]) {
-    const result = await evaluateBroadcastPolicy(input({ serverId }), {
-      isBroadcastEnabled: (id) => { seen.push(id); return id === allowOnly; },
-      fetchFn: respond(),
+// Raft Desktop's bundled Computer (ready.installKind "electron") is updated by
+// Desktop; the standalone installer a web upgrade drives cannot replace it
+// (10-30: two failed web upgrades of a Desktop Computer, 1.0.57 -> 1.0.59).
+test("a Computer bundled in Raft Desktop is not offered a web upgrade, without contacting Hands", async () => {
+  const desktop = await evaluateBroadcastPolicy(input({ installKind: "electron" }), {
+    isPlatformHeld: () => false,
+    fetchFn: async () => { assert.fail("a Desktop-managed Computer must not reach Hands"); },
+  });
+  assert.equal(desktop.eligibility, "no_broadcast");
+  assert.equal(desktop.reasonCode, "managed_by_desktop");
+  assert.equal(desktop.targetVersion, null);
+  // The batch evaluator (machine list) decides the same way.
+  const batch = await createBatchBroadcastPolicyEvaluator({
+    isPlatformHeld: () => false,
+    fetchFn: async () => { assert.fail("a Desktop-managed Computer must not reach Hands"); },
+  })(input({ installKind: "electron" }));
+  assert.equal(batch.reasonCode, "managed_by_desktop");
+  // Standalone installs and older daemons that report no install kind: unchanged.
+  for (const installKind of ["sea", "node", null, undefined] as const) {
+    const result = await evaluateBroadcastPolicy(input({ installKind }), {
+      isPlatformHeld: () => false, fetchFn: respond(),
     });
-    assert.equal(result.eligibility, serverId === allowOnly ? "eligible" : "no_broadcast");
+    assert.equal(result.eligibility, "eligible", String(installKind));
+    assert.equal(result.targetVersion, "1.0.31");
   }
-  assert.deepEqual(seen, [allowOnly, "11111111-1111-4111-8111-111111111111", null]);
+  // Decided before the hold: a held platform's Desktop Computer is still
+  // Desktop's, not "run the install commands"; the hold is not even read.
+  const held = await evaluateBroadcastPolicy(input({ installKind: "electron" }), {
+    isPlatformHeld: () => { assert.fail("a Desktop-managed Computer is decided before the hold"); },
+    fetchFn: async () => { assert.fail("must not fetch"); },
+  });
+  assert.equal(held.reasonCode, "managed_by_desktop");
 });
 
-test("the batch evaluator reads the gate once per server, not once per machine", async () => {
-  // The machine list evaluates every Computer of one server. The gate only
-  // depends on serverId, so reading it per machine cost two flag queries per
-  // Computer (trace 4dbdda63: 36 slow connections on one list request).
-  const serverA = "95f993fa-2a68-4797-b8ae-7beb7d984ada";
-  const serverB = "11111111-1111-4111-8111-111111111111";
-  const seen: (string | null)[] = [];
+test("an unreadable hold fails closed", async () => {
+  const unreadable = await evaluateBroadcastPolicy(input(), {
+    isPlatformHeld: () => { throw new Error("flag store unreachable"); },
+    fetchFn: async () => { assert.fail("an unreadable hold must not reach Hands"); },
+  });
+  assert.equal(unreadable.reasonCode, "broadcast_gate_unavailable");
+});
+
+test("the batch evaluator reads each server's hold once per platform", async () => {
+  const serverId = "95f993fa-2a68-4797-b8ae-7beb7d984ada";
+  const seen: string[] = [];
   const evaluate = createBatchBroadcastPolicyEvaluator({
-    isBroadcastEnabled: async (id) => { seen.push(id); return id === serverA; },
+    isPlatformHeld: async (id, os) => { seen.push(`${id}:${os}`); return os === "windows"; },
     fetchFn: respond(),
   });
+  const windows = { os: "windows", architecture: "x64" } as const;
   const results = await Promise.all([
-    ...Array.from({ length: 5 }, () => evaluate(input({ serverId: serverA }))),
-    evaluate(input({ serverId: serverB })),
-    evaluate(input({ serverId: serverB })),
+    evaluate(input({ serverId })), evaluate(input({ serverId })),
+    evaluate(input({ serverId, platform: windows })), evaluate(input({ serverId, platform: windows })),
   ]);
-  assert.deepEqual(seen, [serverA, serverB]);
-  assert.deepEqual(results.map((r) => r.reasonCode), [
-    "eligible", "eligible", "eligible", "eligible", "eligible", "broadcast_disabled", "broadcast_disabled",
-  ]);
+  assert.deepEqual(seen, [`${serverId}:macos`, `${serverId}:windows`]);
+  assert.deepEqual(results.map((r) => r.reasonCode), ["eligible", "eligible", "platform_held", "platform_held"]);
 });
 
-test("the batch evaluator shares a failed gate read as broadcast_gate_unavailable", async () => {
-  let reads = 0;
-  const evaluate = createBatchBroadcastPolicyEvaluator({
-    isBroadcastEnabled: () => { reads += 1; throw new Error("flag store unreachable"); },
-    fetchFn: async () => { assert.fail("an unreadable gate must not reach Hands"); },
-  });
-  const results = await Promise.all([evaluate(input()), evaluate(input()), evaluate(input())]);
-  assert.equal(reads, 1);
-  assert.deepEqual(results.map((r) => r.reasonCode), [
-    "broadcast_gate_unavailable", "broadcast_gate_unavailable", "broadcast_gate_unavailable",
-  ]);
-});
-
-// ---------------------------------------------------------------------------
-// Which flag the gate reads. The tests above inject the gate; these drive the
-// REAL flag evaluation against a flag store so they prove the key: one flag,
-// `remote_computer_upgrade_v2`, gates every Server-initiated upgrade send.
-// ---------------------------------------------------------------------------
-
-dbTest("the gate reads remote_computer_upgrade_v2: allowed for the server opens it, nothing else does", async ({ db }) => {
+// The holds' real flag evaluation against a flag store, with no other upgrade
+// flag present: an unheld platform resolves.
+dbTest("the hold reads remote_computer_upgrade_hold_<os>: missing is not held, allowed for the server holds that OS only", async ({ db }) => {
   const serverId = randomUUID();
-  const otherServerId = randomUUID();
-  const evaluate = (id: string) => evaluateBroadcastPolicy(input({ serverId: id }), { fetchFn: respond() });
+  const windows = input({ serverId, platform: { os: "windows", architecture: "x64" } });
+  const body = release();
+  body.assets.push({ ...body.assets[0]!, platform: "win32", arch: "x64" });
 
-  // No flag at all: the default state is dark.
-  const missing = await evaluate(serverId);
-  assert.equal(missing.eligibility, "no_broadcast");
-  assert.equal(missing.reasonCode, "broadcast_disabled");
+  // No hold flag: nothing changes.
+  assert.equal((await evaluateBroadcastPolicy(windows, { fetchFn: respond(body) })).reasonCode, "eligible");
 
-  // Only remote_computer_upgrade_v2, allowed for exactly this server.
+  const holdKey = REMOTE_COMPUTER_UPGRADE_PLATFORM_HOLD_FEATURE_FLAG_KEYS.windows;
   await db.insert(featureFlags).values({
-    key: REMOTE_COMPUTER_UPGRADE_V2_FEATURE_FLAG_KEY,
-    description: "test remote computer upgrade v2",
+    key: holdKey,
+    description: "test remote computer upgrade hold",
     enabled: true,
     killSwitch: false,
     randomizationUnit: "server",
     defaultEnabled: false,
-    salt: "broadcast-policy-v2-gate-test",
+    salt: "broadcast-policy-hold-test",
   });
   await db.insert(featureFlagRules).values({
-    id: randomUUID(),
-    flagKey: REMOTE_COMPUTER_UPGRADE_V2_FEATURE_FLAG_KEY,
-    stage: "server",
-    priority: 0,
-    decision: "allow",
-    values: [serverId],
+    id: randomUUID(), flagKey: holdKey, stage: "server", priority: 0, decision: "allow", values: [serverId],
   });
-  const open = await evaluate(serverId);
-  assert.equal(open.eligibility, "eligible");
-  assert.equal(open.reasonCode, "eligible");
-  assert.equal(open.targetVersion, "1.0.31");
-
-  // Same flag, a server it is not allowed for: still closed.
-  const otherServer = await evaluate(otherServerId);
-  assert.equal(otherServer.reasonCode, "broadcast_disabled");
-
-  // Turning v2 off closes the gate again, without contacting Hands.
-  await db.update(featureFlags).set({ enabled: false })
-    .where(eq(featureFlags.key, REMOTE_COMPUTER_UPGRADE_V2_FEATURE_FLAG_KEY));
-  const disabled = await evaluateBroadcastPolicy(input({ serverId }), {
-    fetchFn: async () => { assert.fail("a closed gate must not reach Hands"); },
+  const held = await evaluateBroadcastPolicy(windows, {
+    fetchFn: async () => { assert.fail("a held platform must not reach Hands"); },
   });
-  assert.equal(disabled.eligibility, "no_broadcast");
-  assert.equal(disabled.reasonCode, "broadcast_disabled");
-});
-
-dbTest("the batch evaluator reads the real remote_computer_upgrade_v2 flag when no gate is injected", async ({ db }) => {
-  const serverId = randomUUID();
-  const otherServerId = randomUUID();
-  await db.insert(featureFlags).values({
-    key: REMOTE_COMPUTER_UPGRADE_V2_FEATURE_FLAG_KEY,
-    description: "test remote computer upgrade v2",
-    enabled: true,
-    killSwitch: false,
-    randomizationUnit: "server",
-    defaultEnabled: false,
-    salt: "broadcast-policy-v2-batch-test",
-  });
-  await db.insert(featureFlagRules).values({
-    id: randomUUID(),
-    flagKey: REMOTE_COMPUTER_UPGRADE_V2_FEATURE_FLAG_KEY,
-    stage: "server",
-    priority: 0,
-    decision: "allow",
-    values: [serverId],
-  });
-  const evaluate = createBatchBroadcastPolicyEvaluator({ fetchFn: respond() });
-  const [first, second, other] = await Promise.all([
-    evaluate(input({ serverId })),
-    evaluate(input({ serverId })),
-    evaluate(input({ serverId: otherServerId })),
-  ]);
-  assert.equal(first.reasonCode, "eligible");
-  assert.equal(second.reasonCode, "eligible");
-  assert.equal(other.reasonCode, "broadcast_disabled");
+  assert.equal(held.reasonCode, "platform_held");
+  assert.equal((await evaluateBroadcastPolicy(input({ serverId }), { fetchFn: respond(body) })).reasonCode, "eligible");
 });

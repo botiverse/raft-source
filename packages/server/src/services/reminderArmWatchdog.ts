@@ -5,9 +5,11 @@ import { withTraceChildSpan, withTraceRoot } from "../tracing/semanticTrace";
 import type { AgentOrchestrator } from "./agentOrchestrator";
 
 /**
- * Server-side arm watchdog. It never fires or wakes a Reminder. Its sole job
- * is to make a missing target-Computer armed(revision) receipt visible as
- * durable `not_armed` business state and re-push that exact revision.
+ * Server-side arm watchdog. It never fires or wakes a Reminder. Its jobs:
+ * make a missing target-Computer armed(revision) receipt visible as durable
+ * `not_armed` business state and re-push that exact revision; and tell the
+ * Computer to drop its copy of a reminder the legacy import moved to the
+ * Reminder App (`reminder.cancel` at the migrated revision).
  */
 export interface ReminderArmWatchdogClock extends TimeProvider {
   setInterval(fn: () => void, ms: number): unknown;
@@ -21,7 +23,7 @@ export const systemReminderArmWatchdogClock: ReminderArmWatchdogClock = {
 };
 
 export interface ReminderArmWatchdogOptions {
-  orchestrator: Pick<AgentOrchestrator, "pushReminderUpsert">;
+  orchestrator: Pick<AgentOrchestrator, "pushReminderUpsert" | "pushReminderCancel">;
   clock?: ReminderArmWatchdogClock;
   intervalMs?: number;
   /** Scheduled rows this close to fireAt must already carry armed(version). */
@@ -83,6 +85,32 @@ export function startReminderArmWatchdog(
     }
   };
 
+  // A migrated row is already safe on current daemons: its version moved, so
+  // the server refuses a fire from the stale copy. The cancel clears that copy
+  // (it matters for daemons that fire locally and report afterwards). Marked
+  // done whether or not the push landed: an offline Computer's reconnect
+  // snapshot lists scheduled rows only, and retrying every tick for Computers
+  // that stay offline would never end.
+  const disarmMigrated = async () => {
+    const rows = await reminderService.listMigratedRemindersToDisarm({ limit: batchSize, clock });
+    for (const row of rows) {
+      await withTraceChildSpan(
+        "server.reminder_arm_watchdog.disarm_migrated",
+        {
+          surface: "server",
+          kind: "internal",
+          attrs: { reminder_id: row.id, owner_agent_id: row.ownerAgentId, version: row.version },
+        },
+        async () => {
+          const delivered = await opts.orchestrator.pushReminderCancel(row.ownerAgentId, row.id, row.version);
+          const marked = await reminderService.markMigratedReminderDisarmed(row.id, row.version, { clock });
+          return { outcome: delivered ? "pushed" : "owner_unreachable", marked };
+        },
+        { onSuccess: (result) => result },
+      );
+    }
+  };
+
   const tick = async () => {
     if (running) return;
     running = true;
@@ -93,7 +121,10 @@ export function startReminderArmWatchdog(
         tracer,
         "server.reminder_arm_watchdog.tick",
         { surface: "server", kind: "internal" },
-        resyncGaps,
+        async () => {
+          await resyncGaps();
+          await disarmMigrated();
+        },
       );
     } catch (error) {
       console.error("[reminderArmWatchdog] tick failed:", error);

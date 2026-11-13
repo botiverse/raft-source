@@ -8,13 +8,13 @@ import { encodeOidcAuthorizationCode } from "../services/oidcService";
 import { createServer } from "../services/serverService";
 import { createApiTest } from "../test/integration/apiTest";
 import { openTestApp } from "../test/integration/app";
-import { fixturePasswordHash } from "../test/integration/credentials";
+import { fixturePasswordHash, signInForTest } from "../test/integration/credentials";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 for (const kind of ["agent-code", "agent-request", "human-code", "human-oidc"] as const) {
   test(`PKCE downgrade rejects an unsolicited verifier for ${kind} without consuming the code`, async () => {
-    const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+    const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
     try {
       const suffix = randomUUID();
       const [owner] = await getDb().insert(users).values({
@@ -34,7 +34,7 @@ for (const kind of ["agent-code", "agent-request", "human-code", "human-oidc"] a
         assert.equal(result.status, "approved");
         code = result.request.id;
       } else {
-        const result = await issueHumanAuthorizationCode({ clientKey: client.clientId, userId: owner.id, serverId: server.id, returnUrl: redirectUri, scopes: ["openid", "profile"] });
+        const result = await issueHumanAuthorizationCode({ clientKey: client.clientId, userId: owner.id, serverId: server.id, returnUrl: redirectUri, scopes: ["openid", "profile"], approverSessionFamilyId: (await signInForTest(owner.id)).familyId });
         code = kind === "human-oidc"
           ? encodeOidcAuthorizationCode({ requestId: result.code, clientId: client.clientId, redirectUri })
           : result.code;

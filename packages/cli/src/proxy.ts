@@ -3,6 +3,7 @@
 // parts; WebSocket proxy is not needed in the CLI.
 
 import type { Dispatcher } from "undici";
+import { shouldBypassProxy } from "@botiverse/raft-shared/src/noProxy";
 
 // undici is loaded on first use, not at startup: a managed agent's `raft` call
 // talks to the loopback agent proxy through Node's built-in fetch and never
@@ -84,24 +85,6 @@ export class CanonicalFetchTransportError extends Error {
     this.cause = input.cause;
     this.diagnostics = diagnostics;
   }
-}
-
-function getDefaultPort(protocol: string): string {
-  switch (protocol) {
-    case "https:":
-      return "443";
-    case "http:":
-      return "80";
-    default:
-      return "";
-  }
-}
-
-function hostMatchesNoProxyEntry(hostname: string, ruleHost: string): boolean {
-  if (!ruleHost) return false;
-  const normalizedRule = ruleHost.replace(/^\*\./, ".").replace(/^\./, "").toLowerCase();
-  const normalizedHost = hostname.toLowerCase();
-  return normalizedHost === normalizedRule || normalizedHost.endsWith(`.${normalizedRule}`);
 }
 
 function getProxyUrlForTarget(targetUrl: string, env: NodeJS.ProcessEnv): string | undefined {
@@ -226,26 +209,6 @@ export function credentialFreeDiagnosticUrl(value: string | URL): string {
   return url.toString();
 }
 
-export function shouldBypassProxy(targetUrl: string, env: NodeJS.ProcessEnv): boolean {
-  const rawNoProxy = env.NO_PROXY || env.no_proxy;
-  if (!rawNoProxy) return false;
-
-  const url = new URL(targetUrl);
-  const hostname = url.hostname.toLowerCase();
-  const port = url.port || getDefaultPort(url.protocol);
-
-  return rawNoProxy
-    .split(",")
-    .map((entry) => entry.trim())
-    .filter(Boolean)
-    .some((entry) => {
-      if (entry === "*") return true;
-      const [ruleHost, rulePort] = entry.split(":", 2);
-      if (rulePort && rulePort !== port) return false;
-      return hostMatchesNoProxyEntry(hostname, ruleHost);
-    });
-}
-
 export async function buildFetchDispatcher(
   targetUrl: string,
   env: NodeJS.ProcessEnv = process.env,
@@ -266,6 +229,44 @@ export async function buildFetchDispatcher(
   });
   fetchDispatcherCache.set(proxyUrl, dispatcher);
   return dispatcher;
+}
+
+/**
+ * Send a request through a package-undici `dispatcher` on the package undici's
+ * fetch. That dispatcher must not ride Node's built-in fetch (another undici
+ * major): the pair fails before connecting (UND_ERR_INVALID_ARG "invalid
+ * onRequestStart method") or drops response headers. The request is built as a
+ * native Request first, so FormData and stream bodies cross the implementation
+ * boundary as a byte stream with their content type.
+ */
+export function fetchWithDispatcher(
+  url: string | URL,
+  init: ProxyAwareRequestInit & { dispatcher: Dispatcher },
+): Promise<Response> {
+  const { dispatcher, ...requestInit } = init;
+  const [packageUrl, packageInit] = packageFetchArgs(new Request(url, requestInit as RequestInit), { dispatcher });
+  return canonicalFetchImpl(packageUrl, packageInit);
+}
+
+/**
+ * Node's built-in fetch, except that a target the proxy environment routes
+ * through a proxy goes there via fetchWithDispatcher. For requests that must
+ * honor HTTPS_PROXY but otherwise keep the built-in fetch.
+ */
+export async function proxyAwareFetch(
+  url: string | URL,
+  init: ProxyAwareRequestInit = {},
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<Response> {
+  const dispatcher = await buildFetchDispatcher(url.toString(), env);
+  return dispatcher ? fetchWithDispatcher(url, { ...init, dispatcher }) : fetch(url, init);
+}
+
+/** Host and nested error code of a failed fetch, without the URL's path or query. */
+export function describeFetchFailure(url: string | URL, cause: unknown, proxyUsed: boolean): string {
+  const diagnostics = classifyFetchTransportFailure({ url: url.toString(), cause, proxyUsed });
+  const code = diagnostics.causeCode ? `/${diagnostics.causeCode}` : "";
+  return `${new URL(url).hostname} ${proxyUsed ? "via proxy" : "direct"}: ${diagnostics.causeClass}${code}`;
 }
 
 export async function fetchWithCanonicalProxy(

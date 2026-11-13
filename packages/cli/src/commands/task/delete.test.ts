@@ -52,7 +52,7 @@ test("task delete command uses injected ApiClient and writes canonical text", as
   const requests: Array<{ method: string; path: string; body: unknown }> = [];
   const ctx = contextReturning({ ok: true, status: 200, error: null, data: { ok: true } }, requests, io);
 
-  await taskDeleteCommand.handler(ctx, { target: "  #proj-runtime  ", number: "7" });
+  await taskDeleteCommand.handler(ctx, undefined, { target: "  #proj-runtime  ", number: "7" });
 
   assert.deepEqual(requests, [
     {
@@ -71,7 +71,7 @@ test("task delete command maps invalid numbers into typed CliError", async () =>
   const ctx = contextReturning({ ok: true, status: 200, error: null, data: { ok: true } }, requests, io);
 
   await assert.rejects(
-    async () => { await taskDeleteCommand.handler(ctx, { target: "#proj-runtime", number: "0" }); },
+    async () => { await taskDeleteCommand.handler(ctx, undefined, { target: "#proj-runtime", number: "0" }); },
     (err: unknown) => err instanceof CliError && err.code === "INVALID_ARG",
   );
   assert.deepEqual(requests, [], "a rejected argument must not reach the server");
@@ -92,7 +92,7 @@ test("task delete surfaces who may delete when the server refuses with 403", asy
   );
 
   await assert.rejects(
-    async () => { await taskDeleteCommand.handler(ctx, { target: "#proj-runtime", number: "7" }); },
+    async () => { await taskDeleteCommand.handler(ctx, undefined, { target: "#proj-runtime", number: "7" }); },
     (err: unknown) => {
       assert.ok(err instanceof CliError);
       assert.equal(err.code, "DELETE_FAILED");
@@ -109,7 +109,7 @@ test("task delete maps a 5xx to SERVER_5XX rather than DELETE_FAILED", async () 
   const ctx = contextReturning({ ok: false, status: 502, error: "bad gateway", data: null }, requests, io);
 
   await assert.rejects(
-    async () => { await taskDeleteCommand.handler(ctx, { target: "#proj-runtime", number: "7" }); },
+    async () => { await taskDeleteCommand.handler(ctx, undefined, { target: "#proj-runtime", number: "7" }); },
     (err: unknown) => err instanceof CliError && err.code === "SERVER_5XX",
   );
 });

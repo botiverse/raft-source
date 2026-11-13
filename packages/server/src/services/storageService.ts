@@ -27,16 +27,29 @@ import { s3PutDuration, s3PutRequestsTotal, s3SocketPoolQueueLength, s3SocketPoo
 const SDK_SOCKET_SATURATION_PATTERN = /socket usage at capacity=(\d+) and (\d+) additional requests are enqueued/;
 
 /**
- * Build a smithy-shaped Logger that forwards every level to console (so we
- * preserve the operator-visible warning) and additionally increments the
- * dedicated saturation counter when `warn` matches the SDK's own
+ * The SDK's logger middleware hands the logger each command's input: object
+ * keys and, for uploads, the start of the body. It logs every command at
+ * `info` and failures at `error`. Without a custom logger none of this is
+ * printed, so `info`/`debug`/`trace` stay silent here, and a command failure
+ * keeps the command, error and request metadata but drops the input.
+ */
+function withoutCommandInput(arg: unknown): unknown {
+  if (!arg || typeof arg !== "object" || !("commandName" in arg) || !("input" in arg)) return arg;
+  const { input: _input, ...rest } = arg as Record<string, unknown>;
+  return rest;
+}
+
+/**
+ * Build a smithy-shaped Logger that forwards warnings and errors to console
+ * (so we preserve the operator-visible warning) and additionally increments
+ * the dedicated saturation counter when `warn` matches the SDK's own
  * socket-pool-capacity message.
  */
 export function buildSdkLoggerWithSaturationCounter(labels: { bucket: string; endpoint_host: string }) {
   return {
-    trace: (...args: unknown[]) => console.trace(...args),
-    debug: (...args: unknown[]) => console.debug(...args),
-    info: (...args: unknown[]) => console.info(...args),
+    trace: () => {},
+    debug: () => {},
+    info: () => {},
     warn: (...args: unknown[]) => {
       try {
         const first = args[0];
@@ -48,7 +61,7 @@ export function buildSdkLoggerWithSaturationCounter(labels: { bucket: string; en
       }
       console.warn(...args);
     },
-    error: (...args: unknown[]) => console.error(...args),
+    error: (...args: unknown[]) => console.error(...args.map(withoutCommandInput)),
   };
 }
 import { errorClassOf, getCurrentTraceContext } from "../tracing/semanticTrace";
@@ -129,7 +142,13 @@ export interface StorageBackend {
     contentLength: number,
   ): Promise<void>;
   /** Get a readable stream for a file. */
-  get(key: string): Promise<Readable>;
+  get(key: string, signal?: AbortSignal): Promise<Readable>;
+  /**
+   * Distinguish a confirmed missing object from an inaccessible backend.
+   * Only "missing" is evidence of absence; every thrown error is unknown.
+   * Optional backends that cannot make this distinction must omit it.
+   */
+  probeObjectPresence?(key: string, signal?: AbortSignal): Promise<"present" | "missing">;
   /** Get a readable stream for a byte range. Local/dev storage uses this for media previews. */
   getRange?(key: string, start: number, end: number): Promise<Readable>;
   /** Delete a file. */
@@ -185,14 +204,6 @@ export function buildDirectAttachmentStorageKey(
   objectId: string,
 ): string {
   return `${ATTACHMENT_STORAGE_KEY_PREFIX}${serverId}/direct/${uploadId}/${objectId}`;
-}
-
-export function buildLegacyDirectAttachmentStorageKey(
-  serverId: string,
-  uploadId: string,
-  objectId: string,
-): string {
-  return `${ATTACHMENT_DIRECT_UPLOAD_STORAGE_KEY_PREFIX}${serverId}/${uploadId}/${objectId}`;
 }
 
 export function buildServerAttachmentStorageKey(
@@ -263,9 +274,14 @@ export function createAttachmentStorageRouter(
   };
   const routed: StorageBackend = {
     put: (key, data, contentType) => backendFor(key).put(key, data, contentType),
-    get: (key) => backendFor(key).get(key),
+    get: (key, signal) => backendFor(key).get(key, signal),
     delete: (key) => backendFor(key).delete(key),
   };
+
+  if (legacy.probeObjectPresence && (!directUpload || directUpload.probeObjectPresence)) {
+    routed.probeObjectPresence = (key, signal) =>
+      requireStorageOperation(backendFor(key), "probeObjectPresence")(key, signal);
+  }
 
   if (legacy.putStream && (!directUpload || directUpload.putStream)) {
     routed.putStream = (key, data, contentType, contentLength) =>
@@ -292,10 +308,11 @@ export function createAttachmentStorageRouter(
 
 /**
  * Immutable namespace for public derived assets (attachment thumbnails and
- * SVG raster previews) stored in the dedicated public-content bucket and
- * served from its own domain. The prefix is persisted in the storage key, so
- * every later read, URL, delete, and GC resolves the same backend no matter
- * which generation the write flag currently selects.
+ * SVG raster previews) stored through the public-content backend
+ * (getPublicContentStorage) and served from CDN_BASE_URL. The prefix is
+ * persisted in the storage key, so every later read, URL, delete, and GC
+ * resolves the same backend no matter which generation the write flag
+ * currently selects.
  */
 export const PUBLIC_CONTENT_V2_KEY_PREFIX = "content/v2/";
 
@@ -325,9 +342,64 @@ function normalizePublicBaseUrl(value: string | undefined): string | null {
   return trimmed ? trimmed.replace(/\/$/, "") : null;
 }
 
-/** Public origin for content/v2 keys; null keeps fresh writes on legacy keys. */
-export function getPublicContentBaseUrl(): string | null {
-  return normalizePublicBaseUrl(process.env.PUBLIC_CONTENT_BASE_URL);
+/**
+ * The public bucket and its domain have one set of names: S3_CDN_* and
+ * CDN_BASE_URL. The public-content names (S3_PUBLIC_CONTENT_*,
+ * PUBLIC_CONTENT_BASE_URL) pointed at the same bucket and are deprecated:
+ * each is read only when its CDN name is unset or blank, so the CDN name
+ * always wins when both are set. The first use of each deprecated name is
+ * logged (the name only, never its value). Remove the old names from the
+ * deployment config, then from here.
+ */
+const DEPRECATED_PUBLIC_CONTENT_ENV = {
+  CDN_BASE_URL: "PUBLIC_CONTENT_BASE_URL",
+  S3_CDN_BUCKET: "S3_PUBLIC_CONTENT_BUCKET",
+  S3_CDN_ENDPOINT: "S3_PUBLIC_CONTENT_ENDPOINT",
+  S3_CDN_REGION: "S3_PUBLIC_CONTENT_REGION",
+  S3_CDN_ACCESS_KEY_ID: "S3_PUBLIC_CONTENT_ACCESS_KEY_ID",
+  S3_CDN_SECRET_ACCESS_KEY: "S3_PUBLIC_CONTENT_SECRET_ACCESS_KEY",
+  S3_CDN_FORCE_PATH_STYLE: "S3_PUBLIC_CONTENT_FORCE_PATH_STYLE",
+} as const;
+
+type CdnEnvName = keyof typeof DEPRECATED_PUBLIC_CONTENT_ENV;
+type DeprecatedPublicContentEnvName = (typeof DEPRECATED_PUBLIC_CONTENT_ENV)[CdnEnvName];
+
+/** A CDN setting, trimmed: its CDN name, else its deprecated name (reported in `fallback`). Blank is unset. */
+function readCdnEnv(
+  name: CdnEnvName,
+  env: NodeJS.ProcessEnv = process.env,
+): { value: string | undefined; fallback: DeprecatedPublicContentEnvName | null } {
+  const current = env[name]?.trim();
+  if (current) return { value: current, fallback: null };
+  const deprecatedName = DEPRECATED_PUBLIC_CONTENT_ENV[name];
+  const deprecated = env[deprecatedName]?.trim();
+  return deprecated ? { value: deprecated, fallback: deprecatedName } : { value: undefined, fallback: null };
+}
+
+const CDN_ENV_FOR_DEPRECATED = Object.fromEntries(
+  Object.entries(DEPRECATED_PUBLIC_CONTENT_ENV).map(([cdnName, deprecatedName]) => [deprecatedName, cdnName]),
+) as Record<DeprecatedPublicContentEnvName, CdnEnvName>;
+
+const _loggedDeprecatedPublicContentEnv = new Set<DeprecatedPublicContentEnvName>();
+
+function logDeprecatedPublicContentEnv(names: readonly DeprecatedPublicContentEnvName[]): void {
+  const fresh = names.filter((name) => !_loggedDeprecatedPublicContentEnv.has(name));
+  if (fresh.length === 0) return;
+  for (const name of fresh) _loggedDeprecatedPublicContentEnv.add(name);
+  console.warn("[Storage] Deprecated public-content settings are in use because their CDN names are unset; set the CDN names instead", {
+    fallbacks: fresh.map((name) => `${name} (use ${CDN_ENV_FOR_DEPRECATED[name]})`),
+  });
+}
+
+/**
+ * Public origin for content/v2 keys: CDN_BASE_URL, else the deprecated
+ * PUBLIC_CONTENT_BASE_URL. Null keeps fresh writes on legacy keys.
+ */
+export function getPublicContentBaseUrl(env: NodeJS.ProcessEnv = process.env): string | null {
+  const { value, fallback } = readCdnEnv("CDN_BASE_URL", env);
+  const base = normalizePublicBaseUrl(value);
+  if (base && fallback) logDeprecatedPublicContentEnv([fallback]);
+  return base;
 }
 
 /**
@@ -381,7 +453,7 @@ export function createPublicContentStorageRouter(
   };
   const routed: StorageBackend = {
     put: (key, data, contentType) => backendFor(key).put(key, data, contentType),
-    get: (key) => backendFor(key).get(key),
+    get: (key, signal) => backendFor(key).get(key, signal),
     delete: (key) => backendFor(key).delete(key),
   };
 
@@ -409,12 +481,63 @@ export function createPublicContentStorageRouter(
 
 // --- Local disk storage ---
 
+/** Explicit operator attestation after verifying the intended volume is mounted.
+ * Ordinary storage operations must never call this or create the sentinel. */
+export function initializeLocalStoragePresenceIdentity(input: {
+  directory: string; configuredDirectory: string | undefined; expectedObjectKey: string;
+}): "initialized" | "already_initialized" {
+  if (!path.isAbsolute(input.directory) || !fs.statSync(input.directory).isDirectory()) {
+    throw new Error("Local storage initialization requires an existing absolute volume directory");
+  }
+  const directory = fs.realpathSync(input.directory);
+  if (!input.configuredDirectory || fs.realpathSync(path.resolve(input.configuredDirectory)) !== directory) {
+    throw new Error("Local storage initialization directory must match UPLOADS_DIR");
+  }
+  const key = input.expectedObjectKey;
+  const objectPath = path.resolve(directory, key);
+  if (!key || path.isAbsolute(key) || !objectPath.startsWith(directory + path.sep)
+    || key.startsWith(".raft-storage-presence-")) {
+    throw new Error("Local storage initialization requires a valid expected attachment object key");
+  }
+  let actualObject: string;
+  try { actualObject = fs.realpathSync(objectPath); }
+  catch { throw new Error("Expected attachment object is not present on this storage volume"); }
+  if (!actualObject.startsWith(directory + path.sep) || !fs.statSync(actualObject).isFile()) {
+    throw new Error("Expected attachment object is not a file on this storage volume");
+  }
+  const sentinelPath = path.join(directory, ".raft-storage-presence-v2");
+  try {
+    fs.writeFileSync(sentinelPath, `${randomUUID()}\n`, { flag: "wx", mode: 0o600 });
+    return "initialized";
+  } catch (error) {
+    if (!(error instanceof Error && "code" in error && error.code === "EEXIST")) throw error;
+    if (!/^[0-9a-f-]{36}\n$/.test(fs.readFileSync(sentinelPath, "utf8"))) {
+      throw new Error("Local storage namespace sentinel is invalid");
+    }
+    return "already_initialized";
+  }
+}
+
+let localPresenceInitializationWarningLogged = false;
+function warnUnverifiedLocalPresenceOnce(): void {
+  if (localPresenceInitializationWarningLogged) return;
+  localPresenceInitializationWarningLogged = true;
+  console.warn("[Storage] Local attachment absence is unverified. Verify the mounted UPLOADS_DIR, run pnpm --filter @botiverse/raft-server slack:initialize-local-storage-identity --directory <UPLOADS_DIR> --expect-object <known-existing-attachment-key>, then restart. Do not initialize an unverified mount.");
+}
+
 class LocalStorage implements StorageBackend {
   private dir: string;
+  private sentinel: string | null;
+  private readonly sentinelName = ".raft-storage-presence-v2";
 
   constructor(dir: string) {
     this.dir = dir;
     fs.mkdirSync(dir, { recursive: true });
+    // Only the explicit operator initialization creates this identity. Neither
+    // startup nor ordinary object reads/writes can certify an empty mountpoint.
+    try { this.sentinel = fs.readFileSync(path.join(dir, this.sentinelName), "utf8"); }
+    catch { this.sentinel = null; }
+    if (this.sentinel !== null && !/^[0-9a-f-]{36}\n$/.test(this.sentinel)) this.sentinel = null;
   }
 
   private resolveSafe(key: string): string {
@@ -454,12 +577,44 @@ class LocalStorage implements StorageBackend {
     }
   }
 
-  async get(key: string): Promise<Readable> {
+  async get(key: string, signal?: AbortSignal): Promise<Readable> {
     const filePath = this.resolveSafe(key);
     if (!fs.existsSync(filePath)) {
       throw new Error("File not found on disk");
     }
-    return fs.createReadStream(filePath);
+    return fs.createReadStream(filePath, { signal });
+  }
+
+  async probeObjectPresence(key: string, signal?: AbortSignal): Promise<"present" | "missing"> {
+    signal?.throwIfAborted();
+    const filePath = this.resolveSafe(key);
+    try {
+      const handle = await fs.promises.open(filePath, "r");
+      try { signal?.throwIfAborted(); return "present"; }
+      finally { await handle.close(); }
+    } catch (error) {
+      signal?.throwIfAborted();
+      if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+        // A missing storage root is an unavailable backend, not proof about
+        // this object. Let stat/access errors propagate as unknown.
+        const root = await fs.promises.stat(this.dir);
+        if (!root.isDirectory()) throw new Error("Local storage root is unavailable");
+        if (!this.sentinel) {
+          warnUnverifiedLocalPresenceOnce();
+          throw new Error("Local storage root is unverified");
+        }
+        let identity: string;
+        try { identity = await fs.promises.readFile(path.join(this.dir, this.sentinelName), "utf8"); }
+        catch (error) { warnUnverifiedLocalPresenceOnce(); throw error; }
+        if (identity !== this.sentinel) {
+          warnUnverifiedLocalPresenceOnce();
+          throw new Error("Local storage root identity changed");
+        }
+        signal?.throwIfAborted();
+        return "missing";
+      }
+      throw error;
+    }
   }
 
   async getRange(key: string, start: number, end: number): Promise<Readable> {
@@ -540,7 +695,7 @@ class S3Storage implements StorageBackend {
       },
       // Inject a custom logger so the SDK's own once-per-15s socket-pool
       // saturation warning becomes a Prometheus-counted incident signal.
-      // Forwards normal logging to console unchanged.
+      // Forwards warnings and errors to console, never command inputs.
       logger: buildSdkLoggerWithSaturationCounter({ bucket, endpoint_host }),
     });
     this.tracer = opts.tracer ?? noopTracer;
@@ -687,13 +842,33 @@ class S3Storage implements StorageBackend {
     s3SocketPoolQueueLength.labels(this.bucket, this.endpointHost).set(stats.queuedRequests);
   }
 
-  async get(key: string): Promise<Readable> {
+  async get(key: string, signal?: AbortSignal): Promise<Readable> {
     const response = await this.client.send(new GetObjectCommand({
       Bucket: this.bucket,
       Key: key,
-    }));
+    }), { abortSignal: signal });
     if (!response.Body) throw new Error("Empty response from S3");
     return response.Body as Readable;
+  }
+
+  async probeObjectPresence(key: string, signal?: AbortSignal): Promise<"present" | "missing"> {
+    signal?.throwIfAborted();
+    try {
+      // HEAD's generic 404 cannot distinguish a missing object from a missing
+      // bucket. A ranged GET retains the provider's explicit NoSuchKey code.
+      const response = await this.client.send(new GetObjectCommand({
+        Bucket: this.bucket, Key: key, Range: "bytes=0-0",
+      }), { abortSignal: signal });
+      if (!(response.Body instanceof Readable)) throw new Error("Storage presence response is unavailable");
+      response.Body.destroy();
+      signal?.throwIfAborted();
+      return "present";
+    } catch (error) {
+      signal?.throwIfAborted();
+      const code = error && typeof error === "object" && "Code" in error ? error.Code : undefined;
+      if ((error instanceof Error && error.name === "NoSuchKey") || code === "NoSuchKey") return "missing";
+      throw error;
+    }
   }
 
   async delete(key: string): Promise<void> {
@@ -764,85 +939,6 @@ class S3Storage implements StorageBackend {
 
 }
 
-// --- Orphan cleanup ---
-
-import { lt, isNull, and, eq } from "drizzle-orm";
-import { getDb, type Database } from "../db/index";
-import { attachments } from "../db/schema";
-
-const ORPHAN_MAX_AGE_MS = 60 * 60 * 1000; // 1 hour
-
-export async function cleanupLegacyOrphanAttachmentsWithDependencies(input: {
-  db: Database;
-  now: Date;
-  beforeCandidateLock?: (projectionId: string) => Promise<void>;
-  afterProjectionDeleteBeforeCommit?: (projectionId: string) => Promise<void>;
-}): Promise<number> {
-  const cutoff = new Date(input.now.getTime() - ORPHAN_MAX_AGE_MS);
-  const candidates = await input.db
-    .select({ id: attachments.id })
-    .from(attachments)
-    .where(and(
-      isNull(attachments.messageId),
-      isNull(attachments.objectId),
-      lt(attachments.createdAt, cutoff),
-    ));
-
-  let cleaned = 0;
-  for (const candidate of candidates) {
-    await input.beforeCandidateLock?.(candidate.id);
-    const deleted = await input.db.transaction(async (tx) => {
-      const [locked] = await tx.select({ id: attachments.id })
-        .from(attachments)
-        .where(and(
-          eq(attachments.id, candidate.id),
-          isNull(attachments.messageId),
-          isNull(attachments.objectId),
-          lt(attachments.createdAt, cutoff),
-        ))
-        .for("update", { of: attachments, skipLocked: true })
-        .limit(1);
-      if (!locked) return false;
-      const rows = await tx.delete(attachments).where(and(
-        eq(attachments.id, locked.id),
-        isNull(attachments.messageId),
-        isNull(attachments.objectId),
-      )).returning({ id: attachments.id });
-      if (rows.length !== 1) return false;
-      await input.afterProjectionDeleteBeforeCommit?.(locked.id);
-      return true;
-    });
-    if (deleted) cleaned += 1;
-  }
-
-  // Deliberately no storage/CDN capability exists in this legacy path. New
-  // object-backed uploads are owned by reservation + tokenized object GC;
-  // historical objectless rows may leak bytes until inventory migration, but
-  // can no longer delete bytes underneath a concurrent send or key reuse.
-  if (cleaned > 0) console.log(`[Storage] Cleaned up ${cleaned} legacy orphaned attachments`);
-  return cleaned;
-}
-
-export async function cleanupOrphanAttachments(): Promise<number> {
-  return cleanupLegacyOrphanAttachmentsWithDependencies({ db: getDb(), now: new Date() });
-}
-
-const CLEANUP_INTERVAL_MS = 15 * 60 * 1000; // Run every 15 minutes
-let _cleanupTimer: ReturnType<typeof setInterval> | null = null;
-
-export function startOrphanCleanup(): void {
-  if (_cleanupTimer) return;
-  _cleanupTimer = setInterval(() => {
-    cleanupOrphanAttachments().catch((err) =>
-      console.error("[Storage] Orphan cleanup error:", err)
-    );
-  }, CLEANUP_INTERVAL_MS);
-  // Run once immediately
-  cleanupOrphanAttachments().catch((err) =>
-    console.error("[Storage] Initial orphan cleanup error:", err)
-  );
-}
-
 // --- Singletons ---
 
 let _storage: StorageBackend | null = null;
@@ -850,6 +946,7 @@ let _storageResolved = false;
 let _storageTracer: Tracer | null = null;
 let _directUploadStorage: StorageBackend | null = null;
 let _directUploadStorageResolved = false;
+let _dedicatedAttachmentKeysWritable = true;
 let _publicContentStorage: StorageBackend | null = null;
 let _publicContentStorageResolved = false;
 
@@ -890,7 +987,9 @@ export function getStorage(): StorageBackend | null {
       maxSockets: parseS3MaxSockets(),
       tracer: _storageTracer,
     });
-    _storage = createAttachmentStorageRouter(legacyStorage, getDirectUploadStorage());
+    const dedicated = getDirectUploadStorage();
+    _dedicatedAttachmentKeysWritable = dedicated !== null;
+    _storage = createAttachmentStorageRouter(legacyStorage, dedicated);
   } else if (process.env.UPLOADS_LOCAL !== "false") {
     const dir = path.resolve(process.env.UPLOADS_DIR || path.join(process.cwd(), "uploads"));
     console.log(`[Storage] Using local disk: ${dir}`);
@@ -898,12 +997,25 @@ export function getStorage(): StorageBackend | null {
     // Local development has one physical root. Keep versioned routing active
     // without requiring production R2 credentials on a developer machine.
     _storage = createAttachmentStorageRouter(legacyStorage, getDirectUploadStorage() ?? legacyStorage);
+    _dedicatedAttachmentKeysWritable = true;
   } else {
     console.log(`[Storage] Uploads disabled (no S3 configured, UPLOADS_LOCAL=false)`);
     _storage = null;
+    _dedicatedAttachmentKeysWritable = false;
   }
 
   return _storage;
+}
+
+/**
+ * Whether a new attachment original may take an `attachments/v2/` key. Those
+ * keys route to the dedicated attachment bucket, so an S3 deployment without
+ * that bucket configured (some self-hosted ones) keeps writing legacy keys
+ * instead of failing every upload. Local disk serves both from one root.
+ */
+export function canWriteDedicatedAttachmentKeys(): boolean {
+  getStorage();
+  return _dedicatedAttachmentKeysWritable;
 }
 
 /**
@@ -953,45 +1065,173 @@ export function getDirectUploadStorage(): StorageBackend | null {
   return _directUploadStorage;
 }
 
+/** A standalone bucket on core's S3 client: read, write, delete and presigned GET. */
+export type S3BucketStorage = Pick<StorageBackend, "put" | "get" | "delete"> & Required<Pick<StorageBackend, "getPresignedUrl">>;
+
 /**
- * Dedicated S3-compatible backend for content/v2 public derived assets.
- * Every setting is explicit: this path never inherits the legacy CDN or
- * attachment credentials, and partial configuration disables it.
+ * A bucket outside core's attachment and CDN routing (the platform's
+ * app-content bucket, getAppObjectsBucket) built by core's S3Storage: its own
+ * keep-alive pool of S3_MAX_SOCKETS, S3_REQUEST_TIMEOUT_MS, the put metrics
+ * and traces, and the socket-pool saturation counter, and its SDK logger,
+ * which never prints a command's input. Only the given credentials are used.
+ */
+export function createS3BucketStorage(config: {
+  endpoint: string;
+  region?: string;
+  accessKeyId: string;
+  secretAccessKey: string;
+  bucket: string;
+  forcePathStyle?: boolean;
+}): S3BucketStorage {
+  return new S3Storage({
+    ...config,
+    requestTimeoutMs: parseS3RequestTimeoutMs(),
+    maxSockets: parseS3MaxSockets(),
+    tracer: _storageTracer,
+  });
+}
+
+let _appObjectsBucket: S3BucketStorage | null = null;
+let _appObjectsBucketResolved = false;
+
+const APP_OBJECTS_REQUIRED_ENV = [
+  "APP_STORAGE_R2_ENDPOINT",
+  "APP_STORAGE_R2_ACCESS_KEY_ID",
+  "APP_STORAGE_R2_SECRET_ACCESS_KEY",
+  "APP_STORAGE_R2_BUCKET",
+] as const;
+
+/**
+ * The platform's one app-content bucket (APP_STORAGE_R2_*; region
+ * APP_STORAGE_R2_REGION, default `auto`; always path-style, as R2 and MinIO
+ * take it), where every first-party app keeps its objects under its own
+ * `apps/<id>/` prefix. Apps never get this: core hands each one a handle
+ * scoped to its prefix (services/appObjectStorage.ts). All or nothing: null
+ * when none of it is set; a partial configuration is also null, with a
+ * warning naming what is missing. Every setting is explicit: it never
+ * inherits or falls back to the attachment, CDN or public-content buckets or
+ * their credentials.
+ */
+export function getAppObjectsBucket(env: NodeJS.ProcessEnv = process.env): S3BucketStorage | null {
+  if (_appObjectsBucketResolved) return _appObjectsBucket;
+  _appObjectsBucketResolved = true;
+  const missing = APP_OBJECTS_REQUIRED_ENV.filter((name) => !env[name]);
+  if (missing.length === APP_OBJECTS_REQUIRED_ENV.length) return null;
+  if (missing.length > 0) {
+    console.warn("[Storage] App-content bucket configuration is incomplete; app object storage is disabled", { missing });
+    return null;
+  }
+  console.log(`[Storage] App-content S3 bucket: ${env.APP_STORAGE_R2_ENDPOINT} / ${env.APP_STORAGE_R2_BUCKET}`);
+  _appObjectsBucket = createS3BucketStorage({
+    endpoint: env.APP_STORAGE_R2_ENDPOINT!,
+    region: env.APP_STORAGE_R2_REGION || "auto",
+    accessKeyId: env.APP_STORAGE_R2_ACCESS_KEY_ID!,
+    secretAccessKey: env.APP_STORAGE_R2_SECRET_ACCESS_KEY!,
+    bucket: env.APP_STORAGE_R2_BUCKET!,
+    forcePathStyle: true,
+  });
+  return _appObjectsBucket;
+}
+
+export type PublicContentStorageConfig =
+  | { kind: "disabled" }
+  | { kind: "incomplete"; missing: string[] }
+  | {
+      kind: "configured";
+      endpoint: string;
+      region: string;
+      accessKeyId: string;
+      secretAccessKey: string;
+      bucket: string;
+      forcePathStyle: boolean;
+      /** Deprecated public-content names this configuration was read from. */
+      fallbacks: DeprecatedPublicContentEnvName[];
+    };
+
+const PUBLIC_CONTENT_CONNECTION_ENV = ["S3_CDN_ENDPOINT", "S3_CDN_ACCESS_KEY_ID", "S3_CDN_SECRET_ACCESS_KEY"] as const;
+
+/**
+ * Where content/v2 public derived assets are stored: the CDN bucket
+ * (S3_CDN_BUCKET) on the CDN's own connection (S3_CDN_ENDPOINT,
+ * S3_CDN_ACCESS_KEY_ID, S3_CDN_SECRET_ACCESS_KEY; S3_CDN_REGION, default
+ * `auto`; S3_CDN_FORCE_PATH_STYLE), each name falling back to its deprecated
+ * S3_PUBLIC_CONTENT_* name when unset. The endpoint and key pair are taken
+ * as one unit, the CDN's when all three are set, else the deprecated ones
+ * when all three of those are, so a key id and secret never come from two
+ * different sets. It never inherits the main storage's credentials: without
+ * a connection of its own it is disabled. S3_CDN_BUCKET alone is not an
+ * attempt to configure it (the legacy CDN bucket on the main credentials),
+ * so that is disabled without a warning; any other partial setting is
+ * incomplete.
+ */
+export function resolvePublicContentStorageConfig(env: NodeJS.ProcessEnv = process.env): PublicContentStorageConfig {
+  const fallbacks: DeprecatedPublicContentEnvName[] = [];
+  const read = (name: CdnEnvName): string | undefined => {
+    const { value, fallback } = readCdnEnv(name, env);
+    if (fallback) fallbacks.push(fallback);
+    return value;
+  };
+  const cdnConnection = PUBLIC_CONTENT_CONNECTION_ENV.map((name) => env[name]?.trim() || undefined);
+  const deprecatedConnection = PUBLIC_CONTENT_CONNECTION_ENV.map(
+    (name) => env[DEPRECATED_PUBLIC_CONTENT_ENV[name]]?.trim() || undefined,
+  );
+  let connection: (string | undefined)[] | null = null;
+  if (cdnConnection.every(Boolean)) {
+    connection = cdnConnection;
+  } else if (deprecatedConnection.every(Boolean)) {
+    connection = deprecatedConnection;
+    fallbacks.push(...PUBLIC_CONTENT_CONNECTION_ENV.map((name) => DEPRECATED_PUBLIC_CONTENT_ENV[name]));
+  }
+  const bucket = read("S3_CDN_BUCKET");
+
+  if (!connection) {
+    const anyConnection = [...cdnConnection, ...deprecatedConnection].some(Boolean);
+    if (!anyConnection && !env.S3_PUBLIC_CONTENT_BUCKET?.trim()) return { kind: "disabled" };
+    const missing: string[] = PUBLIC_CONTENT_CONNECTION_ENV.filter((_, index) => !cdnConnection[index]);
+    if (!bucket) missing.push("S3_CDN_BUCKET");
+    return { kind: "incomplete", missing };
+  }
+  if (!bucket) return { kind: "incomplete", missing: ["S3_CDN_BUCKET"] };
+
+  const [endpoint, accessKeyId, secretAccessKey] = connection as [string, string, string];
+  return {
+    kind: "configured",
+    endpoint,
+    region: read("S3_CDN_REGION") || "auto",
+    accessKeyId,
+    secretAccessKey,
+    bucket,
+    forcePathStyle: read("S3_CDN_FORCE_PATH_STYLE") === "true",
+    fallbacks,
+  };
+}
+
+/**
+ * S3-compatible backend for content/v2 public derived assets
+ * (resolvePublicContentStorageConfig). A partial configuration disables it
+ * with a warning naming what is missing.
  */
 export function getPublicContentStorage(): StorageBackend | null {
   if (_publicContentStorageResolved) return _publicContentStorage;
   _publicContentStorageResolved = true;
 
-  const config = {
-    endpoint: process.env.S3_PUBLIC_CONTENT_ENDPOINT,
-    region: process.env.S3_PUBLIC_CONTENT_REGION || "auto",
-    accessKeyId: process.env.S3_PUBLIC_CONTENT_ACCESS_KEY_ID,
-    secretAccessKey: process.env.S3_PUBLIC_CONTENT_SECRET_ACCESS_KEY,
-    bucket: process.env.S3_PUBLIC_CONTENT_BUCKET,
-    forcePathStyle: process.env.S3_PUBLIC_CONTENT_FORCE_PATH_STYLE === "true",
-  };
-  const required = [
-    ["S3_PUBLIC_CONTENT_ENDPOINT", config.endpoint],
-    ["S3_PUBLIC_CONTENT_ACCESS_KEY_ID", config.accessKeyId],
-    ["S3_PUBLIC_CONTENT_SECRET_ACCESS_KEY", config.secretAccessKey],
-    ["S3_PUBLIC_CONTENT_BUCKET", config.bucket],
-  ] as const;
-  const configuredCount = required.filter(([, value]) => Boolean(value)).length;
-  if (configuredCount === 0) return null;
-  if (configuredCount !== required.length) {
+  const config = resolvePublicContentStorageConfig();
+  if (config.kind === "disabled") return null;
+  if (config.kind === "incomplete") {
     console.warn("[Storage] Public-content bucket configuration is incomplete; content/v2 storage is disabled", {
-      missing: required.filter(([, value]) => !value).map(([name]) => name),
+      missing: config.missing,
     });
     return null;
   }
+  logDeprecatedPublicContentEnv(config.fallbacks);
 
   console.log(`[Storage] Public-content S3 bucket: ${config.endpoint} / ${config.bucket}`);
   _publicContentStorage = new S3Storage({
-    endpoint: config.endpoint!,
+    endpoint: config.endpoint,
     region: config.region,
-    accessKeyId: config.accessKeyId!,
-    secretAccessKey: config.secretAccessKey!,
-    bucket: config.bucket!,
+    accessKeyId: config.accessKeyId,
+    secretAccessKey: config.secretAccessKey,
+    bucket: config.bucket,
     forcePathStyle: config.forcePathStyle,
     requestTimeoutMs: parseS3RequestTimeoutMs(),
     maxSockets: parseS3MaxSockets(),
@@ -1002,7 +1242,7 @@ export function getPublicContentStorage(): StorageBackend | null {
 
 /**
  * Fresh writes may select content/v2 keys only when the object can be both
- * stored in and served from the dedicated public-content bucket.
+ * stored through the public-content backend and served from CDN_BASE_URL.
  */
 export function isPublicContentV2WriteConfigured(): boolean {
   return getPublicContentStorage() !== null && getPublicContentBaseUrl() !== null;
@@ -1017,11 +1257,19 @@ export function resetStorageForTests(): void {
   _cdnStorageResolved = false;
   _publicContentStorage = null;
   _publicContentStorageResolved = false;
+  _loggedDeprecatedPublicContentEnv.clear();
+  _appObjectsBucket = null;
+  _appObjectsBucketResolved = false;
+  _opsProfileStorage = null;
+  _opsProfileStorageResolved = false;
+  _dedicatedAttachmentKeysWritable = true;
 }
 
-export function __setStorageForTests(storage: StorageBackend | null): void {
+/** An injected test backend accepts every key unless a test says otherwise. */
+export function __setStorageForTests(storage: StorageBackend | null, options: { dedicatedAttachmentKeys?: boolean } = {}): void {
   _storage = storage;
   _storageResolved = true;
+  _dedicatedAttachmentKeysWritable = options.dedicatedAttachmentKeys ?? true;
 }
 
 export function __setDirectUploadStorageForTests(storage: StorageBackend | null): void {
@@ -1044,23 +1292,70 @@ export function __setPublicContentStorageForTests(storage: StorageBackend | null
 let _cdnStorage: StorageBackend | null = null;
 let _cdnStorageResolved = false;
 
+/** The public CDN base a stored URL starts with when it is ours: CDN_BASE_URL. Raw, as each check compares it. */
+export function cdnPublicBaseUrl(env: NodeJS.ProcessEnv = process.env): string | null {
+  return env.CDN_BASE_URL?.trim() || null;
+}
+
+/**
+ * The connection the CDN's legacy keys use: S3_CDN_ENDPOINT /
+ * S3_CDN_ACCESS_KEY_ID / S3_CDN_SECRET_ACCESS_KEY (S3_CDN_REGION,
+ * S3_CDN_FORCE_PATH_STYLE) when all three are set, so the CDN bucket can sit
+ * in another account than the main storage (slock.ai migration T4: main on
+ * the direct-upload key, CDN on the public-content one); otherwise the main
+ * storage's S3_*, as before. A partial S3_CDN_* is ignored with a warning.
+ */
+export function cdnStorageConnection(env: NodeJS.ProcessEnv = process.env): {
+  endpoint: string | undefined;
+  region: string;
+  accessKeyId: string | undefined;
+  secretAccessKey: string | undefined;
+  forcePathStyle: boolean;
+} {
+  const own = [env.S3_CDN_ENDPOINT, env.S3_CDN_ACCESS_KEY_ID, env.S3_CDN_SECRET_ACCESS_KEY];
+  const ownCount = own.filter(Boolean).length;
+  if (ownCount === own.length) {
+    return {
+      endpoint: env.S3_CDN_ENDPOINT,
+      region: env.S3_CDN_REGION || "auto",
+      accessKeyId: env.S3_CDN_ACCESS_KEY_ID,
+      secretAccessKey: env.S3_CDN_SECRET_ACCESS_KEY,
+      forcePathStyle: env.S3_CDN_FORCE_PATH_STYLE === "true",
+    };
+  }
+  if (ownCount > 0) {
+    console.warn("[Storage] CDN credentials are incomplete (S3_CDN_ENDPOINT, S3_CDN_ACCESS_KEY_ID, S3_CDN_SECRET_ACCESS_KEY); using the main storage's");
+  }
+  return {
+    endpoint: env.S3_ENDPOINT,
+    region: env.S3_REGION || "auto",
+    accessKeyId: env.S3_ACCESS_KEY_ID,
+    secretAccessKey: env.S3_SECRET_ACCESS_KEY,
+    forcePathStyle: env.S3_FORCE_PATH_STYLE === "true",
+  };
+}
+
 /**
  * Returns the storage backend for public derived assets.
- * Legacy keys use S3_CDN_BUCKET (same credentials as main storage, different
- * bucket) and fall back to main storage if S3_CDN_BUCKET is not set.
- * content/v2 keys always route to the dedicated public-content bucket and
- * never fall back to either legacy backend.
+ * Legacy keys use S3_CDN_BUCKET (the main storage's credentials unless
+ * S3_CDN_* names its own: cdnStorageConnection) and fall back to main storage
+ * if S3_CDN_BUCKET is not set.
+ * content/v2 keys always route to the public-content backend
+ * (getPublicContentStorage, on the CDN's own connection) and never fall back
+ * to either legacy backend.
  */
 export function getCdnStorage(): StorageBackend | null {
   if (_cdnStorageResolved) return _cdnStorage;
   _cdnStorageResolved = true;
 
   const cdnBucket = process.env.S3_CDN_BUCKET;
-  const s3Endpoint = process.env.S3_ENDPOINT;
-  const s3Region = process.env.S3_REGION || "auto";
-  const s3AccessKey = process.env.S3_ACCESS_KEY_ID;
-  const s3SecretKey = process.env.S3_SECRET_ACCESS_KEY;
-  const s3ForcePathStyle = process.env.S3_FORCE_PATH_STYLE === "true";
+  const {
+    endpoint: s3Endpoint,
+    region: s3Region,
+    accessKeyId: s3AccessKey,
+    secretAccessKey: s3SecretKey,
+    forcePathStyle: s3ForcePathStyle,
+  } = cdnStorageConnection();
 
   let legacyCdnStorage: StorageBackend | null;
   if (cdnBucket && s3Endpoint && s3AccessKey && s3SecretKey) {
@@ -1085,4 +1380,89 @@ export function getCdnStorage(): StorageBackend | null {
     ? createPublicContentStorageRouter(legacyCdnStorage, getPublicContentStorage())
     : null;
   return _cdnStorage;
+}
+
+let _opsProfileStorage: StorageBackend | null = null;
+let _opsProfileStorageResolved = false;
+
+const OPS_PROFILE_DEDICATED_ENV = [
+  "OPS_PROFILE_S3_ENDPOINT",
+  "OPS_PROFILE_S3_ACCESS_KEY_ID",
+  "OPS_PROFILE_S3_SECRET_ACCESS_KEY",
+] as const;
+
+export type OpsProfileStorageConfig =
+  | { kind: "disabled" }
+  | { kind: "misconfigured"; missing: string[] }
+  | {
+      kind: "dedicated" | "main";
+      bucket: string;
+      endpoint: string;
+      region: string;
+      accessKeyId: string;
+      secretAccessKey: string;
+    };
+
+/**
+ * Where ops CPU profiles are written. S3_OPS_PROFILE_BUCKET (no default) is
+ * required. With all three OPS_PROFILE_S3_* set, a dedicated client writes it
+ * (own endpoint/account and a key scoped to this one bucket; region from
+ * OPS_PROFILE_S3_REGION, default "auto"). With none of them set, the main S3
+ * credentials write it. A partial OPS_PROFILE_S3_* set is a configuration
+ * error: the endpoint stays closed rather than silently falling back to the
+ * main credentials. Never falls back to the attachment bucket.
+ */
+export function resolveOpsProfileStorageConfig(env: NodeJS.ProcessEnv = process.env): OpsProfileStorageConfig {
+  const bucket = env.S3_OPS_PROFILE_BUCKET?.trim();
+  if (!bucket) return { kind: "disabled" };
+
+  const present = OPS_PROFILE_DEDICATED_ENV.filter(name => env[name]?.trim());
+  if (present.length === OPS_PROFILE_DEDICATED_ENV.length) {
+    return {
+      kind: "dedicated",
+      bucket,
+      endpoint: env.OPS_PROFILE_S3_ENDPOINT!.trim(),
+      region: env.OPS_PROFILE_S3_REGION?.trim() || "auto",
+      accessKeyId: env.OPS_PROFILE_S3_ACCESS_KEY_ID!.trim(),
+      secretAccessKey: env.OPS_PROFILE_S3_SECRET_ACCESS_KEY!.trim(),
+    };
+  }
+  if (present.length > 0) {
+    return { kind: "misconfigured", missing: OPS_PROFILE_DEDICATED_ENV.filter(name => !present.includes(name)) };
+  }
+
+  const endpoint = env.S3_ENDPOINT;
+  const accessKeyId = env.S3_ACCESS_KEY_ID;
+  const secretAccessKey = env.S3_SECRET_ACCESS_KEY;
+  if (!endpoint || !accessKeyId || !secretAccessKey) return { kind: "disabled" };
+  return { kind: "main", bucket, endpoint, region: env.S3_REGION || "auto", accessKeyId, secretAccessKey };
+}
+
+/** Storage for ops CPU profiles; null keeps the endpoint closed. */
+export function getOpsProfileStorage(): StorageBackend | null {
+  if (_opsProfileStorageResolved) return _opsProfileStorage;
+  _opsProfileStorageResolved = true;
+
+  const config = resolveOpsProfileStorageConfig();
+  if (config.kind === "misconfigured") {
+    // Names only; never values.
+    console.error(
+      `[ops.cpu_profile] storage misconfigured: OPS_PROFILE_S3_* must be all set or all unset; missing ${config.missing.join(", ")}. CPU profile endpoint stays closed.`,
+    );
+    return null;
+  }
+  if (config.kind === "disabled") return null;
+
+  _opsProfileStorage = new S3Storage({
+    endpoint: config.endpoint,
+    region: config.region,
+    accessKeyId: config.accessKeyId,
+    secretAccessKey: config.secretAccessKey,
+    bucket: config.bucket,
+    forcePathStyle: process.env.S3_FORCE_PATH_STYLE === "true",
+    requestTimeoutMs: parseS3RequestTimeoutMs(),
+    maxSockets: parseS3MaxSockets(),
+    tracer: _storageTracer,
+  });
+  return _opsProfileStorage;
 }

@@ -7,30 +7,25 @@ import {
   LegacyMachinesClient,
   ServerMachinesClient,
   ServersClient,
-  UnreadActivityDiagnosticClient,
   type ServerMachineEntry,
   type UserServerEntry,
 } from "./apiClient";
 import { adjudicate, collectDetectionEvidence } from "./lib/migration";
 import type { LocalCandidateEvidence } from "./lib/types";
-import { ensureUsableUserSession, readUserSessionAuth } from "./lib/userSession";
+import { readUserSessionAuth } from "./lib/userSession";
 import { formatServerSlugDisplay, listServerAttachments } from "./serverState";
 import { formatRaftHomeForDisplay, resolveRaftHome } from "./paths";
 import { info, present } from "./output";
 import { createComputerApi } from "./lib/api";
 import { resolveServerUrl, resolveServerUrlEnv } from "./serverUrl";
 import { redactSecrets } from "./doctor";
-import { ComputerError } from "./lib/errors";
-import {
-  exportUnreadActivityDiagnosticSnapshot,
-  UnreadActivityDiagnosticExportError,
-} from "./unreadActivityDiagnosticExport";
+import { COMPUTER_VERSION } from "./version";
+import type { ComputerCliDoctorJson } from "@botiverse/raft-shared";
 
 export async function runDoctor(opts: {
   cleanup?: boolean;
   serverId?: string;
   serverLabel?: string;
-  unreadActivityDump?: string;
 }): Promise<void> {
   // CLI presenter over `api.doctor`. The api builds the diagnostic report
   // (running the residue cleanup pass when `--fix`/`cleanup` is set — a
@@ -69,7 +64,8 @@ export async function runDoctor(opts: {
       for (const c of crashes) {
         const sig = c.signal ? ` signal=${c.signal}` : "";
         const code = c.exitCode !== null ? ` exitCode=${c.exitCode}` : "";
-        info(`  - ${c.at}${code}${sig}`);
+        const why = c.reason === "external_signal" ? " (stopped by a SIGTERM this Computer did not send)" : "";
+        info(`  - ${c.at}${code}${sig}${why}`);
       }
       info(`  → Once you fix the underlying issue, run`);
       info(`    \`raft-computer restart ${opts.serverLabel ?? opts.serverId}\` to try again.`);
@@ -101,40 +97,6 @@ export async function runDoctor(opts: {
         }
       } else {
         info("  No residue found — clean baseline.");
-      }
-    }
-
-    if (opts.unreadActivityDump) {
-      const session = await ensureUsableUserSession(slockHome);
-      if (session.status !== "usable") {
-        throw new ComputerError(
-          "DIAGNOSTIC_SNAPSHOT_AUTH_REQUIRED",
-          "Unread/Activity diagnostic export requires a current login. Run `raft-computer login`, then retry the same doctor command.",
-        );
-      }
-      const baseUrl = resolveServerUrl(
-        undefined,
-        session.serverUrl,
-        resolveServerUrlEnv(),
-      );
-      try {
-        const receipt = await exportUnreadActivityDiagnosticSnapshot({
-          client: new UnreadActivityDiagnosticClient(baseUrl, session.accessToken),
-          outputPath: opts.unreadActivityDump,
-          ...(opts.serverId ? { serverId: opts.serverId } : {}),
-        });
-        info("");
-        info(
-          redactSecrets(
-            `Unread/Activity diagnostic saved to ${receipt.outputPath} (${receipt.bytes} bytes; ${receipt.servers} server total${receipt.servers === 1 ? "" : "s"}; ${receipt.views} view${receipt.views === 1 ? "" : "s"}).`,
-          ),
-        );
-        info("This private local file was not uploaded.");
-      } catch (error) {
-        if (error instanceof UnreadActivityDiagnosticExportError) {
-          throw new ComputerError(error.code, error.message);
-        }
-        throw error;
       }
     }
 
@@ -217,6 +179,40 @@ function serverMachinesLine(label: string, machines: ServerMachineEntry[]): stri
   return `Server side: your account has ${machines.length} Computer${machines.length === 1 ? "" : "s"} on ${label}: ${rendered}.`;
 }
 
+/**
+ * `raft-computer doctor --json`: the same report as one JSON line, every
+ * detail through `redactSecrets()`. Exits 0 whenever the checks ran (the
+ * outcome is `allOk`), so a caller can tell "failed to run" from "found a
+ * problem". Raft Desktop's Run Diagnostics reads it.
+ */
+export async function runDoctorJson(opts: { cleanup?: boolean; serverId?: string; serverLabel?: string }): Promise<void> {
+  const api = createComputerApi(resolveRaftHome());
+  await present(async () => {
+    const report = await api.doctor({
+      cleanup: opts.cleanup,
+      ...(opts.serverId ? { serverId: opts.serverId } : {}),
+      ...(opts.serverLabel ? { serverLabel: opts.serverLabel } : {}),
+    });
+    const cleaned = report.cleanup
+      ? report.cleanup.stalePidfiles.length + report.cleanup.orphanProcesses.length + report.cleanup.powerLossRecovered.length
+        + report.cleanup.tmpFilesCleared.length + report.cleanup.staleLocks.length
+      : null;
+    const json: ComputerCliDoctorJson = {
+      checks: report.checks.map((check) => ({
+        name: redactSecrets(check.name),
+        ok: check.ok,
+        detail: redactSecrets(check.detail),
+        ...(check.kind === "section" ? { section: true } : {}),
+      })),
+      allOk: report.allOk,
+      cleaned: cleaned === null ? null : { removed: cleaned },
+      cliVersion: COMPUTER_VERSION,
+      ranAt: new Date().toISOString(),
+    };
+    process.stdout.write(`${JSON.stringify(json)}\n`);
+  });
+}
+
 export async function runDoctorMigrationDetails(opts: { serverLabel?: string }): Promise<void> {
   await present(async () => {
     const slockHome = resolveRaftHome();
@@ -244,6 +240,7 @@ export async function runDoctorMigrationDetails(opts: { serverLabel?: string }):
         if (serverMachines.status === "success") machines = serverMachines.machines;
       }
     } else {
+      info("Server side: skipped (it needs a user session, which this machine does not keep); showing local evidence only.");
       evidence = await collectDetectionEvidence(slockHome, "", () => ({
         list: async () => ({ status: "success", entries: [] }),
       }));

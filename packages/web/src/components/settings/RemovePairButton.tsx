@@ -14,7 +14,7 @@ export function RemovePairButton({
   const { formatMessage } = useIntl();
   const handleClick = useCallback(() => onRemove(pair), [onRemove, pair]);
   return (
-    <Button size="icon-sm" variant="ghost" aria-label={formatMessage({ id: "settings.slackBridge.removePair" })} onClick={handleClick}>
+    <Button size="icon-md" variant="ghost" aria-label={formatMessage({ id: "settings.slackBridge.removePair" })} onClick={handleClick}>
       <Trash2 size={16} />
     </Button>
   );

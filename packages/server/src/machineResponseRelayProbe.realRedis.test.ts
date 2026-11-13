@@ -80,3 +80,37 @@ test("real Redis: a wrong-probe response cannot occupy the reply slot", async ()
   await store.remove(asMachineReplyRequestId(e2eRequestId));
   redis.disconnect();
 });
+
+test("real Redis: a relayed reply keeps its empty arrays", async () => {
+  // cjson (Redis Lua) encodes an empty table as `{}`: a reply stored through
+  // the Lua write path came back with `windows: {}` for an account with no
+  // usage windows, and the Computers page crashed on `windows.find` (#triage:#151).
+  if (!REAL_REDIS_URL) {
+    if (REAL_REDIS_REQUIRED) throw new Error("PROBE_RELAY_REAL_REDIS_REQUIRED=1 but PROBE_RELAY_REAL_REDIS_URL is unset");
+    return;
+  }
+  const redis = new Redis(REAL_REDIS_URL);
+  const store = redisMachineReplyStore(() => redis);
+  const requestId = `req-${Math.random().toString(36).slice(2)}`;
+  await store.open({
+    requestId,
+    machineId: "machine-1",
+    type: "machine:runtime_account_usage:snapshot",
+    replyReplicaId: "requester",
+  } as never, 30_000);
+  const response = {
+    type: "machine:runtime_account_usage:snapshot",
+    requestId,
+    snapshot: { protocolVersion: 2, provider: "claude", accounts: [{ health: "error", windows: [] }], tags: [], label: "é/\\\"" },
+  } as unknown as RelayedMachineResponse;
+  await store.write("machine-1", response, asMachineReplyReplicaId("owner"));
+  const record = await store.read(asMachineReplyRequestId(requestId));
+  assert.deepEqual(record?.response, response);
+  // A record written by a replica on older code has no `responseJson`: read its `response`.
+  const legacyId = `req-${Math.random().toString(36).slice(2)}`;
+  await redis.set(`slock:machine-reply:${legacyId}`, JSON.stringify({ requestId: legacyId, machineId: "machine-1", type: response.type, replyReplicaId: "requester", response: { ...response, requestId: legacyId } }), "PX", 30_000);
+  assert.deepEqual((await store.read(asMachineReplyRequestId(legacyId)))?.response, { ...response, requestId: legacyId });
+  await store.remove(asMachineReplyRequestId(requestId));
+  await store.remove(asMachineReplyRequestId(legacyId));
+  redis.disconnect();
+});

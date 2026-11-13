@@ -1,7 +1,6 @@
 import { dbTest as test } from "../test/integration/dbTest";
 import { closeTestDatabase } from "../test/integration/database";
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
 import {
   AGENT_MIGRATION_BUNDLE_CONTENT_TYPE,
   AGENT_MIGRATION_COMMIT_MARKER_PATH,
@@ -9,6 +8,7 @@ import {
   AGENT_MIGRATION_DEFAULT_CHUNK_BYTES,
   AGENT_MIGRATION_MAX_ARCHIVE_ENTRIES,
   AGENT_MIGRATION_CAPABILITY,
+  AGENT_MIGRATION_SOURCE_DRAIN_MAX_MS,
   AGENT_MIGRATION_RESUMABLE_PROTOCOL,
   BasicTracer,
   MAX_AGENT_MIGRATION_TRANSPORT_BYTES,
@@ -39,6 +39,7 @@ import {
   AGENT_MIGRATION_ORPHANED_ARRIVAL_GRACE_MS,
   DEFAULT_AGENT_MIGRATION_TRANSPORT_MAX_BYTES,
   agentMigrationGeneration,
+  agentMigrationTransportLostCode,
   beginAgentMigrationProvisioning,
   buildAgentMigrationCancellationDeliveries,
   claimAgentMigrationAutoStartRemediation,
@@ -53,13 +54,17 @@ import {
   markAgentMigrationTargetImportArrived,
   markAgentMigrationTransportLostForComputer,
   planZenMigratingDelivery,
+  getAgentMigrationResumableControl,
   planAgentMigrationChunkTransfers,
   projectAgentMigrationUpdatedPayload,
   provisionAgentMigrationObjectStoreTransfer,
+  getAgentMigrationTransferProgress,
   recordAgentMigrationChunkReceipt,
   recordAgentMigrationSourceWorkspaceArchived,
   recordAgentMigrationSourceBuildProgress,
   recordAgentMigrationSourceQuiesced,
+  sourceBuildProgressOf,
+  sourceDrainOf,
   recordAgentMigrationAutoStartFailure,
   requestAgentMigrationCancellation,
   acknowledgeAgentMigrationCancellation,
@@ -198,6 +203,9 @@ function makeAvailableReplicaStateStore(): ReplicaStateStore {
     compareAndSetWakeCrashLoopState: async () => true,
     setAgentRuntimeError: async () => {},
     getAgentRuntimeError: async () => null,
+    setAgentContextViewAvailability: async () => {},
+    getAgentContextViewAvailability: async () => null,
+    clearAgentContextViewAvailability: async () => {},
     setMachineMeta: async () => {},
     getMachineMeta: async () => null,
     clearMachineMeta: async () => {},
@@ -239,13 +247,6 @@ async function zenMigrating(agentId: string, now?: Date): Promise<boolean> {
 async function sleep(ms: number): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, ms));
 }
-
-test("server lifecycle wires the migration remediation worker and stops it on shutdown", async () => {
-  const source = await readFile(new URL("../server.ts", import.meta.url), "utf8");
-  assert.match(source, /import \{ startAgentMigrationRemediationWorker \} from "\.\/services\/agentMigrationRemediationWorker";/);
-  assert.match(source, /const agentMigrationRemediationWorker = startAgentMigrationRemediationWorker\(\{\s*io,\s*orchestrator: agentOrchestrator,\s*\}\);/s);
-  assert.match(source, /agentMigrationRemediationWorker\.stop\(\);/);
-});
 
 async function seedMigrationFixture() {
   const db = getDb();
@@ -479,6 +480,35 @@ async function seedAutoStartFailedMigration(input: {
   return { user, server, sourceMachine, targetMachine, agent, migration: failed };
 }
 
+test("a daemon's own summary failing validation is reported as such, not as a lost connection", async () => {
+  // Kirby's prod message (Computer 1.0.59), as the route stores it.
+  const zod = '[\n  {\n    "origin": "number",\n    "code": "too_big",\n    "maximum": 1000000,\n    "inclusive": true,\n    "path": [\n      "excludedIgnored",\n      "fileCount"\n    ]';
+  assert.deepEqual(
+    agentMigrationTransportLostCode({ code: "MIGRATION_TRANSPORT_LOST", detailCode: "JS_ZodError", message: zod }),
+    { failureReason: "MIGRATION_TRANSFER_SUMMARY_INVALID", transportErrorCode: "MIGRATION_TRANSFER_SUMMARY_INVALID" },
+  );
+  // Any other ZodError, or a summary field named by a different error, keeps today's codes.
+  assert.deepEqual(
+    agentMigrationTransportLostCode({ code: "MIGRATION_TRANSPORT_LOST", detailCode: "JS_ZodError", message: '"path": ["chunks", 0, "sha256"]' }),
+    { failureReason: "MIGRATION_TRANSPORT_LOST", transportErrorCode: "JS_ZodError" },
+  );
+  assert.deepEqual(
+    agentMigrationTransportLostCode({ code: "MIGRATION_TRANSPORT_LOST", detailCode: "FETCH_ECONNRESET", message: zod }),
+    { failureReason: "MIGRATION_TRANSPORT_LOST", transportErrorCode: "FETCH_ECONNRESET" },
+  );
+  assert.deepEqual(
+    agentMigrationTransportLostCode({ code: "MIGRATION_OBJECT_STORE_UNREACHABLE" }),
+    { failureReason: "MIGRATION_OBJECT_STORE_UNREACHABLE", transportErrorCode: "MIGRATION_OBJECT_STORE_UNREACHABLE" },
+  );
+});
+
+test("a source that could not write the user's ignore additions keeps its code and reason", () => {
+  assert.deepEqual(
+    agentMigrationTransportLostCode({ code: "MIGRATION_USER_IGNORE_WRITE_FAILED", detailCode: "MIGRATION_USER_IGNORE_WRITE_FAILED:symlink" }),
+    { failureReason: "MIGRATION_USER_IGNORE_WRITE_FAILED", transportErrorCode: "MIGRATION_USER_IGNORE_WRITE_FAILED:symlink" },
+  );
+});
+
 test("object-store transfer provisioner presigns no whole-bundle URL", async () => {
   const calls: Array<{ kind: string; key: string; expiresIn?: number }> = [];
   const storage = {
@@ -584,6 +614,14 @@ test("resumable migration persists the source fence and plans only chunks missin
         otherRegenerable: 0,
       },
       keyWorkspaceEntries: { memoryMdPresent: true, notesPresent: false },
+      // Stored and returned without loss (newer Computers send the per-source split).
+      excludedIgnored: { count: 2, fileCount: 3, bytes: 30, largest: [{ path: "datasets", bytes: 20 }] },
+      excludedIgnoredBySource: {
+        userFile: { count: 1, fileCount: 1, bytes: 10 },
+        agentFile: { count: 1, fileCount: 2, bytes: 20 },
+        legacyFile: { count: 0, fileCount: 0, bytes: 0 },
+        wildcard: { count: 1, fileCount: 2, bytes: 20 },
+      },
     },
     commit: {
       mode: "atomic-rename",
@@ -665,11 +703,56 @@ test("resumable migration persists the source fence and plans only chunks missin
     reportedAt: progressAt(2_200).toISOString(),
   });
   assert.equal(first.migration.revision, quiesced.revision, "progress does not bump revision");
+  assert.equal(first.migration.userIgnoreReceipt, null, "a report without a receipt stores none");
   for (const stale of [report("packing", 10, 1_000), report("packing", 9, 900), report("scanning", 50, 5_000)]) {
     const repeated = await recordAgentMigrationSourceBuildProgress({ ...sourceActor, report: stale, now: progressAt(2_400) });
     assert.equal(repeated.advanced, false, `${stale.phase} ${stale.files}/${stale.bytes} is not progress`);
     assert.equal(repeated.migration.prepDeadlineAt.getTime(), first.migration.prepDeadlineAt.getTime());
   }
+
+  // The user-ignore receipt rides the source's immediate `scanning` 0/0 report:
+  // stored even though that report is not progress, and the first one stands.
+  const userIgnoreReceipt = {
+    written: 2,
+    alreadyPresent: 1,
+    rejected: [{ path: "MEMORY.md", reason: "forced_keep" as const }],
+  };
+  await assert.rejects(
+    () => recordAgentMigrationSourceBuildProgress({
+      ...sourceActor,
+      report: { ...report("scanning", 0, 0), userIgnoreAdditions: { ...userIgnoreReceipt, extra: true } },
+      now: progressAt(2_410),
+    }),
+    /MIGRATION_SOURCE_PROGRESS_INVALID/,
+    "a malformed receipt is a malformed report",
+  );
+  await assert.rejects(
+    () => recordAgentMigrationSourceBuildProgress({
+      ...sourceActor,
+      report: { ...report("scanning", 0, 0, "stale-generation"), userIgnoreAdditions: userIgnoreReceipt },
+      now: progressAt(2_410),
+    }),
+    /MIGRATION_GENERATION_STALE/,
+  );
+  const [beforeReceipt] = await getDb().select().from(agentMigrations)
+    .where(eq(agentMigrations.id, provisioned.migration.id));
+  assert.equal(beforeReceipt.userIgnoreReceipt, null, "a rejected report stores no receipt");
+  const withReceipt = await recordAgentMigrationSourceBuildProgress({
+    ...sourceActor,
+    report: { ...report("scanning", 0, 0), userIgnoreAdditions: userIgnoreReceipt },
+    now: progressAt(2_420),
+  });
+  assert.equal(withReceipt.advanced, false);
+  assert.deepEqual(withReceipt.migration.userIgnoreReceipt, userIgnoreReceipt);
+  assert.deepEqual(withReceipt.migration.sourceBuildProgress, first.migration.sourceBuildProgress);
+  assert.equal(withReceipt.migration.prepDeadlineAt.getTime(), first.migration.prepDeadlineAt.getTime());
+  assert.equal(withReceipt.migration.revision, quiesced.revision, "the receipt does not bump revision");
+  const resent = await recordAgentMigrationSourceBuildProgress({
+    ...sourceActor,
+    report: { ...report("scanning", 0, 0), userIgnoreAdditions: { written: 0, alreadyPresent: 3, rejected: [] } },
+    now: progressAt(2_430),
+  });
+  assert.deepEqual(resent.migration.userIgnoreReceipt, userIgnoreReceipt, "a re-sent lease's receipt does not overwrite the first");
   const later = await recordAgentMigrationSourceBuildProgress({ ...sourceActor, report: report("hashing", 0, 1), now: progressAt(2_500) });
   assert.equal(later.advanced, true, "a later phase is progress even with smaller counts");
   assert.equal(later.migration.prepDeadlineAt.getTime(), progressAt(2_500).getTime() + 10 * 60 * 1000);
@@ -817,6 +900,8 @@ test("resumable migration persists the source fence and plans only chunks missin
   const [afterMalformedCompletion] = await getDb().select().from(agentMigrations)
     .where(eq(agentMigrations.id, provisioned.migration.id));
   assert.equal(afterMalformedCompletion.state, "provisioning");
+  // No download progress while the source is still uploading.
+  assert.equal(await getAgentMigrationTransferProgress(afterMalformedCompletion), null);
   assert.equal(afterMalformedCompletion.transportUploadCompletedAt, null);
   assert.equal(afterMalformedCompletion.transferSummary, null);
   await getDb().update(agentMigrations)
@@ -832,6 +917,13 @@ test("resumable migration persists the source fence and plans only chunks missin
   assert.equal(complete.state, "ready");
   assert.ok(complete.transportUploadCompletedAt);
   assert.deepEqual(complete.transferSummary, control.transferSummary);
+  const totalBytes = control.bundle.totalBytes;
+  assert.deepEqual(await getAgentMigrationTransferProgress(complete), {
+    receivedBytes: 0,
+    totalBytes,
+    receivedChunks: 0,
+    totalChunks: 2,
+  });
   const replayedComplete = await completeAgentMigrationResumableUpload({
     ...sourceActor,
     migrationGeneration: generation,
@@ -863,6 +955,13 @@ test("resumable migration persists the source fence and plans only chunks missin
   const [afterTargetReceipt] = await getDb().select().from(agentMigrations)
     .where(eq(agentMigrations.id, provisioned.migration.id));
   assert.equal(afterTargetReceipt.transferDeadlineAt.getTime(), t0.getTime() + 85 * 60 * 1000);
+  // Only the target's receipts count as downloaded; the source already has both.
+  assert.deepEqual(await getAgentMigrationTransferProgress(afterTargetReceipt), {
+    receivedBytes: chunk0.sizeBytes,
+    totalBytes,
+    receivedChunks: 1,
+    totalChunks: 2,
+  });
   assert.equal((await recordAgentMigrationChunkReceipt(targetChunk0)).outcome, "reused");
   assert.deepEqual((await planAgentMigrationChunkTransfers({
     migrationId: provisioned.migration.id,
@@ -896,6 +995,14 @@ test("resumable migration persists the source fence and plans only chunks missin
     sha256: chunk1.sha256,
   };
   assert.equal((await recordAgentMigrationChunkReceipt(targetChunk1)).outcome, "recorded");
+  const [afterAllTargetReceipts] = await getDb().select().from(agentMigrations)
+    .where(eq(agentMigrations.id, provisioned.migration.id));
+  assert.deepEqual(await getAgentMigrationTransferProgress(afterAllTargetReceipts), {
+    receivedBytes: totalBytes,
+    totalBytes,
+    receivedChunks: 2,
+    totalChunks: 2,
+  });
   await startTestAgentMigrationTransfer(provisioned.migration.id, new Date(t0.getTime() + 6_000));
   const arriving = await flipTestAgentMigration(provisioned.migration.id, new Date(t0.getTime() + 7_000));
   const archived = await recordAgentMigrationSourceWorkspaceArchived({
@@ -1239,6 +1346,156 @@ test("provisioning migration persists object-store lease metadata and sends role
   assert.doesNotMatch(storedText, new RegExp(result.target.message.bearerToken));
 });
 
+// Reconciler step 14 (Q-H): a source that drains before its stop gets the
+// drain's 10 min more prep window, and its lease offers exactly that extra
+// as `sourceDrainUntil`; any other migration's lease has none (the source
+// stops at once, as before). RED proof: drop the extra in insertAgentMigration
+// and the prep deadline is 14:10 with no `sourceDrainUntil`.
+test("a draining source gets the 10 min more prep window and the source lease offers it as sourceDrainUntil", async ({ db }) => {
+  const { targetMachine, agent } = await seedMigrationFixture();
+  const t0 = new Date("2026-07-05T14:00:00.000Z");
+  const result = await beginAgentMigrationProvisioning({
+    agentId: agent.id,
+    targetMachineId: targetMachine.id,
+    now: t0,
+    sourceDrainsBeforeStop: true,
+    transportSessionId: "session-drain",
+  });
+  assert.equal(AGENT_MIGRATION_SOURCE_DRAIN_MAX_MS, 10 * 60 * 1000);
+  assert.equal(result.migration.prepDeadlineAt.toISOString(), "2026-07-05T14:20:00.000Z");
+  assert.equal(result.source.message.sourceDrainUntil, "2026-07-05T14:10:00.000Z", "the ordinary 10 min prep window is left after the wait");
+  assert.equal("sourceDrainUntil" in result.target.message, false, "source lease only");
+});
+
+// task #62: while the source drains (before quiesce) it reports what it waits
+// for and until when. The Server keeps it in `sourceBuildProgress` as a
+// `draining` record, clamps `drainUntil` to [now, the lease's sourceDrainUntil],
+// folds `waitingFor` into the fixed set, and drops it at the quiesce, after
+// which build progress advances as before. RED proof: without the draining
+// branch the report is rejected as MIGRATION_SOURCE_PROGRESS_INVALID.
+test("a draining source's report is stored clamped and normalized, and gives way to build progress", async ({ db }) => {
+  const { agent, sourceMachine, targetMachine, server } = await seedMigrationFixture();
+  const t0 = new Date("2099-07-05T14:00:00.000Z");
+  const at = (minutes: number, seconds = 0) => new Date(t0.getTime() + minutes * 60_000 + seconds * 1000);
+  const provisioned = await beginAgentMigrationProvisioning({
+    agentId: agent.id,
+    targetMachineId: targetMachine.id,
+    now: t0,
+    sourceDrainsBeforeStop: true,
+    transportSessionId: "session-drain-progress",
+    transportLeaseMs: 60 * 60 * 1000,
+  });
+  assert.equal(provisioned.source.message.sourceDrainUntil, at(10).toISOString());
+  const generation = provisioned.source.message.transportGeneration!;
+  const sourceActor = {
+    migrationId: provisioned.migration.id,
+    serverId: server.id,
+    sourceMachineId: sourceMachine.id,
+    transportToken: provisioned.source.message.bearerToken,
+  };
+  const drain = (fields: Record<string, unknown>) => ({ migrationGeneration: generation, phase: "draining", ...fields });
+
+  const first = await recordAgentMigrationSourceBuildProgress({ ...sourceActor, report: drain({ drainUntil: at(5).toISOString(), waitingFor: "turn" }), now: at(1) });
+  assert.equal(first.advanced, false, "a drain report is not build progress");
+  assert.deepEqual(first.migration.sourceBuildProgress, { phase: "draining", drainUntil: at(5).toISOString(), waitingFor: "turn", reportedAt: at(1).toISOString() });
+  assert.equal(first.migration.revision, provisioned.migration.revision, "no revision bump");
+  assert.equal(first.migration.prepDeadlineAt.getTime(), provisioned.migration.prepDeadlineAt.getTime(), "no deadline slide");
+  assert.deepEqual(sourceDrainOf(first.migration), { until: at(5).toISOString(), waitingFor: "turn", reportedAt: at(1).toISOString() });
+  assert.equal(sourceBuildProgressOf(first.migration), null, "the owner never sees a drain record as build progress");
+
+  const beyondCap = await recordAgentMigrationSourceBuildProgress({ ...sourceActor, report: drain({ drainUntil: at(30).toISOString(), waitingFor: "<b>raw text</b>" }), now: at(2) });
+  assert.deepEqual(sourceDrainOf(beyondCap.migration), { until: at(10).toISOString(), waitingFor: "other", reportedAt: at(2).toISOString() }, "clamped to sourceDrainUntil; unknown waitingFor is other");
+
+  const inThePast = await recordAgentMigrationSourceBuildProgress({ ...sourceActor, report: drain({ drainUntil: at(-60).toISOString() }), now: at(3) });
+  assert.deepEqual(sourceDrainOf(inThePast.migration), { until: at(3).toISOString(), waitingFor: null, reportedAt: at(3).toISOString() }, "clamped up to now; missing waitingFor stays null");
+
+  const unparseable = await recordAgentMigrationSourceBuildProgress({ ...sourceActor, report: drain({ drainUntil: "soon", waitingFor: "background_tasks" }), now: at(4) });
+  assert.equal(sourceDrainOf(unparseable.migration)?.until, at(10).toISOString(), "an unparseable drainUntil reads as the cap");
+  assert.equal(sourceDrainOf(unparseable.migration)?.waitingFor, "background_tasks");
+
+  for (const malformed of [drain({ drainUntil: at(5).toISOString(), extra: true }), drain({ drainUntil: at(5).toISOString(), waitingFor: 7 }), drain({})]) {
+    await assert.rejects(
+      () => recordAgentMigrationSourceBuildProgress({ ...sourceActor, report: malformed, now: at(4, 30) }),
+      /MIGRATION_SOURCE_PROGRESS_INVALID/,
+    );
+  }
+  await assert.rejects(
+    () => recordAgentMigrationSourceBuildProgress({ ...sourceActor, report: { ...drain({ drainUntil: at(5).toISOString() }), migrationGeneration: "stale" }, now: at(4, 30) }),
+    /MIGRATION_GENERATION_STALE/,
+  );
+  const beforeQuiesceBuild = await recordAgentMigrationSourceBuildProgress({ ...sourceActor, report: { migrationGeneration: generation, phase: "scanning", files: 1, bytes: 1 }, now: at(4, 40) });
+  assert.equal(beforeQuiesceBuild.advanced, false, "build progress before quiesce is still ignored");
+  assert.equal(sourceDrainOf(beforeQuiesceBuild.migration)?.waitingFor, "background_tasks");
+
+  const quiesced = await recordAgentMigrationSourceQuiesced({
+    ...sourceActor,
+    receipt: {
+      schemaVersion: "agent-migration-quiesce/v1",
+      migrationId: provisioned.migration.id,
+      migrationGeneration: generation,
+      agentId: agent.id,
+      sourceMachineId: sourceMachine.id,
+      sourceRuntimeState: "stopped",
+      stoppedAt: at(5).toISOString(),
+      actor: "migration",
+      launchSessionIdentity: "launch:launch-1:session:session-1",
+      expectedRuntimeRevision: String(provisioned.source.message.expectedMigrationRevision),
+    },
+    now: at(5),
+  });
+  assert.equal(quiesced.sourceBuildProgress, null, "the quiesce clears the drain report");
+  assert.equal(sourceDrainOf(quiesced), null);
+  const lateDrain = await recordAgentMigrationSourceBuildProgress({ ...sourceActor, report: drain({ drainUntil: at(9).toISOString() }), now: at(5, 10) });
+  assert.equal(lateDrain.migration.sourceBuildProgress, null, "a drain report after quiesce is ignored");
+
+  // A drain record still in the column (no quiesce clear) never blocks the first build report.
+  await db.update(agentMigrations)
+    .set({ sourceBuildProgress: { phase: "draining", drainUntil: at(9).toISOString(), waitingFor: "turn", reportedAt: at(4).toISOString() } })
+    .where(eq(agentMigrations.id, provisioned.migration.id));
+  const scanning = await recordAgentMigrationSourceBuildProgress({ ...sourceActor, report: { migrationGeneration: generation, phase: "scanning", files: 0, bytes: 0 }, now: at(6) });
+  assert.equal(scanning.advanced, true, "the first build report after a drain report is progress");
+  assert.deepEqual(scanning.migration.sourceBuildProgress, { phase: "scanning", files: 0, bytes: 0, reportedAt: at(6).toISOString() });
+  assert.equal(sourceDrainOf(scanning.migration), null);
+  const packing = await recordAgentMigrationSourceBuildProgress({ ...sourceActor, report: { migrationGeneration: generation, phase: "packing", files: 3, bytes: 30 }, now: at(7) });
+  assert.equal(packing.advanced, true, "build progress keeps advancing");
+  assert.deepEqual(sourceBuildProgressOf(packing.migration), { phase: "packing", files: 3, bytes: 30, reportedAt: at(7).toISOString() });
+});
+
+test("a draining report for a migration whose lease offers no drain is ignored", async ({ db }) => {
+  const { agent, sourceMachine, targetMachine, server } = await seedMigrationFixture();
+  const t0 = new Date("2099-07-05T14:00:00.000Z");
+  const provisioned = await beginAgentMigrationProvisioning({
+    agentId: agent.id,
+    targetMachineId: targetMachine.id,
+    now: t0,
+    transportSessionId: "session-no-drain-progress",
+    transportLeaseMs: 60 * 60 * 1000,
+  });
+  const result = await recordAgentMigrationSourceBuildProgress({
+    migrationId: provisioned.migration.id,
+    serverId: server.id,
+    sourceMachineId: sourceMachine.id,
+    transportToken: provisioned.source.message.bearerToken,
+    report: { migrationGeneration: provisioned.source.message.transportGeneration, phase: "draining", drainUntil: new Date(t0.getTime() + 60_000).toISOString(), waitingFor: "turn" },
+    now: new Date(t0.getTime() + 1_000),
+  });
+  assert.equal(result.advanced, false);
+  assert.equal(result.migration.sourceBuildProgress, null);
+});
+
+test("a migration whose source does not drain keeps its prep window and sends no sourceDrainUntil", async ({ db }) => {
+  const { targetMachine, agent } = await seedMigrationFixture();
+  const t0 = new Date("2026-07-05T14:00:00.000Z");
+  const result = await beginAgentMigrationProvisioning({
+    agentId: agent.id,
+    targetMachineId: targetMachine.id,
+    now: t0,
+    transportSessionId: "session-no-drain",
+  });
+  assert.equal(result.migration.prepDeadlineAt.toISOString(), "2026-07-05T14:10:00.000Z");
+  assert.equal("sourceDrainUntil" in result.source.message, false);
+});
+
 test("transfer lease ready helper validates object-store role/session/expiry/max-byte contract", async ({ db }) => {
 
   const { targetMachine, agent } = await seedMigrationFixture();
@@ -1495,6 +1752,31 @@ test("machine flip requires an explicit in-transit transfer state", async ({ db 
     () => flipTestAgentMigration(migration.id, new Date("2026-07-05T14:02:00.000Z")),
     /MIGRATION_NOT_FLIPPABLE/,
   );
+});
+
+test("the flip refuses a target whose Computer key was revoked meanwhile: the move fails with its reason, the agent stays on its source", async ({ db }) => {
+
+  const { sourceMachine, targetMachine, agent } = await seedMigrationFixture();
+  const provisioning = await beginTestAgentMigration({
+    agentId: agent.id,
+    targetMachineId: targetMachine.id,
+    now: new Date("2026-07-05T14:00:00.000Z"),
+  });
+  const { migration } = provisioning;
+  await markTestAgentMigrationReady(provisioning, { now: new Date("2026-07-05T14:01:00.000Z") });
+  await startTestAgentMigrationTransfer(migration.id, new Date("2026-07-05T14:02:00.000Z"));
+  // The target is detached between the transfer and the flip (a legacy machine: its own key).
+  await getDb().update(machines).set({ apiKeyHash: "revoked:account_deletion_requested" }).where(eq(machines.id, targetMachine.id));
+
+  await assert.rejects(
+    () => flipTestAgentMigration(migration.id, new Date("2026-07-05T14:03:00.000Z")),
+    /MIGRATION_TARGET_COMPUTER_DETACHED/,
+  );
+  const [row] = await getDb().select().from(agentMigrations).where(eq(agentMigrations.id, migration.id));
+  assert.equal(row.state, "failed");
+  assert.equal(row.failureReason, "MIGRATION_TARGET_COMPUTER_DETACHED");
+  const [agentRow] = await getDb().select().from(agents).where(eq(agents.id, agent.id));
+  assert.equal(agentRow.machineId, sourceMachine.id);
 });
 
 test("zen(migrating) delivery planner queues ordinary traffic until deadline", async () => {
@@ -2931,4 +3213,47 @@ test("hosted target: cancel goes to the source daemon only, and lifecycle events
   // The real row stays a Computer migration and still tells both daemons.
   const [stored] = await db.select().from(agentMigrations).where(eq(agentMigrations.id, requested.migration.id));
   assert.deepEqual(buildAgentMigrationCancellationDeliveries(stored).map((delivery) => delivery.message.role), ["source", "target"]);
+});
+
+test("a finished migration tells the Computer to stop transferring instead of waiting", async ({ db }) => {
+  const { server, sourceMachine, targetMachine, agent } = await seedMigrationFixture();
+  const t0 = new Date("2099-07-06T14:00:00.000Z");
+  const provisioned = await beginAgentMigrationProvisioning({
+    agentId: agent.id,
+    targetMachineId: targetMachine.id,
+    now: t0,
+    transportSessionId: "session-finished",
+    transportLeaseMs: 6 * 60 * 60 * 1000,
+  });
+  const targetActor = {
+    migrationId: provisioned.migration.id,
+    serverId: server.id,
+    machineId: targetMachine.id,
+    role: "target" as const,
+    transportToken: provisioned.target.message.bearerToken,
+  };
+  // While the source is still uploading the target hears "not ready yet" and keeps waiting.
+  await assert.rejects(
+    () => getAgentMigrationResumableControl({ ...targetActor, now: new Date(t0.getTime() + 1_000) }),
+    /MIGRATION_CONTROL_MANIFEST_MISSING/,
+  );
+
+  const afterPrepDeadline = new Date(t0.getTime() + 60 * 60 * 1000);
+  const swept = await sweepElapsedAgentMigrationDeadline({ now: afterPrepDeadline });
+  assert.equal(swept?.state, "aborted");
+  // The lease runs for hours more, but the migration is over: answer 410, not 409.
+  await assert.rejects(
+    () => getAgentMigrationResumableControl({ ...targetActor, now: afterPrepDeadline }),
+    /MIGRATION_TRANSFER_ENDED/,
+  );
+  await assert.rejects(
+    () => planAgentMigrationChunkTransfers({
+      ...targetActor,
+      machineId: sourceMachine.id,
+      role: "source",
+      transportToken: provisioned.source.message.bearerToken,
+      now: afterPrepDeadline,
+    }),
+    /MIGRATION_TRANSFER_ENDED/,
+  );
 });

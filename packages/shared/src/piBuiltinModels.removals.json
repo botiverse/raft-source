@@ -130,6 +130,245 @@
       "id": "openrouter/apodex/apodex-1.1-mini:free",
       "disposition": "no-replacement",
       "note": "Dropped from Pi's openrouter catalog in @earendil-works/pi-ai 1.3.0 (bump 1.2.0 -> 1.3.0). No in-repo consumer pins this id (git grep over packages/ and apps/: only the generated catalog). No apodex/ id of any version remains on openrouter in 1.3.0, so the vendor left the catalog rather than the free-tier variant being dropped in favour of a base id."
+    },
+    {
+      "id": "openrouter/google/gemini-2.5-pro:batch",
+      "disposition": "replaced-by",
+      "replacement": "openrouter/google/gemini-2.5-pro",
+      "note": "Dropped from the Built-in catalog in @earendil-works/pi-ai 1.4.0 (bump 1.3.0 -> 1.4.0). No in-repo consumer pins this id (git grep over packages/ and apps/: only the generated catalog). The batch VARIANT was retired; the base id stays on the same provider (openrouter) and the model is still offered -- the label loses the \"(batch)\" suffix, hence labelChangeAcknowledged. Same shape as the ':free' variant removals recorded earlier.",
+      "labelChangeAcknowledged": true
+    },
+    {
+      "id": "openrouter/google/gemini-2.5-flash:batch",
+      "disposition": "replaced-by",
+      "replacement": "openrouter/google/gemini-2.5-flash",
+      "note": "Dropped from the Built-in catalog in @earendil-works/pi-ai 1.4.0 (bump 1.3.0 -> 1.4.0). No in-repo consumer pins this id (git grep over packages/ and apps/: only the generated catalog). The batch VARIANT was retired; the base id stays on the same provider (openrouter), and only the \"(batch)\" label suffix is gone. Same shape as the ':free' variant removals recorded earlier.",
+      "labelChangeAcknowledged": true
+    },
+    {
+      "id": "openrouter/google/gemini-2.5-flash-lite:batch",
+      "disposition": "replaced-by",
+      "replacement": "openrouter/google/gemini-2.5-flash-lite",
+      "note": "Dropped from the Built-in catalog in @earendil-works/pi-ai 1.4.0 (bump 1.3.0 -> 1.4.0). No in-repo consumer pins this id (git grep over packages/ and apps/: only the generated catalog). The batch VARIANT was retired; the base id stays on the same provider (openrouter), and only the \"(batch)\" label suffix is gone. Same shape as the ':free' variant removals recorded earlier.",
+      "labelChangeAcknowledged": true
+    },
+    {
+      "id": "openrouter/deepseek/deepseek-r1",
+      "disposition": "no-replacement",
+      "note": "Dropped from the Built-in catalog in @earendil-works/pi-ai 1.4.0 (bump 1.3.0 -> 1.4.0). No in-repo consumer pins this id (git grep over packages/ and apps/: only the generated catalog). The undated R1 snapshot was retired; the dated `openrouter/deepseek/deepseek-r1-0528` snapshot remains, which is a different snapshot rather than a drop-in for this exact id."
+    },
+    {
+      "id": "openai/gpt-5.3-chat-latest",
+      "disposition": "no-replacement",
+      "note": "Dropped from the Built-in catalog in @earendil-works/pi-ai 1.4.0 (bump 1.3.0 -> 1.4.0). No in-repo consumer pins this id (git grep over packages/ and apps/: only the generated catalog). The '-chat-latest' pointer for this generation was retired; `openai/gpt-5-chat-latest` remains but is a different generation, and the plain `gpt-5.3` ids are not a drop-in for the chat-tuned pointer."
+    },
+    {
+      "id": "openai/gpt-5.2-chat-latest",
+      "disposition": "no-replacement",
+      "note": "Dropped from the Built-in catalog in @earendil-works/pi-ai 1.4.0 (bump 1.3.0 -> 1.4.0). No in-repo consumer pins this id (git grep over packages/ and apps/: only the generated catalog). The '-chat-latest' pointer for this generation was retired; `openai/gpt-5.2` remains but is the plain model, not the chat-tuned pointer, and `gpt-5-chat-latest` is a different generation."
+    },
+    {
+      "id": "xiaomi/mimo-v2.5-pro",
+      "disposition": "successor-not-substitutable",
+      "note": "Dropped from the Built-in catalog in @earendil-works/pi-ai 1.4.0 (bump 1.3.0 -> 1.4.0). No in-repo consumer pins this id (git grep over packages/ and apps/: only the generated catalog). The MiMo V2.5 ids left the catalog in 1.4.0 and the provider default moved to `xiaomi/mimo-v2.6-pro`. The successor is a new version, not the same model under the same id, so a consumer pinned to this exact id cannot swap without rebuilding its comparison surface."
+    },
+    {
+      "id": "xiaomi/mimo-v2.5-pro-ultraspeed",
+      "disposition": "successor-not-substitutable",
+      "note": "Dropped from the Built-in catalog in @earendil-works/pi-ai 1.4.0 (bump 1.3.0 -> 1.4.0). No in-repo consumer pins this id (git grep over packages/ and apps/: only the generated catalog). The MiMo V2.5 ids left the catalog in 1.4.0; the same-variant successor is `xiaomi/mimo-v2.6-pro-ultraspeed`, a new version rather than the same model under the same id."
+    },
+    {
+      "id": "xiaomi/mimo-v2.5",
+      "disposition": "no-replacement",
+      "note": "Dropped from the Built-in catalog in @earendil-works/pi-ai 1.4.0 (bump 1.3.0 -> 1.4.0). No in-repo consumer pins this id (git grep over packages/ and apps/: only the generated catalog). The base MiMo V2.5 id left the catalog in 1.4.0. No `xiaomi/mimo-v2.6` base id exists -- the remaining V2.6 entries are the Pro, Pro-UltraSpeed and Flash variants -- so there is no same-model successor to record."
+    },
+    {
+      "id": "openrouter/upstage/solar-pro-3",
+      "disposition": "no-replacement",
+      "note": "Dropped from the Built-in catalog in @earendil-works/pi-ai 1.5.0 (bump 1.4.0 -> 1.5.0, which moved the built-in catalog to models.dev v2). No in-repo consumer pins this id (git grep over packages/ and apps/: only the generated catalog, and the matches inside node_modules are the SDK's own data). The vendor's entry left the catalog."
+    },
+    {
+      "id": "openrouter/arcee-ai/trinity-large-thinking",
+      "disposition": "no-replacement",
+      "note": "Dropped from the Built-in catalog in @earendil-works/pi-ai 1.5.0 (bump 1.4.0 -> 1.5.0, which moved the built-in catalog to models.dev v2). No in-repo consumer pins this id (git grep over packages/ and apps/: only the generated catalog, and the matches inside node_modules are the SDK's own data). The vendor's entry left the catalog."
+    },
+    {
+      "id": "openrouter/qwen/qwen3-next-80b-a3b-thinking",
+      "disposition": "no-replacement",
+      "note": "Dropped from the Built-in catalog in @earendil-works/pi-ai 1.5.0 (bump 1.4.0 -> 1.5.0, which moved the built-in catalog to models.dev v2). No in-repo consumer pins this id (git grep over packages/ and apps/: only the generated catalog, and the matches inside node_modules are the SDK's own data). The entry left the catalog; other qwen3-next ids remain but this one is not a drop-in successor."
+    },
+    {
+      "id": "openrouter/mistralai/mistral-large-2512:batch",
+      "disposition": "replaced-by",
+      "replacement": "openrouter/mistralai/mistral-large-2512",
+      "note": "Dropped from the Built-in catalog in @earendil-works/pi-ai 1.5.0 (bump 1.4.0 -> 1.5.0, which moved the built-in catalog to models.dev v2). No in-repo consumer pins this id (git grep over packages/ and apps/: only the generated catalog, and the matches inside node_modules are the SDK's own data). This is the batch-tier VARIANT: the base id stays on the same provider, so the model is still offered and only the variant (and its label suffix) is gone.",
+      "labelChangeAcknowledged": true
+    },
+    {
+      "id": "openrouter/mistralai/mistral-small-2603:batch",
+      "disposition": "replaced-by",
+      "replacement": "openrouter/mistralai/mistral-small-2603",
+      "note": "Dropped from the Built-in catalog in @earendil-works/pi-ai 1.5.0 (bump 1.4.0 -> 1.5.0, which moved the built-in catalog to models.dev v2). No in-repo consumer pins this id (git grep over packages/ and apps/: only the generated catalog, and the matches inside node_modules are the SDK's own data). This is the batch-tier VARIANT: the base id stays on the same provider, so the model is still offered and only the variant (and its label suffix) is gone.",
+      "labelChangeAcknowledged": true
+    },
+    {
+      "id": "openrouter/mistralai/ministral-8b-2512:batch",
+      "disposition": "replaced-by",
+      "replacement": "openrouter/mistralai/ministral-8b-2512",
+      "note": "Dropped from the Built-in catalog in @earendil-works/pi-ai 1.5.0 (bump 1.4.0 -> 1.5.0, which moved the built-in catalog to models.dev v2). No in-repo consumer pins this id (git grep over packages/ and apps/: only the generated catalog, and the matches inside node_modules are the SDK's own data). This is the batch-tier VARIANT: the base id stays on the same provider, so the model is still offered and only the variant (and its label suffix) is gone.",
+      "labelChangeAcknowledged": true
+    },
+    {
+      "id": "openrouter/mistralai/codestral-2508:batch",
+      "disposition": "replaced-by",
+      "replacement": "openrouter/mistralai/codestral-2508",
+      "note": "Dropped from the Built-in catalog in @earendil-works/pi-ai 1.5.0 (bump 1.4.0 -> 1.5.0, which moved the built-in catalog to models.dev v2). No in-repo consumer pins this id (git grep over packages/ and apps/: only the generated catalog, and the matches inside node_modules are the SDK's own data). This is the batch-tier VARIANT: the base id stays on the same provider, so the model is still offered and only the variant (and its label suffix) is gone.",
+      "labelChangeAcknowledged": true
+    },
+    {
+      "id": "openrouter/mistralai/mistral-medium-3.1:batch",
+      "disposition": "replaced-by",
+      "replacement": "openrouter/mistralai/mistral-medium-3.1",
+      "note": "Dropped from the Built-in catalog in @earendil-works/pi-ai 1.5.0 (bump 1.4.0 -> 1.5.0, which moved the built-in catalog to models.dev v2). No in-repo consumer pins this id (git grep over packages/ and apps/: only the generated catalog, and the matches inside node_modules are the SDK's own data). This is the batch-tier VARIANT: the base id stays on the same provider, so the model is still offered and only the variant (and its label suffix) is gone.",
+      "labelChangeAcknowledged": true
+    },
+    {
+      "id": "openrouter/poolside/laguna-s-2.1",
+      "disposition": "no-replacement",
+      "note": "Dropped from the Built-in catalog in @earendil-works/pi-ai 1.5.0 (bump 1.4.0 -> 1.5.0, which moved the built-in catalog to models.dev v2). No in-repo consumer pins this id (git grep over packages/ and apps/: only the generated catalog, and the matches inside node_modules are the SDK's own data). The vendor's ids left the catalog (its `:free` variant went at the same time)."
+    },
+    {
+      "id": "openrouter/poolside/laguna-xs-2.1",
+      "disposition": "no-replacement",
+      "note": "Dropped from the Built-in catalog in @earendil-works/pi-ai 1.5.0 (bump 1.4.0 -> 1.5.0, which moved the built-in catalog to models.dev v2). No in-repo consumer pins this id (git grep over packages/ and apps/: only the generated catalog, and the matches inside node_modules are the SDK's own data). The vendor's ids left the catalog (its `:free` variant went at the same time)."
+    },
+    {
+      "id": "openrouter/openai/o1",
+      "disposition": "no-replacement",
+      "note": "Dropped from the Built-in catalog in @earendil-works/pi-ai 1.5.0 (bump 1.4.0 -> 1.5.0, which moved the built-in catalog to models.dev v2). No in-repo consumer pins this id (git grep over packages/ and apps/: only the generated catalog, and the matches inside node_modules are the SDK's own data). models.dev v2 dropped this older OpenAI model from the chat catalog."
+    },
+    {
+      "id": "openrouter/openai/gpt-4-turbo",
+      "disposition": "no-replacement",
+      "note": "Dropped from the Built-in catalog in @earendil-works/pi-ai 1.5.0 (bump 1.4.0 -> 1.5.0, which moved the built-in catalog to models.dev v2). No in-repo consumer pins this id (git grep over packages/ and apps/: only the generated catalog, and the matches inside node_modules are the SDK's own data). models.dev v2 dropped this older OpenAI model from the chat catalog."
+    },
+    {
+      "id": "openrouter/openai/gpt-3.5-turbo",
+      "disposition": "no-replacement",
+      "note": "Dropped from the Built-in catalog in @earendil-works/pi-ai 1.5.0 (bump 1.4.0 -> 1.5.0, which moved the built-in catalog to models.dev v2). No in-repo consumer pins this id (git grep over packages/ and apps/: only the generated catalog, and the matches inside node_modules are the SDK's own data). models.dev v2 dropped this older OpenAI model from the chat catalog."
+    },
+    {
+      "id": "openrouter/openai/gpt-3.5-turbo:batch",
+      "disposition": "no-replacement",
+      "note": "Dropped from the Built-in catalog in @earendil-works/pi-ai 1.5.0 (bump 1.4.0 -> 1.5.0, which moved the built-in catalog to models.dev v2). No in-repo consumer pins this id (git grep over packages/ and apps/: only the generated catalog, and the matches inside node_modules are the SDK's own data). The entry left the catalog with no same-model successor."
+    },
+    {
+      "id": "openrouter/nvidia/nemotron-3-super-120b-a12b:free",
+      "disposition": "replaced-by",
+      "replacement": "openrouter/nvidia/nemotron-3-super-120b-a12b",
+      "note": "Dropped from the Built-in catalog in @earendil-works/pi-ai 1.5.0 (bump 1.4.0 -> 1.5.0, which moved the built-in catalog to models.dev v2). No in-repo consumer pins this id (git grep over packages/ and apps/: only the generated catalog, and the matches inside node_modules are the SDK's own data). This is the free-tier VARIANT: the base id stays on the same provider, so the model is still offered and only the variant (and its label suffix) is gone.",
+      "labelChangeAcknowledged": true
+    },
+    {
+      "id": "openrouter/openai/o4-mini",
+      "disposition": "no-replacement",
+      "note": "Dropped from the Built-in catalog in @earendil-works/pi-ai 1.5.0 (bump 1.4.0 -> 1.5.0, which moved the built-in catalog to models.dev v2). No in-repo consumer pins this id (git grep over packages/ and apps/: only the generated catalog, and the matches inside node_modules are the SDK's own data). models.dev v2 dropped this older OpenAI model from the chat catalog."
+    },
+    {
+      "id": "openrouter/openai/o4-mini-high",
+      "disposition": "no-replacement",
+      "note": "Dropped from the Built-in catalog in @earendil-works/pi-ai 1.5.0 (bump 1.4.0 -> 1.5.0, which moved the built-in catalog to models.dev v2). No in-repo consumer pins this id (git grep over packages/ and apps/: only the generated catalog, and the matches inside node_modules are the SDK's own data). models.dev v2 dropped this older OpenAI model from the chat catalog."
+    },
+    {
+      "id": "openrouter/openai/o3-mini",
+      "disposition": "no-replacement",
+      "note": "Dropped from the Built-in catalog in @earendil-works/pi-ai 1.5.0 (bump 1.4.0 -> 1.5.0, which moved the built-in catalog to models.dev v2). No in-repo consumer pins this id (git grep over packages/ and apps/: only the generated catalog, and the matches inside node_modules are the SDK's own data). models.dev v2 dropped this older OpenAI model from the chat catalog."
+    },
+    {
+      "id": "openrouter/openai/o3-mini-high",
+      "disposition": "no-replacement",
+      "note": "Dropped from the Built-in catalog in @earendil-works/pi-ai 1.5.0 (bump 1.4.0 -> 1.5.0, which moved the built-in catalog to models.dev v2). No in-repo consumer pins this id (git grep over packages/ and apps/: only the generated catalog, and the matches inside node_modules are the SDK's own data). models.dev v2 dropped this older OpenAI model from the chat catalog."
+    },
+    {
+      "id": "openrouter/poolside/laguna-s-2.1:free",
+      "disposition": "no-replacement",
+      "note": "Dropped from the Built-in catalog in @earendil-works/pi-ai 1.5.0 (bump 1.4.0 -> 1.5.0, which moved the built-in catalog to models.dev v2). No in-repo consumer pins this id (git grep over packages/ and apps/: only the generated catalog, and the matches inside node_modules are the SDK's own data). Both this free variant and its base id left the catalog, so there is no base id to point at."
+    },
+    {
+      "id": "openrouter/poolside/laguna-xs-2.1:free",
+      "disposition": "no-replacement",
+      "note": "Dropped from the Built-in catalog in @earendil-works/pi-ai 1.5.0 (bump 1.4.0 -> 1.5.0, which moved the built-in catalog to models.dev v2). No in-repo consumer pins this id (git grep over packages/ and apps/: only the generated catalog, and the matches inside node_modules are the SDK's own data). Both this free variant and its base id left the catalog, so there is no base id to point at."
+    },
+    {
+      "id": "openrouter/minimax/minimax-m3.1-flash:free",
+      "disposition": "replaced-by",
+      "replacement": "openrouter/minimax/minimax-m3.1-flash",
+      "note": "Dropped from the Built-in catalog in @earendil-works/pi-ai 1.5.0 (bump 1.4.0 -> 1.5.0, which moved the built-in catalog to models.dev v2). No in-repo consumer pins this id (git grep over packages/ and apps/: only the generated catalog, and the matches inside node_modules are the SDK's own data). This is the free-tier VARIANT: the base id stays on the same provider, so the model is still offered and only the variant (and its label suffix) is gone.",
+      "labelChangeAcknowledged": true
+    },
+    {
+      "id": "openai/gpt-realtime-2.1",
+      "disposition": "no-replacement",
+      "note": "Dropped from the Built-in catalog in @earendil-works/pi-ai 1.5.0 (bump 1.4.0 -> 1.5.0, which moved the built-in catalog to models.dev v2). No in-repo consumer pins this id (git grep over packages/ and apps/: only the generated catalog, and the matches inside node_modules are the SDK's own data). models.dev v2 no longer offers realtime-only models as chat models."
+    },
+    {
+      "id": "google/gemini-3.1-flash-live-preview",
+      "disposition": "no-replacement",
+      "note": "Dropped from the Built-in catalog in @earendil-works/pi-ai 1.5.0 (bump 1.4.0 -> 1.5.0, which moved the built-in catalog to models.dev v2). No in-repo consumer pins this id (git grep over packages/ and apps/: only the generated catalog, and the matches inside node_modules are the SDK's own data). models.dev v2 no longer offers live-only models as chat models."
+    },
+    {
+      "id": "google/gemini-3.1-flash-lite-image",
+      "disposition": "no-replacement",
+      "note": "Dropped from the Built-in catalog in @earendil-works/pi-ai 1.5.0 (bump 1.4.0 -> 1.5.0, which moved the built-in catalog to models.dev v2). No in-repo consumer pins this id (git grep over packages/ and apps/: only the generated catalog, and the matches inside node_modules are the SDK's own data). models.dev v2 no longer offers image-only models as chat models."
+    },
+    {
+      "id": "openrouter/meta-llama/llama-3.1-70b-instruct",
+      "disposition": "no-replacement",
+      "note": "Dropped from the Built-in catalog in @earendil-works/pi-ai 1.5.1 (bump 1.5.0 -> 1.5.1). No in-repo consumer pins this id (git grep over packages/ and apps/: only the generated catalog; matches inside node_modules are the SDK's own data). The older Llama 3.1 entry left the catalog."
+    },
+    {
+      "id": "openrouter/inception/mercury-3",
+      "disposition": "no-replacement",
+      "note": "Dropped from the Built-in catalog in @earendil-works/pi-ai 1.5.1 (bump 1.5.0 -> 1.5.1). No in-repo consumer pins this id (git grep over packages/ and apps/: only the generated catalog; matches inside node_modules are the SDK's own data). The vendor's entry left the catalog in this bump."
+    },
+    {
+      "id": "openrouter/inception/mercury-2.5",
+      "disposition": "no-replacement",
+      "note": "Dropped from the Built-in catalog in @earendil-works/pi-ai 1.5.1 (bump 1.5.0 -> 1.5.1). No in-repo consumer pins this id (git grep over packages/ and apps/: only the generated catalog; matches inside node_modules are the SDK's own data). The vendor's entry left the catalog in this bump."
+    },
+    {
+      "id": "openrouter/inception/mercury-2",
+      "disposition": "no-replacement",
+      "note": "Dropped from the Built-in catalog in @earendil-works/pi-ai 1.5.1 (bump 1.5.0 -> 1.5.1). No in-repo consumer pins this id (git grep over packages/ and apps/: only the generated catalog; matches inside node_modules are the SDK's own data). The vendor's entry left the catalog in this bump."
+    },
+    {
+      "id": "openrouter/minimax/minimax-m2.1",
+      "disposition": "no-replacement",
+      "note": "Dropped from the Built-in catalog in @earendil-works/pi-ai 1.5.1 (bump 1.5.0 -> 1.5.1). No in-repo consumer pins this id (git grep over packages/ and apps/: only the generated catalog; matches inside node_modules are the SDK's own data). MiniMax's M1/M2 line left the catalog; the provider's catalogue now leads with M3."
+    },
+    {
+      "id": "openrouter/minimax/minimax-m2",
+      "disposition": "no-replacement",
+      "note": "Dropped from the Built-in catalog in @earendil-works/pi-ai 1.5.1 (bump 1.5.0 -> 1.5.1). No in-repo consumer pins this id (git grep over packages/ and apps/: only the generated catalog; matches inside node_modules are the SDK's own data). MiniMax's M1/M2 line left the catalog; the provider's catalogue now leads with M3."
+    },
+    {
+      "id": "openrouter/minimax/minimax-m1",
+      "disposition": "no-replacement",
+      "note": "Dropped from the Built-in catalog in @earendil-works/pi-ai 1.5.1 (bump 1.5.0 -> 1.5.1). No in-repo consumer pins this id (git grep over packages/ and apps/: only the generated catalog; matches inside node_modules are the SDK's own data). MiniMax's M1/M2 line left the catalog; the provider's catalogue now leads with M3."
+    },
+    {
+      "id": "openrouter/thinkingmachines/inkling:free",
+      "disposition": "replaced-by",
+      "replacement": "openrouter/thinkingmachines/inkling",
+      "note": "Dropped from the Built-in catalog in @earendil-works/pi-ai 1.5.1 (bump 1.5.0 -> 1.5.1). No in-repo consumer pins this id (git grep over packages/ and apps/: only the generated catalog; matches inside node_modules are the SDK's own data). This is the free-tier VARIANT; the base id stays on the same provider, so the model is still offered and only the variant (and its label suffix) is gone.",
+      "labelChangeAcknowledged": true
+    },
+    {
+      "id": "openrouter/thinkingmachines/inkling-small:free",
+      "disposition": "replaced-by",
+      "replacement": "openrouter/thinkingmachines/inkling-small",
+      "note": "Dropped from the Built-in catalog in @earendil-works/pi-ai 1.5.1 (bump 1.5.0 -> 1.5.1). No in-repo consumer pins this id (git grep over packages/ and apps/: only the generated catalog; matches inside node_modules are the SDK's own data). This is the free-tier VARIANT; the base id stays on the same provider, so the model is still offered and only the variant (and its label suffix) is gone.",
+      "labelChangeAcknowledged": true
     }
   ]
 }

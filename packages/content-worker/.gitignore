@@ -1,0 +1,5 @@
+# Screenshots of `pnpm probe:pdf` (scripts/raft-content-pdf-probe.ts).
+.pdf-probe/
+
+# scripts/deploy-config.ts render output (the deploy workflow writes it beside wrangler.jsonc).
+wrangler.*.generated.json

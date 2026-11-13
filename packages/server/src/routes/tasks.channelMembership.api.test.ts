@@ -9,7 +9,7 @@ import { createMessage } from "../services/messageService";
 import { createServer } from "../services/serverService";
 import * as taskService from "../services/taskService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 async function seedUser(email: string, name: string) {
   const db = getDb();

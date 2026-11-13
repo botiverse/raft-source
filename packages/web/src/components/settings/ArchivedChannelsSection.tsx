@@ -1,7 +1,9 @@
 import { useCallback, useMemo, useState } from "react";
+import type { MouseEvent } from "react";
 import { useIntl } from "react-intl";
-import { Archive, GitBranch, Hash, Lock } from "lucide-react";
-import { Card, IconTile } from "@botiverse/raft-ui";
+import { Archive } from "lucide-react";
+import { ChannelIcon } from "../channel/channelKindIcon";
+import { Card, IconTile, TextLink } from "@botiverse/raft-ui";
 
 import { useAppNavigate } from "../../hooks/useAppNavigate";
 import { useServerPermissions } from "../../hooks/useServerPermissions";
@@ -9,6 +11,7 @@ import { useTimeFormatter } from "../../hooks/useTimeFormatter";
 import { useChannelStore } from "../../store/channelStore";
 import type { Channel } from "../../store/channelStore";
 import { useServerStore } from "../../store/serverStore";
+import { isSidebarExternalSectionChannel } from "../layout/sidebarChannelVisibility";
 import Banner from "../ui/Banner";
 import SectionHeader from "../ui/SectionHeader";
 import Tooltip from "../ui/Tooltip";
@@ -26,15 +29,11 @@ function isArchivedChannel(channel: Channel): channel is ArchivedChannel {
   );
 }
 
-function channelTypeIcon(type: ArchivedChannel["type"]) {
-  if (type === "private") return <Lock size={16} />;
-  if (type === "joint") return <GitBranch size={16} />;
-  return <Hash size={16} />;
-}
-
-function channelTypeMessageId(type: ArchivedChannel["type"]) {
-  if (type === "private") return "settings.archivedChannels.private" as const;
-  if (type === "joint") return "settings.archivedChannels.joint" as const;
+/** External first (Q12 A: a guest, a guest server or an open invite), as the channel's header tags it. */
+function channelTypeMessageId(channel: ArchivedChannel) {
+  if (isSidebarExternalSectionChannel(channel)) return "settings.archivedChannels.joint" as const;
+  if (channel.type === "private") return "settings.archivedChannels.private" as const;
+  if (channel.type === "joint") return "settings.archivedChannels.joint" as const;
   return "settings.archivedChannels.public" as const;
 }
 
@@ -42,6 +41,13 @@ function ArchivedChannelsSectionContent() {
   const { formatMessage } = useIntl();
   const { formatMediumDateTime } = useTimeFormatter();
   const nav = useAppNavigate();
+  const openChannel = useCallback(
+    (event: MouseEvent<HTMLButtonElement>) => {
+      const channelId = event.currentTarget.dataset.channelId;
+      if (channelId) nav.toChannel(channelId);
+    },
+    [nav],
+  );
   const { capabilities } = useServerPermissions();
   const channels = useChannelStore((state) => state.channels);
   const loading = useChannelStore((state) => state.loading);
@@ -99,10 +105,10 @@ function ArchivedChannelsSectionContent() {
         </Banner>
       ) : null}
 
-      <Card className="divide-y divide-line-hairline">
+      <Card className="rule-y rule-line-hairline">
         {archivedChannels.map((channel) => {
           const busy = busyChannelId === channel.id;
-          const typeLabel = formatMessage({ id: channelTypeMessageId(channel.type) });
+          const typeLabel = formatMessage({ id: channelTypeMessageId(channel) });
           const channelName = formatMessage(
             { id: "settings.archivedChannels.channelName" },
             { name: channel.name },
@@ -116,21 +122,21 @@ function ArchivedChannelsSectionContent() {
               <div className="flex min-w-0 flex-1 items-center gap-3">
                 <Tooltip content={typeLabel}>
                 <IconTile size="sm" role="img" aria-label={typeLabel}>
-                  {channelTypeIcon(channel.type)}
+                  <ChannelIcon channel={channel} size={16} />
                 </IconTile>
                 </Tooltip>
                 <div className="min-w-0 flex-1">
-                  <button
-                    type="button"
-                    className="block max-w-full truncate rounded-sticker text-left text-subhead font-semibold text-foreground-muted underline decoration-[1.5px] underline-offset-[3px] outline-none hover:text-foreground focus-visible:shadow-focus"
+                  <TextLink
+                    className="block max-w-full truncate text-left text-subhead"
                     aria-label={formatMessage(
                       { id: "settings.archivedChannels.openAriaLabel" },
                       { name: channel.name },
                     )}
-                    onClick={() => nav.toChannel(channel.id)}
+                    data-channel-id={channel.id}
+                    onClick={openChannel}
                   >
                     {channelName}
-                  </button>
+                  </TextLink>
                   <div className="mt-0.5 truncate text-footnote text-foreground-muted">
                     {formatMessage(
                       { id: "settings.archivedChannels.metadata" },

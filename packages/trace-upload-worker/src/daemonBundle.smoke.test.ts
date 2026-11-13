@@ -21,9 +21,9 @@ import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { gzipSync } from "node:zlib";
-import { BasicTracer, TRACE_EVENT_ROW_V2_PROJECTION_COLUMNS } from "@botiverse/raft-shared";
+import { BasicTracer } from "@botiverse/raft-shared";
 import { LocalRotatingTraceSink } from "@botiverse/raft-trace-client";
-import type { Client } from "scopedb";
+import { fakeScopeDbTraceEventClient } from "./testing/fakeScopeDbTraceEventClient";
 import { ingestTraceBundleObject, isLocalTraceRecord, type TraceUploadWorkerEnv } from "./index";
 
 class MockR2Bucket {
@@ -179,21 +179,12 @@ test("daemon-produced LocalRotatingTraceSink bytes round-trip through worker ing
       // endpoint, so this test must not share an endpoint with other tests.
       SCOPEDB_TRACE_EVENTS_ENDPOINT: "https://scopedb-daemon-bundle-smoke.test",
       SCOPEDB_TRACE_EVENTS_WRITE_KEY: "smoke-key",
-      SCOPEDB_TRACE_EVENTS_CLIENT: {
-        table: () => ({
-          withSchema() { return this; },
-          tableSchema: async () => ({
-            fields: () => TRACE_EVENT_ROW_V2_PROJECTION_COLUMNS.map(([name, dataType]) => ({
-              name: () => name,
-              dataType: () => dataType,
-            })),
-          }),
-        }),
-        insert: async (payload: string) => {
+      SCOPEDB_TRACE_EVENTS_CLIENT: fakeScopeDbTraceEventClient({
+        append: (payload: string) => {
           projectedPayloads.push(payload);
           return { num_rows_inserted: payload.split("\n").length };
         },
-      } as unknown as Pick<Client, "insert" | "table">,
+      }),
     };
 
     const bundle = gzipSync(Buffer.from(rawJsonl, "utf8"));

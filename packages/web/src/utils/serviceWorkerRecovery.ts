@@ -41,7 +41,8 @@ export interface BrowserRecoveryCleanupResult extends ServiceWorkerRecoveryResul
 
 /**
  * Everything "clear cache and reload" removes or refreshes in this browser
- * profile: the service worker step above and the `slock-assets-*` caches.
+ * profile: the service worker step above, the `slock-assets-*` caches and the
+ * kept HTML (`slock-shell-*`).
  *
  * Outside ordinary-page mode it does nothing at all. An offline-bundle page may
  * share this origin's storage with the ordinary web app, so its recovery must
@@ -60,7 +61,8 @@ export async function cleanBrowserStateForRecovery(): Promise<BrowserRecoveryCle
     }),
   );
   if ("caches" in window) {
-    const assetCacheKeys = (await window.caches.keys()).filter((key) => key.startsWith("slock-assets-"));
+    // The kept HTML (slock-shell-*) goes too: it names the assets being cleared.
+    const assetCacheKeys = (await window.caches.keys()).filter((key) => key.startsWith("slock-assets-") || key.startsWith("slock-shell-"));
     assetCacheCount = assetCacheKeys.length;
     cleanup.push(
       ...assetCacheKeys.map((key) => window.caches.delete(key).catch(() => { failureCount += 1; return false; })),
@@ -68,4 +70,17 @@ export async function cleanBrowserStateForRecovery(): Promise<BrowserRecoveryCle
   }
   await Promise.all(cleanup);
   return { serviceWorkerCount, assetCacheCount, failureCount };
+}
+
+/**
+ * Forgets the HTML the service worker keeps (`/` in `slock-shell-*`, sw.js), as
+ * an urgent release does, so the next open is answered by the network: a
+ * reload onto a newer release would otherwise open the kept, older one again
+ * (docs/frontend/boot-shell.md, "One open behind"). The asset cache and the
+ * kept display locale stay. Nothing outside ordinary-page mode.
+ */
+export async function dropKeptShell(): Promise<void> {
+  if (!mayUseServiceWorker() || !("caches" in window)) return;
+  const keys = (await window.caches.keys()).filter((key) => key.startsWith("slock-shell-"));
+  await Promise.all(keys.map(async (key) => (await window.caches.open(key)).delete("/")));
 }

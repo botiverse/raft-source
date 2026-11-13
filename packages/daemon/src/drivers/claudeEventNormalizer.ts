@@ -1,5 +1,7 @@
 import type { SubagentLineage } from "@botiverse/raft-shared";
-import type { ParsedEvent } from "./types";
+import { CREDENTIAL_PROBLEM_MESSAGES, type CredentialProblemCode } from "../runtimeErrorDiagnostics";
+import { SendIntentArgumentScanner } from "./sendIntentScanner";
+import type { ParsedEvent, ProviderQuotaObservation, ProviderQuotaRateLimitType } from "./types";
 
 type TelemetryAttrs = Extract<ParsedEvent, { kind: "telemetry" }>["attrs"];
 
@@ -38,6 +40,22 @@ function taskLifecyclePhase(subtype: string): "started" | "progress" | "notifica
     default:
       return null;
   }
+}
+
+/**
+ * What a `system` task-lifecycle envelope's `task_type` says the task is.
+ * Claude Code runs sub-agents (`local_agent`, `remote_agent`) and also shell
+ * commands (`local_bash`, foreground ones too once they run a few seconds) as
+ * tasks with the same envelopes; only an agent task is a sub-agent. Any other
+ * named type is "other". Undefined when the envelope names none (older
+ * Claude Code, which only sent these for sub-agents).
+ */
+function taskKindFromType(value: unknown): "agent" | "command" | "other" | undefined {
+  const taskType = finiteString(value);
+  if (!taskType) return undefined;
+  if (taskType === "local_bash") return "command";
+  // Agents and agent-team teammates (`in_process_teammate`) are sub-agents.
+  return /agent|teammate/.test(taskType) ? "agent" : "other";
 }
 
 /** The closed terminal statuses a `task_notification` may carry; anything else is dropped, not echoed. */
@@ -82,6 +100,40 @@ const CLAUDE_QUOTA_EXHAUSTED_TEXT = [
 
 type ClaudeRateLimitObservation = { status: string; resetsAtSec?: number };
 
+/**
+ * #proj-raft-computer:#68: Claude Code's typed API error on an assistant or
+ * result line. Live stream-json (2.1.3xx) is snake_case: `error` (the SDK
+ * category), `is_api_error_message`, `api_error_status`, `api_error_code`,
+ * `api_error_origin`; the result line repeats the code with `subtype:
+ * "success"` and `is_error: true`. Persisted session JSONL is camelCase
+ * (`isApiErrorMessage`) with `error` and no status. Fixtures:
+ * drivers/fixtures/claude-verification-required.{live,jsonl}.json.
+ */
+function claudeApiErrorCodes(event: Record<string, unknown>): string[] {
+  return [event.error, event.api_error_code, event.apiErrorCode].filter((value): value is string => typeof value === "string" && value.length > 0);
+}
+
+/**
+ * The typed API error a Claude line carries, for the error's trace class and
+ * HTTP status: its codes (`api_error_code`, the SDK `error` category) and
+ * `api_error_status`. Undefined when the line has none.
+ */
+function claudeProviderError(event: Record<string, unknown>): { codes?: string[]; httpStatus?: number } | undefined {
+  const codes = [...new Set([event.api_error_code, event.apiErrorCode, event.error].filter((value): value is string => typeof value === "string" && value.length > 0))];
+  const status = event.api_error_status ?? event.apiErrorStatus;
+  const httpStatus = typeof status === "number" && Number.isInteger(status) ? status : undefined;
+  if (codes.length === 0 && httpStatus === undefined) return undefined;
+  return { ...(codes.length > 0 ? { codes } : {}), ...(httpStatus !== undefined ? { httpStatus } : {}) };
+}
+
+/**
+ * An account problem only its holder can resolve, by Claude's typed code
+ * (never its wording): the account must be verified.
+ */
+function classifyClaudeAccountProblem(codes: readonly string[]): CredentialProblemCode | null {
+  return codes.includes("verification_required") ? "verification_required" : null;
+}
+
 function classifyClaudeProviderLimit(
   sdkError: string,
   text: string,
@@ -107,8 +159,59 @@ function finiteNumber(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
+/** The fields of a Claude `stream_event` row the send-intent scan reads; everything is checked before use. */
+interface ClaudeStreamEvent {
+  type?: unknown;
+  index?: unknown;
+  content_block?: { type?: unknown; id?: unknown; name?: unknown } | null;
+  delta?: { type?: unknown; partial_json?: unknown } | null;
+}
+
 function finiteString(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+const PROVIDER_QUOTA_STATUSES = new Set(["allowed", "allowed_warning", "rejected"]);
+const PROVIDER_QUOTA_RATE_LIMIT_TYPES: ReadonlySet<string> = new Set<ProviderQuotaRateLimitType>([
+  "five_hour",
+  "seven_day",
+  "seven_day_opus",
+  "seven_day_sonnet",
+  "seven_day_overage_included",
+  "overage",
+]);
+/** The furthest ahead a reported reset is believed; later (or millisecond-scale) values are not resets. */
+export const PROVIDER_QUOTA_MAX_RESET_AHEAD_MS = 365 * 24 * 60 * 60 * 1000;
+
+/**
+ * Read the top-level fields of a Claude Code `rate_limit_event.rate_limit_info`
+ * (2.1.317 schema: `status`, `utilization`, `surpassedThreshold`,
+ * `rateLimitType`, `resetsAt` in epoch seconds). Anything without a known
+ * `status` is not a reading; fields of the wrong type are dropped, and so is
+ * a `resetsAt` beyond the coming year (a past one is kept: that window already reset).
+ */
+export function parseClaudeRateLimitInfo(info: unknown, nowMs: number): ProviderQuotaObservation | undefined {
+  if (!info || typeof info !== "object" || Array.isArray(info)) return undefined;
+  const fields = info as Record<string, unknown>;
+  const status = fields.status;
+  if (typeof status !== "string" || !PROVIDER_QUOTA_STATUSES.has(status)) return undefined;
+  const utilization = finiteNumber(fields.utilization);
+  const surpassedThreshold = finiteNumber(fields.surpassedThreshold);
+  const rateLimitType = typeof fields.rateLimitType === "string" && PROVIDER_QUOTA_RATE_LIMIT_TYPES.has(fields.rateLimitType)
+    ? fields.rateLimitType as ProviderQuotaRateLimitType
+    : undefined;
+  const resetsAtSec = finiteNumber(fields.resetsAt);
+  const resetsAtMs = resetsAtSec !== undefined ? resetsAtSec * 1000 : undefined;
+  // A past reset is kept (that window has already reset, so the store expires
+  // the reading at once); one beyond the coming year is not a reset.
+  const plausibleReset = resetsAtMs !== undefined && resetsAtMs > 0 && resetsAtMs < nowMs + PROVIDER_QUOTA_MAX_RESET_AHEAD_MS;
+  return {
+    status: status as ProviderQuotaObservation["status"],
+    ...(utilization !== undefined && utilization >= 0 ? { utilization } : {}),
+    ...(surpassedThreshold !== undefined && surpassedThreshold >= 0 ? { surpassedThreshold } : {}),
+    ...(rateLimitType ? { rateLimitType } : {}),
+    ...(plausibleReset ? { resetsAtMs } : {}),
+  };
 }
 
 function withDefined(attrs: Record<string, unknown>): TelemetryAttrs {
@@ -175,6 +278,15 @@ function collectModelUsageAttrs(value: unknown): TelemetryAttrs {
     modelUsageMaxContextWindow: aggregate.contextWindow,
     modelUsageMaxOutputTokens: aggregate.maxOutputTokens,
   });
+}
+
+/** input + cache read + cache write of one request's `usage`: the context that request carried; null when absent. */
+function claudeRequestContextTokens(usage: unknown): number | null {
+  if (!usage || typeof usage !== "object") return null;
+  const record = usage as Record<string, unknown>;
+  const parts = [record.input_tokens, record.cache_read_input_tokens, record.cache_creation_input_tokens].map(finiteNumber);
+  if (parts.every((part) => part === undefined)) return null;
+  return parts.reduce<number>((sum, part) => sum + (part ?? 0), 0);
 }
 
 function parseClaudeResultUsageTelemetry(
@@ -249,6 +361,32 @@ export class ClaudeEventNormalizer {
   // task #379: set when this turn's assistant message already reported a
   // runtime-declared API error, so the turn's `result` does not count it twice.
   private turnApiErrorReported = false;
+  /**
+   * #proj-runtime:#54: the context the main agent's last model request carried
+   * (input + cache read + cache write of that request's `usage`). The result's
+   * usage is summed over every request of the turn, so it can't tell how big
+   * the context is now; this one can.
+   */
+  private lastRequestContextTokens: number | null = null;
+  /** task #25 step 2: the daemon asked to interrupt this turn; its failed result is the interrupt, not an error. */
+  private interruptRequested = false;
+  /**
+   * Agent typing line: the main agent's streaming `tool_use` blocks by content
+   * index (`content_block_start` names the id; `input_json_delta` carries the
+   * arguments), reset by each `message_start`.
+   */
+  private streamingToolUseIds = new Map<number, string>();
+  private readonly sendIntentScanner = new SendIntentArgumentScanner();
+  /**
+   * The kind `task_started` named for each task that is not a sub-agent: its
+   * progress and notification envelopes name no `task_type`. Forgotten at the
+   * task's notification.
+   */
+  private readonly nonAgentTasks = new Map<string, "command" | "other">();
+
+  noteInterruptRequested(): void {
+    this.interruptRequested = true;
+  }
 
   get currentSessionId(): string | null {
     return this.currentSession;
@@ -275,7 +413,8 @@ export class ClaudeEventNormalizer {
     }
 
     const pushResultError = (message: Record<string, any>, fallback: string) => {
-      events.push({ kind: "error", message: collectResultErrorDetail(message, fallback) });
+      const providerError = message.is_error === true ? claudeProviderError(message) : undefined;
+      events.push({ kind: "error", message: collectResultErrorDetail(message, fallback), ...(providerError ? { providerError } : {}) });
     };
 
     switch (event.type) {
@@ -285,6 +424,7 @@ export class ClaudeEventNormalizer {
           : {};
         const status = finiteString(info.status);
         if (status) this.lastRateLimit = { status, resetsAtSec: finiteNumber(info.resetsAt) };
+        const providerQuota = parseClaudeRateLimitInfo(event.rate_limit_info, this.nowMs());
         events.push({
           kind: "telemetry",
           name: "rate_limits",
@@ -297,6 +437,7 @@ export class ClaudeEventNormalizer {
             overageStatus: finiteString(info.overageStatus),
             isUsingOverage: typeof info.isUsingOverage === "boolean" ? info.isUsingOverage : undefined,
           }),
+          ...(providerQuota ? { providerQuota } : {}),
         });
         break;
       }
@@ -332,10 +473,17 @@ export class ClaudeEventNormalizer {
         {
           const phase = typeof event.subtype === "string" ? taskLifecyclePhase(event.subtype) : null;
           if (phase) {
+            const taskId = finiteString(event.task_id);
+            const namedKind = taskKindFromType(event.task_type);
+            const taskKind = namedKind ?? (taskId ? this.nonAgentTasks.get(taskId) : undefined);
+            if (taskId && phase === "started" && (taskKind === "command" || taskKind === "other")) this.nonAgentTasks.set(taskId, taskKind);
+            // Forgotten only at the end the daemon takes as one (a closed status).
+            if (taskId && phase === "notification" && taskNotificationStatus(event.status)) this.nonAgentTasks.delete(taskId);
             events.push({
               kind: "subagent_progress",
               source: "claude_task_lifecycle",
               phase,
+              ...(taskKind ? { taskKind } : {}),
               ...(finiteString(event.task_id) ? { taskId: finiteString(event.task_id)! } : {}),
               // `system` task-lifecycle envelopes carry the outer Agent tool id
               // as `tool_use_id`; belt-and-suspenders fall back to
@@ -353,7 +501,7 @@ export class ClaudeEventNormalizer {
         }
         break;
 
-      case "stream_event":
+      case "stream_event": {
         events.push({
           kind: "internal_progress",
           source: "claude_stream_event",
@@ -362,7 +510,10 @@ export class ClaudeEventNormalizer {
             : "unknown",
           payloadBytes: Buffer.byteLength(line, "utf8"),
         });
+        const sendIntent = this.scanStreamEventForSendIntent(event);
+        if (sendIntent) events.push(sendIntent);
         break;
+      }
 
       case "assistant": {
         const content = event.message?.content;
@@ -370,6 +521,10 @@ export class ClaudeEventNormalizer {
         // the emitted content events so the daemon marks them as subagent
         // activity (APM 1.6 6b). Absent lineage → flat, ordinary events.
         const subagent = extractSubagentLineage(event);
+        if (!subagent) {
+          const requestContext = claudeRequestContextTokens(event.message?.usage);
+          if (requestContext !== null) this.lastRequestContextTokens = requestContext;
+        }
         const withLineage = subagent ? { subagent } : {};
         if (Array.isArray(content)) {
           const hasToolUse = content.some((block) => block?.type === "tool_use");
@@ -380,11 +535,23 @@ export class ClaudeEventNormalizer {
           const sdkError = !hasToolUse && !subagent && typeof event.error === "string" && event.error
             ? event.error
             : null;
+          const accountProblem = sdkError ? classifyClaudeAccountProblem(claudeApiErrorCodes(event)) : null;
+          const providerError = sdkError ? claudeProviderError(event) : undefined;
           for (const block of content) {
             if (block.type === "thinking" && block.thinking) {
               events.push({ kind: "thinking", text: block.thinking, ...withLineage });
             } else if (block.type === "text" && block.text) {
-              if (sdkError) {
+              if (accountProblem) {
+                if (this.turnApiErrorReported) continue;
+                this.turnApiErrorReported = true;
+                events.push({
+                  kind: "error",
+                  message: CREDENTIAL_PROBLEM_MESSAGES[accountProblem],
+                  nativeReasonPresent: true,
+                  reasonProvenance: "runtime_error_event",
+                  ...(providerError ? { providerError } : {}),
+                });
+              } else if (sdkError) {
                 const providerLimit = classifyClaudeProviderLimit(sdkError, block.text, this.lastRateLimit, this.nowMs());
                 this.turnApiErrorReported = true;
                 events.push({
@@ -393,6 +560,7 @@ export class ClaudeEventNormalizer {
                   nativeReasonPresent: true,
                   reasonProvenance: "runtime_error_event",
                   ...(providerLimit ? { providerLimit } : {}),
+                  ...(providerError ? { providerError } : {}),
                 });
               } else if (isProviderApiFailureText(block.text, hasToolUse)) {
                 events.push({ kind: "error", message: block.text });
@@ -438,16 +606,40 @@ export class ClaudeEventNormalizer {
         const stopReason = typeof event.stop_reason === "string" ? event.stop_reason : null;
         const resultSessionId = eventSessionId ?? this.currentSession;
         const usageTelemetry = parseClaudeResultUsageTelemetry(event, resultSessionId);
+        if (usageTelemetry && this.lastRequestContextTokens !== null && usageTelemetry.kind === "telemetry") {
+          usageTelemetry.attrs.lastRequestContextTokens = this.lastRequestContextTokens;
+        }
         const isMaxTokenError = stopReason === "max_tokens" &&
           (event.is_error === true || subtype !== "success");
         // task #379: the assistant message already reported this turn's API
         // error; the generic result failure is the same fact, not a second one.
         const apiErrorAlreadyReported = this.turnApiErrorReported;
         this.turnApiErrorReported = false;
+        const interrupted = this.interruptRequested && subtype !== "success";
+        this.interruptRequested = false;
+        if (interrupted) {
+          if (usageTelemetry) events.push(usageTelemetry);
+          events.push({ kind: "turn_end", sessionId: resultSessionId || undefined, interrupted: true });
+          break;
+        }
 
+        // #proj-raft-computer:#68: a result whose typed API error is an
+        // account problem, with no assistant line before it: the same fixed text.
+        const resultAccountProblem = event.is_error === true && !apiErrorAlreadyReported
+          ? classifyClaudeAccountProblem(claudeApiErrorCodes(event))
+          : null;
+        const resultProviderError = resultAccountProblem ? claudeProviderError(event) : undefined;
         switch (subtype) {
           case "success":
-            if (event.is_error && !apiErrorAlreadyReported) {
+            if (resultAccountProblem) {
+              events.push({
+                kind: "error",
+                message: CREDENTIAL_PROBLEM_MESSAGES[resultAccountProblem],
+                nativeReasonPresent: true,
+                reasonProvenance: "runtime_error_event",
+                ...(resultProviderError ? { providerError: resultProviderError } : {}),
+              });
+            } else if (event.is_error && !apiErrorAlreadyReported) {
               pushResultError(event, "Execution failed");
             }
             break;
@@ -477,6 +669,43 @@ export class ClaudeEventNormalizer {
     }
 
     return events;
+  }
+
+  /**
+   * Agent typing line: a `raft message send` target in the main agent's
+   * streaming Bash arguments. A subagent's stream (explicit
+   * `parent_tool_use_id`) is not the agent speaking for itself and is skipped.
+   */
+  private scanStreamEventForSendIntent(row: Record<string, unknown>): Extract<ParsedEvent, { kind: "send_intent" }> | null {
+    if (extractSubagentLineage(row)) return null;
+    const streamEvent = row.event as ClaudeStreamEvent | null | undefined;
+    if (!streamEvent || typeof streamEvent !== "object") return null;
+    switch (streamEvent.type) {
+      case "message_start":
+        this.streamingToolUseIds.clear();
+        return null;
+      case "content_block_start": {
+        const block = streamEvent.content_block;
+        if (typeof streamEvent.index !== "number" || block?.type !== "tool_use") return null;
+        const id = finiteString(block.id);
+        if (!id) return null;
+        this.streamingToolUseIds.set(streamEvent.index, id);
+        // Registers the name; an input already present at start is `{}`.
+        return this.sendIntentScanner.append(id, finiteString(block.name), undefined);
+      }
+      case "content_block_delta": {
+        const delta = streamEvent.delta;
+        if (typeof streamEvent.index !== "number" || delta?.type !== "input_json_delta") return null;
+        const id = this.streamingToolUseIds.get(streamEvent.index);
+        if (!id || typeof delta.partial_json !== "string") return null;
+        return this.sendIntentScanner.append(id, undefined, delta.partial_json);
+      }
+      case "content_block_stop":
+        if (typeof streamEvent.index === "number") this.streamingToolUseIds.delete(streamEvent.index);
+        return null;
+      default:
+        return null;
+    }
   }
 }
 

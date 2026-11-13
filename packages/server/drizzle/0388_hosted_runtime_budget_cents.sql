@@ -1,0 +1,2 @@
+ALTER TABLE "hosted_runtime_server_plans" ADD COLUMN "synced_daily_budget_cents" integer;--> statement-breakpoint
+ALTER TABLE "hosted_runtime_server_plans" ADD COLUMN "synced_onboarding_daily_budget_cents" integer;

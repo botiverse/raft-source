@@ -1,0 +1,21 @@
+-- MCP Apps: several Connections per App again (product decision 2026-10-22, yezizp).
+--
+-- 0417 restored idx_managed_mcp_credentials_server (UNIQUE on mcp_server_id) so a binary released
+-- before MCP Apps (#9782) could still save credentials after a rollback (ON CONFLICT (mcp_server_id)
+-- needs it as the arbiter). That also made a second Connection per App impossible, and the flag
+-- release refused one with 409 managed_mcp_single_connection.
+--
+-- The gate is gone and Apps keep several Connections, so the index goes with it. 0417 stays in the
+-- journal: it has already been applied on staging, and a migration that has run cannot be removed
+-- from the chain — this drops what it created. On a database that never ran 0417 this is a no-op.
+--
+-- Consequence, deliberate, and handed to the release owner as an internal step rather than
+-- release-note text: after this, rolling back to a binary released before #9782 breaks credential
+-- saves (42P10) unless the index is restored first —
+-- `scripts/rollback-0409-managed-mcp-credential-index.ts --restore`. That helper REFUSES while any
+-- App has several Connections, so a rollback from this state is not a one-command operation: extra
+-- Connections have to be resolved first, which is exactly why it cannot be advertised as "roll back
+-- whenever".
+--
+-- idx_managed_mcp_credentials_default (one default per App) stays.
+DROP INDEX IF EXISTS "idx_managed_mcp_credentials_server";

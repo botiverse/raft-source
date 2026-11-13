@@ -1,45 +1,11 @@
 import assert from "node:assert/strict";
 import { CSV_PREVIEW_MAX_FILE_SIZE_BYTES } from "@botiverse/raft-shared";
-import { formatDiffPatchStats, isAudioPreviewAttachment, isCsvAttachment, isDiffPatchAttachment, isDocumentPreviewAttachment, isMarkdownAttachment, isPdfAttachment, isTextAttachment, isVideoPreviewAttachment } from "../src/components/message/attachmentPreview";
+import { isAudioPreviewAttachment, isCsvAttachment, isDiffPatchAttachment, isDocumentPreviewAttachment, isMarkdownAttachment, isPdfAttachment, isTextAttachment, isVideoPreviewAttachment } from "../src/components/message/attachmentPreview";
 
 test("isDiffPatchAttachment classifies patch previews by filename and MIME", () => {
   assert.equal(isDiffPatchAttachment({ filename: "changes.diff", mimeType: "text/plain" }), true);
   assert.equal(isDiffPatchAttachment({ filename: "changes", mimeType: "text/x-patch" }), true);
   assert.equal(isDiffPatchAttachment({ filename: "screenshot.png", mimeType: "image/png" }), false);
-});
-
-test("formatDiffPatchStats keeps tiny preview copy compact", () => {
-  const formatMessage: typeof import("react-intl").IntlShape["formatMessage"] = (
-    descriptor,
-    values,
-  ) => {
-    const id = typeof descriptor === "object" && descriptor && "id" in descriptor
-      ? String(descriptor.id)
-      : "";
-    if (id === "message.diff.filesHunks") {
-      const files = Number(values?.files ?? 0);
-      const hunks = Number(values?.hunks ?? 0);
-      const fileLabel = files === 1 ? "file" : "files";
-      const hunkLabel = hunks === 1 ? "hunk" : "hunks";
-      return `${files} ${fileLabel}, ${hunks} ${hunkLabel}`;
-    }
-    return id;
-  };
-
-  assert.equal(
-    formatDiffPatchStats(
-      { kind: "diff", stats: { files: 2, hunks: 5, additions: 41, deletions: 9 } },
-      formatMessage,
-    ),
-    "2 files, 5 hunks · +41 -9",
-  );
-  assert.equal(
-    formatDiffPatchStats(
-      { kind: "diff", stats: { files: 1, hunks: 1, additions: 1, deletions: 0 } },
-      formatMessage,
-    ),
-    "1 file, 1 hunk · +1 -0",
-  );
 });
 
 

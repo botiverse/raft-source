@@ -1,48 +1,33 @@
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { useIntl } from "react-intl";
-import { Check, Copy, Link2, Mail, Plus } from "lucide-react";
-import {
-  Button,
-  Field,
-  Input,
-  SegmentedControl,
-  SegmentedControlItem,
-  SegmentedControlLabel,
-  Select,
-  SelectContent,
-  SelectIcon,
-  SelectItem,
-  SelectItemIndicator,
-  SelectItemText,
-  SelectList,
-  SelectTrigger,
-  SelectValue,
-} from "@botiverse/raft-ui";
-import type { ServerRole } from "@botiverse/raft-shared";
-import { SERVER_GUEST_FEATURE_FLAG_KEY, formatBillingCapacityLimitMessage, getBillingCapacityLimitState, getBillingUsage, validateEmailAddress } from "@botiverse/raft-shared";
+import { Check, Copy, Link, Mail, Plus } from "lucide-react";
+import { Button, Field, Input, SegmentedControl, SegmentedControlItem, SegmentedControlLabel, Select, SelectContent, SelectIcon, SelectItem, SelectItemIndicator, SelectItemText, SelectList, SelectTrigger, SelectValue, TextLink } from "@botiverse/raft-ui";
+import { PRO_AGENT_SEAT_BLOCK_SIZE, formatBillingCapacityLimitMessage, getBillingCapacityLimitState, getBillingUsage, seatTenths, seatsFromTenths, validateEmailAddress } from "@botiverse/raft-shared";
 import { useServerStore } from "../../store/serverStore";
-import { useServerFeatureFlag } from "../../store/serverFeatureFlags";
+import { PRO_SEAT_ADD_FEATURE_FLAG_KEY, useServerFeatureFlag } from "../../store/serverFeatureFlags";
 import { useServerPermissions } from "../../hooks/useServerPermissions";
 import { useAppNavigate } from "../../hooks/useAppNavigate";
+import { PaywallShown, trackPaywallAction } from "../../analytics/paywall";
+import { noteBillingEntry } from "../../analytics/billingEntry";
+import { trackFeature } from "../../analytics/features";
 import api from "../../api/client";
 import { shareableWebOrigin } from "../../utils/desktopShell";
 import DialogCard from "../ui/DialogCard";
+import { DialogCardFooter, DialogCommit } from "../ui/NarrowDialog";
 import Tooltip from "../ui/Tooltip";
 import Banner from "../ui/Banner";
-import TextLink from "../ui/TextLink";
+import type { AddSeatsNeed } from "../billing/AddSeatsDialog";
 import { InviteeRow } from "./InviteeRow";
+import ConfirmDialog from "../ConfirmDialog";
+import { deferredDialog } from "../../boot/deferredUi";
+
+const AddSeatsDialog = deferredDialog(() => import("../billing/AddSeatsDialog"));
 
 // DS TextField label: 13/18 600 ink-2, always visible, sentence case.
 const FIELD_LABEL_CLASS = "mb-1.5 block text-footnote font-semibold text-foreground-muted";
 
-/**
- * The roles an invite can grant. Derived from the shared `ServerRole` union
- * rather than restated as a free-standing `"member" | "guest"`: the server's own
- * `InvitableServerRole` lives in `inviteService.ts`, which the web cannot
- * import, so this is the closest thing to one source of truth. If `ServerRole`
- * ever loses either member, this stops compiling instead of drifting quietly.
- */
-export type InvitableRole = Extract<ServerRole, "member" | "guest">;
+/** Where the invite dialog was opened from (`feature_action.surface`). */
+export type InviteSurface = "sidebar" | "server_menu" | "members_page";
 
 /**
  * `id` is a stable React key that survives removal of an earlier row. Index
@@ -52,7 +37,6 @@ export type InvitableRole = Extract<ServerRole, "member" | "guest">;
 export interface Invitee {
   id: string;
   email: string;
-  role: InvitableRole;
 }
 
 interface JoinLinkRecord {
@@ -71,8 +55,11 @@ export type InviteePatch = Partial<Omit<Invitee, "id">>;
 
 export default function InviteHumanDialog({
   onClose,
+  surface,
 }: {
   onClose: () => void;
+  /** Where the dialog was opened from, for `feature_action` (invite). */
+  surface: InviteSurface;
 }) {
   const intl = useIntl();
   const { formatMessage } = intl;
@@ -80,22 +67,25 @@ export default function InviteHumanDialog({
   const billing = useServerStore((s) => s.billing);
   const loadBilling = useServerStore((s) => s.loadBilling);
   const nav = useAppNavigate();
+  // Once per dialog: the funnel's first step (open → send → someone joins).
+  useEffect(() => {
+    trackFeature("invite", "open", { surface });
+  }, [surface]);
   const openBillingSettings = useCallback(() => {
     onClose();
+    trackPaywallAction("seat_limit_invite", "view_billing");
+    noteBillingEntry("seat_limit_invite");
     nav.toSettings("billing");
   }, [nav, onClose]);
   /**
-   * One row per person, each carrying its OWN role.
-   *
-   * Previously this was three fixed email strings plus a single dialog-wide
-   * role. That shape could not express "two colleagues and one outside guest" —
-   * every invite in the batch was forced to the same grant, and nothing in the
-   * UI said so (@cindyz). Role now lives on the row it applies to.
+   * One row per person. Every invite grants Member: a Guest belongs to exactly
+   * one channel and is never created by a server invite (the server refuses
+   * `role: "guest"` with 400, #wg-rbac:#15), so there is no role to choose.
    *
    * Starts at one row rather than three empty boxes: rows are addable, so three
    * placeholders only asked a question most inviters do not have.
    */
-  const [invitees, setInvitees] = useState<Invitee[]>(() => [{ id: "invitee-0", email: "", role: "member" }]);
+  const [invitees, setInvitees] = useState<Invitee[]>(() => [{ id: "invitee-0", email: "" }]);
   const nextInviteeId = useRef(1);
   const inviteeFieldId = useId();
   const [joinLink, setJoinLink] = useState<JoinLinkRecord | null>(null);
@@ -113,28 +103,15 @@ export default function InviteHumanDialog({
     { maxUses: null, expiresAt: null },
   );
   const [regenerating, setRegenerating] = useState(false);
+  const [confirmingRevoke, setConfirmingRevoke] = useState(false);
+  const [confirmingUpdate, setConfirmingUpdate] = useState(false);
   const [inviteTab, setInviteTab] = useState<"email" | "link">("email");
   const [copied, setCopied] = useState(false);
   const [sending, setSending] = useState(false);
   const [error, setError] = useState("");
-  const guestEnabled = useServerFeatureFlag(SERVER_GUEST_FEATURE_FLAG_KEY).enabled;
   const { capabilities } = useServerPermissions();
-  /**
-   * Guest is offered only when the server has the capability turned on AND the
-   * caller is allowed to invite at all. Both halves are optimistic: this is a
-   * client-side read of a server-owned gate, so it can be stale. It decides what
-   * to OFFER, never what is permitted — see `handleSubmit`.
-   */
-  const canOfferGuest = guestEnabled && capabilities.inviteMembers;
-  const roleItems = useMemo(
-    () => [
-      { value: "member", label: formatMessage({ id: "member.invite.roleMember" }) },
-      { value: "guest", label: formatMessage({ id: "member.invite.roleGuest" }) },
-    ],
-    [formatMessage],
-  );
-  // Link-limit options as rUI Select items (same primitive as the role selector
-  // above; these two use the default button-scale chrome, see the row below).
+  // Link-limit options as rUI Select items (these use the default
+  // button-scale chrome, see the row below).
   // The "keep current" entry only appears once the loaded link already carries
   // that limit.
   const maxUsesItems = useMemo(
@@ -174,11 +151,10 @@ export default function InviteHumanDialog({
   const humanUsageState = billing?.usage ?? getBillingUsage(humanCount, 0);
   const humanCapacityLimitState = getBillingCapacityLimitState(humanCapacity, humanUsageState, "human");
   const humanSeatLimitReached = billing != null && humanCapacityLimitState.reached;
-  // Guest invitations consume no paid human seat. Only block the email path
-  // when a non-empty target actually requests a seat-consuming role; blank
-  // rows are ignored by submission and must not block a Guest-only batch.
+  // Every invite takes a seat. Blank rows are ignored by submission, so only a
+  // filled-in row blocks the email path.
   const emailInviteSeatLimitReached = humanSeatLimitReached && invitees.some(
-    (invitee) => invitee.email.trim() !== "" && invitee.role !== "guest",
+    (invitee) => invitee.email.trim() !== "",
   );
   const humanSeatLimitMessage = humanSeatLimitReached
     ? formatBillingCapacityLimitMessage(
@@ -188,6 +164,43 @@ export default function InviteHumanDialog({
       formatMessage({ id: "member.invite.upgradeForMore" }),
     )
     : "";
+  // Pro seats (task #10, behind pro_seat_add): for an owner, the line under the
+  // title says how many are taken, and they add the seats instead of meeting a
+  // disabled Send. Counted by the different people filled in,
+  // since each needs a seat to join, not only once the seats are full. Admins keep
+  // the notice until they can ask an owner.
+  const seatAddEnabled = useServerFeatureFlag(PRO_SEAT_ADD_FEATURE_FLAG_KEY).enabled;
+  const seatCapacity = seatAddEnabled && billing?.capacity && billing.capacity.maxUniversalSeats !== -1 ? billing.capacity.maxUniversalSeats : null;
+  // An owner adds the seats here; an admin asks an owner for them (task #10).
+  const addsSeatsInPlace = seatCapacity !== null;
+  const asksOwner = !capabilities.manageBilling;
+  const seatUsedTenths = seatTenths(billing?.usage?.humans ?? 0, billing?.usage?.agents ?? 0);
+  const seatEmails = [...new Set(invitees
+    .filter((invitee) => invitee.email.trim() !== "")
+    .map((invitee) => invitee.email.trim().toLowerCase()))];
+  const seatPeople = seatEmails.length;
+  const seatEmailsKey = seatEmails.join(",");
+  // Keyed by the joined emails: the array itself is rebuilt every render.
+  const inviteSeatAsk = useMemo(() => ({ purpose: { kind: "invite" as const, emails: seatEmailsKey.split(",").filter(Boolean) } }), [seatEmailsKey]);
+  // No one filled in, nothing to add.
+  const seatsShort = seatCapacity === null || seatPeople === 0
+    ? 0
+    : Math.max(0, Math.ceil((seatUsedTenths + seatPeople * PRO_AGENT_SEAT_BLOCK_SIZE) / PRO_AGENT_SEAT_BLOCK_SIZE) - seatCapacity);
+  const seatRoomTenths = Math.max(0, (seatCapacity ?? 0) * PRO_AGENT_SEAT_BLOCK_SIZE - seatUsedTenths);
+  const formatSeats = (tenths: number) => intl.formatNumber(seatsFromTenths(tenths), { maximumFractionDigits: 1 });
+  const seatDescription = !addsSeatsInPlace ? undefined : formatMessage(
+    { id: seatsShort > 0 ? "member.invite.seatUsageFull" : "member.invite.seatUsage" },
+    { used: formatSeats(seatUsedTenths), seats: seatCapacity ?? 0, people: seatPeople, count: seatsShort },
+  );
+  // Out of seats, an owner adds them here; anyone else still meets the notice.
+  const emailInviteBlocked = emailInviteSeatLimitReached && !addsSeatsInPlace;
+  const linkSeatsFull = addsSeatsInPlace && humanSeatLimitReached;
+  const formRef = useRef<HTMLFormElement>(null);
+  /** The add-seats dialog, and whether the invites go out once the seats count. */
+  const [seatNeed, setSeatNeed] = useState<{ need: AddSeatsNeed; send: boolean } | null>(null);
+  // Set when the seats were just added: the resumed send runs before this renders
+  // the new billing, so it skips the seat check here (the server still checks).
+  const resumingAfterSeats = useRef(false);
 
   useEffect(() => {
     void loadBilling();
@@ -245,7 +258,7 @@ export default function InviteHumanDialog({
   }, []);
 
   const addInvitee = useCallback(() => {
-    setInvitees((prev) => [...prev, { id: `invitee-${nextInviteeId.current++}`, email: "", role: "member" }]);
+    setInvitees((prev) => [...prev, { id: `invitee-${nextInviteeId.current++}`, email: "" }]);
   }, []);
 
   // The last row is protected by NOT rendering its remove control (below), so
@@ -259,9 +272,10 @@ export default function InviteHumanDialog({
   const handleCopy = useCallback(async () => {
     if (!joinUrl) return;
     await navigator.clipboard.writeText(joinUrl);
+    trackFeature("invite", "submit", { surface, variant: "link" });
     setCopied(true);
     window.setTimeout(() => setCopied(false), 1500);
-  }, [joinUrl]);
+  }, [joinUrl, surface]);
 
   const handleInviteTabChange = useCallback((val: "email" | "link" | null) => {
     if (val) setInviteTab(val);
@@ -310,13 +324,19 @@ export default function InviteHumanDialog({
     }
   }, [server, regenerating, maxUsesChoice, linkLimits, expiryChoice, joinLink, adoptLink, formatMessage]);
 
+  // Updating replaces the current link, so the old one stops working for
+  // whoever holds it: a named action that asks first, as Revoke does (Raft DS
+  // › Forms, "When a change takes effect"). With no link yet there is nothing
+  // to invalidate, so it just makes one.
   const handleRegenerateClick = useCallback(() => {
-    void regenerateLink();
-  }, [regenerateLink]);
+    if (joinLink) setConfirmingUpdate(true);
+    else void regenerateLink();
+  }, [joinLink, regenerateLink]);
+  const closeUpdateConfirm = useCallback(() => setConfirmingUpdate(false), []);
 
   // Revoke the current link entirely: its token stops working and no
   // replacement is created (the "Update link" button can make a fresh one).
-  const revokeLink = async () => {
+  const revokeLink = useCallback(async () => {
     if (!server || !joinLink || regenerating) return;
     setRegenerating(true);
     setError("");
@@ -331,19 +351,27 @@ export default function InviteHumanDialog({
     } finally {
       setRegenerating(false);
     }
-  };
+  }, [server, joinLink, regenerating, adoptLink, formatMessage]);
+  // Revoking can't be undone: the token stops working for good, and "Update
+  // link" makes a different link. So it asks first, and the red is on the
+  // confirmation's button, not on the quiet link that opens it (raft-design
+  // button.md: red only for what can't be undone, only in a confirmation).
+  const openRevokeConfirm = useCallback(() => setConfirmingRevoke(true), []);
+  const closeRevokeConfirm = useCallback(() => setConfirmingRevoke(false), []);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    const seatsJustAdded = resumingAfterSeats.current;
+    resumingAfterSeats.current = false;
     if (!server) return;
     const targets = invitees
-      .map((invitee) => ({ email: invitee.email.trim(), role: invitee.role }))
+      .map((invitee) => ({ email: invitee.email.trim() }))
       .filter((invitee) => invitee.email !== "");
     if (targets.length === 0) {
       setError(formatMessage({ id: "member.invite.enterEmailOrCopyLink" }));
       return;
     }
-    if (emailInviteSeatLimitReached) {
+    if (emailInviteBlocked) {
       setError(humanSeatLimitMessage);
       return;
     }
@@ -355,37 +383,84 @@ export default function InviteHumanDialog({
         return;
       }
     }
+    if (addsSeatsInPlace && seatsShort > 0 && !seatsJustAdded) {
+      // Not enough seats for everyone filled in: the owner adds them, then this sends again.
+      openInviteSeats();
+      return;
+    }
     setSending(true);
-    try {
-      // The chosen role goes to the server as chosen. Deliberately NOT
-      // pre-filtered by `canOfferGuest`: that flag is a possibly-stale client
-      // read, and silently rewriting guest->member here would hand out a WIDER
-      // grant than the inviter picked, with nothing in the UI saying so. The
-      // server refuses (400) rather than downgrading, and the catch below shows
-      // its message verbatim.
-      await Promise.all(
-        targets.map(({ email, role }) => api.post(`/servers/${server.id}/invites`, { email, role })),
-      );
+    // The role is stated explicitly rather than left to a server default.
+    const results = await Promise.allSettled(
+      targets.map(({ email }) => api.post(`/servers/${server.id}/invites`, { email, role: "member" })),
+    );
+    // Each address is its own request: the ones the server accepted went out
+    // even when another was refused (an existing member, a repeat).
+    const sent = results.filter((result) => result.status === "fulfilled").length;
+    if (sent > 0) trackFeature("invite", "submit", { surface, variant: "email", count: sent }, { serverId: server.id });
+    const refused = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
+    if (!refused) {
       onClose();
       nav.toSettings("administration");
-    } catch (err: unknown) {
-      const axiosErr = err as { response?: { data?: { error?: string } } };
-      setError(axiosErr.response?.data?.error || formatMessage({ id: "member.invite.failedSend" }));
-      setSending(false);
+      return;
     }
+    const axiosErr = refused.reason as { response?: { data?: { error?: string } } };
+    setError(axiosErr.response?.data?.error || formatMessage({ id: "member.invite.failedSend" }));
+    setSending(false);
   };
+  const serverName = server?.name ?? "";
+  function openInviteSeats() {
+    setSeatNeed({
+      send: true,
+      need: {
+        tenths: seatPeople * PRO_AGENT_SEAT_BLOCK_SIZE,
+        label: formatMessage({ id: "addSeats.invite.label" }, { count: seatPeople }),
+        title: formatMessage({ id: "addSeats.invite.title" }, { people: seatPeople, count: seatsShort }),
+        hint: asksOwner
+          ? formatMessage({ id: "addSeats.askHint" }, { server: serverName, seats: seatCapacity ?? 0 })
+          : seatRoomTenths > 0
+            ? formatMessage({ id: "addSeats.invite.hintRoom" }, { server: serverName, room: seatsFromTenths(seatRoomTenths), people: seatPeople })
+            : formatMessage({ id: "addSeats.invite.hint" }, { server: serverName, seats: seatCapacity ?? 0 }),
+        resume: formatMessage({ id: "addSeats.invite.resume" }),
+        gate: "seat_limit_invite",
+      },
+    });
+  }
+  const openLinkSeats = useCallback(() => setSeatNeed({
+    send: false,
+    need: {
+      tenths: PRO_AGENT_SEAT_BLOCK_SIZE,
+      label: formatMessage({ id: "addSeats.link.label" }),
+      title: formatMessage({ id: "addSeats.link.title" }),
+      hint: seatRoomTenths > 0
+        ? formatMessage({ id: "addSeats.link.hintRoom" }, { server: serverName, room: seatsFromTenths(seatRoomTenths) })
+        : formatMessage({ id: "addSeats.link.hint" }, { server: serverName, seats: seatCapacity ?? 0 }),
+      resume: formatMessage({ id: "addSeats.link.resume" }),
+      gate: "seat_limit_invite",
+    },
+  }), [formatMessage, seatCapacity, seatRoomTenths, serverName]);
+  const closeSeats = useCallback(() => setSeatNeed(null), []);
+  // The seats count now (billing has the new number): send what was filled in, or
+  // for the link, nothing more to do.
+  const handleSeatsAdded = useCallback(() => {
+    setSeatNeed(null);
+    if (!seatNeed?.send) return;
+    resumingAfterSeats.current = true;
+    formRef.current?.requestSubmit();
+  }, [seatNeed]);
 
   return (
-    <DialogCard title={formatMessage({ id: "member.invite.title" })} onClose={onClose} maxWidthClass="max-w-lg">
-        <form onSubmit={handleSubmit} className="space-y-4">
-          {error && !emailInviteSeatLimitReached && (
+    <>
+    <DialogCard title={formatMessage({ id: "member.invite.title" })} description={seatDescription} onClose={onClose} maxWidthClass="max-w-lg" narrow="sheet">
+        <form ref={formRef} onSubmit={handleSubmit} className="stack-y-4 md:pointer-fine:stack-y-3">
+          {error && !emailInviteBlocked && (
             <Banner intent="warning">
               {error}
               {isBillingGateError(error) && (
                 <>
                   {" "}
+                  <PaywallShown gate="seat_limit_invite" />
                   <TextLink
-                    variant="primary"
+                    variant="strong"
                     onClick={openBillingSettings}
                   >
                     {formatMessage({ id: "member.invite.viewBilling" })}
@@ -395,11 +470,12 @@ export default function InviteHumanDialog({
             </Banner>
           )}
 
-          {emailInviteSeatLimitReached && (
+          {emailInviteBlocked && (
             <Banner intent="warning">
               {humanSeatLimitMessage}{" "}
+              <PaywallShown gate="seat_limit_invite" />
               <TextLink
-                variant="primary"
+                variant="strong"
                 onClick={openBillingSettings}
               >
                 {formatMessage({ id: "member.invite.viewBilling" })}
@@ -407,11 +483,34 @@ export default function InviteHumanDialog({
             </Banner>
           )}
 
+          {/* A link costs no seat, but no one gets in through it while the seats are full:
+              something to fix, so warning (Kirby). The description above already says
+              how many are used, so this says what follows. */}
+          {inviteTab === "link" && linkSeatsFull && (
+            <Banner
+              intent="warning"
+              withIcon
+              live={false}
+              title={formatMessage({ id: "member.invite.linkFullTitle" }, { server: serverName })}
+              actions={asksOwner ? undefined : (
+                <Button type="button" variant="default" size="md" onClick={openLinkSeats} data-testid="invite-link-add-seats">
+                  {formatMessage({ id: "member.invite.linkAddSeats" })}
+                </Button>
+              )}
+              data-testid="invite-link-seats-full"
+            >
+              {formatMessage({ id: "member.invite.linkFullBody" })}
+            </Banner>
+          )}
+
           {/* Stopgap until per-agent access control (task #121): any member can
               DM and direct every agent in the server, so say so before inviting. */}
+          {/* One notice at a time: while the link can't let anyone in, that's the one. */}
+          {!(inviteTab === "link" && linkSeatsFull) && (
           <Banner intent="info" withIcon data-testid="invite-agent-reach-hint">
             {formatMessage({ id: "member.invite.agentReachHint" })}
           </Banner>
+          )}
 
           {/* Invite method tabs (Phase 3): email vs shareable link. */}
           <SegmentedControl<"email" | "link">
@@ -434,16 +533,14 @@ export default function InviteHumanDialog({
             <label className={FIELD_LABEL_CLASS}>
               {formatMessage({ id: "member.invite.byEmail" })}
             </label>
-            <div className="space-y-2">
+            <div className="stack-y-2">
               {invitees.map((invitee, index) => (
                 <InviteeRow
                   key={invitee.id}
                   invitee={invitee}
                   index={index}
                   fieldIdPrefix={inviteeFieldId}
-                  canOfferGuest={canOfferGuest}
                   canRemove={invitees.length > 1}
-                  roleItems={roleItems}
                   onUpdate={updateInvitee}
                   onRemove={removeInvitee}
                 />
@@ -453,7 +550,7 @@ export default function InviteHumanDialog({
               {/* No colour override: `variant="ghost"` already carries the
                   themed treatment, and a literal here could not follow the
                   theme (@cindyz, PR #7010). */}
-              <Button type="button" size="sm" variant="ghost" onClick={addInvitee}>
+              <Button type="button" size="md" variant="ghost" onClick={addInvitee}>
                 <Plus size={16} aria-hidden="true" />
                 {formatMessage({ id: "member.invite.addInvitee" })}
               </Button>
@@ -499,7 +596,7 @@ export default function InviteHumanDialog({
             </div>
             {/* Optional link limits (Phase 1). Purely additive: leaving the
                 defaults keeps the unlimited, non-expiring link. */}
-            {/* Link-limit controls sit beside a `size="sm"` Button (h-8), not
+            {/* Link-limit controls sit beside a `size="md"` Button (h-8), not
                 beside an Input, so they use the Select's DEFAULT chrome (the
                 Button size scale) rather than `chrome="field"` — field metrics
                 made them tower over both the labels and the button (task #98).
@@ -565,7 +662,7 @@ export default function InviteHumanDialog({
               </label>
               <Button
                 type="button"
-                size="sm"
+                size="md"
                 variant="outline"
                 onClick={handleRegenerateClick}
                 disabled={regenerating || linkLoading || !server}
@@ -573,15 +670,14 @@ export default function InviteHumanDialog({
                 {formatMessage({ id: "member.invite.applyLinkOptions" })}
               </Button>
               {joinLink && (
-                <button
-                  type="button"
-                  onClick={() => void revokeLink()}
+                <TextLink
+                  onClick={openRevokeConfirm}
                   disabled={regenerating}
                   data-testid="invite-link-revoke"
-                  className="rounded-[2px] text-footnote font-semibold text-danger-strong underline decoration-[1.5px] underline-offset-[3px] outline-none focus-visible:shadow-focus disabled:cursor-not-allowed disabled:text-foreground-disabled disabled:no-underline"
+                  className="text-footnote"
                 >
                   {formatMessage({ id: "member.invite.revokeLink" })}
-                </button>
+                </TextLink>
               )}
             </div>
             {joinLink && (
@@ -603,15 +699,15 @@ export default function InviteHumanDialog({
               </div>
             )}
             <div className="mt-1.5 flex items-center gap-1.5 text-caption text-foreground-hint">
-              <Link2 size={14} aria-hidden="true" />
-              {humanSeatLimitReached
+              <Link size={14} aria-hidden="true" />
+              {humanSeatLimitReached && !linkSeatsFull
                 ? formatMessage({ id: "member.invite.seatLimitHint" })
                 : formatMessage({ id: "member.invite.sendLinkHint" })}
             </div>
           </div>
           )}
 
-          <div className="flex flex-wrap justify-end gap-2 pt-1">
+          <DialogCardFooter>
             <Button size="lg"
               variant="ghost"
               type="button"
@@ -620,19 +716,60 @@ export default function InviteHumanDialog({
               {formatMessage({ id: "common.confirm.cancel" })}
             </Button>
             {inviteTab === "email" && (
-              <Button size="lg"
-                variant="accent"
-                type="submit"
-                disabled={sending || emailInviteSeatLimitReached}
-              >
-                <Mail size={18} aria-hidden="true" />
-                {sending
-                  ? formatMessage({ id: "member.invite.sending" })
-                  : formatMessage({ id: "member.invite.sendInvites" })}
-              </Button>
+              <DialogCommit>
+                {(inHead) => (
+                  <Button size={inHead ? "md" : "lg"}
+                    variant="primary"
+                    type="submit"
+                    disabled={sending || emailInviteBlocked}
+                  >
+                    <Mail size={18} aria-hidden="true" />
+                    {sending
+                      ? formatMessage({ id: "member.invite.sending" })
+                      : formatMessage({ id: "member.invite.sendInvites" })}
+                  </Button>
+                )}
+              </DialogCommit>
             )}
-          </div>
+          </DialogCardFooter>
         </form>
+      {confirmingUpdate && (
+        <ConfirmDialog
+          title={formatMessage({ id: "member.invite.updateConfirmTitle" })}
+          message={formatMessage({ id: "member.invite.updateConfirmMessage" })}
+          confirmLabel={formatMessage({ id: "member.invite.applyLinkOptions" })}
+          loadingLabel={formatMessage({ id: "member.invite.updatingLink" })}
+          layer={1}
+          confirmTestId="invite-link-update-confirm"
+          analyticsDialog="invite_link_update"
+          onConfirm={regenerateLink}
+          onClose={closeUpdateConfirm}
+        />
+      )}
+      {confirmingRevoke && (
+        <ConfirmDialog
+          title={formatMessage({ id: "settings.joinLinks.confirmTitle" })}
+          message={formatMessage({ id: "settings.joinLinks.confirmMessage" })}
+          confirmLabel={formatMessage({ id: "settings.joinLinks.confirmLabel" })}
+          loadingLabel={formatMessage({ id: "settings.joinLinks.revoking" })}
+          layer={1}
+          confirmTestId="invite-link-revoke-confirm"
+          onConfirm={revokeLink}
+          onClose={closeRevokeConfirm}
+        />
+      )}
     </DialogCard>
+    {/* Beside the invite dialog, not in it, so it stacks over it as over Create Agent. */}
+    {seatNeed ? (
+      <AddSeatsDialog
+        need={seatNeed.need}
+        onClose={closeSeats}
+        onAdded={handleSeatsAdded}
+        // An admin asks an owner for the seats; once added, the invites go out from the admin.
+        ask={asksOwner && seatNeed.send ? inviteSeatAsk : undefined}
+        onSent={onClose}
+      />
+    ) : null}
+    </>
   );
 }

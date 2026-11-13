@@ -1,7 +1,13 @@
-// `raft channel update --target <#channel> [--name <name>] [--description <text>] [--public|--private]`
+// `raft channel update --target <#channel> [--name <name>] [--description <text>] [--public|--private]
+//   [--announcement <artifact> | --no-announcement]`
 // -> PATCH /internal/agent-api/channels/:channelId
 
 import type { Command } from "commander";
+import {
+  CHANNEL_ANNOUNCEMENT_REF_INVALID,
+  channelAnnouncementArtifactId,
+  formatAgentChannelUpdated,
+} from "@botiverse/raft-shared/src/agentCliSurface";
 
 import { createAgentApiSurfaceClient } from "../../agentApiPath";
 import { defineCommand, registerCliCommand } from "../../core/command";
@@ -16,6 +22,8 @@ interface UpdateChannelOpts {
   description?: string;
   public?: boolean;
   private?: boolean;
+  /** `--announcement <artifact>`: a string; `--no-announcement`: false. */
+  announcement?: string | false;
 }
 
 interface UpdatedChannel {
@@ -23,6 +31,9 @@ interface UpdatedChannel {
   name: string;
   type?: string;
 }
+
+/** Said when --announcement names a DM or a thread, which have none. */
+export const CHANNEL_ANNOUNCEMENT_TARGET_INVALID = "Only a channel ('#channel-name') has an announcement; a DM or a thread has none.";
 
 function normalizeChannelName(raw: string | undefined): string {
   return (raw ?? "").trim().replace(/^#/, "");
@@ -58,12 +69,27 @@ export const channelUpdateCommand = defineCommand(
         flags: "--private",
         description: "Make the channel private (you must be a member; not usable on #all)",
       },
+      {
+        flags: "--announcement <artifact>",
+        description: "Make an Artifact homed in this channel (its id pt_… or link) the channel's announcement, replacing any other: for standing rules and link round-ups members should read before working there (the channel's owner or a server owner/admin only)",
+      },
+      {
+        flags: "--no-announcement",
+        description: "Remove the channel's announcement (the Artifact itself stays)",
+      },
     ],
   },
   async (ctx, opts: UpdateChannelOpts) => {
     const target = opts.target ?? "";
     const channelName = parseRegularChannelTarget(target);
     if (!channelName) {
+      if (opts.announcement !== undefined) {
+        throw new CliError({
+          code: "INVALID_TARGET",
+          message: CHANNEL_ANNOUNCEMENT_TARGET_INVALID,
+          suggestedNextAction: "Post it as a message in that conversation instead, or pass the channel it belongs to: --target '#channel-name'.",
+        });
+      }
       throw new CliError({
         code: "INVALID_TARGET",
         message: "Target must be a channel in the form '#channel-name'. DMs and thread targets are not supported.",
@@ -76,15 +102,27 @@ export const channelUpdateCommand = defineCommand(
       });
     }
 
-    const body: { name?: string; description?: string; visibility?: "public" | "private" } = {};
+    const body: { name?: string; description?: string; visibility?: "public" | "private"; announcement?: string | null } = {};
     if (opts.name !== undefined) body.name = normalizeChannelName(opts.name);
     if (opts.description !== undefined) body.description = opts.description;
     if (opts.public) body.visibility = "public";
     if (opts.private) body.visibility = "private";
-    if (body.name === undefined && body.description === undefined && body.visibility === undefined) {
+    if (opts.announcement === false) body.announcement = null;
+    else if (opts.announcement !== undefined) {
+      const artifactId = channelAnnouncementArtifactId(opts.announcement);
+      if (!artifactId) {
+        throw new CliError({
+          code: "INVALID_ARG",
+          message: CHANNEL_ANNOUNCEMENT_REF_INVALID,
+          suggestedNextAction: `Find its id with: raft artifact list --target "#${channelName}"`,
+        });
+      }
+      body.announcement = artifactId;
+    }
+    if (body.name === undefined && body.description === undefined && body.visibility === undefined && body.announcement === undefined) {
       throw new CliError({
         code: "INVALID_ARG",
-        message: "Provide at least one of --name, --description, --public, or --private.",
+        message: "Provide at least one of --name, --description, --public, --private, --announcement, or --no-announcement.",
       });
     }
 
@@ -111,10 +149,11 @@ export const channelUpdateCommand = defineCommand(
       throw new CliError({
         code: updateRes.status >= 500 ? "SERVER_5XX" : "UPDATE_FAILED",
         message: updateRes.error ?? `HTTP ${updateRes.status}`,
+        ...(updateRes.suggestedNextAction ? { suggestedNextAction: updateRes.suggestedNextAction } : {}),
       });
     }
 
-    writeText(ctx.io, adoptCliReplyText(formatUpdateChannelResult(updateRes.data) + "\n"));
+    writeText(ctx.io, adoptCliReplyText(formatAgentChannelUpdated(updateRes.data, { channelAnnouncementChanged: body.announcement !== undefined }) + "\n"));
   },
 );
 

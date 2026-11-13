@@ -23,6 +23,7 @@ export default function RootFallbackScroller({
         flex: "1 1 auto",
         boxSizing: "border-box",
         overflowX: "hidden",
+        // raft-ui: native-scroll the root crash and update screens must scroll without the stylesheet or raft-ui loaded (slock PR 5116); permanent, not ScrollArea debt
         overflowY: "auto",
         overscrollBehaviorY: "contain",
         WebkitOverflowScrolling: "touch",

@@ -22,7 +22,7 @@ import { machines, users } from "../db/schema";
 import { createServer } from "../services/serverService";
 import { getAgent } from "../services/agentService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 type SampleBody = Record<string, unknown>;
 const SAMPLES_FILE = new URL("./testdata/mobile-v1.12.0-save-requests.json", import.meta.url);

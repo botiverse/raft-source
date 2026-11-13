@@ -11,7 +11,7 @@ import {
   timingSafeEqual,
   type KeyObject,
 } from "node:crypto";
-import { currentDate } from "@botiverse/raft-shared";
+import { currentDate, type ServerRole } from "@botiverse/raft-shared";
 
 const AUTHORIZATION_CODE_PREFIX = "raft_oidc_";
 const AUTHORIZATION_CODE_VERSION = 1;
@@ -44,6 +44,12 @@ export type OidcIdentity = {
   email?: string | null;
   emailVerified?: boolean | null;
 };
+
+/**
+ * An account-mode login's identity (RFC 079 phase 3a): a person's, on no
+ * Server, so without the server claims (design §1 row 7).
+ */
+export type OidcAccountIdentity = Omit<OidcIdentity, "type" | "serverId" | "serverSlug" | "serverRole"> & { type: "human" };
 
 type OidcJwk = {
   kty: "EC";
@@ -179,6 +185,126 @@ export function getOidcJwks() {
   }
 }
 
+const SERVER_ROLES: readonly ServerRole[] = ["owner", "admin", "member", "guest"];
+
+/**
+ * The `server_role` claim value (protocol v3.2 §9). It is the viewer's role at
+ * signing time, for that one request, and never an authorization. Anything
+ * that is not one of the four roles reads as guest, the least privileged
+ * (Tenny 0021ea3f); Apps treat a missing claim the same way.
+ */
+export function serverRoleClaim(value: unknown): ServerRole {
+  return SERVER_ROLES.includes(value as ServerRole) ? value as ServerRole : "guest";
+}
+
+/** A callback identity assertion, never an OAuth access or ID token. */
+export function signAppLinkPreviewAssertion(input: {
+  issuer: string; clientKey: string; userId: string; serverId: string; serverRole: ServerRole;
+  installationId: string; url: string; requestId: string; now: Date;
+}): string {
+  const { privateKey, publicJwk } = configuredSigningKey();
+  getOidcJwks();
+  const now = Math.floor(input.now.getTime() / 1000);
+  const header = toBase64Url(JSON.stringify({ alg: "ES256", kid: publicJwk.kid, typ: "raft-link-preview+jwt" }));
+  const payload = toBase64Url(JSON.stringify({
+    iss: input.issuer, aud: `urn:raft:link-preview:${input.clientKey}`, sub: input.userId,
+    iat: now, nbf: now, exp: now + 30, jti: input.requestId,
+    token_use: "link_preview", type: "human", server_id: input.serverId,
+    server_role: serverRoleClaim(input.serverRole), installation_id: input.installationId,
+    url_sha256: createHash("sha256").update(input.url).digest("hex"),
+  }));
+  const signingInput = `${header}.${payload}`;
+  const signature = sign("sha256", Buffer.from(signingInput, "ascii"), { key: privateKey, dsaEncoding: "ieee-p1363" });
+  return `${signingInput}.${toBase64Url(signature)}`;
+}
+
+/**
+ * A resource-resolve assertion (#proj-workspace): the next version of the link
+ * preview assertion above. Raft asks a first-party resource provider (first:
+ * Artifacts) what one actor of one Server may see of a batch of refs. Same
+ * signing key and JWKS; its own `typ` / `token_use` / audience, so neither
+ * assertion can be replayed as the other, and `body_sha256` binds it to the
+ * exact request body. Never an OAuth access or ID token.
+ */
+export function signResourceResolveAssertion(input: {
+  issuer: string; clientKey: string; actorType: "human" | "agent"; actorId: string;
+  serverId: string; serverRole: string; installationId: string; body: string;
+  requestId: string; now: Date;
+}): string {
+  const { privateKey, publicJwk } = configuredSigningKey();
+  getOidcJwks();
+  const now = Math.floor(input.now.getTime() / 1000);
+  const header = toBase64Url(JSON.stringify({ alg: "ES256", kid: publicJwk.kid, typ: "raft-resolve+jwt" }));
+  const payload = toBase64Url(JSON.stringify({
+    iss: input.issuer, aud: `urn:raft:resolve:${input.clientKey}`, sub: input.actorId,
+    iat: now, nbf: now, exp: now + 60, jti: input.requestId,
+    token_use: "resolve", type: input.actorType, server_id: input.serverId,
+    server_role: input.serverRole, installation_id: input.installationId,
+    body_sha256: createHash("sha256").update(input.body).digest("hex"),
+  }));
+  const signingInput = `${header}.${payload}`;
+  const signature = sign("sha256", Buffer.from(signingInput, "ascii"), { key: privateKey, dsaEncoding: "ieee-p1363" });
+  return `${signingInput}.${toBase64Url(signature)}`;
+}
+
+export type CardActionPhase = "prepare" | "execute" | "status";
+
+type CardActionAssertionBase = {
+  clientKey: string; userId: string; serverId: string; serverRole: ServerRole;
+  installationId: string; messageId: string; urlSha256: string; body: string | Uint8Array;
+  jti: string; now: Date;
+};
+/** Execute always carries the first-send deadline; prepare and status may. */
+export type CardActionAssertionInput =
+  | CardActionAssertionBase & { phase: "execute"; notAfter: Date }
+  | CardActionAssertionBase & { phase: Exclude<CardActionPhase, "execute">; notAfter?: Date };
+
+/** The operation's first-send deadline has passed: do not sign, do not send. */
+export class CardActionPastDeadlineError extends Error {
+  constructor() { super("card action deadline has passed"); this.name = "CardActionPastDeadlineError"; }
+}
+
+/**
+ * A card-action assertion (RFC 076): Raft tells an App which human pressed
+ * which card button. Same signing key and JWKS as the link-preview assertion,
+ * but its own `typ` / `token_use` / audience, so the read-only preview
+ * credential can never be replayed as an action and vice versa. `phase` must
+ * equal the body's phase, and `body_sha256` binds the exact bytes sent.
+ * `server_role` is the clicker's role at signing time, for this request only.
+ * The URL is passed as its SHA-256: status is signed from a stored operation,
+ * and raw URLs are never stored. `body` must be the exact bytes sent.
+ * `notAfter` caps `exp` (whole seconds), and nothing is signed at or after it.
+ * Execute must pass it, as the operation's first-send deadline, so no execute
+ * credential outlives that deadline (protocol v3.2.3 §5.3.4); for prepare and
+ * status it is optional.
+ * `iss` is always `<origin>/oidc/<server_id>`, derived here from `serverId`
+ * (addendum 1 §5): a slug can be renamed, and Apps require `iss` to equal the
+ * `server_id` claim's issuer, so no caller can sign it any other way.
+ * Never an OAuth access or ID token.
+ */
+export function signCardActionAssertion(input: CardActionAssertionInput): string {
+  if (!/^[0-9a-f]{64}$/.test(input.urlSha256)) throw new Error("urlSha256 must be a hex SHA-256");
+  if (input.phase === "execute" && !(input.notAfter instanceof Date)) throw new Error("an execute assertion needs notAfter (the first-send deadline)");
+  const now = Math.floor(input.now.getTime() / 1000);
+  const notAfter = input.notAfter ? Math.floor(input.notAfter.getTime() / 1000) : Number.POSITIVE_INFINITY;
+  if (!(now < notAfter)) throw new CardActionPastDeadlineError();
+  const { privateKey, publicJwk } = configuredSigningKey();
+  getOidcJwks();
+  const header = toBase64Url(JSON.stringify({ alg: "ES256", kid: publicJwk.kid, typ: "raft-card-action+jwt" }));
+  const payload = toBase64Url(JSON.stringify({
+    iss: oidcIssuer(undefined, input.serverId), aud: `urn:raft:card-action:${input.clientKey}`, sub: input.userId,
+    iat: now, nbf: now, exp: Math.min(now + 30, notAfter), jti: input.jti,
+    token_use: "card_action", type: "human", phase: input.phase,
+    server_id: input.serverId, server_role: serverRoleClaim(input.serverRole), installation_id: input.installationId,
+    message_id: input.messageId,
+    url_sha256: input.urlSha256,
+    body_sha256: createHash("sha256").update(input.body).digest("hex"),
+  }));
+  const signingInput = `${header}.${payload}`;
+  const signature = sign("sha256", Buffer.from(signingInput, "ascii"), { key: privateKey, dsaEncoding: "ieee-p1363" });
+  return `${signingInput}.${toBase64Url(signature)}`;
+}
+
 export function signAgentAccessJwt(input: {
   issuer: string; agentId: string; clientId: string; serverId: string;
   serverSlug: string; serverRole: string; agentName: string; displayName: string;
@@ -283,13 +409,20 @@ export function validateOidcAuthorizationCode(input: {
   }
 }
 
-export function signOidcIdToken(input: {
+type OidcIdTokenInput<TIdentity> = {
   issuer: string;
-  identity: OidcIdentity;
+  identity: TIdentity;
   nonce?: string;
   expiresInSeconds: number;
   now?: Date;
-}): string {
+};
+
+/**
+ * The ID token's claims up to and including `type`, in the order they are
+ * signed: the whole payload of an account-mode login, and the head of a
+ * server-mode one, which adds the server claims after it.
+ */
+function idTokenClaims(input: OidcIdTokenInput<OidcIdentity | OidcAccountIdentity>) {
   const nowSeconds = Math.floor((input.now ?? currentDate()).getTime() / 1000);
   const profile = input.identity.scopes.includes("profile")
     ? {
@@ -304,7 +437,7 @@ export function signOidcIdToken(input: {
         email_verified: input.identity.emailVerified === true,
       }
     : {};
-  const payload = {
+  return {
     iss: input.issuer,
     sub: input.identity.sub,
     aud: input.identity.clientId,
@@ -314,10 +447,28 @@ export function signOidcIdToken(input: {
     ...profile,
     ...email,
     type: input.identity.type,
+  };
+}
+
+export function signOidcIdToken(input: OidcIdTokenInput<OidcIdentity>): string {
+  return signIdTokenPayload({
+    ...idTokenClaims(input),
     server_id: input.identity.serverId,
     server_slug: input.identity.serverSlug,
     server_role: input.identity.serverRole,
-  };
+  });
+}
+
+/**
+ * An account-mode login's ID token (RFC 079 phase 3a): server mode's payload,
+ * claim for claim and in its order, without server_id, server_slug and
+ * server_role. The caller passes the root issuer (D21).
+ */
+export function signOidcAccountIdToken(input: OidcIdTokenInput<OidcAccountIdentity>): string {
+  return signIdTokenPayload(idTokenClaims(input));
+}
+
+function signIdTokenPayload(payload: Record<string, unknown>): string {
   const { privateKey, publicJwk } = configuredSigningKey();
   const header = { alg: "ES256", typ: "JWT", kid: publicJwk.kid };
   const signingInput = `${toBase64Url(JSON.stringify(header))}.${toBase64Url(JSON.stringify(payload))}`;

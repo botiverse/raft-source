@@ -1,661 +1,344 @@
-import { fixturePasswordHash } from "../test/integration/credentials";
-import { createApiTest } from "../test/integration/apiTest";
+import { apiTest as test } from "../test/integration/apiTest";
 import assert from "node:assert/strict";
+
+import { eq } from "drizzle-orm";
+import type { Server as SocketServer } from "socket.io";
+
+import { pushRegistrations, pushSubscriptions } from "../db/schema";
 import {
-  generateKeyPairSync,
-  randomBytes,
-  randomUUID,
-  sign,
-} from "node:crypto";
-import type { KeyObject } from "node:crypto";
-
-import { asc, eq } from "drizzle-orm";
-
-import { getDb } from "../db/index";
+  __resetApnsPushProviderForTests,
+  __setApnsPushProviderForTests,
+  type ApnsDeliveryInput,
+} from "../services/notifications/transports/apns";
 import {
-  nativeNotificationCredentials,
-  nativeNotificationDevices,
-  nativeNotificationEnrollmentGrants,
-  nativeNotificationEvents,
-  sessionFamilies,
-  users,
-} from "../db/schema";
-import { createServer } from "../services/serverService";
-import { __setNativeNotificationLiveWriteHookForTests } from "./notifications";
+  __resetFcmPushProviderForTests,
+  __setFcmPushProviderForTests,
+} from "../services/notifications/transports/fcm";
+import type { FcmDeliveryInput } from "../services/fcmPushProvider";
 import {
-  __setNativeNotificationAttestationVerifierForTests,
-  buildEnrollmentProofTranscript,
-  buildRotationProofTranscript,
-  persistNativeNotificationIntents,
-  revokeCurrentNativeCredential,
-} from "../services/nativeNotificationService";
-import { openTestApp } from "../test/integration/app";
+  __resetWebPushRuntimeForTests,
+  __setWebPushRuntimeForTests,
+} from "../services/notifications/transports/webPush";
+import {
+  __resetTestNotificationStoreForTests,
+  __setTestNotificationClockForTests,
+  sendTestNotification,
+} from "../services/notifications/testNotification";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const ENDPOINT = "https://fcm.googleapis.com/fcm/send/notification-test";
+const KEYS = {
+  p256dh: "BNcRdreALRFXTkOOUHK1EtK2wtaz5Ry4YfYCA_0QTpQtUbVlUls0VJXg7A8u-Ts1XbjhazAkj7I99e8QcYP7DkM",
+  auth: "tBHItJI5svbpez7KI4CCXg",
+};
 
-async function seedUser(email: string) {
-  const [user] = await getDb().insert(users).values({
-    email,
-    name: `native-${randomUUID()}`,
-    passwordHash: await fixturePasswordHash("password123"),
-    emailVerified: true,
-    profileSetupCompletedAt: new Date(),
-  }).returning();
-  return user!;
-}
+type Http = { request(path: string, init: RequestInit): Promise<Response>; get(path: string): Promise<Response> };
 
-async function login(baseUrl: string, email: string) {
-  const response = await fetch(`${baseUrl}/api/auth/login`, {
+function postJson(client: Http, path: string, body: unknown) {
+  return client.request(path, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ email, password: "password123" }),
+    body: JSON.stringify(body),
   });
-  assert.equal(response.status, 200, await response.clone().text());
-  return response.json() as Promise<{ accessToken: string; refreshToken: string }>;
 }
 
-function sessionHeaders(accessToken: string) {
-  return { authorization: `Bearer ${accessToken}`, "content-type": "application/json" };
-}
-
-function makeNativeBinding() {
-  const { publicKey, privateKey } = generateKeyPairSync("ed25519");
-  return {
-    privateKey,
-    request: {
-      appId: "ai.slock.desktop",
-      protocolVersion: 1,
-      appVersion: "1.0.0-test",
-      releaseChannel: "staging",
-      appInstanceId: randomUUID(),
-      publicKey: (publicKey.export({ format: "der", type: "spki" }) as Buffer).toString("base64url"),
-      nonce: randomBytes(32).toString("base64url"),
+function captureWebPush() {
+  const sent: Array<{ endpoint: string; payload: Record<string, unknown> }> = [];
+  __setWebPushRuntimeForTests({
+    enabled: true,
+    lookup: async () => [{ address: "142.250.72.10", family: 4 }],
+    sendNotification: async (subscription, payload) => {
+      sent.push({ endpoint: subscription.endpoint, payload: JSON.parse(String(payload)) as Record<string, unknown> });
+      return { statusCode: 201, body: "", headers: {} };
     },
-  };
-}
-
-async function requestGrant(baseUrl: string, accessToken: string, request: ReturnType<typeof makeNativeBinding>["request"]) {
-  const response = await fetch(`${baseUrl}/api/notifications/enrollment-grants`, {
-    method: "POST",
-    headers: sessionHeaders(accessToken),
-    body: JSON.stringify(request),
   });
-  assert.equal(response.status, 201, await response.clone().text());
-  return response.json() as Promise<{ grant: string; expiresAt: string }>;
+  return sent;
 }
 
-async function exchangeGrant(
-  baseUrl: string,
-  grant: string,
-  request: ReturnType<typeof makeNativeBinding>["request"],
-  privateKey: KeyObject,
-) {
-  const proof = sign(null, buildEnrollmentProofTranscript(grant, request), privateKey).toString("base64url");
-  return fetch(`${baseUrl}/api/notifications/enrollment-exchanges`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ grant, proof }),
-  });
+function withClock() {
+  let now = Date.parse("2026-10-30T10:00:00.000Z");
+  __setTestNotificationClockForTests(() => now);
+  return { advance(ms: number) { now += ms; } };
 }
 
-async function enroll(baseUrl: string, accessToken: string) {
-  const native = makeNativeBinding();
-  const { grant } = await requestGrant(baseUrl, accessToken, native.request);
-  const response = await exchangeGrant(baseUrl, grant, native.request, native.privateKey);
-  assert.equal(response.status, 201, await response.clone().text());
-  const result = await response.json() as {
-    credential: string;
-    credentialId: string;
-    deviceId: string;
-    scope: string;
-    expiresAt: string;
-  };
-  return { ...native, ...result, grant };
+function resetSeams() {
+  __resetWebPushRuntimeForTests();
+  __resetApnsPushProviderForTests();
+  __resetFcmPushProviderForTests();
+  __setTestNotificationClockForTests(null);
+  __resetTestNotificationStoreForTests();
 }
 
-async function readSseEvents(body: ReadableStream<Uint8Array>, count: number, timeoutMs = 5_000) {
-  const reader = body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-  const events: Array<{ id: string; data: Record<string, unknown> }> = [];
-  const deadline = Date.now() + timeoutMs;
-  while (events.length < count && Date.now() < deadline) {
-    const next = await Promise.race([
-      reader.read(),
-      new Promise<{ done: true; value: undefined }>((resolve) => setTimeout(() => resolve({ done: true, value: undefined }), Math.max(25, deadline - Date.now()))),
+test("a web test notification is sent to that subscription, reads pending, and shown after the ack", async ({ seed, http, db }) => {
+  const sent = captureWebPush();
+  withClock();
+  try {
+    const user = await seed.human();
+    const server = await seed.server({ owner: user, slug: "notif-test" });
+    await db.insert(pushSubscriptions).values([
+      { userId: user.id, endpoint: ENDPOINT, ...KEYS },
+      { userId: user.id, endpoint: `${ENDPOINT}-other`, ...KEYS },
     ]);
-    if (next.done) break;
-    buffer += decoder.decode(next.value, { stream: true });
-    let separator: number;
-    while ((separator = buffer.indexOf("\n\n")) >= 0) {
-      const frame = buffer.slice(0, separator);
-      buffer = buffer.slice(separator + 2);
-      if (!frame.includes("event: native-notification.v1")) continue;
-      const id = frame.split("\n").find((line) => line.startsWith("id: "))?.slice(4) ?? "";
-      const data = frame.split("\n").find((line) => line.startsWith("data: "))?.slice(6) ?? "{}";
-      events.push({ id, data: JSON.parse(data) as Record<string, unknown> });
-    }
-  }
-  await reader.cancel().catch(() => {});
-  return events;
-}
+    const client = http.as(user, server);
 
-async function waitForSseClose(body: ReadableStream<Uint8Array>, timeoutMs = 2_000): Promise<boolean> {
-  const reader = body.getReader();
-  const deadline = Date.now() + timeoutMs;
-  try {
-    while (Date.now() < deadline) {
-      const result = await Promise.race([
-        reader.read(),
-        new Promise<null>((resolve) => setTimeout(() => resolve(null), Math.max(25, deadline - Date.now()))),
-      ]);
-      if (result === null) return false;
-      if (result.done) return true;
-    }
-    return false;
+    const response = await postJson(client, "/api/notifications/test", { device: { kind: "web", endpoint: ENDPOINT } });
+    assert.equal(response.status, 200);
+    const body = await response.json() as { testId: string; sent: boolean };
+    assert.equal(body.sent, true);
+    assert.match(body.testId, /^[0-9a-f-]{36}$/);
+
+    assert.equal(sent.length, 1, "only the named subscription gets it");
+    assert.equal(sent[0].endpoint, ENDPOINT);
+    assert.equal(sent[0].payload.testId, body.testId);
+    assert.equal(sent[0].payload.id, `test:${body.testId}`);
+    assert.equal(sent[0].payload.category, "test");
+    assert.equal(sent[0].payload.title, "Raft test notification", "a caller in one server: no server label");
+    assert.equal("subtitle" in sent[0].payload, false);
+    assert.match(String(sent[0].payload.url), /^https?:\/\/[^/]+\/s\/notif-test\/activity$/);
+
+    const pending = await client.get(`/api/notifications/test/${body.testId}`);
+    assert.equal(pending.status, 200);
+    assert.deepEqual(await pending.json(), { status: "pending" });
+
+    const ack = await postJson(client, `/api/notifications/test/${body.testId}/ack`, { shown: true });
+    assert.equal(ack.status, 200);
+    assert.deepEqual(await ack.json(), { ok: true });
+    assert.deepEqual(await (await client.get(`/api/notifications/test/${body.testId}`)).json(), { status: "shown" });
   } finally {
-    await reader.cancel().catch(() => {});
+    resetSeams();
   }
-}
+});
 
-async function readSseEventsUntilClose(body: ReadableStream<Uint8Array>, timeoutMs = 2_000) {
-  const reader = body.getReader();
-  const decoder = new TextDecoder();
-  const events: Array<{ id: string; data: Record<string, unknown> }> = [];
-  let buffer = "";
-  const deadline = Date.now() + timeoutMs;
+test("a pending test with no ack for 15 s reads not_shown; an explicit not-shown ack is kept", async ({ seed, http, db }) => {
+  captureWebPush();
+  const clock = withClock();
   try {
-    while (Date.now() < deadline) {
-      const result = await Promise.race([
-        reader.read(),
-        new Promise<null>((resolve) => setTimeout(() => resolve(null), Math.max(25, deadline - Date.now()))),
-      ]);
-      if (result === null) return { events, closed: false };
-      if (result.done) return { events, closed: true };
-      buffer += decoder.decode(result.value, { stream: true });
-      let separator: number;
-      while ((separator = buffer.indexOf("\n\n")) >= 0) {
-        const frame = buffer.slice(0, separator);
-        buffer = buffer.slice(separator + 2);
-        if (!frame.includes("event: native-notification.v1")) continue;
-        const id = frame.split("\n").find((line) => line.startsWith("id: "))?.slice(4) ?? "";
-        const data = frame.split("\n").find((line) => line.startsWith("data: "))?.slice(6) ?? "{}";
-        events.push({ id, data: JSON.parse(data) as Record<string, unknown> });
-      }
-    }
-    return { events, closed: false };
+    const user = await seed.human();
+    const server = await seed.server({ owner: user });
+    await db.insert(pushSubscriptions).values({ userId: user.id, endpoint: ENDPOINT, ...KEYS });
+    const client = http.as(user, server);
+
+    const { testId } = await (await postJson(client, "/api/notifications/test", { device: { kind: "web", endpoint: ENDPOINT } })).json() as { testId: string };
+    clock.advance(14_999);
+    assert.deepEqual(await (await client.get(`/api/notifications/test/${testId}`)).json(), { status: "pending" });
+    clock.advance(1);
+    assert.deepEqual(await (await client.get(`/api/notifications/test/${testId}`)).json(), { status: "not_shown" });
+
+    const second = await (await postJson(client, "/api/notifications/test", { device: { kind: "web", endpoint: ENDPOINT } })).json() as { testId: string };
+    assert.equal((await postJson(client, `/api/notifications/test/${second.testId}/ack`, { shown: false })).status, 200);
+    assert.deepEqual(await (await client.get(`/api/notifications/test/${second.testId}`)).json(), { status: "not_shown" });
+    assert.equal((await postJson(client, `/api/notifications/test/${second.testId}/ack`, { shown: "yes" })).status, 400);
   } finally {
-    await reader.cancel().catch(() => {});
-  }
-}
-
-test("the default-off kill switch closes routes and ledger persistence", async () => {
-  process.env.SLOCK_NATIVE_NOTIFICATIONS_ENABLED = "false";
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
-  try {
-    const route = await fetch(`${app.baseUrl}/api/notifications/stream`);
-    assert.equal(route.status, 404);
-    assert.equal(await persistNativeNotificationIntents([{
-      recipientUserId: randomUUID(),
-      eventKey: `disabled:${randomUUID()}`,
-      serverId: randomUUID(),
-      kind: "channel",
-      channelId: randomUUID(),
-      threadId: null,
-      parentChannelId: null,
-      parentMessageId: null,
-      messageId: randomUUID(),
-      title: "disabled",
-      body: "disabled",
-      createdAt: new Date(),
-    }]), 0);
-  } finally {
-    delete process.env.SLOCK_NATIVE_NOTIFICATIONS_ENABLED;
-    await app.close();
+    resetSeams();
   }
 });
 
-test("enrollment is key-bound, <=60s, hash-only, and single-use", async ({ app }) => {
-  const user = await seedUser(`native-enroll-${randomUUID()}@slock.test`);
-  const session = await login(app.baseUrl, user.email);
-  const native = makeNativeBinding();
-  const issuedAt = Date.now();
-  const { grant, expiresAt } = await requestGrant(app.baseUrl, session.accessToken, native.request);
-  assert.match(grant, /^rng1\.[0-9a-f-]{36}\.[A-Za-z0-9_-]+$/);
-  assert.ok(Date.parse(expiresAt) - issuedAt <= 60_500);
-
-  const [persistedGrant] = await getDb().select().from(nativeNotificationEnrollmentGrants);
-  assert.ok(persistedGrant);
-  assert.notEqual(persistedGrant.secretHash, grant);
-  assert.equal(JSON.stringify(persistedGrant).includes(grant), false);
-
-  const wrongKey = makeNativeBinding();
-  const wrongProof = sign(null, buildEnrollmentProofTranscript(grant, native.request), wrongKey.privateKey).toString("base64url");
-  const denied = await fetch(`${app.baseUrl}/api/notifications/enrollment-exchanges`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ grant, proof: wrongProof }),
-  });
-  assert.equal(denied.status, 403);
-
-  const concurrent = await Promise.all([
-    exchangeGrant(app.baseUrl, grant, native.request, native.privateKey),
-    exchangeGrant(app.baseUrl, grant, native.request, native.privateKey),
-  ]);
-  assert.deepEqual(concurrent.map((response) => response.status).sort(), [201, 403], "concurrent exchange must mint exactly once");
-  const exchanged = concurrent.find((response) => response.status === 201)!;
-  const body = await exchanged.json() as { credential: string; credentialId: string; deviceId: string; scope: string };
-  assert.match(body.credential, /^rnc1\.[0-9a-f-]{36}\.[A-Za-z0-9_-]+$/);
-  assert.equal(body.scope, "notifications:stream");
-
-  const replay = await exchangeGrant(app.baseUrl, grant, native.request, native.privateKey);
-  assert.equal(replay.status, 403, "a consumed grant must never mint a later credential");
-
-  const [credentialRow] = await getDb().select().from(nativeNotificationCredentials).where(eq(nativeNotificationCredentials.id, body.credentialId));
-  assert.ok(credentialRow);
-  assert.equal(JSON.stringify(credentialRow).includes(body.credential), false);
-
-  const listed = await fetch(`${app.baseUrl}/api/notifications/devices`, { headers: sessionHeaders(session.accessToken) });
-  assert.equal(listed.status, 200);
-  const listedText = await listed.text();
-  assert.equal(listedText.includes("secretHash"), false);
-  assert.equal(listedText.includes("publicKey"), false);
-  assert.equal(listedText.includes(body.credential), false);
-});
-
-test("preview/no-proof, expired grant, and dead session-family fail closed", async ({ app }) => {
-  const user = await seedUser(`native-negative-${randomUUID()}@slock.test`);
-  const session = await login(app.baseUrl, user.email);
-  const native = makeNativeBinding();
-  const { grant } = await requestGrant(app.baseUrl, session.accessToken, native.request);
-
-  const noProof = await fetch(`${app.baseUrl}/api/notifications/enrollment-exchanges`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ grant }),
-  });
-  assert.equal(noProof.status, 403);
-
-  const alteredBindingProof = sign(null, buildEnrollmentProofTranscript(grant, {
-    ...native.request,
-    nonce: randomBytes(32).toString("base64url"),
-  }), native.privateKey).toString("base64url");
-  const alteredBinding = await fetch(`${app.baseUrl}/api/notifications/enrollment-exchanges`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ grant, proof: alteredBindingProof }),
-  });
-  assert.equal(alteredBinding.status, 403, "a proof over an altered nonce/binding must fail");
-
-  const grantId = grant.split(".")[1]!;
-  await getDb().update(nativeNotificationEnrollmentGrants).set({ expiresAt: new Date(Date.now() - 1_000) })
-    .where(eq(nativeNotificationEnrollmentGrants.id, grantId));
-  const expired = await exchangeGrant(app.baseUrl, grant, native.request, native.privateKey);
-  assert.equal(expired.status, 403);
-
-  const second = await requestGrant(app.baseUrl, session.accessToken, native.request);
-  const [family] = await getDb().select().from(sessionFamilies).where(eq(sessionFamilies.userId, user.id));
-  assert.ok(family);
-  await getDb().update(sessionFamilies).set({ revokedAt: new Date(), revokedReason: "test" }).where(eq(sessionFamilies.id, family.id));
-  const deadFamily = await exchangeGrant(app.baseUrl, second.grant, native.request, native.privateKey);
-  assert.equal(deadFamily.status, 403);
-});
-
-test("enforced attestation fails closed unless the signed-app verifier accepts the evidence", async () => {
-  process.env.NATIVE_NOTIFICATION_ATTESTATION_MODE = "enforce";
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+test("an unknown device answers sent:false no_device and reads failed", async ({ seed, http, db }) => {
+  const sent = captureWebPush();
+  withClock();
   try {
-    const user = await seedUser(`native-attestation-${randomUUID()}@slock.test`);
-    const session = await login(app.baseUrl, user.email);
-    const native = makeNativeBinding();
-    const missing = await fetch(`${app.baseUrl}/api/notifications/enrollment-grants`, {
-      method: "POST",
-      headers: sessionHeaders(session.accessToken),
-      body: JSON.stringify(native.request),
-    });
-    assert.equal(missing.status, 403);
+    const user = await seed.human();
+    const other = await seed.human();
+    const server = await seed.server({ owner: user });
+    // Another user's subscription with the same endpoint is not the caller's device.
+    await db.insert(pushSubscriptions).values({ userId: other.id, endpoint: ENDPOINT, ...KEYS });
+    const client = http.as(user, server);
 
-    const evidence = "bounded-signed-app-attestation-test-evidence";
-    __setNativeNotificationAttestationVerifierForTests((candidate) => candidate === evidence);
-    const accepted = await fetch(`${app.baseUrl}/api/notifications/enrollment-grants`, {
-      method: "POST",
-      headers: sessionHeaders(session.accessToken),
-      body: JSON.stringify({ ...native.request, attestation: evidence }),
-    });
-    assert.equal(accepted.status, 201, await accepted.clone().text());
-  } finally {
-    __setNativeNotificationAttestationVerifierForTests(null);
-    delete process.env.NATIVE_NOTIFICATION_ATTESTATION_MODE;
-    await app.close();
-  }
-});
-
-test("SSE rejects user sessions, starts at latest, replays by user-scoped event ID, and closes on logout", async () => {
-  process.env.NATIVE_NOTIFICATION_STREAM_POLL_MS = "250";
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
-  try {
-    const user = await seedUser(`native-stream-${randomUUID()}@slock.test`);
-    const session = await login(app.baseUrl, user.email);
-    const native = await enroll(app.baseUrl, session.accessToken);
-    const server = await createServer("Native Stream", `native-stream-${randomUUID()}`, user.id);
-    const channelId = randomUUID();
-
-    const sessionDenied = await fetch(`${app.baseUrl}/api/notifications/stream`, {
-      headers: { authorization: `Bearer ${session.accessToken}` },
-    });
-    assert.equal(sessionDenied.status, 401);
-    assert.doesNotMatch(sessionDenied.headers.get("content-type") ?? "", /text\/event-stream/);
-
-    const makeIntent = (messageId: string, body: string) => ({
-      recipientUserId: user.id,
-      eventKey: `stream-test:${messageId}`,
-      serverId: server.id,
-      kind: "channel" as const,
-      channelId,
-      threadId: null,
-      parentChannelId: null,
-      parentMessageId: null,
-      messageId,
-      title: "Native title",
-      body,
-      createdAt: new Date(),
-    });
-
-    const beforeConnect = makeIntent(randomUUID(), "before connect");
-    await persistNativeNotificationIntents([beforeConnect, beforeConnect]);
-    const duplicateRows = await getDb().select().from(nativeNotificationEvents)
-      .where(eq(nativeNotificationEvents.dedupeKey, beforeConnect.eventKey));
-    assert.equal(duplicateRows.length, 1, "intent dedupe must retain one stable event");
-    const stream = await fetch(`${app.baseUrl}/api/notifications/stream`, {
-      headers: { authorization: `Bearer ${native.credential}`, accept: "text/event-stream" },
-    });
-    assert.equal(stream.status, 200);
-    assert.match(stream.headers.get("content-type") ?? "", /text\/event-stream/);
-
-    const firstMessageId = randomUUID();
-    await persistNativeNotificationIntents([makeIntent(firstMessageId, "after connect")]);
-    const [first] = await readSseEvents(stream.body!, 1);
-    assert.ok(first);
-    assert.equal(first.data.version, 1);
-    assert.equal(first.data.body, "after connect", "a cursorless connect must not replay the pre-connect event");
-    assert.deepEqual(Object.keys(first.data).sort(), ["body", "createdAt", "eventId", "serverId", "targetUri", "title", "version"]);
-    assert.match(String(first.data.targetUri), /^raft:\/\/v1\/servers\/[0-9a-f-]{36}\/channels\/[0-9a-f-]{36}\/messages\/[0-9a-f-]{36}$/);
-
-    await persistNativeNotificationIntents([
-      makeIntent(randomUUID(), "replay one"),
-      makeIntent(randomUUID(), "replay two"),
-    ]);
-    const replayStream = await fetch(`${app.baseUrl}/api/notifications/stream`, {
-      headers: { authorization: `Bearer ${native.credential}`, "last-event-id": first.id },
-    });
-    assert.equal(replayStream.status, 200);
-    const replay = await readSseEvents(replayStream.body!, 2);
-    assert.deepEqual(replay.map((event) => event.data.body), ["replay one", "replay two"]);
-    assert.equal(new Set(replay.map((event) => event.id)).size, 2);
-
-    const foreignUser = await seedUser(`native-foreign-${randomUUID()}@slock.test`);
-    const dormantForeignIntent = { ...makeIntent(randomUUID(), "dormant foreign"), recipientUserId: foreignUser.id, eventKey: `foreign-dormant:${randomUUID()}` };
-    assert.equal(await persistNativeNotificationIntents([dormantForeignIntent]), 0, "users without a live native credential must not grow the ledger");
-    const foreignSession = await login(app.baseUrl, foreignUser.email);
-    await enroll(app.baseUrl, foreignSession.accessToken);
-    await persistNativeNotificationIntents([{ ...makeIntent(randomUUID(), "foreign"), recipientUserId: foreignUser.id, eventKey: `foreign:${randomUUID()}` }]);
-    const [foreignEvent] = await getDb().select().from(nativeNotificationEvents)
-      .where(eq(nativeNotificationEvents.recipientUserId, foreignUser.id));
-    const foreignCursor = await fetch(`${app.baseUrl}/api/notifications/stream`, {
-      headers: { authorization: `Bearer ${native.credential}`, "last-event-id": foreignEvent!.eventId },
-    });
-    assert.equal(foreignCursor.status, 409);
-    assert.doesNotMatch(foreignCursor.headers.get("content-type") ?? "", /text\/event-stream/);
-
-    const liveAtLogout = await fetch(`${app.baseUrl}/api/notifications/stream`, {
-      headers: { authorization: `Bearer ${native.credential}` },
-    });
-    assert.equal(liveAtLogout.status, 200);
-
-    const logout = await fetch(`${app.baseUrl}/api/auth/logout`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ refreshToken: session.refreshToken }),
-    });
-    assert.equal(logout.status, 200, await logout.clone().text());
-    assert.equal(await waitForSseClose(liveAtLogout.body!, 1_500), true, "logout must actively close the live stream before another event");
-    const afterLogout = await fetch(`${app.baseUrl}/api/notifications/stream`, {
-      headers: { authorization: `Bearer ${native.credential}` },
-    });
-    assert.equal(afterLogout.status, 401);
-    assert.doesNotMatch(afterLogout.headers.get("content-type") ?? "", /text\/event-stream/);
-  } finally {
-    delete process.env.NATIVE_NOTIFICATION_STREAM_POLL_MS;
-    await app.close();
-  }
-});
-
-test("live SSE reauthenticates before every frame and stops a revoked in-flight batch", async () => {
-  process.env.NATIVE_NOTIFICATION_STREAM_POLL_MS = "250";
-  try {
-    for (const revocation of ["credential", "session-family"] as const) {
-      const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
-      try {
-        const user = await seedUser(`native-mid-batch-${revocation}-${randomUUID()}@slock.test`);
-        const session = await login(app.baseUrl, user.email);
-        const native = await enroll(app.baseUrl, session.accessToken);
-        const server = await createServer("Native Mid Batch", `native-mid-batch-${randomUUID()}`, user.id);
-        const channelId = randomUUID();
-        const stream = await fetch(`${app.baseUrl}/api/notifications/stream`, {
-          headers: { authorization: `Bearer ${native.credential}`, accept: "text/event-stream" },
-        });
-        assert.equal(stream.status, 200);
-
-        let hookCalls = 0;
-        __setNativeNotificationLiveWriteHookForTests(async ({ index, eventCount }) => {
-          hookCalls += 1;
-          assert.equal(eventCount, 2);
-          if (index !== 1) return;
-          if (revocation === "credential") {
-            await revokeCurrentNativeCredential(native.credential);
-            return;
-          }
-          const logout = await fetch(`${app.baseUrl}/api/auth/logout`, {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify({ refreshToken: session.refreshToken }),
-          });
-          assert.equal(logout.status, 200, await logout.clone().text());
-        });
-
-        const makeIntent = (body: string) => {
-          const messageId = randomUUID();
-          return {
-            recipientUserId: user.id,
-            eventKey: `mid-batch:${messageId}`,
-            serverId: server.id,
-            kind: "channel" as const,
-            channelId,
-            threadId: null,
-            parentChannelId: null,
-            parentMessageId: null,
-            messageId,
-            title: "Native title",
-            body,
-            createdAt: new Date(),
-          };
-        };
-        await persistNativeNotificationIntents([makeIntent("first allowed"), makeIntent("second revoked")]);
-
-        const result = await readSseEventsUntilClose(stream.body!, 2_000);
-        assert.equal(result.closed, true, `${revocation} revocation during an already-read batch must close the stream`);
-        assert.deepEqual(result.events.map((event) => event.data.body), ["first allowed"]);
-        assert.equal(hookCalls, 2, "the revocation seam must run between the first and second frame");
-      } finally {
-        __setNativeNotificationLiveWriteHookForTests(null);
-        await app.close();
-      }
-    }
-  } finally {
-    __setNativeNotificationLiveWriteHookForTests(null);
-    delete process.env.NATIVE_NOTIFICATION_STREAM_POLL_MS;
-  }
-});
-
-test("credential rotation is key-bound; expiry and device revoke invalidate credentials", async ({ app }) => {
-  const user = await seedUser(`native-rotate-${randomUUID()}@slock.test`);
-  const session = await login(app.baseUrl, user.email);
-  const native = await enroll(app.baseUrl, session.accessToken);
-  const proof = sign(null, buildRotationProofTranscript(native.credential, native.deviceId), native.privateKey).toString("base64url");
-  const rotated = await fetch(`${app.baseUrl}/api/notifications/credentials/rotate`, {
-    method: "POST",
-    headers: { authorization: `Bearer ${native.credential}`, "content-type": "application/json" },
-    body: JSON.stringify({ proof }),
-  });
-  assert.equal(rotated.status, 201, await rotated.clone().text());
-  const replacement = await rotated.json() as { credential: string; credentialId: string };
-
-  const oldDenied = await fetch(`${app.baseUrl}/api/notifications/stream`, {
-    headers: { authorization: `Bearer ${native.credential}` },
-  });
-  assert.equal(oldDenied.status, 401);
-
-  await getDb().update(nativeNotificationCredentials).set({ expiresAt: new Date(Date.now() - 1_000) })
-    .where(eq(nativeNotificationCredentials.id, replacement.credentialId));
-  const expiredDenied = await fetch(`${app.baseUrl}/api/notifications/stream`, {
-    headers: { authorization: `Bearer ${replacement.credential}` },
-  });
-  assert.equal(expiredDenied.status, 401);
-  const afterExpiry = await fetch(`${app.baseUrl}/api/notifications/devices`, { headers: sessionHeaders(session.accessToken) });
-  const afterExpiryBody = await afterExpiry.json() as { devices: Array<{ deviceId: string; status: string }> };
-  assert.equal(afterExpiryBody.devices.find((device) => device.deviceId === native.deviceId)?.status, "inactive");
-
-  const secondNative = await enroll(app.baseUrl, session.accessToken);
-
-  const revoke = await fetch(`${app.baseUrl}/api/notifications/devices/${secondNative.deviceId}`, {
-    method: "DELETE",
-    headers: sessionHeaders(session.accessToken),
-  });
-  assert.equal(revoke.status, 204, await revoke.clone().text());
-  const replacementDenied = await fetch(`${app.baseUrl}/api/notifications/stream`, {
-    headers: { authorization: `Bearer ${secondNative.credential}` },
-  });
-  assert.equal(replacementDenied.status, 401);
-
-  const [device] = await getDb().select().from(nativeNotificationDevices).where(eq(nativeNotificationDevices.id, secondNative.deviceId));
-  assert.ok(device?.revokedAt);
-  const afterRevoke = await fetch(`${app.baseUrl}/api/notifications/devices`, { headers: sessionHeaders(session.accessToken) });
-  const afterRevokeBody = await afterRevoke.json() as { devices: Array<{ deviceId: string; status: string }> };
-  assert.equal(afterRevokeBody.devices.find((candidate) => candidate.deviceId === secondNative.deviceId)?.status, "revoked");
-
-  const selfRevokedNative = await enroll(app.baseUrl, session.accessToken);
-  const selfRevoke = await fetch(`${app.baseUrl}/api/notifications/credentials/current`, {
-    method: "DELETE",
-    headers: { authorization: `Bearer ${selfRevokedNative.credential}` },
-  });
-  assert.equal(selfRevoke.status, 204);
-  const selfRevokedDenied = await fetch(`${app.baseUrl}/api/notifications/stream`, {
-    headers: { authorization: `Bearer ${selfRevokedNative.credential}` },
-  });
-  assert.equal(selfRevokedDenied.status, 401);
-});
-
-test("native notification logs never contain submitted or persisted sensitive values", async ({ app }) => {
-
-  const originalError = console.error;
-  const originalWarn = console.warn;
-  const captured: string[] = [];
-  console.error = (...args: unknown[]) => { captured.push(args.map(String).join(" ")); };
-  console.warn = (...args: unknown[]) => { captured.push(args.map(String).join(" ")); };
-  try {
-    const user = await seedUser(`native-log-scrub-${randomUUID()}@slock.test`);
-    const session = await login(app.baseUrl, user.email);
-    const native = await enroll(app.baseUrl, session.accessToken);
-    const [credentialRow] = await getDb().select().from(nativeNotificationCredentials)
-      .where(eq(nativeNotificationCredentials.id, native.credentialId));
-    assert.ok(credentialRow);
-
-    const proof = randomBytes(64).toString("base64url");
-    const denied = await fetch(`${app.baseUrl}/api/notifications/credentials/rotate`, {
-      method: "POST",
-      headers: { authorization: `Bearer ${native.credential}`, "content-type": "application/json" },
-      body: JSON.stringify({ proof }),
-    });
-    assert.equal(denied.status, 403);
-
-    const server = await createServer("Native Log Scrub", `native-log-scrub-${randomUUID()}`, user.id);
-    const title = `title-${randomUUID()}`;
-    const body = `body-${randomUUID()}`;
-    await persistNativeNotificationIntents([{
-      recipientUserId: user.id,
-      eventKey: `log-scrub:${randomUUID()}`,
-      serverId: server.id,
-      kind: "channel",
-      channelId: randomUUID(),
-      threadId: null,
-      parentChannelId: null,
-      parentMessageId: null,
-      messageId: randomUUID(),
-      title,
-      body,
-      createdAt: new Date(),
-    }]);
-
-    const output = captured.join("\n");
-    for (const forbidden of [
-      native.grant,
-      native.credential,
-      credentialRow.secretHash,
-      proof,
-      session.accessToken,
-      title,
-      body,
+    for (const device of [
+      { kind: "web", endpoint: ENDPOINT },
+      { kind: "web" },
+      { kind: "mobile", installationId: "missing-install" },
+      { kind: "desktop", socketId: "not-connected" },
     ]) {
-      assert.equal(output.includes(forbidden), false, "logs must remain free of native secrets and notification content");
+      const response = await postJson(client, "/api/notifications/test", { device });
+      assert.equal(response.status, 200);
+      const body = await response.json() as { testId: string; sent: boolean; reason?: string };
+      assert.equal(body.sent, false, JSON.stringify(device));
+      assert.equal(body.reason, "no_device");
+      assert.deepEqual(await (await client.get(`/api/notifications/test/${body.testId}`)).json(), { status: "failed", reason: "no_device" });
     }
+    assert.equal(sent.length, 0);
+
+    assert.equal((await postJson(client, "/api/notifications/test", { device: { kind: "watch" } })).status, 400);
+    assert.equal((await postJson(http.as(user), "/api/notifications/test", { device: { kind: "web" } })).status, 400, "the server header is required");
   } finally {
-    console.error = originalError;
-    console.warn = originalWarn;
-    await app.close();
+    resetSeams();
   }
 });
 
-test("replay overflow and expired cursors fail before SSE headers", async ({ app }) => {
-  const user = await seedUser(`native-overflow-${randomUUID()}@slock.test`);
-  const session = await login(app.baseUrl, user.email);
-  const native = await enroll(app.baseUrl, session.accessToken);
-  const server = await createServer("Native Overflow", `native-overflow-${randomUUID()}`, user.id);
-  const channelId = randomUUID();
-  const intents = Array.from({ length: 514 }, (_, index) => {
-    const messageId = randomUUID();
-    return {
-      recipientUserId: user.id,
-      eventKey: `overflow:${index}:${messageId}`,
+test("a web subscription whose endpoint is not public is deleted and reported as no_device", async ({ seed, http, db }) => {
+  let sends = 0;
+  __setWebPushRuntimeForTests({
+    enabled: true,
+    lookup: async () => [{ address: "10.0.0.5", family: 4 }],
+    sendNotification: async () => {
+      sends += 1;
+      return { statusCode: 201, body: "", headers: {} };
+    },
+  });
+  try {
+    const user = await seed.human();
+    const server = await seed.server({ owner: user });
+    await db.insert(pushSubscriptions).values({ userId: user.id, endpoint: "https://fcm.googleapis.com/fcm/send/private-range", ...KEYS });
+
+    const body = await (await postJson(http.as(user, server), "/api/notifications/test", {
+      device: { kind: "web", endpoint: "https://fcm.googleapis.com/fcm/send/private-range" },
+    })).json() as { sent: boolean; reason?: string };
+    assert.deepEqual({ sent: body.sent, reason: body.reason }, { sent: false, reason: "no_device" });
+    assert.equal(sends, 0);
+    assert.deepEqual(await db.select().from(pushSubscriptions).where(eq(pushSubscriptions.userId, user.id)), []);
+  } finally {
+    resetSeams();
+  }
+});
+
+test("another user's test id is not found for status or ack", async ({ seed, http, db }) => {
+  captureWebPush();
+  withClock();
+  try {
+    const owner = await seed.human();
+    const intruder = await seed.human();
+    const server = await seed.server({ owner, members: [intruder] });
+    await db.insert(pushSubscriptions).values({ userId: owner.id, endpoint: ENDPOINT, ...KEYS });
+
+    const { testId } = await (await postJson(http.as(owner, server), "/api/notifications/test", {
+      device: { kind: "web", endpoint: ENDPOINT },
+    })).json() as { testId: string };
+
+    const intruderClient = http.as(intruder, server);
+    assert.equal((await intruderClient.get(`/api/notifications/test/${testId}`)).status, 404);
+    assert.equal((await postJson(intruderClient, `/api/notifications/test/${testId}/ack`, { shown: true })).status, 404);
+    assert.equal((await intruderClient.get("/api/notifications/test/00000000-0000-4000-8000-000000000000")).status, 404);
+    assert.equal((await intruderClient.get("/api/notifications/test/not-a-uuid")).status, 404);
+    // The intruder's ack changed nothing.
+    assert.deepEqual(await (await http.as(owner).get(`/api/notifications/test/${testId}`)).json(), { status: "pending" });
+  } finally {
+    resetSeams();
+  }
+});
+
+test("a mobile test goes to that live registration as an alert carrying testId", async ({ seed, http, db }) => {
+  const apns: ApnsDeliveryInput[] = [];
+  const fcm: FcmDeliveryInput[] = [];
+  __setApnsPushProviderForTests({ send: async (input) => { apns.push(input); return { status: "sent" }; } });
+  __setFcmPushProviderForTests({ send: async (input) => { fcm.push(input); return { status: "sent" }; } });
+  withClock();
+  try {
+    const user = await seed.human();
+    const server = await seed.server({ owner: user });
+    const registration = (env: "sandbox" | "production", provider: "apns" | "fcm", installationId: string, revoked = false) => ({
+      installationId,
+      provider,
+      userId: user.id,
       serverId: server.id,
-      kind: "channel" as const,
-      channelId,
-      threadId: null,
-      parentChannelId: null,
-      parentMessageId: null,
-      messageId,
-      title: "Overflow",
-      body: `event ${index}`,
-      createdAt: new Date(),
-    };
-  });
-  await persistNativeNotificationIntents(intents);
-  const rows = await getDb().select().from(nativeNotificationEvents)
-    .where(eq(nativeNotificationEvents.recipientUserId, user.id))
-    .orderBy(asc(nativeNotificationEvents.streamSeq));
-  assert.equal(rows.length, 514);
+      deviceToken: `${installationId}-token`,
+      topic: "build.raft.app",
+      env,
+      ...(revoked ? { revokedAt: new Date(), revokedReason: "test" } : {}),
+    });
+    await db.insert(pushRegistrations).values([
+      registration("production", "apns", "ios-install"),
+      registration("production", "apns", "ios-other"),
+      registration("production", "fcm", "android-install"),
+      registration("production", "apns", "ios-revoked", true),
+    ]);
+    const client = http.as(user, server);
 
-  const overflow = await fetch(`${app.baseUrl}/api/notifications/stream`, {
-    headers: { authorization: `Bearer ${native.credential}`, "last-event-id": rows[0]!.eventId },
-  });
-  assert.equal(overflow.status, 409);
-  assert.equal((await overflow.json() as { code: string }).code, "replay_window_exceeded");
-  assert.doesNotMatch(overflow.headers.get("content-type") ?? "", /text\/event-stream/);
+    const ios = await (await postJson(client, "/api/notifications/test", { device: { kind: "mobile", installationId: "ios-install" } })).json() as { testId: string; sent: boolean };
+    assert.equal(ios.sent, true);
+    assert.equal(apns.length, 1);
+    assert.equal(apns[0].deviceToken, "ios-install-token");
+    assert.equal(apns[0].request.pushType, "alert");
+    assert.equal(apns[0].request.body.testId, ios.testId);
+    assert.equal(apns[0].request.body.raftCategory, "test");
+    assert.equal(apns[0].request.body.id, `test:${ios.testId}`);
+    assert.equal((apns[0].request.body.aps as { alert: { title: string } }).alert.title, "Raft test notification");
+    assert.equal("badge" in (apns[0].request.body.aps as object), false, "a test leaves the badge alone");
 
-  await getDb().update(nativeNotificationEvents).set({ expiresAt: new Date(Date.now() - 1_000) })
-    .where(eq(nativeNotificationEvents.eventId, rows[0]!.eventId));
-  const expired = await fetch(`${app.baseUrl}/api/notifications/stream`, {
-    headers: { authorization: `Bearer ${native.credential}`, "last-event-id": rows[0]!.eventId },
-  });
-  assert.equal(expired.status, 409);
-  assert.equal((await expired.json() as { code: string }).code, "replay_cursor_unavailable");
+    const android = await (await postJson(client, "/api/notifications/test", { device: { kind: "mobile", installationId: "android-install" } })).json() as { testId: string; sent: boolean };
+    assert.equal(android.sent, true);
+    assert.equal(fcm.length, 1);
+    assert.equal(fcm[0].message.data.testId, android.testId);
+    assert.equal(fcm[0].message.data.category, "test");
+    assert.equal(fcm[0].message.priority, "HIGH");
+
+    const revoked = await (await postJson(client, "/api/notifications/test", { device: { kind: "mobile", installationId: "ios-revoked" } })).json() as { sent: boolean; reason?: string };
+    assert.deepEqual({ sent: revoked.sent, reason: revoked.reason }, { sent: false, reason: "no_device" });
+    assert.equal(apns.length, 1);
+  } finally {
+    resetSeams();
+  }
+});
+
+test("a provider failure or missing configuration is reported and stored as failed", async ({ seed, http, db }) => {
+  let next: () => Promise<{ status: "sent" | "skipped"; reason?: string }> = async () => {
+    throw Object.assign(new Error("APNs down"), { statusCode: 503 });
+  };
+  __setApnsPushProviderForTests({ send: () => next() });
+  withClock();
+  try {
+    const user = await seed.human();
+    const server = await seed.server({ owner: user });
+    await db.insert(pushRegistrations).values({
+      installationId: "ios-install",
+      provider: "apns",
+      userId: user.id,
+      serverId: server.id,
+      deviceToken: "token",
+      topic: "build.raft.app",
+      env: "production",
+    });
+    const client = http.as(user, server);
+
+    const failed = await (await postJson(client, "/api/notifications/test", { device: { kind: "mobile", installationId: "ios-install" } })).json() as { testId: string; sent: boolean; reason?: string };
+    assert.deepEqual({ sent: failed.sent, reason: failed.reason }, { sent: false, reason: "provider_error" });
+    assert.deepEqual(await (await client.get(`/api/notifications/test/${failed.testId}`)).json(), { status: "failed", reason: "provider_error" });
+
+    next = async () => ({ status: "skipped", reason: "provider_not_configured" });
+    const skipped = await (await postJson(client, "/api/notifications/test", { device: { kind: "mobile", installationId: "ios-install" } })).json() as { sent: boolean; reason?: string };
+    assert.deepEqual({ sent: skipped.sent, reason: skipped.reason }, { sent: false, reason: "provider_not_configured" });
+  } finally {
+    resetSeams();
+  }
+});
+
+test("a desktop test is emitted only to the caller's connected desktop socket", async ({ seed }) => {
+  withClock();
+  try {
+    const user = await seed.human();
+    const server = await seed.server({ owner: user });
+    const emitted: Array<{ socketId: string; event: string; payload: Record<string, unknown> }> = [];
+    const sockets = [
+      { id: "desktop-1", data: { userId: user.id, clientKind: "desktop" } },
+      { id: "web-1", data: { userId: user.id, clientKind: "web" } },
+      { id: "foreign-desktop", data: { userId: "someone-else", clientKind: "desktop" } },
+    ].map((socket) => ({
+      ...socket,
+      emit(event: string, payload: Record<string, unknown>) {
+        emitted.push({ socketId: socket.id, event, payload });
+        return true;
+      },
+    }));
+    const io = {
+      in(room: string) {
+        return { fetchSockets: async () => sockets.filter((socket) => socket.id === room) };
+      },
+    } as unknown as SocketServer;
+
+    const sent = await sendTestNotification({ io, userId: user.id, serverId: server.id, device: { kind: "desktop", socketId: "desktop-1" } });
+    assert.equal(sent.sent, true);
+    assert.equal(emitted.length, 1);
+    assert.equal(emitted[0].socketId, "desktop-1");
+    assert.equal(emitted[0].event, "notification:desktop");
+    assert.equal(emitted[0].payload.testId, sent.testId);
+    assert.equal(emitted[0].payload.event, "test");
+    assert.equal(emitted[0].payload.url, `/s/${server.slug}/activity`);
+
+    for (const socketId of ["web-1", "foreign-desktop", "gone"]) {
+      const result = await sendTestNotification({ io, userId: user.id, serverId: server.id, device: { kind: "desktop", socketId } });
+      assert.deepEqual({ sent: result.sent, reason: "reason" in result ? result.reason : undefined }, { sent: false, reason: "no_device" }, socketId);
+    }
+    assert.equal(emitted.length, 1);
+  } finally {
+    resetSeams();
+  }
 });

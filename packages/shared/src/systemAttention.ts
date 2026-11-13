@@ -4,7 +4,6 @@ import { lazySchema } from "./lazySchema";
 import type { RuntimeAccountUsageProvider } from "./runtimeAccountUsage";
 
 export const SERVER_SYSTEM_ATTENTION_CONTRACT_VERSION = "server-system-attention-v1" as const;
-export const USAGE_LIMIT_ATTENTION_FEATURE_FLAG_KEY = "usage_limit_attention_v0" as const;
 
 export type SystemAttentionKind = "usage_limit_reached";
 

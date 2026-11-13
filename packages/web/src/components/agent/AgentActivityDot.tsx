@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useEffectEvent } from "react";
 import { useIntl } from "react-intl";
 import { useAgentActivityTraceJoin, useAgentDisplayState } from "../../store/agentStore";
 import type { AgentActivity } from "@botiverse/raft-shared";
@@ -28,14 +28,14 @@ export default function AgentActivityDot({
   const displayState = useAgentDisplayState(agentId, { status: fallbackStatus });
   const traceJoin = useAgentActivityTraceJoin(agentId);
   const title = rest.title ?? formatAgentDisplayStateText(intl, displayState);
+  // Traced when what the dot shows changes, with the join of the push that
+  // changed it; a new push that leaves the dot as it was (a new join id
+  // alone) is not a new dot state (#proj-frontend:#8).
+  const traceApplied = useEffectEvent((activity: AgentActivity, isOnline: boolean | undefined, isExternal: boolean | undefined) => {
+    traceAgentActivityStatusDotApplied({ agentId, activity, isOnline, isExternal, join: traceJoin });
+  });
   useEffect(() => {
-    traceAgentActivityStatusDotApplied({
-      agentId,
-      activity: displayState.activity,
-      isOnline: displayState.isOnline,
-      isExternal: displayState.isExternal,
-      join: traceJoin,
-    });
-  }, [agentId, displayState.activity, displayState.isOnline, displayState.isExternal, traceJoin]);
+    traceApplied(displayState.activity, displayState.isOnline, displayState.isExternal);
+  }, [agentId, displayState.activity, displayState.isOnline, displayState.isExternal]);
   return <StatusDot activity={displayState.activity} external={displayState.isExternal && !displayState.isOnline} size={size} className={className} {...rest} title={title} />;
 }

@@ -1,0 +1,47 @@
+{
+  "formatVersion": 1,
+  "id": "R7-jump-lands-on-paywall",
+  "rule": "R7",
+  "title": "A jump to an unread thread's parent that lands on the history paywall is decided from the row's flags: not read",
+  "why": "The jump is decided from the followed row's parentInHistory/repliesInHistory, not from where the jump lands: the row said the parent is inside the window, so the thread is not read and there is no paywall bounce. Parent past the window with replies visible opens the thread; both past jumps and reads it. Decided by artin (#proj-mobile:966d7abd, 2026-10-29): the app's behaviour.",
+  "status": "agreed",
+  "sources": {
+    "web": [
+      "packages/web/src/components/message/ThreadUnreadJumpPill.tsx (reads when the jump came back historyLimited)"
+    ],
+    "app": [
+      "compose/shared/src/commonMain/kotlin/build/raft/app/ThreadJumpPills.kt (threadUnreadJumpHistoryAction: decided from the row's booleans only)"
+    ]
+  },
+  "knownGaps": [
+    {
+      "client": "web",
+      "reason": "adopt decision (artin 10-29): web reads the thread when the jump comes back historyLimited, whatever the row said.",
+      "followUp": "#proj-mobile:#70 (decision #proj-mobile:966d7abd)"
+    }
+  ],
+  "given": {
+    "conversation": {
+      "id": "thread-1",
+      "kind": "thread"
+    },
+    "jumpTarget": {
+      "parentInHistory": true,
+      "repliesInHistory": true
+    }
+  },
+  "steps": [
+    {
+      "act": "jumpToUnreadThread"
+    },
+    {
+      "act": "jumpLands",
+      "historyLimited": true
+    }
+  ],
+  "expect": {
+    "state": {
+      "threadUnreadCleared": false
+    }
+  }
+}

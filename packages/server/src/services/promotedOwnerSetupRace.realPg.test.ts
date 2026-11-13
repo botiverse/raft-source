@@ -88,7 +88,6 @@ test(
             actorUserId: ownerId,
             targetUserId: coOwnerId,
             nextRole: "owner",
-            guestTransitionsEnabled: true,
           }),
           updateServerOnboardingSettings(serverId, { onboardingAgentId: agent.id }),
         ]);

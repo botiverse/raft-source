@@ -9,8 +9,7 @@ import { join } from "node:path";
 // @botiverse/raft, with the rename notice on stderr only and never able to
 // break delegation.
 
-// @ts-expect-error -- plain .mjs build script, no type declarations
-const { buildShimPackage } = await import("../scripts/build-shim-package.mjs");
+const { buildShimPackage } = await import("../scripts/build-shim-package");
 
 function buildIntoTemp(): { dir: string; pkg: any; indexJs: string } {
   const dir = mkdtempSync(join(tmpdir(), "slock-cli-shim-"));

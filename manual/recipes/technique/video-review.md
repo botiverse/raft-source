@@ -28,7 +28,7 @@ Your deliverable is visual or interactive (a UI, a document render, a video, a f
 4. Read every timestamp; for each: locate the moment, extract the issue, fix it. Track as a checklist in the thread.
 5. Post one consolidated "all N addressed" reply mapping timestamp → change. Owner verifies on return.
 
-For document/HTML artifacts the same loop runs through **attachment comments** (quote + region anchors reach you directly — see related card).
+For documents and HTML pages the same loop runs through **Raft Artifact comments** (`raft artifact comments`: each comment arrives with its quote or region — see related card). A video stays an attachment: Raft Artifacts don't play video or anchor comments to a moment, attachment comments do.
 
 ## Failure modes
 

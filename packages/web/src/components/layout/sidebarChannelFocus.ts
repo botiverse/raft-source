@@ -9,7 +9,7 @@ export interface SidebarChannelFocusRequest {
   /**
    * `center`: an explicit one-shot request (e.g. search "Open") — always scroll
    * so the row sits mid-viewport. `nearest`: the route changed to this
-   * conversation (finder, ⌘K, deep link, mention, notification…) — bring the
+   * conversation (⌘K, deep link, mention, notification…) — bring the
    * row into view only if it is not already fully visible.
    */
   align: "center" | "nearest";

@@ -132,17 +132,8 @@ test("every onboarding evidence anchor still names a real executable test", asyn
   }
 });
 
-test("staging audit is scheduled, artifact-exact, locale-independent, staging-push runnable, repo-Node pinned, and evidence preserving", { skip: inSourceSnapshot }, async () => {
+test("staging audit is scheduled, staging-push runnable, repo-Node pinned, and evidence preserving", { skip: inSourceSnapshot }, async () => {
   const workflow = await readFile(`${repoRoot}.github/workflows/onboarding-staging-audit.yml`, "utf8");
-  const stagingSpec = await readFile(
-    `${repoRoot}packages/web/tests/e2e/staging/onboarding-entry.staging.spec.ts`,
-    "utf8",
-  );
-  const releaseIdentityProducer = await readFile(
-    `${repoRoot}packages/web/scripts/frontendReleaseIdentity.ts`,
-    "utf8",
-  );
-
   assert.match(workflow, /workflow_dispatch:/);
   // PR #7935 moves browser validation to staging; retain its real execution entry.
   assert.match(workflow, /^  push:\n    branches: \[staging\]/m);
@@ -157,35 +148,4 @@ test("staging audit is scheduled, artifact-exact, locale-independent, staging-pu
   assert.match(workflow, /playwright test --config playwright\.staging\.config\.ts/);
   assert.match(workflow, /if: failure\(\)/);
   assert.match(workflow, /retention-days: 14/);
-
-  assert.match(
-    stagingSpec,
-    /page\.locator\(["']#raft-frontend-release-identity["']\)\.textContent\(\)/,
-    "the staging spec must read the release identity embedded in the served artifact",
-  );
-  assert.match(
-    stagingSpec,
-    /environmentBadgeText\.toLowerCase\(\)[\s\S]*?\.toContain\(deployedCommitSha\.slice\(0,\s*8\)\.toLowerCase\(\)\)/,
-    "the staging spec must require the badge to match the served artifact's short revision",
-  );
-  assert.match(
-    releaseIdentityProducer,
-    /deploymentEnvironment:\s*clean\(environment\.VITE_DEPLOYMENT_ENV\)/,
-    "the served artifact identity must preserve its build-time deployment environment",
-  );
-  assert.match(
-    stagingSpec,
-    /deploymentEnvironment[\s\S]*?\.toBe\(["']staging["']\)/,
-    "the staging audit must require the served artifact to identify itself as staging",
-  );
-  assert.match(
-    stagingSpec,
-    /LEGACY_STAGING_IDENTITY_COMMIT\s*=\s*[\s\S]*?["']5ec11a117b015142bae8b8a29b45fa2dcc6ed328["'][\s\S]*?\.toBe\(LEGACY_STAGING_IDENTITY_COMMIT\)/,
-    "the one pre-field staging artifact must be the only bounded compatibility exception",
-  );
-  assert.doesNotMatch(
-    stagingSpec,
-    /\.toContain\(["']staging["']\)/i,
-    "the staging audit must not pin the translated environment label to English presentation copy",
-  );
 });

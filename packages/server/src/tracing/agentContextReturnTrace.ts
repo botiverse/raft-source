@@ -21,7 +21,7 @@ import { traceAgentIdHash, traceIdentityHash } from "./traceIdentity";
 
 export const AGENT_CONTEXT_RETURNED_EVENT = "server.agent_context.returned";
 
-export type AgentContextReturnSource = "history" | "hold" | "delivery";
+export type AgentContextReturnSource = "history" | "hold" | "attach" | "delivery";
 
 const DAEMON_ID_PATTERN = /^[A-Za-z0-9-]{8,64}$/;
 

@@ -134,16 +134,6 @@ function sorted<T>(values: readonly T[], key: (value: T) => string): T[] {
   return [...values].sort((left, right) => key(left).localeCompare(key(right)));
 }
 
-function metadataMatches(projection: ProjectionRow, object: ObjectRow): boolean {
-  return projection.storageKey === object.storageKey
-    && projection.thumbnailKey === object.thumbnailKey
-    && projection.contentHash === object.contentHash
-    && projection.mimeType === object.mimeType
-    && projection.sizeBytes === object.sizeBytes
-    && projection.width === object.width
-    && projection.height === object.height;
-}
-
 function normalizeErrorClass(error: unknown): string {
   if (!(error instanceof Error)) return "non_error_throw";
   const code = "code" in error && typeof (error as { code?: unknown }).code === "string"
@@ -190,8 +180,7 @@ async function collectInventorySnapshot(
   const projectionRows = scopeServerId
     ? await projectionQuery.where(or(
       eq(attachmentObjects.originServerId, scopeServerId),
-      and(isNull(attachments.objectId), eq(channels.serverId, scopeServerId)),
-      and(isNotNull(attachments.objectId), isNull(attachmentObjects.id), eq(channels.serverId, scopeServerId)),
+      and(isNull(attachmentObjects.id), eq(channels.serverId, scopeServerId)),
     )).orderBy(attachments.id)
     : await projectionQuery.orderBy(attachments.id);
   const projections = projectionRows.map((row) => row.projection);
@@ -223,22 +212,11 @@ async function collectInventorySnapshot(
     objectArtifacts.set(object.id, plans);
     for (const plan of plans) artifactsByKey.set(artifactKey(plan), plan);
   }
-  for (const projection of projections) {
-    if (projection.objectId !== null) continue;
-    for (const plan of buildAttachmentTransferArtifactPlan(projection)) {
-      artifactsByKey.set(artifactKey(plan), plan);
-    }
-  }
   const artifacts = sorted([...artifactsByKey.values()], artifactKey);
   const objectsById = new Map(objects.map((object) => [object.id, object]));
   const danglingProjectionCount = projections.filter(
-    (projection) => projection.objectId !== null && !objectsById.has(projection.objectId),
+    (projection) => !objectsById.has(projection.objectId),
   ).length;
-  const metadataMismatchCount = projections.filter((projection) => {
-    if (projection.objectId === null) return false;
-    const object = objectsById.get(projection.objectId);
-    return object ? !metadataMatches(projection, object) : false;
-  }).length;
 
   const canonical = {
     scopeServerId: scopeServerId ?? null,
@@ -259,13 +237,6 @@ async function collectInventorySnapshot(
       objectId: projection.objectId,
       messageId: projection.messageId,
       revokedAt: projection.revokedAt,
-      storageKey: projection.storageKey,
-      thumbnailKey: projection.thumbnailKey,
-      mimeType: projection.mimeType,
-      sizeBytes: projection.sizeBytes,
-      contentHash: projection.contentHash,
-      width: projection.width,
-      height: projection.height,
     })),
     reservations: sorted(reservations, (row) => `${row.objectId}\0${row.state}`),
     uploadSessions: sorted(uploadSessions, (row) => `${row.objectId}\0${row.state}`),
@@ -279,9 +250,12 @@ async function collectInventorySnapshot(
     uploadSessions,
     artifacts,
     objectArtifacts,
-    legacyObjectlessProjectionCount: projections.filter((projection) => projection.objectId === null).length,
+    // object_id is NOT NULL, and projections carry no physical copies to
+    // disagree with their object (storage step 2c). The run row keeps both
+    // counts, now always 0.
+    legacyObjectlessProjectionCount: 0,
     danglingProjectionCount,
-    metadataMismatchCount,
+    metadataMismatchCount: 0,
     deletedOriginServerObjectCount,
     sourceDigest: sha256Json(canonical),
   };

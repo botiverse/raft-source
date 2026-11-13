@@ -137,8 +137,11 @@ test.describe("thread view-in-channel profile close", () => {
     await expect(threadParent).toBeVisible();
 
     // With Channel + Thread both open, a profile opened from a Channel avatar
-    // folds only Thread. The channel surface remains mounted and the shell
-    // columns stay inside the viewport.
+    // is a column of the row (#189). At this test's 1280px window the row
+    // (1280 - 57 rail - 240 sidebar = 983) is short of channel 360 + thread
+    // 360 + profile 320 = 1040, so the thread folds into the channel's column
+    // (rule 3); the channel surface remains mounted and the shell columns stay
+    // inside the viewport.
     const channelAgentBody = page.getByTestId("thread-main-column").locator('[data-message-id]', { hasText: channelAgentReply }).first();
     await channelAgentBody.scrollIntoViewIfNeeded();
     await expect(channelAgentBody).toBeVisible();
@@ -168,9 +171,10 @@ test.describe("thread view-in-channel profile close", () => {
         });
       },
     );
+    // #189: the profile is a column like the others; the channel and the thread both stay mounted in the row.
     expect(channelProfileLayout.channelDisplay).toBe("flex");
-    expect(channelProfileLayout.threadDisplay).toBe("none");
-    expect(channelProfileLayout.profilePosition).toBe("relative");
+    expect(channelProfileLayout.threadDisplay).toBe("flex");
+    expect(["relative", "static"]).toContain(channelProfileLayout.profilePosition);
     expect(channelProfileLayout.profileX).toBeGreaterThanOrEqual(0);
     expect(channelProfileLayout.profileRight).toBeLessThanOrEqual(channelProfileLayout.viewportWidth);
     await page.getByTestId("thread-side-column").evaluate((thread) => {
@@ -181,8 +185,9 @@ test.describe("thread view-in-channel profile close", () => {
     await expect(page.getByTestId("thread-side-column")).toBeVisible();
     await expect(page.getByTestId("thread-layout-container").locator('[data-testid="thread-side-column"][data-qa-channel-origin-thread="true"]')).toHaveCount(1);
 
-    // The Thread avatar takes the opposite branch: Channel folds, while
-    // Thread + Profile remain side-by-side and close restores both panes.
+    // The Thread avatar: the same row (983 < 1040), so the thread folds over
+    // the channel's column (#189 rule 3) while Thread + Profile remain
+    // side-by-side, and close restores both panes.
     const agentReplyBody = threadPanel.locator('[data-message-id]', { hasText: agentReply }).first();
     await expect(agentReplyBody).toBeVisible();
     const agentAvatar = threadPanel.locator('button[data-avatar-kind="agent"]');
@@ -225,9 +230,10 @@ test.describe("thread view-in-channel profile close", () => {
       const profileStyle = getComputedStyle(profile);
       return {
         channelDisplay: getComputedStyle(channel).display,
+        channelInert: channel.hasAttribute("inert"),
+        channelX: Math.round(channel.getBoundingClientRect().x),
         threadPosition: threadStyle.position,
-        threadFlex: threadStyle.flex,
-        threadBorderRight: threadStyle.borderRightStyle,
+        threadCovers: thread.hasAttribute("data-covers"),
         profilePosition: profileStyle.position,
         threadBox: (() => {
           const rect = thread.getBoundingClientRect();
@@ -239,15 +245,20 @@ test.describe("thread view-in-channel profile close", () => {
         })(),
       };
     });
-    expect(layout.channelDisplay).toBe("none");
-    expect(layout.threadPosition).toBe("relative");
-    expect(layout.threadFlex).toBe("1 1 auto");
-    expect(layout.threadBorderRight).toBe("solid");
-    expect(layout.profilePosition).toBe("relative");
+    // #189 rule 3: the thread is a layer over the channel's column, which keeps
+    // its box under it, out of reach (inert); Back at the thread's head
+    // instead of Close; the profile stands beside them in a column of its own.
+    expect(layout.channelDisplay).toBe("flex");
+    expect(layout.channelInert).toBe(true);
+    expect(layout.threadCovers).toBe(true);
+    expect(layout.threadPosition).toBe("absolute");
+    expect(layout.threadBox.x).toBe(layout.channelX);
+    expect(["relative", "static"]).toContain(layout.profilePosition);
     expect(layout.threadBox.width).toBeGreaterThan(0);
     expect(layout.profileBox.width).toBeGreaterThan(0);
     expect(layout.threadBox.right).toBeLessThanOrEqual(layout.profileBox.x + 1);
-    await expect(page.getByPlaceholder(`Message #${seedState.channel.name}`)).not.toBeVisible();
+    await expect(page.getByTestId("thread-mobile-back")).toBeVisible();
+    await expect(page.getByTestId("thread-close")).not.toBeVisible();
 
     // Profile tabs are a nested navigation surface.  Their scroll/width work
     // must stay inside the profile pane: the outer rail and channel sidebar
@@ -333,7 +344,10 @@ test.describe("thread view-in-channel profile close", () => {
     // Regression: while Profile is open over Channel + Thread, a reply action
     // on a different Channel message still navigates to that Thread. The
     // Profile surface must close and the ordinary Channel + Thread shell must
-    // be restored for the newly selected parent.
+    // be restored for the newly selected parent. The channel has to be in
+    // reach beside the thread and the profile for that, so the window is wide
+    // enough for all three: 1440 - 57 - 240 = 1143 >= 360 + 360 + 320 (#189).
+    await page.setViewportSize({ width: 1440, height: 900 });
     await channelAgentBody.scrollIntoViewIfNeeded();
     await withProfileOpenEvidence(page, testInfo, "channel-avatar-retarget", async () => {
       await channelAgentBody.locator('button[data-avatar-kind="agent"]').click();

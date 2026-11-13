@@ -11,7 +11,8 @@ test.describe("mobile iOS standalone chrome", () => {
     await loginViaApi(request, seedState);
 
     await page.goto(`/s/${seedState.server.slug}`);
-    await expect(page.getByText(seedState.server.name)).toBeVisible();
+    // The sidebar header's server name: the tab bar's server tab carries it too.
+    await expect(page.getByTestId("mobile-workspace-trigger").getByText(seedState.server.name)).toBeVisible();
 
     const rootColors = await page.evaluate(() => {
       const appRoot = document.querySelector<HTMLElement>("#root > div");
@@ -67,11 +68,12 @@ test.describe("mobile iOS standalone chrome", () => {
     await expectCssColor(page, detailColors.appRoot, "#FFFFFF");
   });
 
-  // Raft DS › TabBar: the tab bar is an edge bar on the card surface with a
-  // seam on top, the last thing in the column; nothing floats over the content
-  // and nothing is stacked above it. A tab root wears the frame (yellow in
-  // light, the neutral #0d0d0b in dark) and the browser chrome follows it.
-  test("the tab bar is an in-flow edge bar under the frame-coloured shell, in light and dark", async ({
+  // Raft DS › MobileNav (edge bar, stdrc 2026-10-21): the tab bar is the last
+  // thing in the column, in flow, full width and flush with the bottom edge,
+  // with a seam on top; nothing else floats over the content. A tab root
+  // wears the frame (yellow in light, the neutral #0d0d0b in dark) and the
+  // browser chrome follows it.
+  test("the tab bar is an in-flow edge bar flush with the bottom under the frame-coloured shell, in light and dark", async ({
     page,
     request,
   }) => {
@@ -97,6 +99,8 @@ test.describe("mobile iOS standalone chrome", () => {
           appRoot: appRoot ? getComputedStyle(appRoot).backgroundColor : null,
           navPosition: navStyle?.position ?? null,
           navBorderTopWidth: navStyle?.borderTopWidth ?? null,
+          navBorderBottomWidth: navStyle?.borderBottomWidth ?? null,
+          navRadius: navStyle?.borderTopLeftRadius ?? null,
           floatingOverlays: document.querySelectorAll(
             '[data-testid="mobile-bottom-bar-overlay"], [data-testid="mobile-live-activity-slot"]',
           ).length,
@@ -104,11 +108,13 @@ test.describe("mobile iOS standalone chrome", () => {
       });
 
     await page.goto(`/s/${seedState.server.slug}`);
-    await expect(page.getByText(seedState.server.name)).toBeVisible();
+    // The sidebar header's server name: the tab bar's server tab carries it too.
+    await expect(page.getByTestId("mobile-workspace-trigger").getByText(seedState.server.name)).toBeVisible();
 
     for (const [mode, frame] of [["light", "#FFD440"], ["dark", "#0D0D0B"]] as const) {
       await setDeviceThemeMode(mode);
-      await expect(page.getByText(seedState.server.name)).toBeVisible();
+      // The sidebar header's server name: the tab bar's server tab carries it too.
+      await expect(page.getByTestId("mobile-workspace-trigger").getByText(seedState.server.name)).toBeVisible();
 
       const shell = await readShell();
       expect(shell.themeColor).toBe(frame);
@@ -118,14 +124,45 @@ test.describe("mobile iOS standalone chrome", () => {
       expect(shell.navBorderTopWidth).toBe("1px");
       expect(shell.floatingOverlays).toBe(0);
 
-      // The bar sits on the bottom edge of the viewport, in flow.
+      expect(shell.navBorderBottomWidth).toBe("0px");
+      expect(shell.navRadius).toBe("0px");
+
+      // The bar spans the width and its bottom edge is the viewport's
+      // (MobileNav Anatomy; no safe-area inset in this viewport).
       const navBox = await page.locator('[data-slot="mobile-nav-root"]').boundingBox();
       expect(navBox).not.toBeNull();
-      expect(Math.abs((navBox?.y ?? 0) + (navBox?.height ?? 0) - page.viewportSize()!.height)).toBeLessThanOrEqual(1);
+      const viewport = page.viewportSize()!;
+      expect(Math.abs(viewport.height - ((navBox?.y ?? 0) + (navBox?.height ?? 0)))).toBeLessThanOrEqual(1);
+      expect(Math.abs(navBox?.x ?? 0)).toBeLessThanOrEqual(1);
+      expect(Math.abs(viewport.width - (navBox?.width ?? 0))).toBeLessThanOrEqual(1);
+    }
+
+    // Five slots: four tabs, then the current server (the server tab, whose
+    // avatar stands where the others have an icon). Every icon sits on one
+    // line at one size whether or not its tab carries a dot (the Activity
+    // icon used to ride up when its dot joined the item's column).
+    const items = page.locator('[data-slot="mobile-nav-root"] [data-slot="mobile-nav-item"]');
+    await expect(items).toHaveCount(4);
+    expect(await items.evaluateAll((els) => els.map((el) => el.getAttribute("aria-label")))).toEqual([
+      "Home",
+      "Activity",
+      "Tasks",
+      "Search",
+    ]);
+    await expect(page.locator('[data-slot="mobile-nav-root"] [data-slot="mobile-nav-server-item"]')).toHaveCount(1);
+    const iconBoxes = await page
+      .locator('[data-slot="mobile-nav-root"] button')
+      .evaluateAll((els) => els
+        .map((el) => el.querySelector('[data-slot="avatar"], svg')!.getBoundingClientRect())
+        .map((r) => ({ top: r.top, height: r.height })));
+    expect(iconBoxes).toHaveLength(5);
+    for (const box of iconBoxes) {
+      expect(Math.abs(box.top - iconBoxes[0].top)).toBeLessThanOrEqual(0.5);
+      expect(box.height).toBe(22);
     }
 
     // The list ends above the bar: its last row scrolls fully clear of it
-    // without any reserved clearance under a floating capsule.
+    // without any reserved clearance under the bar.
     const lastRow = page.locator("[data-sidebar-channel-id]").last();
     await lastRow.scrollIntoViewIfNeeded();
     await page.evaluate(() => {

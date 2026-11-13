@@ -44,10 +44,12 @@ real web components.
 ## Browser CI
 
 [Visual browser](../../.github/workflows/visual-browser.yml) runs the existing
-React browser suite after relevant web, visual-test, shared dependency, or
-workflow changes land on `staging`, daily at 18:23 UTC, and on manual dispatch.
-It does not run on ordinary PRs and is not a required pre-merge check. The daily
-run also covers gaps in the push path filter; GitHub schedules can be delayed.
+React browser suite on manual dispatch only (since 2026-11-10, #wg-cost:#40:
+as a job on every `staging` push and every night it failed almost every time
+and nobody acted on it). Dispatch it before a visual change ships. The whole
+suite does not run on PRs and is not a required pre-merge check; on a PR the
+same workflow only takes the screenshots asked for in a `visual-shots` block
+([PR screenshots](#pr-screenshots-visual-shots-block)).
 
 The job uses the pinned Playwright image and the existing Vite fixture host,
 with one worker, zero retries, and the default manifest selection. It does not
@@ -63,6 +65,72 @@ and Playwright Chromium:
 ```bash
 PLAYWRIGHT_JSON_OUTPUT_NAME=test-results/visual-results.json pnpm exec playwright test --config playwright.visual-testing.config.ts --reporter=line,json --trace=retain-on-failure
 ```
+
+## PR screenshots (`visual-shots` block)
+
+Screenshots of a branch's real pages can be taken locally within the host's
+budget (the [run above](#browser-ci), with an explicit memory budget, or
+separate ones for the Vite server and the browser). When a local run is
+inconvenient or would exceed that budget, CI can take them instead, as an
+optional alternative:
+
+Put one fenced block tagged `visual-shots`, holding JSON, in the PR
+description:
+
+````markdown
+```visual-shots
+{"routes":[{"path":"/","viewport":"390x844","theme":"dark"}],
+ "cases":["components.ui.button.states"]}
+```
+````
+
+- `routes`: real app pages. `path` (required) starts with `/` and is opened on
+  the app under test only; `viewport` is `WIDTHxHEIGHT` (default `390x844`);
+  `theme` is `light` or `dark` (default `light`, set as the browser's colour
+  scheme).
+- `cases`: ids from [`shared/sharedCases.json`](shared/sharedCases.json), shot
+  exactly as the visual suite shoots them (fixture data, the case's own
+  viewport and theme). Pending and skipped cases are rejected.
+
+The block is the whole request: there is no automatic selection, and an empty
+block (`{}`) is an error. The
+[Visual browser](../../.github/workflows/visual-browser.yml) workflow runs it
+when the PR is opened or reopened, on every push, and when the description is
+edited. An edit of only the title or base does not reshoot. A newer run
+cancels an older one for the same PR, so removing the block (or the edit that
+removes it) also stops a run in progress, and later pushes take no shots.
+Only PRs from branches of this repository run; fork PRs never do. A
+description that only mentions the fence inline, with no block on its own
+lines, runs the job but takes no shots.
+
+Limits, checked strictly (an invalid block fails the job and names the
+problem): only the keys above; at most 20 shots in total; paths at most 200
+characters, no `//` prefix, only `A-Z a-z 0-9 . _ ~ - / ? = & % # : @ + , ;`;
+viewport width 320-1920 and height 320-2160; each case listed once.
+
+**Routes are logged out.** They render the branch's web app from the Vite host
+with no backend: every `/api`, `/internal`, `/daemon` and `/socket.io` request
+gets a 401, and requests to other origins are aborted. A route therefore shows
+what a signed-out visitor sees (the login page for `/`, register, invite and
+public pages). For signed-in surfaces use cases, which run on fixture data.
+This path never gets secrets, sessions or a real backend; see the security
+note in the workflow before changing that.
+
+The run uploads the artifact `visual-shots-pr-<n>` (seven days):
+`index.json` (each shot: kind, id or path, viewport, theme, file, `captured` or
+`missing`), `routes/*.png`, `react/<case>.png` with its metadata, `plan.json`,
+and Playwright traces on failure. The job summary lists every shot. Fetch it:
+
+```bash
+stamp run list --repo botiverse/slock --workflow visual-browser.yml --branch <branch> --limit 3
+stamp run download <run-id> -R botiverse/slock --name visual-shots-pr-<n> --dir ./visual-shots-pr-<n>
+```
+
+(`stamp run download <run-url> --name ...` works too.) The request parser is
+`src/visual-shots.mjs` (CLI `src/visual-shots-cli.mjs`); tests:
+`pnpm --filter @botiverse/raft-visual-testing test:shots`, which the job also
+runs before planning. Route shots are `tests/visual-shots-routes.spec.ts`,
+which defines no tests outside this job.
 
 ## CLI
 
@@ -233,10 +301,6 @@ Use the built-in KMP visual-page path first for these surfaces:
 | --- | --- | --- |
 | `components.tokens.palette` | `captureTokenPalette` | `compose_tokens_palette_visual` |
 | `components.navigation.tabbar.states` | `captureNavigationTabbarStates` | `compose_bottom_tabbar_visual` |
-| `auth.login.inputs.empty` | `captureAuthLoginInputsEmpty` | `compose_auth_login_inputs` |
-| `auth.login.inputs.filled` | `captureAuthLoginInputsFilled` | `compose_auth_login_inputs` |
-| `auth.login.inputs.invalid` | `captureAuthLoginInputsInvalid` | `compose_auth_login_inputs` |
-| `components.auth.register.inputs` | `captureAuthRegisterInputs` | `compose_auth_register_inputs` |
 | `components.thread.message.row` | `captureThreadMessageRow` | `compose_thread_message_row_visual` |
 | `components.thread.composer.empty` | `captureThreadComposerEmpty` | `compose_thread_composer_visual` |
 | `components.thread.composer.states` | `captureThreadComposerStates` | `compose_thread_composer_visual` |
@@ -327,6 +391,90 @@ artifacts/visual-testing/token-audit.md
 ```
 
 Usage findings distinguish real-surface hard-coded colors that match known tokens from unknown colors that are outside the shared token set. Existing debt is reported instead of silently folded into the palette screenshot; cleanups should be split by component or surface.
+
+## Full-length capture
+
+`"capture": { "fullLength": true }` (or `{ "fullLength": { "maxHeight": 2700 } }`)
+opts a case into a long screenshot instead of one 390×844 screen. Every
+provider runs the same algorithm: find the largest visible vertical scroller
+that still has content outside its viewport, grow the viewport/display by exactly
+that overflow, repeat until nothing overflows or the cap (default 2700 dp) is
+reached, then capture with the case's normal crop. Fixed chrome (header, tabs,
+composer, bottom bar) keeps its real top/bottom position; a case with nothing
+to scroll stays one screen. React grows the Playwright viewport (and any case
+root pinned to the viewport height); Android grows the emulator display with
+`wm size` and reads the scroll range from Compose semantics. Metadata records
+the expansion under `fullLength`.
+
+Diff never rescales full-length captures: both metrics pad the shorter image to
+the taller canvas with a marker colour (`#ff00ff`) and count every padded pixel
+as a mismatch, so a missing or extra tail lowers the score.
+
+Before hashing and scoring, `diff` cuts the blank tail of every full-length
+capture, on both providers, down to the same 16 dp margin
+(`src/full-length-trim.mjs`, rewrites the PNG in place). The expansion grows
+by the scroller's exact scroll range, but that range includes each platform's
+own trailing padding (the Android member pages end with a 180 dp spacer item,
+Settings with a larger bottom padding than web). Only rows of one uniform
+colour at the very bottom are cut; content and fixed bottom chrome are never
+touched, and tails shorter than the margin stay as they are. So the compared
+height is "content plus 16 dp" on both sides, also for flagged cases that fit
+one screen.
+
+Bottom-anchored message lists (newest at the bottom: a reversed `LazyColumn`
+on Android, a list scrolled to the bottom or `column-reverse` on web) hide
+their history above the fold. That counts as overflow too, so growing the
+screen reveals the history upward while the header stays on top and the
+composer at the bottom. If the cap is hit, both sides go back to the list's
+start, which is the newest message.
+
+### Which cases are full length
+
+Every case whose captured surface is a whole phone screen that can scroll has
+`fullLength` on:
+
+- Settings pages: `components.settings.root.page`, `.account.page`,
+  `.account.error-state`, `.server.profile`, `.appearance.page`,
+  `.notifications.page`.
+- Member pages: `components.members.agent-detail.profile`,
+  `components.members.agent-lifecycle-actions`, every
+  `screens.members.agent-detail.*` tab/state, `screens.members.human.profile`.
+- Lists: `screens.home.channel-list` (+ `.dark`), `components.home.search.results`,
+  `components.tasks.panel.states`, `components.channel.members.add-panel`,
+  `components.thread.forward-modal` (a full-screen page, not a dialog).
+- Thread surfaces: `components.thread.comment-anchor`,
+  `components.thread.message-share.selection`.
+
+A flagged case whose content fits one screen today simply stays one screen; it
+grows as soon as its fixture gets longer.
+
+Not flagged, by group:
+
+- Small component cases (`components.ui.*`, tab bar, thread header, composer
+  states and suggestions, message rows, `components.thread.files.list`,
+  `components.tasks.status-menu`): the crop is the component's own bounds, not
+  a screen.
+- Fixed-height component frames (`components.home.saved.results`,
+  `components.home.activity.results`): both sides render a 342×620 frame, so
+  there is no screen to grow.
+- Long message rows that run past one screen
+  (`components.thread.message-row.long-inline-code`, `.md-wrap-slice1`): the
+  row is laid out unbounded and clipped by the window, there is no scroller to
+  measure. Growing them needs a content-height crop, not this mechanism.
+- Open menus, popovers and dropdowns (`components.thread.message-menu.*`,
+  `components.home.titlebar.states`, `components.home.notification-center.states`,
+  `components.home.search.channel-dropdown`): the overlay is the subject, and
+  its own scroller (e.g. the dropdown list, whose height is capped) would be
+  picked as the main scroller and grown for nothing.
+- Dialogs and sheets (`components.home.create-channel.dialog`,
+  `components.members.create-agent.*`, `components.channel.settings.panel`,
+  `components.members.avatar-management`, `screens.settings.server-danger-modal`):
+  centred dialogs re-centre and bottom sheets re-anchor when the screen grows,
+  so the page behind would move instead of the dialog content growing.
+- Nothing to scroll: `screens.home.loading` (skeleton).
+- Pending or skipped cases are not captured, so they are not flagged
+  (`screens.thread.*`, `screens.home.*` routes, `screens.auth.*`, …). Flag
+  them when they become active.
 
 Visual cases can be temporarily removed from default capture/diff/report/site accounting with a top-level `skip` field in `shared/sharedCases.json`:
 

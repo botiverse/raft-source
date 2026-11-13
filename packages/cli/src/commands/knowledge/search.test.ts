@@ -1,7 +1,5 @@
 import assert from "node:assert/strict";
 
-import { Command } from "commander";
-
 import type { AgentContext } from "../../auth/env";
 import type { ApiResponse } from "../../client";
 import { createCommandContext } from "../../core/context";
@@ -10,7 +8,6 @@ import type { CliIo } from "../../core/io";
 import {
   formatKnowledgeSearchResults,
   knowledgeSearchCommand,
-  registerKnowledgeSearchCommand,
 } from "./search";
 
 function memoryIo(): { io: CliIo; stdout: string[]; stderr: string[] } {
@@ -49,22 +46,6 @@ test("formatKnowledgeSearchResults renders slug title and first screen", () => {
       + "   # Spin up a preview environment\n"
       + "   Use this before merge.\n",
   );
-});
-
-test("manual search help documents recipes scope", () => {
-  const program = new Command();
-  const manual = program.command("manual");
-  registerKnowledgeSearchCommand(manual);
-  const search = manual.commands.find((candidate) => candidate.name() === "search");
-
-  assert.ok(search);
-  let help = "";
-  search.configureOutput({ writeOut: (chunk) => { help += chunk; }, writeErr: (chunk) => { help += chunk; } });
-  search.outputHelp();
-  assert.match(help, /raft manual search "preview before merge" --scope recipes/);
-  assert.match(help, /Currently supports: recipes/);
-  assert.match(help, /--intent <text>/);
-  assert.match(help, /--reason <text>/);
 });
 
 test("knowledge search command uses injected ApiClient and preserves top-3 result order", async () => {

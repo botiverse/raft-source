@@ -1,18 +1,22 @@
 import type { Request, Response, NextFunction } from "express";
 import jwt from "jsonwebtoken";
+import { ASSISTANT_OWNER_SSO_REQUIRED_BODY, assistantOwnerPassesSso, checkAccountSso, SSO_REQUIRED_CODE, SSO_REQUIRED_TEXT, type SsoSessionFacts } from "../services/sso/ssoEnforcement";
 import { eq, and, isNull, ne } from "drizzle-orm";
 import { getDb } from "../db/index";
 import { isPilotServer } from "../raftbench/contract";
 import { resolveProviderConfig } from "../services/agentRuntimeProviderService";
 import { UUID_RE } from "../lib/messageId";
-import { users, serverMembers, servers, sessionFamilies, agents, appBotBindings, oauthClientInstalls, raftbenchServiceAgents, agentRuntimeProvisions } from "../db/schema";
+import { users, serverMembers, servers, sessionFamilies, agents, appBotBindings, oauthClientInstalls, raftbenchServiceAgents, agentRuntimeProvisions, accountDeletionRequests, type SessionScope, type RequestSessionScope } from "../db/schema";
+import { ASSISTANT_ROUTE_NOT_ALLOWED_BODY, isAssistantAgentApiRequestAllowed } from "../services/assistantRouteAllowlist";
 import { findMachineByApiKey, getMachine } from "../services/machineService";
 import {
-  findAgentCredentialByApiKey,
+  AGENT_CREDENTIAL_EXPIRED_CODE,
+  authenticateAgentApiKey,
   isAgentApiKey,
 } from "../services/agentCredentialService";
+import { refusalBody } from "../lib/refusal";
 import { recordAgentApiSeen } from "../services/externalAgentPresence";
-import { addTraceEvent, runWithTraceAttrs } from "../tracing/semanticTrace";
+import { addTraceEvent, createTraceDbQueryTracer, runWithTraceAttrs, traceMiddlewarePhase } from "../tracing/semanticTrace";
 import { agentIdHashAttrs, serverIdHashAttrs } from "../tracing/traceIdentity";
 import {
   findComputerByApiKey,
@@ -21,6 +25,7 @@ import {
 } from "../services/computerCredentialService";
 import { accountNeedsIdentitySetup, asServerId, isExternalAgentRuntime, asMachineId, isOwnerRole, type ServerId, type MachineId } from "@botiverse/raft-shared";
 import { rememberTraceUserId } from "../tracing/traceUserId";
+import { setRequestTraceMachineKeyKind } from "./requestObservability";
 
 const JWT_SECRET = () => {
   const secret = process.env.JWT_SECRET;
@@ -34,6 +39,22 @@ declare global {
     interface Request {
       userId?: string;
       sessionFamilyId?: string;
+      /**
+       * Set by requireAuth: `device` for a device login's session (DEVICE_SESSION_ROUTES only);
+       * `assistant_as_owner` when a personal assistant acts as its owner (middleware/assistantAsOwner.ts).
+       */
+      sessionScope?: RequestSessionScope;
+      /** Set only with sessionScope `assistant_as_owner`: the assistant acting as `userId`, and the table entry. */
+      viaAssistant?: { agentId: string; serverId: string; actionKey: string };
+      /** What the session family says about SSO (RFC 083 §6.2); set by requireAuth. */
+      ssoSession?: SsoSessionFacts;
+      /**
+       * The account fields requireVerified / requireProfileSetupComplete
+       * check, from the same row read that verified the access token in
+       * requireAuth (one read per request instead of three). Absent for any
+       * other auth path: those checks then read the row themselves.
+       */
+      authAccount?: AuthAccountState;
       serverId?: ServerId;
       machineId?: MachineId;
       daemonVersion?: string | null;
@@ -52,6 +73,10 @@ declare global {
       agentCredentialId?: string;
       agentCredentialScopes?: readonly string[];
       raftbenchServiceAgent?: boolean;
+      // RFC 075 v4: set when the credential's agent is someone's personal
+      // assistant (the owner's user id). Its credential reaches only the
+      // assistant route allowlist (services/assistantRouteAllowlist.ts).
+      actingAgentAssistantOwnerUserId?: string;
       // True when the credential's bound agent runs on the `external` runtime
       // (no daemon). Drives the `agent:seen` presence push.
       actingAgentIsExternal?: boolean;
@@ -71,8 +96,13 @@ export interface JwtPayload {
   familyId?: string;
 }
 
-export function signAccessToken(userId: string, familyId?: string): string {
-  return jwt.sign({ sub: userId, type: "access", ...(familyId ? { familyId } : {}) }, JWT_SECRET(), { expiresIn: "15m" });
+/**
+ * Every access token belongs to a session family (design v8 §5): the family
+ * is where revocation, scope and the second-factor state live, and a token
+ * without one is refused (verifyActiveAccessTokenWithAccount).
+ */
+export function signAccessToken(userId: string, familyId: string): string {
+  return jwt.sign({ sub: userId, type: "access", familyId }, JWT_SECRET(), { expiresIn: "15m" });
 }
 
 export function signRefreshToken(userId: string): string {
@@ -83,9 +113,59 @@ export function verifyToken(token: string): JwtPayload {
   return jwt.verify(token, JWT_SECRET()) as JwtPayload;
 }
 
-/** Verify the live account/session at every user-token entry point. Legacy
- * access tokens without a family remain supported until their normal expiry. */
-export async function verifyActiveAccessToken(token: string): Promise<JwtPayload | null> {
+/**
+ * Signature only, expiry not checked. For POST /api/computer/retire-session
+ * alone (computerRetireSession.ts): its other proof is a live machine key that
+ * the token's family issued, and retiring only takes access away, so a Computer
+ * that has been off past the token's 15 minutes can retire without refreshing
+ * (a refresh could rotate a copied Desktop session and sign the app out). Every
+ * other route keeps `verifyToken`.
+ */
+export function verifyTokenSignatureIgnoringExpiry(token: string): JwtPayload {
+  return jwt.verify(token, JWT_SECRET(), { ignoreExpiration: true }) as JwtPayload;
+}
+
+/** The account fields the verified / profile-setup checks read. */
+export type AuthAccountState = {
+  /** Whose row this is: used only while it is still `req.userId`. */
+  userId: string;
+  emailVerified: boolean;
+  profileSetupCompletedAt: Date | null;
+  name: string;
+};
+
+/**
+ * Verify the live account/session at every user-token entry point, in one
+ * read: the user row, the token's session family and the person's pending
+ * account deletion request, if any (both left-joined; the request through
+ * its partial unique index). Refused: a token with no family (design v8 §5:
+ * outside any family's revocation and second-factor state; production issued
+ * none), no account or a retired one, then a missing, revoked or retired
+ * family, then a person whose account is scheduled for deletion unless the
+ * caller opts in (`accountDeletionPending: "allow"`, requireAuth only, which
+ * admits such a person on ACCOUNT_DELETION_PENDING_ROUTES only): sockets,
+ * attachment links and optional-auth reads see no session at all.
+ * A person with no request reads exactly as before.
+ */
+export async function verifyActiveAccessTokenWithAccount(
+  token: string,
+  options: {
+    deviceSession?: "deny" | "allow";
+    accountDeletionPending?: "deny" | "allow";
+    /** Read "require SSO" without its 10 s candidate cache (the socket handshake). */
+    ssoFresh?: boolean;
+  } = {},
+): Promise<{
+  payload: JwtPayload;
+  account: AuthAccountState;
+  scope: SessionScope;
+  accountDeletionScheduledFor: Date | null;
+  sso: SsoSessionFacts;
+  /** RFC 083 §6.2: a Server requiring SSO manages this person and this session does not satisfy it (sign in with that Server's SSO). */
+  ssoRequiredBy: string | null;
+  /** When this session's accepted SSO sign-in stops counting (a live socket closes then). */
+  ssoExpiresAt: Date | null;
+} | null> {
   let payload: JwtPayload;
   try {
     payload = verifyToken(token);
@@ -93,26 +173,103 @@ export async function verifyActiveAccessToken(token: string): Promise<JwtPayload
     return null;
   }
   if (payload.type !== "access") return null;
+  const familyId = payload.familyId;
+  if (typeof familyId !== "string" || !familyId) return null;
   const db = getDb();
-  const [user] = await db.select({ id: users.id, retiredAt: users.retiredAt, traceUserId: users.traceUserId })
-    .from(users).where(eq(users.id, payload.sub)).limit(1);
-  if (!user || user.retiredAt) return null;
+  // `db.query.finished` on the request span (phase `auth`), so the time before
+  // the handler is attributed; a no-op outside a request (sockets).
+  const [row] = await createTraceDbQueryTracer("auth")("auth.user_by_id", async () => db.select({
+    id: users.id,
+    retiredAt: users.retiredAt,
+    traceUserId: users.traceUserId,
+    email: users.email,
+    emailVerified: users.emailVerified,
+    profileSetupCompletedAt: users.profileSetupCompletedAt,
+    name: users.name,
+    familyId: sessionFamilies.id,
+    familyRevokedAt: sessionFamilies.revokedAt,
+    familyRetiredAt: sessionFamilies.retiredAt,
+    familyScope: sessionFamilies.scope,
+    familySsoConnectionId: sessionFamilies.ssoConnectionId,
+    familySsoAuthenticatedAt: sessionFamilies.ssoAuthenticatedAt,
+    accountDeletionScheduledFor: accountDeletionRequests.scheduledFor,
+  })
+    .from(users)
+    .leftJoin(sessionFamilies, and(eq(sessionFamilies.id, familyId), eq(sessionFamilies.userId, users.id)))
+    .leftJoin(accountDeletionRequests, and(eq(accountDeletionRequests.userId, users.id), eq(accountDeletionRequests.state, "pending")))
+    .where(eq(users.id, payload.sub))
+    .limit(1));
+  if (!row || row.retiredAt) return null;
   // Same row read, so this request's spans export the user as trace_user_id.
-  rememberTraceUserId(user.id, user.traceUserId);
-  if (payload.familyId) {
-    const [family] = await db.select({ revokedAt: sessionFamilies.revokedAt })
-      .from(sessionFamilies).where(and(
-        eq(sessionFamilies.id, payload.familyId),
-        eq(sessionFamilies.userId, payload.sub),
-      )).limit(1);
-    if (!family || family.revokedAt) return null;
-  }
-  return payload;
+  rememberTraceUserId(row.id, row.traceUserId);
+  // A retired family (a device session a Computer ended for its own key,
+  // POST /api/computer/retire-session) is as unusable as a revoked one.
+  if (!row.familyId || !row.familyScope || row.familyRevokedAt || row.familyRetiredAt) return null;
+  const scope = row.familyScope;
+  // A device login's session is refused everywhere but requireAuth, which
+  // admits it on DEVICE_SESSION_ROUTES only: sockets, attachment links,
+  // optional-auth reads and everything else see no session at all.
+  // Fail closed: anything but a person's own `full` session needs the opt-in.
+  if (scope !== "full" && options.deviceSession !== "allow") return null;
+  if (row.accountDeletionScheduledFor && options.accountDeletionPending !== "allow") return null;
+  const sso = { connectionId: row.familySsoConnectionId, authenticatedAt: row.familySsoAuthenticatedAt };
+  const ssoCheck = await checkAccountSso({ userId: row.id, email: row.email, facts: sso, fresh: options.ssoFresh }, db);
+  return {
+    payload,
+    scope,
+    accountDeletionScheduledFor: row.accountDeletionScheduledFor,
+    sso,
+    ssoRequiredBy: ssoCheck.ok ? null : ssoCheck.serverId,
+    ssoExpiresAt: ssoCheck.ok ? ssoCheck.expiresAt : null,
+    account: {
+      userId: row.id,
+      emailVerified: row.emailVerified,
+      profileSetupCompletedAt: row.profileSetupCompletedAt,
+      name: row.name,
+    },
+  };
+}
+
+/** A live access token's payload; null too when a Server requiring SSO refuses this session (optional-auth reads see no session). */
+export async function verifyActiveAccessToken(token: string): Promise<JwtPayload | null> {
+  const verified = await verifyActiveAccessTokenWithAccount(token);
+  return verified && !verified.ssoRequiredBy ? verified.payload : null;
+}
+
+/** 403 SSO_REQUIRED with the stable link of the Server whose SSO to sign in with (RFC 083 §6.2). */
+export function respondSsoRequired(res: Response, serverId: string): void {
+  res.status(403).json({
+    error: SSO_REQUIRED_TEXT,
+    code: SSO_REQUIRED_CODE,
+    signInUrl: `${(process.env.SERVER_URL || "").replace(/\/$/, "")}/api/auth/sso/servers/${serverId}/start`,
+  });
+}
+
+/** Signing out always works, also for a session SSO no longer accepts. */
+function isSsoExemptRoute(method: string, originalUrl: string): boolean {
+  const path = originalUrl.split("?")[0]!.replace(/\/+$/, "");
+  return method.toUpperCase() === "POST" && path === "/api/auth/logout";
 }
 
 export async function getBearerAccessUserId(authHeader: string | undefined): Promise<string | null> {
   if (!authHeader?.startsWith("Bearer ")) return null;
   return (await verifyActiveAccessToken(authHeader.slice(7)))?.sub ?? null;
+}
+
+/**
+ * Like getBearerAccessUserId, plus the sign-in it belongs to, for an optional
+ * bearer on a route without requireAuth that may need step-up
+ * (routes/secondFactor.ts refuseWithoutRecentSecondFactor): `webFamilyId` is
+ * the token's own session family, a person's live `full` one (a device
+ * login's session is refused here, as by getBearerAccessUserId), read from
+ * the verified token, never from the body.
+ */
+export async function getBearerAccessSession(authHeader: string | undefined): Promise<{ userId: string; webFamilyId: string } | null> {
+  if (!authHeader?.startsWith("Bearer ")) return null;
+  const verified = await verifyActiveAccessTokenWithAccount(authHeader.slice(7));
+  const familyId = verified?.payload.familyId;
+  if (!verified || verified.scope !== "full" || !familyId || verified.ssoRequiredBy) return null;
+  return { userId: verified.payload.sub, webFamilyId: familyId };
 }
 
 export function respondInvalidOrExpiredToken(res: Response): void {
@@ -125,19 +282,115 @@ function isHtmlPreviewRequestForAttachment(req: Request, attachmentId: string): 
 }
 
 /**
- * Require a valid JWT access token. Sets req.userId.
+ * What a device login's session may call: the routes Raft Computer
+ * (`raft-computer login` / attach / adopt / start-stop / doctor) and the raft
+ * CLI (`raft agent login wait`, `raft agent list`) use it for, and nothing
+ * else — not sockets, not another device code's approval, not the web app.
+ * Matched on the request's own path (Express routes are case-insensitive).
  */
-export function requireAuth(req: Request, res: Response, next: NextFunction): void {
+const DEVICE_SESSION_ROUTES: ReadonlyArray<{ method: string; path: RegExp }> = [
+  { method: "GET", path: /^\/api\/auth\/me$/i },
+  { method: "POST", path: /^\/api\/computer\/attach$/i },
+  { method: "POST", path: /^\/api\/computer\/adopt-legacy$/i },
+  { method: "GET", path: /^\/api\/computer\/legacy-machines$/i },
+  { method: "GET", path: /^\/api\/servers$/i },
+  { method: "GET", path: /^\/api\/servers\/[^/]+\/machines$/i },
+  { method: "POST", path: /^\/api\/servers\/[^/]+\/machines\/[^/]+\/computer-lifecycle-operations$/i },
+  { method: "GET", path: /^\/api\/agents\/manageable$/i },
+  { method: "POST", path: /^\/api\/agents\/[^/]+\/credentials$/i },
+];
+
+/**
+ * The request path must be one the router reads exactly as this check does:
+ * a request target with `#`, `\`, whitespace or a control character is
+ * parsed differently by Express (parseurl falls back to url.parse, which cuts
+ * at `#` and turns `\` into `/`), so `/api/servers/S\invites#/machines`
+ * would pass as an allowed path and run another handler. Such a target is
+ * never admitted for a device session.
+ */
+export function isUnambiguousTarget(target: string): boolean {
+  if (!target.startsWith("/")) return false;
+  for (const ch of target) {
+    const code = ch.codePointAt(0)!;
+    if (ch === "#" || ch === "\\" || code <= 0x20 || code === 0x7f || /\s/.test(ch)) return false;
+  }
+  return true;
+}
+
+const DEVICE_SESSION_NOT_ALLOWED_TEXT =
+  "This sign-in came from a device login and only works for Raft Computer and the raft CLI. Sign in on the web to do this.";
+
+export function isDeviceSessionRoute(method: string, originalUrl: string): boolean {
+  if (!isUnambiguousTarget(originalUrl)) return false;
+  const path = originalUrl.split("?")[0]!.replace(/\/+$/, "") || "/";
+  return DEVICE_SESSION_ROUTES.some((route) => route.method === method.toUpperCase() && route.path.test(path));
+}
+
+/**
+ * What a person whose account is scheduled for deletion may call (design §6):
+ * read the deletion and cancel it. Signing out (POST /api/auth/logout) needs
+ * no access token. Everything else answers 403 `account_deletion_pending`
+ * with `scheduledFor`, which the web and the app show as the "your account
+ * will be deleted" page. Matched like DEVICE_SESSION_ROUTES.
+ */
+const ACCOUNT_DELETION_PENDING_ROUTES: ReadonlyArray<{ method: string; path: RegExp }> = [
+  { method: "GET", path: /^\/api\/me\/account\/deletion$/i },
+  { method: "DELETE", path: /^\/api\/me\/account\/deletion$/i },
+  { method: "DELETE", path: /^\/api\/me\/account\/deletion\/requests\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i },
+];
+
+export function isAccountDeletionPendingRoute(method: string, originalUrl: string): boolean {
+  if (!isUnambiguousTarget(originalUrl)) return false;
+  const path = originalUrl.split("?")[0]!.replace(/\/+$/, "") || "/";
+  return ACCOUNT_DELETION_PENDING_ROUTES.some((route) => route.method === method.toUpperCase() && route.path.test(path));
+}
+
+/**
+ * Require a valid JWT access token. Sets req.userId. A device login's session
+ * passes only on DEVICE_SESSION_ROUTES (403 `device_session_not_allowed`); a
+ * person whose account is scheduled for deletion only on
+ * ACCOUNT_DELETION_PENDING_ROUTES (403 `account_deletion_pending`).
+ */
+export function requireAuth(req: Request, res: Response, untracedNext: NextFunction): void {
+  const next = traceMiddlewarePhase("auth", untracedNext);
   const authHeader = req.headers.authorization;
   if (!authHeader?.startsWith("Bearer ")) {
     res.status(401).json({ error: "Missing or invalid Authorization header", code: "auth_required" });
     return;
   }
 
-  void verifyActiveAccessToken(authHeader.slice(7)).then((payload) => {
-    if (!payload) { respondInvalidOrExpiredToken(res); return; }
-    req.userId = payload.sub;
-    req.sessionFamilyId = payload.familyId;
+  // A personal assistant acting as its owner on one of the owner's own routes
+  // (services/assistantOwnerActions.ts); refused there for anything else.
+  if (isAgentApiKey(authHeader.slice(7))) {
+    void import("./assistantAsOwner")
+      .then(({ authenticateAssistantAsOwner }) => authenticateAssistantAsOwner(req, res, next, authHeader.slice(7)))
+      .catch(next);
+    return;
+  }
+
+  void verifyActiveAccessTokenWithAccount(authHeader.slice(7), { deviceSession: "allow", accountDeletionPending: "allow" }).then((verified) => {
+    if (!verified) { respondInvalidOrExpiredToken(res); return; }
+    if (verified.scope !== "full" && !isDeviceSessionRoute(req.method, req.originalUrl)) {
+      res.status(403).json({ error: DEVICE_SESSION_NOT_ALLOWED_TEXT, code: "device_session_not_allowed" });
+      return;
+    }
+    if (verified.accountDeletionScheduledFor && !isAccountDeletionPendingRoute(req.method, req.originalUrl)) {
+      res.status(403).json({
+        error: "This account is scheduled for deletion. Cancel the deletion to use it again.",
+        code: "account_deletion_pending",
+        scheduledFor: verified.accountDeletionScheduledFor.toISOString(),
+      });
+      return;
+    }
+    if (verified.ssoRequiredBy && !isSsoExemptRoute(req.method, req.originalUrl)) {
+      respondSsoRequired(res, verified.ssoRequiredBy);
+      return;
+    }
+    req.userId = verified.payload.sub;
+    req.sessionFamilyId = verified.payload.familyId;
+    req.sessionScope = verified.scope;
+    req.authAccount = verified.account;
+    req.ssoSession = verified.sso;
     next();
   }).catch(next);
 }
@@ -147,25 +400,50 @@ export function requireAuth(req: Request, res: Response, next: NextFunction): vo
 export function requireRetirementAuth(req: Request, res: Response, next: NextFunction): void {
   const authHeader = req.headers.authorization;
   if (!authHeader?.startsWith("Bearer ")) { respondInvalidOrExpiredToken(res); return; }
+  let payload: JwtPayload;
   try {
-    const payload = verifyToken(authHeader.slice(7));
-    if (payload.type !== "access") { respondInvalidOrExpiredToken(res); return; }
+    payload = verifyToken(authHeader.slice(7));
+  } catch { respondInvalidOrExpiredToken(res); return; }
+  // Every access token has a family (design v8 §5); one without is refused like elsewhere.
+  if (payload.type !== "access" || !payload.familyId) { respondInvalidOrExpiredToken(res); return; }
+  // Still no live-session check (a revoked family may retire), but a device
+  // login's session never retires an account: its scope is read, revoked or not.
+  void retirementFamilyScope(payload.familyId).then((scope) => {
+    if (scope !== "full") {
+      res.status(403).json({ error: DEVICE_SESSION_NOT_ALLOWED_TEXT, code: "device_session_not_allowed" });
+      return;
+    }
     req.userId = payload.sub;
     req.sessionFamilyId = payload.familyId;
     next();
-  } catch { respondInvalidOrExpiredToken(res); }
+  }).catch(next);
+}
+
+/** A token's family scope for retirement; null (refused) for a family that no longer exists. */
+async function retirementFamilyScope(familyId: string): Promise<SessionScope | null> {
+  const [family] = await getDb().select({ scope: sessionFamilies.scope }).from(sessionFamilies)
+    .where(eq(sessionFamilies.id, familyId)).limit(1);
+  return family?.scope ?? null;
 }
 
 /**
  * Require that the authenticated user has verified their email.
  * Must be used after requireAuth.
  */
-export async function requireVerified(req: Request, res: Response, next: NextFunction): Promise<void> {
-  const db = getDb();
-  const [user] = await db
+/**
+ * requireAuth's read of this request's account, only while it is still the
+ * request's user (a later delegation / proxy identity reads its own row).
+ */
+function authAccountOf(req: Request): AuthAccountState | undefined {
+  return req.authAccount && req.authAccount.userId === req.userId ? req.authAccount : undefined;
+}
+
+export async function requireVerified(req: Request, res: Response, untracedNext: NextFunction): Promise<void> {
+  const next = traceMiddlewarePhase("verified", untracedNext);
+  const user = authAccountOf(req) ?? (await getDb()
     .select({ emailVerified: users.emailVerified })
     .from(users)
-    .where(eq(users.id, req.userId!));
+    .where(eq(users.id, req.userId!)))[0];
 
   if (!user) {
     respondInvalidOrExpiredToken(res);
@@ -177,7 +455,8 @@ export async function requireVerified(req: Request, res: Response, next: NextFun
     return;
   }
 
-  await requireProfileSetupComplete(req, res, next);
+  // The untraced check: this phase (`verified`) already covers it.
+  await profileSetupComplete(req, res, next);
 }
 
 /**
@@ -190,11 +469,18 @@ export async function requireProfileSetupComplete(
   res: Response,
   next: NextFunction,
 ): Promise<void> {
-  const db = getDb();
-  const [user] = await db
+  await profileSetupComplete(req, res, traceMiddlewarePhase("profile_setup", next));
+}
+
+async function profileSetupComplete(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  const user = authAccountOf(req) ?? (await getDb()
     .select({ profileSetupCompletedAt: users.profileSetupCompletedAt, name: users.name })
     .from(users)
-    .where(eq(users.id, req.userId!));
+    .where(eq(users.id, req.userId!)))[0];
 
   if (!user) {
     respondInvalidOrExpiredToken(res);
@@ -219,24 +505,29 @@ export async function requireProfileSetupComplete(
  * Require X-Server-Id header and verify user is a member. Sets req.serverId.
  * Must be used after requireAuth.
  */
-export async function requireServer(req: Request, res: Response, next: NextFunction): Promise<void> {
+export async function requireServer(req: Request, res: Response, untracedNext: NextFunction): Promise<void> {
+  const next = traceMiddlewarePhase("server_membership", untracedNext);
   const serverId = req.headers["x-server-id"] as string;
   if (!serverId) {
     res.status(400).json({ error: "Missing X-Server-Id header" });
     return;
   }
-
   const db = getDb();
-  const [membership] = await db
-    .select({ serverId: serverMembers.serverId })
-    .from(serverMembers)
-    .innerJoin(servers, eq(serverMembers.serverId, servers.id))
-    .where(and(
-      eq(serverMembers.serverId, serverId),
-      eq(serverMembers.userId, req.userId!),
-      ne(servers.kind, "joint_storage"),
-      isNull(servers.deletedAt),
-    ));
+  // An id that is no UUID names no server: it is answered as one the caller
+  // isn't in, without the membership query (which would fail on it, as a 500).
+  const [membership] = typeof serverId !== "string" || !UUID_RE.test(serverId) ? [] : await createTraceDbQueryTracer("server_membership")(
+    "server_members.membership_by_user",
+    async () => db
+      .select({ serverId: serverMembers.serverId })
+      .from(serverMembers)
+      .innerJoin(servers, eq(serverMembers.serverId, servers.id))
+      .where(and(
+        eq(serverMembers.serverId, serverId),
+        eq(serverMembers.userId, req.userId!),
+        ne(servers.kind, "joint_storage"),
+        isNull(servers.deletedAt),
+      )),
+  );
 
   if (!membership) {
     res.status(403).json({ error: "Not a member of this server" });
@@ -259,16 +550,24 @@ export async function requireFlexAuth(req: Request, res: Response, next: NextFun
   if (authHeader?.startsWith("Bearer ")) {
     const token = authHeader.slice(7);
 
-    // Keep credential retirement identical to the internal machine surface.
+    // Machine credentials no longer read attachments (#proj-raft-computer:8e6a4629):
+    // the machine branch granted every attachment on the server, private channels
+    // and DMs included, and no daemon calls it. Agents download through
+    // /internal/agent-api/attachments with their own credential.
     if (token.startsWith("sk_machine_") || token.startsWith("sk_daemon_") || isComputerApiKey(token)) {
-      await requireMachineAuth(req, res, next);
+      const keyKind = isComputerApiKey(token) ? "computer" : "legacy_machine";
+      setRequestTraceMachineKeyKind(res, keyKind);
+      addTraceEvent("machine_auth.retired_route.rejected", { surface: "attachments", key_kind: keyKind });
+      res.status(403).json({ error: "Machine credentials cannot read attachments", code: "machine_key_route_retired" });
       return;
     }
 
-    const payload = await verifyActiveAccessToken(token);
-    if (payload) {
-      req.userId = payload.sub;
-      req.sessionFamilyId = payload.familyId;
+    const verified = await verifyActiveAccessTokenWithAccount(token);
+    if (verified?.ssoRequiredBy) { respondSsoRequired(res, verified.ssoRequiredBy); return; }
+    if (verified) {
+      req.userId = verified.payload.sub;
+      req.sessionFamilyId = verified.payload.familyId;
+      req.ssoSession = verified.sso;
       next();
       return;
     }
@@ -278,10 +577,12 @@ export async function requireFlexAuth(req: Request, res: Response, next: NextFun
   // check to their query bearer as to Authorization.
   const queryToken = typeof req.query.token === "string" ? req.query.token : null;
   if (queryToken) {
-    const payload = await verifyActiveAccessToken(queryToken);
-    if (payload) {
-      req.userId = payload.sub;
-      req.sessionFamilyId = payload.familyId;
+    const verified = await verifyActiveAccessTokenWithAccount(queryToken);
+    if (verified?.ssoRequiredBy) { respondSsoRequired(res, verified.ssoRequiredBy); return; }
+    if (verified) {
+      req.userId = verified.payload.sub;
+      req.sessionFamilyId = verified.payload.familyId;
+      req.ssoSession = verified.sso;
       next();
       return;
     }
@@ -372,9 +673,9 @@ export async function requireServerForFlex(req: Request, res: Response, next: Ne
     res.status(400).json({ error: "Missing X-Server-Id" });
     return;
   }
-
   const db = getDb();
-  const [membership] = await db
+  // As in requireServer: an id that is no UUID names no server.
+  const [membership] = !UUID_RE.test(serverId) ? [] : await db
     .select({ serverId: serverMembers.serverId })
     .from(serverMembers)
     .innerJoin(servers, eq(serverMembers.serverId, servers.id))
@@ -476,6 +777,17 @@ export async function requireServerMatchesParam(
   runWithTraceAttrs(serverIdHashAttrs(req.serverId), next);
 }
 
+/** The only machine-auth routes (method + path) a Computer (sk_computer_*) key may call. */
+export const COMPUTER_KEY_MACHINE_AUTH_ROUTES: ReadonlySet<string> = new Set([
+  "POST /internal/machine/scope-attestation",
+]);
+
+/** Bounded trace value: the surface, never ids from the path. */
+function retiredRouteSurface(route: string): string {
+  const [, root, surface] = route.split("/");
+  return root === "internal" && (surface === "agent" || surface === "machine") ? `internal_${surface}` : "other";
+}
+
 /**
  * Require machine API key authentication for /internal/* routes.
  * Sets req.machineId and req.serverId.
@@ -492,6 +804,7 @@ export async function requireMachineAuth(req: Request, res: Response, next: Next
 
   // Check if this is a machine API key (sk_machine_ or legacy sk_daemon_ prefix)
   if (apiKey.startsWith("sk_daemon_") || apiKey.startsWith("sk_machine_")) {
+    setRequestTraceMachineKeyKind(res, "legacy_machine");
     const machine = await findMachineByApiKey(apiKey);
     if (machine) {
       // RFC v8.2 §5.11.3: once a machine has been adopted into a Computer,
@@ -531,6 +844,7 @@ export async function requireMachineAuth(req: Request, res: Response, next: Next
   // attestation for trace-bundle upload) without falling back to a migrated
   // legacy sk_machine_* key.
   if (isComputerApiKey(apiKey)) {
+    setRequestTraceMachineKeyKind(res, "computer");
     const computer = await findComputerByApiKey(apiKey);
     if (!computer) {
       res.status(401).json({ error: "Invalid computer credential" });
@@ -548,6 +862,19 @@ export async function requireMachineAuth(req: Request, res: Response, next: Next
       .where(and(eq(servers.id, machine.serverId), isNull(servers.deletedAt)));
     if (!srv) {
       res.status(401).json({ error: "Server no longer exists" });
+      return;
+    }
+    // A Computer key reaches /internal/* only for what Computers use there.
+    // Everything else on this surface (the legacy /internal/agent/:id/* API acting
+    // as any agent on the machine, /internal/machine/* start/stop) is for legacy
+    // sk_machine_* daemons; Computer daemons go through sk_agent_* instead.
+    const route = `${req.baseUrl}${req.path}`;
+    if (!COMPUTER_KEY_MACHINE_AUTH_ROUTES.has(`${req.method} ${route}`)) {
+      addTraceEvent("machine_auth.retired_route.rejected", {
+        surface: retiredRouteSurface(route),
+        key_kind: "computer",
+      });
+      res.status(403).json({ error: "Computer credentials cannot call this route", code: "machine_key_route_retired" });
       return;
     }
     req.machineId = asMachineId(machine.id);
@@ -606,10 +933,23 @@ async function authenticateAgentCredential(
   | { ok: true }
   | { ok: false; status: number; body: Record<string, unknown> }
 > {
-  const credential = await findAgentCredentialByApiKey(apiKey);
-  if (!credential) {
+  const outcome = await authenticateAgentApiKey(apiKey);
+  if (!outcome.ok) {
+    // An expired key (#wg-rbac:#27) has its own code: its holder renews it
+    // and retries; nothing else is renewed. The request runs nothing.
+    if (outcome.reason === "expired") {
+      return {
+        ok: false,
+        status: 401,
+        body: { ...refusalBody({
+          code: AGENT_CREDENTIAL_EXPIRED_CODE,
+          error: "This agent credential has expired: renew it, or issue a new one, then send the request again.",
+        }) },
+      };
+    }
     return { ok: false, status: 401, body: { error: "Invalid agent credential" } };
   }
+  const credential = outcome.credential;
 
   // Reject if the credential's server has been deleted. Mirrors the
   // post-auth liveness check used by `requireMachineAuth`.
@@ -631,7 +971,7 @@ async function authenticateAgentCredential(
   // but verify again so semantics stay correct if the JOIN is removed.
   const agentLivenessStart = Date.now();
   const [agentRow] = await db
-    .select({ id: agents.id, runtime: agents.runtime, managedByAppInstallId: agents.managedByAppInstallId })
+    .select({ id: agents.id, runtime: agents.runtime, managedByAppInstallId: agents.managedByAppInstallId, assistantOwnerUserId: agents.assistantOwnerUserId })
     .from(agents)
     .where(and(eq(agents.id, credential.agentId), isNull(agents.deletedAt)));
   addTraceEvent("agent_credential_auth.agent_liveness.checked", {
@@ -640,6 +980,14 @@ async function authenticateAgentCredential(
   });
   if (!agentRow) {
     return { ok: false, status: 401, body: { error: "Agent no longer exists" } };
+  }
+
+  // An App-minted key belongs to a managed App Bot. Once its installation is
+  // gone (managed_by_app_install_id SET NULL by the cascade) the Bot is no
+  // longer managed by anything, and its key must not live on as an ordinary
+  // agent's.
+  if (credential.issuedVia === "app" && !agentRow.managedByAppInstallId) {
+    return { ok: false, status: 401, body: { error: "App bot binding not active" } };
   }
 
   // Managed app bot: verify the binding + install grant are still live.
@@ -710,6 +1058,20 @@ async function authenticateAgentCredential(
       (req.method === "POST" && path === "/internal/agent-api/raftbench/submit");
     if (!allowed) {
       return { ok: false, status: 403, body: { error: "This service agent can only check its identity, configure inbox delivery on its staging provider, receive run assignments, read its RaftBench context and submit its result.", code: "raftbench_read_only", suggestedNextAction: "Use the assigned RaftBench run to read context and submit a result. Do not send messages, edit tasks or try other operations; retrying will not help." } };
+    }
+  }
+
+  if (agentRow.assistantOwnerUserId) {
+    req.actingAgentAssistantOwnerUserId = agentRow.assistantOwnerUserId;
+    if (!isAssistantAgentApiRequestAllowed(req.method, req.originalUrl.split("?")[0])) {
+      addTraceEvent("agent_credential_auth.assistant_route_refused", { method: req.method });
+      return { ok: false, status: 403, body: { ...ASSISTANT_ROUTE_NOT_ALLOWED_BODY } };
+    }
+    // It acts as its owner: only while the owner's organization lets the owner (RFC 083 §6.2).
+    const [owner] = await getDb().select({ email: users.email }).from(users).where(eq(users.id, agentRow.assistantOwnerUserId));
+    if (owner && !(await assistantOwnerPassesSso({ userId: agentRow.assistantOwnerUserId, email: owner.email })).ok) {
+      addTraceEvent("agent_credential_auth.assistant_owner_sso_required", {});
+      return { ok: false, status: 403, body: { ...ASSISTANT_OWNER_SSO_REQUIRED_BODY } };
     }
   }
 

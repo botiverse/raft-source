@@ -283,13 +283,19 @@ function assertBuildIdentity(build, { buildId, channelId, channel, version, vers
   }
 }
 
+const PROMOTABLE_CANDIDATE_CHANNELS = new Set(["candidate", "alpha"]);
+
 async function findExistingBuild(api, appId, { version, versionCode, sourceCommit }) {
   const response = await api("GET", `/api/apps/${appId}/builds?version_name=${encodeURIComponent(version)}`);
   const matches = (response.builds ?? []).filter((build) => build.version_name === version && build.source === "external");
   if (matches.length !== 1) throw new Error(`Hands external build '${version}' resolved ${matches.length} times`);
+  // The RC build was created on the channel its candidate was published to:
+  // `candidate`, or `alpha` for RCs from before that channel existed.
+  if (!PROMOTABLE_CANDIDATE_CHANNELS.has(matches[0].channel)) {
+    throw new Error(`Hands external build identity mismatch for ${version}`);
+  }
   assertBuildIdentity(matches[0], {
     buildId: matches[0].id,
-    channel: "alpha",
     version,
     versionCode,
     sourceCommit,

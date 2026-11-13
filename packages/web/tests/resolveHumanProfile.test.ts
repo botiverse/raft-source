@@ -6,7 +6,6 @@ import type { ServerMember } from "../src/store/serverStore";
 const liveMember: ServerMember = {
   userId: "user-1",
   email: "member@example.com",
-  gravatarHash: "hash",
   name: "member",
   displayName: "Member",
   description: "live description",

@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 
-import { formatAttachmentComments, formatAttachmentDownloaded, formatAttachmentUploaded } from "./_format";
+import { formatAttachmentComments, formatAttachmentUploaded } from "./_format";
 
 // Byte pins: expected strings below are copied from the PRE-MOVE inline
-// literals in upload.ts/view.ts/comments.ts (print-seam S2), not from the new
+// literals in upload.ts/comments.ts (print-seam S2), not from the new
 // formatter code. The move must not change a single output byte.
 
 test("formatAttachmentUploaded matches pre-move upload.ts bytes", () => {
@@ -11,10 +11,6 @@ test("formatAttachmentUploaded matches pre-move upload.ts bytes", () => {
     formatAttachmentUploaded({ id: "aaaa1111-0000-0000-0000-000000000000", filename: "spec.md", sizeBytes: 12595 }),
     "File uploaded: spec.md (12.3KB)\nAttachment ID: aaaa1111-0000-0000-0000-000000000000\n\nUse this ID with raft message send --attachment-id aaaa1111-0000-0000-0000-000000000000 to include it in a message.\n",
   );
-});
-
-test("formatAttachmentDownloaded matches pre-move view.ts bytes", () => {
-  assert.equal(formatAttachmentDownloaded("/tmp/out/spec.md"), "Downloaded to: /tmp/out/spec.md\n");
 });
 
 test("formatAttachmentComments matches pre-move comments.ts bytes (empty and list)", () => {
@@ -51,5 +47,22 @@ test("formatAttachmentComments matches pre-move comments.ts bytes (empty and lis
       "[msg=bbbb2222 time=2026-08-31T08:00:00.000Z type=user] ✅ [anchor: L12–18] @richard: looks good\n" +
       "[msg=cccc3333 time=2026-08-31T08:01:00.000Z type=agent] @Alice: fixed\n" +
       "(full conversation lives in thread channel thread-chan-1)\n",
+  );
+});
+
+test("formatAttachmentUploaded: uploaded to a task ref, the hint is the task reply (raft message send refuses task refs)", () => {
+  const attachment = { id: "aaaa1111-0000-0000-0000-000000000000", filename: "spec.md", sizeBytes: 12595 };
+  assert.equal(
+    formatAttachmentUploaded(attachment, "#proj-launch:#2"),
+    "File uploaded: spec.md (12.3KB)\nAttachment ID: aaaa1111-0000-0000-0000-000000000000\n\nUse this ID with raft task reply \"#proj-launch:#2\" --attachment-id aaaa1111-0000-0000-0000-000000000000 to include it in a reply in the task's conversation.\n",
+  );
+  // Any other target: the message send hint, byte-identical to before.
+  assert.equal(
+    formatAttachmentUploaded(attachment, "#proj-launch"),
+    formatAttachmentUploaded(attachment),
+  );
+  assert.equal(
+    formatAttachmentUploaded(attachment, "#proj-launch:abcd1234"),
+    formatAttachmentUploaded(attachment),
   );
 });

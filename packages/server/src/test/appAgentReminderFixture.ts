@@ -29,8 +29,8 @@ export async function seedReminderWorld() {
   const agent = await createAgent(server.id, `RemLocal${suffix}`, { runtime: "claude", model: "sonnet" });
   const externalAgent = await createAgent(server.id, `RemExt${suffix}`, { runtime: "external", model: "external" });
   const foreignAgent = await createAgent(foreign.id, `RemForeign${suffix}`, { runtime: "claude", model: "sonnet" });
-  const agentKey = (await mintAgentCredential({ agentId: agent.id, scopes: ["send", "read"], name: "reminder-test", createdByUserId: null })).apiKey;
-  const externalAgentKey = (await mintAgentCredential({ agentId: externalAgent.id, scopes: ["send", "read"], name: "reminder-test", createdByUserId: null })).apiKey;
+  const agentKey = (await mintAgentCredential({ agentId: agent.id, scopes: ["send", "read"], name: "reminder-test", issuedVia: "computer", createdByUserId: null })).apiKey;
+  const externalAgentKey = (await mintAgentCredential({ agentId: externalAgent.id, scopes: ["send", "read"], name: "reminder-test", issuedVia: "computer", createdByUserId: null })).apiKey;
   return { owner, publisher, server, foreign, agent, agentKey, externalAgent, externalAgentKey, foreignAgent };
 }
 

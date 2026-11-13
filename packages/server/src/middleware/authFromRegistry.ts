@@ -25,8 +25,16 @@ import {
 } from "./routeAuthPolicy";
 import { requireMachineAuth, requireAgentCredentialAuth, requireComputerAuth } from "./auth";
 
+/**
+ * The request path as the registry compares it: lower-cased, because Express
+ * routes case-insensitively (`case sensitive routing` is off), so
+ * `/INTERNAL/COMPUTER/...` reaches the same router as `/internal/computer/...`.
+ * Compared case-sensitively, such a path was not under a claimed prefix and
+ * passed through unauthenticated. Registry paths are lower-case, and a
+ * `:param` segment matches any value, so lower-casing loses nothing.
+ */
 function fullRequestPath(req: Request): string {
-  return `${req.baseUrl ?? ""}${req.path ?? ""}` || req.path;
+  return (`${req.baseUrl ?? ""}${req.path ?? ""}` || req.path).toLowerCase();
 }
 
 function isClaimedPrefix(reqPath: string): boolean {
@@ -53,7 +61,7 @@ function pathMatches(reqPath: string, pattern: string): boolean {
   for (let i = 0; i < patSegs.length; i++) {
     const pat = patSegs[i];
     if (pat.startsWith(":")) continue;
-    if (pat !== reqSegs[i]) return false;
+    if (pat.toLowerCase() !== reqSegs[i]) return false;
   }
   return true;
 }

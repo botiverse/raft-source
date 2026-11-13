@@ -1,19 +1,29 @@
 import { useEffect, useMemo, useState } from "react";
+import { useIntl } from "react-intl";
 import type { ParsedRaftPermalink } from "@botiverse/raft-shared";
 import { Card, Skeleton } from "@botiverse/raft-ui";
 import api from "../../api/client";
 import { useAgentStore } from "../../store/agentStore";
 import { useAuthStore } from "../../store/authStore";
 import { useChannelStore } from "../../store/channelStore";
+import { findStoredChannel } from "../../store/storedChannel";
+import type { Channel } from "../../store/channelStore";
 import type { Message } from "../../store/messageStore";
 import { useServerStore } from "../../store/serverStore";
 import { buildQuotedMessageContextRequest } from "./messageContextRequest";
 import { QuoteCardContent } from "./QuoteCardContent";
+import QuotedMessageCard from "../ui/cards/QuotedMessageCard";
+import { readHistoryLimitedError } from "../../store/hiddenHistoryStore";
+import type { HiddenHistoryMessage } from "../../store/hiddenHistoryStore";
+import { useTimeFormatter } from "../../hooks/useTimeFormatter";
+import { OlderMessageNotice } from "./HistoryWindowNotices";
 
 type PreviewState =
   | { status: "loading" }
   | { status: "loaded"; target: Message; channelArchived: boolean }
-  | { status: "unavailable" };
+  | { status: "unavailable" }
+  /** Behind the plan's history window: who sent it and when, not what. */
+  | { status: "older"; target: HiddenHistoryMessage };
 
 export default function QuotedMessagePermalinkPreview({
   permalink,
@@ -27,6 +37,7 @@ export default function QuotedMessagePermalinkPreview({
   const [state, setState] = useState<PreviewState>({ status: "loading" });
   const channels = useChannelStore((s) => s.channels);
   const dmChannels = useChannelStore((s) => s.dmChannels);
+  const loungeChannels = useChannelStore((s) => s.loungeChannels);
   const agents = useAgentStore((s) => s.agents);
   const members = useServerStore((s) => s.members);
   const currentUser = useAuthStore((s) => s.user);
@@ -54,11 +65,17 @@ export default function QuotedMessagePermalinkPreview({
           onUnavailable?.();
         }
       })
-      .catch(() => {
-        if (!cancelled) {
-          setState({ status: "unavailable" });
-          onUnavailable?.();
+      .catch((error: unknown) => {
+        if (cancelled) return;
+        // Older than the plan's history window: the quote keeps its header and
+        // says so, with the upgrade (the link stays a link, not "unavailable").
+        const older = readHistoryLimitedError(error)?.hiddenTarget?.target;
+        if (older) {
+          setState({ status: "older", target: older });
+          return;
         }
+        setState({ status: "unavailable" });
+        onUnavailable?.();
       });
 
     return () => {
@@ -67,8 +84,8 @@ export default function QuotedMessagePermalinkPreview({
   }, [onUnavailable, permalink.channelId, permalink.messageId, permalink.threadParentMessageId]);
 
   const channel = useMemo(
-    () => channels.find((entry) => entry.id === permalink.channelId) ?? dmChannels.find((entry) => entry.id === permalink.channelId),
-    [channels, dmChannels, permalink.channelId],
+    () => findStoredChannel({ channels, dmChannels, loungeChannels }, permalink.channelId),
+    [channels, dmChannels, loungeChannels, permalink.channelId],
   );
 
   if (state.status === "loading") {
@@ -77,7 +94,7 @@ export default function QuotedMessagePermalinkPreview({
         <div className="h-[34px] border-b border-line-hairline" />
         <div className="flex gap-3 px-3 py-2.5">
           <Skeleton className="size-7 shrink-0" />
-          <div className="flex-1 space-y-2">
+          <div className="flex-1 stack-y-2">
             <Skeleton variant="line" className="w-32" />
             <Skeleton variant="line" className="w-full" />
             <Skeleton variant="line" className="w-3/4" />
@@ -91,6 +108,10 @@ export default function QuotedMessagePermalinkPreview({
     return null;
   }
 
+  if (state.status === "older") {
+    return <OlderQuoteCard target={state.target} channel={channel} permalink={permalink} />;
+  }
+
   return (
     <QuoteCardContent
       target={state.target}
@@ -101,6 +122,38 @@ export default function QuotedMessagePermalinkPreview({
       members={members}
       currentUser={currentUser}
       onOpen={onOpen}
+    />
+  );
+}
+
+/** A quoted message behind the plan's history window: its header, then the line that says so. */
+function OlderQuoteCard({ target, channel, permalink }: {
+  target: HiddenHistoryMessage;
+  channel: Channel | undefined;
+  permalink: ParsedRaftPermalink;
+}) {
+  const { formatMessage } = useIntl();
+  const { formatShortDateTime } = useTimeFormatter();
+  const author = useMemo(() => ({
+    name: target.senderName || formatMessage({ id: "message.historyPaywall.unknownSender" }),
+    kind: target.senderType,
+    avatar: target.senderAvatarUrl ?? undefined,
+  }), [formatMessage, target.senderAvatarUrl, target.senderName, target.senderType]);
+  return (
+    <QuotedMessageCard
+      channelName={
+        channel
+          ? channel.type === "dm"
+            ? (channel.peerDisplayName || channel.peerName || channel.name)
+            : channel.name
+          : formatMessage({ id: permalink.routeKind === "dm" ? "message.quote.directMessage" : "message.quote.channelFallback" })
+      }
+      channelKind={permalink.routeKind}
+      isThread={Boolean(permalink.threadParentMessageId)}
+      timestamp={formatShortDateTime(target.createdAt).replace(",", " ·")}
+      author={author}
+      content=""
+      notice={<OlderMessageNotice surface="quoted_message" testId="quoted-message-older" />}
     />
   );
 }

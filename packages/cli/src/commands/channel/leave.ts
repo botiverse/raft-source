@@ -3,6 +3,7 @@
 
 import type { Command } from "commander";
 import type { AgentApiResponseByRoute } from "@botiverse/raft-shared";
+import { formatChannelDeletedWithLastMember, formatLastMemberRefusal, LAST_MEMBER_DELETES_CHANNEL } from "@botiverse/raft-shared/src/agentCliSurface";
 
 import { createAgentApiSurfaceClient } from "../../agentApiPath";
 import { defineCommand, registerCliCommand } from "../../core/command";
@@ -12,6 +13,7 @@ import { writeText, adoptCliReplyText } from "../../core/renderer";
 
 interface LeaveOpts {
   target?: string;
+  deleteIfLast?: boolean;
 }
 
 type ChannelLeaveResponse = AgentApiResponseByRoute["channelLeave"];
@@ -24,6 +26,7 @@ export function parseRegularChannelTarget(target: string): string | null {
 }
 
 export function formatLeaveChannelResult(target: string, result?: ChannelLeaveResponse): string {
+  if (result?.channelDeleted) return formatChannelDeletedWithLastMember(target);
   const lines = [
     `Left ${target}. You can still inspect visible public channel history there, but you can no longer send or receive ordinary channel delivery until you join the public channel again or a human re-adds you to a private channel.`,
   ];
@@ -50,6 +53,10 @@ export const channelLeaveCommand = defineCommand(
       {
         flags: "--target <target>",
         description: "Channel to leave, e.g. '#engineering'",
+      },
+      {
+        flags: "--delete-if-last",
+        description: "If you are a private channel's last member, leave anyway: that deletes the channel and all its messages, which can't be undone (without it, that leave is refused)",
       },
     ],
   },
@@ -88,8 +95,12 @@ export const channelLeaveCommand = defineCommand(
 
     const leaveRes = await agentApi.channels.leave({
       channelId: channel.id,
-    });
+    }, opts.deleteIfLast ? { deleteIfLast: true } : {});
     if (!leaveRes.ok) {
+      if (leaveRes.errorCode === LAST_MEMBER_DELETES_CHANNEL) {
+        const { message, nextAction } = formatLastMemberRefusal({ target });
+        throw new CliError({ code: "LAST_MEMBER", message, suggestedNextAction: nextAction });
+      }
       throw new CliError({
         code: leaveRes.status >= 500 ? "SERVER_5XX" : "LEAVE_FAILED",
         message: leaveRes.error ?? `HTTP ${leaveRes.status}`,

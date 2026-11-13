@@ -34,6 +34,7 @@ const MATERIALIZATION_WAIT_MS = 1_000;
 const MAX_INBOUND_ATTACHMENT_BATCH_BYTES = 512 * 1024 * 1024;
 
 class InboundAttachmentAuthorityError extends Error {}
+class InboundAttachmentPausedError extends Error {}
 
 export interface ExternalInboundAttachmentWorkerDependencies {
   storage: StorageBackend;
@@ -42,7 +43,8 @@ export interface ExternalInboundAttachmentWorkerDependencies {
     authority: ExternalAttachmentAuthority,
     sourceActorProjectionId: string,
     executor?: DatabaseExecutor,
-  ): Promise<boolean>;
+    custody?: { factId: string; eventId: string; providerFileId: string },
+  ): Promise<boolean | "paused">;
   maximumFileSizeBytes(serverId: string, now: Date): Promise<number>;
   now?(): Date;
 }
@@ -195,13 +197,14 @@ export async function processExternalInboundAttachmentOnce(input: {
   }
 
   const requireCurrentAuthority = async (executor?: DatabaseExecutor) => {
-    if (!await input.dependencies.authorityIsCurrent(
+    const authority = await input.dependencies.authorityIsCurrent(
       work.authority,
       work.sourceActorProjectionId,
       executor,
-    )) {
-      throw new InboundAttachmentAuthorityError("attachment_authority_revoked");
-    }
+      { factId: work.messageFact.id, eventId: work.event.id, providerFileId: work.asset.providerFileId },
+    );
+    if (authority === "paused") throw new InboundAttachmentPausedError("bridge_disabled");
+    if (!authority) throw new InboundAttachmentAuthorityError("attachment_authority_revoked");
   };
 
   const reuseStoredAsset = async (
@@ -405,7 +408,9 @@ export async function processExternalInboundAttachmentOnce(input: {
     };
   } catch (error) {
     const now = input.dependencies.now?.() ?? currentDate();
-    const failure: ExternalAttachmentProviderFailure = error instanceof InboundAttachmentAuthorityError
+    const failure: ExternalAttachmentProviderFailure = error instanceof InboundAttachmentPausedError
+      ? { class: "transient", reason: "bridge_disabled", retryAfterMs: DEFAULT_RETRY_MS, scope: "occurrence_local" }
+      : error instanceof InboundAttachmentAuthorityError
       ? {
         class: "authority_revoked",
         reason: "attachment_authority_revoked",
@@ -455,6 +460,9 @@ export function createExternalInboundAttachmentWorkerRuntime(input: {
   leaseOwner: string;
   dependencies: ExternalInboundAttachmentWorkerDependencies;
   intervalMs?: number;
+  onResult?(result: ExternalInboundAttachmentWorkerResult): void;
+  /** A tick that throws; a tick aborted by stop() is not reported. */
+  onError?(error: unknown): void;
 }) {
   const intervalMs = input.intervalMs ?? 1_000;
   if (!Number.isSafeInteger(intervalMs) || intervalMs <= 0) {
@@ -465,13 +473,16 @@ export function createExternalInboundAttachmentWorkerRuntime(input: {
   let controller: AbortController | null = null;
   const tick = () => {
     if (running) return;
-    controller = new AbortController();
+    const tickController = new AbortController();
+    controller = tickController;
     running = processExternalInboundAttachmentOnce({
       db: input.db,
       leaseOwner: input.leaseOwner,
       dependencies: input.dependencies,
-      signal: controller.signal,
-    }).catch(() => undefined).finally(() => {
+      signal: tickController.signal,
+    }).then((result) => input.onResult?.(result)).catch((error: unknown) => {
+      if (!tickController.signal.aborted) input.onError?.(error);
+    }).finally(() => {
       running = null;
       controller = null;
     });

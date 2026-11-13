@@ -44,7 +44,20 @@ export const channelInfoCommand = defineCommand(
       });
     }
 
-    const channel = (infoRes.data?.channels ?? []).find((candidate) => candidate.name === name);
+    let channel = (infoRes.data?.channels ?? []).find((candidate) => candidate.name === name);
+    // Not a live channel: it may be archived (read-only, still readable), which
+    // server info leaves out. Ask once more for the archived ones.
+    if (!channel && (infoRes.data?.archivedChannelCount ?? 0) > 0) {
+      const archivedRes = await agentApi.server.info({ archived: "include" });
+      if (!archivedRes.ok) {
+        throw new CliError({
+          code: archivedRes.status >= 500 ? "SERVER_5XX" : "INFO_FAILED",
+          message: archivedRes.error ?? `HTTP ${archivedRes.status}`,
+        });
+      }
+      const row = (archivedRes.data?.archivedChannels ?? []).find((candidate) => candidate.name === name);
+      if (row) channel = { ...row, archived: true };
+    }
     if (!channel) {
       throw new CliError({
         code: "NOT_FOUND",

@@ -1,5 +1,5 @@
 import { useCallback, useState } from "react";
-import type { ReactNode } from "react";
+import type { MouseEvent, ReactNode } from "react";
 import { useIntl } from "react-intl";
 import {
   AlertDialog,
@@ -10,9 +10,11 @@ import {
   AlertDialogFooter,
   AlertDialogHeader,
   AlertDialogTitle,
+  MarkdownLink,
 } from "@botiverse/raft-ui";
+import { STANDARD_EXTERNAL_LINK_SCHEMES } from "@botiverse/raft-shared";
 
-const STANDARD_LINK_PROTOCOLS = new Set(["http", "https", "mailto"]);
+const STANDARD_LINK_PROTOCOLS = new Set(STANDARD_EXTERNAL_LINK_SCHEMES);
 
 /**
  * True when an href carries a non-standard scheme (obsidian:// and friends)
@@ -43,18 +45,28 @@ export function CustomProtocolLink({ href, children }: { href: string; children?
     setConfirmOpen(false);
   }, [href]);
 
+  const handleClick = useCallback((event: MouseEvent<HTMLAnchorElement>) => {
+    event.preventDefault();
+    setConfirmOpen(true);
+  }, []);
+  const handleAuxClick = useCallback((event: MouseEvent<HTMLAnchorElement>) => {
+    if (event.button !== 1) return;
+    event.preventDefault();
+    setConfirmOpen(true);
+  }, []);
+
   return (
     <>
-      <a
+      <MarkdownLink
         href={href}
-        className="text-foreground-link underline decoration-2 underline-offset-2 hover:decoration-attention select-text"
-        onClick={(event) => {
-          event.preventDefault();
-          setConfirmOpen(true);
-        }}
+        onClick={handleClick}
+        // A middle click fires auxclick, not click, and the browser would open
+        // the href as a new window; on desktop that reaches the shell's
+        // window-open path, which opens these schemes. Ask first here too.
+        onAuxClick={handleAuxClick}
       >
         {children}
-      </a>
+      </MarkdownLink>
       <AlertDialog open={confirmOpen} onOpenChange={setConfirmOpen}>
         <AlertDialogContent data-testid="custom-protocol-link-confirm">
           <AlertDialogHeader>

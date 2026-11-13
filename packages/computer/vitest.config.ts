@@ -5,6 +5,8 @@ export default defineConfig({
     globals: true,
     environment: "node",
     include: ["src/**/*.test.ts", "scripts/native/*.test.mjs"],
+    // No test sees the launching agent's Raft home or identity.
+    setupFiles: ["../../scripts/vitest/clearAgentEnv.ts"],
     pool: "forks",
     // The previous Node runner imposed no per-test or per-hook timeout. Keep
     // that contract and let the existing job watchdogs bound hangs.

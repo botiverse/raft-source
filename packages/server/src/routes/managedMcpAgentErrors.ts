@@ -39,6 +39,9 @@ export function managedMcpAgentErrorMessage(code: string, context: { serverName?
     const prefix = context.mcpServerId ? ` (its tools' names contain ${formatManagedMcpRuntimeToolPrefix(context.mcpServerId)})` : "";
     return `${server}${prefix} is no longer available to you; don't call its tools again. If you still need it, tell the person who asked.`;
   }
+  if (code === "managed_mcp_endpoint_blocked") {
+    return `${server} was blocked by the server's network security check. Ask a server administrator to check its network or proxy settings; do not retry until this is resolved.`;
+  }
   if (UNAVAILABLE_CODES.has(code)) {
     return `${server} can't be reached right now; try again in a minute, and if it keeps failing, tell the person who asked.`;
   }

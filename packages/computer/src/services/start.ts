@@ -12,6 +12,8 @@
 //     failure; cause retained in-process only — adapters MUST NOT forward it.
 //   - §6 closed-set codes preserved BYTE-IDENTICAL: NO_ATTACHMENT /
 //     NOT_ATTACHED / SUPERVISOR_SPAWN_FAILED / START_DAEMON_TIMEOUT.
+//     START_RUNNER_LOCK_CONFLICT (a runner held off by another daemon's
+//     machine lock) is reported before that timeout.
 //   - AbortSignal honored before EACH network/process boundary AND before
 //     spawn. POST-SPAWN abort = no-op (returns StartResult with
 //     status="aborted"). NEVER SIGKILL detached service (Hao
@@ -35,11 +37,12 @@ import {
   type SupervisorInspection,
   type SystemctlRunner,
 } from "../externalSupervisor";
+import { detectLogindSessionRisk } from "../logindSessionRisk";
 import { setTimeout as delay } from "node:timers/promises";
 
 import { currentTimeMs } from "@botiverse/raft-shared";
-import { isProcessAlive, readPidfileAt } from "../internal/process-primitives";
-import { findLiveServicePid } from "../internal/service-pid-fallback";
+import { clearPidfileAt, isProcessAlive, readPidfileAt } from "../internal/process-primitives";
+import { findLiveServicePid, serviceEndpointAnswers, type ServicePidIdentityDeps } from "../internal/service-pid-fallback";
 import {
   PARENT_LOCK_HELD_ENV_VAR,
   readServiceVersionEvidence,
@@ -50,7 +53,9 @@ import { connectService } from "../lib/ipc-client";
 import {
   describeRaftHomeConflict,
   findRaftHomeConflictFor,
+  serverRunnerLockConflictPath,
   serverRunnerLogReadFallback,
+  serverRunnerPidReadFallback,
   serviceLogPath,
   serviceVersionPath,
 } from "../paths";
@@ -62,7 +67,8 @@ import { ComputerServiceError } from "./errors";
 import { COMPUTER_VERSION } from "../version";
 import { hasUnlinkedComputerHandshake, readRunnerLogTail } from "../internal/runner-log-diagnostics";
 import { collectMachineFacts } from "../machineFacts";
-import { machineReadiness } from "../machineReadiness";
+import { machineReadiness, type MachineReadinessReason, type StartReadinessReport } from "../machineReadiness";
+import { clearRunnerLockConflictMarker, lockOwnerCheckCommand } from "../runnerLockConflict";
 import {
   convergeCliHostLifecycle,
   hostLifecycleSkipped,
@@ -122,7 +128,7 @@ export interface StartResult {
   serviceLogPath: string;
 }
 
-export interface StartDeps {
+export interface StartDeps extends ServicePidIdentityDeps {
   /** Test seams (default to module-level real impls). Mirrors the
    *  pre-extraction `RunStartDeps` shape so existing service.test.ts
    *  test cases keep working through the adapter. */
@@ -132,6 +138,22 @@ export interface StartDeps {
   sleep?: (ms: number) => Promise<void>;
   ensureTimeoutMs?: number;
   ensurePollIntervalMs?: number;
+  /**
+   * When some managed runners are ready and the rest are not by the deadline,
+   * succeed (event `start.partial_ready`) instead of START_DAEMON_TIMEOUT.
+   * Set only for the external installer, which judges an upgrade by this exit
+   * code: a machine still registered on a server it can no longer reach never
+   * has that runner ready, and the installer rolled back working upgrades
+   * (88602a54, 9e56ad23, 2026-11-02). Only runners alive and merely not
+   * connected, or held off by another daemon's machine lock, are excused
+   * (acceptsPartialReady); none ready still fails.
+   */
+  acceptPartialReady?: boolean;
+  /**
+   * Told what the readiness wait saw, once, just before the start succeeds or
+   * fails on it. Best-effort: a throw here never changes the start.
+   */
+  onReadiness?: (report: StartReadinessReport) => void;
   /** Foreground service loop. Default: real `runService`. */
   runService?: typeof runService;
   /** Test seam for explicit start/restart retry recovery. */
@@ -155,6 +177,8 @@ export interface StartDeps {
   releaseMutationLock?: (slockHome: string) => Promise<unknown>;
   /** task #915: refuses when both default homes hold Raft data and no RAFT_HOME picks one. */
   findRaftHomeConflict?: typeof findRaftHomeConflictFor;
+  /** task #37: whether a detached service started here stops when the login session ends. */
+  detectLogindSessionRisk?: typeof detectLogindSessionRisk;
 }
 
 export interface StartOptions extends StartDeps {
@@ -176,6 +200,7 @@ async function readStartReadiness(
   slockHome: string,
   serverIds: string[],
   opts: StartOptions,
+  servicePid?: number,
 ) {
   const facts = await collectMachineFacts(slockHome, {
     runnerServerIds: serverIds,
@@ -185,15 +210,37 @@ async function readStartReadiness(
   return machineReadiness(facts, {
     targetServerIds: serverIds,
     expectedVersion: COMPUTER_VERSION,
+    ...(servicePid !== undefined ? { servicePid } : {}),
   });
 }
 
+type LockConflictReason = Extract<MachineReadinessReason, { code: "runner-lock-conflict" }>;
+
+function lockConflictsOf(reasons: readonly MachineReadinessReason[]): LockConflictReason[] {
+  return reasons.filter((reason): reason is LockConflictReason => reason.code === "runner-lock-conflict");
+}
+
+interface ManagedDaemonWait {
+  ready: Map<string, number>;
+  /** Runners the service reported held off by another daemon's machine lock. */
+  lockConflicts: LockConflictReason[];
+  /** Why each runner still missing was not ready, at the wait's last read. */
+  reasons: readonly MachineReadinessReason[];
+}
+
+/**
+ * Wait until every managed runner is ready or the deadline passes. A runner
+ * held off by another daemon's machine lock will not become ready on its own,
+ * so the wait ends early on one: at once for a person's start (which fails on
+ * it), and once every runner still missing is one under `acceptPartialReady`.
+ */
 async function waitForManagedDaemonPids(
   slockHome: string,
   serverIds: string[],
   opts: StartOptions,
+  servicePid: number,
   observeAbort = true,
-): Promise<Map<string, number>> {
+): Promise<ManagedDaemonWait> {
   const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   const timeoutMs = opts.ensureTimeoutMs ?? START_ENSURE_TIMEOUT_MS;
   const pollIntervalMs = opts.ensurePollIntervalMs ?? START_ENSURE_POLL_INTERVAL_MS;
@@ -205,14 +252,18 @@ async function waitForManagedDaemonPids(
 
   for (;;) {
     throwIfAborted();
-    const verdict = await readStartReadiness(slockHome, serverIds, opts);
+    const verdict = await readStartReadiness(slockHome, serverIds, opts, servicePid);
     ready = new Map(verdict.runnerPids);
     if (verdict.ready) {
       throwIfAborted();
-      return ready;
+      return { ready, lockConflicts: [], reasons: [] };
+    }
+    const lockConflicts = lockConflictsOf(verdict.reasons);
+    if (lockConflicts.length > 0 && (!opts.acceptPartialReady || lockConflicts.length === verdict.reasons.length)) {
+      return { ready, lockConflicts, reasons: verdict.reasons };
     }
     const remaining = deadline - Date.now();
-    if (remaining <= 0) return ready;
+    if (remaining <= 0) return { ready, lockConflicts, reasons: verdict.reasons };
     await sleep(Math.min(pollIntervalMs, remaining));
   }
 }
@@ -344,6 +395,71 @@ async function selectStartableTargets(
     );
   }
   return { startable, unlinked };
+}
+
+/**
+ * Forget the runner pids (and lock-conflict records) an earlier service wrote:
+ * the service about to start has no runner yet. A runner that outlived its
+ * service still holds the daemon machine lock, so the new service's runner
+ * meets that lock and the service records that pid again
+ * (runnerLockConflict.ts). The connected marker stays: only the runner itself
+ * writes it, so nothing would bring back the one such a runner wrote.
+ */
+async function clearRunnerRecordsLeftByEarlierService(slockHome: string, serverIds: readonly string[]): Promise<void> {
+  for (const serverId of serverIds) {
+    for (const pidfile of serverRunnerPidReadFallback(slockHome, serverId)) await clearPidfileAt(pidfile);
+    await clearRunnerLockConflictMarker(serverRunnerLockConflictPath(slockHome, serverId)).catch(() => undefined);
+  }
+}
+
+/**
+ * The runner exited because another process holds this machine key's daemon
+ * lock, and the service deferred to it. Say who holds it and how to tell
+ * whether it is really a Raft daemon: on Windows a pid can belong to an
+ * unrelated program by now. `serviceStopped` (doctor, after a stop): no
+ * service is deferring to anything; the lock's holder is all that is known.
+ */
+export function buildLockConflictMessage(
+  slockHome: string,
+  conflicts: readonly LockConflictReason[],
+  input: Pick<StartInput, "serverId" | "serverLabel">,
+  serviceStopped = false,
+): string {
+  const conflict = conflicts[0]!;
+  const label = input.serverId === conflict.serverId ? input.serverLabel ?? conflict.serverId : conflict.serverId;
+  const lock = conflict.lockPath ? ` Lock: ${conflict.lockPath}.` : "";
+  const others = conflicts.length > 1
+    ? ` Also blocked: ${conflicts.slice(1).map((other) => other.serverId).join(", ")}.`
+    : "";
+  const logs = `Inspect ${serviceLogPath(slockHome)} and ${serverRunnerLogReadFallback(slockHome, conflict.serverId)[0]} for details.`;
+  if (conflict.ownerPid === null) {
+    return (
+      `Cannot start ${label}: its runner found this machine's daemon lock held, but no live owner could be identified, ` +
+      `so the Computer service is not retrying it.${lock}${others} ` +
+      `Make sure no other Raft daemon or Computer runs with this machine key, then run \`raft-computer restart\`.` +
+      (conflict.lockPath ? ` If it still reports this lock, delete ${conflict.lockPath} and restart again.` : "") +
+      ` ${logs}`
+    );
+  }
+  const pid = conflict.ownerPid;
+  const check = lockOwnerCheckCommand(pid);
+  // A restart alone can meet the same lock: the daemon keeps a lock held
+  // whenever it cannot prove the owner is gone (a lock from an older daemon
+  // on Linux, an owner start time it cannot read).
+  return (
+    (serviceStopped
+      ? `The Computer service is not running, and pid ${pid} holds this machine's daemon lock: it could not be confirmed as ${label}'s runner.`
+      : `Cannot start ${label}: pid ${pid} holds this machine's daemon lock, ` +
+        `so the Computer service is deferring to it instead of starting its own runner.`) +
+    `${lock}${others} ` +
+    `Check whether pid ${pid} is really a Raft daemon with ${check}. ` +
+    `If it is, stop that daemon first; if it is another program (the daemon that held the lock is gone and its pid was reused), ` +
+    `run \`raft-computer restart\` to start this server's runner again.` +
+    (conflict.lockPath
+      ? ` Once you have confirmed pid ${pid} is not a Raft daemon, you can delete ${conflict.lockPath}: a restart alone may meet the same lock (on Linux, or when the daemon cannot read that pid's start time).`
+      : "") +
+    ` ${logs}`
+  );
 }
 
 async function buildTimeoutMessage(
@@ -481,9 +597,14 @@ async function startInner(input: StartInput, options: StartOptions = {}): Promis
   //    Computer (RFC v9.8 §1) — the symmetry has to hold across stop /
   //    upgrade / start / status. The helper clears stale candidates in
   //    place so they do not haunt later reads.
+  //    A live pid that is another program (the service ended with its
+  //    sign-in session and its pid was reused) is such a stale candidate:
+  //    not "already running", so the start goes on and spawns the service.
   const { pid: existing } = await findLiveServicePid(slockHome, {
     readPidfile: options.readPidfile,
     isProcessAlive: options.isProcessAlive,
+    endpointAnswers: options.endpointAnswers,
+    processStartTimeMs: options.processStartTimeMs,
   });
   options.signal?.throwIfAborted?.();
   await clearDegradedRecoveryStateForStart(slockHome, managedTargets, existing, options);
@@ -497,8 +618,19 @@ async function startInner(input: StartInput, options: StartOptions = {}): Promis
       managedTargets,
       attachedCount: attached.length,
     });
-    const ready = await waitForManagedDaemonPids(slockHome, managedTargets, options);
-    if (ready.size !== managedTargets.length) {
+    const waitStartedAtMs = Date.now();
+    const wait = await waitForManagedDaemonPids(slockHome, managedTargets, options, existing);
+    const { ready, lockConflicts } = wait;
+    const notReady = ready.size === managedTargets.length ? null : await acceptsPartialReady(slockHome, options, ready, managedTargets, existing);
+    reportStartReadiness(options, managedTargets, wait, {
+      partial: notReady !== null,
+      unlinked: unlinked.length,
+      waitedMs: Date.now() - waitStartedAtMs,
+    });
+    if (ready.size !== managedTargets.length && !notReady) {
+      if (lockConflicts.length > 0) {
+        throw new ComputerServiceError("START_RUNNER_LOCK_CONFLICT", buildLockConflictMessage(slockHome, lockConflicts, input));
+      }
       const message = await buildTimeoutMessage(slockHome, managedTargets, ready, input);
       options.signal?.throwIfAborted?.();
       throw new ComputerServiceError(
@@ -506,7 +638,9 @@ async function startInner(input: StartInput, options: StartOptions = {}): Promis
         message,
       );
     }
-    emit(options, { kind: "start.ready", ready, managedTargets });
+    emit(options, notReady
+      ? { kind: "start.partial_ready", ready, managedTargets, notReady }
+      : { kind: "start.ready", ready, managedTargets });
     return {
       status: "already_running",
       managedTargets,
@@ -525,6 +659,16 @@ async function startInner(input: StartInput, options: StartOptions = {}): Promis
   const duplicateHolder = await (options.findDuplicateKeyHolder ?? findDuplicateKeyHolder)(slockHome);
   if (duplicateHolder) {
     throw new ComputerServiceError("DUPLICATE_KEY_HOLDER", describeDuplicateKeyHolder(duplicateHolder));
+  }
+
+  // No service runs, so nothing supervises a runner: what runner.pid says was
+  // left by an earlier service, and a live pid in it with the old runner's
+  // evidence and connected marker would answer the first readiness poll below
+  // "ready" before the new service has started anything (after a Windows
+  // sign-out that pid is another program). Cleared here, not by the service:
+  // this command polls as soon as the service is spawned, before it has booted.
+  if (!(await (options.endpointAnswers ?? serviceEndpointAnswers)(slockHome))) {
+    await clearRunnerRecordsLeftByEarlierService(slockHome, attached);
   }
 
   // 4. Foreground path: run the service loop inline. Service emits
@@ -596,6 +740,16 @@ async function startInner(input: StartInput, options: StartOptions = {}): Promis
   if (supervision && supervision.unitLoaded) {
     const systemctl = options.systemctl ?? runSystemctl;
     const { scope, unit } = supervision.record;
+    // The unit runs its own `raft-computer start --foreground`, a separate
+    // process that takes the mutation lock itself (systemd passes it no
+    // parent-lock marker). Holding the lock here would make that process
+    // wait it out, fail with CONCURRENT_OPERATION, and only come up on
+    // systemd's RestartSec retry after this command's readiness deadline:
+    // every `restart` on a systemd-supervised Linux Computer exited
+    // START_DAEMON_TIMEOUT (#proj-raft-computer:#59, hetzner-ax42-1). Hand
+    // the lock over first, as the foreground path does once mutations are
+    // ready; from here this command only reads readiness.
+    await (options.releaseMutationLock ?? releaseHeldComputerMutationLock)(slockHome);
     const result = await systemctl(scope, ["start", unit]);
     if (result.code !== 0) {
       throw new ComputerServiceError(
@@ -613,6 +767,10 @@ async function startInner(input: StartInput, options: StartOptions = {}): Promis
     }
   } else {
     if (supervision) await clearSupervisorRecord(slockHome).catch(() => undefined);
+    // task #37: the detached service stays in the caller's login session
+    // scope; say so when logind will stop that scope at logout. Advisory only.
+    const sessionRisk = await (options.detectLogindSessionRisk ?? detectLogindSessionRisk)().catch(() => null);
+    if (sessionRisk) emit(options, { kind: "start.logind_session_risk", risk: sessionRisk });
     try {
       pid = await (options.spawnDetachedService ?? spawnDetachedService)(slockHome);
     } catch (err) {
@@ -626,6 +784,7 @@ async function startInner(input: StartInput, options: StartOptions = {}): Promis
     servicePid: pid,
     managedTargets,
     attachedCount: attached.length,
+    ...(supervision?.unitLoaded ? { supervisorUnit: supervision.record.unit } : {}),
   });
 
   // 6. Post-spawn abort check. Spawn already committed; the detached
@@ -646,15 +805,28 @@ async function startInner(input: StartInput, options: StartOptions = {}): Promis
   }
 
   // 7. Wait for all managed daemons to reach ready state.
-  const ready = await waitForManagedDaemonPids(slockHome, managedTargets, options, false);
-  if (ready.size !== managedTargets.length) {
+  const waitStartedAtMs = Date.now();
+  const wait = await waitForManagedDaemonPids(slockHome, managedTargets, options, pid, false);
+  const { ready, lockConflicts } = wait;
+  const notReady = ready.size === managedTargets.length ? null : await acceptsPartialReady(slockHome, options, ready, managedTargets, pid);
+  reportStartReadiness(options, managedTargets, wait, {
+    partial: notReady !== null,
+    unlinked: unlinked.length,
+    waitedMs: Date.now() - waitStartedAtMs,
+  });
+  if (ready.size !== managedTargets.length && !notReady) {
+    if (lockConflicts.length > 0) {
+      throw new ComputerServiceError("START_RUNNER_LOCK_CONFLICT", buildLockConflictMessage(slockHome, lockConflicts, input));
+    }
     throw new ComputerServiceError(
       "START_DAEMON_TIMEOUT",
       await buildTimeoutMessage(slockHome, managedTargets, ready, input),
     );
   }
 
-  emit(options, { kind: "start.ready", ready, managedTargets });
+  emit(options, notReady
+    ? { kind: "start.partial_ready", ready, managedTargets, notReady }
+    : { kind: "start.ready", ready, managedTargets });
   return {
     status: "spawned",
     managedTargets,
@@ -663,6 +835,52 @@ async function startInner(input: StartInput, options: StartOptions = {}): Promis
     servicePid: pid,
     serviceLogPath: serviceLogPath(slockHome),
   };
+}
+
+/** Hand `onReadiness` what the wait's last read saw: the facts this start succeeds or fails on. */
+function reportStartReadiness(
+  options: StartOptions,
+  managedTargets: string[],
+  wait: ManagedDaemonWait,
+  detail: Pick<StartReadinessReport, "partial" | "unlinked" | "waitedMs">,
+): void {
+  if (!options.onReadiness) return;
+  try {
+    const notReady: StartReadinessReport["notReady"] = {};
+    for (const reason of wait.reasons) notReady[reason.code] = (notReady[reason.code] ?? 0) + 1;
+    options.onReadiness({ targets: managedTargets.length, ready: wait.ready.size, notReady, ...detail });
+  } catch {
+    // Telemetry only.
+  }
+}
+
+/**
+ * Whether a start whose runners are not all ready may still succeed: only with
+ * `acceptPartialReady`, at least one runner ready, and every missing runner
+ * alive at this version but not connected (`runner-disconnected`), which is
+ * what a registration on an unreachable server looks like (runners never stop
+ * reconnecting), or held off by another daemon's machine lock
+ * (`runner-lock-conflict`), which this upgrade cannot resolve and rolling it
+ * back would not either. A missing, unattested or wrong-version runner is a
+ * fault of this version, and still fails the start.
+ */
+async function acceptsPartialReady(
+  slockHome: string,
+  options: StartOptions,
+  ready: Map<string, number>,
+  managedTargets: string[],
+  servicePid: number,
+): Promise<string[] | null> {
+  if (!options.acceptPartialReady || ready.size === 0) return null;
+  const verdict = await readStartReadiness(slockHome, managedTargets, options, servicePid);
+  const missing = verdict.reasons.filter((reason) => !ready.has(reason.serverId));
+  if (
+    missing.length === 0 ||
+    missing.some((reason) => reason.code !== "runner-disconnected" && reason.code !== "runner-lock-conflict")
+  ) {
+    return null;
+  }
+  return managedTargets.filter((id) => !ready.has(id));
 }
 
 /** One non-blocking sweep of the shared runner readiness facts. Used on post-spawn

@@ -4,11 +4,11 @@ import { useAuthStore } from "../store/authStore";
 import { useServerStore } from "../store/serverStore";
 
 export function useServerPermissions() {
+  // Narrow reads: the member list and the user record are replaced on every
+  // /members answer and auth refresh; only this user's role matters here.
   const currentRole = useServerStore((s) => s.current?.role);
-  const members = useServerStore((s) => s.members);
-  const user = useAuthStore((s) => s.user);
-
-  const fallbackRole = members.find((member) => member.userId === user?.id)?.role ?? null;
+  const userId = useAuthStore((s) => s.user?.id);
+  const fallbackRole = useServerStore((s) => s.members.find((member) => member.userId === userId)?.role ?? null);
   const role: ServerRole | null = currentRole ?? fallbackRole;
 
   return {

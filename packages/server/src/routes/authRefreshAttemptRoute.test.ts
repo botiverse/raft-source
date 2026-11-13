@@ -10,7 +10,7 @@ import { getDb } from "../db/index";
 import { users } from "../db/schema";
 import { refreshTokensWithDedupe } from "../../../web/src/utils/refreshCoordinator";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 type StubStore = Record<string, string>;
 

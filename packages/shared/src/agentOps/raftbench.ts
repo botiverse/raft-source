@@ -1,3 +1,4 @@
+import { raftbenchFindingsQuerySchema, type RaftbenchFindingsQuery, type RaftbenchFindingsResponse } from "../raftbenchContract";
 // RaftBench (staging pilot): the read-only service agent's loop, for the
 // hosted harness that runs it. The harness reads its assigned run's context,
 // gives it to the model as input (the model has no tools), and submits the
@@ -23,7 +24,7 @@ import {
   type RaftbenchSubmitResponse,
 } from "../raftbenchContract";
 import { formatUtcTimestamp } from "../utcTimestamp";
-import { failureFromClientResult, type RaftFailure, type RaftOutcome } from "./outcome";
+import { failureFromClientResult, validateOpRequest, type RaftFailure, type RaftOutcome } from "./outcome";
 
 export type { RaftbenchContextResponse, RaftbenchReport, RaftbenchRunAssigned, RaftbenchSubmitResponse };
 
@@ -376,8 +377,16 @@ export async function submitRaftbenchReport(
   };
 }
 
-const REREAD_CODES = new Set(["raftbench_revision_conflict", "raftbench_cursor_stale", "raftbench_cursor_invalid"]);
+const REREAD_CODES = new Set([
+  "raftbench_revision_conflict",
+  "raftbench_cursor_stale",
+  "raftbench_cursor_invalid",
+  "raftbench_findings_changed", // findings reader: start again from the first page
+]);
 const STOP_CODES = new Set([
+  // Findings reader: tell the person who asked; an administrator has to act.
+  "raftbench_reader_not_authorized",
+  "raftbench_findings_unavailable",
   "raftbench_source_unavailable",
   "raftbench_disabled",
   "raftbench_read_permission_revoked",
@@ -397,7 +406,9 @@ const STOP_CODES = new Set([
  * run; an administrator has to act, retrying will not help), `retry_identical`
  * (Raft could not confirm the request; repeat the same read or the identical
  * submission later — a submission may already have been accepted, and the
- * replay returns its receipt), or null (a bug in the request).
+ * replay returns its receipt), or null (a bug in the request). For a
+ * findings read (`raftbench.findings`): `reread` is the first page again,
+ * `stop` is telling the person who asked.
  */
 export function raftbenchFailureKind(failure: RaftFailure): "reread" | "stop" | "retry_identical" | null {
   const { code, status, serverCode } = failure.error;
@@ -433,4 +444,28 @@ export function raftbenchEmptyWindowReport(material: { runId: string; revision: 
 /** An `incomplete` result for a partial analysis within budget (no `failure`; see `raftbenchFailedReport` for a run that failed). */
 export function raftbenchIncompleteReport(run: { runId: string; revision: number }, reason: string, gaps: RaftbenchReport["gaps"] = []): RaftbenchReport {
   return { runId: run.runId, revision: run.revision, status: "incomplete", reason: reason.trim().slice(0, 1000) || "The run could not be completed.", patterns: [], gaps };
+}
+
+export async function readRaftbenchFindings(client: Pick<AgentApiClient, "raftbench">, request: Partial<RaftbenchFindingsQuery> = {}): Promise<RaftOutcome<RaftbenchFindingsResponse, "page" | "last_page">> {
+  const malformed = validateOpRequest(raftbenchFindingsQuerySchema, request); if (malformed) return malformed;
+  const query = { ...request, limit: request.limit ?? 5 };
+  const result = await client.raftbench.findings(query);
+  if (!result.ok) return failureFromClientResult(result);
+  const { nextCursor } = result.data;
+  // The cursor is bound to these filters, so the next page repeats them.
+  const nextArgs = nextCursor ? { ...query, cursor: nextCursor } : null;
+  return {
+    ok: true,
+    state: nextArgs ? "page" : "last_page",
+    data: result.data,
+    next: nextArgs
+      ? {
+        kind: "next_findings_page",
+        args: nextArgs,
+        operation: { name: "raftbench.findings", args: nextArgs },
+        why: "More findings match these filters; read the next page only if more examples would change the answer.",
+      }
+      : null,
+    text: JSON.stringify(result.data),
+  };
 }

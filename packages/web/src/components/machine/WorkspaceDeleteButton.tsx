@@ -17,7 +17,7 @@ export function WorkspaceDeleteButton({
   // it opens. An icon button alone in content carries the ink line (Raft DS).
   return (
     <Tooltip content={formatMessage({ id: "machine.detail.deleteWorkspace" })}>
-    <Button size="icon-sm"
+    <Button size="icon-md"
       variant="outline"
       onClick={handleClick}
       className="shrink-0"

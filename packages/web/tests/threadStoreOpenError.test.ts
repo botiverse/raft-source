@@ -44,7 +44,7 @@ test("openThread flags openThreadError when resolution fails and there is no fal
     assert.equal(state.openThreadChannelId, null, "no thread id resolved");
     assert.deepEqual(
       state.openThreadError,
-      { parentChannelId: "channel-1", parentMessageId: "parent-1" },
+      { parentChannelId: "channel-1", parentMessageId: "parent-1", unavailable: false },
       "failed anchor recorded so the panel can show error + Retry instead of an infinite spinner",
     );
   } finally {
@@ -114,6 +114,8 @@ test("retryOpenThread re-resolves the current anchor and recovers after the chan
   resetStore();
   let attempt = 0;
   api.get = (async (url: string) => {
+    // The replies' first page, sent once the lookup answers (threadRepliesPrefetch), is not a lookup.
+    if (url.startsWith("/messages/")) return { data: { messages: [] } };
     attempt += 1;
     if (attempt === 1) {
       // First open: channel still private / mid-conversion.
@@ -139,6 +141,7 @@ test("retryOpenThread re-resolves the current anchor and recovers after the chan
     assert.deepEqual(useThreadStore.getState().openThreadError, {
       parentChannelId: "channel-1",
       parentMessageId: "parent-1",
+      unavailable: false,
     });
 
     await useThreadStore.getState().retryOpenThread();
@@ -195,11 +198,14 @@ test("a successful openThread clears a stale openThreadError", async () => {
 // Task #14: the lookup route 404s for "channel not visible / wrong server" as
 // well as for "no thread yet". Only the latter is an empty thread; treating
 // every 404 as empty rendered a populated thread as "No replies yet".
-for (const [label, error] of [
-  ["channel-not-visible 404", { response: { status: 404, data: { error: "Channel not found or not visible" } } }],
-  ["bodyless 404", { response: { status: 404 } }],
-  ["403", { response: { status: 403, data: { error: "Access denied" } } }],
-  ["500", { response: { status: 500, data: { error: "Failed to get thread info" } } }],
+// A 403/404 is this server saying it can't show the thread (`unavailable`:
+// the panel names the server instead of the "just became public" hint, e.g.
+// a joint channel seen only through another server); a 500 stays generic.
+for (const [label, error, unavailable] of [
+  ["channel-not-visible 404", { response: { status: 404, data: { error: "Channel not found or not visible" } } }, true],
+  ["bodyless 404", { response: { status: 404 } }, true],
+  ["403", { response: { status: 403, data: { error: "Access denied" } } }, true],
+  ["500", { response: { status: 500, data: { error: "Failed to get thread info" } } }, false],
 ] as const) {
   test(`openThread surfaces a ${label} lookup failure as an error, not an empty thread`, async () => {
     resetStore();
@@ -218,7 +224,7 @@ for (const [label, error] of [
       const state = useThreadStore.getState();
       assert.equal(state.openThreadChannelId, null);
       assert.equal(state.openThreadLoading, false);
-      assert.deepEqual(state.openThreadError, { parentChannelId: "channel-1", parentMessageId: "parent-1" });
+      assert.deepEqual(state.openThreadError, { parentChannelId: "channel-1", parentMessageId: "parent-1", unavailable });
     } finally {
       console.error = originalConsoleError;
       restoreApi();
@@ -252,7 +258,7 @@ for (const [label, data, expectEmpty] of [
       assert.equal(state.openThreadLoading, false);
       assert.deepEqual(
         state.openThreadError,
-        expectEmpty ? null : { parentChannelId: "channel-1", parentMessageId: "parent-1" },
+        expectEmpty ? null : { parentChannelId: "channel-1", parentMessageId: "parent-1", unavailable: true },
       );
     } finally {
       console.error = originalConsoleError;

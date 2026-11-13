@@ -32,3 +32,29 @@ test("v2 form requests ask for the app's display language, not the browser's", a
   assert.deepEqual(runtimeFormV2RequestHeaders("zh-cn"), { "Accept-Language": "zh-CN" });
   assert.deepEqual(runtimeFormV2RequestHeaders("en"), { "Accept-Language": "en" });
 });
+
+test("web advertises every advertised runtime form v2 capability, on form requests and v2 saves (task #10)", async () => {
+  const { RUNTIME_FORM_V2_ADVERTISED_CLIENT_CAPABILITIES, RUNTIME_FORM_V2_CLIENT_CAPABILITIES_QUERY } = await import("@botiverse/raft-runtime-form");
+  const { WEB_RUNTIME_FORM_V2_ADVERTISED_CAPABILITIES, runtimeFormV2ClientCapabilityParams } = await import("../src/utils/runtimeFormV2ClientCapabilities");
+  assert.deepEqual([...WEB_RUNTIME_FORM_V2_ADVERTISED_CAPABILITIES].sort(), [...RUNTIME_FORM_V2_ADVERTISED_CLIENT_CAPABILITIES].sort());
+  assert.deepEqual(runtimeFormV2ClientCapabilityParams(), { [RUNTIME_FORM_V2_CLIENT_CAPABILITIES_QUERY]: "dependent_select.custom_value_with_options,runtime_form.v3" });
+
+  const { default: api } = await import("../src/api/client");
+  const { useAgentStore } = await import("../src/store/agentStore");
+  const originalPatch = api.patch.bind(api);
+  const seen: unknown[] = [];
+  api.patch = (async (_url: string, _body?: unknown, config?: unknown) => {
+    seen.push(config);
+    return { data: { id: "agent-1" } };
+  }) as typeof api.patch;
+  try {
+    await useAgentStore.getState().updateAgent("agent-1", { formDefinitionRef: { protocolVersion: 2, runtimeId: "builtin" }, formValues: {} } as never);
+    await useAgentStore.getState().updateAgent("agent-1", { formDefinitionRef: { protocolVersion: 3, runtimeId: "builtin" }, formValues: {} } as never);
+    await useAgentStore.getState().updateAgent("agent-1", { name: "renamed" } as never);
+  } finally {
+    api.patch = originalPatch;
+  }
+  assert.deepEqual(seen[0], { params: runtimeFormV2ClientCapabilityParams() }, "a v2 save advertises the capability (the server's edit guard reads it)");
+  assert.deepEqual(seen[1], { params: runtimeFormV2ClientCapabilityParams() }, "so does a v3 save");
+  assert.equal(seen[2], undefined, "other edits are unchanged");
+});

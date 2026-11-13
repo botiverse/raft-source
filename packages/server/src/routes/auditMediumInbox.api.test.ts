@@ -1,20 +1,19 @@
 import assert from "node:assert/strict";
 import { and, eq } from "drizzle-orm";
-import { SERVER_GUEST_FEATURE_FLAG_KEY } from "@botiverse/raft-shared";
 import { createApiTest } from "../test/integration/apiTest";
 import { getDb } from "../db/index";
-import { channels, featureFlagRules, serverMembers, threadFollows, userChannelInboxStates, messageMentions } from "../db/schema";
+import { channelHumans, channels, threadFollows, userChannelInboxStates, messageMentions } from "../db/schema";
 import { getDoneInboxItems, getFollowedThreads, getInboxItems } from "../services/channelService";
+import { seedBoundGuest } from "../test/guestFixture";
 
-const test = createApiTest({ onboardingOpenerFlagDefaultEnabled: false, humanActivityMuteFlagDefaultEnabled: true });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 for (const surface of ["done", "followed", "mention"] as const) {
   test(`guest ${surface} reads recheck current visibility`, async ({ seed, db }) => {
     const owner = await seed.human(); const guest = await seed.human();
     const server = await seed.server({ owner, members: [guest] });
-    await db.update(serverMembers).set({ role: "guest" }).where(and(eq(serverMembers.serverId, server.id), eq(serverMembers.userId, guest.id)));
-    await db.insert(featureFlagRules).values({ flagKey: SERVER_GUEST_FEATURE_FLAG_KEY, stage: "server", priority: 0, decision: "allow", values: [server.id] });
     const channel = await seed.channel({ server, members: [owner], visibility: "channel" });
-    await db.update(channels).set({ guestVisible: true }).where(eq(channels.id, channel.id));
+    // The guest reads its one channel while it is a member (#wg-rbac:#15).
+    await seedBoundGuest({ serverId: server.id, userId: guest.id, channelId: channel.id });
     const parent = await seed.message({ channel, author: owner, content: "audit-inbox-secret" });
     const [thread] = await db.insert(channels).values({ serverId: server.id, name: "audit-thread", type: "thread", parentMessageId: parent.id }).returning();
     await db.insert(threadFollows).values({ threadChannelId: thread.id, parentMessageId: parent.id, reason: "manual", followerType: "user", followerId: guest.id });
@@ -27,7 +26,8 @@ for (const surface of ["done", "followed", "mention"] as const) {
       : surface === "followed" ? await getFollowedThreads(server.id, guest.id)
       : (await getInboxItems(server.id, guest.id, { filter: "mentions", forcePostgres: true })).items;
     assert.ok((await read()).length > 0, "positive visible control");
-    await db.update(channels).set({ guestVisible: false }).where(eq(channels.id, channel.id));
+    // Removed from its channel: access ends, whatever residue is left.
+    await db.delete(channelHumans).where(and(eq(channelHumans.channelId, channel.id), eq(channelHumans.userId, guest.id)));
     assert.deepEqual(await read(), [], "residual follows/done/mentions must not grant access");
   });
 }
@@ -36,10 +36,8 @@ test("guest followed threads check each parent channel once, not once per thread
   type PgliteLike = { query: (...args: unknown[]) => Promise<unknown> };
   const owner = await seed.human(); const guest = await seed.human();
   const server = await seed.server({ owner, members: [guest] });
-  await db.update(serverMembers).set({ role: "guest" }).where(and(eq(serverMembers.serverId, server.id), eq(serverMembers.userId, guest.id)));
-  await db.insert(featureFlagRules).values({ flagKey: SERVER_GUEST_FEATURE_FLAG_KEY, stage: "server", priority: 0, decision: "allow", values: [server.id] });
   const channel = await seed.channel({ server, members: [owner], visibility: "channel" });
-  await db.update(channels).set({ guestVisible: true }).where(eq(channels.id, channel.id));
+  await seedBoundGuest({ serverId: server.id, userId: guest.id, channelId: channel.id });
   const followThreads = async (size: number) => {
     for (let i = 0; i < size; i += 1) {
       const parent = await seed.message({ channel, author: owner, content: `parent ${i}` });

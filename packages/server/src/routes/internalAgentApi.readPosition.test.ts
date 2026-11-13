@@ -38,7 +38,7 @@ import { recordInboxNotificationFacts } from "../services/inboxNotificationServi
 import { referenceAgentInboxChain } from "../test/agentInboxChainReference";
 import { withChannelDelivery } from "../test/orchestratorStub";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 __setExternalAgentInboxChainSelectorForTests(async (agentId: string): Promise<AgentInboxChainSelection> => (
   { source: "chain", rows: await referenceAgentInboxChain(agentId) }
@@ -66,7 +66,7 @@ async function seed() {
   await addHuman(channel.id, owner.id);
   await addHuman(channel.id, other.id);
   await addAgent(channel.id, agent.id);
-  const minted = await mintAgentCredential({ agentId: agent.id, scopes: ["send", "read"], name: "read-position", createdByUserId: null });
+  const minted = await mintAgentCredential({ agentId: agent.id, scopes: ["send", "read"], name: "read-position", issuedVia: "computer", createdByUserId: null });
   return { owner, other, serverId: server.id, channelId: channel.id, agentId: agent.id, apiKey: minted.apiKey };
 }
 

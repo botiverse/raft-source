@@ -12,7 +12,6 @@ import {
   createTraceContext,
   eventsForSpan,
   formatTraceparent,
-  isTraceEventRowV2CompatibleIngestStatement,
   isTraceEventRowV2CompatibleSchemaFingerprint,
   isSpanId,
   isTraceFlags,
@@ -26,8 +25,6 @@ import {
   traceEventRowsForSpan,
   traceSpanFactRowForSpan,
   TRACE_B0_FIELD_DEFINITIONS,
-  TRACE_EVENT_ROW_V2_INGEST_STATEMENT,
-  TRACE_EVENT_ROW_V2_LEGACY_INGEST_STATEMENT,
   TRACE_EVENT_ROW_V2_LEGACY_PROJECTION_COLUMNS,
   TRACE_EVENT_ROW_V2_LEGACY_SCHEMA_FINGERPRINT,
   TRACE_EVENT_ROW_V2_PROJECTION_COLUMNS,
@@ -344,6 +341,13 @@ test("trace scope projection emits registry-backed attrs and ignores arbitrary b
   }
 });
 
+test("trace scope projection carries the Computer build sha only when one was baked", () => {
+  assert.equal(projectTraceScopeAttrs({ resource: { computerBuildSha: " 0570bc5395d3 " } }).computer_build_sha, "0570bc5395d3");
+  for (const computerBuildSha of [undefined, null, ""]) {
+    assert.equal("computer_build_sha" in projectTraceScopeAttrs({ resource: { computerVersion: "1.0.60", computerBuildSha } }), false);
+  }
+});
+
 test("trace scope tracer projects scope once on the span and typed event rows inherit it", () => {
   const sink = new MemoryTraceSink();
   const tracer = createTraceScopeTracer(new BasicTracer({
@@ -574,7 +578,7 @@ test("Trace V2 projection columns match the frozen snapshots exactly", () => {
   );
 });
 
-test("Trace V2 ingest statements preserve the additive 59-to-66 column rollout", () => {
+test("Trace V2 projection preserves the additive 59-to-67 column rollout", () => {
   const columnNames = TRACE_EVENT_ROW_V2_PROJECTION_COLUMNS.map(([column]) => column);
   assert.equal(columnNames.length, 67);
   assert.equal(new Set(columnNames).size, 67);
@@ -592,25 +596,6 @@ test("Trace V2 ingest statements preserve the additive 59-to-66 column rollout",
   const legacyColumnNames = TRACE_EVENT_ROW_V2_LEGACY_PROJECTION_COLUMNS.map(([column]) => column);
   assert.deepEqual(legacyColumnNames, columnNames.slice(0, 59));
 
-  const match = TRACE_EVENT_ROW_V2_INGEST_STATEMENT.match(
-    /^SELECT (.*) INSERT INTO raft\.trace_events_v2 \((.*)\)$/,
-  );
-  assert.ok(match);
-  const aliases = [...match[1]!.matchAll(/ AS ([a-z0-9_]+)(?:,|$)/g)].map((entry) => entry[1]);
-  const insertColumns = match[2]!.split(",").map((column) => column.trim());
-  assert.deepEqual(aliases, columnNames);
-  assert.deepEqual(insertColumns, columnNames);
-  const legacyMatch = TRACE_EVENT_ROW_V2_LEGACY_INGEST_STATEMENT.match(
-    /^SELECT (.*) INSERT INTO raft\.trace_events_v2 \((.*)\)$/,
-  );
-  assert.ok(legacyMatch);
-  const legacyAliases = [...legacyMatch[1]!.matchAll(/ AS ([a-z0-9_]+)(?:,|$)/g)].map((entry) => entry[1]);
-  const legacyInsertColumns = legacyMatch[2]!.split(",").map((column) => column.trim());
-  assert.deepEqual(legacyAliases, legacyColumnNames);
-  assert.deepEqual(legacyInsertColumns, legacyColumnNames);
-  assert.equal(isTraceEventRowV2CompatibleIngestStatement(TRACE_EVENT_ROW_V2_INGEST_STATEMENT), true);
-  assert.equal(isTraceEventRowV2CompatibleIngestStatement(TRACE_EVENT_ROW_V2_LEGACY_INGEST_STATEMENT), true);
-  assert.equal(isTraceEventRowV2CompatibleIngestStatement("INSERT INTO raft.trace_events_v2"), false);
   assert.equal(TRACE_EVENT_ROW_V2_TABLE, "raft.trace_events_v2");
   assert.equal(
     TRACE_EVENT_ROW_V2_SCHEMA_FINGERPRINT,

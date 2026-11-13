@@ -1,9 +1,26 @@
 // task #1228 ①: what the Report Issue dialog may say about the session-record
-// request. The browser only ever learns the HTTP result of its own request
-// (the server answers 202 before the agent's computer does anything), so no
-// state here means "attached", "uploaded" or "being uploaded".
+// request.
+// - `pending`, `requested`, `request_failed`, `request_unconfirmed` are about
+//   the browser's own request and claim nothing about the record: the browser
+//   only learns the HTTP result of that request, and the server answers 202
+//   before the agent's computer does anything.
+// - `attached` and `not_attached` say what the agent's computer answered.
+//   They never come from the HTTP request: the server pushes the answer on
+//   the socket (`feedback_report:session_record`, shared
+//   feedbackReportSessionRecord.ts) when the computer gives a typed one. No
+//   push means nothing is known, and the request state stays: `requested` is
+//   also where the dialog rests when no answer ever comes (an older computer,
+//   a collection that timed out, a socket that was down).
 
-export type TranscriptRequestState = "pending" | "requested" | "request_failed" | "request_unconfirmed";
+import { isFeedbackSessionRecordAnswer } from "@botiverse/raft-shared";
+import type { FeedbackReportSessionRecordEvent, FeedbackSessionRecordAnswer } from "@botiverse/raft-shared";
+
+export type TranscriptRequestState =
+  | "pending"
+  | "requested"
+  | "request_failed"
+  | "request_unconfirmed"
+  | FeedbackSessionRecordAnswer;
 
 /** Measured from the START of the request; the report never waits on it. */
 export const TRANSCRIPT_REQUEST_CONFIRM_CAP_MS = 10_000;
@@ -53,4 +70,30 @@ export function startTranscriptRequest(
       return state;
     });
   return { settled };
+}
+
+/**
+ * The answer a `feedback_report:session_record` push carries for the report
+ * whose session record this dialog requested. Null for another report, for no
+ * requested report, and for a payload that is not one of the known answers.
+ */
+export function sessionRecordAnswerFor(
+  payload: Partial<FeedbackReportSessionRecordEvent> | null | undefined,
+  requestedReportId: string | null,
+): FeedbackSessionRecordAnswer | null {
+  if (!requestedReportId || payload?.feedbackReportId !== requestedReportId) return null;
+  return isFeedbackSessionRecordAnswer(payload.sessionRecord) ? payload.sessionRecord : null;
+}
+
+/**
+ * The state after `incoming` arrives. An answer from the agent's computer is
+ * final: the push can arrive before the browser has processed its own
+ * request's 202 (or before the cap fires), and a request state that comes
+ * after it must not replace it.
+ */
+export function nextTranscriptRequestState(
+  current: TranscriptRequestState | null,
+  incoming: TranscriptRequestState,
+): TranscriptRequestState {
+  return isFeedbackSessionRecordAnswer(current) && !isFeedbackSessionRecordAnswer(incoming) ? current : incoming;
 }

@@ -32,6 +32,8 @@ export function buildRuntimeModelSourceResultMessage(
         ...(outcome.value.catalog !== undefined
           ? { catalog: outcome.value.catalog }
           : {}),
+        // Only inside `outcome`: the legacy top-level `models` stays usable-only.
+        ...(outcome.value.unavailable?.length ? { unavailable: outcome.value.unavailable } : {}),
       },
     };
     return {

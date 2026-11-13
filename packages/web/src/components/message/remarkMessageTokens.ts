@@ -56,6 +56,12 @@ export interface TokenContext {
    * value, so only the source can tell.
    */
   escaped: boolean;
+  /**
+   * True inside a block quote (any depth, lazy continuation lines included).
+   * Quoted text repeats someone else's words, so an `@handle` in it is not a
+   * mention (the server's extractRaftMentionHandles skips quotes too).
+   */
+  inQuote: boolean;
 }
 
 export interface TextTokenMatcher {
@@ -107,6 +113,7 @@ function splitText(
   node: Text,
   file: VFile | undefined,
   matcher: TextTokenMatcher,
+  inQuote: boolean,
 ): PhrasingContent[] | null {
   const { value } = node;
   const alignment = alignmentOf(node, file);
@@ -128,7 +135,7 @@ function splitText(
       pattern.lastIndex += 1;
       continue;
     }
-    const replacement = matcher.replace(match, { escaped: alignment?.escaped.has(match.index) ?? false });
+    const replacement = matcher.replace(match, { escaped: alignment?.escaped.has(match.index) ?? false, inQuote });
     if (replacement === false) continue;
     if (match.index > cursor) out.push(slice(cursor, match.index));
     out.push(...toNodes(replacement));
@@ -153,10 +160,10 @@ export function replaceTokensInTree(
   skippedParents: ReadonlySet<string> = SKIPPED_PARENTS,
 ): void {
   if (matchers.length === 0) return;
-  const visit = (parent: Parent) => {
+  const visit = (parent: Parent, inQuote: boolean) => {
     if (skippedParents.has(parent.type)) return;
     for (const child of parent.children as Nodes[]) {
-      if (isParent(child)) visit(child);
+      if (isParent(child)) visit(child, inQuote || child.type === "blockquote");
     }
     if (!parent.children.some((child) => child.type === "text")) return;
 
@@ -168,7 +175,7 @@ export function replaceTokensInTree(
           next.push(child);
           continue;
         }
-        const split = splitText(child, file, matcher);
+        const split = splitText(child, file, matcher, inQuote);
         if (split) next.push(...split);
         else next.push(child);
       }
@@ -176,7 +183,7 @@ export function replaceTokensInTree(
     }
     parent.children = children as Parent["children"];
   };
-  visit(tree);
+  visit(tree, false);
 }
 
 /**
@@ -184,15 +191,18 @@ export function replaceTokensInTree(
  * `[label](<target>)` and `<scheme:target>` autolinks, which the parser has
  * already turned into links.
  */
-export function replaceLinksInTree(tree: Root, toToken: (link: Link) => PhrasingContent | null): void {
-  const visit = (parent: Parent) => {
+export function replaceLinksInTree(
+  tree: Root,
+  toToken: (link: Link, context: { inQuote: boolean }) => PhrasingContent | null,
+): void {
+  const visit = (parent: Parent, inQuote: boolean) => {
     parent.children = (parent.children as Nodes[]).map((child) => {
-      if (child.type === "link") return toToken(child) ?? child;
-      if (isParent(child) && !SKIPPED_PARENTS.has(child.type)) visit(child);
+      if (child.type === "link") return toToken(child, { inQuote }) ?? child;
+      if (isParent(child) && !SKIPPED_PARENTS.has(child.type)) visit(child, inQuote || child.type === "blockquote");
       return child;
     }) as Parent["children"];
   };
-  visit(tree);
+  visit(tree, false);
 }
 
 /**

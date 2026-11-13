@@ -13,19 +13,13 @@ function channel(overrides: Partial<Channel>): Channel {
   };
 }
 
-test("agent DM rows prefer the live agent avatar over a stale DM snapshot", () => {
+test("agent DM profile comes from the live agent", () => {
   const profile = resolveAgentDmProfileSource(
     {
       name: "agent-fallback-name",
       displayName: "Agent fallback",
       description: "agent fallback description",
       avatarUrl: "https://example.com/agent.png",
-    },
-    {
-      peerName: "dm-peer-name",
-      peerDisplayName: "DM profile",
-      peerDescription: "DM source description",
-      peerAvatarUrl: "https://example.com/dm.png",
     },
   );
 
@@ -36,7 +30,7 @@ test("agent DM rows prefer the live agent avatar over a stale DM snapshot", () =
   });
 });
 
-test("pinned agent DM rows fall back to the agent profile before a DM channel exists", () => {
+test("agent DM profile falls back from display name to handle", () => {
   const profile = resolveAgentDmProfileSource(
     {
       name: "agent-name",
@@ -44,7 +38,6 @@ test("pinned agent DM rows fall back to the agent profile before a DM channel ex
       description: "agent fallback description",
       avatarUrl: "https://example.com/agent.png",
     },
-    undefined,
   );
 
   assert.deepEqual(profile, {
@@ -54,19 +47,13 @@ test("pinned agent DM rows fall back to the agent profile before a DM channel ex
   });
 });
 
-test("agent DM rows keep the live agent display name when the DM snapshot only has a peer name", () => {
+test("a reset agent avatar stays null (the default avatar), never a DM snapshot", () => {
   const profile = resolveAgentDmProfileSource(
     {
       name: "agent-name",
       displayName: "Agent fallback",
       description: null,
       avatarUrl: null,
-    },
-    {
-      peerName: "dm-peer-name",
-      peerDisplayName: null,
-      peerDescription: null,
-      peerAvatarUrl: null,
     },
   );
 

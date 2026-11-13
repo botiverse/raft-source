@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
-import { readBundledCliVersion, readBundledDaemonVersion, readComputerVersion } from "./version";
+import { readBundledCliVersion, readBundledDaemonVersion, readComputerBuildSha, readComputerVersion } from "./version";
 
 type VersionEnv = {
   raft?: string;
@@ -93,4 +93,10 @@ test("readBundledCliVersion exposes the CLI version baked into Computer SEA", as
     if (previous === undefined) delete process.env.RAFT_CLI_VERSION;
     else process.env.RAFT_CLI_VERSION = previous;
   }
+});
+
+test("readComputerBuildSha exposes the baked source commit and is absent on local builds", () => {
+  assert.equal(readComputerBuildSha("0570bc5395d3"), "0570bc5395d3");
+  assert.equal(readComputerBuildSha(""), undefined);
+  assert.equal(readComputerBuildSha(), undefined);
 });

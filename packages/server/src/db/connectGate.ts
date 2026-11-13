@@ -30,6 +30,110 @@ export function resolveConnectConcurrency(env: NodeJS.ProcessEnv): number {
   return Math.floor(parsed);
 }
 
+/**
+ * Deadline for the transport part of a handshake: TCP connect plus TLS. Those
+ * take milliseconds; one that stalls (a dead socket: 10-29 a task opened no
+ * connection for 4 minutes while others did, #triage:e17fe621) would hold its
+ * permit for the whole pool timeout, and 8 of them block every new connection
+ * on the task. Startup and authentication are not covered: when Neon itself is
+ * slow (11-02, handshakes p50 6.7 s that did complete) they stay under the
+ * pool's connectionTimeoutMillis rather than turning slow into failed.
+ */
+export const DEFAULT_PG_CONNECT_TRANSPORT_TIMEOUT_MS = 2_500;
+
+/** `PG_CONNECT_TRANSPORT_TIMEOUT_MS` (default 2500). 0 disables the deadline. */
+export function resolveConnectTransportTimeoutMs(env: NodeJS.ProcessEnv): number {
+  const raw = env.PG_CONNECT_TRANSPORT_TIMEOUT_MS;
+  const parsed = raw === undefined || raw.trim() === "" ? DEFAULT_PG_CONNECT_TRANSPORT_TIMEOUT_MS : Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 0) return DEFAULT_PG_CONNECT_TRANSPORT_TIMEOUT_MS;
+  return Math.floor(parsed);
+}
+
+/** Error code of a handshake given up at the transport deadline. */
+export const CONNECT_TRANSPORT_TIMEOUT = "CONNECT_TRANSPORT_TIMEOUT";
+
+/**
+ * Where a handshake spent its time, in ms from its start (the permit). A phase
+ * not reached is absent. `dns` is the lookup inside the TCP connect.
+ */
+export interface ConnectPhases {
+  dnsMs?: number;
+  tcpMs?: number;
+  tlsMs?: number;
+  /** Startup and authentication: transport done to ready for query. */
+  authMs?: number;
+}
+
+export const CONNECT_PHASES = Symbol("slock.connectPhases");
+
+/** The phases of this client's handshake (unset if never gated or not finished). */
+export function connectPhases(client: object): ConnectPhases | undefined {
+  return (client as { [CONNECT_PHASES]?: ConnectPhases })[CONNECT_PHASES];
+}
+
+type PhaseStream = {
+  once?: (event: string, listener: (...args: unknown[]) => void) => unknown;
+  destroy?: (error?: Error) => void;
+  destroyed?: boolean;
+};
+type PhaseConnection = {
+  ssl?: unknown;
+  stream?: PhaseStream;
+  once?: (event: string, listener: (...args: unknown[]) => void) => unknown;
+};
+
+/**
+ * Times the phases of one handshake and enforces the transport deadline. On
+ * the deadline the socket is destroyed first, so the connect fails (and its
+ * permit is released by the caller) only once the socket is gone: the handshakes
+ * really in progress never exceed the gate's limit.
+ */
+function watchHandshake(connection: PhaseConnection | undefined, transportTimeoutMs: number) {
+  const startedAt = Date.now();
+  const phases: ConnectPhases = {};
+  let transportAt: number | undefined;
+  let stage: "tcp" | "tls" | "auth" = "tcp";
+  let timedOut = false;
+  const transportDone = () => {
+    if (transportAt !== undefined) return;
+    transportAt = Date.now();
+    stage = "auth";
+    if (timer) clearTimeout(timer);
+  };
+  connection?.stream?.once?.("lookup", () => { phases.dnsMs = Date.now() - startedAt; });
+  connection?.once?.("connect", () => {
+    phases.tcpMs = Date.now() - startedAt;
+    if (connection.ssl) stage = "tls";
+    else transportDone();
+  });
+  // pg emits sslconnect once the server accepted TLS, then swaps in the TLS
+  // socket: the transport is done when that socket's handshake completes.
+  connection?.once?.("sslconnect", () => {
+    connection.stream?.once?.("secureConnect", () => {
+      phases.tlsMs = Date.now() - startedAt - (phases.tcpMs ?? 0);
+      transportDone();
+    });
+  });
+  const timer = transportTimeoutMs > 0
+    ? setTimeout(() => {
+      if (transportAt !== undefined) return;
+      timedOut = true;
+      const error = Object.assign(new Error(`Connection transport (TCP/TLS) timed out after ${transportTimeoutMs} ms`), { code: CONNECT_TRANSPORT_TIMEOUT });
+      connection?.stream?.destroy?.(error);
+    }, transportTimeoutMs)
+    : undefined;
+  timer?.unref?.();
+  return {
+    get stage() { return stage; },
+    get timedOut() { return timedOut; },
+    finish(succeeded: boolean): ConnectPhases {
+      if (timer) clearTimeout(timer);
+      if (succeeded && transportAt !== undefined) phases.authMs = Date.now() - transportAt;
+      return phases;
+    },
+  };
+}
+
 export interface ConnectPermit {
   waitMs: number;
   release: () => void;
@@ -128,6 +232,9 @@ export interface ConnectAttemptFailure {
   /** Time in the handshake; 0 when it never got a permit. */
   handshakeMs: number;
   errorCategory: string;
+  /** Handshake failures: the phase it was in, and the phases it got through. */
+  handshakeStage?: "tcp" | "tls" | "auth";
+  phases?: ConnectPhases;
 }
 
 /** A pg.Client subclass for `new pg.Pool({ Client })` whose connect() goes through `gate`. */
@@ -135,6 +242,7 @@ export function gatedClientClass(
   gate: ConnectGate,
   onPermit: (waitMs: number) => void = () => {},
   onAttemptFailed: (failure: ConnectAttemptFailure) => void = () => {},
+  transportTimeoutMs: number = DEFAULT_PG_CONNECT_TRANSPORT_TIMEOUT_MS,
 ): typeof pg.Client {
   return class GatedClient extends pg.Client {
     // pg-pool constructs the client right before starting its connect timer,
@@ -180,14 +288,20 @@ export function gatedClientClass(
             throw late;
           }
           const handshakeStartedAt = Date.now();
+          const watch = watchHandshake((this as unknown as { connection?: PhaseConnection }).connection, transportTimeoutMs);
           try {
-            return await super.connect();
+            const client = await super.connect();
+            (this as { [CONNECT_PHASES]?: ConnectPhases })[CONNECT_PHASES] = watch.finish(true);
+            return client;
           } catch (err) {
+            const phases = watch.finish(false);
             onAttemptFailed({
               stage: "handshake",
               permitWaitMs: permit.waitMs,
               handshakeMs: Date.now() - handshakeStartedAt,
-              errorCategory: connectErrorCategory(err),
+              errorCategory: watch.timedOut ? CONNECT_TRANSPORT_TIMEOUT : connectErrorCategory(err),
+              handshakeStage: watch.stage,
+              phases,
             });
             throw err;
           }

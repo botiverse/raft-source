@@ -498,7 +498,6 @@ test("real PG: non-owner create first — an owner-driven demotion of the creato
         actorUserId: owner.id,
         targetUserId: creator.id,
         nextRole: "member",
-        guestTransitionsEnabled: false,
       }));
       // The demotion must be blocked on some row lock the create holds (servers row under the revised order).
       await waitForLockWaiter(observer, "%for update%", createPid, () =>

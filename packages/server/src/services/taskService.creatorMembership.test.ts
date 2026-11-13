@@ -12,7 +12,7 @@ import { addAgent, addHuman, createChannel } from "./channelService";
 import { addMember, createServer, removeMember } from "./serverService";
 import { createTasks, listTasks } from "./taskService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 async function seedUser(name: string) {
   const [user] = await getDb().insert(users).values({

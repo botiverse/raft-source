@@ -1,8 +1,9 @@
+import { handlerTraceEvents } from "../test/handlerTraceEvents";
+import { fillJointMembersFromChannelHumans } from "../test/jointMemberFill";
 import { tokenForHuman } from "../test/integration/credentials";
 import { createApiTest } from "../test/integration/apiTest";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { readFileSync } from "node:fs";
 
 import pg from "pg";
 import { and, eq, inArray, sql } from "drizzle-orm";
@@ -44,9 +45,10 @@ import {
 } from "../services/inboxSuppressionWriters";
 import { InboxRouteBackpressure } from "../services/inboxRouteBackpressure";
 import { signAccessToken } from "../middleware/auth";
-import { createServer, installFakeIo, enableReadReceiptsForServer, recordTestInboxFact, seedThreadFixture, headers, channelDoneBody, threadDoneBody, seedUser, fetchInboxAll, oracleProbes } from "./channels.api.fixtures";
+import { createServer, installFakeIo, recordTestInboxFact, seedThreadFixture, headers, channelDoneBody, threadDoneBody, seedUser, fetchInboxAll, oracleProbes } from "./channels.api.fixtures";
+import { revealAllChannelForTest } from "../test/allChannelFixture";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 
 test("adding a human rolls membership and message back when inbox fact persistence fails", async ({ app }) => {
@@ -409,7 +411,7 @@ test("GET /api/channels/inbox records inbox phases and query shape", async ({ ap
     );
     assert.ok(span, "expected GET /api/channels/inbox root span");
 
-    const processEventNames = span.events
+    const processEventNames = handlerTraceEvents(span.events)
       .map((event) => event.name)
       .filter((name) => name !== "db.query.finished");
     assert.deepEqual(processEventNames.filter((name) =>
@@ -417,6 +419,8 @@ test("GET /api/channels/inbox records inbox phases and query shape", async ({ ap
       && name !== "inbox.serving_row.read",
     ), [
       "inbox.backpressure.admitted",
+      // Multi-device sync spec §6: which list and why (no reason header here: "unknown").
+      "activity.list.fetch",
       "inbox.load.started",
       "history.policy.checked",
         "inbox.backend.selected",
@@ -428,6 +432,16 @@ test("GET /api/channels/inbox records inbox phases and query shape", async ({ ap
       "inbox.backpressure.released",
       "http.response.finished",
     ]);
+
+    const fetchEvent = span.events.find((event) => event.name === "activity.list.fetch");
+    assert.deepEqual(fetchEvent?.attrs, {
+      list: "inbox",
+      fetch_kind: "list",
+      fetch_reason: "unknown",
+      ids_count: 0,
+      fetch_trigger: "unknown",
+      fetch_coalesced: 0,
+    });
 
     const admittedEvent = span.events.find((event) => event.name === "inbox.backpressure.admitted");
     assert.ok(admittedEvent);
@@ -452,12 +466,14 @@ test("GET /api/channels/inbox records inbox phases and query shape", async ({ ap
     assert.ok(readEvents.every((event) => event.attrs?.receiver_type === "user"));
     assert.ok(readEvents.every((event) => event.attrs?.target_kind === "channel" || event.attrs?.target_kind === "dm" || event.attrs?.target_kind === "thread"));
 
-    const dbEvents = span.events.filter((event) => event.name === "db.query.finished");
+    const dbEvents = handlerTraceEvents(span.events).filter((event) => event.name === "db.query.finished");
     assert.deepEqual(dbEvents.map((event) => event.attrs?.query_name), [
       "channels.inbox_items_by_user",
       "channels.inbox_read_state_authority",
       "channels.followed_threads_by_user",
       "channels.followed_joint_threads_by_user",
+      // Task v2: followed task conversations, whatever the reader's flag.
+      "channels.followed_task_conversations_by_user",
     ]);
     const inboxDbEvent = dbEvents.find((event) => event.attrs?.query_name === "channels.inbox_items_by_user");
     assert.ok(inboxDbEvent);
@@ -496,6 +512,29 @@ test("GET /api/channels/inbox records inbox phases and query shape", async ({ ap
     assert.equal(readyEvent.attrs?.inbox_items_count, body.items.length);
     assert.equal(Object.values(span.attrs ?? {}).includes(f.ownerId), false);
     assert.equal(Object.values(readyEvent.attrs ?? {}).includes(dm.id), false);
+
+    // #triage:#229: a realtime re-read names its trigger and coalesced count;
+    // the route reads the headers the web sends (case-insensitive).
+    const fetchAttrsFor = async (extra: Record<string, string>) => {
+      sink.clear();
+      const triggered = await fetch(`${app.baseUrl}/api/channels/inbox?filter=all&limit=10`, {
+        headers: { ...headers(f.ownerToken, f.serverId), "X-Raft-Fetch-Reason": "realtime_fallback", ...extra },
+      });
+      assert.equal(triggered.status, 200);
+      await triggered.json();
+      const triggeredSpan = sink.getAllSpans().find((candidate) =>
+        candidate.name === "server.http.request"
+        && candidate.attrs?.route_pattern === "/api/channels/inbox",
+      );
+      return triggeredSpan?.events.find((event) => event.name === "activity.list.fetch")?.attrs;
+    };
+    const triggeredAttrs = await fetchAttrsFor({ "X-Raft-Fetch-Trigger": "thread_reply", "X-Raft-Fetch-Coalesced": "4" });
+    assert.equal(triggeredAttrs?.fetch_reason, "realtime_fallback");
+    assert.equal(triggeredAttrs?.fetch_trigger, "thread_reply");
+    assert.equal(triggeredAttrs?.fetch_coalesced, 4);
+    const unknownAttrs = await fetchAttrsFor({ "X-Raft-Fetch-Trigger": "socket:anything", "X-Raft-Fetch-Coalesced": "lots" });
+    assert.equal(unknownAttrs?.fetch_trigger, "other");
+    assert.equal(unknownAttrs?.fetch_coalesced, 0);
   } finally {
     if (previousRfc056ServingMode === undefined) {
       delete process.env.RISINGWAVE_INBOX_RFC056_SERVING_MODE;
@@ -562,7 +601,7 @@ test("GET /api/channels/inbox admission precedes verified-profile and server DB 
   const blocker = await gate.acquire();
   const request = () => fetch(`${app.baseUrl}/api/channels/inbox?limit=1`, {
     headers: {
-      Authorization: `Bearer ${signAccessToken(randomUUID())}`,
+      Authorization: `Bearer ${signAccessToken(randomUUID(), randomUUID())}`,
       "X-Server-Id": randomUUID(),
     },
   });
@@ -601,34 +640,6 @@ test("GET /api/channels/inbox admission precedes verified-profile and server DB 
 });
 
 
-test("legacy PG inbox policy query keeps SQL-side paging bounded", () => {
-  const source = readFileSync(new URL("../services/channelService.ts", import.meta.url), "utf8");
-  const legacyQueries = [
-    ...source.matchAll(
-      /traceQuery\(\s*"channels\.inbox_items_by_user",\s*\(\)\s*=>\s*db\.execute\(sql`([\s\S]*?)`\),\s*\(queryResult\)\s*=>\s*\(\{/g,
-    ),
-  ].map((match) => match[1]!);
-  assert.equal(legacyQueries.length, 2, "expected canonical and legacy PG inbox query blocks");
-  const [canonicalPgQuery, legacyPgQuery] = legacyQueries;
-
-  assert.doesNotMatch(source, /const messageCutoff = historyCutoff/);
-  assert.doesNotMatch(canonicalPgQuery, /\$\{messageCutoff\}/);
-  assert.doesNotMatch(legacyPgQuery, /\$\{messageCutoff\}/);
-  assert.match(legacyPgQuery, /filtered AS \(/);
-  assert.match(legacyPgQuery, /totals AS \(/);
-  assert.match(legacyPgQuery, /page AS \(/);
-  assert.match(legacyPgQuery, /LIMIT \$\{limit \+ 1\}/);
-  assert.match(legacyPgQuery, /OFFSET \$\{offset\}/);
-  assert.match(
-    legacyPgQuery,
-    /SELECT\s+page\.\*,\s+totals\."totalCount",\s+totals\."totalUnreadCount",\s+active_totals\."activeUnreadCount"/,
-  );
-  assert.match(legacyPgQuery, /active_totals AS \(/);
-  assert.doesNotMatch(legacyPgQuery, /has_any_mention ON true/);
-  assert.doesNotMatch(legacyPgQuery, /SELECT \*\s+FROM combined\s+ORDER BY "activityAt" DESC NULLS LAST/);
-  assert.doesNotMatch(source, /applyInboxPolicyFilterPageRows\(rawRows/);
-});
-
 
 test("bounded inbox serving prefix filters inaccessible newest rows before LIMIT", async ({ app }) => {
   const db = getDb();
@@ -664,34 +675,13 @@ test("bounded inbox serving prefix filters inaccessible newest rows before LIMIT
     traceQuery: untracedDbQuery,
   });
   assert.deepEqual(
-    new Set(inbox.items.map((item) => item.kind === "thread" ? item.threadChannelId : item.channelId)),
+    new Set(inbox.items.map((item) => (item.kind === "thread" || item.kind === "task") ? item.threadChannelId : item.channelId)),
     new Set(validChannels.map((channel) => channel.id)),
     "three newer inaccessible rows must not consume the limit+1 prefix and hide later visible rows",
   );
 });
 
 
-test("RisingWave inbox serving emits payload-free null thread reply_count contract signal", () => {
-  const source = readFileSync(new URL("../services/channelService.ts", import.meta.url), "utf8");
-  const eventStart = source.indexOf("function recordRisingWaveInboxThreadReplyCountNullContractViolation");
-  const eventEnd = source.indexOf("async function getActivityUnreadTotalsBatchFromRisingWave", eventStart);
-  const eventSource = source.slice(eventStart, eventEnd);
-
-  assert.match(source, /recordRisingWaveInboxThreadReplyCountNullContractViolation\(read\.result\.rows/);
-  assert.match(eventSource, /row\.kind === "thread" && row\.replyCount == null/);
-  assert.match(eventSource, /inbox\.rw\.thread_reply_count_null_contract_violation/);
-  assert.match(eventSource, /contract: "thread_reply_count_non_null"/);
-  assert.match(eventSource, /null_thread_reply_count_rows: nullThreadReplyCountRows/);
-  assert.doesNotMatch(eventSource, /parentMessagePreview|latestActivityPreview|lastMessagePreview|content/);
-});
-
-
-test("RisingWave inbox all filter keeps private member rows", () => {
-  const source = readFileSync(new URL("../services/channelService.ts", import.meta.url), "utf8");
-
-  assert.match(source, /i\.channel_type IN \('channel', 'private', 'joint', 'dm'\)/);
-  assert.doesNotMatch(source, /i\.channel_type IN \('channel', 'joint', 'dm'\)/);
-});
 
 
 test("GET /channels/inbox legacy all filter includes private channels and private parent threads", async ({ app }) => {
@@ -1852,6 +1842,7 @@ test("POST /channels/inbox/done dismisses accessible canonical-server items with
     role: "host",
     joinedByUserId: f.memberBId,
   });
+  await fillJointMembersFromChannelHumans();
   const crossServerPrivate = await createChannel(canonicalServer.id, "cross-server-private-done-room", undefined, "private");
   const unauthorizedServer = await createServer("Unauthorized Done Scope", "unauthorized-done-scope", f.memberBId);
   const unauthorizedCrossServerPublic = await createChannel(unauthorizedServer.id, "unauthorized-cross-server-done-room");
@@ -1967,7 +1958,7 @@ test("POST /channels/threads/done dismisses public mention-only thread rows unti
 });
 
 
-test("read_receipts_v0 exposes ONLY agent watermarks (never human) and emits only advancing agent frames", async ({ app }) => {
+test("read receipts: exposes ONLY agent watermarks (never human) and emits only advancing agent frames", async ({ app }) => {
   const events = installFakeIo(app.app);
   const owner = await seedUser("receipt-owner@slock.test", "receipt-owner");
   const member = await seedUser("receipt-member@slock.test", "receipt-member");
@@ -1989,23 +1980,6 @@ test("read_receipts_v0 exposes ONLY agent watermarks (never human) and emits onl
     lastReadSeq: second.seq,
   });
 
-  const flagOffDetail = await fetch(`${app.baseUrl}/api/channels/${channel.id}`, {
-    headers: headers(ownerToken, server.id),
-  });
-  assert.equal(flagOffDetail.status, 200);
-  const flagOffBody = await flagOffDetail.json() as Record<string, unknown>;
-  assert.equal("peerReadStates" in flagOffBody, false);
-  assert.equal("peerReadSummary" in flagOffBody, false);
-
-  const flagOffRead = await fetch(`${app.baseUrl}/api/channels/${channel.id}/read`, {
-    method: "POST",
-    headers: headers(memberToken, server.id),
-    body: JSON.stringify({ seq: second.seq }),
-  });
-  assert.equal(flagOffRead.status, 200);
-  assert.equal(events.some((event) => event.event === "scope_read:updated"), false);
-
-  await enableReadReceiptsForServer(server.id);
   const detail = await fetch(`${app.baseUrl}/api/channels/${channel.id}`, {
     headers: headers(ownerToken, server.id),
   });
@@ -2060,6 +2034,7 @@ test("read_receipts_v0 exposes ONLY agent watermarks (never human) and emits onl
     agentId: agent.id,
     scopes: ["read"],
     name: "read-receipts-agent-history",
+    issuedVia: "computer",
     createdByUserId: null,
   });
   const eventCountBeforeAgentRead = events.length;
@@ -2109,7 +2084,7 @@ test("read_receipts_v0 exposes ONLY agent watermarks (never human) and emits onl
     "mark-unread must remain self-only",
   );
 
-  await removeHuman(channel.id, member.id);
+  await removeHuman(channel.id, member.id, { self: true });
   await removeAgent(channel.id, agent.id);
   const afterRemoval = await fetch(`${app.baseUrl}/api/channels/${channel.id}`, {
     headers: headers(ownerToken, server.id),
@@ -2128,7 +2103,7 @@ test("read_receipts_v0 exposes ONLY agent watermarks (never human) and emits onl
 });
 
 
-test("read_receipts_v0 hydrates a DM peer watermark", async ({ app }) => {
+test("read receipts: hydrates a DM peer watermark", async ({ app }) => {
   const owner = await seedUser("receipt-dm-owner@slock.test", "receipt-dm-owner");
   const server = await createServer("Receipt DM Server", "receipt-dm-server", owner.id);
   const agent = await createAgent(server.id, "receipt-dm-agent");
@@ -2140,7 +2115,6 @@ test("read_receipts_v0 hydrates a DM peer watermark", async ({ app }) => {
     channelId: dm.id,
     lastReadSeq: message.seq,
   });
-  await enableReadReceiptsForServer(server.id);
   const token = await tokenForHuman(owner.email);
 
   const detail = await fetch(`${app.baseUrl}/api/channels/${dm.id}`, {
@@ -2156,13 +2130,88 @@ test("read_receipts_v0 hydrates a DM peer watermark", async ({ app }) => {
 });
 
 
-test("read_receipts_v0 does not bypass the hidden human directory through #all", async ({ app }) => {
+test("read receipts: covers threads through their parent channel, and stays off under #all", async ({ app }) => {
+  const events = installFakeIo(app.app);
+  const db = getDb();
+  const owner = await seedUser("receipt-thread-owner@slock.test", "receipt-thread-owner");
+  const server = await createServer("Receipt Thread Server", "receipt-thread-server", owner.id);
+  await revealAllChannelForTest(server.id);
+  const channel = await createChannel(server.id, "receipt-thread-channel", undefined, "private");
+  await addHuman(channel.id, owner.id);
+  const agent = await createAgent(server.id, "receipt-thread-agent");
+  await addAgent(channel.id, agent.id);
+  const parent = await createMessage(channel.id, "user", owner.id, "receipt thread parent");
+  const thread = await getOrCreateThread(parent.id, owner.id, "user");
+  const reply = await createMessage(thread.id, "user", owner.id, "receipt thread reply");
+  const ownerToken = await tokenForHuman(owner.email);
+
+  const before = await fetch(`${app.baseUrl}/api/channels/${thread.id}`, {
+    headers: headers(ownerToken, server.id),
+  });
+  assert.equal(before.status, 200);
+  const beforeBody = await before.json() as { peerReadStates?: unknown[] };
+  assert.deepEqual(beforeBody.peerReadStates, [
+    { peerKind: "agent", peerId: agent.id, maxReadSeq: 0 },
+  ], "a thread hydrates its parent channel's agents");
+
+  const agentCredential = await mintAgentCredential({
+    agentId: agent.id,
+    scopes: ["read"],
+    name: "read-receipts-thread-history",
+    issuedVia: "computer",
+    createdByUserId: null,
+  });
+  const eventCountBeforeAgentRead = events.length;
+  const agentHistory = await fetch(
+    `${app.baseUrl}/internal/agent-api/history?channel=${encodeURIComponent(`#receipt-thread-channel:${parent.id.slice(0, 8)}`)}&limit=10`,
+    { headers: { Authorization: `Bearer ${agentCredential.apiKey}` } },
+  );
+  assert.equal(agentHistory.status, 200);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.deepEqual(events.slice(eventCountBeforeAgentRead).filter((event) => event.event === "scope_read:updated"), [{
+    room: `channel:${thread.id}`,
+    event: "scope_read:updated",
+    payload: {
+      scopeId: thread.id,
+      peerKind: "agent",
+      peerId: agent.id,
+      maxReadSeq: reply.seq,
+    },
+  }]);
+
+  const after = await fetch(`${app.baseUrl}/api/channels/${thread.id}`, {
+    headers: headers(ownerToken, server.id),
+  });
+  const afterBody = await after.json() as { peerReadStates?: unknown[] };
+  assert.deepEqual(afterBody.peerReadStates, [
+    { peerKind: "agent", peerId: agent.id, maxReadSeq: reply.seq },
+  ]);
+
+  const [allChannel] = await db
+    .select()
+    .from(channels)
+    .where(and(eq(channels.serverId, server.id), eq(channels.name, "all")));
+  assert.ok(allChannel);
+  const allParent = await createMessage(allChannel.id, "user", owner.id, "receipt #all thread parent");
+  const allThread = await getOrCreateThread(allParent.id, owner.id, "user");
+  const allDetail = await fetch(`${app.baseUrl}/api/channels/${allThread.id}`, {
+    headers: headers(ownerToken, server.id),
+  });
+  assert.equal(allDetail.status, 200);
+  const allBody = await allDetail.json() as Record<string, unknown>;
+  assert.equal("peerReadStates" in allBody, false, "a thread under #all inherits #all's exclusion");
+  assert.equal("peerReadSummary" in allBody, false);
+});
+
+
+test("read receipts: does not bypass the hidden human directory through #all", async ({ app }) => {
   const events = installFakeIo(app.app);
   const db = getDb();
   const owner = await seedUser("receipt-all-owner@slock.test", "receipt-all-owner");
   const member = await seedUser("receipt-all-member@slock.test", "receipt-all-member");
   const other = await seedUser("receipt-all-other@slock.test", "receipt-all-other");
   const server = await createServer("Receipt All Server", "receipt-all-server", owner.id);
+  await revealAllChannelForTest(server.id);
   await db.update(serversTable).set({ hideHumansFromMembers: true }).where(eq(serversTable.id, server.id));
   await db.insert(serverMembers).values([
     { serverId: server.id, userId: member.id, role: "member" },
@@ -2174,7 +2223,6 @@ test("read_receipts_v0 does not bypass the hidden human directory through #all",
     .where(and(eq(channels.serverId, server.id), eq(channels.name, "all")));
   assert.ok(allChannel);
   const message = await createMessage(allChannel.id, "user", owner.id, "hidden receipt all message");
-  await enableReadReceiptsForServer(server.id);
   const memberToken = await tokenForHuman(member.email);
 
   const detail = await fetch(`${app.baseUrl}/api/channels/${allChannel.id}`, {
@@ -2200,7 +2248,7 @@ test("read_receipts_v0 does not bypass the hidden human directory through #all",
 });
 
 
-test("read_receipts_v0 degrades large scopes to anonymous summary hydrate and realtime", async ({ app }) => {
+test("read receipts: degrades large scopes to anonymous summary hydrate and realtime", async ({ app }) => {
   const events = installFakeIo(app.app);
   const owner = await seedUser("receipt-large-owner@slock.test", "receipt-large-owner");
   const server = await createServer("Receipt Large Server", "receipt-large-server", owner.id);
@@ -2224,7 +2272,6 @@ test("read_receipts_v0 degrades large scopes to anonymous summary hydrate and re
     agentId: peers[0]!.id,
     lastReadSeq: first.seq,
   });
-  await enableReadReceiptsForServer(server.id);
   const ownerToken = await tokenForHuman(owner.email);
 
   const detail = await fetch(`${app.baseUrl}/api/channels/${channel.id}`, {
@@ -2250,6 +2297,7 @@ test("read_receipts_v0 degrades large scopes to anonymous summary hydrate and re
     agentId: advancingPeer.id,
     scopes: ["read"],
     name: "receipt-large-advancing",
+    issuedVia: "computer",
     createdByUserId: null,
   });
   const beforeRead = events.length;
@@ -2291,7 +2339,7 @@ test("read_receipts_v0 degrades large scopes to anonymous summary hydrate and re
 });
 
 
-test("read_receipts_v0 at exactly LIMIT+1 agents keeps hydrate and realtime on the same summary side", async ({ app }) => {
+test("read receipts: at exactly LIMIT+1 agents keeps hydrate and realtime on the same summary side", async ({ app }) => {
   const events = installFakeIo(app.app);
   const owner = await seedUser("receipt-edge-owner@slock.test", "receipt-edge-owner");
   const server = await createServer("Receipt Edge Server", "receipt-edge-server", owner.id);
@@ -2313,7 +2361,6 @@ test("read_receipts_v0 at exactly LIMIT+1 agents keeps hydrate and realtime on t
   assert.equal(agents.length, READ_RECEIPT_PEER_STATE_LIMIT + 1);
   // Posted after the agents join, so it is unread for them (read position starts at join).
   const first = await createMessage(channel.id, "user", owner.id, "receipt edge first");
-  await enableReadReceiptsForServer(server.id);
   const ownerToken = await tokenForHuman(owner.email);
 
   const detail = await fetch(`${app.baseUrl}/api/channels/${channel.id}`, {
@@ -2334,6 +2381,7 @@ test("read_receipts_v0 at exactly LIMIT+1 agents keeps hydrate and realtime on t
     agentId: advancing.id,
     scopes: ["read"],
     name: "receipt-edge-advancing",
+    issuedVia: "computer",
     createdByUserId: null,
   });
   const beforeAdvance = events.length;
@@ -2422,6 +2470,7 @@ test("POST /channels/inbox/read-all marks every active Inbox row read", async ({
     role: "host",
     joinedByUserId: f.ownerId,
   });
+  await fillJointMembersFromChannelHumans();
   const jointLatest = await createMessage(canonical.id, "user", f.memberBId, "joint unread for mark all");
   await recordTestInboxFact({
     serverId: f.serverId,
@@ -2958,7 +3007,7 @@ test("task #48: an ex-member with residue but no read cursor keeps the 403", asy
   const room = await createChannel(f.serverId, "left-room", undefined, "private");
   await addHuman(room.id, f.ownerId);
   await addHuman(room.id, f.outsiderId);
-  await removeHuman(room.id, f.outsiderId);
+  await removeHuman(room.id, f.outsiderId, { self: true });
 
   // The gap @Tenny caught: this user never read anything, so there is NO
   // user_channel_read_cursors row. A predicate that only consults the read
@@ -3025,7 +3074,7 @@ test("task #48 U1: a caller with residue but no access can retire it -- both pop
     sourceChannelId: room.id,
     message: unreadWhileMember,
   });
-  await removeHuman(room.id, f.outsiderId);
+  await removeHuman(room.id, f.outsiderId, { self: true });
 
   // The channel keeps moving after they lose access. Task #64: that activity is
   // the channel's live frontier, and read-all must never carry it into the
@@ -3119,7 +3168,7 @@ test("task #48 U3: the residue-only receipt carries only receiver-owned fields",
   await fetch(`${app.baseUrl}/api/channels/${room.id}/read-all`, {
     method: "POST", headers: h, body: JSON.stringify({}),
   });
-  await removeHuman(room.id, f.outsiderId);
+  await removeHuman(room.id, f.outsiderId, { self: true });
   // The channel keeps moving after they lose access. If any channel-derived
   // value reaches them, this is what it would expose.
   await createMessage(room.id, "user", f.ownerId, "two");
@@ -3155,7 +3204,7 @@ test("task #48 U4: retiring residue is idempotent, not an error on replay", asyn
   await fetch(`${app.baseUrl}/api/channels/${room.id}/read-all`, {
     method: "POST", headers: h, body: JSON.stringify({}),
   });
-  await removeHuman(room.id, f.outsiderId);
+  await removeHuman(room.id, f.outsiderId, { self: true });
 
   const first = await fetch(`${app.baseUrl}/api/channels/${room.id}/read-all`, {
     method: "POST", headers: h, body: JSON.stringify({}),
@@ -3218,7 +3267,7 @@ test("task #48 U6: the residue path emits no socket event carrying the live fron
   await fetch(`${app.baseUrl}/api/channels/${room.id}/read-all`, {
     method: "POST", headers: h, body: JSON.stringify({}),
   });
-  await removeHuman(room.id, f.outsiderId);
+  await removeHuman(room.id, f.outsiderId, { self: true });
   await createMessage(room.id, "user", f.ownerId, "two");
   await createMessage(room.id, "user", f.ownerId, "three");
 

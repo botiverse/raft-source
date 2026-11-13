@@ -1,3 +1,4 @@
+import { fillJointMembersFromChannelHumans } from "../test/jointMemberFill";
 import { fixturePasswordHash } from "../test/integration/credentials";
 import { createApiTest } from "../test/integration/apiTest";
 import assert from "node:assert/strict";
@@ -25,7 +26,7 @@ import { withProjectedTaskFacts } from "./messageTaskProjection";
 import { createServer } from "./serverService";
 import * as taskService from "./taskService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 async function seedUser(label: string) {
   const [user] = await getDb().insert(users).values({
@@ -181,6 +182,7 @@ test("joint task amendments authorize members through live local projections whi
       joinedByUserId: peer.id,
     },
   ]);
+  await fillJointMembersFromChannelHumans();
   const { tasks: [created] } = await taskService.createTasks(
     canonical.id,
     "user",

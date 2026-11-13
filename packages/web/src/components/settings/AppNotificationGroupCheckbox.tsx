@@ -1,8 +1,8 @@
 import { useCallback } from "react";
 import type { AppNotificationGroup } from "@botiverse/raft-shared";
 import { Checkbox } from "@botiverse/raft-ui";
-import { toggleAppNotificationGroup } from "./AppNotificationsControls";
-import type { AppNotificationSelection } from "./AppNotificationsControls";
+import { toggleAppNotificationGroup } from "./appNotificationSelection";
+import type { AppNotificationSelection } from "./appNotificationSelection";
 
 export function AppNotificationGroupCheckbox({
   group,

@@ -2,9 +2,10 @@
 // over. The CLI backs it with its local SQLite ledger
 // (cli/src/state/commandStateStore.ts); `createMemoryCommandStateStore`
 // (memoryStore.ts) is the reference implementation of the semantics below.
+// A store method may answer synchronously (the CLI's SQLite ledger) or not;
+// the policy handles both (maybe.ts).
 
-/** A store method may answer synchronously (the CLI's SQLite ledger) or not; the policy handles both (maybe.ts). */
-export type MaybePromise<T> = T | Promise<T>;
+import type { MaybePromise } from "../../maybePromise";
 
 /** One target's consumption record in the agent's ledger. */
 export interface CommandStateStreamEntry {
@@ -22,10 +23,14 @@ export interface CommandStateDraftEntry {
   attachmentIds: string[];
   idempotencyKey?: string;
   mentions?: unknown[];
+  /** RFC 082: a card message's card, as stored; drafts.ts keeps it only when it is an object. */
+  card?: unknown;
   savedAt: number;
   reholdCount: number;
   seenUpToSeq?: number;
   seenExactSeqs?: number[];
+  /** As stored; drafts.ts reads it through `savedDraftCauseOf`. */
+  cause?: string;
 }
 
 /**

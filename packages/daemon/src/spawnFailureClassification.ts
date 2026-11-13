@@ -6,6 +6,8 @@ import {
   type SpawnFailureLookupReason,
 } from "@botiverse/raft-shared";
 import {
+  AgentEnvVarsNotAllowedError,
+  OarOnlyStartError,
   RuntimeModelNotConfiguredError,
   isProviderConnectionMaterializationError,
   isRuntimeModelNotFoundError,
@@ -18,6 +20,9 @@ import { formatRuntimeResetSessionGuidance } from "./runtimeErrorDiagnostics";
 export type { SpawnFailureReason } from "./spawnFailureErrors";
 
 type RuntimeModelNotFoundErrorLike = { model: string };
+
+export const PROVIDER_API_KEY_INVALID_USER_MESSAGE =
+  "Couldn't start: there's a problem with the API key. Copy the full key again from your provider's dashboard, save, and retry.";
 
 export interface SpawnFailureClassification {
   reason: SpawnFailureReason;
@@ -61,14 +66,49 @@ function lookupVerdictOf(error: unknown): { reason: SpawnFailureLookupReason; me
   return null;
 }
 
+function envVarsNotAllowedCause(error: unknown): AgentEnvVarsNotAllowedError | null {
+  for (let current = error, depth = 0; current && depth < 5; current = (current as { cause?: unknown }).cause, depth += 1) {
+    if (current instanceof AgentEnvVarsNotAllowedError) return current;
+  }
+  return null;
+}
+
+/** Names the variables (never their values) and how to get the agent going again. */
+export function agentEnvVarsNotAllowedUserMessage(names: readonly string[], invalidNameCount = 0): string {
+  const sentences: string[] = [];
+  if (names.length > 0) {
+    const one = names.length === 1;
+    sentences.push(
+      `This agent's settings set ${names.join(", ")}, which this Computer no longer accepts from the server because ${one ? "it" : "they"} can make it run other programs.`,
+      `Remove ${one ? "it" : "them"} from the agent's environment variables, then restart the agent.`,
+    );
+  }
+  if (invalidNameCount > 0) {
+    sentences.push(
+      "This agent's environment variables include a name that is not a valid variable name (only letters, digits and underscores, not starting with a digit).",
+      "Fix or remove it in the agent's settings, then restart the agent.",
+    );
+  }
+  if (names.some((name) => name.toUpperCase() === "PATH")) {
+    // The Computer service starts from the user's login shell environment on
+    // macOS and Linux (computer shellEnvCapture.ts), so that is where PATH goes.
+    sentences.push("Agents get PATH from this computer: on macOS and Linux add the directory in your login shell's startup file (such as ~/.zshrc or ~/.profile) and restart the Computer service; on Windows add it to your user PATH.");
+  }
+  return sentences.join(" ");
+}
+
 /**
- * Map a launch failure to a stable reason + a user message that never carries
- * raw detail. Decides by the error's typed code only (task #1120): message
+ * Map a launch failure to a stable reason + a user message. Raw detail stays
+ * out of it, except where a typed error builds its own sentence (an OAR-only
+ * start quotes its runtime's masked first line, agentHostRouter.ts).
+ * Decides by the error's typed code only (task #1120): message
  * text is for logs, so a "not found" in a model error can no longer be read as
  * a missing executable. Anything without a known code is the generic fallback.
  */
 export function classifySpawnFailure(error: unknown): SpawnFailureClassification {
   const detail = error instanceof Error ? error.message : String(error);
+  // An OAR-only runtime's start names its own way out (agentHostRouter.ts).
+  if (error instanceof OarOnlyStartError) return { reason: error.spawnFailureCode, detail, userMessage: error.userMessage };
   const reason = spawnFailureCodeOf(error) ?? "runtime_spawn_failed";
 
   switch (reason) {
@@ -144,6 +184,11 @@ export function classifySpawnFailure(error: unknown): SpawnFailureClassification
         userMessage: `Model ${model} is not configured for this runtime on this computer. Choose a configured model in the agent's settings, or add it to the runtime's configuration there, then restart the agent.`,
       };
     }
+    case "provider_api_key_invalid":
+      // task #1307: Cat's copy. Older servers and web builds drop the typed
+      // reason and show this text, so it is the same sentence the web picks by
+      // reason. Never the key, its position or its character codes.
+      return { reason, detail, userMessage: PROVIDER_API_KEY_INVALID_USER_MESSAGE };
     case "session_needs_reset":
       return {
         reason,
@@ -179,7 +224,24 @@ export function classifySpawnFailure(error: unknown): SpawnFailureClassification
         detail,
         userMessage: "Runtime failed to start. Check the Computer logs for details and retry.",
       };
+    case "env_var_not_allowed":
+    {
+      const typed = envVarsNotAllowedCause(error);
+      return { reason, detail, userMessage: agentEnvVarsNotAllowedUserMessage(typed?.names ?? [], typed?.invalidNameCount ?? 0) };
+    }
+    case "runtime_start_timeout":
+    case "model_unsupported":
+    case "runtime_repeated_failure":
+      // Reported by the daemon itself (`startTimeoutClassification`, a
+      // reconciler step 12 hand-off), never thrown; an error carrying the
+      // code keeps its own message.
+      return { reason, detail, userMessage: detail };
   }
+}
+
+/** A start whose runtime never produced its first output in time; `detail` is the copy shown. */
+export function startTimeoutClassification(detail: string): SpawnFailureClassification {
+  return { reason: "runtime_start_timeout", detail, userMessage: detail };
 }
 
 /** What a failed start shows: the user message and its typed reason (task #1123). */
@@ -190,10 +252,11 @@ export interface StartFailureActivity {
 
 /**
  * The `runtime_unavailable` activity of a failed start. The configured model
- * rides along only for the model reasons, bounded, so the web can name it.
+ * rides along only for the model reasons and a start timeout (the model is the
+ * likely cause), bounded, so the web and the server's pause trace can name it.
  */
 export function startFailureActivity(classification: SpawnFailureClassification, model: string | null | undefined): StartFailureActivity {
-  const carriesModel = (classification.reason === "model_not_found" || classification.reason === "model_not_configured")
+  const carriesModel = (classification.reason === "model_not_found" || classification.reason === "model_not_configured" || classification.reason === "model_unsupported" || classification.reason === "runtime_start_timeout")
     && typeof model === "string" && model.length > 0;
   const carriesLookupReason = classification.reason === "runtime_not_found" && classification.lookupReason !== undefined;
   return {

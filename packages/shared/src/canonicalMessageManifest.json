@@ -1,5 +1,5 @@
 {
-  "version": 6,
+  "version": 7,
   "producerRegistryAnchor": "slock#4593@b0fcdfd9fae9f0af9b32a87a1d5c3e196d3fdaa1",
   "fields": [
     {
@@ -167,6 +167,18 @@
       "presence": {
         "messageNew": "present",
         "enrichedUpdated": "absent",
+        "taskStatusUpdated": "absent"
+      }
+    },
+    {
+      "name": "deletedAt",
+      "class": "optionalAggregate",
+      "wireType": "string",
+      "nullable": true,
+      "mergePolicy": "present-overwrite",
+      "presence": {
+        "messageNew": "present",
+        "enrichedUpdated": "present",
         "taskStatusUpdated": "absent"
       }
     },
@@ -459,9 +471,21 @@
         "nullable": false
       },
       {
+        "name": "identityKind",
+        "wireType": "string-union-raw",
+        "nullable": false,
+        "optionalKey": true
+      },
+      {
         "name": "installId",
         "wireType": "string",
         "nullable": false
+      },
+      {
+        "name": "profileFallback",
+        "wireType": "string-union-raw",
+        "nullable": false,
+        "optionalKey": true
       },
       {
         "name": "projectionId",
@@ -501,9 +525,11 @@
     },
     "emittedUnconsumed": {
       "fields": [
-        "updatedAt"
+        "updatedAt",
+        "delegatedBy",
+        "delegatedByAgentId"
       ],
-      "migrationStatus": "web canonical zero-consumption; mobile legacy consumption to retire in round-2 (label/event-key/SQL cache -> (epoch,seq,id/revision) adjudication)"
+      "migrationStatus": "web canonical zero-consumption; mobile legacy consumption to retire in round-2 (label/event-key/SQL cache -> (epoch,seq,id/revision) adjudication); RFC 077 delegation fields: web/mobile label pending (Kirby / Lagoon)"
     },
     "viewerScopedFields": {
       "fields": [

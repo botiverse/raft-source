@@ -1,3 +1,4 @@
+// `raft task claim "#ch:#N"`, or
 // `raft task claim --target <ch> [--number N ...] [--message-id <id> ...]`
 // → POST /internal/agent-api/tasks/claim
 //
@@ -7,22 +8,23 @@
 
 import type { Command } from "commander";
 import type { AgentApiTaskClaimBody, AgentApiTaskClaimSuccessResponse } from "@botiverse/raft-shared";
-import { TASK_CLAIM_REASON_ALREADY_CLAIMED_BY_YOU } from "@botiverse/raft-shared/src/agentCliSurface";
+import { TASK_CLAIM_REASON_ALREADY_CLAIMED_BY_YOU, TASK_V2_USE_CREATE_ERROR_CODE } from "@botiverse/raft-shared/src/agentCliSurface";
 
 import { createAgentApiSurfaceClient } from "../../agentApiPath";
 import { defineCommand, registerCliCommand } from "../../core/command";
 import type { CommandRuntimeOptions } from "../../core/context";
 import { cliError } from "../../core/errors";
 import { writeText, adoptCliReplyText } from "../../core/renderer";
-import { apiFailureError } from "../_apiFailure";
+import { apiFailureError, rateLimitedResponseError } from "../_apiFailure";
 import { PEER_KIND_OPTION, requireTargetAlias, type TargetAliasOpts } from "../_target";
-import { formatFreshnessHoldOutput, isFreshnessHeldResponse } from "../freshness/_format";
 import {
   reviewerIsolationEnabled,
   reviewerIsolationOption,
   type ReviewerIsolationOpts,
 } from "../reviewerIsolation";
 import { formatClaimResults } from "./_format";
+import { NO_TASK_NAMED_MESSAGE, resolveTaskAddress, TASK_REF_ARGUMENT } from "./_taskAddress";
+import { writeHeldTaskWrite } from "../freshness/_taskHold";
 
 interface ClaimOpts extends TargetAliasOpts, ReviewerIsolationOpts {
   number?: string[];
@@ -36,9 +38,11 @@ function isTaskClaimSuccessResponse(data: unknown): data is AgentApiTaskClaimSuc
 export const taskClaimCommand = defineCommand(
   {
     name: "claim",
-    description: "Claim one or more tasks (by task number or message id)",
+    description: "Claim one or more tasks (by task ref, task number or message id)",
+    arguments: [TASK_REF_ARGUMENT],
+    usage: '"#channel:#7"  (or --target "#channel" --number 7 [--number 8 ...] / --message-id <id>)',
     options: [
-      { flags: "--target <target>", description: "Channel target: '#channel'" },
+      { flags: "--target <target>", description: "The task's board: '#channel' or 'dm:@peer' (with --number / --message-id), instead of a ref" },
       { flags: "--channel <target>", description: "Legacy alias for --target (accepted during transition)" },
       PEER_KIND_OPTION,
       {
@@ -53,17 +57,45 @@ export const taskClaimCommand = defineCommand(
       },
       reviewerIsolationOption,
     ],
+    guidance: [
+      "Servers with task conversations:",
+      "  --message-id does not claim there: the whole call does nothing and fails with code task_v2_use_create,",
+      "  printing what to run instead — for a message that has tasks, one claim per task:",
+      "    raft task claim --target \"#channel\" --number <N>",
+      "  for a message without a task, create one from it and take it:",
+      "    raft task create --target \"#channel\" --message-id <id> --title \"…\" --assignee @you",
+    ].join("\n"),
   },
-  async (ctx, opts: ClaimOpts) => {
-      const channel = requireTargetAlias(opts);
-      const numbers = (opts.number ?? []).map((raw) => {
-        const n = Number(raw);
-        if (!Number.isFinite(n) || !Number.isInteger(n) || n <= 0) {
-          throw cliError("INVALID_ARG", `--number must be a positive integer; got ${raw}`);
-        }
-        return n;
-      });
+  async (ctx, refArg: string | undefined, opts: ClaimOpts = {}) => {
+      let channel: string;
+      let numbers: number[];
       const messageIds = opts.messageId ?? [];
+      if (refArg?.trim()) {
+        // One task by its ref; --number may only repeat it, and a message id
+        // names something else.
+        if (messageIds.length > 0) {
+          throw cliError("INVALID_ARG", "Give a task ref or --message-id, not both.");
+        }
+        const extra = opts.number ?? [];
+        if (extra.length > 1) {
+          throw cliError("INVALID_ARG", "A task ref names one task; to claim several, use --target with one --number each.");
+        }
+        const address = resolveTaskAddress(refArg, { ...opts, number: extra[0] });
+        channel = address.channel;
+        numbers = [address.taskNumber];
+      } else {
+        if (!opts.target?.trim() && !opts.channel?.trim() && (opts.number ?? []).length === 0 && messageIds.length === 0) {
+          throw cliError("INVALID_ARG", NO_TASK_NAMED_MESSAGE);
+        }
+        channel = requireTargetAlias(opts);
+        numbers = (opts.number ?? []).map((raw) => {
+          const n = Number(raw);
+          if (!Number.isFinite(n) || !Number.isInteger(n) || n <= 0) {
+            throw cliError("INVALID_ARG", `--number must be a positive integer; got ${raw}`);
+          }
+          return n;
+        });
+      }
 
       if (numbers.length === 0 && messageIds.length === 0) {
         throw cliError("INVALID_ARG", "Provide at least one --number or --message-id");
@@ -92,12 +124,19 @@ export const taskClaimCommand = defineCommand(
         throw err;
       }
       if (!res.ok) {
+        // The budget's sentence carries only counts, so reviewer isolation shows it too.
+        const rateLimited = rateLimitedResponseError(res);
+        if (rateLimited) throw rateLimited;
         if (reviewerIsolation) {
           const code = res.status >= 500 ? "SERVER_5XX" : "CLAIM_FAILED";
           throw cliError(
             code,
             `Reviewer-isolation task claim failed (HTTP ${res.status}); upstream error detail was withheld.`,
           );
+        }
+        if (res.errorCode === TASK_V2_USE_CREATE_ERROR_CODE) {
+          // Nothing was claimed; the server's text lists the commands to use instead.
+          throw cliError(TASK_V2_USE_CREATE_ERROR_CODE, res.error ?? `HTTP ${res.status}`);
         }
         if (res.status >= 500 && res.errorCode === "agent_proxy_failed") {
           // Next action comes from the shared per-failure_class default.
@@ -109,16 +148,7 @@ export const taskClaimCommand = defineCommand(
       if (!res.data) {
         throw cliError("INVALID_JSON_RESPONSE", "Agent API taskClaim returned an empty response body");
       }
-      if (isFreshnessHeldResponse(res.data)) {
-        writeText(ctx.io, formatFreshnessHoldOutput(channel, res.data, {
-          heldAction: "Your task claim was not applied.",
-          withholdContext: reviewerIsolation || res.data.freshnessContextMode === "withheld",
-          draftInstructions: reviewerIsolation || res.data.freshnessContextMode === "withheld"
-            ? "Retry remains held while reviewer isolation is active. Use a clean review target, or leave the seat and read only with explicit review authority.\n"
-            : "After reviewing the newer context, rerun the task claim command if it is still correct.\n",
-        }));
-        return;
-      }
+      if (writeHeldTaskWrite(ctx, agentContext.agentId, "task_claim", body, res.data, { reviewerIsolation })) return;
       if (!isTaskClaimSuccessResponse(res.data)) {
         throw cliError("INVALID_JSON_RESPONSE", "Agent API taskClaim returned an unexpected response body");
       }

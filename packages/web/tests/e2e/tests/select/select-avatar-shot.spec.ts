@@ -7,7 +7,7 @@ import { dismissOwnerOnboarding } from "../../fixtures/session";
 const AVATAR_PNG_FIXTURE =
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
 
-test("share screenshot keeps pixel, uploaded, gravatar, and fallback avatar cases", async ({ page, request }) => {
+test("share screenshot keeps pixel, uploaded, and fallback avatar cases", async ({ page, request }) => {
   const seedState = await waitForSeedState();
   const login = await loginViaApi(request, seedState);
   await dismissOwnerOnboarding(request, seedState, login.accessToken);
@@ -41,7 +41,7 @@ test("share screenshot keeps pixel, uploaded, gravatar, and fallback avatar case
     window.fetch = async (input, init) => {
       const url = String(input);
       requestedUrls.push(url);
-      if (url.includes("/api/avatars/") || url.includes("gravatar.com/avatar/")) {
+      if (url.includes("/api/avatars/")) {
         const bytes = Uint8Array.from(atob(avatarPng), (char) => char.charCodeAt(0));
         return new Response(new Blob([bytes], { type: "image/png" }), {
           status: 200,
@@ -87,23 +87,16 @@ test("share screenshot keeps pixel, uploaded, gravatar, and fallback avatar case
     uploaded.style.cssText = "display:flex;gap:12px;border:2px solid transparent;padding:8px;background:transparent";
     uploaded.insertAdjacentHTML("beforeend", "<img alt=\"uploaded\" src=\"https://cdn.invalid/avatars/users/0123456789abcdef0123456789abcdef.webp\" style=\"width:32px;height:32px;object-fit:cover\" /><div><div style='font-weight:700'>Uploaded agent</div><div>uploaded avatar</div></div>");
 
-    const gravatar = document.createElement("div");
-    gravatar.id = "message-avatar-gravatar-fixture";
-    gravatar.dataset.avatarKind = "human";
-    gravatar.style.cssText = "display:flex;gap:12px;border:2px solid transparent;padding:8px;background:transparent";
-    gravatar.insertAdjacentHTML("beforeend", "<img alt=\"gravatar\" src=\"https://www.gravatar.com/avatar/0123456789abcdef0123456789abcdef?s=32&d=404\" style=\"width:32px;height:32px;object-fit:cover\" /><div><div style='font-weight:700'>Gravatar human</div><div>gravatar avatar</div></div>");
-
     const fallback = document.createElement("div");
     fallback.id = "message-avatar-fallback-fixture";
     fallback.style.cssText = "display:flex;gap:12px;border:2px solid transparent;padding:8px;background:transparent";
     fallback.insertAdjacentHTML("beforeend", "<div style='width:32px;height:32px;background-color:rgb(187, 175, 230);border:2px solid rgb(20, 17, 17)'><svg viewBox='0 0 24 24' width='16' height='16' fill='none' stroke='rgb(20, 17, 17)'><path d='M20 21a8 8 0 0 0-16 0'/><circle cx='12' cy='7' r='4'/></svg></div><div><div style='font-weight:700'>Fallback human</div><div>placeholder avatar</div></div>");
 
-    host.append(uploaded, gravatar, fallback);
+    host.append(uploaded, fallback);
     document.body.appendChild(host);
     const dataUrl = await captureSelectedMessages([
       pixelMessageId.replace(/^message-/, ""),
       "avatar-uploaded-fixture",
-      "avatar-gravatar-fixture",
       "avatar-fallback-fixture",
     ], { backgroundColor: "#FFFFFF", pixelRatio: 2 });
 
@@ -183,7 +176,6 @@ test("share screenshot keeps pixel, uploaded, gravatar, and fallback avatar case
   expect(result.uniquePixelOutsideAvatar).toBe(0);
   expect(result.contentStartY).toBeGreaterThan(0);
   expect(result.requestedUrls.some((url) => url.includes("/api/avatars/users/0123456789abcdef0123456789abcdef.webp"))).toBe(true);
-  expect(result.requestedUrls.some((url) => url.includes("gravatar.com/avatar/0123456789abcdef0123456789abcdef"))).toBe(true);
 });
 
 test("share screenshot does not retry a failed cross-origin avatar in foreignObject", async ({ page, request }) => {

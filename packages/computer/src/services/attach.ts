@@ -21,13 +21,13 @@
 //     normally).
 import { chmod, mkdir, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
-import { ComputerAttachClient } from "../apiClient";
+import { ComputerAttachClient, type AttachResult as AttachClientResult } from "../apiClient";
 import {
   deriveDefaultComputerName,
   serverAttachmentPath,
   userSessionPath,
 } from "../paths";
-import { formatServerSlugDisplay, normalizeServerSlug, resolveAttachedServerSlug } from "../serverState";
+import { formatServerSlugDisplay, normalizeServerSlug, resolveAttachedServerSlug, type ServerAttachment } from "../serverState";
 import { canonicalizeServerUrl, resolveServerUrl, resolveServerUrlEnv } from "../serverUrl";
 import type { ComputerApiEvent } from "../lib/events";
 import { ComputerServiceError } from "./errors";
@@ -76,7 +76,7 @@ export interface AttachOptions {
   onEvent?: (event: ComputerApiEvent) => void;
 }
 
-function emit(opts: AttachOptions | undefined, event: ComputerApiEvent): void {
+export function emitAttachEvent(opts: AttachOptions | undefined, event: ComputerApiEvent): void {
   const cb = opts?.onEvent;
   if (!cb) return;
   try {
@@ -100,6 +100,146 @@ function attachNotAuthorizedMessage(
   });
 }
 
+/**
+ * An already-attached server: prove the saved credential with the read-only
+ * preflight and report the existing attachment. Never asks the server for a
+ * new one (a fresh attach would orphan this Computer identity).
+ */
+export async function resumeExistingAttachment(
+  existing: ServerAttachment,
+  slugForServer: string,
+  slockHome: string,
+  options: AttachOptions,
+): Promise<AttachResult> {
+  emitAttachEvent(options, { kind: "attach.attaching", serverSlug: slugForServer });
+  emitAttachEvent(options, { kind: "attach.preflight", resumed: true });
+  options.signal?.throwIfAborted?.();
+  const client = new ComputerAttachClient(existing.serverUrl, "");
+  let pre: Awaited<ReturnType<ComputerAttachClient["preflight"]>>;
+  try {
+    pre = await client.preflight(existing.apiKey);
+  } catch {
+    pre = { ok: false as const, code: "request_failed" };
+  }
+  if (!pre.ok) {
+    const detail =
+      pre.code === "request_failed"
+        ? `Network or server may be unavailable; not creating a fresh attachment. Retry later.`
+        : `The saved Computer credential may be revoked or invalid; not creating a fresh attachment. ` +
+          `Ask an admin to recover/rebind, then run \`raft-computer setup ${formatServerSlugDisplay(slugForServer)}\` again.`;
+    throw new ComputerServiceError(
+      "PREFLIGHT_FAILED",
+      `Existing local attachment for ${formatServerSlugDisplay(slugForServer)} failed preflight (${pre.code}). ` +
+        detail,
+    );
+  }
+
+  const file = serverAttachmentPath(slockHome, existing.serverId);
+  const apiKeyRedactedPrefix = existing.apiKey.slice(0, 8);
+  const existingSlug = existing.serverSlug ?? slugForServer;
+  emitAttachEvent(options, {
+    kind: "attach.attached",
+    serverId: existing.serverId,
+    serverMachineId: existing.serverMachineId,
+    serverSlug: existingSlug,
+    attachmentPath: file,
+    resumed: true,
+    apiKeyRedactedPrefix,
+  });
+  return {
+    serverId: existing.serverId,
+    serverMachineId: existing.serverMachineId,
+    ...(existing.machineId ? { machineId: existing.machineId } : {}),
+    serverSlug: existingSlug,
+    serverUrl: existing.serverUrl,
+    attachmentPath: file,
+    resumed: true,
+    apiKeyRedactedPrefix,
+  };
+}
+
+/**
+ * A freshly issued attachment: run the §9 preflight with the new
+ * sk_computer_*, and only then write runner.state.json (0600). Event/result
+ * payloads only ever carry the 8-char prefix.
+ */
+export async function commitAttachment(
+  client: ComputerAttachClient,
+  attached: Extract<AttachClientResult, { status: "success" }>,
+  baseUrl: string,
+  slockHome: string,
+  options: AttachOptions,
+): Promise<AttachResult> {
+  // attached.status === "success" — sk_computer_* held in this binding only
+  // for the preflight call below + the runner.state.json write. Event/result
+  // payloads only ever carry the 8-char prefix.
+  emitAttachEvent(options, { kind: "attach.preflight", resumed: attached.resumed });
+  options.signal?.throwIfAborted?.();
+  let pre: Awaited<ReturnType<ComputerAttachClient["preflight"]>>;
+  try {
+    pre = await client.preflight(attached.apiKey);
+  } catch {
+    pre = { ok: false as const, code: "request_failed" };
+  }
+  if (!pre.ok) {
+    throw new ComputerServiceError(
+      "PREFLIGHT_FAILED",
+      `Server preflight failed (${pre.code}). The server's Computer surface is not aligned; nothing was written locally. Upgrade the server or retry.`,
+    );
+  }
+
+  // Preflight passed → commit local state (0600), per add-not-replace.
+  const file = serverAttachmentPath(slockHome, attached.serverId);
+  await mkdir(dirname(file), { recursive: true });
+  await writeFile(
+    file,
+    JSON.stringify(
+      {
+        kind: "computer-attachment",
+        serverId: attached.serverId,
+        serverSlug: attached.serverSlug,
+        serverMachineId: attached.serverMachineId,
+        // `machines.id` (== `computers.machineId` link on the server); used
+        // by `ServerStatusRow.machineId` so the menu-bar's
+        // "Open This Computer in Browser" lands on a real dashboard row.
+        // Optional: a pre-#99 server doesn't return it.
+        ...(attached.machineId ? { machineId: attached.machineId } : {}),
+        apiKey: attached.apiKey,
+        serverUrl: baseUrl,
+        attachedAt: new Date().toISOString(),
+      },
+      null,
+      2,
+    ),
+    { mode: 0o600 },
+  );
+  // writeFile mode only applies on create; force 0o600 on the resume
+  // (overwrite) path too so a rotated credential never widens perms.
+  await chmod(file, 0o600);
+
+  const apiKeyRedactedPrefix = attached.apiKey.slice(0, 8);
+  emitAttachEvent(options, {
+    kind: "attach.attached",
+    serverId: attached.serverId,
+    serverMachineId: attached.serverMachineId,
+    serverSlug: attached.serverSlug,
+    attachmentPath: file,
+    resumed: attached.resumed,
+    apiKeyRedactedPrefix,
+  });
+
+  return {
+    serverId: attached.serverId,
+    serverMachineId: attached.serverMachineId,
+    ...(attached.machineId ? { machineId: attached.machineId } : {}),
+    serverSlug: attached.serverSlug,
+    serverUrl: baseUrl,
+    attachmentPath: file,
+    resumed: attached.resumed,
+    apiKeyRedactedPrefix,
+  };
+}
+
 export async function attach(input: AttachInput, options: AttachOptions = {}): Promise<AttachResult> {
   options.signal?.throwIfAborted?.();
   const { slockHome } = input;
@@ -121,51 +261,7 @@ export async function attach(input: AttachInput, options: AttachOptions = {}): P
       );
     }
 
-    emit(options, { kind: "attach.attaching", serverSlug: slugForServer });
-    emit(options, { kind: "attach.preflight", resumed: true });
-    options.signal?.throwIfAborted?.();
-    const client = new ComputerAttachClient(existing.serverUrl, "");
-    let pre: Awaited<ReturnType<ComputerAttachClient["preflight"]>>;
-    try {
-      pre = await client.preflight(existing.apiKey);
-    } catch {
-      pre = { ok: false as const, code: "request_failed" };
-    }
-    if (!pre.ok) {
-      const detail =
-        pre.code === "request_failed"
-          ? `Network or server may be unavailable; not creating a fresh attachment. Retry later.`
-          : `The saved Computer credential may be revoked or invalid; not creating a fresh attachment. ` +
-            `Ask an admin to recover/rebind, then run \`raft-computer setup ${formatServerSlugDisplay(slugForServer)}\` again.`;
-      throw new ComputerServiceError(
-        "PREFLIGHT_FAILED",
-        `Existing local attachment for ${formatServerSlugDisplay(slugForServer)} failed preflight (${pre.code}). ` +
-          detail,
-      );
-    }
-
-    const file = serverAttachmentPath(slockHome, existing.serverId);
-    const apiKeyRedactedPrefix = existing.apiKey.slice(0, 8);
-    const existingSlug = existing.serverSlug ?? slugForServer;
-    emit(options, {
-      kind: "attach.attached",
-      serverId: existing.serverId,
-      serverMachineId: existing.serverMachineId,
-      serverSlug: existingSlug,
-      attachmentPath: file,
-      resumed: true,
-      apiKeyRedactedPrefix,
-    });
-    return {
-      serverId: existing.serverId,
-      serverMachineId: existing.serverMachineId,
-      ...(existing.machineId ? { machineId: existing.machineId } : {}),
-      serverSlug: existingSlug,
-      serverUrl: existing.serverUrl,
-      attachmentPath: file,
-      resumed: true,
-      apiKeyRedactedPrefix,
-    };
+    return resumeExistingAttachment(existing, slugForServer, slockHome, options);
   }
 
   const sessionFile = userSessionPath(slockHome);
@@ -174,19 +270,19 @@ export async function attach(input: AttachInput, options: AttachOptions = {}): P
   if (session.status === "not_logged_in" && session.reason === "missing") {
     throw new ComputerServiceError(
       "NO_USER_SESSION",
-      `No user session at ${sessionFile}. Run \`raft-computer login\` first.`,
+      `No user session at ${sessionFile}. Run \`raft-computer attach ${formatServerSlugDisplay(slugForServer)}\` to approve this machine instead.`,
     );
   }
   if (session.status === "not_logged_in" && session.reason === "invalid") {
     throw new ComputerServiceError(
       "INVALID_USER_SESSION",
-      `User session at ${sessionFile} is invalid. Re-run \`raft-computer login\`.`,
+      `User session at ${sessionFile} is invalid. Run \`raft-computer attach ${formatServerSlugDisplay(slugForServer)}\` to approve this machine instead.`,
     );
   }
   if (session.status === "not_logged_in") {
     throw new ComputerServiceError(
       "USER_SESSION_EXPIRED",
-      "Your user session is no longer valid. Re-run `raft-computer login`.",
+      `Your user session is no longer valid. Run \`raft-computer attach ${formatServerSlugDisplay(slugForServer)}\` to approve this machine instead.`,
     );
   }
 
@@ -194,7 +290,7 @@ export async function attach(input: AttachInput, options: AttachOptions = {}): P
   const computerName = input.name?.trim() || deriveDefaultComputerName();
 
   options.signal?.throwIfAborted?.();
-  emit(options, { kind: "attach.attaching", serverSlug: slugForServer });
+  emitAttachEvent(options, { kind: "attach.attaching", serverSlug: slugForServer });
 
   let client = new ComputerAttachClient(baseUrl, session.accessToken);
   let attached = await client.attach(slugForServer, computerName);
@@ -236,7 +332,7 @@ export async function attach(input: AttachInput, options: AttachOptions = {}): P
     if (attached.code === "session_invalid") {
       throw new ComputerServiceError(
         "USER_SESSION_EXPIRED",
-        "Your user session is no longer valid. Re-run `raft-computer login`.",
+        `Your user session is no longer valid. Run \`raft-computer attach ${formatServerSlugDisplay(slugForServer)}\` to approve this machine instead.`,
       );
     }
     if (attached.code === "request_failed") {
@@ -257,67 +353,5 @@ export async function attach(input: AttachInput, options: AttachOptions = {}): P
     );
   }
 
-  // attached.status === "success" — sk_computer_* held in this binding only
-  // for the preflight call below + the runner.state.json write. Event/result
-  // payloads only ever carry the 8-char prefix.
-  emit(options, { kind: "attach.preflight", resumed: attached.resumed });
-  options.signal?.throwIfAborted?.();
-  const pre = await client.preflight(attached.apiKey);
-  if (!pre.ok) {
-    throw new ComputerServiceError(
-      "PREFLIGHT_FAILED",
-      `Server preflight failed (${pre.code}). The server's Computer surface is not aligned; nothing was written locally. Upgrade the server or retry.`,
-    );
-  }
-
-  // Preflight passed → commit local state (0600), per add-not-replace.
-  const file = serverAttachmentPath(slockHome, attached.serverId);
-  await mkdir(dirname(file), { recursive: true });
-  await writeFile(
-    file,
-    JSON.stringify(
-      {
-        kind: "computer-attachment",
-        serverId: attached.serverId,
-        serverSlug: attached.serverSlug,
-        serverMachineId: attached.serverMachineId,
-        // `machines.id` (== `computers.machineId` link on the server); used
-        // by `ServerStatusRow.machineId` so the menu-bar's
-        // "Open This Computer in Browser" lands on a real dashboard row.
-        // Optional: a pre-#99 server doesn't return it.
-        ...(attached.machineId ? { machineId: attached.machineId } : {}),
-        apiKey: attached.apiKey,
-        serverUrl: baseUrl,
-        attachedAt: new Date().toISOString(),
-      },
-      null,
-      2,
-    ),
-    { mode: 0o600 },
-  );
-  // writeFile mode only applies on create; force 0o600 on the resume
-  // (overwrite) path too so a rotated credential never widens perms.
-  await chmod(file, 0o600);
-
-  const apiKeyRedactedPrefix = attached.apiKey.slice(0, 8);
-  emit(options, {
-    kind: "attach.attached",
-    serverId: attached.serverId,
-    serverMachineId: attached.serverMachineId,
-    serverSlug: attached.serverSlug,
-    attachmentPath: file,
-    resumed: attached.resumed,
-    apiKeyRedactedPrefix,
-  });
-
-  return {
-    serverId: attached.serverId,
-    serverMachineId: attached.serverMachineId,
-    ...(attached.machineId ? { machineId: attached.machineId } : {}),
-    serverSlug: attached.serverSlug,
-    serverUrl: baseUrl,
-    attachmentPath: file,
-    resumed: attached.resumed,
-    apiKeyRedactedPrefix,
-  };
+  return commitAttachment(client, attached, baseUrl, slockHome, options);
 }

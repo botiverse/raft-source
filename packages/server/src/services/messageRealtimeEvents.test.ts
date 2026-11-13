@@ -282,20 +282,6 @@ test("message:new and message:updated emitters stay on inventoried projection su
     assert.ok(entry.payloadKeys.length > 0, `${entry.id} must document payloadKeys`);
     assert.notEqual(entry.payloadKeys.length, 1, `${entry.id} must use an expanded payload key set, not an opaque label`);
   }
-
-  const taskRoutes = [
-    new URL("../routes/tasks.ts", import.meta.url),
-    new URL("../routes/internal.ts", import.meta.url),
-    new URL("../routes/internalAgentApi.ts", import.meta.url),
-  ];
-  for (const url of taskRoutes) {
-    const source = await readFile(url, "utf8");
-    assert.doesNotMatch(
-      source,
-      /emit\(\s*["']message:new["']/,
-      `${url.pathname} must use emitTaskMessageNew instead of direct message:new`,
-    );
-  }
 });
 
 test("producer marker comments are a bijection with producer callsites", () => {

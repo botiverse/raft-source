@@ -1,11 +1,10 @@
-import { randomBytes } from "node:crypto";
 import { expect, test } from "@playwright/test";
 import { seedAgentMessages } from "../../fixtures/agentMessage";
 import { loginViaApi } from "../../fixtures/auth";
 import { waitForSeedState } from "../../fixtures/seedState";
 import { dismissOwnerOnboarding } from "../../fixtures/session";
 import { seedSparseAnchorReplies } from "../../fixtures/sparseAnchorReplies";
-import { evidenceConfig, readApiRequestOccupancyEvidence } from "../../../../../../scripts/e2e/transportEvidence";
+import { loadedMessageCount } from "../../fixtures/timeline";
 
 // Regression test for #67 (cindyz f84d85ec): a thread with one reply was
 // rendering the reply pushed against the very bottom of the panel, leaving a
@@ -109,6 +108,10 @@ test.describe("thread sparse-anchor", () => {
     page,
     request,
   }) => {
+    // Seeding 100 replies over HTTP takes 14-28s on CI before the browser
+    // opens (staging runs on 10-28), so the default 30s left no room for the
+    // browser part and the test timed out at whichever step it had reached.
+    test.setTimeout(60_000);
     const seedState = await waitForSeedState();
     const login = await loginViaApi(request, seedState);
     await dismissOwnerOnboarding(request, seedState, login.accessToken);
@@ -191,11 +194,12 @@ test.describe("thread sparse-anchor", () => {
 
     const threadScroller = page.getByTestId("thread-message-scroller");
     const oldestReply = threadScroller.getByText(seededHumanReplyContents[0]!);
-    const humanReplies = threadScroller.getByText(new RegExp(`^${humanReplyPrefix} \\d{2}$`));
+    const loadedReplies = () => loadedMessageCount(threadScroller);
     for (const agentReplyContent of agentReplyContents) {
       await expect(threadScroller.getByText(agentReplyContent)).toBeVisible();
     }
-    await expect(humanReplies).toHaveCount(47);
+    // The latest 50: 47 human replies and the 3 agent replies.
+    await expect.poll(loadedReplies).toBe(50);
 
     // Force a real disconnect/reconnect after the initial HTTP window. The
     // parent-channel load owns the global lastSeq, so sync:resume replays all
@@ -205,9 +209,12 @@ test.describe("thread sparse-anchor", () => {
     await page.waitForTimeout(500);
     await context.setOffline(false);
     await expect.poll(() => resumeResponseObserved, { timeout: 20_000 }).toBe(true);
-    // The loaded reply count reads in the thread header's subtitle
-    // ("#channel · 50 replies", Raft DS › Panel), not in the scroller.
-    await expect(page.getByTestId("thread-header-subtitle")).toHaveText(/ · 50 replies$/);
+    // Once the replay has been applied, the timeline still holds the latest 50.
+    // The thread header's subtitle names every reply ("#channel · 103
+    // replies", #10997), not the loaded ones, so it can't tell.
+    await page.waitForTimeout(500);
+    expect(await loadedReplies()).toBe(50);
+    await expect(page.getByTestId("thread-header-subtitle")).toHaveText(/ · 103 replies$/);
     await expect(oldestReply).toHaveCount(0);
     await expect(page.getByRole("button", { name: /Load Older replies/i })).toHaveCount(0);
 
@@ -229,15 +236,14 @@ test.describe("thread sparse-anchor", () => {
     // 103 replies require two older pages after the latest 50. The first
     // prepend must preserve the viewport anchor and still leave the oldest
     // three human-authored replies unloaded.
-    await expect(humanReplies).toHaveCount(97);
+    await expect.poll(loadedReplies).toBe(100);
     await expect(oldestReply).toHaveCount(0);
     await expect
       .poll(() => threadScroller.evaluate((element) => element.scrollTop))
       .toBeGreaterThan(0);
 
     await scrollToTopAndWaitForOlderPage();
-    await expect(oldestReply).toHaveCount(1);
-    await expect(humanReplies).toHaveCount(100);
+    await expect.poll(loadedReplies).toBe(103);
 
     await threadScroller.evaluate((element) => {
       element.scrollTop = 0;
@@ -250,6 +256,8 @@ test.describe("thread sparse-anchor", () => {
     page,
     request,
   }) => {
+    // 125 replies seeded over HTTP: the same budget as the scroll case above.
+    test.setTimeout(60_000);
     const seedState = await waitForSeedState();
     const login = await loginViaApi(request, seedState);
     await dismissOwnerOnboarding(request, seedState, login.accessToken);
@@ -273,45 +281,13 @@ test.describe("thread sparse-anchor", () => {
       { length: 125 },
       (_, index) => `${replyPrefix} ${index.toString().padStart(3, "0")}`,
     );
-    const transport = evidenceConfig();
     const postReply = async (content: string) => {
-      // Correlate this setup write with the existing anonymous server evidence.
-      // A reset does not prove whether the write arrived; never retry the POST.
-      const traceId = transport ? randomBytes(16).toString("hex") : null;
-      const clientStartedAtEpochMs = Date.now();
-      try {
-        const replyResponse = await request.post(
-          `${seedState.urls.api}/api/channels/${seedState.channel.id}/threads`,
-          {
-            headers: traceId
-              ? { ...headers, traceparent: `00-${traceId}-${randomBytes(8).toString("hex")}-01` }
-              : headers,
-            data: {
-              parentMessageId: parentMessage.id,
-              content,
-            },
-          },
-        );
-        expect(replyResponse.ok()).toBeTruthy();
-        return content;
-      } catch (error) {
-        if (traceId) {
-          const assertionEndedAtEpochMs = Date.now();
-          // Only identifiers and lifecycle facts: no URL, content, auth or error text.
-          try {
-            await test.info().attach(`sparse-anchor-seed-${traceId}`, {
-              contentType: "application/json",
-              body: JSON.stringify({
-                traceId, clientStartedAtEpochMs, assertionEndedAtEpochMs,
-                server: readApiRequestOccupancyEvidence(transport, [{
-                  traceId, clientStartedAtEpochMs, assertionEndedAtEpochMs,
-                }]),
-              }),
-            });
-          } catch { /* Evidence failure must not replace the original request failure. */ }
-        }
-        throw error;
-      }
+      const replyResponse = await request.post(
+        `${seedState.urls.api}/api/channels/${seedState.channel.id}/threads`,
+        { headers, data: { parentMessageId: parentMessage.id, content } },
+      );
+      expect(replyResponse.ok()).toBeTruthy();
+      return content;
     };
 
     // The first and last replies are the pagination anchors asserted below.

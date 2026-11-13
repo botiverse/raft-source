@@ -1,3 +1,5 @@
+import type { HiddenHistory } from "../src/store/hiddenHistoryStore";
+import { resetGapFillForTests } from "../src/store/liveGapFill";
 import {
   selectChannelWindowMeta,
 } from "../src/store/messageStore";
@@ -49,6 +51,7 @@ const originalPost = api.post.bind(api);
 type ChannelPageData = Message[] | {
   messages: Message[];
   historyLimited?: boolean;
+  hiddenHistory?: Partial<HiddenHistory>;
   threadSummariesByParentMessageId?: Record<string, ThreadSummary>;
 };
 type ContextPageData = {
@@ -93,9 +96,11 @@ export interface WindowMetaSnapshot {
 }
 
 function resetStore() {
+  resetGapFillForTests();
   useMessageStore.setState({
     channelMessages: {},
     channelWindowMeta: {},
+    historyFetchedChannels: {},
     messages: [],
     highlightedMessageId: null,
     lastSeq: 0,
@@ -161,6 +166,8 @@ export function createMessageWindowHarness() {
       const lastSeq = overrides?.lastSeq ?? getMaxSeq(messages);
       useMessageStore.setState({
         channelMessages: { [channelId]: messages },
+        // A primed window stands for one a history read filled.
+        historyFetchedChannels: { [channelId]: true },
         channelWindowMeta: {
           [channelId]: {
             loading: overrides?.loading ?? false,
@@ -228,6 +235,10 @@ export function createMessageWindowHarness() {
 
     async syncGap(channelId?: string) {
       await useMessageStore.getState().syncGap(channelId);
+    },
+
+    async loadMessages(channelId: string) {
+      await useMessageStore.getState().loadMessages(channelId);
     },
 
     async loadMessageContext(channelId: string, messageId: string) {

@@ -1,0 +1,38 @@
+{
+  "formatVersion": 1,
+  "id": "R11-count-wins-over-mark",
+  "rule": "R11",
+  "title": "A count wins over the marked-unread dot",
+  "why": "Once something countable lies past the read position the row shows its number, not the dot.",
+  "status": "agreed",
+  "sources": {
+    "web": [
+      "packages/web/src/utils/channelUnreadIndicator.ts (getChannelUnreadIndicatorState)",
+      "packages/web/src/features/sidebar/rows/ChannelRow.tsx"
+    ],
+    "app": [
+      "compose/shared/src/commonMain/kotlin/build/raft/app/RaftHomeComponents.kt (homeChannelRowMarks)"
+    ]
+  },
+  "given": {
+    "conversation": {
+      "id": "channel-1",
+      "kind": "channel"
+    },
+    "row": {
+      "joined": true,
+      "muted": false,
+      "unread": 2,
+      "markedUnread": true
+    }
+  },
+  "steps": [],
+  "expect": {
+    "state": {
+      "rowDisplay": {
+        "kind": "loud",
+        "unreadTone": true
+      }
+    }
+  }
+}

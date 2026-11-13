@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import {
   MachineRuntimeModelCatalogService,
+  applyRuntimeModelCatalogReport,
   __clearMachineRuntimeModelCatalogLocalCacheForTests,
 } from "./machineRuntimeModelCatalogService";
 
@@ -56,4 +57,41 @@ test("concurrent runtime reports do not lose each other, even across instances",
   ]);
   const catalog = await onDemandReplica.read("machine-4");
   assert.deepEqual(Object.keys(catalog.runtimes).sort(), ["claude", "codex", "grok"]);
+});
+
+test("a runtime's own word that it has no models clears its list; the others keep theirs", async () => {
+  const service = freshService();
+  await service.writeRuntime("machine-5", "pi", [{ id: "anthropic/claude-opus", label: "Claude Opus · Anthropic" }]);
+  await service.writeRuntime("machine-5", "codex", [{ id: "gpt-6-astra", label: "GPT-6-Astra" }]);
+  assert.equal(await service.clearRuntime("machine-5", "pi"), true);
+  const catalog = await service.read("machine-5");
+  assert.equal(catalog.runtimes.pi, undefined, "no surface offers the signed-out provider's models");
+  assert.deepEqual(catalog.runtimes.codex?.models, [{ id: "gpt-6-astra", label: "GPT-6-Astra" }]);
+  await service.writeRuntime("machine-5", "pi", [{ id: "openrouter/x", label: "X · OpenRouter" }]);
+  assert.deepEqual((await service.read("machine-5")).runtimes.pi?.models, [{ id: "openrouter/x", label: "X · OpenRouter" }], "a later sign-in brings a list back");
+});
+
+test("a Computer's catalog report clears a list only when authoritative, empty, and for a runtime that signs in per provider", async () => {
+  const service = freshService();
+  const seedLists = async () => {
+    await service.writeRuntime("machine-6", "pi", [{ id: "anthropic/opus", label: "Opus · Anthropic" }]);
+    await service.writeRuntime("machine-6", "codex", [{ id: "gpt-6-astra", label: "GPT-6-Astra" }]);
+  };
+  await seedLists();
+  assert.equal(await applyRuntimeModelCatalogReport(service, "machine-6", { runtime: "codex", models: [], authoritative: true }), "kept", "Codex has one sign-in: its probes never clear");
+  assert.equal(await applyRuntimeModelCatalogReport(service, "machine-6", { runtime: "pi", models: [] }), "kept", "a routine empty probe keeps the copy");
+  assert.equal(await applyRuntimeModelCatalogReport(service, "machine-6", { runtime: "pi", models: [{ id: "x", label: "X" }], authoritative: true }), "written");
+  assert.deepEqual((await service.read("machine-6")).runtimes.pi?.models, [{ id: "x", label: "X" }]);
+  assert.deepEqual((await service.read("machine-6")).runtimes.codex?.models, [{ id: "gpt-6-astra", label: "GPT-6-Astra" }]);
+  assert.equal(await applyRuntimeModelCatalogReport(service, "machine-6", { runtime: "pi", models: [], authoritative: true }), "cleared");
+  assert.equal((await service.read("machine-6")).runtimes.pi, undefined);
+
+  const calls: string[] = [];
+  const spy = {
+    writeRuntime: async (_machineId: string, runtime: string) => { calls.push(`write:${runtime}`); return true; },
+    clearRuntime: async (_machineId: string, runtime: string) => { calls.push(`clear:${runtime}`); return true; },
+  };
+  await applyRuntimeModelCatalogReport(spy, "machine-7", { runtime: "pi", models: [], authoritative: true });
+  await applyRuntimeModelCatalogReport(spy, "machine-7", { runtime: "claude", models: [], authoritative: true });
+  assert.deepEqual(calls, ["clear:pi", "write:claude"], "the orchestrator's path: clear for Pi only");
 });

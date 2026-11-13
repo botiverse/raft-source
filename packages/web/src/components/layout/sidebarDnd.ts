@@ -94,6 +94,45 @@ export function isPointerWithinSidebarDndBounds(
 }
 
 /**
+ * Where a row dragged over a section's drop zone, but over none of its rows,
+ * goes: after every row of that section whose middle is above the pointer.
+ *
+ * A section's rows are a list of cells (raft-design patterns/lists.md): the
+ * drop zone pads its ends by 8px and spaces its rows 2px apart, and those
+ * strips belong to the zone, not to a row. Hovering the 8px under the
+ * section's heading must put the row first, not last, and a 2px gap between
+ * two rows must put it between them. Without a pointer (a keyboard drag)
+ * there is nothing to measure: null, and the row goes last.
+ */
+export function sidebarDndContainerDropIndex(
+  containerId: string,
+  activeItemId: string,
+  pointerY: number | null | undefined,
+  rows: Iterable<{ data: unknown; rect: { top: number; bottom: number } | null | undefined }>,
+): number | null {
+  if (pointerY == null) return null;
+  let index = 0;
+  for (const { data, rect } of rows) {
+    if (!rect || !isSidebarDndData(data) || data.type !== "item") continue;
+    if (data.containerId !== containerId || data.itemId === activeItemId) continue;
+    if ((rect.top + rect.bottom) / 2 < pointerY) index += 1;
+  }
+  return index;
+}
+
+/** Reads the drop index sidebarDndContainerDropIndex put on a collision. */
+export function sidebarDndCollisionDropIndex(
+  collisions: ReadonlyArray<{ id: unknown; data?: Record<string, unknown> }> | null | undefined,
+  overId: unknown,
+): number | null {
+  const collision = collisions?.find((candidate) => candidate.id === overId);
+  const index = collision?.data?.[SIDEBAR_DND_DROP_INDEX_KEY];
+  return typeof index === "number" ? index : null;
+}
+
+export const SIDEBAR_DND_DROP_INDEX_KEY = "sidebarDropIndex";
+
+/**
  * The container a sidebar item drag should stay attached to while the pointer
  * is not over any valid destination (a gap between sections, a section header,
  * or a section the item may not enter, such as Joint Channels for a regular
@@ -143,6 +182,15 @@ export function nextSidebarDndReservedHeight(
 ): number | null {
   if (!itemDragActive) return null;
   return Math.max(reservedHeight ?? 0, measuredHeight);
+}
+
+/**
+ * Whether a drop zone has to measure itself after a render: only while an item
+ * drag is in flight or a height is still reserved. Otherwise the answer is
+ * "none" and measuring would only force a layout (web perf).
+ */
+export function sidebarDndNeedsReservedHeightMeasure(itemDragActive: boolean, reservedHeight: number | null): boolean {
+  return itemDragActive || reservedHeight !== null;
 }
 
 export function moveSidebarDndItem(

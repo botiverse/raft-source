@@ -14,7 +14,7 @@ import {
 import { getServerLabsForActor } from "./serverLabService";
 import { createServer } from "./serverService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 test("Labs GET reads membership, cursor, catalog, and enrollments in one snapshot", async ({ app }) => {
   const db = getDb();

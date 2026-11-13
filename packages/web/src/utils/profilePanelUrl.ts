@@ -1,9 +1,11 @@
 const AGENT_DETAIL_PATH_RE = /^\/s\/[^/]+\/agent\/[^/]+$/;
 const DEFAULT_AGENT_TAB = "profile";
-const AGENT_TAB_ORDER_FALLBACK = ["profile", "activity", "chat", "reminders", "workspace", "integrations", "mcp"] as const;
+const AGENT_TAB_ORDER_FALLBACK = ["profile", "activity", "usage", "chat", "reminders", "workspace", "integrations"] as const;
 const LEGACY_AGENT_TAB_ALIASES: Record<string, string> = {
   channels: "chat",
   dms: "chat",
+  // The MCP tab was retired; MCP Apps are rows of the Apps tab.
+  mcp: "integrations",
 };
 
 export function isFullPageAgentDetailPath(pathname: string): boolean {
@@ -13,7 +15,7 @@ export function isFullPageAgentDetailPath(pathname: string): boolean {
 export function shouldDeleteAgentTabDuringProfileSync(
   pathname: string,
   previousProfileParam: string | null,
-  nextProfileType: "agent" | "human" | "external" | null,
+  nextProfileType: "agent" | "human" | "computer" | "external" | null,
   nextProfileId: string | null,
   options: { resetAgentTabForProfileReopen?: boolean } = {},
 ): boolean {

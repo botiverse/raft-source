@@ -7,6 +7,7 @@ import { asMessageId } from "@botiverse/raft-shared/src/agentCliSurface";
 import { createAgentApiSurfaceClient } from "../../agentApiPath";
 import { defineCommand, registerCliCommand } from "../../core/command";
 import type { CommandRuntimeOptions } from "../../core/context";
+import { rateLimitedResponseError } from "../../core/apiFailure";
 import { cliError } from "../../core/errors";
 import { writeText, adoptCliReplyText } from "../../core/renderer";
 
@@ -61,6 +62,8 @@ export const messageReactCommand = defineCommand(
         ? await agentApi.messages.removeReaction({ msgId: messageId }, { emoji })
         : await agentApi.messages.addReaction({ msgId: messageId }, { emoji });
       if (!res.ok) {
+        const rateLimited = rateLimitedResponseError(res);
+        if (rateLimited) throw rateLimited;
         const code = res.status >= 500 ? "SERVER_5XX" : "REACT_FAILED";
         throw cliError(code, res.error ?? `HTTP ${res.status}`);
       }

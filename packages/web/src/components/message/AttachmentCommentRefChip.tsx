@@ -1,17 +1,15 @@
-import { MessageSquare } from "lucide-react";
 import { useCallback } from "react";
+import { CommentIcon } from "@botiverse/ricons";
 import { useIntl } from "react-intl";
 import type { Message } from "../../store/messageStore";
 import { ReferenceChip } from "./ReferenceChip";
 
 export function AttachmentCommentRefChip({
   commentRef,
-  commentsEnabled,
   onJumpToHost,
   bodyFontSizeClass,
 }: {
   commentRef: Message["commentRef"] | null | undefined;
-  commentsEnabled: boolean;
   onJumpToHost: () => void;
   // The chip box (RUI message-reference recipe, via
   // ReferenceChip) renders at its container's font size, so its size comes
@@ -27,7 +25,7 @@ export function AttachmentCommentRefChip({
     event.preventDefault();
     onJumpToHost();
   }, [onJumpToHost]);
-  if (!commentRef || !commentsEnabled) return null;
+  if (!commentRef) return null;
 
   const detail = `${commentRef.filename}${commentRef.anchorLabel ? ` · ${commentRef.anchorLabel}` : ""}`;
   const label = formatMessage({ id: "message.attachment.rePrefix" }, { name: detail });
@@ -41,7 +39,7 @@ export function AttachmentCommentRefChip({
             href="#"
             onClick={handleJumpToHost}
             data-message-affordance="attachment-comment-ref-chip"
-            icon={MessageSquare}
+            icon={CommentIcon}
             variant="muted"
             label={label}
             title={formatMessage({ id: "message.attachmentComment.jumpTitle" }, { detail })}
@@ -50,7 +48,7 @@ export function AttachmentCommentRefChip({
           <ReferenceChip
             as="span"
             data-message-affordance="attachment-comment-ref-chip"
-            icon={MessageSquare}
+            icon={CommentIcon}
             variant="muted"
             label={label}
             title={formatMessage({ id: "message.attachmentComment.commentTitle" }, { detail })}

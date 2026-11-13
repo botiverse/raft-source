@@ -72,6 +72,15 @@ test("classifyExecuteError: 409 / DIALOG_REQUIRED → conflict", () => {
   assert.equal(meta.error_code, "DIALOG_REQUIRED");
 });
 
+test("classifyExecuteError: 422 FORM_INVALID / FORM_REQUIRED → validation (form.v1)", () => {
+  for (const code of ["FORM_INVALID", "FORM_REQUIRED"]) {
+    const meta = classifyExecuteError(new ActionCardError(422, code, "form"));
+    assert.equal(meta.error_class, "validation");
+    assert.equal(meta.error_code, code);
+    assert.equal(meta.http_status, 422);
+  }
+});
+
 test("classifyExecuteError: arbitrary thrown Error → unknown, no code/status", () => {
   const meta = classifyExecuteError(new Error("DB exploded"));
   assert.equal(meta.error_class, "unknown");

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import {
   FREE_MONTHLY_FILE_UPLOAD_LIMIT_BYTES,
   FREE_SINGLE_FILE_UPLOAD_LIMIT_BYTES,
+  MAX_FREE_SERVER_HOSTED_JOINT_CHANNELS,
   PRO_AGENT_SEAT_BLOCK_SIZE,
   PRO_PACK_AGENT_SEATS,
   PRO_PACK_ANNUAL_DISCOUNT_PERCENT,
@@ -24,7 +25,6 @@ import {
   getBillingCapacityLimitState,
   getBillingUsage,
   getEffectiveLimits,
-  getFinitePlanLimitExcess,
   getSingleFileUploadLimitBytes,
   getSingleFileUploadLimitLabel,
   isTrialActive,
@@ -134,11 +134,27 @@ test("billing capacity helper centralizes human and agent seat increments", () =
   assert.equal(formatBillingCapacityLimitMessage("human", humanLimit, "Pro"), "Seat limit reached (1/1 on Pro plan).");
 });
 
+test("seat math counts tenths, so agents fill a seat exactly", () => {
+  const capacity = { maxHumans: -1, maxAgents: -1, maxUniversalSeats: 3 };
+
+  // 0.1 × 19 drifts to 2.9000000000000004 in floating point; tenths don't.
+  assert.equal(getBillingUsage(1, 19).universalSeats, 2.9);
+  assert.equal(getBillingCapacityLimitState(capacity, getBillingUsage(1, 19), "agent").reached, false);
+  const full = getBillingCapacityLimitState(capacity, getBillingUsage(1, 20), "agent");
+  assert.equal(full.reached, true);
+  assert.equal(full.usage, 3);
+  assert.equal(full.nextUsage, 3.1);
+  assert.equal(formatBillingCapacityLimitMessage("agent", full, "Pro"), "Seat limit reached (3/3 on Pro plan).");
+
+  assert.equal(getBillingCapacityLimitState(capacity, getBillingUsage(0, 29), "agent").reached, false);
+});
+
 test("billing capacities reflect Free Pro Founder contract", () => {
   const postTrial = new Date("2026-06-23T12:00:00Z");
 
   assert.equal(FREE_MONTHLY_FILE_UPLOAD_LIMIT_BYTES, 100 * 1024 * 1024);
   assert.equal(FREE_SINGLE_FILE_UPLOAD_LIMIT_BYTES, 50 * 1024 * 1024);
+  assert.equal(MAX_FREE_SERVER_HOSTED_JOINT_CHANNELS, 1);
   assert.equal(PRO_SINGLE_FILE_UPLOAD_LIMIT_BYTES, 200 * 1024 * 1024);
   assert.equal(getSingleFileUploadLimitBytes("free", postTrial), FREE_SINGLE_FILE_UPLOAD_LIMIT_BYTES);
   assert.equal(getSingleFileUploadLimitLabel("free", postTrial), "50MB");
@@ -170,13 +186,6 @@ test("billing capacities reflect Free Pro Founder contract", () => {
     maxAgents: -1,
     maxUniversalSeats: 1,
   });
-});
-
-test("plan limit excess treats negative limits as unlimited", () => {
-  assert.equal(getFinitePlanLimitExcess(3, -1), 0);
-  assert.equal(getFinitePlanLimitExcess(1, -1), 0);
-  assert.equal(getFinitePlanLimitExcess(4, 3), 1);
-  assert.equal(getFinitePlanLimitExcess(3, 3), 0);
 });
 
 test("full-featured trial remains active through June 22 in every time zone", () => {

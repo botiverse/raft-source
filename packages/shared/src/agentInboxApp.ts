@@ -9,6 +9,7 @@
  * definitions + normalizers + builders.
  */
 
+import { formatHint, RAFT_HINTS } from "./agentOps/hint";
 import { currentTimeMs } from "./clock";
 
 /** Closed set of primary action kinds. App payloads cannot invent shell commands. */
@@ -136,12 +137,42 @@ export function formatAgentInboxAppItem(item: AgentInboxAppItem): string {
   return parts.join(" · ");
 }
 
+/** An app id or a printed item id that can stand in a dismiss target as it is (no quote, space or line break). */
+const DISMISS_TARGET_PART = /^[A-Za-z0-9](?:[A-Za-z0-9_.:-]*[A-Za-z0-9])?$/;
+
+/**
+ * The one rule for which Computer-local app items an agent may dismiss
+ * (`raft inbox dismiss`), and the target that does it: `app:<appId>/<item>`,
+ * `<item>` being the id the row prints (`item=`). The row prints its dismiss
+ * command from it, and the daemon dismisses the calling agent's one item
+ * whose target this is. Null for an item that is not dismissed: one that asks
+ * for an explicit ack (a fired reminder leaves the Inbox by its ack only), a
+ * sealed one, or one whose ids cannot stand in a target.
+ */
+export function agentInboxAppItemDismissTarget(item: AgentInboxAppItem): string | null {
+  if (item.retention === "until_explicit_ack" || item.seal) return null;
+  const printedId = shortId(item.itemId);
+  if (!DISMISS_TARGET_PART.test(item.appId) || !DISMISS_TARGET_PART.test(printedId)) return null;
+  return `app:${item.appId}/${printedId}`;
+}
+
+/**
+ * One item as list lines: its row, then `  dismiss: <command>` for an item
+ * the agent may dismiss (agentInboxAppItemDismissTarget).
+ */
+export function formatAgentInboxAppItemLines(item: AgentInboxAppItem): string[] {
+  const lines = [formatAgentInboxAppItem(item)];
+  const target = agentInboxAppItemDismissTarget(item);
+  if (target !== null) lines.push(`  dismiss: ${formatHint(RAFT_HINTS.inboxDismiss({ target }))}`);
+  return lines;
+}
+
 export function formatAgentInboxAppItems(items: readonly AgentInboxAppItem[]): string {
   if (items.length === 0) return "";
   return [
     `App items: ${items.length}`,
     "",
-    ...items.flatMap((item) => [formatAgentInboxAppItem(item), ""]),
+    ...items.flatMap((item) => [...formatAgentInboxAppItemLines(item), ""]),
   ]
     .join("\n")
     .trimEnd();

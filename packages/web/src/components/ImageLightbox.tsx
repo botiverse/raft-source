@@ -1,17 +1,20 @@
-import { Badge, Spinner, Button, PanelAction } from "@botiverse/raft-ui";
+import { Spinner, Button } from "@botiverse/raft-ui";
 import { useEffect, useState, useCallback } from "react";
 import type { MouseEvent } from "react";
 import { useIntl } from "react-intl";
-import { X, ChevronLeft, ChevronRight, Download, ImageOff, MessageSquareMore } from "lucide-react";
+import { ChevronLeft, ChevronRight, ImageOff } from "lucide-react";
 import { useImageLightboxStore } from "../store/imageLightboxStore";
 import { transparentImageBackgroundClass } from "../utils/imagePreviewStyles";
+import { isHeicImageMimeType, normalizeImageMimeType } from "../utils/imageMimeTypes";
 import api from "../api/client";
-import Lightbox from "./ui/Lightbox";
+import { FileViewerHeader, FileViewerShell } from "./FileViewerShell";
 import Tooltip from "./ui/Tooltip";
 import { AttachmentCommentsPanel } from "./message/AttachmentCommentsPanel";
-import { useImageZoom } from "./ImageZoom";
+import { PROGRAMMATIC_ZOOM_ANIMATION_MS, useImageZoom } from "./ImageZoom";
+import { useShortcutLayer } from "../features/shortcuts/useShortcutLayer";
 
 const URL_CACHE_SAFETY_WINDOW_MS = 60_000;
+const EMPTY_FAILED_SRCS: ReadonlySet<string> = new Set();
 
 interface AttachmentUrlResponse {
   url: string;
@@ -36,6 +39,13 @@ export default function ImageLightbox() {
   const [fullUrl, setFullUrl] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(false);
+  // Sources an <img> here failed to load (undecodable format, dead URL). They
+  // are skipped for the next candidate, and finally the error tile, instead of
+  // leaving a broken-image glyph on the stage or in the thumbnail strip.
+  const [failedSrcs, setFailedSrcs] = useState<ReadonlySet<string>>(EMPTY_FAILED_SRCS);
+  const markSrcFailed = useCallback((src: string) => {
+    setFailedSrcs((current) => (current.has(src) ? current : new Set([...current, src])));
+  }, []);
   // Attachment comments on the lightbox surface (F10, task #10). Same
   // mechanics as AttachmentPreviewShell: panel mounts on first open and
   // stays mounted (collapse animation, no refetch on reopen), collapsed
@@ -50,7 +60,10 @@ export default function ImageLightbox() {
   // so prev/next + close all reset scale=1, translate=(0,0). Zoom state lives
   // entirely inside the hook (per-mount React state); not in
   // imageLightboxStore — transient interaction, not persistent gallery model.
-  const zoom = useImageZoom({ resetKey: current?.id ?? null });
+  const zoom = useImageZoom({
+    resetKey: current?.id ?? null,
+    programmaticZoomAnimationMs: PROGRAMMATIC_ZOOM_ANIMATION_MS,
+  });
   const toggleComments = useCallback(() => {
     if (!commentsOpen) setPanelMounted(true);
     setCommentsOpen((open) => !open);
@@ -58,12 +71,8 @@ export default function ImageLightbox() {
   const hasMultiple = images.length > 1;
   const isFirst = currentIndex === 0;
   const isLast = currentIndex === images.length - 1;
-  const currentMimeType = current?.mimeType.split(";")[0]?.trim().toLowerCase();
-  const isRasterOnlyPreview = currentMimeType === "image/svg+xml"
-    || currentMimeType === "image/heic"
-    || currentMimeType === "image/heif"
-    || currentMimeType === "image/heic-sequence"
-    || currentMimeType === "image/heif-sequence";
+  const currentMimeType = normalizeImageMimeType(current?.mimeType);
+  const isRasterOnlyPreview = currentMimeType === "image/svg+xml" || isHeicImageMimeType(currentMimeType);
 
   // Fetch full-resolution URL when current image changes. Async-loader +
   // reset-on-current-change. Same FP family as Cluster 2/3 async-loaders.
@@ -122,7 +131,7 @@ export default function ImageLightbox() {
     };
   }, [cacheImageUrl, current, imageUrlCache, isRasterOnlyPreview]);
 
-  // Keyboard navigation (Lightbox primitive handles ESC; we add ArrowLeft/Right
+  // Keyboard navigation (the raft-ui Lightbox handles Esc; we add ArrowLeft/Right
   // + zoom shortcuts). When the user is zoomed, ArrowLeft/Right pan instead of
   // navigating — otherwise prev/next would feel like "image jumped" mid-pan.
   const handleKeyDown = useCallback(
@@ -169,12 +178,9 @@ export default function ImageLightbox() {
     }).catch(() => {});
   }, [current]);
 
-  useEffect(() => {
-    if (!isOpen) return;
-    // keydown-global-exempt: arrow nav inside <Lightbox> wrapper which moves focus into the overlay on open
-    document.addEventListener("keydown", handleKeyDown);
-    return () => document.removeEventListener("keydown", handleKeyDown);
-  }, [isOpen, handleKeyDown]);
+  // Arrows and 0 while open: a layer over FileViewerShell's (a raft-ui Lightbox, which moves focus into the overlay on
+  // open and closes on Esc), so a menu opened over the image takes its own keys first.
+  useShortcutLayer("lightbox", isOpen, { onKey: handleKeyDown });
 
   // Lightbox close is a store-level unmount of the content (images reset),
   // so panel visibility resets with it — adjust during render, not effect.
@@ -184,87 +190,43 @@ export default function ImageLightbox() {
     if (!isOpen) {
       setCommentsOpen(false);
       setPanelMounted(false);
+      setFailedSrcs(EMPTY_FAILED_SRCS);
     }
   }
 
   if (!isOpen || !current) return null;
 
   const fallbackSrc = current.thumbnailUrl || current.localPreviewUrl;
-  const displaySrc = fullUrl || fallbackSrc;
+  const displaySrc = [fullUrl, fallbackSrc].find((src): src is string => !!src && !failedSrcs.has(src)) ?? null;
+
+  const allSourcesFailed = !displaySrc && [fullUrl, fallbackSrc].some((src) => !!src && failedSrcs.has(src));
 
   const handleImageError = () => {
-    if (fullUrl && fallbackSrc) {
-      setFullUrl(null);
-      setError(false);
-      return;
-    }
-    setError(true);
+    if (!displaySrc) return;
+    markSrcFailed(displaySrc);
+    const nextSrc = [fullUrl, fallbackSrc].find((src) => !!src && src !== displaySrc && !failedSrcs.has(src));
+    setError(!nextSrc);
   };
 
   return (
-    <Lightbox
+    <FileViewerShell
       onClose={close}
-      className="flex flex-col"
       data-testid="image-lightbox"
+      aria-label={current.filename}
+      header={(
+        <FileViewerHeader
+          filename={current.filename}
+          index={currentIndex}
+          count={images.length}
+          commentsLabel={formatMessage({ id: commentsOpen ? "common.lightbox.hideComments" : "common.lightbox.comments" })}
+          commentsOpen={commentsOpen}
+          commentsAffordance="attachment-comments-toggle"
+          onToggleComments={currentCommentContext ? toggleComments : undefined}
+          onDownload={handleDownload}
+          onClose={close}
+        />
+      )}
     >
-      {/* Title bar — in normal flow so image stage naturally starts below it.
-          Raft Design System › Panel head: white paper, a seam under it, the
-          headline title, ghost icon buttons (the comments toggle turns into
-          the yellow sticker while its panel is open). */}
-      <div
-        className="safe-top safe-left safe-right pointer-events-auto shrink-0 border-b border-line-seam bg-layer-canvas text-foreground"
-        onClick={(e) => e.stopPropagation()}
-      >
-        <div className="flex h-14 items-center gap-3 pl-4 pr-2 md:pl-5">
-          <div className="min-w-0 flex-1 truncate font-sans text-headline text-foreground">
-            {current.filename}
-          </div>
-          {hasMultiple && (
-            <Badge appearance="outline" className="shrink-0 tabular-nums">
-              {currentIndex + 1} / {images.length}
-            </Badge>
-          )}
-          <div className="flex shrink-0 items-center gap-0.5">
-            {currentCommentContext ? (
-              /* Same iconText pattern as the preview-shell comments toggle. */
-              <Tooltip content={commentsOpen
-                ? formatMessage({ id: "common.lightbox.hideComments" })
-                : formatMessage({ id: "common.lightbox.comments" })}>
-                <PanelAction
-                  onClick={toggleComments}
-                  aria-label={
-                    commentsOpen
-                      ? formatMessage({ id: "common.lightbox.hideComments" })
-                      : formatMessage({ id: "common.lightbox.comments" })
-                  }
-                  aria-pressed={commentsOpen}
-                  data-comments-open={commentsOpen ? "true" : "false"}
-                  data-message-affordance="attachment-comments-toggle"
-                >
-                  <MessageSquareMore size={22} aria-hidden="true" />
-                </PanelAction>
-              </Tooltip>
-            ) : null}
-            <Tooltip content={formatMessage({ id: "common.lightbox.download" })}>
-              <PanelAction
-                onClick={handleDownload}
-                aria-label={formatMessage({ id: "common.lightbox.download" })}
-              >
-                <Download size={22} aria-hidden="true" />
-              </PanelAction>
-            </Tooltip>
-            <Tooltip content={formatMessage({ id: "common.close" })}>
-              <PanelAction
-                onClick={close}
-                aria-label={formatMessage({ id: "common.close" })}
-              >
-                <X size={22} aria-hidden="true" />
-              </PanelAction>
-            </Tooltip>
-          </div>
-        </div>
-      </div>
-
       {/* Image area + comments aside — stage is pushed left continuously
           when comments open (same collapse/expand contract as the preview
           shell, task #14). */}
@@ -272,14 +234,18 @@ export default function ImageLightbox() {
       <div
         ref={zoom.wheelTargetRef}
         data-testid="image-lightbox-stage"
-        className="relative flex min-w-0 flex-1 items-center justify-center overflow-hidden"
-        // Empty-stage clicks close the lightbox. After zoom/pan, the visual
+        // pointer-events-auto: the raft-ui lightbox lets the pointer through to its scrim; the stage takes it back.
+        className="pointer-events-auto relative flex min-w-0 flex-1 items-center justify-center overflow-hidden"
+        // A mouse click on the image toggles fit ↔ actual size; the release of
+        // a pan drag is swallowed. Click lives on the stage because pointer
+        // capture retargets clicks on an enlarged image here. Other
+        // empty-stage clicks close the lightbox. After zoom/pan, the visual
         // image box no longer matches its original layout box, so also guard
         // against stage-target clicks that land inside the transformed image.
         onClick={(e) => {
+          if (zoom.onClick(e)) return;
           if (e.target === e.currentTarget && !zoom.containsImagePoint(e.clientX, e.clientY)) close();
         }}
-        onDoubleClick={zoom.onDoubleClick}
         onPointerDown={zoom.onPointerDown}
         onPointerMove={zoom.onPointerMove}
         onPointerUp={zoom.onPointerUp}
@@ -294,7 +260,7 @@ export default function ImageLightbox() {
         {hasMultiple && (
           <Tooltip content={formatMessage({ id: "common.lightbox.previousImage" })}>
             <span
-              className="absolute left-8 z-10 inline-flex"
+              className="absolute left-8 z-raised inline-flex"
               onClick={(e) => e.stopPropagation()}
             >
               <Button size="icon-lg"
@@ -313,7 +279,7 @@ export default function ImageLightbox() {
         {hasMultiple && (
           <Tooltip content={formatMessage({ id: "common.lightbox.nextImage" })}>
             <span
-              className="absolute right-8 z-10 inline-flex"
+              className="absolute right-8 z-raised inline-flex"
               onClick={(e) => e.stopPropagation()}
             >
               <Button size="icon-lg"
@@ -332,7 +298,7 @@ export default function ImageLightbox() {
           <div className="flex size-64 items-center justify-center">
             <Spinner size="lg" variant="inverse"  aria-label={formatMessage({ id: "common.loadingLabel" })} />
           </div>
-        ) : error && !displaySrc ? (
+        ) : (error || allSourcesFailed) && !displaySrc ? (
           <div className="flex size-64 flex-col items-center justify-center gap-3 text-foreground-on-hud/70">
             <ImageOff size={36} />
             {/* break-all so unbreakable long filenames wrap inside the 256px
@@ -355,10 +321,10 @@ export default function ImageLightbox() {
                 transform: zoom.style.transform,
                 cursor: zoom.style.cursor,
                 transformOrigin: "center",
-                transition: "none",
                 willChange: zoom.isZoomed ? "transform" : "auto",
               }}
               onError={handleImageError}
+              onTransitionEnd={zoom.onTransitionEnd}
               draggable={false}
             />
           )
@@ -374,7 +340,7 @@ export default function ImageLightbox() {
           }`}
         >
           {/* Click shield lives on the inner div, not the semantic <aside>
-              (a11y lint): stops Lightbox backdrop-close inside the panel. */}
+              (a11y lint): stops the stage's blank-click close inside the panel. */}
           <div className="h-full w-80" onClick={(e) => e.stopPropagation()}>
             {panelMounted ? (
               <AttachmentCommentsPanel
@@ -394,10 +360,10 @@ export default function ImageLightbox() {
         <div
           inert={!commentsOpen}
           onClick={(e) => e.stopPropagation()}
-          className={`pointer-events-auto fixed bottom-0 right-0 z-20 w-full border-t border-l border-line-seam bg-layer-canvas transition-transform duration-300 ease-in-out sm:hidden ${
+          className={`pointer-events-auto fixed bottom-0 right-0 z-control w-full border-t border-l border-line-seam bg-layer-canvas transition-transform duration-300 ease-in-out sm:hidden ${
             commentsOpen ? "translate-x-0" : "translate-x-full"
           }`}
-          style={{ top: "calc(56px + env(safe-area-inset-top, 0px))" }}
+          style={{ top: "calc(var(--header-height) + env(safe-area-inset-top, 0px))" }}
         >
           {panelMounted ? (
             <AttachmentCommentsPanel
@@ -412,11 +378,12 @@ export default function ImageLightbox() {
       {/* Thumbnail strip (multi-image) */}
       {hasMultiple && (
         <div
-          className="absolute bottom-4 left-0 right-0 z-10 flex items-center justify-center gap-1.5 pointer-events-none"
+          className="absolute bottom-4 left-0 right-0 z-raised flex items-center justify-center gap-1.5 pointer-events-none"
           onClick={(e) => e.stopPropagation()}
         >
           {images.map((img, idx) => {
-            const thumbSrc = img.thumbnailUrl || img.localPreviewUrl;
+            const candidateThumbSrc = img.thumbnailUrl || img.localPreviewUrl;
+            const thumbSrc = candidateThumbSrc && !failedSrcs.has(candidateThumbSrc) ? candidateThumbSrc : null;
             const isActive = idx === currentIndex;
             return (
               <button
@@ -427,7 +394,7 @@ export default function ImageLightbox() {
                   isActive
                     // The image you are on: the yellow "you are here" edge
                     // with its ink outline (a sticker edge, never a shadow).
-                    ? "border-brand opacity-100 ring-[1.5px] ring-sticker-ink"
+                    ? "border-selected opacity-100 ring-[1.5px] ring-sticker-ink"
                     : "border-foreground-on-hud/30 opacity-60 hover:opacity-100 hover:border-foreground-on-hud/60"
                 }`}
               >
@@ -435,6 +402,7 @@ export default function ImageLightbox() {
                   <img
                     src={thumbSrc}
                     alt={img.filename}
+                    onError={() => markSrcFailed(thumbSrc)}
                     className={`h-full w-full object-cover ${transparentImageBackgroundClass}`}
                     draggable={false}
                   />
@@ -448,6 +416,6 @@ export default function ImageLightbox() {
           })}
         </div>
       )}
-    </Lightbox>
+    </FileViewerShell>
   );
 }

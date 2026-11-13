@@ -1,0 +1,1 @@
+ALTER TABLE "user_channel_display_prefs" ALTER COLUMN "collapse_long_messages" SET DEFAULT false;

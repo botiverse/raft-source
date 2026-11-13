@@ -50,6 +50,7 @@ test("host access-only commit updates Zustand and cached socket auth without con
     token: "access-new",
     serverId: "server-1",
     clientKind: "web",
+    capabilities: ["agent_activity_subscriptions_v1"],
   });
 
   const updatedAuth = socket.auth;

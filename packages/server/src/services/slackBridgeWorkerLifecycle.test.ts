@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { mapSlackBridgeLifecycleBatches } from "./slackBridgeLifecycleBatch";
 import {
   applySlackBridgeWorkerEvent,
   planSlackBridgeWorkerLifecycle,
@@ -419,6 +420,8 @@ function createManualClock(): SlackBridgePersistentWorkerClock & {
       intervals.delete(handle as () => void);
     },
     tick() {
+      // Timer callbacks may remove or add registrations during this tick.
+      // oxlint-disable-next-line unicorn/no-useless-spread
       for (const fn of [...intervals]) fn();
     },
     activeIntervals() {
@@ -666,6 +669,8 @@ test("persistent worker serializes event reconcile behind an active periodic dra
   const first = worker.requestReconcile("periodic");
   const queued = await worker.requestReconcile("event");
   assert.deepEqual(queued, { kind: "queued" });
+  const burst = await Promise.all(Array.from({ length: 25 }, () => worker.requestReconcile("event")));
+  assert.ok(burst.every(result => result.kind === "queued"), "a burst shares one pending reconcile");
   assert.deepEqual(loadTriggers, ["periodic"]);
 
   releaseFirstLoad();
@@ -709,4 +714,135 @@ test("persistent worker stop clears interval and prevents future drains", async 
   clock.tick();
   assert.equal(loads, 0);
   assert.deepEqual(await worker.requestReconcile("event"), { kind: "stopped" });
+});
+
+
+test("large lifecycle drains let socket/timer callbacks run between binding batches", async () => {
+  const bindings = Array.from({ length: 2_001 }, (_, index) => activeBinding({ bindingId: `binding-${index}` }));
+  let refreshed = 0;
+  let refreshProgressAtTurn = 0;
+  let persisted = 0;
+  let persistProgressAtTurn = 0;
+  const worker = startSlackBridgePersistentWorker({
+    async loadBindings() { return bindings; },
+    async refreshAudience(binding) {
+      refreshed += 1;
+      if (refreshed === 1) setImmediate(() => { refreshProgressAtTurn = refreshed; });
+      return refreshAudience(binding);
+    },
+    async afterRefresh() { assert.equal(refreshed, bindings.length, "lifecycle polling must not delay privacy/audience refresh for later pairs"); },
+    async executeCommand() { throw new Error("unexpected command"); },
+    async runProbe(request) {
+      return { surface: request.surface, trigger: request.trigger, ok: true, observedAtMs: nowMs };
+    },
+    async persistReceipt() {
+      persisted += 1;
+      if (persisted === 1) setImmediate(() => { persistProgressAtTurn = persisted; });
+    },
+  }, {
+    orchestratorId: "orchestrator-a", intervalMs: 60_000, probeFreshnessMs: 60_000,
+    maxPendingEvents: 50, maxOldestPendingEventAgeMs: 120_000,
+    nowMs: () => nowMs, clock: createManualClock(),
+  });
+  try {
+    const result = await worker.requestReconcile("periodic");
+    assert.deepEqual(result, { kind: "completed", trigger: "periodic", bindingCount: bindings.length });
+    assert.equal(refreshed, bindings.length);
+    assert.equal(persisted, bindings.length);
+    assert.ok(refreshProgressAtTurn > 0 && refreshProgressAtTurn <= 1_000,
+      "resolved audience promises must not starve the first event-loop turn beyond a batch");
+    assert.ok(persistProgressAtTurn > 0 && persistProgressAtTurn <= 1_000,
+      "resolved persistence promises must not starve the first event-loop turn beyond a batch");
+  } finally {
+    worker.stop();
+  }
+});
+
+
+test("lifecycle CPU projections yield before processing more than one batch", async () => {
+  const rows = Array.from({ length: 2_001 }, (_, index) => index);
+  let projected = 0;
+  let progressAtTurn = 0;
+  const result = await mapSlackBridgeLifecycleBatches(rows, (row) => {
+    projected += 1;
+    if (projected === 1) setImmediate(() => { progressAtTurn = projected; });
+    return row + 1;
+  });
+  assert.equal(result.length, rows.length);
+  assert.equal(result[0], 1);
+  assert.equal(result.at(-1), rows.length);
+  assert.ok(progressAtTurn > 0 && progressAtTurn <= 1_000,
+    "CPU-only projection must let event-loop callbacks run between batches");
+});
+
+test("two replicas share one maintenance pass before any state or provider work", async () => {
+  let claimed = false;
+  let ended = 0;
+  let loads = 0;
+  let refreshed = 0;
+  const options = {
+    intervalMs: 1_000, probeFreshnessMs: 60_000,
+    maxPendingEvents: 50, maxOldestPendingEventAgeMs: 120_000,
+    nowMs: () => nowMs, clock: createManualClock(),
+  };
+  const dependencies = {
+    async claimRun() {
+      if (claimed) return null;
+      claimed = true;
+      return { held: async () => true, end() { ended += 1; } };
+    },
+    async loadBindings() { loads += 1; return [activeBinding()]; },
+    async refreshAudience(binding: SlackBridgeBindingRuntime) {
+      refreshed += 1;
+      return { bindingId: binding.bindingId, audienceStatus: "matched" as const, observedAtMs: nowMs };
+    },
+    async executeCommand() {},
+    async runProbe(request: SlackBridgeProbeRequest) {
+      return { surface: request.surface, ok: true, observedAtMs: nowMs, trigger: request.trigger };
+    },
+    async persistReceipt() {},
+  };
+  const first = startSlackBridgePersistentWorker(dependencies, { ...options, orchestratorId: "first" });
+  const second = startSlackBridgePersistentWorker(dependencies, { ...options, orchestratorId: "second" });
+  try {
+    await Promise.all([first.requestReconcile("periodic"), second.requestReconcile("periodic")]);
+    assert.equal(loads, 1, "the losing replica cannot even load the maintenance inputs");
+    assert.equal(refreshed, 1);
+    assert.equal(ended, 1, "only the acquired claim stops its renewal");
+    claimed = false; // The shared store's spacing window has elapsed.
+    await second.requestReconcile("periodic");
+    assert.equal(loads, 2, "another replica can take the next maintenance window");
+  } finally { first.stop(); second.stop(); }
+});
+
+test("a lost maintenance claim stops later bindings and is ended even on load failure", async () => {
+  for (const failLoad of [false, true]) {
+    let held = true;
+    let ended = 0;
+    let refreshed = 0;
+    const worker = startSlackBridgePersistentWorker({
+      claimRun: async () => ({ held: async () => held, end() { ended += 1; } }),
+      async loadBindings() {
+        if (failLoad) throw new Error("load failed");
+        return [activeBinding(), activeBinding({ bindingId: "second" })];
+      },
+      async refreshAudience(binding) {
+        refreshed += 1;
+        held = false;
+        return { bindingId: binding.bindingId, audienceStatus: "matched", observedAtMs: nowMs };
+      },
+      async executeCommand() { assert.fail("a lost owner must not execute commands"); },
+      async runProbe() { throw new Error("a lost owner must not probe"); },
+      async persistReceipt() { assert.fail("a lost owner must not publish receipts"); },
+    }, {
+      orchestratorId: "owner", intervalMs: 1_000, probeFreshnessMs: 60_000,
+      maxPendingEvents: 50, maxOldestPendingEventAgeMs: 120_000,
+      nowMs: () => nowMs, clock: createManualClock(),
+    });
+    try {
+      if (failLoad) await assert.rejects(worker.requestReconcile("periodic"), /load failed/);
+      else { await worker.requestReconcile("periodic"); assert.equal(refreshed, 1); }
+      assert.equal(ended, 1);
+    } finally { worker.stop(); }
+  }
 });

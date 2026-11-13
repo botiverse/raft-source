@@ -102,7 +102,7 @@ export function AgentHostedRuntimeModel({ agentId }: { agentId: string }) {
   // Where the server may not pick (`antiproton_model_picker` off), Raft decides: no picker at all.
   if (state.kind === "hidden" || (state.kind === "ready" && !hostedModelPickerShown(view))) return null;
   return (
-    <div className="border-t border-line-hairline px-5 py-4" data-testid="agent-hosted-runtime-model">
+    <div className="border-t border-line-hairline px-(--surface-inset) py-4" data-testid="agent-hosted-runtime-model">
       <SectionEyebrow as="div" className="mb-2">
         {formatMessage({ id: "agent.detail.hostedModel.title" })}
       </SectionEyebrow>
@@ -113,14 +113,14 @@ export function AgentHostedRuntimeModel({ agentId }: { agentId: string }) {
           {formatMessage({ id: "agent.detail.hostedModel.loadFailed" })}
         </p>
       ) : view!.locked ? (
-        <div className="space-y-1" data-testid="agent-hosted-runtime-model-locked">
+        <div className="stack-y-1" data-testid="agent-hosted-runtime-model-locked">
           <p className={view!.label ? "text-callout text-foreground" : "break-all font-mono text-mono-meta text-foreground"}>{view!.label ?? view!.model}</p>
           <p className="text-caption text-foreground-hint">
             {formatMessage({ id: "agent.detail.hostedModel.locked" })}
           </p>
         </div>
       ) : (
-        <div className="space-y-1.5">
+        <div className="stack-y-1.5">
           <RuntimeChoiceCombobox
             options={options}
             value={view!.source === "default" ? "" : view!.model ?? ""}

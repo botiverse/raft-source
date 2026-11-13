@@ -39,7 +39,12 @@ import { test } from "vitest";
 
 const PROFILE_COLUMNS = new Set(["name", "displayName", "description", "avatarUrl"]);
 /** Service functions that can change an agent's profile columns. */
-const PROFILE_WRITERS = new Set(["updateAgent", "adoptOfficialOnboardingAgentIdentity"]);
+const PROFILE_WRITERS = new Set([
+  "updateAgent",
+  "adoptOfficialOnboardingAgentIdentity",
+  // An App bot's avatar IS its App's logo: every logo upload, clear and App deletion rewrites it.
+  "syncAppBotAvatarsToLogo",
+]);
 const WRITER_DECLARATION_FILE = "services/agentService.ts";
 const WRITER_NAMESPACE = "agentService";
 const BROADCAST = "broadcastAgentUpdated";
@@ -222,8 +227,11 @@ function serverSources(): SourceInput[] {
 test("every agent profile write in the server source is listed and followed by its own agent:updated broadcast", () => {
   const { offenders, writerCalls } = findContractOffenders(serverSources());
   assert.deepEqual(offenders, []);
-  // Seven write sites exist today; zero would mean the scan stopped matching anything.
-  assert.equal(writerCalls, 7);
+  // Thirteen write sites exist today (App logo upload, logo clear and App
+  // deletion, each on the web and the agent API, sync the App's bot avatars;
+  // PATCH /my-assistant no longer renames, an assistant is always Ottie); zero
+  // would mean the scan stopped matching anything.
+  assert.equal(writerCalls, 13);
 });
 
 // The checker itself, on small sources. Each rejected shape below got past an earlier version.

@@ -103,6 +103,7 @@ test("send response normalizer accepts bare message and wrapped pending-actions 
       { targetType: "agent", targetId: "agent-2", reason: "other" },
       { targetType: "user", targetId: "user-1", reason: "ignored" },
       { targetType: "agent", targetId: "", reason: "ignored" },
+      { targetType: "agent", targetId: "agent-3", reason: "agent_stuck_on_tool" },
     ],
   }), {
     message: baseMessage,
@@ -110,6 +111,7 @@ test("send response normalizer accepts bare message and wrapped pending-actions 
     unresolvedMentionHandles: [],
     deliveryWarnings: [
       { targetType: "agent", targetId: "agent-1", reason: "agent_stopped" },
+      { targetType: "agent", targetId: "agent-3", reason: "agent_stuck_on_tool" },
     ],
   });
 });

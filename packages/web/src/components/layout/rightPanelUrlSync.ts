@@ -9,6 +9,7 @@ import { useThreadStore } from "../../store/threadStore";
 import { parseSearchOpenParam } from "../../store/searchContentStore";
 import { useLegacyTaskPanelStore } from "../../store/legacyTaskPanelStore";
 import { useTaskStore } from "../../store/taskStore";
+import { formatTaskConversationParam, parseTaskConversationParam } from "../../utils/taskConversation";
 import { recordSynchronousMobileBackNavigation } from "../../hooks/useAppNavigate";
 import {
   resolveOrderedFirstAgentTab,
@@ -29,7 +30,7 @@ interface RightPanelThreadAnchor {
   openParentChannelId: string | null;
   openParentMessageId: string | null;
   openIntent?: "thread" | "task" | null;
-  taskModal?: { parentMessageId: string } | null;
+  taskModal?: { parentMessageId: string | null; taskId?: string | null } | null;
 }
 
 type NavigateLike = (
@@ -309,7 +310,32 @@ export function isCurrentRightPanelSearchSnapshot(search: string): boolean {
   return true;
 }
 
+/**
+ * The address being applied to the stores, while it is (null otherwise). The
+ * stores' own subscribers write the address back as each one opens (the
+ * thread first, then the profile), from stores that are not all open yet.
+ * So during the apply those writes
+ * - keep every panel param the applied address names and the stores don't
+ *   hold yet (`profile` and its `agentTab` while only the thread is open),
+ *   rather than dropping it and losing the tab;
+ * - replace, never push: an address that names both (a restored one, a link
+ *   followed within the same conversation) adds no history entry of its own.
+ * Opening something by hand still pushes, and a close still removes.
+ */
+let applyingSearch: URLSearchParams | null = null;
+const APPLIED_PANEL_PARAMS = ["thread", "task", "legacyTask", "profile", "agentTab"] as const;
+
 export function syncRightPanelStoresFromSearch(search: string): void {
+  const outer = applyingSearch;
+  applyingSearch = new URLSearchParams(search);
+  try {
+    applySearchToRightPanelStores(search);
+  } finally {
+    applyingSearch = outer;
+  }
+}
+
+function applySearchToRightPanelStores(search: string): void {
   recordProfileOpenE2eUrl("profile-url-read", search);
   const params = new URLSearchParams(search);
   // /search col 3 IS the thread surface for thread search hits — driven by
@@ -378,7 +404,7 @@ export function syncRightPanelStoresFromSearch(search: string): void {
           // Same thread already open — just update focus so the scroll/highlight
           // effect re-runs. Without this, clicking a permalink to another message
           // in the currently-open thread does nothing until the page is refreshed.
-          useThreadStore.setState({ focusedMessageId: threadFocusedMessageId });
+          useThreadStore.getState().focusMessage(threadFocusedMessageId);
         }
       }
     }
@@ -394,7 +420,17 @@ export function syncRightPanelStoresFromSearch(search: string): void {
     const idx = taskParam.indexOf(":");
     const channelId = idx > 0 ? taskParam.slice(0, idx) : "";
     const messageId = idx > 0 ? taskParam.slice(idx + 1) : "";
-    if (channelId && messageId
+    // Task v2: `task=<chId>:task:<taskId>` is the dialog of a task's own
+    // conversation, keyed by the task (it has no parent message).
+    const taskConversation = parseTaskConversationParam(taskParam);
+    if (taskConversation) {
+      if (useThreadStore.getState().taskModal?.taskId !== taskConversation.taskId) {
+        useThreadStore.getState().openTaskConversation({
+          taskId: taskConversation.taskId,
+          parentChannelId: taskConversation.channelId,
+        });
+      }
+    } else if (channelId && messageId
         && useThreadStore.getState().taskModal?.parentMessageId !== messageId) {
       void useThreadStore.getState().openTaskModal({
         parentChannelId: channelId,
@@ -448,7 +484,7 @@ export function syncRightPanelStoresFromSearch(search: string): void {
     if (idx > 0) {
       const type = profileParam.slice(0, idx);
       const id = profileParam.slice(idx + 1);
-      if ((type === "agent" || type === "human") && id) {
+      if ((type === "agent" || type === "human" || type === "computer") && id) {
         const { profileType, profileId } = useProfileStore.getState();
         if (type !== profileType || id !== profileId) {
           useProfileStore.getState().openProfile(type, id);
@@ -553,7 +589,9 @@ export function syncRightPanelUrlFromStores({
   // links still resolve against the thread param's anchor on read.
   const taskModalSlot = useThreadStore.getState().taskModal;
   const nextTaskParam = taskModalSlot?.parentChannelId
-    ? `${taskModalSlot.parentChannelId}:${taskModalSlot.parentMessageId}`
+    ? taskModalSlot.taskId && !taskModalSlot.parentMessageId
+      ? formatTaskConversationParam(taskModalSlot.parentChannelId, taskModalSlot.taskId)
+      : `${taskModalSlot.parentChannelId}:${taskModalSlot.parentMessageId}`
     : null;
   if (nextTaskParam) params.set("task", nextTaskParam);
   if (legacyTask) params.set("legacyTask", `${legacyTask.channelId}:${legacyTask.id}`);
@@ -584,6 +622,13 @@ export function syncRightPanelUrlFromStores({
     );
   }
 
+  if (applyingSearch) {
+    for (const name of APPLIED_PANEL_PARAMS) {
+      const applied = applyingSearch.get(name);
+      if (applied !== null && !params.has(name)) params.set(name, applied);
+    }
+  }
+
   const newSearch = params.toString();
   if (currentSearch === newSearch) return false;
 
@@ -605,6 +650,7 @@ export function syncRightPanelUrlFromStores({
     || (!legacyTask && previousLegacyTaskParam !== null && !preservingPendingLegacyTask);
   const shouldPush =
     mode === "auto"
+    && applyingSearch === null
     && (addedThread || addedProfile || addedLegacyTask || addedTask)
     && !removedAny;
 

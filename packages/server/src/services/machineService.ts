@@ -3,12 +3,14 @@ import { createHash, randomBytes } from "node:crypto";
 import argon2 from "argon2";
 import { timedArgon2Verify, type Argon2VerifyStats } from "./argon2VerifyStats";
 import { getDb, type DatabaseExecutor } from "../db/index";
-import { computers, machines, servers, agents, agentMigrations, agentRuntimeProfiles } from "../db/schema";
+import { agentCredentials, computers, machines, servers, agents, agentMigrations, agentRuntimeProfiles } from "../db/schema";
 import { withServerLock, acquireServerLock } from "./planService";
 import { FencedAuthorizationDeniedError, lockActorMembershipRow } from "../lib/actorMembershipFence";
 import { actorRoleHasServerCapability } from "../lib/actorPermissions";
-import { PLAN_CONFIG, currentDate, getEffectiveLimits, type DeviceClass, type MachineId, type ServerPlan } from "@botiverse/raft-shared";
+import { lockLiveSessionFamily } from "./sessionService";
+import { PLAN_CONFIG, currentDate, getEffectiveLimits, type DeviceClass, type DaemonInstallKind, type HostProvider, type MachineId, type ServerPlan } from "@botiverse/raft-shared";
 import { untracedDbQuery, type DbQueryTracer } from "../tracing/dbQueryTrace";
+import { agentFindableBy, type AgentFinder } from "./agentMemberListPolicy";
 
 /** Extract a short prefix from an API key for indexed DB lookup. */
 export function extractApiKeyPrefix(apiKey: string): string {
@@ -63,7 +65,7 @@ declare const machineCreateLockBrand: unique symbol;
  * The token carries no readable state: the transaction and Server id live in `machineCreateLocks`, keyed by the token's
  * identity and written only by acquireMachineCreateLock. A spread copy, a raw cast or any other fabricated object is not
  * a key in that map, so registerMachine refuses it before writing anything. Construction is enrolled in
- * scripts/ci/check-branded-mint-sites.mjs: `as MachineCreateLock` is allowed only in this file.
+ * scripts/ci/check-branded-mint-sites.ts: `as MachineCreateLock` is allowed only in this file.
  */
 export type MachineCreateLock = { readonly [machineCreateLockBrand]: true };
 
@@ -107,6 +109,14 @@ export async function registerMachine(
     capability?: "registerMachines";
     /** Pre-generated key material, so a caller that already holds locks never hashes inside them. */
     material?: MachineKeyMaterial;
+    /**
+     * The registering person's web (full) session family, when that session
+     * registers (POST /api/servers/:id/machines): fenced live in the create
+     * transaction and recorded on the key, so a security revoke of that
+     * session discards it (webSessionIssuedKeys.ts). Never set by an attach,
+     * whose machine key is discarded.
+     */
+    webSessionFamilyId?: string | null;
   } = {},
 ) {
   // Generate API key outside the lock (argon2 is slow, don't hold the lock during hashing)
@@ -121,6 +131,7 @@ export async function registerMachine(
         throw new FencedAuthorizationDeniedError("forbidden");
       }
     }
+    if (options.webSessionFamilyId) await lockLiveSessionFamily(tx, options.webSessionFamilyId, userId);
     // Check plan quota
     const [serverRow] = await tx.select({ plan: servers.plan }).from(servers).where(eq(servers.id, serverId));
     const plan = (serverRow?.plan as ServerPlan) || "free";
@@ -140,6 +151,7 @@ export async function registerMachine(
       apiKeyHash,
       apiKeyPrefix,
       apiKeyFingerprint,
+      keyIssuedByWebSessionFamilyId: options.webSessionFamilyId ?? null,
     }).returning();
 
     return newMachine;
@@ -170,11 +182,17 @@ export async function listMachines(
       hostname: machines.hostname,
       os: machines.os,
       deviceClass: machines.deviceClass,
+      hostProvider: machines.hostProvider,
+      osRelease: machines.osRelease,
+      osId: machines.osId,
+      osIdLike: machines.osIdLike,
+      installKind: machines.installKind,
       daemonVersion: machines.daemonVersion,
       computerVersion: machines.computerVersion,
       computerVersionReportedAt: machines.computerVersionReportedAt,
       lastHeartbeat: machines.lastHeartbeat,
       createdAt: machines.createdAt,
+      ownerUserId: machines.ownerUserId,
     }).from(machines).where(eq(machines.serverId, serverId)).orderBy(asc(machines.createdAt)),
     (rows) => ({
       row_count: rows.length,
@@ -182,8 +200,14 @@ export async function listMachines(
   );
 }
 
+/**
+ * Each machine's live agents, as `finder` may find them: another person's
+ * personal assistant is not counted (agentFindableBy), so a Computer's count
+ * does not tell anyone else that it hosts one.
+ */
 export async function countActiveAgentsByMachine(
   serverId: string,
+  finder: AgentFinder,
   opts: { traceQuery?: DbQueryTracer } = {},
 ): Promise<Map<string, number>> {
   const db = getDb();
@@ -196,7 +220,7 @@ export async function countActiveAgentsByMachine(
         count: sql<number>`count(*)::int`,
       })
       .from(agents)
-      .where(and(eq(agents.serverId, serverId), isNull(agents.deletedAt), isNotNull(agents.machineId)))
+      .where(and(eq(agents.serverId, serverId), isNull(agents.deletedAt), isNotNull(agents.machineId), agentFindableBy(finder)))
       .groupBy(agents.machineId),
     (result) => ({ row_count: result.length }),
   );
@@ -213,6 +237,7 @@ export async function countActiveAgentsByMachine(
  */
 export async function countRunningAgentsByMachine(
   serverId: string,
+  finder: AgentFinder,
   opts: { traceQuery?: DbQueryTracer } = {},
 ): Promise<Map<string, number>> {
   const db = getDb();
@@ -230,6 +255,8 @@ export async function countRunningAgentsByMachine(
         eq(agents.status, "active"),
         isNull(agents.deletedAt),
         isNotNull(agents.machineId),
+        // As countActiveAgentsByMachine: another person's assistant is not counted.
+        agentFindableBy(finder),
       ))
       .groupBy(agents.machineId),
     (result) => ({ row_count: result.length }),
@@ -259,20 +286,31 @@ export async function updateMachine(
   return updated;
 }
 
+/** What a `ready` says about the machine, validated; null = unknown or an older daemon. */
+export interface MachineHostFacts {
+  deviceClass: DeviceClass | null;
+  hostProvider: HostProvider | null;
+  osRelease: string | null;
+  osId: string | null;
+  osIdLike: string[] | null;
+  installKind: DaemonInstallKind | null;
+  nodeOnPath: boolean | null;
+}
+
 export async function updateMachineRuntimes(
   machineId: string,
   runtimes: string[],
   hostname?: string,
   os?: string,
   daemonVersion?: string | null,
-  deviceClass?: DeviceClass | null,
+  host?: MachineHostFacts,
 ) {
   const db = getDb();
   await db.update(machines).set({
     runtimes,
     ...(hostname !== undefined ? { hostname } : {}),
     ...(os !== undefined ? { os } : {}),
-    ...(deviceClass !== undefined ? { deviceClass } : {}),
+    ...(host ? { deviceClass: host.deviceClass, hostProvider: host.hostProvider, osRelease: host.osRelease, osId: host.osId, osIdLike: host.osIdLike, installKind: host.installKind, nodeOnPath: host.nodeOnPath } : {}),
     ...(daemonVersion !== undefined ? { daemonVersion } : {}),
   }).where(eq(machines.id, machineId));
   if (daemonVersion !== undefined) {
@@ -324,13 +362,26 @@ export async function updateHeartbeat(machineId: string) {
   }).where(eq(machines.id, machineId));
 }
 
-export async function regenerateApiKey(machineId: string, options: { executor?: DatabaseExecutor } = {}) {
+/**
+ * `webSessionFamilyId`: the web (full) session family issuing the new key
+ * (recorded so a security revoke of that session discards it,
+ * webSessionIssuedKeys.ts); the caller fences it live in its transaction.
+ * Whatever issued the old key no longer holds the new one.
+ */
+export async function regenerateApiKey(machineId: string, options: { executor?: DatabaseExecutor; webSessionFamilyId?: string | null } = {}) {
   const db = options.executor ?? getDb();
   const apiKey = `sk_machine_${randomBytes(32).toString("hex")}`;
   const apiKeyHash = await argon2.hash(apiKey);
   const apiKeyPrefix = extractApiKeyPrefix(apiKey);
   const apiKeyFingerprint = extractApiKeyFingerprint(apiKey);
-  await db.update(machines).set({ apiKeyHash, apiKeyPrefix, apiKeyFingerprint }).where(eq(machines.id, machineId));
+  await db.update(machines).set({
+    apiKeyHash,
+    apiKeyPrefix,
+    apiKeyFingerprint,
+    keyIssuedByWebSessionFamilyId: options.webSessionFamilyId ?? null,
+    // The exposed key is no longer the key (#proj-raft-computer task #38).
+    credentialExposureFoundAt: null,
+  }).where(eq(machines.id, machineId));
   // Evict only after the new hash is written, so a concurrent auth cannot re-cache the old key. Inside a caller's
   // transaction the caller must evict after that transaction commits.
   if (!options.executor) clearAuthCache(machineId);
@@ -383,8 +434,17 @@ export async function findMachineByApiKey(apiKey: string, argon2Stats?: Argon2Ve
   return null;
 }
 
-export async function deleteMachine(machineId: string, options: { executor?: DatabaseExecutor } = {}) {
+/**
+ * Returns the agents whose runner credentials the deletion revoked; the caller
+ * broadcasts the revocation per agent after its transaction commits so open
+ * streams close.
+ */
+export async function deleteMachine(
+  machineId: string,
+  options: { executor?: DatabaseExecutor } = {},
+): Promise<{ revokedCredentialAgentIds: string[] }> {
   const db = options.executor ?? getDb();
+  let revokedCredentialAgentIds: string[] = [];
 
   await db.transaction(async (tx) => {
     // Serialize deletion with migration creation. Migration creation takes the
@@ -556,10 +616,19 @@ export async function deleteMachine(machineId: string, options: { executor?: Dat
     // Keep the receipt in the same transaction as the deletion.
     await tx.update(computers).set({ revokedAt: currentDate(), revokedReason: "machine_deleted" })
       .where(and(eq(computers.machineId, machineId), isNull(computers.revokedAt)));
+    // The same for the runner credentials this Machine minted: once
+    // issued_by_machine_id is cleared nothing can tell them apart, and an
+    // agent that moved to another Machine keeps authenticating with them.
+    const revoked = await tx.update(agentCredentials)
+      .set({ revokedAt: currentDate(), revokedReason: "machine_deleted" })
+      .where(and(eq(agentCredentials.issuedByMachineId, machineId), isNull(agentCredentials.revokedAt)))
+      .returning({ agentId: agentCredentials.agentId });
+    revokedCredentialAgentIds = [...new Set(revoked.map((row) => row.agentId))];
     await tx.delete(machines).where(eq(machines.id, machineId));
   });
 
   clearAuthCache(machineId);
+  return { revokedCredentialAgentIds };
 }
 
 export class MachineDeleteConflictError extends Error {
@@ -573,4 +642,36 @@ export class MachineDeleteConflictError extends Error {
     super(message);
     this.name = "MachineDeleteConflictError";
   }
+}
+
+/** The last recorded Computer version of a machine (before this connection's `ready` updates it). */
+export async function getRecordedMachineComputerVersion(machineId: string): Promise<string | null> {
+  const [row] = await getDb()
+    .select({ computerVersion: machines.computerVersion })
+    .from(machines)
+    .where(eq(machines.id, machineId))
+    .limit(1);
+  return row?.computerVersion ?? null;
+}
+
+/**
+ * #proj-raft-computer task #38: the daemon found this machine's current key
+ * in a legacy file an agent could read. Stored only while `keyFingerprint` is
+ * still the stored key and the key has not been retired by the move to a
+ * Computer credential; the first finding is kept. True when the row matched.
+ */
+export async function recordCredentialExposure(
+  machineId: string,
+  report: { foundAt: Date; keyFingerprint: string },
+): Promise<boolean> {
+  const db = getDb();
+  const rows = await db.update(machines)
+    .set({ credentialExposureFoundAt: sql`coalesce(${machines.credentialExposureFoundAt}, ${report.foundAt})` })
+    .where(and(
+      eq(machines.id, machineId),
+      eq(machines.apiKeyFingerprint, report.keyFingerprint),
+      isNull(machines.legacyKeyMigratedAt),
+    ))
+    .returning({ id: machines.id });
+  return rows.length > 0;
 }

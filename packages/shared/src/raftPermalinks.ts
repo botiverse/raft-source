@@ -26,6 +26,16 @@ function toAllowedHostnames(hostnames?: string | readonly string[]): Set<string>
   );
 }
 
+/**
+ * Whether `hostname` is one of Raft's own app hosts: `currentHostname` (the
+ * page's and the deployment's) or the fixed defaults parseRaftPermalink also
+ * reads. A link there is Raft's, and routes in the app rather than in a web
+ * preview.
+ */
+export function isRaftAppHostname(hostname: string, currentHostname?: string | readonly string[]): boolean {
+  return toAllowedHostnames(currentHostname).has(hostname);
+}
+
 export function parseRaftPermalink(
   href: string,
   currentHostname?: string | readonly string[],

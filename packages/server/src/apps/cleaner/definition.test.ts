@@ -25,7 +25,7 @@ const DELETED_SERVER_SYSCALLS = ["notify", "readOwnState", "writeOwnState"] as c
 test("RETAIN: app identity and notification-class identity survive", () => {
   assert.equal(BUILT_IN_MEMORY_CLEANER_APP.appId, CLEANER_APP_ID);
   assert.equal(BUILT_IN_MEMORY_CLEANER_APP.manifest.app_id, CLEANER_APP_ID);
-  assert.deepEqual(BUILT_IN_MEMORY_CLEANER_APP.manifest.notifications, ["memory_size_hint", "disk_space_hint"]);
+  assert.deepEqual(BUILT_IN_MEMORY_CLEANER_APP.manifest.notifications, ["memory_size_hint", "disk_space_hint", "backup_ignore_hint"]);
 });
 
 test("NEGATIVE: no Server execution syscall may be claimed", () => {

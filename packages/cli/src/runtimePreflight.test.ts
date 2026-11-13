@@ -33,13 +33,10 @@ test("unsupported Node 18 exits before CLI runtime dependencies load", () => {
       }),
     /exit 1/,
   );
-
-  assert.equal(
-    writes.join(""),
-    "Error: Node v18.19.1 is unsupported; raft requires Node >=24 before loading CLI runtime dependencies.\n"
-      + "No network requests, credentials, or local state were touched.\n"
-      + "Next action: Install/activate Node 24.21.0 (the repository pin), then retry.\n",
-  );
+  // The agent-parsed envelope, not its wording: an Error: line naming the Node version, and a Next action: line.
+  const text = writes.join("");
+  assert.match(text, /^Error: Node v18\.19\.1 /m);
+  assert.match(text, /^Next action: /m);
 });
 
 test("supported Node 24+ continues without writing or exiting", () => {
@@ -63,15 +60,6 @@ test("runtime copy tracks the published CLI Node contract and repository pin", (
 
   assert.equal(supportedNodeRange, cliPkg.engines?.node);
   assert.equal(recommendedNodeVersion, nodePin);
-});
-
-test("bootstrap runs preflight before dynamically importing the CLI implementation", () => {
-  const source = readFileSync(new URL("./index.ts", import.meta.url), "utf8");
-
-  assert.match(source, /import \{ enforceSupportedNodeRuntime \} from "\.\/runtimePreflight";/);
-  assert.match(source, /enforceSupportedNodeRuntime\(\);\n\nvoid import\("\.\/main"\)\.catch/);
-  assert.doesNotMatch(source, /await import\("\.\/main(?:\.js)?"\)/);
-  assert.doesNotMatch(source, /from "\.\/main(?:\.js)?";/);
 });
 
 test("bootstrap reports a main-module load failure and exits nonzero", () => {

@@ -5,9 +5,6 @@ import { playwrightScenarios } from "./playwrightScenarios";
 import { openTestApp } from "./integration/app";
 import { seedPlaywrightScenario } from "./seedPlaywrightScenario";
 import { installRisingWaveReadReferences } from "./risingWaveReadReference";
-import { evidenceConfig, observeApiProcess } from "../../../../scripts/e2e/transportEvidence";
-
-const observeHttpServer = observeApiProcess(evidenceConfig());
 
 async function main() {
   const port = Number(process.env.SLOCK_TEST_SERVER_PORT || "4174");
@@ -28,10 +25,7 @@ async function main() {
   const scenarioCapability = randomUUID();
   const testApp = await openTestApp(process.env.DATABASE_URL || "pglite://", port, {
     beforeApp: playwrightScenarios(scenarioCapability),
-    observeHttpServer,
     humanActivityMuteFlagDefaultEnabled: true,
-    sidebarMarkAllReadFlagDefaultEnabled: true,
-    onboardingOpenerFlagDefaultEnabled: false,
     // Browser workers share this server/IP; rate limits have server tests.
     skipAuthRateLimit: true,
   });

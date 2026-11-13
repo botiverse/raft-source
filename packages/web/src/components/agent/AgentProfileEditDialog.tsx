@@ -14,13 +14,13 @@ import {
   Button,
   Dialog,
   DialogBody,
-  DialogContent,
   DialogFooter,
   DialogHeader,
   DialogTitle,
   Input,
   RadioGroup,
   RadioGroupItem,
+  Text,
   Textarea,
 } from "@botiverse/raft-ui";
 import type { ServerRole } from "@botiverse/raft-shared";
@@ -32,7 +32,9 @@ import type { MessageId } from "../../i18n/messages";
 import AvatarSlot from "../ui/AvatarSlot";
 import FormField from "../ui/FormField";
 import Tooltip from "../ui/Tooltip";
-import { AVATAR_KEYS, DEFAULT_AVATAR_KEY, isCustomAvatar, parsePixelAvatar } from "./PixelAvatar";
+import { DialogActions, DialogCommit, NarrowDialogContent } from "../ui/NarrowDialog";
+import type { DialogNarrow } from "../ui/NarrowDialog";
+import { AVATAR_SERIES, DEFAULT_AVATAR_KEY, isCustomAvatar, parsePixelAvatar } from "./PixelAvatar";
 
 export type AgentProfileEditField = "displayName" | "description" | "role" | "avatar";
 type EditableRole = Extract<ServerRole, "admin" | "member">;
@@ -45,6 +47,25 @@ const TITLE_ID = {
   role: "agent.detail.editRole",
   avatar: "agent.detail.chooseAvatar",
 } as const satisfies Record<AgentProfileEditField, MessageId>;
+
+/** On a phone (NarrowDialog): the avatar grid is the sheet; a name, a
+ *  description or a role is the centred card (it moves up with the keyboard). */
+function narrowFor(field: AgentProfileEditField): DialogNarrow {
+  return field === "avatar" ? "sheet" : "centered";
+}
+
+/** Heading of each avatar series in the picker, by pixelAvatars.json series key. */
+const AVATAR_SERIES_TITLE_ID: Record<string, MessageId> = {
+  bots: "agent.avatar.series.bots",
+  critters: "agent.avatar.series.critters",
+  space: "agent.avatar.series.space",
+  desk: "agent.avatar.series.desk",
+  food: "agent.avatar.series.food",
+  quest: "agent.avatar.series.quest",
+  weather: "agent.avatar.series.weather",
+  plants: "agent.avatar.series.plants",
+  spooky: "agent.avatar.series.spooky",
+};
 
 /** Avatar choice staged in the dialog; nothing is sent until Save. */
 type AvatarDraft =
@@ -209,23 +230,32 @@ export default function AgentProfileEditDialog({ agent, open, field, onClose, ro
   const presetButtonClass = (selected: boolean, upload = false) =>
     `flex size-11 items-center justify-center overflow-hidden rounded-control border-[1.5px] text-foreground-muted outline-none focus-visible:shadow-focus ${
       selected
-        ? "border-sticker-ink bg-brand text-sticker-ink hover:press-overlay-sticker"
+        ? "border-sticker-ink bg-selected text-sticker-ink hover:overlay-sticker-medium"
         : upload
-          ? "border-dashed border-line-strong hover:bg-fill-pressed"
-          : "border-transparent hover:bg-fill-pressed"
+          ? "border-dashed border-line-strong hover:bg-fill-medium"
+          : "border-transparent hover:bg-fill-medium"
     }`;
 
   return (
     <>
       <Dialog open={open} onOpenChange={handleDialogOpenChange}>
-        <DialogContent aria-labelledby={ids.title} className="max-w-lg" data-testid="agent-profile-edit-dialog">
+        <NarrowDialogContent
+          narrow={narrowFor(field)}
+          aria-labelledby={ids.title}
+          className="max-w-lg"
+          data-testid="agent-profile-edit-dialog"
+          title={formatMessage({ id: TITLE_ID[field] })}
+          titleId={ids.title}
+          closeLabel={formatMessage({ id: "common.close" })}
+          closeDisabled={saving}
+          header={
           <DialogHeader>
             <DialogTitle id={ids.title}>{formatMessage({ id: TITLE_ID[field] })}</DialogTitle>
             <Button
               type="button"
               variant="ghost"
-              size="icon-sm"
-              className="-my-1.5 -mr-1.5"
+              size="icon-md"
+              className="-my-1.5"
               aria-label={formatMessage({ id: "common.close" })}
               onClick={requestClose}
               disabled={saving}
@@ -233,6 +263,8 @@ export default function AgentProfileEditDialog({ agent, open, field, onClose, ro
               <X className="size-4.5" aria-hidden="true" />
             </Button>
           </DialogHeader>
+          }
+        >
           <DialogBody className="grid gap-5">
             {field === "displayName" ? (
             <FormField label={formatMessage({ id: "agent.detail.displayName" })} htmlFor={ids.name}>
@@ -283,68 +315,94 @@ export default function AgentProfileEditDialog({ agent, open, field, onClose, ro
             ) : null}
             {field === "avatar" ? (
             // The dialog title already names this field, so no separate label.
-            <div>
-              <div className="flex items-start gap-4" data-testid="agent-profile-edit-avatar">
+            <div className="grid gap-4" data-testid="agent-profile-edit-avatar">
+              <div className="flex items-center gap-4">
                 <AvatarSlot context="profile-tile" type="agent" agentAvatarUrl={previewAvatarUrl} />
-                <div className="flex min-w-0 flex-wrap gap-2">
-                  <Tooltip content={formatMessage({ id: "agent.detail.uploadImage" })}>
-                    <button
-                      type="button"
-                      autoFocus={field === "avatar"}
-                      aria-label={formatMessage({ id: "agent.detail.uploadImage" })}
-                      onClick={() => fileInputRef.current?.click()}
-                      className={presetButtonClass(avatar.kind === "upload" || (avatar.kind === "unchanged" && isCustomAvatar(agent.avatarUrl)), true)}
+                <Tooltip content={formatMessage({ id: "agent.detail.uploadImage" })}>
+                  <button
+                    type="button"
+                    autoFocus={field === "avatar"}
+                    aria-label={formatMessage({ id: "agent.detail.uploadImage" })}
+                    onClick={() => fileInputRef.current?.click()}
+                    className={presetButtonClass(avatar.kind === "upload" || (avatar.kind === "unchanged" && isCustomAvatar(agent.avatarUrl)), true)}
+                  >
+                    <Upload size={18} />
+                  </button>
+                </Tooltip>
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept={PROFILE_AVATAR_ACCEPT}
+                  className="hidden"
+                  onChange={(e) => {
+                    const file = e.target.files?.[0];
+                    e.currentTarget.value = "";
+                    if (file) stageUpload(file);
+                  }}
+                />
+              </div>
+              {/* One series per row of 8; a container narrower than 8 tiles
+                  (a phone) wraps each series into two rows of 4. */}
+              <div className="@container grid gap-3">
+                {AVATAR_SERIES.map((series) => {
+                  const headingId = `${ids.avatar}-${series.key}`;
+                  return (
+                    <div
+                      key={series.key}
+                      role="group"
+                      aria-labelledby={headingId}
+                      className="grid gap-1.5"
+                      data-avatar-series={series.key}
                     >
-                      <Upload size={18} />
-                    </button>
-                  </Tooltip>
-                  <input
-                    ref={fileInputRef}
-                    type="file"
-                    accept={PROFILE_AVATAR_ACCEPT}
-                    className="hidden"
-                    onChange={(e) => {
-                      const file = e.target.files?.[0];
-                      e.currentTarget.value = "";
-                      if (file) stageUpload(file);
-                    }}
-                  />
-                  {AVATAR_KEYS.map((key) => (
-                    <Tooltip key={key} content={key}>
-                      <button
-                        type="button"
-                        aria-label={key}
-                        aria-pressed={selectedPreset === key}
-                        onClick={() => stageAvatar(key === DEFAULT_AVATAR_KEY ? { kind: "default" } : { kind: "preset", key })}
-                        className={presetButtonClass(selectedPreset === key)}
-                      >
-                        <AvatarSlot context="panel-header" type="agent" agentAvatarUrl={`pixel:${key}`} />
-                      </button>
-                    </Tooltip>
-                  ))}
-                </div>
+                      <Text.Sans
+                        size="group"
+                        id={headingId}
+                        render={<h3>{formatMessage({ id: AVATAR_SERIES_TITLE_ID[series.key] })}</h3>}
+                      />
+                      <div className="grid w-fit grid-cols-4 gap-2 @min-[408px]:grid-cols-8">
+                        {series.avatars.map((key) => (
+                          <Tooltip key={key} content={key}>
+                            <button
+                              type="button"
+                              aria-label={key}
+                              aria-pressed={selectedPreset === key}
+                              onClick={() => stageAvatar(key === DEFAULT_AVATAR_KEY ? { kind: "default" } : { kind: "preset", key })}
+                              className={presetButtonClass(selectedPreset === key)}
+                            >
+                              <AvatarSlot context="panel-header" type="agent" agentAvatarUrl={`pixel:${key}`} />
+                            </button>
+                          </Tooltip>
+                        ))}
+                      </div>
+                    </div>
+                  );
+                })}
               </div>
             </div>
             ) : null}
             {error ? <Banner status="warning" size="sm" role="alert">{error}</Banner> : null}
           </DialogBody>
-          <DialogFooter>
+          <DialogActions as={DialogFooter}>
             <Button type="button" variant="ghost" size="lg" onClick={requestClose} disabled={saving}>
               {formatMessage({ id: "common.confirm.cancel" })}
             </Button>
-            <Button
-              type="button"
-              variant="accent"
-              size="lg"
-              loading={saving}
-              disabled={!dirty || descriptionTooLong}
-              onClick={handleSaveClick}
-              data-testid="agent-profile-edit-save"
-            >
-              {formatMessage({ id: "machine.detail.save" })}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
+            <DialogCommit>
+              {(inHead) => (
+                <Button
+                  type="button"
+                  variant="accent"
+                  size={inHead ? "md" : "lg"}
+                  loading={saving}
+                  disabled={!dirty || descriptionTooLong}
+                  onClick={handleSaveClick}
+                  data-testid="agent-profile-edit-save"
+                >
+                  {formatMessage({ id: "machine.detail.save" })}
+                </Button>
+              )}
+            </DialogCommit>
+          </DialogActions>
+        </NarrowDialogContent>
       </Dialog>
 
       <AlertDialog open={confirmDiscard} onOpenChange={handleConfirmDiscardChange}>

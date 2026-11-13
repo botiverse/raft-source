@@ -19,6 +19,9 @@ export interface RaftMessageTask {
   number: number | null;
   status: string | null;
   assigneeName: string | null;
+  /** The assignee's id and kind (`human` / `agent`); null when unassigned or not sent. */
+  assigneeId: string | null;
+  assigneeType: string | null;
 }
 
 export interface RaftMessage {
@@ -66,12 +69,17 @@ export function toAgentMessageLike(envelope: AgentApiMessageEnvelope): AgentMess
     sender_name: envelope.sender_name ?? envelope.senderName,
     sender_description: envelope.sender_description ?? envelope.senderDescription ?? null,
     sender_timezone: envelope.sender_timezone ?? envelope.senderTimezone ?? null,
+    delegated_by: envelope.delegated_by
+      ?? ((envelope as { delegatedBy?: { name?: unknown } | null }).delegatedBy?.name
+        ? { name: String((envelope as { delegatedBy: { name: unknown } }).delegatedBy.name) }
+        : null),
     task_status: envelope.task_status ?? envelope.taskStatus ?? null,
     task_number: envelope.task_number ?? envelope.taskNumber ?? null,
     task_assignee_id: envelope.task_assignee_id ?? envelope.taskAssigneeId ?? null,
     task_assignee_type: envelope.task_assignee_type ?? envelope.taskAssigneeType ?? null,
     task_assignee_name: envelope.task_assignee_name ?? envelope.taskAssigneeName ?? null,
     task_current_projection: envelope.task_current_projection ?? envelope.taskCurrentProjection ?? null,
+    source_tasks: Array.isArray(envelope.source_tasks) ? envelope.source_tasks : null,
   } as AgentMessageLike;
 }
 
@@ -112,7 +120,13 @@ export function projectRaftMessage(envelope: AgentApiMessageEnvelope, style: Raf
     attachments: (envelope.attachments ?? []).map((a) => ({ id: a.id, filename: a.filename })),
     mentioned: typeof raw.mentioned === "boolean" ? raw.mentioned : null,
     task: taskNumber !== null || taskStatus !== null
-      ? { number: taskNumber, status: taskStatus, assigneeName: nullableString(like.task_assignee_name) }
+      ? {
+          number: taskNumber,
+          status: taskStatus,
+          assigneeName: nullableString(like.task_assignee_name),
+          assigneeId: nullableString(like.task_assignee_id),
+          assigneeType: nullableString(like.task_assignee_type),
+        }
       : null,
     thread: { id: nullableString(envelope.threadId), replyCount: nullableNumber(envelope.replyCount) },
     text: formatAgentMessageLine(like, style),

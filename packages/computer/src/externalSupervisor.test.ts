@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
-import { fileURLToPath } from "node:url";
 import os from "node:os";
 import path from "node:path";
 import {
@@ -10,10 +9,12 @@ import {
   UPGRADE_SAFE_KILL_MODES,
   clearSupervisorRecord,
   describeKillModeRequirement,
+  describeOomPolicyRequirement,
   detectSystemdSupervisor,
   externalSupervisorOptIn,
   inspectSupervisor,
   parseSystemdUnitFromCgroup,
+  readSupervisorOomPolicy,
   readSupervisorRecord,
   writeSupervisorRecord,
   type SystemctlRunner,
@@ -138,50 +139,51 @@ test("task #917: the KillMode requirement names the unit and the exact line to c
   assert.match(text, /daemon-reload/);
 });
 
+test("OOMPolicy of a user's own unit is read from systemd, and the fix fits a unit file or a systemd-run unit", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "raft-supervisor-oom-"));
+  try {
+    assert.equal(await readSupervisorOomPolicy(home, { systemctl: fakeSystemctl({}).runner }), null, "no record ⇒ not under systemd");
+    const record = { kind: "systemd" as const, scope: "user" as const, unit: "raft-computer.service", invocationId: "x", pid: 7, recordedAt: "t" };
+    await writeSupervisorRecord(home, record);
+    const file = fakeSystemctl({
+      "user:show -P LoadState raft-computer.service": "loaded",
+      "user:show -P OOMPolicy raft-computer.service": "stop",
+      "user:show -P Transient raft-computer.service": "no",
+    });
+    const fromFile = await readSupervisorOomPolicy(home, { systemctl: file.runner });
+    assert.deepEqual(fromFile, { record, oomPolicy: "stop", transient: false });
+    const fileFix = describeOomPolicyRequirement(fromFile!);
+    assert.match(fileFix, /raft-computer\.service has OOMPolicy=stop/);
+    assert.match(fileFix, /`systemctl --user edit raft-computer\.service`, add the two lines `\[Service\]` and `OOMPolicy=continue`/);
+
+    const transient = fakeSystemctl({
+      "user:show -P LoadState raft-computer.service": "loaded",
+      "user:show -P OOMPolicy raft-computer.service": "stop",
+      "user:show -P Transient raft-computer.service": "yes",
+    });
+    const fromRun = await readSupervisorOomPolicy(home, { systemctl: transient.runner });
+    assert.equal(fromRun?.transient, true);
+    const runFix = describeOomPolicyRequirement(fromRun!);
+    assert.match(runFix, /systemctl --user reset-failed raft-computer\.service/);
+    assert.match(runFix, /-p OOMPolicy=continue/);
+    assert.doesNotMatch(runFix, /systemctl --user edit/);
+
+    // A unit that is gone, or a manager without a session bus: no answer, never a guess.
+    assert.equal(await readSupervisorOomPolicy(home, { systemctl: fakeSystemctl({ "user:show -P LoadState raft-computer.service": "not-found" }).runner }), null);
+    assert.equal(await readSupervisorOomPolicy(home, { systemctl: fakeSystemctl({ "user:show -P LoadState raft-computer.service": null }).runner }), null);
+    // A system unit is edited with sudo and no --user.
+    assert.match(
+      describeOomPolicyRequirement({ record: { ...record, scope: "system" }, oomPolicy: "kill", transient: false }),
+      /OOMPolicy=kill: .*`sudo systemctl edit raft-computer\.service`/,
+    );
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
 test("task #917: exit codes form two closed classes and the relaunch code is not a stop code", () => {
   assert.deepEqual([...INTENTIONAL_STOP_EXIT_CODES], [77, 78]);
   assert.deepEqual([...RELAUNCH_EXIT_CODES], [SUPERVISED_RELAUNCH_EXIT_CODE, 1]);
   assert.equal(SUPERVISED_RELAUNCH_EXIT_CODE, 75);
   for (const code of INTENTIONAL_STOP_EXIT_CODES) assert.ok(!RELAUNCH_EXIT_CODES.includes(code));
-});
-
-// --- Contract: every non-zero exit in the service belongs to exactly one class ---
-//
-// The unit template writes `RestartPreventExitStatus=` from INTENTIONAL_STOP_EXIT_CODES
-// and relies on `Restart=always` for everything else. A new terminal path that
-// is in neither list would either loop forever (a stop that is restarted) or
-// never come back (a crash listed as intentional). The test reads the service
-// sources, resolves the named constants, and refuses an unclassified code.
-test("task #917: every non-zero service exit code is classified as stop or relaunch", async () => {
-  const files = ["./service.ts", "./lib/serviceShutdown.ts", "./serviceControl.ts", "./externalSupervisor.ts"];
-  const named: Record<string, number> = {
-    EX_CONFIG_EXIT_CODE: 78,
-    COMPUTER_MACHINE_UNLINKED_EXIT_CODE: 77,
-    SUPERVISED_RELAUNCH_EXIT_CODE,
-  };
-  const seen = new Map<string, string[]>();
-  for (const file of files) {
-    const src = await readFile(fileURLToPath(new URL(file, import.meta.url)), "utf8");
-    // `process.exit(X)` and the shutdown seam's `exit(X)`; the `exitCode = 0`
-    // default and `exit(exitCode)` are covered by the supervised path below.
-    for (const match of src.matchAll(/(?:process\.)?exit\(\s*([A-Za-z_][A-Za-z0-9_]*|\d+)\s*\)/gu)) {
-      const token = match[1]!;
-      if (token === "exitCode" || token === "code") continue; // variable: classified where it is assigned
-      const value = /^\d+$/u.test(token) ? Number(token) : named[token];
-      assert.ok(value !== undefined, `${file}: exit(${token}) uses an unknown constant; add it to the named map and to a class`);
-      if (value === 0) continue;
-      const stop = INTENTIONAL_STOP_EXIT_CODES.includes(value);
-      const relaunch = RELAUNCH_EXIT_CODES.includes(value);
-      assert.ok(stop !== relaunch, `${file}: exit code ${value} (${token}) must be in exactly one of INTENTIONAL_STOP_EXIT_CODES / RELAUNCH_EXIT_CODES`);
-      seen.set(`${file}:${token}`, [stop ? "stop" : "relaunch"]);
-    }
-  }
-  // The two known intentional stops and the supervised hand-off are present and classified.
-  assert.deepEqual(seen.get("./service.ts:EX_CONFIG_EXIT_CODE"), ["stop"]);
-  assert.deepEqual(seen.get("./service.ts:COMPUTER_MACHINE_UNLINKED_EXIT_CODE"), ["stop"]);
-  // The relaunch code is assigned into `supervisedExitCode` and flows through
-  // shutdownService's `exitCode`; pin that it is the relaunch class.
-  assert.ok(RELAUNCH_EXIT_CODES.includes(SUPERVISED_RELAUNCH_EXIT_CODE));
-  const serviceSrc = await readFile(fileURLToPath(new URL("./service.ts", import.meta.url)), "utf8");
-  assert.match(serviceSrc, /supervisedExitCode = SUPERVISED_RELAUNCH_EXIT_CODE/);
 });

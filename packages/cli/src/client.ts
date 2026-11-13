@@ -22,14 +22,20 @@
 
 import type { Dispatcher } from "undici";
 import {
+  guideAppCapabilities,
   MANUAL_CONTEXT_CAPABILITY,
+  PLAN_UPGRADE_CARD_CAPABILITY,
+  INBOX_ITEMS_CAPABILITY,
+  RAFT_CLI_ENTRY_HEADER,
+  RAFT_CLI_STABLE_ENTRY,
   RAFT_CLIENT_CAPABILITIES_HEADER,
+  RAFT_CLIENT_VERSION_HEADER,
 } from "@botiverse/raft-shared/src/agentCliSurface";
 import { buildAgentApiEventsPath } from "./agentApiPath";
 import type { AgentContext } from "./auth/env";
-import { apiFailureError } from "./core/apiFailure";
+import { apiFailureError, localProxyLifecycleError } from "./core/apiFailure";
 import { isHttpRedirect, requestJsonOverHttp, type JsonTransportInit, type TransportResponse } from "./httpTransport";
-import { buildFetchDispatcher } from "./proxy";
+import { buildFetchDispatcher, describeFetchFailure, fetchWithDispatcher } from "./proxy";
 import {
   boundedOriginalMessage,
   emitCliTransportNormalizedError,
@@ -37,6 +43,22 @@ import {
   targetHostClassForUrl,
   upstreamLayerForFetchError,
 } from "./transportTrace";
+import { normalizeVersion, readCliVersion } from "./version";
+
+/**
+ * `X-Raft-Client-Capabilities` on every JSON and multipart request: the Manual
+ * context contract, that `raft action prepare` posts `plan:upgrade` cards (so
+ * the Server may hint one), and the guide-app tokens.
+ */
+const CLI_CLIENT_CAPABILITIES = [MANUAL_CONTEXT_CAPABILITY, PLAN_UPGRADE_CARD_CAPABILITY, INBOX_ITEMS_CAPABILITY, ...guideAppCapabilities()].join(",");
+
+let cliVersionHeaderValue: string | null | undefined;
+
+/** `X-Raft-Client-Version`: this CLI's version, so the server can split agent requests by it; null when unknown. */
+function cliVersionHeader(): string | null {
+  if (cliVersionHeaderValue === undefined) cliVersionHeaderValue = normalizeVersion(readCliVersion());
+  return cliVersionHeaderValue;
+}
 
 type ProxyAwareRequestInit = RequestInit & { dispatcher?: Dispatcher };
 
@@ -65,6 +87,8 @@ export interface ApiResponse<T> {
   errorCode?: string | null;
   suggestedNextAction?: string | null;
   proxy?: ApiProxyDiagnostics | null;
+  /** A refusal's parsed JSON body (`details` and all), for callers that explain it. */
+  errorBody?: unknown;
 }
 
 export interface ApiProxyDiagnostics {
@@ -88,6 +112,12 @@ export interface BodyResponse {
   status: number;
   response: Response;
   error: string | null;
+  /** The Server's machine code (`errorCode` or `code` in a JSON error body, e.g. `HISTORY_LIMITED`). */
+  errorCode?: string | null;
+  /** The refusal's text step (`suggestedNextAction` or `suggested_next_action`), as on the JSON path. */
+  suggestedNextAction?: string | null;
+  /** A JSON refusal's parsed body (`details`, `suggestedNextAction` and all), as on the JSON path. */
+  errorBody?: unknown;
 }
 
 export interface BinaryResponse {
@@ -97,6 +127,9 @@ export interface BinaryResponse {
   error: string | null;
   errorCode?: string | null;
   proxy?: ApiProxyDiagnostics | null;
+  suggestedNextAction?: string | null;
+  /** A JSON refusal's parsed body, so a binary route's refusal explains itself like a JSON route's. */
+  errorBody?: unknown;
 }
 
 export class ApiClient {
@@ -187,6 +220,11 @@ export class ApiClient {
       "X-Agent-Id": this.ctx.agentId,
       "X-Raft-Client": "cli",
     };
+    if (this.ctx.clientMode === "managed-runner" && this.ctx.entry === RAFT_CLI_STABLE_ENTRY) {
+      headers[RAFT_CLI_ENTRY_HEADER] = RAFT_CLI_STABLE_ENTRY;
+    }
+    const version = cliVersionHeader();
+    if (version) headers[RAFT_CLIENT_VERSION_HEADER] = version;
     if (this.ctx.serverId) headers["X-Server-Id"] = this.ctx.serverId;
     return headers;
   }
@@ -242,6 +280,7 @@ export class ApiClient {
             error?: string;
             errorCode?: string;
             code?: string;
+            message?: string;
             requiredScope?: string;
             reason?: string;
             suggestedNextAction?: string;
@@ -260,7 +299,9 @@ export class ApiClient {
             `capability, so this command can't run. Ask an authorized human to ` +
             `inspect or update this agent's scope grant through the API.`;
         } else {
-          error = body?.error ?? `HTTP ${res.status}`;
+          // Contract-shaped errors (attachment upload sessions) carry
+          // `{ code, message }` with no `error`.
+          error = body?.error ?? body?.message ?? `HTTP ${res.status}`;
           errorCode = body?.errorCode ?? body?.code ?? null;
         }
         const suggestedNextAction = body?.suggestedNextAction ?? body?.suggested_next_action;
@@ -272,6 +313,7 @@ export class ApiClient {
           errorCode,
           suggestedNextAction,
           proxy: parseProxyDiagnostics(body?.proxy),
+          errorBody: body,
         };
       }
     } else if (!res.ok) {
@@ -284,10 +326,22 @@ export class ApiClient {
     if (response.status >= 500 && response.errorCode === "agent_proxy_failed") {
       throw apiFailureError(response, "CHECK_FAILED");
     }
+    this.throwLaunchLifecycleRefusal(response);
+  }
+
+  // The launch this CLI ran from has ended (or the agent has none): no
+  // command can do anything about it, so every command says it the same way.
+  private throwLaunchLifecycleRefusal(response: Parameters<typeof localProxyLifecycleError>[0]): void {
+    if (this.ctx.clientMode !== "managed-runner") return;
+    const lifecycle = localProxyLifecycleError(response);
+    if (lifecycle) throw lifecycle;
   }
 
   private fetchWithTransportTrace(url: URL, pathname: string, init: ProxyAwareRequestInit): Promise<Response> {
-    return this.sendWithTransportTrace(url, pathname, () => fetch(url, init));
+    const { dispatcher } = init;
+    return this.sendWithTransportTrace(url, pathname, () => (
+      dispatcher ? fetchWithDispatcher(url, { ...init, dispatcher }) : fetch(url, init)
+    ));
   }
 
   // Plain JSON requests go over node:http (see httpTransport.ts). A redirect is
@@ -367,8 +421,12 @@ export class ApiClient {
     Object.assign(headers, options?.headers);
     // Rollout carrier: new CLIs hard-require Manual intent/reason locally and
     // advertise that contract explicitly. New servers may therefore enforce
-    // it without breaking older published CLI/daemon fleets.
-    headers[RAFT_CLIENT_CAPABILITIES_HEADER] = MANUAL_CONTEXT_CAPABILITY;
+    // it without breaking older published CLI/daemon fleets. The plan:upgrade
+    // token lets the Server's Free-limit refusals and history notes hint an
+    // upgrade card this CLI can post. The guide-app tokens name the
+    // first-party app entries this CLI was built with, so the self-hosted
+    // guide (`raft auth whoami --prompt`) names only commands it has.
+    headers[RAFT_CLIENT_CAPABILITIES_HEADER] = CLI_CLIENT_CAPABILITIES;
     // This header is the session-side half of the v0.8 active-capability
     // intersection. The server still enforces credential max scopes first;
     // when present, this set can further deny otherwise-authorized commands
@@ -407,6 +465,8 @@ export class ApiClient {
     const url = new URL(pathname, this.ctx.serverUrl);
     const dispatcher = await buildFetchDispatcher(url.toString());
     const headers = this.buildAuthHeaders();
+    // An attachment upload's Free-limit refusal hints the upgrade card only to a client that declares it can post one.
+    headers[RAFT_CLIENT_CAPABILITIES_HEADER] = CLI_CLIENT_CAPABILITIES;
     if (this.ctx.activeCapabilities && this.ctx.activeCapabilities.length > 0) {
       headers["X-Slock-Agent-Active-Capabilities"] = this.ctx.activeCapabilities.join(",");
     }
@@ -415,6 +475,31 @@ export class ApiClient {
       headers,
       body: form,
     };
+    if (dispatcher) init.dispatcher = dispatcher;
+    const res = await this.fetchWithTransportTrace(url, pathname, init);
+    const parsed = await this.parseJsonResponse<T>(res);
+    this.throwProxyFailure(parsed);
+    return parsed;
+  }
+
+  /** Send raw bytes (an Artifact upload: `PUT …/uploads/:sha256`); the answer is parsed like any JSON route. */
+  async requestRawBody<T>(
+    method: string,
+    pathname: string,
+    bytes: Uint8Array,
+    contentType = "application/octet-stream",
+  ): Promise<ApiResponse<T>> {
+    pathname = this.rewriteAgentCredentialPath(pathname);
+    const url = new URL(pathname, this.ctx.serverUrl);
+    const dispatcher = await buildFetchDispatcher(url.toString());
+    const headers = this.buildAuthHeaders();
+    if (this.ctx.activeCapabilities && this.ctx.activeCapabilities.length > 0) {
+      headers["X-Slock-Agent-Active-Capabilities"] = this.ctx.activeCapabilities.join(",");
+    }
+    headers["Content-Type"] = contentType;
+    const body = new Uint8Array(bytes.byteLength);
+    body.set(bytes);
+    const init: ProxyAwareRequestInit = { method, headers, body };
     if (dispatcher) init.dispatcher = dispatcher;
     const res = await this.fetchWithTransportTrace(url, pathname, init);
     const parsed = await this.parseJsonResponse<T>(res);
@@ -442,16 +527,40 @@ export class ApiClient {
     if (dispatcher) init.dispatcher = dispatcher;
     const res = await this.fetchWithTransportTrace(url, pathname, init);
     let error: string | null = null;
+    let errorCode: string | null = null;
+    let errorBody: unknown;
+    let suggestedNextAction: string | null = null;
     if (!res.ok) {
       const contentType = res.headers.get("content-type") ?? "";
       if (contentType.includes("application/json")) {
-        const parsed = await res.json().catch(() => null);
-        error = (parsed as { error?: string } | null)?.error ?? `HTTP ${res.status}`;
+        const parsed = await res.json().catch(() => null) as { error?: string; errorCode?: string; code?: string; suggestedNextAction?: string } | null;
+        if (parsed !== null) errorBody = parsed;
+        const step = parsed?.suggestedNextAction ?? (parsed as { suggested_next_action?: unknown } | null)?.suggested_next_action;
+        suggestedNextAction = typeof step === "string" ? step : null;
+        error = parsed?.error ?? `HTTP ${res.status}`;
+        // Same machine code the JSON path reads, so a binary route's refusal keeps it.
+        const code = parsed?.errorCode ?? parsed?.code;
+        errorCode = typeof code === "string" ? code : null;
+        this.throwLaunchLifecycleRefusal({
+          status: res.status,
+          error,
+          errorCode,
+          suggestedNextAction,
+          errorBody: parsed,
+        });
       } else {
         error = `HTTP ${res.status}`;
       }
     }
-    return { ok: res.ok, status: res.status, response: res, error };
+    return {
+      ok: res.ok,
+      status: res.status,
+      response: res,
+      error,
+      errorCode,
+      ...(suggestedNextAction !== null ? { suggestedNextAction } : {}),
+      ...(errorBody !== undefined ? { errorBody } : {}),
+    };
   }
 
   async requestBinary(method: string, pathname: string): Promise<BinaryResponse> {
@@ -493,8 +602,11 @@ export class ApiClient {
       let objectResponse: Response;
       try {
         objectResponse = await this.fetchWithTransportTrace(objectUrl, rewrittenPathname, init);
-      } catch {
-        throw new Error("Attachment object download failed");
+      } catch (cause) {
+        throw new Error(
+          `Attachment object download failed (${describeFetchFailure(objectUrl, cause, Boolean(dispatcher))})`,
+          { cause },
+        );
       }
       if (!objectResponse.ok) {
         return {
@@ -512,7 +624,15 @@ export class ApiClient {
       };
     }
     if (!res.ok) {
-      return { ok: false, status: res.status, body: new Uint8Array(), error: res.error };
+      return {
+        ok: false,
+        status: res.status,
+        body: new Uint8Array(),
+        error: res.error,
+        errorCode: res.errorCode ?? null,
+        ...(res.suggestedNextAction ? { suggestedNextAction: res.suggestedNextAction } : {}),
+        ...(res.errorBody !== undefined ? { errorBody: res.errorBody } : {}),
+      };
     }
     try {
       return {

@@ -13,6 +13,8 @@ import {
   traceAgentActivityStoreDecision,
   traceAgentActivityStatusDotApplied,
   deriveActivityDecisionRelation,
+  ROUTINE_AGENT_ACTIVITY_TRACE_SAMPLE_RATE,
+  setAgentActivityTraceRandomForTests,
 } from "../src/utils/webAgentActivityTrace";
 
 function installLocalStorageForTraceTest(): () => void {
@@ -131,6 +133,8 @@ test("agent activity trace wrappers are fire-and-forget no-ops when receiver is 
 test("agent activity trace wrappers preserve non-empty clientEventId only inside join", async () => {
   const restoreLocalStorage = installLocalStorageForTraceTest();
   const batches = captureWebTraceBatches();
+  // The refresh-only push below is routine: sampled in for this test.
+  setAgentActivityTraceRandomForTests(() => 0);
 
   try {
     traceAgentActivitySocketReceived({
@@ -164,6 +168,7 @@ test("agent activity trace wrappers preserve non-empty clientEventId only inside
     });
     await flushAuthTraces();
   } finally {
+    setAgentActivityTraceRandomForTests(null);
     __resetAuthTraceForTest();
     setAuthTraceServerIdGetter(() => undefined);
     setAuthTracePrincipalIdGetter(() => undefined);
@@ -171,6 +176,8 @@ test("agent activity trace wrappers preserve non-empty clientEventId only inside
   }
 
   const records = batches.flatMap((batch) => batch.events ?? []);
+  assert.equal(records[0].attrs?.sample_rate, ROUTINE_AGENT_ACTIVITY_TRACE_SAMPLE_RATE, "a sampled routine push says its rate");
+  assert.equal("sample_rate" in (records[1].attrs ?? {}), false, "a display change is traced in full");
   assert.deepEqual(records.map((record) => record.name), [
     "slock.agent_activity.socket_received",
     "slock.agent_activity.store_decision",
@@ -221,4 +228,43 @@ test("deriveActivityDecisionRelation emits closed-set, value-free decision attrs
   for (const v of Object.values(rel)) {
     assert.ok(typeof v === "boolean" || ["true", "false", "unknown", "gt", "lte", "absent", "server_seq", "none"].includes(v as string));
   }
+});
+
+test("routine agent activity is traced at the sample rate; display changes and anomalies always", async () => {
+  const restoreLocalStorage = installLocalStorageForTraceTest();
+  const batches = captureWebTraceBatches();
+  setAgentActivityTraceRandomForTests(() => 0.5);
+  try {
+    traceAgentActivitySocketReceived({ agentId: "a", activity: "online", isHeartbeat: true });
+    traceAgentActivitySocketReceived({ agentId: "a", activity: "online", isRefreshOnly: true });
+    traceAgentActivityStoreDecision({ agentId: "a", activity: "online", outcome: "applied", previousActivity: "online", nextActivity: "online" });
+    // A detail-only change ("Running command" -> "Editing file") keeps the activity: routine too.
+    traceAgentActivityStoreDecision({ agentId: "a", activity: "working", detail: "Editing file", outcome: "applied", previousActivity: "working", nextActivity: "working" });
+    // Same activity as before (a detail-only push, most of real traffic): routine.
+    traceAgentActivitySocketReceived({ agentId: "a", activity: "working", detail: "Subagent working…", previousActivity: "working" });
+    // No previous activity known, or a different one: traced in full.
+    traceAgentActivitySocketReceived({ agentId: "b", activity: "working" });
+    // The store has nothing for it, but its last push had the same activity: routine.
+    traceAgentActivitySocketReceived({ agentId: "b", activity: "working", detail: "Subagent working…", previousActivity: null });
+    traceAgentActivitySocketReceived({ agentId: "b", activity: "working", detail: "Running command" });
+    // The store knows a different activity (a snapshot set it offline): a real change, traced in full.
+    traceAgentActivitySocketReceived({ agentId: "b", activity: "working", previousActivity: "offline" });
+    traceAgentActivityStoreDecision({ agentId: "a", activity: "working", outcome: "applied", previousActivity: "online", nextActivity: "working" });
+    traceAgentActivityStoreDecision({ agentId: "a", activity: "working", outcome: "stale_server_seq", previousActivity: "working", nextActivity: "working" });
+    await flushAuthTraces();
+  } finally {
+    setAgentActivityTraceRandomForTests(null);
+    __resetAuthTraceForTest();
+    setAuthTraceServerIdGetter(() => undefined);
+    setAuthTracePrincipalIdGetter(() => undefined);
+    restoreLocalStorage();
+  }
+  const records = batches.flatMap((batch) => batch.events ?? []);
+  assert.deepEqual(records.map((record) => [record.name, record.attrs?.outcome]), [
+    ["slock.agent_activity.socket_received", "received"],
+    ["slock.agent_activity.socket_received", "received"],
+    ["slock.agent_activity.store_decision", "applied"],
+    ["slock.agent_activity.store_decision", "stale_server_seq"],
+  ], "heartbeat, refresh-only and unchanged-display pushes are left out above the sample rate");
+  for (const record of records) assert.equal("sample_rate" in (record.attrs ?? {}), false);
 });

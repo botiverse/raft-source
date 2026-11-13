@@ -80,4 +80,10 @@ describe("Cloudflare Pages cache headers", () => {
     assert.equal(headers.get("x-content-type-options"), "nosniff");
     assert.equal(headers.get("etag"), "__RAFT_DESKTOP_MANIFEST_ETAG__");
   });
+
+  test("never caches the published Web version an open tab compares itself with", () => {
+    const headers = headersForPath("/version.json");
+    assert.equal(headers.get("content-type"), "application/json; charset=utf-8");
+    assert.equal(headers.get("cache-control"), "no-store");
+  });
 });

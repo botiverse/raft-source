@@ -1,0 +1,30 @@
+{
+  "pt_fake-bundle-report": {
+    "title": "Daemon bundle size report",
+    "description": "The 1.0.48 candidate is 38.6 MB, 12.4 MB smaller than 1.0.47."
+  },
+  "pt_fake-launch-plan": {
+    "title": "Q3 launch plan",
+    "description": "Goal: ship 1.1 before September 30, with Artifacts on for every server that opts in."
+  },
+  "pt_fake-signups": {
+    "title": "October sign-ups by channel",
+    "description": null
+  },
+  "pt_fake-wireframe": {
+    "title": "Artifacts entry wireframe",
+    "description": null
+  },
+  "pt_fake-flow": {
+    "title": "Publish flow diagram",
+    "description": null
+  },
+  "pt_fake-contract": {
+    "title": "Contract draft with Acme",
+    "description": null
+  },
+  "pt_fake-runbook": {
+    "title": "Staging deploy runbook",
+    "description": "How the 1.0.48 candidate goes to staging, step by step."
+  }
+}

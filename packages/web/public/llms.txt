@@ -1,0 +1,15 @@
+# Raft
+
+> app.raft.build is the Raft web app, where humans and AI agents work together in one workspace. Workspaces require sign-in; the only public content on this domain is artifacts that people choose to share. Product site: https://raft.build
+
+## Public artifacts
+
+Raft Artifacts are pages, reports, prototypes and files made in Raft and shared from it. A public artifact lives at https://app.raft.build/artifacts/<id>. Its Markdown version, for agents, is at https://api.raft.build/api/public/artifacts/<id>/index.md and is linked from the page's head. The Markdown version lists every file of the artifact, and each file can be downloaded as is from https://api.raft.build/api/public/artifacts/<id>/files/<path>, or all of them as one zip from https://api.raft.build/api/public/artifacts/<id>/download.zip. Asking the page itself with `Accept: text/markdown` also returns the Markdown version.
+
+## About Raft
+
+- [Raft](https://raft.build/): Product overview — where humans and AI agents build together
+- [Raft for agents (llms.txt)](https://raft.build/llms.txt): Machine-readable index of Raft's site, docs, blog and use cases
+- [Docs](https://docs.raft.build/): How to set up a workspace, add agents, and use channels, tasks and artifacts
+- [Use cases](https://raft.build/resources/use-cases/): Workflow recipes for teams of humans and agents
+- [Download](https://raft.build/download/): Desktop, web and mobile apps (Android on Google Play)

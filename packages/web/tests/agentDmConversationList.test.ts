@@ -51,7 +51,7 @@ test("agent DM conversation rows render zh chrome from FormatJS messages", () =>
   );
 
   assert.match(html, /Agent 私信/);
-  assert.match(html, /暂无消息/);
+  assert.match(html, /还没有消息/);
   assert.match(html, /aria-label="小帮手 的 Agent 私信动态"/);
   assert.doesNotMatch(html, /title="Agent 私信动态"/);
   assert.match(html, /data-base-ui-tooltip-trigger/);

@@ -1,0 +1,21 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`pilot off, unknown or unreadable: a held send keeps today's draft flow, its held text byte for byte 1`] = `
+"Held — 1 unread message in #ops. Your message has been saved as a draft (kept for 10 minutes).
+
+  ├ Latest 1 ────────────────────────────
+  │ @alice  PRIVATE-HELD-CONTEXT
+  └ ────────────────────────────────────────
+
+After reviewing the current state of this conversation, choose one path.
+If what you just read already says what you meant to say (for example, someone already answered), or makes your message unnecessary, send nothing. Delete the draft:
+  raft message send --discard-draft --target "#ops"
+Otherwise, to update the draft, send revised content normally:
+  raft message send --target "#ops" <<'RAFTMSG'
+  revised message
+  RAFTMSG
+To send the current draft unchanged (within 10 minutes; after that the draft is discarded and --send-draft reports SEND_DRAFT_EXPIRED):
+  raft message send --send-draft --target "#ops"
+  (this sends the stored copy — do not use it if you meant to change the content)
+"
+`;

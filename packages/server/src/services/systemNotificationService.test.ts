@@ -4,7 +4,12 @@ import {
   projectMachineSystemNotifications,
   type MachineNotificationReadModel,
 } from "./systemNotificationService";
-import { planUsageLimitTransition, runtimeProviderForAgentRuntime } from "./usageLimitAttentionService";
+import {
+  planUsageLimitTransition,
+  runtimeProviderForAgentRuntime,
+  USAGE_LIMIT_STALE_AFTER_RESET_MS,
+  USAGE_LIMIT_STALE_WITHOUT_RESET_MS,
+} from "./usageLimitAttentionService";
 
 const EVALUATED_AT = new Date("2026-07-21T10:30:00.000Z");
 
@@ -159,39 +164,67 @@ test("response freezes replace lifecycle, no-read, and local-dismiss semantics",
 test("usage-limit attention maps only runtimes sharing the provider account", () => {
   assert.equal(runtimeProviderForAgentRuntime("claude"), "claude");
   assert.equal(runtimeProviderForAgentRuntime("kimi-sdk"), "kimi");
+  assert.equal(runtimeProviderForAgentRuntime("antigravity"), "antigravity");
   assert.equal(runtimeProviderForAgentRuntime("pi"), null);
 });
 
 test("usage-limit activation ignores stale/unknown data and resolves only on a newer authoritative ok", () => {
   const first = new Date("2026-10-11T00:00:00.000Z");
   const newer = new Date("2026-10-11T00:01:00.000Z");
-  const active = { state: "active" as const, activationGeneration: 4, lastObservedAt: first };
-  assert.deepEqual(planUsageLimitTransition({ latest: active, observedAt: newer, windowStatus: "limit_reached" }), {
+  const active = { state: "active" as const, activationGeneration: 4, lastObservedAt: first, resetsAt: null };
+  assert.deepEqual(planUsageLimitTransition({ latest: active, observedAt: newer, windowStatus: "limit_reached", now: newer }), {
     action: "update_active",
   });
-  assert.deepEqual(planUsageLimitTransition({ latest: active, observedAt: first, windowStatus: "limit_reached" }), {
+  assert.deepEqual(planUsageLimitTransition({ latest: active, observedAt: first, windowStatus: "limit_reached", now: newer }), {
     action: "ignore",
   });
-  assert.deepEqual(planUsageLimitTransition({ latest: active, observedAt: newer, windowStatus: "parse_unavailable" }), {
+  assert.deepEqual(planUsageLimitTransition({ latest: active, observedAt: newer, windowStatus: "parse_unavailable", now: newer }), {
     action: "ignore",
   });
-  assert.deepEqual(planUsageLimitTransition({ latest: active, observedAt: newer, windowStatus: "ok" }), {
+  assert.deepEqual(planUsageLimitTransition({ latest: active, observedAt: newer, windowStatus: "ok", now: newer }), {
     action: "resolve",
   });
-  assert.deepEqual(planUsageLimitTransition({ latest: active, observedAt: first, windowStatus: "ok" }), {
+  assert.deepEqual(planUsageLimitTransition({ latest: active, observedAt: first, windowStatus: "ok", now: newer }), {
     action: "ignore",
   });
+});
+
+test("usage-limit limit hit again on a stale active incident starts a new generation", () => {
+  const first = new Date("2026-10-11T00:00:00.000Z");
+  const resetsAt = new Date("2026-10-11T05:00:00.000Z");
+  const active = { state: "active" as const, activationGeneration: 4, lastObservedAt: first, resetsAt };
+  const withinGrace = new Date(resetsAt.getTime() + USAGE_LIMIT_STALE_AFTER_RESET_MS - 1);
+  const pastGrace = new Date(resetsAt.getTime() + USAGE_LIMIT_STALE_AFTER_RESET_MS + 1);
+  assert.deepEqual(
+    planUsageLimitTransition({ latest: active, observedAt: withinGrace, windowStatus: "limit_reached", now: withinGrace }),
+    { action: "update_active" },
+  );
+  assert.deepEqual(
+    planUsageLimitTransition({ latest: active, observedAt: pastGrace, windowStatus: "limit_reached", now: pastGrace }),
+    { action: "reactivate", generation: 5 },
+  );
+  const noReset = { ...active, resetsAt: null };
+  const dayLater = new Date(first.getTime() + USAGE_LIMIT_STALE_WITHOUT_RESET_MS + 1);
+  assert.deepEqual(
+    planUsageLimitTransition({ latest: noReset, observedAt: dayLater, windowStatus: "limit_reached", now: dayLater }),
+    { action: "reactivate", generation: 5 },
+  );
+  assert.deepEqual(
+    planUsageLimitTransition({ latest: noReset, observedAt: dayLater, windowStatus: "ok", now: dayLater }),
+    { action: "resolve" },
+    "a stale incident still resolves on an authoritative ok",
+  );
 });
 
 test("usage-limit recovered-to-limited creates a new activation generation", () => {
   const first = new Date("2026-10-11T00:00:00.000Z");
   const newer = new Date("2026-10-11T00:01:00.000Z");
-  const resolved = { state: "resolved" as const, activationGeneration: 7, lastObservedAt: first };
-  assert.deepEqual(planUsageLimitTransition({ latest: resolved, observedAt: newer, windowStatus: "limit_reached" }), {
+  const resolved = { state: "resolved" as const, activationGeneration: 7, lastObservedAt: first, resetsAt: null };
+  assert.deepEqual(planUsageLimitTransition({ latest: resolved, observedAt: newer, windowStatus: "limit_reached", now: newer }), {
     action: "activate",
     generation: 8,
   });
-  assert.deepEqual(planUsageLimitTransition({ latest: null, observedAt: first, windowStatus: "limit_reached" }), {
+  assert.deepEqual(planUsageLimitTransition({ latest: null, observedAt: first, windowStatus: "limit_reached", now: newer }), {
     action: "activate",
     generation: 1,
   });

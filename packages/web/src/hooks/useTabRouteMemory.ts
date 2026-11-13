@@ -1,7 +1,9 @@
 import { useEffect } from "react";
 import { useLocation } from "react-router-dom";
+import { isSettingsApplicationsSlug } from "../components/settings/settingsNavigation";
 import { useServerStore } from "../store/serverStore";
 import type { RailMode } from "./useSidebarTab";
+import { SERVER_SURFACE_STORAGE_PREFIX, TAB_MEMORY_STORAGE_PREFIX } from "./tabRouteMemoryKeys";
 
 // Determines which rail mode a given pathname belongs to. Returns null for
 // routes that don't belong to any rail surface (login redirects, etc.) so
@@ -19,6 +21,7 @@ export function classifyRouteForTab(pathname: string, pathBase: string | null): 
   if (rest === "/threads" || rest.startsWith("/threads/")) return "chat";
   if (rest === "/tasks" || rest.startsWith("/tasks/")) return "tasks";
   if (rest === "/saved" || rest.startsWith("/saved/")) return "chat";
+  if (rest === "/drafts" || rest.startsWith("/drafts/")) return "chat";
   // /search is its own rail mode (task #311). It is intentionally NOT
   // memorized — selectRailMode("search") always lands on a fresh /search,
   // and we must NOT classify it as "chat" or visiting Search would clobber
@@ -31,8 +34,10 @@ export function classifyRouteForTab(pathname: string, pathBase: string | null): 
   if (rest.startsWith("/computer/")) return "computers";
   if (rest.startsWith("/machine/")) return "computers"; // legacy
   if (rest === "/computers" || rest.startsWith("/computers/")) return "computers";
+  if (rest === "/apps" || rest.startsWith("/apps/")) return "apps";
   if (rest === "/settings" || rest.startsWith("/settings/")) return "settings";
   if (rest === "/release-notes" || rest.startsWith("/release-notes/")) return "settings";
+  if (rest === "/keyboard-shortcuts") return "settings";
   return null;
 }
 
@@ -40,8 +45,7 @@ export function classifyRouteForTab(pathname: string, pathBase: string | null): 
 // computers split, /machine/<id> → /computer/<id>). Old v1 entries could
 // have stored /machine/<id> under the "members" bucket, which would now
 // route the user to Computers when they click Members — invalidate them.
-const STORAGE_PREFIX = "slock:tabMemory:v2";
-const SERVER_SURFACE_STORAGE_PREFIX = "slock:serverSurface:v1";
+const STORAGE_PREFIX = TAB_MEMORY_STORAGE_PREFIX;
 function memoryKey(serverSlug: string, mode: RailMode): string {
   return `${STORAGE_PREFIX}:${serverSlug}:${mode}`;
 }
@@ -78,6 +82,7 @@ function isServerSurfaceRoute(pathname: string, pathBase: string): boolean {
   if (rest === "/inbox" || rest.startsWith("/inbox/")) return true; // legacy alias
   if (rest === "/tasks" || rest.startsWith("/tasks/")) return true;
   if (rest === "/saved" || rest.startsWith("/saved/")) return true;
+  if (rest === "/drafts" || rest.startsWith("/drafts/")) return true;
   if (rest === "/search" || rest.startsWith("/search/")) return true;
   if (rest.startsWith("/agent/")) return true;
   if (rest.startsWith("/human/")) return true;
@@ -85,8 +90,10 @@ function isServerSurfaceRoute(pathname: string, pathBase: string): boolean {
   if (rest.startsWith("/computer/")) return true;
   if (rest.startsWith("/machine/")) return true; // legacy
   if (rest === "/computers" || rest.startsWith("/computers/")) return true;
+  if (rest === "/apps" || rest.startsWith("/apps/")) return true;
   if (rest === "/settings" || rest.startsWith("/settings/")) return true;
   if (rest === "/release-notes" || rest.startsWith("/release-notes/")) return true;
+  if (rest === "/keyboard-shortcuts") return true;
   return false;
 }
 
@@ -98,7 +105,30 @@ export function normalizeServerSurfaceMemory(serverSlug: string, pathAndSearch: 
   return `${parts.pathname}${parts.suffix}`;
 }
 
-export function readTabMemory(serverSlug: string, mode: RailMode): string | null {
+// The viewer's own assistant's DM: its route redirects to the assistant page
+// (MainLayout's DmRoute), so it is no chat place. Remembered as one, every
+// click on Chat landed on the assistant page instead.
+function isOwnAssistantDmRoute(pathname: string, pathBase: string, assistantDmId: string | null): boolean {
+  if (!assistantDmId) return false;
+  const dmPath = `${pathBase}/dm/${assistantDmId}`;
+  return pathname === dmPath || pathname === `${dmPath}/`;
+}
+
+// Settings' Applications page (or an old alias of it) redirects to the server's
+// Apps page (MainLayout's SettingsRoute), so it is no Settings place. Remembered
+// as one, every click on Settings landed on Apps and Settings couldn't be
+// reached. A guest's Applications is a real page, but a guest's Settings simply
+// opens on its first page.
+function isSettingsApplicationsRoute(pathname: string, pathBase: string): boolean {
+  const [, section, slug] = pathname.slice(pathBase.length).split("/");
+  return section === "settings" && isSettingsApplicationsSlug(slug);
+}
+
+export function readTabMemory(
+  serverSlug: string,
+  mode: RailMode,
+  { assistantDmId = null }: { assistantDmId?: string | null } = {},
+): string | null {
   try {
     const raw = localStorage.getItem(memoryKey(serverSlug, mode));
     if (!raw || raw.length === 0) return null;
@@ -109,7 +139,13 @@ export function readTabMemory(serverSlug: string, mode: RailMode): string | null
     const pathBase = `/s/${serverSlug}`;
     const pathOnly = splitPathAndSearch(raw)?.pathname ?? raw;
     if (classifyRouteForTab(pathOnly, pathBase) !== mode) return null;
-    return raw;
+    // Saved before the assistant was known (or before this was left out of
+    // the memory): dropped as it is read.
+    if (isOwnAssistantDmRoute(pathOnly, pathBase, assistantDmId) || isSettingsApplicationsRoute(pathOnly, pathBase)) {
+      localStorage.removeItem(memoryKey(serverSlug, mode));
+      return null;
+    }
+    return withoutStoredDialogParams(raw, mode);
   } catch {
     return null;
   }
@@ -124,7 +160,8 @@ export function readServerSurfaceMemory(serverSlug: string): string | null {
       localStorage.removeItem(serverSurfaceMemoryKey(serverSlug));
       return null;
     }
-    return normalized;
+    const tab = classifyRouteForTab(splitPathAndSearch(normalized)?.pathname ?? normalized, `/s/${serverSlug}`);
+    return withoutStoredDialogParams(normalized, tab);
   } catch {
     return null;
   }
@@ -148,10 +185,36 @@ function writeServerSurfaceMemory(serverSlug: string, pathAndSearch: string): vo
   }
 }
 
+// A dialog over the page opens only from a click or a link someone followed,
+// never from a rail tab or a server switch coming back to the page: the task
+// dialog (`task=`, a modal wherever it is), and the legacy task panel
+// (`legacyTask=`), a modal on the Tasks page. Remembered with them, leaving
+// the page from inside the dialog (a link in it) left the dialog to pop up
+// again on every return, though it had been closed.
+function withoutDialogParams(search: string, tab: RailMode | null): string {
+  const dialogKeys = tab === "tasks" ? ["task", "legacyTask"] : ["task"];
+  // Filtered as written, so the params kept keep their encoding (URLSearchParams would re-encode `:`).
+  const kept = search.replace(/^\?/, "").split("&")
+    .filter((part) => part !== "" && !dialogKeys.includes(part.split("=", 1)[0] ?? ""));
+  return kept.length > 0 ? `?${kept.join("&")}` : "";
+}
+
+// A place saved before dialogs were left out of it (withoutDialogParams) is
+// cleaned as it is read, so it doesn't pop the dialog once more.
+function withoutStoredDialogParams(pathAndSearch: string, tab: RailMode | null): string {
+  const parts = splitPathAndSearch(pathAndSearch);
+  if (!parts) return pathAndSearch;
+  const hashIndex = parts.suffix.indexOf("#");
+  const search = hashIndex === -1 ? parts.suffix : parts.suffix.slice(0, hashIndex);
+  const hash = hashIndex === -1 ? "" : parts.suffix.slice(hashIndex);
+  return `${parts.pathname}${withoutDialogParams(search, tab)}${hash}`;
+}
+
 // Mount once at the top of the layout. Records the current path+search+hash
 // under a per-server "last surface" slot and, for rail-tab routes, under the
-// per-server/per-tab slot used by LeftRail.
-export function useTabRouteMemory(): void {
+// per-server/per-tab slot used by LeftRail. `assistantDmId` is the viewer's
+// own assistant's DM (useOwnAssistantDmId): undefined while not known yet.
+export function useTabRouteMemory(assistantDmId: string | null | undefined): void {
   const location = useLocation();
   const serverSlug = useServerStore((s) => s.current?.slug ?? null);
 
@@ -161,13 +224,21 @@ export function useTabRouteMemory(): void {
     // Path is the rail-mode source of truth, so we persist the path verbatim.
     // Right-panel keys (?profile=, ?thread=, ?msg=, ?agentTab=, ?chatTab=)
     // belong to other surfaces; preserving them lets the user return to the
-    // exact view they left, including any open profile/thread.
-    const search = location.search ?? "";
+    // exact view they left, including any open profile/thread — but not a
+    // dialog (withoutDialogParams).
+    const tab = classifyRouteForTab(location.pathname, pathBase);
+    const search = withoutDialogParams(location.search ?? "", tab);
     const hash = location.hash ?? "";
     const pathAndSearch = `${location.pathname}${search}${hash}`;
     writeServerSurfaceMemory(serverSlug, pathAndSearch);
-    const tab = classifyRouteForTab(location.pathname, pathBase);
     if (!tab) return;
+    // The assistant's DM is the assistant page: not Chat's place (the server's
+    // last place above keeps it, which is the assistant page too). A DM shown
+    // before the assistant is known may be it (DmRoute redirects once it is):
+    // written when it is known, on this effect's next run.
+    if (assistantDmId === undefined && location.pathname.startsWith(`${pathBase}/dm/`)) return;
+    if (isOwnAssistantDmRoute(location.pathname, pathBase, assistantDmId ?? null)) return;
+    if (isSettingsApplicationsRoute(location.pathname, pathBase)) return;
     writeTabMemory(serverSlug, tab, pathAndSearch);
-  }, [location.hash, location.pathname, location.search, serverSlug]);
+  }, [assistantDmId, location.hash, location.pathname, location.search, serverSlug]);
 }

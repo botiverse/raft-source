@@ -9,11 +9,15 @@
  * and the MV graph, then calls the real readers with every test seam disabled.
  */
 import assert from "node:assert/strict";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
+import type { ServerId, SyncConversationDoneState } from "@botiverse/raft-shared";
 import { closeDatabase, getDb, initDatabase } from "../db/index";
 import {
+  agents,
+  channelAgents,
   channelHumans,
   channels,
+  inboxSuppressionStates,
   jointChannels,
   jointChannelServers,
   messageMentions,
@@ -21,6 +25,7 @@ import {
   serverMembers,
   tasks,
   threadFollows,
+  userChannelReadCursors,
   users,
 } from "../db/schema";
 import {
@@ -42,10 +47,15 @@ import {
   getUnreadCounts,
   getUnreadSummary,
   isDmScopedInboxItem,
+  isPinnedScopedInboxItem,
   listAgentInbox,
+  markChannelInboxDone,
+  readAgentInboxChainTargetSeqs,
   selectAgentInboxChainRows,
 } from "./channelService";
 import { uninstallRisingWaveReadReferences } from "../test/risingWaveReadReference";
+import { fillJointMembersFromChannelHumans } from "../test/jointMemberFill";
+import { parseSyncChangesCursor, readSyncChanges } from "./syncChanges";
 
 const required = process.env.RISINGWAVE_REAL_REQUIRED === "1";
 const databaseUrl = process.env.DATABASE_URL?.trim();
@@ -60,7 +70,7 @@ let f: RealRwFixture;
 
 type InboxItem = Awaited<ReturnType<typeof getInboxItems>>["items"][number];
 /** The conversation an Activity row is about: its channel, or the thread. */
-const targetOf = (item: InboxItem) => (item.kind === "thread" ? item.threadChannelId : item.channelId);
+const targetOf = (item: InboxItem) => ((item.kind === "thread" || item.kind === "task") ? item.threadChannelId : item.channelId);
 
 beforeAll(async () => {
   if (!configured) return;
@@ -263,6 +273,129 @@ test.skipIf(!configured)("Activity DMs scope: RisingWave serves the same DMs and
       .items.some((item) => targetOf(item) === selfDm.id),
     `self-DM (${selfMessage.id}) presence matches canonical Postgres`,
   );
+});
+
+test.skipIf(!configured)("Activity Pinned scope: RisingWave serves the same pinned conversations, threads and tasks as canonical Postgres", async () => {
+  // A fresh user, so the fixture receiver's counts elsewhere in this file are untouched.
+  const db = getDb();
+  const [pinUser] = await db.insert(users).values({
+    name: `rwreal-pinuser-${f.tag}`, email: `rwreal-pinuser-${f.tag}@test.invalid`, passwordHash: "x", emailVerified: true,
+  }).returning();
+  await db.insert(serverMembers).values({ serverId: f.receiverServer.id, userId: pinUser.id, role: "member" });
+  const [pinnedRoom, pinnedDm, controlRoom] = await db.insert(channels).values([
+    { serverId: f.receiverServer.id, name: `rwreal-pin-room-${f.tag}`, type: "channel" },
+    { serverId: f.receiverServer.id, name: `rwreal-pin-dm-${f.tag}`, type: "dm" },
+    { serverId: f.receiverServer.id, name: `rwreal-pin-control-${f.tag}`, type: "channel" },
+  ]).returning();
+  await db.insert(channelHumans).values([pinnedRoom, pinnedDm, controlRoom].flatMap((channel) => [
+    { channelId: channel.id, userId: pinUser.id },
+    { channelId: channel.id, userId: f.sender.id },
+  ]));
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  const parents = await db.insert(messages).values([pinnedRoom, pinnedDm, controlRoom].flatMap((channel) => [
+    { channelId: channel.id, senderType: "user" as const, senderId: f.sender.id, content: `pin thread parent ${channel.name}` },
+    { channelId: channel.id, senderType: "user" as const, senderId: f.sender.id, content: `pin task parent ${channel.name}`, taskNumber: 1, taskStatus: "todo" as const },
+  ])).returning();
+  const threads = await db.insert(channels).values(parents.map((parent) => ({
+    serverId: f.receiverServer.id, name: `thread-${parent.id.slice(0, 8)}`, type: "thread" as const, parentMessageId: parent.id,
+  }))).returning();
+  await db.insert(threadFollows).values(threads.map((thread) => ({
+    threadChannelId: thread.id, parentMessageId: thread.parentMessageId!, reason: "manual" as const, followerType: "user" as const, followerId: pinUser.id,
+  })));
+  // Every second parent hosts a task (task #1 of its channel, stamped on the
+  // message as createTasks does): the task's thread row is scoped by its parent channel too.
+  await db.insert(tasks).values([1, 3, 5].map((index, n) => ({
+    channelId: parents[index]!.channelId, taskNumber: 1, title: `pin task ${f.tag} ${n}`, status: "todo" as const,
+    createdByType: "user" as const, createdById: f.sender.id, messageId: parents[index]!.id,
+  })));
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  await db.insert(messages).values(threads.map((thread) => ({
+    channelId: thread.id, senderType: "user" as const, senderId: f.sender.id, content: `pin reply ${thread.name} ${f.tag}`,
+  })));
+
+  const pinnedChannelIds = [pinnedRoom.id, pinnedDm.id];
+  const pinnedThreadIds = threads.slice(0, 4).map((thread) => thread.id);
+  const controlTargets = [controlRoom.id, ...threads.slice(4).map((thread) => thread.id)];
+  const expectedTargets = [...pinnedChannelIds, ...pinnedThreadIds, ...controlTargets];
+  const timeoutMs = Number(process.env.RISINGWAVE_REAL_CDC_TIMEOUT_MS ?? 120_000);
+  const deadline = Date.now() + timeoutMs;
+  let unscoped = await getInboxItems(f.receiverServer.id, pinUser.id, { filter: "all", limit: 50 });
+  while (!expectedTargets.every((id) => unscoped.items.some((item) => targetOf(item) === id)) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    unscoped = await getInboxItems(f.receiverServer.id, pinUser.id, { filter: "all", limit: 50 });
+  }
+  assert.deepEqual(
+    expectedTargets.filter((id) => !unscoped.items.some((item) => targetOf(item) === id)),
+    [],
+    "RisingWave Activity did not reflect the Pinned-scope fixture in time",
+  );
+  // Let the task rows land on the thread rows as well.
+  const taskDeadline = Date.now() + timeoutMs;
+  while (unscoped.items.filter((item) => item.kind === "thread" && item.taskNumber != null).length < 3 && Date.now() < taskDeadline) {
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    unscoped = await getInboxItems(f.receiverServer.id, pinUser.id, { filter: "all", limit: 50 });
+  }
+
+  const pinnedSet = new Set(pinnedChannelIds);
+  for (const filter of ["all", "unread", "mentions"] as const) {
+    const rw = await getInboxItems(f.receiverServer.id, pinUser.id, { filter, limit: 50, pinnedChannelIds });
+    const pg = await getInboxItems(f.receiverServer.id, pinUser.id, { filter, limit: 50, pinnedChannelIds, forceCanonicalPostgres: true });
+    assert.deepEqual(rw.items.map(targetOf), pg.items.map(targetOf), `${filter}: RW and PG list the same rows`);
+    assert.equal(rw.totalCount, pg.totalCount, `${filter}: totalCount`);
+    assert.equal(rw.totalUnreadCount, pg.totalUnreadCount, `${filter}: totalUnreadCount`);
+    assert.equal(rw.activeUnreadCount, pg.activeUnreadCount, `${filter}: activeUnreadCount`);
+    assert.equal(rw.hasMore, pg.hasMore, `${filter}: hasMore`);
+    assert.deepEqual(
+      rw.groups.map((group) => [group.channelId, group.count]),
+      pg.groups.map((group) => [group.channelId, group.count]),
+      `${filter}: groups (ids and counts)`,
+    );
+    assert.ok(rw.items.every((item) => isPinnedScopedInboxItem(item, pinnedSet)), `${filter}: only pinned rows`);
+    assert.ok(rw.groups.every((group) => pinnedSet.has(group.channelId)), `${filter}: only pinned groups`);
+  }
+
+  const scoped = await getInboxItems(f.receiverServer.id, pinUser.id, { filter: "all", limit: 50, pinnedChannelIds });
+  const targets = scoped.items.map(targetOf);
+  assert.deepEqual([...targets].sort(), [...pinnedChannelIds, ...pinnedThreadIds].sort(), "pinned channels, DM, threads and tasks; no control rows");
+  assert.equal(scoped.items.filter((item) => item.kind === "thread" && item.taskNumber != null).length, 2, "both pinned task rows carry their task");
+  assert.deepEqual(targets, unscoped.items.filter((item) => isPinnedScopedInboxItem(item, pinnedSet)).map(targetOf), "scope is a pure restriction");
+
+  // Paging (limit 1 offset 1) agrees, and the scoped totals hold on every page.
+  const rwSecond = await getInboxItems(f.receiverServer.id, pinUser.id, { filter: "all", limit: 1, offset: 1, pinnedChannelIds });
+  const pgSecond = await getInboxItems(f.receiverServer.id, pinUser.id, { filter: "all", limit: 1, offset: 1, pinnedChannelIds, forceCanonicalPostgres: true });
+  assert.deepEqual(rwSecond.items.map(targetOf), pgSecond.items.map(targetOf));
+  assert.deepEqual(rwSecond.items.map(targetOf), targets.slice(1, 2));
+  assert.equal(rwSecond.hasMore, true);
+  assert.equal(rwSecond.totalCount, scoped.totalCount);
+
+  // Unified All (merges unfollowed threads) keeps the scope; the channel facet narrows within it.
+  const unified = await getInboxItems(f.receiverServer.id, pinUser.id, { filter: "all", limit: 50, pinnedChannelIds, includeUnfollowedThreads: true });
+  assert.deepEqual(unified.items.map(targetOf), targets);
+  const faceted = await getInboxItems(f.receiverServer.id, pinUser.id, { filter: "all", limit: 50, pinnedChannelIds, channelId: pinnedDm.id });
+  const facetedPg = await getInboxItems(f.receiverServer.id, pinUser.id, { filter: "all", limit: 50, pinnedChannelIds, channelId: pinnedDm.id, forceCanonicalPostgres: true });
+  assert.deepEqual(faceted.items.map(targetOf), facetedPg.items.map(targetOf));
+  assert.deepEqual([...faceted.items.map(targetOf)].sort(), [pinnedDm.id, ...threads.slice(2, 4).map((thread) => thread.id)].sort());
+
+  // An empty pin set is empty on both paths.
+  const rwEmpty = await getInboxItems(f.receiverServer.id, pinUser.id, { filter: "all", limit: 50, pinnedChannelIds: [] });
+  const pgEmpty = await getInboxItems(f.receiverServer.id, pinUser.id, { filter: "all", limit: 50, pinnedChannelIds: [], forceCanonicalPostgres: true });
+  for (const empty of [rwEmpty, pgEmpty]) {
+    assert.deepEqual(empty.items, []);
+    assert.deepEqual(empty.groups, []);
+    assert.equal(empty.totalCount, 0);
+    assert.equal(empty.activeUnreadCount, 0);
+  }
+
+  // `ids` (rows by their own id) agrees on both paths; a channel id does not pull in its threads.
+  const rowIds = [pinnedRoom.id, threads[0]!.id, controlRoom.id];
+  const rwIds = await getInboxItems(f.receiverServer.id, pinUser.id, { filter: "all", limit: rowIds.length, rowIds });
+  const pgIds = await getInboxItems(f.receiverServer.id, pinUser.id, { filter: "all", limit: rowIds.length, rowIds, forceCanonicalPostgres: true });
+  assert.deepEqual(rwIds.items.map(targetOf), pgIds.items.map(targetOf));
+  assert.deepEqual([...rwIds.items.map(targetOf)].sort(), [...rowIds].sort());
+  assert.equal(rwIds.totalCount, pgIds.totalCount);
+  assert.equal(rwIds.totalCount, rowIds.length);
+  assert.deepEqual(rwIds.groups.map((group) => [group.channelId, group.count]), pgIds.groups.map((group) => [group.channelId, group.count]));
 });
 
 test.skipIf(!configured)("threads below a deleted DM leave Activity and the sidebar, as in canonical Postgres (task #333)", async () => {
@@ -610,6 +743,13 @@ test.skipIf(!configured)("agent inbox readers: chain rows, paged list, unread co
   assert.equal(joint.mentionUnread, 1);
   assert.equal(joint.maxMentionSeq, Number(f.jointMessage.seq));
 
+  // /events?wait_for= re-check: the same rows by target id (ANY($2) prepares on RW).
+  const seqs = await readAgentInboxChainTargetSeqs(f.agent.id, [f.general.id, f.receiverLocal.id]);
+  assert.deepEqual(
+    seqs?.map((row) => [row.targetId, row.latestSeq, row.maxMentionSeq, row.lastReadSeq]).sort(),
+    [general, joint].map((row) => [row.targetId, row.latestSeq, row.maxMentionSeq, row.lastReadSeq]).sort(),
+  );
+
   const counts = await getAgentUnreadCounts(f.agent.id, rows);
   assert.equal(Object.values(counts).reduce((sum, n) => sum + n, 0), 2);
 
@@ -624,4 +764,508 @@ test.skipIf(!configured)("agent inbox readers: chain rows, paged list, unread co
     beforeSeq: page.nextBeforeSeq ?? undefined,
   });
   assert.equal(next.items.length, 1, "keyset paging by activity_seq");
+});
+
+test.skipIf(!configured)("a task conversation is a sub-conversation: Activity, sidebar, totals and agent inbox list it with its task (078)", async () => {
+  // Its own channel, people and agent, so the fixture's counts stay untouched.
+  const db = getDb();
+  const pool = getRisingWavePool()!;
+  const [follower, member] = await db.insert(users).values(["follower", "member"].map((role) => ({
+    name: `rwreal-taskconv-${role}-${f.tag}`, email: `rwreal-taskconv-${role}-${f.tag}@test.invalid`, passwordHash: "x", emailVerified: true,
+  }))).returning();
+  await db.insert(serverMembers).values([
+    { serverId: f.receiverServer.id, userId: follower.id, role: "member" },
+    { serverId: f.receiverServer.id, userId: member.id, role: "member" },
+  ]);
+  const [channel] = await db.insert(channels).values({
+    serverId: f.receiverServer.id, name: `rwreal-taskconv-${f.tag}`, type: "channel",
+  }).returning();
+  const [agent] = await db.insert(agents).values({
+    serverId: f.receiverServer.id, name: `rwreal-taskconv-agent-${f.tag}`, status: "active",
+  }).returning();
+  await db.insert(channelHumans).values([
+    { channelId: channel.id, userId: follower.id },
+    { channelId: channel.id, userId: member.id },
+    { channelId: channel.id, userId: f.sender.id },
+  ]);
+  await db.insert(channelAgents).values({ channelId: channel.id, agentId: agent.id });
+  const [task] = await db.insert(tasks).values({
+    channelId: channel.id, taskNumber: 7, title: `rw task conversation ${f.tag}`,
+    createdByType: "user", createdById: f.sender.id,
+  }).returning();
+  // The task's conversation: type 'task', no parent message, parent = the task's channel.
+  const [conversation] = await db.insert(channels).values({
+    serverId: f.receiverServer.id, name: `task-${task.id}`, type: "task", taskId: task.id, parentChannelId: channel.id,
+  }).returning();
+  await db.update(tasks).set({ conversationChannelId: conversation.id }).where(eq(tasks.id, task.id));
+  await db.insert(threadFollows).values([
+    { threadChannelId: conversation.id, parentMessageId: null, parentTaskId: task.id, reason: "assigned", followerType: "user", followerId: follower.id },
+    { threadChannelId: conversation.id, parentMessageId: null, parentTaskId: task.id, reason: "assigned", followerType: "agent", followerId: agent.id },
+  ]);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  // A lifecycle line (a system message): neither a reply nor "new" (the reply
+  // basis); the agent inbox still offers it (transport rule).
+  await db.insert(messages).values({
+    channelId: conversation.id, senderType: "user", senderId: f.sender.id, content: `📌 assigned #7 ${f.tag}`,
+    messageType: "system", systemSubtype: "task.assignment_receipt", causalActorType: "user", causalActorId: f.sender.id,
+  });
+  const [reply] = await db.insert(messages).values({
+    channelId: conversation.id, senderType: "user", senderId: f.sender.id, content: `task conversation reply ${f.tag}`,
+  }).returning();
+  // A mention of a channel member who does not follow the conversation: a
+  // mention-only row through the parent channel (rw_inbox_mention_v7).
+  const [mentioning] = await db.insert(messages).values({
+    channelId: conversation.id, senderType: "user", senderId: f.sender.id, content: `@member look ${f.tag}`,
+  }).returning();
+  await db.insert(messageMentions).values({
+    messageId: mentioning.id, messageSeq: mentioning.seq, serverId: f.receiverServer.id, channelId: conversation.id,
+    handleAtSendTime: "member", targetType: "user", targetId: member.id, notifiableAtSend: true,
+  });
+
+  const timeoutMs = Number(process.env.RISINGWAVE_REAL_CDC_TIMEOUT_MS ?? 120_000);
+  const waitForRw = async (sqlText: string, values: unknown[], what: string) => {
+    const deadline = Date.now() + timeoutMs;
+    do {
+      const read = await queryRisingWave<{ n: string }>(pool, sqlText, values);
+      if (Number(read.result.rows[0]?.n ?? 0) > 0) return;
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    } while (Date.now() < deadline);
+    assert.fail(`${what} did not reach RisingWave`);
+  };
+  await waitForRw(
+    `SELECT count(*) AS n FROM ${UNIFIED_CHAIN_VIEWS.serving} WHERE receiver_type = 'user' AND receiver_id = $1 AND thread_channel_id = $2 AND unread_count = 2`,
+    [follower.id, conversation.id],
+    "the follower's task conversation row",
+  );
+  await waitForRw(
+    `SELECT count(*) AS n FROM ${UNIFIED_CHAIN_VIEWS.serving} WHERE receiver_type = 'user' AND receiver_id = $1 AND thread_channel_id = $2`,
+    [member.id, conversation.id],
+    "the mentioned member's task conversation row",
+  );
+
+  // Activity (RisingWave): a kind 'task' row with its task, parent = the task's channel.
+  const activity = await getInboxItems(f.receiverServer.id, follower.id, { filter: "all", limit: 50 });
+  const item = activity.items.find((candidate) => candidate.kind === "task" && candidate.threadChannelId === conversation.id);
+  assert.ok(item && item.kind === "task", "the followed task conversation is in Activity");
+  assert.equal(item.parentChannelId, channel.id);
+  assert.equal(item.parentMessageId, null);
+  assert.equal(item.taskId, task.id);
+  assert.equal(item.taskNumber, 7);
+  assert.equal(item.taskTitle, task.title);
+  assert.equal(item.unreadCount, 2, "the lifecycle line is not new: unread is on the reply basis");
+  assert.equal(item.replyCount, 2, "replies are the chat messages, not the lifecycle line");
+  assert.equal(item.latestActivityMessageId, mentioning.id);
+  // The canonical Postgres read (search / guest / authority paths) lists it the same way.
+  const canonical = await getInboxItems(f.receiverServer.id, follower.id, { filter: "all", limit: 50, forceCanonicalPostgres: true });
+  const canonicalItem = canonical.items.find((candidate) => candidate.kind === "task" && candidate.threadChannelId === conversation.id);
+  assert.ok(canonicalItem && canonicalItem.kind === "task", "the canonical Postgres read lists the task conversation");
+  assert.equal(canonicalItem.taskTitle, task.title);
+  assert.equal(canonicalItem.unreadCount, item.unreadCount);
+  assert.equal(canonicalItem.replyCount, 2, "the canonical read counts chat replies only too");
+  assert.equal(canonicalItem.latestActivityMessageId, item.latestActivityMessageId);
+
+  // A parent-channel member mentioned inside it, not following: a mention row.
+  const mentions = await getInboxItems(f.receiverServer.id, member.id, { filter: "mentions", limit: 50 });
+  const mentionRow = mentions.items.find((candidate) => candidate.kind === "task" && candidate.threadChannelId === conversation.id);
+  assert.ok(mentionRow && mentionRow.hasMention, "a mention in a task conversation reaches a parent member");
+
+  // Sidebar: the followed conversation counts; the per-server badge (channels/DMs) does not.
+  const counts = await getUnreadCounts(f.receiverServer.id, follower.id);
+  assert.equal(counts[conversation.id], 2, "the followed task conversation counts its unread replies in the sidebar");
+  const sidebarRow = await queryRisingWave<{ kind: string }>(
+    pool,
+    `SELECT kind FROM ${CONVERSATION_UNREAD_VIEW} WHERE receiver_type = 'user' AND receiver_id = $1 AND target_id = $2`,
+    [follower.id, conversation.id],
+  );
+  assert.equal(sidebarRow.result.rows[0]?.kind, "task");
+  const perServer = await getSidebarUnreadSummaryCounts([f.receiverServer.id], follower.id);
+  assert.equal(perServer[f.receiverServer.id] ?? 0, 0, "task conversations are not in the channel/DM badge");
+  const totals = await getActivityUnreadTotalsBatch([{ serverId: f.receiverServer.id }], follower.id);
+  assert.equal(totals.get(f.receiverServer.id)?.totalUnreadCount, 2, "Activity totals count the task conversation's unread replies");
+
+  // Agent inbox: a kind 'task' row addressed by the task ref.
+  await waitForRw(
+    `SELECT count(*) AS n FROM ${UNIFIED_CHAIN_VIEWS.agentInbox} WHERE agent_id = $1 AND target_id = $2`,
+    [agent.id, conversation.id],
+    "the agent's task conversation row",
+  );
+  const selection = await selectAgentInboxChainRows(agent.id);
+  assert.equal(selection.source, "chain");
+  const agentRow = selection.source === "chain" ? selection.rows.find((row) => row.targetId === conversation.id) : undefined;
+  assert.ok(agentRow, "the agent is offered the task conversation");
+  assert.equal(agentRow.kind, "task");
+  assert.equal(agentRow.taskNumber, 7);
+  assert.equal(agentRow.parentChannelId, channel.id);
+  assert.equal(agentRow.unreadCount, 3);
+  const agentCounts = await getAgentUnreadCounts(agent.id, selection.source === "chain" ? selection.rows : []);
+  assert.equal(agentCounts[`#${channel.name}:#7`], 3, "the agent-facing target is the task ref");
+  const page = await listAgentInbox(agent.id, f.receiverServer.id, { view: "unread", limit: 10 });
+  const listed = page.items.find((row) => row.target === `#${channel.name}:#7`);
+  assert.ok(listed, "raft inbox check lists the task conversation");
+  assert.equal(listed.kind, "thread", "the contract kind stays thread for older CLIs");
+  assert.equal(listed.conversationKind, "task");
+  assert.equal(listed.title, task.title);
+  assert.equal(reply.channelId, conversation.id);
+});
+
+test.skipIf(!configured)("first-mention anchors and display times on RisingWave equal canonical Postgres (078)", async () => {
+  // A fresh user and channels, so the fixture's counts elsewhere stay untouched.
+  const db = getDb();
+  const [user] = await db.insert(users).values({
+    name: `rwreal-anchor-${f.tag}`, email: `rwreal-anchor-${f.tag}@test.invalid`, passwordHash: "x", emailVerified: true,
+  }).returning();
+  await db.insert(serverMembers).values({ serverId: f.receiverServer.id, userId: user.id, role: "member" });
+  const [room, notifiedLater, deleted, outside, timeRoom, ownCanonical, ownSenderLocal, ownLocal] = await db.insert(channels).values([
+    { serverId: f.receiverServer.id, name: `rwreal-anchor-room-${f.tag}`, type: "channel" },
+    { serverId: f.receiverServer.id, name: `rwreal-anchor-later-${f.tag}`, type: "channel" },
+    { serverId: f.receiverServer.id, name: `rwreal-anchor-deleted-${f.tag}`, type: "channel" },
+    // Public, and the user is not a member: a mention-only (outsider) row.
+    { serverId: f.receiverServer.id, name: `rwreal-anchor-outside-${f.tag}`, type: "channel" },
+    { serverId: f.receiverServer.id, name: `rwreal-anchor-time-${f.tag}`, type: "channel" },
+    { serverId: f.storage.id, name: `rwreal-anchor-canonical-${f.tag}`, type: "joint" },
+    { serverId: f.senderServer.id, name: `rwreal-anchor-sender-local-${f.tag}`, type: "joint" },
+    { serverId: f.receiverServer.id, name: `rwreal-anchor-local-${f.tag}`, type: "joint" },
+  ]).returning();
+  const [ownJoint] = await db.insert(jointChannels).values({
+    canonicalChannelId: ownCanonical.id, createdByServerId: f.senderServer.id, createdByUserId: f.owner.id,
+  }).returning();
+  await db.insert(jointChannelServers).values([
+    { jointChannelId: ownJoint.id, serverId: f.senderServer.id, localChannelId: ownSenderLocal.id, role: "host", status: "active", joinedByUserId: f.owner.id },
+    { jointChannelId: ownJoint.id, serverId: f.receiverServer.id, localChannelId: ownLocal.id, role: "participant", status: "active", joinedByUserId: f.owner.id },
+  ]);
+  await db.insert(channelHumans).values([
+    ...[room, notifiedLater, deleted, timeRoom, ownLocal].map((channel) => ({ channelId: channel.id, userId: user.id })),
+    ...[room, notifiedLater, deleted, outside, timeRoom, ownSenderLocal].map((channel) => ({ channelId: channel.id, userId: f.sender.id })),
+  ]);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  const post = async (channelId: string, content: string, extra: Partial<typeof messages.$inferInsert> = {}) => {
+    const [message] = await db.insert(messages).values({
+      channelId, senderType: "user", senderId: f.sender.id, content: `${content} ${f.tag}`, ...extra,
+    }).returning();
+    return message;
+  };
+  const mention = async (
+    message: { id: string; seq: number },
+    channelId: string,
+    flags: { notifiableAtSend?: boolean; notifiedAt?: Date | null; serverId?: string } = {},
+  ) => {
+    await db.insert(messageMentions).values({
+      messageId: message.id, messageSeq: message.seq, serverId: flags.serverId ?? f.receiverServer.id, channelId,
+      handleAtSendTime: "you", targetType: "user", targetId: user.id,
+      notifiableAtSend: flags.notifiableAtSend ?? true, notifiedAt: flags.notifiedAt ?? null,
+    });
+  };
+
+  // (6) + (1) A member row: a mention below the read cursor, then a mention that
+  // does not notify (neither notifiable at send nor notified), then one that does.
+  const roomBelow = await post(room.id, "@user below the cursor");
+  await mention(roomBelow, room.id);
+  await db.insert(userChannelReadCursors).values({ userId: user.id, channelId: room.id, lastReadSeq: roomBelow.seq });
+  const roomSilent = await post(room.id, "@user silent");
+  await mention(roomSilent, room.id, { notifiableAtSend: false });
+  const roomAbove = await post(room.id, "@user above the cursor");
+  await mention(roomAbove, room.id);
+
+  // (2) Only a silent mention: no @ until it is notified later.
+  const later = await post(notifiedLater.id, "@user notified later");
+  await mention(later, notifiedLater.id, { notifiableAtSend: false });
+
+  // (7) Two mentions; the first one's mention row goes away (CDC delete).
+  const deletedFirst = await post(deleted.id, "@user first");
+  await mention(deletedFirst, deleted.id);
+  const deletedSecond = await post(deleted.id, "@user second");
+  await mention(deletedSecond, deleted.id);
+
+  // (3) A followed thread and a followed task conversation, each with a mention.
+  const threadParent = await post(room.id, "thread parent");
+  const [thread] = await db.insert(channels).values({
+    serverId: f.receiverServer.id, name: `thread-${threadParent.id.slice(0, 8)}`, type: "thread", parentMessageId: threadParent.id,
+  }).returning();
+  const [task] = await db.insert(tasks).values({
+    channelId: room.id, taskNumber: 11, title: `rw anchor task ${f.tag}`, createdByType: "user", createdById: f.sender.id,
+  }).returning();
+  const [taskConversation] = await db.insert(channels).values({
+    serverId: f.receiverServer.id, name: `task-${task.id}`, type: "task", taskId: task.id, parentChannelId: room.id,
+  }).returning();
+  await db.update(tasks).set({ conversationChannelId: taskConversation.id }).where(eq(tasks.id, task.id));
+  await db.insert(threadFollows).values([
+    { threadChannelId: thread.id, parentMessageId: threadParent.id, reason: "manual", followerType: "user", followerId: user.id },
+    { threadChannelId: taskConversation.id, parentMessageId: null, parentTaskId: task.id, reason: "assigned", followerType: "user", followerId: user.id },
+  ]);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const threadMention = await post(thread.id, "@user in the thread");
+  await mention(threadMention, thread.id);
+  const taskMention = await post(taskConversation.id, "@user in the task conversation");
+  await mention(taskMention, taskConversation.id);
+
+  // (4) Joint: stored in canonical storage, mention row under the SENDER's projection.
+  const jointMention = await post(ownCanonical.id, "@user joint");
+  await mention(jointMention, ownSenderLocal.id, { serverId: f.senderServer.id });
+
+  // (5) Outsider: two notified mentions with the read cursor between them.
+  const outsideFirst = await post(outside.id, "@user outsider first");
+  await mention(outsideFirst, outside.id, { notifiedAt: new Date() });
+  const outsideSecond = await post(outside.id, "@user outsider second");
+  await mention(outsideSecond, outside.id, { notifiedAt: new Date() });
+  await db.insert(userChannelReadCursors).values({ userId: user.id, channelId: outside.id, lastReadSeq: outsideFirst.seq });
+
+  // Display time: the highest-seq message carries an older timestamp.
+  await post(timeRoom.id, "now");
+  const backdated = await post(timeRoom.id, "imported", { createdAt: new Date(Date.now() - 86_400_000) });
+
+  type Item = Awaited<ReturnType<typeof getInboxItems>>["items"][number];
+  const timeoutMs = Number(process.env.RISINGWAVE_REAL_CDC_TIMEOUT_MS ?? 120_000);
+  const rwItems = async () => new Map(
+    (await getInboxItems(f.receiverServer.id, user.id, { filter: "all", limit: 50 })).items.map((item) => [targetOf(item), item] as const),
+  );
+  const pgItems = async () => new Map(
+    (await getInboxItems(f.receiverServer.id, user.id, { filter: "all", limit: 50, forceCanonicalPostgres: true }))
+      .items.map((item) => [targetOf(item), item] as const),
+  );
+  const waitForRw = async (want: (items: Map<string, Item>) => boolean, what: string) => {
+    const deadline = Date.now() + timeoutMs;
+    let items = new Map<string, Item>();
+    do {
+      items = await rwItems();
+      if (want(items)) return items;
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    } while (Date.now() < deadline);
+    assert.fail(`${what}; RisingWave Activity: ${JSON.stringify([...items.values()].map((item) => [targetOf(item), item.firstMentionMessageId]))}`);
+  };
+  const anchors = (items: Map<string, Item>, ids: string[]) => ids.map((id) => [id, items.get(id)?.firstMentionMessageId ?? null]);
+  const allTargets = [room.id, deleted.id, thread.id, taskConversation.id, ownLocal.id, outside.id, timeRoom.id];
+
+  const rw = await waitForRw(
+    (items) => items.get(room.id)?.firstMentionMessageId === roomAbove.id
+      && items.get(outside.id)?.firstMentionMessageId === outsideFirst.id
+      && [deleted.id, thread.id, taskConversation.id, ownLocal.id, timeRoom.id].every((id) => items.has(id)),
+    "the anchors did not reach Activity",
+  );
+  const pg = await pgItems();
+  assert.deepEqual(anchors(rw, allTargets), anchors(pg, allTargets), "RW and canonical Postgres anchor the same mentions");
+  assert.deepEqual(anchors(rw, allTargets), [
+    [room.id, roomAbove.id], // above the cursor, skipping the silent one
+    [deleted.id, deletedFirst.id],
+    [thread.id, threadMention.id],
+    [taskConversation.id, taskMention.id],
+    [ownLocal.id, jointMention.id],
+    [outside.id, outsideFirst.id], // mention-only: the read cursor does not gate it
+    [timeRoom.id, null],
+  ]);
+  const outsideItem = rw.get(outside.id)!;
+  assert.equal(outsideItem.firstUnreadMessageId, outsideFirst.id, "a mention-only row opens at its anchor, as in Postgres");
+  assert.equal(outsideItem.firstUnreadMessageId, pg.get(outside.id)?.firstUnreadMessageId);
+  assert.equal(rw.get(notifiedLater.id)?.hasMention ?? false, false, "a silent mention is not an @");
+  assert.equal(rw.get(notifiedLater.id)?.firstMentionMessageId ?? null, null);
+
+  // Display times are the highest-seq message's, as in Postgres; the row stays.
+  const timeItem = rw.get(timeRoom.id)!;
+  const pgTimeItem = pg.get(timeRoom.id)!;
+  assert.ok(timeItem.kind === "channel" && pgTimeItem.kind === "channel");
+  assert.equal(timeItem.lastMessageId, backdated.id);
+  assert.equal(timeItem.lastMessageAt, pgTimeItem.lastMessageAt);
+  assert.equal(new Date(`${timeItem.lastMessageAt.replace(" ", "T").replace(/\+00$/, "Z")}`).getTime(), backdated.createdAt.getTime());
+  const served = await queryRisingWave<{ last_activity_at: Date; activity_at: Date }>(
+    getRisingWavePool()!,
+    `SELECT last_activity_at, activity_at FROM ${UNIFIED_CHAIN_VIEWS.serving} WHERE receiver_type = 'user' AND receiver_id = $1 AND channel_id = $2`,
+    [user.id, timeRoom.id],
+  );
+  assert.equal(new Date(served.result.rows[0]!.last_activity_at).getTime(), backdated.createdAt.getTime());
+  assert.equal(new Date(served.result.rows[0]!.activity_at).getTime(), backdated.createdAt.getTime());
+
+  // (2) Notified later: the @ and its anchor appear.
+  await db.update(messageMentions).set({ notifiedAt: new Date() })
+    .where(and(eq(messageMentions.messageId, later.id), eq(messageMentions.targetId, user.id)));
+  // (7) The first mention's row goes away: the anchor moves to the second.
+  await db.delete(messageMentions)
+    .where(and(eq(messageMentions.messageId, deletedFirst.id), eq(messageMentions.targetId, user.id)));
+  // (5) Done through the first outsider mention: the anchor moves to the second.
+  await db.insert(inboxSuppressionStates).values({
+    receiverType: "user", receiverId: user.id, serverId: f.receiverServer.id, targetKind: "public_channel_mention",
+    targetChannelId: outside.id, sourceChannelId: outside.id, doneThroughSeq: outsideFirst.seq, writeSite: "test",
+  });
+  const moved = await waitForRw(
+    (items) => items.get(notifiedLater.id)?.firstMentionMessageId === later.id
+      && items.get(deleted.id)?.firstMentionMessageId === deletedSecond.id
+      && items.get(outside.id)?.firstMentionMessageId === outsideSecond.id,
+    "the anchors did not move",
+  );
+  const movedTargets = [notifiedLater.id, deleted.id, outside.id];
+  assert.deepEqual(anchors(moved, movedTargets), anchors(await pgItems(), movedTargets));
+  assert.equal(moved.get(notifiedLater.id)?.hasMention, true);
+
+  // (7) The last mention goes away too: no anchor, no @. (5) Done through the
+  // second outsider mention: the row leaves; a newer mention brings it back on it.
+  await db.delete(messageMentions)
+    .where(and(eq(messageMentions.messageId, deletedSecond.id), eq(messageMentions.targetId, user.id)));
+  await db.update(inboxSuppressionStates).set({ doneThroughSeq: outsideSecond.seq })
+    .where(and(eq(inboxSuppressionStates.receiverId, user.id), eq(inboxSuppressionStates.targetChannelId, outside.id)));
+  await waitForRw(
+    (items) => (items.get(deleted.id)?.firstMentionMessageId ?? null) === null && !items.has(outside.id),
+    "the deleted mentions or the done outsider row are still served",
+  );
+  const outsideThird = await post(outside.id, "@user outsider after done");
+  await mention(outsideThird, outside.id, { notifiedAt: new Date() });
+  const reopened = await waitForRw(
+    (items) => items.get(outside.id)?.firstMentionMessageId === outsideThird.id,
+    "a newer outsider mention after done did not reopen the row on it",
+  );
+  const reopenedPg = await pgItems();
+  assert.deepEqual(anchors(reopened, [deleted.id, outside.id]), anchors(reopenedPg, [deleted.id, outside.id]));
+  assert.equal(reopened.get(outside.id)?.firstUnreadMessageId, outsideThird.id);
+});
+
+test.skipIf(!configured)("Done frontier parity: canonical Postgres doneFrontierSeq = RisingWave latestActivitySeq = sync done.doneFrontierSeq", async () => {
+  // Web clients decide whether another device's Done covers an Activity row by
+  // comparing the sync change's done.doneFrontierSeq with the row's
+  // latestActivitySeq (RW rows' doneFrontierSeq is not a contract). So, per
+  // conversation, the PG row's doneFrontierSeq (fetchReadStateAuthorityRows),
+  // the RW row's latestActivitySeq (rw_inbox_serving_v9) and the sync done
+  // state (readConversationStates) must be the same number.
+  // A fresh viewer and conversations, so the fixture's counts stay untouched.
+  const db = getDb();
+  const [viewer] = await db.insert(users).values({
+    name: `rwreal-donefrontier-${f.tag}`, email: `rwreal-donefrontier-${f.tag}@test.invalid`, passwordHash: "x", emailVerified: true,
+  }).returning();
+  await db.insert(serverMembers).values({ serverId: f.receiverServer.id, userId: viewer.id, role: "member" });
+  const [room, dm, canonical, senderLocal, local] = await db.insert(channels).values([
+    { serverId: f.receiverServer.id, name: `rwreal-donefrontier-room-${f.tag}`, type: "channel" },
+    { serverId: f.receiverServer.id, name: `rwreal-donefrontier-dm-${f.tag}`, type: "dm" },
+    { serverId: f.storage.id, name: `rwreal-donefrontier-canonical-${f.tag}`, type: "joint" },
+    { serverId: f.senderServer.id, name: `rwreal-donefrontier-sender-local-${f.tag}`, type: "joint" },
+    { serverId: f.receiverServer.id, name: `rwreal-donefrontier-local-${f.tag}`, type: "joint" },
+  ]).returning();
+  const [joint] = await db.insert(jointChannels).values({
+    canonicalChannelId: canonical.id, createdByServerId: f.senderServer.id, createdByUserId: f.owner.id,
+  }).returning();
+  await db.insert(jointChannelServers).values([
+    { jointChannelId: joint.id, serverId: f.senderServer.id, localChannelId: senderLocal.id, role: "host", status: "active", joinedByUserId: f.owner.id },
+    { jointChannelId: joint.id, serverId: f.receiverServer.id, localChannelId: local.id, role: "participant", status: "active", joinedByUserId: f.owner.id },
+  ]);
+  await db.insert(channelHumans).values([
+    ...[room, dm, local].map((channel) => ({ channelId: channel.id, userId: viewer.id })),
+    ...[room, dm, senderLocal].map((channel) => ({ channelId: channel.id, userId: f.sender.id })),
+  ]);
+  // Joint read authority is computed membership only: the viewer and the sender are J members.
+  await fillJointMembersFromChannelHumans([joint.id]);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  const post = async (channelId: string, authorId: string, content: string, extra: Partial<typeof messages.$inferInsert> = {}) => {
+    const [message] = await db.insert(messages).values({
+      channelId, senderType: "user", senderId: authorId, content: `${content} ${f.tag}`, ...extra,
+    }).returning();
+    return message;
+  };
+
+  // A thread and a task conversation below the room, both followed by the viewer.
+  const threadParent = await post(room.id, f.sender.id, "done frontier thread parent");
+  const [thread] = await db.insert(channels).values({
+    serverId: f.receiverServer.id, name: `thread-${threadParent.id.slice(0, 8)}`, type: "thread", parentMessageId: threadParent.id,
+  }).returning();
+  const [task] = await db.insert(tasks).values({
+    channelId: room.id, taskNumber: 13, title: `rw done frontier task ${f.tag}`, createdByType: "user", createdById: f.sender.id,
+  }).returning();
+  const [taskConversation] = await db.insert(channels).values({
+    serverId: f.receiverServer.id, name: `task-${task.id}`, type: "task", taskId: task.id, parentChannelId: room.id,
+  }).returning();
+  await db.update(tasks).set({ conversationChannelId: taskConversation.id }).where(eq(tasks.id, task.id));
+  await db.insert(threadFollows).values([
+    { threadChannelId: thread.id, parentMessageId: threadParent.id, reason: "manual", followerType: "user", followerId: viewer.id },
+    { threadChannelId: taskConversation.id, parentMessageId: null, parentTaskId: task.id, reason: "assigned", followerType: "user", followerId: viewer.id },
+  ]);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  // Channel: the latest message is the viewer's own.
+  await post(room.id, f.sender.id, "room from the other");
+  const roomLatest = await post(room.id, viewer.id, "room from the viewer");
+  // DM: the latest message is the other's.
+  await post(dm.id, viewer.id, "dm from the viewer");
+  const dmLatest = await post(dm.id, f.sender.id, "dm from the other");
+  // Joint (receiver's projection): stored in canonical storage; the latest is the other's.
+  await post(canonical.id, viewer.id, "joint from the viewer");
+  const jointLatest = await post(canonical.id, f.sender.id, "joint from the other");
+  // Thread: replies; the latest reply is the viewer's own.
+  await post(thread.id, f.sender.id, "thread reply from the other");
+  const threadLatest = await post(thread.id, viewer.id, "thread reply from the viewer");
+  // Task conversation: a lifecycle line, then replies; the latest reply is the other's.
+  await post(taskConversation.id, f.sender.id, `assigned #13`, {
+    messageType: "system", systemSubtype: "task.assignment_receipt", causalActorType: "user", causalActorId: f.sender.id,
+  });
+  await post(taskConversation.id, f.sender.id, "task reply from the other");
+  await post(taskConversation.id, viewer.id, "task reply from the viewer");
+  const taskLatest = await post(taskConversation.id, f.sender.id, "task reply from the other, latest");
+
+  type Item = Awaited<ReturnType<typeof getInboxItems>>["items"][number];
+  const cases = [
+    { what: "channel", id: room.id, kind: "channel", latest: roomLatest, syncDone: true },
+    { what: "DM", id: dm.id, kind: "dm", latest: dmLatest, syncDone: true },
+    { what: "joint (receiver's projection)", id: local.id, kind: "channel", latest: jointLatest, syncDone: true },
+    { what: "thread", id: thread.id, kind: "thread", latest: threadLatest, syncDone: false },
+    { what: "task conversation", id: taskConversation.id, kind: "task", latest: taskLatest, syncDone: false },
+  ] as const;
+  const seqOf = (value: string | null | undefined) => (value === null || value === undefined ? null : BigInt(value));
+  const itemsOf = async (forceCanonicalPostgres: boolean) => new Map(
+    (await getInboxItems(f.receiverServer.id, viewer.id, { filter: "all", limit: 50, forceCanonicalPostgres }))
+      .items.map((item) => [targetOf(item), item] as const),
+  );
+  const describe = (items: Map<string, Item>) => JSON.stringify(cases.map((c) => [c.what, items.get(c.id)?.latestActivitySeq ?? null]));
+  // Wait for CDC: every RW row reflects its last message.
+  const timeoutMs = Number(process.env.RISINGWAVE_REAL_CDC_TIMEOUT_MS ?? 120_000);
+  const deadline = Date.now() + timeoutMs;
+  let rw = await itemsOf(false);
+  while (!cases.every((c) => seqOf(rw.get(c.id)?.latestActivitySeq) === BigInt(c.latest.seq)) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    rw = await itemsOf(false);
+  }
+  const pg = await itemsOf(true);
+  for (const c of cases) {
+    const rwItem = rw.get(c.id);
+    const pgItem = pg.get(c.id);
+    assert.ok(rwItem, `${c.what}: RisingWave Activity lists it; RW: ${describe(rw)}`);
+    assert.ok(pgItem, `${c.what}: canonical Postgres Activity lists it`);
+    assert.equal(rwItem.kind, c.kind, `${c.what}: RW kind`);
+    assert.equal(pgItem.kind, c.kind, `${c.what}: PG kind`);
+    assert.ok(pgItem.doneFrontierSeq, `${c.what}: the PG row carries doneFrontierSeq`);
+    assert.equal(
+      seqOf(pgItem.doneFrontierSeq),
+      seqOf(rwItem.latestActivitySeq),
+      `${c.what}: PG doneFrontierSeq (${pgItem.doneFrontierSeq}) = RW latestActivitySeq (${rwItem.latestActivitySeq})`,
+    );
+    assert.equal(seqOf(rwItem.latestActivitySeq), BigInt(c.latest.seq), `${c.what}: both are the last message's seq`);
+  }
+
+  // Done from "another device", then the sync pull: done.doneFrontierSeq is the
+  // same number. Only channels and DMs carry a done state (inbox_state); a
+  // thread's or task conversation's Done travels as `follow`, without a frontier.
+  const viewerRef = { userId: viewer.id, serverId: f.receiverServer.id as ServerId, isGuest: false };
+  const start = parseSyncChangesCursor((await readSyncChanges({ viewer: viewerRef, since: null, limit: 1 })).cursor);
+  assert.ok(start, "the sync cursor parses");
+  const syncCases = cases.filter((c) => c.syncDone);
+  for (const c of syncCases) {
+    const ack = await markChannelInboxDone(viewer.id, c.id, rw.get(c.id)!.latestActivitySeq);
+    assert.equal(ack.terminalReason, "effect_applied", `${c.what}: Done applied`);
+  }
+  const doneById = new Map<string, SyncConversationDoneState>();
+  let since = start;
+  for (let page = 0; page < 20; page += 1) {
+    const read = await readSyncChanges({ viewer: viewerRef, since, limit: 200 });
+    assert.equal(read.reset, null, "no reset");
+    for (const change of read.changes) {
+      if (change.entity === "conversation" && change.done) doneById.set(change.id, change.done);
+    }
+    since = parseSyncChangesCursor(read.cursor)!;
+    if (!read.hasMore) break;
+  }
+  for (const c of syncCases) {
+    const done = doneById.get(c.id);
+    assert.ok(done, `${c.what}: the sync pull carries its done state; got ${JSON.stringify([...doneById])}`);
+    assert.equal(done.done, true, `${c.what}: done`);
+    assert.equal(
+      seqOf(done.doneFrontierSeq),
+      seqOf(rw.get(c.id)!.latestActivitySeq),
+      `${c.what}: sync done.doneFrontierSeq (${done.doneFrontierSeq}) = RW latestActivitySeq`,
+    );
+    assert.equal(seqOf(done.doneFrontierSeq), seqOf(pg.get(c.id)!.doneFrontierSeq), `${c.what}: = PG doneFrontierSeq`);
+  }
 });

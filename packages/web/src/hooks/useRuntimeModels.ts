@@ -7,6 +7,7 @@ import {
   isRuntimeModelDetectionLookupReason,
   RUNTIME_MODELS,
   runtimeModelSourceOutcomeFromSet,
+  sanitizeRuntimeModelUnavailable,
 } from "@botiverse/raft-shared";
 import type {
   RuntimeModelCatalogCapability,
@@ -24,9 +25,43 @@ export type RuntimeModelSourceState =
   | { kind: "loading"; previous?: RuntimeModelSet }
   | RuntimeModelSourceOutcome;
 
+/**
+ * How the server answered (additive `state`): ok, the Computer's last list
+ * because it did not answer in time (stale, received at `fetchedAt`), or
+ * nothing in time (unavailable). An older server sends none: ok.
+ */
+export type RuntimeModelFreshness =
+  | { state: "ok" }
+  | { state: "stale"; fetchedAt?: string }
+  | { state: "unavailable" };
+
+const FRESH: RuntimeModelFreshness = { state: "ok" };
+
+export function parseRuntimeModelFreshness(payload: unknown): RuntimeModelFreshness {
+  if (!payload || typeof payload !== "object") return FRESH;
+  const { state, fetchedAt } = payload as { state?: unknown; fetchedAt?: unknown };
+  if (state === "stale") return typeof fetchedAt === "string" ? { state, fetchedAt } : { state };
+  if (state === "unavailable") return { state };
+  return FRESH;
+}
+
+/**
+ * A model this Computer's runtime listed as disabled, shown greyed and never
+ * selectable. `runtimeReason` is the runtime's own untrusted text (plain text
+ * only; may be empty).
+ */
+export interface RuntimeModelUnavailableOption {
+  id: string;
+  label: string;
+  runtimeReason: string;
+}
+
 export interface RuntimeModelsResult {
   source: RuntimeModelSourceState;
+  freshness: RuntimeModelFreshness;
   models: RuntimeModelInfo[];
+  /** Not selectable; never part of `models`. */
+  unavailable: RuntimeModelUnavailableOption[];
   default?: string;
   /** Bundled metadata; terminal discovery failures may offer it as unverified. */
   suggestions: RuntimeModelInfo[];
@@ -54,37 +89,6 @@ export function parseBuiltInCatalogCapability(
         runtimeVersion: candidate.runtimeVersion,
       }
     : undefined;
-}
-
-export function builtInCatalogCapabilityIsLive(
-  source: RuntimeModelSourceState,
-): boolean {
-  return (
-    source.kind === "live" &&
-    parseBuiltInCatalogCapability(source.value.catalog) !== undefined
-  );
-}
-
-/**
- * Built-in detection is advisory. Keep the static provider list editable and
- * preserve the current identity; the runtime validates compatibility at start.
- */
-export function projectBuiltInPresetModelOptions(input: {
-  providerModels: readonly RuntimeModelInfo[];
-  persistedModel?: string;
-}): RuntimeModelInfo[] {
-  const options = [...input.providerModels];
-  const persistedModel = input.persistedModel?.trim();
-  if (
-    persistedModel &&
-    !options.some((option) => option.id === persistedModel)
-  ) {
-    options.push({
-      id: persistedModel,
-      label: getModelLabel("builtin", persistedModel),
-    });
-  }
-  return options;
 }
 
 /**
@@ -159,15 +163,19 @@ export function parseRuntimeModelSourcePayload(payload: unknown): RuntimeModelSo
     default?: unknown;
   };
   if (candidate.kind === "live") {
-    const value = candidate.value as { models?: unknown; default?: unknown; catalog?: unknown } | undefined;
+    const value = candidate.value as {
+      models?: unknown; default?: unknown; catalog?: unknown; unavailable?: unknown;
+    } | undefined;
     if (!value || !Array.isArray(value.models)) {
       return { kind: "error", retryable: true };
     }
     const catalog = parseBuiltInCatalogCapability(value.catalog);
+    const unavailable = sanitizeRuntimeModelUnavailable(value.unavailable);
     return runtimeModelSourceOutcomeFromSet({
       models: value.models as RuntimeModelInfo[],
       ...(typeof value.default === "string" ? { default: value.default } : {}),
       ...(catalog ? { catalog } : {}),
+      ...(unavailable ? { unavailable } : {}),
     });
   }
   if (candidate.kind === "missing_config" || candidate.kind === "no_models") {
@@ -198,32 +206,7 @@ export function parseRuntimeModelSourcePayload(payload: unknown): RuntimeModelSo
   return { kind: "error", retryable: true };
 }
 
-/** Form submission eligibility only; the daemon still validates every launch. */
-export function runtimeModelSelectionIsRunnable(input: {
-  runtime?: string;
-  source: RuntimeModelSourceState;
-  model: string;
-  modelIgnored?: boolean;
-  customMode: boolean;
-  customAllowed: boolean;
-  providerCatalog?: boolean;
-  persistedModel?: string;
-  builtInPreset?: boolean;
-}): boolean {
-  if (input.modelIgnored) return true;
-  const model = input.model.trim();
-  if (!model) return false;
-  if (input.providerCatalog) return true;
-  if (input.customMode) return input.customAllowed;
-  if (input.builtInPreset) return true;
-  if (input.source.kind === "live") {
-    if (input.source.value.models.some((candidate) => candidate.id === model)) return true;
-    return input.customAllowed && input.persistedModel === model;
-  }
-  return runtimeModelFallbackOptions(input.runtime, input.source).some((candidate) => candidate.id === model);
-}
-
-export function projectRuntimeModelSourcePresentation(runtime: string, source: RuntimeModelSourceState): Omit<RuntimeModelsResult, "suggestions" | "rescan"> {
+export function projectRuntimeModelSourcePresentation(runtime: string, source: RuntimeModelSourceState): Omit<RuntimeModelsResult, "suggestions" | "rescan" | "freshness"> {
   const value = source.kind === "live"
     ? source.value
     : source.kind === "loading"
@@ -233,6 +216,7 @@ export function projectRuntimeModelSourcePresentation(runtime: string, source: R
     return {
       source,
       models: runtimeModelFallbackOptions(runtime, source),
+      unavailable: [],
       loading: source.kind === "loading",
       fromMachine: false,
     };
@@ -241,10 +225,18 @@ export function projectRuntimeModelSourcePresentation(runtime: string, source: R
   const projectedValue: RuntimeModelSet = {
     ...canon,
     ...(value.catalog ? { catalog: value.catalog } : {}),
+    ...(value.unavailable ? { unavailable: value.unavailable } : {}),
   };
+  const usable = new Set(canon.models.map((model) => model.id));
+  const unavailable: RuntimeModelUnavailableOption[] = source.kind === "live"
+    ? (value.unavailable ?? [])
+        .filter((model) => !usable.has(model.id))
+        .map((model) => ({ id: model.id, label: model.label, runtimeReason: model.reason }))
+    : [];
   return {
     source: source.kind === "live" ? { kind: "live", value: projectedValue } : source,
     models: canon.models,
+    unavailable,
     default: canon.default,
     loading: source.kind === "loading",
     fromMachine: source.kind === "live",
@@ -259,17 +251,18 @@ export function projectRuntimeModelSourcePresentation(runtime: string, source: R
  * and reuse a recent live catalog; the Create Agent dialog and agent details
  * stay fresh on every open, and a rescan always asks again.
  */
-type SharedRuntimeModelRequest = { promise: Promise<RuntimeModelSourceState>; settledAt?: number; source?: RuntimeModelSourceState };
+type RuntimeModelLoad = { source: RuntimeModelSourceState; freshness: RuntimeModelFreshness };
+type SharedRuntimeModelRequest = { promise: Promise<RuntimeModelLoad>; settledAt?: number; load?: RuntimeModelLoad };
 const sharedRuntimeModelRequests = new Map<string, SharedRuntimeModelRequest>();
 
 export function resetSharedRuntimeModelRequestsForTests(): void {
   sharedRuntimeModelRequests.clear();
 }
 
-function loadRuntimeModelSource(serverId: string, machineId: string, runtime: string): Promise<RuntimeModelSourceState> {
+function loadRuntimeModelSource(serverId: string, machineId: string, runtime: string): Promise<RuntimeModelLoad> {
   return api
     .get(`/servers/${serverId}/machines/${machineId}/runtime-models/${runtime}`)
-    .then((res) => {
+    .then((res): RuntimeModelLoad => {
       const source = parseRuntimeModelSourcePayload(res.data);
       // A successful live detect was upserted into the shared catalog server
       // side; refresh our copy so the dropdown never shows the older cached
@@ -278,22 +271,27 @@ function loadRuntimeModelSource(serverId: string, machineId: string, runtime: st
       if (source.kind === "live" && useModelLabelCatalogStore.getState().byServer[serverId]) {
         useModelLabelCatalogStore.getState().load(serverId, { force: true });
       }
-      return source;
+      return { source, freshness: parseRuntimeModelFreshness(res.data) };
     })
-    .catch((): RuntimeModelSourceState => ({ kind: "error", retryable: true }));
+    .catch((): RuntimeModelLoad => ({ source: { kind: "error", retryable: true }, freshness: FRESH }));
 }
 
-function sharedRuntimeModelSource(serverId: string, machineId: string, runtime: string, reuseRecentMs: number): Promise<RuntimeModelSourceState> {
+function sharedRuntimeModelSource(serverId: string, machineId: string, runtime: string, reuseRecentMs: number): Promise<RuntimeModelLoad> {
   const key = JSON.stringify([serverId, machineId, runtime]);
   const existing = sharedRuntimeModelRequests.get(key);
-  if (existing && (existing.settledAt === undefined || (existing.source?.kind === "live" && Date.now() - existing.settledAt < reuseRecentMs))) {
+  // Only a fresh live list is worth sharing; a stale one asks again.
+  if (existing && (existing.settledAt === undefined || (
+    existing.load?.source.kind === "live"
+    && existing.load.freshness.state === "ok"
+    && Date.now() - existing.settledAt < reuseRecentMs
+  ))) {
     return existing.promise;
   }
   const entry: SharedRuntimeModelRequest = {
-    promise: loadRuntimeModelSource(serverId, machineId, runtime).then((source) => {
+    promise: loadRuntimeModelSource(serverId, machineId, runtime).then((load) => {
       entry.settledAt = Date.now();
-      entry.source = source;
-      return source;
+      entry.load = load;
+      return load;
     }),
   };
   sharedRuntimeModelRequests.set(key, entry);
@@ -314,7 +312,8 @@ export function useRuntimeModels(
   const [sourceSnapshot, setSourceSnapshot] = useState<{
     requestKey: string | null;
     source: RuntimeModelSourceState;
-  }>({ requestKey: null, source: { kind: "idle" } });
+    freshness: RuntimeModelFreshness;
+  }>({ requestKey: null, source: { kind: "idle" }, freshness: FRESH });
 
   // The render that changes Computer/runtime/request generation must not expose
   // the previous request's catalog. Project the new identity as loading before
@@ -328,6 +327,7 @@ export function useRuntimeModels(
       previous: getStaticRuntimeModelSourceSet(runtime),
     };
   }, [requestKey, runtime, sourceSnapshot]);
+  const freshness = requestKey && sourceSnapshot.requestKey === requestKey ? sourceSnapshot.freshness : FRESH;
 
   const rescan = useCallback(() => {
     setRefreshNonce((n) => n + 1);
@@ -340,7 +340,7 @@ export function useRuntimeModels(
   useEffect(() => {
     if (!requestKey || !machineId || !runtime || !serverId) {
       // oxlint-disable-next-line react-doctor/no-adjust-state-on-prop-change -- source identity changed; discard the previous machine/runtime truth
-      setSourceSnapshot({ requestKey: null, source: { kind: "idle" } });
+      setSourceSnapshot({ requestKey: null, source: { kind: "idle" }, freshness: FRESH });
       return;
     }
     let cancelled = false;
@@ -355,14 +355,15 @@ export function useRuntimeModels(
         // suggestion-only during loading/error/no-model outcomes.
         previous: getStaticRuntimeModelSourceSet(runtime),
       },
+      freshness: FRESH,
     });
     // A rescan (refreshNonce > 0) always asks the Computer again.
     const pending = reuseRecentMs > 0 && refreshNonce === 0
       ? sharedRuntimeModelSource(serverId, machineId, runtime, reuseRecentMs)
       : loadRuntimeModelSource(serverId, machineId, runtime);
-    void pending.then((nextSource) => {
+    void pending.then((load) => {
       if (cancelled) return;
-      setSourceSnapshot({ requestKey, source: nextSource });
+      setSourceSnapshot({ requestKey, ...load });
     });
     return () => {
       cancelled = true;
@@ -380,7 +381,8 @@ export function useRuntimeModels(
 
   return useMemo(() => ({
     ...presentation,
+    freshness,
     suggestions,
     rescan,
-  }), [presentation, rescan, suggestions]);
+  }), [presentation, freshness, rescan, suggestions]);
 }

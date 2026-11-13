@@ -1,0 +1,4 @@
+{
+  "about": "Intended JS heap increases for the Computer heap check (heap-gate.mjs). Add an entry in the PR that causes the increase: reason, and runnerMB and/or liteMB. An entry counts until the first stable release that contains it; that release's measurement already includes the increase, so the entry can then be removed.",
+  "allowances": []
+}

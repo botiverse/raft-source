@@ -1,6 +1,14 @@
 import assert from "node:assert/strict";
 import { createTraceContext, type CompletedTraceSpan } from "@botiverse/raft-shared";
-import { normalizeOtlpTracesEndpoint, OtlpHttpTraceSink, toOtlpSpan, type OtlpHttpTraceSinkFetch } from "./otlpHttpTraceSink";
+import {
+  normalizeOtlpTracesEndpoint,
+  OtlpHttpTraceSink,
+  toOtlpSpan,
+  type OtlpExportFailure,
+  type OtlpExportObserver,
+  type OtlpHttpTraceSinkFetch,
+  type OtlpSignal,
+} from "./otlpHttpTraceSink";
 
 function makeSpan(overrides: Partial<CompletedTraceSpan> = {}): CompletedTraceSpan {
   const parent = createTraceContext({
@@ -135,4 +143,87 @@ test("OtlpHttpTraceSink exports queued spans as one OTLP HTTP request", async ()
   assert.ok(resourceAttrs.some((attr: any) => attr.key === "slock.fly_region" && attr.value.stringValue === "sjc"));
   assert.ok(resourceAttrs.some((attr: any) => attr.key === "deployment.environment" && attr.value.stringValue === "test"));
   assert.equal(body.resourceSpans[0].scopeSpans[0].spans.length, 2);
+});
+
+function recordingObserver() {
+  const calls: Array<
+    | { call: "exported"; signal: OtlpSignal; items: number }
+    | { call: "exportFailed"; signal: OtlpSignal; items: number; failure: OtlpExportFailure }
+    | { call: "droppedQueueFull"; signal: OtlpSignal; items: number }
+  > = [];
+  const depths: Array<[OtlpSignal, number]> = [];
+  const observer: OtlpExportObserver = {
+    exported: (signal, items) => calls.push({ call: "exported", signal, items }),
+    exportFailed: (signal, items, _durationMs, failure) => calls.push({ call: "exportFailed", signal, items, failure }),
+    droppedQueueFull: (signal, items) => calls.push({ call: "droppedQueueFull", signal, items }),
+    queueDepth: (signal, depth) => depths.push([signal, depth]),
+  };
+  return { calls, depths, observer };
+}
+
+function logEvent(name: string) {
+  return { name, timeMs: 1_000, surface: "server" as const, context: null };
+}
+
+test("the observer hears each batch's outcome per signal, with the failure as a bounded kind", async () => {
+  const responses: Array<() => Promise<Awaited<ReturnType<OtlpHttpTraceSinkFetch>>>> = [
+    async () => ({ ok: true, status: 200, text: async () => "" }),
+    async () => ({ ok: false, status: 429, text: async () => "slow down" }),
+    async () => ({ ok: false, status: 503, text: async () => "data refused due to high memory usage" }),
+    async () => ({ ok: false, status: 400, text: async () => "bad request" }),
+    async () => { throw Object.assign(new Error("This operation was aborted"), { name: "AbortError" }); },
+    async () => { throw new TypeError("fetch failed"); },
+  ];
+  const { calls, observer } = recordingObserver();
+  const sink = new OtlpHttpTraceSink({
+    endpoint: "http://collector:4318",
+    serviceName: "slock-server-test",
+    batchSize: 1,
+    flushIntervalMs: 60_000,
+    fetchImpl: () => responses.shift()!(),
+    observer,
+    onError: () => {},
+  });
+
+  // batchSize 1: each add starts its export; flush() does not wait for one already running.
+  const settled = () => new Promise((resolve) => setTimeout(resolve, 0));
+  sink.recordLogEvent(logEvent("a"));
+  await settled();
+  for (let i = 0; i < 5; i++) {
+    sink.record(makeSpan());
+    await settled();
+  }
+
+  assert.deepEqual(calls, [
+    { call: "exported", signal: "logs", items: 1 },
+    { call: "exportFailed", signal: "traces", items: 1, failure: { kind: "http_429", httpStatus: 429 } },
+    { call: "exportFailed", signal: "traces", items: 1, failure: { kind: "http_5xx", httpStatus: 503 } },
+    { call: "exportFailed", signal: "traces", items: 1, failure: { kind: "http_4xx", httpStatus: 400 } },
+    { call: "exportFailed", signal: "traces", items: 1, failure: { kind: "timeout" } },
+    { call: "exportFailed", signal: "traces", items: 1, failure: { kind: "network" } },
+  ]);
+});
+
+test("a full queue reports each dropped item and the depth it reached", async () => {
+  const { calls, depths, observer } = recordingObserver();
+  const sink = new OtlpHttpTraceSink({
+    endpoint: "http://collector:4318",
+    serviceName: "slock-server-test",
+    batchSize: 2,
+    maxQueueSize: 2,
+    flushIntervalMs: 60_000,
+    // Never answers, so the queue cannot drain while the test adds items.
+    fetchImpl: () => new Promise(() => {}),
+    observer,
+  });
+
+  sink.recordLogEvent(logEvent("a"));
+  sink.recordLogEvent(logEvent("b")); // full batch: one export starts and hangs
+  sink.recordLogEvent(logEvent("c"));
+  sink.recordLogEvent(logEvent("d"));
+  sink.recordLogEvent(logEvent("e")); // queue holds c, d: drops c
+
+  assert.deepEqual(calls, [{ call: "droppedQueueFull", signal: "logs", items: 1 }]);
+  assert.equal(Math.max(...depths.map(([, depth]) => depth)), 2);
+  assert.ok(depths.every(([signal]) => signal === "logs"));
 });

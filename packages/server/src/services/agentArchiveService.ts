@@ -12,6 +12,8 @@
  * after the request, on the Computer's `ready`, and on the 30s sweep. The
  * dispatch stamp is a lease.
  */
+import { agentFindableBy } from "./agentMemberListPolicy";
+import { agentEventRoom } from "../socket/platformScope";
 import { randomUUID } from "node:crypto";
 import {
   AGENT_ARCHIVE_UPDATED_EVENT,
@@ -34,6 +36,8 @@ import {
 } from "../db/schema";
 import { cancelReminder } from "../apps/reminder/service";
 import { mapWithConcurrency } from "../lib/mapWithConcurrency";
+import { recordAgentCredentialsBulkRevoked, type ServerAuditContext } from "./integrationAuditService";
+import { removeWeChatBridgeOfArchivedAssistant } from "./wechatBridgeCleanup";
 
 /** A delete answers within 15s; anything older was lost. */
 const DELETE_OP_LEASE_MS = 2 * 60_000;
@@ -67,13 +71,16 @@ function hasComputerWorkspace(agent: { runtime: string; executionMode: string })
  * Inside the archive transaction, before `deleteAgent` clears `daemon_id`:
  * record where the workspace is and the op the user chose, cancel the agent's
  * reminders, and revoke its credentials and unused bootstrap tokens (they were
- * only unusable through the `deleted_at` join until now).
+ * only unusable through the `deleted_at` join until now). A personal
+ * assistant's WeChat binding goes too: its DM no longer has anyone to answer.
  */
 export async function recordAgentArchive(tx: DatabaseExecutor, input: {
   agentId: string;
   userId: string;
   choice: AgentArchiveWorkspaceChoice;
   now?: Date;
+  /** The audit context of the operation this archive is part of. */
+  audit?: ServerAuditContext;
 }): Promise<AgentArchiveRow> {
   const now = input.now ?? currentDate();
   const [agent] = await tx.select({
@@ -120,11 +127,20 @@ export async function recordAgentArchive(tx: DatabaseExecutor, input: {
       actor: { type: "human", id: input.userId },
     });
   }
-  await tx.update(agentCredentials).set({
+  const revokedCredentials = await tx.update(agentCredentials).set({
     revokedAt: now,
     revokedReason: "agent_archived",
     revokedByUserId: input.userId,
-  }).where(and(eq(agentCredentials.agentId, agent.id), isNull(agentCredentials.revokedAt)));
+  }).where(and(eq(agentCredentials.agentId, agent.id), isNull(agentCredentials.revokedAt)))
+    .returning({ id: agentCredentials.id });
+  await recordAgentCredentialsBulkRevoked({
+    serverId: agent.serverId,
+    agentId: agent.id,
+    actorUserId: input.userId,
+    revokedCount: revokedCredentials.length,
+    reason: "agent_archived",
+    audit: input.audit,
+  }, tx);
   await tx.update(agentBootstrapTokens).set({
     revokedAt: now,
     revokedReason: "agent_archived",
@@ -134,6 +150,7 @@ export async function recordAgentArchive(tx: DatabaseExecutor, input: {
     isNull(agentBootstrapTokens.revokedAt),
     isNull(agentBootstrapTokens.consumedAt),
   ));
+  await removeWeChatBridgeOfArchivedAssistant(tx, { agentId: agent.id, actorUserId: input.userId });
   return row;
 }
 
@@ -353,10 +370,14 @@ async function dispatchOne(port: AgentArchiveDispatchPort, row: AgentArchiveRow,
 /**
  * Tells the server's clients that an archive changed. Only the agent id goes
  * out: the details are read back through the permission-checked
- * `GET /agents/:id/archive`.
+ * `GET /agents/:id/archive`. A personal assistant's goes to its owner only.
  */
-export function emitAgentArchiveUpdated(io: SocketServer | null | undefined, row: Pick<AgentArchiveRow, "agentId" | "serverId">): void {
-  io?.to(`server:${row.serverId}`).emit(AGENT_ARCHIVE_UPDATED_EVENT, { agentId: row.agentId });
+export function emitAgentArchiveUpdated(
+  io: SocketServer | null | undefined,
+  row: Pick<AgentArchiveRow, "agentId" | "serverId">,
+  assistantOwnerUserId: string | null = null,
+): void {
+  io?.to(agentEventRoom(row.serverId, assistantOwnerUserId)).emit(AGENT_ARCHIVE_UPDATED_EVENT, { agentId: row.agentId });
 }
 
 /** The Computer panel removed the directory itself. */
@@ -381,11 +402,12 @@ export interface ArchivedAgentListEntry {
 }
 
 /** Archived agents of a server, newest first, with their archive records when they have one. */
-export async function listArchivedAgents(serverId: string): Promise<ArchivedAgentListEntry[]> {
+/** Another person's archived personal assistant is left out (agentFindableBy). */
+export async function listArchivedAgents(serverId: string, viewerUserId: string): Promise<ArchivedAgentListEntry[]> {
   const rows = await getDb().select({ agent: agents, archive: agentArchives })
     .from(agents)
     .leftJoin(agentArchives, eq(agentArchives.agentId, agents.id))
-    .where(and(eq(agents.serverId, serverId), isNotNull(agents.deletedAt)));
+    .where(and(eq(agents.serverId, serverId), isNotNull(agents.deletedAt), agentFindableBy({ userId: viewerUserId })));
   return rows
     .map(({ agent, archive }) => ({
       agentId: agent.id,

@@ -126,7 +126,7 @@ function launchFailure(runtimeId: string, reason: WindowsLaunchFailureReason, me
   return new RuntimeExecutableNotFoundError({ runtimeId, message, reason });
 }
 
-function resolveNodeForShim(runtimeId: string, shimPath: string, deps: WindowsLaunchDeps): { command: string; env?: NodeJS.ProcessEnv } {
+function resolveNodeForShim(runtimeId: string, shimPath: string, deps: WindowsLaunchDeps): { command: string; env?: NodeJS.ProcessEnv; execArgv?: string[] } {
   try {
     const host = resolveNodeHostLaunch({
       env: deps.env ?? ambientProcessEnv(),
@@ -135,7 +135,7 @@ function resolveNodeForShim(runtimeId: string, shimPath: string, deps: WindowsLa
       execIsSea: deps.execIsSea,
       hasNodeRuntime: deps.hasNodeRuntime,
     });
-    return { command: host.command, env: host.env };
+    return { command: host.command, env: host.env, execArgv: host.execArgv };
   } catch (error) {
     if (!(error instanceof NodeHostUnavailableError)) throw error;
   }
@@ -163,7 +163,7 @@ function resolveNodeForShim(runtimeId: string, shimPath: string, deps: WindowsLa
  * task #1277 — {@link resolveNodeForShim} off the event loop: the `node` PATH
  * lookup runs through the bounded probe child; every other step is file I/O.
  */
-async function resolveNodeForShimAsync(runtimeId: string, shimPath: string, deps: WindowsLaunchDeps): Promise<{ command: string; env?: NodeJS.ProcessEnv }> {
+async function resolveNodeForShimAsync(runtimeId: string, shimPath: string, deps: WindowsLaunchDeps): Promise<{ command: string; env?: NodeJS.ProcessEnv; execArgv?: string[] }> {
   try {
     const host = resolveNodeHostLaunch({
       env: deps.env ?? ambientProcessEnv(),
@@ -172,7 +172,7 @@ async function resolveNodeForShimAsync(runtimeId: string, shimPath: string, deps
       execIsSea: deps.execIsSea,
       hasNodeRuntime: deps.hasNodeRuntime,
     });
-    return { command: host.command, env: host.env };
+    return { command: host.command, env: host.env, execArgv: host.execArgv };
   } catch (error) {
     if (!(error instanceof NodeHostUnavailableError)) throw error;
   }
@@ -213,7 +213,7 @@ export function resolveWindowsDirectLaunch(
         return { command: current, args, shell: false };
       }
       const node = resolveNodeForShim(runtimeId, shim, deps);
-      return { command: node.command, args: [current, ...args], ...(node.env ? { env: node.env } : {}), shell: false };
+      return { command: node.command, args: [...(node.execArgv ?? []), current, ...args], ...(node.env ? { env: node.env } : {}), shell: false };
     }
     const next = windowsShimTargets(current, deps).find((candidate) => existsSyncFn(candidate));
     if (!next) break;
@@ -243,7 +243,7 @@ export async function resolveWindowsDirectLaunchAsync(
         return { command: current, args, shell: false };
       }
       const node = await resolveNodeForShimAsync(runtimeId, shim, deps);
-      return { command: node.command, args: [current, ...args], ...(node.env ? { env: node.env } : {}), shell: false };
+      return { command: node.command, args: [...(node.execArgv ?? []), current, ...args], ...(node.env ? { env: node.env } : {}), shell: false };
     }
     const next = windowsShimTargets(current, deps).find((candidate) => existsSyncFn(candidate));
     if (!next) break;

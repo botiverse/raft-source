@@ -1,4 +1,6 @@
 import { createApiTest } from "../test/integration/apiTest";
+import { insertAttachmentsWithObjects, insertLinkedAttachmentsWithObjects } from "../test/attachmentObjectFixture";
+import { enableTaskV2ConversationsForServer } from "../test/integration/taskV2Flag";
 import { tokenForHuman } from "../test/integration/credentials";
 import { resolveAgentVisibleMessagePayload } from "./internal";
 import assert from "node:assert/strict";
@@ -23,11 +25,13 @@ import {
 
 import { getDb } from "../db/index";
 import { traceAgentIdHash, traceServerIdHash } from "../tracing/traceIdentity";
-import { actionCards, attachments, channelAgents, channelHumans, channels, computers, externalAppRegistrations, inboxNotificationFacts, inboxTargetMuteStates, jointChannels, jointChannelServers, messageMentions, messageReactions, messages, oauthAccessRequests, oauthClientInstalls, oauthClientMaintainers, oauthClients, oauthGrants, reminders, serverAgentMembers, serverMembers, servers as serversTable, taskEvents, tasks, threadFollows, userChannelInboxStates, users } from "../db/schema";
+import { actionCards, agentCredentials, agents as agentsTable, attachmentObjects, attachments, channelAgents, channelHumans, channels, computers, externalAppRegistrations, inboxNotificationFacts, inboxTargetMuteStates, jointChannels, jointChannelServers, machines, messageMentions, messageReactions, messages, notificationOutbox, oauthAccessRequests, oauthClientInstalls, oauthClientMaintainers, oauthClients, oauthGrants, reminders, serverAgentMembers, serverMembers, servers as serversTable, taskEvents, tasks, threadFollows, userChannelInboxStates, users } from "../db/schema";
+import { drainNotificationTasksForTests } from "../services/notifications/dispatcher";
 import { openTestApp } from "../test/integration/app";
 import { createHangingStorageTestHarness } from "../test/hangingStorageTestHarness";
 import { createServer } from "../services/serverService";
-import { createAgent, assignMachine } from "../services/agentService";
+import { createAgent } from "../services/agentService";
+import { placeAgentOnMachine } from "../test/agentMachineFixture";
 import { archiveChannel, createChannel, addAgent, addHuman, findOrCreateAgentDM, findOrCreateDM, getAgentLegacyReadCursor, getOrCreateThread, markAgentLegacyRead } from "../services/channelService";
 import { createMessage, getMaxSeq } from "../services/messageService";
 import * as taskService from "../services/taskService";
@@ -43,15 +47,17 @@ import {
   type StorageBackend,
 } from "../services/storageService";
 import { recordInboxNotificationFacts } from "../services/inboxNotificationService";
-import { buildSearchText } from "../services/searchService";
+import { buildSearchText } from "../services/searchTokenizer";
 import type {
   AttachmentUploadSessionContext,
   AttachmentUploadSessionResult,
   AttachmentUploadSessionService,
   CreateAttachmentUploadSessionInput,
 } from "./attachmentUploadSessions";
+import { revealAllChannelForTest } from "../test/allChannelFixture";
+import { seedJointChannel } from "../test/integration/jointFixture";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 type AuthFixture = {
   ownerId: string;
@@ -174,6 +180,7 @@ async function mintAgentKey(agentId: string, scopes: readonly AgentCapability[])
     agentId,
     scopes,
     name: `test-${scopes.join("-")}`,
+    issuedVia: "computer",
     createdByUserId: null,
   });
   return minted.apiKey;
@@ -199,7 +206,7 @@ async function seedAuthFixture(): Promise<AuthFixture> {
   await addAgent(channel.id, agent.id);
 
   const { machine, apiKey: machineApiKey } = await registerMachine(server.id, owner.id, "agent-api-auth-machine");
-  await assignMachine(agent.id, machine.id);
+  await placeAgentOnMachine(agent.id, machine.id);
   const computerMaterial = await generateComputerApiKeyMaterial();
   await db.insert(computers).values({
     serverId: server.id,
@@ -572,6 +579,7 @@ test("agent-api server info and channel membership use the bound runner identity
 
 test("agent-api server info and channel members respect hidden human directory", async ({ app }) => {
   const fixture = await seedAuthFixture();
+  await revealAllChannelForTest(fixture.serverId);
   const db = getDb();
   const [extraHuman] = await db.insert(users).values({
     email: `agent-api-hidden-extra-${randomUUID()}@slock.test`,
@@ -605,6 +613,74 @@ test("agent-api server info and channel members respect hidden human directory",
   assert.ok(memberListBody.agents?.some((candidate) => (
     candidate.name === "AgentApiAuthBot" && candidate.role === "member"
   )), "agent channel member rows should expose server role labels");
+});
+
+async function setAgentServerRole(serverId: string, agentId: string, role: "member" | "admin") {
+  const updated = await getDb().update(serverAgentMembers).set({ role }).where(and(
+    eq(serverAgentMembers.serverId, serverId),
+    eq(serverAgentMembers.agentId, agentId),
+  )).returning();
+  assert.equal(updated.length, 1, "precondition: agent has a server membership row");
+}
+
+/** A response with the probed handle masked, so two probes compare whole. */
+async function maskedResponse(res: Response, handle: string) {
+  const text = await res.text();
+  return { status: res.status, body: JSON.parse(text.split(handle).join("<handle>")) as unknown };
+}
+
+function fetchAgentProfile(baseUrl: string, apiKey: string, handle: string) {
+  return fetch(
+    `${baseUrl}/internal/agent-api/profile?target=${encodeURIComponent(`@${handle}`)}`,
+    { headers: jsonHeaders(apiKey) },
+  );
+}
+
+test("agent profile lookup of a hidden human @handle answers exactly like a missing handle", async ({ app }) => {
+  const fixture = await seedAuthFixture();
+  const db = getDb();
+  const hiddenName = `hidden-profile-${randomUUID().slice(0, 8)}`;
+  const [hiddenHuman] = await db.insert(users).values({
+    email: `${hiddenName}@slock.test`,
+    name: hiddenName,
+    displayName: "Hidden Profile Human",
+    passwordHash: await argon2.hash("password123"),
+    emailVerified: true,
+    profileSetupCompletedAt: new Date(),
+  }).returning();
+  await db.insert(serverMembers).values({ serverId: fixture.serverId, userId: hiddenHuman.id, role: "member" });
+  await db.update(serversTable).set({ hideHumansFromMembers: true }).where(eq(serversTable.id, fixture.serverId));
+  const missingName = `missing-profile-${randomUUID().slice(0, 8)}`;
+
+  const hidden = await maskedResponse(await fetchAgentProfile(app.baseUrl, fixture.agentApiKey, hiddenName), hiddenName);
+  const missing = await maskedResponse(await fetchAgentProfile(app.baseUrl, fixture.agentApiKey, missingName), missingName);
+  assert.deepEqual(hidden, missing, "a hidden human must be indistinguishable from a missing handle");
+  assert.equal(missing.status, 404);
+
+  await setAgentServerRole(fixture.serverId, fixture.agentId, "admin");
+  const adminRes = await fetchAgentProfile(app.baseUrl, fixture.agentApiKey, hiddenName);
+  const adminBody = await adminRes.json() as { kind?: string; id?: string };
+  assert.equal(adminRes.status, 200, JSON.stringify(adminBody));
+  assert.deepEqual([adminBody.kind, adminBody.id], ["human", hiddenHuman.id], "an admin agent resolves the hidden person");
+});
+
+test("agent profile lookup never returns a human's email, to member, admin or assistant agents", async ({ app }) => {
+  const fixture = await seedAuthFixture();
+  const emailOf = async (apiKey: string) => {
+    const res = await fetchAgentProfile(app.baseUrl, apiKey, fixture.ownerName);
+    const body = await res.json() as { kind?: string; email?: string | null };
+    assert.equal(res.status, 200, JSON.stringify(body));
+    assert.equal(body.kind, "human");
+    return body.email;
+  };
+
+  assert.equal(await emailOf(fixture.agentApiKey), null, "a member agent gets no human email");
+  const assistant = await createAgent(fixture.serverId, `owner-helper-${randomUUID().slice(0, 8)}`, { runtime: "claude", model: "sonnet" });
+  // An assistant is on no machine (agents_assistant_not_on_machine).
+  await getDb().update(agentsTable).set({ assistantOwnerUserId: fixture.ownerId, machineId: null }).where(eq(agentsTable.id, assistant.id));
+  assert.equal(await emailOf(await mintAgentKey(assistant.id, ["read"])), null, "the person's own assistant gets no email either");
+  await setAgentServerRole(fixture.serverId, fixture.agentId, "admin");
+  assert.equal(await emailOf(fixture.agentApiKey), null, "an admin agent gets no human email");
 });
 
 test("agent-api task routes use the bound runner identity without legacy agent id paths", async ({ app }) => {
@@ -726,7 +802,7 @@ test("agent-api task routes use the bound runner identity without legacy agent i
   });
   assert.equal(claim.status, 200);
   const claimBody = await claim.json() as { results?: Array<{ taskNumber?: number; success?: boolean }> };
-  assert.deepEqual(claimBody.results, [{ taskNumber: 1, messageId: createBody.tasks?.[0]?.messageId, success: true }]);
+  assert.deepEqual(claimBody.results, [{ taskNumber: 1, messageId: createBody.tasks?.[0]?.messageId, title: "native task route — current", success: true }]);
 
   const update = await fetch(`${app.baseUrl}/internal/agent-api/tasks/update-status`, {
     method: "POST",
@@ -734,7 +810,7 @@ test("agent-api task routes use the bound runner identity without legacy agent i
     body: JSON.stringify({ channel: channelRef, task_number: 1, status: "in_review" }),
   });
   assert.equal(update.status, 200);
-  assert.deepEqual(await update.json(), { ok: true });
+  assert.deepEqual(await update.json(), { ok: true, status: "in_review", title: "native task route — current" });
 
   const close = await fetch(`${app.baseUrl}/internal/agent-api/tasks/update-status`, {
     method: "POST",
@@ -742,7 +818,7 @@ test("agent-api task routes use the bound runner identity without legacy agent i
     body: JSON.stringify({ channel: channelRef, task_number: 1, status: "closed" }),
   });
   assert.equal(close.status, 200);
-  assert.deepEqual(await close.json(), { ok: true });
+  assert.deepEqual(await close.json(), { ok: true, status: "closed", title: "native task route — current" });
 
   const directResume = await fetch(`${app.baseUrl}/internal/agent-api/tasks/update-status`, {
     method: "POST",
@@ -750,7 +826,7 @@ test("agent-api task routes use the bound runner identity without legacy agent i
     body: JSON.stringify({ channel: channelRef, task_number: 1, status: "in_progress" }),
   });
   assert.equal(directResume.status, 200);
-  assert.deepEqual(await directResume.json(), { ok: true });
+  assert.deepEqual(await directResume.json(), { ok: true, status: "in_progress", title: "native task route — current" });
 
   const unclaim = await fetch(`${app.baseUrl}/internal/agent-api/tasks/unclaim`, {
     method: "POST",
@@ -758,7 +834,7 @@ test("agent-api task routes use the bound runner identity without legacy agent i
     body: JSON.stringify({ channel: channelRef, task_number: 1 }),
   });
   assert.equal(unclaim.status, 200);
-  assert.deepEqual(await unclaim.json(), { ok: true });
+  assert.deepEqual(await unclaim.json(), { ok: true, title: "native task route — current" });
 });
 
 test("agent-api resource task requires a structured receipt and creates an owner-anchored expiry reminder", async ({ app }) => {
@@ -808,7 +884,9 @@ test("agent-api resource task requires a structured receipt and creates an owner
   });
   assert.equal(prematureDone.status, 409);
   assert.deepEqual(await prematureDone.json(), {
-    error: "resource receipt required before task can move to done",
+    error: "This task creates a resource, so it needs a resource receipt before it can move to done: record the receipt first, then mark it done.",
+    code: "task_resource_receipt_required",
+    errorCode: "task_resource_receipt_required",
   });
 
   const invalidReceipt = await fetch(`${app.baseUrl}/internal/agent-api/tasks/resource-receipt`, {
@@ -867,7 +945,7 @@ test("agent-api resource task requires a structured receipt and creates an owner
     body: JSON.stringify({ channel: channelRef, task_number: taskNumber, status: "done" }),
   });
   assert.equal(completed.status, 200);
-  assert.deepEqual(await completed.json(), { ok: true });
+  assert.deepEqual(await completed.json(), { ok: true, status: "done", title: "Create staging bucket" });
 });
 
 test("agent-api task mine is untruncated, identity-bound, and hides inaccessible channel tasks", async ({ app }) => {
@@ -949,7 +1027,6 @@ test("agent-api task mine is untruncated, identity-bound, and hides inaccessible
     undefined,
     "joint",
   );
-  await addAgent(visibleJoint.id, fixture.agentId);
   const [joint] = await db.insert(jointChannels).values({
     canonicalChannelId: jointStorageChannel.id,
     createdByServerId: fixture.serverId,
@@ -963,6 +1040,7 @@ test("agent-api task mine is untruncated, identity-bound, and hides inaccessible
     status: "active",
     joinedByUserId: fixture.ownerId,
   });
+  await addAgent(visibleJoint.id, fixture.agentId);
   await db.insert(tasks).values({
     channelId: visibleJoint.id,
     taskNumber: 1,
@@ -1135,7 +1213,6 @@ test("agent-api task mine resolves channel visibility in a constant number of qu
     }).returning();
     const storage = await createChannel(storageServer.id, `count-joint-storage-${randomUUID().slice(0, 8)}`);
     const local = await createChannel(fixture.serverId, `count-joint-${randomUUID().slice(0, 8)}`, undefined, "joint");
-    await addAgent(local.id, fixture.agentId);
     const [joint] = await db.insert(jointChannels).values({
       canonicalChannelId: storage.id,
       createdByServerId: fixture.serverId,
@@ -1149,6 +1226,7 @@ test("agent-api task mine resolves channel visibility in a constant number of qu
       status: "active",
       joinedByUserId: fixture.ownerId,
     });
+    await addAgent(local.id, fixture.agentId);
     await assign(local.id, `joint ${label}`);
   };
   const seedBatch = async (label: string, size: number) => {
@@ -1200,7 +1278,7 @@ test("agent-api task mine resolves channel visibility in a constant number of qu
     else assert.match(task.channelRef ?? "", /^#count-(open|private|joint)-/, task.title);
   }
 });
-test("agent-api bulk task create wakes each recipient once while preserving every inbox fact", async ({ app }) => {
+test("agent-api bulk task create wakes each recipient once while preserving every inbox fact (task v2 off: visible task bodies)", async ({ app }) => {
   const fixture = await seedAuthFixture();
   const target = await createAgent(fixture.serverId, `batch-wake-${randomUUID().slice(0, 8)}`, {
     runtime: "claude",
@@ -1288,6 +1366,168 @@ test("agent-api bulk task create wakes each recipient once while preserving ever
     new Set(createdIds),
     "wake coalescing must not collapse the N durable inbox rows",
   );
+});
+
+
+test("agent-api bulk task create on a task v2 server delivers nothing to channel agents: no message, no created summary", async ({ app }) => {
+  const fixture = await seedAuthFixture();
+  await enableTaskV2ConversationsForServer(fixture.serverId);
+  const target = await createAgent(fixture.serverId, `batch-wake-${randomUUID().slice(0, 8)}`, {
+    runtime: "claude",
+    model: "sonnet",
+  });
+  await addAgent(fixture.channelId, target.id);
+
+  let targetAwake = false;
+  let wakeCount = 0;
+  const deliveredMessageIds: string[] = [];
+  const eventOrder: string[] = [];
+  const adapter = app.io.of("/").adapter as unknown as {
+    broadcast(packet: { data?: unknown[] }, opts: unknown): void;
+  };
+  const originalBroadcast = adapter.broadcast.bind(adapter);
+  adapter.broadcast = (packet, opts) => {
+    if (packet.data?.[0] === "task:created") eventOrder.push("task:created");
+    originalBroadcast(packet, opts);
+  };
+  const orchestrator = app.app.get("agentOrchestrator") as {
+    deliverMessage: (
+      agentId: string,
+      message: { message_id?: string },
+      options?: unknown,
+    ) => Promise<{ status: "queued"; reason: string }>;
+  };
+  orchestrator.deliverMessage = async (agentId, message) => {
+    if (agentId === target.id) {
+      if (deliveredMessageIds.length === 0) eventOrder.push("agent-delivery");
+      deliveredMessageIds.push(message.message_id ?? "");
+      if (!targetAwake) {
+        // Keep the inactive window open long enough that concurrent per-task
+        // fanout would deterministically attempt multiple wakes.
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        wakeCount += 1;
+        targetAwake = true;
+      }
+    }
+    return { status: "queued", reason: "test" };
+  };
+
+  // Task v2: a task always has a source; here the agent's own message.
+  const source = await createMessage(fixture.channelId, "agent", fixture.agentId, "splitting this into three tasks");
+  const create = await fetch(`${app.baseUrl}/internal/agent-api/tasks`, {
+    method: "POST",
+    headers: jsonHeaders(fixture.agentApiKey),
+    body: JSON.stringify({
+      channel: `#${fixture.channelName}`,
+      tasks: [
+        { title: "batch wake one", source_message_id: source.id },
+        { title: "batch wake two", source_message_id: source.id },
+        { title: "batch wake three", source_message_id: source.id },
+      ],
+    }),
+  });
+  const createText = await create.text();
+  assert.equal(create.status, 200, createText);
+  // Task v2 tasks have no message: `messageId` is the ref's tail (`#1`) for
+  // pre-v2 clients, so the facts check below covers every fact of the agent.
+  const createBody = JSON.parse(createText) as { tasks: Array<{ taskNumber: number; messageId: string }> };
+  assert.deepEqual(createBody.tasks.map((task) => task.messageId), createBody.tasks.map((task) => `#${task.taskNumber}`));
+
+  await new Promise((resolve) => setTimeout(resolve, 300));
+
+  // Task v2: creating a task posts nothing in the channel — no host message
+  // (each task owns its lazily created conversation) and no created summary — so a
+  // channel agent is neither delivered anything nor woken.
+  assert.equal(wakeCount, 0, "creating tasks does not wake channel agents");
+  assert.deepEqual(deliveredMessageIds, [], "no task message and no created summary is delivered");
+  assert.ok(eventOrder.includes("task:created"), "the task board still hears about the tasks");
+  const summaries = await getDb().select({ id: messages.id }).from(messages).where(and(
+    eq(messages.channelId, fixture.channelId),
+    eq(messages.systemSubtype, "task.created_summary"),
+  ));
+  assert.deepEqual(summaries, [], "no created summary in the channel");
+
+  const durableFacts = await getDb()
+    .select({ messageId: inboxNotificationFacts.messageId })
+    .from(inboxNotificationFacts)
+    .where(and(
+      eq(inboxNotificationFacts.receiverType, "agent"),
+      eq(inboxNotificationFacts.receiverId, target.id),
+    ));
+  assert.deepEqual(
+    durableFacts.map((fact) => fact.messageId),
+    [],
+    "task v2 creation records no inbox fact",
+  );
+});
+
+test("agent-api task create stores description and a short-id source message (task v2)", async ({ app }) => {
+  const fixture = await seedAuthFixture();
+  const source = await createMessage(fixture.channelId, "user", fixture.ownerId, "ship the launch page");
+  // Task v2 off (default): a source message is refused, nothing is created.
+  const refused = await fetch(`${app.baseUrl}/internal/agent-api/tasks`, {
+    method: "POST",
+    headers: jsonHeaders(fixture.agentApiKey),
+    body: JSON.stringify({ channel: `#${fixture.channelName}`, tasks: [{ title: "hero", source_message_id: source.id }] }),
+  });
+  assert.equal(refused.status, 403);
+  const refusedBody = await refused.json() as { code?: string; error?: string };
+  assert.equal(refusedBody.code, "task_v2_not_enabled");
+  assert.match(refusedBody.error ?? "", /not available on this server/);
+  assert.equal((await getDb().select().from(tasks).where(eq(tasks.channelId, fixture.channelId))).length, 0);
+  // A description alone is fine while off.
+  const described = await fetch(`${app.baseUrl}/internal/agent-api/tasks`, {
+    method: "POST",
+    headers: jsonHeaders(fixture.agentApiKey),
+    body: JSON.stringify({ channel: `#${fixture.channelName}`, tasks: [{ title: "plain", description: "details" }] }),
+  });
+  assert.equal(described.status, 200, await described.clone().text());
+  assert.equal((await getDb().select().from(tasks).where(eq(tasks.title, "plain")))[0]?.description, "details");
+
+  await enableTaskV2ConversationsForServer(fixture.serverId);
+  const create = await fetch(`${app.baseUrl}/internal/agent-api/tasks`, {
+    method: "POST",
+    headers: jsonHeaders(fixture.agentApiKey),
+    body: JSON.stringify({
+      channel: `#${fixture.channelName}`,
+      tasks: [
+        { title: "hero", description: "countdown + CTA", source_message_id: source.id.slice(0, 8) },
+        { title: "pricing", source_message_id: source.id },
+      ],
+    }),
+  });
+  const createText = await create.text();
+  assert.equal(create.status, 200, createText);
+  const rows = await getDb().select().from(tasks).where(eq(tasks.sourceMessageId, source.id));
+  assert.deepEqual(rows.map((row) => row.title).sort(), ["hero", "pricing"]);
+  assert.equal(rows.find((row) => row.title === "hero")?.description, "countdown + CTA");
+  // Task v2: each task owns its conversation, created lazily (like a thread)
+  // by the first action that needs it, so none exists right after creation.
+  assert.ok(rows.every((row) => row.ownConversation && row.conversationChannelId === null), "each task owns its (not yet created) conversation");
+  assert.ok(rows.every((row) => row.messageId === null), "task v2 tasks have no host message");
+
+  const missing = await fetch(`${app.baseUrl}/internal/agent-api/tasks`, {
+    method: "POST",
+    headers: jsonHeaders(fixture.agentApiKey),
+    body: JSON.stringify({ channel: `#${fixture.channelName}`, tasks: [{ title: "x", source_message_id: "00000000" }] }),
+  });
+  assert.equal(missing.status, 400);
+  assert.equal((await missing.json() as { code?: string }).code, "invalid_source_message");
+
+  // A malformed id (a line break, a flag, an over-long value) is never echoed into
+  // the sentence: still a 400 with the same code, a one-line sentence, no task.
+  for (const malformed of ["bad\nid", "--message-id", "x".repeat(400)]) {
+    const answer = await fetch(`${app.baseUrl}/internal/agent-api/tasks`, {
+      method: "POST",
+      headers: jsonHeaders(fixture.agentApiKey),
+      body: JSON.stringify({ channel: `#${fixture.channelName}`, tasks: [{ title: "malformed source", source_message_id: malformed }] }),
+    });
+    const body = await answer.json() as { code?: string; error?: string };
+    assert.equal(answer.status, 400, `${JSON.stringify(malformed)}: ${JSON.stringify(body)}`);
+    assert.equal(body.code, "invalid_source_message");
+    assert.ok(body.error && !/[\r\n]/.test(body.error) && !body.error.includes(malformed), body.error);
+  }
+  assert.equal((await getDb().select().from(tasks).where(eq(tasks.title, "malformed source"))).length, 0, "no task was created");
 });
 
 test("agent-api task create distinguishes self-start from member dispatch and preserves claim ownership", async ({ app }) => {
@@ -1413,6 +1653,7 @@ test("agent-api task create distinguishes self-start from member dispatch and pr
     tasks: Array<{
       taskNumber: number;
       messageId: string;
+      title: string;
       status: string;
       claimedById: string | null;
       claimedByType: string | null;
@@ -1584,6 +1825,7 @@ test("agent-api task create distinguishes self-start from member dispatch and pr
   assert.deepEqual((await claimByNumber.json() as { results: unknown[] }).results, [{
     taskNumber: dispatchBody.tasks[0]!.taskNumber,
     messageId: dispatchBody.tasks[0]!.messageId,
+    title: dispatchBody.tasks[0]!.title,
     success: true,
   }]);
   // v1.4: resolve by host message id, then read the state off the owning row.
@@ -1829,8 +2071,18 @@ test("assigned task creation is rollback-atomic and post-commit fanout failures 
       .where(eq(messageMentions.messageId, body.assignmentReceipt.messageId));
     assert.equal(receiptMentions.length, 1);
     assert.equal(receiptMentions[0]?.targetId, target.id);
-    assert.deepEqual(socketEvents, [], "the injected fanout failure occurs before every assigned-path emit");
+    // The notification outbox rows committed with the task, so the unified
+    // dispatcher delivers them whatever happened to the realtime fanout: a
+    // committed event must not lose its notification because an unrelated
+    // post-commit emit failed. Every other assigned-path emit stays absent.
+    await drainNotificationTasksForTests();
+    const fanoutEvents = socketEvents.filter((event) => !event.startsWith("notification:"));
+    assert.deepEqual(fanoutEvents, [], "the injected fanout failure occurs before every assigned-path emit");
     assert.deepEqual(deliveries, []);
+    const hostOutbox = await db.select().from(notificationOutbox)
+      .where(eq(notificationOutbox.messageId, postCommitHosts[0]!.id));
+    assert.ok(hostOutbox.length > 0, "the committed host message has its outbox rows");
+    for (const row of hostOutbox) assert.notEqual(row.status, "pending", "the committed notification was dispatched");
   } finally {
     __resetFailpointsForTests();
     await app.close();
@@ -2352,7 +2604,8 @@ test("agent-api and legacy history conserve a caller-authored newest row and rep
     assert.deepEqual(beforeBody.messages.map((message) => message.id), [second.id], `${endpoint.label} before page`);
     assert.equal(beforeBody.has_more, true, `${endpoint.label} before has_more`);
     assert.equal(beforeBody.has_older, true, `${endpoint.label} before has_older`);
-    assert.equal(beforeBody.has_newer, false, `${endpoint.label} before has_newer`);
+    // The anchor (third) is newer than the page: a --before page says so.
+    assert.equal(beforeBody.has_newer, true, `${endpoint.label} before has_newer`);
   }
 });
 
@@ -2657,6 +2910,24 @@ test("agent-api mentions uses a limit-plus-one probe for has_more", async ({ app
   assert.equal(overBody.has_more, true);
 });
 
+test("an unknown agent key is traced by a hash of its prefix, never the key", async ({ app }) => {
+  const sink = new MemoryTraceSink();
+  app.app.set("serverTracer", new BasicTracer({ sink }));
+  const unknownKey = "sk_agent_unknownunknownunknownunknown";
+
+  const res = await fetch(`${app.baseUrl}/internal/agent-api/server`, {
+    headers: { Authorization: `Bearer ${unknownKey}` },
+  });
+  assert.equal(res.status, 401);
+
+  const [span] = sink.getAllSpans().filter((candidate) => candidate.name === "server.http.request");
+  assert.ok(span);
+  const lookup = span.events.find((event) => event.name === "agent_credential_auth.credential_lookup.finished");
+  assert.equal(lookup?.attrs?.candidate_count, 0);
+  assert.ok(lookup?.attrs?.key_prefix_hash);
+  assert.equal(JSON.stringify(span).includes(unknownKey.slice(0, 16)), false);
+});
+
 test("agent credential auth records phase traces", async ({ app }) => {
   const sink = new MemoryTraceSink();
   app.app.set("serverTracer", new BasicTracer({ sink }));
@@ -2936,7 +3207,7 @@ test("agent-api integration login uses service-aware defaults and closes invalid
   assert.equal(invalidLogin.status, 400);
   const invalidBody = await invalidLogin.json() as { error?: string; errorCode?: string };
   assert.equal(invalidBody.errorCode, "INVALID_SCOPE");
-  assert.match(invalidBody.error ?? "", /not allowed for this service/);
+  assert.match(invalidBody.error ?? "", /doesn't offer one of the scopes you asked for/);
 
   const routeSpans = sink.getAllSpans().filter((span) =>
     span.name === "server.http.request"
@@ -3305,6 +3576,8 @@ test("agent-api installed private and published global apps grant agent access w
     serverId: fixture.serverId,
     clientId: client.id,
     installedByUserId: fixture.ownerId,
+    // Installed with the app's default login scopes approved (task #2).
+    approvedScopes: ["openid", "profile", "identity"],
   });
 
   const loginResponse = await fetch(`${app.baseUrl}/internal/agent-api/integrations/login`, {
@@ -3361,6 +3634,7 @@ test("agent-api installed private and published global apps grant agent access w
     serverId: fixture.serverId,
     clientId: publishedClient.id,
     installedByUserId: fixture.ownerId,
+    approvedScopes: ["openid", "profile", "identity"],
   });
 
   const publishedLogin = await fetch(`${app.baseUrl}/internal/agent-api/integrations/login`, {
@@ -3403,7 +3677,75 @@ test("generic action prepare rejects integration approval cards", async ({ app }
   assert.equal(res.status, 400);
   const body = await res.json() as { errorCode?: string; error?: string };
   assert.equal(body.errorCode, "ACTION_TYPE_NOT_PREPARABLE");
-  assert.match(body.error ?? "", /raft integration commands/);
+  assert.match(body.error ?? "", /the integration commands create them/);
+});
+
+test("generic action prepare rejects MCP connection cards", async ({ app }) => {
+  // Only ensureMcpConnectionCard may raise this card. Through the generic route an agent could
+  // name ANOTHER agent as the beneficiary and skip the one-open-card-per-(agent, App) dedupe.
+  const fixture = await seedAuthFixture();
+  await updateAgentScopes({
+    agentId: fixture.agentId,
+    scopes: ["action:prepare"],
+    updatedByUserId: fixture.ownerId,
+  });
+
+  const res = await fetch(`${app.baseUrl}/internal/agent-api/prepare-action`, {
+    method: "POST",
+    headers: jsonHeaders(fixture.agentApiKey),
+    body: JSON.stringify({
+      target: "#agent-api-auth-room",
+      action: {
+        type: "integration:connect_mcp",
+        mcpServerId: randomUUID(),
+        agentId: randomUUID(),
+        reason: "login_required",
+        revision: 0,
+      },
+    }),
+  });
+
+  assert.equal(res.status, 400);
+  const body = await res.json() as { errorCode?: string; error?: string };
+  assert.equal(body.errorCode, "ACTION_TYPE_NOT_PREPARABLE");
+});
+
+test("generic action prepare leaves the card to prepareActionCard: an unknown type or a bad field is its refusal, not the contract's", async ({ app }) => {
+  // A client (a Computer's CLI that does not update itself) sends card types
+  // and fields it does not know; the Agent API body checks only the `type`.
+  const fixture = await seedAuthFixture();
+  await updateAgentScopes({
+    agentId: fixture.agentId,
+    scopes: ["action:prepare"],
+    updatedByUserId: fixture.ownerId,
+  });
+  const prepare = (action: unknown) => fetch(`${app.baseUrl}/internal/agent-api/prepare-action`, {
+    method: "POST",
+    headers: jsonHeaders(fixture.agentApiKey),
+    body: JSON.stringify({ target: "#agent-api-auth-room", action }),
+  });
+
+  for (const [action, field] of [
+    [{ type: "future:card", title: "Plan the offsite" }, 'type: unknown card type "future:card"'],
+    [{ type: "channel:add_member", channel: "#agent-api-auth-room" }, "action: channel:add_member must include at least one human or agent"],
+    [{ type: "channel:create", name: "" }, "name: "],
+  ] as const) {
+    const res = await prepare(action);
+    const text = await res.text();
+    assert.equal(res.status, 400, text);
+    // The agent's own card: prepareActionCard's INVALID_ACTION, naming the field.
+    const body = JSON.parse(text) as { errorCode?: string; error?: string; suggestedNextAction?: string };
+    assert.equal(body.errorCode, "INVALID_ACTION", text);
+    assert.ok(body.error?.includes(field), text);
+    assert.ok(body.suggestedNextAction?.startsWith(`Fix these fields and run it again: ${field}`), text);
+  }
+  // A card without a type is still the contract's refusal.
+  const untyped = await prepare({ name: "no-type" });
+  assert.equal(untyped.status, 400);
+  assert.equal(((await untyped.json()) as { code?: string }).code, "agent_api_contract_invalid");
+
+  const cards = await getDb().select({ id: actionCards.id }).from(actionCards).where(eq(actionCards.requesterAgentId, fixture.agentId));
+  assert.deepEqual(cards, [], "nothing was prepared");
 });
 
 test("generic action prepare can post to a DM thread target", async ({ app }) => {
@@ -3533,6 +3875,61 @@ test("agent-api integration app prepare rejects invalid scopes and categories be
       eq(actionCards.actionType, "integration:register_app"),
     ));
   assert.equal(preparedCards.length, 0, "invalid metadata must not leave a prepared action card");
+});
+
+// artin, #proj-apps:#57: a card's client id is fixed when it is prepared, with
+// nothing random added, so the person approving sees the exact id.
+test("agent-api integration app prepare fixes the client id from the name, and refuses one it can't use", async ({ app }) => {
+  const fixture = await seedAuthFixture();
+  const prepare = (body: Record<string, unknown>) => fetch(`${app.baseUrl}/internal/agent-api/integrations/app/prepare`, {
+    method: "POST",
+    headers: jsonHeaders(fixture.agentApiKey),
+    body: JSON.stringify({ mode: "register", target: "#agent-api-auth-room", returnUrl: "https://client-id.example.test/auth/raft/callback", ...body }),
+  });
+  const cards = () => getDb().select({ id: actionCards.id }).from(actionCards).where(and(
+    eq(actionCards.serverId, fixture.serverId),
+    eq(actionCards.actionType, "integration:register_app"),
+  ));
+
+  const named = await prepare({ name: "Weekly Sync  Tool!" });
+  const namedBody = await named.json() as { action?: { clientKey?: string } };
+  assert.equal(named.status, 201, JSON.stringify(namedBody));
+  assert.equal(namedBody.action?.clientKey, "weekly-sync-tool", "the name as it is, nothing random added");
+
+  const chosen = await prepare({ name: "Weekly Sync Tool", clientKey: "my-chosen-id" });
+  assert.equal(chosen.status, 201);
+  assert.equal(((await chosen.json()) as { action?: { clientKey?: string } }).action?.clientKey, "my-chosen-id");
+  assert.equal((await cards()).length, 2);
+
+  await createOAuthClient({ serverId: fixture.serverId, createdByUserId: fixture.ownerId, clientId: "already-held", name: "Already Held" });
+
+  const taken = await prepare({ name: "Already Held" });
+  assert.equal(taken.status, 409);
+  const takenBody = await taken.json() as { errorCode?: string; error?: string };
+  assert.equal(takenBody.errorCode, "CLIENT_KEY_TAKEN");
+  assert.match(takenBody.error ?? "", /"already-held" is already taken/);
+
+  const takenChosen = await prepare({ name: "Something Else", clientKey: "already-held" });
+  assert.equal(takenChosen.status, 409);
+  const takenOtherCase = await prepare({ name: "Something Else", clientKey: "Already-Held" });
+  assert.equal(takenOtherCase.status, 409, "compared as it would be stored");
+
+  const mixedCase = await prepare({ name: "Something Else", clientKey: "Mixed-Case-Id" });
+  assert.equal(((await mixedCase.json()) as { action?: { clientKey?: string } }).action?.clientKey, "mixed-case-id", "the card shows the id that will exist");
+
+  for (const invalid of ["my app", "ab", "1abc", "x".repeat(65)]) {
+    const refused = await prepare({ name: "Something Else", clientKey: invalid });
+    assert.equal(refused.status, 400, invalid);
+    assert.equal(((await refused.json()) as { errorCode?: string }).errorCode, "INVALID_CLIENT_KEY", invalid);
+  }
+
+  const noLatin = await prepare({ name: "微信任务事件桥" });
+  assert.equal(noLatin.status, 400);
+  assert.equal(((await noLatin.json()) as { errorCode?: string }).errorCode, "CLIENT_KEY_REQUIRED");
+
+  const noLatinChosen = await prepare({ name: "微信任务事件桥", clientKey: "wechat-task-bridge" });
+  assert.equal(noLatinChosen.status, 201);
+  assert.equal((await cards()).length, 4, "a refused card leaves nothing prepared");
 });
 
 test("agent-api rejects the legacy app update-card path in favor of owner-direct update", async ({ app }) => {
@@ -3958,7 +4355,7 @@ test("agent-api integration app exposes installationId strictly for current serv
   assert.equal(installedAdminApp.installationId, currentInstall.id);
 });
 
-test("agent-api integration app prepare register can defer client key generation", async ({ app }) => {
+test("agent-api integration app prepare register without a client key: the card carries the name's id, and that exact id is created", async ({ app }) => {
   const fixture = await seedAuthFixture();
 
   const prepare = await fetch(`${app.baseUrl}/internal/agent-api/integrations/app/prepare`, {
@@ -3981,7 +4378,7 @@ test("agent-api integration app prepare register can defer client key generation
   assert.equal(prepareBody.status, "prepared");
   assert.ok(prepareBody.actionCardMessageId);
   assert.equal(prepareBody.action?.type, "integration:register_app");
-  assert.equal(prepareBody.action?.clientKey, undefined);
+  assert.equal(prepareBody.action?.clientKey, "generated-demo");
   assert.equal(prepareBody.action?.returnUrl, "https://generated.example.test/auth/raft/callback");
 
   const ownerToken = await login(app.baseUrl, fixture.ownerEmail);
@@ -4002,7 +4399,7 @@ test("agent-api integration app prepare register can defer client key generation
   assert.equal(executeBody.metadata?.state, "executed");
   assert.equal(executeBody.metadata?.result?.kind, "integration-app-registration");
   assert.equal(executeBody.metadata?.result?.mode, "register");
-  assert.match(generatedKey ?? "", /^generated-demo-[a-f0-9]{6}$/);
+  assert.equal(generatedKey, "generated-demo", "nothing is added after a person approves");
   assert.equal(containsOAuthSecret(executeBody.metadata), false);
 
   const [client] = await getDb()
@@ -4086,19 +4483,107 @@ test("agent-api cannot self-join joint channels", async ({ app }) => {
     "joint",
   );
 
+  // A joint channel the agent is not in is invisible to it: 404, the same
+  // answer as an id that does not exist (#wg-rbac B14).
   const join = await fetch(`${app.baseUrl}/internal/agent-api/channels/${jointChannel.id}/join`, {
     method: "POST",
     headers: jsonHeaders(fixture.agentApiKey),
   });
-  assert.equal(join.status, 403, `expected 403, got ${join.status}`);
-  const body = (await join.json()) as { error?: string };
-  assert.match(body.error ?? "", /Joint channels require an invitation/);
+  assert.equal(join.status, 404, `expected 404, got ${join.status}`);
+  const body = (await join.json()) as { code?: string };
+  assert.equal(body.code, "channel_not_found");
 
   const rows = await getDb()
     .select({ channelId: channelAgents.channelId })
     .from(channelAgents)
     .where(and(eq(channelAgents.channelId, jointChannel.id), eq(channelAgents.agentId, fixture.agentId)));
   assert.equal(rows.length, 0, "agent-api join must not add channel_agents rows for joint channels");
+});
+
+test("agent-api join on a joint channel the agent can see keeps the joint refusal", async ({ app }) => {
+  const fixture = await seedAuthFixture();
+  const jointChannel = await createChannel(
+    fixture.serverId,
+    `agent-api-joint-visible-${randomUUID()}`,
+    "joint visible",
+    "joint",
+  );
+  // A real joint projection, so the agent's membership makes it visible.
+  const db = getDb();
+  const [jointStorageServer] = await db.insert(serversTable).values({
+    name: "Joint Visible Storage",
+    slug: `joint-visible-storage-${randomUUID()}`,
+    kind: "joint_storage",
+    ownerId: fixture.ownerId,
+    plan: "founder",
+    agentAllChannelGreetingEnabled: false,
+  }).returning();
+  const jointStorageChannel = await createChannel(jointStorageServer.id, `joint-visible-storage-${randomUUID().slice(0, 8)}`);
+  const [joint] = await db.insert(jointChannels).values({
+    canonicalChannelId: jointStorageChannel.id,
+    createdByServerId: fixture.serverId,
+    createdByUserId: fixture.ownerId,
+  }).returning();
+  await db.insert(jointChannelServers).values({
+    jointChannelId: joint.id,
+    serverId: fixture.serverId,
+    localChannelId: jointChannel.id,
+    role: "host",
+    status: "active",
+    joinedByUserId: fixture.ownerId,
+  });
+  await addAgent(jointChannel.id, fixture.agentId);
+
+  const join = await fetch(`${app.baseUrl}/internal/agent-api/channels/${jointChannel.id}/join`, {
+    method: "POST",
+    headers: jsonHeaders(fixture.agentApiKey),
+  });
+  assert.equal(join.status, 403, `expected 403, got ${join.status}`);
+  const body = (await join.json()) as { error?: string };
+  assert.match(body.error ?? "", /You can't join this channel yourself\. Ask someone from your server who's in it to add you\./);
+});
+
+test("agent channel directories skip orphan joint membership and keep valid channels", async ({ app }) => {
+  const fixture = await seedAuthFixture();
+  const db = getDb();
+  const active = await createChannel(fixture.serverId, `valid-joint-${randomUUID()}`, undefined, "joint");
+  const orphan = await createChannel(fixture.serverId, `orphan-joint-${randomUUID()}`, undefined, "joint");
+  const canonical = await createChannel(fixture.serverId, `joint-storage-${randomUUID()}`);
+  const [joint] = await db.insert(jointChannels).values({
+    canonicalChannelId: canonical.id,
+    createdByServerId: fixture.serverId,
+    createdByUserId: fixture.ownerId,
+  }).returning();
+  await db.insert(jointChannelServers).values({
+    jointChannelId: joint.id,
+    serverId: fixture.serverId,
+    localChannelId: active.id,
+    role: "host",
+    joinedByUserId: fixture.ownerId,
+  });
+  await addHuman(active.id, fixture.ownerId);
+  await addAgent(active.id, fixture.agentId);
+  // Historical inconsistent data: today's addAgent correctly rejects an orphan.
+  await db.insert(channelAgents).values({ channelId: orphan.id, agentId: fixture.agentId });
+  await db.insert(channelHumans).values({ channelId: orphan.id, userId: fixture.ownerId });
+  await assert.rejects(() => addAgent(orphan.id, fixture.agentId), /Channel capability required/);
+
+  const directory = await fetch(`${app.baseUrl}/internal/agent-api/server`, {
+    headers: jsonHeaders(fixture.agentApiKey),
+  });
+  assert.equal(directory.status, 200);
+  const body = await directory.json() as { channels: Array<{ id: string }> };
+  assert.ok(body.channels.some(channel => channel.id === fixture.channelId));
+  assert.ok(body.channels.some(channel => channel.id === active.id));
+  assert.ok(!body.channels.some(channel => channel.id === orphan.id));
+
+  const memberships = await fetch(`${app.baseUrl}/internal/agent-api/users/${fixture.ownerName}/channels`, {
+    headers: jsonHeaders(fixture.agentApiKey),
+  });
+  assert.equal(memberships.status, 200);
+  const memberBody = await memberships.json() as { memberships: Array<{ id: string }> };
+  assert.ok(memberBody.memberships.some(channel => channel.id === active.id));
+  assert.ok(!memberBody.memberships.some(channel => channel.id === orphan.id));
 });
 
 test("agent-api attachment upload uses the id-less route and bound agent identity", async () => {
@@ -4109,7 +4594,7 @@ test("agent-api attachment upload uses the id-less route and bound agent identit
   process.env.UPLOADS_LOCAL = "true";
   resetStorageForTests();
 
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const fixture = await seedAuthFixture();
     const uploadBody = new FormData();
@@ -4147,9 +4632,15 @@ test("agent-api attachment upload uses the id-less route and bound agent identit
     assert.equal(row.channelId, fixture.channelId);
     assert.equal(row.uploaderId, fixture.agentId);
     assert.equal(row.uploaderType, "agent");
-    assert.ok(row.storageKey.startsWith(`${ATTACHMENT_STORAGE_KEY_PREFIX}${fixture.serverId}/server/${body.id}/`));
-    assert.ok(row.storageKey.endsWith(".txt"));
-    assert.equal(fs.existsSync(path.join(uploadsDir, row.storageKey)), true);
+    const [object] = await getDb()
+      .select()
+      .from(attachmentObjects)
+      .where(eq(attachmentObjects.id, row.objectId))
+      .limit(1);
+    assert.ok(object, "uploaded attachment object row should be inserted");
+    assert.ok(object.storageKey.startsWith(`${ATTACHMENT_STORAGE_KEY_PREFIX}${fixture.serverId}/server/${body.id}/`));
+    assert.ok(object.storageKey.endsWith(".txt"));
+    assert.equal(fs.existsSync(path.join(uploadsDir, object.storageKey)), true);
   } finally {
     await app.close();
     resetStorageForTests();
@@ -4190,7 +4681,7 @@ test("agent-api exposes server-owned upload capability and binds direct sessions
       return { status: 200, body: { uploadId, state: "pending", expiresAt: "2026-07-27T08:00:00.000Z", attachment: null, terminalReason: null } };
     },
   };
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false, attachmentUploadSessionService: fake });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, attachmentUploadSessionService: fake });
   try {
     const fixture = await seedAuthFixture();
     const headers = jsonHeaders(fixture.agentApiKey);
@@ -4248,7 +4739,7 @@ test("agent-api attachment download serves unicode pdf filenames", async () => {
   process.env.UPLOADS_LOCAL = "true";
   resetStorageForTests();
 
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const fixture = await seedAuthFixture();
     const pdfId = "00000000-0000-4000-8000-000000000099";
@@ -4258,7 +4749,7 @@ test("agent-api attachment download serves unicode pdf filenames", async () => {
     fs.writeFileSync(path.join(storageDir, `${pdfId}.pdf`), pdfBuffer);
 
     const db = getDb();
-    await db.insert(attachments).values({
+    await insertLinkedAttachmentsWithObjects({
       id: pdfId,
       channelId: fixture.channelId,
       uploaderId: fixture.agentId,
@@ -4300,7 +4791,7 @@ test("agent-api attachment download redirects only after cloaked access and keep
     const attachmentId = randomUUID();
     const privateAttachmentId = randomUUID();
     const payload = Buffer.from("agent attachment direct-download bytes");
-    await getDb().insert(attachments).values({
+    await insertLinkedAttachmentsWithObjects({
       id: attachmentId,
       channelId: fixture.channelId,
       uploaderId: fixture.agentId,
@@ -4320,7 +4811,7 @@ test("agent-api attachment download redirects only after cloaked access and keep
       "private",
     );
     await addHuman(privateChannel.id, fixture.ownerId);
-    await getDb().insert(attachments).values({
+    await insertLinkedAttachmentsWithObjects({
       id: privateAttachmentId,
       channelId: privateChannel.id,
       uploaderId: fixture.ownerId,
@@ -4430,7 +4921,7 @@ test("agent-api attachment download allows linked joint attachments through the 
   process.env.UPLOADS_LOCAL = "true";
   resetStorageForTests();
 
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const db = getDb();
     const suffix = randomUUID();
@@ -4460,8 +4951,6 @@ test("agent-api attachment download allows linked joint attachments through the 
     const canonical = await createChannel(hostServer.id, `joint-storage-${suffix}`, undefined, "channel");
     const hostProjection = await createChannel(hostServer.id, `joint-host-${suffix}`, undefined, "joint");
     const peerProjection = await createChannel(peerServer.id, `joint-peer-${suffix}`, undefined, "joint");
-    await addAgent(hostProjection.id, hostAgent.id);
-    await addAgent(peerProjection.id, peerAgent.id);
 
     const [joint] = await db.insert(jointChannels).values({
       canonicalChannelId: canonical.id,
@@ -4484,6 +4973,8 @@ test("agent-api attachment download allows linked joint attachments through the 
         joinedByUserId: peerOwner.id,
       },
     ]);
+    await addAgent(hostProjection.id, hostAgent.id);
+    await addAgent(peerProjection.id, peerAgent.id);
 
     const message = await createMessage(canonical.id, "agent", hostAgent.id, "joint attachment from host agent");
     const attachmentId = "00000000-0000-4000-8000-000000000199";
@@ -4494,7 +4985,7 @@ test("agent-api attachment download allows linked joint attachments through the 
     fs.writeFileSync(path.join(storageDir, `${attachmentId}.txt`), payload);
     fs.writeFileSync(path.join(storageDir, `${draftAttachmentId}.txt`), payload);
 
-    await db.insert(attachments).values([
+    await insertAttachmentsWithObjects(getDb(), [
       {
         id: attachmentId,
         messageId: message.id,
@@ -4555,7 +5046,7 @@ test("agent-api attachment download releases its real upstream Agent socket when
       "agent API hanging attachment",
     );
     const attachmentId = randomUUID();
-    await getDb().insert(attachments).values({
+    await insertLinkedAttachmentsWithObjects({
       id: attachmentId,
       messageId: message.id,
       channelId: fixture.channelId,
@@ -4623,8 +5114,6 @@ test("agent-api history scrubs forwarded source pointers for peer joint agents",
   const peerProjection = await createChannel(peerServer.id, `forward-peer-${suffix}`, undefined, "joint");
   await addAgent(source.id, hostAgent.id);
   await addAgent(privateSource.id, hostAgent.id);
-  await addAgent(hostProjection.id, hostAgent.id);
-  await addAgent(peerProjection.id, peerAgent.id);
 
   const [joint] = await db.insert(jointChannels).values({
     canonicalChannelId: canonical.id,
@@ -4647,6 +5136,8 @@ test("agent-api history scrubs forwarded source pointers for peer joint agents",
       joinedByUserId: peerOwner.id,
     },
   ]);
+  await addAgent(hostProjection.id, hostAgent.id);
+  await addAgent(peerProjection.id, peerAgent.id);
 
   const sourceMessage = await createMessage(source.id, "agent", hostAgent.id, "source only host agents can open");
   const privateSourceMessage = await createMessage(
@@ -4734,17 +5225,17 @@ test("agent-api history scrubs forwarded source pointers for peer joint agents",
   };
   const forwardedItems = body.messages.find((message) => message.id === forwarded.id)?.actionMetadata?.forwardedItems ?? [];
   const item = forwardedItems[0];
-  assert.equal(item?.sourceServerId, null);
-  assert.equal(item?.sourceTargetId, null);
-  assert.equal(item?.sourceMessageId, null);
+  assert.equal(Object.hasOwn(item ?? {}, "sourceServerId"), false, "sourceServerId is removed, not null");
+  assert.equal(Object.hasOwn(item ?? {}, "sourceTargetId"), false, "sourceTargetId is removed, not null");
+  assert.equal(Object.hasOwn(item ?? {}, "sourceMessageId"), false, "sourceMessageId is removed, not null");
   assert.equal(item?.sourceTargetSnapshot.id, null);
   assert.equal(item?.sourceTargetSnapshot.label, "");
   assert.equal(item?.sourceTargetSnapshot.labelVisibility, "restricted");
   assert.equal(item?.provenanceState, "original_unavailable");
   const privateItem = forwardedItems[1];
-  assert.equal(privateItem?.sourceServerId, null);
-  assert.equal(privateItem?.sourceTargetId, null);
-  assert.equal(privateItem?.sourceMessageId, null);
+  assert.equal(Object.hasOwn(privateItem ?? {}, "sourceServerId"), false, "sourceServerId is removed, not null");
+  assert.equal(Object.hasOwn(privateItem ?? {}, "sourceTargetId"), false, "sourceTargetId is removed, not null");
+  assert.equal(Object.hasOwn(privateItem ?? {}, "sourceMessageId"), false, "sourceMessageId is removed, not null");
   assert.equal(privateItem?.sourceTargetSnapshot.id, null);
   assert.equal(privateItem?.sourceTargetSnapshot.label, "");
   assert.equal(privateItem?.sourceTargetSnapshot.labelVisibility, "restricted");
@@ -4912,7 +5403,7 @@ test("agent-api attachment download cloaks inaccessible attachment ids", async (
     "private attachment holder",
   );
   const privateAttachmentId = randomUUID();
-  await getDb().insert(attachments).values({
+  await insertLinkedAttachmentsWithObjects({
     id: privateAttachmentId,
     messageId: privateMessage.id,
     channelId: privateChannel.id,
@@ -4976,10 +5467,37 @@ test("computer surface accepts phase-one machine alias for runner credential min
   });
   assert.equal(res.status, 201);
   assert.equal(res.headers.get("Sec-Slock-Api-Version"), "1");
-  const body = await res.json() as { apiKey?: string; scopes?: string[]; agentId?: string };
+  const body = await res.json() as { apiKey?: string; scopes?: string[]; agentId?: string; credentialId?: string };
   assert.ok(body.apiKey?.startsWith("sk_agent_"));
   assert.deepEqual(body.scopes, ["read"]);
   assert.equal(body.agentId, fixture.agentId);
+  // No device session issued a legacy machine key: the credential carries no session family.
+  const [row] = await getDb()
+    .select({ family: agentCredentials.issuedBySessionFamilyId })
+    .from(agentCredentials)
+    .where(eq(agentCredentials.id, body.credentialId!));
+  assert.equal(row?.family, null);
+});
+
+test("computer surface refuses a migrated machine alias before the runner mint", async ({ app }) => {
+  const fixture = await seedAuthFixture();
+  await getDb()
+    .update(machines)
+    .set({ legacyKeyMigratedAt: new Date() })
+    .where(eq(machines.id, fixture.machineId));
+
+  const res = await fetch(`${app.baseUrl}/internal/computer/runners/${fixture.agentId}/credentials`, {
+    method: "POST",
+    headers: jsonHeaders(fixture.machineApiKey),
+    body: JSON.stringify({ scopes: ["read"], name: "migrated-alias-mint" }),
+  });
+  assert.equal(res.status, 401);
+  assert.equal((await res.json() as { code?: string }).code, "legacy_machine_key_migrated");
+  const minted = await getDb()
+    .select({ id: agentCredentials.id })
+    .from(agentCredentials)
+    .where(and(eq(agentCredentials.agentId, fixture.agentId), eq(agentCredentials.name, "migrated-alias-mint")));
+  assert.deepEqual(minted, []);
 });
 
 test("computer surface revokes managed-runner credential and raw sk_agent stops authenticating", async ({ app }) => {
@@ -5057,7 +5575,7 @@ test("agent-api task claim reports already claimed by you for self-claim", async
   });
   assert.equal(firstClaim.status, 200);
   assert.deepEqual((await firstClaim.json() as { results?: unknown[] }).results, [
-    { taskNumber: task.taskNumber, messageId: task.messageId, success: true },
+    { taskNumber: task.taskNumber, messageId: task.messageId, title: "self claim route", success: true },
   ]);
 
   const secondClaim = await fetch(`${app.baseUrl}/internal/agent-api/tasks/claim`, {
@@ -5151,7 +5669,7 @@ test("agent-api rejects thread-target task claims without throwing 5xx", async (
 
   assert.equal(claim.status, 409);
   const body = await claim.json() as { error?: string };
-  assert.equal(body.error, "Thread messages cannot be claimed as tasks");
+  assert.equal(body.error, "A thread holds no tasks, so its messages can't be claimed as tasks: claim tasks in the thread's channel instead.");
 
   const [unchangedReply] = await getDb().select().from(messages).where(eq(messages.id, reply.id));
   assert.equal(unchangedReply?.taskStatus, null);
@@ -5495,7 +6013,7 @@ test("agent-api message resolve is registered and gated by read capability", asy
   assert.equal(syntheticSystemEventId.status, 404);
   const syntheticBody = await syntheticSystemEventId.json() as { errorCode?: string; error?: string };
   assert.equal(syntheticBody.errorCode, "NOT_FOUND");
-  assert.match(syntheticBody.error ?? "", /Message not found/);
+  assert.match(syntheticBody.error ?? "", /no message you can see has that id/);
 
   const noReadKey = await mintAgentKey(fixture.agentId, ["send"]);
   const noRead = await fetch(`${app.baseUrl}/internal/agent-api/messages/${message.id}/resolve`, {
@@ -5535,7 +6053,6 @@ test("agent-api message resolve projects joint storage messages to the local cha
   const peerProjection = await createChannel(fixture.serverId, "shared-resolve-room", undefined, "joint");
   await addHuman(hostProjection.id, hostOwner.id);
   await addHuman(peerProjection.id, fixture.ownerId);
-  await addAgent(peerProjection.id, fixture.agentId);
 
   const [joint] = await db.insert(jointChannels).values({
     canonicalChannelId: canonical.id,
@@ -5558,6 +6075,7 @@ test("agent-api message resolve projects joint storage messages to the local cha
       joinedByUserId: fixture.ownerId,
     },
   ]);
+  await addAgent(peerProjection.id, fixture.agentId);
 
   const message = await createMessage(canonical.id, "user", hostOwner.id, "joint storage resolve target");
 
@@ -5612,7 +6130,7 @@ test("agent-api message resolve computes short-id ambiguity only across visible 
   assert.equal(inaccessibleCollision.status, 404);
   const inaccessibleBody = await inaccessibleCollision.json() as { errorCode?: string; error?: string };
   assert.equal(inaccessibleBody.errorCode, "NOT_FOUND");
-  assert.match(inaccessibleBody.error ?? "", /Message not found/);
+  assert.match(inaccessibleBody.error ?? "", /no message you can see has that id/);
 
   const [visible] = await getDb().insert(messages).values({
     id: "bbbbbbbb-3333-4333-8333-333333333333",
@@ -5639,7 +6157,8 @@ test("agent-api history around resolves anchors and fails closed on bad anchors"
     fixture.ownerId,
     "agent-api around target",
   );
-  const createdAt = new Date("2026-06-27T07:36:19.123Z");
+  // A day ago, with milliseconds: inside the Free plan's 30-day history window.
+  const createdAt = new Date(Math.floor(Date.now() / 1000) * 1000 - 24 * 60 * 60 * 1000 + 123);
   await getDb().update(messages).set({ createdAt }).where(eq(messages.id, message.id));
   const channelRef = encodeURIComponent(`#${fixture.channelName}`);
 
@@ -5699,7 +6218,7 @@ test("agent-api history around resolves anchors and fails closed on bad anchors"
   assert.equal(invalid.status, 400);
   const invalidBody = await invalid.json() as { errorCode?: string; error?: string };
   assert.equal(invalidBody.errorCode, "INVALID_ARG");
-  assert.match(invalidBody.error ?? "", /seq, full UUID, or 8-character short id/);
+  assert.match(invalidBody.error ?? "", /isn't a seq number, a full message UUID or an 8-character short id/);
 });
 
 test("agent-api history keeps 8-digit pagination seqs distinct from around short ids", async ({ app }) => {
@@ -5751,6 +6270,19 @@ test("agent-api history keeps 8-digit pagination seqs distinct from around short
   assert.equal(before.status, 200);
   const beforeBody = await before.json() as { messages?: unknown[] };
   assert.equal(beforeBody.messages?.length, 1);
+  // An 8-digit seq that is no message's short id reads as a seq for `around`
+  // too: the "Older:"/"Newer:" lines print seqs (Cindy 10-30: it was a 404).
+  for (const endpoint of [
+    { label: "agent-api", path: "/internal/agent-api/history", headers: jsonHeaders(fixture.readOnlyApiKey) },
+    { label: "legacy", path: `/internal/agent/${fixture.agentId}/history`, headers: jsonHeaders(fixture.machineApiKey) },
+  ]) {
+    const aroundSeq = await fetch(`${app.baseUrl}${endpoint.path}?channel=${channelRef}&around=10018628&limit=1`, {
+      headers: endpoint.headers,
+    });
+    assert.equal(aroundSeq.status, 200, `${endpoint.label} around=<8-digit seq> status`);
+    const aroundSeqBody = await aroundSeq.json() as { messages?: Array<{ id?: string }> };
+    assert.equal(aroundSeqBody.messages?.[0]?.id, afterTarget.id, `${endpoint.label} around=<8-digit seq> window`);
+  }
 });
 
 test("agent-api reactions cloak private message existence before system-message checks", async ({ app }) => {
@@ -5875,6 +6407,8 @@ test("agent-api reactions add idempotently and remove for the bound runner agent
     count: 1,
     reactorIds: [fixture.agentId],
     reactorNames: ["AgentApiAuthBot"],
+    // Typed for agents (#wg-ax:#26): who reacted, by handle and kind.
+    reactors: [{ name: "AgentApiAuthBot", kind: "agent" }],
   }]);
 
   const second = await add();
@@ -5910,7 +6444,6 @@ test("agent-api reactions reject a joint channel past its over-limit grace", asy
     "joint",
   );
   await addHuman(jointProjection.id, fixture.ownerId);
-  await addAgent(jointProjection.id, fixture.agentId);
   // Contract v0.3 §18.8: observed over the free-server cap more than 3 days ago.
   // Same shape as the other agent-api joint fixtures: the projection doubles
   // as the storage channel so the agent's membership check passes first.
@@ -5927,6 +6460,7 @@ test("agent-api reactions reject a joint channel past its over-limit grace", asy
     role: "host",
     joinedByUserId: fixture.ownerId,
   });
+  await addAgent(jointProjection.id, fixture.agentId);
   const message = await createMessage(
     jointProjection.id,
     "user",
@@ -5947,6 +6481,68 @@ test("agent-api reactions reject a joint channel past its over-limit grace", asy
     .from(messageReactions)
     .where(eq(messageReactions.messageId, message.id));
   assert.equal(persisted.length, 0);
+});
+
+test("agent-api reactions reach a Joint Channel message through the agent's own server's copy", async ({ app }) => {
+  // The fixture's server joins a Joint Channel hosted elsewhere; the message
+  // lives in canonical storage, so the agent holds it through its projection.
+  const fixture = await seedAuthFixture();
+  const hostServer = await createServer("Agent API Joint Host", `agent-api-joint-host-${randomUUID()}`, fixture.ownerId);
+  const hostAgent = await createAgent(hostServer.id, "AgentApiJointHostBot", { runtime: "claude", model: "sonnet" });
+  const hostAgentKey = await mintAgentKey(hostAgent.id, ["reactions"]);
+  const joint = await seedJointChannel({
+    name: `agent-api-joint-react-${randomUUID().slice(0, 8)}`,
+    serverIds: [hostServer.id, fixture.serverId],
+    createdByUserId: fixture.ownerId,
+  });
+  const [hostCopy, guestCopy] = joint.projections as [typeof joint.projections[number], typeof joint.projections[number]];
+  for (const projection of joint.projections) await addHuman(projection.id, fixture.ownerId);
+  await addAgent(hostCopy.id, hostAgent.id);
+  const message = await createMessage(joint.canonical.id, "user", fixture.ownerId, "agent-api joint reaction target");
+
+  const react = (apiKey: string, messageId = message.id, emoji = "👀") => fetch(`${app.baseUrl}/internal/agent-api/messages/${messageId}/reactions`, {
+    method: "POST",
+    headers: jsonHeaders(apiKey),
+    body: JSON.stringify({ emoji }),
+  });
+  const reactors = async () => (await getDb().select().from(messageReactions).where(eq(messageReactions.messageId, message.id)))
+    .map((row) => row.reactorId).sort();
+
+  // Not a member of its server's copy: refused like any channel it isn't in.
+  const outside = await react(fixture.agentApiKey);
+  assert.equal(outside.status, 404);
+  assert.deepEqual(await reactors(), []);
+
+  await addAgent(guestCopy.id, fixture.agentId);
+  const guest = await react(fixture.agentApiKey);
+  assert.equal(guest.status, 200, await guest.clone().text());
+  const guestBody = await guest.json() as { channelId?: string; reactions: Array<{ emoji: string; reactorIds: string[] }> };
+  assert.equal(guestBody.channelId, guestCopy.id, "the reply is the agent's own server's copy");
+  assert.deepEqual(guestBody.reactions.map((reaction) => [reaction.emoji, reaction.reactorIds]), [["👀", [fixture.agentId]]]);
+
+  // The host server's agent reacts through the host copy, onto the same message.
+  const host = await react(hostAgentKey, message.id, "👍");
+  assert.equal(host.status, 200, await host.clone().text());
+  assert.deepEqual(await reactors(), [fixture.agentId, hostAgent.id].sort());
+
+  // People on both servers see both reactions on their own copy.
+  const humanToken = await tokenForHuman(fixture.ownerEmail);
+  for (const projection of joint.projections) {
+    const page = await fetch(`${app.baseUrl}/api/messages/channel/${projection.id}?limit=10`, {
+      headers: { Authorization: `Bearer ${humanToken}`, "X-Server-Id": projection.serverId },
+    });
+    assert.equal(page.status, 200);
+    const row = (await page.json() as { messages: Array<{ id: string; reactions?: Array<{ emoji: string }> }> }).messages
+      .find((item) => item.id === message.id);
+    assert.deepEqual(row?.reactions?.map((reaction) => reaction.emoji).sort(), ["👀", "👍"].sort(), `seen from ${projection.serverId}`);
+  }
+
+  // A message on another server's ordinary channel stays out of reach.
+  const elsewhere = await createChannel(hostServer.id, `agent-api-joint-elsewhere-${randomUUID().slice(0, 6)}`);
+  const foreign = await createMessage(elsewhere.id, "user", fixture.ownerId, "another server's message");
+  const crossServer = await react(fixture.agentApiKey, foreign.id);
+  assert.equal(crossServer.status, 404);
+  assert.equal((await getDb().select().from(messageReactions).where(eq(messageReactions.messageId, foreign.id))).length, 0);
 });
 
 test("agent-api reactions work on thread replies", async ({ app }) => {
@@ -5979,6 +6575,8 @@ test("agent-api reactions work on thread replies", async ({ app }) => {
     count: 1,
     reactorIds: [fixture.agentId],
     reactorNames: ["AgentApiAuthBot"],
+    // Typed for agents (#wg-ax:#26): who reacted, by handle and kind.
+    reactors: [{ name: "AgentApiAuthBot", kind: "agent" }],
   }]);
 
   const remove = await fetch(`${app.baseUrl}/internal/agent-api/messages/${reply.id.slice(0, 8)}/reactions`, {
@@ -6143,6 +6741,16 @@ test("agent-api search sees agent-member private channels and parent-authorized 
     sort: "recent",
     limit: "10",
   });
+  // These dates are older than the free plan's history window, which agent
+  // search honours like every read; an unlimited plan finds them.
+  const freeRes = await fetch(`${app.baseUrl}/internal/agent-api/search?${params}`, {
+    headers: jsonHeaders(fixture.agentApiKey),
+  });
+  const freeBody = await freeRes.json() as { error?: string; results: Array<{ id: string }> };
+  assert.equal(freeRes.status, 200, freeBody.error);
+  assert.deepEqual(freeBody.results, [], "free plan: messages older than the history window are not found");
+  await db.update(serversTable).set({ plan: "founder" }).where(eq(serversTable.id, fixture.serverId));
+
   const res = await fetch(`${app.baseUrl}/internal/agent-api/search?${params}`, {
     headers: jsonHeaders(fixture.agentApiKey),
   });
@@ -6350,7 +6958,9 @@ test("agent-api thread unfollow cloaks inaccessible private thread UUIDs", async
     body: JSON.stringify({ thread: thread.id }),
   });
   assert.equal(threadRes.status, 404);
-  assert.deepEqual(await threadRes.json(), { error: "Thread not found" });
+  // Missing and not visible answer the same body, whatever form the target took.
+  const notFound = await threadRes.json() as { code?: string };
+  assert.equal(notFound.code, "thread_not_found");
 
   const shortRefRes = await fetch(`${app.baseUrl}/internal/agent-api/threads/unfollow`, {
     method: "POST",
@@ -6358,7 +6968,7 @@ test("agent-api thread unfollow cloaks inaccessible private thread UUIDs", async
     body: JSON.stringify({ thread: `#${privateChannel.name}:${parent.id.slice(0, 8)}` }),
   });
   assert.equal(shortRefRes.status, 404);
-  assert.deepEqual(await shortRefRes.json(), { error: "Thread not found" });
+  assert.deepEqual(await shortRefRes.json(), notFound);
 
   const privateChannelRes = await fetch(`${app.baseUrl}/internal/agent-api/threads/unfollow`, {
     method: "POST",
@@ -6366,7 +6976,53 @@ test("agent-api thread unfollow cloaks inaccessible private thread UUIDs", async
     body: JSON.stringify({ thread: privateChannel.id }),
   });
   assert.equal(privateChannelRes.status, 404);
-  assert.deepEqual(await privateChannelRes.json(), { error: "Thread not found" });
+  assert.deepEqual(await privateChannelRes.json(), notFound);
+});
+
+test("agent-api thread follow answers a hidden thread exactly as a missing one, by UUID, short ref or channel", async ({ app }) => {
+  const fixture = await seedAuthFixture();
+  const privateChannel = await createChannel(fixture.serverId, "agent-api-private-thread-follow", undefined, "private");
+  await addHuman(privateChannel.id, fixture.ownerId);
+  const parent = await createMessage(
+    privateChannel.id,
+    "user",
+    fixture.ownerId,
+    "agent-api private follow parent",
+  );
+  const thread = await getOrCreateThread(parent.id, fixture.ownerId, "user");
+
+  const threadRes = await fetch(`${app.baseUrl}/internal/agent-api/threads/follow`, {
+    method: "POST",
+    headers: jsonHeaders(fixture.agentApiKey),
+    body: JSON.stringify({ thread: thread.id }),
+  });
+  assert.equal(threadRes.status, 404);
+  // Missing and not visible answer the same body, whatever form the target took.
+  const notFound = await threadRes.json() as { code?: string };
+  assert.equal(notFound.code, "thread_not_found");
+
+  const shortRefRes = await fetch(`${app.baseUrl}/internal/agent-api/threads/follow`, {
+    method: "POST",
+    headers: jsonHeaders(fixture.agentApiKey),
+    body: JSON.stringify({ thread: `#${privateChannel.name}:${parent.id.slice(0, 8)}` }),
+  });
+  assert.equal(shortRefRes.status, 404);
+  assert.deepEqual(await shortRefRes.json(), notFound);
+
+  const privateChannelRes = await fetch(`${app.baseUrl}/internal/agent-api/threads/follow`, {
+    method: "POST",
+    headers: jsonHeaders(fixture.agentApiKey),
+    body: JSON.stringify({ thread: privateChannel.id }),
+  });
+  assert.equal(privateChannelRes.status, 404);
+  assert.deepEqual(await privateChannelRes.json(), notFound);
+  const missingRes = await fetch(`${app.baseUrl}/internal/agent-api/threads/follow`, {
+    method: "POST",
+    headers: jsonHeaders(fixture.agentApiKey),
+    body: JSON.stringify({ thread: randomUUID() }),
+  });
+  assert.equal(missingRes.status, 404);
+  assert.deepEqual(await missingRes.json(), notFound);
 });
 
 test("agent-api thread unfollow suppresses ordinary delivery for the bound runner agent", async ({ app }) => {
@@ -6580,7 +7236,11 @@ test("agent-api taskAssign stays opaque for a public-channel outsider human", as
   assert.equal(after.revision, before.revision, "refused assign must not burn a revision");
 });
 
-test("agent-api current assignee can undo an accidental start without unlocking another member's work", async ({ app }) => {
+// stdrc 2026-10-31 (#wg-task-v2 msg=ad820421): any status from any status, for
+// people and agents alike. A member moving someone else's started work back to
+// todo is allowed; what must hold is that the assignment survives the move and
+// the assignee's next claim stamps a fresh start epoch.
+test("agent-api moving started work back to todo keeps the assignment, and the assignee's claim restarts it", async ({ app }) => {
   const fixture = await seedAuthFixture();
   const db = getDb();
 
@@ -6615,15 +7275,12 @@ test("agent-api current assignee can undo an accidental start without unlocking 
     });
 
   const peerDemotion = await setStatus(peerKey, "todo");
-  assert.equal(peerDemotion.status, 409, `another member must not demote owned work: ${await peerDemotion.clone().text()}`);
-  assert.match((await peerDemotion.json() as { error: string }).error, /cannot transition from in_progress to todo/);
-  const [afterPeer] = await db.select().from(tasks).where(eq(tasks.taskNumber, createdTask.taskNumber));
-  assert.equal(afterPeer.status, "in_progress");
-  assert.equal(afterPeer.claimedById, fixture.agentId);
-  assert.ok(afterPeer.claimedAt);
+  assert.equal(peerDemotion.status, 200, `any member may set any status: ${await peerDemotion.clone().text()}`);
 
-  const selfDemotion = await setStatus(fixture.agentApiKey, "todo");
-  assert.equal(selfDemotion.status, 200, await selfDemotion.clone().text());
+  const unchanged = await setStatus(fixture.agentApiKey, "todo");
+  assert.equal(unchanged.status, 409, "setting the status a task already has is the one refusal");
+  assert.match((await unchanged.json() as { error: string }).error, /already todo/);
+
   const [reserved] = await db.select().from(tasks).where(eq(tasks.taskNumber, createdTask.taskNumber));
   assert.equal(reserved.status, "todo");
   assert.equal(reserved.claimedByType, "agent", "undoing start preserves the reservation");
@@ -6637,7 +7294,7 @@ test("agent-api current assignee can undo an accidental start without unlocking 
     .orderBy(taskEvents.seq);
   const demotion = events.filter((event) => event.eventType === "status_changed").at(-1)!;
   assert.equal(demotion.actorType, "agent");
-  assert.equal(demotion.actorId, fixture.agentId);
+  assert.equal(demotion.actorId, peer.id);
   assert.deepEqual(demotion.payload, { from: "in_progress", to: "todo", forced: false });
 
   const resumed = await fetch(`${app.baseUrl}/internal/agent-api/tasks/claim`, {
@@ -6653,71 +7310,46 @@ test("agent-api current assignee can undo an accidental start without unlocking 
 });
 
 /**
- * @stdrc, 2026-08-08 (#proj-task msg=a74a8521): "admin agent 也应该可以 force 改
- * 状态，这样人和 agent 的权限管理才一致".
- *
- * The agent status route called `updateTaskStatus` and returned its refusal
- * verbatim, never consulting `serverAgentMembers.role`. The browser route has
- * always had the `manageServer` force-override, so an admin agent was strictly
- * weaker than an admin human at the same task — not by design, by omission.
- *
- * `todo -> done` is the probe because it is illegal in VALID_TRANSITIONS
- * (`todo` allows only `in_progress` and `closed`). A member agent must still be
- * refused, or "force" would just mean "the transition table is gone".
+ * stdrc 2026-10-31 (#wg-task-v2 msg=ad820421): "所有的状态之间切换的限制其实都不需要了".
+ * `todo -> done` used to be the probe for the transition table (and for the
+ * admin-agent force override that skipped it). With the table gone a plain
+ * member agent makes the same jump, and back; only a write of the status the
+ * task already has is refused, under its own code.
  */
-test("agent-api task status: an admin agent forces an illegal transition, a member agent is refused", async ({ app }) => {
+test("agent-api task status: a member agent moves any status to any status; the same status is refused", async ({ app }) => {
   const fixture = await seedAuthFixture();
   const db = getDb();
 
-  const createTask = async (title: string) => {
-    const res = await fetch(`${app.baseUrl}/internal/agent-api/tasks`, {
-      method: "POST",
-      headers: jsonHeaders(fixture.agentApiKey),
-      body: JSON.stringify({ channel: `#${fixture.channelName}`, tasks: [{ title }] }),
-    });
-    assert.equal(res.status, 200, await res.clone().text());
-    const { tasks: [created] } = await res.json() as { tasks: Array<{ taskNumber: number }> };
-    return created.taskNumber;
-  };
-  const setStatus = (taskNumber: number, status: string) =>
+  const created = await fetch(`${app.baseUrl}/internal/agent-api/tasks`, {
+    method: "POST",
+    headers: jsonHeaders(fixture.agentApiKey),
+    body: JSON.stringify({ channel: `#${fixture.channelName}`, tasks: [{ title: "jump straight to done" }] }),
+  });
+  assert.equal(created.status, 200, await created.clone().text());
+  const { tasks: [{ taskNumber }] } = await created.json() as { tasks: Array<{ taskNumber: number }> };
+  const setStatus = (status: string) =>
     fetch(`${app.baseUrl}/internal/agent-api/tasks/update-status`, {
       method: "POST",
       headers: jsonHeaders(fixture.agentApiKey),
       body: JSON.stringify({ channel: `#${fixture.channelName}`, task_number: taskNumber, status }),
     });
 
-  // --- member agent: the transition table still binds ---
   const [memberRole] = await db
     .select({ role: serverAgentMembers.role })
     .from(serverAgentMembers)
     .where(and(eq(serverAgentMembers.serverId, fixture.serverId), eq(serverAgentMembers.agentId, fixture.agentId)));
-  assert.equal(memberRole.role, "member", "precondition: the fixture agent starts as a plain member");
+  assert.equal(memberRole.role, "member", "precondition: the fixture agent is a plain member");
 
-  const memberTask = await createTask("member cannot skip the table");
-  const refused = await setStatus(memberTask, "done");
-  assert.equal(refused.status, 409, `member agent must be refused: ${await refused.clone().text()}`);
-  assert.match((await refused.json() as { error: string }).error, /cannot transition from todo to done/);
-  const [memberRow] = await db.select().from(tasks).where(eq(tasks.taskNumber, memberTask));
-  assert.equal(memberRow.status, "todo", "a refused status write must not land");
+  for (const status of ["done", "todo", "in_review", "closed", "in_progress"]) {
+    const res = await setStatus(status);
+    assert.equal(res.status, 200, `${status}: ${await res.clone().text()}`);
+    const [row] = await db.select().from(tasks).where(eq(tasks.taskNumber, taskNumber));
+    assert.equal(row.status, status, "the status write must land");
+  }
 
-  // --- same agent, promoted to admin: force applies ---
-  await db
-    .update(serverAgentMembers)
-    .set({ role: "admin" })
-    .where(and(eq(serverAgentMembers.serverId, fixture.serverId), eq(serverAgentMembers.agentId, fixture.agentId)));
-
-  const adminTask = await createTask("admin forces the same illegal jump");
-  const forced = await setStatus(adminTask, "done");
-  assert.equal(forced.status, 200, `admin agent must be able to force: ${await forced.clone().text()}`);
-  const [adminRow] = await db.select().from(tasks).where(eq(tasks.taskNumber, adminTask));
-  assert.equal(adminRow.status, "done", "the forced status must actually be persisted");
-
-  // The SAME task number that was refused a moment ago now succeeds, so the
-  // difference is the role and not the task's own state.
-  const nowAllowed = await setStatus(memberTask, "done");
-  assert.equal(nowAllowed.status, 200, await nowAllowed.clone().text());
-  const [memberRowAfter] = await db.select().from(tasks).where(eq(tasks.taskNumber, memberTask));
-  assert.equal(memberRowAfter.status, "done");
+  const same = await setStatus("in_progress");
+  assert.equal(same.status, 409, await same.clone().text());
+  assert.match((await same.json() as { error: string }).error, /already in_progress/);
 });
 
 /**
@@ -6857,8 +7489,13 @@ test("agent-api task convert turns a message into an UNCLAIMED task", async ({ a
  * `observed.claimedByType/Id`, so an admin force-closing someone else's task
  * recorded the PREVIOUS ASSIGNEE as the closer — an affirmatively wrong name,
  * not a missing one.
+ *
+ * Since #12227 (any status from any status) the agent route has no force
+ * branch at all; the browser route forces only for orphan tasks. So the forced
+ * write is driven through `forceUpdateTaskStatus` directly, and the route's
+ * closing write still has to name the agent that made it.
  */
-test("agent-api forced status records the forcing agent, not system or the previous assignee", async ({ app }) => {
+test("forced status records the forcing agent, and the agent route's close names the closer, not the previous assignee", async ({ app }) => {
   const fixture = await seedAuthFixture();
   const db = getDb();
 
@@ -6888,18 +7525,8 @@ test("agent-api forced status records the forcing agent, not system or the previ
   const [beforeRow] = await db.select().from(tasks).where(eq(tasks.taskNumber, createdTask.taskNumber));
   assert.equal(beforeRow.claimedById, victim.id, "precondition: the task belongs to the other agent");
 
-  // todo -> closed is legal, so force this via an ILLEGAL jump to be certain
-  // the forced branch is the one exercised: todo -> in_review.
-  const forced = await fetch(`${app.baseUrl}/internal/agent-api/tasks/update-status`, {
-    method: "POST",
-    headers: jsonHeaders(fixture.agentApiKey),
-    body: JSON.stringify({
-      channel: `#${fixture.channelName}`,
-      task_number: createdTask.taskNumber,
-      status: "in_review",
-    }),
-  });
-  assert.equal(forced.status, 200, await forced.clone().text());
+  const forced = await taskService.forceUpdateTaskStatus(beforeRow.id, "in_review", "agent", fixture.agentId);
+  assert.notEqual(typeof forced, "string", `forced write refused: ${String(forced)}`);
 
   const [row] = await db.select().from(tasks).where(eq(tasks.taskNumber, createdTask.taskNumber));
   const events = await db
@@ -7100,7 +7727,7 @@ test("agent rosters read activity and server roles as batches, not per agent", a
     for (let i = 0; i < size; i += 1) {
       const extra = await createAgent(fixture.serverId, `roster-${randomUUID().slice(0, 8)}`, { runtime: "claude", model: "sonnet" });
       await addAgent(fixture.channelId, extra.id);
-      await assignMachine(extra.id, fixture.machineId);
+      await placeAgentOnMachine(extra.id, fixture.machineId);
     }
   };
   const routes = {

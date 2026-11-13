@@ -25,6 +25,8 @@ export interface RuntimeInfo {
   supported: boolean;
   /** Deprecated runtimes are hidden from selectors + detection display, but kept for backward compat with existing agents on that runtime. */
   deprecated?: boolean;
+  /** Experimental runtimes can be used but are marked as such wherever a runtime is named: not yet run end to end on a real account in Raft. */
+  experimental?: boolean;
 }
 
 export const RUNTIMES: RuntimeInfo[] = [
@@ -49,7 +51,20 @@ export const RUNTIMES: RuntimeInfo[] = [
   { id: "gemini", displayName: "Gemini CLI", abbreviation: "GM", binary: "gemini", supported: true, deprecated: true },
   { id: "opencode", displayName: "OpenCode", abbreviation: "OC", binary: "opencode", supported: true },
   { id: "pi", displayName: "Pi", abbreviation: "PI", binary: "pi", supported: true },
+  // Run only on the Computer's OAR host (daemon drivers/oarOnly.ts). Creating or
+  // switching an agent to them needs a Computer that reports the runtime (no
+  // server flag: server runtimeAdmissionService.ts).
+  { id: "qwen", displayName: "Qwen Code", abbreviation: "QW", binary: "qwen", supported: true, experimental: true },
+  { id: "qoder", displayName: "Qoder", abbreviation: "QD", binary: "qodercli", supported: true, experimental: true },
+  { id: "codebuddy", displayName: "CodeBuddy Code", abbreviation: "CB", binary: "codebuddy", supported: true, experimental: true },
 ];
+
+/** Runtimes that run only on the Computer's OAR host: there is no legacy driver to fall back to. */
+export const OAR_ONLY_RUNTIME_IDS: readonly string[] = ["qwen", "qoder", "codebuddy"];
+
+export function isOarOnlyRuntime(runtime: string | null | undefined): boolean {
+  return typeof runtime === "string" && OAR_ONLY_RUNTIME_IDS.includes(runtime);
+}
 
 /**
  * Label suffix for a runtime in a machine's runtime picker. A runtime is offered
@@ -59,7 +74,7 @@ export const RUNTIMES: RuntimeInfo[] = [
  *
  * - unsupported → " (coming soon)"
  * - in-process runtime (`binary === ""`, e.g. Built-in, Kimi Code) that the
- *   daemon doesn't report → " (update computer)": there is nothing to install
+ *   daemon doesn't report → " (update Raft Computer)": there is nothing to install
  *   locally; the daemon/computer simply predates the runtime, so "(not
  *   installed)" would be misleading.
  * - local CLI runtime (`binary !== ""`) the daemon didn't detect → " (not installed)"
@@ -87,6 +102,10 @@ export function isRuntimeDeprecated(runtimeId: string): boolean {
   return RUNTIMES.some((runtime) => runtime.id === runtimeId && Boolean(runtime.deprecated));
 }
 
+export function isRuntimeExperimental(runtimeId: string): boolean {
+  return RUNTIMES.some((runtime) => runtime.id === runtimeId && Boolean(runtime.experimental));
+}
+
 export function isRuntimeSelectableForNewAgent(runtime: RuntimeInfo): boolean {
   return runtime.supported && !runtime.deprecated;
 }
@@ -103,8 +122,9 @@ export function getExistingAgentRuntimeOptions(currentRuntime: string): RuntimeI
   return RUNTIMES.filter((runtime) => isRuntimeVisibleForExistingAgent(runtime, currentRuntime));
 }
 
+/** Server setup offers neither Built-in nor the per-server preview runtimes (OAR-only). */
 export function isRuntimeSetupCandidate(runtime: RuntimeInfo): boolean {
-  return runtime.supported && !runtime.deprecated && runtime.id !== "builtin";
+  return runtime.supported && !runtime.deprecated && runtime.id !== "builtin" && !isOarOnlyRuntime(runtime.id);
 }
 
 export function getSetupRuntimeOptions(): RuntimeInfo[] {
@@ -113,6 +133,15 @@ export function getSetupRuntimeOptions(): RuntimeInfo[] {
 
 export function getMachineRuntimeDisplayOptions(): RuntimeInfo[] {
   return RUNTIMES.filter((runtime) => runtime.supported && !runtime.deprecated);
+}
+
+/**
+ * The bundled entry for a runtime id, to name a runtime a server already
+ * listed (its runtime-options rows, its catalog). Whether a runtime is offered
+ * on a server is that server's answer, never this catalog's `deprecated`.
+ */
+export function getRuntimeInfo(id: string): RuntimeInfo | undefined {
+  return RUNTIMES.find((runtime) => runtime.id === id);
 }
 
 /** Map runtime ID → display name. Falls back to the ID itself. */

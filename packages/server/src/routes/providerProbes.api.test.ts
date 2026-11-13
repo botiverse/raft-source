@@ -42,7 +42,7 @@ import {
 } from "../services/providerProbeService";
 import { openTestApp } from "../test/integration/app";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 const AUTHORITY = { connectionEpochId: "epoch-probe-1", replicaGeneration: "gen-probe-1" };
 const FACT: ProbeCarrierFact = {
@@ -241,7 +241,7 @@ async function createBody(connectionId: string, computerId: string, overrides: R
 test("provider probe foundation: idempotent create, closed receipts, capability and drift guards", async () => {
   const originalKey = process.env.SLOCK_PROVIDER_CREDENTIAL_KEY;
   process.env.SLOCK_PROVIDER_CREDENTIAL_KEY = Buffer.alloc(32, 11).toString("base64");
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const owner = await seedUser("probe-owner@raft.test", "probe-owner");
     const member = await seedUser("probe-member@raft.test", "probe-member");
@@ -671,7 +671,7 @@ test("provider probe foundation: idempotent create, closed receipts, capability 
 test("provider probe expiry closes before any credential or provider call", async () => {
   const originalKey = process.env.SLOCK_PROVIDER_CREDENTIAL_KEY;
   process.env.SLOCK_PROVIDER_CREDENTIAL_KEY = Buffer.alloc(32, 12).toString("base64");
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const owner = await seedUser("probe-expiry-owner@raft.test", "probe-expiry-owner");
     const server = await createServer("Probe Expiry", "probe-expiry", owner.id);
@@ -851,7 +851,7 @@ test("probe budgets keep provider_timeout ahead of carrier_timeout, and daemon-d
 
   const originalKey = process.env.SLOCK_PROVIDER_CREDENTIAL_KEY;
   process.env.SLOCK_PROVIDER_CREDENTIAL_KEY = Buffer.alloc(32, 13).toString("base64");
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const owner = await seedUser("probe-budget-owner@raft.test", "probe-budget-owner");
     const server = await createServer("Probe Budget", "probe-budget", owner.id);
@@ -939,7 +939,7 @@ test("probe budgets keep provider_timeout ahead of carrier_timeout, and daemon-d
 test("the shadow-UI receipt list exposes durable coordinates without reply bodies", async () => {
   const originalKey = process.env.SLOCK_PROVIDER_CREDENTIAL_KEY;
   process.env.SLOCK_PROVIDER_CREDENTIAL_KEY = Buffer.alloc(32, 14).toString("base64");
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const owner = await seedUser("probe-list-owner@raft.test", "probe-list-owner");
     const member = await seedUser("probe-list-member@raft.test", "probe-list-member");

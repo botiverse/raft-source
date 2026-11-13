@@ -18,10 +18,10 @@ function zhRender(machine: Parameters<typeof MachineRunLabel>[0]["machine"]): st
   );
 }
 
-test("zh: offline legacy machine renders 旧版离线, not the .text fallback", () => {
+test("zh: offline legacy machine renders 离线, not the .text fallback", () => {
   const html = zhRender({ status: "offline" });
-  assert.match(html, /旧版离线/);
-  assert.doesNotMatch(html, /legacy offline/);
+  assert.match(html, /离线/);
+  assert.doesNotMatch(html, /Offline/);
 });
 
 test("zh: online legacy machine with version renders 旧版 v{version}", () => {
@@ -30,23 +30,24 @@ test("zh: online legacy machine with version renders 旧版 v{version}", () => {
   assert.doesNotMatch(html, /legacy v1\.2\.3/);
 });
 
-test("zh: online computer without version renders Computer 在线 (status, not version presence)", () => {
+test("zh: online computer without version renders 在线 (status, not version presence)", () => {
   const html = zhRender({ isComputer: true, status: "online", computerVersion: null, daemonVersion: "9.9.9" });
-  assert.match(html, /Computer 在线/);
-  assert.doesNotMatch(html, /computer v9\.9\.9/);
+  assert.match(html, /在线/);
+  assert.doesNotMatch(html, /9\.9\.9/);
 });
 
-test("zh: offline computer renders Computer 离线", () => {
+test("zh: offline computer renders 离线", () => {
   const html = zhRender({ isComputer: true, status: "offline" });
-  assert.match(html, /Computer 离线/);
-  assert.doesNotMatch(html, /computer offline/);
+  assert.match(html, /离线/);
+  assert.doesNotMatch(html, /Offline/);
 });
 
-test("en output is unchanged", () => {
-  const html = renderToStaticMarkup(
-    createElement(TestIntlProvider, null,
-      createElement(MachineRunLabel, { machine: { status: "offline" } }),
-    ),
+test("en: Online / Offline as the state, the bare version as a fact", () => {
+  const en = (machine: Parameters<typeof MachineRunLabel>[0]["machine"]) => renderToStaticMarkup(
+    createElement(TestIntlProvider, null, createElement(MachineRunLabel, { machine })),
   );
-  assert.match(html, /legacy offline/);
+  assert.equal(en({ status: "offline" }), "Offline");
+  assert.equal(en({ isComputer: true, status: "offline" }), "Offline");
+  assert.equal(en({ isComputer: true, status: "online", computerVersion: "1.2.0" }), "v1.2.0");
+  assert.equal(en({ isComputer: true, status: "online", computerVersion: null }), "Online");
 });

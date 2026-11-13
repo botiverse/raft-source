@@ -1,4 +1,5 @@
 export const FEATURE_FLAG_ADMIN_OPERATOR_ROLE = "feature_flag_admin_operator";
+export const FEATURE_FLAG_ADMIN_ANNOUNCEMENT_RULES_REACH_FUNCTION = "public.announcement_rules_reach(jsonb, text, uuid[], uuid[], timestamptz)";
 
 export const REQUIRED_FEATURE_FLAG_ADMIN_PRIVILEGES = [
   { kind: "schema", object: "public", privilege: "USAGE" },
@@ -56,11 +57,100 @@ export const REQUIRED_FEATURE_FLAG_ADMIN_PRIVILEGES = [
   { kind: "column", object: "public.agents", column: "id", privilege: "SELECT" },
   { kind: "column", object: "public.agents", column: "server_id", privilege: "SELECT" },
   { kind: "column", object: "public.agents", column: "deleted_at", privilege: "SELECT" },
+  // Official app registry (#proj-apps task #5), 0384: list/register/approve/disable entries;
+  // no DELETE. Updates touch only the reviewable fields and bump revision.
+  { kind: "column", object: "public.official_app_registry", column: "oauth_client_id", privilege: "SELECT" },
+  { kind: "column", object: "public.official_app_registry", column: "client_key", privilege: "SELECT" },
+  { kind: "column", object: "public.official_app_registry", column: "publisher_server_id", privilege: "SELECT" },
+  { kind: "column", object: "public.official_app_registry", column: "auto_install", privilege: "SELECT" },
+  { kind: "column", object: "public.official_app_registry", column: "purpose", privilege: "SELECT" },
+  { kind: "column", object: "public.official_app_registry", column: "status", privilege: "SELECT" },
+  { kind: "column", object: "public.official_app_registry", column: "revision", privilege: "SELECT" },
+  { kind: "column", object: "public.official_app_registry", column: "created_by_user_id", privilege: "SELECT" },
+  { kind: "column", object: "public.official_app_registry", column: "updated_by_user_id", privilege: "SELECT" },
+  { kind: "column", object: "public.official_app_registry", column: "created_at", privilege: "SELECT" },
+  { kind: "column", object: "public.official_app_registry", column: "updated_at", privilege: "SELECT" },
+  { kind: "column", object: "public.official_app_registry", column: "oauth_client_id", privilege: "INSERT" },
+  { kind: "column", object: "public.official_app_registry", column: "client_key", privilege: "INSERT" },
+  { kind: "column", object: "public.official_app_registry", column: "publisher_server_id", privilege: "INSERT" },
+  { kind: "column", object: "public.official_app_registry", column: "auto_install", privilege: "INSERT" },
+  { kind: "column", object: "public.official_app_registry", column: "purpose", privilege: "INSERT" },
+  { kind: "column", object: "public.official_app_registry", column: "status", privilege: "INSERT" },
+  { kind: "column", object: "public.official_app_registry", column: "revision", privilege: "INSERT" },
+  { kind: "column", object: "public.official_app_registry", column: "created_by_user_id", privilege: "INSERT" },
+  { kind: "column", object: "public.official_app_registry", column: "updated_by_user_id", privilege: "INSERT" },
+  { kind: "column", object: "public.official_app_registry", column: "created_at", privilege: "INSERT" },
+  { kind: "column", object: "public.official_app_registry", column: "updated_at", privilege: "INSERT" },
+  { kind: "column", object: "public.official_app_registry", column: "auto_install", privilege: "UPDATE" },
+  { kind: "column", object: "public.official_app_registry", column: "purpose", privilege: "UPDATE" },
+  { kind: "column", object: "public.official_app_registry", column: "status", privilege: "UPDATE" },
+  { kind: "column", object: "public.official_app_registry", column: "revision", privilege: "UPDATE" },
+  { kind: "column", object: "public.official_app_registry", column: "updated_by_user_id", privilege: "UPDATE" },
+  { kind: "column", object: "public.official_app_registry", column: "updated_at", privilege: "UPDATE" },
+  // The app an entry names, and that its identity matches oauth_clients (0384).
+  { kind: "column", object: "public.oauth_clients", column: "id", privilege: "SELECT" },
+  { kind: "column", object: "public.oauth_clients", column: "client_id", privilege: "SELECT" },
+  { kind: "column", object: "public.oauth_clients", column: "server_id", privilege: "SELECT" },
+  { kind: "column", object: "public.oauth_clients", column: "name", privilege: "SELECT" },
+  { kind: "column", object: "public.oauth_clients", column: "app_type", privilege: "SELECT" },
+  { kind: "column", object: "public.oauth_clients", column: "publish_status", privilege: "SELECT" },
+  { kind: "column", object: "public.oauth_clients", column: "enabled", privilege: "SELECT" },
+  // Append-only Raft-side audit of every registry write, in the same transaction (0384).
+  { kind: "column", object: "public.integration_audit_events", column: "id", privilege: "INSERT" },
+  { kind: "column", object: "public.integration_audit_events", column: "server_id", privilege: "INSERT" },
+  { kind: "column", object: "public.integration_audit_events", column: "client_id", privilege: "INSERT" },
+  { kind: "column", object: "public.integration_audit_events", column: "event_type", privilege: "INSERT" },
+  { kind: "column", object: "public.integration_audit_events", column: "event_category", privilege: "INSERT" },
+  { kind: "column", object: "public.integration_audit_events", column: "outcome", privilege: "INSERT" },
+  { kind: "column", object: "public.integration_audit_events", column: "source", privilege: "INSERT" },
+  { kind: "column", object: "public.integration_audit_events", column: "actor_type", privilege: "INSERT" },
+  { kind: "column", object: "public.integration_audit_events", column: "actor_id", privilege: "INSERT" },
+  { kind: "column", object: "public.integration_audit_events", column: "subject_type", privilege: "INSERT" },
+  { kind: "column", object: "public.integration_audit_events", column: "subject_id", privilege: "INSERT" },
+  { kind: "column", object: "public.integration_audit_events", column: "target_type", privilege: "INSERT" },
+  { kind: "column", object: "public.integration_audit_events", column: "target_id", privilege: "INSERT" },
+  { kind: "column", object: "public.integration_audit_events", column: "request_id", privilege: "INSERT" },
+  { kind: "column", object: "public.integration_audit_events", column: "metadata", privilege: "INSERT" },
+  { kind: "column", object: "public.integration_audit_events", column: "diff", privilege: "INSERT" },
+  { kind: "column", object: "public.integration_audit_events", column: "created_at", privilege: "INSERT" },
+  // Stuck interactive link card operations (RFC 076 §5.2), 0387: list them and mark one
+  // resolved_manually. No INSERT/DELETE; the trigger allows this role only that one transition
+  // and bumps receipt_revision itself.
+  { kind: "column", object: "public.link_card_operations", column: "operation_id", privilege: "SELECT" },
+  { kind: "column", object: "public.link_card_operations", column: "viewer_id", privilege: "SELECT" },
+  { kind: "column", object: "public.link_card_operations", column: "server_id", privilege: "SELECT" },
+  { kind: "column", object: "public.link_card_operations", column: "provider_kind", privilege: "SELECT" },
+  { kind: "column", object: "public.link_card_operations", column: "provider_key", privilege: "SELECT" },
+  { kind: "column", object: "public.link_card_operations", column: "installation_key", privilege: "SELECT" },
+  { kind: "column", object: "public.link_card_operations", column: "message_id", privilege: "SELECT" },
+  { kind: "column", object: "public.link_card_operations", column: "action_id", privilege: "SELECT" },
+  { kind: "column", object: "public.link_card_operations", column: "state", privilege: "SELECT" },
+  { kind: "column", object: "public.link_card_operations", column: "receipt_revision", privilege: "SELECT" },
+  { kind: "column", object: "public.link_card_operations", column: "last_status_at", privilege: "SELECT" },
+  { kind: "column", object: "public.link_card_operations", column: "resolved_by_user_id", privilege: "SELECT" },
+  { kind: "column", object: "public.link_card_operations", column: "resolution_reason", privilege: "SELECT" },
+  { kind: "column", object: "public.link_card_operations", column: "resolved_at", privilege: "SELECT" },
+  { kind: "column", object: "public.link_card_operations", column: "created_at", privilege: "SELECT" },
+  { kind: "column", object: "public.link_card_operations", column: "updated_at", privilege: "SELECT" },
+  { kind: "column", object: "public.link_card_operations", column: "state", privilege: "UPDATE" },
+  { kind: "column", object: "public.link_card_operations", column: "resolved_by_user_id", privilege: "UPDATE" },
+  { kind: "column", object: "public.link_card_operations", column: "resolution_reason", privilege: "UPDATE" },
+  { kind: "column", object: "public.link_card_operations", column: "resolved_at", privilege: "UPDATE" },
+  { kind: "column", object: "public.link_card_operations", column: "updated_at", privilege: "UPDATE" },
+  // Announcement reach with audience rules, 0617: a count-only SECURITY DEFINER function, so the
+  // role still cannot read users.created_at / display_language or servers.created_at itself.
+  { kind: "function", object: FEATURE_FLAG_ADMIN_ANNOUNCEMENT_RULES_REACH_FUNCTION, privilege: "EXECUTE" },
 ] as const;
 
 // Column-level writes the operator may hold on lab_definitions (0303). Anything else stays unexpected.
 const FEATURE_FLAG_ADMIN_LAB_DEFINITION_INSERT_COLUMNS = ["created_at", "description", "key", "name", "state", "updated_at"] as const;
 const FEATURE_FLAG_ADMIN_LAB_DEFINITION_UPDATE_COLUMNS = ["description", "name", "state", "updated_at"] as const;
+// Column-level writes the operator may hold on official_app_registry and integration_audit_events (0384).
+const FEATURE_FLAG_ADMIN_OFFICIAL_APP_REGISTRY_INSERT_COLUMNS = ["auto_install", "client_key", "created_at", "created_by_user_id", "oauth_client_id", "publisher_server_id", "purpose", "revision", "status", "updated_at", "updated_by_user_id"] as const;
+const FEATURE_FLAG_ADMIN_OFFICIAL_APP_REGISTRY_UPDATE_COLUMNS = ["auto_install", "purpose", "revision", "status", "updated_at", "updated_by_user_id"] as const;
+// Column-level writes the operator may hold on link_card_operations (0387).
+const FEATURE_FLAG_ADMIN_LINK_CARD_OPERATION_UPDATE_COLUMNS = ["resolution_reason", "resolved_at", "resolved_by_user_id", "state", "updated_at"] as const;
+const FEATURE_FLAG_ADMIN_INTEGRATION_AUDIT_INSERT_COLUMNS = ["actor_id", "actor_type", "client_id", "created_at", "diff", "event_category", "event_type", "id", "metadata", "outcome", "request_id", "server_id", "source", "subject_id", "subject_type", "target_id", "target_type"] as const;
 
 export const FEATURE_FLAG_ADMIN_COLUMN_PROJECTIONS = [
   { object: "public.users", columns: ["id"] },
@@ -71,6 +161,9 @@ export const FEATURE_FLAG_ADMIN_COLUMN_PROJECTIONS = [
   { object: "public.server_lab_access", columns: ["enabled", "server_id"] },
   { object: "public.lab_definitions", columns: ["created_at", "description", "key", "name", "state", "updated_at"] },
   { object: "public.agents", columns: ["deleted_at", "id", "server_id"] },
+  { object: "public.official_app_registry", columns: ["auto_install", "client_key", "created_at", "created_by_user_id", "oauth_client_id", "publisher_server_id", "purpose", "revision", "status", "updated_at", "updated_by_user_id"] },
+  { object: "public.oauth_clients", columns: ["app_type", "client_id", "enabled", "id", "name", "publish_status", "server_id"] },
+  { object: "public.link_card_operations", columns: ["action_id", "created_at", "installation_key", "last_status_at", "message_id", "operation_id", "provider_key", "provider_kind", "receipt_revision", "resolution_reason", "resolved_at", "resolved_by_user_id", "server_id", "state", "updated_at", "viewer_id"] },
 ] as const;
 
 const FEATURE_FLAG_ADMIN_COLUMN_PRIVILEGE_OBJECTS = [
@@ -87,6 +180,10 @@ const FEATURE_FLAG_ADMIN_COLUMN_PRIVILEGE_OBJECTS = [
   "public.server_lab_access",
   "public.lab_definitions",
   "public.agents",
+  "public.official_app_registry",
+  "public.oauth_clients",
+  "public.integration_audit_events",
+  "public.link_card_operations",
 ] as const;
 
 const FEATURE_FLAG_ADMIN_COLUMN_PRIVILEGES = [
@@ -129,6 +226,21 @@ function isExpectedEffectiveColumnPrivilege(
       return (FEATURE_FLAG_ADMIN_LAB_DEFINITION_UPDATE_COLUMNS as readonly string[]).includes(columnName);
     }
   }
+  if (object === "public.official_app_registry") {
+    if (privilege === "INSERT") {
+      return (FEATURE_FLAG_ADMIN_OFFICIAL_APP_REGISTRY_INSERT_COLUMNS as readonly string[]).includes(columnName);
+    }
+    if (privilege === "UPDATE") {
+      return (FEATURE_FLAG_ADMIN_OFFICIAL_APP_REGISTRY_UPDATE_COLUMNS as readonly string[]).includes(columnName);
+    }
+  }
+  if (object === "public.link_card_operations" && privilege === "UPDATE") {
+    return (FEATURE_FLAG_ADMIN_LINK_CARD_OPERATION_UPDATE_COLUMNS as readonly string[]).includes(columnName);
+  }
+  if (object === "public.integration_audit_events") {
+    return privilege === "INSERT"
+      && (FEATURE_FLAG_ADMIN_INTEGRATION_AUDIT_INSERT_COLUMNS as readonly string[]).includes(columnName);
+  }
   return FEATURE_FLAG_ADMIN_COLUMN_PROJECTIONS.some(
     (entry) => entry.object === object
       && privilege === "SELECT"
@@ -138,6 +250,7 @@ function isExpectedEffectiveColumnPrivilege(
 
 export const FORBIDDEN_FEATURE_FLAG_ADMIN_PRIVILEGES = [
   { kind: "schema", object: "public", privilege: "CREATE" },
+  { kind: "function", object: FEATURE_FLAG_ADMIN_ANNOUNCEMENT_RULES_REACH_FUNCTION, privilege: "EXECUTE WITH GRANT OPTION" },
   { kind: "schema", object: "public", privilege: "USAGE WITH GRANT OPTION" },
   { kind: "schema", object: "public", privilege: "CREATE WITH GRANT OPTION" },
   { kind: "table", object: "public.announcements", privilege: "SELECT WITH GRANT OPTION" },
@@ -175,6 +288,12 @@ export const FORBIDDEN_FEATURE_FLAG_ADMIN_PRIVILEGES = [
   { kind: "table", object: "public.feature_flag_audience_members", privilege: "TRUNCATE" },
   { kind: "table", object: "public.feature_flag_audience_members", privilege: "REFERENCES" },
   { kind: "table", object: "public.feature_flag_audience_members", privilege: "TRIGGER" },
+  // Append-only, column-level: no table-level privilege of any kind (0384).
+  ...["SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER"].map((privilege) => ({
+    kind: "table" as const,
+    object: "public.integration_audit_events",
+    privilege,
+  })),
   ...FEATURE_FLAG_ADMIN_COLUMN_PROJECTIONS.flatMap((projection) => [
     { kind: "table" as const, object: projection.object, privilege: "SELECT" },
     { kind: "table" as const, object: projection.object, privilege: "INSERT" },
@@ -201,6 +320,7 @@ export type FeatureFlagAdminPrivilegeQuery = (
 export type FeatureFlagAdminPrivilegeCheck =
   | { readonly kind: "schema"; readonly object: string; readonly privilege: string }
   | { readonly kind: "table"; readonly object: string; readonly privilege: string }
+  | { readonly kind: "function"; readonly object: string; readonly privilege: string }
   | {
     readonly kind: "column";
     readonly object: string;
@@ -225,6 +345,7 @@ const FEATURE_FLAG_ADMIN_PRIVILEGE_MATRIX_ORACLE = `SELECT
        CASE checks.kind
          WHEN 'schema' THEN has_schema_privilege($1, checks.object, checks.privilege)
          WHEN 'table' THEN has_table_privilege($1, checks.object, checks.privilege)
+         WHEN 'function' THEN has_function_privilege($1, checks.object, checks.privilege)
          ELSE has_column_privilege($1, checks.object, checks.column_name, checks.privilege)
        END AS allowed
      FROM unnest($2::text[], $3::text[], $4::text[], $5::text[])

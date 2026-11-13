@@ -35,37 +35,18 @@
 //   `reminders_unsupported_for_external_agents`); clients can surface that
 //   before the request instead of after.
 
-import type { AgentApiRouteKey } from "./agentApiContract";
+import type { AgentApiRouteKey, CoreAgentApiRouteKey } from "./agentApiContract";
+import { AGENT_API_META, appAgentApiRoutesOf, type AgentApiRouteMeta } from "./agentApiRoute";
+import { firstPartyAppAgentApis } from "./apps";
 
-export const AGENT_API_SIDE_EFFECTS = ["read", "destructive_read", "write"] as const;
-export type AgentApiSideEffect = (typeof AGENT_API_SIDE_EFFECTS)[number];
+export { AGENT_API_AUDIENCES, AGENT_API_IDEMPOTENCY, AGENT_API_SIDE_EFFECTS } from "./agentApiRoute";
+export type { AgentApiAudience, AgentApiIdempotency, AgentApiRouteMeta, AgentApiSideEffect } from "./agentApiRoute";
 
-export const AGENT_API_IDEMPOTENCY = ["natural", "key", "none"] as const;
-export type AgentApiIdempotency = (typeof AGENT_API_IDEMPOTENCY)[number];
+const { read, naturalWrite, keyedWrite, write, naturalDestructive, destructive, managedWrite, managedNaturalDestructive } = AGENT_API_META;
 
-export const AGENT_API_AUDIENCES = ["both", "external", "managed"] as const;
-export type AgentApiAudience = (typeof AGENT_API_AUDIENCES)[number];
-
-export interface AgentApiRouteMeta {
-  sideEffect: AgentApiSideEffect;
-  idempotency: AgentApiIdempotency;
-  /** May remove, archive, rotate, transfer, or overwrite existing state (MCP `destructiveHint`). */
-  destructive: boolean;
-  audience: AgentApiAudience;
-}
-
-const read: AgentApiRouteMeta = { sideEffect: "read", idempotency: "natural", destructive: false, audience: "both" };
-// Additive writes: repeating or undoing them is another ordinary post.
-const naturalWrite: AgentApiRouteMeta = { sideEffect: "write", idempotency: "natural", destructive: false, audience: "both" };
-const keyedWrite: AgentApiRouteMeta = { sideEffect: "write", idempotency: "key", destructive: false, audience: "both" };
-const write: AgentApiRouteMeta = { sideEffect: "write", idempotency: "none", destructive: false, audience: "both" };
-// Destructive writes: remove, archive, rotate, transfer, or overwrite shared state.
-const naturalDestructive: AgentApiRouteMeta = { sideEffect: "write", idempotency: "natural", destructive: true, audience: "both" };
-const destructive: AgentApiRouteMeta = { sideEffect: "write", idempotency: "none", destructive: true, audience: "both" };
-const managedWrite: AgentApiRouteMeta = { sideEffect: "write", idempotency: "none", destructive: false, audience: "managed" };
-const managedNaturalDestructive: AgentApiRouteMeta = { sideEffect: "write", idempotency: "natural", destructive: true, audience: "managed" };
-
-export const AGENT_API_ROUTE_META = {
+/** Core's routes' metadata by hand; each app route's comes from its fragment (`meta`). */
+const CORE_AGENT_API_ROUTE_META = {
+  raftbenchFindings: { audience: "external", sideEffect: "read", idempotency: "natural", destructive: false },
   raftbenchContext: { ...read, audience: "external" },
   raftbenchSubmit: { ...naturalWrite, audience: "external" },
   feedbackLocatorIngest: naturalWrite,
@@ -76,6 +57,9 @@ export const AGENT_API_ROUTE_META = {
   historyRead: read,
   knowledgeGet: read,
   knowledgeSearch: read,
+  // #wg-ax:#15: POST only for its body; it reads a context and records the view, changes nothing else.
+  contextSearch: read,
+  contextRead: read,
   managedMcpTools: read,
   managedMcpCall: destructive,
   messageSend: keyedWrite,
@@ -84,6 +68,10 @@ export const AGENT_API_ROUTE_META = {
   messageSearch: read,
   messageReactionAdd: naturalWrite,
   messageReactionRemove: naturalDestructive,
+  // RFC 082: the sender replaces its own card (every revision is kept, and
+  // another update replaces it again), so not destructive; `idempotencyKey`
+  // makes a retry answer the first result instead of a second revision.
+  messageCardUpdate: keyedWrite,
   channelJoin: naturalWrite,
   channelLeave: naturalDestructive,
   channelMute: naturalWrite,
@@ -97,11 +85,35 @@ export const AGENT_API_ROUTE_META = {
   channelMemberRemove: naturalDestructive,
   channelMembers: read,
   resolveChannel: read,
+  threadFollow: naturalWrite,
   threadUnfollow: naturalDestructive,
   threadList: read,
   inboxList: read,
+  // RFC 081: consumes exactly the entries it returns (like `events`); clients must not auto-retry.
+  inboxRead: { sideEffect: "destructive_read", idempotency: "none", destructive: true, audience: "both" },
+  // Moves read state forward without showing anything; a repeat converges (nothing left to dismiss).
+  inboxDismiss: naturalDestructive,
   assistantOwnerInbox: read,
+  assistantOwnerArtifact: read,
+  assistantOwnerArtifactPublish: write,
   assistantOwnerMessages: read,
+  assistantSendAsOwner: write,
+  assistantForwardAsOwner: keyedWrite,
+  assistantSearchForwardTargets: read,
+  assistantOwnerActivity: read,
+  assistantOwnerResolve: read,
+  assistantCheckStateImport: naturalWrite,
+  assistantNotify: keyedWrite,
+  assistantContactRules: read,
+  assistantContactRuleAdd: naturalWrite,
+  assistantContactRuleRemove: naturalDestructive,
+  assistantContactSettings: naturalDestructive,
+  assistantOwnerSettings: read,
+  // Set-to-value: a replay converges.
+  assistantOwnerSettingsUpdate: naturalDestructive,
+  assistantContactRulesImport: naturalWrite,
+  assistantToldRecord: naturalWrite,
+  assistantToldList: read,
   agentContext: read,
   serverInfo: read,
   userChannels: read,
@@ -124,6 +136,16 @@ export const AGENT_API_ROUTE_META = {
   taskConvert: write,
   taskAmend: destructive,
   taskHistory: read,
+  taskView: read,
+  taskFollowing: read,
+  taskRead: read,
+  taskReply: keyedWrite,
+  taskFollow: naturalWrite,
+  taskUnfollow: naturalDestructive,
+  // Records what it returns as reminded: a repeat answers "no change" (single attempt).
+  taskIdleNudge: write,
+  // Starts a migration of the agent itself; a repeat is refused (one retry per failed migration).
+  migrationRetry: managedWrite,
   reminderList: read,
   reminderCreate: managedWrite,
   reminderCancel: naturalDestructive,
@@ -149,6 +171,8 @@ export const AGENT_API_ROUTE_META = {
   integrationAppList: read,
   integrationAppStatus: read,
   actionPrepare: keyedWrite,
+  // Withdraw twice and it is withdrawn; asking again undoes it, so not destructive.
+  actionWithdraw: naturalWrite,
   attachmentUpload: write,
   attachmentUploadCapabilities: read,
   attachmentUploadSessionCreate: write,
@@ -159,16 +183,29 @@ export const AGENT_API_ROUTE_META = {
   // Minting a presigned URL changes no state; each call mints a fresh URL.
   attachmentDownloadUrl: read,
   attachmentCommentsList: read,
+  // Moves the caller's read position, which only it reads; repeating converges.
+  // Moves the caller's read position over what it shows; repeating converges.
+  // Additive: a new version keeps the older ones. Natural idempotency: the
+  // same request repeated after it went through answers the version it made
+  // (same base, files, settings and publisher), never a second one.
+  // Content-addressed: the same bytes again are the same blob.
+  // A comment is a new post: repeating it comments twice.
+  // Reversible per-agent attention preferences, like mute/unmute.
   pushWebhookStatus: { sideEffect: "read", idempotency: "natural", destructive: false, audience: "external" },
   // Registering replaces the existing registration and its secret.
   pushWebhookRegister: { sideEffect: "write", idempotency: "natural", destructive: true, audience: "external" },
   pushWebhookDelete: { sideEffect: "write", idempotency: "natural", destructive: true, audience: "external" },
   mentionsList: read,
-} as const satisfies Record<AgentApiRouteKey, AgentApiRouteMeta>;
+} as const satisfies Record<CoreAgentApiRouteKey, AgentApiRouteMeta>;
 
 type AssertNever<T extends never> = T;
-type _AgentApiRouteMetaMissingRoutes = AssertNever<Exclude<AgentApiRouteKey, keyof typeof AGENT_API_ROUTE_META>>;
-type _AgentApiRouteMetaExtraRoutes = AssertNever<Exclude<keyof typeof AGENT_API_ROUTE_META, AgentApiRouteKey>>;
+type _AgentApiRouteMetaMissingRoutes = AssertNever<Exclude<CoreAgentApiRouteKey, keyof typeof CORE_AGENT_API_ROUTE_META>>;
+type _AgentApiRouteMetaExtraRoutes = AssertNever<Exclude<keyof typeof CORE_AGENT_API_ROUTE_META, CoreAgentApiRouteKey>>;
+
+export const AGENT_API_ROUTE_META: Readonly<Record<AgentApiRouteKey, AgentApiRouteMeta>> = {
+  ...CORE_AGENT_API_ROUTE_META,
+  ...Object.fromEntries(appAgentApiRoutesOf(firstPartyAppAgentApis).map(({ route }) => [route.key, route.meta])),
+} as Record<AgentApiRouteKey, AgentApiRouteMeta>;
 
 export function getAgentApiRouteMeta(key: AgentApiRouteKey): AgentApiRouteMeta {
   return AGENT_API_ROUTE_META[key];

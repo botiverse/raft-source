@@ -1,5 +1,6 @@
 // `raft integration invoke --service <service> --action <action>` — invoke a manifest-backed HTTP API action.
 
+import { findIntegrationService, findListedIntegrationService, foldAgentOneLineText } from "@botiverse/raft-shared/src/agentCliSurface";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -11,16 +12,20 @@ import type { Command } from "commander";
 
 import { createAgentApiSurfaceClient } from "../../agentApiPath";
 import { defineCommand, registerCliCommand } from "../../core/command";
-import type { CommandRuntimeOptions } from "../../core/context";
+import type { CommandContext, CommandRuntimeOptions } from "../../core/context";
+import type { AgentContext } from "../../auth/env";
 import { cliError, CliError, type FileWriteEffectState } from "../../core/errors";
 import { writeJson, writeText, NL, adoptCliReplyText } from "../../core/renderer";
 import { CanonicalFetchTransportError, fetchWithCanonicalProxy } from "../../proxy";
 import { apiFailureError } from "../_apiFailure";
-import type { IntegrationListResponse, IntegrationLoginResponse, RegisteredIntegrationService } from "./_format";
+import { agentHandoffProtocol } from "./agentHandoffDirect";
+import { loginWithAgentProof } from "./agentHandoffProof";
+import type { IntegrationLoginResponse, RegisteredIntegrationService } from "./_format";
+import { findMcpAppForService, mcpAppIsNotAgentLoginMessage } from "./_format";
 import {
   cookieHeaderForUrl,
   ensureIntegrationServiceSession,
-  loadStoredIntegrationSession,
+  loadVerifiedIntegrationSession,
   type SessionCookie,
 } from "./_session";
 import {
@@ -236,22 +241,65 @@ function actionFailureMessage(status: number, responseBody: string): string {
   return `service action failed (HTTP ${status}); response body: ${responseBody}`;
 }
 
+/**
+ * An app's own typed answer (`{ error: { code, message, details? } }`, as
+ * Raft Artifacts sends): its message often says what happened and what to do
+ * next ("Held — not posted. … repeat this call with seen=44 …"), so it goes on
+ * its own line instead of inside one escaped JSON line after "failed".
+ * Anything else keeps `actionFailureMessage`.
+ */
+function appAnsweredMessage(status: number, body: unknown): string | null {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return null;
+  const error = (body as { error?: unknown }).error;
+  if (!error || typeof error !== "object" || Array.isArray(error)) return null;
+  const { code, message, details, request_id: requestId, ...errorRest } = error as Record<string, unknown>;
+  if (typeof code !== "string" || !code.trim() || typeof message !== "string" || !message.trim()) return null;
+  const lines = [
+    `service action answered HTTP ${status} ${redactCredentialText(code.trim())}:`,
+    truncateActionErrorBody(redactCredentialText(message.trim())),
+  ];
+  if (details && typeof details === "object" && Object.keys(details).length > 0) {
+    lines.push(`details: ${formatJsonActionErrorBody(details)}`);
+  }
+  if (typeof requestId === "string" && requestId.trim()) lines.push(`request_id: ${redactCredentialText(requestId.trim())}`);
+  // Nothing the app sent is dropped: any other field follows, redacted like the rest.
+  const { error: _error, ...bodyRest } = body as Record<string, unknown>;
+  const rest = { ...(Object.keys(errorRest).length > 0 ? { error: errorRest } : {}), ...bodyRest };
+  if (Object.keys(rest).length > 0) lines.push(`other fields: ${formatJsonActionErrorBody(rest)}`);
+  return lines.join("\n");
+}
+
+/**
+ * A non-2xx action answer. 401, and a 403 without the App's own typed error,
+ * mean the stored service session was refused: log in again. A 403 that
+ * carries the App's typed error (`FORBIDDEN`, `PUBLIC_ADMIN_REQUIRED`, …) is the
+ * App refusing the action itself; logging in again would not change it, so it
+ * reads as the App's answer, with no login step.
+ */
+function actionFailureError(status: number, body: unknown, responseBody: string, serviceClientId: string) {
+  const answered = appAnsweredMessage(status, body);
+  if (status === 401 || (status === 403 && answered === null)) {
+    return cliError(
+      "INTEGRATION_INVOKE_FAILED",
+      rejectedSessionMessage(status, responseBody),
+      {
+        suggestedNextAction: `Run \`raft integration login --service ${serviceClientId}\` and retry the action.`,
+      },
+    );
+  }
+  return cliError("INTEGRATION_INVOKE_FAILED", answered ?? actionFailureMessage(status, responseBody));
+}
+
+function parsedJsonBody(rawBody: string): unknown {
+  try {
+    return JSON.parse(rawBody);
+  } catch {
+    return undefined;
+  }
+}
+
 function rejectedSessionMessage(status: number, responseBody: string): string {
   return `service session was rejected or expired (HTTP ${status}); response body: ${responseBody}`;
-}
-
-function normalizeService(value: string): string {
-  return value.trim().toLowerCase();
-}
-
-function findService(data: IntegrationListResponse, service: string): RegisteredIntegrationService | null {
-  const normalized = normalizeService(service);
-  if (!normalized) return null;
-  return data.services.find((candidate) =>
-    candidate.id === service
-    || normalizeService(candidate.clientId) === normalized
-    || normalizeService(candidate.name) === normalized
-  ) ?? null;
 }
 
 function normalizeScopes(raw: string[] | undefined): string[] | undefined {
@@ -1258,20 +1306,7 @@ async function invokeHttpAction(input: {
   if (isFileResponse) {
     if (!response.ok) {
       const rawBody = await response.text().catch(() => "");
-      const responseBody = formatActionErrorBody(rawBody);
-      if (response.status === 401 || response.status === 403) {
-        throw cliError(
-          "INTEGRATION_INVOKE_FAILED",
-          rejectedSessionMessage(response.status, responseBody),
-          {
-            suggestedNextAction: `Run \`raft integration login --service ${input.service.clientId}\` and retry the action.`,
-          },
-        );
-      }
-      throw cliError(
-        "INTEGRATION_INVOKE_FAILED",
-        actionFailureMessage(response.status, responseBody),
-      );
+      throw actionFailureError(response.status, parsedJsonBody(rawBody), formatActionErrorBody(rawBody), input.service.clientId);
     }
     const { filePath, defaultTempDir } = resolveDownloadPath({
       action: input.action,
@@ -1319,40 +1354,14 @@ async function invokeHttpAction(input: {
       throw cliError("INVALID_JSON_RESPONSE", `service action returned invalid JSON (HTTP ${response.status})`);
     }
     if (!response.ok) {
-      const responseBody = formatJsonActionErrorBody(value);
-      if (response.status === 401 || response.status === 403) {
-        throw cliError(
-          "INTEGRATION_INVOKE_FAILED",
-          rejectedSessionMessage(response.status, responseBody),
-          {
-            suggestedNextAction: `Run \`raft integration login --service ${input.service.clientId}\` and retry the action.`,
-          },
-        );
-      }
-      throw cliError(
-        "INTEGRATION_INVOKE_FAILED",
-        actionFailureMessage(response.status, responseBody),
-      );
+      throw actionFailureError(response.status, value, formatJsonActionErrorBody(value), input.service.clientId);
     }
     return { kind: "json", status: response.status, value };
   }
 
   const value = await response.text();
   if (!response.ok) {
-    const responseBody = formatActionErrorBody(value);
-    if (response.status === 401 || response.status === 403) {
-      throw cliError(
-        "INTEGRATION_INVOKE_FAILED",
-        rejectedSessionMessage(response.status, responseBody),
-        {
-          suggestedNextAction: `Run \`raft integration login --service ${input.service.clientId}\` and retry the action.`,
-        },
-      );
-    }
-    throw cliError(
-      "INTEGRATION_INVOKE_FAILED",
-      actionFailureMessage(response.status, responseBody),
-    );
+    throw actionFailureError(response.status, parsedJsonBody(value), formatActionErrorBody(value), input.service.clientId);
   }
   return { kind: "text", status: response.status, value };
 }
@@ -1423,7 +1432,7 @@ function formatV1Actions(input: {
   sessionPresent: boolean;
 }): string {
   const lines = [
-    `Actions for ${input.service.name}`,
+    `Actions for ${foldAgentOneLineText(input.service.name)}`,
     `service: ${input.service.clientId}`,
     `manifest: ${input.manifestUrl}`,
     "schema: raft-agent-manifest.v1",
@@ -1454,7 +1463,7 @@ function formatV1Actions(input: {
     });
     lines.push(`- ${action.name}`);
     lines.push(`  endpoint: ${action.endpoint.method} ${action.endpoint.path}`);
-    if (action.description) lines.push(`  description: ${action.description}`);
+    if (action.description) lines.push(`  description: ${foldAgentOneLineText(action.description)}`);
     lines.push(`  effect: ${action.effect}`);
     lines.push(`  idempotency: ${action.idempotency.mode}`);
     lines.push(`  readback: ${action.readback.mode}`);
@@ -1471,7 +1480,7 @@ function formatMissingManifestActions(input: {
   observation: ManifestObservation;
 }): string {
   return [
-    `Actions for ${input.service.name}`,
+    `Actions for ${foldAgentOneLineText(input.service.name)}`,
     `service: ${input.service.clientId}`,
     `manifest: ${input.observation.manifest_url ?? "-"}`,
     `manifest status: ${input.observation.status}`,
@@ -1766,6 +1775,281 @@ function formatActionPreflightV1(data: ReturnType<typeof actionPreflightDataV1>)
   ].join("\n");
 }
 
+type IntegrationApi = ReturnType<typeof createAgentApiSurfaceClient>;
+
+/** The registered service an invoke names: listed id or client id first, then the server's answer for an old id or a name. */
+async function resolveInvokeService(api: IntegrationApi, serviceQuery: string): Promise<RegisteredIntegrationService> {
+  const listRes = await api.integrations.list();
+  if (!listRes.ok || !listRes.data) {
+    throw apiFailureError(listRes, "INTEGRATION_LIST_FAILED");
+  }
+
+  // A listed id or client id needs no second call; for an old id or a name the server decides.
+  let service = findListedIntegrationService(listRes.data.services, serviceQuery);
+  if (!service) {
+    const asked = await api.integrations.list({ service: serviceQuery });
+    service = findIntegrationService(asked.ok && asked.data ? asked.data : listRes.data, serviceQuery);
+  }
+  if (!service) {
+    const mcpApp = findMcpAppForService(listRes.data, serviceQuery);
+    if (mcpApp) throw cliError("INTEGRATION_SERVICE_IS_MCP_APP", mcpAppIsNotAgentLoginMessage(mcpApp, "invoke"));
+    throw cliError("INTEGRATION_NOT_FOUND", `No registered integration matched ${serviceQuery}`);
+  }
+  return service;
+}
+
+interface ResolvedActionInvokeInput {
+  cmdCtx: CommandContext;
+  agentContext: AgentContext;
+  api: IntegrationApi;
+  service: RegisteredIntegrationService;
+  payload: Record<string, unknown>;
+  scope?: string[];
+  target?: string;
+  json?: boolean;
+}
+
+/** A manifest v1 action: contract preflight, stored session or Agent Login, then the call. */
+async function invokeResolvedV1Action(input: ResolvedActionInvokeInput & {
+  manifest: AgentManifestV1;
+  action: AgentManifestActionV1;
+  retryInvocation?: string;
+}) {
+  const { agentContext, api, service, manifest, action, payload } = input;
+  try {
+    preflightManifestActionV1({
+      actorContext: agentContext,
+      service,
+      manifest,
+      action,
+      payload,
+    });
+  } catch (error) {
+    if (error instanceof IntegrationV1Error) raiseIntegrationV1Error(error, input.json);
+    throw error;
+  }
+  const storedSession = await loadVerifiedIntegrationSession({ service, agentContext, env: input.cmdCtx.env, api });
+  const requestedScopes = normalizeScopes(input.scope);
+  let cookies = requestedScopes || input.target ? null : storedSession?.cookies ?? null;
+  if (!cookies) {
+    const loginScopes = normalizeScopes([
+      ...(input.scope ?? []),
+      ...action.authority.required_scopes,
+    ]);
+    const flow = await loginWithAgentProof({ api, context: agentContext, env: input.cmdCtx.env, body: {
+      service: service.clientId,
+      scopes: loginScopes,
+      target: input.target?.trim() || undefined,
+    } });
+    const loginRes = flow.result;
+    if (!loginRes.ok || !loginRes.data) {
+      const error = new IntegrationV1Error({
+        schema: "raft-integration-error.v1",
+        code: loginRes.errorCode ?? (loginRes.status >= 500 ? "SERVER_5XX" : "INTEGRATION_AUTH_NOT_READY"),
+        message: loginRes.error ?? `Agent Login failed with HTTP ${loginRes.status}.`,
+        service_id: service.clientId,
+        action: action.name,
+        effect: action.effect,
+        fault_domain: "auth",
+        retryable: loginRes.status >= 500,
+        evidence: {
+          manifest: "valid",
+          auth: "not_ready",
+          authority: "unknown",
+          transport: "not_attempted",
+          response_schema: "not_run",
+          readback: "not_run",
+        },
+        schema_path: null,
+        http_status: loginRes.status,
+        request_id: null,
+        next_action: `Run \`raft integration login --service ${JSON.stringify(service.clientId)}\` and retry.`,
+      });
+      raiseIntegrationV1Error(error, input.json);
+    }
+    agentHandoffProtocol(loginRes.data.agentHandoffProtocol);
+    if (loginRes.data.status === "approval_required") {
+      const error = new IntegrationV1Error({
+        schema: "raft-integration-error.v1",
+        code: "INTEGRATION_AUTH_NOT_READY",
+        message: "Human approval is required before invoking this integration action.",
+        service_id: service.clientId,
+        action: action.name,
+        effect: action.effect,
+        fault_domain: "auth",
+        retryable: false,
+        evidence: {
+          manifest: "valid",
+          auth: "not_ready",
+          authority: "unknown",
+          transport: "not_attempted",
+          response_schema: "not_run",
+          readback: "not_run",
+        },
+        schema_path: null,
+        http_status: null,
+        request_id: loginRes.data.approval?.requestId ?? loginRes.data.requestId ?? null,
+        next_action: approvalRequiredNextAction({
+          service,
+          login: loginRes.data,
+          requestedTarget: input.target,
+        }),
+      });
+      raiseIntegrationV1Error(error, input.json);
+    }
+    const session = await ensureIntegrationServiceSession({
+      login: loginRes.data,
+      service,
+      agentContext,
+      env: input.cmdCtx.env,
+      api,
+      verifier: flow.verifier,
+      refresh: true,
+    }).finally(() => { if (loginRes.data?.agentHandoffProtocol === "v1") flow.clear(); });
+    cookies = session.cookies;
+  }
+
+  let result;
+  try {
+    result = await invokeManifestActionV1({
+      actorContext: agentContext,
+      env: input.cmdCtx.env,
+      service,
+      manifest,
+      action,
+      payload,
+      cookies,
+      retryInvocationId: input.retryInvocation?.trim() || undefined,
+    });
+  } catch (error) {
+    if (error instanceof IntegrationV1Error) raiseIntegrationV1Error(error, input.json);
+    throw error;
+  }
+  return result;
+}
+
+/** A manifest v0 action: required params, stored session or Agent Login, then the HTTP call. */
+async function invokeResolvedV0Action(input: ResolvedActionInvokeInput & {
+  manifest: AgentManifestV0;
+  action: AgentManifestActionV0;
+  output?: string;
+}): Promise<ActionResult> {
+  const { agentContext, api, service, manifest, action, payload } = input;
+  validateRequiredParams(action, payload);
+  const scopes = normalizeScopes(input.scope);
+  const storedSession = scopes || input.target
+    ? null
+    : await loadVerifiedIntegrationSession({ service, agentContext, env: input.cmdCtx.env, api });
+  let cookies = storedSession?.cookies ?? null;
+  if (!cookies) {
+    const flow = await loginWithAgentProof({ api, context: agentContext, env: input.cmdCtx.env, body: {
+      service: service.clientId,
+      scopes,
+      target: input.target?.trim() || undefined,
+    } });
+    const loginRes = flow.result;
+    if (!loginRes.ok || !loginRes.data) {
+      const code = loginRes.errorCode
+        ?? (loginRes.status >= 500 ? "SERVER_5XX" : "INTEGRATION_LOGIN_FAILED");
+      throw cliError(code, loginRes.error ?? `HTTP ${loginRes.status}`);
+    }
+    agentHandoffProtocol(loginRes.data.agentHandoffProtocol);
+    if (loginRes.data.status === "approval_required") {
+      throw cliError(
+        "INTEGRATION_APPROVAL_REQUIRED",
+        "human approval is required before invoking this integration action",
+        {
+          suggestedNextAction: approvalRequiredNextAction({
+            service,
+            login: loginRes.data,
+            requestedTarget: input.target,
+          }),
+        },
+      );
+    }
+
+    const session = await ensureIntegrationServiceSession({
+      login: loginRes.data,
+      service,
+      agentContext,
+      env: input.cmdCtx.env,
+      api,
+      verifier: flow.verifier,
+      refresh: true,
+    }).finally(() => { if (loginRes.data?.agentHandoffProtocol === "v1") flow.clear(); });
+    cookies = session.cookies;
+  }
+
+  const url = resolveActionUrl({ service, manifest, action, payload });
+  let result: ActionResult;
+  try {
+    result = await invokeHttpAction({
+      url,
+      action,
+      payload,
+      cookies,
+      service,
+      env: input.cmdCtx.env,
+      output: input.output,
+    });
+  } catch (error) {
+    setCliErrorOutputMode(error, input.json);
+    throw error;
+  }
+  return result;
+}
+
+/**
+ * Invoke one app action the way `raft integration invoke` does (service lookup,
+ * manifest, stored session or Agent Login, the call) and return the action's
+ * parsed answer. Throws the same typed errors. For commands built on an app
+ * (`raft reminder trigger`) that print their own output.
+ */
+export async function invokeAppAction(
+  cmdCtx: CommandContext,
+  input: {
+    service: string;
+    action: string;
+    payload: Record<string, unknown>;
+    json?: boolean;
+    /** A command that targets a first-party app by name: only the platform-marked official service counts, never a look-alike. */
+    requireOfficial?: boolean;
+  },
+): Promise<{ service: RegisteredIntegrationService; value: unknown }> {
+  const agentContext = cmdCtx.loadAgentContext();
+  const api = createAgentApiSurfaceClient(cmdCtx.createApiClient(agentContext));
+  const service = await resolveInvokeService(api, input.service);
+  if (input.requireOfficial && service.official !== true) {
+    throw cliError("INTEGRATION_NOT_FOUND", `No official integration matched ${input.service}`);
+  }
+  const manifest = await fetchManifestForInvoke({
+    probe: await probeIntegrationManifest(service, { env: cmdCtx.env }),
+  });
+  const common = { cmdCtx, agentContext, api, service, payload: input.payload, json: input.json };
+  if (manifest.schema === "slock-agent-manifest.v1") {
+    if (manifest.execution.mode === "local_cli") {
+      raiseIntegrationV1Error(localCliDesignBlockedError({ serviceId: service.clientId, action: input.action }), input.json);
+    }
+    const action = manifest.actions.find((candidate) => candidate.name === input.action);
+    if (!action) {
+      raiseIntegrationV1Error(actionUndeclaredV1Error({ serviceId: service.clientId, action: input.action }), input.json);
+    }
+    const result = await invokeResolvedV1Action({ ...common, manifest, action });
+    return { service, value: result.value };
+  }
+  if (manifest.execution.mode !== "http_api") {
+    throw cliError("INTEGRATION_MANIFEST_UNSUPPORTED", "manifest execution mode is not http_api");
+  }
+  const action = (manifest.actions ?? []).find((candidate) => candidate.name === input.action);
+  if (!action) throw cliError("INVALID_ARG", `manifest does not define action ${input.action}`);
+  if (action.response?.type === "file") {
+    throw cliError("INVALID_ARG", `${input.action} returns a file; use raft integration invoke --output`);
+  }
+  const result = await invokeResolvedV0Action({ ...common, manifest, action });
+  if (result.kind === "file") throw cliError("INTERNAL_BUG", "a JSON action returned a file");
+  return { service, value: result.value };
+}
+
 export const integrationInvokeCommand = defineCommand(
   {
     name: "invoke",
@@ -1774,7 +2058,7 @@ export const integrationInvokeCommand = defineCommand(
     options: [
       { flags: "--service <id>", description: "Registered service id, client id, or exact service name" },
       { flags: "--action <name>", description: "Manifest action name to invoke" },
-      { flags: "--list-actions", description: "List manifest actions instead of invoking one" },
+      { flags: "--list-actions", description: "List manifest actions without invoking; combine with --action NAME to inspect one" },
       {
         flags: "--preflight",
         description: "Check the exact manifest action and existing session without login or invocation",
@@ -1822,15 +2106,7 @@ export const integrationInvokeCommand = defineCommand(
     const agentContext = cmdCtx.loadAgentContext();
     const client = cmdCtx.createApiClient(agentContext);
     const api = createAgentApiSurfaceClient(client);
-    const listRes = await api.integrations.list();
-    if (!listRes.ok || !listRes.data) {
-      throw apiFailureError(listRes, "INTEGRATION_LIST_FAILED");
-    }
-
-    const service = findService(listRes.data, serviceQuery);
-    if (!service) {
-      throw cliError("INTEGRATION_NOT_FOUND", `No registered integration matched ${serviceQuery}`);
-    }
+    const service = await resolveInvokeService(api, serviceQuery);
 
     const manifestProbe = await probeIntegrationManifest(service, { env: cmdCtx.env });
     if (
@@ -1861,10 +2137,13 @@ export const integrationInvokeCommand = defineCommand(
 
     if (manifest.schema === "slock-agent-manifest.v1") {
       if (opts.listActions) {
+        const listedActions = manifest.actions.filter((action) => !actionName || action.name === actionName);
+        if (actionName && listedActions.length === 0) throw cliError("INVALID_ARG", `manifest does not define action ${actionName}`);
+        const listedManifest = { ...manifest, actions: listedActions };
         const storedSession = manifest.execution.mode === "local_cli"
           ? null
-          : loadStoredIntegrationSession({ service, agentContext, env: cmdCtx.env });
-        const actionReadiness = manifest.actions.map((action) =>
+          : await loadVerifiedIntegrationSession({ service, agentContext, env: cmdCtx.env, api });
+        const actionReadiness = listedActions.map((action) =>
           buildIntegrationReadinessV1({
             actorId: agentContext.agentId,
             observation: manifestProbe.observation,
@@ -1882,7 +2161,7 @@ export const integrationInvokeCommand = defineCommand(
               status: manifestProbe.observation.status,
               surface: manifestProbe.observation.surface,
               manifestObservation: manifestProbe.observation,
-              actions: manifest.actions,
+              actions: listedActions,
               actionReadiness,
             },
           });
@@ -1891,7 +2170,7 @@ export const integrationInvokeCommand = defineCommand(
         writeText(cmdCtx.io, adoptCliReplyText(formatV1Actions({
           service,
           manifestUrl: service.agentManifestUrl ?? "-",
-          manifest,
+          manifest: listedManifest,
           observation: manifestProbe.observation,
           actorId: agentContext.agentId,
           sessionPresent: Boolean(storedSession),
@@ -1916,7 +2195,7 @@ export const integrationInvokeCommand = defineCommand(
         throw cliError("INVALID_ARG", "--output is only available for manifest v0 file-response actions");
       }
       if (opts.preflight) {
-        const storedSession = loadStoredIntegrationSession({ service, agentContext, env: cmdCtx.env });
+        const storedSession = await loadVerifiedIntegrationSession({ service, agentContext, env: cmdCtx.env, api });
         let sessionUrl: URL;
         try {
           sessionUrl = actionSessionProbeUrlV1({ service, manifest, action });
@@ -1942,111 +2221,19 @@ export const integrationInvokeCommand = defineCommand(
         return;
       }
       const payload = parseActionPayload(opts, (name) => declaredV1ParamType(action, name));
-      try {
-        preflightManifestActionV1({
-          actorContext: agentContext,
-          service,
-          manifest,
-          action,
-          payload,
-        });
-      } catch (error) {
-        if (error instanceof IntegrationV1Error) raiseIntegrationV1Error(error, opts.json);
-        throw error;
-      }
-      const storedSession = loadStoredIntegrationSession({ service, agentContext, env: cmdCtx.env });
-      const requestedScopes = normalizeScopes(opts.scope);
-      let cookies = requestedScopes || opts.target ? null : storedSession?.cookies ?? null;
-      if (!cookies) {
-        const loginScopes = normalizeScopes([
-          ...(opts.scope ?? []),
-          ...action.authority.required_scopes,
-        ]);
-        const loginRes = await api.integrations.login({
-          service: service.clientId,
-          scopes: loginScopes,
-          target: opts.target?.trim() || undefined,
-        });
-        if (!loginRes.ok || !loginRes.data) {
-          const error = new IntegrationV1Error({
-            schema: "raft-integration-error.v1",
-            code: loginRes.errorCode ?? (loginRes.status >= 500 ? "SERVER_5XX" : "INTEGRATION_AUTH_NOT_READY"),
-            message: loginRes.error ?? `Agent Login failed with HTTP ${loginRes.status}.`,
-            service_id: service.clientId,
-            action: action.name,
-            effect: action.effect,
-            fault_domain: "auth",
-            retryable: loginRes.status >= 500,
-            evidence: {
-              manifest: "valid",
-              auth: "not_ready",
-              authority: "unknown",
-              transport: "not_attempted",
-              response_schema: "not_run",
-              readback: "not_run",
-            },
-            schema_path: null,
-            http_status: loginRes.status,
-            request_id: null,
-            next_action: `Run \`raft integration login --service ${JSON.stringify(service.clientId)}\` and retry.`,
-          });
-          raiseIntegrationV1Error(error, opts.json);
-        }
-        if (loginRes.data.status === "approval_required") {
-          const error = new IntegrationV1Error({
-            schema: "raft-integration-error.v1",
-            code: "INTEGRATION_AUTH_NOT_READY",
-            message: "Human approval is required before invoking this integration action.",
-            service_id: service.clientId,
-            action: action.name,
-            effect: action.effect,
-            fault_domain: "auth",
-            retryable: false,
-            evidence: {
-              manifest: "valid",
-              auth: "not_ready",
-              authority: "unknown",
-              transport: "not_attempted",
-              response_schema: "not_run",
-              readback: "not_run",
-            },
-            schema_path: null,
-            http_status: null,
-            request_id: loginRes.data.approval?.requestId ?? loginRes.data.requestId ?? null,
-            next_action: approvalRequiredNextAction({
-              service,
-              login: loginRes.data,
-              requestedTarget: opts.target,
-            }),
-          });
-          raiseIntegrationV1Error(error, opts.json);
-        }
-        const session = await ensureIntegrationServiceSession({
-          login: loginRes.data,
-          service,
-          agentContext,
-          env: cmdCtx.env,
-          refresh: true,
-        });
-        cookies = session.cookies;
-      }
-
-      let result;
-      try {
-        result = await invokeManifestActionV1({
-          actorContext: agentContext,
-          env: cmdCtx.env,
-          service,
-          manifest,
-          action,
-          payload,
-          cookies,
-          retryInvocationId: opts.retryInvocation?.trim() || undefined,
-        });
-      } catch (error) {
-        if (error instanceof IntegrationV1Error) raiseIntegrationV1Error(error, opts.json);
-        throw error;
-      }
+      const result = await invokeResolvedV1Action({
+        cmdCtx,
+        agentContext,
+        api,
+        service,
+        manifest,
+        action,
+        payload,
+        scope: opts.scope,
+        target: opts.target,
+        retryInvocation: opts.retryInvocation,
+        json: opts.json,
+      });
       if (opts.json) {
         writeJson(cmdCtx.io, {
           ok: true,
@@ -2082,9 +2269,11 @@ export const integrationInvokeCommand = defineCommand(
     }
 
     if (opts.listActions) {
+      const listedActions = (manifest.actions ?? []).filter((action) => !actionName || action.name === actionName);
+      if (actionName && listedActions.length === 0) throw cliError("INVALID_ARG", `manifest does not define action ${actionName}`);
       const data = buildIntegrationActionListData({
         service,
-        manifest,
+        manifest: { ...manifest, actions: listedActions },
         observation: manifestProbe.observation,
       });
       if (opts.json) {
@@ -2102,63 +2291,19 @@ export const integrationInvokeCommand = defineCommand(
     }
 
     const payload = parseActionPayload(opts, (name) => action.parameters?.[name]?.type);
-    validateRequiredParams(action, payload);
-    const scopes = normalizeScopes(opts.scope);
-    const storedSession = scopes || opts.target
-      ? null
-      : loadStoredIntegrationSession({ service, agentContext, env: cmdCtx.env });
-    let cookies = storedSession?.cookies ?? null;
-    if (!cookies) {
-      const loginRes = await api.integrations.login({
-        service: service.clientId,
-        scopes,
-        target: opts.target?.trim() || undefined,
-      });
-      if (!loginRes.ok || !loginRes.data) {
-        const code = loginRes.errorCode
-          ?? (loginRes.status >= 500 ? "SERVER_5XX" : "INTEGRATION_LOGIN_FAILED");
-        throw cliError(code, loginRes.error ?? `HTTP ${loginRes.status}`);
-      }
-      if (loginRes.data.status === "approval_required") {
-        throw cliError(
-          "INTEGRATION_APPROVAL_REQUIRED",
-          "human approval is required before invoking this integration action",
-          {
-            suggestedNextAction: approvalRequiredNextAction({
-              service,
-              login: loginRes.data,
-              requestedTarget: opts.target,
-            }),
-          },
-        );
-      }
-
-      const session = await ensureIntegrationServiceSession({
-        login: loginRes.data,
-        service,
-        agentContext,
-        env: cmdCtx.env,
-        refresh: true,
-      });
-      cookies = session.cookies;
-    }
-
-    const url = resolveActionUrl({ service, manifest, action, payload });
-    let result: ActionResult;
-    try {
-      result = await invokeHttpAction({
-        url,
-        action,
-        payload,
-        cookies,
-        service,
-        env: cmdCtx.env,
-        output: opts.output,
-      });
-    } catch (error) {
-      setCliErrorOutputMode(error, opts.json);
-      throw error;
-    }
+    const result = await invokeResolvedV0Action({
+      cmdCtx,
+      agentContext,
+      api,
+      service,
+      manifest,
+      action,
+      payload,
+      scope: opts.scope,
+      target: opts.target,
+      output: opts.output,
+      json: opts.json,
+    });
     if (opts.json) {
       const data: Record<string, unknown> = {
         service: service.clientId,

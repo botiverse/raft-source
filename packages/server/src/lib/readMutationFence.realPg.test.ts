@@ -300,7 +300,6 @@ async function writeFirstAgainstTransition<T>(
       actorUserId: seeded.owner.id,
       targetUserId: seeded.actor.id,
       nextRole: "admin",
-      guestTransitionsEnabled: false,
     }));
     // Behind the frozen write on `servers` (this order) or on the actor's member row (an order without the servers lock).
     await waitForLockWaiter(observer, "%for update%", writePid);

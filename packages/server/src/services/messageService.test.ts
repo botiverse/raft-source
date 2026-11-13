@@ -1,23 +1,22 @@
+import { fillJointMembersFromChannelHumans } from "../test/jointMemberFill";
 import { dbTest as test } from "../test/integration/dbTest";
 import { closeTestDatabase, openTestDatabase } from "../test/integration/database";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { BasicTracer, CANONICAL_MESSAGE_FIELD_DESCRIPTORS, MemoryTraceSink, MESSAGE_REPLIES_SYNC_WINDOW_PRODUCER } from "@botiverse/raft-shared";
 import { enrichedMessagePayloadKeys } from "./messageRealtimeProducerRegistry";
-import { buildNotificationPushProjectionTargets, buildNotificationPushSocketTargets, buildPushTargetsFromContext, broadcastAndDeliver, broadcastSystemMessage, createMessage, deliverExternalInboundCommittedMessageToAgents, deliverMessageToAgent, deliverMessageToAgents, emitExternalProjectionMessageToFrontend, runExternalInboundCommitSideEffects, emitExternalReactionMessageUpdateToFrontend, getAgentResumeCatchupMessages, type AgentResumeCatchupResult, getSenderPendingMentionActions, getSenderReadReceiptInFlightCountForTests, planDirectMentionThreadFollow, registerSenderReadReceiptForTests, selectCanonicalWebPushProjectionTargets, __resetMessageServiceDepsForTests, __setMessageServiceDepsForTests } from "./messageService";
+import { broadcastAndDeliver, broadcastSystemMessage, createMessage, recordInboxFactsForPersistedMessages, deliverExternalInboundCommittedMessageToAgents, deliverMessageToAgent, deliverMessageToAgents, emitExternalProjectionMessageToFrontend, runExternalInboundCommitSideEffects, emitExternalLinkedMessageUpdateToFrontend, getAgentResumeCatchupMessages, type AgentResumeCatchupResult, getSenderPendingMentionActions, getSenderReadReceiptInFlightCountForTests, planDirectMentionThreadFollow, registerSenderReadReceiptForTests, __resetMessageServiceDepsForTests, __setMessageServiceDepsForTests } from "./messageService";
 import { __resetAgentSendReplayDbForTests, __setAgentSendReplayDbForTests } from "./agentSendReplayService";
 import { CompatibilityReadMutationPendingError } from "./readMutationSequencer";
 import { recordInboxNotificationFacts } from "./inboxNotificationService";
 import { ensureMentionDeliveryOccurrences, listRecoverableMentionDeliveriesForAgent } from "./mentionDeliveryOccurrenceService";
-import { socketClientKindRoom } from "../socket/platformScope";
-import { getActiveJointChannelProjectionsByLocalChannel, getActiveJointThreadProjectionsByCanonicalThread, getAgentLegacyReadCursor, getAgentUnreadCounts, markAgentLegacyAckCheckpoint, type AgentInboxChainRow, getJointThreadProjectionForMember, getOrCreateThread } from "./channelService";
+import { getActiveJointThreadProjectionsByCanonicalThread, getAgentLegacyReadCursor, getAgentUnreadCounts, markAgentLegacyAckCheckpoint, type AgentInboxChainRow, getJointThreadProjectionForMember, getOrCreateThread } from "./channelService";
 import * as taskService from "./taskService";
 import { closeDatabase, getDb } from "../db/index";
-import { agents, agentChannelReadCursors, attachments, channelAgents, channelHumans, channels, externalActorProjections, externalAddressabilityProjections, externalAppInstalls, externalAppRegistrations, externalAppServerGrants, externalBindingAudienceSnapshots, externalChannelBindings, externalMentionFacts, externalMessageLinks, externalProjectionAvatarArtifacts, externalReactionStates, inboxNotificationFacts, inboxTargetMuteStates, jointChannels, jointChannelServers, mentionDeliveryOccurrences, messageMentions, messages, oauthClients, serverMembers, servers, threadFollows, users } from "../db/schema";
+import { agents, agentChannelReadCursors, attachments, channelAgents, channelHumans, channels, externalActorProjections, externalAddressabilityProjections, externalAppInstalls, externalAppRegistrations, externalAppServerGrants, externalBindingAudienceSnapshots, externalChannelBindings, externalMentionFacts, externalMessageLinks, externalProjectionAvatarArtifacts, externalReactionStates, inboxNotificationFacts, inboxTargetMuteStates, jointChannels, jointChannelServers, mentionDeliveryOccurrences, messageMentions, messages, oauthClients, serverMembers, servers, tasks, threadFollows, users } from "../db/schema";
 import { insertCanonicalExternalMessage } from "./externalProjectionService";
 import { withTraceRoot } from "../tracing/semanticTrace";
-import { summarizePushBody } from "./pushDisplay";
 import { referenceAgentInboxChain } from "../test/agentInboxChainReference";
 import { withChannelDelivery } from "../test/orchestratorStub";
 
@@ -131,14 +130,15 @@ function createAgentSendReplayDb() {
               return Promise.resolve(rows).then(resolve, reject);
             },
           });
-          return {
-            leftJoin() {
-              return {
-                where() {
-                  return makeAfterWhere([]);
-                },
-              };
+          // Joined reads (attachment linking's inner join, others' left joins) find nothing here.
+          const joined = () => ({
+            where() {
+              return makeAfterWhere([]);
             },
+          });
+          return {
+            leftJoin: joined,
+            innerJoin: joined,
             where() {
               const rows = table === messages ? [...byKey.values()] : [];
               return makeAfterWhere(rows);
@@ -374,8 +374,6 @@ test("closeDatabase waits for broadcastAndDeliver sender read receipt before pgl
         uniqueName: fallbackName,
         description: null,
       }),
-      buildPushTargets: async () => new Map(),
-      sendPushNotifications: async () => undefined,
     });
 
     const { io } = createIoRecorder();
@@ -386,6 +384,9 @@ test("closeDatabase waits for broadcastAndDeliver sender read receipt before pgl
       senderName: "Ray",
       content: "pending sender read receipt",
     });
+    // The (empty) agent delivery aggregate settles within a tick; only the
+    // read receipt stays in flight.
+    await new Promise<void>((resolve) => setImmediate(resolve));
     assert.equal(getSenderReadReceiptInFlightCountForTests(), 1);
 
     let closeResolved = false;
@@ -462,8 +463,6 @@ test("broadcastAndDeliver sender read receipt failures do not retain production 
         uniqueName: fallbackName,
         description: null,
       }),
-      buildPushTargets: async () => new Map(),
-      sendPushNotifications: async () => undefined,
     });
 
     const { io } = createIoRecorder();
@@ -528,8 +527,6 @@ test("broadcastAndDeliver swallows typed pending sender read receipts on the pro
         uniqueName: fallbackName,
         description: null,
       }),
-      buildPushTargets: async () => new Map(),
-      sendPushNotifications: async () => undefined,
     });
 
     const { io } = createIoRecorder();
@@ -593,8 +590,6 @@ test("broadcastAndDeliver continues after post-persist thread follower read fail
       uniqueName: fallbackName,
       description: null,
     }),
-    buildPushTargets: async () => new Map(),
-    sendPushNotifications: async () => undefined,
     getMentionFactsForMessages: async () => new Map(),
   });
 
@@ -738,8 +733,6 @@ test("broadcastAndDeliver reuses inbox-selected thread agents for wake delivery"
     },
     markRead: async () => undefined,
     markAgentLegacyRead: async () => undefined,
-    buildPushTargets: async () => new Map(),
-    sendPushNotifications: async () => undefined,
     renderAgentReadablePermalinks: async (content: string) => content,
     getSenderIdentity: async (_senderType, _senderId, fallbackName) => ({
       uniqueName: fallbackName,
@@ -862,8 +855,6 @@ test("broadcastAndDeliver repairs same-send mentioned agent follow when inbox fa
     ])),
     markRead: async () => undefined,
     markAgentLegacyRead: async () => undefined,
-    buildPushTargets: async () => new Map(),
-    sendPushNotifications: async () => undefined,
     renderAgentReadablePermalinks: async (content: string) => content,
     recordInboxNotificationFacts,
     getJointThreadProjectionForMember,
@@ -947,8 +938,6 @@ test("broadcastAndDeliver message:new does not emit storage-only message columns
       uniqueName: fallbackName,
       description: null,
     }),
-    buildPushTargets: async () => new Map(),
-    sendPushNotifications: async () => undefined,
     getMentionFactsForMessages: async () => new Map(),
     insertMentionRows: async () => [],
   });
@@ -1020,8 +1009,6 @@ test("broadcastAndDeliver message:new and send response carry every manifest mes
       senderIdentityCalls.push(senderId);
       return { uniqueName: fallbackName, description: "Reviews pull requests" };
     },
-    buildPushTargets: async () => new Map(),
-    sendPushNotifications: async () => undefined,
     getMentionFactsForMessages: async () => new Map(),
     insertMentionRows: async () => [],
   });
@@ -1044,6 +1031,8 @@ test("broadcastAndDeliver message:new and send response carry every manifest mes
   assert.deepEqual(emitted.reactions, []);
   assert.equal(emitted.externalAuthor, null);
   assert.equal(emitted.commentRef, null);
+  // Manifest v7 (RFC 077): a brand-new message is not retracted.
+  assert.equal(emitted.deletedAt, null);
   // The HTTP send response is the same body minus the frame-only context.
   const responseMissing = MESSAGE_NEW_MANIFEST_KEYS
     .filter((key) => key !== "conversationContext")
@@ -1094,6 +1083,7 @@ test("broadcastSystemMessage message:new carries every manifest messageNew key w
   assert.deepEqual(emitted.reactions, []);
   assert.deepEqual(emitted.attachments, []);
   assert.deepEqual(emitted.mentions, []);
+  assert.equal(emitted.deletedAt, null);
 });
 
 test("a committed external projection emits one enriched message:new with its frozen avatar", async ({ db }) => {
@@ -1217,7 +1207,7 @@ test("a committed external projection emits one enriched message:new with its fr
     lastEventSequence: 1,
   });
 
-  await emitExternalReactionMessageUpdateToFrontend(io, localMessage.id);
+  await emitExternalLinkedMessageUpdateToFrontend(io, localMessage.id);
   const updated = events.find((event) => (
     event.room === `channel:${channel.id}` && event.event === "message:updated"
   ))?.payload;
@@ -1450,7 +1440,7 @@ test("a Joint canonical commit keeps face-channel delivery and never takes the t
   assert.equal(threads.length, 0, "joint commits must not create canonical threads");
 });
 
-test("external reaction updates fan out once to every local Joint channel projection", async ({ db }) => {
+test("external linked body and reaction updates fan out once to every local Joint channel projection", async ({ db }) => {
   const [ownerA] = await db.insert(users).values({
     email: "reaction-joint-owner-a@test.com",
     name: "ReactionJointOwnerA",
@@ -1492,6 +1482,7 @@ test("external reaction updates fan out once to every local Joint channel projec
     { jointChannelId: joint.id, serverId: serverA.id, localChannelId: localA.id, role: "host", status: "active", joinedByUserId: ownerA.id },
     { jointChannelId: joint.id, serverId: serverB.id, localChannelId: localB.id, role: "participant", status: "active", joinedByUserId: ownerB.id },
   ]);
+  await fillJointMembersFromChannelHumans();
   const [message] = await db.insert(messages).values({
     channelId: canonical.id,
     senderType: "agent",
@@ -1502,8 +1493,9 @@ test("external reaction updates fan out once to every local Joint channel projec
   await seedSlackReactionForMessage({ messageId: message.id, projectionId: reactor.id, key: "joint-channel" });
 
   const beforeInboxFacts = await db.select({ id: inboxNotificationFacts.id }).from(inboxNotificationFacts);
+  await db.update(messages).set({ content: "updated provider body", searchText: "updated provider body" }).where(eq(messages.id, message.id));
   const { io, events } = createIoRecorder();
-  await emitExternalReactionMessageUpdateToFrontend(io, message.id);
+  await emitExternalLinkedMessageUpdateToFrontend(io, message.id);
 
   assert.deepEqual(events.map(({ room, event }) => ({ room, event })).sort((a, b) => a.room.localeCompare(b.room)), [
     { room: `channel:${localA.id}`, event: "message:updated" },
@@ -1511,6 +1503,7 @@ test("external reaction updates fan out once to every local Joint channel projec
   ].sort((a, b) => a.room.localeCompare(b.room)));
   for (const event of events) {
     assert.equal(event.payload.channelId, event.room.slice("channel:".length));
+    assert.equal(event.payload.content, "updated provider body");
     assert.equal(event.payload.senderType, "agent");
     assert.equal(event.payload.senderId, sender.id);
     assert.equal(event.payload.senderName, sender.name);
@@ -1525,7 +1518,8 @@ test("external reaction updates fan out once to every local Joint channel projec
   assert.deepEqual(await db.select({ id: inboxNotificationFacts.id }).from(inboxNotificationFacts), beforeInboxFacts);
 });
 
-test("external reaction updates use only ordinary and Joint thread rooms with sender identity intact", async ({ db }) => {
+for (const updateThreadPreview of [false, true]) for (const parentType of ["channel", "private"] as const) {
+test(`external linked updates preserve ordinary and Joint thread projections (preview=${updateThreadPreview}, parent=${parentType})`, async ({ db }) => {
   const [ownerA] = await db.insert(users).values({
     email: "reaction-thread-owner-a@test.com",
     name: "ReactionThreadOwnerA",
@@ -1556,7 +1550,8 @@ test("external reaction updates use only ordinary and Joint thread rooms with se
     observedAt: new Date("2026-09-05T16:00:00.000Z"),
   }).returning();
 
-  const [ordinaryParent] = await db.insert(channels).values({ serverId: serverA.id, name: "reaction-ordinary-parent", type: "channel" }).returning();
+  const [ordinaryParent] = await db.insert(channels).values({ serverId: serverA.id, name: "reaction-ordinary-parent", type: parentType }).returning();
+  await db.insert(channelHumans).values({ channelId: ordinaryParent.id, userId: ownerA.id });
   const [ordinaryParentMessage] = await db.insert(messages).values({
     channelId: ordinaryParent.id,
     senderType: "user",
@@ -1584,6 +1579,7 @@ test("external reaction updates use only ordinary and Joint thread rooms with se
     { jointChannelId: parentJoint.id, serverId: serverA.id, localChannelId: localParentA.id, role: "host", status: "active", joinedByUserId: ownerA.id },
     { jointChannelId: parentJoint.id, serverId: serverB.id, localChannelId: localParentB.id, role: "participant", status: "active", joinedByUserId: ownerB.id },
   ]);
+  await fillJointMembersFromChannelHumans();
   const [canonicalParentMessage] = await db.insert(messages).values({
     channelId: canonicalParent.id,
     senderType: "user",
@@ -1608,6 +1604,7 @@ test("external reaction updates use only ordinary and Joint thread rooms with se
     { jointChannelId: threadJoint.id, serverId: serverA.id, localChannelId: localThreadA.id, role: "host", status: "active", joinedByUserId: ownerA.id },
     { jointChannelId: threadJoint.id, serverId: serverB.id, localChannelId: localThreadB.id, role: "participant", status: "active", joinedByUserId: ownerB.id },
   ]);
+  await fillJointMembersFromChannelHumans();
   const externalReply = await db.transaction((executor) => insertCanonicalExternalMessage({
     executor,
     channelId: canonicalThread.id,
@@ -1627,11 +1624,11 @@ test("external reaction updates use only ordinary and Joint thread rooms with se
 
   const beforeInboxFacts = await db.select({ id: inboxNotificationFacts.id }).from(inboxNotificationFacts);
   const { io, events } = createIoRecorder();
-  await emitExternalReactionMessageUpdateToFrontend(io, ordinaryReply.id);
-  await emitExternalReactionMessageUpdateToFrontend(io, externalReply.message.id);
+  await emitExternalLinkedMessageUpdateToFrontend(io, ordinaryReply.id, { updateThreadPreview });
+  await emitExternalLinkedMessageUpdateToFrontend(io, externalReply.message.id, { updateThreadPreview });
 
-  assert.equal(events.every(({ event }) => event === "message:updated"), true);
-  assert.equal(events.some(({ room }) => room === `channel:${ordinaryParent.id}`), false);
+  assert.equal(events.filter(({ event }) => event === "message:updated").length, 3);
+  assert.equal(events.some(({ room }) => room === `channel:${ordinaryParent.id}`), updateThreadPreview);
   assert.equal(events.some(({ room }) => room === `channel:${canonicalParent.id}`), false);
   assert.equal(events.some(({ room }) => room === `channel:${canonicalThread.id}`), false);
   const ordinaryEvent = events.find(({ room }) => room === `channel:${ordinaryThread.id}`);
@@ -1643,7 +1640,7 @@ test("external reaction updates use only ordinary and Joint thread rooms with se
     channelType: "thread",
     parentMessageId: ordinaryParentMessage.id,
     parentChannelId: ordinaryParent.id,
-    parentChannelType: "channel",
+    parentChannelType: parentType,
   });
 
   for (const [localThread, localParent] of [[localThreadA, localParentA], [localThreadB, localParentB]] as const) {
@@ -1667,9 +1664,24 @@ test("external reaction updates use only ordinary and Joint thread rooms with se
       reactorNames: [reactor.displayName],
     }]);
   }
-  assert.equal(events.length, 3, "each local thread projection receives exactly one merge-only update");
+  assert.equal(events.length, updateThreadPreview ? 6 : 3, "each intended room receives one merge-only update");
+  if (updateThreadPreview) {
+    const ordinaryParentEvent = events.find(({ room }) => room === `channel:${ordinaryParent.id}`)!;
+    assert.equal(ordinaryParentEvent.event, "thread:reply_updated");
+    assert.equal(ordinaryParentEvent.payload.channelId, ordinaryThread.id);
+    assert.equal(ordinaryParentEvent.payload.id, ordinaryReply.id);
+    assert.equal(new Date(ordinaryParentEvent.payload.updatedAt).getTime(), ordinaryReply.updatedAt.getTime());
+    for (const [localThread, localParent] of [[localThreadA, localParentA], [localThreadB, localParentB]] as const) {
+      const parentEvent = events.find(({ room }) => room === `channel:${localParent.id}`)!;
+      assert.equal(parentEvent.event, "thread:reply_updated");
+      assert.equal(parentEvent.payload.channelId, localThread.id);
+      assert.equal(parentEvent.payload.id, externalReply.message.id);
+      assert.equal(parentEvent.payload.conversationContext.parentChannelId, localParent.id);
+    }
+  }
   assert.deepEqual(await db.select({ id: inboxNotificationFacts.id }).from(inboxNotificationFacts), beforeInboxFacts);
 });
+}
 
 test("broadcastSystemMessage records inbox facts for persistent system messages and honors mute", async ({ db }) => {
   const [owner] = await db.insert(users).values({
@@ -1793,6 +1805,41 @@ test("broadcastSystemMessage records inbox facts for persistent system messages 
   assert.equal(ownerLifecycleFact?.unreadEligible, false, "the user who moved the task is born-read (#9)");
 });
 
+/**
+ * Task v2: createTasks writes no message with task v2 conversations on (the
+ * task gets its own conversation). The delivery tests below pin the VISIBLE
+ * task-linked message path
+ * (converted and pre-v2 tasks), so they seed that shape directly: a chat row,
+ * its task.body inbox facts, and a canonical task linked to it.
+ */
+async function seedVisibleHostTask(channelId: string, ownerId: string, title: string) {
+  const db = getDb();
+  const hostMessage = await createMessage(channelId, "user", ownerId, title);
+  await recordInboxFactsForPersistedMessages([hostMessage], {
+    inboxFactPolicy: {
+      mode: "record",
+      producer: "task.body",
+      reason: "visible task host messages are durable shared work items",
+    },
+    dedupeLogicalReceiverAcrossJointProjections: true,
+  });
+  const [{ maxNumber }] = await db
+    .select({ maxNumber: sql<number>`COALESCE(MAX(${tasks.taskNumber}), 0)::int` })
+    .from(tasks)
+    .where(eq(tasks.channelId, channelId));
+  const [task] = await db.insert(tasks).values({
+    channelId,
+    taskNumber: Number(maxNumber) + 1,
+    title,
+    status: "todo",
+    createdByType: "user",
+    createdById: ownerId,
+    messageId: hostMessage.id,
+    sourceMessageId: hostMessage.id,
+  }).returning();
+  return { tasks: [task!], hostMessages: [hostMessage] };
+}
+
 test("task-created direct agent delivery honors channel mute for body and summary messages", async ({ db }) => {
   const [owner] = await db.insert(users).values({
     email: "task-create-mute-owner@test.com",
@@ -1828,7 +1875,7 @@ test("task-created direct agent delivery honors channel mute for body and summar
     muteFromSeq: 1,
   });
 
-  const { tasks: [task], hostMessages: [taskHostMessage] } = await taskService.createTasks(channel.id, "user", owner.id, [{ title: "muted task body" }]);
+  const { tasks: [task], hostMessages: [taskHostMessage] } = await seedVisibleHostTask(channel.id, owner.id, "muted task body");
   const amendment = await taskService.amendTask(task.id, {
     title: "current amended task body",
     description: "current amended details",
@@ -1927,7 +1974,7 @@ test("task-created direct agent delivery includes parent channel metadata for th
     reason: "manual",
   });
 
-  const { tasks: [task], hostMessages: [taskHostMessage] } = await taskService.createTasks(threadChannel.id, "user", owner.id, [{ title: "thread task body" }]);
+  const { tasks: [task], hostMessages: [taskHostMessage] } = await seedVisibleHostTask(threadChannel.id, owner.id, "thread task body");
   const deliveries: { agentId: string; payload: any }[] = [];
   const orchestrator = withChannelDelivery({
     deliverMessage: async (agentId: string, payload: any) => {
@@ -2020,7 +2067,7 @@ test("task-created direct agent delivery keeps followed threads independent from
     sourceChannelId: parentChannel.id,
     muteFromSeq: parent.seq + 1,
   });
-  const { hostMessages: [taskHostMessage] } = await taskService.createTasks(thread.id, "user", owner.id, [{ title: "muted thread task body" }]);
+  const { hostMessages: [taskHostMessage] } = await seedVisibleHostTask(thread.id, owner.id, "muted thread task body");
 
   const deliveries: { agentId: string; payload: any }[] = [];
   const orchestrator = withChannelDelivery({
@@ -2080,7 +2127,7 @@ test("task-created followed-thread delivery projects task assignee metadata with
     sourceChannelId: parentChannel.id,
     muteFromSeq: parent.seq + 1,
   });
-  const { tasks: [task], hostMessages: [assignedTask] } = await taskService.createTasks(thread.id, "user", owner.id, [{ title: "muted assigned thread task" }]);
+  const { tasks: [task], hostMessages: [assignedTask] } = await seedVisibleHostTask(thread.id, owner.id, "muted assigned thread task");
   // v1.4: assignment lives on the canonical task row, not messages.task_*.
   // The host message below carries no task columns at all — delivery must
   // still ship task_assignee_id, which is only
@@ -2256,6 +2303,7 @@ test("agent resume recovers joint channels and threads from storage, labelled as
     { jointChannelId: joint.id, serverId: serverA.id, localChannelId: localA.id, role: "host", status: "active", joinedByUserId: ownerA.id },
     { jointChannelId: joint.id, serverId: serverB.id, localChannelId: localB.id, role: "participant", status: "active", joinedByUserId: ownerB.id },
   ]);
+  await fillJointMembersFromChannelHumans();
   const [membership] = await db.insert(channelAgents).values({ channelId: localB.id, agentId: agent.id }).returning();
 
   const parent = await createMessage(canonical.id, "user", ownerA.id, "joint parent");
@@ -2281,6 +2329,7 @@ test("agent resume recovers joint channels and threads from storage, labelled as
     { jointChannelId: threadJoint.id, serverId: serverA.id, localChannelId: threadA.id, role: "host", status: "active", joinedByUserId: ownerA.id },
     { jointChannelId: threadJoint.id, serverId: serverB.id, localChannelId: threadB.id, role: "participant", status: "active", joinedByUserId: ownerB.id },
   ]);
+  await fillJointMembersFromChannelHumans();
   const [follow] = await db.insert(threadFollows).values({
     followerType: "agent",
     followerId: agent.id,
@@ -2415,6 +2464,7 @@ async function seedJointMentionOccurrenceFixture(db: ReturnType<typeof getDb>, s
     { channelId: localB.id, userId: ownerB.id },
   ]);
   await db.insert(channelAgents).values({ channelId: localB.id, agentId: agent.id });
+  await fillJointMembersFromChannelHumans();
   const delivered: { agentId: string; payload: any; options?: any }[] = [];
   let signalAgentDelivered!: () => void;
   // Joint channel deliveries are scheduled after broadcastAndDeliver returns.
@@ -2487,6 +2537,7 @@ test("a joint thread mention persists the agent's occurrence payload and passes 
     { jointChannelId: threadJoint.id, serverId: f.serverA.id, localChannelId: threadA.id, role: "host", status: "active", joinedByUserId: f.ownerA.id },
     { jointChannelId: threadJoint.id, serverId: f.serverB.id, localChannelId: threadB.id, role: "participant", status: "active", joinedByUserId: f.ownerB.id },
   ]);
+  await fillJointMembersFromChannelHumans();
   const { io } = createIoRecorder();
 
   const reply = await broadcastAndDeliver(io, f.orchestrator, {
@@ -2880,965 +2931,6 @@ test("agent thread resume and unread require current private parent membership",
   assert.equal((await getAgentUnreadCounts(agent.id, await referenceAgentInboxChain(agent.id)))[`#${threadName}`], undefined);
 });
 
-function legacyPushEntries(targets: ReturnType<typeof buildPushTargetsFromContext>) {
-  return [...targets.entries()].map(([userId, payload]) => [userId, {
-    title: payload.title,
-    body: payload.body,
-    tag: payload.tag,
-    url: payload.url,
-  }]);
-}
-
-test("buildPushTargetsFromContext builds DM pushes and excludes the sender", () => {
-  const targets = buildPushTargetsFromContext({
-    serverSlug: "acme",
-    serverName: "Acme Workspace",
-    channel: { id: "dm-1", type: "dm", name: "ray", parentMessageId: null },
-    messageId: "msg-1",
-    senderId: "user-1",
-    senderType: "user",
-    senderName: "Ray",
-    body: "hello",
-    dmHumans: [
-      { id: "user-1", name: "ray" },
-      { id: "user-2", name: "tygg" },
-    ],
-  });
-
-  assert.deepEqual(legacyPushEntries(targets), [[
-    "user-2",
-    {
-      title: "DM · Acme Workspace",
-      body: "Ray: hello",
-      tag: "message:msg-1",
-      url: "/s/acme/dm/dm-1?msg=msg-1",
-    },
-  ]]);
-});
-
-test("buildPushTargetsFromContext pushes channel messages to all joined humans and uses mention-specific titles", () => {
-  const targets = buildPushTargetsFromContext({
-    serverSlug: "acme",
-    serverName: "Acme Workspace",
-    channel: { id: "channel-1", type: "channel", name: "engineering", parentMessageId: null },
-    messageId: "msg-2",
-    senderId: "user-1",
-    senderType: "user",
-    senderName: "Ray",
-    body: "hi @tygg",
-    mentionNames: new Set(["tygg"]),
-    humanScopeMembers: [
-      { id: "user-1", name: "ray" },
-      { id: "user-2", name: "tygg" },
-      { id: "user-3", name: "applepi" },
-    ],
-  });
-
-  assert.deepEqual(legacyPushEntries(targets), [
-    [
-      "user-2",
-      {
-        title: "#engineering · Acme Workspace",
-        body: "Ray mentioned you: hi @tygg",
-        tag: "message:msg-2",
-        url: "/s/acme/channel/channel-1?msg=msg-2",
-      },
-    ],
-    [
-      "user-3",
-      {
-        title: "#engineering · Acme Workspace",
-        body: "Ray: hi @tygg",
-        tag: "message:msg-2",
-        url: "/s/acme/channel/channel-1?msg=msg-2",
-      },
-    ],
-  ]);
-});
-
-test("buildPushTargetsFromContext excludes users who muted the server", () => {
-  const targets = buildPushTargetsFromContext({
-    serverSlug: "acme",
-    serverName: "Acme Workspace",
-    channel: { id: "channel-1", type: "channel", name: "engineering", parentMessageId: null },
-    messageId: "msg-muted",
-    senderId: "user-1",
-    senderType: "user",
-    senderName: "Ray",
-    body: "hi @tygg",
-    mentionNames: new Set(["tygg"]),
-    mutedUserIds: new Set(["user-2"]),
-    humanScopeMembers: [
-      { id: "user-1", name: "ray" },
-      { id: "user-2", name: "tygg" },
-      { id: "user-3", name: "applepi" },
-    ],
-  });
-
-  assert.deepEqual(legacyPushEntries(targets), [[
-    "user-3",
-    {
-      title: "#engineering · Acme Workspace",
-      body: "Ray: hi @tygg",
-      tag: "message:msg-muted",
-      url: "/s/acme/channel/channel-1?msg=msg-muted",
-    },
-  ]]);
-});
-
-test("buildPushTargetsFromContext also notifies visible non-joined humans when they are mentioned in a public channel", () => {
-  const targets = buildPushTargetsFromContext({
-    serverSlug: "acme",
-    serverName: "Acme Workspace",
-    channel: { id: "channel-1", type: "channel", name: "engineering", parentMessageId: null },
-    messageId: "msg-2b",
-    senderId: "user-1",
-    senderType: "user",
-    senderName: "Ray",
-    body: "hi @tygg and @applepi",
-    mentionNames: new Set(["tygg", "applepi"]),
-    mentionedUserIds: new Set(["user-3"]),
-    humanScopeMembers: [
-      { id: "user-1", name: "ray" },
-      { id: "user-2", name: "tygg" },
-    ],
-    humanMentionOnlyMembers: [{ id: "user-3", name: "applepi" }],
-  });
-
-  assert.deepEqual(legacyPushEntries(targets), [
-    [
-      "user-2",
-      {
-        title: "#engineering · Acme Workspace",
-        body: "Ray mentioned you: hi @tygg and @applepi",
-        tag: "message:msg-2b",
-        url: "/s/acme/channel/channel-1?msg=msg-2b",
-      },
-    ],
-    [
-      "user-3",
-      {
-        title: "#engineering · Acme Workspace",
-        body: "Ray mentioned you: hi @tygg and @applepi",
-        tag: "message:msg-2b",
-        url: "/s/acme/channel/channel-1?msg=msg-2b",
-      },
-    ],
-  ]);
-});
-
-test("buildPushTargetsFromContext does not notify visible non-joined humans from a name-only mention fallback", () => {
-  const targets = buildPushTargetsFromContext({
-    serverSlug: "acme",
-    serverName: "Acme Workspace",
-    channel: { id: "channel-1", type: "channel", name: "engineering", parentMessageId: null },
-    messageId: "msg-2c",
-    senderId: "user-1",
-    senderType: "user",
-    senderName: "Ray",
-    body: "hi @applepi",
-    mentionNames: new Set(["applepi"]),
-    humanScopeMembers: [
-      { id: "user-1", name: "ray" },
-      { id: "user-2", name: "tygg" },
-    ],
-    humanMentionOnlyMembers: [{ id: "user-3", name: "applepi" }],
-  });
-
-  assert.deepEqual(legacyPushEntries(targets), [[
-    "user-2",
-    {
-      title: "#engineering · Acme Workspace",
-      body: "Ray: hi @applepi",
-      tag: "message:msg-2c",
-      url: "/s/acme/channel/channel-1?msg=msg-2c",
-    },
-  ]]);
-});
-
-test("buildPushTargetsFromContext does not notify non-members mentioned in a private channel", () => {
-  const targets = buildPushTargetsFromContext({
-    serverSlug: "acme",
-    serverName: "Acme Workspace",
-    channel: { id: "private-1", type: "private", name: "secret", parentMessageId: null },
-    messageId: "msg-private",
-    senderId: "user-1",
-    senderType: "user",
-    senderName: "Ray",
-    body: "hi @tygg and @applepi",
-    mentionNames: new Set(["tygg", "applepi"]),
-    humanScopeMembers: [
-      { id: "user-1", name: "ray" },
-      { id: "user-2", name: "tygg" },
-    ],
-    humanMentionOnlyMembers: [{ id: "user-3", name: "applepi" }],
-  });
-
-  assert.deepEqual(legacyPushEntries(targets), [[
-    "user-2",
-    {
-      title: "#secret · Acme Workspace",
-      body: "Ray mentioned you: hi @tygg and @applepi",
-      tag: "message:msg-private",
-      url: "/s/acme/channel/private-1?msg=msg-private",
-    },
-  ]]);
-});
-
-test("buildPushTargetsFromContext pushes joint projection messages to local members only", () => {
-  const targets = buildPushTargetsFromContext({
-    serverSlug: "peer-lab",
-    serverName: "Peer Lab",
-    channel: { id: "joint-projection-1", type: "joint", name: "partner-design-room", parentMessageId: null },
-    messageId: "msg-joint",
-    senderId: "user-1",
-    senderType: "user",
-    senderName: "Ray",
-    body: "hi @tygg",
-    mentionNames: new Set(["tygg"]),
-    humanScopeMembers: [
-      { id: "user-1", name: "ray" },
-      { id: "user-2", name: "tygg" },
-    ],
-    humanMentionOnlyMembers: [{ id: "user-3", name: "applepi" }],
-  });
-
-  assert.deepEqual(legacyPushEntries(targets), [[
-    "user-2",
-    {
-      title: "#partner-design-room · Peer Lab",
-      body: "Ray mentioned you: hi @tygg",
-      tag: "message:msg-joint",
-      url: "/s/peer-lab/channel/joint-projection-1?msg=msg-joint",
-    },
-  ]]);
-});
-
-test("buildPushTargetsFromContext pushes thread replies only to followed humans", () => {
-  const targets = buildPushTargetsFromContext({
-    serverSlug: "acme",
-    serverName: "Acme Workspace",
-    channel: { id: "thread-1", type: "thread", name: "thread-1", parentMessageId: "parent-1" },
-    messageId: "msg-3",
-    senderId: "agent-1",
-    senderType: "agent",
-    senderName: "Ray",
-    body: "please take a look",
-    parentChannel: { id: "channel-1", type: "channel", name: "engineering" },
-    followedUserIds: ["user-1"],
-    mentionNames: new Set(["tygg"]),
-    humanScopeMembers: [{ id: "user-1", name: "tygg" }],
-  });
-
-  assert.deepEqual(legacyPushEntries(targets), [[
-    "user-1",
-    {
-      title: "Thread in #engineering · Acme Workspace",
-      body: "Ray: please take a look",
-      tag: "message:msg-3",
-      url: "/s/acme/channel/channel-1?thread=channel-1%3Aparent-1&msg=msg-3",
-    },
-  ]]);
-});
-
-test("buildPushTargetsFromContext excludes muted users from followed thread reply pushes", () => {
-  const targets = buildPushTargetsFromContext({
-    serverSlug: "acme",
-    serverName: "Acme Workspace",
-    channel: { id: "thread-1", type: "thread", name: "thread-1", parentMessageId: "parent-1" },
-    messageId: "msg-thread-muted",
-    senderId: "agent-1",
-    senderType: "agent",
-    senderName: "Ray",
-    body: "please take a look",
-    parentChannel: { id: "channel-1", type: "channel", name: "engineering" },
-    followedUserIds: ["user-1", "user-2"],
-    mutedUserIds: new Set(["user-1"]),
-  });
-
-  assert.deepEqual(legacyPushEntries(targets), [[
-    "user-2",
-    {
-      title: "Thread in #engineering · Acme Workspace",
-      body: "Ray: please take a look",
-      tag: "message:msg-thread-muted",
-      url: "/s/acme/channel/channel-1?thread=channel-1%3Aparent-1&msg=msg-thread-muted",
-    },
-  ]]);
-});
-
-test("buildPushTargetsFromContext does not push thread replies to non-followed mentions", () => {
-  const targets = buildPushTargetsFromContext({
-    serverSlug: "acme",
-    channel: { id: "thread-2", type: "thread", name: "thread-2", parentMessageId: "parent-2" },
-    messageId: "msg-4",
-    senderId: "user-1",
-    senderType: "user",
-    senderName: "Ray",
-    body: "ping",
-    parentChannel: { id: "dm-2", type: "dm", name: "ray" },
-    mentionNames: new Set(["tygg"]),
-    humanScopeMembers: [{ id: "user-2", name: "tygg" }],
-  });
-
-  assert.deepEqual(legacyPushEntries(targets), []);
-});
-
-const LEGACY_NOTIFICATION_PUSH_SOCKET_PAYLOAD_KEYS = [
-  "body",
-  "channelId",
-  "kind",
-  "messageId",
-  "parentChannelId",
-  "parentMessageId",
-  "serverId",
-  "tag",
-  "threadId",
-  "title",
-  "url",
-].sort();
-
-const STRUCTURED_NOTIFICATION_PUSH_SOCKET_PAYLOAD_KEYS = [
-  ...LEGACY_NOTIFICATION_PUSH_SOCKET_PAYLOAD_KEYS,
-  "channelName",
-  "messagePreview",
-  "mentioned",
-  "parentChannelKind",
-  "senderId",
-  "senderName",
-  "senderType",
-  "serverName",
-].sort();
-
-function pushMapToTargets(targets: Map<string, { title: string; body: string; tag: string; url: string }>) {
-  return [...targets.entries()].map(([userId, payload]) => ({ userId, payload }));
-}
-
-test("buildNotificationPushSocketTargets mirrors DM push targets with a closed typed identity payload", () => {
-  const pushTargets = buildPushTargetsFromContext({
-    serverSlug: "acme",
-    serverName: "Acme Workspace",
-    channel: { id: "dm-1", type: "dm", name: "ray", parentMessageId: null },
-    messageId: "msg-dm-socket",
-    senderId: "user-1",
-    senderType: "user",
-    senderName: "Ray",
-    body: "hello",
-    dmHumans: [
-      { id: "user-1", name: "ray" },
-      { id: "user-2", name: "tygg" },
-    ],
-  });
-
-  const socketTargets = buildNotificationPushSocketTargets(pushMapToTargets(pushTargets), {
-    serverId: "server-1",
-    kind: "dm",
-    channelId: "dm-1",
-    threadId: null,
-    parentChannelId: null,
-    parentMessageId: null,
-    messageId: "msg-dm-socket",
-  });
-
-  assert.deepEqual(socketTargets.map((target) => target.userId), [...pushTargets.keys()]);
-  assert.deepEqual(Object.keys(socketTargets[0]!.payload).sort(), STRUCTURED_NOTIFICATION_PUSH_SOCKET_PAYLOAD_KEYS);
-  assert.deepEqual(socketTargets[0]!.payload, {
-    title: "DM · Acme Workspace",
-    body: "Ray: hello",
-    tag: "message:msg-dm-socket",
-    url: "/s/acme/dm/dm-1?msg=msg-dm-socket",
-    serverName: "Acme Workspace",
-    channelName: null,
-    parentChannelKind: null,
-    senderId: "user-1",
-    senderName: "Ray",
-    senderType: "user",
-    messagePreview: "hello",
-    mentioned: false,
-    serverId: "server-1",
-    kind: "dm",
-    channelId: "dm-1",
-    threadId: null,
-    parentChannelId: null,
-    parentMessageId: null,
-    messageId: "msg-dm-socket",
-  });
-});
-
-test("Web Push and mobile socket transports share the same plain-text Markdown preview", () => {
-  const messagePreview = summarizePushBody(
-    "## **Release ready** — read the [runbook](https://example.com/runbook).",
-    0,
-  );
-  const pushTargets = buildPushTargetsFromContext({
-    serverSlug: "acme",
-    serverName: "Acme Workspace",
-    channel: { id: "dm-1", type: "dm", name: "ray", parentMessageId: null },
-    messageId: "msg-markdown-preview",
-    senderId: "user-1",
-    senderType: "user",
-    senderName: "Ray",
-    body: messagePreview,
-    dmHumans: [
-      { id: "user-1", name: "ray" },
-      { id: "user-2", name: "tygg" },
-    ],
-  });
-  const socketTargets = buildNotificationPushSocketTargets(pushMapToTargets(pushTargets), {
-    serverId: "server-1",
-    kind: "dm",
-    channelId: "dm-1",
-    threadId: null,
-    parentChannelId: null,
-    parentMessageId: null,
-    messageId: "msg-markdown-preview",
-  });
-
-  assert.equal(messagePreview, "Release ready — read the runbook.");
-  assert.equal(pushTargets.get("user-2")?.body, "Ray: Release ready — read the runbook.");
-  assert.equal(socketTargets[0]?.payload.body, pushTargets.get("user-2")?.body);
-  assert.equal(socketTargets[0]?.payload.messagePreview, messagePreview);
-});
-
-test("buildNotificationPushSocketTargets preserves muted channel target exclusions", () => {
-  const pushTargets = buildPushTargetsFromContext({
-    serverSlug: "acme",
-    serverName: "Acme Workspace",
-    channel: { id: "channel-1", type: "channel", name: "engineering", parentMessageId: null },
-    messageId: "msg-muted-socket",
-    senderId: "user-1",
-    senderType: "user",
-    senderName: "Ray",
-    body: "hi @tygg",
-    mentionNames: new Set(["tygg"]),
-    mutedUserIds: new Set(["user-2"]),
-    humanScopeMembers: [
-      { id: "user-1", name: "ray" },
-      { id: "user-2", name: "tygg" },
-      { id: "user-3", name: "applepi" },
-    ],
-  });
-
-  const socketTargets = buildNotificationPushSocketTargets(pushMapToTargets(pushTargets), {
-    serverId: "server-1",
-    kind: "channel",
-    channelId: "channel-1",
-    threadId: null,
-    parentChannelId: null,
-    parentMessageId: null,
-    messageId: "msg-muted-socket",
-  });
-
-  assert.deepEqual(socketTargets.map((target) => target.userId), ["user-3"]);
-});
-
-test("buildNotificationPushSocketTargets preserves followed-thread target scope", () => {
-  const pushTargets = buildPushTargetsFromContext({
-    serverSlug: "acme",
-    serverName: "Acme Workspace",
-    channel: { id: "thread-1", type: "thread", name: "thread-1", parentMessageId: "parent-1" },
-    messageId: "msg-thread-socket",
-    senderId: "agent-1",
-    senderType: "agent",
-    senderName: "Ray",
-    body: "please take a look",
-    parentChannel: { id: "channel-1", type: "channel", name: "engineering" },
-    followedUserIds: ["user-1"],
-  });
-
-  const socketTargets = buildNotificationPushSocketTargets(pushMapToTargets(pushTargets), {
-    serverId: "server-1",
-    kind: "thread",
-    channelId: "thread-1",
-    threadId: "thread-1",
-    parentChannelId: "channel-1",
-    parentMessageId: "parent-1",
-    messageId: "msg-thread-socket",
-  });
-
-  assert.deepEqual(socketTargets.map((target) => target.userId), [...pushTargets.keys()]);
-  assert.deepEqual(socketTargets[0]!.payload, {
-    title: "Thread in #engineering · Acme Workspace",
-    body: "Ray: please take a look",
-    tag: "message:msg-thread-socket",
-    url: "/s/acme/channel/channel-1?thread=channel-1%3Aparent-1&msg=msg-thread-socket",
-    serverName: "Acme Workspace",
-    channelName: "engineering",
-    parentChannelKind: "channel",
-    senderId: "agent-1",
-    senderName: "Ray",
-    senderType: "agent",
-    messagePreview: "please take a look",
-    mentioned: false,
-    serverId: "server-1",
-    kind: "thread",
-    channelId: "thread-1",
-    threadId: "thread-1",
-    parentChannelId: "channel-1",
-    parentMessageId: "parent-1",
-    messageId: "msg-thread-socket",
-  });
-});
-
-test("buildNotificationPushProjectionTargets preserves receiver-local identities for one user on both joint servers", () => {
-  const targets = buildNotificationPushProjectionTargets([
-    {
-      targets: new Map([["user-shared", {
-        title: "Thread in #partners · Alpha Workspace",
-        body: "Ray: hello from the joint thread",
-        tag: "message:msg-joint-thread",
-        url: "/s/alpha/channel/parent-alpha?thread=parent-alpha%3Aparent-message&msg=msg-joint-thread",
-      }]]),
-      identity: {
-        serverId: "server-alpha",
-        kind: "thread",
-        channelId: "thread-alpha",
-        threadId: "thread-alpha",
-        parentChannelId: "parent-alpha",
-        parentMessageId: "parent-message",
-        messageId: "msg-joint-thread",
-      },
-    },
-    {
-      targets: new Map([["user-shared", {
-        title: "Thread in #partners · Beta Workspace",
-        body: "Ray: hello from the joint thread",
-        tag: "message:msg-joint-thread",
-        url: "/s/beta/channel/parent-beta?thread=parent-beta%3Aparent-message&msg=msg-joint-thread",
-      }]]),
-      identity: {
-        serverId: "server-beta",
-        kind: "thread",
-        channelId: "thread-beta",
-        threadId: "thread-beta",
-        parentChannelId: "parent-beta",
-        parentMessageId: "parent-message",
-        messageId: "msg-joint-thread",
-      },
-    },
-    {
-      targets: new Map(),
-      identity: {
-        serverId: "server-without-local-recipient",
-        kind: "thread",
-        channelId: "thread-empty",
-        threadId: "thread-empty",
-        parentChannelId: "parent-empty",
-        parentMessageId: "parent-message",
-        messageId: "msg-joint-thread",
-      },
-    },
-  ]).sort((left, right) => left.identity.serverId.localeCompare(right.identity.serverId));
-
-  assert.equal(targets.length, 2);
-  assert.deepEqual(targets, [
-    {
-      userId: "user-shared",
-      payload: {
-        title: "Thread in #partners · Alpha Workspace",
-        body: "Ray: hello from the joint thread",
-        tag: "message:msg-joint-thread",
-        url: "/s/alpha/channel/parent-alpha?thread=parent-alpha%3Aparent-message&msg=msg-joint-thread",
-      },
-      identity: {
-        serverId: "server-alpha",
-        kind: "thread",
-        channelId: "thread-alpha",
-        threadId: "thread-alpha",
-        parentChannelId: "parent-alpha",
-        parentMessageId: "parent-message",
-        messageId: "msg-joint-thread",
-      },
-    },
-    {
-      userId: "user-shared",
-      payload: {
-        title: "Thread in #partners · Beta Workspace",
-        body: "Ray: hello from the joint thread",
-        tag: "message:msg-joint-thread",
-        url: "/s/beta/channel/parent-beta?thread=parent-beta%3Aparent-message&msg=msg-joint-thread",
-      },
-      identity: {
-        serverId: "server-beta",
-        kind: "thread",
-        channelId: "thread-beta",
-        threadId: "thread-beta",
-        parentChannelId: "parent-beta",
-        parentMessageId: "parent-message",
-        messageId: "msg-joint-thread",
-      },
-    },
-  ]);
-
-  const socketPayloads = targets.map((target) => (
-    buildNotificationPushSocketTargets([target], target.identity)[0]!.payload
-  ));
-  assert.deepEqual(socketPayloads.map(({ serverId, threadId, parentChannelId, title, url }) => ({
-    serverId,
-    threadId,
-    parentChannelId,
-    title,
-    url,
-  })), [
-    {
-      serverId: "server-alpha",
-      threadId: "thread-alpha",
-      parentChannelId: "parent-alpha",
-      title: "Thread in #partners · Alpha Workspace",
-      url: "/s/alpha/channel/parent-alpha?thread=parent-alpha%3Aparent-message&msg=msg-joint-thread",
-    },
-    {
-      serverId: "server-beta",
-      threadId: "thread-beta",
-      parentChannelId: "parent-beta",
-      title: "Thread in #partners · Beta Workspace",
-      url: "/s/beta/channel/parent-beta?thread=parent-beta%3Aparent-message&msg=msg-joint-thread",
-    },
-  ]);
-
-  assert.deepEqual(
-    selectCanonicalWebPushProjectionTargets(targets, {
-      serverId: "server-beta",
-      messageId: "msg-joint-thread",
-    }),
-    [targets[1]],
-    "web push should keep exactly the complete source-server projection",
-  );
-  assert.deepEqual(
-    selectCanonicalWebPushProjectionTargets([targets[1]!], {
-      serverId: "server-alpha",
-      messageId: "msg-joint-thread",
-    }),
-    [targets[1]],
-    "a user with only one eligible projection should retain that complete target",
-  );
-  assert.deepEqual(
-    selectCanonicalWebPushProjectionTargets(targets, {
-      serverId: "server-missing",
-      messageId: "msg-joint-thread",
-    }),
-    [],
-    "ambiguous projections without one source-server match must fail closed",
-  );
-  assert.deepEqual(
-    selectCanonicalWebPushProjectionTargets(targets, {
-      serverId: "server-beta",
-      messageId: "different-message",
-    }),
-    [],
-    "projection targets from another message must never be selected",
-  );
-});
-
-test("broadcastAndDeliver shares the authoritative recipient set and persists native intent without APP_URL", async () => {
-  const previousAppUrl = process.env.APP_URL;
-  const previousSocketFlag = process.env.SLOCK_NOTIFICATION_PUSH_SOCKET_ENABLED;
-  process.env.APP_URL = "https://app.example.test";
-  delete process.env.SLOCK_NOTIFICATION_PUSH_SOCKET_ENABLED;
-  const sentTargets: Array<{ userId: string; payload: { title: string; body: string; tag: string; url: string } }> = [];
-  const nativeRecipientBatches: string[][] = [];
-
-  __setMessageServiceDepsForTests({
-    createMessage: async (channelId: string, senderType: "user" | "agent", senderId: string, content: string, messageType: "chat" | "system" = "chat") =>
-      makePersistedMessage({
-        id: "msg-push-socket",
-        channelId,
-        senderType,
-        senderId,
-        content,
-        searchText: content,
-        messageType,
-      }) as any,
-    getChannel: async (channelId: string) => ({
-      id: channelId,
-      serverId: "server-1",
-      type: "channel",
-      name: "engineering",
-      parentMessageId: null,
-    } as any),
-    getChannelHumans: async () => [],
-    getChannelAgents: async () => [],
-    getChannelMembers: async () => ({ agents: [], humans: [] }),
-    assertChannelNotArchived: async () => undefined,
-    markRead: async () => undefined,
-    markAgentLegacyRead: async () => {},
-    renderAgentReadablePermalinks: async (content: string) => content,
-    getSenderIdentity: async (_senderType, _senderId, fallbackName) => ({
-      uniqueName: fallbackName,
-      description: null,
-    }),
-    buildPushTargets: async () => new Map([
-      ["user-2", {
-        title: "#engineering · Acme Workspace",
-        body: "Ray: hello socket mirror",
-        tag: "message:msg-push-socket",
-        url: "/s/acme/channel/channel-1?msg=msg-push-socket",
-      }],
-      ["user-3", {
-        title: "#engineering · Acme Workspace",
-        body: "Ray: hello socket mirror",
-        tag: "message:msg-push-socket",
-        url: "/s/acme/channel/channel-1?msg=msg-push-socket",
-      }],
-    ]),
-    sendPushNotifications: async (targets) => {
-      sentTargets.push(...targets);
-    },
-    persistNativeNotificationIntents: async (intents) => {
-      nativeRecipientBatches.push(intents.map((intent) => intent.recipientUserId));
-      return intents.length;
-    },
-    getMentionFactsForMessages: async () => new Map(),
-  });
-
-  try {
-    const { io, events } = createIoRecorder();
-    await broadcastAndDeliver(io, withChannelDelivery({ deliverMessage: async () => undefined }) as any, {
-      channelId: "channel-1",
-      senderType: "user",
-      senderId: "user-1",
-      senderName: "Ray",
-      content: "hello socket mirror",
-    });
-
-    const notificationEvents = events.filter((event) => event.event === "notification:push");
-    assert.deepEqual(sentTargets.map((target) => target.userId), ["user-2", "user-3"]);
-    assert.deepEqual(nativeRecipientBatches, [["user-2", "user-3"]], "native must consume the exact authoritative web recipient set");
-    assert.deepEqual(
-      notificationEvents.map((event) => event.room),
-      sentTargets.map((target) => socketClientKindRoom(target.userId, "mobile")),
-    );
-    assert.deepEqual(
-      events.filter((event) => event.event === "notification:push" && event.room.startsWith("user:") && !event.room.includes(":clientKind:")),
-      [],
-      "notification:push must not use unfiltered user rooms because web sockets also join them",
-    );
-    for (const event of notificationEvents) {
-      assert.deepEqual(Object.keys(event.payload).sort(), LEGACY_NOTIFICATION_PUSH_SOCKET_PAYLOAD_KEYS);
-    }
-    assert.deepEqual(notificationEvents[0]!.payload, {
-      title: "#engineering · Acme Workspace",
-      body: "Ray: hello socket mirror",
-      tag: "message:msg-push-socket",
-      url: "https://app.example.test/s/acme/channel/channel-1?msg=msg-push-socket",
-      serverId: "server-1",
-      kind: "channel",
-      channelId: "channel-1",
-      threadId: null,
-      parentChannelId: null,
-      parentMessageId: null,
-      messageId: "msg-push-socket",
-    });
-
-    delete process.env.APP_URL;
-    await broadcastAndDeliver(io, withChannelDelivery({ deliverMessage: async () => undefined }) as any, {
-      channelId: "channel-1",
-      senderType: "user",
-      senderId: "user-1",
-      senderName: "Ray",
-      content: "native survives missing web origin",
-    });
-    assert.deepEqual(nativeRecipientBatches, [
-      ["user-2", "user-3"],
-      ["user-2", "user-3"],
-    ], "native persistence must stay independent of the optional web origin");
-    assert.equal(sentTargets.length, 2, "missing APP_URL must suppress only the web dispatch");
-  } finally {
-    if (previousAppUrl === undefined) delete process.env.APP_URL;
-    else process.env.APP_URL = previousAppUrl;
-    if (previousSocketFlag === undefined) delete process.env.SLOCK_NOTIFICATION_PUSH_SOCKET_ENABLED;
-    else process.env.SLOCK_NOTIFICATION_PUSH_SOCKET_ENABLED = previousSocketFlag;
-  }
-});
-
-test("notification payload projection stays fail-closed while Socket diagnostics are best-effort", async () => {
-  const previousAppUrl = process.env.APP_URL;
-  const previousSocketFlag = process.env.SLOCK_NOTIFICATION_PUSH_SOCKET_ENABLED;
-  process.env.APP_URL = "https://app.example.test";
-  delete process.env.SLOCK_NOTIFICATION_PUSH_SOCKET_ENABLED;
-  await openTestDatabase("pglite://");
-  try {
-    const db = getDb();
-    const [owner] = await db.insert(users).values({
-      email: "notification-socket-trace-owner@test.com",
-      name: "NotificationSocketTraceOwner",
-      passwordHash: "x",
-      emailVerified: true,
-    }).returning();
-    const [server] = await db.insert(servers).values({
-      name: "Notification Socket Trace",
-      slug: "notification-socket-trace",
-      ownerId: owner.id,
-    }).returning();
-    await db.insert(serverMembers).values({ serverId: server.id, userId: owner.id, role: "owner" });
-    const [channel] = await db.insert(channels).values({
-      serverId: server.id,
-      name: "notification-socket-trace",
-      type: "channel",
-    }).returning();
-    await db.insert(channelHumans).values({ channelId: channel.id, userId: owner.id });
-
-    const notificationDeps = {
-      markRead: async () => undefined,
-      renderAgentReadablePermalinks: async (content: string) => content,
-      getSenderIdentity: async (_senderType, _senderId, fallbackName) => ({
-        uniqueName: fallbackName,
-        description: null,
-      }),
-      buildPushTargets: async () => new Map([["notification-recipient", {
-        title: "#notification-socket-trace · Notification Socket Trace",
-        body: "durable before realtime",
-        tag: "message:notification-socket-trace",
-        url: `/s/${server.slug}/channel/${channel.id}`,
-      }]]),
-      sendPushNotifications: async () => undefined,
-      persistNativeNotificationIntents: async (intents) => intents.length,
-    } satisfies Parameters<typeof __setMessageServiceDepsForTests>[0];
-    __setMessageServiceDepsForTests(notificationDeps);
-
-    const recorded = createIoRecorder();
-    const io = {
-      ...recorded.io,
-      to(room: string) {
-        const target = recorded.io.to(room);
-        return {
-          emit(event: string, payload: unknown) {
-            if (event === "notification:push") {
-              throw new Error("review notification socket failure");
-            }
-            target.emit(event, payload);
-          },
-        };
-      },
-    } as any;
-    const tracer = new BasicTracer({
-      sink: {
-        record() {},
-        recordEvent(record) {
-          if (record.event.name === "message_pipeline.frontend_socket_emit.degraded") {
-            throw new Error("review trace callback failure");
-          }
-        },
-      },
-    });
-
-    const sent = await withTraceRoot(
-      tracer,
-      "server.http.request",
-      { surface: "server", kind: "server" },
-      () => broadcastAndDeliver(io, withChannelDelivery({ deliverMessage: async () => undefined }) as any, {
-        channelId: channel.id,
-        senderType: "user",
-        senderId: owner.id,
-        senderName: owner.name,
-        content: "durable before realtime",
-      }),
-    );
-
-    assert.equal(sent.content, "durable before realtime");
-    const durableRows = await db.select({ id: messages.id }).from(messages).where(eq(messages.id, sent.id));
-    assert.equal(durableRows.length, 1, "the first-send fact must remain durable despite both realtime failures");
-
-    __setMessageServiceDepsForTests({
-      ...notificationDeps,
-      buildNotificationPushSocketTargets: () => {
-        throw new Error("review notification payload projection failure");
-      },
-    });
-    await assert.rejects(
-      () => broadcastAndDeliver(recorded.io as any, withChannelDelivery({ deliverMessage: async () => undefined }) as any, {
-        channelId: channel.id,
-        senderType: "user",
-        senderId: owner.id,
-        senderName: owner.name,
-        content: "projection remains fail-closed",
-      }),
-      /review notification payload projection failure/,
-    );
-    const projectionFailureRows = await db.select({ id: messages.id }).from(messages).where(and(
-      eq(messages.channelId, channel.id),
-      eq(messages.content, "projection remains fail-closed"),
-    ));
-    assert.equal(projectionFailureRows.length, 1, "the projection error occurs after the source fact is durable");
-  } finally {
-    await closeTestDatabase();
-    if (previousAppUrl === undefined) delete process.env.APP_URL;
-    else process.env.APP_URL = previousAppUrl;
-    if (previousSocketFlag === undefined) delete process.env.SLOCK_NOTIFICATION_PUSH_SOCKET_ENABLED;
-    else process.env.SLOCK_NOTIFICATION_PUSH_SOCKET_ENABLED = previousSocketFlag;
-  }
-});
-
-test("notification push socket kill-switch suppresses user-room emits without changing web push dispatch", async () => {
-  const previousAppUrl = process.env.APP_URL;
-  const previousSocketFlag = process.env.SLOCK_NOTIFICATION_PUSH_SOCKET_ENABLED;
-  process.env.APP_URL = "https://app.example.test";
-  process.env.SLOCK_NOTIFICATION_PUSH_SOCKET_ENABLED = "false";
-  let sentCount = 0;
-
-  __setMessageServiceDepsForTests({
-    createMessage: async (channelId: string, senderType: "user" | "agent", senderId: string, content: string, messageType: "chat" | "system" = "chat") =>
-      makePersistedMessage({
-        id: "msg-push-kill",
-        channelId,
-        senderType,
-        senderId,
-        content,
-        searchText: content,
-        messageType,
-      }) as any,
-    getChannel: async (channelId: string) => ({
-      id: channelId,
-      serverId: "server-1",
-      type: "channel",
-      name: "engineering",
-      parentMessageId: null,
-    } as any),
-    getChannelHumans: async () => [],
-    getChannelAgents: async () => [],
-    getChannelMembers: async () => ({ agents: [], humans: [] }),
-    assertChannelNotArchived: async () => undefined,
-    markRead: async () => undefined,
-    markAgentLegacyRead: async () => {},
-    renderAgentReadablePermalinks: async (content: string) => content,
-    getSenderIdentity: async (_senderType, _senderId, fallbackName) => ({
-      uniqueName: fallbackName,
-      description: null,
-    }),
-    buildPushTargets: async () => new Map([
-      ["user-2", {
-        title: "#engineering · Acme Workspace",
-        body: "Ray: hello kill switch",
-        tag: "message:msg-push-kill",
-        url: "/s/acme/channel/channel-1?msg=msg-push-kill",
-      }],
-    ]),
-    sendPushNotifications: async () => {
-      sentCount += 1;
-    },
-    getMentionFactsForMessages: async () => new Map(),
-  });
-
-  try {
-    const { io, events } = createIoRecorder();
-    await broadcastAndDeliver(io, withChannelDelivery({ deliverMessage: async () => undefined }) as any, {
-      channelId: "channel-1",
-      senderType: "user",
-      senderId: "user-1",
-      senderName: "Ray",
-      content: "hello kill switch",
-    });
-
-    assert.equal(sentCount, 1, "web push dispatch must remain scheduled");
-    assert.deepEqual(events.filter((event) => event.event === "notification:push"), []);
-  } finally {
-    if (previousAppUrl === undefined) delete process.env.APP_URL;
-    else process.env.APP_URL = previousAppUrl;
-    if (previousSocketFlag === undefined) delete process.env.SLOCK_NOTIFICATION_PUSH_SOCKET_ENABLED;
-    else process.env.SLOCK_NOTIFICATION_PUSH_SOCKET_ENABLED = previousSocketFlag;
-  }
-});
-
 test("broadcastAndDeliver replays the original persisted agent send and re-broadcasts the same message on retry", async () => {
   const replayDb = createAgentSendReplayDb();
   __setAgentSendReplayDbForTests(() => replayDb.db as any);
@@ -3869,7 +2961,6 @@ test("broadcastAndDeliver replays the original persisted agent send and re-broad
       uniqueName: fallbackName,
       description: null,
     }),
-    buildPushTargets: async () => new Map(),
   });
 
   const { io, events } = createIoRecorder();
@@ -3950,8 +3041,6 @@ test("broadcastAndDeliver emits dm:new to human user room for first-touch DM sid
       uniqueName: fallbackName,
       description: null,
     }),
-    buildPushTargets: async () => new Map(),
-    sendPushNotifications: async () => {},
     getMentionFactsForMessages: async () => new Map(),
   });
 
@@ -4065,7 +3154,6 @@ test("broadcastAndDeliver keeps keyless agent sends on the legacy non-idempotent
       uniqueName: fallbackName,
       description: null,
     }),
-    buildPushTargets: async () => new Map(),
   });
   const { io, events } = createIoRecorder();
   const agentOrchestrator = withChannelDelivery({ deliverMessage: async () => undefined }) as any;
@@ -4128,8 +3216,6 @@ test("broadcastAndDeliver emits dm conversationContext without changing the top-
   ]);
 
   __setMessageServiceDepsForTests({
-    buildPushTargets: async () => new Map(),
-    sendPushNotifications: async () => undefined,
     renderAgentReadablePermalinks: async (content: string) => content,
     getSenderIdentity: async (_senderType, _senderId, fallbackName) => ({
       uniqueName: fallbackName,
@@ -4193,8 +3279,6 @@ test("broadcastAndDeliver only emits private-thread parent context to parent-vis
   });
 
   __setMessageServiceDepsForTests({
-    buildPushTargets: async () => new Map(),
-    sendPushNotifications: async () => undefined,
     renderAgentReadablePermalinks: async (content: string) => content,
     getSenderIdentity: async (_senderType, _senderId, fallbackName) => ({
       uniqueName: fallbackName,
@@ -4248,8 +3332,6 @@ test("broadcastAndDeliver emits replies sync window producer envelope for normal
   ]);
 
   __setMessageServiceDepsForTests({
-    buildPushTargets: async () => new Map(),
-    sendPushNotifications: async () => undefined,
     renderAgentReadablePermalinks: async (content: string) => content,
     getSenderIdentity: async (_senderType, _senderId, fallbackName) => ({
       uniqueName: fallbackName,
@@ -4295,219 +3377,6 @@ test("broadcastAndDeliver emits replies sync window producer envelope for normal
       parentScopeKind: parentType,
       parentScopeId: parentChannel.id,
     });
-  }
-});
-
-test("broadcastAndDeliver sends one source projection to web and both receiver-local projections to mobile for joint channels", async () => {
-  const previousAppUrl = process.env.APP_URL;
-  const previousSocketFlag = process.env.SLOCK_NOTIFICATION_PUSH_SOCKET_ENABLED;
-  process.env.APP_URL = "https://app.example.test";
-  delete process.env.SLOCK_NOTIFICATION_PUSH_SOCKET_ENABLED;
-  const createdAt = new Date("2026-04-17T00:02:00.000Z");
-  await openTestDatabase("pglite://");
-  try {
-    const db = getDb();
-    const [ownerA] = await db.insert(users).values({
-      email: "joint-context-owner-a@test.com",
-      name: "JointContextOwnerA",
-      passwordHash: "x",
-      emailVerified: true,
-    }).returning();
-    const [ownerB] = await db.insert(users).values({
-      email: "joint-context-owner-b@test.com",
-      name: "JointContextOwnerB",
-      passwordHash: "x",
-      emailVerified: true,
-    }).returning();
-    const [sharedRecipient] = await db.insert(users).values({
-      email: "joint-context-shared-recipient@test.com",
-      name: "JointContextSharedRecipient",
-      passwordHash: "x",
-      emailVerified: true,
-    }).returning();
-    const [serverA] = await db.insert(servers).values({
-      name: "Joint Context A",
-      slug: "joint-context-a",
-      ownerId: ownerA.id,
-    }).returning();
-    const [serverB] = await db.insert(servers).values({
-      name: "Joint Context B",
-      slug: "joint-context-b",
-      ownerId: ownerB.id,
-    }).returning();
-    await db.insert(serverMembers).values([
-      { serverId: serverA.id, userId: ownerA.id, role: "owner" },
-      { serverId: serverB.id, userId: ownerB.id, role: "owner" },
-      { serverId: serverA.id, userId: sharedRecipient.id, role: "member" },
-      { serverId: serverB.id, userId: sharedRecipient.id, role: "member" },
-    ]);
-    const [canonicalChannel] = await db.insert(channels).values({
-      serverId: serverA.id,
-      name: "joint-context-canonical",
-      type: "joint",
-    }).returning();
-    const [localChannelA] = await db.insert(channels).values({
-      serverId: serverA.id,
-      name: "joint-context-local-a",
-      type: "joint",
-    }).returning();
-    const [localChannelB] = await db.insert(channels).values({
-      serverId: serverB.id,
-      name: "joint-context-local-b",
-      type: "joint",
-    }).returning();
-    const [joint] = await db.insert(jointChannels).values({
-      canonicalChannelId: canonicalChannel.id,
-      createdByServerId: serverA.id,
-      createdByUserId: ownerA.id,
-    }).returning();
-    await db.insert(jointChannelServers).values([
-      {
-        jointChannelId: joint.id,
-        serverId: serverA.id,
-        localChannelId: localChannelA.id,
-        role: "host",
-        status: "active",
-        joinedByUserId: ownerA.id,
-      },
-      {
-        jointChannelId: joint.id,
-        serverId: serverB.id,
-        localChannelId: localChannelB.id,
-        role: "participant",
-        status: "active",
-        joinedByUserId: ownerB.id,
-      },
-    ]);
-    await db.insert(channelHumans).values([
-      { channelId: localChannelA.id, userId: sharedRecipient.id },
-      { channelId: localChannelB.id, userId: sharedRecipient.id },
-    ]);
-    const sentTargetBatches: any[][] = [];
-    const nativeIntentBatches: any[][] = [];
-    let signalFirstPush: (() => void) | undefined;
-    const firstPush = new Promise<void>((resolve) => {
-      signalFirstPush = resolve;
-    });
-    __setMessageServiceDepsForTests({
-      createMessage: async (channelId, senderType, senderId, content, messageType = "chat") => ({
-        id: "joint-msg-1",
-        seq: 1,
-        channelId,
-        senderType,
-        senderId,
-        agentSendKey: null,
-        messageType,
-        content,
-        searchText: content,
-        searchVector: null,
-        threadId: null,
-        taskStatus: null,
-        taskNumber: null,
-        taskAssigneeType: null,
-        taskAssigneeId: null,
-        taskClaimedAt: null,
-        taskCompletedAt: null,
-        createdAt,
-        updatedAt: createdAt,
-      } as any),
-      getActiveJointChannelProjectionsByLocalChannel,
-      getChannelAgents: async () => [],
-      assertChannelNotArchived: async () => undefined,
-      markRead: async () => undefined,
-      renderAgentReadablePermalinks: async (content: string) => content,
-      buildPushTargets: async () => new Map(),
-      sendPushNotifications: async (targets) => {
-        sentTargetBatches.push(targets as any[]);
-        signalFirstPush?.();
-      },
-      persistNativeNotificationIntents: async (intents) => {
-        nativeIntentBatches.push([...intents]);
-        return intents.length;
-      },
-      getSenderIdentity: async (_senderType, _senderId, fallbackName) => ({
-        uniqueName: fallbackName,
-        description: null,
-      }),
-    });
-
-    const { io, events } = createIoRecorder();
-    await broadcastAndDeliver(io, withChannelDelivery({ deliverMessage: async () => undefined }) as any, {
-      channelId: localChannelB.id,
-      senderType: "user",
-      senderId: ownerB.id,
-      senderName: ownerB.name,
-      content: "joint frame",
-    });
-    await waitForTestSignal(firstPush, "joint channel notification dispatch");
-
-    const localBFrame = events.find((event) => event.event === "message:new" && event.room === `channel:${localChannelB.id}`)?.payload;
-    assert.ok(localBFrame, "expected realtime message:new payload for local joint projection");
-    assert.equal(localBFrame.channelId, localChannelB.id);
-    assert.deepEqual(localBFrame.conversationContext, { channelType: "joint" });
-
-    assert.equal(sentTargetBatches.length, 1);
-    assert.equal(nativeIntentBatches.length, 1);
-    assert.deepEqual(nativeIntentBatches[0]!.map((intent) => ({
-      userId: intent.recipientUserId,
-      serverId: intent.serverId,
-      channelId: intent.channelId,
-    })), [{
-      userId: sharedRecipient.id,
-      serverId: serverB.id,
-      channelId: localChannelB.id,
-    }], "joint native projection must use the same single canonical source target as web push");
-    const pushed = sentTargetBatches[0]!
-      .map((target) => ({
-        userId: target.userId,
-        serverId: target.identity.serverId,
-        channelId: target.identity.channelId,
-        title: target.payload.title,
-        url: target.payload.url,
-      }))
-      .sort((left, right) => left.serverId.localeCompare(right.serverId));
-    assert.deepEqual(pushed, [
-      {
-        userId: sharedRecipient.id,
-        serverId: serverB.id,
-        channelId: localChannelB.id,
-        title: `#${localChannelB.name} · ${serverB.name}`,
-        url: `https://app.example.test/s/${serverB.slug}/channel/${localChannelB.id}?msg=joint-msg-1`,
-      },
-    ].sort((left, right) => left.serverId.localeCompare(right.serverId)));
-
-    const socketPushes = events
-      .filter((event) => event.event === "notification:push")
-      .map((event) => ({
-        room: event.room,
-        serverId: event.payload.serverId,
-        channelId: event.payload.channelId,
-        title: event.payload.title,
-        url: event.payload.url,
-      }))
-      .sort((left, right) => left.serverId.localeCompare(right.serverId));
-    assert.deepEqual(socketPushes, [
-      {
-        room: socketClientKindRoom(sharedRecipient.id, "mobile"),
-        serverId: serverA.id,
-        channelId: localChannelA.id,
-        title: `#${localChannelA.name} · ${serverA.name}`,
-        url: `https://app.example.test/s/${serverA.slug}/channel/${localChannelA.id}?msg=joint-msg-1`,
-      },
-      {
-        room: socketClientKindRoom(sharedRecipient.id, "mobile"),
-        serverId: serverB.id,
-        channelId: localChannelB.id,
-        title: `#${localChannelB.name} · ${serverB.name}`,
-        url: `https://app.example.test/s/${serverB.slug}/channel/${localChannelB.id}?msg=joint-msg-1`,
-      },
-    ].sort((left, right) => left.serverId.localeCompare(right.serverId)));
-  } finally {
-    await closeTestDatabase();
-    if (previousAppUrl === undefined) delete process.env.APP_URL;
-    else process.env.APP_URL = previousAppUrl;
-    if (previousSocketFlag === undefined) delete process.env.SLOCK_NOTIFICATION_PUSH_SOCKET_ENABLED;
-    else process.env.SLOCK_NOTIFICATION_PUSH_SOCKET_ENABLED = previousSocketFlag;
   }
 });
 
@@ -4558,8 +3427,6 @@ test("broadcastAndDeliver lets tests stub the archive gate without initializing 
       uniqueName: fallbackName,
       description: null,
     }),
-    buildPushTargets: async () => new Map(),
-    sendPushNotifications: async () => undefined,
   });
 
   const { io } = createIoRecorder();
@@ -4655,7 +3522,6 @@ __setMessageServiceDepsForTests({
   }),
   getActorServerRoleInServer: async () => "member",
   canViewerReadForwardedSource: async () => true,
-  buildPushTargets: async () => new Map(),
   insertMentionRows: async () => [],
 });
 
@@ -4686,9 +3552,9 @@ assert.ok(emittedMessage, "expected realtime message:new payload");
 const emittedItem = emittedMessage.actionMetadata.forwardedItems[0];
 assert.equal(emittedItem.contentSnapshot, "forwarded body stays visible");
 assert.deepEqual(emittedItem.attachmentSnapshots, [{ filename: "proof.pdf", mimeType: "application/pdf" }]);
-assert.equal(emittedItem.sourceTargetId, null);
-assert.equal(emittedItem.sourceMessageId, null);
-assert.equal(emittedItem.sourceServerId, null);
+assert.equal(Object.hasOwn(emittedItem ?? {}, "sourceTargetId"), false, "sourceTargetId is removed, not null");
+assert.equal(Object.hasOwn(emittedItem ?? {}, "sourceMessageId"), false, "sourceMessageId is removed, not null");
+assert.equal(Object.hasOwn(emittedItem ?? {}, "sourceServerId"), false, "sourceServerId is removed, not null");
 assert.equal(emittedItem.sourceTargetSnapshot.id, null);
 assert.equal(emittedItem.sourceTargetSnapshot.label, "");
 assert.equal(emittedItem.sourceTargetSnapshot.labelVisibility, "restricted");
@@ -4783,7 +3649,6 @@ __setMessageServiceDepsForTests({
   }),
   getActorServerRoleInServer: async () => "member",
   canViewerReadForwardedSource: async () => true,
-  buildPushTargets: async () => new Map(),
   insertMentionRows: async () => [],
 });
 
@@ -4876,8 +3741,6 @@ test("④ durability precedes delivery: a mention is recoverable at the instant 
     listAgents: async () => [mentionedAgent] as any,
     markRead: async () => undefined,
     markAgentLegacyRead: async () => undefined,
-    buildPushTargets: async () => new Map(),
-    sendPushNotifications: async () => undefined,
     renderAgentReadablePermalinks: async (content: string) => content,
     recordInboxNotificationFacts,
     getSenderIdentity: async (_senderType, _senderId, fallbackName) => ({
@@ -4990,8 +3853,6 @@ test("⑤ declared degradation: a failed occurrence payload write is traced, sti
     listAgents: async () => [mentionedAgent] as any,
     markRead: async () => undefined,
     markAgentLegacyRead: async () => undefined,
-    buildPushTargets: async () => new Map(),
-    sendPushNotifications: async () => undefined,
     renderAgentReadablePermalinks: async (content: string) => content,
     recordInboxNotificationFacts,
     getSenderIdentity: async (_senderType, _senderId, fallbackName) => ({
@@ -5114,7 +3975,6 @@ test("broadcastAndDeliver delivers a public-channel mention to a non-joined agen
       uniqueName: fallbackName,
       description: null,
     }),
-    buildPushTargets: async () => new Map(),
     getServerMembers: async () => [],
     insertMentionRows: async () => [],
     // Simulates a fact made target-visible by a later notify action (replay
@@ -5199,7 +4059,6 @@ test("broadcastAndDeliver does not deliver an outsider mention at send time and 
       uniqueName: fallbackName,
       description: null,
     }),
-    buildPushTargets: async () => new Map(),
     getServerMembers: async () => [],
     insertMentionRows: async (rows: any[]) => {
       insertedRows.push(...rows);
@@ -5297,7 +4156,6 @@ test("broadcastAndDeliver does not deliver ordinary public-channel traffic to no
       uniqueName: fallbackName,
       description: null,
     }),
-    buildPushTargets: async () => new Map(),
   });
 
   const { io } = createIoRecorder();
@@ -5406,8 +4264,6 @@ test("broadcastAndDeliver records same-send thread facts and reactivates a direc
       messageId,
       [{ type: "user", id: mentioned.id, name: mentioned.name }],
     ])),
-    buildPushTargets: async () => new Map(),
-    sendPushNotifications: async () => undefined,
     renderAgentReadablePermalinks: async (content: string) => content,
     recordInboxNotificationFacts,
     getJointThreadProjectionForMember,
@@ -5527,8 +4383,6 @@ test("broadcastAndDeliver suppresses ordinary facts until a direct mention react
       messageId,
       [{ type: "user", id: parentAuthor.id, name: parentAuthor.name }],
     ])),
-    buildPushTargets: async () => new Map(),
-    sendPushNotifications: async () => undefined,
     renderAgentReadablePermalinks: async (content: string) => content,
     recordInboxNotificationFacts,
     getJointThreadProjectionForMember,
@@ -5602,11 +4456,7 @@ test("broadcastAndDeliver suppresses ordinary facts until a direct mention react
   );
 });
 
-test("broadcastAndDeliver keeps followed joint-thread agent and push projections independent from parent mute", async () => {
-  const previousAppUrl = process.env.APP_URL;
-  const previousSocketFlag = process.env.SLOCK_NOTIFICATION_PUSH_SOCKET_ENABLED;
-  process.env.APP_URL = "https://app.example.test";
-  delete process.env.SLOCK_NOTIFICATION_PUSH_SOCKET_ENABLED;
+test("broadcastAndDeliver keeps followed joint-thread agent delivery independent from parent mute", async () => {
   await openTestDatabase("pglite://");
   try {
     const db = getDb();
@@ -5705,6 +4555,7 @@ test("broadcastAndDeliver keeps followed joint-thread agent and push projections
       channelId: localParentA.id,
       agentId: agentA.id,
     });
+    await fillJointMembersFromChannelHumans();
     const [canonicalParentMessage] = await db.insert(messages).values({
       channelId: canonicalParent.id,
       senderType: "user",
@@ -5754,6 +4605,7 @@ test("broadcastAndDeliver keeps followed joint-thread agent and push projections
         joinedByUserId: ownerB.id,
       },
     ]);
+    await fillJointMembersFromChannelHumans();
     await db.insert(threadFollows).values([
       {
         threadChannelId: localThreadA.id,
@@ -5815,19 +4667,9 @@ test("broadcastAndDeliver keeps followed joint-thread agent and push projections
     assert.equal(ownerAProjection?.localThreadChannelId, localThreadA.id);
     assert.equal(senderBProjection?.localThreadChannelId, localThreadB.id);
 
-    const sentTargetBatches: any[][] = [];
-    const nativeIntentBatches: any[][] = [];
     __setMessageServiceDepsForTests({
       markRead: async () => undefined,
       markAgentLegacyRead: async () => undefined,
-      buildPushTargets: async () => new Map(),
-      sendPushNotifications: async (targets) => {
-        sentTargetBatches.push(targets as any[]);
-      },
-      persistNativeNotificationIntents: async (intents) => {
-        nativeIntentBatches.push([...intents]);
-        return intents.length;
-      },
       renderAgentReadablePermalinks: async (content: string) => content,
       recordInboxNotificationFacts,
       getActiveJointThreadProjectionsByCanonicalThread,
@@ -5838,7 +4680,7 @@ test("broadcastAndDeliver keeps followed joint-thread agent and push projections
       }),
     });
 
-    const { io, events } = createIoRecorder();
+    const { io } = createIoRecorder();
     const agentDeliveries: Array<{ agentId: string; payload: any }> = [];
     const agentOrchestrator = withChannelDelivery({
       deliverMessage: async (agentId: string, payload: any) => {
@@ -5862,85 +4704,6 @@ test("broadcastAndDeliver keeps followed joint-thread agent and push projections
     );
     assert.equal(ordinaryAgentDelivery.payload.channel_id, localThreadA.id);
     assert.equal(ordinaryAgentDelivery.payload.parent_channel_id, localParentA.id);
-
-    assert.deepEqual(
-      nativeIntentBatches.map((batch) =>
-        batch.map((intent) => ({
-          recipientUserId: intent.recipientUserId,
-          serverId: intent.serverId,
-          channelId: intent.channelId,
-          threadId: intent.threadId,
-          parentChannelId: intent.parentChannelId,
-        })),
-      ),
-      [
-        [
-          {
-            recipientUserId: sharedRecipient.id,
-            serverId: serverB.id,
-            channelId: localThreadB.id,
-            threadId: localThreadB.id,
-            parentChannelId: localParentB.id,
-          },
-        ],
-      ],
-      "joint-thread native outbox projection must survive parent activity mute for an active follower",
-    );
-    assert.equal(
-      sentTargetBatches.length,
-      1,
-      "joint-thread web push projection must survive parent activity mute for an active follower",
-    );
-    const pushed = sentTargetBatches[0]!
-      .map((target) => ({
-        userId: target.userId,
-        serverId: target.identity.serverId,
-        threadId: target.identity.threadId,
-        parentChannelId: target.identity.parentChannelId,
-        title: target.payload.title,
-        url: target.payload.url,
-      }))
-      .sort((left, right) => left.serverId.localeCompare(right.serverId));
-    assert.deepEqual(pushed, [
-      {
-        userId: sharedRecipient.id,
-        serverId: serverB.id,
-        threadId: localThreadB.id,
-        parentChannelId: localParentB.id,
-        title: `Thread in #${localParentB.name} · ${serverB.name}`,
-        url: `https://app.example.test/s/${serverB.slug}/channel/${localParentB.id}?thread=${encodeURIComponent(`${localParentB.id}:${canonicalParentMessage.id}`)}&msg=${reply.id}`,
-      },
-    ].sort((left, right) => left.serverId.localeCompare(right.serverId)));
-
-    const socketPushes = events
-      .filter((event) => event.event === "notification:push")
-      .map((event) => ({
-        room: event.room,
-        serverId: event.payload.serverId,
-        threadId: event.payload.threadId,
-        parentChannelId: event.payload.parentChannelId,
-        title: event.payload.title,
-        url: event.payload.url,
-      }))
-      .sort((left, right) => left.serverId.localeCompare(right.serverId));
-    assert.deepEqual(socketPushes, [
-      {
-        room: socketClientKindRoom(sharedRecipient.id, "mobile"),
-        serverId: serverA.id,
-        threadId: localThreadA.id,
-        parentChannelId: localParentA.id,
-        title: `Thread in #${localParentA.name} · ${serverA.name}`,
-        url: `https://app.example.test/s/${serverA.slug}/channel/${localParentA.id}?thread=${encodeURIComponent(`${localParentA.id}:${canonicalParentMessage.id}`)}&msg=${reply.id}`,
-      },
-      {
-        room: socketClientKindRoom(sharedRecipient.id, "mobile"),
-        serverId: serverB.id,
-        threadId: localThreadB.id,
-        parentChannelId: localParentB.id,
-        title: `Thread in #${localParentB.name} · ${serverB.name}`,
-        url: `https://app.example.test/s/${serverB.slug}/channel/${localParentB.id}?thread=${encodeURIComponent(`${localParentB.id}:${canonicalParentMessage.id}`)}&msg=${reply.id}`,
-      },
-    ].sort((left, right) => left.serverId.localeCompare(right.serverId)));
 
     const facts = (await db.select().from(inboxNotificationFacts)).filter((fact) => fact.messageId === reply.id);
     assert.ok(facts.some((fact) => fact.receiverType === "agent" && fact.receiverId === agentA.id && fact.sourceChannelId === localThreadA.id));
@@ -6025,10 +4788,6 @@ test("broadcastAndDeliver keeps followed joint-thread agent and push projections
     assert.notEqual(peerThreadUpdate.syncCoreReplyWindow.discussion.root.serverId, serverA.id);
   } finally {
     await closeTestDatabase();
-    if (previousAppUrl === undefined) delete process.env.APP_URL;
-    else process.env.APP_URL = previousAppUrl;
-    if (previousSocketFlag === undefined) delete process.env.SLOCK_NOTIFICATION_PUSH_SOCKET_ENABLED;
-    else process.env.SLOCK_NOTIFICATION_PUSH_SOCKET_ENABLED = previousSocketFlag;
   }
 });
 
@@ -6073,7 +4832,6 @@ test("broadcastAndDeliver marks owner/admin sender delivery as admin authority",
       description: null,
     }),
     getActorServerRoleInServer: async () => "owner",
-    buildPushTargets: async () => new Map(),
     insertMentionRows: async () => [],
   });
 
@@ -6137,7 +4895,6 @@ test("broadcastAndDeliver leaves member sender delivery subject to inbox receive
       description: null,
     }),
     getActorServerRoleInServer: async () => "member",
-    buildPushTargets: async () => new Map(),
     insertMentionRows: async () => [],
   });
 
@@ -6207,7 +4964,6 @@ test("broadcastAndDeliver does not deliver private-channel mentions to non-membe
       uniqueName: fallbackName,
       description: null,
     }),
-    buildPushTargets: async () => new Map(),
     insertMentionRows: async () => [],
     getMentionFactsForMessages: async () => new Map([["msg-private-mention", []]]),
   });

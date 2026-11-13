@@ -165,6 +165,10 @@
     });
   })();
 
+  // Undeclared providers read n/a, not missing (site/applicability.js).
+  var providerDeclared = VtApplicability.providerDeclared;
+  VtApplicability.markNotApplicable(DATA.cases);
+
   var pairDefs = DATA.pairs || [];
   var pairByKey = {};
   pairDefs.forEach(function (def) {
@@ -755,12 +759,44 @@
     var summary = (pair && pair.summary) || {};
     var analysis = (pair && pair.analysisSummary) || {};
     var pass = Number(summary.same || 0) + Number(summary.pass || 0) + Number(summary["basic-pass"] || 0);
+    // The CLI summary counts a case missing whenever an end has no capture;
+    // the n/a ones (undeclared provider) move to their own tile.
+    var notApplicable = pairNotApplicableCount(pair);
     setStatValue("total", String(Number(summary.total || 0)));
     setStatValue("pass", String(pass));
     setStatValue("different", String(Number(summary.different || 0)));
-    setStatValue("missing", String(Number(summary.missing || 0)));
+    setStatValue("missing", String(Math.max(0, Number(summary.missing || 0) - notApplicable)));
     setStatValue("ai", Number(analysis.ready || 0) + "/" + Number(analysis.total || 0));
+    renderNotApplicableStat(notApplicable);
     renderDeclaredStat(pair);
+  }
+  function pairNotApplicableCount(pair) {
+    if (!pair) return 0;
+    var count = 0;
+    (DATA.cases || []).forEach(function (item) {
+      var entry = item.pairs && item.pairs[pair.key];
+      if (entry && entry.status === "n/a") count += 1;
+    });
+    return count;
+  }
+  // "N/A N" mini-stat: cases whose selected pair includes a provider the case
+  // does not declare. Shown only when there are any.
+  function renderNotApplicableStat(count) {
+    var stats = document.querySelector(".sb-stats");
+    if (!stats) return;
+    var tile = document.getElementById("vt-stat-na");
+    if (!count) { if (tile) tile.remove(); return; }
+    if (!tile) {
+      tile = el("div", "sb-stat");
+      tile.id = "vt-stat-na";
+      tile.title = "Cases whose pair includes a provider the case does not declare";
+      tile.appendChild(el("div", "lbl", "N/A"));
+      tile.appendChild(el("div", "val"));
+      var missingTile = stats.querySelector('.val[data-stat="missing"]');
+      var anchor = missingTile && missingTile.parentNode ? missingTile.parentNode.nextSibling : null;
+      stats.insertBefore(tile, anchor);
+    }
+    tile.querySelector(".val").textContent = String(count);
   }
   // "Declared N" mini-stat: cases in the selected pair with declared
   // renderer fallbacks on either end. Client-computed; not a defect count.
@@ -836,6 +872,7 @@
   // Provider capture dot: green = raw capture exists, red = missing/error.
   // Pair status coloring stays on the row header dot (grid semantics).
   function providerDotKind(entry) {
+    if (entry && entry.status === "n/a") return "other";
     return entry && entry.status === "captured" && entry.image ? "pass" : "missing";
   }
   // Opens a case on one provider's RAW image tab. When the selected pair
@@ -990,9 +1027,11 @@
           cell.addEventListener("click", function () { openCaseForProvider(item.id, def.id); });
           td.appendChild(cell);
         } else {
-          var miss = el("div", "sb-mcell miss");
-          miss.appendChild(el("span", "sb-dot " + providerDotKind(entry)));
-          miss.appendChild(el("span", "lbl", "No capture"));
+          var notApplicable = !providerDeclared(item, def.id);
+          var miss = el("div", "sb-mcell miss" + (notApplicable ? " na" : ""));
+          miss.appendChild(el("span", "sb-dot " + (notApplicable ? "other" : providerDotKind(entry))));
+          miss.appendChild(el("span", "lbl", notApplicable ? "n/a" : "No capture"));
+          if (notApplicable) miss.title = (def.label || providerTitle(def.id)) + " is not declared for this case";
           td.appendChild(miss);
         }
         tr.appendChild(td);
@@ -1382,10 +1421,11 @@
     storyTitle.appendChild(copyIdButton(item.id, "button"));
     zoom = 1; actualSize = false; bgIndex = 0;
     applyZoom(); applyFit(); applyBg();
-    // Fresh case entry lands on the selected pair's side-by-side unless a
-    // matrix cell requested a specific raw tab; pair switches inside a case
-    // keep the tab (buildCompTabs directly).
-    compTab = pendingCompTab;
+    // A matrix cell may ask for a specific raw tab; otherwise the tab the reader
+    // last picked carries over to the next case (artin 2026-11-02: comparing case
+    // after case in Overlay kept jumping back to Side-by-side). buildCompTabs falls
+    // back to side-by-side when that tab has no content for this case.
+    compTab = pendingCompTab || compTab;
     pendingCompTab = null;
     buildCompTabs(item);
     buildAddons(item);

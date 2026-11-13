@@ -2,6 +2,7 @@ import { Check } from "lucide-react";
 import { useCallback } from "react";
 import { useIntl } from "react-intl";
 import { Card, RadioGroup, RadioGroupItem } from "@botiverse/raft-ui";
+import { useOptionalAppTheme } from "../../hooks/useAppTheme";
 import { APP_APPEARANCE_MODES, isAppAppearanceMode } from "../../theme/appTheme";
 import type { AppAppearanceMode, AppResolvedMode } from "../../theme/appTheme";
 
@@ -29,12 +30,17 @@ export function AppearanceThemePicker({ mode, onModeChange, size = "default" }: 
     if (isAppAppearanceMode(value)) onModeChange(value);
   }, [onModeChange]);
 
+  // Columns follow the picker's own width (`@container`): the settings column
+  // can be 360px on a wide window. One column when narrow, three side by side
+  // from @sm, and from @3xl the theme tiles' size, columns of at least 14rem
+  // (cindyz, #proj-raft-ui:#220).
   return (
+    <div className="@container">
     <RadioGroup
       value={mode}
       onValueChange={handleValueChange}
       aria-label={formatMessage({ id: "settings.appearance.themeAria" })}
-      className={size === "large" ? "grid grid-cols-1 gap-3 sm:grid-cols-3" : "grid grid-cols-1 gap-2 sm:grid-cols-3"}
+      className={size === "large" ? "grid grid-cols-1 gap-3 @sm:grid-cols-3" : "grid grid-cols-1 gap-3 @sm:grid-cols-3 @3xl:grid-cols-[repeat(auto-fill,minmax(14rem,1fr))]"}
       data-testid="appearance-theme-picker"
     >
       {APP_APPEARANCE_MODES.map((option) => (
@@ -49,6 +55,7 @@ export function AppearanceThemePicker({ mode, onModeChange, size = "default" }: 
         />
       ))}
     </RadioGroup>
+    </div>
   );
 }
 
@@ -75,7 +82,7 @@ function ThemeModeCard({
         onClick={handleClick}
         className={[
           "h-full gap-2 p-2",
-          "hover:press-overlay",
+          "hover:overlay-subtle active:overlay-medium",
           "peer-focus-visible:shadow-focus",
           "peer-data-checked:border-[1.5px] peer-data-checked:border-line-strong peer-data-checked:p-[7.5px]",
         ].join(" ")}
@@ -136,3 +143,10 @@ function ThemePreviewSurface({ mode, size }: { mode: AppResolvedMode; size: "def
 }
 
 export default AppearanceThemePicker;
+
+/** The picker bound to the app's theme: Settings › Theme, or Appearance where there is no Theme page. */
+export function AppearanceThemeSettingsControl() {
+  const theme = useOptionalAppTheme();
+  if (!theme) return null;
+  return <AppearanceThemePicker mode={theme.mode} onModeChange={theme.setMode} />;
+}

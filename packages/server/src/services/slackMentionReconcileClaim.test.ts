@@ -1,8 +1,12 @@
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
+import Redis from "ioredis";
 import { test } from "vitest";
 
 import {
   claimSlackMentionReconcile,
+  redisSlackMentionReconcileClaimStore,
+  releaseSlackMentionReconcileClaim,
   type SlackMentionReconcileClaimStore,
   type SlackMentionReconcileClaimTimers,
 } from "./slackMentionReconcileClaim";
@@ -161,4 +165,32 @@ test("a claim already held elsewhere is not acquired", async () => {
   assert.equal(await claimSlackMentionReconcile({
     store: memory.store, key: KEY, token: "replica-a", ttlMs: TTL_MS, renewEveryMs: RENEW_MS, timers: clock.timers,
   }), null);
+});
+
+
+const redisTestUrl = process.env.SLACK_MENTION_REDIS_TEST_URL;
+(redisTestUrl ? test : test.skip)("real Redis workspace release admits the next server and cannot delete a new owner", async () => {
+  const redis = new Redis(redisTestUrl!, { maxRetriesPerRequest: 0 });
+  const key = `peng:slack-mention-claim:${randomUUID()}`;
+  try {
+    const store = redisSlackMentionReconcileClaimStore(redis);
+    const first = await claimSlackMentionReconcile({ store, key, token: "server-a", ttlMs: TTL_MS, renewEveryMs: RENEW_MS });
+    assert.ok(first);
+    try {
+      assert.equal(await first.held(), true);
+      assert.equal(await releaseSlackMentionReconcileClaim(redis, key, "wrong-owner"), false);
+      assert.equal(await redis.get(key), "server-a");
+    } finally { first.end(); }
+    assert.equal(await releaseSlackMentionReconcileClaim(redis, key, "server-a"), true);
+    const second = await claimSlackMentionReconcile({ store, key, token: "server-b", ttlMs: TTL_MS, renewEveryMs: RENEW_MS });
+    assert.ok(second, "a completed pass does not starve the next server until TTL");
+    try {
+      assert.equal(await releaseSlackMentionReconcileClaim(redis, key, "server-a"), false);
+      assert.equal(await second.held(), true);
+    } finally { second.end(); }
+    assert.equal(await releaseSlackMentionReconcileClaim(redis, key, "server-b"), true);
+  } finally {
+    await redis.del(key);
+    await redis.quit();
+  }
 });

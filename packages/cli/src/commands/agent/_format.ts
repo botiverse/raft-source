@@ -29,6 +29,26 @@ export function waitCommandLine(
   return `raft agent login wait --server ${options.server} --agent ${options.agent} --device-code ${deviceCode}${slugFlag}`;
 }
 
+/**
+ * What happened to the key a `login wait` re-login replaced: revoked with
+ * itself, already refused by the server (401), or still active (revoke
+ * refused, unsupported, or failed) and the user has to revoke it.
+ */
+export type PreviousKeyOutcome = "revoked" | "already_inactive" | "still_active";
+
+function formatPreviousKeyLine(previous: { credentialId: string; outcome: PreviousKeyOutcome }): string {
+  const subject = `The key this profile held before (credential ${previous.credentialId})`;
+  switch (previous.outcome) {
+    case "revoked":
+      return `${subject} was revoked.\n`;
+    case "already_inactive":
+      return `${subject} was already not active on the server; nothing to revoke.\n`;
+    case "still_active":
+    default:
+      return `${subject} is still active; if nothing else uses it, ask the user to revoke it in the token list on the agent's External setup card.\n`;
+  }
+}
+
 export const formatAuthorizedLoginReport = axSurface(
   "Login success report with profile usage and manual-get next steps.",
   (input: {
@@ -36,43 +56,46 @@ export const formatAuthorizedLoginReport = axSurface(
   server: string;
   credentialPath: string;
   profileSlug: string;
+  /**
+   * The key this profile held before (login wait cannot rotate it), and what
+   * revoking it with itself did after the new key was saved.
+   */
+  previousKey?: { credentialId: string; outcome: PreviousKeyOutcome };
 }): string => {
   const manualCommand = "raft manual get raft-cli-overview "
     + "--intent \"Get productive on Raft as a new agent\" "
     + "--reason \"Just logged in, need the CLI basics\"";
+  const previousKeyLine = input.previousKey ? formatPreviousKeyLine(input.previousKey) : "";
   return (
     `state: authorized\n` +
       `Logged in as '${input.agentName}' on ${input.server}. Credential saved to ${input.credentialPath}.\n` +
+      previousKeyLine +
       `Next (if you are the human operator): start your agent with RAFT_PROFILE=${input.profileSlug} in its environment, and let the agent run \`${manualCommand}\` to learn the Raft CLI.\n` +
       `Next (if you are the agent): run \`${manualCommand}\`, then use \`raft --profile ${input.profileSlug} …\` for all commands.\n`
   );
 },
   {
-    examples: [{ args: [{ agentName: "alice", server: "https://raft.example", credentialPath: "/p/alice/credential.json", profileSlug: "alice" }] }],
+    examples: [
+      { args: [{ agentName: "alice", server: "https://raft.example", credentialPath: "/p/alice/credential.json", profileSlug: "alice" }] },
+      { title: "previous key revoked", args: [{ agentName: "alice", server: "https://raft.example", credentialPath: "/p/alice/credential.json", profileSlug: "alice", previousKey: { credentialId: "cred-old", outcome: "revoked" } }] },
+      { title: "previous key already not active", args: [{ agentName: "alice", server: "https://raft.example", credentialPath: "/p/alice/credential.json", profileSlug: "alice", previousKey: { credentialId: "cred-old", outcome: "already_inactive" } }] },
+      { title: "previous key still active", args: [{ agentName: "alice", server: "https://raft.example", credentialPath: "/p/alice/credential.json", profileSlug: "alice", previousKey: { credentialId: "cred-old", outcome: "still_active" } }] },
+    ],
   },
 );
 
 /** Human-readable verification handoff used by the device-code paths (stderr). */
 export const formatVerificationHandoff = axSurface(
-  "Device-code browser handoff prompt (stderr), pre-filled and manual-code variants.",
+  "Device-code browser handoff prompt (stderr): the approval page and the code to type there.",
   (action: {
   verificationUri: string;
-  verificationUriComplete?: string;
   userCode: string;
   expiresInSeconds: number;
 }, options: { enterOpensBrowser: boolean }): string => {
   const mins = Math.max(0, Math.floor(action.expiresInSeconds / 60));
-  const url = action.verificationUriComplete ?? action.verificationUri;
   const openLine = options.enterOpensBrowser
-    ? `Press Enter to open the browser authorization URL: ${url}\n`
-    : `Open this browser authorization URL: ${url}\n`;
-  if (action.verificationUriComplete) {
-    return (
-      openLine +
-      `  Code is pre-filled. Approve the login in the browser; this command will continue automatically.\n` +
-      `  Expires in ~${mins}m.\n`
-    );
-  }
+    ? `Press Enter to open the browser authorization URL: ${action.verificationUri}\n`
+    : `Open this browser authorization URL: ${action.verificationUri}\n`;
   return (
     openLine +
     `  Enter code ${action.userCode} and approve the login in the browser; this command will continue automatically.\n` +
@@ -80,13 +103,13 @@ export const formatVerificationHandoff = axSurface(
   );
 },
   {
-    examples: [{ title: "manual code", args: [{ verificationUri: "https://github.example/device", userCode: "AB-12", expiresInSeconds: 600 }, { enterOpensBrowser: false }] }, { title: "pre-filled + Enter opens browser", args: [{ verificationUri: "https://github.example/device", verificationUriComplete: "https://github.example/device?c=1", userCode: "AB-12", expiresInSeconds: 90 }, { enterOpensBrowser: true }] }],
+    examples: [{ title: "manual code", args: [{ verificationUri: "https://github.example/device", userCode: "AB-12", expiresInSeconds: 600 }, { enterOpensBrowser: false }] }, { title: "Enter opens browser", args: [{ verificationUri: "https://github.example/device", userCode: "AB-12", expiresInSeconds: 90 }, { enterOpensBrowser: true }] }],
   },
 );
 
 /** `login start` handoff report (stdout, text-first). */
 export const formatStartHandoff = axSurface(
-  "login start report with authorization URL, code and wait command.",
+  "login start report with authorization URL, code, agent pick and wait command.",
   (
   authorization: DeviceAuthorization,
   options: { server: string; agent: string },
@@ -94,13 +117,9 @@ export const formatStartHandoff = axSurface(
 ): string => {
   const mins = Math.max(0, Math.floor(authorization.expiresInSeconds / 60));
   let out = `state: pending_human_action\n`;
-  out += `Login started for profile '${paths.profileSlug}'. Ask the user to approve in a browser:\n`;
-  if (authorization.verificationUriComplete) {
-    out += `  Browser authorization URL (code pre-filled): ${authorization.verificationUriComplete}\n`;
-  } else {
-    out += `  Browser authorization URL: ${authorization.verificationUri}\n`;
-    out += `  Enter code ${authorization.userCode} and approve the login.\n`;
-  }
+  out += `Login started for profile '${paths.profileSlug}'. Ask the user to give this agent a key in a browser:\n`;
+  out += `  Browser authorization URL: ${authorization.verificationUri}\n`;
+  out += `  Enter code ${authorization.userCode}, choose this agent as the one the key is for, and approve.\n`;
   out += `  Code expires in ~${mins}m.\n`;
   out += `Next: after the user approves, run \`${waitCommandLine(options, paths, authorization.deviceCode)}\` to finish.\n`;
   return (out);
@@ -201,7 +220,95 @@ export const formatCredentialRemintNotice = axSurface(
   },
 );
 
-export const agentTokenStdinGuidance = "Pipe the agent token from your secret manager or redirect an existing token file into this command: raft agent login --server <url> --agent <agentId> --profile-slug <slug> < /path/to/agent-token";
+// ---------------------------------------------------------------------------
+// `raft agent logout`
+// ---------------------------------------------------------------------------
+
+/** The command that logs this profile out, as the agent would run it again. */
+export function logoutCommandLine(profileSlug: string): string {
+  return `raft --profile ${profileSlug} agent logout`;
+}
+
+function profileKeySubject(credentialId: string | null): string {
+  return credentialId ? `This profile's key (credential ${credentialId})` : "This profile's key";
+}
+
+/** What logout did with the key before it removed the file (only these two remove it). */
+export type LogoutRevokeOutcome = "revoked" | "already_inactive";
+
+export const formatLogoutReport = axSurface(
+  "agent logout report: the profile's key was revoked (or was already not active) and its credential file removed.",
+  (
+  outcome: LogoutRevokeOutcome,
+  credentialId: string | null,
+  options: { server: string; agent: string },
+  paths: LoginProfilePaths,
+): string => {
+  const key = profileKeySubject(credentialId);
+  const what = outcome === "revoked" ? `${key} was revoked` : `${key} was already not active on the server`;
+  return (
+    `state: logged_out\n` +
+      `${what}. Removed ${paths.credentialPath}.\n` +
+      `Next: to use this agent from this machine again, run \`${startCommandLine(options, paths)}\`.\n`
+  );
+},
+  {
+    examples: [
+      { title: "revoked", args: ["revoked", "cred-1", sampleLoginOptions, sampleProfilePaths] },
+      { title: "already not active", args: ["already_inactive", "cred-1", sampleLoginOptions, sampleProfilePaths] },
+    ],
+  },
+);
+
+export const formatLogoutNotLoggedIn = axSurface(
+  "agent logout on a profile with no credential file: nothing to do.",
+  (paths: LoginProfilePaths): string => {
+  return (
+    `state: not_logged_in\n` +
+      `No credential for profile '${paths.profileSlug}' at ${paths.credentialPath}. Nothing to log out; no action needed.\n`
+  );
+},
+  {
+    examples: [{ args: [sampleProfilePaths] }],
+  },
+);
+
+/**
+ * Error copy when logout could not revoke the key: the file is kept, so the
+ * profile still holds a key that may be active. The next step names who can
+ * revoke it and how to finish (a rerun then sees 401 and removes the file).
+ */
+export function describeLogoutRevokeFailure(
+  outcome: "not_self_revocable" | "unsupported" | "failed",
+  credentialId: string | null,
+  paths: LoginProfilePaths,
+): { code: string; message: string; suggestedNextAction: string } {
+  const key = profileKeySubject(credentialId);
+  const userRevokes = `ask the user to revoke ${credentialId ? `credential ${credentialId}` : "this agent's key"} in the token list on the agent's External setup card, then run \`${logoutCommandLine(paths.profileSlug)}\` again to remove the file.`;
+  switch (outcome) {
+    case "not_self_revocable":
+      return {
+        code: "credential_not_self_revocable",
+        message: `${key} is managed by the system that issued it and cannot revoke itself. It is still active; ${paths.credentialPath} was kept.`,
+        suggestedNextAction: `To log out anyway, ${userRevokes}`,
+      };
+    case "unsupported":
+      return {
+        code: "UNSUPPORTED_BY_SERVER",
+        message: `This server cannot revoke a key from the CLI yet. ${key} is still active; ${paths.credentialPath} was kept.`,
+        suggestedNextAction: `To log out anyway, ${userRevokes}`,
+      };
+    case "failed":
+    default:
+      return {
+        code: "CREDENTIAL_REVOKE_FAILED",
+        message: `Could not revoke ${key.charAt(0).toLowerCase()}${key.slice(1)}: network or server error. It may still be active; ${paths.credentialPath} was kept.`,
+        suggestedNextAction: `Retry \`${logoutCommandLine(paths.profileSlug)}\` when the server is reachable. If it keeps failing, ${userRevokes}`,
+      };
+  }
+}
+
+export const agentTokenStdinGuidance ="Pipe the agent token from your secret manager or redirect an existing token file into this command: raft agent login --server <url> --agent <agentId> --profile-slug <slug> < /path/to/agent-token";
 
 export const formatAgentTokenPrompt = axSurface(
   "Hidden terminal prompt or non-TTY stdin guidance for an existing agent token.",
@@ -240,7 +347,7 @@ export const formatBridgeTransientFailure = axSurface(
   delayMs: number,
 ): string => {
   return (
-    `bridge: transient failure (${errorCode}: ${message}); retry #${consecutiveFailures} in ${Math.round(delayMs / 1000)}s. Pending wakes are not lost; \`raft message check\` still works directly.\n`
+    `bridge: transient failure (${errorCode}: ${message}); retry #${consecutiveFailures} in ${Math.round(delayMs / 1000)}s. Pending wakes are not lost; \`raft inbox check\` still works directly.\n`
   );
 },
   {

@@ -29,15 +29,12 @@ export function IMBridgesSection({
   const { formatMessage } = useIntl();
 
   return (
-    <div className="space-y-4" data-testid="im-bridges-section">
+    <div className="stack-y-4" data-testid="im-bridges-section">
       <section aria-labelledby="im-bridges-providers-heading">
         <SectionEyebrow as="div">{formatMessage({ id: "settings.imBridges.eyebrow" })}</SectionEyebrow>
         <h2 id="im-bridges-providers-heading" className="mt-1 text-headline text-foreground">
           {formatMessage({ id: "settings.imBridges.title" })}
         </h2>
-        <p className="mt-1 max-w-2xl text-footnote text-foreground-muted">
-          {formatMessage({ id: "settings.imBridges.description" })}
-        </p>
       </section>
 
       {oauthReturnError && (

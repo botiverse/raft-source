@@ -64,14 +64,74 @@ export interface CliTransportNormalizedErrorAttrs {
 
 type TraceSinkForTest = (name: "cli.transport.normalized_error", attrs: CliTransportNormalizedErrorAttrs) => void;
 
+/**
+ * Every span name the CLI writes. A closed set on purpose: a span name is
+ * data that leaves the machine, so adding one is a reviewed change here.
+ */
+export type CliTraceSpanName =
+  | "cli.transport.normalized_error"
+  | "cli.draft.held"
+  | "cli.draft.resolved"
+  | "cli.continuation.created"
+  | "cli.continuation.answered"
+  | "cli.continuation.refused"
+  | "cli.guidance.decision";
+
+/** Flat scalar attributes only; undefined, null and "" are left off the record. */
+export type CliTraceSpanAttrs = Readonly<Record<string, string | number | boolean | null | undefined>>;
+
+export interface CliTraceSpanShape {
+  /**
+   * `error` only for a failure: the daemon's observed-failure summary counts
+   * `status === "error"` records (shared/observedFailureSummary.ts).
+   */
+  status: "ok" | "error";
+  kind: "client" | "internal";
+}
+
+/** The JSONL record as written, for tests that assert exactly what ships. */
+export interface CliTraceSpanRecord {
+  type: "span";
+  schema_version: 1;
+  trace_id: string;
+  span_id: string;
+  parent_span_id: null;
+  name: CliTraceSpanName;
+  surface: "cli";
+  kind: CliTraceSpanShape["kind"];
+  status: CliTraceSpanShape["status"];
+  start_time: string;
+  end_time: string;
+  duration_ms: 0;
+  attrs: Record<string, string | number | boolean>;
+  events: [];
+}
+
+type CliTraceSinkForTest = (record: CliTraceSpanRecord) => void;
+
 const CLI_TRACE_DIR_ENV = "SLOCK_CLI_TRANSPORT_TRACE_DIR";
+// The daemon uploads every `traces/daemon-trace-*.jsonl` as is (no span-name
+// filter, daemon/src/traceBundleUpload.ts), and its sink budgets files by this
+// prefix (trace-client `traceFileFamily`). Every CLI span keeps it, so a new
+// span name ships without a daemon change.
+const CLI_TRACE_FILE_PREFIX = "daemon-trace-cli-transport-";
+// The agent's runtime id, set by the daemon in the spawn env
+// (daemon/src/drivers/cliTransport.ts `RAFT_CURRENT_RUNTIME_ENV`).
+const CLI_TRACE_RUNTIME_ENV = "RAFT_CURRENT_RUNTIME";
+const RUNTIME_ID_PATTERN = /^[a-z0-9][a-z0-9_-]{0,31}$/;
 const TRACE_ID_HEX_LENGTH = 32;
 const SPAN_ID_HEX_LENGTH = 16;
 let traceSinkForTest: TraceSinkForTest | null = null;
+let cliTraceSinkForTest: CliTraceSinkForTest | null = null;
 let traceFilePath: string | null = null;
 
 export function __setCliTransportTraceSinkForTest(sink: TraceSinkForTest | null): void {
   traceSinkForTest = sink;
+}
+
+/** Test seam: receives every CLI span record, of any name, before it is written. */
+export function __setCliTraceSinkForTest(sink: CliTraceSinkForTest | null): void {
+  cliTraceSinkForTest = sink;
 }
 
 export function emitCliTransportNormalizedError(
@@ -80,21 +140,52 @@ export function emitCliTransportNormalizedError(
 ): void {
   try {
     traceSinkForTest?.("cli.transport.normalized_error", attrs);
+  } catch {
+    return;
+  }
+  emitCliTraceSpan("cli.transport.normalized_error", { ...attrs }, { status: "error", kind: "client" }, env);
+}
+
+/**
+ * The runtime id for a span's `runtime` attr, or undefined: unset (an older
+ * daemon, a profile-login CLI) or not shaped like a runtime id. The agent's
+ * shell can change its env, so only an id-shaped value is written.
+ */
+export function cliTraceRuntime(env: NodeJS.ProcessEnv = process.env): string | undefined {
+  const value = env[CLI_TRACE_RUNTIME_ENV]?.trim();
+  return value && RUNTIME_ID_PATTERN.test(value) ? value : undefined;
+}
+
+/**
+ * Append one span to this process's CLI trace file in
+ * `$SLOCK_CLI_TRANSPORT_TRACE_DIR` (set by the daemon for the agents it runs;
+ * unset, nothing is written). Never throws: tracing must not affect the
+ * user-visible CLI command result.
+ */
+export function emitCliTraceSpan(
+  name: CliTraceSpanName,
+  attrs: CliTraceSpanAttrs,
+  shape: CliTraceSpanShape,
+  env: NodeJS.ProcessEnv = process.env,
+): void {
+  try {
+    const record = spanRecord(name, attrs, shape);
+    cliTraceSinkForTest?.(record);
     const traceDir = env[CLI_TRACE_DIR_ENV];
     if (!traceDir) return;
     mkdirSync(traceDir, { recursive: true, mode: 0o700 });
     if (!traceFilePath) {
       traceFilePath = path.join(
         traceDir,
-        `daemon-trace-cli-transport-${safeTimestamp(Date.now())}-${process.pid}-${randomHex(4)}.jsonl`,
+        `${CLI_TRACE_FILE_PREFIX}${safeTimestamp(Date.now())}-${process.pid}-${randomHex(4)}.jsonl`,
       );
     }
-    appendFileSync(traceFilePath, `${JSON.stringify(spanRecord("cli.transport.normalized_error", attrs))}\n`, {
+    appendFileSync(traceFilePath, `${JSON.stringify(record)}\n`, {
       encoding: "utf8",
       mode: 0o600,
     });
   } catch {
-    // Transport tracing must never affect the user-visible CLI command result.
+    // Tracing must never affect the user-visible CLI command result.
   }
 }
 
@@ -195,7 +286,7 @@ export function boundedOriginalMessage(err: unknown): string | undefined {
   return message || undefined;
 }
 
-function spanRecord(name: string, attrs: CliTransportNormalizedErrorAttrs): Record<string, unknown> {
+function spanRecord(name: CliTraceSpanName, attrs: CliTraceSpanAttrs, shape: CliTraceSpanShape): CliTraceSpanRecord {
   const now = new Date().toISOString();
   return {
     type: "span",
@@ -205,12 +296,17 @@ function spanRecord(name: string, attrs: CliTransportNormalizedErrorAttrs): Reco
     parent_span_id: null,
     name,
     surface: "cli",
-    kind: "client",
-    status: "error",
+    kind: shape.kind,
+    status: shape.status,
     start_time: now,
     end_time: now,
     duration_ms: 0,
-    attrs: Object.fromEntries(Object.entries(attrs).filter(([, value]) => value !== undefined && value !== null && value !== "")),
+    attrs: Object.fromEntries(
+      Object.entries(attrs).filter((entry): entry is [string, string | number | boolean] => {
+        const value = entry[1];
+        return value !== undefined && value !== null && value !== "";
+      }),
+    ),
     events: [],
   };
 }

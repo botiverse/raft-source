@@ -21,11 +21,12 @@ import { getDb } from "../db/index";
 import { users, messages, tasks } from "../db/schema";
 import { createChannel, addHuman, addAgent } from "../services/channelService";
 import { createServer } from "../services/serverService";
-import { createAgent, assignMachine } from "../services/agentService";
+import { createAgent } from "../services/agentService";
+import { placeAgentOnMachine } from "../test/agentMachineFixture";
 import { registerMachine } from "../services/machineService";
 import * as taskService from "../services/taskService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 type ShapeName = "v0" | "message" | "backfilled" | "v14";
 
@@ -64,7 +65,7 @@ async function setup(slug: string) {
 async function seedAgentWithMachine(serverId: string, channelId: string, ownerId: string, name: string) {
   const agent = await createAgent(serverId, name, { runtime: "claude" });
   const { machine, apiKey } = await registerMachine(serverId, ownerId, `${name}-machine`);
-  await assignMachine(agent.id, machine.id);
+  await placeAgentOnMachine(agent.id, machine.id);
   await addAgent(channelId, agent.id);
   return { agent, apiKey };
 }

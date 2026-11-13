@@ -9,6 +9,7 @@ import type { Message } from "../../store/messageStore";
 import type { useServerStore } from "../../store/serverStore";
 import { resolveMessageSenderMemberFromList } from "../../utils/messageSenderMember";
 import QuotedMessageCard from "../ui/cards/QuotedMessageCard";
+import { delegatedByOf, isRetractedMessage } from "./delegatedMessage";
 import { buildQuotedMessageAttachmentLabel } from "./quotedMessagePermalink";
 
 export function QuoteCardContent({
@@ -37,6 +38,15 @@ export function QuoteCardContent({
   const attachmentLabel = buildQuotedMessageAttachmentLabel(target.attachments, formatMessage);
   const isArchived = channelArchived || (channel ? !!channel.archivedAt : false);
 
+  const delegatedByRaw = (target as { delegatedBy?: unknown }).delegatedBy;
+  const delegatedByLabel = useMemo(() => {
+    const delegatedBy = target.senderType === "user" ? delegatedByOf({ delegatedBy: delegatedByRaw }) : null;
+    if (!delegatedBy) return undefined;
+    return delegatedBy.deleted
+      ? formatMessage({ id: "message.delegated.sentByDeletedInBody" })
+      : formatMessage({ id: "message.delegated.sentByInBody" }, { name: delegatedBy.name });
+  }, [delegatedByRaw, formatMessage, target.senderType]);
+
   const quoteAuthor = useMemo(() => ({
     name: target.senderName || (target.senderType === "agent"
       ? formatMessage({ id: "message.author.agentFallback" })
@@ -49,13 +59,13 @@ export function QuoteCardContent({
       : target.senderType === "external_projection"
         ? (target.externalAuthor?.avatarUrl ?? undefined)
         : (member?.avatarUrl ?? undefined),
-    gravatarHash: target.senderType === "user" ? (member?.gravatarHash ?? undefined) : undefined,
     subtitle: target.senderType === "agent"
       ? (agent?.description ?? undefined)
       : target.senderType === "external_projection"
         ? target.externalAuthor?.provider
         : (member?.description || member?.role || undefined),
-  }), [target.senderName, target.senderType, target.externalAuthor, formatMessage, agent, member]);
+    delegatedByLabel,
+  }), [target.senderName, target.senderType, target.externalAuthor, formatMessage, agent, member, delegatedByLabel]);
   const quoteAttachments = useMemo(
     () => (attachmentLabel ? [{ label: attachmentLabel }] : undefined),
     [attachmentLabel],
@@ -81,6 +91,10 @@ export function QuoteCardContent({
       content={target.content}
       attachments={quoteAttachments}
       onClick={handleOpenQuote}
+      // RFC 077: a retracted message is quoted as one muted line, like an
+      // unavailable one, never with its old words.
+      unavailable={isRetractedMessage(target)}
+      unavailableText={formatMessage({ id: "message.delegated.retracted" })}
     />
   );
 }

@@ -52,17 +52,6 @@ test("parseThreadTarget rejects non-thread targets", () => {
   assert.equal(parseThreadTarget(""), null);
 });
 
-test("unfollow thread output explains delivery semantics", () => {
-  assert.equal(
-    formatUnfollowThreadResult("#engineering:abcd1234"),
-    [
-      "Unfollowed #engineering:abcd1234. Ordinary delivery for this thread has stopped.",
-      "A later personal @mention arrives and re-follows you; that delivery reminds you to run: raft thread unfollow --target \"#engineering:abcd1234\"",
-      "Posting in this thread re-follows you automatically.",
-    ].join("\n"),
-  );
-});
-
 test("unfollow thread command uses injected ApiClient and writes result", async () => {
   const { io, stdout, stderr } = memoryIo();
   const requests: Array<{ method: string; path: string; body?: unknown }> = [];
@@ -88,7 +77,7 @@ test("unfollow thread command uses injected ApiClient and writes result", async 
     {
       method: "POST",
       path: "/internal/agent-api/threads/unfollow",
-      body: { thread: "#engineering:abcd1234", reason: "no longer following" },
+      body: { thread: "#engineering:abcd1234" },
     },
   ]);
   assert.deepEqual(stderr, []);

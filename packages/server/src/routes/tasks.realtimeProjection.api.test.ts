@@ -9,7 +9,7 @@ import { addHuman, createChannel } from "../services/channelService";
 import { createServer } from "../services/serverService";
 import * as taskService from "../services/taskService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 type EmittedEvent = { rooms: string[]; event: string; payload: unknown };
 type FakeAudience = {

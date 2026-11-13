@@ -1,9 +1,10 @@
 import ConversationPreviewCard from "../ui/cards/ConversationPreviewCard";
 import { formatRelativeTimeParts } from "../../utils/relativeTime";
-import { getSearchRelativeTimeParts } from "../search/searchGrouping";
+import { getSearchRelativeTimeParts } from "../../features/search/searchGrouping";
 import { useIntl } from "react-intl";
 import { useMemo } from "react";
 import type { AgentDMConversation } from "./AgentDMConversationList";
+import { useDmPeerAvatar } from "../layout/dmPeerAvatar";
 
 export function AgentDMConversationCard({ item }: { item: AgentDMConversation }) {
   const { formatMessage, locale } = useIntl();
@@ -14,14 +15,16 @@ export function AgentDMConversationCard({ item }: { item: AgentDMConversation })
     const parts = getSearchRelativeTimeParts(value);
     return parts ? formatRelativeTimeParts(parts.value, parts.unit, locale) : "";
   };
+  // The peer agent's face is read live: the listed copy is from when the tab loaded.
+  const { avatarUrl } = useDmPeerAvatar({ peerType: "agent", peerId: item.peerId, peerAvatarUrl: item.peerAvatarUrl });
   const author = useMemo(
     () => ({
       name: item.peerDisplayName || item.peerName,
       kind: "agent" as const,
-      avatarUrl: item.peerAvatarUrl || null,
+      avatarUrl,
       subtitle: `@${item.peerName}`,
     }),
-    [item.peerDisplayName, item.peerName, item.peerAvatarUrl],
+    [item.peerDisplayName, item.peerName, avatarUrl],
   );
   return (
     <ConversationPreviewCard

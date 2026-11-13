@@ -10,7 +10,7 @@ import { and, eq } from "drizzle-orm";
 import { getDb } from "../db/index";
 import { users, computers, onboardingEmailJourneys } from "../db/schema";
 import { openTestApp } from "../test/integration/app";
-import { signAccessToken } from "../middleware/auth";
+import { accessTokenForTest } from "../test/integration/credentials";
 import { createServer, addMember, transitionMemberRole } from "../services/serverService";
 import { getMachine } from "../services/machineService";
 import {
@@ -18,7 +18,7 @@ import {
   setComputerMobileAppEmailJourneyConfigForTest,
 } from "../services/computerMobileAppEmailJourneyService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 // task #30 PR-B regression guard — user-authed Computer attach
 // (RFC v0.8 contract v3 §6/§9). Pins: env gate, requireAuth, name as a
@@ -54,7 +54,7 @@ async function withEnv<T>(
   } else {
     process.env.SLOCK_DEVICE_LOGIN_ENABLED = "false";
   }
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     return await fn(app);
   } finally {
@@ -77,7 +77,7 @@ async function seedUser(): Promise<{ id: string; bearer: string }> {
       emailVerified: true,
     })
     .returning();
-  return { id: u.id, bearer: signAccessToken(u.id) };
+  return { id: u.id, bearer: await accessTokenForTest(u.id) };
 }
 
 test("attach surface is NOT mounted when gate explicitly disabled", async () => {
@@ -275,7 +275,6 @@ test("attach: non-member and nonexistent server collapse to uniform 403 not_auth
       actorUserId: owner.id,
       targetUserId: stranger.id,
       nextRole: "admin",
-      guestTransitionsEnabled: true,
     });
     const nowAdmin = await fetch(`${app.baseUrl}/api/computer/attach`, {
       method: "POST",

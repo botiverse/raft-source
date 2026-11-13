@@ -17,7 +17,12 @@ import { join } from "node:path";
 import { writePidfileAt } from "./internal/process-primitives";
 import { ServiceClientError } from "./lib/types";
 import { servicePidPath } from "./paths";
-import { performServiceSelfRestart } from "./serviceControl";
+import {
+  awaitRestartOutcomeAfterConnectionLoss,
+  isServiceConnectionLoss,
+  performServiceSelfRestart,
+  requestServiceUpgradeStartViaIpc,
+} from "./serviceControl";
 
 async function withHome<T>(fn: (home: string) => Promise<T>): Promise<T> {
   const home = await mkdtemp(join(tmpdir(), "raft-service-control-"));
@@ -107,4 +112,83 @@ test("self-restart rollback: a pidfile write failure is reported, not swallowed"
         err.message.includes("incumbent pidfile restore failed: EACCES: run/"),
     );
   });
+});
+
+// task #924: on Windows the restart request's connection is closed by the
+// handoff itself, so the requester settles the restart from the marker.
+function markerFor(serverId: string, requestId: string) {
+  return { requestId, originServerId: serverId, startedAt: "2026-10-27T00:00:00.000Z" };
+}
+
+test("isServiceConnectionLoss: a closed or reset connection, not a typed service error", () => {
+  assert.equal(isServiceConnectionLoss(new ServiceClientError("IPC_CLIENT_CLOSED", "closed")), true);
+  const reset = Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" });
+  assert.equal(isServiceConnectionLoss(new ServiceClientError("IPC_MALFORMED_FRAME", "socket error: read ECONNRESET", reset)), true);
+  assert.equal(isServiceConnectionLoss(new ServiceClientError("IPC_MALFORMED_FRAME", "frame decode failed")), false);
+  assert.equal(isServiceConnectionLoss(new ServiceClientError("SELF_RELAUNCH_UNAVAILABLE", "x")), false);
+  assert.equal(isServiceConnectionLoss(new Error("closed")), false);
+});
+
+test("awaitRestartOutcomeAfterConnectionLoss: cleared marker while alive is the failed takeover", async () => {
+  const reads = [markerFor("server-a", "req-1"), markerFor("server-a", "req-1"), null];
+  let t = 0;
+  await assert.rejects(
+    awaitRestartOutcomeAfterConnectionLoss("/tmp/raft-home", "server-a", "req-1", {
+      readPendingRestartMarkerFn: async () => reads.shift() ?? null,
+      now: () => t,
+      sleep: async (ms) => { t += ms; },
+      timeoutMs: 60_000,
+    }),
+    (error: unknown) =>
+      error instanceof ServiceClientError &&
+      error.code === "SELF_RELAUNCH_UNAVAILABLE" &&
+      /did not complete/.test(error.message),
+  );
+  assert.equal(reads.length, 0);
+});
+
+test("awaitRestartOutcomeAfterConnectionLoss: a marker for another request is not this restart", async () => {
+  await assert.rejects(
+    awaitRestartOutcomeAfterConnectionLoss("/tmp/raft-home", "server-a", "req-1", {
+      readPendingRestartMarkerFn: async () => markerFor("server-a", "req-2"),
+    }),
+    /did not complete/,
+  );
+});
+
+test("awaitRestartOutcomeAfterConnectionLoss: keeps waiting while the handoff is pending, bounded", async () => {
+  let t = 0;
+  let readsCount = 0;
+  await assert.rejects(
+    awaitRestartOutcomeAfterConnectionLoss("/tmp/raft-home", "server-a", "req-1", {
+      readPendingRestartMarkerFn: async () => {
+        readsCount += 1;
+        return markerFor("server-a", "req-1");
+      },
+      now: () => t,
+      sleep: async (ms) => { t += ms; },
+      timeoutMs: 1_000,
+    }),
+    /restart handoff did not finish/,
+  );
+  assert.ok(readsCount > 2, `polled ${readsCount} times`);
+});
+
+// Reconciler step 13: the runner relays the Server's (clamped) drain to the
+// service; a `draining` answer is an accepted upgrade, as `started` is.
+test("step 13: requestServiceUpgradeStartViaIpc relays drain and accepts draining", async () => {
+  const requests: unknown[] = [];
+  let answer: { status: string; upgradeId: string } = { status: "draining", upgradeId: "req-1" };
+  const connectServiceFn = (async () => ({
+    request: async (method: string, params: unknown) => { requests.push([method, params]); return answer; },
+    close: async () => {},
+  })) as unknown as NonNullable<Parameters<typeof requestServiceUpgradeStartViaIpc>[2]>["connectServiceFn"];
+  await requestServiceUpgradeStartViaIpc("/unused", { requestId: "req-1", originServerId: "s", targetVersion: "1.0.9", drain: { deadlineMs: 600_000 } }, { connectServiceFn });
+  await requestServiceUpgradeStartViaIpc("/unused", { requestId: "req-1", originServerId: "s" }, { connectServiceFn });
+  assert.deepEqual(requests, [
+    ["upgrade-start", { scope: "remote", requestId: "req-1", originServerId: "s", trigger: "web", targetVersion: "1.0.9", drain: { deadlineMs: 600_000 } }],
+    ["upgrade-start", { scope: "remote", requestId: "req-1", originServerId: "s", trigger: "web" }],
+  ]);
+  answer = { status: "already-running", upgradeId: "req-0" };
+  await assert.rejects(() => requestServiceUpgradeStartViaIpc("/unused", { requestId: "req-1", originServerId: "s" }, { connectServiceFn }), /UPGRADE_ALREADY_RUNNING/);
 });

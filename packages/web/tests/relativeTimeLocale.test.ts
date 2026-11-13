@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 
-import { formatRelativeTime, formatRelativeTimeParts } from "../src/utils/relativeTime";
+import { formatRelativeTime, formatRelativeTimeParts, formatShortRelativeTime } from "../src/utils/relativeTime";
 
 test("shared relative-time formatter follows the app locale passed by the caller", () => {
   const fixedNow = Date.parse("2026-08-02T12:00:00.000Z");
@@ -85,4 +85,46 @@ test("shared relative-time formatter keeps absent and invalid inputs quiet", () 
   assert.equal(formatRelativeTime(null, "zh-cn"), null);
   assert.equal(formatRelativeTime(undefined, "zh-cn"), null);
   assert.equal(formatRelativeTime("not-a-date", "zh-cn"), null);
+});
+
+test("the short form says how long ago in one word and a number, in the same steps as the long one, zh spaced", () => {
+  const fixedNow = Date.parse("2026-08-02T12:00:00.000Z");
+  const realNow = Date.now;
+  Date.now = () => fixedNow;
+  const ago = (ms: number) => new Date(fixedNow - ms).toISOString();
+  try {
+    assert.equal(formatShortRelativeTime(ago(9 * 86_400_000), "en"), "9d ago");
+    assert.equal(formatShortRelativeTime(ago(9 * 86_400_000), "zh-cn"), "9 天前");
+    assert.equal(formatShortRelativeTime(ago(3 * 3_600_000), "en"), "3h ago");
+    assert.equal(formatShortRelativeTime(ago(5 * 60_000), "en"), "5m ago");
+    // Never the long words ("yesterday", "this minute"), which are what didn't fit.
+    assert.equal(formatShortRelativeTime(ago(86_400_000), "en"), "1d ago");
+    assert.equal(formatShortRelativeTime(ago(86_400_000), "zh-cn"), "1 天前");
+    assert.equal(formatShortRelativeTime(ago(0), "en"), "0m ago");
+    // A clock behind the server's: just now, never "in 5m".
+    assert.equal(formatShortRelativeTime(ago(-5 * 60_000), "en"), "0m ago");
+    assert.equal(formatShortRelativeTime(null, "en"), null);
+    assert.equal(formatShortRelativeTime("not a time", "en"), null);
+  } finally {
+    Date.now = realNow;
+  }
+});
+
+test("a narrow form that only marks the past with a minus says the short one instead, and the others stay narrow", () => {
+  const fixedNow = Date.parse("2026-08-02T12:00:00.000Z");
+  const realNow = Date.now;
+  Date.now = () => fixedNow;
+  const ago = (ms: number) => new Date(fixedNow - ms).toISOString();
+  try {
+    // What Node's ICU gives: the premise, and if a later CLDR drops the minus this one says so.
+    assert.equal(new Intl.RelativeTimeFormat("ru", { style: "narrow", numeric: "always" }).format(-9, "day"), "-9 дн.");
+    assert.equal(formatShortRelativeTime(ago(9 * 86_400_000), "ru"), "9 дн. назад");
+    assert.equal(formatShortRelativeTime(ago(3 * 3_600_000), "ru"), "3 ч назад");
+    assert.equal(formatShortRelativeTime(ago(5 * 60_000), "ru"), "5 мин. назад");
+    assert.equal(formatShortRelativeTime(ago(0), "ru"), "0 мин. назад", "the negated zero has a minus too");
+    assert.equal(formatShortRelativeTime(ago(9 * 86_400_000), "en"), "9d ago");
+    assert.equal(formatShortRelativeTime(ago(3 * 3_600_000), "en"), "3h ago", "not en's short \"3 hr. ago\"");
+  } finally {
+    Date.now = realNow;
+  }
 });

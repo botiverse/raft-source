@@ -16,11 +16,13 @@ import {
   type SpawnOptions,
   type StdioOptions,
 } from "node:child_process";
-import { appendFileSync } from "node:fs";
+import { appendFileSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { emitFileTimings, SERVER_SHARD_TIMINGS_ENV } from "./serverShardTimings";
 
-export const SERVER_SHARD_WATCHDOG_TIMEOUT_MS = 20 * 60_000;
+export const SERVER_SHARD_WATCHDOG_TIMEOUT_MS = 25 * 60_000;
 export const SERVER_SHARD_WATCHDOG_KILL_GRACE_MS = 5_000;
 export const SERVER_SHARD_WATCHDOG_EXIT_CODE = 124;
 
@@ -56,6 +58,8 @@ interface ExitWatchdogOptions {
   timeoutMs: number;
   killGraceMs: number;
   emit?: (receipt: ProcessDidNotExitReceipt) => void;
+  timingJournal?: string;
+  writeTimingSummary?: (text: string) => void;
 }
 
 interface RunWithWatchdogOptions extends ExitWatchdogOptions {
@@ -194,6 +198,10 @@ export function watchSpawnedChildExit(
     const finish = (exitCode: number) => {
       if (settled) return;
       settled = true;
+      if (options.timingJournal) {
+        try { emitFileTimings(options.timingJournal, options.shard, timedOut ? "watchdog" : "exit", options.writeTimingSummary); }
+        catch { console.error("[serverShardTimings] diagnostic failed; exit code preserved"); }
+      }
       resolve(exitCode);
     };
 
@@ -289,15 +297,24 @@ async function main(): Promise<void> {
     process.exit(2);
   }
 
-  const exitCode = await runWithExitWatchdog({
-    command: process.execPath,
-    args: ["--import", "@oxc-node/core/register", SHARD_RUNNER, String(shard)],
-    cwd: SERVER_DIR,
-    env: { ...process.env, TZ: process.env.TZ || "Asia/Singapore" },
-    shard,
-    timeoutMs: SERVER_SHARD_WATCHDOG_TIMEOUT_MS,
-    killGraceMs: SERVER_SHARD_WATCHDOG_KILL_GRACE_MS,
-  });
+  const timingDirectory = mkdtempSync(path.join(tmpdir(), `raft-server-shard-${shard}-`));
+  const timingJournal = path.join(timingDirectory, "timings.jsonl");
+  let exitCode: number;
+  try {
+    exitCode = await runWithExitWatchdog({
+      command: process.execPath,
+      args: ["--import", "@oxc-node/core/register", SHARD_RUNNER, String(shard)],
+      cwd: SERVER_DIR,
+      env: { ...process.env, TZ: process.env.TZ || "Asia/Singapore", [SERVER_SHARD_TIMINGS_ENV]: timingJournal },
+      timingJournal,
+      shard,
+      timeoutMs: SERVER_SHARD_WATCHDOG_TIMEOUT_MS,
+      killGraceMs: SERVER_SHARD_WATCHDOG_KILL_GRACE_MS,
+    });
+  } finally {
+    try { rmSync(timingDirectory, { recursive: true, force: true }); }
+    catch { console.error("[serverShardTimings] temporary journal cleanup failed"); }
+  }
   process.exit(exitCode);
 }
 

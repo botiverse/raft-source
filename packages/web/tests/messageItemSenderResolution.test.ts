@@ -50,7 +50,6 @@ function makeUser(overrides: Partial<User> = {}): User {
   return {
     id: "user-1",
     email: "current@example.com",
-    gravatarHash: "currenthash",
     name: "current",
     displayName: "Current User",
     description: "Auth profile description",
@@ -72,7 +71,6 @@ function makeMember(overrides: Partial<ServerMember> = {}): ServerMember {
   return {
     userId: "user-1",
     email: "member@example.com",
-    gravatarHash: "memberhash",
     name: "member",
     displayName: "Cached Member",
     description: "Cached description",
@@ -121,7 +119,6 @@ function makeAgentDmChannel(overrides: Partial<Channel> = {}): Channel {
     peerDisplayName: "Jinc Display",
     peerDescription: null,
     peerAvatarUrl: null,
-    peerGravatarHash: null,
     ...overrides,
   };
 }
@@ -209,14 +206,14 @@ function resetStores(options: { user?: User | null; currentServer?: Server; memb
   Object.assign(useChannelStore.getInitialState(), channelState);
 }
 
-function renderMessage(message: Message, props: Record<string, unknown> = {}) {
+function renderMessage(message: Message, props: Record<string, unknown> = {}, locale: "en" | "zh-cn" = "en") {
   return renderToStaticMarkup(
     createElement(
       MemoryRouter,
       null,
       createElement(
         TestIntlProvider,
-        null,
+        { locale },
         createElement(MessageItem, {
           message,
           mentionMap: new Map(),
@@ -254,6 +251,24 @@ test("MessageItem renders Slock angle refs and named links while preserving code
   assert.match(html, />#general msg=abc12345<\/a>/);
   assert.match(html, /<code[^>]*>#general<\/code>/);
   assert.match(html, /&lt;#general&gt;/);
+});
+
+test("message refs are never the yellow sticker, which means you (#triage:71de6c0b)", () => {
+  resetStores({ members: [makeMember()] });
+  const html = renderMessage(
+    makeMessage({ content: "see #general msg=abc12345 and #general:abcd1234 msg=abc12345" }),
+    { channels: [makeChannel()], onOpenThread: () => {} },
+  );
+  const classOf = (text: string) => {
+    const tag = new RegExp(`<(?:a|span)[^>]*class="([^"]*)"[^>]*>${text}</(?:a|span)>`).exec(html);
+    assert.ok(tag, `no element for ${text}`);
+    return tag[1];
+  };
+
+  for (const ref of ["#general msg=abc12345", "#general:abcd1234 msg=abc12345"]) {
+    assert.match(classOf(ref), /\bbg-info-soft\b/);
+    assert.doesNotMatch(classOf(ref), /\bbg-you\b/);
+  }
 });
 
 test("cross-server bare thread refs do not capture a same-named local channel projection", () => {
@@ -408,41 +423,50 @@ test("MessageItem renders auth avatar for current user when member cache is miss
   assert.match(html, new RegExp(authAvatarUrl));
 });
 
-test("MessageItem renders current server role when current-user member cache is missing", () => {
+// Member labels (#wg-rbac:#46): the author row writes one role, this server's
+// Guest; Owner, Admin and Member are the hover card's.
+test("MessageItem renders the current user's Guest role when the current-user member cache is missing", () => {
   resetStores({
     user: makeUser({ description: null }),
-    currentServer: makeServer({ role: "admin" }),
+    currentServer: makeServer({ role: "guest" }),
     members: [],
   });
 
   const html = renderMessage(makeMessage());
 
-  // The role badge renders through the catalog now (member.role.*) — the raw
-  // enum badge was English in zh UI (DOM sweep 2026-08-04). en locale → "Admin".
-  // The hover hint moved from native title= to the RUI tooltip trigger.
+  // The label renders through the catalog (en locale → "Guest"), never the raw enum.
+  // The hover hint is the RUI tooltip trigger, not a native title=.
   assert.match(html, /data-base-ui-tooltip-trigger/);
-  assert.match(html, />Admin<\/span>/);
-  assert.doesNotMatch(html, /title="member"/);
+  assert.match(html, />Guest<\/span>/);
+  assert.doesNotMatch(html, /title="guest"/);
 });
 
-test("MessageItem renders auth gravatar hash for current user when member cache and uploaded avatar are missing", () => {
-  resetStores({ user: makeUser({ avatarUrl: null }), members: [] });
+test("MessageItem writes no Owner, Admin or Member after a sender's name", () => {
+  for (const role of ["owner", "admin", "member"] as const) {
+    resetStores({
+      user: makeUser({ description: null }),
+      currentServer: makeServer({ role }),
+      members: [],
+    });
 
-  const html = renderMessage(makeMessage());
+    const html = renderMessage(makeMessage());
 
-  assert.match(html, /www\.gravatar\.com\/avatar\/currenthash/);
+    assert.doesNotMatch(html, />(Owner|Admin|Member)<\/span>/, role);
+  }
 });
 
-test("MessageItem keeps an email fallback diagnostic for old-session current users without auth gravatar hash", () => {
+test("MessageItem renders the User placeholder for a current user with no stored avatar, never a gravatar.com image or email hash", () => {
   resetStores({
-    user: { ...makeUser({ avatarUrl: null }), gravatarHash: undefined as unknown as string },
+    // An older server's session still carries a hash: ignored.
+    user: { ...makeUser({ avatarUrl: null }), ...({ gravatarHash: "currenthash" } as object) },
     members: [],
   });
 
   const html = renderMessage(makeMessage());
 
-  assert.match(html, /data-avatar-source="email-fallback"/);
-  assert.match(html, /data-avatar-has-email-fallback="true"/);
+  assert.match(html, /data-avatar-source="placeholder"/);
+  assert.doesNotMatch(html, /gravatar|currenthash/i);
+  assert.match(html, /lucide-user/);
 });
 
 test("MessageItem renders other users from member cache instead of auth profile", () => {
@@ -479,6 +503,7 @@ test("MessageItem resolves agent sender identity from agent store", () => {
   assert.match(html, new RegExp(agentAvatarUrl));
   assert.match(html, />Agent One</);
   assert.doesNotMatch(html, />agent-one</);
+  // The description follows the name on the author row again (cindyz, #triage:4eb8046c).
   assert.match(html, /Agent description/);
 });
 
@@ -487,7 +512,6 @@ test("MessageItem prefers live agent identity over a stale channel preview", () 
     agents: [makeAgent({
       displayName: "Current Agent",
       avatarUrl: agentAvatarUrl,
-      description: "Current description",
     })],
   });
 
@@ -501,16 +525,15 @@ test("MessageItem prefers live agent identity over a stale channel preview", () 
       previewSenderAgent: makeAgent({
         displayName: "Stale Agent",
         avatarUrl: previewAgentAvatarUrl,
-        description: "Stale description",
       }),
     },
   );
 
   assert.match(html, new RegExp(agentAvatarUrl));
   assert.match(html, />Current Agent</);
-  assert.match(html, /Current description/);
   assert.doesNotMatch(html, new RegExp(previewAgentAvatarUrl));
-  assert.doesNotMatch(html, /Stale Agent|Stale description/);
+  // The name and avatar the author row draws of an agent are the live ones.
+  assert.doesNotMatch(html, /Stale Agent/);
 });
 
 test("MessageItem uses agent DM peer display name when agent profile displayName is missing", () => {
@@ -551,6 +574,7 @@ test("MessageItem preview sender override supports non-store preview agents", ()
   );
 
   assert.match(html, new RegExp(previewAgentAvatarUrl));
+  assert.match(html, />Preview Agent</);
   assert.match(html, /Preview-only sender/);
 });
 
@@ -596,7 +620,8 @@ test("profile hover card renders a fallback preview agent missing from the local
   assert.match(fallbackHtml, /Remote Preview Agent/);
   assert.match(fallbackHtml, /@preview-agent/);
   assert.match(fallbackHtml, /Remote profile fallback/);
-  assert.match(fallbackHtml, /Online/);
+  // No state for an agent outside the store: a guess, worded apart (#triage:#97).
+  assert.match(fallbackHtml, /Likely online/);
 });
 
 // Task #762: refs are recognised on the parsed markdown tree, so the parser
@@ -665,4 +690,87 @@ test("an escaped ref stays literal next to an unescaped one and a bare URL", () 
   assert.equal((html.match(/>#general<\/a>/g) ?? []).length, 1, "only the unescaped ref is a link");
   assert.equal((html.match(/&lt;#general&gt;/g) ?? []).length, 2);
   assert.match(html, /href="https:\/\/example\.com"/);
+});
+
+test("Slack bot author is labeled as a bot without becoming a Raft agent", () => {
+  resetStores();
+  const externalAuthor = {
+    projectionId: "external-1", provider: "slack", appRegistrationId: "app-1", installId: "install-1",
+    workspaceId: "workspace-1", workspaceName: "Example Workspace", externalActorId: "B123",
+    externalConversationId: "C123", externalMessageId: "123.456", displayName: "Alert Bot",
+    actorKind: "bot" as const, avatarUrl: null, avatarDigest: null, actorProjectionRevision: 1,
+  };
+  const bot = renderMessage(makeMessage({ senderType: "external_projection", senderId: "external-1", externalAuthor }));
+  assert.match(bot, /Alert Bot/);
+  assert.match(bot, /data-testid="app-bot-badge"/);
+  assert.match(bot, /Slack/);
+  assert.doesNotMatch(bot, /agent-online-indicator|data-sidebar-avatar-badge/);
+  const human = renderMessage(makeMessage({ senderType: "external_projection", senderId: "external-1",
+    externalAuthor: { ...externalAuthor, actorKind: "human" } }));
+  assert.doesNotMatch(human, /data-testid="app-bot-badge"/);
+  assert.match(human, /Slack/, "human external authors use the localized provider name too");
+});
+
+test("verified Slack bot profile replaces only a fallback sender label", () => {
+  resetStores();
+  const base = { projectionId: "external-1", provider: "slack", appRegistrationId: "app-1", installId: "install-1",
+    workspaceId: "workspace-1", workspaceName: "Example Workspace", externalActorId: "B123",
+    externalConversationId: "C123", externalMessageId: "123.456", displayName: "Slack bot · B123",
+    actorKind: "bot" as const, avatarUrl: null, avatarDigest: null, actorProjectionRevision: 1 };
+  const fresh = renderMessage(makeMessage({ senderType: "external_projection", senderId: "external-1", externalAuthor: {
+    ...base, profileDisplayName: "Formal Bot", profileAvatarUrl: "https://cdn.example/formal.png" } }));
+  assert.match(fresh, /Formal Bot/);
+  assert.match(fresh, /https:\/\/cdn\.example\/formal\.png/);
+  const revoked = renderMessage(makeMessage({ senderType: "external_projection", senderId: "external-1", externalAuthor: base }));
+  assert.match(revoked, /Slack bot · B123/);
+  assert.doesNotMatch(revoked, /Formal Bot/);
+  const historical = renderMessage(makeMessage({ senderType: "external_projection", senderId: "external-1", externalAuthor: {
+    ...base, displayName: "Historical name", profileDisplayName: "Formal Bot" } }));
+  assert.match(historical, /Historical name/);
+});
+
+test("external bot keeps its App attribution in a truncatable badge", () => {
+  resetStores();
+  const externalAuthor = {
+    projectionId: "external-1", provider: "slack", appRegistrationId: "app-1", installId: "install-1",
+    workspaceId: "workspace-1", workspaceName: "Example Workspace", externalActorId: "B123",
+    externalConversationId: "C123", externalMessageId: "123.456", displayName: "Alert Bot",
+    actorKind: "bot" as const, avatarUrl: null, avatarDigest: null, actorProjectionRevision: 1,
+    appName: "A very long incident management application",
+  };
+  const html = renderMessage(makeMessage({ senderType: "external_projection", senderId: "external-1", externalAuthor }));
+  assert.match(html, /data-testid="app-bot-badge"/);
+  assert.match(html, /class="[^"]*truncate[^"]*">App · A very long incident management application<\/span>/);
+  assert.match(html, /Slack/);
+});
+
+test("anonymous Slack author renders without a profile or mention control", () => {
+  resetStores();
+  const marker = `slack-anonymous:${"a".repeat(64)}`;
+  const externalAuthor = {
+    projectionId: "external-1", provider: "slack", appRegistrationId: "app-1", installId: "install-1",
+    workspaceId: "workspace-1", externalActorId: marker, identityKind: "anonymous" as const,
+    externalConversationId: "C123", externalMessageId: "123.456", displayName: "Slack",
+    actorKind: "unknown" as const, avatarUrl: null, avatarDigest: null, actorProjectionRevision: 1,
+  };
+  const html = renderMessage(makeMessage({ senderType: "external_projection", senderId: marker, externalAuthor }),
+    { senderAvatarTestId: "anonymous-avatar" });
+  assert.match(html, /<span data-testid="anonymous-avatar" aria-label="Slack">/);
+  assert.doesNotMatch(html, /data-testid="message-sender-mention-/);
+  assert.doesNotMatch(html, /<img[^>]*src=["'][^"']*(?:slack-anonymous|slack\.com)/);
+});
+
+
+test("unresolved Slack author is localized only when explicitly marked", () => {
+  resetStores();
+  const externalAuthor = { projectionId: "external-1", provider: "slack", appRegistrationId: "app-1", installId: "install-1",
+    workspaceId: "workspace-1", externalActorId: "U123", externalConversationId: "C123", externalMessageId: "123.456",
+    displayName: "Slack user U123", actorKind: "unknown" as const, avatarUrl: null, avatarDigest: null,
+    actorProjectionRevision: 1, profileFallback: "unresolved" as const };
+  const msg = makeMessage({ senderType: "external_projection", senderId: "external-1", externalAuthor });
+  assert.match(renderMessage(msg, {}, "en"), /Slack user U123/);
+  assert.match(renderMessage(msg, {}, "zh-cn"), /Slack 用户 U123/);
+  const ordinary = makeMessage({ senderType: "external_projection", senderId: "external-1",
+    externalAuthor: { ...externalAuthor, profileFallback: undefined, displayName: "Original display" } });
+  assert.match(renderMessage(ordinary, {}, "zh-cn"), /Original display/);
 });

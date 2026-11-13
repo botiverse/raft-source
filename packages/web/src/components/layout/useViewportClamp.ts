@@ -169,6 +169,12 @@ export function calculateViewportClampStyle({
   return next;
 }
 
+function sameStyle(a: CSSProperties, b: CSSProperties): boolean {
+  const aKeys = Object.keys(a) as Array<keyof CSSProperties>;
+  if (aKeys.length !== Object.keys(b).length) return false;
+  return aKeys.every((key) => a[key] === b[key]);
+}
+
 export function useViewportClamp({
   triggerRef,
   popoverRef,
@@ -199,13 +205,15 @@ export function useViewportClamp({
     const vw = vv?.width ?? window.innerWidth;
     const vh = vv?.height ?? window.innerHeight;
 
-    setStyle(calculateViewportClampStyle({
+    const next = calculateViewportClampStyle({
       triggerRect: tr,
       popoverRect: popRect,
       viewport: { width: vw, height: vh },
       placement,
       gutter,
-    }));
+    });
+    // Keep the previous object when nothing moved, so React skips the render.
+    setStyle((previous) => (sameStyle(previous, next) ? previous : next));
   });
 
   // Re-measure synchronously after the popover renders so users don't see a
@@ -225,10 +233,19 @@ export function useViewportClamp({
     };
   }, [open]);
 
-  // Re-measure on viewport changes.
+  // Re-measure on viewport changes, once per frame: on iOS the visual
+  // viewport fires scroll/resize continuously while the page scrolls (the
+  // toolbars collapse), and each measurement reads layout.
   useEffect(() => {
     if (!open) return;
-    const onResize = () => measure();
+    let frame: number | null = null;
+    const onResize = () => {
+      if (frame !== null) return;
+      frame = requestAnimationFrame(() => {
+        frame = null;
+        measure();
+      });
+    };
     window.addEventListener("resize", onResize);
     if (window.visualViewport) {
       window.visualViewport.addEventListener("resize", onResize);
@@ -237,6 +254,7 @@ export function useViewportClamp({
       window.visualViewport.addEventListener("scroll", onResize, { passive: true });
     }
     return () => {
+      if (frame !== null) cancelAnimationFrame(frame);
       window.removeEventListener("resize", onResize);
       if (window.visualViewport) {
         window.visualViewport.removeEventListener("resize", onResize);

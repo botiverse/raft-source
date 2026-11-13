@@ -1,24 +1,29 @@
+import { emptyRaftbenchKindCounts, type RaftbenchFindingFilter } from "@botiverse/raft-shared";
 import { getRaftbenchCanaryServerId } from "../services/agentRuntimeProviderService";
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { and, eq, gt, inArray, isNull, sql } from "drizzle-orm";
 import { asServerId, currentDate, EXTERNAL_AGENT_RUNTIME_ID, EXTERNAL_AGENT_RUNTIME_MODEL, type RaftbenchReport } from "@botiverse/raft-shared";
 import { getDb, type DatabaseExecutor, type DatabaseTransaction } from "../db/index";
-import { agentCredentials, agentRuntimeProvisions, agents, channels, channelAgents, messages, raftbenchFindings, raftbenchConfigs, raftbenchLatestRuns, raftbenchServiceAgents, serverMembers, servers, thirdPartyAgentEvents } from "../db/schema";
+import { agentCredentials, agentRuntimeProvisions, agents, channels, channelAgents, messages, raftbenchFindings, raftbenchConfigs, raftbenchLatestRuns, raftbenchMessageLabels, raftbenchServiceAgents, serverMembers, servers, thirdPartyAgentEvents } from "../db/schema";
 import * as channelService from "../services/channelService";
 import { createAgent, invalidateRaftBenchServiceAgentBindings } from "../services/agentService";
 import { updateAgentScopes } from "../services/agentScopesService";
 import { assertProviderProvisioningAvailable, kickAgentRuntimeProvisionWorker, recordAgentProvisioning } from "../services/agentRuntimeProvisionService";
 import { evaluateFeatureFlag } from "../services/featureFlagService";
-import { getAgentInboundOAuthResource } from "../services/oauthService";
+import { createSystemAppAgentEvent } from "../services/systemAppAgentEvents";
 import { getActorServerRoleInServer } from "../lib/actorPermissions";
 import { pilotServerIds, READ_GRANTS } from "./contract";
 import { hasExactRaftbenchServiceScopes } from "./credentialScopes";
 import { listFindings } from "./findings";
 import { sourceCoverage } from "./sourceCoverage";
+import { recordTraceEvent } from "../tracing/semanticTrace";
+import { triageSummary } from "./triageRunner";
 import { assertLiveSources, sourceVersionsLive, runCoverage, RaftbenchError, requirePilot } from "./service";
 
 const INTERVAL_MS = 15 * 60_000;
 const TIMEOUT_MS = 30 * 60_000;
+// Coverage only annotates the page; a slow count must not hold it past this.
+const COVERAGE_WAIT_MS = 3_000;
 function refuse(status: number, code: string, message: string): never {
   throw new RaftbenchError(status, code, message, "An administrator can review the RaftBench settings on this staging server.");
 }
@@ -39,7 +44,9 @@ async function validateChannels(serverId: string, userId: string, channelIds: st
 async function clearRun(tx: DatabaseTransaction, serverId: string, clearFindings = true) {
   if (clearFindings) {
     await tx.delete(raftbenchFindings).where(eq(raftbenchFindings.serverId, serverId));
-    await tx.update(raftbenchConfigs).set({ readMessages: 0, readThroughSeq: 0, completedBatches: 0, scannedThroughAt: null }).where(eq(raftbenchConfigs.serverId, serverId));
+    // The triage batch ledger stays: it bounds today's spend across scope changes.
+    await tx.delete(raftbenchMessageLabels).where(eq(raftbenchMessageLabels.serverId, serverId));
+    await tx.update(raftbenchConfigs).set({ readMessages: 0, readThroughSeq: 0, threadReadMessages: 0, threadReadThroughSeq: 0, threadScannedThroughAt: null, sourceScanVersion: 1, completedBatches: 0, scannedThroughAt: null }).where(eq(raftbenchConfigs.serverId, serverId));
   }
   await tx.delete(raftbenchLatestRuns).where(eq(raftbenchLatestRuns.serverId, serverId));
   // Assignment events contain identifiers only; remove stale ones on scope/consent change.
@@ -106,12 +113,18 @@ async function createServiceAgent(serverId: string, userId: string, target: "def
       description: "Automated RaftBench analysis agent for this server. It analyzes the selected channels but does not reply to messages or mentions; results appear in the RaftBench dashboard.",
       runtime: EXTERNAL_AGENT_RUNTIME_ID, model: EXTERNAL_AGENT_RUNTIME_MODEL, creatorType: "user", creatorId: userId,
       actorCapabilityFence: { userId, capability: "createAgents" },
+      configChangeSource: "raftbench_create",
       afterInsert: async (tx, agent) => {
         await fenceAdmin(tx, serverId, userId);
         await tx.insert(raftbenchServiceAgents).values({ agentId: agent.id, serverId });
         await updateAgentScopes({ agentId: agent.id, scopes: assignment ? [...READ_GRANTS] : [], updatedByUserId: userId }, { executor: tx });
         if (assignment) {
-          await tx.select({ id: channels.id }).from(channels).where(inArray(channels.id, assignment.ids)).for("share");
+          // KEY SHARE: pins the rows against delete only. This transaction already
+          // holds servers (and the owner member row) FOR UPDATE; FOR SHARE here waited
+          // on a Joint send holding the row FOR NO KEY UPDATE while that send waited
+          // for servers FOR SHARE: a deadlock (#proj-o11y:058cb07b). validateChannels
+          // still refuses archived or deleted rows.
+          await tx.select({ id: channels.id }).from(channels).where(inArray(channels.id, assignment.ids)).for("key share");
           await validateChannels(serverId, userId, assignment.ids, tx);
           if (assignment.existingRevision !== undefined) {
             const [config] = await tx.select().from(raftbenchConfigs).where(eq(raftbenchConfigs.serverId, serverId)).for("update");
@@ -171,7 +184,7 @@ export async function assignServiceAgent(serverId: string, userId: string, agent
       if (ids.length < 1 || ids.length > 50) refuse(422, "raftbench_sources_required", "Select 1 to 50 channels before assigning this service agent.");
       const historyFrom = initial?.historyFrom ? new Date(initial.historyFrom) : null;
       if (historyFrom && (!Number.isFinite(historyFrom.getTime()) || historyFrom >= currentDate())) refuse(400, "raftbench_history_invalid", "Choose a start date before now.");
-      await tx.select({ id: channels.id }).from(channels).where(inArray(channels.id, ids)).for("share");
+      await tx.select({ id: channels.id }).from(channels).where(inArray(channels.id, ids)).for("key share");
       await validateChannels(serverId, userId, ids, tx);
       await updateAgentScopes({ agentId, scopes: [...READ_GRANTS], updatedByUserId: userId }, { executor: tx });
       await tx.insert(channelAgents).values(ids.map(channelId => ({ channelId, agentId, role: "member" as const }))).onConflictDoNothing();
@@ -182,11 +195,12 @@ export async function assignServiceAgent(serverId: string, userId: string, agent
       if (!config.enabled) await tx.update(raftbenchConfigs).set({ enabled: true, revision: config.revision + 1, configuredByUserId: userId, updatedAt: currentDate() }).where(eq(raftbenchConfigs.serverId, serverId));
       return;
     }
-    await tx.select({ id: channels.id }).from(channels).where(inArray(channels.id, config.channelIds)).for("share");
+    await tx.select({ id: channels.id }).from(channels).where(inArray(channels.id, config.channelIds)).for("key share");
     await validateChannels(serverId, userId, config.channelIds, tx);
     await clearRun(tx, serverId, false);
     const revision = config.revision + 1;
     await tx.update(raftbenchFindings).set({ revision }).where(and(eq(raftbenchFindings.serverId, serverId), eq(raftbenchFindings.revision, config.revision)));
+    await tx.update(raftbenchMessageLabels).set({ revision }).where(and(eq(raftbenchMessageLabels.serverId, serverId), eq(raftbenchMessageLabels.revision, config.revision)));
     if (config.agentId) {
       await tx.delete(channelAgents).where(eq(channelAgents.agentId, config.agentId));
       await updateAgentScopes({ agentId: config.agentId, scopes: [], updatedByUserId: userId }, { executor: tx });
@@ -223,6 +237,7 @@ export async function advanceServer(serverId: string, now = currentDate(), force
     // The worker also withdraws findings when no dashboard is open.
     await listFindings(serverId, config.revision, sources, 1, tx);
     let refreshedFrom: Date | undefined;
+    const previousKind = run?.sourceKind ?? "channel";
     if (run && !await sourceVersionsLive(tx, run, sources)) {
       refreshedFrom = run.from;
       await clearRun(tx, serverId, false);
@@ -238,42 +253,70 @@ export async function advanceServer(serverId: string, now = currentDate(), force
     const credentials = await tx.select({ scopes: agentCredentials.scopes }).from(agentCredentials)
       .where(and(eq(agentCredentials.agentId, config.agentId), isNull(agentCredentials.revokedAt)));
     if (!dedicated || !credentials.some(credential => hasExactRaftbenchServiceScopes(credential.scopes))) return;
-    if (run && !force && (run.exhausted || run.status === "failed") && now.getTime() - run.updatedAt.getTime() < INTERVAL_MS) return;
+    if (run && !force && (run.exhausted || run.status === "failed") && !(run.status !== "failed" && config.sourceScanVersion < 2) && now.getTime() - run.updatedAt.getTime() < INTERVAL_MS) return;
     // Advance only accepted analysis. Failure retries replay the same chunk,
     // with a server-enforced three-attempt cap and an explicit unknown gap.
     const failed = run?.status === "failed";
-    const skip = !!run && failed && run.failureCount >= 2;
     const hasProgress = !!run && run.nextSeq > run.startAfterSeq;
-    const continuation = !!run && (failed || !run.exhausted) && !(skip && !hasProgress);
-    const failureCount = failed && !skip ? run!.failureCount + 1 : 0;
+    // Keep unread windows independently of the single active assignment. A
+    // persistently broken stream must neither lose history nor starve its peer.
+    const unreadRetries = { ...run?.unreadRetries };
+    if (run && failed && !hasProgress) {
+      unreadRetries[previousKind] = { from: run.from.toISOString(), to: run.to.toISOString(), startAfterSeq: run.startAfterSeq,
+        failures: (unreadRetries[previousKind]?.failures ?? run.failureCount) + 1, reason: run.failureReason };
+    } else if (hasProgress) delete unreadRetries[previousKind];
+    const yieldUnread = failed && !hasProgress && (unreadRetries[previousKind]?.failures ?? 0) >= 2;
+    const skip = !!run && failed && run.failureCount >= 2 && hasProgress;
+    const continuation = !!run && (failed || !run.exhausted) && !yieldUnread;
+    const failureCount = failed && !skip && hasProgress ? run!.failureCount + 1 : 0;
     const skippedRanges = [...(run?.skippedRanges ?? []), ...(skip ? [{ from: run!.from.toISOString(), to: run!.to.toISOString(), messages: run!.fetched.length || null }] : [])].slice(-10);
-    const startAfterSeq = continuation ? (skip || (run!.report && !failed) ? run!.nextSeq : run!.startAfterSeq) : 0;
-    const from = refreshedFrom ?? (continuation ? run!.from : run ? new Date(Math.min(run.to.getTime() - (skip ? 0 : 5 * 60_000), now.getTime() - 1)) : config.historyFrom ?? new Date(now.getTime() - 7 * 24 * 60 * 60_000));
-    const to = continuation ? run!.to : now;
+    const sourceKind = refreshedFrom || continuation ? previousKind : run ? (previousKind === "channel" ? "thread" : "channel") : "channel";
+    const resume = !continuation && !refreshedFrom ? unreadRetries[sourceKind] : undefined;
+    const startAfterSeq = resume?.startAfterSeq ?? (continuation ? (skip || (run!.report && !failed) ? run!.nextSeq : run!.startAfterSeq) : 0);
+    const checkpoint = sourceKind === "thread" ? config.threadScannedThroughAt : config.scannedThroughAt;
+    const historyStart = config.historyFrom ?? new Date(config.updatedAt.getTime() - 7 * 24 * 60 * 60_000);
+    const from = refreshedFrom ?? (resume ? new Date(resume.from) : continuation ? run!.from : checkpoint ? new Date(checkpoint.getTime() - 5 * 60_000) : historyStart);
+    const to = resume ? new Date(resume.to) : continuation ? run!.to : now;
+    if (sourceKind === "thread" && config.sourceScanVersion < 2) await tx.update(raftbenchConfigs).set({ sourceScanVersion: 2 }).where(eq(raftbenchConfigs.serverId, serverId));
     const runId = randomUUID();
-    const values = { serverId, agentId: config.agentId, runId, revision: config.revision, status: "queued" as const, from, to, fetched: [], nextSeq: startAfterSeq, startAfterSeq, failureCount, skippedRanges, sourceCharacters: 0, stopReason: "more_pages" as const, exhausted: false, report: null, submissionHash: null, receiptId: null, failureReason: null, startedAt: now, updatedAt: now };
+    const values = { serverId, sourceKind, agentId: config.agentId, runId, revision: config.revision, status: "queued" as const, from, to, fetched: [], nextSeq: startAfterSeq, startAfterSeq, failureCount, unreadRetries, skippedRanges, sourceCharacters: 0, stopReason: "more_pages" as const, exhausted: false, report: null, submissionHash: null, receiptId: null, failureReason: null, startedAt: now, updatedAt: now };
     await tx.insert(raftbenchLatestRuns).values(values).onConflictDoUpdate({ target: raftbenchLatestRuns.serverId, set: values });
     await tx.delete(thirdPartyAgentEvents).where(and(eq(thirdPartyAgentEvents.serverId, serverId), eq(thirdPartyAgentEvents.systemApp, "system.raftbench")));
     const payload = { kind: "raftbench_run_assigned", runId, revision: config.revision, text: "This run is handled automatically by the system. You do not need to take any action or reply." };
-    const [event] = await tx.insert(thirdPartyAgentEvents).values({ serverId, agentId: config.agentId, systemApp: "system.raftbench", kind: "event", summary: payload.text, payload, payloadHash: createHash("sha256").update(JSON.stringify(payload)).digest("hex"), resource: getAgentInboundOAuthResource(serverId), expiresAt: new Date(now.getTime() + TIMEOUT_MS), createdAt: now, updatedAt: now }).returning();
-    return event;
+    return createSystemAppAgentEvent({ serverId, agentId: config.agentId, systemApp: "system.raftbench", kind: "event", summary: payload.text, payload, ttlMs: TIMEOUT_MS, now, executor: tx });
   });
 }
 
+async function settleCoverage<T>(pending: Promise<T>, sourceCount: number): Promise<T | null> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<"timeout">(resolve => { timer = setTimeout(() => resolve("timeout"), COVERAGE_WAIT_MS); });
+  try {
+    const result = await Promise.race([pending.catch(() => "error" as const), timeout]);
+    if (result !== "timeout" && result !== "error") return result;
+    recordTraceEvent("raftbench.coverage_unavailable", { outcome: result, source_count: sourceCount });
+    return null;
+  } finally { clearTimeout(timer); }
+}
+
 /** Server-owned counts and derived results only; raw source bodies are never returned here. */
-export async function dashboard(serverId: string, userId: string, page = 1) {
+export async function dashboard(serverId: string, userId: string, page = 1, filter: RaftbenchFindingFilter = {}) {
   await requireAdmin(serverId, userId);
   const [config] = await getDb().select().from(raftbenchConfigs).where(eq(raftbenchConfigs.serverId, serverId));
   const [run] = await getDb().select().from(raftbenchLatestRuns).where(eq(raftbenchLatestRuns.serverId, serverId));
   const [provision] = config?.agentId ? await getDb().select().from(agentRuntimeProvisions).where(eq(agentRuntimeProvisions.agentId, config.agentId)) : [];
   const sources = config?.enabled && config.agentId ? await assertLiveSources(config, config.agentId) : [];
   const stale = !!run && !await sourceVersionsLive(getDb(), run, sources);
-  const coverage = config?.enabled ? await sourceCoverage(config.serverId, config.revision, sources.map(source => source.storageId), config.historyFrom ?? new Date(config.updatedAt.getTime() - 7 * 24 * 60 * 60_000), run?.to ?? currentDate()) : null;
+  const pendingCoverage = config?.enabled ? sourceCoverage(config.serverId, config.revision, sources.map(source => source.storageId), config.historyFrom ?? new Date(config.updatedAt.getTime() - 7 * 24 * 60 * 60_000), run?.to ?? currentDate()) : null;
   const [inFlight] = config && run && run.fetched.length ? await getDb().select({ count: sql<number>`count(*)`.mapWith(Number) }).from(messages)
-    .where(and(inArray(messages.id, run.fetched.map(ref => ref.messageId)), gt(messages.seq, config.readThroughSeq))) : [];
-  const accumulated = config?.enabled ? await listFindings(config.serverId, config.revision, sources, page) : { patterns: [], total: 0, page: 1, pageCount: 1 };
-  const legacyPatterns = (stale ? [] : run?.report?.patterns ?? []);
-  const hasAccumulated = accumulated.total > 0;
+    .where(and(inArray(messages.id, run.fetched.map(ref => ref.messageId)), gt(messages.seq, run.sourceKind === "thread" ? config.threadReadThroughSeq : config.readThroughSeq))) : [];
+  const accumulated = config?.enabled ? await listFindings(config.serverId, config.revision, sources, page, getDb(), filter, true) : { patterns: [], records: [], examples: [], total: 0, allTotal: 0, kindCounts: emptyRaftbenchKindCounts(), page: 1, pageCount: 1 };
+  // Unknown, not a failed page: the client shows the read count without a total.
+  const coverage = pendingCoverage && await settleCoverage(pendingCoverage, sources.length);
+  const legacyChannelPatterns = (stale || !config?.enabled || filter.period ? [] : run?.report?.patterns ?? []).filter(pattern => !filter.channelId || [...pattern.evidence, ...pattern.counterevidence].some(ref => sources.some(source => source.localId === filter.channelId && (ref.target === source.target || ref.target.startsWith(`${source.target}:`)))));
+  const hasAccumulated = accumulated.allTotal > 0;
+  const kindCounts = hasAccumulated ? accumulated.kindCounts : emptyRaftbenchKindCounts();
+  if (!hasAccumulated) for (const pattern of legacyChannelPatterns) kindCounts[pattern.kind]++;
+  const legacyPatterns = legacyChannelPatterns.filter(pattern => !filter.kind || pattern.kind === filter.kind);
   const legacyPage = Math.min(page, Math.max(1, Math.ceil(legacyPatterns.length / 5)));
   const patterns = hasAccumulated ? accumulated.patterns : legacyPatterns.slice((legacyPage - 1) * 5, legacyPage * 5).map(pattern => ({ ...pattern,
     evidence: pattern.evidence.map(ref => ({ ...ref, messageId: run?.fetched.find(source => source.target === ref.target && source.messageId.startsWith(ref.messageId))?.messageId ?? ref.messageId })),
@@ -282,16 +325,47 @@ export async function dashboard(serverId: string, userId: string, page = 1) {
   const total = hasAccumulated ? accumulated.total : legacyPatterns.length;
   const pageCount = Math.max(1, Math.ceil(total / 5));
   const currentPage = Math.min(page, pageCount);
+  const unreadRetries = { ...run?.unreadRetries };
+  if (run?.status === "failed" && run.nextSeq === run.startAfterSeq) {
+    unreadRetries[run.sourceKind] = { from: run.from.toISOString(), to: run.to.toISOString(), startAfterSeq: run.startAfterSeq,
+      failures: (unreadRetries[run.sourceKind]?.failures ?? run.failureCount) + 1, reason: run.failureReason };
+  }
+
   return {
+    findingIndex: { kindCounts, filter },
+    findingExamples: accumulated.examples.map(group => ({ kind: group.kind, findings: group.findings.map(row => ({ id: row.id, evidenceAt: new Date(row.evidenceAt).toISOString(), version: row.version, value: row.feedback[userId] ?? null, pattern: row.pattern })) })),
+    findingFeedback: hasAccumulated ? accumulated.records.map(row => ({ id: row.id, evidenceAt: new Date(row.evidenceAt).toISOString(), version: row.version, value: row.feedback[userId] ?? null })) : [],
     historyFrom: config?.historyFrom?.toISOString() ?? null, coverage,
-    progress: { readMessages: (config?.readMessages ?? 0) + (inFlight?.count ?? 0), completedBatches: config?.completedBatches ?? 0, scannedThroughAt: config?.scannedThroughAt?.toISOString() ?? null },
+    progress: { streams: { channel: { readMessages: config?.readMessages ?? 0, scannedThroughAt: config?.scannedThroughAt?.toISOString() ?? null }, thread: { readMessages: config?.threadReadMessages ?? 0, scannedThroughAt: config?.threadScannedThroughAt?.toISOString() ?? null } }, readMessages: (config?.readMessages ?? 0) + (config?.threadReadMessages ?? 0) + (inFlight?.count ?? 0), completedBatches: config?.completedBatches ?? 0, scannedThroughAt: config?.scannedThroughAt && config.threadScannedThroughAt ? new Date(Math.min(config.scannedThroughAt.getTime(), config.threadScannedThroughAt.getTime())).toISOString() : null },
     enabled: config?.enabled ?? false, revision: config?.revision ?? 0, channelIds: config?.channelIds ?? [], agentId: config?.agentId ?? null,
     provisioning: provision ? { state: provision.state, error: provision.lastErrorCode, profile: provision.provisionedProfile, providerTarget: provision.providerTarget } : null,
     intervalMinutes: INTERVAL_MS / 60_000,
-    run: run ? { runId: run.runId, status: stale ? "stale" : run.status, from: run.from.toISOString(), to: run.to.toISOString(), updatedAt: run.updatedAt.toISOString(), fetchedMessages: run.fetched.length, skippedRanges: run.skippedRanges, stopReason: run.stopReason, exhausted: runCoverage(run).exhausted, skippedChunks: runCoverage(run).skippedChunks, failureReason: stale ? null : run.failureReason,
+    run: run ? { runId: run.runId, sourceKind: run.sourceKind, failureCount: run.failureCount, unreadRetries: stale ? {} : unreadRetries, status: stale ? "stale" : run.status, from: run.from.toISOString(), to: run.to.toISOString(), updatedAt: run.updatedAt.toISOString(), fetchedMessages: run.fetched.length, skippedRanges: run.skippedRanges, stopReason: run.stopReason, exhausted: runCoverage(run).exhausted, skippedChunks: runCoverage(run).skippedChunks, failureReason: stale ? null : run.failureReason,
       report: hasAccumulated || (!stale && run.report) ? { status: run.report?.status ?? "incomplete", reason: stale ? undefined : run.report?.reason, gaps: run.report?.gaps ?? ["partial_scan"], patterns } satisfies Partial<RaftbenchReport> : null } : null,
     pagination: { page: currentPage, pageCount, total, pageSize: 5 },
+    triage: config?.enabled ? await triageSummary(config.serverId, config.revision, config.configuredByUserId) : null,
   };
+}
+/** Feedback is an administrator opinion on this exact current finding, not an eval label. */
+export async function saveFindingFeedback(serverId: string, userId: string, findingId: string,
+  input: { revision: number; version: string; value: "agree" | "inaccurate" | null }) {
+  await requireAdmin(serverId, userId);
+  return getDb().transaction(async tx => {
+    const [config] = await tx.select().from(raftbenchConfigs).where(eq(raftbenchConfigs.serverId, serverId)).for("update");
+    await fenceAdmin(tx, serverId, userId);
+    if (!config?.enabled || !config.agentId || config.revision !== input.revision) refuse(409, "raftbench_feedback_stale", "Refresh the current findings before leaving feedback.");
+    const sources = await assertLiveSources(config, config.agentId);
+    await validateChannels(serverId, userId, sources.map(source => source.localId), tx);
+    await listFindings(serverId, config.revision, sources, 1, tx);
+    const [saved] = await tx.update(raftbenchFindings).set({ feedback: input.value === null
+      ? sql`${raftbenchFindings.feedback} - ${userId}`
+      : sql`${raftbenchFindings.feedback} || ${JSON.stringify({ [userId]: input.value })}::jsonb` })
+      .where(and(eq(raftbenchFindings.id, findingId), eq(raftbenchFindings.serverId, serverId),
+        eq(raftbenchFindings.revision, input.revision), sql`md5(${raftbenchFindings.pattern}::text || ${raftbenchFindings.sourceRefs}::text) = ${input.version}`))
+      .returning({ id: raftbenchFindings.id });
+    // Return rather than throw so withdrawing a stale source is committed.
+    return { saved: !!saved };
+  });
 }
 export async function enrolledServers() {
   return getDb().select({ serverId: raftbenchConfigs.serverId }).from(raftbenchConfigs).where(and(eq(raftbenchConfigs.enabled, true), inArray(raftbenchConfigs.serverId, pilotServerIds())));

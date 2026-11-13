@@ -7,7 +7,10 @@ import {
   type AgentMigrationHostedImportSummary,
   type AgentMigrationHostedSkipReason,
   type AgentMigrationTransferSummary,
+  MAX_AGENT_MIGRATION_EXCLUDED_REGENERABLE_COUNT,
   EXTERNAL_AGENT_RUNTIME_ID,
+  AGENT_MIGRATION_SOURCE_USER_IGNORE_CAPABILITY,
+  AGENT_MIGRATION_AGENT_RETRY_CAPABILITY,
 } from "@botiverse/raft-shared";
 import { getDb, type DatabaseExecutor } from "../db/index";
 import {
@@ -21,6 +24,7 @@ import {
   messages,
 } from "../db/schema";
 import type { AgentOrchestrator } from "./agentOrchestrator";
+import { notifyStarterOfAgentMigrationRetry } from "./agentMigrationRetryNotice";
 import {
   broadcastSystemMessage,
   recordInboxFactsForPersistedMessages,
@@ -133,6 +137,57 @@ export function formatAgentMigrationCompletedReceipt(input: {
   return [formatCompletedReceiptBody(input), cleanupLine].filter((line): line is string => line !== null).join("\n");
 }
 
+const IGNORE_FILE_NAMES = [
+  ["userFile", ".raftbackupignore.user"],
+  ["agentFile", ".raftbackupignore"],
+  ["legacyFile", ".raftmigrateignore"],
+] as const;
+
+/**
+ * Which ignore files the excluded paths came from. A summary without
+ * `excludedIgnoredBySource` is from a Computer that reads only
+ * `.raftmigrateignore`.
+ */
+function describeIgnoredSources(bySource: AgentMigrationTransferSummary["excludedIgnoredBySource"]): {
+  files: string;
+  chineseFiles: string;
+  breakdown: string;
+  chineseBreakdown: string;
+} {
+  if (!bySource) return { files: ".raftmigrateignore", chineseFiles: ".raftmigrateignore", breakdown: "", chineseBreakdown: "" };
+  const used = IGNORE_FILE_NAMES.filter(([key]) => bySource[key].count > 0);
+  const names = used.map(([, name]) => name);
+  // Sources sum to excludedIgnored, so at least one is used; the fallback only
+  // keeps the sentence whole if a summary ever says otherwise.
+  const files = names.length > 0 ? joinWithAnd(names, ", ", " and ") : "the ignore files";
+  const chineseFiles = names.length > 0 ? joinWithAnd(names, "、", " 和 ") : "忽略文件";
+  const perFile = used.length > 1 ? used.map(([key, name]) => `${name} ${bySource[key].count}`) : [];
+  const wildcard = bySource.wildcard.count;
+  // Wildcard matches are a subset of the per-file paths, not another bucket.
+  const breakdown = [
+    perFile.length > 0 ? perFile.join(", ") : null,
+    wildcard > 0 ? `${perFile.length > 0 ? "of which " : ""}${wildcard} through **/ patterns` : null,
+  ].filter((part): part is string => part !== null);
+  const chineseBreakdown = [
+    perFile.length > 0 ? perFile.join("，") : null,
+    wildcard > 0 ? `其中 ${wildcard} 个来自 **/ 通配` : null,
+  ].filter((part): part is string => part !== null);
+  return {
+    files,
+    chineseFiles,
+    breakdown: breakdown.length > 0 ? ` (${breakdown.join("; ")})` : "",
+    chineseBreakdown: chineseBreakdown.length > 0 ? `（${chineseBreakdown.join("；")}）` : "",
+  };
+}
+
+function joinWithAnd(items: readonly string[], separator: string, lastSeparator: string): string {
+  return items.length > 1 ? `${items.slice(0, -1).join(separator)}${lastSeparator}${items[items.length - 1]}` : items.join("");
+}
+
+function countNoun(count: number, noun: string): string {
+  return `${count} ${noun}${count === 1 ? "" : "s"}`;
+}
+
 function formatCompletedReceiptBody(input: {
   sourceMachineName: string;
   targetMachineName: string;
@@ -163,10 +218,14 @@ function formatCompletedReceiptBody(input: {
 
   const ignored = summary.excludedIgnored;
   const ignoredLargest = ignored?.largest.map((entry) => `${entry.path} (${formatReceiptBytes(entry.bytes)})`).join(", ");
-  const ignoredLines = ignored
+  const ignoredSources = ignored ? describeIgnoredSources(summary.excludedIgnoredBySource) : null;
+  // The source stops counting at the schema bound, so a count at the bound
+  // (and the bytes counted with it) is a lower bound.
+  const ignoredAtBound = ignored ? ignored.fileCount >= MAX_AGENT_MIGRATION_EXCLUDED_REGENERABLE_COUNT : false;
+  const ignoredLines = ignored && ignoredSources
     ? [
-      `Not moved, as listed in .raftmigrateignore: ${ignored.count} paths, ${ignored.fileCount} files (${formatReceiptBytes(ignored.bytes)})${ignoredLargest ? `; largest: ${ignoredLargest}` : ""}. The old workspace is archived on ${input.sourceMachineName} and kept for up to 30 days, so anything missing can be recovered from there.`,
-      `按 .raftmigrateignore 未迁移：${ignored.count} 个路径，${ignored.fileCount} 个文件（${formatReceiptBytes(ignored.bytes)}）。旧工作区归档在 ${input.sourceMachineName} 上，最多保留 30 天，缺了可以从那里找回。`,
+      `Not moved, as listed in ${ignoredSources.files}: ${countNoun(ignored.count, "path")}${ignoredSources.breakdown}, ${ignoredAtBound ? "at least " : ""}${countNoun(ignored.fileCount, "file")} (${formatReceiptBytes(ignored.bytes)}${ignoredAtBound ? " or more" : ""})${ignoredLargest ? `; largest: ${ignoredLargest}` : ""}. The old workspace is archived on ${input.sourceMachineName} and kept for up to 7 days, so anything missing can be recovered from there.`,
+      `按 ${ignoredSources.chineseFiles} 未迁移：${ignored.count} 个路径${ignoredSources.chineseBreakdown}，${ignoredAtBound ? "至少 " : ""}${ignored.fileCount} 个文件（${formatReceiptBytes(ignored.bytes)}${ignoredAtBound ? " 以上" : ""}）。旧工作区归档在 ${input.sourceMachineName} 上，最多保留 7 天，缺了可以从那里找回。`,
     ]
     : [];
 
@@ -180,12 +239,13 @@ function formatCompletedReceiptBody(input: {
   ].join("\n");
 }
 
-function wireValue(rawMessage: string, key: string): string | null {
+/** One `key=value` field of a daemon wire message (`CODE:key=value:key=value`). */
+export function wireValue(rawMessage: string, key: string): string | null {
   return rawMessage.match(new RegExp(`(?:^|:)${key}=([^:]*)`))?.[1] ?? null;
 }
 
 /** "path,n;path,n" with URI-encoded paths, as the source daemon reports them. */
-function parseWirePathList(encoded: string | null): Array<{ path: string; value: number }> {
+export function parseWirePathList(encoded: string | null): Array<{ path: string; value: number }> {
   if (!encoded) return [];
   const entries: Array<{ path: string; value: number }> = [];
   for (const item of encoded.split(";").slice(0, 3)) {
@@ -204,12 +264,31 @@ function parseWirePathList(encoded: string | null): Array<{ path: string; value:
   return entries;
 }
 
+/** The failed receipt's line when the failed migration was the agent's one retry. */
+export const AGENT_MIGRATION_RETRY_ALSO_FAILED_LINE = "The automatic retry also failed; a person needs to start the next migration.";
+
 /**
  * A workspace too big to move is the one failure the agent itself can act on.
  * State only what the source already measured while packing (no extra scan),
  * then the next step; which paths to remove is the agent's call.
+ *
+ * `sourceCapabilities` are the source Computer's migration capabilities when
+ * known. A source advertising AGENT_MIGRATION_SOURCE_USER_IGNORE_CAPABILITY
+ * (1.0.63+) reads `.raftbackupignore` (1.0.62+), whose lines can also skip a
+ * folder name at any depth, so that file is named; otherwise (older, or
+ * unknown) the `.raftmigrateignore` every version reads.
+ *
+ * A source advertising AGENT_MIGRATION_AGENT_RETRY_CAPABILITY lets the
+ * agent retry the migration itself, once (`raft migration retry`), so the
+ * step ends with that, unless this failed migration already was that retry
+ * (`retry.isRetry`): then a person starts the next one. Missing capabilities
+ * keep the wording every version supports.
  */
-export function formatAgentMigrationWorkspaceSizeLines(rawMessage: string | null | undefined): string[] {
+export function formatAgentMigrationWorkspaceSizeLines(
+  rawMessage: string | null | undefined,
+  sourceCapabilities?: readonly string[] | null,
+  retry?: { isRetry: boolean; targetMachineName: string } | null,
+): string[] {
   if (!rawMessage) return [];
   let measured: string;
   let largest: string;
@@ -236,9 +315,17 @@ export function formatAgentMigrationWorkspaceSizeLines(rawMessage: string | null
   } else {
     return [];
   }
+  const trim = sourceCapabilities?.includes(AGENT_MIGRATION_SOURCE_USER_IGNORE_CAPABILITY)
+    ? "To move it, delete what you no longer need or list it in .raftbackupignore (listed paths are not moved; a `**/<name>` line skips every folder with that name)"
+    : "To move it, delete what you no longer need or list it in .raftmigrateignore (listed paths are not moved)";
+  const nextStep = retry?.isRetry
+    ? `${trim}. ${AGENT_MIGRATION_RETRY_ALSO_FAILED_LINE}`
+    : retry && sourceCapabilities?.includes(AGENT_MIGRATION_AGENT_RETRY_CAPABILITY)
+      ? `${trim}, then run \`raft migration retry\` (once; it moves you to ${retry.targetMachineName} again).`
+      : `${trim}, then ask for the migration to be retried.`;
   return [
     largest ? `${measured} ${largestLabel}: ${largest}.` : measured,
-    "To move it, delete what you no longer need or list it in .raftmigrateignore (listed paths are not moved), then ask for the migration to be retried.",
+    nextStep,
   ];
 }
 
@@ -250,6 +337,10 @@ export function formatAgentMigrationTerminalReceipt(input: {
   reason?: string | null;
   /** Raw daemon error message; only workspace-size failures add lines from it. */
   detail?: string | null;
+  /** The source Computer's migration capabilities, when known (whether a size failure offers the agent's own retry). */
+  sourceCapabilities?: readonly string[] | null;
+  /** The failed migration was the agent's own retry (retry_of_migration_id set): there is no retry left. */
+  isRetry?: boolean;
   needsAttention?: boolean;
   /** Whether the agent had already been moved to the target when the migration ended. */
   flipped?: boolean;
@@ -278,11 +369,15 @@ export function formatAgentMigrationTerminalReceipt(input: {
       "This migration is no longer the active gate; messages held during it are delivered normally again.",
     ].join("\n");
   }
+  const sizeLines = formatAgentMigrationWorkspaceSizeLines(input.detail, input.sourceCapabilities, {
+    isRetry: input.isRetry === true,
+    targetMachineName: input.targetMachineName,
+  });
   return [
     `Migration failed. The migration ${direction} did not complete.`,
     placement,
     `Migration support ref: ${input.supportRef}.${reason}`,
-    ...formatAgentMigrationWorkspaceSizeLines(input.detail),
+    ...(sizeLines.length > 0 ? sizeLines : input.isRetry ? [AGENT_MIGRATION_RETRY_ALSO_FAILED_LINE] : []),
     "This migration has ended; a new migration can be started separately.",
   ].join("\n");
 }
@@ -416,7 +511,7 @@ export function formatHostedMigrationCompletedReceipt(input: {
         const examples = group.largestPaths.length > 0 ? ` (e.g. ${group.largestPaths.slice(0, 3).join(", ")})` : "";
         return `${group.count} ${HOSTED_SKIP_REASON_LABELS[group.reason]}, ${formatReceiptBytes(group.bytes)}${examples}`;
       }).join("; ")}.`,
-      `The old workspace is archived on ${input.sourceMachineName} and kept for up to 30 days, so anything missing can be recovered from there.`,
+      `The old workspace is archived on ${input.sourceMachineName} and kept for up to 7 days, so anything missing can be recovered from there.`,
     ]
     : [];
   const cleanupLine = input.sourceCleanupPending
@@ -519,8 +614,12 @@ export async function enqueueAgentMigrationFailedReceipt(
   migration: typeof agentMigrations.$inferSelect,
   now: Date,
   hooks: AgentMigrationReceiptEnqueueHooks = {},
+  /** The source Computer's migration capabilities, when the caller has them; missing keeps the wording every version supports. */
+  sourceCapabilities?: readonly string[] | null,
 ): Promise<typeof messages.$inferSelect> {
   if (migration.state !== "failed") throw new Error("MIGRATION_RECEIPT_NOT_FAILED");
+  // The agent's own retry failed too: its starter hears it (the receipt is the agent's).
+  if (migration.retryOfMigrationId) await notifyStarterOfAgentMigrationRetry(migration, "failed", executor);
   return enqueueAgentMigrationReceipt(
     executor,
     migration,
@@ -532,6 +631,8 @@ export async function enqueueAgentMigrationFailedReceipt(
       supportRef: migration.supportRef,
       reason: migration.failureReason ?? migration.transportErrorCode,
       detail: migration.transportErrorMessage,
+      sourceCapabilities,
+      isRetry: migration.retryOfMigrationId !== null,
       // A hosted switch undone because the provider never created the agent
       // leaves it on its Computer, as before the switch.
       flipped: migration.flippedAt !== null && migration.failureReason !== HOSTED_MIGRATION_NOT_CREATED_REASON,

@@ -139,7 +139,7 @@ test("held for the DM peer's card alone", () => {
     },
     {
       heldAction: "Your message has been saved as a draft (kept for 10 minutes).",
-      draftInstructions: "To send the current draft unchanged:\n  raft message send --send-draft --target \"dm:@richard\"\nYou can also choose not to send anything.\n",
+      draftInstructions: "To send the current draft unchanged:\n  raft message send --send-draft --target \"dm:@richard\"\nIf what you just read already says what you meant to say, or makes your message unnecessary, send nothing.\n",
     },
   )).toMatchSnapshot();
 });

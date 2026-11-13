@@ -1,6 +1,7 @@
 import { sql, type SQL } from "drizzle-orm";
 
-export type ActivityMuteTargetKind = "channel" | "dm" | "thread";
+// `thread` and `task` (task v2 conversation) are follow-scoped: never muted.
+export type ActivityMuteTargetKind = "channel" | "dm" | "thread" | "task";
 
 export function isActivityPromotionSuppressedByMute(opts: {
   kind: ActivityMuteTargetKind;
@@ -9,6 +10,7 @@ export function isActivityPromotionSuppressedByMute(opts: {
   personalMention: boolean;
 }): boolean {
   return opts.kind !== "thread"
+    && opts.kind !== "task"
     && !opts.personalMention
     && opts.muteFromSeq != null
     && opts.messageSeq >= opts.muteFromSeq;

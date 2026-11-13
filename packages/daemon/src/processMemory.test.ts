@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "vitest";
+import { BasicTracer } from "@botiverse/raft-shared";
+import { LocalRotatingTraceSink } from "@botiverse/raft-trace-client";
 
 import type { Clock } from "./connection";
 import {
@@ -93,10 +95,13 @@ test("samples after startup settles, writes every sample, traces at most every 3
     assert.equal(traced[1]!.heap_used_mb, 131);
     // Context is read when the event is emitted, not when the reporter starts.
     assert.equal(traced[1]!.agents_running, 5);
-    // Without a service sample every contract key but the service ones is set.
+    // Without a service sample every contract key but the service ones is set
+    // (the pi session ones come from the daemon's context, not this fake).
     assert.deepEqual(
       Object.keys(traced[1]!).sort(),
-      PROCESS_MEMORY_TRACE_ATTRS.filter((key) => !key.startsWith("service_") && key !== "swap_mb").sort(),
+      PROCESS_MEMORY_TRACE_ATTRS.filter(
+        (key) => !key.startsWith("service_") && !key.startsWith("pi_") && key !== "swap_mb",
+      ).sort(),
     );
 
     reporter.stop();
@@ -166,4 +171,25 @@ test("swap comes from VmSwap in /proc/self/status and is absent when unknown", (
   assert.equal(readSwapBytes("Name:\traft\n"), undefined);
   assert.equal(processMemoryTraceAttrs({ ...sampleAt(1), swapBytes: 181 * MB }).swap_mb, 181);
   assert.equal("swap_mb" in processMemoryTraceAttrs(sampleAt(1)), false);
+});
+
+test("every memory event attr survives the local trace sink's key rules", () => {
+  // The sink drops keys by name (ids, paths, files, content words), so a new
+  // attr named like `pi_session_file_kb` would vanish without an error.
+  const machineDir = mkdtempSync(path.join(os.tmpdir(), "process-memory-sink-"));
+  try {
+    const sink = new LocalRotatingTraceSink({ machineDir, maxFileBytes: 1024 * 1024, maxFiles: 4 });
+    const attrs = Object.fromEntries(PROCESS_MEMORY_TRACE_ATTRS.map((key) => [key, 1]));
+    new BasicTracer({ sink }).startSpan("daemon.process.memory", { surface: "daemon", kind: "internal", attrs }).end("ok");
+    const dir = path.join(machineDir, "traces");
+    const written = readdirSync(dir)
+      .flatMap((name) => readFileSync(path.join(dir, name), "utf8").split("\n").filter(Boolean))
+      .map((line) => JSON.parse(line) as { name?: string; attrs?: Record<string, unknown> })
+      .find((record) => record.name === "daemon.process.memory");
+    assert.ok(written, "the event reached disk");
+    const missing = PROCESS_MEMORY_TRACE_ATTRS.filter((key) => !(key in (written.attrs ?? {})));
+    assert.deepEqual(missing, []);
+  } finally {
+    rmSync(machineDir, { recursive: true, force: true });
+  }
 });

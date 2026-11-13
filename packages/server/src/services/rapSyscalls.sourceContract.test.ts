@@ -397,7 +397,9 @@ function realProgram(): { program: ts.Program; checker: ts.TypeChecker } {
   assert.ok(!raw.error, "HARNESS-BROKEN: cannot read packages/server/tsconfig.json");
   const parsed = ts.parseJsonConfigFileContent(raw.config, ts.sys, path.dirname(configPath));
   assert.equal(parsed.errors.length, 0, "HARNESS-BROKEN: tsconfig did not parse cleanly");
-  const program = ts.createProgram({ rootNames: parsed.fileNames, options: parsed.options });
+  // What the gate scans, and the declarations that type it: the server's tests
+  // took this worker past Node's default 4 GB heap (staging, 2026-11-06).
+  const program = ts.createProgram({ rootNames: parsed.fileNames.filter((file) => file.endsWith(".d.ts") || isProductionFile(file)), options: parsed.options });
   cached = { program, checker: program.getTypeChecker() };
   return cached;
 }

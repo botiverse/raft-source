@@ -1,6 +1,8 @@
+import { effectiveAllowedOAuthScopes } from "@botiverse/raft-shared";
 import { and, asc, eq } from "drizzle-orm";
 import { getDb, type DatabaseTransaction } from "../db/index";
 import { oauthClients, oauthClientInstalls } from "../db/schema";
+import { currentTextConfirmation } from "./appPromptTextService";
 
 // Called only inside an authorized source-server mutation, or the explicit
 // legacy backfill. Lock the client before reading its current grant so a
@@ -9,11 +11,15 @@ import { oauthClients, oauthClientInstalls } from "../db/schema";
 export async function ensureLocalAppSourceInstallation(
   clientId: typeof oauthClients.$inferSelect.id,
   tx: DatabaseTransaction,
+  options?: { expectedServerId?: string },
 ) {
   const [client] = await tx.select().from(oauthClients).where(and(
     eq(oauthClients.id, clientId),
     eq(oauthClients.appType, "server_local"),
     eq(oauthClients.enabled, true),
+    // Callers acting on behalf of a specific server must not materialize an
+    // install on a different server that happens to own this client id.
+    options?.expectedServerId ? eq(oauthClients.serverId, options.expectedServerId) : undefined,
   )).limit(1).for("update");
   if (!client) return null;
   const [created] = await tx.insert(oauthClientInstalls).values({
@@ -23,6 +29,8 @@ export async function ensureLocalAppSourceInstallation(
     approvedRequestRevisionId: client.outboundCurrentRevisionId,
     approvedGroups: client.outboundCurrentGroups,
     grantRevision: client.outboundCurrentRevisionId ? 1 : 0,
+    approvedScopes: effectiveAllowedOAuthScopes(client.allowedScopes),
+    ...await currentTextConfirmation(tx, client.id),
   }).onConflictDoNothing({ target: [oauthClientInstalls.serverId, oauthClientInstalls.clientId] })
     .returning({ id: oauthClientInstalls.id });
   return created ?? null;

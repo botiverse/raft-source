@@ -23,6 +23,20 @@ export class ChannelConversionError extends Error {
   }
 }
 
+/**
+ * The conversion lock was still held when a request's bounded wait ran out
+ * (lockChannelConversionResourceBoundedInTransaction): a phase is running.
+ * The same 409 `channel_conversion_in_progress` writers get under the fence;
+ * nothing was changed, so the request can simply be sent again.
+ */
+export class ChannelConversionBusyError extends ChannelConversionError {
+  constructor(options?: { cause?: unknown }) {
+    super("A conversion step is running on this channel right now. Try again in a moment.", "channel_conversion_in_progress");
+    this.name = "ChannelConversionBusyError";
+    if (options && "cause" in options) (this as { cause?: unknown }).cause = options.cause;
+  }
+}
+
 
 export type ConversionPhaseContext = {
   tx: DatabaseExecutor;
@@ -76,8 +90,6 @@ export async function advance(
       state: stateForLegacyPhase(phase),
       phase,
       status: phase === "done" ? "done" : "running",
-      leaseOwner: null,
-      leaseExpiresAt: null,
       updatedAt: currentDate(),
     })
     .where(eq(channelConversionJobs.id, jobId));
@@ -166,7 +178,7 @@ export async function requireStorageNamespaceId(tx: DatabaseExecutor, canonicalC
 
 export async function persistResourceBatchProgress(tx: DatabaseExecutor, job: ChannelConversionJob, progress: ConversionProgress) {
   await tx.update(channelConversionJobs).set({
-    progress, leaseOwner: null, leaseExpiresAt: null, updatedAt: currentDate(),
+    progress, updatedAt: currentDate(),
   }).where(eq(channelConversionJobs.id, job.id));
 }
 

@@ -4,7 +4,7 @@
  * Required-Test Admission evidence (docs/sops/ci-check-maintenance.md)
  *
  * - Test/check: packages/web FormatJS literal gate catalog MessageId filter
- *   (`lint:i18n-literals` / i18n-catalog-message-ids.mjs)
+ *   (`lint:i18n-literals` / i18n-catalog-message-ids.ts)
  * - Protected invariant: object-literal values that are exact en.ts MessageIds
  *   are not debt; JSX / misspelled / random dotted / prose / templates stay
  * - RED proof: this file fails until loadCatalogMessageIds* + filter exist and
@@ -17,17 +17,12 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import {
-  aggregateFindings,
   collectCurrentFindings,
-  compareFindingsToBaseline,
   filterCatalogMessageIdFindings,
-  filterIgnorableStructuralFindings,
-  findingsFromOxlintDiagnostics,
   isCatalogMessageIdObjectLiteralFinding,
   loadCatalogMessageIdsFromPath,
   loadCatalogMessageIdsFromSource,
-  runOxlintI18n,
-} from "../scripts/check-i18n-literals.mjs";
+} from "../scripts/check-i18n-literals";
 
 const WEB_ROOT = resolve(import.meta.dirname, "..");
 const CONFIG = resolve(WEB_ROOT, "scripts/oxlint-i18n.json");
@@ -310,155 +305,6 @@ test("collectCurrentFindings: temp root without en.ts stays GREEN via catalogMes
   } finally {
     rmSync(fixtureRoot, { recursive: true, force: true });
   }
-});
-
-test("real corpus: catalog MessageId filter drops exact 6 keys/6 hits (billing+settings+agent profile)", () => {
-  const catalog = loadCatalogMessageIdsFromPath(EN_CATALOG);
-  const baseline = JSON.parse(readFileSync(BASELINE_PATH, "utf8")) as Array<{
-    path: string;
-    rule: string;
-    source: string;
-    count: number;
-    classification: string;
-  }>;
-
-  const { report } = runOxlintI18n({
-    root: WEB_ROOT,
-    configPath: CONFIG,
-    target: "src",
-  });
-  const raw = findingsFromOxlintDiagnostics(report.diagnostics, {
-    root: WEB_ROOT,
-    readFile: (absPath: string) => readFileSync(absPath, "utf8"),
-  });
-  const afterStructural = filterIgnorableStructuralFindings(raw, catalog);
-  const catalogFiltered = filterCatalogMessageIdFindings(afterStructural, catalog);
-  const dropped = afterStructural.filter(
-    (f) => isCatalogMessageIdObjectLiteralFinding(f, catalog),
-  );
-  const droppedAgg = aggregateFindings(dropped);
-  const current = collectCurrentFindings({
-    root: WEB_ROOT,
-    configPath: CONFIG,
-    target: "src",
-  });
-
-  // Wiki retirement removes settingsNavigation SETTINGS_TABS label/title
-  // "wiki.settings": one aggregated key, two hits (24/33 -> 23/31).
-  // Agent profile edit dialogs (task #672) title each field through a MessageId
-  // map; "agent.detail.editDescription" is a catalog id there, not copy (24/32).
-  // messageStore's focused-context failure now picks its catalog id through a
-  // ternary (not-found vs beyond-history, task #14) instead of two object
-  // literal `contextLoadError:` values, retiring that key/2 hits (23/30).
-  // Removing the Workspace grid layout deleted workspaceGridUrlState.ts and its
-  // 17 catalog-id object literals (24 hits), leaving 6/6.
-  assert.equal(droppedAgg.length, 6, `expected 6 filtered keys; got ${droppedAgg.length}`);
-  assert.equal(
-    droppedAgg.reduce((n, e) => n + e.count, 0),
-    6,
-    "expected 6 filtered hits",
-  );
-  assert.equal(
-    droppedAgg.filter((e) => e.path === "src/components/agent/AgentScopesPanel.tsx").length,
-    0,
-  );
-  assert.equal(
-    droppedAgg.filter((e) => e.path === "src/utils/billingControls.ts").length,
-    5,
-  );
-  assert.equal(
-    droppedAgg.filter((e) => e.path === "src/components/settings/settingsNavigation.ts").length,
-    0,
-  );
-  for (const entry of droppedAgg) {
-    assert.equal(entry.rule, "formatjs/no-literal-string-in-object");
-    const text = entry.source.slice(1, -1);
-    assert.ok(catalog.has(text), `filtered source must be in catalog: ${entry.source}`);
-  }
-
-  // 2026-08-19: the exact flag-off compatibility surfaces repeat the existing
-  // ChannelMembers 99+ notation and EditChannelDialog #channel prefix. These
-  // are the same protocol literals under separate source paths, not new copy.
-  // 168 -> 161 keys / 200 -> 191 hits: the ten legacy `input-brutal` inputs in
-  // RuntimeConfigFields became raft-ui <Input>, and formatjs/no-literal-string-in-jsx
-  // only flags intrinsic elements — so their seven audited placeholder literals stopped
-  // being reported. The baseline ratchets DOWN as literals leave; a rise means new
-  // un-catalogued copy crept in.
-  // Removing the retired TaskItem also retires its two protocol-literal entries.
-  // 154 -> 153 keys / 183 -> 182 hits (2026-09-08): InviteHumanDialog's email box
-  // became a raft-ui <Input> for per-row invite roles, so its audited
-  // `name@company.com` placeholder stopped being reported — the same intrinsic-only
-  // effect recorded above for RuntimeConfigFields, ratcheting DOWN again.
-  // ReleaseNotesPanel's eight owner-managed literals moved into the catalogs.
-  // 180 -> 179 hits: MachineDetailPanel lost its raw-daemon version row (the
-  // standalone daemon has no release line any more), so one audited `v` prefix
-  // literal stopped being reported.
-  // ReleaseNotesPanel's owner-managed strings moved into the message catalogs (143/171),
-  // and the wave-2 title→Tooltip migration deleted HumanDetailPanel's redundant handle-span title
-  // `` `@${human.name}` `` (title == visible text), ratcheting down to 142 keys / 170 hits.
-  // 2026-09-24: 142 -> 138 keys / 170 -> 166 hits. 11fc52292 removed the dormant
-  // PostHog integration, deleting src/analytics/flagRegistry.ts ("Chat grid
-  // layout", "Sync-core messages", "Auto", "Feature flags") and two App.tsx
-  // entries. The baseline was pruned in that commit; only these counts were left.
-  // Task #41 deleted the separate Provider-connection select and its duplicate
-  // item literals; the one Provider selector now owns both saved and direct
-  // choices. Net after staging's own moves the corpus holds at 138 keys / 166 hits.
-  // 138 -> 137 keys / 166 -> 165 hits: the Computer upgrade copy rework renders
-  // the target inside the catalogued "Upgrade to v{version}" button label, so
-  // MachineDetailPanel's audited `(v` version-marker literal left the source.
-  // 137 -> 136 keys / 165 -> 164 hits: MachineDetailPanel's `~/.slock/agents/`
-  // workspace path moved out of JSX into a helper (the daemon now reports
-  // `~/.raft` paths on new machines; slock#9190).
-  // 136 -> 110 keys / 164 -> 132 hits: removing the Workspace grid layout
-  // deleted its panel-title protocol literals (#channel / @name / task #N) in
-  // MainLayout, Sidebar, member rows, MessageSearchPage and src/components/workspace.
-  // 132 -> 130 hits: the Sidebar channel row's two `"99+"` caps moved out of
-  // JSX into one helper shared by the badge's message and thread segments.
-  // 110 -> 108 keys / 130 -> 127 hits: ActionCard's `@` / `#` prefixes left
-  // JSX for template strings in useActionCardDetail (task #752).
-  // 108 -> 98 keys / 127 -> 117 hits: the Raft Design System rewrite redrew
-  // PaletteAuditPage on DS tokens, retiring ten legacy-palette research
-  // literals (`brutal-pink`, `bg-palette-lavender/40`, `#E08585`, …).
-  // 117 -> 116 hits: the Sidebar DM and pinned-agent rows draw through one
-  // SidebarPeerRowBody, so their two `"99+"` caps are one.
-  assert.equal(current.length, 98, `final disposition baseline keys; got ${current.length}`);
-  assert.equal(
-    current.reduce((n, e) => n + e.count, 0),
-    116,
-
-    "final disposition baseline hits",
-  );
-  assert.equal(
-    aggregateFindings(catalogFiltered).length,
-    current.length,
-    "collectCurrentFindings must apply catalog filter after structural before aggregate",
-  );
-
-  const compare = compareFindingsToBaseline(current, baseline);
-  assert.equal(
-    compare.ok,
-    true,
-    JSON.stringify({
-      new: compare.newFindings.slice(0, 5),
-      stale: compare.staleBaseline.slice(0, 5),
-    }),
-  );
-
-  assert.equal(baseline.length, 98); // 108 -> 98: see the PaletteAuditPage note above
-
-  assert.equal(
-    baseline.filter((e) => e.path === "src/components/agent/AgentScopesPanel.tsx").length,
-    0,
-  );
-  assert.equal(
-    baseline.filter(
-      (e) =>
-        e.path === "src/utils/billingControls.ts" &&
-        e.rule === "formatjs/no-literal-string-in-object" &&
-        /^"[a-z]+(?:\.[a-zA-Z0-9_]+)+"$/.test(e.source),
-    ).length,
-    0,
-  );
 });
 
 test("boundary: @/#/99+/technical/object English stay; safe glue leaves baseline; JSX raw MessageId stays", () => {

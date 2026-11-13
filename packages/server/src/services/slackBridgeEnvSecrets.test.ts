@@ -4,6 +4,7 @@ import type { ExternalInboundPayloadAad } from "./externalAppIngressService";
 import {
   createSlackBridgeEnvSecretBackends,
   slackBridgeKeyFromEnv,
+  slackBridgePayloadKeyringFromEnv,
   SLACK_BRIDGE_CREDENTIAL_KEY_ID,
   SLACK_BRIDGE_PAYLOAD_KEY_ID,
   SLACK_BRIDGE_SIGNING_SECRET_REF,
@@ -145,7 +146,8 @@ test("Slack env credential cipher round-trips the accepted plaintext boundary an
   }), /credential authority is invalid/);
 });
 
-test.each([1, 2, 3] as const)("Slack env payload cipher v%i binds the full install and binding authority", async (schemaVersion) => {
+test.each([1, 2, 3, 4] as const)("Slack env payload cipher v%i binds the full install and binding authority", async (schemaVersion) => {
+  const { SlackNormalizedEnvelopeInvalid } = await import("./slackNormalizedPayloadError");
   const { payloadSealer, decryptNormalizedPayload } = backends();
   const authority = aad({ schemaVersion });
   const plaintext = JSON.stringify({ text: "line one\nline two" });
@@ -158,6 +160,11 @@ test.each([1, 2, 3] as const)("Slack env payload cipher v%i binds the full insta
     envelopeKeyId: sealed.envelopeKeyId,
     aad: authority,
   }), plaintext);
+  await assert.rejects(() => decryptNormalizedPayload({ eventId: "event-1", ciphertext: "malformed",
+    envelopeKeyId: sealed.envelopeKeyId, aad: authority }), SlackNormalizedEnvelopeInvalid);
+  await assert.rejects(() => decryptNormalizedPayload({ eventId: "event-1", ciphertext: sealed.encryptedPayload,
+    envelopeKeyId: sealed.envelopeKeyId, aad: aad({ installId: "77777777-7777-4777-8777-777777777777" }) }),
+  (error: unknown) => error instanceof Error && !(error instanceof SlackNormalizedEnvelopeInvalid));
   await assert.rejects(() => decryptNormalizedPayload({
     eventId: "event-1",
     ciphertext: sealed.encryptedPayload,
@@ -220,4 +227,33 @@ test("Slack env keys require canonical base64 for exactly 32 bytes", () => {
   assert.deepEqual(slackBridgeKeyFromEnv(value, "TEST_KEY"), Buffer.alloc(32, 4));
   assert.throws(() => slackBridgeKeyFromEnv("not-base64", "TEST_KEY"), /base64-encoded 32-byte/);
   assert.throws(() => slackBridgeKeyFromEnv(undefined, "TEST_KEY"), /requires TEST_KEY/);
+});
+
+test("normalized payload rotation reads old keys and only writes the active key id", async () => {
+  const old = backends();
+  const original = await old.payloadSealer.sealNormalizedPayload({ plaintext: "old message", aad: aad() });
+  const rotated = createSlackBridgeEnvSecretBackends({ registrationId: REGISTRATION_ID, environment: "test",
+    providerAppId: "A0123", providerOAuthClientId: "client-123", signingSecret: "signing-secret", oauthClientSecret: "oauth-secret",
+    credentialEncryptionKey: Buffer.alloc(32, 7), payloadEncryptionKey: Buffer.alloc(32, 10), payloadKeyId: "next",
+    payloadDecryptionKeys: new Map([[SLACK_BRIDGE_PAYLOAD_KEY_ID, Buffer.alloc(32, 9)]]) });
+  assert.equal(await rotated.decryptNormalizedPayload({ eventId: "event-1", ciphertext: original.encryptedPayload, envelopeKeyId: original.envelopeKeyId, aad: aad() }), "old message");
+  const replacement = await rotated.payloadSealer.sealNormalizedPayload({ plaintext: "new message", aad: aad() });
+  assert.equal(replacement.envelopeKeyId, "next");
+  assert.equal(await rotated.decryptNormalizedPayload({ eventId: "event-2", ciphertext: replacement.encryptedPayload, envelopeKeyId: replacement.envelopeKeyId, aad: aad() }), "new message");
+  await assert.rejects(rotated.decryptNormalizedPayload({ eventId: "event-1", ciphertext: original.encryptedPayload, envelopeKeyId: "next", aad: aad() }));
+  await assert.rejects(rotated.decryptNormalizedPayload({ eventId: "event-1", ciphertext: original.encryptedPayload, envelopeKeyId: "unknown", aad: aad() }));
+});
+
+
+test("payload env keyring preserves legacy id and fails closed for invalid configuration", () => {
+  const legacy = Buffer.alloc(32, 9); const next = Buffer.alloc(32, 10);
+  const defaults = slackBridgePayloadKeyringFromEnv(legacy);
+  assert.equal(defaults.activePayloadKeyId, SLACK_BRIDGE_PAYLOAD_KEY_ID);
+  const rotated = slackBridgePayloadKeyringFromEnv(legacy, "key-v2", JSON.stringify({ "key-v2": next.toString("base64") }));
+  assert.equal(rotated.activePayloadKeyId, "key-v2"); assert.deepEqual(rotated.activePayloadKey, next);
+  assert.deepEqual(rotated.payloadReadKeys.get(SLACK_BRIDGE_PAYLOAD_KEY_ID), legacy);
+  assert.throws(() => slackBridgePayloadKeyringFromEnv(legacy, "missing"));
+  assert.throws(() => slackBridgePayloadKeyringFromEnv(legacy, "key-v2", "not-json"));
+  assert.throws(() => slackBridgePayloadKeyringFromEnv(legacy, undefined,
+    JSON.stringify({ [SLACK_BRIDGE_PAYLOAD_KEY_ID]: next.toString("base64") })));
 });

@@ -110,7 +110,7 @@ function formatMs(ms: number): string {
 }
 
 async function runScale(scale: Scale) {
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const sink = new MemoryTraceSink();
     app.app.set("serverTracer", new BasicTracer({ sink }));

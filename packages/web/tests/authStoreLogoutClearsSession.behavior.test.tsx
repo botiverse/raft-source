@@ -3,6 +3,7 @@ import "./helpers/domSetup";
 import { useAuthStore } from "../src/store/authStore";
 import { useAnnouncementStore } from "../src/store/announcementStore";
 import { useServerStore } from "../src/store/serverStore";
+import { actionCardFormDraftKey } from "../src/store/actionCardFormDrafts";
 import { hasSlockdevManualLogout } from "../src/utils/devMode";
 
 function tokenFor(subject: string): string {
@@ -74,4 +75,44 @@ test("an external token principal switch clears the prior account's announcement
 
   assert.deepEqual(useAnnouncementStore.getState().writeFailedIds, []);
   assert.equal(useAnnouncementStore.getState().loaded, false);
+});
+
+// A half-answered question card's sheet (store/actionCardFormDrafts.ts) is kept per person in this
+// tab's sessionStorage; the next person in the tab must not open it.
+function seedFormDrafts() {
+  sessionStorage.setItem(actionCardFormDraftKey("user-a", "message-1", "answers")!, JSON.stringify({ page: 1, values: {} }));
+  sessionStorage.setItem(actionCardFormDraftKey("user-c", "message-2", "answers")!, JSON.stringify({ page: 0, values: {} }));
+  sessionStorage.setItem("unrelated", "kept");
+}
+const formDraftKeys = () => Object.keys(sessionStorage).filter((key) => key.startsWith("raft.actionCardFormDraft."));
+
+test("logout drops every action-card form draft in the tab", () => {
+  seedFormDrafts();
+  useAuthStore.setState({ user: { id: "user-a", email: "a@example.com" } as never, accessToken: "at", refreshToken: null } as never);
+  useAuthStore.getState().logout();
+  assert.deepEqual(formDraftKeys(), []);
+  assert.equal(sessionStorage.getItem("unrelated"), "kept");
+  sessionStorage.clear();
+});
+
+test("another account signing in on another tab drops the form drafts too", () => {
+  seedFormDrafts();
+  useAuthStore.setState({ user: { id: "user-a", email: "a@example.com" } as never, accessToken: tokenFor("user-a"), refreshToken: "refresh-a" } as never);
+  // The other tab wrote its tokens: this tab hears it through the storage event (authTokenSync).
+  localStorage.setItem("slock_access_token", tokenFor("user-b"));
+  localStorage.setItem("slock_refresh_token", "refresh-b");
+  window.dispatchEvent(new StorageEvent("storage", { key: "slock_refresh_token" }));
+  assert.deepEqual(formDraftKeys(), []);
+  sessionStorage.clear();
+});
+
+test("another account's tokens in this tab (setTokens) drop the form drafts; a refresh for the same person keeps them", () => {
+  seedFormDrafts();
+  useAuthStore.setState({ user: { id: "user-a", email: "a@example.com" } as never, accessToken: tokenFor("user-a"), refreshToken: "refresh-a" } as never);
+  useAuthStore.getState().setTokens(tokenFor("user-a"), "refresh-a2");
+  assert.equal(formDraftKeys().length, 2, "same person: kept");
+  useAuthStore.getState().setTokens(tokenFor("user-b"), "refresh-b");
+  assert.deepEqual(formDraftKeys(), []);
+  assert.equal(sessionStorage.getItem("unrelated"), "kept");
+  sessionStorage.clear();
 });

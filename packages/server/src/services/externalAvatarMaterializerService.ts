@@ -9,6 +9,7 @@ import {
   externalActorProjections,
   externalProjectionAvatarArtifacts,
 } from "../db/schema";
+import { withImageDecodeSlot } from "../lib/imageDecodeLimit";
 import type { StorageBackend } from "./storageService";
 
 export const EXTERNAL_AVATAR_MAX_SOURCE_BYTES = 5 * 1024 * 1024;
@@ -57,27 +58,30 @@ export async function normalizeExternalAvatarRaster(source: Buffer): Promise<{
   if (source.length <= 0 || source.length > EXTERNAL_AVATAR_MAX_SOURCE_BYTES) {
     throw new Error("avatar_source_size_invalid");
   }
-  const decoder = sharp(source, {
-    animated: true,
-    limitInputPixels: EXTERNAL_AVATAR_MAX_DIMENSION * EXTERNAL_AVATAR_MAX_DIMENSION,
+  // Both reads of the source take one image-decode slot.
+  const { data, info } = await withImageDecodeSlot(async () => {
+    const decoder = sharp(source, {
+      animated: true,
+      limitInputPixels: EXTERNAL_AVATAR_MAX_DIMENSION * EXTERNAL_AVATAR_MAX_DIMENSION,
+    });
+    const metadata = await decoder.metadata();
+    if (
+      !metadata.width
+      || !metadata.height
+      || metadata.width > EXTERNAL_AVATAR_MAX_DIMENSION
+      || metadata.height > EXTERNAL_AVATAR_MAX_DIMENSION
+      || !(["jpeg", "png", "webp", "gif"] as Array<typeof metadata.format>).includes(metadata.format)
+      || (metadata.pages ?? 1) !== 1
+    ) throw new Error("avatar_source_raster_invalid");
+    return sharp(source, {
+      animated: false,
+      limitInputPixels: EXTERNAL_AVATAR_MAX_DIMENSION * EXTERNAL_AVATAR_MAX_DIMENSION,
+    })
+      .rotate()
+      .resize(EXTERNAL_AVATAR_OUTPUT_DIMENSION, EXTERNAL_AVATAR_OUTPUT_DIMENSION, { fit: "cover" })
+      .webp({ quality: 85 })
+      .toBuffer({ resolveWithObject: true });
   });
-  const metadata = await decoder.metadata();
-  if (
-    !metadata.width
-    || !metadata.height
-    || metadata.width > EXTERNAL_AVATAR_MAX_DIMENSION
-    || metadata.height > EXTERNAL_AVATAR_MAX_DIMENSION
-    || !(["jpeg", "png", "webp", "gif"] as Array<typeof metadata.format>).includes(metadata.format)
-    || (metadata.pages ?? 1) !== 1
-  ) throw new Error("avatar_source_raster_invalid");
-  const { data, info } = await sharp(source, {
-    animated: false,
-    limitInputPixels: EXTERNAL_AVATAR_MAX_DIMENSION * EXTERNAL_AVATAR_MAX_DIMENSION,
-  })
-    .rotate()
-    .resize(EXTERNAL_AVATAR_OUTPUT_DIMENSION, EXTERNAL_AVATAR_OUTPUT_DIMENSION, { fit: "cover" })
-    .webp({ quality: 85 })
-    .toBuffer({ resolveWithObject: true });
   if (
     info.format !== "webp"
     || info.width !== EXTERNAL_AVATAR_OUTPUT_DIMENSION
@@ -315,9 +319,12 @@ export async function materializeExternalProjectionAvatar(input: {
   publicOrigin: string;
   signal?: AbortSignal;
   now?: () => Date;
+  /** Caller-specific authority is checked before the projection lock. */
+  lockAdditionalAuthority?: (tx: DatabaseTransaction) => Promise<boolean>;
 }): Promise<ExternalAvatarMaterializationResult> {
   if (input.sourceLocator === null) {
     const cleared = await input.db.transaction(async (tx) => {
+      if (input.lockAdditionalAuthority && !await input.lockAdditionalAuthority(tx)) return null;
       const [projection] = await tx.select().from(externalActorProjections).where(and(
         eq(externalActorProjections.id, input.projectionId),
         eq(externalActorProjections.provider, input.source.provider),
@@ -355,6 +362,7 @@ export async function materializeExternalProjectionAvatar(input: {
     ownerId: input.projectionId,
     expectedProvider: input.source.provider,
     lockAuthority: async (tx) => {
+      if (input.lockAdditionalAuthority && !await input.lockAdditionalAuthority(tx)) return false;
       const [projection] = await tx.select().from(externalActorProjections).where(and(
         eq(externalActorProjections.id, input.projectionId),
         eq(externalActorProjections.provider, input.source.provider),

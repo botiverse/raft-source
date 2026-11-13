@@ -4,6 +4,7 @@ import {
   flushAsyncWork,
 } from "./messageWindowHarness";
 import { buildOptimisticMessageId } from "../src/components/message/optimisticMessageDraft";
+import { channelOwesGapFill, GAP_FILL_MAX_RETRIES, GAP_FILL_RETRY_BASE_MS, resetGapFillForTests } from "../src/store/liveGapFill";
 import {
   CONTEXT_BEYOND_HISTORY_ERROR,
   compareMessagesForDisplay,
@@ -128,6 +129,13 @@ function persistedSend(overrides: Partial<Message> = {}): Message {
     createdAt: "2026-06-17T03:15:01.000Z",
     ...overrides,
   };
+}
+
+/** A failed read the harness awaits later (handled now, so it is no unhandled rejection). */
+function failedRead(message: string): Promise<Message[]> {
+  const failed = Promise.reject(new Error(message));
+  failed.catch(() => undefined);
+  return failed;
 }
 
 function deferred<T>() {
@@ -623,12 +631,13 @@ test("loadMessages reuses cached rows immediately while refreshing the channel t
 
     const pending = useMessageStore.getState().loadMessages(channelId);
     assert.deepEqual(harness.snapshot(channelId).messageIds, ["m-10"]);
+    // The cached window shows with the meta its own fetch recorded.
     assert.deepEqual(harness.windowMeta(channelId), {
       loading: false,
       loadingOlder: false,
       loadingNewer: false,
       loadingGap: false,
-      hasMore: true,
+      hasMore: false,
       hasNewer: false,
       hasGap: false,
       historyLimited: false,
@@ -2136,6 +2145,9 @@ test("canonical reply context opens the owning thread before restoring the paren
 test("falls back to the channel timeline when focused message context is missing", SERIAL, async () => {
   const harness = createMessageWindowHarness();
   try {
+    // The context route's answer for a message that is not there (deep
+    // links: only a 400/403/404 is a final not-found).
+    harness.enqueueContextPages(Promise.reject({ response: { status: 404, data: { error: "Message not found" } } }));
     harness.enqueueChannelPages([message(20), message(21), message(22)]);
 
     await harness.loadMessageContext(CHANNEL_ID, "missing-message");
@@ -2145,6 +2157,7 @@ test("falls back to the channel timeline when focused message context is missing
     assert.equal(snapshot.highlightedMessageId, null);
     assert.equal(snapshot.loading, false);
     assert.equal(snapshot.contextLoadError, "message.chatPanel.messageNotFound");
+    assert.equal(useMessageStore.getState().pendingNotFoundToast, true, "the toast is owed");
     assert.equal(harness.windowMeta(CHANNEL_ID).loading, false);
     assert.equal(harness.windowMeta(CHANNEL_ID).contextLoadError, "message.chatPanel.messageNotFound");
     assert.deepEqual(harness.getCalls(), [
@@ -2156,19 +2169,20 @@ test("falls back to the channel timeline when focused message context is missing
   }
 });
 
-test("a focused message hidden by the plan history cutoff reports beyond-history, not not-found (task #14)", SERIAL, async () => {
+test("a plain not-found context stays not found in a history-limited channel: the route names a hidden target itself (task #8)", SERIAL, async () => {
   const harness = createMessageWindowHarness();
   try {
-    // The context route 404s for a target behind the cutoff; the fallback page
-    // reports the channel as history-limited.
+    // A target behind the cutoff answers history_limited (historyJumpTargets
+    // test); a bare 404 is a message that is not there.
+    harness.enqueueContextPages(Promise.reject({ response: { status: 404, data: { error: "Message not found" } } }));
     harness.enqueueChannelPages({ messages: [message(20), message(21)], historyLimited: true });
 
     await harness.loadMessageContext(CHANNEL_ID, "old-message");
 
     const snapshot = harness.snapshot(CHANNEL_ID);
     assert.deepEqual(snapshot.messageIds, ["m-20", "m-21"]);
-    assert.equal(snapshot.contextLoadError, CONTEXT_BEYOND_HISTORY_ERROR);
-    assert.equal(harness.windowMeta(CHANNEL_ID).contextLoadError, CONTEXT_BEYOND_HISTORY_ERROR);
+    assert.equal(snapshot.contextLoadError, "message.chatPanel.messageNotFound");
+    assert.notEqual(harness.windowMeta(CHANNEL_ID).contextLoadError, CONTEXT_BEYOND_HISTORY_ERROR);
   } finally {
     harness.restore();
   }
@@ -2528,7 +2542,7 @@ test("loadMessageWindowSilent clears metadata loading after a failed context pag
   }
 });
 
-test("defers non-contiguous socket messages until gap recovery fills the missing seqs", SERIAL, async () => {
+test("shows a non-contiguous socket message at once and fills the missing seqs behind it", SERIAL, async () => {
   const harness = createMessageWindowHarness();
   try {
     harness.primeWindow(CHANNEL_ID, [message(10)]);
@@ -2537,14 +2551,14 @@ test("defers non-contiguous socket messages until gap recovery fills the missing
     harness.socketMessage(message(13));
 
     const beforeRecovery = harness.snapshot(CHANNEL_ID);
-    assert.deepEqual(beforeRecovery.messageIds, ["m-10"]);
-    assert.equal(beforeRecovery.hasGap, true);
+    assert.deepEqual(beforeRecovery.messageIds, ["m-10", "m-13"], "the live row is not held back");
+    assert.equal(beforeRecovery.hasGap, true, "the hole behind it is not yet confirmed");
     assert.equal(beforeRecovery.unreadCount, 1);
 
     await flushAsyncWork();
 
     const afterRecovery = harness.snapshot(CHANNEL_ID);
-    assert.deepEqual(afterRecovery.messageIds, ["m-10", "m-11", "m-12", "m-13"]);
+    assert.deepEqual(afterRecovery.messageIds, ["m-10", "m-11", "m-12", "m-13"], "older rows interleave in seq order");
     assert.equal(afterRecovery.hasGap, false);
     assert.equal(afterRecovery.loadingGap, false);
     assert.equal(afterRecovery.unreadCount, 1);
@@ -2554,7 +2568,7 @@ test("defers non-contiguous socket messages until gap recovery fills the missing
   }
 });
 
-test("re-stitches a deferred socket message even if sync returns only the missing range", SERIAL, async () => {
+test("a seq jump with nothing missing (global seqs): the fill answers empty and the gap clears", SERIAL, async () => {
   const harness = createMessageWindowHarness();
   try {
     harness.primeWindow(CHANNEL_ID, [message(10)]);
@@ -2562,9 +2576,8 @@ test("re-stitches a deferred socket message even if sync returns only the missin
 
     harness.socketMessage(message(13));
 
-    const beforeRecovery = harness.snapshot(CHANNEL_ID);
-    assert.deepEqual(beforeRecovery.messageIds, ["m-10"]);
-    assert.equal(beforeRecovery.hasGap, true);
+    assert.deepEqual(harness.snapshot(CHANNEL_ID).messageIds, ["m-10", "m-13"]);
+    assert.equal(harness.snapshot(CHANNEL_ID).hasGap, true);
 
     await flushAsyncWork();
 
@@ -2573,6 +2586,189 @@ test("re-stitches a deferred socket message even if sync returns only the missin
     assert.equal(afterRecovery.hasGap, false);
     assert.equal(afterRecovery.loadingGap, false);
     assert.deepEqual(harness.getCalls(), ["/messages/sync?since_seq=10&limit=200&channel_id=channel-1"]);
+  } finally {
+    harness.restore();
+  }
+});
+
+test("live rows arriving out of seq order are shown at once, in seq order, once each", SERIAL, async () => {
+  const harness = createMessageWindowHarness();
+  try {
+    harness.primeWindow(CHANNEL_ID, [message(10)]);
+    harness.enqueueSyncPages([message(15), message(20)], []);
+
+    harness.socketMessage(message(20));
+    harness.socketMessage(message(15));
+    harness.socketMessage(message(20));
+
+    assert.deepEqual(harness.snapshot(CHANNEL_ID).messageIds, ["m-10", "m-15", "m-20"]);
+    await flushAsyncWork();
+
+    const after = harness.snapshot(CHANNEL_ID);
+    assert.deepEqual(after.messageIds, ["m-10", "m-15", "m-20"]);
+    assert.equal(after.hasGap, false);
+    assert.equal(after.loadingGap, false);
+    assert.equal(channelOwesGapFill(CHANNEL_ID), false);
+    assert.deepEqual(harness.getCalls(), ["/messages/sync?since_seq=10&limit=200&channel_id=channel-1"], "one burst, one read");
+  } finally {
+    harness.restore();
+  }
+});
+
+test("a gap fill whose read fails is retried with backoff and fills the hole", SERIAL, async () => {
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  const harness = createMessageWindowHarness();
+  try {
+    harness.primeWindow(CHANNEL_ID, [message(10)]);
+    harness.enqueueSyncPages(failedRead("offline"), [message(11), message(12)]);
+
+    harness.socketMessage(message(12));
+    await vi.advanceTimersByTimeAsync(0);
+    assert.equal(harness.getCalls().length, 1, "the first fill ran and failed");
+    assert.deepEqual(harness.snapshot(CHANNEL_ID).messageIds, ["m-10", "m-12"], "the live row stays shown");
+    assert.equal(harness.snapshot(CHANNEL_ID).loadingGap, false, "a failed read clears loading");
+    assert.equal(harness.snapshot(CHANNEL_ID).hasGap, true, "the hole is still unconfirmed");
+
+    await vi.advanceTimersByTimeAsync(GAP_FILL_RETRY_BASE_MS - 1);
+    assert.equal(harness.getCalls().length, 1, "not before the backoff");
+    await vi.advanceTimersByTimeAsync(1);
+    assert.equal(harness.getCalls().length, 2, "retried after it");
+    assert.equal(harness.getCalls()[1], "/messages/sync?since_seq=10&limit=200&channel_id=channel-1");
+
+    const after = harness.snapshot(CHANNEL_ID);
+    assert.deepEqual(after.messageIds, ["m-10", "m-11", "m-12"]);
+    assert.equal(after.hasGap, false);
+    assert.equal(after.loadingGap, false);
+  } finally {
+    harness.restore();
+    vi.useRealTimers();
+  }
+});
+
+test("gap fill retries stop at the cap with the hole still known (the heartbeat takes over)", SERIAL, async () => {
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  const harness = createMessageWindowHarness();
+  try {
+    harness.primeWindow(CHANNEL_ID, [message(10)]);
+    harness.enqueueSyncPages(...Array.from({ length: GAP_FILL_MAX_RETRIES + 3 }, () => failedRead("down")));
+
+    harness.socketMessage(message(12));
+    await vi.advanceTimersByTimeAsync(10 * 60_000);
+
+    assert.equal(harness.getCalls().length, 1 + GAP_FILL_MAX_RETRIES, "the first read and each retry, no more");
+    assert.deepEqual(harness.snapshot(CHANNEL_ID).messageIds, ["m-10", "m-12"]);
+    assert.equal(harness.snapshot(CHANNEL_ID).hasGap, true);
+    assert.equal(harness.snapshot(CHANNEL_ID).loadingGap, false);
+    assert.equal(channelOwesGapFill(CHANNEL_ID), true);
+  } finally {
+    harness.restore();
+    vi.useRealTimers();
+  }
+});
+
+test("a gap read dropped because the signed-in person changed still clears loadingGap", SERIAL, async () => {
+  const harness = createMessageWindowHarness();
+  const response = deferred<Message[]>();
+  try {
+    harness.primeWindow(CHANNEL_ID, [message(10)]);
+    harness.enqueueSyncPages(response.promise);
+
+    const pending = harness.syncGap(CHANNEL_ID);
+    assert.equal(useMessageStore.getState().loadingGap, true);
+    useMessageStore.getState().setCurrentUserId("someone-else");
+    response.resolve([message(11)]);
+    await pending;
+
+    assert.equal(useMessageStore.getState().loadingGap, false);
+    assert.equal(harness.windowMeta(CHANNEL_ID).loadingGap, false);
+    assert.deepEqual(harness.snapshot(CHANNEL_ID).messageIds, ["m-10"], "the dropped page is not applied");
+  } finally {
+    harness.restore();
+  }
+});
+
+test("a live row that lands while a gap read is in flight gets a read of its own after it", SERIAL, async () => {
+  const harness = createMessageWindowHarness();
+  const first = deferred<Message[]>();
+  try {
+    harness.primeWindow(CHANNEL_ID, [message(10)]);
+    harness.enqueueSyncPages(first.promise, []);
+
+    harness.socketMessage(message(40));
+    await flushAsyncWork();
+    harness.socketMessage(message(75));
+    await flushAsyncWork();
+    assert.deepEqual(harness.snapshot(CHANNEL_ID).messageIds, ["m-10", "m-40", "m-75"]);
+    assert.equal(harness.getCalls().length, 1, "one read at a time");
+
+    first.resolve([message(40)]);
+    await flushAsyncWork();
+
+    assert.deepEqual(harness.getCalls(), [
+      "/messages/sync?since_seq=10&limit=200&channel_id=channel-1",
+      "/messages/sync?since_seq=40&limit=200&channel_id=channel-1",
+    ]);
+    const after = harness.snapshot(CHANNEL_ID);
+    assert.deepEqual(after.messageIds, ["m-10", "m-40", "m-75"]);
+    assert.equal(after.hasGap, false);
+    assert.equal(after.loadingGap, false);
+  } finally {
+    harness.restore();
+  }
+});
+
+test("a focus read does not read past a hole still being filled; the fill reads the channel once it answers", SERIAL, async () => {
+  const harness = createMessageWindowHarness();
+  const first = deferred<Message[]>();
+  const second = deferred<Message[]>();
+  const readSeqs = () => harness.postCalls()
+    .filter((call) => call.url === `/channels/${CHANNEL_ID}/read`)
+    .map((call) => (call.body as { seq: number }).seq);
+  try {
+    harness.primeWindow(CHANNEL_ID, [message(10)]);
+    harness.enqueueSyncPages(first.promise, second.promise);
+
+    harness.socketMessage(message(40));
+    await flushAsyncWork();
+    harness.socketMessage(message(75));
+    await flushAsyncWork();
+    assert.equal(harness.getCalls().length, 1, "the fill for 40 is in flight");
+
+    useMessageStore.getState().markCurrentChannelRead();
+    await flushAsyncWork();
+    assert.deepEqual(readSeqs(), [], "a focus read does not post past the unconfirmed hole");
+
+    first.resolve([message(40)]);
+    await flushAsyncWork();
+    assert.deepEqual(readSeqs(), [], "75's hole is still being filled");
+    second.resolve([message(75)]);
+    await flushAsyncWork();
+
+    assert.equal(harness.snapshot(CHANNEL_ID).hasGap, false);
+    useMessageStore.getState().markCurrentChannelRead();
+    await flushAsyncWork();
+    assert.equal(Math.max(0, ...readSeqs()), 75, "once confirmed, the channel reads through its newest row");
+  } finally {
+    harness.restore();
+  }
+});
+
+test("a server switch during a gap read: the read asks for nothing afterwards (no rerun on the new server)", SERIAL, async () => {
+  const harness = createMessageWindowHarness();
+  const first = deferred<Message[]>();
+  try {
+    harness.primeWindow(CHANNEL_ID, [message(10)]);
+    harness.enqueueSyncPages(first.promise);
+
+    harness.socketMessage(message(40));
+    await flushAsyncWork();
+    void useMessageStore.getState().syncGap(CHANNEL_ID, { sinceSeq: 40 });
+    assert.equal(harness.getCalls().length, 1, "a heartbeat-style read asked mid-flight waits to rerun");
+
+    resetGapFillForTests();
+    first.resolve([message(40)]);
+    await flushAsyncWork();
+    assert.equal(harness.getCalls().length, 1, "no rerun for the old server's channel");
   } finally {
     harness.restore();
   }

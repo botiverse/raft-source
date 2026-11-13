@@ -1,5 +1,7 @@
+import { fillJointMembersFromChannelHumans } from "../test/jointMemberFill";
 import { fixturePasswordHash, tokenForHuman } from "../test/integration/credentials";
 import { createApiTest } from "../test/integration/apiTest";
+import { enableTaskV2ConversationsForServer } from "../test/integration/taskV2Flag";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 
@@ -10,7 +12,6 @@ import {
   attachmentCommentRefs,
   attachmentObjects,
   attachments,
-  featureFlags,
   channelConversionJobs,
   channels,
   channelAgents,
@@ -23,17 +24,19 @@ import {
   serverMembers,
   taskEvents,
   tasks,
+  threadFollows,
   users,
 } from "../db/schema";
 import { createServer } from "../services/serverService";
-import { createAgent, assignMachine } from "../services/agentService";
+import { createAgent } from "../services/agentService";
+import { placeAgentOnMachine } from "../test/agentMachineFixture";
 import { registerMachine } from "../services/machineService";
 import { mintAgentCredential } from "../services/agentCredentialService";
 import * as channelService from "../services/channelService";
 import { createMessage } from "../services/messageService";
 import * as taskService from "../services/taskService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 test("Joint attachment comments use each viewer's local authority and persist in the shared canonical thread", async ({ app }) => {
   const db = getDb();
@@ -42,11 +45,10 @@ test("Joint attachment comments use each viewer's local authority and persist in
   const outsider = await seedUser("comment-outsider@test.invalid", "comment-outsider");
   const fixture = await createJointFixture({ slug: "comment-authority", channelName: "comment-authority", hostOwnerId: hostOwner.id, peerOwnerId: peerOwner.id });
   await db.insert(serverMembers).values({ serverId: fixture.peerServer.id, userId: outsider.id, role: "member" });
-  await db.update(featureFlags).set({ enabled: true, defaultEnabled: true, killSwitch: false }).where(eq(featureFlags.key, "attachment_comments_v0"));
   const parent = await createMessage(fixture.canonical.id, "user", hostOwner.id, "Shared attachment host");
   const objectId = randomUUID(), attachmentId = randomUUID();
   await db.insert(attachmentObjects).values({ id: objectId, originServerId: fixture.hostServer.id, uploaderId: hostOwner.id, uploaderType: "user", storageKey: `comment/${objectId}`, mimeType: "text/plain", sizeBytes: 8, lifecycleState: "active" });
-  await db.insert(attachments).values({ id: attachmentId, objectId, messageId: parent.id, channelId: fixture.hostProjection.id, uploaderId: hostOwner.id, uploaderType: "user", createdById: hostOwner.id, createdByType: "user", filename: "shared.txt", mimeType: "text/plain", sizeBytes: 8, storageKey: `comment/${objectId}` });
+  await db.insert(attachments).values({ id: attachmentId, objectId, messageId: parent.id, channelId: fixture.hostProjection.id, uploaderId: hostOwner.id, uploaderType: "user", createdById: hostOwner.id, createdByType: "user", filename: "shared.txt" });
   const commentIds: string[] = [];
   for (const [owner, server] of [[hostOwner, fixture.hostServer], [peerOwner, fixture.peerServer]] as const) {
     const headers = authHeaders(await tokenForHuman(owner.email), server.id);
@@ -130,7 +132,7 @@ test("an agent-prepared Joint action card persists canonically, is visible from 
   await channelService.addHuman(fixture.peerProjection.id, dual.id);
   const peerAgent = await createAgent(fixture.peerServer.id, "joint-card-peer-agent", { runtime: "claude" });
   await channelService.addAgent(fixture.peerProjection.id, peerAgent.id);
-  const { apiKey } = await mintAgentCredential({ agentId: peerAgent.id, scopes: ["tasks"], name: "joint-card-prepare", createdByUserId: peerOwner.id });
+  const { apiKey } = await mintAgentCredential({ agentId: peerAgent.id, scopes: ["tasks"], name: "joint-card-prepare", issuedVia: "human", createdByUserId: peerOwner.id });
   installRecordingOrchestrator(app.app);
   const realtimeEvents = installFakeIo(app.app);
 
@@ -306,6 +308,7 @@ async function createJointFixture(opts: {
       joinedByUserId: opts.peerOwnerId,
     },
   ]);
+  await fillJointMembersFromChannelHumans();
   return { hostServer, peerServer, canonical, hostProjection, peerProjection, joint };
 }
 
@@ -569,17 +572,19 @@ test("agent joint task create summaries (legacy internal + Agent API) persist ca
     const peerAgent = await createAgent(fixture.peerServer.id, "joint-agent-peer-agent", { runtime: "claude" });
     await channelService.addAgent(fixture.peerProjection.id, peerAgent.id);
     const { machine, apiKey } = await registerMachine(fixture.peerServer.id, peerOwner.id, "joint-agent-machine");
-    await assignMachine(peerAgent.id, machine.id);
+    await placeAgentOnMachine(peerAgent.id, machine.id);
     const { apiKey: agentApiKey } = await mintAgentCredential({
       agentId: peerAgent.id,
       scopes: ["tasks"],
       name: "joint-agent-task-create",
+      issuedVia: "human",
       createdByUserId: peerOwner.id,
     });
     const { apiKey: hostAgentApiKey } = await mintAgentCredential({
       agentId: hostAgent.id,
       scopes: ["tasks"],
       name: "joint-agent-task-assign",
+      issuedVia: "human",
       createdByUserId: hostOwner.id,
     });
 
@@ -661,7 +666,9 @@ test("agent joint task create summaries (legacy internal + Agent API) persist ca
       { headers: { Authorization: `Bearer ${agentApiKey}` } },
     );
     assert.equal(listRes.status, 200, `expected Agent API joint list 200, got ${listRes.status}`);
-    const listBody = await listRes.json() as { tasks: Array<{ channelId: string; title: string }> };
+    const listBody = await listRes.json() as { tasks: Array<{ channelId: string; title: string }>; scope: string; pagination: unknown };
+    assert.equal(listBody.scope, "channel");
+    assert.deepEqual(listBody.pagination, { mode: "complete", truncated: false });
     assert.equal(listBody.tasks.filter((task) => task.title.includes("joint task")).length, 2);
     assert.ok(
       listBody.tasks.filter((task) => task.title.includes("joint task")).every((task) => task.channelId === fixture.peerProjection.id),
@@ -1283,7 +1290,9 @@ test("participant workspace reads historical converted tasks but cannot mutate t
       hostOwnerId: hostOwner.id,
       peerOwnerId: peerOwner.id,
     });
-    const conversionAt = new Date("2026-08-20T00:00:00.000Z");
+    // Ten days ago, so the history stays inside a Free server's 30-day window.
+    const day = 24 * 60 * 60 * 1000;
+    const conversionAt = new Date(Date.now() - 10 * day);
     await db.insert(channelConversionJobs).values({
       serverId: fixture.hostServer.id,
       sourceChannelId: fixture.hostProjection.id,
@@ -1294,7 +1303,7 @@ test("participant workspace reads historical converted tasks but cannot mutate t
       jointChannelId: fixture.joint.id,
       createdByUserId: hostOwner.id,
       createdAt: conversionAt,
-      completedAt: new Date("2026-08-20T00:01:00.000Z"),
+      completedAt: new Date(conversionAt.getTime() + 60 * 1000),
     });
     const { tasks: [historical] } = await taskService.createTasks(
       fixture.canonical.id,
@@ -1309,12 +1318,12 @@ test("participant workspace reads historical converted tasks but cannot mutate t
       [{ title: "post-cutover task" }],
     );
     await db.update(tasks).set({
-      createdAt: new Date("2026-08-19T00:00:00.000Z"),
-      updatedAt: new Date("2026-08-19T00:00:00.000Z"),
+      createdAt: new Date(conversionAt.getTime() - day),
+      updatedAt: new Date(conversionAt.getTime() - day),
     }).where(eq(tasks.id, historical.id));
     await db.update(tasks).set({
-      createdAt: new Date("2026-08-21T00:00:00.000Z"),
-      updatedAt: new Date("2026-08-21T00:00:00.000Z"),
+      createdAt: new Date(conversionAt.getTime() + day),
+      updatedAt: new Date(conversionAt.getTime() + day),
     }).where(eq(tasks.id, fresh.id));
     const historicalMessage = await createMessage(
       fixture.canonical.id,
@@ -1323,8 +1332,8 @@ test("participant workspace reads historical converted tasks but cannot mutate t
       "historical message cannot become a participant task",
     );
     await db.update(messages).set({
-      createdAt: new Date("2026-08-19T00:00:00.000Z"),
-      updatedAt: new Date("2026-08-19T00:00:00.000Z"),
+      createdAt: new Date(conversionAt.getTime() - day),
+      updatedAt: new Date(conversionAt.getTime() - day),
     }).where(eq(messages.id, historicalMessage.id));
 
     const peerToken = await tokenForHuman(peerOwner.email);
@@ -1383,3 +1392,124 @@ test("participant workspace reads historical converted tasks but cannot mutate t
     });
     assert.equal(peerFreshStatus.status, 200, "post-cutover participant task follows normal Joint rules");
   });
+
+test("task v2 on, joint channel: a person's create without a source posts their message into the shared storage channel and hangs the task under it", async ({ app }) => {
+  const hostOwner = await seedUser("joint-v2-src-host@slock.test", "joint-v2-src-host");
+  const peerOwner = await seedUser("joint-v2-src-peer@slock.test", "joint-v2-src-peer");
+  const fixture = await createJointFixture({
+    slug: "joint-v2-src",
+    channelName: "joint-v2-src-room",
+    hostOwnerId: hostOwner.id,
+    peerOwnerId: peerOwner.id,
+  });
+  await enableTaskV2ConversationsForServer(fixture.hostServer.id);
+  installFakeIo(app.app);
+  installRecordingOrchestrator(app.app);
+  const headers = authHeaders(await tokenForHuman(hostOwner.email), fixture.hostServer.id);
+
+  // Through the host's local face: broadcastAndDeliver stores the message in
+  // the joint's canonical channel, where the task lives (createTasks checks).
+  const createRes = await fetch(`${app.baseUrl}/api/tasks/channel/${fixture.hostProjection.id}`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ tasks: [{ title: "joint sourced task" }] }),
+  });
+  assert.equal(createRes.status, 200, await createRes.clone().text());
+  const createdTask = (await createRes.json() as { tasks: Array<{ id: string }> }).tasks[0]!;
+  const [row] = await getDb().select().from(tasks).where(eq(tasks.id, createdTask.id));
+  assert.ok(row!.sourceMessageId, "the task has a source");
+  const [source] = await getDb().select().from(messages).where(eq(messages.id, row!.sourceMessageId!));
+  assert.equal(source!.channelId, fixture.canonical.id, "the source lives in the shared storage channel");
+  assert.equal(source!.senderType, "user");
+  assert.equal(source!.senderId, hostOwner.id);
+  assert.equal(source!.messageType, "chat");
+  assert.equal(source!.content, "joint sourced task");
+});
+
+test("task v2 on (initiating server): a joint task posts nothing in the channel (only the 📌 line in its source's thread) and has no conversation until first use; then a canonical + per-server conversation, the creator following on their own server's face", async ({ app }) => {
+  const hostOwner = await seedUser("joint-v2-host@slock.test", "joint-v2-host");
+  const peerOwner = await seedUser("joint-v2-peer@slock.test", "joint-v2-peer");
+  const fixture = await createJointFixture({
+    slug: "joint-v2",
+    channelName: "joint-v2-room",
+    hostOwnerId: hostOwner.id,
+    peerOwnerId: peerOwner.id,
+  });
+  // The gate reads the server the request came through (the host here).
+  await enableTaskV2ConversationsForServer(fixture.hostServer.id);
+  const hostAgent = await createAgent(fixture.hostServer.id, "joint-v2-host-agent", { runtime: "claude" });
+  const peerAgent = await createAgent(fixture.peerServer.id, "joint-v2-peer-agent", { runtime: "claude" });
+  await channelService.addAgent(fixture.hostProjection.id, hostAgent.id);
+  await channelService.addAgent(fixture.peerProjection.id, peerAgent.id);
+  const events = installFakeIo(app.app);
+  const deliveries = installRecordingOrchestrator(app.app);
+  const headers = authHeaders(await tokenForHuman(hostOwner.email), fixture.hostServer.id);
+  // A task always has a source: the creator's own message, already in the
+  // channel (a create without one would post it first).
+  const source = await createMessage(fixture.canonical.id, "user", hostOwner.id, "we need a joint v2 task");
+  const messagesBefore = await getDb().select({ id: messages.id }).from(messages).where(eq(messages.channelId, fixture.canonical.id));
+
+  const createRes = await fetch(`${app.baseUrl}/api/tasks/channel/${fixture.hostProjection.id}`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ tasks: [{ title: "joint v2 task", sourceMessageId: source.id }] }),
+  });
+  assert.equal(createRes.status, 200);
+  const createdTask = (await createRes.json() as { tasks: Array<{ id: string; conversationChannelId: string | null }> }).tasks[0]!;
+  assert.equal(createdTask.conversationChannelId, null, "creating a task creates no conversation (lazy, like a thread)");
+  const [row] = await getDb().select().from(tasks).where(eq(tasks.id, createdTask.id));
+  assert.equal(row!.messageId, null, "no host message");
+  assert.equal(row!.ownConversation, true);
+  assert.deepEqual(await getDb().select().from(channels).where(eq(channels.taskId, createdTask.id)), [], "no conversation face yet");
+
+  // Nothing reached the channel: no message, no created summary, no delivery.
+  await waitFor(() => {
+    assert.ok(events.some((event) => event.event === "task:created"));
+  });
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  const messagesAfter = await getDb().select({ id: messages.id }).from(messages).where(eq(messages.channelId, fixture.canonical.id));
+  assert.equal(messagesAfter.length, messagesBefore.length, "creating a task posts nothing in the channel");
+  assert.equal(
+    deliveries.some((delivery) => [hostAgent.id, peerAgent.id].includes(delivery.agentId)),
+    false,
+    "no agent hears about the creation",
+  );
+  // The only message:new is the 📌 line in the source message's thread (always
+  // posted, task v2); the channel itself got no message (messagesAfter above).
+  const broadcast = events.filter((e) => e.event === "message:new").map((e) => (e.payload as { content?: string }).content ?? "");
+  assert.equal(broadcast.length, 1, JSON.stringify(broadcast));
+  assert.ok(broadcast[0]!.startsWith("📌 "), `only the 📌 thread line is broadcast: ${broadcast[0]}`);
+
+  // First use (the web opening the conversation to reply): one canonical
+  // conversation under the storage channel + one local face per server under
+  // that server's local channel, linked through joint_channels.
+  const open = await fetch(`${app.baseUrl}/api/tasks/${createdTask.id}/conversation`, { method: "POST", headers });
+  assert.equal(open.status, 200, await open.clone().text());
+  const opened = await open.json() as { conversationChannelId: string; canonicalConversationChannelId: string; created: boolean };
+  assert.equal(opened.created, true);
+  const faces = await getDb().select().from(channels).where(eq(channels.taskId, createdTask.id));
+  assert.deepEqual(
+    faces.map((face) => face.parentChannelId).sort(),
+    [fixture.canonical.id, fixture.hostProjection.id, fixture.peerProjection.id].sort(),
+  );
+  const [created] = await getDb().select().from(tasks).where(eq(tasks.id, createdTask.id));
+  assert.equal(created!.conversationChannelId, opened.canonicalConversationChannelId);
+  const [jointConversation] = await getDb().select().from(jointChannels).where(eq(jointChannels.canonicalChannelId, opened.canonicalConversationChannelId));
+  assert.ok(jointConversation, "the conversation is linked like a joint thread");
+  const localRows = await getDb().select().from(jointChannelServers).where(eq(jointChannelServers.jointChannelId, jointConversation!.id));
+  assert.deepEqual(localRows.map((local) => local.serverId).sort(), [fixture.hostServer.id, fixture.peerServer.id].sort());
+  const hostFace = faces.find((face) => face.parentChannelId === fixture.hostProjection.id)!;
+  assert.equal(opened.conversationChannelId, hostFace.id, "the host reader gets its server's local face");
+
+  // The creator follows from creation, on their own server's local face only.
+  const follows = await getDb().select().from(threadFollows).where(and(
+    eq(threadFollows.followerType, "user"),
+    eq(threadFollows.followerId, hostOwner.id),
+    eq(threadFollows.parentTaskId, createdTask.id),
+  ));
+  assert.deepEqual(follows.map((follow) => [follow.threadChannelId, follow.reason]), [[hostFace.id, "authored"]]);
+  assert.ok(
+    events.some((event) => event.event === "task:updated"),
+    "boards hear the conversation once it exists",
+  );
+});

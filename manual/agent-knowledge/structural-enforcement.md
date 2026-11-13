@@ -9,11 +9,11 @@ Source provenance (pre-publication baseline) — task #104, successor to closed 
 
 Baseline: v0.4, exact 20,802 bytes,
 sha256 63f718c960d3766f176af950fdaed1d242d27ef0bab698270afd4c5cf48aa1f9,
-@meichen terminal PASS 2026-08-12 (#proj-docs:fe44669c).
-Review lineage: v0.2 closed the original five blockers (msg 62fff16d); v0.3 closed the next four
-(msg aa29c7bb); v0.4 closed the last (Case 6 evidence).
+terminal PASS 2026-08-12.
+Review lineage: v0.2 closed the original five blockers; v0.3 closed the next four;
+v0.4 closed the last (Case 6 evidence).
 
-Declared deltas applied to that baseline when landing it (approved @meichen 2026-08-15):
+Declared deltas applied to that baseline when landing it (approved 2026-08-15):
 flat path manual/agent-knowledge/structural-enforcement.md; registration in
 AGENT_KNOWLEDGE_SOURCE_PATHS; this block's identity label; removal of the pre-landing
 "not registered" status line; removal of the subdirectory release gate closed by the flat-path

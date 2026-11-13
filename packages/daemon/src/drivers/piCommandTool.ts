@@ -12,8 +12,10 @@ import {
   type BashOperations,
 } from "@earendil-works/pi-coding-agent";
 import { clearClockTimeout, setClockTimeout } from "@botiverse/raft-shared";
+import { Type } from "typebox";
 
 import { createWindowsPowerShellChildEnv } from "./windowsPowerShellEnv";
+import { defaultProcessTreeOps, type ProcessTreeEntry, type ProcessTreeOps } from "./processTree";
 import type { PiToolExecutionObserver } from "./piToolExecutionObservability";
 
 const POWERSHELL_STDIN_LOADER = [
@@ -38,7 +40,11 @@ export interface PiCommandToolDeps {
   platform?: NodeJS.Platform;
   spawn?: typeof spawn;
   killProcessTree?: (pid: number) => void;
+  /** Test seam: the descendant snapshot taken before the group kill. */
+  processTree?: Pick<ProcessTreeOps, "snapshotDescendants" | "killEntries">;
   observer?: PiToolExecutionObserver;
+  /** Test seam for DEFAULT_COMMAND_TIMEOUT_SECONDS. */
+  defaultTimeoutSeconds?: number;
 }
 
 function killWindowsProcessTree(pid: number): void {
@@ -256,7 +262,10 @@ export function createPiPowerShellOperations(
           });
         });
         if (signal?.aborted) throw new Error("aborted");
-        if (timedOut) throw new Error(`timeout:${timeout}`);
+        if (timedOut) {
+          deps.observer?.observeTimeout();
+          throw new Error(`timeout:${timeout}`);
+        }
         return { exitCode };
       } finally {
         if (timeoutHandle) clearClockTimeout(timeoutHandle);
@@ -267,10 +276,11 @@ export function createPiPowerShellOperations(
 }
 
 export function createPiPosixOperations(
-  deps: Pick<PiCommandToolDeps, "spawn" | "killProcessTree" | "observer"> = {},
+  deps: Pick<PiCommandToolDeps, "spawn" | "killProcessTree" | "processTree" | "observer"> = {},
 ): BashOperations {
   const spawnProcess = deps.spawn ?? spawn;
   const killProcessTree = deps.killProcessTree ?? killPosixProcessTree;
+  const processTree = deps.processTree ?? defaultProcessTreeOps;
 
   return {
     exec: async (command, cwd, { onData, signal, timeout, env }) => {
@@ -297,8 +307,19 @@ export function createPiPosixOperations(
 
       let timedOut = false;
       let timeoutHandle: unknown;
+      // task #25 step 2: the group kill misses a child that left the group
+      // (`setsid`), and once the shell dies that child can no longer be found
+      // from it. Read the tree first, then kill the group and the tree.
       const terminate = () => {
-        if (child.pid) killProcessTree(child.pid);
+        const pid = child.pid;
+        if (!pid) return;
+        void processTree.snapshotDescendants(pid).then(
+          (tree: ProcessTreeEntry[]) => {
+            killProcessTree(pid);
+            processTree.killEntries(tree);
+          },
+          () => killProcessTree(pid),
+        );
       };
       const onAbort = () => terminate();
       const observeData = (data: Buffer) => {
@@ -331,11 +352,62 @@ export function createPiPosixOperations(
         });
         const exitCode = await waitForChildProcess(child);
         if (signal?.aborted) throw new Error("aborted");
-        if (timedOut) throw new Error(`timeout:${timeout}`);
+        if (timedOut) {
+          deps.observer?.observeTimeout();
+          throw new Error(`timeout:${timeout}`);
+        }
         return { exitCode };
       } finally {
         if (timeoutHandle) clearClockTimeout(timeoutHandle);
         signal?.removeEventListener("abort", onAbort);
+      }
+    },
+  };
+}
+
+/**
+ * Pi's command tool has no default timeout, so a command that never exits
+ * (a dev server, a watcher, a prompt for input) keeps the agent's turn open
+ * forever. A call without a timeout gets this one; the process tree is killed
+ * when it runs out, like an explicit timeout. An explicit timeout is kept as
+ * passed, so long builds can still ask for more. Claude Code's 10 minute
+ * Bash limit moves the command to the background instead; Pi has no
+ * background path, so the limit kills.
+ */
+export const DEFAULT_COMMAND_TIMEOUT_SECONDS = 600;
+
+export function defaultCommandTimeoutHint(text: string, timeoutSeconds = DEFAULT_COMMAND_TIMEOUT_SECONDS): string {
+  return `${text}\n\nThe command was stopped by the default limit of ${timeoutSeconds} seconds for commands run without a timeout. ` +
+    "If it needs longer, run it again with an explicit timeout in seconds, " +
+    "or start it in the background with its output redirected to a file and check that file.";
+}
+
+type PiCommandTool = ReturnType<typeof createBashTool>;
+
+function withDefaultCommandTimeout(tool: PiCommandTool, timeoutSeconds: number): PiCommandTool {
+  const execute = tool.execute.bind(tool);
+  const parameters = tool.parameters;
+  const timedOutAtDefault = `Command timed out after ${timeoutSeconds} seconds`;
+  return {
+    ...tool,
+    description: `${tool.description} Commands run without a timeout are stopped after ${timeoutSeconds} seconds;` +
+      " pass a larger timeout for a command that needs longer.",
+    parameters: {
+      ...parameters,
+      properties: {
+        ...parameters.properties,
+        timeout: Type.Optional(Type.Number({ description: `Timeout in seconds (optional, default ${timeoutSeconds})` })),
+      },
+    },
+    execute: async (toolCallId, params, ...rest) => {
+      if (params.timeout !== undefined) return execute(toolCallId, params, ...rest);
+      try {
+        return await execute(toolCallId, { ...params, timeout: timeoutSeconds }, ...rest);
+      } catch (err) {
+        if (err instanceof Error && err.message.endsWith(timedOutAtDefault)) {
+          throw new Error(defaultCommandTimeoutHint(err.message, timeoutSeconds));
+        }
+        throw err;
       }
     },
   };
@@ -350,9 +422,9 @@ export function createPiCommandTool(
   const tool = createBashTool(cwd, {
     ...(platform === "win32"
       ? { operations: createPiPowerShellOperations(deps) }
-      : deps.observer
-        ? { operations: createPiPosixOperations(deps) }
-        : {}),
+      // Built-in and Pi both use Raft's POSIX operations (same `bash -c`
+      // spawn as Pi's own), so both get the tree kill above.
+      : { operations: createPiPosixOperations(deps) }),
     spawnHook: (spawnContext) => ({
       ...spawnContext,
       env: {
@@ -362,7 +434,7 @@ export function createPiCommandTool(
     }),
   });
 
-  const labeledTool = platform !== "win32"
+  const labeledTool = withDefaultCommandTimeout(platform !== "win32"
     ? tool
     : {
         ...tool,
@@ -370,7 +442,7 @@ export function createPiCommandTool(
         description:
           "Execute a Windows PowerShell 5.1 command in the current working directory. " +
           "Use PowerShell syntax, not Bash syntax. Standard output and standard error are returned.",
-      };
+      }, deps.defaultTimeoutSeconds ?? DEFAULT_COMMAND_TIMEOUT_SECONDS);
   if (!deps.observer) return labeledTool;
 
   const execute = labeledTool.execute.bind(labeledTool);

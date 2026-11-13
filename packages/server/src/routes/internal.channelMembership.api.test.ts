@@ -24,7 +24,8 @@ import { openTestApp } from "../test/integration/app";
 import { getDb } from "../db/index";
 import { channelAgents, channelHumans, channels, inboxNotificationFacts, jointChannels, jointChannelServers, messages, serverAgentMembers, servers, threadFollows, users } from "../db/schema";
 import { createServer } from "../services/serverService";
-import { createAgent, assignMachine } from "../services/agentService";
+import { createAgent } from "../services/agentService";
+import { placeAgentOnMachine } from "../test/agentMachineFixture";
 import { AgentOrchestrator } from "../services/agentOrchestrator";
 import { registerMachine, updateMachine } from "../services/machineService";
 import { mintAgentCredential } from "../services/agentCredentialService";
@@ -38,8 +39,9 @@ import {
 import { referenceAgentInboxChain } from "../test/agentInboxChainReference";
 import { recordInboxNotificationFacts } from "../services/inboxNotificationService";
 import * as taskService from "../services/taskService";
+import { revealAllChannelForTest } from "../test/allChannelFixture";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 const execFileAsync = promisify(execFile);
 const cliEntry = fileURLToPath(new URL("../../../cli/src/index.ts", import.meta.url));
@@ -57,13 +59,15 @@ async function seed() {
     })
     .returning();
   const server = await createServer("Internal Channel", "internal-channel", owner.id);
+  await revealAllChannelForTest(server.id);
   const agent = await createAgent(server.id, "channel-agent", { runtime: "claude" });
   const { machine, apiKey } = await registerMachine(server.id, owner.id, "channel-machine");
-  await assignMachine(agent.id, machine.id);
+  await placeAgentOnMachine(agent.id, machine.id);
   const { apiKey: agentApiKey } = await mintAgentCredential({
     agentId: agent.id,
     scopes: ["channels", "server"],
     name: "channel-membership-cli-e2e",
+    issuedVia: "human",
     createdByUserId: owner.id,
   });
   const channel = await channelService.createChannel(server.id, "focus-room", "Agent can leave this channel");
@@ -228,6 +232,7 @@ async function createAgentProfileEnv(baseUrl: string, serverId: string, agentId:
     agentId,
     scopes: ["read", "send", "server", "channels"],
     name: `cli-e2e-${randomUUID().slice(0, 8)}`,
+    issuedVia: "computer",
     createdByUserId: null,
   });
   fs.writeFileSync(path.join(profileDir, "credential.json"), JSON.stringify({
@@ -448,7 +453,7 @@ test("agent receive drops queued private-channel messages after membership remov
 });
 
 test("agent receive long-poll records timeout and failure outcomes", async () => {
-  const timeoutApp = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const timeoutApp = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const { agent, apiKey } = await seed();
     const sink = new MemoryTraceSink();
@@ -470,7 +475,7 @@ test("agent receive long-poll records timeout and failure outcomes", async () =>
     await timeoutApp.close();
   }
 
-  const failureApp = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const failureApp = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   const originalConsoleError = console.error;
   try {
     console.error = () => {};
@@ -573,7 +578,7 @@ test("agent internal route can leave its own regular channel without admin permi
   ]);
 });
 
-test("agent internal route can leave private channel and empty private channel is deleted", async ({ app }) => {
+test("agent internal route can leave private channel as its last member only with deleteIfLast, which deletes it", async ({ app }) => {
   const db = getDb();
   const { agent, apiKey, server } = await seed();
   const privateChannel = await channelService.createChannel(server.id, "agent-private-leave", undefined, "private");
@@ -596,11 +601,26 @@ test("agent internal route can leave private channel and empty private channel i
     purges.push({ agentId, channelIds: [parentChannelId, ...threadChannelIds], reason });
   };
 
-  const res = await fetch(`${app.baseUrl}/internal/agent/${agent.id}/channels/${privateChannel.id}/leave`, {
+  // An older CLI sends no body: as the last member it is refused and nothing changes.
+  const refused = await fetch(`${app.baseUrl}/internal/agent/${agent.id}/channels/${privateChannel.id}/leave`, {
     method: "POST",
     headers: machineHeaders(apiKey),
   });
+  assert.equal(refused.status, 409);
+  const refusal = await refused.json() as { code?: string; error?: string; suggestedNextAction?: string };
+  assert.equal(refusal.code, "last_member_deletes_channel");
+  assert.equal(refusal.error, "You are the last member of #agent-private-leave, a private channel: leaving would delete the channel and all its messages, and that can't be undone. Nothing changed.");
+  assert.ok(refusal.suggestedNextAction?.includes(`raft channel leave --target "#agent-private-leave" --delete-if-last`), refusal.suggestedNextAction);
+  assert.equal(await isAgentInChannel(privateChannel.id, agent.id), true, "the refused leave rolled back");
+  assert.deepEqual([events, purges], [[], []]);
+
+  const res = await fetch(`${app.baseUrl}/internal/agent/${agent.id}/channels/${privateChannel.id}/leave`, {
+    method: "POST",
+    headers: machineHeaders(apiKey),
+    body: JSON.stringify({ deleteIfLast: true }),
+  });
   assert.equal(res.status, 200, `expected 200, got ${res.status}`);
+  assert.deepEqual(await res.json(), { ok: true, channelDeleted: true });
   assert.equal(await isAgentInChannel(privateChannel.id, agent.id), false);
   assert.deepEqual(events, [
     {
@@ -656,7 +676,7 @@ test("agent server info includes current runtime machine context", async ({ app 
   assert.equal(ownAgent?.activityDetail, "");
 });
 
-test("agent server info hides archived channels and non-member private channels", async ({ app }) => {
+test("agent server info leaves archived channels out of the list but counts them; non-member private channels are hidden", async ({ app }) => {
   const { agent, apiKey, server, owner } = await seed();
   await getDb().update(servers).set({ plan: "founder" }).where(eq(servers.id, server.id));
   const archivedChannel = await channelService.createChannel(server.id, "archived-agent-list", "hidden from list_server");
@@ -681,6 +701,39 @@ test("agent server info hides archived channels and non-member private channels"
   assert.equal(byName.get("agent-private-member")?.type, "private", "agent list_server must identify private channels");
   assert.ok(!channelNames.includes("agent-private-outsider"), "agent must not see private channels it does not belong to");
   assert.ok(!channelNames.includes("archived-agent-list"), "agent list_server must not include archived channels");
+
+  // The Agent API surface: archived channels stay out of `channels`, are counted
+  // with the same visibility, and are returned (read-only rows) with ?archived=include.
+  // A private archived channel the agent is not in is neither listed nor counted;
+  // one it is in is both.
+  const archivedPublicUnjoined = await channelService.createChannel(server.id, "archived-public-unjoined", "old public room");
+  await channelService.archiveChannel(archivedPublicUnjoined.id, owner.id);
+  const archivedPrivateMember = await channelService.createChannel(server.id, "archived-private-member", undefined, "private");
+  await channelService.addAgent(archivedPrivateMember.id, agent.id);
+  await channelService.archiveChannel(archivedPrivateMember.id, owner.id);
+  const archivedPrivateOutsider = await channelService.createChannel(server.id, "archived-private-outsider", undefined, "private");
+  await channelService.archiveChannel(archivedPrivateOutsider.id, owner.id);
+  const { apiKey: readKey } = await mintAgentCredential({ agentId: agent.id, scopes: ["read"], name: "archived-list", issuedVia: "human", createdByUserId: owner.id });
+  const info = await fetch(`${app.baseUrl}/internal/agent-api/server`, { headers: { Authorization: `Bearer ${readKey}` } });
+  assert.equal(info.status, 200);
+  const infoBody = await info.json() as { channels: Array<{ name: string }>; archivedChannelCount?: number };
+  assert.ok(!infoBody.channels.some((channel) => channel.name.startsWith("archived-")), "archived channels stay out of the default list");
+  assert.equal(infoBody.archivedChannelCount, 3, "counts the visible archived channels only (not the private one the agent is not in)");
+  assert.equal("archivedChannels" in infoBody, false, "archived rows only when asked for");
+  const archivedRes = await fetch(`${app.baseUrl}/internal/agent-api/server?archived=include`, { headers: { Authorization: `Bearer ${readKey}` } });
+  assert.equal(archivedRes.status, 200);
+  const archivedBody = await archivedRes.json() as { channels: Array<{ name: string }>; archivedChannelCount?: number; archivedChannels?: Array<{ name: string; archived?: boolean; joined: boolean }> };
+  assert.ok(!archivedBody.channels.some((channel) => channel.name.startsWith("archived-")), "`channels` stays live-only");
+  assert.equal(archivedBody.archivedChannelCount, 3);
+  assert.deepEqual((archivedBody.archivedChannels ?? []).map((channel) => channel.name).sort(), ["archived-agent-list", "archived-private-member", "archived-public-unjoined"]);
+  assert.ok((archivedBody.archivedChannels ?? []).every((channel) => channel.archived === true), "every archived row says so");
+  assert.equal(archivedBody.archivedChannels?.find((channel) => channel.name === "archived-public-unjoined")?.joined, false);
+  // Read-only: no management action but unarchiving is offered on an archived row.
+  await getDb().update(serverAgentMembers).set({ role: "admin" }).where(and(eq(serverAgentMembers.serverId, server.id), eq(serverAgentMembers.agentId, agent.id)));
+  const asAdmin = await (await fetch(`${app.baseUrl}/internal/agent-api/server?archived=include`, { headers: { Authorization: `Bearer ${readKey}` } })).json() as { archivedChannels?: Array<{ name: string; channelCapabilities?: Record<string, boolean> }> };
+  const caps = asAdmin.archivedChannels?.find((channel) => channel.name === "archived-public-unjoined")?.channelCapabilities ?? {};
+  assert.equal(caps.archiveChannels, true, "an admin can still unarchive");
+  assert.deepEqual(Object.entries(caps).filter(([key, value]) => key !== "archiveChannels" && value).map(([key]) => key), [], "nothing else applies to an archived channel");
 });
 
 test("agent internal route can unfollow its own thread attention row", async ({ app }) => {
@@ -828,7 +881,7 @@ test("CLI e2e: parent-muted followed thread travels from message send through se
 test("agent internal route can unfollow a followed thread without parent membership", async ({ app }) => {
   const { server, machine, apiKey, channel, owner } = await seed();
   const listener = await createAgent(server.id, "thread-listener", { runtime: "claude" });
-  await assignMachine(listener.id, machine.id);
+  await placeAgentOnMachine(listener.id, machine.id);
   const { thread } = await createFollowedThread(channel.id, owner.id, listener.id);
   assert.equal(await isAgentFollowingThread(thread.id, listener.id), true);
   assert.equal(await isAgentInChannel(channel.id, listener.id), false);
@@ -851,8 +904,9 @@ test("agent internal route rejects non-thread unfollow targets", async ({ app })
     body: JSON.stringify({ thread: "#focus-room" }),
   });
   assert.equal(res.status, 400, `expected 400, got ${res.status}`);
-  const body = (await res.json()) as { error?: string };
-  assert.match(body.error ?? "", /Target must be a thread/);
+  const body = (await res.json()) as { code?: string; error?: string };
+  assert.equal(body.code, "not_a_thread");
+  assert.match(body.error ?? "", /not a thread/);
 });
 
 test("agent internal route can join a visible public channel", async ({ app }) => {
@@ -1435,7 +1489,7 @@ test("CLI e2e: channel archive and unarchive enforce admin authority and restore
     await assertSlockCliFails(
       ["channel", "archive", "--target", "#join-public"],
       agentProfile.env,
-      /Channel not found/,
+      /no channel you can see matches that target/,
     );
     const [privateAfterOutsiderDenial] = await getDb()
       .select({ archivedAt: channels.archivedAt })
@@ -1731,9 +1785,15 @@ test("agent internal route cannot self-join private channels", async ({ app }) =
     method: "POST",
     headers: machineHeaders(apiKey),
   });
-  assert.equal(res.status, 403, `expected 403, got ${res.status}`);
-  const body = (await res.json()) as { error?: string };
-  assert.match(body.error ?? "", /Private channels require an invitation/);
+  // The agent is not in this private channel, so it cannot see it: the route must
+  // answer exactly as it does for an id that does not exist (#14131).
+  const unknown = await fetch(`${app.baseUrl}/internal/agent/${agent.id}/channels/${randomUUID()}/join`, {
+    method: "POST",
+    headers: machineHeaders(apiKey),
+  });
+  assert.equal(unknown.status, 404, `expected 404 for an unknown id, got ${unknown.status}`);
+  assert.equal(res.status, 404, `expected 404, got ${res.status}`);
+  assert.equal(await res.text(), await unknown.text(), "body must be byte-identical to an unknown id's");
   assert.equal(await isAgentInChannel(privateChannel.id, agent.id), false);
 });
 
@@ -1745,9 +1805,15 @@ test("agent internal route cannot self-join joint channels", async ({ app }) => 
     method: "POST",
     headers: machineHeaders(apiKey),
   });
-  assert.equal(res.status, 403, `expected 403, got ${res.status}`);
-  const body = (await res.json()) as { error?: string };
-  assert.match(body.error ?? "", /Joint channels require an invitation/);
+  // The agent is not in this joint channel, so it cannot see it: the route must
+  // answer exactly as it does for an id that does not exist (#14131).
+  const unknown = await fetch(`${app.baseUrl}/internal/agent/${agent.id}/channels/${randomUUID()}/join`, {
+    method: "POST",
+    headers: machineHeaders(apiKey),
+  });
+  assert.equal(unknown.status, 404, `expected 404 for an unknown id, got ${unknown.status}`);
+  assert.equal(res.status, 404, `expected 404, got ${res.status}`);
+  assert.equal(await res.text(), await unknown.text(), "body must be byte-identical to an unknown id's");
   assert.equal(await isAgentInChannel(jointChannel.id, agent.id), false);
 });
 
@@ -1768,7 +1834,7 @@ test("agent internal route cannot join archived public channels", async ({ app }
 test("agent reactions cloak private message existence from non-member agents", async ({ app }) => {
   const { server, agent, machine, apiKey, owner } = await seed();
   const outsiderAgent = await createAgent(server.id, "reaction-outsider-agent", { runtime: "claude" });
-  await assignMachine(outsiderAgent.id, machine.id);
+  await placeAgentOnMachine(outsiderAgent.id, machine.id);
   const privateChannel = await channelService.createChannel(server.id, "agent-reaction-private", undefined, "private");
   await channelService.addAgent(privateChannel.id, agent.id);
   const chatMessage = await createMessage(privateChannel.id, "user", owner.id, "private agent reaction target");
@@ -1850,7 +1916,6 @@ test("agent resolves, creates, and claims joint tasks through its local projecti
   const peerProjection = await channelService.createChannel(peerServer.id, "botiverse-scopedb", undefined, "joint");
   await channelService.addHuman(hostProjection.id, hostOwner.id);
   await channelService.addHuman(peerProjection.id, peerOwner.id);
-  await channelService.addAgent(peerProjection.id, peerAgent.id);
 
   const [joint] = await db.insert(jointChannels).values({
     canonicalChannelId: canonical.id,
@@ -1873,6 +1938,7 @@ test("agent resolves, creates, and claims joint tasks through its local projecti
       joinedByUserId: peerOwner.id,
     },
   ]);
+  await channelService.addAgent(peerProjection.id, peerAgent.id);
 
   const message = await createMessage(canonical.id, "user", hostOwner.id, "joint task candidate");
 
@@ -1925,8 +1991,9 @@ test("GET /agent/:id/tasks validates the ?status filter", async ({ app }) => {
   // An unknown status is rejected (was silently passed through as `any`).
   const bad = await fetch(`${base}&status=bogus`, { headers: machineHeaders(apiKey) });
   assert.equal(bad.status, 400, `expected 400 for invalid status, got ${bad.status}`);
-  const badBody = await bad.json() as { error: string };
-  assert.equal(badBody.error, "Invalid status value");
+  const badBody = await bad.json() as { code?: string; error: string };
+  assert.equal(badBody.code, "invalid_status");
+  assert.match(badBody.error, /isn't a task status/);
 
   // A repeated ?status param (Express parses to an array) must also fail
   // closed — a present non-string value can't bypass the filter validation.
@@ -1944,7 +2011,8 @@ test("agent internal route cannot leave #all", async ({ app }) => {
     headers: machineHeaders(apiKey),
   });
   assert.equal(res.status, 403, `expected 403, got ${res.status}`);
-  const body = (await res.json()) as { error?: string };
-  assert.match(body.error ?? "", /#all channel/);
+  const body = (await res.json()) as { error?: string; code?: string };
+  assert.equal(body.code, "all_channel_membership_fixed");
+  assert.equal(body.error, "Everyone on the server is in #all, so nobody can leave it.");
   assert.equal(await isAgentInChannel(allChannel.id, agent.id), false);
 });

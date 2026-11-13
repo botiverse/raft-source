@@ -1,5 +1,5 @@
 import * as serverService from "../services/serverService";
-import { actorHasServerCapabilityInServer } from "../lib/actorPermissions";
+import { actorHasServerCapabilityInServer, getActorServerRoleInServer } from "../lib/actorPermissions";
 import { addTraceEvent } from "../tracing/semanticTrace";
 import { agentServerRoleRequiredBody } from "../lib/agentServerRoleRequired";
 
@@ -86,7 +86,9 @@ export async function updateServerProfileForAgent(input: {
     return { status: 400, body: { error: "At least one field is required" } };
   }
 
-  const updated = await serverService.updateServerProfile(input.serverId, updates);
+  const updated = await serverService.updateServerProfile(input.serverId, updates, {
+    audit: await agentServerProfileAudit(input.actor, input.serverId),
+  });
   if (!updated) {
     addTraceEvent("agent_server_profile.request.failed", {
       reason: "server_not_found",
@@ -99,4 +101,16 @@ export async function updateServerProfileForAgent(input: {
     hide_humans_changed: updates.hideHumansFromMembers !== undefined,
   });
   return { status: 200, body: updated };
+}
+
+/** Audit context for an agent's server-profile write: the agent and its live server role. */
+export async function agentServerProfileAudit(
+  actor: AgentServerManageActor,
+  serverId: string,
+): Promise<serverService.ServerProfileAuditContext> {
+  return {
+    actor: { type: "agent", id: actor.id },
+    source: "api",
+    agentServerRole: await getActorServerRoleInServer(serverId, "agent", actor.id),
+  };
 }

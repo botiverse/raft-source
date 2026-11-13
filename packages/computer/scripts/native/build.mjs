@@ -334,6 +334,7 @@ const SEA_SOURCE_ALIASES = {
   "@botiverse/raft-daemon/core": join(DAEMON_ROOT, "src", "core.ts"),
   "@botiverse/raft-daemon/bundled-cli": join(DAEMON_ROOT, "src", "bundledRaftCli.ts"),
   "@botiverse/raft-daemon/runtime-detection-child": join(DAEMON_ROOT, "src", "runtimeDetectionChild.ts"),
+  "@botiverse/raft-daemon/context-view-restore-child": join(DAEMON_ROOT, "src", "agentContextView", "contextViewRestoreChild.ts"),
   "@botiverse/raft/dist/index.js": join(CLI_ROOT, "src", "index.ts"),
 };
 
@@ -344,6 +345,11 @@ const SEA_SOURCE_ALIASES = {
 // languages only".
 const SEA_UNREACHABLE_ALIASES = {
   "highlight.js/lib/index.js": join(HERE, "sea-empty-module.cjs"),
+  // #oar-raft:#10: a SEA never advertises Cursor on OAR (no node_modules for
+  // the SDK's native binaries, and OAR cannot start its child from a SEA). The
+  // daemon never imports the SDK (OAR's child does, from a resolved file URL);
+  // this keeps a future import from pulling it into the bundle.
+  "@cursor/sdk": join(HERE, "sea-empty-module.cjs"),
 };
 
 // Each lazily loaded package (seaEntries.mjs SEA_LAZY_ASSETS) is replaced in
@@ -379,7 +385,7 @@ function assertLazyShimsDynamicOnly(result, shims, where) {
 // esbuild options both Computer bundles share. Each bundle function spells out
 // its entry, `bundle` and `packages` itself: carrier-version-closure-gate reads
 // them from bundleCjs's own body.
-function computerBundleOptions({ version, daemonVersion, cliVersion, minify }) {
+function computerBundleOptions({ version, daemonVersion, cliVersion, buildSha, minify }) {
   return {
     platform: "node",
     format: "cjs",
@@ -389,6 +395,8 @@ function computerBundleOptions({ version, daemonVersion, cliVersion, minify }) {
       __RAFT_COMPUTER_VERSION__: JSON.stringify(version),
       __RAFT_DAEMON_VERSION__: JSON.stringify(daemonVersion),
       __RAFT_CLI_VERSION__: JSON.stringify(cliVersion),
+      // Absent on local builds, so the identifier stays undefined at runtime.
+      ...(buildSha ? { __RAFT_COMPUTER_BUILD_SHA__: JSON.stringify(buildSha) } : {}),
       // The source is ESM and uses `import.meta.url` (e.g. service.ts's
       // top-level `createRequire(import.meta.url)` for SEA detection). In CJS
       // output esbuild lowers `import.meta.url` to `undefined`, so
@@ -423,11 +431,11 @@ function bundledInputs(result) {
 // with the daemon and the agent CLI left external, so none of their source is
 // resident in those processes; the SEA loader turns a stray daemon import into
 // a routing error.
-async function bundleLiteCjs({ version, daemonVersion, cliVersion, workDir, minify = true }) {
+async function bundleLiteCjs({ version, daemonVersion, cliVersion, buildSha, workDir, minify = true }) {
   const { build } = await import("esbuild");
   const outfile = join(workDir, "computer-lite-bundle.cjs");
   const result = await build({
-    ...computerBundleOptions({ version, daemonVersion, cliVersion, minify }),
+    ...computerBundleOptions({ version, daemonVersion, cliVersion, buildSha, minify }),
     entryPoints: [join(COMPUTER_ROOT, "src", "index.ts")],
     bundle: true,
     packages: undefined,
@@ -484,11 +492,11 @@ async function bundleKimiCjs({ workDir, minify = true }) {
 
 // The full bundle: the runner (`__run`) and the other hidden entries that run
 // daemon code (seaEntries.mjs SEA_RUNNER_ENTRIES).
-async function bundleCjs({ version, daemonVersion, cliVersion, workDir, minify = true }) {
+async function bundleCjs({ version, daemonVersion, cliVersion, buildSha, workDir, minify = true }) {
   const { build } = await import("esbuild");
   const outfile = join(workDir, "computer-bundle.cjs");
   const result = await build({
-    ...computerBundleOptions({ version, daemonVersion, cliVersion, minify }),
+    ...computerBundleOptions({ version, daemonVersion, cliVersion, buildSha, minify }),
     entryPoints: [join(COMPUTER_ROOT, "src", "index.ts")],
     bundle: true,
     // SEA has no node_modules — inline EVERYTHING including @botiverse/raft-daemon.
@@ -734,6 +742,62 @@ function smokeNativeBinary({ outBinary, platform, arch, version, daemonVersion, 
   }
   console.log(`[verify] ${outBinary} kimi SDK asset loaded`);
 
+  // The daemon's View Context restore child re-executes the binary: a request on
+  // stdin, a header line and the result body on stdout. A missing file exercises
+  // the routing and the protocol; the heap limit goes through NODE_OPTIONS, which
+  // a SEA must honor or a large session would take the machine's memory, so the
+  // limit the child reports is checked too.
+  const restoreRequest = JSON.stringify({
+    runtime: "claude",
+    file: join(tmpdir(), "raft-native-smoke-no-such-session.jsonl"),
+    allowedRoots: [tmpdir()],
+    offset: 0,
+    messageId: "smoke",
+    sessionId: "smoke",
+    maxBytes: 1024,
+  });
+  const restoreResult = spawnSync(outBinary, ["__restore-context-view"], {
+    encoding: "utf8",
+    windowsHide: true,
+    timeout: 30_000,
+    input: restoreRequest,
+    env: { ...smokeEnv, NODE_OPTIONS: "--max-old-space-size=512" },
+  });
+  const [restoreHeader, restoreBody] = (restoreResult.stdout ?? "").split("\n");
+  // The reported limit also counts the young generation (512 reads about 700).
+  // V8's own default on a build machine is 2 GiB or more, so past 1 GiB means
+  // NODE_OPTIONS was ignored.
+  const restoreHeapLimit = /"child_heap_limit_mb":(\d+)/.exec(restoreHeader ?? "")?.[1];
+  if (
+    restoreResult.status !== 0
+    || restoreBody !== JSON.stringify({ ok: false, reason: "not_found" })
+    || !restoreHeader?.includes('"outcome":"not_found"')
+    || !(Number(restoreHeapLimit) >= 512 && Number(restoreHeapLimit) <= 1024)
+  ) {
+    throw new Error(
+      `native context view restore smoke failed with ${restoreResult.status ?? restoreResult.signal}: ` +
+        `${restoreResult.stderr || restoreResult.stdout || restoreResult.error}`,
+    );
+  }
+  console.log(`[verify] ${outBinary} context view restore child answered, heap limit ${restoreHeapLimit} MB`);
+
+  // RFC 060: the OAR host loads OAR's runtimes (grok, qwen, qoder, codebuddy), their
+  // session paths and the observe entry lazily; load them from the binary as a
+  // launch would.
+  const oarResult = spawnSync(outBinary, ["__verify-bundled-oar"], {
+    encoding: "utf8",
+    windowsHide: true,
+    timeout: 30_000,
+    env: smokeEnv,
+  });
+  if (oarResult.status !== 0 || oarResult.stdout.trim() !== "oar-bundle-ok") {
+    throw new Error(
+      `native OAR host smoke failed with ${oarResult.status ?? oarResult.signal}: ` +
+        `${oarResult.stderr || oarResult.stdout || oarResult.error}`,
+    );
+  }
+  console.log(`[verify] ${outBinary} OAR host runtimes loaded`);
+
   // The agent CLI path runs from its own embedded asset (seaCliEntry.ts).
   const cliResult = spawnSync(outBinary, ["__cli", "--version"], {
     encoding: "utf8",
@@ -800,6 +864,9 @@ async function main() {
   const version = args.version || pkg.version;
   const daemonVersion = daemonPkg.version;
   const cliVersion = cliPkg.version;
+  // The commit Actions checked out; tells a staging build from the release
+  // that reports the same version. Unset outside CI.
+  const buildSha = process.env.GITHUB_SHA?.trim() || undefined;
   const platform = args.platform || process.platform;
   const arch = args.arch || process.arch;
   const nodeVersion = args["node-version"] || process.versions.node;
@@ -839,8 +906,8 @@ async function main() {
   await mkdir(outDir, { recursive: true });
   await mkdir(workDir, { recursive: true });
 
-  const bundlePath = await bundleCjs({ version, daemonVersion, cliVersion, workDir, minify: !noMinify });
-  const liteBundlePath = await bundleLiteCjs({ version, daemonVersion, cliVersion, workDir, minify: !noMinify });
+  const bundlePath = await bundleCjs({ version, daemonVersion, cliVersion, buildSha, workDir, minify: !noMinify });
+  const liteBundlePath = await bundleLiteCjs({ version, daemonVersion, cliVersion, buildSha, workDir, minify: !noMinify });
   const kimiBundlePath = await bundleKimiCjs({ workDir, minify: !noMinify });
   if (bundleOnly) {
     console.log(

@@ -54,6 +54,8 @@ test("buildWebEventRecord produces a valid web-surface event with closed-set att
   assert.ok("releaseSha" in attrs);
   assert.ok("deploymentEnv" in attrs);
   assert.ok("appVersion" in attrs);
+  assert.notEqual(attrs.appVersion, "unknown", "falls back to the package version");
+  assert.equal(attrs.clientPlatform, "browser");
   assert.ok("webAssetId" in attrs);
   // undefined attrs are dropped, not serialized as undefined
   assert.equal("authVerdict" in attrs, false);

@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -65,7 +65,8 @@ describe("measure-load-heap", () => {
       "packages/app/src/cli.ts": 2,
       "packages/lib/src/core.ts": 3,
     });
-    expect(result.source.bytesPerChar).toBe(1);
+    // zod 4.6 ships non-Latin-1 text (`…`, `—`), so the bundle's cost follows its actual characters.
+    expect(result.source).toEqual(sourceStringCost(readFileSync(bundlePath, "utf8")));
   });
 
   it("still counts phases on a whitespace-minified bundle, without attribution", () => {
@@ -83,6 +84,9 @@ describe("measure-load-heap", () => {
     expect(() => instrument("console.log(1)")).toThrow(/zod \$constructor not found/);
     const zodLike = "function $constructor(name, init) {\n  const inst = params?.Parent ? new Definition() : this;\n}\n";
     expect(() => instrument(zodLike, [{ name: "x", module: "packages/x/src/x.ts" }])).toThrow(/not lazily wrapped/);
+    // zod 4.6 builds the Parent case through a helper instead of `new Definition()`.
+    const zod46Like = "function $constructor(name, init) {\n  const inst = params?.Parent ? newError(Definition) : this;\n}\n";
+    expect(() => instrument(zod46Like, [{ name: "x", module: "packages/x/src/x.ts" }])).toThrow(/not lazily wrapped/);
   });
 
   it("charges two bytes per char once any char is beyond Latin-1", () => {

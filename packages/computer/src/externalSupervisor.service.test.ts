@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { vi } from "vitest";
 import * as externalInstaller from "./externalInstaller";
 import { readLastRemoteUpgradeReceipt } from "./externalInstaller";
+import { collectRemoteUpgradeSteps } from "./remoteUpgradeTrace";
 import { runService } from "./service";
 import { readSupervisorRecord, supervisorRecordPath, writeSupervisorRecord, type ExternalSupervisorRecord, type SystemctlRunner } from "./externalSupervisor";
 import { ServiceClientError } from "./lib/types";
@@ -44,9 +45,19 @@ async function withServiceHome<T>(fn: (home: string) => Promise<T>): Promise<T> 
 const remote = (requestId: string, targetVersion?: string) =>
   ({ scope: "remote" as const, requestId, originServerId: "test-server", trigger: "web" as const, ...(targetVersion ? { targetVersion } : {}) });
 
-test("task #917: under systemd with KillMode=control-group a remote upgrade is refused and settled as this request's failed receipt", async () => {
+/** Resolve "the installer", let the service's pre-spawn check run, then report a pid. */
+function launchThroughVeto() {
+  return vi.spyOn(externalInstaller, "launchInstallerDetached").mockImplementation(
+    async (_home, _args, _id, _env, stats, beforeSpawn) => {
+      if (stats) stats.resolved = true;
+      await beforeSpawn?.("/fake/raft-computer-installer");
+      return 4321;
+    });
+}
+
+test("task #917: under systemd with KillMode=control-group an installer older than 0.3.21 is refused before spawn and settled as this request's failed receipt", async () => {
   await withServiceHome(async (home) => {
-    const launch = vi.spyOn(externalInstaller, "launchInstallerDetached").mockResolvedValue(4321);
+    const launch = launchThroughVeto();
     const { runner, calls } = systemctlAnswering("control-group");
     try {
       let exercised = false;
@@ -54,22 +65,74 @@ test("task #917: under systemd with KillMode=control-group a remote upgrade is r
         stopAfterMutationsReady: true,
         detectSystemdSupervisorFn: async () => RECORD,
         systemctl: runner,
+        readInstallerVersionFn: async () => "0.3.20",
         onMutationsReady: async (mutations) => {
           await assert.rejects(
             () => mutations.upgradeStart!(remote("req-1", "1.0.33")),
-            (err: unknown) => err instanceof ServiceClientError && err.code === "UPGRADE_START_REJECTED" && /KillMode=process/.test(err.message),
+            (err: unknown) => err instanceof ServiceClientError && err.code === "UPGRADE_START_REJECTED" && /KillMode=process/.test(err.message) && /0\.3\.20/.test(err.message),
           );
           exercised = true;
         },
       });
       assert.equal(exercised, true);
-      assert.equal(launch.mock.calls.length, 0, "the installer is never launched behind a refusal");
       assert.deepEqual(calls, ["user:show -P KillMode raft-computer.service"]);
       assert.deepEqual(await readSupervisorRecord(home), RECORD, "the service records who supervises it");
       const receipt = await readLastRemoteUpgradeReceipt(home);
       assert.equal(receipt?.targetVersion, "1.0.33");
       assert.equal(receipt?.outcome, "failed");
       assert.match(receipt?.reason ?? "", /raft-computer\.service with KillMode=control-group/);
+      const steps = (await collectRemoteUpgradeSteps(home, { serverId: "test-server" })).events;
+      assert.deepEqual(steps.map((event) => [event.step, event.outcome, event.errorCode, event.killMode]), [
+        ["received", "ok", undefined, "control-group"],
+        ["download", "ok", undefined, undefined],
+        ["installer_spawned", "failed", "unsafe_kill_mode", "control-group"],
+      ]);
+    } finally {
+      launch.mockRestore();
+    }
+  });
+});
+
+test("installer 0.3.21: under systemd with KillMode=control-group an installer that leaves the unit itself is launched", async () => {
+  await withServiceHome(async (home) => {
+    const launch = launchThroughVeto();
+    try {
+      await runService({
+        stopAfterMutationsReady: true,
+        detectSystemdSupervisorFn: async () => RECORD,
+        systemctl: systemctlAnswering("control-group").runner,
+        readInstallerVersionFn: async () => "0.3.21",
+        onMutationsReady: async (mutations) => {
+          assert.deepEqual(await mutations.upgradeStart!(remote("req-3", "1.0.33")), { status: "started", upgradeId: "req-3", targetVersion: "1.0.33" });
+        },
+      });
+      assert.equal(launch.mock.calls.length, 1);
+      const steps = (await collectRemoteUpgradeSteps(home, { serverId: "test-server" })).events;
+      assert.deepEqual(steps.map((event) => [event.step, event.outcome, event.killMode]).slice(0, 3), [
+        ["received", "ok", "control-group"],
+        ["download", "ok", undefined],
+        ["installer_spawned", "ok", "control-group"],
+      ]);
+    } finally {
+      launch.mockRestore();
+    }
+  });
+});
+
+test("task #917: an installer whose version cannot be read counts as old under an unsafe KillMode", async () => {
+  await withServiceHome(async () => {
+    const launch = launchThroughVeto();
+    try {
+      await runService({
+        stopAfterMutationsReady: true,
+        detectSystemdSupervisorFn: async () => RECORD,
+        systemctl: systemctlAnswering("control-group").runner,
+        readInstallerVersionFn: async () => null,
+        onMutationsReady: async (mutations) => {
+          await assert.rejects(() => mutations.upgradeStart!(remote("req-4")),
+            (err: unknown) => err instanceof ServiceClientError && err.code === "UPGRADE_START_REJECTED" && /unknown version/.test(err.message));
+        },
+      });
     } finally {
       launch.mockRestore();
     }

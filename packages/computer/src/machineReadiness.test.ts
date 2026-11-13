@@ -138,6 +138,7 @@ test("collectMachineFacts keeps raw evidence and prefers a live fallback pid", a
       writtenAt: "2026-07-22T00:00:00.000Z",
     }),
     readConnectionEvidence: () => ({ pid: 202, connectedAt: 1_753_142_400_000 }),
+    readLockConflict: () => null,
   });
 
   assert.deepEqual(collected.managedServerIds, [SERVER_A]);
@@ -152,5 +153,36 @@ test("collectMachineFacts keeps raw evidence and prefers a live fallback pid", a
       writtenAt: "2026-07-22T00:00:00.000Z",
     },
     connectionEvidence: { pid: 202, connectedAt: 1_753_142_400_000 },
+    lockConflict: null,
   }]);
+});
+
+test("a lock conflict recorded by the live service is runner-lock-conflict; another service's, or an attested runner, is not", () => {
+  const conflict = { servicePid: 900, ownerPid: 10424, lockPath: "/home/me/.slock/machines/m/daemon.lock", recordedAt: 1 };
+  const adopted = runner({ pid: 10424, versionEvidence: null, connectionEvidence: null, lockConflict: conflict });
+  const verdict = (machineFacts: MachineFacts, servicePid?: number) =>
+    machineReadiness(machineFacts, { targetServerIds: [SERVER_A], expectedVersion: EXPECTED_VERSION, ...(servicePid !== undefined ? { servicePid } : {}) });
+
+  assert.deepEqual(verdict(facts(adopted), 900).reasons, [
+    { code: "runner-lock-conflict", serverId: SERVER_A, ownerPid: 10424, lockPath: conflict.lockPath },
+  ]);
+  // Written by an earlier service, or read without a service: the plain reason.
+  assert.deepEqual(verdict(facts(adopted), 901).reasons.map((reason) => reason.code), ["runner-unattested"]);
+  assert.deepEqual(verdict(facts(adopted)).reasons.map((reason) => reason.code), ["runner-unattested"]);
+  // The pid is no longer the owner the service deferred to.
+  assert.deepEqual(
+    verdict(facts(runner({ pid: 555, versionEvidence: null, connectionEvidence: null, lockConflict: conflict })), 900).reasons.map((reason) => reason.code),
+    ["runner-unattested"],
+  );
+  // The adopted owner turns out to be this server's attested runner: judged as one.
+  assert.equal(verdict(facts(runner({ lockConflict: { ...conflict, ownerPid: 101 } })), 900).ready, true);
+  // No live owner could be named and the runner is parked.
+  assert.deepEqual(
+    verdict(facts(runner({ pid: null, alive: false, lockConflict: { ...conflict, ownerPid: null } })), 900).reasons,
+    [{ code: "runner-lock-conflict", serverId: SERVER_A, ownerPid: null, lockPath: conflict.lockPath }],
+  );
+  assert.deepEqual(
+    verdict(facts(runner({ pid: null, alive: false, lockConflict: conflict })), 900).reasons.map((reason) => reason.code),
+    ["runner-absent"],
+  );
 });

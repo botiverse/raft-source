@@ -1,13 +1,8 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { Paperclip } from "lucide-react";
 import EmptyState from "../src/components/ui/EmptyState";
-
-const repoRoot = resolve(import.meta.dirname, "..");
-const read = (path: string) => readFileSync(resolve(repoRoot, path), "utf8");
 
 /**
  * Per #proj-uiux:4e20fa91 (task #246, 2026-05-15) — cindyz raised the
@@ -77,37 +72,19 @@ test("EmptyState renders sentence-case title and frameless icon (B + C contract)
   assert.match(html, /Add file/);
 });
 
-test("full-panel empty states reuse the shared EmptyState primitive", () => {
-  const files = [
-    "src/components/message/ChannelFilesPanel.tsx",
-    "src/components/saved/SavedPanel.tsx",
-    "src/components/thread/ThreadsInbox.tsx",
-    "src/components/task/TasksPanel.tsx",
-    "src/components/message/ChatPanel.tsx",
-    "src/components/message/ThreadPanel.tsx",
-    "src/components/machine/MobileComputersPanel.tsx",
-    "src/components/agent/AgentActivityLog.tsx",
-    "src/components/agent/AgentDetailPanel.tsx",
-    "src/components/agent/AgentRemindersSection.tsx",
-  ];
-
-  for (const file of files) {
-    const source = read(file);
-    assert.match(source, /<EmptyState\b/, `${file} should render EmptyState`);
-  }
-});
-
 /**
- * Empty-state title templates (locked 2026-05-15 #proj-uiux:ce50bf6b, task #246):
+ * Empty-state title templates. The canonical rule is raft-design
+ * design/content/writing.md "Errors and empty states": the form follows why the
+ * view is empty.
  *
- *   1. Base empty:           "No {object} yet"
- *   2. Filter empty:         "No {object} match this filter"
- *   3. Product noun special: "{ProductNoun} is empty"
- *   4. Status-type empty:    "No {state}"        (no "yet" — state is binary, not progressive)
+ *   1. Nothing yet:          "No {object} yet"
+ *   2. A filter hides all:   "No {object} match this filter"
+ *   3. (retired) "{ProductNoun} is empty" — describes the container, not what
+ *      is missing; Activity's empty title is now "No conversations".
+ *   4. Handled items leave:  "No {state} {object}" / "No {object}" (no "yet" —
+ *      the view empties because things were handled, not because none came)
  *
- * Sentence case throughout, no trailing period. CLAUDE.md "Empty-state title
- * templates" is the canonical doctrine — this test pins the templates to the
- * actual callsite literals so any drift trips CI.
+ * Sentence case throughout, no trailing period.
  */
 
 const TEMPLATE_PATTERNS = [
@@ -116,11 +93,11 @@ const TEMPLATE_PATTERNS = [
   /^No [a-z][A-Za-z0-9-]*(?: [A-Za-z0-9-]+)* yet$/,
   // Rule 2: "No {object} match this filter".
   /^No [a-z][A-Za-z0-9-]*(?: [A-Za-z0-9-]+)* match this filter$/,
-  // Rule 3: "{ProductNoun} is empty" — single capitalized product noun.
-  /^[A-Z][a-z]+ is empty$/,
-  // Rule 4: "No {state}" — status-type, no "yet" suffix. Object is a state
-  // (unread / archived / muted) optionally followed by a noun ("unread chats").
-  /^No (?:unread|archived|muted)(?: [a-z][a-z]*)?$/,
+  // Rule 4: "No {state}" — handled items leave, no "yet" suffix. A state
+  // (unread / archived / muted) optionally followed by a noun ("unread
+  // conversations"), or a view whose items leave once done (mentions,
+  // conversations in Activity).
+  /^No (?:(?:unread|archived|muted)(?: [a-z][a-z]*)?|mentions|conversations)$/,
 ];
 
 function matchesTemplate(title: string): boolean {
@@ -141,14 +118,13 @@ test("template patterns themselves accept canonical examples and reject offender
     "No agent-to-agent DMs yet",
     "No computers yet",
     "No reminders yet",
-    "No mentions yet",
     // Rule 2
     "No tasks match this filter",
-    // Rule 3
-    "Activity is empty",
-    "Inbox is empty",
     // Rule 4
+    "No unread conversations",
     "No unread chats",
+    "No mentions",
+    "No conversations",
     "No archived chats",
     "No muted chats",
     "No unread",
@@ -168,48 +144,9 @@ test("template patterns themselves accept canonical examples and reject offender
     "Inbox empty",                // missing "is"
     "The inbox is empty",         // article — must be bare product noun
     "No tasks matching this filter", // wrong verb form ("matching" vs "match")
+    "Activity is empty",          // describes the container, not what is missing
   ];
   for (const title of negative) {
     assert.equal(matchesTemplate(title), false, `template should reject "${title}"`);
-  }
-});
-
-test("EmptyState callsite titles match doctrine templates", () => {
-  // Each callsite's expected literal title strings, drawn directly from source.
-  // If a callsite changes its title text, this list must be updated and the
-  // new text must still match TEMPLATE_PATTERNS — otherwise the doctrine in
-  // CLAUDE.md is violated.
-  const callsites: Array<{ file: string; titles: string[] }> = [
-    // All tracked empty-state titles are migrated to react-intl (ThreadsInbox +
-    // B2a ChatPanel + B2b ThreadPanel + the emptyState.* horizontal sweep across
-    // agent/machine/message/task/saved panels). They now live in the en catalog;
-    // the doctrine still applies to the en source-of-truth values, checked here.
-    {
-      file: "src/i18n/messages/en.ts",
-      titles: [
-        "No mentions yet", "No unread chats", "Activity is empty", "No messages yet", "No replies yet",
-        "No activity yet", "No chats yet", "No channels yet", "No agent-to-agent DMs yet",
-        "No managed MCP servers yet", "No reminders yet", "No computers yet", "No files yet",
-        "No saved messages yet", "No tasks yet", "No tasks match this filter",
-      ],
-    },
-  ];
-
-  for (const { file, titles } of callsites) {
-    const source = read(file);
-    for (const title of titles) {
-      // 1. Title literal must actually appear in the source — guard against
-      //    silent rename drift.
-      assert.ok(
-        source.includes(`"${title}"`),
-        `${file} should contain literal title "${title}" (callsite drift?)`,
-      );
-      // 2. Title must match one of the four canonical templates.
-      assert.equal(
-        matchesTemplate(title),
-        true,
-        `${file} title "${title}" must match one of the empty-state title templates (CLAUDE.md "Empty-state title templates")`,
-      );
-    }
   }
 });

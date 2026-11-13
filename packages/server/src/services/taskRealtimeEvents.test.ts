@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
 import {
   emitTaskCreated,
   emitTaskDeleted,
@@ -59,6 +58,10 @@ test("task:created emits only the explicit task-domain allowlist", () => {
     tasks: [{
       id: "task-allowlist",
       messageId: "task-allowlist",
+      hostMessageId: null,
+      sourceMessageId: "message-source",
+      conversationReplyCount: 3,
+      conversationChannelId: "conversation-allowlist",
       channelId: "channel-allowlist",
       channelName: "allowlist",
       channelType: "channel",
@@ -99,6 +102,11 @@ test("task:created emits only the explicit task-domain allowlist", () => {
   assert.equal(payload.tasks[0]?.status, "todo");
   assert.equal(payload.tasks[0]?.claimedById, null);
   assert.equal(payload.tasks[0]?.revision, 2);
+  assert.equal(payload.tasks[0]?.sourceMessageId, "message-source");
+  // Task v2: the real host message (none for a v2 task), as on the task DTO.
+  assert.equal(payload.tasks[0]?.hostMessageId, null);
+  assert.equal(payload.tasks[0]?.conversationReplyCount, 3);
+  assert.equal(payload.tasks[0]?.conversationChannelId, "conversation-allowlist");
   assert.deepEqual(payload.tasks[0]?.taskCurrentProjection, {
     title: "Current allowlisted task",
     description: "Current details",
@@ -276,75 +284,4 @@ test("task message update emission uses the row channel and projected payload", 
   assert.equal("agentSendKey" in events[0]!.payload, false);
   assert.equal("searchText" in events[0]!.payload, false);
   assert.equal("searchVector" in events[0]!.payload, false);
-});
-
-test("task mutation routes cannot restore raw row spreads in message:updated", async () => {
-  // v1.4 added an indirection: most routes now reach the projector through
-  // `taskMutationBroadcast.emitTaskMutation` (or its joint-surface fanout
-  // variant), which also decides whether a `message:updated` is emitted at all
-  // (a canonical task's host message did not change). Counting only direct
-  // `emitTaskMessageUpdated(` calls would have quietly reduced this ratchet's
-  // scope to one file, so it counts projector-reaching calls and scans the new
-  // indirection too.
-  //
-  // ⚠️ P3 LOWERED `tasks.ts` FROM 1 TO 0. That is a ratchet being relaxed, so it
-  // is spelled out: the removed call was the `result.source === "message"` arm
-  // of `emitTaskUpdate`, and message-owned tasks no longer resolve, so the arm
-  // was unreachable rather than merely unused. Nothing else about the guard is
-  // weakened -- `noRawSpread` below is the assertion that actually prevents a
-  // raw DB row reaching the socket, it still runs over `tasks.ts`, and the
-  // agent-facing counts are untouched. If a future change makes `tasks.ts` emit
-  // `message:updated` again it must go through the projector, and the extra
-  // assertion under this loop will fail until this number is raised again.
-  const routes = [
-    ["tasks.ts", 0],
-    ["internal.ts", 5],
-    // 6 -> 8: the agent-facing resource-receipt and amendment routes. Raising
-    // this number is the SAFE direction for this guard -- each new task
-    // mutation reaches the shared projector instead of hand-rolling realtime.
-    ["internalAgentApi.ts", 8],
-  ] as const;
-
-  const noRawSpread = /emit\(\s*["']message:updated["']\s*,\s*\{\s*\.\.\./s;
-  const projectorReaching = /emitTaskMessageUpdated\(|emitTaskMutation(?:ToSurfaces)?\(|describeTaskMutation\(/g;
-
-  for (const [filename, expectedProjectionCalls] of routes) {
-    const source = await readFile(new URL(`../routes/${filename}`, import.meta.url), "utf8");
-    assert.doesNotMatch(
-      source,
-      noRawSpread,
-      `${filename} must not spread a DB row into message:updated`,
-    );
-    assert.equal(
-      source.match(projectorReaching)?.length ?? 0,
-      expectedProjectionCalls,
-      `${filename} must route every task-family message update through the projector`,
-    );
-  }
-
-  // The indirection itself must not become the escape hatch.
-  const broadcast = await readFile(new URL("./taskMutationBroadcast.ts", import.meta.url), "utf8");
-  assert.doesNotMatch(
-    broadcast,
-    noRawSpread,
-    "taskMutationBroadcast must not spread a DB row into message:updated",
-  );
-  // P3: the message-owned branch is gone, so the indirection reaches the
-  // projector zero times. Same reasoning as the `tasks.ts` count above.
-  assert.equal(
-    broadcast.match(/emitTaskMessageUpdated\(/g)?.length ?? 0,
-    0,
-    "taskMutationBroadcast must not reach the message projector after P3",
-  );
-
-  // The replacement teeth for what the count above used to guard: `tasks.ts`
-  // must emit no `message:updated` at all now. A count of 0 alone would also be
-  // satisfied by someone emitting it *without* the projector -- which is the
-  // exact regression this file exists to stop.
-  const tasksSource = await readFile(new URL("../routes/tasks.ts", import.meta.url), "utf8");
-  assert.equal(
-    tasksSource.match(/["']message:updated["']/g)?.length ?? 0,
-    0,
-    "tasks.ts must not emit message:updated after P3, by any route",
-  );
 });

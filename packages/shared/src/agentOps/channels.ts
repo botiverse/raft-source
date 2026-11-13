@@ -10,7 +10,7 @@ import { lazySchema } from "../lazySchema";
 import type { AgentApiClient } from "../agentApiClient";
 import { joinRaftChannelByTarget, parseRaftRegularChannelTarget } from "../agentApiChannelJoin";
 import type { AgentApiChannelMembersResponse, AgentApiThreadListItem } from "../agentApiContract";
-import { formatAgentChannelInfo, formatAgentChannelMembers, type AgentChannelInfo } from "../agentText/server";
+import { formatAgentChannelInfo, formatAgentChannelMembers, formatChannelDeletedWithLastMember, formatLastMemberRefusal, LAST_MEMBER_DELETES_CHANNEL, type AgentChannelInfo } from "../agentText/server";
 import { formatAgentThreadList } from "../agentText/threadsProfile";
 import { formatHint, hintStep, RAFT_HINTS, type RaftHintOptions } from "./hint";
 import { failureFromClientResult, failureOutcome, opError, validateOpRequest, type RaftFailure, type RaftOutcome } from "./outcome";
@@ -19,6 +19,18 @@ import { requestSchema } from "./requestSchema";
 /** `{ target }` of a regular channel (join, leave, mute, unmute). */
 export const channelTargetRequestSchema = lazySchema("channelTargetRequestSchema", () => requestSchema<{ target: string }>()(z.object({
   target: z.string().describe("A regular channel, `#channel-name`. DMs and threads are not accepted."),
+})));
+
+export interface ChannelLeaveRequest {
+  target: string;
+  /** You may be the private channel's last member: leaving then deletes it and all its messages. Without it that leave is refused and nothing changes. */
+  deleteIfLast?: boolean;
+}
+
+/** `{ target, deleteIfLast? }` for `channels.leave`. */
+export const channelLeaveRequestSchema = lazySchema("channelLeaveRequestSchema", () => requestSchema<ChannelLeaveRequest>()(z.object({
+  target: z.string().describe("A regular channel, `#channel-name`. DMs and threads are not accepted."),
+  deleteIfLast: z.boolean().optional().describe("Only when the channel and all its messages should go: if you are a private channel's last member, leaving deletes it, which can't be undone. Without it that leave is refused and nothing changes."),
 })));
 
 export const channelMembersRequestSchema = lazySchema("channelMembersRequestSchema", () => requestSchema<{ target: string }>()(z.object({
@@ -95,17 +107,24 @@ export async function joinChannel(
 
 export async function leaveChannel(
   client: Pick<AgentApiClient, "server" | "channels">,
-  request: { target: string },
+  request: ChannelLeaveRequest,
   options: RaftHintOptions = {},
-): Promise<RaftOutcome<RaftChannelRef, "left" | "not_joined">> {
-  const invalid = validateOpRequest(channelTargetRequestSchema, request); if (invalid) return invalid;
+): Promise<RaftOutcome<RaftChannelRef & { channelDeleted?: true }, "left" | "not_joined">> {
+  const invalid = validateOpRequest(channelLeaveRequestSchema, request); if (invalid) return invalid;
   const channel = await resolveRegularChannel(client, request.target, options);
   if ("ok" in channel) return channel;
   if (!channel.joined) {
     return { ok: true, state: "not_joined", data: { target: request.target, channelId: channel.id }, next: null, text: `You are not a member of ${request.target}; nothing to leave.` };
   }
-  const result = await client.channels.leave({ channelId: channel.id as never });
-  if (!result.ok) return failureFromClientResult(result);
+  const result = await client.channels.leave({ channelId: channel.id as never }, request.deleteIfLast ? { deleteIfLast: true } : {});
+  if (!result.ok) {
+    const failure = failureFromClientResult(result);
+    if (failure.error.serverCode !== LAST_MEMBER_DELETES_CHANNEL) return failure;
+    return failureOutcome({ ...failure.error, ...formatLastMemberRefusal({ target: request.target }, options.hints) });
+  }
+  if (result.data.channelDeleted) {
+    return { ok: true, state: "left", data: { target: request.target, channelId: channel.id, channelDeleted: true }, next: null, text: formatChannelDeletedWithLastMember(request.target) };
+  }
   const lines = [
     `Left ${request.target}. You can still inspect visible public channel history there, but you can no longer send or receive ordinary channel delivery until you join the public channel again or a human re-adds you to a private channel.`,
   ];
@@ -247,7 +266,15 @@ export async function channelInfo(
   }
   const info = await client.server.info();
   if (!info.ok) return failureFromClientResult(info);
-  const channel = (info.data.channels as AgentChannelInfo[]).find((candidate) => candidate.name === name);
+  let channel = (info.data.channels as AgentChannelInfo[]).find((candidate) => candidate.name === name);
+  // Not a live channel: it may be archived (read-only, still readable), which
+  // the default listing leaves out. Ask once more for the archived ones.
+  if (!channel && (info.data.archivedChannelCount ?? 0) > 0) {
+    const archived = await client.server.info({ archived: "include" });
+    if (!archived.ok) return failureFromClientResult(archived);
+    const row = (archived.data.archivedChannels as AgentChannelInfo[] | undefined)?.find((candidate) => candidate.name === name);
+    if (row) channel = { ...row, archived: true };
+  }
   if (!channel) {
     return failureOutcome(opError("NOT_FOUND", {
       message: `Channel not found or not visible: ${input}`,

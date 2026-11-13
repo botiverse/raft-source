@@ -6,7 +6,7 @@ React SPA frontend for Slock.
 
 ```bash
 pnpm --filter @botiverse/raft-web dev        # Vite dev server on :5173 (proxies /api to :3001)
-pnpm --filter @botiverse/raft-web build      # tsc --noEmit && vite build → dist/
+pnpm --filter @botiverse/raft-web build      # tsrs --noEmit && vite build → dist/
 pnpm --filter @botiverse/raft-web typecheck
 ```
 
@@ -24,6 +24,22 @@ by setting `SLOCK_WEB_PROXY_STAGING_ORIGIN` or
 `SLOCK_WEB_PROXY_PROD_ORIGIN` to a pathless HTTPS origin.
 Remote proxy mode automatically marks the UI as a Web Preview and shows the
 selected data target.
+
+## Module shape
+
+One component per file, named exports, and no file over 800 lines. Hooks,
+helpers and constants live in their own modules, so React Fast Refresh can
+update a component in place. `scripts/check-module-shape.ts` (part of `lint`)
+holds today's exceptions in `scripts/module-shape-baseline/`, one small JSON
+file per module (`src/x/Y.tsx` → `src/x/Y.tsx.json`), and only lets them
+shrink: when you split a file, lower or remove its entry in the same PR.
+`node --import @oxc-node/core/register scripts/check-module-shape.ts --write`
+does that for you and follows files you moved (same file name, old path gone);
+it refuses to write if anything grew. A large component moved into a file with
+a new name (ThreadPanel.tsx → AuthenticatedThreadPanel.tsx) isn't recognised:
+`git mv` its baseline file to the new path, with numbers no higher than
+before, and say so in the PR. One file per module keeps parallel PRs from
+conflicting in the baseline.
 
 ## Tests
 

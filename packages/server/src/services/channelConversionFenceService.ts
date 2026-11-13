@@ -12,8 +12,10 @@ import {
 } from "../db/schema";
 import {
   lockServerResourceInTransaction,
+  probeServerResourceLockFree,
   setBeforeServerResourceLockQueryForTest,
   setServerResourceLockProbeForTest,
+  tryLockServerResourceInTransaction,
   withServerResourceLock,
 } from "./planService";
 
@@ -160,7 +162,7 @@ export async function resolveChannelConversionLockTarget(
   }
   const result = await executor.execute(sql`
     WITH input_channel AS (
-      SELECT id, server_id, type, parent_message_id
+      SELECT id, server_id, type, parent_message_id, parent_channel_id
         FROM channels
        WHERE id = ${channelId}
          AND deleted_at IS NULL
@@ -184,6 +186,14 @@ export async function resolveChannelConversionLockTarget(
         JOIN ${messages} parent_message
           ON parent_message.id = canonical_thread.parent_message_id
        WHERE input_channel.type = 'thread'
+    ), task_conversation_scope AS (
+      -- Task v2: a task conversation (canonical or a joint local projection)
+      -- names its parent channel on the row; it is fenced with that channel,
+      -- as a thread is with its parent message's channel.
+      SELECT input_channel.parent_channel_id AS channel_id
+        FROM input_channel
+       WHERE input_channel.type = 'task'
+         AND input_channel.parent_channel_id IS NOT NULL
     ), active_job AS (
       SELECT job.server_id, job.source_channel_id
         FROM channel_conversion_jobs job
@@ -195,6 +205,8 @@ export async function resolveChannelConversionLockTarget(
            OR job.canonical_channel_id IN (SELECT channel_id FROM parent_scope)
            OR job.source_channel_id IN (SELECT channel_id FROM thread_projection_scope)
            OR job.canonical_channel_id IN (SELECT channel_id FROM thread_projection_scope)
+           OR job.source_channel_id IN (SELECT channel_id FROM task_conversation_scope)
+           OR job.canonical_channel_id IN (SELECT channel_id FROM task_conversation_scope)
          )
        ORDER BY job.created_at DESC
        LIMIT 1
@@ -204,6 +216,7 @@ export async function resolveChannelConversionLockTarget(
       COALESCE(
         active_job.source_channel_id,
         (SELECT channel_id FROM parent_scope LIMIT 1),
+        (SELECT channel_id FROM task_conversation_scope LIMIT 1),
         input_channel.id
       )::text AS "sourceChannelId"
       FROM input_channel
@@ -274,6 +287,97 @@ export async function withChannelConversionResourceLock<T>(
     return fn(transaction);
   }
   return withServerResourceLock(serverId, CHANNEL_CONVERSION_LOCK_NAMESPACE, sourceChannelId, fn);
+}
+
+/**
+ * The conversion worker's form of the lock: the same exclusive key, without
+ * waiting. Not acquired (another replica's phase, or a start, retry or cancel,
+ * holds it): `{ acquired: false }`, and `fn` does not run. Every replica runs
+ * the worker on the same jobs; a blocking lock here parked one pooled
+ * connection per replica behind a phase for its whole length (1.23.0).
+ */
+export async function withChannelConversionResourceTryLock<T>(
+  serverId: string,
+  sourceChannelId: string,
+  fn: (tx: DatabaseTransaction) => Promise<T>,
+  transaction?: DatabaseTransaction,
+): Promise<{ acquired: true; value: T } | { acquired: false }> {
+  const run = async (tx: DatabaseTransaction): Promise<{ acquired: true; value: T } | { acquired: false }> => {
+    if (!await tryLockServerResourceInTransaction(tx, serverId, CHANNEL_CONVERSION_LOCK_NAMESPACE, sourceChannelId)) {
+      return { acquired: false };
+    }
+    return { acquired: true, value: await fn(tx) };
+  };
+  return transaction ? run(transaction) : getDb().transaction(run);
+}
+
+/**
+ * The conversion worker's check before it opens a phase's transaction: is the
+ * conversion lock free right now? Held (a phase is running elsewhere): the
+ * pass is busy without reading the channel's people, locking their users rows
+ * or opening a transaction. Free: the phase goes on as before (users rows,
+ * then withChannelConversionResourceTryLock, which decides). Holds nothing.
+ */
+export function probeChannelConversionResourceLockFree(serverId: string, sourceChannelId: string): Promise<boolean> {
+  return probeServerResourceLockFree(serverId, CHANNEL_CONVERSION_LOCK_NAMESPACE, sourceChannelId);
+}
+
+/**
+ * How long a request (start, retry, cancel, a connect's reservation) or a
+ * phase's failure record waits for the conversion lock. A phase holds it for
+ * its whole transaction (seconds, up to tens of seconds on a big channel);
+ * past this the caller is told the conversion is busy instead of holding a
+ * pooled connection for the rest of the phase.
+ */
+export const CHANNEL_CONVERSION_LOCK_WAIT_TIMEOUT = "2s";
+
+function isLockNotAvailable(error: unknown): boolean {
+  for (let current: unknown = error, depth = 0; current && depth < 5; depth += 1) {
+    if ((current as { code?: unknown }).code === "55P03") return true;
+    current = (current as { cause?: unknown }).cause;
+  }
+  return false;
+}
+
+/**
+ * lockChannelConversionResourceInTransaction, waiting at most
+ * CHANNEL_CONVERSION_LOCK_WAIT_TIMEOUT: past it, throws `onTimeout()` (the
+ * caller's "conversion in progress" refusal). The transaction's own
+ * lock_timeout is put back once the lock is held, so later statements wait as
+ * they did. The failed statement aborts the transaction (or the caller's
+ * savepoint), which also drops the SET LOCAL.
+ */
+export async function lockChannelConversionResourceBoundedInTransaction(
+  tx: DatabaseExecutor,
+  serverId: string,
+  sourceChannelId: string,
+  onTimeout: (cause: unknown) => Error,
+): Promise<void> {
+  const previous = await tx.execute(sql`SELECT current_setting('lock_timeout') AS previous`);
+  await tx.execute(sql`SELECT set_config('lock_timeout', ${CHANNEL_CONVERSION_LOCK_WAIT_TIMEOUT}, true)`);
+  try {
+    await lockChannelConversionResourceInTransaction(tx, serverId, sourceChannelId);
+  } catch (error) {
+    if (isLockNotAvailable(error)) throw onTimeout(error);
+    throw error;
+  }
+  const restore = (previous.rows[0] as { previous?: unknown } | undefined)?.previous;
+  await tx.execute(sql`SELECT set_config('lock_timeout', ${typeof restore === "string" ? restore : "0"}, true)`);
+}
+
+/** withChannelConversionResourceLock with lockChannelConversionResourceBoundedInTransaction's wait. */
+export async function withChannelConversionResourceBoundedLock<T>(
+  serverId: string,
+  sourceChannelId: string,
+  onTimeout: (cause: unknown) => Error,
+  fn: (tx: DatabaseTransaction) => Promise<T>,
+  transaction?: DatabaseTransaction,
+): Promise<T> {
+  const run = async (tx: DatabaseTransaction): Promise<T> => {
+    await lockChannelConversionResourceBoundedInTransaction(tx, serverId, sourceChannelId, onTimeout);
+    return fn(tx);
+  };
+  return transaction ? run(transaction) : getDb().transaction(run);
 }
 
 /**

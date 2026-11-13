@@ -99,3 +99,61 @@ test("flag-off or malformed hydrate has no projection", () => {
     peerCount: 0,
   });
 });
+
+test("stoppedFollowing is kept only as true, survives read moves, and each detail decides it again", () => {
+  const scope = normalizeReadReceiptHydrate({
+    peerReadStates: [
+      { peerKind: "agent", peerId: "a-1", maxReadSeq: 8, stoppedFollowing: true },
+      { peerKind: "agent", peerId: "a-2", maxReadSeq: 8, stoppedFollowing: "yes" },
+      { peerKind: "agent", peerId: "a-3", maxReadSeq: 8 },
+    ],
+  });
+  assert.deepEqual(scope, {
+    kind: "peers",
+    peers: [
+      { peerKind: "agent", peerId: "a-1", maxReadSeq: 8, stoppedFollowing: true },
+      { peerKind: "agent", peerId: "a-2", maxReadSeq: 8 },
+      { peerKind: "agent", peerId: "a-3", maxReadSeq: 8 },
+    ],
+  });
+
+  const moved = mergePeerReadAdvance(scope!, { scopeId: "t", peerKind: "agent", peerId: "a-1", maxReadSeq: 9 });
+  assert.ok(moved?.kind === "peers");
+  assert.deepEqual(moved.peers[0], { peerKind: "agent", peerId: "a-1", maxReadSeq: 9, stoppedFollowing: true });
+
+  // Followed again: the next detail has no flag. The position stays forward-only.
+  const reloaded = mergeReadReceiptHydrate(moved, {
+    kind: "peers",
+    peers: [{ peerKind: "agent", peerId: "a-1", maxReadSeq: 8 }],
+  });
+  assert.deepEqual(reloaded, { kind: "peers", peers: [{ peerKind: "agent", peerId: "a-1", maxReadSeq: 9 }] });
+});
+
+test("mutedChannel is kept only as true, beside stoppedFollowing, and each detail decides it again", () => {
+  const scope = normalizeReadReceiptHydrate({
+    peerReadStates: [
+      { peerKind: "agent", peerId: "a-1", maxReadSeq: 8, mutedChannel: true },
+      { peerKind: "agent", peerId: "a-2", maxReadSeq: 8, mutedChannel: 1 },
+      { peerKind: "agent", peerId: "a-3", maxReadSeq: 8, stoppedFollowing: true, mutedChannel: true },
+    ],
+  });
+  assert.deepEqual(scope, {
+    kind: "peers",
+    peers: [
+      { peerKind: "agent", peerId: "a-1", maxReadSeq: 8, mutedChannel: true },
+      { peerKind: "agent", peerId: "a-2", maxReadSeq: 8 },
+      { peerKind: "agent", peerId: "a-3", maxReadSeq: 8, stoppedFollowing: true, mutedChannel: true },
+    ],
+  });
+
+  const moved = mergePeerReadAdvance(scope!, { scopeId: "c", peerKind: "agent", peerId: "a-1", maxReadSeq: 9 });
+  assert.ok(moved?.kind === "peers");
+  assert.deepEqual(moved.peers[0], { peerKind: "agent", peerId: "a-1", maxReadSeq: 9, mutedChannel: true });
+
+  // Unmuted: the next detail has no flag. The position stays forward-only.
+  const reloaded = mergeReadReceiptHydrate(moved, {
+    kind: "peers",
+    peers: [{ peerKind: "agent", peerId: "a-1", maxReadSeq: 8 }],
+  });
+  assert.deepEqual(reloaded, { kind: "peers", peers: [{ peerKind: "agent", peerId: "a-1", maxReadSeq: 9 }] });
+});

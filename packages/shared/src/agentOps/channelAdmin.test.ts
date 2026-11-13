@@ -136,6 +136,28 @@ test("members: exactly one of user and agent, handles sent without '@', CLI text
   assert.deepEqual(calls.at(-1), { method: "DELETE", path: `/internal/agent-api/channels/${DESIGN_ID}/members`, body: { agent: "Kirby" } });
 });
 
+test("remove-member: a private channel's last member is refused with the deleting call as the next step; deleteIfLast sends it and says the channel went", async () => {
+  const calls: Call[] = [];
+  const api = client((path) => {
+    if (path.startsWith("/internal/agent-api/server")) return Response.json(serverInfoBody);
+    if ((calls.at(-1)?.body as { deleteIfLast?: boolean }).deleteIfLast !== true) {
+      return Response.json({ error: "…", code: "last_member_deletes_channel", suggestedNextAction: "(the Server's CLI form)" }, { status: 409 });
+    }
+    return Response.json({ ok: true, wasMember: true, channelId: DESIGN_ID, member: { type: "human", id: "user-1", name: "tygg" }, channelDeleted: true });
+  }, calls);
+
+  const refused = await removeChannelMember(api, { target: "#design", user: "@tygg" }, { hints: "tool" });
+  assert.ok(!refused.ok);
+  assert.equal(refused.error.message, "@tygg is the last member of #design, a private channel: removing them would delete the channel and all its messages, and that can't be undone. Nothing changed.");
+  assert.equal(refused.error.nextAction, `Only if the channel and all its messages should go: channels_remove_member({ target: "#design", user: "@tygg", deleteIfLast: true }). Otherwise leave them in it.`);
+  assert.deepEqual(calls.at(-1)?.body, { user: "tygg" });
+
+  const removed = await removeChannelMember(api, { target: "#design", user: "@tygg", deleteIfLast: true });
+  assert.ok(removed.ok);
+  assert.deepEqual(calls.at(-1)?.body, { user: "tygg", deleteIfLast: true });
+  assert.equal(removed.text, "@tygg was the last member of #design, a private channel, so it and all its messages were deleted. That can't be undone.");
+});
+
 test("server update sends the trimmed name and refuses an empty change locally", async () => {
   const calls: Call[] = [];
   const api = client(() => Response.json({ id: "server-1", name: "Raft HQ", hideHumansFromMembers: false, avatarUrl: null }), calls);

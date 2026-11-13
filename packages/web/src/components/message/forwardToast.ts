@@ -1,5 +1,6 @@
 import type { ComponentPropsWithRef, ReactNode } from "react";
 import { createToastManager } from "@botiverse/raft-ui";
+import { toastTimeout } from "../toastBridge";
 
 export const forwardToastManager = createToastManager();
 
@@ -20,6 +21,8 @@ function addForwardToast(
     actionProps: options.action
       ? { children: options.action.label, onClick: options.action.onClick }
       : undefined,
+    // 8s with an action or as an error, 5s (the provider's) otherwise.
+    timeout: toastTimeout({ hasAction: Boolean(options.action), type: intent }),
     title,
     type: intent,
     priority: intent === "error" ? "high" : undefined,

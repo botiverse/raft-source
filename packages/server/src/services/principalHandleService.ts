@@ -32,6 +32,30 @@ export async function assertAgentHandleAvailableInServer(
   }
 }
 
+/**
+ * Personal assistants' handles (`<owner>-assistant`, `-2`…, assistantService
+ * assistantHandleCandidates) are reserved: no other agent may take one. Agent
+ * handles are unique per server, so without this a create that hit another
+ * person's assistant would answer "already taken" and reveal that they have
+ * one, though nobody else may find it (agentFindableBy). The refusal depends
+ * on the name alone, never on whether such an assistant exists.
+ */
+const ASSISTANT_HANDLE_RE = /-assistant(-[0-9]+)?$/i;
+
+export const ASSISTANT_RESERVED_HANDLE_CODE = "agent_name_reserved_for_assistants";
+
+export class AssistantReservedHandleError extends Error {
+  readonly code = ASSISTANT_RESERVED_HANDLE_CODE;
+  constructor(handle: string) {
+    super(`Agent name @${handle} is reserved: names ending in "-assistant" belong to personal assistants. Choose another name.`);
+    this.name = "AssistantReservedHandleError";
+  }
+}
+
+export function isAssistantReservedAgentHandle(handle: string): boolean {
+  return ASSISTANT_HANDLE_RE.test(handle.trim().replace(/^@/, ""));
+}
+
 export function isPrincipalHandleConflictError(err: unknown) {
   return err instanceof PrincipalHandleConflictError;
 }

@@ -1,3 +1,6 @@
+import { hasSidebarPinnedRef, removeSidebarPinnedRef, upsertSidebarPinnedRef } from "../utils/sidebarPinnedRefs";
+import type { SidebarPinnedRef } from "../utils/sidebarPinnedRefs";
+
 export type SidebarSectionItemKind = "channel" | "agent";
 
 export interface SidebarCustomSection {
@@ -115,4 +118,106 @@ export function removeSidebarItemPlacement(
     return placements;
   }
   return placements.filter((placement) => sidebarSectionItemKey(placement.kind, placement.id) !== itemKey);
+}
+
+// ---------------------------------------------------------------------------
+// Placement moves shared by the sidebar (row menu, drag and drop, section
+// dialogs) and channel settings › Move to section. Pinned is the system
+// section `system:pinned` (a pinned ref); a custom section is a placement.
+// Each returns the sidebar-order fields to write.
+// ---------------------------------------------------------------------------
+
+export interface SidebarPlacementState {
+  pinned: SidebarPinnedRef[];
+  sectionPlacements: SidebarSectionPlacement[];
+}
+
+export interface SidebarSectionsState extends SidebarPlacementState {
+  customSections: SidebarCustomSection[];
+  sectionOrder: string[];
+}
+
+type SidebarItem = Pick<SidebarSectionPlacement, "kind" | "id">;
+
+/** Pin the item and take it out of any custom section. */
+export function sidebarMoveToPinnedUpdate(state: SidebarPlacementState, item: SidebarItem, ref: SidebarPinnedRef): SidebarPlacementState {
+  return {
+    sectionPlacements: removeSidebarItemPlacement(state.sectionPlacements, item),
+    pinned: hasSidebarPinnedRef(state.pinned, ref) ? state.pinned : upsertSidebarPinnedRef(state.pinned, ref),
+  };
+}
+
+/** Place the item last in a custom section and unpin it (`ref`, when it can be pinned). */
+export function sidebarMoveToCustomSectionUpdate(
+  state: SidebarPlacementState,
+  item: SidebarItem,
+  sectionId: string,
+  ref: SidebarPinnedRef | null,
+): SidebarPlacementState {
+  return {
+    sectionPlacements: moveSidebarItemToCustomSection(state.sectionPlacements, item, sectionId),
+    pinned: ref ? removeSidebarPinnedRef(state.pinned, ref) : state.pinned,
+  };
+}
+
+/**
+ * Back to the item's home section: drop its placement and its pin, writing
+ * only what changes (Remove from Section writes only the placements). Empty
+ * when it is already home.
+ */
+export function sidebarMoveToHomeUpdate(
+  state: SidebarPlacementState,
+  item: SidebarItem,
+  ref: SidebarPinnedRef | null,
+): Partial<SidebarPlacementState> {
+  const sectionPlacements = removeSidebarItemPlacement(state.sectionPlacements, item);
+  return {
+    ...(sectionPlacements === state.sectionPlacements ? {} : { sectionPlacements }),
+    ...(ref && hasSidebarPinnedRef(state.pinned, ref) ? { pinned: removeSidebarPinnedRef(state.pinned, ref) } : {}),
+  };
+}
+
+/**
+ * Add a custom section, before `insertBefore` (a sectionOrder key) or last,
+ * optionally with `moveItem` placed in it and unpinned.
+ */
+export function sidebarCreateSectionUpdate(
+  state: SidebarSectionsState,
+  section: SidebarCustomSection,
+  { insertBefore, moveItem, moveItemRef = null }: { insertBefore?: string; moveItem?: SidebarItem; moveItemRef?: SidebarPinnedRef | null } = {},
+): SidebarSectionsState {
+  const { sectionOrder } = state;
+  const insertAt = insertBefore ? sectionOrder.indexOf(insertBefore) : -1;
+  const nextSectionOrder = insertAt >= 0
+    ? [...sectionOrder.slice(0, insertAt), section.id, ...sectionOrder.slice(insertAt)]
+    : [...sectionOrder, section.id];
+  return {
+    customSections: [...state.customSections, section],
+    sectionOrder: nextSectionOrder,
+    sectionPlacements: moveItem
+      ? moveSidebarItemToCustomSection(state.sectionPlacements, moveItem, section.id)
+      : state.sectionPlacements,
+    pinned: moveItemRef ? removeSidebarPinnedRef(state.pinned, moveItemRef) : state.pinned,
+  };
+}
+
+/**
+ * The section an item is shown in, as a sectionOrder key. Pinned wins over a
+ * placement, as the sidebar renders it (a pinned item is skipped in its
+ * custom section); a placement in a deleted section counts as home.
+ */
+export function sidebarItemSectionKey({
+  pinned,
+  placementSectionId,
+  customSections,
+  homeKey,
+}: {
+  pinned: boolean;
+  placementSectionId: string | null;
+  customSections: SidebarCustomSection[];
+  homeKey: string;
+}): string {
+  if (pinned) return "system:pinned";
+  if (placementSectionId && customSections.some((section) => section.id === placementSectionId)) return placementSectionId;
+  return homeKey;
 }

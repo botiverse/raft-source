@@ -181,7 +181,9 @@ export async function daemonFetch(
     // connect/tunnel/TLS reset, headers timeout, socket close. Evict the cached
     // dispatcher so the next request rebuilds a fresh pool instead of reusing
     // a possibly-poisoned one. This branch is ONLY reachable when no Response
-    // was obtained; isolated lanes evict only their own pool.
+    // was obtained; isolated lanes evict only their own pool. A caller's own
+    // abort says nothing about the pool, so it keeps it.
+    if (init?.signal?.aborted) throw err;
     if (options.isolationKey) {
       evictIsolatedFetchDispatcher(
         targetUrl,

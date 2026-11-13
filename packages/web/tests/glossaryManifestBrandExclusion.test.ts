@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 
-import { assign, displayText, parseCatalog, stripBrand } from "../scripts/build-glossary-manifest.mjs";
+import { assign, displayText, parseCatalog, stripBrand } from "../scripts/build-glossary-manifest";
 
 // @沈括's ask: the brand exclusion must not be able to regress silently. The
-// first manifest had no exclusion, counted `Raft Server` as the common noun,
+// first manifest had no exclusion, counted `Raft server` as the common noun,
 // over-counted batch B by 13, and would have shipped `Raft 服务器`.
 //
 // The generator is checked in precisely so this rule has somewhere to be
@@ -16,7 +16,7 @@ test("a brand-only value never enters B-server", () => {
     + '  "b": "Raft Server 负责身份验证、刷新和远程 MCP 请求。"\n',
   );
   const { owner } = assign(catalog);
-  assert.equal(owner.b, undefined, "a value whose only English is `Raft Server` must not be batched");
+  assert.equal(owner.b, undefined, "a value whose only English is `Raft server` must not be batched");
   // `a` still qualifies — but via provider (batch A), not via the brand Server.
   assert.equal(owner.a, "A-runtime-provider");
 });

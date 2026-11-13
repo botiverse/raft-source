@@ -54,6 +54,10 @@ function describeReason(reason: MachineReadinessReason): string {
       return `runner pid ${reason.pid} is version ${reason.actualVersion}, expected ${reason.expectedVersion}`;
     case "runner-disconnected":
       return `runner starting (pid ${reason.pid}), not connected to the server yet`;
+    case "runner-lock-conflict":
+      return reason.ownerPid === null
+        ? "runner blocked by another daemon's machine lock (owner unknown)"
+        : `runner blocked by another daemon's machine lock (pid ${reason.ownerPid})`;
   }
 }
 

@@ -1,6 +1,4 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
 import {
   getCooldownState,
   getPwaInstallPlatform,
@@ -8,8 +6,6 @@ import {
   hasPwaInstallPath,
   shouldShowPwaInstallPrompt,
 } from "../src/utils/pwaInstall";
-
-const repoRoot = resolve(new URL("..", import.meta.url).pathname);
 
 test("PWA install platform detection separates iOS Safari from non-Safari iOS", () => {
   assert.equal(
@@ -67,38 +63,4 @@ test("dismiss cooldown and session buckets match analytics contract", () => {
   assert.equal(getSessionCountBucket(2), "2");
   assert.equal(getSessionCountBucket(5), "3-5");
   assert.equal(getSessionCountBucket(6), "6+");
-});
-
-test("PWA install UI is wired into mobile layout and Browser settings only", () => {
-  const mainLayout = readFileSync(resolve(repoRoot, "src/components/layout/MainLayout.tsx"), "utf8");
-  const settings = readFileSync(resolve(repoRoot, "src/components/settings/SettingsPanel.tsx"), "utf8");
-  const prompt = readFileSync(resolve(repoRoot, "src/components/pwa/PwaInstallPrompt.tsx"), "utf8");
-  const notifications = readFileSync(resolve(repoRoot, "src/components/layout/useSystemNotifications.tsx"), "utf8");
-  const illustration = readFileSync(resolve(repoRoot, "public/pwa/ios-add-to-home-screen-3step.svg"), "utf8");
-
-  assert.match(mainLayout, /import PwaInstallPrompt from "\.\.\/pwa\/PwaInstallPrompt"/);
-  assert.match(mainLayout, /<PwaInstallPrompt \/>/);
-  assert.match(settings, /import \{ PwaInstallSettingsCard \} from "\.\.\/pwa\/PwaInstallPrompt"/);
-  assert.match(settings, /<PwaInstallSettingsCard \/>/);
-  assert.doesNotMatch(prompt, /function NativeInstallBanner/);
-  assert.match(notifications, /id: "pwa-install"/);
-  assert.match(notifications, /kind: "info"/);
-  assert.match(notifications, /id: pwaInstallBusy \? "layout\.systemNotifications\.opening" : "layout\.systemNotifications\.install"/);
-  assert.match(notifications, /variant: "primary"/);
-  assert.match(prompt, /if \(standalone\) return null/);
-  assert.doesNotMatch(prompt, /NativeInstallBanner[\s\S]*bg-palette-yellow/);
-  assert.match(prompt, /data-pwa-install-settings-card[\s\S]*md:hidden/);
-  assert.match(prompt, /PWA_INSTALL_SESSION_DISMISSED_KEY/);
-  assert.match(notifications, /PWA_INSTALL_SESSION_DISMISSED_KEY/);
-  assert.match(notifications, /window\.sessionStorage\.setItem\(PWA_INSTALL_SESSION_DISMISSED_KEY, "1"\)/);
-  assert.match(notifications, /PWA_INSTALL_OPEN_EVENT/);
-  assert.match(notifications, /beforeinstallprompt/);
-  assert.match(notifications, /pwa_install_cta_shown/);
-  assert.match(notifications, /supported_browser/);
-  assert.match(notifications, /trackPwaInstall\("pwa_install_cta_shown", "notification_center"\)/);
-  assert.doesNotMatch(prompt, /firstEngagementCompleted|PWA_INSTALL_ENGAGEMENT_KEY|session_count_2/);
-  assert.doesNotMatch(prompt, /PWA_INSTALL_DISMISS_UNTIL_KEY/);
-  assert.match(prompt, /\/pwa\/ios-add-to-home-screen-3step\.svg/);
-  assert.match(illustration, /Tap Share/);
-  assert.doesNotMatch(prompt, /mobile_menu/);
 });

@@ -1,9 +1,5 @@
 import type { ButtonHTMLAttributes, ReactNode } from "react";
-
-/** Raft Design System UI text link (the section action / "See all" form): ink
- *  footnote text, 600, a 1.5px underline 3px below; keyboard focus gets the
- *  shared focus ring. Not a prose link, so it never turns link blue. */
-export const SHOW_MORE_TOGGLE_CLASS = "rounded-[2px] text-footnote font-semibold text-foreground underline decoration-[1.5px] underline-offset-[3px] hover:decoration-attention outline-none focus-visible:shadow-focus";
+import { TextLink } from "@botiverse/raft-ui";
 
 type ShowMoreToggleProps = Omit<ButtonHTMLAttributes<HTMLButtonElement>, "children" | "type"> & {
   expanded: boolean;
@@ -11,6 +7,8 @@ type ShowMoreToggleProps = Omit<ButtonHTMLAttributes<HTMLButtonElement>, "childr
   expandedLabel?: ReactNode;
 };
 
+/** "Show more" / "Collapse" toggle below content: a standalone raft-ui
+ *  TextLink (muted variant) at footnote size. */
 export default function ShowMoreToggle({
   expanded,
   collapsedLabel,
@@ -18,10 +16,9 @@ export default function ShowMoreToggle({
   className = "",
   ...buttonProps
 }: ShowMoreToggleProps) {
-  const cls = `${SHOW_MORE_TOGGLE_CLASS}${className ? ` ${className}` : ""}`;
   return (
-    <button type="button" className={cls} {...buttonProps}>
+    <TextLink className={`text-footnote${className ? ` ${className}` : ""}`} {...buttonProps}>
       {expanded ? expandedLabel : collapsedLabel}
-    </button>
+    </TextLink>
   );
 }

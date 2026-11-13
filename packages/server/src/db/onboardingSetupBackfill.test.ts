@@ -9,7 +9,7 @@ import { announcements, users, serverMembers } from "./schema";
 import { createServer } from "../services/serverService";
 import { createAgent } from "../services/agentService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 // The exact grandfathering backfill from migration 0157 (task #118). Kept in sync
 // with drizzle/0157_ambiguous_piledriver.sql — pre-migration servers with any live

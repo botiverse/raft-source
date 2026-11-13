@@ -80,8 +80,12 @@ export function segmentChannelDescription(description: string): ChannelDescripti
 }
 
 export default function ChannelDescription({ description }: { description: string }) {
+  // One line, cut with an ellipsis. The header's meta line is `truncate`
+  // (nowrap), and that white-space reaches this span, so the description never
+  // wrapped; it was clipped here, inside its own overflow box, where the meta
+  // line's ellipsis cannot show. Its own truncate puts the ellipsis on the cut.
   return (
-    <span className="line-clamp-2 min-w-0 [overflow-wrap:anywhere] [@media(max-height:600px)]:line-clamp-1">
+    <span className="block min-w-0 truncate" data-testid="channel-header-description">
       {segmentChannelDescription(description).map((segment, index) => (
         segment.kind === "link" ? (
           <a
@@ -89,7 +93,7 @@ export default function ChannelDescription({ description }: { description: strin
             href={segment.value}
             target="_blank"
             rel="noopener noreferrer"
-            className="rounded-[2px] underline decoration-[1.5px] decoration-foreground-hint underline-offset-[3px] outline-none transition-colors hover:text-foreground hover:decoration-attention focus-visible:text-foreground focus-visible:shadow-focus"
+            className="rounded-[2px] underline decoration-[1.5px] decoration-foreground-hint underline-offset-[3px] outline-none transition-colors hover:text-foreground hover:decoration-current focus-visible:text-foreground focus-visible:shadow-focus"
           >
             {segment.value}
           </a>

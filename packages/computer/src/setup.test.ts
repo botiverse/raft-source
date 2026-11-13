@@ -3,6 +3,7 @@ import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -10,6 +11,7 @@ import { BasicTracer, MemoryTraceSink, type CompletedTraceSpan } from "@botivers
 
 import { CliExit, inferNextCommands } from "./output";
 import { ComputerError } from "./lib/errors";
+import { markTerminalUnlinked } from "./health";
 import type { LegacyMachineCandidate } from "./lib/types";
 import { migrationDismissalsPath, serverAttachmentPath, userSessionPath } from "./paths";
 import { ComputerServiceError } from "./services/errors";
@@ -38,6 +40,19 @@ const DEFAULT_USER_SERVERS = [
 
 const defaultServersClient = () => ({
   list: async () => ({ status: "success" as const, servers: DEFAULT_USER_SERVERS }),
+});
+
+// Detection that found local legacy-daemon evidence: it lists the legacy
+// roster, which is what makes setup ask for its credential (in a terminal a
+// computer_migrate approval; without one, a saved user session).
+const detectWithLegacyEvidence = (calls: string[]): NonNullable<SetupDeps["detectLegacyMigration"]> =>
+  (async (_home, slug, factory) => {
+    calls.push("detect");
+    await factory().list(slug);
+    return { kind: "no_local_evidence" as const };
+  }) as NonNullable<SetupDeps["detectLegacyMigration"]>;
+const emptyRosterClient = () => ({
+  list: async () => ({ status: "success" as const, entries: [] }),
 });
 
 async function withHome<T>(fn: (home: string) => Promise<T>): Promise<T> {
@@ -177,7 +192,12 @@ async function runSetup(opts: SetupOptions, deps: SetupDeps = {}): Promise<void>
   const buildServersClient =
     deps.buildServersClient ??
     defaultServersClient;
-  await runSetupImpl(opts, { ...deps, buildServersClient });
+  // In a terminal the legacy-daemon branch always asks for a computer_migrate
+  // approval. A test that expects one scripts it (`approvedMigration`); an
+  // approval nobody scripted fails the test instead of passing silently.
+  // A test that drives the real approval (a fake server) passes `requestMigrateApproval: undefined`.
+  const requestMigrateApproval = "requestMigrateApproval" in deps ? deps.requestMigrateApproval : unexpectedMigrateApproval;
+  await runSetupImpl(opts, { ...deps, buildServersClient, requestMigrateApproval });
 }
 
 async function writeLegacyOwner(
@@ -204,7 +224,7 @@ async function writeLegacyOwner(
   );
 }
 
-test("setup: existing login + attachment skips login/attach and starts target server", async () => {
+test("setup: existing attachment skips sign-in/attach and starts target server", async () => {
   await withHome(async (home) => {
     await writeSession(home);
     await writeAttach(home);
@@ -224,7 +244,7 @@ test("setup: existing login + attachment skips login/attach and starts target se
       cap.restore();
     }
     assert.deepEqual(calls, [`start:${SERVER_A}`]);
-    assert.match(cap.text(), /already logged in/);
+    assert.doesNotMatch(cap.text(), /Logging in/);
     assert.match(cap.text(), /already attached/);
   });
 });
@@ -296,9 +316,10 @@ test("setup: existing attachment with different explicit serverUrl fails before 
   });
 });
 
-test("setup: no login in TTY runs login, then attach, then start", async () => {
+test("setup: not attached, no legacy daemon: attach by one-time approval then start, never signs in or lists servers", async () => {
   await withHome(async (home) => {
     const calls: string[] = [];
+    let useUserSession: boolean | undefined;
     await runSetup(
       { serverSlug: "/alpha" },
       {
@@ -307,6 +328,122 @@ test("setup: no login in TTY runs login, then attach, then start", async () => {
           calls.push("login");
           await writeSession(home);
         },
+        buildServersClient: () => {
+          calls.push("list-servers");
+          return defaultServersClient();
+        },
+        runAttach: async (opts) => {
+          calls.push("attach");
+          useUserSession = opts.useUserSession;
+          await writeAttach(home);
+        },
+        runStart: async (opts) => { calls.push(`start:${opts?.serverId}`); },
+      },
+    );
+    assert.deepEqual(calls, ["attach", `start:${SERVER_A}`]);
+    assert.equal(useUserSession, undefined, "a fresh attach is a one-time approval, not the user-session attach");
+    assert.equal(await readFile(userSessionPath(home), "utf8").catch(() => null), null);
+  });
+});
+
+test("setup (real attach, fake server): prints the approval link and code, attaches by approval, writes no user session", async () => {
+  await withHome(async (home) => {
+    const attachAuth: string[] = [];
+    const server = createServer((req, res) => {
+      req.resume();
+      req.on("end", () => {
+        res.setHeader("content-type", "application/json");
+        if (req.url === "/api/auth/device/authorize") {
+          res.statusCode = 201;
+          res.end(JSON.stringify({ deviceCode: "dvc_setup", userCode: "WXYZ-9876", verificationUri: "https://app.raft.build/login/device", expiresIn: 30, interval: 1 }));
+          return;
+        }
+        if (req.url === "/api/auth/device/token") {
+          res.statusCode = 200;
+          res.end(JSON.stringify({ kind: "computer_attach", attachToken: "dvat_setupAttachToken0123", expiresIn: 600, serverId: SERVER_A, serverSlug: SLUG_A, serverName: "Alpha" }));
+          return;
+        }
+        if (req.url === "/api/computer/attach") {
+          attachAuth.push(String(req.headers.authorization ?? ""));
+          res.statusCode = 201;
+          res.end(JSON.stringify({ apiKey: "sk_computer_setup", serverMachineId: "cm-setup", serverId: SERVER_A, serverSlug: SLUG_A, resumed: false }));
+          return;
+        }
+        if (req.url === "/internal/computer/preflight") {
+          res.statusCode = 200;
+          res.end(JSON.stringify({ ok: true }));
+          return;
+        }
+        res.statusCode = 404;
+        res.end("{}");
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    assert.ok(address && typeof address === "object");
+    const cap = captureOut();
+    const calls: string[] = [];
+    try {
+      await runSetup(
+        { serverSlug: "/alpha", serverUrl: `http://127.0.0.1:${address.port}`, yes: true },
+        { isTty: false, runStart: async () => { calls.push("start"); } },
+      );
+    } finally {
+      cap.restore();
+      await new Promise<void>((resolve, reject) => server.close((err) => (err ? reject(err) : resolve())));
+    }
+    const out = cap.text();
+    assert.match(out, /To approve this machine, open this link in a browser:\n  https:\/\/app\.raft\.build\/login\/device\n/);
+    assert.match(out, /Then enter this code on the page: WXYZ-9876\n/);
+    assert.match(out, /If the page asks which server, choose \/alpha\.\n/);
+    assert.match(out, /Connecting this computer to \/alpha… done\./);
+    assert.doesNotMatch(out, /dvat_|sk_computer_setup|Logging in/);
+    assert.deepEqual(attachAuth, ["Bearer dvat_setupAttachToken0123"]);
+    assert.deepEqual(calls, ["start"]);
+    const saved = JSON.parse(await readFile(serverAttachmentPath(home, SERVER_A), "utf8")) as { apiKey?: string };
+    assert.equal(saved.apiKey, "sk_computer_setup");
+    assert.equal(await readFile(userSessionPath(home), "utf8").catch(() => null), null);
+  });
+});
+
+test("setup: non-TTY --yes fresh attach also goes by one-time approval (no sign-in guard)", async () => {
+  await withHome(async (home) => {
+    const calls: string[] = [];
+    await runSetup(
+      { serverSlug: "/alpha", yes: true },
+      {
+        isTty: false,
+        runLogin: async () => { calls.push("login"); },
+        runAttach: async () => {
+          calls.push("attach");
+          await writeAttach(home);
+        },
+        runStart: async () => { calls.push("start"); },
+      },
+    );
+    assert.deepEqual(calls, ["attach", "start"]);
+  });
+});
+
+test("setup (legacy-daemon branch, terminal): a saved user session is not used as the credential, not refreshed, and stays on disk", async () => {
+  await withHome(async (home) => {
+    await writeSession(home);
+    const before = await readFile(userSessionPath(home), "utf8");
+    const calls: string[] = [];
+    const rosterTokens: string[] = [];
+    await runSetup(
+      { serverSlug: "/alpha" },
+      {
+        isTty: true,
+        detectLegacyMigration: detectWithLegacyEvidence(calls),
+        buildRosterClient: (_baseUrl, token) => {
+          rosterTokens.push(token);
+          return emptyRosterClient();
+        },
+        buildServersClient: () => ({ list: async () => { calls.push("servers"); return { status: "success" as const, servers: DEFAULT_USER_SERVERS }; } }),
+        refreshUserSession: async () => { calls.push("refresh"); return true; },
+        requestMigrateApproval: approvedMigration(calls),
+        runLogin: async () => { calls.push("login"); },
         runAttach: async () => {
           calls.push("attach");
           await writeAttach(home);
@@ -314,31 +451,35 @@ test("setup: no login in TTY runs login, then attach, then start", async () => {
         runStart: async (opts) => { calls.push(`start:${opts?.serverId}`); },
       },
     );
-    assert.deepEqual(calls, ["login", "attach", `start:${SERVER_A}`]);
+    assert.deepEqual(calls, ["detect", "approve:alpha", "attach", `start:${SERVER_A}`]);
+    assert.deepEqual(rosterTokens, [MIGRATE_TOKEN], "the roster is read with the migrate token, not the saved session");
+    assert.equal(await readFile(userSessionPath(home), "utf8"), before, "the saved session is left as it was");
   });
 });
 
-test("setup: expired user session refreshes before attach without browser login", async () => {
+test("setup (legacy-daemon branch, no terminal): an expired saved session is refreshed and used, with no approval", async () => {
   await withHome(async (home) => {
     await writeExpiredSession(home);
     const calls: string[] = [];
+    let useUserSession: boolean | undefined;
     const cap = captureOut();
     try {
       await runSetup(
-        { serverSlug: "/alpha" },
+        { serverSlug: "/alpha", yes: true, fresh: true },
         {
-          isTty: true,
+          isTty: false,
+          detectLegacyMigration: detectWithLegacyEvidence(calls),
+          buildRosterClient: emptyRosterClient,
           refreshUserSession: async () => {
             calls.push("refresh");
             await writeSession(home);
             return true;
           },
-          runLogin: async () => {
-            calls.push("login");
-            await writeSession(home);
-          },
-          runAttach: async () => {
+          requestMigrateApproval: approvedMigration(calls),
+          runLogin: async () => { calls.push("login"); },
+          runAttach: async (opts) => {
             calls.push("attach");
+            useUserSession = opts.useUserSession;
             await writeAttach(home);
           },
           runStart: async (opts) => { calls.push(`start:${opts?.serverId}`); },
@@ -347,28 +488,80 @@ test("setup: expired user session refreshes before attach without browser login"
     } finally {
       cap.restore();
     }
-    assert.deepEqual(calls, ["refresh", "attach", `start:${SERVER_A}`]);
+    assert.deepEqual(calls, ["detect", "refresh", "attach", `start:${SERVER_A}`]);
+    assert.equal(useUserSession, true, "without a terminal the branch used the session, so its fresh attach keeps it");
     assert.match(cap.text(), /Logging in… done \(session refreshed\)\./);
   });
 });
 
-test("setup: expired user session with no refresh path in TTY re-runs login before attach", async () => {
+test("setup (legacy-daemon branch, no terminal): a saved session the server no longer accepts is refused, with no approval and no sign-in", async () => {
+  await withHome(async (home) => {
+    await writeSession(home);
+    const calls: string[] = [];
+    await assert.rejects(
+      setupCore(
+        resolveHomeForCore(),
+        { serverSlug: "alpha", yes: true, fresh: true },
+        {
+          isTty: false,
+          detectLegacyMigration: detectWithLegacyEvidence(calls),
+          buildRosterClient: emptyRosterClient,
+          buildServersClient: () => ({ list: async () => { calls.push("servers"); return { status: "auth_required" as const }; } }),
+          refreshUserSession: async () => { calls.push("refresh"); return false; },
+          requestMigrateApproval: approvedMigration(calls),
+          runLogin: async () => { calls.push("login"); },
+          runAttach: async () => { calls.push("attach"); },
+        },
+        () => {},
+      ),
+      (err: unknown) => err instanceof ComputerError
+        && err.code === "USER_SESSION_EXPIRED"
+        && /in a terminal to approve the move there/.test(err.message),
+    );
+    assert.deepEqual(calls, ["detect", "servers"]);
+  });
+});
+
+const MIGRATE_TOKEN = "dvmt_setupMigrateToken0123";
+
+const unexpectedMigrateApproval: NonNullable<SetupDeps["requestMigrateApproval"]> = async (input) => {
+  throw new Error(`this test asked for a computer_migrate approval (${input.serverSlug}) without scripting one`);
+};
+
+const approvedMigration = (calls: string[], token = MIGRATE_TOKEN): NonNullable<SetupDeps["requestMigrateApproval"]> =>
+  async (input) => {
+    calls.push(`approve:${input.serverSlug}`);
+    return {
+      outcome: "approved" as const,
+      credential: { baseUrl: "https://api.example.test", migrateToken: token, serverId: SERVER_A, serverSlug: SLUG_A },
+    };
+  };
+
+test("setup (legacy-daemon branch): no usable user session in TTY asks for a computer_migrate approval, never a session login, and writes no session", async () => {
   await withHome(async (home) => {
     await writeExpiredSessionWithoutRefresh(home);
+    const before = await readFile(userSessionPath(home), "utf8");
     const calls: string[] = [];
+    const rosterTokens: string[] = [];
+    let useUserSession: boolean | undefined;
     const cap = captureOut();
     try {
       await runSetup(
         { serverSlug: "/alpha" },
         {
           isTty: true,
-          refreshUserSession: async () => false,
-          runLogin: async () => {
-            calls.push("login");
-            await writeSession(home);
+          detectLegacyMigration: detectWithLegacyEvidence(calls),
+          buildRosterClient: (_baseUrl, token) => {
+            rosterTokens.push(token);
+            return emptyRosterClient();
           },
-          runAttach: async () => {
+          buildServersClient: () => ({ list: async () => { calls.push("servers"); return { status: "success" as const, servers: DEFAULT_USER_SERVERS }; } }),
+          refreshUserSession: async () => false,
+          requestMigrateApproval: approvedMigration(calls),
+          runLogin: async () => { calls.push("login"); },
+          runAttach: async (opts) => {
             calls.push("attach");
+            useUserSession = opts.useUserSession;
             await writeAttach(home);
           },
           runStart: async (opts) => { calls.push(`start:${opts?.serverId}`); },
@@ -377,8 +570,258 @@ test("setup: expired user session with no refresh path in TTY re-runs login befo
     } finally {
       cap.restore();
     }
-    assert.deepEqual(calls, ["login", "attach", `start:${SERVER_A}`]);
-    assert.match(cap.text(), /Logging in… done\./);
+    assert.deepEqual(calls, ["detect", "approve:alpha", "attach", `start:${SERVER_A}`]);
+    assert.deepEqual(rosterTokens, [MIGRATE_TOKEN], "the roster is read with the migrate token");
+    assert.equal(useUserSession, undefined, "a migrate token cannot attach: a fresh attach is its own approval");
+    assert.equal(await readFile(userSessionPath(home), "utf8"), before, "user-session.json untouched");
+    assert.doesNotMatch(cap.text(), /dvmt_|Logging in/);
+  });
+});
+
+test("setup (legacy-daemon branch, fake server): the migrate approval's dvmt_ token reads the roster and adopts; no user-session.json, no server list", async () => {
+  await withHome(async (home) => {
+    await writeLegacyOwner(home, `machine-${FP_A}`, FP_A);
+    const seen: Array<{ url: string; auth: string; body: string }> = [];
+    const server = createServer((req, res) => {
+      let body = "";
+      req.on("data", (chunk) => { body += String(chunk); });
+      req.on("end", () => {
+        seen.push({ url: String(req.url), auth: String(req.headers.authorization ?? ""), body });
+        res.setHeader("content-type", "application/json");
+        if (req.url === "/api/auth/device/authorize") {
+          res.statusCode = 201;
+          res.end(JSON.stringify({ deviceCode: "dvc_migrate", userCode: "MIGR-1234", verificationUri: "https://app.raft.build/login/device", expiresIn: 30, interval: 1 }));
+        } else if (req.url === "/api/auth/device/token") {
+          res.statusCode = 200;
+          res.end(JSON.stringify({ kind: "computer_migrate", migrateToken: MIGRATE_TOKEN, expiresIn: 600, serverId: SERVER_A, serverSlug: SLUG_A, serverName: "Alpha" }));
+        } else if (req.url?.startsWith("/api/computer/legacy-machines")) {
+          res.statusCode = 200;
+          res.end(JSON.stringify({ entries: [{ daemonId: "legacy-a", apiKeyFingerprint: FP_A, machineName: "old-laptop", hostname: "test-host", lastSeenAt: null, legacyKeyMigratedAt: null, hasFingerprint: true }] }));
+        } else if (req.url === "/api/computer/adopt-legacy") {
+          res.statusCode = 201;
+          res.end(JSON.stringify({ apiKey: "sk_computer_migrated", computerId: "cm-migrated", machineId: "legacy-a", serverId: SERVER_A, resumed: false }));
+        } else if (req.url === "/internal/computer/preflight") {
+          res.statusCode = 200;
+          res.end(JSON.stringify({ ok: true, serverSlug: SLUG_A }));
+        } else {
+          res.statusCode = 404;
+          res.end("{}");
+        }
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    assert.ok(address && typeof address === "object");
+    const calls: string[] = [];
+    const cap = captureOut();
+    try {
+      await runSetup(
+        { serverSlug: "/alpha", serverUrl: `http://127.0.0.1:${address.port}` },
+        {
+          isTty: true,
+          requestMigrateApproval: undefined,
+          buildServersClient: () => ({ list: async () => { calls.push("servers"); return { status: "success" as const, servers: DEFAULT_USER_SERVERS }; } }),
+          runLogin: async () => { calls.push("login"); },
+          pickMigrationCandidate: async () => ({ kind: "candidate", index: 0 }),
+          diagnosticsPush: (async () => ({ outcome: "skipped" })) as unknown as NonNullable<SetupDeps["diagnosticsPush"]>,
+          runStart: async (opts) => { calls.push(`start:${opts?.serverId}`); },
+        },
+      );
+    } finally {
+      cap.restore();
+      await new Promise<void>((resolve, reject) => server.close((err) => (err ? reject(err) : resolve())));
+    }
+    const authorize = seen.find((r) => r.url === "/api/auth/device/authorize")!;
+    assert.equal(JSON.parse(authorize.body).grant.kind, "computer_migrate");
+    assert.equal(seen.filter((r) => r.url === "/api/auth/device/authorize").length, 1, "one approval, no grantless login");
+    const roster = seen.filter((r) => r.url.startsWith("/api/computer/legacy-machines"));
+    assert.ok(roster.length >= 1);
+    assert.ok(roster.every((r) => r.auth === `Bearer ${MIGRATE_TOKEN}`));
+    const adopt = seen.filter((r) => r.url === "/api/computer/adopt-legacy");
+    assert.equal(adopt.length, 1);
+    assert.equal(adopt[0]!.auth, `Bearer ${MIGRATE_TOKEN}`);
+    assert.deepEqual(JSON.parse(adopt[0]!.body), { serverSlug: SLUG_A, legacyMachineId: "legacy-a", apiKeyFingerprint: FP_A });
+    assert.equal(seen.some((r) => r.url.startsWith("/api/servers") || r.url === "/api/computer/attach"), false);
+    assert.deepEqual(calls, [`start:${SERVER_A}`], "no session login, no server list");
+    assert.equal(await readFile(userSessionPath(home), "utf8").catch(() => null), null, "no user-session.json");
+    const saved = JSON.parse(await readFile(serverAttachmentPath(home, SERVER_A), "utf8")) as { apiKey?: string };
+    assert.equal(saved.apiKey, "sk_computer_migrated");
+    assert.doesNotMatch(cap.text(), /dvmt_|sk_computer_migrated/);
+    assert.match(cap.text(), /Then enter this code on the page: MIGR-1234/);
+  });
+});
+
+test("setup (legacy-daemon branch): a migrate token the server stops taking is renewed with a new approval, never a session login", async () => {
+  await withHome(async (home) => {
+    const calls: string[] = [];
+    const tokens = ["dvmt_first0123456789", "dvmt_second0123456789"];
+    const rosterTokens: string[] = [];
+    await runSetup(
+      { serverSlug: "/alpha" },
+      {
+        isTty: true,
+        detectLegacyMigration: detectWithLegacyEvidence(calls),
+        buildRosterClient: (_baseUrl, token) => {
+          rosterTokens.push(token);
+          return {
+            list: async () => (token === tokens[0]
+              ? { status: "auth_required" as const }
+              : { status: "success" as const, entries: [] }),
+          };
+        },
+        requestMigrateApproval: async (input, options) => {
+          const next = tokens[calls.filter((c) => c === "approve").length]!;
+          calls.push("approve");
+          return approvedMigration([], next)(input, options);
+        },
+        runLogin: async () => { calls.push("login"); },
+        runAttach: async () => { calls.push("attach"); await writeAttach(home); },
+        runStart: async () => { calls.push("start"); },
+      },
+    );
+    assert.deepEqual(calls, ["detect", "approve", "approve", "attach", "start"]);
+    assert.deepEqual(rosterTokens, tokens);
+  });
+});
+
+test("setup (legacy-daemon branch): a server too old for computer_migrate (it refuses the grant kind) falls back to the user-session sign-in", async () => {
+  await withHome(async (home) => {
+    const authorizeBodies: Array<Record<string, unknown>> = [];
+    const server = createServer((req, res) => {
+      let body = "";
+      req.on("data", (chunk) => { body += String(chunk); });
+      req.on("end", () => {
+        res.setHeader("content-type", "application/json");
+        if (req.url === "/api/auth/device/authorize") {
+          authorizeBodies.push(JSON.parse(body) as Record<string, unknown>);
+          res.statusCode = 400;
+          res.end(JSON.stringify({ error: "grant.kind must be computer_attach or agent_key", code: "grant_invalid" }));
+          return;
+        }
+        res.statusCode = 404;
+        res.end("{}");
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    assert.ok(address && typeof address === "object");
+    const baseUrl = `http://127.0.0.1:${address.port}`;
+    const calls: string[] = [];
+    const rosterTokens: string[] = [];
+    let useUserSession: boolean | undefined;
+    const cap = captureOut();
+    try {
+      await runSetup(
+        { serverSlug: "/alpha", serverUrl: baseUrl },
+        {
+          isTty: true,
+          requestMigrateApproval: undefined,
+          detectLegacyMigration: detectWithLegacyEvidence(calls),
+          buildRosterClient: (_url, token) => { rosterTokens.push(token); return emptyRosterClient(); },
+          refreshUserSession: async () => false,
+          runLogin: async (opts) => {
+            assert.equal(opts.orchestrated, true);
+            calls.push("login");
+            await writeSession(home, baseUrl);
+          },
+          runAttach: async (opts) => {
+            calls.push("attach");
+            useUserSession = opts.useUserSession;
+            await writeAttach(home, SERVER_A, SLUG_A, baseUrl);
+          },
+          runStart: async () => { calls.push("start"); },
+        },
+      );
+    } finally {
+      cap.restore();
+      await new Promise<void>((resolve, reject) => server.close((err) => (err ? reject(err) : resolve())));
+    }
+    assert.equal(authorizeBodies.length, 1);
+    assert.equal((authorizeBodies[0]!.grant as Record<string, unknown>).kind, "computer_migrate");
+    assert.deepEqual(calls, ["detect", "login", "attach", "start"]);
+    assert.deepEqual(rosterTokens, ["tok"], "the old flow's session reads the roster");
+    assert.equal(useUserSession, true);
+    assert.match(cap.text(), /too old to approve moving an old daemon over in one step; signing in with a user session instead/);
+  });
+});
+
+test("setup (legacy-daemon branch, terminal): on a server too old for computer_migrate, the sign-in goes to the saved session's server, where the approval was asked", async () => {
+  await withHome(async (home) => {
+    let authorizeCount = 0;
+    const server = createServer((req, res) => {
+      req.resume();
+      req.on("end", () => {
+        res.setHeader("content-type", "application/json");
+        if (req.url === "/api/auth/device/authorize") {
+          authorizeCount += 1;
+          res.statusCode = 400;
+          res.end(JSON.stringify({ error: "grant.kind must be computer_attach or agent_key", code: "grant_invalid" }));
+          return;
+        }
+        res.statusCode = 404;
+        res.end("{}");
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    assert.ok(address && typeof address === "object");
+    const baseUrl = `http://127.0.0.1:${address.port}`;
+    // A working saved session on a non-default server, and no --server-url.
+    await writeSession(home, baseUrl);
+    const calls: string[] = [];
+    let loginServerUrl: string | undefined;
+    const cap = captureOut();
+    try {
+      await runSetup(
+        { serverSlug: "/alpha" },
+        {
+          isTty: true,
+          requestMigrateApproval: undefined,
+          detectLegacyMigration: detectWithLegacyEvidence(calls),
+          buildRosterClient: emptyRosterClient,
+          refreshUserSession: async () => { calls.push("refresh"); return true; },
+          runLogin: async (opts) => {
+            calls.push("login");
+            loginServerUrl = opts.serverUrl;
+            await writeSession(home, baseUrl);
+          },
+          runAttach: async () => {
+            calls.push("attach");
+            await writeAttach(home, SERVER_A, SLUG_A, baseUrl);
+          },
+          runStart: async () => { calls.push("start"); },
+        },
+      );
+    } finally {
+      cap.restore();
+      await new Promise<void>((resolve, reject) => server.close((err) => (err ? reject(err) : resolve())));
+    }
+    assert.equal(authorizeCount, 1, "the approval was asked from the saved session's server");
+    assert.equal(loginServerUrl, baseUrl, "the fallback sign-in goes to that same server, not the default");
+    assert.deepEqual(calls, ["detect", "login", "attach", "start"], "the saved session is not refreshed in a terminal");
+  });
+});
+
+test("setup (legacy-daemon branch): non-TTY with no usable user session refuses before asking for any approval", async () => {
+  await withHome(async () => {
+    const calls: string[] = [];
+    await assert.rejects(
+      setupCore(
+        resolveHomeForCore(),
+        { serverSlug: "alpha", yes: true },
+        {
+          isTty: false,
+          detectLegacyMigration: detectWithLegacyEvidence(calls),
+          buildRosterClient: emptyRosterClient,
+          refreshUserSession: async () => false,
+          requestMigrateApproval: approvedMigration(calls),
+          runLogin: async () => { calls.push("login"); },
+        },
+        () => {},
+      ),
+      (err: unknown) => err instanceof ComputerError && err.code === "NON_INTERACTIVE_SETUP_REQUIRES_FLAGS",
+    );
+    assert.deepEqual(calls, ["detect"]);
   });
 });
 
@@ -397,7 +840,7 @@ test("setup: non-TTY without explicit --yes fails closed", async () => {
   });
 });
 
-test("setup: account-unavailable target fails through the production guard before any migration/runtime call", async () => {
+test("setup (legacy-daemon branch): account-unavailable target fails through the production guard before any adoption/runtime call", async () => {
   await withHome(async (home) => {
     await writeSession(home);
     const calls: string[] = [];
@@ -417,10 +860,7 @@ test("setup: account-unavailable target fails through the production guard befor
                 ],
               }),
             }),
-            detectLegacyMigration: async () => {
-              calls.push("detect");
-              return { kind: "no_local_evidence" };
-            },
+            detectLegacyMigration: detectWithLegacyEvidence(calls),
             runAttach: async () => { calls.push("attach"); },
             runStart: async () => { calls.push("start"); },
             buildAccountUnavailableMessage: (input) => {
@@ -439,7 +879,7 @@ test("setup: account-unavailable target fails through the production guard befor
     } finally {
       cap.restore();
     }
-    assert.deepEqual(calls, ["account-unavailable"]);
+    assert.deepEqual(calls, ["detect", "account-unavailable"]);
     const text = cap.text();
     assert.equal(countOccurrences(text, /^What happened /gm), 1);
     assert.equal(countOccurrences(text, /^Next: /gm), 1);
@@ -448,7 +888,7 @@ test("setup: account-unavailable target fails through the production guard befor
     assert.match(text, /SETUP_SERVER_UNAVAILABLE_TO_ACCOUNT/);
     assert.match(text, /Server \/missing is not available to the account signed into Computer profile/);
     assert.match(text, /user u-1/);
-    assert.match(text, /SLOCK_HOME=.*raft-computer login/);
+    assert.doesNotMatch(text, /raft-computer login/);
     assert.match(text, /SLOCK_HOME=.*raft-computer setup '\/missing'/);
     assert.match(text, /https:\/\/app\.raft\.build\/s\/missing\//);
     assert.match(text, /State: No local Computer state change was confirmed by this command\./);
@@ -461,11 +901,20 @@ test("setup: account-unavailable target fails through the production guard befor
 test("account-unavailable catalogs keep placeholders aligned and fall back to English", () => {
   const placeholders = (text: string) =>
     [...text.matchAll(/\{([a-zA-Z]+)\}/g)].map((match) => match[1]).sort();
-  assert.deepEqual(
-    placeholders(ACCOUNT_UNAVAILABLE_MESSAGES["zh-cn"].serverUnavailable),
-    placeholders(ACCOUNT_UNAVAILABLE_MESSAGES.en.serverUnavailable),
-  );
+  for (const locale of Object.keys(ACCOUNT_UNAVAILABLE_MESSAGES) as (keyof typeof ACCOUNT_UNAVAILABLE_MESSAGES)[]) {
+    assert.deepEqual(
+      placeholders(ACCOUNT_UNAVAILABLE_MESSAGES[locale].serverUnavailable),
+      placeholders(ACCOUNT_UNAVAILABLE_MESSAGES.en.serverUnavailable),
+      locale,
+    );
+  }
   assert.equal(resolveAccountUnavailableLocale({ LANG: "zh_CN.UTF-8" }), "zh-cn");
+  assert.equal(resolveAccountUnavailableLocale({ LANG: "ja_JP.UTF-8" }), "ja");
+  assert.equal(resolveAccountUnavailableLocale({ LC_ALL: "ko_KR.UTF-8", LANG: "en_US.UTF-8" }), "ko");
+  assert.equal(resolveAccountUnavailableLocale({ LANG: "zh_TW.UTF-8" }), "zh-tw");
+  assert.equal(resolveAccountUnavailableLocale({ LANG: "es_MX.UTF-8" }), "es");
+  assert.equal(resolveAccountUnavailableLocale({ LANG: "pt_PT.UTF-8" }), "pt-br");
+  assert.equal(resolveAccountUnavailableLocale({ LANG: "ru_RU.UTF-8" }), "ru");
   assert.equal(resolveAccountUnavailableLocale({ LANG: "fr_FR.UTF-8" }), "en");
   assert.equal(resolveAccountUnavailableLocale({}), "en");
 });
@@ -510,7 +959,6 @@ test("account-unavailable copy identifies default/named profiles without exposin
       assert.match(namedCopy, /profile "client-b" \(@alice\)/);
       assert.doesNotMatch(defaultCopy, /alice-secret@example\.test/);
       const command =
-        `SLOCK_HOME="$HOME"/'${dirname}/profiles/<other-profile>' raft-computer login && ` +
         `SLOCK_HOME="$HOME"/'${dirname}/profiles/<other-profile>' raft-computer setup '/project'`;
       assert.ok(defaultCopy.includes(`\`${command}\``));
       assert.ok(namedCopy.includes(`\`${command}\``));
@@ -518,7 +966,7 @@ test("account-unavailable copy identifies default/named profiles without exposin
   }
 });
 
-test("account-unavailable copy renders zh-cn and a single executable Windows recovery command", () => {
+test("account-unavailable copy under a zh-cn locale has a single executable Windows recovery command", () => {
   withHomeDir(".slock", (homeDir) => {
     const copy = accountUnavailableMessage({
       serverLabel: "/项目",
@@ -531,8 +979,7 @@ test("account-unavailable copy renders zh-cn and a single executable Windows rec
     });
     const command =
       "$env:SLOCK_HOME = $HOME + '\\.slock\\profiles\\<other-profile>'; " +
-      "raft-computer login; if ($?) { raft-computer setup '/项目' }";
-    assert.match(copy, /当前 Computer 配置档 default 登录的账号（当前账号）无法访问服务器 \/项目/);
+      "raft-computer setup '/项目'";
     assert.ok(copy.includes(`\`${command}\``));
     assert.equal(countOccurrences(copy, /`/g), 2);
     assert.deepEqual(inferNextCommands("SETUP_SERVER_UNAVAILABLE_TO_ACCOUNT", copy), [command]);
@@ -584,9 +1031,6 @@ test("account-unavailable recovery commands preserve adversarial values as liter
       readFileSync(capturePath, "utf8"),
       [
         `home=${expectedProfileHome}`,
-        "argc=1",
-        "arg=login",
-        `home=${expectedProfileHome}`,
         "argc=2",
         "arg=setup",
         `arg=${serverLabel}`,
@@ -604,7 +1048,7 @@ test("account-unavailable recovery commands preserve adversarial values as liter
   );
   assert.ok(powerShellCommand);
   const powerShellShape = powerShellCommand.match(
-    /^\$env:SLOCK_HOME = ('(?:[^']|'')*'); raft-computer login; if \(\$\?\) \{ raft-computer setup ('(?:[^']|'')*') \}$/,
+    /^\$env:SLOCK_HOME = ('(?:[^']|'')*'); raft-computer setup ('(?:[^']|'')*')$/,
   );
   assert.ok(powerShellShape, powerShellCommand);
   const decodePowerShellLiteral = (literal: string) =>
@@ -618,9 +1062,10 @@ for (const [caseName, name] of [
   ["same-account missing membership", "current-account"],
   ["different browser account with no signed intent", "other-account"],
 ] as const) {
-  test(`setup: ${caseName} is the same honest typed outcome and causes zero local/runtime mutation`, async () => {
+  test(`setup (legacy-daemon branch): ${caseName} is the same honest typed outcome and causes zero local/runtime mutation`, async () => {
     await withHome(async (home) => {
       await writeSession(home, "https://api.example.test", { name });
+      await writeLegacyOwner(home, "machine-aaaaaaaaaaaaaaaa", FP_A);
       const runDir = join(home, "computer", "run");
       await mkdir(runDir, { recursive: true });
       await writeFile(join(runDir, "service.pid"), "4242\n");
@@ -650,9 +1095,10 @@ for (const [caseName, name] of [
   });
 }
 
-test("setup: malformed server roster response fails closed without misclassifying an account mismatch", async () => {
+test("setup (legacy-daemon branch): malformed server roster response fails closed without misclassifying an account mismatch", async () => {
   await withHome(async (home) => {
     await writeSession(home, "https://api.example.test", { name: "alice" });
+    await writeLegacyOwner(home, "machine-aaaaaaaaaaaaaaaa", FP_A);
     const before = await treeFingerprint(home);
     let thrown: unknown;
     try {
@@ -677,7 +1123,7 @@ test("setup: malformed server roster response fails closed without misclassifyin
   });
 });
 
-test("setup: member-only target server fails before migration detection", async () => {
+test("setup (legacy-daemon branch): member-only target server fails before any adoption or attach", async () => {
   await withHome(async (home) => {
     await writeSession(home);
     const calls: string[] = [];
@@ -696,10 +1142,7 @@ test("setup: member-only target server fails before migration detection", async 
                 ],
               }),
             }),
-            detectLegacyMigration: async () => {
-              calls.push("detect");
-              return { kind: "no_local_evidence" };
-            },
+            detectLegacyMigration: detectWithLegacyEvidence(calls),
             runAttach: async () => { calls.push("attach"); },
             runStart: async () => { calls.push("start"); },
           },
@@ -709,7 +1152,7 @@ test("setup: member-only target server fails before migration detection", async 
     } finally {
       cap.restore();
     }
-    assert.deepEqual(calls, []);
+    assert.deepEqual(calls, ["detect"]);
     const text = cap.text();
     assert.equal(countOccurrences(text, /^What happened /gm), 1);
     assert.equal(countOccurrences(text, /^Next: /gm), 1);
@@ -725,7 +1168,7 @@ test("setup: member-only target server fails before migration detection", async 
   });
 });
 
-test("setup: future unknown role stays visible but fails closed as non-attachable", async () => {
+test("setup (legacy-daemon branch): future unknown role stays visible but fails closed as non-attachable", async () => {
   await withHome(async (home) => {
     await writeSession(home);
     const calls: string[] = [];
@@ -744,10 +1187,7 @@ test("setup: future unknown role stays visible but fails closed as non-attachabl
               ],
             }),
           }),
-          detectLegacyMigration: async () => {
-            calls.push("detect");
-            return { kind: "no_local_evidence" };
-          },
+          detectLegacyMigration: detectWithLegacyEvidence(calls),
           runAttach: async () => { calls.push("attach"); },
           runStart: async () => { calls.push("start"); },
         },
@@ -758,7 +1198,7 @@ test("setup: future unknown role stays visible but fails closed as non-attachabl
     }
     assert.ok(thrown instanceof ComputerError);
     assert.equal((thrown as ComputerError).code, "SETUP_REQUIRES_ADMIN");
-    assert.deepEqual(calls, []);
+    assert.deepEqual(calls, ["detect"]);
   });
 });
 
@@ -783,7 +1223,7 @@ test("setup: --no-start stops after creating attachment", async () => {
   });
 });
 
-test("setup: forwards orchestrated:true to login/attach to suppress Next hints", async () => {
+test("setup: forwards orchestrated:true to attach to suppress Next hints", async () => {
   await withHome(async (home) => {
     const seen: { login?: boolean; attach?: boolean } = {};
     await runSetup(
@@ -801,7 +1241,7 @@ test("setup: forwards orchestrated:true to login/attach to suppress Next hints",
         runStart: async () => { /* no-op */ },
       },
     );
-    assert.equal(seen.login, true, "setup must forward orchestrated:true to login");
+    assert.equal(seen.login, undefined, "a fresh attach never runs the session login");
     assert.equal(seen.attach, true, "setup must forward orchestrated:true to attach");
   });
 });
@@ -906,6 +1346,10 @@ function excludedCandidateForFingerprint(fp: string, reasons: string[] = ["not_i
   };
 }
 
+function resolveHomeForCore(): string {
+  return process.env.SLOCK_HOME!;
+}
+
 function rosterClientStub(
   entries: Array<{
     daemonId?: string;
@@ -973,6 +1417,9 @@ test("setup output: fresh happy path stays within v1.4 five-line budget", async 
         {
           isTty: false,
           attachService: async () => {
+            throw new Error("a fresh attach without legacy evidence must not use the user-session attach");
+          },
+          attachWithApprovalService: async () => {
             await writeAttach(home);
             return {
               serverId: SERVER_A,
@@ -991,10 +1438,9 @@ test("setup output: fresh happy path stays within v1.4 five-line budget", async 
       cap.restore();
     }
     assert.deepEqual(cap.text().trim().split("\n"), [
-      "Logging in… done (already logged in).",
       "Connecting this computer to /alpha… done.",
       "Raft Computer is running. Agents can now use this computer.",
-      "Next: chat with your agents at https://app.raft.build/alpha",
+      "Next: chat with your agents at https://app.raft.build/s/alpha/",
       "(check this computer anytime with `raft-computer status`)",
     ]);
   });
@@ -1133,6 +1579,7 @@ test("setup output: zero-match q prints human unchanged line before nonzero exit
           { serverSlug: "/alpha" },
           {
             isTty: true,
+            requestMigrateApproval: approvedMigration([]),
             detectLegacyMigration: (async () => ({
               kind: "zero_match",
               excluded: [{
@@ -1176,6 +1623,7 @@ test("setup: unlinked stale runner state is archived and setup re-enters migrati
         { serverSlug: "/alpha" },
         {
           isTty: true,
+          requestMigrateApproval: approvedMigration([]),
           buildRosterClient: rosterClientStub([
             { apiKeyFingerprint: FP_A, machineName: "wenyi-old" },
           ]),
@@ -1216,6 +1664,82 @@ test("setup: unlinked stale runner state is archived and setup re-enters migrati
   });
 });
 
+test("setup: a start ended by a runner lock conflict archives unlinked state the same way a timeout does", async () => {
+  for (const errorKind of ["service", "cli"] as const) {
+    await withHome(async (home) => {
+      await writeSession(home);
+      await writeAttach(home);
+      await writeLegacyOwner(home, "machine-aaaaaaaaaaaaaaaa", FP_A);
+      // The runner was told its machine is unlinked; start's wait then ended
+      // on a lock conflict, whose message names only the lock.
+      await markTerminalUnlinked(home, SERVER_A, `cm-${SERVER_A}`, 401);
+      const calls: string[] = [];
+      let startCalls = 0;
+      const cap = captureOut();
+      try {
+        await runSetup(
+          { serverSlug: "/alpha" },
+          {
+            isTty: true,
+            requestMigrateApproval: approvedMigration([]),
+            buildRosterClient: rosterClientStub([{ apiKeyFingerprint: FP_A, machineName: "wenyi-old" }]),
+            pickMigrationCandidate: async () => { calls.push("pick"); return { kind: "candidate", index: 0 }; },
+            adoptLegacyByFingerprint: async () => {
+              calls.push("adopt");
+              await writeAttach(home);
+              return adoptedResult(home);
+            },
+            runAttach: async () => { calls.push("attach"); },
+            runStart: async () => {
+              startCalls += 1;
+              calls.push(`start:${startCalls}`);
+              if (startCalls === 1) {
+                const message = "Cannot start /alpha: pid 4242 holds this machine's daemon lock, so the Computer service is deferring to it instead of starting its own runner.";
+                throw errorKind === "service"
+                  ? new ComputerServiceError("START_RUNNER_LOCK_CONFLICT", message)
+                  : new CliExit(1, "START_RUNNER_LOCK_CONFLICT");
+              }
+            },
+          },
+        );
+      } finally {
+        cap.restore();
+      }
+      assert.deepEqual(calls, ["start:1", "pick", "adopt", "start:2"], errorKind);
+      const names = await readdir(dirname(serverAttachmentPath(home, SERVER_A)));
+      assert.equal(names.filter((name) => /runner\.state\.json\.unlinked-.*\.bak/.test(name)).length, 1, errorKind);
+      assert.match(cap.text(), /archived stale unlinked runner state/);
+    });
+  }
+});
+
+test("setup: a runner lock conflict without unlinked state is reported, nothing archived", async () => {
+  await withHome(async (home) => {
+    await writeSession(home);
+    await writeAttach(home);
+    const cap = captureOut();
+    try {
+      await assert.rejects(
+        runSetup(
+          { serverSlug: "/alpha" },
+          {
+            isTty: true,
+            runStart: async () => {
+              throw new ComputerServiceError("START_RUNNER_LOCK_CONFLICT", "Cannot start /alpha: pid 4242 holds this machine's daemon lock, so the Computer service is deferring to it instead of starting its own runner.");
+            },
+          },
+        ),
+        (err: unknown) => err instanceof CliExit && err.code === "START_RUNNER_LOCK_CONFLICT",
+      );
+    } finally {
+      cap.restore();
+    }
+    const names = await readdir(dirname(serverAttachmentPath(home, SERVER_A)));
+    assert.equal(names.filter((name) => name.includes(".unlinked-")).length, 0);
+    assert.ok(names.includes("runner.state.json"));
+  });
+});
+
 test("setup: adopted connection restarts service when stale running memory reports unlinked", async () => {
   await withHome(async (home) => {
     await writeSession(home);
@@ -1228,6 +1752,7 @@ test("setup: adopted connection restarts service when stale running memory repor
         { serverSlug: "/alpha" },
         {
           isTty: true,
+          requestMigrateApproval: approvedMigration([]),
           buildRosterClient: rosterClientStub([
             { apiKeyFingerprint: FP_A, machineName: "wenyi-old" },
           ]),
@@ -1282,6 +1807,7 @@ test("setup output: §1b n exits with human unchanged line", async () => {
           { serverSlug: "/alpha" },
           {
             isTty: true,
+            requestMigrateApproval: approvedMigration([]),
             buildRosterClient: rosterClientStub([{ apiKeyFingerprint: FP_A }]),
             pickMigrationCandidate: async () => ({ kind: "quit" }),
             runAttach: async () => { throw new Error("attach MUST NOT run after n"); },
@@ -1310,6 +1836,7 @@ test("setup: §X.4 zero-match local evidence — picker fresh selection proceeds
         { serverSlug: "/alpha" },
         {
           isTty: true,
+          requestMigrateApproval: approvedMigration([]),
           // Roster has no entry matching FP_A → empty intersection.
           buildRosterClient: rosterClientStub([
             { apiKeyFingerprint: "ffffffffffffffff" },
@@ -1436,6 +1963,7 @@ test("setup: §X.4 server-unavailable — info logged, fresh attach proceeds", a
         { serverSlug: "/alpha" },
         {
           isTty: true,
+          requestMigrateApproval: approvedMigration([]),
           buildRosterClient: rosterClientUnavailable(),
           pickRosterUnavailable: async () => ({ kind: "fresh" }),
           pickMigrationCandidate: async () => { throw new Error("picker MUST NOT fire"); },
@@ -1781,6 +2309,7 @@ test("setup: dismissed zero-match evidence never hides a future matched candidat
       { serverSlug: "/alpha", start: false },
       {
         isTty: true,
+        requestMigrateApproval: approvedMigration([]),
         detectLegacyMigration: (async () => ({
           kind: "matched",
           candidates: [{
@@ -1815,6 +2344,7 @@ test("setup: zero-match TTY can adopt an includeAll server row by daemonId", asy
         { serverSlug: "/alpha" },
         {
           isTty: true,
+          requestMigrateApproval: approvedMigration([]),
           detectLegacyMigration: (async () => ({
             kind: "zero_match",
             excluded: [futureExcludedCandidate(
@@ -1881,6 +2411,7 @@ test("setup: matched adjudication prints excluded rows before the picker", async
         { serverSlug: "/alpha" },
         {
           isTty: true,
+          requestMigrateApproval: approvedMigration([]),
           detectLegacyMigration: (async () => ({
             kind: "matched",
             candidates: [fakeCandidate(1)],
@@ -2228,6 +2759,7 @@ test("setup: §X.4 picker fresh — typed-new selection → fresh attach", async
         { serverSlug: "/alpha" },
         {
           isTty: true,
+          requestMigrateApproval: approvedMigration([]),
           buildRosterClient: rosterClientStub([{ apiKeyFingerprint: FP_A }]),
           pickMigrationCandidate: async () => { pickerCalls += 1; return { kind: "fresh" }; },
           runAttach: async () => {
@@ -2264,6 +2796,7 @@ test("setup: §X.4 picker candidate — selection N → adopt-by-fingerprint inv
         { serverSlug: "/alpha" },
         {
           isTty: true,
+          requestMigrateApproval: approvedMigration([]),
           buildRosterClient: rosterClientStub([
             { apiKeyFingerprint: FP_A, machineName: "alice-laptop" },
             { apiKeyFingerprint: FP_B, machineName: "bob-laptop" },
@@ -2333,6 +2866,7 @@ test("setup: §X.4 picker candidate + missing legacy api key → adopts without 
         { serverSlug: "/alpha" },
         {
           isTty: true,
+          requestMigrateApproval: approvedMigration([]),
           buildRosterClient: rosterClientStub([{ apiKeyFingerprint: FP_A }]),
           pickMigrationCandidate: async () => ({ kind: "candidate", index: 0 }),
           adoptLegacyByFingerprint: async (input) => {
@@ -2376,6 +2910,7 @@ test("setup: §X.4 picker candidate + malformed SLOCK_LEGACY_API_KEY → ignores
         { serverSlug: "/alpha" },
         {
           isTty: true,
+          requestMigrateApproval: approvedMigration([]),
           buildRosterClient: rosterClientStub([{ apiKeyFingerprint: FP_A }]),
           pickMigrationCandidate: async () => ({ kind: "candidate", index: 0 }),
           adoptLegacyByFingerprint: async (input) => {

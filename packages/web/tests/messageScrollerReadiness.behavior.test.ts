@@ -1,7 +1,4 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
-import os from "node:os";
-import path from "node:path";
 import vm from "node:vm";
 
 import {
@@ -102,11 +99,10 @@ class FakePage {
   }
 }
 
-function fakeRequest(rawUrl: string, failureText?: string, traceparent?: string) {
+function fakeRequest(rawUrl: string, failureText?: string) {
   return {
     method: () => "GET",
     url: () => rawUrl,
-    headers: () => traceparent ? { traceparent } : {},
     failure: () => failureText ? { errorText: failureText } : null,
   };
 }
@@ -200,7 +196,6 @@ test("failed readiness attaches a bounded sanitized lifecycle receipt and rethro
     id: 1,
     kind: "messages",
     startedAtMs: (receipt?.requests as Array<{ startedAtMs: number }>)[0].startedAtMs,
-    traceCorrelationState: "unavailable",
     responseAtMs: (receipt?.requests as Array<{ responseAtMs: number }>)[0].responseAtMs,
     status: 200,
     finishedAtMs: (receipt?.requests as Array<{ finishedAtMs: number }>)[0].finishedAtMs,
@@ -213,135 +208,6 @@ test("failed readiness attaches a bounded sanitized lifecycle receipt and rethro
   assert.equal(serialized.includes("http://"), false);
 });
 
-test("failed readiness retains the opaque browser/server request correlation in its own attachment", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "readiness-correlation-"));
-  onTestFinished(() => rm(directory, { recursive: true, force: true }));
-  const runId = "11111111-1111-4111-8111-111111111111";
-  const traceId = "a".repeat(32);
-  const traceparent = `00-${traceId}-${"b".repeat(16)}-01`;
-  const oldDirectory = process.env.SLOCK_E2E_TRANSPORT_DIR;
-  const oldRunId = process.env.SLOCK_E2E_TRANSPORT_RUN_ID;
-  process.env.SLOCK_E2E_TRANSPORT_DIR = directory;
-  process.env.SLOCK_E2E_TRANSPORT_RUN_ID = runId;
-  onTestFinished(() => {
-    if (oldDirectory === undefined) delete process.env.SLOCK_E2E_TRANSPORT_DIR;
-    else process.env.SLOCK_E2E_TRANSPORT_DIR = oldDirectory;
-    if (oldRunId === undefined) delete process.env.SLOCK_E2E_TRANSPORT_RUN_ID;
-    else process.env.SLOCK_E2E_TRANSPORT_RUN_ID = oldRunId;
-  });
-
-  const serverEventTime = new Date().toISOString();
-  await writeFile(path.join(directory, "server.jsonl"), [
-    { version: 1, runId, time: serverEventTime, event: "readiness_request_arrival", traceId, requestKind: "messages" },
-    { version: 1, runId, time: serverEventTime, event: "readiness_request_finish", traceId, requestKind: "messages", status: 200 },
-  ].map((row) => JSON.stringify(row)).join("\n") + "\n");
-  const apiInstanceId = "22222222-2222-4222-8222-222222222222";
-  const apiStartedAt = Date.now() - 100;
-  await writeFile(path.join(directory, "server-api.jsonl"), [
-    { version: 1, runId, instanceId: apiInstanceId, sequence: 1, time: new Date(apiStartedAt - 1).toISOString(), event: "process_start" },
-    ...Array.from({ length: 6 }, (_, index) => ({
-      version: 1,
-      runId,
-      instanceId: apiInstanceId,
-      sequence: index + 2,
-      time: new Date(apiStartedAt + index).toISOString(),
-      event: "api_request_begin",
-      apiRequestId: index + 1,
-      connectionId: index + 1,
-    })),
-  ].map((row) => JSON.stringify(row)).join("\n") + "\n");
-
-  const page = new FakePage();
-  const original = new Error("original visibility assertion");
-  const targetRequest = fakeRequest(
-    "http://localhost/api/messages/channel/target-channel?secret=do-not-record",
-    undefined,
-    traceparent,
-  );
-  let receipt: {
-    requests?: Array<{
-      id?: number;
-      kind?: string;
-      startedAtMs?: number;
-      traceId?: string;
-      traceCorrelationState?: string;
-    }>;
-    requestEvidence?: { source?: string; interpretation?: string };
-    serverEvidence?: {
-      state?: string;
-      source?: string;
-      retention?: string;
-      records?: Array<{ traceId?: string; kind?: string; stage?: string; status?: number }>;
-    };
-    apiOccupancy?: {
-      state?: string;
-      coverage?: string;
-      snapshots?: Array<{
-        traceId?: string;
-        clientStartedAtMs?: number;
-        atClientStart?: {
-          state?: string;
-          observedActiveRequestCount?: number;
-          observedActiveConnectionCount?: number;
-        };
-        targetServerRequest?: { state?: string };
-        releasesBeforeAssertionEnd?: unknown[];
-        releasesTruncated?: number;
-      }>;
-    };
-  } | null = null;
-
-  const caught = await withMessageScrollerReadinessEvidence(
-    page as never,
-    {
-      retry: 0,
-      attach: async (_name: string, attachment: { body: Buffer }) => {
-        receipt = JSON.parse(attachment.body.toString("utf8"));
-      },
-    } as never,
-    { consumer: "unread-click-read", channelId: "target-channel" },
-    async () => {
-      page.emit("request", targetRequest);
-      throw original;
-    },
-  ).catch(error => error);
-
-  assert.equal(caught, original);
-  const browserRequest = receipt?.requests?.[0];
-  assert.ok(browserRequest);
-  assert.equal(typeof browserRequest.startedAtMs, "number");
-  assert.deepEqual(browserRequest, {
-    id: 1,
-    kind: "messages",
-    startedAtMs: browserRequest.startedAtMs,
-    traceCorrelationState: "available",
-    traceId,
-  });
-  assert.equal(receipt?.requestEvidence?.source, "playwright-page-request-events");
-  assert.match(receipt?.requestEvidence?.interpretation ?? "", /not server arrival/);
-  assert.equal(receipt?.serverEvidence?.state, "matched");
-  assert.equal(receipt?.serverEvidence?.source, "playwright-node-api-server-http-events");
-  assert.equal(receipt?.serverEvidence?.retention, "copied-into-failure-attachment");
-  assert.deepEqual(receipt?.serverEvidence?.records?.map((record) => ({
-    traceId: record.traceId,
-    kind: record.kind,
-    stage: record.stage,
-    status: record.status,
-  })), [
-    { traceId, kind: "messages", stage: "arrival", status: undefined },
-    { traceId, kind: "messages", stage: "response-finished", status: 200 },
-  ]);
-  assert.equal(receipt?.apiOccupancy?.state, "matched");
-  assert.equal(receipt?.apiOccupancy?.coverage, "complete-from-process-start");
-  assert.equal(receipt?.apiOccupancy?.snapshots?.[0]?.traceId, traceId);
-  assert.equal(receipt?.apiOccupancy?.snapshots?.[0]?.atClientStart?.state, "known");
-  assert.equal(receipt?.apiOccupancy?.snapshots?.[0]?.atClientStart?.observedActiveRequestCount, 6);
-  assert.equal(receipt?.apiOccupancy?.snapshots?.[0]?.atClientStart?.observedActiveConnectionCount, 6);
-  assert.equal(receipt?.apiOccupancy?.snapshots?.[0]?.targetServerRequest?.state, "not-observed");
-  assert.deepEqual(receipt?.apiOccupancy?.snapshots?.[0]?.releasesBeforeAssertionEnd, []);
-  assert.equal(receipt?.apiOccupancy?.snapshots?.[0]?.releasesTruncated, 0);
-  assert.doesNotMatch(JSON.stringify(receipt), /secret|do-not-record|http:\/\//);
-});
 
 test("browser probe scopes loading state to the message content surface and shares the request timeline", async () => {
   const page = new FakePage();

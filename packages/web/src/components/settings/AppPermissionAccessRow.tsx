@@ -2,8 +2,8 @@ import { useCallback, useMemo } from "react";
 import { useIntl } from "react-intl";
 import type { AppNotificationGroup } from "@botiverse/raft-shared";
 import { Select, SelectContent, SelectIcon, SelectItem, SelectItemIndicator, SelectItemText, SelectList, SelectTrigger, SelectValue, TableCell, TableRow } from "@botiverse/raft-ui";
-import { APP_NOTIFICATION_GROUP_META, permissionGroupLabel, toggleAppNotificationGroup } from "./AppNotificationsControls";
-import type { AppNotificationSelection } from "./AppNotificationsControls";
+import { APP_NOTIFICATION_GROUP_META, permissionGroupLabel, toggleAppNotificationGroup } from "./appNotificationSelection";
+import type { AppNotificationSelection } from "./appNotificationSelection";
 
 /** One resource row of the developer app-permissions table. It owns its access
     options and change handler so the table passes only stable references

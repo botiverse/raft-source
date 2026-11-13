@@ -2,14 +2,14 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { createApiTest } from "../test/integration/apiTest";
-import { fixturePasswordHash } from "../test/integration/credentials";
+import { fixturePasswordHash, signInForTest } from "../test/integration/credentials";
 import { getDb } from "../db/index";
 import { agents, oauthAccessTokens, oauthClients, oauthGrants, serverAgentMembers, users } from "../db/schema";
 import { createServer, removeMember } from "../services/serverService";
 import { createAgent } from "../services/agentService";
 import { createOAuthClient, issueHumanAuthorizationCode, requestAgentAccess } from "../services/oauthService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 async function setup() {
   const suffix = randomUUID();
@@ -33,7 +33,7 @@ async function setup() {
 
 async function token(baseUrl: string, f: Awaited<ReturnType<typeof setup>>, principal: "human" | "agent", scopes = ["openid", "profile", "agent:read"]) {
   const code = principal === "human"
-    ? (await issueHumanAuthorizationCode({ clientKey: f.client.clientId, userId: f.owner.id, serverId: f.server.id, returnUrl: f.client.returnUrl!, scopes })).code
+    ? (await issueHumanAuthorizationCode({ clientKey: f.client.clientId, userId: f.owner.id, serverId: f.server.id, returnUrl: f.client.returnUrl!, scopes, approverSessionFamilyId: (await signInForTest(f.owner.id)).familyId })).code
     : (await requestAgentAccess({ clientId: f.client.id, serverSlug: f.server.slug, agentName: f.agent.name, scopes })).request.id;
   const response = await fetch(`${baseUrl}/api/oauth/token`, {
     method: "POST",
@@ -50,13 +50,17 @@ for (const principal of ["human", "agent"] as const) {
     const bearer = await token(app.baseUrl, f, principal);
     const headers = { Authorization: `Bearer ${bearer}` };
     for (const prefix of ["", `/oidc/${f.server.slug}`, `/oidc/${f.server.id}`]) {
-      const response = await fetch(`${app.baseUrl}${prefix}/api/oauth/agents?server_id=${f.other.id}&agentId=${f.foreign.id}`, { headers });
+      const response = await fetch(`${app.baseUrl}${prefix}/api/oauth/agents?server_id=${f.server.id}&agentId=${f.foreign.id}`, { headers });
       assert.equal(response.status, 200);
       assert.equal(response.headers.get("cache-control"), "no-store");
       const body = await response.json() as { agents: Array<Record<string, unknown>> };
       assert.deepEqual(body.agents.map((a) => a.id), [f.agent.id]);
       assert.deepEqual(Object.keys(body.agents[0]).sort(), ["avatar_url", "display_name", "handle", "id", "picture"]);
       assert.equal(body.agents[0].handle, "DirectoryAgent");
+      // Another Server's id cannot switch the directory (RFC 079 D12).
+      const switched = await fetch(`${app.baseUrl}${prefix}/api/oauth/agents?server_id=${f.other.id}`, { headers });
+      assert.equal(switched.status, 403);
+      assert.equal("agents" in await switched.json(), false);
     }
     const crossServer = await fetch(`${app.baseUrl}/oidc/${f.other.slug}/api/oauth/agents`, { headers });
     assert.equal(crossServer.status, 401);
@@ -88,7 +92,7 @@ test("webhook groups cannot grant the directory scope; missing, revoked and expi
   await getDb().update(oauthClients).set({ allowedScopes: ["openid", "profile"], outboundCurrentGroups: ["agent"] }).where(eq(oauthClients.id, f.client.id));
   await assert.rejects(() => issueHumanAuthorizationCode({
     clientKey: f.client.clientId, userId: f.owner.id, serverId: f.server.id,
-    returnUrl: f.client.returnUrl!, scopes: ["agent:read"],
+    returnUrl: f.client.returnUrl!, scopes: ["agent:read"], approverSessionFamilyId: null,
   }));
   const identityOnly = await token(app.baseUrl, f, "human", ["openid", "profile"]);
   const read = (credential?: string) => fetch(`${app.baseUrl}/api/oauth/agents`, { headers: credential ? { Authorization: `Bearer ${credential}` } : {} });
@@ -111,3 +115,21 @@ test("webhook groups cannot grant the directory scope; missing, revoked and expi
   await getDb().update(oauthGrants).set({ revokedAt: new Date() }).where(eq(oauthGrants.clientId, f.client.id));
   assert.equal((await read(renewed)).status, 401);
 });
+
+// Only its owner finds a personal assistant (agentFindableBy). An App reading
+// the directory is not its owner, even signed in as them: the directory is the
+// server's agents a member list shows (listedServerAgent), never an assistant.
+for (const principal of ["human", "agent"] as const) {
+  test(`agent directory never lists a personal assistant (${principal} token)`, async ({ app }) => {
+    const f = await setup();
+    const assistant = await createAgent(f.server.id, `assistant-${randomUUID().slice(0, 6)}`, {
+      runtime: "external", model: "external", creatorType: "user", creatorId: f.owner.id, kind: "personal_assistant",
+    });
+    await getDb().update(agents).set({ assistantOwnerUserId: f.owner.id }).where(eq(agents.id, assistant.id));
+    const bearer = await token(app.baseUrl, f, principal);
+    const response = await fetch(`${app.baseUrl}/api/oauth/agents`, { headers: { Authorization: `Bearer ${bearer}` } });
+    assert.equal(response.status, 200);
+    const body = await response.json() as { agents: Array<{ id: string }> };
+    assert.deepEqual(body.agents.map((a) => a.id), [f.agent.id], "the assistant is absent; the ordinary agent stays");
+  });
+}

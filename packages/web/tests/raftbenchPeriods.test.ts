@@ -1,6 +1,6 @@
 import { afterEach, expect, test, vi } from "vitest";
 import api from "../src/api/client";
-import { loadTaskPeriods } from "../src/raftbench/periodMetrics";
+import { loadTaskPeriods, loadTaskSnapshot } from "../src/raftbench/periodMetrics";
 vi.mock("../src/api/client", () => ({ default: { get: vi.fn() } }));
 afterEach(() => vi.clearAllMocks());
 const empty = { completed: 0, durationSamples: 0, meanHours: null, medianHours: null };
@@ -20,4 +20,14 @@ test.each(["window", "samples", "missing-mean", "count"])("rejects malformed %s 
   if (kind === "count") data.current.completed = -1;
   vi.mocked(api.get).mockResolvedValue({ data });
   await expect(loadTaskPeriods("s1", "2026-10-18T12:00:00Z", null, new AbortController().signal)).rejects.toThrow();
+});
+
+test("a snapshot with backlog tasks adds up: the server counts them in its total", async () => {
+  const snapshot = {
+    surfaces: 1, total: 3, backlog: 1, todo: 1, inProgress: 0, inReview: 0, done: 1, closed: 0,
+    humanCreated: 2, agentCreated: 1, durationSamples: 0, medianHours: null, p90Hours: null,
+    firstCreatedAt: null, latestCreatedAt: null, latestUpdatedAt: null,
+  };
+  vi.mocked(api.get).mockResolvedValueOnce({ data: snapshot });
+  await expect(loadTaskSnapshot("s1", null, new AbortController().signal)).resolves.toMatchObject({ backlog: 1, total: 3 });
 });

@@ -38,6 +38,12 @@ export interface CrashEntry {
   at: string; // ISO timestamp
   exitCode: number | null;
   signal: string | null;
+  /**
+   * Set when the exit was not a crash but still counts toward the budget:
+   * `external_signal` = the runner was stopped by a SIGTERM the service did
+   * not send. Absent on real crashes (and on files written before this field).
+   */
+  reason?: "external_signal";
 }
 
 export interface FatalConfigMarker {
@@ -143,6 +149,7 @@ export async function recordCrash(
   exitCode: number | null,
   signal: NodeJS.Signals | null,
   nowMs: number = Date.now(),
+  reason?: CrashEntry["reason"],
 ): Promise<void> {
   if (!isValidServerId(serverId)) return;
   const file = await readHealthFile(slockHome, serverId);
@@ -156,6 +163,7 @@ export async function recordCrash(
     at: new Date(nowMs).toISOString(),
     exitCode,
     signal,
+    ...(reason ? { reason } : {}),
   });
   await writeHealthFile(slockHome, serverId, file);
 }

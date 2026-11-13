@@ -1,5 +1,5 @@
-import { Badge, Button } from "@botiverse/raft-ui";
-import { BellRing, Clock3, Link2, RefreshCw, Repeat } from "lucide-react";
+import { Badge, Button, ScrollArea } from "@botiverse/raft-ui";
+import { AlarmClock, Clock, Link, RefreshCw, Repeat } from "lucide-react";
 import type { MouseEvent } from "react";
 import { useCallback } from "react";
 import { useIntl } from "react-intl";
@@ -51,7 +51,7 @@ function ReminderCard({
         <div className="break-words text-subhead font-semibold text-foreground">{reminder.title}</div>
         <div className="mt-1 flex flex-wrap items-center gap-2 text-caption text-foreground-muted">
           <span className="inline-flex items-center gap-1">
-            <Clock3 size={14} className="shrink-0 text-foreground-muted" />
+            <Clock size={14} className="shrink-0 text-foreground-muted" />
             {(() => {
               const parts = getRelativeTimeParts(reminder.fireAt);
               return formatRelativeTimeParts(parts.value, parts.unit, locale);
@@ -71,14 +71,14 @@ function ReminderCard({
               <a
                 href={reminder.msgPermalink}
                 onClick={handleMsgRefClick}
-                className="inline-flex h-[22px] max-w-full cursor-default items-center gap-1 truncate rounded-sticker bg-info-soft px-1.5 font-mono text-mono-meta text-foreground outline-none hover:press-overlay focus-visible:shadow-focus"
+                className="inline-flex h-[22px] md:pointer-fine:h-5 max-w-full cursor-default items-center gap-1 truncate rounded-sticker bg-info-soft px-1.5 font-mono text-mono-meta text-foreground outline-none hover:overlay-medium focus-visible:shadow-focus"
               >
-                <Link2 size={14} className="shrink-0 text-foreground-muted" />
+                <Link size={14} className="shrink-0 text-foreground-muted" />
                 <span className="truncate">{reminder.msgRef}</span>
               </a>
             ) : (
-              <span className="inline-flex h-[22px] max-w-full items-center gap-1 truncate rounded-sticker bg-inactive-soft px-1.5 font-mono text-mono-meta text-foreground-muted">
-                <Link2 size={14} className="shrink-0 text-foreground-muted" />
+              <span className="inline-flex h-[22px] md:pointer-fine:h-5 max-w-full items-center gap-1 truncate rounded-sticker bg-inactive-soft px-1.5 font-mono text-mono-meta text-foreground-muted">
+                <Link size={14} className="shrink-0 text-foreground-muted" />
                 <span className="truncate">{reminder.msgRef}</span>
               </span>
             )}
@@ -109,20 +109,14 @@ export default function AgentRemindersSection({
   const handleRetry = useCallback(() => {
     void onRetry?.();
   }, [onRetry]);
-  return (
-    <div
-      className={
-        isTab
-          ? "flex-1 overflow-y-auto bg-layer-canvas px-5 py-5"
-          : "px-5 py-4 border-t border-line-hairline"
-      }
-    >
+  const body = (
+    <>
       {isTab ? (
         loading ? <div className="mb-3 text-footnote text-foreground-hint">{formatMessage({ id: "common.loading" })}</div> : null
       ) : (
         <SectionHeader
           className="mb-3"
-          icon={<BellRing size={16} />}
+          icon={<AlarmClock size={16} />}
           label={formatMessage({ id: "agent.reminders.pendingLabel" })}
           count={reminders.length}
           action={
@@ -138,7 +132,7 @@ export default function AgentRemindersSection({
           intent="warning"
           density="sm"
           actions={onRetry ? (
-            <Button variant="outline" size="sm" type="button" onClick={handleRetry}>
+            <Button variant="outline" size="md" type="button" onClick={handleRetry}>
               <RefreshCw size={16} />
               {formatMessage({ id: "agent.reminders.retry" })}
             </Button>
@@ -150,7 +144,7 @@ export default function AgentRemindersSection({
         isTab ? (
           <EmptyState
             className="flex h-full flex-col items-center justify-center bg-layer-canvas"
-            icon={<BellRing size={36} />}
+            icon={<AlarmClock size={36} />}
             title={formatMessage({ id: "emptyState.noRemindersTitle" })}
             description={formatMessage({ id: "emptyState.noRemindersDesc" })}
           />
@@ -158,7 +152,7 @@ export default function AgentRemindersSection({
           <div className="text-callout text-foreground-hint">{formatMessage({ id: "agent.reminders.noPending" })}</div>
         )
       ) : (
-        <div className="space-y-3">
+        <div className="stack-y-3">
           {reminders.map((reminder) => (
             <ReminderCard
               key={reminder.reminderId}
@@ -168,6 +162,21 @@ export default function AgentRemindersSection({
           ))}
         </div>
       )}
-    </div>
+    </>
+  );
+  // The tab is its own page and scrolls in a raft-ui ScrollArea, named like
+  // the tab (a tab stop once it overflows). The padding stays on the area, so
+  // the empty state's full height is the area's. `variant` is fixed per
+  // caller, so the element never switches while mounted.
+  return isTab ? (
+    <ScrollArea
+      role="region"
+      aria-label={formatMessage({ id: "agent.detail.tab.reminders" })}
+      className="flex-1 bg-layer-canvas px-(--surface-inset) py-5"
+    >
+      {body}
+    </ScrollArea>
+  ) : (
+    <div className="px-(--surface-inset) py-4 border-t border-line-hairline">{body}</div>
   );
 }

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import {
+  allowedReasoningEffortsForModel,
   BUILTIN_RUNTIME_HOST_PROVIDER_ENV_SCRUB_KEYS,
   BUILTIN_RUNTIME_GATEWAY_PROVIDER_ENV_KEYS,
   BUILTIN_RUNTIME_PROVIDER_BLOCKED_HOST_ENV_KEYS,
@@ -14,10 +15,13 @@ import {
   getStaticRuntimeModelSourceSet,
   hasStaticRuntimeModelSource,
   hydrateRuntimeConfig,
+  parseRuntimeConfig,
   RUNTIME_MODELS,
+  runtimeChoiceModel,
   STATIC_RUNTIME_MODEL_SOURCE_IDS,
   STATIC_RUNTIME_MODEL_SOURCE_VERIFICATION,
   runtimeConfigToLaunchFields,
+  sanitizeRuntimeModelUnavailable,
 } from "./index";
 
 test("only declared closed catalogs are static model sources", () => {
@@ -106,6 +110,7 @@ test("Claude model catalog includes latest aliases and selected pinned versions"
       "Claude Opus 4.8",
       "Claude Opus 4.7",
       "Claude Opus 4.6",
+      "Claude Fable 5.2",
       "Claude Fable 5.1",
       "Claude Fable 5",
       "Claude Sonnet 5.5",
@@ -127,6 +132,7 @@ test("Claude model catalog includes latest aliases and selected pinned versions"
     "claude-opus-4-8",
     "claude-opus-4-7",
     "claude-opus-4-6",
+    "claude-fable-5-2",
     "claude-fable-5-1",
     "claude-fable-5",
     "claude-sonnet-5-5",
@@ -185,24 +191,27 @@ test("Grok bundled catalog offers 4.6 without changing the existing default or c
 });
 
 test("Built-in Kimi provider defaults mirror Pi internal defaults independent of display order", () => {
-  assert.equal(PI_BUILTIN_PROVIDER_DEFAULT_MODELS.moonshotai, "moonshotai/kimi-k2.6");
-  assert.equal(PI_BUILTIN_PROVIDER_DEFAULT_MODELS["moonshotai-cn"], "moonshotai-cn/kimi-k2.6");
-  assert.equal(PI_BUILTIN_PROVIDER_DEFAULT_MODELS.openrouter, "openrouter/moonshotai/kimi-k2.6");
+  // pi 1.5.1 moved the Moonshot defaults to K2.7 Code on both sites and openrouter.
+  assert.equal(PI_BUILTIN_PROVIDER_DEFAULT_MODELS.moonshotai, "moonshotai/kimi-k2.7-code");
+  assert.equal(PI_BUILTIN_PROVIDER_DEFAULT_MODELS["moonshotai-cn"], "moonshotai-cn/kimi-k2.7-code");
+  assert.equal(PI_BUILTIN_PROVIDER_DEFAULT_MODELS.openrouter, "openrouter/moonshotai/kimi-k2.7-code");
 
-  assert.equal(PI_BUILTIN_PROVIDER_MODELS.moonshotai[0]?.id, "moonshotai/kimi-k2.7-code");
-  assert.equal(PI_BUILTIN_PROVIDER_MODELS["moonshotai-cn"][0]?.id, "moonshotai-cn/kimi-k2.7-code");
+  // pi 1.5.0 added Kimi K3.1 Pro at the head of both Moonshot providers; the default stays K2.6.
+  assert.equal(PI_BUILTIN_PROVIDER_MODELS.moonshotai[0]?.id, "moonshotai/kimi-k3.1-pro");
+  assert.equal(PI_BUILTIN_PROVIDER_MODELS["moonshotai-cn"][0]?.id, "moonshotai-cn/kimi-k3.1-pro");
   assert.notEqual(PI_BUILTIN_PROVIDER_MODELS.moonshotai[0]?.id, PI_BUILTIN_PROVIDER_DEFAULT_MODELS.moonshotai);
 });
 
 test("Built-in Xiaomi MiMo provider is generated from the Pi model catalog", () => {
   const xiaomiModels = PI_BUILTIN_PROVIDER_MODELS.xiaomi;
 
-  // pi 1.3.0 (as 1.2.0, 1.1.0 and 1.0.2 did) lists MiMo-V2.6 first but keeps V2.5-Pro as the provider default.
-  assert.equal(PI_BUILTIN_PROVIDER_DEFAULT_MODELS.xiaomi, "xiaomi/mimo-v2.5-pro");
+  // pi 1.4.0 made MiMo-V2.6-Pro the provider default when the V2.5 ids left the catalog
+  // (1.3.0 and earlier listed V2.6 first but kept V2.5-Pro as the default).
+  assert.equal(PI_BUILTIN_PROVIDER_DEFAULT_MODELS.xiaomi, "xiaomi/mimo-v2.6-pro");
   assert.equal(xiaomiModels[0]?.id, "xiaomi/mimo-v2.6-pro");
   assert.equal(xiaomiModels[0]?.label, "MiMo-V2.6-Pro");
   assert.ok(xiaomiModels.some((model) => model.id === PI_BUILTIN_PROVIDER_DEFAULT_MODELS.xiaomi));
-  assert.ok(xiaomiModels.some((model) => model.id === "xiaomi/mimo-v2.5-pro-ultraspeed"));
+  assert.ok(xiaomiModels.some((model) => model.id === "xiaomi/mimo-v2.6-pro-ultraspeed"));
 });
 
 test("Built-in provider env keys are generated for every surfaced Pi provider", () => {
@@ -237,4 +246,31 @@ test("Provider Connections accepts exactly the builtin Pi schema provider catalo
     );
     assert.match(probe.baseUrl, /^https:\/\//u);
   }
+});
+
+test("runtime-reported unavailable models are validated, de-duplicated and length-capped", () => {
+  assert.equal(sanitizeRuntimeModelUnavailable(undefined), undefined);
+  assert.equal(sanitizeRuntimeModelUnavailable([{ id: "" }, null, "x"]), undefined);
+  const entries = sanitizeRuntimeModelUnavailable([
+    { id: "m", label: "  Model\n M ", reason: ` why ${"x".repeat(500)}` },
+    { id: "m", label: "dup", reason: "dup" },
+    { id: "n", reason: 7 },
+  ])!;
+  assert.deepEqual(entries.map((entry) => [entry.id, entry.label]), [["m", "Model M"], ["n", "n"]]);
+  assert.ok(entries[0]!.reason.startsWith("why x") && entries[0]!.reason.length <= 200);
+  assert.equal(entries[1]!.reason, "");
+  assert.equal(sanitizeRuntimeModelUnavailable(Array.from({ length: 80 }, (_, i) => ({ id: `m${i}`, label: "", reason: "" })))!.length, 50);
+});
+
+test("Antigravity's configured default allows no effort; a model only the Computer lists is left to its live list", () => {
+  assert.deepEqual(allowedReasoningEffortsForModel("antigravity", "default"), []);
+  assert.ok(allowedReasoningEffortsForModel("antigravity", "gemini-3.8-flash").includes("high"));
+  assert.ok(allowedReasoningEffortsForModel("claude", "claude-unlisted").includes("high"), "other runtimes keep the base set");
+  assert.equal(runtimeChoiceModel("antigravity")?.id, "default");
+  assert.equal(runtimeChoiceModel("claude"), undefined);
+  const parsed = parseRuntimeConfig({
+    runtimeConfig: { version: 1, runtime: "antigravity", model: { kind: "preset", id: "default" }, mode: { kind: "default" }, reasoningEffort: "high", envVars: null },
+  });
+  assert.ok(parsed.ok);
+  assert.equal(parsed.config.reasoningEffort, null, "an effort sent with agy's default is dropped");
 });

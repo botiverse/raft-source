@@ -74,12 +74,11 @@ test("human usergroup markers are distinct from Agent markers in both directions
   assert.throws(() => slackHumanUsergroupMarker(SERVER_ID, "not-a-uuid"));
 });
 
-test("Slack human handle candidates follow the Agent handle rules", () => {
-  assert.deepEqual(slackHumanHandleCandidates({
-    name: "Richard",
-    serverSlug: "Example Org",
-    userId: USER_ID,
-  }), ["richard", "richard-example-org", "richard-33333333"]);
+test("Slack human handle candidates are stable across Raft server provenance", () => {
+  const first = { name: "Richard", serverSlug: "Example Org", userId: USER_ID };
+  const second = { ...first, serverSlug: "other-server" };
+  assert.deepEqual(slackHumanHandleCandidates(first), ["richard", "richard-raft", "richard-33333333"]);
+  assert.deepEqual(slackHumanHandleCandidates(second), slackHumanHandleCandidates(first));
 });
 
 test("Slack usergroups render by exact provider id while plain @ text stays inert", () => {

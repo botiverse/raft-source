@@ -7,8 +7,8 @@ import { resolveAgentKnowledgeDoc } from "./agentKnowledgeService";
 // The true absence is the other direction: nothing outside a Raft App can POST
 // in to wake an agent. The two directions are guarded separately so that fixing
 // one sentence cannot silently erase the other.
-test("what-slock-doesnt-have separates inbound and outbound webhooks", async () => {
-  const doc = await resolveAgentKnowledgeDoc("what-slock-doesnt-have");
+test("what-raft-doesnt-have separates inbound and outbound webhooks", async () => {
+  const doc = await resolveAgentKnowledgeDoc("what-raft-doesnt-have");
   assert.ok(doc, "the topic must resolve");
 
   assert.doesNotMatch(doc.content, /No API for external services to subscribe to Raft events/,

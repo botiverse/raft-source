@@ -1,0 +1,34 @@
+{
+  "name": "@botiverse/raft-content-worker",
+  "version": "0.1.0",
+  "license": "LicenseRef-Raft-License",
+  "private": true,
+  "type": "module",
+  "description": "The content Worker for Raft's workspace Artifacts: serves each framed version on its own origin through Porthole.",
+  "main": "src/raftContent.ts",
+  "scripts": {
+    "build": "wrangler deploy --dry-run --outdir dist",
+    "test": "pnpm run build && node --import tsx --test \"test/*.test.ts\"",
+    "test:browser": "pnpm run build && tsx scripts/raft-content-image-viewer-browser-smoke.ts && tsx scripts/raft-content-comments-browser-smoke.ts && tsx scripts/raft-content-pages-browser-smoke.ts && tsx scripts/raft-content-pdf-text-browser-smoke.ts",
+    "test:check-parity": "pnpm run build && tsx scripts/raft-content-check-parity.ts",
+    "probe:pdf": "pnpm run build && tsx scripts/raft-content-pdf-probe.ts",
+    "generate:pdfjs-assets": "tsx scripts/pdfjs-assets.ts",
+    "typecheck": "tsrs --noEmit",
+    "typecheck:tsc": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@botiverse/porthole": "0.16.0",
+    "@botiverse/raft-shared": "workspace:*",
+    "marked": "^16.1.1",
+    "pdfjs-dist": "6.4.299"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "5.20260730.1",
+    "@types/node": "^25.5.0",
+    "miniflare": "4.20260722.0",
+    "playwright": "^1.64.0",
+    "tsx": "^4.21.0",
+    "typescript": "^6.0.3",
+    "wrangler": "4.114.0"
+  }
+}

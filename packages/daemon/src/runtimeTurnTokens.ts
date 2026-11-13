@@ -1,3 +1,4 @@
+import type { ActivityTurnTokens } from "@botiverse/raft-shared";
 import type { ParsedEvent } from "./drivers/index";
 
 type TelemetryEvent = Extract<ParsedEvent, { kind: "telemetry" }>;
@@ -24,6 +25,20 @@ export interface TurnTokenAccumulator {
    * first model call, and the latest totals. */
   sessionBase?: TurnTokenCounts;
   sessionLatest?: TurnTokenCounts;
+  /**
+   * #proj-runtime:#54: the context the turn's last model request carried
+   * (input + cache read + cache write of that one request). The counts above
+   * are summed over every request, so they can't size the context for a
+   * threshold; this can. Claude and Codex report it.
+   */
+  lastRequestContextTokens?: number;
+  /**
+   * #runtime-watch:#1: what the turn's provider calls put on the wire, summed,
+   * and how many calls (`provider_request` telemetry; Pi on
+   * `anthropic-messages` only); absent for runtimes that do not report it.
+   */
+  requestBytes?: number;
+  providerRequests?: number;
 }
 
 export function createTurnTokenAccumulator(): TurnTokenAccumulator {
@@ -65,17 +80,27 @@ function addCounts(into: TurnTokenCounts, next: TurnTokenCounts): void {
  * are not known to mean the same thing (gemini reports only a total) are
  * skipped rather than guessed. */
 export function noteTurnTokenUsage(acc: TurnTokenAccumulator, event: TelemetryEvent): void {
+  if (event.name === "provider_request") {
+    noteTurnProviderRequest(acc, event);
+    return;
+  }
   if (event.name !== "token_usage") return;
   const { attrs } = event;
   switch (event.source) {
-    case "claude_result_usage":
+    case "claude_result_usage": {
       addCounts(acc.added, counts(num(attrs, "inputTokens"), num(attrs, "outputTokens"), num(attrs, "cachedInputTokens"), num(attrs, "cacheCreationInputTokens")));
+      const lastRequest = num(attrs, "lastRequestContextTokens");
+      if (lastRequest !== undefined) acc.lastRequestContextTokens = lastRequest;
       return;
+    }
     case "pi_message_end_usage":
     case "kimi_turn_step_completed_usage":
       addCounts(acc.added, counts(num(attrs, "input_tokens"), num(attrs, "output_tokens"), num(attrs, "cached_read_tokens"), num(attrs, "cache_write_tokens")));
       return;
     case "codex_thread_token_usage_updated": {
+      // Codex counts cached input inside inputTokens, so the last call's input is its whole context.
+      const lastInput = num(attrs, "lastInputTokens");
+      if (lastInput !== undefined) acc.lastRequestContextTokens = lastInput;
       const total = codexCounts(attrs, "");
       if (!total) return;
       if (!acc.sessionBase) {
@@ -92,6 +117,26 @@ export function noteTurnTokenUsage(acc: TurnTokenAccumulator, event: TelemetryEv
       return;
     }
   }
+}
+
+/** One provider call's wire size (`provider_request`); its tokens come with the runtime's own `token_usage`. */
+function noteTurnProviderRequest(acc: TurnTokenAccumulator, event: TelemetryEvent): void {
+  const bytes = num(event.attrs, "request_bytes");
+  if (bytes === undefined) return;
+  acc.requestBytes = (acc.requestBytes ?? 0) + bytes;
+  acc.providerRequests = (acc.providerRequests ?? 0) + 1;
+}
+
+/**
+ * Folds a running session total into the open turn, as Codex's running totals
+ * are folded: `before` is the session's total before this report (the first
+ * report of the turn fixes the turn's base), `latest` the total now. For a
+ * host that reads the session totals itself (the OAR host's `usage` events,
+ * counted from the session's open).
+ */
+export function noteTurnSessionTokenTotals(acc: TurnTokenAccumulator, before: TurnTokenCounts, latest: TurnTokenCounts): void {
+  acc.sessionBase ??= { ...before };
+  acc.sessionLatest = { ...latest };
 }
 
 export function turnTokenCounts(acc: TurnTokenAccumulator): TurnTokenCounts {
@@ -118,5 +163,26 @@ export function turnTokenTraceAttrs(acc: TurnTokenAccumulator): Record<string, n
     ...(tokens.output !== undefined ? { output_tokens: tokens.output } : {}),
     ...(tokens.cacheRead !== undefined ? { cache_read_tokens: tokens.cacheRead } : {}),
     ...(tokens.cacheWrite !== undefined ? { cache_write_tokens: tokens.cacheWrite } : {}),
+    ...(acc.lastRequestContextTokens !== undefined ? { last_request_context_tokens: acc.lastRequestContextTokens } : {}),
+    ...(acc.requestBytes !== undefined ? { provider_request_bytes: acc.requestBytes } : {}),
+    ...(acc.providerRequests !== undefined ? { provider_requests_count: acc.providerRequests } : {}),
+  };
+}
+
+/**
+ * A turn's counts as its Activity summary carries them
+ * (ActivityTurnSummary.tokens): the four counts this accumulator knows, the
+ * context the last request carried, and the model. A count the runtime did
+ * not report stays absent.
+ */
+export function activityTurnTokensFrom(acc: TurnTokenAccumulator, model: string | undefined): ActivityTurnTokens {
+  const counts = turnTokenCounts(acc);
+  return {
+    ...(counts.input !== undefined ? { input: counts.input } : {}),
+    ...(counts.cacheRead !== undefined ? { cacheRead: counts.cacheRead } : {}),
+    ...(counts.cacheWrite !== undefined ? { cacheWrite: counts.cacheWrite } : {}),
+    ...(counts.output !== undefined ? { output: counts.output } : {}),
+    ...(acc.lastRequestContextTokens !== undefined ? { contextUsed: acc.lastRequestContextTokens } : {}),
+    ...(model ? { model } : {}),
   };
 }

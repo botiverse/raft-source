@@ -1,11 +1,19 @@
-import type {
-  AgentCreateFormOptionSource,
-  RuntimeConfig,
-  RuntimeModelSourceOutcome,
+import {
+  isBuiltInRuntimeCustomModelPresetProviderId,
+  type AgentCreateFormOptionSource,
+  type BuiltInRuntimeConfig,
+  type RuntimeConfig,
+  type RuntimeModelSourceOutcome,
 } from "@botiverse/raft-shared";
+
+/** A Built-in config on a preset provider (the selections the catalog vouches for). */
+type BuiltInPresetConfig = BuiltInRuntimeConfig & {
+  provider: Extract<BuiltInRuntimeConfig["provider"], { kind: "preset" }>;
+};
 
 export type BuiltInModelCatalogErrorCode =
   | "builtin_catalog_capability_required"
+  | "builtin_custom_model_upgrade_required"
   | "builtin_catalog_unavailable"
   | "builtin_model_unsupported_by_target"
   | "builtin_catalog_stale";
@@ -61,6 +69,8 @@ export interface BuiltInModelCatalogValidation {
   computerVersion: string | null;
   catalogRuntimeVersion: string;
   supportedModelIds: ReadonlySet<string>;
+  /** task #10: preset providers this Computer runs a typed model id for; empty on older Computers. */
+  customModelProviderIds: ReadonlySet<string>;
 }
 
 export type BuiltInCatalogRead = Omit<
@@ -68,12 +78,22 @@ export type BuiltInCatalogRead = Omit<
   "requestedModel"
 >;
 
+/**
+ * A Built-in selection the target Computer's catalog must vouch for: a preset
+ * model, or (task #10) a typed model on a preset provider that takes one
+ * (OpenRouter). An older Computer's parser rejects the latter outright.
+ */
+export function isBuiltInCatalogCheckedSelection(config: RuntimeConfig): config is BuiltInPresetConfig {
+  if (config.runtime !== "builtin" || config.provider.kind !== "preset") return false;
+  return config.model.kind === "preset"
+    || isBuiltInRuntimeCustomModelPresetProviderId(config.provider.providerId);
+}
+
 function builtInPresetSelectionKey(config: RuntimeConfig): string | null {
-  return config.runtime === "builtin" &&
-    config.provider.kind === "preset" &&
-    config.model.kind === "preset"
+  if (!isBuiltInCatalogCheckedSelection(config)) return null;
+  return config.model.kind === "preset"
     ? `${config.provider.providerId}\0${config.model.id}`
-    : null;
+    : `${config.provider.providerId}\0custom\0${config.model.name}`;
 }
 
 /** Revalidate only a newly selected preset identity, not profile/reasoning/key-only edits. */
@@ -130,6 +150,11 @@ export function requireBuiltInCatalogCapability(
     computerVersion: target.computerVersion,
     catalogRuntimeVersion: catalog.runtimeVersion,
     supportedModelIds: new Set(outcome.value.models.map((model) => model.id)),
+    customModelProviderIds: new Set(
+      Array.isArray(catalog.customModelProviderIds)
+        ? catalog.customModelProviderIds.filter((id): id is string => typeof id === "string")
+        : [],
+    ),
   };
 }
 
@@ -139,21 +164,32 @@ export function assertBuiltInPresetSupportedByCatalog(
   outcome: RuntimeModelSourceOutcome,
   target: BuiltInModelCatalogTarget,
 ): BuiltInModelCatalogValidation | null {
-  if (
-    config.runtime !== "builtin" ||
-    config.provider.kind !== "preset" ||
-    config.model.kind !== "preset"
-  )
-    return null;
+  if (!isBuiltInCatalogCheckedSelection(config)) return null;
 
-  const requestedModel = config.model.id;
+  const requestedModel = config.model.kind === "preset" ? config.model.id : config.model.name;
   const catalog = requireBuiltInCatalogCapability(
     outcome,
     target,
     requestedModel,
   );
   const { supportedModelIds } = catalog;
-  if (!supportedModelIds.has(requestedModel)) {
+  if (config.model.kind === "custom") {
+    // task #10: only a Computer that says it runs a typed id on this provider
+    // may get one; an older one would refuse the config at start.
+    if (!catalog.customModelProviderIds.has(config.provider.providerId)) {
+      throw new BuiltInModelCatalogError(
+        "builtin_custom_model_upgrade_required",
+        "This Computer is too old to run a model ID that is not in its list. Upgrade the Computer, or choose a model from the list.",
+        {
+          requestedModel,
+          daemonVersion: target.daemonVersion,
+          computerVersion: target.computerVersion,
+          catalogRuntimeVersion: catalog.catalogRuntimeVersion,
+          recovery: "upgrade_or_reselect",
+        },
+      );
+    }
+  } else if (!supportedModelIds.has(requestedModel)) {
     throw new BuiltInModelCatalogError(
       "builtin_model_unsupported_by_target",
       "The selected model is not supported by the target Computer. Upgrade the Computer or explicitly choose a supported model.",
@@ -173,6 +209,7 @@ export function assertBuiltInPresetSupportedByCatalog(
     computerVersion: catalog.computerVersion,
     catalogRuntimeVersion: catalog.catalogRuntimeVersion,
     supportedModelIds,
+    customModelProviderIds: catalog.customModelProviderIds,
   };
 }
 
@@ -180,6 +217,8 @@ export function assertBuiltInPresetSupportedByCatalog(
 export function filterBuiltInPiFormOptionSourceForCatalog(
   source: AgentCreateFormOptionSource,
   supportedModelIds: ReadonlySet<string>,
+  /** task #10: a preset provider keeps its typed-id field only when this Computer runs one. */
+  customModelProviderIds: ReadonlySet<string> = new Set(),
 ): AgentCreateFormOptionSource {
   if (source.kind === "select" && source.pointer === "/providerId") {
     const options = source.options.filter(
@@ -228,9 +267,14 @@ export function filterBuiltInPiFormOptionSourceForCatalog(
     ),
   );
   const customValueAllowedByValue = Object.fromEntries(
-    Object.entries(source.customValueAllowedByValue).filter(
-      ([providerId]) => providerId in optionsByValue,
-    ),
+    Object.entries(source.customValueAllowedByValue)
+      .filter(([providerId]) => providerId in optionsByValue)
+      .map(([providerId, allowed]) => [
+        providerId,
+        allowed &&
+          (!isBuiltInRuntimeCustomModelPresetProviderId(providerId) ||
+            customModelProviderIds.has(providerId)),
+      ]),
   );
   return {
     ...source,

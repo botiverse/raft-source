@@ -12,11 +12,12 @@ import { and, eq } from "drizzle-orm";
 import { getDb } from "../db/index";
 import { oauthTransactions, sessions, userAuthIdentities, users } from "../db/schema";
 import { openTestApp } from "../test/integration/app";
+import { socialCompletionCookie } from "../test/integration/socialCompletionCookie";
 import * as sessionService from "../services/sessionService";
 import * as userService from "../services/userService";
 import { vi } from "vitest";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 const EXISTING_EMAIL = "existing@slock.test";
 
@@ -94,10 +95,17 @@ async function webProviderRoundTrip(baseUrl: string, provider: "google" | "githu
   return new URL(callback.headers.get("location")!);
 }
 
+/** Web social completion (`/api/auth/:provider/complete`) carries the browser binding its callback left. */
+function webCompletionCookie(path: string, body: unknown): Record<string, string> {
+  const provider = /^\/api\/auth\/(google|github|apple)\/complete$/.exec(path)?.[1];
+  const code = (body as { code?: unknown } | null)?.code;
+  return provider && typeof code === "string" ? { Cookie: socialCompletionCookie(provider, code) } : {};
+}
+
 async function post(baseUrl: string, path: string, body: Record<string, unknown>) {
   return fetch(`${baseUrl}${path}`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...webCompletionCookie(path, body) },
     body: JSON.stringify(body),
   });
 }
@@ -127,7 +135,7 @@ async function webConflictToken(baseUrl: string): Promise<LinkRequired> {
 
 test("web: a Google conflict links Google once the existing account signs in with its password", async () => {
   await withOAuthEnv(async () => {
-    const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+    const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
     const restoreFetch = installProviderFetch({ google: EXISTING_EMAIL });
     try {
       const existing = await seedUser(EXISTING_EMAIL, "existing");
@@ -191,7 +199,7 @@ test("web: a Google conflict links Google once the existing account signs in wit
 
 test("web: without linkOnConflict the conflict stays the old error redirect", async () => {
   await withOAuthEnv(async () => {
-    const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+    const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
     const restoreFetch = installProviderFetch({ google: EXISTING_EMAIL });
     try {
       await seedUser(EXISTING_EMAIL, "existing");
@@ -208,7 +216,7 @@ test("web: without linkOnConflict the conflict stays the old error redirect", as
 
 test("web: the conflict completion carries no userId, so an older server cannot sign it in", async () => {
   await withOAuthEnv(async () => {
-    const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+    const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
     const restoreFetch = installProviderFetch({ google: EXISTING_EMAIL });
     try {
       await seedUser(EXISTING_EMAIL, "existing");
@@ -228,7 +236,7 @@ test("web: the conflict completion carries no userId, so an older server cannot 
 
 test("web: signing in with another linked provider completes the pending link", async () => {
   await withOAuthEnv(async () => {
-    const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+    const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
     const restoreFetch = installProviderFetch({ google: EXISTING_EMAIL });
     try {
       const existing = await seedUser(EXISTING_EMAIL, "existing");
@@ -257,7 +265,7 @@ test("web: signing in with another linked provider completes the pending link", 
 
 test("web: a provider sign-in to a different account is refused before its completion code is spent", async () => {
   await withOAuthEnv(async () => {
-    const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+    const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
     const restoreFetch = installProviderFetch({ google: EXISTING_EMAIL, github: "other@slock.test" });
     try {
       await seedUser(EXISTING_EMAIL, "existing");
@@ -287,7 +295,7 @@ test("web: a provider sign-in to a different account is refused before its compl
 
 test("cancel drops the pending link", async () => {
   await withOAuthEnv(async () => {
-    const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+    const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
     const restoreFetch = installProviderFetch({ google: EXISTING_EMAIL });
     try {
       const existing = await seedUser(EXISTING_EMAIL, "existing");
@@ -312,7 +320,7 @@ test("cancel drops the pending link", async () => {
 
 test("an expired pending link issues no session", async () => {
   await withOAuthEnv(async () => {
-    const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+    const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
     const restoreFetch = installProviderFetch({ google: EXISTING_EMAIL });
     try {
       const existing = await seedUser(EXISTING_EMAIL, "existing");
@@ -334,7 +342,7 @@ test("an expired pending link issues no session", async () => {
 
 test("desktop/mobile: the conflict returns a code, and PKCE complete answers account_link_required", async () => {
   await withOAuthEnv(async () => {
-    const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+    const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
     const restoreFetch = installProviderFetch({ google: EXISTING_EMAIL });
     try {
       const existing = await seedUser(EXISTING_EMAIL, "existing");
@@ -400,7 +408,7 @@ test("desktop/mobile: the conflict returns a code, and PKCE complete answers acc
 
 test("desktop/mobile: without linkOnConflict the callback still reports account_conflict", async () => {
   await withOAuthEnv(async () => {
-    const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+    const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
     const restoreFetch = installProviderFetch({ google: EXISTING_EMAIL });
     try {
       await seedUser(EXISTING_EMAIL, "existing");
@@ -425,7 +433,7 @@ test("desktop/mobile: without linkOnConflict the callback still reports account_
 
 test("desktop/mobile: signing in with another linked provider over PKCE completes the pending link", async () => {
   await withOAuthEnv(async () => {
-    const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+    const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
     const restoreFetch = installProviderFetch({ google: EXISTING_EMAIL });
     try {
       const existing = await seedUser(EXISTING_EMAIL, "existing");
@@ -473,7 +481,7 @@ test("desktop/mobile: signing in with another linked provider over PKCE complete
 
 test("password: a session issuance failure rolls the link back and keeps the token usable", async () => {
   await withOAuthEnv(async () => {
-    const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+    const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
     const restoreFetch = installProviderFetch({ google: EXISTING_EMAIL });
     try {
       const existing = await seedUser(EXISTING_EMAIL, "existing");
@@ -498,7 +506,7 @@ test("password: a session issuance failure rolls the link back and keeps the tok
 
 test("password: a password changed after the first check links nothing and spends no token", async () => {
   await withOAuthEnv(async () => {
-    const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+    const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
     const restoreFetch = installProviderFetch({ google: EXISTING_EMAIL });
     try {
       const existing = await seedUser(EXISTING_EMAIL, "existing");

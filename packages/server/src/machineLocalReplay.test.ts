@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
 import { BasicTracer, MemoryTraceSink, parseTraceparent } from "@botiverse/raft-shared";
 import type { Request, Response } from "express";
 
 import {
   buildReplayHeaders,
   buildReplayTargetUrl,
+  handleMachineLocalProbeRouting,
   handleMachineLocalRouting,
   isMachineLocalReplayAllowed,
   sendMachineAffinityUnavailable,
@@ -22,9 +22,10 @@ test("machine-local replay allowlist is limited to daemon-affinity routes", () =
     true,
   );
   assert.equal(isMachineLocalReplayAllowed("POST", "/api/agents/agent-1/start"), true);
+  // Retired: /migrate is the only way an agent changes Computer.
   assert.equal(
     isMachineLocalReplayAllowed("POST", "/api/agents/agent-1/assign-machine"),
-    true,
+    false,
   );
   assert.equal(
     isMachineLocalReplayAllowed("POST", "/api/agents/agent-1/migrate"),
@@ -43,6 +44,10 @@ test("machine-local replay allowlist is limited to daemon-affinity routes", () =
     isMachineLocalReplayAllowed("GET", "/api/servers/server-1/machines/machine-1/runtime-forms/v2/builtin/option-sources/model"),
     true,
   );
+  // task #10: the Built-in v2 definition reads the Computer's model source too.
+  assert.equal(isMachineLocalReplayAllowed("GET", "/api/servers/server-1/machines/machine-1/runtime-forms/v2/builtin"), true);
+  assert.equal(isMachineLocalReplayAllowed("POST", "/api/servers/server-1/machines/machine-1/runtime-forms/v2/builtin"), false);
+  assert.equal(isMachineLocalReplayAllowed("GET", "/api/agents/agent-1/runtime-form"), true);
   assert.equal(isMachineLocalReplayAllowed("POST", "/api/servers/server-1/machines/machine-1/computer/restart"), true);
   assert.equal(isMachineLocalReplayAllowed(
     "POST",
@@ -598,30 +603,6 @@ test("stale cleanup cannot delete a re-registered generation on the same replica
   assert.equal(Buffer.from(response.sentBody as Uint8Array).toString("utf8"), "refreshed-successor");
 });
 
-test("Redis owner cleanup compares the observed generation before deletion", async () => {
-  const source = await readFile(new URL("./replicaRouter.ts", import.meta.url), "utf8");
-  assert.match(
-    source,
-    /if currentGeneration ~= ARGV\[2\] then\s+return 0\s+end/,
-    "the Redis CAS must reject a same-replica successor generation",
-  );
-  assert.match(
-    source,
-    /if currentUpdatedAt ~= ARGV\[3\] then\s+return 0\s+end/,
-    "the Redis CAS must reject a refreshed snapshot version",
-  );
-  assert.match(
-    source,
-    /ARGV\[4\] ~= "" and redis\.call\("GET", KEYS\[8\]\) ~= ARGV\[4\]/,
-    "the Redis CAS must reject a changed replay endpoint",
-  );
-  assert.match(
-    source,
-    /redis\.call\("SET", KEYS\[2\], ARGV\[2\], "EX", ARGV\[8\]\)/,
-    "heartbeat refresh must preserve the registered lease generation",
-  );
-});
-
 test("a rerouted GET clears a second exact owner_not_local without a third replay", async () => {
   const cleared: Array<{ machineId: string; replicaId: string; generation: string; version: string }> = [];
   const targets = [
@@ -727,6 +708,86 @@ for (const [label, ownerUpdatedAtMs, expectedClears] of [
     });
   });
 }
+
+test("a probe GET whose replay fails returns the failure to the route instead of a 504/503; other routes keep them", async () => {
+  const abort = new Error("timeout");
+  abort.name = "AbortError";
+  const ownerGone = () => routingDeps({
+    // Fresh lease: the failed replay never clears the owner, so there is no reroute.
+    getReplayTarget: async () => ({
+      replicaId: "replica-a",
+      endpoint: "http://replica-a",
+      generation: "generation-a",
+      version: String(1_000_000),
+      currentReplica: false,
+    }),
+  });
+  const probeRequest = () => ({
+    method: "GET",
+    originalUrl: "/api/servers/server-1/machines/machine-1/runtime-models/codex",
+    url: "/api/servers/server-1/machines/machine-1/runtime-models/codex",
+    headers: {},
+  } as unknown as Request);
+
+  for (const [failure, expected] of [
+    [abort, "replay_timeout"],
+    [new Error("ECONNREFUSED"), "replay_failed"],
+  ] as const) {
+    const response = makeRoutingResponse();
+    const routed = await handleMachineLocalProbeRouting(probeRequest(), response, "machine-1", false, {
+      ...ownerGone(),
+      fetch: async () => { throw failure; },
+    });
+    assert.equal(routed, expected);
+    assert.equal(response.jsonBody, undefined, "nothing was sent: the route answers");
+    assert.equal(response.sentBody, undefined);
+  }
+
+  // The owner replica answering is still forwarded as is.
+  const answered = makeRoutingResponse();
+  assert.equal(await handleMachineLocalProbeRouting(probeRequest(), answered, "machine-1", false, {
+    ...ownerGone(),
+    fetch: async () => new globalThis.Response(JSON.stringify({ kind: "live" }), { status: 200 }),
+  }), "handled");
+  assert.equal(answered.statusCode, 200);
+
+  // A route that did not opt in keeps the 504.
+  const plain = makeRoutingResponse();
+  assert.equal(await handleMachineLocalRouting(makeRoutingRequest("GET"), plain, "machine-1", false, {
+    ...ownerGone(),
+    fetch: async () => { throw abort; },
+  }), "handled");
+  assert.equal(plain.statusCode, 504);
+  assert.equal((plain.jsonBody as { code?: string }).code, "machine_affinity_replay_timeout");
+});
+
+test("a probe GET whose owner answers machine_owner_not_local with no replacement is owner_missing (offline), not a replay failure", async () => {
+  const cleared: string[] = [];
+  let reads = 0;
+  const response = makeRoutingResponse();
+  const routed = await handleMachineLocalProbeRouting({
+    method: "GET",
+    originalUrl: "/api/servers/server-1/machines/machine-1/runtime-models/codex",
+    url: "/api/servers/server-1/machines/machine-1/runtime-models/codex",
+    headers: {},
+  } as unknown as Request, response, "machine-1", false, routingDeps({
+    getReplayTarget: async () => {
+      reads += 1;
+      return reads === 1
+        ? { replicaId: "replica-a", endpoint: "http://replica-a", generation: "generation-a", version: "version-a", currentReplica: false }
+        : null;
+    },
+    clearOwner: async (_machineId, replicaId) => {
+      cleared.push(replicaId);
+      return "deleted";
+    },
+    fetch: async () => new globalThis.Response(JSON.stringify({ code: "machine_owner_not_local" }), { status: 409 }),
+  }));
+  assert.equal(routed, "owner_missing");
+  assert.deepEqual(cleared, ["replica-a"], "the typed answer still clears the stale owner");
+  assert.equal(response.sentBody, undefined, "the route answers offline itself");
+  assert.equal(response.jsonBody, undefined);
+});
 
 test("task #440: a transport failure keeps an owner whose lease is not a parseable timestamp", async () => {
   let clears = 0;

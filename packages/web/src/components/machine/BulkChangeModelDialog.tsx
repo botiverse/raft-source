@@ -1,13 +1,15 @@
-import { Button, Spinner } from "@botiverse/raft-ui";
+import { Button, Checkbox, Spinner, TextLink } from "@botiverse/raft-ui";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { useIntl } from "react-intl";
+import { formatRuntimeLabelBesideBadge, runtimeShowsExperimentalBadge } from "../../utils/runtimeAvailabilityLabel";
 import { ArrowRight, Check, X } from "lucide-react";
 import {
   REASONING_EFFORT_RUNTIMES,
   currentTimeMs,
   getDefaultModel,
   getRuntimeDisplayName,
+  runtimeChoiceModel,
 } from "@botiverse/raft-shared";
 import type { ReasoningEffort } from "@botiverse/raft-shared";
 import api from "../../api/client";
@@ -16,12 +18,13 @@ import AvatarSlot from "../ui/AvatarSlot";
 import { RuntimeSelectControl } from "../agent/RuntimeConfigFields";
 import { useRuntimeModels } from "../../hooks/useRuntimeModels";
 import { fetchExistingAgentRuntimeOptions } from "../../hooks/useRuntimeSelectionCatalog";
+import { isRuntimeDeprecatedOnServer, useServerRuntimeCatalog } from "../../hooks/useServerRuntimeCatalog";
 import { reasoningEffortOptionsForModel, reconcileReasoningEffort } from "../../utils/reasoningEffortOptions";
 import { useAgentStore } from "../../store/agentStore";
 import { useServerStore } from "../../store/serverStore";
 import { runtimeAccountUsageClient } from "../../utils/runtimeAccountUsageClient";
-import { formatRelativeTime } from "../../utils/relativeTime";
-import { usageProviderForRuntime } from "./RuntimeAccountUsageChip";
+import { usageProviderForRuntime } from "../../utils/runtimeUsageProvider";
+import { runtimeUsageText } from "./runtimeUsageText";
 import type { Agent } from "../../store/agentStore";
 import type { Machine } from "../../store/machineStore";
 import type { BulkChangeReceipt, BulkUnfinishedAgent } from "../../store/bulkChangeModelReceiptStore";
@@ -43,6 +46,7 @@ import {
   summarizeRuntimeUsage,
 } from "./bulkChangeModelPlan";
 import type { BulkModelTarget, BulkPlanAgentInput, BulkPlanRow, BulkRuntimeUsageSummary, BulkUnfinishedPhase } from "./bulkChangeModelPlan";
+import { DialogCardFooter, DialogCancel, DialogCommit } from "../ui/NarrowDialog";
 
 type Step = "choose" | "review" | "applying";
 type ApplyState = "saving" | "saved" | "failed";
@@ -130,9 +134,9 @@ function EditAgentLink({ agentId, onOpenAgent }: { agentId: string; onOpenAgent:
   const open = useCallback(() => onOpenAgent(agentId), [agentId, onOpenAgent]);
   return (
     // The "·" separator is drawn by CSS so it is not a JSX literal.
-    <button type="button" className="underline before:mr-1 before:inline-block before:no-underline before:content-['·']" onClick={open}>
+    <TextLink variant="strong" className="before:mr-1 before:inline-block before:no-underline before:content-['·']" onClick={open}>
       {formatMessage({ id: "machine.detail.bulkModel.edit" })}
-    </button>
+    </TextLink>
   );
 }
 
@@ -143,7 +147,7 @@ function EditAgentLink({ agentId, onOpenAgent }: { agentId: string; onOpenAgent:
 const STEP_MARK_CLASS_NAME =
   "inline-flex size-5 shrink-0 items-center justify-center rounded-sticker font-mono text-mono-meta font-bold";
 const STEP_MARK_DONE_CLASS_NAME = "border-[1.5px] border-foreground bg-foreground text-foreground-inverse";
-const STEP_MARK_CURRENT_CLASS_NAME = "border-[1.5px] border-sticker-ink bg-brand text-sticker-ink";
+const STEP_MARK_CURRENT_CLASS_NAME = "border-[1.5px] border-sticker-ink bg-selected text-sticker-ink";
 const STEP_MARK_NEXT_CLASS_NAME = "border border-line-seam bg-layer-card text-foreground-hint";
 
 function Stepper({ step }: { step: Step }) {
@@ -224,6 +228,8 @@ export default function BulkChangeModelDialog({
   const [runtimeAllowed, setRuntimeAllowed] = useState<Record<string, boolean> | null>(null);
   const [checkingRuntime, setCheckingRuntime] = useState(false);
   const [applyStates, setApplyStates] = useState<Record<string, ApplyState>>({});
+  // Reconciler step 11c: running agents switch at their next idle point unless asked to restart now.
+  const [restartNow, setRestartNow] = useState(false);
 
   // Usage events (RFC-067): one operation per dialog open, pinned to the
   // server it was opened in. The ref keeps React's dev double-run of effects
@@ -237,13 +243,20 @@ export default function BulkChangeModelDialog({
   }, [agents.length, operation, retry]);
 
   const runtimeModels = useRuntimeModels(machine.id, runtime, { reuseRecentMs: 60_000 });
-  const models = runtimeModels.models;
+  // "The runtime chooses" (Antigravity's configured default) stays first and
+  // preselected, so confirming without a pick does not pin agents to the
+  // model the runtime happens to start on today, nor to its effort.
+  const runtimeChoice = runtimeChoiceModel(runtime);
+  const models = useMemo(
+    () => (runtimeChoice ? [runtimeChoice, ...runtimeModels.models.filter((m) => m.id !== runtimeChoice.id)] : runtimeModels.models),
+    [runtimeChoice, runtimeModels.models],
+  );
 
   const model = useMemo(() => {
     if (models.some((m) => m.id === modelChoice)) return modelChoice;
-    const preferred = runtimeModels.default ?? getDefaultModel(runtime);
+    const preferred = runtimeChoice?.id ?? runtimeModels.default ?? getDefaultModel(runtime);
     return models.find((m) => m.id === preferred)?.id ?? models[0]?.id ?? "";
-  }, [modelChoice, models, runtime, runtimeModels.default]);
+  }, [modelChoice, models, runtime, runtimeChoice, runtimeModels.default]);
 
   const supportsReasoning = REASONING_EFFORT_RUNTIMES.has(runtime);
   const reasoning = useMemo(
@@ -275,26 +288,43 @@ export default function BulkChangeModelDialog({
     ...(phaseById.has(agent.id) ? { phase: phaseById.get(agent.id) } : {}),
   })), [agents, isRunning, phaseById, runtimeAllowed]);
 
-  const plan = useMemo(() => planBulkModelChange(planInputs, target), [planInputs, target]);
+  const plan = useMemo(() => planBulkModelChange(planInputs, target, { restartNow }), [planInputs, restartNow, target]);
   const agentById = useMemo(() => new Map(agents.map((a) => [a.id, a])), [agents]);
 
-  const usageText = useCallback((summary: BulkRuntimeUsageSummary | null | undefined): string | undefined => {
-    if (!summary) return undefined;
-    const plan = summary.plan ?? formatMessage({ id: "machine.runtimeUsage.accountFallback" });
-    if (summary.kind === "used") return formatMessage({ id: "machine.detail.bulkModel.usageUsed" }, { plan, percent: summary.percent });
-    if (summary.kind === "attention") return formatMessage({ id: "machine.detail.bulkModel.usageAttention" }, { plan });
-    const reset = summary.resetsAt ? formatRelativeTime(summary.resetsAt, locale) : null;
-    return reset
-      ? formatMessage({ id: "machine.detail.bulkModel.usageLimit" }, { plan, reset })
-      : formatMessage({ id: "machine.detail.bulkModel.usageLimitNoReset" }, { plan });
-  }, [formatMessage, locale]);
+  const usageText = useCallback(
+    (summary: BulkRuntimeUsageSummary | null | undefined) => runtimeUsageText(summary, formatMessage, locale),
+    [formatMessage, locale],
+  );
+  // "(deprecated)" is this server's answer: a runtime it offers again is not.
+  const runtimeCatalog = useServerRuntimeCatalog(serverId);
   const runtimeOptions = useMemo(() => runtimeIds.map((id) => {
     const description = usageText(usageByRuntime[id]);
-    return description
-      ? { value: id, label: getRuntimeDisplayName(id), description }
-      : { value: id, label: getRuntimeDisplayName(id) };
-  }), [runtimeIds, usageByRuntime, usageText]);
-  const modelOptions = useMemo(() => models.map((m) => ({ value: m.id, label: m.label || m.id })), [models]);
+    const deprecated = isRuntimeDeprecatedOnServer(id, runtimeCatalog);
+    // Like every runtime picker: raft-ui's Experimental badge, not "(experimental)" text.
+    return {
+      value: id,
+      label: formatRuntimeLabelBesideBadge(id, formatMessage, deprecated),
+      ...(runtimeShowsExperimentalBadge(id, deprecated) ? { experimental: true } : {}),
+      ...(description ? { description } : {}),
+    };
+  }), [formatMessage, runtimeCatalog, runtimeIds, usageByRuntime, usageText]);
+  // Models this Computer's runtime listed as disabled come last, greyed and not
+  // selectable, with the runtime's own reason (plain text).
+  const modelOptions = useMemo(() => {
+    const usable = models.map((m) => ({ value: m.id, label: m.label || m.id }));
+    if (runtimeModels.unavailable.length === 0) return usable;
+    const group = formatMessage({ id: "agent.runtimeModels.unavailableGroup" });
+    return [
+      ...usable,
+      ...runtimeModels.unavailable.map((m) => ({
+        value: m.id,
+        label: m.label || m.id,
+        disabled: true,
+        group,
+        ...(m.runtimeReason ? { description: m.runtimeReason } : {}),
+      })),
+    ];
+  }, [formatMessage, models, runtimeModels.unavailable]);
   const reasoningOptions = useMemo(() => {
     if (!supportsReasoning || !model) return [];
     return [
@@ -413,16 +443,17 @@ export default function BulkChangeModelDialog({
       onClose={step === "applying" ? ignoreClose : handleClose}
       maxWidthClass="max-w-2xl"
       testId="bulk-change-model-dialog"
+      narrow="sheet"
     >
       {step !== "applying" && <Stepper step={step} />}
       <StepBody stepKey={step}>
         {step === "choose" && (
-          <div className="space-y-4">
+          <div className="stack-y-4">
             {runtimeIds.length === 0 ? (
               <p className="text-callout text-foreground-muted">{formatMessage({ id: "machine.detail.bulkModel.noRuntimes" })}</p>
             ) : (
               <>
-                <div className="space-y-1.5">
+                <div className="stack-y-1.5">
                   <div className={FIELD_LABEL_CLASS_NAME}>{formatMessage({ id: "machine.detail.bulkModel.runtime" })}</div>
                   <RuntimeSelectControl
                     value={runtime}
@@ -435,7 +466,7 @@ export default function BulkChangeModelDialog({
                     {formatMessage({ id: "machine.detail.bulkModel.accountHint" }, { runtime: getRuntimeDisplayName(runtime) })}
                   </p>
                 </div>
-                <div className="space-y-1.5">
+                <div className="stack-y-1.5">
                   <div className={FIELD_LABEL_CLASS_NAME}>{formatMessage({ id: "machine.detail.bulkModel.model" })}</div>
                   <RuntimeSelectControl
                     value={model}
@@ -446,7 +477,7 @@ export default function BulkChangeModelDialog({
                   />
                 </div>
                 {reasoningOptions.length > 0 && (
-                  <div className="space-y-1.5">
+                  <div className="stack-y-1.5">
                     <div className={FIELD_LABEL_CLASS_NAME}>{formatMessage({ id: "machine.detail.bulkModel.reasoning" })}</div>
                     <RuntimeSelectControl
                       value={reasoning ?? REASONING_DEFAULT_VALUE}
@@ -459,28 +490,32 @@ export default function BulkChangeModelDialog({
                 )}
               </>
             )}
-            <div className="flex justify-end gap-2 pt-1">
+            <DialogCardFooter>
               <Button size="lg" variant="ghost" type="button" onClick={handleClose}>
                 {formatMessage({ id: "common.confirm.cancel" })}
               </Button>
-              <Button
-                size="lg"
-                variant="accent"
-                type="button"
-                onClick={handleNext}
-                disabled={nextDisabled}
-                data-testid="bulk-model-next"
-              >
-                {checkingRuntime && <Spinner size="xs" aria-label={formatMessage({ id: "common.loadingLabel" })} />}
-                {formatMessage({ id: "machine.detail.bulkModel.next" })}
-              </Button>
-            </div>
+              <DialogCommit>
+                {(inHead) => (
+                  <Button
+                    size={inHead ? "md" : "lg"}
+                    variant="primary"
+                    type="button"
+                    onClick={handleNext}
+                    disabled={nextDisabled}
+                    data-testid="bulk-model-next"
+                  >
+                    {checkingRuntime && <Spinner size="xs" aria-label={formatMessage({ id: "common.loadingLabel" })} />}
+                    {formatMessage({ id: "machine.detail.bulkModel.next" })}
+                  </Button>
+                )}
+              </DialogCommit>
+            </DialogCardFooter>
           </div>
         )}
 
         {step === "review" && (
           <div>
-            <ul className="divide-y divide-line-hairline border-y border-line-hairline" data-testid="bulk-model-review-list">
+            <ul className="rule-y rule-line-hairline border-y border-line-hairline" data-testid="bulk-model-review-list">
               {plan.rows.map((row) => {
                 const agent = agentById.get(row.agentId)!;
                 const sameRuntime = agent.runtime === runtime;
@@ -523,6 +558,17 @@ export default function BulkChangeModelDialog({
                 );
               })}
             </ul>
+            {plan.runningChangeCount > 0 && (
+              <label className="mt-3 flex select-none items-center gap-2">
+                <Checkbox checked={restartNow} onCheckedChange={setRestartNow} data-testid="bulk-model-restart-now" />
+                <span className="text-callout font-semibold">{formatMessage({ id: "machine.detail.bulkModel.restartNow" })}</span>
+              </label>
+            )}
+            {!restartNow && plan.runningChangeCount > 0 && (
+              <p className="mt-3 text-footnote text-foreground-muted" data-testid="bulk-model-idle-line">
+                {formatMessage({ id: "machine.detail.bulkModel.idleLine" }, { count: plan.runningChangeCount })}
+              </p>
+            )}
             {plan.restartCount > 0 && (
               <p className="mt-3 text-footnote text-foreground-muted" data-testid="bulk-model-restart-line">
                 {formatMessage({ id: "machine.detail.bulkModel.restartLine" }, { count: plan.restartCount })}
@@ -533,25 +579,31 @@ export default function BulkChangeModelDialog({
                 {formatMessage({ id: "machine.detail.bulkModel.back" })}
               </Button>
               <span className="flex-1" />
-              <Button size="lg" variant="ghost" type="button" onClick={handleClose}>
-                {formatMessage({ id: "common.confirm.cancel" })}
-              </Button>
-              <Button
-                size="lg"
-                variant="accent"
-                type="button"
-                onClick={handleApply}
-                disabled={plan.applyCount === 0}
-                data-testid="bulk-model-apply"
-              >
-                {formatMessage({ id: "machine.detail.bulkModel.apply" }, { count: plan.applyCount })}
-              </Button>
+              <DialogCancel>
+                <Button size="lg" variant="ghost" type="button" onClick={handleClose}>
+                  {formatMessage({ id: "common.confirm.cancel" })}
+                </Button>
+              </DialogCancel>
+              <DialogCommit>
+                {(inHead) => (
+                  <Button
+                    size={inHead ? "md" : "lg"}
+                    variant="accent"
+                    type="button"
+                    onClick={handleApply}
+                    disabled={plan.applyCount === 0}
+                    data-testid="bulk-model-apply"
+                  >
+                    {formatMessage({ id: "machine.detail.bulkModel.apply" }, { count: plan.applyCount })}
+                  </Button>
+                )}
+              </DialogCommit>
             </div>
           </div>
         )}
 
         {step === "applying" && (
-          <ul className="divide-y divide-line-hairline" data-testid="bulk-model-applying-list">
+          <ul className="rule-y rule-line-hairline" data-testid="bulk-model-applying-list">
             {plan.rows.filter((row) => row.kind !== "skip").map((row) => {
               const agent = agentById.get(row.agentId)!;
               const state = applyStates[row.agentId] ?? "saving";

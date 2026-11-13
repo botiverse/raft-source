@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { resolve } from "node:path";
+import { isTestPath } from "../scripts/testLocations";
 
 /**
  * Auth trace failure-isolation contract (Auth Session Contract, #2494
@@ -13,20 +14,15 @@ import { resolve } from "node:path";
  * state. Specifically: a trace failure must never become a new logout
  * cause.
  *
- * Companion to:
- *   - `webAuthTraceWiringContract.test.ts` (verifies emits ARE present at
- *     each contract-required callsite, never awaited, never returned,
- *     session_cleared uses immediate-flush variant).
- *   - `authClearSessionContract.test.ts` (verifies WHO may clear session).
+ * Companion to `authClearSessionContract.test.ts` (verifies WHO may clear
+ * session).
  *
- * The gap this file closes: even with the wiring-contract guarantees,
- * someone could later add a `.then(...)` / `.catch(...)` chain on an
+ * The gap this file closes: someone could later add a `.then(...)` / `.catch(...)` chain on an
  * emit, or wrap an emit in a `try { ... } catch { logout(); }` block —
  * either pattern would let a trace-side failure cause an auth-side
  * mutation. That is exactly the regression class the contract forbids.
  *
- * Pattern modeled on `restoreTimeoutWiringContract.test.ts` and
- * `authClearSessionContract.test.ts`: strip comments, scan a fixed file
+ * Pattern modeled on `authClearSessionContract.test.ts`: strip comments, scan a fixed file
  * list of auth-adjacent producers, fail loud with file:line.
  */
 
@@ -56,7 +52,7 @@ const EMIT_FUNCTIONS = ["emitAuthTrace", "emitAuthTraceAndFlush"] as const;
 // Strip block + line comments before scanning so doc text mentioning
 // `.then(emitAuthTrace...)` or `try { emitAuthTrace } catch { logout() }`
 // in an explanation comment doesn't false-fire. Mirrors the strip-comments
-// idiom in restoreTimeoutWiringContract / authClearSessionContract.
+// idiom in authClearSessionContract.
 function stripComments(source: string): string {
   let s = source.replace(/\/\*[\s\S]*?\*\//g, "");
   s = s.replace(/\/\/[^\n]*/g, "");
@@ -337,6 +333,8 @@ test("emit functions are only called from the approved caller set (anti-rot)", (
   for (const full of walk(srcRoot)) {
     const rel = full.slice(srcRoot.length + 1).replaceAll("\\", "/");
     if (rel === PRODUCER_FILE) continue;
+    // Feature tests (src/features/<feature>/tests/) are not app code.
+    if (isTestPath(`src/${rel}`)) continue;
     const src = stripComments(readFileSync(full, "utf8"));
     if (!emitCallRe.test(src)) continue;
     if ((AUTH_EMIT_CALLER_FILES as readonly string[]).includes(rel)) continue;
@@ -350,8 +348,7 @@ test("emit functions are only called from the approved caller set (anti-rot)", (
     violations,
     [],
     `New auth-trace emit callsite outside the approved caller list. Update AUTH_EMIT_CALLER_FILES ` +
-      `here AND add the corresponding wiring-contract entry in webAuthTraceWiringContract.test.ts ` +
-      `so the new callsite is subject to both wiring and failure-isolation contracts.\n` +
+      `here so the new callsite is subject to the failure-isolation contract.\n` +
       violations.map((v) => `  ${v.file}:${v.line}  ${v.text}`).join("\n"),
   );
 });

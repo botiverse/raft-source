@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import {
+  DirectUploadTargetOriginError,
   requestDaemonScopeAttestation,
   uploadWithSignedCapability,
 } from "./directUploadCapability";
@@ -151,3 +152,65 @@ test("requestDaemonScopeAttestation classifies an HTML 413 from the server as 41
     /Failed to request daemon scope attestation \(413\)/,
   );
 });
+
+describe("pinWorkerOrigin (a receiver the daemon did not choose)", () => {
+  function fakeHops(putUrl: string) {
+    const calls: Array<{ url: string; redirect: RequestRedirect | undefined }> = [];
+    const fetchImpl = async (url: string, init?: RequestInit) => {
+      calls.push({ url, redirect: init?.redirect });
+      if (url.endsWith("/internal/machine/scope-attestation")) {
+        return jsonResponse({ attestation: "signed", scope: "s", audience: "a", resource: null, expiresAt: "2026-01-01T00:00:00.000Z" });
+      }
+      if (url.endsWith("/api/trace-bundles")) return jsonResponse({ upload: { method: "PUT", url: putUrl } });
+      return new Response(null, { status: 200 });
+    };
+    return { calls, fetchImpl };
+  }
+  const upload = (putUrl: string, pinWorkerOrigin?: boolean) => {
+    const hops = fakeHops(putUrl);
+    const result = uploadWithSignedCapability({
+      serverUrl: "https://server.test",
+      apiKey: "sk_machine_test",
+      workerUrl: "http://localhost:18787",
+      scope: "daemon-trace-bundle:create",
+      createPath: "/api/trace-bundles",
+      createBody: {},
+      uploadBody: "bytes",
+      fetchImpl: hops.fetchImpl,
+      ...(pinWorkerOrigin === undefined ? {} : { pinWorkerOrigin }),
+    });
+    return { result, calls: hops.calls };
+  };
+
+  test("no redirects on the create POST or the PUT, and a same-origin PUT proceeds", async () => {
+    const { result, calls } = upload("http://localhost:18787/api/trace-bundles/u1/object?token=t", true);
+    await result;
+    assert.deepEqual(calls.map((c) => [c.url.split("?")[0], c.redirect]), [
+      ["https://server.test/internal/machine/scope-attestation", undefined],
+      ["http://localhost:18787/api/trace-bundles", "error"],
+      ["http://localhost:18787/api/trace-bundles/u1/object", "error"],
+    ]);
+  });
+
+  test.each([
+    "http://evil.example/api/trace-bundles/u1/object",
+    "http://localhost:9999/api/trace-bundles/u1/object",
+    "https://localhost:18787/api/trace-bundles/u1/object",
+    "not a url",
+  ])("a PUT target off the worker's origin (%s) fails closed before any bytes are sent", async (putUrl) => {
+    const { result, calls } = upload(putUrl, true);
+    await assert.rejects(result, DirectUploadTargetOriginError);
+    assert.equal(calls.length, 2, "attestation + create only; no PUT");
+  });
+
+  test("without pinWorkerOrigin (env / default URL) behaviour is unchanged", async () => {
+    const { result, calls } = upload("https://storage.example/u1", undefined);
+    await result;
+    assert.deepEqual(calls.map((c) => [c.url, c.redirect]), [
+      ["https://server.test/internal/machine/scope-attestation", undefined],
+      ["http://localhost:18787/api/trace-bundles", undefined],
+      ["https://storage.example/u1", undefined],
+    ]);
+  });
+});
+

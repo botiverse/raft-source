@@ -7,7 +7,6 @@ import type { BuiltInRapAppDefinition } from "../../services/rapBuiltinAppManife
  */
 export const BUILT_IN_REMINDER_APP = {
   appId: "system.reminder" as AppId,
-  composerReference: { displayName: "Reminder" },
   manifest: {
     app_id: "system.reminder" as AppId,
     // Reminder execution is Computer-local. The Server registry retains the

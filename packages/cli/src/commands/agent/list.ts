@@ -101,7 +101,7 @@ export const agentListCommand = defineCommand(
             const enterOpensBrowser = canInstallEnterToOpenUrl(ctx.io.stdin);
             writeDiagnostic(ctx.io, formatVerificationHandoff(action, { enterOpensBrowser }));
             if (enterOpensBrowser) {
-              cleanupEnterToOpen = installEnterToOpenUrl({ input: ctx.io.stdin, url: action.verificationUriComplete ?? action.verificationUri });
+              cleanupEnterToOpen = installEnterToOpenUrl({ input: ctx.io.stdin, url: action.verificationUri });
             }
           },
         });

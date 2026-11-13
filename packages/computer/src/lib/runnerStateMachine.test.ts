@@ -24,7 +24,14 @@ import type { ChildExitClass } from "../service";
 //     degrade → no respawn), the daemon-upgrade-compat-relevant case.
 
 const SERVER = "11111111-1111-4111-8111-111111111111";
-const EXIT_CLASSES: ChildExitClass[] = ["graceful", "config-error", "already-running", "unlinked-terminal", "crash"];
+const EXIT_CLASSES: ChildExitClass[] = [
+  "graceful",
+  "config-error",
+  "already-running",
+  "unlinked-terminal",
+  "external-stop",
+  "crash",
+];
 
 function rec(partial: Partial<RunnerRecord>): RunnerRecord {
   return { serverId: SERVER, lifecycle: "stopped", stopping: false, ...partial };
@@ -41,6 +48,10 @@ test("nextRunnerStateOnExit — exhaustive exitClass × budget", () => {
   assert.equal(nextRunnerStateOnExit("crash", true), "degraded");
   assert.equal(nextRunnerStateOnExit("graceful", false), "stopped");
   assert.equal(nextRunnerStateOnExit("graceful", true), "stopped");
+  // An external SIGTERM respawns like a graceful stop until it breaches the
+  // shared budget; then it parks the runner instead of looping forever.
+  assert.equal(nextRunnerStateOnExit("external-stop", false), "stopped");
+  assert.equal(nextRunnerStateOnExit("external-stop", true), "degraded");
 });
 
 test("nextRunnerStateOnExit — total over every exitClass (no undefined)", () => {
@@ -62,6 +73,8 @@ test("exitTrigger — agrees with the transition and is kebab-case", () => {
   assert.equal(exitTrigger("crash", false), RUNNER_TRIGGER.exitCrash);
   assert.equal(exitTrigger("crash", true), RUNNER_TRIGGER.exitCrashDegraded);
   assert.equal(exitTrigger("graceful", false), RUNNER_TRIGGER.exitGraceful);
+  assert.equal(exitTrigger("external-stop", false), RUNNER_TRIGGER.exitExternalStop);
+  assert.equal(exitTrigger("external-stop", true), RUNNER_TRIGGER.exitExternalStopDegraded);
   for (const v of Object.values(RUNNER_TRIGGER)) {
     assert.match(v, /^[a-z][a-z0-9]*(-[a-z0-9]+)*$/, `${v} must be kebab-case (§5.5)`);
   }

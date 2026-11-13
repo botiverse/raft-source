@@ -1,8 +1,9 @@
 import { useEffect, useState } from "react";
-import { useIntl } from "react-intl";
 
 /**
- * QR code for the mobile download entry, shown beside the download buttons.
+ * QR code for the mobile download entry: on a computer, the phones' way in,
+ * on /download and in Settings → About, with the sentence that says what it
+ * does (raft-design getting-the-app.md). The caller sets the sentence beside it.
  *
  * **It encodes the route with NO `platform` parameter, deliberately.** At scan
  * time we cannot know what the scanning device is — the person is looking at a
@@ -12,11 +13,8 @@ import { useIntl } from "react-intl";
  * would mean printing two codes and making the reader classify their own device,
  * which is the job we just automated.
  *
- * **Desktop-only, and that is a viewport question rather than a device one.**
- * Someone reading this on a phone should tap a button; a QR they would have to
- * scan with a second device is useless to them. That is the opposite axis from
- * *which artifact to serve*, which is decided by User-Agent in the route — width
- * decides layout, UA decides the installable.
+ * **Computers only.** A phone reading this can't scan its own screen, so the
+ * callers show it when the device isn't a phone (`detectPhoneDevice`).
  *
  * **Built from the module matrix, not from the library's SVG string.** `uqr`
  * also offers `renderSVG`, but painting that requires `dangerouslySetInnerHTML`,
@@ -29,7 +27,6 @@ import { useIntl } from "react-intl";
  * one section of one settings tab.
  */
 export default function MobileDownloadQr({ url }: { url: string }) {
-  const { formatMessage } = useIntl();
   const [code, setCode] = useState<{ size: number; path: string } | null>(null);
 
   useEffect(() => {
@@ -60,22 +57,14 @@ export default function MobileDownloadQr({ url }: { url: string }) {
   if (!code) return null;
 
   return (
-    <div className="hidden shrink-0 sm:block" data-testid="mobile-download-qr">
-      {/* Above the code, and never wrapped: it introduces the QR rather than
-          captioning it, so it has to be read first. `w-28` (the code's width)
-          broke "Or, Scan with your phone" across two lines, which made a
-          one-line aside look like a heading (@wenyi). */}
-      <div className="mb-1.5 whitespace-nowrap text-caption text-foreground-hint">
-        {formatMessage({ id: "settings.mobileApp.qrCaption" })}
-      </div>
-      <svg
-        aria-hidden="true"
-        viewBox={`0 0 ${code.size} ${code.size}`}
-        className="h-28 w-28 rounded-sticker border border-line-hairline bg-sticker-paper p-1 text-sticker-ink"
-        shapeRendering="crispEdges"
-      >
-        <path d={code.path} fill="currentColor" />
-      </svg>
-    </div>
+    <svg
+      aria-hidden="true"
+      viewBox={`0 0 ${code.size} ${code.size}`}
+      className="size-28 shrink-0 rounded-sticker border border-line-hairline bg-sticker-paper p-1 text-sticker-ink"
+      shapeRendering="crispEdges"
+      data-testid="mobile-download-qr"
+    >
+      <path d={code.path} fill="currentColor" />
+    </svg>
   );
 }

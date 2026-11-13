@@ -52,7 +52,7 @@ test("task unassign sends an explicit null assignee and writes canonical text", 
   const { io, stdout, stderr } = memoryIo();
   const requests: Array<{ method: string; path: string; body: unknown }> = [];
 
-  await taskUnassignCommand.handler(recordingCtx(io, requests), {
+  await taskUnassignCommand.handler(recordingCtx(io, requests), undefined, {
     target: "  #proj-runtime  ", number: "7",
   });
 
@@ -74,13 +74,13 @@ test("task unassign forwards --expected-revision only when supplied", async () =
   const { io } = memoryIo();
 
   const withRev: Array<{ method: string; path: string; body: unknown }> = [];
-  await taskUnassignCommand.handler(recordingCtx(io, withRev), {
+  await taskUnassignCommand.handler(recordingCtx(io, withRev), undefined, {
     target: "#proj-runtime", number: "7", expectedRevision: "3",
   });
   assert.equal((withRev[0]!.body as { expected_revision?: number }).expected_revision, 3);
 
   const withoutRev: Array<{ method: string; path: string; body: unknown }> = [];
-  await taskUnassignCommand.handler(recordingCtx(io, withoutRev), {
+  await taskUnassignCommand.handler(recordingCtx(io, withoutRev), undefined, {
     target: "#proj-runtime", number: "7",
   });
   assert.ok(
@@ -116,9 +116,22 @@ test("task unassign maps invalid numbers and revisions to typed CliError", async
       createApiClient: () => { throw new Error("must not reach the network"); },
     });
     await assert.rejects(
-      async () => { await taskUnassignCommand.handler(ctx, opts); },
+      async () => { await taskUnassignCommand.handler(ctx, undefined, opts); },
       (err: unknown) => err instanceof CliError && err.code === "INVALID_ARG",
       JSON.stringify(opts),
     );
   }
+});
+
+test("task unassign takes the task by its ref", async () => {
+  const { io } = memoryIo();
+  const requests: Array<{ method: string; path: string; body: unknown }> = [];
+
+  await taskUnassignCommand.handler(recordingCtx(io, requests), "#proj-runtime:#7", {});
+
+  const body = requests[0]!.body as Record<string, unknown>;
+  assert.equal(body.channel, "#proj-runtime");
+  assert.equal(body.task_number, 7);
+  assert.equal(body.assignee, null);
+  assert.ok(!("reason" in body), "clearing the assignee carries no reason");
 });

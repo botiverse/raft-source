@@ -57,7 +57,7 @@ export function classifyLinuxDmi(dmi: LinuxDmi): DeviceClass | undefined {
   return undefined;
 }
 
-function readOptional(file: string): string | undefined {
+export function readOptional(file: string): string | undefined {
   try {
     return readFileSync(file, "utf8");
   } catch {
@@ -102,21 +102,4 @@ export async function detectDeviceClass(
     // Any failure means "unknown"; the icon falls back to the OS.
   }
   return undefined;
-}
-
-let cached: Promise<DeviceClass | undefined> | undefined;
-let known: DeviceClass | undefined;
-
-/** Start (once per daemon process) detecting this host's category. */
-export function hostDeviceClass(): Promise<DeviceClass | undefined> {
-  cached ??= detectDeviceClass().then((value) => {
-    known = value;
-    return value;
-  });
-  return cached;
-}
-
-/** The category if detection has finished, without waiting; undefined until then or when unknown. */
-export function knownHostDeviceClass(): DeviceClass | undefined {
-  return known;
 }

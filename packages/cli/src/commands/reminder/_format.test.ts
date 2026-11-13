@@ -20,7 +20,7 @@ const AFTER_FIRE = new Date(2026, 3, 23, 9, 30, 0);
 const sample = (overrides: Partial<{
   reminderId: string;
   title: string;
-  status: "scheduled" | "fired" | "canceled";
+  status: "scheduled" | "fired" | "canceled" | "migrated";
   msgRef: string | null;
   msgPermalink: string | null;
   fireAt: string;
@@ -92,7 +92,6 @@ test("formatReminderScheduled: without warning", () => {
     [
       `Reminder scheduled: #abcd1234 (one-time) "follow up on PR #982"`,
       `Next: ${sample().fireAt}`,
-      `(to modify: snooze/update/cancel; raft reminder --help)`,
     ].join("\n"),
   );
 });
@@ -103,7 +102,6 @@ test("formatReminderScheduled: with warning", () => {
     [
       `Reminder scheduled: #abcd1234 (one-time) "follow up on PR #982"`,
       `Next: ${sample().fireAt}`,
-      `(to modify: snooze/update/cancel; raft reminder --help)`,
       `Warning: fireAt is >30d in the future`,
     ].join("\n"),
   );
@@ -123,8 +121,29 @@ test("formatReminderList: multiple", () => {
     [
       `#11111111 [scheduled] (one-time) next=${sample().fireAt} "check CI"`,
       `#22222222 [fired] (one-time) fired_at=${sample().fireAt} "review PR"`,
+      "[fired] is the reminder's state, not something to act on: a fire still waiting for your ack is listed in `raft inbox check`.",
     ].join("\n"),
   );
+});
+
+test("formatReminderList: fired reminders left out of the default view are counted with the command that lists them", () => {
+  // A one-time reminder stays `fired` forever; listing every one read as an
+  // unacked backlog (RFC 081 numbers: p90 37 per agent, max 2,684).
+  assert.equal(
+    formatReminderList([sample({ reminderId: "11111111-aaaa", title: "check CI" })], BEFORE_FIRE, { hiddenFired: 47 }),
+    [
+      `#11111111 [scheduled] (one-time) next=${sample().fireAt} "check CI"`,
+      "Not shown: 47 fired one-time reminders (`raft reminder list --status fired`).",
+    ].join("\n"),
+  );
+  assert.equal(
+    formatReminderList([], BEFORE_FIRE, { hiddenFired: 1 }),
+    ["No scheduled reminders.", "Not shown: 1 fired one-time reminder (`raft reminder list --status fired`)."].join("\n"),
+    "nothing scheduled must not read as no reminders at all",
+  );
+  assert.equal(formatReminderList([], BEFORE_FIRE, { hiddenFired: 0 }), "No reminders.");
+  const withMigrated = formatReminderList([sample({ status: "migrated" })], BEFORE_FIRE, { hiddenFired: 2 }).split("\n");
+  assert.match(withMigrated.at(-1)!, /^Not shown: 2 fired/, "the count stays the last line after the migrated hint");
 });
 
 test("formatReminderCanceled", () => {
@@ -178,4 +197,17 @@ test("formatReminderList: marks only the overdue rows in a mixed list", () => {
   const [first, second] = out.split("\n");
   assert.ok(first?.includes("OVERDUE"), first);
   assert.ok(!second?.includes("OVERDUE"), second);
+});
+
+test("a migrated reminder shows where it went, with no next fire here, and the list explains once", () => {
+  const moved = sample({ reminderId: "bbbbbbbb-0000-0000-0000-000000000000", status: "migrated", title: "weekly report", msgRef: null });
+  assert.equal(
+    formatReminder(moved, AFTER_FIRE),
+    '#bbbbbbbb [migrated] (one-time) "weekly report" -> now in the Reminder app',
+    "no next= and no OVERDUE: it no longer fires in this system",
+  );
+  const listed = formatReminderList([sample({}), moved], AFTER_FIRE).split("\n");
+  assert.equal(listed.length, 3);
+  assert.match(listed[2]!, /^Reminders marked \[migrated\] moved to the Reminder app .*raft integration list/);
+  assert.equal(formatReminderList([sample({})], AFTER_FIRE).includes("[migrated]"), false, "no hint without a migrated row");
 });

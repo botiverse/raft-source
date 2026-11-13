@@ -11,7 +11,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { sql } from "drizzle-orm";
 import { getDb } from "../db/index";
-import { mobilePushOutboxDrainCandidatesQuery } from "./pushService";
+import { notificationOutboxDrainCandidatesQuery as mobilePushOutboxDrainCandidatesQuery } from "./notifications/dispatcher";
 import {
   ACTIVE_INDEX_COLUMNS,
   ACTIVE_INDEX_NAME,
@@ -54,7 +54,8 @@ test("migrations build the active-row index exactly as the create/verify scripts
 
 test("the outbox table vacuums at 2% dead tuples and never truncates its tail", async ({ db }) => {
   void db;
-  const result = await getDb().execute(sql`SELECT reloptions FROM pg_class WHERE relname = 'mobile_push_outbox'`);
+  // Renamed to notification_outbox (migration notification_outbox); the options moved with it.
+  const result = await getDb().execute(sql`SELECT reloptions FROM pg_class WHERE relname = 'notification_outbox'`);
   const options = ((result as unknown as { rows: Array<{ reloptions: string[] | string | null }> }).rows[0]?.reloptions) ?? [];
   const list = Array.isArray(options) ? options : String(options).replace(/^\{|\}$/g, "").split(",");
   assert.ok(list.includes("autovacuum_vacuum_scale_factor=0.02"), String(list));
@@ -80,7 +81,9 @@ test("the migration's guard refuses a missing index on a large outbox and passes
   void db;
   const migration = await readFile(path.join(SERVER_ROOT, "drizzle/0359_mobile_push_outbox_active_index.sql"), "utf8");
   const guard = migration.split("--> statement-breakpoint").find((part) => part.includes("RAISE EXCEPTION"))!;
-  const block = guard.slice(guard.indexOf("DO $$"));
+  // The guard names the table as it was then (mobile_push_outbox); run it
+  // against its current name (migration notification_outbox renamed it).
+  const block = guard.slice(guard.indexOf("DO $$")).replace("'public.mobile_push_outbox'::regclass", "'public.notification_outbox'::regclass");
   // Index present (as after migrations): the guard is a no-op.
   await getDb().execute(sql.raw(block));
   // Present but invalid (a failed concurrent build): the guard raises.
@@ -89,6 +92,6 @@ test("the migration's guard refuses a missing index on a large outbox and passes
   await getDb().execute(sql`UPDATE pg_index SET indisvalid = true WHERE indexrelid = 'public.idx_mobile_push_outbox_active_created'::regclass`);
   // Missing index on a table the planner believes is large: the guard raises.
   await getDb().execute(sql`DROP INDEX "idx_mobile_push_outbox_active_created"`);
-  await getDb().execute(sql`UPDATE pg_class SET reltuples = 7000000 WHERE oid = 'public.mobile_push_outbox'::regclass`);
+  await getDb().execute(sql`UPDATE pg_class SET reltuples = 7000000 WHERE oid = 'public.notification_outbox'::regclass`);
   await assert.rejects(getDb().execute(sql.raw(block)), /db:create-mobile-push-outbox-active-index/);
 });

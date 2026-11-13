@@ -61,7 +61,7 @@ export interface RuntimeBusyDeliveryCoordinatorHooks<
   ): void;
 }
 
-function bucketMs(ms: number): string {
+export function bucketMs(ms: number): string {
   if (ms < 1_000) return "<1s";
   if (ms < 10_000) return "1-10s";
   if (ms < 60_000) return "10-60s";

@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 import { openTestApp } from "../test/integration/app";
 import { createApiTest } from "../test/integration/apiTest";
 import { fixturePasswordHash, tokenForHuman } from "../test/integration/credentials";
+import { expectedAppPermissionsJson } from "../test/integration/appPermissions";
 import { getDb } from "../db";
 import { users, oauthClients, oauthClientInstalls, integrationAuditEvents, serverAgentMembers } from "../db/schema";
 import { createServer, addMember } from "../services/serverService";
@@ -19,7 +20,7 @@ import { createChannel, addAgent, addHuman } from "../services/channelService";
 import { prepareActionCard, executeActionCard, bindMarketplaceAppName, ActionCardError } from "../services/actionCardsService";
 import { asServerId } from "@botiverse/raft-shared";
 
-const test = createApiTest({ onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest();
 
 async function fixture(baseUrl: string, setupUrl: string | null = "https://setup.example.test/configure?from=raft&server_id=untrusted") {
   const suffix = randomUUID().slice(0, 8);
@@ -32,7 +33,7 @@ async function fixture(baseUrl: string, setupUrl: string | null = "https://setup
   const headers = { Authorization: `Bearer ${token}`, "X-Server-Id": target.id, "Content-Type": "application/json" };
   const sourceHeaders = { ...headers, "X-Server-Id": source.id };
   const install = async () => {
-    const response = await fetch(`${baseUrl}/api/integrations/marketplace/${created.client.id}/install`, { method: "POST", headers });
+    const response = await fetch(`${baseUrl}/api/integrations/marketplace/${created.client.id}/install`, { method: "POST", headers, body: await expectedAppPermissionsJson(created.client.id) });
     assert.equal(response.status, 200, await response.clone().text());
     const [row] = await getDb().select().from(oauthClientInstalls).where(and(eq(oauthClientInstalls.clientId, created.client.id), eq(oauthClientInstalls.serverId, target.id)));
     assert.ok(row); return row;
@@ -127,8 +128,8 @@ test("Agent list and owner update preserve setup declaration and the selected Se
   const agent = await createAgent(f.target.id, "SetupReader", { runtime: "external", model: "external" });
   const sourceAgent = await createAgent(f.source.id, "SetupOwner", { runtime: "external", model: "external" });
   await getDb().update(serverAgentMembers).set({ role: "admin" }).where(and(eq(serverAgentMembers.serverId, f.source.id), eq(serverAgentMembers.agentId, sourceAgent.id)));
-  const keyFor = async (id: string) => (await mintAgentCredential({ agentId: id, scopes: ["read"], name: "setup-test", createdByUserId: null })).apiKey;
-  const sourceInstallResponse = await fetch(`${app.baseUrl}/api/integrations/marketplace/${f.client.id}/install`, { method: "POST", headers: f.sourceHeaders });
+  const keyFor = async (id: string) => (await mintAgentCredential({ agentId: id, scopes: ["read"], name: "setup-test", issuedVia: "computer", createdByUserId: null })).apiKey;
+  const sourceInstallResponse = await fetch(`${app.baseUrl}/api/integrations/marketplace/${f.client.id}/install`, { method: "POST", headers: f.sourceHeaders, body: await expectedAppPermissionsJson(f.client.id) });
   assert.equal(sourceInstallResponse.status, 200, await sourceInstallResponse.clone().text());
   const [sourceInstall] = await getDb().select().from(oauthClientInstalls).where(and(eq(oauthClientInstalls.clientId, f.client.id), eq(oauthClientInstalls.serverId, f.source.id)));
   assert.equal((await f.report(1, "complete", sourceInstall.id)).status, 200);
@@ -165,11 +166,11 @@ test("installation cards disclose server-owned setup requirements and reject cha
   if (action.type !== "integration:install_marketplace_app") throw new Error("wrong card");
   assert.equal(action.setupUrl, f.client.setupUrl); assert.equal(action.setupRevision, 1);
   await fetch(`${app.baseUrl}/api/integrations/clients/${f.client.id}`, { method: "PATCH", headers: f.sourceHeaders, body: JSON.stringify({ setupUrl: "https://setup.example.test/revised" }) });
-  await assert.rejects(executeActionCard({ messageId: card.messageId, serverId: asServerId(f.target.id), userId: f.owner.id }),
+  await assert.rejects(executeActionCard({ webSessionFamilyId: null, messageId: card.messageId, serverId: asServerId(f.target.id), userId: f.owner.id }),
     (error: unknown) => error instanceof ActionCardError && error.code === "APP_SETUP_CHANGED");
   assert.equal((await f.read()).status, 404, "stale approval did not install the App");
   const fresh = await prepare();
-  const receipt = await executeActionCard({ messageId: fresh.messageId, serverId: asServerId(f.target.id), userId: f.owner.id });
+  const receipt = await executeActionCard({ webSessionFamilyId: null, messageId: fresh.messageId, serverId: asServerId(f.target.id), userId: f.owner.id });
   const result = receipt.metadata.result;
   assert.equal(result?.kind, "marketplace-app-installation");
   if (result?.kind !== "marketplace-app-installation") throw new Error("wrong result");
@@ -193,7 +194,7 @@ test("Agent registration approval carries setup declaration and rejects invalid 
   }
   await assert.rejects(prepare("https://registered.example.test/setup", "two\nlines"), (error: unknown) => error instanceof ActionCardError && error.status === 400);
   const card = await prepare("https://registered.example.test/setup");
-  await executeActionCard({ messageId: card.messageId, serverId: asServerId(f.source.id), userId: f.owner.id });
+  await executeActionCard({ webSessionFamilyId: null, messageId: card.messageId, serverId: asServerId(f.source.id), userId: f.owner.id });
   const [registered] = await getDb().select().from(oauthClients).where(eq(oauthClients.clientId, "registered-setup"));
   assert.equal(registered.setupUrl, "https://registered.example.test/setup");
   assert.equal(registered.setupDescription, "Select a repository");
@@ -215,7 +216,7 @@ nativeTest.skipIf(!process.env.APP_SETUP_TEST_DATABASE_URL)("native PG: migrated
     root.pathname = `/${name}`;
     client = new pg.Client({ connectionString: root.toString() }); await client.connect();
     await migrate(drizzle(client), { migrationsFolder: fileURLToPath(new URL("../../drizzle", import.meta.url)) });
-    app = await openTestApp(root.toString(), 0, { onboardingOpenerFlagDefaultEnabled: false });
+    app = await openTestApp(root.toString(), 0);
     const f = await fixture(app.baseUrl);
     const responses = await Promise.all(Array.from({ length: 8 }, () => f.report(1, "complete")));
     assert.ok(responses.every(response => response.status === 200));

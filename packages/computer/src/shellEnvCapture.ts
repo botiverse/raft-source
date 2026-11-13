@@ -23,6 +23,8 @@
  *  - Replace-not-merge: parent keys absent from the snapshot are deleted;
  *    the snapshot is applied verbatim; a closed set of Raft control keys is
  *    re-applied last so rc files cannot alter machine identity/ownership.
+ *    One exception: when the shell sets no proxy, the proxy variables the
+ *    service was started with are kept (withInheritedProxyEnv).
  */
 import { spawn } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -414,6 +416,57 @@ export function applyCapturedEnv(
   }
 }
 
+/** Variables that pick a proxy (any non-blank one means "this env has a proxy"). */
+export const PROXY_URL_ENV_KEYS = [
+  "HTTPS_PROXY",
+  "https_proxy",
+  "HTTP_PROXY",
+  "http_proxy",
+  "ALL_PROXY",
+  "all_proxy",
+] as const;
+export const NO_PROXY_ENV_KEYS = ["NO_PROXY", "no_proxy"] as const;
+
+function hasProxyUrl(env: Readonly<Record<string, string | undefined>>): boolean {
+  return PROXY_URL_ENV_KEYS.some((key) => (env[key] ?? "").trim() !== "");
+}
+
+function setValues(
+  env: Readonly<Record<string, string | undefined>>,
+  keys: readonly string[],
+): Array<[string, string]> {
+  return keys.flatMap((key): Array<[string, string]> => {
+    const value = env[key];
+    return value !== undefined && value.trim() !== "" ? [[key, value]] : [];
+  });
+}
+
+/**
+ * The login shell is the proxy authority only when it defines a proxy. A proxy
+ * that lives only outside the shell (e.g. the macOS system proxy, which Raft
+ * Desktop resolves and passes in as HTTPS_PROXY/HTTP_PROXY/NO_PROXY) would
+ * otherwise be erased by the replace-not-merge apply. So: when the captured
+ * env sets no proxy URL variable and the inherited env does, the inherited
+ * proxy URL variables are kept, and so is its NO_PROXY (both spellings
+ * replace the shell's, since it was chosen together with that proxy). A
+ * shell that sets any proxy URL variable wins wholesale, as before; with no
+ * inherited proxy the captured env is returned unchanged (direct).
+ */
+export function withInheritedProxyEnv(
+  inherited: Readonly<Record<string, string | undefined>>,
+  captured: Record<string, string>,
+): Record<string, string> {
+  if (hasProxyUrl(captured) || !hasProxyUrl(inherited)) return captured;
+  const merged: Record<string, string> = { ...captured };
+  for (const [key, value] of setValues(inherited, PROXY_URL_ENV_KEYS)) merged[key] = value;
+  const inheritedNoProxy = setValues(inherited, NO_PROXY_ENV_KEYS);
+  if (inheritedNoProxy.length > 0) {
+    for (const key of NO_PROXY_ENV_KEYS) delete merged[key];
+    for (const [key, value] of inheritedNoProxy) merged[key] = value;
+  }
+  return merged;
+}
+
 // ── Service boot seam (moved from index.ts so hosts other than the CLI entry —
 // Raft Desktop's app-hosted `__service` — can apply the SAME contract:
 // "the whole Computer process tree = Terminal launch environment", task #326).
@@ -463,7 +516,8 @@ export async function bootstrapServiceEnv(
 
   const result = await capture();
   if (result.ok) {
-    applyCapturedEnv(env, result.env);
+    // A proxy only the starter knew (system proxy) survives a proxy-less shell.
+    applyCapturedEnv(env, withInheritedProxyEnv(env, result.env));
     env[SHELL_ENV_STATE_ENV_VAR] = "inherited";
     return "inherited";
   }

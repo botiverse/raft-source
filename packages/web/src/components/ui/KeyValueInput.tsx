@@ -79,7 +79,7 @@ export function KeyValueInputRow({
       {/* Removing an unsaved row is reversible (nothing is written until the
           form saves), so it is a quiet ghost icon button, not the red sticker
           the DS keeps for irreversible consequences. */}
-      <Button type="button" size="icon-sm" variant="ghost" onClick={onRemove} aria-label={resolvedRemoveLabel} className="shrink-0">
+      <Button type="button" size="icon-md" variant="ghost" onClick={onRemove} aria-label={resolvedRemoveLabel} className="shrink-0">
         <Trash2 size={16} />
       </Button>
     </div>
@@ -91,12 +91,11 @@ export function KeyValueInputRow({
  *
  * `variant="ghost"` already carries the themed treatment (ink text, the
  * pressed wash on hover); a literal colour here would stop the control from
- * following the theme. `size="sm"` is raft-ui's 32px text button (an alias of
- * `md`).
+ * following the theme. `size="md"` is raft-ui's 32px text button.
  */
 export function KeyValueAddButton({ label, onClick }: { label: string; onClick: () => void }) {
   return (
-    <Button type="button" size="sm" variant="ghost" onClick={onClick}>
+    <Button type="button" size="md" variant="ghost" onClick={onClick}>
       <Plus size={16} />
       {label}
     </Button>

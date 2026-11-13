@@ -6,10 +6,10 @@
 
 
 
-/** Wire contract identity, compared with the server-reported contract (X-Raft-Contract header, follow-up to task #3). */
+/** Identity of the retained library contract and binding fixtures. */
 export const ACTIVITY_SYNC_CONTRACT = "raft.activity-sync" as const;
-/** Contract revision from revisions.json; enable the sync engine only when the server reports exactly this revision. */
-export const ACTIVITY_SYNC_CONTRACT_REVISION = 2 as const;
+/** Contract revision from revisions.json; this metadata does not enable a serving endpoint. */
+export const ACTIVITY_SYNC_CONTRACT_REVISION = 3 as const;
 
 export type OpaqueId = string;
 

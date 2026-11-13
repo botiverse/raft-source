@@ -13,7 +13,7 @@ import { createAgent } from "../services/agentService";
 import { mintAgentCredential, type AgentCapability } from "../services/agentCredentialService";
 import { createServer } from "../services/serverService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 type Fixture = {
   agentId: string;
@@ -48,6 +48,7 @@ async function mintAgentKey(agentId: string, scopes: readonly AgentCapability[])
     agentId,
     scopes,
     name: `knowledge-test-${scopes.join("-")}`,
+    issuedVia: "computer",
     createdByUserId: null,
   });
   return minted.apiKey;
@@ -738,15 +739,70 @@ test("agent-api knowledge search rejects raw payload intent", async ({ app }) =>
     assert.match(body.error ?? "", /raw Slock message headers/);
 });
 
-test("agent-api knowledge get rejects non-CLI source", async ({ app }) => {
-    const fixture = await seedFixture();
-    const headers = agentHeaders(fixture.apiKey);
-    delete headers["X-Raft-Client"];
-    const res = await fetch(`${app.baseUrl}/internal/agent-api/knowledge?topic=slock-home${VALID_KNOWLEDGE_CONTEXT}`, { headers });
+function sdkHeaders(apiKey: string, client: "sdk" | null): Record<string, string> {
+  const headers: Record<string, string> = { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" };
+  if (client) headers["X-Raft-Client"] = client;
+  return headers;
+}
 
-    assert.equal(res.status, 400);
-    const body = await res.json() as { code?: string };
-    assert.equal(body.code, "knowledge_source_invalid");
+test("agent-api Manual records the raft SDK, and a request naming no client, as source sdk", async ({ app }) => {
+    const fixture = await seedFixture();
+    for (const client of ["sdk", null] as const) {
+      const getRes = await fetch(
+        `${app.baseUrl}/internal/agent-api/knowledge?topic=slock-home${VALID_KNOWLEDGE_CONTEXT}`,
+        { headers: sdkHeaders(fixture.apiKey, client) },
+      );
+      assert.equal(getRes.status, 200, `get with X-Raft-Client ${client ?? "absent"}`);
+      const getEvent = await latestKnowledgeEvent();
+      assert.equal(getEvent.agentId, fixture.agentId);
+      assert.equal(getEvent.source, "sdk");
+      assert.equal(getEvent.operation, "get");
+      assert.equal(getEvent.intent, DEFAULT_INTENT);
+
+      const searchRes = await fetch(
+        `${app.baseUrl}/internal/agent-api/knowledge/search?query=preview&scope=recipes${VALID_KNOWLEDGE_CONTEXT}`,
+        { headers: sdkHeaders(fixture.apiKey, client) },
+      );
+      assert.equal(searchRes.status, 200, `search with X-Raft-Client ${client ?? "absent"}`);
+      const searchEvent = await latestKnowledgeEvent();
+      assert.equal(searchEvent.source, "sdk");
+      assert.equal(searchEvent.operation, "search");
+    }
+});
+
+test("agent-api Manual requires intent and reason from the sdk source even without the context capability", async ({ app }) => {
+    const fixture = await seedFixture();
+    const cases = [
+      { path: "knowledge?topic=slock-home", query: "", code: "knowledge_intent_invalid", error: "intent is required" },
+      { path: "knowledge?topic=slock-home", query: `&intent=${encodeURIComponent(DEFAULT_INTENT)}`, code: "knowledge_reason_invalid", error: "reason is required" },
+      { path: "knowledge/search?query=preview", query: "", code: "knowledge_intent_invalid", error: "intent is required" },
+      { path: "knowledge/search?query=preview", query: `&intent=${encodeURIComponent(DEFAULT_INTENT)}`, code: "knowledge_reason_invalid", error: "reason is required" },
+    ];
+    for (const client of ["sdk", null] as const) {
+      for (const { path, query, code, error } of cases) {
+        const res = await fetch(`${app.baseUrl}/internal/agent-api/${path}${query}`, { headers: sdkHeaders(fixture.apiKey, client) });
+        assert.equal(res.status, 400, `${path}${query} with X-Raft-Client ${client ?? "absent"}`);
+        assert.deepEqual(await res.json(), { ok: false, code, error });
+      }
+    }
+    const events = await getDb()
+      .select()
+      .from(agentKnowledgeEvents)
+      .where(eq(agentKnowledgeEvents.agentId, fixture.agentId));
+    assert.equal(events.length, 0, "a refused request records nothing");
+});
+
+test("agent-api Manual still refuses a client it does not know", async ({ app }) => {
+    const fixture = await seedFixture();
+    for (const client of ["mcp", "daemon", "web"]) {
+      const headers = agentHeaders(fixture.apiKey);
+      headers["X-Raft-Client"] = client;
+      for (const path of ["knowledge?topic=slock-home", "knowledge/search?query=preview"]) {
+        const res = await fetch(`${app.baseUrl}/internal/agent-api/${path}${VALID_KNOWLEDGE_CONTEXT}`, { headers });
+        assert.equal(res.status, 400, `${path} with X-Raft-Client "${client}"`);
+        assert.equal((await res.json() as { code?: string }).code, "knowledge_source_invalid");
+      }
+    }
 });
 
 test("agent-api knowledge get still honors the legacy X-Slock-Client header", async ({ app }) => {

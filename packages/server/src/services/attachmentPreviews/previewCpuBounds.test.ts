@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import type { AttachmentPreviewResponse, XlsxAttachmentPreviewData } from "@botiverse/raft-shared";
 import * as XLSX from "xlsx";
-import type { attachments } from "../../db/schema";
+import type { ResolvedAttachment } from "../attachmentRecord";
 import {
   ATTACHMENT_PREVIEW_CACHE_MIN_COMPUTE_MS,
   ATTACHMENT_PREVIEW_CACHE_VERSION,
@@ -12,7 +12,7 @@ import {
 } from "./previewCache";
 import { buildXlsxPreview, fitXlsxPreviewToPayloadCap, XLSX_PREVIEW_MAX_SHEETS } from "./providers/xlsx";
 
-type Attachment = typeof attachments.$inferSelect;
+type Attachment = ResolvedAttachment;
 
 function workbook(sheets: number, rows: number, columns: number, cellLength: number): Buffer {
   const book = XLSX.utils.book_new();

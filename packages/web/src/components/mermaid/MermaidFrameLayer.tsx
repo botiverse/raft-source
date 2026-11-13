@@ -16,6 +16,7 @@ function frameLayerStyle(kind: MermaidFrameLayerState["kind"], ratio: number): C
         width: "100%",
         height: "100%",
         opacity: 1,
+        // raft-ui: z-index crossfade buffer, three frames (prepared 0 < active 1 < retiring 2) inside the viewer's own stack
         zIndex: 1,
       }
     : kind === "prepared"
@@ -31,6 +32,7 @@ function frameLayerStyle(kind: MermaidFrameLayerState["kind"], ratio: number): C
           // exact stale-frame flash this buffer exists to prevent. The old
           // frame is above it and covers the same visual pixels.
           opacity: 1,
+          // raft-ui: z-index crossfade buffer, three frames (prepared 0 < active 1 < retiring 2) inside the viewer's own stack
           zIndex: 0,
         }
       : {
@@ -41,6 +43,7 @@ function frameLayerStyle(kind: MermaidFrameLayerState["kind"], ratio: number): C
           transform: `translate(-50%, -50%) scale(${ratio})`,
           transformOrigin: "center center",
           opacity: 1,
+          // raft-ui: z-index crossfade buffer, three frames (prepared 0 < active 1 < retiring 2) inside the viewer's own stack
           zIndex: 2,
         };
 }

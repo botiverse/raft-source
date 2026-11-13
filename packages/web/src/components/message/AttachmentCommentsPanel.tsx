@@ -1,8 +1,7 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import { useIntl } from "react-intl";
-import { ChevronDown, ChevronUp, FileText, MapPin, X } from "lucide-react";
-import api from "../../api/client";
-import MessageInput from "./MessageInput";
+import { ChevronDown, ChevronUp, MapPin, X } from "lucide-react";
+import { MessageInput } from "../../features/composer/MessageInput";
 import AvatarSlot from "../ui/AvatarSlot";
 import {
   anchorLabel,
@@ -14,15 +13,36 @@ import type {
   CommentAnchor,
   StoredAnchor,
 } from "./attachmentCommentAnchors";
-import { getSocket } from "../../api/socket";
-import { useMessageStore } from "../../store/messageStore";
-import type { Message } from "../../store/messageStore";
-import { useAuthStore } from "../../store/authStore";
+import type { Message, MessageMention } from "../../store/messageStore";
 import { useTimeFormatter } from "../../hooks/useTimeFormatter";
 import MarkdownContent from "../markdown/MarkdownContent";
-import { Card, Spinner, Button } from "@botiverse/raft-ui";
+import {
+  MarkdownBlockquote,
+  MessageItem,
+  MessageItemAvatarSlot,
+  MessageItemBody,
+  MessageItemContent,
+  MessageItemGutter,
+  MessageItemHeader,
+  MessageItemSender,
+  MessageItemTime,
+  Panel,
+  PanelAction,
+  PanelActions,
+  PanelHeader,
+  PanelHeaderContent,
+  PanelHeading,
+  PanelMeta,
+  PanelTitle,
+  Spinner,
+  ScrollArea,
+} from "@botiverse/raft-ui";
+import { CommentIcon } from "@botiverse/ricons";
 import AttachmentTooltip from "./attachmentTooltip";
+import EmptyState from "../ui/EmptyState";
+import { ReferenceChip } from "./ReferenceChip";
 import { COMPOSER_DOCK_CLASS } from "./composerHost";
+import { useAttachmentComments } from "./useAttachmentComments";
 
 // Attachment comments panel (attachment-comments MVP spec §5/§5b).
 //
@@ -32,32 +52,32 @@ import { COMPOSER_DOCK_CLASS } from "./composerHost";
 // POST /attachments/:id/comments. General thread replies intentionally never
 // appear here — that split is the §6.5 scope-path × visibility contract.
 
-interface CommentReaction {
-  emoji: string;
-  reactorType: "user" | "agent";
-  reactorId: string;
+/** A comment's anchor: the muted reference chip, as a link that jumps to the
+ *  spot in the file it points at. It says where (§ Rollout, L12, Rows 3–5) and
+ *  the quote under it says what. An HTML region has no where of its own but
+ *  its quote (anchorLabel is quote-first for it), which the quote block under
+ *  the chip already shows in full: the chip says "Jump to location" then, so
+ *  the quote shows once. */
+function AnchorJumpChip({ anchor, onAnchorJump }: { anchor: StoredAnchor; onAnchorJump?: () => void }) {
+  const { formatMessage } = useIntl();
+  const jump = useCallback((event: React.MouseEvent) => {
+    event.preventDefault();
+    if (jumpToAnchor(anchor)) onAnchorJump?.();
+  }, [anchor, onAnchorJump]);
+  const quoteBelow = anchor.type === "html-region" && anchorQuote(anchor) !== undefined;
+  return (
+    <ReferenceChip
+      as="a"
+      href="#"
+      onClick={jump}
+      data-message-affordance="attachment-comment-anchor"
+      icon={MapPin}
+      variant="muted"
+      label={quoteBelow ? formatMessage({ id: "message.attachmentComments.jumpToLocation" }) : anchorLabel(anchor, formatMessage)}
+      title={anchorQuote(anchor) ?? formatMessage({ id: "message.attachmentComments.jumpToLocation" })}
+    />
+  );
 }
-
-interface AttachmentComment {
-  id: string;
-  channelId: string;
-  senderType: "user" | "agent";
-  senderId: string;
-  senderName: string;
-  content: string;
-  createdAt: string;
-  reactions: CommentReaction[];
-  /** Structural anchor (task #15) — null for unanchored comments. */
-  anchor: StoredAnchor | null;
-  senderAvatarUrl: string | null;
-  senderGravatarHash: string | null;
-}
-
-type ViewerState = {
-  canComment: boolean;
-  reason: "ok" | "not_member" | "archived" | "unlinked" | "read_only";
-};
-
 
 export function AttachmentCommentsPanel({
   attachmentId,
@@ -94,15 +114,16 @@ export function AttachmentCommentsPanel({
    *  the mobile sheet is collapsed to its header row. */
   collapsedBody?: boolean;
 }) {
-  const currentUser = useAuthStore((s) => s.user);
-  const viewerUserId = currentUser?.id ?? null;
   const { formatMessage } = useIntl();
   const { formatMessageTime } = useTimeFormatter();
-  const [comments, setComments] = useState<AttachmentComment[] | null>(null);
-  const [pendingComments, setPendingComments] = useState<AttachmentComment[]>([]);
-  const [threadChannelId, setThreadChannelId] = useState<string | null>(null);
-  const [viewerState, setViewerState] = useState<ViewerState | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const {
+    comments,
+    pendingComments,
+    canComment,
+    writeBlockedCopy,
+    error,
+    send,
+  } = useAttachmentComments(attachmentId);
   const listRef = useRef<HTMLDivElement | null>(null);
 
   // The panel stays mounted across open/close (collapse animation, task #14),
@@ -121,135 +142,22 @@ export function AttachmentCommentsPanel({
     onAnchorCleared?.();
   }, [onAnchorCleared]);
 
-  // The panel can also be RE-SCOPED while mounted (image lightbox paging,
-  // task #10 — Dozy review): a new attachmentId must never show the previous
-  // attachment's comments under the new filename, and a slow previous load
-  // must never overwrite the new one. Reset to loading state during render;
-  // fence every async write on "is this still the active attachment".
-  // oxlint-disable-next-line react-doctor/no-derived-useState -- same prev-prop tracker pattern as above, for re-scoping resets (Dozy review on 94b7c86e).
-  const [lastAttachmentId, setLastAttachmentId] = useState(attachmentId);
-  if (attachmentId !== lastAttachmentId) {
-    setLastAttachmentId(attachmentId);
-    setComments(null);
-    setPendingComments([]);
-    setThreadChannelId(null);
-    setViewerState(null);
-    setError(null);
-  }
-  const attachmentIdRef = useRef(attachmentId);
-  attachmentIdRef.current = attachmentId;
-
-  const commentsRef = useRef(comments);
-  commentsRef.current = comments;
-
-  const load = useCallback(async () => {
-    try {
-      const { data } = await api.get(`/attachments/${attachmentId}/comments`);
-      if (attachmentIdRef.current !== attachmentId) return false; // stale response
-      setComments(data.comments as AttachmentComment[]);
-      setThreadChannelId(data.threadChannelId ?? null);
-      setViewerState((data.viewer as ViewerState | undefined) ?? null);
-      return true;
-    } catch {
-      if (attachmentIdRef.current !== attachmentId) return false;
-      setError(formatMessage({ id: "message.attachmentComments.loadError" }));
-      return false;
-    }
-  }, [attachmentId, formatMessage]);
-
-  useEffect(() => {
-    void load();
-  }, [load]);
-
-  // Live updates: comments ARE thread messages, so the existing message
-  // events cover them — reactions re-emit the full message as
-  // `message:updated`; no comment-specific event types exist.
-  useEffect(() => {
-    const socket = getSocket();
-    if (!socket) return;
-    const onMessage = (payload: { channelId?: string }) => {
-      if (threadChannelId && payload?.channelId === threadChannelId) void load();
-    };
-    const onUpdated = (payload: { id?: string; channelId?: string }) => {
-      if (
-        (threadChannelId && payload?.channelId === threadChannelId)
-        || commentsRef.current?.some((c) => c.id === payload?.id)
-      ) {
-        void load();
-      }
-    };
-    socket.on("message:new", onMessage);
-    socket.on("message:updated", onUpdated);
-    return () => {
-      socket.off("message:new", onMessage);
-      socket.off("message:updated", onUpdated);
-    };
-  }, [threadChannelId, load]);
-
-  const canComment = viewerState?.canComment ?? true;
-  const writeBlockedCopy = viewerState && !viewerState.canComment
-    ? viewerState.reason === "archived"
-      ? formatMessage({ id: "message.attachmentComments.blockedArchived" })
-      : viewerState.reason === "not_member"
-        ? formatMessage({ id: "message.attachmentComments.blockedNotMember" })
-        : viewerState.reason === "read_only"
-          ? formatMessage({ id: "message.attachmentComments.blockedReadOnly" })
-          : formatMessage({ id: "message.attachmentComments.blockedGeneric" })
-    : null;
-
   // Delivery for the inherited composer (task #20): comments must pair the
   // message with its ref/anchor in one request, so the composer's store send
   // path is replaced — typing/mentions/shortcuts/error handling stay in
-  // MessageInput.
-  const sendComment = useCallback(async (content: string, mentions: { type: string; id: string; name: string }[]) => {
+  // MessageInput. The data path (optimistic row, POST, reload) is shared with
+  // the margin through useAttachmentComments.
+  const sendComment = useCallback(async (content: string, mentions: MessageMention[]) => {
     const anchorForSend = getPendingAnchor ? getPendingAnchor() : activeAnchor;
-    const optimisticId = `optimistic-comment-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-    const optimisticComment: AttachmentComment = {
-      id: optimisticId,
-      channelId: threadChannelId ?? `attachment-comment:${attachmentId}`,
-      senderType: "user",
-      senderId: viewerUserId ?? "",
-      senderName: currentUser?.displayName || currentUser?.name || formatMessage({ id: "message.author.you" }),
-      content,
-      createdAt: new Date().toISOString(),
-      reactions: [],
-      anchor: anchorForSend ? { type: anchorForSend.type, data: anchorForSend.data as Record<string, unknown> } : null,
-      senderAvatarUrl: currentUser?.avatarUrl ?? null,
-      senderGravatarHash: currentUser?.gravatarHash ?? null,
-    };
-    setPendingComments((prev) => [...prev, optimisticComment]);
-    window.setTimeout(() => listRef.current?.scrollTo({ top: listRef.current.scrollHeight }), 0);
-
-    try {
-      const { data } = await api.post(`/attachments/${attachmentId}/comments`, {
-        content,
-        anchor: anchorForSend ?? undefined,
-        mentions: mentions.length > 0 ? mentions : undefined,
-      });
-      // Same staleness fence as load(): if the host re-scoped the panel while
-      // the POST was in flight, don't touch the new attachment's UI state
-      // (future-proofing for pageable hosts that pass pendingAnchor).
-      if (attachmentIdRef.current !== attachmentId) return;
-      clearActiveAnchor();
-      setError(null);
-      if (typeof data?.threadChannelId === "string") {
-        setThreadChannelId(data.threadChannelId);
-      }
-      if (data?.message && typeof data.message.id === "string" && typeof data.message.channelId === "string") {
-        useMessageStore.getState().addMessage(data.message as Message);
-      }
-      const loaded = await load();
-      if (loaded) {
-        setPendingComments((prev) => prev.filter((comment) => comment.id !== optimisticId));
-      }
+    const scrollToEnd = () => {
       window.setTimeout(() => listRef.current?.scrollTo({ top: listRef.current.scrollHeight }), 0);
-    } catch (err) {
-      if (attachmentIdRef.current === attachmentId) {
-        setPendingComments((prev) => prev.filter((comment) => comment.id !== optimisticId));
-      }
-      throw err;
-    }
-  }, [getPendingAnchor, activeAnchor, threadChannelId, attachmentId, viewerUserId, currentUser, formatMessage, clearActiveAnchor, load]);
+    };
+    await send(content, mentions, anchorForSend, {
+      onQueued: scrollToEnd,
+      onAccepted: clearActiveAnchor,
+      onDelivered: scrollToEnd,
+    });
+  }, [getPendingAnchor, activeAnchor, send, clearActiveAnchor]);
 
   // Fixed order (cindyz 6/11, task #28): by anchor position in the document;
   // comments WITHOUT a position always sit on top. No user-facing sort
@@ -264,133 +172,145 @@ export function AttachmentCommentsPanel({
     })
     .map(({ c }) => c);
 
-  /* Pending-anchor chip, built once so the quote tooltip can wrap it
-     conditionally (title= migration: native title showed the anchor's quote
-     on hover; absent a quote there is no tooltip at all). */
+  /* Pending-anchor chip above the composer: the same reference chip as the
+     anchors on the comments, with its remove button trailing. The quote
+     tooltip wraps it below only when the anchor has a quote. */
   const pendingAnchorChip = activeAnchor ? (
-    <span
+    <ReferenceChip
       data-message-affordance="attachment-comment-pending-anchor"
-      className="inline-flex max-w-full items-center gap-1 overflow-hidden rounded-chip bg-fill-muted px-1.5 py-0.5 text-caption font-semibold text-foreground"
-    >
-      <MapPin size={12} className="shrink-0" />
-      <span className="min-w-0 truncate">{anchorLabel(activeAnchor, formatMessage)}</span>
-      <AttachmentTooltip content={formatMessage({ id: "message.attachmentComments.removeAnchor" })}>
-      <button
-        type="button"
-        aria-label={formatMessage({ id: "message.attachmentComments.removeAnchor" })}
-        onClick={clearActiveAnchor}
-        className="shrink-0 rounded-[2px] text-foreground-muted outline-none hover:text-foreground focus-visible:shadow-focus"
-      >
-        <X size={12} />
-      </button>
-      </AttachmentTooltip>
-    </span>
+      icon={MapPin}
+      variant="muted"
+      label={anchorLabel(activeAnchor, formatMessage)}
+      trailing={(
+        <AttachmentTooltip content={formatMessage({ id: "message.attachmentComments.removeAnchor" })}>
+          <button
+            type="button"
+            aria-label={formatMessage({ id: "message.attachmentComments.removeAnchor" })}
+            onClick={clearActiveAnchor}
+            className="shrink-0 rounded-chip text-foreground-muted outline-none hover:text-foreground focus-visible:shadow-focus"
+          >
+            <X size={12} aria-hidden="true" />
+          </button>
+        </AttachmentTooltip>
+      )}
+    />
   ) : null;
   const pendingAnchorQuote = activeAnchor ? anchorQuote(activeAnchor) : undefined;
 
+  const sheetToggleLabel = sheetControls
+    ? formatMessage({ id: sheetControls.expanded ? "message.attachmentComments.collapse" : "message.attachmentComments.expand" })
+    : "";
+
   return (
-    <div className="flex h-full w-full flex-col bg-layer-canvas">
-      <div className="flex min-h-10 shrink-0 items-center gap-2 border-b border-line-seam px-3 py-1.5">
+    <Panel
+      edge="inset"
+      aria-label={formatMessage({ id: "message.attachmentComments.titleTooltip" }, { filename })}
+      className="flex h-full w-full flex-col"
+    >
+      {/* The DS panel header, like every other side panel: title, the file
+          it belongs to as the meta line, and on the phone sheet the expand /
+          collapse PanelAction. */}
+      <PanelHeader>
         <AttachmentTooltip content={formatMessage({ id: "message.attachmentComments.titleTooltip" }, { filename })}>
-        <span className="min-w-0 flex-1 truncate text-footnote font-bold text-foreground">
-          {formatMessage({ id: "message.attachmentComments.header" }, { filename })}
-        </span>
+          <PanelHeaderContent>
+            <PanelHeading>
+              <PanelTitle>{formatMessage({ id: "message.attachmentComments.title" })}</PanelTitle>
+            </PanelHeading>
+            <PanelMeta>{filename}</PanelMeta>
+          </PanelHeaderContent>
         </AttachmentTooltip>
         {sheetControls ? (
-          <AttachmentTooltip content={formatMessage({ id: sheetControls.expanded ? "message.attachmentComments.collapse" : "message.attachmentComments.expand" })}>
-          <Button size="icon-sm" variant="ghost"
-            type="button"
-            aria-label={formatMessage({ id: sheetControls.expanded ? "message.attachmentComments.collapse" : "message.attachmentComments.expand" })}
-            data-slot="button"
-            aria-expanded={sheetControls.expanded}
-            onClick={sheetControls.onToggle}
-            data-message-affordance="attachment-comments-sheet-toggle"
-          >
-            {sheetControls.expanded ? <ChevronDown size={16} /> : <ChevronUp size={16} />}
-          </Button>
-          </AttachmentTooltip>
+          <PanelActions>
+            <AttachmentTooltip content={sheetToggleLabel}>
+              <PanelAction
+                aria-label={sheetToggleLabel}
+                aria-expanded={sheetControls.expanded}
+                onClick={sheetControls.onToggle}
+                data-message-affordance="attachment-comments-sheet-toggle"
+              >
+                {sheetControls.expanded ? <ChevronDown aria-hidden="true" /> : <ChevronUp aria-hidden="true" />}
+              </PanelAction>
+            </AttachmentTooltip>
+          </PanelActions>
         ) : null}
-      </div>
+      </PanelHeader>
 
-      <div ref={listRef} className={`min-h-0 flex-1 overflow-y-auto px-3 py-2 ${collapsedBody ? "hidden" : ""}`}>
+      {/* The comments scroll in a raft-ui ScrollArea (`listRef` is still the
+          element that scrolls). The padding stays on it, so the loading and
+          empty states fill its height; the comments are text, so it is a
+          region named like the panel, a tab stop once it overflows. */}
+      <ScrollArea
+        ref={listRef}
+        role="region"
+        aria-label={formatMessage({ id: "message.attachmentComments.title" })}
+        className={`min-h-0 flex-1 px-3 py-2 ${collapsedBody ? "hidden" : ""}`}
+      >
         {comments === null ? (
-          <div className="flex h-full items-center justify-center"><Spinner size="sm" aria-label={formatMessage({ id: "common.loadingLabel" })} /></div>
+          <div className="flex h-full items-center justify-center"><Spinner size="md" aria-label={formatMessage({ id: "common.loadingLabel" })} /></div>
         ) : visible.length === 0 ? (
-          <p className="px-1 py-3 text-footnote text-foreground-muted">
-            {formatMessage(
+          <EmptyState
+            className="flex h-full flex-col items-center justify-center px-2"
+            icon={<CommentIcon width={36} height={36} />}
+            title={formatMessage({ id: "message.attachmentComments.emptyTitle" })}
+            description={formatMessage(
               { id: "message.attachmentComments.emptyHint" },
               {
                 filename,
-                strong: (chunks) => <span className="font-bold" key="attachment-comments-empty-hint-filename">{chunks}</span>,
+                strong: (chunks) => <span className="font-semibold" key="attachment-comments-empty-hint-filename">{chunks}</span>,
               },
             )}
-          </p>
+          />
         ) : (
-          <ul className="flex flex-col gap-3">
+          <ul className="flex flex-col" data-testid="attachment-comments-list">
             {visible.map((c) => {
-              const jump = c.anchor
-                ? () => {
-                    if (jumpToAnchor(c.anchor!)) onAnchorJump?.();
-                  }
-                : null;
-              /* Figma-list card (cindyz 6/11): avatar-led header, anchor chip
-                 as location ref, body. The whole card is the jump affordance
-                 when an anchor exists — a real <button> (semantic, lint-
-                 clean); the resolve control is a SIBLING in the corner, not
-                 nested inside it. This location-ref card explicitly keeps the
-                 arrow cursor even though normal app controls use the link hand. */
-              const inner = (
-                <>
-                  <div className="flex items-center gap-1.5 pr-6">
-                    <AvatarSlot
-                      context="compact-list"
-                      type={c.senderType === "agent" ? "agent" : "human"}
-                      agentAvatarUrl={c.senderType === "agent" ? c.senderAvatarUrl : undefined}
-                      humanAvatarUrl={c.senderType === "user" ? c.senderAvatarUrl : undefined}
-                      gravatarHash={c.senderType === "user" ? c.senderGravatarHash : undefined}
-                    />
-                    <span className="min-w-0 flex-1 truncate text-footnote font-bold text-foreground">{c.senderName}</span>
-                    <span className="shrink-0 font-mono text-mono-meta text-foreground-hint">
-                      {formatMessageTime(c.createdAt)}
-                    </span>
-                  </div>
-                  <span
-                    data-message-affordance="attachment-comment-anchor"
-                    className="mt-1 inline-flex max-w-full items-center gap-1 overflow-hidden rounded-chip bg-fill-muted px-1.5 py-0.5 text-caption font-semibold text-foreground"
-                  >
-                    {c.anchor ? <MapPin size={12} className="shrink-0" /> : <FileText size={12} className="shrink-0" />}
-                    <span className="min-w-0 truncate">{c.anchor ? anchorLabel(c.anchor, formatMessage) : filename}</span>
-                  </span>
-                  {c.anchor && typeof (c.anchor.data as Record<string, unknown>)?.quote === "string" && (c.anchor.data as Record<string, unknown>).quote ? (
-                    <div className="mt-1 whitespace-pre-wrap break-words border-l-2 border-line-seam pl-2.5 text-caption font-normal text-foreground-muted">
-                      {(c.anchor.data as Record<string, unknown>).quote as string}
-                    </div>
-                  ) : null}
-                  <div className="mt-1 text-footnote text-foreground">
-                    <MarkdownContent source={c.content} density="compact" enableMermaid />
-                  </div>
-                </>
-              );
+              const anchor = c.anchor;
+              const quote = anchor && typeof anchor.data?.quote === "string" && anchor.data.quote ? anchor.data.quote : null;
+              /* A comment is a message in the attachment's thread, so it is a
+                 raft-ui MessageItem row: avatar, sender and time, then where
+                 it points and what it says. An anchored comment's location is
+                 the same muted reference chip as a comment's re: chip in the
+                 conversation, and the chip is the link that jumps to it.
+                 raft-ui 0.24 makes a named MessageItem an `article`; here it
+                 is the list's item, so it keeps `listitem` or the list would
+                 have none. */
               return (
-                <li key={c.id} className="relative">
-                  {jump ? (
-                    <AttachmentTooltip content={anchorQuote(c.anchor!) ?? formatMessage({ id: "message.attachmentComments.jumpToLocation" })}>
-                    <Card
-                      render={<button type="button" onClick={jump} />}
-                      className="block w-full px-3 py-2.5 text-left outline-none hover:press-overlay active:press-overlay focus-visible:shadow-focus"
-                    >
-                      {inner}
-                    </Card>
-                    </AttachmentTooltip>
-                  ) : (
-                    <Card className="block px-3 py-2.5">{inner}</Card>
-                  )}
-                </li>
+                <MessageItem key={c.id} render={<li />} role="listitem" data-comment-id={c.id}>
+                  <MessageItemGutter>
+                    <MessageItemAvatarSlot className="flex items-start">
+                      <AvatarSlot
+                        context="message-row"
+                        type={c.senderType === "agent" ? "agent" : "human"}
+                        agentAvatarUrl={c.senderType === "agent" ? c.senderAvatarUrl : undefined}
+                        humanAvatarUrl={c.senderType === "user" ? c.senderAvatarUrl : undefined}
+                      />
+                    </MessageItemAvatarSlot>
+                  </MessageItemGutter>
+                  <MessageItemContent>
+                    <MessageItemHeader>
+                      <MessageItemSender>{c.senderName}</MessageItemSender>
+                      <MessageItemTime render={<time dateTime={c.createdAt} />}>{formatMessageTime(c.createdAt)}</MessageItemTime>
+                    </MessageItemHeader>
+                    {/* Only a comment pinned to a spot gets a location chip:
+                        a whole-file comment would just repeat the file name
+                        the panel header already shows. */}
+                    {anchor ? (
+                      <div className="mt-0.5">
+                        <AnchorJumpChip anchor={anchor} onAnchorJump={onAnchorJump} />
+                      </div>
+                    ) : null}
+                    {quote ? (
+                      <MarkdownBlockquote className="mt-1 whitespace-pre-wrap">{quote}</MarkdownBlockquote>
+                    ) : null}
+                    <MessageItemBody className="mt-1">
+                      <MarkdownContent source={c.content} density="compact" enableMermaid />
+                    </MessageItemBody>
+                  </MessageItemContent>
+                </MessageItem>
               );
             })}
           </ul>
         )}
-      </div>
+      </ScrollArea>
 
       <div className={`${COMPOSER_DOCK_CLASS} ${collapsedBody ? "hidden" : ""}`} data-message-affordance="attachment-comment-composer">
         {canComment ? (
@@ -434,6 +354,6 @@ export function AttachmentCommentsPanel({
           </p>
         )}
       </div>
-    </div>
+    </Panel>
   );
 }

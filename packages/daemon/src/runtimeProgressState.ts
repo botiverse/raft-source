@@ -20,8 +20,22 @@ export class RuntimeProgressState {
   private staleSinceMs: number | null = null;
   private turnStartedAtMs: number | null = null;
 
+  /** When this process's progress clock started (its first turn's anchor). */
+  readonly createdAtMs: number;
+
   constructor(nowMs: number = Date.now()) {
     this.lastEventAtMs = nowMs;
+    this.createdAtMs = nowMs;
+  }
+
+  /** When a turn was explicitly started on this process; null while its first turn rides the spawn. */
+  get notedTurnStartedAt(): number | null {
+    return this.turnStartedAtMs;
+  }
+
+  /** task #25 step 2: when the current turn began; the process start for its first turn. */
+  get currentTurnStartedAt(): number {
+    return this.turnStartedAtMs ?? this.createdAtMs;
   }
 
   get lastEventAt(): number {

@@ -5,8 +5,9 @@
 // endpoint always answers 204 and nothing here is retried.
 
 import { campaignToken, referrerHostname } from "@botiverse/raft-shared";
-import { RUNTIME_API_BASE } from "../desktopRuntimeEnvironment";
+import { RUNTIME_API_BASE } from "../runtimeEndpoints";
 import { publicVisitorId } from "./publicVisitorConsent";
+import { createPrivacyHold } from "../utils/webTelemetryPrivacyHold";
 
 const TOKEN_KEY = "slock_access_token";
 
@@ -71,6 +72,8 @@ function viewSource(slug: string): VisitSource {
  * Call once per successfully shown page (`public_page_viewed`), channel the
  * visitor picked (`public_page_channel_opened`) or thread they opened
  * (`public_page_thread_opened`, with its parent channel), never per API request.
+ * Nothing under RAFT_PRIVACY_MODE; held in memory until the client config
+ * says whether it is on (store/privacyMode.ts), then sent or dropped.
  */
 export function recordPublicVisit(
   slug: string,
@@ -87,7 +90,7 @@ export function recordPublicVisit(
   // Logged out and after cookie consent only (publicVisitorConsent.ts); a
   // signed-in visitor is linked to an account only by joining.
   const anonymousId = token ? null : publicVisitorId();
-  void Promise.resolve()
+  const post = () => void Promise.resolve()
     .then(() => send(`${RUNTIME_API_BASE}/public-visits/${encodeURIComponent(slug)}`, {
       method: "POST",
       keepalive: true,
@@ -105,7 +108,12 @@ export function recordPublicVisit(
       }),
     }))
     .catch(() => undefined);
+  void visitHold.send(post);
 }
+
+// Visits recorded before the privacy-mode answer (up to 20): built then, so a
+// landing keeps its referrer; sent on "off", dropped on "on".
+const visitHold = createPrivacyHold(20, (post: () => void) => post());
 
 /** Test-only: capture visits instead of sending them. */
 export function setPublicVisitFetchForTest(fetchImpl: FetchLike | null): void {

@@ -22,7 +22,7 @@ async function raw(name) {
   if (!response.ok) throw new Error(`${url}: HTTP ${response.status}`);
   return response.text();
 }
-const [scriptText, ps1Text] = await Promise.all([raw('install.sh'), raw('install.ps1')]);
+const scriptText = await raw('install.sh');
 
 function sandbox(t, { script = scriptText } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'bootstrap-pin-'));
@@ -103,30 +103,6 @@ test('tooth: deleting the pin block silently drops the version pin', t => {
   );
 });
 
-test('sh/ps1 pin forwarding stays in lockstep (static cross-check)', () => {
-  // The Windows execution contract runs in the SEA win32 job; this static pin
-  // keeps the two entry scripts from drifting apart on Linux CI too.
-  assert.match(ps1Text, /\$argv \+= @\('--version', \$env:RAFT_COMPUTER_VERSION\)/,
-    'install.ps1 lost the RAFT_COMPUTER_VERSION forwarding');
-  assert.match(ps1Text, /explicit --version/,
-    'install.ps1 lost the explicit-argument precedence note');
-  assert.match(scriptText, /set -- "\$@" --version "\$RAFT_COMPUTER_VERSION"/,
-    'install.sh lost the RAFT_COMPUTER_VERSION forwarding');
-});
-
-test('sh/ps1 show the executable download instead of silencing both transfers', () => {
-  // Installer #31 filters curl's stderr down to the bar's own updates (so curl
-  // error text stays out of the terminal) and prints them on stderr.
-  assert.match(scriptText, /dl_progress\(\) \{[^}]*?curl -fL [^\n]*--progress-bar[^\n]*\| *\n *awk [^\n]*%[^\n]*>&2\n/,
-    'install.sh lost the visible curl progress bar');
-  assert.match(scriptText, /dl_progress "\$binary_url" "\$tmp\/installer"/,
-    'install.sh no longer uses the visible path for the executable');
-  assert.match(ps1Text, /\$ProgressPreference = if \(\$showProgress\) \{ 'Continue' \}/,
-    'install.ps1 lost its scoped progress preference');
-  assert.match(ps1Text, /Download \$binaryUrl \$cli \$true/,
-    'install.ps1 no longer enables progress for the executable');
-});
-
 test('both SEA publish workflows carry the Windows argv contract and no scalar steps', () => {
   // Structural tooth: a step that is a bare scalar (`- name` with no mapping)
   // is invalid Actions structure and must never ship.
@@ -138,16 +114,14 @@ test('both SEA publish workflows carry the Windows argv contract and no scalar s
   }
 });
 
-test('staging installer publication is compare-and-swap and keeps alpha baked in', () => {
+test('staging workflow writes no CDN entry points and keeps alpha baked into its artifacts', () => {
   const text = readFileSync(new URL('../../../.github/workflows/publish-computer-staging-sea.yml', import.meta.url), 'utf8');
-  assert.match(text, /previous_staging_installer_sha256:/,
-    'staging install.sh has no compare-and-swap input');
-  assert.match(text, /previous_staging_installer_ps1_sha256:/,
-    'staging install.ps1 has no compare-and-swap input');
-  assert.match(text, /s3:\/\/slock-staging-cdn\/\$key/,
-    'the installer-only job no longer writes the staging bucket');
-  assert.match(text, /slock-cdn-staging\.botiverse\.dev\/\$key\?fresh=/,
-    'the installer-only job no longer reads back the public staging object');
+  // Staging installs use the production entry scripts with --channel alpha;
+  // the staging workflow publishes only through Hands.
+  assert.doesNotMatch(text, /previous_staging_installer_(ps1_)?sha256|installer_only/,
+    'staging workflow regained the compare-and-swap entry-point inputs');
+  assert.doesNotMatch(text, /s3:\/\//, 'staging workflow writes a storage bucket');
+  assert.doesNotMatch(text, /cdn-staging/, 'staging workflow touches the staging CDN');
   assert.match(text, /INSTALL_CHANNEL_DEFAULT="alpha"/,
     'the staging shell entry point lost its alpha default');
   assert.match(text, /\$InstallChannelDefault = 'alpha'/,

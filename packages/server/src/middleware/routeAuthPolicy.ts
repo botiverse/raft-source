@@ -32,6 +32,8 @@
 // `requireAgentCapability()` first checks the credential max-capability set,
 // then applies the runner session active-capability header when present.
 
+import { appAgentApiRoutesOf, firstPartyAppAgentApis } from "@botiverse/raft-shared";
+
 export type PrincipalKind =
   | "sk_machine"               // legacy sk_machine_* surface
   | "sk_computer"              // sk_computer_* (Computer host attachment session)
@@ -77,6 +79,7 @@ export const routeAuthPolicy: readonly RouteAuthPolicyEntry[] = [
   // credential row — there is NO `:id` path param. All active routes
   // act on the credential's bound agent identity.
   // ---------------------------------------------------------------------------
+  { method: "GET", path: "/internal/agent-api/raftbench/findings", principal: "sk_agent", note: "Explicit admin grant and caller source visibility" },
   { method: "GET", path: "/internal/agent-api/raftbench/context", principal: "sk_agent", note: "Staging-only bound RaftBench source context" },
   { method: "POST", path: "/internal/agent-api/raftbench/submit", principal: "sk_agent", note: "Staging-only bound RaftBench result submission" },
   {
@@ -102,6 +105,18 @@ export const routeAuthPolicy: readonly RouteAuthPolicyEntry[] = [
     path: "/internal/agent-api/context",
     principal: "sk_agent",
     note: "identity bootstrap — agent/server identity, credential capabilities, external-agent guide prompt",
+  },
+  {
+    method: "POST",
+    path: "/internal/agent-api/context/search",
+    principal: "sk_agent",
+    note: "#wg-ax:#15 — an agent searching its own View Context (entries, never the context)",
+  },
+  {
+    method: "POST",
+    path: "/internal/agent-api/context/read",
+    principal: "sk_agent",
+    note: "#wg-ax:#15 — an agent reading entries around one entry of its own View Context",
   },
   {
     method: "GET",
@@ -162,6 +177,12 @@ export const routeAuthPolicy: readonly RouteAuthPolicyEntry[] = [
     path: "/internal/agent-api/mentions",
     principal: "sk_agent",
     note: "RFC v0.8 — mentions inbox for the bound agent",
+  },
+  {
+    method: "PUT",
+    path: "/internal/agent-api/messages/:messageId/card",
+    principal: "sk_agent",
+    note: "RFC 082 — the sender replaces its card message's card (and fallback)",
   },
   {
     method: "GET",
@@ -325,6 +346,7 @@ export const routeAuthPolicy: readonly RouteAuthPolicyEntry[] = [
     principal: "sk_agent",
     note: "RFC 035 D7 T1 — SSE push projection of the same content-free wake-hint peek (task #72)",
   },
+  { method: "POST", path: "/internal/agent-api/credentials/self/revoke", principal: "sk_agent", note: "the holder revokes the very key it authenticated with (self_revoked); person-minted keys only" },
   { method: "POST", path: "/internal/agent-api/activity", principal: "sk_agent", note: "external plugin activity ingest (#2886) — bridge-forwarded, plugin-reported telemetry" },
   { method: "POST", path: "/internal/agent-api/third-party-events/delivered", principal: "sk_agent", note: "task #175 — managed daemon reports third-party events it served from its Local Inbox" },
   { method: "POST", path: "/internal/agent-api/resolve-channel", principal: "sk_agent", note: "RFC v0.8 — agent-self channel resolution" },
@@ -338,13 +360,44 @@ export const routeAuthPolicy: readonly RouteAuthPolicyEntry[] = [
   { method: "GET", path: "/internal/agent-api/attachments/:attachmentId/url", principal: "sk_agent", note: "agent-self short-lived attachment download URL (same resolution as the download route)" },
   { method: "GET", path: "/internal/agent-api/attachments/:attachmentId/comments", principal: "sk_agent", note: "attachment-comments MVP — agent-self scoped comment list" },
   { method: "POST", path: "/internal/agent-api/attachments/:attachmentId/comments", principal: "sk_agent", note: "attachment-comments MVP — agent-self scoped comment create" },
+  // First-party apps' agent API, each route from its app's fragment
+  // (packages/shared/src/apps/<id>/agentApi.ts): the agent's own credential.
+  // `:path`-style params are one percent-encoded segment (this matcher binds
+  // one segment per param).
+  ...appAgentApiRoutesOf(firstPartyAppAgentApis).map(({ app, route }): RouteAuthPolicyEntry => ({
+    method: route.method,
+    path: route.fullPath,
+    principal: "sk_agent",
+    note: `first-party app ${app}: ${route.key}`,
+  })),
   { method: "GET", path: "/internal/agent-api/search", principal: "sk_agent", note: "RFC v0.8 — agent-self message search" },
   { method: "GET", path: "/internal/agent-api/channel-members", principal: "sk_agent", note: "RFC v0.8 — agent-self channel member listing" },
   { method: "GET", path: "/internal/agent-api/users/:name/channels", principal: "sk_agent", note: "raft user info — one user's visible facts and memberships over a window of the agent's visible channels" },
   { method: "GET", path: "/internal/agent-api/threads", principal: "sk_agent", note: "RFC v0.8 — agent-self followed thread listing" },
   { method: "GET", path: "/internal/agent-api/inbox/conversations", principal: "sk_agent", note: "raft inbox check — agent-self durable unread conversation listing" },
-  { method: "GET", path: "/internal/agent-api/assistant/owner-inbox", principal: "sk_agent", note: "RFC 074 assistant — owner's inbox minus DMs (assistants only)" },
-  { method: "GET", path: "/internal/agent-api/assistant/owner-messages", principal: "sk_agent", note: "RFC 074 assistant — read an owner-visible channel or thread, never a DM (assistants only)" },
+  { method: "POST", path: "/internal/agent-api/inbox/read", principal: "sk_agent", note: "RFC 081 raft inbox read — agent-self: one page of its own inbox item, consuming what it returns" },
+  { method: "POST", path: "/internal/agent-api/inbox/dismiss", principal: "sk_agent", note: "RFC 081 raft inbox dismiss — agent-self: its own inbox items marked read without reading" },
+  { method: "GET", path: "/internal/agent-api/assistant/owner-inbox", principal: "sk_agent", note: "RFC 074 assistant — owner's inbox, DMs unless the owner turned that off (RFC 077; assistants only)" },
+  { method: "GET", path: "/internal/agent-api/assistant/owner-messages", principal: "sk_agent", note: "RFC 074 assistant — read an owner-visible conversation, DMs unless the owner turned that off (RFC 077; assistants only)" },
+  { method: "GET", path: "/internal/agent-api/assistant/owner-artifact", principal: "sk_agent", note: "RFC 075 assistant — read an Artifact the owner can open, by the web's checks with the owner as reader (#proj-assistant:#31; assistants only)" },
+  { method: "POST", path: "/internal/agent-api/assistant/owner-artifact", principal: "sk_agent", note: "RFC 075 assistant — publish an Artifact as itself into its DM with its owner, or a new version of one it published (#proj-assistant:#31; assistants only)" },
+  { method: "GET", path: "/internal/agent-api/assistant/owner-activity", principal: "sk_agent", note: "RFC 077 assistant — the owner's own actions since a time, references only (assistants only)" },
+  { method: "GET", path: "/internal/agent-api/assistant/owner-resolve", principal: "sk_agent", note: "RFC 077 assistant — who @name is as the owner would find them; unseen = not found (assistants only)" },
+  { method: "POST", path: "/internal/agent-api/assistant/check-state/import", principal: "sk_agent", note: "RFC 077 step 2c assistant — one-time brief-state push when raftCheck turns on (assistants only)" },
+  { method: "POST", path: "/internal/agent-api/assistant/send-as-owner", principal: "sk_agent", note: "RFC 077 assistant — send as its owner, labeled delegated_by (assistants only, owner opt-in)" },
+  { method: "POST", path: "/internal/agent-api/assistant/forward-as-owner", principal: "sk_agent", note: "RFC 077 assistant — forward as its owner by the web's forward rules, labeled delegated_by (assistants only, owner opt-in)" },
+  { method: "GET", path: "/internal/agent-api/assistant/forward-targets", principal: "sk_agent", note: "RFC 077 assistant — the forward picker's search as its owner (assistants only)" },
+  { method: "POST", path: "/internal/agent-api/assistant/notify", principal: "sk_agent", note: "RFC 077 step 2 assistant — the model's lines for a Raft check; Raft composes and sends the owner DM (assistants only)" },
+  { method: "GET", path: "/internal/agent-api/assistant/contact-rules", principal: "sk_agent", note: "RFC 077 step 1 assistant — the owner's contact rules, quiet hours and default lines (assistants only)" },
+  { method: "POST", path: "/internal/agent-api/assistant/contact-rules", principal: "sk_agent", note: "RFC 077 step 1 assistant — store (or update) a contact rule for the owner (assistants only)" },
+  { method: "DELETE", path: "/internal/agent-api/assistant/contact-rules/:ruleId", principal: "sk_agent", note: "RFC 077 step 1 assistant — remove one of the owner's contact rules (assistants only)" },
+  { method: "PUT", path: "/internal/agent-api/assistant/contact-settings", principal: "sk_agent", note: "RFC 077 step 1 assistant — set or turn off the owner's quiet hours (assistants only)" },
+  { method: "GET", path: "/internal/agent-api/assistant/owner-settings", principal: "sk_agent", note: "assistant — the owner's theme in this server, UI language and time zone (assistants only)" },
+  { method: "PATCH", path: "/internal/agent-api/assistant/owner-settings", principal: "sk_agent", note: "assistant — change the owner's theme in this server, UI language or time zone; each change audited for the owner (assistants only)" },
+  { method: "POST", path: "/internal/agent-api/assistant/contact-rules/import", principal: "sk_agent", note: "RFC 077 step 1 assistant — one-time import of the runtime's rules, idempotent by rule id (assistants only)" },
+  { method: "POST", path: "/internal/agent-api/assistant/told", principal: "sk_agent", note: "RFC 077 step 1 assistant — record what the owner was already told (owner-visible messages only) (assistants only)" },
+  { method: "GET", path: "/internal/agent-api/assistant/told", principal: "sk_agent", note: "RFC 077 step 1 assistant — list what the owner was already told (assistants only)" },
+  { method: "POST", path: "/internal/agent-api/threads/follow", principal: "sk_agent", note: "agent-self thread follow (parity with raft task follow)" },
   { method: "POST", path: "/internal/agent-api/threads/unfollow", principal: "sk_agent", note: "RFC v0.8 — agent-self thread unfollow" },
   { method: "GET", path: "/internal/agent-api/profile", principal: "sk_agent", note: "RFC v0.8 — agent-self profile show" },
   { method: "POST", path: "/internal/agent-api/profile", principal: "sk_agent", note: "RFC v0.8 — agent-self profile update" },
@@ -371,6 +424,14 @@ export const routeAuthPolicy: readonly RouteAuthPolicyEntry[] = [
   { method: "POST", path: "/internal/agent-api/tasks/convert", principal: "sk_agent", note: "task v1.4 — convert a message into a task without claiming it" },
   { method: "POST", path: "/internal/agent-api/tasks/amend", principal: "sk_agent", note: "task card amendment with actor-bound audit history" },
   { method: "GET", path: "/internal/agent-api/tasks/history", principal: "sk_agent", note: "agent-self task audit history read" },
+  { method: "GET", path: "/internal/agent-api/tasks/view", principal: "sk_agent", note: "task v2 — one task's properties, follow state and latest conversation" },
+  { method: "GET", path: "/internal/agent-api/tasks/read", principal: "sk_agent", note: "task v2 — read a task's own conversation" },
+  { method: "POST", path: "/internal/agent-api/tasks/reply", principal: "sk_agent", note: "task v2 — reply in a task's own conversation" },
+  { method: "GET", path: "/internal/agent-api/tasks/following", principal: "sk_agent", note: "task v2 — the task conversations the agent follows, with unread counts" },
+  { method: "POST", path: "/internal/agent-api/tasks/follow", principal: "sk_agent", note: "task v2 — follow a task's conversation" },
+  { method: "POST", path: "/internal/agent-api/tasks/unfollow", principal: "sk_agent", note: "task v2 — unfollow a task's conversation" },
+  { method: "POST", path: "/internal/agent-api/tasks/idle-nudge", principal: "sk_agent", note: "idle task reminder — which assigned tasks to remind the agent of now (records what it returns)" },
+  { method: "POST", path: "/internal/agent-api/migrations/retry", principal: "sk_agent", note: "agent's own retry of its size-failed migration, once, on behalf of its starter (whose migrateAgents is re-checked)" },
   { method: "GET", path: "/internal/agent-api/reminders", principal: "sk_agent", note: "RFC v0.8 — agent-self reminder list" },
   { method: "POST", path: "/internal/agent-api/reminders", principal: "sk_agent", note: "RFC v0.8 — agent-self reminder schedule" },
   { method: "DELETE", path: "/internal/agent-api/reminders/:reminderId", principal: "sk_agent", note: "RFC v0.8 — agent-self reminder cancel" },
@@ -381,6 +442,7 @@ export const routeAuthPolicy: readonly RouteAuthPolicyEntry[] = [
   { method: "GET", path: "/internal/agent-api/apps/:appId/config", principal: "sk_agent", note: "RAP App Config v0.1 — read effective config for the bound agent" },
   { method: "PATCH", path: "/internal/agent-api/apps/:appId/config", principal: "sk_agent", note: "RAP App Config v0.1 — atomically update config for the bound agent" },
   { method: "POST", path: "/internal/agent-api/prepare-action", principal: "sk_agent", note: "RFC v0.8 — agent-self action card prepare" },
+  { method: "POST", path: "/internal/agent-api/actions/:messageId/withdraw", principal: "sk_agent", note: "Question cards — the asking agent withdraws its own unanswered card" },
 
   // ---------------------------------------------------------------------------
   // RFC v0.8 — `/internal/computer/*` mint surface.
@@ -499,16 +561,66 @@ export const routeAuthPolicy: readonly RouteAuthPolicyEntry[] = [
     note: "RFC v0.8 — Computer-requested runner credential mint",
   },
   {
+    // #wg-rbac:#27: the Computer's own key renews a runner credential it
+    // minted (body: the old credential's id); never the old agent key.
+    method: "POST",
+    path: "/internal/computer/runners/:agentId/credentials/renew",
+    principal: "sk_computer",
+    note: "Runner credential renewal — Computer-requested, for its own runner credential",
+  },
+  {
     method: "POST",
     path: "/internal/computer/runners/:agentId/provider-connection",
     principal: "sk_computer",
     note: "Server-managed provider credential materialization for an attached Agent",
   },
   {
+    // Provider probe claim: the Computer fetches the probe's credentials once
+    // (internalComputer.ts). Unregistered, every daemon call failed closed.
+    method: "POST",
+    path: "/internal/computer/probes/:probeId/materialize",
+    principal: "sk_computer",
+    note: "Provider probe one-time credential materialization",
+  },
+  {
     method: "DELETE",
     path: "/internal/computer/runners/:agentId/credentials/:credentialId",
     principal: "sk_computer",
     note: "RFC v0.8 — Computer-requested managed-runner credential revoke",
+  },
+  {
+    // Device-auth PR 3c: the Computer records its own local start/stop/restart
+    // with its key instead of a person's session. The handler takes the
+    // machine from the key's computers row, never from the request.
+    method: "POST",
+    path: "/internal/computer/lifecycle-operations",
+    principal: "sk_computer",
+    note: "Device-auth 3c — this Computer's own local start/stop/restart record (actor: the machine, locally)",
+  },
+  {
+    // Device-auth PR 3c: `raft-computer doctor` reads how the server sees this
+    // Computer (its own row only).
+    method: "GET",
+    path: "/internal/computer/self",
+    principal: "sk_computer",
+    note: "Device-auth 3c — this Computer's own server row for doctor",
+  },
+  {
+    // Device-auth PR 3c: `raft-computer detach <server>` revokes the
+    // presenting key and the runner keys its machine minted.
+    method: "POST",
+    path: "/internal/computer/detach",
+    principal: "sk_computer",
+    note: "Device-auth 3c — the Computer revokes its own key (and its machine's runner keys)",
+  },
+  {
+    // View Context: the daemon's one result POST for a request the Server
+    // sent it (routes/agentContextViewResult.ts). The relay checks the
+    // request was sent to this credential's machine.
+    method: "POST",
+    path: "/internal/computer/agent-context/:requestId",
+    principal: "sk_computer",
+    note: "View Context — the Computer's result for one context view request (raw body, streamed to the viewer)",
   },
   {
     // task #30 PR-A — synthetic read-only attach/login preflight. MUST be

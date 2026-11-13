@@ -11,7 +11,7 @@ import { agents, users } from "../db/schema";
 import { createServer } from "../services/serverService";
 import { registerMachine } from "../services/machineService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 async function seed() {
   const db = getDb();
@@ -33,7 +33,7 @@ async function seed() {
 async function withSigningApp(fn: (app: Awaited<ReturnType<typeof openTestApp>>) => Promise<void>): Promise<void> {
   const previousSecret = process.env.SCOPE_ATTESTATION_SECRET;
   process.env.SCOPE_ATTESTATION_SECRET = "transcript-outcome-test-secret";
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     await fn(app);
   } finally {

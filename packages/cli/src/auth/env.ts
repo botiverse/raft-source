@@ -35,6 +35,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import { RAFT_CLI_ENTRY_ENV, RAFT_CLI_STABLE_ENTRY } from "@botiverse/raft-shared/src/agentCliSurface";
 import { resolveRaftHome } from "../state/raftHome";
 
 export interface AgentContext {
@@ -77,6 +78,13 @@ export interface AgentContext {
    */
   profileSlug?: string;
   profileCredentialPath?: string;
+  /**
+   * Managed runner only: the daemon's stable entry ran this CLI
+   * (`cli-transport/<agent>/current/raft`, which sets RAFT_CLI_ENTRY). The
+   * CLI says so to the daemon proxy, which serves it with the agent's current
+   * launch.
+   */
+  entry?: "stable_entry";
 }
 
 interface ProfileCredentialFile {
@@ -296,6 +304,7 @@ export function loadAgentContext(env: NodeJS.ProcessEnv = process.env): AgentCon
       clientMode: "managed-runner",
       secretSource: agentProxyTokenFile ? "agent-proxy-token-file" : "agent-proxy-token-env",
       activeCapabilities,
+      ...(env[RAFT_CLI_ENTRY_ENV] === RAFT_CLI_STABLE_ENTRY ? { entry: RAFT_CLI_STABLE_ENTRY } : {}),
     };
   }
 

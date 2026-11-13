@@ -1,0 +1,3886 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`each type, prepared and executed > agent:create executed 1`] = `
+{
+  "catalog": "action-card.v1",
+  "icon": "bot",
+  "result": {
+    "elements": {
+      "actions": {
+        "children": [
+          "openAgent",
+        ],
+        "props": {
+          "direction": "row",
+          "role": "actions",
+          "wrap": true,
+        },
+        "type": "Stack",
+      },
+      "agent": {
+        "props": {
+          "label": {
+            "$msg": "actionCard.field.agent",
+          },
+          "value": [
+            {
+              "fallback": "scribe",
+              "id": "5a6d2b9d-6c7f-4e1a-8b8c-0d2e3f4a5b6c",
+              "kind": "agent",
+            },
+          ],
+        },
+        "type": "Field",
+      },
+      "openAgent": {
+        "props": {
+          "action": {
+            "kind": "navigate",
+            "target": {
+              "id": "5a6d2b9d-6c7f-4e1a-8b8c-0d2e3f4a5b6c",
+              "kind": "agent",
+            },
+          },
+          "emphasis": "secondary",
+          "label": {
+            "$msg": "actionCard.result.openAgent",
+          },
+        },
+        "type": "Button",
+      },
+      "root": {
+        "children": [
+          "agent",
+          "actions",
+        ],
+        "props": {
+          "direction": "column",
+          "wrap": false,
+        },
+        "type": "Stack",
+      },
+    },
+    "root": "root",
+  },
+  "spec": {
+    "elements": {
+      "actions": {
+        "children": [
+          "createAgent",
+        ],
+        "props": {
+          "direction": "row",
+          "role": "actions",
+          "wrap": true,
+        },
+        "type": "Stack",
+      },
+      "computer": {
+        "props": {
+          "label": {
+            "$msg": "actionCard.field.suggestedComputer",
+          },
+          "mono": true,
+          "value": [
+            {
+              "fallback": "4f5c1a8c",
+              "id": "4f5c1a8c-5b6e-4d0f-9a7b-9c1d2e3f4a5b",
+              "kind": "computer",
+            },
+          ],
+        },
+        "type": "Field",
+      },
+      "createAgent": {
+        "props": {
+          "action": {
+            "intent": "create_agent",
+            "kind": "open",
+          },
+          "emphasis": "primary",
+          "label": {
+            "$msg": "actionCard.verb.createAgent",
+          },
+        },
+        "type": "Button",
+      },
+      "description": {
+        "props": {
+          "label": {
+            "$msg": "actionCard.field.description",
+          },
+          "value": "Takes meeting notes.",
+        },
+        "type": "Field",
+      },
+      "properties": {
+        "children": [
+          "description",
+          "computer",
+        ],
+        "props": {
+          "direction": "column",
+          "wrap": false,
+        },
+        "type": "Stack",
+      },
+      "reason": {
+        "children": [
+          "reasonLabel",
+          "reasonText",
+        ],
+        "props": {
+          "direction": "column",
+          "role": "reason",
+          "wrap": false,
+        },
+        "type": "Stack",
+      },
+      "reasonLabel": {
+        "props": {
+          "mono": false,
+          "text": {
+            "$msg": "actionCard.reason",
+          },
+          "tone": "muted",
+        },
+        "type": "Text",
+      },
+      "reasonText": {
+        "props": {
+          "mono": false,
+          "text": "You asked for a note taker.",
+          "tone": "default",
+        },
+        "type": "Text",
+      },
+      "root": {
+        "children": [
+          "properties",
+          "reason",
+          "actions",
+        ],
+        "props": {
+          "direction": "column",
+          "wrap": false,
+        },
+        "type": "Stack",
+      },
+    },
+    "root": "root",
+  },
+  "title": {
+    "$msg": "actionCard.title.createAgent",
+    "name": "scribe",
+  },
+}
+`;
+
+exports[`each type, prepared and executed > agent:create prepared 1`] = `
+{
+  "catalog": "action-card.v1",
+  "icon": "bot",
+  "spec": {
+    "elements": {
+      "actions": {
+        "children": [
+          "createAgent",
+        ],
+        "props": {
+          "direction": "row",
+          "role": "actions",
+          "wrap": true,
+        },
+        "type": "Stack",
+      },
+      "computer": {
+        "props": {
+          "label": {
+            "$msg": "actionCard.field.suggestedComputer",
+          },
+          "mono": true,
+          "value": [
+            {
+              "fallback": "4f5c1a8c",
+              "id": "4f5c1a8c-5b6e-4d0f-9a7b-9c1d2e3f4a5b",
+              "kind": "computer",
+            },
+          ],
+        },
+        "type": "Field",
+      },
+      "createAgent": {
+        "props": {
+          "action": {
+            "intent": "create_agent",
+            "kind": "open",
+          },
+          "emphasis": "primary",
+          "label": {
+            "$msg": "actionCard.verb.createAgent",
+          },
+        },
+        "type": "Button",
+      },
+      "description": {
+        "props": {
+          "label": {
+            "$msg": "actionCard.field.description",
+          },
+          "value": "Takes meeting notes.",
+        },
+        "type": "Field",
+      },
+      "properties": {
+        "children": [
+          "description",
+          "computer",
+        ],
+        "props": {
+          "direction": "column",
+          "wrap": false,
+        },
+        "type": "Stack",
+      },
+      "reason": {
+        "children": [
+          "reasonLabel",
+          "reasonText",
+        ],
+        "props": {
+          "direction": "column",
+          "role": "reason",
+          "wrap": false,
+        },
+        "type": "Stack",
+      },
+      "reasonLabel": {
+        "props": {
+          "mono": false,
+          "text": {
+            "$msg": "actionCard.reason",
+          },
+          "tone": "muted",
+        },
+        "type": "Text",
+      },
+      "reasonText": {
+        "props": {
+          "mono": false,
+          "text": "You asked for a note taker.",
+          "tone": "default",
+        },
+        "type": "Text",
+      },
+      "root": {
+        "children": [
+          "properties",
+          "reason",
+          "actions",
+        ],
+        "props": {
+          "direction": "column",
+          "wrap": false,
+        },
+        "type": "Stack",
+      },
+    },
+    "root": "root",
+  },
+  "title": {
+    "$msg": "actionCard.title.createAgent",
+    "name": "scribe",
+  },
+}
+`;
+
+exports[`each type, prepared and executed > agent:migrate executed 1`] = `
+{
+  "catalog": "action-card.v1",
+  "icon": "bot",
+  "result": {
+    "elements": {
+      "root": {
+        "children": [
+          "summary",
+        ],
+        "props": {
+          "direction": "column",
+          "wrap": false,
+        },
+        "type": "Stack",
+      },
+      "summary": {
+        "props": {
+          "mono": false,
+          "text": {
+            "$msg": "actionCard.result.migrationStarted",
+            "agent": {
+              "fallback": "scout",
+              "id": "2d3a9e6a-3f4c-4b8d-9e5f-7a9b0c1d2e3f",
+              "kind": "agent",
+            },
+            "to": {
+              "fallback": "4f5c1a8c",
+              "id": "4f5c1a8c-5b6e-4d0f-9a7b-9c1d2e3f4a5b",
+              "kind": "computer",
+            },
+          },
+          "tone": "default",
+        },
+        "type": "Text",
+      },
+    },
+    "root": "root",
+  },
+  "spec": {
+    "elements": {
+      "actions": {
+        "children": [
+          "migrateAgent",
+        ],
+        "props": {
+          "direction": "row",
+          "role": "actions",
+          "wrap": true,
+        },
+        "type": "Stack",
+      },
+      "computer": {
+        "props": {
+          "label": {
+            "$msg": "actionCard.field.suggestedComputer",
+          },
+          "mono": true,
+          "value": [
+            {
+              "fallback": "4f5c1a8c",
+              "id": "4f5c1a8c-5b6e-4d0f-9a7b-9c1d2e3f4a5b",
+              "kind": "computer",
+            },
+          ],
+        },
+        "type": "Field",
+      },
+      "migrateAgent": {
+        "props": {
+          "action": {
+            "intent": "migrate_agent",
+            "kind": "open",
+          },
+          "emphasis": "primary",
+          "label": {
+            "$msg": "actionCard.verb.migrateAgent",
+          },
+        },
+        "type": "Button",
+      },
+      "properties": {
+        "children": [
+          "computer",
+        ],
+        "props": {
+          "direction": "column",
+          "wrap": false,
+        },
+        "type": "Stack",
+      },
+      "reason": {
+        "children": [
+          "reasonLabel",
+          "reasonText",
+        ],
+        "props": {
+          "direction": "column",
+          "role": "reason",
+          "wrap": false,
+        },
+        "type": "Stack",
+      },
+      "reasonLabel": {
+        "props": {
+          "mono": false,
+          "text": {
+            "$msg": "actionCard.reason",
+          },
+          "tone": "muted",
+        },
+        "type": "Text",
+      },
+      "reasonText": {
+        "props": {
+          "mono": false,
+          "text": "My computer has been offline since 07:40, so I can't run tonight's eval.",
+          "tone": "default",
+        },
+        "type": "Text",
+      },
+      "root": {
+        "children": [
+          "properties",
+          "reason",
+          "actions",
+        ],
+        "props": {
+          "direction": "column",
+          "wrap": false,
+        },
+        "type": "Stack",
+      },
+    },
+    "root": "root",
+  },
+  "title": {
+    "$msg": "actionCard.title.migrateAgent",
+    "agent": {
+      "fallback": "scout",
+      "id": "2d3a9e6a-3f4c-4b8d-9e5f-7a9b0c1d2e3f",
+      "kind": "agent",
+    },
+  },
+}
+`;
+
+exports[`each type, prepared and executed > agent:migrate prepared 1`] = `
+{
+  "catalog": "action-card.v1",
+  "icon": "bot",
+  "spec": {
+    "elements": {
+      "actions": {
+        "children": [
+          "migrateAgent",
+        ],
+        "props": {
+          "direction": "row",
+          "role": "actions",
+          "wrap": true,
+        },
+        "type": "Stack",
+      },
+      "computer": {
+        "props": {
+          "label": {
+            "$msg": "actionCard.field.suggestedComputer",
+          },
+          "mono": true,
+          "value": [
+            {
+              "fallback": "4f5c1a8c",
+              "id": "4f5c1a8c-5b6e-4d0f-9a7b-9c1d2e3f4a5b",
+              "kind": "computer",
+            },
+          ],
+        },
+        "type": "Field",
+      },
+      "migrateAgent": {
+        "props": {
+          "action": {
+            "intent": "migrate_agent",
+            "kind": "open",
+          },
+          "emphasis": "primary",
+          "label": {
+            "$msg": "actionCard.verb.migrateAgent",
+          },
+        },
+        "type": "Button",
+      },
+      "properties": {
+        "children": [
+          "computer",
+        ],
+        "props": {
+          "direction": "column",
+          "wrap": false,
+        },
+        "type": "Stack",
+      },
+      "reason": {
+        "children": [
+          "reasonLabel",
+          "reasonText",
+        ],
+        "props": {
+          "direction": "column",
+          "role": "reason",
+          "wrap": false,
+        },
+        "type": "Stack",
+      },
+      "reasonLabel": {
+        "props": {
+          "mono": false,
+          "text": {
+            "$msg": "actionCard.reason",
+          },
+          "tone": "muted",
+        },
+        "type": "Text",
+      },
+      "reasonText": {
+        "props": {
+          "mono": false,
+          "text": "My computer has been offline since 07:40, so I can't run tonight's eval.",
+          "tone": "default",
+        },
+        "type": "Text",
+      },
+      "root": {
+        "children": [
+          "properties",
+          "reason",
+          "actions",
+        ],
+        "props": {
+          "direction": "column",
+          "wrap": false,
+        },
+        "type": "Stack",
+      },
+    },
+    "root": "root",
+  },
+  "title": {
+    "$msg": "actionCard.title.migrateAgent",
+    "agent": {
+      "fallback": "scout",
+      "id": "2d3a9e6a-3f4c-4b8d-9e5f-7a9b0c1d2e3f",
+      "kind": "agent",
+    },
+  },
+}
+`;
+
+exports[`each type, prepared and executed > channel:add_member executed 1`] = `
+{
+  "catalog": "action-card.v1",
+  "icon": "user_plus",
+  "result": {
+    "elements": {
+      "changed": {
+        "props": {
+          "mono": false,
+          "text": {
+            "$msg": "actionCard.result.changedBeforeAdding",
+          },
+          "tone": "muted",
+        },
+        "type": "Text",
+      },
+      "root": {
+        "children": [
+          "changed",
+        ],
+        "props": {
+          "direction": "column",
+          "wrap": false,
+        },
+        "type": "Stack",
+      },
+    },
+    "root": "root",
+  },
+  "spec": {
+    "elements": {
+      "actions": {
+        "children": [
+          "addMembers",
+        ],
+        "props": {
+          "direction": "row",
+          "role": "actions",
+          "wrap": true,
+        },
+        "type": "Stack",
+      },
+      "addMembers": {
+        "props": {
+          "action": {
+            "intent": "add_members",
+            "kind": "open",
+          },
+          "emphasis": "primary",
+          "label": {
+            "$msg": "actionCard.verb.addMembers",
+          },
+        },
+        "type": "Button",
+      },
+      "agents": {
+        "props": {
+          "label": {
+            "$msg": "actionCard.field.agents",
+          },
+          "value": [
+            {
+              "fallback": "scout",
+              "id": "2d3a9e6a-3f4c-4b8d-9e5f-7a9b0c1d2e3f",
+              "kind": "agent",
+            },
+          ],
+        },
+        "type": "Field",
+      },
+      "channel": {
+        "props": {
+          "label": {
+            "$msg": "actionCard.field.channel",
+          },
+          "value": [
+            {
+              "fallback": "general",
+              "id": "3e4b0f7b-4a5d-4c9e-8f6a-8b0c1d2e3f4a",
+              "kind": "channel",
+            },
+          ],
+        },
+        "type": "Field",
+      },
+      "humans": {
+        "props": {
+          "label": {
+            "$msg": "actionCard.field.humans",
+          },
+          "value": [
+            {
+              "fallback": "Alice",
+              "id": "0b1e7c4e-1d2a-4f6b-9c3d-5e7f8a9b0c1d",
+              "kind": "user",
+            },
+            {
+              "fallback": "bob",
+              "id": "1c2f8d5f-2e3b-4a7c-8d4e-6f8a9b0c1d2e",
+              "kind": "user",
+            },
+          ],
+        },
+        "type": "Field",
+      },
+      "properties": {
+        "children": [
+          "channel",
+          "humans",
+          "agents",
+        ],
+        "props": {
+          "direction": "column",
+          "wrap": false,
+        },
+        "type": "Stack",
+      },
+      "reason": {
+        "children": [
+          "reasonLabel",
+          "reasonText",
+        ],
+        "props": {
+          "direction": "column",
+          "role": "reason",
+          "wrap": false,
+        },
+        "type": "Stack",
+      },
+      "reasonLabel": {
+        "props": {
+          "mono": false,
+          "text": {
+            "$msg": "actionCard.reason",
+          },
+          "tone": "muted",
+        },
+        "type": "Text",
+      },
+      "reasonText": {
+        "props": {
+          "mono": false,
+          "text": "They work on the launch.",
+          "tone": "default",
+        },
+        "type": "Text",
+      },
+      "root": {
+        "children": [
+          "properties",
+          "reason",
+          "actions",
+        ],
+        "props": {
+          "direction": "column",
+          "wrap": false,
+        },
+        "type": "Stack",
+      },
+    },
+    "root": "root",
+  },
+  "title": {
+    "$msg": "actionCard.title.addMembers.other",
+    "count": 2,
+    "target": {
+      "fallback": "general",
+      "id": "3e4b0f7b-4a5d-4c9e-8f6a-8b0c1d2e3f4a",
+      "kind": "channel",
+    },
+  },
+}
+`;
+
+exports[`each type, prepared and executed > channel:add_member prepared 1`] = `
+{
+  "catalog": "action-card.v1",
+  "icon": "user_plus",
+  "spec": {
+    "elements": {
+      "actions": {
+        "children": [
+          "addMembers",
+        ],
+        "props": {
+          "direction": "row",
+          "role": "actions",
+          "wrap": true,
+        },
+        "type": "Stack",
+      },
+      "addMembers": {
+        "props": {
+          "action": {
+            "intent": "add_members",
+            "kind": "open",
+          },
+          "emphasis": "primary",
+          "label": {
+            "$msg": "actionCard.verb.addMembers",
+          },
+        },
+        "type": "Button",
+      },
+      "agents": {
+        "props": {
+          "label": {
+            "$msg": "actionCard.field.agents",
+          },
+          "value": [
+            {
+              "fallback": "scout",
+              "id": "2d3a9e6a-3f4c-4b8d-9e5f-7a9b0c1d2e3f",
+              "kind": "agent",
+            },
+          ],
+        },
+        "type": "Field",
+      },
+      "channel": {
+        "props": {
+          "label": {
+            "$msg": "actionCard.field.channel",
+          },
+          "value": [
+            {
+              "fallback": "general",
+              "id": "3e4b0f7b-4a5d-4c9e-8f6a-8b0c1d2e3f4a",
+              "kind": "channel",
+            },
+          ],
+        },
+        "type": "Field",
+      },
+      "humans": {
+        "props": {
+          "label": {
+            "$msg": "actionCard.field.humans",
+          },
+          "value": [
+            {
+              "fallback": "Alice",
+              "id": "0b1e7c4e-1d2a-4f6b-9c3d-5e7f8a9b0c1d",
+              "kind": "user",
+            },
+          ],
+        },
+        "type": "Field",
+      },
+      "properties": {
+        "children": [
+          "channel",
+          "humans",
+          "agents",
+        ],
+        "props": {
+          "direction": "column",
+          "wrap": false,
+        },
+        "type": "Stack",
+      },
+      "reason": {
+        "children": [
+          "reasonLabel",
+          "reasonText",
+        ],
+        "props": {
+          "direction": "column",
+          "role": "reason",
+          "wrap": false,
+        },
+        "type": "Stack",
+      },
+      "reasonLabel": {
+        "props": {
+          "mono": false,
+          "text": {
+            "$msg": "actionCard.reason",
+          },
+          "tone": "muted",
+        },
+        "type": "Text",
+      },
+      "reasonText": {
+        "props": {
+          "mono": false,
+          "text": "They work on the launch.",
+          "tone": "default",
+        },
+        "type": "Text",
+      },
+      "root": {
+        "children": [
+          "properties",
+          "reason",
+          "actions",
+        ],
+        "props": {
+          "direction": "column",
+          "wrap": false,
+        },
+        "type": "Stack",
+      },
+    },
+    "root": "root",
+  },
+  "title": {
+    "$msg": "actionCard.title.addMembers.other",
+    "count": 2,
+    "target": {
+      "fallback": "general",
+      "id": "3e4b0f7b-4a5d-4c9e-8f6a-8b0c1d2e3f4a",
+      "kind": "channel",
+    },
+  },
+}
+`;
+
+exports[`each type, prepared and executed > channel:create executed 1`] = `
+{
+  "catalog": "action-card.v1",
+  "icon": "hash",
+  "result": {
+    "elements": {
+      "actions": {
+        "children": [
+          "openChannel",
+        ],
+        "props": {
+          "direction": "row",
+          "role": "actions",
+          "wrap": true,
+        },
+        "type": "Stack",
+      },
+      "channel": {
+        "props": {
+          "label": {
+            "$msg": "actionCard.field.channel",
+          },
+          "value": [
+            {
+              "fallback": "launch-plan",
+              "id": "5a6d2b9d-6c7f-4e1a-8b8c-0d2e3f4a5b6c",
+              "kind": "channel",
+            },
+          ],
+        },
+        "type": "Field",
+      },
+      "openChannel": {
+        "props": {
+          "action": {
+            "kind": "navigate",
+            "target": {
+              "id": "5a6d2b9d-6c7f-4e1a-8b8c-0d2e3f4a5b6c",
+              "kind": "channel",
+            },
+          },
+          "emphasis": "secondary",
+          "label": {
+            "$msg": "actionCard.channel.edit.returnToChannel",
+          },
+        },
+        "type": "Button",
+      },
+      "root": {
+        "children": [
+          "channel",
+          "actions",
+        ],
+        "props": {
+          "direction": "column",
+          "wrap": false,
+        },
+        "type": "Stack",
+      },
+    },
+    "root": "root",
+  },
+  "spec": {
+    "elements": {
+      "actions": {
+        "children": [
+          "createChannel",
+        ],
+        "props": {
+          "direction": "row",
+          "role": "actions",
+          "wrap": true,
+        },
+        "type": "Stack",
+      },
+      "agents": {
+        "props": {
+          "label": {
+            "$msg": "actionCard.field.agents",
+          },
+          "value": [
+            {
+              "fallback": "scout",
+              "id": "2d3a9e6a-3f4c-4b8d-9e5f-7a9b0c1d2e3f",
+              "kind": "agent",
+            },
+          ],
+        },
+        "type": "Field",
+      },
+      "createChannel": {
+        "props": {
+          "action": {
+            "intent": "create_channel",
+            "kind": "open",
+          },
+          "emphasis": "primary",
+          "label": {
+            "$msg": "actionCard.verb.createChannel",
+          },
+        },
+        "type": "Button",
+      },
+      "description": {
+        "props": {
+          "label": {
+            "$msg": "actionCard.field.description",
+          },
+          "value": "Where we plan the October launch.",
+        },
+        "type": "Field",
+      },
+      "humans": {
+        "props": {
+          "label": {
+            "$msg": "actionCard.field.humans",
+          },
+          "value": [
+            {
+              "fallback": "Alice",
+              "id": "0b1e7c4e-1d2a-4f6b-9c3d-5e7f8a9b0c1d",
+              "kind": "user",
+            },
+            {
+              "fallback": "bob",
+              "id": "1c2f8d5f-2e3b-4a7c-8d4e-6f8a9b0c1d2e",
+              "kind": "user",
+            },
+          ],
+        },
+        "type": "Field",
+      },
+      "properties": {
+        "children": [
+          "description",
+          "humans",
+          "agents",
+        ],
+        "props": {
+          "direction": "column",
+          "wrap": false,
+        },
+        "type": "Stack",
+      },
+      "reason": {
+        "children": [
+          "reasonLabel",
+          "reasonText",
+        ],
+        "props": {
+          "direction": "column",
+          "role": "reason",
+          "wrap": false,
+        },
+        "type": "Stack",
+      },
+      "reasonLabel": {
+        "props": {
+          "mono": false,
+          "text": {
+            "$msg": "actionCard.reason",
+          },
+          "tone": "muted",
+        },
+        "type": "Text",
+      },
+      "reasonText": {
+        "props": {
+          "mono": false,
+          "text": "Alice asked for a private room for the launch.",
+          "tone": "default",
+        },
+        "type": "Text",
+      },
+      "root": {
+        "children": [
+          "properties",
+          "reason",
+          "actions",
+        ],
+        "props": {
+          "direction": "column",
+          "wrap": false,
+        },
+        "type": "Stack",
+      },
+    },
+    "root": "root",
+  },
+  "title": {
+    "$msg": "actionCard.title.createPrivateChannel",
+    "name": "launch-plan",
+  },
+}
+`;
+
+exports[`each type, prepared and executed > channel:create prepared 1`] = `
+{
+  "catalog": "action-card.v1",
+  "icon": "hash",
+  "spec": {
+    "elements": {
+      "actions": {
+        "children": [
+          "createChannel",
+        ],
+        "props": {
+          "direction": "row",
+          "role": "actions",
+          "wrap": true,
+        },
+        "type": "Stack",
+      },
+      "agents": {
+        "props": {
+          "label": {
+            "$msg": "actionCard.field.agents",
+          },
+          "value": [
+            {
+              "fallback": "scout",
+              "id": "2d3a9e6a-3f4c-4b8d-9e5f-7a9b0c1d2e3f",
+              "kind": "agent",
+            },
+          ],
+        },
+        "type": "Field",
+      },
+      "createChannel": {
+        "props": {
+          "action": {
+            "intent": "create_channel",
+            "kind": "open",
+          },
+          "emphasis": "primary",
+          "label": {
+            "$msg": "actionCard.verb.createChannel",
+          },
+        },
+        "type": "Button",
+      },
+      "description": {
+        "props": {
+          "label": {
+            "$msg": "actionCard.field.description",
+          },
+          "value": "Where we plan the October launch.",
+        },
+        "type": "Field",
+      },
+      "humans": {
+        "props": {
+          "label": {
+            "$msg": "actionCard.field.humans",
+          },
+          "value": [
+            {
+              "fallback": "Alice",
+              "id": "0b1e7c4e-1d2a-4f6b-9c3d-5e7f8a9b0c1d",
+              "kind": "user",
+            },
+            {
+              "fallback": "bob",
+              "id": "1c2f8d5f-2e3b-4a7c-8d4e-6f8a9b0c1d2e",
+              "kind": "user",
+            },
+          ],
+        },
+        "type": "Field",
+      },
+      "properties": {
+        "children": [
+          "description",
+          "humans",
+          "agents",
+        ],
+        "props": {
+          "direction": "column",
+          "wrap": false,
+        },
+        "type": "Stack",
+      },
+      "reason": {
+        "children": [
+          "reasonLabel",
+          "reasonText",
+        ],
+        "props": {
+          "direction": "column",
+          "role": "reason",
+          "wrap": false,
+        },
+        "type": "Stack",
+      },
+      "reasonLabel": {
+        "props": {
+          "mono": false,
+          "text": {
+            "$msg": "actionCard.reason",
+          },
+          "tone": "muted",
+        },
+        "type": "Text",
+      },
+      "reasonText": {
+        "props": {
+          "mono": false,
+          "text": "Alice asked for a private room for the launch.",
+          "tone": "default",
+        },
+        "type": "Text",
+      },
+      "root": {
+        "children": [
+          "properties",
+          "reason",
+          "actions",
+        ],
+        "props": {
+          "direction": "column",
+          "wrap": false,
+        },
+        "type": "Stack",
+      },
+    },
+    "root": "root",
+  },
+  "title": {
+    "$msg": "actionCard.title.createPrivateChannel",
+    "name": "launch-plan",
+  },
+}
+`;
+
+exports[`each type, prepared and executed > feedback:submit executed 1`] = `
+{
+  "catalog": "action-card.v1",
+  "icon": "message",
+  "result": {
+    "elements": {
+      "actions": {
+        "children": [
+          "openTicket",
+        ],
+        "props": {
+          "direction": "row",
+          "role": "actions",
+          "wrap": true,
+        },
+        "type": "Stack",
+      },
+      "openTicket": {
+        "props": {
+          "action": {
+            "intent": "feedback_ticket",
+            "kind": "open",
+          },
+          "emphasis": "secondary",
+          "label": {
+            "$msg": "actionCard.result.feedbackSubmitted",
+          },
+        },
+        "type": "Button",
+      },
+      "root": {
+        "children": [
+          "summary",
+          "actions",
+        ],
+        "props": {
+          "direction": "column",
+          "wrap": false,
+        },
+        "type": "Stack",
+      },
+      "summary": {
+        "props": {
+          "mono": false,
+          "text": {
+            "$msg": "actionCard.result.feedbackSentToRaft",
+          },
+          "tone": "default",
+        },
+        "type": "Text",
+      },
+    },
+    "root": "root",
+  },
+  "spec": {
+    "elements": {
+      "actions": {
+        "children": [
+          "submitFeedback",
+        ],
+        "props": {
+          "direction": "row",
+          "role": "actions",
+          "wrap": true,
+        },
+        "type": "Stack",
+      },
+      "feedback": {
+        "props": {
+          "clamp": 6,
+          "label": {
+            "$msg": "actionCard.field.feedback",
+          },
+          "value": "Search misses messages older than a week.
+Steps: search for 'launch'.",
+        },
+        "type": "Field",
+      },
+      "feedbackType": {
+        "props": {
+          "label": {
+            "$msg": "actionCard.field.feedbackType",
+          },
+          "value": {
+            "$msg": "actionCard.feedbackType.problem",
+          },
+        },
+        "type": "Field",
+      },
+      "properties": {
+        "children": [
+          "feedbackType",
+          "feedback",
+        ],
+        "props": {
+          "direction": "column",
+          "wrap": false,
+        },
+        "type": "Stack",
+      },
+      "reason": {
+        "children": [
+          "reasonLabel",
+          "reasonText",
+        ],
+        "props": {
+          "direction": "column",
+          "role": "reason",
+          "wrap": false,
+        },
+        "type": "Stack",
+      },
+      "reasonLabel": {
+        "props": {
+          "mono": false,
+          "text": {
+            "$msg": "actionCard.reason",
+          },
+          "tone": "muted",
+        },
+        "type": "Text",
+      },
+      "reasonText": {
+        "props": {
+          "mono": false,
+          "text": "You hit this twice today.",
+          "tone": "default",
+        },
+        "type": "Text",
+      },
+      "root": {
+        "children": [
+          "properties",
+          "reason",
+          "actions",
+        ],
+        "props": {
+          "direction": "column",
+          "wrap": false,
+        },
+        "type": "Stack",
+      },
+      "submitFeedback": {
+        "props": {
+          "action": {
+            "intent": "feedback_form",
+            "kind": "open",
+          },
+          "emphasis": "primary",
+          "label": {
+            "$msg": "actionCard.verb.submitFeedback",
+          },
+        },
+        "type": "Button",
+      },
+    },
+    "root": "root",
+  },
+  "title": {
+    "$msg": "actionCard.title.submitFeedback",
+  },
+}
+`;
+
+exports[`each type, prepared and executed > feedback:submit prepared 1`] = `
+{
+  "catalog": "action-card.v1",
+  "icon": "message",
+  "spec": {
+    "elements": {
+      "actions": {
+        "children": [
+          "submitFeedback",
+        ],
+        "props": {
+          "direction": "row",
+          "role": "actions",
+          "wrap": true,
+        },
+        "type": "Stack",
+      },
+      "feedback": {
+        "props": {
+          "clamp": 6,
+          "label": {
+            "$msg": "actionCard.field.feedback",
+          },
+          "value": "Search misses messages older than a week.
+Steps: search for 'launch'.",
+        },
+        "type": "Field",
+      },
+      "feedbackType": {
+        "props": {
+          "label": {
+            "$msg": "actionCard.field.feedbackType",
+          },
+          "value": {
+            "$msg": "actionCard.feedbackType.problem",
+          },
+        },
+        "type": "Field",
+      },
+      "properties": {
+        "children": [
+          "feedbackType",
+          "feedback",
+        ],
+        "props": {
+          "direction": "column",
+          "wrap": false,
+        },
+        "type": "Stack",
+      },
+      "reason": {
+        "children": [
+          "reasonLabel",
+          "reasonText",
+        ],
+        "props": {
+          "direction": "column",
+          "role": "reason",
+          "wrap": false,
+        },
+        "type": "Stack",
+      },
+      "reasonLabel": {
+        "props": {
+          "mono": false,
+          "text": {
+            "$msg": "actionCard.reason",
+          },
+          "tone": "muted",
+        },
+        "type": "Text",
+      },
+      "reasonText": {
+        "props": {
+          "mono": false,
+          "text": "You hit this twice today.",
+          "tone": "default",
+        },
+        "type": "Text",
+      },
+      "root": {
+        "children": [
+          "properties",
+          "reason",
+          "actions",
+        ],
+        "props": {
+          "direction": "column",
+          "wrap": false,
+        },
+        "type": "Stack",
+      },
+      "submitFeedback": {
+        "props": {
+          "action": {
+            "intent": "feedback_form",
+            "kind": "open",
+          },
+          "emphasis": "primary",
+          "label": {
+            "$msg": "actionCard.verb.submitFeedback",
+          },
+        },
+        "type": "Button",
+      },
+    },
+    "root": "root",
+  },
+  "title": {
+    "$msg": "actionCard.title.submitFeedback",
+  },
+}
+`;
+
+exports[`each type, prepared and executed > integration:approve_agent_login executed 1`] = `
+{
+  "catalog": "action-card.v1",
+  "icon": "key",
+  "result": {
+    "elements": {
+      "root": {
+        "children": [
+          "summary",
+        ],
+        "props": {
+          "direction": "column",
+          "wrap": false,
+        },
+        "type": "Stack",
+      },
+      "summary": {
+        "props": {
+          "mono": false,
+          "text": {
+            "$msg": "actionCard.result.integrationLogin",
+            "agent": {
+              "fallback": "scout",
+              "id": "2d3a9e6a-3f4c-4b8d-9e5f-7a9b0c1d2e3f",
+              "kind": "agent",
+            },
+            "client": "Stamp",
+          },
+          "tone": "default",
+        },
+        "type": "Text",
+      },
+    },
+    "root": "root",
+  },
+  "spec": {
+    "elements": {
+      "actions": {
+        "children": [
+          "approveLogin",
+        ],
+        "props": {
+          "direction": "row",
+          "role": "actions",
+          "wrap": true,
+        },
+        "type": "Stack",
+      },
+      "agent": {
+        "props": {
+          "label": {
+            "$msg": "actionCard.field.agent",
+          },
+          "value": [
+            {
+              "fallback": "scout",
+              "id": "2d3a9e6a-3f4c-4b8d-9e5f-7a9b0c1d2e3f",
+              "kind": "agent",
+            },
+          ],
+        },
+        "type": "Field",
+      },
+      "approveLogin": {
+        "props": {
+          "action": {
+            "kind": "execute",
+          },
+          "emphasis": "primary",
+          "label": {
+            "$msg": "actionCard.verb.approveLogin",
+          },
+        },
+        "type": "Button",
+      },
+      "properties": {
+        "children": [
+          "service",
+          "agent",
+        ],
+        "props": {
+          "direction": "column",
+          "wrap": false,
+        },
+        "type": "Stack",
+      },
+      "reason": {
+        "children": [
+          "reasonLabel",
+          "reasonText",
+        ],
+        "props": {
+          "direction": "column",
+          "role": "reason",
+          "wrap": false,
+        },
+        "type": "Stack",
+      },
+      "reasonLabel": {
+        "props": {
+          "mono": false,
+          "text": {
+            "$msg": "actionCard.reason",
+          },
+          "tone": "muted",
+        },
+        "type": "Text",
+      },
+      "reasonText": {
+        "props": {
+          "mono": false,
+          "text": "scout wants to sign in to Stamp.",
+          "tone": "default",
+        },
+        "type": "Text",
+      },
+      "root": {
+        "children": [
+          "properties",
+          "reason",
+          "scopes",
+          "actions",
+        ],
+        "props": {
+          "direction": "column",
+          "wrap": false,
+        },
+        "type": "Stack",
+      },
+      "scopes": {
+        "props": {
+          "agentName": "scout",
+          "scopes": [
+            "identity:read",
+            "messages:read",
+          ],
+        },
+        "type": "ScopeList",
+      },
+      "service": {
+        "props": {
+          "label": {
+            "$msg": "actionCard.field.service",
+          },
+          "value": "Stamp",
+        },
+        "type": "Field",
+      },
+    },
+    "root": "root",
+  },
+  "title": {
+    "$msg": "actionCard.title.approveLogin",
+    "agent": {
+      "fallback": "scout",
+      "id": "2d3a9e6a-3f4c-4b8d-9e5f-7a9b0c1d2e3f",
+      "kind": "agent",
+    },
+    "client": "Stamp",
+  },
+}
+`;
+
+exports[`each type, prepared and executed > integration:approve_agent_login prepared 1`] = `
+{
+  "catalog": "action-card.v1",
+  "icon": "key",
+  "spec": {
+    "elements": {
+      "actions": {
+        "children": [
+          "approveLogin",
+        ],
+        "props": {
+          "direction": "row",
+          "role": "actions",
+          "wrap": true,
+        },
+        "type": "Stack",
+      },
+      "agent": {
+        "props": {
+          "label": {
+            "$msg": "actionCard.field.agent",
+          },
+          "value": [
+            {
+              "fallback": "scout",
+              "id": "2d3a9e6a-3f4c-4b8d-9e5f-7a9b0c1d2e3f",
+              "kind": "agent",
+            },
+          ],
+        },
+        "type": "Field",
+      },
+      "approveLogin": {
+        "props": {
+          "action": {
+            "kind": "execute",
+          },
+          "emphasis": "primary",
+          "label": {
+            "$msg": "actionCard.verb.approveLogin",
+          },
+        },
+        "type": "Button",
+      },
+      "properties": {
+        "children": [
+          "service",
+          "agent",
+        ],
+        "props": {
+          "direction": "column",
+          "wrap": false,
+        },
+        "type": "Stack",
+      },
+      "reason": {
+        "children": [
+          "reasonLabel",
+          "reasonText",
+        ],
+        "props": {
+          "direction": "column",
+          "role": "reason",
+          "wrap": false,
+        },
+        "type": "Stack",
+      },
+      "reasonLabel": {
+        "props": {
+          "mono": false,
+          "text": {
+            "$msg": "actionCard.reason",
+          },
+          "tone": "muted",
+        },
+        "type": "Text",
+      },
+      "reasonText": {
+        "props": {
+          "mono": false,
+          "text": "scout wants to sign in to Stamp.",
+          "tone": "default",
+        },
+        "type": "Text",
+      },
+      "root": {
+        "children": [
+          "properties",
+          "reason",
+          "scopes",
+          "actions",
+        ],
+        "props": {
+          "direction": "column",
+          "wrap": false,
+        },
+        "type": "Stack",
+      },
+      "scopes": {
+        "props": {
+          "agentName": "scout",
+          "scopes": [
+            "identity:read",
+            "messages:read",
+          ],
+        },
+        "type": "ScopeList",
+      },
+      "service": {
+        "props": {
+          "label": {
+            "$msg": "actionCard.field.service",
+          },
+          "value": "Stamp",
+        },
+        "type": "Field",
+      },
+    },
+    "root": "root",
+  },
+  "title": {
+    "$msg": "actionCard.title.approveLogin",
+    "agent": {
+      "fallback": "scout",
+      "id": "2d3a9e6a-3f4c-4b8d-9e5f-7a9b0c1d2e3f",
+      "kind": "agent",
+    },
+    "client": "Stamp",
+  },
+}
+`;
+
+exports[`each type, prepared and executed > integration:connect_mcp executed 1`] = `
+{
+  "catalog": "action-card.v1",
+  "icon": "plug",
+  "result": {
+    "elements": {
+      "root": {
+        "children": [
+          "summary",
+        ],
+        "props": {
+          "direction": "column",
+          "wrap": false,
+        },
+        "type": "Stack",
+      },
+      "summary": {
+        "props": {
+          "mono": false,
+          "text": {
+            "$msg": "actionCard.result.mcpConnectionGranted",
+            "agent": {
+              "fallback": "scout",
+              "id": "2d3a9e6a-3f4c-4b8d-9e5f-7a9b0c1d2e3f",
+              "kind": "agent",
+            },
+          },
+          "tone": "default",
+        },
+        "type": "Text",
+      },
+    },
+    "root": "root",
+  },
+  "spec": {
+    "elements": {
+      "root": {
+        "children": [],
+        "props": {
+          "direction": "column",
+          "wrap": false,
+        },
+        "type": "Stack",
+      },
+    },
+    "root": "root",
+  },
+  "title": {
+    "$msg": "actionCard.title.connectMcp",
+    "agent": {
+      "fallback": "scout",
+      "id": "2d3a9e6a-3f4c-4b8d-9e5f-7a9b0c1d2e3f",
+      "kind": "agent",
+    },
+    "app": "Notion",
+  },
+}
+`;
+
+exports[`each type, prepared and executed > integration:connect_mcp prepared 1`] = `
+{
+  "catalog": "action-card.v1",
+  "icon": "plug",
+  "spec": {
+    "elements": {
+      "root": {
+        "children": [],
+        "props": {
+          "direction": "column",
+          "wrap": false,
+        },
+        "type": "Stack",
+      },
+    },
+    "root": "root",
+  },
+  "title": {
+    "$msg": "actionCard.title.connectMcp",
+    "agent": {
+      "fallback": "scout",
+      "id": "2d3a9e6a-3f4c-4b8d-9e5f-7a9b0c1d2e3f",
+      "kind": "agent",
+    },
+    "app": "Notion",
+  },
+}
+`;
+
+exports[`each type, prepared and executed > integration:install_marketplace_app executed 1`] = `
+{
+  "catalog": "action-card.v1",
+  "icon": "package",
+  "result": {
+    "elements": {
+      "root": {
+        "children": [
+          "summary",
+          "setupUrl",
+        ],
+        "props": {
+          "direction": "column",
+          "wrap": false,
+        },
+        "type": "Stack",
+      },
+      "setupUrl": {
+        "props": {
+          "breakAll": true,
+          "label": {
+            "$msg": "actionCard.appSetup.urlLabel",
+          },
+          "value": "https://vault.example/setup",
+        },
+        "type": "Field",
+      },
+      "summary": {
+        "props": {
+          "mono": false,
+          "text": {
+            "$msg": "actionCard.result.marketplaceInstalled",
+            "client": "Vault",
+          },
+          "tone": "default",
+        },
+        "type": "Text",
+      },
+    },
+    "root": "root",
+  },
+  "spec": {
+    "elements": {
+      "actions": {
+        "children": [
+          "installApp",
+        ],
+        "props": {
+          "direction": "row",
+          "role": "actions",
+          "wrap": true,
+        },
+        "type": "Stack",
+      },
+      "agent": {
+        "props": {
+          "label": {
+            "$msg": "actionCard.field.agent",
+          },
+          "value": [
+            {
+              "fallback": "scout",
+              "id": "2d3a9e6a-3f4c-4b8d-9e5f-7a9b0c1d2e3f",
+              "kind": "agent",
+            },
+          ],
+        },
+        "type": "Field",
+      },
+      "installApp": {
+        "props": {
+          "action": {
+            "kind": "execute",
+          },
+          "emphasis": "primary",
+          "label": {
+            "$msg": "actionCard.verb.installApp",
+          },
+        },
+        "type": "Button",
+      },
+      "ownerOnly": {
+        "props": {
+          "text": {
+            "$msg": "actionCard.installMarketplaceOwnerOnly",
+          },
+          "tone": "info",
+        },
+        "type": "Notice",
+      },
+      "properties": {
+        "children": [
+          "service",
+          "agent",
+        ],
+        "props": {
+          "direction": "column",
+          "wrap": false,
+        },
+        "type": "Stack",
+      },
+      "reason": {
+        "children": [
+          "reasonLabel",
+          "reasonText",
+        ],
+        "props": {
+          "direction": "column",
+          "role": "reason",
+          "wrap": false,
+        },
+        "type": "Stack",
+      },
+      "reasonLabel": {
+        "props": {
+          "mono": false,
+          "text": {
+            "$msg": "actionCard.reason",
+          },
+          "tone": "muted",
+        },
+        "type": "Text",
+      },
+      "reasonText": {
+        "props": {
+          "mono": false,
+          "text": "scout requested Vault, which is public in the Raft Marketplace but is not installed on this Server.",
+          "tone": "default",
+        },
+        "type": "Text",
+      },
+      "root": {
+        "children": [
+          "ownerOnly",
+          "setupRequired",
+          "setupDescription",
+          "properties",
+          "reason",
+          "scopes",
+          "actions",
+        ],
+        "props": {
+          "direction": "column",
+          "wrap": false,
+        },
+        "type": "Stack",
+      },
+      "scopes": {
+        "props": {
+          "agentName": "scout",
+          "scopes": [
+            "identity:read",
+          ],
+        },
+        "type": "ScopeList",
+      },
+      "service": {
+        "props": {
+          "label": {
+            "$msg": "actionCard.field.service",
+          },
+          "value": "Vault",
+        },
+        "type": "Field",
+      },
+      "setupDescription": {
+        "props": {
+          "mono": false,
+          "text": "Pick the vault to share.",
+          "tone": "default",
+        },
+        "type": "Text",
+      },
+      "setupRequired": {
+        "props": {
+          "text": {
+            "$msg": "actionCard.appSetup.requiredAfterInstall",
+          },
+          "tone": "info",
+        },
+        "type": "Notice",
+      },
+    },
+    "root": "root",
+  },
+  "title": {
+    "$msg": "actionCard.title.installApp",
+    "agent": {
+      "fallback": "scout",
+      "id": "2d3a9e6a-3f4c-4b8d-9e5f-7a9b0c1d2e3f",
+      "kind": "agent",
+    },
+    "client": "Vault",
+  },
+}
+`;
+
+exports[`each type, prepared and executed > integration:install_marketplace_app prepared 1`] = `
+{
+  "catalog": "action-card.v1",
+  "icon": "package",
+  "spec": {
+    "elements": {
+      "actions": {
+        "children": [
+          "installApp",
+        ],
+        "props": {
+          "direction": "row",
+          "role": "actions",
+          "wrap": true,
+        },
+        "type": "Stack",
+      },
+      "agent": {
+        "props": {
+          "label": {
+            "$msg": "actionCard.field.agent",
+          },
+          "value": [
+            {
+              "fallback": "scout",
+              "id": "2d3a9e6a-3f4c-4b8d-9e5f-7a9b0c1d2e3f",
+              "kind": "agent",
+            },
+          ],
+        },
+        "type": "Field",
+      },
+      "installApp": {
+        "props": {
+          "action": {
+            "kind": "execute",
+          },
+          "emphasis": "primary",
+          "label": {
+            "$msg": "actionCard.verb.installApp",
+          },
+        },
+        "type": "Button",
+      },
+      "ownerOnly": {
+        "props": {
+          "text": {
+            "$msg": "actionCard.installMarketplaceOwnerOnly",
+          },
+          "tone": "info",
+        },
+        "type": "Notice",
+      },
+      "properties": {
+        "children": [
+          "service",
+          "agent",
+        ],
+        "props": {
+          "direction": "column",
+          "wrap": false,
+        },
+        "type": "Stack",
+      },
+      "reason": {
+        "children": [
+          "reasonLabel",
+          "reasonText",
+        ],
+        "props": {
+          "direction": "column",
+          "role": "reason",
+          "wrap": false,
+        },
+        "type": "Stack",
+      },
+      "reasonLabel": {
+        "props": {
+          "mono": false,
+          "text": {
+            "$msg": "actionCard.reason",
+          },
+          "tone": "muted",
+        },
+        "type": "Text",
+      },
+      "reasonText": {
+        "props": {
+          "mono": false,
+          "text": "scout requested Vault, which is public in the Raft Marketplace but is not installed on this Server.",
+          "tone": "default",
+        },
+        "type": "Text",
+      },
+      "root": {
+        "children": [
+          "ownerOnly",
+          "setupRequired",
+          "setupDescription",
+          "properties",
+          "reason",
+          "scopes",
+          "actions",
+        ],
+        "props": {
+          "direction": "column",
+          "wrap": false,
+        },
+        "type": "Stack",
+      },
+      "scopes": {
+        "props": {
+          "agentName": "scout",
+          "scopes": [
+            "identity:read",
+          ],
+        },
+        "type": "ScopeList",
+      },
+      "service": {
+        "props": {
+          "label": {
+            "$msg": "actionCard.field.service",
+          },
+          "value": "Vault",
+        },
+        "type": "Field",
+      },
+      "setupDescription": {
+        "props": {
+          "mono": false,
+          "text": "Pick the vault to share.",
+          "tone": "default",
+        },
+        "type": "Text",
+      },
+      "setupRequired": {
+        "props": {
+          "text": {
+            "$msg": "actionCard.appSetup.requiredAfterInstall",
+          },
+          "tone": "info",
+        },
+        "type": "Notice",
+      },
+    },
+    "root": "root",
+  },
+  "title": {
+    "$msg": "actionCard.title.installApp",
+    "agent": {
+      "fallback": "scout",
+      "id": "2d3a9e6a-3f4c-4b8d-9e5f-7a9b0c1d2e3f",
+      "kind": "agent",
+    },
+    "client": "Vault",
+  },
+}
+`;
+
+exports[`each type, prepared and executed > integration:recover_app_owner executed 1`] = `
+{
+  "catalog": "action-card.v1",
+  "icon": "shield",
+  "result": {
+    "elements": {
+      "root": {
+        "children": [
+          "summary",
+        ],
+        "props": {
+          "direction": "column",
+          "wrap": false,
+        },
+        "type": "Stack",
+      },
+      "summary": {
+        "props": {
+          "mono": false,
+          "text": {
+            "$msg": "actionCard.result.ownerRecovered",
+            "client": "Reminder",
+            "owner": "scout",
+          },
+          "tone": "default",
+        },
+        "type": "Text",
+      },
+    },
+    "root": "root",
+  },
+  "spec": {
+    "elements": {
+      "actions": {
+        "children": [
+          "recoverOwner",
+        ],
+        "props": {
+          "direction": "row",
+          "role": "actions",
+          "wrap": true,
+        },
+        "type": "Stack",
+      },
+      "adminOnly": {
+        "props": {
+          "text": {
+            "$msg": "actionCard.adminRecoveryOnly",
+          },
+          "tone": "info",
+        },
+        "type": "Notice",
+      },
+      "clientKey": {
+        "props": {
+          "label": {
+            "$msg": "actionCard.field.clientKey",
+          },
+          "mono": true,
+          "value": "reminder",
+        },
+        "type": "Field",
+      },
+      "properties": {
+        "children": [
+          "clientKey",
+          "recoveryOwner",
+        ],
+        "props": {
+          "direction": "column",
+          "wrap": false,
+        },
+        "type": "Stack",
+      },
+      "reason": {
+        "children": [
+          "reasonLabel",
+          "reasonText",
+        ],
+        "props": {
+          "direction": "column",
+          "role": "reason",
+          "wrap": false,
+        },
+        "type": "Stack",
+      },
+      "reasonLabel": {
+        "props": {
+          "mono": false,
+          "text": {
+            "$msg": "actionCard.reason",
+          },
+          "tone": "muted",
+        },
+        "type": "Text",
+      },
+      "reasonText": {
+        "props": {
+          "mono": false,
+          "text": "The owner agent was deleted.",
+          "tone": "default",
+        },
+        "type": "Text",
+      },
+      "recoverOwner": {
+        "props": {
+          "action": {
+            "kind": "execute",
+          },
+          "emphasis": "primary",
+          "label": {
+            "$msg": "actionCard.verb.recoverOwner",
+          },
+        },
+        "type": "Button",
+      },
+      "recoveryOwner": {
+        "props": {
+          "label": {
+            "$msg": "actionCard.field.recoveryOwner",
+          },
+          "mono": true,
+          "value": [
+            {
+              "fallback": "scout",
+              "id": "2d3a9e6a-3f4c-4b8d-9e5f-7a9b0c1d2e3f",
+              "kind": "agent",
+            },
+          ],
+        },
+        "type": "Field",
+      },
+      "root": {
+        "children": [
+          "adminOnly",
+          "properties",
+          "reason",
+          "actions",
+        ],
+        "props": {
+          "direction": "column",
+          "wrap": false,
+        },
+        "type": "Stack",
+      },
+    },
+    "root": "root",
+  },
+  "title": {
+    "$msg": "actionCard.title.recoverOwner",
+    "agent": {
+      "fallback": "scout",
+      "id": "2d3a9e6a-3f4c-4b8d-9e5f-7a9b0c1d2e3f",
+      "kind": "agent",
+    },
+    "clientKey": "reminder",
+  },
+}
+`;
+
+exports[`each type, prepared and executed > integration:recover_app_owner prepared 1`] = `
+{
+  "catalog": "action-card.v1",
+  "icon": "shield",
+  "spec": {
+    "elements": {
+      "actions": {
+        "children": [
+          "recoverOwner",
+        ],
+        "props": {
+          "direction": "row",
+          "role": "actions",
+          "wrap": true,
+        },
+        "type": "Stack",
+      },
+      "adminOnly": {
+        "props": {
+          "text": {
+            "$msg": "actionCard.adminRecoveryOnly",
+          },
+          "tone": "info",
+        },
+        "type": "Notice",
+      },
+      "clientKey": {
+        "props": {
+          "label": {
+            "$msg": "actionCard.field.clientKey",
+          },
+          "mono": true,
+          "value": "reminder",
+        },
+        "type": "Field",
+      },
+      "properties": {
+        "children": [
+          "clientKey",
+          "recoveryOwner",
+        ],
+        "props": {
+          "direction": "column",
+          "wrap": false,
+        },
+        "type": "Stack",
+      },
+      "reason": {
+        "children": [
+          "reasonLabel",
+          "reasonText",
+        ],
+        "props": {
+          "direction": "column",
+          "role": "reason",
+          "wrap": false,
+        },
+        "type": "Stack",
+      },
+      "reasonLabel": {
+        "props": {
+          "mono": false,
+          "text": {
+            "$msg": "actionCard.reason",
+          },
+          "tone": "muted",
+        },
+        "type": "Text",
+      },
+      "reasonText": {
+        "props": {
+          "mono": false,
+          "text": "The owner agent was deleted.",
+          "tone": "default",
+        },
+        "type": "Text",
+      },
+      "recoverOwner": {
+        "props": {
+          "action": {
+            "kind": "execute",
+          },
+          "emphasis": "primary",
+          "label": {
+            "$msg": "actionCard.verb.recoverOwner",
+          },
+        },
+        "type": "Button",
+      },
+      "recoveryOwner": {
+        "props": {
+          "label": {
+            "$msg": "actionCard.field.recoveryOwner",
+          },
+          "mono": true,
+          "value": [
+            {
+              "fallback": "scout",
+              "id": "2d3a9e6a-3f4c-4b8d-9e5f-7a9b0c1d2e3f",
+              "kind": "agent",
+            },
+          ],
+        },
+        "type": "Field",
+      },
+      "root": {
+        "children": [
+          "adminOnly",
+          "properties",
+          "reason",
+          "actions",
+        ],
+        "props": {
+          "direction": "column",
+          "wrap": false,
+        },
+        "type": "Stack",
+      },
+    },
+    "root": "root",
+  },
+  "title": {
+    "$msg": "actionCard.title.recoverOwner",
+    "agent": {
+      "fallback": "scout",
+      "id": "2d3a9e6a-3f4c-4b8d-9e5f-7a9b0c1d2e3f",
+      "kind": "agent",
+    },
+    "clientKey": "reminder",
+  },
+}
+`;
+
+exports[`each type, prepared and executed > integration:register_app executed 1`] = `
+{
+  "catalog": "action-card.v1",
+  "icon": "app",
+  "result": {
+    "elements": {
+      "root": {
+        "children": [
+          "summary",
+        ],
+        "props": {
+          "direction": "column",
+          "wrap": false,
+        },
+        "type": "Stack",
+      },
+      "summary": {
+        "props": {
+          "mono": false,
+          "text": {
+            "$msg": "actionCard.result.appRegistered",
+            "client": "Reminder",
+            "clientKey": "reminder",
+          },
+          "tone": "default",
+        },
+        "type": "Text",
+      },
+    },
+    "root": "root",
+  },
+  "spec": {
+    "elements": {
+      "actions": {
+        "children": [
+          "registerApp",
+        ],
+        "props": {
+          "direction": "row",
+          "role": "actions",
+          "wrap": true,
+        },
+        "type": "Stack",
+      },
+      "appUrl": {
+        "props": {
+          "breakAll": true,
+          "label": {
+            "$msg": "actionCard.field.appUrl",
+          },
+          "value": "https://reminder.example",
+        },
+        "type": "Field",
+      },
+      "clientKey": {
+        "props": {
+          "label": {
+            "$msg": "actionCard.field.clientKey",
+          },
+          "mono": true,
+          "value": "reminder",
+        },
+        "type": "Field",
+      },
+      "ownerNote": {
+        "props": {
+          "text": {
+            "$msg": "actionCard.registerOwnerNote",
+          },
+          "tone": "info",
+        },
+        "type": "Notice",
+      },
+      "properties": {
+        "children": [
+          "clientKey",
+          "redirectUrl",
+          "appUrl",
+        ],
+        "props": {
+          "direction": "column",
+          "wrap": false,
+        },
+        "type": "Stack",
+      },
+      "reason": {
+        "children": [
+          "reasonLabel",
+          "reasonText",
+        ],
+        "props": {
+          "direction": "column",
+          "role": "reason",
+          "wrap": false,
+        },
+        "type": "Stack",
+      },
+      "reasonLabel": {
+        "props": {
+          "mono": false,
+          "text": {
+            "$msg": "actionCard.reason",
+          },
+          "tone": "muted",
+        },
+        "type": "Text",
+      },
+      "reasonText": {
+        "props": {
+          "mono": false,
+          "text": "To send reminders.",
+          "tone": "default",
+        },
+        "type": "Text",
+      },
+      "redirectUrl": {
+        "props": {
+          "breakAll": true,
+          "label": {
+            "$msg": "actionCard.field.redirectUrl",
+          },
+          "value": "https://reminder.example/callback",
+        },
+        "type": "Field",
+      },
+      "registerApp": {
+        "props": {
+          "action": {
+            "kind": "execute",
+          },
+          "emphasis": "primary",
+          "label": {
+            "$msg": "actionCard.verb.registerApp",
+          },
+        },
+        "type": "Button",
+      },
+      "root": {
+        "children": [
+          "ownerNote",
+          "unsafeDemoUrl",
+          "properties",
+          "reason",
+          "scopes",
+          "actions",
+        ],
+        "props": {
+          "direction": "column",
+          "wrap": false,
+        },
+        "type": "Stack",
+      },
+      "scopes": {
+        "props": {
+          "scopes": [
+            "identity:read",
+          ],
+        },
+        "type": "ScopeList",
+      },
+      "unsafeDemoUrl": {
+        "props": {
+          "text": {
+            "$msg": "actionCard.unsafeDemoUrlOverride",
+          },
+          "tone": "info",
+        },
+        "type": "Notice",
+      },
+    },
+    "root": "root",
+  },
+  "title": {
+    "$msg": "actionCard.title.registerApp",
+    "name": "Reminder",
+  },
+}
+`;
+
+exports[`each type, prepared and executed > integration:register_app prepared 1`] = `
+{
+  "catalog": "action-card.v1",
+  "icon": "app",
+  "spec": {
+    "elements": {
+      "actions": {
+        "children": [
+          "registerApp",
+        ],
+        "props": {
+          "direction": "row",
+          "role": "actions",
+          "wrap": true,
+        },
+        "type": "Stack",
+      },
+      "appUrl": {
+        "props": {
+          "breakAll": true,
+          "label": {
+            "$msg": "actionCard.field.appUrl",
+          },
+          "value": "https://reminder.example",
+        },
+        "type": "Field",
+      },
+      "clientKey": {
+        "props": {
+          "label": {
+            "$msg": "actionCard.field.clientKey",
+          },
+          "mono": true,
+          "value": "reminder",
+        },
+        "type": "Field",
+      },
+      "ownerNote": {
+        "props": {
+          "text": {
+            "$msg": "actionCard.registerOwnerNote",
+          },
+          "tone": "info",
+        },
+        "type": "Notice",
+      },
+      "properties": {
+        "children": [
+          "clientKey",
+          "redirectUrl",
+          "appUrl",
+        ],
+        "props": {
+          "direction": "column",
+          "wrap": false,
+        },
+        "type": "Stack",
+      },
+      "reason": {
+        "children": [
+          "reasonLabel",
+          "reasonText",
+        ],
+        "props": {
+          "direction": "column",
+          "role": "reason",
+          "wrap": false,
+        },
+        "type": "Stack",
+      },
+      "reasonLabel": {
+        "props": {
+          "mono": false,
+          "text": {
+            "$msg": "actionCard.reason",
+          },
+          "tone": "muted",
+        },
+        "type": "Text",
+      },
+      "reasonText": {
+        "props": {
+          "mono": false,
+          "text": "To send reminders.",
+          "tone": "default",
+        },
+        "type": "Text",
+      },
+      "redirectUrl": {
+        "props": {
+          "breakAll": true,
+          "label": {
+            "$msg": "actionCard.field.redirectUrl",
+          },
+          "value": "https://reminder.example/callback",
+        },
+        "type": "Field",
+      },
+      "registerApp": {
+        "props": {
+          "action": {
+            "kind": "execute",
+          },
+          "emphasis": "primary",
+          "label": {
+            "$msg": "actionCard.verb.registerApp",
+          },
+        },
+        "type": "Button",
+      },
+      "root": {
+        "children": [
+          "ownerNote",
+          "unsafeDemoUrl",
+          "properties",
+          "reason",
+          "scopes",
+          "actions",
+        ],
+        "props": {
+          "direction": "column",
+          "wrap": false,
+        },
+        "type": "Stack",
+      },
+      "scopes": {
+        "props": {
+          "scopes": [
+            "identity:read",
+          ],
+        },
+        "type": "ScopeList",
+      },
+      "unsafeDemoUrl": {
+        "props": {
+          "text": {
+            "$msg": "actionCard.unsafeDemoUrlOverride",
+          },
+          "tone": "info",
+        },
+        "type": "Notice",
+      },
+    },
+    "root": "root",
+  },
+  "title": {
+    "$msg": "actionCard.title.registerApp",
+    "name": "Reminder",
+  },
+}
+`;
+
+exports[`each type, prepared and executed > integration:update_app_registration prepared 1`] = `
+{
+  "catalog": "action-card.v1",
+  "icon": "app",
+  "spec": {
+    "elements": {
+      "clientKey": {
+        "props": {
+          "label": {
+            "$msg": "actionCard.field.clientKey",
+          },
+          "mono": true,
+          "value": "reminder",
+        },
+        "type": "Field",
+      },
+      "name": {
+        "props": {
+          "label": {
+            "$msg": "actionCard.field.name",
+          },
+          "value": "Reminder 2",
+        },
+        "type": "Field",
+      },
+      "properties": {
+        "children": [
+          "clientKey",
+          "name",
+          "redirectUrl",
+        ],
+        "props": {
+          "direction": "column",
+          "wrap": false,
+        },
+        "type": "Stack",
+      },
+      "redirectUrl": {
+        "props": {
+          "breakAll": true,
+          "label": {
+            "$msg": "actionCard.field.redirectUrl",
+          },
+          "value": "https://reminder.example/cb2",
+        },
+        "type": "Field",
+      },
+      "root": {
+        "children": [
+          "unavailable",
+          "properties",
+          "scopes",
+        ],
+        "props": {
+          "direction": "column",
+          "wrap": false,
+        },
+        "type": "Stack",
+      },
+      "scopes": {
+        "props": {
+          "scopes": [
+            "identity:read",
+          ],
+        },
+        "type": "ScopeList",
+      },
+      "unavailable": {
+        "props": {
+          "text": {
+            "$msg": "actionCard.updateAppUnavailable",
+          },
+          "tone": "info",
+        },
+        "type": "Notice",
+      },
+    },
+    "root": "root",
+  },
+  "title": {
+    "$msg": "actionCard.title.updateApp",
+    "clientKey": "reminder",
+  },
+}
+`;
+
+exports[`each type, prepared and executed > plan:upgrade prepared 1`] = `
+{
+  "catalog": "action-card.v1",
+  "icon": "credit_card",
+  "spec": {
+    "elements": {
+      "actions": {
+        "children": [
+          "upgrade",
+        ],
+        "props": {
+          "direction": "row",
+          "role": "actions",
+          "wrap": true,
+        },
+        "type": "Stack",
+      },
+      "gateHint": {
+        "props": {
+          "text": {
+            "$msg": "actionCard.upgradeDialog.history.hint",
+            "days": 30,
+            "freeServers": 2,
+            "monthly": "100 MB",
+            "proSingle": "200 MB",
+            "server": "Botiverse",
+            "single": "50 MB",
+          },
+          "tone": "info",
+        },
+        "type": "Notice",
+      },
+      "reason": {
+        "children": [
+          "reasonText",
+        ],
+        "props": {
+          "direction": "column",
+          "role": "reason",
+          "wrap": false,
+        },
+        "type": "Stack",
+      },
+      "reasonText": {
+        "props": {
+          "mono": false,
+          "text": "You need the March messages for the audit.",
+          "tone": "default",
+        },
+        "type": "Text",
+      },
+      "root": {
+        "children": [
+          "reason",
+          "gateHint",
+          "actions",
+        ],
+        "props": {
+          "direction": "column",
+          "wrap": false,
+        },
+        "type": "Stack",
+      },
+      "upgrade": {
+        "props": {
+          "action": {
+            "gate": "history_30d",
+            "intent": "upgrade_dialog",
+            "kind": "open",
+          },
+          "emphasis": "primary",
+          "label": {
+            "$msg": "actionCard.billing.upgradeToPro",
+          },
+        },
+        "type": "Button",
+      },
+    },
+    "root": "root",
+  },
+  "title": {
+    "$msg": "actionCard.title.upgradeToPro",
+  },
+}
+`;
+
+exports[`each type, prepared and executed > question:ask executed 1`] = `
+{
+  "catalog": "action-card.v1",
+  "icon": "message",
+  "result": {
+    "elements": {
+      "a_window": {
+        "props": {
+          "label": {
+            "$msg": "actionCard.question.answerLabel",
+          },
+          "value": "Tue",
+        },
+        "type": "Field",
+      },
+      "q_window": {
+        "props": {
+          "label": {
+            "$msg": "actionCard.question.question",
+          },
+          "value": "Which window?",
+        },
+        "type": "Field",
+      },
+      "root": {
+        "children": [
+          "q_window",
+          "a_window",
+        ],
+        "props": {
+          "direction": "column",
+          "wrap": false,
+        },
+        "type": "Stack",
+      },
+    },
+    "root": "root",
+  },
+  "spec": {
+    "elements": {
+      "reason": {
+        "children": [
+          "reasonLabel",
+          "reasonText",
+        ],
+        "props": {
+          "direction": "column",
+          "role": "reason",
+          "wrap": false,
+        },
+        "type": "Stack",
+      },
+      "reasonLabel": {
+        "props": {
+          "mono": false,
+          "text": {
+            "$msg": "actionCard.reason",
+          },
+          "tone": "muted",
+        },
+        "type": "Text",
+      },
+      "reasonText": {
+        "props": {
+          "mono": false,
+          "text": "Before I deploy.",
+          "tone": "default",
+        },
+        "type": "Text",
+      },
+      "root": {
+        "children": [
+          "reason",
+        ],
+        "props": {
+          "direction": "column",
+          "wrap": false,
+        },
+        "type": "Stack",
+      },
+    },
+    "root": "root",
+  },
+  "title": {
+    "$msg": "actionCard.question.title.one",
+    "count": 1,
+  },
+}
+`;
+
+exports[`each type, prepared and executed > question:ask prepared 1`] = `
+{
+  "catalog": "action-card.v1",
+  "icon": "message",
+  "spec": {
+    "elements": {
+      "actions": {
+        "children": [
+          "answer",
+        ],
+        "props": {
+          "direction": "row",
+          "role": "actions",
+          "wrap": true,
+        },
+        "type": "Stack",
+      },
+      "answer": {
+        "props": {
+          "action": {
+            "kind": "execute",
+          },
+          "emphasis": "primary",
+          "label": {
+            "$msg": "actionCard.question.answer.one",
+            "count": 1,
+          },
+        },
+        "type": "Button",
+      },
+      "properties": {
+        "children": [
+          "q_window",
+        ],
+        "props": {
+          "direction": "column",
+          "wrap": false,
+        },
+        "type": "Stack",
+      },
+      "q_window": {
+        "props": {
+          "label": {
+            "$msg": "actionCard.question.question",
+          },
+          "value": "Which window?",
+        },
+        "type": "Field",
+      },
+      "reason": {
+        "children": [
+          "reasonLabel",
+          "reasonText",
+        ],
+        "props": {
+          "direction": "column",
+          "role": "reason",
+          "wrap": false,
+        },
+        "type": "Stack",
+      },
+      "reasonLabel": {
+        "props": {
+          "mono": false,
+          "text": {
+            "$msg": "actionCard.reason",
+          },
+          "tone": "muted",
+        },
+        "type": "Text",
+      },
+      "reasonText": {
+        "props": {
+          "mono": false,
+          "text": "Before I deploy.",
+          "tone": "default",
+        },
+        "type": "Text",
+      },
+      "root": {
+        "children": [
+          "properties",
+          "reason",
+          "actions",
+        ],
+        "props": {
+          "direction": "column",
+          "wrap": false,
+        },
+        "type": "Stack",
+      },
+    },
+    "root": "root",
+  },
+  "title": {
+    "$msg": "actionCard.question.title.one",
+    "count": 1,
+  },
+}
+`;
+
+exports[`the legacy presentation fields are what they were: buildActionCardPresentation does not add a card > agent:create 1`] = `
+{
+  "confirmLabel": "Create Agent",
+  "displayItems": [
+    {
+      "key": "name",
+      "value": "scribe",
+    },
+    {
+      "key": "description",
+      "value": "Takes meeting notes.",
+    },
+    {
+      "key": "suggestedComputer",
+      "value": "4f5c1a8c-5b6e-4d0f-9a7b-9c1d2e3f4a5b",
+    },
+  ],
+  "genericApprovalAllowed": false,
+  "riskLevel": "normal",
+  "title": "Create Agent @scribe",
+}
+`;
+
+exports[`the legacy presentation fields are what they were: buildActionCardPresentation does not add a card > agent:create 2`] = `
+{
+  "confirmLabel": "Create Agent",
+  "displayItems": [
+    {
+      "key": "name",
+      "value": "scribe",
+    },
+    {
+      "key": "description",
+      "value": "Takes meeting notes.",
+    },
+    {
+      "key": "suggestedComputer",
+      "value": "4f5c1a8c-5b6e-4d0f-9a7b-9c1d2e3f4a5b",
+    },
+  ],
+  "genericApprovalAllowed": false,
+  "riskLevel": "normal",
+  "title": "Create Agent @scribe",
+}
+`;
+
+exports[`the legacy presentation fields are what they were: buildActionCardPresentation does not add a card > agent:migrate 1`] = `
+{
+  "confirmLabel": "Move Agent",
+  "displayItems": [
+    {
+      "key": "agentId",
+      "value": "2d3a9e6a-3f4c-4b8d-9e5f-7a9b0c1d2e3f",
+    },
+    {
+      "key": "suggestedComputer",
+      "value": "4f5c1a8c-5b6e-4d0f-9a7b-9c1d2e3f4a5b",
+    },
+  ],
+  "genericApprovalAllowed": false,
+  "riskLevel": "normal",
+  "title": "Move agent to another computer",
+}
+`;
+
+exports[`the legacy presentation fields are what they were: buildActionCardPresentation does not add a card > agent:migrate 2`] = `
+{
+  "confirmLabel": "Move Agent",
+  "displayItems": [
+    {
+      "key": "agentId",
+      "value": "2d3a9e6a-3f4c-4b8d-9e5f-7a9b0c1d2e3f",
+    },
+    {
+      "key": "suggestedComputer",
+      "value": "4f5c1a8c-5b6e-4d0f-9a7b-9c1d2e3f4a5b",
+    },
+  ],
+  "genericApprovalAllowed": false,
+  "riskLevel": "normal",
+  "title": "Move agent to another computer",
+}
+`;
+
+exports[`the legacy presentation fields are what they were: buildActionCardPresentation does not add a card > channel:add_member 1`] = `
+{
+  "confirmLabel": "Add Members",
+  "displayItems": [
+    {
+      "key": "channel",
+      "value": "3e4b0f7b-4a5d-4c9e-8f6a-8b0c1d2e3f4a",
+    },
+    {
+      "key": "humans",
+      "value": "0b1e7c4e-1d2a-4f6b-9c3d-5e7f8a9b0c1d",
+    },
+    {
+      "key": "agents",
+      "value": "2d3a9e6a-3f4c-4b8d-9e5f-7a9b0c1d2e3f",
+    },
+  ],
+  "genericApprovalAllowed": false,
+  "riskLevel": "normal",
+  "title": "Add channel members",
+}
+`;
+
+exports[`the legacy presentation fields are what they were: buildActionCardPresentation does not add a card > channel:add_member 2`] = `
+{
+  "confirmLabel": "Add Members",
+  "displayItems": [
+    {
+      "key": "channel",
+      "value": "3e4b0f7b-4a5d-4c9e-8f6a-8b0c1d2e3f4a",
+    },
+    {
+      "key": "humans",
+      "value": "0b1e7c4e-1d2a-4f6b-9c3d-5e7f8a9b0c1d",
+    },
+    {
+      "key": "agents",
+      "value": "2d3a9e6a-3f4c-4b8d-9e5f-7a9b0c1d2e3f",
+    },
+  ],
+  "genericApprovalAllowed": false,
+  "riskLevel": "normal",
+  "title": "Add channel members",
+}
+`;
+
+exports[`the legacy presentation fields are what they were: buildActionCardPresentation does not add a card > channel:create 1`] = `
+{
+  "confirmLabel": "Create Channel",
+  "displayItems": [
+    {
+      "key": "name",
+      "value": "launch-plan",
+    },
+    {
+      "key": "visibility",
+      "value": "private",
+    },
+    {
+      "key": "description",
+      "value": "Where we plan the October launch.",
+    },
+    {
+      "key": "initialHumans",
+      "value": "0b1e7c4e-1d2a-4f6b-9c3d-5e7f8a9b0c1d, 1c2f8d5f-2e3b-4a7c-8d4e-6f8a9b0c1d2e",
+    },
+    {
+      "key": "initialAgents",
+      "value": "2d3a9e6a-3f4c-4b8d-9e5f-7a9b0c1d2e3f",
+    },
+  ],
+  "genericApprovalAllowed": false,
+  "riskLevel": "normal",
+  "title": "Create channel #launch-plan",
+}
+`;
+
+exports[`the legacy presentation fields are what they were: buildActionCardPresentation does not add a card > channel:create 2`] = `
+{
+  "confirmLabel": "Create Channel",
+  "displayItems": [
+    {
+      "key": "name",
+      "value": "launch-plan",
+    },
+    {
+      "key": "visibility",
+      "value": "private",
+    },
+    {
+      "key": "description",
+      "value": "Where we plan the October launch.",
+    },
+    {
+      "key": "initialHumans",
+      "value": "0b1e7c4e-1d2a-4f6b-9c3d-5e7f8a9b0c1d, 1c2f8d5f-2e3b-4a7c-8d4e-6f8a9b0c1d2e",
+    },
+    {
+      "key": "initialAgents",
+      "value": "2d3a9e6a-3f4c-4b8d-9e5f-7a9b0c1d2e3f",
+    },
+  ],
+  "genericApprovalAllowed": false,
+  "riskLevel": "normal",
+  "title": "Create channel #launch-plan",
+}
+`;
+
+exports[`the legacy presentation fields are what they were: buildActionCardPresentation does not add a card > feedback:submit 1`] = `
+{
+  "confirmLabel": "Submit Feedback",
+  "displayItems": [
+    {
+      "key": "feedbackType",
+      "value": "problem",
+    },
+    {
+      "key": "message",
+      "value": "Search misses messages older than a week.
+Steps: search for 'launch'.",
+    },
+  ],
+  "genericApprovalAllowed": false,
+  "riskLevel": "normal",
+  "title": "Submit feedback",
+}
+`;
+
+exports[`the legacy presentation fields are what they were: buildActionCardPresentation does not add a card > feedback:submit 2`] = `
+{
+  "confirmLabel": "Submit Feedback",
+  "displayItems": [
+    {
+      "key": "feedbackType",
+      "value": "problem",
+    },
+    {
+      "key": "message",
+      "value": "Search misses messages older than a week.
+Steps: search for 'launch'.",
+    },
+  ],
+  "genericApprovalAllowed": false,
+  "riskLevel": "normal",
+  "title": "Submit feedback",
+}
+`;
+
+exports[`the legacy presentation fields are what they were: buildActionCardPresentation does not add a card > integration:approve_agent_login 1`] = `
+{
+  "confirmLabel": "Approve Login",
+  "displayItems": [
+    {
+      "key": "requestId",
+      "value": "7c8f4d1f-8e9b-4a3c-8d0e-2f4a5b6c7d8e",
+    },
+    {
+      "key": "agentId",
+      "value": "2d3a9e6a-3f4c-4b8d-9e5f-7a9b0c1d2e3f",
+    },
+    {
+      "key": "agentName",
+      "value": "scout",
+    },
+    {
+      "key": "clientId",
+      "value": "6b7e3c0e-7d8a-4f2b-9c9d-1e3f4a5b6c7d",
+    },
+    {
+      "key": "clientKey",
+      "value": "stamp",
+    },
+    {
+      "key": "clientName",
+      "value": "Stamp",
+    },
+    {
+      "key": "scopes",
+      "value": "identity:read, messages:read",
+    },
+  ],
+  "genericApprovalAllowed": true,
+  "riskLevel": "elevated",
+  "title": "Approve Stamp for @scout",
+}
+`;
+
+exports[`the legacy presentation fields are what they were: buildActionCardPresentation does not add a card > integration:approve_agent_login 2`] = `
+{
+  "confirmLabel": "Approve Login",
+  "displayItems": [
+    {
+      "key": "requestId",
+      "value": "7c8f4d1f-8e9b-4a3c-8d0e-2f4a5b6c7d8e",
+    },
+    {
+      "key": "agentId",
+      "value": "2d3a9e6a-3f4c-4b8d-9e5f-7a9b0c1d2e3f",
+    },
+    {
+      "key": "agentName",
+      "value": "scout",
+    },
+    {
+      "key": "clientId",
+      "value": "6b7e3c0e-7d8a-4f2b-9c9d-1e3f4a5b6c7d",
+    },
+    {
+      "key": "clientKey",
+      "value": "stamp",
+    },
+    {
+      "key": "clientName",
+      "value": "Stamp",
+    },
+    {
+      "key": "scopes",
+      "value": "identity:read, messages:read",
+    },
+  ],
+  "genericApprovalAllowed": true,
+  "riskLevel": "elevated",
+  "title": "Approve Stamp for @scout",
+}
+`;
+
+exports[`the legacy presentation fields are what they were: buildActionCardPresentation does not add a card > integration:connect_mcp 1`] = `
+{
+  "confirmLabel": "Authorize",
+  "displayItems": [
+    {
+      "key": "mcpServerId",
+      "value": "8d9a5e2a-9f0c-4b4d-9e1f-3a5b6c7d8e9f",
+    },
+    {
+      "key": "agentId",
+      "value": "2d3a9e6a-3f4c-4b8d-9e5f-7a9b0c1d2e3f",
+    },
+    {
+      "key": "reason",
+      "value": "login_required",
+    },
+    {
+      "key": "revision",
+      "value": "3",
+    },
+  ],
+  "genericApprovalAllowed": false,
+  "riskLevel": "elevated",
+  "title": "Authorize an MCP connection",
+  "warning": "An agent tried to use this MCP server and has no authorized connection. Choose a connection to grant, or authorize a new one.",
+}
+`;
+
+exports[`the legacy presentation fields are what they were: buildActionCardPresentation does not add a card > integration:connect_mcp 2`] = `
+{
+  "confirmLabel": "Authorize",
+  "displayItems": [
+    {
+      "key": "mcpServerId",
+      "value": "8d9a5e2a-9f0c-4b4d-9e1f-3a5b6c7d8e9f",
+    },
+    {
+      "key": "agentId",
+      "value": "2d3a9e6a-3f4c-4b8d-9e5f-7a9b0c1d2e3f",
+    },
+    {
+      "key": "reason",
+      "value": "login_required",
+    },
+    {
+      "key": "revision",
+      "value": "3",
+    },
+  ],
+  "genericApprovalAllowed": false,
+  "riskLevel": "elevated",
+  "title": "Authorize an MCP connection",
+  "warning": "An agent tried to use this MCP server and has no authorized connection. Choose a connection to grant, or authorize a new one.",
+}
+`;
+
+exports[`the legacy presentation fields are what they were: buildActionCardPresentation does not add a card > integration:install_marketplace_app 1`] = `
+{
+  "confirmLabel": "Install App",
+  "displayItems": [
+    {
+      "key": "clientId",
+      "value": "6b7e3c0e-7d8a-4f2b-9c9d-1e3f4a5b6c7d",
+    },
+    {
+      "key": "clientKey",
+      "value": "vault",
+    },
+    {
+      "key": "clientName",
+      "value": "Vault",
+    },
+    {
+      "key": "agentId",
+      "value": "2d3a9e6a-3f4c-4b8d-9e5f-7a9b0c1d2e3f",
+    },
+    {
+      "key": "agentName",
+      "value": "scout",
+    },
+    {
+      "key": "scopes",
+      "value": "identity:read",
+    },
+    {
+      "key": "installScopes",
+      "value": "identity:read, messages:read",
+    },
+    {
+      "key": "installGroups",
+      "value": "channel",
+    },
+    {
+      "key": "setupUrl",
+      "value": "https://vault.example/setup",
+    },
+    {
+      "key": "setupDescription",
+      "value": "Pick the vault to share.",
+    },
+    {
+      "key": "setupRevision",
+      "value": "2",
+    },
+  ],
+  "genericApprovalAllowed": true,
+  "riskLevel": "elevated",
+  "title": "Install Vault on this Server",
+  "warning": "This installs the Marketplace app for this Server so @scout can request the listed scopes.",
+}
+`;
+
+exports[`the legacy presentation fields are what they were: buildActionCardPresentation does not add a card > integration:install_marketplace_app 2`] = `
+{
+  "confirmLabel": "Install App",
+  "displayItems": [
+    {
+      "key": "clientId",
+      "value": "6b7e3c0e-7d8a-4f2b-9c9d-1e3f4a5b6c7d",
+    },
+    {
+      "key": "clientKey",
+      "value": "vault",
+    },
+    {
+      "key": "clientName",
+      "value": "Vault",
+    },
+    {
+      "key": "agentId",
+      "value": "2d3a9e6a-3f4c-4b8d-9e5f-7a9b0c1d2e3f",
+    },
+    {
+      "key": "agentName",
+      "value": "scout",
+    },
+    {
+      "key": "scopes",
+      "value": "identity:read",
+    },
+    {
+      "key": "installScopes",
+      "value": "identity:read, messages:read",
+    },
+    {
+      "key": "installGroups",
+      "value": "channel",
+    },
+    {
+      "key": "setupUrl",
+      "value": "https://vault.example/setup",
+    },
+    {
+      "key": "setupDescription",
+      "value": "Pick the vault to share.",
+    },
+    {
+      "key": "setupRevision",
+      "value": "2",
+    },
+  ],
+  "genericApprovalAllowed": true,
+  "riskLevel": "elevated",
+  "title": "Install Vault on this Server",
+  "warning": "This installs the Marketplace app for this Server so @scout can request the listed scopes.",
+}
+`;
+
+exports[`the legacy presentation fields are what they were: buildActionCardPresentation does not add a card > integration:recover_app_owner 1`] = `
+{
+  "confirmLabel": "Recover Owner",
+  "displayItems": [
+    {
+      "key": "clientKey",
+      "value": "reminder",
+    },
+    {
+      "key": "targetAgent",
+      "value": "2d3a9e6a-3f4c-4b8d-9e5f-7a9b0c1d2e3f",
+    },
+  ],
+  "genericApprovalAllowed": true,
+  "riskLevel": "elevated",
+  "title": "Recover Connected App owner",
+  "warning": "This changes the owner of a server-local Connected App.",
+}
+`;
+
+exports[`the legacy presentation fields are what they were: buildActionCardPresentation does not add a card > integration:recover_app_owner 2`] = `
+{
+  "confirmLabel": "Recover Owner",
+  "displayItems": [
+    {
+      "key": "clientKey",
+      "value": "reminder",
+    },
+    {
+      "key": "targetAgent",
+      "value": "2d3a9e6a-3f4c-4b8d-9e5f-7a9b0c1d2e3f",
+    },
+  ],
+  "genericApprovalAllowed": true,
+  "riskLevel": "elevated",
+  "title": "Recover Connected App owner",
+  "warning": "This changes the owner of a server-local Connected App.",
+}
+`;
+
+exports[`the legacy presentation fields are what they were: buildActionCardPresentation does not add a card > integration:register_app 1`] = `
+{
+  "confirmLabel": "Register App",
+  "displayItems": [
+    {
+      "key": "name",
+      "value": "Reminder",
+    },
+    {
+      "key": "clientKey",
+      "value": "reminder",
+    },
+    {
+      "key": "returnUrl",
+      "value": "https://reminder.example/callback",
+    },
+    {
+      "key": "homepageUrl",
+      "value": "https://reminder.example",
+    },
+    {
+      "key": "scopes",
+      "value": "identity:read",
+    },
+    {
+      "key": "unsafeDemoUrlOverride",
+      "value": "true",
+    },
+  ],
+  "genericApprovalAllowed": true,
+  "riskLevel": "elevated",
+  "title": "Register Connected App Reminder",
+  "warning": "The requesting agent becomes the initial app owner. No client secret is stored in this card.",
+}
+`;
+
+exports[`the legacy presentation fields are what they were: buildActionCardPresentation does not add a card > integration:register_app 2`] = `
+{
+  "confirmLabel": "Register App",
+  "displayItems": [
+    {
+      "key": "name",
+      "value": "Reminder",
+    },
+    {
+      "key": "clientKey",
+      "value": "reminder",
+    },
+    {
+      "key": "returnUrl",
+      "value": "https://reminder.example/callback",
+    },
+    {
+      "key": "homepageUrl",
+      "value": "https://reminder.example",
+    },
+    {
+      "key": "scopes",
+      "value": "identity:read",
+    },
+    {
+      "key": "unsafeDemoUrlOverride",
+      "value": "true",
+    },
+  ],
+  "genericApprovalAllowed": true,
+  "riskLevel": "elevated",
+  "title": "Register Connected App Reminder",
+  "warning": "The requesting agent becomes the initial app owner. No client secret is stored in this card.",
+}
+`;
+
+exports[`the legacy presentation fields are what they were: buildActionCardPresentation does not add a card > integration:update_app_registration 1`] = `
+{
+  "confirmLabel": "Unavailable",
+  "displayItems": [
+    {
+      "key": "clientKey",
+      "value": "reminder",
+    },
+    {
+      "key": "name",
+      "value": "Reminder 2",
+    },
+    {
+      "key": "returnUrl",
+      "value": "https://reminder.example/cb2",
+    },
+    {
+      "key": "scopes",
+      "value": "identity:read",
+    },
+  ],
+  "genericApprovalAllowed": false,
+  "riskLevel": "normal",
+  "title": "Connected App update unavailable",
+  "warning": "Use the current Connected Apps management command instead.",
+}
+`;
+
+exports[`the legacy presentation fields are what they were: buildActionCardPresentation does not add a card > plan:upgrade 1`] = `
+{
+  "confirmLabel": "Upgrade to Pro",
+  "displayItems": [
+    {
+      "key": "reason",
+      "value": "You need the March messages for the audit.",
+    },
+    {
+      "key": "gate",
+      "value": "history_30d",
+    },
+  ],
+  "genericApprovalAllowed": false,
+  "riskLevel": "normal",
+  "title": "Upgrade to Pro",
+}
+`;
+
+exports[`the legacy presentation fields are what they were: buildActionCardPresentation does not add a card > question:ask 1`] = `
+{
+  "confirmLabel": "Answer Question",
+  "displayItems": [
+    {
+      "key": "For",
+      "value": "@alice",
+    },
+    {
+      "key": "Question",
+      "value": "Which window?",
+    },
+  ],
+  "genericApprovalAllowed": false,
+  "riskLevel": "normal",
+  "title": "Answer Question",
+}
+`;
+
+exports[`the legacy presentation fields are what they were: buildActionCardPresentation does not add a card > question:ask 2`] = `
+{
+  "confirmLabel": "Answer Question",
+  "displayItems": [
+    {
+      "key": "For",
+      "value": "@alice",
+    },
+    {
+      "key": "Question",
+      "value": "Which window?",
+    },
+  ],
+  "genericApprovalAllowed": false,
+  "riskLevel": "normal",
+  "title": "Answer Question",
+}
+`;

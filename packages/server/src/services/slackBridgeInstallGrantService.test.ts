@@ -159,7 +159,7 @@ function provider(
   return {
     readInstallGrant: read,
     async readWorkspace() {
-      return { kind: "unverified" };
+      return { oauth: "unverified", directory: { kind: "unverified" } };
     },
     async readConversationAudience() {
       return { kind: "unverified" };

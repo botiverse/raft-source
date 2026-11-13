@@ -1,6 +1,7 @@
+import { MAX_PROFILE_AVATAR_BYTES } from "@botiverse/raft-shared";
 import type { MessageId } from "../i18n/messages/en";
 
-export const MAX_PROFILE_AVATAR_BYTES = 5 * 1024 * 1024;
+export { MAX_PROFILE_AVATAR_BYTES };
 /** Catalog id for the localized "5 MB" max-size label used in avatar.tooLarge. */
 export const PROFILE_AVATAR_MAX_SIZE_LABEL_ID = "common.fileSize.maxLabel5mb" satisfies MessageId;
 /**

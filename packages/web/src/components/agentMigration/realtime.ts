@@ -6,7 +6,9 @@ import {
 import type {
   AgentMigrationHostedImportSummary,
   AgentMigrationSourceBuildProgress,
+  AgentMigrationSourceDrain,
   AgentMigrationTargetKind,
+  AgentMigrationTransferProgress,
 } from "@botiverse/raft-shared";
 import { isActiveMigrationState } from "./state";
 import type { AgentMigrationState } from "./state";
@@ -36,7 +38,15 @@ export interface AgentMigrationNotice {
   // Source finished packing and registered the bundle; upload follows.
   transportControlRegisteredAt?: string | null;
   sourceQuiescedAt?: string | null;
+  // REST only: until when the source waits for the agent to finish its current
+  // work before it stops it (null once quiesced, or when it stops at once).
+  sourceDrainUntil?: string | null;
+  // REST only: what the draining source waits for, and until when (within
+  // sourceDrainUntil). Null once quiesced or packing, or when it never reported.
+  sourceDrain?: AgentMigrationSourceDrain | null;
   sourceBuildProgress?: AgentMigrationSourceBuildProgress | null;
+  // REST only: what the target has downloaded while the state is ready/in_transit.
+  transferProgress?: AgentMigrationTransferProgress | null;
   readyAt?: string | null;
   flippedAt?: string | null;
   arrivedAt?: string | null;
@@ -57,8 +67,32 @@ export interface AgentMigrationNotice {
   cancelTargetOutcome?: "cleaned" | "stopped" | "needs_attention" | null;
   createdAt?: string;
   updatedAt?: string;
+  // REST only: who started it, while they are still a member of this server.
+  initiatedBy?: { id: string; name: string; displayName: string | null } | null;
   // REST only, and only for a move to the cloud: the review the user confirms.
   hosted?: AgentMigrationHostedReview | null;
+  // REST only: the agent's own retry of a migration that failed for size
+  // (`raft migration retry`, run on behalf of its starter). Null or absent for
+  // a migration a person started (and from servers before the retry).
+  retryOfMigrationId?: string | null;
+  triggeredByAgentId?: string | null;
+  retryComparison?: AgentMigrationRetryComparison | null;
+}
+
+/**
+ * For a retry: what the failed attempt measured (its entry count, or for a
+ * too-large bundle the bytes packed before it stopped, a lower bound) next to
+ * what this attempt packs (`final` once the bundle is registered). Mirrors the
+ * server's agentMigrationRetryComparison.
+ */
+export interface AgentMigrationRetryComparison {
+  previousFailure: {
+    code: string;
+    entries: number | null;
+    bytes: number | null;
+    bytesIsLowerBound: boolean;
+  } | null;
+  packed: { files: number; bytes: number; final: boolean } | null;
 }
 
 export interface AgentMigrationHostedReview {

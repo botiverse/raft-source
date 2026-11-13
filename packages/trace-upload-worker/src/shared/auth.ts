@@ -1,6 +1,6 @@
 // Server-signed scope attestations and the short-lived upload/complete tokens.
 import type { TraceUploadWorkerEnv } from "../env";
-import { HttpError, type JsonObject } from "./http";
+import { HttpError, isJsonObject, type JsonObject } from "./http";
 
 export const SESSION_TTL_SECONDS = 10 * 60;
 
@@ -36,6 +36,11 @@ export async function verifyToken<T extends { exp?: number }>(token: string, sec
   try {
     claims = JSON.parse(new TextDecoder().decode(base64UrlDecode(payload))) as T;
   } catch {
+    throw new HttpError(401, "Invalid token payload");
+  }
+  // No token issued today carries a `purpose`; one that does (a retired
+  // feedback report read token) is refused on every route.
+  if (!isJsonObject(claims) || (claims as JsonObject).purpose !== undefined) {
     throw new HttpError(401, "Invalid token payload");
   }
   if (typeof claims.exp === "number" && Date.now() / 1000 > claims.exp) {

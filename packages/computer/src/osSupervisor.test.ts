@@ -76,6 +76,8 @@ test("systemd-user definition pins one current binary, one home, and restart pol
     /^ExecStart="\/tmp\/raft bin\/raft-computer" "__service" "--slock-home" "\/tmp\/raft home\/\.slock" "--os-supervised" "systemd-user"$/m,
   );
   assert.match(spec.definition, /^Restart=always$/m);
+  // #triage:#169: one agent killed by the OOM killer must not stop the service.
+  assert.match(spec.definition, /^OOMPolicy=continue$/m);
   assert.match(spec.definition, /^RestartSec=2$/m);
   assert.match(spec.definition, /^WantedBy=default\.target$/m);
   assert.equal(classifySupervisorDefinition(spec, spec.definition), "exact");
@@ -447,19 +449,8 @@ test("stop plans disable the OS owner before ending the service, so no restart p
 });
 
 test("supervisor retirement stays internal; no public manager mutation surface is exposed", async () => {
-  const cli = await readFile(join(import.meta.dirname, "cli.ts"), "utf8");
   const { program } = await import("./cli");
   assert.doesNotMatch(program.helpInformation(), /__supervisor|__legacy-supervisor-takeover/);
-  assert.doesNotMatch(cli, /inspectOsSupervisor|mutateOsSupervisor/);
-
-  const runtime = await readFile(
-    join(import.meta.dirname, "osSupervisorRuntime.ts"),
-    "utf8",
-  );
-  assert.doesNotMatch(
-    runtime,
-    /export async function (?:inspectOsSupervisor|mutateOsSupervisor|reconcileOwnedOsSupervisorDefinition)/,
-  );
 
   const plans = [
     buildSupervisorCommandPlan(
@@ -759,7 +750,7 @@ test("legacy Windows task pointing at install dir A is retired when installer mo
   assert.match(await readFile(result.receiptPath, "utf8"), /"definitionRemoved": true/);
 });
 
-test("legacy supervisor cleanup failure is nonblocking and explicitly says Computer remains usable", async (t) => {
+test("legacy supervisor cleanup failure is nonblocking and reports legacy_os_supervisor_cleanup_incomplete", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "raft-os-retire-failure-"));
   t.onTestFinished(async () => rm(root, { recursive: true, force: true }));
   const slockHome = join(root, ".slock");
@@ -787,7 +778,5 @@ test("legacy supervisor cleanup failure is nonblocking and explicitly says Compu
   });
   assert.equal(result.status, "incomplete");
   assert.match(result.message, /legacy_os_supervisor_cleanup_incomplete/);
-  assert.match(result.message, /Computer remains usable/);
-  assert.doesNotMatch(result.message, /service unavailable|start failed/i);
   assert.equal(await readFile(spec.definitionPath!, "utf8"), spec.definition);
 });

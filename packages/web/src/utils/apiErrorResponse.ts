@@ -1,5 +1,6 @@
 export interface ApiErrorResponse {
   status?: number;
+  code?: string;
   error?: string;
 }
 
@@ -16,5 +17,8 @@ export function getApiErrorResponse(error: unknown): ApiErrorResponse | undefine
     ? data.error
     : undefined;
 
-  return { status, error: message };
+  const code = data && typeof data === "object" && "code" in data && typeof data.code === "string"
+    ? data.code
+    : undefined;
+  return { status, error: message, ...(code ? { code } : {}) };
 }

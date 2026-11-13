@@ -7,7 +7,7 @@ import { afterEach, test } from "vitest";
 import type { AgentMigrationControlManifest } from "@botiverse/raft-shared";
 import { __setAgentRuntimeProviderTransportForTests } from "./agentRuntimeProviderService";
 import { resumableChunkStorageKey } from "./agentMigrationService";
-import { HostedImportBuildError, buildHostedImportFileSet } from "./hostedAgentMigrationImporter";
+import { HostedImportBuildError, buildHostedImportFileSet, hostedMigrationFileSetKey, hostedMigrationFileSetStorage } from "./hostedAgentMigrationImporter";
 import type { HostedImportClaim } from "./hostedAgentMigrationService";
 import type { StorageBackend } from "./storageService";
 
@@ -138,4 +138,14 @@ test("a refused MEMORY.md fails the build even when it is the only file", async 
     buildHostedImportFileSet({ claim, storage, config }),
     (error: unknown) => error instanceof HostedImportBuildError && error.code === "HOSTED_IMPORT_MEMORY_UNIMPORTABLE",
   );
+});
+
+test("file set: a new one is keyed under agent-migrations/v2 in the dedicated bucket; an older key is read from the main storage", () => {
+  const dedicated = { put: async () => {}, get: async () => Readable.from([]), delete: async () => {} } as unknown as StorageBackend;
+  const main = { put: async () => {}, get: async () => Readable.from([]), delete: async () => {} } as unknown as StorageBackend;
+  assert.equal(hostedMigrationFileSetKey("m1", true), "agent-migrations/v2/hosted/m1/file-set.json");
+  assert.equal(hostedMigrationFileSetKey("m1", false), "agent-migrations/hosted/m1/file-set.json");
+  assert.equal(hostedMigrationFileSetStorage(hostedMigrationFileSetKey("m1", true), { dedicated, main }), dedicated);
+  // Written before the move (or where there is no dedicated bucket): the main storage.
+  assert.equal(hostedMigrationFileSetStorage(hostedMigrationFileSetKey("m1", false), { dedicated, main }), main);
 });

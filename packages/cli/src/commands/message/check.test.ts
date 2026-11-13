@@ -8,8 +8,12 @@ import type { AgentContext } from "../../auth/env";
 import { createCommandContext } from "../../core/context";
 import { CliError } from "../../core/errors";
 import type { CliIo } from "../../core/io";
-import { messageCheckCommand } from "./check";
+import { inboxReplacesMessageCheck, MESSAGE_CHECK_INBOX_PROBE_TIMEOUT_MS, messageCheckCommand } from "./check";
 import { getConsumedExactSeqs, getConsumedSeq } from "./_consumedSeqState";
+
+/** The `message check` probe for inbox items (RFC 081 D10): a server with the flag off answers no `rows`. */
+const INBOX_LIST_EMPTY = { view: "unread", items: [], hasMore: false, nextBeforeSeq: null, totals: { conversations: 0, dms: 0, mentions: 0 } };
+const INBOX_ITEMS_OFF: ApiResponse<unknown> = { ok: true, status: 200, error: null, data: INBOX_LIST_EMPTY };
 
 function memoryIo(): { io: CliIo; stdout: string[]; stderr: string[] } {
   const stdout: string[] = [];
@@ -56,6 +60,7 @@ test("message check command drains inbox through injected ApiClient and writes c
     loadAgentContext: () => agentContext,
     createApiClient: () => ({
       request: async (method: string, path: string, body?: unknown): Promise<ApiResponse<unknown>> => {
+        if (path.startsWith("/internal/agent-api/inbox/conversations")) return INBOX_ITEMS_OFF;
         requests.push({ method, path, body });
         if (path === "/internal/agent-api/events?since=latest&ack=cursor") {
           return {
@@ -106,6 +111,87 @@ test("message check command drains inbox through injected ApiClient and writes c
   );
 });
 
+test("message check is gone where the server lists inbox items: it points to the inbox and drains nothing (RFC 081 D10)", async () => {
+  const { io, stdout, stderr } = memoryIo();
+  const requests: string[] = [];
+  const ctx = createCommandContext({
+    io,
+    loadAgentContext: () => agentContext,
+    createApiClient: () => ({
+      request: async (_method: string, requestPath: string): Promise<ApiResponse<unknown>> => {
+        requests.push(requestPath);
+        return { ok: true, status: 200, error: null, data: { ...INBOX_LIST_EMPTY, rows: [], preLaunch: null } };
+      },
+    }) as any,
+  });
+
+  await assert.rejects(async () => messageCheckCommand.handler(ctx), (error: unknown) => {
+    assert.equal((error as { code?: string }).code, "MESSAGE_CHECK_REMOVED");
+    assert.match(String((error as { suggestedNextAction?: string }).suggestedNextAction), /raft inbox check .*raft inbox read --target <item>/);
+    return true;
+  });
+  assert.deepEqual(requests, ["/internal/agent-api/inbox/conversations?items=true"], "nothing is drained");
+  assert.deepEqual(stdout, []);
+  assert.deepEqual(stderr, []);
+});
+
+test("message check keeps draining for a personal assistant, whose inbox lists app rows only (appRowsOnly)", async () => {
+  process.env.SLOCK_CLI_CONSUMED_SEQ_STATE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "slock-cli-check-assistant-"));
+  const { io } = memoryIo();
+  const requests: string[] = [];
+  const ctx = createCommandContext({
+    io,
+    loadAgentContext: () => agentContext,
+    createApiClient: () => ({
+      request: async (_method: string, requestPath: string): Promise<ApiResponse<unknown>> => {
+        requests.push(requestPath);
+        if (requestPath.startsWith("/internal/agent-api/inbox/conversations")) {
+          return { ok: true, status: 200, error: null, data: { ...INBOX_LIST_EMPTY, rows: [], preLaunch: null, appRowsOnly: true } };
+        }
+        if (requestPath.startsWith("/internal/agent-api/events")) return { ok: true, status: 200, error: null, data: agentEvents([]) };
+        return { ok: true, status: 200, error: null, data: { ok: true } };
+      },
+    }) as any,
+  });
+
+  await messageCheckCommand.handler(ctx);
+  assert.ok(requests.some((p) => p.startsWith("/internal/agent-api/events")), "the owner DM still drains through /events");
+});
+
+test("message check reads as before whenever the inbox probe isn't a positive answer: 400, 403, 404, 500, 503 INBOX_UNAVAILABLE", async () => {
+  for (const status of [400, 403, 404, 500, 503]) {
+    process.env.SLOCK_CLI_CONSUMED_SEQ_STATE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "slock-cli-check-probe-"));
+    const { io } = memoryIo();
+    const requests: string[] = [];
+    const ctx = createCommandContext({
+      io,
+      loadAgentContext: () => agentContext,
+      createApiClient: () => ({
+        request: async (_method: string, requestPath: string): Promise<ApiResponse<unknown>> => {
+          requests.push(requestPath);
+          if (requestPath.startsWith("/internal/agent-api/inbox/conversations")) {
+            return { ok: false, status, error: "Inbox is temporarily unavailable", errorCode: status === 503 ? "INBOX_UNAVAILABLE" : undefined, data: null } as ApiResponse<unknown>;
+          }
+          if (requestPath.startsWith("/internal/agent-api/events")) return { ok: true, status: 200, error: null, data: agentEvents([]) };
+          return { ok: true, status: 200, error: null, data: { ok: true } };
+        },
+      }) as any,
+    });
+    await messageCheckCommand.handler(ctx);
+    assert.ok(requests.some((p) => p.startsWith("/internal/agent-api/events")), `status ${status} still drains`);
+  }
+});
+
+test("a probe with no answer within the timeout reads as before; a thrown request does too", async () => {
+  const never = { request: () => new Promise<ApiResponse<unknown>>(() => {}) };
+  const started = Date.now();
+  assert.equal(await inboxReplacesMessageCheck(never as any, 30), false);
+  assert.ok(Date.now() - started < 1_000, "the timeout ends the probe");
+  const throws = { request: async () => { throw new Error("socket hang up"); } };
+  assert.equal(await inboxReplacesMessageCheck(throws as any, 30), false);
+  assert.ok(MESSAGE_CHECK_INBOX_PROBE_TIMEOUT_MS >= 1_000, "long enough for the proxy's one retry (400 ms) to finish");
+});
+
 test("message check command prints the server's inbox hint after the messages", async () => {
   process.env.SLOCK_CLI_CONSUMED_SEQ_STATE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "slock-cli-check-inbox-hint-"));
   const { io, stdout } = memoryIo();
@@ -113,7 +199,7 @@ test("message check command prints the server's inbox hint after the messages", 
     io,
     loadAgentContext: () => agentContext,
     createApiClient: () => ({
-      request: async (): Promise<ApiResponse<unknown>> => ({
+      request: async (_method: string, requestPath: string): Promise<ApiResponse<unknown>> => requestPath.startsWith("/internal/agent-api/inbox/conversations") ? INBOX_ITEMS_OFF : ({
         ok: true,
         status: 200,
         error: null,
@@ -148,7 +234,8 @@ test("message check command renders an actionable hint when more messages may re
     createApiClient: () => {
       let calls = 0;
       return {
-        request: async (): Promise<ApiResponse<unknown>> => {
+        request: async (_method: string, requestPath: string): Promise<ApiResponse<unknown>> => {
+          if (requestPath.startsWith("/internal/agent-api/inbox/conversations")) return INBOX_ITEMS_OFF;
           calls += 1;
           if (calls === 1) {
             return {
@@ -188,7 +275,7 @@ test("message check command renders a final-drain hint when one explicit batch i
       token: "sk_agent_test",
     }),
     createApiClient: () => ({
-      request: async (): Promise<ApiResponse<unknown>> => ({
+      request: async (_method: string, requestPath: string): Promise<ApiResponse<unknown>> => requestPath.startsWith("/internal/agent-api/inbox/conversations") ? INBOX_ITEMS_OFF : ({
         ok: true,
         status: 200,
         error: null,
@@ -219,7 +306,8 @@ test("message check command renders a final-drain hint when has_more batches wer
     createApiClient: () => {
       let calls = 0;
       return {
-        request: async (): Promise<ApiResponse<unknown>> => {
+        request: async (_method: string, requestPath: string): Promise<ApiResponse<unknown>> => {
+          if (requestPath.startsWith("/internal/agent-api/inbox/conversations")) return INBOX_ITEMS_OFF;
           calls += 1;
           return {
             ok: true,
@@ -255,6 +343,7 @@ test("message check command exposes pending App Inbox work after an empty manage
     }),
     createApiClient: () => ({
       request: async (method: string, requestPath: string, body?: unknown): Promise<ApiResponse<unknown>> => {
+        if (requestPath.startsWith("/internal/agent-api/inbox/conversations")) return INBOX_ITEMS_OFF;
         requests.push({ method, path: requestPath, body });
         if (requestPath === "/internal/agent-api/events?since=latest") {
           return {
@@ -316,6 +405,7 @@ test("message check command leaves an empty managed drain unchanged when App Inb
     }),
     createApiClient: () => ({
       request: async (_method: string, requestPath: string): Promise<ApiResponse<unknown>> => {
+        if (requestPath.startsWith("/internal/agent-api/inbox/conversations")) return INBOX_ITEMS_OFF;
         requests.push(requestPath);
         if (requestPath === "/internal/agent-api/events?since=latest") {
           return { ok: true, status: 200, error: null, data: agentEvents([]) };
@@ -350,6 +440,7 @@ test("message check command does not query App Inbox when a managed drain return
     }),
     createApiClient: () => ({
       request: async (_method: string, requestPath: string): Promise<ApiResponse<unknown>> => {
+        if (requestPath.startsWith("/internal/agent-api/inbox/conversations")) return INBOX_ITEMS_OFF;
         requests.push(requestPath);
         return {
           ok: true,
@@ -374,7 +465,7 @@ test("message check command maps events failures into typed CliError", async () 
     io,
     loadAgentContext: () => agentContext,
     createApiClient: () => ({
-      request: async (): Promise<ApiResponse<unknown>> => ({
+      request: async (_method: string, requestPath: string): Promise<ApiResponse<unknown>> => requestPath.startsWith("/internal/agent-api/inbox/conversations") ? INBOX_ITEMS_OFF : ({
         ok: false,
         status: 409,
         data: null,
@@ -400,7 +491,7 @@ test("message check command fails loud when the inbox events surface returns 5xx
     io,
     loadAgentContext: () => agentContext,
     createApiClient: () => ({
-      request: async (): Promise<ApiResponse<unknown>> => ({
+      request: async (_method: string, requestPath: string): Promise<ApiResponse<unknown>> => requestPath.startsWith("/internal/agent-api/inbox/conversations") ? INBOX_ITEMS_OFF : ({
         ok: false,
         status: 503,
         data: null,
@@ -429,6 +520,7 @@ test("message check command says app items are unavailable after an empty extern
     loadAgentContext: () => agentContext,
     createApiClient: () => ({
       request: async (_method: string, requestPath: string): Promise<ApiResponse<unknown>> => {
+        if (requestPath.startsWith("/internal/agent-api/inbox/conversations")) return INBOX_ITEMS_OFF;
         requests.push(requestPath);
         if (requestPath === "/internal/agent-api/events?since=latest&ack=cursor") {
           return { ok: true, status: 200, error: null, data: agentEvents([]) };
@@ -473,6 +565,7 @@ function managedClient(
 ) {
   return {
     request: async (method: string, path: string, body?: unknown, options?: { headers?: Record<string, string> }): Promise<ApiResponse<unknown>> => {
+      if (path.startsWith("/internal/agent-api/inbox/conversations")) return INBOX_ITEMS_OFF;
       requests.push({ method, path, body, headers: options?.headers });
       if (path === "/internal/agent-api/events?since=latest") {
         return { ok: true, status: 200, error: null, data: leasedThirdPartyEvents() };

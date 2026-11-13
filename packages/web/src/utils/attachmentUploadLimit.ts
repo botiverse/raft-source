@@ -1,5 +1,9 @@
 import api from "../api/client";
 import { registerServerReset } from "../store/serverResetRegistry";
+import { useServerStore } from "../store/serverStore";
+import { noteMonthlyUploadQuota } from "../store/monthlyUploadQuotaStore";
+import { readMonthlyUploadQuota } from "./monthlyUploadQuota";
+import type { MonthlyUploadQuota } from "./monthlyUploadQuota";
 
 /**
  * The single-file upload ceiling is server-owned.
@@ -26,9 +30,21 @@ import { registerServerReset } from "../store/serverResetRegistry";
  * fallback that is quietly wider than the real rule.
  */
 
-/** The one field the composer needs; the capability body carries more. */
+/** The fields the composer needs; the capability body carries more. */
 interface UploadCapabilityResponse {
   maxBytes: number;
+  /** Absent from older servers, null on Pro. */
+  monthlyUpload?: unknown;
+}
+
+/**
+ * What a selection is checked against: the single-file ceiling, and what is
+ * left of a Free server's monthly quota (null where none applies, or the
+ * server didn't say: the upload then finds out, as it did before).
+ */
+export interface AttachmentUploadLimits {
+  maxBytes: number;
+  monthlyUpload: MonthlyUploadQuota | null;
 }
 
 export interface AttachmentUploadLimitSource {
@@ -52,7 +68,7 @@ export interface AttachmentUploadLimitSource {
  * user-initiated action that already awaits this value before attaching, so the
  * cost is one small request at the moment it is about to matter.
  */
-let inFlight: Promise<number | null> | null = null;
+let inFlight: Promise<AttachmentUploadLimits | null> | null = null;
 
 // One selection can ask more than once (multi-file, rapid re-pick); those share
 // a single request. The window is milliseconds, so this coalesces requests
@@ -62,26 +78,30 @@ registerServerReset(() => {
 });
 
 /**
- * Resolve the server's effective single-file ceiling in bytes, or `null` when
- * it cannot be established. `null` means "do not allow the upload" — never
- * "substitute a local guess".
+ * Resolve the server's effective single-file ceiling in bytes and its monthly
+ * quota, or `null` when the ceiling cannot be established. `null` means "do
+ * not allow the upload" — never "substitute a local guess".
  */
-export async function resolveAttachmentUploadLimitBytes(
+export async function resolveAttachmentUploadLimits(
   source: AttachmentUploadLimitSource = api,
-): Promise<number | null> {
-  inFlight ??= fetchLimitBytes(source).finally(() => {
+): Promise<AttachmentUploadLimits | null> {
+  inFlight ??= fetchLimits(source).finally(() => {
     inFlight = null;
   });
   return inFlight;
 }
 
-async function fetchLimitBytes(source: AttachmentUploadLimitSource): Promise<number | null> {
+async function fetchLimits(source: AttachmentUploadLimitSource): Promise<AttachmentUploadLimits | null> {
+  const serverId = useServerStore.getState().current?.id;
   try {
     const { data } = await source.get<UploadCapabilityResponse>("/attachments/upload-capabilities");
     // A non-positive or non-finite ceiling is not a usable rule; treat it as
     // unknown rather than letting it read as "everything is too large".
     if (!Number.isFinite(data?.maxBytes) || data.maxBytes <= 0) return null;
-    return data.maxBytes;
+    const monthlyUpload = readMonthlyUploadQuota(data.monthlyUpload);
+    // The upload entries' answer to "is this month used up?" (monthlyUploadQuotaStore).
+    if (serverId) noteMonthlyUploadQuota(serverId, monthlyUpload);
+    return { maxBytes: data.maxBytes, monthlyUpload };
   } catch {
     return null;
   }

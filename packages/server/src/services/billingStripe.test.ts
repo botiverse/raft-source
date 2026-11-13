@@ -3,7 +3,7 @@ import { closeTestDatabase, openTestDatabase } from "../test/integration/databas
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import type Stripe from "stripe";
-import { eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import {
   PRO_AGENT_SEAT_BLOCK_SIZE,
   calculateAgentSeatBlockQuantity,
@@ -13,7 +13,9 @@ import {
   type TraceEvent,
 } from "@botiverse/raft-shared";
 import { getDb } from "../db/index";
-import { subscriptions, servers, users, webhookEvents } from "../db/schema";
+import { subscriptions, servers, serverMembers, users, webhookEvents } from "../db/schema";
+import { requestAccountDeletion } from "./accountDeletion/requests";
+import { __setEmailDeliveryObserverForTests } from "./emailService";
 import { runWithTraceSpan } from "../tracing/semanticTrace";
 import { createServer } from "./serverService";
 import { createAgent } from "./agentService";
@@ -23,6 +25,8 @@ import {
   __setBillingPreviewClockForTests,
   __setStripeForTests,
   cancelSubscriptionAtPeriodEnd,
+  cancelSubscriptionForAccountDeletion,
+  resumeSubscriptionAfterCancelledDeletion,
   createCheckoutSession,
   getBillingSummary,
   handleWebhookEvent,
@@ -145,6 +149,7 @@ function stripeSub(input: {
   trialEnd?: number | null;
   billingInterval?: "monthly" | "annual";
   cancelAtPeriodEnd?: boolean;
+  canceledAt?: number | null;
   cancelAt?: number | null;
   billingTraceId?: string;
   discounts?: Array<string | Stripe.Discount>;
@@ -158,6 +163,7 @@ function stripeSub(input: {
     customer: input.customer ?? "cus_test",
     status: input.status,
     cancel_at_period_end: input.cancelAtPeriodEnd ?? false,
+    canceled_at: input.canceledAt ?? null,
     cancel_at: input.cancelAt ?? null,
     pending_update: input.pendingUpdate ? { expires_at: 1_700_010_000 } : null,
     schedule: input.schedule ?? null,
@@ -381,7 +387,7 @@ async function assertCheckoutSeats(humanSeats: number, requestedAgentSeats: numb
       sessions: {
         create: async (params: unknown) => {
           createCalls.push(params);
-          return { url: "https://checkout.stripe.test/session" };
+          return { id: `cs_test_${randomUUID()}`, url: "https://checkout.stripe.test/session" };
         },
       },
     },
@@ -430,7 +436,11 @@ async function assertCheckoutSeats(humanSeats: number, requestedAgentSeats: numb
   assert.equal(params.metadata.provisionedHumanSeats, String(seatQuantity));
   assert.equal(params.metadata.provisionedAgentSeats, String(provisionedAgentSeats));
   assert.equal(params.metadata.firstPackTrialEndsAt, undefined);
-  assert.deepEqual(params.subscription_data.metadata, params.metadata);
+  // Product-analytics keys stay on the session; the subscription keeps the contract (#10389).
+  const { checkoutEntry, defaultSeatQuantity, returningCustomer, raftCheckoutAttemptId, ...contractMetadata } = params.metadata;
+  assert.match(raftCheckoutAttemptId, /^[0-9a-f-]{36}$/);
+  assert.deepEqual({ checkoutEntry, defaultSeatQuantity, returningCustomer }, { checkoutEntry: "unknown", defaultSeatQuantity: undefined, returningCustomer: "false" });
+  assert.deepEqual(params.subscription_data.metadata, contractMetadata);
   assert.equal(params.subscription_data.trial_period_days, undefined);
   assert.equal(params.subscription_data.trial_end, undefined);
 
@@ -464,7 +474,7 @@ test("checkout emits sanitized billing trace events", async () => {
         sessions: {
           create: async (params: unknown) => {
             createCalls.push(params);
-            return { url: "https://checkout.stripe.test/session" };
+            return { id: `cs_test_${randomUUID()}`, url: "https://checkout.stripe.test/session" };
           },
         },
       },
@@ -1379,6 +1389,8 @@ test("reducing existing Pro pack quantity down to occupied usage floor updates S
 
     const result = await updateProPackQuantity(server.id, owner.id, { packQuantity: 4 });
     assert.equal(result.status, "updated");
+    // No cancellation was scheduled: nothing withdrawn.
+    assert.equal(result.cancellationWithdrawn, undefined);
     assert.equal(result.effectiveAt, "current");
     assert.equal(updateCalls.length, 1);
     assert.equal(updateCalls[0]?.id, "sub_pack_reduce");
@@ -1579,6 +1591,8 @@ test("pack quantity update reactivates cancel-scheduled subscription while addin
 
     const result = await updateProPackQuantity(server.id, owner.id, { packQuantity: 3 });
     assert.equal(result.status, "pending_webhook");
+    // The route records billing_cancellation_withdrawn as well as the seat change.
+    assert.deepEqual(result.cancellationWithdrawn, { billingInterval: "annual" });
     assert.equal(updateCalls.length, 2);
     assert.equal(updateCalls[0]?.params.cancel_at_period_end, false);
     assert.equal(updateCalls[0]?.params.payment_behavior, undefined);
@@ -1749,6 +1763,7 @@ test("unchanged pack quantity reactivates cancel-scheduled subscription", async 
 
     const result = await updateProPackQuantity(server.id, owner.id, { packQuantity: 2 });
     assert.equal(result.status, "reactivated");
+    assert.ok(result.cancellationWithdrawn);
     assert.equal(updateCalls.length, 1);
     assert.equal(updateCalls[0]?.params.cancel_at_period_end, false);
     assert.equal(typeof (updateCalls[0]?.params.metadata as Record<string, string>).reactivatedAt, "string");
@@ -1885,6 +1900,130 @@ test("pending payment pack increase does not grant additional entitlement", asyn
     const entitlement = await getServerBillingEntitlement(getDb(), server.id);
     assert.equal(entitlement.proPackQuantity, 1);
     assert.equal(entitlement.capacity.maxUniversalSeats, 1);
+  } finally {
+    restoreEnv(env);
+  }
+});
+
+test("fewer seats, or a held seat payment, while a cancellation is scheduled still withdraws it (billing_cancellation_withdrawn)", async () => {
+  const env = snapshotEnv();
+  configureStripeEnv();
+  await openTestDatabase("pglite://");
+  try {
+    const owner = await seedUser("pack-withdraw-owner");
+    for (const { name, from, to, held, status } of [
+      { name: "fewer", from: 3, to: 2, held: false, status: "updated" },
+      { name: "held", from: 1, to: 2, held: true, status: "pending_payment" },
+    ] as const) {
+      const server = await createServer(`Pack Withdraw ${name}`, `pack-withdraw-${name}-${randomUUID()}`, owner.id);
+      const subscriptionId = `sub_pack_withdraw_${name}`;
+      await seedLocalProSubscription({
+        serverId: server.id,
+        userId: owner.id,
+        subscriptionId,
+        packQuantity: from,
+        billingInterval: "annual",
+        cancelAtPeriodEnd: true,
+      });
+      const sub = (overrides: { itemQuantity: number; cancelAtPeriodEnd: boolean; pendingUpdate?: boolean }) => stripeSub({
+        id: subscriptionId,
+        serverId: server.id,
+        userId: owner.id,
+        status: "active",
+        customer: `cus_pack_withdraw_${name}`,
+        packQuantity: from,
+        billingInterval: "annual",
+        ...overrides,
+      });
+      __setStripeForTests({
+        subscriptions: {
+          retrieve: async () => sub({ itemQuantity: from, cancelAtPeriodEnd: true }),
+          update: async (_id: string, params: Record<string, unknown>) => params.items == null
+            ? sub({ itemQuantity: from, cancelAtPeriodEnd: false })
+            : sub({ itemQuantity: held ? from : to, cancelAtPeriodEnd: false, pendingUpdate: held }),
+        },
+      } as unknown as Stripe);
+
+      const result = await updateProPackQuantity(server.id, owner.id, { packQuantity: to });
+      assert.equal(result.status, status, name);
+      assert.deepEqual(result.cancellationWithdrawn, { billingInterval: "annual" }, name);
+    }
+  } finally {
+    restoreEnv(env);
+  }
+});
+
+test("a held seat payment answers the invoice's page and what it waits for", async () => {
+  const env = snapshotEnv();
+  configureStripeEnv();
+  await openTestDatabase("pglite://");
+  try {
+    const owner = await seedUser("pack-held-owner");
+    const server = await createServer("Pack Held", `pack-held-${randomUUID()}`, owner.id);
+    await seedLocalProSubscription({
+      serverId: server.id,
+      userId: owner.id,
+      subscriptionId: "sub_pack_held",
+      packQuantity: 1,
+    });
+    const retrievedInvoices: Array<{ id: string; expand?: string[] }> = [];
+    let paymentIntentStatus = "requires_action";
+    __setStripeForTests({
+      subscriptions: {
+        retrieve: async () => stripeSub({
+          id: "sub_pack_held",
+          serverId: server.id,
+          userId: owner.id,
+          status: "active",
+          customer: "cus_pack_held",
+          packQuantity: 1,
+          itemQuantity: 1,
+        }),
+        update: async (id: string) => ({
+          ...stripeSub({
+            id,
+            serverId: server.id,
+            userId: owner.id,
+            status: "active",
+            customer: "cus_pack_held",
+            packQuantity: 1,
+            itemQuantity: 1,
+            pendingUpdate: true,
+          }),
+          latest_invoice: "in_held",
+        }),
+      },
+      invoices: {
+        retrieve: async (id: string, params?: { expand?: string[] }) => {
+          retrievedInvoices.push({ id, expand: params?.expand });
+          if (paymentIntentStatus === "lookup_fails") throw new Error("stripe down");
+          return {
+            id,
+            hosted_invoice_url: "https://invoice.stripe.com/i/held",
+            payments: { data: [
+              // An earlier attempt that failed stays on the invoice; the open one is what it waits for.
+              { status: "failed", payment: { type: "payment_intent", payment_intent: { status: "canceled" } } },
+              { status: "open", payment: { type: "payment_intent", payment_intent: { status: paymentIntentStatus } } },
+            ] },
+          };
+        },
+      },
+    } as unknown as Stripe);
+
+    const authenticate = await updateProPackQuantity(server.id, owner.id, { packQuantity: 2 });
+    assert.equal(authenticate.status, "pending_payment");
+    assert.deepEqual(authenticate.heldPayment, { url: "https://invoice.stripe.com/i/held", action: "authenticate" });
+    assert.deepEqual(retrievedInvoices[0], { id: "in_held", expand: ["payments.data.payment.payment_intent"] });
+
+    paymentIntentStatus = "requires_payment_method";
+    const declined = await updateProPackQuantity(server.id, owner.id, { packQuantity: 2 });
+    assert.deepEqual(declined.heldPayment, { url: "https://invoice.stripe.com/i/held", action: "update_payment_method" });
+
+    // The update is held either way: a failed lookup leaves the page out, not the answer.
+    paymentIntentStatus = "lookup_fails";
+    const unknown = await updateProPackQuantity(server.id, owner.id, { packQuantity: 2 });
+    assert.equal(unknown.status, "pending_payment");
+    assert.equal(unknown.heldPayment, undefined);
   } finally {
     restoreEnv(env);
   }
@@ -2301,7 +2440,7 @@ test("retired referral input cannot silently create a full-price checkout", asyn
     let creates = 0;
     __setStripeForTests({ checkout: { sessions: { create: async () => {
       creates += 1;
-      return { url: "https://checkout.stripe.test/session" };
+      return { id: `cs_test_${randomUUID()}`, url: "https://checkout.stripe.test/session" };
     } } } } as unknown as Stripe);
     for (const referralCode of ["OLD-CODE", 12, {}, false]) {
       const request = { targetPlan: "pro", referralCode };
@@ -2332,7 +2471,7 @@ test("first Checkout promotion uses only explicit discount and canonical price/q
     __setStripeForTests({
       prices: { retrieve: async (id: string) => ({ id, active: true, livemode: false, type: "recurring", product: "prod_pro_seat", currency: "usd", recurring: { interval: "year", interval_count: 1 } }) },
       promotionCodes: { list: async (params: Stripe.PromotionCodeListParams) => { lookups.push(params); return { data: [promo], has_more: false }; } },
-      checkout: { sessions: { create: async (params: Stripe.Checkout.SessionCreateParams) => { calls.push(params); return { url: "https://checkout.stripe.test/native" }; } } },
+      checkout: { sessions: { create: async (params: Stripe.Checkout.SessionCreateParams) => { calls.push(params); return { id: `cs_test_${randomUUID()}`, url: "https://checkout.stripe.test/native" }; } } },
     } as unknown as Stripe);
     const { events } = await captureBillingTrace(() => createCheckoutSession(server.id, owner.id, "https://raft.test/success", "https://raft.test/cancel", {
       targetPlan: "pro", billingInterval: "annual", seatQuantity: 3, promotionCode: " save10 ",
@@ -2352,7 +2491,7 @@ test("blank promotion inputs preserve legacy Checkout and never query promotion 
   try {
     const owner = await seedUser("blank-native-code"); const server = await createServer("Blank", `blank-${randomUUID()}`, owner.id);
     const calls: Stripe.Checkout.SessionCreateParams[] = [];
-    __setStripeForTests({ checkout: { sessions: { create: async (p: Stripe.Checkout.SessionCreateParams) => { calls.push(p); return { url: "https://checkout.stripe.test/blank" }; } } } } as unknown as Stripe);
+    __setStripeForTests({ checkout: { sessions: { create: async (p: Stripe.Checkout.SessionCreateParams) => { calls.push(p); return { id: `cs_test_${randomUUID()}`, url: "https://checkout.stripe.test/blank" }; } } } } as unknown as Stripe);
     for (const promotionCode of [undefined, null, "", "   "]) await createCheckoutSession(server.id, owner.id, "https://raft.test/s", "https://raft.test/c", { targetPlan: "pro", promotionCode });
     assert.equal(calls.length, 4); for (const p of calls) { assert.equal(p.allow_promotion_codes, true); assert.equal(Object.hasOwn(p, "discounts"), false); }
   } finally { restoreEnv(env); }
@@ -2385,7 +2524,7 @@ test("invalid, ambiguous, restricted, expired, exhausted or provider lookup fail
       __setStripeForTests({
         prices: { retrieve: async () => ({ active: true, livemode: false, type: "recurring", product: "prod_pro_seat", currency: "usd", recurring: { interval: "month", interval_count: 1 }, ...item.price }) },
         promotionCodes: { list: async () => { if (item.throwLookup) throw new Error("PRIVATECODE provider request leaked"); return { data: item.mutate(base), has_more: false }; } },
-        checkout: { sessions: { create: async () => { createCount++; return { url: "https://checkout.stripe.test/wrong" }; } } },
+        checkout: { sessions: { create: async () => { createCount++; return { id: `cs_test_${randomUUID()}`, url: "https://checkout.stripe.test/wrong" }; } } },
       } as unknown as Stripe);
       const { error, events } = await captureRejectedBillingTrace(() => createCheckoutSession(server.id, owner.id, "https://raft.test/s", "https://raft.test/c", { targetPlan: "pro", billingInterval: "monthly", promotionCode: item.code ?? "PRIVATECODE" }));
       assert.equal((error as Error).message, "Promotion code is unavailable", item.label); assert.equal(createCount, 0, item.label);
@@ -2405,7 +2544,9 @@ test("Stripe create rejection returns generic error with no fallback or raw code
       checkout: { sessions: { create: async () => { attempts++; throw new Error("PRIVATECODE minimum-amount restriction"); } } },
     } as unknown as Stripe);
     const { error, events } = await captureRejectedBillingTrace(() => createCheckoutSession(server.id, owner.id, "https://raft.test/s", "https://raft.test/c", { targetPlan: "pro", billingInterval: "monthly", promotionCode: "PRIVATECODE" }));
-    assert.equal((error as Error).message, "Promotion code is unavailable"); assert.equal(attempts, 1, "must not retry without the discount"); assert.equal(JSON.stringify(events).includes("PRIVATECODE"), false);
+    assert.match((error as Error).message, /checkout could not be confirmed/i); assert.equal(attempts, 1, "must not retry without the discount"); assert.equal(JSON.stringify(events).includes("PRIVATECODE"), false);
+    await assert.rejects(createCheckoutSession(server.id, owner.id, "https://raft.test/s", "https://raft.test/c", { targetPlan: "pro" }), /checkout could not be confirmed/i);
+    assert.equal(attempts, 1, "an ambiguous previous request must fence new provider creates");
   } finally { restoreEnv(env); }
 });
 
@@ -2424,7 +2565,7 @@ test("customer-scoped code on later page uses canonical persisted customer and r
         assert.equal(params.starting_after, "promo_OtherCustomer");
         return { data: ambiguous ? [promo, { ...promo, id: "promo_Second" }] : [promo], has_more: false };
       } },
-      checkout: { sessions: { create: async (p: Stripe.Checkout.SessionCreateParams) => { calls++; assert.equal(p.customer, "cus_Canonical"); return { url: "https://checkout.stripe.test/paged" }; } } },
+      checkout: { sessions: { create: async (p: Stripe.Checkout.SessionCreateParams) => { calls++; assert.equal(p.customer, "cus_Canonical"); return { id: `cs_test_${randomUUID()}`, url: "https://checkout.stripe.test/paged" }; } } },
     } as unknown as Stripe);
     const request = { targetPlan: "pro", billingInterval: "monthly", promotionCode: "SAVE10" };
     await createCheckoutSession(server.id, owner.id, "https://raft.test/s", "https://raft.test/c", request);
@@ -2445,11 +2586,436 @@ test("Stripe owns code characters: underscores, internal spaces and Unicode are 
       __setStripeForTests({
         prices: { retrieve: async () => ({ active: true, livemode: false, type: "recurring", product: "prod_pro_seat", currency: "usd", recurring: { interval: "month", interval_count: 1 } }) },
         promotionCodes: { list: async (p: Stripe.PromotionCodeListParams) => { lookups.push(p.code!); return { data: [seatUpdatePromotionCode({ id: "promo_Characters", code })], has_more: false }; } },
-        checkout: { sessions: { create: async (p: Stripe.Checkout.SessionCreateParams) => { creates.push(p); return { url: "https://checkout.stripe.test/characters" }; } } },
+        checkout: { sessions: { create: async (p: Stripe.Checkout.SessionCreateParams) => { creates.push(p); return { id: `cs_test_${randomUUID()}`, url: "https://checkout.stripe.test/characters" }; } } },
       } as unknown as Stripe);
       const { events } = await captureBillingTrace(() => createCheckoutSession(server.id, owner.id, "https://raft.test/s", "https://raft.test/c", { targetPlan: "pro", billingInterval: "monthly", promotionCode: raw }));
       assert.deepEqual(lookups, [code]); assert.equal(creates.length, 1); assert.deepEqual(creates[0].discounts, [{ promotion_code: "promo_Characters" }]);
       assert.equal(JSON.stringify(creates).includes(code), false); assert.equal(JSON.stringify(events).includes(code), false);
     }
   } finally { restoreEnv(env); }
+});
+
+test("a late Stripe cancellation cannot revoke prepaid time or its plan projection", async ({ db }) => {
+  const env = snapshotEnv();
+  configureStripeEnv();
+  try {
+    const { seedPrepaidPurchase } = await import("../test/prepaidProFixture");
+    const owner = await seedUser("prepaid-stripe-cancel");
+    const server = await createServer("Prepaid", `prepaid-stripe-${randomUUID()}`, owner.id);
+    const now = Date.now();
+    await seedPrepaidPurchase(db, { serverId: server.id, startsAt: new Date(now - 60_000), endsAt: new Date(now + 30 * 86_400_000), seatQuantity: 3 });
+    await handleWebhookEvent(makeEvent(`evt_${randomUUID()}`, "customer.subscription.deleted", stripeSub({
+      id: "sub_before_prepaid", serverId: server.id, userId: owner.id, status: "canceled",
+    })));
+    const [row] = await db.select({ plan: servers.plan, downgradedAt: servers.planDowngradedAt }).from(servers).where(eq(servers.id, server.id));
+    assert.equal(row.plan, "pro");
+    assert.equal(row.downgradedAt, null);
+    const entitlement = await getServerBillingEntitlement(db, server.id);
+    assert.equal(entitlement.source, "prepaid");
+    assert.deepEqual(entitlement.capacity, { maxHumans: -1, maxAgents: -1, maxUniversalSeats: 3 });
+  } finally { restoreEnv(env); }
+});
+
+test("a late Stripe cancellation cannot revoke a bound AppSumo grant or its plan projection", async ({ db }) => {
+  const env = snapshotEnv();
+  configureStripeEnv();
+  try {
+    const { appSumoLicenses, appSumoLicenseBindings } = await import("../db/schema");
+    const { parseAppSumoLicenseKey } = await import("./appSumoContracts");
+    const owner = await seedUser("lifetime-stripe-cancel");
+    const server = await createServer("Lifetime", `lifetime-${randomUUID()}`, owner.id);
+    const key = parseAppSumoLicenseKey(randomUUID())!;
+    await db.insert(appSumoLicenses).values({ productId: "test", licenseKey: key, tier: 2, status: "active", verifiedAt: new Date() });
+    await db.insert(appSumoLicenseBindings).values({ serverId: server.id, productId: "test", originalLicenseKey: key, currentLicenseKey: key, boundByUserId: owner.id });
+    await handleWebhookEvent(makeEvent(`evt_${randomUUID()}`, "customer.subscription.deleted", stripeSub({
+      id: "sub_before_lifetime", serverId: server.id, userId: owner.id, status: "canceled",
+    })));
+    const [row] = await db.select({ plan: servers.plan, downgradedAt: servers.planDowngradedAt }).from(servers).where(eq(servers.id, server.id));
+    assert.equal(row.plan, "pro");
+    assert.equal(row.downgradedAt, null);
+    const entitlement = await getServerBillingEntitlement(db, server.id);
+    assert.equal(entitlement.source, "appsumo");
+    assert.deepEqual(entitlement.capacity, { maxHumans: 6, maxAgents: 30, maxUniversalSeats: -1 });
+    const [sub] = await db.select().from(subscriptions).where(eq(subscriptions.serverId, server.id));
+    assert.equal(sub.status, "canceled", "the Stripe record still reflects its own cancellation");
+    for (const plan of ["partner", "founder"] as const) {
+      await db.update(servers).set({ plan }).where(eq(servers.id, server.id));
+      await handleWebhookEvent(makeEvent(`evt_${randomUUID()}`, "customer.subscription.deleted", stripeSub({
+        id: "sub_before_lifetime", serverId: server.id, userId: owner.id, status: "canceled",
+      })));
+      assert.equal((await db.select({ plan: servers.plan }).from(servers).where(eq(servers.id, server.id)))[0].plan, plan);
+      assert.equal((await getServerBillingEntitlement(db, server.id)).plan, plan);
+    }
+  } finally { restoreEnv(env); }
+});
+
+test("a late active Stripe snapshot cannot revive a canceled subscription, but a distinct active subscription is visible", async ({ db }) => {
+  const env = snapshotEnv();
+  configureStripeEnv();
+  try {
+    const { appSumoLicenses, appSumoLicenseBindings } = await import("../db/schema");
+    const { parseAppSumoLicenseKey } = await import("./appSumoContracts");
+    const owner = await seedUser("lifetime-stale-stripe");
+    const server = await createServer("Lifetime stale", `lifetime-stale-${randomUUID()}`, owner.id);
+    const key = parseAppSumoLicenseKey(randomUUID())!;
+    await db.insert(appSumoLicenses).values({ productId: "test", licenseKey: key, tier: 2, status: "active", verifiedAt: new Date() });
+    await db.insert(appSumoLicenseBindings).values({ serverId: server.id, productId: "test", originalLicenseKey: key, currentLicenseKey: key });
+    const subId = `sub_${randomUUID()}`;
+    await db.insert(subscriptions).values({ serverId: server.id, stripeCustomerId: "cus_test", stripeSubscriptionId: subId, status: "canceled" });
+    await handleWebhookEvent(makeEvent(`evt_${randomUUID()}`, "customer.subscription.updated", stripeSub({
+      id: subId, serverId: server.id, userId: owner.id, status: "active",
+    })));
+    const [local] = await db.select().from(subscriptions).where(eq(subscriptions.serverId, server.id));
+    assert.equal(local.status, "canceled", "a stale event cannot revive a terminal subscription");
+    // The summary may refresh a terminal provider projection. Keep that read
+    // synthetic too, rather than constructing a real Stripe client.
+    __setStripeForTests({ subscriptions: { retrieve: async () => stripeSub({
+      id: subId, serverId: server.id, userId: owner.id, status: "canceled",
+    }) } } as unknown as Stripe);
+    const summary = await getBillingSummary(server.id);
+    assert.equal(summary.sourceConflict, null, "the old event must not create a false support warning");
+    assert.equal(summary.source, "appsumo");
+    const olderId = `sub_old_${randomUUID()}`;
+    __setStripeForTests({ subscriptions: { retrieve: async () => stripeSub({
+      id: olderId, serverId: server.id, userId: owner.id, status: "canceled",
+    }) } } as unknown as Stripe);
+    await handleWebhookEvent(makeEvent(`evt_${randomUUID()}`, "customer.subscription.updated", stripeSub({
+      id: olderId, serverId: server.id, userId: owner.id, status: "active",
+    })));
+    assert.equal((await db.select().from(subscriptions).where(eq(subscriptions.serverId, server.id)))[0].stripeSubscriptionId, subId,
+      "another stale active snapshot must not displace the current canceled record");
+    const nextId = `sub_${randomUUID()}`;
+    __setStripeForTests({ subscriptions: { retrieve: async () => stripeSub({
+      id: nextId, serverId: server.id, userId: owner.id, status: "active",
+    }) } } as unknown as Stripe);
+    await handleWebhookEvent(makeEvent(`evt_${randomUUID()}`, "customer.subscription.updated", stripeSub({
+      id: nextId, serverId: server.id, userId: owner.id, status: "active",
+    })));
+    const updated = await getBillingSummary(server.id);
+    assert.equal(updated.sourceConflict, "appsumo_stripe", "a distinct paid subscription remains visible for support");
+    assert.equal(updated.subscription?.status, "active");
+  } finally { restoreEnv(env); }
+});
+
+test("a late failed invoice cannot revive the same canceled Stripe subscription", async ({ db }) => {
+  const env = snapshotEnv();
+  configureStripeEnv();
+  try {
+    const owner = await seedUser("terminal-invoice");
+    const server = await createServer("Terminal", `terminal-${randomUUID()}`, owner.id);
+    const subId = `sub_${randomUUID()}`;
+    await db.insert(subscriptions).values({ serverId: server.id, stripeCustomerId: "cus_test", stripeSubscriptionId: subId, status: "canceled" });
+    __setStripeForTests({ subscriptions: { retrieve: async () => stripeSub({
+      id: subId, serverId: server.id, userId: owner.id, status: "canceled",
+    }) } } as unknown as Stripe);
+    await handleWebhookEvent(makeEvent(`evt_${randomUUID()}`, "invoice.payment_failed", {
+      parent: { subscription_details: { subscription: subId } },
+    }));
+    const [row] = await db.select().from(subscriptions).where(eq(subscriptions.serverId, server.id));
+    assert.equal(row.status, "canceled");
+  } finally { restoreEnv(env); }
+});
+
+test("a late cancellation for an older Stripe subscription cannot replace the current subscription", async ({ db }) => {
+  const env = snapshotEnv();
+  configureStripeEnv();
+  try {
+    const owner = await seedUser("historical-subscription");
+    const server = await createServer("Current subscription", `current-${randomUUID()}`, owner.id);
+    const current = `sub_current_${randomUUID()}`, old = `sub_old_${randomUUID()}`;
+    await db.insert(subscriptions).values({ serverId: server.id, stripeCustomerId: "cus_test", stripeSubscriptionId: current, status: "active" });
+    await handleWebhookEvent(makeEvent(`evt_${randomUUID()}`, "customer.subscription.deleted", stripeSub({
+      id: old, serverId: server.id, userId: owner.id, status: "canceled",
+    })));
+    const [row] = await db.select().from(subscriptions).where(eq(subscriptions.serverId, server.id));
+    assert.equal(row.stripeSubscriptionId, current);
+    assert.equal(row.status, "active");
+    const eventId = `evt_${randomUUID()}`;
+    await assert.rejects(handleWebhookEvent(makeEvent(eventId, "customer.subscription.updated", stripeSub({
+      id: old, serverId: server.id, userId: owner.id, status: "active",
+    }))), /requires reconciliation/);
+    assert.equal((await db.select().from(webhookEvents).where(eq(webhookEvents.id, eventId))).length, 0,
+      "an unresolved second active subscription remains retryable");
+  } finally { restoreEnv(env); }
+});
+
+test("subscription replacement retries if the current identity changes during provider verification", async ({ db }) => {
+  const env = snapshotEnv();
+  configureStripeEnv();
+  try {
+    const owner = await seedUser("subscription-replacement-race");
+    const server = await createServer("Replacement race", `replacement-${randomUUID()}`, owner.id);
+    const old = `sub_old_${randomUUID()}`, incoming = `sub_new_${randomUUID()}`, winner = `sub_winner_${randomUUID()}`;
+    await db.insert(subscriptions).values({ serverId: server.id, stripeCustomerId: "cus_test", stripeSubscriptionId: old, status: "canceled" });
+    let entered!: () => void, release!: () => void;
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    __setStripeForTests({ subscriptions: { retrieve: async () => { entered(); await gate; return stripeSub({
+      id: incoming, serverId: server.id, userId: owner.id, status: "active",
+    }); } } } as unknown as Stripe);
+    const eventId = `evt_${randomUUID()}`;
+    const pending = handleWebhookEvent(makeEvent(eventId, "customer.subscription.updated", stripeSub({
+      id: incoming, serverId: server.id, userId: owner.id, status: "active",
+    })));
+    await started;
+    await db.update(subscriptions).set({ stripeSubscriptionId: winner, status: "canceled" }).where(eq(subscriptions.serverId, server.id));
+    release();
+    await assert.rejects(pending, /requires reconciliation/);
+    const [row] = await db.select().from(subscriptions).where(eq(subscriptions.serverId, server.id));
+    assert.equal(row.stripeSubscriptionId, winner);
+    assert.equal(row.status, "canceled");
+    assert.equal((await db.select().from(webhookEvents).where(eq(webhookEvents.id, eventId))).length, 0);
+  } finally { restoreEnv(env); }
+});
+
+test("subscription replacement rejects a provider customer mismatch without consuming the event", async ({ db }) => {
+  const env = snapshotEnv();
+  configureStripeEnv();
+  try {
+    const owner = await seedUser("replacement-customer-mismatch");
+    const server = await createServer("Replacement customer", `replacement-customer-${randomUUID()}`, owner.id);
+    const old = `sub_old_${randomUUID()}`, incoming = `sub_new_${randomUUID()}`;
+    await db.insert(subscriptions).values({ serverId: server.id, stripeCustomerId: "cus_test", stripeSubscriptionId: old, status: "canceled" });
+    __setStripeForTests({ subscriptions: { retrieve: async () => stripeSub({
+      id: incoming, serverId: server.id, userId: owner.id, status: "active", customer: "cus_other",
+    }) } } as unknown as Stripe);
+    const eventId = `evt_${randomUUID()}`;
+    await assert.rejects(handleWebhookEvent(makeEvent(eventId, "customer.subscription.updated", stripeSub({
+      id: incoming, serverId: server.id, userId: owner.id, status: "active",
+    }))), /could not be verified/);
+    assert.equal((await db.select().from(subscriptions).where(eq(subscriptions.serverId, server.id)))[0].stripeSubscriptionId, old);
+    assert.equal((await db.select().from(webhookEvents).where(eq(webhookEvents.id, eventId))).length, 0);
+    const unavailableId = `evt_${randomUUID()}`;
+    __setStripeForTests({ subscriptions: { retrieve: async () => { throw new Error("provider unavailable"); } } } as unknown as Stripe);
+    await assert.rejects(handleWebhookEvent(makeEvent(unavailableId, "customer.subscription.updated", stripeSub({
+      id: incoming, serverId: server.id, userId: owner.id, status: "active",
+    }))), /provider unavailable/);
+    assert.equal((await db.select().from(subscriptions).where(eq(subscriptions.serverId, server.id)))[0].stripeSubscriptionId, old);
+    assert.equal((await db.select().from(webhookEvents).where(eq(webhookEvents.id, unavailableId))).length, 0);
+  } finally { restoreEnv(env); }
+});
+
+test("subscription replacement retries if the stored customer changes during verification", async ({ db }) => {
+  const env = snapshotEnv();
+  configureStripeEnv();
+  try {
+    const owner = await seedUser("replacement-customer-race");
+    const server = await createServer("Customer race", `customer-race-${randomUUID()}`, owner.id);
+    const old = `sub_old_${randomUUID()}`, incoming = `sub_new_${randomUUID()}`;
+    await db.insert(subscriptions).values({ serverId: server.id, stripeCustomerId: "cus_test", stripeSubscriptionId: old, status: "canceled" });
+    let entered!: () => void, release!: () => void;
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    __setStripeForTests({ subscriptions: { retrieve: async () => { entered(); await gate; return stripeSub({
+      id: incoming, serverId: server.id, userId: owner.id, status: "active",
+    }); } } } as unknown as Stripe);
+    const eventId = `evt_${randomUUID()}`;
+    const pending = handleWebhookEvent(makeEvent(eventId, "customer.subscription.updated", stripeSub({
+      id: incoming, serverId: server.id, userId: owner.id, status: "active",
+    })));
+    await started;
+    await db.update(subscriptions).set({ stripeCustomerId: "cus_new" }).where(eq(subscriptions.serverId, server.id));
+    release();
+    await assert.rejects(pending, /requires reconciliation/);
+    const [row] = await db.select().from(subscriptions).where(eq(subscriptions.serverId, server.id));
+    assert.equal(row.stripeSubscriptionId, old);
+    assert.equal(row.stripeCustomerId, "cus_new");
+    assert.equal((await db.select().from(webhookEvents).where(eq(webhookEvents.id, eventId))).length, 0);
+  } finally { restoreEnv(env); }
+});
+
+test("paid invoice projection admits a current subscription but never revives or enrolls a canceled one", async ({ db }) => {
+  const env = snapshotEnv();
+  const keys = ["PAID_LIFECYCLE_EMAIL_MODE", "PAID_LIFECYCLE_START_AT", "PAID_LIFECYCLE_RECEIPT_MARKER_SECRET", "RESEND_API_KEY"] as const;
+  const oldPaidEnv = keys.map((key) => [key, process.env[key]] as const);
+  const oldFetch = globalThis.fetch;
+  configureStripeEnv();
+  process.env.PAID_LIFECYCLE_EMAIL_MODE = "enabled";
+  process.env.PAID_LIFECYCLE_START_AT = "2026-01-01T00:00:00Z";
+  process.env.PAID_LIFECYCLE_RECEIPT_MARKER_SECRET = "synthetic-marker-key-only-for-tests";
+  process.env.RESEND_API_KEY = "re_synthetic_no_network";
+  globalThis.fetch = async () => new Response(JSON.stringify({ id: "synthetic", unsubscribed: true }), { status: 200 });
+  try {
+    const { paidLifecyclePayments } = await import("../db/schema");
+    const owner = await seedUser("paid-projection-fence");
+    const server = await createServer("Paid projection", `paid-projection-${randomUUID()}`, owner.id);
+    const subId = `sub_${randomUUID()}`;
+    const now = Math.floor(Date.now() / 1000);
+    const invoice = { id: `in_${randomUUID()}`, status: "paid", created: now, currency: "usd", customer: "cus_test", livemode: false,
+      parent: { subscription_details: { subscription: subId } } } as unknown as Stripe.Invoice;
+    const allocation = { id: `inpay_${randomUUID()}`, invoice: invoice.id, status: "paid", amount_paid: 500, currency: "usd", livemode: false,
+      status_transitions: { paid_at: now }, payment: { type: "charge", charge: "ch_synthetic" } };
+    const charge = { id: "ch_synthetic", status: "succeeded", paid: true, captured: true, refunded: false, amount_refunded: 0,
+      amount_captured: 500, currency: "usd", customer: "cus_test", livemode: false };
+    const each = async function* (items: unknown[]) { for (const item of items) yield item; };
+    __setStripeForTests({
+      subscriptions: { retrieve: async () => stripeSub({ id: subId, serverId: server.id, userId: owner.id, status: "active" }) },
+      invoicePayments: { list: () => each([allocation]) }, charges: { retrieve: async () => charge },
+      invoices: { listLineItems: () => each([{ subscription: subId, amount: 500, period: { start: now, end: now + 86400 } }]) },
+    } as unknown as Stripe);
+    await db.insert(subscriptions).values({ serverId: server.id, stripeCustomerId: "cus_test", stripeSubscriptionId: subId, status: "canceled" });
+    await handleWebhookEvent(makeEvent(`evt_${randomUUID()}`, "invoice.paid", invoice));
+    assert.equal((await db.select().from(subscriptions).where(eq(subscriptions.serverId, server.id)))[0].status, "canceled");
+    assert.equal((await db.select().from(paidLifecyclePayments).where(eq(paidLifecyclePayments.invoiceId, invoice.id))).length, 0);
+    await db.update(subscriptions).set({ status: "active" }).where(eq(subscriptions.serverId, server.id));
+    await handleWebhookEvent(makeEvent(`evt_${randomUUID()}`, "invoice.paid", invoice));
+    assert.equal((await db.select().from(paidLifecyclePayments).where(eq(paidLifecyclePayments.invoiceId, invoice.id))).length, 1);
+  } finally {
+    globalThis.fetch = oldFetch;
+    for (const [key, value] of oldPaidEnv) value === undefined ? delete process.env[key] : process.env[key] = value;
+    restoreEnv(env);
+  }
+});
+
+test("deletion cancellation undo leaves replacement subscriptions and later cancellation decisions untouched", async () => {
+  const env = snapshotEnv();
+  configureStripeEnv();
+  await openTestDatabase("pglite://");
+  try {
+    for (const variant of ["replacement", "later_cancel", "former_owner", "past_due", "not_scheduled", "missing_proof", "owner_lost_during_read", "replacement_during_read"] as const) {
+      const person = await seedUser(`deletion-resume-${variant}`);
+      const server = await createServer(`Deletion ${variant}`, `del-${randomUUID()}`, person.id);
+      const expectedId = `sub_original_${server.id}`;
+      const currentId = variant === "replacement" ? `sub_replacement_${server.id}` : expectedId;
+      await seedLocalProSubscription({ serverId: server.id, userId: person.id, subscriptionId: currentId, packQuantity: 1, cancelAtPeriodEnd: true });
+      if (variant === "former_owner") {
+        await getDb().update(serverMembers).set({ role: "member" }).where(and(eq(serverMembers.serverId, server.id), eq(serverMembers.userId, person.id)));
+      }
+      const current = () => stripeSub({ id: currentId, serverId: server.id, userId: person.id,
+        status: variant === "past_due" ? "past_due" : "active",
+        cancelAtPeriodEnd: variant !== "not_scheduled", canceledAt: variant === "later_cancel" ? 200 : 100 });
+      const updates: string[] = [];
+      __setStripeForTests({ subscriptions: {
+        retrieve: async () => {
+          if (variant === "owner_lost_during_read") await getDb().update(serverMembers).set({ role: "member" }).where(and(eq(serverMembers.serverId, server.id), eq(serverMembers.userId, person.id)));
+          if (variant === "replacement_during_read") await getDb().update(subscriptions).set({ stripeSubscriptionId: `sub_new_${server.id}` }).where(eq(subscriptions.serverId, server.id));
+          return current();
+        },
+        update: async (id: string) => { updates.push(id); return { ...current(), cancel_at_period_end: false }; },
+      } } as unknown as Stripe);
+      await resumeSubscriptionAfterCancelledDeletion(server.id, person.id, { stripeSubscriptionId: expectedId, canceledAt: variant === "missing_proof" ? null : 100 });
+      assert.deepEqual(updates, [], `${variant}: a deletion undo must not change this subscription`);
+    }
+  } finally { restoreEnv(env); }
+});
+
+test("deletion cancellation undo resumes the recorded active cancellation and checks Stripe instead of a stale projection", async () => {
+  const env = snapshotEnv();
+  configureStripeEnv();
+  await openTestDatabase("pglite://");
+  try {
+    const person = await seedUser("deletion-resume-positive");
+    const server = await createServer("Deletion resume", `del-${randomUUID()}`, person.id);
+    const id = `sub_resume_${server.id}`;
+    await seedLocalProSubscription({ serverId: server.id, userId: person.id, subscriptionId: id, packQuantity: 1, cancelAtPeriodEnd: true });
+    const updates: string[] = []; let reads = 0;
+    let current = stripeSub({ id, serverId: server.id, userId: person.id, status: "active", cancelAtPeriodEnd: true, canceledAt: 100 });
+    __setStripeForTests({ subscriptions: {
+      retrieve: async () => { reads++; return current; },
+      update: async (subId: string) => { updates.push(subId); current = { ...current, cancel_at_period_end: false }; return current; },
+    } } as unknown as Stripe);
+    await resumeSubscriptionAfterCancelledDeletion(server.id, person.id, { stripeSubscriptionId: id, canceledAt: 100 });
+    assert.deepEqual(updates, [id]);
+    assert.equal(reads, 2, "read the provider before restoration and confirm its state afterwards");
+  } finally { restoreEnv(env); }
+});
+
+
+test("deletion request records Stripe's cancellation response and never takes over an already scheduled cancellation", async () => {
+  const env = snapshotEnv(); configureStripeEnv(); await openTestDatabase("pglite://");
+  try {
+    const person = await seedUser("deletion-capture");
+    const server = await createServer("Capture cancellation", `del-${randomUUID()}`, person.id);
+    const id = `sub_capture_${server.id}`;
+    await seedLocalProSubscription({ serverId: server.id, userId: person.id, subscriptionId: id, packQuantity: 1 });
+    let scheduled = false; const updates: Array<{ id: string; key: string }> = [];
+    const current = () => stripeSub({ id, serverId: server.id, userId: person.id, status: "active", cancelAtPeriodEnd: scheduled, canceledAt: scheduled ? 321 : null });
+    __setStripeForTests({ subscriptions: {
+      retrieve: async () => current(),
+      update: async (subId: string, _body: Stripe.SubscriptionUpdateParams, options: Stripe.RequestOptions) => {
+        updates.push({ id: subId, key: options.idempotencyKey! }); scheduled = true; return current();
+      },
+    } } as unknown as Stripe);
+    const requestId = randomUUID();
+    assert.deepEqual(await cancelSubscriptionForAccountDeletion(server.id, person.id, id, requestId), { stripeSubscriptionId: id, canceledAt: 321 });
+    assert.deepEqual(updates, [{ id, key: `account-deletion-cancel-${requestId}-${server.id}` }]);
+    assert.equal(await cancelSubscriptionForAccountDeletion(server.id, person.id, id, randomUUID()), null);
+    assert.equal(updates.length, 1, "an existing cancellation is not attributed to a later request");
+    assert.equal(await cancelSubscriptionForAccountDeletion(server.id, person.id, "sub_not_current", requestId), null);
+    assert.equal(updates.length, 1);
+    for (const status of ["trialing", "unpaid"] as const) {
+      // Preserve the old cancellation eligibility: provider states that map to
+      // active/past_due still need to stop billing when deletion is requested.
+      await getDb().update(subscriptions).set({ status: status === "trialing" ? "active" : "past_due", cancelAtPeriodEnd: false }).where(eq(subscriptions.serverId, server.id));
+      scheduled = false;
+      __setStripeForTests({ subscriptions: {
+        retrieve: async () => ({ ...current(), status }),
+        update: async () => { scheduled = true; return { ...current(), status }; },
+      } } as unknown as Stripe);
+      assert.deepEqual(await cancelSubscriptionForAccountDeletion(server.id, person.id, id, randomUUID()), { stripeSubscriptionId: id, canceledAt: 321 });
+    }
+  } finally { restoreEnv(env); }
+});
+
+test("legacy deletion records retain live-subscription compatibility but require the current owner", async () => {
+  const env = snapshotEnv(); configureStripeEnv(); await openTestDatabase("pglite://");
+  try {
+    const person = await seedUser("deletion-legacy");
+    const server = await createServer("Legacy resume", `del-${randomUUID()}`, person.id);
+    const id = `sub_legacy_${server.id}`;
+    await seedLocalProSubscription({ serverId: server.id, userId: person.id, subscriptionId: id, packQuantity: 1, cancelAtPeriodEnd: true });
+    let status: Stripe.Subscription.Status = "active"; let scheduled = true; const updates: string[] = [];
+    const current = () => stripeSub({ id, serverId: server.id, userId: person.id, status, cancelAtPeriodEnd: scheduled, canceledAt: 999 });
+    __setStripeForTests({ subscriptions: { retrieve: async () => current(), update: async (subId: string) => { updates.push(subId); scheduled = false; return current(); } } } as unknown as Stripe);
+    assert.equal(await resumeSubscriptionAfterCancelledDeletion(server.id, person.id), "restored");
+    assert.deepEqual(updates, [id]);
+    status = "past_due"; scheduled = true;
+    assert.equal(await resumeSubscriptionAfterCancelledDeletion(server.id, person.id), "restored", "legacy keeps the previous live-subscription compatibility");
+    for (const legacyStatus of ["trialing", "unpaid"] as const) {
+      status = legacyStatus; scheduled = true;
+      assert.equal(await resumeSubscriptionAfterCancelledDeletion(server.id, person.id), "restored");
+    }
+    status = "canceled";
+    assert.equal(await resumeSubscriptionAfterCancelledDeletion(server.id, person.id), "not_restored");
+    await getDb().update(serverMembers).set({ role: "member" }).where(and(eq(serverMembers.serverId, server.id), eq(serverMembers.userId, person.id)));
+    status = "active";
+    assert.equal(await resumeSubscriptionAfterCancelledDeletion(server.id, person.id), "not_restored");
+    assert.deepEqual(updates, [id, id, id, id]);
+  } finally { restoreEnv(env); }
+});
+
+test("review: successful provider restoration is not reported as un-restored when projection fails", async () => {
+  const env = snapshotEnv();
+  configureStripeEnv();
+  await openTestDatabase("pglite://");
+  try {
+    const person = await seedUser("review-projection-loss");
+    const server = await createServer("Review projection", `review-${randomUUID()}`, person.id);
+    const subscriptionId = `sub_review_${server.id}`;
+    await seedLocalProSubscription({ serverId: server.id, userId: person.id, subscriptionId, packQuantity: 1, cancelAtPeriodEnd: true });
+    let cancelAtPeriodEnd = true;
+    const current = () => stripeSub({ id: subscriptionId, serverId: server.id, userId: person.id,
+      customer: `cus_${subscriptionId}`, status: "active", cancelAtPeriodEnd, canceledAt: cancelAtPeriodEnd ? 123 : null });
+    __setStripeForTests({ subscriptions: {
+      retrieve: async () => current(),
+      update: async (_id: string, body: Stripe.SubscriptionUpdateParams) => {
+        cancelAtPeriodEnd = body.cancel_at_period_end === true;
+        return current();
+      },
+    } } as unknown as Stripe);
+    await getDb().execute(sql`CREATE FUNCTION reject_review_projection() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'synthetic projection failure'; END $$`);
+    await getDb().execute(sql`CREATE TRIGGER reject_review_projection BEFORE INSERT OR UPDATE ON subscriptions FOR EACH ROW EXECUTE FUNCTION reject_review_projection()`);
+    const result = await resumeSubscriptionAfterCancelledDeletion(server.id, person.id, { stripeSubscriptionId: subscriptionId, canceledAt: 123 });
+    assert.equal(cancelAtPeriodEnd, false, "the fake provider confirmed that auto-renewal was restored");
+    assert.equal(result, "restored", "a failed projection savepoint cannot undo the provider-confirmed restoration");
+    assert.equal((await getDb().select().from(subscriptions).where(eq(subscriptions.serverId, server.id)))[0].cancelAtPeriodEnd, true, "the projection remained stale after its failed savepoint");
+    await getDb().execute(sql`DROP TRIGGER reject_review_projection ON subscriptions`);
+    await getDb().execute(sql`DROP FUNCTION reject_review_projection()`);
+    __setEmailDeliveryObserverForTests(() => {});
+    await requestAccountDeletion({ userId: person.id, source: "self", actorUserId: person.id });
+    assert.equal(cancelAtPeriodEnd, true, "the next deletion must check the provider even when the local projection still says cancelled");
+  } finally {
+    __setEmailDeliveryObserverForTests(null);
+    restoreEnv(env);
+  }
 });

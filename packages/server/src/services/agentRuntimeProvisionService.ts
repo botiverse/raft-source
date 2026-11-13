@@ -33,6 +33,7 @@
  * ordered; edits are last-write-wins (the PATCH sends the Agent's current
  * name/instructions and marks the revision it read as synced).
  */
+import { ASSISTANT_INSTRUCTIONS_VERSION, assistantInstructionsWithOwnerNotes } from "./assistantInstructions";
 import { hostname } from "node:os";
 import { randomUUID } from "node:crypto";
 import { and, eq, gt, inArray, isNull, lt, lte, or, sql } from "drizzle-orm";
@@ -46,8 +47,9 @@ import {
   type AgentRuntimeProviderKind,
 } from "@botiverse/raft-shared";
 import { getDb, type DatabaseExecutor } from "../db/index";
-import { agentCredentials, agentRuntimeProvisions, agents, serverMembers, servers } from "../db/schema";
-import { HOSTED_RUNTIME_AGENT_CAPABILITIES, mintAgentCredential } from "./agentCredentialService";
+import { agentCredentials, agentRuntimeProvisions, agents, assistantOwnerNotes, serverMembers, servers } from "../db/schema";
+import { ASSISTANT_AGENT_CAPABILITIES, HOSTED_RUNTIME_AGENT_CAPABILITIES, mintAgentCredential } from "./agentCredentialService";
+import { recordAgentCredentialsBulkRevoked, recordIntegrationAuditEvent, type ServerAuditContext } from "./integrationAuditService";
 import {
   AgentRuntimeProviderError,
   assertAgentRuntimeProviderSecretKeyConfigured,
@@ -95,9 +97,19 @@ export function providerAgentName(agent: { name: string; displayName: string | n
   return (display || agent.name).slice(0, PROVIDER_NAME_MAX);
 }
 
-/** Raft has no separate system-prompt field; the Agent's description is its instructions. */
-export function providerAgentInstructions(agent: { description: string | null }): string {
+/**
+ * Raft has no separate system-prompt field; the Agent's description is its
+ * instructions. A personal assistant gets Raft's assistant instructions
+ * instead, then its owner's notes (RFC 077).
+ */
+export function providerAgentInstructions(agent: { description: string | null; assistantOwnerNotes?: string | null }, options: { assistant?: boolean } = {}): string {
+  if (options.assistant) return assistantInstructionsWithOwnerNotes(agent.assistantOwnerNotes).slice(0, PROVIDER_INSTRUCTIONS_MAX);
   return (agent.description ?? "").slice(0, PROVIDER_INSTRUCTIONS_MAX);
+}
+
+/** The Raft instructions version the provider gets with this agent's instructions, or null when Raft sends none. */
+export function providerInstructionsVersion(options: { assistant?: boolean }): string | null {
+  return options.assistant ? ASSISTANT_INSTRUCTIONS_VERSION : null;
 }
 
 export function provisionBackoffMs(attempt: number): number {
@@ -140,6 +152,8 @@ export async function recordAgentProvisioning(tx: DatabaseExecutor, input: {
   /** An offered model id the creator picked; null/absent = the provider's default. */
   model?: string | null;
   profile?: "raftbench_service";
+  /** A personal assistant (RFC 075 v4): its credential carries only ASSISTANT_AGENT_CAPABILITIES. */
+  assistant?: boolean;
   /** Workspace import after create: a registered source (agentRuntimeProvisionImport) and its reference. */
   importSource?: string;
   importRef?: string | null;
@@ -162,11 +176,27 @@ export async function recordAgentProvisioning(tx: DatabaseExecutor, input: {
   }
   const minted = await mintAgentCredential({
     agentId: input.agent.id,
-    scopes: input.profile === "raftbench_service" ? ["read", "raftbench"] : HOSTED_RUNTIME_AGENT_CAPABILITIES,
+    scopes: input.profile === "raftbench_service" ? ["read", "raftbench"]
+      : input.assistant ? ASSISTANT_AGENT_CAPABILITIES
+      : HOSTED_RUNTIME_AGENT_CAPABILITIES,
     name: "Cloud runtime",
-    createdByUserId: input.createdByUserId,
+    // The provider holds this key and no person ever sees it, so it names no
+    // issuer; the creator who triggered it is the audit event's actor below.
+    issuedVia: "provision",
+    createdByUserId: null,
     requireExternalRuntime: true,
   }, { executor: tx });
+  // The creator's authority mints it; ids and scopes only, never the key.
+  await recordIntegrationAuditEvent({
+    serverId: minted.serverId,
+    eventType: "agent_credential.issued",
+    outcome: "success",
+    source: "web",
+    actor: { type: "human", id: input.createdByUserId },
+    subject: { type: "agent", id: minted.agentId },
+    target: { type: "agent_credential", id: minted.credentialId },
+    metadata: { agentId: minted.agentId, credentialId: minted.credentialId, scopes: minted.scopes, issuedVia: minted.issuedVia },
+  }, tx);
   const now = currentDate();
   await tx.insert(agentRuntimeProvisions).values({
     agentId: input.agent.id,
@@ -177,7 +207,8 @@ export async function recordAgentProvisioning(tx: DatabaseExecutor, input: {
     credentialId: minted.credentialId,
     encryptedCredential: encryptProviderSecret(minted.apiKey, credentialScope(input.agent.id)),
     provisionedName: providerAgentName(input.agent),
-    provisionedInstructions: providerAgentInstructions(input.agent),
+    provisionedInstructions: providerAgentInstructions(input.agent, { assistant: input.assistant === true }),
+    instructionsVersion: providerInstructionsVersion({ assistant: input.assistant === true }),
     provisionedModel: input.model ?? null,
     provisionedProfile: input.profile ?? null,
     importSource: input.importSource ?? null,
@@ -210,18 +241,22 @@ export async function noteProvisionedAgentProfileEdit(tx: DatabaseExecutor, agen
  * transaction, so it is committed before the worker can issue the provider
  * DELETE) and turn the record into a deletion tombstone.
  */
-export async function beginProvisionedAgentDeletion(tx: DatabaseExecutor, agentId: string, revokedByUserId: string | null): Promise<boolean> {
-  const [row] = await tx.select({ state: agentRuntimeProvisions.state })
+export async function beginProvisionedAgentDeletion(tx: DatabaseExecutor, agentId: string, revokedByUserId: string | null, audit?: ServerAuditContext): Promise<boolean> {
+  const [row] = await tx.select({ state: agentRuntimeProvisions.state, serverId: agentRuntimeProvisions.serverId })
     .from(agentRuntimeProvisions)
     .where(eq(agentRuntimeProvisions.agentId, agentId))
     .for("update");
   if (!row || row.state === "deleted" || row.state === "deleting") return false;
   const now = currentDate();
-  await tx.update(agentCredentials).set({
+  const revoked = await tx.update(agentCredentials).set({
     revokedAt: now,
     revokedReason: "agent_deleted",
     ...(revokedByUserId ? { revokedByUserId } : {}),
-  }).where(and(eq(agentCredentials.agentId, agentId), isNull(agentCredentials.revokedAt)));
+  }).where(and(eq(agentCredentials.agentId, agentId), isNull(agentCredentials.revokedAt)))
+    .returning({ id: agentCredentials.id });
+  await recordAgentCredentialsBulkRevoked({
+    serverId: row.serverId, agentId, actorUserId: revokedByUserId, revokedCount: revoked.length, reason: "agent_deleted", audit,
+  }, tx);
   await tx.update(agentRuntimeProvisions).set({
     state: "deleting",
     encryptedCredential: null,
@@ -327,11 +362,20 @@ async function requestHostedAgentStop(provider: typeof agentRuntimeProvisions.$i
  */
 export async function settleProvisionDeleted(tx: DatabaseExecutor, agentId: string, revokedByUserId: string | null): Promise<void> {
   const now = currentDate();
-  await tx.update(agentCredentials).set({
+  const revoked = await tx.update(agentCredentials).set({
     revokedAt: now,
     revokedReason: "agent_deleted",
     ...(revokedByUserId ? { revokedByUserId } : {}),
-  }).where(and(eq(agentCredentials.agentId, agentId), isNull(agentCredentials.revokedAt)));
+  }).where(and(eq(agentCredentials.agentId, agentId), isNull(agentCredentials.revokedAt)))
+    .returning({ id: agentCredentials.id });
+  const [agent] = revoked.length > 0
+    ? await tx.select({ serverId: agents.serverId }).from(agents).where(eq(agents.id, agentId))
+    : [];
+  if (agent) {
+    await recordAgentCredentialsBulkRevoked({
+      serverId: agent.serverId, agentId, actorUserId: revokedByUserId, revokedCount: revoked.length, reason: "agent_deleted",
+    }, tx);
+  }
   await tx.update(agentRuntimeProvisions).set({
     state: "deleted",
     deletedAt: now,
@@ -525,7 +569,7 @@ export async function claimProvision(agentId: string, leaseOwner: string, now: D
 
 type Outcome =
   | { kind: "post_ok"; providerAgentId: string; push: { registered: boolean; error: string | null } }
-  | { kind: "patch_ok"; revision: number }
+  | { kind: "patch_ok"; revision: number; instructionsVersion?: string | null }
   | { kind: "delete_ok" }
   | { kind: "import_ok" }
   | { kind: "import_retry"; code: string; message: string; httpStatus: number | null }
@@ -639,14 +683,19 @@ async function execute(row: ProvisionRow, op: Operation): Promise<Outcome> {
     name: agents.name,
     displayName: agents.displayName,
     description: agents.description,
-  }).from(agents).where(eq(agents.id, row.agentId)).limit(1);
+    assistantOwnerUserId: agents.assistantOwnerUserId,
+    assistantOwnerNotes: assistantOwnerNotes.notes,
+  }).from(agents).leftJoin(assistantOwnerNotes, eq(assistantOwnerNotes.agentId, agents.id)).where(eq(agents.id, row.agentId)).limit(1);
   if (!agent || !row.providerAgentId) {
     return { kind: "patch_ok", revision: row.desiredRevision };
   }
+  const assistant = agent.assistantOwnerUserId !== null;
   const result = await providerRequest(config, "PATCH", providerAgentPath(row.providerAgentId, row.serverId), {
-    body: { name: providerAgentName(agent), instructions: providerAgentInstructions(agent) },
+    body: { name: providerAgentName(agent), instructions: providerAgentInstructions(agent, { assistant }) },
   });
-  if (result.kind === "response" && result.status >= 200 && result.status < 300) return { kind: "patch_ok", revision: row.desiredRevision };
+  if (result.kind === "response" && result.status >= 200 && result.status < 300) {
+    return { kind: "patch_ok", revision: row.desiredRevision, instructionsVersion: providerInstructionsVersion({ assistant }) };
+  }
   const c = classify(result);
   return { kind: c.retryable ? "retry" : "terminal", code: c.code, message: c.message, httpStatus: c.httpStatus };
 }
@@ -716,6 +765,7 @@ async function finish(claimed: ProvisionRow, op: Operation, outcome: Outcome, no
         patch = {
           ...release,
           ...clearError,
+          ...(outcome.instructionsVersion !== undefined ? { instructionsVersion: outcome.instructionsVersion } : {}),
           syncedRevision: Math.max(current.syncedRevision, outcome.revision),
           attemptCount: 0,
           nextAttemptAt: now,
@@ -770,6 +820,31 @@ async function finish(claimed: ProvisionRow, op: Operation, outcome: Outcome, no
 export interface ProvisionDrainSummary { claimed: number; succeeded: number; retried: number; failed: number }
 
 /** Process due rows once. Safe to run concurrently on every replica. */
+/**
+ * RFC 077: an upgrade of Raft's assistant instructions reaches every live
+ * assistant without a script. An active assistant
+ * provision with nothing pending and no standing error whose provider got
+ * another version (or none)
+ * is queued for one PATCH, exactly like a profile edit; the worker records the
+ * version it sent. Returns how many were queued.
+ */
+export async function queueAssistantInstructionUpgrades(now: Date = currentDate()): Promise<number> {
+  const rows = await getDb().update(agentRuntimeProvisions).set({
+    desiredRevision: sql`${agentRuntimeProvisions.desiredRevision} + 1`,
+    attemptCount: 0,
+    nextAttemptAt: now,
+    updatedAt: now,
+  }).where(and(
+    eq(agentRuntimeProvisions.state, "active"),
+    eq(agentRuntimeProvisions.syncedRevision, agentRuntimeProvisions.desiredRevision),
+    // A PATCH the provider refused for good is not resent every pass (the error shows; an edit or retry resends).
+    isNull(agentRuntimeProvisions.lastErrorCode),
+    sql`${agentRuntimeProvisions.instructionsVersion} IS DISTINCT FROM ${ASSISTANT_INSTRUCTIONS_VERSION}`,
+    sql`EXISTS (SELECT 1 FROM ${agents} WHERE ${agents.id} = ${agentRuntimeProvisions.agentId} AND ${agents.assistantOwnerUserId} IS NOT NULL AND ${agents.deletedAt} IS NULL)`,
+  )).returning({ agentId: agentRuntimeProvisions.agentId });
+  return rows.length;
+}
+
 export async function drainAgentRuntimeProvisions(input: {
   leaseOwner?: string;
   batchSize?: number;
@@ -782,6 +857,7 @@ export async function drainAgentRuntimeProvisions(input: {
   const leaseOwner = input.leaseOwner ?? defaultLeaseOwner;
   const clock = input.now ?? currentDate;
   const summary: ProvisionDrainSummary = { claimed: 0, succeeded: 0, retried: 0, failed: 0 };
+  await queueAssistantInstructionUpgrades(clock());
   const candidates = await getDb().select({ agentId: agentRuntimeProvisions.agentId })
     .from(agentRuntimeProvisions)
     .where(dueCondition(clock()))

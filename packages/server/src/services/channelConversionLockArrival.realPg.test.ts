@@ -178,7 +178,7 @@ test.skipIf(!REAL_PG_URL && !REAL_PG_REQUIRED)(
       await migrate(drizzle(setupPool, { schema }), { migrationsFolder: MIGRATIONS_FOLDER });
       await setupPool.end();
       setupPool = undefined;
-      app = await startTestApp(testUrl, 0, { channelToJointConversionFlagDefaultEnabled: true, humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+      app = await startTestApp(testUrl, 0, { humanActivityMuteFlagDefaultEnabled: true });
       observationPool = new pg.Pool({
         connectionString: testUrl,
         application_name: "channel-conversion-lock-arrival-observer",
@@ -263,7 +263,7 @@ test.skipIf(!REAL_PG_URL && !REAL_PG_REQUIRED)(
         });
 
         try {
-          const executed = await executeActionCard({
+          const executed = await executeActionCard({ webSessionFamilyId: null,
             messageId: card.messageId,
             serverId: server.id as ServerId,
             userId: owner.id,

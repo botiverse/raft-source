@@ -43,6 +43,23 @@ function isExactAcknowledgement(
     && ack.sourceRef.revision === item.sourceRef.revision;
 }
 
+const FULL_REMINDER_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+/**
+ * A failed daemon ack as the agent reads it. The daemon says whether the
+ * reminder is still not acked and whether the same ack is safe to run again
+ * (its `suggested_next_action`); ACK_UNREACHABLE: it could not reach the Server.
+ */
+function ackFailure(ack: { status: number; error?: string | null; errorCode?: string | null; suggestedNextAction?: string | null }): Error {
+  return cliError(
+    ack.errorCode === "app_source_ack_unavailable"
+      ? "ACK_UNREACHABLE"
+      : ack.status >= 500 ? "SERVER_5XX" : "ACK_FAILED",
+    ack.error ?? `HTTP ${ack.status}`,
+    ack.suggestedNextAction ? { suggestedNextAction: ack.suggestedNextAction } : {},
+  );
+}
+
 function parseAckOptions(opts: AckOpts): { id: string; revision: string } {
   const id = opts.id?.trim();
   if (!id) {
@@ -123,13 +140,39 @@ async function runReminderAck(ctx: CommandContext, opts: AckOpts): Promise<void>
     if (!exact) {
       const acknowledged = reminderAcknowledgements.find((ack) => ack.sourceRef.revision === revision);
       if (acknowledged) {
+        // Acked here, perhaps only here (a daemon before reminder-server-ack@1):
+        // the daemon sends the Server the ack; its answer is the answer, and
+        // "already acknowledged" there is a success.
+        const forwarded = await daemonApi.inbox.ack({ itemId: acknowledged.itemId });
+        if (!forwarded.ok && !(forwarded.status === 404 && forwarded.errorCode === "item_not_found")) {
+          throw ackFailure(forwarded);
+        }
         writeText(ctx.io, adoptCliReplyText(`Reminder ${acknowledged.sourceRef.id} revision ${revision} was already acknowledged for this fired item.\n`));
         return;
       }
-      if (reminderItems.length > 0) {
-        throw cliError("ACK_FAILED", `No active reminder Inbox item matches ${id} revision ${revision}`);
+      if (distinctReminderIds.size === 0 && !FULL_REMINDER_ID.test(id)) {
+        throw cliError(
+          "ACK_FAILED",
+          `No reminder Inbox item on this Computer matches ${id} revision ${revision}, so the short id cannot be resolved`,
+          { suggestedNextAction: "Run the ack with the full reminder id from its ack: line in raft inbox check." },
+        );
       }
-      throw cliError("ACK_FAILED", `No active or acknowledged reminder Inbox item matches ${id} revision ${revision}`);
+      // Not held here (a lost store, another machine): ack the exact source on
+      // the Server, by the full id.
+      const reminderId = distinctReminderIds.size === 1 ? [...distinctReminderIds][0]! : id;
+      const sourceRef = { kind: "reminder", id: reminderId, revision };
+      const forwarded = await daemonApi.inbox.ack({
+        itemId: `reminder:${reminderId}:${revision}`,
+        source: { appId: REMINDER_INBOX_APP_ID, notificationClass: REMINDER_DUE_NOTIFICATION_CLASS, sourceRef },
+      });
+      if (!forwarded.ok) {
+        if (forwarded.status === 404 && forwarded.errorCode === "item_not_found") {
+          throw cliError("ACK_FAILED", `No active or acknowledged reminder Inbox item matches ${id} revision ${revision}`);
+        }
+        throw ackFailure(forwarded);
+      }
+      writeText(ctx.io, adoptCliReplyText(`Reminder ${reminderId} revision ${revision} fired item acknowledged.\n`));
+      return;
     }
     const protectingSeal = findReminderSeal(seals, exact.sourceRef.id);
     if (protectingSeal) throw sealedReminderError(protectingSeal);
@@ -148,10 +191,7 @@ async function runReminderAck(ctx: CommandContext, opts: AckOpts): Promise<void>
         throw cliError("ACK_FAILED", `No durable acknowledgement was recorded for reminder ${exact.sourceRef.id} revision ${revision}`);
       }
     } else if (!ack.ok) {
-      throw cliError(
-        ack.status >= 500 ? "SERVER_5XX" : "ACK_FAILED",
-        ack.error ?? `HTTP ${ack.status}`,
-      );
+      throw ackFailure(ack);
     }
 
     writeText(ctx.io, adoptCliReplyText(`Reminder ${exact.sourceRef.id} revision ${revision} fired item acknowledged.\n`));

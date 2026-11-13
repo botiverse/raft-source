@@ -22,7 +22,7 @@ import { BasicTracer, MemoryTraceSink } from "@botiverse/raft-shared";
 import { createMessage, __setExternalAgentInboxChainSelectorForTests, __setExternalWakeFollowUpPullDelaysMsForTests } from "../services/messageService";
 
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 // CI has no RisingWave: the external agent inbox pull reads the test-only
 // reference derivation of the agent inbox chain.
@@ -47,6 +47,7 @@ async function seedExternalFixture() {
     agentId: agent.id,
     scopes: ["send", "read"],
     name: "wake-stream-test",
+    issuedVia: "computer",
     createdByUserId: null,
   });
   return { ownerId: owner!.id, ownerName: owner!.name, serverId: server.id, channelId: channel.id, channelName: channel.name, agentId: agent.id, apiKey: minted.apiKey };
@@ -200,7 +201,7 @@ test("a valid sk_machine credential is rejected before the stream opens (wrong p
 // stay non-draining / zero-cursor, and not double-push what was already sent.
 test("heartbeat tick pushes durable pending the in-process emitter never announced (split-brain rescue)", async () => {
   process.env.SLOCK_WAKE_STREAM_HEARTBEAT_MS = "300";
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const f = await seedExternalFixture();
     const orchestrator = new AgentOrchestrator() as any;
@@ -251,7 +252,7 @@ test("heartbeat tick pushes durable pending the in-process emitter never announc
 test("a wake signal that outruns the inbox chain still reaches the stream through the follow-up pulls", async () => {
   process.env.SLOCK_WAKE_STREAM_HEARTBEAT_MS = "60000"; // park the heartbeat out of the test window
   __setExternalWakeFollowUpPullDelaysMsForTests([300, 800]);
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   let chainHasMessage = false;
   let readsWithoutMessage = 0;
   __setExternalAgentInboxChainSelectorForTests(async (agentId: string) => {
@@ -297,7 +298,7 @@ test("a wake signal that outruns the inbox chain still reaches the stream throug
 // root trace that points back at the stream.
 test("every stream pull is its own root trace that names the stream; the stream span keeps only connection events", async () => {
   process.env.SLOCK_WAKE_STREAM_HEARTBEAT_MS = "250";
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const sink = new MemoryTraceSink();
     app.app.set("serverTracer", new BasicTracer({ sink }));

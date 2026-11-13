@@ -14,9 +14,26 @@ const entryHash = typeof window !== "undefined" ? window.location.hash : "";
 
 type Saved = { path: string; ts: number };
 
-function isResumable(path: string): boolean {
-  if (!path.startsWith("/s/")) return false;
-  return true;
+/** The server slug of an in-app `/s/<slug>/...` path, or null. */
+function serverSlugOf(path: string): string | null {
+  const match = path.match(/^\/s\/([^/?#]+)/);
+  if (!match) return null;
+  try {
+    return decodeURIComponent(match[1]!);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Only a server the user has joined is a place to come back to. A public
+ * server they are only reading (`/s/<slug>` for a nonmember renders the public
+ * page) is not: resuming into it from `/` dropped people on someone else's
+ * server instead of their own (task #134).
+ */
+function isResumable(path: string, isJoinedServerSlug: (slug: string) => boolean): boolean {
+  const slug = serverSlugOf(path);
+  return slug !== null && isJoinedServerSlug(slug);
 }
 
 function readSaved(): Saved | null {
@@ -33,6 +50,20 @@ function readSaved(): Saved | null {
 }
 
 /**
+ * Settings › Account › Delete Account is never a place to come back to: once a
+ * deletion is cancelled (pages/accountDeletionReturn.ts) a resume there showed
+ * the page stuck loading instead of the app.
+ */
+function isDeleteAccountPath(path: string): boolean {
+  return /^\/s\/[^/?#]+\/settings\/account\/delete(?:[/?#]|$)/.test(path);
+}
+
+/** The last in-app location saved (within a day), or null. */
+export function readLastLocationPath(): string | null {
+  return readSaved()?.path ?? null;
+}
+
+/**
  * Persist the current in-app location and, on a cold PWA resume that lands on
  * `/` (the manifest start_url), redirect back to the last deep location.
  *
@@ -40,7 +71,7 @@ function readSaved(): Saved | null {
  * re-launches from `start_url`, which drops the user on the default channel
  * instead of where they left off.
  */
-export function useLastLocationResume(enabled: boolean) {
+export function useLastLocationResume(enabled: boolean, isJoinedServerSlug: (slug: string) => boolean) {
   const location = useLocation();
   const navigate = useNavigate();
   // A deliberate Server Picker navigation owns this whole page load. Capture
@@ -61,18 +92,18 @@ export function useLastLocationResume(enabled: boolean) {
     }
     restoredRef.current = true;
     const saved = readSaved();
-    if (!saved || !isResumable(saved.path)) return;
+    if (!saved || !isResumable(saved.path, isJoinedServerSlug) || isDeleteAccountPath(saved.path)) return;
     navigate(saved.path, { replace: true });
-  }, [enabled, navigate]);
+  }, [enabled, isJoinedServerSlug, navigate]);
 
   useEffect(() => {
     if (!enabled) return;
     const path = location.pathname + location.search + location.hash;
-    if (!isResumable(path)) return;
+    if (!isResumable(path, isJoinedServerSlug) || isDeleteAccountPath(path)) return;
     try {
       localStorage.setItem(STORAGE_KEY, JSON.stringify({ path, ts: Date.now() }));
     } catch {
       // ignore quota / privacy-mode failures
     }
-  }, [enabled, location.pathname, location.search, location.hash]);
+  }, [enabled, isJoinedServerSlug, location.pathname, location.search, location.hash]);
 }

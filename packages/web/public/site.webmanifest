@@ -18,5 +18,10 @@
   ],
   "theme_color": "#FFD440",
   "background_color": "#FFD440",
+  "color_scheme_dark": {
+    "theme_color": "#0D0D0B",
+    "background_color": "#0D0D0B"
+  },
+  "display_override": ["window-controls-overlay"],
   "display": "standalone"
 }

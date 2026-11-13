@@ -57,10 +57,11 @@ export async function handleAgentKnowledgeGet(
   }
 
   const contextContractVersion = resolveKnowledgeContextContractVersion(req);
+  const contextRequired = knowledgeContextRequired(source, contextContractVersion);
   const intent = resolveKnowledgeContext(
     req.query.intent,
     "intent",
-    contextContractVersion !== null,
+    contextRequired,
   );
   if (!intent.ok) {
     res.status(400).json({
@@ -74,7 +75,7 @@ export async function handleAgentKnowledgeGet(
   const reason = resolveKnowledgeContext(
     req.query.reason,
     "reason",
-    contextContractVersion !== null,
+    contextRequired,
   );
   if (!reason.ok) {
     res.status(400).json({
@@ -116,7 +117,7 @@ export async function handleAgentKnowledgeGet(
     if (!resolved) {
       const guidance = await buildAgentKnowledgeNotFoundGuidanceWithCandidates(
         topic,
-        contextContractVersion !== null,
+        contextRequired,
       );
       await recordAgentKnowledgeEvent({
         serverId: actor.serverId,
@@ -235,10 +236,11 @@ export async function handleAgentKnowledgeSearch(
   }
 
   const contextContractVersion = resolveKnowledgeContextContractVersion(req);
+  const contextRequired = knowledgeContextRequired(source, contextContractVersion);
   const intent = resolveKnowledgeContext(
     req.query.intent,
     "intent",
-    contextContractVersion !== null,
+    contextRequired,
   );
   if (!intent.ok) {
     res.status(400).json({
@@ -252,7 +254,7 @@ export async function handleAgentKnowledgeSearch(
   const reason = resolveKnowledgeContext(
     req.query.reason,
     "reason",
-    contextContractVersion !== null,
+    contextRequired,
   );
   if (!reason.ok) {
     res.status(400).json({
@@ -310,7 +312,6 @@ export async function handleAgentKnowledgeSearch(
         reason: reason.value,
         contextContractVersion,
       });
-      const contextRequired = contextContractVersion !== null;
       const retryContext = contextRequired ? ", keeping your --intent/--reason" : "";
       res.status(404).json({
         ok: false,
@@ -341,7 +342,6 @@ export async function handleAgentKnowledgeSearch(
         contextContractVersion,
       });
       const scopeHint = scope ? ` in ${scope}` : "";
-      const contextRequired = contextContractVersion !== null;
       const indexCommand = buildAgentKnowledgeIndexCommand(contextRequired);
       const retryContext = contextRequired ? ", keeping your --intent/--reason" : "";
       res.status(404).json({
@@ -439,12 +439,28 @@ export function serializeKnowledgeSearch(query: string, scope: string | null, re
   };
 }
 
+/**
+ * `cli`: the raft CLI (also anything forwarded by a Computer's agent proxy,
+ * which stamps `cli` on every request). `sdk`: the raft SDK, which names
+ * itself, and a request with no client header at all: SDK builds before it
+ * named itself, and the cloud runtime, send none. Any other value is refused.
+ */
 function resolveKnowledgeSource(req: Request): AgentKnowledgeSource | null {
   // Dual-read is permanent: senders switched from X-Slock-Client to
   // X-Raft-Client in the slock→raft rename, but already-deployed CLI/daemon
   // builds keep sending the legacy header indefinitely.
   const client = req.header("X-Raft-Client") ?? req.header("X-Slock-Client");
+  if (client === undefined || client === "sdk") return "sdk";
   return client === "cli" ? "cli" : null;
+}
+
+/**
+ * Whether intent and reason are required: when the client declares the
+ * Manual context contract, and always for the SDK source, declared or
+ * inferred (the SDK's manual operations refuse a call without both).
+ */
+function knowledgeContextRequired(source: AgentKnowledgeSource, contextContractVersion: string | null): boolean {
+  return contextContractVersion !== null || source === "sdk";
 }
 
 function resolveKnowledgeContextContractVersion(req: Request): string | null {

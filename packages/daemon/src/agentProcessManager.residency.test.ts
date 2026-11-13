@@ -7,14 +7,13 @@ import type { ChildProcess } from "node:child_process";
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { asAxSurfaceText, type AgentMessage } from "@botiverse/raft-shared";
+import { asAxSurfaceText, type AgentConfig, type AgentMessage } from "@botiverse/raft-shared";
 import { AgentProcessManager } from "./agentProcessManager";
 import { setDaemonFetchImplForTests } from "./daemonFetch";
 import type { RuntimeDriver } from "./drivers/index";
 import { promptConfig } from "./testing/promptFixture";
 import type { AgentLifecycleRecords } from "./agentLifecycleRecord";
 import type { AgentStartPendingDeliveryBuffer } from "./agentStartPendingDeliveryBuffer";
-import type { TerminalRuntimeFailureEvidence } from "./runtimeOutcome";
 import { drainAgentManagerForTests } from "./testing/agentManagerTeardown";
 
 class FakeChild extends EventEmitter {
@@ -37,7 +36,7 @@ type ManagerInternals = {
   agents: Map<string, { inbox: AgentMessage[] }>;
   lifecycleRecords: AgentLifecycleRecords;
   startingInboxes: AgentStartPendingDeliveryBuffer;
-  cleanupTerminalRuntimeFailure(agentId: string, ap: unknown, detail: string, failure: TerminalRuntimeFailureEvidence): void;
+  refuseUnreliableSpawn(agentId: string, start: { config: AgentConfig; wakeMessage?: AgentMessage; wakeMessageTransient: boolean; launchId?: string }, detail: string, spawnTraceparent: string): void;
   consumeVisibleMessages(agentId: string, input: { messages: AgentMessage[]; source: string }): void;
 };
 
@@ -65,7 +64,7 @@ async function withManager(run: (manager: AgentProcessManager) => Promise<void>)
     id: "prompt-test",
     lifecycle: { kind: "persistent", stdin: "direct", inFlightWake: "steer" },
     communication: { chat: "slock_cli", runtimeControl: "none" },
-    session: { recovery: "resume_or_fresh" },
+    session: { recovery: "resume_or_fresh", compaction: "reported", compactionFailure: "does_not_stick" } as const,
     model: { detectedModelsVerifiedAs: "suggestion_only" },
     supportsStdinNotification: true,
     busyDeliveryMode: "direct",
@@ -106,19 +105,19 @@ async function withManager(run: (manager: AgentProcessManager) => Promise<void>)
   }
 }
 
-/** Drive `victim` into the real terminal-runtime-failure cleanup with one buffered message. */
+/**
+ * Drive `victim` into the real terminal residency with one buffered message.
+ * Reconciler step 12: terminal records are RFC 071's refused spawn's only
+ * (`refuseUnreliableSpawn`); a runtime's own failure no longer writes one.
+ */
 async function terminalFailureWithPendingInbox(manager: AgentProcessManager, victim: string): Promise<void> {
-  await manager.startAgent(victim, promptConfig({ name: victim, displayName: victim }));
   const m = internals(manager);
-  const ap = m.agents.get(victim);
-  expect(ap, "victim must be running before terminal cleanup").toBeTruthy();
-  ap!.inbox.push(makeMessage("buffered while failing", { message_id: `${victim}-pending`, seq: 7 }));
-  // RFC 071: the terminal cleanup requires the raw-text failure evidence it reports as E1.
-  m.cleanupTerminalRuntimeFailure(victim, ap, "auth-class terminal runtime error", {
-    failureKind: "sticky_runtime_error",
-    fingerprint: "0123456789abcdef",
-    errorClass: "AuthError",
-  });
+  m.refuseUnreliableSpawn(victim, {
+    config: promptConfig({ name: victim, displayName: victim }),
+    wakeMessage: makeMessage("buffered while failing", { message_id: `${victim}-pending`, seq: 7 }),
+    wakeMessageTransient: false,
+    launchId: `${victim}-launch`,
+  }, "the runtime outcome of the last launch is unknown", "");
   expect(m.lifecycleRecords.getTerminalFailure(victim)).toBeTruthy();
   expect(m.startingInboxes.has(victim)).toBe(true);
 }

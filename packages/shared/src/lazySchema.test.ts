@@ -5,11 +5,11 @@ import { resolve } from "node:path";
 import { afterEach, test, vi } from "vitest";
 import { z } from "zod";
 
-const SCRIPT = resolve(__dirname, "../scripts/lazy-contract-schemas.mjs");
+const SCRIPT = resolve(__dirname, "../scripts/lazy-contract-schemas.ts");
 
-// Every module the rewrite wrapped (scripts/lazy-contract-schemas.mjs --list).
+// Every module the rewrite wrapped (scripts/lazy-contract-schemas.ts --list).
 const CONTRACT_MODULES: string[] = (JSON.parse(
-  spawnSync(process.execPath, [SCRIPT, "--list"], { encoding: "utf8" }).stdout,
+  spawnSync(process.execPath, ["--import", "@oxc-node/core/register", SCRIPT, "--list"], { encoding: "utf8" }).stdout,
 ) as string[]).map((module) => `./${module}`);
 
 async function importContracts(): Promise<Record<string, unknown>[]> {
@@ -53,9 +53,9 @@ afterEach(() => {
   vi.resetModules();
 });
 
-test("the shared sources are fully rewritten by scripts/lazy-contract-schemas.mjs", () => {
+test("the shared sources are fully rewritten by scripts/lazy-contract-schemas.ts", () => {
   assert.ok(CONTRACT_MODULES.includes("./agentApiContract") && CONTRACT_MODULES.length >= 20, CONTRACT_MODULES.join(", "));
-  const result = spawnSync(process.execPath, [SCRIPT, "--check"], { encoding: "utf8" });
+  const result = spawnSync(process.execPath, ["--import", "@oxc-node/core/register", SCRIPT, "--check"], { encoding: "utf8" });
   assert.equal(result.status, 0, result.stderr);
 });
 
@@ -112,11 +112,25 @@ test("after warm-up, own-property reads match an eager build", async () => {
   assert.deepEqual(lazy, eager);
 });
 
+// zod 4.6 installs prototype methods as "materialize bound on first read"
+// getters (util.defineBound), so any `.nullable()` / `.extend()` / … call
+// leaves an enumerable own `bound <name>` function on the schema it was
+// called on. WHICH schemas carry those caches depends on evaluation order
+// (which dependent factory ran first), not on lazy-vs-eager construction —
+// both sides materialize the same way, just at different times. They are
+// method caches, not schema data, so the comparison drops them.
+function dataOwnKeys(schema: object): string[] {
+  return Object.entries(schema)
+    .filter(([key, value]) => !(typeof value === "function" && (value as Function).name === `bound ${key}`))
+    .map(([key]) => key)
+    .sort();
+}
+
 function ownKeysOfSchemas(modules: Record<string, unknown>[]): Map<string, string[]> {
   const out = new Map<string, string[]>();
   modules.forEach((mod, index) => {
     for (const [name, value] of Object.entries(mod)) {
-      if (value instanceof z.ZodType) out.set(`${CONTRACT_MODULES[index]}:${name}`, Object.keys(value).sort());
+      if (value instanceof z.ZodType) out.set(`${CONTRACT_MODULES[index]}:${name}`, dataOwnKeys(value));
     }
   });
   return out;

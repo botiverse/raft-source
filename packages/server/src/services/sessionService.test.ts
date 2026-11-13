@@ -9,7 +9,7 @@ import {
   refreshSessionWithTrace,
   rotateSession,
 } from "./sessionService";
-import { sessionFamilies, sessions, sessionTokenPredecessors } from "../db/schema";
+import { sessions, sessionTokenPredecessors } from "../db/schema";
 import { __traceUserIdForTests, cachedTraceUserId } from "../tracing/traceUserId";
 
 type DeleteCapture = { table?: unknown };
@@ -84,8 +84,12 @@ function makeDb(options: {
     transaction: async (fn: (tx: any) => Promise<unknown>) => {
       const tx = {
         select() {
+          // The user lock (`.for("update")`) and the family's scope (awaited as is).
+          const rows = [{ retiredAt: null, traceUserId: "trace-user-1", scope: "full" }];
           return { from: () => ({ where: () => ({ limit: () => ({
-            for: async () => [{ retiredAt: null, traceUserId: "trace-user-1" }],
+            for: async () => rows,
+            then: (resolve: (value: unknown) => unknown, reject?: (reason: unknown) => unknown) =>
+              Promise.resolve(rows).then(resolve, reject),
           }) }) }) };
         },
         delete(table: unknown) {
@@ -198,7 +202,7 @@ test("rotateSession does not create a child token when no session row is consume
   assert.equal(rotated, null);
 });
 
-test("rotateSession adopts a mixed-version legacy session that has no family", async () => {
+test("rotateSession refuses a session row that has no family instead of starting one", async () => {
   const familyInsert: InsertCapture = {};
   const sessionInsert: InsertCapture = {};
   const db = makeDb({
@@ -209,11 +213,9 @@ test("rotateSession adopts a mixed-version legacy session that has no family", a
 
   const rotated = await rotateSession("legacy-refresh-token", "user-1");
 
-  assert.ok(rotated?.familyId);
-  assert.equal(familyInsert.table, sessionFamilies);
-  assert.equal(familyInsert.values?.id, rotated.familyId);
-  assert.equal(sessionInsert.table, sessions);
-  assert.equal(sessionInsert.values?.familyId, rotated.familyId);
+  assert.equal(rotated, null);
+  assert.equal(familyInsert.table, undefined);
+  assert.equal(sessionInsert.table, undefined);
 });
 
 test("refreshSession replays a just-rotated token for an old refresh token", async () => {

@@ -9,7 +9,6 @@ function currentUserFallbackMember(
   return {
     userId: currentUser.id,
     email: null,
-    gravatarHash: currentUser.gravatarHash,
     name: currentUser.name,
     displayName: currentUser.displayName,
     description: currentUser.description,

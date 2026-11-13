@@ -1,7 +1,11 @@
 import { resolveProviderConfigForServer } from "./agentRuntimeProviderTargetService";
 /**
- * Tells the hosting provider each server's plan, which sets that server's
- * daily hosted spend limit (antiproton#884: Free $3/day, Pro $10/day).
+ * Tells the hosting provider each server's plan and its two daily hosted
+ * budgets (Tenny, #raft-antiproton:f5f3e410): `dailyBudgetCents` for the
+ * server's own hosted agents (paid by the server) and
+ * `onboardingDailyBudgetCents` for its onboarding agent (paid by the
+ * platform). Raft is the source of both amounts; the provider only lowers
+ * them (its global caps, an admin emergency override).
  *
  * `hosted_runtime_server_plans` records the plan the provider last confirmed.
  * The sweep PUTs the current plan for every server that has a hosted agent
@@ -23,6 +27,19 @@ export type HostedRuntimePlan = "free" | "pro";
 export function hostedRuntimePlanFor(serverPlan: string | null | undefined): HostedRuntimePlan {
   return serverPlan === "pro" || serverPlan === "founder" || serverPlan === "partner" ? "pro" : "free";
 }
+
+export interface HostedRuntimeDailyBudgets { dailyBudgetCents: number; onboardingDailyBudgetCents: number }
+
+/**
+ * Daily hosted budgets per plan, integer cents. These reproduce the provider's
+ * own mapping before Raft sent amounts (antiproton cf/src/spend-limit.ts: Free
+ * $3, Pro $10, onboarding $1 per server), so shipping this changes nothing;
+ * tygg sets new amounts here.
+ */
+export const HOSTED_RUNTIME_DAILY_BUDGETS: Readonly<Record<HostedRuntimePlan, HostedRuntimeDailyBudgets>> = {
+  free: { dailyBudgetCents: 300, onboardingDailyBudgetCents: 100 },
+  pro: { dailyBudgetCents: 1000, onboardingDailyBudgetCents: 100 },
+};
 
 export async function getHostedRuntimePlan(serverId: string): Promise<HostedRuntimePlan> {
   const [row] = await getDb().select({ plan: servers.plan }).from(servers).where(eq(servers.id, serverId)).limit(1);
@@ -66,7 +83,23 @@ async function claimServerRow(serverId: string, provider: AgentRuntimeProviderKi
 
 type DuePlan = { serverId: string; plan: HostedRuntimePlan; failedAttempts: number | null };
 
-/** Servers with a hosted agent whose provider plan is unconfirmed or stale, and not backing off. */
+/**
+ * `HOSTED_RUNTIME_SEND_BUDGETS=true` sends the two budgets with the plan. Off
+ * (the default) keeps today's `{ plan }` body and never treats a budget
+ * mismatch as stale: a provider that does not know the fields rejects them
+ * (antiproton answers 422 `unknown field`), so this turns on per deployment
+ * only after that provider accepts them (Tenny).
+ */
+export function hostedRuntimeBudgetsEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.HOSTED_RUNTIME_SEND_BUDGETS?.trim().toLowerCase() === "true";
+}
+
+/** SQL for one budget of the mapped plan, from HOSTED_RUNTIME_DAILY_BUDGETS. */
+function budgetCentsSql(mapped: ReturnType<typeof sql>, key: keyof HostedRuntimeDailyBudgets) {
+  return sql<number>`CASE WHEN ${mapped} = 'pro' THEN ${HOSTED_RUNTIME_DAILY_BUDGETS.pro[key]}::int ELSE ${HOSTED_RUNTIME_DAILY_BUDGETS.free[key]}::int END`;
+}
+
+/** Servers with a hosted agent whose provider plan or budgets are unconfirmed or stale, and not backing off. */
 export async function dueHostedRuntimeServerPlans(input: { now?: Date; limit?: number; provider?: AgentRuntimeProviderKind } = {}): Promise<DuePlan[]> {
   const provider = input.provider ?? "antiproton";
   const now = input.now ?? currentDate();
@@ -80,7 +113,16 @@ export async function dueHostedRuntimeServerPlans(input: { now?: Date; limit?: n
     .leftJoin(hostedRuntimeServerPlans, and(eq(hostedRuntimeServerPlans.serverId, servers.id), eq(hostedRuntimeServerPlans.provider, provider)))
     .where(and(
       inArray(servers.id, hosted),
-      or(isNull(hostedRuntimeServerPlans.syncedPlan), sql`${hostedRuntimeServerPlans.syncedPlan} <> ${mapped}`),
+      or(
+        isNull(hostedRuntimeServerPlans.syncedPlan),
+        sql`${hostedRuntimeServerPlans.syncedPlan} <> ${mapped}`,
+        // With budgets on, a changed amount (a deploy of a new HOSTED_RUNTIME_DAILY_BUDGETS,
+        // or turning the setting on) re-sends to every server.
+        ...(hostedRuntimeBudgetsEnabled() ? [
+          sql`${hostedRuntimeServerPlans.syncedDailyBudgetCents} IS DISTINCT FROM ${budgetCentsSql(mapped, "dailyBudgetCents")}`,
+          sql`${hostedRuntimeServerPlans.syncedOnboardingDailyBudgetCents} IS DISTINCT FROM ${budgetCentsSql(mapped, "onboardingDailyBudgetCents")}`,
+        ] : []),
+      ),
       or(isNull(hostedRuntimeServerPlans.nextAttemptAt), lte(hostedRuntimeServerPlans.nextAttemptAt, now)),
     ))
     .limit(input.limit ?? PLAN_SYNC_BATCH);
@@ -100,16 +142,34 @@ export async function syncHostedRuntimeServerPlans(input: { now?: Date; limit?: 
     if (!config) continue;
     if (!await claimServerRow(row.serverId, provider, "plan", now)) continue;
     summary.checked += 1;
-    const result = await providerRequest(config, "PUT", providerServerPlanPath(row.serverId), { body: { plan: row.plan } });
+    const budgets = hostedRuntimeBudgetsEnabled() ? HOSTED_RUNTIME_DAILY_BUDGETS[row.plan] : null;
+    const result = await providerRequest(config, "PUT", providerServerPlanPath(row.serverId), { body: { plan: row.plan, ...budgets } });
     if (result.kind === "response" && result.status >= 200 && result.status < 300) {
       summary.synced += 1;
+      const synced = {
+        syncedPlan: row.plan,
+        // Off: record that no amounts were sent, so turning the setting on re-sends once.
+        syncedDailyBudgetCents: budgets?.dailyBudgetCents ?? null,
+        syncedOnboardingDailyBudgetCents: budgets?.onboardingDailyBudgetCents ?? null,
+        syncedAt: now,
+        failedAttempts: 0,
+        nextAttemptAt: null,
+        lastErrorCode: null,
+      };
       await getDb().insert(hostedRuntimeServerPlans)
-        .values({ serverId: row.serverId, provider, syncedPlan: row.plan, syncedAt: now, failedAttempts: 0, nextAttemptAt: null, lastErrorCode: null })
+        .values({ serverId: row.serverId, provider, ...synced })
         .onConflictDoUpdate({
           target: [hostedRuntimeServerPlans.serverId, hostedRuntimeServerPlans.provider],
-          set: { syncedPlan: row.plan, syncedAt: now, failedAttempts: 0, nextAttemptAt: null, lastErrorCode: null },
+          set: synced,
         });
-      addTraceEvent("server.hosted_runtime.plan_synced", { server_id: row.serverId, plan: row.plan });
+      addTraceEvent("server.hosted_runtime.plan_synced", {
+        server_id: row.serverId,
+        plan: row.plan,
+        ...(budgets && {
+          daily_budget_cents: budgets.dailyBudgetCents,
+          onboarding_daily_budget_cents: budgets.onboardingDailyBudgetCents,
+        }),
+      });
       continue;
     }
     summary.failed += 1;

@@ -29,7 +29,7 @@ test("mobile-app unsubscribe tokens are signed, purpose-bound, and do not expose
     userId: USER_ID,
     locale: "zh-cn",
   });
-  assert.equal(verifyMobileAppEmailUnsubscribeToken(`${token.slice(0, -1)}x`), null);
+  assert.equal(verifyMobileAppEmailUnsubscribeToken(`${token.slice(0, -1)}${token.endsWith("x") ? "y" : "x"}`), null);
   assert.equal(verifyMobileAppEmailUnsubscribeToken(`${token}.extra`), null);
   assert.doesNotMatch(token, /@|example\.com/);
 });

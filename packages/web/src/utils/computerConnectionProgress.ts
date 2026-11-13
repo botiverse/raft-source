@@ -34,6 +34,14 @@ export function resolveComputerConnectionProgress<T extends AddMachineConnection
   machines: T[],
   pendingMachineId: string,
   baseline: AddMachineConnectionBaseline[],
+  {
+    includeAlreadyOnline = true,
+  }: {
+    // The onboarding gate: yes (below). The Add Computer dialog: no, it is
+    // adding another computer, so one that was online before the attempt
+    // began is not the one being added.
+    includeAlreadyOnline?: boolean;
+  } = {},
 ): ComputerConnectionProgress<T> {
   // "Connected" is the stricter question (online + attributable + owned), so it
   // is asked first and reuses the resolver the Add Computer dialog already ships.
@@ -67,6 +75,7 @@ export function resolveComputerConnectionProgress<T extends AddMachineConnection
   // when we started (the setup gate still shows this surface when a computer is
   // online without a usable runtime). It is already connected; saying otherwise
   // would ask the user to set up a computer they have.
+  if (!includeAlreadyOnline) return { state: "idle", machine: null, requiresConfirmation: false };
   const alreadyOnline = machines.find(
     (machine) =>
       Boolean(machine.isComputer) &&

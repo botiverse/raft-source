@@ -13,7 +13,7 @@ import {
 } from "./runtimeFormV2Registry";
 
 test("the v2 registry holds exactly the runtimes that have a v2 form today", () => {
-  assert.deepEqual(runtimeFormV2RuntimeIds().sort(), ["antigravity", "builtin", "claude", "codex", "copilot", "cursor", "gemini", "grok", "kimi", "kimi-sdk", "opencode", "pi"]);
+  assert.deepEqual(runtimeFormV2RuntimeIds().sort(), ["antigravity", "builtin", "claude", "codebuddy", "codex", "copilot", "cursor", "gemini", "grok", "kimi", "kimi-sdk", "opencode", "pi", "qoder", "qwen"]);
 });
 
 test("since batch 4 every runtime in the catalog has a v2 form", () => {

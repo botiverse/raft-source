@@ -717,41 +717,6 @@ model SnapshotRequiredResponse {
   @body body: SnapshotRequiredBody;
 }
 
-@route("/activity/snapshot")
-@get
-op getActivitySnapshot(
-  @query requestId: OpaqueId,
-  @query filter?: ActivityFilter,
-  @query windowId?: "main",
-):
-  | {
-      @statusCode statusCode: 200;
-      @body body: SnapshotIngress;
-    }
-  | V1BadRequestResponse
-  | V1UnauthorizedResponse
-  | V1ForbiddenResponse
-  | V1InternalErrorResponse;
-
-@route("/activity/difference")
-@get
-op getActivityDifference(
-  @query requestId: OpaqueId,
-  @query epoch: UInt64String,
-  @query afterWatermark: UInt64String,
-  @query filter?: ActivityFilter,
-  @query windowId?: "main",
-):
-  | {
-      @statusCode statusCode: 200;
-      @body body: DifferenceIngress | NotModifiedIngress;
-    }
-  | SnapshotRequiredResponse
-  | V1BadRequestResponse
-  | V1UnauthorizedResponse
-  | V1ForbiddenResponse
-  | V1InternalErrorResponse;
-
 @route("/inbox")
 @get
 op getInbox(

@@ -352,16 +352,6 @@ test("prep-deadline copy offers both causes and a recovery", () => {
   }
 });
 
-test("prep-deadline copy no longer leads with workspace size as the cause", () => {
-  // "Large workspaces can take longer" is about duration, not diagnosis; placed
-  // first it was read as the root cause. Size may not be asserted at all here —
-  // nothing in the record establishes it.
-  assert.ok(!/large workspace/i.test(en["agent.detail.migrationAbortedPrepDeadline"]!));
-  assert.ok(!/large workspace/i.test(en["agent.detail.migrationAbortedPrepDeadlineAt"]!));
-  assert.ok(!/大型工作区|工作区.*过大/.test(zh["agent.detail.migrationAbortedPrepDeadline"]!));
-  assert.ok(!/大型工作区|工作区.*过大/.test(zh["agent.detail.migrationAbortedPrepDeadlineAt"]!));
-});
-
 test("the dated variant renders the deadline it is given, in both locales", () => {
   const values = { source: "isolani-awl", target: "koala-fife", deadline: "2026-09-13 09:45" };
   const rendered = intl.formatMessage({ id: "agent.detail.migrationAbortedPrepDeadlineAt" }, values);

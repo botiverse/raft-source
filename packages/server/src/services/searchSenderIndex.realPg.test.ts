@@ -9,16 +9,18 @@ import { openTestApp } from "../test/integration/app";
 import { getDb } from "../db/index";
 import { users } from "../db/schema";
 import { createServer } from "../services/serverService";
+import { asServerId } from "@botiverse/raft-shared";
 import {
   buildMessageSearchStatement,
-  buildUserVisibleChannelsSql,
+  buildVisibleConversationChannelsSql,
 } from "./searchService";
+import { visibleRootChannelIds } from "./visibilityService";
 import {
   CREATE_SENDER_INDEX_SQL,
   SENDER_INDEX_NAME,
 } from "../../scripts/messages-sender-index";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 const DATABASE_URL = process.env.SEARCH_SENDER_INDEX_REAL_PG_URL;
 const REQUIRED = process.env.SEARCH_SENDER_INDEX_REAL_PG_REQUIRED === "1";
@@ -105,7 +107,7 @@ test(
   },
   async () => {
     assert.ok(DATABASE_URL, "SEARCH_SENDER_INDEX_REAL_PG_URL is required");
-    const app = await openTestApp(DATABASE_URL, 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false, skipAuthRateLimit: true });
+    const app = await openTestApp(DATABASE_URL, 0, { humanActivityMuteFlagDefaultEnabled: true, skipAuthRateLimit: true });
     const client = new pg.Client({ connectionString: DATABASE_URL });
     await client.connect();
     try {
@@ -135,10 +137,11 @@ test(
       };
       const absentSenderId = await senderUuid(`${fixtureId}-sender-absent`);
       const presentSenderId = await senderUuid(`${fixtureId}-sender-7`);
+      const visibleRoots = await visibleRootChannelIds({ type: "user", id: user.id, serverId: asServerId(server.id) });
       const renderStatement = (senderId: string) =>
         new PgDialect().sqlToQuery(
           buildMessageSearchStatement(
-            buildUserVisibleChannelsSql({ serverId: server.id, userId: user.id }),
+            buildVisibleConversationChannelsSql(visibleRoots),
             {
               serverId: server.id,
               senderId,

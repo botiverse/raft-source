@@ -52,8 +52,10 @@ afterEach(() => {
   }
 });
 
-async function send(response: Record<string, unknown>): Promise<{ requests: number; stdout: string; error?: CliError }> {
+async function send(response: Record<string, unknown>): Promise<{ requests: number; contextReads: number; stdout: string; error?: CliError }> {
   let requests = 0;
+  // A held send reads the agent context for the continuation pilot flag; this Server has none.
+  let contextReads = 0;
   let stdout = "";
   const ctx = createCommandContext({
     io: {
@@ -64,7 +66,11 @@ async function send(response: Record<string, unknown>): Promise<{ requests: numb
     env: {},
     loadAgentContext: () => ({ agentId: AGENT, serverUrl: "http://stub.local", clientMode: "self-hosted-runner", profileSlug: "t" }) as never,
     createApiClient: () => ({
-      request: async () => {
+      request: async (_method: string, path: string) => {
+        if (path === "/internal/agent-api/context") {
+          contextReads += 1;
+          return { ok: false, status: 404, error: "not found", errorCode: null, data: null };
+        }
         requests += 1;
         return { ok: true, status: 200, error: null, data: { ok: true, messageId: "m1", ...response } };
       },
@@ -72,9 +78,9 @@ async function send(response: Record<string, unknown>): Promise<{ requests: numb
   });
   try {
     await messageSendCommand.handler(ctx, [], { target: TARGET });
-    return { requests, stdout };
+    return { requests, contextReads, stdout };
   } catch (err) {
-    return { requests, stdout, error: err as CliError };
+    return { requests, contextReads, stdout, error: err as CliError };
   }
 }
 
@@ -87,6 +93,7 @@ test.skipIf(process.getuid?.() === 0)("an unwritable ledger does not stop a send
 test.skipIf(process.getuid?.() === 0)("a hold on an unwritable ledger says no draft was kept", async () => {
   const r = await send({ state: "held", held: { latestMessages: [], unreadCount: 1 } });
   assert.equal(r.requests, 1);
+  assert.equal(r.contextReads, 1, "the pilot flag, read once the send was held (unreadable here: the draft flow)");
   assert.equal(r.error?.code, "SEND_HELD");
   assert.equal(r.error?.draftSaved, false);
   assert.match(r.stdout, /no draft was kept/);

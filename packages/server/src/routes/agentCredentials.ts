@@ -59,6 +59,12 @@
  *   - 400 `agent_not_external` when the agent is managed: its credentials
  *     come only from its Computer (`/internal/computer/runners/...`).
  *   - 404 `device_login_disabled` when the feature gate is off.
+ *   - 429 `agent_credential_mint_rate_limited` (Retry-After) past the per-person
+ *     or per-agent mint rate, 409 `agent_credential_limit_reached` when the
+ *     agent already holds the most live person-issued keys
+ *     (services/agentCredentialMintLimits.ts).
+ *   - A non-UUID `:id` is the same 404 `agent_missing`; a non-UUID
+ *     `:credentialId` the same 404 `credential_missing` as an unknown one.
  */
 
 import type { Request, Response } from "express";
@@ -68,15 +74,21 @@ import {
   DEFAULT_EXTERNAL_AGENT_CAPABILITIES,
   mintAgentCredential,
   listAgentCredentials,
-  revokeAgentCredential,
+  revokeAgentCredentialWithOutcome,
   resolveRequestedAgentCapabilities,
 } from "../services/agentCredentialService";
+import { newAuditOperationId, recordIntegrationAuditEvent, serverAuditContextMetadata } from "../services/integrationAuditService";
 import { isExternalAgentRuntime } from "@botiverse/raft-shared";
 import { broadcastAgentCredentialRevocation } from "../replicaRouter";
-import { isDeviceAuthSurfaceEnabled } from "../services/deviceAuthService";
+import { isDeviceAuthSurfaceEnabled, notifyDeviceSessionAction } from "../services/deviceAuthService";
+import { DeviceSessionRevokedError, deviceSessionFamilyOf, lockLiveSessionFamily, webSessionFamilyOf } from "../services/sessionService";
+import { respondInvalidOrExpiredToken } from "../middleware/auth";
 import { addTraceEvent } from "../tracing/semanticTrace";
+import { isAgentFindableBy } from "../services/agentMemberListPolicy";
 import { resolveActorContext, userCanActOnAgentResource } from "../lib/actorPermissions";
 import { sendJsonServerError } from "./errorResponse";
+import { refuseWithoutRecentSecondFactor } from "./secondFactor";
+import { enforceAgentCredentialMintRate } from "../services/agentCredentialMintLimits";
 import { and, eq, isNull } from "drizzle-orm";
 import { agents as agentsTable } from "../db/schema";
 import type { DatabaseTransaction } from "../db/index";
@@ -110,8 +122,10 @@ function respondReplacesCredentialInvalid(res: Response): void {
 
 // Mint, list and revoke use the same subject-derived authority boundary.
 async function authorizedAgent(req: Request<{ id: string }>, res: Response) {
-  const agent = await agentService.getAgent(req.params.id);
-  if (!agent) { respondAgentMissing(res); return null; }
+  // A non-UUID id names no agent: the same 404, not the uuid cast's error.
+  const agent = UUID_RE.test(req.params.id) ? await agentService.getAgent(req.params.id) : null;
+  // Another person's personal assistant is missing, for every role (agentFindableBy).
+  if (!agent || !isAgentFindableBy({ userId: req.userId }, agent)) { respondAgentMissing(res); return null; }
   const actor = await resolveActorContext(agent.serverId, "user", req.userId!);
   if (actor.serverRole === null) { respondAgentMissing(res); return null; }
   if (!userCanActOnAgentResource(actor.serverRole, req.userId!, agent, "issueAgentCredentials")) {
@@ -129,7 +143,7 @@ async function authorizedAgent(req: Request<{ id: string }>, res: Response) {
 async function withFencedCredentialAuthority<T>(
   agent: { id: string; serverId: string },
   userId: string,
-  run: (tx: DatabaseTransaction) => Promise<T>,
+  run: (tx: DatabaseTransaction, lockedRole: Parameters<typeof userCanActOnAgentResource>[0]) => Promise<T>,
 ): Promise<T> {
   return withActorMembershipFence(agent.serverId, userId, async (tx, lockedRole) => {
     const [locked] = await tx
@@ -138,6 +152,7 @@ async function withFencedCredentialAuthority<T>(
         serverId: agentsTable.serverId,
         creatorType: agentsTable.creatorType,
         creatorId: agentsTable.creatorId,
+        assistantOwnerUserId: agentsTable.assistantOwnerUserId,
       })
       .from(agentsTable)
       .where(and(eq(agentsTable.id, agent.id), isNull(agentsTable.deletedAt)))
@@ -146,7 +161,7 @@ async function withFencedCredentialAuthority<T>(
     if (!userCanActOnAgentResource(lockedRole, userId, locked, "issueAgentCredentials")) {
       throw new FencedAuthorizationDeniedError("forbidden");
     }
-    return run(tx);
+    return run(tx, lockedRole);
   });
 }
 
@@ -174,8 +189,8 @@ export async function listAgentCredentialsHandler(req: Request<{ id: string }>, 
     if (!agent) return;
     res.setHeader("Cache-Control", "no-store");
     res.json({ agentId: agent.id, credentials: await listAgentCredentials(agent.id) });
-  } catch {
-    res.status(500).json({ error: "Failed to list agent credentials" });
+  } catch (err) {
+    sendJsonServerError(req, res, { error: "Failed to list agent credentials", logPrefix: "agents.credentials.list error:", err });
   }
 }
 
@@ -185,10 +200,26 @@ export async function revokeAgentCredentialHandler(req: Request<{ id: string; cr
     if (!agent) return;
     const credentialId = req.params.credentialId;
     const validId = UUID_RE.test(credentialId);
-    const revoked = validId && await withFencedCredentialAuthority(agent, req.userId!, (tx) => revokeAgentCredential({
-      credentialId, agentId: agent.id, serverId: agent.serverId,
-      reason: "user_revoked", revokedByUserId: req.userId!,
-    }, { executor: tx }));
+    const revoked = validId && await withFencedCredentialAuthority(agent, req.userId!, async (tx, lockedRole) => {
+      const outcome = await revokeAgentCredentialWithOutcome({
+        credentialId, agentId: agent.id, serverId: agent.serverId,
+        reason: "user_revoked", revokedByUserId: req.userId!,
+      }, { executor: tx });
+      // An idempotent repeat revokes nothing, so it records nothing.
+      if (outcome === "revoked") {
+        await recordIntegrationAuditEvent({
+          serverId: agent.serverId,
+          eventType: "agent_credential.revoked",
+          outcome: "success",
+          source: "web",
+          actor: { type: "human", id: req.userId! },
+          subject: { type: "agent", id: agent.id },
+          target: { type: "agent_credential", id: credentialId },
+          metadata: { agentId: agent.id, credentialId, reason: "user_revoked", ...serverAuditContextMetadata({ actorRole: lockedRole }) },
+        }, tx);
+      }
+      return outcome !== null;
+    });
     if (!revoked) {
       res.status(404).json({ error: "Credential not found", code: "credential_missing" });
       return;
@@ -270,14 +301,77 @@ export async function agentCredentialsHandler(
     }
 
     // The raw key is generated inside the fenced transaction and returned only after it commits.
-    const minted = await withFencedCredentialAuthority(agent, req.userId!, (tx) => mintAgentCredential({
-      agentId: agent.id,
-      scopes,
-      createdByUserId: req.userId!,
-      requireExternalRuntime: true,
-      replacesCredentialId,
-      ...(name !== null ? { name } : {}),
-    }, { executor: tx }));
+    // A device login's session records itself on the credential (any revoke
+    // of it revokes the credential); a person's own web session records itself
+    // in its own column (a security revoke of it revokes the credential,
+    // webSessionIssuedKeys.ts). Either fences its live family for the write.
+    const deviceFamilyId = deviceSessionFamilyOf(req);
+    const webFamilyId = webSessionFamilyOf(req);
+    // From the web, with two-step verification on: this sign-in passed it in
+    // the last 10 minutes (stepUpGate.ts). Not a device login's session (the
+    // CLI's `raft agent login`): it cannot step up, and its approval already
+    // needed a verified sign-in (approverSecondFactorCheck).
+    if (!deviceFamilyId && await refuseWithoutRecentSecondFactor(res, req.userId!, webFamilyId, "agent_credential_mint")) return;
+    // Which kind of session minted it (a device login's is not gated above):
+    // on the audit event and the trace. Its family id goes only in the trace
+    // (Tenny): server admins see the audit event and can't act on a member's
+    // sign-in id.
+    const sessionSource = deviceFamilyId ? "device_session" : webFamilyId ? "web_session" : null;
+    const sessionFamilyId = deviceFamilyId ?? webFamilyId;
+    // Per person and per agent (agentCredentialMintLimits.ts); the live-key cap
+    // is checked inside mintAgentCredential's transaction.
+    await enforceAgentCredentialMintRate({ userId: req.userId!, agentId: agent.id });
+    const minted = await withFencedCredentialAuthority(agent, req.userId!, async (tx, lockedRole) => {
+      if (sessionFamilyId) await lockLiveSessionFamily(tx, sessionFamilyId, req.userId!);
+      const credential = await mintAgentCredential({
+        agentId: agent.id,
+        scopes,
+        issuedVia: "human",
+        createdByUserId: req.userId!,
+        issuedBySessionFamilyId: deviceFamilyId,
+        issuedByWebSessionFamilyId: webFamilyId,
+        requireExternalRuntime: true,
+        replacesCredentialId,
+        ...(name !== null ? { name } : {}),
+      }, { executor: tx });
+      // Ids and scopes only: never the key, its prefix or its hash. A rotation's
+      // revoke and issue are one operation.
+      const audit = serverAuditContextMetadata({
+        actorRole: lockedRole,
+        ...(credential.replacedCredentialId ? { operationId: newAuditOperationId() } : {}),
+      });
+      if (credential.replacedCredentialId) {
+        await recordIntegrationAuditEvent({
+          serverId: credential.serverId,
+          eventType: "agent_credential.revoked",
+          outcome: "success",
+          source: "web",
+          actor: { type: "human", id: req.userId! },
+          subject: { type: "agent", id: credential.agentId },
+          target: { type: "agent_credential", id: credential.replacedCredentialId },
+          metadata: { agentId: credential.agentId, credentialId: credential.replacedCredentialId, reason: "rotated", ...audit },
+        }, tx);
+      }
+      await recordIntegrationAuditEvent({
+        serverId: credential.serverId,
+        eventType: "agent_credential.issued",
+        outcome: "success",
+        source: "web",
+        actor: { type: "human", id: req.userId! },
+        subject: { type: "agent", id: credential.agentId },
+        target: { type: "agent_credential", id: credential.credentialId },
+        metadata: {
+          agentId: credential.agentId,
+          credentialId: credential.credentialId,
+          scopes: credential.scopes,
+          issuedVia: credential.issuedVia,
+          replacedCredentialId: credential.replacedCredentialId,
+          sessionSource,
+          ...audit,
+        },
+      }, tx);
+      return credential;
+    });
     if (minted.replacedCredentialId) {
       await broadcastAgentCredentialRevocation(minted.agentId);
       addTraceEvent("agents.credentials.revoked", {
@@ -301,6 +395,17 @@ export async function agentCredentialsHandler(
       credential_id: minted.credentialId,
       user_id: req.userId!,
       scopes_count: minted.scopes.length,
+      ...(sessionSource ? { session_source: sessionSource, session_family_id: sessionFamilyId } : {}),
+    });
+
+    // Minted by a device login's session (`raft agent login wait`): the
+    // person gets told, with a revoke link (part C of the phishing fix).
+    void notifyDeviceSessionAction({
+      userId: req.userId,
+      familyId: req.sessionFamilyId,
+      scope: req.sessionScope,
+      event: "agent_credential",
+      target: { label: "Agent", value: minted.agentName },
     });
 
     // Raw `sk_agent_*` is surfaced exactly once. The client (e.g.
@@ -316,6 +421,10 @@ export async function agentCredentialsHandler(
       serverId: minted.serverId,
     });
   } catch (err) {
+    if (err instanceof DeviceSessionRevokedError) {
+      respondInvalidOrExpiredToken(res);
+      return;
+    }
     if (respondFencedCredentialError(err, res)) return;
     if (err instanceof Error && err.message === "agent_missing") {
       res.status(404).json({ error: "Agent not found", code: "agent_missing" });

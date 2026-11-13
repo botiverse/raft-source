@@ -17,7 +17,8 @@
 // the agent reads again. Without a signal the lifetime of a read is
 // unknowable, so the record is attested.
 
-import type { CommandStateStore, CommandStateStreamEntry, MaybePromise } from "./store";
+import type { MaybePromise } from "../../maybePromise";
+import type { CommandStateStore, CommandStateStreamEntry } from "./store";
 import { andThen, mapInOrder } from "./maybe";
 
 /**

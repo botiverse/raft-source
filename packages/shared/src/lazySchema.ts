@@ -30,7 +30,7 @@
 // pays the build latency.
 //
 // The contract files are rewritten mechanically by
-// `scripts/lazy-contract-schemas.mjs`; do not hand-wrap or hand-unwrap.
+// `scripts/lazy-contract-schemas.ts`; do not hand-wrap or hand-unwrap.
 
 import { globalRegistry } from "zod";
 

@@ -14,6 +14,13 @@ export function pendingMentionCanAdd(action: PendingMentionAction): boolean {
   return action.availableActions.some((available) => available === "add" || available === "invite");
 }
 
+/**
+ * Agent Lounge v0: another agent mentioned in a Lounge. It can only read
+ * there, so the server offers no Notify and no Add (`availableActions: []`);
+ * the row says why instead of "not in this channel".
+ */
+export const LOUNGE_AGENT_EXCLUDED_REASON = "lounge_agent_excluded";
+
 export function pendingMentionTargetLabel(action: PendingMentionAction): string {
   const handle = action.targetHandle || action.targetType;
   if ((action.targetType === "user" || action.targetType === "agent") && handle && !handle.startsWith("@")) {
@@ -23,7 +30,7 @@ export function pendingMentionTargetLabel(action: PendingMentionAction): string 
 }
 
 // A finished step reads as a neutral status chip: sunken fill, no edge, hint ink.
-const PENDING_MENTION_DONE_CHIP_CLASS = "inline-flex h-[22px] cursor-default items-center gap-1 rounded-chip bg-fill-muted px-2 text-caption font-semibold text-foreground-muted";
+const PENDING_MENTION_DONE_CHIP_CLASS = "inline-flex h-[22px] cursor-default items-center gap-1 rounded-chip md:pointer-fine:h-5 md:pointer-fine:rounded-sticker bg-fill-muted px-2 text-caption font-semibold text-foreground-muted";
 
 interface PendingMentionActionStripRowProps {
   action: PendingMentionAction;
@@ -46,9 +53,12 @@ export function PendingMentionActionStripRow({
 }: PendingMentionActionStripRowProps) {
   const { formatMessage } = useIntl();
   const targetLabel = pendingMentionTargetLabel(action);
-  const canNotify = pendingMentionCanNotify(action) && !localState;
-  const canAdd = pendingMentionCanAdd(action) && !localState;
-  const statusCopy = localState === "added"
+  const loungeExcluded = action.reason === LOUNGE_AGENT_EXCLUDED_REASON;
+  const canNotify = !loungeExcluded && pendingMentionCanNotify(action) && !localState;
+  const canAdd = !loungeExcluded && pendingMentionCanAdd(action) && !localState;
+  const statusCopy = loungeExcluded
+    ? formatMessage({ id: "message.pendingMention.loungeAgentExcluded" }, { target: targetLabel })
+    : localState === "added"
     ? formatMessage(
       { id: "message.pendingMention.addedStatus" },
       { target: targetLabel, channel: channelLabel },
@@ -73,11 +83,13 @@ export function PendingMentionActionStripRow({
     onDismissAction(action.resolutionId);
   }, [onDismissAction, action.resolutionId]);
 
+  // Stack or go single-row by the strip's own width (`@container` on the card):
+  // a thread panel can be 360px on a wide window.
   return (
     <div
-      className={`flex min-w-0 flex-col items-stretch gap-2 transition-opacity duration-300 sm:flex-row sm:flex-wrap sm:items-center ${isRemoving ? "opacity-0" : "opacity-100"}`}
+      className={`flex min-w-0 flex-col items-stretch gap-2 transition-opacity duration-300 @xl:flex-row @xl:flex-wrap @xl:items-center ${isRemoving ? "opacity-0" : "opacity-100"}`}
     >
-      <div className="flex w-full min-w-0 items-center gap-2 sm:w-auto sm:flex-1">
+      <div className="flex w-full min-w-0 items-center gap-2 @xl:w-auto @xl:flex-1">
         <UserX size={14} className="shrink-0 text-foreground-hint" />
         <div className="relative h-5 w-5 shrink-0" aria-hidden="true">
           <PendingMentionTargetAvatar action={action} />
@@ -85,7 +97,7 @@ export function PendingMentionActionStripRow({
         <div className="min-w-0 flex-1">
           <div className="truncate text-footnote font-bold text-foreground">{targetLabel}</div>
           <div
-            className="line-clamp-2 text-caption text-foreground-muted sm:line-clamp-none sm:truncate"
+            className="line-clamp-2 text-caption text-foreground-muted @xl:line-clamp-none @xl:truncate"
             data-testid="pending-mention-action-status"
           >
             {statusCopy}
@@ -93,7 +105,7 @@ export function PendingMentionActionStripRow({
         </div>
       </div>
       <div
-        className="flex w-full shrink-0 items-center justify-end gap-1.5 sm:ml-auto sm:w-auto"
+        className="flex w-full shrink-0 items-center justify-end gap-1.5 @xl:ml-auto @xl:w-auto"
         data-testid="pending-mention-action-buttons"
       >
         {localState === "added" ? (
@@ -105,7 +117,7 @@ export function PendingMentionActionStripRow({
           <Button
             type="button"
             variant="outline"
-            size="sm"
+            size="md"
             disabled={Boolean(executingState)}
             onClick={handleMarkAdded}
           >
@@ -122,7 +134,7 @@ export function PendingMentionActionStripRow({
           <Button
             type="button"
             variant="outline"
-            size="sm"
+            size="md"
             disabled={Boolean(executingState)}
             onClick={handleMarkNotified}
           >
@@ -133,7 +145,7 @@ export function PendingMentionActionStripRow({
         <Button
           type="button"
           variant="ghost"
-          size="sm"
+          size="md"
           onClick={handleDismiss}
         >
           {formatMessage({ id: "message.pendingMention.dismiss" })}

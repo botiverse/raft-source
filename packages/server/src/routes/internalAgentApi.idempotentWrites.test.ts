@@ -21,7 +21,7 @@ import {
   pruneExpiredAgentApiIdempotencyKeys,
 } from "../services/agentApiIdempotencyService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 type Fixture = {
   channelId: string;
@@ -77,6 +77,7 @@ async function seedFixture(label: string): Promise<Fixture> {
     agentId: agent.id,
     scopes: ["send", "read", "tasks"],
     name: "idempotent-writes-test",
+    issuedVia: "computer",
     createdByUserId: null,
   });
   return { channelId: channel.id, channelName: channel.name, agentId: agent.id, agentName: agent.name, apiKey };

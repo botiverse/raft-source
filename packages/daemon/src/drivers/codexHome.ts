@@ -1,9 +1,10 @@
 import os from "node:os";
 import path from "node:path";
-import { hydrateRuntimeConfig, runtimeConfigToLaunchFields, type AgentConfig } from "@botiverse/raft-shared";
+import { CODEX_HOME_ENV, hydrateRuntimeConfig, runtimeConfigToLaunchFields, type AgentConfig } from "@botiverse/raft-shared";
 
 function readConfiguredCodexHome(env: Record<string, string | undefined>): string | null {
-  const raw = env.CODEX_HOME;
+  // The one env var the Codex home depends on (RUNTIME_SESSION_HOME_ENV_KEYS).
+  const raw = env[CODEX_HOME_ENV];
   return typeof raw === "string" && raw.trim().length > 0 ? raw : null;
 }
 

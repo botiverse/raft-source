@@ -3,6 +3,7 @@ import argon2 from "argon2";
 import { Readable } from "node:stream";
 
 import { CURRENT_LEGAL_ACCEPTANCE } from "@botiverse/raft-shared";
+import { isAutoHumanAvatarUrl } from "@botiverse/raft-shared/src/humanAvatar";
 import { eq } from "drizzle-orm";
 
 import { closeDatabase, getDb, initDatabase } from "../db/index";
@@ -217,9 +218,76 @@ test("social signup does not persist provider hotlinks when avatar fetch fails",
       avatarUrl: "https://provider.example/missing-avatar.gif",
     }, LEGAL_ACCEPTANCE, {}, "oauth", { deferProfileSetup: true });
 
+    // Not the hotlink, and no built one: social sign-up joins no server, so
+    // human_avatar_builder_v0 reads off (newAccountAvatarUrlFor).
     assert.equal(user.avatarUrl, null);
     const [stored] = await getDb().select({ avatarUrl: users.avatarUrl }).from(users).where(eq(users.id, user.id));
     assert.equal(stored?.avatarUrl, null);
+  } finally {
+    restoreFetch(originalFetch);
+  }
+});
+
+test("re-login after a failed provider fetch replaces the Server-picked avatar with the photo", async () => {
+  installAvatarStorage();
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response("down", { status: 503 })) as typeof fetch;
+  let created;
+  try {
+    created = await createSocialUser({
+      provider: "github",
+      providerUserId: "github-auto-relogin",
+      email: "social-auto-relogin@slock.test",
+      emailVerified: true,
+      displayName: "Auto Relogin",
+      avatarUrl: "https://provider.example/later.gif",
+    }, LEGAL_ACCEPTANCE, {}, "oauth", { deferProfileSetup: true });
+  } finally {
+    restoreFetch(originalFetch);
+  }
+  // The Server's pick (an SSO account's, where the builder is on).
+  const picked = "pixel-human:v1:sky.3.bun.brown.calm.none.none/auto";
+  await getDb().update(users).set({ avatarUrl: picked }).where(eq(users.id, created.id));
+  assert.ok(isAutoHumanAvatarUrl(picked));
+
+  const fetchAgain = globalThis.fetch;
+  installAvatarFetch("https://provider.example/later.gif");
+  try {
+    const loggedIn = await findExistingSocialLoginUser({
+      provider: "github",
+      providerUserId: "github-auto-relogin",
+      email: created.email,
+      emailVerified: true,
+      displayName: "Auto Relogin",
+      avatarUrl: "https://provider.example/later.gif",
+    });
+    assert.ok(loggedIn);
+    assertStoredUserAvatarUrl(loggedIn.avatarUrl);
+  } finally {
+    restoreFetch(fetchAgain);
+  }
+});
+
+test("linking a provider replaces a Server-picked avatar, and keeps one the person built", async () => {
+  installAvatarStorage();
+  const auto = await seedUser({ email: "social-link-auto@slock.test", name: "social-link-auto", avatarUrl: "pixel-human:v1:sky.3.bun.brown.calm.none.none/auto" });
+  const built = await seedUser({ email: "social-link-built@slock.test", name: "social-link-built", avatarUrl: "pixel-human:v1:sky.3.bun.brown.calm.none.none" });
+  const originalFetch = globalThis.fetch;
+  const avatarFetchCalls = installAvatarFetch("https://provider.example/link.gif");
+  try {
+    const profile = (user: { email: string }, id: string) => ({
+      provider: "google" as const,
+      providerUserId: id,
+      email: user.email,
+      emailVerified: true,
+      displayName: "Linker",
+      avatarUrl: "https://provider.example/link.gif",
+    });
+    const linkedAuto = await linkSocialIdentity(auto.id, profile(auto, "google-link-auto"));
+    assertStoredUserAvatarUrl(linkedAuto.avatarUrl);
+    const linkedBuilt = await linkSocialIdentity(built.id, profile(built, "google-link-built"));
+    assert.equal(linkedBuilt.avatarUrl, built.avatarUrl, "a built avatar is the person's choice");
+    assert.equal(avatarFetchCalls(), 1, "no photo fetched for a built avatar");
   } finally {
     restoreFetch(originalFetch);
   }

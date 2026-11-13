@@ -62,6 +62,7 @@ export const sampleTask = {
   claimedById: "a-1",
   claimedByName: "Alice",
   createdByName: "richard",
+  createdByHandle: "richard",
   messageId: UUID_A,
 };
 

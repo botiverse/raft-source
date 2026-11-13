@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { readFileSync, readdirSync } from "node:fs";
 import { resolve } from "node:path";
+import { isTestPath } from "../scripts/testLocations";
 
 // Loading→loaded render hygiene (闪回 fix, task #37): guard against the
 // URL-param self-trigger loop class.
@@ -40,6 +41,8 @@ function allSourceFiles(): string[] {
     for (const ent of readdirSync(resolve(repoRoot, dir), { withFileTypes: true })) {
       const rel = `${dir}/${ent.name}`;
       if (ent.isDirectory()) walk(rel);
+      // Feature tests (src/features/<feature>/tests/) are not app code.
+      else if (isTestPath(rel)) continue;
       else if (ent.name.endsWith(".tsx") || (ent.name.endsWith(".ts") && !ent.name.endsWith(".d.ts"))) {
         out.push(rel);
       }

@@ -143,8 +143,9 @@ export const FEEDBACK_AGENT_EVENT_TAIL_EVENT_SPECS = {
   "daemon.agent.inbox.visible_consumed": {
     record: "event",
     attrs: {
-      source: { spec: { kind: "enum_or_other", values: VISIBLE_CONSUMED_SOURCES }, from: ["source"] },
+      source: { spec: { kind: "enum_or_other", values: VISIBLE_CONSUMED_SOURCES }, from: ["consume_source", "source"] },
       messages_count: count("messages_count"),
+      already_seen_count: count("already_seen_count"),
       suppressed_pending_count: count("suppressed_pending_count"),
     },
   },

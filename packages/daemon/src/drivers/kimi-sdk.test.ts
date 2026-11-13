@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
 import { channel } from "node:diagnostics_channel";
+import { execFileSync } from "node:child_process";
 import { mkdirSync as fsMkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync as fsWriteFileSync } from "node:fs";
 import os from "node:os";
 import { createServer } from "node:http";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
+import { kimiToolResultOutcome } from "./kimiToolResult";
 import {
   KimiSdkDriver,
   KimiSdkRuntimeSession,
@@ -17,18 +19,20 @@ import {
   createKimiSdkEventMappingState,
   detectKimiSdkModels,
   loadKimiSdk,
-  kimiToolResultOutcome,
+  kimiEventIsShownForMainAgent,
+  kimiToolBaseEnv,
   mapKimiSdkEventToParsedEvents,
+  mapKimiSubagentEvent,
   resolveKimiHome,
   setKimiSdkEventMappingSession,
   typedKimiStartError,
   type KimiSessionFactory,
 } from "./kimi-sdk";
 import { classifySpawnFailure } from "../spawnFailureClassification";
-import { prepareCliTransport, toolEnvFromSpawnEnv } from "./cliTransport";
+import { prepareCliTransport } from "./cliTransport";
+import { resolveKimiSdkHomeFromConfig } from "./runtimeArtifacts";
 import {
   KimiError,
-  LocalKaos,
   createKimiHarness,
   resolveKimiHome as sdkResolveKimiHome,
   type Event as KimiSdkEvent,
@@ -435,11 +439,10 @@ test("RS-004 invariant — explicit drops (state-only / out-of-band) emit no Par
     { ...eventBase(), type: "shell.completed", commandId: "c", taskId: "t", isError: false },
     { ...eventBase(), type: "tool.list.updated", reason: "mcp.connected", serverName: "m" },
     { ...eventBase(), type: "mcp.server.status", server: { name: "m", transport: "stdio", status: "connected", toolCount: 0 } },
-    { ...eventBase(), type: "subagent.spawned", subagentId: "sa", subagentName: "sa", parentToolCallId: "t1", runInBackground: false },
+    // #proj-runtime:#41: spawned / completed / failed / cancelled are mapped (see the subagent test).
     { ...eventBase(), type: "subagent.started", subagentId: "sa" },
     { ...eventBase(), type: "subagent.suspended", subagentId: "sa", reason: "x" },
-    { ...eventBase(), type: "subagent.completed", subagentId: "sa", resultSummary: "done" },
-    { ...eventBase(), type: "subagent.failed", subagentId: "sa", error: "oh" },
+    { ...eventBase(), type: "subagent.completed", subagentId: "never-spawned", resultSummary: "done" },
     { ...eventBase(), type: "compaction.blocked" },
     { ...eventBase(), type: "compaction.cancelled" },
     { ...eventBase(), type: "task.started", info: {} as never },
@@ -496,57 +499,46 @@ test("source guard — descriptor pins transport=sdk + busyDelivery=direct + lif
   assert.equal(session.descriptor.startPolicy, "immediate");
 });
 
-test("source guard — kimi-sdk.ts must NOT contain wildcard mapping (every Kimi event class needs an explicit map or drop)", () => {
-  const sourcePath = fileURLToPath(new URL("./kimi-sdk.ts", import.meta.url));
-  const source = readFileSync(sourcePath, "utf8");
-  // The exhaustive-never default is the closed-mapping pin. If a wildcard
-  // ever sneaks in (default falling through silently to []), this RED-greens.
-  assert.match(
-    source,
-    /const _exhaustive: never = event;/,
-    "mapKimiSdkEventToParsedEvents must end its switch with `const _exhaustive: never = event;` — RS-004 closed-mapping",
-  );
-  // No silent default — a `default:\s*return` would route any new event class
-  // to a no-op without the type-error. Reject it.
-  assert.doesNotMatch(
-    source,
-    /default:\s*return\s*\[\]/,
-    "kimi-sdk.ts must not have `default: return []` — that hides unmapped event classes",
-  );
-  assert.doesNotMatch(
-    source,
-    /(?:export\s+)?type KimiSdkEvent\s*=/,
-    "kimi-sdk.ts must use the SDK Event type directly, not maintain a local mirror",
-  );
-  assert.match(
-    source,
-    /import type \{[^}]*\bEvent as KimiSdkEvent\b/,
-    "kimi-sdk.ts must import the SDK Event type as the closed-mapping input",
-  );
-});
-
-test("source guard — kimi-sdk.ts loads the Kimi SDK lazily, never at daemon startup", () => {
-  const source = readFileSync(fileURLToPath(new URL("./kimi-sdk.ts", import.meta.url)), "utf8");
-  // A value import (or a side-effect import) would build the SDK's ~8k zod
-  // schemas in every runner, Kimi agents or not. Types only; values go
-  // through loadKimiSdk().
-  const imports = [...source.matchAll(/^import\s+(type\s+)?[^;]*?from\s+"@botiverse\/kimi-code-sdk[^"]*";/gms)];
-  assert.ok(imports.length > 0);
-  for (const [statement, typeOnly] of imports) assert.ok(typeOnly, `value import of the Kimi SDK: ${statement}`);
-  assert.doesNotMatch(source, /^import\s+"@botiverse\/kimi-code-sdk/m);
-  assert.match(source, /import\("@botiverse\/kimi-code-sdk"\)/);
-});
-
 test("resolveKimiHome matches the SDK's resolver without loading the SDK", () => {
   const saved = process.env.KIMI_CODE_HOME;
   try {
     delete process.env.KIMI_CODE_HOME;
     assert.equal(resolveKimiHome(), sdkResolveKimiHome());
-    assert.equal(resolveKimiHome("/explicit/home"), sdkResolveKimiHome("/explicit/home"));
+    assert.equal(resolveKimiHome({ KIMI_CODE_HOME: "/explicit/home" }), sdkResolveKimiHome("/explicit/home"));
     process.env.KIMI_CODE_HOME = "/env/kimi-home";
     assert.equal(resolveKimiHome(), sdkResolveKimiHome());
     assert.equal(resolveKimiHome(), "/env/kimi-home");
-    assert.equal(resolveKimiHome("/explicit/home"), sdkResolveKimiHome("/explicit/home"));
+  } finally {
+    if (saved === undefined) delete process.env.KIMI_CODE_HOME;
+    else process.env.KIMI_CODE_HOME = saved;
+  }
+});
+
+// #12938 review: the home a session launches in is the home the transcript resolver reads,
+// for whatever KIMI_CODE_HOME the agent and the daemon set (the spawn env merges them the same way).
+test("the launch home and the transcript resolver's home agree for every KIMI_CODE_HOME", () => {
+  const saved = process.env.KIMI_CODE_HOME;
+  try {
+    for (const daemonValue of [undefined, "/daemon/kimi"]) {
+      // The daemon's own env is process.env: a launch must not fall back to it when the agent set a value.
+      if (daemonValue === undefined) delete process.env.KIMI_CODE_HOME;
+      else process.env.KIMI_CODE_HOME = daemonValue;
+      const daemonEnv = daemonValue === undefined ? {} : { KIMI_CODE_HOME: daemonValue };
+      for (const agentValue of [undefined, "", "rel/kimi", "/agent/kimi"]) {
+        const envVars = agentValue === undefined ? null : { KIMI_CODE_HOME: agentValue };
+        const spawnEnv = { ...daemonEnv, ...(envVars ?? {}) };
+        const config = { ...makeSpawnContext({ envVars }).config };
+        assert.equal(
+          resolveKimiHome(spawnEnv),
+          resolveKimiSdkHomeFromConfig(config, os.homedir(), daemonEnv),
+          `daemon ${JSON.stringify(daemonValue)}, agent ${JSON.stringify(agentValue)}`,
+        );
+      }
+    }
+    // An agent's empty value is unset: the default home, never the daemon's.
+    process.env.KIMI_CODE_HOME = "/daemon/kimi";
+    assert.equal(resolveKimiHome({ KIMI_CODE_HOME: "" }), path.join(os.homedir(), ".kimi-code"));
+    assert.equal(resolveKimiHome({ KIMI_CODE_HOME: "rel/kimi" }), path.resolve("rel/kimi"));
   } finally {
     if (saved === undefined) delete process.env.KIMI_CODE_HOME;
     else process.env.KIMI_CODE_HOME = saved;
@@ -792,11 +784,21 @@ function makeCapturingHarness(): {
   harness: KimiHarness;
   createCalls: Array<Record<string, unknown>>;
   resumeCalls: Array<Record<string, unknown>>;
+  mcpServerCalls: Array<Record<string, unknown>>;
 } {
   const createCalls: Array<Record<string, unknown>> = [];
   const resumeCalls: Array<Record<string, unknown>> = [];
+  const mcpServerCalls: Array<Record<string, unknown>> = [];
   // setModel: a fresh session resolves its model at start (task #1221).
-  const fakeSession = { id: "kimi-session-x", setModel: async () => {} } as unknown as KimiSession;
+  const fakeSession = {
+    id: "kimi-session-x",
+    setModel: async () => {},
+    addMcpServer: async (server: Record<string, unknown>) => {
+      mcpServerCalls.push(server);
+      return server;
+    },
+    reloadSession: async () => ({}),
+  } as unknown as KimiSession;
   const harness = {
     createSession: async (fields: Record<string, unknown>) => {
       createCalls.push(fields);
@@ -807,66 +809,7 @@ function makeCapturingHarness(): {
       return fakeSession;
     },
   } as unknown as KimiHarness;
-  return { harness, createCalls, resumeCalls };
-}
-
-function makeFakeLocalKaos(): {
-  localKaos: LocalKaos;
-  toolKaos: LocalKaos;
-  capturedEnv: Record<string, string>;
-} {
-  const capturedEnv: Record<string, string> = {};
-  const toolKaos = {
-    name: "fake-tool-kaos",
-    osEnv: { platform: process.platform, shell: "/bin/bash" },
-    pathClass: () => (process.platform === "win32" ? "win32" : "posix"),
-    normpath: (p: string) => p,
-    gethome: () => "/tmp/fake-home",
-    getcwd: () => "/tmp/fake-cwd",
-    chdir: async () => {},
-    withCwd: () => toolKaos,
-    withEnv: (env: Record<string, string>) => {
-      Object.assign(capturedEnv, env);
-      return toolKaos;
-    },
-    stat: async () => { throw new Error("not implemented"); },
-    iterdir: async function* () {},
-    glob: async function* () {},
-    readBytes: async () => Buffer.alloc(0),
-    readText: async () => "",
-    readLines: async function* () {},
-    writeBytes: async () => 0,
-    writeText: async () => 0,
-    mkdir: async () => {},
-    exec: async () => { throw new Error("not implemented"); },
-    execWithEnv: async () => { throw new Error("not implemented"); },
-  } as unknown as LocalKaos;
-  const localKaos = {
-    name: "fake-local-kaos",
-    osEnv: { platform: process.platform, shell: "/bin/bash" },
-    pathClass: () => (process.platform === "win32" ? "win32" : "posix"),
-    normpath: (p: string) => p,
-    gethome: () => "/tmp/fake-home",
-    getcwd: () => "/tmp/fake-cwd",
-    chdir: async () => {},
-    withCwd: () => localKaos,
-    withEnv: (env: Record<string, string>) => {
-      Object.assign(capturedEnv, env);
-      return toolKaos;
-    },
-    stat: async () => { throw new Error("not implemented"); },
-    iterdir: async function* () {},
-    glob: async function* () {},
-    readBytes: async () => Buffer.alloc(0),
-    readText: async () => "",
-    readLines: async function* () {},
-    writeBytes: async () => 0,
-    writeText: async () => 0,
-    mkdir: async () => {},
-    exec: async () => { throw new Error("not implemented"); },
-    execWithEnv: async () => { throw new Error("not implemented"); },
-  } as unknown as LocalKaos;
-  return { localKaos, toolKaos, capturedEnv };
+  return { harness, createCalls, resumeCalls, mcpServerCalls };
 }
 
 function makeFakeDeps(
@@ -877,7 +820,6 @@ function makeFakeDeps(
   slockHome: string = "/tmp/kimi-slock-home",
   spawnEnvExtra: Record<string, string> = {},
 ) {
-  const { localKaos, toolKaos, capturedEnv } = makeFakeLocalKaos();
   return {
     createHarness: ((options: Record<string, unknown>) => {
       createHarnessCalls.push(options);
@@ -889,9 +831,11 @@ function makeFakeDeps(
       slockDir,
       slockHome,
     })) as never,
-    createLocalKaos: async () => localKaos,
-    _fakeToolKaos: toolKaos,
-    _capturedEnv: capturedEnv,
+    _harnessOptions: createHarnessCalls,
+    /** The tool base env the harness was created with (last launch). */
+    get _capturedEnv(): Record<string, string> {
+      return (createHarnessCalls.at(-1)?.baseEnv ?? {}) as Record<string, string>;
+    },
   };
 }
 
@@ -905,7 +849,7 @@ test("composeStandingRoleAdditional carries only the standing prompt; wrapper pa
   assert.equal(composeStandingRoleAdditional("only standing", null), "only standing");
 });
 
-test("kimi tool Kaos keeps the transport's PATH (wrapper dir + agent-configured PATH), not a fresh daemon PATH (#8610)", async () => {
+test("kimi tool base env keeps the transport's PATH (wrapper dir + agent-configured PATH), not a fresh daemon PATH (#8610)", async () => {
   const { ctx, home } = makeTempCtx({ sessionId: null });
   const { harness } = makeCapturingHarness();
   const slockDir = "/tmp/kimi-wrappers/agent-1/w3-launch";
@@ -917,7 +861,7 @@ test("kimi tool Kaos keeps the transport's PATH (wrapper dir + agent-configured 
   assert.equal(deps._capturedEnv.PATH, transportPath, "the bash tool sees exactly the runtime PATH");
 });
 
-test("kimi tool Kaos carries the managed-launch agent env, not only the daemon's process env", async () => {
+test("kimi tool base env carries the managed-launch agent env, not only the daemon's process env", async () => {
   const { ctx, home } = makeTempCtx({ sessionId: null });
   const { harness } = makeCapturingHarness();
   const agentEnv = {
@@ -943,7 +887,7 @@ test("kimi tool Kaos carries the managed-launch agent env, not only the daemon's
   }
 });
 
-test("kimi tool Kaos unsets daemon env keys the transport removed (credentials, profile selectors)", async () => {
+test("kimi tool base env leaves out daemon env keys the transport removed (credentials, profile selectors)", async () => {
   const leaked = {
     SLOCK_AGENT_TOKEN_FILE: "/tmp/daemon-token",
     SLOCK_AGENT_PROXY_URL: "http://127.0.0.1:1/daemon",
@@ -959,9 +903,10 @@ test("kimi tool Kaos unsets daemon env keys the transport removed (credentials, 
 
     await createKimiAgentSessionForContext(ctx, "sess-unset", deps);
 
+    // The base env replaces the daemon's process.env, so a removed key is
+    // simply absent: nothing the daemon carries reaches the tools.
     for (const key of Object.keys(leaked)) {
-      assert.ok(key in deps._capturedEnv, `tool env must explicitly unset ${key}`);
-      assert.equal(deps._capturedEnv[key], undefined, `tool env must not carry ${key}`);
+      assert.equal(key in deps._capturedEnv, false, `tool env must not carry ${key}`);
     }
   } finally {
     for (const [key, value] of Object.entries(saved)) {
@@ -971,33 +916,28 @@ test("kimi tool Kaos unsets daemon env keys the transport removed (credentials, 
   }
 });
 
-test("toolEnvFromSpawnEnv on a real LocalKaos: tool sees spawnEnv values and not removed daemon keys", async () => {
-  const base = { ...process.env, KIMI_TOOL_ENV_TEST_REMOVED: "daemon-value" };
+test("kimiToolBaseEnv as a process env: the tool sees spawnEnv values and not removed daemon keys", async () => {
   const saved = process.env.KIMI_TOOL_ENV_TEST_REMOVED;
   process.env.KIMI_TOOL_ENV_TEST_REMOVED = "daemon-value";
   try {
-    const spawnEnv = { ...base, KIMI_TOOL_ENV_TEST_AGENT: "agent-value" } as NodeJS.ProcessEnv;
+    const spawnEnv = { ...process.env, KIMI_TOOL_ENV_TEST_AGENT: "agent-value" } as NodeJS.ProcessEnv;
     delete spawnEnv.KIMI_TOOL_ENV_TEST_REMOVED;
-    const toolKaos = (await LocalKaos.create()).withEnv(
-      toolEnvFromSpawnEnv(spawnEnv, base) as Record<string, string>,
-    );
-    const proc = await toolKaos.exec(
+    // The engine spawns tool processes with exactly this env (its baseEnv
+    // replaces process.env; the shell tool only adds its own overrides).
+    const env = kimiToolBaseEnv({ spawnEnv, slockDir: "/tmp/kimi-wrappers/agent-1/launch", slockHome: "/tmp/kimi-slock-home" });
+    const out = execFileSync(
       "sh",
-      "-c",
-      'printf "%s|%s" "${KIMI_TOOL_ENV_TEST_AGENT-unset}" "${KIMI_TOOL_ENV_TEST_REMOVED-unset}"',
+      ["-c", 'printf "%s|%s" "${KIMI_TOOL_ENV_TEST_AGENT-unset}" "${KIMI_TOOL_ENV_TEST_REMOVED-unset}"'],
+      { env, encoding: "utf8" },
     );
-    const chunks: Buffer[] = [];
-    for await (const chunk of proc.stdout) chunks.push(chunk);
-    await proc.wait();
-    await proc.dispose();
-    assert.equal(Buffer.concat(chunks).toString("utf8"), "agent-value|unset");
+    assert.equal(out, "agent-value|unset");
   } finally {
     if (saved === undefined) delete process.env.KIMI_TOOL_ENV_TEST_REMOVED;
     else process.env.KIMI_TOOL_ENV_TEST_REMOVED = saved;
   }
 });
 
-test("createKimiAgentSessionForContext passes standing prompt + per-session tool Kaos on CREATE path", async () => {
+test("createKimiAgentSessionForContext gives the harness the standing prompt + tool base env on the CREATE path", async () => {
   const { ctx, home } = makeTempCtx({ sessionId: null });
   const { harness, createCalls, resumeCalls } = makeCapturingHarness();
   const slockDir = "/tmp/kimi-wrappers/agent-1/w2-launch";
@@ -1009,27 +949,26 @@ test("createKimiAgentSessionForContext passes standing prompt + per-session tool
   assert.equal(resumeCalls.length, 0, "no prior sessionId → must not resume");
   assert.equal(createCalls.length, 1, "must create exactly one session");
   const fields = createCalls[0];
-  assert.equal(typeof fields.roleAdditional, "string", "roleAdditional must be passed as a session option");
-  const roleAdditional = fields.roleAdditional as string;
+  assert.equal(fields.workDir, ctx.workingDirectory);
+  // kimi-code 2.x silently ignores these on createSession: they ride the harness.
+  for (const key of ["roleAdditional", "kaos", "persistenceKaos", "mcpServers"]) {
+    assert.equal(key in fields, false, `createSession must not carry ${key}`);
+  }
+  const options = deps._harnessOptions.at(-1)!;
+  assert.equal(typeof options.roleAdditional, "string", "roleAdditional must be a harness option");
+  const roleAdditional = options.roleAdditional as string;
   assert.ok(roleAdditional.includes(ctx.standingPrompt), "roleAdditional must carry the standing prompt");
   assert.ok(!roleAdditional.includes(WRAPPER_PATH), "roleAdditional must NOT carry the wrapper CLI note");
-  assert.equal(fields.workDir, ctx.workingDirectory);
-
-  // The SDK bash tool must receive a dedicated tool Kaos with per-session env,
-  // while file/session persistence stays on a plain LocalKaos.
-  assert.equal(fields.kaos, deps._fakeToolKaos, "createSession must receive the per-session tool Kaos");
-  assert.ok(fields.persistenceKaos, "createSession must receive a persistence Kaos");
-  assert.notEqual(fields.kaos, fields.persistenceKaos, "tool Kaos and persistence Kaos must be distinct");
   assert.equal(deps._capturedEnv.NO_COLOR, "1");
   assert.equal(deps._capturedEnv.SLOCK_HOME, slockHome);
   assert.equal(deps._capturedEnv.SLOCK_AGENT_LAUNCH_DIR, path.basename(slockDir));
-  assert.ok(deps._capturedEnv.PATH?.startsWith(slockDir), "tool Kaos PATH must be prepended with slockDir");
+  assert.ok(deps._capturedEnv.PATH?.startsWith(slockDir), "tool base env PATH must be prepended with slockDir");
   for (const key of ["KIMI_CODE_HOME", "NO_COLOR", "PATH", "SLOCK_AGENT_LAUNCH_DIR", "SLOCK_CLI_TRANSPORT_DIR", "SLOCK_HOME"]) {
-    assert.equal(typeof deps._capturedEnv[key], "string", `tool Kaos env must set ${key}`);
+    assert.equal(typeof deps._capturedEnv[key], "string", `tool base env must set ${key}`);
   }
 });
 
-test("createKimiAgentSessionForContext passes standing prompt + per-session tool Kaos on RESUME path", async () => {
+test("createKimiAgentSessionForContext gives the harness the standing prompt + tool base env on the RESUME path", async () => {
   const { ctx, home } = makeTempCtx({ sessionId: "resume-me" });
   const { harness, createCalls, resumeCalls } = makeCapturingHarness();
   const slockDir = "/tmp/kimi-wrappers/agent-1/w2-launch";
@@ -1042,17 +981,16 @@ test("createKimiAgentSessionForContext passes standing prompt + per-session tool
   assert.equal(resumeCalls.length, 1, "must resume exactly one session");
   const fields = resumeCalls[0];
   assert.equal(fields.id, "resume-me", "resume must target the persisted session id");
-  assert.equal(typeof fields.roleAdditional, "string", "roleAdditional must be re-applied on resume");
-  const roleAdditional = fields.roleAdditional as string;
+  for (const key of ["roleAdditional", "kaos", "persistenceKaos", "mcpServers"]) {
+    assert.equal(key in fields, false, `resumeSession must not carry ${key}`);
+  }
+  // The harness re-renders a resumed session's prompt with this value.
+  const roleAdditional = deps._harnessOptions.at(-1)!.roleAdditional as string;
   assert.ok(roleAdditional.includes(ctx.standingPrompt), "resume roleAdditional must carry the standing prompt");
   assert.ok(!roleAdditional.includes(WRAPPER_PATH), "resume roleAdditional must NOT carry the wrapper CLI note");
-
-  assert.equal(fields.kaos, deps._fakeToolKaos, "resumeSession must receive the per-session tool Kaos");
-  assert.ok(fields.persistenceKaos, "resumeSession must receive a persistence Kaos");
-  assert.notEqual(fields.kaos, fields.persistenceKaos, "tool Kaos and persistence Kaos must be distinct");
   assert.equal(deps._capturedEnv.SLOCK_AGENT_LAUNCH_DIR, path.basename(slockDir));
   for (const key of ["KIMI_CODE_HOME", "NO_COLOR", "PATH", "SLOCK_AGENT_LAUNCH_DIR", "SLOCK_CLI_TRANSPORT_DIR", "SLOCK_HOME"]) {
-    assert.equal(typeof deps._capturedEnv[key], "string", `tool Kaos env must set ${key} on resume`);
+    assert.equal(typeof deps._capturedEnv[key], "string", `tool base env must set ${key} on resume`);
   }
 });
 
@@ -1172,8 +1110,10 @@ model = "k3"
 max_context_size = 1048576
 `);
   fsMkdirSync(fixture.ctx.workingDirectory, { recursive: true });
-  const seed = createKimiHarness({ homeDir: fixture.home });
+  const seed = createKimiHarness({ homeDir: fixture.home, identity: { productName: "kimi-code-cli", version: KIMI_CODE_HOST_VERSION, platform: KIMI_CODE_PLATFORM } });
   let resumedHarness: KimiHarness | undefined;
+  // kimi-code 2.x's harness close is not idempotent.
+  let seedClosed = false;
   try {
     const old = await seed.createSession({
       workDir: fixture.ctx.workingDirectory,
@@ -1194,6 +1134,7 @@ max_context_size = 1048576
     const sessionId = old.id;
     fixture.ctx.config.sessionId = sessionId;
     await seed.close();
+    seedClosed = true;
 
     // Only the Raft CLI-wrapper preparation is stubbed. Harness, persistence,
     // resume, model switching, prompt construction and HTTP serialization are real.
@@ -1206,13 +1147,82 @@ max_context_size = 1048576
     assert.equal(requests.length, 2);
     assert.equal(requests[1]?.model, "k3", "first real resumed HTTP request must use the current profile model");
     assert.ok(JSON.stringify(requests[1]?.messages).includes("remember the old session marker"), "resumed request must retain old conversation context");
+    // The seed session was bound without a standing prompt; the resuming
+    // harness carries one, and the real request's system prompt has it.
+    const system = (requests[1]?.messages ?? []).find((message) => (message as { role?: string }).role === "system");
+    assert.ok(JSON.stringify(system?.content ?? "").includes(fixture.ctx.standingPrompt!), "the resumed request's system prompt must carry the standing prompt");
+    assert.ok(!JSON.stringify(requests[0]?.messages).includes(fixture.ctx.standingPrompt!), "the seed request had no standing prompt (control)");
   } finally {
     await resumedHarness?.close();
-    await seed.close();
+    if (!seedClosed) await seed.close();
     await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
     rmSync(path.dirname(fixture.home), { recursive: true, force: true });
   }
 }, 15000);
+
+test("Kimi's Bash tool runs with the agent's tool env, not the daemon's, through the real SDK engine", async () => {
+  const fixture = makeTempCtx({ sessionId: null, model: "kimi-code/k3" });
+  const requests: Array<{ messages: Array<{ role?: string; content: unknown }> }> = [];
+  const command = 'printf "%s|%s" "${KIMI_ENV_PROBE_AGENT-unset}" "${KIMI_ENV_PROBE_DAEMON-unset}"';
+  const server = createServer(async (req, res) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) chunks.push(Buffer.from(chunk));
+    requests.push(JSON.parse(Buffer.concat(chunks).toString()));
+    res.writeHead(200, { "Content-Type": "text/event-stream" });
+    const chunk = (delta: unknown, finish: string | null) => `data: ${JSON.stringify({ id: "c", object: "chat.completion.chunk", choices: [{ index: 0, delta, finish_reason: finish }] })}\n\n`;
+    if (requests.length === 1) {
+      res.end(chunk({ role: "assistant", tool_calls: [{ index: 0, id: "call_env", type: "function", function: { name: "Bash", arguments: JSON.stringify({ command }) } }] }, null) + chunk({}, "tool_calls") + "data: [DONE]\n\n");
+      return;
+    }
+    res.end(chunk({ role: "assistant", content: "done" }, null) + chunk({}, "stop") + "data: [DONE]\n\n");
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+  fsWriteFileSync(path.join(fixture.home, "config.toml"), `
+default_model = "kimi-code/k3"
+[providers.local]
+type = "kimi"
+base_url = "http://127.0.0.1:${address.port}/v1"
+api_key = "local-test-only"
+[models."kimi-code/k3"]
+provider = "local"
+model = "k3"
+max_context_size = 262144
+`);
+  fsMkdirSync(fixture.ctx.workingDirectory, { recursive: true });
+  const savedDaemon = process.env.KIMI_ENV_PROBE_DAEMON;
+  process.env.KIMI_ENV_PROBE_DAEMON = "daemon-only";
+  let harness: KimiHarness | undefined;
+  try {
+    const result = await createKimiAgentSessionForContext(fixture.ctx, "sess-env-probe", {
+      prepareTransport: makeFakeDeps(fixture.home, {} as KimiHarness, [], "/tmp/kimi-wrappers/agent-1/env-launch", "/tmp/kimi-slock-home", {
+        PATH: process.env.PATH ?? "",
+        KIMI_ENV_PROBE_AGENT: "agent-value",
+      }).prepareTransport,
+    });
+    harness = result.harness;
+    const session = result.session;
+    session.setApprovalHandler(() => ({ decision: "approved", scope: "session" }));
+    const finished = new Promise<void>((resolve, reject) => {
+      const unsubscribe = session.onEvent((event) => {
+        if (event.type === "turn.ended" && (event as { agentId?: string }).agentId !== "agent-sub") { unsubscribe(); resolve(); }
+        if (event.type === "error") { unsubscribe(); reject(new Error(JSON.stringify(event))); }
+      });
+    });
+    await session.prompt("probe the env");
+    await finished;
+    assert.equal(requests.length, 2, "the tool result goes back to the model");
+    const toolResult = JSON.stringify(requests[1]!.messages.filter((message) => message.role === "tool"));
+    assert.ok(toolResult.includes("agent-value|unset"), `Bash must see the agent env and not the daemon's: ${toolResult}`);
+  } finally {
+    if (savedDaemon === undefined) delete process.env.KIMI_ENV_PROBE_DAEMON;
+    else process.env.KIMI_ENV_PROBE_DAEMON = savedDaemon;
+    await harness?.close();
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    rmSync(path.dirname(fixture.home), { recursive: true, force: true });
+  }
+}, 20000);
 
 // Product tooth for persisted-session roleAdditional refresh: after a daemon
 // Stop→Start, the resumed Kimi SDK session must receive the *fresh* standing
@@ -1235,6 +1245,7 @@ test("KimiSdkRuntimeSession resumes with the fresh roleAdditional after Stop→S
 
   function makeRuntime(standingPrompt: string, slockDir: string) {
     const { harness, createCalls, resumeCalls } = makeCapturingHarness();
+    const harnessOptions: Array<Record<string, unknown>> = [];
     const promptCalls: string[] = [];
     const fakeSession = {
       id: sessionId,
@@ -1268,11 +1279,11 @@ test("KimiSdkRuntimeSession resumes with the fresh roleAdditional after Stop→S
       const result = await createKimiAgentSessionForContext(
         ctx,
         sid,
-        makeFakeDeps(home, harnessWithSession, [], slockDir, path.dirname(path.dirname(path.dirname(slockDir)))),
+        makeFakeDeps(home, harnessWithSession, harnessOptions, slockDir, path.dirname(path.dirname(path.dirname(slockDir)))),
       );
       return { harness: result.harness, session: fakeSession, wrapperPath: result.wrapperPath };
     };
-    return { factory, createCalls, resumeCalls, promptCalls };
+    return { factory, createCalls, resumeCalls, promptCalls, harnessOptions };
   }
 
   // First launch: standing prompt W1.
@@ -1288,7 +1299,7 @@ test("KimiSdkRuntimeSession resumes with the fresh roleAdditional after Stop→S
   // Daemon restart: standing prompt changed to W2 with a fresh launch dir.
   const w2SlockDir = path.join(workingDirectory, "cli-transport", "agent", "w2-launch");
   const ctx2 = makeCtx("standing prompt W2");
-  const { factory: factory2, createCalls: createCalls2, resumeCalls: resumeCalls2, promptCalls: promptCalls2 } = makeRuntime("standing prompt W2", w2SlockDir);
+  const { factory: factory2, createCalls: createCalls2, resumeCalls: resumeCalls2, promptCalls: promptCalls2, harnessOptions: harnessOptions2 } = makeRuntime("standing prompt W2", w2SlockDir);
   const runtime2 = new KimiSdkRuntimeSession(ctx2, () => {}, factory2);
   const start2 = await runtime2.start({ text: "second turn" });
   assert.equal(start2.ok, true);
@@ -1300,14 +1311,17 @@ test("KimiSdkRuntimeSession resumes with the fresh roleAdditional after Stop→S
   assert.equal(resumeCalls2.length, 1, "must call resumeSession exactly once after restart");
   const resumedFields = resumeCalls2[0];
   assert.equal(resumedFields.id, sessionId, "resume must target the same session id");
-  const roleAdditional = resumedFields.roleAdditional as string;
+  // The resuming harness carries the fresh W2 standing prompt (the SDK
+  // re-renders the resumed main agent's prompt with it).
+  const roleAdditional = harnessOptions2.at(-1)!.roleAdditional as string;
   assert.ok(roleAdditional.includes("standing prompt W2"), "resumed roleAdditional must carry the fresh standing prompt W2");
   assert.ok(!roleAdditional.includes("standing prompt W1"), "resumed roleAdditional must not carry the stale W1 prompt");
   assert.ok(!roleAdditional.includes(WRAPPER_PATH), "resumed roleAdditional must NOT carry the wrapper CLI note");
 
-  // Resume must receive the W2 tool Kaos so the model's first CLI call resolves
-  // to the current launch's wrapper, not a stale W1 absolute path.
-  assert.equal((resumedFields.kaos as { name: string }).name, "fake-tool-kaos");
+  // The W2 launch's tool env, so the model's first CLI call resolves to the
+  // current launch's wrapper, not a stale W1 absolute path.
+  const baseEnv = harnessOptions2.at(-1)!.baseEnv as Record<string, string>;
+  assert.ok(baseEnv.PATH?.startsWith(w2SlockDir), "resumed tool env PATH must lead with the W2 launch dir");
 
   // The first turn after resume must contain only the user's text.
   assert.equal(promptCalls2.length, 1, "first resumed turn must issue exactly one prompt");
@@ -1315,7 +1329,7 @@ test("KimiSdkRuntimeSession resumes with the fresh roleAdditional after Stop→S
   assert.ok(!promptCalls2[0].includes("standing prompt"), "first resumed turn must NOT contain the standing prompt");
 });
 
-test("createKimiAgentSessionForContext passes the launch-scoped remote MCP server on create and resume", async () => {
+test("createKimiAgentSessionForContext attaches the launch-scoped remote MCP server to the session on create and resume", async () => {
   const mcpServerId = "22222222-2222-4222-8222-222222222222";
   const originalFetch = globalThis.fetch;
   globalThis.fetch = (async () => new Response(JSON.stringify({
@@ -1345,15 +1359,15 @@ test("createKimiAgentSessionForContext passes the launch-scoped remote MCP serve
       "managed-create",
       makeFakeDeps(createFixture.home, createHarness.harness),
     );
-    const createServers = createHarness.createCalls[0]?.mcpServers as Record<string, {
-      transport: string;
-      url: string;
-    }>;
-    const [createName] = Object.keys(createServers);
-    assert.match(createName!, /^rm[a-zA-Z0-9]{6}$/);
-    assert.equal(createServers[createName!]!.transport, "http");
-    assert.match(createServers[createName!]!.url, /^http:\/\/127\.0\.0\.1:\d+\/mcp\/[A-Za-z0-9_-]+$/);
-    assert.doesNotMatch(JSON.stringify(createServers), /private\.example\.test/);
+    // kimi-code 2.x takes no MCP servers on create/resume: they are attached
+    // to the live session.
+    assert.equal("mcpServers" in createHarness.createCalls[0]!, false);
+    const [createServer] = createHarness.mcpServerCalls as Array<{ name: string; transport: string; url: string }>;
+    assert.equal(createHarness.mcpServerCalls.length, 1);
+    assert.match(createServer!.name, /^rm[a-zA-Z0-9]{6}$/);
+    assert.equal(createServer!.transport, "http");
+    assert.match(createServer!.url, /^http:\/\/127\.0\.0\.1:\d+\/mcp\/[A-Za-z0-9_-]+$/);
+    assert.doesNotMatch(JSON.stringify(createServer), /private\.example\.test/);
 
     const resumeFixture = makeTempCtx({ sessionId: "resume-managed" });
     configureManagedMcp(resumeFixture.ctx);
@@ -1363,18 +1377,210 @@ test("createKimiAgentSessionForContext passes the launch-scoped remote MCP serve
       "resume-managed",
       makeFakeDeps(resumeFixture.home, resumeHarness.harness),
     );
-    const resumeServers = resumeHarness.resumeCalls[0]?.mcpServers as Record<string, {
-      transport: string;
-      url: string;
-    }>;
-    const [resumeName] = Object.keys(resumeServers);
-    assert.equal(resumeServers[resumeName!]!.transport, "http");
-    assert.match(resumeServers[resumeName!]!.url, /^http:\/\/127\.0\.0\.1:\d+\/mcp\/[A-Za-z0-9_-]+$/);
+    assert.equal("mcpServers" in resumeHarness.resumeCalls[0]!, false);
+    const [resumeServer] = resumeHarness.mcpServerCalls as Array<{ name: string; transport: string; url: string }>;
+    assert.equal(resumeHarness.mcpServerCalls.length, 1);
+    assert.equal(resumeServer!.transport, "http");
+    assert.match(resumeServer!.url, /^http:\/\/127\.0\.0\.1:\d+\/mcp\/[A-Za-z0-9_-]+$/);
   } finally {
     globalThis.fetch = originalFetch;
     await __resetManagedMcpRuntimeProxyForTest();
   }
 });
+
+// Tenny (10-19): kimi-code 2.x ignores `mcpServers` on create and resume without
+// an error, so prove the managed server reaches the real engine, not only that
+// addMcpServer was called: the model request lists the server's tool, on a
+// created and on a resumed session, and does not without the server (control).
+test("the managed MCP server's tools reach the real Kimi engine's model request on create and resume", async () => {
+  const fixture = makeTempCtx({ sessionId: null, model: "kimi-code/k3" });
+  const requests: Array<{ model?: string; tools?: unknown }> = [];
+  const server = createServer(async (req, res) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) chunks.push(Buffer.from(chunk));
+    requests.push(JSON.parse(Buffer.concat(chunks).toString()));
+    res.writeHead(200, { "Content-Type": "text/event-stream" });
+    res.end(`data: ${JSON.stringify({ id: "local-completion", object: "chat.completion.chunk", choices: [{ index: 0, delta: { role: "assistant", content: "ok" }, finish_reason: null }] })}\n\ndata: ${JSON.stringify({ id: "local-completion", object: "chat.completion.chunk", choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\ndata: [DONE]\n\n`);
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+  fsWriteFileSync(path.join(fixture.home, "config.toml"), `
+default_model = "kimi-code/other"
+[providers.local]
+type = "kimi"
+base_url = "http://127.0.0.1:${address.port}/v1"
+api_key = "local-test-only"
+[models."kimi-code/other"]
+provider = "local"
+model = "other"
+max_context_size = 262144
+[models."kimi-code/k3"]
+provider = "local"
+model = "k3"
+max_context_size = 1048576
+`);
+  fsMkdirSync(fixture.ctx.workingDirectory, { recursive: true });
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+    const url = String(input instanceof Request ? input.url : input);
+    if (!url.includes("/internal/agent-api/mcp/tools")) return originalFetch(input, init);
+    return new Response(JSON.stringify({
+      catalogVersion: 1,
+      tools: [{
+        mcpServerId: "22222222-2222-4222-8222-222222222222",
+        serverName: "Private Docs",
+        toolName: "search",
+        runtimeName: "mcp_private_search",
+        description: "Search private docs",
+        inputSchema: { type: "object" },
+        configVersion: 1,
+        assignmentVersion: 1,
+      }],
+    }), { status: 200, headers: { "content-type": "application/json" } });
+  }) as typeof fetch;
+  const deps = { prepareTransport: makeFakeDeps(fixture.home, {} as KimiHarness).prepareTransport };
+  const promptAndFinish = async (session: KimiSession, text: string) => {
+    const finished = new Promise<void>((resolve, reject) => {
+      const unsubscribe = session.onEvent((event) => {
+        if (event.type === "turn.ended") { unsubscribe(); resolve(); }
+        if (event.type === "error") { unsubscribe(); reject(new Error(JSON.stringify(event))); }
+      });
+    });
+    await session.prompt(text);
+    await finished;
+  };
+  // The proxy publishes the tool as r<sha8(runtimeName)>_<toolName>, which the engine qualifies as mcp__<server>__<tool>.
+  const listsManagedTool = (request: { tools?: unknown } | undefined) => ((request?.tools ?? []) as Array<{ function?: { name?: string } }>).some((tool) => /^mcp__rm[a-zA-Z0-9]{6}__r[0-9a-f]{8}_search$/.test(tool.function?.name ?? ""));
+  const harnesses: KimiHarness[] = [];
+  try {
+    // Control: no agent credential, so no managed server.
+    const control = await createKimiAgentSessionForContext({ ...fixture.ctx, config: { ...fixture.ctx.config, agentCredentialKey: undefined } }, "mcp-control", deps);
+    harnesses.push(control.harness);
+    await promptAndFinish(control.session, "control turn");
+    assert.equal(listsManagedTool(requests.at(-1)), false, "control: no managed server, no managed tool");
+
+    fixture.ctx.launchId = "launch-managed";
+    fixture.ctx.config.agentCredentialKey = "sk_agent_test";
+    const created = await createKimiAgentSessionForContext(fixture.ctx, "mcp-real", deps);
+    harnesses.push(created.harness);
+    await promptAndFinish(created.session, "first turn");
+    assert.ok(listsManagedTool(requests.at(-1)), "a created session's first request lists the managed tool");
+    // The reload that brings the server in must not undo the profile model
+    // (the config default is another model).
+    assert.equal(requests.at(-1)?.model, "k3");
+    const sessionId = created.session.id;
+    await created.harness.close();
+    harnesses.pop();
+
+    fixture.ctx.config.sessionId = sessionId;
+    fixture.ctx.launchId = "launch-managed-2";
+    const resumed = await createKimiAgentSessionForContext(fixture.ctx, sessionId, deps);
+    harnesses.push(resumed.harness);
+    assert.equal(resumed.session.id, sessionId, "resumed, not created");
+    await promptAndFinish(resumed.session, "first turn after resume");
+    assert.ok(listsManagedTool(requests.at(-1)), "a resumed session's first request lists the managed tool");
+    assert.ok(JSON.stringify(requests.at(-1)).includes(fixture.ctx.standingPrompt!), "the reload keeps the standing prompt");
+    assert.equal(requests.at(-1)?.model, "k3");
+  } finally {
+    globalThis.fetch = originalFetch;
+    for (const harness of harnesses) await harness.close();
+    await __resetManagedMcpRuntimeProxyForTest();
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    rmSync(path.dirname(fixture.home), { recursive: true, force: true });
+  }
+}, 20000);
+
+// Tenny: an app server that cannot be attached must not stop the Kimi agent
+// from starting (0.34 opened the session even when the server was down). The
+// real engine is used; only the failing call is replaced.
+test.each(["addMcpServer", "reloadSession"] as const)("a failing %s leaves the managed MCP out and the agent still starts and answers", async (failing) => {
+  const fixture = makeTempCtx({ sessionId: null, model: "kimi-code/k3" });
+  const requests: Array<{ tools?: unknown }> = [];
+  const server = createServer(async (req, res) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) chunks.push(Buffer.from(chunk));
+    requests.push(JSON.parse(Buffer.concat(chunks).toString()));
+    res.writeHead(200, { "Content-Type": "text/event-stream" });
+    res.end(`data: ${JSON.stringify({ id: "local-completion", object: "chat.completion.chunk", choices: [{ index: 0, delta: { role: "assistant", content: "ok" }, finish_reason: null }] })}\n\ndata: ${JSON.stringify({ id: "local-completion", object: "chat.completion.chunk", choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\ndata: [DONE]\n\n`);
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+  fsWriteFileSync(path.join(fixture.home, "config.toml"), `
+default_model = "kimi-code/k3"
+[providers.local]
+type = "kimi"
+base_url = "http://127.0.0.1:${address.port}/v1"
+api_key = "local-test-only"
+[models."kimi-code/k3"]
+provider = "local"
+model = "k3"
+max_context_size = 1048576
+`);
+  fsMkdirSync(fixture.ctx.workingDirectory, { recursive: true });
+  fixture.ctx.launchId = "launch-managed";
+  fixture.ctx.config.agentCredentialKey = "sk_agent_test";
+  const traced: Array<{ name: string; attrs: Record<string, unknown> }> = [];
+  fixture.ctx.tracer = { emitEvent: (name: string, options: { attrs?: Record<string, unknown> }) => traced.push({ name, attrs: options.attrs ?? {} }) } as never;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+    const url = String(input instanceof Request ? input.url : input);
+    if (!url.includes("/internal/agent-api/mcp/tools")) return originalFetch(input, init);
+    return new Response(JSON.stringify({
+      catalogVersion: 1,
+      tools: [{
+        mcpServerId: "22222222-2222-4222-8222-222222222222",
+        serverName: "Private Docs",
+        toolName: "search",
+        runtimeName: "mcp_private_search",
+        description: "Search private docs",
+        inputSchema: { type: "object" },
+        configVersion: 1,
+        assignmentVersion: 1,
+      }],
+    }), { status: 200, headers: { "content-type": "application/json" } });
+  }) as typeof fetch;
+  // The real harness, with the one session call made to fail.
+  const realHarness = createKimiHarness;
+  const createHarness = ((options: Parameters<typeof createKimiHarness>[0]) => {
+    const harness = realHarness(options);
+    const createSession = harness.createSession.bind(harness);
+    harness.createSession = async (input) => {
+      const session = await createSession(input);
+      session[failing] = async () => { throw new Error(`${failing} refused`); };
+      return session;
+    };
+    return harness;
+  }) as typeof createKimiHarness;
+  let harness: KimiHarness | undefined;
+  try {
+    const started = await createKimiAgentSessionForContext(fixture.ctx, "mcp-down", {
+      createHarness,
+      prepareTransport: makeFakeDeps(fixture.home, {} as KimiHarness).prepareTransport,
+    });
+    harness = started.harness;
+    const finished = new Promise<void>((resolve, reject) => {
+      const unsubscribe = started.session.onEvent((event) => {
+        if (event.type === "turn.ended") { unsubscribe(); resolve(); }
+        if (event.type === "error") { unsubscribe(); reject(new Error(JSON.stringify(event))); }
+      });
+    });
+    await started.session.prompt("hello");
+    await finished;
+    assert.equal(requests.length, 1, "the agent answered");
+    assert.ok(!JSON.stringify(requests[0]?.tools ?? []).includes("_search"), "no managed tool after a failed attach");
+    assert.deepEqual(traced.map((event) => [event.name, event.attrs.step_kind]), [
+      ["daemon.runtime.managed_mcp.attach_failed", failing === "addMcpServer" ? "add" : "reload"],
+    ]);
+  } finally {
+    globalThis.fetch = originalFetch;
+    await harness?.close();
+    await __resetManagedMcpRuntimeProxyForTest();
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    rmSync(path.dirname(fixture.home), { recursive: true, force: true });
+  }
+}, 20000);
 
 test("createKimiAgentSessionForContext launches K3 from the same KIMI_CODE_HOME used for model detection", async () => {
   const { ctx, home } = makeTempCtx({ model: "kimi-code/k3" });
@@ -1763,140 +1969,6 @@ test("KimiSdkRuntimeSession keeps pending goal idle closed until the final conti
   await runtime.dispose();
 });
 
-test("KimiSdkRuntimeSession maps real SDK turn.agent_busy error event to delivery_error", async () => {
-  let eventListener: ((event: KimiSdkEvent) => void) | null = null;
-  const promptCalls: string[] = [];
-  const fakeSession = {
-    id: "kimi-session-delivery-error",
-    getGoal() {
-      return Promise.resolve({ goal: null });
-    },
-    setApprovalHandler() {},
-    onEvent(listener: (event: KimiSdkEvent) => void) {
-      eventListener = listener;
-      return () => {};
-    },
-    prompt(text: string) {
-      promptCalls.push(text);
-      if (text !== "start") {
-        eventListener?.({
-          ...eventBase(),
-          type: "error",
-          code: "turn.agent_busy",
-          message: "Cannot launch a new turn while another turn (ID 257) is active",
-          retryable: false,
-        });
-      }
-      return Promise.resolve();
-    },
-    steer() {
-      return Promise.resolve();
-    },
-    cancel() {
-      return Promise.resolve();
-    },
-  } as unknown as KimiSession;
-
-  const runtime = new KimiSdkRuntimeSession(makeSpawnContext(), () => {}, async () => ({
-    harness: {} as KimiHarness,
-    session: fakeSession,
-    wrapperPath: WRAPPER_PATH,
-  }));
-  const runtimeEvents: ParsedEvent[] = [];
-  runtime.on("runtime_event", (event) => runtimeEvents.push(event));
-
-  const start = await runtime.start({ text: "start" });
-  assert.equal(start.ok, true);
-  await flushImmediate();
-  await flushImmediate();
-  assert.ok(eventListener, "runtime must register the SDK event callback");
-  const emitSdkEvent = eventListener as unknown as (event: KimiSdkEvent) => void;
-  emitSdkEvent({ ...eventBase(), type: "turn.ended", turnId: 1, reason: "completed" });
-  runtimeEvents.length = 0;
-
-  const delivery = runtime.send({ mode: "idle", text: "follow-up after daemon thought idle" });
-  assert.deepEqual(delivery, { ok: true, acceptedAs: "prompt" });
-  await flushImmediate();
-  await flushImmediate();
-
-  assert.equal(promptCalls.length, 2);
-  assert.deepEqual(runtimeEvents, [{
-    kind: "delivery_error",
-    message: "Cannot launch a new turn while another turn (ID 257) is active",
-    requestMethod: "turn/start",
-    source: "kimi_sdk_response",
-    code: "turn.agent_busy",
-    payloadBytes: Buffer.byteLength("follow-up after daemon thought idle", "utf8"),
-  }]);
-
-  await runtime.dispose();
-});
-
-test("KimiSdkRuntimeSession does not misattribute stale SDK busy errors after turn.started", async () => {
-  let eventListener: ((event: KimiSdkEvent) => void) | null = null;
-  const fakeSession = {
-    id: "kimi-session-started-error",
-    getGoal() {
-      return Promise.resolve({ goal: null });
-    },
-    setApprovalHandler() {},
-    onEvent(listener: (event: KimiSdkEvent) => void) {
-      eventListener = listener;
-      return () => {};
-    },
-    prompt() {
-      return Promise.resolve();
-    },
-    steer() {
-      return Promise.resolve();
-    },
-    cancel() {
-      return Promise.resolve();
-    },
-  } as unknown as KimiSession;
-
-  const runtime = new KimiSdkRuntimeSession(makeSpawnContext(), () => {}, async () => ({
-    harness: {} as KimiHarness,
-    session: fakeSession,
-    wrapperPath: WRAPPER_PATH,
-  }));
-  const runtimeEvents: ParsedEvent[] = [];
-  runtime.on("runtime_event", (event) => runtimeEvents.push(event));
-
-  const start = await runtime.start({ text: "start" });
-  assert.equal(start.ok, true);
-  await flushImmediate();
-  await flushImmediate();
-  assert.ok(eventListener, "runtime must register the SDK event callback");
-  const emitSdkEvent = eventListener as unknown as (event: KimiSdkEvent) => void;
-  emitSdkEvent({ ...eventBase(), type: "turn.ended", turnId: 1, reason: "completed" });
-  runtimeEvents.length = 0;
-
-  const delivery = runtime.send({ mode: "idle", text: "follow-up that starts successfully" });
-  assert.deepEqual(delivery, { ok: true, acceptedAs: "prompt" });
-  await flushImmediate();
-  emitSdkEvent({ ...eventBase(), type: "turn.started", turnId: 2, origin: "user" as never });
-  emitSdkEvent({
-    ...eventBase(),
-    type: "error",
-    code: "turn.agent_busy",
-    message: "Cannot launch a new turn while another turn (ID 258) is active",
-    retryable: false,
-  });
-
-  assert.equal(
-    runtimeEvents.some((event) => event.kind === "delivery_error"),
-    false,
-    "turn.started clears the delivery-attempt attribution before later SDK error events",
-  );
-  assert.deepEqual(runtimeEvents, [{
-    kind: "error",
-    message: "Cannot launch a new turn while another turn (ID 258) is active",
-  }]);
-
-  await runtime.dispose();
-});
-
 test("KimiSdkRuntimeSession callback safely drops new 0.26 prompt lifecycle events", async () => {
   let eventListener: ((event: KimiSdkEvent) => void) | null = null;
   const fakeSession = {
@@ -1963,35 +2035,26 @@ test("KimiSdkRuntimeSession callback safely drops new 0.26 prompt lifecycle even
   await runtime.dispose();
 });
 
-// ── LocalKaos per-session PATH tooth ───────────────────────────────────────
+// ── Per-launch PATH tooth ─────────────────────────────────────────────────
 //
-// The Kimi SDK bash tool receives a dedicated tool Kaos whose PATH is prepended
-// with the current launch's wrapper directory. This test proves that a real
-// LocalKaos process resolves the bare `raft` command to that wrapper, so the
-// model never needs an absolute wrapper path in its prompt.
+// The Kimi engine spawns its tool processes from the harness's base env, whose
+// PATH is prepended with the current launch's wrapper directory. This test
+// proves a real process with that env resolves the bare `raft` command to that
+// wrapper, so the model never needs an absolute wrapper path in its prompt.
 
-test("LocalKaos per-session PATH resolves bare `raft` to the current launch wrapper", async () => {
-  const tmp = mkdtempSync(path.join(os.tmpdir(), "kimi-kaos-path-"));
+test("the tool base env resolves bare `raft` to the current launch wrapper", async () => {
+  const tmp = mkdtempSync(path.join(os.tmpdir(), "kimi-tool-path-"));
   const oldSlockHome = process.env.SLOCK_HOME;
   process.env.SLOCK_HOME = path.join(tmp, "home");
   try {
     const ctx = makeSpawnContext();
     ctx.workingDirectory = tmp;
-    const { slockDir } = await prepareCliTransport(ctx, { NO_COLOR: "1" });
+    const transport = await prepareCliTransport(ctx, { NO_COLOR: "1" });
+    const env = kimiToolBaseEnv({ spawnEnv: transport.spawnEnv, slockDir: transport.slockDir, slockHome: transport.slockHome });
 
-    const localKaos = await LocalKaos.create();
-    const toolKaos = localKaos.withEnv({
-      PATH: `${slockDir}${path.delimiter}${process.env.PATH ?? ""}`,
-    });
+    const out = execFileSync("sh", ["-c", "command -v raft"], { env, encoding: "utf8" }).trim();
 
-    const proc = await toolKaos.exec("sh", "-c", "command -v raft");
-    const chunks: Buffer[] = [];
-    for await (const chunk of proc.stdout) chunks.push(chunk);
-    const out = Buffer.concat(chunks).toString("utf8").trim();
-    await proc.wait();
-    await proc.dispose();
-
-    assert.equal(out, path.join(slockDir, "raft"), "command -v raft must resolve to the current launch's raft wrapper");
+    assert.equal(out, path.join(transport.slockDir, "raft"), "command -v raft must resolve to the current launch's raft wrapper");
   } finally {
     if (oldSlockHome === undefined) {
       delete process.env.SLOCK_HOME;
@@ -2000,6 +2063,18 @@ test("LocalKaos per-session PATH resolves bare `raft` to the current launch wrap
     }
     rmSync(tmp, { recursive: true, force: true });
   }
+});
+
+test("only a subagent's usage reaches the main agent's event stream", () => {
+  const subagent = (type: string) => ({ type, agentId: "agent-2", sessionId: "s" }) as never;
+  assert.equal(kimiEventIsShownForMainAgent({ type: "turn.ended", agentId: "main", sessionId: "s" } as never), true);
+  assert.equal(kimiEventIsShownForMainAgent({ type: "turn.ended" } as never), true, "an event without agentId is the main agent's");
+  // Tool calls stay out until they carry subagent lineage: a background
+  // subagent's calls arrive after the main turn ended.
+  for (const type of ["turn.started", "turn.ended", "assistant.delta", "thinking.delta", "error", "compaction.started", "goal.updated", "tool.call.started", "tool.result"]) {
+    assert.equal(kimiEventIsShownForMainAgent(subagent(type)), false, `a subagent's ${type} is not the main agent's`);
+  }
+  assert.equal(kimiEventIsShownForMainAgent(subagent("turn.step.completed")), true, "a subagent's usage is counted");
 });
 
 
@@ -2136,4 +2211,274 @@ test("task #17: a Kimi tool result reports ok, and a non-zero Bash exit is an ok
   assert.deepEqual(kimiToolResultOutcome({ isError: true, output: "Command failed with exit code: 3." }), { ok: true, exitCode: 3 });
   assert.deepEqual(kimiToolResultOutcome({ isError: true, output: { message: "Command failed with exit code: 1.", brief: "Failed with exit code: 1" } }), { ok: true, exitCode: 1 });
   assert.deepEqual(kimiToolResultOutcome({ isError: true, output: "Permission denied" }), { ok: false });
+});
+
+test("KimiSdkRuntimeSession.interruptTurn cancels the running turn natively and ends it as interrupted, not failed", async () => {
+  let eventListener: ((event: KimiSdkEvent) => void) | null = null;
+  let rejectPrompt: (error: Error) => void = () => {};
+  let cancelCalls = 0;
+  const fakeSession = {
+    id: "kimi-session-1",
+    setApprovalHandler() {},
+    onEvent(listener: (event: KimiSdkEvent) => void) {
+      eventListener = listener;
+      return () => {};
+    },
+    prompt() {
+      eventListener?.({ ...eventBase(), type: "turn.started", turnId: 1 } as KimiSdkEvent);
+      return new Promise<void>((_resolve, reject) => { rejectPrompt = reject; });
+    },
+    steer() {
+      return Promise.resolve();
+    },
+    cancel() {
+      cancelCalls += 1;
+      // Kimi ends the cancelled turn, then the pending prompt settles.
+      eventListener?.({ ...eventBase(), type: "turn.ended", turnId: 1, reason: "cancelled", interruptReason: "user_cancelled" } as KimiSdkEvent);
+      rejectPrompt(new Error("turn cancelled"));
+      return Promise.resolve();
+    },
+  } as unknown as KimiSession;
+  const factory = async () => ({ harness: {} as unknown as KimiHarness, session: fakeSession, wrapperPath: WRAPPER_PATH });
+  const runtime = new KimiSdkRuntimeSession(makeSpawnContext(), () => {}, factory);
+  const runtimeEvents: ParsedEvent[] = [];
+  runtime.on("runtime_event", (event) => runtimeEvents.push(event));
+
+  assert.equal(runtime.interruptTurn(), "unsupported", "no turn yet: the daemon takes its restart path");
+  await runtime.start({ text: "work" });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(runtime.interruptTurn(), "sent");
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(cancelCalls, 1);
+  const turnEnds = runtimeEvents.filter((event) => event.kind === "turn_end");
+  assert.deepEqual(turnEnds.map((event) => event.kind === "turn_end" && event.interrupted), [true]);
+  assert.deepEqual(runtimeEvents.filter((event) => event.kind === "error" || event.kind === "delivery_error"), []);
+  assert.equal(runtime.interruptTurn(), "unsupported", "the turn is over");
+
+  await runtime.dispose();
+});
+
+test("#54 phase 3: KimiSdkRuntimeSession reads its context and window from the session, compacts when idle, settles on compaction.completed, and refuses while a turn runs", async () => {
+  let eventListener: ((event: KimiSdkEvent) => void) | null = null;
+  let compactCalls = 0;
+  let resolvePrompt: () => void = () => {};
+  const fakeSession = {
+    id: "kimi-session-1",
+    setApprovalHandler() {},
+    onEvent(listener: (event: KimiSdkEvent) => void) {
+      eventListener = listener;
+      return () => {};
+    },
+    prompt() {
+      eventListener?.({ ...eventBase(), type: "turn.started", turnId: 1 } as KimiSdkEvent);
+      return new Promise<void>((resolve) => { resolvePrompt = resolve; });
+    },
+    steer() {
+      return Promise.resolve();
+    },
+    getStatus() {
+      return Promise.resolve({ contextTokens: 300_000, maxContextTokens: 1_000_000 });
+    },
+    compact() {
+      compactCalls += 1;
+      setImmediate(() => eventListener?.({ ...eventBase(), type: "compaction.completed" } as KimiSdkEvent));
+      return Promise.resolve();
+    },
+  } as unknown as KimiSession;
+  const factory = async () => ({ harness: {} as unknown as KimiHarness, session: fakeSession, wrapperPath: WRAPPER_PATH });
+  const runtime = new KimiSdkRuntimeSession(makeSpawnContext(), () => {}, factory);
+
+  await runtime.start({ text: "work" });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(await runtime.compactAtTurnEnd(), { kind: "refused", reason: "busy" }, "a turn is running");
+  assert.equal(compactCalls, 0);
+
+  eventListener!({ ...eventBase(), type: "turn.ended", turnId: 1, reason: "completed" } as KimiSdkEvent);
+  resolvePrompt();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(await runtime.turnEndContextFacts(), { contextTokens: 300_000, windowTokens: 1_000_000 });
+  assert.deepEqual(await runtime.compactAtTurnEnd(), { kind: "completed" });
+  assert.equal(compactCalls, 1);
+
+  await runtime.dispose();
+});
+
+test("a Kimi turn cancelled by anything other than the daemon's interrupt still ends without the interrupted mark", () => {
+  const state = createKimiSdkEventMappingState("kimi-session-1");
+  const events = mapKimiSdkEventToParsedEvents({ ...eventBase(), type: "turn.ended", turnId: 1, reason: "cancelled" } as KimiSdkEvent, state);
+  assert.deepEqual(events.filter((event) => event.kind === "turn_end"), [{ kind: "turn_end", sessionId: "kimi-session-1" }]);
+});
+
+test("a cancelled Kimi prompt that rejects after the next turn started neither reports an error nor ends that turn", async () => {
+  let eventListener: ((event: KimiSdkEvent) => void) | null = null;
+  const rejecters: Array<(error: Error) => void> = [];
+  const fakeSession = {
+    id: "kimi-session-1",
+    setApprovalHandler() {},
+    onEvent(listener: (event: KimiSdkEvent) => void) {
+      eventListener = listener;
+      return () => {};
+    },
+    prompt() {
+      eventListener?.({ ...eventBase(), type: "turn.started", turnId: rejecters.length + 1 } as KimiSdkEvent);
+      return new Promise<void>((_resolve, reject) => { rejecters.push(reject); });
+    },
+    steer() {
+      return Promise.resolve();
+    },
+    cancel() {
+      // The turn ends now; the prompt's own rejection comes later.
+      eventListener?.({ ...eventBase(), type: "turn.ended", turnId: 1, reason: "cancelled" } as KimiSdkEvent);
+      return Promise.resolve();
+    },
+  } as unknown as KimiSession;
+  const factory = async () => ({ harness: {} as unknown as KimiHarness, session: fakeSession, wrapperPath: WRAPPER_PATH });
+  const runtime = new KimiSdkRuntimeSession(makeSpawnContext(), () => {}, factory);
+  const runtimeEvents: ParsedEvent[] = [];
+  runtime.on("runtime_event", (event) => runtimeEvents.push(event));
+
+  await runtime.start({ text: "work" });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(runtime.interruptTurn(), "sent");
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(runtime.send({ mode: "idle", text: "next" }), { ok: true, acceptedAs: "prompt" });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(rejecters.length, 2, "precondition: the next turn's prompt is out");
+  rejecters[0]!(new Error("turn cancelled"));
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(runtimeEvents.filter((event) => event.kind === "error" || event.kind === "delivery_error"), []);
+  assert.equal(runtime.interruptTurn(), "sent", "the next turn is still running and can be stopped natively");
+
+  await runtime.dispose();
+});
+
+test("#proj-runtime:#41: a Kimi subagent's spawn, steps and end carry its lineage; its turn and errors stay out", () => {
+  const state = createKimiSdkEventMappingState("kimi-session-1");
+  state.sessionAnnounced = true;
+  const lineage = { parentToolUseId: "call_agent_1", taskId: "sub-1", subagentType: "coder" };
+  // The spawn comes from the main agent (requester) and names the subagent's own agent id.
+  assert.deepEqual(mapKimiSdkEventToParsedEvents({ ...eventBase(), type: "subagent.spawned", subagentId: "sub-1", subagentName: "coder", parentToolCallId: "call_agent_1", runInBackground: true, taskId: "bg-7" }, state), [
+    { kind: "subagent_progress", source: "kimi_subagent", phase: "started", ...lineage },
+  ]);
+  assert.deepEqual(mapKimiSdkEventToParsedEvents({ ...eventBase(), type: "subagent.spawned", subagentId: "sub-1", subagentName: "coder", parentToolCallId: "call_agent_1", runInBackground: true }, state), [], "a repeat while it runs starts nothing");
+  assert.equal(state.subagents?.get("sub-1")?.stopTaskId, "bg-7");
+
+  const child = { agentId: "sub-1", sessionId: "kimi-session-1" };
+  // Its deltas are buffered into one row, passed on before its next tool call.
+  assert.deepEqual(mapKimiSubagentEvent({ ...child, type: "thinking.delta", turnId: 1, delta: "pl" } as never, state), []);
+  assert.deepEqual(mapKimiSubagentEvent({ ...child, type: "thinking.delta", turnId: 1, delta: "an" } as never, state), []);
+  assert.deepEqual(mapKimiSubagentEvent({ ...child, type: "tool.call.started", turnId: 1, toolCallId: "c1", name: "Shell", args: { command: "ls" } } as never, state), [
+    { kind: "thinking", text: "plan", subagent: lineage },
+    { kind: "tool_call", name: "Shell", input: { command: "ls" }, callId: "sub-1:c1", subagent: lineage },
+  ]);
+  const result = mapKimiSubagentEvent({ ...child, type: "tool.result", turnId: 1, toolCallId: "c1", isError: false, output: "ok" } as never, state);
+  assert.equal(result?.[0]?.kind, "tool_output");
+  assert.equal((result?.[0] as { callId?: string }).callId, "sub-1:c1");
+  assert.deepEqual(mapKimiSubagentEvent({ ...child, type: "assistant.delta", turnId: 1, delta: "done" } as never, state), []);
+  // Its turn end passes on its text, never a turn end; its errors stay out.
+  assert.deepEqual(mapKimiSubagentEvent({ ...child, type: "turn.ended", turnId: 1, reason: "completed" } as never, state), [{ kind: "text", text: "done", subagent: lineage }]);
+  assert.deepEqual(mapKimiSubagentEvent({ ...child, type: "error", message: "boom" } as never, state), []);
+  // Its own (nested) subagent: the spawning call id is qualified by the spawner, as its tool rows are.
+  assert.deepEqual(mapKimiSubagentEvent({ ...child, type: "subagent.spawned", subagentId: "sub-2", subagentName: "explore", parentToolCallId: "c9", runInBackground: false } as never, state), [
+    { kind: "subagent_progress", source: "kimi_subagent", phase: "started", parentToolUseId: "sub-1:c9", taskId: "sub-2", subagentType: "explore" },
+  ]);
+  // The main agent's and an unknown agent's events are not a subagent's.
+  assert.equal(mapKimiSubagentEvent({ ...eventBase(), type: "assistant.delta", turnId: 1, delta: "x" } as never, state), null);
+  assert.equal(mapKimiSubagentEvent({ agentId: "stranger", sessionId: "kimi-session-1", type: "assistant.delta", turnId: 1, delta: "x" } as never, state), null);
+
+  assert.deepEqual(mapKimiSdkEventToParsedEvents({ ...eventBase(), type: "subagent.completed", subagentId: "sub-1", resultSummary: "done" }, state), [
+    { kind: "subagent_progress", source: "kimi_subagent", phase: "notification", taskStatus: "completed", ...lineage },
+  ]);
+  // A resume spawns it again under a new call: a new run, started again.
+  assert.deepEqual(mapKimiSdkEventToParsedEvents({ ...eventBase(), type: "subagent.spawned", subagentId: "sub-1", subagentName: "coder", parentToolCallId: "call_agent_2", runInBackground: false }, state), [
+    { kind: "subagent_progress", source: "kimi_subagent", phase: "started", parentToolUseId: "call_agent_2", taskId: "sub-1", subagentType: "coder" },
+  ]);
+  assert.equal(state.subagents?.get("sub-1")?.stopTaskId, undefined, "the new run names no task");
+  for (const [type, extra, taskStatus] of [
+    ["subagent.failed", { error: "oh" }, "failed"],
+  ] as const) {
+    assert.deepEqual(mapKimiSdkEventToParsedEvents({ ...eventBase(), type, subagentId: "sub-1", ...extra } as never, state), [
+      { kind: "subagent_progress", source: "kimi_subagent", phase: "notification", taskStatus, parentToolUseId: "call_agent_2", taskId: "sub-1", subagentType: "coder" },
+    ], type);
+  }
+  assert.deepEqual(mapKimiSdkEventToParsedEvents({ ...eventBase(), type: "subagent.cancelled", subagentId: "sub-2" }, state), [
+    { kind: "subagent_progress", source: "kimi_subagent", phase: "notification", taskStatus: "stopped", parentToolUseId: "sub-1:c9", taskId: "sub-2", subagentType: "explore" },
+  ]);
+});
+
+test("#proj-runtime:#41: a Kimi subagent cancelled before its spawn was announced is never counted as running", () => {
+  const state = createKimiSdkEventMappingState("kimi-session-1");
+  state.sessionAnnounced = true;
+  assert.deepEqual(mapKimiSdkEventToParsedEvents({ ...eventBase(), type: "subagent.cancelled", subagentId: "sub-9" }, state), []);
+  assert.deepEqual(mapKimiSdkEventToParsedEvents({ ...eventBase(), type: "subagent.spawned", subagentId: "sub-9", subagentName: "coder", parentToolCallId: "c1", runInBackground: true }, state), []);
+  assert.equal(state.subagents?.get("sub-9")?.running, false);
+  // The same race on a resume: its end beats the resume's spawn.
+  assert.deepEqual(mapKimiSdkEventToParsedEvents({ ...eventBase(), type: "subagent.failed", subagentId: "sub-9", error: "limit" }, state), []);
+  assert.deepEqual(mapKimiSdkEventToParsedEvents({ ...eventBase(), type: "subagent.spawned", subagentId: "sub-9", subagentName: "coder", parentToolCallId: "c2", runInBackground: false }, state), []);
+  assert.equal(state.subagents?.get("sub-9")?.running, false);
+});
+
+test("#proj-runtime:#41: through the runtime session, a Kimi subagent's steps reach the activity with its lineage, and its turn end never ends the agent's turn", async () => {
+  let eventListener: ((event: KimiSdkEvent) => void) | null = null;
+  const fakeSession = {
+    id: "kimi-session-sub",
+    getGoal() { return Promise.resolve({ goal: null }); },
+    setApprovalHandler() {},
+    onEvent(listener: (event: KimiSdkEvent) => void) { eventListener = listener; return () => {}; },
+    prompt() { return Promise.resolve(); },
+    steer() { return Promise.resolve(); },
+    cancel() { return Promise.resolve(); },
+  } as unknown as KimiSession;
+  const runtime = new KimiSdkRuntimeSession(makeSpawnContext(), () => {}, async () => ({ harness: {} as KimiHarness, session: fakeSession, wrapperPath: WRAPPER_PATH }));
+  const runtimeEvents: ParsedEvent[] = [];
+  runtime.on("runtime_event", (event) => runtimeEvents.push(event));
+  assert.equal((await runtime.start({ text: "start" })).ok, true);
+  await flushImmediate();
+  const emit = eventListener as unknown as (event: KimiSdkEvent) => void;
+  runtimeEvents.length = 0;
+  const child = { agentId: "sub-1", sessionId: "kimi-session-sub" };
+  emit({ ...eventBase(), type: "subagent.spawned", subagentId: "sub-1", subagentName: "coder", parentToolCallId: "call_1", runInBackground: true });
+  emit({ ...child, type: "assistant.delta", turnId: 1, delta: "hi" } as never);
+  emit({ ...child, type: "turn.ended", turnId: 1, reason: "completed" } as never);
+  assert.deepEqual(runtimeEvents.map((event) => event.kind), ["subagent_progress", "text"], "no turn_end from the subagent");
+  assert.ok(runtimeEvents.every((event) => (event as { subagent?: unknown }).subagent !== undefined || event.kind === "subagent_progress"));
+});
+
+
+test("#proj-runtime:#41: a Kimi subagent the main agent started stops through its task, foreground or background; a nested one cannot be stopped from the session", async () => {
+  let eventListener: ((event: KimiSdkEvent) => void) | null = null;
+  const stopped: Array<{ taskId: string; reason?: string }> = [];
+  const fakeSession = {
+    id: "kimi-session-stop",
+    getGoal() { return Promise.resolve({ goal: null }); },
+    setApprovalHandler() {},
+    onEvent(listener: (event: KimiSdkEvent) => void) { eventListener = listener; return () => {}; },
+    prompt() { return Promise.resolve(); },
+    steer() { return Promise.resolve(); },
+    cancel() { return Promise.resolve(); },
+    stopBackgroundTask(taskId: string, options?: { reason?: string }) { stopped.push({ taskId, reason: options?.reason }); return Promise.resolve(); },
+  } as unknown as KimiSession;
+  const runtime = new KimiSdkRuntimeSession(makeSpawnContext(), () => {}, async () => ({ harness: {} as KimiHarness, session: fakeSession, wrapperPath: WRAPPER_PATH }));
+  assert.equal((await runtime.start({ text: "start" })).ok, true);
+  await flushImmediate();
+  const emit = eventListener as unknown as (event: KimiSdkEvent) => void;
+  emit({ ...eventBase(), type: "subagent.spawned", subagentId: "bg-sub", subagentName: "coder", parentToolCallId: "c1", runInBackground: true, taskId: "task-7" });
+  emit({ ...eventBase(), type: "subagent.spawned", subagentId: "fg-sub", subagentName: "explore", parentToolCallId: "c2", runInBackground: false, taskId: "task-8" });
+  // A subagent's own subagent: its task is in that subagent's task service, not the main agent's.
+  emit({ agentId: "bg-sub", sessionId: "kimi-session-stop", type: "subagent.spawned", subagentId: "nested", subagentName: "explore", parentToolCallId: "c3", runInBackground: false, taskId: "task-9" } as never);
+
+  assert.equal(runtime.interruptSubagent("bg-sub"), "sent");
+  assert.deepEqual(stopped, [{ taskId: "task-7", reason: "Stopped from Raft" }]);
+  assert.equal(runtime.interruptSubagent("fg-sub"), "sent", "a foreground run is a task too");
+  assert.equal(runtime.interruptSubagent("nested"), "unsupported", "the main session cannot reach a nested subagent's task");
+  assert.deepEqual(stopped.map((stop) => stop.taskId), ["task-7", "task-8"]);
+  assert.equal(runtime.interruptSubagent("nobody"), "not_running");
+  emit({ ...eventBase(), type: "subagent.cancelled", subagentId: "bg-sub" });
+  assert.equal(runtime.interruptSubagent("bg-sub"), "not_running", "ended");
+  assert.equal(stopped.length, 2);
+  assert.equal(new KimiSdkDriver().stopsSubagentsInSession, true);
 });

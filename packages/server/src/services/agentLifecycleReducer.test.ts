@@ -17,6 +17,8 @@ import {
   reduceReadyReconcileLifecycle,
   reduceRuntimeProfileControlLifecycle,
   reduceRuntimeErrorActivityAction,
+  runtimeErrorClearsOnlyOnModelOutput,
+  isModelOutputRecoveryFrame,
   reduceStartLifecycle,
   reduceStopLifecycle,
   shouldEmitLiveActivity,
@@ -331,6 +333,57 @@ test("canonical daemon activity signal reducer computes activityKind without tru
   }
 });
 
+test("a provider-limit or billing runtime error is cleared only by real model output", () => {
+  assert.equal(runtimeErrorClearsOnlyOnModelOutput({ errorClass: "RateLimitError" }), true);
+  assert.equal(runtimeErrorClearsOnlyOnModelOutput({ errorClass: "BillingError" }), true);
+  assert.equal(runtimeErrorClearsOnlyOnModelOutput({ errorClass: "AuthError" }), false);
+  assert.equal(runtimeErrorClearsOnlyOnModelOutput({ errorClass: "ProviderConnectionError" }), false);
+  assert.equal(runtimeErrorClearsOnlyOnModelOutput({}), false);
+  assert.equal(runtimeErrorClearsOnlyOnModelOutput(null), false);
+  const action = (detailKind: AgentActivityDetailKind, currentErrorClearsOnlyOnModelOutput: boolean) => reduceRuntimeErrorActivityAction({
+    signal: reduceDaemonActivitySignal({ detailKind, legacyActivity: "working" }),
+    currentErrorPresent: true,
+    currentErrorClearsOnlyOnModelOutput,
+    isHeartbeat: false,
+  });
+  for (const detailKind of ["model_request_started", "runtime_progress", "tool_end", "subagent_activity", "compaction_finished"] as AgentActivityDetailKind[]) {
+    assert.equal(action(detailKind, true), "preserve", `${detailKind} keeps a provider-limit error`);
+    assert.equal(action(detailKind, false), "clear", `${detailKind} still clears any other error`);
+  }
+  for (const detailKind of ["model_response_started", "thinking_started", "tool_started", "running_command", "checking_messages"] as AgentActivityDetailKind[]) {
+    assert.equal(action(detailKind, true), "clear", `${detailKind} is model output`);
+  }
+});
+
+test("task #1351: only a canonical, non-heartbeat model-output frame may prove a BillingError recovered", () => {
+  const output = [{ kind: "text", text: "Hello" }];
+  const frame = (detailKind: AgentActivityDetailKind | undefined, isHeartbeat?: boolean, entries: unknown[] = output) =>
+    isModelOutputRecoveryFrame({ signal: reduceDaemonActivitySignal({ detailKind, legacyActivity: "working" }), isHeartbeat, entries });
+  // Text and thinking need their own non-empty output entry: an empty frame is
+  // the daemon's turn-start bookkeeping, and earlier turns' summaries (or a
+  // status row) riding on it are not this request's output.
+  const summary = { kind: "turn_summary", outcome: "completed", text: "earlier turn" };
+  for (const detailKind of ["model_response_started", "thinking_started"] as AgentActivityDetailKind[]) {
+    assert.equal(frame(detailKind, false, []), false, `empty ${detailKind}`);
+    assert.equal(frame(detailKind, false, [summary]), false, `${detailKind} with only a turn summary`);
+    assert.equal(frame(detailKind, false, [{ kind: "status", activity: "thinking", detail: "", detailKind }]), false, `${detailKind} with only a status row`);
+    assert.equal(frame(detailKind, false, [{ kind: "text", text: "  " }]), false, `${detailKind} with blank text`);
+    assert.equal(frame(detailKind, false, [summary, { kind: "thinking", text: "Planning" }]), true, `${detailKind} with output after a summary`);
+  }
+  for (const detailKind of ["tool_started", "running_command", "checking_messages"] as AgentActivityDetailKind[]) {
+    assert.equal(frame(detailKind, false, []), true, `${detailKind} is a tool call`);
+  }
+  for (const detailKind of ["model_response_started", "thinking_started", "tool_started", "running_command", "checking_messages"] as AgentActivityDetailKind[]) {
+    assert.equal(frame(detailKind, false), true, detailKind);
+    assert.equal(frame(detailKind, true), false, `${detailKind} heartbeat`);
+    assert.equal(frame(detailKind), false, `${detailKind} without the heartbeat bit`);
+  }
+  for (const detailKind of ["model_request_started", "runtime_progress", "tool_end", "subagent_activity"] as AgentActivityDetailKind[]) {
+    assert.equal(frame(detailKind, false), false, detailKind);
+  }
+  assert.equal(frame(undefined, false), false, "a legacy frame without a detailKind");
+});
+
 test("provider request observation preserves existing runtime error authority", () => {
   const signal = reduceDaemonActivitySignal({ detailKind: "provider_request_status", legacyActivity: "error" });
   for (const currentErrorPresent of [false, true]) {
@@ -355,6 +408,18 @@ test("detailKind-less legacy daemon compatibility is deterministic and never cle
       "clear",
     );
   }
+});
+
+test("#triage:eedc43fe: delivery_unconsumed is a diagnostic, so it keeps the activity the daemon sent", () => {
+  const signal = reduceDaemonActivitySignal({ detailKind: "delivery_unconsumed", legacyActivity: "working" });
+  assert.equal(signal.activity, "working", "an agent mid-turn doesn't read as idle");
+  assert.equal(signal.detailKind, "delivery_unconsumed");
+  assert.equal(reduceDaemonActivitySignal({ detailKind: "delivery_unconsumed" }).activity, "online", "online only when the daemon sent none");
+  const [entry] = rewriteDaemonActivityEntries(
+    [{ kind: "status", activity: "online", activityKind: "online", detail: "3 deliveries written, runtime not consuming", detailKind: "delivery_unconsumed" }] as never,
+    signal,
+  )!;
+  assert.equal((entry as { activity?: string }).activity, "working", "its status entry agrees");
 });
 
 test("only detailKind-less legacy frames retain producer activity during the deprecation window", () => {
@@ -843,4 +908,30 @@ test("RFC 069 §8: sequenced status is accepted in order and only from the conne
   assert.deepEqual(planSequencedStatus({ connectionInstanceId: "d2", frameInstanceId: "d2", frameSeq: 1, last: { daemonInstanceId: "d1", clientSeq: 90 } }), { kind: "accept", next: { daemonInstanceId: "d2", clientSeq: 1 } });
   assert.deepEqual(planSequencedStatus({ connectionInstanceId: "d2", frameInstanceId: "d2", frameSeq: 4, last: { daemonInstanceId: "d2", clientSeq: 3 } }), { kind: "accept", next: { daemonInstanceId: "d2", clientSeq: 4 } });
   assert.deepEqual(planSequencedStatus({ connectionInstanceId: null, frameInstanceId: "d1", frameSeq: 4, last: { daemonInstanceId: "d2", clientSeq: 3 } }), { kind: "unsequenced" });
+});
+
+test("claude_root_privileges establishes durable authority only with a valid typed carrier (#688b)", () => {
+  const crash = reduceDaemonActivitySignal({
+    detailKind: "claude_root_privileges",
+    legacyActivity: "error",
+  });
+  // With a valid typed carrier: set durable typed authority.
+  assert.equal(reduceRuntimeErrorActivityAction({
+    signal: crash,
+    currentErrorPresent: false,
+    isHeartbeat: false,
+    typedRuntimeCarrierPresent: true,
+  }), "set");
+  // Without a carrier: a crash is a weak signal — must not establish authority.
+  assert.equal(reduceRuntimeErrorActivityAction({
+    signal: crash,
+    currentErrorPresent: false,
+    isHeartbeat: false,
+  }), "preserve");
+  // And without a carrier it must not clear pre-existing authority either.
+  assert.equal(reduceRuntimeErrorActivityAction({
+    signal: crash,
+    currentErrorPresent: true,
+    isHeartbeat: false,
+  }), "preserve");
 });

@@ -4,7 +4,7 @@
  * Creates minimal test data directly via Drizzle ORM (no running server needed).
  *
  * Usage:
- *   DATABASE_URL="..." node --import @oxc-node/core/register scripts/seed.ts [--output <file>] [--with-onboarding]
+ *   DATABASE_URL="..." node --import @oxc-node/core/register scripts/seed.ts [--output <file>] [--with-onboarding] [--with-agent-runs]
  *
  * Idempotent: skips creation if data already exists.
  * Outputs JSON with credentials to stdout (or --output file).
@@ -15,9 +15,11 @@ import { eq, and, isNull, desc } from "drizzle-orm";
 import { createHash, randomBytes } from "node:crypto";
 import argon2 from "argon2";
 import * as schema from "../src/db/schema";
-import { buildSearchText } from "../src/services/searchService";
+import { CONTINUATIONS_PILOT_FEATURE_FLAG_KEY } from "@botiverse/raft-shared";
+import { buildSearchText } from "../src/services/searchTokenizer";
 import { getStorage } from "../src/services/storageService";
 import { applyDevSeedOnboardingFixture } from "./devSeedOnboarding";
+import { explicitSeedPassword, resetExistingSeedUserPassword, seedPassword } from "./devSeedPassword";
 
 const {
   users,
@@ -38,12 +40,14 @@ const {
   taskEvents,
   agentRuntimeProfiles,
   agentChannelReadCursors,
+  attachmentObjects,
   attachments,
   agentActivityEvents,
   reminders,
   userSaved,
   announcements,
   featureFlags,
+  dmChannelIdentities,
   rapAppConfigs,
   inboxNotificationFacts,
   jointChannels,
@@ -52,7 +56,12 @@ const {
 
 // --- Config ---
 const SEED_USER_EMAIL = "dev@slock.ai";
-const SEED_USER_PASSWORD = "password123";
+// raftdev preview --with-agent-runs passes a random password: those instances
+// run agents with the machine's model credentials behind a public URL, so the
+// well-known default must not sign anyone in there. An explicit password is
+// also written onto seed accounts that already exist (a reused database).
+const SEED_USER_PASSWORD = seedPassword(process.env);
+const EXPLICIT_SEED_PASSWORD = explicitSeedPassword(process.env);
 const SEED_USER_NAME = "Developer";
 const SEED_SERVER_NAME = "Dev Workspace";
 const SEED_SERVER_SLUG = "dev";
@@ -60,6 +69,11 @@ const SEED_MACHINE_NAME = "dev-machine";
 const SEED_AGENT_NAME = "assistant";
 const SEED_CHANNEL_NAME = "general";
 const SEED_DM_CHANNEL_NAME = "assistant-dm";
+// Seeded messages are back-dated up to 45 days. Members must have joined before
+// them: RisingWave's inbox view only shows a conversation whose latest message
+// is newer than the member's channel_humans.joined_at, so a "now" join hid six
+// seeded conversations from RW and failed raftdev's --risingwave parity check.
+const SEED_JOINED_AT = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000);
 
 const THREAD_SEED_CONTENT = {
   generalUnreadParent: "Could you review the onboarding copy?",
@@ -101,6 +115,13 @@ async function main() {
   // persisted completion state. Opt in when onboarding itself is under test.
   let outputPath: string | null = null;
   let withOnboarding = false;
+  // The seed builds data only. Agents on the online dev machine are written
+  // "stopped", the one status no automatic wake (message, mention, reminder,
+  // app inbox) starts, so a seeded fixture never runs a model on its own: a
+  // seeded reminder came due and cold-started one in a local eval. Opt in when
+  // the run itself is under test; the fixtures then keep their runnable
+  // statuses (assistant inactive, codex-reviewer active).
+  let withAgentRuns = false;
   const args = process.argv.slice(2);
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--output" && args[i + 1]) {
@@ -108,11 +129,25 @@ async function main() {
       i++;
     } else if (args[i] === "--with-onboarding") {
       withOnboarding = true;
+    } else if (args[i] === "--with-agent-runs") {
+      withAgentRuns = true;
     }
   }
 
   const pool = new pg.Pool({ connectionString: databaseUrl, max: 5 });
   const db = drizzle(pool, { schema });
+  // Every seed account that already exists gets an explicit RAFTDEV_SEED_PASSWORD.
+  const resetSeedPassword = async (existing: { id: string; email: string }): Promise<void> => {
+    const reset = await resetExistingSeedUserPassword({
+      user: existing,
+      explicitPassword: EXPLICIT_SEED_PASSWORD,
+      hash: (password) => argon2.hash(password),
+      update: async (userId, passwordHash) => {
+        await db.update(users).set({ passwordHash }).where(eq(users.id, userId));
+      },
+    });
+    if (reset) console.error(`Reset seed password: ${existing.email}`);
+  };
 
   try {
     // 1. User
@@ -135,6 +170,7 @@ async function main() {
       console.error(`Created user: ${user.email}`);
     } else {
       console.error(`User already exists: ${user.email}`);
+      await resetSeedPassword(user);
     }
 
     // 2. Server
@@ -228,7 +264,7 @@ async function main() {
           serverId: server.id,
           name: SEED_AGENT_NAME,
           displayName: "Assistant",
-          status: "inactive",
+          status: withAgentRuns ? "inactive" : "stopped",
           model: "sonnet",
           runtime: "claude",
           machineId: machine.id,
@@ -261,6 +297,9 @@ async function main() {
     console.error(withOnboarding
       ? "Seeded onboarding fixture: fresh owner flow enabled"
       : "Seeded onboarding fixture: canonical gates completed");
+    console.error(withAgentRuns
+      ? "Seeded agent fixture: dev-machine agents runnable (--with-agent-runs)"
+      : "Seeded agent fixture: dev-machine agents stopped; nothing runs until you start one");
 
     // 6a. #all channel (system channel, created first — matches normal server creation flow)
     const [existingAll] = await db
@@ -279,7 +318,7 @@ async function main() {
         })
         .returning();
       // Add user and agent to #all
-      await db.insert(channelHumans).values({ channelId: allChannel.id, userId: user.id });
+      await db.insert(channelHumans).values({ channelId: allChannel.id, userId: user.id, joinedAt: SEED_JOINED_AT });
       await db.insert(channelAgents).values({ channelId: allChannel.id, agentId: agent.id });
       console.error(`Created channel: #all`);
     } else {
@@ -314,6 +353,7 @@ async function main() {
       await db.insert(channelHumans).values({
         channelId: channel.id,
         userId: user.id,
+        joinedAt: SEED_JOINED_AT,
       });
       console.error(`Added user to #${channel.name}`);
     } else {
@@ -375,7 +415,7 @@ async function main() {
         console.error(`Created DM channel: ${SEED_DM_CHANNEL_NAME}`);
       }
 
-      await db.insert(channelHumans).values({ channelId: dmChannel.id, userId: user.id }).onConflictDoNothing();
+      await db.insert(channelHumans).values({ channelId: dmChannel.id, userId: user.id, joinedAt: SEED_JOINED_AT }).onConflictDoNothing();
       await db.insert(channelAgents).values({ channelId: dmChannel.id, agentId: agent.id }).onConflictDoNothing();
       return dmChannel;
     };
@@ -472,7 +512,10 @@ async function main() {
         .from(users)
         .where(eq(users.email, opts.email))
         .limit(1);
-      if (existingUser) return existingUser;
+      if (existingUser) {
+        await resetSeedPassword(existingUser);
+        return existingUser;
+      }
       const passwordHash = await argon2.hash(SEED_USER_PASSWORD);
       [existingUser] = await db
         .insert(users)
@@ -509,7 +552,7 @@ async function main() {
     };
 
     const addHumanToChannel = async (channelId: string, userId: string) => {
-      await db.insert(channelHumans).values({ channelId, userId }).onConflictDoNothing();
+      await db.insert(channelHumans).values({ channelId, userId, joinedAt: SEED_JOINED_AT }).onConflictDoNothing();
     };
 
     const addAgentToChannel = async (channelId: string, agentId: string) => {
@@ -835,10 +878,13 @@ async function main() {
       if (!storage) return null;
       const storageKey = `seed/${server.id}/${opts.filename}`;
       await storage.put(storageKey, opts.bytes, opts.mimeType);
+      // The bytes' metadata lives on the immutable object; the projection is
+      // this occurrence of it. A re-run finds the object by its key.
       const [existing] = await db
-        .select()
+        .select({ projection: attachments })
         .from(attachments)
-        .where(eq(attachments.storageKey, storageKey))
+        .innerJoin(attachmentObjects, eq(attachmentObjects.id, attachments.objectId))
+        .where(eq(attachmentObjects.storageKey, storageKey))
         .limit(1);
       const values = {
         messageId: opts.messageId,
@@ -846,18 +892,23 @@ async function main() {
         uploaderId: opts.uploaderId,
         uploaderType: opts.uploaderType,
         filename: opts.filename,
-        mimeType: opts.mimeType,
-        sizeBytes: opts.bytes.length,
-        storageKey,
-        contentHash: createHash("sha256").update(opts.bytes).digest("hex"),
-        width: opts.width ?? null,
-        height: opts.height ?? null,
       };
       if (existing) {
-        await db.update(attachments).set(values).where(eq(attachments.id, existing.id));
-        return existing;
+        await db.update(attachments).set(values).where(eq(attachments.id, existing.projection.id));
+        return existing.projection;
       }
-      const [created] = await db.insert(attachments).values(values).returning();
+      const [object] = await db.insert(attachmentObjects).values({
+        originServerId: server.id,
+        uploaderId: opts.uploaderId,
+        uploaderType: opts.uploaderType,
+        storageKey,
+        contentHash: createHash("sha256").update(opts.bytes).digest("hex"),
+        mimeType: opts.mimeType,
+        sizeBytes: opts.bytes.length,
+        width: opts.width ?? null,
+        height: opts.height ?? null,
+      }).returning({ id: attachmentObjects.id });
+      const [created] = await db.insert(attachments).values({ ...values, objectId: object!.id }).returning();
       return created;
     };
 
@@ -948,7 +999,7 @@ async function main() {
       displayName: "Claude Assistant",
       runtime: "claude",
       model: "sonnet",
-      status: "inactive",
+      status: withAgentRuns ? "inactive" : "stopped",
       machineId: machine.id,
       creatorType: "user",
       creatorId: user.id,
@@ -960,7 +1011,7 @@ async function main() {
       displayName: "Codex Reviewer",
       runtime: "codex",
       model: "gpt-5.3-codex",
-      status: "active",
+      status: withAgentRuns ? "active" : "stopped",
       machineId: machine.id,
       reasoningEffort: "high",
       description: "Active Codex agent for code-review and long-tool activity states.",
@@ -1416,11 +1467,14 @@ async function main() {
         "Thanks!",
       ];
       const msgValues = [];
-      // Generate 150 messages spread over 45 days (some beyond 30-day free limit)
+      // Generate 150 messages spread over 45 days (some beyond 30-day free limit).
+      // History ends 4h ago so it stays older than the timed fixtures inserted
+      // after it (the oldest start ~3h ago): seq order must follow created_at.
+      const historyEnd = now - 4 * 60 * 60 * 1000;
       for (let i = 0; i < 150; i++) {
         const daysAgo = Math.floor((i / 150) * 45); // 0-45 days ago
         const sender = senders[i % 2];
-        const ts = new Date(now - daysAgo * DAY - Math.random() * DAY);
+        const ts = new Date(historyEnd - daysAgo * DAY - Math.random() * DAY);
         msgValues.push({
           channelId: channel.id,
           senderType: sender.type,
@@ -1443,6 +1497,192 @@ async function main() {
     const dmChannel = await ensureDmChannel();
     const now = Date.now();
     const MINUTE = 60 * 1000;
+
+    // Every block below inserts in created_at order (seq is assigned at insert,
+    // and Activity/inbox read a conversation's latest message by seq), and the
+    // guard at the end of main() fails the seed if a channel goes backwards.
+
+    // 8a. Bulk-generate older threads for Threads inbox Load More testing.
+    // They are the oldest timed fixtures (~3h to 80min ago), so insert them
+    // first, oldest topic first.
+    const bulkThreadTopics = [
+      "Rate limiting strategy for the public API — should we do token bucket or sliding window?",
+      "The search indexer is lagging behind by ~10 seconds during peak hours. Need to investigate.",
+      "Proposal: switch from REST to tRPC for internal service calls. Thoughts?",
+      "CSS grid vs flexbox for the new dashboard layout — grid gives us better alignment but flexbox is simpler.",
+      "Memory leak in the daemon process after 48 hours — heap snapshot shows detached DOM nodes.",
+      "Should we add E2E tests for the auth flow? Current unit tests don't catch the refresh token race.",
+      "The WebSocket reconnection logic needs a jitter factor to avoid thundering herd on server restart.",
+      "Thinking about adding keyboard shortcuts — Cmd+K for search, Cmd+/ for threads. Opinions?",
+      "Database migration failed on staging because of a NOT NULL column without a default value.",
+      "Agent context window management: should we summarize or truncate when hitting the limit?",
+      "The avatar upload is accepting files > 5MB. Need to add client-side validation.",
+      "Feature flag system: should we use LaunchDarkly or build a simple one in-house?",
+      "The notification sound is too aggressive. Can we add a softer option or let users pick?",
+      "CI is taking 8 minutes. Most of the time is in the Docker build step — can we cache better?",
+      "Accessibility audit: tab navigation is broken in the settings panel and modal dialogs.",
+      "Dark mode support: the brutal design system makes this tricky. Bold borders need to invert.",
+      "Should we migrate from Zustand to Jotai? Jotai's atom model might be better for our store structure.",
+      "The invite link system needs rate limiting. Someone could enumerate valid invite codes.",
+      "Performance: the message list re-renders when any agent activity changes. Need to fix selectors.",
+      "Documentation: we should auto-generate API docs from the route definitions. Maybe use Swagger.",
+    ];
+    let bulkThreadCount = 0;
+    for (let i = bulkThreadTopics.length - 1; i >= 0; i--) {
+      const topic = bulkThreadTopics[i];
+      const sender = i % 2 === 0
+        ? { type: "user" as const, id: user.id }
+        : { type: "agent" as const, id: agent.id };
+      const responder = i % 2 === 0
+        ? { type: "agent" as const, id: agent.id }
+        : { type: "user" as const, id: user.id };
+      const baseTime = now - (80 + i * 5) * MINUTE;
+
+      const parent = await ensureMessage({
+        channelId: channel.id,
+        senderType: sender.type,
+        senderId: sender.id,
+        content: topic,
+        createdAt: new Date(baseTime),
+      });
+      const thread = await ensureThreadChannel({
+        parentMessageId: parent.id,
+        participants: [
+          { type: "user", id: user.id },
+          { type: "agent", id: agent.id },
+        ],
+      });
+      await ensureThreadFollow(thread.id, parent.id, i % 3 === 0 ? "authored" : "replied");
+      // Add 1-3 replies
+      const replyCount = (i % 3) + 1;
+      let lastReply = parent;
+      for (let r = 0; r < replyCount; r++) {
+        const replySender = r % 2 === 0 ? responder : sender;
+        lastReply = await ensureMessage({
+          channelId: thread.id,
+          senderType: replySender.type,
+          senderId: replySender.id,
+          content: `Reply ${r + 1} to: ${topic.slice(0, 50)}...`,
+          createdAt: new Date(baseTime + (r + 1) * MINUTE),
+        });
+      }
+      // Mark some as read, some as unread
+      if (i % 3 !== 0) {
+        await ensureUserReadCursor(thread.id, lastReply.seq ?? 0);
+      } else {
+        // Leave unread — or partially read
+        if (replyCount > 1) {
+          await ensureUserReadCursor(thread.id, (lastReply.seq ?? 1) - 1);
+        }
+      }
+      bulkThreadCount++;
+    }
+    console.error(`Seeded ${bulkThreadCount} bulk threads for Load More testing`);
+
+    // Extra threads for richer inbox (oldest first so seq follows created_at)
+    const apiDiscussionParent = await ensureMessage({
+      channelId: channel.id,
+      senderType: "agent",
+      senderId: agent.id,
+      content: THREAD_SEED_CONTENT.apiDiscussionParent,
+      createdAt: new Date(now - 70 * MINUTE),
+    });
+    const apiDiscussionThread = await ensureThreadChannel({
+      parentMessageId: apiDiscussionParent.id,
+      participants: [
+        { type: "user", id: user.id },
+        { type: "agent", id: agent.id },
+      ],
+    });
+    await ensureThreadFollow(apiDiscussionThread.id, apiDiscussionParent.id, "manual");
+    const apiDiscussionReply1 = await ensureMessage({ channelId: apiDiscussionThread.id, senderType: "user", senderId: user.id, content: THREAD_SEED_CONTENT.apiDiscussionReply1, createdAt: new Date(now - 69 * MINUTE) });
+    await ensureUserReadCursor(apiDiscussionThread.id, (apiDiscussionReply1.seq ?? 1) - 1);
+
+    const deployParent = await ensureMessage({
+      channelId: channel.id,
+      senderType: "user",
+      senderId: user.id,
+      content: THREAD_SEED_CONTENT.deployParent,
+      createdAt: new Date(now - 60 * MINUTE),
+    });
+    const deployThread = await ensureThreadChannel({
+      parentMessageId: deployParent.id,
+      participants: [
+        { type: "user", id: user.id },
+        { type: "agent", id: agent.id },
+      ],
+    });
+    await ensureThreadFollow(deployThread.id, deployParent.id, "authored");
+    await ensureMessage({ channelId: deployThread.id, senderType: "agent", senderId: agent.id, content: THREAD_SEED_CONTENT.deployReply1, createdAt: new Date(now - 59 * MINUTE) });
+    await ensureMessage({ channelId: deployThread.id, senderType: "user", senderId: user.id, content: THREAD_SEED_CONTENT.deployReply2, createdAt: new Date(now - 58 * MINUTE) });
+    await ensureMessage({ channelId: deployThread.id, senderType: "agent", senderId: agent.id, content: THREAD_SEED_CONTENT.deployReply3, createdAt: new Date(now - 57 * MINUTE) });
+    const deployReply4 = await ensureMessage({ channelId: deployThread.id, senderType: "user", senderId: user.id, content: THREAD_SEED_CONTENT.deployReply4, createdAt: new Date(now - 56 * MINUTE) });
+    await ensureUserReadCursor(deployThread.id, deployReply4.seq ?? 0);
+
+    const bugReportParent = await ensureMessage({
+      channelId: channel.id,
+      senderType: "user",
+      senderId: user.id,
+      content: THREAD_SEED_CONTENT.bugReportParent,
+      createdAt: new Date(now - 50 * MINUTE),
+    });
+    const bugReportThread = await ensureThreadChannel({
+      parentMessageId: bugReportParent.id,
+      participants: [
+        { type: "user", id: user.id },
+        { type: "agent", id: agent.id },
+      ],
+    });
+    await ensureThreadFollow(bugReportThread.id, bugReportParent.id, "authored");
+    await ensureMessage({ channelId: bugReportThread.id, senderType: "agent", senderId: agent.id, content: THREAD_SEED_CONTENT.bugReportReply1, createdAt: new Date(now - 49 * MINUTE) });
+    await ensureMessage({ channelId: bugReportThread.id, senderType: "user", senderId: user.id, content: THREAD_SEED_CONTENT.bugReportReply2, createdAt: new Date(now - 48 * MINUTE) });
+    const bugReportReply3 = await ensureMessage({ channelId: bugReportThread.id, senderType: "agent", senderId: agent.id, content: THREAD_SEED_CONTENT.bugReportReply3, createdAt: new Date(now - 47 * MINUTE) });
+    await ensureUserReadCursor(bugReportThread.id, bugReportReply3.seq ?? 0);
+
+    const designReviewParent = await ensureMessage({
+      channelId: channel.id,
+      senderType: "agent",
+      senderId: agent.id,
+      content: THREAD_SEED_CONTENT.designReviewParent,
+      createdAt: new Date(now - 40 * MINUTE),
+    });
+    const designReviewThread = await ensureThreadChannel({
+      parentMessageId: designReviewParent.id,
+      participants: [
+        { type: "user", id: user.id },
+        { type: "agent", id: agent.id },
+      ],
+    });
+    await ensureThreadFollow(designReviewThread.id, designReviewParent.id, "replied");
+    await ensureMessage({ channelId: designReviewThread.id, senderType: "user", senderId: user.id, content: THREAD_SEED_CONTENT.designReviewReply1, createdAt: new Date(now - 39 * MINUTE) });
+    const designReviewReply2 = await ensureMessage({ channelId: designReviewThread.id, senderType: "agent", senderId: agent.id, content: THREAD_SEED_CONTENT.designReviewReply2, createdAt: new Date(now - 38 * MINUTE) });
+    await ensureUserReadCursor(designReviewThread.id, (designReviewReply2.seq ?? 1) - 1);
+
+    const unfollowedParent = await ensureMessage({
+      channelId: channel.id,
+      senderType: "user",
+      senderId: user.id,
+      content: "I can still open this thread from its parent, but it no longer appears in my followed inbox.",
+      createdAt: new Date(now - 34 * MINUTE),
+    });
+    const unfollowedThread = await ensureThreadChannel({
+      parentMessageId: unfollowedParent.id,
+      participants: [{ type: "agent", id: agent.id }],
+    });
+    await ensureMessage({
+      channelId: unfollowedThread.id,
+      senderType: "agent",
+      senderId: agent.id,
+      content: "Parent membership still grants read and post access here.",
+      createdAt: new Date(now - 33 * MINUTE),
+    });
+    await db
+      .delete(threadFollows)
+      .where(and(
+        eq(threadFollows.threadChannelId, unfollowedThread.id),
+        eq(threadFollows.followerType, "user"),
+        eq(threadFollows.followerId, user.id),
+      ));
 
     const generalUnreadParent = await ensureMessage({
       channelId: channel.id,
@@ -1551,88 +1791,10 @@ async function main() {
     await ensureThreadFollow(dmThread.id, dmParent.id, "replied");
     await ensureUserReadCursor(dmThread.id, dmReply2.seq ?? 0);
 
-    // Extra threads for richer inbox
-    const bugReportParent = await ensureMessage({
-      channelId: channel.id,
-      senderType: "user",
-      senderId: user.id,
-      content: THREAD_SEED_CONTENT.bugReportParent,
-      createdAt: new Date(now - 50 * MINUTE),
-    });
-    const bugReportThread = await ensureThreadChannel({
-      parentMessageId: bugReportParent.id,
-      participants: [
-        { type: "user", id: user.id },
-        { type: "agent", id: agent.id },
-      ],
-    });
-    await ensureThreadFollow(bugReportThread.id, bugReportParent.id, "authored");
-    await ensureMessage({ channelId: bugReportThread.id, senderType: "agent", senderId: agent.id, content: THREAD_SEED_CONTENT.bugReportReply1, createdAt: new Date(now - 49 * MINUTE) });
-    await ensureMessage({ channelId: bugReportThread.id, senderType: "user", senderId: user.id, content: THREAD_SEED_CONTENT.bugReportReply2, createdAt: new Date(now - 48 * MINUTE) });
-    const bugReportReply3 = await ensureMessage({ channelId: bugReportThread.id, senderType: "agent", senderId: agent.id, content: THREAD_SEED_CONTENT.bugReportReply3, createdAt: new Date(now - 47 * MINUTE) });
-    await ensureUserReadCursor(bugReportThread.id, bugReportReply3.seq ?? 0);
 
-    const designReviewParent = await ensureMessage({
-      channelId: channel.id,
-      senderType: "agent",
-      senderId: agent.id,
-      content: THREAD_SEED_CONTENT.designReviewParent,
-      createdAt: new Date(now - 40 * MINUTE),
-    });
-    const designReviewThread = await ensureThreadChannel({
-      parentMessageId: designReviewParent.id,
-      participants: [
-        { type: "user", id: user.id },
-        { type: "agent", id: agent.id },
-      ],
-    });
-    await ensureThreadFollow(designReviewThread.id, designReviewParent.id, "replied");
-    await ensureMessage({ channelId: designReviewThread.id, senderType: "user", senderId: user.id, content: THREAD_SEED_CONTENT.designReviewReply1, createdAt: new Date(now - 39 * MINUTE) });
-    const designReviewReply2 = await ensureMessage({ channelId: designReviewThread.id, senderType: "agent", senderId: agent.id, content: THREAD_SEED_CONTENT.designReviewReply2, createdAt: new Date(now - 38 * MINUTE) });
-    await ensureUserReadCursor(designReviewThread.id, (designReviewReply2.seq ?? 1) - 1);
-
-    const deployParent = await ensureMessage({
-      channelId: channel.id,
-      senderType: "user",
-      senderId: user.id,
-      content: THREAD_SEED_CONTENT.deployParent,
-      createdAt: new Date(now - 60 * MINUTE),
-    });
-    const deployThread = await ensureThreadChannel({
-      parentMessageId: deployParent.id,
-      participants: [
-        { type: "user", id: user.id },
-        { type: "agent", id: agent.id },
-      ],
-    });
-    await ensureThreadFollow(deployThread.id, deployParent.id, "authored");
-    await ensureMessage({ channelId: deployThread.id, senderType: "agent", senderId: agent.id, content: THREAD_SEED_CONTENT.deployReply1, createdAt: new Date(now - 59 * MINUTE) });
-    await ensureMessage({ channelId: deployThread.id, senderType: "user", senderId: user.id, content: THREAD_SEED_CONTENT.deployReply2, createdAt: new Date(now - 58 * MINUTE) });
-    await ensureMessage({ channelId: deployThread.id, senderType: "agent", senderId: agent.id, content: THREAD_SEED_CONTENT.deployReply3, createdAt: new Date(now - 57 * MINUTE) });
-    const deployReply4 = await ensureMessage({ channelId: deployThread.id, senderType: "user", senderId: user.id, content: THREAD_SEED_CONTENT.deployReply4, createdAt: new Date(now - 56 * MINUTE) });
-    await ensureUserReadCursor(deployThread.id, deployReply4.seq ?? 0);
-
-    const apiDiscussionParent = await ensureMessage({
-      channelId: channel.id,
-      senderType: "agent",
-      senderId: agent.id,
-      content: THREAD_SEED_CONTENT.apiDiscussionParent,
-      createdAt: new Date(now - 70 * MINUTE),
-    });
-    const apiDiscussionThread = await ensureThreadChannel({
-      parentMessageId: apiDiscussionParent.id,
-      participants: [
-        { type: "user", id: user.id },
-        { type: "agent", id: agent.id },
-      ],
-    });
-    await ensureThreadFollow(apiDiscussionThread.id, apiDiscussionParent.id, "manual");
-    const apiDiscussionReply1 = await ensureMessage({ channelId: apiDiscussionThread.id, senderType: "user", senderId: user.id, content: THREAD_SEED_CONTENT.apiDiscussionReply1, createdAt: new Date(now - 69 * MINUTE) });
-    await ensureUserReadCursor(apiDiscussionThread.id, (apiDiscussionReply1.seq ?? 1) - 1);
-
-    // Create a fresh latest #general host message so task acceptance data is
-    // immediately visible without scrolling back through older fixtures.
-    const taskHistoryHost = await ensureMessage({ channelId: channel.id, senderType: "user", senderId: user.id, content: "Task history acceptance fixture", createdAt: new Date(now) });
+    // Create a recent #general host message so task acceptance data is
+    // visible without scrolling back through older fixtures.
+    const taskHistoryHost = await ensureMessage({ channelId: channel.id, senderType: "user", senderId: user.id, content: "Task history acceptance fixture", createdAt: new Date(now - 17 * MINUTE) });
 
     // Create tasks linked to some thread parent messages
     const TASK1_TITLE = "Investigate and permanently fix sidebar flicker during rapid multi-channel switching workflows across desktop, mobile, keyboard navigation, unread markers, thread selection, persisted state, and release validation before shipping this reliability improvement";
@@ -1784,7 +1946,7 @@ async function main() {
         taskNumber: t.taskNumber,
         taskStatus: t.status,
         assignee: t.assignee,
-        createdAt: new Date(now - (25 - i) * MINUTE),
+        createdAt: new Date(now - (16 - i) * MINUTE),
       });
       if (t.taskNumber === 15) messageChipDemoTask = taskMessage;
     }
@@ -1955,32 +2117,6 @@ async function main() {
         eq(threadFollows.followerId, user.id),
       ));
 
-    const unfollowedParent = await ensureMessage({
-      channelId: channel.id,
-      senderType: "user",
-      senderId: user.id,
-      content: "I can still open this thread from its parent, but it no longer appears in my followed inbox.",
-      createdAt: new Date(now - 34 * MINUTE),
-    });
-    const unfollowedThread = await ensureThreadChannel({
-      parentMessageId: unfollowedParent.id,
-      participants: [{ type: "agent", id: agent.id }],
-    });
-    await ensureMessage({
-      channelId: unfollowedThread.id,
-      senderType: "agent",
-      senderId: agent.id,
-      content: "Parent membership still grants read and post access here.",
-      createdAt: new Date(now - 33 * MINUTE),
-    });
-    await db
-      .delete(threadFollows)
-      .where(and(
-        eq(threadFollows.threadChannelId, unfollowedThread.id),
-        eq(threadFollows.followerType, "user"),
-        eq(threadFollows.followerId, user.id),
-      ));
-
     await db.insert(agentChannelReadCursors).values({
       agentId: codexAgent.id,
       channelId: generalUnreadThread.id,
@@ -2050,7 +2186,7 @@ async function main() {
       senderType: "user",
       senderId: user.id,
       content: "PNG, JPEG, and text files are attached for review.",
-      createdAt: new Date(now - 15 * MINUTE),
+      createdAt: new Date(now - 3 * MINUTE),
     });
     await ensureSeedAttachment({
       messageId: attachmentMessage.id,
@@ -2091,7 +2227,7 @@ async function main() {
       senderType: "user",
       senderId: user.id,
       content: "Please review the attached Markdown document with the long filename.",
-      createdAt: new Date(now - 14 * MINUTE),
+      createdAt: new Date(now - 2 * MINUTE),
     });
     await ensureSeedAttachment({
       messageId: longFilenameMessage.id,
@@ -2114,81 +2250,6 @@ async function main() {
     });
 
     console.error("Seeded thread scenarios: 3 original + 4 extra threads for rich inbox + 3 tasks + 6 long-title tasks");
-
-    // 8b. Bulk-generate extra threads for Threads inbox Load More testing
-    const bulkThreadTopics = [
-      "Rate limiting strategy for the public API — should we do token bucket or sliding window?",
-      "The search indexer is lagging behind by ~10 seconds during peak hours. Need to investigate.",
-      "Proposal: switch from REST to tRPC for internal service calls. Thoughts?",
-      "CSS grid vs flexbox for the new dashboard layout — grid gives us better alignment but flexbox is simpler.",
-      "Memory leak in the daemon process after 48 hours — heap snapshot shows detached DOM nodes.",
-      "Should we add E2E tests for the auth flow? Current unit tests don't catch the refresh token race.",
-      "The WebSocket reconnection logic needs a jitter factor to avoid thundering herd on server restart.",
-      "Thinking about adding keyboard shortcuts — Cmd+K for search, Cmd+/ for threads. Opinions?",
-      "Database migration failed on staging because of a NOT NULL column without a default value.",
-      "Agent context window management: should we summarize or truncate when hitting the limit?",
-      "The avatar upload is accepting files > 5MB. Need to add client-side validation.",
-      "Feature flag system: should we use LaunchDarkly or build a simple one in-house?",
-      "The notification sound is too aggressive. Can we add a softer option or let users pick?",
-      "CI is taking 8 minutes. Most of the time is in the Docker build step — can we cache better?",
-      "Accessibility audit: tab navigation is broken in the settings panel and modal dialogs.",
-      "Dark mode support: the brutal design system makes this tricky. Bold borders need to invert.",
-      "Should we migrate from Zustand to Jotai? Jotai's atom model might be better for our store structure.",
-      "The invite link system needs rate limiting. Someone could enumerate valid invite codes.",
-      "Performance: the message list re-renders when any agent activity changes. Need to fix selectors.",
-      "Documentation: we should auto-generate API docs from the route definitions. Maybe use Swagger.",
-    ];
-    let bulkThreadCount = 0;
-    for (let i = 0; i < bulkThreadTopics.length; i++) {
-      const topic = bulkThreadTopics[i];
-      const sender = i % 2 === 0
-        ? { type: "user" as const, id: user.id }
-        : { type: "agent" as const, id: agent.id };
-      const responder = i % 2 === 0
-        ? { type: "agent" as const, id: agent.id }
-        : { type: "user" as const, id: user.id };
-      const baseTime = now - (80 + i * 5) * MINUTE;
-
-      const parent = await ensureMessage({
-        channelId: channel.id,
-        senderType: sender.type,
-        senderId: sender.id,
-        content: topic,
-        createdAt: new Date(baseTime),
-      });
-      const thread = await ensureThreadChannel({
-        parentMessageId: parent.id,
-        participants: [
-          { type: "user", id: user.id },
-          { type: "agent", id: agent.id },
-        ],
-      });
-      await ensureThreadFollow(thread.id, parent.id, i % 3 === 0 ? "authored" : "replied");
-      // Add 1-3 replies
-      const replyCount = (i % 3) + 1;
-      let lastReply = parent;
-      for (let r = 0; r < replyCount; r++) {
-        const replySender = r % 2 === 0 ? responder : sender;
-        lastReply = await ensureMessage({
-          channelId: thread.id,
-          senderType: replySender.type,
-          senderId: replySender.id,
-          content: `Reply ${r + 1} to: ${topic.slice(0, 50)}...`,
-          createdAt: new Date(baseTime + (r + 1) * MINUTE),
-        });
-      }
-      // Mark some as read, some as unread
-      if (i % 3 !== 0) {
-        await ensureUserReadCursor(thread.id, lastReply.seq ?? 0);
-      } else {
-        // Leave unread — or partially read
-        if (replyCount > 1) {
-          await ensureUserReadCursor(thread.id, (lastReply.seq ?? 1) - 1);
-        }
-      }
-      bulkThreadCount++;
-    }
-    console.error(`Seeded ${bulkThreadCount} bulk threads for Load More testing`);
 
     // The production Activity projector is notification-fact driven. Direct
     // seed inserts intentionally bypass the message service, so establish one
@@ -2342,11 +2403,15 @@ async function main() {
       console.error(`Backfilled search_text for ${messagesMissingSearchText.length} existing messages`);
     }
 
-    // 11. Seed feature flags needed for dev/preview environments
+    // 11. Seed feature flags needed for dev/preview environments. A flag row
+    // a migration inserts is created here too when it is missing (a database
+    // built some other way), and left as the migration wrote it otherwise.
     const devFeatureFlags = [
-      { key: "onboarding_opener_v2", description: "Enable onboarding opener v2 flow", randomizationUnit: "server" as const },
-      { key: "onboarding_owner_wizard_v0", description: "Enable owner onboarding wizard", randomizationUnit: "server" as const },
-      { key: "attachment_comments_v0", description: "Enable attachment comments panel", randomizationUnit: "server" as const },
+      { key: "onboarding_owner_wizard_v0", description: "Enable owner onboarding wizard", randomizationUnit: "server" as const, defaultEnabled: true },
+      // As migration continuations_pilot_flag inserts it: off until a server rule turns it on.
+      { key: CONTINUATIONS_PILOT_FEATURE_FLAG_KEY, description: "Continuation pilot: a held raft message send asks the agent what to do instead of saving a draft", randomizationUnit: "server" as const, defaultEnabled: false },
+      // On here: the seeded owner has a personal assistant (step 12), so a preview shows its otter.
+      { key: "personal_assistant", description: "Personal assistant (Ottie) for each person", randomizationUnit: "server" as const, defaultEnabled: true },
     ];
     for (const flag of devFeatureFlags) {
       const [existing] = await db.select().from(featureFlags).where(eq(featureFlags.key, flag.key)).limit(1);
@@ -2357,10 +2422,51 @@ async function main() {
           enabled: true,
           killSwitch: false,
           randomizationUnit: flag.randomizationUnit,
-          defaultEnabled: true,
+          defaultEnabled: flag.defaultEnabled,
           salt: flag.key,
         });
         console.error(`Seeded feature flag: ${flag.key}`);
+      }
+    }
+
+    // 12. The dev owner's personal assistant (#proj-assistant:#24): Ottie and
+    // its DM with the owner, as createMyAssistant makes them, so a preview
+    // opens with the otter on the composer. Stopped like the other seeded
+    // agents, and never provisioned on a hosted runtime: opening it shows the
+    // DM; nothing answers unless someone starts it.
+    {
+      const ASSISTANT_NAME = "developer-assistant";
+      let [assistant] = await db.select().from(agents).where(and(eq(agents.serverId, server.id), eq(agents.assistantOwnerUserId, user.id), isNull(agents.deletedAt))).limit(1);
+      if (!assistant) {
+        [assistant] = await db.insert(agents).values({
+          serverId: server.id,
+          name: ASSISTANT_NAME,
+          displayName: "Ottie",
+          avatarUrl: "pixel:ottie",
+          description: `Personal assistant of @${user.name}.`,
+          creatorType: "user",
+          creatorId: user.id,
+          assistantOwnerUserId: user.id,
+          assistantSendAsOwner: true,
+          status: "stopped",
+          model: "sonnet",
+          runtime: "claude",
+          // Never on a Computer (agents_assistant_not_on_machine, #13384).
+        }).returning();
+        console.error(`Created personal assistant: ${assistant.name}`);
+      } else {
+        console.error(`Personal assistant already exists: ${assistant.name}`);
+      }
+      await db.insert(serverAgentMembers).values({ serverId: server.id, agentId: assistant.id, role: "member", joinedAt: assistant.createdAt ?? new Date(), updatedAt: new Date() }).onConflictDoNothing();
+      // The DM, found as channelService.findHumanAgentDmChannelId finds it: by its identity row.
+      const peerKey = [user.id, assistant.id].sort().join(":");
+      const [identity] = await db.select().from(dmChannelIdentities).where(and(eq(dmChannelIdentities.serverId, server.id), eq(dmChannelIdentities.kind, "human_agent"), eq(dmChannelIdentities.peerKey, peerKey))).limit(1);
+      if (!identity) {
+        const [dm] = await db.insert(channels).values({ serverId: server.id, name: `dm-${assistant.name}`, type: "dm" }).returning();
+        await db.insert(dmChannelIdentities).values({ channelId: dm.id, serverId: server.id, kind: "human_agent", peerKey });
+        await db.insert(channelHumans).values({ channelId: dm.id, userId: user.id, joinedAt: SEED_JOINED_AT }).onConflictDoNothing();
+        await db.insert(channelAgents).values({ channelId: dm.id, agentId: assistant.id }).onConflictDoNothing();
+        console.error(`Created DM with the personal assistant: ${dm.name}`);
       }
     }
 
@@ -2374,6 +2480,46 @@ async function main() {
       revision: 1,
     }).onConflictDoNothing();
     console.error("Seeded RAP App config: system.reminder");
+
+    // 12. Guard: in every channel of the seeded servers, created_at must not go
+    // backwards in seq order. Postgres reads a conversation's latest message by
+    // seq and RisingWave by MAX(created_at); an out-of-order fixture makes them
+    // disagree (raftdev --risingwave parity) and renders history out of order.
+    const seededServerIds = [server, isolationServer, jointInviteTargetServer, emptyStateServer, jointStorageServer]
+      .map((s) => s.id);
+    const { rows: outOfOrder } = await pool.query<{
+      channel_name: string;
+      channel_id: string;
+      id: string;
+      seq: string;
+      created_at: Date;
+      prev_seq: string;
+      prev_created_at: Date;
+    }>(
+      `SELECT c.name AS channel_name, m.channel_id, m.id, m.seq, m.created_at, m.prev_seq, m.prev_created_at
+         FROM (
+           SELECT id, channel_id, seq, created_at,
+                  lag(seq) OVER w AS prev_seq,
+                  lag(created_at) OVER w AS prev_created_at
+             FROM messages
+            WHERE channel_id IN (SELECT id FROM channels WHERE server_id = ANY($1::uuid[]))
+           WINDOW w AS (PARTITION BY channel_id ORDER BY seq)
+         ) m
+         JOIN channels c ON c.id = m.channel_id
+        WHERE m.created_at < m.prev_created_at
+        ORDER BY m.seq
+        LIMIT 20`,
+      [seededServerIds],
+    );
+    if (outOfOrder.length > 0) {
+      const lines = outOfOrder.map((r) =>
+        `  #${r.channel_name} (${r.channel_id}): seq ${r.seq} id ${r.id} created_at ${r.created_at.toISOString()}`
+        + ` < previous seq ${r.prev_seq} created_at ${r.prev_created_at.toISOString()}`);
+      throw new Error(
+        `Seed messages are not in created_at order by seq (first ${outOfOrder.length} shown); `
+        + `insert fixtures oldest first:\n${lines.join("\n")}`,
+      );
+    }
 
     // Output credentials
     const output = {

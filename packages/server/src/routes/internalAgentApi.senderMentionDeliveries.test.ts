@@ -19,7 +19,7 @@ import { createServer } from "../services/serverService";
  * comparing responses.
  */
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 function jsonHeaders(apiKey: string): Record<string, string> {
   return { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" };
@@ -30,6 +30,7 @@ async function mintAgentKey(agentId: string, scopes: readonly AgentCapability[])
     agentId,
     scopes,
     name: `sender-mention-deliveries-${agentId}`,
+    issuedVia: "computer",
     createdByUserId: null,
   });
   return minted.apiKey;

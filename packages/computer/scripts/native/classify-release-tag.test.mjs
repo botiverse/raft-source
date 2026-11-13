@@ -27,6 +27,7 @@ test("feature channel tags refuse reserved cohort words, bad slugs and a package
   assert.throws(() => classifyComputerReleaseTag("computer-v1.0.33-rc.1", "1.0.32"), /RC base version/);
   assert.throws(() => classifyComputerReleaseTag("computer-v1.0.33-stable.1", "1.0.33"), /reserved cohort word/);
   assert.throws(() => classifyComputerReleaseTag("computer-v1.0.33-main.1", "1.0.33"), /reserved cohort word/);
+  assert.throws(() => classifyComputerReleaseTag("computer-v1.0.33-candidate.1", "1.0.33"), /reserved cohort word/);
   assert.throws(() => classifyComputerReleaseTag("computer-v1.0.33-Constructed.1", "1.0.33"), /Tag must match/);
   assert.throws(() => classifyComputerReleaseTag("computer-v1.0.33-constructed-wake-context.0", "1.0.33"), /Tag must match/);
   assert.throws(() => classifyComputerReleaseTag("computer-v1.0.33-constructed-wake-context", "1.0.33"), /Tag must match/);

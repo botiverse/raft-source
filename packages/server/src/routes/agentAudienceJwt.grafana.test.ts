@@ -11,7 +11,7 @@ import { getOidcJwks, signOidcIdToken } from "../services/oidcService";
 import { createApiTest } from "../test/integration/apiTest";
 import { openTestApp } from "../test/integration/app";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 const enabled = process.env.AGENT_JWT_GRAFANA_REQUIRED === "1";
 
 test.skipIf(!enabled)("issued JWT interoperates with real Grafana 12.4.12 without creating a login session", async () => {
@@ -23,7 +23,7 @@ test.skipIf(!enabled)("issued JWT interoperates with real Grafana 12.4.12 withou
   process.env.SERVER_URL = "https://issuer.example.test";
   const folder = fs.mkdtempSync(path.join(os.tmpdir(), "raft-jwt-grafana-"));
   const container = `raft-jwt-test-${randomUUID().slice(0, 8)}`;
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const suffix = randomUUID();
     const [owner] = await getDb().insert(users).values({ name: `jwt-${suffix}`, email: `jwt-${suffix}@raft.test`, passwordHash: "fixture", emailVerified: true }).returning();
@@ -31,7 +31,7 @@ test.skipIf(!enabled)("issued JWT interoperates with real Grafana 12.4.12 withou
     const [agent] = await getDb().insert(agents).values({ serverId: server.id, name: "grafana-agent" }).returning();
     await getDb().insert(serverAgentMembers).values({ serverId: server.id, agentId: agent.id });
     const [client] = await getDb().insert(oauthClients).values({ serverId: server.id, createdByUserId: owner.id, name: "Grafana", clientId: "test-grafana", clientSecretHash: "fixture", allowedScopes: ["openid", "profile"], enabled: true, appType: "server_local" }).returning();
-    const credential = await mintAgentCredential({ agentId: agent.id, scopes: ["read"], name: "grafana-e2e", createdByUserId: null });
+    const credential = await mintAgentCredential({ agentId: agent.id, scopes: ["read"], name: "grafana-e2e", issuedVia: "computer", createdByUserId: null });
     const issuer = `https://issuer.example.test/oidc/${server.slug}`;
     fs.writeFileSync(path.join(folder, "jwks.json"), JSON.stringify(getOidcJwks()), { mode: 0o644 });
     fs.chmodSync(folder, 0o755); // only public JWKS, needed by the container user

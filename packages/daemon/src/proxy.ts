@@ -1,4 +1,5 @@
 import { HttpsProxyAgent } from "https-proxy-agent";
+import { shouldBypassProxy } from "@botiverse/raft-shared/src/noProxy";
 import {
   Agent,
   ProxyAgent,
@@ -94,26 +95,6 @@ export function validateProviderProxyEnv(env: NodeJS.ProcessEnv): void {
   assertSupportedProviderProxyUrl(proxy.httpsProxy);
 }
 
-function getDefaultPort(protocol: string): string {
-  switch (protocol) {
-    case "https:":
-    case "wss:":
-      return "443";
-    case "http:":
-    case "ws:":
-      return "80";
-    default:
-      return "";
-  }
-}
-
-function hostMatchesNoProxyEntry(hostname: string, ruleHost: string): boolean {
-  if (!ruleHost) return false;
-  const normalizedRule = ruleHost.replace(/^\*\./, ".").replace(/^\./, "").toLowerCase();
-  const normalizedHost = hostname.toLowerCase();
-  return normalizedHost === normalizedRule || normalizedHost.endsWith(`.${normalizedRule}`);
-}
-
 function getProxyUrlForTarget(targetUrl: string, env: NodeJS.ProcessEnv): string | undefined {
   const protocol = new URL(targetUrl).protocol;
 
@@ -129,26 +110,6 @@ function getProxyUrlForTarget(targetUrl: string, env: NodeJS.ProcessEnv): string
     default:
       return env.ALL_PROXY || env.all_proxy;
   }
-}
-
-export function shouldBypassProxy(targetUrl: string, env: NodeJS.ProcessEnv): boolean {
-  const rawNoProxy = env.NO_PROXY || env.no_proxy;
-  if (!rawNoProxy) return false;
-
-  const url = new URL(targetUrl);
-  const hostname = url.hostname.toLowerCase();
-  const port = url.port || getDefaultPort(url.protocol);
-
-  return rawNoProxy
-    .split(",")
-    .map((entry) => entry.trim())
-    .filter(Boolean)
-    .some((entry) => {
-      if (entry === "*") return true;
-      const [ruleHost, rulePort] = entry.split(":", 2);
-      if (rulePort && rulePort !== port) return false;
-      return hostMatchesNoProxyEntry(hostname, ruleHost);
-    });
 }
 
 export function buildWebSocketOptions(
@@ -198,6 +159,11 @@ function closeDispatcherBestEffort(dispatcher: Dispatcher): void {
     .then(() => dispatcher.close())
     .catch(() => dispatcher.destroy?.(new Error("evicted")))
     .catch(() => {});
+}
+
+/** Whether a fetch of `targetUrl` goes through an HTTP proxy (env proxy, not bypassed by NO_PROXY). */
+export function fetchUsesHttpProxy(targetUrl: string, env: NodeJS.ProcessEnv): boolean {
+  return resolveProxyUrl(targetUrl, env) !== undefined;
 }
 
 export function buildFetchDispatcher(

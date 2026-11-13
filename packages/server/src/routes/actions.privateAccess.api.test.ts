@@ -6,18 +6,18 @@ import { randomUUID } from "node:crypto";
 import { and, eq } from "drizzle-orm";
 
 import { getDb } from "../db/index";
-import { agentMigrations, agents, channelAgents, channelHumans, channels, featureFlagRules, messages, serverMembers, threadFollows, users } from "../db/schema";
-import { assignMachine, createAgent } from "../services/agentService";
+import { actionCards, agentMigrations, agents, channelAgents, channelHumans, channels, messages, serverMembers, threadFollows, users } from "../db/schema";
+import { createAgent } from "../services/agentService";
+import { placeAgentOnMachine } from "../test/agentMachineFixture";
 import { addAgent, addHuman, createChannel, getOrCreateThread, removeHuman } from "../services/channelService";
 import { ActionCardError, executeActionCard, markActionCardExecuted, prepareActionCard } from "../services/actionCardsService";
 import { isInTransaction } from "../db/ambientTransaction";
 import { asServerId } from "@botiverse/raft-shared";
-import { AGENT_MIGRATION_FEATURE_FLAG_KEY } from "../services/featureFlagService";
 import { registerMachine } from "../services/machineService";
 import { createMessage, getMaxSeq } from "../services/messageService";
 import { createServer } from "../services/serverService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 async function seedUser(email: string, name: string) {
   const db = getDb();
@@ -42,18 +42,6 @@ function authHeaders(token: string, serverId: string) {
   };
 }
 
-async function enableMigrationFlag(serverId: string) {
-  const db = getDb();
-  await db.insert(featureFlagRules).values({
-    id: randomUUID(),
-    flagKey: AGENT_MIGRATION_FEATURE_FLAG_KEY,
-    stage: "server",
-    priority: 0,
-    decision: "allow",
-    values: [serverId],
-  });
-}
-
 async function prepareMigrationCard(args: {
   baseUrl: string;
   token: string;
@@ -76,7 +64,6 @@ async function prepareMigrationCard(args: {
 
 async function seedMigrationRouteScenario(args: {
   slug: string;
-  enableFlag?: boolean;
   assignSourceMachine?: boolean;
 }) {
   const db = getDb();
@@ -88,15 +75,12 @@ async function seedMigrationRouteScenario(args: {
     userId: member.id,
     role: "member",
   }).onConflictDoNothing();
-  if (args.enableFlag !== false) {
-    await enableMigrationFlag(server.id);
-  }
   const short = args.slug.slice(0, 8);
   const source = await registerMachine(server.id, owner.id, `${short}-source-computer`);
   const target = await registerMachine(server.id, owner.id, `${short}-target-computer`);
   const agent = await createAgent(server.id, `${short}-agent`, { runtime: "codex" });
   if (args.assignSourceMachine !== false) {
-    await assignMachine(agent.id, source.machine.id);
+    await placeAgentOnMachine(agent.id, source.machine.id);
   } else {
     await db.update(agents).set({ machineId: null }).where(eq(agents.id, agent.id));
     agent.machineId = null;
@@ -225,18 +209,10 @@ test("migration export profile action-card route is not supported", async ({ app
   const db = getDb();
   const owner = await seedUser("migration-card-owner@slock.test", "migration-card-owner");
   const server = await createServer("Botiverse", "botiverse", owner.id);
-  await db.insert(featureFlagRules).values({
-    id: randomUUID(),
-    flagKey: AGENT_MIGRATION_FEATURE_FLAG_KEY,
-    stage: "server",
-    priority: 0,
-    decision: "allow",
-    values: [server.id],
-  });
   const source = await registerMachine(server.id, owner.id, "source-computer");
   const target = await registerMachine(server.id, owner.id, "target-computer");
   const agent = await createAgent(server.id, "migration-card-agent", { runtime: "codex" });
-  await assignMachine(agent.id, source.machine.id);
+  await placeAgentOnMachine(agent.id, source.machine.id);
 
   const token = await tokenForHuman(owner.email);
   const prepareRes = await fetch(`${app.baseUrl}/api/actions/migration-export`, {
@@ -326,7 +302,7 @@ test("action card prepare into private thread does not leak through stale thread
     },
   ]);
 
-  await removeHuman(privateChannel.id, removed.id);
+  await removeHuman(privateChannel.id, removed.id, { self: true });
   const { io, events } = installFakeIo();
 
   await prepareActionCard({
@@ -385,7 +361,7 @@ test("executed action cards update private thread followers without stale thread
     },
   ]);
 
-  await removeHuman(privateChannel.id, removed.id);
+  await removeHuman(privateChannel.id, removed.id, { self: true });
   const card = await prepareActionCard({
     serverId: asServerId(server.id),
     requesterAgentId: agent.id,
@@ -543,6 +519,68 @@ test("channel:add_member cards cannot report success before the target membershi
   assert.equal(committed.status, 200);
 });
 
+test("a done channel:add_member card records whether the person changed the agent's list, not counting who was a member already", async ({ app }) => {
+  void app;
+  const db = getDb();
+  const slug = randomUUID().slice(0, 8);
+  const owner = await seedUser(`members-changed-owner-${slug}@slock.test`, `members-changed-owner-${slug}`);
+  const actor = await seedUser(`members-changed-actor-${slug}@slock.test`, `members-changed-actor-${slug}`);
+  const alice = await seedUser(`members-changed-alice-${slug}@slock.test`, `members-changed-alice-${slug}`);
+  const bob = await seedUser(`members-changed-bob-${slug}@slock.test`, `members-changed-bob-${slug}`);
+  const carol = await seedUser(`members-changed-carol-${slug}@slock.test`, `members-changed-carol-${slug}`);
+  const server = await createServer("Members Changed", `members-changed-${slug}`, owner.id);
+  await db.insert(serverMembers).values([actor, alice, bob, carol].map((user) => ({ serverId: server.id, userId: user.id, role: "member" as const })));
+  const requester = await createAgent(server.id, `members-changed-agent-${slug}`, { runtime: "codex" });
+  const scout = await createAgent(server.id, `members-changed-scout-${slug}`, { runtime: "codex" });
+  const carrier = await createChannel(server.id, `members-changed-carrier-${slug}`, undefined, "channel", { type: "user", id: owner.id });
+  await addHuman(carrier.id, actor.id);
+  await addAgent(carrier.id, requester.id);
+
+  /**
+   * A card asking for `ask` in a new channel where `already` are members,
+   * then what the dialog does: adds `added` and marks the card executed with
+   * them (and a `changed` of the client's own, which the server must not keep).
+   * Returns what the card recorded.
+   */
+  async function run(name: string, ask: { humans: string[]; agents: string[] }, already: string[], added: { humans: string[]; agents: string[] }) {
+    const target = await createChannel(server.id, `members-changed-${name}-${slug}`, undefined, "channel", { type: "user", id: owner.id });
+    await addHuman(target.id, actor.id);
+    for (const id of already) await addHuman(target.id, id);
+    const card = await prepareActionCard({
+      serverId: asServerId(server.id),
+      requesterAgentId: requester.id,
+      targetChannelId: carrier.id,
+      action: { type: "channel:add_member", channel: target.id, humans: ask.humans, agents: ask.agents },
+    });
+    for (const id of added.humans) await addHuman(target.id, id);
+    for (const id of added.agents) await addAgent(target.id, id);
+    const out = await markActionCardExecuted({
+      messageId: card.messageId,
+      serverId: asServerId(server.id),
+      userId: actor.id,
+      result: {
+        kind: "channel-members", channelId: target.id, channelName: target.name, addedHumanIds: added.humans, addedAgentIds: added.agents,
+        // The client's own claim, the opposite of each case's answer below: the server keeps its own.
+        changed: name === "as-asked",
+      },
+    });
+    const [row] = await db.select({ result: actionCards.result }).from(actionCards).where(eq(actionCards.messageId, card.messageId));
+    const stored = row?.result as { changed?: unknown } | null;
+    const returned = out.metadata.result?.kind === "channel-members" ? out.metadata.result.changed : undefined;
+    assert.equal(returned, stored?.changed, `${name}: the message and the card row record the same`);
+    // The card as drawn says so too (actionCard.result.changedBeforeAdding), or not.
+    assert.equal(JSON.stringify(out.metadata.presentation).includes("actionCard.result.changedBeforeAdding"), stored?.changed === true, name);
+    return stored?.changed;
+  }
+
+  // Alice is in the channel already, so the dialog leaves her out: adding bob and scout is the list as asked.
+  assert.equal(await run("as-asked", { humans: [alice.id, bob.id], agents: [scout.id] }, [alice.id], { humans: [bob.id], agents: [scout.id] }), false);
+  // The person removed scout, who is not a member.
+  assert.equal(await run("removed", { humans: [alice.id, bob.id], agents: [scout.id] }, [alice.id], { humans: [bob.id], agents: [] }), true);
+  // The person added carol, whom the card didn't ask for.
+  assert.equal(await run("added", { humans: [bob.id], agents: [] }, [], { humans: [bob.id, carol.id], agents: [] }), true);
+});
+
 test("action card agent:create resolves structured computer constraints", async ({ app }) => {
   const ownerA = await seedUser("action-card-computer-owner-a@slock.test", "action-card-computer-owner-a");
   const ownerB = await seedUser("action-card-computer-owner-b@slock.test", "action-card-computer-owner-b");
@@ -597,7 +635,7 @@ test("agent:create action card required computer blocks mark-executed mismatch",
   const { machine: requiredMachine } = await registerMachine(server.id, owner.id, "required-ec2");
   const { machine: wrongMachine } = await registerMachine(server.id, owner.id, "wrong-ec2");
   const created = await createAgent(server.id, "action-card-required-created", { runtime: "codex" });
-  await assignMachine(created.id, wrongMachine.id);
+  await placeAgentOnMachine(created.id, wrongMachine.id);
 
   const card = await prepareActionCard({
     serverId: server.id,
@@ -825,7 +863,7 @@ test("channel:create action defers its realtime broadcast until after the transa
     },
   };
 
-  await executeActionCard({
+  await executeActionCard({ webSessionFamilyId: null,
     messageId: card.messageId,
     serverId: asServerId(server.id),
     userId: owner.id,
@@ -872,7 +910,7 @@ test("channel:create action emits no broadcast when the transaction rolls back",
     },
   };
 
-  await executeActionCard({
+  await executeActionCard({ webSessionFamilyId: null,
     messageId: card.messageId,
     serverId: asServerId(server.id),
     userId: owner.id,
@@ -930,7 +968,7 @@ test("public channel:create defers publishChannelUpdate until after the transact
     },
   };
 
-  await executeActionCard({
+  await executeActionCard({ webSessionFamilyId: null,
     messageId: card.messageId,
     serverId: asServerId(server.id),
     userId: owner.id,

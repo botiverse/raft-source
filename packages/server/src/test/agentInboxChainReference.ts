@@ -3,25 +3,24 @@
  *
  * Agent resume recovery (channelService.getAgentUnreadCounts and
  * messageService.getAgentResumeCatchupMessages) reads ONE source: the agent inbox
- * view of the unified RisingWave chain (`rw_agent_inbox_v6`, read through
+ * view of the unified RisingWave chain (`rw_agent_inbox_v7`, read through
  * channelService.readAgentInboxChainRows). CI has no RisingWave, so this derives
  * the same rows from Postgres with the SAME semantics as the view, and tests pass
  * them as the chain.
  *
  * This is a stand-in for the RW view, not a product path. KEEP IT IN SYNC with the
  * SQL it mirrors:
- *   - infra/risingwave/sql/076-cursor-decouple-consumers.sql
- *                                                rw_agent_inbox_v6 (065's rw_agent_inbox_v4 on mention v6)
- *   - infra/risingwave/sql/067-mention-v6.sql    rw_inbox_mention_v6
- *   - infra/risingwave/sql/064-agent-inbox-v3.sql
- *                                                rw_agent_inbox_v3
+ *   - infra/risingwave/sql/078-task-conversations.sql
+ *                                                rw_agent_inbox_v7, rw_inbox_mention_v7,
+ *                                                rw_conversation_parent_v1
  *   - infra/risingwave/sql/075-inbox-cursor-decouple.sql
  *                                                rw_inbox_normal_v5, rw_inbox_muted_prefix_v2
+ *   - infra/risingwave/sql/064-agent-inbox-v3.sql
+ *                                                rw_agent_inbox_v3
  *   - infra/risingwave/sql/063-chain-v5.sql      rw_muted_subs_v1
  *   - infra/risingwave/sql/063-unified-inbox-chain.sql
- *                                                rw_message_target_v3, rw_target_latest_v4,
- *                                                rw_target_eligible_v1, rw_receiver_cursors_v1,
- *                                                rw_subs_v2
+ *                                                rw_message_target_v3, rw_receiver_cursors_v1,
+ *                                                rw_subs_v2, rw_target_latest_v4, rw_target_eligible_v1
  *   - infra/risingwave/sql/061-inbox-derivation-chain.sql
  *                                                rw_thread_parent_v3
  * Each CTE below is named after the view it mirrors, restricted to one agent.
@@ -33,7 +32,8 @@
  *   - unread: seq > cursor (COALESCE(last_read_seq8, last_read_seq)), excluding the
  *     agent's own sends, system messages whose causal actor is the agent, and the
  *     noise subtypes channel.self_unfollow_thread / task.deleted_summary. No join bound.
- *   - mention arm (v6): message_mentions for the agent with seq > cursor. A mention
+ *   - mention arm (v7): message_mentions for the agent with seq > cursor that
+ *     notify (notifiable_at_send, or notified_at set later). A mention
  *     stored under a joint local projection id (the SENDER's projection) is first
  *     mapped to its canonical storage, then fanned out to every local target like
  *     messages. Visible through membership, parent membership, an active follow, or
@@ -49,7 +49,11 @@
  *     the thread's own channels.parent_message_id) -- the canonical parent for a
  *     joint local thread projection; parent_channel_* is the LOCAL parent as
  *     rw_thread_parent_v3 resolves it.
- *   - offered rows only (rw_agent_inbox_v6): the agent is joined (membership or
+ *   - task conversations (channels.type = 'task'): sub-conversations like threads
+ *     (rw_conversation_parent_v1: parent = channels.parent_channel_id, no parent
+ *     message), kind 'task' in the output. taskNumber / taskTitle are not view
+ *     columns: the reader adds them from Postgres; here they are joined directly.
+ *   - offered rows only (rw_agent_inbox_v7): the agent is joined (membership or
  *     active follow, joined_at not null) and the row offers unread: the admitted
  *     stream has unread (subscribed and unread_count > 0), OR mention_unread > 0 and
  *     the mention lies beyond the admitted stream (not subscribed, or
@@ -86,7 +90,7 @@ export async function referenceAgentInboxChain(agentId: string): Promise<AgentIn
       WHERE c.deleted_at IS NULL AND c.archived_at IS NULL AND p.local_channel_id IS NULL
       UNION ALL
       SELECT p.canonical_channel_id, p.local_channel_id, TRUE FROM proj AS p
-    ), mention_storage AS (         -- rw_inbox_mention_v6: a sender-projection id -> canonical storage
+    ), mention_storage AS (         -- rw_inbox_mention_v7: a sender-projection id -> canonical storage
       SELECT m.*, COALESCE(pj.canonical_channel_id, m.channel_id) AS storage_id
       FROM message_mentions AS m
       LEFT JOIN proj AS pj ON pj.local_channel_id = m.channel_id
@@ -156,7 +160,7 @@ export async function referenceAgentInboxChain(agentId: string): Promise<AgentIn
       JOIN message_target AS m
         ON m.target_id = s.target_id AND (s.mute_from_seq IS NULL OR m.seq < s.mute_from_seq)
       GROUP BY s.kind, s.target_id, s.server_id, rc.last_read_seq
-    ), thread_parent AS (           -- rw_thread_parent_v3
+    ), thread_parent AS (           -- rw_conversation_parent_v1 (rw_thread_parent_v3 + task conversations)
       SELECT c.id AS thread_channel_id, c.parent_message_id, m.channel_id AS parent_channel_id,
              pc.name AS parent_channel_name, pc.type AS parent_channel_type
       FROM channels AS c
@@ -174,11 +178,18 @@ export async function referenceAgentInboxChain(agentId: string): Promise<AgentIn
       LEFT JOIN proj AS pl ON pl.canonical_channel_id = m.channel_id AND pl.server_id = lt.server_id
       JOIN channels AS pc2 ON pc2.id = COALESCE(pl.local_channel_id, m.channel_id)
       WHERE lt.type = 'thread'
-    ), mention AS (                 -- rw_inbox_mention_v6 (agent arm)
-      SELECT CASE WHEN c.type = 'thread' THEN 'thread' WHEN c.type = 'dm' THEN 'dm' ELSE 'channel' END AS kind,
+      UNION ALL
+      SELECT tc.id, NULL::uuid, tc.parent_channel_id, tpc.name, tpc.type
+      FROM channels AS tc
+      JOIN channels AS tpc ON tpc.id = tc.parent_channel_id
+      WHERE tc.type = 'task'
+    ), mention AS (                 -- rw_inbox_mention_v7 (agent arm)
+      SELECT CASE WHEN c.type IN ('thread', 'task') THEN 'thread' WHEN c.type = 'dm' THEN 'dm' ELSE 'channel' END AS kind,
              map.target_id, c.server_id,
-             COUNT(*) FILTER (WHERE mm.message_seq > COALESCE(rc.last_read_seq, 0)) AS mention_unread,
-             MAX(mm.message_seq) FILTER (WHERE mm.message_seq > COALESCE(rc.last_read_seq, 0)) AS max_mention_seq
+             COUNT(*) FILTER (WHERE mm.message_seq > COALESCE(rc.last_read_seq, 0)
+               AND (mm.notifiable_at_send OR mm.notified_at IS NOT NULL)) AS mention_unread,
+             MAX(mm.message_seq) FILTER (WHERE mm.message_seq > COALESCE(rc.last_read_seq, 0)
+               AND (mm.notifiable_at_send OR mm.notified_at IS NOT NULL)) AS max_mention_seq
       FROM mention_storage AS mm
       JOIN chan_map AS map ON map.storage_id = mm.storage_id
       JOIN target_eligible AS g ON g.target_id = map.target_id
@@ -190,8 +201,8 @@ export async function referenceAgentInboxChain(agentId: string): Promise<AgentIn
        AND mf.follower_id = mm.target_id AND mf.unfollowed_at IS NULL
       LEFT JOIN receiver_cursors AS rc ON rc.channel_id = map.target_id
       WHERE mm.target_type = 'agent' AND mm.target_id::text = ${agent}
-        AND ((c.type <> 'thread' AND visa.agent_id IS NOT NULL)
-          OR (c.type = 'thread' AND (pvisa.agent_id IS NOT NULL OR mf.follower_id IS NOT NULL))
+        AND ((c.type NOT IN ('thread', 'task') AND visa.agent_id IS NOT NULL)
+          OR (c.type IN ('thread', 'task') AND (pvisa.agent_id IS NOT NULL OR mf.follower_id IS NOT NULL))
           OR (mm.notified_at IS NOT NULL AND NOT map.projected))
       GROUP BY 1, 2, 3
     ), n AS (
@@ -214,7 +225,9 @@ export async function referenceAgentInboxChain(agentId: string): Promise<AgentIn
          OR (COALESCE(mn.mention_unread, 0) > 0
              AND (n.target_id IS NULL OR mn.max_mention_seq > COALESCE(n.latest_seq, 0)))
     )
-    SELECT u.kind, u.target_id::text AS target_id,
+    SELECT CASE WHEN u.kind = 'thread' AND c.type = 'task' THEN 'task' ELSE u.kind END AS kind,
+           u.target_id::text AS target_id,
+           conv_task.task_number AS task_number, conv_task.title AS task_title,
            COALESCE(p.canonical_channel_id, u.target_id)::text AS storage_channel_id,
            u.server_id::text AS server_id,
            c.name AS channel_name, c.type AS channel_type,
@@ -230,6 +243,7 @@ export async function referenceAgentInboxChain(agentId: string): Promise<AgentIn
            CASE WHEN u.kind = 'thread' THEN tf.created_at ELSE ca.added_at END AS joined_at
     FROM u
     JOIN channels AS c ON c.id = u.target_id AND c.deleted_at IS NULL
+    LEFT JOIN tasks AS conv_task ON c.type = 'task' AND conv_task.id = c.task_id
     LEFT JOIN proj AS p ON p.local_channel_id = u.target_id
     LEFT JOIN thread_parent AS tp ON tp.thread_channel_id = u.target_id AND u.kind = 'thread'
     LEFT JOIN channels AS pc ON pc.id = tp.parent_channel_id AND pc.deleted_at IS NULL
@@ -270,5 +284,8 @@ export async function referenceAgentInboxChain(agentId: string): Promise<AgentIn
     offeredUnread: Number(row.offered_unread),
     activitySeq: Number(row.activity_seq),
     joinedAt: new Date(row.joined_at as string | Date),
+    ...(row.kind === "task"
+      ? { taskNumber: num(row.task_number), taskTitle: row.task_title == null ? null : String(row.task_title) }
+      : {}),
   }));
 }

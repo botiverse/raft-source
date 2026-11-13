@@ -3,7 +3,42 @@ import { createReadStream } from 'node:fs';
 import { once } from 'node:events';
 import { ensureActiveRelease, transportCauseSuffix } from './publish-hands-release.mjs';
 
-export async function uploadAsset({ api, apiBase = 'https://hands.build', appId, buildId, asset, fetchImpl = fetch, recovery = {} }) {
+/** Direct PUT attempts per asset: the first and two retries (Hands has no multipart upload). */
+export const DIRECT_UPLOAD_ATTEMPTS = 3;
+/** One PUT's time limit; a stuck stream gives way to a retry with a fresh link. */
+export const DIRECT_UPLOAD_ATTEMPT_TIMEOUT_MS = 600_000;
+const DIRECT_UPLOAD_BACKOFF_MS = [10_000, 30_000];
+
+/**
+ * Uploads one asset. A failed direct PUT that may pass on another try — a
+ * transport failure or timeout, HTTP 408/429/5xx, or 403 (the link rejected:
+ * expired or invalid) — retries this asset only, after a backoff, and each
+ * retry asks Hands for the upload again so it gets a fresh link. Any other
+ * failure, and the last attempt's, is thrown.
+ */
+export async function uploadAsset(input) {
+  const sleep = input.recovery?.sleep ?? sleepFor;
+  const log = input.log ?? ((line) => process.stderr.write(`${line}\n`));
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      return await uploadAssetOnce(input);
+    } catch (error) {
+      if (!error.directUploadRetry || attempt >= DIRECT_UPLOAD_ATTEMPTS) throw error;
+      const waitMs = DIRECT_UPLOAD_BACKOFF_MS[attempt - 1] ?? DIRECT_UPLOAD_BACKOFF_MS.at(-1);
+      log(`Hands direct upload attempt ${attempt}/${DIRECT_UPLOAD_ATTEMPTS} failed (${error.directUploadRetry}), retrying ${input.asset.file} with a fresh link in ${waitMs / 1000} s: ${error.message}`);
+      await sleep(waitMs);
+    }
+  }
+}
+
+/** Why a failed direct PUT may pass on another try, or null when it will not. */
+export function directUploadRetryReason(status) {
+  if (status === 403) return 'link_rejected';
+  if (status === 408 || status === 429 || status >= 500) return `http_${status}`;
+  return null;
+}
+
+async function uploadAssetOnce({ api, apiBase = 'https://hands.build', appId, buildId, asset, fetchImpl = fetch, recovery = {} }) {
   const slot = { artifact_kind: asset.artifact_kind, platform: asset.platform, arch: asset.arch, variant: asset.variant, filetype: asset.filetype };
   const idempotency = createHash('sha256').update(JSON.stringify([buildId, slot, asset.sha256, asset.size_bytes])).digest('hex');
   const response = await api('POST', `/api/apps/${appId}/builds/${buildId}/assets/uploads`, {
@@ -26,19 +61,30 @@ export async function uploadAsset({ api, apiBase = 'https://hands.build', appId,
   const complete = new URL(response.complete_url, apiBase);
   if (complete.origin !== new URL(apiBase).origin || complete.pathname !== expectedComplete || complete.search || complete.hash) throw new Error('upload completion escaped its app/build/asset');
   const body = createReadStream(asset.path);
+  const startedAt = Date.now();
   try {
     let uploaded;
     try {
       uploaded = await fetchImpl(url, {
         method: 'PUT', redirect: 'error', duplex: 'half',
         headers: { ...response.upload.headers, 'content-length': String(asset.size_bytes) },
-        body, signal: AbortSignal.timeout(900_000),
+        body, signal: AbortSignal.timeout(DIRECT_UPLOAD_ATTEMPT_TIMEOUT_MS),
       });
     } catch (error) {
       // Host and path only: the upload capability's query string is a signature.
-      throw new Error(`Hands direct upload transport failed: ${asset.file} -> ${url.host}${url.pathname}${transportCauseSuffix(error)}`);
+      throw Object.assign(
+        new Error(`Hands direct upload transport failed: ${asset.file} (${asset.size_bytes} bytes) -> ${url.host}${url.pathname} after ${Date.now() - startedAt} ms${transportCauseSuffix(error)}`),
+        { directUploadRetry: error?.name === 'TimeoutError' ? 'timeout' : 'transport' },
+      );
     }
-    if (!uploaded.ok) throw new Error(`Hands direct upload failed: HTTP ${uploaded.status}`);
+    if (!uploaded.ok) {
+      const retry = directUploadRetryReason(uploaded.status);
+      const what = uploaded.status === 403 ? 'upload link rejected (expired or invalid)' : 'failed';
+      throw Object.assign(
+        new Error(`Hands direct upload ${what}: HTTP ${uploaded.status}: ${asset.file} (${asset.size_bytes} bytes) -> ${url.host}${url.pathname}${await directUploadFailureDetail(uploaded, startedAt)}`),
+        retry ? { directUploadRetry: retry } : {},
+      );
+    }
     await uploaded.body?.cancel();
   } finally {
     // destroy() defers to a pending open; wait so the file is released (and a
@@ -109,4 +155,30 @@ export async function activateRelease({ api, appId, buildId, channelId, version 
   }
   const result = await ensureActiveRelease(api, { appId, buildId, channelId, version, requiredExternalTargets: null });
   return { id: result.releaseId, revision: result.revision };
+}
+
+// Request ids the storage edge returns, so its owner can find the failure in
+// its own logs. Header values are ids, never credentials.
+const DIRECT_UPLOAD_REQUEST_ID_HEADERS = ['cf-ray', 'x-amz-request-id', 'x-amz-id-2', 'x-request-id', 'server'];
+
+/**
+ * After a failed direct PUT: elapsed time, the edge's request ids and the
+ * start of the response body. The body is an error document from the storage
+ * service; signature material it may echo (a canonical request, a string to
+ * sign, X-Amz-* query values) is cut out, and it is capped.
+ */
+export async function directUploadFailureDetail(response, startedAt, now = Date.now()) {
+  const ids = DIRECT_UPLOAD_REQUEST_ID_HEADERS
+    .map((name) => [name, response.headers?.get?.(name)])
+    .filter(([, value]) => value)
+    .map(([name, value]) => `${name}=${String(value).slice(0, 120)}`);
+  let text = '';
+  try { text = await response.text(); } catch { text = ''; }
+  const cleaned = text
+    .replace(/<(StringToSign|StringToSignBytes|CanonicalRequest|CanonicalRequestBytes|SignatureProvided)>[\s\S]*?<\/\1>/gi, '<$1>[redacted]</$1>')
+    .replace(/X-Amz-[A-Za-z-]+=[^&\s<"']*/g, (match) => `${match.split('=')[0]}=[redacted]`)
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 400);
+  return `; after ${Math.max(0, now - startedAt)} ms${ids.length ? `; ${ids.join(' ')}` : ''}${cleaned ? `; body: ${cleaned}` : ''}`;
 }

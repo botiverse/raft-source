@@ -7,7 +7,7 @@
 
 export const SEA_CLI_ENTRY = "__cli";
 /** Hidden argv[2] entries that run daemon code: they get the full bundle. */
-export const SEA_RUNNER_ENTRIES = ["__run", "__detect-runtimes", "__verify-bundled-oauth", "__verify-bundled-kimi"];
+export const SEA_RUNNER_ENTRIES = ["__run", "__detect-runtimes", "__restore-context-view", "__verify-bundled-oauth", "__verify-bundled-kimi", "__verify-bundled-oar"];
 
 export const SEA_ASSET_FULL = "computer.cjs";
 export const SEA_ASSET_LITE = "computer-lite.cjs";

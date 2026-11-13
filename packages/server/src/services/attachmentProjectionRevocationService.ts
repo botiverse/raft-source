@@ -7,6 +7,7 @@ import {
   attachments,
   messages,
 } from "../db/schema";
+import { removeAttachmentObjectHoldWithExecutor } from "./attachmentObjectHoldService";
 
 export type AttachmentProjectionRevocationActor = {
   type: "user" | "agent" | "machine" | "system";
@@ -101,6 +102,12 @@ export async function revokeAttachmentProjection(input: {
       reason,
       revokedAt,
     });
+    // A revoked projection no longer keeps the bytes alive.
+    await removeAttachmentObjectHoldWithExecutor(tx, {
+      holderType: "attachment",
+      holderId: projection.id,
+      objectId: projection.objectId,
+    }, revokedAt);
     return { revokedAt, replayed: false };
   });
 }

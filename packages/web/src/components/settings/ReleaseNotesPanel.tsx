@@ -4,8 +4,11 @@ import { useIntl } from "react-intl";
 import api from "../../api/client";
 import { useServerStore } from "../../store/serverStore";
 import { useMobileBack } from "../../hooks/useAppNavigate";
+import { useLocale } from "../../i18n/LocaleProvider";
+import { isSupportedLocale } from "../../i18n/locale";
+import type { Locale } from "../../i18n/locale";
 import type { MessageId } from "../../i18n/messages/en";
-import { Badge, Button, Card } from "@botiverse/raft-ui";
+import { Badge, Button, Card, ScrollArea } from "@botiverse/raft-ui";
 import Banner from "../ui/Banner";
 import PanelHeader from "../ui/PanelHeader";
 import SectionEyebrow from "../ui/SectionEyebrow";
@@ -16,6 +19,8 @@ export interface ReleaseNoteEntry {
   entryId: string;
   type: ReleaseNoteType;
   text: string;
+  /** The entry in the requested display locale, when it has a current translation. */
+  translation?: { locale: Locale; text: string };
   emphasis: boolean;
   ordinal: number;
 }
@@ -77,7 +82,7 @@ function isNonEmptyString(value: unknown): value is string {
 
 function parseEntry(value: unknown): ReleaseNoteEntry {
   if (!isRecord(value)) throw new Error("release note entry must be an object");
-  const { entryId, type, text, emphasis, ordinal } = value;
+  const { entryId, type, text, translation, emphasis, ordinal } = value;
   if (!isNonEmptyString(entryId)) throw new Error("release note entryId is invalid");
   if (typeof type !== "string" || !RELEASE_NOTE_TYPES.has(type as ReleaseNoteType)) {
     throw new Error("release note type is invalid");
@@ -85,7 +90,13 @@ function parseEntry(value: unknown): ReleaseNoteEntry {
   if (typeof text !== "string" || text.includes("\0")) throw new Error("release note text is invalid");
   if (typeof emphasis !== "boolean") throw new Error("release note emphasis is invalid");
   if (!Number.isInteger(ordinal) || Number(ordinal) < 0) throw new Error("release note ordinal is invalid");
-  return { entryId, type: type as ReleaseNoteType, text, emphasis, ordinal: Number(ordinal) };
+  const parsed: ReleaseNoteEntry = { entryId, type: type as ReleaseNoteType, text, emphasis, ordinal: Number(ordinal) };
+  if (translation === undefined) return parsed;
+  if (!isRecord(translation) || typeof translation.locale !== "string" || !isSupportedLocale(translation.locale)
+    || !isNonEmptyString(translation.text) || translation.text.includes("\0")) {
+    throw new Error("release note translation is invalid");
+  }
+  return { ...parsed, translation: { locale: translation.locale, text: translation.text } };
 }
 
 function parseRelease(value: unknown): PublishedReleaseNote {
@@ -124,9 +135,10 @@ export function parseReleaseNotesPage(value: unknown): ReleaseNotesPage {
   return { items: value.items.map(parseRelease), nextCursor: value.nextCursor as string | null };
 }
 
-async function loadReleaseNotesPage(cursor: string | null, signal: AbortSignal): Promise<unknown> {
+async function loadReleaseNotesPage(cursor: string | null, signal: AbortSignal, locale: Locale): Promise<unknown> {
   const response = await api.get("/release-notes", {
-    params: { limit: 100, ...(cursor ? { cursor } : {}) },
+    // English is the source: only other display locales ask for translations.
+    params: { limit: 100, ...(cursor ? { cursor } : {}), ...(locale === "en" ? {} : { locale }) },
     signal,
   });
   return response.data;
@@ -134,7 +146,7 @@ async function loadReleaseNotesPage(cursor: string | null, signal: AbortSignal):
 
 export async function loadAllReleaseNotes(
   signal: AbortSignal,
-  loadPage: ReleaseNotesPageLoader = loadReleaseNotesPage,
+  loadPage: ReleaseNotesPageLoader = (cursor, pageSignal) => loadReleaseNotesPage(cursor, pageSignal, "en"),
 ): Promise<PublishedReleaseNote[]> {
   const releases: PublishedReleaseNote[] = [];
   const seenCursors = new Set<string>();
@@ -153,37 +165,45 @@ export async function loadAllReleaseNotes(
 type PanelState = {
   status: "loading" | "ready" | "error";
   releases: PublishedReleaseNote[];
+  /** The display locale `releases` were loaded for. */
+  locale: Locale | null;
   attempt: number;
 };
 
 function panelReducer(state: PanelState, action:
   | { type: "retry" }
-  | { type: "ready"; releases: PublishedReleaseNote[] }
+  | { type: "ready"; releases: PublishedReleaseNote[]; locale: Locale }
   | { type: "error" },
 ): PanelState {
-  if (action.type === "retry") return { status: "loading", releases: [], attempt: state.attempt + 1 };
-  if (action.type === "ready") return { ...state, status: "ready", releases: action.releases };
-  return { ...state, status: "error", releases: [] };
+  if (action.type === "retry") return { status: "loading", releases: [], locale: null, attempt: state.attempt + 1 };
+  if (action.type === "ready") return { ...state, status: "ready", releases: action.releases, locale: action.locale };
+  return { ...state, status: "error", releases: [], locale: null };
 }
 
 export default function ReleaseNotesPanel() {
   const { formatMessage } = useIntl();
+  const { locale } = useLocale();
   const serverSlug = useServerStore((s) => s.current?.slug);
   const onMobileBack = useMobileBack(serverSlug ? `/s/${serverSlug}/settings` : "/");
-  const [state, dispatch] = useReducer(panelReducer, { status: "loading", releases: [], attempt: 0 });
+  const [state, dispatch] = useReducer(panelReducer, { status: "loading", releases: [], locale: null, attempt: 0 });
+  // After a language switch, the previous language's notes are not shown while the new ones load.
+  const status = state.status === "ready" && state.locale !== locale ? "loading" : state.status;
 
   useEffect(() => {
     const controller = new AbortController();
-    void loadAllReleaseNotes(controller.signal).then(
+    void loadAllReleaseNotes(
+      controller.signal,
+      (cursor, signal) => loadReleaseNotesPage(cursor, signal, locale),
+    ).then(
       (releases) => {
-        if (!controller.signal.aborted) dispatch({ type: "ready", releases });
+        if (!controller.signal.aborted) dispatch({ type: "ready", releases, locale });
       },
       () => {
         if (!controller.signal.aborted) dispatch({ type: "error" });
       },
     );
     return () => controller.abort();
-  }, [state.attempt]);
+  }, [state.attempt, locale]);
 
   const currentReleaseId = useMemo(
     () => state.releases.find((release) => release.state === "published")?.releaseId,
@@ -198,19 +218,19 @@ export default function ReleaseNotesPanel() {
         onMobileBack={onMobileBack}
       />
 
-      <div className="flex-1 overflow-y-auto bg-layer-canvas px-4 py-4 text-foreground md:px-5">
+      <ScrollArea className="flex-1 bg-layer-canvas text-foreground" contentClassName="px-4 py-4 md:px-(--surface-inset)">
         <div className="mb-3 flex items-center gap-2">
           <FileText size={16} className="text-foreground-hint" />
           <SectionEyebrow>{formatMessage({ id: "settings.releaseNotes.whatsNew" })}</SectionEyebrow>
         </div>
 
-        {state.status === "loading" ? (
+        {status === "loading" ? (
           <p className="text-callout text-foreground-muted" role="status">
             {formatMessage({ id: "settings.releaseNotes.loading" })}
           </p>
         ) : null}
 
-        {state.status === "error" ? (
+        {status === "error" ? (
           <Banner
             intent="warning"
             withIcon
@@ -218,7 +238,7 @@ export default function ReleaseNotesPanel() {
             actions={(
               <Button
                 variant="outline"
-                size="sm"
+                size="md"
                 onClick={handleRetry}
               >
                 {formatMessage({ id: "settings.releaseNotes.retry" })}
@@ -229,8 +249,8 @@ export default function ReleaseNotesPanel() {
           </Banner>
         ) : null}
 
-        {state.status === "ready" ? (
-          <div className="space-y-4">
+        {status === "ready" ? (
+          <div className="stack-y-4">
             {state.releases.map((release) => {
               const isCurrentRelease = release.releaseId === currentReleaseId;
               return (
@@ -257,7 +277,7 @@ export default function ReleaseNotesPanel() {
                     ) : null}
                   </div>
 
-                  <div className="space-y-3">
+                  <div className="stack-y-3">
                     {RELEASE_CATEGORY_ORDER.map((type) => {
                       const entries = release.entries.filter((entry) => entry.type === type);
                       if (entries.length === 0) return null;
@@ -267,12 +287,22 @@ export default function ReleaseNotesPanel() {
                           <Badge appearance="soft" variant={config.badgeVariant}>
                             {formatMessage({ id: config.labelId })}
                           </Badge>
-                          <ul className="mt-2 list-disc space-y-1.5 pl-5 marker:text-foreground-hint">
-                            {entries.map((entry) => (
-                              <li key={entry.entryId} className={`text-subhead text-foreground ${entry.emphasis ? "font-semibold" : ""}`}>
-                                {entry.text}
-                              </li>
-                            ))}
+                          <ul className="mt-2 list-disc stack-y-1.5 pl-5 marker:text-foreground-hint">
+                            {entries.map((entry) => {
+                              // Only a translation into this page's language counts.
+                              const translated = entry.translation?.locale === locale ? entry.translation.text : undefined;
+                              return (
+                                <li
+                                  key={entry.entryId}
+                                  // Untranslated entries stay English inside a
+                                  // translated page; say so for fonts and screen readers.
+                                  lang={translated !== undefined || locale === "en" ? undefined : "en"}
+                                  className={`text-subhead text-foreground ${entry.emphasis ? "font-semibold" : ""}`}
+                                >
+                                  {translated ?? entry.text}
+                                </li>
+                              );
+                            })}
                           </ul>
                         </div>
                       );
@@ -283,7 +313,7 @@ export default function ReleaseNotesPanel() {
             })}
           </div>
         ) : null}
-      </div>
+      </ScrollArea>
     </div>
   );
 }

@@ -46,17 +46,7 @@ const REMOVED_CAPABILITIES = [
 // route, the way permission-matrix and channel.md were: the retired name is the
 // marker, not the whole defect (Cat, 2026-09-23).
 const PENDING_REMOVAL: Record<string, readonly string[]> = {
-  // manageChannels left this page in this commit; the other two still stand.
-  "agent-knowledge/permission-matrix.md": ["manageAgents", "manageMachines"],
   "agent-knowledge/action-cards.md": ["manageServer"],
-  "agent-knowledge/server-management.md": ["manageServer", "manageMembers"],
-  "agent-knowledge/server.md": ["manageServer"],
-  "agent-knowledge/what-slock-doesnt-have.md": ["manageServer"],
-  "agent-knowledge/agent.md": ["manageAgents"],
-  "agent-knowledge/agent-profile.md": ["manageAgents"],
-  "agent-knowledge/server-role.md": ["manageAgents", "manageMachines"],
-  "agent-knowledge/computer.md": ["manageMachines"],
-  "agent-knowledge/membership.md": ["manageMembers"],
 };
 
 async function manualPages(): Promise<string[]> {

@@ -1,0 +1,1 @@
+ALTER TABLE "agents" ADD COLUMN "assistant_reads_dms" boolean DEFAULT true NOT NULL;

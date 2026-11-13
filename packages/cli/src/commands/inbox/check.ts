@@ -1,9 +1,14 @@
 // `raft inbox check [--view unread|mentions] [--before <seq>]`
-// -> GET /internal/agent-api/inbox/conversations (durable unread list, server)
+// -> GET /internal/agent-api/inbox/conversations?items=true (durable unread list, server)
 // -> GET /internal/agent-api/inbox (managed runners: daemon pending snapshot)
 //
 // The agent's Activity panel: one entry point, no required flags. Every row
-// carries its `open:` command; the output ends with exactly one `Next:` line.
+// carries its `read:` command; the output ends with exactly one `Next:` line.
+//
+// RFC 081: a server with inbox items on answers `items=true` with `rows`
+// (conversations, app items, reminders), each read with `raft inbox read`. An
+// older server, or one with the flag off, ignores it: the conversation-only
+// list, read with `raft message read` / `raft task read`.
 
 import type { Command } from "commander";
 import type { AgentApiInboxView, AgentInboxSourceSeal } from "@botiverse/raft-shared";
@@ -27,7 +32,7 @@ interface InboxCheckOpts {
   before?: string;
 }
 
-const INBOX_UNAVAILABLE_NEXT_ACTION = "Retry in a moment; to drain new messages now use raft message check.";
+const INBOX_UNAVAILABLE_NEXT_ACTION = "Retry raft inbox check in a moment.";
 
 function parseView(raw: string | undefined): AgentApiInboxView {
   if (raw === undefined) return "unread";
@@ -60,7 +65,7 @@ type DaemonSnapshot = {
 export const inboxCheckCommand = defineCommand(
   {
     name: "check",
-    description: "List your unread conversations, newest activity first, each with the command that opens it (no flags needed).",
+    description: "List your unread conversations (and, where the server lists them, app items and reminders), newest activity first, each with the command that reads it (no flags needed).",
     options: [
       { flags: "--view <view>", description: "unread (default) or mentions" },
       { flags: "--before <seq>", description: "Next page: the seq printed on the More: line" },
@@ -77,6 +82,7 @@ export const inboxCheckCommand = defineCommand(
       createAgentApiSurfaceClient(client).inbox.list({
         ...(view !== "unread" ? { view } : {}),
         ...(before !== undefined ? { before_seq: String(before) } : {}),
+        items: "true",
       }),
       managed ? createDaemonApiSurfaceClient(client).inbox.check() : Promise.resolve(null),
     ]);

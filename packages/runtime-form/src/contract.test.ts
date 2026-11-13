@@ -16,7 +16,7 @@ const ROOT = fileURLToPath(new URL("../", import.meta.url));
 
 test("generated TypeScript, Kotlin and JSON Schema are fresh from the contract", () => {
   // Throws (non-zero exit) when any generated file differs from the contract.
-  execFileSync(process.execPath, [`${ROOT}contract/generate.mjs`, "--check"], { stdio: "pipe" });
+  execFileSync(process.execPath, ["--import", "@oxc-node/core/register", `${ROOT}contract/generate.ts`, "--check"], { stdio: "pipe" });
 });
 
 type Schema = {
@@ -136,10 +136,10 @@ test("a malformed requiredClientCapabilities fails closed as a capability no cli
   }
 });
 
-// Batch 2 fixtures (OpenCode, and the edit-only Kimi CLI, Gemini CLI and
-// Antigravity CLI): every served form and option source conforms to the
-// contract, parses without blocking fields, and needs no client capability.
-const BATCH_2_FORMS = ["opencode.form.json", "opencode.edit.json", "kimi.edit.json", "gemini.edit.json", "antigravity.edit.json"];
+// Batch 2 fixtures (OpenCode, and the edit-only Kimi CLI and Gemini CLI):
+// every served form and option source conforms to the contract, parses
+// without blocking fields, and needs no client capability.
+const BATCH_2_FORMS = ["opencode.form.json", "opencode.edit.json", "kimi.edit.json", "gemini.edit.json"];
 const BATCH_2_OPTION_SOURCES = ["opencode.option-source.fallback.json", "kimi.option-source.fallback.json", "gemini.option-source.json"];
 const fixture = (name: string) => JSON.parse(readFileSync(`${ROOT}fixtures/${name}`, "utf8")) as Record<string, unknown>;
 
@@ -163,15 +163,16 @@ test("batch 2 fixtures conform to the contract and render with the base renderer
   }
 });
 
-// Batch 3a (Codex, Grok): the first served forms that list client capabilities,
-// the option sources that carry `option_source.status`, and the hand-written
-// `choice.labels` sample. The server-produced files are byte-locked by
+// Batch 3a (Codex, Grok): served forms (which list neither `choice.labels` nor
+// `option_source.status`: both are always on), the option sources that carry
+// `option_source.status`, and the hand-written `choice.labels` sample (which
+// still lists the reserved name; clients accept it). The server-produced files are byte-locked by
 // packages/server/src/services/runtimeFormV2Fixtures.test.ts; the hand-written
 // samples are byte-locked here.
 const BATCH_3A_FORMS: Record<string, string[]> = {
-  "codex.form.json": ["select.custom_value", "choice.labels", "option_source.status"],
-  "codex.edit.json": ["select.custom_value", "choice.labels", "option_source.status"],
-  "grok.form.json": ["choice.labels", "option_source.status"],
+  "codex.form.json": ["select.custom_value"],
+  "codex.edit.json": ["select.custom_value"],
+  "grok.form.json": [],
   "choices.form.json": ["choice.labels"],
 };
 const BATCH_3A_SOURCES: Record<string, { status?: string; reason?: string; retryable?: boolean; custom?: boolean }> = {
@@ -207,20 +208,27 @@ test("batch 3a fixtures conform to the contract and declare exactly the capabili
 });
 
 // Batch 3b (Claude, Cursor, Copilot): server-produced, byte-locked by the
-// server's fixtures test. Each form lists only the capabilities it uses.
+// server's fixtures test. Each form lists only select.custom_value where it uses
+// it; choices (choice.labels) follow the reasoning effort, never the list.
 const BATCH_3B_FORMS: Record<string, string[]> = {
-  "claude.form.json": ["select.custom_value", "choice.labels", "option_source.status"],
-  "claude.edit.json": ["select.custom_value", "choice.labels", "option_source.status"],
-  "cursor.form.json": ["select.custom_value", "option_source.status"],
-  "cursor.edit.json": ["select.custom_value", "option_source.status"],
+  "claude.form.json": ["select.custom_value"],
+  "claude.edit.json": ["select.custom_value"],
+  "cursor.form.json": ["select.custom_value"],
+  "cursor.edit.json": ["select.custom_value"],
   // Copilot CLI is deprecated: edit-only, so it ships an edit fixture and no create form.
-  "copilot.edit.json": ["select.custom_value", "choice.labels", "option_source.status"],
+  "copilot.edit.json": ["select.custom_value"],
+  // Antigravity (catalog-deprecated, revived on the OAR host): the same live-list form.
+  "antigravity.edit.json": ["select.custom_value"],
 };
+// Forms with a reasoning effort, whose choices carry labels.
+const BATCH_3B_CHOICES = new Set(["claude.form.json", "claude.edit.json", "copilot.edit.json", "antigravity.edit.json"]);
 const BATCH_3B_SOURCES: Record<string, { status?: string; reason?: string; retryable?: boolean; custom: boolean; efforts: boolean }> = {
   "claude.option-source.provider.json": { custom: false, efforts: false },
   "claude.option-source.fallback.json": { status: "fallback", reason: "machine_offline", retryable: true, custom: true, efforts: true },
   "cursor.option-source.fallback.json": { status: "fallback", reason: "missing_config", retryable: false, custom: true, efforts: false },
   "copilot.option-source.live.json": { status: "live", custom: true, efforts: true },
+  "claude.option-source.live.json": { status: "live", custom: true, efforts: true },
+  "antigravity.option-source.live.json": { status: "live", custom: true, efforts: true },
 };
 
 test("batch 3b fixtures conform to the contract and declare exactly the capabilities they use", () => {
@@ -231,7 +239,7 @@ test("batch 3b fixtures conform to the contract and declare exactly the capabili
     assert.ok(parsed, name);
     assert.deepEqual(parsed.requiredClientCapabilities, capabilities, name);
     assert.deepEqual(parsed.blockingFieldKeys, [], name);
-    assert.equal(parsed.fields.some((field) => field.choices), capabilities.includes("choice.labels"), `${name}: choices iff choice.labels`);
+    assert.equal(parsed.fields.some((field) => field.choices), BATCH_3B_CHOICES.has(name), `${name}: choices on the reasoning effort`);
     if (name.endsWith(".edit.json")) assert.ok(parsed.values, name);
   }
   assert.equal(JSON.stringify(fixture("claude.edit.json")).includes("fixture-secret-must-not-appear"), false);
@@ -246,6 +254,20 @@ test("batch 3b fixtures conform to the contract and declare exactly the capabili
       assert.equal(Array.isArray(option.supportedReasoningEfforts), expected.efforts, `${name} ${String(option.value)}`);
     }
   }
+});
+
+test("unavailableOptions: Claude's live source keeps unusable models out of `options`, which every older client offers", () => {
+  const body = fixture("claude.option-source.live.json") as { options: Array<{ value: string }>; unavailableOptions: Array<{ value: string; label: string; reason?: string }> };
+  assert.equal(violation(body, { $ref: "#/$defs/OptionSource" }, ""), null);
+  const listed = new Set(body.options.map((option) => option.value));
+    for (const option of body.unavailableOptions) assert.ok(!listed.has(option.value), option.value);
+  assert.deepEqual(body.unavailableOptions[0], { value: "claude-opus-9", label: "Claude Opus 9", reason: "Update Claude Code to use this model" });
+  // Only the runtime's own disabled models: never bundled models its list lacks.
+  assert.deepEqual(body.unavailableOptions.map((option) => option.value), ["claude-opus-9"]);
+  assert.match(violation({ ...body, unavailableOptions: [{ label: "no value" }] }, { $ref: "#/$defs/OptionSource" }, "") ?? "", /value: required/);
+  // No fallback source carries it: the bundled list is not the Computer's.
+  assert.ok(!("unavailableOptions" in fixture("claude.option-source.fallback.json")));
+  assert.match(readFileSync(`${ROOT}generated/kotlin/RuntimeFormV2.kt`, "utf8"), /val unavailableOptions: List<RuntimeFormV2UnavailableOption>\? = null,/);
 });
 
 test("the status vocabulary is closed in the contract: an unknown status or reason is not a valid server body", () => {
@@ -268,4 +290,50 @@ test("hand-written batch 3a samples are byte-locked (change them only with a cli
     form: "75fd1a7a157898bb4b5bbaa2b7f097cd7891b76a694e8d71e8f38a5637808417",
     source: "26f822b3c7d10d6d678c9e83a7833bd2639222d9b1c66621273690cea270bc4e",
   });
+});
+
+// Protocol v3 (`*.v3.json`): server-produced, byte-locked by
+// packages/server/src/services/runtimeFormV3Fixtures.test.ts. v3 forms carry
+// rules (never visibility), a revision, no capabilities, no x-optionsFrom or
+// x-connectionOwned; v3 sources never put an unavailable option in `options`.
+const V3_FORMS = [
+  "builtin.form.v3.json", "builtin.form.saved-connections.v3.json", "builtin.edit.connection-unavailable.v3.json",
+  "codex.form.v3.json", "codex.edit.v3.json", "grok.form.v3.json", "claude.form.v3.json", "claude.edit.v3.json",
+  "copilot.edit.v3.json", "kimi-sdk.form.v3.json", "kimi-sdk.edit.v3.json", "pi.form.v3.json", "pi.edit.v3.json",
+  "antigravity.edit.v3.json",
+];
+const V3_SOURCES = [
+  "builtin.option-source.provider.saved-connections.v3.json", "codex.option-source.reasoning-effort.v3.json",
+  "claude.option-source.reasoning-effort.v3.json", "kimi-sdk.option-source.reasoning-effort.v3.json",
+  "pi.option-source.reasoning-effort.v3.json", "pi.option-source.provider-reasoning-effort.v3.json",
+  "antigravity.option-source.reasoning-effort.v3.json",
+];
+
+test("v3 fixtures conform to the contract and parse as protocol 3 with nothing unsupported", () => {
+  for (const name of V3_FORMS) {
+    const body = fixture(name) as Record<string, unknown> & { uiSchema: Record<string, unknown>; dataSchema: { properties: Record<string, Record<string, unknown>> } };
+    assert.equal(violation(body, { $ref: "#/$defs/Definition" }, name), null);
+    assert.equal(body.protocolVersion, 3, name);
+    assert.ok(typeof body.revision === "string" && body.revision, `${name}: revision`);
+    assert.equal("requiredClientCapabilities" in body, false, name);
+    assert.equal("visibility" in body.uiSchema, false, name);
+    for (const [key, property] of Object.entries(body.dataSchema.properties)) {
+      assert.equal("x-optionsFrom" in property, false, `${name}/${key}`);
+      assert.equal("x-connectionOwned" in property, false, `${name}/${key}`);
+    }
+    const parsed = parseRuntimeFormV2(body);
+    assert.ok(parsed, name);
+    assert.equal(parsed.protocolVersion, 3);
+    assert.deepEqual(parsed.requiredClientCapabilities, [], name);
+    assert.deepEqual(parsed.blockingFieldKeys, [], name);
+    assert.ok(!parsed.fields.some((field) => field.kind === "derived_select"), `${name}: no derived_select on v3`);
+  }
+  for (const name of V3_SOURCES) {
+    const body = fixture(name) as Record<string, unknown>;
+    assert.equal(violation(body, { $ref: "#/$defs/OptionSource" }, name), null);
+    for (const option of (body.options ?? []) as Array<Record<string, unknown>>) assert.equal("unavailable" in option, false, `${name}: ${String(option.value)}`);
+    for (const options of Object.values((body.optionsByValue ?? {}) as Record<string, Array<{ value: string; label: string }>>)) {
+      assert.deepEqual(options[0], { value: "", label: "Default" }, `${name}: the server-sent Default comes first`);
+    }
+  }
 });

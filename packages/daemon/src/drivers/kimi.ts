@@ -1,11 +1,13 @@
 import { randomUUID } from "node:crypto";
 import { spawnRuntimeChild } from "./runtimeChild";
-import { chmodSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, readFileSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { hydrateRuntimeConfig, runtimeConfigToLaunchFields, runtimeModelSourceOutcomeFromSet, type AgentConfig, type RuntimeModelInfo, type RuntimeModelSet, type RuntimeModelSourceOutcome , type AxSurfaceText } from "@botiverse/raft-shared";
 import type { RuntimeDriver, SpawnContext, SpawnResult, ParsedEvent } from "./types";
 import { buildCliTransportSystemPrompt, prepareCliTransport } from "./cliTransport";
+import { kimiToolResultOutcome } from "./kimiToolResult";
+import { OpenToolCalls } from "./openToolCalls";
 import { resolveCommandOnPath, type ProbeDeps } from "./probe";
 import {
   prepareManagedMcpRuntimeProxy,
@@ -23,6 +25,10 @@ const KIMI_AGENT_FILE = ".slock-kimi-agent.yaml";
  * Extracted so the file modes are assertable without spawning a runtime, and
  * to mirror claudeLaunch.ts's writeClaudeSystemPromptFile.
  *
+ * The system-prompt file holds the standing prompt (never the launch's first
+ * input) and is rewritten on every launch, resume included, so it is always
+ * the current one.
+ *
  * Both files are 0o600. The prompt body is Raft-authored and carries no
  * credential field, but it lands in the agent workspace and every sibling
  * prompt writer is owner-only; without an explicit mode these are created
@@ -30,14 +36,11 @@ const KIMI_AGENT_FILE = ".slock-kimi-agent.yaml";
  */
 export function writeKimiPromptFiles(
   workingDirectory: string,
-  prompt: string,
-  isResume: boolean,
+  standingPrompt: string,
 ): { systemPromptPath: string; agentFilePath: string } {
   const systemPromptPath = path.join(workingDirectory, KIMI_SYSTEM_PROMPT_FILE);
   const agentFilePath = path.join(workingDirectory, KIMI_AGENT_FILE);
-  if (!isResume || !existsSync(systemPromptPath)) {
-    writeFileSync(systemPromptPath, prompt, { encoding: "utf8", mode: 0o600 });
-  }
+  writeFileSync(systemPromptPath, standingPrompt, { encoding: "utf8", mode: 0o600 });
   writeFileSync(agentFilePath, [
     "version: 1",
     "agent:",
@@ -45,10 +48,9 @@ export function writeKimiPromptFiles(
     `  system_prompt_path: ./${KIMI_SYSTEM_PROMPT_FILE}`,
     "",
   ].join("\n"), { encoding: "utf8", mode: 0o600 });
-  // writeFileSync only applies `mode` when it CREATES the file, and on resume the
-  // prompt write above is skipped entirely. Either way a pre-existing file keeps
-  // its old 0644 — which is exactly the stock this card exists to fix, not just
-  // newly created files. chmod is idempotent (task #302).
+  // writeFileSync only applies `mode` when it CREATES the file, so a
+  // pre-existing file keeps its old 0644 — which is exactly the stock this card
+  // exists to fix, not just newly created files. chmod is idempotent (task #302).
   chmodSync(systemPromptPath, 0o600);
   chmodSync(agentFilePath, 0o600);
   return { systemPromptPath, agentFilePath };
@@ -144,6 +146,9 @@ export class KimiDriver implements RuntimeDriver {
   } as const;
   readonly session = {
     recovery: "resume_or_fresh",
+    // Emits the compaction events.
+    compaction: "reported",
+    compactionFailure: "does_not_stick",
   } as const;
   readonly model = {
     detectedModelsVerifiedAs: "launchable",
@@ -151,22 +156,27 @@ export class KimiDriver implements RuntimeDriver {
   } as const;
   readonly supportsStdinNotification = true;
   readonly busyDeliveryMode = "direct" as const;
+  /** The standing prompt goes in the `--agent-file` system prompt, so the first input is only the launch's input. */
+  readonly supportsNativeStandingPrompt = true;
 
   private sessionId: string | null = null;
   private sessionAnnounced = false;
   private promptRequestId: string | null = null;
+  private readonly openTools = new OpenToolCalls();
 
   async spawn(ctx: SpawnContext): Promise<SpawnResult> {
-    const isResume = !!ctx.config.sessionId;
     const sessionId = ctx.config.sessionId || randomUUID();
     this.sessionId = sessionId;
     this.sessionAnnounced = false;
+    this.openTools.clear();
     this.promptRequestId = randomUUID();
 
-    const { systemPromptPath, agentFilePath } = writeKimiPromptFiles(ctx.workingDirectory, ctx.prompt, isResume);
+    const { agentFilePath } = writeKimiPromptFiles(ctx.workingDirectory, ctx.standingPrompt);
     const managedMcp = await prepareManagedMcpRuntimeProxy({
       agentId: ctx.agentId,
       launchId: ctx.launchId,
+      processInstanceId: ctx.processInstanceId,
+      readTurnOrigin: ctx.readTurnOrigin,
       serverUrl: ctx.config.serverUrl,
       agentCredentialKey: ctx.config.agentCredentialKey,
     });
@@ -222,9 +232,7 @@ export class KimiDriver implements RuntimeDriver {
       id: this.promptRequestId,
       method: "prompt",
       params: {
-        user_input: isResume
-          ? ctx.prompt
-          : "Your system prompt contains your standing instructions. Follow it now and begin listening for messages.",
+        user_input: ctx.prompt,
       },
     }) + "\n");
 
@@ -271,19 +279,42 @@ export class KimiDriver implements RuntimeDriver {
           }
           break;
 
-        case "ToolCall":
+        case "ToolCall": {
+          const name = payload.function?.name || "unknown_tool";
+          const callId = typeof payload.id === "string" && payload.id ? payload.id : undefined;
+          if (callId && !this.openTools.start(callId, name)) break;
           events.push({
             kind: "tool_call",
-            name: payload.function?.name || "unknown_tool",
+            name,
             input: parseToolArguments(payload.function?.arguments),
+            ...(callId ? { callId } : {}),
           });
           break;
+        }
+
+        case "ToolResult": {
+          // Paired with its ToolCall by id; a cancelled step sends none, and
+          // the turn's end closes those.
+          const callId = typeof payload.tool_call_id === "string" ? payload.tool_call_id : "";
+          const name = callId ? this.openTools.end(callId) : undefined;
+          if (name === undefined) break;
+          const result = payload.return_value || {};
+          events.push({
+            kind: "tool_output",
+            name,
+            callId,
+            ...kimiToolResultOutcome({ isError: result.is_error, output: result.message || result.output }),
+          });
+          break;
+        }
 
         case "TurnEnd":
+          this.openTools.clear();
           events.push({ kind: "turn_end", sessionId: this.sessionId || undefined });
           break;
 
         case "StepInterrupted":
+          this.openTools.clear();
           events.push({ kind: "error", message: "Turn interrupted" });
           events.push({ kind: "turn_end", sessionId: this.sessionId || undefined });
           break;
@@ -293,6 +324,7 @@ export class KimiDriver implements RuntimeDriver {
     }
 
     if ("error" in message) {
+      this.openTools.clear();
       events.push({ kind: "error", message: message.error?.message || "Unknown Kimi error" });
       events.push({ kind: "turn_end", sessionId: this.sessionId || undefined });
     }

@@ -1,4 +1,4 @@
-import { fixturePasswordHash } from "../test/integration/credentials";
+import { accessTokenForTest, fixturePasswordHash } from "../test/integration/credentials";
 import { createApiTest } from "../test/integration/apiTest";
 import assert from "node:assert/strict";
 import { createServer as createHttpServer, type IncomingMessage } from "node:http";
@@ -6,12 +6,13 @@ import type { AddressInfo } from "node:net";
 
 import { getDb } from "../db/index";
 import { users } from "../db/schema";
-import { signAccessToken } from "../middleware/auth";
 import { resetProductFeedbackRouteBindingCacheForTest } from "../services/productFeedbackRouteBindingService";
 import {
   resetProductFeedbackBreakersForTest,
   resetProductFeedbackReporterSessionCacheForTest,
 } from "../services/productFeedbackConversationService";
+import { setProductFeedbackAppsForTest } from "../services/productFeedbackApps";
+import { setMobileFeedbackAppsForTest } from "../test/handsFeedbackStub";
 
 // Mobile diagnostics: the host uploads the zip through Hands' presign endpoint
 // and the web page submits only the reference; the server forwards it in the
@@ -81,6 +82,7 @@ async function withEnv<T>(baseUrl: string, run: () => Promise<T>): Promise<T> {
     HANDS_FEEDBACK_ROUTE_SUBJECT_KEY_ID: "v1",
     HANDS_FEEDBACK_ROUTE_SUBJECT_ROOT: Buffer.alloc(32, 1).toString("base64url"),
   });
+  setMobileFeedbackAppsForTest();
   resetProductFeedbackRouteBindingCacheForTest();
   resetProductFeedbackReporterSessionCacheForTest();
   resetProductFeedbackBreakersForTest();
@@ -92,6 +94,7 @@ async function withEnv<T>(baseUrl: string, run: () => Promise<T>): Promise<T> {
       if (value === undefined) delete process.env[key];
       else process.env[key] = value;
     }
+    setProductFeedbackAppsForTest(null);
     resetProductFeedbackRouteBindingCacheForTest();
     resetProductFeedbackReporterSessionCacheForTest();
     resetProductFeedbackBreakersForTest();
@@ -111,7 +114,7 @@ async function seedToken(): Promise<string> {
     emailVerified: true,
     profileSetupCompletedAt: new Date(),
   }).returning();
-  return signAccessToken(user!.id);
+  return accessTokenForTest(user!.id);
 }
 
 function submitForm(clientKind: string, diagnostics?: string): FormData {

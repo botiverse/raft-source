@@ -13,6 +13,7 @@ import { afterEach, beforeEach, test } from "vitest";
 
 import { createCommandContext } from "../../core/context";
 import { readObservation, recordObservation, resolveStateDbPath } from "../../state/agentLedger";
+import { readPassiveRenderCountsForTest } from "../../state/passiveRenderCountsTestReader";
 import { messageSendCommand } from "./send";
 import { DatabaseSync } from "node:sqlite";
 
@@ -191,6 +192,8 @@ test("unread messages and an unseen card come in one hold, card first", async ()
   assert.ok(out.startsWith("Held — 1 unread message in #ops."), out);
   assert.ok(out.indexOf("Channel #ops (public): Release") < out.indexOf("@richard 09:00  deploy at 5?"), out);
   assert.equal(readObservation(AGENT, "channel", "#ops")?.rev, channelCardRev(card));
+  // A hold for unread messages counts as a freshness hold, card included.
+  assert.deepEqual(readPassiveRenderCountsForTest(AGENT).map(({ kind, renders }) => ({ kind, renders })), [{ kind: "freshness_hold", renders: 1 }]);
 });
 
 test("a card that only reached JSON output is recorded, so a JSON-mode send is held once, not forever", async () => {
@@ -198,4 +201,25 @@ test("a card that only reached JSON output is recorded, so a JSON-mode send is h
   const run = harness([cardHold()]);
   await assert.rejects(async () => { await messageSendCommand.handler(run.ctx, [], { target: "#ops", json: true }); }, { code: "SEND_HELD_AS_DRAFT" });
   assert.equal(readObservation(AGENT, "channel", "#ops")?.rev, channelCardRev(card));
+});
+
+test("the hold and a card in the reply are counted for the daemon's turn report", async () => {
+  context("ctx-A");
+  const first = harness([{
+    ok: true,
+    status: 200,
+    error: null,
+    data: { ok: true, state: "held", holdReasons: ["channel_card"], newMessageCount: 0, heldMessages: [], channelCard: card },
+  }]);
+  await assert.rejects(async () => { await messageSendCommand.handler(first.ctx, [], { target: "#ops" }); }, { code: "SEND_HELD_AS_DRAFT" });
+  const held = first.out();
+  recordObservation(AGENT, "channel", "#ops", "v1:older", "ctx-A");
+  const run = harness([sent({ channelCard: card, channelCardChanged: true })]);
+  await messageSendCommand.handler(run.ctx, [], { target: "#ops" });
+  const cardText = "\nChannel #ops (public), changed since you last saw it: Release coordination. Post go/no-go here.\nEquivalent: raft channel info \"#ops\"\n";
+  assert.ok(run.out().endsWith(cardText), run.out());
+  assert.deepEqual(readPassiveRenderCountsForTest(AGENT), [
+    { contextId: "ctx-A", kind: "card_hold", renders: 1, chars: Array.from(held).length, bytes: Buffer.byteLength(held, "utf8") },
+    { contextId: "ctx-A", kind: "channel_card", renders: 1, chars: cardText.length, bytes: cardText.length },
+  ]);
 });

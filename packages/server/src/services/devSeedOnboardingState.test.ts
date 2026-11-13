@@ -11,7 +11,7 @@ import { getDb } from "../db/index";
 import { serverMembers, users } from "../db/schema";
 import { createServer } from "./serverService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 const NOW = new Date("2026-07-21T00:00:00.000Z");
 

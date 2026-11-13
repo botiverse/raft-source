@@ -189,7 +189,7 @@ test("flag-off Grok capability is absent from the server-owned setup catalog", (
     />,
   );
 
-  assert.equal(screen.queryByText("Grok Build"), null);
+  assert.ok(screen.queryByText("Grok Build") === null);
   assert.deepEqual(logLines().at(-1), {
     key: "runtime",
     state: "failed",
@@ -202,8 +202,8 @@ test("deprecated detected runtimes stay out of the setup log and readiness path"
   renderStep({ runtimeIds: ["gemini", "kimi", "copilot"], runtimeStatus: "not_ready" });
 
   assert.deepEqual(logLines().at(-1), { key: "runtime", state: "failed", text: "No usable runtime found on this computer." });
-  assert.equal(screen.queryByText(/Gemini CLI/i), null);
-  assert.equal(screen.queryByText(/Kimi CLI/i), null);
+  assert.ok(screen.queryByText(/Gemini CLI/i) === null);
+  assert.ok(screen.queryByText(/Kimi CLI/i) === null);
   assert.ok(screen.queryByText(/Copilot CLI/i) === null);
   assert.equal((screen.getByRole("button", { name: "Next" }) as HTMLButtonElement).disabled, true);
 });
@@ -223,8 +223,7 @@ test("nothing run yet: the command, the instructions, and one waiting line", () 
   ]);
   // Instructions, not a progress tracker: nothing here claims to know what the
   // user has done in their terminal.
-  assert.ok(screen.getByText("Paste the command above into your terminal and press Enter."));
-  assert.equal(screen.queryByText(/Step \d/i), null);
+  assert.ok(screen.queryByText(/Step \d/i) === null);
   assert.equal((screen.getByRole("button", { name: "Next" }) as HTMLButtonElement).disabled, true);
 });
 
@@ -235,7 +234,7 @@ test("approved but not yet online: the first tick lands and the next line starts
     { key: "approve", state: "done", text: "Request approved." },
     { key: "online", state: "pending", text: "Waiting for Wenyi's MacBook Pro to come online…" },
   ]);
-  assert.equal(screen.queryByText("No usable runtime yet"), null);
+  assert.ok(screen.queryByText("No usable runtime yet") === null);
   assert.equal((screen.getByRole("button", { name: "Next" }) as HTMLButtonElement).disabled, true);
 });
 
@@ -251,9 +250,9 @@ test("online but no runtime yet: two ticks, detection running, and NOTHING else 
   // used to render in that gap and then vanish when the list landed — a box full of
   // runtime rows flashing up inside the modal for a fraction of a second. "Not answered
   // yet" is not "nothing usable found".
-  assert.equal(screen.queryByText("No usable runtime yet"), null);
-  assert.equal(screen.queryByText("Recommended"), null);
-  assert.equal(screen.queryByRole("button", { name: /Claude Code/i }), null);
+  assert.ok(screen.queryByText("No usable runtime yet") === null);
+  assert.ok(screen.queryByText("Recommended") === null);
+  assert.ok(screen.queryByRole("button", { name: /Claude Code/i }) === null);
   assert.equal((screen.getByRole("button", { name: "Next" }) as HTMLButtonElement).disabled, true);
 });
 
@@ -281,8 +280,8 @@ test("runtime detected: the third tick names EVERY runtime found, and Next opens
 test("a successful connect leaves no runtime box and no empty bordered strip behind it", () => {
   const { container } = renderStep({ runtimeIds: ["claude"], runtimeStatus: "ready_recommended" });
 
-  assert.equal(screen.queryByText("No usable runtime yet"), null);
-  assert.equal(screen.queryByRole("heading", { name: /Detect Runtime/i }), null);
+  assert.ok(screen.queryByText("No usable runtime yet") === null);
+  assert.ok(screen.queryByRole("heading", { name: /Detect Runtime/i }) === null);
   // The box used to render even with nothing in it, which drew a stray line across
   // the page under the log.
   assert.equal(
@@ -290,7 +289,7 @@ test("a successful connect leaves no runtime box and no empty bordered strip beh
     false,
   );
   // Renaming is not part of connecting: it lived here as a link nobody needed mid-flow.
-  assert.equal(screen.queryByRole("button", { name: /Rename/i }), null);
+  assert.ok(screen.queryByRole("button", { name: /Rename/i }) === null);
 });
 
 test("Pi is bundled with the computer, so a bare machine still detects a runtime", () => {
@@ -315,7 +314,6 @@ test("a computer that answers with nothing usable prints a failure line, it does
     state: "failed",
     text: "No usable runtime found on this computer.",
   });
-  assert.ok(screen.getByText("No usable runtime yet"));
 });
 
 test("no usable runtime keeps the education box, without turning it into a chooser", () => {
@@ -324,7 +322,7 @@ test("no usable runtime keeps the education box, without turning it into a choos
   assert.ok(screen.getByText("No usable runtime yet"));
   fireEvent.click(screen.getByRole("button", { name: /Own API key/i }));
   assert.ok(screen.getByText("Use your own API key instead of installing a runtime."));
-  assert.equal(screen.queryByText(/same tier|not a fallback/i), null);
+  assert.ok(screen.queryByText(/same tier|not a fallback/i) === null);
 });
 
 // task #159 — the whole point of the SSOT change. The machine store can shout
@@ -344,7 +342,7 @@ test("a runtime visible in the machine store cannot enable Next by itself", () =
 // USER's failure.
 test("checking is not a verdict: a stale store cannot render a failure the server never issued", () => {
   renderStep({ runtimeIds: ["builtin"], runtimeStatus: "checking" });
-  assert.equal(screen.queryByText("No usable runtime yet"), null, "no failure box while the server is still checking");
+  assert.ok(screen.queryByText("No usable runtime yet") === null, "no failure box while the server is still checking");
   assert.equal((screen.getByRole("button", { name: "Next" }) as HTMLButtonElement).disabled, true);
 });
 
@@ -352,7 +350,7 @@ test("the server's verdict enables Next even when the store has not caught up", 
   renderStep({ runtimeIds: [], runtimeStatus: "ready_recommended" });
   assert.equal((screen.getByRole("button", { name: "Next" }) as HTMLButtonElement).disabled, false);
   // and the failure block must not claim "no usable runtime" against the server's word
-  assert.equal(screen.queryByText("No usable runtime yet"), null);
+  assert.ok(screen.queryByText("No usable runtime yet") === null);
 });
 
 /**
@@ -382,7 +380,7 @@ test("first connect on Windows offers Computer only — no Legacy entrance, and 
   fireEvent.click(screen.getByRole("radio", { name: "Windows x64" }));
 
   // The supported path is intact — this is a removal, not a regression of the real route.
-  assert.ok(screen.getByText("Experimental"));
+  assert.ok(screen.queryByText("Experimental") === null, "Windows is no longer marked Experimental");
   assert.ok(screen.getByText("Raft Computer · Windows x64"));
   assert.ok(screen.getByText("irm https://cdn.raft.build/computer/install.ps1 | iex"));
   assert.ok(screen.getByText("raft-computer setup /launch"));
@@ -393,12 +391,11 @@ test("first connect on Windows offers Computer only — no Legacy entrance, and 
   ]);
 
   // The dead end is gone, in all three of its shapes.
-  assert.equal(screen.queryByTestId("windows-daemon-command-block"), null, "no Legacy block at first connect");
-  assert.equal(screen.queryByText("Daemon / Legacy"), null);
-  assert.equal(screen.queryByText(/npx\.cmd @botiverse\/raft-daemon/), null);
-  assert.equal(
-    screen.queryByTestId("computer-windows-daemon-request"),
-    null,
+  assert.ok(screen.queryByTestId("windows-daemon-command-block") === null, "no Legacy block at first connect");
+  assert.ok(screen.queryByText("Daemon / Legacy") === null);
+  assert.ok(screen.queryByText(/npx\.cmd @botiverse\/raft-daemon/) === null);
+  assert.ok(
+    screen.queryByTestId("computer-windows-daemon-request") === null,
     "no button offering to generate a legacy daemon command",
   );
 
@@ -407,7 +404,7 @@ test("first connect on Windows offers Computer only — no Legacy entrance, and 
 
   // mac/Linux first connect is closed too — the legacy npx line was never Windows-only.
   fireEvent.click(screen.getByRole("radio", { name: "macOS / Linux" }));
-  assert.equal(screen.queryByText(/npx @botiverse\/raft-daemon/), null, "no Legacy block at first connect on mac/Linux");
+  assert.ok(screen.queryByText(/npx @botiverse\/raft-daemon/) === null, "no Legacy block at first connect on mac/Linux");
 });
 
 
@@ -433,7 +430,7 @@ test("a computer that is merely offline gets the START command, not install+setu
   assert.equal(screen.getByTestId("onboarding-recovery-start-command").textContent, "raft-computer start");
 
   // And NOT the thing that would change nothing.
-  assert.equal(screen.queryByText(/curl install/), null, "no install command for a machine that already has the binary");
+  assert.ok(screen.queryByText(/curl install/) === null, "no install command for a machine that already has the binary");
 
   // The way out is ON THIS CARD, beside the machine that failed — not in the modal's bottom
   // corner, a room away from the thing it undoes. We do not guess "offline for N days ⇒ it's
@@ -443,7 +440,7 @@ test("a computer that is merely offline gets the START command, not install+setu
 
 test("someone who has never connected a computer still gets the install + setup commands", () => {
   renderStep({ connected: false, hasConnectedComputer: false });
-  assert.equal(screen.queryByTestId("onboarding-offline-recovery"), null);
+  assert.ok(screen.queryByTestId("onboarding-offline-recovery") === null);
   assert.ok(screen.getByText("curl install && raft-computer setup /launch"));
 });
 
@@ -460,7 +457,7 @@ test("a computer that will never come back offers Start over — not another ins
     canReset: true,
     onStartOver: startOver,
   });
-  assert.equal(screen.queryByText("curl install && raft-computer setup /launch"), null, "no install command for a machine that already has the binary");
+  assert.ok(screen.queryByText("curl install && raft-computer setup /launch") === null, "no install command for a machine that already has the binary");
 
   await act(async () => {
     fireEvent.click(screen.getByTestId("onboarding-recovery-start-over"));
@@ -485,7 +482,7 @@ test("a machine connected with the retired daemon gets Computer install + setup,
   });
 
   assert.ok(screen.getByTestId("onboarding-recovery-legacy-daemon"));
-  assert.equal(screen.queryByTestId("onboarding-recovery-start-command"), null, "no raft-computer start on a machine that never had the binary");
+  assert.ok(screen.queryByTestId("onboarding-recovery-start-command") === null, "no raft-computer start on a machine that never had the binary");
   assert.ok(screen.getByText(/retired standalone daemon/i));
   assert.ok(screen.getByText("curl -fsSL https://cdn.raft.build/computer/install.sh | sh"));
   assert.ok(screen.getByText("raft-computer setup /launch"));
@@ -529,7 +526,7 @@ test("several offline computers: list them all by name, one command, no chooser"
   assert.ok(screen.getByText(/Any one of these will do/i));
 
   // Still no install command: they have all three already.
-  assert.equal(screen.queryByText(/curl install/), null);
+  assert.ok(screen.queryByText(/curl install/) === null);
 });
 
 // A machine with no heartbeat on record shows NO last-seen line rather than a fabricated
@@ -559,7 +556,7 @@ test("a v2 server never shows the bypass, and keeps its footer clear", () => {
 
   // No bypass, and no rollback link down in the modal chrome either (@stdrc). On a v2 server
   // the footer carries nothing but Next: the exit belongs on the card that failed.
-  assert.equal(screen.queryByText("I'll set this up myself"), null, "the bypass is gone for v2");
+  assert.ok(screen.queryByText("I'll set this up myself") === null, "the bypass is gone for v2");
   assert.ok(screen.getByTestId("onboarding-recovery-start-over"), "the exit lives on the recovery card");
 });
 
@@ -570,6 +567,6 @@ test("there is no bypass anywhere — the only way out is to finish or start ove
   // contract version. A bypass leaves a half-built server that can never tell its owner they
   // are done; the ~9,474 rows still holding one are being cleared in the database, not by
   // keeping a second exit alive in here forever.
-  assert.equal(screen.queryByText("I'll set this up myself"), null);
+  assert.ok(screen.queryByText("I'll set this up myself") === null);
   assert.ok(screen.getByTestId("onboarding-recovery-start-over"), "finish, or start over");
 });

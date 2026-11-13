@@ -1,6 +1,6 @@
 import { createApiTest } from "../test/integration/apiTest";
 import assert from "node:assert/strict";
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 import {
   classifyHands404,
@@ -274,8 +274,8 @@ test("route: the chooser hand-off never overrides a device we DO recognise", asy
   const iphone = await callRoute("", { "user-agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0) Safari/604" }, () =>
     jsonResponse(200, { build: {}, assets: [] }));
   assert.ok(
-    iphone.location?.startsWith("https://testflight.apple.com/"),
-    `an iPhone must still go straight to TestFlight, got ${iphone.location}`,
+    iphone.location?.startsWith("https://apps.apple.com/"),
+    `an iPhone must still go straight to the App Store, got ${iphone.location}`,
   );
 });
 
@@ -337,7 +337,7 @@ test("mount: the entry point is reachable without a session", async ({ app }) =>
   }
 });
 
-test("route: iOS goes to TestFlight, never to the Hands .ipa", async () => {
+test("route: iOS goes to the App Store, never to the Hands .ipa", async () => {
   // Hands does hold a raft-ios release, but its asset is an .ipa and stock iOS
   // cannot install one. Redirecting there would be a download that silently
   // does nothing — the exact failure this route exists to prevent. If this ever
@@ -348,11 +348,27 @@ test("route: iOS goes to TestFlight, never to the Hands .ipa", async () => {
       assets: [{ platform: "ios", filetype: "ipa", download_url: "https://r2.example/app.ipa" }],
     }));
   assert.equal(result.status, 302);
-  assert.ok(
-    result.location?.startsWith("https://testflight.apple.com/"),
-    `iOS must land on TestFlight, got ${result.location}`,
+  assert.equal(
+    result.location,
+    "https://apps.apple.com/app/id6789091965",
+    "iOS must land on the App Store listing (primary since the app went live there)",
   );
   assert.ok(!result.location?.includes("hands.build"), "iOS must not be sent to a Hands artifact");
+});
+
+test("route: ios-beta still goes to the TestFlight beta, for old QR codes and links", async () => {
+  // The App Store is primary; TestFlight stays reachable only by asking for it
+  // explicitly. It must not touch Hands (no lookup at all) and must not be
+  // reachable by UA: no device resolves to the beta on its own.
+  let handsCalls = 0;
+  const result = await callRoute("?platform=ios-beta", { "user-agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0) Safari/604" }, () => {
+    handsCalls += 1;
+    return jsonResponse(200, { build: {}, assets: [] });
+  });
+  assert.equal(result.status, 302);
+  assert.equal(result.location, "https://testflight.apple.com/join/JvM5wXuc");
+  assert.equal(handsCalls, 0, "the beta is an Apple-side link, not a Hands lookup");
+  assert.equal(isMobilePlatform("ios-beta"), false, "ios-beta is not a device family");
 });
 
 test("android prefers the APK over the store bundle, in either order", async () => {

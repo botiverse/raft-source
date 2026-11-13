@@ -22,7 +22,7 @@ import { updateChannelForAgent } from "./agentChannelUpdate";
 // projection and members are untouched, or updated together where the state
 // is shared (name, archive).
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 async function setupJoint(app: { baseUrl: string }, label: string) {
   const suffix = randomUUID().slice(0, 8);
@@ -78,6 +78,7 @@ test("an agent can leave a joint channel without touching the other server's mem
     agentId: f.agent.id,
     scopes: ["channels"],
     name: "joint-leave-test",
+    issuedVia: "computer",
     createdByUserId: null,
   });
   // The test orchestrator has no inbox; record the purge the route requests.
@@ -99,7 +100,7 @@ test("an agent can leave a joint channel without touching the other server's mem
   assert.equal(await isChannelHuman(f.targetProjectionId, f.targetOwner.id), true);
 });
 
-test("an admin agent adds and removes its own server's members in a joint channel, but not the other server's", async ({ app }) => {
+test("an admin agent of the host adds its own server's members to a joint channel, never the other server's, and removes members", async ({ app }) => {
   const f = await setupJoint(app, "joint-members");
   const suffix = randomUUID().slice(0, 8);
   const hostMember = await seedUser(`joint-members-local-${suffix}@slock.test`, `joint-members-local-${suffix}`);
@@ -125,15 +126,6 @@ test("an admin agent adds and removes its own server's members in a joint channe
   assert.notEqual(crossServer.status, 200);
   assert.equal(await isChannelHuman(f.hostProjectionId, f.targetOwner.id), false);
 
-  // Nor can it remove the other server's members from the shared channel.
-  const crossServerRemove = await removeChannelMemberForAgent({
-    actor: f.actor,
-    serverId: f.hostServer.id,
-    channelId: f.hostProjectionId,
-    body: { userId: f.targetOwner.id },
-  });
-  assert.notEqual(crossServerRemove.status, 200);
-  assert.equal(await isChannelHuman(f.targetProjectionId, f.targetOwner.id), true);
 
   const removed = await removeChannelMemberForAgent({
     actor: f.actor,
@@ -232,6 +224,7 @@ test("an agent's joint member listing names every server a person takes part thr
     agentId: f.agent.id,
     scopes: ["channels"],
     name: "joint-badges-test",
+    issuedVia: "computer",
     createdByUserId: null,
   });
 
@@ -239,11 +232,64 @@ test("an agent's joint member listing names every server a person takes part thr
     headers: { Authorization: `Bearer ${credential.apiKey}` },
   });
   assert.equal(res.status, 200, await res.clone().text());
-  const body = await res.json() as { humans: Array<{ name: string; servers?: Array<{ name: string; slug: string; yours?: true }> }> };
+  const body = await res.json() as { humans: Array<{ name: string; role?: string; servers?: Array<{ name: string; slug: string; yours?: true }> }> };
   const byName = new Map(body.humans.map((human) => [human.name, human]));
-  const host = { name: f.hostServer.name, slug: f.hostServer.slug, yours: true };
   const target = { name: f.targetServer.name, slug: f.targetServer.slug };
-  assert.deepEqual(byName.get(dual.name)?.servers, [host, target], "own server first and marked yours, then the peer");
+  // Already in through the host: adding them through the target records no second source.
+  assert.equal(byName.get(dual.name)?.servers, undefined, "the current entry is omitted; no other source");
   assert.deepEqual(byName.get(f.targetOwner.name)?.servers, [target], "a peer-only person names the peer server");
   assert.equal(byName.get(f.hostOwner.name)?.servers, undefined, "a person only on the agent's server is listed as before");
+  // No server role is public in a joint roster (computed membership): not
+  // even the agent's own server's owner shows one.
+  assert.equal("role" in (byName.get(f.targetOwner.name) ?? {}), false);
+});
+
+test("an admin agent that is not in a joint channel cannot add members to it, same as a human admin (#wg-rbac B6)", async ({ app }) => {
+  const f = await setupJoint(app, "jua");
+  const suffix = randomUUID().slice(0, 8);
+  const outsider = await createAgent(f.hostServer.id, `jua-admin-${suffix}`, { runtime: "codex" });
+  await getDb().update(serverAgentMembers).set({ role: "admin" }).where(and(
+    eq(serverAgentMembers.serverId, f.hostServer.id),
+    eq(serverAgentMembers.agentId, outsider.id),
+  ));
+  const hostMember = await seedUser(`joint-unjoined-local-${suffix}@slock.test`, `joint-unjoined-local-${suffix}`);
+  await addMember(f.hostServer.id, hostMember.id, "member");
+
+  const refused = await addChannelMemberForAgent({
+    actor: { id: outsider.id, name: outsider.name, serverId: f.hostServer.id },
+    serverId: f.hostServer.id,
+    channelId: f.hostProjectionId,
+    body: { userId: hostMember.id },
+  });
+  assert.equal(refused.status, 404, JSON.stringify(refused.body));
+  assert.equal(await isChannelHuman(f.hostProjectionId, hostMember.id), false);
+});
+
+test("a joint roster shows another server's people and agents without their roles", async ({ app }) => {
+  const f = await setupJoint(app, "joint-roles");
+  type RosterRow = { id: string; serverRole?: string | null; channelRole?: string | null; role?: string | null; effectiveChannelRole?: string; channelAdminBasis?: string | null };
+  const roster = async (owner: { email: string }, serverId: string, channelId: string) => {
+    const res = await fetch(`${app.baseUrl}/api/channels/${channelId}/members`, { headers: headers(await tokenForHuman(owner.email), serverId) });
+    assert.equal(res.status, 200, await res.clone().text());
+    const body = await res.json() as { agents: RosterRow[]; humans: RosterRow[] };
+    return { agents: new Map(body.agents.map((row) => [row.id, row])), humans: new Map(body.humans.map((row) => [row.id, row])) };
+  };
+
+  // The target server's owner reads: the host's admin agent and owner are
+  // another organization's, so they read as plain members.
+  const fromTarget = await roster(f.targetOwner, f.targetServer.id, f.targetProjectionId);
+  const peerAgent = fromTarget.agents.get(f.agent.id);
+  assert.deepEqual(
+    [peerAgent?.serverRole, peerAgent?.channelRole, peerAgent?.effectiveChannelRole, peerAgent?.channelAdminBasis],
+    [null, null, "member", null],
+  );
+  const peerOwner = fromTarget.humans.get(f.hostOwner.id);
+  // No foreign role; the host's owner manages the channel, which every copy shows.
+  assert.deepEqual([peerOwner?.role, peerOwner?.serverRole, peerOwner?.effectiveChannelRole], [null, null, "admin"]);
+
+  // The host reads its own agent and owner with their roles.
+  const fromHost = await roster(f.hostOwner, f.hostServer.id, f.hostProjectionId);
+  assert.equal(fromHost.agents.get(f.agent.id)?.effectiveChannelRole, "admin");
+  // The host's owner manages the channel: shown as its admin.
+  assert.equal(fromHost.humans.get(f.hostOwner.id)?.effectiveChannelRole, "admin");
 });

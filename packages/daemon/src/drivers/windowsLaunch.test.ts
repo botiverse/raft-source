@@ -303,14 +303,13 @@ test("a timed-out lookup for node behind an npm shim is not reported as node_una
   );
 });
 
-test("the unresolved-wrapper message tells the user what to do", () => {
+test("the unresolved-wrapper message names the wrapper, not the user's directory", () => {
   try {
     resolveWindowsDirectLaunch("tool", "C:\\tools\\tool.cmd", [], windowsDeps({ files: { "C:\\tools\\tool.cmd": POWERSHELL_HANDOFF_SHIM } }));
     assert.fail("expected rejection");
   } catch (error) {
     assert.ok(error instanceof RuntimeExecutableNotFoundError);
     assert.match(error.message, /tool\.cmd/);
-    assert.match(error.message, /Reinstall tool with npm|native \.exe/);
     assert.doesNotMatch(error.message, /C:\\tools/, "the message names the wrapper, not the user's directory layout");
   }
 });

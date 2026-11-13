@@ -15,6 +15,7 @@ import {
   DEFAULT_WAKE_CRASH_LOOP_RULES,
   InMemoryWakeCrashLoopStateStore,
   applyWakeCrashLoopStart,
+  wakeCrashLoopRefusesAutomaticStart,
   freshWakeCrashLoopEpisode,
   type WakeCrashLoopEpisodeState,
   type WakeCrashLoopRules,
@@ -205,7 +206,7 @@ export function decideCombinedClaim(
   input: CombinedClaimInput,
   rules: WakeCrashLoopRules = DEFAULT_WAKE_CRASH_LOOP_RULES,
 ): CombinedDecision {
-  if (!input.human && wake.state.blocked) return { kind: "refuse", result: { ok: false, reason: "wake_crash_loop_blocked" } };
+  if (!input.human && wakeCrashLoopRefusesAutomaticStart(wake.state, input.nowMs)) return { kind: "refuse", result: { ok: false, reason: "wake_crash_loop_blocked" } };
   const claim = claimTerminalStart(terminal.state, input);
   if (!claim.ok) return { kind: "refuse", result: { ok: false, reason: claim.reason } };
   const crashLoopLaunchId = input.crashLoopLaunchId !== undefined ? input.crashLoopLaunchId : input.launchId;

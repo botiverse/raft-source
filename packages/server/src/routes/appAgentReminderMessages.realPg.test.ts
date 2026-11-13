@@ -34,7 +34,7 @@ function barrier(parties: number) {
   };
 }
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 const REAL_PG_URL = process.env.APP_AGENT_REMINDER_REAL_PG_URL;
 const REAL_PG_REQUIRED = process.env.APP_AGENT_REMINDER_REAL_PG_REQUIRED === "1";
@@ -53,7 +53,6 @@ async function withRealPgApp(run: (app: TestApp, deliveries: Array<{ agentId: st
   }
   const app = await openTestApp(REAL_PG_URL, 0, {
     humanActivityMuteFlagDefaultEnabled: true,
-    onboardingOpenerFlagDefaultEnabled: false,
     skipAuthRateLimit: true,
   });
   const deliveries: Array<{ agentId: string; message: AgentMessage }> = [];

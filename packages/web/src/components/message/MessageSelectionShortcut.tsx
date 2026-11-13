@@ -1,7 +1,11 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { Copy, TextQuote } from "lucide-react";
-import { Separator } from "@botiverse/raft-ui";
+import {
+  TextSelectionToolbar,
+  TextSelectionToolbarButton,
+  TextSelectionToolbarSeparator,
+} from "@botiverse/raft-ui";
 import { useIntl } from "react-intl";
 import { useSelectionStore } from "../../store/selectionStore";
 import { emitSelectedTextQuote } from "./selectedTextQuote";
@@ -12,10 +16,9 @@ import {
 import type {
   MessageSelectionShortcutTarget,
 } from "./messageSelectionShortcutUtils";
+import { useShortcutLayer } from "../../features/shortcuts/useShortcutLayer";
 
-const SHORTCUT_ESTIMATED_SIZE = { width: 124, height: 32 };
-// DS Menu item, laid out in a row: hover / keyboard highlight is yellow-soft.
-const SELECTION_SHORTCUT_ITEM_CLASS = "flex h-7 items-center gap-1.5 rounded-control px-2 text-foreground outline-none hover:bg-brand-soft focus-visible:bg-brand-soft";
+const SHORTCUT_ESTIMATED_SIZE = { width: 140, height: 32 };
 const MESSAGE_ACTION_SELECTOR = [
   "button",
   "a",
@@ -132,7 +135,6 @@ export default function MessageSelectionShortcut() {
     setTarget(nextTarget);
     setPosition(placeMessageSelectionShortcut({
       anchorRect: nextTarget.anchorRect,
-      avoidRect: nextTarget.selectionRect,
       floatingSize: SHORTCUT_ESTIMATED_SIZE,
       viewport: viewport(),
     }));
@@ -211,27 +213,23 @@ export default function MessageSelectionShortcut() {
       if (isShortcutTarget(event.target)) return;
       close();
     };
-    const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") close();
-    };
     const handleViewportChange = () => close();
 
     document.addEventListener("pointerdown", handlePointerDown, true);
-    // keydown-global-exempt: Escape closes the non-modal selection shortcut.
-    document.addEventListener("keydown", handleKeyDown, true);
     window.addEventListener("scroll", handleViewportChange, { capture: true, passive: true });
     window.addEventListener("resize", handleViewportChange);
     window.visualViewport?.addEventListener("resize", handleViewportChange);
     window.visualViewport?.addEventListener("scroll", handleViewportChange, { passive: true });
     return () => {
       document.removeEventListener("pointerdown", handlePointerDown, true);
-      document.removeEventListener("keydown", handleKeyDown, true);
       window.removeEventListener("scroll", handleViewportChange, true);
       window.removeEventListener("resize", handleViewportChange);
       window.visualViewport?.removeEventListener("resize", handleViewportChange);
       window.visualViewport?.removeEventListener("scroll", handleViewportChange);
     };
   }, [close, target]);
+  // Esc closes the non-modal selection shortcut: a layer heard in the capture phase, before the thread's own Esc.
+  useShortcutLayer("selection", !!target, { onEscape: () => { close(); }, phase: "capture", ignoreDefaultPrevented: true });
 
   useLayoutEffect(() => {
     if (!target) return;
@@ -240,7 +238,6 @@ export default function MessageSelectionShortcut() {
     const rect = floating.getBoundingClientRect();
     setPosition(placeMessageSelectionShortcut({
       anchorRect: target.anchorRect,
-      avoidRect: target.selectionRect,
       floatingSize: { width: rect.width, height: rect.height },
       viewport: viewport(),
     }));
@@ -259,37 +256,28 @@ export default function MessageSelectionShortcut() {
     window.getSelection()?.removeAllRanges();
   }, [dismissCurrentSelection, target]);
 
+  const positionStyle = useMemo(() => ({ left: position.x, top: position.y }), [position]);
+
   if (!target) return null;
 
   return createPortal(
-    <div
+    <TextSelectionToolbar
       ref={shortcutRef}
-      role="menu"
       aria-label={formatMessage({ id: "message.selectionShortcut.actionsAria" })}
       data-message-selection-shortcut="true"
-      className="fixed z-[70] flex items-center gap-0.5 rounded-container bg-layer-popover p-0.5 text-callout font-medium text-foreground shadow-float ring-1 ring-line-seam select-none"
-      style={{ left: position.x, top: position.y }}
+      className="fixed z-popup w-max"
+      style={positionStyle}
     >
-      <button
-        type="button"
-        role="menuitem"
-        onClick={handleQuote}
-        className={SELECTION_SHORTCUT_ITEM_CLASS}
-      >
-        <TextQuote size={16} className="text-foreground-muted" />
+      <TextSelectionToolbarButton onClick={handleQuote}>
+        <TextQuote />
         {formatMessage({ id: "message.selectionShortcut.quote" })}
-      </button>
-      <Separator orientation="vertical" className="h-5" />
-      <button
-        type="button"
-        role="menuitem"
-        onClick={handleCopy}
-        className={SELECTION_SHORTCUT_ITEM_CLASS}
-      >
-        <Copy size={16} className="text-foreground-muted" />
+      </TextSelectionToolbarButton>
+      <TextSelectionToolbarSeparator />
+      <TextSelectionToolbarButton onClick={handleCopy}>
+        <Copy />
         {formatMessage({ id: "message.selectionShortcut.copy" })}
-      </button>
-    </div>,
+      </TextSelectionToolbarButton>
+    </TextSelectionToolbar>,
     document.body,
   );
 }

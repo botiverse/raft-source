@@ -3,7 +3,7 @@ import type { AgentActivity } from "@botiverse/raft-shared";
 import type { Agent } from "../store/agentStore";
 import type { Channel } from "../store/channelStore";
 import type { Message } from "../store/messageStore";
-import { en } from "../i18n/messages/en";
+import { enFallback } from "../i18n/messages/enFallback";
 import { getActivityText, getActivityTextDescriptor } from "./activity";
 import type { ActivityTextDescriptor } from "./activity";
 
@@ -25,6 +25,12 @@ export interface LiveAgentActivityItem {
   startedAt: number;
   /** When the agent went idle; it stays listed for LIVE_AGENT_IDLE_GRACE_MS in case it resumes. */
   idleSince: number | null;
+  /**
+   * From a coarse state (AGENT_ACTIVITY_STATE_EVENT, an agent this tab does
+   * not subscribe to): no heartbeat follows it, so the row stays until a
+   * later state settles it instead of expiring after the visible window.
+   */
+  heldUntilChange?: boolean;
 }
 
 export interface ThreadContextLike {
@@ -57,7 +63,7 @@ function truncateText(text: string, maxLength = MAX_TEXT_LENGTH): string {
 
 /** English-catalog fallback label when an agent row has no display name. */
 export function agentFallbackLabel(): string {
-  return en["activity.live.agentFallback"];
+  return enFallback["activity.live.agentFallback"];
 }
 
 function agentLabel(agentId: string, agents: Agent[], fallback?: string): string {
@@ -126,9 +132,17 @@ export function applyStatusActivityEvent(
     timestamp?: number;
     isHeartbeat?: boolean;
     isRefreshOnly?: boolean;
+    /** A coarse state (no detail, no heartbeat after it): see LiveAgentActivityItem.heldUntilChange. */
+    fromCoarseState?: boolean;
   },
   agents: Agent[],
 ): LiveAgentActivityItem[] {
+  if (event.fromCoarseState === true) {
+    const { fromCoarseState: _coarse, ...detailed } = event;
+    const next = applyStatusActivityEvent(items, detailed, agents);
+    if (!isLiveWorkActivity(normalizeActivity(event.activity))) return next;
+    return next.map((item) => (item.agentId === event.agentId && item.kind === "activity" && item.idleSince === null ? { ...item, heldUntilChange: true } : item));
+  }
   const activity = normalizeActivity(event.activityKind ?? event.activity);
   const now = event.timestamp ?? Date.now();
   if (event.isRefreshOnly === true || event.isHeartbeat === true) {
@@ -194,10 +208,12 @@ export function pruneExpiredLiveAgentActivityItems(
 
 /** When a row leaves on its own: the idle grace runs out, or (the safety net) no signal for the visible window. */
 function liveAgentActivityExpiry(item: LiveAgentActivityItem): number {
-  return item.idleSince === null ? item.createdAt + LIVE_AGENT_ACTIVITY_VISIBLE_MS : item.idleSince + LIVE_AGENT_IDLE_GRACE_MS;
+  if (item.idleSince === null) return item.heldUntilChange ? Number.POSITIVE_INFINITY : item.createdAt + LIVE_AGENT_ACTIVITY_VISIBLE_MS;
+  return item.idleSince + LIVE_AGENT_IDLE_GRACE_MS;
 }
 
 /** The earliest moment any row leaves on its own, to schedule the next prune; null with no rows. */
 export function nextLiveAgentActivityExpiry(items: readonly LiveAgentActivityItem[]): number | null {
-  return items.length === 0 ? null : Math.min(...items.map(liveAgentActivityExpiry));
+  const next = items.length === 0 ? null : Math.min(...items.map(liveAgentActivityExpiry));
+  return next === null || Number.isFinite(next) ? next : null;
 }

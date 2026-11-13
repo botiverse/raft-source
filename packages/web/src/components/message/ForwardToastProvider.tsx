@@ -55,11 +55,13 @@ function ForwardToastList() {
 
 export function ForwardToastProvider({ children }: PropsWithChildren) {
   return (
+    // raft-ui 0.28's limit of 1 and 5s timeout: a newer notice replaces the
+    // older one. This is its own manager at the top center (the Forward flow
+    // and desktop notices), separate from the app's bottom toasts, so one of
+    // each can show at once; one at a time holds within each surface.
     <ToastProvider
-      limit={3}
       renderViewport={false}
       toastManager={forwardToastManager}
-      timeout={5000}
     >
       {children}
       <ToastPortal>

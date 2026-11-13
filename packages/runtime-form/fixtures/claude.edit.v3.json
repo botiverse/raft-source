@@ -1,0 +1,255 @@
+{
+  "protocolVersion": 3,
+  "runtimeId": "claude",
+  "schemaVersion": "claude.create.v1",
+  "dataSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "provider",
+      "model"
+    ],
+    "properties": {
+      "provider": {
+        "type": "string",
+        "title": "Provider",
+        "minLength": 1,
+        "x-optionSource": "provider"
+      },
+      "apiUrl": {
+        "type": "string",
+        "title": "API URL",
+        "format": "uri"
+      },
+      "authType": {
+        "type": "string",
+        "title": "Authentication",
+        "x-optionSource": "authType"
+      },
+      "apiKey": {
+        "type": "string",
+        "title": "API Key",
+        "writeOnly": true
+      },
+      "model": {
+        "type": "string",
+        "title": "Model",
+        "minLength": 1,
+        "x-optionSource": "model"
+      },
+      "reasoningEffort": {
+        "type": "string",
+        "title": "Reasoning",
+        "x-optionSource": "reasoningEffort"
+      },
+      "fastMode": {
+        "type": "boolean",
+        "title": "Fast mode"
+      },
+      "command": {
+        "type": "string",
+        "title": "Claude Command"
+      },
+      "envVars": {
+        "type": "object",
+        "title": "Environment Variables",
+        "additionalProperties": {
+          "type": "string"
+        }
+      }
+    }
+  },
+  "uiSchema": {
+    "order": [
+      "provider",
+      "apiUrl",
+      "authType",
+      "apiKey",
+      "model",
+      "reasoningEffort",
+      "fastMode",
+      "command",
+      "envVars"
+    ],
+    "layout": {
+      "advanced": [
+        "/command",
+        "/envVars"
+      ]
+    },
+    "localization": {
+      "provider": {
+        "label": "Provider",
+        "hint": "Default leaves Claude Code provider settings untouched. Custom sets ANTHROPIC_BASE_URL and, from the key, ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN for this agent."
+      },
+      "apiUrl": {
+        "label": "API URL",
+        "placeholder": "https://gateway.example.com"
+      },
+      "authType": {
+        "label": "Authentication",
+        "hint": "Use Bearer token for a gateway that expects an Authorization header."
+      },
+      "apiKey": {
+        "label": "API Key",
+        "placeholder": "sk-ant-..."
+      },
+      "model": {
+        "label": "Model",
+        "hint": "Models Claude Code accepts. You can also type a model ID."
+      },
+      "reasoningEffort": {
+        "label": "Reasoning",
+        "hint": "Available values depend on the selected model.",
+        "choices": {
+          "off": {
+            "label": "No reasoning",
+            "description": "Answers directly, without a thinking phase"
+          },
+          "minimal": {
+            "label": "Minimal",
+            "description": "Very light reasoning for the fastest responses"
+          },
+          "low": {
+            "label": "Low",
+            "description": "Fast responses with lighter reasoning"
+          },
+          "medium": {
+            "label": "Medium",
+            "description": "Balances speed and reasoning depth for everyday tasks"
+          },
+          "high": {
+            "label": "High",
+            "description": "Greater reasoning depth for complex problems"
+          },
+          "xhigh": {
+            "label": "Extra high",
+            "description": "Extra high reasoning depth for complex problems"
+          },
+          "max": {
+            "label": "Max",
+            "description": "Maximum reasoning depth for the hardest problems"
+          },
+          "ultra": {
+            "label": "Ultra",
+            "description": "Maximum reasoning with automatic task delegation"
+          }
+        }
+      },
+      "fastMode": {
+        "label": "Fast mode",
+        "hint": "Launch this runtime with higher speed at a higher cost per token."
+      },
+      "command": {
+        "label": "Claude Command",
+        "hint": "Executable path or command name; Slock adds the Claude stream-json runtime arguments.",
+        "placeholder": "claude"
+      },
+      "envVars": {
+        "label": "Environment Variables",
+        "hint": "These will be injected into the runtime command environment."
+      }
+    },
+    "rules": [
+      {
+        "scope": "#/properties/apiUrl",
+        "effect": "SHOW",
+        "condition": {
+          "scope": "#/properties/provider",
+          "schema": {
+            "enum": [
+              "custom"
+            ]
+          }
+        }
+      },
+      {
+        "scope": "#/properties/authType",
+        "effect": "SHOW",
+        "condition": {
+          "scope": "#/properties/provider",
+          "schema": {
+            "enum": [
+              "custom"
+            ]
+          }
+        }
+      },
+      {
+        "scope": "#/properties/apiKey",
+        "effect": "SHOW",
+        "condition": {
+          "scope": "#/properties/provider",
+          "schema": {
+            "enum": [
+              "custom"
+            ]
+          }
+        }
+      }
+    ]
+  },
+  "capabilities": {
+    "providerKinds": [],
+    "writeOnlyPointers": [
+      "/apiKey"
+    ],
+    "forbiddenPointers": [
+      "/hostUserState"
+    ]
+  },
+  "optionSources": {
+    "provider": {
+      "protocolVersion": 1,
+      "runtimeId": "claude",
+      "schemaVersion": "claude.create.v1",
+      "sourceId": "provider",
+      "kind": "select",
+      "pointer": "/provider"
+    },
+    "authType": {
+      "protocolVersion": 1,
+      "runtimeId": "claude",
+      "schemaVersion": "claude.create.v1",
+      "sourceId": "authType",
+      "kind": "select",
+      "pointer": "/authType"
+    },
+    "model": {
+      "protocolVersion": 1,
+      "runtimeId": "claude",
+      "schemaVersion": "claude.create.v1",
+      "sourceId": "model",
+      "kind": "select",
+      "pointer": "/model"
+    },
+    "reasoningEffort": {
+      "protocolVersion": 1,
+      "runtimeId": "claude",
+      "schemaVersion": "claude.create.v1",
+      "sourceId": "reasoningEffort",
+      "kind": "dependent_select",
+      "pointer": "/reasoningEffort",
+      "dependsOn": "/model"
+    }
+  },
+  "writeOnlyKeepRequiresUnchanged": {
+    "/apiKey": [
+      "/provider",
+      "/apiUrl"
+    ]
+  },
+  "values": {
+    "provider": "custom",
+    "apiUrl": "https://gateway.example.test",
+    "authType": "api_key",
+    "model": "sonnet",
+    "reasoningEffort": "high",
+    "fastMode": true,
+    "command": "/usr/local/bin/claude",
+    "envVars": {
+      "EXAMPLE_FLAG": "1"
+    }
+  },
+  "revision": "484767cafed86fd3a9cee773"
+}

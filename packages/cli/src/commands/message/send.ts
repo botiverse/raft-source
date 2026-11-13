@@ -1,5 +1,5 @@
-// `raft message send --target <t> [--attachment-id <id>...]`
-// → POST /internal/agent-api/send
+// `raft message send --target <t> [--attachment-id <id>... | --card <file>]`
+// → POST /internal/agent-api/v2/send
 
 import { applyDmPeerKind, PEER_KIND_OPTION } from "../_target";
 import { randomUUID } from "node:crypto";
@@ -11,11 +11,21 @@ import type {
   AgentApiSendV2Body,
   AgentApiSendSentResponse,
   AgentApiStructuredMention,
+  MessageCardInput,
 } from "@botiverse/raft-shared";
 import {
   currentTimeMs,
   formatAgentThreadTargetCheck,
+  MESSAGE_CARD_LIMITS,
+  formatAgentDeliveredToAgentsLine,
+  formatTaskTargetUseTaskCommand,
+  heldSendNothing,
+  normalizeAgentDeliveredToAgents,
+  parseAgentTaskRef,
+  renderAgentHoldPreview,
   structuredRaftMentionStillAppears,
+  TASK_TARGET_USE_TASK_COMMAND_ERROR_CODE,
+  CONTINUATIONS_DRAFT_FLOW_RUNTIMES,
 } from "@botiverse/raft-shared/src/agentCliSurface";
 import { detectThreadTargetMismatch, type ThreadTargetMismatch } from "@botiverse/raft-shared/src/agentOps/seenPolicy/index";
 
@@ -35,8 +45,11 @@ import type { CommandContext, CommandRuntimeOptions } from "../../core/context";
 import { incrementMetaCounter } from "../../state/agentLedger";
 import { channelCardForSend, recordChannelCardShown } from "../../ax/channelCard";
 import { peerCardForSend, recordPeerCardShown } from "../../ax/peerCard";
+import { countRendered } from "../../ax/renderCounts";
+import { cliTraceRuntime } from "../../transportTrace";
 import { attachOnEverySend, fetchSendAttachment } from "../../ax/sendAttachment";
-import { CliError, cliError } from "../../core/errors";
+import { rateLimitedCliError, rateLimitedResponse } from "../../core/apiFailure";
+import { CliError, CliExit, cliError } from "../../core/errors";
 import { adoptCliReplyText, writeDiagnostic, writeJson, writeText, NL, type CliReplyText } from "../../core/renderer";
 import { elideSeenSenders } from "./_senderElision";
 import {
@@ -63,6 +76,7 @@ import {
   LOCAL_DRAFT_TTL_MINUTES,
   lookupSavedDraft,
   setSavedDraft,
+  type OnDraftExpired,
   type SavedDraft,
 } from "./_continueDraftState";
 import {
@@ -71,11 +85,38 @@ import {
   formatDraftReplacedWarning,
   formatMessages,
   formatSendDraftStdinDeadlineDiagnostic,
+  formatCardStdinDeadlineDiagnostic,
+  formatMessageCardNotStored,
+  formatMessageCardSentHint,
   formatSentChannelCard,
   formatSentPeerCard,
   formatSendAttachment,
+  isThreadTargetRef,
 } from "./_format";
 import { archiveReplacedDraft } from "./_replacedDraftHistory";
+import {
+  assertCardFallback,
+  cardMentionsWithoutTextError,
+  cardWithAttachmentsError,
+  loadCardFile,
+  messageCardRefusal,
+  shellQuoteArg,
+  type LoadedCard,
+} from "./_card";
+import { emitDraftHeld, emitDraftResolved, type DraftTraceScope } from "./_draftResolvedTrace";
+import {
+  isContinuationRefusal,
+  runContinuable,
+  type CliContinuationCommand,
+  type ContinuationInvocation,
+} from "../continuation/_runtime";
+import {
+  createSendContinuation,
+  type SendAttempt,
+  type SendContinuationArgs,
+  type SendStepResult,
+} from "./_sendContinuation";
+import type { SendContinuationOutcome } from "./_format";
 
 // Re-exports for existing imports; canonical home is message/_format.ts.
 export {
@@ -97,6 +138,8 @@ interface SendOpts extends ReviewerIsolationOpts {
   targetConfirmed?: boolean;
   peerKind?: string;
   json?: boolean;
+  /** RFC 082: post the message as a card read from this JSON file; stdin is then optional (the card's fallback text). */
+  card?: string;
 }
 
 const MESSAGE_HEREDOC_DELIMITER = "RAFTMSG";
@@ -347,8 +390,14 @@ export function rejectArgContent(positionalContent: string[], opts: Pick<SendOpt
 }
 
 export function validateDraftSendFlags(
-  opts: Pick<SendOpts, "sendDraft" | "discardDraft" | "expectedDraftKey" | "anyway" | "attachmentId" | "mention">,
+  opts: Pick<SendOpts, "sendDraft" | "discardDraft" | "expectedDraftKey" | "anyway" | "attachmentId" | "mention" | "card">,
 ): void {
+  if (opts.card !== undefined && (opts.sendDraft || opts.discardDraft)) {
+    throw new SendContentError(
+      "CARD_WITH_SAVED_DRAFT_UNSUPPORTED",
+      `--card cannot be used with ${opts.sendDraft ? "--send-draft" : "--discard-draft"}: a saved draft keeps the card it was saved with. To change the card, send again normally with --card.`,
+    );
+  }
   if (opts.discardDraft && opts.sendDraft) {
     throw new SendContentError(
       "DISCARD_DRAFT_WITH_SEND_DRAFT",
@@ -400,18 +449,24 @@ export function formatHeldSendOutput(
   data: FreshnessHoldOutputData,
   reviewerIsolation = false,
   draftSaved = true,
+  /** RFC 082: the held message is a card (`--card`); `file` is its card file when this run was given one. */
+  card?: { file: string | null },
 ): CliReplyText {
   const withholdContext = reviewerIsolation || data.freshnessContextMode === "withheld";
+  const sendNothing = heldSendNothing((data.newMessageCount ?? 0) > 0);
+  // A card message is sent again with its card; its text on stdin is optional.
+  const cardFlag = card ? ` --card ${card.file ? shellQuoteArg(card.file) : "<file>"}` : "";
+  const bodyLine = (text: string) => card ? `${text} (optional with --card)` : text;
   if (!draftSaved) {
     return formatFreshnessHoldOutput(target, data, {
       ...(withholdContext ? { withholdContext: true } : {}),
       heldAction: "Your message was not delivered, and no draft was kept: this agent's local record cannot be written.",
       draftInstructions:
-        `After reviewing, send the full content again${withholdContext ? " (with --reviewer-isolation)" : ""}:\n` +
-        `  raft message send --target "${target}" <<'${MESSAGE_HEREDOC_DELIMITER}'\n` +
-        `  message\n` +
-        `  ${MESSAGE_HEREDOC_DELIMITER}\n` +
-        `You can also choose not to send anything.\n`,
+        `${sendNothing}\n` +
+        `Otherwise, send the full content again${withholdContext ? " (with --reviewer-isolation)" : ""}:\n` +
+        `  raft message send --target "${target}"${cardFlag} <<'${MESSAGE_HEREDOC_DELIMITER}'\n` +
+        `  ${bodyLine("message")}\n` +
+        `  ${MESSAGE_HEREDOC_DELIMITER}\n`,
     });
   }
   if (withholdContext) {
@@ -428,14 +483,15 @@ export function formatHeldSendOutput(
   return formatFreshnessHoldOutput(target, data, {
     heldAction: `Your message has been saved as a draft (kept for ${LOCAL_DRAFT_TTL_MINUTES} minutes).`,
     draftInstructions:
-      `To update the draft, send revised content normally:\n` +
-      `  raft message send --target "${target}" <<'${MESSAGE_HEREDOC_DELIMITER}'\n` +
-      `  revised message\n` +
+      `${sendNothing} Delete the draft:\n` +
+      `  raft message send --discard-draft --target \"${target}\"\n` +
+      `Otherwise, to update the draft, send revised content normally:\n` +
+      `  raft message send --target "${target}"${cardFlag} <<'${MESSAGE_HEREDOC_DELIMITER}'\n` +
+      `  ${bodyLine("revised message")}\n` +
       `  ${MESSAGE_HEREDOC_DELIMITER}\n` +
       `To send the current draft unchanged (within ${LOCAL_DRAFT_TTL_MINUTES} minutes; after that the draft is discarded and --send-draft reports SEND_DRAFT_EXPIRED):\n` +
       `  raft message send --send-draft --target \"${target}\"\n` +
-      `  (this sends the stored copy — do not use it if you meant to change the content)\n` +
-      `You can also choose not to send anything.\n`,
+      `  (this sends the stored copy — do not use it if you meant to change the content)\n`,
     continueAnywayInstruction:
       `If repeated updates keep blocking the same draft and this is still the right reply, you may use:\n` +
       `  raft message send --send-draft --anyway --target \"${target}\"\n`,
@@ -536,7 +592,36 @@ export function markSendFailureDraftSaved(
   });
 }
 
-function isPreResponseTransportAmbiguity(err: unknown): boolean {
+/**
+ * A send refused by a message budget (429 RATE_LIMITED): the Server's
+ * sentence, and, when this send's copy is the saved draft, the wait and the
+ * command that sends that draft (the agent needn't write the message again;
+ * under reviewer isolation, bound to this send's key, as its other retry
+ * steps are); else the wait and the same command again.
+ */
+function rateLimitedSendError(
+  rateLimited: { message: string; retryAfterSeconds: number },
+  agentId: string,
+  target: string,
+  idempotencyKey: string,
+  reviewerIsolation: boolean,
+): CliError {
+  const draftSaved = getSavedDraft(agentId, target)?.idempotencyKey === idempotencyKey;
+  if (!draftSaved) return rateLimitedCliError(rateLimited, null);
+  const seconds = rateLimited.retryAfterSeconds;
+  const command = reviewerIsolation
+    ? `raft message send --reviewer-isolation --send-draft --expected-draft-key "${idempotencyKey}" --target "${target}"`
+    : `raft message send --send-draft --target "${target}"`;
+  return new CliError({
+    code: "RATE_LIMITED",
+    message: rateLimited.message,
+    retryable: true,
+    draftSaved: true,
+    suggestedNextAction: `Nothing was sent; your message is saved as a draft. Wait ${seconds} second${seconds === 1 ? "" : "s"}, then send it:\n${command}`,
+  });
+}
+
+export function isPreResponseTransportAmbiguity(err: unknown): boolean {
   return err instanceof CliError
     && err.fault_domain === "agent_api_transport"
     && err.proxyResponseStarted !== true
@@ -607,7 +692,8 @@ function discardSavedDraft(
   opts: Pick<SendOpts, "expectedDraftKey" | "json">,
 ): void {
   const agentContext = ctx.loadAgentContext();
-  const draft = getSavedDraft(agentContext.agentId, target);
+  const traceScope = draftTraceScope(ctx, agentContext, target);
+  const draft = getSavedDraft(agentContext.agentId, target, (expired) => emitDraftResolved(traceScope, expired, "expired"));
   const report = (state: "discarded" | "no_draft", text: string): void => {
     if (opts.json) writeJson(ctx.io, { ok: true, state, target });
     else writeText(ctx.io, adoptCliReplyText(`${text}\n`));
@@ -644,7 +730,474 @@ function discardSavedDraft(
     });
   }
   if (!deleted) throw identityChanged();
+  emitDraftResolved(traceScope, draft, "discarded");
   report("discarded", `Discarded the saved draft for ${target}. Nothing was sent.`);
+}
+
+function draftTraceScope(
+  ctx: CommandContext,
+  agentContext: { agentId: string; serverId?: string | null },
+  target: string,
+): DraftTraceScope {
+  return { agentId: agentContext.agentId, serverId: agentContext.serverId, env: ctx.env, target };
+}
+
+/**
+ * Send, reconciling a lost response by its idempotency key (replaying once
+ * with the same key when the server says it never committed), and classify
+ * the answer: held, sent, or committed under a lost response.
+ */
+async function sendWithReconciliation(
+  agentApi: ReturnType<typeof createAgentApiSurfaceClient>,
+  body: AgentApiSendV2Body,
+  { agentId, target, idempotencyKey, reviewerIsolation, cardFile = null }: {
+    agentId: string;
+    target: string;
+    idempotencyKey: string;
+    reviewerIsolation: boolean;
+    /** A card send (RFC 082): its card file, for the next step of a card refusal ("<file>" when unknown). */
+    cardFile?: string | null;
+  },
+): Promise<MessageSendOutcome> {
+  let res;
+  try {
+    let initialFailure: unknown;
+    try {
+      res = await agentApi.messages.sendV2(body);
+    } catch (err) {
+      if (!isPreResponseTransportAmbiguity(err)) throw err;
+      initialFailure = err;
+    }
+
+    if (initialFailure !== undefined || (res && !res.ok && res.status >= 500)) {
+      const originalResponse = res;
+      let reconciliation;
+      try {
+        reconciliation = await agentApi.messages.sendV2({
+          target,
+          idempotencyKey,
+          reconcileOnly: true,
+        });
+      } catch {
+        if (initialFailure !== undefined) throw initialFailure;
+      }
+
+      if (!reconciliation?.ok || !reconciliation.data) {
+        if (initialFailure !== undefined) throw initialFailure;
+        throw markSendFailureDraftSaved(
+          cliError(
+            originalResponse && originalResponse.status >= 500 ? "SERVER_5XX" : "SEND_FAILED",
+            originalResponse?.error ?? `HTTP ${originalResponse?.status ?? 500}`,
+          ),
+          true,
+          true,
+        );
+      } else if (reconciliation.data.state === "committed") {
+        res = reconciliation;
+      } else if (reconciliation.data.state === "not_found") {
+        try {
+          res = await agentApi.messages.sendV2(body);
+        } catch (err) {
+          const originalDraftStillSaved =
+            getSavedDraft(agentId, target)?.idempotencyKey === idempotencyKey;
+          throw markIdempotentReplayFailure(err, target, idempotencyKey, originalDraftStillSaved);
+        }
+        if (!res.ok) {
+          // The same-key replay over the message budget: refused before it ran, so nothing is unknown.
+          const replayRateLimited = rateLimitedResponse(res);
+          if (replayRateLimited) throw rateLimitedSendError(replayRateLimited, agentId, target, idempotencyKey, reviewerIsolation);
+          const originalDraftStillSaved =
+            getSavedDraft(agentId, target)?.idempotencyKey === idempotencyKey;
+          throw markIdempotentReplayFailure(
+            cliError(res.status >= 500 ? "SERVER_5XX" : "SEND_FAILED", res.error ?? `HTTP ${res.status}`),
+            target,
+            idempotencyKey,
+            originalDraftStillSaved,
+          );
+        }
+      } else {
+        if (initialFailure !== undefined) throw initialFailure;
+        throw markSendFailureDraftSaved(
+          cliError(
+            originalResponse && originalResponse.status >= 500 ? "SERVER_5XX" : "SEND_FAILED",
+            originalResponse?.error ?? `HTTP ${originalResponse?.status ?? 500}`,
+          ),
+          true,
+          true,
+        );
+      }
+    }
+  } catch (err) {
+    if (reviewerIsolation) {
+      const retryable = err instanceof CliError && err.retryable === true;
+      throw cliError(
+        "SEND_FAILED",
+        "Reviewer-isolation send failed; upstream response detail was withheld.",
+        {
+          cause: err,
+          draftSaved: retryable ? true : undefined,
+          retryable: retryable ? true : undefined,
+          suggestedNextAction: retryable
+            ? `The saved draft retains the same idempotency key, so retrying it cannot create a second message: \`raft message send --reviewer-isolation --send-draft --expected-draft-key "${idempotencyKey}" --target "${target}"\`. The command verifies the expected key again before making any request and refuses if another send replaced the draft.`
+            : undefined,
+        },
+      );
+    }
+    throw err;
+  }
+  if (!res) {
+    throw cliError("INVALID_JSON_RESPONSE", "Agent API messageSend did not return a response");
+  }
+  if (!res.ok) {
+    // RFC 082: a refusal because of the card (nothing was posted), with its
+    // next step. It says nothing about the conversation, so reviewer isolation
+    // shows it too.
+    const cardRefusal = body.card !== undefined ? messageCardRefusal(res, "send", cardFile ?? "<file>") : null;
+    if (cardRefusal) throw cardRefusal;
+    // Over the agent's or the Server's message budget: nothing was posted.
+    // Retryable after the Server's wait; the agent decides, the CLI doesn't
+    // resend behind its back.
+    const rateLimited = rateLimitedResponse(res);
+    if (rateLimited) throw rateLimitedSendError(rateLimited, agentId, target, idempotencyKey, reviewerIsolation);
+    // Task v2 (flag-on server): a task conversation target is refused with the
+    // `raft task reply` command; keep its code so callers can branch on it.
+    const code = res.status >= 500
+      ? "SERVER_5XX"
+      : res.errorCode === TASK_TARGET_USE_TASK_COMMAND_ERROR_CODE ? TASK_TARGET_USE_TASK_COMMAND_ERROR_CODE : "SEND_FAILED";
+    throw cliError(
+      code,
+      reviewerIsolation
+        ? `Reviewer-isolation send failed (HTTP ${res.status}); upstream error detail was withheld.`
+        : res.error ?? `HTTP ${res.status}`,
+    );
+  }
+  const rawData = res.data;
+  if (!rawData) {
+    throw cliError("INVALID_JSON_RESPONSE", "Agent API messageSend returned an empty response body");
+  }
+  return classifyMessageSendOutcome(rawData);
+}
+
+/**
+ * A hold's bookkeeping in the draft flow, before its context is shown: the
+ * observability counters, and the shown boundary recorded as consumed.
+ */
+function bookHeldContext(
+  agentId: string,
+  target: string,
+  data: AgentApiHeldFreshnessResponse,
+  held: { reviewerIsolation: boolean; seenUpToSeq: number | undefined },
+): { heldForCardOnly: boolean; contextWasWithheld: boolean } {
+  const counted = countHold(agentId, target, data, held);
+  recordHeldShown(agentId, target, data, counted.contextWasWithheld);
+  return counted;
+}
+
+/** The hold's observability counters, and what kind of hold it is. */
+function countHold(
+  agentId: string,
+  target: string,
+  data: AgentApiHeldFreshnessResponse,
+  { reviewerIsolation, seenUpToSeq }: { reviewerIsolation: boolean; seenUpToSeq: number | undefined },
+): { heldForCardOnly: boolean; contextWasWithheld: boolean } {
+  // RFC 072 §7.10 observability: a hold because this context has not read
+  // the thread (evidence from another context withheld) vs. a hold that
+  // came with evidence (there really were newer messages).
+  const holdReasons = data.holdReasons ?? [];
+  const heldForCardOnly = (holdReasons.includes("channel_card") || holdReasons.includes("peer_card")) && !holdReasons.includes("unread_messages");
+  if (heldForCardOnly) {
+    incrementMetaCounter(agentId, "channelCardHold");
+  } else if (seenUpToSeq !== undefined) {
+    incrementMetaCounter(agentId, "freshnessHold.withEvidence");
+  } else if (wasConsumedEvidenceWithheldForContext(agentId, target)) {
+    incrementMetaCounter(agentId, "freshnessHold.contextSwitch");
+  }
+  const contextWasWithheld = reviewerIsolation || data.freshnessContextMode === "withheld";
+  return { heldForCardOnly, contextWasWithheld };
+}
+
+/** The shown held context's boundary, recorded as consumed (unless the context was withheld). */
+function recordHeldShown(agentId: string, target: string, data: AgentApiHeldFreshnessResponse, contextWasWithheld: boolean): void {
+  // The held bounded context was just rendered to the agent — that
+  // boundary is consumed too; record it so even an abandoned draft
+  // leaves an honest per-target cursor behind.
+  if (!contextWasWithheld && typeof data.seenUpToSeq === "number" && Number.isFinite(data.seenUpToSeq)) {
+    recordConsumedSeqs(agentId, { [target]: data.seenUpToSeq });
+  }
+}
+
+/** What a send attempt asks the server with: the message and how it relates to a draft that was held. */
+interface SendBodyInput {
+  target: string;
+  /** With a card, "" means none: the Server derives the card's fallback. */
+  content: string;
+  /** RFC 082: the card, as the sender wrote it. */
+  card?: MessageCardInput;
+  attachmentIds: string[];
+  mentions: AgentApiStructuredMention[];
+  idempotencyKey: string;
+  /** How often the draft this send sends or replaces was held (`draftReholdCount`). */
+  reholdCount: number;
+  /** A saved draft's seen frontier: a floor for what this send attests. */
+  seenUpToSeq: number | undefined;
+  seenExactSeqs: number[];
+  reviewerIsolation: boolean;
+  /** The same held message again (`--send-draft`), and whether anyway (`--anyway`). */
+  sendDraft: boolean;
+  anyway: boolean;
+}
+
+interface SendBodyPlan {
+  body: AgentApiSendV2Body;
+  seenUpToSeq: number | undefined;
+  seenExactSeqs: number[];
+  cardForSend: ReturnType<typeof channelCardForSend> | undefined;
+  peerForSend: ReturnType<typeof peerCardForSend> | undefined;
+}
+
+/** The send body, with what this agent's ledger attests it has seen of the target. */
+function buildSendBody(agentId: string, input: SendBodyInput): SendBodyPlan {
+  const { target, reviewerIsolation } = input;
+  let { seenUpToSeq, seenExactSeqs } = input;
+  // FH-001 full-body advance contract (A), send side: attest only the
+  // local per-target cursor recorded by active body-returning operations
+  // that safely advance a contiguous boundary (`message read` in this
+  // slice). Target keys stay isolated (thread != parent); passive wake/inbox
+  // notices and sparse `message check` drains never record this cursor.
+  // Absent cursor means omit `seenUpToSeq` so the server freshness gate fails
+  // closed.
+  // A saved draft's cursor is a floor, not a pin: reads after the hold move
+  // the ledger cursor past it and fold exact seqs into it, so pinning the
+  // draft value would drop what those reads attested.
+  const ledgerSeenUpToSeq = getConsumedSeq(agentId, target);
+  if (ledgerSeenUpToSeq !== undefined && (seenUpToSeq === undefined || ledgerSeenUpToSeq > seenUpToSeq)) {
+    seenUpToSeq = ledgerSeenUpToSeq;
+  }
+  seenExactSeqs = [...new Set([
+    ...seenExactSeqs,
+    ...getConsumedExactSeqs(agentId, target),
+  ])]
+    .filter((seq) => Number.isInteger(seq) && seq > (seenUpToSeq ?? 0))
+    .sort((a, b) => a - b)
+    .slice(-2_500);
+  const body: AgentApiSendV2Body = {
+    target,
+    // A card without text: no content, so the Server derives the fallback from the card.
+    ...(input.card && input.content.length === 0 ? {} : { content: input.content }),
+    ...(input.card ? { card: input.card } : {}),
+    idempotencyKey: input.idempotencyKey,
+    draftReholdCount: input.reholdCount,
+  };
+  if (reviewerIsolation) {
+    body.freshnessContextMode = "withheld";
+  }
+  // The channel card version this context has (RFC 072 `channel`; glimpse
+  // G1): never seen here holds the send once, an older one comes back with
+  // the reply. Reviewer isolation sends no new context, so it says nothing.
+  const cardForSend = reviewerIsolation ? undefined : channelCardForSend(agentId, target);
+  const peerForSend = reviewerIsolation ? undefined : peerCardForSend(agentId, target);
+  if (cardForSend || peerForSend) {
+    body.seenCards = {
+      ...(cardForSend ? cardForSend.seenCards : {}),
+      ...(peerForSend ? { peer: peerForSend.seen } : {}),
+    };
+  }
+  if (seenUpToSeq !== undefined) {
+    body.seenUpToSeq = seenUpToSeq;
+  }
+  if (seenExactSeqs.length > 0) {
+    body.seenExactSeqs = seenExactSeqs;
+  }
+  if (input.sendDraft) {
+    body.sendDraft = true;
+    if (input.anyway) body.continueAnyway = true;
+  } else {
+    body.draftReplacedExisting = input.reholdCount > 0;
+  }
+  if (input.attachmentIds.length > 0) {
+    body.attachmentIds = input.attachmentIds;
+  }
+  if (input.mentions.length > 0) {
+    body.mentions = input.mentions;
+  }
+  return { body, seenUpToSeq, seenExactSeqs, cardForSend, peerForSend };
+}
+
+/**
+ * A committed send's output: the receipt (text or JSON), the unread messages
+ * it brought back, the cards it carried (recorded as seen once printed), the
+ * thread attachment, and settling the senders it showed.
+ */
+async function writeSentOutput(
+  ctx: CommandContext,
+  agentContext: ReturnType<CommandContext["loadAgentContext"]>,
+  agentApi: ReturnType<typeof createAgentApiSurfaceClient>,
+  target: string,
+  outcome: Exclude<MessageSendOutcome, { kind: "held" }>,
+  {
+    json,
+    reviewerIsolation,
+    replacementArchiveAttempted,
+    replacementRecoveryFilePath,
+    cardForSend,
+    peerForSend,
+    messageCard = false,
+  }: {
+    json: boolean;
+    reviewerIsolation: boolean;
+    /**
+     * RFC 082: the message was sent with a card. The receipt says how to
+     * update it when the answer says it was stored (`messageCard`), and that
+     * it went out as text only when not.
+     */
+    messageCard?: boolean;
+    /** A saved draft was replaced (and archived): the receipt says where its body went. */
+    replacementArchiveAttempted: boolean;
+    replacementRecoveryFilePath: string | null;
+    cardForSend: SendBodyPlan["cardForSend"];
+    peerForSend: SendBodyPlan["peerForSend"];
+  },
+): Promise<void> {
+  const cardSection = (messageId: string | undefined, stored: { revision: number } | undefined): string => {
+    if (!messageCard || !messageId) return "";
+    return `\n${stored ? formatMessageCardSentHint(messageId, stored.revision) : formatMessageCardNotStored()}`;
+  };
+  if (outcome.kind === "committed") {
+    const data = outcome.data;
+    if (json) {
+      writeJson(ctx.io, replacementArchiveAttempted
+        ? {
+            ...data,
+            replacedDraft: {
+              replaced: true,
+              recoverySaved: replacementRecoveryFilePath !== null,
+              recoveryFile: replacementRecoveryFilePath,
+            },
+          }
+        : data);
+      return;
+    }
+    const replacementSection = replacementArchiveAttempted
+      ? `\n${formatDraftReplacedSuccess(replacementRecoveryFilePath)}`
+      : "";
+    writeText(
+      ctx.io,
+      adoptCliReplyText(
+        `Message commit confirmed for ${target}. Message ID: ${data.messageId}\n`
+        + "The original response was lost, so delivery-side receipt details (including mention delivery warnings and recent unread context) are unavailable; no message was replayed."
+        + cardSection(data.messageId, data.messageCard)
+        + replacementSection,
+      ),
+      NL,
+    );
+    return;
+  }
+  const data = outcome.data;
+  const shortId = data.messageId ? data.messageId.slice(0, 8) : null;
+  const threadHint = shortId
+    ? `. Thread: "${isThreadTargetRef(target) ? target : `${target}:${shortId}`}"`
+    : "";
+
+  let unreadSection = "";
+  let settleSenders: (io: typeof ctx.io) => Promise<void> = async () => {};
+  if (data.recentUnread && data.recentUnread.length > 0) {
+    const senders = elideSeenSenders(data.recentUnread, agentContext.agentId);
+    settleSenders = senders.settle;
+    unreadSection = `\n\n--- New messages you may have missed ---\n${formatMessages(senders.messages)}`;
+  }
+
+  const pendingMentionActions = normalizePendingMentionActions(data);
+  const unresolvedMentionHandles = normalizeUnresolvedMentionHandles(data);
+  const undeliveredMentionCount = pendingMentionActions.length + unresolvedMentionHandles.length;
+  const mentionSection = undeliveredMentionCount > 0
+    ? formatPendingMentionActions(pendingMentionActions, {
+        source: "send",
+        unresolvedMentionHandles,
+      }).trimEnd()
+    : "";
+  const sentStatusLine = undeliveredMentionCount > 0
+    ? `Message queued to ${target}. Message ID: ${data.messageId}`
+    : `Message sent to ${target}. Message ID: ${data.messageId}`;
+  const deliveredLine = formatAgentDeliveredToAgentsLine(normalizeAgentDeliveredToAgents(data));
+  const deliveredSection = deliveredLine ? `\n${deliveredLine}` : "";
+  const cardHintSection = cardSection(data.messageId, data.messageCard);
+  const driveByTip = formatDriveByJoinedToPostTip(target, data);
+  const driveBySection = driveByTip ? `\n\n${driveByTip}` : "";
+
+  const partialSendPayload = undeliveredMentionCount > 0
+    ? {
+        ...data,
+        state: "partial",
+        message: { status: "queued", id: data.messageId },
+        pendingMentionActions: pendingMentionActions.map(toSenderPendingMentionAction),
+        ...(unresolvedMentionHandles.length > 0
+          ? { unresolvedMentionWarnings: unresolvedMentionHandles.map(toSenderUnresolvedMentionWarning) }
+          : {}),
+      }
+    : null;
+  // A partial result exits 0: the message is committed, and a nonzero exit
+  // reads as "not sent" to callers, who then resend it. The undelivered
+  // mentions lead stdout (text) or ride in the payload (JSON) with their
+  // per-token recovery commands.
+  if (json) {
+    const jsonResult = partialSendPayload ?? data;
+    writeJson(ctx.io, replacementArchiveAttempted
+      ? {
+          ...jsonResult,
+          replacedDraft: {
+            replaced: true,
+            recoverySaved: replacementRecoveryFilePath !== null,
+            recoveryFile: replacementRecoveryFilePath,
+          },
+        }
+      : jsonResult);
+    if (data.channelCard && cardForSend) {
+      await recordChannelCardShown(agentContext.agentId, data.channelCard, cardForSend.contextId, target, ctx.io);
+    }
+    if (data.peerCard && peerForSend) {
+      await recordPeerCardShown(agentContext.agentId, data.peerCard, peerForSend.contextId, target, ctx.io);
+    }
+    return;
+  }
+
+  const partialSection = mentionSection ? `${mentionSection}\n\n` : "";
+  const replacementSection = replacementArchiveAttempted
+    ? `\n${formatDraftReplacedSuccess(replacementRecoveryFilePath)}`
+    : "";
+  writeText(
+    ctx.io,
+    adoptCliReplyText(
+      `${partialSection}${sentStatusLine}${threadHint}${deliveredSection}${cardHintSection}${replacementSection}${driveBySection}${unreadSection}`,
+    ),
+    NL,
+  );
+  if (data.channelCard && cardForSend) {
+    const cardText = formatSentChannelCard(data.channelCard, data.channelCardChanged === true);
+    writeText(ctx.io, cardText);
+    countRendered(agentContext.agentId, "channel_card", cardText);
+    await recordChannelCardShown(agentContext.agentId, data.channelCard, cardForSend.contextId, target, ctx.io);
+  }
+  if (data.peerCard && peerForSend) {
+    const cardText = formatSentPeerCard(data.peerCard);
+    writeText(ctx.io, cardText);
+    countRendered(agentContext.agentId, "peer_card", cardText);
+    await recordPeerCardShown(agentContext.agentId, data.peerCard, peerForSend.contextId, target, ctx.io);
+  }
+  if (!reviewerIsolation && data.messageId && attachOnEverySend(agentContext.agentId, target)) {
+    const attachment = await fetchSendAttachment(agentApi, target, data.messageId);
+    // The message is committed: rendering trouble must not fail the command.
+    let attached: CliReplyText | null = null;
+    try {
+      attached = attachment ? formatSendAttachment(attachment) : null;
+    } catch {
+      attached = null;
+    }
+    if (attached) {
+      writeText(ctx.io, attached);
+      countRendered(agentContext.agentId, "send_attachment", attached);
+    }
+  }
+  await settleSenders(ctx.io);
 }
 
 async function handleMessageSend(
@@ -659,6 +1212,13 @@ async function handleMessageSend(
   }
   const target = applyDmPeerKind(rawTarget, opts.peerKind);
   const reviewerIsolation = reviewerIsolationEnabled(opts, ctx.env);
+  // Task v2: a task ref is never a message target in this CLI — a task is
+  // replied to with `raft task reply`. (Servers still accept the ref from
+  // older CLIs, which copy it from the delivery.) Refused before stdin is read.
+  const taskRef = parseAgentTaskRef(target);
+  if (taskRef) {
+    throw cliError(TASK_TARGET_USE_TASK_COMMAND_ERROR_CODE, formatTaskTargetUseTaskCommand({ ref: taskRef.ref, action: "send" }));
+  }
 
   try {
     rejectArgContent(positionalContent, opts);
@@ -688,6 +1248,9 @@ async function handleMessageSend(
   let outgoingContent = "";
   let outgoingAttachmentIds: string[] = [];
   let outgoingMentions: AgentApiStructuredMention[] = explicitMentions;
+  // RFC 082: `--card <file>` (checked here), or the card a saved draft was sent with.
+  let loadedCard: LoadedCard | undefined;
+  let outgoingCard: MessageCardInput | undefined;
   let previousDraftReholdCount = 0;
   let seenUpToSeq: number | undefined;
   let seenExactSeqs: number[] = [];
@@ -706,18 +1269,44 @@ async function handleMessageSend(
       throw err;
     }
   } else {
+    let cardStdinDeadlineExpired = false;
     try {
-      // Checked before stdin is consumed, so a bad id costs no message body.
+      // Checked before stdin is consumed, so a bad id or card costs no message body.
+      // A card message carries no files (RFC 082 §4.1), whatever the ids are.
+      if (opts.card !== undefined && (opts.attachmentId?.length ?? 0) > 0) throw cardWithAttachmentsError();
       outgoingAttachmentIds = normalizeAttachmentIdFlags(opts.attachmentId ?? [], target);
-      content = await resolveSendContent(ctx.io.stdin ?? process.stdin);
+      if (opts.card !== undefined) {
+        loadedCard = loadCardFile(opts.card);
+        // With a card the text is optional: it is the card's fallback, derived by the Server when absent.
+        const text = await resolveOptionalSendContent(ctx.io.stdin ?? process.stdin, {
+          onNoBytesWithinWindow: () => {
+            cardStdinDeadlineExpired = true;
+          },
+        });
+        content = text !== undefined && text.trim().length > 0 ? text : undefined;
+      } else {
+        content = await resolveSendContent(ctx.io.stdin ?? process.stdin);
+      }
     } catch (err) {
       if (err instanceof SendContentError) throw cliError(err.code, err.message, { cause: err });
       throw err;
     }
-    outgoingContent = content;
+    outgoingContent = content ?? "";
+    if (loadedCard) {
+      // Mentions resolve only from text the sender wrote; a derived fallback mentions no one.
+      if (explicitMentions.length > 0 && content === undefined) throw cardMentionsWithoutTextError();
+      assertCardFallback(loadedCard, content);
+      outgoingCard = loadedCard.input;
+      if (cardStdinDeadlineExpired) writeDiagnostic(ctx.io, formatCardStdinDeadlineDiagnostic("sent"), NL);
+    }
   }
 
   const agentContext = ctx.loadAgentContext();
+  const traceScope = draftTraceScope(ctx, agentContext, target);
+  const traceExpired: OnDraftExpired = (expired) => emitDraftResolved(traceScope, expired, "expired");
+  // The saved draft this send resolves if it is sent (`--send-draft`) or
+  // replaces (a normal send); `cli.draft.resolved` reports how it ended.
+  let draftBeingResolved: SavedDraft | null = null;
   let previousDraftToReplace: SavedDraft | null = null;
   let replacementArchiveAttempted = false;
   let replacementRecoveryFilePath: string | null = null;
@@ -742,7 +1331,7 @@ async function handleMessageSend(
     );
   };
   if (opts.sendDraft) {
-    const draftLookup = lookupSavedDraft(agentContext.agentId, target);
+    const draftLookup = lookupSavedDraft(agentContext.agentId, target, traceExpired);
     if (draftLookup.status === "expired") {
       throw cliError(
         "SEND_DRAFT_EXPIRED",
@@ -791,6 +1380,7 @@ async function handleMessageSend(
       );
     }
     outgoingContent = savedDraft.content;
+    outgoingCard = savedDraft.card;
     outgoingAttachmentIds = savedDraft.attachmentIds;
     outgoingMentions = explicitMentions.length > 0 ? explicitMentions : (savedDraft.mentions ?? []);
     idempotencyKey = savedDraft.idempotencyKey ?? idempotencyKey;
@@ -804,12 +1394,14 @@ async function handleMessageSend(
         mentions: outgoingMentions,
       });
     }
+    draftBeingResolved = { ...savedDraft, idempotencyKey };
     setFailureDraftSaved(true);
     if (sendDraftStdinDeadlineExpired) {
       writeDiagnostic(ctx.io, formatSendDraftStdinDeadlineDiagnostic(), NL);
     }
   } else {
-    const previousDraft = getSavedDraft(agentContext.agentId, target);
+    const previousDraft = getSavedDraft(agentContext.agentId, target, traceExpired);
+    draftBeingResolved = previousDraft;
     previousDraftReholdCount = previousDraft?.reholdCount ?? 0;
     seenUpToSeq = previousDraft?.seenUpToSeq;
     seenExactSeqs = previousDraft?.seenExactSeqs ?? [];
@@ -839,12 +1431,16 @@ async function handleMessageSend(
         attachmentIds: outgoingAttachmentIds,
         idempotencyKey,
         mentions: outgoingMentions,
+        ...(outgoingCard ? { card: outgoingCard } : {}),
         savedAt: currentTimeMs(),
         reholdCount: previousDraftReholdCount,
         seenUpToSeq,
         seenExactSeqs,
+        // Inherits the rehold count above without a server hold: say so.
+        cause: "thread_confirmation",
       });
       setFailureDraftSaved(true);
+      if (draftBeingResolved) emitDraftResolved(traceScope, draftBeingResolved, "superseded");
       throw cliError(
         "THREAD_CONTEXT_TARGET_CONFIRMATION_REQUIRED",
         formatThreadContextParentSendMessage(target, {
@@ -859,65 +1455,24 @@ async function handleMessageSend(
     }
   }
 
-  // FH-001 full-body advance contract (A), send side: attest only the
-  // local per-target cursor recorded by active body-returning operations
-  // that safely advance a contiguous boundary (`message read` in this
-  // slice). Target keys stay isolated (thread != parent); passive wake/inbox
-  // notices and sparse `message check` drains never record this cursor.
-  // Absent cursor means omit `seenUpToSeq` so the server freshness gate fails
-  // closed.
-  // A saved draft's cursor is a floor, not a pin: reads after the hold move
-  // the ledger cursor past it and fold exact seqs into it, so pinning the
-  // draft value would drop what those reads attested.
-  const ledgerSeenUpToSeq = getConsumedSeq(agentContext.agentId, target);
-  if (ledgerSeenUpToSeq !== undefined && (seenUpToSeq === undefined || ledgerSeenUpToSeq > seenUpToSeq)) {
-    seenUpToSeq = ledgerSeenUpToSeq;
-  }
-  seenExactSeqs = [...new Set([
-    ...seenExactSeqs,
-    ...getConsumedExactSeqs(agentContext.agentId, target),
-  ])]
-    .filter((seq) => Number.isInteger(seq) && seq > (seenUpToSeq ?? 0))
-    .sort((a, b) => a - b)
-    .slice(-2_500);
-  const body: AgentApiSendV2Body = {
+  const plan = buildSendBody(agentContext.agentId, {
     target,
     content: outgoingContent,
+    ...(outgoingCard ? { card: outgoingCard } : {}),
+    attachmentIds: outgoingAttachmentIds,
+    mentions: outgoingMentions,
     idempotencyKey,
-    draftReholdCount: previousDraftReholdCount,
-  };
-  if (reviewerIsolation) {
-    body.freshnessContextMode = "withheld";
-  }
-  // The channel card version this context has (RFC 072 `channel`; glimpse
-  // G1): never seen here holds the send once, an older one comes back with
-  // the reply. Reviewer isolation sends no new context, so it says nothing.
-  const cardForSend = reviewerIsolation ? undefined : channelCardForSend(agentContext.agentId, target);
-  const peerForSend = reviewerIsolation ? undefined : peerCardForSend(agentContext.agentId, target);
-  if (cardForSend || peerForSend) {
-    body.seenCards = {
-      ...(cardForSend ? cardForSend.seenCards : {}),
-      ...(peerForSend ? { peer: peerForSend.seen } : {}),
-    };
-  }
-  if (seenUpToSeq !== undefined) {
-    body.seenUpToSeq = seenUpToSeq;
-  }
-  if (seenExactSeqs.length > 0) {
-    body.seenExactSeqs = seenExactSeqs;
-  }
-  if (opts.sendDraft) {
-    body.sendDraft = true;
-    if (opts.anyway) body.continueAnyway = true;
-  } else {
-    body.draftReplacedExisting = previousDraftReholdCount > 0;
-  }
-  if (outgoingAttachmentIds.length > 0) {
-    body.attachmentIds = outgoingAttachmentIds;
-  }
-  if (outgoingMentions.length > 0) {
-    body.mentions = outgoingMentions;
-  }
+    reholdCount: previousDraftReholdCount,
+    seenUpToSeq,
+    seenExactSeqs,
+    reviewerIsolation,
+    sendDraft: opts.sendDraft === true,
+    anyway: opts.anyway === true,
+  });
+  const { body, cardForSend, peerForSend } = plan;
+  seenUpToSeq = plan.seenUpToSeq;
+  seenExactSeqs = plan.seenExactSeqs;
+  let preSendCopySaved = false;
   if (!opts.sendDraft) {
     // The pre-send copy only exists to survive a failed send. The ledger is
     // loss-tolerant: if it cannot be written, send anyway and report honestly
@@ -929,11 +1484,15 @@ async function handleMessageSend(
         attachmentIds: outgoingAttachmentIds,
         idempotencyKey,
         mentions: outgoingMentions,
+        ...(outgoingCard ? { card: outgoingCard } : {}),
         savedAt: currentTimeMs(),
         reholdCount: previousDraftReholdCount,
         seenUpToSeq,
         seenExactSeqs,
+        // Like the rehold count, the cause of the draft this copy replaces.
+        ...(draftBeingResolved?.cause ? { cause: draftBeingResolved.cause } : {}),
       });
+      preSendCopySaved = true;
       setFailureDraftSaved(true);
     } catch {
       setFailureDraftSaved(false);
@@ -941,128 +1500,34 @@ async function handleMessageSend(
   }
   const client = ctx.createApiClient(agentContext);
   const agentApi = createAgentApiSurfaceClient(client);
-  let res;
-  try {
-    let initialFailure: unknown;
-    try {
-      res = await agentApi.messages.sendV2(body);
-    } catch (err) {
-      if (!isPreResponseTransportAmbiguity(err)) throw err;
-      initialFailure = err;
-    }
-
-    if (initialFailure !== undefined || (res && !res.ok && res.status >= 500)) {
-      const originalResponse = res;
-      let reconciliation;
-      try {
-        reconciliation = await agentApi.messages.sendV2({
-          target,
-          idempotencyKey,
-          reconcileOnly: true,
-        });
-      } catch {
-        if (initialFailure !== undefined) throw initialFailure;
-      }
-
-      if (!reconciliation?.ok || !reconciliation.data) {
-        if (initialFailure !== undefined) throw initialFailure;
-        throw markSendFailureDraftSaved(
-          cliError(
-            originalResponse && originalResponse.status >= 500 ? "SERVER_5XX" : "SEND_FAILED",
-            originalResponse?.error ?? `HTTP ${originalResponse?.status ?? 500}`,
-          ),
-          true,
-          true,
-        );
-      } else if (reconciliation.data.state === "committed") {
-        res = reconciliation;
-      } else if (reconciliation.data.state === "not_found") {
-        try {
-          res = await agentApi.messages.sendV2(body);
-        } catch (err) {
-          const originalDraftStillSaved =
-            getSavedDraft(agentContext.agentId, target)?.idempotencyKey === idempotencyKey;
-          throw markIdempotentReplayFailure(err, target, idempotencyKey, originalDraftStillSaved);
-        }
-        if (!res.ok) {
-          const originalDraftStillSaved =
-            getSavedDraft(agentContext.agentId, target)?.idempotencyKey === idempotencyKey;
-          throw markIdempotentReplayFailure(
-            cliError(res.status >= 500 ? "SERVER_5XX" : "SEND_FAILED", res.error ?? `HTTP ${res.status}`),
-            target,
-            idempotencyKey,
-            originalDraftStillSaved,
-          );
-        }
-      } else {
-        if (initialFailure !== undefined) throw initialFailure;
-        throw markSendFailureDraftSaved(
-          cliError(
-            originalResponse && originalResponse.status >= 500 ? "SERVER_5XX" : "SEND_FAILED",
-            originalResponse?.error ?? `HTTP ${originalResponse?.status ?? 500}`,
-          ),
-          true,
-          true,
-        );
-      }
-    }
-  } catch (err) {
-    if (reviewerIsolation) {
-      const retryable = err instanceof CliError && err.retryable === true;
-      throw cliError(
-        "SEND_FAILED",
-        "Reviewer-isolation send failed; upstream response detail was withheld.",
-        {
-          cause: err,
-          draftSaved: retryable ? true : undefined,
-          retryable: retryable ? true : undefined,
-          suggestedNextAction: retryable
-            ? `The saved draft retains the same idempotency key, so retrying it cannot create a second message: \`raft message send --reviewer-isolation --send-draft --expected-draft-key "${idempotencyKey}" --target "${target}"\`. The command verifies the expected key again before making any request and refuses if another send replaced the draft.`
-            : undefined,
-        },
-      );
-    }
-    throw err;
-  }
-  if (!res) {
-    throw cliError("INVALID_JSON_RESPONSE", "Agent API messageSend did not return a response");
-  }
-  if (!res.ok) {
-    const code = res.status >= 500 ? "SERVER_5XX" : "SEND_FAILED";
-    throw cliError(
-      code,
-      reviewerIsolation
-        ? `Reviewer-isolation send failed (HTTP ${res.status}); upstream error detail was withheld.`
-        : res.error ?? `HTTP ${res.status}`,
-    );
-  }
-  const rawData = res.data;
-  if (!rawData) {
-    throw cliError("INVALID_JSON_RESPONSE", "Agent API messageSend returned an empty response body");
-  }
-  const outcome = classifyMessageSendOutcome(rawData);
+  const outcome = await sendWithReconciliation(agentApi, body, {
+    agentId: agentContext.agentId,
+    target,
+    idempotencyKey,
+    reviewerIsolation,
+    cardFile: loadedCard?.file ?? null,
+  });
 
   if (outcome.kind === "held") {
-    // RFC 072 §7.10 observability: a hold because this context has not read
-    // the thread (evidence from another context withheld) vs. a hold that
-    // came with evidence (there really were newer messages).
     const data = outcome.data;
-    const holdReasons = data.holdReasons ?? [];
-    const heldForCardOnly = (holdReasons.includes("channel_card") || holdReasons.includes("peer_card")) && !holdReasons.includes("unread_messages");
-    if (heldForCardOnly) {
-      incrementMetaCounter(agentContext.agentId, "channelCardHold");
-    } else if (seenUpToSeq !== undefined) {
-      incrementMetaCounter(agentContext.agentId, "freshnessHold.withEvidence");
-    } else if (wasConsumedEvidenceWithheldForContext(agentContext.agentId, target)) {
-      incrementMetaCounter(agentContext.agentId, "freshnessHold.contextSwitch");
+    // The continuation pilot (continuations_pilot_v0): a plain text send that
+    // is held asks the agent instead of saving a draft. Read from the Server
+    // only here, where it changes something; off, unknown or unreadable keeps
+    // the draft flow below. A card message is not plain text: its draft keeps
+    // the card (RFC 082).
+    if (!opts.sendDraft && !opts.json && !reviewerIsolation && !outgoingCard && continuationsSupportedRuntime(ctx.env) && await continuationsPilotOn(ctx, agentContext)) {
+      await continueHeldSend(ctx, agentContext, {
+        target,
+        content: outgoingContent,
+        attachmentIds: outgoingAttachmentIds,
+        mentions: outgoingMentions.map(({ type, id, name }) => ({ type, id, name })),
+        reholdCount: previousDraftReholdCount,
+        seenUpToSeq: seenUpToSeq ?? null,
+        seenExactSeqs,
+      }, { data, idempotencyKey, preSendCopySaved, seenUpToSeq, cardForSend, peerForSend });
+      return;
     }
-    const contextWasWithheld = reviewerIsolation || data.freshnessContextMode === "withheld";
-    // The held bounded context was just rendered to the agent — that
-    // boundary is consumed too; record it so even an abandoned draft
-    // leaves an honest per-target cursor behind.
-    if (!contextWasWithheld && typeof data.seenUpToSeq === "number" && Number.isFinite(data.seenUpToSeq)) {
-      recordConsumedSeqs(agentContext.agentId, { [target]: data.seenUpToSeq });
-    }
+    const { heldForCardOnly, contextWasWithheld } = bookHeldContext(agentContext.agentId, target, data, { reviewerIsolation, seenUpToSeq });
     let heldDraftSaved = true;
     try {
       setSavedDraft(agentContext.agentId, target, {
@@ -1070,19 +1535,37 @@ async function handleMessageSend(
         attachmentIds: outgoingAttachmentIds,
         idempotencyKey,
         mentions: outgoingMentions,
+        ...(outgoingCard ? { card: outgoingCard } : {}),
         savedAt: currentTimeMs(),
         reholdCount: previousDraftReholdCount + 1,
         // A hold for the card alone showed no messages: keep what was attested.
         seenUpToSeq: contextWasWithheld || heldForCardOnly ? seenUpToSeq : data.seenUpToSeq,
         seenExactSeqs: contextWasWithheld || heldForCardOnly ? seenExactSeqs : [],
+        cause: "held",
       });
     } catch {
       heldDraftSaved = false;
     }
+    if (heldDraftSaved) {
+      emitDraftHeld(traceScope, { idempotencyKey, savedAt: currentTimeMs(), reholdCount: previousDraftReholdCount + 1, cause: "held" });
+    }
     setFailureDraftSaved(heldDraftSaved);
+    // `--send-draft` held again keeps the same draft (same key), so only a
+    // normal send that replaced one ends it here.
+    if (heldDraftSaved && !opts.sendDraft && draftBeingResolved) {
+      emitDraftResolved(traceScope, draftBeingResolved, "superseded");
+    }
     const heldDetails = contextWasWithheld ? redactFreshnessHoldForReviewerIsolation(data) : data;
     if (!opts.json) {
-      writeText(ctx.io, formatHeldSendOutput(target, data, contextWasWithheld, heldDraftSaved));
+      const heldText = formatHeldSendOutput(
+        target,
+        data,
+        contextWasWithheld,
+        heldDraftSaved,
+        outgoingCard ? { file: loadedCard?.file ?? null } : undefined,
+      );
+      writeText(ctx.io, heldText);
+      countRendered(agentContext.agentId, heldForCardOnly ? "card_hold" : "freshness_hold", heldText);
     }
     // A card in the JSON error details is shown too: not recording it would
     // hold every JSON-mode send again, `--send-draft` included.
@@ -1100,7 +1583,7 @@ async function handleMessageSend(
         retryable: false,
         outputMode: opts.json ? "json" : "text",
         details: { held: heldDetails as unknown as Record<string, unknown> },
-        suggestedNextAction: "Review the held context, then send the full content again.",
+        suggestedNextAction: "Review the held context. If it already says what you meant to say, send nothing; otherwise send the full content again.",
       });
     }
     throw cliError(
@@ -1116,7 +1599,7 @@ async function handleMessageSend(
         retryable: false,
         outputMode: opts.json ? "json" : "text",
         details: { held: heldDetails as unknown as Record<string, unknown> },
-        suggestedNextAction: "Review the held context, then update the draft or send the current draft unchanged.",
+        suggestedNextAction: "Review the held context. If it already says what you meant to say, send nothing and delete the draft (--discard-draft); otherwise update the draft or send it unchanged.",
       },
     );
   }
@@ -1130,166 +1613,48 @@ async function handleMessageSend(
   } catch {
     // Swallow: see above.
   }
-  if (outcome.kind === "committed") {
-    const data = outcome.data;
-    if (opts.json) {
-      writeJson(ctx.io, replacementArchiveAttempted
-        ? {
-            ...data,
-            replacedDraft: {
-              replaced: true,
-              recoverySaved: replacementRecoveryFilePath !== null,
-              recoveryFile: replacementRecoveryFilePath,
-            },
-          }
-        : data);
-      return;
-    }
-    const replacementSection = replacementArchiveAttempted
-      ? `\n${formatDraftReplacedSuccess(replacementRecoveryFilePath)}`
-      : "";
-    writeText(
-      ctx.io,
-      adoptCliReplyText(
-        `Message commit confirmed for ${target}. Message ID: ${data.messageId}\n`
-        + "The original response was lost, so delivery-side receipt details (including mention delivery warnings and recent unread context) are unavailable; no message was replayed."
-        + replacementSection,
-      ),
-      NL,
-    );
-    return;
+  if (draftBeingResolved) {
+    emitDraftResolved(traceScope, draftBeingResolved, opts.sendDraft ? "sent_unchanged" : "replaced_and_sent");
   }
-  const data = outcome.data;
-  const shortId = data.messageId ? data.messageId.slice(0, 8) : null;
-  const replyHint = shortId
-    ? ` (to reply in this message's thread, use target "${target.includes(":") ? target : target + ":" + shortId}")`
-    : "";
-
-  let unreadSection = "";
-  let settleSenders: (io: typeof ctx.io) => Promise<void> = async () => {};
-  if (data.recentUnread && data.recentUnread.length > 0) {
-    const senders = elideSeenSenders(data.recentUnread, agentContext.agentId);
-    settleSenders = senders.settle;
-    unreadSection = `\n\n--- New messages you may have missed ---\n${formatMessages(senders.messages)}`;
-  }
-
-  const pendingMentionActions = normalizePendingMentionActions(data);
-  const unresolvedMentionHandles = normalizeUnresolvedMentionHandles(data);
-  const undeliveredMentionCount = pendingMentionActions.length + unresolvedMentionHandles.length;
-  const mentionSection = undeliveredMentionCount > 0
-    ? formatPendingMentionActions(pendingMentionActions, {
-        source: "send",
-        unresolvedMentionHandles,
-      }).trimEnd()
-    : "";
-  const sentStatusLine = undeliveredMentionCount > 0
-    ? `Message queued to ${target}. Message ID: ${data.messageId}`
-    : `Message sent to ${target}. Message ID: ${data.messageId}`;
-  const driveByTip = formatDriveByJoinedToPostTip(target, data);
-  const driveBySection = driveByTip ? `\n\n${driveByTip}` : "";
-
-  const mentionRecoveryCommands = pendingMentionActions
-    .map((action) => toSenderPendingMentionAction(action).recoveryCommand)
-    .filter((command): command is string => command !== null);
-  const partialSendPayload = undeliveredMentionCount > 0
-    ? {
-        ...data,
-        state: "partial",
-        message: { status: "queued", id: data.messageId },
-        pendingMentionActions: pendingMentionActions.map(toSenderPendingMentionAction),
-        ...(unresolvedMentionHandles.length > 0
-          ? { unresolvedMentionWarnings: unresolvedMentionHandles.map(toSenderUnresolvedMentionWarning) }
-          : {}),
-      }
-    : null;
-  const mentionDeliveryError = undeliveredMentionCount > 0
-    ? cliError(
-        "MENTION_DELIVERY_FAILED",
-        `Partial result for message ${data.messageId}: message status=queued; ${undeliveredMentionCount} @mention${undeliveredMentionCount === 1 ? "" : "s"} status=not_queued.`,
-        {
-          draftSaved: false,
-          effect: "message_queued",
-          retryable: false,
-          outputMode: opts.json ? "json" : "text",
-          details: partialSendPayload ? { result: partialSendPayload } : undefined,
-          suggestedNextAction:
-            [
-              "The message is already queued.",
-              ...(mentionRecoveryCommands.length > 0
-                ? [
-                    `Run only the per-token mention ${mentionRecoveryCommands.length === 1 ? "recovery" : "recoveries"}: `
-                      + mentionRecoveryCommands.map((command) => `\`${command}\``).join("; ")
-                      + ".",
-                  ]
-                : []),
-              ...(unresolvedMentionHandles.length > 0
-                ? ["If an unresolved token was literal prose, wrap it in code; otherwise verify the exact handle and send only a corrected follow-up mention."]
-                : []),
-              "Do not resend the queued message.",
-            ].join(" "),
-        },
-      )
-    : null;
-  if (opts.json) {
-    if (mentionDeliveryError) throw mentionDeliveryError;
-    writeJson(ctx.io, replacementArchiveAttempted
-      ? {
-          ...data,
-          replacedDraft: {
-            replaced: true,
-            recoverySaved: replacementRecoveryFilePath !== null,
-            recoveryFile: replacementRecoveryFilePath,
-          },
-        }
-      : data);
-    if (data.channelCard && cardForSend) {
-      await recordChannelCardShown(agentContext.agentId, data.channelCard, cardForSend.contextId, target, ctx.io);
-    }
-    if (data.peerCard && peerForSend) {
-      await recordPeerCardShown(agentContext.agentId, data.peerCard, peerForSend.contextId, target, ctx.io);
-    }
-    return;
-  }
-
-  const partialSection = mentionSection ? `${mentionSection}\n\n` : "";
-  const replacementSection = replacementArchiveAttempted
-    ? `\n${formatDraftReplacedSuccess(replacementRecoveryFilePath)}`
-    : "";
-  writeText(
-    ctx.io,
-    adoptCliReplyText(
-      `${partialSection}${sentStatusLine}${replyHint}${replacementSection}${driveBySection}${unreadSection}`,
-    ),
-    NL,
-  );
-  if (data.channelCard && cardForSend) {
-    writeText(ctx.io, formatSentChannelCard(data.channelCard, data.channelCardChanged === true));
-    await recordChannelCardShown(agentContext.agentId, data.channelCard, cardForSend.contextId, target, ctx.io);
-  }
-  if (data.peerCard && peerForSend) {
-    writeText(ctx.io, formatSentPeerCard(data.peerCard));
-    await recordPeerCardShown(agentContext.agentId, data.peerCard, peerForSend.contextId, target, ctx.io);
-  }
-  if (!reviewerIsolation && data.messageId && attachOnEverySend(agentContext.agentId, target)) {
-    const attachment = await fetchSendAttachment(agentApi, target, data.messageId);
-    // The message is committed: rendering trouble must not fail the command.
-    let attached: CliReplyText | null = null;
-    try {
-      attached = attachment ? formatSendAttachment(attachment) : null;
-    } catch {
-      attached = null;
-    }
-    if (attached) writeText(ctx.io, attached);
-  }
-  await settleSenders(ctx.io);
-  if (mentionDeliveryError) throw mentionDeliveryError;
+  await writeSentOutput(ctx, agentContext, agentApi, target, outcome, {
+    json: opts.json === true,
+    reviewerIsolation,
+    replacementArchiveAttempted,
+    replacementRecoveryFilePath,
+    cardForSend,
+    peerForSend,
+    messageCard: outgoingCard !== undefined,
+  });
 }
+
+/** `raft message send --help`: card messages (RFC 082), kept short; the Manual topic `message` has every element's props. */
+const MESSAGE_CARD_SEND_HELP =
+  "\nCard messages (--card <file>):\n" +
+  "  A card is a small display-only layout that everyone in the conversation sees the same way: Stack, Text, Badge, RelativeTime, Duration, Button (a button only opens an https link; \"open\": \"beside\" opens it in a panel beside the conversation on the web instead of a new tab), Markdown (bold, lists, quotes, code, http, https and mailto links), Fields (label and value rows) and Divider, under an optional header (a title, a subtitle, up to 3 tags).\n" +
+  "  The file is JSON: {\"version\":1,\"header\":{\"title\":\"Build 42\",\"tags\":[{\"text\":\"In review\",\"tone\":\"info\"}]},\"root\":\"root\",\"elements\":{\"root\":{\"type\":\"Stack\",\"props\":{},\"children\":[\"facts\"]},\"facts\":{\"type\":\"Fields\",\"props\":{\"items\":[{\"label\":\"Version\",\"value\":\"1.20.0\",\"mono\":true}]}}}}\n" +
+  `  Limits: ${MESSAGE_CARD_LIMITS.maxElements} elements, depth ${MESSAGE_CARD_LIMITS.maxDepth}, 12 children per Stack, ${MESSAGE_CARD_LIMITS.maxButtons} buttons, ${MESSAGE_CARD_LIMITS.maxFields} rows per Fields, 8 KiB of JSON (the header included). Markdown with anything else (a heading, table, image, HTML, a link that is not http, https or mailto, lists or quotes nested deeper than ${MESSAGE_CARD_LIMITS.markdownMaxNesting}) is refused, never cut. A card that breaks a rule is refused before anything is sent, with the element's path and the limit.\n` +
+  "  The text on stdin is optional: it is what agents, search and notifications read. Without it, Raft makes it from the card (the header first), and it mentions no one: neither does an @name anywhere on the card, Markdown included.\n" +
+  "  A card message carries no files: send files in a separate message.\n" +
+  `  Only you can replace the card, for ${MESSAGE_CARD_LIMITS.updateWindowDays} days: raft message update-card. Replacing it notifies no one.\n` +
+  "  If card messages are off on this Server (flag message_cards), the send is refused: send text instead.\n" +
+  "  A Server older than card messages posts only the text: the receipt then says \"Sent as text only\" (with --json, it has no messageCard).\n" +
+  "  Every element and its props: the Manual topic \"message\" (Card messages).\n";
 
 export const messageSendCommand = defineCommand(
   {
     name: "send",
     description: "Send a message to a channel, DM, or thread",
+    // Declared only so positional content gets the stdin guidance error
+    // (rejectArgContent) instead of a generic parser error; usage hides it.
     arguments: ["[content...]"],
+    usage: "--target <target> [options] < message body on stdin",
+    helpAfter:
+      "\nThe message body is read from stdin, never from arguments. Use a quoted heredoc so the shell leaves quotes, $vars and backticks alone:\n" +
+      `  raft message send --target "#channel" <<'${MESSAGE_HEREDOC_DELIMITER}'\n` +
+      "  message body\n" +
+      `  ${MESSAGE_HEREDOC_DELIMITER}\n` +
+      "\nIf the message is sent but an @mention could not be delivered, the command still exits 0 and lists each undelivered mention with its recovery command. Do not resend the message.\n" +
+      MESSAGE_CARD_SEND_HELP,
     options: [
       { flags: "--target <target>", description: "Target: '#channel', 'dm:@peer', '#channel:shortid', 'dm:@peer:shortid' (a thread: shortid is its root message's msg=, as in replyTarget)" },
       PEER_KIND_OPTION,
@@ -1314,7 +1679,7 @@ export const messageSendCommand = defineCommand(
       },
       reviewerIsolationOption,
       { flags: "--json", description: "Emit the Agent API send response as JSON" },
-      { flags: "--content <content>", description: "Unsupported. Pipe message content to stdin instead." },
+      { flags: "--content <content>", description: "Unsupported. Pipe message content to stdin instead.", hidden: true },
       {
         flags: "--attachment-id <id>",
         description: "Attachment ID to link (repeatable). Get one from `raft attachment upload`. Several IDs in one value, separated by spaces or commas, are split.",
@@ -1325,6 +1690,10 @@ export const messageSendCommand = defineCommand(
         description: "Bind an @handle to one actor (repeatable): human:<uuid>:<handle> or agent:<uuid>:<handle>.",
         parse: (value, prev: string[] = []) => prev.concat(value),
       },
+      {
+        flags: "--card <file>",
+        description: "Post the message as a card, from this JSON file (see Card messages below). The text on stdin is then optional.",
+      },
     ],
   },
   async (ctx, positionalContent: string[], opts: SendOpts) => {
@@ -1334,6 +1703,8 @@ export const messageSendCommand = defineCommand(
         failureDraftSaved = draftSaved;
       });
     } catch (err) {
+      // A pause (exit 10) and a continuation's refusal are not send failures.
+      if (err instanceof CliExit || isContinuationRefusal(err)) throw err;
       throw markSendFailureDraftSaved(err, failureDraftSaved);
     }
   },
@@ -1341,4 +1712,253 @@ export const messageSendCommand = defineCommand(
 
 export function registerSendCommand(parent: Command, runtimeOptions: CommandRuntimeOptions = {}): void {
   registerCliCommand(parent, messageSendCommand, runtimeOptions);
+}
+
+// ---- the continuation pilot (message/_sendContinuation.ts) ----
+
+/**
+ * The draft flow stays for runtimes the pilot fails (codex: it read the
+ * pause's exit 10 as a failure and sent again, #wg-ax:#5). The Server already
+ * reports the pilot off for them; this covers a server without that check.
+ * The runtime is what the daemon passes the CLI; an unknown or missing
+ * runtime keeps the pilot's behaviour.
+ */
+function continuationsSupportedRuntime(env: NodeJS.ProcessEnv): boolean {
+  const runtime = cliTraceRuntime(env);
+  return runtime === undefined || !CONTINUATIONS_DRAFT_FLOW_RUNTIMES.has(runtime);
+}
+
+const pilotReads = new WeakMap<CommandContext, Promise<boolean>>();
+
+/**
+ * Whether the continuation pilot (`continuations_pilot_v0`) is on for this
+ * agent's server: the agent context's `features.continuationsPilot`, read
+ * with the command's own client and credential. Read at most once per
+ * command (a CLI process runs one), and only when a send is held. A failed
+ * read, or a Server that does not report it, is off.
+ */
+function continuationsPilotOn(ctx: CommandContext, agentContext: ReturnType<CommandContext["loadAgentContext"]>): Promise<boolean> {
+  let read = pilotReads.get(ctx);
+  if (!read) {
+    read = (async () => {
+      try {
+        const res = await createAgentApiSurfaceClient(ctx.createApiClient(agentContext)).agent.context();
+        return res.ok && res.data?.features?.continuationsPilot === true;
+      } catch {
+        return false;
+      }
+    })();
+    pilotReads.set(ctx, read);
+  }
+  return read;
+}
+
+/**
+ * A send just held, with the pilot on: keep the message in a continuation
+ * instead of a draft. The attempt already made (today's send, under today's
+ * key) is the continuation's first step, so nothing is sent again; its copy
+ * is removed, so `--send-draft` cannot send the message a second time.
+ */
+async function continueHeldSend(
+  ctx: CommandContext,
+  agentContext: ReturnType<CommandContext["loadAgentContext"]>,
+  args: SendContinuationArgs,
+  held: {
+    data: AgentApiHeldFreshnessResponse;
+    idempotencyKey: string;
+    preSendCopySaved: boolean;
+    seenUpToSeq: number | undefined;
+    cardForSend: SendBodyPlan["cardForSend"];
+    peerForSend: SendBodyPlan["peerForSend"];
+  },
+): Promise<void> {
+  if (held.preSendCopySaved) {
+    try {
+      clearSavedDraftIfIdempotencyKeyMatches(agentContext.agentId, args.target, held.idempotencyKey);
+    } catch (err) {
+      throw heldCopyNotCleared(err, args.target, null);
+    }
+  }
+  const first = heldStep(ctx, agentContext.agentId, args.target, held.data, held);
+  await runContinuable(ctx, ctx.continuations, messageSendContinuation(ctx, { answering: null }, first), args);
+}
+
+/**
+ * What a held attempt journals (the question's preview), and what it records
+ * once the question was printed: the shown messages as read, the render
+ * count, the cards.
+ */
+function heldStep(
+  ctx: CommandContext,
+  agentId: string,
+  target: string,
+  data: AgentApiHeldFreshnessResponse,
+  plan: { seenUpToSeq: number | undefined; cardForSend: SendBodyPlan["cardForSend"]; peerForSend: SendBodyPlan["peerForSend"] },
+): { result: SendStepResult; afterPause: () => Promise<void> } {
+  const { heldForCardOnly, contextWasWithheld } = countHold(agentId, target, data, { reviewerIsolation: false, seenUpToSeq: plan.seenUpToSeq });
+  const { cardOnlyLead, preview } = renderAgentHoldPreview(target, data);
+  return {
+    result: { held: true, cardOnlyLead, preview, anywayOffered: data.continueAnywaySuggested === true },
+    // What the question shows counts as seen once it was printed: a pause that
+    // could not be saved (or a crash before it) showed nothing, so the next
+    // send holds for the same messages and shows them.
+    afterPause: async () => {
+      recordHeldShown(agentId, target, data, contextWasWithheld);
+      countRendered(agentId, heldForCardOnly ? "card_hold" : "freshness_hold", preview);
+      if (contextWasWithheld) return;
+      if (data.channelCard && plan.cardForSend) await recordChannelCardShown(agentId, data.channelCard, plan.cardForSend.contextId, target, ctx.io);
+      if (data.peerCard && plan.peerForSend) await recordPeerCardShown(agentId, data.peerCard, plan.peerForSend.contextId, target, ctx.io);
+    },
+  };
+}
+
+/** What one invocation of the continued send keeps between its steps and its output. */
+interface ContinuedSendLive {
+  /** The continuation this invocation answers (`cont`), or null for the send's first run. */
+  answering: ContinuationInvocation["answering"];
+  /** The first run's attempt, already made and held (handleMessageSend): its step returns it. */
+  first: ReturnType<typeof heldStep> | undefined;
+  printedSentOutput: boolean;
+  /** Run once the paused text was written (cards the agent has now seen). */
+  afterPause: Array<() => Promise<void>>;
+}
+
+/**
+ * One attempt of a continued send: the same body, request and bookkeeping as
+ * a normal send, under the step's idempotency key. Held, it keeps no draft:
+ * the message lives in the continuation, so `--send-draft` cannot send it a
+ * second time. Sent, it prints the usual output.
+ */
+async function attemptContinuedSend(
+  ctx: CommandContext,
+  args: SendContinuationArgs,
+  attempt: SendAttempt,
+  live: ContinuedSendLive,
+): Promise<SendStepResult> {
+  if (live.first) {
+    // The send itself happened before the continuation existed: journal what it got.
+    const first = live.first;
+    live.first = undefined;
+    live.afterPause.push(first.afterPause);
+    return first.result;
+  }
+  const agentContext = ctx.loadAgentContext();
+  const agentId = agentContext.agentId;
+  const { target } = args;
+  const { idempotencyKey } = attempt;
+  const plan = buildSendBody(agentId, {
+    target,
+    content: attempt.content,
+    attachmentIds: args.attachmentIds,
+    mentions: attempt.mentions,
+    idempotencyKey,
+    reholdCount: attempt.reholdCount,
+    seenUpToSeq: args.seenUpToSeq ?? undefined,
+    seenExactSeqs: args.seenExactSeqs,
+    reviewerIsolation: false,
+    sendDraft: attempt.mode !== "new",
+    anyway: attempt.mode === "anyway",
+  });
+  // As for a normal send: a copy that survives a failed send, under the same key.
+  let copySaved = false;
+  try {
+    setSavedDraft(agentId, target, {
+      content: attempt.content,
+      attachmentIds: args.attachmentIds,
+      idempotencyKey,
+      mentions: attempt.mentions,
+      savedAt: currentTimeMs(),
+      reholdCount: attempt.reholdCount,
+      seenUpToSeq: plan.seenUpToSeq,
+      seenExactSeqs: plan.seenExactSeqs,
+    });
+    copySaved = true;
+  } catch {
+    // Send anyway; a failure then reports that no draft was kept.
+  }
+  const agentApi = createAgentApiSurfaceClient(ctx.createApiClient(agentContext));
+  let outcome: MessageSendOutcome;
+  try {
+    outcome = await sendWithReconciliation(agentApi, plan.body, { agentId, target, idempotencyKey, reviewerIsolation: false });
+  } catch (err) {
+    throw markSendFailureDraftSaved(err, copySaved);
+  }
+
+  if (outcome.kind === "held") {
+    // No held draft: drop the copy before anything is booked, so a failure
+    // here leaves the hold unbooked.
+    if (copySaved) {
+      try {
+        clearSavedDraftIfIdempotencyKeyMatches(agentId, target, idempotencyKey);
+      } catch (err) {
+        throw heldCopyNotCleared(err, target, live.answering);
+      }
+    }
+    const held = heldStep(ctx, agentId, target, outcome.data, plan);
+    live.afterPause.push(held.afterPause);
+    return held.result;
+  }
+
+  // Committed: as for a normal send, a failed clear only leaves a copy under this same key.
+  try {
+    clearSavedDraftIfIdempotencyKeyMatches(agentId, target, idempotencyKey);
+  } catch {
+    // See handleMessageSend.
+  }
+  await writeSentOutput(ctx, agentContext, agentApi, target, outcome, {
+    json: false,
+    reviewerIsolation: false,
+    replacementArchiveAttempted: false,
+    replacementRecoveryFilePath: null,
+    cardForSend: plan.cardForSend,
+    peerForSend: plan.peerForSend,
+  });
+  live.printedSentOutput = true;
+  return { held: false, status: outcome.kind, messageId: outcome.data.messageId ?? null };
+}
+
+/**
+ * A held attempt whose local copy could not be removed. In the send's first
+ * run nothing was saved for an answer: the copy is a draft like today's. In
+ * `cont`, the continuation still holds the message: the run let go of the
+ * answer, so the same `cont` takes it over and runs this step again under
+ * the same key, as `--send-draft` would send the copy; a new send would be a
+ * second message.
+ */
+function heldCopyNotCleared(cause: unknown, target: string, answering: ContinuedSendLive["answering"]): CliError {
+  if (!answering) {
+    return cliError("LOCAL_WRITE_FAILED", "Message held: no target delivery occurred, and its local copy could not be removed, so it was not kept for an answer.", {
+      cause,
+      draftSaved: true,
+      retryable: false,
+      suggestedNextAction: `Read the new messages (raft message read --target "${target}"), then send what still needs saying.`,
+    });
+  }
+  const command = `cont ${answering.id}${answering.choice === undefined ? "" : ` ${answering.choice}`}`;
+  const again = answering.withInput ? `${command} <<'${MESSAGE_HEREDOC_DELIMITER}'\n<the same text>\n${MESSAGE_HEREDOC_DELIMITER}` : command;
+  return cliError(
+    "LOCAL_WRITE_FAILED",
+    `Your message could not be cleared from this computer's saved copy, so it is still kept for this question. Answer again with the same command: ${again}`,
+    { cause, draftSaved: true, retryable: true },
+  );
+}
+
+/**
+ * `raft message send` held for unseen messages, as a continuation, built for
+ * this invocation (its steps send through this invocation's agent and API
+ * client). In the table `cont` resumes from (continuation/_commands.ts).
+ */
+export function messageSendContinuation(
+  ctx: CommandContext,
+  invocation: ContinuationInvocation,
+  first?: ReturnType<typeof heldStep>,
+): CliContinuationCommand<SendContinuationArgs, SendContinuationOutcome> {
+  const live: ContinuedSendLive = { answering: invocation.answering, first, printedSentOutput: false, afterPause: [] };
+  return createSendContinuation({
+    attempt: (args, attempt) => attemptContinuedSend(ctx, args, attempt, live),
+    printedSentOutput: () => live.printedSentOutput,
+    onPaused: async () => {
+      for (const action of live.afterPause.splice(0)) await action();
+    },
+  });
 }

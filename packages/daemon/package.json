@@ -1,8 +1,8 @@
 {
   "name": "@botiverse/raft-daemon",
-  "version": "1.0.49",
+  "version": "1.25.0",
   "private": true,
-  "license": "FSL-1.1-ALv2",
+  "license": "LicenseRef-Raft-License",
   "type": "module",
   "bin": {
     "raft-daemon": "dist/raft-daemon.js",
@@ -16,6 +16,10 @@
     "./bundled-cli": {
       "types": "./src/bundledRaftCli.ts",
       "import": "./dist/bundledRaftCli.js"
+    },
+    "./context-view-restore-child": {
+      "types": "./src/agentContextView/contextViewRestoreChild.ts",
+      "import": "./dist/agentContextView/contextViewRestoreChild.js"
     },
     "./runtime-detection-child": {
       "types": "./src/runtimeDetectionChild.ts",
@@ -34,13 +38,14 @@
     "directory": "packages/daemon"
   },
   "scripts": {
-    "dev": "pnpm --filter @botiverse/raft build && node --watch --import @oxc-node/core/register src/index.ts",
+    "dev": "pnpm --filter @botiverse/raft build && node --watch-path=src --watch-path=../shared/src --watch-path=../shared/assets --watch-path=../shared/announcement-audience.ts --watch-path=../shared/announcement-presentation.ts --watch-path=../shared/feature-flag-taxonomy.ts --watch-path=../sync-core/src --watch-path=../sync-core/contracts --watch-path=../trace-client/src --import @oxc-node/core/register src/index.ts",
     "start": "node --import @oxc-node/core/register src/index.ts",
     "build": "pnpm --filter @botiverse/raft build && tsdown && node -e \"require('fs').cpSync('../cli/dist','dist/cli',{recursive:true})\" && node scripts/write-dist-bins.mjs",
-    "test": "vitest run",
+    "test": "node --import @oxc-node/core/register ../../scripts/vitest/run-in-slot.ts vitest run",
     "test:sea-host": "vitest run --config vitest.sea-host.config.ts",
     "prepack": "pnpm run build",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsrs --noEmit",
+    "typecheck:tsc": "tsc --noEmit",
     "generate:raft-cli-guide": "node --import @oxc-node/core/register scripts/generate-raft-cli-guide.ts",
     "check:raft-cli-guide-fresh": "pnpm generate:raft-cli-guide && git diff --exit-code ../../manual/agent-knowledge/raft-cli-overview.md",
     "generate:pi-builtin-models": "node --import @oxc-node/core/register scripts/generate-pi-builtin-models.ts",
@@ -48,12 +53,13 @@
     "release:sdk-preflight": "node scripts/release-runtime-sdk-preflight.mjs"
   },
   "dependencies": {
-    "@botiverse/kimi-code-sdk": "0.34.0-botiverse.0",
-    "@botiverse/oar": "0.68.1",
-    "@earendil-works/pi-ai": "1.3.0",
-    "@earendil-works/pi-coding-agent": "1.3.0",
-    "@jackwener/opencli": "^1.8.3",
-    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@botiverse/kimi-code-sdk": "2.3.1-botiverse.1",
+    "@botiverse/oar": "0.103.0",
+    "@cursor/sdk": "1.3.1",
+    "@earendil-works/pi-ai": "1.5.2",
+    "@earendil-works/pi-coding-agent": "1.5.2",
+    "@jackwener/opencli": "^2.0.2",
+    "@modelcontextprotocol/sdk": "^1.32.0",
     "ajv": "^8.20.0",
     "commander": "^12.1.0",
     "https-proxy-agent": "^7.0.6",
@@ -61,9 +67,9 @@
     "safe-regex2": "5.1.1",
     "tar-stream": "2.2.0",
     "typebox": "1.1.38",
-    "undici": "8.10.2",
+    "undici": "8.12.3",
     "ws": "^8.22.0",
-    "zod": "^4.3.6"
+    "zod": "^4.6.6"
   },
   "devDependencies": {
     "@botiverse/raft": "workspace:*",

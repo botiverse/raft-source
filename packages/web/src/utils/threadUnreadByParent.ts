@@ -3,7 +3,7 @@ import type { FollowedThread } from "../store/threadStore";
 type FollowedThreadUnreadFields = Pick<
   FollowedThread,
   "threadChannelId" | "parentChannelId" | "unreadCount" | "hasMention" | "lastReplyAt" | "parentMessageCreatedAt"
->;
+> & Partial<Pick<FollowedThread, "conversationKind">>;
 
 /** Followed-thread unread folded onto one parent channel. Never part of the channel's own unreadCount. */
 export type ParentThreadUnread = {
@@ -30,7 +30,10 @@ export function groupThreadUnreadByParent(
   if (cached) return cached;
   const byParent = new Map<string, ParentThreadUnread>();
   for (const thread of threads) {
-    if (thread.unreadCount <= 0) continue;
+    // A task conversation (task v2) shows its unread in Activity only
+    // (stdrc): the channel can neither lead to it nor mark it read
+    // (conversation read-all covers threads), so it never counts here.
+    if (thread.unreadCount <= 0 || thread.conversationKind === "task") continue;
     const current = byParent.get(thread.parentChannelId);
     byParent.set(thread.parentChannelId, {
       count: (current?.count ?? 0) + 1,
@@ -79,6 +82,7 @@ export function orderParentUnreadThreadsForJump<T extends FollowedThreadUnreadFi
   parentChannelId: string,
 ): T[] {
   return threads
-    .filter((thread) => thread.parentChannelId === parentChannelId && thread.unreadCount > 0)
+    // A task conversation (task v2) is not counted, as in the sidebar mark.
+    .filter((thread) => thread.parentChannelId === parentChannelId && thread.unreadCount > 0 && thread.conversationKind !== "task")
     .sort((a, b) => channelPositionTime(a) - channelPositionTime(b));
 }

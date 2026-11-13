@@ -15,7 +15,7 @@ import assert from "node:assert/strict";
 import type { Server as SocketServer } from "socket.io";
 import { and, eq } from "drizzle-orm";
 
-import type { MachineToServerMessage, ServerToMachineMessage } from "@botiverse/raft-shared";
+import { BasicTracer, MemoryTraceSink, type MachineToServerMessage, type ServerToMachineMessage } from "@botiverse/raft-shared";
 
 import { getDb } from "../db/index";
 import { agents, machines, messages, serverMembers, servers, users } from "../db/schema";
@@ -30,7 +30,7 @@ afterEach(async () => {
 });
 
 function fakeIo(): SocketServer {
-  const operator = { in: () => operator, to: () => operator, socketsJoin: () => undefined, emit: () => true };
+  const operator = { in: () => operator, to: () => operator, except: () => operator, socketsJoin: () => undefined, emit: () => true };
   return { in: () => operator, to: () => operator } as unknown as SocketServer;
 }
 
@@ -122,6 +122,14 @@ function unkindedLegacyFailure(agentId: string, launchId: string): MachineToServ
   } as unknown as MachineToServerMessage;
 }
 
+/** The trace events with this name, standalone or on a span, as their attributes. */
+function traceEvents(sink: MemoryTraceSink, name: string): Array<Record<string, unknown>> {
+  return [
+    ...sink.getAllLogEvents().filter((event) => event.name === name),
+    ...sink.getAllSpans().flatMap((span) => span.events.filter((event) => event.name === name)),
+  ].map((event) => event.attrs as Record<string, unknown>);
+}
+
 async function ownerNotices(dmId: string) {
   return getDb().select({ content: messages.content }).from(messages)
     .where(and(eq(messages.channelId, dmId), eq(messages.messageType, "system")));
@@ -129,7 +137,8 @@ async function ownerNotices(dmId: string) {
 
 test("a legacy failed start on a computer that does not list the runtime pauses automatic wakes, tells the owner once, and lifts when the runtime appears", async ({ db: _db }) => {
   const { owner, server, machine, agent } = await seed();
-  const orchestrator = new CapturingOrchestrator();
+  const sink = new MemoryTraceSink();
+  const orchestrator = new CapturingOrchestrator(undefined, undefined, new BasicTracer({ sink }));
   orchestrator.setIO(fakeIo());
   try {
     bindMachine(orchestrator, machine.id, server.id, ["claude"]);
@@ -155,6 +164,11 @@ test("a legacy failed start on a computer that does not list the runtime pauses 
     await orchestrator.handleMachineMessage(machine.id, kindedLegacyFailure(agent.id, orchestrator.starts[0]!.launchId!));
     assert.deepEqual(await breaker.automaticWakeHold(agent.id, Date.now()), { kind: "blocked", reason: "runtime_not_found" });
     assert.equal((await ownerNotices(dm.id)).length, 1, "not told twice");
+    // #proj-runtime:#32: the skipped notice is recorded, so a pause without one never reads as a missing notice.
+    assert.deepEqual(
+      traceEvents(sink, "wake.runtime_unavailable.owner_notice").map((attrs) => attrs.outcome),
+      ["posted", "already_notified"],
+    );
 
     // The owner installs Codex; the computer reports it: automatic wakes resume.
     await (orchestrator as any).enqueueCapabilitiesPersist(machine.id, {

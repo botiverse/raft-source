@@ -1,9 +1,11 @@
 import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
 import remarkBreaks from "remark-breaks";
 import remarkGfm from "remark-gfm";
+import remarkCjkFriendly from "remark-cjk-friendly";
 import type { Options } from "react-markdown";
 import { remarkAutolinkBareUrls } from "../../utils/markdownAutolink";
 import { remarkRawHtmlAsText } from "./remarkMessageTokens";
+import { remarkRaftMath } from "../markdown/remarkRaftMath";
 
 type PluggableList = NonNullable<Options["remarkPlugins"]>;
 type Pluggable = PluggableList[number];
@@ -94,6 +96,8 @@ export const messageMarkdownSanitizeSchema: RehypeSanitizeOptions = {
     span: [
       ...(defaultSchema.attributes?.span || []),
       "dataReminderFireAt",
+      // A caller's structured part (messageMarkdownSlots): an index into its own parts.
+      "dataMessageSlot",
     ],
   },
   protocols: {
@@ -108,8 +112,14 @@ export const messageMarkdownSanitizeSchema: RehypeSanitizeOptions = {
 // the sanitize schema above is the one allowlist they all pass.
 export const MESSAGE_MARKDOWN_REHYPE_PLUGINS: PluggableList = [[rehypeSanitize, messageMarkdownSanitizeSchema]];
 
+// remark-cjk-friendly: `**` next to CJK punctuation opens and closes emphasis
+// (`中文**“重点”**中文`), which strict CommonMark refuses when the `**` sits
+// between a CJK letter and punctuation; mobile ports the same rules.
 const MESSAGE_MARKDOWN_BASE_REMARK_PLUGINS: PluggableList = [
   remarkGfm,
+  remarkCjkFriendly,
+  // Same math syntax as raft-shared's markdownStructure (task #775).
+  remarkRaftMath,
   remarkAutolinkBareUrls,
   remarkRawHtmlAsText,
   remarkBreaks,
@@ -122,5 +132,12 @@ const MESSAGE_MARKDOWN_BASE_REMARK_PLUGINS: PluggableList = [
  */
 export function messageMarkdownRemarkPlugins(refsPlugin?: Pluggable): PluggableList {
   if (!refsPlugin) return MESSAGE_MARKDOWN_BASE_REMARK_PLUGINS;
-  return [remarkGfm, remarkAutolinkBareUrls, remarkRawHtmlAsText, refsPlugin, remarkBreaks];
+  // The base list with the ref matchers inserted before remark-breaks, so the
+  // two lists can't drift apart.
+  const breaksIndex = MESSAGE_MARKDOWN_BASE_REMARK_PLUGINS.indexOf(remarkBreaks);
+  return [
+    ...MESSAGE_MARKDOWN_BASE_REMARK_PLUGINS.slice(0, breaksIndex),
+    refsPlugin,
+    ...MESSAGE_MARKDOWN_BASE_REMARK_PLUGINS.slice(breaksIndex),
+  ];
 }

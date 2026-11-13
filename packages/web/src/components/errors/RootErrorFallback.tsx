@@ -1,9 +1,17 @@
 import type { CSSProperties } from "react";
 import { useIntl } from "react-intl";
 import RootFallbackScroller from "./RootFallbackScroller";
+import { TraceIdNote } from "./TraceIdNote";
+import { forgetRememberedPlaces } from "../../hooks/tabRouteMemoryKeys";
 
 function reloadApp() {
   window.location.reload();
+}
+
+/** Raft's start page, with no remembered conversation to go back to (#triage:#351: Reload reopened the one that crashed). */
+function openRaftHome() {
+  forgetRememberedPlaces();
+  window.location.assign("/");
 }
 
 /**
@@ -12,7 +20,7 @@ function reloadApp() {
  * design system to draw an error about the design system. Every value reads
  * the Raft Design System token first (so light/dark follow the app when the
  * tokens are there) and falls back to the DS light literal when they are not.
- * Inline literals are intentional here (scripts/check-color-tokens.mjs
+ * Inline literals are intentional here (scripts/check-color-tokens.ts
  * INLINE_STYLE_EXEMPT).
  */
 export const FALLBACK_STYLE = {
@@ -92,16 +100,43 @@ export const FALLBACK_STYLE = {
   },
 } satisfies Record<string, CSSProperties>;
 
+/**
+ * The window's title strip on the crash screen of a shell whose top row is the
+ * window's title bar (the desktop app): the crash took the app's top bar and
+ * stand-in strip with it, so without this the frameless window could not be
+ * moved and nothing would keep content out from under the window controls.
+ * `data-raft-titlebar` gives it the shared drag region and insets (titleBar.css).
+ * The bar's height (44, the desktop title bar's) and frame colour (--layer-frame, the colour the
+ * caption buttons were last painted in), in plain inline styles like the rest
+ * of this screen.
+ */
+function FallbackTitleBar() {
+  return (
+    <div
+      data-raft-titlebar
+      data-testid="root-error-title-bar"
+      aria-hidden="true"
+      style={{ height: 44, flexShrink: 0, background: "var(--layer-frame, #ffd440)" }}
+    />
+  );
+}
+
 export default function RootErrorFallback({
   error,
   componentStack,
+  traceId,
+  titleBar = false,
 }: {
   error: Error;
   componentStack?: string | null;
+  /** The crash report's trace id (clientErrorTrace.ts), shown with a copy button. */
+  traceId?: string | null;
+  /** The top row is the window's title bar (a title-bar host shell): draw the draggable strip. */
+  titleBar?: boolean;
 }) {
   const { formatMessage } = useIntl();
 
-  return (
+  const page = (
     <RootFallbackScroller className="safe-top safe-bottom" style={FALLBACK_STYLE.page}>
       <div
         role="alert"
@@ -115,6 +150,8 @@ export default function RootErrorFallback({
         <div style={FALLBACK_STYLE.code}>
           <pre style={FALLBACK_STYLE.pre}>{error.message}</pre>
         </div>
+
+        {traceId ? <TraceIdNote traceId={traceId} /> : null}
 
         {error.stack ? (
           <details style={FALLBACK_STYLE.code}>
@@ -139,11 +176,21 @@ export default function RootErrorFallback({
         ) : null}
 
         <div style={FALLBACK_STYLE.actions}>
+          <button type="button" onClick={openRaftHome} style={FALLBACK_STYLE.ghostButton} data-testid="root-error-open-home">
+            {formatMessage({ id: "errorBoundary.openHome" })}
+          </button>
           <button type="button" onClick={reloadApp} style={FALLBACK_STYLE.primaryButton}>
             {formatMessage({ id: "errorBoundary.reloadApp" })}
           </button>
         </div>
       </div>
     </RootFallbackScroller>
+  );
+  if (!titleBar) return page;
+  return (
+    <>
+      <FallbackTitleBar />
+      {page}
+    </>
   );
 }

@@ -20,7 +20,7 @@ import {
   setComputerMobileAppEmailJourneyConfigForTest,
 } from "./computerMobileAppEmailJourneyService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 const SEGMENT_ID = "78261eea-8f8b-4381-83c6-79fa7120f1cf";
 const WEBHOOK_SECRET = `whsec_${Buffer.from("newsletter-webhook-secret").toString("base64")}`;
@@ -62,7 +62,7 @@ test("profile-completion newsletter sync is fail-open and records local sync fai
       throw new Error("resend unavailable");
     },
   });
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
 
   try {
     const res = await fetch(`${app.baseUrl}/api/auth/register`, {
@@ -323,7 +323,7 @@ test("realtime signup sync records retryable rate limits without blocking for re
 
 test("Resend unsubscribe webhook persists local opt-out state idempotently", async () => {
   setNewsletterConfigForTest({ segmentId: SEGMENT_ID, webhookSecret: WEBHOOK_SECRET });
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
 
   try {
     const user = await seedUser("unsubscribe@example.com", "unsubscribe-user");
@@ -386,7 +386,7 @@ test("Resend opt-out webhooks cancel already-scheduled mobile lifecycle mail", a
       canceled.push(emailId);
     },
   });
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
 
   try {
     const cases = [
@@ -465,7 +465,7 @@ test("failed scheduled-mail cancellation retries the webhook without a second su
       successfulCancellations++;
     },
   });
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
 
   try {
     const email = "scheduled-retry@example.com";

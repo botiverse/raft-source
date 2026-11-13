@@ -204,6 +204,7 @@ test("a failed slot lookup lands on the slot's own error state, never on the sid
     assert.deepEqual(state.taskModal?.error, {
       parentChannelId: "channel-task",
       parentMessageId: "parent-task",
+      unavailable: false,
     });
     assert.equal(state.taskModal?.loading, false);
     assert.equal(state.openThreadError, null);

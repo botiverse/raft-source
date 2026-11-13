@@ -1,27 +1,81 @@
-import { Button, Card, Input, Progress, ProgressIndicator, ProgressTrack, Separator } from "@botiverse/raft-ui";
-import Banner from "../ui/Banner";
-import Tooltip from "../ui/Tooltip";
-import { useCallback, useMemo } from "react";
-import type { ChangeEvent } from "react";
-import { Check, CreditCard, Plus, X } from "lucide-react";
-import { DEFAULT_BILLING_INTERVAL, FREE_MONTHLY_FILE_UPLOAD_LIMIT_BYTES, PLAN_CONFIG, PRO_AGENT_SEAT_BLOCK_SIZE, PRO_AGENT_SEAT_FRACTION, PRO_SEAT_ANNUAL_USD, PRO_SEAT_MONTHLY_USD, formatProAgentSeatFraction, getEffectiveLimits, isTrialActive } from "@botiverse/raft-shared";
-import type { ServerPlan } from "@botiverse/raft-shared";
+import {
+  Badge,
+  Button,
+  Card,
+  CardContent,
+  CardDescription,
+  CardFooter,
+  CardHeader,
+  CardTitle,
+  CardTrailing,
+  DescriptionDetails,
+  DescriptionItem,
+  DescriptionList,
+  DescriptionTerm,
+  Spinner,
+  TextLink,
+} from "@botiverse/raft-ui";
+import { Meter, MeterHeader, MeterIndicator, MeterLabel, MeterTrack, MeterValue } from "@botiverse/raft-ui/wip";
+import { Check } from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { ReactNode } from "react";
+import { useIntl } from "react-intl";
+import type { IntlShape } from "react-intl";
+import { FREE_MONTHLY_FILE_UPLOAD_LIMIT_BYTES, PLAN_CONFIG, PRO_AGENT_SEAT_FRACTION, PRO_SEAT_ANNUAL_USD, PRO_SEAT_MONTHLY_USD, formatProAgentSeatFraction } from "@botiverse/raft-shared";
+import type { BillingPortalFrom } from "@botiverse/raft-shared";
+import { trackPlanBillingDialogClosed, trackPlanBillingDialogOpened } from "../../analytics/planBilling";
+import type { MessageId } from "../../i18n/messages";
 import type { BillingInfo, Server, ServerUsage } from "../../store/serverStore";
-import ConfirmDialog from "../ConfirmDialog";
 import api from "../../api/client";
-import { FormattedMessage, useIntl } from "react-intl";
-import SectionEyebrow from "../ui/SectionEyebrow";
-import SectionHeader from "../ui/SectionHeader";
+import ConfirmDialog from "../ConfirmDialog";
+import Banner from "../ui/Banner";
+import LeavingRaftMark, { opensInNewTabAriaLabel } from "../ui/LeavingRaftMark";
+import { shareableWebUrl } from "../../utils/desktopShell";
+import { useBillingReturnRefresh } from "../../hooks/useBillingReturnRefresh";
 import { getBillingControlsState, getSettingsBillingPlanPresentation } from "../../utils/billingControls";
-import { formatGlobalTrialCutoffDate } from "../../utils/trialCutoff";
-import { applyBillingSeatInputChange, applyBillingSeatInputCommit, getBillingCurrentTotalLabel, getBillingSeatCopyLabels, getBillingSeatDraftState, getBillingSeatInputValue, getBillingSelectedTotalLabels, getBillingTotalSummaryLabels } from "../../utils/billingSeatInput";
-import type { BillingPricedTotal } from "../../utils/billingSeatInput";
-import { BillingIntervalSegmentedControl } from "./SettingsSegmentedControls";
-import { DowngradeWarningCard } from "./SettingsPanel";
+import { monthlyUploadResetsAt } from "../../utils/monthlyUploadQuota";
+import { openUpgradeDialog } from "../../store/upgradeDialogStore";
+import { PRO_PREPAID_FEATURE_FLAG_KEY, useServerFeatureFlag } from "../../store/serverFeatureFlags";
+import type { AddSeatsNeed } from "../billing/AddSeatsDialog";
+import {
+  BILLING_OVERVIEW_CLASS,
+  BILLING_PLAN_SUMMARY_CLASS,
+  BILLING_PLAN_TITLE_CLASS,
+  BILLING_USAGE_CONTENT_CLASS,
+  BILLING_USAGE_METER_CLASS,
+} from "./planBillingLayout";
+import { ManageSeatsDialog } from "../billing/ManageSeatsDialog";
+import { DowngradeWarningCard } from "../../features/settings/billing/DowngradeWarningCard";
 import { HostedRuntimeSpendCard } from "./HostedRuntimeSpendCard";
-import type { BillingSeatUpdatePreview, usePlanBillingDraft } from "./SettingsPanel";
+import { deferredDialog } from "../../boot/deferredUi";
+import type { usePlanBillingDraft } from "../../features/settings/billing/usePlanBillingDraft";
 
-// Stryker disable all: Settings billing UI wiring is covered by billingSeatInput behavior tests, source-copy contracts, and visual preview screenshots.
+// Loaded when it opens, as everywhere else (a deferred module with a chunk of its own).
+const AddSeatsDialog = deferredDialog(() => import("../billing/AddSeatsDialog"));
+/** Prepaid Pro shows its end on the page this many days ahead. */
+const PREPAID_REMINDER_DAYS = 7;
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+const PRICING_URL = "https://raft.build/pricing";
+const MIB = 1024 * 1024;
+const GIB = 1024 * MIB;
+/** What Pro adds over Free: the Pro plan's own list (billingControls), less "everything in Free" and "coming soon". */
+const PRO_ADDS: MessageId[] = [
+  "billing.unlimitedMessageHistory",
+  "billing.higherFileUploadLimits",
+  "billing.agentMigration",
+  "billing.unlimitedJointChannels",
+];
+
+/**
+ * Settings › Plan & Billing (task #13, #proj-commercial; option B, cindyz
+ * 2026-10-30): an overview, one card per question. The plan and when it
+ * renews; what is used; on Free, what Pro adds; on Pro, how it is billed; and
+ * cancelling, last. Buying goes through the dialogs every other Upgrade and
+ * Add Seats opens, not a form on this page. Problems with the subscription (a
+ * failed payment, a cancellation on its way) are banners at the top.
+ */
+// Stryker disable all: Settings billing UI wiring is covered by the billing page behavior tests and visual preview screenshots.
 export function PlanSectionContent({
   server,
   usage,
@@ -35,354 +89,133 @@ export function PlanSectionContent({
   loadBilling: () => Promise<void>;
   draft: ReturnType<typeof usePlanBillingDraft>;
 }) {
-  const { formatMessage, locale: intlLocale } = useIntl();
+  const { formatMessage, formatDate, formatNumber } = useIntl();
   const {
     billingAction, setBillingAction,
     billingError, setBillingError,
     billingNotice, setBillingNotice,
-    desiredSeatOverride, setDesiredSeatOverride,
-    desiredSeatInput, setDesiredSeatInput,
-    billingInterval, setBillingInterval,
     showCancelSubscriptionConfirm, setShowCancelSubscriptionConfirm,
-    confirmBillingAction, setConfirmBillingAction,
-    promotionCode, setPromotionCode,
-    seatUpdatePreview, setSeatUpdatePreview,
+    seatDialog, setSeatDialog,
+    billingEntry,
   } = draft;
 
-  const plan = (billing?.plan ?? server.plan) as ServerPlan;
-  const config = PLAN_CONFIG[plan];
-  const limits = getEffectiveLimits(plan);
-  const pricedLimits = config.limits;
-  const capacity = billing?.capacity;
-
-  const agentCount = billing?.usage.agents ?? usage?.agents ?? 0;
-  const humanCount = billing?.usage.humans;
-  const usesUniversalSeats = capacity != null && capacity.maxUniversalSeats !== -1;
-  const universalSeatLimit = usesUniversalSeats ? capacity?.maxUniversalSeats ?? 0 : 0;
-  const usedHumanUniversalSeats = Math.max(0, humanCount ?? 0);
-  const usedAgentUniversalSeats = Math.max(0, agentCount * PRO_AGENT_SEAT_FRACTION);
-  const usedUniversalSeats = Math.max(
-    0,
-    billing?.usage.universalSeats ?? usedHumanUniversalSeats + usedAgentUniversalSeats,
-  );
-  const seatUsageScale = universalSeatLimit > 0 && usedUniversalSeats > universalSeatLimit
-    ? universalSeatLimit / usedUniversalSeats
-    : 1;
-  const humanSeatUsagePercent = universalSeatLimit > 0
-    ? Math.min(100, (usedHumanUniversalSeats * seatUsageScale / universalSeatLimit) * 100)
-    : 0;
-  const agentSeatUsagePercent = universalSeatLimit > 0
-    ? Math.min(100, (usedAgentUniversalSeats * seatUsageScale / universalSeatLimit) * 100)
-    : 0;
-  const canManageBilling = billing?.permissions.canManageBilling === true;
-  const billingControlsState = getBillingControlsState({
-    plan: billing?.plan ?? server?.plan ?? null,
+  const plan = billing?.plan ?? server.plan;
+  const config = PLAN_CONFIG[plan as keyof typeof PLAN_CONFIG] ?? PLAN_CONFIG.free;
+  const appsumo = billing?.appsumo ?? null;
+  const controls = getBillingControlsState({
+    source: billing?.source,
+    appsumoBillingReserved: billing?.appsumoBillingReserved,
+    plan,
     subscriptionStatus: billing?.subscription?.status ?? null,
   });
-  const isProPlan = plan === "pro";
-  const showSeatUsage = isProPlan;
-  const billingControlsDisabledReason = !canManageBilling
+  const isFree = plan === "free" && !appsumo;
+  const isPro = plan === "pro" && !appsumo;
+  const owner = billing?.permissions?.canManageBilling === true;
+  const subscription = controls.hasEntitlingSubscription ? billing?.subscription ?? null : null;
+  const pastDue = subscription?.status === "past_due";
+  const ending = subscription?.cancelAtPeriodEnd === true;
+  const periodEnd = subscription?.currentPeriodEnd ? new Date(subscription.currentPeriodEnd) : null;
+  const periodEndLabel = periodEnd && Number.isFinite(periodEnd.getTime())
+    ? formatDate(periodEnd, { month: "short", day: "numeric", year: "numeric" })
+    : null;
+  const annual = (subscription?.billingInterval ?? billing?.price?.billingInterval) === "annual";
+  const seats = Math.max(0, billing?.provisioned?.proPackQuantity ?? 0);
+  const usedSeats = Math.max(0, billing?.usage?.universalSeats ?? 0);
+  // The fewest seats the server can keep: what its people and agents use (the server checks the same).
+  const neededSeats = Math.max(1, Math.ceil(usedSeats));
+  const humans = billing?.usage?.humans ?? 0;
+  const agents = billing?.usage?.agents ?? usage?.agents ?? 0;
+  const freeHistoryDays = PLAN_CONFIG.free.limits.messageHistoryDays;
+  const freeUpload = formatBytes(FREE_MONTHLY_FILE_UPLOAD_LIMIT_BYTES);
+  // Why buttons that change billing are off: not an owner, or no Stripe here.
+  const disabledReason = !owner
     ? formatMessage({ id: "billing.onlyServerOwnersCanChangeBilling" })
     : !billing?.stripeConfigured
       ? formatMessage({ id: "billing.paidPlansAreNotAvailableYet" })
       : null;
-  const formatLimit = (value: number | undefined) => value == null
-    ? "..."
-    : value === -1 ? formatMessage({ id: "billing.unlimited" }) : String(value);
-  const formatBytes = (value: number | undefined) => {
-    if (value == null || value < 0) return formatMessage({ id: "billing.unlimited" });
-    if (value >= 1024 * 1024) return `${Math.round(value / 1024 / 1024)} MB`;
-    return `${Math.round(value / 1024)} KB`;
-  };
-  const formatSeatUsageNumber = (value: number) => value.toFixed(1).replace(/\.0$/, "");
-  const finalTrialActive = isTrialActive();
-  const formatUsd = (value: number) => Number.isInteger(value) ? String(value) : value.toFixed(2);
-  const currentHumanSeats = billing?.provisioned.humans ?? 0;
-  const currentAgentSeats = billing?.provisioned.agents ?? 0;
-  const currentSeatQuantity = billing?.provisioned.proPackQuantity ?? 0;
-  const minimumUsageSeatQuantity = Math.max(1, Math.ceil(usedUniversalSeats));
-  const minimumSeatQuantity = isProPlan ? Math.max(1, currentSeatQuantity) : 1;
-  const isCheckoutMode = billingControlsState.canCheckout;
-  const isManageSeatMode = !isCheckoutMode && billingControlsState.canUpdatePacks && isProPlan;
-  const showManagePlanSection = isCheckoutMode || billingControlsState.canUpdatePacks;
-  const isCancelScheduled = billing?.subscription?.cancelAtPeriodEnd === true;
-  const minimumManageSeatQuantity = Math.max(1, minimumUsageSeatQuantity);
-  const defaultSeatInputQuantity = isManageSeatMode
-    ? Math.max(minimumManageSeatQuantity, currentSeatQuantity)
-    : Math.max(minimumUsageSeatQuantity, minimumSeatQuantity);
-  const requestedSeatInputQuantity = desiredSeatOverride ?? defaultSeatInputQuantity;
-  const draftRequestedSeatQuantity = requestedSeatInputQuantity;
-  const billingSeatDraftState = getBillingSeatDraftState({
-    requestedSeatQuantity: draftRequestedSeatQuantity,
-    draftSeatQuantity: draftRequestedSeatQuantity,
-    minimumUsageSeatQuantity,
-    minimumSeatQuantity: isManageSeatMode ? 1 : minimumSeatQuantity,
-  });
-  const requestedSeatQuantity = billingSeatDraftState.requestedSeatQuantity;
-  const draftSeatQuantity = billingSeatDraftState.draftSeatQuantity;
-  const draftProvisionedAgentSeats = draftSeatQuantity * PRO_AGENT_SEAT_BLOCK_SIZE;
-  const requestedHumanSeatCapacity = requestedSeatQuantity;
-  const requestedAgentSeatCapacity = requestedSeatQuantity * PRO_AGENT_SEAT_BLOCK_SIZE;
-  const draftBelowRequiredCoverage = billingSeatDraftState.belowCurrentUsage;
-  const managePlanTitle = isCheckoutMode
-    ? formatMessage({ id: "billing.upgradeToPro" })
-    : isManageSeatMode ? (formatMessage({ id: "billing.manageSeats" })) : formatMessage({ id: "billing.managePlan" });
-  const currentBillingInterval = billing?.subscription?.billingInterval ?? billing?.price?.billingInterval ?? DEFAULT_BILLING_INTERVAL;
-  const currentBillingIntervalLabel = currentBillingInterval === "annual" ? formatMessage({ id: "billing.yearly" }) : formatMessage({ id: "billing.monthly" });
-  const currentTotalLabel = billing?.price
-    ? getBillingCurrentTotalLabel(
-      currentBillingInterval,
-      billing.price.monthlyUsd,
-      billing.price.annualUsd,
-      formatUsd,
-    )
-    : null;
-  const currentPlanPresentation = getSettingsBillingPlanPresentation(
-    plan,
-    config.displayName,
-    currentHumanSeats,
-    currentAgentSeats,
-    currentSeatQuantity,
-    formatProAgentSeatFraction(),
-  );
-  const currentPlanDisplayName = formatMessage({ id: currentPlanPresentation.displayName });
-  const currentPlanDescription = formatMessage(
-    { id: currentPlanPresentation.description },
-    currentPlanPresentation.descriptionValues,
-  );
-  const pricedFileUploadLimitLabel = plan === "free" ? `${formatBytes(FREE_MONTHLY_FILE_UPLOAD_LIMIT_BYTES)}/${formatMessage({ id: "billing.month" })}` : formatMessage({ id: "billing.unlimited" });
-  const comparePlansHref = "https://raft.build/#pricing";
-  const currentIncludedFeatures = currentPlanPresentation.includedFeatures.map((id) => formatMessage({ id }));
-  const currentNotIncludedFeatures = currentPlanPresentation.notIncludedFeatures.map((id) => formatMessage({ id }));
-  const hasNotIncludedFeatures = currentNotIncludedFeatures.length > 0;
-  const selectedTotalLabels = getBillingSelectedTotalLabels(
-    isManageSeatMode ? currentBillingInterval : billingInterval,
-    draftSeatQuantity,
-    PRO_SEAT_MONTHLY_USD,
-    PRO_SEAT_ANNUAL_USD,
-    formatUsd,
-  );
-  // Priced totals arrive as {id, amount}; the "/ year" | "/ 年" period is part of
-  // the translation now, so there is nothing left to patch after the fact.
-  const formatPricedTotal = (total: BillingPricedTotal | null) =>
-    total == null ? null : formatMessage({ id: total.id }, { amount: total.amount });
-  const localizedSelectedTotalLabels = {
-    totalLabel: formatPricedTotal(selectedTotalLabels.totalLabel)!,
-    originalLabel: formatPricedTotal(selectedTotalLabels.originalLabel),
-  };
-  const localizedCurrentTotalLabel = formatPricedTotal(currentTotalLabel);
-  const seatDelta = draftSeatQuantity - currentSeatQuantity;
-  const additionalSeats = Math.max(0, seatDelta);
-  const removedSeats = Math.max(0, -seatDelta);
-  const normalizedPromotionCode = promotionCode.trim();
-  const formatBillingAmount = (amount: number, currency: string) => new Intl.NumberFormat(
-    intlLocale.toLowerCase().startsWith("zh") ? "zh-CN" : "en-US",
-    { style: "currency", currency: currency.toUpperCase() },
-  ).format(amount / 100);
-  const formatSeatLabel = (count: number) => formatMessage({ id: "billing.seatCount" }, { count });
-  const formatHumanCapacityLabel = (count: number) => formatMessage({ id: "billing.upToHumans" }, { count });
-  const formatAgentCapacityLabel = (count: number) => formatMessage({ id: "billing.orAgents" }, { count });
-  const handleSeatInputChange = useCallback((event: ChangeEvent<HTMLInputElement>) => {
-    applyBillingSeatInputChange(
-      event.currentTarget.value,
-      setDesiredSeatInput,
-      setDesiredSeatOverride,
-    );
-  }, [setDesiredSeatInput, setDesiredSeatOverride]);
-  const seatInputMinimum = isManageSeatMode ? minimumManageSeatQuantity : Math.max(minimumUsageSeatQuantity, minimumSeatQuantity);
-  // Stryker disable next-line BlockStatement: component wiring delegates to billingSeatInput helpers covered by DOM-gate behavior tests.
-  const commitSeatInput = useCallback(() => {
-    applyBillingSeatInputCommit(
-      desiredSeatInput,
-      requestedSeatInputQuantity,
-      seatInputMinimum,
-      setDesiredSeatOverride,
-      setDesiredSeatInput,
-    );
-  }, [desiredSeatInput, requestedSeatInputQuantity, seatInputMinimum, setDesiredSeatInput, setDesiredSeatOverride]);
-  const noSeatChangeSelected = requestedSeatQuantity === currentSeatQuantity;
-  const updateSeatButtonDisabled = !!billingControlsDisabledReason
-    || draftBelowRequiredCoverage
-    || billingAction != null
-    || (!isCancelScheduled && noSeatChangeSelected);
-  const updateSeatButtonTitle = billingControlsDisabledReason
-    ?? (draftBelowRequiredCoverage
-      ? formatMessage({ id: "billing.keepAtLeastSeats" }, { min: minimumUsageSeatQuantity })
-      : null)
-    ?? (isCancelScheduled
-      ? noSeatChangeSelected
-        ? formatMessage({ id: "billing.reactivateThisProSubscriptionBeforeTheCurren" })
-        : formatMessage({ id: "billing.reactivateThisSubscriptionAndUpdateSeats" })
-      : noSeatChangeSelected
-        ? formatMessage({ id: "billing.enterADifferentSeatTotal" })
-      : formatMessage({ id: "billing.reviewProSeatUpdateBeforeConfirming" }));
-  const updateSeatButtonLabel = isCancelScheduled
-    ? noSeatChangeSelected ? formatMessage({ id: "billing.reactivateSubscription" }) : formatMessage({ id: "billing.reactivateAndUpdateSeats" })
-    : formatMessage({ id: "billing.reviewSeatUpdate" });
-  const updateSeatButtonBusyLabel = billingAction === "preview"
-    ? formatMessage({ id: "billing.reviewing" })
-    : isCancelScheduled && noSeatChangeSelected ? formatMessage({ id: "billing.reactivating" }) : formatMessage({ id: "billing.updating" });
-  const capacityLabel = isManageSeatMode
-    ? seatDelta > 0
-      ? formatMessage({ id: "billing.addsSeats" }, { seats: formatSeatLabel(additionalSeats) })
-      : seatDelta < 0
-        ? formatMessage({ id: "billing.removesSeats" }, { seats: formatSeatLabel(removedSeats) })
-        : formatMessage({ id: "billing.keepsCurrentSeats" })
-    : formatMessage({ id: "billing.selectedSeats" }, { seats: formatSeatLabel(draftSeatQuantity) });
-  const billingSeatCopyMode = isManageSeatMode ? "manageSeats" : "default";
-  const billingSeatCopyLabels = getBillingSeatCopyLabels(billingSeatCopyMode);
-  const billingTotalSummaryLabels = getBillingTotalSummaryLabels(
-    billingSeatCopyMode,
-    isManageSeatMode ? currentBillingInterval : billingInterval,
-  );
-  // The two `localized…Labels` objects used to hold a full parallel Chinese copy
-  // of these label groups behind `locale === "zh-CN"`, so every label existed
-  // twice and could drift independently. The ids carry both languages now, so
-  // the branch is gone and there is only one place to change a label.
-  // Format at this boundary so the ~11 consumers below keep receiving STRINGS.
-  // Without this the ids typecheck perfectly and the UI renders the literal text
-  // "billing.totalSeats" — the same trap as the plan-presentation change in
-  // #5774: the type system proves every value is a valid id and says nothing
-  // about whether the consumer formats it.
-  const localizedBillingSeatCopyLabels = {
-    seatQuantityLabel: formatMessage({ id: billingSeatCopyLabels.seatQuantityLabel }),
-    seatSummaryLabel: formatMessage({ id: billingSeatCopyLabels.seatSummaryLabel }),
-    billableSeatsSummaryLabel: formatMessage({ id: billingSeatCopyLabels.billableSeatsSummaryLabel }),
-    capacitySummaryLabel: formatMessage({ id: billingSeatCopyLabels.capacitySummaryLabel }),
-    quantityHelpLabel: formatMessage(
-      { id: billingSeatCopyLabels.quantityHelpLabel },
-      { capacity: capacityLabel },
-    ),
-  };
-  const localizedBillingTotalSummaryLabels = {
-    currentTotalLabel: billingTotalSummaryLabels.currentTotalLabel
-      ? formatMessage({ id: billingTotalSummaryLabels.currentTotalLabel })
-      : null,
-    totalLabel: formatMessage({ id: billingTotalSummaryLabels.totalLabel }),
-  };
-  const billingSeatDraftError = draftBelowRequiredCoverage
-    ? isManageSeatMode
-      ? formatMessage({ id: "billing.keepAtLeastSeats" }, { min: minimumUsageSeatQuantity })
-      : formatMessage({ id: "billing.enterAtLeastSeats" }, { min: minimumUsageSeatQuantity })
-    : null;
-  // Stryker disable next-line StringLiteral: validated by source-copy contracts and visual preview, not by the DOM mutation corpus.
-  const managePlanInputPrompt = isCheckoutMode
-    ? formatMessage({ id: "billing.enterTheNumberOfSeatsToBuy" })
-    : formatMessage({ id: "billing.enterTheTotalSeatsAfterThisUpdate" });
-  const seatInputValue = getBillingSeatInputValue(desiredSeatInput, requestedSeatInputQuantity);
-  const seatSummaryValue = draftSeatQuantity;
+  const seatEntry = billingEntry;
+  // Prepaid Pro (task #19): paid once with Alipay until a date, renewed from here.
+  const prepaid = billing?.source === "prepaid" ? billing.prepaid ?? null : null;
+  const prepaidEnabled = useServerFeatureFlag(PRO_PREPAID_FEATURE_FLAG_KEY).enabled;
+  const prepaidEndLabel = prepaid ? formatDate(prepaid.endsAt, { month: "short", day: "numeric", year: "numeric" }) : null;
+  const prepaidGraceLabel = prepaid ? formatDate(prepaid.graceEndsAt, { month: "short", day: "numeric", year: "numeric" }) : null;
+  // The last week before the end: a reminder on the page (the email and the bell come later).
+  const prepaidEndingSoon = Boolean(prepaid && !prepaid.inGrace && Date.parse(prepaid.endsAt) - Date.now() <= PREPAID_REMINDER_DAYS * DAY_MS);
+  const canRenew = owner && Boolean(prepaid) && prepaidEnabled;
+  // Seats are added to prepaid time for the days left, until it ends; in grace, with a renewal.
+  const canAddPrepaidSeats = canRenew && !prepaid?.inGrace;
+  const prepaidBanner = Boolean(prepaid && (prepaid.inGrace || prepaidEndingSoon));
+  // Kept on Pro, a server using more seats than it has bought has to buy them (see Keep Pro).
+  const keepNeedsSeats = owner && controls.canUpdatePacks && ending && !pastDue && neededSeats > seats;
 
-  const handleCheckout = useCallback(async () => {
-    if (billingControlsDisabledReason || !billingControlsState.canCheckout) return;
-    setBillingError("");
-    setBillingNotice("");
-    setBillingAction("checkout");
-    try {
-      const { data } = await api.post("/billing/checkout", {
-        targetPlan: "pro",
-        ...(normalizedPromotionCode ? { promotionCode: normalizedPromotionCode } : {}),
-        billingInterval,
-        seatQuantity: requestedSeatQuantity,
-        humanSeatQuantity: requestedHumanSeatCapacity,
-        agentSeatQuantity: requestedAgentSeatCapacity,
-        successUrl: window.location.href,
-        cancelUrl: window.location.href,
-      });
-      window.location.href = data.url;
-    } catch (err: any) {
-      setBillingError(err.response?.data?.code === "promotion_code_unavailable"
-        ? formatMessage({ id: "billing.checkoutPromotionUnavailable" })
-        : err.response?.data?.error || formatMessage({ id: "billing.failedToStartCheckout" }));
-      setBillingAction(null);
-    }
-  }, [
-    billingControlsDisabledReason,
-    billingControlsState.canCheckout,
-    normalizedPromotionCode,
-    billingInterval,
-    formatMessage,
-    requestedAgentSeatCapacity,
-    requestedHumanSeatCapacity,
-    requestedSeatQuantity,
-    setBillingAction,
-    setBillingError,
-    setBillingNotice,
-  ]);
+  function formatBytes(bytes: number) {
+    if (bytes >= GIB) return formatMessage({ id: "common.fileSize.gb" }, { value: formatNumber(bytes / GIB, { maximumFractionDigits: 1 }) });
+    return formatMessage({ id: "common.fileSize.mb" }, { value: formatNumber(bytes / MIB, { maximumFractionDigits: 0 }) });
+  }
+  function usd(amount: number) {
+    return formatNumber(amount, { style: "currency", currency: "USD", minimumFractionDigits: Number.isInteger(amount) ? 0 : 2 });
+  }
 
-  const handlePortal = useCallback(async () => {
-    if (billingControlsDisabledReason || !billingControlsState.canOpenPortal) return;
+  // Stripe leaves the window (Raft Desktop): refetch billing on every return.
+  const noteStripeOpened = useBillingReturnRefresh();
+  // `from`: the button, for the server's billing_portal_opened.
+  const openPortal = useCallback(async (from: BillingPortalFrom) => {
+    if (disabledReason) return;
     setBillingError("");
     setBillingNotice("");
     setBillingAction("portal");
     try {
-      const { data } = await api.post("/billing/portal", {
-        returnUrl: window.location.href,
-      });
+      const { data } = await api.post("/billing/portal", { returnUrl: shareableWebUrl(), entry: seatEntry, from });
+      noteStripeOpened();
+      // A browser leaves for Stripe in this tab; Raft Desktop's shell opens it
+      // in the system browser and this page stays, ready again.
       window.location.href = data.url;
+      setBillingAction(null);
     } catch (err: any) {
       setBillingError(err.response?.data?.error || formatMessage({ id: "billing.failedToOpenBillingPortal" }));
       setBillingAction(null);
     }
-  }, [billingControlsDisabledReason, billingControlsState.canOpenPortal, formatMessage, setBillingAction, setBillingError, setBillingNotice]);
+  }, [disabledReason, formatMessage, noteStripeOpened, seatEntry, setBillingAction, setBillingError, setBillingNotice]);
+  const handlePortalFromPlanCard = useCallback(() => void openPortal("plan_card"), [openPortal]);
+  const handlePortalFromPastDue = useCallback(() => void openPortal("past_due_banner"), [openPortal]);
+  // Which add-seats dialog is open, for plan_billing_dialog_*: Keep Pro's (the
+  // server has outgrown its seats) or the page's Add Seats.
+  const addSeatsDialog = useRef<"add_seats" | "keep_pro">("add_seats");
 
-  const handlePackQuantityUpdate = useCallback(async () => {
-    if (billingControlsDisabledReason || !billingControlsState.canUpdatePacks) return;
+  // Keep Pro: the same seats again while a cancellation is scheduled reactivates
+  // the subscription (POST /billing/seat-pack-quantity, `reactivated`). The
+  // server won't keep fewer seats than are in use, so a server that has grown
+  // past them adds seats instead, which reactivates it too.
+  const handleKeepPro = useCallback(async () => {
+    if (disabledReason) return;
+    if (keepNeedsSeats) {
+      addSeatsDialog.current = "keep_pro";
+      trackPlanBillingDialogOpened("keep_pro", seatEntry);
+      setSeatDialog("add");
+      return;
+    }
     setBillingError("");
     setBillingNotice("");
-    setBillingAction("update");
+    setBillingAction("keep");
     try {
-      const { data } = await api.post("/billing/seat-pack-quantity", {
-        seatQuantity: requestedSeatQuantity,
-        humanSeatQuantity: requestedHumanSeatCapacity,
-        agentSeatQuantity: requestedAgentSeatCapacity,
-        ...(seatUpdatePreview ? { previewToken: seatUpdatePreview.previewToken } : {}),
-      });
-      if (data.status === "pending_payment") {
-        setBillingNotice(formatMessage({ id: "billing.seatUpdateIsPendingStripePaymentConfirmation" }));
-      } else if (data.status === "unchanged") {
-        setBillingNotice(formatMessage({ id: "billing.seatQuantitiesAreAlreadyUpToDate" }));
-      } else if (data.status === "reactivated") {
-        setBillingNotice(formatMessage({ id: "billing.subscriptionReactivatedYourCurrentProSeatCap" }));
-      } else if (data.status === "updated" || data.effectiveAt === "current") {
-        setBillingNotice(formatMessage({ id: "billing.seatUpdateConfirmedCapacityHasBeenRefreshedFro" }));
-      } else {
-        setBillingNotice(formatMessage({ id: "billing.seatUpdateRequestedCapacityWillUpdateAfterStri" }));
-      }
+      await api.post("/billing/seat-pack-quantity", { seatQuantity: seats, entry: seatEntry });
       await loadBilling();
-      setDesiredSeatOverride(null);
-      setDesiredSeatInput(null);
-      setPromotionCode("");
-      setSeatUpdatePreview(null);
+      setBillingNotice(formatMessage({ id: "billing.subscriptionReactivatedYourCurrentProSeatCap" }));
     } catch (err: any) {
       setBillingError(err.response?.data?.error || formatMessage({ id: "billing.failedToUpdateSeats" }));
     } finally {
       setBillingAction(null);
     }
-  }, [
-    billingControlsDisabledReason,
-    billingControlsState.canUpdatePacks,
-    formatMessage,
-    loadBilling,
-    requestedAgentSeatCapacity,
-    requestedHumanSeatCapacity,
-    requestedSeatQuantity,
-    seatUpdatePreview,
-    setBillingAction,
-    setBillingError,
-    setBillingNotice,
-    setDesiredSeatInput,
-    setDesiredSeatOverride,
-    setPromotionCode,
-    setSeatUpdatePreview,
-  ]);
+  }, [disabledReason, formatMessage, keepNeedsSeats, loadBilling, seatEntry, seats, setBillingAction, setBillingError, setBillingNotice, setSeatDialog]);
 
   const handleCancelSubscription = useCallback(async () => {
-    if (billingControlsDisabledReason || !billingControlsState.canOpenPortal) return;
+    if (disabledReason) return;
     setBillingError("");
     setBillingNotice("");
     setBillingAction("cancel");
     try {
-      await api.post("/billing/cancel");
+      await api.post("/billing/cancel", { entry: seatEntry });
+      trackPlanBillingDialogClosed("cancel_subscription", "completed");
       await loadBilling();
       setBillingNotice(formatMessage({ id: "billing.subscriptionCancellationScheduledForTheEndOf" }));
       setShowCancelSubscriptionConfirm(false);
@@ -391,640 +224,565 @@ export function PlanSectionContent({
     } finally {
       setBillingAction(null);
     }
-  }, [
-    billingControlsDisabledReason,
-    billingControlsState.canOpenPortal,
-    formatMessage,
-    loadBilling,
-    setBillingAction,
-    setBillingError,
-    setBillingNotice,
-    setShowCancelSubscriptionConfirm,
-  ]);
+  }, [disabledReason, formatMessage, loadBilling, seatEntry, setBillingAction, setBillingError, setBillingNotice, setShowCancelSubscriptionConfirm]);
 
-  const openCheckoutConfirm = useCallback(() => {
-    if (billingControlsDisabledReason || billingSeatDraftError || !billingControlsState.canCheckout) return;
-    setConfirmBillingAction("checkout");
-  }, [billingControlsDisabledReason, billingControlsState.canCheckout, billingSeatDraftError, setConfirmBillingAction]);
-
-  const openSeatUpdateConfirm = useCallback(async () => {
-    if (updateSeatButtonDisabled || !billingControlsState.canUpdatePacks) return;
+  const handleRenew = useCallback(() => {
+    if (!prepaid) return;
+    trackPlanBillingDialogOpened("upgrade", seatEntry);
+    // The dialog sees a prepaid server and renews it (see its OwnerPart).
+    openUpgradeDialog("general", { serverId: server.id, unprompted: true, settingsEntry: seatEntry });
+  }, [prepaid, seatEntry, server.id]);
+  const handleUpgrade = useCallback(() => {
+    // The dialog shows an owner the checkout and anyone else a message to an owner.
+    trackPlanBillingDialogOpened("upgrade", seatEntry);
+    openUpgradeDialog("general", { serverId: server.id, unprompted: true, settingsEntry: seatEntry });
+  }, [seatEntry, server.id]);
+  const openAddSeats = useCallback(() => {
     setBillingError("");
     setBillingNotice("");
-    setSeatUpdatePreview(null);
-    if (seatDelta <= 0 || !normalizedPromotionCode) {
-      setConfirmBillingAction("update");
-      return;
-    }
-    setBillingAction("preview");
-    try {
-      const { data } = await api.post<BillingSeatUpdatePreview>("/billing/seat-pack-quantity/preview", {
-        seatQuantity: requestedSeatQuantity,
-        humanSeatQuantity: requestedHumanSeatCapacity,
-        agentSeatQuantity: requestedAgentSeatCapacity,
-        promotionCode: normalizedPromotionCode,
-      });
-      setSeatUpdatePreview(data);
-      setConfirmBillingAction("update");
-    } catch (err: unknown) {
-      const axiosErr = err as { response?: { data?: { error?: string } } };
-      setBillingError(axiosErr.response?.data?.error || formatMessage({ id: "billing.failedToPreviewSeatUpdate" }));
-    } finally {
-      setBillingAction(null);
-    }
-  }, [
-    billingControlsState.canUpdatePacks,
-    formatMessage,
-    normalizedPromotionCode,
-    requestedAgentSeatCapacity,
-    requestedHumanSeatCapacity,
-    requestedSeatQuantity,
-    seatDelta,
-    setBillingAction,
-    setBillingError,
-    setBillingNotice,
-    setConfirmBillingAction,
-    setSeatUpdatePreview,
-    updateSeatButtonDisabled,
-  ]);
+    addSeatsDialog.current = "add_seats";
+    trackPlanBillingDialogOpened("add_seats", seatEntry);
+    setSeatDialog("add");
+  }, [seatEntry, setBillingError, setBillingNotice, setSeatDialog]);
+  const openRemoveSeats = useCallback(() => {
+    setBillingError("");
+    setBillingNotice("");
+    trackPlanBillingDialogOpened("remove_seats", seatEntry);
+    setSeatDialog("remove");
+  }, [seatEntry, setBillingError, setBillingNotice, setSeatDialog]);
+  const closeSeatDialog = useCallback(() => {
+    trackPlanBillingDialogClosed(seatDialog === "remove" ? "remove_seats" : addSeatsDialog.current, "dismissed");
+    setSeatDialog(null);
+  }, [seatDialog, setSeatDialog]);
+  // Stripe charged for the seats (they count once its webhook lands): done,
+  // even if the dialog is closed before then. A payment Stripe held is not.
+  const handleSeatsPaid = useCallback(() => trackPlanBillingDialogClosed(addSeatsDialog.current, "completed"), []);
+  const handleSeatsAdded = useCallback(() => {
+    trackPlanBillingDialogClosed(addSeatsDialog.current, "completed");
+    setSeatDialog(null);
+  }, [setSeatDialog]);
+  // Adding seats for nothing in particular: no paywall, no action waiting on them.
+  const addSeatsNeed = useMemo<AddSeatsNeed>(() => ({
+    tenths: 0,
+    label: "",
+    title: formatMessage({ id: "addSeats.settings.title" }, { server: server.name }),
+    hint: formatMessage({ id: "addSeats.settings.hint" }, { server: server.name }),
+    resume: formatMessage({ id: "addSeats.settings.resume" }),
+    entry: seatEntry,
+  }), [formatMessage, seatEntry, server.name]);
+  const handleSeatsRemoved = useCallback(async (count: number) => {
+    trackPlanBillingDialogClosed("remove_seats", "completed");
+    await loadBilling();
+    setBillingNotice(formatMessage({ id: "planBilling.removeSeats.done" }, { count }));
+  }, [formatMessage, loadBilling, setBillingNotice]);
+  const openCancelConfirm = useCallback(() => {
+    trackPlanBillingDialogOpened("cancel_subscription", seatEntry);
+    setShowCancelSubscriptionConfirm(true);
+  }, [seatEntry, setShowCancelSubscriptionConfirm]);
+  // After a failed cancellation too: the error shows on the page.
+  const closeCancelConfirm = useCallback(() => {
+    trackPlanBillingDialogClosed("cancel_subscription", "dismissed");
+    setShowCancelSubscriptionConfirm(false);
+  }, [setShowCancelSubscriptionConfirm]);
+  const retryLoad = useCallback(() => void loadBilling(), [loadBilling]);
 
-  const handleOpenCancelSubscriptionConfirm = useCallback(
-    () => setShowCancelSubscriptionConfirm(true),
-    [setShowCancelSubscriptionConfirm],
+  // ── The plan card ──
+  const presentation = getSettingsBillingPlanPresentation(
+    plan,
+    config.displayName,
+    billing?.provisioned?.humans ?? 0,
+    billing?.provisioned?.agents ?? 0,
+    seats,
+    formatProAgentSeatFraction(),
   );
-  const handleCloseCancelSubscriptionConfirm = useCallback(
-    () => setShowCancelSubscriptionConfirm(false),
-    [setShowCancelSubscriptionConfirm],
-  );
-  const handlePromotionCodeChange = useCallback((event: ChangeEvent<HTMLInputElement>) => {
-    setPromotionCode(event.currentTarget.value);
-    setSeatUpdatePreview(null);
-  }, [setPromotionCode, setSeatUpdatePreview]);
-  const handleCloseBillingConfirm = useCallback(() => {
-    setConfirmBillingAction(null);
-    setSeatUpdatePreview(null);
-  }, [setConfirmBillingAction, setSeatUpdatePreview]);
-  // One seat meter, the DS progress bar: cyan, orange from 90% (or over the
-  // cap). Humans and agents are two segments of the same colour, agents in its
-  // lighter tint, so the split reads without inventing a new colour meaning.
-  const seatUsagePercent = Math.min(100, humanSeatUsagePercent + agentSeatUsagePercent);
-  const seatUsageNearLimit = seatUsagePercent >= 90;
-  const humanSeatFillClass = seatUsageNearLimit ? "bg-warning" : "bg-info";
-  const agentSeatFillClass = seatUsageNearLimit ? "bg-warning-muted" : "bg-info-muted";
-  const humanSeatIndicatorStyle = useMemo(() => ({ width: `${humanSeatUsagePercent}%` }), [humanSeatUsagePercent]);
-  const agentSeatIndicatorStyle = useMemo(() => ({ width: `${agentSeatUsagePercent}%` }), [agentSeatUsagePercent]);
+  const planName = appsumo
+    ? formatMessage({ id: "billing.appsumoLifetimePlan" }, { tier: appsumo.tier })
+    : formatMessage({ id: presentation.displayName });
+  const price = billing?.price
+    ? annual && billing.price.annualUsd != null
+      ? formatMessage({ id: "planBilling.pro.priceYearly" }, { amount: usd(billing.price.annualUsd) })
+      : formatMessage({ id: "planBilling.pro.priceMonthly" }, { amount: usd(billing.price.monthlyUsd) })
+    : null;
+  let planDescription: string;
+  if (appsumo) {
+    planDescription = formatMessage({ id: "billing.appsumoManaged" });
+  } else if (prepaid && prepaidEndLabel) {
+    planDescription = formatMessage({ id: "planBilling.prepaid.summary" }, { seats: prepaid.seatQuantity, date: prepaidEndLabel });
+  } else if (isPro && subscription && price && periodEndLabel) {
+    planDescription = formatMessage(
+      { id: "planBilling.pro.summary" },
+      { price, seats, renewal: formatMessage({ id: ending ? "planBilling.endsOn" : "planBilling.pro.renews" }, { date: periodEndLabel }) },
+    );
+  } else if (isFree) {
+    planDescription = formatMessage({ id: "planBilling.free.summary" }, { days: freeHistoryDays, upload: freeUpload });
+  } else {
+    planDescription = formatMessage({ id: presentation.description }, presentation.descriptionValues);
+  }
+  // A badge only says what needs a look: a failed payment, an end date, a lifetime license.
+  let status: ReactNode = null;
+  if (appsumo) status = <Badge appearance="soft" variant="success">{formatMessage({ id: "planBilling.status.lifetime" })}</Badge>;
+  else if (prepaid?.inGrace && prepaidEndLabel) status = <Badge appearance="soft" variant="warning">{formatMessage({ id: "planBilling.prepaid.ended" }, { date: prepaidEndLabel })}</Badge>;
+  else if (prepaidEndingSoon && prepaidEndLabel) status = <Badge appearance="soft" variant="muted">{formatMessage({ id: "planBilling.endsOn" }, { date: prepaidEndLabel })}</Badge>;
+  else if (pastDue) status = <Badge appearance="soft" variant="warning">{formatMessage({ id: "planBilling.paymentFailed" })}</Badge>;
+  else if (ending && periodEndLabel) status = <Badge appearance="soft" variant="muted">{formatMessage({ id: "planBilling.endsOn" }, { date: periodEndLabel })}</Badge>;
+  // Seats are added from here only on a subscription that is paid up and renewing:
+  // adding to one being cancelled would quietly take the cancellation back.
+  const canAddSeats = owner && controls.canUpdatePacks && !pastDue && !ending;
+  // At least one whole seat unused (task #18): Manage Seats, under the seat count.
+  const canRemoveSeats = canAddSeats && seats > neededSeats;
+  const showPortal = owner && controls.canOpenPortal;
+
+  // ── Usage ──
+  const uploadQuota = billing?.fileUploadQuota?.limited && billing.fileUploadQuota.limitBytes > 0 ? billing.fileUploadQuota : null;
+  // What is used is what isn't left (reservations for uploads under way count), as the upload limit counts it.
+  const uploadUsed = uploadQuota ? Math.min(uploadQuota.limitBytes, Math.max(0, uploadQuota.limitBytes - Math.max(0, uploadQuota.remainingBytes ?? 0))) : 0;
+  // When the month starts over; left out when billing doesn't say which month it is.
+  const uploadResets = uploadQuota && /^\d{4}-\d{2}$/.test(uploadQuota.month ?? "")
+    ? formatDate(monthlyUploadResetsAt(uploadQuota), { month: "short", day: "numeric", timeZone: "UTC" })
+    : null;
+  const universalSeats = isPro && (billing?.capacity?.maxUniversalSeats ?? -1) !== -1;
+  const seatCapacity = Math.max(0, billing?.capacity?.maxUniversalSeats ?? 0);
+  const formatSeats = (value: number) => formatNumber(value, { maximumFractionDigits: 1 });
 
   return (
-    <div className="mb-6">
-      <SectionHeader
-        className="mb-3"
-        icon={<CreditCard size={16} />}
-        label={formatMessage({ id: "billing.currentPlan" })}
-      />
-
-      {/* Downgrade warning */}
-      {server?.planDowngradedAt && (
-        <DowngradeWarningCard server={server} usage={usage} />
+    <div className={BILLING_OVERVIEW_CLASS} data-testid="billing-overview">
+      {billingNotice && (
+        <Banner intent="info" density="sm" role="status">{billingNotice}</Banner>
       )}
-
-      {/* Free trial notice */}
-      {plan === "free" && finalTrialActive && (
+      {billingError && (
+        <Banner intent="warning" density="sm">{billingError}</Banner>
+      )}
+      {!billing && (
         <Banner
-          intent="info"
-          role="note"
-          className="mb-4"
-          title={formatMessage({ id: "billing.finalTrialPeriod" })}
+          intent="warning"
+          density="sm"
+          live={false}
+          title={formatMessage({ id: "planBilling.loadFailed.title" })}
+          actions={<Button variant="outline" size="md" onClick={retryLoad}>{formatMessage({ id: "planBilling.retry" })}</Button>}
         >
-          {formatMessage(
-            { id: "billing.trialActiveThrough" },
-            {
-              date: formatGlobalTrialCutoffDate(intlLocale),
-            },
+          {formatMessage({ id: "planBilling.loadFailed.body" })}
+        </Banner>
+      )}
+      <DowngradeWarningCard server={server} canManageBilling={owner} />
+      {billing?.appsumoBillingReserved && !appsumo && (
+        <Banner intent="info" role="status">{formatMessage({ id: "billing.appsumoPendingBilling" })}</Banner>
+      )}
+      {billing?.sourceConflict === "appsumo_stripe" && billing.subscription && (
+        <Banner intent="warning" role="alert">
+          <p>{formatMessage({ id: "billing.appsumoStripeConflict" }, { status: billing.subscription.status })}</p>
+          {billing.subscription.cancelAtPeriodEnd && <p>{formatMessage({ id: "billing.subscriptionCancellationScheduledForTheEndOf" })}</p>}
+          {billing.subscription.currentPeriodEnd && Number.isFinite(Date.parse(billing.subscription.currentPeriodEnd)) && (
+            <p>{formatMessage({ id: "billing.appsumoStripePeriodEnd" }, { date: new Date(billing.subscription.currentPeriodEnd) })}</p>
           )}
         </Banner>
       )}
+      {isPro && pastDue && (
+        <Banner
+          intent="warning"
+          withIcon
+          live={false}
+          title={formatMessage({ id: "planBilling.paymentFailed" })}
+          actions={showPortal ? (
+            <Button variant="outline" size="md" onClick={handlePortalFromPastDue} disabled={!!disabledReason || billingAction != null}>
+              {formatMessage({ id: "planBilling.pastDue.action" })}
+              <LeavingRaftMark data-icon="inline-end" destination="stripe" />
+            </Button>
+          ) : undefined}
+          data-testid="billing-past-due"
+        >
+          {formatMessage({ id: owner ? "planBilling.pastDue.body" : "planBilling.pastDue.bodyOther" })}
+        </Banner>
+      )}
+      {isPro && ending && !pastDue && periodEndLabel && (
+        <Banner
+          intent="info"
+          withIcon
+          live={false}
+          title={formatMessage({ id: "planBilling.ending.title" }, { date: periodEndLabel })}
+          actions={owner ? (
+            <Button
+              variant="accent"
+              size="md"
+              onClick={handleKeepPro}
+              disabled={!!disabledReason || billingAction != null}
+              loading={billingAction === "keep"}
+              loadingLabel={formatMessage({ id: "planBilling.keepingPro" })}
+            >
+              {formatMessage({ id: "planBilling.keepPro" })}
+            </Button>
+          ) : undefined}
+          data-testid="billing-ending"
+        >
+          {formatMessage({ id: "planBilling.ending.body" }, { days: freeHistoryDays, upload: freeUpload })}
+        </Banner>
+      )}
 
-      <Card
-        className="mb-6"
-        data-testid="billing-current-plan-card"
-      >
-        <div className="border-b border-line-hairline px-4 py-4">
-          <div className="flex flex-wrap items-center gap-3">
-            <div className="min-w-0">
-              <div className="flex min-w-0 items-center gap-2">
-                <div className="min-w-0 text-headline text-foreground">{currentPlanDisplayName}</div>
-                <span
-                  aria-hidden="true"
-                  className="inline-flex size-[22px] shrink-0 items-center justify-center rounded-chip border-[1.5px] border-sticker-ink bg-brand text-sticker-ink"
-                >
-                  <Check size={14} strokeWidth={2.5} />
-                </span>
-              </div>
-              <div className="mt-0.5 text-callout text-foreground-muted">
-                {currentPlanDescription}
-              </div>
-            </div>
-          </div>
-        </div>
+      {prepaid && prepaidBanner && prepaidEndLabel && prepaidGraceLabel && (
+        <Banner
+          intent={prepaid.inGrace ? "warning" : "info"}
+          withIcon
+          live={false}
+          title={formatMessage({ id: prepaid.inGrace ? "planBilling.prepaid.graceTitle" : "planBilling.prepaid.endingTitle" }, { date: prepaidEndLabel })}
+          actions={canRenew ? (
+            <Button variant="accent" size="md" onClick={handleRenew} disabled={!!disabledReason || billingAction != null} data-testid="billing-prepaid-banner-renew">
+              {formatMessage({ id: "planBilling.prepaid.renew" })}
+            </Button>
+          ) : undefined}
+          data-testid={prepaid.inGrace ? "billing-prepaid-grace" : "billing-prepaid-ending"}
+        >
+          {/* "Renew" only where renewing is open: the owner's button, or an owner to ask. */}
+          {prepaid.inGrace
+            ? formatMessage({ id: !prepaidEnabled ? "planBilling.prepaid.graceBodyNoRenew" : owner ? "planBilling.prepaid.graceBody" : "planBilling.prepaid.graceBodyOther" }, { date: prepaidGraceLabel })
+            : formatMessage({ id: !prepaidEnabled ? "planBilling.prepaid.endingBodyNoRenew" : owner ? "planBilling.prepaid.endingBody" : "planBilling.prepaid.endingBodyOther" })}
+        </Banner>
+      )}
 
-        <div className={`grid gap-4 p-4 ${hasNotIncludedFeatures ? "lg:grid-cols-2" : ""}`}>
-          <div>
-            <SectionEyebrow as="div" className="mb-3">{formatMessage({ id: "billing.included" })}</SectionEyebrow>
-            <div className="space-y-3">
-              {currentIncludedFeatures.map((feature) => (
-                <div key={feature} className="flex items-start gap-3 text-callout text-foreground">
-                  <Check size={16} className="mt-0.5 shrink-0 text-foreground" />
-                  <span>{feature}</span>
-                </div>
-              ))}
-            </div>
-          </div>
-
-          {hasNotIncludedFeatures && (
-            <div>
-              <SectionEyebrow as="div" className="mb-3">{formatMessage({ id: "billing.notIncluded" })}</SectionEyebrow>
-              <div className="space-y-3">
-                {currentNotIncludedFeatures.map((feature) => (
-                  <div key={feature} className="flex items-start gap-3 text-callout text-foreground-muted">
-                    <X size={16} className="mt-0.5 shrink-0 text-foreground-hint" />
-                    <span>{feature}</span>
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
-        </div>
-
-        <Separator />
-        <div className="px-4 py-4">
-          {showSeatUsage && usesUniversalSeats && (
-            <div className="space-y-2">
-              <div className="flex items-center justify-between gap-3">
-                <span className="text-footnote font-semibold text-foreground">{formatMessage({ id: "billing.seat" })}</span>
-                <span className="font-mono text-mono-meta text-foreground-hint">
-                  {formatSeatUsageNumber(usedUniversalSeats)} / {formatLimit(universalSeatLimit)} {formatMessage({ id: "billing.used" })}
-                </span>
-              </div>
-              <Progress
-                value={seatUsagePercent}
-                variant={seatUsageNearLimit ? "warning" : "information"}
-                aria-label={formatMessage({ id: "billing.seat" })}
-              >
-              <ProgressTrack className="flex">
-                {humanSeatUsagePercent > 0 && (
-                  <Tooltip content={formatMessage(
-                    { id: "billing.humansUsingSeats" },
-                    {
-                      people: humanCount ?? 0,
-                      seatsText: formatSeatUsageNumber(usedHumanUniversalSeats),
-                      seatCount: usedHumanUniversalSeats,
-                    },
-                  )}>
-                  <ProgressIndicator
-                    className={`h-full ${humanSeatFillClass} ${agentSeatUsagePercent > 0 ? "rounded-r-none" : ""}`}
-                    style={humanSeatIndicatorStyle}
-                    data-slot="progress-indicator"
-                  />
-                  </Tooltip>
-                )}
-                {agentSeatUsagePercent > 0 && (
-                  <Tooltip content={formatMessage(
-                    { id: "billing.agentsUsingSeats" },
-                    {
-                      people: agentCount,
-                      seatsText: formatSeatUsageNumber(usedAgentUniversalSeats),
-                      seatCount: usedAgentUniversalSeats,
-                    },
-                  )}>
-                  <ProgressIndicator
-                    className={`h-full ${agentSeatFillClass} ${humanSeatUsagePercent > 0 ? "-ml-[1.5px] rounded-l-none" : ""}`}
-                    style={agentSeatIndicatorStyle}
-                    data-slot="progress-indicator"
-                  />
-                  </Tooltip>
-                )}
-              </ProgressTrack>
-              </Progress>
-              <div className="flex flex-wrap items-center gap-4 text-caption text-foreground-muted">
-                <div className="flex items-center gap-2">
-                  <span className="flex items-center gap-2 font-semibold">
-                    <span aria-hidden="true" className={`size-[9px] shrink-0 rounded-[2px] border-[1.5px] border-sticker-ink ${humanSeatFillClass}`} />
-                    {formatMessage({ id: "billing.humans" })}
-                  </span>
-                </div>
-                <div className="flex items-center gap-2">
-                  <span className="flex items-center gap-2 font-semibold">
-                    <span aria-hidden="true" className={`size-[9px] shrink-0 rounded-[2px] border-[1.5px] border-sticker-ink ${agentSeatFillClass}`} />
-                    {formatMessage({ id: "billing.agents" })}
-                  </span>
-                </div>
-              </div>
-            </div>
-          )}
-          {showSeatUsage && !usesUniversalSeats && (
-            <div className="grid gap-3 sm:grid-cols-2">
-              {humanCount != null && (
-                <div className="flex items-center justify-between gap-3">
-                  <span className="text-footnote font-semibold text-foreground">{formatMessage({ id: "billing.humans" })}</span>
-                  <span className="font-mono text-mono-meta text-foreground-hint">
-                    {humanCount} / {formatLimit(capacity?.maxHumans)}
-                  </span>
-                </div>
-              )}
-              <div className="flex items-center justify-between gap-3">
-                <span className="text-footnote font-semibold text-foreground">{formatMessage({ id: "billing.agents" })}</span>
-                <span className="font-mono text-mono-meta text-foreground-hint">
-                  {agentCount} / {formatLimit(capacity?.maxAgents ?? limits.maxAgents)}
-                </span>
-              </div>
-            </div>
-          )}
-          <div className="grid gap-3 sm:grid-cols-2">
-            {plan === "free" && (
-              <div className="flex items-center justify-between gap-3">
-                <span className="text-footnote font-semibold text-foreground">{formatMessage({ id: "billing.messageHistory" })}</span>
-                <span className="font-mono text-mono-meta text-foreground-hint">
-                  {pricedLimits.messageHistoryDays === -1 ? formatMessage({ id: "billing.unlimited" }) : `${pricedLimits.messageHistoryDays} ${formatMessage({ id: "billing.days" })}`}
-                </span>
-              </div>
+      {/* The plan */}
+      <Card id="plan" data-testid="billing-current-plan-card">
+        <CardHeader>
+          <CardTitle className={BILLING_PLAN_TITLE_CLASS} render={<h2>{planName}</h2>} />
+          {status && <CardTrailing>{status}</CardTrailing>}
+          {/* AppSumo's line says how to get changes made (recovery); the others are the plan's facts. */}
+          {appsumo ? <CardDescription>{planDescription}</CardDescription> : null}
+        </CardHeader>
+        {/* The plan's price, seats and renewal (or the Free plan's limits) are data: body ink, not CardDescription. */}
+        {appsumo ? null : (
+          <CardContent>
+            <p className={BILLING_PLAN_SUMMARY_CLASS} data-testid="billing-current-plan-summary">{planDescription}</p>
+          </CardContent>
+        )}
+        {(canAddSeats || canAddPrepaidSeats || showPortal || (canRenew && !prepaidBanner)) && (
+          <CardContent className="flex flex-wrap gap-2">
+            {/* The banner above carries Renew in the last week and the grace days. */}
+            {canRenew && !prepaidBanner && (
+              <Button variant="accent" size="md" onClick={handleRenew} disabled={!!disabledReason || billingAction != null} data-testid="billing-prepaid-renew">
+                {formatMessage({ id: "planBilling.prepaid.renew" })}
+              </Button>
             )}
-            {plan === "free" && billing?.fileUploadQuota && (
-              <div className="flex items-center justify-between gap-3">
-                <span className="text-footnote font-semibold text-foreground">{formatMessage({ id: "billing.fileUploads" })}</span>
-                <span className="font-mono text-mono-meta text-foreground-hint">
-                  {billing.fileUploadQuota.limited
-                    ? `${formatBytes(billing.fileUploadQuota.usedBytes)} / ${formatBytes(billing.fileUploadQuota.limitBytes)} ${formatMessage({ id: "billing.thisMonth" })}`
-                    : pricedFileUploadLimitLabel}
-                </span>
-              </div>
+            {canAddSeats && (
+              <Button variant="accent" size="md" onClick={openAddSeats} disabled={!!disabledReason || billingAction != null}>
+                {formatMessage({ id: "planBilling.addSeats" })}
+              </Button>
             )}
-          </div>
-        </div>
-        <Separator />
-        <div className="flex flex-wrap items-center justify-between gap-3 px-4 py-4">
-          {billingControlsState.canOpenPortal ? (
-            <div className="flex min-w-0 flex-wrap gap-2">
-              <div className="flex flex-wrap gap-2">
-                <Tooltip content={billingControlsDisabledReason ?? formatMessage({ id: "billing.openStripeBillingPortal" })}>
-                <Button
-                  variant="outline" size="sm"
-                  type="button"
-                  disabled={!!billingControlsDisabledReason || billingAction != null}
-                  onClick={handlePortal}
-                  data-slot="button"
-                >
-                  {billingAction === "portal" ? formatMessage({ id: "billing.opening" }) : formatMessage({ id: "billing.billingPortal" })}
-                </Button>
-                </Tooltip>
-                {!isCancelScheduled && (
-                  <Tooltip content={billingControlsDisabledReason ?? formatMessage({ id: "billing.cancelTheWholeProSubscriptionAtPeriodEnd" })}>
-                  <Button
-                    variant="warning" size="sm"
-                    type="button"
-                    disabled={!!billingControlsDisabledReason || billingAction != null}
-                    onClick={handleOpenCancelSubscriptionConfirm}
-                    data-slot="button"
-                  >
-                    {formatMessage({ id: "billing.cancelSubscription2" })}
-                  </Button>
-                  </Tooltip>
-                )}
-              </div>
-            </div>
-          ) : (
-            <span />
-          )}
-          <Button
-            render={<a href={comparePlansHref} aria-label={formatMessage({ id: "billing.seeAllFeaturesAndComparePlans" })} />}
-            nativeButton={false}
-            size="sm"
-            variant="outline"
-          >
-            <FormattedMessage id="billing.seeAllFeaturesAndComparePlans" />
-          </Button>
-        </div>
+            {/* Renew is the accent here; adding seats to prepaid time is the second action. */}
+            {canAddPrepaidSeats && (
+              <Button variant="outline" size="md" onClick={openAddSeats} disabled={!!disabledReason || billingAction != null} data-testid="billing-prepaid-add-seats">
+                {formatMessage({ id: "planBilling.addSeats" })}
+              </Button>
+            )}
+            {showPortal && (
+              <Button variant="outline" size="md" onClick={handlePortalFromPlanCard} disabled={!!disabledReason || billingAction != null}>
+                {billingAction === "portal" ? formatMessage({ id: "billing.opening" }) : formatMessage({ id: "planBilling.manageInStripe" })}
+                <LeavingRaftMark data-icon="inline-end" destination="stripe" />
+              </Button>
+            )}
+          </CardContent>
+        )}
       </Card>
 
-      {billing?.permissions.canReadBillingSummary === true && <HostedRuntimeSpendCard />}
-
-      {showManagePlanSection && (
-        <>
-          <SectionHeader
-            className="mb-3"
-            icon={isCheckoutMode ? <CreditCard size={16} /> : <Plus size={16} />}
-            label={managePlanTitle}
-          />
-
-          <Card className="mb-6 grid gap-4 p-4 lg:grid-cols-[minmax(0,1fr)_280px]">
-            <div>
-              {isCheckoutMode && (
-                <div className="mb-4">
-                  <div className="mb-2 text-subhead font-semibold text-foreground">{formatMessage({ id: "billing.howOftenDoYouWantToBeBilled" })}</div>
-                  <BillingIntervalSegmentedControl
-                    value={billingInterval}
-                    onValueChange={setBillingInterval}
-                    disabled={!!billingControlsDisabledReason || billingAction != null}
-                  />
-                </div>
-              )}
-
-              {billing?.subscription && (
-                <div className="mb-4 text-footnote text-foreground-muted">
-                  {formatMessage({ id: "billing.billingInterval" })}: {isCancelScheduled
-                    ? formatMessage(
-                        { id: "billing.intervalWithCancellationScheduled" },
-                        { interval: currentBillingIntervalLabel },
-                      )
-                    : currentBillingIntervalLabel}
-                </div>
-              )}
-
-              <div className="flex min-w-0 flex-col gap-3">
-                <span className="text-subhead font-semibold text-foreground">
-                  {managePlanInputPrompt}
-                </span>
-                <div className="flex flex-wrap items-end gap-3">
-                  <label className="flex flex-col gap-1.5">
-                    <span className="text-footnote font-semibold text-foreground-muted">{localizedBillingSeatCopyLabels.seatQuantityLabel}</span>
-                    <Input
-                      className="w-28"
-                      type="text"
-                      inputMode="numeric"
-                      pattern="[0-9]*"
-                      min={isManageSeatMode ? minimumManageSeatQuantity : Math.max(minimumUsageSeatQuantity, minimumSeatQuantity)}
-                      step={1}
-                      aria-label={localizedBillingSeatCopyLabels.seatQuantityLabel}
-                      value={seatInputValue}
-                      disabled={!!billingControlsDisabledReason || billingAction != null}
-                      onChange={handleSeatInputChange}
-                      onBlur={commitSeatInput}
-                    />
-                  </label>
-                  {(isCheckoutMode || (isManageSeatMode && seatDelta > 0)) && (
-                    <label className="flex w-64 max-w-full flex-col gap-1.5">
-                      <span className="text-footnote font-semibold text-foreground-muted">{formatMessage({ id: "billing.promotionCodeOptional" })}</span>
-                      <Input
-                        className="w-full"
-                        type="text"
-                        autoComplete="off"
-                        aria-label={formatMessage({ id: "billing.promotionCodeOptional" })}
-                        value={promotionCode}
-                        disabled={!!billingControlsDisabledReason || billingAction != null}
-                        onChange={handlePromotionCodeChange}
-                      />
-                    </label>
-                  )}
-                </div>
-                {isCheckoutMode && (
-                  <span className="text-caption text-foreground-hint">
-                    {formatMessage({ id: "billing.checkoutPromotionHint" })}
-                  </span>
-                )}
-                {isManageSeatMode && seatDelta > 0 && (
-                  <span className="text-caption text-foreground-hint">
-                    {formatMessage({ id: "billing.enterACodeApprovedForExistingSeatUpdate" })}
-                  </span>
-                )}
-                <span className="text-caption text-foreground-hint">
-                    {localizedBillingSeatCopyLabels.quantityHelpLabel} {formatMessage(
-                      { id: "billing.seatCoverageHelp" },
-                      { min: minimumUsageSeatQuantity, price: PRO_SEAT_MONTHLY_USD },
-                    )}
-                </span>
-                {billingSeatDraftError && (
-                  <span className="text-caption font-semibold text-danger-strong">
-                    {billingSeatDraftError}
-                  </span>
+      {/* What is used */}
+      <Card data-testid="billing-usage-card">
+        <CardHeader>
+          <CardTitle render={<h2>{formatMessage({ id: "planBilling.usage.title" })}</h2>} />
+        </CardHeader>
+        <CardContent className={BILLING_USAGE_CONTENT_CLASS}>
+          {universalSeats && (
+            <div className={BILLING_USAGE_METER_CLASS}>
+              <Meter used={usedSeats} max={Math.max(seatCapacity, 0.0001)} valueText={formatMessage({ id: "planBilling.usage.used" }, { used: formatSeats(usedSeats), total: formatSeats(seatCapacity) })}>
+                <MeterHeader>
+                  <MeterLabel>{formatMessage({ id: "billing.seats" })}</MeterLabel>
+                  <MeterValue />
+                </MeterHeader>
+                <MeterTrack>
+                  <MeterIndicator />
+                </MeterTrack>
+              </Meter>
+              {/* Under "n of m used", outside the meter: a meter's contents aren't controls (role="meter"). */}
+              <div className="flex flex-wrap items-baseline justify-between gap-x-6 gap-y-2">
+                <DescriptionList direction="inline">
+                  <DescriptionItem>
+                    <DescriptionTerm>{formatMessage({ id: "planBilling.usage.people" })}</DescriptionTerm>
+                    <DescriptionDetails>{formatMessage({ id: "planBilling.usage.countSeats" }, { count: humans, seats: formatSeats(humans), seatCount: humans })}</DescriptionDetails>
+                  </DescriptionItem>
+                  <DescriptionItem>
+                    <DescriptionTerm>{formatMessage({ id: "billing.agents" })}</DescriptionTerm>
+                    <DescriptionDetails>{formatMessage({ id: "planBilling.usage.countSeats" }, { count: agents, seats: formatSeats(agents * PRO_AGENT_SEAT_FRACTION), seatCount: agents * PRO_AGENT_SEAT_FRACTION })}</DescriptionDetails>
+                  </DescriptionItem>
+                </DescriptionList>
+                {canRemoveSeats && (
+                  <TextLink className="text-footnote" onClick={openRemoveSeats} data-testid="billing-manage-seats">
+                    {formatMessage({ id: "planBilling.manageSeats" })}
+                  </TextLink>
                 )}
               </div>
-
-              <div className="mt-4 flex flex-wrap gap-2">
-                {isCheckoutMode && (
-                  <Tooltip content={billingControlsDisabledReason ?? billingSeatDraftError ?? formatMessage(
-                    { id: "billing.startCheckoutTitle" },
-                    {
-                      interval: formatMessage({
-                        id: billingInterval === "annual" ? "billing.yearly" : "billing.monthly",
-                      }),
-                      seats: requestedSeatQuantity,
-                    },
-                  )}>
-                  <Button
-                    variant="accent" size="sm"
-                    type="button"
-                    disabled={!!billingControlsDisabledReason || !!billingSeatDraftError || billingAction != null}
-                    onClick={openCheckoutConfirm}
-                    data-slot="button"
-                  >
-                    {billingAction === "checkout" ? formatMessage({ id: "billing.opening" }) : formatMessage({ id: "billing.upgradeToPro" })}
-                  </Button>
-                  </Tooltip>
-                )}
-                {billingControlsState.canUpdatePacks && (
-                  <Tooltip content={updateSeatButtonTitle}>
-                  <Button
-                    variant="accent" size="sm"
-                    type="button"
-                    disabled={updateSeatButtonDisabled}
-                    onClick={openSeatUpdateConfirm}
-                    data-slot="button"
-                  >
-                    {billingAction === "update" || billingAction === "preview" ? updateSeatButtonBusyLabel : updateSeatButtonLabel}
-                  </Button>
-                  </Tooltip>
-                )}
-              </div>
-              {billingControlsDisabledReason && (
-                <p className="mt-2 text-caption text-foreground-hint">{billingControlsDisabledReason}</p>
-              )}
-              {billingNotice && (
-                <Banner intent="info" density="sm" role="status" className="mt-3">{billingNotice}</Banner>
-              )}
-              {billingError && (
-                <Banner intent="warning" density="sm" className="mt-3">{billingError}</Banner>
-              )}
-            </div>
-
-            <Card
-              data-testid="billing-summary-card"
-              className="p-4"
-            >
-              <SectionEyebrow as="div" className="mb-3">
-                {isCheckoutMode ? formatMessage({ id: "billing.checkoutSummary" }) : isManageSeatMode ? (formatMessage({ id: "billing.manageSeatsSummary" })) : formatMessage({ id: "billing.subscriptionSummary" })}
-              </SectionEyebrow>
-              <div className="space-y-3">
-                <div className="flex items-center justify-between gap-3">
-                  <span className="text-callout text-foreground-muted">{localizedBillingSeatCopyLabels.seatSummaryLabel}</span>
-                  <span className="font-mono text-mono-code text-foreground">{seatSummaryValue}</span>
-                </div>
-                <div className="flex items-center justify-between gap-3">
-                  <span className="text-callout text-foreground-muted">{localizedBillingSeatCopyLabels.billableSeatsSummaryLabel}</span>
-                  <span className="font-mono text-mono-code text-foreground">{draftSeatQuantity}</span>
-                </div>
-                <div className="flex items-center justify-between gap-3">
-                  <span className="text-callout text-foreground-muted">{localizedBillingSeatCopyLabels.capacitySummaryLabel}</span>
-                  <span className="inline-flex flex-col items-end text-right text-callout text-foreground">
-                    <span>{formatHumanCapacityLabel(draftSeatQuantity)}</span>
-                    <span>{formatAgentCapacityLabel(draftProvisionedAgentSeats)}</span>
-                  </span>
-                </div>
-                {isCheckoutMode ? (
-                  <>
-                    <div className="flex items-center justify-between gap-3">
-                      <span className="text-callout font-semibold text-foreground">{localizedBillingTotalSummaryLabels.totalLabel}</span>
-                      <span className="inline-flex flex-col items-end text-callout font-semibold text-foreground">
-                        {localizedSelectedTotalLabels.originalLabel && (
-                          <span className="font-normal text-foreground-hint line-through">{localizedSelectedTotalLabels.originalLabel}</span>
-                        )}
-                        <span>{localizedSelectedTotalLabels.totalLabel}</span>
-                      </span>
-                    </div>
-                  </>
-                ) : (
-                  <>
-                    {isManageSeatMode && (
-                      <div className="flex items-center justify-between gap-3">
-                        <span className="text-callout text-foreground-muted">{formatMessage({ id: "billing.currentSeats" })}</span>
-                        <span className="font-mono text-mono-code text-foreground">{currentSeatQuantity}</span>
-                      </div>
-                    )}
-                    {isManageSeatMode && seatDelta !== 0 && (
-                      <div className="flex items-center justify-between gap-3">
-                        <span className="text-callout text-foreground-muted">{seatDelta > 0 ? formatMessage({ id: "billing.addedCapacity" }) : formatMessage({ id: "billing.removedCapacity" })}</span>
-                        <span className="inline-flex flex-col items-end text-right text-callout text-foreground">
-                          <span>{formatHumanCapacityLabel(Math.abs(seatDelta))}</span>
-                          <span>{formatAgentCapacityLabel(Math.abs(seatDelta) * PRO_AGENT_SEAT_BLOCK_SIZE)}</span>
-                        </span>
-                      </div>
-                    )}
-                    {isManageSeatMode && localizedCurrentTotalLabel && localizedBillingTotalSummaryLabels.currentTotalLabel && (
-                      <div className="flex items-center justify-between gap-3">
-                        <span className="text-callout text-foreground-muted">{localizedBillingTotalSummaryLabels.currentTotalLabel}</span>
-                        <span className="text-callout text-foreground">{localizedCurrentTotalLabel}</span>
-                      </div>
-                    )}
-                    {isManageSeatMode && (
-                      <div className="flex items-center justify-between gap-3">
-                        <span className="text-callout font-semibold text-foreground">{localizedBillingTotalSummaryLabels.totalLabel}</span>
-                        <span className="inline-flex flex-col items-end text-callout font-semibold text-foreground">
-                          {localizedSelectedTotalLabels.originalLabel && (
-                            <span className="font-normal text-foreground-hint line-through">{localizedSelectedTotalLabels.originalLabel}</span>
-                          )}
-                          <span>{localizedSelectedTotalLabels.totalLabel}</span>
-                        </span>
-                      </div>
-                    )}
-                    <div className="text-caption text-foreground-hint">
-                      <Separator className="mb-3" />
-                      {formatMessage({ id: "billing.seatIncreasesMayBillImmediatelyAfterStripeConf" })}
-                    </div>
-                  </>
-                )}
-              </div>
-            </Card>
-          </Card>
-        </>
-      )}
-
-      {showCancelSubscriptionConfirm && (
-        <ConfirmDialog
-          chromeLocale="active"
-          title={formatMessage({ id: "billing.cancelSubscription" })}
-          message={formatMessage({ id: "billing.cancelTheWholeProSubscriptionAtTheEndOfTheCu" })}
-          confirmLabel={formatMessage({ id: "billing.cancelSubscription2" })}
-          loadingLabel={formatMessage({ id: "billing.canceling" })}
-          confirmVariant="warning"
-          onConfirm={handleCancelSubscription}
-          onClose={handleCloseCancelSubscriptionConfirm}
-        />
-      )}
-      {/* Stryker restore all: the real PlanSection composition test owns this complete dialog boundary. */}
-      {confirmBillingAction && (
-        <ConfirmDialog
-          chromeLocale="active"
-          title={confirmBillingAction === "checkout"
-            ? formatMessage({ id: "billing.confirmProCheckout" })
-            : formatMessage({ id: "billing.confirmSeatUpdate" })}
-          message={(
-            <div className="space-y-2">
-              <p>
-                {confirmBillingAction === "checkout"
-                  ? formatMessage({ id: "billing.youAreAboutToStartProCheckout" })
-                  : formatMessage({ id: "billing.youAreAboutToUpdateThisProSubscription" })}
-              </p>
-              {confirmBillingAction === "checkout" && normalizedPromotionCode && (
-                <p className="break-all text-footnote text-foreground-muted">{formatMessage({ id: "billing.checkoutPromotionReview" }, { code: normalizedPromotionCode })}</p>
-              )}
-              <div className="space-y-0.5 rounded-control bg-fill-muted px-3 py-2 text-footnote text-foreground">
-                {confirmBillingAction === "update" ? (
-                  <>
-                    <div>{formatMessage({ id: "billing.currentSeats" })}: {currentSeatQuantity}</div>
-                    {seatDelta > 0 && <div>{formatMessage({ id: "billing.seatsToAdd" })}: {additionalSeats}</div>}
-                    {seatDelta < 0 && <div>{formatMessage({ id: "billing.seatsToRemove" })}: {removedSeats}</div>}
-                    <div>{formatMessage({ id: "billing.totalSeatsAfterUpdate" })}: {draftSeatQuantity}</div>
-                    <div>{formatMessage({ id: "billing.capacityAfterUpdate" })}: {formatMessage(
-                        { id: "billing.capacityPair" },
-                        {
-                          human: formatHumanCapacityLabel(draftSeatQuantity),
-                          agent: formatAgentCapacityLabel(draftProvisionedAgentSeats),
-                        },
-                      )}</div>
-                    {seatUpdatePreview && (
-                      <>
-                        {seatUpdatePreview.promotion && (
-                          <div>{formatMessage({ id: "billing.appliedPromotion" })}: {seatUpdatePreview.promotion.code}</div>
-                        )}
-                        <div>{formatMessage({ id: "billing.estimatedProratedCharge" })}: {formatBillingAmount(seatUpdatePreview.prorationAmount, seatUpdatePreview.currency)}</div>
-                        {seatUpdatePreview.discountAmount > 0 && (
-                          <div>{formatMessage({ id: "billing.discount" })}: {formatBillingAmount(-seatUpdatePreview.discountAmount, seatUpdatePreview.currency)}</div>
-                        )}
-                        <div>
-                          {currentBillingInterval === "annual" ? formatMessage({ id: "billing.estimatedNextYearlyTotal" }) : formatMessage({ id: "billing.estimatedNextMonthlyTotal" })}: {formatBillingAmount(seatUpdatePreview.recurringAmount, seatUpdatePreview.currency)}
-                        </div>
-                      </>
-                    )}
-                  </>
-                ) : (
-                  <>
-                    <div>{formatMessage({ id: "billing.seats" })}: {draftSeatQuantity}</div>
-                    <div>{formatMessage({ id: "billing.capacity" })}: {formatMessage(
-                        { id: "billing.capacityPair" },
-                        {
-                          human: formatHumanCapacityLabel(draftSeatQuantity),
-                          agent: formatAgentCapacityLabel(draftProvisionedAgentSeats),
-                        },
-                      )}</div>
-                  </>
-                )}
-                <div>{localizedBillingTotalSummaryLabels.totalLabel}: {localizedSelectedTotalLabels.totalLabel}</div>
-              </div>
-              <p>
-                {confirmBillingAction === "checkout"
-                  ? formatMessage({ id: "billing.theNextPageIsStripeCheckoutWhereThePaymentAmou" })
-                  : seatDelta > 0
-                    ? formatMessage({ id: "billing.stripeMayBillThisSeatIncreaseImmediatelyAfterY" })
-                    : seatDelta < 0
-                      ? formatMessage({ id: "billing.stripeWillUpdateTheSubscriptionQuantityAfterYo" })
-                      : formatMessage({ id: "billing.stripeWillReactivateThisSubscriptionWithoutCha" })}
-              </p>
-              {seatUpdatePreview && (
-                <p>{formatMessage({ id: "billing.thisStripeEstimateExpiresAfter5MinutesRe" })}</p>
-              )}
             </div>
           )}
-          confirmLabel={confirmBillingAction === "checkout"
-            ? formatMessage({ id: "billing.continueToStripe" })
-            : formatMessage({ id: "billing.confirmAndUpdateSeats" })}
-          loadingLabel={confirmBillingAction === "checkout"
-            ? formatMessage({ id: "billing.opening2" })
-            : formatMessage({ id: "billing.updating2" })}
-          confirmVariant="accent"
-          onConfirm={confirmBillingAction === "checkout" ? handleCheckout : handlePackQuantityUpdate}
-          onClose={handleCloseBillingConfirm}
+          {appsumo && (
+            <>
+              <UsageMeter label={formatMessage({ id: "planBilling.usage.people" })} used={humans} max={appsumo.maxHumans} />
+              <UsageMeter label={formatMessage({ id: "billing.agents" })} used={agents} max={appsumo.maxAgents} />
+              <UsageMeter label={formatMessage({ id: "planBilling.usage.jointChannels" })} used={appsumo.hostedJointChannels} max={appsumo.maxHostedJointChannels} />
+            </>
+          )}
+          {(isFree || appsumo) && uploadQuota && (
+            <Meter
+              used={uploadUsed}
+              max={uploadQuota.limitBytes}
+              valueText={uploadResets
+                ? formatMessage(
+                  { id: uploadQuota.remainingBytes <= 0 ? "planBilling.usage.uploadsUsedUp" : "planBilling.usage.uploadsUsed" },
+                  { used: formatBytes(uploadUsed), limit: formatBytes(uploadQuota.limitBytes), date: uploadResets },
+                )
+                : formatMessage({ id: "planBilling.usage.used" }, { used: formatBytes(uploadUsed), total: formatBytes(uploadQuota.limitBytes) })}
+              data-testid="billing-upload-meter"
+            >
+              <MeterHeader>
+                <MeterLabel>{formatMessage({ id: "planBilling.usage.uploads" })}</MeterLabel>
+                <MeterValue />
+              </MeterHeader>
+              <MeterTrack>
+                <MeterIndicator />
+              </MeterTrack>
+            </Meter>
+          )}
+          {/* Free, and any plan without a seat count (founder, partner, or billing that came back partial). */}
+          {!universalSeats && !appsumo && (plan === "free" || billing) && (
+            <DescriptionList direction="horizontal">
+              {plan === "free" && (
+                <DescriptionItem>
+                  <DescriptionTerm>{formatMessage({ id: "planBilling.usage.history" })}</DescriptionTerm>
+                  <DescriptionDetails>{formatMessage({ id: "planBilling.usage.historyValue" }, { days: freeHistoryDays })}</DescriptionDetails>
+                </DescriptionItem>
+              )}
+              {/* Who is on the server comes with billing: without it, no count rather than a wrong one. */}
+              {billing && (
+                <DescriptionItem>
+                  <DescriptionTerm>{formatMessage({ id: "planBilling.usage.members" })}</DescriptionTerm>
+                  <DescriptionDetails>{formatMessage({ id: "planBilling.usage.membersValue" }, { people: humans, agents })}</DescriptionDetails>
+                </DescriptionItem>
+              )}
+            </DescriptionList>
+          )}
+        </CardContent>
+      </Card>
+
+      {billing?.permissions?.canReadBillingSummary === true && <HostedRuntimeSpendCard />}
+
+      {/* Free: what Pro adds */}
+      {isFree && billing && controls.canCheckout && (
+        <Card data-testid="billing-upgrade-card">
+          <CardHeader>
+            <CardTitle render={<h2>{formatMessage({ id: "billing.upgradeToPro" })}</h2>} />
+          </CardHeader>
+          <CardContent className="grid gap-4">
+            {/* Prices and the seats this server needs: data, in body ink (not CardDescription). */}
+            <p className="m-0 text-callout text-foreground" data-testid="billing-upgrade-price">
+              {formatMessage(
+                { id: "planBilling.upgrade.description" },
+                { monthly: usd(PRO_SEAT_MONTHLY_USD), annual: usd(Math.round((PRO_SEAT_ANNUAL_USD / 12) * 100) / 100), seats: neededSeats },
+              )}
+            </p>
+            <ul className="grid gap-x-6 gap-y-2 text-callout text-foreground sm:grid-cols-2">
+              {PRO_ADDS.map((id) => (
+                <li key={id} className="flex items-start gap-2">
+                  <Check size={16} className="mt-0.5 shrink-0 text-success-strong" aria-hidden="true" />
+                  {formatMessage({ id })}
+                </li>
+              ))}
+            </ul>
+            <div className="flex flex-wrap items-center gap-2">
+              <Button
+                variant="accent"
+                size="md"
+                onClick={handleUpgrade}
+                disabled={!billing?.stripeConfigured || billingAction != null}
+              >
+                {formatMessage({ id: owner ? "billing.upgradeToPro" : "planBilling.upgrade.askOwner" })}
+              </Button>
+              <Button
+                render={<a href={PRICING_URL} target="_blank" rel="noopener noreferrer" aria-label={opensInNewTabAriaLabel(formatMessage, formatMessage({ id: "planBilling.comparePlans" }))} />}
+                nativeButton={false}
+                size="md"
+                variant="ghost"
+              >
+                {formatMessage({ id: "planBilling.comparePlans" })}
+                <LeavingRaftMark data-icon="inline-end" />
+              </Button>
+            </div>
+            {billing && !billing.stripeConfigured && (
+              <p className="text-caption text-foreground-hint">{formatMessage({ id: "billing.paidPlansAreNotAvailableYet" })}</p>
+            )}
+          </CardContent>
+        </Card>
+      )}
+
+      {/* Pro: how it is billed */}
+      {isPro && subscription && (
+        <Card data-testid="billing-details-card">
+          <CardHeader>
+            <CardTitle render={<h2>{formatMessage({ id: "billing.billing" })}</h2>} />
+          </CardHeader>
+          <CardContent>
+            <DescriptionList direction="horizontal">
+              <DescriptionItem>
+                <DescriptionTerm>{formatMessage({ id: "planBilling.billing.billed" })}</DescriptionTerm>
+                <DescriptionDetails>{formatMessage({ id: annual ? "billing.yearly" : "billing.monthly" })}</DescriptionDetails>
+              </DescriptionItem>
+              {periodEndLabel && (
+                <DescriptionItem>
+                  <DescriptionTerm>{formatMessage({ id: ending ? "planBilling.billing.lastDay" : "planBilling.billing.renews" })}</DescriptionTerm>
+                  <DescriptionDetails>{periodEndLabel}</DescriptionDetails>
+                </DescriptionItem>
+              )}
+              {owner && <PaymentMethodItem />}
+              <DescriptionItem>
+                <DescriptionTerm>{formatMessage({ id: "billing.seats" })}</DescriptionTerm>
+                <DescriptionDetails>
+                  {formatMessage({ id: "billing.seatCount" }, { count: seats })}
+                </DescriptionDetails>
+              </DescriptionItem>
+            </DescriptionList>
+          </CardContent>
+          <CardFooter>
+            {formatMessage({ id: owner ? "planBilling.billing.ownerNote" : "planBilling.billing.memberNote" })}
+          </CardFooter>
+        </Card>
+      )}
+
+      {/* Cancelling, last */}
+      {isPro && subscription && owner && !ending && periodEndLabel && (
+        <Card data-testid="billing-cancel-card">
+          <CardHeader>
+            <CardTitle render={<h2>{formatMessage({ id: "planBilling.cancel.title" })}</h2>} />
+            <CardDescription>
+              {formatMessage({ id: "planBilling.cancel.body" }, { date: periodEndLabel, days: freeHistoryDays, upload: freeUpload })}
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="flex justify-end">
+            <Button variant="warning" size="md" onClick={openCancelConfirm} disabled={!!disabledReason || billingAction != null}>
+              {formatMessage({ id: "billing.cancelSubscription" })}
+            </Button>
+          </CardContent>
+        </Card>
+      )}
+
+      {/* A prepaid owner's dialog stays open into the grace days: it turns into Renew itself. */}
+      {seatDialog === "add" && (canAddSeats || keepNeedsSeats || (owner && Boolean(prepaid))) && (
+        <AddSeatsDialog
+          need={addSeatsNeed}
+          onClose={closeSeatDialog}
+          onPaid={handleSeatsPaid}
+          onAdded={handleSeatsAdded}
         />
       )}
-      {/* Stryker disable all: remaining billing wiring is covered by the broader billing contract suite. */}
+      {seatDialog === "remove" && canRemoveSeats && (
+        <ManageSeatsDialog
+          serverName={server.name}
+          seats={seats}
+          used={usedSeats}
+          minimum={neededSeats}
+          priced={price != null}
+          annual={annual}
+          entry={seatEntry}
+          onClose={closeSeatDialog}
+          onRemoved={handleSeatsRemoved}
+        />
+      )}
+      {showCancelSubscriptionConfirm && (
+        <ConfirmDialog
+          title={formatMessage({ id: "billing.cancelSubscription" })}
+          message={cancelConfirmMessage(formatMessage, server.name, billing?.externalChannelsTotal)}
+          confirmLabel={formatMessage({ id: "billing.cancelSubscription" })}
+          loadingLabel={formatMessage({ id: "billing.canceling" })}
+          cancelLabel={formatMessage({ id: "billing.keepSubscription" })}
+          confirmVariant="warning"
+          onConfirm={handleCancelSubscription}
+          onClose={closeCancelConfirm}
+        />
+      )}
     </div>
   );
 }
 // Stryker restore all
+
+/**
+ * The cancel confirmation's words, and, for a server in more than one external
+ * channel, what Free does to them when Pro ends (Warden's v4 H, cindyz: no
+ * grace period, so they freeze until it is back to one).
+ */
+function cancelConfirmMessage(formatMessage: IntlShape["formatMessage"], serverName: string, externalChannels: number | undefined): ReactNode {
+  const base = formatMessage({ id: "billing.cancelTheWholeProSubscriptionAtTheEndOfTheCu" });
+  if (!externalChannels || externalChannels < 2) return base;
+  return (
+    <>
+      <p>{base}</p>
+      <p className="mt-2" data-testid="cancel-external-channels">
+        {formatMessage({ id: "planBilling.cancel.externalChannels" }, { server: serverName, count: externalChannels })}
+      </p>
+    </>
+  );
+}
+
+type PaymentMethod =
+  | { type: "card"; brand: string; last4: string; expMonth: number; expYear: number }
+  | { type: "bank_account"; last4: string | null; bankName: string | null }
+  | { type: string };
+
+/**
+ * The Billing card's Payment method row (owners; PR 2 of task #13): what Stripe
+ * charges, read when the card shows (GET /billing/payment-method, an outside
+ * system). Left out when Stripe can't say.
+ */
+function PaymentMethodItem() {
+  const { formatMessage, formatDate } = useIntl();
+  const [state, setState] = useState<{ kind: "loading" } | { kind: "ready"; method: PaymentMethod | null } | { kind: "failed" }>({ kind: "loading" });
+  useEffect(() => {
+    let cancelled = false;
+    api.get<{ paymentMethod: PaymentMethod | null }>("/billing/payment-method")
+      .then(({ data }) => { if (!cancelled) setState({ kind: "ready", method: data.paymentMethod ?? null }); })
+      .catch(() => { if (!cancelled) setState({ kind: "failed" }); });
+    return () => { cancelled = true; };
+  }, []);
+  if (state.kind === "failed") return null;
+  let value: ReactNode;
+  if (state.kind === "loading") {
+    value = <Spinner size="xs" aria-label={formatMessage({ id: "planBilling.paymentMethod.loading" })} />;
+  } else if (!state.method) {
+    value = formatMessage({ id: "planBilling.paymentMethod.none" });
+  } else if (state.method.type === "card" && "last4" in state.method && "brand" in state.method) {
+    value = formatMessage(
+      { id: "planBilling.paymentMethod.card" },
+      {
+        brand: state.method.brand,
+        last4: state.method.last4,
+        expiry: formatDate(new Date(Date.UTC(state.method.expYear, state.method.expMonth - 1, 1)), { month: "2-digit", year: "2-digit", timeZone: "UTC" }),
+      },
+    );
+  } else if (state.method.type === "bank_account" && "last4" in state.method && state.method.last4) {
+    value = formatMessage({ id: "planBilling.paymentMethod.bank" }, { last4: state.method.last4 });
+  } else {
+    value = formatMessage({ id: "planBilling.paymentMethod.other" });
+  }
+  return (
+    <DescriptionItem data-testid="billing-payment-method">
+      <DescriptionTerm>{formatMessage({ id: "planBilling.paymentMethod.title" })}</DescriptionTerm>
+      <DescriptionDetails>{value}</DescriptionDetails>
+    </DescriptionItem>
+  );
+}
+
+/** One AppSumo allowance: what is used of the license's limit. */
+function UsageMeter({ label, used, max }: { label: string; used: number; max: number }) {
+  const { formatMessage, formatNumber } = useIntl();
+  return (
+    <Meter used={used} max={Math.max(max, 0.0001)} valueText={formatMessage({ id: "planBilling.usage.used" }, { used: formatNumber(used), total: formatNumber(max) })}>
+      <MeterHeader>
+        <MeterLabel>{label}</MeterLabel>
+        <MeterValue />
+      </MeterHeader>
+      <MeterTrack>
+        <MeterIndicator />
+      </MeterTrack>
+    </Meter>
+  );
+}

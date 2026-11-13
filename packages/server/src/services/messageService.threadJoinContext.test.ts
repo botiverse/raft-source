@@ -1,7 +1,7 @@
 import { dbTest as test } from "../test/integration/dbTest";
 import { closeTestDatabase } from "../test/integration/database";
 import assert from "node:assert/strict";
-import { eq } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 
 import {
   broadcastAndDeliver,
@@ -25,7 +25,7 @@ import { withChannelDelivery } from "../test/orchestratorStub";
 
 // Delivery-decision teeth for thread_join_context. Persistence, follow rows,
 // mention resolution, and channel/thread relations stay real in PGlite; only
-// transport/push/identity projections are stubbed.
+// transport/identity projections are stubbed.
 
 function stubIoAndPushDeps() {
   __setMessageServiceDepsForTests({
@@ -34,8 +34,6 @@ function stubIoAndPushDeps() {
       uniqueName: fallbackName,
       description: null,
     }),
-    buildPushTargets: async () => new Map(),
-    sendPushNotifications: async () => undefined,
   });
 }
 
@@ -131,9 +129,12 @@ async function mentionIntoThread(
   opts: {
     preFollowReason?: "replied" | "manual";
     unfollowedAt?: Date;
+    beforeMention?: (seeded: Awaited<ReturnType<typeof seed>>) => Promise<void>;
   } = {},
 ) {
-  const { db, owner, agent, parentMessage, threadChannel } = await seed(slug);
+  const seeded = await seed(slug);
+  const { db, owner, agent, parentMessage, threadChannel } = seeded;
+  await opts.beforeMention?.(seeded);
   if (opts.preFollowReason) {
     await db.insert(threadFollows).values({
       threadChannelId: threadChannel.id,
@@ -319,4 +320,40 @@ test("sender_timezone is persisted on direct sends and forced to null for agent 
   const toListener = agentDelivered.find((delivery) => delivery.agentId === listener.id);
   assert.ok(toListener, "the other agent must receive the agent's message");
   assert.equal(toListener.payload.sender_timezone, null);
+});
+
+// A Free server's 30-day history window (services/historyWindow.ts): the
+// context a thread mention carries stays inside it.
+const FORTY_DAYS_AGO = () => new Date(Date.now() - 40 * 24 * 60 * 60 * 1000);
+
+test("Free: the join context's recent replies stop at the history window", async ({ db: database }) => {
+
+  stubIoAndPushDeps();
+  const { agent, delivered } = await mentionIntoThread("tjc-hw", {
+    beforeMention: async ({ db, threadChannel }) => {
+      const replies = await db.select({ id: messages.id }).from(messages)
+        .where(and(eq(messages.channelId, threadChannel.id), inArray(messages.content, [1, 2, 3, 4, 5, 6].map((n) => `earlier unseen reply ${n}`))));
+      await db.update(messages).set({ createdAt: FORTY_DAYS_AGO() }).where(inArray(messages.id, replies.map((reply) => reply.id)));
+    },
+  });
+  const got = delivered.find((delivery) => delivery.agentId === agent.id);
+  assert.ok(got?.payload.thread_join_context);
+  assert.deepEqual(
+    got.payload.thread_join_context.recent_messages.map((message: any) => message.content),
+    ["earlier unseen reply 7", "earlier unseen reply 8"],
+  );
+  assert.equal(got.payload.thread_join_context.history_truncated, false);
+});
+
+test("Free: a thread whose start is behind the history window delivers the mention without a join context", async ({ db: database }) => {
+
+  stubIoAndPushDeps();
+  const { agent, delivered } = await mentionIntoThread("tjc-hp", {
+    beforeMention: async ({ db, parentMessage }) => {
+      await db.update(messages).set({ createdAt: FORTY_DAYS_AGO() }).where(eq(messages.id, parentMessage.id));
+    },
+  });
+  const got = delivered.find((delivery) => delivery.agentId === agent.id);
+  assert.ok(got, "the mention itself is delivered");
+  assert.equal(got.payload.thread_join_context, undefined, "the thread start is not the agent's to read");
 });

@@ -6,20 +6,27 @@ import { and, eq, inArray } from "drizzle-orm";
 
 import { getDb } from "../db/index";
 import {
+  accountDeletionRequests,
+  agents,
   notificationDeliveries,
   notificationEvents,
   notificationRecipients,
+  oauthAccessRequests,
   oauthAccessTokens,
+  oauthUserConsents,
   oauthClientInstalls,
   oauthClients,
   users,
 } from "../db/schema";
 import { addMember, createServer, updateAgentMemberRole } from "../services/serverService";
-import { createAgent } from "../services/agentService";
-import { createOAuthClient } from "../services/oauthService";
+import { requestAccountDeletion } from "../services/accountDeletion/requests";
+import { retireDueAccounts, runAccountDeletionCleanup } from "../services/accountDeletion/cleanup";
+import { __setAppMemberRefKeyForTests, deriveAppMemberRef, getAppServerProjection } from "../services/appOutboundProjectionService";
+import { createAgent, deleteAgent, updateAgent, updateAgentStatus } from "../services/agentService";
+import { createOAuthClient, exchangeAccessRequest } from "../services/oauthService";
 import { __setAppWebhookEncryptionKeyForTests, configureAppWebhook } from "../services/appWebhookConfigService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 async function seedUser(prefix: string, suffix: string) {
   const name = `${prefix}-${suffix.slice(0, 8)}`;
@@ -257,4 +264,150 @@ test("an agent joining and changing role queues the same member events", async (
   assert.deepEqual(changed[0]!.provenance, {
     actor_type: "human", previous_role: "member", principal_type: "agent", role: "admin", source: "server_service",
   });
+});
+
+test("a personal assistant is in no App event: not its creation, role change, status or profile change, removal, or its Server's deletion", async ({ app }) => {
+  const events = [
+    "server.member_added", "server.member_removed", "server.member_role_changed",
+    "agent.status_changed", "agent.profile_updated",
+  ];
+  const { owner, signedIn, server, client, agent: ordinary } = await seedSubscribedServer(events);
+  await getDb().update(oauthClients).set({ outboundCurrentGroups: ["server", "agent"] }).where(eq(oauthClients.id, client.id));
+  await getDb().update(oauthClientInstalls).set({ approvedGroups: ["server", "agent"] })
+    .where(and(eq(oauthClientInstalls.serverId, server.id), eq(oauthClientInstalls.clientId, client.id)));
+  // As createMyAssistant makes one: the row is marked with its owner only after
+  // createAgent has inserted it (afterInsert), so creation must not read the row.
+  const createAssistant = (ownerId: string) => createAgent(server.id, `smeassist${randomUUID().slice(0, 6)}`, {
+    runtime: "claude",
+    model: "sonnet",
+    creatorType: "user",
+    creatorId: ownerId,
+    kind: "personal_assistant",
+    afterInsert: async (tx, created) => {
+      await tx.update(agents).set({ assistantOwnerUserId: ownerId }).where(eq(agents.id, created.id));
+    },
+  });
+  const kept = await createAssistant(owner.id);
+  const removed = await createAssistant(signedIn.id);
+  const later = await createAgent(server.id, `smeordinary${randomUUID().slice(0, 4)}`, {
+    runtime: "claude", model: "sonnet", creatorType: "user", creatorId: owner.id,
+  });
+
+  for (const agent of [kept, ordinary]) {
+    await updateAgentMemberRole(server.id, agent.id, "admin");
+    await updateAgentStatus(agent.id, "active");
+    await updateAgent(agent.id, { displayName: `Renamed ${agent.id.slice(0, 4)}` });
+  }
+  await deleteAgent(removed.id);
+  await deleteAgent(later.id);
+  const res = await fetch(`${app.baseUrl}/api/servers/${server.id}`, {
+    method: "DELETE",
+    headers: serverHeaders(await tokenForHuman(owner.email), server.id),
+  });
+  assert.equal(res.status, 200);
+
+  const assistantIds = new Set([kept.id, removed.id]);
+  for (const eventType of events) {
+    const subjects = (await memberEvents(server.id, eventType)).map((event) => event.subjectId);
+    // The same changes to ordinary agents are announced, so the App is listening for each.
+    const control = eventType === "server.member_added" ? later.id : ordinary.id;
+    assert.ok(subjects.includes(control), `${eventType} is queued for an ordinary agent`);
+    assert.deepEqual(subjects.filter((id) => assistantIds.has(id!)), [], `${eventType} names no personal assistant`);
+  }
+  const all = await getDb().select({ subjectId: notificationEvents.subjectId }).from(notificationEvents)
+    .where(and(eq(notificationEvents.serverId, server.id), inArray(notificationEvents.subjectId, [...assistantIds])));
+  assert.deepEqual(all, [], "no event row about an assistant is written at all");
+});
+
+test("an App reading the server's member list sees ordinary agents and people, never a personal assistant", async ({ db }) => {
+  void db;
+  __setAppMemberRefKeyForTests(Buffer.alloc(32, 7));
+  const { owner, signedIn, server, client, agent: ordinary } = await seedSubscribedServer();
+  const assistant = await createAgent(server.id, `smeassist${randomUUID().slice(0, 6)}`, {
+    runtime: "claude", model: "sonnet", creatorType: "user", creatorId: owner.id,
+    kind: "personal_assistant",
+    afterInsert: async (tx, created) => {
+      await tx.update(agents).set({ assistantOwnerUserId: owner.id }).where(eq(agents.id, created.id));
+    },
+  });
+  const [install] = await getDb().select({ id: oauthClientInstalls.id }).from(oauthClientInstalls)
+    .where(and(eq(oauthClientInstalls.serverId, server.id), eq(oauthClientInstalls.clientId, client.id)));
+  const credential = {
+    tokenId: randomUUID(), installationId: install!.id, clientId: client.id, serverId: server.id,
+    grantRevision: 1, groups: ["server" as const], audience: "test", expiresAt: new Date(Date.now() + 60_000),
+  };
+  const refOf = (principalId: string) => deriveAppMemberRef({ clientId: client.id, installationId: install!.id, principalId }).member_ref;
+  const members = (await getAppServerProjection(credential))!.members.map((member) => member.member_ref);
+  assert.ok(members.includes(refOf(ordinary.id)), "an ordinary agent is listed");
+  assert.ok(members.includes(refOf(owner.id)) && members.includes(refOf(signedIn.id)), "people are listed");
+  assert.equal(members.includes(refOf(assistant.id)), false, "a personal assistant is not");
+});
+
+test("an account deletion queues server.member_removed with reason account_deleted for each server the person was in", async ({ app: _app }) => {
+  const { leaver, server } = await seedSubscribedServer();
+  const outcome = await requestAccountDeletion({ userId: leaver.id, source: "self", actorUserId: leaver.id });
+  assert.equal(outcome.kind, "scheduled");
+  await getDb().update(accountDeletionRequests).set({ scheduledFor: new Date(Date.now() - 60_000) })
+    .where(and(eq(accountDeletionRequests.userId, leaver.id), eq(accountDeletionRequests.state, "pending")));
+  await runAccountDeletionCleanup({ deps: { deleteResendContact: async () => {}, cancelScheduledEmail: async () => {}, cancelStripeSubscription: async () => {} } });
+
+  const events = await memberRemovedEvents(server.id);
+  assert.equal(events.length, 1);
+  assert.equal(events[0]!.subjectId, leaver.id);
+  assert.deepEqual(events[0]!.provenance, {
+    actor_type: "system", principal_type: "human", reason: "account_deleted", role: "admin", source: "account_deletion",
+  });
+  assert.equal(events[0]!.deliveryQueued, true);
+});
+
+test("after an account deletion the app's server projection no longer lists the person, and their Sign in with Raft token is revoked", async ({ app: _app }) => {
+  __setAppMemberRefKeyForTests(Buffer.alloc(32, 7));
+  const { signedIn, owner, server, client } = await seedSubscribedServer();
+  const [install] = await getDb().select({ id: oauthClientInstalls.id }).from(oauthClientInstalls)
+    .where(and(eq(oauthClientInstalls.serverId, server.id), eq(oauthClientInstalls.clientId, client.id)));
+  const credential = {
+    tokenId: randomUUID(), installationId: install!.id, clientId: client.id, serverId: server.id,
+    grantRevision: 1, groups: ["server" as const], audience: "test", expiresAt: new Date(Date.now() + 60_000),
+  };
+  const refOf = (principalId: string) => deriveAppMemberRef({ clientId: client.id, installationId: install!.id, principalId }).member_ref;
+  const listed = async () => (await getAppServerProjection(credential))!.members.map((member) => member.member_ref);
+  assert.ok((await listed()).includes(refOf(signedIn.id)));
+
+  await getDb().insert(oauthUserConsents).values({ userId: signedIn.id, serverId: server.id, clientId: client.id, scopes: ["openid"] });
+  const [pending] = await getDb().insert(oauthAccessRequests).values({
+    serverId: server.id, principalType: "human", userId: signedIn.id, clientId: client.id, scopes: ["openid"],
+  } as typeof oauthAccessRequests.$inferInsert).returning({ id: oauthAccessRequests.id });
+  // The installation approves the scope, so only the denial can refuse the exchange below.
+  await getDb().update(oauthClientInstalls).set({ approvedScopes: ["openid"] })
+    .where(and(eq(oauthClientInstalls.serverId, server.id), eq(oauthClientInstalls.clientId, client.id)));
+  // Approved in the grace period, its code not exchanged yet.
+  const [approved] = await getDb().insert(oauthAccessRequests).values({
+    serverId: server.id, principalType: "human", userId: signedIn.id, clientId: client.id, scopes: ["openid"],
+    status: "approved", resolvedByUserId: signedIn.id, resolvedAt: new Date(),
+  } as typeof oauthAccessRequests.$inferInsert).returning({ id: oauthAccessRequests.id });
+  const outcome = await requestAccountDeletion({ userId: signedIn.id, source: "self", actorUserId: signedIn.id });
+  assert.equal(outcome.kind, "scheduled");
+  await getDb().update(accountDeletionRequests).set({ scheduledFor: new Date(Date.now() - 60_000) })
+    .where(and(eq(accountDeletionRequests.userId, signedIn.id), eq(accountDeletionRequests.state, "pending")));
+  // Phase A only (retirement): the rows phase B deletes are still there, so the revocation itself is what is checked.
+  await retireDueAccounts({ deps: { deleteResendContact: async () => {}, cancelScheduledEmail: async () => {}, cancelStripeSubscription: async () => {} } });
+
+  const members = await listed();
+  assert.equal(members.includes(refOf(signedIn.id)), false, "a retired account is not a member to the app");
+  assert.ok(members.includes(refOf(owner.id)));
+  const tokens = await getDb().select({ revokedAt: oauthAccessTokens.revokedAt }).from(oauthAccessTokens)
+    .where(eq(oauthAccessTokens.userId, signedIn.id));
+  assert.equal(tokens.length, 1);
+  assert.ok(tokens[0]!.revokedAt, "their app token is revoked at retirement");
+  const consents = await getDb().select({ revokedAt: oauthUserConsents.revokedAt }).from(oauthUserConsents)
+    .where(eq(oauthUserConsents.userId, signedIn.id));
+  assert.equal(consents.length, 1);
+  assert.ok(consents[0]!.revokedAt, "their consent too");
+  const [request] = await getDb().select({ status: oauthAccessRequests.status }).from(oauthAccessRequests).where(eq(oauthAccessRequests.id, pending!.id));
+  assert.equal(request!.status, "denied", "and their pending request");
+  await assert.rejects(
+    () => exchangeAccessRequest({ clientId: client.id, requestId: approved!.id }),
+    /access_denied/,
+    "an approved, unexchanged code no longer mints a token after retirement",
+  );
 });

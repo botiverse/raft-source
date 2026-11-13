@@ -104,7 +104,11 @@ export function __setNotificationPrefsSyncCoreForTests(core: SyncCore | null): v
 }
 
 export function scopeIdForNotificationPrefsUpdate(update: NotificationPrefsUpdate): string {
-  return update.type === "channel" ? `channel:${update.channelId}` : `server:${update.serverId}`;
+  // The untyped channel event is the Activity mute (inbox_target_mute_states,
+  // its own prefsVersion sequence): keyed `mute:` so it never shares a version
+  // line with the channel's notification level (`channel:` in
+  // notificationSettingsStore, user_channel_notification_prefs).
+  return update.type === "channel" ? `mute:${update.channelId}` : `server:${update.serverId}`;
 }
 
 function prefsVersionForNotificationPrefsUpdate(update: NotificationPrefsUpdate): number | null {

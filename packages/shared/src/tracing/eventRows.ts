@@ -1,3 +1,4 @@
+import { encodeScopeDbAppendLine, encodeScopeDbAppendRecord } from "../scopeDbAppend";
 import type { CompletedTraceSpan, TraceAttributes, TraceEvent, TraceEventRecord, TraceSpanKind, TraceStatus, TraceSurface } from "./index";
 
 export interface TraceEventRowResource {
@@ -128,9 +129,9 @@ type TraceEventRowProjectionColumn = {
 }[keyof TraceEventRow];
 
 /**
- * The live Trace V2 ScopeDB projection. Keep executable schema ownership in
- * code so every producer uses one reviewable, type-checked statement rather
- * than copying the SQL value through deployment configuration.
+ * The live Trace V2 ScopeDB projection. Keep schema ownership in code so every
+ * producer encodes the same reviewable, type-checked column list for the
+ * Append API rather than copying it through deployment configuration.
  */
 export const TRACE_EVENT_ROW_V2_PROJECTION_COLUMNS = [
   ["row_kind", "string"],
@@ -202,15 +203,15 @@ export const TRACE_EVENT_ROW_V2_PROJECTION_COLUMNS = [
   // 67th column — additive rollout step 2026-09-20 (precedent: the 59->66
   // seven-column rollout). ORDERING CONTRACT: raft.trace_events_v2 must gain
   // this column BEFORE this code deploys; the sink asserts required columns at
-  // startup and the ingest statement names columns explicitly, so the old
-  // 66-column insert stays valid against the widened table.
+  // startup, and Append rejects a field the table does not have, while a
+  // writer that omits a column stays valid against the widened table.
   ["error_message", "string"],
 ] as const satisfies readonly TraceEventRowProjectionColumn[];
 
 /**
- * The immediately preceding projection remains valid during the additive
- * seven-column rollout. Old workers keep using this explicit 59-column insert
- * against the expanded table while new workers write the full projection.
+ * The 59-column projection that preceded the additive seven-column rollout.
+ * Kept only for its schema fingerprint, which event-buffer envelopes from old
+ * producers may still carry.
  */
 export const TRACE_EVENT_ROW_V2_LEGACY_PROJECTION_COLUMNS =
   Object.freeze(TRACE_EVENT_ROW_V2_PROJECTION_COLUMNS.slice(0, 59));
@@ -224,38 +225,20 @@ export const TRACE_EVENT_ROW_V2_SCHEMA_FINGERPRINT =
 export const TRACE_EVENT_ROW_V2_LEGACY_SCHEMA_FINGERPRINT =
   "sha256:d8cbabe44110bb2bc108a48021dbee4e37af732d6cc52c97fdcf06cb44b5e1ce";
 
-function buildTraceEventRowV2IngestStatement(
-  columns: readonly TraceEventRowProjectionColumn[],
-): string {
-  return [
-    "SELECT",
-    columns
-      .map(([column, type]) => `$0["${column}"]::${type} AS ${column}`)
-      .join(", "),
-    `INSERT INTO ${TRACE_EVENT_ROW_V2_TABLE}`,
-    `(${columns.map(([column]) => column).join(", ")})`,
-  ].join(" ");
+/**
+ * One Append record for raft.trace_events_v2: exactly the projection columns,
+ * in projection order, each encoded for its column type (scopedb 0.3 Append
+ * takes no ScopeQL cast). Row fields outside the projection (operation_id,
+ * inbox_*, rw_*, ...) are dropped, as the legacy explicit-column ingest
+ * statement dropped them. Missing columns are additive-safe: a table wider
+ * than the projection stores NULL for the columns this code does not send.
+ */
+export function encodeTraceEventRowV2AppendRecord(row: TraceEventRow): Record<string, string | number | object | null> {
+  return encodeScopeDbAppendRecord(row, TRACE_EVENT_ROW_V2_PROJECTION_COLUMNS);
 }
 
-export const TRACE_EVENT_ROW_V2_INGEST_STATEMENT =
-  buildTraceEventRowV2IngestStatement(TRACE_EVENT_ROW_V2_PROJECTION_COLUMNS);
-
-export const TRACE_EVENT_ROW_V2_LEGACY_INGEST_STATEMENT =
-  buildTraceEventRowV2IngestStatement(TRACE_EVENT_ROW_V2_LEGACY_PROJECTION_COLUMNS);
-
-/** The 66-column statement that preceded the error_message rollout. The env
- * override (SCOPEDB_TRACE_EVENTS_INGEST_STATEMENT) is validation-only — the
- * sink always writes with the current code-owned statement — so an env value
- * pinned before this rollout must stay recognized or the sink disables itself
- * on the first post-rollout deploy. Retire together with the previous schema
- * fingerprint. */
-export const TRACE_EVENT_ROW_V2_PREVIOUS_INGEST_STATEMENT =
-  buildTraceEventRowV2IngestStatement(TRACE_EVENT_ROW_V2_PROJECTION_COLUMNS.slice(0, 66));
-
-export function isTraceEventRowV2CompatibleIngestStatement(value: string): boolean {
-  return value === TRACE_EVENT_ROW_V2_INGEST_STATEMENT
-    || value === TRACE_EVENT_ROW_V2_PREVIOUS_INGEST_STATEMENT
-    || value === TRACE_EVENT_ROW_V2_LEGACY_INGEST_STATEMENT;
+export function encodeTraceEventRowV2AppendLine(row: TraceEventRow): string {
+  return encodeScopeDbAppendLine(row, TRACE_EVENT_ROW_V2_PROJECTION_COLUMNS);
 }
 
 /** The 66-column projection that preceded the error_message rollout. Old
@@ -274,6 +257,54 @@ export function isTraceEventRowV2CompatibleSchemaFingerprint(value: string): boo
 export interface TraceEventRowV2SchemaField {
   name: string;
   dataType: string;
+}
+
+/** The subset of a scopedb 0.3 Catalog table definition the assertion reads. */
+export interface TraceEventRowV2CatalogTable {
+  columns?: ReadonlyArray<{ name: string; data_type: string; expression?: string | null }>;
+}
+
+/**
+ * Catalog columns (`client.table(name, { schema }).catalog().get()`) as the
+ * assertion's {name, dataType} shape. Computed columns are left out: Append
+ * input must omit them, so a required projection column that became computed
+ * is reported as missing rather than written.
+ */
+export function traceEventRowV2SchemaFieldsFromCatalog(
+  definition: TraceEventRowV2CatalogTable,
+): TraceEventRowV2SchemaField[] {
+  return (definition.columns ?? [])
+    .filter((column) => column.expression === undefined || column.expression === null)
+    .map((column) => ({ name: column.name, dataType: column.data_type }));
+}
+
+/**
+ * Why a live schema check was skipped. Only a schema that was read and does
+ * not match blocks writes; a catalog that cannot be read is no evidence of a
+ * mismatch, and Append itself rejects a real one (the whole request, as a
+ * permanent rejection), so writing anyway never loses more than blocking.
+ *
+ * - `unauthorized`: the catalog read was refused (HTTP 401/403). A write-only
+ *   key may never be allowed to read the catalog; re-checked rarely.
+ * - `catalog_error`: any other read failure (timeout, 5xx, 429, network).
+ *   Blocking here would drop every batch for the outage even while Append
+ *   works; re-checked soon.
+ */
+export type TraceEventRowV2SchemaCheckSkipReason = "unauthorized" | "catalog_error";
+
+export const TRACE_EVENT_ROW_V2_SCHEMA_RECHECK_MS: Readonly<Record<TraceEventRowV2SchemaCheckSkipReason, number>> = {
+  unauthorized: 10 * 60_000,
+  catalog_error: 60_000,
+};
+
+const UNAUTHORIZED_CATALOG_CODES = new Set(["unauthorized", "unauthenticated", "forbidden", "permission_denied"]);
+
+/** Classifies a failed catalog read (a scopedb 0.3 ScopeDBError, read structurally). */
+export function traceEventRowV2SchemaCheckSkipReason(error: unknown): TraceEventRowV2SchemaCheckSkipReason {
+  const shape = (typeof error === "object" && error !== null ? error : {}) as { httpStatus?: unknown; code?: unknown };
+  if (shape.httpStatus === 401 || shape.httpStatus === 403) return "unauthorized";
+  if (typeof shape.code === "string" && UNAUTHORIZED_CATALOG_CODES.has(shape.code)) return "unauthorized";
+  return "catalog_error";
 }
 
 export class TraceEventRowV2SchemaMismatchError extends Error {

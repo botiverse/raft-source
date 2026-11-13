@@ -12,7 +12,7 @@ import {
   type WorkflowStepOutput,
   type WorkflowTemplateStep,
 } from "../db/schema";
-import { enrichSingleLegacyTask } from "./taskService";
+import { enrichSingleLegacyTask, reserveTaskNumbers } from "./taskService";
 
 type ActorType = "user" | "agent";
 
@@ -71,15 +71,8 @@ async function createWorkflowTask(
     .for("update");
   if (!channel) throw new WorkflowConflictError("workflow channel is unavailable");
 
-  const [{ maxMsgNum }] = await tx
-    .select({ maxMsgNum: sql<number>`COALESCE(MAX(${messages.taskNumber}), 0)` })
-    .from(messages)
-    .where(eq(messages.channelId, channelId));
-  const [{ maxTaskNum }] = await tx
-    .select({ maxTaskNum: sql<number>`COALESCE(MAX(${tasks.taskNumber}), 0)` })
-    .from(tasks)
-    .where(eq(tasks.channelId, channelId));
-  const taskNumber = Math.max(maxMsgNum ?? 0, maxTaskNum ?? 0) + 1;
+  // Under the channel row lock above; never reuses a number (RFC 078).
+  const taskNumber = await reserveTaskNumbers(tx, channelId);
 
   const [hostMessage] = await tx
     .insert(messages)
@@ -103,6 +96,8 @@ async function createWorkflowTask(
       createdByType: actorType,
       createdById: actorId,
       messageId: hostMessage.id,
+      // Creation is Tasks-page activity (taskService.TASK_ACTIVITY_NOW).
+      lastActivityAt: sql`now()`,
     })
     .returning();
 

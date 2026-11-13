@@ -1,7 +1,6 @@
-import { expect, test } from "@playwright/test";
+import { expect } from "@playwright/test";
 import type { Page } from "@playwright/test";
-import { loginViaApi } from "../fixtures/auth";
-import { waitForSeedState } from "../fixtures/seedState";
+import { seedChannelHistory, test } from "../fixtures/scenario";
 
 // Regression test for #proj-message task #13 ("点开消息之后会闪到往上一些
 // 的位置而不是消息列表底部").
@@ -35,8 +34,9 @@ async function scrollAwayFromBottom(page: Page) {
   }
 }
 
-// Mirror MessageTimeline.captureAnchor's semantic: the topmost message whose
-// bottom is below the scroller's top edge. This is what the primitive
+// Mirror the timeline's top visible row (topVisibleMessage in
+// VirtualMessageTimeline): the topmost message whose bottom is below the
+// scroller's top edge. This is what the primitive
 // persists, so we compare against the same notion of "where was I reading".
 async function captureTopmostVisible(page: Page) {
   return page.getByTestId("message-scroller").evaluate((el) => {
@@ -77,9 +77,9 @@ async function captureTopmostVisible(page: Page) {
 // state this scenario needs — never the whole storage, and never credentials.
 //
 // The storage contract is taken from the product, not assumed:
-//   MessageTimeline.tsx — SCROLL_MEMORY_PREFIX = "slock.scroll-memory.v1."
+//   messageTimelineShared.ts — SCROLL_MEMORY_PREFIX = "slock.scroll-memory.v1."
 //   ChatPanel.tsx       — persistKey={`channel:${channel.id}`}
-//   MessageTimeline.tsx — falls back to an in-memory Map when sessionStorage
+//   messageTimelineShared.ts — falls back to an in-memory Map when sessionStorage
 //                         is unavailable (a Map does not survive reload).
 
 const SCROLL_MEMORY_PREFIX = "slock.scroll-memory.v1.";
@@ -188,15 +188,18 @@ async function probeScrollStateInner(page: Page, channelId: string): Promise<Pro
 test.describe("message list scroll restore alignment", () => {
   test("persisted scroll resumes at the saved message's top, not centered", async ({
     page,
-    request,
+    scenario,
   }) => {
-    const seedState = await waitForSeedState();
-    await loginViaApi(request, seedState);
-    const channelId = seedState.channel.id;
+    // A tenant of its own (fixtures/scenario): other specs post to the shared
+    // seeded channel, so its seeded latest message is not always at the tail
+    // (nor mounted there by the virtual timeline).
+    const { seed } = scenario;
+    const history = await seedChannelHistory(seed);
+    const channelId = seed.channel.id;
 
-    await page.goto(`/s/${seedState.server.slug}/channel/${channelId}`);
+    await page.goto(`/s/${seed.server.slug}/channel/${channelId}`);
     await expect(page.getByTestId("message-scroller")).toBeVisible();
-    await expect(page.getByText(seedState.messages.latestContent)).toBeVisible();
+    await expect(page.getByText(history.latestContent)).toBeVisible();
 
     // Scroll up enough to clear AT_BOTTOM_THRESHOLD (100px) so the save path
     // fires on the next user-driven scroll event. Stay near the bottom so

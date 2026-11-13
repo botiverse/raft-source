@@ -6,11 +6,12 @@ import {
   Router,
   type Router as RouterType,
 } from "express";
-import { asServerId, currentTimeMs } from "@botiverse/raft-shared";
+import { ANNOUNCEMENT_SIDEBAR_STACK_MAX, asServerId, currentTimeMs } from "@botiverse/raft-shared";
 import type { Server as SocketServer } from "socket.io";
 import { requireAuth, requireVerified } from "../middleware/auth";
 import { UUID_RE } from "../lib/messageId";
 import * as announcementService from "../services/announcementService";
+import { parseRaftAppClient, requestClientPlatform } from "../services/productEventContext";
 
 export const announcementRouter: RouterType = Router();
 
@@ -58,12 +59,23 @@ announcementRouter.get("/active", requireAuth, requireVerified, async (req, res)
     res.status(400).json({ error: "after must be an announcement UUID" });
     return;
   }
+  // Optional and additive: clients that omit it keep the one-row contract.
+  const rawSidebarLimit = req.query.sidebar_limit;
+  const sidebarLimit = rawSidebarLimit === undefined ? 1 : Number(rawSidebarLimit);
+  if (!Number.isInteger(sidebarLimit) || sidebarLimit < 1 || sidebarLimit > ANNOUNCEMENT_SIDEBAR_STACK_MAX) {
+    res.status(400).json({ error: `sidebar_limit must be an integer from 1 to ${ANNOUNCEMENT_SIDEBAR_STACK_MAX}` });
+    return;
+  }
   const items = await announcementService.listUndismissedForUser(
     userId,
     req.sessionFamilyId,
     undefined,
     afterAnnouncementId,
     serverId,
+    // Coarse platform/build only; the raw User-Agent is not kept (productEventContext.ts).
+    parseRaftAppClient(req.get("user-agent")),
+    sidebarLimit,
+    announcementService.announcementRulePlatform(requestClientPlatform(req.get("x-raft-client-platform"), req.get("user-agent"))),
   );
   res.json({ announcements: items });
 });
@@ -80,7 +92,14 @@ announcementRouter.post("/:id/dismiss", requireAuth, requireVerified, async (req
     return;
   }
   const serverId = typeof rawServer === "string" ? asServerId(rawServer.toLowerCase()) : undefined;
-  const ok = await announcementService.dismiss(userId, req.params.id as string, undefined, serverId);
+  const ok = await announcementService.dismiss(
+    userId,
+    req.params.id as string,
+    undefined,
+    serverId,
+    parseRaftAppClient(req.get("user-agent")),
+    announcementService.announcementRulePlatform(requestClientPlatform(req.get("x-raft-client-platform"), req.get("user-agent"))),
+  );
   if (!ok) {
     res.status(404).json({ error: "Announcement not found" });
     return;
@@ -100,7 +119,7 @@ announcementRouter.get("/images/:id", async (req, res) => {
       SELECT 1 FROM announcements a
       CROSS JOIN LATERAL json_each(a.localized_content) locale
       WHERE locale.value->'image'->>'assetId' = ${id}
-      AND a.published_at IS NOT NULL AND a.starts_at <= now()
+      AND a.deleted_at IS NULL AND a.published_at IS NOT NULL AND a.starts_at <= now()
     )
   `);
   const row = result.rows[0] as { storage_key: string; content_type: string } | undefined;

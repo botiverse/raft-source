@@ -1,12 +1,22 @@
+import { ArtifactMessageRefs, ArtifactSavedAttachments, useArtifactAttachmentMenu } from "../../apps/artifacts";
+import { channelAnnouncementNoticeLine } from "../channel/channelAnnouncementNotice";
+import { trackMessageAction, messageMenuSurface } from "../../analytics/entries";
+import { MessageLinkCardsProvider, useMessageLinkCards } from "./useMessageLinkCards";
+import {
+  InlineAudioKeepAliveContext,
+  keepInlineAudioPlaying,
+  resumeKeptInlineAudio,
+} from "../../utils/inlineAudioKeepAlive";
 import Tooltip from "../ui/Tooltip";
-import { memo, useCallback, useEffect, useMemo, useRef, useState, Children } from "react";
+import { memo, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { ChangeEvent, MouseEvent, PointerEvent as ReactPointerEvent, ReactNode, TouchEvent } from "react";
 import { createPortal } from "react-dom";
 import { useIntl } from "react-intl";
 import type { IntlShape } from "react-intl";
-import { Copy, MessageCirclePlus, MessageCircleOff, Download, ClipboardCheck, Play, Pause, Volume2, CheckCircle, RotateCcw, Link, Bookmark, BookmarkMinus, Languages, AlertTriangle, Plus, Eye, Music } from "lucide-react";
+import { Copy, Download, Play, Pause, Volume2, SquareCheckBig, Link, Bookmark, BookmarkMinus, Languages, AlertTriangle, Plus, Eye, Music, Paperclip, ListChecks, SquareDashedText, RefreshCw, MessageSquareDot } from "lucide-react";
 import {
   Badge,
+  Button,
   Card,
   ContextMenuPopup,
   MessageAttachmentDiffAddition,
@@ -26,9 +36,9 @@ import {
   MessageItemMeta,
   MessageItemSender,
   MessageItemSenderButton,
+  MessageItemSenderGroup,
   MessageItemTime,
   MessageItemSavedIndicator,
-  MessageItemSearchMatch,
   MessageItemTranslationAction,
   MessageItemTranslationFailedStatus,
   MessageItemTranslationOriginal,
@@ -36,8 +46,17 @@ import {
   MessageItemTranslationRetryAction,
   MessageItemTranslationStatus,
   MessageMultiSelectCheckbox,
-  MessageReferenceChip,
-  MessageReferenceText,
+  MessageReactionAddButton,
+  MessageReactionChip,
+  MessageReactionCount,
+  MessageReactionGlyph,
+  MessageReactionQuickRow,
+  MessageReactionTooltipContent,
+  MessageReactionTooltipMeta,
+  MessageReactionTooltipName,
+  MessageReactionTooltipNameText,
+  MessageReactionTooltipNames,
+  MessageReactionTooltipSeparator,
   MessageVideoPreview,
   MessageVideoPreviewAction,
   MessageVideoPreviewFailureAction,
@@ -57,42 +76,54 @@ import {
   SystemMessageTime,
   TaskChip,
   TaskStatusIcon,
-  ThreadIcon,
+  Tooltip as RaftTooltip,
+  TooltipTrigger,
   toast,
   buildMessageImageGalleryRows,
   MessageImageGalleryRow,
+  ScrollArea,
 } from "@botiverse/raft-ui";
-import type { Components } from "react-markdown";
+import {
+  ThreadIcon,
+  FollowThreadIcon,
+  UnfollowThreadIcon,
+  ReopenTaskIcon,
+} from "@botiverse/ricons";
+import {
+  MessageItemDelegatedAvatar,
+  MessageItemDelegatedBy,
+  MessageItemDelegatedByName,
+} from "@botiverse/raft-ui/wip";
+import { delegatedByOf, isRetractedMessage } from "./delegatedMessage";
+import type { DelegatedBy } from "./delegatedMessage";
+import { DelegatedReceiptLines } from "../../assistant/DelegatedReceiptLines";
+import { delegatedReceiptsOf, joinedNotForwardedOf } from "../../assistant/delegatedReceipt";
+import { WeChatConnectedNotice } from "../../assistant/WeChatConnectedNotice";
+import { isWeChatConnectedNotice } from "../../assistant/wechatNotice";
+import { TaskHandoffCard } from "../task/TaskHandoffCard";
+import { readTaskHandoffNotice } from "../task/taskHandoffNotice";
+import type { TaskHandoffReturn } from "../task/taskHandoffNotice";
 
 // Shared across renders — never created inside a component (task #709).
 import { useStore } from "zustand";
 import {
-  createRaftBareTaskRefRegex,
-  createRaftChannelRefRegex,
-  createRaftChannelThreadRefRegex,
-  createRaftDmRefRegex,
-  createRaftDmThreadRefRegex,
-  createRaftMalformedDmKindRefRegex,
-  createRaftMessageRefRegex,
-  createRaftStructuredUserRefRegex,
-  createRaftUserRefRegex,
-  formatRaftRefTarget,
   messageReactionActorsDiscussion,
   messageRef as canonicalMessageRef,
-  parseRaftPermalink,
-  parseRaftRefTarget,
-  resolveRaftMentionHandle,
 } from "@botiverse/raft-shared";
 import type {
   ActionCardMetadata,
+  AttachmentPreviewSummaryData,
   ExternalActorKind,
   ExternalMessageAuthorProjection,
-  RaftRefTarget,
   ReactionActorRef,
   SyncScopeKey,
+  parseRaftPermalink,
 } from "@botiverse/raft-shared";
 import { useMessageStore } from "../../store/messageStore";
 import type { Message, MessageAttachment, MessageMention } from "../../store/messageStore";
+import { readHistoryLimitedError } from "../../store/hiddenHistoryStore";
+import type { ContextCanonicalTarget } from "../../store/hiddenHistoryStore";
+import { loadThreadRefContext } from "../../utils/threadRefContext";
 import { ActionCard } from "../actions/ActionCard";
 import { toRuiTaskStatus } from "../task/taskStatusUi";
 import { useAuthStore } from "../../store/authStore";
@@ -102,30 +133,40 @@ import type { Agent } from "../../store/agentStore";
 import type { ServerMember } from "../../store/serverStore";
 import type { ChannelExternalMember, ChannelHuman } from "../../hooks/useChannelMembers";
 import { useChannelStore } from "../../store/channelStore";
-import { useMachineStore } from "../../store/machineStore";
+import { findStoredChannel } from "../../store/storedChannel";
 
 import { useTaskStore } from "../../store/taskStore";
 import type { Task } from "../../store/taskStore";
 // Parked with its render site below — see the note there.
-// import TaskChipList from "../task/TaskChipList";
+import TaskChipList from "../task/TaskChipList";
+import { CreateTaskDialog } from "../task/DeferredCreateTaskDialog";
+import { openTaskConversationDialog, useOpenTask } from "../task/useOpenTask";
 import { isThreadFollowed, useThreadStore } from "../../store/threadStore";
+import { useEnclosingThreadMarkUnread } from "./threadUnreadHold";
+import { useMessageMenuMarkUnread } from "./messageMenuMarkUnread";
+import { useEnclosingThreadFollowCommand } from "./threadFollowCommand";
 import type { OpenThreadRequest, ThreadSummary } from "../../store/threadStore";
 import type { ThreadRepliesScope } from "../../store/threadRepliesReadModel";
 import { hasInlineThreadReplySurface, InlineThreadReplies } from "./InlineThreadReplies";
+import { AgentReplyingHint } from "./AgentTypingLine";
 import { useSavedStore } from "../../store/savedStore";
 import { useSelectionStore } from "../../store/selectionStore";
 import { useAppNavigate, buildMessagePermalink } from "../../hooks/useAppNavigate";
 import { useProfileStore } from "../../store/profileStore";
 import { setCachedAgentProfile } from "../profile/profileFallbackCache";
 import { useServerStore } from "../../store/serverStore";
+import { useRaftPermalinkHostnames } from "../../store/raftAppHosts";
+import { useActorFallback } from "../../store/localTables/useActorFallback";
 import { useTranslationStore } from "../../store/translationStore";
 import type { PreferredTranslationDisplay, TranslationEntry } from "../../store/translationStore";
 import { useLegacyTaskPanelStore } from "../../store/legacyTaskPanelStore";
 import {
+  getMessageAvatarSizeClass,
   getMessageBodyFontSizeClass,
   getMessageBodyFontSizeStyle,
   getMessageMetaSizeClass,
   getMessageNameSizeClass,
+  getMessageTimeSizeClass,
   useAppearanceStore,
 } from "../../store/appearanceStore";
 import api from "../../api/client";
@@ -134,43 +175,45 @@ import type { LightboxCommentContext } from "../../store/imageLightboxStore";
 import QuotedMessagePermalinkPreview from "./QuotedMessagePermalinkPreview";
 import {
   extractFirstQuotedMessagePermalink,
-  matchesUnavailableQuotedPermalink,
 } from "./quotedMessagePermalink";
-import MentionLink from "./MentionLink";
 import { GalleryImageItem } from "./GalleryImageItem";
-import { PermalinkReferenceChip } from "./PermalinkReferenceChip";
-import ProfilePreviewCardContent from "./ProfilePreviewCardContent";
+import { WRAPPED_CHIP_PRESS_CLASS } from "./clickableAffordance";
+import ProfilePreviewCardContent from "./DeferredProfilePreviewCardContent";
 import ExternalIdentityPreviewCard from "./ExternalIdentityPreviewCard";
+import { externalSenderPresentation, formatExternalProviderLabel } from "./externalIdentityPresentation";
 import { useTimeFormatter } from "../../hooks/useTimeFormatter";
+import { TimelineRevealTime } from "./TimelineRevealTime";
 import { useRefreshingMediaUrl } from "../../hooks/useRefreshingMediaUrl";
 import { agentModelLabel, useShowAgentModelName } from "../../utils/agentModelName";
 import { useCatalogModelLabel } from "../../store/modelLabelCatalogStore";
+import AppBadge from "../agent/AppBadge";
 import StatusDot from "../ui/StatusDot";
 import type { StatusDotProps } from "../ui/StatusDot";
 import { formatAgentDisplayStateText } from "../../utils/activity";
 import AvatarSlot from "../ui/AvatarSlot";
 import ContextMenuDivider from "../ui/ContextMenuDivider";
 import MenuItem from "../ui/MenuItem";
+import { ViewContextMenuGroup } from "../agentContextView/ViewContextMenuGroup";
+import { openAgentContextViewFor } from "../agentContextView/agentContextViewState";
 import DismissBackdrop from "../ui/DismissBackdrop";
+import { DeferredEmojiPickerPanel as EmojiPickerPanel } from "../ui/PickerPanelDeferred";
 import { isAudioPreviewAttachment, isDiffPatchAttachment, isDocumentPreviewAttachment, isVideoPreviewAttachment } from "./attachmentPreview";
-import type { DiffAttachmentPreview, DocumentAttachmentPreview } from "./attachmentPreview";
-import MarkdownContent, {MarkdownCode, MarkdownLink} from "../markdown/MarkdownContent";
-import { isCustomProtocolHref } from "../markdown/CustomProtocolLink";
-import { MessageReadReceiptScopeProvider } from "./messageReadReceiptScope";
-import type { MessageReadReceiptScope } from "./messageReadReceiptScope";
+import type { DiffAttachmentPreview } from "./attachmentPreview";
 import { projectReadReceipt } from "../../store/readReceiptDomain";
 import { useReadReceiptStore } from "../../store/readReceiptStore";
-import { fetchAttachmentPreviewSummary } from "./attachmentPreviewSummaryCache";
+import { AgentReadFaces, AgentReadStatusLine, AgentReadSystemRow } from "./AgentReadFaces";
+import { DmReadStatusLine } from "./MessageReadStatusLine";
+import { selectIsDmSurface } from "../../store/channelDmSurface";
+import { fetchAttachmentPreviewCardSummary } from "./attachmentPreviewSummaryCache";
 import { fetchInlineAttachmentUrls } from "./inlineAttachmentUrlCache";
 import { openDocumentPreview } from "./openDocumentPreview";
 import { openMediaPreview } from "./openMediaPreview";
 import { useMediaPreviewStore } from "../../store/mediaPreviewStore";
 import { useDocumentPreviewStore } from "../../store/documentPreviewStore";
-import { DOCUMENT_PREVIEW_LABEL_ID, INLINE_AUDIO_PREVIEW_CARD_CLASS } from "./attachmentPreviewSurfaces";
+import { DOCUMENT_PREVIEW_LABEL_ID, INLINE_AUDIO_PREVIEW_CARD_CLASS } from "./attachmentPreviewLabels";
 import { parseTimestampLabel, setPendingVideoSeek } from "./attachmentCommentAnchors";
-import { useAttachmentCommentsEnabled } from "./useAttachmentCommentsEnabled";
 import {
-  READ_RECEIPTS_FEATURE_FLAG_KEY,
+  TASK_V2_CONVERSATIONS_FLAG_KEY,
   useServerFeatureFlag,
 } from "../../store/serverFeatureFlags";
 import {
@@ -186,6 +229,13 @@ import { AttachmentCommentRefChip } from "./AttachmentCommentRefChip";
 import { shouldShowGroupedMessageHeader } from "./messageGrouping";
 import type { MessageGroupState } from "./messageGrouping";
 import { MessageHoverToolbar } from "./MessageHoverToolbar";
+import { recordReactionUsage } from "./reactionFavorite";
+import { useToolbarQuickReaction } from "./useToolbarQuickReaction";
+import { MessageForwardContext } from "./messageForwardContext";
+import { MessageSelectIntentContext } from "./messageSelectIntent";
+import { ForwardIcon } from "./messageForwardIcon";
+import { MessageSelectTextDrawer } from "./MessageSelectTextDrawer";
+import { getForwardableMessages } from "./forwardSelectionUtils";
 import { AttachmentChip } from "./AttachmentChip";
 import { AttachmentMetaText } from "./AttachmentMetaText";
 import ReadOnlyMessageAttachments from "./ReadOnlyMessageAttachments";
@@ -203,92 +253,115 @@ import {
 } from "./urlImageFallback";
 import { ThreadRepliesBadge } from "./ThreadRepliesBadge";
 import CollapsibleMessageContent from "./CollapsibleMessageContent";
-
+import { MessageCardBody } from "./MessageCardBody";
+import { readMessageCard } from "./messageCardRead";
 import { formatReminderReceiptContentTitle, formatReminderReceiptTime, formatReminderReceiptTooltip, splitReminderReceiptFireAtTokens } from "../../utils/reminderReceiptTime";
 import { resolveMessageSenderMember } from "../../utils/messageSenderMember";
-import { isRaftUploadedHumanAvatarUrl } from "../../utils/humanAvatar";
-import type { TimeFormatOptions } from "../../utils/timeFormatting";
+import { humanAvatarSource as avatarSourceOf, isRaftUploadedHumanAvatarUrl } from "../../utils/humanAvatar";
 import {
   buildThreadRefHandoffPath,
   captureThreadRouteAuthorityGuard,
   findThreadRefParentChannel,
   resolveThreadTargetByShortId,
+  threadRefMissingParentNotice,
 } from "../../utils/threadRefNavigation";
-import type {
-  ThreadRefIntent,
-  ThreadRouteTarget,
-} from "../../utils/threadRefNavigation";
-import { MESSAGE_MARKDOWN_REHYPE_PLUGINS, messageMarkdownRemarkPlugins } from "./messageMarkdownSecurity";
-import { highlightThreadSearchInTree, normalizeThreadSearchQuery } from "./threadSearch";
-import {
-  messageTokenNode,
-  plainTextOf,
-  replaceLinksInTree,
-  replaceTokensInTree,
-} from "./remarkMessageTokens";
-import type { TextTokenMatcher } from "./remarkMessageTokens";
-import { repairGeneratedMarkdown, unwrapDmKindStrikethrough } from "./repairGeneratedMarkdown";
-import type { Root as MdastRoot } from "mdast";
-import type { VFile } from "vfile";
+import type { ThreadRefIntent, ThreadRefMissingParentNotice, ThreadRouteTarget } from "../../utils/threadRefNavigation";
+import { useSearchHitMarkStore } from "../../store/searchHitMarkStore";
 import { QUICK_REACTION_EMOJIS } from "./reactionConstants";
 import ReactionGlyph from "./ReactionGlyph";
+import { QuickReactionButtons } from "./QuickReactionButtons";
 import { useFloatingOverlayPosition } from "../ui/useFloatingOverlayPosition";
 import { placeTouchMessageContextMenu } from "./messageContextMenuPosition";
+import { nextMessageMenuItem } from "./messageMenuKeyboard";
 import { isForwardedBundleMetadata } from "./ForwardedBundleCard";
 import type { ForwardedBundleAttachmentSnapshot, ForwardedBundleItem } from "./ForwardedBundleCard";
 import ForwardedBundleRouteCard from "./ForwardedBundleRouteCard";
 import { openConversationAgentActivity, openConversationAgentProfile } from "../../utils/profilePanelUrl";
-import { formatMemberRole } from "../../utils/memberRoleLabel";
-import { findDmByPeer } from "../../utils/refTarget";
+import { isViewerServerGuest, originServerNames } from "../../utils/memberOrigin";
+import type { MemberOrigin } from "../../utils/memberOrigin";
+import { AvatarOriginCorner } from "../member/MemberLabelParts";
+import { useSenderOrigin } from "./useSenderOrigin";
+import { taskRefKey } from "../../utils/refTarget";
+import { openTaskByChannelNumber } from "../../utils/openTaskRef";
+import { opensAsTaskConversation } from "../../utils/taskConversation";
 import { dispatchSenderMentionInsert } from "./senderMentionInsert";
 import { dismissLayerProps } from "../ui/dismissLayer";
+import { consumeDismissingTouch, useMessageTouchTaps } from "./useMessageTouchTaps";
+import type { MessageTapPoint } from "./useMessageTouchTaps";
+import { useShortcutLayer } from "../../features/shortcuts/useShortcutLayer";
+import { useDetailSlotThreadOpener } from "../layout/detailSlotThread";
+import { MESSAGE_AVATAR_OFFSET } from "./composerHost";
+import { MessageMarkdownBody } from "./MessageMarkdownBody";
+import { useOpenRaftPermalink } from "./useOpenRaftPermalink";
+import { taskNumberSigil } from "./messageMarkdownRefs";
+import type { MentionEntry } from "./messageMarkdownRefs";
+import { LinkCardBoundary } from "./LinkCardBoundary";
+
+export type { MentionEntry };
 
 // raft-ui's task status ids are kebab-case; slock's are snake_case.
 
+// A message followed by a reply surface or badge ends flush: the body and its
+// last Markdown block drop their bottom margin (a code block keeps 1px for its
+// edge), so the follower sits at the rhythm the ending matrix defines. Every
+// rule ends in a tag or attribute of the block itself, never a bare
+// `:last-child`: WebKit tests an unanchored `> :last-child` against every
+// element and then restyles whole subtrees whenever any last child changes
+// (no-unanchored-structural guard).
+const FOLLOWED_BODY_ENDING = [
+  "group-data-[followed-by]/message:mb-0",
+  "group-data-[followed-by]/message:[&>:last-child>p:last-child]:mb-0",
+  "group-data-[followed-by]/message:[&>:last-child>ul:last-child]:mb-0",
+  "group-data-[followed-by]/message:[&>:last-child>ol:last-child]:mb-0",
+  "group-data-[followed-by]/message:[&>:last-child>blockquote:last-child]:mb-0",
+  "group-data-[followed-by]/message:[&>:last-child>h1:last-child]:mb-0",
+  "group-data-[followed-by]/message:[&>:last-child>h2:last-child]:mb-0",
+  "group-data-[followed-by]/message:[&>:last-child>h3:last-child]:mb-0",
+  "group-data-[followed-by]/message:[&>:last-child>h4:last-child]:mb-0",
+  "group-data-[followed-by]/message:[&>:last-child>h5:last-child]:mb-0",
+  "group-data-[followed-by]/message:[&>:last-child>h6:last-child]:mb-0",
+  "group-data-[followed-by]/message:[&>:last-child>img:last-child]:mb-0",
+  "group-data-[followed-by]/message:[&>:last-child>[data-slot=separator]:last-child]:mb-0",
+  "group-data-[followed-by]/message:[&>:last-child>[data-md-table]:last-child]:mb-0",
+  "group-data-[followed-by]/message:[&>:last-child>[data-mermaid-status]:last-child]:mb-0",
+  "group-data-[followed-by]/message:[&>:last-child>[data-code-block]:last-child]:mb-px",
+  "group-data-[followed-by]/message:[&>:last-child>:last-child_li:last-child]:mb-0",
+].join(" ");
+
 const REACTION_PICKER_EVENT = "raft:message-reaction-picker-open";
-const REACTION_PICKER_WIDTH = 224;
-const REACTION_PICKER_HEIGHT = 42;
-const REACTION_PICKER_VIEWPORT_MARGIN = 8;
-const QUICK_REACTION_GLYPH_SIZE = 18;
+// The quick bar's size, derived from what it is built from: raft-ui's
+// MessageReactionQuickButton is size-9 (36px; the 34px control height with a
+// mouse, so 36 is the upper bound used here), and the popup below lays the
+// buttons out gap-0.5 (2px) inside px-1.5 py-1 (6px / 4px). The bar is also
+// measured once it renders and pulled back inside the viewport, so a change to
+// those metrics can't push the last emoji off a phone screen.
+const QUICK_REACTION_BUTTON_SIZE = 36;
+const REACTION_PICKER_GAP = 2;
+const REACTION_PICKER_PADDING_X = 4;
+const REACTION_PICKER_PADDING_Y = 4;
+// The seven reactions and the button that opens every other emoji.
+const QUICK_REACTION_BUTTON_COUNT = QUICK_REACTION_EMOJIS.length + 1;
+export const REACTION_PICKER_WIDTH = QUICK_REACTION_BUTTON_COUNT * QUICK_REACTION_BUTTON_SIZE
+  + (QUICK_REACTION_BUTTON_COUNT - 1) * REACTION_PICKER_GAP
+  + 2 * REACTION_PICKER_PADDING_X;
+const REACTION_PICKER_HEIGHT = QUICK_REACTION_BUTTON_SIZE + 2 * REACTION_PICKER_PADDING_Y;
+export const REACTION_PICKER_VIEWPORT_MARGIN = 8;
+// A double tap opens the bar at the finger: it keeps this far from the tap
+// point, above it (below when there is no room above), so the finger never
+// covers it and the click the browser derives from the second tap can't land
+// on one of its reactions.
+const REACTION_PICKER_TAP_CLEARANCE = 24;
+// Defence in depth for that click: the bar's reactions ignore activation this
+// long after a double tap opened it, and a press outside it that is no touch
+// (the mouse events the browser derives from the taps) doesn't close it.
+const REACTION_PICKER_TAP_SHIELD_MS = 400;
+// The full emoji picker that Add Reaction opens from the message menu: the
+// picker panel's 340px, and its 360px list under a 44px search row.
+const REACTION_EMOJI_PICKER_WIDTH = 340;
+const REACTION_EMOJI_PICKER_HEIGHT = 420;
 const SENDER_AVATAR_LONG_PRESS_MS = 500;
 const SENDER_AVATAR_LONG_PRESS_MOVE_TOLERANCE_PX = 10;
-function ThreadSearchFragmentHighlight({ children }: { children?: ReactNode }) {
-  return (
-    <MessageItemSearchMatch data-testid="thread-search-fragment-highlight">
-      {children}
-    </MessageItemSearchMatch>
-  );
-}
 
-function highlightThreadSearchInlineCode(
-  children: ReactNode,
-  query: string | undefined,
-): ReactNode {
-  const normalizedQuery = normalizeThreadSearchQuery(query ?? "");
-  if (!normalizedQuery) return children;
-
-  return Children.map(children, (child) => {
-    if (typeof child !== "string") return child;
-
-    const lowerText = child.toLocaleLowerCase();
-    const fragments: ReactNode[] = [];
-    let cursor = 0;
-    let matchIndex = lowerText.indexOf(normalizedQuery);
-    while (matchIndex !== -1) {
-      fragments.push(child.slice(cursor, matchIndex));
-      const matchEnd = matchIndex + normalizedQuery.length;
-      fragments.push(
-        <ThreadSearchFragmentHighlight key={`${matchIndex}:${matchEnd}`}>
-          {child.slice(matchIndex, matchEnd)}
-        </ThreadSearchFragmentHighlight>,
-      );
-      cursor = matchEnd;
-      matchIndex = lowerText.indexOf(normalizedQuery, cursor);
-    }
-    fragments.push(child.slice(cursor));
-    return fragments;
-  });
-}
 
 function buildOptimisticReactionMessage(
   message: Message,
@@ -391,38 +464,38 @@ function mergeReactionResponsePreservingPending(
   return merged;
 }
 
-function ReactionCount({ count }: { count: number }) {
-  const previousCountRef = useRef(count);
-  const [animationKey, setAnimationKey] = useState(0);
+// A failed toggle flashes the orange-soft problem wash over either fill.
+const REACTION_FAILURE_FLASH_CLASS = "bg-warning-soft data-pressed:bg-warning-soft";
+// MessageReactionChip's metrics, for the inert chip of a read-only viewer.
+const READ_ONLY_REACTION_CHIP_CLASS = "inline-flex h-6 min-w-0 max-w-full items-center gap-1 overflow-hidden whitespace-nowrap rounded-chip pl-1.5 pr-2 text-callout leading-none text-foreground";
 
-  // animation-key bump pattern: functional updater bumps an internal counter
-  // (NOT derived from count — it's a change-event counter used to retrigger
-  // CSS animation on key change). `previousCountRef` guard ensures only real
-  // count transitions bump. The rule's "compute during render" suggestion
-  // cannot express this (the key is animation state, not derived data).
-  useEffect(() => {
-    if (previousCountRef.current === count) return;
-    previousCountRef.current = count;
-    // oxlint-disable-next-line react-doctor/no-adjust-state-on-prop-change
-    setAnimationKey((key) => key + 1);
-  }, [count]);
-
+/** The reactors of one reaction in raft-ui's reaction tooltip parts. */
+function ReactionReactorsTooltipBody({
+  emoji,
+  visibleNames,
+  hiddenCount,
+}: {
+  emoji: string;
+  visibleNames: string[];
+  hiddenCount: number;
+}) {
+  const { formatMessage } = useIntl();
+  if (visibleNames.length === 0) return <span className="block leading-5">{emoji}</span>;
   return (
-    <span
-      key={animationKey}
-      className={`font-mono text-mono-meta font-bold tabular-nums ${animationKey > 0 ? "reaction-count-bump" : ""}`}
-    >
-      {count}
-    </span>
+    <MessageReactionTooltipNames>
+      {visibleNames.map((name, index) => (
+        <MessageReactionTooltipName key={`${emoji}-${index}-${name}`}>
+          <MessageReactionTooltipNameText>{name}</MessageReactionTooltipNameText>
+          {index < visibleNames.length - 1 || hiddenCount > 0 ? (
+            <MessageReactionTooltipSeparator className="pe-[0.3em]">,</MessageReactionTooltipSeparator>
+          ) : null}
+        </MessageReactionTooltipName>
+      ))}
+      {hiddenCount > 0 && (
+        <MessageReactionTooltipMeta>{formatMessage({ id: "message.messageItem.reactionHiddenMore" }, { count: hiddenCount })}</MessageReactionTooltipMeta>
+      )}
+    </MessageReactionTooltipNames>
   );
-}
-
-export interface MentionEntry {
-  displayName: string;
-  /** `external` = linked provider member — never linkable, renders as text. */
-  type: "agent" | "user" | "external";
-  id: string;
-  agent?: Agent;
 }
 
 // External-origin text has no Raft mention authority of its own: free text such
@@ -479,780 +552,6 @@ function buildStructuredMentionMap(mentions: MessageMention[] | undefined): Map<
   return map;
 }
 
-const mentionIdentityMapCache = new WeakMap<Map<string, MentionEntry>, Map<string, MentionEntry>>();
-
-function buildMentionIdentityMap(mentionMap: Map<string, MentionEntry>): Map<string, MentionEntry> {
-  const cached = mentionIdentityMapCache.get(mentionMap);
-  if (cached) return cached;
-  const map = new Map<string, MentionEntry>();
-  for (const entry of mentionMap.values()) {
-    map.set(`${entry.type}:${entry.id}`, entry);
-  }
-  mentionIdentityMapCache.set(mentionMap, map);
-  return map;
-}
-
-function getRaftRefProp(node: any, prop: string): string | undefined {
-  const value = node?.properties?.[prop] ?? node?.properties?.[`data-${prop.replace(/[A-Z]/g, (c) => `-${c.toLowerCase()}`)}`];
-  return typeof value === "string" ? value : undefined;
-}
-
-/** Render message content as Markdown with @mention and #channel highlighting.
-    Hook-named: it memoizes the markdown components map and handlers (task #709),
-    and is called exactly once, unconditionally, inside MessageMarkdownBody. */
-function useRenderMessageMarkdown(
-  content: string,
-  channels: Channel[],
-  mentionMap: Map<string, MentionEntry>,
-  structuredMentionMap: Map<string, MentionEntry>,
-  onNavigateChannel: (channel: Channel) => void,
-  onNavigateDm: (channel: Channel) => void,
-  onNavigateAgent: (agentId: string) => void,
-  onNavigateHuman: (userId: string) => void,
-  onNavigateExternal: ((profile: ExternalMessageAuthorProjection) => void) | undefined,
-  onNavigateComputer: (machineId: string) => void,
-  onOpenThread?: (intent: ThreadRefIntent) => void | Promise<void>,
-  resolvingThreadRefKey?: string | null,
-  onOpenTaskRef?: (taskNumber: number) => void,
-  onOpenMessageRef?: (channel: Channel, messageId: string, threadParentShortId: string | null) => void | Promise<void>,
-  onOpenPermalink?: (href: string) => void,
-  currentServerSlug?: string,
-  refAuthorityServerSlug?: string,
-  threadRefAuthorityUnavailable = false,
-  knownTaskNumbers?: Set<number>,
-  taskByNumber?: ReadonlyMap<number, Task>,
-  timeFormatOptions: TimeFormatOptions = {},
-  threadSearchHighlightQuery?: string,
-  formatMessage?: IntlShape["formatMessage"],
-  channelParticipantAgentsById?: ReadonlyMap<string, Agent>,
-  channelParticipantMembersById?: ReadonlyMap<string, ServerMember>,
-  channelParticipantExternalsById?: ReadonlyMap<string, ChannelExternalMember>,
-  unavailableQuotedPermalinkUrl?: string | null,
-  mentionsDisplayOnly = false,
-) {
-  // Inline task refs render rui's inline `TaskChip` when the referenced task is
-  // loaded in the client store. The chip is designed for running text —
-  // borderless and body-sized — so a mixed line (#mention-mix) keeps its
-  // baseline; it reads the same `task-status-*` tokens as every other surface,
-  // so the status colour still matches (task-status unification).
-  // Unknown tasks keep a neutral badge so the chip never claims a status it
-  // does not know.
-  //
-  // The inline badge shows the status icon + `#N` and deliberately NOT the
-  // assignee: the badge sits inside the sender's sentence, and an `@name`
-  // there reads as a mention the author never wrote (task #1252 — "等 #211
-  // @peng 做完", where @peng came from the badge). The footer badge is not
-  // inside a sentence and keeps the assignee; the task detail shows it too.
-  //
-  // No Tooltip wrapper here on purpose: the footer badge's tooltip mounts a
-  // base-ui trigger with an auto-generated id, and the evidence contract in
-  // tests/taskRefChannelScope.evidence.test.tsx requires the rendered ref
-  // markup to be byte-identical across renders of the same number.
-  const renderTaskBadge = useCallback((taskNumber: number) => {
-    const task = taskByNumber?.get(taskNumber);
-    if (!task) return null;
-    return (
-      <TaskChip
-        variant="inline"
-        status={toRuiTaskStatus(task.status)}
-        data-status={task.status}
-        data-testid="message-task-ref-badge"
-        render={
-          <a
-            href="#"
-            className="cursor-default"
-            data-message-affordance="open-linked-task"
-            onClick={(e) => {
-              e.preventDefault();
-              onOpenTaskRef?.(taskNumber);
-            }}
-          >
-            <TaskStatusIcon status={toRuiTaskStatus(task.status)} />
-            <span className="shrink-0">{taskNumberSigil(task.taskNumber)}</span>
-          </a>
-        }
-      />
-    );
-  }, [taskByNumber, onOpenTaskRef]);
-  // Task #762: every ref below is recognised on the parsed markdown tree
-  // (remarkMessageTokens), so code, links and escapes are skipped by the
-  // parser itself. Matchers run in this order; each sees only the text the
-  // earlier ones left alone, which is the precedence the old placeholders
-  // enforced (thread refs before mentions, `dm:@peer` before `@peer`).
-  const messageRefsPlugin = useMemo(() => {
-    const channelNameSet = new Set(channels.map((c) => c.name.toLowerCase()));
-    const crossServerAuthority = !!refAuthorityServerSlug
-      && !!currentServerSlug
-      && refAuthorityServerSlug !== currentServerSlug;
-    let mentionIdentityMap: Map<string, MentionEntry> | null = null;
-    const resolveMentionByIdentity = (type: "agent" | "user" | "external", id: string) => {
-      mentionIdentityMap ??= buildMentionIdentityMap(mentionMap);
-      return mentionIdentityMap.get(`${type}:${id}`);
-    };
-    const plain = (text: string) => messageTokenNode("span", text);
-    const raftRefAnchor = (target: RaftRefTarget, label: string) =>
-      messageTokenNode("a", label, {
-        dataRaftRefKind: target.kind,
-        dataRaftRefTarget: formatRaftRefTarget(target),
-      });
-    const mentionAnchor = (name: string, entry: MentionEntry) => {
-      const resolvedMention = resolveMentionByIdentity(entry.type, entry.id);
-      const visibleLabel = resolvedMention?.displayName ? `@${resolvedMention.displayName}` : `@${name}`;
-      return messageTokenNode("a", visibleLabel, {
-        dataMention: name,
-        dataMentionType: entry.type,
-        dataMentionId: entry.id,
-      });
-    };
-
-    const matchers: TextTokenMatcher[] = [
-      // `<target>` refs. `\<target>` is the escape: it stays literal text and
-      // no later matcher may claim part of it.
-      {
-        pattern: /<([^<>\n]+)>/g,
-        replace: (match, { escaped }) => {
-          const target = parseRaftRefTarget(match[1]);
-          if (!target) return false;
-          if (escaped) return plain(match[0]);
-          return raftRefAnchor(target, formatRaftRefTarget(target));
-        },
-      },
-      {
-        pattern: createRaftMessageRefRegex(),
-        replace: (match) => {
-          const [, channelName, threadParentShortId, messageId] = match;
-          const target = parseRaftRefTarget(
-            threadParentShortId
-              ? `#${channelName}:${threadParentShortId} msg=${messageId}`
-              : `#${channelName} msg=${messageId}`,
-          );
-          return target ? raftRefAnchor(target, formatRaftRefTarget(target)) : false;
-        },
-      },
-      // Thread refs MUST run before the mention matchers: `dm:@peer(:shortId)?`
-      // contains `@peer`, and letting mentions claim it first breaks the ref
-      // into `dm:` + mention chip (+ `:shortId`) — the production regression
-      // where `dm:@artin:1f1def75` stopped being clickable.
-      {
-        pattern: createRaftChannelThreadRefRegex(),
-        replace: (match) => {
-          const [text, chanName, shortId] = match;
-          if (threadRefAuthorityUnavailable) return plain(text);
-          if (!channelNameSet.has(chanName.toLowerCase()) && !crossServerAuthority) return false;
-          const chan = channels.find((c) => c.name.toLowerCase() === chanName.toLowerCase() && (c.type === "channel" || c.type === "private" || c.type === "joint"));
-          return messageTokenNode("a", `#${chanName}:${shortId}`, {
-            dataThreadRef: shortId,
-            dataThreadParent: crossServerAuthority ? "" : chan?.id || "",
-            dataThreadParentName: chanName,
-          });
-        },
-      },
-      {
-        pattern: createRaftDmThreadRefRegex(),
-        replace: (match) => {
-          const [text, peerName, shortId] = match;
-          if (threadRefAuthorityUnavailable) return plain(text);
-          const dm = findDmByPeer(channels, peerName);
-          // Unresolvable refs must read identically to the source — claim the
-          // whole token as plain text instead of letting the mention matcher
-          // chip `@peer` out of it.
-          if (!dm && !crossServerAuthority) return plain(text);
-          return messageTokenNode("a", `dm:@${peerName}:${shortId}`, {
-            dataThreadRef: shortId,
-            dataThreadParent: crossServerAuthority ? "" : dm?.id || "",
-            dataThreadParentName: crossServerAuthority ? peerName : dm?.name || peerName,
-            dataThreadParentType: "dm",
-          });
-        },
-      },
-      // Bare `dm:@peer` refs: claim the whole token (same preemption rule) and
-      // render through the raft-ref anchor path, which navigates to the DM.
-      {
-        pattern: createRaftDmRefRegex(),
-        replace: (match) => {
-          const [text, peerName] = match;
-          if (!findDmByPeer(channels, peerName)) return plain(text);
-          return raftRefAnchor({ kind: "dm", peerName }, text);
-        },
-      },
-      // `dm:@name~bot` (unknown peer kind) is not a ref: keep it plain text so
-      // neither `dm:@name` nor the mention matcher turns it into another target.
-      { pattern: createRaftMalformedDmKindRefRegex(), replace: (match) => plain(match[0]) },
-      // A selected mention is an identity-backed entity, not a fresh username
-      // guess. Keep it mentionable after left-boundary edits such as
-      // `草案@Mona` and before CJK suffixes such as `@Mona的`; a Latin right
-      // boundary still prevents a stale `@Mona` entity from claiming `@Monica`.
-      ...[...structuredMentionMap].flatMap(([name, entry]): TextTokenMatcher[] => {
-        const pattern = createRaftStructuredUserRefRegex(name);
-        return pattern ? [{ pattern, replace: () => mentionAnchor(name, entry) }] : [];
-      }),
-      // Free text still uses the conservative grammar so emails/package-like
-      // strings never become notifications merely because a directory name
-      // happens to match.
-      {
-        pattern: createRaftUserRefRegex(),
-        replace: (match) => {
-          const [, prefix, token] = match;
-          const resolved = resolveRaftMentionHandle(
-            token,
-            (name) => structuredMentionMap.has(name) || mentionMap.has(name),
-          );
-          if (!resolved) return false; // Not a known name — keep as plain text
-          const entry = structuredMentionMap.get(resolved.handle) ?? mentionMap.get(resolved.handle);
-          if (!entry) return false;
-          return [
-            { type: "text", value: prefix },
-            mentionAnchor(resolved.handle, entry),
-            { type: "text", value: resolved.suffix },
-          ];
-        },
-      },
-      // "task #205" always links; bare "#205" only if it's a known task.
-      {
-        pattern: createRaftBareTaskRefRegex(),
-        replace: (match) => {
-          const [, prefix, taskKeyword, taskNumber] = match;
-          if (!taskKeyword && !knownTaskNumbers?.has(Number(taskNumber))) return false;
-          return [
-            { type: "text", value: `${prefix}${taskKeyword ?? ""}` },
-            messageTokenNode("a", `#${taskNumber}`, { dataTaskRef: taskNumber }),
-          ];
-        },
-      },
-      // #channel refs: only a known channel becomes a link.
-      {
-        pattern: createRaftChannelRefRegex(),
-        replace: (match) => {
-          const [, name] = match;
-          if (!channelNameSet.has(name.toLowerCase())) return false;
-          return messageTokenNode("a", `#${name}`, { dataChannel: name });
-        },
-      },
-    ];
-
-    return () => (tree: MdastRoot, file: VFile) => {
-      repairGeneratedMarkdown(tree, file);
-      unwrapDmKindStrikethrough(tree, file);
-      replaceLinksInTree(tree, (link) => {
-        // `[label](<target>)` and `<dm:@peer>`: the parser made these links,
-        // and only the angle-bracket forms are refs (`[x](#general)` is not).
-        const source = file.value ? String(file.value).slice(link.position?.start.offset ?? 0, link.position?.end.offset ?? 0) : "";
-        const isLabelled = /\]\(<[^<>\n]+>\)$/.test(source);
-        const isAutolink = source === `<${link.url}>`;
-        if (!isLabelled && !isAutolink) return null;
-        const target = parseRaftRefTarget(link.url);
-        if (!target) return null;
-        return raftRefAnchor(target, isLabelled ? plainTextOf(link) : formatRaftRefTarget(target));
-      });
-      replaceTokensInTree(tree, matchers, file);
-      highlightThreadSearchInTree(tree, threadSearchHighlightQuery ?? "");
-    };
-  }, [
-    channels, mentionMap, structuredMentionMap, knownTaskNumbers, threadRefAuthorityUnavailable,
-    refAuthorityServerSlug, currentServerSlug, threadSearchHighlightQuery,
-  ]);
-  const remarkPlugins = useMemo(
-    () => messageMarkdownRemarkPlugins(messageRefsPlugin),
-    [messageRefsPlugin],
-  );
-
-  // Chat body shares its visual styling (code blocks, lists, headings, table,
-  // etc.) with attachment preview via BASE_MARKDOWN_COMPONENTS in
-  // MarkdownContent. We override only the elements that need chat-specific
-  // behavior — `a` (mentions / channel refs / task refs / thread refs /
-  // raft permalinks) and `span` (reminder receipts).
-  // stdrc 2026-05-08 #proj-uiux:6110c1ce (task #137).
-  const markdownComponents = useMemo(() => ({
-    code: ({ children, className }) => (
-      <MarkdownCode className={className}>
-        {className
-          ? children
-          : highlightThreadSearchInlineCode(children, threadSearchHighlightQuery)}
-      </MarkdownCode>
-    ),
-    // Links — handle @mention, #channel, and regular URLs
-    a: ({ href, children, node }) => {
-          const raftRefTarget = getRaftRefProp(node, "dataRaftRefTarget");
-          if (raftRefTarget) {
-            const target = parseRaftRefTarget(raftRefTarget);
-            if (!target) return <span>{children}</span>;
-
-            if (target.kind === "user") {
-              const entry = structuredMentionMap.get(target.name) ?? mentionMap.get(target.name);
-              if (!entry) return <span>{children}</span>;
-              if (mentionsDisplayOnly) return renderDisplayOnlyMention(children);
-              return (
-                <MentionLink
-                  mentionType={entry.type}
-                  mentionId={entry.id}
-                  fallbackLabel={target.name}
-                  fallbackAgent={entry.type === "agent" ? channelParticipantAgentsById?.get(entry.id) : undefined}
-                  fallbackMember={entry.type === "user" ? channelParticipantMembersById?.get(entry.id) : undefined}
-                  fallbackExternal={entry.type === "external" ? channelParticipantExternalsById?.get(entry.id) : undefined}
-                  onNavigateAgent={onNavigateAgent}
-                  onNavigateHuman={onNavigateHuman}
-                  onNavigateExternal={onNavigateExternal}
-                >
-                  {children}
-                </MentionLink>
-              );
-            }
-
-            if (target.kind === "computer") {
-              return (
-                <MessageReferenceChip
-                  variant="link"
-                  className="cursor-default"
-                  render={
-                    <a data-testid={`computer-reference-${target.machineId}`}
-                      href="#"
-                      onClick={(event) => {
-                        event.preventDefault();
-                        onNavigateComputer(target.machineId);
-                      }}>
-                      {children}
-                    </a>
-                  }
-                />
-              );
-            }
-
-            if (target.kind === "app") {
-              return (
-                <Tooltip content={formatMessage?.({ id: "message.messageItem.appReferenceOnly" })}>
-                <MessageReferenceText
-                  variant="primary"
-                                    render={
-                    <span data-testid={`app-reference-${target.appId}`} />}>
-                  {children}
-                </MessageReferenceText>
-                </Tooltip>
-              );
-            }
-
-            if (target.kind === "channel" || target.kind === "channel-thread" || target.kind === "message") {
-              const crossServerAuthority = !!refAuthorityServerSlug
-                && !!currentServerSlug
-                && refAuthorityServerSlug !== currentServerSlug;
-              const channel = channels.find(
-                (entry) =>
-                  entry.name.toLowerCase() === target.channelName.toLowerCase() &&
-                  (entry.type === "channel" || entry.type === "private" || entry.type === "joint"),
-              );
-              const crossServerThreadTarget = crossServerAuthority
-                && (target.kind === "channel-thread" || (target.kind === "message" && !!target.threadParentShortId));
-              if (!channel && !crossServerThreadTarget) return <span>{children}</span>;
-
-              if (target.kind === "channel") {
-                if (!channel) return <span>{children}</span>;
-                return (
-                  <MessageReferenceChip
-                    variant="accent"
-                    className="cursor-default"
-                    render={
-                      <a href="#"
-                        onClick={(e) => {
-                          e.preventDefault();
-                          onNavigateChannel(channel);
-                        }}>
-                        {children}
-                      </a>
-                    }
-                  />
-                );
-              }
-
-              if (target.kind === "channel-thread") {
-                if (threadRefAuthorityUnavailable) return <span>{children}</span>;
-                if (!onOpenThread) return <span>{children}</span>;
-                const routeServerSlug = refAuthorityServerSlug ?? currentServerSlug;
-                if (!routeServerSlug) return <span>{children}</span>;
-                const parentChannelId = crossServerAuthority ? null : channel?.id ?? null;
-                const threadRefKey = `${routeServerSlug}:${target.channelName.toLowerCase()}:${target.threadShortId.toLowerCase()}`;
-                const isResolvingThreadRef = resolvingThreadRefKey === threadRefKey;
-                return (
-                  <MessageReferenceChip
-                    variant="link"
-                    className={`${isResolvingThreadRef ? "cursor-wait opacity-80" : "cursor-default"}`}
-                    render={
-                      <a href="#"
-                        aria-busy={isResolvingThreadRef}
-                        onClick={(e) => {
-                          e.preventDefault();
-                          if (isResolvingThreadRef) return;
-                          void onOpenThread({
-                            serverSlug: routeServerSlug,
-                            parentChannelName: target.channelName,
-                            parentChannelId,
-                            shortId: target.threadShortId,
-                          });
-                        }}>
-                        <span>{children}</span>
-                        {isResolvingThreadRef ? (
-                          <Spinner size="xs" className="ml-1 align-[-1px]" aria-label={formatMessage?.({ id: "common.loadingLabel" })} />
-                        ) : null}
-                      </a>
-                    }
-                  />
-                );
-              }
-
-              if (target.threadParentShortId && onOpenThread) {
-                if (threadRefAuthorityUnavailable) return <span>{children}</span>;
-                const routeServerSlug = refAuthorityServerSlug ?? currentServerSlug;
-                if (!routeServerSlug) return <span>{children}</span>;
-                return (
-                  <MessageReferenceText
-                    variant="primary"
-                    className="cursor-default"
-                    render={
-                      <a href="#"
-                        onClick={(e) => {
-                          e.preventDefault();
-                          void onOpenThread({
-                            serverSlug: routeServerSlug,
-                            parentChannelName: target.channelName,
-                            parentChannelId: crossServerAuthority ? null : channel?.id ?? null,
-                            shortId: target.threadParentShortId!,
-                            focusedMessageId: target.messageId,
-                          });
-                        }}>
-                        {children}
-                      </a>
-                    }
-                  />
-                );
-              }
-
-              if (!onOpenMessageRef) return <span>{children}</span>;
-              if (!channel) return <span>{children}</span>;
-              return (
-                <MessageReferenceText
-                  variant="primary"
-                  className="cursor-default"
-                  render={
-                    <a href="#"
-                      onClick={(e) => {
-                        e.preventDefault();
-                        void onOpenMessageRef?.(channel, target.messageId, target.threadParentShortId);
-                      }}>
-                      {children}
-                    </a>
-                  }
-                />
-              );
-            }
-
-            if (target.kind === "dm" || target.kind === "dm-thread") {
-              const crossServerAuthority = !!refAuthorityServerSlug
-                && !!currentServerSlug
-                && refAuthorityServerSlug !== currentServerSlug;
-              const dm = findDmByPeer(channels, target.peerName);
-              if (!dm && !(crossServerAuthority && target.kind === "dm-thread")) return <span>{children}</span>;
-              if (target.kind === "dm") {
-                if (!dm) return <span>{children}</span>;
-                return (
-                  <MessageReferenceChip
-                    variant="accent"
-                    className="cursor-default"
-                    render={
-                      <a href="#"
-                        onClick={(e) => {
-                          e.preventDefault();
-                          onNavigateDm(dm);
-                        }}>
-                        {children}
-                      </a>
-                    }
-                  />
-                );
-              }
-              if (!onOpenThread) return <span>{children}</span>;
-              if (threadRefAuthorityUnavailable) return <span>{children}</span>;
-              const routeServerSlug = refAuthorityServerSlug ?? currentServerSlug;
-              if (!routeServerSlug) return <span>{children}</span>;
-              return (
-                <MessageReferenceChip
-                  variant="link"
-                  className="cursor-default"
-                  render={
-                    <a href="#"
-                      onClick={(e) => {
-                        e.preventDefault();
-                        void onOpenThread({
-                          serverSlug: routeServerSlug,
-                          parentChannelName: crossServerAuthority ? target.peerName : dm!.name,
-                          parentChannelType: "dm",
-                          parentChannelId: crossServerAuthority ? null : dm!.id,
-                          shortId: target.threadShortId,
-                        });
-                      }}>
-                      {children}
-                    </a>
-                  }
-                />
-              );
-            }
-
-            if (target.kind === "task" && onOpenTaskRef) {
-              const taskBadge = renderTaskBadge(target.taskNumber);
-              if (taskBadge) return taskBadge;
-              return (
-                <a
-                  href="#"
-                  className="cursor-default"
-                  data-message-affordance="open-linked-task"
-                  onClick={(e) => {
-                    e.preventDefault();
-                    onOpenTaskRef(target.taskNumber);
-                  }}>
-                  <Badge variant="muted">{children}</Badge>
-                </a>
-              );
-            }
-
-            return <span>{children}</span>;
-          }
-
-          // @mention → clickable, navigates to agent or human detail
-          const mentionName = node?.properties?.dataMention as string | undefined;
-          if (mentionName) {
-            const mentionType = node?.properties?.dataMentionType as string | undefined;
-            const mentionId = node?.properties?.dataMentionId as string | undefined;
-
-            if (mentionsDisplayOnly) return renderDisplayOnlyMention(children);
-            if (!mentionId || (mentionType !== "agent" && mentionType !== "user" && mentionType !== "external")) {
-              return (
-                <span className="font-bold text-foreground underline decoration-foreground-hint decoration-[1.5px] underline-offset-[3px] select-text">
-                  {children}
-                </span>
-              );
-            }
-
-            return (
-              <MentionLink
-                mentionType={mentionType}
-                mentionId={mentionId}
-                fallbackLabel={mentionName}
-                fallbackAgent={mentionType === "agent" ? channelParticipantAgentsById?.get(mentionId) : undefined}
-                fallbackMember={mentionType === "user" ? channelParticipantMembersById?.get(mentionId) : undefined}
-                fallbackExternal={mentionType === "external" ? channelParticipantExternalsById?.get(mentionId) : undefined}
-                onNavigateAgent={onNavigateAgent}
-                onNavigateHuman={onNavigateHuman}
-                onNavigateExternal={onNavigateExternal}
-              >
-                {children}
-              </MentionLink>
-            );
-          }
-          // Thread reference → clickable, opens thread panel
-          const threadRef = node?.properties?.dataThreadRef as string | undefined;
-          if (threadRef && onOpenThread) {
-            if (threadRefAuthorityUnavailable) return <span>{children}</span>;
-            const parentId = node?.properties?.dataThreadParent as string | undefined;
-            const parentName = node?.properties?.dataThreadParentName as string | undefined;
-            const parentType = node?.properties?.dataThreadParentType === "dm" ? "dm" : "channel";
-            const routeServerSlug = refAuthorityServerSlug ?? currentServerSlug;
-            const crossServerAuthority = !!refAuthorityServerSlug
-              && !!currentServerSlug
-              && refAuthorityServerSlug !== currentServerSlug;
-            if (!routeServerSlug || !parentName || (!parentId && !crossServerAuthority)) {
-              return (
-                <MessageReferenceChip
-                  variant="link"
-                  className="opacity-60"
-                  render={
-                    <span />}>
-                  {children}
-                </MessageReferenceChip>
-              );
-            }
-            const threadRefKey = `${routeServerSlug}:${parentName.toLowerCase()}:${threadRef.toLowerCase()}`;
-            const isResolvingThreadRef = resolvingThreadRefKey === threadRefKey;
-            return (
-              <MessageReferenceChip
-                variant="link"
-                className={`${isResolvingThreadRef ? "cursor-wait opacity-80" : "cursor-default"}`}
-                render={
-                  <a href="#"
-                    aria-busy={isResolvingThreadRef}
-                    onClick={(e) => {
-                      e.preventDefault();
-                      if (isResolvingThreadRef) return;
-                      void onOpenThread({
-                        serverSlug: routeServerSlug,
-                        parentChannelName: parentName,
-                        parentChannelType: parentType,
-                        parentChannelId: crossServerAuthority ? null : parentId,
-                        shortId: threadRef,
-                      });
-                    }}>
-                    <span>{children}</span>
-                    {isResolvingThreadRef ? (
-                      <Spinner size="xs" className="ml-1 align-[-1px]" aria-label={formatMessage?.({ id: "common.loadingLabel" })} />
-                    ) : null}
-                  </a>
-                }
-              />
-            );
-          }
-          // #channel → clickable, navigates to channel
-          const channelName = node?.properties?.dataChannel as string | undefined;
-          if (channelName) {
-            const channel = channels.find(
-              (c) => c.name.toLowerCase() === channelName.toLowerCase() && (c.type === "channel" || c.type === "private" || c.type === "joint")
-            );
-            if (!channel) {
-              return (
-                <MessageReferenceChip
-                  variant="accent"
-                  className="opacity-60"
-                  render={
-                    <span />}>
-                  {children}
-                </MessageReferenceChip>
-              );
-            }
-            return (
-              <MessageReferenceChip
-                variant="accent"
-                className="cursor-default"
-                render={
-                  <a href="#"
-                    onClick={(e) => {
-                      e.preventDefault();
-                      onNavigateChannel(channel);
-                    }}>
-                    {children}
-                  </a>
-                }
-              />
-            );
-          }
-          // #205 → clickable, resolves a task in the current channel context.
-          // Task refs reuse the message-side task badge (task #662); unknown
-          // tasks keep a neutral badge that claims no status color.
-          const taskRef = node?.properties?.dataTaskRef as string | undefined;
-          if (taskRef && onOpenTaskRef) {
-            const taskNumber = Number(taskRef);
-            if (!Number.isInteger(taskNumber) || taskNumber <= 0) {
-              return (
-                <span className="opacity-60">
-                  <Badge variant="muted">{children}</Badge>
-                </span>
-              );
-            }
-            const taskBadge = renderTaskBadge(taskNumber);
-            if (taskBadge) return taskBadge;
-            return (
-              <a
-                href="#"
-                className="cursor-default"
-                data-message-affordance="open-linked-task"
-                onClick={(e) => {
-                  e.preventDefault();
-                  onOpenTaskRef(taskNumber);
-                }}>
-                <Badge variant="muted">{children}</Badge>
-              </a>
-            );
-          }
-          const raftPermalink = href
-            ? parseRaftPermalink(
-                href,
-                typeof window !== "undefined" ? window.location.hostname : undefined
-              )
-            : null;
-          if (href && raftPermalink) {
-            const quotedMessageUnavailable = matchesUnavailableQuotedPermalink(
-              href,
-              unavailableQuotedPermalinkUrl,
-              typeof window !== "undefined" ? window.location.hostname : undefined,
-            );
-            const channel = channels.find((entry) => entry.id === raftPermalink.channelId);
-            const channelLabel = quotedMessageUnavailable
-              ? (formatMessage
-                ? formatMessage({ id: "message.messageItem.unavailableLinkedMessage" })
-                : "Unavailable linked message")
-              : channel
-              ? channel.type === "dm"
-                ? `@${channel.peerDisplayName || channel.peerName || channel.name}`
-                : `#${channel.name}`
-              : (formatMessage
-                ? formatMessage({ id: "message.messageItem.linkedMessageFallback" })
-                : "linked message");
-            return (
-              <PermalinkReferenceChip
-                href={href}
-                quotedMessageUnavailable={quotedMessageUnavailable}
-                channelLabel={channelLabel}
-                onOpenPermalink={onOpenPermalink}
-              />
-            );
-          }
-          // Custom-protocol links (obsidian:// and friends, per the sanitize
-          // href allowlist) delegate to the canonical MarkdownLink, which
-          // confirms before handing off to the OS (task #734).
-          if (isCustomProtocolHref(href)) {
-            return <MarkdownLink href={href}>{children}</MarkdownLink>;
-          }
-          return (
-            <a
-              href={href}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="text-foreground-link underline decoration-2 underline-offset-2 hover:decoration-attention select-text"
-            >
-              {children}
-            </a>
-          );
-        },
-        // Reminder-receipt span: when ReactMarkdown sees `<span data-reminder-fire-at="...">...</span>`
-        // (rehypeRaw + sanitize lets that data attribute through), re-render
-        // with a humanized fire time + tooltip. Other `<span>`s pass through
-        // unchanged.
-        span: ({ children, node, ...props }) => {
-          const reminderFireAt = (node?.properties?.dataReminderFireAt
-            || node?.properties?.["data-reminder-fire-at"]) as string | undefined;
-          if (reminderFireAt) {
-            return (
-              <Tooltip content={formatReminderReceiptTooltip(reminderFireAt, timeFormatOptions)}>
-              <span
-                {...props}
-              >
-                {formatMessage
-                  ? formatReminderReceiptTime(reminderFireAt, formatMessage, new Date(), timeFormatOptions)
-                  : reminderFireAt}
-              </span>
-              </Tooltip>
-            );
-          }
-          return <span {...props}>{children}</span>;
-        },
-        mark: ({ children }) => (
-          <ThreadSearchFragmentHighlight>{children}</ThreadSearchFragmentHighlight>
-        ),
-      } as Components), [
-      threadSearchHighlightQuery, structuredMentionMap, mentionMap,
-      channelParticipantAgentsById, channelParticipantMembersById, channelParticipantExternalsById,
-      onNavigateAgent, onNavigateHuman, onNavigateExternal, onNavigateComputer, onNavigateChannel,
-      onNavigateDm, onOpenThread, onOpenMessageRef, onOpenTaskRef, onOpenPermalink,
-      formatMessage, channels, refAuthorityServerSlug, currentServerSlug,
-      threadRefAuthorityUnavailable, resolvingThreadRefKey, renderTaskBadge,
-      timeFormatOptions, unavailableQuotedPermalinkUrl, mentionsDisplayOnly,
-    ]);
-  return (
-    <MarkdownContent
-      source={content}
-      density="compact"
-      enableMermaid
-      remarkPlugins={remarkPlugins}
-      rehypePlugins={MESSAGE_MARKDOWN_REHYPE_PLUGINS}
-      components={markdownComponents}
-    />
-  );
-}
-
 function isPreviewableHtmlAttachment(att: NonNullable<Message["attachments"]>[number]): boolean {
   const mimeType = att.mimeType.split(";")[0]?.trim().toLowerCase();
   return mimeType === "text/html" || /\.html?$/i.test(att.filename);
@@ -1270,8 +569,9 @@ function isPreviewableAudioAttachment(att: NonNullable<Message["attachments"]>[n
   return isAudioPreviewAttachment(att);
 }
 
+// The card renders from the summary read only: kind plus the CSV stats line.
 interface DocumentAttachmentPreviewState {
-  preview: DocumentAttachmentPreview;
+  preview: Exclude<AttachmentPreviewSummaryData, { kind: "diff" }>;
   truncated: boolean;
 }
 
@@ -1360,7 +660,7 @@ function DocumentPreviewSummaryLine({ preview }: { preview: DocumentAttachmentPr
     const id = preview.truncated
       ? "message.messageItem.documentSummaryFirst"
       : "message.messageItem.documentSummaryPreview";
-    return <span className="min-w-0 truncate text-foreground-hint">{formatMessage({ id }, { rowCount: preview.preview.rows.length, columnCount: preview.preview.columnCount })}</span>;
+    return <span className="min-w-0 truncate text-foreground-hint">{formatMessage({ id }, { rowCount: preview.preview.rowsShown, columnCount: preview.preview.columnCount })}</span>;
   }
   if (preview.preview.kind === "markdown") {
     return <span className="min-w-0 truncate text-foreground-hint">{formatMessage({ id: "message.messageItem.markdownDocument" })}</span>;
@@ -1392,6 +692,8 @@ function AttachmentCard({
   isHtmlLoading,
   onClick,
   onDownload,
+  messageId,
+  conversationId,
 }: {
   attachment: NonNullable<Message["attachments"]>[number];
   isOptimistic: boolean;
@@ -1402,12 +704,19 @@ function AttachmentCard({
   isHtmlLoading: boolean;
   onClick: (attachment: NonNullable<Message["attachments"]>[number]) => void;
   onDownload: (attachment: NonNullable<Message["attachments"]>[number]) => void | Promise<void>;
+  /** The message and conversation the attachment is in (workspace Artifacts: Save as Artifact). */
+  messageId: string;
+  conversationId: string;
 }) {
   const { formatMessage } = useIntl();
   const handleClick = useCallback(() => onClick(attachment), [onClick, attachment]);
   const handleDownload = useCallback(() => {
     void onDownload(attachment);
   }, [onDownload, attachment]);
+  // Workspace Artifacts (S5, F14a): the ⋯ with Save as Artifact while it can
+  // be saved; nothing with the flag off. The "Saved as" lines go under the group.
+  const artifactContext = useMemo(() => ({ messageId, conversationId, onDownload: handleDownload }), [messageId, conversationId, handleDownload]);
+  const artifactMenu = useArtifactAttachmentMenu(attachment, artifactContext);
 
   const audioSecondaryDownload = useMemo(() => isAudio
     ? { onClick: handleDownload, label: formatMessage({ id: "message.messageItem.downloadFile" }, { filename: attachment.filename }), affordanceName: "audio-download" }
@@ -1430,7 +739,7 @@ function AttachmentCard({
       setDocumentPreview(null);
       return;
     }
-    void fetchAttachmentPreviewSummary(attachment.id)
+    void fetchAttachmentPreviewCardSummary(attachment.id)
       .then((data) => {
         if (cancelled || !data) return;
         if (data.status === "ok" && data.data.kind === "diff") {
@@ -1462,6 +771,7 @@ function AttachmentCard({
       <AttachmentChip
         attachment={attachment}
         isOptimistic={isOptimistic}
+        menu={artifactMenu}
         onClick={handleDownload}
         affordance="download"
         meta={<AttachmentMetaText label={attachment.mimeType || formatMessage({ id: "message.messageItem.metaPatch" })} sizeBytes={attachment.sizeBytes} />}
@@ -1475,6 +785,7 @@ function AttachmentCard({
       <AttachmentChip
         attachment={attachment}
         isOptimistic={isOptimistic}
+        menu={artifactMenu}
         loading={isHtmlLoading}
         loadingLabel={formatMessage({ id: "message.messageItem.openingPreview" })}
         onClick={handleClick}
@@ -1486,9 +797,9 @@ function AttachmentCard({
     );
   }
 
-  // Stryker disable next-line ConditionalExpression,LogicalOperator: shared card branch matrix predates audio; this PR's audio branch is covered by audioAttachmentPreview.behavior.test.tsx.
+  // Stryker disable next-line ConditionalExpression,LogicalOperator: shared card branch matrix predates audio; this PR's audio branch is covered by audioAttachmentPreview.behavior.test.tsx (removed in the 2026-11 web DOM test prune).
   const primaryIsPreview = isImage || isHtml || isVideo || isAudio;
-  // Stryker disable next-line ConditionalExpression: audio/non-preview click behavior is covered by audioAttachmentPreview.behavior.test.tsx; legacy image/html/video branches are covered elsewhere.
+  // Stryker disable next-line ConditionalExpression: audio/non-preview click behavior is covered by audioAttachmentPreview.behavior.test.tsx (removed in the 2026-11 web DOM test prune); legacy image/html/video branches are covered elsewhere.
   const primaryOnClick = primaryIsPreview ? handleClick : handleDownload;
   // Stryker disable next-line ConditionalExpression,StringLiteral: visual affordance labels for legacy branches are source-pinned; audio/file behavior is covered by DOM tests.
   const primaryAffordance = primaryIsPreview ? "preview" : "download";
@@ -1501,6 +812,7 @@ function AttachmentCard({
     <AttachmentChip
       attachment={attachment}
       isOptimistic={isOptimistic}
+      menu={artifactMenu}
       loading={isHtmlLoading}
       loadingLabel={formatMessage({ id: "message.messageItem.openingPreview" })}
       onClick={primaryOnClick}
@@ -1509,6 +821,26 @@ function AttachmentCard({
       meta={<AttachmentMetaText label={primaryMetaLabel} sizeBytes={attachment.sizeBytes} />}
       secondaryDownload={audioSecondaryDownload}
     />
+  );
+}
+
+function ScreenshotAttachmentSummary({ attachments }: { attachments: readonly MessageAttachment[] }) {
+  return (
+    <div
+      className="hidden"
+      data-select-screenshot-attachment-summary="true"
+      aria-hidden="true"
+    >
+      {attachments.map((attachment) => (
+        <span
+          key={attachment.id}
+          className="inline-flex min-w-0 max-w-full items-center gap-1.5 border border-line-hairline bg-fill-muted px-2 py-1 text-caption font-bold text-foreground"
+        >
+          <Paperclip size={12} className="shrink-0" />
+          <span className="truncate">{attachment.filename}</span>
+        </span>
+      ))}
+    </div>
   );
 }
 
@@ -1616,7 +948,7 @@ function InlineVideoAttachmentCard({
                   onClick={media.retry}
                   aria-label={formatMessage({ id: "message.messageItem.retryVideoPreview" }, { filename: attachment.filename })}
                 >
-                  <RotateCcw size={13} />
+                  <RefreshCw size={13} />
                   {formatMessage({ id: "message.messageItem.videoRetry" })}
                 </MessageVideoPreviewFailureAction>
                 {downloadAction}
@@ -1654,15 +986,27 @@ function formatAudioTimestamp(seconds: number) {
 function InlineAudioPlayer({
   filename,
   url,
+  keepAliveKey,
   mediaEvents,
 }: {
   filename: string;
   url: string;
+  /** Plays on while the row is unmounted (scrolled out of a virtual timeline). */
+  keepAliveKey: string;
   mediaEvents: ReturnType<typeof useRefreshingMediaUrl>["mediaEvents"];
 }) {
   const { formatMessage } = useIntl();
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const [playing, setPlaying] = useState(false);
+  // Scrolled out of a virtual timeline while playing, the audio plays on
+  // (inlineAudioKeepAlive) until that timeline goes; back in view, this
+  // player takes it over.
+  const keepAliveScope = useContext(InlineAudioKeepAliveContext);
+  useLayoutEffect(() => {
+    const audio = audioRef.current;
+    if (audio && resumeKeptInlineAudio(keepAliveScope, keepAliveKey, audio)) setPlaying(true);
+    return () => keepInlineAudioPlaying(keepAliveScope, keepAliveKey, audio);
+  }, [keepAliveScope, keepAliveKey]);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
   const [volume, setVolume] = useState(1);
@@ -1720,15 +1064,15 @@ function InlineAudioPlayer({
   return (
     <div data-message-affordance="inline-audio-player" className="w-full rounded-control bg-fill-muted p-2">
       <div className="flex min-w-0 items-center gap-2">
-        <button
-          type="button"
+        <Button
+          variant="default"
+          size="icon-md"
           data-message-affordance="audio-play-toggle"
           aria-label={formatMessage({ id: playing ? "message.messageItem.pauseAudio" : "message.messageItem.playAudio" }, { filename })}
-          className="flex size-8 shrink-0 items-center justify-center rounded-control border-[1.5px] border-line-strong bg-layer-card text-foreground outline-none hover:press-overlay active:press-overlay focus-visible:shadow-focus"
           onClick={handleTogglePlayback}
         >
-          {playing ? <Pause size={16} fill="currentColor" /> : <Play size={16} fill="currentColor" />}
-        </button>
+          {playing ? <Pause fill="currentColor" /> : <Play fill="currentColor" />}
+        </Button>
         <div className="relative h-8 min-w-0 flex-1">
           <input
             type="range"
@@ -1740,7 +1084,7 @@ function InlineAudioPlayer({
             step={0.1}
             value={durationKnown ? boundedCurrentTime : 0}
             disabled={!durationKnown}
-            className="peer absolute inset-0 z-10 h-8 w-full opacity-0"
+            className="peer absolute inset-0 z-raised h-8 w-full opacity-0"
             onChange={handleSeek}
           />
           <div
@@ -1773,7 +1117,7 @@ function InlineAudioPlayer({
             max={1}
             step={0.05}
             value={volume}
-            className="peer absolute inset-0 z-10 h-6 w-full opacity-0"
+            className="peer absolute inset-0 z-raised h-6 w-full opacity-0"
             onChange={handleVolumeChange}
           />
           <div
@@ -1841,6 +1185,10 @@ function InlineAudioAttachmentCard({
   const handleDownload = useCallback(() => {
     void onDownload(attachment);
   }, [onDownload, attachment]);
+  // The card's own download: it must not also open the attachment under it.
+  const handleDownloadClick = useCallback((event: MouseEvent) => {
+    event.preventDefault(); event.stopPropagation(); handleDownload();
+  }, [handleDownload]);
 
   useEffect(() => {
     const node = containerRef.current;
@@ -1866,19 +1214,15 @@ function InlineAudioAttachmentCard({
 
   const downloadButton = (
     <Tooltip content={formatMessage({ id: "message.messageItem.downloadFile" }, { filename: attachment.filename })}>
-    <button
-      type="button"
+    <Button
+      variant="ghost"
+      size="icon-md"
       data-message-affordance="audio-download"
       aria-label={formatMessage({ id: "message.messageItem.downloadFile" }, { filename: attachment.filename })}
-      className="flex size-8 items-center justify-center rounded-control text-foreground outline-none hover:bg-fill-pressed active:bg-fill-pressed focus-visible:shadow-focus"
-      onClick={(event) => {
-        event.preventDefault();
-        event.stopPropagation();
-        handleDownload();
-      }}
+      onClick={handleDownloadClick}
     >
-      <Download size={18} />
-    </button>
+      <Download />
+    </Button>
     </Tooltip>
   );
 
@@ -1906,6 +1250,7 @@ function InlineAudioAttachmentCard({
             key={inlineUrl}
             filename={attachment.filename}
             url={inlineUrl}
+            keepAliveKey={attachment.id}
             mediaEvents={media.mediaEvents}
           />
         </Card>
@@ -1923,26 +1268,30 @@ function InlineAudioAttachmentCard({
             </div>
             {!isOptimistic && !loadFailed ? downloadButton : null}
           </div>
-          <button
+          {/* A full-width ghost Button at md on the muted well: the label is
+              a control's (text-control); only the failed state is pressable. */}
+          <Button
             type="button"
-            className={`flex h-10 w-full items-center justify-center rounded-control bg-fill-muted text-footnote font-semibold text-foreground-muted outline-none focus-visible:shadow-focus ${loadFailed ? "hover:press-overlay active:press-overlay" : "cursor-default"}`}
+            variant="ghost"
+            size="md"
+            className={`w-full min-w-0 overflow-hidden bg-fill-muted text-foreground-muted *:max-w-full *:min-w-0 ${loadFailed ? "hover:bg-fill-muted hover:overlay-medium active:bg-fill-muted active:overlay-medium" : "cursor-default hover:bg-fill-muted active:bg-fill-muted"}`}
             onClick={loadFailed ? handleDownload : undefined}
             aria-label={loadFailed ? formatMessage({ id: "message.messageItem.downloadFile" }, { filename: attachment.filename }) : formatMessage({ id: "message.messageItem.loadingFile" }, { filename: attachment.filename })}
           >
             {isOptimistic || loadingUrl ? (
-              <span className="inline-flex items-center gap-2">
+              <>
                 <Spinner size="xs" aria-label={formatMessage({ id: "common.loadingLabel" })} />
-                {formatMessage({ id: "message.messageItem.loadingFile" }, { filename: attachment.filename })}
-              </span>
+                <span className="truncate">{formatMessage({ id: "message.messageItem.loadingFile" }, { filename: attachment.filename })}</span>
+              </>
             ) : loadFailed ? (
-              <span className="inline-flex items-center gap-1.5">
-                <Download size={16} />
+              <>
+                <Download aria-hidden />
                 {formatMessage({ id: "message.messageItem.downloadToView" })}
-              </span>
+              </>
             ) : (
-              <span>{formatMessage({ id: "message.messageItem.loadingFile" }, { filename: attachment.filename })}</span>
+              <span className="truncate">{formatMessage({ id: "message.messageItem.loadingFile" }, { filename: attachment.filename })}</span>
             )}
-          </button>
+          </Button>
         </Card>
       )}
     </div>
@@ -2000,6 +1349,9 @@ interface MessageItemProps {
   hideThreadActions?: boolean;
   showThreadFollowAction?: boolean;
   linkedTask?: Task;
+  /** Every task linked to this message, by task number. With two or more the
+   *  footer chip gives way to the TaskChipList (task v2, behind its flag). */
+  linkedTasks?: readonly Task[];
   senderAvatarTestId?: string;
   mentionComposerChannelId?: string;
   /**
@@ -2030,6 +1382,14 @@ interface MessageItemProps {
   threadSearchHighlightQuery?: string;
   threadSearchActive?: boolean;
   /**
+   * Shows the located highlight (states.md#located) now: the message a jump
+   * took someone to, while its list's `useLocated` on that jump is on (the
+   * channel's, ChatPanel; a thread's, ThreadPanel, from the focus its surface
+   * owns, the side thread's or the task modal's). The list holds it, not the
+   * row, so a row that scrolls out and back in after it has run stays unlit.
+   */
+  located?: boolean;
+  /**
    * Consecutive-same-sender grouping state (task #44). When a message continues
    * the previous sender's group, avatar + name are hidden and the timestamp
    * moves to a hover gutter. Optional — surfaces that don't compute grouping
@@ -2038,20 +1398,28 @@ interface MessageItemProps {
   groupState?: MessageGroupState;
   /**
    * Rhythm marker (messageGrouping.followedByFor): the kind of row that
-   * follows this one. The root carries it as `data-followed-by` and the recipe
-   * collapses this row's bottom padding so group interiors read 16 apart while
-   * group breaks stay 24.
+   * follows this one. The root carries it as `data-followed-by`, and the
+   * body, attachments and footer drop their trailing margin under it
+   * (FOLLOWED_BODY_ENDING) so the follower sits on the row rhythm.
    */
   followedBy?: "compact" | "group";
-  /** Rhythm marker (messageGrouping.followsSystemFor): this row directly
-   * follows a system note, whose 12/12 rhythm the row completes. */
-  followsSystem?: boolean;
   /**
    * #693 DM read status (artin, option C): set by ChatPanel on the LAST message
    * of a DM at the live edge. The status line renders below this message only
    * when it is also the viewer's own message and the peer has read it.
    */
   showDmReadStatus?: boolean;
+  /** Agent read progress: your latest message at the live edge, set by the
+   *  timeline. Its agents' read line takes the DM status line's slot. */
+  showAgentReadStatus?: boolean;
+  /** Agent read progress is on in this conversation: the faces of the agents
+   *  that last read this message end its body (raft-ui MessageItemTrailing),
+   *  on the last line, with no column of their own. */
+  agentReadFaces?: boolean;
+  /** A task hand-off card (an assignment line with a reason): when the task
+   *  came back to whoever handed it off, set by the task conversation's
+   *  timeline (taskHandoffReturns). */
+  taskHandoffReturn?: TaskHandoffReturn | null;
 }
 
 // Isolated subscriber — only re-renders when this agent's activity changes.
@@ -2080,15 +1448,54 @@ function AgentStatusDot({
 
 // Isolates hover-card state so opening the card doesn't re-render the whole MessageItem.
 // Stryker disable all: sender preview-card composition is covered by the existing sender-resolution contracts plus manual visual validation; this migration batch is not adding new hover DOM tests.
+/**
+ * RFC 077, DS Identity and presence › Sent by an assistant: the assistant's
+ * face on the owner's avatar. Decoration only (raft-ui hides it from
+ * assistive technology); the words say who sent it. A deleted assistant shows
+ * the default face, grayed and faded.
+ */
+function DelegatedFace({ delegatedBy }: { delegatedBy: DelegatedBy }) {
+  return (
+    <MessageItemDelegatedAvatar deleted={delegatedBy.deleted} data-testid="message-delegated-face">
+      <AvatarSlot context="delegated-face" type="agent" agentAvatarUrl={delegatedBy.deleted ? null : delegatedBy.avatarUrl} />
+    </MessageItemDelegatedAvatar>
+  );
+}
+
+/**
+ * "sent by Friday" after the sender, or "(sent by Friday)" at the end of a
+ * continuation; "sent by a deleted assistant" once it is gone, with no name
+ * part, so none of it truncates. The words come from the catalog; raft-ui
+ * lays them out.
+ */
+function DelegatedByLabel({ delegatedBy, inBody = false, messageId }: { delegatedBy: DelegatedBy; inBody?: boolean; messageId: string }) {
+  const { formatMessage } = useIntl();
+  const testId = `message-delegated-by-${messageId}`;
+  if (delegatedBy.deleted) {
+    return (
+      <MessageItemDelegatedBy data-testid={testId}>
+        {formatMessage({ id: inBody ? "message.delegated.sentByDeletedInBody" : "message.delegated.sentByDeleted" })}
+      </MessageItemDelegatedBy>
+    );
+  }
+  return (
+    <MessageItemDelegatedBy data-testid={testId}>
+      {formatMessage(
+        { id: inBody ? "message.delegated.sentByInBody" : "message.delegated.sentBy" },
+        { name: <MessageItemDelegatedByName key="name">{delegatedBy.name}</MessageItemDelegatedByName> },
+      )}
+    </MessageItemDelegatedBy>
+  );
+}
+
 function MessageSenderAvatar({
   showAgent,
   showExternal,
+  externalAnonymous,
   isDeactivatedAgent,
   senderId,
   agentAvatarUrl,
   avatarUrl,
-  gravatarHash,
-  email,
   hoverAgent,
   hoverMember,
   readOnlySender,
@@ -2097,6 +1504,9 @@ function MessageSenderAvatar({
   externalProvider,
   externalWorkspaceName,
   externalActorKind,
+  externalProfileDisplayName,
+  externalProfileAvatarUrl,
+  externalAppName,
   testId,
   onNavigateAgent,
   onNavigateAgentActivity,
@@ -2104,15 +1514,16 @@ function MessageSenderAvatar({
   onNavigateExternal,
   onContextMenu,
   onLongPressMention,
+  delegatedBy = null,
+  origin,
 }: {
   showAgent: boolean;
   showExternal: boolean;
+  externalAnonymous?: boolean;
   isDeactivatedAgent: boolean;
   senderId: string;
   agentAvatarUrl: string | null;
   avatarUrl: string | null;
-  gravatarHash: string | undefined;
-  email?: string | null;
   hoverAgent?: Agent | null;
   hoverMember?: ServerMember | null;
   readOnlySender?: ReadOnlySenderProjection;
@@ -2121,6 +1532,9 @@ function MessageSenderAvatar({
   externalProvider?: string | null;
   externalWorkspaceName?: string | null;
   externalActorKind?: ExternalActorKind | null;
+  externalProfileDisplayName?: string | null;
+  externalProfileAvatarUrl?: string | null;
+  externalAppName?: string | null;
   testId?: string;
   onNavigateAgent: (id: string) => void;
   onNavigateAgentActivity: (id: string) => void;
@@ -2128,6 +1542,10 @@ function MessageSenderAvatar({
   onNavigateExternal: () => void;
   onContextMenu?: (event: MouseEvent<HTMLButtonElement>) => void;
   onLongPressMention?: () => void;
+  /** RFC 077: the assistant that sent this person's message; its face goes on the corner. */
+  delegatedBy?: DelegatedBy | null;
+  /** Another server's sender: its server's tile goes on the avatar's top-left corner, its ribbon on the card. */
+  origin: MemberOrigin;
 }) {
   const previewActionsRef = useRef<{ close: () => void; unmount: () => void } | null>(null);
   const longPressStartedAtRef = useRef<number | null>(null);
@@ -2227,14 +1645,11 @@ function MessageSenderAvatar({
     }
     onContextMenu?.(event);
   }, [onContextMenu]);
-  const humanAvatarSource = isRaftUploadedHumanAvatarUrl(avatarUrl)
-    ? "uploaded"
-    : gravatarHash
-      ? "gravatar-hash"
-      : email
-        ? "email-fallback"
-        : "placeholder";
+  const humanAvatarSource = avatarSourceOf(avatarUrl);
   if (showExternal) {
+    if (externalAnonymous) return <span data-testid={testId} aria-label={externalDisplayName}>
+      <AvatarSlot context="message-row" type="app" appInitials={externalDisplayName} />
+    </span>;
     return (
       <ExternalIdentityPreviewCard
         displayName={externalDisplayName}
@@ -2242,6 +1657,9 @@ function MessageSenderAvatar({
         workspaceName={externalWorkspaceName}
         actorKind={externalActorKind}
         avatarUrl={externalAvatarUrl}
+        profileDisplayName={externalProfileDisplayName}
+        profileAvatarUrl={externalProfileAvatarUrl}
+        appName={externalAppName}
         testId={testId}
         onNavigate={onNavigateExternal}
       />
@@ -2287,7 +1705,7 @@ function MessageSenderAvatar({
               data-avatar-kind="agent"
               data-avatar-source={agentAvatarUrl ? "agent-avatar" : "placeholder"}
               data-avatar-pressed={avatarPressed ? "true" : "false"}
-              className={`relative mt-0.5 shrink-0 self-start transition-[filter,transform] duration-75 hover:brightness-90 ${avatarPressed ? "scale-90 brightness-75" : ""}`}
+              className={`relative ${MESSAGE_AVATAR_OFFSET} shrink-0 self-start transition-[filter,transform] duration-75 hover:brightness-90 ${avatarPressed ? "scale-90 brightness-75" : ""}`}
             >
               <AvatarSlot
                 context="message-row"
@@ -2296,7 +1714,8 @@ function MessageSenderAvatar({
                 badge={!isDeactivatedAgent ? (
                   <AgentStatusDot agentId={senderId} fallbackAgent={hoverAgent} />
                 ) : undefined}
-                className={isDeactivatedAgent ? "grayscale opacity-60" : ""}
+                className={isDeactivatedAgent ? "grayscale opacity-dimmed" : ""}
+                corner={<AvatarOriginCorner origin={origin} />}
               />
             </button>
           }
@@ -2308,6 +1727,7 @@ function MessageSenderAvatar({
             fallbackAgent={hoverAgent}
             readOnlyProfile={readOnlySender}
             onOpenAgentActivity={onOpenAgentActivity}
+            origin={origin}
           />
         </PreviewCardContent>
       </PreviewCard>
@@ -2333,22 +1753,19 @@ function MessageSenderAvatar({
             data-avatar-source={humanAvatarSource}
             data-avatar-pressed={avatarPressed ? "true" : "false"}
             data-avatar-has-uploaded={isRaftUploadedHumanAvatarUrl(avatarUrl) ? "true" : "false"}
-            data-avatar-has-gravatar-hash={gravatarHash ? "true" : "false"}
-            data-avatar-has-email-fallback={email ? "true" : "false"}
-            className={`mt-0.5 shrink-0 self-start transition-[filter,transform] duration-75 hover:brightness-90 ${avatarPressed ? "scale-90 brightness-75" : ""}`}
+            className={`${MESSAGE_AVATAR_OFFSET} shrink-0 self-start transition-[filter,transform] duration-75 hover:brightness-90 ${avatarPressed ? "scale-90 brightness-75" : ""}`}
           >
             <AvatarSlot
               context="message-row"
               type="human"
               humanAvatarUrl={avatarUrl}
-              gravatarHash={gravatarHash}
-              email={email}
+              corner={<>{delegatedBy ? <DelegatedFace delegatedBy={delegatedBy} /> : null}<AvatarOriginCorner origin={origin} /></>}
             />
           </button>
         }
       />
       <PreviewCardContent sideOffset={6} collisionPadding={6}>
-        <ProfilePreviewCardContent mentionType={mentionType} mentionId={senderId} fallbackMember={hoverMember} readOnlyProfile={readOnlySender} />
+        <ProfilePreviewCardContent mentionType={mentionType} mentionId={senderId} fallbackMember={hoverMember} readOnlyProfile={readOnlySender} origin={origin} />
       </PreviewCardContent>
     </PreviewCard>
   );
@@ -2424,6 +1841,8 @@ function TranslationIndicator({
   const indicator = (
     <StatusWrapper
       data-testid={`message-translation-indicator-${entry.messageId}`}
+      data-select-screenshot-transient-state={text.tone === "pending" || text.tone === "failed" ? "true" : undefined}
+      data-message-affordance="translation-status"
     >
       <Icon size={12} className={text.tone === "pending" ? "animate-pulse" : ""} />
       {text.message && <span>{text.message}</span>}
@@ -2435,110 +1854,12 @@ function TranslationIndicator({
   return action ? indicator : <Tooltip content={text.title}>{indicator}</Tooltip>;
 }
 
-interface MessageMarkdownBodyProps {
-  content: string;
-  channels: Channel[];
-  mentionMap: Map<string, MentionEntry>;
-  structuredMentionMap: Map<string, MentionEntry>;
-  onNavigateChannel: (channel: Channel) => void;
-  onNavigateDm: (channel: Channel) => void;
-  onNavigateAgent: (agentId: string) => void;
-  onNavigateHuman: (userId: string) => void;
-  /** Click handler for `type:"external"` mentions — opens the
-   *  external-identity panel via `openExternalProfile`. */
-  onNavigateExternal: (profile: ExternalMessageAuthorProjection) => void;
-  onNavigateComputer: (machineId: string) => void;
-  onOpenThread?: (intent: ThreadRefIntent) => void | Promise<void>;
-  resolvingThreadRefKey?: string | null;
-  onOpenTask?: (taskNumber: number) => void;
-  onOpenMessage?: (channel: Channel, messageId: string, threadParentShortId: string | null) => void | Promise<void>;
-  onOpenPermalink?: (href: string) => void;
-  serverSlug?: string;
-  refAuthorityServerSlug?: string;
-  threadRefAuthorityUnavailable?: boolean;
-  knownTaskNumbers?: Set<number>;
-  /** Task payloads for inline task refs (task #662 research prototype: refs
-   *  reuse the message-side task badge). Referentially stable via useMemo in
-   *  the parent; an unstable map would defeat the memo above. */
-  taskByNumber?: ReadonlyMap<number, Task>;
-  timeFormatOptions: TimeFormatOptions;
-  threadSearchHighlightQuery?: string;
-  /** #693 per-@mentioned-agent read badge. Primitives only, so the memo above
-   *  still short-circuits — an object prop would defeat it. */
-  readReceiptChannelId: string;
-  readReceiptMessageSeq: number | undefined;
-  readReceiptEnabled: boolean;
-  channelParticipantAgentsById?: ReadonlyMap<string, Agent>;
-  channelParticipantMembersById?: ReadonlyMap<string, ServerMember>;
-  channelParticipantExternalsById?: ReadonlyMap<string, ChannelExternalMember>;
-  unavailableQuotedPermalinkUrl?: string | null;
-  /** Read-only projection: mentions are highlighted text, never profile links
-   *  or hover cards (those read member stores and load profiles). */
-  mentionsDisplayOnly?: boolean;
-}
-
-// Memoized markdown body. `renderContent` runs the full markdown preprocessing
-// + react-markdown parse, which the 2026-06-06 prod CPU trace showed to be ~33%
-// of main-thread JS in the message list. Wrapping it in a memo'd component lets
-// it skip that work whenever the parent MessageItem re-renders WITHOUT a change
-// to the actual markdown inputs — provided callers pass referentially-stable
-// props (the navigate/open handlers are now useCallback'd and useAppNavigate is
-// memoized). #wg-frontend-perf.
-const MessageMarkdownBody = memo(function MessageMarkdownBody(props: MessageMarkdownBodyProps) {
-  const { formatMessage } = useIntl();
-  const readReceiptScope = useMemo<MessageReadReceiptScope>(() => ({
-    channelId: props.readReceiptChannelId,
-    messageSeq: props.readReceiptMessageSeq,
-    enabled: props.readReceiptEnabled,
-  }), [props.readReceiptChannelId, props.readReceiptMessageSeq, props.readReceiptEnabled]);
-  const body = useRenderMessageMarkdown(
-    props.content,
-    props.channels,
-    props.mentionMap,
-    props.structuredMentionMap,
-    props.onNavigateChannel,
-    props.onNavigateDm,
-    props.onNavigateAgent,
-    props.onNavigateHuman,
-    props.onNavigateExternal,
-    props.onNavigateComputer,
-    props.onOpenThread,
-    props.resolvingThreadRefKey,
-    props.onOpenTask,
-    props.onOpenMessage,
-    props.onOpenPermalink,
-    props.serverSlug,
-    props.refAuthorityServerSlug,
-    props.threadRefAuthorityUnavailable,
-    props.knownTaskNumbers,
-    props.taskByNumber,
-    props.timeFormatOptions,
-    props.threadSearchHighlightQuery,
-    formatMessage,
-    props.channelParticipantAgentsById,
-    props.channelParticipantMembersById,
-    props.channelParticipantExternalsById,
-    props.unavailableQuotedPermalinkUrl,
-    props.mentionsDisplayOnly,
-  );
-  return (
-    <MessageReadReceiptScopeProvider value={readReceiptScope}>
-      {body}
-    </MessageReadReceiptScopeProvider>
-  );
-});
-
 // Persistent thread-ref notice is keyed (not a formatted string) so it
 // re-localizes on a language switch while still displayed.
 type ThreadRefNoticeKey =
   | "message.messageItem.threadServerUnknown"
-  | "message.messageItem.threadUnavailable"
+  | ThreadRefMissingParentNotice
   | "message.messageItem.sourceUnavailable";
-
-/** `#` is markup, not translatable copy. */
-function taskNumberSigil(taskNumber: number): string {
-  return `#${taskNumber}`;
-}
 
 /** Task-assignee handle inside the footer task badge. One shared JSX node
  *  keeps the file's audited `@` literal count at one —
@@ -2551,29 +1872,47 @@ function taskAssigneeHandle(claimedByName: string) {
 
 const ignoreReadOnlyProjectionNavigation = () => undefined;
 
-/** A mention on a read-only projection: the member highlight, no link. */
-function renderDisplayOnlyMention(children: ReactNode) {
-  return (
-    <MessageReferenceText variant="secondary" render={<span data-message-mention="display-only" />}>
-      {children}
-    </MessageReferenceText>
+const ConnectedMessageItem = memo(function ConnectedMessageItem({ message: rawMessage, mentionMap, channels, previewSenderAgent, previewSenderMember, channelParticipantAgentsById, channelParticipantMembersById, channelParticipantExternalsById, threadSummary, parentChannelId, parentMessageId, hideThreadActions, showThreadFollowAction, linkedTask: linkedTaskProp, linkedTasks, senderAvatarTestId, mentionComposerChannelId, reactionParentScopeKey, canReact: canReactProp = true, readOnlyProjection = false, readOnlySender, readOnlyReplyScope, onReadOnlyNavigateChannel, onBeforeOpenThread, onOpenThread, onOpenProfile, threadSearchHighlightQuery, threadSearchActive, located = false, groupState, followedBy, showDmReadStatus = false, showAgentReadStatus = false, agentReadFaces = false, taskHandoffReturn = null, className }: MessageItemProps) {
+  // RFC 077: a retracted message (sent by an assistant, taken back by its
+  // owner) is a single non-interactive record: its sender, time, delegated
+  // marks and thread replies stay; its words, attachments, link previews,
+  // quotes, reactions, hover actions and menus go. Everything below reads the
+  // emptied message, so none of them can render from the stored row.
+  const retracted = isRetractedMessage(rawMessage);
+  const message = useMemo(
+    () => (retracted ? { ...rawMessage, content: "", attachments: [], reactions: [] } : rawMessage),
+    [rawMessage, retracted],
   );
-}
-
-const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, mentionMap, channels, previewSenderAgent, previewSenderMember, channelParticipantAgentsById, channelParticipantMembersById, channelParticipantExternalsById, threadSummary, parentChannelId, parentMessageId, hideThreadActions, showThreadFollowAction, linkedTask, senderAvatarTestId, mentionComposerChannelId, reactionParentScopeKey, canReact = true, readOnlyProjection = false, readOnlySender, readOnlyReplyScope, onReadOnlyNavigateChannel, onBeforeOpenThread, onOpenThread, onOpenProfile, threadSearchHighlightQuery, threadSearchActive, groupState, followedBy, followsSystem, showDmReadStatus = false, className }: MessageItemProps) {
-  // Feature flag gate: outside enabled scope, NO comment
-  // affordance renders — preview comments context, re: chips, chip counts.
-  const commentsEnabled = useAttachmentCommentsEnabled(!readOnlyProjection);
-  const isHighlightedInChannel = useMessageStore((s) => s.highlightedMessageId === message.id);
-  // A thread reply permalink owns highlight chrome only inside that thread.
-  // The same store focus must never color a stale channel row when another
-  // thread opens while the channel URL still carries its old `msg=` anchor.
-  const isHighlightedInThread = useThreadStore(
-    (s) => Boolean(parentMessageId) && s.focusedMessageId === message.id,
-  );
-  const isHighlighted = isHighlightedInChannel || isHighlightedInThread || !!threadSearchActive;
+  const canReact = canReactProp && !retracted;
+  const actionable = !readOnlyProjection && !retracted;
+  // Task v2 (the caller passes linkedTasks only with the flag on): every task
+  // linked to the message renders as the list under it, one included — old
+  // tasks whose title is the message itself too (@stdrc). Without it, the
+  // single footer chip and its quick actions stay.
+  const linkedTaskList = linkedTasks && linkedTasks.length > 0 ? linkedTasks : null;
+  const linkedTask = linkedTaskList ? undefined : linkedTaskProp;
+  // The located highlight (design/foundations/states.md#located) is decided
+  // by the list the row is in (`located`): a channel jump by ChatPanel, a
+  // thread jump by ThreadPanel. A reply in a thread never takes the channel's
+  // jump, so a stale channel `msg=` anchor can't color it.
+  const isLocated = located;
+  // While thread search is open, its current match is selected content: held
+  // cyan while the search is open, not a 2s located highlight.
+  const isThreadSearchMatch = !!threadSearchActive;
+  const isHighlighted = isLocated || isThreadSearchMatch;
+  // Opened from a search result: the query's words are marked in this one
+  // message while its conversation stays open (searchHitMarkStore).
+  const searchHitQuery = useSearchHitMarkStore((s) => (
+    !readOnlyProjection && s.mark?.messageId === message.id ? s.mark.query : undefined
+  ));
   const isAgent = message.senderType === "agent";
   const isExternal = message.senderType === "external_projection";
+  // RFC 077: sent by the sender's assistant for them, and retracted by them.
+  const delegatedByRaw = (message as { delegatedBy?: unknown }).delegatedBy;
+  const delegatedBy = useMemo(
+    () => (message.senderType === "user" ? delegatedByOf({ delegatedBy: delegatedByRaw }) : null),
+    [message.senderType, delegatedByRaw],
+  );
   const isSystem = message.messageType === "system";
   const humanDepartureLabel = isAgent || isExternal
     ? null
@@ -2585,7 +1924,7 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
     ? structuredMentionMap
     : isExternal ? EXTERNAL_MESSAGE_MENTION_MAP : mentionMap;
   const effectiveStructuredMentionMap = structuredMentionMap;
-  const { formatMessageTime, formatClock, formatMediumDateTime, options: timeFormatOptions } = useTimeFormatter();
+  const { formatMessageTime, formatGutterClock, formatMediumDateTime, options: timeFormatOptions } = useTimeFormatter();
   const intl = useIntl();
   const { formatMessage } = intl;
   // Render reads formatMessage directly; effects/handlers read
@@ -2593,12 +1932,17 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
   const formatMessageRef = useRef(formatMessage);
   formatMessageRef.current = formatMessage;
   const time = formatMessageTime(message.createdAt);
-  // Bare HH:MM clock for the continuation-row hover gutter (task #44); the
-  // full `time` above ("Yesterday 3:04") is too wide for the narrow gutter.
-  // Fixed-width clock in the gutter (stdrc); full date+time in the tooltip. Both
-  // go through the shared time formatter so no raw browser time API lives here.
-  const gutterClock = formatClock(message.createdAt);
+  // Hour and minute only for the continuation-row hover gutter: the full
+  // `time` ("Yesterday 3:04") and an AM/PM time like "06:35 PM" are too wide for the
+  // 35px gutter. Full date+time in the tooltip. Both go through the shared
+  // time formatter so no raw browser time API lives here.
+  const gutterClock = formatGutterClock(message.createdAt);
   const gutterFullTimestamp = formatMediumDateTime(message.createdAt);
+  // The machine-readable moment for the message's <time> elements (task #115).
+  const sentAtIso = useMemo(() => {
+    const date = new Date(message.createdAt);
+    return Number.isNaN(date.getTime()) ? undefined : date.toISOString();
+  }, [message.createdAt]);
   // Grouping defaults: surfaces that don't pass groupState (thread/DM panels)
   // keep the full header — avatar + name always shown, timestamp inline.
   const viewer = useAuthStore((s) => s.user);
@@ -2633,15 +1977,48 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
   const hostedModelLabelText = senderAgent?.hostedRuntime
     ? intl.formatMessage({ id: "message.agentModel.hosted" })
     : null;
-  const agentModelLabelText = showAgentModelNameOption
-    ? hostedModelLabelText ?? catalogModelLabelText ?? agentModelLabel(senderAgent)
-    : null;
+  // A personal assistant has no runtime chip (DS Terminology › assistant): its
+  // description, "Personal assistant of @owner", already says what it is, as
+  // the sidebar does.
+  const isPersonalAssistantSender = Boolean(senderAgent?.assistantOwnerUserId);
+  // An App bot runs no model: its stored model is the column default, not
+  // something it uses. It carries the App badge instead, as on its sidebar
+  // row and profile card.
+  const isAppBotSender = Boolean(senderAgent?.managedByAppInstallId);
   const senderMember = useMemo(() => {
     if (previewSenderMember) return previewSenderMember;
     const memberById = new Map<string, ServerMember>();
     if (storeSenderMember) memberById.set(storeSenderMember.userId, storeSenderMember);
     return resolveMessageSenderMember(message, memberById, currentUser, currentUserServerRole);
   }, [currentUser, currentUserServerRole, message, previewSenderMember, storeSenderMember]);
+  // A joint channel's other server: neither the directory nor this
+  // channel's roster names them, so their face comes from the actors table
+  // (filled by `/actors/resolve`), and an agent still reads as an agent.
+  // Only joint surfaces ask: elsewhere a sender is this server's. A sender the
+  // directory knows (deleted ones too) never takes the table's row.
+  const jointSurfaceChannel = channels.find(
+    (channel) => channel.id === (parentChannelId || message.channelId) && channel.type === "joint",
+  );
+  const onJointSurface = jointSurfaceChannel !== undefined;
+  const senderActor = useActorFallback(
+    onJointSurface && !readOnlyProjection && !isSystem && message.senderId && message.senderId !== "system"
+      && (isAgent ? !senderAgent : message.senderType === "user" && !senderMember)
+      ? { kind: isAgent ? "agent" : "human", id: message.senderId }
+      : null,
+  );
+  // Member labels (#wg-rbac:#46): a sender from another server carries that
+  // server's tile on the avatar, and none of this server's facts.
+  const senderOrigin = useSenderOrigin(
+    isAgent ? senderAgent : senderMember,
+    senderActor?.homeServerId,
+    jointSurfaceChannel?.jointServers,
+    readOnlyProjection || isSystem || message.senderType === "external_projection",
+  );
+  // The model follows the name of this server's agents only, whatever the
+  // appearance setting says: another server's agent never shows one.
+  const agentModelLabelText = showAgentModelNameOption && !isPersonalAssistantSender && !isAppBotSender && !senderOrigin.external
+    ? hostedModelLabelText ?? catalogModelLabelText ?? agentModelLabel(senderAgent)
+    : null;
   const isDeactivatedAgent = isAgent && !!senderAgent?.deletedAt;
   const viewerUserId = viewer?.id ?? null;
   const serverId = useServerStore((s) => s.current?.id ?? null);
@@ -2650,10 +2027,6 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
     reactionReadModelStore,
     (state) => state.actorCache,
   );
-  const readReceiptsEnabled = useServerFeatureFlag(
-    READ_RECEIPTS_FEATURE_FLAG_KEY,
-    { prefetch: false },
-  ).enabled;
   // #693: the aggregate footer "Read" chip is REMOVED. It collapsed every peer
   // into one boolean, so a message with no @agent at all still showed "Read"
   // once any un-mentioned agent had read the channel, and large-channel summary
@@ -2665,8 +2038,7 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
   // of `isReadByPeer`, which collapses human+agent peers.
   const agentReadBadgesEnabled =
     message.senderType === "user"
-    && viewerUserId === message.senderId
-    && readReceiptsEnabled;
+    && viewerUserId === message.senderId;
   // #693 follow-up: a DM has no @mention to hang the per-agent badge on, so
   // removing the legacy footer chip left DMs with NO read indicator at all.
   // Restored here, but scoped to DMs only — that is exactly where the chip was
@@ -2677,13 +2049,9 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
   // DM-ness from the prop therefore reads false for every real DM, so the chip
   // could never render outside a test that hand-builds the prop. Ask the store,
   // which is the actual authority for both collections.
-  const isDmSurface = useChannelStore(
-    (state) =>
-      state.dmChannels.some((candidate) => candidate.id === message.channelId)
-      || state.channels.some(
-        (candidate) => candidate.id === message.channelId && candidate.type === "dm",
-      ),
-  );
+  // A DM thread reply carries the thread's channelId; its DM is the parent.
+  const dmSurfaceChannelId = parentChannelId || message.channelId;
+  const isDmSurface = useChannelStore((state) => selectIsDmSurface(state, dmSurfaceChannelId));
   const dmReadReceiptScope = useReadReceiptStore(
     (state) => state.scopes[message.channelId],
   );
@@ -2702,17 +2070,13 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
   // task #187 collapse-long-messages: per-user, per-channel server-persisted
   // pref. OFF = long messages on this surface always render fully expanded
   // (CollapsibleMessageContent behaves as if disabled). Missing hydration
-  // defaults to collapsing — the server default.
+  // defaults to OFF — the server default.
   const storedCollapseLongMessages = useChannelStore(
     (state) =>
-      (state.channels.find((candidate) => candidate.id === referenceSurfaceChannelId)
-        ?? state.dmChannels.find((candidate) => candidate.id === referenceSurfaceChannelId))
-        ?.collapseLongMessages ?? true,
+      findStoredChannel(state, referenceSurfaceChannelId)?.collapseLongMessages ?? false,
   );
   const collapseLongMessages = storedCollapseLongMessages;
-  const isJointReferenceSurface = channels.some(
-    (channel) => channel.id === referenceSurfaceChannelId && channel.type === "joint",
-  );
+  const isJointReferenceSurface = onJointSurface;
   const storeSenderKnownOnCurrentServer = !!storeSenderAgent || !!storeSenderMember;
   const previewRefAuthorityServerSlug = previewSenderAgent?.serverSlug
     ?? previewSenderMember?.serverSlug
@@ -2735,6 +2099,7 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
   // `lastMessageAt` lives in the `channelActivity` slice (not the channel
   // objects), so this per-row subscription no longer re-renders on every message.
   const dmChannels = useChannelStore((s) => s.dmChannels);
+  const loungeChannels = useChannelStore((s) => s.loungeChannels);
   const requestTransientFocus = useMessageStore((s) => s.requestTransientFocus);
   const nav = useAppNavigate();
   const translationSettings = useTranslationStore((s) => s.settings);
@@ -2743,9 +2108,11 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
   const retryTranslation = useTranslationStore((s) => s.retryMessage);
   const setTranslationShowOriginal = useTranslationStore((s) => s.setShowOriginal);
   const messageBodyFontSize = useAppearanceStore((s) => s.messageBodyFontSize);
+  const showSenderDescription = useAppearanceStore((s) => s.showSenderDescription); // Settings › Appearance
   const messageBodyFontSizeClass = getMessageBodyFontSizeClass(messageBodyFontSize);
   const messageNameSizeClass = getMessageNameSizeClass(messageBodyFontSize);
   const messageMetaSizeClass = getMessageMetaSizeClass(messageBodyFontSize);
+  const messageTimeSizeClass = getMessageTimeSizeClass(messageBodyFontSize);
   const messageBodyFontSizeStyle = useMemo(() => ({
     ...getMessageBodyFontSizeStyle(messageBodyFontSize),
     userSelect: "text" as const,
@@ -2761,12 +2128,15 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
   );
   const actionMetadata = message.actionMetadata as { kind?: string } | null | undefined;
   const isActionCardMessage = actionMetadata?.kind === "action-card";
+  const messageCard = readMessageCard(message.actionMetadata); // RFC 082: a card the shared schema reads, else null (draw `content`).
   const translationTargetLanguage = translationSettings.available && translationSettings.preferredTranslationMode !== "off"
     ? translationSettings.effectiveLanguage
     : null;
   const isOwnHumanMessage = message.senderType === "user" && viewerUserId === message.senderId;
   const translationEligible =
-    !isSystem &&
+    !isSystem && !messageCard &&
+    // A retracted message has no words of the sender's left to translate.
+    !retracted &&
     !!translationTargetLanguage &&
     (translationSettings.preferredTranslationMode === "manual" || !isOwnHumanMessage);
   const currentTranslationEntry =
@@ -2832,16 +2202,19 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
     && visibleMessageContent.trim() === generatedForwardContent
     ? ""
     : visibleMessageContent;
-  const currentHostname = typeof window !== "undefined" ? window.location.hostname : undefined;
+  const permalinkHostnames = useRaftPermalinkHostnames();
   const quotedPermalink = useMemo(
-    () => extractFirstQuotedMessagePermalink(message.content, currentHostname, serverSlug),
-    [currentHostname, message.content, serverSlug],
+    () => extractFirstQuotedMessagePermalink(message.content, permalinkHostnames, serverSlug),
+    [permalinkHostnames, message.content, serverSlug],
   );
   const [unavailableQuotedPermalinkUrl, setUnavailableQuotedPermalinkUrl] = useState<string | null>(null);
   const quotedPermalinkUnavailable = quotedPermalink?.rawUrl === unavailableQuotedPermalinkUrl;
+  // By its URL: the same quote found again (the server's app hosts arriving)
+  // keeps its handler, so its preview is not read again.
+  const quotedPermalinkUrl = quotedPermalink?.rawUrl ?? null;
   const handleQuotedPermalinkUnavailable = useCallback(() => {
-    if (quotedPermalink) setUnavailableQuotedPermalinkUrl(quotedPermalink.rawUrl);
-  }, [quotedPermalink]);
+    if (quotedPermalinkUrl) setUnavailableQuotedPermalinkUrl(quotedPermalinkUrl);
+  }, [quotedPermalinkUrl]);
   // Stable so they don't break the memoized markdown body (renderContent) below.
   const handleNavigateAgent = useCallback((agentId: string) => {
     const knownAgent = senderAgent?.id === agentId
@@ -2866,24 +2239,25 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
       ? senderAgent
       : [...mentionMap.values()].find((entry) => entry.type === "agent" && entry.id === agentId)?.agent;
     if (knownAgent) setCachedAgentProfile(serverId, knownAgent);
-    openConversationAgentActivity(useProfileStore.getState().openProfile, agentId, {
-      openSource: parentMessageId ? "thread" : "channel",
-    });
-  }, [mentionMap, parentMessageId, senderAgent, serverId]);
+    if (onOpenProfile) onOpenProfile("agent", agentId); // its owner's panel (the task dialog): the profile
+    else openConversationAgentActivity(useProfileStore.getState().openProfile, agentId, { openSource: parentMessageId ? "thread" : "channel" });
+  }, [mentionMap, onOpenProfile, parentMessageId, senderAgent, serverId]);
 
   const handleNavigateHuman = useCallback((userId: string) => {
     if (onOpenProfile) {
       onOpenProfile("human", userId);
       return;
     }
+    // The channel (a thread's parent) names the person's servers on their profile.
     useProfileStore.getState().openProfile("human", userId, {
       openSource: parentMessageId ? "thread" : "channel",
+      channelId: parentChannelId || message.channelId,
     });
-  }, [onOpenProfile, parentMessageId]);
+  }, [message.channelId, onOpenProfile, parentChannelId, parentMessageId]);
 
   const handleNavigateExternal = useCallback(() => {
     const profile = message.externalAuthor;
-    if (!profile) return;
+    if (!profile || profile.identityKind === "anonymous") return;
     useProfileStore.getState().openExternalProfile(message.id, profile, {
       channelId: message.channelId,
       openSource: parentMessageId ? "thread" : "channel",
@@ -2902,11 +2276,6 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
     });
   }, [message.channelId, parentChannelId, parentMessageId]);
 
-  const handleNavigateComputer = useCallback((machineId: string) => {
-    const computer = useMachineStore.getState().machines.find((machine) => machine.id === machineId && machine.isComputer);
-    if (computer) nav.toComputer(machineId);
-  }, [nav]);
-
   const handleNavigateChannel = useCallback((channel: Channel) => {
     nav.toChannel(channel.id);
   }, [nav]);
@@ -2918,36 +2287,45 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
   // Look up agent's avatar
   const agentAvatarUrl = readOnlyProjection
     ? readOnlySender?.avatarUrl ?? null
-    : senderAgent?.avatarUrl ?? null;
+    : senderAgent ? senderAgent.avatarUrl ?? null : senderActor?.avatarUrl ?? null;
   const humanAvatarUrl = readOnlyProjection
     ? readOnlySender?.avatarUrl ?? null
-    : senderMember?.avatarUrl ?? null;
-  const externalAvatarUrl = readOnlyProjection
-    ? null
-    : message.externalAuthor?.avatarUrl ?? null;
+    : senderMember ? senderMember.avatarUrl ?? null : senderActor?.avatarUrl ?? null;
+  const externalPresentation = externalSenderPresentation(message.externalAuthor);
+  const externalAvatarUrl = readOnlyProjection ? null : externalPresentation.avatarUrl;
   const senderAgentDmChannel = isAgent
     ? dmChannels.find((channel) => channel.peerType === "agent" && channel.peerId === message.senderId)
     : null;
-  const senderEmailForAvatar =
-    !isAgent && currentUser?.id === message.senderId && !senderMember?.gravatarHash
-      ? currentUser.email
-      : null;
 
-  // Sender subtitle: agent description or human description (fallback to role)
+  // Sender subtitle: a projection's description, an external provider, or this server's Guest
   const senderDisplayName = readOnlyProjection
     ? readOnlySender?.displayName || message.senderName || formatMessage({ id: "message.messageItem.senderUserFallback" })
     : isExternal
-      ? message.externalAuthor?.displayName || message.senderName || formatMessage({ id: "message.author.externalFallback" })
+      ? message.externalAuthor?.profileFallback === "unresolved"
+        ? formatMessage({ id: "message.author.slackUnresolved" }, { id: message.externalAuthor.externalActorId })
+        : externalPresentation.displayName || message.senderName || formatMessage({ id: "message.author.externalFallback" })
       : isAgent
-        ? senderAgent?.displayName || senderAgentDmChannel?.peerDisplayName || senderAgent?.name || message.senderName || formatMessage({ id: "message.messageItem.senderAgentFallback" })
+        ? senderAgent?.displayName || senderAgentDmChannel?.peerDisplayName || senderAgent?.name || senderActor?.displayName || senderActor?.name || message.senderName || formatMessage({ id: "message.messageItem.senderAgentFallback" })
         : message.senderName || formatMessage({ id: "message.messageItem.senderUserFallback" });
+  // Member labels (#wg-rbac:#46): the author row says who this is and whether
+  // they are from outside. A server role is the hover card's; the one role
+  // written here is this server's Guest.
+  const humanSenderRoleLabel = !isAgent && !isExternal && !readOnlyProjection && isViewerServerGuest(senderMember?.role, senderOrigin)
+    ? formatMessage({ id: "member.detail.roleGuest" })
+    : null;
+  // The description follows the name (and its label) for people and agents,
+  // this server's or another's (cindyz, #triage:4eb8046c). Another server's
+  // agent is in no directory here and its joint roster row carries none, so
+  // the message's own senderDescription is the fallback; whitespace is none.
+  const senderDescriptionText = !isExternal && !readOnlyProjection && showSenderDescription
+    ? ((isAgent ? senderAgent?.description : senderMember?.description)?.trim() || message.senderDescription?.trim() || null)
+    : null;
   const senderSubtitle = readOnlyProjection
-    ? readOnlySender?.description ?? null
+    ? (showSenderDescription ? readOnlySender?.description ?? null : null)
     : isExternal
-      ? message.externalAuthor?.provider ?? null
-      : isAgent
-        ? senderAgent?.description || message.senderDescription || null
-        : senderMember?.description || message.senderDescription || formatMemberRole(senderMember?.role ?? "", formatMessage) || null;
+      ? formatExternalProviderLabel(message.externalAuthor?.provider, formatMessage)
+      : humanSenderRoleLabel;
+  const senderSubtitleIsHumanRoleLabel = humanSenderRoleLabel !== null && senderSubtitle === humanSenderRoleLabel;
   const senderMention = useMemo<MessageMention | null>(() => {
     if (isExternal) return null;
     const name = isAgent ? senderAgent?.name : senderMember?.name;
@@ -2966,11 +2344,14 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
       mention: senderMention,
     });
   }, [senderMention, senderMentionChannelId]);
+  // message_action_selected: a reply inside a thread vs a top-level row.
+  const inThread = Boolean(parentMessageId);
   const handleSenderNameMention = useCallback((e: MouseEvent<HTMLButtonElement>) => {
     e.preventDefault();
     e.stopPropagation();
+    trackMessageAction("mention_sender", "sender_name", inThread);
     insertSenderMention();
-  }, [insertSenderMention]);
+  }, [inThread, insertSenderMention]);
   const storeOpenThread = useThreadStore((s) => s.openThread);
   const openThread = useCallback((request: OpenThreadRequest) => {
     if (onOpenThread) {
@@ -3023,6 +2404,9 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
       : false,
   );
   const toggleSelection = useSelectionStore((s) => s.toggle);
+  // The surface answers a row's select intent with its timeline's order
+  // (messageSelectIntent.ts); a row never reads the list itself.
+  const selectIntent = useContext(MessageSelectIntentContext);
   const enterSelection = useSelectionStore((s) => s.enter);
   const enterThreadSelection = useSelectionStore((s) => s.enterThread);
   const isSelectedAsThreadParent =
@@ -3042,6 +2426,18 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
   const canShowThreadFollowAction = !readOnlyProjection && (!hideThreadActions || !!showThreadFollowAction);
   const messageRef = useRef<HTMLDivElement | null>(null);
   const messageBodyRef = useRef<HTMLDivElement | null>(null);
+  // Link cards for the links in the text: App links (protocol v3.2.3
+  // addendum 5) and first-party objects (Artifacts), one hook for both, read
+  // once the body is in view; shown as chips by the Markdown links below, and
+  // the Artifacts again as the cards under the text, from the same answers.
+  // Ordinary chat and thread messages only (docs/development/app-link-previews.md).
+  const linkCards = useMessageLinkCards({
+    messageId: message.id,
+    content: message.content,
+    conversationId: message.channelId,
+    enabled: !readOnlyProjection && !forwardedBundleMetadata,
+    target: messageBodyRef,
+  });
   // Stryker disable all: React effect wiring delegates branch decisions to
   // behavior-tested helpers; source contracts pin the API endpoint and render
   // use sites while the focused mutation oracle avoids full MessageItem DOM.
@@ -3053,6 +2449,12 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
     ? threadSummary?.threadChannelId ?? followedListThreadChannelId
     : null;
   const hasThreadConversation = !!threadSummary?.threadChannelId || (threadSummary?.replyCount ?? 0) > 0 || threadFollowed;
+  // In a thread panel: the thread's own Follow / Unfollow (its header ⋯'s),
+  // beside Mark Thread as Unread on every message; null elsewhere. The
+  // thread's parent then shows it there only, not also as its own thread's.
+  const enclosingThreadFollow = useEnclosingThreadFollowCommand();
+  const enclosingThreadFollowCommand = readOnlyProjection ? null : enclosingThreadFollow;
+  const showOwnThreadFollowAction = canShowThreadFollowAction && hasThreadConversation && !enclosingThreadFollowCommand;
   const threadUnreadCount = threadSummary?.unreadCount ?? 0;
   const firstUnreadThreadMessageId = threadUnreadCount > 0 ? threadSummary?.firstUnreadMessageId ?? null : null;
   const threadDraftChannelId = !hideThreadActions
@@ -3182,31 +2584,6 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
     }
   }, [message.commentRef, parentChannelId, parentMessageId, requestTransientFocus, openThread, nav]);
 
-  // On mobile (no hover), tapping a message opens its thread.
-  // When select mode is active for this message's channel, single-click (any
-  // device) toggles selection instead and we suppress the thread-open path.
-  const handleMobileTap = useCallback((e: MouseEvent) => {
-    if (selectionScopedHere) {
-      const target = e.target as HTMLElement;
-      // Allow links/buttons inside selected rows to still work
-      if (target.closest("a, button")) return;
-      e.preventDefault();
-      toggleSelection(message.id);
-      return;
-    }
-    if (hideThreadActions) return;
-    // Don't open thread if long-press context menu just fired
-    if (longPressFired.current) return;
-    // Only on touch devices (no hover capability); jsdom suites without a
-    // matchMedia stub are treated as touch (the target filter below still
-    // exempts interactive elements, so the guard stays behavior-neutral).
-    if (typeof window.matchMedia === "function" && window.matchMedia("(hover: hover)").matches) return;
-    // Don't intercept clicks on interactive elements (links, buttons, code blocks, images)
-    const target = e.target as HTMLElement;
-    if (target.closest("a, button, pre, code, img")) return;
-    handleReplyInThread();
-  }, [hideThreadActions, handleReplyInThread, selectionScopedHere, toggleSelection, message.id]);
-
   const [resolvingThreadRefKey, setResolvingThreadRefKey] = useState<string | null>(null);
 
   // Transient ref-open failures surface through the standard RUI toast — the
@@ -3216,16 +2593,16 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
     toast.error(formatMessageRef.current({ id: notice }));
   }, []);
 
-  const navigableChannels = useMemo(
-    () => [...channels, ...dmChannels.filter((dm) => !channels.some((channel) => channel.id === dm.id))],
-    [channels, dmChannels],
-  );
-  const taskSurfaceChannel = useMemo(
-    () => navigableChannels.find((channel) => channel.id === (parentChannelId || message.channelId)),
-    [message.channelId, navigableChannels, parentChannelId],
-  );
+  // Every conversation a link or ref here can reach: channels, DMs and agents' Lounges (in neither list).
+  const navigableChannels = useMemo(() => {
+    const listed = new Set(channels.map((channel) => channel.id));
+    return [...channels, ...[...dmChannels, ...loungeChannels].filter((row) => !listed.has(row.id))];
+  }, [channels, dmChannels, loungeChannels]);
+  const findNavigableChannel = useCallback((id: string | null | undefined) => findStoredChannel({ channels, dmChannels, loungeChannels }, id), [channels, dmChannels, loungeChannels]);
+  const taskSurfaceChannel = useMemo(() => findNavigableChannel(parentChannelId || message.channelId), [findNavigableChannel, message.channelId, parentChannelId]);
   const supportsMessageTasks = taskSurfaceChannel !== undefined && taskSurfaceChannel.type !== "thread";
 
+  const openInDetailSlot = useDetailSlotThreadOpener();
   const handleOpenThreadRef = useCallback(async (intent: ThreadRefIntent) => {
     const threadRefKey = `${intent.serverSlug}:${intent.parentChannelName.toLowerCase()}:${intent.shortId.toLowerCase()}`;
 
@@ -3241,7 +2618,7 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
 
     const parentChannel = findThreadRefParentChannel(intent, serverSlug, navigableChannels);
     if (!parentChannel) {
-      showThreadRefNotice("message.messageItem.threadUnavailable");
+      showThreadRefNotice(threadRefMissingParentNotice(intent, serverSlug, navigableChannels));
       return;
     }
     const isRequestAuthorityCurrent = captureThreadRouteAuthorityGuard(serverSlug, () => {
@@ -3261,22 +2638,9 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
         shortId: intent.shortId,
         summaries: useThreadStore.getState().summaries,
         followedThreads: useThreadStore.getState().followedThreads,
-        loadContext: async (channelId, targetShortId) => {
-          const { data } = await api.get<{
-            targetMessageId?: string | null;
-            canonicalTarget?: {
-              kind?: string;
-              channelId?: string;
-              messageId?: string;
-              threadParentMessageId?: string;
-              threadChannelId?: string | null;
-            } | null;
-          }>(
-            `/messages/context/${targetShortId}`,
-            { params: { channelId } },
-          );
-          return data;
-        },
+        // A thread whose first message is behind the plan's history window
+        // still opens: on its history paywall (task #8, frames 6b, 7).
+        loadContext: loadThreadRefContext,
       });
     } finally {
       setResolvingThreadRefKey((current) => current === threadRefKey ? null : current);
@@ -3284,20 +2648,17 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
 
     if (!isRequestAuthorityCurrent()) return;
     if (threadTarget) {
-      if (parentChannel?.type === "dm") {
-        nav.toDmMessage(threadTarget.parentChannelId, threadTarget.parentMessageId);
-      } else {
-        nav.toMessage(threadTarget.parentChannelId, threadTarget.parentMessageId);
-      }
+      const target = { ...threadTarget, focusedMessageId: intent.focusedMessageId ?? threadTarget.focusedMessageId };
+      // In Activity's or Search's detail slot it takes the slot's place (detailSlotThread.ts).
+      if (openInDetailSlot?.(target)) return;
+      if (parentChannel?.type === "dm") nav.toDmMessage(threadTarget.parentChannelId, threadTarget.parentMessageId);
+      else nav.toMessage(threadTarget.parentChannelId, threadTarget.parentMessageId);
       if (!isRequestAuthorityCurrent()) return;
-      void openThread({
-        ...threadTarget,
-        focusedMessageId: intent.focusedMessageId ?? threadTarget.focusedMessageId,
-      });
+      void openThread(target);
       return;
     }
     showThreadRefNotice("message.messageItem.threadUnavailable");
-  }, [nav, navigableChannels, openThread, serverSlug, showThreadRefNotice, threadRefAuthorityUnavailable]);
+  }, [nav, navigableChannels, openInDetailSlot, openThread, serverSlug, showThreadRefNotice, threadRefAuthorityUnavailable]);
 
   // Stryker disable all: message-ref navigation dependency-array rewrites are
   // equivalent in the static mutation oracle; behavior coverage exercises the
@@ -3333,17 +2694,19 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
     if (!sourceTarget || sourceTarget.type === "dm" || sourceTarget.labelVisibility !== "public") return;
 
     if (sourceTarget.type === "thread" && item.sourceThreadId && item.parentChannelId) {
-      const parentChannel = navigableChannels.find((channel) => channel.id === item.parentChannelId);
+      const parentChannel = findNavigableChannel(item.parentChannelId);
       if (!parentChannel || parentChannel.type === "dm") return;
       try {
-        const { data } = await api.get<{
-          canonicalTarget?: {
-            kind?: string;
-            messageId?: string;
-            threadParentMessageId?: string;
-            threadChannelId?: string | null;
-          };
-        }>(`/messages/context/${sourceMessageId}`, { params: { channelId: item.parentChannelId } });
+        let data: { canonicalTarget?: ContextCanonicalTarget | null };
+        try {
+          ({ data } = await api.get<{ canonicalTarget?: ContextCanonicalTarget | null }>(`/messages/context/${sourceMessageId}`, { params: { channelId: item.parentChannelId } }));
+        } catch (error) {
+          // A source behind the plan's history window still opens, on the
+          // thread's paywall centered on it (task #8, frame 9).
+          const hidden = readHistoryLimitedError(error);
+          if (!hidden) throw error;
+          data = hidden;
+        }
         const target = data.canonicalTarget;
         if (target?.kind === "thread" && target.threadParentMessageId) {
           nav.toMessage(item.parentChannelId, target.threadParentMessageId);
@@ -3374,10 +2737,10 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
     }
 
     if (!item.sourceTargetId) return;
-    const sourceChannel = navigableChannels.find((channel) => channel.id === item.sourceTargetId);
+    const sourceChannel = findNavigableChannel(item.sourceTargetId);
     if (!sourceChannel || sourceChannel.type === "dm") return;
     await handleOpenMessageRef(sourceChannel, sourceMessageId, null);
-  }, [handleOpenMessageRef, nav, navigableChannels, openThread, showThreadRefNotice]);
+  }, [findNavigableChannel, handleOpenMessageRef, nav, openThread, showThreadRefNotice]);
   // Stryker restore all
 
   // Save / unsave message
@@ -3397,15 +2760,29 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
   }, [handleToggleSave]);
 
   // Context menu for "Convert to task"
-  const [ctxMenu, setCtxMenu] = useState<{ anchorX: number; anchorY: number; x: number; y: number; source: "pointer" | "touch" } | null>(null);
+  const [ctxMenu, setCtxMenu] = useState<{ anchorX: number; anchorY: number; x: number; y: number; source: "pointer" | "touch"; fromToolbar?: boolean } | null>(null);
   const ctxMenuRef = useRef<HTMLDivElement | null>(null);
+  /** An action chosen in the message menu, recorded with how the menu was opened. */
+  const trackFromMenu = useCallback((action: Parameters<typeof trackMessageAction>[0]) => {
+    trackMessageAction(action, ctxMenu ? messageMenuSurface(ctxMenu) : "context_menu", inThread);
+  }, [ctxMenu, inThread]);
+  // Set when the toolbar's More button opened the menu from the keyboard:
+  // focus moves into the menu, and Escape hands it back to this button.
+  const ctxMenuReturnFocusRef = useRef<HTMLButtonElement | null>(null);
   // iOS can emit a synthetic mousedown/click pair after long-press touchend.
   // Keep a short-lived portal shield mounted so neither event reaches the
   // outside-click overlay and closes the menu as soon as the finger lifts.
   const [ctxMenuClickShielded, setCtxMenuClickShielded] = useState(false);
+  // Every emoji, opened by Add Reaction (`smile-plus`) at the end of the
+  // menu's quick reactions; it opens where the menu was.
+  // `focusSearch`: opened from the keyboard, so focus goes to its search field.
+  const [emojiPickerAt, setEmojiPickerAt] = useState<{ x: number; y: number; focusSearch: boolean } | null>(null);
+  // Where Escape gives focus back when the picker was opened from the keyboard.
+  const emojiPickerReturnFocusRef = useRef<HTMLElement | null>(null);
   const ctxMenuShieldTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const handleManualTranslate = useCallback(() => {
     if (!showManualTranslationAction || manualTranslationPending || !translationTargetLanguage) return;
+    trackFromMenu("translate");
     setCtxMenu(null);
     void requestTranslations([message], {
       targetLanguage: translationTargetLanguage,
@@ -3413,6 +2790,7 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
       force: true,
     });
   }, [
+    trackFromMenu,
     manualTranslationPending,
     message,
     requestTranslations,
@@ -3423,13 +2801,6 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
   const convertMessage = useTaskStore((s) => s.convertMessage);
   const channelTasks = useTaskStore((s) => s.tasks);
 
-  // Parked with TaskChipList: grouping the channel's tasks by message id is
-  // what feeds the list, and it comes back when the list does.
-  // const messageTasks = useMemo(
-  //   () => channelTasks.filter((t) => t.messageId === message.id)
-  //     .sort((a, b) => a.taskNumber - b.taskNumber),
-  //   [channelTasks, message.id],
-  // );
 
   // A task with no host message cannot use the thread-backed modal, so it
   // falls back to the legacy panel (@stdrc msg=1561f8fc). Everything reaching
@@ -3437,30 +2808,40 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
   // rather than the assumption keeps the two paths honest.
 
   const serverTasks = useTaskStore((s) => s.serverTasks);
-  const knownTaskNumbers = useMemo(() => {
-    const nums = new Set<number>();
-    for (const t of channelTasks) nums.add(t.taskNumber);
-    for (const t of serverTasks) nums.add(t.taskNumber);
-    return nums;
-  }, [channelTasks, serverTasks]);
-  // Task #662 research prototype: full task payloads for inline task refs,
-  // from the same source as knownTaskNumbers. Channel tasks win over the
-  // server cache for the same number.
-  const taskByNumber = useMemo(() => {
-    const map = new Map<number, Task>();
-    for (const t of serverTasks) map.set(t.taskNumber, t);
-    for (const t of channelTasks) map.set(t.taskNumber, t);
+  // Task #662: full task payloads for inline task refs, keyed by (channel,
+  // number) — task numbers repeat across channels, so a number-only key let
+  // a ref's badge show another channel's task. A ref is "known" when its key
+  // is here. Channel tasks win over the server cache for the same task.
+  const taskByChannelNumber = useMemo(() => {
+    const map = new Map<string, Task>();
+    for (const t of serverTasks) map.set(taskRefKey(t.channelId, t.taskNumber), t);
+    for (const t of channelTasks) map.set(taskRefKey(t.channelId, t.taskNumber), t);
     // The message's own linked task is always the freshest source for a ref
     // in that message's body.
-    if (linkedTask) map.set(linkedTask.taskNumber, linkedTask);
+    if (linkedTask) map.set(taskRefKey(linkedTask.channelId, linkedTask.taskNumber), linkedTask);
     return map;
   }, [channelTasks, serverTasks, linkedTask]);
+  const taskContextChannelId = parentChannelId || message.channelId;
   const updateTaskStatus = useTaskStore((s) => s.updateTaskStatus);
   const [converting, setConverting] = useState(false);
   const pendingReactionEmojisRef = useRef<Set<string>>(new Set());
   const reactionFailureFlashTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [reactionFailureEmoji, setReactionFailureEmoji] = useState<string | null>(null);
   const [reactionPicker, setReactionPicker] = useState<{ x: number; y: number } | null>(null);
+  const reactionPickerRef = useRef<HTMLDivElement | null>(null);
+  // Keep the rendered bar inside the viewport even if its real width differs
+  // from REACTION_PICKER_WIDTH (see the metrics above).
+  useLayoutEffect(() => {
+    const element = reactionPickerRef.current;
+    if (!reactionPicker || !element) return;
+    const { width, height } = element.getBoundingClientRect();
+    if (width === 0) return;
+    const margin = REACTION_PICKER_VIEWPORT_MARGIN;
+    const x = Math.max(margin, Math.min(reactionPicker.x, window.innerWidth - width - margin));
+    const y = Math.max(margin, Math.min(reactionPicker.y, window.innerHeight - height - margin));
+    // oxlint-disable-next-line react-doctor/no-adjust-state-on-prop-change
+    if (x !== reactionPicker.x || y !== reactionPicker.y) setReactionPicker({ x, y });
+  }, [reactionPicker]);
   const reactionPickerCloseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [senderCtxMenu, setSenderCtxMenu] = useState<{ x: number; y: number } | null>(null);
   const senderHandleText = senderMention ? `@${senderMention.name}` : null;
@@ -3478,16 +2859,23 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
   const closeSenderCtxMenu = useCallback(() => setSenderCtxMenu(null), []);
 
   const handleOpenThreadFromContextMenu = useCallback(() => {
+    trackFromMenu("reply_in_thread");
     setCtxMenu(null);
     handleReplyInThread();
-  }, [handleReplyInThread]);
-  const [reactionPopover, setReactionPopover] = useState<{
-    emoji: string;
-    visibleNames: string[];
-    hiddenCount: number;
-    x: number;
-    y: number;
-  } | null>(null);
+  }, [handleReplyInThread, trackFromMenu]);
+  // Forward this message straight from its row (task #35). Only messages the
+  // composer accepts get the entry: not system rows, action cards or bundles.
+  const forwardMessage = useContext(MessageForwardContext);
+  const canForwardThisMessage = !!forwardMessage && getForwardableMessages([message]).messages.length === 1;
+  // The toolbar's More opens this context menu; system rows have none, and
+  // select mode suppresses it.
+  const canOpenMenuFromToolbar = !isSystem && !selectionActive;
+  const handleForward = useCallback((event?: MouseEvent) => {
+    event?.stopPropagation();
+    trackMessageAction("forward", ctxMenu ? messageMenuSurface(ctxMenu) : "hover_toolbar", inThread);
+    setCtxMenu(null);
+    forwardMessage?.(message);
+  }, [ctxMenu, forwardMessage, inThread, message]);
   const documentPreviewLoadingId = useDocumentPreviewStore((state) => state.loadingId);
   const mediaPreviewLoadingId = useMediaPreviewStore((state) => state.loadingId);
   const htmlPreviewLoadingId = mediaPreviewLoadingId;
@@ -3510,11 +2898,141 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
       : belowTop;
 
     window.dispatchEvent(new CustomEvent(REACTION_PICKER_EVENT, { detail: { messageId: message.id } }));
+    reactionPickerTapOpenedAtRef.current = Number.NEGATIVE_INFINITY;
     setReactionPicker({
       x: Math.min(Math.max(desiredLeft, minLeft), maxLeft),
       y: Math.min(Math.max(desiredTop, REACTION_PICKER_VIEWPORT_MARGIN), maxTop),
     });
   }, [message.id]);
+
+  // When a double tap opened the bar (see REACTION_PICKER_TAP_SHIELD_MS); minus
+  // infinity when the bar opened from a button.
+  const reactionPickerTapOpenedAtRef = useRef(Number.NEGATIVE_INFINITY);
+  const positionReactionPickerAtTap = useCallback((point: MessageTapPoint) => {
+    if (reactionPickerCloseTimerRef.current) {
+      clearTimeout(reactionPickerCloseTimerRef.current);
+      reactionPickerCloseTimerRef.current = null;
+    }
+    const margin = REACTION_PICKER_VIEWPORT_MARGIN;
+    const maxLeft = Math.max(margin, window.innerWidth - REACTION_PICKER_WIDTH - margin);
+    const aboveTop = point.y - REACTION_PICKER_TAP_CLEARANCE - REACTION_PICKER_HEIGHT;
+    const belowTop = point.y + REACTION_PICKER_TAP_CLEARANCE;
+    const roomBelow = belowTop + REACTION_PICKER_HEIGHT <= window.innerHeight - margin;
+    window.dispatchEvent(new CustomEvent(REACTION_PICKER_EVENT, { detail: { messageId: message.id } }));
+    reactionPickerTapOpenedAtRef.current = Date.now();
+    setReactionPicker({
+      x: Math.min(Math.max(point.x - REACTION_PICKER_WIDTH / 2, margin), maxLeft),
+      y: aboveTop >= margin || !roomBelow ? Math.max(aboveTop, margin) : belowTop,
+    });
+  }, [message.id]);
+
+  // Long-press to open context menu on mobile
+  const longPressTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const longPressFired = useRef(false);
+  // Where the current touch started; null when no finger is down on this row.
+  const touchPointRef = useRef<{ x: number; y: number } | null>(null);
+
+  const openTouchContextMenu = useCallback((point: { x: number; y: number }) => {
+    if (longPressTimer.current) {
+      clearTimeout(longPressTimer.current);
+      longPressTimer.current = null;
+    }
+    longPressFired.current = true;
+    trackMessageAction("open_menu", "long_press", inThread);
+    setCtxMenu(placeTouchMessageContextMenu(point));
+    setReactionPicker(null);
+    setCtxMenuClickShielded(true);
+    if (ctxMenuShieldTimerRef.current) clearTimeout(ctxMenuShieldTimerRef.current);
+    ctxMenuShieldTimerRef.current = setTimeout(() => {
+      setCtxMenuClickShielded(false);
+      ctxMenuShieldTimerRef.current = null;
+    }, 600);
+  }, [inThread]);
+
+  // Taps on a touch screen (raft-design states.md "Taps on a touch screen",
+  // stdrc 2026-10-29): a tap opens the thread (nothing inside a thread), a
+  // double tap opens the quick-reaction bar at the message, never a reaction
+  // by itself. Select mode keeps its own tap, below. The bar opens at the
+  // finger, not the row: a row taller than the screen would clamp it under
+  // the finger.
+  const openQuickReactionsAtTap = useCallback((point: MessageTapPoint) => {
+    setCtxMenu(null);
+    positionReactionPickerAtTap(point);
+  }, [positionReactionPickerAtTap]);
+  const readLongPressFired = useCallback(() => longPressFired.current, []);
+  const touchTaps = useMessageTouchTaps({
+    rowRef: messageRef,
+    enabled: actionable && !isSystem && !selectionActive,
+    onTap: hideThreadActions ? null : handleReplyInThread,
+    onDoubleTap: canReact && !isSystem ? openQuickReactionsAtTap : null,
+    longPressFired: readLongPressFired,
+  });
+  const { ownsClick: touchTapsOwnClick } = touchTaps;
+
+  // When select mode is active for this message's channel, single-click (any
+  // device) toggles selection instead and we suppress the thread-open path.
+  // A click the browser derived from a touch belongs to the taps above. Any
+  // other click on a device without hover (a screen reader's activation)
+  // opens the thread at once.
+  const selectThisMessage = useCallback((range: boolean) => {
+    if (selectIntent) selectIntent.select(message.id, { range });
+    else if (range) useSelectionStore.getState().selectRange([message.id], message.id);
+    else toggleSelection(message.id);
+  }, [message.id, selectIntent, toggleSelection]);
+  // In select mode the whole row is the selection target: a click anywhere in
+  // it (its links, thread and task cards, images, avatar) toggles it, or with
+  // Shift takes the range from the anchor, and never opens what it landed on.
+  // Capture phase: preventDefault stops a link's navigation, and
+  // stopPropagation is needed too, because the row's buttons (thread card,
+  // task chip, image, avatar) act in their own onClick, which preventDefault
+  // does not stop. Portaled children (this row's menus) are not in the row's
+  // DOM and keep their clicks.
+  const handleSelectClickCapture = useCallback((e: MouseEvent) => {
+    if (!(e.target instanceof Node) || !e.currentTarget.contains(e.target)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    // The release of a long-press that opened the selection menu.
+    if (longPressFired.current) {
+      longPressFired.current = false;
+      return;
+    }
+    selectThisMessage(e.shiftKey);
+  }, [selectThisMessage]);
+  // Shift+mousedown would extend the browser's text selection across every
+  // row up to here; in select mode Shift+click is a range of messages.
+  const handleSelectMouseDown = useCallback((e: MouseEvent) => {
+    if (e.shiftKey) e.preventDefault();
+  }, []);
+  // A middle-click on a link would open it in a new tab: in select mode the
+  // row is the target, so it does nothing.
+  const handleSelectAuxClickCapture = useCallback((e: MouseEvent) => {
+    if (!(e.target instanceof Node) || !e.currentTarget.contains(e.target)) return;
+    e.preventDefault();
+  }, []);
+  // A mouse or pen press is a new gesture: a touch long-press before it must
+  // not swallow its click (the flag is otherwise reset only by a touch).
+  const touchTapsPointerDown = touchTaps.handlers.onPointerDown;
+  const handleRowPointerDown = useCallback((e: ReactPointerEvent<HTMLDivElement>) => {
+    if (e.pointerType !== "touch") longPressFired.current = false;
+    touchTapsPointerDown?.(e);
+  }, [touchTapsPointerDown]);
+
+  const handleMobileTap = useCallback((e: MouseEvent) => {
+    // Select mode's click is the capture handler's.
+    if (selectionScopedHere) return;
+    if (touchTapsOwnClick()) return;
+    if (hideThreadActions) return;
+    // Don't open thread if long-press context menu just fired
+    if (longPressFired.current) return;
+    // Only on touch devices (no hover capability); jsdom suites without a
+    // matchMedia stub are treated as touch (the target filter below still
+    // exempts interactive elements, so the guard stays behavior-neutral).
+    if (typeof window.matchMedia === "function" && window.matchMedia("(hover: hover)").matches) return;
+    // Don't intercept clicks on interactive elements (links, buttons, code blocks, images)
+    const target = e.target as HTMLElement;
+    if (target.closest("a, button, pre, code, img")) return;
+    handleReplyInThread();
+  }, [hideThreadActions, handleReplyInThread, selectionScopedHere, touchTapsOwnClick]);
 
   const handleContextMenu = useCallback((e: MouseEvent) => {
     if (isSystem) return;
@@ -3543,6 +3061,15 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
       return;
     }
     e.preventDefault();
+    // Android Chrome also fires contextmenu for a touch long-press (task #50).
+    // While a finger is down, the touch path owns the gesture: open the touch
+    // menu now if the timer has not fired yet (Android's 400ms can beat our
+    // 500ms), and never a second, pointer-placed one.
+    if (touchPointRef.current) {
+      if (!longPressFired.current) openTouchContextMenu(touchPointRef.current);
+      return;
+    }
+    trackMessageAction("open_menu", "context_menu", inThread);
     setCtxMenu({
       anchorX: e.clientX,
       anchorY: e.clientY,
@@ -3551,11 +3078,29 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
       source: "pointer",
     });
     setReactionPicker(null);
-  }, [isSystem, selectionActive]);
+  }, [inThread, isSystem, selectionActive, openTouchContextMenu]);
 
-  // Long-press to open context menu on mobile
-  const longPressTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const longPressFired = useRef(false);
+  // The hover toolbar's shortcuts (message_action_selected surface hover_toolbar).
+  const handleToolbarReplyInThread = useCallback(() => {
+    trackMessageAction("reply_in_thread", "hover_toolbar", inThread);
+    handleReplyInThread();
+  }, [handleReplyInThread, inThread]);
+  const handleToolbarToggleSave = useCallback(() => {
+    trackMessageAction(isSaved ? "unsave" : "save", "hover_toolbar", inThread);
+    handleToggleSave();
+  }, [handleToggleSave, inThread, isSaved]);
+
+  // The hover toolbar's More button opens the same menu under itself.
+  const handleOpenMenuFromToolbar = useCallback((e: MouseEvent<HTMLButtonElement>) => {
+    e.stopPropagation();
+    const rect = e.currentTarget.getBoundingClientRect();
+    const anchor = { x: rect.left, y: rect.bottom + 4 };
+    // detail 0: activated with Enter/Space rather than a pointer click.
+    ctxMenuReturnFocusRef.current = e.detail === 0 ? e.currentTarget : null;
+    trackMessageAction("open_menu", "toolbar_menu", inThread);
+    setCtxMenu({ anchorX: anchor.x, anchorY: anchor.y, x: anchor.x, y: anchor.y, source: "pointer", fromToolbar: true });
+    setReactionPicker(null);
+  }, [inThread]);
 
   const handleTouchStart = useCallback((e: TouchEvent) => {
     if (isSystem) return;
@@ -3564,29 +3109,21 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
     // ownership boundary: only touches physically inside the row may arm the
     // message long-press timer.
     if (!(e.target instanceof Element) || !e.currentTarget.contains(e.target)) return;
-    const target = e.target;
-    if (target.closest("[data-message-selectable='true']")) return;
+    // External links keep the browser's link menu, matching handleContextMenu.
+    if (e.target.closest('a[target="_blank"]')) return;
     // Parity with handleContextMenu: once select mode is active, long-press
     // should not re-open the context menu either. Mobile users toggle
     // selection by tapping rows in select mode; the popup menu here would
     // only get in the way.
-    if (selectionActive) return;
+    // Every touch starts a new gesture, including one that opens no menu: a
+    // long-press before it must not swallow this tap's click.
     longPressFired.current = false;
+    if (selectionActive) return;
     const touch = e.touches[0];
-    const x = touch.clientX;
-    const y = touch.clientY;
-    longPressTimer.current = setTimeout(() => {
-      longPressFired.current = true;
-      setCtxMenu(placeTouchMessageContextMenu({ x, y }));
-      setReactionPicker(null);
-      setCtxMenuClickShielded(true);
-      if (ctxMenuShieldTimerRef.current) clearTimeout(ctxMenuShieldTimerRef.current);
-      ctxMenuShieldTimerRef.current = setTimeout(() => {
-        setCtxMenuClickShielded(false);
-        ctxMenuShieldTimerRef.current = null;
-      }, 600);
-    }, 500);
-  }, [isSystem, selectionActive]);
+    const point = { x: touch.clientX, y: touch.clientY };
+    touchPointRef.current = point;
+    longPressTimer.current = setTimeout(() => openTouchContextMenu(point), 500);
+  }, [isSystem, selectionActive, openTouchContextMenu]);
 
   useEffect(() => () => {
     if (ctxMenuShieldTimerRef.current) {
@@ -3596,6 +3133,7 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
   }, []);
 
   const handleTouchEnd = useCallback((e: TouchEvent) => {
+    touchPointRef.current = null;
     if (longPressTimer.current) {
       clearTimeout(longPressTimer.current);
       longPressTimer.current = null;
@@ -3608,6 +3146,7 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
 
   const handleTouchMove = useCallback(() => {
     // Cancel long press if finger moves (scrolling)
+    touchPointRef.current = null;
     if (longPressTimer.current) {
       clearTimeout(longPressTimer.current);
       longPressTimer.current = null;
@@ -3618,14 +3157,17 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
   // in — mirrors the "Share messages…" routing exactly so a thread reply
   // quotes into the thread composer, a thread parent rendered in ThreadPanel
   // quotes into that thread, and a channel-timeline row quotes into the
-  // channel composer.
+  // channel composer. A surface naming its composer wins: task replies have no
+  // parent message or threadId, so inference would pick the channel composer.
   const quoteComposerChannelId = useMemo(() => {
+    if (mentionComposerChannelId) return mentionComposerChannelId;
     if (parentMessageId) return message.channelId; // thread reply → thread channel
     if (hideThreadActions && message.threadId) return message.threadId; // parent in ThreadPanel
     return parentChannelId || message.channelId; // channel timeline
-  }, [parentMessageId, hideThreadActions, message.threadId, parentChannelId, message.channelId]);
+  }, [mentionComposerChannelId, parentMessageId, hideThreadActions, message.threadId, parentChannelId, message.channelId]);
 
   const handleConvertToTask = useCallback(async () => {
+    trackFromMenu("convert_to_task");
     setCtxMenu(null);
     setConverting(true);
     try {
@@ -3635,10 +3177,32 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
     } finally {
       setConverting(false);
     }
-  }, [convertMessage, message.id]);
+  }, [convertMessage, message.id, trackFromMenu]);
+
+  const openTaskFromList = useOpenTask();
+  // Task v2: a task is created FROM a message (it hangs under it; several may),
+  // never "converted" from it (@stdrc).
+  const taskV2 = useServerFeatureFlag(TASK_V2_CONVERSATIONS_FLAG_KEY).enabled;
+  const [createFromMessageOpen, setCreateFromMessageOpen] = useState(false);
+  const openCreateFromMessage = useCallback(() => {
+    trackFromMenu("create_task");
+    setCtxMenu(null);
+    setCreateFromMessageOpen(true);
+  }, [trackFromMenu]);
+  const closeCreateFromMessage = useCallback(() => setCreateFromMessageOpen(false), []);
+  const createFromMessageSource = useMemo(
+    () => ({ id: message.id, senderName: senderDisplayName, text: message.content }),
+    [message.id, message.content, senderDisplayName],
+  );
 
   const openLinkedTask = useCallback(() => {
     if (!linkedTask) return;
+    if (opensAsTaskConversation(linkedTask, taskV2)) {
+      // Task v2: the task's own conversation, not its message's thread — for
+      // a task made the v2 way whatever the flag says.
+      openTaskConversationDialog(linkedTask);
+      return;
+    }
     if (linkedTask.messageId) {
       // Declares intent rather than leaving the host to infer it: the thread icon
     // on this same message opens the replies in the side panel, and only the
@@ -3652,10 +3216,11 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
       return;
     }
     openLegacyTask(linkedTask);
-  }, [linkedTask, openThread, openLegacyTask]);
+  }, [linkedTask, openThread, openLegacyTask, taskV2]);
 
   const handleToggleTaskDone = useCallback(async () => {
     if (!linkedTask) return;
+    trackFromMenu(linkedTask.status === "done" ? "task_reopen" : "task_done");
     setCtxMenu(null);
     const nextStatus = linkedTask.status === "done" ? "todo" : "done";
     try {
@@ -3663,26 +3228,28 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
     } catch (err) {
       console.error("Failed to update task status:", err);
     }
-  }, [linkedTask, updateTaskStatus]);
+  }, [linkedTask, trackFromMenu, updateTaskStatus]);
 
   const handleFollowThread = useCallback(async () => {
+    trackFromMenu("follow_thread");
     setCtxMenu(null);
     try {
       await followThread(message.id);
     } catch (err) {
       console.error("Failed to follow thread:", err);
     }
-  }, [followThread, message.id]);
+  }, [followThread, message.id, trackFromMenu]);
 
   const handleUnfollowThread = useCallback(async () => {
     if (!followedThreadChannelId) return;
+    trackFromMenu("unfollow_thread");
     setCtxMenu(null);
     try {
       await unfollowThread(followedThreadChannelId);
     } catch (err) {
       console.error("Failed to unfollow thread:", err);
     }
-  }, [followedThreadChannelId, unfollowThread]);
+  }, [followedThreadChannelId, trackFromMenu, unfollowThread]);
 
   const reactions = useMemo(() => message.reactions ?? [], [message.reactions]);
   const visibleReactions = useMemo(
@@ -3754,6 +3321,8 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
         active: !alreadyReacted,
       });
       pendingReactionEmojisRef.current.delete(emoji);
+      // Every reaction added counts toward the toolbar button's emoji.
+      if (!alreadyReacted) recordReactionUsage(viewerUserId, emoji);
       const currentMessage = getCurrentMessage();
       const reconciledMessage = mergeReactionResponsePreservingPending(
         currentMessage,
@@ -3831,9 +3400,10 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
     if (reactionPicker) {
       closeReactionPicker();
     } else {
+      trackMessageAction("open_reaction_picker", "hover_toolbar", inThread);
       openReactionPicker(e.currentTarget as HTMLElement);
     }
-  }, [reactionPicker, closeReactionPicker, openReactionPicker]);
+  }, [inThread, reactionPicker, closeReactionPicker, openReactionPicker]);
 
   const handleQuickReactionClick = useCallback((emoji: string) => {
     closeReactionPicker();
@@ -3845,6 +3415,111 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
     }
     void handleToggleReaction(emoji);
   }, [closeReactionPicker, handleToggleReaction]);
+
+  // Every emoji, where the menu or the reaction bar was, kept inside the
+  // window like the menu itself. Shared by the menu's Add Reaction and the
+  // bar's (the one reaction bar, QuickReactionButtons).
+  const openEmojiPickerAt = useCallback((at: { x: number; y: number } | null, fromKeyboard: boolean) => {
+    if (!at || typeof window === "undefined") return;
+    const margin = REACTION_PICKER_VIEWPORT_MARGIN;
+    const width = Math.min(REACTION_EMOJI_PICKER_WIDTH, window.innerWidth - 2 * margin);
+    const maxX = Math.max(margin, window.innerWidth - width - margin);
+    const maxY = Math.max(margin, window.innerHeight - REACTION_EMOJI_PICKER_HEIGHT - margin);
+    setEmojiPickerAt({ x: Math.min(Math.max(at.x, margin), maxX), y: Math.min(Math.max(at.y, margin), maxY), focusSearch: fromKeyboard });
+  }, []);
+  // Add Reaction in the message menu.
+  const handleOpenEmojiPickerFromMenu = useCallback((event: MouseEvent<HTMLElement>) => {
+    const at = ctxMenu;
+    trackFromMenu("open_reaction_picker");
+    // detail 0: chosen with Enter or Space, not a pointer. Then focus goes to
+    // the picker's search field, and Escape hands it back to where the menu
+    // came from: the toolbar's More button when it opened the menu from the
+    // keyboard, else the message row (as the menu's own Escape does).
+    const fromKeyboard = event.detail === 0;
+    emojiPickerReturnFocusRef.current = fromKeyboard ? (ctxMenuReturnFocusRef.current ?? messageRef.current) : null;
+    ctxMenuReturnFocusRef.current = null;
+    setCtxMenu(null);
+    setCtxMenuClickShielded(false);
+    if (ctxMenuShieldTimerRef.current) {
+      clearTimeout(ctxMenuShieldTimerRef.current);
+      ctxMenuShieldTimerRef.current = null;
+    }
+    openEmojiPickerAt(at, fromKeyboard);
+  }, [ctxMenu, openEmojiPickerAt, trackFromMenu]);
+  // Add Reaction at the end of the reaction bar.
+  const handleOpenEmojiPickerFromBar = useCallback((event: MouseEvent<HTMLElement>) => {
+    // The click the browser derives from the double tap that opened the bar.
+    if (Date.now() - reactionPickerTapOpenedAtRef.current < REACTION_PICKER_TAP_SHIELD_MS) return;
+    const at = reactionPicker;
+    trackMessageAction("open_reaction_picker", "hover_toolbar", inThread);
+    const fromKeyboard = event.detail === 0;
+    emojiPickerReturnFocusRef.current = fromKeyboard ? messageRef.current : null;
+    closeReactionPicker();
+    openEmojiPickerAt(at, fromKeyboard);
+  }, [closeReactionPicker, inThread, openEmojiPickerAt, reactionPicker]);
+  const closeEmojiPicker = useCallback(() => {
+    emojiPickerReturnFocusRef.current = null;
+    setEmojiPickerAt(null);
+  }, []);
+  const emojiPickerStyle = useMemo(
+    () => (emojiPickerAt ? { left: emojiPickerAt.x, top: emojiPickerAt.y } : undefined),
+    [emojiPickerAt],
+  );
+  const handleEmojiPickerChoose = useCallback((emojiData: { emoji: string }) => {
+    emojiPickerReturnFocusRef.current = null;
+    setEmojiPickerAt(null);
+    void handleToggleReaction(emojiData.emoji);
+  }, [handleToggleReaction]);
+  // Esc closes the reaction emoji picker (a layer while open); focus goes back to the message row, which takes it
+  // only from script (tabIndex -1), as a located message does (raft-ui MessageItem, focus ring).
+  useShortcutLayer("menu", !!emojiPickerAt, { ignoreDefaultPrevented: true, onEscape: () => {
+    const returnFocus = emojiPickerReturnFocusRef.current;
+    emojiPickerReturnFocusRef.current = null;
+    setEmojiPickerAt(null);
+    if (returnFocus && !returnFocus.hasAttribute("tabindex")) returnFocus.setAttribute("tabindex", "-1");
+    returnFocus?.focus({ preventScroll: true });
+  } });
+
+  // The hover toolbar's reaction button (useToolbarQuickReaction): a click
+  // toggles the favorite as its chip does; resting on it opens the reaction bar.
+  const { quickReaction, rowHandlers: quickReactionRowHandlers } = useToolbarQuickReaction(viewerUserId, !!reactionPicker || !!ctxMenu || !!emojiPickerAt);
+  const handleToolbarQuickReact = useCallback((event: MouseEvent<HTMLButtonElement>) => {
+    event.stopPropagation();
+    trackMessageAction("react_quick", "hover_toolbar", inThread);
+    handleQuickReactionClick(quickReaction);
+  }, [handleQuickReactionClick, inThread, quickReaction]);
+  const handleToolbarReactionHoverOpen = useCallback((button: HTMLButtonElement) => {
+    setCtxMenu(null);
+    trackMessageAction("open_reaction_picker", "hover_toolbar", inThread);
+    openReactionPicker(button);
+  }, [inThread, openReactionPicker]);
+  // The reaction buttons carry their emoji, so one stable handler serves each list.
+  const handleReactionChipClick = useCallback((event: MouseEvent<HTMLElement>) => {
+    const emoji = event.currentTarget.dataset.reactionEmoji;
+    if (emoji) void handleToggleReaction(emoji);
+  }, [handleToggleReaction]);
+  const handleMenuQuickReactionClick = useCallback((event: MouseEvent<HTMLElement>) => {
+    event.stopPropagation();
+    const emoji = event.currentTarget.dataset.reactionEmoji;
+    if (!emoji) return;
+    trackFromMenu("react_quick");
+    handleQuickReactionClick(emoji);
+  }, [handleQuickReactionClick, trackFromMenu]);
+  const handleQuickReactionButtonClick = useCallback((event: MouseEvent<HTMLElement>) => {
+    // The click the browser derives from the double tap that opened the bar.
+    if (Date.now() - reactionPickerTapOpenedAtRef.current < REACTION_PICKER_TAP_SHIELD_MS) return;
+    const emoji = event.currentTarget.dataset.reactionEmoji;
+    if (emoji) handleQuickReactionClick(emoji);
+  }, [handleQuickReactionClick]);
+  const handleMobileReactionAddClick = useCallback((event: MouseEvent<HTMLButtonElement>) => {
+    event.stopPropagation();
+    setCtxMenu(null);
+    if (reactionPicker) {
+      closeReactionPicker();
+    } else {
+      openReactionPicker(event.currentTarget);
+    }
+  }, [closeReactionPicker, openReactionPicker, reactionPicker]);
 
   useEffect(() => {
     const handlePeerPickerOpen = (event: Event) => {
@@ -3861,27 +3536,28 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
     const handlePointerDown = (event: PointerEvent) => {
       const target = event.target as HTMLElement | null;
       if (target?.closest("[data-message-affordance='reaction'], [data-message-affordance='reaction-picker']")) return;
+      // Right after a double tap opened the bar, only a finger closes it.
+      if (event.pointerType !== "touch" && Date.now() - reactionPickerTapOpenedAtRef.current < REACTION_PICKER_TAP_SHIELD_MS) return;
+      // A finger outside the bar only closes it: no tap on the message, link
+      // or composer under it. A mouse press keeps its own action.
+      consumeDismissingTouch(event);
       closeReactionPicker();
-    };
-    const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") closeReactionPicker();
     };
     const handleViewportChange = () => {
       closeReactionPicker();
     };
 
     document.addEventListener("pointerdown", handlePointerDown, true);
-    // keydown-global-exempt: capture-phase reaction-picker escape, runs before background so focus-on-open not needed
-    document.addEventListener("keydown", handleKeyDown, true);
     window.addEventListener("scroll", handleViewportChange, true);
     window.addEventListener("resize", handleViewportChange);
     return () => {
       document.removeEventListener("pointerdown", handlePointerDown, true);
-      document.removeEventListener("keydown", handleKeyDown, true);
       window.removeEventListener("scroll", handleViewportChange, true);
       window.removeEventListener("resize", handleViewportChange);
     };
   }, [closeReactionPicker, reactionPicker]);
+  // Esc closes the reaction bar: a capture-phase layer, before the background hears it.
+  useShortcutLayer("menu", !!reactionPicker, { phase: "capture", ignoreDefaultPrevented: true, onEscape: () => { closeReactionPicker(); } });
 
   useEffect(() => () => clearReactionPickerCloseTimer(), [clearReactionPickerCloseTimer]);
 
@@ -3891,43 +3567,35 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
 
   const handleReactionPickerBoundaryLeave = useCallback((event: MouseEvent) => {
     if (!reactionPicker) return;
+    // A double tap opened the bar: no mouse hovered it open, so no mouse
+    // leaving closes it. The mouse events the browser derives from the taps,
+    // or its fake mouse move after the layout changes, would otherwise close
+    // it 120ms later with no further input. A press outside, a scroll or
+    // Escape still does.
+    if (Number.isFinite(reactionPickerTapOpenedAtRef.current)) return;
     if (isReactionPickerBoundaryTarget(event.relatedTarget)) return;
     scheduleReactionPickerClose();
   }, [isReactionPickerBoundaryTarget, reactionPicker, scheduleReactionPickerClose]);
 
-  const showReactionPopover = useCallback((
-    reaction: NonNullable<Message["reactions"]>[number],
-    target: HTMLElement,
-  ) => {
-    const rect = target.getBoundingClientRect();
+  // The reactors tooltip: you first (when you reacted), then up to five
+  // names, then "+N more" for the rest of the count.
+  const reactionReactorNames = (reaction: NonNullable<Message["reactions"]>[number]) => {
     const actors = readReactionActors(reaction);
-    const currentViewerReacted = hasCurrentUserReaction(reaction.emoji);
-    const reactorNames = currentViewerReacted && viewerUserId
+    const reactorNames = hasCurrentUserReaction(reaction.emoji) && viewerUserId
       ? [
-        formatMessageRef.current({ id: "message.messageItem.reactorYou" }),
+        formatMessage({ id: "message.messageItem.reactorYou" }),
         ...actors.filter((actor) => actor.id !== viewerUserId).map((actor) => actor.displayName),
       ]
       : actors.map((actor) => actor.displayName);
     const visibleNames = reactorNames.slice(0, 5);
-    const hiddenCount = Math.max(0, reaction.count - visibleNames.length);
-
-    setReactionPopover({
-      emoji: reaction.emoji,
-      visibleNames,
-      hiddenCount,
-      x: rect.left,
-      y: rect.bottom + 4,
-    });
-  }, [hasCurrentUserReaction, readReactionActors, viewerUserId]);
-
-  const hideReactionPopover = useCallback(() => {
-    setReactionPopover(null);
-  }, []);
+    return { visibleNames, hiddenCount: Math.max(0, reaction.count - visibleNames.length) };
+  };
 
   const handleCopyLink = useCallback(() => {
     if (!serverSlug) return;
+    trackFromMenu("copy_link");
     const channelForLink = parentChannelId || message.channelId;
-    const routeKind = navigableChannels.find((channel) => channel.id === channelForLink)?.type === "dm" ? "dm" : "channel";
+    const routeKind = findNavigableChannel(channelForLink)?.type === "dm" ? "dm" : "channel";
     const url = buildMessagePermalink(serverSlug, channelForLink, message.id, {
       routeKind,
       threadParentMessageId: parentMessageId ?? null,
@@ -3935,67 +3603,9 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
     navigator.clipboard.writeText(url).then(() => {
       setCtxMenu(null);
     });
-  }, [serverSlug, parentChannelId, parentMessageId, message.channelId, message.id, navigableChannels]);
+  }, [trackFromMenu, serverSlug, parentChannelId, parentMessageId, message.channelId, message.id, findNavigableChannel]);
 
-  const handleOpenPermalink = useCallback(async (href: string) => {
-    let permalink = parseRaftPermalink(href, currentHostname);
-    if (!permalink) {
-      window.open(href, "_blank", "noopener,noreferrer");
-      return;
-    }
-
-    if (serverSlug && permalink.serverSlug !== serverSlug && permalink.routeKind === "channel") {
-      const { serverEpoch, current } = useServerStore.getState();
-      try {
-        const { data } = await api.get<{
-          channelId: string;
-          targetMessageId: string;
-          canonicalTarget?: { kind: string; channelId: string; threadParentMessageId: string };
-        }>(`/messages/context/${encodeURIComponent(permalink.messageId)}`, {
-          params: { channelId: permalink.channelId },
-          headers: { "X-Server-Id": current?.id },
-        });
-        if (useServerStore.getState().serverEpoch !== serverEpoch) return;
-        // The context endpoint authorizes the local projection and returns its
-        // canonical navigation target, including reply-to-thread projection.
-        const target = data.canonicalTarget;
-        permalink = {
-          ...permalink,
-          serverSlug,
-          channelId: target?.kind === "thread" ? target.channelId : data.channelId,
-          messageId: data.targetMessageId ?? permalink.messageId,
-          threadParentMessageId: target?.kind === "thread" ? target.threadParentMessageId : permalink.threadParentMessageId,
-        };
-      } catch (error) {
-        if (useServerStore.getState().serverEpoch !== serverEpoch) return;
-        const status = (error as { response?: { status?: number } }).response?.status;
-        if (status !== 404) {
-          toast.error(formatMessageRef.current({ id: "message.messageItem.linkResolutionUnavailable" }));
-          return;
-        }
-        // No readable local projection exists. An unrelated workspace link
-        // keeps its original destination, whose own access checks still apply.
-      }
-    }
-
-    if (serverSlug && permalink.serverSlug === serverSlug) {
-      if (permalink.threadParentMessageId) {
-        nav.toThreadMessage(
-          permalink.channelId,
-          permalink.threadParentMessageId,
-          permalink.messageId,
-          permalink.routeKind,
-        );
-      } else if (permalink.routeKind === "dm") {
-        nav.toDmMessage(permalink.channelId, permalink.messageId);
-      } else {
-        nav.toMessage(permalink.channelId, permalink.messageId);
-      }
-      return;
-    }
-
-    window.open(href, "_blank", "noopener,noreferrer");
-  }, [currentHostname, nav, serverSlug]);
+  const handleOpenPermalink = useOpenRaftPermalink();
 
   const handleOpenQuotedPermalink = useCallback((permalink: ReturnType<typeof parseRaftPermalink>) => {
     if (!permalink) return;
@@ -4023,24 +3633,17 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
     }
   }, [nav, openThread, requestTransientFocus]);
 
-  const handleOpenTaskRef = useCallback(async (taskNumber: number) => {
-    const taskContextChannelId = parentChannelId || message.channelId;
-    try {
-      const { data } = await api.get(`/tasks/channel/${taskContextChannelId}/number/${taskNumber}`);
-      const task = (data as { task: Task }).task;
-      closeProfile();
-      if (task.isLegacy) {
-        closeThread();
-        nav.toChannel(task.channelId, { chatTab: "tasks" });
-        openLegacyTask(task);
-        return;
-      }
-      // Stryker disable next-line ObjectLiteral: typed thread payload shape is covered by openThread payload/source contracts.
-      void openThread({ parentChannelId: task.channelId, parentMessageId: task.messageId, intent: "task" });
-    } catch (err) {
-      console.error(`Failed to resolve task #${taskNumber}:`, err);
-    }
-  }, [closeProfile, closeThread, message.channelId, nav, openLegacyTask, openThread, parentChannelId]);
+  // `channelId` is the channel the ref resolved in (`#proj:#7` → #proj);
+  // legacy refs resolve in the conversation being read.
+  const handleOpenTaskRef = useCallback((taskNumber: number, channelId?: string) => openTaskByChannelNumber({
+    closeProfile,
+    closeThread,
+    toChannelTasks: (taskChannelId) => nav.toChannel(taskChannelId, { chatTab: "tasks" }),
+    openLegacyTask,
+    openThread,
+    openTaskConversation: openTaskConversationDialog,
+    taskV2Enabled: taskV2,
+  }, channelId ?? taskContextChannelId, taskNumber), [closeProfile, closeThread, nav, openLegacyTask, openThread, taskContextChannelId, taskV2]);
 
   const handleDownloadAttachment = useCallback(async (attachment: NonNullable<Message["attachments"]>[number]) => {
     try {
@@ -4070,7 +3673,7 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
     });
   }, [message.id, message.channelId, message.senderId, message.senderType]);
 
-  // Stryker disable all: audio open/loading/fallback behavior is covered by audioAttachmentPreview.behavior.test.tsx; remaining handler mutants are stale-concurrent/dependency glue.
+  // Stryker disable all: audio open/loading/fallback behavior is covered by audioAttachmentPreview.behavior.test.tsx (removed in the 2026-11 web DOM test prune); remaining handler mutants are stale-concurrent/dependency glue.
   const handleOpenAudioPreview = useCallback(async (attachment: NonNullable<Message["attachments"]>[number]) => {
     await openMediaPreview("audio", attachment, {
       commentContext: { parentMessage: { id: message.id, channelId: message.channelId, senderId: message.senderId, senderType: message.senderType } },
@@ -4151,36 +3754,101 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
   const reactionPickerPopupStyle = useMemo(() => reactionPicker
     ? { left: reactionPicker.x, top: reactionPicker.y }
     : undefined, [reactionPicker]);
-  const reactionPopoverPopupStyle = useMemo(() => reactionPopover
-    ? { left: reactionPopover.x, top: reactionPopover.y }
-    : undefined, [reactionPopover]);
   const ctxMenuPopupStyle = useMemo(() => ctxMenu
-    ? { left: ctxMenu.x, top: ctxMenu.y, maxHeight: "calc(100dvh - 16px)", overflowY: "auto" as const }
+    ? { left: ctxMenu.x, top: ctxMenu.y, maxHeight: "calc(100dvh - 16px)" }
     : undefined, [ctxMenu]);
   const senderCtxMenuPopupStyle = useMemo(() => senderCtxMenu
     ? { left: senderCtxMenu.x, top: senderCtxMenu.y }
     : undefined, [senderCtxMenu]);
+  // View Context: the context behind an agent's message, beside its conversation (a phone: a page).
+  const handleViewContextFromMenu = useCallback(() => {
+    setCtxMenu(null);
+    openAgentContextViewFor({
+      agentId: message.senderId,
+      messageId: message.id,
+      agentName: senderDisplayName,
+      agentAvatarUrl: agentAvatarUrl ?? null,
+      content: message.content,
+      createdAt: message.createdAt,
+      conversationId: message.channelId,
+      hostChannelId: parentChannelId || message.channelId,
+    });
+  }, [agentAvatarUrl, message.channelId, message.content, message.createdAt, message.id, message.senderId, parentChannelId, senderDisplayName]);
   const handleSaveFromMenu = useCallback(() => {
+    trackFromMenu(isSaved ? "unsave" : "save");
     handleToggleSave();
     setCtxMenu(null);
-  }, [handleToggleSave]);
+  }, [handleToggleSave, isSaved, trackFromMenu]);
+  // In a thread panel: the thread's own Mark as Unread (its header ⋯'s; the
+  // whole thread, as the server marks it). In a channel's or DM's list: the
+  // conversation's, and the message's own thread's when it is followed.
+  const enclosingThreadMarkUnread = useEnclosingThreadMarkUnread();
+  const menuMarkUnread = useMessageMenuMarkUnread({
+    conversationId: dmSurfaceChannelId,
+    topLevel: !readOnlyProjection && !parentMessageId,
+    followedThreadChannelId,
+    threadOpen: isOpenThreadParent,
+  });
+  const markThreadUnread = enclosingThreadMarkUnread ?? menuMarkUnread.markThreadUnread;
+  const { markConversationUnread } = menuMarkUnread;
+  const handleMarkConversationUnreadFromMenu = useCallback(() => {
+    markConversationUnread?.();
+    setCtxMenu(null);
+  }, [markConversationUnread]);
+  // Context-menu "keep going" section: Reply / Follow Thread / Mark Thread
+  // as Unread / task action (cindyz, #wg-thread-unread: the thread's own
+  // actions sit with Reply). Its divider renders only when one of them does.
+  const showThreadTaskSection = !hideThreadActions
+    || showOwnThreadFollowAction
+    || !!enclosingThreadFollowCommand
+    || !!markThreadUnread
+    || (!parentMessageId && supportsMessageTasks && !isExternal);
+  const handleMarkThreadUnreadFromMenu = useCallback(() => {
+    markThreadUnread?.();
+    setCtxMenu(null);
+  }, [markThreadUnread]);
+  const handleEnclosingThreadFollowFromMenu = useCallback(() => {
+    if (!enclosingThreadFollowCommand) return;
+    trackFromMenu(enclosingThreadFollowCommand.followed ? "unfollow_thread" : "follow_thread");
+    enclosingThreadFollowCommand.onFollowAction();
+    setCtxMenu(null);
+  }, [enclosingThreadFollowCommand, trackFromMenu]);
   const handleCopySenderDisplayName = useCallback(() => {
+    trackMessageAction("copy_sender_name", "sender_menu", inThread);
     void navigator.clipboard.writeText(senderDisplayName);
     setSenderCtxMenu(null);
-  }, [senderDisplayName]);
+  }, [inThread, senderDisplayName]);
   const handleCopySenderHandle = useCallback(() => {
     if (!senderHandleText) return;
+    trackMessageAction("copy_sender_handle", "sender_menu", inThread);
     void navigator.clipboard.writeText(senderHandleText);
     setSenderCtxMenu(null);
-  }, [senderHandleText]);
+  }, [inThread, senderHandleText]);
   const handleCopyMarkdown = useCallback(() => {
+    trackFromMenu("copy_markdown");
     void navigator.clipboard.writeText(message.content).then(() => setCtxMenu(null));
-  }, [message.content]);
+  }, [message.content, trackFromMenu]);
+  // "Select Text" (touch menu only): a bottom sheet with the message's text,
+  // natively selectable, since the touch row itself is not (index.css
+  // [data-touch-menu]). Mounted from the tap until its close animation ends.
+  const [selectTextSheet, setSelectTextSheet] = useState<"closed" | "open" | "closing">("closed");
+  const canSelectText = !isSystem && message.content.trim().length > 0;
+  const handleOpenSelectText = useCallback(() => {
+    trackFromMenu("select_text");
+    setCtxMenu(null);
+    setSelectTextSheet("open");
+  }, [trackFromMenu]);
+  const handleCloseSelectText = useCallback(() => setSelectTextSheet("closing"), []);
+  const handleSelectTextClosed = useCallback(() => setSelectTextSheet("closed"), []);
   // "Select Message" (image-share) — the three entry modes (channel timeline,
   // thread reply row, thread parent in ThreadPanel) select only what is
   // mounted; the contract stays "what you see is what you share".
   const handleSelectShare = useCallback(() => {
+    trackFromMenu("select");
     setCtxMenu(null);
+    // A text selection left in the conversation would read as selected
+    // messages once the rows are selection targets.
+    window.getSelection()?.removeAllRanges();
     if (parentMessageId) {
       // Thread reply row → thread mode, clicked reply only.
       const threadCh = message.channelId; // replies live in the thread channel
@@ -4199,11 +3867,22 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
     // Channel timeline: just this message. To share a thread the user opens
     // the panel and triggers select from there.
     enterSelection(message.channelId, [message.id]);
-  }, [parentMessageId, parentChannelId, message.channelId, message.threadId, message.id, hideThreadActions, enterThreadSelection, enterSelection]);
+  }, [trackFromMenu, parentMessageId, parentChannelId, message.channelId, message.threadId, message.id, hideThreadActions, enterThreadSelection, enterSelection]);
+  // The message menu is for outside select mode: one open when select mode
+  // starts or ends here closes.
+  const ctxMenuSelectionScopeRef = useRef(selectionScopedHere);
+  useEffect(() => {
+    if (ctxMenuSelectionScopeRef.current === selectionScopedHere) return;
+    ctxMenuSelectionScopeRef.current = selectionScopedHere;
+    setCtxMenu(null);
+  }, [selectionScopedHere]);
 
   useEffect(() => {
     if (!ctxMenu) return;
-    const handleViewportChange = () => handleCloseCtx();
+    const handleViewportChange = (event: Event) => {
+      if (event.target instanceof Node && ctxMenuRef.current?.contains(event.target)) return; // its own ScrollArea scrolled
+      handleCloseCtx();
+    };
     window.addEventListener("scroll", handleViewportChange, true);
     window.addEventListener("resize", handleViewportChange);
     return () => {
@@ -4220,6 +3899,34 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
     });
   }, []);
 
+  const ctxMenuOpen = Boolean(ctxMenu);
+  useEffect(() => {
+    if (!ctxMenuOpen) return;
+    if (ctxMenuReturnFocusRef.current) {
+      ctxMenuRef.current?.querySelector<HTMLElement>("[role='menuitem']:not([disabled])")?.focus();
+    }
+  }, [ctxMenuOpen]);
+  // The message context menu is a layer while open: Esc closes it (focus back to where it was opened from), and its
+  // other keys move through its items.
+  useShortcutLayer("menu", ctxMenuOpen, { ignoreDefaultPrevented: true, onEscape: () => {
+    const returnFocus = ctxMenuReturnFocusRef.current;
+    ctxMenuReturnFocusRef.current = null;
+    handleCloseCtx();
+    returnFocus?.focus();
+  }, onKey: (event) => {
+      // Arrow keys, Home and End move through the menu's items, the quick
+      // reactions included, as in raft-ui's ContextMenu (raft-design
+      // dropdown-menu.md, Accessibility): Up and Down go row by row, Left and
+      // Right along the reactions. The first arrow key focuses the first item.
+      const menu = ctxMenuRef.current;
+      if (!menu) return;
+      const nav = nextMessageMenuItem(menu, document.activeElement, event.key);
+      if (!nav) return;
+      event.preventDefault();
+      nav.focus();
+      return true;
+  } });
+
   useFloatingOverlayPosition({
     open: Boolean(ctxMenu),
     anchor: ctxMenu ? { x: ctxMenu.anchorX, y: ctxMenu.anchorY } : null,
@@ -4231,14 +3938,56 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
   // Title content is summarized server-side; clamp to a single line as a
   // defense-in-depth so any unexpectedly long body still renders on one line.
   if (isSystem) {
-    const systemContentParts = splitReminderReceiptFireAtTokens(message.content);
-    const systemContentTitle = formatReminderReceiptContentTitle(message.content, timeFormatOptions);
-    return (
-      <SystemMessage id={`message-${message.id}`}>
+    // A system line has no body to end: its read faces sit beside it.
+    const withAgentReadFaces = (row: ReactNode) => (
+      agentReadFaces ? <AgentReadSystemRow messageId={message.id}>{row}</AgentReadSystemRow> : row
+    );
+    // RFC 077: Raft's receipt for a message the assistant sent as its owner
+    // is a card with the place, the message and Retract, not an event line;
+    // so is the WeChat connected notice, with Disconnect WeChat.
+    const delegatedReceipts = delegatedReceiptsOf(message.actionMetadata);
+    const wechatNotice = isWeChatConnectedNotice(message);
+    // A task handed to someone with a reason is a card with the reason as its
+    // body, not the one-line notice (the line's text stays the record).
+    const taskHandoff = readTaskHandoffNotice(message);
+    if (taskHandoff) {
+      return withAgentReadFaces(
+        <MessageItem id={`message-${message.id}`} compact>
+          <MessageItemGutter />
+          <MessageItemContent>
+            <TaskHandoffCard message={message} notice={taskHandoff} returned={taskHandoffReturn} time={time} />
+          </MessageItemContent>
+          <TimelineRevealTime dateTime={sentAtIso}>{gutterClock}</TimelineRevealTime>
+        </MessageItem>
+      );
+    }
+    if (wechatNotice || delegatedReceipts.length > 0 || joinedNotForwardedOf(message.actionMetadata).length > 0) {
+      // Its own row, its left edge on the text column like the messages
+      // around it (DS Identity and presence › Sent by an assistant).
+      return withAgentReadFaces(
+        <MessageItem id={`message-${message.id}`} compact>
+          <MessageItemGutter />
+          <MessageItemContent>
+            {wechatNotice
+              ? <WeChatConnectedNotice message={message} time={time} />
+              : <DelegatedReceiptLines message={message} receipts={delegatedReceipts} time={time} />}
+          </MessageItemContent>
+          <TimelineRevealTime dateTime={sentAtIso}>{gutterClock}</TimelineRevealTime>
+        </MessageItem>
+      );
+    }
+    // A channel announcement's set, replace or remove line, in the reader's language (its text is the English record).
+    const systemText = channelAnnouncementNoticeLine(message.actionMetadata, formatMessage) ?? message.content;
+    const systemContentParts = splitReminderReceiptFireAtTokens(systemText);
+    const systemContentTitle = formatReminderReceiptContentTitle(systemText, timeFormatOptions);
+    return withAgentReadFaces(
+      <SystemMessage id={`message-${message.id}`} className="pe-[calc((--spacing(4))+var(--message-rail-inset,0px))]">
         <SystemMessageTime>{time}</SystemMessageTime>
-        <SystemMessageContent>
+        {/* One line, truncated; the whole text is the line's native title (DS
+            System message), beside the hover-only Tooltip. */}
+        <SystemMessageContent title={systemContentTitle}>
           <Tooltip content={systemContentTitle}>
-          <span>
+          <span className="block truncate">
           {systemContentParts.map((part, index) => (
             part.type === "reminderFireAt" ? (
               <Tooltip key={`${part.value}-${index}`} content={formatReminderReceiptTooltip(part.value, timeFormatOptions)}>
@@ -4262,28 +4011,49 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
     <MessageItem
       ref={messageRef}
       id={`message-${message.id}`}
-      onClick={readOnlyProjection ? undefined : handleMobileTap}
-      onContextMenu={readOnlyProjection ? undefined : handleContextMenu}
-      onTouchStart={readOnlyProjection ? undefined : handleTouchStart}
-      onTouchEnd={readOnlyProjection ? undefined : handleTouchEnd}
-      onTouchMove={readOnlyProjection ? undefined : handleTouchMove}
+      onClick={actionable ? handleMobileTap : undefined}
+      onClickCapture={actionable && selectionScopedHere ? handleSelectClickCapture : undefined}
+      onMouseDown={actionable && selectionScopedHere ? handleSelectMouseDown : undefined}
+      onAuxClickCapture={actionable && selectionScopedHere ? handleSelectAuxClickCapture : undefined}
+      onContextMenu={actionable ? handleContextMenu : undefined}
+      onTouchStart={actionable ? handleTouchStart : undefined}
+      onTouchEnd={actionable ? handleTouchEnd : undefined}
+      onTouchMove={actionable ? handleTouchMove : undefined}
+      onTouchCancel={actionable ? handleTouchMove : undefined}
+      onPointerDown={actionable ? handleRowPointerDown : undefined}
+      onPointerMove={actionable ? touchTaps.handlers.onPointerMove : undefined}
+      onPointerUp={actionable ? touchTaps.handlers.onPointerUp : undefined}
+      onPointerCancel={actionable ? touchTaps.handlers.onPointerCancel : undefined}
+      // index.css: on touch, a long-press here opens the message menu, so the
+      // row's text is not selectable. Read-only rows have no menu and keep it.
+      data-touch-menu={actionable ? "true" : undefined}
       onMouseEnter={handleReactionPickerBoundaryEnter}
       onMouseLeave={handleReactionPickerBoundaryLeave}
+      {...(actionable ? quickReactionRowHandlers : null)}
       compact={!showSelectedGroupedHeader}
       data-popup-open={ctxMenu || reactionPicker ? "" : undefined}
+      data-tap-pending={touchTaps.pressed ? "" : undefined}
       data-selected={isSelectedAsThreadParent || isSelected ? "true" : undefined}
       data-selection-active={selectionScopedHere ? "true" : undefined}
       data-highlighted={isHighlighted ? "true" : undefined}
       data-followed-by={followedBy}
-      data-follows-system={followsSystem ? "true" : undefined}
-      // The message you jumped to is the DS cyan-soft wash; an open menu or
-      // picker needs nothing here: rui's data-popup-open state tints the row
-      // the same way hover does (task #694).
-      className={`${isHighlighted
- ? "bg-info-soft hover:bg-info-soft"
- : ""} ${messageBodyFontSize === "lg" ? "[--mi-avatar:2.125rem]" : ""} ${className ?? ""}`.trim()}
+      // raft-ui paints and fades the located highlight. The current thread
+      // search match is painted through the row's own fill variable, the one
+      // raft-ui's search match sets, so it is one fill (and the delegated
+      // face's ring matches it), and it doesn't change on hover. An open menu
+      // or picker needs nothing here: rui's data-popup-open state tints the
+      // row the same way hover does (task #694). A tap waiting for a possible
+      // second one shows the press at once: raft-ui's row has no press, so it
+      // is painted here, in the medium tier (raft-design states.md, Hover and
+      // press).
+      located={isLocated}
+      className={`${isThreadSearchMatch
+ ? "[--mi-row-fill:var(--info-soft)] hover:[--mi-row-fill:var(--info-soft)]"
+ : ""} ${touchTaps.pressed
+ ? "[--mi-row-fill:var(--fill-medium)]"
+ : ""} ${getMessageAvatarSizeClass(messageBodyFontSize)} pe-[calc((--spacing(2))+var(--message-rail-inset,0px))] ${className ?? ""}`.trim()}
     >
-      {selectionScopedHere && (
+      {selectionScopedHere && actionable && (
         <MessageMultiSelectCheckbox
           // v1.5 (huxijin 2026-05-01): was `self-center`, which dropped the
           // circle into the vertical middle of the row. On long messages
@@ -4300,15 +4070,24 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
       )}
       {/* Hover action toolbar — the "骑线按钮组" pill. Extracted into its own
           component (stdrc). */}
-      {!readOnlyProjection ? <MessageHoverToolbar
+      {/* Not in select mode: the row is a selection target there, and the
+          actions on the selection live in its bottom toolbar. */}
+      {actionable && !selectionScopedHere ? <MessageHoverToolbar
         isSaved={isSaved}
         reactionActive={!!reactionPicker}
+        quickReaction={quickReaction}
+        quickReacted={hasCurrentUserReaction(quickReaction)}
         hideThreadActions={hideThreadActions}
         isSystem={isSystem}
         canReact={canReact}
-        onReplyInThread={handleReplyInThread}
+        onReplyInThread={handleToolbarReplyInThread}
         onReactionClick={handleReactionClick}
-        onToggleSave={handleToggleSave}
+        onQuickReact={handleToolbarQuickReact}
+        onReactionHoverOpen={handleToolbarReactionHoverOpen}
+        onToggleSave={handleToolbarToggleSave}
+        onForward={canForwardThisMessage ? handleForward : undefined}
+        onMore={canOpenMenuFromToolbar ? handleOpenMenuFromToolbar : undefined}
+        moreActive={!!ctxMenu?.fromToolbar}
       /> : null}
       {showSelectedGroupedHeader ? (
         <MessageItemGutter>
@@ -4320,14 +4099,13 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
               the recipe; the override stays harmless.) */}
           <MessageItemAvatarSlot className="flex items-start">
             <MessageSenderAvatar
-          showAgent={isAgent && (!!senderAgent || !!readOnlySender)}
+          showAgent={isAgent && (!!senderAgent || !!readOnlySender || !!senderActor)}
           showExternal={isExternal}
+          externalAnonymous={message.externalAuthor?.identityKind === "anonymous"}
           isDeactivatedAgent={isDeactivatedAgent}
           senderId={message.senderId}
           agentAvatarUrl={agentAvatarUrl}
           avatarUrl={humanAvatarUrl}
-          gravatarHash={senderMember?.gravatarHash}
-          email={senderEmailForAvatar}
           hoverAgent={readOnlyProjection ? undefined : senderAgent}
           hoverMember={readOnlyProjection ? undefined : senderMember}
           readOnlySender={readOnlyProjection ? readOnlySender : undefined}
@@ -4336,6 +4114,9 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
           externalProvider={isExternal ? message.externalAuthor?.provider ?? null : null}
           externalWorkspaceName={isExternal ? message.externalAuthor?.workspaceName ?? null : null}
           externalActorKind={isExternal ? message.externalAuthor?.actorKind ?? null : null}
+          externalProfileDisplayName={isExternal ? message.externalAuthor?.profileDisplayName : undefined}
+          externalProfileAvatarUrl={isExternal ? message.externalAuthor?.profileAvatarUrl : undefined}
+          externalAppName={isExternal ? message.externalAuthor?.appName : undefined}
           testId={senderAvatarTestId}
           onNavigateAgent={readOnlyProjection ? ignoreReadOnlyProjectionNavigation : handleNavigateAgent}
           onNavigateAgentActivity={readOnlyProjection ? ignoreReadOnlyProjectionNavigation : handleNavigateAgentActivity}
@@ -4343,6 +4124,8 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
           onNavigateExternal={readOnlyProjection ? ignoreReadOnlyProjectionNavigation : handleNavigateExternal}
           onContextMenu={readOnlyProjection ? undefined : handleSenderContextMenu}
           onLongPressMention={!readOnlyProjection && senderMention ? insertSenderMention : undefined}
+          delegatedBy={delegatedBy}
+          origin={senderOrigin}
             />
           </MessageItemAvatarSlot>
         </MessageItemGutter>
@@ -4354,6 +4137,8 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
         <MessageItemGutter>
           <Tooltip content={gutterFullTimestamp}>
           <MessageItemContinuationTime
+            dateTime={sentAtIso}
+            data-gutter-time=""
             // No transition — the time reveals instantly on hover, like the row
             // border (stdrc: 时间不要动画呈现，跟边框一样立即出现). The DS
             // treatment (Space Mono 12, ink-3 on row hover) is the recipe's.
@@ -4366,10 +4151,11 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
       <MessageItemContent>
         {groupState?.showName === false && !showSelectedGroupedHeader ? null : (
           <MessageItemHeader>
-          {/* The font-preference size classes carry no line-height and would
-              displace the recipe's own leading in the merge, so each header
-              text re-asserts its DS leading right after the size (name 20,
-              role/model/time 16). */}
+          {/* The name, notes and time stand on the name's baseline
+              (raft-design alignment.md, "Text of different sizes on one
+              line"): raft-ui's MessageItemHeader and MessageItemSenderGroup
+              align that way. The size classes carry each style's line
+              height from its tokens (appearanceStore). */}
           {/* Left cluster: name · [model · badges · description]. Space is
               given up in this order: description, then model, then name
               (Artea, task #743). The name never shrinks while the tail has
@@ -4379,11 +4165,11 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
               still shaves a sub-pixel off the name and shows "C…". The time
               and status stay OUTSIDE the cluster, so a narrow panel can never
               clip them. */}
-          <span className="flex min-w-0 items-center gap-1.5 overflow-hidden">
+          <MessageItemSenderGroup>
           {senderMention ? (
             <Tooltip content={formatMessage({ id: "message.messageItem.mentionSender" }, { name: senderMention.name })}>
             <MessageItemSenderButton
-              className={`max-w-full shrink-0 ${messageNameSizeClass} leading-5`}
+              className={`max-w-full shrink-0 ${messageNameSizeClass}`}
               onClick={handleSenderNameMention}
               onContextMenu={readOnlyProjection ? undefined : handleSenderContextMenu}
               data-testid={`message-sender-mention-${message.id}`}
@@ -4393,18 +4179,28 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
             </Tooltip>
           ) : (
             <MessageItemSender
-              className={`max-w-full shrink-0 ${messageNameSizeClass} leading-5`}
+              className={`${isExternal && message.externalAuthor?.actorKind === "bot" ? "max-w-[45%] min-w-0 shrink" : "max-w-full shrink-0"} ${messageNameSizeClass}`}
               onContextMenu={readOnlyProjection ? undefined : handleSenderContextMenu}
             >
               {senderDisplayName}
             </MessageItemSender>
           )}
-          <span data-testid={`message-sender-tail-${message.id}`} className="flex min-w-0 items-center gap-1.5 overflow-hidden">
+          {/* Member labels (#wg-rbac:#46): the avatar's server tile is
+              decoration; where the sender is from is read here, after the name. */}
+          {senderOrigin.servers.length > 0 ? (
+            <span className="sr-only" data-testid={`message-sender-origin-${message.id}`}>
+              {formatMessage({ id: "message.profilePreview.fromServers" }, { servers: originServerNames(senderOrigin) })}
+            </span>
+          ) : null}
+          <span data-testid={`message-sender-tail-${message.id}`} className="flex min-w-0 items-baseline gap-1.5 overflow-hidden">
+          {(isAppBotSender || (!readOnlyProjection && isExternal && message.externalAuthor?.actorKind === "bot")) && (
+            <AppBadge truncateLabel={isExternal} className={isExternal ? "max-w-24 sm:max-w-52 min-w-12 shrink overflow-hidden" : "shrink-0"} appName={isAppBotSender ? senderAgent?.managedByApp?.name : message.externalAuthor?.appName} botName={senderDisplayName} />
+          )}
           {agentModelLabelText && (
             <Tooltip content={agentModelLabelText}>
             <MessageItemMeta
               render={<span />}
-              className={`min-w-0 max-w-full shrink-0 truncate ${messageMetaSizeClass} leading-4`}
+              className={`min-w-0 max-w-full shrink-0 truncate ${messageMetaSizeClass}`}
               data-testid={`message-sender-model-${message.id}`}
             >
               {agentModelLabelText}
@@ -4412,28 +4208,48 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
             </Tooltip>
           )}
           {isDeactivatedAgent && (
-            <span className="inline-flex h-5 shrink-0 items-center whitespace-nowrap rounded-chip bg-fill-muted px-1.5 text-caption font-semibold text-foreground-muted">
+            <Badge appearance="soft" variant="muted">
               {formatMessage({ id: "message.messageItem.deletedBadge" })}
-            </span>
+            </Badge>
           )}
           {humanDepartureLabel && (
-            <span className="inline-flex h-5 shrink-0 items-center whitespace-nowrap rounded-chip bg-fill-muted px-1.5 text-caption font-semibold text-foreground-muted">
+            <Badge appearance="soft" variant="muted">
               {humanDepartureLabel}
-            </span>
+            </Badge>
           )}
           {senderSubtitle && (
             <Tooltip content={senderSubtitle}>
             <MessageItemMeta
               render={<span />}
-              className={`min-w-0 shrink truncate ${messageMetaSizeClass} leading-4`}
+              className={`min-w-0 ${(isExternal && message.externalAuthor?.actorKind === "bot") || senderDescriptionText ? "shrink-0" : "shrink"} truncate ${messageMetaSizeClass}`}
+              data-select-screenshot-human-role={senderSubtitleIsHumanRoleLabel ? "true" : undefined}
             >
               {senderSubtitle}
             </MessageItemMeta>
             </Tooltip>
           )}
+          {senderDescriptionText && (
+            <Tooltip content={senderDescriptionText}>
+            <MessageItemMeta
+              render={<span />}
+              className={`min-w-0 shrink truncate ${messageMetaSizeClass}`}
+              data-testid={`message-sender-description-${message.id}`}
+            >
+              {senderDescriptionText}
+            </MessageItemMeta>
+            </Tooltip>
+          )}
           </span>
-          </span>
-          <MessageItemTime render={<span />} className={`shrink-0 whitespace-nowrap ${messageMetaSizeClass} leading-4`}>{time}</MessageItemTime>
+          </MessageItemSenderGroup>
+          {delegatedBy ? <DelegatedByLabel delegatedBy={delegatedBy} messageId={message.id} /> : null}
+          {/* The time follows the sender cluster (task #115). The header keeps
+              no room for the hover toolbar (raft-ui 0.23): while the toolbar
+              shows, it may cover the end of a line long enough to reach the
+              corner, which fades out under it; hovering never reflows the
+              line. Its tooltip carries the full date and time. */}
+          <Tooltip content={gutterFullTimestamp}>
+          <MessageItemTime dateTime={sentAtIso} className={messageTimeSizeClass}>{time}</MessageItemTime>
+          </Tooltip>
           {converting && (
             <MessageItemInlineStatus render={<span />}>
               {formatMessage({ id: "message.messageItem.converting" })}
@@ -4443,27 +4259,36 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
         )}
         <AttachmentCommentRefChip
           commentRef={message.commentRef}
-          commentsEnabled={commentsEnabled}
           onJumpToHost={handleJumpToCommentHost}
           bodyFontSizeClass={messageBodyFontSizeClass}
         />
+        <MessageLinkCardsProvider value={linkCards.links} blocks={linkCards.blocks} blocksIn={showBilingualOriginal ? message.content : visibleMessageContent}>
         <CollapsibleMessageContent
           key={message.id}
           messageId={message.id}
           measurementKey={message.randomId ?? message.id}
           measureBeforePaint={message.id.startsWith("optimistic-")}
-          disabled={isActionCardMessage || !!forwardedBundleMetadata || !collapseLongMessages}
+          disabled={isActionCardMessage || !!messageCard || !!forwardedBundleMetadata || !collapseLongMessages}
         >
         <MessageItemBody
           ref={messageBodyRef}
-          data-message-selectable="true"
+          data-message-selectable={retracted ? undefined : "true"}
           data-message-id={message.id}
           data-quote-channel-id={quoteComposerChannelId}
           data-message-font-size={messageBodyFontSize}
-          className={`${messageBodyFontSizeClass}${followedBy && !inlineReplySurfaceReplacesBadge ? " group-data-[followed-by]/message:mb-0 group-data-[followed-by]/message:[&>:last-child]:mb-0 group-data-[followed-by]/message:[&>:last-child>:last-child]:mb-0 group-data-[followed-by]/message:[&>:last-child>:last-child_li:last-child]:mb-0 group-data-[followed-by]/message:[&>:last-child>:last-child:has(pre)]:mb-px" : ""}`}
+          className={`${messageBodyFontSizeClass}${followedBy && !inlineReplySurfaceReplacesBadge ? ` ${FOLLOWED_BODY_ENDING}` : ""}`}
           style={messageBodyFontSizeStyle}
         >
           {(() => {
+            // RFC 077: a retracted message keeps its place; its body is the
+            // muted placeholder, like an unavailable quote, never body text.
+            if (retracted) {
+              return (
+                <span className="text-foreground-hint" data-testid={`message-retracted-${message.id}`}>
+                  {formatMessage({ id: "message.delegated.retracted" })}
+                </span>
+              );
+            }
             // Operation card (B-mode): the message body IS the card. Skip
             // markdown rendering and inline the structured card from
             // `actionMetadata`.
@@ -4473,15 +4298,18 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
                   messageId={message.id}
                   metadata={message.actionMetadata as ActionCardMetadata}
                   channelId={message.channelId}
+                  parentChannelId={parentChannelId || undefined}
                 />
               );
             }
+            if (messageCard) return <MessageCardBody read={messageCard} />;
             if (isTranslationPending) {
               return (
                 <Skeleton
                   variant="line"
                   className="inline-block w-44 max-w-full align-middle"
                   data-testid={`message-translation-placeholder-${message.id}`}
+                  data-select-screenshot-transient-state="true"
                 />
               );
             }
@@ -4503,7 +4331,6 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
                 onNavigateAgent={readOnlyProjection ? ignoreReadOnlyProjectionNavigation : handleNavigateAgent}
                 onNavigateHuman={readOnlyProjection ? ignoreReadOnlyProjectionNavigation : handleNavigateHuman}
                 onNavigateExternal={readOnlyProjection ? ignoreReadOnlyProjectionNavigation : handleNavigateExternalMention}
-                onNavigateComputer={readOnlyProjection ? ignoreReadOnlyProjectionNavigation : handleNavigateComputer}
                 onOpenThread={readOnlyProjection ? undefined : handleOpenThreadRef}
                 resolvingThreadRefKey={resolvingThreadRefKey}
                 onOpenTask={readOnlyProjection ? undefined : handleOpenTaskRef}
@@ -4512,14 +4339,23 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
                 serverSlug={serverSlug}
                 refAuthorityServerSlug={refAuthorityServerSlug}
                 threadRefAuthorityUnavailable={readOnlyProjection || threadRefAuthorityUnavailable}
-                knownTaskNumbers={knownTaskNumbers}
-                taskByNumber={taskByNumber}
+                taskContextChannelId={taskContextChannelId}
+                taskByChannelNumber={taskByChannelNumber}
                 timeFormatOptions={timeFormatOptions}
                 threadSearchHighlightQuery={threadSearchHighlightQuery}
+                searchHitQuery={searchHitQuery}
                 mentionsDisplayOnly={readOnlyProjection}
               />
             );
           })()}
+          {/* A continuation row has no header: the words end the text instead
+              (DS MessageItem › Sent by an assistant), without the face. */}
+          {delegatedBy && groupState?.showName === false && !showSelectedGroupedHeader ? (
+            <div data-testid={`message-delegated-continuation-${message.id}`}>
+              <DelegatedByLabel delegatedBy={delegatedBy} inBody messageId={message.id} />
+            </div>
+          ) : null}
+          {agentReadFaces ? <AgentReadFaces messageId={message.id} /> : null}
         </MessageItemBody>
         {showBilingualOriginal ? (
           <MessageItemTranslationOriginal
@@ -4550,7 +4386,6 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
                 onNavigateAgent={readOnlyProjection ? ignoreReadOnlyProjectionNavigation : handleNavigateAgent}
                 onNavigateHuman={readOnlyProjection ? ignoreReadOnlyProjectionNavigation : handleNavigateHuman}
                 onNavigateExternal={readOnlyProjection ? ignoreReadOnlyProjectionNavigation : handleNavigateExternalMention}
-                onNavigateComputer={readOnlyProjection ? ignoreReadOnlyProjectionNavigation : handleNavigateComputer}
                 onOpenThread={readOnlyProjection ? undefined : handleOpenThreadRef}
                 resolvingThreadRefKey={resolvingThreadRefKey}
                 onOpenTask={readOnlyProjection ? undefined : handleOpenTaskRef}
@@ -4559,10 +4394,11 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
                 serverSlug={serverSlug}
                 refAuthorityServerSlug={refAuthorityServerSlug}
                 threadRefAuthorityUnavailable={readOnlyProjection || threadRefAuthorityUnavailable}
-                knownTaskNumbers={knownTaskNumbers}
-                taskByNumber={taskByNumber}
+                taskContextChannelId={taskContextChannelId}
+                taskByChannelNumber={taskByChannelNumber}
                 timeFormatOptions={timeFormatOptions}
                 threadSearchHighlightQuery={threadSearchHighlightQuery}
+                searchHitQuery={searchHitQuery}
                 mentionsDisplayOnly={readOnlyProjection}
               />
             </div>
@@ -4578,8 +4414,14 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
             />
           </div>
         ) : null}
+        {!readOnlyProjection && !forwardedBundleMetadata && (
+          <LinkCardBoundary><ArtifactMessageRefs links={linkCards.objects} /></LinkCardBoundary>
+        )}
         {!readOnlyProjection && quotedPermalink && !quotedPermalinkUnavailable ? (
-          <div className="mt-1.5">
+          // The linked message as this viewer may see it (its conversation,
+          // author, words): never in a share image, in any state. The marker
+          // is on the box that carries the margin, so no gap is left either.
+          <div className="mt-1.5" data-select-screenshot-viewer-only="true">
             <QuotedMessagePermalinkPreview
               permalink={quotedPermalink.parsed}
               onOpen={handleOpenQuotedPermalink}
@@ -4588,15 +4430,23 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
           </div>
         ) : null}
         </CollapsibleMessageContent>
+        </MessageLinkCardsProvider>
         {/* Attached files */}
+        {message.attachments && message.attachments.length > 0 ? (
+          <ScreenshotAttachmentSummary attachments={message.attachments} />
+        ) : null}
         {readOnlyProjection && message.attachments && message.attachments.length > 0 ? (
-          <ReadOnlyMessageAttachments attachments={message.attachments} />
+          <div data-select-screenshot-attachment-content="true">
+            <ReadOnlyMessageAttachments attachments={message.attachments} />
+          </div>
         ) : null}
         {!readOnlyProjection && !forwardedBundleMetadata && message.attachments && message.attachments.length > 0 && (() => {
           return renderWithImageInlineFallback(imageFallbackKey, (imageFallbackUrls) => {
             // Stryker disable all: pre-existing attachment classification moved under the fallback seam.
             if (!message.attachments) return null;
-            const renderedImages = imagePreviewAttachments.filter((att) => !!getImageGalleryPreviewSrc(att, imageFallbackUrls));
+            const renderedImages = imagePreviewAttachments.filter((att) => (
+              !!getImageGalleryPreviewSrc(att, imageFallbackUrls)
+            ));
             const imageRows = buildMessageImageGalleryRows(renderedImages);
             const videoAttachments = message.attachments.filter((att) => isPreviewableVideoAttachment(att));
             const audioAttachments = message.attachments.filter((att) => isPreviewableAudioAttachment(att));
@@ -4607,7 +4457,7 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
             // Stryker restore all
 
           return (
-            <div className="mt-1 space-y-2">
+            <div className="mt-1 stack-y-2" data-select-screenshot-attachment-content="true">
               {/* Josh's ending matrix: image-terminated rows sit 1px short of
                   the rhythm; same one-pixel knife as the reply card (#9444). */}
               {imageRows.length > 0 && (
@@ -4639,7 +4489,7 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
                 </MessageImageGallery>
               )}
               {videoAttachments.length > 0 && (
-                <div className="space-y-2 group-data-[followed-by]/message:mb-px">
+                <div className="stack-y-2 group-data-[followed-by]/message:mb-px">
                   {videoAttachments.map((att) => {
                     const isOptimistic = isOptimisticAttachment(att);
                     return (
@@ -4655,7 +4505,7 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
                 </div>
               )}
               {audioAttachments.length > 0 && (
-                <div className="space-y-2">
+                <div className="stack-y-2">
                   {audioAttachments.map((att) => {
                     const isOptimistic = isOptimisticAttachment(att);
                     return (
@@ -4689,11 +4539,15 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
                         isHtmlLoading={isHtmlLoading}
                         onClick={handleOpenAttachmentCard}
                         onDownload={handleDownloadAttachment}
+                        messageId={message.id}
+                        conversationId={message.channelId}
                       />
                     );
                   })}
                 </MessageAttachmentGroup>
               )}
+              {/* Any attachment saved as an Artifact (images and video too, when the server says so): one line each, under them all. */}
+              <ArtifactSavedAttachments attachments={message.attachments} />
 	            </div>
 	          );
 	          });
@@ -4709,6 +4563,16 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
 	            />
 	          </div>
 	        ) : null}
+        {/* Many tasks per message (task v2): the list replaces the single footer chip,
+            and sits above the replies, which stay the message's own discussion. */}
+        {linkedTaskList ? <TaskChipList tasks={linkedTaskList} onOpenTask={openTaskFromList} /> : null}
+        {createFromMessageOpen ? (
+          <CreateTaskDialog
+            channelId={message.channelId}
+            onClose={closeCreateFromMessage}
+            sourceMessage={createFromMessageSource}
+          />
+        ) : null}
         {/* Footer metadata/actions — below translation status and the full message content block. */}
         {(
           // Stryker disable all: footer badge visibility/editability behavior is pre-existing; this PR only swaps Badge chrome to raft-ui.
@@ -4752,7 +4616,7 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
                 <button
                   type="button"
                   onClick={openLinkedTask}
-                  className="inline-flex min-w-0 max-w-full items-center overflow-hidden whitespace-nowrap"
+                  className={`inline-flex min-w-0 max-w-full items-center overflow-hidden whitespace-nowrap ${WRAPPED_CHIP_PRESS_CLASS}`}
                   aria-label={formatMessage({ id: "task.chip.openAria" }, { taskNumber: linkedTask.taskNumber, title: linkedTask.title })}
                   data-message-affordance="open-linked-task"
                 >
@@ -4776,7 +4640,7 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
                 aria-label={formatMessage({ id: "message.messageItem.removeFromSaved" })}
                 onClick={handleSavedIndicatorClick}
               >
-                <Bookmark size={10} fill="currentColor" className="shrink-0" />
+                <Bookmark size={10} className="shrink-0" />
                 <span className="shrink-0">{formatMessage({ id: "message.messageItem.saved" })}</span>
               </MessageItemSavedIndicator>
             ) : null}
@@ -4796,45 +4660,54 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
               const reactorSummary = summaryNames.length > 0
                 ? `${summaryNames.join(", ")}${summaryHiddenCount > 0 ? ` ${formatMessage({ id: "message.messageItem.reactionHiddenMore" }, { count: summaryHiddenCount })}` : ""}`
                 : formatMessage({ id: "message.messageItem.reactionCount" }, { count: reaction.count });
+              const reactionLabel = formatMessage({ id: "message.messageItem.reactionAria" }, { emoji: reaction.emoji, reactors: reactorSummary });
               const reactionContent = (
                 <>
-                  <span className="inline-flex items-center leading-none">
+                  <MessageReactionGlyph>
                     <ReactionGlyph emoji={reaction.emoji} size={16} className="block" />
-                  </span>
-                  <ReactionCount count={reaction.count} />
+                  </MessageReactionGlyph>
+                  <MessageReactionCount>{reaction.count}</MessageReactionCount>
                 </>
               );
-              // DS reaction: a 24px chip on fill-muted; yours is pink-soft; a
-              // failed toggle flashes the orange-soft problem wash.
-              const reactionClassName = `inline-flex h-6 min-w-0 max-w-full items-center gap-1 overflow-hidden whitespace-nowrap rounded-chip pl-1.5 pr-2 text-callout leading-none text-foreground ${
-                showFailureFlash
-                  ? "bg-warning-soft"
-                  : currentViewerReacted
-                    ? "bg-attention-soft"
-                    : "bg-fill-muted"
-              }`;
               return (
-                <span key={reaction.emoji} className="inline-flex">
+                <span
+                  key={reaction.emoji}
+                  className="inline-flex"
+                  data-select-screenshot-reaction="true"
+                >
                   {canReact ? (
-                    <button
-                      type="button"
-                      onClick={() => {
-                        hideReactionPopover();
-                        void handleToggleReaction(reaction.emoji);
-                      }}
-                      onMouseEnter={(event) => showReactionPopover(reaction, event.currentTarget)}
-                      onMouseLeave={hideReactionPopover}
-                      onFocus={(event) => showReactionPopover(reaction, event.currentTarget)}
-                      onBlur={hideReactionPopover}
-                      className={`${reactionClassName} outline-none hover:press-overlay active:press-overlay focus-visible:shadow-focus`}
-                      aria-label={formatMessage({ id: "message.messageItem.reactionAria" }, { emoji: reaction.emoji, reactors: reactorSummary })}
-                    >
-                      {reactionContent}
-                    </button>
+                    // raft-ui MessageReactionChip (a Base UI Toggle: aria-pressed
+                    // says whether you reacted, yours on attention-soft); a failed
+                    // toggle flashes the orange-soft problem wash.
+                    <RaftTooltip>
+                      <TooltipTrigger
+                        delay={0}
+                        closeDelay={0}
+                        render={(
+                          <MessageReactionChip
+                            pressed={currentViewerReacted}
+                            onClick={handleReactionChipClick}
+                            data-reaction-emoji={reaction.emoji}
+                            className={showFailureFlash ? REACTION_FAILURE_FLASH_CLASS : undefined}
+                            aria-label={reactionLabel}
+                          />
+                        )}
+                      >
+                        {reactionContent}
+                      </TooltipTrigger>
+                      <MessageReactionTooltipContent side="bottom" align="start" sideOffset={4}>
+                        <ReactionReactorsTooltipBody
+                          emoji={reaction.emoji}
+                          {...reactionReactorNames(reaction)}
+                        />
+                      </MessageReactionTooltipContent>
+                    </RaftTooltip>
                   ) : (
+                    // Read-only (no reacting here): the same chip, inert. A Toggle
+                    // would still be a button, so the look is drawn on a span.
                     <span
-                      className={reactionClassName}
-                      aria-label={formatMessage({ id: "message.messageItem.reactionAria" }, { emoji: reaction.emoji, reactors: reactorSummary })}
+                      className={`${READ_ONLY_REACTION_CHIP_CLASS} ${currentViewerReacted ? "bg-attention-soft" : "bg-fill-muted"}`}
+                      aria-label={reactionLabel}
                     >
                       {reactionContent}
                     </span>
@@ -4845,24 +4718,13 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
               {!isSystem && canReact && visibleReactions.length > 0 ? (
                 <span className="inline-flex md:hidden">
                   <Tooltip content={formatMessage({ id: "message.messageItem.addReaction" })}>
-                  <button
-                    type="button"
-                    onClick={(event) => {
-                      event.stopPropagation();
-                      hideReactionPopover();
-                      setCtxMenu(null);
-                      if (reactionPicker) {
-                        closeReactionPicker();
-                      } else {
-                        openReactionPicker(event.currentTarget);
-                      }
-                    }}
-                    className="inline-flex h-6 min-w-0 items-center justify-center rounded-chip bg-fill-muted px-1.5 text-foreground-muted outline-none hover:press-overlay active:press-overlay focus-visible:shadow-focus"
+                  <MessageReactionAddButton
+                    onClick={handleMobileReactionAddClick}
                     aria-label={formatMessage({ id: "message.messageItem.addReaction" })}
                     data-message-affordance="mobile-reaction-add"
                   >
-                    <Plus size={16} strokeWidth={2} />
-                  </button>
+                    <Plus strokeWidth={2} aria-hidden />
+                  </MessageReactionAddButton>
                   </Tooltip>
                 </span>
               ) : null}
@@ -4881,35 +4743,26 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
             channelParticipantMembersById={channelParticipantMembersById}
           />
         ) : null}
-        {showDmReadReceipt ? (
-          // artin (option C): a status line under the DM's last message, below
-          // everything the message owns (footer, inline thread replies), like
-          // iMessage's "Read". Its own row, right-aligned.
-          <div className="mt-1 flex h-5 justify-end" data-testid="dm-read-status">
-            <Tooltip content={formatMessage({ id: "message.messageItem.read" })}>
-            <span
-              className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap text-caption text-foreground-hint"
-              data-message-affordance="read-receipt"
-              aria-label={formatMessage({ id: "message.messageItem.read" })}
-            >
-              <CheckCircle size={12} className="shrink-0" />
-              <span>{formatMessage({ id: "message.messageItem.read" })}</span>
-            </span>
-            </Tooltip>
-          </div>
+        {/* An agent about to reply in this message's thread: said here, under
+            the replies, not above the channel's composer (raft-design 0042). */}
+        {!hideThreadActions && !readOnlyProjection ? (
+          <AgentReplyingHint channelId={message.channelId} parentMessageId={message.id} />
         ) : null}
-        {/* Parked, not dead. A message can hold exactly one task today
-            (`uniqueIndex` on `tasks.message_id`) and its title is not editable
-            yet, so a list of one row earns nothing over the status badge —
-            @stdrc msg=9b8763dd / aa662414. Kept wired and ready because the
-            endgame is many tasks per message, at which point this is the shape
-            and the badge is not. Do not delete as cruft. */}
-        {/* <TaskChipList tasks={messageTasks} onOpenTask={openTaskFromChip} /> */}
+        {/* artin (option C): the read-status line under the message, below
+            everything it owns (MessageReadStatusLine). */}
+        {showDmReadReceipt ? (
+          <DmReadStatusLine />
+        ) : showAgentReadStatus && !readOnlyProjection ? (
+          <AgentReadStatusLine messageId={message.id} />
+        ) : null}
       </MessageItemContent>
+      {/* Its time for the touch reveal: drag the conversation left. */}
+      <TimelineRevealTime dateTime={sentAtIso}>{gutterClock}</TimelineRevealTime>
     </MessageItem>
     {reactionPicker && typeof document !== "undefined" && createPortal(
       <PopoverPopup
-        className="fixed z-[80] min-w-0 flex items-center gap-0.5 px-1.5 py-1"
+        ref={reactionPickerRef}
+        className="fixed z-popup min-w-0 flex items-center gap-0.5 p-1"
         data-message-affordance="reaction-picker"
         {...dismissLayerProps}
         style={reactionPickerPopupStyle}
@@ -4917,63 +4770,29 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
         onMouseLeave={handleReactionPickerBoundaryLeave}
         onClick={stopClickPropagation}
       >
-        {QUICK_REACTION_EMOJIS.map((emoji) => (
-          <Tooltip key={emoji} content={formatMessage({ id: "message.messageItem.reactWith" }, { emoji })}>
-          <button
-            type="button"
-            onClick={() => handleQuickReactionClick(emoji)}
-            className="flex size-7 items-center justify-center rounded-control bg-transparent outline-none hover:bg-brand-soft active:bg-brand-soft focus-visible:shadow-focus"
-          >
-            <ReactionGlyph emoji={emoji} size={QUICK_REACTION_GLYPH_SIZE} className="block" />
-          </button>
-          </Tooltip>
-        ))}
+        <QuickReactionButtons onReact={handleQuickReactionButtonClick} onMore={handleOpenEmojiPickerFromBar} />
       </PopoverPopup>,
       document.body,
     )}
-    {reactionPopover && typeof document !== "undefined" && createPortal(
-        <PopoverPopup
-        role="tooltip"
-        data-message-affordance="reaction-reactors-popover"
-        className="pointer-events-none fixed z-[80] min-w-0 max-w-[280px] px-2.5 py-1.5 text-footnote font-semibold text-foreground"
-        style={reactionPopoverPopupStyle}
-      >
-        {reactionPopover.visibleNames.length > 0 ? (
-          <div className="flex max-w-60 flex-wrap items-center gap-y-0.5">
-            {reactionPopover.visibleNames.map((name, index) => (
-              <span key={`${reactionPopover.emoji}-${index}-${name}`} className="inline-flex min-w-0 items-baseline leading-5">
-                <span className="max-w-28 truncate">{name}</span>
-                {index < reactionPopover.visibleNames.length - 1 || reactionPopover.hiddenCount > 0 ? (
-                  <span className="shrink-0 text-foreground-hint">, </span>
-                ) : null}
-              </span>
-            ))}
-            {reactionPopover.hiddenCount > 0 && (
-              <span className="leading-5 text-foreground-muted">{formatMessage({ id: "message.messageItem.reactionHiddenMore" }, { count: reactionPopover.hiddenCount })}</span>
-            )}
-          </div>
-        ) : (
-          <span className="block leading-5">{reactionPopover.emoji}</span>
-        )}
-      </PopoverPopup>,
-      document.body,
-    )}
-    {ctxMenu && createPortal(
+    {ctxMenu && !selectionScopedHere && createPortal(
       <>
         <DismissBackdrop onDismiss={handleCloseCtx} trapContextMenu />
         {ctxMenuClickShielded && (
-          // Above the dismiss backdrop (50) but below the menu (z-[60]) so
-          // it absorbs the iOS phantom outside-tap without blocking menu rows.
-          <DismissBackdrop onDismiss={handleCloseCtx} zIndex={55} stopPropagation />
+          // Over the dismiss backdrop and under the menu (all z-popup, in
+          // this DOM order) so it absorbs the iOS phantom outside-tap without
+          // blocking menu rows.
+          <DismissBackdrop onDismiss={handleCloseCtx} stopPropagation />
         )}
         <ContextMenuPopup
           ref={ctxMenuRef}
-          className="fixed z-[60] select-none"
+          className="fixed z-popup select-none p-0"
           role="menu"
           aria-label={formatMessage({ id: "message.messageItem.messageContextMenu" })}
           style={ctxMenuPopupStyle}
         >
-          <>
+          {/* The popup is the frame (max height, rounded clip); the items scroll in a raft-ui
+              ScrollArea, the popup's padding on its content. The items take focus: no tab stop. */}
+          <ScrollArea tabIndex={-1} className="min-h-0 flex-1" contentClassName="flex flex-col p-1">
           {/* Reaction quick row — shown on both desktop right-click ("pointer")
               and mobile long-press ("touch") per stdrc 2026-05-14
               #proj-mobile:a8293493 msg=2cebeb18: "无论是移动端还是桌面端，其右
@@ -4988,26 +4807,88 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
               msg=ed2eee8c "只要一样就行，说白了就分 section"). */}
           {!isSystem && canReact && (
             <>
-              <div
-                className="flex h-9 items-center gap-1 px-2"
+              {/* raft-ui's quick row (raft-design dropdown-menu.md, "The
+                  message menu"): 7 drawings at 22px, each a menu item the
+                  arrow keys reach, then Add Reaction for every other emoji.
+                  `px-0.75` lines the first drawing up with the items' icons
+                  (10px in); raft-ui ships it as the row's own padding next. */}
+              <MessageReactionQuickRow
                 data-message-affordance="reaction-quick-row"
               >
-                {QUICK_REACTION_EMOJIS.map((emoji) => (
-                  <Tooltip key={emoji} content={formatMessage({ id: "message.messageItem.reactWith" }, { emoji })}>
-                  <button
-                    type="button"
-                    onClick={(event) => {
-                      event.stopPropagation();
-                      handleQuickReactionClick(emoji);
-                    }}
-                    className="flex size-7 items-center justify-center rounded-control bg-transparent outline-none hover:bg-brand-soft active:bg-brand-soft focus-visible:shadow-focus"
-                    aria-label={formatMessage({ id: "message.messageItem.reactWith" }, { emoji })}
+                <QuickReactionButtons itemRole="menuitem" onReact={handleMenuQuickReactionClick} onMore={handleOpenEmojiPickerFromMenu} />
+              </MessageReactionQuickRow>
+              <ContextMenuDivider />
+            </>
+          )}
+          {/* Sections, by what the action does (stdrc 2026-10-20 #proj-chat:2466beff):
+              keep going on this message (thread + task — a task's discussion
+              lives in its thread), take it elsewhere (nothing changes here),
+              just for me (nobody else sees it). The hover toolbar is a
+              shortcut for this menu and keeps its order. */}
+          {showThreadTaskSection && (
+            <>
+              {!hideThreadActions && (
+                <MenuItem
+                  icon={<ThreadIcon width={14} height={14} />}
+                  onClick={handleOpenThreadFromContextMenu}
+                >
+                  {formatMessage({ id: "message.messageItem.replyInThread" })}
+                </MenuItem>
+              )}
+              {showOwnThreadFollowAction && (
+                <MenuItem
+                  icon={threadFollowed ? <UnfollowThreadIcon width={14} height={14} /> : <FollowThreadIcon width={14} height={14} />}
+                  onClick={threadFollowed ? handleUnfollowThread : handleFollowThread}
+                >
+                  {threadFollowed ? formatMessage({ id: "message.messageItem.unfollowThread" }) : formatMessage({ id: "message.messageItem.followThread" })}
+                </MenuItem>
+              )}
+              {enclosingThreadFollowCommand ? (
+                <MenuItem
+                  icon={enclosingThreadFollowCommand.followed ? <UnfollowThreadIcon width={14} height={14} /> : <FollowThreadIcon width={14} height={14} />}
+                  onClick={handleEnclosingThreadFollowFromMenu}
+                  disabled={enclosingThreadFollowCommand.disabled}
+                  data-testid="message-context-thread-follow-action"
+                >
+                  {formatMessage({ id: enclosingThreadFollowCommand.followed ? "message.messageItem.unfollowThread" : "message.messageItem.followThread" })}
+                </MenuItem>
+              ) : null}
+              {markThreadUnread ? (
+                <MenuItem
+                  icon={<MessageSquareDot size={14} />}
+                  onClick={handleMarkThreadUnreadFromMenu}
+                  data-testid="message-context-mark-thread-unread"
+                >
+                  {formatMessage({ id: "message.messageItem.markThreadAsUnread" })}
+                </MenuItem>
+              ) : null}
+              {!parentMessageId && supportsMessageTasks && (
+                !isExternal ? (linkedTask ? (
+                  <>
+                    <MenuItem
+                      icon={linkedTask.status === "done" ? <ReopenTaskIcon width={14} height={14} /> : <SquareCheckBig size={14} />}
+                      onClick={handleToggleTaskDone}
+                    >
+                      {linkedTask.status === "done" ? formatMessage({ id: "message.messageItem.reopenTask" }) : formatMessage({ id: "message.messageItem.markAsDone" })}
+                    </MenuItem>
+                  </>
+                ) : taskV2 ? (
+                  <MenuItem
+                    icon={<Plus size={14} />}
+                    onClick={openCreateFromMessage}
+                    data-testid="message-create-task-from-message"
                   >
-                    <ReactionGlyph emoji={emoji} size={QUICK_REACTION_GLYPH_SIZE} className="block" />
-                  </button>
-                  </Tooltip>
-                ))}
-              </div>
+                    {formatMessage({ id: "message.messageItem.createTaskFromMessage" })}
+                  </MenuItem>
+                ) : (
+                  <MenuItem
+                    icon={<Plus size={14} />}
+                    onClick={handleConvertToTask}
+                  >
+                    {formatMessage({ id: "message.messageItem.convertToTask" })}
+                  </MenuItem>
+                )) : null
+              )}
               <ContextMenuDivider />
             </>
           )}
@@ -5023,25 +4904,28 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
           >
             {formatMessage({ id: "message.messageItem.copyMarkdown" })}
           </MenuItem>
-          {showManualTranslationAction ? (
+          {ctxMenu.source === "touch" && canSelectText && (
             <MenuItem
-              icon={<Languages size={14} />}
-              onClick={handleManualTranslate}
-              disabled={manualTranslationPending}
-              data-testid={`message-translate-menu-item-${message.id}`}
+              icon={<SquareDashedText size={14} />}
+              onClick={handleOpenSelectText}
             >
-              {formatMessage({
-                id: manualTranslationPending
-                  ? "message.messageItem.translating"
-                  : "message.messageItem.translate",
-              })}
+              {formatMessage({ id: "message.messageItem.selectText" })}
             </MenuItem>
-          ) : null}
+          )}
+          {canForwardThisMessage && (
+            <MenuItem
+              icon={<ForwardIcon size={14} />}
+              onClick={handleForward}
+              data-testid="message-context-forward"
+            >
+              {formatMessage({ id: "message.messageItem.forward" })}
+            </MenuItem>
+          )}
           {(() => {
-            // "Select Message" — last item in the outbound-content-propagation
-            // section (Copy link → Copy markdown → Select Message), in
+            // "Select Message" — last item in the take-it-elsewhere section
+            // (Copy link → Copy markdown → Forward → Select Message), in
             // ascending "weight" of what gets propagated: pointer →
-            // content → multi-message render+send. Was previously
+            // content → send one → multi-message render+send. Was previously
             // a standalone section above Copy link; relocated to this
             // section per stdrc 2026-05-14 #proj-mobile:a8293493
             // msg=ad3320ce ("share messages 可能应该放到 copy markdown
@@ -5069,7 +4953,9 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
             if (isSystem || currentUserServerRole === "guest") return null;
             return (
               <MenuItem
-                icon={<CheckCircle size={14} />}
+                // Not SquareCheckBig: that is Mark as Done, earlier in this menu. ListChecks
+                // is also the multi-select toolbar's Select All.
+                icon={<ListChecks size={14} />}
                 onClick={handleSelectShare}
               >
                 {formatMessage({ id: "message.messageItem.selectMessage" })}
@@ -5077,60 +4963,77 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
             );
           })()}
           <ContextMenuDivider />
-          {!hideThreadActions && (
-            <MenuItem
-              icon={<ThreadIcon width={14} height={14} />}
-              onClick={handleOpenThreadFromContextMenu}
-            >
-              {formatMessage({ id: "message.messageItem.openThread" })}
-            </MenuItem>
-          )}
           <MenuItem
             icon={isSaved ? <BookmarkMinus size={14} /> : <Bookmark size={14} />}
             onClick={handleSaveFromMenu}
           >
             {isSaved ? formatMessage({ id: "message.messageItem.removeFromSaved" }) : formatMessage({ id: "message.messageItem.saveMessage" })}
           </MenuItem>
-          {canShowThreadFollowAction && hasThreadConversation && (
+          {showManualTranslationAction ? (
             <MenuItem
-              icon={threadFollowed ? <MessageCircleOff size={14} /> : <MessageCirclePlus size={14} />}
-              onClick={threadFollowed ? handleUnfollowThread : handleFollowThread}
+              icon={<Languages size={14} />}
+              onClick={handleManualTranslate}
+              disabled={manualTranslationPending}
+              data-testid={`message-translate-menu-item-${message.id}`}
             >
-              {threadFollowed ? formatMessage({ id: "message.messageItem.unfollowThread" }) : formatMessage({ id: "message.messageItem.followThread" })}
+              {formatMessage({
+                id: manualTranslationPending
+                  ? "message.messageItem.translating"
+                  : "message.messageItem.translate",
+              })}
             </MenuItem>
-          )}
-          {canShowThreadFollowAction && hasThreadConversation && (
-            <ContextMenuDivider />
-          )}
-          {!parentMessageId && supportsMessageTasks && (
-            !isExternal ? (linkedTask ? (
-              <>
-                <MenuItem
-                  icon={linkedTask.status === "done" ? <RotateCcw size={14} /> : <CheckCircle size={14} />}
-                  onClick={handleToggleTaskDone}
-                >
-                  {linkedTask.status === "done" ? formatMessage({ id: "message.messageItem.reopenTask" }) : formatMessage({ id: "message.messageItem.markAsDone" })}
-                </MenuItem>
-              </>
-            ) : (
-              <MenuItem
-                icon={<ClipboardCheck size={14} />}
-                onClick={handleConvertToTask}
-              >
-                {formatMessage({ id: "message.messageItem.convertToTask" })}
-              </MenuItem>
-            )) : null
-          )}
-          </>
+          ) : null}
+          {/* The conversation's Mark as Unread (the sidebar row's), last of the just-for-me section. */}
+          {markConversationUnread ? (
+            <MenuItem
+              icon={<MessageSquareDot size={14} />}
+              onClick={handleMarkConversationUnreadFromMenu}
+              data-testid="message-context-mark-conversation-unread"
+            >
+              {formatMessage({ id: isDmSurface ? "message.messageItem.markDmAsUnread" : "message.messageItem.markChannelAsUnread" })}
+            </MenuItem>
+          ) : null}
+          {/* View Context: its own last group, agent messages only, shown once the Server says the person may open it.
+              Never in a joint channel: its messages live in the joint's storage channel (the
+              joint-storage namespace, never a Server), so the route answers a bare 404 for every one. */}
+          {isAgent && !onJointSurface ? <ViewContextMenuGroup agentId={message.senderId} onOpen={handleViewContextFromMenu} /> : null}
+          </ScrollArea>
         </ContextMenuPopup>
       </>,
       document.body
+    )}
+    {selectTextSheet !== "closed" && (
+      <MessageSelectTextDrawer
+        open={selectTextSheet === "open"}
+        onClose={handleCloseSelectText}
+        onClosed={handleSelectTextClosed}
+        senderName={senderDisplayName}
+        time={time}
+        markdown={message.content}
+        quoteChannelId={quoteComposerChannelId}
+      />
+    )}
+    {emojiPickerAt && createPortal(
+      <>
+        <DismissBackdrop onDismiss={closeEmojiPicker} />
+        <PopoverPopup
+          className="fixed z-popup min-w-0 p-0"
+          role="dialog"
+          aria-label={formatMessage({ id: "message.messageItem.addReaction" })}
+          data-message-affordance="reaction-emoji-picker"
+          style={emojiPickerStyle}
+          onClick={stopClickPropagation}
+        >
+          <EmojiPickerPanel onEmojiClick={handleEmojiPickerChoose} focusSearch={emojiPickerAt.focusSearch} />
+        </PopoverPopup>
+      </>,
+      document.body,
     )}
     {senderCtxMenu && createPortal(
       <>
         <DismissBackdrop onDismiss={closeSenderCtxMenu} trapContextMenu />
         <ContextMenuPopup
-          className="fixed z-[60] select-none"
+          className="fixed z-popup select-none"
           role="menu"
           aria-label={formatMessage({ id: "message.messageItem.senderContextMenu" })}
           style={senderCtxMenuPopupStyle}
@@ -5158,3 +5061,4 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
 });
 
 export default ConnectedMessageItem;
+

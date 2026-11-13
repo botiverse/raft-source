@@ -1,4 +1,6 @@
+import { setImmediate } from "node:timers/promises";
 import { clearClockInterval, currentTimeMs, setClockInterval, type Tracer } from "@botiverse/raft-shared";
+import { mapSlackBridgeLifecycleBatches, SLACK_BRIDGE_LIFECYCLE_BATCH_SIZE } from "./slackBridgeLifecycleBatch";
 import { withTraceRoot } from "../tracing/semanticTrace";
 
 export type SlackBridgeBindingMode = "active" | "paused" | "disconnected";
@@ -148,6 +150,8 @@ export interface SlackBridgeLifecycleProbeContext {
 }
 
 export interface SlackBridgeLifecycleLoadContext {
+  /** Recheck at nested provider-call boundaries during a claimed pass. */
+  isRunHeld?(): Promise<boolean>;
   orchestratorId: string;
   nowMs: number;
   trigger: SlackBridgeProbeTrigger;
@@ -182,7 +186,14 @@ export interface SlackBridgeLifecycleExecutionReceipt {
   probeObservations: SlackBridgeProbeObservation[];
 }
 
+export interface SlackBridgeLifecycleRunClaim {
+  held(): Promise<boolean>;
+  end(): void;
+}
+
 export interface SlackBridgePersistentWorkerDependencies {
+  /** Fleet-wide ownership; suppress the entire pass before loading any state. */
+  claimRun?(): Promise<SlackBridgeLifecycleRunClaim | null>;
   loadBindings(context: SlackBridgeLifecycleLoadContext): Promise<readonly SlackBridgeBindingRuntime[]>;
   refreshAudience(
     binding: SlackBridgeBindingRuntime,
@@ -190,6 +201,8 @@ export interface SlackBridgePersistentWorkerDependencies {
   ): Promise<SlackBridgeAudienceRefreshReceipt>;
   executeCommand(command: SlackBridgeWorkerCommand, context: SlackBridgeLifecycleCommandContext): Promise<void>;
   runProbe(request: SlackBridgeProbeRequest, context: SlackBridgeLifecycleProbeContext): Promise<SlackBridgeProbeObservation>;
+  /** Lower-priority maintenance runs after every binding's audience refresh. */
+  afterRefresh?(context: SlackBridgeLifecycleLoadContext): Promise<void>;
   persistReceipt(receipt: SlackBridgeLifecycleExecutionReceipt, context: SlackBridgeLifecyclePersistContext): Promise<void>;
   onError?(error: unknown): void;
   tracer?: Tracer;
@@ -413,16 +426,23 @@ function projectHealth(binding: SlackBridgeBindingRuntime, policy: SlackBridgeLi
   };
 }
 
-export function planSlackBridgeWorkerLifecycle(
-  bindings: readonly SlackBridgeBindingRuntime[],
+function planSlackBridgeBindingLifecycle(
+  binding: SlackBridgeBindingRuntime,
   policy: SlackBridgeLifecyclePolicy,
-): SlackBridgeLifecyclePlan[] {
-  return bindings.map((binding) => ({
+): SlackBridgeLifecyclePlan {
+  return {
     bindingId: binding.bindingId,
     command: planCommand(binding, policy),
     probeRequests: planProbeRequests(binding, policy),
     health: projectHealth(binding, policy),
-  }));
+  };
+}
+
+export function planSlackBridgeWorkerLifecycle(
+  bindings: readonly SlackBridgeBindingRuntime[],
+  policy: SlackBridgeLifecyclePolicy,
+): SlackBridgeLifecyclePlan[] {
+  return bindings.map((binding) => planSlackBridgeBindingLifecycle(binding, policy));
 }
 
 export function applySlackBridgeWorkerEvent(
@@ -502,7 +522,10 @@ export function startSlackBridgePersistentWorker(
   let running = false;
   let pendingTrigger: SlackBridgeProbeTrigger | null = null;
 
-  const runOnce = async (trigger: SlackBridgeProbeTrigger): Promise<SlackBridgePersistentWorkerRunResult> => {
+  const runClaimedOnce = async (
+    trigger: SlackBridgeProbeTrigger,
+    claim?: SlackBridgeLifecycleRunClaim,
+  ): Promise<SlackBridgePersistentWorkerRunResult> => {
     const observedNowMs = nowMs();
     const policy: SlackBridgeLifecyclePolicy = {
       orchestratorId: options.orchestratorId,
@@ -513,14 +536,19 @@ export function startSlackBridgePersistentWorker(
       trigger,
     };
     const loadContext: SlackBridgeLifecycleLoadContext = {
+      ...(claim ? { isRunHeld: () => claim.held() } : {}),
       orchestratorId: options.orchestratorId,
       nowMs: observedNowMs,
       trigger,
     };
+    const skipped: SlackBridgePersistentWorkerRunResult = { kind: "completed", trigger, bindingCount: 0 };
+    if (claim && !await claim.held()) return skipped;
     const bindings = await dependencies.loadBindings(loadContext);
     const refreshedBindings: SlackBridgeBindingRuntime[] = [];
     const audienceRefreshes = new Map<string, SlackBridgeAudienceRefreshReceipt>();
-    for (const binding of bindings) {
+    for (const [index, binding] of bindings.entries()) {
+      if (index > 0 && index % SLACK_BRIDGE_LIFECYCLE_BATCH_SIZE === 0) await setImmediate();
+      if (claim && !await claim.held()) return skipped;
       const audienceRefresh = await dependencies.refreshAudience(binding, loadContext);
       validateAudienceRefreshReceipt(binding, audienceRefresh);
       if (audienceRefreshes.has(binding.bindingId)) {
@@ -537,9 +565,16 @@ export function startSlackBridgePersistentWorker(
           }
         : binding);
     }
-    const plans = planSlackBridgeWorkerLifecycle(refreshedBindings, policy);
+    const plans = await mapSlackBridgeLifecycleBatches(
+      refreshedBindings, (binding) => planSlackBridgeBindingLifecycle(binding, policy),
+    );
 
-    for (const plan of plans) {
+    if (claim && !await claim.held()) return skipped;
+    await dependencies.afterRefresh?.(loadContext);
+
+    for (const [index, plan] of plans.entries()) {
+      if (index > 0 && index % SLACK_BRIDGE_LIFECYCLE_BATCH_SIZE === 0) await setImmediate();
+      if (claim && !await claim.held()) return skipped;
       const audienceRefresh = audienceRefreshes.get(plan.bindingId);
       if (!audienceRefresh) {
         throw new Error("Slack Bridge persistent worker plan is missing its audience refresh receipt");
@@ -581,6 +616,16 @@ export function startSlackBridgePersistentWorker(
     }
 
     return { kind: "completed", trigger, bindingCount: refreshedBindings.length };
+  };
+
+  const runOnce = async (trigger: SlackBridgeProbeTrigger): Promise<SlackBridgePersistentWorkerRunResult> => {
+    const claim = await dependencies.claimRun?.();
+    if (dependencies.claimRun && !claim) return { kind: "completed", trigger, bindingCount: 0 };
+    try {
+      return await runClaimedOnce(trigger, claim ?? undefined);
+    } finally {
+      claim?.end();
+    }
   };
 
   const drain = async (trigger: SlackBridgeProbeTrigger): Promise<SlackBridgePersistentWorkerRunResult> => {

@@ -35,7 +35,7 @@ export function ServerLabRow({
   return (
     <div
       data-testid="server-lab-row"
-      className="grid grid-cols-[minmax(0,1fr)_44px] items-start gap-4 py-3 first:pt-0 last:pb-0"
+      className="grid grid-cols-[minmax(0,1fr)_44px] items-center gap-4 py-3 first:pt-0 last:pb-0"
     >
       <div className="min-w-0">
         <div className="flex min-w-0 flex-wrap items-center gap-2">
@@ -53,7 +53,7 @@ export function ServerLabRow({
             disabled={!editable || mutationPending}
             onCheckedChange={handleCheckedChange}
             aria-label={formatMessage({ id: "settings.labs.enrollmentAria" }, { name: lab.name })}
-            className="mt-0.5 justify-self-end"
+            className="justify-self-end"
             data-slot="switch"
           />
         </Tooltip>
@@ -63,7 +63,7 @@ export function ServerLabRow({
           disabled={!editable || mutationPending}
           onCheckedChange={handleCheckedChange}
           aria-label={formatMessage({ id: "settings.labs.enrollmentAria" }, { name: lab.name })}
-          className="mt-0.5 justify-self-end"
+          className="justify-self-end"
         />
       )}
       {saving && (

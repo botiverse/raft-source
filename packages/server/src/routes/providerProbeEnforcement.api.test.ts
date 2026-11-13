@@ -25,7 +25,7 @@ import {
 } from "../services/providerProbeService";
 import { openTestApp } from "../test/integration/app";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 const AUTHORITY = { connectionEpochId: "epoch-enf", replicaGeneration: "gen-enf" };
 const FACT: ProbeCarrierFact = {
@@ -42,7 +42,7 @@ const MODEL = "deepseek/deepseek-v4-pro";
 test("enforcement retires server-side probes and gates launches on fresh Computer receipts", async () => {
   const originalKey = process.env.SLOCK_PROVIDER_CREDENTIAL_KEY;
   process.env.SLOCK_PROVIDER_CREDENTIAL_KEY = Buffer.alloc(32, 15).toString("base64");
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   let providerCalls = 0;
   try {
     const owner = await seedUser("enf-owner@raft.test", "enf-owner");
@@ -242,7 +242,7 @@ test("probe and enforcement predicates read the single provider_connections_v0 k
   const { createServer: makeServer } = await import("../services/serverService");
   const { featureFlagRules: rules, users: usersTable } = await import("../db/schema");
   const { eq: eqOp } = await import("drizzle-orm");
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const [owner] = await db().insert(usersTable).values({
       email: "single-key@raft.test", name: "single-key", displayName: "single-key",

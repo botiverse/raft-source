@@ -6,9 +6,13 @@ import { readFileSync, rmSync } from "node:fs";
 import {
   CursorDriver,
   buildCursorArgs,
+  buildCursorLaunchInput,
   buildCursorManagedMcpConfig,
   buildCursorModelProbeEnv,
   buildCursorSpawnEnv,
+  CURSOR_ARGV_PROMPT_LIMIT_POSIX_BYTES,
+  CURSOR_ARGV_PROMPT_LIMIT_WIN32_CHARS,
+  cursorPromptViaStdin,
   detectCursorModelSource,
   killCursorProbeTree,
   parseCursorModelsOutput,
@@ -129,6 +133,43 @@ test("cursor managed MCP overlay preserves user servers and uses the upstream re
   ]);
 });
 
+test("cursor sends a prompt too long for the Windows command line on stdin, not argv (#triage:#309)", () => {
+  const longPrompt = "x".repeat(CURSOR_ARGV_PROMPT_LIMIT_WIN32_CHARS + 1);
+  const atLimit = "x".repeat(CURSOR_ARGV_PROMPT_LIMIT_WIN32_CHARS);
+  assert.equal(cursorPromptViaStdin(longPrompt, "win32"), true);
+  assert.equal(cursorPromptViaStdin(atLimit, "win32"), false);
+  assert.deepEqual(buildCursorArgs({ ...makeSpawnContext(), prompt: longPrompt }, "win32"), [
+    "--print",
+    "--output-format", "stream-json",
+    "--force",
+  ]);
+  assert.equal(buildCursorArgs({ ...makeSpawnContext(), prompt: atLimit }, "win32").at(-1), atLimit);
+  // The same prompt still fits one argv entry on Linux/macOS.
+  assert.equal(buildCursorArgs({ ...makeSpawnContext(), prompt: longPrompt }, "linux").at(-1), longPrompt);
+});
+
+test("a Cursor turn carries its prompt in exactly one of argv and stdin", () => {
+  const longPrompt = "x".repeat(CURSOR_ARGV_PROMPT_LIMIT_WIN32_CHARS + 1);
+  for (const platform of ["win32", "linux", "darwin"] as const) {
+    for (const prompt of ["hello", longPrompt, "中".repeat(CURSOR_ARGV_PROMPT_LIMIT_POSIX_BYTES)]) {
+      const { args, stdinPrompt } = buildCursorLaunchInput({ ...makeSpawnContext(), prompt }, platform);
+      const inArgv = args.at(-1) === prompt;
+      assert.equal(inArgv !== (stdinPrompt === prompt), true, `${platform} ${prompt.length}`);
+      assert.equal(stdinPrompt === null || stdinPrompt === prompt, true);
+    }
+  }
+});
+
+test("cursor keeps --resume and sends a prompt over the POSIX per-argument cap on stdin", () => {
+  // Counted in UTF-8 bytes: 3 bytes per character here.
+  const prompt = "中".repeat(Math.floor(CURSOR_ARGV_PROMPT_LIMIT_POSIX_BYTES / 3) + 1);
+  assert.equal(prompt.length < CURSOR_ARGV_PROMPT_LIMIT_POSIX_BYTES, true);
+  assert.equal(cursorPromptViaStdin(prompt, "linux"), true);
+  const ctx = makeSpawnContext();
+  const args = buildCursorArgs({ ...ctx, prompt, config: { ...ctx.config, sessionId: "chat-1" } }, "darwin");
+  assert.deepEqual(args.slice(-2), ["--resume", "chat-1"]);
+});
+
 test("parseLine: system init emits session_init", () => {
   const driver = new CursorDriver();
   const events = driver.parseLine(JSON.stringify({
@@ -190,28 +231,100 @@ test("parseLine: assistant thinking content emits thinking", () => {
   assert.deepEqual(events[0], { kind: "thinking", text: "Let me think..." });
 });
 
-test("parseLine: assistant tool_use content emits tool_call", () => {
-  const driver = new CursorDriver();
-  const events = driver.parseLine(JSON.stringify({
-    type: "assistant",
-    message: {
-      role: "assistant",
-      content: [{
-        type: "tool_use",
-        name: "mcp__chat__send_message",
-        input: { target: "#general", content: "hi" },
-      }],
-    },
-  }));
-  assert.equal(events.length, 1);
-  assert.deepEqual(events[0], {
-    kind: "tool_call",
-    name: "mcp__chat__send_message",
-    input: { target: "#general", content: "hi" },
-  });
+// task #26: Cursor reports tools as their own `tool_call` events, `started`
+// then `completed` with the same `call_id` (shapes from Cursor's headless docs
+// and captured output); assistant content carries only text. The driver used
+// to look for Claude-style `tool_use` blocks, so no Cursor tool was reported.
+const cursorShellStarted = {
+  type: "tool_call", subtype: "started", call_id: "call-0",
+  tool_call: { shellToolCall: { args: { command: "raft message send --target \"#general\"" } } },
+  session_id: "s1",
+};
+const cursorShellCompleted = (result: unknown) => ({
+  type: "tool_call", subtype: "completed", call_id: "call-0",
+  tool_call: { shellToolCall: { args: { command: "raft message send --target \"#general\"" }, result } },
+  session_id: "s1",
 });
 
-test("parseLine: assistant with mixed content emits multiple events", () => {
+test("parseLine: tool_call started/completed pair by call_id", () => {
+  const driver = new CursorDriver();
+  assert.deepEqual(driver.parseLine(JSON.stringify(cursorShellStarted)), [{
+    kind: "tool_call",
+    name: "Shell",
+    input: { command: "raft message send --target \"#general\"" },
+    callId: "call-0",
+  }]);
+  assert.deepEqual(
+    driver.parseLine(JSON.stringify(cursorShellCompleted({ failure: { exitCode: 1, stderr: "no", stdout: "" } }))),
+    [{ kind: "tool_output", name: "Shell", callId: "call-0", ok: true, exitCode: 1 }],
+    "a command that ran and exited non-zero is a finished call with its exit code",
+  );
+  assert.deepEqual(
+    driver.parseLine(JSON.stringify(cursorShellCompleted({ success: {} }))),
+    [],
+    "a completion for a call already ended (or never started) is dropped",
+  );
+});
+
+test("parseLine: tool_call outcomes for success, omitted zero exit, rejection and MCP errors", () => {
+  const driver = new CursorDriver();
+  driver.parseLine(JSON.stringify(cursorShellStarted));
+  assert.deepEqual(driver.parseLine(JSON.stringify(cursorShellCompleted({ success: { stdout: "ok" } }))), [
+    { kind: "tool_output", name: "Shell", callId: "call-0", ok: true, exitCode: 0 },
+  ]);
+
+  const read = { readToolCall: { args: { path: "README.md" } } };
+  assert.deepEqual(driver.parseLine(JSON.stringify({ type: "tool_call", subtype: "started", call_id: "r1", tool_call: read })), [
+    { kind: "tool_call", name: "Read", input: { path: "README.md" }, callId: "r1" },
+  ]);
+  assert.deepEqual(driver.parseLine(JSON.stringify({
+    type: "tool_call", subtype: "completed", call_id: "r1",
+    tool_call: { readToolCall: { args: { path: "README.md" }, result: { rejected: { reason: "user" } } } },
+  })), [{ kind: "tool_output", name: "Read", callId: "r1", ok: false }]);
+
+  const mcp = { mcpToolCall: { args: { toolName: "lookup", args: { q: "x" } } } };
+  assert.deepEqual(driver.parseLine(JSON.stringify({ type: "tool_call", subtype: "started", call_id: "m1", tool_call: mcp })), [
+    { kind: "tool_call", name: "lookup", input: { q: "x" }, callId: "m1" },
+  ]);
+  assert.deepEqual(driver.parseLine(JSON.stringify({
+    type: "tool_call", subtype: "completed", call_id: "m1",
+    tool_call: { mcpToolCall: { ...mcp.mcpToolCall, result: { success: { content: [], isError: true } } } },
+  })), [{ kind: "tool_output", name: "lookup", callId: "m1", ok: false }]);
+});
+
+test("parseLine: a shell command killed or aborted is a failed call", () => {
+  const driver = new CursorDriver();
+  driver.parseLine(JSON.stringify(cursorShellStarted));
+  assert.deepEqual(driver.parseLine(JSON.stringify(cursorShellCompleted({ failure: { exitCode: 137, signal: "SIGKILL", oomKill: true } }))), [
+    { kind: "tool_output", name: "Shell", callId: "call-0", ok: false, exitCode: 137 },
+  ]);
+  driver.parseLine(JSON.stringify({ ...cursorShellStarted, call_id: "call-1" }));
+  assert.deepEqual(driver.parseLine(JSON.stringify({ ...cursorShellCompleted({ failure: { aborted: true, abortReason: "user" } }), call_id: "call-1" })), [
+    { kind: "tool_output", name: "Shell", callId: "call-1", ok: false },
+  ]);
+  driver.parseLine(JSON.stringify({ ...cursorShellStarted, call_id: "call-2" }));
+  assert.deepEqual(driver.parseLine(JSON.stringify({ ...cursorShellCompleted({ failure: { stderr: "?" } }), call_id: "call-2" })), [
+    { kind: "tool_output", name: "Shell", callId: "call-2" },
+  ], "a failure with no exit code and no kill is left unknown");
+});
+
+test("parseLine: a repeated started event does not reopen a finished call", () => {
+  const driver = new CursorDriver();
+  driver.parseLine(JSON.stringify(cursorShellStarted));
+  driver.parseLine(JSON.stringify(cursorShellCompleted({ success: {} })));
+  assert.deepEqual(driver.parseLine(JSON.stringify(cursorShellStarted)), []);
+});
+
+test("parseLine: a reconnect closes the calls whose completion Cursor will not send", () => {
+  const driver = new CursorDriver();
+  driver.parseLine(JSON.stringify(cursorShellStarted));
+  assert.deepEqual(driver.parseLine(JSON.stringify({ type: "connection", subtype: "reconnecting" })), [
+    { kind: "tool_output", name: "Shell", callId: "call-0" },
+  ]);
+  assert.deepEqual(driver.parseLine(JSON.stringify(cursorShellCompleted({ success: {} }))), []);
+});
+
+test("parseLine: assistant text and thinking content emit in order", () => {
   const driver = new CursorDriver();
   const events = driver.parseLine(JSON.stringify({
     type: "assistant",
@@ -220,14 +333,10 @@ test("parseLine: assistant with mixed content emits multiple events", () => {
       content: [
         { type: "thinking", thinking: "planning" },
         { type: "text", text: "response" },
-        { type: "tool_use", name: "Read", input: { file_path: "/tmp/f" } },
       ],
     },
   }));
-  assert.equal(events.length, 3);
-  assert.equal(events[0]!.kind, "thinking");
-  assert.equal(events[1]!.kind, "text");
-  assert.equal(events[2]!.kind, "tool_call");
+  assert.deepEqual(events.map((e) => e.kind), ["thinking", "text"]);
 });
 
 test("parseLine: result success emits turn_end", () => {
@@ -340,26 +449,17 @@ test("parseLine: full turn lifecycle", () => {
     message: { role: "assistant", content: [{ type: "text", text: "2 + 2 = 4" }] },
   })));
 
-  // assistant tool use
-  all.push(...driver.parseLine(JSON.stringify({
-    type: "assistant",
-    message: {
-      role: "assistant",
-      content: [{ type: "tool_use", name: "mcp__chat__send_message", input: { target: "#general" } }],
-    },
-  })));
+  // a tool call, started then completed
+  all.push(...driver.parseLine(JSON.stringify(cursorShellStarted)));
+  all.push(...driver.parseLine(JSON.stringify(cursorShellCompleted({ success: { exitCode: 0 } }))));
 
   // result
   all.push(...driver.parseLine(JSON.stringify({
     type: "result", subtype: "success", is_error: false, session_id: "full-cursor-test",
   })));
 
-  assert.equal(all.length, 4);
-  assert.equal(all[0]!.kind, "session_init");
+  assert.deepEqual(all.map((e) => e.kind), ["session_init", "text", "tool_call", "tool_output", "turn_end"]);
   assert.equal(all[0]!.sessionId, "full-cursor-test");
-  assert.equal(all[1]!.kind, "text");
-  assert.equal(all[2]!.kind, "tool_call");
-  assert.equal(all[3]!.kind, "turn_end");
 });
 
 // artin 2026-09-27 (task #1209): switching a Cursor agent's model always

@@ -1,17 +1,16 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
 import "./helpers/domSetup";
 
 import {
   blurFocusedControlForScreenshotShortcut,
+  COMMENT_SHORTCUT,
+  getCommentShortcutKeys,
   getGlobalSearchShortcutLabel,
+  isCommentShortcut,
   isGlobalSearchShortcut,
   isSystemScreenshotShortcut,
+  shortcutKeyNames,
 } from "../src/utils/keyboardShortcuts";
-
-const repoRoot = resolve(import.meta.dirname, "..");
-const readSource = (path: string) => readFileSync(resolve(repoRoot, path), "utf8");
 
 test("global search shortcut uses Command+K on Apple platforms", () => {
   assert.equal(isGlobalSearchShortcut({ key: "k", metaKey: true, ctrlKey: false }, "MacIntel"), true);
@@ -30,6 +29,21 @@ test("global search shortcut uses Ctrl+K on non-Apple platforms", () => {
 test("global search shortcut ignores other keys", () => {
   assert.equal(isGlobalSearchShortcut({ key: "j", metaKey: true, ctrlKey: false }, "MacIntel"), false);
   assert.equal(isGlobalSearchShortcut({ key: "j", metaKey: false, ctrlKey: true }, "Win32"), false);
+});
+
+test("the comment shortcut is ⌘⌥M on Apple platforms and Ctrl+Alt+M elsewhere", () => {
+  // ⌥M types "µ" on a Mac: the physical key decides.
+  assert.equal(isCommentShortcut({ key: "µ", code: "KeyM", metaKey: true, altKey: true }, "MacIntel"), true);
+  assert.equal(isCommentShortcut({ key: "m", code: "KeyM", ctrlKey: true, altKey: true }, "MacIntel"), false);
+  assert.equal(isCommentShortcut({ key: "m", code: "KeyM", ctrlKey: true, altKey: true }, "Win32"), true);
+  assert.equal(isCommentShortcut({ key: "M", ctrlKey: true, altKey: true }, "Linux x86_64"), true);
+  assert.equal(isCommentShortcut({ key: "m", code: "KeyM", ctrlKey: true }, "Win32"), false, "Alt is required");
+  assert.equal(isCommentShortcut({ key: "M", code: "KeyM", ctrlKey: true, altKey: true, shiftKey: true }, "Win32"), false);
+  assert.equal(isCommentShortcut({ key: "n", code: "KeyN", ctrlKey: true, altKey: true }, "Win32"), false);
+  // The tooltips draw it from the combo (KbdShortcut): ⌥⌘M on a Mac, Ctrl Alt M elsewhere.
+  assert.deepEqual(shortcutKeyNames(COMMENT_SHORTCUT), ["mod", "alt", "M"]);
+  assert.equal(getCommentShortcutKeys("MacIntel"), "Meta+Alt+M");
+  assert.equal(getCommentShortcutKeys("Win32"), "Control+Alt+M");
 });
 
 test("global search shortcut label matches the active platform shortcut", () => {
@@ -58,20 +72,20 @@ test("system screenshot shortcut clears focused button chrome but leaves typing 
 
   try {
     button.focus();
-    assert.equal(document.activeElement, button);
+    assert.ok(document.activeElement === button);
     assert.equal(
       blurFocusedControlForScreenshotShortcut({ key: "4", metaKey: true, shiftKey: true }, document, "MacIntel"),
       true,
     );
-    assert.notEqual(document.activeElement, button);
+    assert.ok(document.activeElement !== button);
 
     input.focus();
-    assert.equal(document.activeElement, input);
+    assert.ok(document.activeElement === input);
     assert.equal(
       blurFocusedControlForScreenshotShortcut({ key: "4", metaKey: true, shiftKey: true }, document, "MacIntel"),
       false,
     );
-    assert.equal(document.activeElement, input);
+    assert.ok(document.activeElement === input);
   } finally {
     button.remove();
     input.remove();
@@ -86,12 +100,12 @@ test("macOS screenshot modifier prelude clears button chrome before the final ca
 
   try {
     button.focus();
-    assert.equal(document.activeElement, button);
+    assert.ok(document.activeElement === button);
     assert.equal(
       blurFocusedControlForScreenshotShortcut({ key: "Shift", metaKey: true, shiftKey: true }, document, "MacIntel"),
       true,
     );
-    assert.notEqual(document.activeElement, button);
+    assert.ok(document.activeElement !== button);
 
     button.focus();
     assert.equal(
@@ -102,7 +116,7 @@ test("macOS screenshot modifier prelude clears button chrome before the final ca
       ),
       true,
     );
-    assert.notEqual(document.activeElement, button);
+    assert.ok(document.activeElement !== button);
 
     button.focus();
     assert.equal(
@@ -113,33 +127,23 @@ test("macOS screenshot modifier prelude clears button chrome before the final ca
       ),
       false,
     );
-    assert.equal(document.activeElement, button);
+    assert.ok(document.activeElement === button);
 
     button.focus();
     assert.equal(
       blurFocusedControlForScreenshotShortcut({ key: "Shift", metaKey: true, shiftKey: true }, document, "Win32"),
       false,
     );
-    assert.equal(document.activeElement, button);
+    assert.ok(document.activeElement === button);
 
     input.focus();
     assert.equal(
       blurFocusedControlForScreenshotShortcut({ key: "Shift", metaKey: true, shiftKey: true }, document, "MacIntel"),
       false,
     );
-    assert.equal(document.activeElement, input);
+    assert.ok(document.activeElement === input);
   } finally {
     button.remove();
     input.remove();
   }
-});
-
-test("MainLayout clears focused control chrome from the shared keydown listener", () => {
-  const mainLayout = readSource("src/components/layout/MainLayout.tsx");
-
-  assert.match(mainLayout, /blurFocusedControlForScreenshotShortcut,\n\s+isGlobalSearchShortcut,/);
-  assert.match(
-    mainLayout,
-    /const onKeyDown = \(event: KeyboardEvent\) => \{\n\s+blurFocusedControlForScreenshotShortcut\(event\);\n\s+if \(isGlobalSearchShortcut\(event\)\)/,
-  );
 });

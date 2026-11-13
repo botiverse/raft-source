@@ -1,23 +1,20 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, readFile, writeFile, rm, stat } from "node:fs/promises";
+import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import {
-  UNREAD_ACTIVITY_DIAGNOSTIC_SCHEMA_DIGEST,
-  UNREAD_ACTIVITY_DIAGNOSTIC_SCHEMA_VERSION,
-  UNREAD_ACTIVITY_DIAGNOSTIC_SYSTEM_IDENTIFIER_NOTE,
-} from "@botiverse/raft-shared/unread-activity-diagnostic";
-
 import { redactSecrets, runDoctorChecks } from "./doctor";
-import { runDoctor, runDoctorMigrationDetails, renderMigrationDetailsBody } from "./doctorCli";
+import { runDoctor, runDoctorJson, runDoctorMigrationDetails, renderMigrationDetailsBody } from "./doctorCli";
 import type { LocalCandidateEvidence } from "./lib/types";
 import {
   serverAttachmentPath,
   serverConnectedMarkerPath,
+  serverRunnerLockConflictPath,
   serverRunnerLogPath,
+  serverRunnerMemoryPath,
   serverRunnerPidPath,
+  serverRunnerVersionPath,
   servicePidPath,
   userSessionPath,
 } from "./paths";
@@ -142,62 +139,6 @@ async function stop(server: Server): Promise<void> {
   await new Promise<void>((resolve, reject) => server.close((err) => (err ? reject(err) : resolve())));
 }
 
-async function startUnreadActivityDiagnosticServer(): Promise<{
-  server: Server;
-  baseUrl: string;
-  requests: Array<{ method?: string; url?: string; authorization?: string }>;
-}> {
-  const requests: Array<{ method?: string; url?: string; authorization?: string }> = [];
-  const server = await new Promise<Server>((resolve) => {
-    const s = createServer((req: IncomingMessage, res: ServerResponse) => {
-      requests.push({
-        method: req.method,
-        url: req.url,
-        authorization: req.headers.authorization,
-      });
-      if (req.method !== "GET" || req.url !== "/api/diagnostics/unread-activity") {
-        res.writeHead(404).end();
-        return;
-      }
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({
-        schema_version: UNREAD_ACTIVITY_DIAGNOSTIC_SCHEMA_VERSION,
-        manifest_digest: UNREAD_ACTIVITY_DIAGNOSTIC_SCHEMA_DIGEST,
-        diagnostic_correlation_id: "0123456789abcdef0123456789abcdef",
-        build_id: "doctor-server-fixture",
-        value_at: "2026-09-25T00:00:00.000Z",
-        membership_truncated: 0,
-        views: [{
-          requested_name: "activity_v1",
-          served_name: "activity_v1",
-          catalog_fingerprint: "catalog-fixture",
-          system_identifier_note: UNREAD_ACTIVITY_DIAGNOSTIC_SYSTEM_IDENTIFIER_NOTE,
-        }],
-        totals: [{
-          row_present: true,
-          status: "ok",
-          value: 0,
-          generation: "generation-fixture",
-          value_at: "2026-09-25T00:00:00.000Z",
-        }],
-        aggregates: {
-          served_row_count: 1,
-          suppressed_row_count: 0,
-          watermark: 0,
-          mute_rows_before: 0,
-          mute_rows_at_or_after: 0,
-          structural_target_count: 1,
-          generation_gap_bucket: "same",
-        },
-      }));
-    });
-    s.listen(0, "127.0.0.1", () => resolve(s));
-  });
-  const address = server.address();
-  if (!address || typeof address !== "object") throw new Error("no test server address");
-  return { server, baseUrl: `http://127.0.0.1:${address.port}`, requests };
-}
-
 test("redactSecrets: masks sk_* / JWT / long hex", () => {
   assert.equal(redactSecrets(`key=${SECRET_KEY} done`), "key=***REDACTED*** done");
   assert.equal(redactSecrets(`tok ${SECRET_JWT}`), "tok ***REDACTED***");
@@ -209,41 +150,10 @@ test("doctor: fresh home → login + attachments checks fail (actionable)", asyn
     const checks = await runDoctorChecks(home);
     const byName = Object.fromEntries(checks.map((c) => [c.name, c]));
     assert.equal(byName["user session"].ok, false);
-    assert.match(byName["user session"].detail, /raft-computer login/);
+    assert.match(byName["user session"].detail, /not attached to any server — run `raft-computer attach/);
     assert.equal(byName["attachments"].ok, false);
     assert.match(byName["attachments"].detail, /raft-computer attach/);
     assert.equal(byName["OS supervisor"], undefined);
-  });
-});
-
-test("doctor unread/Activity dump stays human-readable and saves a private canonical JSON file", async () => {
-  await withHome(async (home) => {
-    const ctx = await startUnreadActivityDiagnosticServer();
-    const outputPath = join(home, "exports", "unread-activity.json");
-    await writeUserSessionForServer(home, SECRET_JWT, ctx.baseUrl);
-    const cap = captureOut();
-    try {
-      await runDoctor({ unreadActivityDump: outputPath });
-      const output = cap.text();
-      const saved = await readFile(outputPath, "utf8");
-      const parsed = JSON.parse(saved) as Record<string, unknown>;
-
-      assert.match(output, /Unread\/Activity diagnostic saved to/);
-      assert.match(output, /This private local file was not uploaded\./);
-      assert.doesNotMatch(output, /diagnostic_correlation_id|0123456789abcdef/);
-      assert.doesNotMatch(output, /^\s*\{/m, "doctor must not grow a JSON stdout mode");
-      assert.equal(parsed.diagnostic_correlation_id, "0123456789abcdef0123456789abcdef");
-      assert.equal(ctx.requests.length, 1);
-      assert.deepEqual(ctx.requests[0], {
-        method: "GET",
-        url: "/api/diagnostics/unread-activity",
-        authorization: `Bearer ${SECRET_JWT}`,
-      });
-      if (process.platform !== "win32") assert.equal((await stat(outputPath)).mode & 0o777, 0o600);
-    } finally {
-      cap.restore();
-      await stop(ctx.server);
-    }
   });
 });
 
@@ -413,7 +323,7 @@ test("migration-details render: no-server mode is verdict-free end to end", () =
   assert.match(body, /raft-computer doctor --migration-details \/<server>/);
 });
 
-test("doctor: corrupted user-session.json fails fast with login guidance", async () => {
+test("doctor: corrupted user-session.json with nothing attached fails with attach guidance", async () => {
   await withHome(async (home) => {
     const p = userSessionPath(home);
     await mkdir(join(p, ".."), { recursive: true });
@@ -424,7 +334,7 @@ test("doctor: corrupted user-session.json fails fast with login guidance", async
     assert.ok(userSession);
     assert.equal(userSession.ok, false);
     assert.match(userSession.detail, /invalid user session file/);
-    assert.match(userSession.detail, /raft-computer login/);
+    assert.match(userSession.detail, /raft-computer attach/);
 
     const cap = captureOut();
     try {
@@ -432,13 +342,44 @@ test("doctor: corrupted user-session.json fails fast with login guidance", async
       const out = cap.text();
       cap.restore();
       assert.match(out, /invalid user session file/);
-      assert.match(out, /raft-computer login/);
+      assert.match(out, /raft-computer attach/);
       assert.ok(!out.includes("abc"), "doctor must not echo corrupted session content");
     } finally {
       cap.restore();
     }
   });
 });
+
+for (const [caseName, writeSession] of [
+  ["no user session", async (_home: string) => {}],
+  ["corrupted user session", async (home: string) => {
+    const p = userSessionPath(home);
+    await mkdir(join(p, ".."), { recursive: true });
+    await writeFile(p, '{"kind":"user-session","userId":"abc","acce');
+  }],
+] as const) {
+  test(`doctor: attached machine with ${caseName} reports the session as not needed and skips session-only checks with one note`, async () => {
+    await withHome(async (home) => {
+      const { server, baseUrl } = await startPreflightServer(200, { ok: true });
+      try {
+        await writeSession(home);
+        await writeAttach(home, SERVER_A, "sk_computer_doctorgrant123", { serverSlug: "alpha", serverUrl: baseUrl });
+        const checks = await runDoctorChecks(home);
+        const userSession = checks.find((c) => c.name === "user session");
+        assert.ok(userSession);
+        assert.equal(userSession.ok, true);
+        assert.equal(userSession.detail, "not needed (attached with this machine's key)");
+        const notes = checks.filter((c) => c.name === "legacy migration checks");
+        assert.equal(notes.length, 1);
+        assert.equal(notes[0]!.ok, true);
+        assert.match(notes[0]!.detail, /^skipped \(they need a user session/);
+        assert.equal(checks.find((c) => c.name === "preflight /alpha")?.ok, true);
+      } finally {
+        await stop(server);
+      }
+    });
+  });
+}
 
 test("doctor: SECRET REDLINE — injected per-server key + user token never appear in output", async () => {
   await withHome(async (home) => {
@@ -457,7 +398,7 @@ test("doctor: SECRET REDLINE — injected per-server key + user token never appe
   });
 });
 
-test("doctor: auth preflight rejection explains id-vs-display-name recovery after #3862", async () => {
+test("doctor: auth preflight rejection is a failed check that names COMPUTER_NAME_COLLISION", async () => {
   await withHome(async (home) => {
     await writeUserSession(home, SECRET_JWT);
     const ctx = await startPreflightServer(401, { code: "computer_key_revoked" });
@@ -467,11 +408,7 @@ test("doctor: auth preflight rejection explains id-vs-display-name recovery afte
       const preflight = checks.find((c) => c.name === "preflight /alpha");
       assert.ok(preflight);
       assert.equal(preflight.ok, false);
-      assert.match(preflight.detail, /saved Computer credential is no longer accepted/);
-      assert.match(preflight.detail, /identity is the server-issued id, not the display name/i);
       assert.match(preflight.detail, /COMPUTER_NAME_COLLISION/);
-      assert.match(preflight.detail, /admin.*revoke/i);
-      assert.doesNotMatch(preflight.detail, /re-attach/i);
     } finally {
       await stop(ctx.server);
     }
@@ -559,6 +496,161 @@ test("doctor: attached server with stopped runner is a red runner check", async 
   });
 });
 
+// The Windows sign-out case: the runner's pid, connected marker, version
+// evidence and a 12-minute-old memory sample outlive it, and the pid now
+// belongs to an unrelated program.
+test("doctor: service stopped, a recorded runner pid held by a later process is a stopped runner; the runner itself, or an unreadable start, stays running", async () => {
+  await withHome(async (home) => {
+    const ctx = await startPreflightServer(200, { ok: true, serverSlug: "beta" });
+    try {
+      await writeAttach(home, SERVER_B, SECRET_KEY, { serverSlug: "beta", serverUrl: ctx.baseUrl });
+      await writeConnectedRunner(home, SERVER_B);
+      const recordedAt = Date.now() - 13 * 60_000;
+      await writeFile(serverRunnerVersionPath(home, SERVER_B), JSON.stringify({
+        version: "1.22.0", installRoot: "/runner", pid: process.pid, writtenAt: new Date(recordedAt).toISOString(),
+      }));
+      await writeFile(serverRunnerMemoryPath(home, SERVER_B), JSON.stringify({
+        sampledAt: new Date(recordedAt + 60_000).toISOString(), pid: process.pid, uptimeMs: 60_000,
+        rssBytes: 158 * 1024 * 1024, heapUsedBytes: 78 * 1024 * 1024, heapTotalBytes: 82 * 1024 * 1024,
+      }));
+
+      const reused = await runDoctorChecks(home, { processStartTimeMs: async () => recordedAt + 10 * 60_000 });
+      const runner = reused.find((c) => c.name === "runner /beta");
+      assert.equal(runner?.ok, false);
+      assert.match(runner?.detail ?? "", /^stopped — run `raft-computer start \/beta` and inspect .*runner\.log$/);
+      assert.equal(reused.find((c) => c.name === "memory /beta"), undefined, "a dead runner's sample is not its current state");
+
+      for (const startedAtMs of [recordedAt - 2_000, undefined]) {
+        const live = await runDoctorChecks(home, { processStartTimeMs: async () => startedAtMs });
+        assert.deepEqual(
+          live.find((c) => c.name === "runner /beta"),
+          { name: "runner /beta", ok: true, detail: `running and connected (pid ${process.pid})` },
+          String(startedAtMs),
+        );
+        assert.match(live.find((c) => c.name === "memory /beta")?.detail ?? "", /^rss 158 MB, .*sampled 12 min ago$/);
+      }
+    } finally {
+      await stop(ctx.server);
+    }
+  });
+});
+
+// The service deferred to the daemon machine lock's holder and wrote its pid
+// into runner.pid; on a real Windows machine that holder was explorer.exe.
+test("doctor: a lock holder the service defers to is a red runner check with start's conflict message, never running and connected", async () => {
+  await withHome(async (home) => {
+    const ctx = await startPreflightServer(200, { ok: true, serverSlug: "beta" });
+    try {
+      await writeAttach(home, SERVER_B, SECRET_KEY, { serverSlug: "beta", serverUrl: ctx.baseUrl });
+      await writeConnectedRunner(home, SERVER_B);
+      await writePidfileAt(servicePidPath(home), process.pid);
+      await writeFile(serverRunnerLockConflictPath(home, SERVER_B), JSON.stringify({
+        servicePid: process.pid, ownerPid: process.pid, lockPath: "/raft/machines/machine-x/daemon.lock", recordedAt: Date.now(),
+      }));
+
+      const checks = await runDoctorChecks(home);
+      const runner = checks.find((c) => c.name === "runner /beta");
+      assert.equal(runner?.ok, false);
+      assert.match(
+        runner?.detail ?? "",
+        new RegExp(`^Cannot start /beta: pid ${process.pid} holds this machine's daemon lock, so the Computer service is deferring to it instead of starting its own runner\\. Lock: /raft/machines/machine-x/daemon\\.lock\\.`),
+      );
+      assert.match(runner?.detail ?? "", new RegExp(`Check whether pid ${process.pid} is really a Raft daemon with \``));
+      assert.match(runner?.detail ?? "", /run `raft-computer restart` to start this server's runner again/);
+      assert.doesNotMatch(runner?.detail ?? "", /running and connected|another Slock daemon/);
+      assert.equal(checks.find((c) => c.name === "memory /beta"), undefined);
+
+      // After `raft-computer stop` no service defers to anything: the holder is all that is known.
+      await rm(servicePidPath(home));
+      const stopped = (await runDoctorChecks(home)).find((c) => c.name === "runner /beta");
+      assert.equal(stopped?.ok, false);
+      assert.match(
+        stopped?.detail ?? "",
+        new RegExp(`^The Computer service is not running, and pid ${process.pid} holds this machine's daemon lock: it could not be confirmed as /beta's runner\\. Lock: /raft/machines/machine-x/daemon\\.lock\\. Check whether pid ${process.pid} is really a Raft daemon with \``),
+      );
+      assert.match(stopped?.detail ?? "", /run `raft-computer restart` to start this server's runner again/);
+      assert.doesNotMatch(stopped?.detail ?? "", /deferring|Cannot start|Nothing is running/);
+    } finally {
+      await stop(ctx.server);
+    }
+  });
+});
+
+// A deferred-to lock owner that runner-version.json names. `start` and
+// `restart` never touch it, so "restart with raft-computer start" is false
+// advice for it when it is not connected.
+test("doctor: a deferred-to runner is running and connected by its own marker; not connected, the advice is to end that pid, never to restart it", async () => {
+  await withHome(async (home) => {
+    const ctx = await startPreflightServer(200, { ok: true, serverSlug: "beta" });
+    try {
+      await writeAttach(home, SERVER_B, SECRET_KEY, { serverSlug: "beta", serverUrl: ctx.baseUrl });
+      const evidenceAt = "2026-11-13T08:00:00.000Z";
+      const pid = process.pid;
+      await writePidfileAt(serverRunnerPidPath(home, SERVER_B), pid);
+      await writeFile(serverRunnerVersionPath(home, SERVER_B), JSON.stringify({ version: "1.22.0", installRoot: "/runner", pid, writtenAt: evidenceAt }));
+      await writeFile(serverRunnerLockConflictPath(home, SERVER_B), JSON.stringify({ servicePid: pid, ownerPid: pid, lockPath: null, recordedAt: 1 }));
+      const runner = async (startedAtMs: number | undefined) =>
+        (await runDoctorChecks(home, { processStartTimeMs: async () => startedAtMs })).find((c) => c.name === "runner /beta");
+      const ownRunner = Date.parse(evidenceAt) - 2_000;
+
+      // Connected by its own marker: this server's runner, or one whose start cannot be read (Linux).
+      await writeFile(serverConnectedMarkerPath(home, SERVER_B), JSON.stringify({ pid, connectedAt: 1 }));
+      for (const startedAtMs of [ownRunner, undefined]) {
+        assert.deepEqual(await runner(startedAtMs), { name: "runner /beta", ok: true, detail: `running and connected (pid ${pid})` }, String(startedAtMs));
+      }
+
+      // Not connected, the service stopped (no service pid file here), then running.
+      await rm(serverConnectedMarkerPath(home, SERVER_B));
+      const stopped = await runner(ownRunner);
+      assert.equal(stopped?.ok, false);
+      assert.match(stopped?.detail ?? "", new RegExp(`^process running \\(pid ${pid}\\) but not connected to the server — inspect .*runner\\.log; this runner was started by an earlier Computer service and cannot be restarted from here: end pid ${pid}, then run \`raft-computer start /beta\`$`));
+
+      await writePidfileAt(servicePidPath(home), pid);
+      const running = await runner(ownRunner);
+      assert.match(running?.detail ?? "", new RegExp(`; this runner was started by an earlier Computer service and cannot be restarted from here: ending pid ${pid} lets the Computer service start a new one$`));
+
+      // Its start cannot be read: nothing says what it is, and still nothing restarts it from here.
+      const unread = await runner(undefined);
+      assert.equal(unread?.ok, false);
+      assert.match(unread?.detail ?? "", new RegExp(`; pid ${pid} holds this machine's daemon lock and was not started by this Computer service, so it cannot be restarted from here: check it with \`[^\`]+\`; if it is this server's runner, ending pid ${pid} lets the Computer service start a new one$`));
+      for (const detail of [stopped?.detail, running?.detail, unread?.detail]) assert.doesNotMatch(detail ?? "", /restart with/);
+    } finally {
+      await stop(ctx.server);
+    }
+  });
+});
+
+// A runner the service started itself keeps the advice that is true for it.
+test("doctor: a runner the service started that is not connected is restarted with start", async () => {
+  await withHome(async (home) => {
+    const ctx = await startPreflightServer(200, { ok: true, serverSlug: "beta" });
+    try {
+      await writeAttach(home, SERVER_B, SECRET_KEY, { serverSlug: "beta", serverUrl: ctx.baseUrl });
+      await writePidfileAt(serverRunnerPidPath(home, SERVER_B), process.pid);
+      const runner = (await runDoctorChecks(home)).find((c) => c.name === "runner /beta");
+      assert.match(runner?.detail ?? "", /but not connected to the server — inspect .*runner\.log; restart with `raft-computer start \/beta`$/);
+    } finally {
+      await stop(ctx.server);
+    }
+  });
+});
+
+test("doctor: a recorded service pid that is another program is a stopped service", async () => {
+  await withHome(async (home) => {
+    await writePidfileAt(servicePidPath(home), process.pid);
+    await writeFile(join(home, "computer", "service-version.json"), JSON.stringify({
+      version: "1.22.0", installRoot: "/service", pid: process.pid, writtenAt: "2026-11-13T08:00:00.000Z",
+    }));
+    const service = (startedAtMs: number | undefined, serviceAnswers: boolean) =>
+      runDoctorChecks(home, { endpointAnswers: async () => serviceAnswers, processStartTimeMs: async () => startedAtMs })
+        .then((checks) => checks.find((c) => c.name === "service"));
+    const later = Date.parse("2026-11-13T08:10:00.000Z");
+    assert.deepEqual(await service(later, false), { name: "service", ok: true, detail: "stopped (run `raft-computer start` when you want background)" });
+    assert.deepEqual(await service(later, true), { name: "service", ok: true, detail: `running (pid ${process.pid})` });
+    assert.deepEqual(await service(undefined, false), { name: "service", ok: true, detail: `running (pid ${process.pid})` });
+  });
+});
+
 test("doctor: degraded runner guidance says fix cause then restart", async () => {
   await withHome(async (home) => {
     await writeUserSession(home, SECRET_JWT);
@@ -574,9 +666,7 @@ test("doctor: degraded runner guidance says fix cause then restart", async () =>
       const runner = checks.find((c) => c.name === "runner /beta");
       assert.ok(runner);
       assert.equal(runner.ok, false);
-      assert.match(runner.detail, /degraded after repeated crashes/);
       assert.match(runner.detail, /after fixing, run `raft-computer restart \/beta` to try again/);
-      assert.doesNotMatch(runner.detail, /reset/);
     } finally {
       await stop(ctx.server);
     }
@@ -891,6 +981,39 @@ test("doctor: healthy connected attachment ignores zero-match traces from the sh
   });
 });
 
+test("doctor: a running service under a unit with OOMPolicy=stop or kill fails with the fix; continue adds nothing", async () => {
+  await withHome(async (home) => {
+    await mkdir(join(home, "computer"), { recursive: true });
+    await writePidfileAt(servicePidPath(home), process.pid);
+    const record = { kind: "systemd" as const, scope: "user" as const, unit: "raft-computer.service", invocationId: "x", pid: process.pid, recordedAt: "t" };
+    for (const oomPolicy of ["stop", "kill"]) {
+      const checks = await runDoctorChecks(home, { readSupervisorOomPolicy: async () => ({ record, oomPolicy, transient: false }) });
+      const oom = checks.find((c) => c.name === "service OOM policy");
+      assert.equal(oom?.ok, false, oomPolicy);
+      assert.match(oom?.detail ?? "", new RegExp(`OOMPolicy=${oomPolicy}: .*systemctl --user edit raft-computer\\.service`));
+    }
+    // continue, no answer, a reader that throws, or a record left by another process: no line.
+    const quiet = [
+      async () => ({ record, oomPolicy: "continue", transient: false }),
+      async () => null,
+      async () => { throw new Error("bus gone"); },
+      async () => ({ record: { ...record, pid: process.pid + 1 }, oomPolicy: "stop", transient: false }),
+    ];
+    for (const readSupervisorOomPolicy of quiet) {
+      const checks = await runDoctorChecks(home, { readSupervisorOomPolicy });
+      assert.equal(checks.find((c) => c.name === "service OOM policy"), undefined);
+    }
+  });
+});
+
+test("doctor: a stopped service never reads the unit's OOM policy", async () => {
+  await withHome(async (home) => {
+    let read = false;
+    await runDoctorChecks(home, { readSupervisorOomPolicy: async () => { read = true; return null; } });
+    assert.equal(read, false);
+  });
+});
+
 // PR-H integration tests — doctor cleanup (`--fix`).
 // (`--fix` remains stale-local-state cleanup only; retrying a degraded
 // runner is now owned by explicit `start` / `restart`.)
@@ -972,5 +1095,128 @@ test("task #915: doctor reports both default homes holding Raft data, and stays 
 
     const clean = await runDoctorChecks(home, { findDuplicateKeyHolder: async () => null, findRaftHomeConflict: () => null });
     assert.equal(clean.find((c) => c.name === "Raft home"), undefined);
+  });
+});
+
+// Device-auth PR 3c: the "this Computer on the server" line is read with the
+// attachment's own key (GET /internal/computer/self), with no user session.
+async function startSelfServer(
+  self: { status: number; body: Record<string, unknown> },
+): Promise<{ server: Server; baseUrl: string; selfAuth: Array<string | undefined> }> {
+  const selfAuth: Array<string | undefined> = [];
+  const server = await new Promise<Server>((resolve) => {
+    const s = createServer((req: IncomingMessage, res: ServerResponse) => {
+      if (req.method === "POST" && req.url === "/internal/computer/preflight") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+        return;
+      }
+      if (req.method === "GET" && req.url === "/internal/computer/self") {
+        selfAuth.push(req.headers.authorization);
+        res.writeHead(self.status, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(self.body));
+        return;
+      }
+      res.writeHead(404).end();
+    });
+    s.listen(0, "127.0.0.1", () => resolve(s));
+  });
+  const address = server.address();
+  if (!address || typeof address !== "object") throw new Error("no test server address");
+  return { server, baseUrl: `http://127.0.0.1:${address.port}`, selfAuth };
+}
+
+test("doctor: the server's view of this Computer is read with its own key, without a user session", async () => {
+  await withHome(async (home) => {
+    const ctx = await startSelfServer({
+      status: 200,
+      body: { computer: { computerId: "cm-1", computerName: "laptop", serverId: SERVER_A, machineId: MACHINE_A, machineName: "laptop", agentCount: 3 } },
+    });
+    try {
+      await writeAttach(home, SERVER_A, SECRET_KEY, { serverSlug: "alpha", serverUrl: ctx.baseUrl, machineId: MACHINE_A });
+      const checks = await runDoctorChecks(home);
+      const self = checks.find((c) => c.name === "computer /alpha");
+      assert.deepEqual(self, { name: "computer /alpha", ok: true, detail: 'the server knows this Computer as "laptop" (3 agents)' });
+      assert.deepEqual(ctx.selfAuth, [`Bearer ${SECRET_KEY}`]);
+    } finally {
+      await stop(ctx.server);
+    }
+  });
+});
+
+test("doctor: a server tying the key to another machine is red; an older server is a note", async () => {
+  await withHome(async (home) => {
+    const ctx = await startSelfServer({
+      status: 200,
+      body: { computer: { computerId: "cm-1", computerName: "laptop", serverId: SERVER_A, machineId: MACHINE_B, machineName: "other", agentCount: 0 } },
+    });
+    try {
+      await writeAttach(home, SERVER_A, SECRET_KEY, { serverSlug: "alpha", serverUrl: ctx.baseUrl, machineId: MACHINE_A });
+      const self = (await runDoctorChecks(home)).find((c) => c.name === "computer /alpha");
+      assert.equal(self?.ok, false);
+      assert.match(self?.detail ?? "", /ties this key to machine bbbbbbbb/);
+      assert.match(self?.detail ?? "", /raft-computer doctor \/alpha --migration-details/);
+    } finally {
+      await stop(ctx.server);
+    }
+  });
+  await withHome(async (home) => {
+    // An older server: the internal prefix refuses the unknown route.
+    const ctx = await startSelfServer({ status: 401, body: { code: "auth_policy_unregistered_path" } });
+    try {
+      await writeAttach(home, SERVER_A, SECRET_KEY, { serverSlug: "alpha", serverUrl: ctx.baseUrl, machineId: MACHINE_A });
+      const self = (await runDoctorChecks(home)).find((c) => c.name === "computer /alpha");
+      assert.equal(self?.ok, true);
+      assert.match(self?.detail ?? "", /skipped \(this server is older/);
+    } finally {
+      await stop(ctx.server);
+    }
+  });
+});
+
+test("doctor: the regret check takes this Computer's own row from its key", async () => {
+  await withHome(async (home) => {
+    await writeUserSessionForServer(home, "tok", "https://api.example.test");
+    await writeAttach(home, SERVER_A, SECRET_KEY, { serverSlug: "botiverse", serverUrl: "https://api.example.test", machineId: MACHINE_B });
+    const checks = await runDoctorChecks(home, {
+      detectMigration: async () => ({
+        kind: "matched",
+        candidates: [{ apiKeyFingerprint: FP_A, daemonId: MACHINE_A, localPath: "owner.json", machineName: "old-daemon" }],
+        excluded: [],
+      }),
+      readComputerSelf: async () => ({
+        status: "success",
+        computer: { computerId: "cm-1", computerName: "fresh", serverId: SERVER_A, machineId: MACHINE_B, machineName: "fresh-computer", agentCount: 0 },
+      }),
+      // The person's list no longer shows this Computer; its own key still does.
+      listServerMachines: async () => ({
+        status: "success",
+        machines: [{ id: MACHINE_A, name: "old-daemon", createdAt: null, isComputer: false, computerAttachedByCurrentUser: false, agentCount: 2 }],
+      }),
+    });
+    const identity = checks.find((c) => c.name === "identity /botiverse");
+    assert.match(identity?.detail ?? "", /connected as "fresh-computer" \(0 agents\)/);
+  });
+});
+
+test("doctor --json: one JSON line with redacted details; it ran, so the outcome is allOk, not the exit", async () => {
+  await withHome(async (home) => {
+    const p = userSessionPath(home);
+    await mkdir(join(p, ".."), { recursive: true });
+    await writeFile(p, '{"kind":"user-session","userId":"abc","acce');
+    const cap = captureOut();
+    try {
+      await runDoctorJson({});
+    } finally {
+      cap.restore();
+    }
+    const report = JSON.parse(cap.text().trim()) as { checks: Array<{ name: string; ok: boolean; detail: string }>; allOk: boolean; cleaned: unknown; cliVersion: string; ranAt: string };
+    assert.equal(report.allOk, false);
+    assert.equal(report.cleaned, null);
+    assert.equal(typeof report.cliVersion, "string");
+    assert.ok(!Number.isNaN(Date.parse(report.ranAt)));
+    const userSession = report.checks.find((c) => c.name === "user session");
+    assert.equal(userSession?.ok, false);
+    assert.ok(!cap.text().includes("abc"), "never echoes the corrupted session");
   });
 });

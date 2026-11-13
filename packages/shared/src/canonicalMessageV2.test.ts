@@ -10,8 +10,10 @@ import {
   CANONICAL_MESSAGE_V2_MANIFEST,
   CANONICAL_MESSAGE_V2_SCHEMA_VERSION,
   canonicalReactionFactsJson,
+  canonicalRetractionFactJson,
   isCanonicalMessageV2SoleApplyEligible,
   normalizeLegacyReactionRoster,
+  normalizeLegacyRetraction,
   reactionViewerOverlaySnapshotJson,
   type LegacyReactionRosterDto,
   type NormalizeLegacyReactionRosterInput,
@@ -324,5 +326,38 @@ test("neutral JSON vector executes the normalizer and pins canonical bytes plus 
       vector.viewerOverlaySha256,
       vector.name,
     );
+  }
+});
+
+test("RFC 077 retraction: deletedAt is an additive optional V2 fact key at schema 5", () => {
+  assert.equal(CANONICAL_MESSAGE_V2_MANIFEST.retraction.field, "deletedAt");
+  assert.equal(CANONICAL_MESSAGE_V2_MANIFEST.retraction.optionalKey, true);
+  assert.equal(CANONICAL_MESSAGE_V2_MANIFEST.retraction.absentPolicy, "preserve");
+  assert.deepEqual(CANONICAL_MESSAGE_V2_MANIFEST.factFields, ["deletedAt", "reactions"]);
+
+  const reactions = normalize(roster).sharedFact;
+  const live = { schemaVersion: CANONICAL_MESSAGE_V2_SCHEMA_VERSION, kind: CANONICAL_MESSAGE_V2_ENVELOPE_KIND, fact: { reactions } };
+  assert.equal(isCanonicalMessageV2SoleApplyEligible(live), true, "a fact without deletedAt stays eligible");
+  assert.equal(isCanonicalMessageV2SoleApplyEligible({
+    ...live,
+    fact: { reactions: [], ...normalizeLegacyRetraction("2026-10-20T08:15:30.123Z") },
+  }), true, "a retracted fact carries deletedAt");
+  for (const deletedAt of [null, "", " 2026-10-20T08:15:30.123Z", "not-a-time", 0]) {
+    assert.equal(isCanonicalMessageV2SoleApplyEligible({ ...live, fact: { reactions, deletedAt } }), false,
+      `deletedAt=${JSON.stringify(deletedAt)} is never a canonical value; omit the key instead`);
+  }
+  assert.equal(isCanonicalMessageV2SoleApplyEligible({ ...live, fact: { deletedAt: "2026-10-20T08:15:30.123Z" } }), false,
+    "reactions stays required");
+});
+
+test("neutral JSON vector pins the retraction fact bytes plus SHA", () => {
+  const fixture = JSON.parse(readFileSync(join(here, "canonicalMessageV2.vector.json"), "utf8"));
+  assert.equal(fixture.retractionCases.length, 4, "retracted, live null, absent key, and malformed are pinned");
+  for (const vector of fixture.retractionCases) {
+    const fact = normalizeLegacyRetraction(vector.legacyRow.deletedAt);
+    const bytes = canonicalRetractionFactJson(fact);
+    assert.deepEqual(fact, vector.expectedFact, vector.name);
+    assert.equal(bytes, vector.retractionFactJson, vector.name);
+    assert.equal(createHash("sha256").update(bytes).digest("hex"), vector.retractionFactSha256, vector.name);
   }
 });

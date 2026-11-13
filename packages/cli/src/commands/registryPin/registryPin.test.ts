@@ -407,6 +407,50 @@ test("inbox check", async () => {
   }]);
 });
 
+test("inbox check (inbox items, RFC 081)", async () => {
+  const reminderId = "76d9397d-1111-4222-8333-444455556666";
+  const rows = [
+    { target: "dm:@richard", kind: "conversation", conversationKind: "dm", unread: 3, mentions: 0, latestSender: { name: "richard", type: "user" }, preview: "can you look at the release notes?", previewTruncated: false, firstUnreadAt: "2026-10-03T11:40:00.000Z", latestAt: "2026-10-03T11:48:00.000Z", preLaunch: false },
+    { target: "app:stamp/pr-13754", kind: "app", objectRef: "pr-13754", app: { key: "stamp", name: "Stamp" }, related: { target: "#general:aaaabbbb" }, unread: 2, latestSender: { name: "Stamp", type: "app" }, preview: "checks failed on 9ed73d5", previewTruncated: true, firstUnreadAt: "2026-10-03T11:30:00.000Z", latestAt: "2026-10-03T11:35:00.000Z", preLaunch: false },
+    { target: `reminder:${reminderId}`, kind: "reminder", app: { key: "system.reminder", name: "Reminder" }, ack: [{ app: "system.reminder", id: reminderId, revision: "2" }], unread: 1, latestSender: null, preview: "check the deploy", previewTruncated: false, firstUnreadAt: "2026-10-03T11:00:00.000Z", latestAt: "2026-10-03T11:00:00.000Z", preLaunch: false },
+  ];
+  await pin(["inbox", "check"], [{
+    path: /inbox\/conversations/,
+    data: { view: "unread", items: [], rows, hasMore: false, nextBeforeSeq: null, totals: { conversations: 1, dms: 1, mentions: 0 }, preLaunch: { count: 9, before: "2026-09-01" }, omitted: { app: 0, reminder: 1 } },
+  }]);
+});
+
+test("inbox read / dismiss", async () => {
+  await pin(["inbox", "read", "--target", "#general"], [{
+    method: "POST",
+    path: /inbox\/read$/,
+    data: {
+      target: "#general",
+      kind: "conversation",
+      entries: [
+        { seq: 1201, message_id: MSG_PARENT, channel_type: "channel", channel_name: "general", timestamp: "2026-10-03T11:40:00.000Z", sender_type: "human", sender_name: "richard", content: "deploy is green" },
+        { seq: 1202, message_id: MSG_REPLY, channel_type: "channel", channel_name: "general", timestamp: "2026-10-03T11:41:00.000Z", sender_type: "agent", sender_name: "scout", content: "thanks" },
+      ],
+      unreadBefore: 4,
+      remaining: 2,
+      remainingCapped: false,
+      consumed: false,
+      nextCursor: null,
+    },
+  }]);
+  await pin(["inbox", "read", "--target", "#general"], [{
+    method: "POST",
+    path: /inbox\/read$/,
+    response: { ok: false, status: 404, error: "Inbox items are off", errorCode: "INBOX_ITEMS_DISABLED", data: null },
+  }], undefined, "inbox items off");
+  await pin(["inbox", "dismiss", "--before", "2026-09-01"], [{
+    method: "POST",
+    path: /inbox\/dismiss$/,
+    data: { dismissed: 9, conversations: 9, appItems: 0, skippedNeedsAck: 1, earliestActivityAt: "2026-08-02T18:00:00.000Z", remaining: 0 },
+  }]);
+  await pin(["inbox", "dismiss"], [], undefined, "neither flag");
+});
+
 test("thread unfollow", async () => {
   await pin(["thread", "unfollow", "--target", "#general:aaaabbbb"], [{ path: /unfollow/, data: { ok: true } }]);
 });
@@ -472,8 +516,8 @@ test("user info", async () => {
 
 test("task list", async () => {
   const tasks = [
-    { taskNumber: 3, status: "todo", title: "Fix the staging healthcheck", createdByName: "richard", messageId: MSG_PARENT, revision: 0, description: null },
-    { taskNumber: 2, status: "in_progress", title: "Write release notes", claimedById: "agent-scout", claimedByName: "scout", createdByName: "richard", messageId: MSG_REPLY, revision: 2, description: "for 0.0.31" },
+    { taskNumber: 3, status: "todo", title: "Fix the staging healthcheck", createdByName: "richard", createdByHandle: "richard", messageId: MSG_PARENT, revision: 0, description: null },
+    { taskNumber: 2, status: "in_progress", title: "Write release notes", claimedById: "agent-scout", claimedByName: "scout", createdByName: "richard", createdByHandle: "richard", messageId: MSG_REPLY, revision: 2, description: "for 0.0.31" },
   ];
   await pin(["task", "list", "--target", "#general"], [{ path: /tasks/, data: { tasks, scope: "channel" } }]);
   await pin(["task", "list", "--mine"], [{
@@ -558,6 +602,14 @@ test("reminder schedule / list / cancel", async () => {
           fireAt: "2026-10-04T01:00:00.000Z",
           recurrence: { kind: "daily", description: "daily at 09:00 Asia/Singapore" },
         },
+        { ...reminder, reminderId: "99990000-aaaa-4222-8333-444455556666", title: "overdue check", fireAt: "2026-10-03T11:00:00.000Z", status: "fired", firedAt: "2026-10-03T11:00:00.000Z" },
+      ],
+    },
+  }]);
+  await pin(["reminder", "list", "--status", "fired"], [{
+    path: /reminders/,
+    data: {
+      reminders: [
         { ...reminder, reminderId: "99990000-aaaa-4222-8333-444455556666", title: "overdue check", fireAt: "2026-10-03T11:00:00.000Z", status: "fired", firedAt: "2026-10-03T11:00:00.000Z" },
       ],
     },
@@ -659,6 +711,16 @@ const ACTIONS: Record<string, unknown> = {
     clientKey: "deploy-dashboard",
     targetAgent: "@scout",
   },
+  "feedback:submit": {
+    type: "feedback:submit",
+    feedbackType: "problem",
+    message: "Search does not find messages in DMs",
+  },
+  "plan:upgrade": {
+    type: "plan:upgrade",
+    reason: "You asked for the launch notes from March, and Free can't show messages older than 30 days.",
+    gate: "history_30d",
+  },
 };
 
 test("action prepare", async () => {
@@ -670,13 +732,76 @@ test("action prepare", async () => {
     ));
     expect(run).toMatchSnapshot(type);
   }
+  // The Server checks the card: the CLI sends it as written and prints the refusal.
   const invalid = scrub(await runPinned(
     ["action", "prepare", "--target", "#general"],
-    [{ method: "POST", path: /action/, data: actionPrepared }],
+    [{
+      method: "POST",
+      path: /action/,
+      response: { ok: false, status: 400, error: "channel:add_member must include at least one human or agent", errorCode: "INVALID_PAYLOAD", data: null },
+    }],
     JSON.stringify({ type: "channel:add_member", channel: "#general" }),
   ));
-  expect(invalid.requests).toEqual([]);
-  expect(invalid).toMatchSnapshot("channel:add_member without members (validation failure)");
+  expect(invalid.requests).toHaveLength(1);
+  expect(invalid).toMatchSnapshot("channel:add_member without members (server refusal)");
+  // A card type this CLI doesn't know reaches the Server as written.
+  const unknownType = scrub(await runPinned(
+    ["action", "prepare", "--target", "#general"],
+    [{ method: "POST", path: /action/, data: actionPrepared }],
+    JSON.stringify({ type: "future:card", title: "Plan the offsite" }),
+  ));
+  expect(unknownType).toMatchSnapshot("a card type this CLI does not know (sent as written)");
+  // JSON without a card type is refused before anything is sent.
+  const noType = scrub(await runPinned(
+    ["action", "prepare", "--target", "#general"],
+    [{ method: "POST", path: /action/, data: actionPrepared }],
+    JSON.stringify({ name: "demo" }),
+  ));
+  expect(noType.requests).toEqual([]);
+  expect(noType).toMatchSnapshot("no type (refused before sending)");
+  // A plan:upgrade repeat within a day posts nothing; the server answers with the card already there.
+  const existing = scrub(await runPinned(
+    ["action", "prepare", "--target", "#general"],
+    [{ method: "POST", path: /action/, data: { ...actionPrepared, existing: true } }],
+    JSON.stringify(ACTIONS["plan:upgrade"]),
+  ));
+  expect(existing).toMatchSnapshot("plan:upgrade already posted (existing)");
+  // An upgrade card takes the reason and the gate only: the Server refuses any other field, saying why and what to do.
+  const withText = scrub(await runPinned(
+    ["action", "prepare", "--target", "#general"],
+    [{
+      method: "POST",
+      path: /action/,
+      response: {
+        ok: false,
+        status: 400,
+        error: 'The card was refused: plan:upgrade takes only "reason" and an optional "gate". Remove the other fields.',
+        errorCode: "INVALID_ACTION",
+        suggestedNextAction: "Fix the fields named above and prepare the card again.",
+        data: null,
+      },
+    }],
+    JSON.stringify({ ...ACTIONS["plan:upgrade"] as object, message: "Upgrade!" }),
+  ));
+  expect(withText.requests).toHaveLength(1);
+  expect(withText).toMatchSnapshot("plan:upgrade with agent text (server refusal)");
+  // In a shared channel the server refuses it; the agent reads why and where to post instead.
+  const shared = scrub(await runPinned(
+    ["action", "prepare", "--target", "#partners"],
+    [{
+      method: "POST",
+      path: /action/,
+      response: {
+        ok: false,
+        status: 403,
+        error: "Upgrade cards can't be posted in a shared channel: upgrading is for this server's own people. Post it in one of this server's channels or a DM instead.",
+        errorCode: "JOINT_CHANNEL_NOT_ALLOWED",
+        data: null,
+      },
+    }],
+    JSON.stringify(ACTIONS["plan:upgrade"]),
+  ));
+  expect(shared).toMatchSnapshot("plan:upgrade in a shared channel (server refusal)");
 });
 
 test("server error responses", async () => {

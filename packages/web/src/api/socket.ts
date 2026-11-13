@@ -1,4 +1,5 @@
 import { io } from "socket.io-client";
+import { AGENT_ACTIVITY_SUBSCRIPTIONS_CAPABILITY } from "@botiverse/raft-shared";
 import type { Socket } from "socket.io-client";
 import { useServerStore } from "../store/serverStore";
 import { useAuthStore } from "../store/authStore";
@@ -14,7 +15,7 @@ import {
   parseAccessTokenExp,
 } from "../utils/socketReconnectAuthRefresh";
 import { prefetchServerFeatureFlags } from "../store/serverFeatureFlags";
-import { assertValidDesktopRuntimeEnvironment, RUNTIME_SOCKET_ORIGIN } from "../desktopRuntimeEnvironment";
+import { RUNTIME_SOCKET_ORIGIN } from "../runtimeEndpoints";
 import { isElectronDesktopShell } from "../utils/desktopShell";
 
 let socket: Socket | null = null;
@@ -28,6 +29,9 @@ function freshAuth() {
     // Raft Desktop runs this same web code. Identifying it lets the server
     // tell "using the desktop app" apart from a browser tab (task #725).
     clientKind: isElectronDesktopShell() ? "desktop" : "web",
+    // Detailed agent activity only for the agents a surface on screen
+    // subscribes to; the coarse state for the rest (store/agentActivitySubscriptions.ts).
+    capabilities: [AGENT_ACTIVITY_SUBSCRIPTIONS_CAPABILITY],
   };
 }
 
@@ -36,10 +40,22 @@ export function updateSocketAuthFromStorage() {
   socket.auth = freshAuth();
 }
 
+const socketCreatedListeners = new Set<(created: Socket) => void>();
+
+/**
+ * Calls `listener` each time a new socket instance replaces the old one
+ * (`reconnectSocket()` / `resetSocket()` drop every listener on the old one),
+ * so a module-level subscriber can attach to the new instance.
+ */
+export function onSocketCreated(listener: (created: Socket) => void): () => void {
+  socketCreatedListeners.add(listener);
+  return () => {
+    socketCreatedListeners.delete(listener);
+  };
+}
+
 export function getSocket(): Socket {
   if (!socket) {
-    assertValidDesktopRuntimeEnvironment();
-
     socket = io(RUNTIME_SOCKET_ORIGIN, {
       autoConnect: false,
       forceNew: true,
@@ -50,6 +66,8 @@ export function getSocket(): Socket {
       // Auth is refreshed by setting socket.auth before each connect() call.
       auth: freshAuth(),
     });
+    const created = socket;
+    for (const listener of [...socketCreatedListeners]) listener(created);
   }
   return socket;
 }
@@ -82,7 +100,7 @@ export function connectSocket() {
         try {
           let ok = false;
           try {
-            ok = await useAuthStore.getState().refreshAccessToken();
+            ok = await useAuthStore.getState().refreshAccessToken("socket_connect_error");
           } catch (refreshErr) {
             // Transient refresh failures should not force logout.
             console.warn("[Socket.io] Refresh failed transiently:", refreshErr);
@@ -186,7 +204,7 @@ async function runReconnectAuthRefresh(s: Socket): Promise<void> {
   refreshingForSocket = true;
   try {
     try {
-      await useAuthStore.getState().refreshAccessToken();
+      await useAuthStore.getState().refreshAccessToken("socket_reconnect");
     } catch (err) {
       console.warn("[Socket.io] Reconnect token refresh failed:", err);
     }

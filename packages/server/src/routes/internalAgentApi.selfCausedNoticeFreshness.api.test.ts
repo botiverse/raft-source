@@ -8,7 +8,8 @@ import { and, eq, gt, max } from "drizzle-orm";
 import { getDb } from "../db/index";
 import { channels, inboxNotificationFacts, messages, tasks, users } from "../db/schema";
 import { createServer } from "../services/serverService";
-import { assignMachine, createAgent } from "../services/agentService";
+import { createAgent } from "../services/agentService";
+import { placeAgentOnMachine } from "../test/agentMachineFixture";
 import { addAgent, addHuman, createChannel } from "../services/channelService";
 import { mintAgentCredential } from "../services/agentCredentialService";
 import { registerMachine } from "../services/machineService";
@@ -19,9 +20,9 @@ import * as attestedSendService from "../services/attestedSendService";
 // recorded as caused by that same agent (`messages.causal_actor_*`) when the
 // notice kind is in SELF_CAUSED_FRESHNESS_EXEMPT_SUBTYPES. Notices caused by
 // anyone else, with no recorded causal actor, or of an unlisted kind (the
-// agent's own task.lifecycle_thread / channel.rename included) still hold.
+// agent's own channel.rename included) still hold.
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 type Fixture = {
   serverId: string;
@@ -70,11 +71,12 @@ async function seedFixture(baseUrl: string): Promise<Fixture> {
   await addHuman(channel.id, owner.id);
   await addAgent(channel.id, agent.id);
   const { machine, apiKey: machineApiKey } = await registerMachine(server.id, owner.id, "self-caused-notice-daemon");
-  await assignMachine(agent.id, machine.id);
+  await placeAgentOnMachine(agent.id, machine.id);
   const minted = await mintAgentCredential({
     agentId: agent.id,
     scopes: ["send", "read", "tasks"],
     name: "self-caused-notice",
+    issuedVia: "computer",
     createdByUserId: null,
   });
 
@@ -106,6 +108,7 @@ async function seedPeerAgent(f: Fixture): Promise<Fixture> {
     agentId: peer.id,
     scopes: ["send", "read", "tasks"],
     name: "self-caused-notice-peer",
+    issuedVia: "computer",
     createdByUserId: null,
   });
   return { ...f, agentId: peer.id, agentApiKey: minted.apiKey };
@@ -348,7 +351,7 @@ test("thread: human-caused task.lifecycle_thread after boundary -> held", async 
   }), notice);
 });
 
-test("thread: agent's own task.lifecycle_thread after boundary -> held (kind not exempt)", async ({ app }) => {
+test("thread: agent's own task.lifecycle_thread after boundary -> sent (its response names the task)", async ({ app }) => {
   const f = await seedFixture(app.baseUrl);
   const task = await agentTaskSettled(app.baseUrl, f, "thread own close task");
   const boundary = await globalMaxSeq();
@@ -356,9 +359,9 @@ test("thread: agent's own task.lifecycle_thread after boundary -> held (kind not
   const notice = await waitForNotice(() => threadChannelIdFor(task.messageId), "task.lifecycle_thread", boundary);
   assertCausalActor(notice, "agent", f.agentId);
 
-  assertHeldOnly(await sendViaAgentApi(app.baseUrl, f, {
+  assertSent(await sendViaAgentApi(app.baseUrl, f, {
     target: threadTarget(f, task.messageId), content: "own notice", seenUpToSeq: boundary,
-  }), notice);
+  }));
 });
 
 test("thread: agent's own exempt-kind notice in the thread after boundary -> sent", async ({ app }) => {
@@ -408,6 +411,7 @@ const EXPECTED_EXEMPT_KINDS = [
   "task.created_summary",
   "task.assignment_receipt",
   "task.converted_summary",
+  "task.lifecycle_thread",
 ];
 
 test("exempt kind allowlist is exactly the checked kinds", () => {
@@ -428,7 +432,7 @@ for (const producer of EXPECTED_EXEMPT_KINDS) {
   });
 }
 
-for (const producer of ["channel.rename", "task.lifecycle_thread", "test.self_caused_unlisted_kind"]) {
+for (const producer of ["channel.rename", "test.self_caused_unlisted_kind"]) {
   test(`channel: agent's own ${producer} after boundary -> held (kind not exempt)`, async ({ app }) => {
     const f = await seedFixture(app.baseUrl);
     const boundary = await globalMaxSeq();

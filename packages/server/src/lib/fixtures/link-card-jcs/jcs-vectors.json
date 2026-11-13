@@ -1,0 +1,1307 @@
+[
+  {
+    "name": "jcs_empty_object",
+    "layer": "jcs",
+    "input_json": " {\n} ",
+    "canonical": "{}",
+    "sha256_hex": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+    "expect": "ok",
+    "note": "Empty object; surrounding whitespace dropped."
+  },
+  {
+    "name": "jcs_empty_containers",
+    "layer": "jcs",
+    "input_json": "{ \"b\" : [ ] , \"a\" : { } }",
+    "canonical": "{\"a\":{},\"b\":[]}",
+    "sha256_hex": "aeeba1e56a144077f89e26c930dad7cf933e9383cfb8e33ddff618233b29be76",
+    "expect": "ok",
+    "note": "Empty array and empty object as values."
+  },
+  {
+    "name": "jcs_whitespace_all_four_kinds",
+    "layer": "jcs",
+    "input_json": "\t{\r\n \"b\":\"2\",\n\t\"a\" :\t\"1\"\r\n}\n",
+    "canonical": "{\"a\":\"1\",\"b\":\"2\"}",
+    "sha256_hex": "21f76dfbfe6dfe21f762080ef484112cf2952974cef30741fd1931e1c6d92112",
+    "expect": "ok",
+    "note": "Only space, tab, LF, CR are JSON whitespace; all removed."
+  },
+  {
+    "name": "jcs_key_order_ascii",
+    "layer": "jcs",
+    "input_json": "{\"b\":\"\",\"aa\":\"\",\"_\":\"\",\"a\":\"\",\"A\":\"\",\"1\":\"\"}",
+    "canonical": "{\"1\":\"\",\"A\":\"\",\"_\":\"\",\"a\":\"\",\"aa\":\"\",\"b\":\"\"}",
+    "sha256_hex": "5c4e488f57c62c178908a55b1e926182b2676feb1b504c17cc244e89afad1493",
+    "expect": "ok",
+    "note": "Plain code-unit order: '1' < 'A' < '_' < 'a' < 'aa' < 'b' (shorter prefix first)."
+  },
+  {
+    "name": "jcs_empty_key_sorts_first",
+    "layer": "jcs",
+    "input_json": "{\"a\":\"x\",\"\":\"empty\"}",
+    "canonical": "{\"\":\"empty\",\"a\":\"x\"}",
+    "sha256_hex": "e1a21f88d8f29f26cf005dabc8a822d95585bca22ec68eb10c7226505f9d906f",
+    "expect": "ok",
+    "note": "Empty string is a legal key and sorts first."
+  },
+  {
+    "name": "jcs_key_with_nul_between_prefix_and_longer",
+    "layer": "jcs",
+    "input_json": "{\"ab\":\"3\",\"a\\u0000\":\"2\",\"a\":\"1\"}",
+    "canonical": null,
+    "sha256_hex": null,
+    "expect": "reject",
+    "note": "Addendum 4 §4: a key containing a C0 control character (here U+0000) is refused. Sort coverage moved to jcs_key_with_space_and_del_around_longer."
+  },
+  {
+    "name": "jcs_key_with_space_and_del_around_longer",
+    "layer": "jcs",
+    "input_json": "{\"a\\u007f\":\"4\",\"ab\":\"3\",\"a \":\"2\",\"a\":\"1\"}",
+    "canonical": "{\"a\":\"1\",\"a \":\"2\",\"ab\":\"3\",\"a\":\"4\"}",
+    "sha256_hex": "ab69880383e96c9e141007e66fd6c090d339f7ce44d68e2604bc8f31d05a894f",
+    "expect": "ok",
+    "note": "'a' < 'a ' (0020, the lowest non-C0 code unit) < 'ab' < 'a\\u007f' (DEL sorts after 'b'): the shorter prefix first. DEL is not C0 and is written raw, not escaped."
+  },
+  {
+    "name": "jcs_rfc8785_sort_example_strings",
+    "layer": "jcs",
+    "input_json": "{\"\\u20ac\":\"Euro Sign\",\"\\r\":\"Carriage Return\",\"\\ufb33\":\"Hebrew Letter Dalet With Dagesh\",\"1\":\"One\",\"\\ud83d\\ude00\":\"Emoji: Grinning Face\",\"\\u0080\":\"Control\",\"\\u00f6\":\"Latin Small Letter O With Diaeresis\"}",
+    "canonical": null,
+    "sha256_hex": null,
+    "expect": "reject",
+    "note": "Addendum 4 §4: the RFC 8785 §3.2.3 example has a \"\\r\" key, a C0 control character, so it is refused. Sort coverage moved to jcs_rfc8785_sort_example_space_key."
+  },
+  {
+    "name": "jcs_rfc8785_sort_example_space_key",
+    "layer": "jcs",
+    "input_json": "{\"\\u20ac\":\"Euro Sign\",\" \":\"Space\",\"\\ufb33\":\"Hebrew Letter Dalet With Dagesh\",\"1\":\"One\",\"\\ud83d\\ude00\":\"Emoji: Grinning Face\",\"\\u0080\":\"Control\",\"\\u00f6\":\"Latin Small Letter O With Diaeresis\"}",
+    "canonical": "{\" \":\"Space\",\"1\":\"One\",\"\":\"Control\",\"ö\":\"Latin Small Letter O With Diaeresis\",\"€\":\"Euro Sign\",\"😀\":\"Emoji: Grinning Face\",\"דּ\":\"Hebrew Letter Dalet With Dagesh\"}",
+    "sha256_hex": "5e89f2e0363318e9dca5db7d53e82689d15c8b1091672f4a5bc02a541d6a1115",
+    "expect": "ok",
+    "note": "RFC 8785 §3.2.3 sort example with string values, its '\\r' key replaced by ' ' (U+0020) per addendum 4 §4; the space still sorts first. U+1F600 (UTF-16 D83D DE00) sorts BEFORE U+FB33: code-unit order, not code-point order. U+0080 is not escaped."
+  },
+  {
+    "name": "jcs_reject_key_escape_char",
+    "layer": "jcs",
+    "input_json": "{\"\\u001b\":\"x\"}",
+    "canonical": null,
+    "sha256_hex": null,
+    "expect": "reject",
+    "note": "Addendum 4 §4: key U+001B (the key Node v24 JSON.parse can misdecode as a backslash) is refused."
+  },
+  {
+    "name": "jcs_reject_key_c0_short_escape_nested",
+    "layer": "jcs",
+    "input_json": "{\"a\":[{\"b\":{\"\\t\":\"x\"}}]}",
+    "canonical": null,
+    "sha256_hex": null,
+    "expect": "reject",
+    "note": "Addendum 4 §4: a C0 key is refused at any depth, inside arrays too, and \\t is treated like \\u0009."
+  },
+  {
+    "name": "jcs_c0_in_value_and_escaped_backslash_key",
+    "layer": "jcs",
+    "input_json": "{\"\\\\u001b\":\"line1\\nline2\\u001b\"}",
+    "canonical": "{\"\\\\u001b\":\"line1\\nline2\\u001b\"}",
+    "sha256_hex": "e3751c5ea185f1beec35d94388303438097cc407d6b89f2a8187669a21ba0c11",
+    "expect": "ok",
+    "note": "Addendum 4 §4 applies to keys only: C0 characters in a value pass, and the key here is a literal backslash followed by 'u001b' (no control character)."
+  },
+  {
+    "name": "jcs_non_bmp_sorts_before_high_bmp",
+    "layer": "jcs",
+    "input_json": "{\"�\":\"FFFD\",\"\":\"E000\",\"𠀀\":\"20000\",\"😀\":\"1F600\",\"中\":\"4E2D\"}",
+    "canonical": "{\"中\":\"4E2D\",\"😀\":\"1F600\",\"𠀀\":\"20000\",\"\":\"E000\",\"�\":\"FFFD\"}",
+    "sha256_hex": "b161c1181029a684e68c04349d91bc0343be1ac005b39683ac253db7de89c47f",
+    "expect": "ok",
+    "note": "Raw UTF-8 keys. UTF-16 order: 中(4E2D) < 😀(D83D) < 𠀀(D840) < U+E000 < U+FFFD. Code-point order would put E000/FFFD before both non-BMP keys; sorting by code points or by UTF-8 bytes gives a different (wrong) result."
+  },
+  {
+    "name": "jcs_keys_differ_only_in_surrogates",
+    "layer": "jcs",
+    "input_json": "{\"\\ud83e\\udd16\":\"robot U+1F916\",\"\\ud83d\\ude42\":\"slight smile U+1F642\",\"\\ud83d\\ude01\":\"grin U+1F601\",\"\\ud83d\\ude00\":\"grinning U+1F600\"}",
+    "canonical": "{\"😀\":\"grinning U+1F600\",\"😁\":\"grin U+1F601\",\"🙂\":\"slight smile U+1F642\",\"🤖\":\"robot U+1F916\"}",
+    "sha256_hex": "129fca0d80a1d2bb3ffd5fd3aa8aa072231004eba46fd7b20f19b4a5954403f4",
+    "expect": "ok",
+    "note": "Emoji keys sharing or differing in the high surrogate: D83D DE00 < D83D DE01 < D83D DE42 < D83E DD16."
+  },
+  {
+    "name": "jcs_cjk_keys",
+    "layer": "jcs",
+    "input_json": "{\"标题\":\"c\",\"名称\":\"b\",\"名\":\"a\",\"z\":\"z\"}",
+    "canonical": "{\"z\":\"z\",\"名\":\"a\",\"名称\":\"b\",\"标题\":\"c\"}",
+    "sha256_hex": "6679a9a835e227293ab4258f00ff5217087d3615fc02964b4d1ccaef3cce6de5",
+    "expect": "ok",
+    "note": "CJK keys: 'z'(007A) < 名(540D) < 名称(540D 79F0) < 标题(6807); prefix shorter first."
+  },
+  {
+    "name": "jcs_key_escape_equivalent",
+    "layer": "jcs",
+    "input_json": "{\"\\u0062\":\"1\",\"a\":\"2\",\"\\u00E9\":\"3\"}",
+    "canonical": "{\"a\":\"2\",\"b\":\"1\",\"é\":\"3\"}",
+    "sha256_hex": "ab6b3ca70118a7b1d4152a9ac666d7a395f439bf4c0abe53bf30ce9163d5d12f",
+    "expect": "ok",
+    "note": "Escaped keys are compared after unescaping: \\u0062 is 'b', \\u00E9 is 'é' (raw in output)."
+  },
+  {
+    "name": "jcs_escape_all_c0_controls",
+    "layer": "jcs",
+    "input_json": "{\"s\":\"\\u0000\\u0001\\u0002\\u0003\\u0004\\u0005\\u0006\\u0007\\u0008\\u0009\\u000A\\u000B\\u000c\\u000D\\u000E\\u000f\\u0010\\u0011\\u0012\\u0013\\u0014\\u0015\\u0016\\u0017\\u0018\\u0019\\u001A\\u001b\\u001C\\u001D\\u001e\\u001F\"}",
+    "canonical": "{\"s\":\"\\u0000\\u0001\\u0002\\u0003\\u0004\\u0005\\u0006\\u0007\\b\\t\\n\\u000b\\f\\r\\u000e\\u000f\\u0010\\u0011\\u0012\\u0013\\u0014\\u0015\\u0016\\u0017\\u0018\\u0019\\u001a\\u001b\\u001c\\u001d\\u001e\\u001f\"}",
+    "sha256_hex": "03850482fbc7152f63d9bf30cc9c9d258ea8fcd82747e6cff884acc3509e9710",
+    "expect": "ok",
+    "note": "All U+0000..U+001F written as \\uXXXX (mixed hex case). Output: only \\b \\t \\n \\f \\r use short forms; every other control is \\u00xx with lowercase hex."
+  },
+  {
+    "name": "jcs_escape_short_forms_in_input",
+    "layer": "jcs",
+    "input_json": "{\"s\":\"\\b\\f\\n\\r\\t\\\"\\\\\\/\"}",
+    "canonical": "{\"s\":\"\\b\\f\\n\\r\\t\\\"\\\\/\"}",
+    "sha256_hex": "9019e5310ea81e53c088bbd8a36258efdfc463ec2ea392eca0d12e3298b6b95c",
+    "expect": "ok",
+    "note": "All JSON short escapes in input. Output keeps \\b \\f \\n \\r \\t \\\" \\\\ but '\\/' becomes a bare '/'."
+  },
+  {
+    "name": "jcs_solidus_escaped",
+    "layer": "jcs",
+    "input_json": "{\"u\":\"https:\\/\\/stamp.build\\/pr\\/1\"}",
+    "canonical": "{\"u\":\"https://stamp.build/pr/1\"}",
+    "sha256_hex": "2b94bdcbf79c0bbc18e6d763c056a81f4b2b356745bb0520cb5c100e8e273547",
+    "expect": "ok",
+    "note": "Same digest as jcs_solidus_raw: '/' is never escaped in output."
+  },
+  {
+    "name": "jcs_solidus_raw",
+    "layer": "jcs",
+    "input_json": "{ \"u\": \"https://stamp.build/pr/1\" }",
+    "canonical": "{\"u\":\"https://stamp.build/pr/1\"}",
+    "sha256_hex": "2b94bdcbf79c0bbc18e6d763c056a81f4b2b356745bb0520cb5c100e8e273547",
+    "expect": "ok",
+    "note": "Same digest as jcs_solidus_escaped."
+  },
+  {
+    "name": "jcs_del_and_c1_not_escaped",
+    "layer": "jcs",
+    "input_json": "{\"s\":\"\\u007f|\\u0080|\\u009F\"}",
+    "canonical": "{\"s\":\"||\"}",
+    "sha256_hex": "7d1f4e5d0158327c1ba00f2f063e9639efba1379aaa26be3c620fa30cc990434",
+    "expect": "ok",
+    "note": "DEL (U+007F) and C1 controls (U+0080..U+009F) are NOT escaped; they are emitted as raw UTF-8."
+  },
+  {
+    "name": "jcs_u2028_u2029_escaped_input",
+    "layer": "jcs",
+    "input_json": "{\"s\":\"a\\u2028b\\u2029c\"}",
+    "canonical": "{\"s\":\"a b c\"}",
+    "sha256_hex": "5b2dc062ac2d05c4b51a388dd0e99e9b161c6c6f0fefeef39629890a42902b84",
+    "expect": "ok",
+    "note": "U+2028/U+2029 are emitted raw (UTF-8 E2 80 A8 / E2 80 A9), NOT as \\u2028. Go's encoding/json escapes them; do not use it for output. Same digest as jcs_u2028_u2029_raw_input."
+  },
+  {
+    "name": "jcs_u2028_u2029_raw_input",
+    "layer": "jcs",
+    "input_json": "{\n  \"s\": \"a b c\"\n}",
+    "canonical": "{\"s\":\"a b c\"}",
+    "sha256_hex": "5b2dc062ac2d05c4b51a388dd0e99e9b161c6c6f0fefeef39629890a42902b84",
+    "expect": "ok",
+    "note": "Raw U+2028/U+2029 in input; same digest as jcs_u2028_u2029_escaped_input."
+  },
+  {
+    "name": "jcs_html_chars_not_escaped",
+    "layer": "jcs",
+    "input_json": "{\"s\":\"<a href=\\\"x\\\">&amp;</a> \\u003c\\u003e\\u0026 \\u0027\"}",
+    "canonical": "{\"s\":\"<a href=\\\"x\\\">&amp;</a> <>& '\"}",
+    "sha256_hex": "d2b6820ab2e32ec939fde5d6827c68ff2b80b46bed987aea302630caeb4f1486",
+    "expect": "ok",
+    "note": "<, >, &, ' are never escaped (Go's default SetEscapeHTML(true) would emit \\u003c etc.)."
+  },
+  {
+    "name": "jcs_non_ascii_escaped_input",
+    "layer": "jcs",
+    "input_json": "{\"s\":\"\\u00e9\\u4E2D\\uD83D\\uDE00\\ufffd\"}",
+    "canonical": "{\"s\":\"é中😀�\"}",
+    "sha256_hex": "82ba6a1805059938d990d596c4670e9c5561948d775ac328f9a296b66316e25a",
+    "expect": "ok",
+    "note": "Escaped non-ASCII (incl. uppercase-hex surrogate pair) emitted as raw UTF-8: é中😀�. Same digest as jcs_non_ascii_raw_input. U+FFFD itself is valid."
+  },
+  {
+    "name": "jcs_non_ascii_raw_input",
+    "layer": "jcs",
+    "input_json": "{ \"s\":\"é中😀�\" }",
+    "canonical": "{\"s\":\"é中😀�\"}",
+    "sha256_hex": "82ba6a1805059938d990d596c4670e9c5561948d775ac328f9a296b66316e25a",
+    "expect": "ok",
+    "note": "Raw UTF-8; same digest as jcs_non_ascii_escaped_input."
+  },
+  {
+    "name": "jcs_nfc_precomposed",
+    "layer": "jcs",
+    "input_json": "{\"s\":\"caf\\u00e9\"}",
+    "canonical": "{\"s\":\"café\"}",
+    "sha256_hex": "298ebe9dfd0022919780451da01d6ff22cd701ae9f614b77522b751906ac2784",
+    "expect": "ok",
+    "note": "NFC 'café' (U+00E9). Different digest from jcs_nfd_decomposed: JCS does NOT normalize Unicode."
+  },
+  {
+    "name": "jcs_nfd_decomposed",
+    "layer": "jcs",
+    "input_json": "{\"s\":\"cafe\\u0301\"}",
+    "canonical": "{\"s\":\"café\"}",
+    "sha256_hex": "01e83133e8239890d58d0e1ec43f3c9312ea253fde7e8affb937003cdd450943",
+    "expect": "ok",
+    "note": "NFD 'café' (e + U+0301). Different digest from jcs_nfc_precomposed."
+  },
+  {
+    "name": "jcs_nfc_vs_nfd_keys",
+    "layer": "jcs",
+    "input_json": "{\"e\\u0301\":\"nfd\",\"\\u00e9\":\"nfc\"}",
+    "canonical": "{\"é\":\"nfd\",\"é\":\"nfc\"}",
+    "sha256_hex": "2571d7f8a735ecac7c10838f25335b0a0a2f665ebc75a5bd3398c77af13efd98",
+    "expect": "ok",
+    "note": "NFC and NFD forms are DIFFERENT keys (not duplicates); 'e\\u0301' (0065) sorts before 'é' (00E9)."
+  },
+  {
+    "name": "jcs_quote_and_backslash",
+    "layer": "jcs",
+    "input_json": "{\"s\": \"say \\\"hi\\\" C:\\\\tmp\\\\x\"}",
+    "canonical": "{\"s\":\"say \\\"hi\\\" C:\\\\tmp\\\\x\"}",
+    "sha256_hex": "b7d807ec92c12433975f65f60155e71fe802b8dd33b1e8a8020a47eaea88e621",
+    "expect": "ok",
+    "note": "Quote and backslash re-escaped as \\\" and \\\\."
+  },
+  {
+    "name": "jcs_nested_mixed",
+    "layer": "jcs",
+    "input_json": "{ \"z\": [ {\"b\":\"1\",\"a\":\"2\"}, [], [\"y\",\"x\"], {} ],\n  \"m\": {\"q\": {\"s\": {\"r\":\"deep\"}}, \"p\": [[[\"n\"]]]},\n  \"a\": \"first\" }",
+    "canonical": "{\"a\":\"first\",\"m\":{\"p\":[[[\"n\"]]],\"q\":{\"s\":{\"r\":\"deep\"}}},\"z\":[{\"a\":\"2\",\"b\":\"1\"},[],[\"y\",\"x\"],{}]}",
+    "sha256_hex": "57c1a680983be38e80acde1cb799998807c582eb038c0b9718da89c0e9d2c295",
+    "expect": "ok",
+    "note": "Objects sorted at every depth, including objects inside arrays; array element order preserved."
+  },
+  {
+    "name": "jcs_array_order_preserved",
+    "layer": "jcs",
+    "input_json": "{\"rows\": [\"b\", \"a\", \"c\", \"a\"]}",
+    "canonical": "{\"rows\":[\"b\",\"a\",\"c\",\"a\"]}",
+    "sha256_hex": "28b3a61e7119783914ebf7ed2767c6b85d17acbdb817d590a14292affeda7c60",
+    "expect": "ok",
+    "note": "Arrays are never sorted or deduplicated."
+  },
+  {
+    "name": "jcs_js_special_keys",
+    "layer": "jcs",
+    "input_json": "{\"toString\":\"t\",\"constructor\":\"c\",\"__proto__\":\"p\",\"hasOwnProperty\":\"h\"}",
+    "canonical": "{\"__proto__\":\"p\",\"constructor\":\"c\",\"hasOwnProperty\":\"h\",\"toString\":\"t\"}",
+    "sha256_hex": "733d085456659ac97346841e2a8e9808330b2b7d724e7bc3c86e98c1ccbcc8ef",
+    "expect": "ok",
+    "note": "Keys that are special in JS objects are ordinary strings. JS parsers must keep __proto__ as an own property (JSON.parse does; object spread / zod record rebuilding may drop it)."
+  },
+  {
+    "name": "jcs_reject_duplicate_key_same_value",
+    "layer": "jcs",
+    "input_json": "{\"a\":\"1\",\"a\":\"1\"}",
+    "canonical": null,
+    "sha256_hex": null,
+    "expect": "reject",
+    "note": "Duplicate keys are rejected even with equal values (I-JSON; JSON.parse and Go silently keep the last)."
+  },
+  {
+    "name": "jcs_reject_duplicate_key_via_escape",
+    "layer": "jcs",
+    "input_json": "{\"a\":\"1\",\"\\u0061\":\"2\"}",
+    "canonical": null,
+    "sha256_hex": null,
+    "expect": "reject",
+    "note": "\\u0061 is 'a': duplicate after unescaping."
+  },
+  {
+    "name": "jcs_reject_duplicate_key_nested",
+    "layer": "jcs",
+    "input_json": "{\"o\":{\"k\":\"1\",\"k\":\"2\"}}",
+    "canonical": null,
+    "sha256_hex": null,
+    "expect": "reject",
+    "note": "Duplicate inside a nested object."
+  },
+  {
+    "name": "jcs_reject_duplicate_key_in_array_object",
+    "layer": "jcs",
+    "input_json": "{\"rows\":[{\"k\":\"1\"},{\"k\":\"1\",\"k\":\"2\"}]}",
+    "canonical": null,
+    "sha256_hex": null,
+    "expect": "reject",
+    "note": "Duplicate inside an object in an array."
+  },
+  {
+    "name": "jcs_reject_lone_high_surrogate",
+    "layer": "jcs",
+    "input_json": "{\"s\":\"x\\ud83d\"}",
+    "canonical": null,
+    "sha256_hex": null,
+    "expect": "reject",
+    "note": "Lone high surrogate. JSON.parse accepts it and Raft canonicalJson emits \"x\\ud83d\"; Go decodes it to U+FFFD. Digests would diverge, so the strict parser MUST reject."
+  },
+  {
+    "name": "jcs_reject_lone_low_surrogate",
+    "layer": "jcs",
+    "input_json": "{\"s\":\"\\ude00x\"}",
+    "canonical": null,
+    "sha256_hex": null,
+    "expect": "reject",
+    "note": "Lone low surrogate."
+  },
+  {
+    "name": "jcs_reject_reversed_surrogate_pair_key",
+    "layer": "jcs",
+    "input_json": "{\"\\ude00\\ud83d\":\"x\"}",
+    "canonical": null,
+    "sha256_hex": null,
+    "expect": "reject",
+    "note": "Key with low+high surrogates in the wrong order (two lone surrogates)."
+  },
+  {
+    "name": "jcs_reject_high_surrogate_then_bmp",
+    "layer": "jcs",
+    "input_json": "{\"s\":\"\\ud83d\\u0041\"}",
+    "canonical": null,
+    "sha256_hex": null,
+    "expect": "reject",
+    "note": "High surrogate followed by a non-surrogate."
+  },
+  {
+    "name": "jcs_number_int",
+    "layer": "jcs",
+    "input_json": "{\"a\":1}",
+    "canonical": "{\"a\":1}",
+    "sha256_hex": "015abd7f5cc57a2dd94b7590f04ad8084273905ee33ec5cebeae62276a97f862",
+    "expect": "ok",
+    "note": "Integer at the generic layer: allowed (handle/ticket iat/exp/epoch are numbers)."
+  },
+  {
+    "name": "jcs_number_float",
+    "layer": "jcs",
+    "input_json": "{\"n\":1.5,\"a\":\"x\"}",
+    "canonical": "{\"a\":\"x\",\"n\":1.5}",
+    "sha256_hex": "4f212bcca396cab02491d59c1a031e24b6efa1da31462f9098a476f1b109a10c",
+    "expect": "ok",
+    "note": "Short decimal: ES Number formatting gives 1.5."
+  },
+  {
+    "name": "jcs_number_negative_zero",
+    "layer": "jcs",
+    "input_json": "{\"a\":-0}",
+    "canonical": "{\"a\":0}",
+    "sha256_hex": "45b619e97b5d9b029af4522e9ffb02fa99ff2bf226c82ee22a7cc10269a557e8",
+    "expect": "ok",
+    "note": "-0 canonicalizes to 0 (RFC 8785 §3.2.2.3)."
+  },
+  {
+    "name": "jcs_number_exponent",
+    "layer": "jcs",
+    "input_json": "{\"a\":[\"x\",1e2]}",
+    "canonical": "{\"a\":[\"x\",100]}",
+    "sha256_hex": "ab5cd9c7dcd1783e6ed3cfed7c0fa7294bddc298ac69163ec7a1da3995415856",
+    "expect": "ok",
+    "note": "1e2 canonicalizes to 100."
+  },
+  {
+    "name": "jcs_number_fraction_trailing_zeros",
+    "layer": "jcs",
+    "input_json": "{\"a\":2.250,\"b\":-2.25e0}",
+    "canonical": "{\"a\":2.25,\"b\":-2.25}",
+    "sha256_hex": "ca42be2dd51698ac68f05ea901283dc99d08210a12ae2d639892127078056cb6",
+    "expect": "ok",
+    "note": "2.250 and -2.25e0 canonicalize to 2.25 and -2.25."
+  },
+  {
+    "name": "jcs_true",
+    "layer": "jcs",
+    "input_json": "{\"a\":true}",
+    "canonical": "{\"a\":true}",
+    "sha256_hex": "5daa0644c4a1c43ea018f7f1ef2944b90e0165ef1f2d5669ca89e5d4f69ac597",
+    "expect": "ok",
+    "note": "Boolean at the generic layer: allowed (requiresPrepare)."
+  },
+  {
+    "name": "jcs_false",
+    "layer": "jcs",
+    "input_json": "{\"o\":{\"b\":false}}",
+    "canonical": "{\"o\":{\"b\":false}}",
+    "sha256_hex": "fae15fa754d6936d6f554409edfc9013d31ff6901f4e27d308895dfe76017263",
+    "expect": "ok",
+    "note": "Nested boolean: allowed."
+  },
+  {
+    "name": "jcs_null",
+    "layer": "jcs",
+    "input_json": "{\"a\":null}",
+    "canonical": "{\"a\":null}",
+    "sha256_hex": "d091f9c83c091f79652fe8786375b3fe4ce0861a56f5bfbafedbe431877ff0e8",
+    "expect": "ok",
+    "note": "null at the generic layer: allowed (not in descriptions)."
+  },
+  {
+    "name": "jcs_null_in_array",
+    "layer": "jcs",
+    "input_json": "{\"a\":[\"x\",null]}",
+    "canonical": "{\"a\":[\"x\",null]}",
+    "sha256_hex": "f4ebef708339c8b5032d082dd585fb81121238d01c5b7f4dd431d460d2d7ad8b",
+    "expect": "ok",
+    "note": "null inside an array: allowed at the generic layer."
+  },
+  {
+    "name": "jcs_handle_payload_shape",
+    "layer": "jcs",
+    "input_json": "{\"kind\":\"handle\",\"requiresPrepare\":true,\"epoch\":3,\"iat\":1761034530,\"exp\":1761035130,\"actionId\":\"merge\",\"binding\":{\"capabilities\":[\"confirm.v1\",\"card.v2\"],\"viewerId\":\"u1\"}}",
+    "canonical": "{\"actionId\":\"merge\",\"binding\":{\"capabilities\":[\"confirm.v1\",\"card.v2\"],\"viewerId\":\"u1\"},\"epoch\":3,\"exp\":1761035130,\"iat\":1761034530,\"kind\":\"handle\",\"requiresPrepare\":true}",
+    "sha256_hex": "ae54b6885cc3839b0c6113bf4c2bec9d3735595723141ea47ffb9d4b7fdb2b76",
+    "expect": "ok",
+    "note": "Shape of a signed handle payload: booleans and integers must survive the generic layer unchanged. Array order is preserved (the signer sorts capabilities itself; JCS does not)."
+  },
+  {
+    "name": "jcs_button_descriptor_shape",
+    "layer": "jcs",
+    "input_json": "{\"variant\":\"default\",\"label\":\"批准\",\"action\":{\"undoWindowMs\":5000,\"kind\":\"execute\",\"action_id\":\"approve\"}}",
+    "canonical": "{\"action\":{\"action_id\":\"approve\",\"kind\":\"execute\",\"undoWindowMs\":5000},\"label\":\"批准\",\"variant\":\"default\"}",
+    "sha256_hex": "8075c559d8301c4ac0e21b5985b7931fb301259e42ec3ec531bd4103be94969d",
+    "expect": "ok",
+    "note": "Shape of a Button descriptor D (§3.3) with undoWindowMs as a number."
+  },
+  {
+    "name": "jcs_reject_nan",
+    "layer": "jcs",
+    "input_json": "{\"a\":NaN}",
+    "canonical": null,
+    "sha256_hex": null,
+    "expect": "reject",
+    "note": "NaN is not JSON."
+  },
+  {
+    "name": "jcs_reject_infinity",
+    "layer": "jcs",
+    "input_json": "{\"a\":Infinity}",
+    "canonical": null,
+    "sha256_hex": null,
+    "expect": "reject",
+    "note": "Infinity is not JSON."
+  },
+  {
+    "name": "jcs_reject_leading_plus",
+    "layer": "jcs",
+    "input_json": "{\"a\":+1}",
+    "canonical": null,
+    "sha256_hex": null,
+    "expect": "reject",
+    "note": "Leading '+' is not JSON."
+  },
+  {
+    "name": "jcs_reject_leading_zero",
+    "layer": "jcs",
+    "input_json": "{\"a\":01}",
+    "canonical": null,
+    "sha256_hex": null,
+    "expect": "reject",
+    "note": "Leading zero is not JSON."
+  },
+  {
+    "name": "jcs_reject_raw_control_in_string",
+    "layer": "jcs",
+    "input_json": "{\"s\":\"a\u0001b\"}",
+    "canonical": null,
+    "sha256_hex": null,
+    "expect": "reject",
+    "note": "Raw (unescaped) U+0001 inside a string is invalid JSON."
+  },
+  {
+    "name": "jcs_reject_raw_tab_in_string",
+    "layer": "jcs",
+    "input_json": "{\"s\":\"a\tb\"}",
+    "canonical": null,
+    "sha256_hex": null,
+    "expect": "reject",
+    "note": "Raw tab inside a string is invalid JSON (must be \\t)."
+  },
+  {
+    "name": "jcs_reject_raw_newline_in_string",
+    "layer": "jcs",
+    "input_json": "{\"s\":\"a\nb\"}",
+    "canonical": null,
+    "sha256_hex": null,
+    "expect": "reject",
+    "note": "Raw LF inside a string is invalid JSON."
+  },
+  {
+    "name": "jcs_reject_invalid_escape",
+    "layer": "jcs",
+    "input_json": "{\"s\":\"\\a\"}",
+    "canonical": null,
+    "sha256_hex": null,
+    "expect": "reject",
+    "note": "\\a is not a JSON escape."
+  },
+  {
+    "name": "jcs_reject_short_unicode_escape",
+    "layer": "jcs",
+    "input_json": "{\"s\":\"\\u00e\"}",
+    "canonical": null,
+    "sha256_hex": null,
+    "expect": "reject",
+    "note": "Truncated \\u escape."
+  },
+  {
+    "name": "jcs_reject_single_quotes",
+    "layer": "jcs",
+    "input_json": "{'a':'1'}",
+    "canonical": null,
+    "sha256_hex": null,
+    "expect": "reject",
+    "note": "Single quotes are not JSON."
+  },
+  {
+    "name": "jcs_reject_trailing_comma",
+    "layer": "jcs",
+    "input_json": "{\"a\":\"1\",}",
+    "canonical": null,
+    "sha256_hex": null,
+    "expect": "reject",
+    "note": "Trailing comma."
+  },
+  {
+    "name": "jcs_reject_comment",
+    "layer": "jcs",
+    "input_json": "{\"a\":\"1\" /* c */}",
+    "canonical": null,
+    "sha256_hex": null,
+    "expect": "reject",
+    "note": "Comments are not JSON."
+  },
+  {
+    "name": "jcs_reject_trailing_garbage",
+    "layer": "jcs",
+    "input_json": "{\"a\":\"1\"}x",
+    "canonical": null,
+    "sha256_hex": null,
+    "expect": "reject",
+    "note": "Content after the top-level value."
+  },
+  {
+    "name": "jcs_reject_two_values",
+    "layer": "jcs",
+    "input_json": "{\"a\":\"1\"} {\"b\":\"2\"}",
+    "canonical": null,
+    "sha256_hex": null,
+    "expect": "reject",
+    "note": "Two top-level values."
+  },
+  {
+    "name": "jcs_reject_bom",
+    "layer": "jcs",
+    "input_json": "﻿{\"a\":\"1\"}",
+    "canonical": null,
+    "sha256_hex": null,
+    "expect": "reject",
+    "note": "Leading BOM (U+FEFF) is not JSON whitespace."
+  },
+  {
+    "name": "jcs_reject_nbsp_whitespace",
+    "layer": "jcs",
+    "input_json": "{\"a\": \"1\"}",
+    "canonical": null,
+    "sha256_hex": null,
+    "expect": "reject",
+    "note": "U+00A0 is not JSON whitespace."
+  },
+  {
+    "name": "jcs_reject_empty_input",
+    "layer": "jcs",
+    "input_json": "",
+    "canonical": null,
+    "sha256_hex": null,
+    "expect": "reject",
+    "note": "Empty input."
+  },
+  {
+    "name": "jcs_reject_unquoted_key",
+    "layer": "jcs",
+    "input_json": "{a:\"1\"}",
+    "canonical": null,
+    "sha256_hex": null,
+    "expect": "reject",
+    "note": "Unquoted key."
+  },
+  {
+    "name": "jcs_u_fffd_escaped_is_valid",
+    "layer": "jcs",
+    "input_json": "{\"s\":\"\\ufffd\"}",
+    "canonical": "{\"s\":\"�\"}",
+    "sha256_hex": "7513ecfd87d7bd3c5671d16e2a24074dc15ea73c79a51ffda3ffc1cd8ede8389",
+    "expect": "ok",
+    "note": "A legitimate escaped U+FFFD MUST be accepted. Go's Decoder.Token returns the same token for this and for the invalid \"\\ud800\"; detect lone surrogates on the raw bytes, never by rejecting U+FFFD. Same digest as jcs_u_fffd_raw_is_valid."
+  },
+  {
+    "name": "jcs_u_fffd_raw_is_valid",
+    "layer": "jcs",
+    "input_json": "{\"s\":\"�\"}",
+    "canonical": "{\"s\":\"�\"}",
+    "sha256_hex": "7513ecfd87d7bd3c5671d16e2a24074dc15ea73c79a51ffda3ffc1cd8ede8389",
+    "expect": "ok",
+    "note": "Raw U+FFFD; same digest as jcs_u_fffd_escaped_is_valid."
+  },
+  {
+    "name": "jcs_noncharacters_escaped",
+    "layer": "jcs",
+    "input_json": "{\"s\":\"\\uffff|\\ufffe|\\ufdd0|\\ufdef|\\ud83f\\udfff|\\udbff\\udfff\"}",
+    "canonical": "{\"s\":\"￿|￾|﷐|﷯|🿿|􏿿\"}",
+    "sha256_hex": "fb866bb211ecafcfaa226ff515f5b7ebe14697acfcd0fd26b44b97d90a4c277b",
+    "expect": "ok",
+    "note": "Noncharacters U+FFFF, U+FFFE, U+FDD0, U+FDEF, U+1FFFF, U+10FFFF are ACCEPTED by this protocol's input policy (RFC 7493 §2.1 forbids them in strict I-JSON; this protocol is deliberately not a strict I-JSON subset). Emitted raw. Same digest as jcs_noncharacters_raw."
+  },
+  {
+    "name": "jcs_noncharacters_raw",
+    "layer": "jcs",
+    "input_json": "{\"s\":\"￿|￾|﷐|﷯|🿿|􏿿\"}",
+    "canonical": "{\"s\":\"￿|￾|﷐|﷯|🿿|􏿿\"}",
+    "sha256_hex": "fb866bb211ecafcfaa226ff515f5b7ebe14697acfcd0fd26b44b97d90a4c277b",
+    "expect": "ok",
+    "note": "Raw noncharacters; same digest as jcs_noncharacters_escaped."
+  },
+  {
+    "name": "jcs_noncharacter_key",
+    "layer": "jcs",
+    "input_json": "{\"\\uffff\":\"k1\",\"\\ufdd0\":\"k2\",\"a\":\"k3\"}",
+    "canonical": "{\"a\":\"k3\",\"﷐\":\"k2\",\"￿\":\"k1\"}",
+    "sha256_hex": "8f1313c9e973870963602275973eb3a307ababecea7e34399290eaf93aab78d5",
+    "expect": "ok",
+    "note": "Noncharacters as keys: allowed; sorted by UTF-16 code units ('a' < U+FDD0 < U+FFFF)."
+  },
+  {
+    "name": "desc_stamp_merge_zh_CN",
+    "layer": "description",
+    "input_json": "{\n  \"execution_account\": \"github:b_7f3a9c2e:cody-bot\",\n  \"execution_mode\": \"squash\",\n  \"target\": \"staging\",\n  \"cancel_label\": \"取消\",\n  \"confirm_label\": \"合并\",\n  \"fine_print\": \"合并以 Stamp App 身份执行；确认后若 head 或 base 变化，合并会被拒绝。\",\n  \"rows\": [\n    {\n      \"value\": \"botiverse/slock\",\n      \"label\": \"仓库\"\n    },\n    {\n      \"value\": \"staging\",\n      \"label\": \"目标分支\"\n    },\n    {\n      \"value\": \"squash\",\n      \"label\": \"合并方式\"\n    },\n    {\n      \"value\": \"GitHub @cody-bot\",\n      \"label\": \"执行账号\"\n    },\n    {\n      \"value\": \"3f2a1c9 \\\"feat: prepare\\\"\",\n      \"label\": \"Head\"\n    }\n  ],\n  \"body\": \"feat(link-cards): 交互式卡片 prepare/execute 阶段\\n作者 @cody，2 个 approval，CI 全部通过。\",\n  \"title\": \"合并 PR #10612 到 staging？\",\n  \"read_at\": \"2026-10-21T08:15:30Z\",\n  \"locale\": \"zh-CN\",\n  \"business_revision\": \"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\n  \"action_id\": \"merge\",\n  \"prepared_action_id\": \"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\"\n}",
+    "canonical": "{\"action_id\":\"merge\",\"body\":\"feat(link-cards): 交互式卡片 prepare/execute 阶段\\n作者 @cody，2 个 approval，CI 全部通过。\",\"business_revision\":\"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\"cancel_label\":\"取消\",\"confirm_label\":\"合并\",\"execution_account\":\"github:b_7f3a9c2e:cody-bot\",\"execution_mode\":\"squash\",\"fine_print\":\"合并以 Stamp App 身份执行；确认后若 head 或 base 变化，合并会被拒绝。\",\"locale\":\"zh-CN\",\"prepared_action_id\":\"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\",\"read_at\":\"2026-10-21T08:15:30Z\",\"rows\":[{\"label\":\"仓库\",\"value\":\"botiverse/slock\"},{\"label\":\"目标分支\",\"value\":\"staging\"},{\"label\":\"合并方式\",\"value\":\"squash\"},{\"label\":\"执行账号\",\"value\":\"GitHub @cody-bot\"},{\"label\":\"Head\",\"value\":\"3f2a1c9 \\\"feat: prepare\\\"\"}],\"target\":\"staging\",\"title\":\"合并 PR #10612 到 staging？\"}",
+    "sha256_hex": "fffd863bde0f5d293b649485da9db9599df6ad828fcb1074203d8871591fe026",
+    "expect": "ok",
+    "note": "Realistic Stamp merge description, zh-CN, pretty-printed with reversed key order."
+  },
+  {
+    "name": "desc_stamp_merge_zh_CN_escaped",
+    "layer": "description",
+    "input_json": "{\r\n\t\"execution_account\" : \"github:b_7f3a9c2e:cody-bot\" ,\r\n\t\"execution_mode\" : \"squash\" ,\r\n\t\"target\" : \"staging\" ,\r\n\t\"cancel_label\" : \"\\u53D6\\u6D88\" ,\r\n\t\"confirm_label\" : \"\\u5408\\u5E76\" ,\r\n\t\"fine_print\" : \"\\u5408\\u5E76\\u4EE5 Stamp App \\u8EAB\\u4EFD\\u6267\\u884C\\uFF1B\\u786E\\u8BA4\\u540E\\u82E5 head \\u6216 base \\u53D8\\u5316\\uFF0C\\u5408\\u5E76\\u4F1A\\u88AB\\u62D2\\u7EDD\\u3002\" ,\r\n\t\"rows\" : [\r\n\t\t{\r\n\t\t\t\"value\" : \"botiverse\\/slock\" ,\r\n\t\t\t\"label\" : \"\\u4ED3\\u5E93\"\r\n\t\t},\r\n\t\t{\r\n\t\t\t\"value\" : \"staging\" ,\r\n\t\t\t\"label\" : \"\\u76EE\\u6807\\u5206\\u652F\"\r\n\t\t},\r\n\t\t{\r\n\t\t\t\"value\" : \"squash\" ,\r\n\t\t\t\"label\" : \"\\u5408\\u5E76\\u65B9\\u5F0F\"\r\n\t\t},\r\n\t\t{\r\n\t\t\t\"value\" : \"GitHub @cody-bot\" ,\r\n\t\t\t\"label\" : \"\\u6267\\u884C\\u8D26\\u53F7\"\r\n\t\t},\r\n\t\t{\r\n\t\t\t\"value\" : \"3f2a1c9 \\\"feat: prepare\\\"\" ,\r\n\t\t\t\"label\" : \"Head\"\r\n\t\t}\r\n\t] ,\r\n\t\"body\" : \"feat(link-cards): \\u4EA4\\u4E92\\u5F0F\\u5361\\u7247 prepare\\/execute \\u9636\\u6BB5\\n\\u4F5C\\u8005 @cody\\uFF0C2 \\u4E2A approval\\uFF0CCI \\u5168\\u90E8\\u901A\\u8FC7\\u3002\" ,\r\n\t\"title\" : \"\\u5408\\u5E76 PR #10612 \\u5230 staging\\uFF1F\" ,\r\n\t\"read_at\" : \"2026-10-21T08:15:30Z\" ,\r\n\t\"locale\" : \"zh-CN\" ,\r\n\t\"business_revision\" : \"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\" ,\r\n\t\"action_id\" : \"merge\" ,\r\n\t\"prepared_action_id\" : \"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\"\r\n}",
+    "canonical": "{\"action_id\":\"merge\",\"body\":\"feat(link-cards): 交互式卡片 prepare/execute 阶段\\n作者 @cody，2 个 approval，CI 全部通过。\",\"business_revision\":\"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\"cancel_label\":\"取消\",\"confirm_label\":\"合并\",\"execution_account\":\"github:b_7f3a9c2e:cody-bot\",\"execution_mode\":\"squash\",\"fine_print\":\"合并以 Stamp App 身份执行；确认后若 head 或 base 变化，合并会被拒绝。\",\"locale\":\"zh-CN\",\"prepared_action_id\":\"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\",\"read_at\":\"2026-10-21T08:15:30Z\",\"rows\":[{\"label\":\"仓库\",\"value\":\"botiverse/slock\"},{\"label\":\"目标分支\",\"value\":\"staging\"},{\"label\":\"合并方式\",\"value\":\"squash\"},{\"label\":\"执行账号\",\"value\":\"GitHub @cody-bot\"},{\"label\":\"Head\",\"value\":\"3f2a1c9 \\\"feat: prepare\\\"\"}],\"target\":\"staging\",\"title\":\"合并 PR #10612 到 staging？\"}",
+    "sha256_hex": "fffd863bde0f5d293b649485da9db9599df6ad828fcb1074203d8871591fe026",
+    "expect": "ok",
+    "note": "Same value as desc_stamp_merge_zh_CN written with reversed keys, CRLF/tab whitespace, every non-ASCII char as uppercase \\uXXXX and '/' as '\\/'. MUST give the same digest."
+  },
+  {
+    "name": "desc_stamp_merge_en",
+    "layer": "description",
+    "input_json": "{\n  \"execution_account\": \"github:b_7f3a9c2e:cody-bot\",\n  \"execution_mode\": \"squash\",\n  \"target\": \"staging\",\n  \"cancel_label\": \"Cancel\",\n  \"confirm_label\": \"Merge\",\n  \"fine_print\": \"Merged as the Stamp App. If head or base changes after you confirm, the merge is refused.\",\n  \"rows\": [\n    {\n      \"value\": \"botiverse/slock\",\n      \"label\": \"Repository\"\n    },\n    {\n      \"value\": \"staging\",\n      \"label\": \"Base branch\"\n    },\n    {\n      \"value\": \"squash\",\n      \"label\": \"Merge method\"\n    },\n    {\n      \"value\": \"GitHub @cody-bot\",\n      \"label\": \"Merging as\"\n    },\n    {\n      \"value\": \"3f2a1c9 \\\"feat: prepare\\\"\",\n      \"label\": \"Head\"\n    }\n  ],\n  \"body\": \"feat(link-cards): interactive card prepare/execute phases\\nby @cody, 2 approvals, all CI checks passed.\",\n  \"title\": \"Merge PR #10612 into staging?\",\n  \"read_at\": \"2026-10-21T08:15:30Z\",\n  \"locale\": \"en\",\n  \"business_revision\": \"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\n  \"action_id\": \"merge\",\n  \"prepared_action_id\": \"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\"\n}",
+    "canonical": "{\"action_id\":\"merge\",\"body\":\"feat(link-cards): interactive card prepare/execute phases\\nby @cody, 2 approvals, all CI checks passed.\",\"business_revision\":\"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\"cancel_label\":\"Cancel\",\"confirm_label\":\"Merge\",\"execution_account\":\"github:b_7f3a9c2e:cody-bot\",\"execution_mode\":\"squash\",\"fine_print\":\"Merged as the Stamp App. If head or base changes after you confirm, the merge is refused.\",\"locale\":\"en\",\"prepared_action_id\":\"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\",\"read_at\":\"2026-10-21T08:15:30Z\",\"rows\":[{\"label\":\"Repository\",\"value\":\"botiverse/slock\"},{\"label\":\"Base branch\",\"value\":\"staging\"},{\"label\":\"Merge method\",\"value\":\"squash\"},{\"label\":\"Merging as\",\"value\":\"GitHub @cody-bot\"},{\"label\":\"Head\",\"value\":\"3f2a1c9 \\\"feat: prepare\\\"\"}],\"target\":\"staging\",\"title\":\"Merge PR #10612 into staging?\"}",
+    "sha256_hex": "1bd9911b74c5262551ee4022731da90f72b545b7ec0810be0f6ec4666c53fabd",
+    "expect": "ok",
+    "note": "Same merge in English. Different digest from zh-CN (locale and text are in the digest)."
+  },
+  {
+    "name": "desc_vault_approve_zh_CN",
+    "layer": "description",
+    "input_json": "{\n  \"terms\": {\n    \"expires_at\": \"2026-10-21T09:16:02Z\",\n    \"access_mode\": \"read\",\n    \"requester\": \"@raft-bot\",\n    \"secret_key\": \"prod/postgres/readonly_dsn\"\n  },\n  \"cancel_label\": \"取消\",\n  \"confirm_label\": \"批准\",\n  \"fine_print\": \"批准后 @raft-bot 可在 1 小时内读取该密钥；可随时在 Vault 撤销。\",\n  \"rows\": [\n    {\n      \"value\": \"prod/postgres/readonly_dsn\",\n      \"label\": \"密钥\"\n    },\n    {\n      \"value\": \"@raft-bot\",\n      \"label\": \"申请人\"\n    },\n    {\n      \"value\": \"只读\",\n      \"label\": \"访问方式\"\n    },\n    {\n      \"value\": \"2026-10-21 17:16（UTC+8）\",\n      \"label\": \"到期时间\"\n    }\n  ],\n  \"body\": \"⚠️ 生产环境密钥。申请理由：“排查 10/20 的 pgsync 延迟”。\",\n  \"title\": \"批准 @raft-bot 读取 prod/postgres/readonly_dsn？\",\n  \"read_at\": \"2026-10-21T08:16:02Z\",\n  \"locale\": \"zh-CN\",\n  \"business_revision\": \"req_01JB8Z6Q4K2M9T7V3X5N1P8R6W:rev-3\",\n  \"action_id\": \"approve\",\n  \"prepared_action_id\": \"7c1d2e3f-4a5b-4c6d-8e7f-9a0b1c2d3e4f\"\n}",
+    "canonical": "{\"action_id\":\"approve\",\"body\":\"⚠️ 生产环境密钥。申请理由：“排查 10/20 的 pgsync 延迟”。\",\"business_revision\":\"req_01JB8Z6Q4K2M9T7V3X5N1P8R6W:rev-3\",\"cancel_label\":\"取消\",\"confirm_label\":\"批准\",\"fine_print\":\"批准后 @raft-bot 可在 1 小时内读取该密钥；可随时在 Vault 撤销。\",\"locale\":\"zh-CN\",\"prepared_action_id\":\"7c1d2e3f-4a5b-4c6d-8e7f-9a0b1c2d3e4f\",\"read_at\":\"2026-10-21T08:16:02Z\",\"rows\":[{\"label\":\"密钥\",\"value\":\"prod/postgres/readonly_dsn\"},{\"label\":\"申请人\",\"value\":\"@raft-bot\"},{\"label\":\"访问方式\",\"value\":\"只读\"},{\"label\":\"到期时间\",\"value\":\"2026-10-21 17:16（UTC+8）\"}],\"terms\":{\"access_mode\":\"read\",\"expires_at\":\"2026-10-21T09:16:02Z\",\"requester\":\"@raft-bot\",\"secret_key\":\"prod/postgres/readonly_dsn\"},\"title\":\"批准 @raft-bot 读取 prod/postgres/readonly_dsn？\"}",
+    "sha256_hex": "e4583e1451edb8e4e81f118bb1756e481f430291d0fc1360542e1b6338d5b818",
+    "expect": "ok",
+    "note": "Realistic Vault approval with terms (no secret values), zh-CN; body has ⚠️ (U+26A0 U+FE0F) and curly quotes."
+  },
+  {
+    "name": "desc_vault_approve_zh_CN_escaped",
+    "layer": "description",
+    "input_json": "{\r\n\t\"terms\" : {\r\n\t\t\"expires_at\" : \"2026-10-21T09:16:02Z\" ,\r\n\t\t\"access_mode\" : \"read\" ,\r\n\t\t\"requester\" : \"@raft-bot\" ,\r\n\t\t\"secret_key\" : \"prod\\/postgres\\/readonly_dsn\"\r\n\t} ,\r\n\t\"cancel_label\" : \"\\u53D6\\u6D88\" ,\r\n\t\"confirm_label\" : \"\\u6279\\u51C6\" ,\r\n\t\"fine_print\" : \"\\u6279\\u51C6\\u540E @raft-bot \\u53EF\\u5728 1 \\u5C0F\\u65F6\\u5185\\u8BFB\\u53D6\\u8BE5\\u5BC6\\u94A5\\uFF1B\\u53EF\\u968F\\u65F6\\u5728 Vault \\u64A4\\u9500\\u3002\" ,\r\n\t\"rows\" : [\r\n\t\t{\r\n\t\t\t\"value\" : \"prod\\/postgres\\/readonly_dsn\" ,\r\n\t\t\t\"label\" : \"\\u5BC6\\u94A5\"\r\n\t\t},\r\n\t\t{\r\n\t\t\t\"value\" : \"@raft-bot\" ,\r\n\t\t\t\"label\" : \"\\u7533\\u8BF7\\u4EBA\"\r\n\t\t},\r\n\t\t{\r\n\t\t\t\"value\" : \"\\u53EA\\u8BFB\" ,\r\n\t\t\t\"label\" : \"\\u8BBF\\u95EE\\u65B9\\u5F0F\"\r\n\t\t},\r\n\t\t{\r\n\t\t\t\"value\" : \"2026-10-21 17:16\\uFF08UTC+8\\uFF09\" ,\r\n\t\t\t\"label\" : \"\\u5230\\u671F\\u65F6\\u95F4\"\r\n\t\t}\r\n\t] ,\r\n\t\"body\" : \"\\u26A0\\uFE0F \\u751F\\u4EA7\\u73AF\\u5883\\u5BC6\\u94A5\\u3002\\u7533\\u8BF7\\u7406\\u7531\\uFF1A\\u201C\\u6392\\u67E5 10\\/20 \\u7684 pgsync \\u5EF6\\u8FDF\\u201D\\u3002\" ,\r\n\t\"title\" : \"\\u6279\\u51C6 @raft-bot \\u8BFB\\u53D6 prod\\/postgres\\/readonly_dsn\\uFF1F\" ,\r\n\t\"read_at\" : \"2026-10-21T08:16:02Z\" ,\r\n\t\"locale\" : \"zh-CN\" ,\r\n\t\"business_revision\" : \"req_01JB8Z6Q4K2M9T7V3X5N1P8R6W:rev-3\" ,\r\n\t\"action_id\" : \"approve\" ,\r\n\t\"prepared_action_id\" : \"7c1d2e3f-4a5b-4c6d-8e7f-9a0b1c2d3e4f\"\r\n}",
+    "canonical": "{\"action_id\":\"approve\",\"body\":\"⚠️ 生产环境密钥。申请理由：“排查 10/20 的 pgsync 延迟”。\",\"business_revision\":\"req_01JB8Z6Q4K2M9T7V3X5N1P8R6W:rev-3\",\"cancel_label\":\"取消\",\"confirm_label\":\"批准\",\"fine_print\":\"批准后 @raft-bot 可在 1 小时内读取该密钥；可随时在 Vault 撤销。\",\"locale\":\"zh-CN\",\"prepared_action_id\":\"7c1d2e3f-4a5b-4c6d-8e7f-9a0b1c2d3e4f\",\"read_at\":\"2026-10-21T08:16:02Z\",\"rows\":[{\"label\":\"密钥\",\"value\":\"prod/postgres/readonly_dsn\"},{\"label\":\"申请人\",\"value\":\"@raft-bot\"},{\"label\":\"访问方式\",\"value\":\"只读\"},{\"label\":\"到期时间\",\"value\":\"2026-10-21 17:16（UTC+8）\"}],\"terms\":{\"access_mode\":\"read\",\"expires_at\":\"2026-10-21T09:16:02Z\",\"requester\":\"@raft-bot\",\"secret_key\":\"prod/postgres/readonly_dsn\"},\"title\":\"批准 @raft-bot 读取 prod/postgres/readonly_dsn？\"}",
+    "sha256_hex": "e4583e1451edb8e4e81f118bb1756e481f430291d0fc1360542e1b6338d5b818",
+    "expect": "ok",
+    "note": "Same value as desc_vault_approve_zh_CN, escaped/reordered. MUST give the same digest."
+  },
+  {
+    "name": "desc_vault_approve_en",
+    "layer": "description",
+    "input_json": "{\n  \"terms\": {\n    \"expires_at\": \"2026-10-21T09:16:02Z\",\n    \"access_mode\": \"read\",\n    \"requester\": \"@raft-bot\",\n    \"secret_key\": \"prod/postgres/readonly_dsn\"\n  },\n  \"cancel_label\": \"Cancel\",\n  \"confirm_label\": \"Approve\",\n  \"fine_print\": \"Once approved, @raft-bot can read this secret for 1 hour. You can revoke it in Vault at any time.\",\n  \"rows\": [\n    {\n      \"value\": \"prod/postgres/readonly_dsn\",\n      \"label\": \"Secret\"\n    },\n    {\n      \"value\": \"@raft-bot\",\n      \"label\": \"Requester\"\n    },\n    {\n      \"value\": \"read-only\",\n      \"label\": \"Access\"\n    },\n    {\n      \"value\": \"2026-10-21 09:16 UTC\",\n      \"label\": \"Expires\"\n    }\n  ],\n  \"body\": \"⚠️ Production secret. Reason: \\\"investigate pgsync lag on 10/20\\\".\",\n  \"title\": \"Approve @raft-bot reading prod/postgres/readonly_dsn?\",\n  \"read_at\": \"2026-10-21T08:16:02Z\",\n  \"locale\": \"en\",\n  \"business_revision\": \"req_01JB8Z6Q4K2M9T7V3X5N1P8R6W:rev-3\",\n  \"action_id\": \"approve\",\n  \"prepared_action_id\": \"7c1d2e3f-4a5b-4c6d-8e7f-9a0b1c2d3e4f\"\n}",
+    "canonical": "{\"action_id\":\"approve\",\"body\":\"⚠️ Production secret. Reason: \\\"investigate pgsync lag on 10/20\\\".\",\"business_revision\":\"req_01JB8Z6Q4K2M9T7V3X5N1P8R6W:rev-3\",\"cancel_label\":\"Cancel\",\"confirm_label\":\"Approve\",\"fine_print\":\"Once approved, @raft-bot can read this secret for 1 hour. You can revoke it in Vault at any time.\",\"locale\":\"en\",\"prepared_action_id\":\"7c1d2e3f-4a5b-4c6d-8e7f-9a0b1c2d3e4f\",\"read_at\":\"2026-10-21T08:16:02Z\",\"rows\":[{\"label\":\"Secret\",\"value\":\"prod/postgres/readonly_dsn\"},{\"label\":\"Requester\",\"value\":\"@raft-bot\"},{\"label\":\"Access\",\"value\":\"read-only\"},{\"label\":\"Expires\",\"value\":\"2026-10-21 09:16 UTC\"}],\"terms\":{\"access_mode\":\"read\",\"expires_at\":\"2026-10-21T09:16:02Z\",\"requester\":\"@raft-bot\",\"secret_key\":\"prod/postgres/readonly_dsn\"},\"title\":\"Approve @raft-bot reading prod/postgres/readonly_dsn?\"}",
+    "sha256_hex": "1e324812f3c9570131b914a4aeb07b12ac654596d4fb156eb6f83f86a4d1c811",
+    "expect": "ok",
+    "note": "Same approval in English. Different digest from zh-CN."
+  },
+  {
+    "name": "desc_vault_approve_locale_field_only_differs",
+    "layer": "description",
+    "input_json": "{\n  \"terms\": {\n    \"expires_at\": \"2026-10-21T09:16:02Z\",\n    \"access_mode\": \"read\",\n    \"requester\": \"@raft-bot\",\n    \"secret_key\": \"prod/postgres/readonly_dsn\"\n  },\n  \"cancel_label\": \"取消\",\n  \"confirm_label\": \"批准\",\n  \"fine_print\": \"批准后 @raft-bot 可在 1 小时内读取该密钥；可随时在 Vault 撤销。\",\n  \"rows\": [\n    {\n      \"value\": \"prod/postgres/readonly_dsn\",\n      \"label\": \"密钥\"\n    },\n    {\n      \"value\": \"@raft-bot\",\n      \"label\": \"申请人\"\n    },\n    {\n      \"value\": \"只读\",\n      \"label\": \"访问方式\"\n    },\n    {\n      \"value\": \"2026-10-21 17:16（UTC+8）\",\n      \"label\": \"到期时间\"\n    }\n  ],\n  \"body\": \"⚠️ 生产环境密钥。申请理由：“排查 10/20 的 pgsync 延迟”。\",\n  \"title\": \"批准 @raft-bot 读取 prod/postgres/readonly_dsn？\",\n  \"read_at\": \"2026-10-21T08:16:02Z\",\n  \"locale\": \"en\",\n  \"business_revision\": \"req_01JB8Z6Q4K2M9T7V3X5N1P8R6W:rev-3\",\n  \"action_id\": \"approve\",\n  \"prepared_action_id\": \"7c1d2e3f-4a5b-4c6d-8e7f-9a0b1c2d3e4f\"\n}",
+    "canonical": "{\"action_id\":\"approve\",\"body\":\"⚠️ 生产环境密钥。申请理由：“排查 10/20 的 pgsync 延迟”。\",\"business_revision\":\"req_01JB8Z6Q4K2M9T7V3X5N1P8R6W:rev-3\",\"cancel_label\":\"取消\",\"confirm_label\":\"批准\",\"fine_print\":\"批准后 @raft-bot 可在 1 小时内读取该密钥；可随时在 Vault 撤销。\",\"locale\":\"en\",\"prepared_action_id\":\"7c1d2e3f-4a5b-4c6d-8e7f-9a0b1c2d3e4f\",\"read_at\":\"2026-10-21T08:16:02Z\",\"rows\":[{\"label\":\"密钥\",\"value\":\"prod/postgres/readonly_dsn\"},{\"label\":\"申请人\",\"value\":\"@raft-bot\"},{\"label\":\"访问方式\",\"value\":\"只读\"},{\"label\":\"到期时间\",\"value\":\"2026-10-21 17:16（UTC+8）\"}],\"terms\":{\"access_mode\":\"read\",\"expires_at\":\"2026-10-21T09:16:02Z\",\"requester\":\"@raft-bot\",\"secret_key\":\"prod/postgres/readonly_dsn\"},\"title\":\"批准 @raft-bot 读取 prod/postgres/readonly_dsn？\"}",
+    "sha256_hex": "d66cf602aea8347f03ebc9fb837def3a0a63cd9ddb006b0e6bce41a8c4abb76a",
+    "expect": "ok",
+    "note": "zh-CN text but locale='en': only the locale field differs from desc_vault_approve_zh_CN, and the digest differs."
+  },
+  {
+    "name": "desc_minimal_required_only",
+    "layer": "description",
+    "input_json": "{\r\n\t\"cancel_label\" : \"Cancel\" ,\r\n\t\"confirm_label\" : \"Merge\" ,\r\n\t\"title\" : \"Merge PR #10612 into staging?\" ,\r\n\t\"read_at\" : \"2026-10-21T08:15:30Z\" ,\r\n\t\"locale\" : \"en\" ,\r\n\t\"business_revision\" : \"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\" ,\r\n\t\"action_id\" : \"merge\" ,\r\n\t\"prepared_action_id\" : \"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\"\r\n}",
+    "canonical": "{\"action_id\":\"merge\",\"business_revision\":\"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\"cancel_label\":\"Cancel\",\"confirm_label\":\"Merge\",\"locale\":\"en\",\"prepared_action_id\":\"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\",\"read_at\":\"2026-10-21T08:15:30Z\",\"title\":\"Merge PR #10612 into staging?\"}",
+    "sha256_hex": "46b7a9dbce59ef41f82514daa22a8808b2f1939a47a9616b3f155968544adc2c",
+    "expect": "ok",
+    "note": "Only the 8 required fields; optional fields absent (no defaults filled in)."
+  },
+  {
+    "name": "desc_minimal_with_empty_body",
+    "layer": "description",
+    "input_json": "{\n  \"body\": \"\",\n  \"cancel_label\": \"Cancel\",\n  \"confirm_label\": \"Merge\",\n  \"title\": \"Merge PR #10612 into staging?\",\n  \"read_at\": \"2026-10-21T08:15:30Z\",\n  \"locale\": \"en\",\n  \"business_revision\": \"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\n  \"action_id\": \"merge\",\n  \"prepared_action_id\": \"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\"\n}",
+    "canonical": "{\"action_id\":\"merge\",\"body\":\"\",\"business_revision\":\"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\"cancel_label\":\"Cancel\",\"confirm_label\":\"Merge\",\"locale\":\"en\",\"prepared_action_id\":\"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\",\"read_at\":\"2026-10-21T08:15:30Z\",\"title\":\"Merge PR #10612 into staging?\"}",
+    "sha256_hex": "c7b3a88be4f3b7e8bcd4acce861bbf2dfaedec6db87c9836de4244aa9e7ef98a",
+    "expect": "ok",
+    "note": "body:\"\" present. Different digest from desc_minimal_required_only: empty is not the same as absent."
+  },
+  {
+    "name": "desc_minimal_with_empty_rows_and_terms",
+    "layer": "description",
+    "input_json": "{\n  \"terms\": {},\n  \"rows\": [],\n  \"cancel_label\": \"Cancel\",\n  \"confirm_label\": \"Merge\",\n  \"title\": \"Merge PR #10612 into staging?\",\n  \"read_at\": \"2026-10-21T08:15:30Z\",\n  \"locale\": \"en\",\n  \"business_revision\": \"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\n  \"action_id\": \"merge\",\n  \"prepared_action_id\": \"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\"\n}",
+    "canonical": "{\"action_id\":\"merge\",\"business_revision\":\"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\"cancel_label\":\"Cancel\",\"confirm_label\":\"Merge\",\"locale\":\"en\",\"prepared_action_id\":\"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\",\"read_at\":\"2026-10-21T08:15:30Z\",\"rows\":[],\"terms\":{},\"title\":\"Merge PR #10612 into staging?\"}",
+    "sha256_hex": "e8551a164e211e3fd27d78720ae4f4f3df05fdd96387a6b416419eeed2f63355",
+    "expect": "ok",
+    "note": "rows:[] and terms:{} present. Different digest from desc_minimal_required_only."
+  },
+  {
+    "name": "desc_reject_unknown_field",
+    "layer": "description",
+    "input_json": "{\n  \"extra\": \"x\",\n  \"cancel_label\": \"Cancel\",\n  \"confirm_label\": \"Merge\",\n  \"title\": \"Merge PR #10612 into staging?\",\n  \"read_at\": \"2026-10-21T08:15:30Z\",\n  \"locale\": \"en\",\n  \"business_revision\": \"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\n  \"action_id\": \"merge\",\n  \"prepared_action_id\": \"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\"\n}",
+    "canonical": null,
+    "sha256_hex": null,
+    "expect": "reject",
+    "note": "Unknown field: strict schema rejects instead of dropping."
+  },
+  {
+    "name": "desc_reject_missing_locale",
+    "layer": "description",
+    "input_json": "{\n  \"cancel_label\": \"Cancel\",\n  \"confirm_label\": \"Merge\",\n  \"title\": \"Merge PR #10612 into staging?\",\n  \"read_at\": \"2026-10-21T08:15:30Z\",\n  \"business_revision\": \"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\n  \"action_id\": \"merge\",\n  \"prepared_action_id\": \"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\"\n}",
+    "canonical": null,
+    "sha256_hex": null,
+    "expect": "reject",
+    "note": "Required field locale missing."
+  },
+  {
+    "name": "desc_reject_null_optional",
+    "layer": "description",
+    "input_json": "{\n  \"body\": null,\n  \"cancel_label\": \"Cancel\",\n  \"confirm_label\": \"Merge\",\n  \"title\": \"Merge PR #10612 into staging?\",\n  \"read_at\": \"2026-10-21T08:15:30Z\",\n  \"locale\": \"en\",\n  \"business_revision\": \"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\n  \"action_id\": \"merge\",\n  \"prepared_action_id\": \"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\"\n}",
+    "canonical": null,
+    "sha256_hex": null,
+    "expect": "reject",
+    "note": "Optional field as null: omit it instead."
+  },
+  {
+    "name": "desc_reject_number_field",
+    "layer": "description",
+    "input_json": "{\n  \"cancel_label\": \"Cancel\",\n  \"confirm_label\": \"Merge\",\n  \"title\": \"Merge PR #10612 into staging?\",\n  \"read_at\": 1761034530,\n  \"locale\": \"en\",\n  \"business_revision\": \"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\n  \"action_id\": \"merge\",\n  \"prepared_action_id\": \"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\"\n}",
+    "canonical": null,
+    "sha256_hex": null,
+    "expect": "reject",
+    "note": "read_at as a number."
+  },
+  {
+    "name": "desc_reject_boolean_field",
+    "layer": "description",
+    "input_json": "{\n  \"target\": true,\n  \"cancel_label\": \"Cancel\",\n  \"confirm_label\": \"Merge\",\n  \"title\": \"Merge PR #10612 into staging?\",\n  \"read_at\": \"2026-10-21T08:15:30Z\",\n  \"locale\": \"en\",\n  \"business_revision\": \"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\n  \"action_id\": \"merge\",\n  \"prepared_action_id\": \"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\"\n}",
+    "canonical": null,
+    "sha256_hex": null,
+    "expect": "reject",
+    "note": "target as a boolean."
+  },
+  {
+    "name": "desc_reject_row_extra_key",
+    "layer": "description",
+    "input_json": "{\n  \"rows\": [\n    {\n      \"tone\": \"muted\",\n      \"value\": \"b\",\n      \"label\": \"a\"\n    }\n  ],\n  \"cancel_label\": \"Cancel\",\n  \"confirm_label\": \"Merge\",\n  \"title\": \"Merge PR #10612 into staging?\",\n  \"read_at\": \"2026-10-21T08:15:30Z\",\n  \"locale\": \"en\",\n  \"business_revision\": \"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\n  \"action_id\": \"merge\",\n  \"prepared_action_id\": \"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\"\n}",
+    "canonical": null,
+    "sha256_hex": null,
+    "expect": "reject",
+    "note": "Row object with an unknown key."
+  },
+  {
+    "name": "desc_reject_terms_nested_object",
+    "layer": "description",
+    "input_json": "{\n  \"terms\": {\n    \"k\": {\n      \"v\": \"x\"\n    }\n  },\n  \"cancel_label\": \"Cancel\",\n  \"confirm_label\": \"Merge\",\n  \"title\": \"Merge PR #10612 into staging?\",\n  \"read_at\": \"2026-10-21T08:15:30Z\",\n  \"locale\": \"en\",\n  \"business_revision\": \"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\n  \"action_id\": \"merge\",\n  \"prepared_action_id\": \"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\"\n}",
+    "canonical": null,
+    "sha256_hex": null,
+    "expect": "reject",
+    "note": "terms values must be strings."
+  },
+  {
+    "name": "desc_reject_terms_duplicate_key",
+    "layer": "description",
+    "input_json": "{\"terms\":{\"requester\":\"@a\",\"requester\":\"@b\"},\"action_id\":\"merge\",\"business_revision\":\"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\"cancel_label\":\"Cancel\",\"confirm_label\":\"Merge\",\"locale\":\"en\",\"prepared_action_id\":\"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\",\"read_at\":\"2026-10-21T08:15:30Z\",\"title\":\"Merge PR #10612 into staging?\"}",
+    "canonical": null,
+    "sha256_hex": null,
+    "expect": "reject",
+    "note": "Duplicate key inside terms: the two copies would disagree about who is approved."
+  },
+  {
+    "name": "desc_reject_too_many_rows",
+    "layer": "description",
+    "input_json": "{\n  \"rows\": [\n    {\n      \"value\": \"v\",\n      \"label\": \"r0\"\n    },\n    {\n      \"value\": \"v\",\n      \"label\": \"r1\"\n    },\n    {\n      \"value\": \"v\",\n      \"label\": \"r2\"\n    },\n    {\n      \"value\": \"v\",\n      \"label\": \"r3\"\n    },\n    {\n      \"value\": \"v\",\n      \"label\": \"r4\"\n    },\n    {\n      \"value\": \"v\",\n      \"label\": \"r5\"\n    },\n    {\n      \"value\": \"v\",\n      \"label\": \"r6\"\n    },\n    {\n      \"value\": \"v\",\n      \"label\": \"r7\"\n    },\n    {\n      \"value\": \"v\",\n      \"label\": \"r8\"\n    }\n  ],\n  \"cancel_label\": \"Cancel\",\n  \"confirm_label\": \"Merge\",\n  \"title\": \"Merge PR #10612 into staging?\",\n  \"read_at\": \"2026-10-21T08:15:30Z\",\n  \"locale\": \"en\",\n  \"business_revision\": \"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\n  \"action_id\": \"merge\",\n  \"prepared_action_id\": \"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\"\n}",
+    "canonical": null,
+    "sha256_hex": null,
+    "expect": "reject",
+    "note": "9 rows > 8."
+  },
+  {
+    "name": "desc_reject_empty_title",
+    "layer": "description",
+    "input_json": "{\n  \"cancel_label\": \"Cancel\",\n  \"confirm_label\": \"Merge\",\n  \"title\": \"\",\n  \"read_at\": \"2026-10-21T08:15:30Z\",\n  \"locale\": \"en\",\n  \"business_revision\": \"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\n  \"action_id\": \"merge\",\n  \"prepared_action_id\": \"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\"\n}",
+    "canonical": null,
+    "sha256_hex": null,
+    "expect": "reject",
+    "note": "title must be 1-120 chars."
+  },
+  {
+    "name": "desc_reject_top_level_array",
+    "layer": "description",
+    "input_json": "[{\"action_id\":\"merge\",\"business_revision\":\"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\"cancel_label\":\"Cancel\",\"confirm_label\":\"Merge\",\"locale\":\"en\",\"prepared_action_id\":\"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\",\"read_at\":\"2026-10-21T08:15:30Z\",\"title\":\"Merge PR #10612 into staging?\"}]",
+    "canonical": null,
+    "sha256_hex": null,
+    "expect": "reject",
+    "note": "Description must be an object."
+  },
+  {
+    "name": "desc_reject_number_in_terms",
+    "layer": "description",
+    "input_json": "{\n  \"terms\": {\n    \"ttl\": 3600\n  },\n  \"cancel_label\": \"Cancel\",\n  \"confirm_label\": \"Merge\",\n  \"title\": \"Merge PR #10612 into staging?\",\n  \"read_at\": \"2026-10-21T08:15:30Z\",\n  \"locale\": \"en\",\n  \"business_revision\": \"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\n  \"action_id\": \"merge\",\n  \"prepared_action_id\": \"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\"\n}",
+    "canonical": null,
+    "sha256_hex": null,
+    "expect": "reject",
+    "note": "Number as a terms value: description layer forbids numbers (generic layer would allow it)."
+  },
+  {
+    "name": "desc_reject_boolean_in_row",
+    "layer": "description",
+    "input_json": "{\n  \"rows\": [\n    {\n      \"value\": false,\n      \"label\": \"a\"\n    }\n  ],\n  \"cancel_label\": \"Cancel\",\n  \"confirm_label\": \"Merge\",\n  \"title\": \"Merge PR #10612 into staging?\",\n  \"read_at\": \"2026-10-21T08:15:30Z\",\n  \"locale\": \"en\",\n  \"business_revision\": \"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\n  \"action_id\": \"merge\",\n  \"prepared_action_id\": \"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\"\n}",
+    "canonical": null,
+    "sha256_hex": null,
+    "expect": "reject",
+    "note": "Boolean inside rows."
+  },
+  {
+    "name": "desc_reject_null_in_rows_array",
+    "layer": "description",
+    "input_json": "{\n  \"rows\": [\n    null\n  ],\n  \"cancel_label\": \"Cancel\",\n  \"confirm_label\": \"Merge\",\n  \"title\": \"Merge PR #10612 into staging?\",\n  \"read_at\": \"2026-10-21T08:15:30Z\",\n  \"locale\": \"en\",\n  \"business_revision\": \"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\n  \"action_id\": \"merge\",\n  \"prepared_action_id\": \"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\"\n}",
+    "canonical": null,
+    "sha256_hex": null,
+    "expect": "reject",
+    "note": "null as a rows element."
+  },
+  {
+    "name": "desc_terms_proto_key_kept",
+    "layer": "description",
+    "input_json": "{\n  \"terms\": {\n    \"requester\": \"@a\",\n    \"__proto__\": \"p\"\n  },\n  \"cancel_label\": \"Cancel\",\n  \"confirm_label\": \"Merge\",\n  \"title\": \"Merge PR #10612 into staging?\",\n  \"read_at\": \"2026-10-21T08:15:30Z\",\n  \"locale\": \"en\",\n  \"business_revision\": \"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\n  \"action_id\": \"merge\",\n  \"prepared_action_id\": \"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\"\n}",
+    "canonical": "{\"action_id\":\"merge\",\"business_revision\":\"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\"cancel_label\":\"Cancel\",\"confirm_label\":\"Merge\",\"locale\":\"en\",\"prepared_action_id\":\"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\",\"read_at\":\"2026-10-21T08:15:30Z\",\"terms\":{\"__proto__\":\"p\",\"requester\":\"@a\"},\"title\":\"Merge PR #10612 into staging?\"}",
+    "sha256_hex": "9772111edbfabcfe0e4639f9730939f85f79ae33c6fd408054318740ee849558",
+    "expect": "ok",
+    "note": "terms key '__proto__' is ordinary data, kept and digested. Test the real parse+schema pipeline: setters / prototype assignment must not drop or reinterpret it."
+  },
+  {
+    "name": "desc_read_at_seconds",
+    "layer": "description",
+    "input_json": "{\n  \"cancel_label\": \"Cancel\",\n  \"confirm_label\": \"Merge\",\n  \"title\": \"Merge PR #10612 into staging?\",\n  \"read_at\": \"2026-10-21T08:15:30Z\",\n  \"locale\": \"en\",\n  \"business_revision\": \"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\n  \"action_id\": \"merge\",\n  \"prepared_action_id\": \"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\"\n}",
+    "canonical": "{\"action_id\":\"merge\",\"business_revision\":\"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\"cancel_label\":\"Cancel\",\"confirm_label\":\"Merge\",\"locale\":\"en\",\"prepared_action_id\":\"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\",\"read_at\":\"2026-10-21T08:15:30Z\",\"title\":\"Merge PR #10612 into staging?\"}",
+    "sha256_hex": "46b7a9dbce59ef41f82514daa22a8808b2f1939a47a9616b3f155968544adc2c",
+    "expect": "ok",
+    "note": "No fraction."
+  },
+  {
+    "name": "desc_read_at_millis",
+    "layer": "description",
+    "input_json": "{\n  \"cancel_label\": \"Cancel\",\n  \"confirm_label\": \"Merge\",\n  \"title\": \"Merge PR #10612 into staging?\",\n  \"read_at\": \"2026-10-21T08:15:30.123Z\",\n  \"locale\": \"en\",\n  \"business_revision\": \"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\n  \"action_id\": \"merge\",\n  \"prepared_action_id\": \"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\"\n}",
+    "canonical": "{\"action_id\":\"merge\",\"business_revision\":\"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\"cancel_label\":\"Cancel\",\"confirm_label\":\"Merge\",\"locale\":\"en\",\"prepared_action_id\":\"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\",\"read_at\":\"2026-10-21T08:15:30.123Z\",\"title\":\"Merge PR #10612 into staging?\"}",
+    "sha256_hex": "9f7e3d10fe64eab63cae26ee527e6586ff3b1fb8d962683ee3ac987dee782f4f",
+    "expect": "ok",
+    "note": "Millisecond fraction."
+  },
+  {
+    "name": "desc_read_at_millis_trailing_zero",
+    "layer": "description",
+    "input_json": "{\n  \"cancel_label\": \"Cancel\",\n  \"confirm_label\": \"Merge\",\n  \"title\": \"Merge PR #10612 into staging?\",\n  \"read_at\": \"2026-10-21T08:15:30.120Z\",\n  \"locale\": \"en\",\n  \"business_revision\": \"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\n  \"action_id\": \"merge\",\n  \"prepared_action_id\": \"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\"\n}",
+    "canonical": "{\"action_id\":\"merge\",\"business_revision\":\"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\"cancel_label\":\"Cancel\",\"confirm_label\":\"Merge\",\"locale\":\"en\",\"prepared_action_id\":\"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\",\"read_at\":\"2026-10-21T08:15:30.120Z\",\"title\":\"Merge PR #10612 into staging?\"}",
+    "sha256_hex": "2eb15ecfe800981eb82d48962ec3eac30b2210eaa4bcedd2d129d3b78ddb8d24",
+    "expect": "ok",
+    "note": "Digested verbatim: '.120' is NOT rewritten to '.12'. Different digest from desc_read_at_two_digit_fraction."
+  },
+  {
+    "name": "desc_read_at_two_digit_fraction",
+    "layer": "description",
+    "input_json": "{\n  \"cancel_label\": \"Cancel\",\n  \"confirm_label\": \"Merge\",\n  \"title\": \"Merge PR #10612 into staging?\",\n  \"read_at\": \"2026-10-21T08:15:30.12Z\",\n  \"locale\": \"en\",\n  \"business_revision\": \"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\n  \"action_id\": \"merge\",\n  \"prepared_action_id\": \"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\"\n}",
+    "canonical": "{\"action_id\":\"merge\",\"business_revision\":\"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\"cancel_label\":\"Cancel\",\"confirm_label\":\"Merge\",\"locale\":\"en\",\"prepared_action_id\":\"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\",\"read_at\":\"2026-10-21T08:15:30.12Z\",\"title\":\"Merge PR #10612 into staging?\"}",
+    "sha256_hex": "d1771a941117ba9473e288e0c325d6be783869e1e5dfd7a4ed04dd36d49989d2",
+    "expect": "ok",
+    "note": "Same instant as .120 but different text, so a different digest."
+  },
+  {
+    "name": "desc_read_at_one_digit_fraction",
+    "layer": "description",
+    "input_json": "{\n  \"cancel_label\": \"Cancel\",\n  \"confirm_label\": \"Merge\",\n  \"title\": \"Merge PR #10612 into staging?\",\n  \"read_at\": \"2026-10-21T08:15:30.5Z\",\n  \"locale\": \"en\",\n  \"business_revision\": \"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\n  \"action_id\": \"merge\",\n  \"prepared_action_id\": \"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\"\n}",
+    "canonical": "{\"action_id\":\"merge\",\"business_revision\":\"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\"cancel_label\":\"Cancel\",\"confirm_label\":\"Merge\",\"locale\":\"en\",\"prepared_action_id\":\"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\",\"read_at\":\"2026-10-21T08:15:30.5Z\",\"title\":\"Merge PR #10612 into staging?\"}",
+    "sha256_hex": "e945581b2a674f22318d6e8363ad381fa2999f2c49f85948b3da20cd7c5a9341",
+    "expect": "ok",
+    "note": "1-digit fraction."
+  },
+  {
+    "name": "desc_read_at_nine_digit_fraction",
+    "layer": "description",
+    "input_json": "{\n  \"cancel_label\": \"Cancel\",\n  \"confirm_label\": \"Merge\",\n  \"title\": \"Merge PR #10612 into staging?\",\n  \"read_at\": \"2026-10-21T08:15:30.123456789Z\",\n  \"locale\": \"en\",\n  \"business_revision\": \"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\n  \"action_id\": \"merge\",\n  \"prepared_action_id\": \"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\"\n}",
+    "canonical": "{\"action_id\":\"merge\",\"business_revision\":\"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\"cancel_label\":\"Cancel\",\"confirm_label\":\"Merge\",\"locale\":\"en\",\"prepared_action_id\":\"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\",\"read_at\":\"2026-10-21T08:15:30.123456789Z\",\"title\":\"Merge PR #10612 into staging?\"}",
+    "sha256_hex": "d6e1df10bf14ccfdb811244a7e1a945dd02e3c5238ba405e4966fefd56c3d9b4",
+    "expect": "ok",
+    "note": "9-digit fraction (maximum)."
+  },
+  {
+    "name": "desc_read_at_leap_day",
+    "layer": "description",
+    "input_json": "{\n  \"cancel_label\": \"Cancel\",\n  \"confirm_label\": \"Merge\",\n  \"title\": \"Merge PR #10612 into staging?\",\n  \"read_at\": \"2028-02-29T23:59:59Z\",\n  \"locale\": \"en\",\n  \"business_revision\": \"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\n  \"action_id\": \"merge\",\n  \"prepared_action_id\": \"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\"\n}",
+    "canonical": "{\"action_id\":\"merge\",\"business_revision\":\"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\"cancel_label\":\"Cancel\",\"confirm_label\":\"Merge\",\"locale\":\"en\",\"prepared_action_id\":\"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\",\"read_at\":\"2028-02-29T23:59:59Z\",\"title\":\"Merge PR #10612 into staging?\"}",
+    "sha256_hex": "6fc6594eef77588d67e3c8a5799924e944e48f6fe8ddb2a16dd9407b1439a236",
+    "expect": "ok",
+    "note": "Feb 29 in a leap year; 23:59:59."
+  },
+  {
+    "name": "desc_read_at_year_end",
+    "layer": "description",
+    "input_json": "{\n  \"cancel_label\": \"Cancel\",\n  \"confirm_label\": \"Merge\",\n  \"title\": \"Merge PR #10612 into staging?\",\n  \"read_at\": \"2026-12-31T00:00:00Z\",\n  \"locale\": \"en\",\n  \"business_revision\": \"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\n  \"action_id\": \"merge\",\n  \"prepared_action_id\": \"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\"\n}",
+    "canonical": "{\"action_id\":\"merge\",\"business_revision\":\"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\"cancel_label\":\"Cancel\",\"confirm_label\":\"Merge\",\"locale\":\"en\",\"prepared_action_id\":\"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\",\"read_at\":\"2026-12-31T00:00:00Z\",\"title\":\"Merge PR #10612 into staging?\"}",
+    "sha256_hex": "0d7ba9fbebf321e9356ceaac087cc137f38e49841955f0f14f46b16e45165f23",
+    "expect": "ok",
+    "note": "Year end, midnight."
+  },
+  {
+    "name": "desc_reject_read_at_feb_30",
+    "layer": "description",
+    "input_json": "{\n  \"cancel_label\": \"Cancel\",\n  \"confirm_label\": \"Merge\",\n  \"title\": \"Merge PR #10612 into staging?\",\n  \"read_at\": \"2026-02-30T12:00:00Z\",\n  \"locale\": \"en\",\n  \"business_revision\": \"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\n  \"action_id\": \"merge\",\n  \"prepared_action_id\": \"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\"\n}",
+    "canonical": null,
+    "sha256_hex": null,
+    "expect": "reject",
+    "note": "Shape matches the regex but Feb 30 does not exist: the calendar check MUST reject (no date repair)."
+  },
+  {
+    "name": "desc_reject_read_at_feb_29_non_leap",
+    "layer": "description",
+    "input_json": "{\n  \"cancel_label\": \"Cancel\",\n  \"confirm_label\": \"Merge\",\n  \"title\": \"Merge PR #10612 into staging?\",\n  \"read_at\": \"2027-02-29T12:00:00Z\",\n  \"locale\": \"en\",\n  \"business_revision\": \"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\n  \"action_id\": \"merge\",\n  \"prepared_action_id\": \"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\"\n}",
+    "canonical": null,
+    "sha256_hex": null,
+    "expect": "reject",
+    "note": "2027 is not a leap year."
+  },
+  {
+    "name": "desc_reject_read_at_apr_31",
+    "layer": "description",
+    "input_json": "{\n  \"cancel_label\": \"Cancel\",\n  \"confirm_label\": \"Merge\",\n  \"title\": \"Merge PR #10612 into staging?\",\n  \"read_at\": \"2026-04-31T12:00:00Z\",\n  \"locale\": \"en\",\n  \"business_revision\": \"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\n  \"action_id\": \"merge\",\n  \"prepared_action_id\": \"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\"\n}",
+    "canonical": null,
+    "sha256_hex": null,
+    "expect": "reject",
+    "note": "April has 30 days."
+  },
+  {
+    "name": "desc_reject_read_at_month_13",
+    "layer": "description",
+    "input_json": "{\n  \"cancel_label\": \"Cancel\",\n  \"confirm_label\": \"Merge\",\n  \"title\": \"Merge PR #10612 into staging?\",\n  \"read_at\": \"2026-13-01T12:00:00Z\",\n  \"locale\": \"en\",\n  \"business_revision\": \"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\n  \"action_id\": \"merge\",\n  \"prepared_action_id\": \"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\"\n}",
+    "canonical": null,
+    "sha256_hex": null,
+    "expect": "reject",
+    "note": "Month 13."
+  },
+  {
+    "name": "desc_reject_read_at_month_00",
+    "layer": "description",
+    "input_json": "{\n  \"cancel_label\": \"Cancel\",\n  \"confirm_label\": \"Merge\",\n  \"title\": \"Merge PR #10612 into staging?\",\n  \"read_at\": \"2026-00-10T12:00:00Z\",\n  \"locale\": \"en\",\n  \"business_revision\": \"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\n  \"action_id\": \"merge\",\n  \"prepared_action_id\": \"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\"\n}",
+    "canonical": null,
+    "sha256_hex": null,
+    "expect": "reject",
+    "note": "Month 00."
+  },
+  {
+    "name": "desc_reject_read_at_day_00",
+    "layer": "description",
+    "input_json": "{\n  \"cancel_label\": \"Cancel\",\n  \"confirm_label\": \"Merge\",\n  \"title\": \"Merge PR #10612 into staging?\",\n  \"read_at\": \"2026-10-00T12:00:00Z\",\n  \"locale\": \"en\",\n  \"business_revision\": \"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\n  \"action_id\": \"merge\",\n  \"prepared_action_id\": \"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\"\n}",
+    "canonical": null,
+    "sha256_hex": null,
+    "expect": "reject",
+    "note": "Day 00."
+  },
+  {
+    "name": "desc_reject_read_at_hour_24",
+    "layer": "description",
+    "input_json": "{\n  \"cancel_label\": \"Cancel\",\n  \"confirm_label\": \"Merge\",\n  \"title\": \"Merge PR #10612 into staging?\",\n  \"read_at\": \"2026-10-21T24:00:00Z\",\n  \"locale\": \"en\",\n  \"business_revision\": \"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\n  \"action_id\": \"merge\",\n  \"prepared_action_id\": \"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\"\n}",
+    "canonical": null,
+    "sha256_hex": null,
+    "expect": "reject",
+    "note": "Hour 24."
+  },
+  {
+    "name": "desc_reject_read_at_minute_60",
+    "layer": "description",
+    "input_json": "{\n  \"cancel_label\": \"Cancel\",\n  \"confirm_label\": \"Merge\",\n  \"title\": \"Merge PR #10612 into staging?\",\n  \"read_at\": \"2026-10-21T08:60:00Z\",\n  \"locale\": \"en\",\n  \"business_revision\": \"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\n  \"action_id\": \"merge\",\n  \"prepared_action_id\": \"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\"\n}",
+    "canonical": null,
+    "sha256_hex": null,
+    "expect": "reject",
+    "note": "Minute 60."
+  },
+  {
+    "name": "desc_reject_read_at_leap_second",
+    "layer": "description",
+    "input_json": "{\n  \"cancel_label\": \"Cancel\",\n  \"confirm_label\": \"Merge\",\n  \"title\": \"Merge PR #10612 into staging?\",\n  \"read_at\": \"2026-12-31T23:59:60Z\",\n  \"locale\": \"en\",\n  \"business_revision\": \"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\n  \"action_id\": \"merge\",\n  \"prepared_action_id\": \"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\"\n}",
+    "canonical": null,
+    "sha256_hex": null,
+    "expect": "reject",
+    "note": "Second 60: this protocol's UTC subset has seconds 00-59."
+  },
+  {
+    "name": "desc_reject_read_at_garbage_fields",
+    "layer": "description",
+    "input_json": "{\n  \"cancel_label\": \"Cancel\",\n  \"confirm_label\": \"Merge\",\n  \"title\": \"Merge PR #10612 into staging?\",\n  \"read_at\": \"2026-13-99T29:99:99Z\",\n  \"locale\": \"en\",\n  \"business_revision\": \"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\n  \"action_id\": \"merge\",\n  \"prepared_action_id\": \"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\"\n}",
+    "canonical": null,
+    "sha256_hex": null,
+    "expect": "reject",
+    "note": "Every field out of range (matches a shape-only regex)."
+  },
+  {
+    "name": "desc_reject_read_at_missing_z",
+    "layer": "description",
+    "input_json": "{\n  \"cancel_label\": \"Cancel\",\n  \"confirm_label\": \"Merge\",\n  \"title\": \"Merge PR #10612 into staging?\",\n  \"read_at\": \"2026-10-21T08:15:30\",\n  \"locale\": \"en\",\n  \"business_revision\": \"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\n  \"action_id\": \"merge\",\n  \"prepared_action_id\": \"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\"\n}",
+    "canonical": null,
+    "sha256_hex": null,
+    "expect": "reject",
+    "note": "No 'Z'."
+  },
+  {
+    "name": "desc_reject_read_at_missing_z_with_millis",
+    "layer": "description",
+    "input_json": "{\n  \"cancel_label\": \"Cancel\",\n  \"confirm_label\": \"Merge\",\n  \"title\": \"Merge PR #10612 into staging?\",\n  \"read_at\": \"2026-10-21T08:15:30.123\",\n  \"locale\": \"en\",\n  \"business_revision\": \"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\n  \"action_id\": \"merge\",\n  \"prepared_action_id\": \"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\"\n}",
+    "canonical": null,
+    "sha256_hex": null,
+    "expect": "reject",
+    "note": "Fraction but no 'Z'."
+  },
+  {
+    "name": "desc_reject_read_at_lowercase_z",
+    "layer": "description",
+    "input_json": "{\n  \"cancel_label\": \"Cancel\",\n  \"confirm_label\": \"Merge\",\n  \"title\": \"Merge PR #10612 into staging?\",\n  \"read_at\": \"2026-10-21T08:15:30z\",\n  \"locale\": \"en\",\n  \"business_revision\": \"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\n  \"action_id\": \"merge\",\n  \"prepared_action_id\": \"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\"\n}",
+    "canonical": null,
+    "sha256_hex": null,
+    "expect": "reject",
+    "note": "Lowercase 'z'."
+  },
+  {
+    "name": "desc_reject_read_at_offset_zero",
+    "layer": "description",
+    "input_json": "{\n  \"cancel_label\": \"Cancel\",\n  \"confirm_label\": \"Merge\",\n  \"title\": \"Merge PR #10612 into staging?\",\n  \"read_at\": \"2026-10-21T08:15:30+00:00\",\n  \"locale\": \"en\",\n  \"business_revision\": \"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\n  \"action_id\": \"merge\",\n  \"prepared_action_id\": \"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\"\n}",
+    "canonical": null,
+    "sha256_hex": null,
+    "expect": "reject",
+    "note": "Numeric offset: only 'Z' is allowed."
+  },
+  {
+    "name": "desc_reject_read_at_offset_nonzero",
+    "layer": "description",
+    "input_json": "{\n  \"cancel_label\": \"Cancel\",\n  \"confirm_label\": \"Merge\",\n  \"title\": \"Merge PR #10612 into staging?\",\n  \"read_at\": \"2026-10-21T16:15:30+08:00\",\n  \"locale\": \"en\",\n  \"business_revision\": \"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\n  \"action_id\": \"merge\",\n  \"prepared_action_id\": \"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\"\n}",
+    "canonical": null,
+    "sha256_hex": null,
+    "expect": "reject",
+    "note": "Non-UTC offset."
+  },
+  {
+    "name": "desc_reject_read_at_space_separator",
+    "layer": "description",
+    "input_json": "{\n  \"cancel_label\": \"Cancel\",\n  \"confirm_label\": \"Merge\",\n  \"title\": \"Merge PR #10612 into staging?\",\n  \"read_at\": \"2026-10-21 08:15:30Z\",\n  \"locale\": \"en\",\n  \"business_revision\": \"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\n  \"action_id\": \"merge\",\n  \"prepared_action_id\": \"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\"\n}",
+    "canonical": null,
+    "sha256_hex": null,
+    "expect": "reject",
+    "note": "Space instead of 'T'."
+  },
+  {
+    "name": "desc_reject_read_at_lowercase_t",
+    "layer": "description",
+    "input_json": "{\n  \"cancel_label\": \"Cancel\",\n  \"confirm_label\": \"Merge\",\n  \"title\": \"Merge PR #10612 into staging?\",\n  \"read_at\": \"2026-10-21t08:15:30Z\",\n  \"locale\": \"en\",\n  \"business_revision\": \"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\n  \"action_id\": \"merge\",\n  \"prepared_action_id\": \"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\"\n}",
+    "canonical": null,
+    "sha256_hex": null,
+    "expect": "reject",
+    "note": "Lowercase 't'."
+  },
+  {
+    "name": "desc_reject_read_at_ten_digit_fraction",
+    "layer": "description",
+    "input_json": "{\n  \"cancel_label\": \"Cancel\",\n  \"confirm_label\": \"Merge\",\n  \"title\": \"Merge PR #10612 into staging?\",\n  \"read_at\": \"2026-10-21T08:15:30.1234567890Z\",\n  \"locale\": \"en\",\n  \"business_revision\": \"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\n  \"action_id\": \"merge\",\n  \"prepared_action_id\": \"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\"\n}",
+    "canonical": null,
+    "sha256_hex": null,
+    "expect": "reject",
+    "note": "More than 9 fraction digits."
+  },
+  {
+    "name": "desc_reject_read_at_empty_fraction",
+    "layer": "description",
+    "input_json": "{\n  \"cancel_label\": \"Cancel\",\n  \"confirm_label\": \"Merge\",\n  \"title\": \"Merge PR #10612 into staging?\",\n  \"read_at\": \"2026-10-21T08:15:30.Z\",\n  \"locale\": \"en\",\n  \"business_revision\": \"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\n  \"action_id\": \"merge\",\n  \"prepared_action_id\": \"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\"\n}",
+    "canonical": null,
+    "sha256_hex": null,
+    "expect": "reject",
+    "note": "Dot with no digits."
+  },
+  {
+    "name": "desc_reject_read_at_comma_fraction",
+    "layer": "description",
+    "input_json": "{\n  \"cancel_label\": \"Cancel\",\n  \"confirm_label\": \"Merge\",\n  \"title\": \"Merge PR #10612 into staging?\",\n  \"read_at\": \"2026-10-21T08:15:30,123Z\",\n  \"locale\": \"en\",\n  \"business_revision\": \"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\n  \"action_id\": \"merge\",\n  \"prepared_action_id\": \"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\"\n}",
+    "canonical": null,
+    "sha256_hex": null,
+    "expect": "reject",
+    "note": "Comma decimal separator."
+  },
+  {
+    "name": "desc_reject_read_at_no_seconds",
+    "layer": "description",
+    "input_json": "{\n  \"cancel_label\": \"Cancel\",\n  \"confirm_label\": \"Merge\",\n  \"title\": \"Merge PR #10612 into staging?\",\n  \"read_at\": \"2026-10-21T08:15Z\",\n  \"locale\": \"en\",\n  \"business_revision\": \"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\n  \"action_id\": \"merge\",\n  \"prepared_action_id\": \"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\"\n}",
+    "canonical": null,
+    "sha256_hex": null,
+    "expect": "reject",
+    "note": "Seconds missing."
+  },
+  {
+    "name": "desc_reject_read_at_fullwidth_digit",
+    "layer": "description",
+    "input_json": "{\n  \"cancel_label\": \"Cancel\",\n  \"confirm_label\": \"Merge\",\n  \"title\": \"Merge PR #10612 into staging?\",\n  \"read_at\": \"2026-10-2１T08:15:30Z\",\n  \"locale\": \"en\",\n  \"business_revision\": \"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\n  \"action_id\": \"merge\",\n  \"prepared_action_id\": \"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\"\n}",
+    "canonical": null,
+    "sha256_hex": null,
+    "expect": "reject",
+    "note": "Fullwidth digit U+FF11: regex must be ASCII-only (\\d in some engines matches non-ASCII digits)."
+  },
+  {
+    "name": "desc_title_120_ascii",
+    "layer": "description",
+    "input_json": "{\n  \"cancel_label\": \"Cancel\",\n  \"confirm_label\": \"Merge\",\n  \"title\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\n  \"read_at\": \"2026-10-21T08:15:30Z\",\n  \"locale\": \"en\",\n  \"business_revision\": \"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\n  \"action_id\": \"merge\",\n  \"prepared_action_id\": \"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\"\n}",
+    "canonical": "{\"action_id\":\"merge\",\"business_revision\":\"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\"cancel_label\":\"Cancel\",\"confirm_label\":\"Merge\",\"locale\":\"en\",\"prepared_action_id\":\"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\",\"read_at\":\"2026-10-21T08:15:30Z\",\"title\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}",
+    "sha256_hex": "0c94d1763bb47737805db2f7841c1d705bc02d3f716dd58eeea1e4da64f92702",
+    "expect": "ok",
+    "note": "title = 120 code points: allowed."
+  },
+  {
+    "name": "desc_reject_title_121_ascii",
+    "layer": "description",
+    "input_json": "{\n  \"cancel_label\": \"Cancel\",\n  \"confirm_label\": \"Merge\",\n  \"title\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\n  \"read_at\": \"2026-10-21T08:15:30Z\",\n  \"locale\": \"en\",\n  \"business_revision\": \"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\n  \"action_id\": \"merge\",\n  \"prepared_action_id\": \"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\"\n}",
+    "canonical": null,
+    "sha256_hex": null,
+    "expect": "reject",
+    "note": "title = 121 code points."
+  },
+  {
+    "name": "desc_title_120_supplementary",
+    "layer": "description",
+    "input_json": "{\n  \"cancel_label\": \"Cancel\",\n  \"confirm_label\": \"Merge\",\n  \"title\": \"😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀\",\n  \"read_at\": \"2026-10-21T08:15:30Z\",\n  \"locale\": \"en\",\n  \"business_revision\": \"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\n  \"action_id\": \"merge\",\n  \"prepared_action_id\": \"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\"\n}",
+    "canonical": "{\"action_id\":\"merge\",\"business_revision\":\"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\"cancel_label\":\"Cancel\",\"confirm_label\":\"Merge\",\"locale\":\"en\",\"prepared_action_id\":\"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\",\"read_at\":\"2026-10-21T08:15:30Z\",\"title\":\"😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀\"}",
+    "sha256_hex": "2879c7621218264e54770bcca58484eb40938cb167274888920f13bf0cc095a8",
+    "expect": "ok",
+    "note": "120 supplementary-plane chars = 120 code points (240 UTF-16 units, 480 UTF-8 bytes): allowed. Counting UTF-16 units or bytes would wrongly reject."
+  },
+  {
+    "name": "desc_reject_title_121_supplementary",
+    "layer": "description",
+    "input_json": "{\n  \"cancel_label\": \"Cancel\",\n  \"confirm_label\": \"Merge\",\n  \"title\": \"😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀\",\n  \"read_at\": \"2026-10-21T08:15:30Z\",\n  \"locale\": \"en\",\n  \"business_revision\": \"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\n  \"action_id\": \"merge\",\n  \"prepared_action_id\": \"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\"\n}",
+    "canonical": null,
+    "sha256_hex": null,
+    "expect": "reject",
+    "note": "121 supplementary-plane chars."
+  },
+  {
+    "name": "desc_title_120_combining",
+    "layer": "description",
+    "input_json": "{\n  \"cancel_label\": \"Cancel\",\n  \"confirm_label\": \"Merge\",\n  \"title\": \"éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé\",\n  \"read_at\": \"2026-10-21T08:15:30Z\",\n  \"locale\": \"en\",\n  \"business_revision\": \"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\n  \"action_id\": \"merge\",\n  \"prepared_action_id\": \"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\"\n}",
+    "canonical": "{\"action_id\":\"merge\",\"business_revision\":\"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\"cancel_label\":\"Cancel\",\"confirm_label\":\"Merge\",\"locale\":\"en\",\"prepared_action_id\":\"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\",\"read_at\":\"2026-10-21T08:15:30Z\",\"title\":\"éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé\"}",
+    "sha256_hex": "9216981593acde209e485986189af97a6aa1bb5eb3860250be1f2e4ed32d3807",
+    "expect": "ok",
+    "note": "60 x (e + U+0301) = 120 code points: allowed. No NFC merging before counting."
+  },
+  {
+    "name": "desc_reject_title_122_combining",
+    "layer": "description",
+    "input_json": "{\n  \"cancel_label\": \"Cancel\",\n  \"confirm_label\": \"Merge\",\n  \"title\": \"ééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé\",\n  \"read_at\": \"2026-10-21T08:15:30Z\",\n  \"locale\": \"en\",\n  \"business_revision\": \"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\n  \"action_id\": \"merge\",\n  \"prepared_action_id\": \"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\"\n}",
+    "canonical": null,
+    "sha256_hex": null,
+    "expect": "reject",
+    "note": "61 x (e + U+0301) = 122 code points: rejected even though NFC would make it 61."
+  },
+  {
+    "name": "desc_title_120_noncharacters",
+    "layer": "description",
+    "input_json": "{\n  \"cancel_label\": \"Cancel\",\n  \"confirm_label\": \"Merge\",\n  \"title\": \"￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿\",\n  \"read_at\": \"2026-10-21T08:15:30Z\",\n  \"locale\": \"en\",\n  \"business_revision\": \"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\n  \"action_id\": \"merge\",\n  \"prepared_action_id\": \"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\"\n}",
+    "canonical": "{\"action_id\":\"merge\",\"business_revision\":\"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\"cancel_label\":\"Cancel\",\"confirm_label\":\"Merge\",\"locale\":\"en\",\"prepared_action_id\":\"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\",\"read_at\":\"2026-10-21T08:15:30Z\",\"title\":\"￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿￿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿􏿿\"}",
+    "sha256_hex": "3fb7b845c35da8a56335582b2d7b44d5c624aae3421693b1719d9442751560af",
+    "expect": "ok",
+    "note": "Noncharacters count as code points and are accepted."
+  },
+  {
+    "name": "desc_confirm_label_40_cjk",
+    "layer": "description",
+    "input_json": "{\n  \"cancel_label\": \"Cancel\",\n  \"confirm_label\": \"批批批批批批批批批批批批批批批批批批批批批批批批批批批批批批批批批批批批批批批批\",\n  \"title\": \"Merge PR #10612 into staging?\",\n  \"read_at\": \"2026-10-21T08:15:30Z\",\n  \"locale\": \"en\",\n  \"business_revision\": \"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\n  \"action_id\": \"merge\",\n  \"prepared_action_id\": \"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\"\n}",
+    "canonical": "{\"action_id\":\"merge\",\"business_revision\":\"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\"cancel_label\":\"Cancel\",\"confirm_label\":\"批批批批批批批批批批批批批批批批批批批批批批批批批批批批批批批批批批批批批批批批\",\"locale\":\"en\",\"prepared_action_id\":\"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\",\"read_at\":\"2026-10-21T08:15:30Z\",\"title\":\"Merge PR #10612 into staging?\"}",
+    "sha256_hex": "ff7fa005ef9f2f15a3974b3e51a9247c43eddb271b8b784c160243fdebaf8ab3",
+    "expect": "ok",
+    "note": "confirm_label = 40 CJK code points."
+  },
+  {
+    "name": "desc_reject_confirm_label_41_cjk",
+    "layer": "description",
+    "input_json": "{\n  \"cancel_label\": \"Cancel\",\n  \"confirm_label\": \"批批批批批批批批批批批批批批批批批批批批批批批批批批批批批批批批批批批批批批批批批\",\n  \"title\": \"Merge PR #10612 into staging?\",\n  \"read_at\": \"2026-10-21T08:15:30Z\",\n  \"locale\": \"en\",\n  \"business_revision\": \"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\n  \"action_id\": \"merge\",\n  \"prepared_action_id\": \"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\"\n}",
+    "canonical": null,
+    "sha256_hex": null,
+    "expect": "reject",
+    "note": "confirm_label = 41."
+  },
+  {
+    "name": "desc_body_500_supplementary",
+    "layer": "description",
+    "input_json": "{\n  \"body\": \"😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀\",\n  \"cancel_label\": \"Cancel\",\n  \"confirm_label\": \"Merge\",\n  \"title\": \"Merge PR #10612 into staging?\",\n  \"read_at\": \"2026-10-21T08:15:30Z\",\n  \"locale\": \"en\",\n  \"business_revision\": \"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\n  \"action_id\": \"merge\",\n  \"prepared_action_id\": \"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\"\n}",
+    "canonical": "{\"action_id\":\"merge\",\"body\":\"😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀\",\"business_revision\":\"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\"cancel_label\":\"Cancel\",\"confirm_label\":\"Merge\",\"locale\":\"en\",\"prepared_action_id\":\"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\",\"read_at\":\"2026-10-21T08:15:30Z\",\"title\":\"Merge PR #10612 into staging?\"}",
+    "sha256_hex": "f4333390171be0d21a37cdc37bf535fa5beabe3722b4116d50244022c46fe6ad",
+    "expect": "ok",
+    "note": "body = 500 code points."
+  },
+  {
+    "name": "desc_reject_body_501_mixed",
+    "layer": "description",
+    "input_json": "{\n  \"body\": \"😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\n  \"cancel_label\": \"Cancel\",\n  \"confirm_label\": \"Merge\",\n  \"title\": \"Merge PR #10612 into staging?\",\n  \"read_at\": \"2026-10-21T08:15:30Z\",\n  \"locale\": \"en\",\n  \"business_revision\": \"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\n  \"action_id\": \"merge\",\n  \"prepared_action_id\": \"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\"\n}",
+    "canonical": null,
+    "sha256_hex": null,
+    "expect": "reject",
+    "note": "body = 501 code points."
+  },
+  {
+    "name": "desc_rows_label_40_value_200",
+    "layer": "description",
+    "input_json": "{\n  \"rows\": [\n    {\n      \"value\": \"中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中\",\n      \"label\": \"😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀\"\n    }\n  ],\n  \"cancel_label\": \"Cancel\",\n  \"confirm_label\": \"Merge\",\n  \"title\": \"Merge PR #10612 into staging?\",\n  \"read_at\": \"2026-10-21T08:15:30Z\",\n  \"locale\": \"en\",\n  \"business_revision\": \"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\n  \"action_id\": \"merge\",\n  \"prepared_action_id\": \"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\"\n}",
+    "canonical": "{\"action_id\":\"merge\",\"business_revision\":\"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\"cancel_label\":\"Cancel\",\"confirm_label\":\"Merge\",\"locale\":\"en\",\"prepared_action_id\":\"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\",\"read_at\":\"2026-10-21T08:15:30Z\",\"rows\":[{\"label\":\"😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀\",\"value\":\"中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中\"}],\"title\":\"Merge PR #10612 into staging?\"}",
+    "sha256_hex": "d20c51aeca9fbc9c08b77a59f18649f9f9e77fba53a8a16ccbf9c51e01abcd12",
+    "expect": "ok",
+    "note": "Row label 40 and value 200 code points."
+  },
+  {
+    "name": "desc_reject_rows_label_41",
+    "layer": "description",
+    "input_json": "{\n  \"rows\": [\n    {\n      \"value\": \"v\",\n      \"label\": \"😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀\"\n    }\n  ],\n  \"cancel_label\": \"Cancel\",\n  \"confirm_label\": \"Merge\",\n  \"title\": \"Merge PR #10612 into staging?\",\n  \"read_at\": \"2026-10-21T08:15:30Z\",\n  \"locale\": \"en\",\n  \"business_revision\": \"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\n  \"action_id\": \"merge\",\n  \"prepared_action_id\": \"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\"\n}",
+    "canonical": null,
+    "sha256_hex": null,
+    "expect": "reject",
+    "note": "Row label 41 code points."
+  },
+  {
+    "name": "desc_reject_rows_value_201",
+    "layer": "description",
+    "input_json": "{\n  \"rows\": [\n    {\n      \"value\": \"中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中\",\n      \"label\": \"l\"\n    }\n  ],\n  \"cancel_label\": \"Cancel\",\n  \"confirm_label\": \"Merge\",\n  \"title\": \"Merge PR #10612 into staging?\",\n  \"read_at\": \"2026-10-21T08:15:30Z\",\n  \"locale\": \"en\",\n  \"business_revision\": \"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\n  \"action_id\": \"merge\",\n  \"prepared_action_id\": \"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\"\n}",
+    "canonical": null,
+    "sha256_hex": null,
+    "expect": "reject",
+    "note": "Row value 201 code points."
+  },
+  {
+    "name": "desc_title_120_supplementary_escaped",
+    "layer": "description",
+    "input_json": "{\r\n\t\"cancel_label\" : \"Cancel\" ,\r\n\t\"confirm_label\" : \"Merge\" ,\r\n\t\"title\" : \"\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\" ,\r\n\t\"read_at\" : \"2026-10-21T08:15:30Z\" ,\r\n\t\"locale\" : \"en\" ,\r\n\t\"business_revision\" : \"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\" ,\r\n\t\"action_id\" : \"merge\" ,\r\n\t\"prepared_action_id\" : \"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\"\r\n}",
+    "canonical": "{\"action_id\":\"merge\",\"business_revision\":\"3f2a1c9e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39:a71c2e5f9d0b8c7a6e5f4d3c2b1a0f9e8d7c6b5a\",\"cancel_label\":\"Cancel\",\"confirm_label\":\"Merge\",\"locale\":\"en\",\"prepared_action_id\":\"0b7e3c1a-5f2d-4c8e-9a61-3d2f8e4b7c90\",\"read_at\":\"2026-10-21T08:15:30Z\",\"title\":\"😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀\"}",
+    "sha256_hex": "2879c7621218264e54770bcca58484eb40938cb167274888920f13bf0cc095a8",
+    "expect": "ok",
+    "note": "Same as desc_title_120_supplementary written as \\uD83D\\uDE00 pairs: still 120 code points, same digest."
+  }
+]

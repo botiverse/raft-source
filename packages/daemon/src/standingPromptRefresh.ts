@@ -1,8 +1,9 @@
 import { createHash } from "node:crypto";
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import path from "node:path";
+import { readFileSync } from "node:fs";
+import { agentStateFile, writeAgentStateText } from "./agentStateFiles";
 import type { AgentConfig } from "@botiverse/raft-shared";
 import { axSurface, composeAxSurfaces, type AxSurfaceText } from "./agentRuntimeInput";
+import { WAKE_SECTION_BREAK } from "./startupMemoryBlock";
 
 /**
  * task #13 — keeping a resumed session's standing prompt current.
@@ -52,8 +53,26 @@ export function stableStandingPromptConfig(config: AgentConfig): AgentConfig {
   };
 }
 
-export function standingPromptHash(prompt: string): string {
-  return createHash("sha256").update(prompt).digest("hex").slice(0, 32);
+/**
+ * Folded into the ledger hash of a runtime without a native standing prompt.
+ *
+ * Before version 2, a session of such a runtime started by anything but a cold
+ * start (a wake message, resume catch-up, missing-session recovery, ...) never
+ * got the standing prompt, yet the ledger recorded it as running on the current
+ * one, so its resumes planned `unchanged` and never delivered it. Changing what
+ * is hashed makes every record written before version 2 mismatch once: the
+ * next resume of each such session re-delivers the prompt (`inject`) and
+ * records the new hash, after which it is `unchanged` again. A session that
+ * did get the prompt at its cold start gets it once more, which is harmless.
+ * Native runtimes hash the prompt alone, as before, so their records still
+ * match. Bump only to force one more re-delivery of this kind.
+ */
+export const STANDING_PROMPT_LEDGER_VERSION_WITHOUT_NATIVE = 2;
+
+export function standingPromptHash(prompt: string, opts: { nativeStandingPrompt: boolean }): string {
+  const hash = createHash("sha256");
+  if (!opts.nativeStandingPrompt) hash.update(`raft-standing-prompt-ledger-v${STANDING_PROMPT_LEDGER_VERSION_WITHOUT_NATIVE}\n`);
+  return hash.update(prompt).digest("hex").slice(0, 32);
 }
 
 interface LedgerRecord {
@@ -65,12 +84,12 @@ interface LedgerRecord {
 
 const FILE_NAME = "standing-prompt.json";
 
-/** One record per agent, in its workspace's hidden `.raft/` (never listed). Ids, a hash and a time only. */
+/** One record per agent, in the daemon's agent state (`agentStateFiles.ts`), never the workspace. Ids, a hash and a time only. */
 export class StandingPromptLedger {
   constructor(private readonly agentsDir: string, private readonly now: () => number = Date.now) {}
 
   private file(agentId: string): string {
-    return path.join(this.agentsDir, agentId, ".raft", FILE_NAME);
+    return agentStateFile(this.agentsDir, agentId, FILE_NAME);
   }
 
   read(agentId: string): LedgerRecord | null {
@@ -84,12 +103,8 @@ export class StandingPromptLedger {
   }
 
   write(agentId: string, sessionId: string, promptHash: string): void {
-    const file = this.file(agentId);
-    mkdirSync(path.dirname(file), { recursive: true });
     const record: LedgerRecord = { version: 1, sessionId, promptHash, recordedAtMs: this.now() };
-    const tmp = `${file}.${process.pid}.tmp`;
-    writeFileSync(tmp, JSON.stringify(record));
-    renameSync(tmp, file);
+    writeAgentStateText(this.file(agentId), JSON.stringify(record));
   }
 }
 
@@ -146,4 +161,81 @@ export function applyStandingPromptUpdate(
 ): { prompt: AxSurfaceText; promptSource: string } {
   if (plan.action !== "inject") return { prompt, promptSource };
   return { prompt: composeAxSurfaces(formatStandingPromptUpdate(standingPrompt), prompt), promptSource: `${promptSource}_with_standing_prompt_update` };
+}
+
+/**
+ * A runtime without a native standing prompt (Cursor, Gemini, Copilot) sees
+ * the standing prompt only if a fresh session's first input carries it. Every
+ * fresh start goes through here, whatever triggered it (cold start, a wake
+ * message, a thread join, resume catch-up for a dropped session, missing-session
+ * recovery), so the prompt opens the first input the daemon composes, the way a
+ * native runtime has it ahead of the first input. Two short spawn-time
+ * prefixes can still go in front of it when they apply (the memory-limit
+ * recovery note and the held server context, see `startAgent`).
+ */
+export function standingPromptGoesInFirstInput(input: { nativeStandingPrompt: boolean; resumeSessionId: string | null }): boolean {
+  return !input.nativeStandingPrompt && !input.resumeSessionId;
+}
+
+/**
+ * Puts the standing prompt ahead of a fresh session's first input. The prompt
+ * source is left as it is (the feedback event tail only accepts the known
+ * sources); traces record the fact as `runtime_input_standing_prompt_present`.
+ */
+export function applyFreshSessionStandingPrompt(
+  inFirstInput: boolean,
+  standingPrompt: AxSurfaceText,
+  prompt: AxSurfaceText,
+): AxSurfaceText {
+  if (!inFirstInput) return prompt;
+  return composeAxSurfaces(standingPrompt, WAKE_SECTION_BREAK, prompt);
+}
+
+/**
+ * Recorded for a session the current standing prompt did not reach (a runtime
+ * without a native standing prompt that came up on another session than the
+ * one this launch resumed). Never equal to a real hash, so that session's
+ * next resume re-delivers the prompt instead of treating it as current.
+ */
+export const UNDELIVERED_STANDING_PROMPT_HASH = "undelivered";
+
+/**
+ * Which sessions reported by a launch run on the current standing prompt:
+ * - `any`: the runtime carries it natively, so every session it reports has it;
+ * - `first_reported`: it went in the first input, which reaches the first session the runtime reports
+ *   (`sessionId` is null until that session is reported);
+ * - `resumed`: it is not in this launch's input, so only the resumed session (recorded or baselined earlier) is on it.
+ */
+export type StandingPromptSessionBinding =
+  | { kind: "any" }
+  | { kind: "first_reported"; sessionId: string | null }
+  | { kind: "resumed"; sessionId: string };
+
+export function standingPromptSessionBinding(input: {
+  nativeStandingPrompt: boolean;
+  resumeSessionId: string | null;
+  /** The launch's first input carries the full prompt (fresh session, or a re-delivery). */
+  promptInFirstInput: boolean;
+}): StandingPromptSessionBinding {
+  if (input.nativeStandingPrompt) return { kind: "any" };
+  if (input.promptInFirstInput || !input.resumeSessionId) return { kind: "first_reported", sessionId: null };
+  return { kind: "resumed", sessionId: input.resumeSessionId };
+}
+
+/**
+ * What to record when the runtime reports `sessionId`: the launch's hash if
+ * its standing prompt reached that session, else UNDELIVERED_STANDING_PROMPT_HASH.
+ * Returns the binding to keep for later reports: a `first_reported` binding
+ * becomes bound to the first session reported. The input is not modified.
+ */
+export function standingPromptRecordForReportedSession(
+  binding: StandingPromptSessionBinding,
+  sessionId: string,
+  promptHash: string,
+): { promptHash: string; binding: StandingPromptSessionBinding } {
+  const next: StandingPromptSessionBinding = binding.kind === "first_reported" && binding.sessionId === null
+    ? { kind: "first_reported", sessionId }
+    : binding;
+  const current = next.kind === "any" || next.sessionId === sessionId;
+  return { promptHash: current ? promptHash : UNDELIVERED_STANDING_PROMPT_HASH, binding: next };
 }

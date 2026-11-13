@@ -31,6 +31,7 @@ import {
   AGENT_MIGRATION_MIN_CHUNK_BYTES,
   AGENT_MIGRATION_CAPABILITY,
   AGENT_MIGRATION_RESUMABLE_PROTOCOL,
+  MAX_AGENT_MIGRATION_TRANSFER_BYTES,
   agentMigrationTransferSummarySchema,
   currentDate,
   type AgentMigrationControlChunk,
@@ -167,11 +168,19 @@ export interface StreamAgentMigrationResumableBundleInput {
   maxBytes: number;
   /** Test seam; defaults to AGENT_MIGRATION_MAX_ARCHIVE_ENTRIES. */
   maxEntries?: number;
+  /** Test seam; defaults to MAX_AGENT_MIGRATION_TRANSFER_BYTES, the summary's uncompressed cap. */
+  maxExpandedBytes?: number;
   chunkSizeBytes?: number;
   /** Chunks uploading at once; each one holds its bytes in memory. */
   uploadConcurrency?: number;
   signal?: AbortSignal;
   onProgress?: (progress: AgentMigrationExportProgress) => void;
+  /**
+   * The Server advertised SERVER_CAPABILITY_MIGRATION_BACKUP_IGNORE_SOURCES_V1,
+   * so the transfer summary may carry `excludedIgnoredBySource`. Read when the
+   * summary is built, after the walk, so a reconnect meanwhile is followed.
+   */
+  reportIgnoredBySource?: () => boolean;
   /** Uploads one sealed chunk (retrying is up to the caller); a rejection fails the bundle. */
   uploadChunk(chunk: AgentMigrationControlChunk, bytes: Buffer): Promise<void>;
 }
@@ -319,6 +328,17 @@ export async function streamAgentMigrationResumableBundle(
     stopped = true;
   }
 
+  // The transfer summary caps the uncompressed total too. A workspace over it
+  // that still compressed under the byte limit would otherwise fail the
+  // summary's validation with raw validator output; report it as the same
+  // too-large error, with the largest paths, so it can be explained.
+  const maxExpandedBytes = input.maxExpandedBytes ?? MAX_AGENT_MIGRATION_TRANSFER_BYTES;
+  if (totals.bytes > maxExpandedBytes) {
+    const tooLarge = `MIGRATION_OBJECT_STORE_BUNDLE_TOO_LARGE:actualBytes=${totals.bytes}:maxBytes=${maxExpandedBytes}`;
+    const bytesByTopLevelPath = await measureWorkspaceBytesByTopLevelPath(workspacePath).catch(() => null);
+    throw new Error(bytesByTopLevelPath ? `${tooLarge}:topEntries=${bundleTooLargeTopEntries(bytesByTopLevelPath)}` : tooLarge);
+  }
+
   const control = buildControlManifest(input, {
     bundle: {
       totalBytes: chunkWriter.totalBytes,
@@ -334,6 +354,7 @@ export async function streamAgentMigrationResumableBundle(
       notesPresent: totals.notesPresent,
       excludedRegenerable: listing.excludedRegenerable,
       excludedIgnored: listing.excludedIgnored,
+      reportIgnoredBySource: input.reportIgnoredBySource?.() === true,
     }),
   });
   const { sha256: controlSha256, bytes: controlBytes } = validateAgentMigrationControlManifest(control);

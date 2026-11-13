@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
 import { Readable } from "node:stream";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 
 import { closeDatabase, getDb, initDatabase } from "../db/index";
 import {
@@ -18,12 +18,14 @@ import {
   servers,
   users,
 } from "../db/schema";
-import type { ExternalOutboundAttachmentProviderAdapter } from "./externalAttachmentProviderAdapter";
+import type { ExternalAttachmentCompletionRequest, ExternalOutboundAttachmentProviderAdapter } from "./externalAttachmentProviderAdapter";
 import { createOutboundExternalAttachmentTransferWithExecutor } from "./externalAttachmentTransferService";
 import type { SlackBridgeRenderSnapshot } from "./externalDeliveryOutboxService";
 import {
   dispatchExternalOutboundAttachments,
   finalizeAcceptedOutboundAttachmentFacts,
+  prepareOutboundAttachmentSourceDigests,
+  reconcileExternalOutboundAttachments,
 } from "./externalOutboundAttachmentCoordinator";
 import type { StorageBackend } from "./storageService";
 
@@ -32,7 +34,7 @@ const NOW = new Date("2026-09-05T02:00:00.000Z");
 beforeEach(async () => { await initDatabase("pglite://"); });
 afterEach(async () => { await closeDatabase(); });
 
-async function fixture() {
+async function fixture(hashless = false) {
   const db = getDb();
   const [owner] = await db.insert(users).values({
     email: `outbound-asset-${randomUUID()}@raft.test`,
@@ -69,7 +71,7 @@ async function fixture() {
       uploaderId: owner.id,
       uploaderType: "user",
       storageKey: `${server.id}/file-${messagePosition}.txt`,
-      contentHash,
+      contentHash: hashless ? null : contentHash,
       mimeType: "text/plain",
       sizeBytes: body.length,
     }).returning();
@@ -81,10 +83,6 @@ async function fixture() {
       uploaderId: owner.id,
       uploaderType: "user",
       filename: `file-${messagePosition}.txt`,
-      mimeType: "text/plain",
-      sizeBytes: body.length,
-      storageKey: object.storageKey,
-      contentHash,
     }).returning();
     sourceAttachments.push({ attachment, object, body });
   }
@@ -108,6 +106,7 @@ async function fixture() {
     },
     sanitizedText: message.content,
     externalMentions: [],
+    raftMentionSubstitutions: [],
     attachments: sourceAttachments.map(({ attachment, object }, messagePosition) => ({
       sourceAttachmentId: attachment.id,
       objectId: object.id,
@@ -116,7 +115,7 @@ async function fixture() {
       filename: attachment.filename,
       mimeType: object.mimeType,
       sizeBytes: object.sizeBytes,
-      contentDigest: object.contentHash!,
+      contentDigest: object.contentHash,
       messagePosition,
     })),
     bindingAuthority: {
@@ -149,7 +148,7 @@ async function fixture() {
       renderSnapshotSchema: snapshot.schema,
       renderSnapshot: snapshot as unknown as Record<string, unknown>,
       renderSnapshotDigest: "a".repeat(64),
-      reconciliationMarker: "m".repeat(43),
+      reconciliationMarker: createHash("sha256").update(randomUUID()).digest("base64url"),
     }).returning();
   });
   for (const { attachment } of sourceAttachments) {
@@ -226,6 +225,81 @@ function adapter(input: { completionUnknown?: boolean; uploadUnknownOnce?: boole
     uploadFileIds: () => [...uploadFileIds],
   };
 }
+
+test("hashless direct uploads are hashed before any provider ticket and then delivered", async () => {
+  const state = await fixture(true);
+  const provider = adapter();
+  assert.deepEqual(await prepareOutboundAttachmentSourceDigests({
+    db: state.db, deliveryId: state.delivery.id, snapshot: state.snapshot,
+    storage: state.storage, leaseOwner: "hashless-prepare", now: () => NOW,
+  }), { ready: true });
+  const result = await dispatchExternalOutboundAttachments({
+    db: state.db, deliveryId: state.delivery.id,
+    reconciliationMarker: state.delivery.reconciliationMarker, snapshot: state.snapshot,
+    adapter: provider.value, storage: state.storage, providerRootThreadId: null,
+    leaseOwner: "hashless-worker", now: () => NOW,
+  });
+  assert.deepEqual(result, { kind: "accepted", providerMessageId: "provider-message-1" });
+  assert.deepEqual(provider.counts(), { ticketCalls: 2, uploadCalls: 2, completeCalls: 1, correlationCalls: 1 });
+  const jobs = await state.db.select().from(externalAttachmentTransferJobs);
+  for (const source of state.sourceAttachments) {
+    const job = jobs.find((candidate) => candidate.sourceAttachmentId === source.attachment.id);
+    assert.equal(job?.frozenContentDigest, createHash("sha256").update(source.body).digest("hex"));
+  }
+});
+
+test("hashless source read failure makes no provider call and remains retryable", async () => {
+  const state = await fixture(true);
+  const provider = adapter();
+  const storage = { ...state.storage, async get() { throw new Error("unavailable"); } };
+  const result = await prepareOutboundAttachmentSourceDigests({
+    db: state.db, deliveryId: state.delivery.id, snapshot: state.snapshot, storage,
+    leaseOwner: "hashless-prepare", now: () => NOW,
+  });
+  assert.deepEqual(result, { ready: false, reason: "attachment_source_read_failed" });
+  assert.deepEqual(provider.counts(), { ticketCalls: 0, uploadCalls: 0, completeCalls: 0, correlationCalls: 0 });
+  const [job] = await state.db.select().from(externalAttachmentTransferJobs)
+    .where(eq(externalAttachmentTransferJobs.sourceAttachmentId, state.sourceAttachments[0]!.attachment.id));
+  assert.equal(job.state, "retry_wait");
+  assert.equal(job.frozenContentDigest, null);
+});
+
+test("aborting a stalled source stream releases the claim for retry", async () => {
+  const state = await fixture(true);
+  const controller = new AbortController();
+  let opened!: () => void;
+  const openedPromise = new Promise<void>((resolve) => { opened = resolve; });
+  const storage = { ...state.storage, async get() { opened(); return new Readable({ read() {} }); } };
+  const preparation = prepareOutboundAttachmentSourceDigests({
+    db: state.db, deliveryId: state.delivery.id, snapshot: state.snapshot, storage,
+    leaseOwner: "hashless-prepare", now: () => NOW, signal: controller.signal,
+  });
+  await openedPromise;
+  controller.abort();
+  assert.deepEqual(await preparation, { ready: false, reason: "attachment_source_read_failed" });
+  const [job] = await state.db.select().from(externalAttachmentTransferJobs)
+    .where(eq(externalAttachmentTransferJobs.sourceAttachmentId, state.sourceAttachments[0]!.attachment.id));
+  assert.equal(job.state, "retry_wait");
+  assert.equal(job.leaseOwner, null);
+});
+
+test("hashless wrong-size source is retained for retry with an explicit reason", async () => {
+  const state = await fixture(true);
+  const storage = { ...state.storage, async get() { return Readable.from(Buffer.from("x")); } };
+  const result = await prepareOutboundAttachmentSourceDigests({
+    db: state.db, deliveryId: state.delivery.id, snapshot: state.snapshot, storage,
+    leaseOwner: "hashless-prepare", now: () => NOW,
+  });
+  assert.deepEqual(result, { ready: false, reason: "attachment_source_size_mismatch" });
+  const [job] = await state.db.select().from(externalAttachmentTransferJobs)
+    .where(eq(externalAttachmentTransferJobs.sourceAttachmentId, state.sourceAttachments[0]!.attachment.id));
+  assert.equal(job.state, "retry_wait");
+  assert.equal(job.lastErrorClass, "attachment_source_size_mismatch");
+  assert.deepEqual(await prepareOutboundAttachmentSourceDigests({
+    db: state.db, deliveryId: state.delivery.id, snapshot: state.snapshot, storage: state.storage,
+    leaseOwner: "hashless-recovery", now: () => new Date(NOW.getTime() + 31_000),
+  }), { ready: true });
+});
 
 test("multi-file upload uses one completion and acceptance links every durable file fact", async () => {
   const state = await fixture();
@@ -320,6 +394,10 @@ test("an unknown raw upload is not uploaded again and proceeds through the one-s
     now: () => NOW,
   });
   assert.deepEqual(first, { kind: "outcome_unknown", reasonCode: "fixture_unknown" });
+  assert.equal(await reconcileExternalOutboundAttachments({ db: state.db, deliveryId: state.delivery.id,
+    snapshot: state.snapshot, adapter: provider.value, providerRootThreadId: null,
+    reconciliationMarker: state.delivery.reconciliationMarker }), null,
+    "a private-upload uncertainty has not crossed the visible completion fence");
   const afterUnknown = provider.counts();
   assert.deepEqual(afterUnknown, { ticketCalls: 1, uploadCalls: 1, completeCalls: 0, correlationCalls: 0 });
 
@@ -360,4 +438,169 @@ test("provider file and aggregate capability bounds reject before any upload sid
     now: () => NOW,
   }), { kind: "deterministic_failure", reasonCode: "attachment_provider_capability_exceeded" });
   assert.deepEqual(provider.counts(), { ticketCalls: 0, uploadCalls: 0, completeCalls: 0, correlationCalls: 0 });
+});
+
+for (const avatar of [null, { publicUrl: "https://cdn.example.test/author.webp", contentDigest: "a".repeat(32) }]) {
+  test(`file completion preserves frozen author presentation with ${avatar ? "an avatar" : "no avatar"}`, async () => {
+    const state = await fixture();
+    const snapshot = { ...state.snapshot, authorPresentation: { ...state.snapshot.authorPresentation, avatar } };
+    const provider = adapter();
+    const complete = provider.value.completeOutboundMessage;
+    let observedAuthor: ExternalAttachmentCompletionRequest["author"] | undefined;
+    provider.value.completeOutboundMessage = async (input) => {
+      observedAuthor = input.completion.author;
+      return complete(input);
+    };
+    const result = await dispatchExternalOutboundAttachments({
+      db: state.db, deliveryId: state.delivery.id, reconciliationMarker: state.delivery.reconciliationMarker,
+      snapshot, adapter: provider.value, storage: state.storage, providerRootThreadId: null,
+      leaseOwner: "author-presentation-worker", now: () => NOW,
+    });
+    assert.equal(result.kind, "accepted");
+    assert.deepEqual(observedAuthor, {
+      displayName: snapshot.authorPresentation.displayName, avatarPublicUrl: avatar?.publicUrl ?? null,
+      fallbackKind: snapshot.authorPresentation.fallbackKind,
+    });
+  });
+}
+
+test("a positively missing attachment preserves body and sends the remaining file", async () => {
+  const { digestSlackBridgeRenderSnapshot } = await import("./externalDeliveryOutboxService");
+  const { prepareSlackAttachmentFallbackPlan, readSlackAttachmentFallbackForClaim } = await import("./slackAttachmentFallbackPlan");
+  const state = await fixture();
+  const snapshot: SlackBridgeRenderSnapshot = { ...state.snapshot,
+    bindingAuthority: { ...state.snapshot.bindingAuthority, provider: "slack" } };
+  const digest = digestSlackBridgeRenderSnapshot(snapshot);
+  await state.db.update(externalOutboundDeliveries).set({ renderSnapshot: snapshot as unknown as Record<string, unknown>,
+    renderSnapshotDigest: digest }).where(eq(externalOutboundDeliveries.id, state.delivery.id));
+  const missing = state.sourceAttachments[0]!;
+  const storage: StorageBackend = { ...state.storage,
+    async probeObjectPresence(key) { return key === missing.object.storageKey ? "missing" : "present"; },
+    async get(key, signal) { if (key === missing.object.storageKey) throw new Error("source missing"); return state.storage.get(key, signal); },
+  };
+  assert.deepEqual(await prepareSlackAttachmentFallbackPlan({ db: state.db, deliveryId: state.delivery.id,
+    bindingId: state.delivery.bindingId, bindingEpoch: state.delivery.bindingEpoch, snapshot, storage,
+    now: () => NOW, assertWriterFleetFenced: async () => true }), { kind: "planned", revision: 1 });
+  await state.db.transaction(async tx => {
+    await tx.execute(sql`select set_config('slock.attachment_plan', '1', true)`);
+    await tx.update(externalOutboundDeliveries).set({ state: "dispatching", leaseOwner: "parent-worker",
+      leaseGeneration: 2, leaseExpiresAt: new Date(NOW.getTime() + 60_000), leaseOriginState: "queued" })
+      .where(eq(externalOutboundDeliveries.id, state.delivery.id));
+  });
+  const claim = { db: state.db, deliveryId: state.delivery.id, bindingId: state.delivery.bindingId,
+    bindingEpoch: state.delivery.bindingEpoch, leaseOwner: "parent-worker", leaseGeneration: 2, snapshot, now: () => NOW };
+  const plan = await readSlackAttachmentFallbackForClaim(claim);
+  assert.deepEqual(plan, { kind: "planned", revision: 1, transport: "files",
+    includedAttachmentIds: [state.sourceAttachments[1]!.attachment.id], omittedAttachmentIds: [missing.attachment.id] });
+  assert.deepEqual(await readSlackAttachmentFallbackForClaim({ ...claim, leaseGeneration: 1 }), { kind: "unavailable" });
+  assert.equal(plan.kind, "planned");
+  const provider = adapter();
+  const completions: ExternalAttachmentCompletionRequest[] = [];
+  const originalComplete = provider.value.completeOutboundMessage;
+  provider.value.completeOutboundMessage = async (input) => { completions.push(input.completion); return originalComplete(input); };
+  const result = await dispatchExternalOutboundAttachments({ db: state.db, deliveryId: state.delivery.id,
+    reconciliationMarker: state.delivery.reconciliationMarker, snapshot, adapter: provider.value,
+    storage, providerRootThreadId: null, leaseOwner: "fallback-worker", now: () => NOW,
+    selection: plan.kind === "planned" ? plan : undefined,
+    renderedText: `${state.message.content}\n\n[One or more attachments unavailable]`,
+    admitWrite: async tx => { await tx.execute(sql`select set_config('slock.attachment_plan', '1', true)`); },
+  });
+  assert.deepEqual(result, { kind: "accepted", providerMessageId: "provider-message-1" });
+  assert.deepEqual(provider.uploadFileIds(), [state.sourceAttachments[1]!.attachment.id]);
+  assert.equal(completions.length, 1);
+  assert.deepEqual(completions[0]!.providerFileIds, [`provider-${state.sourceAttachments[1]!.attachment.id}`]);
+  assert.equal(completions[0]!.renderedText, `${state.message.content}\n\n[One or more attachments unavailable]`);
+});
+
+test("a claimed fallback plan rejects expired, stale and substituted snapshots", async () => {
+  const { digestSlackBridgeRenderSnapshot } = await import("./externalDeliveryOutboxService");
+  const { prepareSlackAttachmentFallbackPlan, readSlackAttachmentFallbackForClaim } = await import("./slackAttachmentFallbackPlan");
+  const state = await fixture();
+  const snapshot: SlackBridgeRenderSnapshot = { ...state.snapshot,
+    bindingAuthority: { ...state.snapshot.bindingAuthority, provider: "slack" } };
+  const digest = digestSlackBridgeRenderSnapshot(snapshot);
+  await state.db.update(externalOutboundDeliveries).set({ renderSnapshot: snapshot as unknown as Record<string, unknown>,
+    renderSnapshotDigest: digest }).where(eq(externalOutboundDeliveries.id, state.delivery.id));
+  const missing = state.sourceAttachments[0]!;
+  const storage: StorageBackend = { ...state.storage,
+    async probeObjectPresence(key) { return key === missing.object.storageKey ? "missing" : "present"; },
+    async get(key, signal) { if (key === missing.object.storageKey) throw new Error("source missing"); return state.storage.get(key, signal); },
+  };
+  assert.deepEqual(await prepareSlackAttachmentFallbackPlan({ db: state.db, deliveryId: state.delivery.id,
+    bindingId: state.delivery.bindingId, bindingEpoch: state.delivery.bindingEpoch, snapshot, storage,
+    now: () => NOW, assertWriterFleetFenced: async () => true }), { kind: "planned", revision: 1 });
+  await state.db.transaction(async tx => {
+    await tx.execute(sql`select set_config('slock.attachment_plan', '1', true)`);
+    await tx.update(externalOutboundDeliveries).set({ state: "dispatching", leaseOwner: "parent-worker",
+      leaseGeneration: 2, leaseExpiresAt: new Date(NOW.getTime() + 60_000), leaseOriginState: "queued" })
+      .where(eq(externalOutboundDeliveries.id, state.delivery.id));
+  });
+  const claim = { db: state.db, deliveryId: state.delivery.id, bindingId: state.delivery.bindingId,
+    bindingEpoch: state.delivery.bindingEpoch, leaseOwner: "parent-worker", leaseGeneration: 2, snapshot, now: () => NOW };
+  assert.deepEqual(await readSlackAttachmentFallbackForClaim(claim), { kind: "planned", revision: 1, transport: "files",
+    includedAttachmentIds: [state.sourceAttachments[1]!.attachment.id], omittedAttachmentIds: [missing.attachment.id] });
+  assert.deepEqual(await readSlackAttachmentFallbackForClaim({ ...claim, leaseGeneration: 1 }), { kind: "unavailable" });
+  assert.deepEqual(await readSlackAttachmentFallbackForClaim({ ...claim, now: () => new Date(NOW.getTime() + 60_000) }), { kind: "unavailable" });
+  assert.deepEqual(await readSlackAttachmentFallbackForClaim({ ...claim, leaseOwner: "another-worker" }), { kind: "unavailable" });
+  assert.deepEqual(await readSlackAttachmentFallbackForClaim({ ...claim, snapshot: { ...snapshot, sanitizedText: "changed" } }), { kind: "unavailable" });
+  let reads = 0;
+  assert.deepEqual(await readSlackAttachmentFallbackForClaim({ ...claim, now: () =>
+    new Date(NOW.getTime() + (reads++ === 0 ? 0 : 60_000)) }), { kind: "unavailable" }, "the lease may expire while locking plan jobs");
+});
+
+
+test("private upload authority failure closes its source and retains a retryable file job", async () => {
+  const state = await fixture();
+  const provider = adapter();
+  const source = Readable.from(state.sourceAttachments[0]!.body);
+  provider.value.uploadOutboundAsset = async () => { throw new Error("synthetic authority unavailable"); };
+  provider.value.classifyFailure = () => ({ class: "authority_revoked", reason: "synthetic_authority_unavailable",
+    retryAfterMs: null, scope: "occurrence_local" });
+  const result = await dispatchExternalOutboundAttachments({ db: state.db, deliveryId: state.delivery.id,
+    reconciliationMarker: state.delivery.reconciliationMarker, snapshot: state.snapshot, adapter: provider.value,
+    storage: { ...state.storage, async get() { return source; } }, providerRootThreadId: null,
+    leaseOwner: "private-upload-recovery", now: () => NOW, prepareOnly: true });
+  assert.deepEqual(result, { kind: "transient_failure", reasonCode: "synthetic_authority_unavailable", baseDelayMs: 30_000 });
+  assert.equal(source.destroyed, true, "a failed permission check must not retain an unread storage connection");
+  const jobs = await state.db.select().from(externalAttachmentTransferJobs);
+  assert.ok(jobs.some(job => job.state === "retry_wait" && job.assetId === null));
+  assert.ok(jobs.every(job => job.terminalAt === null));
+  assert.equal(provider.counts().completeCalls, 0);
+});
+
+test("a stale parent cannot publish privately prepared files; its successor reuses them", async () => {
+  const state = await fixture();
+  const provider = adapter();
+  const input = { db: state.db, deliveryId: state.delivery.id,
+    reconciliationMarker: state.delivery.reconciliationMarker, snapshot: state.snapshot, adapter: provider.value,
+    storage: state.storage, providerRootThreadId: null, leaseOwner: "stale-parent", now: () => NOW };
+  await assert.rejects(dispatchExternalOutboundAttachments({ ...input,
+    admitCompletion: async () => { throw new Error("attachment_parent_lease_lost"); },
+  }), /attachment_parent_lease_lost/);
+  assert.equal(provider.counts().completeCalls, 0, "the only publication boundary validates the parent claim");
+  const jobs = await state.db.select().from(externalAttachmentTransferJobs);
+  assert.ok(jobs.every(job => job.phase === "complete" && job.state === "queued"));
+  assert.equal((await dispatchExternalOutboundAttachments({ ...input, leaseOwner: "successor" })).kind, "accepted");
+  assert.deepEqual(provider.counts(), { ticketCalls: 2, uploadCalls: 2, completeCalls: 1, correlationCalls: 1 });
+});
+
+test("new omission plans are globally bounded while unchanged retries cost no additional budget", async () => {
+  const { digestSlackBridgeRenderSnapshot } = await import("./externalDeliveryOutboxService");
+  const { prepareSlackAttachmentFallbackPlan } = await import("./slackAttachmentFallbackPlan");
+  const requests: Array<Parameters<typeof prepareSlackAttachmentFallbackPlan>[0]> = [];
+  for (let index = 0; index < 5; index++) {
+    const state = await fixture();
+    const snapshot: SlackBridgeRenderSnapshot = { ...state.snapshot,
+      bindingAuthority: { ...state.snapshot.bindingAuthority, provider: "slack" } };
+    await state.db.update(externalOutboundDeliveries).set({ renderSnapshot: snapshot as unknown as Record<string, unknown>,
+      renderSnapshotDigest: digestSlackBridgeRenderSnapshot(snapshot) }).where(eq(externalOutboundDeliveries.id, state.delivery.id));
+    requests.push({ db: state.db, deliveryId: state.delivery.id, bindingId: state.delivery.bindingId,
+      bindingEpoch: state.delivery.bindingEpoch, snapshot, storage: { ...state.storage, async probeObjectPresence() { return "missing"; } },
+      now: () => NOW, assertWriterFleetFenced: async () => true });
+  }
+  for (const input of requests.slice(0, 4)) assert.deepEqual(await prepareSlackAttachmentFallbackPlan(input), { kind: "planned", revision: 1 });
+  assert.deepEqual(await prepareSlackAttachmentFallbackPlan(requests[0]!), { kind: "planned", revision: 1 });
+  assert.deepEqual(await prepareSlackAttachmentFallbackPlan(requests[4]!), { kind: "source_unavailable" });
+  assert.deepEqual(await prepareSlackAttachmentFallbackPlan({ ...requests[4]!, now: () => new Date(NOW.getTime() + 60_001) }),
+    { kind: "planned", revision: 1 });
 });

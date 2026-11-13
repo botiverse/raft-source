@@ -1,5 +1,3 @@
-import { isElectronDesktopShell } from "../../utils/desktopShell";
-
 // A single global display preference (not per-server): when on, sidebar sections
 // that currently hold nothing — empty Pinned, empty joined-channels, empty custom
 // sections, empty DMs — are dropped entirely (header + empty-state help), instead
@@ -17,10 +15,12 @@ function getDefaultStorage(): SidebarVisibilityStorage | undefined {
   }
 }
 
-// Default ON in the desktop shell (@WAWQAQ 2026-09-11 #kabi-desktop:043384f5),
-// OFF on the web until a stored choice says otherwise.
+// Default OFF everywhere, desktop included: empty sections stay visible so their
+// create affordances remain discoverable. (#7608 had made desktop default ON;
+// that default was never written to storage, so only users who explicitly chose
+// a value keep "on".) A stored choice always wins.
 export function defaultHideEmptySidebarSections(): boolean {
-  return isElectronDesktopShell();
+  return false;
 }
 
 export function readHideEmptySidebarSections(

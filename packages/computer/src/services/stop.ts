@@ -123,6 +123,8 @@ export interface StopDeps {
   /** Test seam for the IPC identity probe used when the pidfile is stale.
    *  Defaults to `machine-attestation` over the service endpoint. */
   probeLiveServicePid?: (slockHome: string) => Promise<number | null>;
+  /** Test seam: when the process holding a pid started (the reused-pid check on the recorded service pid). */
+  processStartTimeMs?: (pid: number) => Promise<number | undefined>;
   /** Test seam for re-registering a pid the IPC probe found. */
   writePidfile?: typeof writePidfileAt;
   /** task #917 seams: the systemd unit (if any) that owns the service, and systemctl. */
@@ -193,9 +195,17 @@ export async function stop(
   // alone (instead of by liveness) would let a stale current pidfile
   // mask a still-live legacy service — see
   // `internal/service-pid-fallback.ts` doc-comment.
+  // Only the service is signalled. A live recorded pid counts as the service
+  // when the service answering on the IPC endpoint reports that very pid;
+  // when nothing answers, unless its process started after the service's own
+  // evidence (its pid was reused: service-pid-fallback.ts). Such a pid is
+  // another program: its record is cleared like a dead one's.
+  const probeLiveServicePid = options.probeLiveServicePid ?? probeLiveServicePidViaIpc;
   const walk = await findLiveServicePid(slockHome, {
     readPidfile,
     isProcessAlive: isAlive,
+    endpointReportsPid: async (home, recorded) => (await probeLiveServicePid(home)) === recorded,
+    processStartTimeMs: options.processStartTimeMs,
   });
   const { pidfilePath, firstStalePidfile, firstStalePid } = walk;
   let pid = walk.pid;
@@ -207,7 +217,7 @@ export async function stop(
   //    (task #912). Ask the endpoint who answers; a live answer is the
   //    service to stop, and it gets its pidfile back so later reads agree.
   if (pid === null) {
-    const probed = await (options.probeLiveServicePid ?? probeLiveServicePidViaIpc)(slockHome);
+    const probed = await probeLiveServicePid(slockHome);
     if (probed !== null && isAlive(probed)) {
       pid = probed;
       await (options.writePidfile ?? writePidfileAt)(pidfilePath, probed).catch(() => undefined);
@@ -225,7 +235,11 @@ export async function stop(
       // is rendered (preserves the pre-fallback-chain behavior for the
       // single-candidate case).
       await disableHostLifecycle();
-      emit(options, { kind: "stop.stale_pidfile_cleared", pid: firstStalePid });
+      emit(options, {
+        kind: "stop.stale_pidfile_cleared",
+        pid: firstStalePid,
+        ...(walk.otherProgramPid === firstStalePid ? { otherProgram: true as const } : {}),
+      });
       return {
         status: "stale_pidfile_cleared",
         pid: firstStalePid,

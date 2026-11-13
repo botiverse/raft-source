@@ -104,6 +104,7 @@ function fallbackNextCommand(code: string): string {
   if (code === "CHANNEL_INVALID") return "raft-computer channel set latest";
   if (code === "NON_INTERACTIVE_SETUP_REQUIRES_FLAGS") return "raft-computer setup /<server>";
   if (code === "CONCURRENT_OPERATION") return "raft-computer status";
+  if (code.startsWith("DETACH_")) return "raft-computer status";
   if (code === "MUTATION_LOCK_COMPROMISED") return "raft-computer doctor";
   return "raft-computer doctor";
 }
@@ -116,6 +117,10 @@ function stateGuarantee(code: string): string {
   if (code === "CONCURRENT_OPERATION") return "This command did not start because another Computer operation is already running.";
   if (code === "MUTATION_LOCK_COMPROMISED") return "The command stopped after losing its mutation lock; completion was not confirmed.";
   if (code === "MIGRATION_LOCAL_EVIDENCE_UNMATCHED") return "Nothing was changed on this computer.";
+  if (code === "DETACH_LOCAL_CLEANUP_FAILED") {
+    return "The server revoked this machine's key; some local files for that server were not removed.";
+  }
+  if (code.startsWith("DETACH_")) return "No local Computer state was changed; what the server did is said above.";
   if (code.startsWith("MIGRATION_") || code.startsWith("MIGRATE_") || code.startsWith("LEGACY_")) {
     return "Setup stopped before changing local Computer state.";
   }

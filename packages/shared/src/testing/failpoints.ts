@@ -1,4 +1,6 @@
-export type MaybePromise<T> = T | Promise<T>;
+import type { MaybePromise } from "../maybePromise";
+
+export type { MaybePromise };
 
 export type FailpointMode = "off" | "once" | "n_times" | "always";
 export type FailpointEffect = "throw" | "delay" | "drop" | "return";

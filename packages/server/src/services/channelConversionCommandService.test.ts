@@ -9,21 +9,25 @@ import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { createApiTest } from "../test/integration/apiTest";
 import { getDb } from "../db/index";
-import { channelConversionCommands, channelConversionJobs, channelConversionPhaseLedger, servers, serverMembers } from "../db/schema";
+import { agents, channelConversionCommands, channelConversionJobs, channelConversionPhaseLedger, servers, serverMembers } from "../db/schema";
+import { createAgent } from "./agentService";
 import { seedUser, createServer, headers } from "../routes/channels.api.fixtures";
 import { tokenForHuman } from "../test/integration/credentials";
+import { enableExternalChannelsFlag } from "../test/externalInviteFixture";
 import { addHuman, createChannel } from "./channelService";
 import { admitConversionCommand, conversionCommandId, executeConversionCommand, runConversionCommandWorkerPass } from "./channelConversionCommandService";
 import { cancelChannelConversionJob } from "./channelConversionService";
 import { emitChannelConversionState, emitChannelConversionCompletion } from "../routes/channels";
 import { attachLatestChannelConversionJobs, runChannelConversionJob } from "./channelConversionService";
 
-const test = createApiTest({ channelToJointConversionFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
-async function fixture() {
+const test = createApiTest();
+// A conversion is followed (its job read, Retry, Cancel) where external_channels_v1 is on (#wg-rbac:#50).
+async function fixture({ externalChannels = true }: { externalChannels?: boolean } = {}) {
   const suffix = randomUUID().slice(0, 8);
   const owner = await seedUser(`command-${suffix}@slock.test`, `command-${suffix}`);
   const server = await createServer(`Command ${suffix}`, `command-${suffix}`, owner.id);
   await getDb().update(servers).set({ plan: "founder" }).where(eq(servers.id, server.id));
+  if (externalChannels) await enableExternalChannelsFlag(server.id);
   const channel = await createChannel(server.id, "command-room", undefined, "private");
   await addHuman(channel.id, owner.id);
   return { owner, server, channel };
@@ -65,8 +69,12 @@ test("admission execution commits one job and duplicate execution does not repea
   assert.ok(decoded.resources.parent?.messages?.checksum);
   const response = await fetch(`${app.baseUrl}/api/channels/conversion-jobs/${first!.jobId}`, { headers: headers(await tokenForHuman(f.owner.email), f.server.id) });
   assert.equal(response.status, 200);
-  const api = await response.json() as { conversionJob: { progress: unknown } };
-  assert.deepEqual(parseConversionProgress(api.conversionJob.progress), decoded, "production persistence and API must round-trip the same typed state");
+  const api = await response.json() as { conversionJob: { id: string; progress: Record<string, unknown> } };
+  assert.equal(api.conversionJob.id, first!.jobId);
+  // The API carries only the progress the client reads; the runner's state stays on the server.
+  assert.deepEqual(Object.keys(api.conversionJob.progress).filter((key) => !["canonicalCopyStarted", "uploadCount", "errorCode", "failedAt", "relockedAt", "rollbackState"].includes(key)), []);
+  const [stored] = await getDb().select({ progress: channelConversionJobs.progress }).from(channelConversionJobs).where(eq(channelConversionJobs.id, first!.jobId!));
+  assert.deepEqual(parseConversionProgress(stored!.progress), decoded, "production persistence must round-trip the same typed state");
   const ledger = await getDb().select().from(channelConversionPhaseLedger).where(eq(channelConversionPhaseLedger.jobId, first!.jobId!));
   const parentLedger = ledger.find(row => row.phase === "move_parent_messages" && row.batchKey === "all");
   assert.ok(parentLedger, "phase ledger must include the committed resource projection");
@@ -77,6 +85,56 @@ test("admission execution commits one job and duplicate execution does not repea
   const replay = await executeConversionCommand(input.id);
   assert.equal(replay?.jobId, first?.jobId);
   assert.equal((await getDb().select().from(channelConversionJobs)).length, 1);
+});
+
+test("a conversion job receipt names no agent: not a personal assistant, not any other", async ({ app }) => {
+  const f = await fixture();
+  const channel = await createChannel(f.server.id, "public-room", undefined, "channel");
+  await addHuman(channel.id, f.owner.id);
+  const assistantOwner = await seedUser(`receipt-assistant-owner-${randomUUID().slice(0, 8)}@slock.test`, "receipt-assistant-owner");
+  await getDb().insert(serverMembers).values({ serverId: f.server.id, userId: assistantOwner.id, role: "member" });
+  const assistant = await createAgent(f.server.id, `receiptassist${randomUUID().slice(0, 6)}`, {
+    runtime: "claude", model: "sonnet", creatorType: "user", creatorId: assistantOwner.id,
+    kind: "personal_assistant",
+    afterInsert: async (tx, created) => {
+      await tx.update(agents).set({ assistantOwnerUserId: assistantOwner.id }).where(eq(agents.id, created.id));
+    },
+  });
+  const ordinary = await createAgent(f.server.id, `receiptagent${randomUUID().slice(0, 6)}`, {
+    runtime: "claude", model: "sonnet", creatorType: "user", creatorId: f.owner.id,
+  });
+  const input = { id: conversionCommandId(randomUUID()), serverId: f.server.id, sourceChannelId: channel.id, requestedByUserId: f.owner.id, kind: "start" as const };
+  await admitConversionCommand(input);
+  const command = await executeConversionCommand(input.id);
+  assert.ok(command?.jobId);
+  const finished = await runChannelConversionJob(command!.jobId!);
+  // The stored job lists both: a former public channel's audience was every agent on the server.
+  assert.ok(parseConversionProgress(finished.progress).audienceCutover?.lostAgentIds.includes(assistant.id));
+
+  const response = await fetch(`${app.baseUrl}/api/channels/conversion-jobs/${command!.jobId}`, {
+    headers: headers(await tokenForHuman(f.owner.email), f.server.id),
+  });
+  assert.equal(response.status, 200);
+  const text = await response.text();
+  assert.equal(text.includes(assistant.id), false, "a server owner never finds another person's assistant");
+  assert.equal(text.includes(ordinary.id), false, "the progress view needs no agent ids at all");
+  const body = JSON.parse(text) as { conversionJob: { id: string; status: string; progress: Record<string, unknown> } };
+  assert.equal(body.conversionJob.id, command!.jobId);
+  assert.equal(body.conversionJob.progress.audienceCutover, undefined);
+});
+
+test("with external_channels_v1 off, a conversion job is not followed: 404 channel_to_joint_conversion_disabled", async ({ app }) => {
+  const f = await fixture({ externalChannels: false });
+  const input = { id: conversionCommandId(randomUUID()), serverId: f.server.id, sourceChannelId: f.channel.id, requestedByUserId: f.owner.id, kind: "start" as const };
+  await admitConversionCommand(input);
+  const completed = await executeConversionCommand(input.id);
+  assert.ok(completed?.jobId);
+  const response = await fetch(`${app.baseUrl}/api/channels/conversion-jobs/${completed!.jobId}`, { headers: headers(await tokenForHuman(f.owner.email), f.server.id) });
+  assert.equal(response.status, 404);
+  assert.equal((await response.json() as { code?: string }).code, "channel_to_joint_conversion_disabled");
+  await enableExternalChannelsFlag(f.server.id);
+  const followed = await fetch(`${app.baseUrl}/api/channels/conversion-jobs/${completed!.jobId}`, { headers: headers(await tokenForHuman(f.owner.email), f.server.id) });
+  assert.equal(followed.status, 200, await followed.text());
 });
 
 test("conversion job receipts remain hidden from same-server non-members", async ({ app }) => {

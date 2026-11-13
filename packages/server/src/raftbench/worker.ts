@@ -2,23 +2,21 @@ import { and, eq } from "drizzle-orm";
 import { getDb } from "../db/index";
 import { thirdPartyAgentEvents } from "../db/schema";
 import type { AgentOrchestrator } from "../services/agentOrchestrator";
-import { buildThirdPartyAgentMessage, claimQueuedThirdPartyAgentEventForDelivery, releaseThirdPartyAgentEventDeliveryClaim } from "../services/oauthService";
+import { deliverSystemAppAgentEvent } from "../services/systemAppAgentEvents";
 import { advanceServer, enrolledServers } from "./controls";
+import { dispatchTriage } from "./triageRunner";
 
-/** Source reads and model work stay in the hosted plugin; this worker only assigns bounded runs. */
+/** Assigns bounded hosted runs and dispatches first-pass triage batches (behind its own flag). */
 export async function tickRaftbench(orchestrator: Pick<AgentOrchestrator, "deliverMessage">) {
   if (process.env.DEPLOYMENT_ENV !== "staging") return;
   for (const { serverId } of await enrolledServers()) {
+    // Triage is independent of the hosted run; its model calls continue after dispatch returns.
+    try { await dispatchTriage(serverId); }
+    catch { console.error("[RaftBench] triage dispatch failed; next tick will retry"); }
     await advanceServer(serverId);
     const events = await getDb().select().from(thirdPartyAgentEvents).where(and(eq(thirdPartyAgentEvents.serverId, serverId), eq(thirdPartyAgentEvents.systemApp, "system.raftbench"), eq(thirdPartyAgentEvents.status, "queued"))).limit(1);
     for (const event of events) {
-      if (!await claimQueuedThirdPartyAgentEventForDelivery(event.id)) continue;
-      try {
-        await orchestrator.deliverMessage(event.agentId, buildThirdPartyAgentMessage({ event, clientKey: "system.raftbench", clientName: "system.raftbench" }));
-      } catch (error) {
-        await releaseThirdPartyAgentEventDeliveryClaim(event.id);
-        throw error;
-      }
+      await deliverSystemAppAgentEvent({ event, deliverer: orchestrator });
     }
   }
 }

@@ -2,13 +2,21 @@ import type { TaskReadOnlyReason } from "@botiverse/raft-shared";
 import * as channelService from "./channelService";
 import { and, asc, eq, inArray, isNull, sql } from "drizzle-orm";
 import { getDb } from "../db/index";
-import { channelConversionJobs, channels, jointChannelServers, jointChannels } from "../db/schema";
+import { channelConversionJobs, channels, jointChannelServers, jointChannels, tasks } from "../db/schema";
+
+/** Channel types that can hold tasks: never a task conversation (task v2). */
+export type TaskChannelType = "channel" | "private" | "joint" | "dm" | "thread";
+
+export function asTaskChannelType(type: typeof channels.$inferSelect["type"]): TaskChannelType {
+  if (type === "task") throw new Error("a task conversation never holds tasks");
+  return type;
+}
 
 export type TaskSurfaceChannel = {
   id: string;
   name: string;
   serverId: string;
-  type: "channel" | "private" | "joint" | "dm" | "thread";
+  type: TaskChannelType;
   deletedAt: Date | null;
   taskReadOnlyBefore?: Date | null;
 };
@@ -36,7 +44,7 @@ export type TaskChannelSurface = {
 
 export type TaskRealtimeSurfaceTarget = {
   channelId: string;
-  channelType: "channel" | "private" | "joint" | "dm" | "thread";
+  channelType: TaskChannelType;
   serverId: string;
   localChannel: TaskSurfaceChannel;
 };
@@ -46,7 +54,7 @@ function toSurfaceChannel(channel: NonNullable<Awaited<ReturnType<typeof channel
     id: channel.id,
     name: channel.name,
     serverId: channel.serverId,
-    type: channel.type,
+    type: asTaskChannelType(channel.type),
     deletedAt: channel.deletedAt,
   };
 }
@@ -130,6 +138,8 @@ async function resolveTaskChannelSurfaceFallback(
 ): Promise<TaskChannelSurface | null> {
   const channel = await channelService.getChannel(channelId, { includeDeleted: opts?.includeDeleted });
   if (!channel || channel.serverId !== serverId) return null;
+  // A task's own conversation is no task surface: it holds no tasks.
+  if (channel.type === "task") return null;
   // Thread projections have their own canonical storage row.  Treating the
   // local projection id as storage would make task reads/writes disappear
   // immediately after Channel -> Joint conversion, because thread tasks are
@@ -330,6 +340,27 @@ export function isHistoricalJointTaskReadOnly(surface: TaskChannelSurface, creat
   return getTaskReadOnlyReason(surface.localChannel, createdAt) !== null;
 }
 
+/**
+ * Whether a task conversation is read-only on this server: the conversation
+ * of a historical joint task, seen from a participant workspace. Its task is
+ * read-only there (`isHistoricalJointTaskReadOnly`), and so is its
+ * discussion. Any other channel: false.
+ */
+export async function isTaskConversationReadOnly(
+  serverId: string,
+  conversation: { type: string; taskId?: string | null; parentChannelId?: string | null },
+): Promise<boolean> {
+  if (conversation.type !== "task" || !conversation.taskId || !conversation.parentChannelId) return false;
+  const [task] = await getDb()
+    .select({ createdAt: tasks.createdAt })
+    .from(tasks)
+    .where(eq(tasks.id, conversation.taskId))
+    .limit(1);
+  if (!task) return false;
+  const surface = await resolveTaskChannelSurface(serverId, conversation.parentChannelId);
+  return surface !== null && isHistoricalJointTaskReadOnly(surface, task.createdAt);
+}
+
 export function writeTaskSurfaceFields(surface: TaskChannelSurface): Pick<TaskChannelSurface, "isJoint" | "jointRole" | "jointHistoricalCutoffAt"> {
   return {
     isJoint: surface.isJoint,
@@ -355,10 +386,26 @@ export async function getTaskRealtimeSurfaceTargets(surface: TaskChannelSurface)
     if (!localChannel) continue;
     targets.push({
       channelId: localChannel.id,
-      channelType: localChannel.type,
+      channelType: asTaskChannelType(localChannel.type),
       serverId: projection.serverId,
       localChannel: await toTaskSurfaceChannel(localChannel),
     });
   }
   return targets;
+}
+
+/**
+ * Realtime targets for a task known only by its storage channel (no request
+ * surface at hand, e.g. a lazily created task v2 conversation): every active
+ * joint projection, or the storage channel itself.
+ */
+export async function getTaskRealtimeTargetsForStorageChannel(storageChannelId: string): Promise<TaskRealtimeSurfaceTarget[]> {
+  const storage = await channelService.getChannel(storageChannelId);
+  if (!storage) return [];
+  return getTaskRealtimeSurfaceTargets({
+    storageChannelId,
+    localChannel: await toTaskSurfaceChannel(storage),
+    isJoint: false,
+    ...jointSurfaceFields(null, null),
+  });
 }

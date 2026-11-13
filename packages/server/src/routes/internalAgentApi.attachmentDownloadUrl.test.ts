@@ -1,4 +1,5 @@
 import { createApiTest } from "../test/integration/apiTest";
+import { insertLinkedAttachmentsWithObjects } from "../test/attachmentObjectFixture";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { Readable } from "node:stream";
@@ -11,7 +12,7 @@ import {
 } from "@botiverse/raft-shared";
 
 import { getDb } from "../db/index";
-import { attachments, users } from "../db/schema";
+import { users } from "../db/schema";
 import { fixturePasswordHash } from "../test/integration/credentials";
 import { createServer } from "../services/serverService";
 import { createAgent } from "../services/agentService";
@@ -19,7 +20,7 @@ import { addAgent, addHuman, createChannel } from "../services/channelService";
 import { mintAgentCredential } from "../services/agentCredentialService";
 import { __setStorageForTests, resetStorageForTests, type StorageBackend } from "../services/storageService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 /**
  * GET /internal/agent-api/attachments/:attachmentId/url: the download route's
@@ -56,7 +57,7 @@ async function seedFixture() {
 
   const visibleId = randomUUID();
   const privateId = randomUUID();
-  await db.insert(attachments).values([
+  await insertLinkedAttachmentsWithObjects([
     {
       id: visibleId,
       channelId: channel.id,
@@ -79,8 +80,8 @@ async function seedFixture() {
     },
   ]);
 
-  const readKey = await mintAgentCredential({ agentId: agent.id, scopes: ["read"], name: "dl-url-read", createdByUserId: null });
-  const sendOnlyKey = await mintAgentCredential({ agentId: agent.id, scopes: ["send"], name: "dl-url-send-only", createdByUserId: null });
+  const readKey = await mintAgentCredential({ agentId: agent.id, scopes: ["read"], name: "dl-url-read", issuedVia: "computer", createdByUserId: null });
+  const sendOnlyKey = await mintAgentCredential({ agentId: agent.id, scopes: ["send"], name: "dl-url-send-only", issuedVia: "computer", createdByUserId: null });
   return { server, visibleId, privateId, readKey: readKey.apiKey, sendOnlyKey: sendOnlyKey.apiKey };
 }
 
@@ -171,7 +172,7 @@ test("agent-api attachment download URL: storage without presign answers 409 dow
 
     const res = await fetch(`${app.baseUrl}/internal/agent-api/attachments/${fx.visibleId}/url`, { headers: agentHeaders(fx.readKey) });
     assert.equal(res.status, 409);
-    assert.deepEqual(await res.json(), AGENT_API_ATTACHMENT_DOWNLOAD_URL_UNAVAILABLE_RESPONSE);
+    assert.deepEqual(await res.json(), { ...AGENT_API_ATTACHMENT_DOWNLOAD_URL_UNAVAILABLE_RESPONSE, errorCode: AGENT_API_ATTACHMENT_DOWNLOAD_URL_UNAVAILABLE_RESPONSE.code });
     assert.equal(gets, 0, "the URL route never streams bytes");
 
     // Visibility is still checked first: a hidden attachment is 404, not 409.

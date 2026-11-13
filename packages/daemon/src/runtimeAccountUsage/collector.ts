@@ -9,8 +9,10 @@ import {
   projectOarAccountUsageSnapshot,
   type OarAccountUsageSnapshot,
 } from "./oarAdapter";
+import { RUNTIME_AUTH_OAR_ENV } from "../runtimeAuth/runtimeAuthHost";
 import { resolveKimiCodeAuth, type KimiCodeAuth } from "./kimiAuth";
 import { ensureFreshKimiToken, type KimiFreshness, type KimiRefreshDeps } from "./kimiTokenRefresh";
+
 
 const DEFAULT_TIMEOUT_MS = 20_000;
 
@@ -19,6 +21,12 @@ const DEFAULT_TIMEOUT_MS = 20_000;
 export type OarUsageReadDeps = {
   readonly runtime?: Runtime;
   readonly timeoutMs?: number;
+  /**
+   * #triage:#253: Kimi Code's usage on the bundled SDK, read when OAR finds no
+   * Kimi Code CLI (its reader needs one). Absent: such a Computer stays
+   * `unsupported`, as before.
+   */
+  readonly kimiSdkUsage?: () => Promise<OarAccountUsageSnapshot>;
   /** task #1282 — seams for the kimi pre-probe refresh (production resolves the client's auth and refreshes for real). */
   readonly kimi?: {
     readonly resolveAuth?: (command: string) => Promise<KimiCodeAuth | null>;
@@ -119,16 +127,32 @@ export async function readOarAccountUsage(input: {
 
   const probe = runtime.installation;
   const readUsage = runtime.accountUsage;
+  const kimiSdkUsage = input.provider === "kimi" ? input.deps?.kimiSdkUsage : undefined;
+  // No Kimi Code CLI for OAR to read with: the SDK the agents run on reads it.
+  const readOnSdk = async (): Promise<RuntimeAccountUsageSnapshot> => {
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      const timedOut = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error("Kimi usage read timed out")), input.deps?.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+        timer.unref?.();
+      });
+      return project(await Promise.race([kimiSdkUsage!(), timedOut]));
+    } catch {
+      return failure();
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  };
   if (!probe || !readUsage) {
     // Structural absence, not a failed attempt.
-    return project({ kind: "unsupported" });
+    return kimiSdkUsage ? readOnSdk() : project({ kind: "unsupported" });
   }
 
   try {
     const installation = await probe();
     if (installation.kind !== "available") {
       // `not_found` and `unsupported` are both "no reading is obtainable here".
-      return project({ kind: "unsupported" });
+      return kimiSdkUsage ? readOnSdk() : project({ kind: "unsupported" });
     }
     if (input.provider === "kimi" && input.deps?.kimi?.enabled === true) {
       // task #1282: the client's 15-minute access token is refreshed the way
@@ -145,8 +169,16 @@ export async function readOarAccountUsage(input: {
         }
       }
     }
+    // Antigravity (OAR 0.103 runs `agy models`, then `agy -p /usage`): in the
+    // environment its agents and its sign-in run in, so it reads the sign-in
+    // they use (agy keeps another one under SSH).
+    const env = input.provider === "antigravity" ? RUNTIME_AUTH_OAR_ENV.antigravity : undefined;
     const snapshot = await readUsage(installation, {
+      ...(env ? { env } : {}),
       timeoutMs: input.deps?.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+      // Raft polls: the count of limit resets is enough, without Codex's
+      // per-read lookup of their details (OAR falls back on an older Codex).
+      limitResetDetails: false,
     });
     return project(snapshot);
   } catch {

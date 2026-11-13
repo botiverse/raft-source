@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
+import { AsyncResource } from "node:async_hooks";
 import { randomBytes, randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { drizzle } from "drizzle-orm/node-postgres";
 import { migrate } from "drizzle-orm/node-postgres/migrator";
-import { and, desc, eq, inArray } from "drizzle-orm";
+import { and, desc, eq, inArray, sql } from "drizzle-orm";
 import pg from "pg";
 
 import { closeDatabase, getDb, initDatabase } from "../db/index";
@@ -25,7 +26,10 @@ import {
   userChannelReadCursors,
   users,
 } from "../db/schema";
-import { getInboxItems } from "./channelService";
+import { getInboxItems, removeHuman } from "./channelService";
+import { jointHumanReadFixture } from "../test/jointHumanReadFixture";
+import { fillJointMembersFromChannelHumans } from "../test/jointMemberFill";
+import { createSeed } from "../test/integration/seed";
 import { createMessage } from "./messageService";
 import {
   admitReadMutation,
@@ -34,6 +38,7 @@ import {
   drainReadMutationOutbox,
   executeReadMutationClaim,
   ReadMutationError,
+  resetLockHolderSampleLimitForTests,
 } from "./readMutationSequencer";
 
 const REAL_PG_URL_ENV = "READ_MUTATION_REAL_PG_URL";
@@ -183,6 +188,8 @@ async function seedDoneRaceFixture(
       role: "host",
       status: "active",
     });
+    // Joint read authority is computed membership only: the owner is a J member.
+    await fillJointMembersFromChannelHumans([joint.id]);
     const baseline = await createMessage(canonical.id, "user", owner.id, `${label} baseline`);
     return { owner, server, scopeId: local.id, storageScopeId: canonical.id, baseline };
   }
@@ -230,6 +237,8 @@ async function seedDoneRaceFixture(
     role: "host",
     status: "active",
   });
+  // Joint read authority is computed membership only: the owner is a member of the parent's J.
+  await fillJointMembersFromChannelHumans([parentJoint.id]);
   const parent = await createMessage(canonicalParent.id, "user", owner.id, `${label} joint parent`);
   const [canonicalThread, localThread] = await getDb().insert(channels).values([
     {
@@ -574,17 +583,20 @@ test(
           "SELECT 1 FROM read_mutation_authorities WHERE server_id = $1 AND principal_id = $2 FOR UPDATE",
           [server.id, owner.id],
         );
-        const compaction = compactTerminalReadMutations({ before: new Date("2026-07-20T00:00:00.000Z") });
-        await waitForServiceRowLock(blocker, serviceApplication, 1);
         const replay = admitReadMutation({
           serverId: server.id,
           principalId: owner.id,
           mutationId: compatibilityMutationId,
           mutation: { kind: "row_read", scopeId: scope.id, throughSeq: 2 },
         });
-        await waitForServiceRowLock(blocker, serviceApplication, 2);
+        await waitForServiceRowLock(blocker, serviceApplication, 1);
+        // Compaction never waits on a held authority row (SKIP LOCKED): it skips
+        // the principal now and a later cycle compacts it.
+        const skippedWhileLocked = await compactTerminalReadMutations({ before: new Date("2026-07-20T00:00:00.000Z") });
+        assert.equal(skippedWhileLocked.compacted, 0, "compaction skips a locked principal instead of queueing behind it");
         await blocker.query("COMMIT");
-        const [compacted, replayed] = await Promise.all([compaction, replay]);
+        const replayed = await replay;
+        const compacted = await compactTerminalReadMutations({ before: new Date("2026-07-20T00:00:00.000Z") });
         assert.equal(compacted.compacted, 1);
         assert.equal(replayed.outcome, "ALREADY_TERMINAL");
         assert.equal(replayed.authoritySeq, 3);
@@ -949,10 +961,10 @@ test(
           });
           const active = inbox.items.find((item) => matrixCase.targetKind === "thread"
             ? item.kind === "thread" && item.threadChannelId === fixture.scopeId
-            : item.kind !== "thread" && item.channelId === fixture.scopeId);
+            : item.kind !== "thread" && item.kind !== "task" && item.channelId === fixture.scopeId);
           assert.ok(active, `${label}: canonical Inbox must retain the row containing post-S activity`);
           assert.equal(active.latestActivitySeq, String(postMessage.seq));
-          if (active.kind === "thread") {
+          if (active.kind === "thread" || active.kind === "task") {
             assert.equal(active.latestActivityMessageId, postMessage.id);
           } else {
             assert.equal(active.lastMessageId, postMessage.id);
@@ -1078,3 +1090,297 @@ test(
     }
   },
 );
+
+test(
+  "real PostgreSQL: a held authority lock fails the claim fast (lock_timeout), and the leased mutation is applied on retry",
+  {
+    skip: !(REAL_PG_URL || REAL_PG_REQUIRED),
+  },
+  async () => {
+    assert.ok(REAL_PG_URL, `${REAL_PG_URL_ENV} is required`);
+    const databaseName = `slock_read_mutation_lt_${process.pid}_${randomBytes(4).toString("hex")}`;
+    const admin = new pg.Client({ connectionString: REAL_PG_URL, application_name: "read-mutation-lt-admin" });
+    let blocker: pg.Client | null = null;
+    await admin.connect();
+    try {
+      await admin.query(`CREATE DATABASE ${quoteIdentifier(databaseName)}`);
+      const migrationPool = new pg.Pool({ connectionString: databaseUrlFor(REAL_PG_URL, databaseName, "read-mutation-lt-migrator"), max: 2 });
+      await migrate(drizzle(migrationPool, { schema }), { migrationsFolder: MIGRATIONS_FOLDER });
+      await migrationPool.end();
+      await initDatabase(databaseUrlFor(REAL_PG_URL, databaseName, `read-mutation-lt-service-${process.pid}`));
+      const [owner] = await getDb().insert(users).values({
+        email: `read-lt-${randomUUID()}@test.invalid`,
+        name: `ReadLt${randomUUID().replaceAll("-", "").slice(0, 8)}`,
+        passwordHash: "x",
+        emailVerified: true,
+      }).returning();
+      const [server] = await getDb().insert(servers).values({ name: "Read Lock Timeout", slug: `read-lt-${randomUUID()}`, ownerId: owner.id }).returning();
+      await getDb().insert(serverMembers).values({ serverId: server.id, userId: owner.id, role: "owner" });
+      const mutationId = randomUUID();
+      await admitReadMutation({ serverId: server.id, principalId: owner.id, mutationId, mutation: { kind: "global_read_all" } });
+
+      const t0 = new Date("2026-07-21T00:00:00.000Z");
+      const claim = await claimNextReadMutation({ serverId: server.id, principalId: owner.id, leaseOwner: "lt-worker-a", leaseMs: 1_000, now: t0 });
+      assert.ok(claim);
+
+      // A stray session holds the authority row (10-27: idle in transaction).
+      blocker = new pg.Client({ connectionString: databaseUrlFor(REAL_PG_URL, databaseName, "read-mutation-lt-blocker") });
+      await blocker.connect();
+      await blocker.query("BEGIN");
+      await blocker.query("SELECT 1 FROM read_mutation_authorities WHERE server_id = $1 AND principal_id = $2 FOR UPDATE", [server.id, owner.id]);
+
+      const started = Date.now();
+      await assert.rejects(
+        executeReadMutationClaim({ claim, now: new Date(t0.getTime() + 10) }),
+        (error: unknown) => (error as { code?: string; cause?: { code?: string } }).code === "55P03"
+          || (error as { cause?: { code?: string } }).cause?.code === "55P03",
+        "the claim gives up on the lock with lock_not_available",
+      );
+      const waitedMs = Date.now() - started;
+      assert.ok(waitedMs >= 2_500 && waitedMs < 10_000, `gave up after the 3 s lock_timeout, not the 15 s statement timeout (waited ${waitedMs} ms)`);
+      const [stillPending] = await getDb().select().from(readMutations).where(eq(readMutations.mutationId, mutationId));
+      assert.ok(stillPending, "the mutation is not lost");
+      assert.ok(stillPending.state !== "applied" && stillPending.state !== "retired_no_effect", "nothing was applied while the lock was held");
+
+      await blocker.query("COMMIT");
+      // After the lease expires, the next claim applies it.
+      const retry = await claimNextReadMutation({ serverId: server.id, principalId: owner.id, leaseOwner: "lt-worker-b", leaseMs: 1_000, now: new Date(t0.getTime() + 1_001) });
+      assert.ok(retry, "the mutation is claimable again after the lease");
+      assert.equal(retry.mutationId, mutationId);
+      const ack = await executeReadMutationClaim({ claim: retry, now: new Date(t0.getTime() + 1_002) });
+      assert.equal(ack.authoritySeq, 1);
+      const [applied] = await getDb().select().from(readMutations).where(eq(readMutations.mutationId, mutationId));
+      assert.ok(!applied || applied.state === "applied" || applied.state === "retired_no_effect", "applied on retry");
+    } finally {
+      if (blocker) await blocker.end().catch(() => {});
+      await closeDatabase().catch(() => {});
+      await admin.query(`DROP DATABASE IF EXISTS ${quoteIdentifier(databaseName)} WITH (FORCE)`).catch(() => {});
+      await admin.end().catch(() => {});
+    }
+  },
+);
+
+test(
+  "real PostgreSQL: on a sequencer lock_timeout the sample traces the chain to its front (a channel row lock held idle in transaction)",
+  {
+    skip: !(REAL_PG_URL || REAL_PG_REQUIRED),
+  },
+  async () => {
+    assert.ok(REAL_PG_URL, `${REAL_PG_URL_ENV} is required`);
+    const databaseName = `slock_read_mutation_chain_${process.pid}_${randomBytes(4).toString("hex")}`;
+    const admin = new pg.Client({ connectionString: REAL_PG_URL, application_name: "read-mutation-chain-admin" });
+    let blocker: pg.Client | null = null;
+    const originalWarn = console.warn;
+    await admin.connect();
+    try {
+      await admin.query(`CREATE DATABASE ${quoteIdentifier(databaseName)}`);
+      const migrationPool = new pg.Pool({ connectionString: databaseUrlFor(REAL_PG_URL, databaseName, "read-mutation-chain-migrator"), max: 2 });
+      await migrate(drizzle(migrationPool, { schema }), { migrationsFolder: MIGRATIONS_FOLDER });
+      await migrationPool.end();
+      await initDatabase(databaseUrlFor(REAL_PG_URL, databaseName, `read-mutation-chain-service-${process.pid}`));
+      const people = await getDb().insert(users).values([0, 1].map((index) => ({
+        email: `read-chain-${index}-${randomUUID()}@test.invalid`,
+        name: `ReadChain${index}${randomUUID().replaceAll("-", "").slice(0, 6)}`,
+        passwordHash: "x",
+        emailVerified: true,
+      }))).returning();
+      const [server] = await getDb().insert(servers).values({ name: "Read Chain", slug: `read-chain-${randomUUID()}`, ownerId: people[0]!.id }).returning();
+      await getDb().insert(serverMembers).values(people.map((person, index) => ({ serverId: server.id, userId: person.id, role: index === 0 ? "owner" as const : "member" as const })));
+      const [room] = await getDb().insert(channels).values({ serverId: server.id, name: "chain-room", type: "channel" }).returning();
+      await getDb().insert(channelHumans).values(people.map((person) => ({ channelId: room.id, userId: person.id })));
+      await createMessage(room.id, "user", people[0]!.id, "hello", "chat");
+
+      // The front of the chain: a session that took the channel row and went idle in transaction.
+      blocker = new pg.Client({ connectionString: databaseUrlFor(REAL_PG_URL, databaseName, "read-mutation-chain-blocker") });
+      await blocker.connect();
+      const blockerPid = Number((await blocker.query("SELECT pg_backend_pid() AS pid")).rows[0].pid);
+      await blocker.query("BEGIN");
+      await blocker.query("SELECT 1 FROM channels WHERE id = $1 FOR UPDATE", [room.id]);
+
+      resetLockHolderSampleLimitForTests();
+      const warnings: unknown[][] = [];
+      console.warn = (...args: unknown[]) => { warnings.push(args); };
+      const admit = (principalId: string) => admitReadMutation({
+        serverId: server.id,
+        principalId,
+        mutationId: randomUUID(),
+        mutation: { kind: "row_read", scopeId: room.id, throughSeq: 1 },
+      });
+      // Two readers queue behind the channel lock; the second is still waiting
+      // when the first one's lock_timeout fires and samples.
+      const first = admit(people[0]!.id).then(() => "ok", (error: unknown) => error);
+      await new Promise((resolve) => setTimeout(resolve, 1_000));
+      const second = admit(people[1]!.id).then(() => "ok", (error: unknown) => error);
+      const firstOutcome = await first;
+      const isLockTimeout = (error: unknown) => {
+        for (let current = error, depth = 0; current && depth < 5; depth += 1) {
+          if ((current as { code?: unknown }).code === "55P03") return true;
+          current = (current as { cause?: unknown }).cause;
+        }
+        return false;
+      };
+      assert.ok(isLockTimeout(firstOutcome), `the first reader gives up with lock_not_available: ${String(firstOutcome)}`);
+      const chainLog = warnings.find((args) => String(args[0]).includes("lock_timeout; lock chain"));
+      assert.ok(chainLog, "the lock_timeout logs the lock chain");
+      const { roots } = chainLog[1] as { roots: Array<Record<string, unknown>> };
+      const front = roots.find((root) => Number(root.blockerPid) === blockerPid);
+      assert.ok(front, `the channel-lock holder is named as the front of the chain: ${JSON.stringify(roots)}`);
+      assert.equal(front.state, "idle in transaction");
+      assert.ok(roots.every((root) => !("query" in root)), "no query text is logged");
+      await blocker.query("ROLLBACK");
+      await second;
+    } finally {
+      console.warn = originalWarn;
+      if (blocker) await blocker.end().catch(() => {});
+      await closeDatabase().catch(() => {});
+      await admin.query(`DROP DATABASE IF EXISTS ${quoteIdentifier(databaseName)} WITH (FORCE)`).catch(() => {});
+      await admin.end().catch(() => {});
+    }
+  },
+);
+
+test("real PostgreSQL joint reads serialize opposite-entry unread, fence member removal, and keep child Done independent of root traffic", {
+  skip: !(REAL_PG_URL || REAL_PG_REQUIRED),
+}, async () => {
+  assert.ok(REAL_PG_URL, `${REAL_PG_URL_ENV} is required`);
+  const databaseName = `slock_joint_read_${process.pid}_${randomBytes(4).toString("hex")}`;
+  const applicationName = `joint-read-${process.pid}`;
+  const admin = new pg.Client({ connectionString: REAL_PG_URL });
+  let observer: pg.Client | undefined;
+  await admin.connect();
+  const releaseRead = deferred(), releaseRemoval = deferred();
+  const releaseChildDone: Array<() => void> = [];
+  const pending: Promise<unknown>[] = [];
+  try {
+    await admin.query(`CREATE DATABASE ${quoteIdentifier(databaseName)}`);
+    const migrationPool = new pg.Pool({ connectionString: databaseUrlFor(REAL_PG_URL, databaseName), max: 2 });
+    try { await migrate(drizzle(migrationPool, { schema }), { migrationsFolder: MIGRATIONS_FOLDER }); }
+    finally { await migrationPool.end(); }
+    const testUrl = databaseUrlFor(REAL_PG_URL, databaseName, applicationName, true);
+    await initDatabase(testUrl);
+    observer = new pg.Client({ connectionString: databaseUrlFor(REAL_PG_URL, databaseName) });
+    await observer.connect();
+    // Bind BEFORE any transaction. A competitor launched in a hook otherwise
+    // joins the hook's ambient transaction as a savepoint and proves no race.
+    const outside = AsyncResource.bind(<T>(run: () => Promise<T>): Promise<T> => run());
+    const x = await jointHumanReadFixture({ db: getDb(), seed: createSeed(getDb()) });
+    const readId = randomUUID(), unreadId = randomUUID();
+    await admitReadMutation({ serverId: x.a.id, principalId: x.peer.id, mutationId: readId,
+      mutation: { kind: "row_read", scopeId: x.joint.channel.id, throughSeq: 10 } });
+    await admitReadMutation({ serverId: x.b.id, principalId: x.peer.id, mutationId: unreadId,
+      mutation: { kind: "row_unread", scopeId: x.target.id, throughSeq: 9 } });
+    const readClaim = await claimNextReadMutation({ serverId: x.a.id, principalId: x.peer.id, leaseOwner: "read-A" });
+    const unreadClaim = await claimNextReadMutation({ serverId: x.b.id, principalId: x.peer.id, leaseOwner: "unread-B" });
+    assert.ok(readClaim && unreadClaim);
+    const held = deferred();
+    let readPid = 0, unreadPid = 0;
+    const reading = outside(() => executeReadMutationClaim({ claim: readClaim, afterBoundaryCaptured: async ({ tx }) => {
+      readPid = Number((await tx.execute<{ pid: number }>(sql`SELECT pg_backend_pid() pid`)).rows[0]!.pid);
+    }, afterScopeCursorLocked: async () => { held.resolve(); await releaseRead.promise; } }));
+    pending.push(reading);
+    await bounded(held.promise, "A's cursor hold");
+    const unreading = outside(() => executeReadMutationClaim({ claim: unreadClaim, afterBoundaryCaptured: async ({ tx }) => {
+      unreadPid = Number((await tx.execute<{ pid: number }>(sql`SELECT pg_backend_pid() pid`)).rows[0]!.pid);
+    } }));
+    pending.push(unreading);
+    await waitForServiceRowLock(observer, applicationName);
+    const waiter = await observer.query<{ pid: number }>(`SELECT pid FROM pg_stat_activity
+      WHERE application_name=$1 AND pid<>$2 AND $2=ANY(pg_blocking_pids(pid))`, [applicationName, readPid]);
+    assert.equal(waiter.rows.length, 1, "B is a real different-backend waiter on A");
+    releaseRead.resolve();
+    await bounded(Promise.all([reading, unreading]), "opposite-entry read and unread");
+    assert.notEqual(readPid, unreadPid);
+    const positions = await getDb().select().from(userChannelReadCursors).where(and(
+      eq(userChannelReadCursors.userId, x.peer.id), inArray(userChannelReadCursors.channelId, [x.joint.channel.id, x.target.id]),
+    ));
+    assert.equal(positions.length, 2); assert.ok(positions.every((row) => row.lastReadSeq === 9));
+
+    for (const [index, child] of x.children.entries()) {
+      await admitReadMutation({ serverId: x.b.id, principalId: x.peer.id, mutationId: randomUUID(),
+        mutation: { kind: "done", scopeId: child.local.id, targetKind: "thread", throughSeq: "11" } });
+      const doneClaim = await claimNextReadMutation({ serverId: x.b.id, principalId: x.peer.id, leaseOwner: "child-Done" });
+      await admitReadMutation({ serverId: x.a.id, principalId: x.owner.id, mutationId: randomUUID(),
+        mutation: { kind: "row_read", scopeId: x.joint.channel.id, throughSeq: 10 } });
+      const otherReaderClaim = await claimNextReadMutation({ serverId: x.a.id, principalId: x.owner.id, leaseOwner: "other-root-reader" });
+      assert.ok(doneClaim && otherReaderClaim);
+      const doneHeld = deferred(), releaseDone = deferred();
+      releaseChildDone.push(releaseDone.resolve);
+      let donePid = 0, otherReaderPid = 0;
+      const completing = outside(() => executeReadMutationClaim({ claim: doneClaim,
+        afterBoundaryCaptured: async ({ tx }) => {
+          donePid = Number((await tx.execute<{ pid: number }>(sql`SELECT pg_backend_pid() pid`)).rows[0]!.pid);
+        },
+        afterScopeCursorLocked: async () => { doneHeld.resolve(); await releaseDone.promise; },
+      }));
+      pending.push(completing);
+      await bounded(doneHeld.promise, `${child.local.type} Done's cursor hold`);
+      // The target's content frontier still needs an exclusive fence.
+      await observer.query("BEGIN");
+      try {
+        await assert.rejects(observer.query("SELECT id FROM channels WHERE id=$1 FOR KEY SHARE NOWAIT", [child.storage.id]),
+          (error: Error & { code?: string }) => error.code === "55P03");
+      } finally { await observer.query("ROLLBACK"); }
+      const rootTraffic = outside(() => getDb().transaction(async (tx) => {
+        // Metadata and the root must stay compatible with foreign-key readers;
+        // NOWAIT makes an unnecessarily broad Done lock a deterministic failure.
+        await tx.execute(sql`SELECT id FROM channels WHERE id=${x.joint.jointChannel.canonicalChannelId}::uuid FOR KEY SHARE NOWAIT`);
+        await tx.execute(sql`SELECT p.local_channel_id FROM joint_channel_servers p
+          JOIN joint_channels j ON j.id=p.joint_channel_id
+          WHERE p.local_channel_id=${child.local.id}::uuid FOR KEY SHARE OF p,j NOWAIT`);
+        if (child.storage.parentMessageId) await tx.execute(sql`SELECT id FROM messages
+          WHERE id=${child.storage.parentMessageId}::uuid FOR KEY SHARE NOWAIT`);
+        if (child.storage.taskId) await tx.execute(sql`SELECT id FROM tasks
+          WHERE id=${child.storage.taskId}::uuid FOR KEY SHARE NOWAIT`);
+        await tx.insert(messages).values({ channelId: x.joint.jointChannel.canonicalChannelId,
+          senderType: "user", senderId: x.owner.id, content: "root traffic during child Done", seq: 12 + index });
+      }));
+      const otherReading = outside(() => executeReadMutationClaim({ claim: otherReaderClaim,
+        afterBoundaryCaptured: async ({ tx }) => {
+          otherReaderPid = Number((await tx.execute<{ pid: number }>(sql`SELECT pg_backend_pid() pid`)).rows[0]!.pid);
+        },
+      }));
+      pending.push(rootTraffic, otherReading);
+      const [, otherAck] = await bounded(Promise.all([rootTraffic, otherReading]), "root insert and other human's read while child Done is held", 3_000);
+      assert.notEqual(otherReaderPid, donePid, "root reading really uses another PostgreSQL backend");
+      assert.equal(otherAck.scopes[0]?.maxReadSeq, 10);
+      releaseDone.resolve();
+      assert.equal((await bounded(completing, "child Done")).scopes[0]?.maxReadSeq, 11);
+    }
+
+    const y = await jointHumanReadFixture({ db: getDb(), seed: createSeed(getDb()) });
+    await admitReadMutation({ serverId: y.b.id, principalId: y.peer.id, mutationId: randomUUID(),
+      mutation: { kind: "row_read", scopeId: y.target.id, throughSeq: 10 } });
+    const afterRemovalClaim = await claimNextReadMutation({ serverId: y.b.id, principalId: y.peer.id, leaseOwner: "read-after-remove" });
+    assert.ok(afterRemovalClaim);
+    const channelHeld = deferred();
+    let removalPid = 0;
+    const removing = outside(() => getDb().transaction(async (tx) => {
+      removalPid = Number((await tx.execute<{ pid: number }>(sql`SELECT pg_backend_pid() pid`)).rows[0]!.pid);
+      await tx.execute(sql`SELECT id FROM channels WHERE id=${y.joint.channel.id}::uuid FOR UPDATE`);
+      channelHeld.resolve();
+      await releaseRemoval.promise;
+      await removeHuman(y.joint.channel.id, y.peer.id, { self: true }, tx);
+    }));
+    pending.push(removing);
+    await bounded(channelHeld.promise, "remover's channel hold");
+    const afterRemovalRead = outside(() => executeReadMutationClaim({ claim: afterRemovalClaim }));
+    pending.push(afterRemovalRead);
+    await waitForServiceRowLock(observer, applicationName);
+    const removalWaiter = await observer.query<{ pid: number }>(`SELECT pid FROM pg_stat_activity
+      WHERE application_name=$1 AND pid<>$2 AND $2=ANY(pg_blocking_pids(pid))`, [applicationName, removalPid]);
+    assert.equal(removalWaiter.rows.length, 1, "reader waits before taking the joint member lock");
+    releaseRemoval.resolve();
+    await bounded(removing, "global member removal");
+    const removedAck = await bounded(afterRemovalRead, "read after removal");
+    assert.equal(removedAck.terminalReason, "authorization_revoked");
+    assert.equal((await getDb().select().from(userChannelReadCursors).where(eq(userChannelReadCursors.userId, y.peer.id))).length, 0);
+  } finally {
+    releaseRead.resolve(); releaseRemoval.resolve();
+    for (const release of releaseChildDone) release();
+    await Promise.allSettled(pending);
+    await observer?.end().catch(() => {});
+    await closeDatabase().catch(() => {});
+    await admin.query(`DROP DATABASE IF EXISTS ${quoteIdentifier(databaseName)} WITH (FORCE)`).catch(() => {});
+    await admin.end();
+  }
+});

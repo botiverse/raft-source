@@ -1,5 +1,5 @@
-import { and, eq, inArray } from "drizzle-orm";
-import { alias } from "drizzle-orm/pg-core";
+import { and, eq, inArray, sql } from "drizzle-orm";
+import { alias, type AnyPgColumn } from "drizzle-orm/pg-core";
 import { JOINT_CHANNEL_OVER_LIMIT_GRACE_MS } from "@botiverse/raft-shared";
 import { getDb, type DatabaseExecutor } from "../db/index";
 import { channels, jointChannels, jointChannelServers, messages } from "../db/schema";
@@ -8,7 +8,10 @@ import { channels, jointChannels, jointChannelServers, messages } from "../db/sc
 // Every sub-thread of a joint is also stored as its own joint_channels row,
 // with no parent pointer, so anything keyed by a joint id must first resolve
 // to the parent here. This module only reads stored state; it never consults
-// billing, so request-time gates stay one row lookup.
+// billing, so request-time gates stay one row lookup. Task v2 conversations
+// are sub-records too: a joint task conversation's canonical row (type
+// 'task') names its canonical parent channel on the row (parent_channel_id),
+// where a thread's is its parent message's channel.
 
 export type JointLimitState = {
   parentJointId: string;
@@ -27,6 +30,25 @@ export function isJointReadOnlyAt(overLimitSince: Date | null, now: Date): boole
   return graceEndsAt !== null && now.getTime() >= graceEndsAt.getTime();
 }
 
+/** A joint record of a sub-conversation (thread or task v2 conversation), never a top-level joint. */
+export function isSubRecordType(type: string): boolean {
+  return type === "thread" || type === "task";
+}
+
+/**
+ * The parent joint of a sub-record: the joint whose canonical channel holds a
+ * thread's parent message, or a task conversation's canonical parent channel.
+ */
+function subRecordParentJointCondition(
+  parentJoint: { canonicalChannelId: AnyPgColumn },
+  parentMessage: { channelId: AnyPgColumn },
+) {
+  return sql`${parentJoint.canonicalChannelId} = COALESCE(
+    ${parentMessage.channelId},
+    CASE WHEN ${channels.type} = 'task' THEN ${channels.parentChannelId} END
+  )`;
+}
+
 /** Map any joint id (top-level or sub-thread record) to its top-level joint id. */
 export async function resolveParentJointId(
   executor: DatabaseExecutor,
@@ -43,11 +65,11 @@ export async function resolveParentJointId(
     .from(jointChannels)
     .innerJoin(channels, eq(channels.id, jointChannels.canonicalChannelId))
     .leftJoin(parentMessage, eq(parentMessage.id, channels.parentMessageId))
-    .leftJoin(parentJoint, eq(parentJoint.canonicalChannelId, parentMessage.channelId))
+    .leftJoin(parentJoint, subRecordParentJointCondition(parentJoint, parentMessage))
     .where(eq(jointChannels.id, jointChannelId))
     .limit(1);
   if (!row) return null;
-  if (row.canonicalType !== "thread") return row.id;
+  if (!isSubRecordType(row.canonicalType)) return row.id;
   return row.parentJointId ?? null;
 }
 
@@ -83,7 +105,7 @@ export async function resolveGatingParentJointId(
   serverId: string,
 ): Promise<string | null> {
   const [channel] = await executor
-    .select({ id: channels.id, type: channels.type, parentMessageId: channels.parentMessageId })
+    .select({ id: channels.id, type: channels.type, parentMessageId: channels.parentMessageId, parentChannelId: channels.parentChannelId })
     .from(channels)
     .where(and(eq(channels.id, channelId), eq(channels.serverId, serverId)))
     .limit(1);
@@ -101,7 +123,7 @@ export async function resolveGatingParentJointId(
       .where(and(eq(jointChannels.canonicalChannelId, channelId), eq(jointChannels.status, "active")))
       .limit(1);
     jointChannelId = storage?.jointChannelId ?? null;
-  } else if (channel.type === "joint" || channel.type === "thread") {
+  } else if (channel.type === "joint" || channel.type === "thread" || channel.type === "task") {
     // Local joint projections and local joint-thread projections both carry
     // a joint_channel_servers row. Joint-thread projections have no
     // parentMessageId, so they must be found here, not through the parent
@@ -116,6 +138,18 @@ export async function resolveGatingParentJointId(
         .limit(1);
       if (parent?.parentChannelType === "joint") {
         jointChannelId = await getActiveJointIdForLocalChannel(executor, parent.parentChannelId, serverId);
+      }
+    }
+    // Task v2: a local task conversation without its own projection row
+    // (defensive) is gated by its parent channel's joint.
+    if (!jointChannelId && channel.type === "task" && channel.parentChannelId) {
+      const [parent] = await executor
+        .select({ id: channels.id, type: channels.type })
+        .from(channels)
+        .where(and(eq(channels.id, channel.parentChannelId), eq(channels.serverId, serverId)))
+        .limit(1);
+      if (parent?.type === "joint") {
+        jointChannelId = await getActiveJointIdForLocalChannel(executor, parent.id, serverId);
       }
     }
   }
@@ -177,11 +211,11 @@ export async function getJointLimitStatesForJoints(
     .from(jointChannels)
     .innerJoin(channels, eq(channels.id, jointChannels.canonicalChannelId))
     .leftJoin(parentMessage, eq(parentMessage.id, channels.parentMessageId))
-    .leftJoin(parentJoint, eq(parentJoint.canonicalChannelId, parentMessage.channelId))
+    .leftJoin(parentJoint, subRecordParentJointCondition(parentJoint, parentMessage))
     .where(inArray(jointChannels.id, ids))
     .orderBy(jointChannels.id);
   for (const row of rows) {
-    const isThread = row.canonicalType === "thread";
+    const isThread = isSubRecordType(row.canonicalType);
     const parentJointId = isThread ? row.parentJointId : row.id;
     if (!parentJointId) {
       states.set(row.id, null);

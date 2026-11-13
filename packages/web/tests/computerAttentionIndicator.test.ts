@@ -56,7 +56,7 @@ test("Computer attention summary returns aggregate counts and dot priority", () 
   assert.equal(summary.offlineCount, 1);
   assert.deepEqual(summary.problemComputers.map((machine) => machine.id), ["upgrade", "offline"]);
   assert.equal(formatComputerAttentionCounts(summary), "1 needs upgrade · 1 offline");
-  assert.equal(getComputerAttentionDotTone(summary.status), "bg-attention");
+  assert.equal(getComputerAttentionDotTone(summary.status), "bg-presence-error");
 });
 
 test("rail attention counts every affected machine once", () => {
@@ -115,9 +115,10 @@ test("Computer row dot is a single full-state signal for managed Computers and l
   );
 
   // Raft DS: presence lights are fixed (online lime, offline stone); an
-  // upgrade waiting for you is the pink attention pixel.
+  // update waiting for you needs handling: the orange error light (pink is
+  // only for unread / new).
   assert.deepEqual(getComputerRowDotLight("online"), { presence: "online" });
-  assert.deepEqual(getComputerRowDotLight("upgrade"), { tone: "bg-attention" });
+  assert.deepEqual(getComputerRowDotLight("upgrade"), { presence: "error" });
   assert.deepEqual(getComputerRowDotLight("offline"), { presence: "offline" });
 });
 

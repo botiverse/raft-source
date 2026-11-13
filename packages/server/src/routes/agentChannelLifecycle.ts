@@ -7,6 +7,7 @@ import * as channelService from "../services/channelService";
 import * as messageService from "../services/messageService";
 import { addTraceEvent, errorClassOf } from "../tracing/semanticTrace";
 import { agentServerRoleRequiredBody } from "../lib/agentServerRoleRequired";
+import { ExternalChannelLimitError } from "../services/externalChannelLimitService";
 
 export interface AgentChannelLifecycleActor {
   id: string;
@@ -71,14 +72,11 @@ export async function setChannelArchivedForAgent(input: {
     });
     return { status: 404, body: { error: "Channel not found" } };
   }
-  // Archiving a joint channel archives it for every connected server, so a
-  // joint channel admin cannot do it (JOINT_CHANNEL_ADMIN_CAPABILITIES): the
-  // authority is the server capability, exactly as the human archive route
-  // decides it.
+  // Archiving a joint channel archives it for every connected server: the
+  // authority is the host's (channelActorHasCapability), exactly as the human
+  // archive route decides it.
   const isJoint = channel.type === "joint";
-  const hasAuthority = isJoint
-    ? await actorHasServerCapabilityInServer(serverId, "agent", actor.id, "archiveChannels")
-    : await actorHasChannelCapability(serverId, channel.id, "agent", actor.id, "archiveChannels");
+  const hasAuthority = await actorHasChannelCapability(serverId, channel.id, "agent", actor.id, "archiveChannels");
   addTraceEvent("agent_channel_lifecycle.authorization.checked", {
     action,
     outcome: hasAuthority ? "allowed" : "denied",
@@ -97,15 +95,26 @@ export async function setChannelArchivedForAgent(input: {
   }
 
   try {
-    const { channel: updated, changed } = isJoint
-      ? await channelService.setLocalChannelArchivedByAgent(channel.id, actor.id, archived)
-      : await withLockedChannelActorCapability({
+    const endedGuests: channelService.EndedChannelGuest[] = [];
+    const { channel: updated, changed } = await withLockedChannelActorCapability({
           serverId,
           channelId: channel.id,
           actorType: "agent",
           actorId: actor.id,
           capability: "archiveChannels",
-        }, (tx) => channelService.setLocalChannelArchivedByAgent(channel.id, actor.id, archived, tx));
+          // An unarchive checks the free plan's external channel rule under them (ADMISSION_LOCK_ORDER).
+          admissionServerIds: archived ? [] : await channelService.unarchiveAdmissionServerIds(channel.id),
+          // The Guests an archive removes: their users rows first.
+          guessUserIds: archived ? () => channelService.archiveBoundGuestIds(channel.id) : undefined,
+        }, (tx, _context, lockedUserIds) => {
+          endedGuests.length = 0; // A restarted attempt starts over.
+          return channelService.setLocalChannelArchivedByAgent(channel.id, actor.id, archived, tx, { endedGuests, lockedUserIds });
+        });
+    // An archive ends its Guests' server membership (in the commit); finish them after it.
+    await channelService.finishEndedChannelGuests(updated.serverId, endedGuests);
+    // After commit: an archived channel's Guests lose their live connections
+    // (#wg-rbac:#15), also on an idempotent retry (repairs a failed revocation).
+    if (archived && updated.archivedAt) await channelService.revokeBoundGuestSockets(updated.id);
 
     if (changed) {
       if (isJoint) {
@@ -151,6 +160,11 @@ export async function setChannelArchivedForAgent(input: {
     });
     return { status: 200, body: updated };
   } catch (err) {
+    // Unarchiving would put a free server in a second external channel: the admission's 409.
+    if (err instanceof ExternalChannelLimitError) {
+      addTraceEvent("agent_channel_lifecycle.request.failed", { action, reason: "free_external_limit", status_code: 409 });
+      return { status: 409, body: { error: err.message, code: err.code, limitSide: err.limitSide, limitServerId: err.limitServerId } };
+    }
     const message = err instanceof Error ? err.message : "";
     if (message === "Channel capability required") {
       return { status: 403, body: await agentServerRoleRequiredBody({ serverId, agentId: actor.id, capabilities: ["archiveChannels"], action: `${action} channels`, channelAdminIn: channel.type === "joint" ? undefined : channel.name }) };

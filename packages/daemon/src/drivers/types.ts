@@ -1,9 +1,12 @@
+import type { TurnEndCompactionDriverOutcome, TurnEndContextFacts } from "../turnEndCompaction";
 import type { ChildProcess } from "node:child_process";
 import type { RuntimeCompactionInterruption } from "@botiverse/raft-shared";
 import type { ActiveSpan, AgentConfig, AgentMessage, RuntimeModelSourceOutcome, SubagentLineage, Tracer, AxSurfaceText } from "@botiverse/raft-shared";
 import type { AgentProxyInboxCoordinator } from "../agentCredentialProxy";
 import type { AgentAppInboxStore } from "../agentAppInbox";
+import type { RuntimeTurnOrigin, RuntimeTurnOriginReader } from "../runtimeTurnOrigin";
 import type { SpawnContextGeneration } from "../contextGeneration";
+import type { AgentNotIdleReason } from "../agentIdle";
 
 // ── Runtime Contracts ──
 // Behavior-level contracts that describe how the daemon should interact with a
@@ -36,7 +39,29 @@ export type RuntimeSessionContract = {
    * explicitly ephemeral runtimes or no-resume modes.
    */
   recovery: "fresh" | "resume_or_fresh";
+  /**
+   * Whether the runtime tells the daemon when it compacts its context
+   * (`compaction_started` / `compaction_finished` events). `reported`: an
+   * unchanged context id proves the context still holds what was shown in it,
+   * so glimpse shows a thing once per context id. `unreported`: it proves
+   * nothing, so glimpse shows it on every use. Required, with no default:
+   * every runtime answers it in its own driver.
+   */
+  compaction: RuntimeCompactionReporting;
+  /**
+   * What a terminal compaction failure does to the session. `sticks_to_session`:
+   * the runtime summarizes the whole session in one request, so once that no
+   * longer fits the model every resume fails compaction again (Pi). The daemon
+   * counts these failures per session and, after SESSION_NEEDS_RESET_THRESHOLD
+   * in a row, refuses to resume it (`session_needs_reset`) until the session is
+   * reset or the model changes. `does_not_stick`: nothing is counted.
+   * Required, with no default.
+   */
+  compactionFailure: RuntimeCompactionFailure;
 };
+
+export type RuntimeCompactionReporting = "reported" | "unreported";
+export type RuntimeCompactionFailure = "sticks_to_session" | "does_not_stick";
 
 export type RuntimeModelVerification = "launchable" | "suggestion_only";
 export type RuntimeStartupReadiness = "first_event" | "initial_turn";
@@ -98,6 +123,10 @@ export type RuntimeTokenUsageKind = "cumulative_session" | "per_turn" | "per_gen
 export type ParsedEvent =
   | { kind: "provider_request"; activity: import("@botiverse/raft-shared").ProviderRequestActivity }
   | { kind: "session_init"; sessionId: string }
+  // task #1357 item 1: a Pi session was opened with these model limits
+  // registered, built from the config of `configRevision` (null: unknown).
+  // Display evidence only: not model progress, readiness or lifecycle.
+  | { kind: "model_limits"; sessionId: string; configRevision: number | null; modelLimits: import("@botiverse/raft-shared").ModelLimits }
   | ({ kind: "thinking"; text: string; runtimeTurn?: RuntimeTurnAttribution } & SubagentLineage)
   | ({ kind: "text"; text: string; runtimeTurn?: RuntimeTurnAttribution } & SubagentLineage)
   // `callId` is the runtime's id for the call when it reports one; `tool_output`
@@ -106,10 +135,21 @@ export type ParsedEvent =
   // runtime's own measurement, used instead of the daemon's when present.
   | ({ kind: "tool_call"; name: string; input: any; callId?: string } & SubagentLineage)
   | ({ kind: "tool_output"; name: string; callId?: string; ok?: boolean; durationMs?: number; exitCode?: number } & SubagentLineage)
-  | { kind: "compaction_started" }
-  | { kind: "compaction_finished" }
+  // Agent typing line (shared agentTyping.ts): the main agent's shell call
+  // `callId` is a `raft message send --target <target>`, found while its
+  // arguments were still streaming (`early`) or once they were complete,
+  // before the call ran. Display hint only: not model progress or lifecycle.
+  | { kind: "send_intent"; callId: string; target: string; early: boolean }
+  // `cycleId` pairs a start with its own finish or interruption, when the
+  // producer knows the pairing (Pi). Absent: the producer makes no claim.
+  // `afterRunEnd`: the runtime had already reported its run's end and its
+  // turn end has not come yet (Pi: after agent_end, before agent_settled).
+  // It says nothing about whether the session takes a new prompt.
+  | { kind: "compaction_started"; cycleId?: number; afterRunEnd?: true }
+  | { kind: "compaction_finished"; cycleId?: number }
   | {
       kind: "compaction_interrupted";
+      cycleId?: number;
       outcome: "compaction_failed_or_exhausted" | "aborted";
       reason: "manual" | "threshold" | "overflow" | "unknown";
       failureReason?: "recovery_exhausted" | "input_too_large" | "compaction_failed";
@@ -117,7 +157,12 @@ export type ParsedEvent =
     }
   | { kind: "review_started" }
   | { kind: "review_finished" }
-  | { kind: "turn_end"; sessionId?: string }
+  | {
+      kind: "turn_end";
+      sessionId?: string;
+      /** task #25 step 2: the turn ended because the daemon interrupted it, not by failing. */
+      interrupted?: true;
+    }
   | {
       kind: "error";
       message: string;
@@ -136,6 +181,12 @@ export type ParsedEvent =
        * set when the runtime reported it; it is never inferred.
        */
       providerLimit?: { kind: "quota_exhausted" | "transient_rate_limit"; resetsAt?: string };
+      /**
+       * The runtime's typed API error behind this one (Claude Code's `error` /
+       * `api_error_code` and `api_error_status`): its codes and HTTP status,
+       * never its wording. Read for the error's trace class and status.
+       */
+      providerError?: { codes?: string[]; httpStatus?: number };
       compaction?: RuntimeCompactionInterruption;
       startupRequestMethod?:
         | "initialize"
@@ -165,6 +216,10 @@ export type ParsedEvent =
         | "grok_acp_notification";
       itemType?: string;
       payloadBytes?: number;
+      /** Category only (traceCategory): the role of a raw response message item. */
+      role?: string;
+      /** Category only (traceCategory): the agent-message phase, e.g. commentary for suppressed text. */
+      phase?: string;
     }
   // A subagent (Claude `Agent` tool) lifecycle/activity signal derived from
   // EXPLICIT parent_tool_use_id / `system` task-lifecycle lineage — never
@@ -173,15 +228,22 @@ export type ParsedEvent =
   // closed ids / bounded tokens (Q8 discipline): no raw prompt or output.
   | {
       kind: "subagent_progress";
-      source: "claude_task_lifecycle" | "claude_parent_tool_use";
+      source: "claude_task_lifecycle" | "claude_parent_tool_use" | "codex_subagent_thread" | "kimi_subagent";
       /** Bounded lifecycle phase from the `system` envelope kind. */
       phase: "started" | "progress" | "notification" | "active";
-      /** Outer `Agent` tool_use id that owns this subagent turn. */
+      /** Outer `Agent` tool_use id (Codex: the `spawn_agent` call id) that owns this subagent turn. */
       parentToolUseId?: string;
       /** Declared subagent role (bounded label, never content). */
       subagentType?: string;
-      /** Claude `system` task-lifecycle envelope id. */
+      /** Claude `system` task-lifecycle envelope id; Codex: the subagent's own thread id. */
       taskId?: string;
+      /**
+       * Claude task lifecycle only: what the task is, from its `task_type`.
+       * A `command` (a shell command Claude Code runs as a task) or `other`
+       * task is background work, not a sub-agent. Absent: a sub-agent (older
+       * Claude Code named no type and sent these only for sub-agents).
+       */
+      taskKind?: "agent" | "command" | "other";
       /**
        * task #1260 — terminal status of a `task_notification` envelope, the
        * closed vocabulary Claude documents (completed | failed | stopped).
@@ -192,10 +254,8 @@ export type ParsedEvent =
       lastToolName?: string;
       payloadBytes?: number;
     }
-  | {
+  | ({
       kind: "runtime_diagnostic";
-      severity: "warning";
-      source: "codex_app_server_notification" | "grok_acp_notification";
       itemType: string;
       message: string;
       details?: string;
@@ -205,7 +265,10 @@ export type ParsedEvent =
       sessionId?: string;
       inputEvidence?: "nonempty" | "unknown";
       reasonPresent?: boolean;
-    }
+    } & (
+      | { severity: "warning"; source: "codex_app_server_notification" | "grok_acp_notification" }
+      | { severity: "info"; source: "pi_empty_response"; itemType: "empty_response" | "whitespace_response" }
+    ))
   | {
       kind: "runtime_recovery";
       source: "codex_resume_missing_rollout" | "codex_resume_thread_writer_busy" | "codex_resume_archived" | "grok_resume_missing_session";
@@ -231,14 +294,43 @@ export type ParsedEvent =
     }
   | {
       kind: "telemetry";
-      name: "token_usage" | "usage_omission" | "rate_limits" | "recovery" | "request_diagnostic";
+      name: "token_usage" | "usage_omission" | "rate_limits" | "recovery" | "request_diagnostic" | "provider_request";
       source?: string;
       usageKind?: RuntimeTokenUsageKind;
       sessionId?: string;
       turnId?: string;
       runtimeResultId?: string;
       attrs: Record<string, string | number | boolean>;
+      /** A provider quota reading (Claude `rate_limit_event`); absent when the row carried none that could be read. */
+      providerQuota?: ProviderQuotaObservation;
     };
+
+/**
+ * One reading of the provider's subscription quota, from the top-level fields
+ * of Claude Code's `rate_limit_event.rate_limit_info` (schema confirmed in
+ * Claude Code 2.1.317). The top level describes the currently limiting window;
+ * its `status` says whether requests are refused.
+ */
+export interface ProviderQuotaObservation {
+  status: "allowed" | "allowed_warning" | "rejected";
+  /** Fraction of the window used (usually 0-1; can exceed 1). */
+  utilization?: number;
+  /** Highest warning threshold passed, as a fraction of the limit (1 once rejected). */
+  surpassedThreshold?: number;
+  /** The limiting window; absent when unreported or a value this daemon does not know. */
+  rateLimitType?: ProviderQuotaRateLimitType;
+  /** When the window resets, epoch milliseconds; only a plausible reset (within a year from now) is kept. */
+  resetsAtMs?: number;
+}
+
+/** `rate_limit_info.rateLimitType` values in Claude Code 2.1.317. */
+export type ProviderQuotaRateLimitType =
+  | "five_hour"
+  | "seven_day"
+  | "seven_day_opus"
+  | "seven_day_sonnet"
+  | "seven_day_overage_included"
+  | "overage";
 
 // ── Spawn Context ──
 // Everything a driver needs to spawn a CLI process.
@@ -246,6 +338,8 @@ export type ParsedEvent =
 export interface SpawnContext {
   agentId: string;
   config: AgentConfig;
+  /** View Context: where a runtime hosted in this daemon records its model requests; null while off. */
+  contextViewRequestLogDir?: () => string | null;
   /**
    * Long-lived standing instructions for the runtime. Drivers that support a
    * native instruction layer should mount this there so it survives compaction
@@ -280,11 +374,29 @@ export interface SpawnContext {
    * probe children and must not create a child once it is aborted.
    */
   launchSignal?: AbortSignal;
+  /**
+   * Read-only getter for the current foreground turn's origin, bound to THIS process's
+   * RuntimeSession. Set by the session itself when it hands the context to spawn / its SDK session
+   * factory; anything the manager put here is overwritten. Managed MCP call surfaces read it at call
+   * time and never cache it (task #21).
+   */
+  readTurnOrigin?: RuntimeTurnOriginReader;
   agentCredentialProxyInboxCoordinator?: AgentProxyInboxCoordinator;
+  /** A launch with no coordinator (the OAR host) still hears of the messages the Server accepted. */
+  agentCredentialProxyMessageCommitted?: AgentProxyInboxCoordinator["recordMessageCommitted"];
+  /** A launch with no coordinator (the OAR host) still hears what the Server said about each message send. */
+  agentCredentialProxySendOutcome?: AgentProxyInboxCoordinator["recordSendOutcome"];
+  /**
+   * RFC 081: the agent's CURRENT `AgentConfig.inboxItems` (read at each call,
+   * so a flag turned off later is honoured). The proxy's `inbox check`
+   * snapshot then leaves out third-party events the Server lists as app items.
+   */
+  agentCredentialProxyInboxItems?: () => boolean;
   /**
    * RFC 072 context id this spawn publishes, planned by the daemon so the
-   * start input it books and the id the CLI reads are the same (glimpse G0).
-   * Absent: the transport plans its own.
+   * start input it books and the id the CLI reads are the same (glimpse G0),
+   * with the driver's compaction declaration. Absent: the transport publishes
+   * no id (signal unknown); it never guesses the declaration.
    */
   contextGeneration?: SpawnContextGeneration;
   /** Shared per-agent Computer-local app Inbox used by the credential proxy. */
@@ -388,12 +500,18 @@ export type RuntimeSendResult =
 export interface RuntimeExitInfo {
   code: number | null;
   signal: NodeJS.Signals | null;
-  reason?: "requested" | "runtime_exit" | "error" | "timeout";
+  /**
+   * `kill_unconfirmed`: reconciler step 5's last resort. No exit was seen
+   * after the SIGKILL; the session reports one so the agent is released, but
+   * it is no evidence that the process is gone.
+   */
+  reason?: "requested" | "runtime_exit" | "error" | "timeout" | "kill_unconfirmed";
 }
 
 export type RuntimeToolDiagnosticTrigger =
   | "runtime_inactivity_tripwire"
   | "manual_probe"
+  | "queued_message_recovery"
   | "testbed_acceptance";
 
 export type RuntimeToolDiagnosticClassification =
@@ -413,6 +531,14 @@ export type RuntimeToolDiagnosticSnapshot = {
   toolAgeMs?: number;
   lastProgressAgeMs?: number;
   processLiveness: "alive" | "exited" | "not_spawned" | "unavailable" | "unknown";
+  /**
+   * The runtime's own id for the tool call, when it had one. In-memory only
+   * (never put on a trace): it lets the daemon match each snapshot to one open
+   * call (task #1302).
+   */
+  runtimeToolCallId?: string;
+  /** completion_loss only: whether the exited child's process group is gone. */
+  processGroupLiveness?: "alive" | "exited" | "unknown";
   progressState: "recent" | "stale" | "never_observed" | "unavailable";
   negativeEvidenceBucket:
     | "none"
@@ -449,6 +575,12 @@ export interface RuntimeSession {
    */
   isAlive(): boolean | undefined;
 
+  /**
+   * Task #1310: read-only view of the runtime's open provider calls, for the
+   * stall events. Absent for runtimes that do not observe their model calls.
+   */
+  providerCallSnapshot?(): RuntimeProviderCallSnapshot;
+
   /** Read-only tool/process diagnosis. It may emit fact spans but cannot mutate runtime behavior. */
   emitToolDiagnosticSnapshots?(
     input: RuntimeToolDiagnosticInput,
@@ -460,18 +592,98 @@ export interface RuntimeSession {
   on(event: "error", cb: (error: Error) => void): void;
   on(event: "exit" | "close", cb: (info: RuntimeExitInfo) => void): void;
 
-  start(input: { text: string; sessionId?: string | null }): Promise<RuntimeSendResult>;
+  /**
+   * `origin` is the single Raft message this prompt answers, or null. Sessions adopt it only when the
+   * input is accepted as a NEW prompt; a steer never changes the current turn's origin (task #21).
+   */
+  start(input: { text: string; sessionId?: string | null; origin?: RuntimeTurnOrigin | null }): Promise<RuntimeSendResult>;
   send(input: {
     mode: "idle" | "busy";
     text: string;
     sessionId?: string | null;
+    origin?: RuntimeTurnOrigin | null;
   }): RuntimeSendResult | Promise<RuntimeSendResult>;
-  stop(opts?: {
-    signal?: NodeJS.Signals;
-    forceAfterMs?: number;
-    reason?: string;
-  }): Promise<void>;
+  /**
+   * Reconciler step 5: SIGTERM (or the runtime's native shutdown), then after
+   * `forceAfterMs` (AGENT_STOP_KILL_GRACE_MS by default) a SIGKILL of the
+   * whole process tree. Settles once the exit is observed, or after
+   * `confirmAfterMs` more without one (`onKillUnconfirmed`; the session then
+   * reports the exit itself so the agent can be released). A second call
+   * joins the first; with `SIGKILL` it skips what is left of the grace.
+   * Nothing is written to a session once its stop has begun.
+   */
+  stop(opts?: RuntimeStopOptions): Promise<void>;
   dispose?(): Promise<void>;
+  /**
+   * task #25 step 2: end the current turn without ending the process, when
+   * the runtime has a native way to (Claude Code's stream-json interrupt,
+   * Pi's abort). "sent" means the request went out; the turn's own end event
+   * says it worked. Absent or "unsupported": the caller restarts instead.
+   */
+  interruptTurn?(): "sent" | "unsupported";
+
+  /**
+   * #proj-runtime:#54 phase 3, in-process runtimes (Pi, Built-in, Kimi SDK):
+   * the live session's last context and its model's window, for the turn-end
+   * compaction decision. Absent: the runtime is asked as Claude is (`/compact`).
+   */
+  turnEndContextFacts?(): Promise<TurnEndContextFacts>;
+
+  /**
+   * Run the runtime's own compaction on an idle session and resolve once it
+   * settled. Only called at a turn end with nothing running, held or queued.
+   */
+  compactAtTurnEnd?(): Promise<TurnEndCompactionDriverOutcome>;
+  /**
+   * Cancel a `compactAtTurnEnd()` the manager gave up on (its cap), and
+   * resolve once the session takes prompts again (Pi refuses a prompt while
+   * a compaction is open). Absent: the manager releases without cancelling.
+   */
+  cancelTurnEndCompaction?(): Promise<void>;
+  /** #proj-runtime:#41: ask the runtime to stop one sub-agent's turn (RuntimeDriver.encodeSubagentInterruptRequest). */
+  interruptSubagent?(subagentTaskId: string): "sent" | "not_running" | "unsupported";
+  /**
+   * After a native interrupt ended the turn: kill what the turn started in
+   * the runtime's process tree, as the restart path does. Codex leaves the
+   * interrupted command running. Absent on in-process sessions, whose tree is
+   * the daemon's.
+   */
+  killTurnProcesses?(startedAtOrAfterMs: number, startedAtOrBeforeMs: number): Promise<{ killed: number; leftAlone: number }>;
+  /**
+   * pi session rotation (pi#10642): APM calls this at every turn end. A
+   * runtime with a rotation due (a compaction finished since its last
+   * rotation) reads `hold` right before it rotates, after its own turn has
+   * settled; a hold keeps the rotation due for the next turn end. Absent on
+   * runtimes that do not rotate.
+   */
+  rotateSessionIfDue?(hold: () => RuntimeSessionRotationHold | null): void;
+}
+
+/** Why the agent is not idle (agentIdle.ts); a session rotation runs only when idle. */
+export type RuntimeSessionRotationHold = AgentNotIdleReason;
+
+export interface RuntimeStopOptions {
+  signal?: NodeJS.Signals;
+  /** Grace before the tree kill; AGENT_STOP_KILL_GRACE_MS by default. */
+  forceAfterMs?: number;
+  /** After the tree kill, how long the exit is awaited; AGENT_STOP_KILL_CONFIRM_MS by default. */
+  confirmAfterMs?: number;
+  reason?: string;
+  turnTreeKill?: RuntimeTurnTreeKill;
+  /** The grace ran out: the tree was SIGKILLed. */
+  onEscalated?: (escalation: { pid: number | undefined; graceMs: number; treeKilledCount: number }) => void;
+  /** No exit was observed `confirmAfterMs` after the SIGKILL. */
+  onKillUnconfirmed?: (info: { pid: number | undefined; graceMs: number; confirmMs: number }) => void;
+}
+
+/**
+ * task #25 step 2: on a stop that interrupts a turn, kill the descendants the
+ * turn started (start time at or after `startedAtOrAfterMs`) at the stop
+ * deadline, whether or not the runtime exited; leave older or unknown ones.
+ */
+export interface RuntimeTurnTreeKill {
+  startedAtOrAfterMs: number;
+  onResult?: (result: { killed: number; leftAlone: number }) => void;
 }
 
 // ── Runtime Driver ──
@@ -502,6 +714,13 @@ export interface RuntimeDriver {
    * first turn has actually been accepted by the server.
    */
   readonly startupReadiness?: RuntimeStartupReadiness;
+
+  /**
+   * The CLI version this driver instance read for its last launch, when it
+   * reads one at spawn (OpenCode does, to pick its launch line). Absent: the
+   * manager falls back to the version the daemon last detected.
+   */
+  readonly launchedCliVersion?: string | null;
 
   /**
    * Whether a launch config `sessionId` is only a native resume target until
@@ -562,6 +781,40 @@ export interface RuntimeDriver {
 
   /** Whether this runtime supports a native standing-prompt layer. */
   readonly supportsNativeStandingPrompt?: boolean;
+
+  /**
+   * The runtime gives the agent a tool to start sub-agents, so its standing
+   * prompt renders the "Working through sub-agents" section when the Server's
+   * `subagentDelegation` flag is on (SystemPromptOptions.supportsSubagents).
+   * Absent/false: that flag changes nothing for this runtime.
+   */
+  readonly supportsSubagents?: boolean;
+
+  /**
+   * When a subagent finishes after the agent's turn has ended, the runtime
+   * only queues the result for the agent's next turn and does not start one
+   * itself (Codex: a `<subagent_notification>` input item). The daemon then
+   * starts that turn once the last background task ends and the agent is
+   * idle. Absent/false: the runtime opens it by itself (Claude Code).
+   */
+  readonly needsWakeAfterSubagents?: boolean;
+
+  /**
+   * The runtime runs only on the OAR host (drivers/oarOnly.ts): `spawn` is
+   * never reached. The router and the OAR host key on this flag, never on a
+   * list of runtime names: no start of it goes to the legacy host, and one
+   * the OAR host cannot run fails (agentHostRouter.ts).
+   */
+  readonly oarOnly?: boolean;
+
+  /**
+   * The runtime is part of the Computer itself (an SDK running in the daemon
+   * process), not a CLI found on PATH: the version its `probe` reports changes
+   * only when the Computer does. Such a runtime is left out of the runtime CLI
+   * version record (runtimeCliVersionTracker.ts), whose downgrade notice is
+   * about an older CLI earlier on PATH.
+   */
+  readonly shipsWithComputer?: boolean;
 
   /**
    * task #13: the runtime rebuilds the standing prompt from this launch on
@@ -628,6 +881,23 @@ export interface RuntimeDriver {
    * Encode a text message for live delivery into the running runtime.
    * Returns null if the runtime doesn't support live message delivery.
    */
+  /**
+   * task #25 step 2: the stdin line that interrupts the current turn, for a
+   * runtime whose stream protocol has one (Claude Code's control_request).
+   */
+  encodeInterruptRequest?(): string | null;
+  /**
+   * #proj-runtime:#41: the stdin line that stops one running sub-agent's
+   * turn, by its `SubagentLineage.taskId`; null when no such sub-agent turn
+   * is running. Absent: the runtime cannot stop one sub-agent.
+   */
+  encodeSubagentInterruptRequest?(subagentTaskId: string): string | null;
+  /**
+   * #proj-runtime:#41: the runtime's session (not a stdin line) stops one
+   * subagent: `RuntimeSession.interruptSubagent` does it (Kimi SDK, its
+   * background subagents).
+   */
+  readonly stopsSubagentsInSession?: boolean;
   encodeStdinMessage(
     text: string,
     sessionId: string | null,
@@ -650,4 +920,17 @@ export interface RuntimeDriver {
 export interface RuntimeModelDetectionContext {
   tracer?: Tracer;
   span?: ActiveSpan;
+}
+
+/** Task #1310: open provider calls at one moment. `oldest` is the longest-open call, absent when none is open. */
+export interface RuntimeProviderCallSnapshot {
+  openCount: number;
+  oldest?: {
+    /** The highest stage the call has been observed to reach. */
+    phase: "started" | "headers" | "streaming";
+    /** Time-window attribution only, not causal. */
+    callContext: "compaction" | "outside_compaction" | "unknown";
+    ageMs: number;
+    msSinceLastStreamEvent?: number;
+  };
 }

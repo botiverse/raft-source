@@ -9,6 +9,8 @@ import {
 import {
   AppOutboundProjectionError,
   getAppServerProjection,
+  getAppHumanMemberRole,
+  canAppHumanManageAgent,
   listAppAgentProjections,
   listAppComputerProjections,
   listAppPublicChannelProjections,
@@ -87,6 +89,33 @@ appInstallationRouter.get("/server", async (req, res) => {
     res.json({ installation_id: result.credential.installationId, server: result.projection });
   } catch (error) {
     handleProjectionError(req, error, res, "Read installation server projection");
+  }
+});
+
+// App's installation names the only Server; sub cannot widen that scope.
+// All user-level misses have the same response; app credential errors keep the
+// existing 401/403 contract. No role decision should outlive this read.
+appInstallationRouter.get("/members/:sub/role", async (req, res) => {
+  res.setHeader("Cache-Control", "private, no-store");
+  try {
+    const result = await readInstallationProjection(req, res, (credential, tx) =>
+      getAppHumanMemberRole(credential, req.params.sub, tx));
+    if (!result) return;
+    res.json({ role: result.projection?.role ?? null });
+  } catch (error) {
+    handleProjectionError(req, error, res, "Read installation member role");
+  }
+});
+
+appInstallationRouter.get("/members/:sub/agents/:agentId/manage", async (req, res) => {
+  res.setHeader("Cache-Control", "private, no-store");
+  try {
+    const result = await readInstallationProjection(req, res, (credential, tx) =>
+      canAppHumanManageAgent(credential, req.params.sub, req.params.agentId, tx));
+    if (!result) return;
+    res.json({ allowed: result.projection });
+  } catch (error) {
+    handleProjectionError(req, error, res, "Check installation Agent management");
   }
 });
 

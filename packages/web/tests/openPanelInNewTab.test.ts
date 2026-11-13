@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
 import "global-jsdom/register";
 import { buildTaskChannelUrl, closeThreadWindow } from "../src/components/window/closeThreadWindow";
 
@@ -8,11 +7,6 @@ const {
   buildThreadWindowUrl,
   openPanelInNewTab,
 } = await import("../src/utils/openPanelInNewTab");
-
-const threadWindowRouteSource = readFileSync(
-  new URL("../src/components/window/ThreadWindowRoute.tsx", import.meta.url),
-  "utf8",
-);
 
 test("thread window URL preserves live view/filter state and replaces stale panel state", () => {
   const url = new URL(buildThreadWindowUrl(
@@ -116,25 +110,6 @@ test("thread-window route returns a normal tab when browser close is unavailable
     navigate: (to, options) => events.push(`navigate:${to}:${options.replace}`),
   });
   assert.deepEqual(events, ["thread", "legacy", "window.close", "navigate:/s/acme%20space:true"]);
-});
-
-test("thread-window route supplies the host-owned close callback to ThreadPanel", () => {
-  assert.match(threadWindowRouteSource, /<ThreadPanel\s+presentation="modal"\s+mobilePage\s+onClose=\{closeWindow\}/);
-  assert.match(threadWindowRouteSource, /closeThreadWindow\(\{/);
-});
-
-test("task page header keeps identity compact and exposes title through a themed tooltip", () => {
-  assert.match(threadWindowRouteSource, /const NON_INTERACTIVE_TOOLTIP_PROPS = \{ className: "pointer-events-none" \};/);
-  assert.match(threadWindowRouteSource, /<Tooltip\s+content=\{task\.title\}\s+disableHoverablePopup\s+contentProps=\{NON_INTERACTIVE_TOOLTIP_PROPS\}\s*>/);
-  assert.match(threadWindowRouteSource, /data-testid="task-page-identity"/);
-  assert.match(threadWindowRouteSource, /task\.modal\.taskWithNumber/);
-  assert.match(threadWindowRouteSource, /taskChannelType === "dm" \? "dm"/);
-  assert.match(threadWindowRouteSource, /h-dvh max-h-dvh min-h-0.*overflow-hidden/);
-  // The thread sits on paper inside the cream window, framed by a region seam
-  // (DS: seams between regions, no shadow on a docked surface).
-  assert.match(threadWindowRouteSource, /bg-layer-canvas sm:max-w-3xl sm:rounded-container sm:border sm:border-line-seam/);
-  assert.match(threadWindowRouteSource, /data-testid="thread-window-surface"/);
-  assert.match(threadWindowRouteSource, /parentSlot=\{taskPageSlot\}/);
 });
 
 test("task page view-in-channel URL preserves message focus and legacy task tab", () => {

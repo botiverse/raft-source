@@ -31,7 +31,7 @@ import { createServer } from "../services/serverService";
 import { createAgent } from "../services/agentService";
 import * as taskService from "../services/taskService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 async function seedUser(label: string) {
   const [user] = await getDb().insert(users).values({
@@ -203,7 +203,10 @@ test("self-assign then start: the status route still moves todo -> in_progress",
   assert.ok(after.claimedAt instanceof Date, "starting the work does stamp claimedAt");
 });
 
-test("the current assignee can return active work to reserved todo, but another member cannot", async ({ app }) => {
+// stdrc 2026-10-31 (#wg-task-v2 msg=ad820421): any status from any status, so
+// another member may return active work to todo too. The assignment survives
+// the move and the stale start epoch does not.
+test("moving active work back to todo keeps the assignment, whoever moves it", async ({ app }) => {
   const { member, server, channel, task } = await setup("assignee-undo-start");
   const peer = await seedUser("assignee-undo-start-peer");
   await getDb().insert(serverMembers).values({ serverId: server.id, userId: peer.id, role: "member" });
@@ -226,23 +229,20 @@ test("the current assignee can return active work to reserved todo, but another 
     headers: headers(peerToken, server.id),
     body: JSON.stringify({ status: "todo" }),
   });
-  assert.equal(otherMemberDemotion.status, 409, await otherMemberDemotion.clone().text());
-  const unchanged = await readTask(task.id);
-  assert.equal(unchanged.status, "in_progress");
-  assert.equal(unchanged.claimedById, member.id);
-  assert.ok(unchanged.claimedAt instanceof Date);
-
-  const selfDemotion = await fetch(`${app.baseUrl}/api/tasks/${task.id}/status`, {
-    method: "PATCH",
-    headers: headers(memberToken, server.id),
-    body: JSON.stringify({ status: "todo" }),
-  });
-  assert.equal(selfDemotion.status, 200, await selfDemotion.clone().text());
+  assert.equal(otherMemberDemotion.status, 200, await otherMemberDemotion.clone().text());
   const reserved = await readTask(task.id);
   assert.equal(reserved.status, "todo");
   assert.equal(reserved.claimedByType, "user");
-  assert.equal(reserved.claimedById, member.id, "undoing start keeps the task reserved");
+  assert.equal(reserved.claimedById, member.id, "moving it back keeps the task reserved");
   assert.equal(reserved.claimedAt, null, "todo carries no stale work-start epoch");
+
+  const restart = await fetch(`${app.baseUrl}/api/tasks/${task.id}/status`, {
+    method: "PATCH",
+    headers: headers(memberToken, server.id),
+    body: JSON.stringify({ status: "in_progress" }),
+  });
+  assert.equal(restart.status, 200, await restart.clone().text());
+  assert.ok((await readTask(task.id)).claimedAt instanceof Date, "starting it again stamps a new start");
 });
 
 test("a member can withdraw an assignment made to someone else", async ({ app }) => {

@@ -32,6 +32,13 @@ vi.mock("node:fs/promises", async (importOriginal) => {
   };
 });
 
+// The fake statfs is the free space under test; on macOS the real important-
+// usage capacity (osascript) would otherwise replace it.
+vi.mock("./volumeCapacity", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./volumeCapacity")>();
+  return { ...actual, readVolumeCapacity: (target: string) => actual.readVolumeCapacity(target, { platform: "linux" }) };
+});
+
 const {
   AGENT_MIGRATION_WORKSPACE_BACKUP_DIRECTORY,
   archiveCompletedAgentMigrationSourceWorkspace,

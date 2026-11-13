@@ -5,7 +5,7 @@ import { getDb } from "../db/index";
 import { agentMigrations, agents, channelAgents } from "../db/schema";
 import { eq } from "drizzle-orm";
 import { createAgent, deleteAgent } from "../services/agentService";
-import { addAgent, addHuman, createChannel, getOrCreateThreadForChannel, recordThreadFollow } from "../services/channelService";
+import { addAgent, addHuman, createChannel, filterAgentsWithChannelAccess, getOrCreateThreadForChannel, recordThreadFollow } from "../services/channelService";
 import { broadcastSystemMessage, createMessage, deliverMessagesToAgents } from "../services/messageService";
 import { updateAgentScopes } from "../services/agentScopesService";
 import { AgentOrchestrator } from "../services/agentOrchestrator";
@@ -14,7 +14,7 @@ import { tokenForHuman } from "../test/integration/credentials";
 import type { createSeed } from "../test/integration/seed";
 import { createServer as createServerFixture, headers, seedUser } from "../routes/channels.api.fixtures";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 type PgliteLike = { query: (...args: unknown[]) => Promise<unknown> };
 
@@ -184,6 +184,48 @@ test("deliverMessagesOnChannel reads agent rows, channel access, scopes and migr
   // membership, its scope (plus the agent-exists fallback: no scope row) and
   // its migration.
   assert.ok(perAgent.matched - many.matched >= 7 * agentIds.length - 7, `one by one ${perAgent.matched} vs batch ${many.matched}`);
+});
+
+test("a thread message's delivery gates, with the server pin, stay a fixed number of queries in the recipient count", async ({ seed }) => {
+  const owner = await seed.human();
+  const server = await seed.server({ owner });
+  const room = await createChannel(server.id, `batch-thread-${randomUUID().slice(0, 8)}`, undefined, "private");
+  const root = await createMessage(room.id, "user", owner.id, "thread root");
+  const thread = await getOrCreateThreadForChannel(room.id, root.id, owner.id, "user");
+  const target = { id: thread.id, name: `thread-${root.id.slice(0, 8)}`, type: "thread" as AgentMessage["channel_type"] };
+  const agentIds: string[] = [];
+  const addAgents = async (size: number) => {
+    for (let i = 0; i < size; i += 1) {
+      const agent = await createAgent(server.id, `batch-thread-${randomUUID().slice(0, 8)}`, { runtime: "claude", model: "sonnet" });
+      await addAgent(room.id, agent.id);
+      await getDb().update(agents).set({ status: "active" }).where(eq(agents.id, agent.id));
+      agentIds.push(agent.id);
+    }
+  };
+  const gateReads = /from "agents"|from "channel_agents"|from "channels"|from "agent_scopes"|from "agent_migrations"|from "messages"/;
+  const run = async () => {
+    const orchestrator = new AgentOrchestrator();
+    const message = payload(target as never, 1);
+    return countQueries(() => Promise.all(orchestrator.deliverMessagesOnChannel(thread.id, agentIds.map((agentId) => ({ agentId, message })))), gateReads);
+  };
+  // The batched access check itself (thread -> parent recursion, server pin on agents): constant.
+  const access = () => countQueries(() => filterAgentsWithChannelAccess(thread.id, agentIds), /./);
+
+  await addAgents(2);
+  await run();
+  const few = await run();
+  const fewAccess = await access();
+  await addAgents(8);
+  await run();
+  const many = await run();
+  const manyAccess = await access();
+
+  assert.equal(fewAccess.result.size, 2);
+  assert.equal(manyAccess.result.size, 10);
+  assert.equal(manyAccess.total, fewAccess.total, `filterAgentsWithChannelAccess: ${fewAccess.total} -> ${manyAccess.total} queries`);
+  assert.ok(few.matched > 0, "the counter must observe gate reads");
+  // As for channels: only the still-active re-read before the inbox enqueue is per agent.
+  assert.equal(many.matched - few.matched, 8, `gate-table reads: ${few.matched} -> ${many.matched} for +8 agents`);
 });
 
 test("a channel send reads its agents' gates in one deliverMessagesOnChannel batch and delivers each through deliverMessage", async ({ app, seed }) => {

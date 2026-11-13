@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import {
   SERVER_CAPABILITY_KEYS,
+  canChangeAgentMemberRole,
   canChangeMemberRole,
   canTransitionServerRole,
   canMutateBilling,
@@ -34,9 +35,7 @@ test("public server view modes never derive membership powers from authenticatio
 });
 
 const MEMBER_CAPABILITIES = new Set<ServerCapability>([
-  "viewChannel",
   "createChannels",
-  "viewChannelMembers",
   "joinPublicChannels",
   "addChannelMembers",
   "viewMembers",
@@ -59,7 +58,7 @@ test("role bundles match every role x capability cell", () => {
 
     for (const capability of SERVER_CAPABILITY_KEYS) {
       const expected = role === "owner"
-        || (role === "admin" && capability !== "manageBilling")
+        || (role === "admin" && capability !== "manageBilling" && capability !== "manageSso")
         || (role === "member" && MEMBER_CAPABILITIES.has(capability));
       assert.equal(hasServerCapability(role, capability), expected, `${role}.${capability}`);
     }
@@ -73,7 +72,7 @@ test("guest has an explicit all-false server capability bundle", () => {
   );
 });
 
-test("member has exactly the eleven explicitly approved capabilities", () => {
+test("member has exactly the nine explicitly approved capabilities", () => {
   const granted = SERVER_CAPABILITY_KEYS.filter((capability) => hasServerCapability("member", capability));
   assert.deepEqual(granted, [...MEMBER_CAPABILITIES]);
 });
@@ -116,6 +115,30 @@ test("admin can only promote a member to admin", () => {
   ] satisfies [ServerRole, ServerRole][]) {
     assert.equal(canChangeMemberRole("admin", targetRole, nextRole), false, `${targetRole}->${nextRole}`);
   }
+});
+
+test("an admin can also demote an admin agent to member; nothing else widens for agents", () => {
+  assert.equal(canChangeAgentMemberRole("admin", "admin", "member"), true);
+  assert.equal(canChangeAgentMemberRole("admin", "member", "admin"), true);
+  // People keep the peer-admin rule.
+  assert.equal(canChangeMemberRole("admin", "admin", "member"), false);
+  for (const [targetRole, nextRole] of [
+    ["member", "member"],
+    ["member", "owner"],
+    ["admin", "admin"],
+    ["admin", "owner"],
+    ["owner", "member"],
+    ["owner", "admin"],
+    ["owner", "owner"],
+  ] satisfies [ServerRole, ServerRole][]) {
+    assert.equal(canChangeAgentMemberRole("admin", targetRole, nextRole), false, `${targetRole}->${nextRole}`);
+  }
+  for (const actorRole of ["member", "guest", null] as const) {
+    assert.equal(canChangeAgentMemberRole(actorRole, "admin", "member"), false, String(actorRole));
+    assert.equal(canChangeAgentMemberRole(actorRole, "member", "admin"), false, String(actorRole));
+  }
+  assert.equal(canChangeAgentMemberRole("owner", "admin", "member"), true);
+  assert.equal(canChangeAgentMemberRole("admin", null, "member"), false);
 });
 
 test("member and missing actors cannot change roles", () => {

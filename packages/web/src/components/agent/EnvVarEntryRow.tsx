@@ -47,7 +47,7 @@ export function EnvVarEntryRow({
         className="min-w-0 flex-1"
         placeholder={formatMessage({ id: "agent.runtimeConfig.envVarFallback" })}
       />
-      <Button variant="ghost" size="icon-sm"
+      <Button variant="ghost" size="icon-md"
         type="button"
         onClick={handleRemove}
         aria-label={formatMessage({ id: "agent.runtimeConfig.removeEnvVar" })}

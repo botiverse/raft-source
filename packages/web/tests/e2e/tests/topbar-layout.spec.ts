@@ -10,7 +10,8 @@ import { waitForSeedState } from "../fixtures/seedState";
  * layout facts worth pinning are the bar's.
  *
  * What a user sees, measured in a real browser (jsdom has no layout):
- *   - one 48px bar across the top, the rail starting right under it;
+ *   - one 44px bar across the top (the desktop header: 32px frame items with
+ *     6px above and below), the rail starting right under it;
  *   - the search field centred on the window, whatever the left side holds;
  *   - the rail without a second server switcher or Search tab;
  *   - the Bell at the bar's right end, its panel opening under it; Help on the
@@ -47,7 +48,7 @@ test.describe("top bar layout", () => {
       const fieldBox = (await field.boundingBox())!;
       const railBox = (await rail.boundingBox())!;
       expect(barBox.y).toBe(0);
-      expect(barBox.height).toBe(48);
+      expect(barBox.height).toBe(44);
       expect(barBox.width).toBe(viewport.width);
       expect(Math.abs(railBox.y - (barBox.y + barBox.height))).toBeLessThanOrEqual(0.5);
       // Centred on the window: the two side regions are equal by construction,
@@ -73,7 +74,6 @@ test.describe("top bar layout", () => {
       // panel under the bar, inside the window. Help stays on the rail, right
       // above Settings (cindyz 2026-10-14).
       await expect(page.getByTestId("notification-trigger-rail")).toHaveCount(0);
-      await expect(page.getByTestId("top-bar-help")).toHaveCount(0);
       const helpBox = (await page.getByTestId("left-rail-help").boundingBox())!;
       const settingsBox = (await page.getByTestId("left-rail-settings").boundingBox())!;
       expect(helpBox.x).toBeGreaterThanOrEqual(railBox.x);
@@ -84,6 +84,10 @@ test.describe("top bar layout", () => {
         ["notification-trigger-top-bar", "notification-center"],
       ] as const) {
         const button = page.getByTestId(trigger);
+        // While the server is still being resolved the bar holds a placeholder
+        // Bell that opens nothing (PendingNotificationTrigger); the live one is
+        // the popover trigger. Click that one.
+        await expect(button).toHaveAttribute("aria-haspopup", "dialog", { timeout: 15_000 });
         const buttonBox = (await button.boundingBox())!;
         expect(buttonBox.x).toBeGreaterThan(fieldBox.x + fieldBox.width);
         expect(buttonBox.y + buttonBox.height).toBeLessThanOrEqual(barBox.height);

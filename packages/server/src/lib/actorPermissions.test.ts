@@ -8,10 +8,10 @@ import { serverAgentMembers, serverMembers, users } from "../db/schema";
 import { getDb } from "../db/index";
 import { createAgent } from "../services/agentService";
 import { createServer } from "../services/serverService";
-import { actorHasServerCapabilityInServer, decideAgentConnectorAuthority, resolveActorContext } from "./actorPermissions";
+import { actorHasServerCapabilityInServer, decideAgentConnectorAuthority, resolveActorContext, serverRolesWithCapability } from "./actorPermissions";
 import { assertActorServerCapabilityMatrix } from "../test/actorCapabilityMatrix";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 async function seedUser(name: string) {
   const [user] = await getDb().insert(users).values({
@@ -97,4 +97,10 @@ test("connector authority: creator first, then owner/admin; members and guests o
   assert.equal(decideAgentConnectorAuthority("member", me, null), null);
   assert.equal(decideAgentConnectorAuthority("guest", me, me), null);
   assert.equal(decideAgentConnectorAuthority(null, me, me), null);
+});
+
+test("serverRolesWithCapability: the roles the matrix grants a capability, for a roster read (manageBilling is the owner's)", () => {
+  assert.deepEqual(serverRolesWithCapability("manageBilling"), ["owner"]);
+  assert.deepEqual(serverRolesWithCapability("viewBilling"), ["owner", "admin"]);
+  assert.deepEqual(serverRolesWithCapability("viewMembers"), ["owner", "admin", "member"]);
 });

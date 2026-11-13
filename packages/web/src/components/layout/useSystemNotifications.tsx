@@ -1,20 +1,22 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { useIntl } from "react-intl";
-import { AlertTriangle, Download, GitBranch, HardDrive, MessageSquare, Monitor, WifiOff } from "lucide-react";
-import {
-  PLAN_CONFIG,
-  DOWNGRADE_GRACE_PERIOD_DAYS,
-  getEffectiveLimits,
-  getFinitePlanLimitExcess,
-} from "@botiverse/raft-shared";
+import { AlertTriangle, Download, HardDrive, Monitor, WifiOff } from "lucide-react";
+import { FeedbackIcon, JoinJointChannelIcon } from "@botiverse/ricons";
+import { PLAN_CONFIG, currentTimeMs } from "@botiverse/raft-shared";
+import type { RuntimeAccountUsageProvider } from "@botiverse/raft-shared";
+import { resetWhen } from "../machine/rack/rackResetText";
 import { machineDiskLowPresentation } from "../../utils/machineDiskPresentation";
+import { showsPlanDowngradeNotice } from "../../utils/planDowngrade";
 import { useFeedbackUnread } from "../../feedback/useFeedbackUnread";
 import { useServerStore } from "../../store/serverStore";
 import { useAgentStore } from "../../store/agentStore";
 import { useMachineStore } from "../../store/machineStore";
+import { useAuthStore } from "../../store/authStore";
 import { useChannelStore } from "../../store/channelStore";
 import { useAppNavigate } from "../../hooks/useAppNavigate";
+import { usePaywallUpgrade } from "../../hooks/usePaywallUpgrade";
+import { PaywallShown } from "../../analytics/paywall";
 import { useServerPermissions } from "../../hooks/useServerPermissions";
 import {
   PWA_INSTALL_ELIGIBLE_DAILY_KEY,
@@ -43,11 +45,29 @@ import {
   formatComputerAttentionCounts,
   summarizeComputerAttention,
 } from "../../utils/computerUpgradeIndicator";
+import {
+  machinesNeedingReinstall,
+  machinesNeedingUpgradeByDeadline,
+} from "../../utils/computersNeedingReinstall";
+import { computerVersionNotificationEntries } from "./computerVersionNotifications";
 import { isJointChannelReadOnly, jointInviteAcceptErrorMessage } from "../../utils/jointChannelLimit";
 import { useUsageLimitAttention } from "./useUsageLimitAttention";
+import { useSeatJoinBlocks } from "./useSeatJoinBlocks";
+import { openSeatJoinDialog } from "../billing/SeatJoinDialog";
 import { usePendingJointInvites } from "./usePendingJointInvites";
+import { useAppPermissionUpdates } from "./useAppPermissionUpdates";
+import { useSecondFactorRecoveryNotification } from "../auth/useSecondFactorRecoveryNotification";
 import api from "../../api/client";
 import { showToast } from "../toastBridge";
+
+/** A usage-limit notice's provider, as its title names it ("Claude used up"). */
+const USAGE_LIMIT_PROVIDER_NAMES: Record<RuntimeAccountUsageProvider, string> = {
+  claude: "Claude",
+  codex: "Codex",
+  kimi: "Kimi",
+  grok: "Grok",
+  antigravity: "Antigravity",
+};
 export { compareNotificationKind, topNotificationKind } from "./notificationKind";
 export type { NotificationKind } from "./notificationKind";
 
@@ -68,6 +88,8 @@ export interface NotificationAction {
   onClick: () => void;
   variant?: "primary" | "secondary";
   disabled?: boolean;
+  /** It opens a dialog: the notification center closes first, so it isn't left open behind it. */
+  opensDialog?: boolean;
 }
 
 export interface NotificationEntry {
@@ -89,26 +111,36 @@ export interface NotificationEntry {
    *  ids of currently-offline machines, so the notification re-surfaces when
    *  a *different* machine drops. See dismissedNotificationStore.ts. */
   dismissalKey?: string;
+  /** An account-security alert (a two-step verification reset on this
+   *  account): listed first, and while it is there the Bell wears the
+   *  security marker instead of the unread dot (NotificationTrigger). */
+  security?: boolean;
 }
 
 export type SystemNotificationSurface = "desktop" | "mobile";
 
 export function useSystemNotifications(surface: SystemNotificationSurface = "desktop"): NotificationEntry[] {
-  const { formatMessage, formatDate } = useIntl();
+  const { formatMessage, formatDate, locale } = useIntl();
   const server = useServerStore((s) => s.current);
   const machines = useMachineStore((s) => s.machines);
   const machineLoading = useMachineStore((s) => s.loading);
   const allAgents = useAgentStore((s) => s.agents);
   const agentLoading = useAgentStore((s) => s.loading);
   const channelsList = useChannelStore((s) => s.channels);
+  const currentUserId = useAuthStore((s) => s.user?.id ?? null);
+  const dismissedNotificationKeys = useDismissedNotificationStore((s) => s.dismissedKeys);
   const { capabilities } = useServerPermissions();
   const nav = useAppNavigate();
+  const paywallUpgrade = usePaywallUpgrade();
   const feedbackUnread = useFeedbackUnread();
   const usageLimitAttention = useUsageLimitAttention();
+  const { blocks: seatJoinBlocks, usage: seatJoinUsage } = useSeatJoinBlocks();
   const { invites: pendingJointInvites, refresh: refreshPendingJointInvites } = usePendingJointInvites();
+  const secondFactorRecovery = useSecondFactorRecoveryNotification();
   const [acceptingJointInviteId, setAcceptingJointInviteId] = useState<string | null>(null);
 
   const serverId = server?.id ?? null;
+  const appPermissionUpdates = useAppPermissionUpdates(serverId, currentUserId, capabilities.manageIntegrations);
   const [pwaPlatform, setPwaPlatform] = useState<PwaInstallPlatform>("other");
   const [pwaSessionCount, setPwaSessionCount] = useState(1);
   const [pwaCooldownState, setPwaCooldownState] = useState<PwaInstallCooldownState>("not_dismissed");
@@ -262,22 +294,38 @@ export function useSystemNotifications(surface: SystemNotificationSurface = "des
         nav.toChannel(channelId);
       }
     } catch (err) {
-      showToast({ title: jointInviteAcceptErrorMessage(err, formatMessage), type: "error" });
+      showToast({ title: jointInviteAcceptErrorMessage(err, formatMessage, server?.name), type: "error" });
     } finally {
       setAcceptingJointInviteId(null);
       void refreshPendingJointInvites();
     }
-  }, [formatMessage, nav, refreshPendingJointInvites, serverId]);
+  }, [formatMessage, nav, refreshPendingJointInvites, server?.name, serverId]);
 
   return useMemo<NotificationEntry[]>(() => {
     const out: NotificationEntry[] = [];
+
+    // ── Account security first: a two-step verification reset on this account.
+    if (secondFactorRecovery) out.push(secondFactorRecovery);
+
+    if (appPermissionUpdates > 0) {
+      out.push({
+        id: "app-permission-updates",
+        kind: "warning",
+        title: formatMessage({ id: "layout.systemNotifications.appPermissionUpdatesTitle" }),
+        body: formatMessage({ id: "layout.systemNotifications.appPermissionUpdatesBody" }, { count: appPermissionUpdates }),
+        action: {
+          label: formatMessage({ id: "settings.connectedApps.viewPermissionUpdates" }),
+          onClick: () => nav.toApps("?permission_updates=1"),
+        },
+      });
+    }
 
     // ── 0a. Pending joint channel invites (RFC 075 §4.5) ─────────────────
     for (const invite of pendingJointInvites) {
       out.push({
         id: `joint-invite:${invite.id}`,
         kind: "info",
-        icon: <GitBranch size={16} className="text-foreground" />,
+        icon: <JoinJointChannelIcon width={16} height={16} className="text-foreground" />,
         dismissalKey: `joint-invite:${invite.id}`,
         title: formatMessage({ id: "layout.systemNotifications.jointInviteTitle" }, { channel: invite.channelName }),
         body: (
@@ -299,16 +347,9 @@ export function useSystemNotifications(surface: SystemNotificationSurface = "des
     // from Agent error strings: only a newer normalized usage snapshot may
     // activate or silently resolve an incident.
     for (const notification of usageLimitAttention.notifications) {
-      const provider = notification.provider === "claude"
-        ? "Claude"
-        : notification.provider === "codex"
-          ? "Codex"
-          : notification.provider === "kimi"
-            ? "Kimi"
-            : "Grok";
-      const reset = notification.resetsAt
-        ? formatDate(new Date(notification.resetsAt), { dateStyle: "medium", timeStyle: "short" })
-        : null;
+      const provider = USAGE_LIMIT_PROVIDER_NAMES[notification.provider] ?? notification.provider;
+      // Relative, as the usage card and cell say it: "Back in 6 days".
+      const reset = resetWhen(notification.resetsAt, locale, currentTimeMs());
       out.push({
         id: `usage-limit:${notification.id}`,
         kind: "warning",
@@ -346,73 +387,70 @@ export function useSystemNotifications(surface: SystemNotificationSurface = "des
       });
     }
 
-    // ── 1. Plan downgrade ────────────────────────────────────────────────
-    if (server && server.plan === "free" && server.planDowngradedAt) {
-      const downgradedAt = new Date(server.planDowngradedAt);
-      const graceEnd = new Date(downgradedAt);
-      graceEnd.setDate(graceEnd.getDate() + DOWNGRADE_GRACE_PERIOD_DAYS);
-      const now = new Date();
-      const graceExpired = now >= graceEnd;
-      const daysLeft = graceExpired
-        ? 0
-        : Math.ceil((graceEnd.getTime() - now.getTime()) / (1000 * 60 * 60 * 24));
-
-      const limits = getEffectiveLimits("free");
-      const liveAgents = allAgents.filter((a) => !a.deletedAt);
-      const excessAgents = getFinitePlanLimitExcess(liveAgents.length, limits.maxAgents);
-      const excessMachines = getFinitePlanLimitExcess(machines.length, limits.maxMachines);
-      const excessChannels = getFinitePlanLimitExcess(channelsList.length, limits.maxChannels);
-
+    // ── 0b. Someone a full invite or join link turned away (task #10) ────
+    // The server lists them for owners, admins and the link's creator, and
+    // only while the seats are full: once a seat is added (or they join) the
+    // entry goes. An owner adds the seat; anyone else asks an owner for it.
+    // Dismissed per notice: a new one (the person turned away again later) shows.
+    for (const block of seatJoinBlocks) {
       out.push({
-        id: "plan-downgrade",
-        kind: graceExpired ? "error" : "warning",
-        icon: <AlertTriangle size={16} className="text-foreground" />,
-        // Dismissal fingerprint: anchor on which phase + how much of an excess
-        // remains so the notification re-surfaces if the user adds more resources
-        // or grace expires.
-        dismissalKey: `plan-downgrade:${graceExpired ? "expired" : "grace"}:${excessAgents}:${excessMachines}:${excessChannels}`,
-        title: formatMessage({
-          id: graceExpired
-            ? "layout.systemNotifications.planDowngradeExpiredTitle"
-            : "layout.systemNotifications.planDowngradeTitle",
-        }),
-        body: graceExpired ? (
-          <span>{formatMessage({ id: "layout.systemNotifications.planDowngradeExpiredBody" })}</span>
-        ) : (
-          <span>
-            {excessAgents > 0 && (
-              <>
-                {formatMessage({ id: "layout.systemNotifications.planAgentsOverLimit" }, { count: excessAgents })}{" "}
-              </>
-            )}
-            {excessMachines > 0 && (
-              <>
-                {formatMessage({ id: "layout.systemNotifications.planComputersOverLimit" }, { count: excessMachines })}{" "}
-              </>
-            )}
-            {excessChannels > 0 && (
-              <>
-                {formatMessage({ id: "layout.systemNotifications.planChannelsOverLimit" }, { count: excessChannels })}{" "}
-              </>
-            )}
-            <span>
-              {formatMessage(
-                { id: "layout.systemNotifications.planDaysLeft" },
-                { daysLeft, b: (chunks) => <span key="b" className="font-bold">{chunks}</span> },
-              )}
-            </span>
+        id: `seat-join-blocked:${block.id}`,
+        kind: "warning",
+        title: formatMessage(
+          { id: "layout.systemNotifications.seatJoinBlockedTitle" },
+          { server: server?.name ?? "", name: block.name },
+        ),
+        body: (
+          <span className="text-foreground-muted">
+            {formatMessage({ id: "layout.systemNotifications.seatJoinBlockedBody" }, { name: block.name })}
           </span>
         ),
         action: {
-          label: formatMessage({ id: "layout.systemNotifications.upgrade" }),
-          onClick: () => nav.toSettings("billing"),
+          label: formatMessage({
+            id: capabilities.manageBilling
+              ? "layout.systemNotifications.seatJoinAddSeats"
+              : "layout.systemNotifications.seatJoinAskOwner",
+          }),
+          onClick: () => void openSeatJoinDialog(block, seatJoinUsage),
           variant: "primary",
+          opensDialog: true,
         },
+        dismissalKey: `seat-join-blocked:${block.id}`,
       });
+    }
 
-      // Keep the configured plan name visible somewhere in the codebase so
-      // a future refactor doesn't drop the dependency without noticing.
-      void PLAN_CONFIG;
+    // ── 1. Plan downgrade ────────────────────────────────────────────────
+    // For a week after the server went back to Free, everyone on it is told
+    // what that took away. Only an owner, who can pay, gets the Upgrade button;
+    // the sentence stays within the item's two lines.
+    if (server && showsPlanDowngradeNotice(server)) {
+      const canUpgrade = capabilities.manageBilling;
+      out.push({
+        id: "plan-downgrade",
+        kind: "warning",
+        icon: <AlertTriangle size={16} className="text-foreground" />,
+        // A later downgrade is a new notice, even after this one was dismissed.
+        dismissalKey: `plan-downgrade:${server.planDowngradedAt}`,
+        title: formatMessage({ id: "billing.downgraded.title" }, { server: server.name }),
+        body: (
+          <span>
+            {canUpgrade && <PaywallShown gate="plan_downgraded" />}
+            {formatMessage(
+              { id: "billing.downgraded.whatChanged" },
+              { days: PLAN_CONFIG.free.limits.messageHistoryDays },
+            )}
+          </span>
+        ),
+        ...(canUpgrade
+          ? {
+              action: {
+                label: formatMessage({ id: "layout.systemNotifications.upgrade" }),
+                onClick: () => paywallUpgrade("plan_downgraded"),
+                variant: "primary" as const,
+              },
+            }
+          : {}),
+      });
     }
 
     // ── 1b. Joint channels over the free-server limit (contract v0.3 §18.8) ──
@@ -435,6 +473,7 @@ export function useSystemNotifications(surface: SystemNotificationSurface = "des
           ),
           body: (
             <span>
+              <PaywallShown gate={locked ? "joint_channel_read_only" : "joint_channel_over_limit"} />
               {formatMessage(
                 { id: locked ? "message.chatPanel.jointLocked" : "message.chatPanel.jointOverLimitGrace" },
                 { deadline },
@@ -443,7 +482,7 @@ export function useSystemNotifications(surface: SystemNotificationSurface = "des
           ),
           action: {
             label: formatMessage({ id: "layout.systemNotifications.upgrade" }),
-            onClick: () => nav.toSettings("billing"),
+            onClick: () => paywallUpgrade(locked ? "joint_channel_read_only" : "joint_channel_over_limit"),
             variant: "primary",
           },
         });
@@ -452,7 +491,17 @@ export function useSystemNotifications(surface: SystemNotificationSurface = "des
 
     // ── 2. Machine state notifications ─────────────────────────────────────────
     if (capabilities.viewMachines && !machineLoading && !agentLoading) {
-      const computerAttention = summarizeComputerAttention(machines);
+      const reinstallMachines = machinesNeedingReinstall(machines, currentUserId, capabilities);
+      // Computers the web can still upgrade, below a floor whose deadline is
+      // set (#proj-o11y:#19): their own entry on both surfaces, so the date is
+      // seen by people who never open a Computer page.
+      const upgradeByDeadline = machinesNeedingUpgradeByDeadline(machines, currentUserId, capabilities);
+      const reinstallIds = new Set([...reinstallMachines, ...upgradeByDeadline].map((m) => m.id));
+      // A machine listed in computer-reinstall or computer-upgrade-deadline is
+      // not counted again in the phone's computer-attention aggregate.
+      const computerAttention = summarizeComputerAttention(
+        reinstallIds.size > 0 ? machines.filter((m) => !reinstallIds.has(m.id)) : machines,
+      );
       const offlineMachines = machines.filter((m) => !m.isComputer && m.status === "offline");
       const liveAgents = allAgents.filter((a) => !a.deletedAt);
 
@@ -487,6 +536,18 @@ export function useSystemNotifications(surface: SystemNotificationSurface = "des
           },
         });
       }
+
+      out.push(...computerVersionNotificationEntries({
+        machines,
+        reinstallMachines,
+        upgradeByDeadline,
+        currentUserId,
+        capabilities,
+        dismissedNotificationKeys,
+        formatMessage,
+        formatDate,
+        toComputer: nav.toComputer,
+      }));
 
       if (offlineMachines.length > 0) {
         // Kind follows impact, not status: an offline machine without
@@ -567,7 +628,7 @@ export function useSystemNotifications(surface: SystemNotificationSurface = "des
             <span className="text-foreground-muted">
               {formatMessage(
                 { id: "layout.systemNotifications.machineDiskLowBody" },
-                { free: first.diskLow.free, percent: first.diskLow.freePercent },
+                { free: first.diskLow.free, total: first.diskLow.total },
               )}
             </span>
           ),
@@ -614,7 +675,7 @@ export function useSystemNotifications(surface: SystemNotificationSurface = "des
       out.push({
         id: "feedback-replies",
         kind: "info",
-        icon: <MessageSquare size={16} />,
+        icon: <FeedbackIcon width={16} height={16} />,
         title: formatMessage({ id: "layout.systemNotifications.feedbackRepliesTitle" }),
         body: formatMessage({ id: "layout.systemNotifications.feedbackRepliesBody" }, { count: feedbackUnread }),
         action: {
@@ -626,6 +687,8 @@ export function useSystemNotifications(surface: SystemNotificationSurface = "des
 
     return out;
   }, [
+    secondFactorRecovery,
+    appPermissionUpdates,
     feedbackUnread,
     server,
     machines,
@@ -633,8 +696,11 @@ export function useSystemNotifications(surface: SystemNotificationSurface = "des
     allAgents,
     agentLoading,
     channelsList,
-    capabilities.viewMachines,
+    capabilities,
+    currentUserId,
+    dismissedNotificationKeys,
     nav,
+    paywallUpgrade,
     pwaInstallVisible,
     pwaInstallBusy,
     handlePwaInstall,
@@ -642,7 +708,10 @@ export function useSystemNotifications(surface: SystemNotificationSurface = "des
     surface,
     formatMessage,
     formatDate,
+    locale,
     usageLimitAttention,
+    seatJoinBlocks,
+    seatJoinUsage,
     pendingJointInvites,
     acceptingJointInviteId,
     acceptJointInvite,

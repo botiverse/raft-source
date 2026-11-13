@@ -1,7 +1,9 @@
 import { create } from "zustand";
 import api from "../api/client";
+import { withSecondFactorStepUp } from "../components/settings/secondFactorStepUp";
 import { coalesce, useServerStore } from "./serverStore";
 import { registerServerReset } from "./serverResetRegistry";
+import { purgeStoredMachineKeys } from "./machineKeyStorage";
 import { emitStateTransitionTrace } from "../utils/stateTransitionTrace";
 import {
   applyMachineEvent,
@@ -14,7 +16,7 @@ import type {
 import type { CreatorSummary } from "./agentStore";
 import type { AcceptedComputerUpgrade } from "../utils/computerUpgradeInFlight";
 import { currentTimeMs, normalizeComputerReleaseNotes } from "@botiverse/raft-shared";
-import type { ComputerReleaseNotes, MachineDiskStatus } from "@botiverse/raft-shared";
+import type { ComputerReadiness, ReadinessAttention, ComputerInstallerRepairHint, ComputerReleaseNotes, ComputerUpgradeFailureHint, ComputerVersionGate, MachineDiskStatus, MachineMemoryStatus } from "@botiverse/raft-shared";
 
 export interface MachineRuntimeDetection {
   status: "pending" | "complete" | "incomplete";
@@ -41,6 +43,20 @@ export interface Machine {
   runtimeDetection?: MachineRuntimeDetection | null;
   hostname: string | null;
   os: string | null;
+  // Cloud / VM platform id (display name from HOST_PROVIDER_LABELS) and OS
+  // name + version ("Ubuntu 26.04"), as the Computer reports them; null =
+  // unknown, absent on older servers. The id stays a plain string: a newer
+  // Server may send one this bundle does not know, which then shows nothing.
+  hostProvider?: string | null;
+  osRelease?: string | null;
+  // Coarse machine kind ("laptop", "server", ... DEVICE_CLASSES) for the
+  // device icon; null = unknown, absent on older servers. A plain string for
+  // the same reason as hostProvider: an unknown kind draws the fallback.
+  deviceClass?: string | null;
+  // Same-physical-machine label for this response ("machine-1"), shared by
+  // the Computers that run on one host; null when alone, absent while
+  // computer_host_identity_v0 is off. Compare only, never display.
+  sameMachineGroup?: string | null;
   daemonVersion: string | null;
   // Run-kind: true when this machine is presented by an attached managed
   // Computer (server derives it from the computers↔machines link); false
@@ -51,12 +67,27 @@ export interface Machine {
   // True when this Computer row was attached by the current user. Raw daemons
   // and older server responses leave this false/absent.
   computerAttachedByCurrentUser?: boolean;
+  // The machine row's owner (`machines.userId`, sent with every machine row:
+  // machineReadModel.ts spreads it). It can differ from who attached the
+  // Computer, for a legacy machine someone else adopted; the server's revoke
+  // holds only this person to other people's agents (DeleteComputerDialog).
+  userId?: string;
+  /** #proj-raft-computer task #38: when an agent may have read this machine's current key (ISO). The server sends it to the owner only. */
+  credentialExposureFoundAt?: string | null;
   // Latest disk report while online; null/absent when offline, never
   // reported, or from an older server. See machineDiskLowPresentation.
   diskStatus?: MachineDiskStatus | null;
+  // Latest memory report while online; null/absent when offline, never
+  // reported, from an older Computer or an older server.
+  memoryStatus?: MachineMemoryStatus | null;
   // Public, server-scoped identity of the human who attached this managed
   // Computer. Null for departed creators and raw daemon rows.
   creator?: CreatorSummary | null;
+  // Computer owner v1 (#wg-rbac:#32): who Raft records as its owner, null =
+  // a Public Computer (absent on older servers: shown as Public). Not the
+  // connector (`creator`, `userId`); display and transfer only, no rights.
+  ownerUserId?: string | null;
+  owner?: CreatorSummary | null;
   // For a managed Computer: its own `@botiverse/raft-computer` version (0.0.x),
   // reported by the Computer and shown instead of the underlying daemon
   // version. Null/absent until reported.
@@ -72,6 +103,18 @@ export interface Machine {
   // Computer predates the web-driven path; null = version unknown. Both show
   // the greyed button + local upgrade hint (same fail-closed shape as the server).
   remoteUpgradeSupported?: boolean | null;
+  // The server's version floor verdict (#10343): null = at or above the floor
+  // (or no floor configured); absent = an older server that does not send it.
+  versionGate?: ComputerVersionGate | null;
+  // #proj-raft-computer:#68: the Computer's readiness and each runtime's
+  // (Computer → runtime → its machine login), trimmed for this viewer;
+  // absent from older servers.
+  readiness?: ComputerReadiness;
+  // #proj-raft-computer:#68: what a person must act on here (the server's
+  // composeReadinessAttention, trimmed for this viewer): the Computers
+  // "Needs attention" count, filter and dot. Absent from older servers: then
+  // the web shows nothing new.
+  attention?: ReadinessAttention;
   // Per-machine source-aware policy projection. This is the only authority for
   // target/copy; top-level latestComputerVersion is an artifact hint.
   computerBroadcastPolicy?: {
@@ -82,6 +125,10 @@ export interface Machine {
     policyRevision: string | null;
     reasonCode: string;
   } | null;
+  // #proj-raft-computer task #34: advisory, the Computer's installer state
+  // looks like it needs a repair run on the machine. Never changes whether
+  // Upgrade is offered; absent = an older server or Computer.
+  installerRepairHint?: ComputerInstallerRepairHint | null;
   lastHeartbeat: string | null;
   createdAt: string;
 }
@@ -105,10 +152,27 @@ export interface MachineUpgradeRequest {
   id: string;
   targetVersion: string;
   requestedAt: string;
-  state: "pending" | "done" | "failed" | "no_response";
+  /** `succeeded_late`: the target version connected only after the deadline
+   *  (shown like `done`); absent on older servers. */
+  state: "pending" | "done" | "failed" | "no_response" | "succeeded_late";
   observedVersion: string | null;
   reason: string | null;
   resolvedAt: string | null;
+  /** A failure only the install command on the machine gets past; absent on older servers. */
+  failureHint?: ComputerUpgradeFailureHint | null;
+  /** When the server gives up on the request (ISO), drain wait included; absent on older servers. */
+  deadlineAt?: string;
+  /**
+   * Reconciler step 13, only on a pending request whose Computer waits for
+   * its agents first: `draining` while they finish their work, `installing`
+   * once that wait is over. Absent (older servers, no drain): the plain copy.
+   */
+  phase?: "draining" | "installing";
+  /** The agents of THIS server still finishing their work, while `draining`.
+   *  Agents of the Computer's other servers wait too but are not listed. */
+  drainingAgentIds?: string[];
+  /** When the drain stops waiting (ISO). */
+  drainDeadlineAt?: string;
 }
 
 export interface ComputerOperationProgress {
@@ -127,7 +191,17 @@ export interface ComputerOperationProgress {
   error?: string;
 }
 
+/** Host facts a `machine:capabilities` push may carry; undefined = not in this push (keep). */
+export interface MachineCapabilitiesHostFacts {
+  hostProvider?: string | null;
+  osRelease?: string | null;
+  deviceClass?: string | null;
+  /** The server's version floor verdict (null = not gated). */
+  versionGate?: ComputerVersionGate | null;
+}
+
 export type MachineLoadStatus = "loading" | "loaded" | "error";
+export type AddMachineIntent = "default" | "another-computer";
 
 interface MachineState {
   machines: Machine[];
@@ -142,13 +216,12 @@ interface MachineState {
   selectedMachineId: string | null;
   showAddMachine: boolean;
   /**
-   * Machine a native host wants first in the sidebar's Computers list (the
-   * desktop pins "this device"; see sidebarMachineOrder.ts). Null on the web.
+   * What Add Computer was opened for: "default" asks which computer
+   * (AddMachineDialog); "another-computer" opens straight on the command
+   * flow for a different machine (This device's "Install on Another
+   * Computer" when this computer can't run Raft Computer).
    */
-  pinnedMachineId: string | null;
-  /** Transient: API key shown once after registration */
-  pendingApiKey: string | null;
-  pendingMachineId: string | null;
+  addMachineIntent: AddMachineIntent;
   /** Per-machine workspace scan results */
   machineWorkspaces: Record<string, MachineWorkspaceEntry[]>;
   machineWorkspacesLoading: Record<string, boolean>;
@@ -167,6 +240,10 @@ interface MachineState {
    *  the last loadMachines), so a transition seen live is the best anchor for
    *  "offline since". Client-only; never a server fact. */
   computerOfflineObservedAt: Record<string, number>;
+  /** Computers this tab holds offline only because the server refused a Start
+   *  with `machine_offline` (#triage:#206): no "offline since" is known for
+   *  them. Cleared by the next status event or machine list. Client-only. */
+  computerOfflineFromRefusal: Record<string, true>;
 
   loadMachines: () => Promise<void>;
   /** Ask a computer to re-detect its installed runtimes. Fresh list arrives via the capabilities push. */
@@ -180,11 +257,15 @@ interface MachineState {
     updates: { name?: string; description?: string | null },
   ) => Promise<void>;
   deleteMachine: (machineId: string) => Promise<void>;
+  /** Computer owner v1: set who Raft records as the owner (null = Public); the answer's machine replaces the row. */
+  setMachineOwner: (machineId: string, ownerUserId: string | null) => Promise<void>;
   applyMachineStatusEvent: (
     machineId: string,
     status: "online" | "offline",
     statusVersion?: number,
   ) => MachineTransition;
+  /** A Start refused with `machine_offline`: hold that Computer offline, with no time, until the machine list it reloads (or a status update) says. */
+  markMachineOfflineFromRefusal: (machineId: string) => void;
   requestMachineReconcile: (
     reason: "machine-updated" | "scheduled",
   ) => MachineTransition;
@@ -202,12 +283,11 @@ interface MachineState {
     computerVersion?: string | null,
     runtimeVersions?: Record<string, string>,
     runtimeDetection?: MachineRuntimeDetection | null,
+    host?: MachineCapabilitiesHostFacts,
   ) => void;
   rotateApiKey: (machineId: string) => Promise<string>;
-  clearPendingApiKey: () => void;
   setSelectedMachine: (machineId: string | null) => void;
-  setShowAddMachine: (show: boolean) => void;
-  setPinnedMachineId: (machineId: string | null) => void;
+  setShowAddMachine: (show: boolean, intent?: AddMachineIntent) => void;
   scanMachineWorkspaces: (machineId: string) => Promise<void>;
   deleteMachineWorkspace: (
     machineId: string,
@@ -229,6 +309,12 @@ interface MachineState {
   /** Computed helpers */
   hasOnlineMachine: () => boolean;
   hasAnyMachine: () => boolean;
+}
+
+/** The agent's Computer is known and offline (#triage:#206). Unknown (not loaded, a Guest) is not offline. */
+export function isMachineOffline(machines: readonly Machine[], machineId: string | null | undefined): boolean {
+  if (!machineId) return false;
+  return machines.find((machine) => machine.id === machineId)?.status === "offline";
 }
 
 export const useMachineStore = create<MachineState>((set, get) => {
@@ -266,9 +352,7 @@ export const useMachineStore = create<MachineState>((set, get) => {
     loadError: false,
     selectedMachineId: null,
     showAddMachine: false,
-    pinnedMachineId: null,
-    pendingApiKey: null,
-    pendingMachineId: null,
+    addMachineIntent: "default",
     machineWorkspaces: {},
     machineWorkspacesLoading: {},
     computerOperationProgress: {},
@@ -278,6 +362,7 @@ export const useMachineStore = create<MachineState>((set, get) => {
     computerUpgradeSubmitting: {},
     computerUpgradeAccepted: {},
     computerOfflineObservedAt: {},
+    computerOfflineFromRefusal: {},
     setComputerUpgradeAccepted: (machineId, request) => {
       set({
         computerUpgradeAccepted: {
@@ -343,7 +428,7 @@ export const useMachineStore = create<MachineState>((set, get) => {
             machines,
             latestComputerVersion,
           });
-          set({ latestComputerReleaseNotes, loading: false, loadStatus: "loaded", loadError: false });
+          set({ latestComputerReleaseNotes, loading: false, loadStatus: "loaded", loadError: false, computerOfflineFromRefusal: {} });
         } catch (err) {
           console.error("Failed to load machines:", err);
           if (useServerStore.getState().serverEpoch !== epoch) return;
@@ -360,19 +445,20 @@ export const useMachineStore = create<MachineState>((set, get) => {
     registerMachine: async (name: string) => {
       const serverId = useServerStore.getState().current?.id;
       if (!serverId) throw new Error("No server selected");
-      const { data } = await api.post(`/servers/${serverId}/machines`, {
+      // Two-step verification on: a web sign-in verifies first (403
+      // second_factor_step_up_required; server stepUpGate.ts).
+      const { data } = await withSecondFactorStepUp(() => api.post(`/servers/${serverId}/machines`, {
         name,
-      });
+      }), "other");
       const machine: Machine = {
         ...data.machine,
         runtimes: data.machine.runtimes || [],
       };
-      // Persist API key locally so the run command is always available
-      localStorage.setItem(`slock_machine_apikey_${machine.id}`, data.apiKey);
+      // The key is returned to the caller and never kept: not in
+      // localStorage, not in this store. Nothing renders it (setup commands
+      // carry the server slug and machine id, never the key).
       set((state) => ({
         machines: [...state.machines, machine],
-        pendingApiKey: data.apiKey,
-        pendingMachineId: machine.id,
       }));
       return { machine, apiKey: data.apiKey };
     },
@@ -399,21 +485,30 @@ export const useMachineStore = create<MachineState>((set, get) => {
       }));
     },
 
+    setMachineOwner: async (machineId, ownerUserId) => {
+      const serverId = useServerStore.getState().current?.id;
+      if (!serverId) throw new Error("No server selected");
+      const { data } = await api.put<{ machine: Machine | null }>(`/servers/${serverId}/machines/${machineId}/owner`, { ownerUserId });
+      const machine = data?.machine ?? null;
+      set((state) => ({
+        machines: state.machines.map((m) =>
+          m.id === machineId
+            ? machine ? { ...m, ...machine } : { ...m, ownerUserId, owner: ownerUserId === null ? null : m.owner }
+            : m,
+        ),
+      }));
+    },
+
     deleteMachine: async (machineId: string) => {
       const serverId = useServerStore.getState().current?.id;
       if (!serverId) throw new Error("No server selected");
       await api.delete(`/servers/${serverId}/machines/${machineId}`);
-      localStorage.removeItem(`slock_machine_apikey_${machineId}`);
       set((state) => ({
         machines: state.machines.filter((m) => m.id !== machineId),
         selectedMachineId:
           state.selectedMachineId === machineId
             ? null
             : state.selectedMachineId,
-        pendingApiKey:
-          state.pendingMachineId === machineId ? null : state.pendingApiKey,
-        pendingMachineId:
-          state.pendingMachineId === machineId ? null : state.pendingMachineId,
       }));
     },
 
@@ -430,6 +525,11 @@ export const useMachineStore = create<MachineState>((set, get) => {
         statusVersion,
       });
       if (transition.accepted) {
+        if (machineId in get().computerOfflineFromRefusal) {
+          const rest = { ...get().computerOfflineFromRefusal };
+          delete rest[machineId];
+          set({ computerOfflineFromRefusal: rest });
+        }
         const observed = get().computerOfflineObservedAt;
         if (status === "offline" && wasOnline) {
           set({ computerOfflineObservedAt: { ...observed, [machineId]: currentTimeMs() } });
@@ -440,6 +540,29 @@ export const useMachineStore = create<MachineState>((set, get) => {
         }
       }
       return transition;
+    },
+
+    markMachineOfflineFromRefusal: (machineId: string) => {
+      if (get().machines.find((machine) => machine.id === machineId)?.status !== "online") return;
+      // A status event with no version: the next real one wins. Unlike a live
+      // push, no "offline since" is recorded: the refusal says only that it is
+      // offline now, not since when.
+      dispatchMachineEvent({ kind: "status", machineId, status: "offline" });
+      set({ computerOfflineFromRefusal: { ...get().computerOfflineFromRefusal, [machineId]: true } });
+      // The server also answers machine_offline for transient misses (a replica handoff, a socket not ready yet), so
+      // this is a guess until the server's own list says otherwise (its recovery: reload machines). The reload
+      // replaces the row and clears the mark either way. If it fails twice, the guess is dropped: the row goes back
+      // to what this tab knew, so a Computer the server never confirmed offline doesn't stay offline here.
+      const stillGuessed = () => get().loadError && get().computerOfflineFromRefusal[machineId] === true;
+      void get().loadMachines()
+        .then(() => (stillGuessed() ? get().loadMachines() : undefined))
+        .then(() => {
+          if (!stillGuessed()) return;
+          dispatchMachineEvent({ kind: "status", machineId, status: "online" });
+          const rest = { ...get().computerOfflineFromRefusal };
+          delete rest[machineId];
+          set({ computerOfflineFromRefusal: rest });
+        });
     },
 
     requestMachineReconcile: (reason) =>
@@ -466,6 +589,7 @@ export const useMachineStore = create<MachineState>((set, get) => {
       computerVersion?: string | null,
       runtimeVersions?: Record<string, string>,
       runtimeDetection?: MachineRuntimeDetection | null,
+      host?: MachineCapabilitiesHostFacts,
     ) => {
       dispatchMachineEvent({
         kind: "capabilities",
@@ -477,20 +601,21 @@ export const useMachineStore = create<MachineState>((set, get) => {
         daemonVersion,
         computerVersion,
         runtimeDetection,
+        hostProvider: host?.hostProvider,
+        osRelease: host?.osRelease,
+        deviceClass: host?.deviceClass,
+        versionGate: host?.versionGate,
       });
     },
 
     rotateApiKey: async (machineId: string) => {
       const serverId = useServerStore.getState().current?.id;
       if (!serverId) throw new Error("No server selected");
-      const { data } = await api.post(
+      const { data } = await withSecondFactorStepUp(() => api.post(
         `/servers/${serverId}/machines/${machineId}/rotate-key`,
-      );
-      localStorage.setItem(`slock_machine_apikey_${machineId}`, data.apiKey);
+      ), "other");
       const newPrefix = data.apiKey.slice(0, 20);
       set((state) => ({
-        pendingApiKey: data.apiKey,
-        pendingMachineId: machineId,
         machines: state.machines.map((m) =>
           m.id === machineId ? { ...m, apiKeyPrefix: newPrefix } : m,
         ),
@@ -498,13 +623,9 @@ export const useMachineStore = create<MachineState>((set, get) => {
       return data.apiKey;
     },
 
-    clearPendingApiKey: () =>
-      set({ pendingApiKey: null, pendingMachineId: null }),
-
     setSelectedMachine: (machineId) => set({ selectedMachineId: machineId }),
 
-    setShowAddMachine: (show) => set({ showAddMachine: show }),
-    setPinnedMachineId: (machineId) => set((state) => (state.pinnedMachineId === machineId ? state : { pinnedMachineId: machineId })),
+    setShowAddMachine: (show, intent = "default") => set({ showAddMachine: show, addMachineIntent: show ? intent : "default" }),
 
     scanMachineWorkspaces: async (machineId: string) => {
       const serverId = useServerStore.getState().current?.id;
@@ -577,6 +698,10 @@ function domainStateToStorePatch(
   };
 }
 
+// Drop machine keys an older build cached in localStorage. Runs once per
+// load, when this store module is first evaluated.
+purgeStoredMachineKeys();
+
 // Reset all server-scoped state when the user switches servers.
 registerServerReset(() =>
   useMachineStore.setState({
@@ -588,13 +713,13 @@ registerServerReset(() =>
     loadError: false,
     selectedMachineId: null,
     showAddMachine: false,
-    pendingApiKey: null,
-    pendingMachineId: null,
+    addMachineIntent: "default",
     machineWorkspaces: {},
     machineWorkspacesLoading: {},
     computerOperationProgress: {},
     computerUpgradeSubmitting: {},
     computerUpgradeAccepted: {},
     computerOfflineObservedAt: {},
+    computerOfflineFromRefusal: {},
   }),
 );

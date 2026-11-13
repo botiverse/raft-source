@@ -135,8 +135,8 @@ test("parseLine: assistant.message with toolRequests emits tool_calls", () => {
       messageId: "msg-1",
       content: "I'll search for that.",
       toolRequests: [
-        { name: "send_message", arguments: { target: "#general", content: "hi" } },
-        { name: "read_history", arguments: { target: "#dev" } },
+        { toolCallId: "call_1", name: "send_message", arguments: { target: "#general", content: "hi" } },
+        { toolCallId: "call_2", name: "read_history", arguments: { target: "#dev" } },
       ],
       interactionId: "int-1",
       phase: "tool_use",
@@ -149,12 +149,50 @@ test("parseLine: assistant.message with toolRequests emits tool_calls", () => {
     kind: "tool_call",
     name: "send_message",
     input: { target: "#general", content: "hi" },
+    callId: "call_1",
   });
   assert.deepEqual(events[1], {
     kind: "tool_call",
     name: "read_history",
     input: { target: "#dev" },
+    callId: "call_2",
   });
+});
+
+// task #26: `tool.execution_complete` ends the request with the same
+// `toolCallId`; the driver used to ignore it, so every call stayed open.
+test("parseLine: tool.execution_complete ends the matching tool request", () => {
+  const driver = new CopilotDriver();
+  driver.parseLine(JSON.stringify({
+    type: "assistant.message",
+    data: { toolRequests: [{ toolCallId: "a", name: "bash", arguments: { command: "false" } }, { toolCallId: "b", name: "view", arguments: {} }] },
+  }));
+  assert.deepEqual(driver.parseLine(JSON.stringify({
+    type: "tool.execution_complete",
+    data: { toolCallId: "a", success: false, error: { message: "exit 2", code: "failure" }, shellExecution: { exitCode: 2 } },
+  })), [{ kind: "tool_output", name: "bash", callId: "a", ok: true, exitCode: 2 }], "a command that ran is a finished call");
+  assert.deepEqual(driver.parseLine(JSON.stringify({
+    type: "tool.execution_complete",
+    data: { toolCallId: "b", success: false, error: { message: "Permission denied", code: "denied" } },
+  })), [{ kind: "tool_output", name: "view", callId: "b", ok: false }]);
+  driver.parseLine(JSON.stringify({ type: "assistant.message", data: { toolRequests: [{ toolCallId: "t", name: "bash", arguments: {} }] } }));
+  assert.deepEqual(driver.parseLine(JSON.stringify({
+    type: "tool.execution_complete",
+    data: { toolCallId: "t", success: false, error: { message: "timed out", code: "timeout" }, shellExecution: { exitCode: 137 } },
+  })), [{ kind: "tool_output", name: "bash", callId: "t", ok: false, exitCode: 137 }], "a timed-out command did not run to its exit");
+  assert.deepEqual(driver.parseLine(JSON.stringify({
+    type: "tool.execution_complete",
+    data: { toolCallId: "advisor", success: true },
+  })), [], "a completion without a request (Copilot's advisor path) is dropped");
+});
+
+test("parseLine: an abort closes the calls Copilot will not complete", () => {
+  const driver = new CopilotDriver();
+  driver.parseLine(JSON.stringify({ type: "assistant.message", data: { toolRequests: [{ toolCallId: "a", name: "bash", arguments: {} }] } }));
+  assert.deepEqual(driver.parseLine(JSON.stringify({ type: "abort", data: { reason: "user" } })), [
+    { kind: "tool_output", name: "bash", callId: "a" },
+  ], "the outcome of an aborted call is unknown");
+  assert.deepEqual(driver.parseLine(JSON.stringify({ type: "tool.execution_complete", data: { toolCallId: "a", success: true } })), []);
 });
 
 test("parseLine: assistant.message without toolRequests emits nothing", () => {

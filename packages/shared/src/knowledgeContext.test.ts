@@ -2,8 +2,13 @@ import assert from "node:assert/strict";
 
 import {
   hasManualContextCapability,
+  hasPlanUpgradeCardCapability,
+  hasReminderServerAckCapability,
+  INBOX_ITEMS_CAPABILITY,
   MANUAL_CONTEXT_CAPABILITY,
   MANUAL_INDEX_COMMAND,
+  PLAN_UPGRADE_CARD_CAPABILITY,
+  REMINDER_SERVER_ACK_CAPABILITY,
   validateKnowledgeContext,
 } from "./knowledgeContext";
 
@@ -45,4 +50,25 @@ test("Manual context capability is an exact comma-delimited rollout marker", () 
   assert.equal(hasManualContextCapability(`read, ${MANUAL_CONTEXT_CAPABILITY}, tasks`), true);
   assert.equal(hasManualContextCapability("manual-context-v10"), false);
   assert.equal(hasManualContextCapability(undefined), false);
+});
+
+test("the plan:upgrade card capability is a versioned comma-delimited token, at its version or later", () => {
+  assert.equal(PLAN_UPGRADE_CARD_CAPABILITY, "action-card:plan:upgrade@1");
+  assert.equal(hasPlanUpgradeCardCapability(PLAN_UPGRADE_CARD_CAPABILITY), true);
+  assert.equal(hasPlanUpgradeCardCapability(`${MANUAL_CONTEXT_CAPABILITY}, ${PLAN_UPGRADE_CARD_CAPABILITY} ,guide-app:artifacts@3`), true);
+  assert.equal(hasPlanUpgradeCardCapability("action-card:plan:upgrade@2"), true, "a later version");
+  for (const header of [undefined, "", MANUAL_CONTEXT_CAPABILITY, "action-card:plan:upgrade", "action-card:plan:upgrade@0", "action-card:plan:upgrade@01", "action-card:plan:upgrade@1x", "guide-app:plan:upgrade@1"]) {
+    assert.equal(hasPlanUpgradeCardCapability(header), false, String(header));
+  }
+});
+
+test("RFC 081 D17: the reminder server-ack capability is a versioned comma-delimited token, at its version or later", () => {
+  assert.equal(REMINDER_SERVER_ACK_CAPABILITY, "reminder-server-ack@1");
+  assert.equal(hasReminderServerAckCapability(REMINDER_SERVER_ACK_CAPABILITY), true);
+  // As the daemon's proxy forwards it: appended to the CLI's own list.
+  assert.equal(hasReminderServerAckCapability(`${MANUAL_CONTEXT_CAPABILITY},${INBOX_ITEMS_CAPABILITY}, ${REMINDER_SERVER_ACK_CAPABILITY} `), true);
+  assert.equal(hasReminderServerAckCapability("reminder-server-ack@2"), true, "a later version");
+  for (const header of [undefined, null, 1, "", `${MANUAL_CONTEXT_CAPABILITY},${INBOX_ITEMS_CAPABILITY}`, "reminder-server-ack", "reminder-server-ack@0", "reminder-server-ack@01", "reminder-server-ack@1x", "x-reminder-server-ack@1", "reminder-server-ack@1;reminder"]) {
+    assert.equal(hasReminderServerAckCapability(header), false, String(header));
+  }
 });

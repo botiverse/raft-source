@@ -2,7 +2,7 @@ import { and, desc, eq, sql } from "drizzle-orm";
 import { getDb, type DatabaseExecutor } from "../db/index";
 import { serverAgreements, serverMembershipAgreementAudit } from "../db/schema";
 
-export type AgreementSource = "invite" | "join" | "request-access" | "admin-add";
+export type AgreementSource = "invite" | "join" | "request-access" | "admin-add" | "sso";
 export type AgreementSubjectType = "user" | "agent";
 
 export class AgreementRequiredError extends Error {

@@ -37,7 +37,7 @@ import type { WebhookPost } from "../services/appNotificationDeliveryService";
 import { traceAgentIdHash } from "../tracing/traceIdentity";
 import { withChannelDelivery } from "../test/orchestratorStub";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 __setAppWebhookEncryptionKeyForTests(Buffer.alloc(32, 7));
 
 type Delivery = { agentId: string; message: AgentMessage; options?: DeliverMessageOptions };

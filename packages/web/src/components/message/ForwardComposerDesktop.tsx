@@ -1,26 +1,22 @@
-import { DialogSurface, Field, FieldLabel, InputGroup, InputGroupAddon, InputGroupInput } from "@botiverse/raft-ui";
+import { Dialog, DialogTitle, Field, FieldLabel, InputGroup, InputGroupAddon, InputGroupInput, ScrollArea, TextLink } from "@botiverse/raft-ui";
+import type { DialogProps } from "@botiverse/raft-ui";
 import CloseButton from "../ui/CloseButton";
-import type { Dispatch, ReactNode, SetStateAction } from "react";
-import { useCallback } from "react";
+import type { Dispatch, KeyboardEvent, ReactNode, SetStateAction } from "react";
+import { useCallback, useRef } from "react";
 import { Search, X } from "lucide-react";
 import { useIntl } from "react-intl";
-import Modal from "../Modal";
-import ForwardedBundleCard from "./ForwardedBundleCard";
-import type { ForwardedBundleAttachmentSnapshot, ForwardedBundleMetadata } from "./ForwardedBundleCard";
-import MessageInput from "./MessageInput";
+import { NarrowDialogContent } from "../ui/NarrowDialog";
+import { isFromForeignLayer } from "../ui/useOverlayLayer";
+import type { ForwardSource } from "./forwardComposerModel";
+import { MessageInput } from "../../features/composer/MessageInput";
 import { COMPOSER_DOCK_CLASS } from "./composerHost";
 import SectionEyebrow from "../ui/SectionEyebrow";
+import { ICON_BAR_END_PULL } from "../ui/headEdges";
 
-// No-op close handler for the Modal while a send/join is in flight. Hoisted so
-// the JSX does not allocate a fresh function per render.
-function noopClose() {}
-
-// DS UI text link (Clear): ink, 1.5px underline, semibold.
-const FORWARD_TEXT_LINK_CLASS = "font-semibold text-foreground underline decoration-[1.5px] underline-offset-[3px]";
+type OpenChangeDetails = Parameters<NonNullable<DialogProps["onOpenChange"]>>[1];
 
 type Props = {
-  sourceMessageCount: number;
-  sourceLabelText: string;
+  source: ForwardSource;
   onClose: () => void;
   sending: boolean;
   joinInFlight: boolean;
@@ -32,19 +28,18 @@ type Props = {
   clearSelection: () => void;
   targetResults: ReactNode;
   warnings: ReactNode;
-  previewMetadata: ForwardedBundleMetadata;
-  onOpenAttachment: (attachment: ForwardedBundleAttachmentSnapshot) => void;
-  noteComposerChannelId: string;
+  openDetail: () => boolean;
   noteMentionChannelId?: string;
   noteMentionScopeChannelType?: "channel" | "private" | "joint" | "dm" | "thread" | null;
   submitDisabled: boolean;
   submitDisabledReason: string | null;
   sendForwardNote: (note: string) => Promise<void>;
+  /** Above the search: the server the destinations are from, where there is a choice. */
+  scope?: ReactNode;
 };
 
 export default function ForwardComposerDesktop({
-  sourceMessageCount,
-  sourceLabelText,
+  source,
   onClose,
   sending,
   joinInFlight,
@@ -56,17 +51,16 @@ export default function ForwardComposerDesktop({
   clearSelection,
   targetResults,
   warnings,
-  previewMetadata,
-  onOpenAttachment,
-  noteComposerChannelId,
+  openDetail,
   noteMentionChannelId,
   noteMentionScopeChannelType,
   submitDisabled,
   submitDisabledReason,
   sendForwardNote,
+  scope,
 }: Props) {
   const { formatMessage } = useIntl();
-  const sendLabel = formatMessage({ id: "message.forwardComposer.sendForward" });
+  const { sendLabel, note } = source;
   // Stable handler: the target search is a rui InputGroup control now, and an
   // inline arrow would be a new function prop on every render (react-perf gate).
   const handleSearchChange = useCallback((event: { target: { value: string } }) => {
@@ -75,20 +69,53 @@ export default function ForwardComposerDesktop({
     const trimmed = value.trim();
     if (trimmed) search(trimmed); else resetSearch();
   }, [setQuery, search, resetSearch]);
+  const popupRef = useRef<HTMLDivElement | null>(null);
+  const busy = sending || joinInFlight;
+  // Esc, × and a press on the scrim close it, except while a send or a join is out (they act on this dialog).
+  const handleOpenChange = useCallback((open: boolean, details: OpenChangeDetails) => {
+    if (open) return;
+    // A lightbox opened from the preview (a forwarded image) is outside this dialog's tree: its Esc and presses are its own.
+    if (busy || isFromForeignLayer(details.event, popupRef.current)) {
+      details.cancel();
+      return;
+    }
+    onClose();
+  }, [busy, onClose]);
+  // The dialog is a portal, so React would bubble its Escape on to what opened it (the Artifact viewer closes on
+  // Escape): mark it handled here. Base UI still closes the dialog on it; an Escape a child took first (the note's
+  // @ list) leaves it open (NarrowDialogContent).
+  const handleKeyDown = useCallback((event: KeyboardEvent<HTMLElement>) => {
+    if (event.key === "Escape" && !event.defaultPrevented) event.preventDefault();
+  }, []);
+  const title = source.title;
+  const closeLabel = formatMessage({ id: "message.forwardComposer.close" });
   return (
-    <Modal onClose={sending || joinInFlight ? noopClose : onClose} closeOnBackdrop>
-      {/* DS Dialog surface: raft-ui's DialogSurface on the raw Modal backdrop,
-          because the two-column picker is wider than raft-ui's confirm Dialog. */}
-      <DialogSurface className="h-[min(42rem,calc(100dvh-1rem))] w-[min(48rem,calc(100vw-1rem))] max-h-[calc(100dvh-1rem)] md:h-[min(clamp(30rem,72dvh,46rem),calc(100dvh-2rem))] md:w-[min(clamp(48rem,60vw,60rem),calc(100vw-2rem))]" data-testid="forward-composer-dialog">
-        <div className="flex min-h-14 shrink-0 items-center justify-between gap-3 border-b border-line-seam py-2 pl-5 pr-3">
-          <div className="min-w-0">
-            <h2 className="text-headline">{formatMessage({ id: "message.forwardComposer.title" })}</h2>
-            <p className="truncate text-caption text-foreground-hint">{formatMessage({ id: "message.forwardComposer.selectedFrom" }, { count: sourceMessageCount, source: sourceLabelText })}</p>
+    <Dialog open onOpenChange={handleOpenChange}>
+      {/* raft-ui Dialog, sized by hand: the two-column picker is wider than its sizes. Focus starts in the search
+          (autoFocus), as before. */}
+      <NarrowDialogContent
+        ref={popupRef}
+        narrow="centered"
+        className="h-[min(42rem,calc(100dvh-1rem))] w-[min(48rem,calc(100vw-1rem))] max-w-none max-h-[calc(100dvh-1rem)] md:h-[min(clamp(30rem,72dvh,46rem),calc(100dvh-2rem))] md:w-[min(clamp(48rem,60vw,60rem),calc(100vw-2rem))]"
+        testId="forward-composer-dialog"
+        onKeyDown={handleKeyDown}
+        header={null}
+        title={title}
+        closeLabel={closeLabel}
+      >
+        {/* A dialog's bar: with a mouse one line at the header height (raft-ui
+            header-height, 44), the summary beside the title; on a touch screen
+            the summary keeps its own line. */}
+        <div className="flex min-h-14 shrink-0 items-center justify-between gap-3 border-b border-line-seam px-(--surface-inset) py-2 md:pointer-fine:min-h-(--header-height) md:pointer-fine:py-0">
+          <div className="min-w-0 md:pointer-fine:flex md:pointer-fine:items-baseline md:pointer-fine:gap-2">
+            <DialogTitle className="text-headline md:pointer-fine:shrink-0">{title}</DialogTitle>
+            {source.summary ? <p className="truncate text-caption text-foreground-hint" data-testid="forward-composer-summary">{source.summary}</p> : null}
           </div>
-          <CloseButton type="button"   onClick={onClose} disabled={sending || joinInFlight} aria-label={formatMessage({ id: "message.forwardComposer.close" })}><X size={16} /></CloseButton>
+          <CloseButton type="button" className={ICON_BAR_END_PULL} onClick={onClose} disabled={busy} aria-label={closeLabel}><X size={16} /></CloseButton>
         </div>
         <div className="flex min-h-0 flex-1 flex-col gap-0 md:grid md:grid-cols-[clamp(19rem,24vw,22rem)_minmax(0,1fr)]">
           <div className="flex max-h-[min(34dvh,13rem)] shrink-0 flex-col border-b border-line-seam p-3 md:h-full md:max-h-none md:min-h-0 md:border-b-0 md:border-r">
+            {scope ? <div className="mb-2 flex min-w-0 shrink-0">{scope}</div> : null}
             <InputGroup className="mb-2">
               <InputGroupAddon>
                 <Search size={14} aria-hidden="true" />
@@ -104,20 +131,26 @@ export default function ForwardComposerDesktop({
             </InputGroup>
             <SectionEyebrow as="div" className="mb-1 flex h-6 shrink-0 items-center justify-between px-1">
               <span data-testid="forward-selected-count">{formatMessage({ id: "message.forwardComposer.selectedCount" }, { count: selectedCount })}</span>
-              {selectedCount > 0 && <button type="button" onClick={clearSelection} disabled={joinInFlight} className={FORWARD_TEXT_LINK_CLASS}>{formatMessage({ id: "message.forwardComposer.clear" })}</button>}
+              {selectedCount > 0 && <TextLink onClick={clearSelection} disabled={joinInFlight}>{formatMessage({ id: "message.forwardComposer.clear" })}</TextLink>}
             </SectionEyebrow>
-            <div className="min-h-0 flex-1 space-y-0.5 overflow-y-auto">{targetResults}</div>
+            {/* Each target row takes focus itself, so the list is no tab stop. */}
+            <ScrollArea tabIndex={-1} className="min-h-0 flex-1" contentClassName="stack-y-0.5">{targetResults}</ScrollArea>
           </div>
           <div className="flex min-w-0 min-h-0 flex-1 flex-col">
-            <div className="min-h-0 flex-1 overflow-y-auto p-3">
+            <ScrollArea
+              role="region"
+              aria-label={formatMessage({ id: "message.forwardComposer.messagePreview" })}
+              className="min-h-0 flex-1"
+              contentClassName="p-3"
+            >
               {warnings}
-              <div className="mb-2"><ForwardedBundleCard metadata={previewMetadata} onOpenAttachment={onOpenAttachment} fullWidth /></div>
-            </div>
+              <div className="mb-2">{source.renderPreview("desktop", openDetail)}</div>
+            </ScrollArea>
             <div className={COMPOSER_DOCK_CLASS} data-testid="forward-desktop-note-actions">
               <Field>
                 <FieldLabel size="sm" htmlFor="forward-desktop-note">{formatMessage({ id: "message.forwardComposer.optionalNote" })}</FieldLabel>
                 <MessageInput
-                  channelId={noteComposerChannelId}
+                  channelId={note.draftKey}
                   channelName={formatMessage({ id: "message.forwardComposer.optionalNote" })}
                   placeholder={formatMessage({ id: "message.forwardComposer.addNotePlaceholder" })}
                   variant="compact"
@@ -132,13 +165,14 @@ export default function ForwardComposerDesktop({
                   submitTitleOverride={sendLabel}
                   submitLabelOverride={sendLabel}
                   textareaId="forward-desktop-note"
-                  maxLength={4000}
+                  maxLength={note.maxLength}
+                  plainText={note.plainText}
                 />
               </Field>
             </div>
           </div>
         </div>
-      </DialogSurface>
-    </Modal>
+      </NarrowDialogContent>
+    </Dialog>
   );
 }

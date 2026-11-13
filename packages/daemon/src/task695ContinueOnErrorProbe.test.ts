@@ -2,7 +2,8 @@
 // skipped in ordinary PR/push/scheduled runs and fails only when the manual
 // workflow input is explicitly enabled. One-command SOP (replace <ref>):
 //   gh workflow run test.yml --ref <ref> -f unit_daemon_failure_probe=true
-// Expected: unit-daemon reports raw outcome=failure and unit-daemon-gate is RED.
+// Expected: the unit-daemon job (its test step) and unit-daemon-gate are both
+// RED, and unit-daemon reports outcome=failure.
 import assert from "node:assert/strict";
 
 test(

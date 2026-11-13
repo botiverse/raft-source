@@ -325,7 +325,10 @@ const CHANNEL_BORN_READ_PRODUCERS: readonly RequiresCausalActorProducer[] = [
   "channel.agent_membership",
   "channel.human_membership",
   "channel.rename",
+  "channel.announcement",
   "channel.archive",
+  "channel.joint_disconnect",
+  "channel.joint_connect",
   "channel.unarchive",
   "task.created_summary",
   "task.assignment_receipt",
@@ -408,6 +411,45 @@ test("task status change born-reads the acting user's own thread row while anoth
 });
 
 // ---------------------------------------------------------------------------
+// assistant.delegated_receipt (RFC 077) → born-read only for its causal actor,
+// the assistant that sent as the owner; the owner it is written for stays
+// unread (and the assistant is never a delivery target of its own receipt).
+// ---------------------------------------------------------------------------
+test("a delegated-send receipt is born-read only for the assistant that caused it; the owner stays unread", async ({ db: _database }) => {
+  const { owner, member, agent, channel } = await seedSurface();
+  const system = await broadcastSystemMessage(createIoStub(), agentOrchestratorStub, channel.id, "Sent for you in #born-read-channel: \"hi\"", {
+    inboxFactPolicy: {
+      mode: "record",
+      producer: "assistant.delegated_receipt",
+      reason: "paired born-read coverage for assistant.delegated_receipt",
+      causalActor: { type: "agent", id: agent.id },
+    },
+    targetAgentIds: [],
+  });
+  assert.equal((await factFor(system.id, "user", owner.id)).unreadEligible, true, "the owner must see the receipt unread");
+  assert.equal((await factFor(system.id, "user", member.id)).unreadEligible, true, "another human stays unread");
+});
+
+// ---------------------------------------------------------------------------
+// assistant.stopped_by_admin → born-read only for the admin who stopped the
+// assistant; its owner, the reader the notice is for, stays unread.
+// ---------------------------------------------------------------------------
+test("an admin-stopped-assistant notice is born-read only for the admin; the owner stays unread", async ({ db: _database }) => {
+  const { owner, member, channel } = await seedSurface();
+  const system = await broadcastSystemMessage(createIoStub(), agentOrchestratorStub, channel.id, "An admin is stopping your assistant.", {
+    inboxFactPolicy: {
+      mode: "record",
+      producer: "assistant.stopped_by_admin",
+      reason: "paired born-read coverage for assistant.stopped_by_admin",
+      causalActor: { type: "user", id: member.id },
+    },
+    targetAgentIds: [],
+  });
+  assert.equal((await factFor(system.id, "user", member.id)).unreadEligible, false, "the admin who stopped it is born-read");
+  assert.equal((await factFor(system.id, "user", owner.id)).unreadEligible, true, "the owner must see the notice unread");
+});
+
+// ---------------------------------------------------------------------------
 // action_card.result_reply → born-read for the confirming human; the @mentioned
 // preparing agent (the card author, following the card thread) stays unread.
 // ---------------------------------------------------------------------------
@@ -467,6 +509,8 @@ const COVERED_BORN_READ_PRODUCERS = new Set<ProductionSystemMessageProducer>([
   ...CHANNEL_BORN_READ_PRODUCERS,
   "task.lifecycle_thread",
   "action_card.result_reply",
+  "assistant.delegated_receipt",
+  "assistant.stopped_by_admin",
 ]);
 
 test("every registry born-read producer has paired suppression coverage in this file", () => {

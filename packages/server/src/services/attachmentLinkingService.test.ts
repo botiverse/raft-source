@@ -6,6 +6,7 @@ import type { Database } from "../db/index";
 import { migratePglite } from "../db/pgliteMigrations";
 import * as schema from "../db/schema";
 import { attachmentObjects, attachments, channels, messages, servers, users } from "../db/schema";
+import { insertAttachmentsWithObjects } from "../test/attachmentObjectFixture";
 import {
   AttachmentLinkError,
   getAttachmentsForMessagesWithExecutor,
@@ -87,7 +88,7 @@ test("ordered attachment helper persists request ordinals and isolates batch rea
     const a2 = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2";
     const b1 = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb1";
     const b2 = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb2";
-    await db.insert(attachments).values([
+    await insertAttachmentsWithObjects(db, [
       attachmentValue(a1, OWNER_ID, "a1.png", new Date("2026-07-24T00:00:00.000Z")),
       attachmentValue(a2, OWNER_ID, "a2.png", new Date("2026-07-24T00:00:01.000Z")),
       attachmentValue(b1, OWNER_ID, "b1.png", new Date("2026-07-24T00:00:02.000Z")),
@@ -126,14 +127,13 @@ test("joined attachment reads use active object bytes and exclude revoked projec
       mimeType: "application/pdf",
       sizeBytes: 321,
     });
-    await db.insert(attachments).values([
+    // The fixture's projection-side metadata (image/png, 100 bytes) is never
+    // stored; only the bound object's is read.
+    await insertAttachmentsWithObjects(db, [
       {
         ...attachmentValue(liveId, OWNER_ID, "projection-name.pdf", new Date()),
         objectId,
         messageId: MESSAGE_A_ID,
-        storageKey: "legacy/stale.bin",
-        mimeType: "application/octet-stream",
-        sizeBytes: 1,
       },
       {
         ...attachmentValue(revokedId, OWNER_ID, "revoked.pdf", new Date()),
@@ -156,6 +156,22 @@ test("joined attachment reads use active object bytes and exclude revoked projec
   }
 });
 
+test("a projection without an object cannot be stored", async () => {
+  const { client, db } = await createFixture();
+  try {
+    const { mimeType: _mimeType, sizeBytes: _sizeBytes, storageKey: _storageKey, ...projection } =
+      attachmentValue("99999999-9999-4999-8999-99999999999a", OWNER_ID, "objectless.png", new Date());
+    await assert.rejects(db.insert(attachments).values({
+      ...projection,
+      objectId: null as unknown as string,
+      messageId: MESSAGE_A_ID,
+      messagePosition: 1,
+    }));
+  } finally {
+    await client.close();
+  }
+});
+
 test("ordered attachment helper rejects duplicate, missing, and foreign sets with zero writes", async () => {
   const { client, db } = await createFixture();
   try {
@@ -163,7 +179,7 @@ test("ordered attachment helper rejects duplicate, missing, and foreign sets wit
     const valid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa4";
     const foreign = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa5";
     const missing = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa6";
-    await db.insert(attachments).values([
+    await insertAttachmentsWithObjects(db, [
       attachmentValue(duplicate, OWNER_ID, "duplicate.png", new Date("2026-07-24T00:00:00.000Z")),
       attachmentValue(valid, OWNER_ID, "valid.png", new Date("2026-07-24T00:00:01.000Z")),
       attachmentValue(foreign, OTHER_ID, "foreign.png", new Date("2026-07-24T00:00:02.000Z")),
@@ -207,7 +223,7 @@ test("ordered attachment replay is exact and cross-message or reordered reuse is
   try {
     const first = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa7";
     const second = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa8";
-    await db.insert(attachments).values([
+    await insertAttachmentsWithObjects(db, [
       attachmentValue(first, OWNER_ID, "first.png", new Date("2026-07-24T00:00:00.000Z")),
       attachmentValue(second, OWNER_ID, "second.png", new Date("2026-07-24T00:00:01.000Z")),
     ]);

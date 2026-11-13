@@ -5,7 +5,7 @@
 // latest messages, within GLIMPSE_PUSH_BUDGET_CHARS. Read with
 // `consume=false`: an attachment is not a read, so read positions stay.
 import type { SendAttachment, ThreadWindowMessage } from "@botiverse/raft-shared";
-import { isLocalStateAgentId, parseRaftRefTarget } from "@botiverse/raft-shared/src/agentCliSurface";
+import { isLocalStateAgentId, parseRaftRefTarget, windowAttachmentCount } from "@botiverse/raft-shared/src/agentCliSurface";
 
 import type { createAgentApiSurfaceClient } from "../agentApiPath";
 import { enabledContextSignal } from "./passiveEngine";
@@ -44,6 +44,7 @@ export async function fetchSendAttachment(
       sender: m.sender_name ?? null,
       timestamp: m.timestamp ?? null,
       content: m.content ?? "",
+      attachmentCount: windowAttachmentCount(m),
     }));
     return {
       target,

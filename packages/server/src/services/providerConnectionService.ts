@@ -32,6 +32,7 @@ import {
 import { createSafeFetch, validateManagedMcpEndpoint } from "./managedMcpGateway";
 import { isProviderProbeEnforcementEnabled } from "./providerConnectionFeature";
 import { recordIntegrationAuditEvent } from "./integrationAuditService";
+import { bumpProviderConnectionAgentsConfigRevision } from "./agentConfigRevision";
 
 const KEY_ENV = "SLOCK_PROVIDER_CREDENTIAL_KEY";
 const SECRET_VERSION = "v1";
@@ -564,6 +565,8 @@ export async function updateProviderConnection(input: {
       eq(agentProviderConnections.serverId, input.serverId),
       eq(agentProviderConnections.connectionId, input.connectionId),
     ));
+    // Reconciler step 11b: a new key or endpoint changes the launch of every agent on it.
+    if (shouldResetStatus) await bumpProviderConnectionAgentsConfigRevision(tx, input.serverId, input.connectionId);
 
     const changedFields = [
       ...(nameChanged ? ["name"] : []),
@@ -653,6 +656,7 @@ export async function rotateProviderConnectionCredential(input: {
       eq(agentProviderConnections.serverId, input.serverId),
       eq(agentProviderConnections.connectionId, input.connectionId),
     ));
+    await bumpProviderConnectionAgentsConfigRevision(tx, input.serverId, input.connectionId);
     await recordIntegrationAuditEvent({
       serverId: input.serverId,
       eventType: "provider_connection.credential_rotated",

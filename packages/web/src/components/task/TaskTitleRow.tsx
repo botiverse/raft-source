@@ -29,7 +29,7 @@ export function TaskTitleRow({ index, title, placeholder, removable, onChange, o
       {/* Removing a draft row is undoable typing, not an irreversible
           consequence: a borderless icon button, not the red sticker. */}
       {removable && (
-        <Button size="icon-sm"
+        <Button size="icon-md"
           variant="ghost"
           type="button"
           onClick={handleRemove}

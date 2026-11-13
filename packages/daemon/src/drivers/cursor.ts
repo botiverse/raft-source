@@ -6,6 +6,7 @@ import path from "node:path";
 import { clearClockTimeout, CURSOR_MODEL_DETECTION_TIMEOUT_MS, hydrateRuntimeConfig, setClockTimeout, runtimeConfigToLaunchFields, runtimeModelSourceOutcomeFromSet, type AgentConfig, type RuntimeModelInfo, type RuntimeModelSet, type RuntimeModelSourceOutcome , type AxSurfaceText } from "@botiverse/raft-shared";
 import type { RuntimeDriver, SpawnContext, SpawnResult, ParsedEvent } from "./types";
 import { buildCliTransportSystemPrompt, prepareCliTransport } from "./cliTransport";
+import { OpenToolCalls } from "./openToolCalls";
 import { withWindowsUserEnvironment, type ProbeDeps } from "./probe";
 import { resolveRuntimeLaunch, type DirectLaunch, type WindowsLaunchDeps } from "./windowsLaunch";
 import {
@@ -43,7 +44,36 @@ export function buildCursorManagedMcpConfig(
   };
 }
 
-export function buildCursorArgs(ctx: SpawnContext): string[] {
+/**
+ * Prompts longer than this go to cursor-agent on stdin instead of as the last
+ * argv entry (`cursor-agent --print` reads stdin when it gets no prompt
+ * argument and stdin is not a TTY).
+ *
+ * Windows caps a whole command line at 32,767 UTF-16 units and quoting can
+ * double backslashes and quotes (plus node.exe/index.js paths and flags), so
+ * first turns carrying the standing prompt failed with `spawn ENAMETOOLONG`
+ * (#triage:#309). Linux caps one argument at 128 KiB (E2BIG). Short prompts keep using argv, so an old Cursor CLI that
+ * cannot read stdin only fails where argv already could not carry the prompt.
+ */
+export const CURSOR_ARGV_PROMPT_LIMIT_WIN32_CHARS = 6_000;
+export const CURSOR_ARGV_PROMPT_LIMIT_POSIX_BYTES = 64 * 1024;
+
+export function cursorPromptViaStdin(prompt: string, platform: NodeJS.Platform = process.platform): boolean {
+  return platform === "win32"
+    ? prompt.length > CURSOR_ARGV_PROMPT_LIMIT_WIN32_CHARS
+    : Buffer.byteLength(prompt, "utf8") > CURSOR_ARGV_PROMPT_LIMIT_POSIX_BYTES;
+}
+
+/** The argv and, for a long prompt, the stdin text of one Cursor turn: the prompt is in exactly one of them. */
+export function buildCursorLaunchInput(
+  ctx: SpawnContext,
+  platform: NodeJS.Platform = process.platform,
+): { args: string[]; stdinPrompt: string | null } {
+  const viaStdin = cursorPromptViaStdin(ctx.prompt, platform);
+  return { args: buildCursorArgs(ctx, platform), stdinPrompt: viaStdin ? ctx.prompt : null };
+}
+
+export function buildCursorArgs(ctx: SpawnContext, platform: NodeJS.Platform = process.platform): string[] {
   const args = [
     "--print",
     "--output-format", "stream-json",
@@ -59,7 +89,7 @@ export function buildCursorArgs(ctx: SpawnContext): string[] {
     args.push("--resume", ctx.config.sessionId);
   }
 
-  args.push(ctx.prompt);
+  if (!cursorPromptViaStdin(ctx.prompt, platform)) args.push(ctx.prompt);
   return args;
 }
 
@@ -126,10 +156,12 @@ export function resolveCursorLaunch(args: string[], deps: CursorLaunchDeps = {})
 /**
  * Cursor CLI driver.
  *
- * Uses `--print --output-format stream-json` which emits the same NDJSON
- * event format as Claude Code (system/init, assistant, result).
+ * Uses `--print --output-format stream-json`, NDJSON events: system/init,
+ * assistant (text), tool_call (started/completed, paired by `call_id`),
+ * connection, result.
  *
  * No stdin streaming support — each turn is a separate process invocation.
+ * A long prompt is written to stdin once and stdin closed (cursorPromptViaStdin).
  */
 export class CursorDriver implements RuntimeDriver {
   readonly id = "cursor";
@@ -145,6 +177,9 @@ export class CursorDriver implements RuntimeDriver {
   } as const;
   readonly session = {
     recovery: "resume_or_fresh",
+    // Emits the compaction events.
+    compaction: "reported",
+    compactionFailure: "does_not_stick",
   } as const;
   readonly model = {
     detectedModelsVerifiedAs: "launchable",
@@ -153,10 +188,15 @@ export class CursorDriver implements RuntimeDriver {
   readonly supportsStdinNotification = false;
   readonly busyDeliveryMode = "none" as const;
 
+  private readonly openTools = new OpenToolCalls();
+
   async spawn(ctx: SpawnContext): Promise<SpawnResult> {
+    this.openTools.clear();
     const managedMcp = await prepareManagedMcpRuntimeProxy({
       agentId: ctx.agentId,
       launchId: ctx.launchId,
+      processInstanceId: ctx.processInstanceId,
+      readTurnOrigin: ctx.readTurnOrigin,
       serverUrl: ctx.config.serverUrl,
       agentCredentialKey: ctx.config.agentCredentialKey,
     });
@@ -169,7 +209,7 @@ export class CursorDriver implements RuntimeDriver {
       });
     }
 
-    const args = buildCursorArgs(ctx);
+    const { args, stdinPrompt } = buildCursorLaunchInput(ctx);
 
     const spawnEnv = await buildCursorSpawnEnv(ctx);
 
@@ -182,6 +222,8 @@ export class CursorDriver implements RuntimeDriver {
       env: launch.env ?? spawnEnv,
       shell: false,
     });
+    // spawnRuntimeChild already guards stdin errors (EPIPE if the child exits first).
+    if (stdinPrompt !== null) proc.stdin?.end(stdinPrompt);
 
     return { process: proc };
   }
@@ -215,15 +257,41 @@ export class CursorDriver implements RuntimeDriver {
               events.push({ kind: "thinking", text: block.thinking });
             } else if (block.type === "text" && block.text) {
               events.push({ kind: "text", text: block.text });
-            } else if (block.type === "tool_use") {
-              events.push({ kind: "tool_call", name: block.name || "unknown_tool", input: block.input });
             }
           }
         }
         break;
       }
 
+      case "tool_call": {
+        // task #26: Cursor reports each call as its own `tool_call` event,
+        // `started` then `completed`, paired by `call_id`; assistant content
+        // carries only text.
+        const callId = typeof event.call_id === "string" ? event.call_id : "";
+        if (!callId) break;
+        if (event.subtype === "started") {
+          const call = cursorToolCall(event.tool_call);
+          if (this.openTools.start(callId, call.name)) {
+            events.push({ kind: "tool_call", name: call.name, input: call.input, callId });
+          }
+        } else if (event.subtype === "completed") {
+          const name = this.openTools.end(callId);
+          if (name !== undefined) events.push({ kind: "tool_output", name, callId, ...cursorToolOutcome(event.tool_call) });
+        }
+        break;
+      }
+
+      case "connection":
+        // A call started before a reconnect never gets its completion.
+        if (event.subtype === "reconnecting") {
+          for (const call of this.openTools.drain()) {
+            events.push({ kind: "tool_output", name: call.name, callId: call.callId });
+          }
+        }
+        break;
+
       case "result": {
+        this.openTools.clear();
         const subtype = typeof event.subtype === "string" ? event.subtype : "success";
         if (subtype !== "success" || event.is_error) {
           const parts: string[] = [];
@@ -413,4 +481,88 @@ export function runCursorModelsCommandAsync(options: CursorModelsProbeOptions = 
     child.on("error", (error) => finish({ status: null, stdout: output(), error }));
     child.on("close", (status) => finish({ status, stdout: output() }));
   });
+}
+
+/** Cursor's tool kinds, named the way the shared tool display knows them. */
+const CURSOR_TOOL_NAMES: Record<string, string> = {
+  shell: "Shell",
+  read: "Read",
+  write: "Write",
+  edit: "Edit",
+  grep: "Grep",
+  glob: "Glob",
+  webFetch: "WebFetch",
+  webSearch: "WebSearch",
+};
+
+type JsonObject = Record<string, unknown>;
+
+function asJsonObject(value: unknown): JsonObject | null {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as JsonObject) : null;
+}
+
+function nonEmptyString(value: unknown): string | undefined {
+  return typeof value === "string" && value ? value : undefined;
+}
+
+/**
+ * The call inside Cursor's `tool_call` object: one `<kind>ToolCall: { args,
+ * result? }` entry (`shellToolCall`, `readToolCall`, `mcpToolCall`, ...), or
+ * the older `function: { name, arguments }` form.
+ */
+function cursorToolEntry(toolCall: unknown): { kind: string; body: JsonObject } | null {
+  for (const [key, value] of Object.entries(asJsonObject(toolCall) ?? {})) {
+    const body = asJsonObject(value);
+    if (!body) continue;
+    if (key.endsWith("ToolCall")) return { kind: key.slice(0, -"ToolCall".length), body };
+    if (key === "function") return { kind: "function", body };
+  }
+  return null;
+}
+
+function cursorToolCall(toolCall: unknown): { name: string; input: unknown } {
+  const entry = cursorToolEntry(toolCall);
+  if (!entry) return { name: "unknown_tool", input: {} };
+  if (entry.kind === "function") {
+    let input: unknown = entry.body.arguments ?? {};
+    if (typeof input === "string") {
+      try {
+        input = JSON.parse(input);
+      } catch {
+        input = { arguments: input };
+      }
+    }
+    return { name: nonEmptyString(entry.body.name) ?? "unknown_tool", input };
+  }
+  const args = asJsonObject(entry.body.args) ?? {};
+  if (entry.kind === "mcp") {
+    return { name: nonEmptyString(args.toolName) ?? nonEmptyString(args.name) ?? "mcp", input: args.args ?? args };
+  }
+  return { name: CURSOR_TOOL_NAMES[entry.kind] ?? entry.kind, input: args };
+}
+
+/**
+ * A completed call's outcome. `result` holds one variant: `success`, or a
+ * failure such as `rejected` or `permissionDenied`. A shell command that ran
+ * and exited non-zero is `failure` with its exit code, which is a finished
+ * command rather than a failed call; one killed or aborted is not. Zero values
+ * may be left out of Cursor's JSON, so a shell `success` without `exitCode`
+ * exited 0; a `failure` with neither is left unknown.
+ */
+function cursorToolOutcome(toolCall: unknown): { ok?: boolean; exitCode?: number } {
+  const entry = cursorToolEntry(toolCall);
+  const result = asJsonObject(entry?.body.result);
+  if (!entry || !result) return {};
+  const variant = Object.keys(result)[0];
+  const detail = asJsonObject(variant ? result[variant] : undefined) ?? {};
+  if (entry.kind === "shell" && (variant === "success" || variant === "failure")) {
+    // A command killed by a signal, OOM-killed or aborted did not run to its exit.
+    if (detail.aborted === true || nonEmptyString(detail.signal) || detail.oomKill === true || detail.oom_kill === true) {
+      return { ok: false, ...(Number.isInteger(detail.exitCode) ? { exitCode: detail.exitCode as number } : {}) };
+    }
+    const exitCode = Number.isInteger(detail.exitCode) ? (detail.exitCode as number) : variant === "success" ? 0 : undefined;
+    return exitCode !== undefined ? { ok: true, exitCode } : {};
+  }
+  if (variant === "success") return { ok: !(entry.kind === "mcp" && detail.isError === true) };
+  return { ok: false };
 }

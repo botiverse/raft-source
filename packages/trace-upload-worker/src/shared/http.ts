@@ -131,11 +131,21 @@ export function jsonResponse(body: unknown, status = 200, headers: Record<string
   });
 }
 
+/**
+ * Raft Desktop's page origin: it serves the web app from its own app://raft
+ * scheme, and its feedback reports and web traces come from there. Allowed
+ * wherever an allowlist is configured, exactly this one origin.
+ */
+export const RAFT_DESKTOP_APP_ORIGIN = "app://raft";
+
 function configuredWebCorsOrigins(env: TraceUploadWorkerEnv): string[] {
-  return (env.TRACE_WEB_CORS_ORIGIN ?? "")
+  const origins = (env.TRACE_WEB_CORS_ORIGIN ?? "")
     .split(",")
     .map((origin) => origin.trim())
     .filter(Boolean);
+  // No allowlist answers `*`, which already covers the desktop.
+  if (origins.length === 0 || origins.includes(RAFT_DESKTOP_APP_ORIGIN)) return origins;
+  return [...origins, RAFT_DESKTOP_APP_ORIGIN];
 }
 
 export function resolveWebCorsOrigin(env: TraceUploadWorkerEnv, request: Request): string {

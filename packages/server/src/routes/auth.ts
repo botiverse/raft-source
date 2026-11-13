@@ -1,29 +1,54 @@
 import { serializeErrorForLog } from "../tracing/safeErrorLog";
+import {
+  completionBindingCookie,
+  completionIsBound,
+  socialCompletionBinding,
+  SOCIAL_COMPLETION_BINDING_TTL_SECONDS,
+} from "../services/completionBrowserBinding";
+import { finishSsoSecondStep, SsoSecondStepRefusedError, type SsoSignInResult } from "../services/sso/ssoSignIn";
+import { enterpriseSsoUnavailableResponse, sendSsoSignIn } from "./sso";
+import { anySsoSignInOffered } from "../services/sso/ssoEnforcement";
 import { kickAppNotificationDelivery } from "../services/appNotificationDeliveryService";
 import { Router, urlencoded, type NextFunction, type Request, type Response, type Router as RouterType } from "express";
 import type { Server as SocketServer } from "socket.io";
 import multer from "multer";
 import { z } from "zod";
 import * as userService from "../services/userService";
+import { HumanSeatLimitError } from "../services/planService";
+import { DeploymentUserLimitError, deploymentUserLimitReached as isDeploymentUserLimitReached } from "../services/deploymentUserLimit";
 import { getDb, type DatabaseExecutor } from "../db/index";
+import { findPendingAccountDeletion } from "../services/accountDeletion/requests";
 import { setProductAnalyticsOptOut } from "../services/productAnalyticsGate";
+import { requestClientPlatform } from "../services/productEventContext";
+import { getProductEventSink } from "../services/productEventIngest";
+import { recordServerProductEvent } from "../services/serverProductEvents";
+import {
+  recordAccountProfileCompleted,
+  recordEmailVerificationSent,
+  recordEmailVerified,
+} from "../services/onboardingProductEvents";
 import * as sessionService from "../services/sessionService";
 import * as inviteService from "../services/inviteService";
+import * as seatJoinBlockService from "../services/seatJoinBlockService";
+import { coalesceListChanges } from "../services/listChangedRealtime";
 import * as onboardingService from "../services/onboardingService";
 import * as serverService from "../services/serverService";
-import * as featureFlagService from "../services/featureFlagService";
+import { announceUserProfileUpdated } from "../services/userProfileEvents";
 import * as legalAcceptanceService from "../services/legalAcceptanceService";
+import { rejectLegacyMobileOAuthLogin, rejectLegacyPrivacyVersionRegister } from "../services/legacyMobileOAuthUpgrade";
 import * as serverAgreementService from "../services/serverAgreementService";
 import type { AgentOrchestrator } from "../services/agentOrchestrator";
 import {
+  getBearerAccessSession,
   getBearerAccessUserId,
   signAccessToken,
   requireAuth,
   requireRetirementAuth,
   requireProfileSetupComplete,
+  requireVerified,
   respondInvalidOrExpiredToken,
 } from "../middleware/auth";
-import { attachAuthTraceIdentity } from "../middleware/requestObservability";
+import { attachAuthTraceIdentity, setRequestTraceErrorCode } from "../middleware/requestObservability";
 import { recordEmailLoginRejectedTrace } from "./authLoginTrace";
 import {
   authRefreshAttemptIdFromHeader,
@@ -33,14 +58,21 @@ import {
 } from "./authRefreshTrace";
 import { sendJsonServerError } from "./errorResponse";
 import {
+  replaceAgentLineBreaks,
   isReservedAgentName,
   isSignupRoleId,
   REFERRAL_SOURCES,
   REFERRAL_SOURCES_LEGACY,
   normalizeTimeFormatPreference,
   normalizeTranslationLanguageCode,
-  normalizeDisplayLocale,
+  normalizeRailTabOrder,
+  parseAssistantOtterShortcutPreference,
+  parseComposerSendKeyPreference,
+  parseShortcutOverridesPreference,
   validateName,
+  type RailTabId,
+  type StoredComposerSendKey,
+  type StoredShortcutOverrides,
   type TimeFormatPreference,
 } from "@botiverse/raft-shared";
 import { getRegistrationBlockedReason } from "../services/registrationPolicy";
@@ -50,8 +82,17 @@ import {
   PROFILE_AVATAR_BAD_FORMAT_MESSAGE,
   PROFILE_AVATAR_TOO_LARGE_MESSAGE,
   runSingleAvatarUpload,
+  deleteReplacedUserAvatar,
+  storedUserAvatarContentHash,
   storeUserAvatar,
 } from "../services/avatarService";
+import {
+  isAutoHumanAvatarUrl,
+  parseHumanAvatarRecipe,
+  serializeHumanAvatarRecipe,
+  setHumanAvatarRecipeBodySchema,
+} from "@botiverse/raft-shared/src/humanAvatar";
+import { isHumanAvatarBuilderOnForPerson } from "../services/humanAvatarBuilderFlag";
 import {
   assertVerifiedSocialAuthProfile,
   buildAuthorizationUrl,
@@ -71,12 +112,16 @@ import {
   getSocialAuthCompletion,
   getSocialAuthProvider,
   assertPendingSocialLinkFor,
+  assertPendingSocialLinkForHash,
   cancelPendingSocialLink,
-  claimPendingSocialLink,
+  claimPendingSocialLinkByHash,
+  pendingSocialLinkTokenHash,
+  pkceS256Challenge,
   exchangeMobileConflictCompletionForPendingLink,
   exchangeWebConflictCompletionForPendingLink,
   PendingSocialLinkError,
   type PendingSocialLink,
+  SocialLoginUnavailableError,
   isNativeAppleSignInConfigured,
   isSocialAuthProviderConfigured,
   markMobileOAuthCompletionConsumed,
@@ -87,9 +132,35 @@ import {
   verifySocialAuthState,
 } from "../services/socialAuthService";
 import type { SocialAuthMode, SocialAuthProfile, SocialAuthProvider } from "../services/socialAuthService";
-import { parseCanonicalBrowserTimezone, parseIanaTimezone } from "../lib/ianaTimezone";
+import { socialLoginAllowed } from "../edition";
+import { refuse } from "../lib/refusal";
+import { parseCanonicalBrowserTimezone } from "../lib/ianaTimezone";
+import { parseDisplayLanguage, parsePreferredTimezone } from "../lib/accountPreferenceParsers";
+import { proofForMobileSocialLogin, proofForSignup, proofForSocialLogin, type SessionIssueProof } from "../services/sessionIssueGate";
+import { parseAuthChallengeToken } from "../services/secondFactor/authChallenges";
+import { PasskeySignInError, startPasskeySignIn, verifyPasskeySignIn } from "../services/secondFactor/passkeySignIn";
+import { parsePasskeyAssertionResponse } from "../services/secondFactor/webauthn";
+import { refuseWithoutRecentSecondFactor } from "./secondFactor";
+import {
+  completeSecondFactorRecoverySignIn,
+  isSecondFactorRecoveryAnswer,
+  parseSecondFactorSignInAnswer,
+  SecondFactorSignInError,
+  startSecondFactorSignIn,
+  verifySecondFactorSignIn,
+  type SecondFactorSignInContext,
+  type SignInFinish,
+} from "../services/secondFactor/signIn";
+import {
+  isWebClientTooOldForSecondFactor,
+  WEB_CLIENT_TOO_OLD_CODE,
+  WEB_CLIENT_TOO_OLD_STATUS,
+  webClientTooOldBody,
+} from "../services/secondFactor/oldWebClient";
 
 export const authRouter: RouterType = Router();
+/** /api/invites: what an invite's page tells the server (beside accept-invite and invite-info below). */
+export const invitesRouter: RouterType = Router();
 const MAX_USER_DESCRIPTION_LENGTH = 3000;
 const userAvatarUpload = createAvatarUpload();
 // Write-side validation accepts retired ids too (`hn_reddit`, before Hacker News and
@@ -195,34 +266,155 @@ async function sendAccountLinkRequired(res: Response, pending: PendingSocialLink
   });
 }
 
-/** Link the pending identity to the account that just signed in. No session exists yet. */
-async function completePendingSocialLink(token: string, userId: string): Promise<SocialAuthProvider> {
-  const profile = await claimPendingSocialLink(token, userId);
-  await userService.linkSocialIdentity(userId, profile);
-  return profile.provider;
+/**
+ * A pending social link, checked against the account that is signing in and
+ * its avatar fetched (outside any lock); the step it returns claims and
+ * links it inside that sign-in's transaction, before the session. Carried by
+ * the token's stored hash, which is also what a second-factor challenge
+ * keeps (services/secondFactor/signIn.ts).
+ */
+type PendingSocialLinkStep = (tx: DatabaseExecutor) => Promise<{ provider: SocialAuthProvider; afterCommit: () => Promise<void> }>;
+
+async function preparePendingSocialLink(tokenHash: string, userId: string): Promise<PendingSocialLinkStep> {
+  const profile = await assertPendingSocialLinkForHash(tokenHash, userId);
+  const prepared = await userService.prepareSocialLink(userId, profile);
+  return async (tx) => {
+    const claimed = await claimPendingSocialLinkByHash(tokenHash, userId, tx);
+    const { afterCommit } = await userService.linkSocialIdentityTx(tx, userId, claimed, prepared);
+    return { provider: claimed.provider, afterCommit };
+  };
 }
 
-/**
- * Password sign-in: check the token and fetch the avatar now, then claim and
- * link inside the locked login transaction, so a password rejected by the
- * locked revalidation never links the provider or spends the token.
- */
-async function preparePendingSocialLinkInLock(
-  token: string,
-  userId: string,
-  onLinked: (provider: SocialAuthProvider) => void,
-) {
-  const profile = await assertPendingSocialLinkFor(token, userId);
-  const prepared = await userService.prepareSocialLink(userId, profile);
-  return async (tx: DatabaseExecutor) => {
-    const claimed = await claimPendingSocialLink(token, userId, tx);
-    const { afterCommit } = await userService.linkSocialIdentityTx(tx, userId, claimed, prepared);
-    onLinked(claimed.provider);
+/** A password sign-in's link step (userService.PasswordSignInLinkStep), reporting the provider it linked. */
+function passwordSignInLinkStep(link: PendingSocialLinkStep, onLinked: (provider: SocialAuthProvider) => void): userService.PasswordSignInLinkStep {
+  return async (tx) => {
+    const { provider, afterCommit } = await link(tx);
+    onLinked(provider);
     return afterCommit;
   };
 }
 
+type CreatedSession = Awaited<ReturnType<typeof sessionService.createSession>>;
+type SocialSignInFinished = { session: CreatedSession; linkedProvider?: SocialAuthProvider; afterCommit?: () => Promise<void> };
+
+/**
+ * The end of a web or mobile social sign-in, inside its transaction: commit
+ * the pending link if any, then the session. Shared by the social endpoints
+ * and their second step (POST /second-factor/verify).
+ */
+async function finishSocialSignIn(tx: DatabaseExecutor, proof: SessionIssueProof, link: PendingSocialLinkStep | null): Promise<SocialSignInFinished> {
+  const linked = link ? await link(tx) : null;
+  const session = await sessionService.createSession(proof, tx);
+  return { session, ...(linked ? { linkedProvider: linked.provider, afterCommit: linked.afterCommit } : {}) };
+}
+
+/**
+ * A social sign-in's first factor passed for `userId`: the gate runs inside
+ * the transaction that would issue the session. Null when two-step
+ * verification is on (nothing written: no link, no session).
+ */
+async function signInWithSocialFirstFactor(
+  flow: "social_login" | "mobile_social_login",
+  userId: string,
+  link: PendingSocialLinkStep | null,
+): Promise<SocialSignInFinished | null> {
+  const finished = await getDb().transaction(async (tx) => {
+    const gate = flow === "social_login" ? await proofForSocialLogin(userId, tx) : await proofForMobileSocialLogin(userId, tx);
+    if (gate.secondFactorRequired) return null;
+    return finishSocialSignIn(tx, gate.proof, link);
+  });
+  await finished?.afterCommit?.();
+  return finished;
+}
+
+/** Extra success-body fields a second step adds (after a backup code). */
+type SecondStepExtra = { backupCodesRemaining?: number };
+
+/**
+ * The password sign-in's success body; passkey sign-in answers with the same (only its trace differs).
+ * A person with a scheduled account deletion also gets `accountDeletion: { status, scheduledFor }`,
+ * so the web shows the pending-deletion page at once instead of probing first (Kirby, #triage:d10ace06).
+ */
+async function sendPasswordSignIn(
+  req: Request,
+  res: Response,
+  signedIn: { user: { id: string }; session: CreatedSession; linkedProvider?: SocialAuthProvider },
+  extra: SecondStepExtra = {},
+  trace: "email_login" | "passkey_login" = "email_login",
+) {
+  const { user, session, linkedProvider } = signedIn;
+  const accessToken = signAccessToken(user.id, session.familyId);
+  attachAuthTraceIdentity(req, { userId: user.id, sessionId: session.sessionId, source: trace });
+  recordAuthSessionIssuedTrace({ flow: trace, userId: user.id, sessionId: session.sessionId });
+  const pendingDeletion = await findPendingAccountDeletion(getDb(), user.id).catch(() => null);
+  res.json({
+    user, accessToken, refreshToken: session.refreshToken,
+    ...(linkedProvider ? { linkedProvider } : {}),
+    ...extra,
+    ...(pendingDeletion ? { accountDeletion: { status: "scheduled", scheduledFor: pendingDeletion.scheduledFor.toISOString() } } : {}),
+  });
+}
+
+function sendWebSocialSignIn(
+  req: Request,
+  res: Response,
+  signedIn: { userId: string; provider: SocialAuthProvider; returnTo: string | undefined; finished: SocialSignInFinished },
+  extra: SecondStepExtra = {},
+) {
+  const { userId, finished: { session, linkedProvider } } = signedIn;
+  const accessToken = signAccessToken(userId, session.familyId);
+  attachAuthTraceIdentity(req, { userId, sessionId: session.sessionId, source: "social_oauth" });
+  recordAuthSessionIssuedTrace({ flow: "social_oauth", userId, sessionId: session.sessionId });
+  res.json({
+    provider: signedIn.provider,
+    mode: "login",
+    returnTo: signedIn.returnTo,
+    accessToken,
+    refreshToken: session.refreshToken,
+    ...(linkedProvider ? { linkedProvider } : {}),
+    ...extra,
+  });
+}
+
+function sendMobileSocialSignIn(
+  req: Request,
+  res: Response,
+  signedIn: { user: { id: string }; provider: SocialAuthProvider; returnUri: string; finished: SocialSignInFinished },
+  extra: SecondStepExtra = {},
+) {
+  const { user, finished: { session, linkedProvider } } = signedIn;
+  res.json({
+    user,
+    provider: signedIn.provider,
+    mode: "login",
+    returnUri: signedIn.returnUri,
+    accessToken: signAccessToken(user.id, session.familyId),
+    refreshToken: session.refreshToken,
+    ...(linkedProvider ? { linkedProvider } : {}),
+    ...extra,
+  });
+}
+
+function traceMobileSocialSignIn(req: Request, userId: string, session: CreatedSession) {
+  attachAuthTraceIdentity(req, { userId, sessionId: session.sessionId, source: "mobile_oauth" });
+  recordAuthSessionIssuedTrace({ flow: "mobile_oauth", userId, sessionId: session.sessionId });
+}
+
+/** An edition without social login (edition.ts): the same 404 the starts give an unconfigured provider. */
+function socialLoginUnavailableResponse(res: Response, err: unknown): boolean {
+  if (!(err instanceof SocialLoginUnavailableError)) return false;
+  refuse(res, 404, { code: err.code, error: err.message });
+  return true;
+}
+
+/** Refuses a social callback or completion before it reads its code (socialAuthService.assertSocialLoginAllowed). */
+function refuseWithoutSocialLogin(res: Response): boolean {
+  return !socialLoginAllowed() && socialLoginUnavailableResponse(res, new SocialLoginUnavailableError());
+}
+
 function pendingSocialLinkErrorResponse(res: Response, err: unknown): boolean {
+  if (socialLoginUnavailableResponse(res, err)) return true;
+  if (socialLinkEmailUnverifiedResponse(res, err)) return true;
   if (err instanceof PendingSocialLinkError) {
     res.status(err.code === "pending_link_expired" ? 410 : 403).json({ code: err.code, error: err.message });
     return true;
@@ -252,37 +444,6 @@ function parsePreferredLanguage(raw: unknown): string | null | undefined {
     throw new Error("preferredLanguage must be a supported language tag");
   }
   return normalized;
-}
-
-// UI display language (app-chrome i18n). Validated against the DISPLAY locale
-// taxonomy — the set the web app ships a catalog for (en | zh-cn) — NOT the
-// message-translation taxonomy. Region/script variants normalize within a
-// shipped base (en-US→en, zh-Hans→zh-cn); anything we cannot render (fr, zh-tw,
-// …) is rejected so we never persist a preference that silently no-ops on read.
-function parseDisplayLanguage(raw: unknown): string | null | undefined {
-  if (raw === undefined) return undefined;
-  if (raw === null) return null;
-  if (typeof raw !== "string") {
-    throw new Error("displayLanguage must be a string or null");
-  }
-  const value = raw.trim();
-  if (!value) return null;
-  const normalized = normalizeDisplayLocale(value);
-  if (!normalized) {
-    throw new Error("displayLanguage must be a supported UI display locale");
-  }
-  return normalized;
-}
-
-function parsePreferredTimezone(raw: unknown): string | null | undefined {
-  if (raw === undefined) return undefined;
-  if (raw === null) return null;
-  if (typeof raw !== "string") {
-    throw new Error("preferredTimezone must be a string or null");
-  }
-  const value = raw.trim();
-  if (!value) return null;
-  return parseIanaTimezone(value, "preferredTimezone");
 }
 
 function parseAutoTranslationEnabled(raw: unknown): boolean | undefined {
@@ -345,6 +506,24 @@ function parsePreferredTimeFormat(raw: unknown): TimeFormatPreference | null | u
 
 type MessageBodyFontSizePreference = "sm" | "md" | "lg";
 
+/** #proj-assistant:#21: show the assistant's otter over every page. */
+function parseAssistantOtterVisible(raw: unknown): boolean | undefined {
+  if (raw === undefined) return undefined;
+  if (typeof raw !== "boolean") throw new Error("assistantOtterVisible must be a boolean");
+  return raw;
+}
+
+// The rail tab order: null resets to the default; an array is stored complete
+// (unknown ids dropped, missing tabs appended in their default place).
+function parseRailTabOrder(raw: unknown): RailTabId[] | null | undefined {
+  if (raw === undefined) return undefined;
+  if (raw === null) return null;
+  if (!Array.isArray(raw) || raw.length > 50 || raw.some((id) => typeof id !== "string")) {
+    throw new Error("railTabOrder must be an array of tab ids, or null");
+  }
+  return normalizeRailTabOrder(raw);
+}
+
 function parsePreferredMessageBodyFontSize(raw: unknown): MessageBodyFontSizePreference | null | undefined {
   if (raw === undefined) return undefined;
   if (raw === null) return null;
@@ -365,6 +544,27 @@ function parseLegalAcceptance(raw: any): legalAcceptanceService.LegalAcceptanceI
     termsVersion: typeof raw?.termsVersion === "string" ? raw.termsVersion : undefined,
     privacyVersion: typeof raw?.privacyVersion === "string" ? raw.privacyVersion : undefined,
   };
+}
+
+// account_created (xxchan, 2026-10-22, task #13): where new accounts come
+// from. The client is what the signup request says (X-Raft-Client-Platform),
+// `unknown` when it does not; best effort, never delays the signup.
+function recordAccountCreated(
+  req: Request,
+  userId: string,
+  method: "email" | SocialAuthProvider,
+  creationSource: "signup" | "oauth" | "invite",
+): void {
+  void recordServerProductEvent(getProductEventSink(req.app), {
+    event: "account_created",
+    userId,
+    serverId: null,
+    properties: {
+      platform: requestClientPlatform(req.get("x-raft-client-platform"), req.get("user-agent")),
+      method,
+      invited: creationSource === "invite",
+    },
+  });
 }
 
 function parseEmailAccountCreationSource(raw: any): "signup" | "invite" {
@@ -403,30 +603,6 @@ function socialProfileFromCompletion(provider: NonNullable<ReturnType<typeof get
   };
 }
 
-async function isSocialAuthProviderGateOpen(
-  provider: SocialAuthProvider,
-  platform: featureFlagService.FeatureFlagPlatform,
-): Promise<boolean> {
-  if (provider !== "apple") return true;
-  const evaluation = await featureFlagService.evaluateFeatureFlag({
-    key: featureFlagService.APPLE_WEB_LOGIN_FEATURE_FLAG_KEY,
-    platform,
-  });
-  return evaluation.enabled;
-}
-
-async function isSocialAuthProviderAvailable(
-  provider: NonNullable<ReturnType<typeof getSocialAuthProvider>>,
-  platform: featureFlagService.FeatureFlagPlatform,
-): Promise<boolean> {
-  if (!isSocialAuthProviderConfigured(provider.id)) return false;
-  return isSocialAuthProviderGateOpen(provider.id, platform);
-}
-
-async function isNativeAppleMobileAuthAvailable(): Promise<boolean> {
-  return isNativeAppleSignInConfigured() && isSocialAuthProviderGateOpen("apple", "mobile");
-}
-
 async function startMobileOAuthResponse(req: Request, res: Response, params: {
   providerId: string;
   mode: unknown;
@@ -440,18 +616,21 @@ async function startMobileOAuthResponse(req: Request, res: Response, params: {
     res.status(400).json({ code: "provider_invalid", error: "provider must be google, github, or apple" });
     return;
   }
-  if (!(await isSocialAuthProviderAvailable(provider, "mobile"))) {
+  if (!isSocialAuthProviderConfigured(provider.id)) {
     res.status(404).json({ code: "provider_not_configured", error: `${provider.label} sign-in is not configured` });
     return;
   }
 
-  const userId = params.mode === "link"
-    ? params.authenticatedUserId ?? (await getBearerAccessUserId(req.headers.authorization)) ?? undefined
-    : undefined;
+  // An optional bearer (POST /mobile/oauth/start { mode: "link" }) has not
+  // been gated by step-up yet; `authenticatedUserId` callers gate before this.
+  const bearer = params.mode === "link" && !params.authenticatedUserId ? await getBearerAccessSession(req.headers.authorization) : null;
+  const userId = params.mode === "link" ? params.authenticatedUserId ?? bearer?.userId : undefined;
   if (params.mode === "link" && !userId) {
     res.status(401).json({ code: "auth_required", error: "link mode requires authentication" });
     return;
   }
+  // The complete leg is bound to this start's transaction: gating the start gates the link.
+  if (bearer && await refuseWithoutRecentSecondFactor(res, bearer.userId, bearer.webFamilyId, "identity_link")) return;
 
   const started = await createMobileOAuthStart({
     provider: provider.id,
@@ -469,7 +648,14 @@ async function startMobileOAuthResponse(req: Request, res: Response, params: {
   });
 }
 
+function socialLinkEmailUnverifiedResponse(res: Response, err: unknown): boolean {
+  if (!(err instanceof userService.SocialLinkEmailUnverifiedError)) return false;
+  res.status(403).json({ code: err.code, error: err.message });
+  return true;
+}
+
 function mobileOAuthErrorResponse(res: Response, err: unknown, operation: "start" | "complete"): boolean {
+  if (socialLinkEmailUnverifiedResponse(res, err)) return true;
   const message = errorMessage(err, `mobile_oauth_${operation}_failed`);
   if (message === "return_uri_not_allowed") {
     res.status(400).json({ code: "return_uri_not_allowed", error: "Mobile OAuth return URI is not allowed" });
@@ -600,32 +786,37 @@ async function completeMobileOAuthResponse(req: Request, res: Response, params: 
   if (!user) {
     legalAcceptanceService.requireCurrentLegalAcceptance(parseLegalAcceptance(req.body));
     const profile = socialProfileFromCompletion(getSocialAuthProvider(completion.provider)!, completion);
+    const creationSource = parseSocialAccountCreationSource(req.body);
     user = await userService.createSocialUser(
       profile,
       parseLegalAcceptance(req.body),
       legalAcceptanceService.getRequestLegalMetadata(req),
-      parseSocialAccountCreationSource(req.body),
+      creationSource,
       { deferProfileSetup: true },
     );
+    recordAccountCreated(req, user.id, completion.provider, creationSource);
   }
 
-  const linkedProvider = params.pendingLinkToken
-    ? await completePendingSocialLink(params.pendingLinkToken, user.id)
-    : undefined;
-  const { sessionId, familyId, refreshToken } = await sessionService.createSession(user.id);
-  const accessToken = signAccessToken(user.id, familyId);
-  attachAuthTraceIdentity(req, { userId: user.id, sessionId, source: "mobile_oauth" });
-  recordAuthSessionIssuedTrace({ flow: "mobile_oauth", userId: user.id, sessionId });
+  const pendingLinkTokenHash = params.pendingLinkToken ? pendingSocialLinkTokenHash(params.pendingLinkToken) : null;
+  const link = pendingLinkTokenHash ? await preparePendingSocialLink(pendingLinkTokenHash, user.id) : null;
+  const finished = await signInWithSocialFirstFactor("mobile_social_login", user.id, link);
+  if (!finished) {
+    // Two-step verification is on: the handoff code is spent now, and the
+    // challenge carries the rest (the link stays pending; PKCE-bound).
+    await markMobileOAuthCompletionConsumed(completion.requestId);
+    attachAuthTraceIdentity(req, { userId: user.id, source: "mobile_oauth", reason: "second_factor_required" });
+    res.json(await startSecondFactorSignIn(user.id, {
+      flow: "mobile_social_login",
+      provider: completion.provider,
+      returnUri: completion.returnUri,
+      codeChallenge: pkceS256Challenge(params.codeVerifier),
+      pendingLinkTokenHash,
+    }));
+    return;
+  }
+  traceMobileSocialSignIn(req, user.id, finished.session);
   await markMobileOAuthCompletionConsumed(completion.requestId);
-  res.json({
-    user,
-    provider: completion.provider,
-    mode: completion.mode,
-    returnUri: completion.returnUri,
-    accessToken,
-    refreshToken,
-    ...(linkedProvider ? { linkedProvider } : {}),
-  });
+  sendMobileSocialSignIn(req, res, { user, provider: completion.provider, returnUri: completion.returnUri, finished });
 }
 
 // Register
@@ -633,6 +824,12 @@ authRouter.post("/register", async (req, res) => {
   const registrationBlockedReason = getRegistrationBlockedReason();
   if (registrationBlockedReason) {
     res.status(403).json({ error: registrationBlockedReason });
+    return;
+  }
+  try {
+    if (await rejectLegacyPrivacyVersionRegister(req, res)) return;
+  } catch (err) {
+    sendJsonServerError(req, res, { error: "Registration failed", logPrefix: "Register error:", err });
     return;
   }
   const body = parseEmailRegisterRequest(req.body, res);
@@ -661,15 +858,24 @@ authRouter.post("/register", async (req, res) => {
       return;
     }
 
+    const creationSource = parseEmailAccountCreationSource(req.body);
+    let verificationEmail: "sent" | "failed" | undefined;
     const user = await userService.createUser(
       email,
       password,
       name?.trim() ?? null,
       parseLegalAcceptance(req.body),
       legalAcceptanceService.getRequestLegalMetadata(req),
-      parseEmailAccountCreationSource(req.body),
-      { deferProfileSetup: true, stagingSelfAccountCapability },
+      creationSource,
+      {
+        deferProfileSetup: true,
+        stagingSelfAccountCapability,
+        verificationReturnTo: verificationReturnTo(req.body?.returnTo),
+        onVerificationEmail: (result) => { verificationEmail = result; },
+      },
     );
+    recordAccountCreated(req, user.id, "email", creationSource);
+    if (verificationEmail) recordEmailVerificationSent(req, user.id, "signup", verificationEmail);
     // E2E-only opt-in: verify ephemeral test users (e.g. the removed-dm DM-seed
     // peer) so they can post. Double-gated — the SLOCK_E2E_AUTO_VERIFY_EMAIL
     // test-env flag AND an explicit per-request opt-in — so the normal signup
@@ -678,7 +884,7 @@ authRouter.post("/register", async (req, res) => {
     if (process.env.SLOCK_E2E_AUTO_VERIFY_EMAIL === "1" && req.body?.__e2eAutoVerify === true) {
       await userService.markEmailVerifiedForTest(user.id);
     }
-    const { sessionId, familyId, refreshToken } = await sessionService.createSession(user.id);
+    const { sessionId, familyId, refreshToken } = await sessionService.createSession(await proofForSignup(user.id));
     const accessToken = signAccessToken(user.id, familyId);
     attachAuthTraceIdentity(req, { userId: user.id, sessionId, source: "email_register" });
     recordAuthSessionIssuedTrace({ flow: "email_register", userId: user.id, sessionId });
@@ -706,27 +912,32 @@ authRouter.post("/register", async (req, res) => {
 });
 
 authRouter.get("/providers", async (req, res) => {
-  // `platform` selects which platform stage gates provider visibility. Default `web`
-  // preserves the original Web-login behavior; `mobile` lets native clients show a
-  // provider button only when the backend would also accept its mobile start call.
+  // `platform` (web | mobile, default web) is still validated for older clients
+  // that send it, but every platform sees the same list: a provider is offered
+  // exactly when it is configured, matching what its start routes accept.
   const platformParam = typeof req.query.platform === "string" ? req.query.platform : "web";
   if (platformParam !== "web" && platformParam !== "mobile") {
     res.status(400).json({ code: "platform_invalid", error: "platform must be web or mobile" });
     return;
   }
-  const platform: featureFlagService.FeatureFlagPlatform = platformParam;
 
   const providerConfigs = ["google", "github", "apple"]
     .map((providerId) => getSocialAuthProvider(providerId))
     .filter((provider): provider is NonNullable<typeof provider> => !!provider);
 
-  const providers = await Promise.all(providerConfigs.map(async (provider) => ({
-      id: provider.id,
-      label: provider.label,
-      enabled: await isSocialAuthProviderAvailable(provider, platform),
-    })));
+  const providers = providerConfigs.map((provider) => ({
+    id: provider.id,
+    label: provider.label,
+    enabled: isSocialAuthProviderConfigured(provider.id),
+  }));
+  // RFC 083: "Continue with SSO" is offered once some Server has single sign-on on.
+  const sso = await anySsoSignInOffered().catch(() => false);
+  // The sign-up page's notice (source-available only; always false in cloud,
+  // without a query): the deployment already has as many people as the Raft
+  // License allows. Signing up still works; joining is what is refused.
+  const deploymentUserLimitReached = await isDeploymentUserLimitReached().catch(() => false);
 
-  res.json({ providers });
+  res.json({ providers, sso, deploymentUserLimitReached });
 });
 
 authRouter.get("/identities", requireAuth, async (req, res) => {
@@ -754,6 +965,7 @@ authRouter.delete("/identities/:provider", requireAuth, async (req, res) => {
   }
 
   try {
+    if (await refuseWithoutRecentSecondFactor(res, req.userId!, sessionService.webSessionFamilyOf(req), "identity_unlink")) return;
     const result = await userService.unlinkSocialIdentity(req.userId!, provider.id);
     res.json(result);
   } catch (err) {
@@ -775,7 +987,7 @@ authRouter.delete("/identities/:provider", requireAuth, async (req, res) => {
 
 authRouter.post("/mobile/oauth/apple/native/start", async (req, res) => {
   try {
-    if (!(await isNativeAppleMobileAuthAvailable())) {
+    if (!isNativeAppleSignInConfigured()) {
       res.status(404).json({ code: "provider_not_configured", error: "Apple sign-in is not configured" });
       return;
     }
@@ -788,12 +1000,15 @@ authRouter.post("/mobile/oauth/apple/native/start", async (req, res) => {
       return;
     }
     const mode = req.body?.mode;
-    const authenticatedUserId = (await getBearerAccessUserId(req.headers.authorization)) ?? undefined;
+    const bearer = mode === "link" ? await getBearerAccessSession(req.headers.authorization) : null;
+    // /authorize is bound to this start (signed request token, its stored
+    // mode and user): gating the start gates linking Apple.
+    if (bearer && await refuseWithoutRecentSecondFactor(res, bearer.userId, bearer.webFamilyId, "identity_link")) return;
     const started = await createNativeAppleMobileOAuthStart({
       mode,
       returnUri: req.body?.returnUri,
       codeChallenge: req.body?.codeChallenge,
-      userId: mode === "link" ? authenticatedUserId : undefined,
+      userId: bearer?.userId,
     });
     res.status(201).json({
       requestId: started.requestId,
@@ -814,7 +1029,7 @@ authRouter.post("/mobile/oauth/apple/native/start", async (req, res) => {
 
 authRouter.post("/mobile/oauth/apple/native/authorize", async (req, res) => {
   try {
-    if (!(await isNativeAppleMobileAuthAvailable())) {
+    if (!isNativeAppleSignInConfigured()) {
       res.status(404).json({ code: "provider_not_configured", error: "Apple sign-in is not configured" });
       return;
     }
@@ -840,6 +1055,7 @@ authRouter.post("/mobile/oauth/apple/native/authorize", async (req, res) => {
 
 authRouter.post("/mobile/oauth/start", async (req, res) => {
   try {
+    if (await rejectLegacyMobileOAuthLogin(req, res)) return;
     await startMobileOAuthResponse(req, res, {
       providerId: typeof req.body?.provider === "string" ? req.body.provider : "",
       mode: req.body?.mode,
@@ -866,6 +1082,8 @@ authRouter.post("/mobile/oauth/:provider/link/start", requireAuth, async (req, r
   }
 
   try {
+    // The complete leg is bound to this start's transaction: gating the start gates the link.
+    if (await refuseWithoutRecentSecondFactor(res, req.userId!, sessionService.webSessionFamilyOf(req), "identity_link")) return;
     await startMobileOAuthResponse(req, res, {
       providerId: provider.id,
       mode: "link",
@@ -885,9 +1103,11 @@ authRouter.post("/mobile/oauth/:provider/link/start", requireAuth, async (req, r
 });
 
 authRouter.post("/mobile/oauth/complete", async (req, res) => {
-  const pendingLinkToken = parsePendingLinkToken(req.body, res);
-  if (pendingLinkToken === null) return;
+  if (refuseWithoutSocialLogin(res)) return;
   try {
+    if (await rejectLegacyMobileOAuthLogin(req, res)) return;
+    const pendingLinkToken = parsePendingLinkToken(req.body, res);
+    if (pendingLinkToken === null) return;
     await completeMobileOAuthResponse(req, res, {
       code: req.body?.code,
       codeVerifier: req.body?.codeVerifier,
@@ -916,6 +1136,7 @@ authRouter.post("/mobile/oauth/:provider/link/complete", requireAuth, async (req
     next();
     return;
   }
+  if (refuseWithoutSocialLogin(res)) return;
 
   try {
     await completeMobileOAuthResponse(req, res, {
@@ -943,7 +1164,7 @@ authRouter.get("/:provider/start", async (req, res, next) => {
     return;
   }
 
-  if (!(await isSocialAuthProviderAvailable(provider, "web"))) {
+  if (!isSocialAuthProviderConfigured(provider.id)) {
     res.status(404).json({ error: `${provider.label} sign-in is not configured` });
     return;
   }
@@ -969,10 +1190,13 @@ authRouter.post("/:provider/link/start", requireAuth, async (req, res, next) => 
     return;
   }
 
-  if (!(await isSocialAuthProviderAvailable(provider, "web"))) {
+  if (!isSocialAuthProviderConfigured(provider.id)) {
     res.status(404).json({ error: `${provider.label} sign-in is not configured` });
     return;
   }
+
+  // The callback is bound to this start's signed state: gating the start gates the link.
+  if (await refuseWithoutRecentSecondFactor(res, req.userId!, sessionService.webSessionFamilyOf(req), "identity_link")) return;
 
   const returnTo = sanitizeReturnTo(req.body?.returnTo);
   const nonce = createSocialAuthNonce();
@@ -994,6 +1218,7 @@ async function handleSocialAuthCallback(req: Request, res: Response, next: NextF
     next();
     return;
   }
+  if (refuseWithoutSocialLogin(res)) return;
 
   let state = null as (ReturnType<typeof verifySocialAuthState> & { mode: SocialAuthMode }) | null;
   let returnTo = "/";
@@ -1065,6 +1290,7 @@ async function handleSocialAuthCallback(req: Request, res: Response, next: NextF
         returnTo,
       });
 
+      res.append("Set-Cookie", completionBindingCookie(socialCompletionBinding(provider.id), completionCode, SOCIAL_COMPLETION_BINDING_TTL_SECONDS));
       res.redirect(buildSocialAuthCallbackUrl({
         provider: provider.id,
         mode: "link",
@@ -1097,6 +1323,8 @@ async function handleSocialAuthCallback(req: Request, res: Response, next: NextF
       returnTo,
     });
 
+    // The code completes only in this browser (login CSRF; apps use PKCE).
+    res.append("Set-Cookie", completionBindingCookie(socialCompletionBinding(provider.id), completionCode, SOCIAL_COMPLETION_BINDING_TTL_SECONDS));
     res.redirect(buildSocialAuthCallbackUrl({
       provider: provider.id,
       mode: "login",
@@ -1127,11 +1355,24 @@ authRouter.post("/:provider/complete", async (req, res, next) => {
     next();
     return;
   }
+  if (refuseWithoutSocialLogin(res)) return;
 
   try {
     const { code } = req.body;
     if (!code) {
+      setRequestTraceErrorCode(res, "completion_code_required");
       res.status(400).json({ error: "Sign-in completion code is required" });
+      return;
+    }
+    // Only the browser the provider answered can complete (login CSRF). Checked
+    // before any lookup: another browser gets the same answer whether or not
+    // the code exists, and spends nothing.
+    const binding = socialCompletionBinding(provider.id);
+    // Every client, whatever version it names (#raft-architecture:#32 retired
+    // social_completion_binding with this as the permanent behaviour).
+    if (typeof code !== "string" || !completionIsBound(binding, req.headers.cookie, code)) {
+      setRequestTraceErrorCode(res, "browser_mismatch");
+      res.status(400).json({ error: "This sign-in could not be finished. Refresh the page and sign in again.", code: "browser_mismatch" });
       return;
     }
 
@@ -1156,10 +1397,12 @@ authRouter.post("/:provider/complete", async (req, res, next) => {
     if (pendingCompletion.mode === "link") {
       authenticatedLinkUserId = (await getBearerAccessUserId(req.headers.authorization));
       if (!authenticatedLinkUserId) {
+        setRequestTraceErrorCode(res, "auth_required");
         res.status(401).json({ code: "auth_required", error: "Authentication is required to link an account" });
         return;
       }
       if (!pendingCompletion.userId || pendingCompletion.userId !== authenticatedLinkUserId) {
+        setRequestTraceErrorCode(res, "link_user_mismatch");
         res.status(403).json({ code: "link_user_mismatch", error: "Social auth link does not match the authenticated user" });
         return;
       }
@@ -1182,53 +1425,55 @@ authRouter.post("/:provider/complete", async (req, res, next) => {
       return;
     }
 
-    if (!completion.userId) {
+    let userId = completion.userId;
+    if (!userId) {
       const profile = socialProfileFromCompletion(provider, completion);
+      const creationSource = parseSocialAccountCreationSource(req.body);
       const user = await userService.createSocialUser(
         profile,
         parseLegalAcceptance(req.body),
         legalAcceptanceService.getRequestLegalMetadata(req),
-        parseSocialAccountCreationSource(req.body),
+        creationSource,
         { deferProfileSetup: true },
       );
-      const { sessionId, familyId, refreshToken } = await sessionService.createSession(user.id);
-      const accessToken = signAccessToken(user.id, familyId);
-      attachAuthTraceIdentity(req, { userId: user.id, sessionId, source: "social_oauth" });
-      recordAuthSessionIssuedTrace({ flow: "social_oauth", userId: user.id, sessionId });
-      res.json({
-        provider: completion.provider,
-        mode: completion.mode,
-        returnTo: completion.returnTo,
-        accessToken,
-        refreshToken,
-      });
-      return;
+      recordAccountCreated(req, user.id, provider.id, creationSource);
+      userId = user.id;
     }
 
-    const linkedProvider = pendingLinkToken
-      ? await completePendingSocialLink(pendingLinkToken, completion.userId)
-      : undefined;
-    const { sessionId, familyId, refreshToken } = await sessionService.createSession(completion.userId);
-    const accessToken = signAccessToken(completion.userId, familyId);
-    attachAuthTraceIdentity(req, { userId: completion.userId, sessionId, source: "social_oauth" });
-    recordAuthSessionIssuedTrace({ flow: "social_oauth", userId: completion.userId, sessionId });
-    res.json({
-      provider: completion.provider,
-      mode: completion.mode,
-      returnTo: completion.returnTo,
-      accessToken,
-      refreshToken,
-      ...(linkedProvider ? { linkedProvider } : {}),
-    });
+    // A new account never has a pending link (refused above for no account).
+    const pendingLinkTokenHash = pendingLinkToken ? pendingSocialLinkTokenHash(pendingLinkToken) : null;
+    const link = pendingLinkTokenHash ? await preparePendingSocialLink(pendingLinkTokenHash, userId) : null;
+    const finished = await signInWithSocialFirstFactor("social_login", userId, link);
+    if (!finished) {
+      // Two-step verification is on: the completion code is spent, the
+      // challenge carries the rest (the link stays pending until it passes).
+      if (isWebClientTooOldForSecondFactor((name) => req.header(name))) {
+        attachAuthTraceIdentity(req, { userId, source: "social_oauth", reason: WEB_CLIENT_TOO_OLD_CODE });
+        setRequestTraceErrorCode(res, WEB_CLIENT_TOO_OLD_CODE);
+        res.status(WEB_CLIENT_TOO_OLD_STATUS).json(webClientTooOldBody);
+        return;
+      }
+      attachAuthTraceIdentity(req, { userId, source: "social_oauth", reason: "second_factor_required" });
+      res.json(await startSecondFactorSignIn(userId, {
+        flow: "social_login",
+        provider: completion.provider,
+        returnTo: completion.returnTo ?? null,
+        pendingLinkTokenHash,
+      }));
+      return;
+    }
+    sendWebSocialSignIn(req, res, { userId, provider: completion.provider, returnTo: completion.returnTo, finished });
   } catch (err: any) {
     const legalResponse = legalAcceptanceService.legalAcceptanceErrorResponse(err);
     if (legalResponse) {
+      setRequestTraceErrorCode(res, legalResponse.body.error);
       res.status(legalResponse.status).json(legalResponse.body);
       return;
     }
     if (pendingSocialLinkErrorResponse(res, err)) return;
     const message = err?.message || "";
     if (message.includes("Invalid") || message.includes("expired") || message.includes("mismatch")) {
+      setRequestTraceErrorCode(res, "completion_invalid");
       res.status(400).json({ error: message });
       return;
     }
@@ -1253,15 +1498,35 @@ authRouter.post("/login", async (req, res) => {
     const { email, password } = body;
 
     let linkedProvider: SocialAuthProvider | undefined;
-    const { user, session } = await userService.authenticateUser(email, password, pendingLinkToken
-      ? { prepareLink: (userId) => preparePendingSocialLinkInLock(pendingLinkToken, userId, (provider) => { linkedProvider = provider; }) }
+    // Read only once the password verified, as before.
+    let pendingLinkTokenHash: string | null = null;
+    const signedIn = await userService.authenticateUser(email, password, pendingLinkToken
+      ? {
+          prepareLink: async (userId) => {
+            pendingLinkTokenHash = pendingSocialLinkTokenHash(pendingLinkToken);
+            return passwordSignInLinkStep(
+              await preparePendingSocialLink(pendingLinkTokenHash, userId),
+              (provider) => { linkedProvider = provider; },
+            );
+          },
+        }
       : {});
-    const { sessionId, familyId, refreshToken } = session;
-    const accessToken = signAccessToken(user.id, familyId);
-    attachAuthTraceIdentity(req, { userId: user.id, sessionId, source: "email_login" });
-    recordAuthSessionIssuedTrace({ flow: "email_login", userId: user.id, sessionId });
-
-    res.json({ user, accessToken, refreshToken, ...(linkedProvider ? { linkedProvider } : {}) });
+    if (signedIn.secondFactorRequired) {
+      // Two-step verification is on: no session and no link yet.
+      if (isWebClientTooOldForSecondFactor((name) => req.header(name))) {
+        attachAuthTraceIdentity(req, { userId: signedIn.userId, source: "email_login", reason: WEB_CLIENT_TOO_OLD_CODE });
+        res.status(WEB_CLIENT_TOO_OLD_STATUS).json(webClientTooOldBody);
+        return;
+      }
+      attachAuthTraceIdentity(req, { userId: signedIn.userId, source: "email_login", reason: "second_factor_required" });
+      res.json(await startSecondFactorSignIn(signedIn.userId, {
+        flow: "password_login",
+        passwordFingerprint: signedIn.passwordFingerprint,
+        pendingLinkTokenHash,
+      }));
+      return;
+    }
+    await sendPasswordSignIn(req, res, { user: signedIn.user, session: signedIn.session, linkedProvider });
   } catch (err: any) {
     if (pendingSocialLinkErrorResponse(res, err)) return;
     if (err instanceof userService.EmailLoginRejectedError) {
@@ -1278,6 +1543,166 @@ authRouter.post("/login", async (req, res) => {
         err,
       });
     }
+  }
+});
+
+type SsoSignedIn = Extract<SsoSignInResult, { kind: "signed_in" }>;
+
+type SecondStepFinished =
+  | { flow: "password_login"; user: { id: string }; session: CreatedSession; linkedProvider?: SocialAuthProvider; afterCommit?: () => Promise<void> }
+  | { flow: "social_login"; userId: string; provider: SocialAuthProvider; returnTo: string | undefined; finished: SocialSignInFinished }
+  | { flow: "mobile_social_login"; user: { id: string }; provider: SocialAuthProvider; returnUri: string; finished: SocialSignInFinished }
+  | { flow: "sso_login"; signedIn: SsoSignedIn; returnTo: string | null };
+
+/**
+ * POST /api/auth/second-factor/verify { challenge, code (or totp) | backupCode |
+ * webauthn, codeVerifier? (mobile) }: the second step of a password or social
+ * sign-in (services/secondFactor/signIn.ts). Unauthenticated, behind
+ * authLimiter like /login (mounted in app.ts ahead of the second-factor
+ * management router, which requires a session). On success it answers
+ * exactly as the first step would have without two-step verification (same
+ * finish, same body), plus `backupCodesRemaining` after a backup code.
+ *
+ * `{ challenge, recovery: true, codeVerifier? }` instead finishes the
+ * person's two-step verification recovery request (offered as `recovery` in
+ * the challenge's methods once it is ready; services/secondFactor/recovery.ts):
+ * the same finish and body, with every factor removed and every other sign-in
+ * signed out; 409 `recovery_not_ready` (with `eligibleAt`) or
+ * `recovery_not_found` otherwise.
+ */
+export async function secondFactorVerifyHandler(req: Request, res: Response): Promise<void> {
+  const challenge = parseAuthChallengeToken(req.body?.challenge);
+  const recovery = isSecondFactorRecoveryAnswer(req.body);
+  const answer = recovery ? null : parseSecondFactorSignInAnswer(req.body);
+  if (!challenge || (!answer && !recovery)) {
+    res.status(400).json({ code: "invalid_request", error: "Send the sign-in challenge with a code from your authenticator app, a backup code or a passkey." });
+    return;
+  }
+  const codeVerifier = typeof req.body?.codeVerifier === "string" ? req.body.codeVerifier : null;
+  try {
+    const prepare = async (context: SecondFactorSignInContext, userId: string): Promise<SignInFinish<SecondStepFinished>> => {
+      const link = context.pendingLinkTokenHash ? await preparePendingSocialLink(context.pendingLinkTokenHash, userId) : null;
+      if (context.flow === "password_login") {
+        return async (tx, proof) => {
+          let linkedProvider: SocialAuthProvider | undefined;
+          const signedIn = await userService.finishPasswordSignInAfterSecondFactor(tx, {
+            userId,
+            passwordFingerprint: context.passwordFingerprint,
+            proof,
+            ...(link ? { linkInLock: passwordSignInLinkStep(link, (provider) => { linkedProvider = provider; }) } : {}),
+          });
+          // The password changed since the first step: start again.
+          if (!signedIn) throw new SecondFactorSignInError("challenge_expired", "This sign-in has expired. Sign in again.");
+          return { flow: "password_login", ...signedIn, linkedProvider };
+        };
+      }
+      if (context.flow === "social_login") {
+        const { provider, returnTo } = context;
+        return async (tx, proof) => ({
+          flow: "social_login",
+          userId,
+          provider,
+          returnTo: returnTo ?? undefined,
+          finished: await finishSocialSignIn(tx, proof, link),
+        });
+      }
+      if (context.flow === "sso_login") {
+        const { ssoConnectionId, returnTo } = context;
+        return async (tx, proof) => ({
+          flow: "sso_login",
+          signedIn: await finishSsoSecondStep(tx, proof, { userId, connectionId: ssoConnectionId }),
+          returnTo,
+        });
+      }
+      // Mobile answers with the account as it was before the link, like its first step.
+      const user = await userService.getUser(userId);
+      if (!user) throw new SecondFactorSignInError("challenge_expired", "This sign-in has expired. Sign in again.");
+      const { provider, returnUri } = context;
+      return async (tx, proof) => ({ flow: "mobile_social_login", user, provider, returnUri, finished: await finishSocialSignIn(tx, proof, link) });
+    };
+    const verified = answer
+      ? await verifySecondFactorSignIn<SecondStepFinished>({ challenge, answer, codeVerifier }, prepare)
+      : await completeSecondFactorRecoverySignIn<SecondStepFinished>({ challenge, codeVerifier }, prepare);
+    const { result } = verified;
+    const extra: SecondStepExtra = verified.backupCodesRemaining === null ? {} : { backupCodesRemaining: verified.backupCodesRemaining };
+    switch (result.flow) {
+      case "password_login":
+        await result.afterCommit?.();
+        await sendPasswordSignIn(req, res, result, extra);
+        return;
+      case "social_login":
+        await result.finished.afterCommit?.();
+        sendWebSocialSignIn(req, res, result, extra);
+        return;
+      case "mobile_social_login":
+        await result.finished.afterCommit?.();
+        traceMobileSocialSignIn(req, result.user.id, result.finished.session);
+        sendMobileSocialSignIn(req, res, result, extra);
+        return;
+      case "sso_login":
+        await sendSsoSignIn(req, res, result.signedIn, result.returnTo, extra);
+        return;
+      default:
+        throw new Error(`second factor verify: unhandled flow ${(result satisfies never as { flow: string }).flow}`);
+    }
+  } catch (err) {
+    if (err instanceof SecondFactorSignInError) {
+      res.status(err.status).json({ error: err.message, code: err.code, ...err.extra });
+      return;
+    }
+    if (err instanceof SsoSecondStepRefusedError) {
+      res.status(403).json({ error: "This single sign-on can't sign you in right now.", code: err.reason });
+      return;
+    }
+    // An edition without SSO (services/sso/ssoEdition.ts): an sso_login challenge issued before finishes nothing.
+    if (enterpriseSsoUnavailableResponse(res, err)) return;
+    if (pendingSocialLinkErrorResponse(res, err)) return;
+    sendJsonServerError(req, res, { error: "Sign-in failed", logPrefix: "Second-factor sign-in error:", err });
+  }
+}
+
+/**
+ * Passkey sign-in (design v8 §1, §2 D3; rollout PR 4b;
+ * services/secondFactor/passkeySignIn.ts): unauthenticated, behind authLimiter
+ * like /login. A passkey with user verification is both factors, so a person
+ * with two-step verification on is not asked for a second step. Open only to
+ * an active account; anyone else's passkey is
+ * `passkey_not_recognized`, like an unknown one. 404 `passkeys_unavailable`
+ * without a WebAuthn relying party (an expected answer to every login page's
+ * autofill request, so not a 5xx).
+ *
+ *   POST /passkey/options {}                    -> { options, expiresAt }
+ *   POST /passkey/verify { challenge, response } -> exactly /login's success body
+ */
+function sendPasskeySignInError(req: Request, res: Response, err: unknown, failure: string): void {
+  if (err instanceof PasskeySignInError) {
+    res.status(err.status).json({ error: err.message, code: err.code });
+    return;
+  }
+  sendJsonServerError(req, res, { error: failure, logPrefix: `[passkey-sign-in] ${failure}:`, err });
+}
+
+authRouter.post("/passkey/options", async (req, res) => {
+  try {
+    res.setHeader("Cache-Control", "no-store");
+    res.json(await startPasskeySignIn());
+  } catch (err) {
+    sendPasskeySignInError(req, res, err, "Failed to start passkey sign-in");
+  }
+});
+
+authRouter.post("/passkey/verify", async (req, res) => {
+  const challenge = parseAuthChallengeToken(req.body?.challenge);
+  const response = parsePasskeyAssertionResponse(req.body?.response);
+  if (!challenge || !response) {
+    res.status(400).json({ code: "invalid_request", error: "Send the passkey sign-in challenge and the passkey from your browser." });
+    return;
+  }
+  try {
+    const signedIn = await verifyPasskeySignIn({ challenge, response }, (tx, proof) => userService.finishPasskeySignIn(tx, proof));
+    await sendPasswordSignIn(req, res, signedIn, {}, "passkey_login");
+  } catch (err) {
+    sendPasskeySignInError(req, res, err, "Sign-in failed");
   }
 });
 
@@ -1330,8 +1755,27 @@ authRouter.post("/refresh", async (req, res) => {
     );
     recordAuthRefreshTrace(refreshed, replayTrace, {
       authRefreshAttemptId,
+      authRefreshInstallationId,
+      refreshToken,
+      userAgent: req.get("user-agent"),
     });
     if (!refreshed) {
+      if (replayTrace.replayLookupResult === "superseded") {
+        // The token this replay would hand back was itself refreshed since:
+        // the client lost that rotation (task #72). Still a sign-in, but the
+        // client can log why.
+        attachAuthTraceIdentity(req, { source: "refresh", reason: "refresh_rotation_superseded" });
+        res.status(401).json({ error: "Refresh token was already rotated", code: "refresh_rotation_superseded" });
+        return;
+      }
+      if (await sessionService.isRevokedSessionRefreshToken(refreshToken)) {
+        // This sign-in was ended (signed out, or by a security change made
+        // from another sign-in such as turning two-step verification on).
+        // A 401 like any refresh failure: every client signs in again.
+        attachAuthTraceIdentity(req, { source: "refresh", reason: "refresh_session_revoked" });
+        refuse(res, 401, { code: "session_revoked", error: "This sign-in was ended. Sign in again." });
+        return;
+      }
       attachAuthTraceIdentity(req, { source: "refresh", reason: "invalid_or_expired_refresh" });
       res.status(401).json({ error: "Invalid or expired refresh token" });
       return;
@@ -1354,7 +1798,14 @@ authRouter.post("/refresh", async (req, res) => {
 authRouter.get("/me", requireAuth, async (req, res) => {
   try {
     attachAuthTraceIdentity(req, { userId: req.userId!, source: "require_auth" });
-    const user = await userService.getUser(req.userId!);
+    // Additive (deep links, 1d): Raft Desktop's web client sends
+    // X-Raft-Client-Platform: desktop_app, so its profile load is the record
+    // that this account uses the app (a throttled write). The same read then
+    // answers usedDesktopAppRecently; only this account's own /me carries it.
+    if (req.get("x-raft-client-platform")?.trim() === "desktop_app") {
+      await userService.recordDesktopAppSeen(req.userId!).catch(() => undefined);
+    }
+    const user = await userService.getUser(req.userId!, { withDesktopAppHint: true });
     if (!user) {
       respondInvalidOrExpiredToken(res);
       return;
@@ -1434,7 +1885,8 @@ authRouter.post("/me/complete-profile", requireAuth, async (req, res) => {
     const user = await userService.completeProfile(req.userId!, {
       name,
       displayName: parsed.data.displayName,
-    });
+    }, () => recordAccountProfileCompleted(req, req.userId!));
+    await announceProfileChange(req, user);
     res.json(user);
   } catch (err) {
     if (err instanceof userService.CompleteProfileError) {
@@ -1483,6 +1935,60 @@ authRouter.get("/me/username-available", requireAuth, async (req, res) => {
 });
 
 // Update current user profile
+/**
+ * A person's name or avatar changed: the viewers who may see them in each of
+ * their servers' member lists hear `user:profile-updated` and patch that one
+ * member in place (userProfileEvents.ts). Best effort: the change is saved.
+ */
+async function announceProfileChange(
+  req: Request,
+  user: { id: string; name: string; displayName: string | null; avatarUrl: string | null },
+): Promise<void> {
+  const io = req.app.get("io") as SocketServer | undefined;
+  if (!io) return;
+  const { id: userId, name, displayName, avatarUrl } = user;
+  try {
+    await announceUserProfileUpdated(io, { userId, name, displayName, avatarUrl });
+  } catch (err) {
+    console.warn(`[profile] Failed to announce a profile change for ${userId}:`, serializeErrorForLog(err));
+  }
+}
+
+/**
+ * What `PATCH /me { avatarUrl }` may set (Tenny, after #14303): no avatar
+ * (null or ""), the photo this person already shows, or a built avatar they
+ * chose. A photo is theirs only through `POST /me/avatar`, which stores it and
+ * sets it as their avatar; uploads are shared by content hash and record no
+ * other owner, so the one stored photo they may name is their current one (any
+ * spelling of its URL; the stored value is kept as it is). A built avatar must
+ * be a v1 recipe this build knows, without the Server-picked `/auto` marker,
+ * and is stored in its canonical form. Anything else is refused.
+ */
+function patchedAvatarUrl(
+  value: unknown,
+  currentAvatarUrl: string | null,
+): { ok: true; avatarUrl: string | null } | { ok: false; code: string; error: string } {
+  if (value === null || value === "") return { ok: true, avatarUrl: null };
+  if (typeof value === "string") {
+    const hash = storedUserAvatarContentHash(value);
+    if (hash) {
+      if (hash === storedUserAvatarContentHash(currentAvatarUrl)) return { ok: true, avatarUrl: currentAvatarUrl };
+      return {
+        ok: false,
+        code: "PROFILE_AVATAR_URL_NOT_OWN",
+        error: "That photo is not your current avatar: upload the image to make it your avatar.",
+      };
+    }
+    const recipe = isAutoHumanAvatarUrl(value) ? null : parseHumanAvatarRecipe(value);
+    if (recipe) return { ok: true, avatarUrl: serializeHumanAvatarRecipe(recipe) };
+  }
+  return {
+    ok: false,
+    code: "PROFILE_AVATAR_URL_INVALID",
+    error: "An avatar can only be removed (null), your own uploaded photo, or a pixel avatar built from the builder's options.",
+  };
+}
+
 authRouter.patch("/me", requireAuth, async (req, res) => {
   try {
     const {
@@ -1498,13 +2004,35 @@ authRouter.patch("/me", requireAuth, async (req, res) => {
       signupSurveyServerId,
     } = req.body;
 
+    // The avatar is checked before anything in this request is applied.
+    let previousAvatarUrl: string | null = null;
+    let nextAvatarUrl: string | null | undefined;
+    if (avatarUrl !== undefined) {
+      const currentUser = await userService.getUser(req.userId!);
+      if (!currentUser) {
+        respondInvalidOrExpiredToken(res);
+        return;
+      }
+      previousAvatarUrl = currentUser.avatarUrl ?? null;
+      const checked = patchedAvatarUrl(avatarUrl, previousAvatarUrl);
+      if (!checked.ok) {
+        refuse(res, 400, { code: checked.code, error: checked.error });
+        return;
+      }
+      nextAvatarUrl = checked.avatarUrl;
+    }
+
     // Password change
     if (currentPassword && newPassword) {
       if (newPassword.length < 8) {
         res.status(400).json({ error: "New password must be at least 8 characters" });
         return;
       }
-      await userService.changePassword(req.userId!, currentPassword, newPassword);
+      // Two-step verification on: this sign-in passed it in the last 10
+      // minutes, or nothing in this request is applied (stepUpGate.ts).
+      if (await refuseWithoutRecentSecondFactor(res, req.userId!, sessionService.webSessionFamilyOf(req), "password_change")) return;
+      // The session that gave the current password keeps what it issued (securityRevokeCascade.ts).
+      await userService.changePassword(req.userId!, currentPassword, newPassword, sessionService.webSessionFamilyOf(req));
     }
 
     // Profile update (name is immutable — set at registration only)
@@ -1520,6 +2048,11 @@ authRouter.patch("/me", requireAuth, async (req, res) => {
       preferredTranslationDisplay?: PreferredTranslationDisplay;
       preferredTimeFormat?: TimeFormatPreference | null;
       preferredMessageBodyFontSize?: MessageBodyFontSizePreference | null;
+      railTabOrder?: string[] | null;
+      assistantOtterVisible?: boolean;
+      assistantOtterShortcut?: string | null;
+      composerSendKey?: StoredComposerSendKey;
+      shortcutOverrides?: StoredShortcutOverrides | null;
       shareUsageData?: boolean | null;
       referralSource?: string | null;
       referralSourceOther?: string | null;
@@ -1527,15 +2060,16 @@ authRouter.patch("/me", requireAuth, async (req, res) => {
       signupRole?: string | null;
       signupSurveyCompletedAt?: Date | null;
     } = {};
-    if (displayName !== undefined) profileFields.displayName = displayName;
+    // Free text other people's agents read: a display name has no line break, a description only `\n`.
+    if (displayName !== undefined) profileFields.displayName = typeof displayName === "string" ? replaceAgentLineBreaks(displayName, " ") : displayName;
     if (description !== undefined) {
       if (description !== null && (typeof description !== "string" || description.length > MAX_USER_DESCRIPTION_LENGTH)) {
         res.status(400).json({ error: `Description must be a string of at most ${MAX_USER_DESCRIPTION_LENGTH} characters` });
         return;
       }
-      profileFields.description = typeof description === "string" ? (description.trim() || null) : null;
+      profileFields.description = typeof description === "string" ? (replaceAgentLineBreaks(description, "\n").trim() || null) : null;
     }
-    if (avatarUrl !== undefined) profileFields.avatarUrl = avatarUrl;
+    if (nextAvatarUrl !== undefined) profileFields.avatarUrl = nextAvatarUrl;
     try {
       const preferredLanguage = parsePreferredLanguage(req.body?.preferredLanguage);
       if (preferredLanguage !== undefined) profileFields.preferredLanguage = preferredLanguage;
@@ -1559,6 +2093,16 @@ authRouter.patch("/me", requireAuth, async (req, res) => {
       if (preferredTimeFormat !== undefined) profileFields.preferredTimeFormat = preferredTimeFormat;
       const preferredMessageBodyFontSize = parsePreferredMessageBodyFontSize(req.body?.preferredMessageBodyFontSize);
       if (preferredMessageBodyFontSize !== undefined) profileFields.preferredMessageBodyFontSize = preferredMessageBodyFontSize;
+      const railTabOrder = parseRailTabOrder(req.body?.railTabOrder);
+      if (railTabOrder !== undefined) profileFields.railTabOrder = railTabOrder;
+      const assistantOtterVisible = parseAssistantOtterVisible(req.body?.assistantOtterVisible);
+      if (assistantOtterVisible !== undefined) profileFields.assistantOtterVisible = assistantOtterVisible;
+      const assistantOtterShortcut = parseAssistantOtterShortcutPreference(req.body?.assistantOtterShortcut);
+      if (assistantOtterShortcut !== undefined) profileFields.assistantOtterShortcut = assistantOtterShortcut;
+      const composerSendKey = parseComposerSendKeyPreference(req.body?.composerSendKey);
+      if (composerSendKey !== undefined) profileFields.composerSendKey = composerSendKey;
+      const shortcutOverrides = parseShortcutOverridesPreference(req.body?.shortcutOverrides);
+      if (shortcutOverrides !== undefined) profileFields.shortcutOverrides = shortcutOverrides;
       const shareUsageData = parseShareUsageData(req.body?.shareUsageData);
       if (shareUsageData !== undefined) profileFields.shareUsageData = shareUsageData;
     } catch (err) {
@@ -1613,6 +2157,8 @@ authRouter.patch("/me", requireAuth, async (req, res) => {
       await setProductAnalyticsOptOut(getDb(), req.userId!, !profileFields.shareUsageData);
     }
 
+    // Any avatar change (null included): the photo it replaces goes
+    // (previousAvatarUrl, read when the avatar was checked).
     let user;
     if (Object.keys(profileFields).length > 0) {
       user = await userService.updateUser(req.userId!, profileFields);
@@ -1624,6 +2170,10 @@ authRouter.patch("/me", requireAuth, async (req, res) => {
       respondInvalidOrExpiredToken(res);
       return;
     }
+    if (profileFields.displayName !== undefined || profileFields.avatarUrl !== undefined) {
+      await announceProfileChange(req, user);
+    }
+    if (profileFields.avatarUrl !== undefined) await deleteReplacedUserAvatar(previousAvatarUrl, user.avatarUrl);
 
     // Brief Cindy at the moment the owner actually enters the server ("Let's go"),
     // not when the survey saves a screen earlier. Her briefing was deferred at agent
@@ -1679,6 +2229,7 @@ authRouter.post("/me/avatar", requireAuth, async (req, res) => {
       respondInvalidOrExpiredToken(res);
       return;
     }
+    await announceProfileChange(req, user);
 
     res.json(user);
   } catch (err: any) {
@@ -1705,6 +2256,59 @@ authRouter.post("/me/avatar", requireAuth, async (req, res) => {
   }
 });
 
+// Set the current user's avatar to a built pixel avatar: the options, never an
+// image (shared humanAvatar.ts). It replaces whatever avatar was there; a photo
+// Raft stored is deleted unless someone else still shows it. It shares the
+// /api/auth rate limit and tells the person's servers, like an upload.
+//
+// Behind human_avatar_builder_v0: the server the request names when the
+// person is in it, else any of their servers (humanAvatarBuilderFlag.ts).
+authRouter.put("/me/avatar-recipe", requireAuth, async (req, res) => {
+  try {
+    if (!(await isHumanAvatarBuilderOnForPerson(req.userId!, req.headers["x-server-id"]))) {
+      refuse(res, 404, {
+        code: "HUMAN_AVATAR_BUILDER_DISABLED",
+        error: "Building an avatar isn't available on this server yet: upload a photo instead.",
+      });
+      return;
+    }
+    const parsed = setHumanAvatarRecipeBodySchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      refuse(res, 400, {
+        code: "PROFILE_AVATAR_RECIPE_INVALID",
+        error: "That avatar has an option this server doesn't know: pick every part from the builder's own options.",
+      });
+      return;
+    }
+    const previous = await userService.getUser(req.userId!);
+    const user = await userService.updateUser(req.userId!, { avatarUrl: serializeHumanAvatarRecipe(parsed.data.recipe) });
+    if (!user) {
+      respondInvalidOrExpiredToken(res);
+      return;
+    }
+    await announceProfileChange(req, user);
+    await deleteReplacedUserAvatar(previous?.avatarUrl, user.avatarUrl);
+    res.json(user);
+  } catch (err) {
+    sendJsonServerError(req, res, {
+      error: "Failed to save avatar",
+      logPrefix: "User avatar recipe error:",
+      err,
+    });
+  }
+});
+
+/**
+ * The page a sign-up came from, carried through the verification email and
+ * back from verify-email (#88: an Artifact link survives sign-up). Client
+ * input: only a same-site relative path survives (sanitizeReturnTo, the
+ * social sign-in's validator); anything else is dropped silently (undefined: land on `/`).
+ */
+function verificationReturnTo(value: unknown): string | undefined {
+  const path = sanitizeReturnTo(value);
+  return path === "/" ? undefined : path;
+}
+
 // Verify email
 authRouter.post("/verify-email", async (req, res) => {
   try {
@@ -1714,13 +2318,16 @@ authRouter.post("/verify-email", async (req, res) => {
       return;
     }
 
-    const success = await userService.verifyEmail(token);
-    if (!success) {
+    const verified = await userService.verifyEmailToken(token);
+    if (!verified) {
       res.status(400).json({ error: "Invalid or expired verification token" });
       return;
     }
+    if (verified.newlyVerified) recordEmailVerified(req, verified.userId);
 
-    res.json({ ok: true });
+    // Where the web lands after verifying: the link's returnTo, validated here again (it came back through a URL).
+    const returnTo = verificationReturnTo(req.body?.returnTo);
+    res.json(returnTo ? { ok: true, returnTo } : { ok: true });
   } catch {
     res.status(500).json({ error: "Email verification failed" });
   }
@@ -1729,15 +2336,18 @@ authRouter.post("/verify-email", async (req, res) => {
 // Resend verification email
 authRouter.post("/resend-verification", requireAuth, async (req, res) => {
   try {
-    await userService.resendVerificationEmail(req.userId!);
+    await userService.resendVerificationEmail(req.userId!, verificationReturnTo(req.body?.returnTo));
+    recordEmailVerificationSent(req, req.userId!, "resend", "sent");
     res.json({ ok: true });
   } catch (err: any) {
     const msg = err?.message || "";
     if (msg.includes("already verified")) {
       res.status(400).json({ error: msg });
     } else if (msg.includes("Too many") || msg.includes("Please wait")) {
+      recordEmailVerificationSent(req, req.userId!, "resend", "rate_limited");
       res.status(429).json({ error: msg });
     } else {
+      if (!msg.includes("User not found")) recordEmailVerificationSent(req, req.userId!, "resend", "failed");
       sendJsonServerError(req, res, {
         error: "Failed to resend verification email",
         logPrefix: "Resend verification error:",
@@ -1792,7 +2402,7 @@ authRouter.post("/reset-password", async (req, res) => {
 });
 
 // Accept invite (authenticated user joins a server)
-authRouter.post("/accept-invite", requireAuth, requireProfileSetupComplete, async (req, res) => {
+authRouter.post("/accept-invite", requireAuth, requireVerified, async (req, res) => {
   try {
     const { token, agreementId } = req.body;
     if (!token) {
@@ -1800,20 +2410,38 @@ authRouter.post("/accept-invite", requireAuth, requireProfileSetupComplete, asyn
       return;
     }
 
-    const result = await inviteService.acceptInvite(token, req.userId!, {
-      agreementId: typeof agreementId === "string" ? agreementId : null,
-      ...getAgreementRequestMetadata(req),
+    // The join and the end of their seat notice commit apart: one seat-join-blocks:changed.
+    const result = await coalesceListChanges(async () => {
+      const accepted = await inviteService.acceptInvite(token, req.userId!, {
+        agreementId: typeof agreementId === "string" ? agreementId : null,
+        ...getAgreementRequestMetadata(req),
+      });
+      // Committed: deliver the server.member_added App Notification now.
+      kickAppNotificationDelivery();
+      // They're in: a notice that a full link turned them away goes (task #10).
+      await seatJoinBlockService.resolveSeatJoinBlock({ serverId: accepted.serverId, userId: req.userId!, reason: "joined" })
+        .catch((err: unknown) => console.warn(`[seat-join-blocks] Failed to resolve after invite accept for ${req.userId}:`, serializeErrorForLog(err)));
+      return accepted;
     });
-    // Committed: deliver the server.member_added App Notification now.
-    kickAppNotificationDelivery();
     const io = req.app.get("io") as SocketServer | undefined;
     const agentOrchestrator = req.app.get("agentOrchestrator") as AgentOrchestrator | undefined;
     if (io) {
-      io.to(`server:${result.serverId}`).emit("server:member-added", {
-        serverId: result.serverId,
-        userId: req.userId!,
-      });
+      if (result.promotedFromGuest) {
+        // A Guest promoted to member (inviteService.promoteGuestByInvite), as a role change by hand announces it.
+        io.to(`server:${result.serverId}`).emit("server:member-updated", {
+          serverId: result.serverId,
+          userId: req.userId!,
+          previousRole: result.promotedFromGuest.previousRole,
+          role: result.promotedFromGuest.role,
+        });
+      } else {
+        io.to(`server:${result.serverId}`).emit("server:member-added", {
+          serverId: result.serverId,
+          userId: req.userId!,
+        });
+      }
       if (agentOrchestrator) {
+        // A promoted Guest is onboarded now: Guests skip it.
         void onboardingService.triggerNewMemberOnboarding(io, agentOrchestrator, result.serverId, req.userId!).catch((err: unknown) => {
           console.warn(`[Onboarding] Failed to trigger member onboarding after invite accept for ${req.userId}:`, serializeErrorForLog(err));
         });
@@ -1832,6 +2460,11 @@ authRouter.post("/accept-invite", requireAuth, requireProfileSetupComplete, asyn
       res.status(agreementResponse.status).json(agreementResponse.body);
       return;
     }
+    // The Raft License's user limit (source-available): 403 with its code.
+    if (err instanceof DeploymentUserLimitError) {
+      refuse(res, err.status, err.refusal);
+      return;
+    }
     const msg = err?.message || "";
     if (
       msg.includes("Invalid")
@@ -1839,11 +2472,13 @@ authRouter.post("/accept-invite", requireAuth, requireProfileSetupComplete, asyn
       || msg.includes("already")
       || msg.includes("revoked")
       || msg.includes("usage limit")
+      || msg.includes("no longer valid")
       || msg.includes("different email")
       || msg.includes("seat limit")
       || msg.includes("limit reached")
     ) {
-      res.status(400).json({ error: msg });
+      // The code only: the invitee isn't a member yet, so no numbers.
+      res.status(400).json(err instanceof HumanSeatLimitError ? { error: msg, code: err.code } : { error: msg });
     } else {
       sendJsonServerError(req, res, {
         error: "Failed to accept invite",
@@ -1875,10 +2510,37 @@ authRouter.get("/invite-info", async (req, res) => {
   }
 });
 
+// A signed-in person's page of a full invite or join link says its owners were
+// told (task #10, behind pro_seat_add): this tells them. The server checks the
+// token, the flag, that they aren't a member and that the seats really are
+// full; who made the link comes from the token. seatJoinBlockService.ts.
+invitesRouter.post("/seat-blocked", requireAuth, requireProfileSetupComplete, async (req, res) => {
+  try {
+    const token = typeof req.body?.token === "string" ? req.body.token : "";
+    if (!token) {
+      res.status(400).json({ error: "Invite token is required" });
+      return;
+    }
+    const out = await seatJoinBlockService.recordSeatJoinBlock(token, req.userId!);
+    if (!out) {
+      res.status(404).json({ error: "Invalid or expired invite" });
+      return;
+    }
+    res.json(out);
+  } catch (err) {
+    sendJsonServerError(req, res, {
+      error: "Failed to record the blocked join",
+      logPrefix: "Seat-blocked invite error:",
+      err,
+    });
+  }
+});
+
 // Logout
 authRouter.post("/logout", async (req, res) => {
   try {
-    const { refreshToken } = req.body;
+    // No body (or no token) logs nothing out: the client already dropped its tokens.
+    const refreshToken = typeof req.body?.refreshToken === "string" ? req.body.refreshToken : null;
     if (refreshToken) {
       const revoked = await sessionService.revokeSession(refreshToken);
       if (revoked) {

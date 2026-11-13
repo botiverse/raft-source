@@ -68,7 +68,7 @@ export function resolveComputerLifecycleOperationId(
   return acknowledgement.operationId ?? acknowledgement.requestId ?? null;
 }
 
-export async function createUserComputerLifecycleOperation(input: {
+type ComputerLifecycleOperationInput = {
   operationId?: string;
   parentOperationId?: string | null;
   serverId: string;
@@ -84,10 +84,49 @@ export async function createUserComputerLifecycleOperation(input: {
     targetVersion: string;
     adapter: string;
   };
-}, options: { executor?: DatabaseExecutor } = {}): Promise<{
+};
+
+type CreatedComputerLifecycleOperation = {
   operationId: string;
   dispatch?: { operationId: string; action: "restart" | "upgrade"; targetVersion: string };
-} | null> {
+} | null;
+
+/** A person's start/stop/restart/upgrade of a Computer, recorded with them as its actor. */
+export function createUserComputerLifecycleOperation(
+  input: ComputerLifecycleOperationInput,
+  options: { executor?: DatabaseExecutor } = {},
+): Promise<CreatedComputerLifecycleOperation> {
+  return createComputerLifecycleOperation({ ...input, cause: "user_action" }, options);
+}
+
+/**
+ * A start/stop/restart asked for on the machine itself (`raft-computer
+ * start|stop|restart`), recorded by its own key (POST
+ * /internal/computer/lifecycle-operations). No person is named: whoever can
+ * run the service's commands on that machine is its owner, so the honest
+ * actor is "this machine, locally" (cause `machine_local`, no actor user).
+ */
+export function createMachineLocalComputerLifecycleOperation(
+  input: Omit<ComputerLifecycleOperationInput, "actorUserId" | "dispatchMode" | "dispatch" | "targetVersion" | "broadcastPolicyDecision" | "action"> & {
+    action: Exclude<ComputerLifecycleAction, "upgrade">;
+  },
+  options: { executor?: DatabaseExecutor } = {},
+): Promise<CreatedComputerLifecycleOperation> {
+  return createComputerLifecycleOperation({
+    ...input,
+    actorUserId: null,
+    dispatchMode: "local",
+    cause: "machine_local",
+  }, options);
+}
+
+async function createComputerLifecycleOperation(
+  input: Omit<ComputerLifecycleOperationInput, "actorUserId"> & (
+    | { cause: "user_action"; actorUserId: string }
+    | { cause: "machine_local"; actorUserId: null }
+  ),
+  options: { executor?: DatabaseExecutor } = {},
+): Promise<CreatedComputerLifecycleOperation> {
   // With a caller executor every read and write below (including the idempotent re-selects) runs in that transaction.
   const db = options.executor ?? getDb();
   const [computer] = await db.select({ id: computers.id })
@@ -107,7 +146,7 @@ export async function createUserComputerLifecycleOperation(input: {
       computerId: computer.id,
       machineId: input.machineId,
       action: input.action,
-      cause: "user_action",
+      cause: input.cause,
       actorUserId: input.actorUserId,
       dispatchMode: input.dispatchMode,
       ...(input.connectionEpochBefore ? { connectionEpochBefore: input.connectionEpochBefore } : {}),
@@ -168,6 +207,7 @@ export async function createUserComputerLifecycleOperation(input: {
     machineId: computerLifecycleOperations.machineId,
     action: computerLifecycleOperations.action,
     actorUserId: computerLifecycleOperations.actorUserId,
+    cause: computerLifecycleOperations.cause,
     parentOperationId: computerLifecycleOperations.parentOperationId,
     dispatchMode: computerLifecycleOperations.dispatchMode,
     targetVersion: computerLifecycleOperations.targetVersion,
@@ -190,6 +230,7 @@ export async function createUserComputerLifecycleOperation(input: {
     && existing.machineId === input.machineId
     && existing.action === input.action
     && existing.actorUserId === input.actorUserId
+    && existing.cause === input.cause
     && existing.targetVersion === (input.targetVersion ?? null)
     && isDeepStrictEqual(
       existing.broadcastPolicyDecision,

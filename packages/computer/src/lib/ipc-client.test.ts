@@ -360,7 +360,7 @@ test("IPC_ERROR_CODES — closed-set sentinel: 10 tokens, exact-shape, no silent
   // a forward-only minor library bump (must update this assertion);
   // removing / renaming / reordering tokens is a major bump (must
   // update this assertion AND the lib semver).
-  assert.equal(IPC_ERROR_CODES.length, 11, "IPC_ERROR_CODES tuple length must be 11");
+  assert.equal(IPC_ERROR_CODES.length, 12, "IPC_ERROR_CODES tuple length must be 12");
   assert.deepEqual(
     [...IPC_ERROR_CODES],
     [
@@ -375,6 +375,7 @@ test("IPC_ERROR_CODES — closed-set sentinel: 10 tokens, exact-shape, no silent
       "SELF_RELAUNCH_UNAVAILABLE",
       "CONTROL_BUSY",
       "UPGRADE_START_REJECTED",
+      "IPC_METHOD_UNSUPPORTED",
     ],
     "IPC_ERROR_CODES exact-shape sentinel — extending requires updating this test (forward-only minor); reordering / removing / renaming requires major lib bump",
   );

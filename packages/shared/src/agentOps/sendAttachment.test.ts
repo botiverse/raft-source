@@ -15,7 +15,7 @@ describe("renderSendAttachment", () => {
       `  ├ Latest 2 ${"─".repeat(28)}`,
       "  │ @richard 09:00  a",
       "  │ @richard 09:00  b",
-      "  └ Previews are truncated. Full text: raft message read --target \"#ops\"",
+      `  └ ${"─".repeat(40)}`,
     ]);
   });
 

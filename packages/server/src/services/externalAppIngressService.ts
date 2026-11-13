@@ -1,6 +1,8 @@
+import type { SlackLifecycleMemberProfile } from "./slackChannelLifecycleObservation";
+import { parseSlackEditTimestamp } from "./slackMessageEditTimestamp";
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 
-import { and, desc, eq } from "drizzle-orm";
+import { and, desc, eq, inArray } from "drizzle-orm";
 import { currentDate, SLACK_BRIDGE_FEATURE_FLAG_KEYS } from "@botiverse/raft-shared";
 
 import { getDb, type DatabaseExecutor } from "../db/index";
@@ -21,10 +23,20 @@ import {
   resolveExternalBindingAuthority,
   type ExternalBindingAuthorityDecision,
 } from "./externalAppControlPlaneService";
-import { reconcileSlackChannelLifecycle } from "./slackBindingLifecycleService";
+import { parseSlackLifecycleClock, slackLifecycleClockAt, slackLifecycleClockIsNewer } from "./slackChannelLifecycleObservation";
+import { reconcileSlackChannelLifecycle, recordVerifiedSlackChannelDeletion, type SlackChannelLifecycleEvent } from "./slackBindingLifecycleService";
 import { evaluateFeatureFlag } from "./featureFlagService";
 import { slackBridgeDatabaseRuntimeRevision } from "./slackBridgeDatabaseRuntimeAuthority";
 import { extractSlackUsergroupMentions } from "./slackMentionTokens";
+import { serializeSlackVerifiedEvent, type SlackVerifiedIngressAad, type SlackVerifiedIngressPayloadCrypto } from "./slackVerifiedIngressContracts";
+import { enqueueSlackVerifiedIngress } from "./slackVerifiedIngressInbox";
+import { isSlackVerifiedIngressEnvelope } from "./slackVerifiedIngressCrypto";
+import { readSlackInboundSelfIdentity } from "./slackInboundSelfIdentity";
+import { summarizeSlackInboundIdentity, type SlackTestIdentityObserver } from "./slackInboundIdentityObservation";
+
+// Bound diagnostic work independently of the message admission path.
+const MAX_SLACK_IDENTITY_OBSERVATIONS_IN_FLIGHT = 4;
+let slackIdentityObservationsInFlight = 0;
 
 const SLACK_SIGNATURE_MAX_SKEW_SECONDS = 5 * 60;
 const EXTERNAL_EVENT_PAYLOAD_TTL_MS = 24 * 60 * 60_000;
@@ -39,6 +51,9 @@ type ActiveBindingAuthority = Extract<ExternalBindingAuthorityDecision, { active
 type EventStatus = "queued" | "quarantined" | "paused" | "revoked" | "unsupported" | "committed" | "duplicate" | "echo" | "dead";
 type IntentionalDiscardReason =
   | "unsupported_event"
+  | "lifecycle_metadata_processed"
+  | "lifecycle_metadata_stale_authority"
+  | "lifecycle_metadata_unpaired"
   | "provider_tokens_unrelated"
   | "provider_loop_suppressed"
   | "unsupported_message_subtype"
@@ -72,7 +87,7 @@ export interface ExternalIngressSecretResolver {
 export type ExternalInboundPayloadAad = {
   purpose: typeof PAYLOAD_AAD_PURPOSE;
   aadVersion: 1;
-  schemaVersion: 1 | 2 | 3;
+  schemaVersion: 1 | 2 | 3 | 4;
   provider: "slack";
   environment: Environment;
   appRegistrationId: string;
@@ -155,11 +170,14 @@ type SlackEnvelope = {
   team_id?: unknown;
   enterprise_id?: unknown;
   event_id?: unknown;
+  event_time?: unknown;
+  minute_rate_limited?: unknown;
   challenge?: unknown;
   event?: {
     type?: unknown;
     subtype?: unknown;
     channel?: unknown;
+    channel_id?: unknown;
     user?: unknown;
     text?: unknown;
     ts?: unknown;
@@ -167,6 +185,7 @@ type SlackEnvelope = {
     bot_id?: unknown;
     app_id?: unknown;
     files?: unknown;
+    message?: SlackEnvelope["event"] & { edited?: { ts?: unknown; user?: unknown } };
     reaction?: unknown;
     event_ts?: unknown;
     item?: {
@@ -314,6 +333,7 @@ async function endpointStillCurrent(input: {
   requestUrl: string;
   endpointRevision: number;
   signingSecretRevision: number;
+  lockMode?: "update" | "share";
 }): Promise<boolean> {
   const [registration] = await input.executor.select().from(externalAppRegistrations).where(and(
     eq(externalAppRegistrations.id, input.registrationId),
@@ -321,7 +341,7 @@ async function endpointStillCurrent(input: {
     eq(externalAppRegistrations.providerAppId, input.providerAppId),
     eq(externalAppRegistrations.environment, input.environment),
     eq(externalAppRegistrations.state, "active"),
-  )).for("update").limit(1);
+  )).for(input.lockMode ?? "update").limit(1);
   const [endpoint] = await input.executor.select().from(externalAppIngressEndpoints).where(and(
     eq(externalAppIngressEndpoints.id, input.endpointId),
     eq(externalAppIngressEndpoints.registrationId, input.registrationId),
@@ -330,12 +350,12 @@ async function endpointStillCurrent(input: {
     eq(externalAppIngressEndpoints.state, "active"),
     eq(externalAppIngressEndpoints.endpointRevision, input.endpointRevision),
     eq(externalAppIngressEndpoints.signingSecretRevision, input.signingSecretRevision),
-  )).for("update").limit(1);
+  )).for(input.lockMode ?? "update").limit(1);
   const [secret] = await input.executor.select().from(externalAppRegistrationSecrets).where(and(
     eq(externalAppRegistrationSecrets.registrationId, input.registrationId),
     eq(externalAppRegistrationSecrets.purpose, "signing_secret"),
     eq(externalAppRegistrationSecrets.secretRevision, input.signingSecretRevision),
-  )).for("update").limit(1);
+  )).for(input.lockMode ?? "update").limit(1);
   return Boolean(registration && endpoint && secret && !secret.revokedAt);
 }
 
@@ -355,10 +375,11 @@ async function recordIntentionalDiscard(input: {
   slackRetryReasonHeader?: string | null;
   rawBody: Buffer;
   now: Date;
+  executor?: DatabaseExecutor;
 }): Promise<string> {
   const slackRetryNum = optionalHeader(input.slackRetryNumHeader, 32, "retry number");
   const slackRetryReason = optionalHeader(input.slackRetryReasonHeader, 160, "retry reason");
-  const receiptId = await getDb().transaction(async (tx) => {
+  const persist = async (tx: DatabaseExecutor) => {
     if (!await endpointStillCurrent({
       executor: tx,
       endpointId: input.endpointId,
@@ -387,7 +408,8 @@ async function recordIntentionalDiscard(input: {
       receivedAt: input.now,
     }).returning({ id: externalIngressDiscardReceipts.id });
     return created?.id ?? null;
-  });
+  };
+  const receiptId = input.executor ? await persist(input.executor) : await getDb().transaction(persist);
   if (!receiptId) {
     throw new ExternalAppIngressError("External ingress authority changed", "external_ingress_endpoint_unavailable");
   }
@@ -439,6 +461,11 @@ async function revokeInstallForLifecycleEvent(input: {
   now: Date;
 }): Promise<{ authorityCurrent: boolean; changed: boolean }> {
   return getDb().transaction(async (tx) => {
+    let changed = false;
+    const installs = await tx.select().from(externalAppInstalls).where(and(
+      eq(externalAppInstalls.registrationId, input.registrationId),
+      eq(externalAppInstalls.providerAuthorityId, input.providerAuthorityId),
+    )).orderBy(externalAppInstalls.id).for("update");
     if (!await endpointStillCurrent({
       executor: tx,
       endpointId: input.endpointId,
@@ -452,11 +479,6 @@ async function revokeInstallForLifecycleEvent(input: {
     })) {
       return { authorityCurrent: false, changed: false };
     }
-    let changed = false;
-    const installs = await tx.select().from(externalAppInstalls).where(and(
-      eq(externalAppInstalls.registrationId, input.registrationId),
-      eq(externalAppInstalls.providerAuthorityId, input.providerAuthorityId),
-    )).for("update");
     for (const install of installs) {
       if (install.state !== "active") continue;
       if (
@@ -521,6 +543,11 @@ export async function verifyAndAdmitSlackIngress(input: {
   secretResolver: ExternalIngressSecretResolver;
   payloadSealer: ExternalIngressPayloadSealer;
   runtimeResolver?: ExternalIngressRuntimeResolver;
+  /** Internal rollout seam; do not enable while legacy writers/workers exist. */
+  verifiedIngressCrypto?: SlackVerifiedIngressPayloadCrypto;
+  testIdentityObserver?: SlackTestIdentityObserver;
+  requestLifecycleRefresh?(bindingId: string): void;
+  readLifecycleMemberProfile?(bindingId: string, providerUserId: string): Promise<SlackLifecycleMemberProfile | null>;
   now?: Date;
 }): Promise<SlackIngressAdmission> {
   const now = input.now ?? currentDate();
@@ -581,11 +608,113 @@ export async function verifyAndAdmitSlackIngress(input: {
   if (providerAppId !== loaded.registration.providerAppId) {
     throw new ExternalAppIngressError("Slack application identity is invalid", "external_ingress_authority_unavailable");
   }
+  if (envelope.type === "app_rate_limited") {
+    const team = nonEmpty(envelope.team_id, 160);
+    const minute = envelope.minute_rate_limited;
+    if (!team || !Number.isSafeInteger(minute) || (minute as number) <= 0) {
+      throw new ExternalAppIngressError("Slack rate notice is invalid", "external_ingress_payload_invalid");
+    }
+    const current = await getDb().transaction((tx) => endpointStillCurrent({ executor: tx,
+      endpointId: loaded.endpoint.id, registrationId: loaded.registration.id, provider: loaded.registration.provider,
+      providerAppId: loaded.registration.providerAppId, environment: input.environment, requestUrl: input.requestUrl,
+      endpointRevision: loaded.endpoint.endpointRevision, signingSecretRevision: loaded.endpoint.signingSecretRevision }));
+    if (!current) throw new ExternalAppIngressError("External ingress authority changed", "external_ingress_endpoint_unavailable");
+    console.warn("[Slack Bridge] Slack reported event delivery throttling");
+    const noticeId = createHash("sha256").update(JSON.stringify([team, minute])).digest("hex");
+    return { kind: "event", eventInboxId: noticeId, duplicate: false,
+      status: "unsupported", reason: "app_rate_limited", authority: null };
+  }
+  if (input.verifiedIngressCrypto && envelope.type !== "event_callback") {
+    throw new ExternalAppIngressError("Slack event payload is invalid", "external_ingress_payload_invalid");
+  }
 
   const providerEventId = nonEmpty(envelope.event_id);
   const providerAuthorityId = nonEmpty(envelope.team_id) ?? nonEmpty(envelope.enterprise_id);
   if (!providerEventId || !providerAuthorityId) {
     throw new ExternalAppIngressError("Slack event identity is invalid", "external_ingress_payload_invalid");
+  }
+  const observer = input.testIdentityObserver;
+  // Diagnostics never affect admission, discard or retries. Only the exact
+  // opted-in test channel is observed after signature and identity validation;
+  // no event content, identifiers or credentials are emitted.
+  if (observer && !input.slackRetryNumHeader && envelope.type === "event_callback" && envelope.event?.type === "message"
+    && typeof envelope.event?.channel === "string"
+    && observer.providerConversationIds.includes(envelope.event.channel)
+    && slackIdentityObservationsInFlight < MAX_SLACK_IDENTITY_OBSERVATIONS_IN_FLIGHT) {
+    slackIdentityObservationsInFlight += 1;
+    void (async () => {
+      const aad = { registrationId: loaded.registration.id, environment: input.environment,
+        providerAppId: loaded.registration.providerAppId, providerAuthorityId };
+      const identity = await readSlackInboundSelfIdentity({ db: getDb(), aad });
+      const outer = envelope.event!;
+      const message = outer.subtype === "message_changed" && outer.message && typeof outer.message === "object"
+        ? outer.message : outer;
+      if (identity) {
+        const sample = summarizeSlackInboundIdentity({ message, providerAppId: identity.providerAppId,
+          selfBotIds: identity.installations.map(value => value.botId),
+          selfUserIds: identity.installations.map(value => value.botUserId) });
+        await observer.record(sample);
+      }
+    })().catch(() => {
+      // Diagnostics cannot delay admission or expose error contents.
+    }).finally(() => { slackIdentityObservationsInFlight -= 1; });
+  }
+  const eventType = envelope.type === "event_callback" ? envelope.event?.type : null;
+  if (input.verifiedIngressCrypto && envelope.type === "event_callback"
+    && (!envelope.event || typeof envelope.event !== "object" || Array.isArray(envelope.event)
+      || !nonEmpty(eventType, 160))) {
+    throw new ExternalAppIngressError("Slack event payload is invalid", "external_ingress_payload_invalid");
+  }
+  const knownLifecycle = eventType === "app_uninstalled" || eventType === "tokens_revoked"
+    || eventType === "channel_archive" || eventType === "channel_deleted"
+    || eventType === "group_archive" || eventType === "group_deleted"
+    || eventType === "channel_rename" || eventType === "group_rename" || eventType === "channel_left" || eventType === "group_left"
+    || eventType === "member_joined_channel" || eventType === "member_left_channel";
+  if (input.verifiedIngressCrypto && envelope.type === "event_callback" && envelope.event && !knownLifecycle) {
+    const event = envelope.event!;
+    const isMessageOrReaction = eventType === "message" || eventType === "reaction_added" || eventType === "reaction_removed";
+    const conversationId = eventType === "message" ? nonEmpty(event.channel, 160)
+      : eventType === "reaction_added" || eventType === "reaction_removed" ? nonEmpty(event.item?.channel, 160)
+        : nonEmpty(event.channel, 160) ?? nonEmpty(event.item?.channel, 160)
+          ?? (eventType === "file_shared" ? nonEmpty(event.channel_id, 160) : null);
+    if (isMessageOrReaction && !conversationId) throw new ExternalAppIngressError("Slack conversation identity is invalid", "external_ingress_payload_invalid");
+    const aad: SlackVerifiedIngressAad = {
+      purpose: "slack-verified-ingress", version: 1, registrationId: loaded.registration.id,
+      environment: input.environment, providerAppId: loaded.registration.providerAppId,
+      providerAuthorityId, providerEventId, providerConversationId: conversationId,
+    };
+    let sanitized: Buffer;
+    try { sanitized = serializeSlackVerifiedEvent(envelope, aad); }
+    catch { throw new ExternalAppIngressError("Slack event payload is invalid", "external_ingress_payload_invalid"); }
+    let sealed: Awaited<ReturnType<SlackVerifiedIngressPayloadCrypto["seal"]>>;
+    try { sealed = await input.verifiedIngressCrypto.seal({ bytes: sanitized, aad }); }
+    catch { throw new ExternalAppIngressError("Slack payload sealing failed", "external_ingress_seal_failed"); }
+    finally { sanitized.fill(0); }
+    if (!sealed || !isSlackVerifiedIngressEnvelope(sealed.encryptedPayload)
+      || typeof sealed.envelopeKeyId !== "string" || !sealed.envelopeKeyId.trim()
+      || /[\r\n\0]/u.test(sealed.envelopeKeyId) || Buffer.byteLength(sealed.envelopeKeyId, "utf8") > 320) {
+      throw new ExternalAppIngressError("Slack payload sealing receipt is invalid", "external_ingress_seal_failed");
+    }
+    const receipt = await enqueueSlackVerifiedIngress({
+      db: getDb(), aad, rawDigest: sha256(input.rawBody), encryptedPayload: sealed.encryptedPayload,
+      envelopeKeyId: sealed.envelopeKeyId, now,
+      validateEndpoint: (executor) => endpointStillCurrent({ executor, endpointId: loaded.endpoint.id,
+        registrationId: loaded.registration.id, provider: loaded.registration.provider,
+        providerAppId: loaded.registration.providerAppId, environment: input.environment,
+        requestUrl: input.requestUrl, endpointRevision: loaded.endpoint.endpointRevision,
+        signingSecretRevision: loaded.endpoint.signingSecretRevision, lockMode: "share" }),
+    });
+    if (receipt.kind === "receipt") {
+      return { kind: "event", eventInboxId: receipt.id, duplicate: receipt.duplicate,
+        status: "queued", reason: null, authority: null };
+    }
+    const legacyStatus = receipt.state === "processing" ? "queued" : receipt.state;
+    if (legacyStatus !== "queued" && legacyStatus !== "committed" && legacyStatus !== "duplicate"
+      && legacyStatus !== "echo" && !(legacyStatus === "dead" && receipt.outcomeReason === "confirmed_thread_root_missing")) {
+      throw new ExternalAppIngressError("Slack legacy receipt needs recovery", "external_ingress_endpoint_unavailable");
+    }
+    return { kind: "event", eventInboxId: receipt.id, duplicate: true,
+      status: legacyStatus, reason: receipt.outcomeReason, authority: null };
   }
   const lifecycleType = envelope.type === "event_callback"
     && (envelope.event?.type === "app_uninstalled" || envelope.event?.type === "tokens_revoked")
@@ -655,63 +784,123 @@ export async function verifyAndAdmitSlackIngress(input: {
       || envelope.event?.type === "channel_deleted"
       || envelope.event?.type === "group_archive"
       || envelope.event?.type === "group_deleted"
+      || envelope.event?.type === "channel_rename" || envelope.event?.type === "group_rename"
+      || envelope.event?.type === "channel_left" || envelope.event?.type === "group_left"
+      || envelope.event?.type === "member_joined_channel" || envelope.event?.type === "member_left_channel"
     )
     ? envelope.event.type
     : null;
   if (channelLifecycleType) {
-    const providerConversationId = nonEmpty(envelope.event?.channel, 160);
+    const channelValue = envelope.event?.channel;
+    const channelObject = channelValue !== null && typeof channelValue === "object" && !Array.isArray(channelValue)
+      ? channelValue as { id?: unknown; name?: unknown } : null;
+    const providerConversationId = nonEmpty(channelObject?.id ?? channelValue, 160);
     if (!providerConversationId) {
       throw new ExternalAppIngressError("Slack channel lifecycle event is invalid", "external_ingress_payload_invalid");
     }
+    if (channelLifecycleType === "channel_deleted" || channelLifecycleType === "group_deleted") {
+      const deleted = await recordVerifiedSlackChannelDeletion({ registrationId: loaded.registration.id,
+        environment: input.environment, providerAppId: loaded.registration.providerAppId,
+        providerAuthorityId, providerConversationId, providerEventId, providerEventType: channelLifecycleType,
+        signingSecretRevision: loaded.endpoint.signingSecretRevision, payloadSha256: sha256(input.rawBody), now,
+        verifySource: executor => endpointStillCurrent({ executor, endpointId: loaded.endpoint.id,
+          registrationId: loaded.registration.id, provider: "slack", providerAppId: loaded.registration.providerAppId,
+          environment: input.environment, requestUrl: input.requestUrl, endpointRevision: loaded.endpoint.endpointRevision,
+          signingSecretRevision: loaded.endpoint.signingSecretRevision }) });
+      if (!deleted) throw new ExternalAppIngressError("Slack deletion has no matching binding history", "external_ingress_authority_unavailable");
+      if (!deleted.paused) {
+        await recordIntentionalDiscard({ endpointId: loaded.endpoint.id, registrationId: loaded.registration.id,
+          providerAppId: loaded.registration.providerAppId, environment: input.environment, requestUrl: input.requestUrl,
+          endpointRevision: loaded.endpoint.endpointRevision, signingSecretRevision: loaded.endpoint.signingSecretRevision,
+          // No message is relayed; the separate signed deletion fact retains
+          // the exact deletion type and event identity.
+          providerAuthorityId, providerConversationId, providerEventId, outcomeReason: "unsupported_event",
+          slackRetryNumHeader: input.slackRetryNumHeader, slackRetryReasonHeader: input.slackRetryReasonHeader,
+          rawBody: input.rawBody, now });
+      }
+      return { kind: "event", eventInboxId: providerEventId, duplicate: deleted.duplicate,
+        status: deleted.paused ? "paused" : "unsupported", reason: "provider_channel_deleted", authority: null };
+    }
     const installs = await getDb().select().from(externalAppInstalls).where(and(
       eq(externalAppInstalls.registrationId, loaded.registration.id),
+      eq(externalAppInstalls.providerAppId, loaded.registration.providerAppId),
       eq(externalAppInstalls.providerAuthorityId, providerAuthorityId),
-      eq(externalAppInstalls.state, "active"),
     )).limit(2);
-    if (installs.length !== 1) {
-      throw new ExternalAppIngressError("Slack install authority is unavailable", "external_ingress_authority_unavailable");
-    }
-    const install = installs[0]!;
-    const bindings = await getDb().select().from(externalChannelBindings).where(and(
+    if (installs.length > 1) throw new ExternalAppIngressError("Slack install identity is ambiguous", "external_ingress_authority_unavailable");
+    const install = installs[0];
+    const bindings = install ? await getDb().select().from(externalChannelBindings).where(and(
       eq(externalChannelBindings.installId, install.id),
       eq(externalChannelBindings.providerConversationId, providerConversationId),
-    )).limit(2);
-    if (bindings.length !== 1) {
-      throw new ExternalAppIngressError("Slack binding authority is unavailable", "external_ingress_authority_unavailable");
+      inArray(externalChannelBindings.state, ["active", "paused", "quarantined"]),
+    )).limit(2) : [];
+    if (bindings.length > 1) throw new ExternalAppIngressError("Slack binding identity is ambiguous", "external_ingress_authority_unavailable");
+    const binding = bindings[0];
+    const recordMetadataReceipt = (outcomeReason: IntentionalDiscardReason, executor?: DatabaseExecutor) => recordIntentionalDiscard({ executor, endpointId: loaded.endpoint.id,
+      registrationId: loaded.registration.id, providerAppId: loaded.registration.providerAppId,
+      environment: input.environment, requestUrl: input.requestUrl, endpointRevision: loaded.endpoint.endpointRevision,
+      signingSecretRevision: loaded.endpoint.signingSecretRevision, providerAuthorityId, providerConversationId,
+      providerEventId, outcomeReason, slackRetryNumHeader: input.slackRetryNumHeader,
+      slackRetryReasonHeader: input.slackRetryReasonHeader, rawBody: input.rawBody, now });
+    if (!install || !binding) {
+      return { kind: "event", eventInboxId: await recordMetadataReceipt("lifecycle_metadata_unpaired"), duplicate: false,
+        status: "unsupported", reason: "lifecycle_metadata_unpaired", authority: null };
     }
-    const binding = bindings[0]!;
-    const expectsPrivateBinding = channelLifecycleType === "group_archive"
-      || channelLifecycleType === "group_deleted";
-    if ((binding.privacyClass === "private") !== expectsPrivateBinding) {
-      throw new ExternalAppIngressError("Slack channel lifecycle authority is mismatched", "external_ingress_authority_unavailable");
+    if (channelLifecycleType === "channel_left" || channelLifecycleType === "group_left") {
+      // This event describes an authorization leaving; it does not identify
+      // our bot. Treat it only as a hint to recheck current provider state.
+      const receipt = await recordMetadataReceipt("lifecycle_metadata_processed");
+      if (install.state === "active" && (binding.state === "active" || (binding.state === "paused"
+        && (binding.stateReason === "provider_channel_archived" || binding.stateReason === "provider_bot_removed")))) {
+        input.requestLifecycleRefresh?.(binding.id);
+      }
+      return { kind: "event", eventInboxId: receipt, duplicate: false, status: "committed",
+        reason: "lifecycle_recheck_requested", authority: null };
     }
-    const lifecycle = await reconcileSlackChannelLifecycle({
-      serverId: binding.serverId,
-      registrationId: loaded.registration.id,
-      installId: install.id,
-      bindingId: binding.id,
-      providerAuthorityId,
-      providerConversationId,
-      expectedConnectionEpoch: install.connectionEpoch,
-      expectedBindingEpoch: binding.bindingEpoch,
-      event: channelLifecycleType === "channel_archive" || channelLifecycleType === "group_archive"
-        ? "channel_archived"
-        : "channel_deleted",
-      now,
-    });
+    let event: SlackChannelLifecycleEvent;
+    if (channelLifecycleType === "channel_archive" || channelLifecycleType === "group_archive") event = { kind: "archived" };
+    else if (channelLifecycleType === "channel_rename" || channelLifecycleType === "group_rename") {
+      const name = nonEmpty(channelObject?.name, 200);
+      if (!name) throw new ExternalAppIngressError("Slack channel name is invalid", "external_ingress_payload_invalid");
+      event = { kind: "renamed", name };
+    } else {
+      const userId = nonEmpty(envelope.event?.user, 160);
+      if (!userId) throw new ExternalAppIngressError("Slack member identity is invalid", "external_ingress_payload_invalid");
+      event = { kind: channelLifecycleType === "member_joined_channel" ? "member_joined" : "member_left", userId };
+    }
+    const eventClock = parseSlackLifecycleClock(envelope.event?.event_ts)
+      ?? (typeof envelope.event_time === "number" && Number.isSafeInteger(envelope.event_time) && envelope.event_time >= 0
+        ? parseSlackLifecycleClock(`${envelope.event_time}.000000`) : null)
+      // Old archive fixtures/receipts without a provider clock sort before
+      // every real observation; a retry cannot re-pause an unarchived pair.
+      ?? (event.kind === "archived" ? parseSlackLifecycleClock("0.000000") : null);
+    if (!eventClock || slackLifecycleClockIsNewer(eventClock, slackLifecycleClockAt(new Date(now.getTime() + 5 * 60_000)))) {
+      throw new ExternalAppIngressError("Slack lifecycle clock is invalid", "external_ingress_payload_invalid");
+    }
+    if (event.kind === "member_joined" && event.userId !== install.botUserId && binding.state === "active" && install.state === "active") {
+      const profile = await input.readLifecycleMemberProfile?.(binding.id, event.userId);
+      if (profile) event = { ...event, profile };
+    }
+    const lifecycle = await reconcileSlackChannelLifecycle({ serverId: binding.serverId,
+      registrationId: loaded.registration.id, installId: install.id, bindingId: binding.id,
+      providerAuthorityId, providerConversationId, expectedConnectionEpoch: install.connectionEpoch,
+      expectedBindingEpoch: binding.bindingEpoch, event, eventClock, now,
+      persistReceipt: async (tx, reason) => { await recordMetadataReceipt(reason, tx); } });
     if (lifecycle.kind === "fence_mismatch") {
       throw new ExternalAppIngressError("Slack binding authority changed", "external_ingress_authority_unavailable");
     }
-    return {
-      kind: "event",
-      eventInboxId: providerEventId,
-      duplicate: lifecycle.kind === "unchanged",
-      status: "paused",
-      reason: channelLifecycleType === "channel_archive" || channelLifecycleType === "group_archive"
-        ? "provider_channel_archived"
-        : "provider_channel_deleted",
-      authority: null,
-    };
+    if (lifecycle.kind === "ignored") return { kind: "event", eventInboxId: providerEventId, duplicate: false,
+      status: "unsupported", reason: lifecycle.reason, authority: null };
+    if (event.kind === "member_joined" && install.state === "active"
+      && ((binding.state === "paused" && (binding.stateReason === "provider_channel_archived" || binding.stateReason === "provider_bot_removed"))
+        || (binding.state === "active" && event.userId === install.botUserId))) {
+      input.requestLifecycleRefresh?.(binding.id);
+    }
+    return { kind: "event", eventInboxId: providerEventId, duplicate: lifecycle.kind === "unchanged",
+      status: lifecycle.projection.state === "connected" ? "committed" : "paused",
+      reason: event.kind === "archived" ? "provider_channel_archived"
+        : event.kind === "renamed" ? "provider_channel_renamed"
+        : event.kind === "member_joined" ? "provider_member_joined" : "provider_member_left",
+      authority: null };
   }
   const reactionType = envelope.type === "event_callback"
     && (envelope.event?.type === "reaction_added" || envelope.event?.type === "reaction_removed")
@@ -793,11 +982,7 @@ export async function verifyAndAdmitSlackIngress(input: {
       key: SLACK_BRIDGE_FEATURE_FLAG_KEYS.master,
       serverId: binding.serverId,
     });
-    const reactionFlag = await evaluateFeatureFlag({
-      key: SLACK_BRIDGE_FEATURE_FLAG_KEYS.reactionSync,
-      serverId: binding.serverId,
-    });
-    if (!master.enabled || !reactionFlag.enabled) {
+    if (!master.enabled) {
       const discardReceiptId = await recordIntentionalDiscard({
         endpointId: loaded.endpoint.id,
         registrationId: loaded.registration.id,
@@ -1009,7 +1194,18 @@ export async function verifyAndAdmitSlackIngress(input: {
     };
   }
 
-  const event = envelope.event;
+  const outerEvent = envelope.event;
+  const isEdit = outerEvent.subtype === "message_changed";
+  const changedMessage = isEdit ? outerEvent.message : undefined;
+  if (isEdit && (!changedMessage || typeof changedMessage !== "object" || Array.isArray(changedMessage))) {
+    throw new ExternalAppIngressError("Slack changed message is invalid", "external_ingress_payload_invalid");
+  }
+  // Slack's wrapper ts identifies the change, not the original message.
+  const event = changedMessage ? { ...changedMessage, channel: outerEvent.channel } : outerEvent;
+  const providerEditedTs = isEdit ? parseSlackEditTimestamp(changedMessage?.edited?.ts ?? outerEvent.event_ts ?? outerEvent.ts) : null;
+  if (isEdit && !providerEditedTs) {
+    throw new ExternalAppIngressError("Slack edit timestamp is invalid", "external_ingress_payload_invalid");
+  }
   const providerConversationId = nonEmpty(event.channel, 160);
   const unsupportedMessageSubtype = event.subtype !== undefined && event.subtype !== "file_share";
   const discardReason: IntentionalDiscardReason | null = event.bot_id !== undefined || event.app_id !== undefined
@@ -1018,13 +1214,14 @@ export async function verifyAndAdmitSlackIngress(input: {
       ? "unsupported_message_subtype"
       : null;
   const providerMessageId = nonEmpty(event.ts, 160);
-  const providerThreadId = event.thread_ts === undefined ? null : nonEmpty(event.thread_ts, 160);
+  const providerThreadId = event.thread_ts === undefined || (isEdit && event.thread_ts === providerMessageId)
+    ? null : nonEmpty(event.thread_ts, 160);
   if (
     !providerConversationId
     || (!unsupportedMessageSubtype && (
       !providerMessageId
       || !/^[0-9]{1,20}\.[0-9]{1,20}$/.test(providerMessageId)
-      || (event.thread_ts !== undefined && !providerThreadId)
+      || (event.thread_ts !== undefined && !providerThreadId && !(isEdit && event.thread_ts === providerMessageId))
     ))
   ) {
     throw new ExternalAppIngressError("Slack message event is invalid", "external_ingress_payload_invalid");
@@ -1065,7 +1262,7 @@ export async function verifyAndAdmitSlackIngress(input: {
     throw new ExternalAppIngressError("Slack message event is invalid", "external_ingress_payload_invalid");
   }
   const hasAttachments = providerFileIds.length > 0;
-  if ((event.subtype === "file_share") !== hasAttachments) {
+  if (!isEdit && (event.subtype === "file_share") !== hasAttachments) {
     throw new ExternalAppIngressError("Slack file-share event is invalid", "external_ingress_payload_invalid");
   }
   const rawContent = nonEmpty(event.text, 40_000);
@@ -1097,12 +1294,20 @@ export async function verifyAndAdmitSlackIngress(input: {
   const bindings = await getDb().select().from(externalChannelBindings).where(and(
     eq(externalChannelBindings.installId, install.id),
     eq(externalChannelBindings.providerConversationId, providerConversationId),
-    eq(externalChannelBindings.state, "active"),
+    inArray(externalChannelBindings.state, ["active", "paused"]),
   )).limit(2);
   if (bindings.length !== 1) {
     throw new ExternalAppIngressError("Slack binding authority is unavailable", "external_ingress_authority_unavailable");
   }
   const binding = bindings[0]!;
+  if (binding.state !== "active") {
+    if (binding.stateReason === "provider_channel_archived" || binding.stateReason === "provider_bot_removed") {
+      // A verified message only requests a provider check. It neither resumes
+      // the pair nor bypasses the existing message admission rules.
+      input.requestLifecycleRefresh?.(binding.id);
+    }
+    throw new ExternalAppIngressError("Slack binding authority is inactive", "external_ingress_authority_unavailable");
+  }
   const authorityDecision = await resolveExternalBindingAuthority({
     serverId: binding.serverId,
     bindingId: binding.id,
@@ -1158,7 +1363,7 @@ export async function verifyAndAdmitSlackIngress(input: {
     externalActorId,
     memberRevision: addressability.memberRevision,
     contextRevision: addressability.contextRevision,
-    requiredCapabilities: hasAttachments ? ["attachment_transfer"] : [],
+    requiredCapabilities: hasAttachments && !isEdit ? ["attachment_transfer"] : [],
     now,
   });
   if (!runtime || !nonEmpty(runtime.runtimeRevision)) {
@@ -1166,13 +1371,15 @@ export async function verifyAndAdmitSlackIngress(input: {
   }
 
   const normalizedPayload = JSON.stringify({
-    schema: NORMALIZED_PAYLOAD_SCHEMA,
+    schema: isEdit ? "external-inbound-normalized-edit.v1" : NORMALIZED_PAYLOAD_SCHEMA,
+    ...(isEdit ? { providerEditedTs } : {}),
     projectionId: projection.id,
     actorProjectionRevision: projection.projectionRevision,
     externalActorId,
     providerMessageId,
     providerThreadId,
-    providerFileIds,
+    // An edit updates the body, not the attachment transfer lifecycle.
+    providerFileIds: isEdit ? [] : providerFileIds,
     providerAgentMentions,
     content,
     createdAt: new Date(Number(providerMessageId.split(".")[0]) * 1_000).toISOString(),
@@ -1180,7 +1387,7 @@ export async function verifyAndAdmitSlackIngress(input: {
   const aad: ExternalInboundPayloadAad = {
     purpose: PAYLOAD_AAD_PURPOSE,
     aadVersion: 1,
-    schemaVersion: 2,
+    schemaVersion: isEdit ? 4 : 2,
     provider: "slack",
     environment: input.environment,
     appRegistrationId: authority.registrationId,
@@ -1241,7 +1448,7 @@ export async function verifyAndAdmitSlackIngress(input: {
       envelopeKeyId: sealed.envelopeKeyId,
       payloadAadPurpose: PAYLOAD_AAD_PURPOSE,
       payloadAadVersion: 1,
-      payloadSchemaVersion: 2,
+      payloadSchemaVersion: isEdit ? 4 : 2,
       payloadExpiresAt,
       receivedAt: now,
       updatedAt: now,

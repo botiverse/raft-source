@@ -16,11 +16,14 @@
 //   `cancel` means cancelling needs no request: just don't execute `resume`.
 //
 // `resume` and `cancel` are plain data, never closures. Only the model may run
-// them.
+// them, with one exception: a gateway replaying a call a person already approved
+// has no model to ask, and that person made the decision this would put to the
+// model, so it may resend once with the same input and key, attesting
+// `seenUpToSeq` (docs/contracts/hosted-agent-approvals.md).
 
 import type { AgentApiHeldFreshnessResponse } from "../agentApiMessageContract";
 import { projectRaftMessagesInTarget, type RaftMessage } from "./message";
-import type { RaftHintStyle } from "./hint";
+import { hintStep, RAFT_HINTS, type RaftHintStyle } from "./hint";
 import type { RaftNextStep } from "./outcome";
 import type { ChannelCard, PeerCard } from "./passiveResources";
 
@@ -84,7 +87,7 @@ export interface RaftInterrupt {
   omittedMessageCount: number;
   /** How many of the unread messages formally @mention this agent. */
   formalMentionCount: number;
-  /** The seq the Server considers current for this conversation; attesting it says the model saw the context. */
+  /** The seq the Server considers current for this conversation; attesting it says the model saw the context (or, on an approved replay, that a person decided). */
   seenUpToSeq: number | null;
   /** Reviewer isolation: bodies withheld, only a count. */
   withheld: boolean;
@@ -188,4 +191,24 @@ export function taskClaimArgv(target: string, taskNumbers: readonly number[], me
 /** `raft task update` argv (resume of a held status update). */
 export function taskUpdateArgv(target: string, taskNumber: number, status: string, extraArgv: readonly string[] = []): string[] {
   return ["task", "update", "--target", target, "--number", String(taskNumber), "--status", status, ...extraArgv];
+}
+
+/**
+ * A hold's next step. It names the read only when the held text points to
+ * one (`renderAgentHold`'s `pointsToRead`: bodies withheld, or the window
+ * leaves something out) or the shown messages do not account for the count;
+ * otherwise `context` already shows all of it and the step carries no
+ * command, so following it never prints the same messages again.
+ */
+export function heldNextStep(
+  kind: string,
+  interrupt: RaftInterrupt,
+  pointsToRead: boolean,
+  why: { read: string; shown: string },
+  style: RaftHintStyle,
+): RaftNextStep {
+  const target = interrupt.target;
+  return pointsToRead || !interrupt.contextComplete
+    ? hintStep(kind, RAFT_HINTS.messageRead({ target }), why.read, style, { target })
+    : { kind, args: { target }, why: why.shown };
 }

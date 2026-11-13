@@ -9,7 +9,7 @@ import { createServer as createServerService } from "../services/serverService";
 import { createChannel as createChannelService, addHuman } from "../services/channelService";
 import { createMessage } from "../services/messageService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 // task #17 (staging load speed): `searchText` / `searchVector` only feed the
 // full-text index. The history HTTP reads used to SELECT every column, so a
@@ -17,7 +17,7 @@ const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardi
 // message content itself. The realtime path already strips them; the HTTP
 // reads must not send them either.
 
-const STORAGE_ONLY_KEYS = ["searchText", "searchVector"] as const;
+const STORAGE_ONLY_KEYS = ["searchText", "searchVector", "insertXid"] as const;
 
 async function seedUser(email: string, name: string) {
   const db = getDb();
@@ -95,6 +95,7 @@ test("web send records a valid sender time zone and never serializes it to human
     const body = await res.json() as Record<string, unknown>;
     const message = (path === "/api/v2/messages" ? body.message : body) as Record<string, unknown>;
     assert.equal("senderTimezone" in message, false, `${content}: send response must not echo the zone`);
+    assert.equal("insertXid" in message, false, `${content}: send response must not carry the inserting transaction id`);
     const [row] = await getDb().select({ senderTimezone: messages.senderTimezone })
       .from(messages).where(eq(messages.id, message.id as string));
     return row?.senderTimezone;

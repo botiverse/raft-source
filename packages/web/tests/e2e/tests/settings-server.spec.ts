@@ -256,16 +256,19 @@ test.describe.serial("Settings › Server tab", () => {
         browser,
         seedState,
         memberLogin,
+        // The old Settings link opens the Apps page (#proj-apps task #22).
         `/s/${seedState.server.slug}/settings/applications`,
       );
       try {
+        await expect(page).toHaveURL(new RegExp(`/s/${seedState.server.slug}/apps$`));
         await expect(page.getByTestId("connected-apps-v3-section")).toBeVisible();
         await expect(page.getByText("Only server owners and admins can install, edit, or remove apps.")).toBeVisible();
-        await expect(page.getByRole("button", { name: "Register App" })).toHaveCount(0);
+        await expect(page.getByRole("button", { name: "Add app" })).toHaveCount(0);
 
         await page.getByTestId("connected-apps-tab-installed").click();
         const installedTab = page.getByTestId("connected-apps-installed-tab");
-        await expect(installedTab.getByText(appName)).toBeVisible();
+        // Apps v4 D3: a Raft App this server builds and has not installed is under Developer only.
+        await expect(installedTab.getByText(appName)).toHaveCount(0);
         await expect(installedTab.getByRole("button", { name: "Edit" })).toHaveCount(0);
         await expect(installedTab.getByRole("button", { name: "Uninstall" })).toHaveCount(0);
 
@@ -273,14 +276,15 @@ test.describe.serial("Settings › Server tab", () => {
         const myAppsTab = page.getByTestId("connected-apps-my-apps-tab");
         const myAppsCollection = myAppsTab.getByTestId("connected-apps-my-apps-collection");
         await expect(myAppsTab.getByText(appName)).toBeVisible();
+        // Grid by default (yezizp, #11723): cards show no description; the list shows it.
         await expect(myAppsCollection).toHaveAttribute("data-view", "grid");
         await expect(myAppsTab.getByText("Visible to every active server member.")).toHaveCount(0);
         await page
           .getByTestId("connected-apps-view-toggle")
-          .getByRole("button", { name: "List view" })
+          .getByRole("radio", { name: "List view" })
           .click();
         await expect(myAppsCollection).toHaveAttribute("data-view", "list");
-        await expect(myAppsTab.getByText("Visible to every active server member.")).toBeVisible();
+        await expect(myAppsCollection.getByText("Visible to every active server member.")).toBeVisible();
         await expect(myAppsTab.getByRole("button", { name: "Edit" })).toHaveCount(0);
         await expect(myAppsTab.getByRole("button", { name: "Request offline review" })).toHaveCount(0);
         await expect(myAppsTab.getByRole("button", { name: "Delete" })).toHaveCount(0);
@@ -298,43 +302,30 @@ test.describe.serial("Settings › Server tab", () => {
     }
   });
 
-  test("owner: Connected Apps filter controls keep matching row height", async ({ page }) => {
+  test("owner: the Apps toolbar's search, filter buttons and view switch share one row", async ({ page }) => {
     const seedState = await waitForSeedState();
 
-    await page.goto(`/s/${seedState.server.slug}/settings/applications`);
+    await page.goto(`/s/${seedState.server.slug}/apps`);
     await expect(page.getByTestId("connected-apps-v3-section")).toBeVisible();
 
+    // Raft DS › Tabs › A tab's own controls: search, then the filter buttons,
+    // in one row under the tabs on a desktop, centred on one line.
     const search = page.getByRole("searchbox", { name: "Search connected apps" });
-    const category = page.getByRole("combobox", { name: "Filter connected apps by category" });
-    const viewToggle = page.getByTestId("connected-apps-view-toggle");
-
-    // The #7444 decision was row alignment, not the absolute 40px: the filter
-    // row must read as one row with no dangling gap. Post-RUI the search input
-    // and category select are full-height fields that must share height and
-    // bottom edge; the view toggle is a compact (h-8) ToggleGroup that the app
-    // deliberately centers inside its h-10 slot, so pin symmetric centering
-    // instead of equal height.
+    const category = page.getByRole("combobox", { name: "All categories" });
     const searchBox = await search.boundingBox();
     const categoryBox = await category.boundingBox();
-    const toggleBox = await viewToggle.boundingBox();
     expect(searchBox).not.toBeNull();
     expect(categoryBox).not.toBeNull();
+    const searchMid = searchBox!.y + searchBox!.height / 2;
+    const categoryMid = categoryBox!.y + categoryBox!.height / 2;
+    expect(Math.abs(searchMid - categoryMid)).toBeLessThanOrEqual(1);
+    // The grid/list switch is back at the row's right end (yezizp, #11723).
+    const toggle = page.getByTestId("connected-apps-view-toggle");
+    await expect(toggle).toBeVisible();
+    const toggleBox = await toggle.boundingBox();
     expect(toggleBox).not.toBeNull();
-
-    // The two full-height fields share a height and an aligned bottom edge.
-    expect(Math.round(searchBox!.height)).toBe(Math.round(categoryBox!.height));
-    expect(Math.round(searchBox!.y + searchBox!.height)).toBe(
-      Math.round(categoryBox!.y + categoryBox!.height),
-    );
-
-    // The compact toggle is centered within the fields' vertical span, leaving
-    // no dangling gap at either edge.
-    const fieldTop = searchBox!.y;
-    const fieldBottom = searchBox!.y + searchBox!.height;
-    const topGap = toggleBox!.y - fieldTop;
-    const bottomGap = fieldBottom - (toggleBox!.y + toggleBox!.height);
-    expect(Math.abs(topGap - bottomGap)).toBeLessThanOrEqual(1);
-    expect(topGap).toBeGreaterThanOrEqual(0);
+    expect(Math.abs(toggleBox!.y + toggleBox!.height / 2 - searchMid)).toBeLessThanOrEqual(1);
+    expect(toggleBox!.x).toBeGreaterThan(categoryBox!.x + categoryBox!.width);
   });
 
   test("owner: delete dialog gates submit on exact slug match", async ({ page, request }) => {

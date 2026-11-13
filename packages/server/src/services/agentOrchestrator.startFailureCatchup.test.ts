@@ -12,12 +12,13 @@ import { dbTest as test } from "../test/integration/dbTest";
 import { closeTestDatabase } from "../test/integration/database";
 import assert from "node:assert/strict";
 
-import type { ServerToMachineMessage } from "@botiverse/raft-shared";
+import { DAEMON_CAPABILITY_CONTROL_START_CATCHUP_V1, type ServerToMachineMessage } from "@botiverse/raft-shared";
 
 import { getDb } from "../db/index";
 import { agents, machines, serverMembers, servers, users } from "../db/schema";
 import { referenceAgentInboxChain } from "../test/agentInboxChainReference";
 import { AgentOrchestrator } from "./agentOrchestrator";
+import * as agentRuntimeProfileService from "./agentRuntimeProfileService";
 import * as channelService from "./channelService";
 import * as messageService from "./messageService";
 import { createMessage, deliverMessageToAgent } from "./messageService";
@@ -230,6 +231,98 @@ test("task #1221: blocked message -> manual stop -> start again carries the same
     assert.equal(await breaker.isCatchupOwed(agent.id), true, "stopping does not deliver it");
     assert.equal((await orchestrator.startAgent(agent.id)).outcome, "dispatched");
     assert.ok(carriedIds(orchestrator.starts.at(-1)!).includes(owed.id), "the start after the stop carries the same message id");
+  } finally {
+    await orchestrator.shutdown();
+  }
+});
+
+// RFC 071 F9 (#proj-raft-computer:#56): the start after the block, while a
+// runtime-profile daemon_release_notice is pending, would carry BOTH
+// config.runtimeProfileControl and the owed resumeMessages (no wake). An older
+// daemon renders only the notice for such a start and drops resumeMessages; its
+// OAR host never even acks a notice that came with a start, so the notice
+// returns on every start. The server leaves the control off that start on a
+// daemon without DAEMON_CAPABILITY_CONTROL_START_CATCHUP_V1, so the catch-up
+// goes through and the notice comes with a later start. A daemon that
+// advertises the capability renders both, and gets both.
+const F9_RELEASE_NOTICE = {
+  kind: "daemon_release_notice" as const,
+  key: "release-notice-f9",
+  message: "Runtime Profile notice: daemon upgraded.",
+};
+
+test("RFC 071 F9: an older daemon (OAR host never acks the notice) gets the owed catch-up without the control, then the notice on a later start", async ({ db: _db }) => {
+  const { agent, orchestrator, breaker, owed } = await blockedWithOwedMessage();
+  // Never acked: the notice is pending on every start, as on an old OAR host.
+  const spy = vi.spyOn(agentRuntimeProfileService, "getPendingRuntimeProfileControl").mockResolvedValue(F9_RELEASE_NOTICE);
+  try {
+    assert.equal((await orchestrator.startAgent(agent.id)).outcome, "dispatched");
+    const start = orchestrator.starts.at(-1)!;
+    assert.equal(start.wakeMessage, undefined);
+    assert.equal(start.resumePrompt, undefined);
+    assert.ok(carriedIds(start).includes(owed.id), "the start carries the owed message id");
+    assert.ok(!start.config.runtimeProfileControl, "F9: the control is left off a catch-up start on a daemon that would drop the catch-up");
+    // The daemon renders the catch-up (no control on this start) and reports the launch active.
+    assert.equal(await breaker.confirmCatchupDelivered(agent.id, start.launchId!), true);
+    assert.equal(await breaker.isCatchupOwed(agent.id), false, "the catch-up is delivered, not owed forever");
+    // The notice is still pending and comes with the next start.
+    assert.equal((await orchestrator.startAgent(agent.id)).outcome, "dispatched");
+    assert.deepEqual(orchestrator.starts.at(-1)!.config.runtimeProfileControl, F9_RELEASE_NOTICE);
+  } finally {
+    spy.mockRestore();
+    await orchestrator.shutdown();
+  }
+});
+
+test("RFC 071 F9: a daemon that renders both gets the control and the owed catch-up on one start, which delivers it", async ({ db: _db }) => {
+  const { agent, machine, orchestrator, breaker, owed } = await blockedWithOwedMessage();
+  (orchestrator as any).machineConnections.get(machine.id).capabilities.add(DAEMON_CAPABILITY_CONTROL_START_CATCHUP_V1);
+  const spy = vi.spyOn(agentRuntimeProfileService, "getPendingRuntimeProfileControl").mockResolvedValue(F9_RELEASE_NOTICE);
+  try {
+    assert.equal((await orchestrator.startAgent(agent.id)).outcome, "dispatched");
+    const start = orchestrator.starts.at(-1)!;
+    assert.deepEqual(start.config.runtimeProfileControl, F9_RELEASE_NOTICE);
+    assert.equal(start.wakeMessage, undefined);
+    assert.equal(start.resumePrompt, undefined);
+    assert.ok(carriedIds(start).includes(owed.id));
+    assert.equal(await breaker.confirmCatchupDelivered(agent.id, start.launchId!), true);
+    assert.equal(await breaker.isCatchupOwed(agent.id), false);
+  } finally {
+    spy.mockRestore();
+    await orchestrator.shutdown();
+  }
+});
+
+test("RFC 071 F9: a capability read error counts as not declared and does not fail the start", async ({ db: _db }) => {
+  const { agent, orchestrator, breaker, owed } = await blockedWithOwedMessage();
+  const spy = vi.spyOn(agentRuntimeProfileService, "getPendingRuntimeProfileControl").mockResolvedValue(F9_RELEASE_NOTICE);
+  const capability = vi.spyOn(orchestrator, "machineAdvertisesCapability").mockRejectedValue(new Error("shared store unavailable"));
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+  try {
+    assert.equal((await orchestrator.startAgent(agent.id)).outcome, "dispatched");
+    assert.ok(capability.mock.calls.length > 0, "precondition: the capability was read");
+    const start = orchestrator.starts.at(-1)!;
+    assert.ok(carriedIds(start).includes(owed.id));
+    assert.ok(!start.config.runtimeProfileControl, "not declared: the control is left off");
+    assert.ok(warn.mock.calls.some((call) => String(call[0]).includes("treated as not declared")), "the read error is logged");
+    assert.equal(await breaker.confirmCatchupDelivered(agent.id, start.launchId!), true);
+  } finally {
+    warn.mockRestore();
+    capability.mockRestore();
+    spy.mockRestore();
+    await orchestrator.shutdown();
+  }
+});
+
+test("task #1221: an owed catch-up the agent has since read is settled by the next start's build, not owed forever", async ({ db: _db }) => {
+  const { agent, dm, orchestrator, breaker, owed } = await blockedWithOwedMessage();
+  try {
+    assert.equal(await breaker.isCatchupOwed(agent.id), true, "precondition: owed");
+    // The agent reads the owed message itself (e.g. `raft message check`).
+    await channelService.markAgentLegacyRead(agent.id, dm.id, owed.seq);
+    assert.equal((await orchestrator.startAgent(agent.id)).outcome, "dispatched");
+    assert.equal(carriedIds(orchestrator.starts.at(-1)!).includes(owed.id), false, "precondition: nothing unread to carry");
+    assert.equal(await breaker.isCatchupOwed(agent.id), false, "nothing unread: no longer owed");
   } finally {
     await orchestrator.shutdown();
   }

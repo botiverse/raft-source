@@ -1,12 +1,7 @@
 import assert from "node:assert/strict";
-import { createIntl } from "react-intl";
-import { mergedMessages } from "../src/i18n/messages";
-import { DEFAULT_LOCALE } from "../src/i18n/locale";
-const fmt = createIntl({ locale: DEFAULT_LOCALE, messages: mergedMessages(DEFAULT_LOCALE) }).formatMessage;
 import {
   applyMessageAttachmentLimits,
   decideMessageAttachmentSelection,
-  formatMessageAttachmentLimitError,
   MAX_MESSAGE_ATTACHMENTS,
 } from "../src/utils/messageAttachmentLimits";
 
@@ -50,90 +45,88 @@ test("rejects empty and oversized files without consuming attachment slots", () 
   assert.equal(result.rejectedForCount.length, 0);
 });
 
-test("formats all skipped-file reasons together", () => {
-  const error = formatMessageAttachmentLimitError({
-    rejectedForCount: [file(1024), file(1024)],
-    rejectedForEmpty: [file(0)],
-    rejectedForSize: [file(51 * 1024 * 1024)],
-  }, fmt, SERVED_LIMIT_BYTES);
-
-  assert.equal(
-    error,
-    "Only 10 attachments per message. 2 extra files skipped. 1 empty file skipped. Max 50MB per file. Current largest file is 51.0MB.",
-  );
+const limits = (maxBytes: number, remainingBytes: number | null = null) => ({
+  maxBytes,
+  monthlyUpload: remainingBytes === null ? null : { month: "2026-10", limitBytes: 100 * 1024 * 1024, remainingBytes },
 });
+const MIB = 1024 * 1024;
 
-test("validation and copy both follow an arbitrary served ceiling", () => {
+test("the decision follows an arbitrary served ceiling", () => {
   // Deliberately a third number — neither the Free nor the Pro plan limit. Any
   // implementation that re-derives the ceiling from a plan fails here, which is
   // the whole point of this test.
-  const servedBytes = 137 * 1024 * 1024;
+  const servedBytes = 137 * MIB;
   const justOver = file(servedBytes + 1);
   const justUnder = file(servedBytes);
 
-  const result = applyMessageAttachmentLimits(0, [justOver, justUnder], servedBytes);
-  assert.deepEqual(result.accepted, [justUnder]);
-  assert.deepEqual(result.rejectedForSize, [justOver]);
-
-  assert.equal(
-    formatMessageAttachmentLimitError(result, fmt, servedBytes),
-    "Max 137MB per file. Current largest file is 137.0MB.",
-  );
+  const decision = decideMessageAttachmentSelection(0, [justOver, justUnder], limits(servedBytes));
+  assert.deepEqual(decision.accepted, [justUnder]);
+  assert.deepEqual(decision.rejection, { rejected: [{ file: justOver, reason: "size" }], limits: limits(servedBytes) });
 });
 
-test("a lower served ceiling moves both the decision and the copy", () => {
-  // Same files, a different served number: the boundary must track the server,
+test("a lower served ceiling moves the decision", () => {
+  // Same file, a different served number: the boundary must track the server,
   // not a constant baked into the client.
-  const servedBytes = 12 * 1024 * 1024;
-  const candidate = file(20 * 1024 * 1024);
-
-  const result = applyMessageAttachmentLimits(0, [candidate], servedBytes);
-  assert.equal(result.accepted.length, 0);
-  assert.deepEqual(result.rejectedForSize, [candidate]);
-
-  assert.equal(
-    formatMessageAttachmentLimitError(result, fmt, servedBytes),
-    "Max 12MB per file. Current largest file is 20.0MB.",
-  );
+  const candidate = file(20 * MIB);
+  assert.deepEqual(decideMessageAttachmentSelection(0, [candidate], limits(137 * MIB)).accepted, [candidate]);
+  assert.deepEqual(decideMessageAttachmentSelection(0, [candidate], limits(12 * MIB)).rejection?.rejected, [{ file: candidate, reason: "size" }]);
 });
 
-test("an unknown ceiling refuses the batch instead of guessing one", () => {
+test("an unknown ceiling refuses the batch as unchecked, not as oversized", () => {
   // The composer's fail-safe. If this ever starts accepting files, the client
   // has reacquired a local ceiling from somewhere — which is the defect this
-  // change exists to remove.
-  const decision = decideMessageAttachmentSelection(0, [file(1024)], null, fmt);
+  // change exists to remove. 1 byte is under every plan limit that has ever
+  // existed, so the reason is what tells "we do not know the limit" from "your
+  // file is too big", and only the former is honest here.
+  const tiny = file(1);
+  const decision = decideMessageAttachmentSelection(0, [tiny], null);
 
   assert.deepEqual(decision.accepted, []);
-  assert.equal(decision.error, "The upload size limit could not be checked. Try again in a moment.");
+  assert.deepEqual(decision.rejection, { rejected: [{ file: tiny, reason: "unchecked" }], limits: null });
 });
 
-test("an unknown ceiling refuses as unknown, not as oversized", () => {
-  // 1 byte is under every plan limit that has ever existed, so an empty
-  // `accepted` alone proves nothing — a missing fail-safe would also reject it
-  // by comparing against a zero-ish ceiling. The message is what distinguishes
-  // "we do not know the limit" from "your file is too big", and only the former
-  // is honest here.
-  const decision = decideMessageAttachmentSelection(0, [file(1)], null, fmt);
-
-  assert.deepEqual(decision.accepted, []);
-  assert.equal(decision.error, "The upload size limit could not be checked. Try again in a moment.");
-  assert.ok(!decision.error.includes("per file"), "must not render a size-limit message for an unknown ceiling");
-});
-
-test("a known ceiling drives both the accepted set and the copy", () => {
-  const servedBytes = 137 * 1024 * 1024;
-  const justUnder = file(servedBytes);
-  const justOver = file(servedBytes + 1);
-
-  const decision = decideMessageAttachmentSelection(0, [justUnder, justOver], servedBytes, fmt);
-
-  assert.deepEqual(decision.accepted, [justUnder]);
-  assert.equal(decision.error, "Max 137MB per file. Current largest file is 137.0MB.");
-});
-
-test("a clean batch under a known ceiling reports no error", () => {
-  const decision = decideMessageAttachmentSelection(0, [file(1024)], 137 * 1024 * 1024, fmt);
+test("a clean batch under a known ceiling rejects nothing", () => {
+  const decision = decideMessageAttachmentSelection(0, [file(1024)], limits(137 * MIB));
 
   assert.equal(decision.accepted.length, 1);
-  assert.equal(decision.error, "");
+  assert.equal(decision.rejection, null);
+});
+
+test("every file that isn't attached is named with its reason, in the order picked", () => {
+  const empty = file(0);
+  const big = file(SERVED_LIMIT_BYTES + 1);
+  const ok = Array.from({ length: MAX_MESSAGE_ATTACHMENTS }, () => file(1024));
+  const extra = file(1024);
+  const decision = decideMessageAttachmentSelection(0, [empty, big, ...ok, extra], limits(SERVED_LIMIT_BYTES));
+
+  assert.deepEqual(decision.accepted, ok);
+  assert.deepEqual(decision.rejection?.rejected, [
+    { file: empty, reason: "empty" },
+    { file: big, reason: "size" },
+    { file: extra, reason: "count" },
+  ]);
+});
+
+test("files beyond what's left of the month are refused for the quota, the rest attach", () => {
+  // 5 MB left: 3 MB fits, then 4 MB doesn't (2 MB are left), then 2 MB does.
+  const three = file(3 * MIB);
+  const four = file(4 * MIB);
+  const two = file(2 * MIB);
+  const decision = decideMessageAttachmentSelection(0, [three, four, two], limits(SERVED_LIMIT_BYTES, 5 * MIB));
+
+  assert.deepEqual(decision.accepted, [three, two]);
+  assert.deepEqual(decision.rejection?.rejected, [{ file: four, reason: "quota" }]);
+});
+
+test("a file refused for the quota doesn't use an attachment slot", () => {
+  const files = [file(10 * MIB), ...Array.from({ length: MAX_MESSAGE_ATTACHMENTS }, () => file(1024))];
+  const decision = decideMessageAttachmentSelection(0, files, limits(SERVED_LIMIT_BYTES, MIB));
+
+  assert.equal(decision.accepted.length, MAX_MESSAGE_ATTACHMENTS);
+  assert.deepEqual(decision.rejection?.rejected.map(({ reason }) => reason), ["quota"]);
+});
+
+test("no monthly quota (Pro) refuses nothing for it", () => {
+  const decision = decideMessageAttachmentSelection(0, [file(40 * MIB), file(40 * MIB)], limits(SERVED_LIMIT_BYTES));
+  assert.equal(decision.rejection, null);
 });

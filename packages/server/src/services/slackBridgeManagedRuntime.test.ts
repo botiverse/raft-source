@@ -101,6 +101,7 @@ test("managed runtime composes one-use OAuth exchange without route-visible secr
           ok: true,
           user: {
             id: "U_HUMAN",
+            team_id: "T_TEAM",
             deleted: false,
             is_bot: false,
             is_admin: true,

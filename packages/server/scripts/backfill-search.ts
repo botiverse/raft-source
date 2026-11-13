@@ -3,7 +3,7 @@ import { drizzle } from "drizzle-orm/node-postgres";
 import { sql } from "drizzle-orm";
 import pg from "pg";
 import * as schema from "../src/db/schema";
-import { buildSearchText } from "../src/services/searchService";
+import { buildSearchText } from "../src/services/searchTokenizer";
 
 type CliOptions = {
   batchSize: number;

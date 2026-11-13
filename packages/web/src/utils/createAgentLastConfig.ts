@@ -1,8 +1,12 @@
+/**
+ * The last create's Computer and runtime. The runtime's settings (model and the
+ * rest) are not remembered: the runtime's server form owns their defaults.
+ * Records written before that still carry `model`/`customModelMode`; they parse
+ * and those fields are ignored.
+ */
 export interface CreateAgentLastConfig {
   machineId: string;
   runtime: string;
-  model: string;
-  customModelMode: boolean;
 }
 
 const STORAGE_KEY_PREFIX = "raft:create-agent:last-config:v1:";
@@ -12,28 +16,21 @@ function storageKey(serverId: string): string {
   return `${STORAGE_KEY_PREFIX}${encodeURIComponent(serverId)}`;
 }
 
-function isPreferenceValue(value: unknown, allowEmpty = false): value is string {
+function isPreferenceValue(value: unknown): value is string {
   return typeof value === "string"
     && value.length <= MAX_PREFERENCE_VALUE_LENGTH
-    && (allowEmpty || value.length > 0);
+    && value.length > 0;
 }
 
 function parseCreateAgentLastConfig(value: unknown): CreateAgentLastConfig | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const candidate = value as Record<string, unknown>;
-  if (
-    !isPreferenceValue(candidate.machineId)
-    || !isPreferenceValue(candidate.runtime)
-    || !isPreferenceValue(candidate.model, true)
-    || typeof candidate.customModelMode !== "boolean"
-  ) {
+  if (!isPreferenceValue(candidate.machineId) || !isPreferenceValue(candidate.runtime)) {
     return null;
   }
   return {
     machineId: candidate.machineId,
     runtime: candidate.runtime,
-    model: candidate.model,
-    customModelMode: candidate.customModelMode,
   };
 }
 

@@ -43,6 +43,8 @@ test("createRaftClient sends through the typed Agent API without CLI state", asy
   const headers = new Headers(calls[0]?.init.headers);
   assert.equal(headers.get("authorization"), `Bearer ${credential}`);
   assert.equal(headers.get("x-sdk-test"), "rss");
+  assert.equal(headers.get("x-raft-client"), "sdk");
+  assert.equal(headers.get("x-raft-client-capabilities"), "manual-context-v1");
 });
 
 test("createRaftClient resolves and joins a visible public channel by target", async () => {

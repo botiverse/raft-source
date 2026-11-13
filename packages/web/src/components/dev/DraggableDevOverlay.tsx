@@ -6,7 +6,7 @@ import {
   useSensors,
 } from "@dnd-kit/core";
 import type { DragEndEvent } from "@dnd-kit/core";
-import { Popover, PopoverContent, PopoverTrigger } from "@botiverse/raft-ui";
+import { Popover, PopoverContent, PopoverTrigger, ScrollArea } from "@botiverse/raft-ui";
 import Tooltip from "../ui/Tooltip";
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { CSSProperties, ReactNode, SyntheticEvent } from "react";
@@ -225,11 +225,11 @@ function DraggableDevOverlayNode({
           side={popoverSide}
           align="center"
           sideOffset={8}
-          disableAnchorTracking={false}
-          className="z-40 max-h-[min(80vh,40rem)] max-w-[calc(100vw-1rem)] overflow-y-auto p-0"
+          className="flex max-h-[min(80vh,40rem)] max-w-[calc(100vw-1rem)] flex-col p-0"
           data-testid={`${testId ?? id}-popover`}
         >
-          {panel}
+          {/* The panel scrolls in a raft-ui ScrollArea that fills the popup up to its height limit. */}
+          <ScrollArea className="min-h-0">{panel}</ScrollArea>
         </PopoverContent>
       ) : null}
     </Popover>

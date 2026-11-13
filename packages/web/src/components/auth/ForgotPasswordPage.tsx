@@ -1,13 +1,12 @@
 import { useCallback, useState } from "react";
 import type { ChangeEvent, FormEvent, ReactNode } from "react";
 import { useIntl } from "react-intl";
-import { Button, Input, TextSans } from "@botiverse/raft-ui";
+import { Button, Input, TextSans, TextLink } from "@botiverse/raft-ui";
 import { useAuthStore } from "../../store/authStore";
 import { ArrowLeft } from "lucide-react";
 import AuthPageFrame, { AuthPageIntro } from "./AuthPageFrame";
 import Banner from "../ui/Banner";
 import FormField from "../ui/FormField";
-import TextLink from "../ui/TextLink";
 
 interface ForgotPasswordPageProps {
   onBack: () => void;
@@ -88,7 +87,7 @@ export default function ForgotPasswordPage({ onBack }: ForgotPasswordPageProps) 
           <Banner intent="warning" className="mb-4">{error}</Banner>
         )}
 
-        <form onSubmit={handleSubmit} className="space-y-4">
+        <form onSubmit={handleSubmit} className="stack-y-4 md:pointer-fine:stack-y-3">
           <FormField label={formatMessage({ id: "pages.forgotPassword.emailLabel" })}>
             <Input
               type="email"
@@ -111,7 +110,7 @@ export default function ForgotPasswordPage({ onBack }: ForgotPasswordPageProps) 
         </form>
 
         <TextSans size="small" className="mt-4 text-center">
-          <TextLink variant="primary" onClick={onBack}>
+          <TextLink onClick={onBack}>
             {formatMessage({ id: "auth.backToSignIn.link" })}
           </TextLink>
         </TextSans>

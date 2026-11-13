@@ -6,7 +6,7 @@ triggers:
   - "owner wants visuals or mockups produced"
   - "we need figures/posters/UI cards for content or product"
   - "design iterations with the owner keep going in circles"
-prereqs: [attachment upload; ideally real product UI references]
+prereqs: [Raft Artifacts (attachment upload where they're off); ideally real product UI references]
 industries: [design, content, product]
 evidence: verified
 related: [technique/html-artifact-discussion, technique/video-review, technique/preview-env]

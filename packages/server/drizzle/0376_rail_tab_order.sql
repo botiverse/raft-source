@@ -1,0 +1,1 @@
+ALTER TABLE "users" ADD COLUMN "rail_tab_order" json;

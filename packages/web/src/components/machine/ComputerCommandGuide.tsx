@@ -1,4 +1,4 @@
-import { Badge, SegmentedControl, SegmentedControlItem, SegmentedControlLabel } from "@botiverse/raft-ui";
+import { SegmentedControl, SegmentedControlItem, SegmentedControlLabel, TextLink } from "@botiverse/raft-ui";
 import { useCallback, useMemo, useState } from "react";
 import { Terminal } from "lucide-react";
 import { useIntl } from "react-intl";
@@ -16,16 +16,14 @@ interface ComputerCommandGuideProps {
   windowsComputerInstallCommand?: string | null;
   className?: string;
   onPlatformChange?: (platform: ComputerCommandPlatform) => void;
+  /** Told which command was copied (the setup step's funnel counts it). */
+  onCopy?: (target: CopyTarget) => void;
 }
 
 /** Where a command line would be when there is none yet: a dashed seam box,
  *  like an empty board column (Raft DS), ink-3 text. */
 const COMMAND_PLACEHOLDER_CLASS_NAME =
   "rounded-control border border-dashed border-line-seam px-3 py-2.5 text-footnote text-foreground-hint";
-
-/** A UI text button (Raft DS: ink, 1.5px underline, 600). */
-const COMMAND_GUIDE_TEXT_BUTTON_CLASS_NAME =
-  "rounded-sticker text-footnote font-semibold text-foreground underline decoration-[1.5px] underline-offset-[3px] outline-none hover:bg-fill-pressed focus-visible:shadow-focus";
 
 // Raft Computer is the only connect path. The standalone daemon connect
 // command is retired: the daemon is no longer published on its own and this
@@ -46,14 +44,14 @@ export interface CommandStep {
   copyAriaLabel: string;
 }
 
-interface ComputerStepLabels {
+export interface ComputerStepLabels {
   install: string;
   setup: string;
   copyInstall: string;
   copySetup: string;
 }
 
-function getComputerSteps(
+export function getComputerSteps(
   platform: ComputerCommandPlatform,
   macLinuxInstall: string | null,
   macLinuxSetup: string | null,
@@ -89,7 +87,7 @@ function CommandRows({
   onCopy: (target: CopyTarget) => void;
 }) {
   return (
-    <div className="space-y-3">
+    <div className="stack-y-3">
       {steps.map((step) => (
         <CommandRow
           key={step.target}
@@ -110,6 +108,7 @@ export default function ComputerCommandGuide({
   windowsComputerInstallCommand = null,
   className = "",
   onPlatformChange,
+  onCopy,
 }: ComputerCommandGuideProps) {
   const { formatMessage } = useIntl();
   const [platform, setPlatform] = useState<ComputerCommandPlatform>("mac-linux");
@@ -160,11 +159,14 @@ export default function ComputerCommandGuide({
     : []), [computerCommand, formatMessage]);
 
   const handleCopy = useCallback((target: CopyTarget) => {
+    onCopy?.(target);
     setCopiedCommand(target);
     setTimeout(() => {
       setCopiedCommand((current) => (current === target ? null : current));
     }, 2000);
-  }, []);
+  }, [onCopy]);
+
+  const toggleConnectOnly = useCallback(() => setShowConnectOnly((open) => !open), []);
 
   const handlePlatformChange = useCallback((next: ComputerCommandPlatform) => {
     setPlatform(next);
@@ -182,7 +184,6 @@ export default function ComputerCommandGuide({
           value={platform}
           onValueChange={handlePlatformChange}
           aria-label={formatMessage({ id: "machine.commandGuide.choosePlatform" })}
-          className="shrink-0"
         >
           <SegmentedControlItem value="mac-linux" data-testid="computer-command-platform-mac-linux">
             <SegmentedControlLabel>{formatMessage({ id: "machine.detail.macLinux" })}</SegmentedControlLabel>
@@ -206,12 +207,11 @@ export default function ComputerCommandGuide({
       </p>
 
       {isComputerGuide && platform === "windows" ? (
-        <div className="space-y-3" data-testid="windows-computer-command-block">
+        <div className="stack-y-3" data-testid="windows-computer-command-block">
             <div className="flex flex-wrap items-center gap-2">
               <div className="text-footnote font-bold text-foreground">
                 {formatMessage({ id: "machine.commandGuide.raftComputerWindowsX64" })}
               </div>
-              <Badge.Experimental />
             </div>
           {displayedComputerSteps.length > 0 ? (
             <CommandRows
@@ -238,15 +238,14 @@ export default function ComputerCommandGuide({
               connect-only command behind an explicit choice. */}
           {computerInstallAndSetupCommand && computerCommand && (
             <div className="mt-2">
-              <button
-                type="button"
+              <TextLink
                 aria-expanded={showConnectOnly}
-                onClick={() => setShowConnectOnly((open) => !open)}
-                className={COMMAND_GUIDE_TEXT_BUTTON_CLASS_NAME}
+                onClick={toggleConnectOnly}
+                className="text-footnote"
                 data-testid="computer-command-already-installed"
               >
                 {formatMessage({ id: "machine.commandGuide.alreadyInstalled" })}
-              </button>
+              </TextLink>
               {showConnectOnly && (
                 <div className="mt-2" data-testid="computer-command-connect-only">
                   <p className="mb-2 text-footnote text-foreground-muted">

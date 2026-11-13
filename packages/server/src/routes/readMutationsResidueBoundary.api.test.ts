@@ -21,7 +21,7 @@ import { createMessage } from "../services/messageService";
 import { claimNextReadMutation, executeReadMutationClaim } from "../services/readMutationSequencer";
 import { createServer } from "../services/serverService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 async function login(baseUrl: string, email: string): Promise<string> {
   const response = await fetch(`${baseUrl}/api/auth/login`, {

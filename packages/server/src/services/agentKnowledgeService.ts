@@ -13,7 +13,7 @@ import { agentKnowledgeEvents, agents } from "../db/schema";
 export const AGENT_KNOWLEDGE_STATUSES = ["success", "not_found", "denied", "error"] as const;
 export type AgentKnowledgeStatus = (typeof AGENT_KNOWLEDGE_STATUSES)[number];
 
-export const AGENT_KNOWLEDGE_SOURCES = ["cli"] as const;
+export const AGENT_KNOWLEDGE_SOURCES = ["cli", "sdk"] as const;
 export type AgentKnowledgeSource = (typeof AGENT_KNOWLEDGE_SOURCES)[number];
 
 export const AGENT_KNOWLEDGE_DOC_STATES = ["draft", "published", "deprecated", "retired"] as const;
@@ -227,10 +227,12 @@ const AGENT_KNOWLEDGE_SOURCE_PATHS = [
   "manual/agent-knowledge/agent-status.md",
   "manual/agent-knowledge/agent.md",
   "manual/agent-knowledge/app.md",
+  "manual/agent-knowledge/artifact.md",
   "manual/agent-knowledge/attachment.md",
   "manual/agent-knowledge/channel.md",
   "manual/agent-knowledge/common-worked-patterns.md",
   "manual/agent-knowledge/computer.md",
+  "manual/agent-knowledge/context.md",
   "manual/agent-knowledge/dm.md",
   "manual/agent-knowledge/external-agent.md",
   "manual/agent-knowledge/getting-started.md",
@@ -262,7 +264,7 @@ const AGENT_KNOWLEDGE_SOURCE_PATHS = [
   "manual/agent-knowledge/ui-surface-map.md",
   "manual/agent-knowledge/user-profile.md",
   "manual/agent-knowledge/voice-and-tone.md",
-  "manual/agent-knowledge/what-slock-doesnt-have.md",
+  "manual/agent-knowledge/what-raft-doesnt-have.md",
 ] as const;
 
 const RECIPE_SOURCE_PATHS = [
@@ -345,7 +347,7 @@ const LEGACY_AGENT_KNOWLEDGE_GROUP_BY_DOC_ID: Readonly<Record<string, string>> =
   "ui-surface-map": "cross-cutting",
   "user-profile": "participants",
   "voice-and-tone": "cross-cutting",
-  "what-slock-doesnt-have": "cross-cutting",
+  "what-raft-doesnt-have": "cross-cutting",
 };
 
 const EXTRA_AGENT_KNOWLEDGE_ALIASES_BY_DOC_ID: Readonly<Record<string, readonly string[]>> = {
@@ -452,6 +454,19 @@ const EXTRA_AGENT_KNOWLEDGE_ALIASES_BY_DOC_ID: Readonly<Record<string, readonly 
     "agent-knowledge/cross-cutting/slock-cli-overview",
     "manual/agent-knowledge/cross-cutting/slock-cli-overview",
     "docs/agent-knowledge/cross-cutting/slock-cli-overview",
+  ],
+  // The topic was `what-slock-doesnt-have` until the Slock -> Raft rename of its
+  // id. Old links, cached topic ids and the section-qualified path forms keep
+  // resolving to it.
+  "what-raft-doesnt-have": [
+    "what-slock-doesnt-have",
+    "agent-knowledge/what-slock-doesnt-have",
+    "manual/agent-knowledge/what-slock-doesnt-have",
+    "docs/agent-knowledge/what-slock-doesnt-have",
+    "cross-cutting/what-slock-doesnt-have",
+    "agent-knowledge/cross-cutting/what-slock-doesnt-have",
+    "manual/agent-knowledge/cross-cutting/what-slock-doesnt-have",
+    "docs/agent-knowledge/cross-cutting/what-slock-doesnt-have",
   ],
   "rename-slock-to-raft": [
     "slock to raft",
@@ -683,7 +698,6 @@ export async function searchAgentKnowledgeDocsWithResolution(
     const content = contents.get(entry.docId) ?? await readKnowledgeContent(entry);
     const digest = createHash("sha256").update(content, "utf8").digest("hex").slice(0, 16);
     const title = extractKnowledgeTitle(content) ?? entry.docId;
-    const firstScreen = extractFirstScreen(content);
     const scoringInput = {
       entry,
       title,
@@ -696,6 +710,11 @@ export async function searchAgentKnowledgeDocsWithResolution(
     const detailed = scoreKnowledgeEntryDetailed(scoringInput);
     const score = scoreKnowledgeEntry(scoringInput);
     if (score <= 0) continue;
+    const firstScreen = extractSearchExcerpt(
+      content,
+      title,
+      new Set([...detailed.matchedTerms, ...detailed.fuzzyTerms.values()]),
+    );
     scored.push({
       slug: entry.docId,
       title,
@@ -1179,16 +1198,132 @@ function extractKnowledgeTitle(content: string): string | null {
   return headingTitle?.[1]?.trim() ?? null;
 }
 
-function extractFirstScreen(content: string): string {
+function extractFirstScreenLines(content: string): string[] {
   const body = content.replace(/^---\n[\s\S]*?\n---\n?/, "");
-  const lines = body
+  return body
     .split(/\r?\n/)
     .map((line) => line.trim())
     .filter((line) => line && !line.startsWith("<!--"));
-  const excerpt = lines.join("\n").slice(0, FIRST_SCREEN_MAX_CHARS).trim();
-  return excerpt.length === FIRST_SCREEN_MAX_CHARS
+}
+
+function truncateExcerpt(text: string, maxChars: number): string {
+  const excerpt = text.slice(0, maxChars).trim();
+  return excerpt.length === maxChars
     ? `${excerpt.replace(/\s+\S*$/, "")}...`
     : excerpt;
+}
+
+function extractFirstScreen(content: string): string {
+  return truncateExcerpt(extractFirstScreenLines(content).join("\n"), FIRST_SCREEN_MAX_CHARS);
+}
+
+/**
+ * The search result's excerpt. Usually the topic's first screen, but when the
+ * query matched a section the first screen does not reach, the excerpt keeps
+ * the opening line and then shows that section from its heading.
+ *
+ * Without this an agent saw only a topic's intro and concluded the Manual did
+ * not cover what it searched for, though a full section further down did
+ * (`.raftmigrateignore` in the agent topic, #wg-agent-migration:e1f4df83).
+ * The field keeps its name and shape so CLIs, SDKs and runtimes already
+ * deployed show the better excerpt without an upgrade.
+ */
+export function extractSearchExcerpt(content: string, title: string, hitTokens: ReadonlySet<string>): string {
+  const firstScreen = extractFirstScreen(content);
+  if (hitTokens.size === 0) return firstScreen;
+
+  const lines = extractFirstScreenLines(content);
+  // Tokenized as written: normalizeKnowledgeLookupTopic is for topic paths and
+  // would cut a line at its first `#` or `?`, blanking every heading.
+  const lineHits = lines.map((line) =>
+    tokenizeKnowledgeTextParts(line).filter((token) => hitTokens.has(token))
+  );
+
+  // Lines the first screen shows (it is the same lines joined, cut at the limit).
+  let firstScreenLineCount = 0;
+  for (let used = 0; firstScreenLineCount < lines.length; firstScreenLineCount += 1) {
+    used += lines[firstScreenLineCount].length + 1;
+    if (used > FIRST_SCREEN_MAX_CHARS) break;
+  }
+  const covered = new Set(lineHits.slice(0, firstScreenLineCount).flat());
+
+  // A section runs from a heading (level 2 or deeper, outside code fences) to
+  // the next; the lines before the first heading are a section of their own.
+  const sections = [{ start: 0, end: lines.length }];
+  let inFence = false;
+  for (let index = 1; index < lines.length; index += 1) {
+    const line = lines[index];
+    if (line.startsWith("```")) inFence = !inFence;
+    if (inFence || !/^#{2,6}\s/.test(line)) continue;
+    sections[sections.length - 1].end = index;
+    sections.push({ start: index, end: lines.length });
+  }
+
+  // The section showing the most query terms the first screen does not. Such
+  // terms only occur past the first screen (or in the line it cuts off), so
+  // its first hit is there too.
+  let best: { start: number; end: number; firstHit: number; hitToken: string; gained: number } | null = null;
+  for (const section of sections) {
+    const gainedTokens = new Set<string>();
+    let firstHit = -1;
+    let hitToken = "";
+    for (let index = section.start; index < section.end; index += 1) {
+      const gained = lineHits[index].filter((token) => !covered.has(token));
+      if (gained.length === 0) continue;
+      if (firstHit < 0) {
+        firstHit = index;
+        hitToken = gained[0];
+      }
+      for (const token of gained) gainedTokens.add(token);
+    }
+    if (gainedTokens.size > (best?.gained ?? 0)) best = { ...section, firstHit, hitToken, gained: gainedTokens.size };
+  }
+  if (!best) return firstScreen;
+
+  // The title, the section heading, then the section from the line before its
+  // first hit, all within the first screen's budget. Skipped lines become
+  // "...", unless that would replace just one line.
+  const titleLine = /^#\s/.test(lines[0]) ? lines[0] : `# ${title}`;
+  const skippedBeforeSection = titleLine === lines[0] ? best.start - 1 : best.start;
+  const head = best.start === 0
+    ? [lines[0]]
+    : [titleLine, ...(skippedBeforeSection > 0 ? ["..."] : []), lines[best.start]];
+  if (best.firstHit === best.start) {
+    return truncateExcerpt([...head, ...lines.slice(best.start + 1, best.end)].join("\n"), FIRST_SCREEN_MAX_CHARS);
+  }
+
+  // A long line must not push the hit past the cut: drop the line before the
+  // hit when both don't fit, and show a hit line that alone is too long from
+  // shortly before the hit.
+  // One spare character: a text exactly at the budget loses its last word.
+  const remaining = FIRST_SCREEN_MAX_CHARS - head.join("\n").length - "\n...\n".length - 1;
+  const hitLine = lines[best.firstHit];
+  let fromLine = best.firstHit - 1 > best.start + 2 ? best.firstHit - 1 : best.start + 1;
+  if (lines.slice(fromLine, best.firstHit + 1).join("\n").length > remaining) fromLine = best.firstHit;
+  const body = hitLine.length <= remaining
+    ? lines.slice(fromLine, best.end)
+    : [windowAroundHit(hitLine, best.hitToken), ...lines.slice(best.firstHit + 1, best.end)];
+  const gap = fromLine > best.start + 1 ? ["..."] : [];
+  return truncateExcerpt([...head, ...gap, ...body].join("\n"), FIRST_SCREEN_MAX_CHARS);
+}
+
+/**
+ * The line from shortly before the hit, so the hit shows near the start. The
+ * hit is found with the tokenizer that picked it: the token is a stem
+ * (`approval` -> `approve`, `directories` -> `directory`), so it may not be
+ * spelled out in the line, and a word merely starting with it is not a hit.
+ */
+function windowAroundHit(line: string, hitToken: string): string {
+  let index = 0;
+  for (const word of line.toLowerCase().matchAll(/[a-z0-9]+/g)) {
+    if (word[0].length >= 3 && stemSearchTerm(word[0]) === hitToken) {
+      index = word.index ?? 0;
+      break;
+    }
+  }
+  const from = Math.max(0, index - 80);
+  if (from === 0) return line;
+  return `...${line.slice(from).replace(/^\S*\s/, "")}`;
 }
 
 function listAgentKnowledgeTopicIds(): string[] {

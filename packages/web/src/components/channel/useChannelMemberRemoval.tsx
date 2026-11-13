@@ -11,7 +11,7 @@ export interface ChannelMemberRemoveTarget {
 /**
  * Shared remove-member flow (member-page task): the removeTarget staging
  * state plus the destructive ConfirmDialog, factored out of
- * agent/ChannelMembers so the members page (its presentation="page"
+ * features/channel/ChannelMembers so the members page (its presentation="page"
  * drawer-internal view) runs the byte-identical confirm →
  * removeAgent/removeHuman mutation path. The caller keeps ownership of the
  * mutations (they ride its own useChannelMembers instance) and renders

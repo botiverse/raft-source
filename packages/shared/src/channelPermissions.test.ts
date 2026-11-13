@@ -3,12 +3,10 @@ import {
   CHANNEL_ADMIN_CAPABILITIES,
   CHANNEL_MANAGEMENT_CAPABILITIES,
   canAddChannelMembers,
-  canGuestJoinChannel,
   canGuestPostToChannel,
   canGuestReadChannel,
   getChannelAdminBasis,
   hasEffectiveChannelCapability,
-  JOINT_CHANNEL_ADMIN_CAPABILITIES,
   channelSupportsRoles,
 } from "./channelPermissions";
 
@@ -36,7 +34,7 @@ test("stored channel admin grants only the closed local capability set", () => {
   }
 });
 
-test("a stored admin on a joint channel grants only the joint allowlist", () => {
+test("a stored admin on a joint channel grants nothing on its own (the host decides)", () => {
   for (const capability of CHANNEL_ADMIN_CAPABILITIES) {
     assert.equal(hasEffectiveChannelCapability({
       serverRole: "member",
@@ -45,9 +43,8 @@ test("a stored admin on a joint channel grants only the joint allowlist", () => 
       supportsChannelRoles: true,
       capability,
       channelType: "joint",
-    }), (JOINT_CHANNEL_ADMIN_CAPABILITIES as readonly string[]).includes(capability), capability);
+    }), false, capability);
   }
-  assert.deepEqual([...JOINT_CHANNEL_ADMIN_CAPABILITIES], ["editChannelMetadata", "changeChannelMemberRoles"]);
 });
 
 test("channel roles exist on public, private and joint channels, never on #all", () => {
@@ -98,14 +95,21 @@ test("add-member policy is admission-aware, shape-closed, and independent of loc
   }), false);
 
   // Joint channels are addable again (task #1150): the same admission rules
-  // apply, so a joint channel is not a way around them.
+  // apply, so a joint channel is not a way around them. A joint channel is
+  // shared with other servers, so owner/admin must be in it too (#wg-rbac B6).
   for (const serverRole of ["owner", "admin"] as const) {
+    assert.equal(canAddChannelMembers({
+      ...base,
+      serverRole,
+      isChannelMember: true,
+      channelType: "joint",
+    }), true, `joint/${serverRole}/joined`);
     assert.equal(canAddChannelMembers({
       ...base,
       serverRole,
       isChannelMember: false,
       channelType: "joint",
-    }), true, `joint/${serverRole}`);
+    }), false, `joint/${serverRole}/not joined`);
   }
   assert.equal(canAddChannelMembers({
     ...base,
@@ -146,7 +150,7 @@ test("channel projection includes local and server-only management capabilities"
     "archiveChannels",
     "deleteChannels",
     "changeChannelVisibility",
-    "manageGuestAccess",
+    "manageVisitorAccess",
     "federateChannels",
     "addChannelMembers",
     "removeChannelMembers",
@@ -154,69 +158,51 @@ test("channel projection includes local and server-only management capabilities"
   ]);
 });
 
-test("guest channel policy separates read and join from fixed read-only post authority", () => {
+test("a Guest reads and posts only in its one bound channel (#wg-rbac:#15)", () => {
   const base = {
-    gateEnabled: true,
     serverRole: "guest" as const,
-    channelType: "channel" as const,
-    channelName: "project",
-    guestVisible: true,
-    guestJoinable: true,
-    isChannelMember: false,
+    channelId: "bound",
+    channelType: "private" as const,
+    guestChannelId: "bound",
+    isChannelMember: true,
     archived: false,
     deleted: false,
   };
   assert.equal(canGuestReadChannel(base), true);
-  assert.equal(canGuestJoinChannel(base), true);
-  assert.equal(canGuestPostToChannel(base), false);
-  assert.equal(canGuestPostToChannel({ ...base, isChannelMember: true }), false);
+  assert.equal(canGuestPostToChannel(base), true);
+  assert.equal(canGuestReadChannel({ ...base, channelType: "channel" }), true);
+  // P3: its bound joint channel, once the server resolved the host entry.
+  assert.equal(canGuestReadChannel({ ...base, channelType: "joint", jointEntry: true }), true);
+  assert.equal(canGuestPostToChannel({ ...base, channelType: "joint", jointEntry: true }), true);
 });
 
-test("guest channel policy fails closed for rollout, shape, archive, and hidden all boundaries", () => {
+test("a Guest is denied everything outside its live, bound membership", () => {
   const base = {
-    gateEnabled: true,
     serverRole: "guest" as const,
-    channelType: "channel" as const,
-    channelName: "project",
-    guestVisible: true,
-    guestJoinable: true,
-    isChannelMember: false,
+    channelId: "bound",
+    channelType: "private" as const,
+    guestChannelId: "bound",
+    isChannelMember: true,
     archived: false,
     deleted: false,
   };
-  assert.equal(canGuestReadChannel({ ...base, gateEnabled: false }), false);
-  assert.equal(canGuestReadChannel({ ...base, channelType: "joint" }), false);
-  assert.equal(canGuestReadChannel({ ...base, archived: true }), true);
-  assert.equal(canGuestReadChannel({ ...base, deleted: true }), false);
-  assert.equal(canGuestJoinChannel({ ...base, archived: true }), false);
-  assert.equal(canGuestReadChannel({ ...base, channelName: "all", allChannelHidden: true }), false);
-  assert.equal(canGuestReadChannel({ ...base, channelType: "private", isChannelMember: false }), false);
-  assert.equal(canGuestReadChannel({ ...base, channelType: "private", isChannelMember: true }), true);
-  assert.equal(canGuestReadChannel({ ...base, channelType: "dm", isChannelMember: true }), true);
-  assert.equal(canGuestPostToChannel({ ...base, channelType: "dm", isChannelMember: true }), false);
-  assert.equal(canGuestPostToChannel({ ...base, channelType: "private", isChannelMember: true }), false);
-  assert.equal(canGuestPostToChannel({ ...base, archived: true, isChannelMember: true }), false);
-});
-
-test("#all exposes one read-only Guest policy and never creates Guest membership", () => {
-  const all = {
-    gateEnabled: true,
-    serverRole: "guest" as const,
-    channelType: "channel" as const,
-    channelName: "all",
-    allChannelHidden: false,
-    guestVisible: true,
-    guestJoinable: true,
-    isChannelMember: false,
-    archived: false,
-    deleted: false,
-  };
-  assert.equal(canGuestReadChannel(all), true);
-  assert.equal(canGuestReadChannel({ ...all, guestVisible: false }), false);
-  assert.equal(canGuestReadChannel({ ...all, allChannelHidden: true }), false);
-  assert.equal(canGuestJoinChannel(all), false);
-  assert.equal(canGuestJoinChannel({ ...all, isChannelMember: true }), false);
-  assert.equal(canGuestPostToChannel({ ...all, isChannelMember: true }), false);
+  for (const [label, input] of [
+    ["another channel, even as its member", { ...base, channelId: "other" }],
+    ["no binding (legacy Guest)", { ...base, guestChannelId: null }],
+    ["bound but no longer a member", { ...base, isChannelMember: false }],
+    ["archived", { ...base, archived: true }],
+    ["deleted", { ...base, deleted: true }],
+    ["a DM", { ...base, channelType: "dm" as const }],
+    ["a joint channel without a resolved joint entry", { ...base, channelType: "joint" as const }],
+    ["a joint channel whose entry was refused", { ...base, channelType: "joint" as const, jointEntry: false }],
+    ["another joint channel, even with an entry", { ...base, channelType: "joint" as const, jointEntry: true, channelId: "other" }],
+    ["a joint channel with an entry but no membership", { ...base, channelType: "joint" as const, jointEntry: true, isChannelMember: false }],
+    ["a thread passed unresolved", { ...base, channelType: "thread" as const }],
+    ["not a Guest", { ...base, serverRole: "member" as const }],
+  ] as const) {
+    assert.equal(canGuestReadChannel(input), false, `read: ${label}`);
+    assert.equal(canGuestPostToChannel(input), false, `post: ${label}`);
+  }
 });
 
 test("local role never bypasses membership or unsupported channel shape", () => {

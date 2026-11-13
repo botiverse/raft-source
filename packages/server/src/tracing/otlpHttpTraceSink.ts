@@ -35,6 +35,40 @@ export interface OtlpHttpTraceSinkOptions {
   timeoutMs?: number;
   fetchImpl?: OtlpHttpTraceSinkFetch;
   onError?: (err: Error) => void;
+  /** Counts what each queue sent, dropped and failed (./traceExportSummary). */
+  observer?: OtlpExportObserver;
+}
+
+export type OtlpSignal = "traces" | "logs";
+export type OtlpExportFailureKind = "timeout" | "network" | "http_429" | "http_4xx" | "http_5xx";
+
+export interface OtlpExportFailure {
+  kind: OtlpExportFailureKind;
+  httpStatus?: number;
+}
+
+export interface OtlpExportObserver {
+  exported(signal: OtlpSignal, items: number, durationMs: number): void;
+  exportFailed(signal: OtlpSignal, items: number, durationMs: number, failure: OtlpExportFailure): void;
+  droppedQueueFull(signal: OtlpSignal, items: number): void;
+  queueDepth(signal: OtlpSignal, depth: number): void;
+}
+
+class OtlpHttpStatusError extends Error {
+  constructor(readonly status: number, body: string) {
+    super(`OTLP HTTP ${status}${body ? `: ${body.slice(0, 200)}` : ""}`);
+  }
+}
+
+/** Bounded kind only: the message can carry Telescope's response text. */
+export function otlpExportFailureOf(err: unknown): OtlpExportFailure {
+  if (err instanceof OtlpHttpStatusError) {
+    const kind = err.status === 429 ? "http_429" : err.status >= 500 ? "http_5xx" : "http_4xx";
+    return { kind, httpStatus: err.status };
+  }
+  // post() aborts the fetch at timeoutMs; fetch rejects with an AbortError.
+  if (err instanceof Error && (err.name === "AbortError" || err.name === "TimeoutError")) return { kind: "timeout" };
+  return { kind: "network" };
 }
 
 type OtlpAnyValue =
@@ -148,10 +182,14 @@ export class OtlpHttpTraceSink implements TraceSink {
     this.fetchImpl = options.fetchImpl ?? globalThis.fetch.bind(globalThis);
     this.spanQueue = new ExportQueue({
       ...queueOptions,
+      signal: "traces",
+      observer: options.observer,
       exportBatch: (spans) => this.post(this.tracesEndpoint, this.toOtlpPayload(spans)),
     });
     this.eventQueue = new ExportQueue({
       ...queueOptions,
+      signal: "logs",
+      observer: options.observer,
       exportBatch: (events) => this.post(this.logsEndpoint, this.toOtlpLogsPayload(events)),
     });
   }
@@ -190,7 +228,7 @@ export class OtlpHttpTraceSink implements TraceSink {
       });
       if (!response.ok) {
         const body = await response.text().catch(() => "");
-        throw new Error(`OTLP HTTP ${response.status}${body ? `: ${body.slice(0, 200)}` : ""}`);
+        throw new OtlpHttpStatusError(response.status, body);
       }
     } finally {
       clearTimeout(timeout);
@@ -261,6 +299,8 @@ interface ExportQueueOptions<T> {
   flushIntervalMs: number;
   maxQueueSize: number;
   onError: (err: Error) => void;
+  signal: OtlpSignal;
+  observer?: OtlpExportObserver;
   exportBatch: (items: readonly T[]) => Promise<void>;
 }
 
@@ -276,8 +316,10 @@ class ExportQueue<T> {
     if (this.items.length >= this.options.maxQueueSize) {
       this.items.shift();
       this.droppedCount += 1;
+      this.options.observer?.droppedQueueFull(this.options.signal, 1);
     }
     this.items.push(item);
+    this.options.observer?.queueDepth(this.options.signal, this.items.length);
 
     if (this.items.length >= this.options.batchSize) {
       void this.flush();
@@ -305,11 +347,14 @@ class ExportQueue<T> {
 
     this.flushing = true;
     const batch = this.items.splice(0, this.options.batchSize);
+    const startedMs = Date.now();
 
     try {
       await this.options.exportBatch(batch);
+      this.options.observer?.exported(this.options.signal, batch.length, Date.now() - startedMs);
     } catch (err) {
       this.droppedCount += batch.length;
+      this.options.observer?.exportFailed(this.options.signal, batch.length, Date.now() - startedMs, otlpExportFailureOf(err));
       this.options.onError(err instanceof Error ? err : new Error(String(err)));
     } finally {
       this.flushing = false;

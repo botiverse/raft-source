@@ -1,0 +1,31 @@
+{
+  "name": "@botiverse/raft-perf",
+  "version": "0.9.1",
+  "license": "LicenseRef-Raft-License",
+  "private": true,
+  "type": "module",
+  "description": "Web performance tools for agents: paired on/off page measurement with a JSON verdict, and first-screen snapshots/diffs of deployed builds (docs/frontend/perf-measure.md).",
+  "scripts": {
+    "measure": "node --import @oxc-node/core/register src/measure.ts",
+    "load": "node --import @oxc-node/core/register src/load.ts",
+    "advise": "node --import @oxc-node/core/register src/advise.ts",
+    "snapshot": "node --import @oxc-node/core/register src/snapshot.ts",
+    "diff": "node --import @oxc-node/core/register src/diff.ts",
+    "interact": "node --import @oxc-node/core/register src/interact.ts",
+    "check": "node --import @oxc-node/core/register src/check.ts",
+    "claim": "node --import @oxc-node/core/register src/claim.ts",
+    "test": "vitest run",
+    "typecheck": "tsrs --noEmit",
+    "typecheck:tsc": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@oxc-node/core": "^0.1.6",
+    "@types/node": "^25.5.0",
+    "playwright": "^1.64.0",
+    "typescript": "6.0.3",
+    "vitest": "^5.0.3"
+  },
+  "dependencies": {
+    "web-vitals": "6.2.3"
+  }
+}

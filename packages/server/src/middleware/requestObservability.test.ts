@@ -1,9 +1,12 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { BasicTracer, MemoryTraceSink, traceEventRowsForSpan, traceSpanFactRowForSpan } from "@botiverse/raft-shared";
+import { vi } from "vitest";
+import { CLIENT_IP_HASH_SALT_ENV } from "../tracing/clientIpHash";
 import { httpRequestDuration, httpRequestsTotal } from "../metrics";
+import { traceAgentIdHash } from "../tracing/traceIdentity";
 import { __traceUserIdForTests, rememberTraceUserId } from "../tracing/traceUserId";
-import { attachAuthTraceIdentity, bucketHttpStatus, inferHttpCallerKind, normalizeObservedRoutePattern, requestObservabilityMiddleware, setRequestTraceComputerTarget, setRequestTraceErrorCode } from "./requestObservability";
+import { attachAuthTraceIdentity, bucketHttpStatus, inferHttpCallerKind, normalizeObservedRoutePattern, requestClientAttrs, requestObservabilityMiddleware, setRequestTraceComputerCaller, setRequestTraceComputerTarget, setRequestTraceErrorCode } from "./requestObservability";
 
 const EXPECTED_LABELS = {
   route_pattern: "/api/servers/:id/members/:memberId/profile",
@@ -387,6 +390,37 @@ test("requestObservabilityMiddleware classifies agent-origin HTTP without raw ag
   assert.equal(responseRow.caller_kind, "agent");
 });
 
+test("a refused agent request carries a hash of the agent id it claimed, never the raw id", () => {
+  process.env.JWT_SECRET ??= "test-jwt-secret-for-claimed-agent-hash";
+  const run = (statusCode: number, actingAgentId?: string) => {
+    const sink = new MemoryTraceSink();
+    const tracer = new BasicTracer({ sink });
+    const req: any = {
+      method: "GET",
+      originalUrl: "/internal/agent-api/search",
+      url: "/internal/agent-api/search",
+      actingAgentId,
+      header: (name: string) => (name.toLowerCase() === "x-agent-id" ? "agent-raw-id" : undefined),
+      app: { get: (key: string) => (key === "serverTracer" ? tracer : undefined) },
+    };
+    const res: any = new EventEmitter();
+    res.statusCode = statusCode;
+    res.locals = {};
+    requestObservabilityMiddleware(req, res, () => {});
+    res.emit("finish");
+    return sink.getAllSpans()[0].attrs ?? {};
+  };
+
+  const refused = run(401);
+  assert.equal(refused.claimed_agent_id_hash, traceAgentIdHash("agent-raw-id"));
+  assert.ok(refused.claimed_agent_id_hash);
+  assert.equal("agent_id_hash" in refused, false);
+  assert.equal(Object.values(refused).includes("agent-raw-id"), false);
+
+  assert.equal("claimed_agent_id_hash" in run(200), false);
+  assert.equal("claimed_agent_id_hash" in run(401, "agent-verified"), false);
+});
+
 test("inferHttpCallerKind treats internal agent and machine routes as separate caller kinds", () => {
   assert.equal(
     inferHttpCallerKind({ header: () => undefined } as any, "/internal/agent/:id/receive"),
@@ -488,6 +522,200 @@ test("a request waiting on a Computer names it on the root span and its finished
     assert.equal(attrs?.target_runtime, "codex");
     assert.equal(attrs?.option_source_id, "model");
   }
+});
+
+test("an sk_computer request names its Computer and migration once the route resolves them", () => {
+  const sink = new MemoryTraceSink();
+  const tracer = new BasicTracer({ sink, traceIdGenerator: () => "9".repeat(32), spanIdGenerator: () => "a".repeat(16) });
+  const migrationId = "550E8400-E29B-41D4-A716-446655440000";
+  const req: any = {
+    method: "GET",
+    originalUrl: `/internal/computer/agent-migrations/by-id/${migrationId}/resumable/control?role=target`,
+    url: `/agent-migrations/by-id/${migrationId}/resumable/control?role=target`,
+    baseUrl: "/internal/computer",
+    route: { path: "/agent-migrations/by-id/:migrationId/resumable/control" },
+    app: { get: (key: string) => (key === "serverTracer" ? tracer : undefined) },
+  };
+  const res: any = new EventEmitter();
+  res.statusCode = 409;
+  res.locals = {};
+  requestObservabilityMiddleware(req, res, () => {});
+  setRequestTraceComputerCaller(res, { machineId: "m1", migrationId });
+  res.emit("finish");
+  const [span] = sink.getAllSpans();
+  const finished = span!.events.find((event) => event.name === "http.response.finished")?.attrs;
+  for (const attrs of [span!.attrs, finished]) {
+    assert.ok(!Object.values(attrs ?? {}).includes("m1"));
+    assert.equal(attrs?.machine_id_present, true);
+    assert.equal(attrs?.migration_id, migrationId.toLowerCase());
+  }
+});
+
+test("a migration id that is not a UUID is left off the request span", () => {
+  const sink = new MemoryTraceSink();
+  const tracer = new BasicTracer({ sink, traceIdGenerator: () => "b".repeat(32), spanIdGenerator: () => "c".repeat(16) });
+  const req: any = {
+    method: "GET",
+    originalUrl: "/internal/computer/agent-migrations/by-id/not-a-uuid",
+    url: "/agent-migrations/by-id/not-a-uuid",
+    baseUrl: "/internal/computer",
+    route: { path: "/agent-migrations/by-id/:migrationId" },
+    app: { get: (key: string) => (key === "serverTracer" ? tracer : undefined) },
+  };
+  const res: any = new EventEmitter();
+  res.statusCode = 404;
+  res.locals = {};
+  requestObservabilityMiddleware(req, res, () => {});
+  setRequestTraceComputerCaller(res, { machineId: "m1", migrationId: "not-a-uuid" });
+  res.emit("finish");
+  const [span] = sink.getAllSpans();
+  assert.equal(span!.attrs?.migration_id, undefined);
+  assert.equal(span!.attrs?.machine_id_present, true);
+});
+
+test("a request names the client, version, Computer, daemon and runtime it says it came from", () => {
+  const sink = new MemoryTraceSink();
+  const tracer = new BasicTracer({ sink, traceIdGenerator: () => "7".repeat(32), spanIdGenerator: () => "8".repeat(16) });
+  const headers: Record<string, string> = {
+    "x-raft-client": "cli",
+    "x-raft-client-version": "0.0.42",
+    "x-raft-computer-version": "1.0.54",
+    "x-raft-daemon-version": "1.0.53",
+    "x-raft-runtime": "codex",
+  };
+  const req: any = {
+    method: "GET",
+    originalUrl: "/internal/agent-api/history",
+    url: "/internal/agent-api/history",
+    baseUrl: "/internal/agent-api",
+    route: { path: "/history" },
+    header: (name: string) => headers[name.toLowerCase()],
+    app: { get: (key: string) => (key === "serverTracer" ? tracer : undefined) },
+  };
+  const res: any = new EventEmitter();
+  res.statusCode = 200;
+  res.locals = {};
+  requestObservabilityMiddleware(req, res, () => {});
+  res.emit("finish");
+  const [span] = sink.getAllSpans();
+  const finished = span!.events.find((event) => event.name === "http.response.finished")?.attrs;
+  for (const attrs of [span!.attrs, finished]) {
+    assert.equal(attrs?.client_kind, "cli");
+    assert.equal(attrs?.client_version, "0.0.42");
+    assert.equal(attrs?.client_computer_version, "1.0.54");
+    assert.equal(attrs?.client_daemon_version, "1.0.53");
+    assert.equal(attrs?.client_runtime, "codex");
+  }
+});
+
+// #proj-analytics:#17 (Tenny 4772ad78): a signed-out public route's caller as a class, never the raw User-Agent.
+test("a public route names its caller's class; other routes do not", () => {
+  const spanFor = (url: string, userAgent: string) => {
+    const sink = new MemoryTraceSink();
+    const tracer = new BasicTracer({ sink, traceIdGenerator: () => "9".repeat(32), spanIdGenerator: () => "a".repeat(16) });
+    const req: any = {
+      method: "GET",
+      originalUrl: url,
+      url,
+      baseUrl: "",
+      header: (name: string) => (name.toLowerCase() === "user-agent" ? userAgent : undefined),
+      app: { get: (key: string) => (key === "serverTracer" ? tracer : undefined) },
+    };
+    const res: any = new EventEmitter();
+    res.statusCode = 200;
+    res.locals = {};
+    requestObservabilityMiddleware(req, res, () => {});
+    res.emit("finish");
+    const [span] = sink.getAllSpans();
+    return span!;
+  };
+  const chatgpt = "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko); compatible; ChatGPT-User/1.0; +https://openai.com/bot";
+
+  const publicSpan = spanFor("/api/public/artifacts/pt_1/index.md?x=1", chatgpt);
+  const finished = publicSpan.events.find((event) => event.name === "http.response.finished")?.attrs;
+  for (const attrs of [publicSpan.attrs, finished]) assert.equal(attrs?.public_requester, "chatgpt_user");
+  assert.equal(JSON.stringify(publicSpan).includes("ChatGPT-User/1.0"), false, "the raw User-Agent is never recorded");
+
+  assert.equal(spanFor("/api/channels", chatgpt).attrs?.public_requester, undefined, "only /api/public/*");
+});
+
+// #proj-o11y:#26 (Warden, Tenny): the IP limiters' key as a salted hash, so their limits can be checked against traffic.
+test("every request span carries the salted client_ip_hash once the salt is set, never the address", () => {
+  vi.stubEnv(CLIENT_IP_HASH_SALT_ENV, `v1:${"k".repeat(40)}`);
+  try {
+    const sink = new MemoryTraceSink();
+    const tracer = new BasicTracer({ sink, traceIdGenerator: () => "9".repeat(32), spanIdGenerator: () => "b".repeat(16) });
+    const req: any = {
+      method: "GET",
+      originalUrl: "/api/channels",
+      url: "/api/channels",
+      baseUrl: "",
+      ip: "198.51.100.23",
+      headers: {},
+      header: () => undefined,
+      app: { get: (key: string) => (key === "serverTracer" ? tracer : undefined) },
+    };
+    const res: any = new EventEmitter();
+    res.statusCode = 200;
+    res.locals = {};
+    requestObservabilityMiddleware(req, res, () => {});
+    res.emit("finish");
+    const [span] = sink.getAllSpans();
+    const finished = span!.events.find((event) => event.name === "http.response.finished")?.attrs;
+    for (const attrs of [span!.attrs, finished]) {
+      assert.match(String(attrs?.client_ip_hash), /^[0-9a-f]{16}$/);
+      assert.equal(attrs?.client_ip_hash_salt, "v1");
+      assert.equal(attrs?.client_ip_source, "edge");
+    }
+    assert.equal(JSON.stringify(span).includes("198.51.100.23"), false, "the address is never recorded");
+  } finally {
+    vi.unstubAllEnvs();
+  }
+});
+
+test("client claims that are not a short name, a version or a known platform are dropped, never written raw", () => {
+  const attrsFor = (headers: Record<string, string>) => requestClientAttrs({ header: ((name: string) => headers[name.toLowerCase()]) as never });
+  // The web and App platform header, and versions with a pre-release or build part.
+  assert.deepEqual(attrsFor({ "x-raft-client-platform": "pwa" }), { client_platform: "pwa" });
+  assert.deepEqual(attrsFor({ "x-raft-client-version": "1.15.5+123", "x-raft-computer-version": "v1.0.54-rc.1" }), {
+    client_version: "1.15.5+123",
+    client_computer_version: "v1.0.54-rc.1",
+  });
+  assert.deepEqual(attrsFor({
+    "x-raft-client": "Mozilla/5.0 (secret)",
+    "x-raft-client-platform": "toaster",
+    "x-raft-client-version": "latest; rm -rf",
+    "x-raft-computer-version": `1.0.0-${"x".repeat(80)}`,
+    "x-raft-daemon-version": "unknown",
+    "x-raft-runtime": "Claude Code",
+  }), {});
+  // A version is short: no digit group longer than 9.
+  assert.deepEqual(attrsFor({ "x-raft-client-version": `${"9".repeat(20)}.0.0` }), {});
+  // Older CLIs and daemons name themselves in X-Slock-Client; clients older still send nothing.
+  assert.deepEqual(attrsFor({ "x-slock-client": "cli" }), { client_kind: "cli" });
+  assert.deepEqual(attrsFor({ "x-raft-client": "daemon", "x-slock-client": "cli" }), { client_kind: "daemon" });
+  assert.deepEqual(attrsFor({}), {});
+});
+
+test("a call through an agent's stable CLI entry is recorded as via=stable_entry; any other value is dropped", () => {
+  const attrsFor = (headers: Record<string, string>) => requestClientAttrs({ header: ((name: string) => headers[name.toLowerCase()]) as never });
+  assert.deepEqual(attrsFor({ "x-raft-client": "cli", "x-raft-cli-entry": "stable_entry" }), { client_kind: "cli", via: "stable_entry" });
+  assert.deepEqual(attrsFor({ "x-raft-client": "cli", "x-raft-cli-entry": "launch; drop" }), { client_kind: "cli" });
+});
+
+test("the web names its build; an App's version comes from its User-Agent", () => {
+  const attrsFor = (headers: Record<string, string>) => requestClientAttrs({ header: ((name: string) => headers[name.toLowerCase()]) as never });
+  assert.deepEqual(attrsFor({ "x-raft-client-platform": "desktop_app", "x-raft-client-version": "1.21.36" }), {
+    client_platform: "desktop_app",
+    client_version: "1.21.36",
+  });
+  const appUserAgent = "Raft/1.15.5+123 (Android 14; release) Mobile";
+  assert.deepEqual(attrsFor({ "x-raft-client-platform": "android", "user-agent": appUserAgent }), { client_platform: "android", client_version: "1.15.5" });
+  assert.deepEqual(attrsFor({ "x-raft-client-platform": "ios", "user-agent": "Raft/2.0.1 (iOS 18.1; testflight) Mobile" }), { client_platform: "ios", client_version: "2.0.1" });
+  // A header the App sends itself wins; a browser's User-Agent naming Raft/ is never read; an odd one is dropped.
+  assert.equal(attrsFor({ "x-raft-client-platform": "android", "x-raft-client-version": "1.16.0", "user-agent": appUserAgent }).client_version, "1.16.0");
+  assert.equal(attrsFor({ "x-raft-client-platform": "browser", "user-agent": `Mozilla/5.0 Chrome/141.0 Raft/9.9.9` }).client_version, undefined);
+  assert.equal(attrsFor({ "x-raft-client-platform": "android", "user-agent": "Raft/1.15 (Android 14; release) Mobile" }).client_version, undefined);
 });
 
 // #proj-o11y task #6: an outside client's traceparent is recorded, not
@@ -652,3 +880,71 @@ test("a real Express app labels the scope-attestation pre-parse route once, at e
     "inner:/internal/machine/scope-attestation",
   ]);
 });
+
+test("requestObservabilityMiddleware returns the request's trace id as X-Trace-Id (#proj-o11y:#18)", () => {
+  const sink = new MemoryTraceSink();
+  const tracer = new BasicTracer({
+    sink,
+    traceIdGenerator: () => "d".repeat(32),
+    spanIdGenerator: () => "c".repeat(16),
+  });
+  const run = (traceparent: string | undefined) => {
+    const headers: Record<string, string> = {};
+    const req: any = {
+      method: "GET",
+      originalUrl: "/api/agents",
+      url: "/api/agents",
+      baseUrl: "/api/agents",
+      route: { path: "/" },
+      header: (name: string) => (name === "traceparent" ? traceparent : undefined),
+      app: { get: (key: string) => (key === "serverTracer" ? tracer : undefined) },
+    };
+    const res: any = new EventEmitter();
+    res.statusCode = 500;
+    res.locals = {};
+    res.setHeader = (name: string, value: string) => { headers[name] = value; };
+    requestObservabilityMiddleware(req, res, () => {});
+    res.emit("finish");
+    return headers;
+  };
+  // A web session continues the browser's trace: the browser's id comes back.
+  assert.deepEqual(run(`00-${"a".repeat(32)}-${"b".repeat(16)}-01`), { "X-Trace-Id": "a".repeat(32) });
+  // No (or a malformed) traceparent: the server's own new trace comes back.
+  assert.deepEqual(run(undefined), { "X-Trace-Id": "d".repeat(32) });
+  assert.deepEqual(run("00-not-a-valid-parent"), { "X-Trace-Id": "d".repeat(32) });
+});
+
+function unmatchedSpanAttrs(originalUrl: string, statusCode: number) {
+  const sink = new MemoryTraceSink();
+  const tracer = new BasicTracer({
+    sink,
+    traceIdGenerator: () => "1".repeat(32),
+    spanIdGenerator: () => "2".repeat(16),
+  });
+  const req: any = {
+    method: "GET",
+    originalUrl,
+    url: originalUrl,
+    baseUrl: "",
+    route: undefined,
+    app: { get: (key: string) => (key === "serverTracer" ? tracer : undefined) },
+  };
+  const res: any = new EventEmitter();
+  res.statusCode = statusCode;
+  res.locals = {};
+  requestObservabilityMiddleware(req, res, () => {});
+  res.emit("finish");
+  return sink.getAllSpans()[0]?.attrs;
+}
+
+test("an unmatched 5xx names its path prefix without ids or caller input", () => {
+  assert.equal(unmatchedSpanAttrs("/api/apps/widgets/more?token=secret", 500)?.unmatched_prefix, "/api/apps/widgets");
+  assert.equal(unmatchedSpanAttrs("/api/v2/550e8400-e29b-41d4-a716-446655440000", 500)?.unmatched_prefix, "/api/v2/*");
+  assert.equal(unmatchedSpanAttrs("/api/abcdef-123/%ZZ", 503)?.unmatched_prefix, "/api/*/*");
+  assert.equal(unmatchedSpanAttrs(`/api/${"a".repeat(41)}`, 500)?.unmatched_prefix, "/api/*");
+});
+
+test("only an unmatched 5xx records a path prefix", () => {
+  assert.equal(unmatchedSpanAttrs("/api/apps/widgets", 404)?.unmatched_prefix, undefined);
+});
+

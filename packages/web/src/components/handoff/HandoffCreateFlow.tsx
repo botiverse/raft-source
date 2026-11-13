@@ -11,39 +11,18 @@ import { useMessageStore } from "../../store/messageStore";
 import { useMachineStore } from "../../store/machineStore";
 import { useServerStore } from "../../store/serverStore";
 import SectionEyebrow from "../ui/SectionEyebrow";
-import {
-  Badge,
-  Banner,
-  BannerDescription,
-  Button,
-  Card,
-  DescriptionDetails,
-  DescriptionItem,
-  DescriptionList,
-  DescriptionTerm,
-  Input,
-  InputGroup,
-  InputGroupAddon,
-  InputGroupInput,
-  SegmentedControl,
-  Spinner,
-  ListRow,
-  ListRowBody,
-  ListRowGroup,
-  ListRowIcon,
-  ListRowMeta,
-  ListRowTitle,
-} from "@botiverse/raft-ui";
+import { Badge, Banner, BannerDescription, Button, Card, DescriptionDetails, DescriptionItem, DescriptionList, DescriptionTerm, Input, InputGroup, InputGroupAddon, InputGroupInput, ScrollArea, SegmentedControl, Spinner, ListRow, ListRowBody, ListRowGroup, ListRowIcon, ListRowMeta, ListRowTitle, TextLink } from "@botiverse/raft-ui";
 import {
   dirBasename,
   getHandoffBridge,
-  getLocalIdentity,
   pickLocalOnlineMachine,
   searchReducer,
   TOOL_LABEL,
 } from "./handoffSessions";
-import type { LocalIdentity, LocalSession, SessionExcerpt } from "./handoffSessions";
+import type { LocalSession, SessionExcerpt } from "./handoffSessions";
+import { useLocalComputerIdentity } from "../machine/localComputer/localComputerStore";
 import { HandoffToolTab } from "./HandoffToolTab";
+import { DialogCardFooter, DialogCommit } from "../ui/NarrowDialog";
 
 // Desktop-only Handoff flow (#kabi-desktop task #13; design: raft-artifacts
 // desktop-handoff-design v2). Since task #104 it is the "start from a local
@@ -102,7 +81,8 @@ export default function HandoffCreateFlow({ onClose, onStateChange }: {
   const [selected, setSelected] = useState<LocalSession | null>(null);
   const [excerpt, setExcerpt] = useState<SessionExcerpt | null>(null);
   const [agentName, setAgentName] = useState("");
-  const [localIdentity, setLocalIdentity] = useState<LocalIdentity>({ hostname: null, machineIds: [] });
+  // Which of the server's machines this app runs on (localComputerStore).
+  const localIdentity = useLocalComputerIdentity();
   const [excerptFailed, setExcerptFailed] = useState(false);
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
@@ -141,7 +121,6 @@ export default function HandoffCreateFlow({ onClose, onStateChange }: {
     bridge.listSessions()
       .then((list) => { if (alive) setSessions(list); })
       .catch(() => { if (alive) setLoadError(true); });
-    void getLocalIdentity().then((identity) => { if (alive) setLocalIdentity(identity); });
     return () => { alive = false; };
   }, []);
 
@@ -393,17 +372,14 @@ export default function HandoffCreateFlow({ onClose, onStateChange }: {
               {TOOL_LABEL[selected.tool]} · {selected.cwd ?? "-"}
             </div>
           </div>
-          <Button
-            type="button"
-            variant="link"
-            size="inline"
+          <TextLink
             onClick={chooseAnother}
             disabled={creating}
             data-testid="handoff-choose-another"
             className="shrink-0"
           >
             {formatMessage({ id: "handoff.wizard.chooseAnother" })}
-          </Button>
+          </TextLink>
         </Card>
 
         {selected.activeRecently && (
@@ -462,9 +438,20 @@ export default function HandoffCreateFlow({ onClose, onStateChange }: {
         <label className="mb-1 block text-footnote font-semibold text-foreground-muted">
           {formatMessage({ id: "handoff.wizard.briefingPreview" })}
         </label>
-        <pre className="mb-3 max-h-48 overflow-y-auto whitespace-pre-wrap break-words rounded-container border border-line-hairline bg-layer-code px-3 py-2 font-mono text-mono-code text-foreground">
-          {excerpt === null ? formatMessage({ id: "handoff.loading" }) : briefing}
-        </pre>
+        {/* The code frame scrolls in a raft-ui ScrollArea (a <pre> holds
+            phrasing content only, so the area frames it); the padding is on
+            the <pre>, inside, so the scrollbar sits at the frame's edge. In
+            the dialog's scroller, so a scroll at its end carries on. */}
+        <ScrollArea
+          role="region"
+          aria-label={formatMessage({ id: "handoff.wizard.briefingPreview" })}
+          overscroll="auto"
+          className="mb-3 max-h-48 rounded-container border border-line-hairline bg-layer-code"
+        >
+          <pre className="m-0 whitespace-pre-wrap break-words px-3 py-2 font-mono text-mono-code text-foreground">
+            {excerpt === null ? formatMessage({ id: "handoff.loading" }) : briefing}
+          </pre>
+        </ScrollArea>
 
         {createError && (
           <Banner status="warning" className="mb-3">
@@ -474,22 +461,26 @@ export default function HandoffCreateFlow({ onClose, onStateChange }: {
           </Banner>
         )}
 
-        <div className="flex justify-end gap-2">
+        <DialogCardFooter>
           {cancelButton}
-          <Button size="lg"
-            type="button"
-            variant="primary"
-            disabled={creating || excerpt === null || !localMachine}
-            onClick={handleConfirmClick}
-            data-testid="handoff-confirm-button"
-          >
-            {creating
-              ? formatMessage({ id: "handoff.wizard.creating" })
-              : createdAgent
-                ? formatMessage({ id: "handoff.wizard.retryBriefing" })
-                : formatMessage({ id: "handoff.wizard.confirm" })}
-          </Button>
-        </div>
+          <DialogCommit>
+            {(inHead) => (
+              <Button size={inHead ? "md" : "lg"}
+                type="button"
+                variant="primary"
+                disabled={creating || excerpt === null || !localMachine}
+                onClick={handleConfirmClick}
+                data-testid="handoff-confirm-button"
+              >
+                {creating
+                  ? formatMessage({ id: "handoff.wizard.creating" })
+                  : createdAgent
+                    ? formatMessage({ id: "handoff.wizard.retryBriefing" })
+                    : formatMessage({ id: "handoff.wizard.confirm" })}
+              </Button>
+            )}
+          </DialogCommit>
+        </DialogCardFooter>
       </div>
     );
   }
@@ -556,7 +547,9 @@ export default function HandoffCreateFlow({ onClose, onStateChange }: {
       )}
 
       {sessions !== null && !loadError && filtered.length > 0 && (
-        <div className="max-h-[50vh] overflow-y-auto" data-testid={`handoff-tool-list-${activeTool}`}>
+        // Each session row is a button that takes focus: the list is no tab
+        // stop. In the dialog's scroller: a scroll at its end carries on.
+        <ScrollArea tabIndex={-1} overscroll="auto" className="max-h-[50vh]" data-testid={`handoff-tool-list-${activeTool}`}>
           {grouped[activeTool].length === 0 ? (
             <div className="rounded-container bg-fill-muted px-3 py-4 text-center text-callout text-foreground-hint">
               {formatMessage({ id: "handoff.toolEmpty" }, { tool: TOOL_LABEL[activeTool] })}
@@ -572,12 +565,12 @@ export default function HandoffCreateFlow({ onClose, onStateChange }: {
               ))}
             </ListRowGroup>
           )}
-        </div>
+        </ScrollArea>
       )}
 
-      <div className="mt-4 flex justify-end gap-2">
+      <DialogCardFooter className="mt-4">
         {cancelButton}
-      </div>
+      </DialogCardFooter>
     </div>
   );
 }

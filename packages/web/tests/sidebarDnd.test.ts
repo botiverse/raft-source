@@ -5,8 +5,12 @@ import {
   isSidebarDndData,
   moveSidebarDndItem,
   nextSidebarDndReservedHeight,
+  sidebarDndNeedsReservedHeightMeasure,
   replaceSidebarSubsetOrder,
   resolveSidebarDndRetainedContainer,
+  SIDEBAR_DND_DROP_INDEX_KEY,
+  sidebarDndCollisionDropIndex,
+  sidebarDndContainerDropIndex,
   SIDEBAR_CHANNELS_CONTAINER_ID,
   sidebarCustomContainerId,
   sidebarCustomSectionId,
@@ -130,4 +134,48 @@ test("retains the projection only while the pointer is inside the sidebar sectio
   assert.equal(isPointerWithinSidebarDndBounds({ x: 120, y: 929 }, rects), false);
   assert.equal(isPointerWithinSidebarDndBounds({ x: 600, y: 150 }, rects), false);
   assert.equal(isPointerWithinSidebarDndBounds({ x: 120, y: 150 }, []), false);
+});
+
+test("a drop zone measures itself only during an item drag or while a height is reserved (web perf)", () => {
+  assert.equal(sidebarDndNeedsReservedHeightMeasure(false, null), false, "an ordinary render forces no layout");
+  assert.equal(sidebarDndNeedsReservedHeightMeasure(true, null), true);
+  assert.equal(sidebarDndNeedsReservedHeightMeasure(false, 48), true, "a drag just ended: release the reserved height");
+  // The skipped case is exactly the one whose answer is "no reservation".
+  assert.equal(nextSidebarDndReservedHeight(false, null, 123), null);
+});
+
+test("a row dropped in the 8px band under another section's heading goes first, not last", () => {
+  // The pinned section's drop zone: py-2 (8px) above its first row, 38px rows
+  // 2px apart, 8px below the last (raft-design patterns/lists.md).
+  const pinned = "pinned";
+  const row = (itemId: string, top: number) => ({
+    data: { type: "item", containerId: pinned, itemId },
+    rect: { top, bottom: top + 38 },
+  });
+  const rows = [
+    { data: { type: "container", containerId: pinned, kind: "pinned", manual: true }, rect: { top: 100, bottom: 224 } },
+    row("channel:c", 108),
+    row("channel:d", 148),
+    row("channel:e", 188),
+    // A row of another section, and the dragged row itself, never count.
+    { data: { type: "item", containerId: "channels", itemId: "channel:a" }, rect: { top: 20, bottom: 58 } },
+    { data: { type: "item", containerId: pinned, itemId: "channel:b" }, rect: { top: 20, bottom: 58 } },
+  ];
+  const projection: SidebarDndProjection = {
+    channels: ["channel:a", "channel:b"],
+    pinned: ["channel:c", "channel:d", "channel:e"],
+  };
+  const dropAt = (pointerY: number) => {
+    const index = sidebarDndContainerDropIndex(pinned, "channel:b", pointerY, rows);
+    // What the drag handlers read back off dnd-kit's collision.
+    const collisions = [{ id: "sidebar:pinned", data: { [SIDEBAR_DND_DROP_INDEX_KEY]: index } }];
+    const read = sidebarDndCollisionDropIndex(collisions, "sidebar:pinned");
+    return moveSidebarDndItem(projection, "channel:b", pinned, read ?? projection.pinned.length).pinned;
+  };
+
+  assert.deepEqual(dropAt(104), ["channel:b", "channel:c", "channel:d", "channel:e"], "the top band: first");
+  assert.deepEqual(dropAt(147), ["channel:c", "channel:b", "channel:d", "channel:e"], "the 2px gap: between the two rows");
+  assert.deepEqual(dropAt(230), ["channel:c", "channel:d", "channel:e", "channel:b"], "the bottom band: last");
+  assert.equal(sidebarDndContainerDropIndex(pinned, "channel:b", undefined, rows), null, "a keyboard drag has no pointer");
+  assert.equal(sidebarDndCollisionDropIndex([{ id: "other", data: {} }], "sidebar:pinned"), null);
 });

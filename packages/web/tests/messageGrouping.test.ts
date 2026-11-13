@@ -6,7 +6,6 @@ import assert from "node:assert/strict";
 import {
   computeMessageGrouping,
   followedByFor,
-  followsSystemFor,
   localDayKey,
   shouldShowGroupedMessageHeader,
 } from "../src/components/message/messageGrouping";
@@ -167,13 +166,30 @@ test("a system next-row reads as a group break, not a continuation", () => {
   );
 });
 
-test("followsSystemFor marks messages directly after a system note", () => {
-  const messages = [
-    msg({ id: "a", createdAt: "2026-07-01T15:00:00Z" }),
-    msg({ id: "s", messageType: "system", createdAt: "2026-07-01T15:00:30Z" }),
-    msg({ id: "b", createdAt: "2026-07-01T15:01:00Z" }),
-  ];
-  assert.equal(followsSystemFor(messages, 0), false);
-  assert.equal(followsSystemFor(messages, 1), false);
-  assert.equal(followsSystemFor(messages, 2), true, "b follows the system note");
+test("RFC 077: a message an assistant sent for its owner starts its own group; its own run continues", () => {
+  const friday = { id: "agent-friday", name: "friday", displayName: "Friday", avatarUrl: null, deleted: false };
+  const withDelegate = (id: string, at: string) =>
+    ({ ...msg({ id, createdAt: at }), delegatedBy: friday }) as GroupableMessage;
+  const states = computeMessageGrouping([
+    msg({ id: "own", createdAt: "2026-07-01T15:00:00Z" }),
+    withDelegate("sent-1", "2026-07-01T15:01:00Z"),
+    withDelegate("sent-2", "2026-07-01T15:02:00Z"),
+    msg({ id: "own-again", createdAt: "2026-07-01T15:03:00Z" }),
+  ]);
+  assert.equal(states.get("sent-1")?.isFirstInGroup, true, "the assistant's message does not continue the owner's own run");
+  assert.equal(states.get("sent-2")?.isFirstInGroup, false, "consecutive messages from the same assistant group");
+  assert.equal(states.get("own-again")?.isFirstInGroup, true, "the owner's own message after it starts a new group");
+});
+
+test("external messages only share a header while their frozen display name and avatar agree", () => {
+  const author = { displayName: "PagerDuty", avatarUrl: "https://cdn.example/avatar-a", avatarDigest: "a" };
+  const group = computeMessageGrouping([
+    msg({ id: "a", senderType: "external_projection", senderId: "bot", externalAuthor: author }),
+    msg({ id: "b", senderType: "external_projection", senderId: "bot", externalAuthor: { ...author } }),
+    msg({ id: "c", senderType: "external_projection", senderId: "bot", externalAuthor: { ...author, displayName: "Datadog" } }),
+    msg({ id: "d", senderType: "external_projection", senderId: "bot", externalAuthor: { ...author, displayName: "Datadog", avatarUrl: "https://cdn.example/avatar-b", avatarDigest: "b" } }),
+  ]);
+  assert.equal(group.get("b")?.showName, false);
+  assert.equal(group.get("c")?.showName, true);
+  assert.equal(group.get("d")?.showAvatar, true);
 });

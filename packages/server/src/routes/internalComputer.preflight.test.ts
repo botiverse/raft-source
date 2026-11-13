@@ -12,8 +12,9 @@ import { registerMachine } from "../services/machineService";
 import { mintAgentCredential } from "../services/agentCredentialService";
 import { generateComputerApiKeyMaterial } from "../services/computerCredentialService";
 import { routeAuthPolicy } from "../middleware/routeAuthPolicy";
+import { internalComputerRouter } from "./internalComputer";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 // task #30 PR-A regression guard — the 3-piece binding gate for the
 // synthetic attach/login preflight (RFC v0.8 §9):
@@ -61,6 +62,7 @@ async function seedFixture(): Promise<{
     agentId: agent.id,
     scopes: ["read"],
     name: "preflight-agent",
+    issuedVia: "computer",
     createdByUserId: null,
   });
   return { computerApiKey: computerMaterial.apiKey, agentApiKey: agentMinted.apiKey };
@@ -137,4 +139,65 @@ test("preflight: unregistered sibling under /internal/computer/ fail-closes (aut
     (await res.json() as { code?: string }).code,
     "auth_policy_unregistered_path",
   );
+});
+
+// Express routes case-insensitively, so `/INTERNAL/COMPUTER/...` reaches the
+// same router as `/internal/computer/...`. The registry once compared paths
+// case-sensitively: such a path was not under a claimed prefix, skipped
+// authentication and reached the handler (production probes, 11-03..11-05,
+// got the preflight route list with no credential). Every case variant must
+// authenticate exactly as the lower-case path does.
+test("a case variant of a claimed prefix is authenticated, never passed through", async ({ app }) => {
+  const { computerApiKey, agentApiKey } = await seedFixture();
+  for (const path of ["/INTERNAL/COMPUTER/preflight", "/Internal/Computer/preflight", "/internal/COMPUTER/PREFLIGHT"]) {
+    const anonymous = await fetch(`${app.baseUrl}${path}`, { method: "POST", headers: { "Content-Type": "application/json" } });
+    assert.equal(anonymous.status, 401, `${path} without a credential`);
+    const wrongPrincipal = await fetch(`${app.baseUrl}${path}`, { method: "POST", headers: jsonHeaders(agentApiKey) });
+    assert.equal(wrongPrincipal.status, 401, `${path} with an agent key`);
+    assert.equal((await wrongPrincipal.json() as { code?: string }).code, "invalid_principal");
+    const unregistered = await fetch(`${app.baseUrl}${path}-NOT-REGISTERED`, { method: "POST", headers: jsonHeaders(computerApiKey) });
+    assert.equal(unregistered.status, 401, `${path}-NOT-REGISTERED`);
+    assert.equal((await unregistered.json() as { code?: string }).code, "auth_policy_unregistered_path");
+  }
+  for (const path of ["/INTERNAL/AGENT-API/server", "/Internal/Agent-Api/server"]) {
+    const anonymous = await fetch(`${app.baseUrl}${path}`);
+    assert.equal(anonymous.status, 401, `${path} without a credential`);
+  }
+  // The real credential still works on a case variant: it is authenticated, not refused by shape.
+  const upper = await fetch(`${app.baseUrl}/INTERNAL/COMPUTER/preflight`, { method: "POST", headers: jsonHeaders(computerApiKey) });
+  assert.equal(upper.status, 200);
+  assert.equal((await upper.json() as { principal: { kind: string | null } }).principal.kind, "computer");
+});
+
+// Archer (#proj-runtime:828ad737): POST /internal/computer/probes/:probeId/materialize
+// was served by internalComputerRouter but never registered, so every daemon
+// call got 401 auth_policy_unregistered_path. Derive the served routes from the
+// router itself so a future sibling cannot ship the same way.
+test("every route internalComputerRouter serves is registered in routeAuthPolicy", () => {
+  const registered = new Set(
+    routeAuthPolicy
+      .filter((entry) => entry.path.startsWith("/internal/computer/"))
+      .map((entry) => `${entry.method} ${entry.path}`),
+  );
+  type Layer = { route?: { path: string; methods: Record<string, boolean> } };
+  const served = (internalComputerRouter as unknown as { stack: Layer[] }).stack
+    .flatMap((layer) => (layer.route
+      ? Object.keys(layer.route.methods).map((method) => `${method.toUpperCase()} /internal/computer${layer.route!.path}`)
+      : []));
+  assert.ok(served.length > 10, "the router's routes were read");
+  const missing = served.filter((signature) => !registered.has(signature));
+  assert.deepEqual(missing, [], "served under /internal/computer/ but unregistered, so they fail closed for every caller");
+});
+
+test("probe materialize reaches its handler under the Computer principal", async ({ app }) => {
+  const { computerApiKey } = await seedFixture();
+  const res = await fetch(`${app.baseUrl}/internal/computer/probes/not-a-probe-id/materialize`, {
+    method: "POST",
+    headers: jsonHeaders(computerApiKey),
+    body: JSON.stringify({ claimRequestId: "claim-1" }),
+  });
+  const body = await res.json() as { code?: string };
+  assert.notEqual(body.code, "auth_policy_unregistered_path");
+  assert.notEqual(res.status, 401);
+  assert.ok(["probe_disabled", "probe_invalid"].includes(body.code ?? ""), `the handler answered: ${res.status} ${JSON.stringify(body)}`);
 });

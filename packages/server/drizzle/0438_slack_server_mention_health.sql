@@ -1,0 +1,4 @@
+ALTER TABLE "external_app_install_server_grants" ADD COLUMN "agent_mention_sync" jsonb;--> statement-breakpoint
+ALTER TABLE "slack_usergroup_identities" ADD COLUMN "human_canonical" boolean DEFAULT false NOT NULL;--> statement-breakpoint
+CREATE UNIQUE INDEX "idx_slack_human_usergroup_canonical" ON "slack_usergroup_identities" USING btree ("install_id","principal_id") WHERE "slack_usergroup_identities"."principal_kind" = 'user' AND "slack_usergroup_identities"."human_canonical" = true;--> statement-breakpoint
+ALTER TABLE "slack_usergroup_identities" ADD CONSTRAINT "slack_human_usergroup_canonical_valid" CHECK (NOT "slack_usergroup_identities"."human_canonical" OR ("slack_usergroup_identities"."principal_kind" = 'user' AND "slack_usergroup_identities"."provider_usergroup_id" IS NOT NULL));

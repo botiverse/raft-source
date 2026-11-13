@@ -1,28 +1,38 @@
 import { tokenForHuman, fixturePasswordHash } from "../test/integration/credentials";
 import { createApiTest } from "../test/integration/apiTest";
 import assert from "node:assert/strict";
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
-import { openTestApp } from "../test/integration/app";
+import { randomUUID } from "node:crypto";
+import { Readable } from "node:stream";
+import { afterEach } from "vitest";
 import { createHangingStorageTestHarness } from "../test/hangingStorageTestHarness";
+import { eq } from "drizzle-orm";
 import { getDb } from "../db/index";
-import { serverMembers, shareArtifacts, users } from "../db/schema";
-import { addHuman, createChannel } from "../services/channelService";
+import { shareArtifacts, users } from "../db/schema";
+import { createChannel } from "../services/channelService";
 import { createServer } from "../services/serverService";
 import {
   __setCdnStorageForTests,
   resetStorageForTests,
+  type StorageBackend,
 } from "../services/storageService";
+import { __setShareArtifactsRetiredForTests, SHARE_ARTIFACTS_RETIRED } from "./shareArtifacts";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+// Share to X was retired on 2026-11-09 (docs/contracts/share-artifacts.md):
+// nothing makes, lists or deletes a share link any more, and the links made
+// before answer "no longer available" while SHARE_ARTIFACTS_RETIRED is on.
+// Their rows and stored images stay, so turning it off serves them again.
+
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 const PNG_1X1 = Buffer.from(
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=",
   "base64",
 );
 
-
+afterEach(() => {
+  __setShareArtifactsRetiredForTests(null);
+  resetStorageForTests();
+});
 
 async function createVerifiedUser(email: string, name: string) {
   const [user] = await getDb()
@@ -46,151 +56,211 @@ function pngForm(channelId: string) {
   return form;
 }
 
-test("Guest cannot persist a public share artifact from readable messages", async ({ app }) => {
-  const owner = await createVerifiedUser("share-guest-owner@slock.test", "Share Guest Owner");
-  const guest = await createVerifiedUser("share-guest@slock.test", "Share Guest");
-  const server = await createServer("Share Guest Server", "share-guest-server", owner.id);
-  await getDb().insert(serverMembers).values({ serverId: server.id, userId: guest.id, role: "guest" });
-  const channel = await createChannel(server.id, "guest-private", undefined, "private");
-  await addHuman(channel.id, guest.id);
-  const guestToken = await tokenForHuman(guest.email);
-  const before = await getDb().select({ id: shareArtifacts.id }).from(shareArtifacts);
-
-  const response = await fetch(`${app.baseUrl}/api/share-artifacts/message-selection`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${guestToken}`,
-      "X-Server-Id": server.id,
+/** The CDN bucket in memory: what is stored, and every key deleted. */
+function memoryCdnStorage() {
+  const objects = new Map<string, Buffer>();
+  const deleted: string[] = [];
+  const storage: StorageBackend = {
+    async put(key, data) { objects.set(key, Buffer.from(data)); },
+    async get(key) {
+      const data = objects.get(key);
+      if (!data) throw new Error("File not found on disk");
+      return Readable.from([data]);
     },
+    async delete(key) {
+      deleted.push(key);
+      objects.delete(key);
+    },
+  };
+  return { storage, objects, deleted };
+}
+
+/** A share made before the retirement: its row, and its image in the (in-memory) CDN bucket. */
+async function seedExistingShare(tag: string) {
+  const owner = await createVerifiedUser(`share-${tag}@slock.test`, `Share ${tag}`);
+  const server = await createServer(`Share ${tag}`, `share-${tag}`, owner.id);
+  const channel = await createChannel(server.id, "general", "channel");
+  const cdn = memoryCdnStorage();
+  __setCdnStorageForTests(cdn.storage);
+  const id = randomUUID();
+  const storageKey = `${server.id}/share-artifacts/${id}.png`;
+  await cdn.storage.put(storageKey, PNG_1X1, "image/png");
+  await getDb().insert(shareArtifacts).values({
+    id,
+    serverId: server.id,
+    channelId: channel.id,
+    createdByUserId: owner.id,
+    storageKey,
+    mimeType: "image/png",
+    sizeBytes: PNG_1X1.length,
+    width: 1,
+    height: 1,
+  });
+  return { owner, server, channel, cdn, id, storageKey, token: await tokenForHuman(owner.email) };
+}
+
+async function withEnv<T>(env: Record<string, string | undefined>, run: () => Promise<T>): Promise<T> {
+  const previous = Object.fromEntries(Object.keys(env).map((key) => [key, process.env[key]]));
+  for (const [key, value] of Object.entries(env)) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+  try {
+    return await run();
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+}
+
+test("existing share links are retired by default", () => {
+  assert.equal(SHARE_ARTIFACTS_RETIRED, true);
+});
+
+test("creating a share link answers 410 SHARE_ARTIFACT_RETIRED to older clients and stores nothing", async ({ app }) => {
+  const owner = await createVerifiedUser("share-create@slock.test", "Share Create");
+  const server = await createServer("Share Create", "share-create", owner.id);
+  const channel = await createChannel(server.id, "general", "channel");
+  const cdn = memoryCdnStorage();
+  __setCdnStorageForTests(cdn.storage);
+
+  const res = await fetch(`${app.baseUrl}/api/share-artifacts/message-selection`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${await tokenForHuman(owner.email)}`, "X-Server-Id": server.id },
     body: pngForm(channel.id),
   });
 
-  assert.equal(response.status, 403);
-  assert.deepEqual(
-    await getDb().select({ id: shareArtifacts.id }).from(shareArtifacts),
-    before,
-    "denied Guest share creation must not persist a public artifact",
-  );
+  assert.equal(res.status, 410);
+  const body = (await res.json()) as { code: string; errorCode: string; error: string };
+  assert.equal(body.code, "SHARE_ARTIFACT_RETIRED");
+  assert.equal(body.errorCode, "SHARE_ARTIFACT_RETIRED");
+  assert.match(body.error, /retired/);
+  assert.deepEqual(await getDb().select({ id: shareArtifacts.id }).from(shareArtifacts), []);
+  assert.equal(cdn.objects.size, 0);
+
+  const anonymous = await fetch(`${app.baseUrl}/api/share-artifacts/message-selection`, {
+    method: "POST",
+    body: pngForm(channel.id),
+  });
+  assert.equal(anonymous.status, 401, "the stub stays behind sign-in");
 });
 
-test("share artifact creation is auth-gated and public URL serves OG metadata + non-expiring PNG", async () => {
-  const uploadsDir = fs.mkdtempSync(path.join(os.tmpdir(), "share-artifacts-"));
-  const previousUploadsDir = process.env.UPLOADS_DIR;
-  const previousShareBaseUrl = process.env.SHARE_BASE_URL;
-  const previousCdnBaseUrl = process.env.CDN_BASE_URL;
-  process.env.UPLOADS_DIR = uploadsDir;
-  delete process.env.SHARE_BASE_URL;
-  delete process.env.CDN_BASE_URL;
-  resetStorageForTests();
+test("the list and delete routes are gone, and a delete attempt leaves the row and the stored image", async ({ app }) => {
+  const share = await seedExistingShare("gone");
+  const headers = { Authorization: `Bearer ${share.token}`, "X-Server-Id": share.server.id };
 
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
-  try {
-    const owner = await createVerifiedUser("share-owner@slock.test", "Share Owner");
-    const server = await createServer("Share Server", "share-server", owner.id);
-    const channel = await createChannel(server.id, "general", "channel");
-    const token = await tokenForHuman(owner.email);
+  const list = await fetch(`${app.baseUrl}/api/share-artifacts?scope=all`, { headers });
+  assert.equal(list.status, 404);
+  const del = await fetch(`${app.baseUrl}/api/share-artifacts/${share.id}`, { method: "DELETE", headers });
+  assert.equal(del.status, 404);
 
-    const createRes = await fetch(`${app.baseUrl}/api/share-artifacts/message-selection`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "X-Server-Id": server.id,
-      },
-      body: pngForm(channel.id),
-    });
-    assert.equal(createRes.status, 200);
-    const created = (await createRes.json()) as { id: string; url: string; imageUrl: string };
-    assert.match(created.url, new RegExp(`/share/${created.id}$`));
-    assert.match(created.imageUrl, new RegExp(`/share/${created.id}\\.png$`));
+  assert.equal((await getDb().select({ id: shareArtifacts.id }).from(shareArtifacts).where(eq(shareArtifacts.id, share.id))).length, 1);
+  assert.equal(share.cdn.objects.has(share.storageKey), true);
+  assert.deepEqual(share.cdn.deleted, []);
+});
 
-    const pageRes = await fetch(created.url);
+test("an existing link's page answers 410 'no longer available' with no image and no card image", async ({ app }) => {
+  const share = await seedExistingShare("retired-page");
+
+  await withEnv({ SHARE_BASE_URL: "https://slock.ai/share", CDN_BASE_URL: "https://cdn.raft.build" }, async () => {
+    const page = await fetch(`${app.baseUrl}/share/${share.id}`);
+    assert.equal(page.status, 410);
+    assert.match(page.headers.get("content-type") ?? "", /text\/html/);
+    assert.equal(page.headers.get("x-robots-tag"), "noindex, nofollow");
+    assert.equal(page.headers.get("cache-control"), "public, max-age=60");
+    assert.match(page.headers.get("vary") ?? "", /Accept-Language/i);
+    const html = await page.text();
+    assert.match(html, /<html lang="en">/);
+    assert.match(html, /<p>This shared link is no longer available\.<\/p>/);
+    assert.match(html, /name="robots" content="noindex, nofollow"/);
+    assert.match(html, /name="twitter:card" content="summary"/);
+    assert.doesNotMatch(html, /og:image|twitter:image|<img|summary_large_image/);
+    assert.doesNotMatch(html, new RegExp(share.storageKey.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    assert.doesNotMatch(html, /cdn\.raft\.build|share-artifacts/);
+  });
+
+  const zh = await fetch(`${app.baseUrl}/share/${share.id}`, { headers: { "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8" } });
+  assert.equal(zh.status, 410);
+  const zhHtml = await zh.text();
+  assert.match(zhHtml, /<html lang="zh-CN">/);
+  assert.match(zhHtml, /<p>这个分享链接已失效。<\/p>/);
+
+  const image = await fetch(`${app.baseUrl}/share/${share.id}.png`);
+  assert.equal(image.status, 410);
+  assert.equal(image.headers.get("cache-control"), "public, max-age=60");
+  assert.doesNotMatch(image.headers.get("content-type") ?? "", /image\/png/);
+  await image.arrayBuffer();
+
+  // Kept, so the link can be brought back: the row and the stored image.
+  assert.equal((await getDb().select({ id: shareArtifacts.id }).from(shareArtifacts).where(eq(shareArtifacts.id, share.id))).length, 1);
+  assert.equal(share.cdn.objects.has(share.storageKey), true);
+  assert.deepEqual(share.cdn.deleted, []);
+});
+
+test("a link that never existed still answers 404, page and image", async ({ app }) => {
+  const missing = "00000000-0000-4000-8000-000000000000";
+  const page = await fetch(`${app.baseUrl}/share/${missing}`);
+  assert.equal(page.status, 404);
+  assert.equal(await page.text(), "Not found");
+  const image = await fetch(`${app.baseUrl}/share/${missing}.png`);
+  assert.equal(image.status, 404);
+  assert.equal(await image.text(), "Not found");
+});
+
+test("share artifact public routes return 404 for malformed artifact ids", async ({ app }) => {
+  const pageRes = await fetch(`${app.baseUrl}/share/not-a-uuid`);
+  assert.equal(pageRes.status, 404);
+  assert.equal(await pageRes.text(), "Not found");
+
+  const imageRes = await fetch(`${app.baseUrl}/share/not-a-uuid.png`);
+  assert.equal(imageRes.status, 404);
+  assert.equal(await imageRes.text(), "Not found");
+});
+
+// Restoring: with the switch off, an existing link is served exactly as before.
+
+test("restored: the page serves its OG and card metadata on the canonical host, with the CDN image", async ({ app }) => {
+  __setShareArtifactsRetiredForTests(false);
+  const share = await seedExistingShare("restored-cdn");
+
+  await withEnv({ SHARE_BASE_URL: "https://slock.ai/share", CDN_BASE_URL: "https://cdn.slock.ai" }, async () => {
+    const pageRes = await fetch(`${app.baseUrl}/share/${share.id}`);
     assert.equal(pageRes.status, 200);
     assert.match(pageRes.headers.get("content-type") ?? "", /text\/html/);
     assert.equal(pageRes.headers.get("x-robots-tag"), "noindex, nofollow");
+    assert.equal(pageRes.headers.get("cache-control"), "public, max-age=60");
     const html = await pageRes.text();
-    assert.match(html, /name="robots" content="noindex, nofollow"/);
+    const escapedKey = share.storageKey.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    assert.match(html, new RegExp(`property="og:url" content="https://slock\\.ai/share/${share.id}"`));
+    assert.match(html, new RegExp(`property="og:image" content="https://cdn\\.slock\\.ai/${escapedKey}"`));
+    assert.match(html, new RegExp(`name="twitter:image" content="https://cdn\\.slock\\.ai/${escapedKey}"`));
     assert.match(html, /name="twitter:card" content="summary_large_image"/);
-    assert.match(html, new RegExp(`name="twitter:image" content="${created.imageUrl.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}"`));
     assert.match(html, /property="og:image:width" content="1"/);
     assert.match(html, /property="og:image:height" content="1"/);
-    assert.match(html, /name="twitter:image:alt" content="Slock conversation screenshot"/);
-    assert.match(html, /\.share-card \{ width: min\(100%, 960px\); margin-inline: auto; \}/);
     assert.match(html, /<div class="share-card">/);
+  });
+});
 
-    const imageRes = await fetch(created.imageUrl);
+test("restored: without a CDN the page points at, and the server serves, its own copy of the PNG", async ({ app }) => {
+  __setShareArtifactsRetiredForTests(false);
+  const share = await seedExistingShare("restored-local");
+
+  await withEnv({ SHARE_BASE_URL: undefined, CDN_BASE_URL: undefined }, async () => {
+    const html = await (await fetch(`${app.baseUrl}/share/${share.id}`)).text();
+    assert.match(html, new RegExp(`name="twitter:image" content="[^"]*/share/${share.id}\\.png"`));
+
+    const imageRes = await fetch(`${app.baseUrl}/share/${share.id}.png`);
     assert.equal(imageRes.status, 200);
     assert.equal(imageRes.headers.get("content-type"), "image/png");
-    assert.equal(imageRes.headers.get("cache-control"), "public, immutable, max-age=31536000");
+    assert.equal(imageRes.headers.get("cache-control"), "public, max-age=60");
     assert.deepEqual(Buffer.from(await imageRes.arrayBuffer()), PNG_1X1);
-  } finally {
-    await app.close();
-    if (previousUploadsDir === undefined) delete process.env.UPLOADS_DIR;
-    else process.env.UPLOADS_DIR = previousUploadsDir;
-    if (previousShareBaseUrl === undefined) delete process.env.SHARE_BASE_URL;
-    else process.env.SHARE_BASE_URL = previousShareBaseUrl;
-    if (previousCdnBaseUrl === undefined) delete process.env.CDN_BASE_URL;
-    else process.env.CDN_BASE_URL = previousCdnBaseUrl;
-    resetStorageForTests();
-    fs.rmSync(uploadsDir, { recursive: true, force: true });
-  }
+  });
 });
 
-test("share artifact response and OG metadata use canonical share host and CDN image URL when configured", async () => {
-  const uploadsDir = fs.mkdtempSync(path.join(os.tmpdir(), "share-artifacts-cdn-"));
-  const previousUploadsDir = process.env.UPLOADS_DIR;
-  const previousShareBaseUrl = process.env.SHARE_BASE_URL;
-  const previousCdnBaseUrl = process.env.CDN_BASE_URL;
-  process.env.UPLOADS_DIR = uploadsDir;
-  process.env.SHARE_BASE_URL = "https://slock.ai/share";
-  process.env.CDN_BASE_URL = "https://cdn.slock.ai";
-  resetStorageForTests();
-
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
-  try {
-    const owner = await createVerifiedUser("share-canonical@slock.test", "Share Canonical");
-    const server = await createServer("Share Canonical", "share-canonical", owner.id);
-    const channel = await createChannel(server.id, "general", "channel");
-    const token = await tokenForHuman(owner.email);
-
-    const createRes = await fetch(`${app.baseUrl}/api/share-artifacts/message-selection`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "X-Server-Id": server.id,
-      },
-      body: pngForm(channel.id),
-    });
-    assert.equal(createRes.status, 200);
-    const created = (await createRes.json()) as { id: string; url: string; imageUrl: string };
-    const expectedStorageKey = `${server.id}/share-artifacts/${created.id}.png`;
-    assert.equal(created.url, `https://slock.ai/share/${created.id}`);
-    assert.equal(created.imageUrl, `https://cdn.slock.ai/${expectedStorageKey}`);
-
-    const pageRes = await fetch(`${app.baseUrl}/share/${created.id}`);
-    assert.equal(pageRes.status, 200);
-    const html = await pageRes.text();
-    assert.match(html, new RegExp(`property="og:url" content="https://slock\\.ai/share/${created.id}"`));
-    assert.match(html, new RegExp(`property="og:image" content="https://cdn\\.slock\\.ai/${expectedStorageKey.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}"`));
-    assert.match(html, new RegExp(`name="twitter:image" content="https://cdn\\.slock\\.ai/${expectedStorageKey.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}"`));
-    assert.doesNotMatch(html, /slock-server-staging\.fly\.dev|fly\.dev/);
-
-    const fallbackImageRes = await fetch(`${app.baseUrl}/share/${created.id}.png`);
-    assert.equal(fallbackImageRes.status, 200);
-    assert.deepEqual(Buffer.from(await fallbackImageRes.arrayBuffer()), PNG_1X1);
-  } finally {
-    await app.close();
-    if (previousUploadsDir === undefined) delete process.env.UPLOADS_DIR;
-    else process.env.UPLOADS_DIR = previousUploadsDir;
-    if (previousShareBaseUrl === undefined) delete process.env.SHARE_BASE_URL;
-    else process.env.SHARE_BASE_URL = previousShareBaseUrl;
-    if (previousCdnBaseUrl === undefined) delete process.env.CDN_BASE_URL;
-    else process.env.CDN_BASE_URL = previousCdnBaseUrl;
-    resetStorageForTests();
-    fs.rmSync(uploadsDir, { recursive: true, force: true });
-  }
-});
-
-test("share artifact image releases its real upstream Agent socket when the client aborts", async ({ app }) => {
+test("restored: the share image releases its real upstream Agent socket when the client aborts", async ({ app }) => {
+  __setShareArtifactsRetiredForTests(false);
   const harness = await createHangingStorageTestHarness();
   try {
     const owner = await createVerifiedUser("share-abort@slock.test", "Share Abort");
@@ -213,40 +283,10 @@ test("share artifact image releases its real upstream Agent socket when the clie
         assert.equal(response.status, 200);
         assert.equal(response.headers.get("content-type"), "image/png");
         assert.equal(response.headers.get("content-length"), String(1024 * 1024));
-        assert.equal(response.headers.get("cache-control"), "public, immutable, max-age=31536000");
+        assert.equal(response.headers.get("cache-control"), "public, max-age=60");
       },
     );
   } finally {
     await harness.close();
-    resetStorageForTests();
   }
-});
-
-test("share artifact public routes return 404 for malformed artifact ids", async ({ app }) => {
-  const pageRes = await fetch(`${app.baseUrl}/share/not-a-uuid`);
-  assert.equal(pageRes.status, 404);
-  assert.equal(await pageRes.text(), "Not found");
-
-  const imageRes = await fetch(`${app.baseUrl}/share/not-a-uuid.png`);
-  assert.equal(imageRes.status, 404);
-  assert.equal(await imageRes.text(), "Not found");
-});
-
-test("share artifact creation rejects channels outside the active server membership", async ({ app }) => {
-  const userA = await createVerifiedUser("share-a@slock.test", "Share A");
-  const userB = await createVerifiedUser("share-b@slock.test", "Share B");
-  const serverA = await createServer("Share A", "share-a", userA.id);
-  const serverB = await createServer("Share B", "share-b", userB.id);
-  const channelB = await createChannel(serverB.id, "secret", "channel");
-  const tokenA = await tokenForHuman(userA.email);
-
-  const res = await fetch(`${app.baseUrl}/api/share-artifacts/message-selection`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${tokenA}`,
-      "X-Server-Id": serverA.id,
-    },
-    body: pngForm(channelB.id),
-  });
-  assert.equal(res.status, 403);
 });

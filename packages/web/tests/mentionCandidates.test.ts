@@ -203,25 +203,6 @@ test("mention group builder keeps ranked order when thread prioritization is omi
   assert.deepEqual(createMentionCandidateSearchEntries(displayNameOnlyCandidate()).map((entry) => entry.fields[1]?.raw), ["Only Display"]);
 });
 
-test("Computer and App references keep distinct groups and keyboard order", () => {
-  const resourceCandidates: MentionCandidate[] = [
-    ...candidates,
-    { id: "computer-1", name: "Desk", displayName: "Desk", type: "computer", avatarUrl: null, description: "Office Mac" },
-    { id: "system.reminder", name: "system.reminder", displayName: "Reminder", type: "app", avatarUrl: null },
-  ];
-  const groups = buildMentionCandidateGroups({
-    candidates: resourceCandidates,
-    query: "",
-    channelMemberIds: new Set(["member-idle", "member-recent"]),
-  });
-
-  assert.deepEqual(groups.computers.map((candidate) => candidate.id), ["computer-1"]);
-  assert.deepEqual(groups.apps.map((candidate) => candidate.id), ["system.reminder"]);
-  assert.deepEqual(groups.flat.map((candidate) => candidate.type), [
-    "user", "agent", "user", "agent", "computer", "app",
-  ]);
-});
-
 function displayNameOnlyCandidate(): MentionCandidate[] {
   return [{ id: "display", name: "plain", displayName: "Only Display", type: "user", avatarUrl: null }];
 }
@@ -230,7 +211,7 @@ test("candidate descriptions are normalized for compact dropdown display", () =>
   assert.equal(getMentionCandidateDescription(candidates[2]!), "Builds frontend flows");
   assert.equal(getMentionCandidateDescription(candidates[3]!), "Research and synthesis");
   assert.equal(getMentionCandidateDescription(candidates[0]!), null);
-  assert.equal(getMentionCandidateDescription({ id: "c", name: "Desk", displayName: "Desk", type: "computer", avatarUrl: null, description: "Office\nMac" }), "Office Mac");
+  assert.equal(getMentionCandidateDescription({ id: "c", name: "Desk", displayName: "Desk", type: "agent", avatarUrl: null, description: "Office\nMac" }), "Office Mac");
 });
 
 test("joint mention candidates preserve peer server labels", () => {
@@ -323,8 +304,8 @@ test("external (Slack) candidates land in their own group and reach flat", () =>
   assert.deepEqual(groups.externals.map((c) => c.id), ["proj-august", "proj-huarong"]);
   assert.ok(groups.flat.some((c) => c.id === "proj-august"), "external must reach flat");
   assert.ok(groups.flat.some((c) => c.id === "proj-huarong"), "external must reach flat");
-  // Order: inChannel, externals (in-channel group, Slack-tagged), notInChannel,
-  // computers, apps — externals slot between inChannel and notInChannel so the
+  // Order: inChannel, externals (in-channel group, Slack-tagged), notInChannel
+  // — externals slot between inChannel and notInChannel so the
   // keyboard navigation order matches the visual "in this channel → Slack →
   // not in this channel" layout.
   const augIdx = groups.flat.findIndex((c) => c.id === "proj-august");

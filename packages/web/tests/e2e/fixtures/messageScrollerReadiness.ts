@@ -1,11 +1,5 @@
 import { expect } from "@playwright/test";
 import type { JSHandle, Page, Request, Response, TestInfo } from "@playwright/test";
-import {
-  evidenceConfig,
-  readApiRequestOccupancyEvidence,
-  readReadinessServerEvidence,
-  traceIdFromTraceparent,
-} from "../../../../../scripts/e2e/transportEvidence";
 
 export const MESSAGE_SCROLLER_READINESS_TIMEOUT_MS = 5_000;
 
@@ -44,8 +38,6 @@ interface RequestLifecycleEntry {
   id: number;
   kind: MessageScrollerRequestKind;
   startedAtMs: number;
-  traceCorrelationState: "available" | "unavailable";
-  traceId?: string;
   responseAtMs?: number;
   status?: number;
   finishedAtMs?: number;
@@ -205,18 +197,10 @@ export async function withMessageScrollerReadinessEvidence<T>(
   const onRequest = (request: Request) => {
     const kind = classifyMessageScrollerRequest(request.method(), request.url(), target.channelId);
     if (!kind || requests.length >= MAX_MATCHED_REQUESTS) return;
-    let traceId: string | null = null;
-    try {
-      traceId = traceIdFromTraceparent(request.headers().traceparent);
-    } catch {
-      // Correlation is optional diagnostic evidence; request observation remains useful without it.
-    }
     const entry: RequestLifecycleEntry = {
       id: requests.length + 1,
       kind,
       startedAtMs: elapsedMs(startedAt),
-      traceCorrelationState: traceId ? "available" : "unavailable",
-      ...(traceId ? { traceId } : {}),
     };
     requests.push(entry);
     requestEntries.set(request, entry);
@@ -287,77 +271,9 @@ export async function withMessageScrollerReadinessEvidence<T>(
 
   if (assertionSucceeded) return assertionResult as T;
 
-  const traceIds = requests.flatMap((request) => request.traceId ? [request.traceId] : []);
-  const rawServerEvidence = readReadinessServerEvidence(evidenceConfig(), traceIds);
-  const serverEvidence = rawServerEvidence.state === "matched"
-    ? {
-        state: rawServerEvidence.state,
-        source: "playwright-node-api-server-http-events",
-        retention: "copied-into-failure-attachment",
-        records: rawServerEvidence.records.map((record) => ({
-          traceId: record.traceId,
-          kind: record.requestKind,
-          stage: record.stage,
-          atMs: Math.max(0, record.atEpochMs - startedAt),
-          ...(record.status !== undefined ? { status: record.status } : {}),
-          ...(record.finished !== undefined ? { finished: record.finished } : {}),
-        })),
-        interpretation: {
-          arrival: "the Node API server HTTP listener emitted its request event",
-          responseFinished: "Node emitted response finish after handing the response to its transport; browser receipt is not proven",
-          missingStage: "missing stages do not establish that a request or response did not occur",
-        },
-      }
-    : {
-        state: rawServerEvidence.state,
-        source: "playwright-node-api-server-http-events",
-        ...(rawServerEvidence.state === "unavailable" ? { reason: rawServerEvidence.reason } : {}),
-        records: [],
-        interpretation: "missing server evidence does not establish that the request did not arrive",
-      };
-
-  const rawApiOccupancy = readApiRequestOccupancyEvidence(
-    evidenceConfig(),
-    requests.flatMap((request) => request.traceId ? [{
-      traceId: request.traceId,
-      clientStartedAtEpochMs: startedAt + request.startedAtMs,
-      assertionEndedAtEpochMs: startedAt + assertionEndedAtMs,
-    }] : []),
-  );
-  const apiOccupancy = rawApiOccupancy.state === "matched"
-    ? {
-        state: rawApiOccupancy.state,
-        coverage: rawApiOccupancy.coverage,
-        source: "playwright-node-api-server-anonymous-request-events",
-        snapshots: rawApiOccupancy.snapshots.map((snapshot) => ({
-          traceId: snapshot.traceId,
-          clientStartedAtMs: Math.max(0, snapshot.clientStartedAtEpochMs - startedAt),
-          atClientStart: snapshot.atClientStart,
-          targetServerRequest: snapshot.targetServerRequest,
-          releasesBeforeAssertionEnd: snapshot.releasesBeforeAssertionEnd,
-          releasesTruncated: snapshot.releasesTruncated,
-        })),
-        interpretation: {
-          active: "Node observed these API requests begin without a request terminal, connection close, or process exit before this browser request start",
-          known: "known means retained lifecycle is continuous from every observed server process start or a complete bounded occupancy checkpoint, and every observed active request has anonymous connection correlation",
-          unknown: "unknown counts only retained observations; they do not establish the complete active-request or connection count",
-          releaseOrder: "first retained request terminal, connection close, or process exit for each request that was active at browser request start",
-          releasesTruncated: "number of additional matching releases omitted after the bounded detail limit",
-          targetNotObserved: "the browser request existed, but no matching Node API request-begin event was retained before attachment capture; this is not proof of permanent non-arrival",
-          partialRetention: "missing process-start/checkpoint coverage, a truncated checkpoint, or a sequence gap makes occupancy unknown even when an observed count is zero",
-        },
-      }
-    : {
-        state: rawApiOccupancy.state,
-        source: "playwright-node-api-server-anonymous-request-events",
-        ...(rawApiOccupancy.state === "unavailable" ? { reason: rawApiOccupancy.reason } : {}),
-        snapshots: [],
-        interpretation: "missing occupancy evidence does not establish that no API requests or occupied connections existed",
-      };
-
   const receipt = {
     schema: "message-scroller-readiness",
-    version: 2,
+    version: 3,
     consumer: target.consumer,
     retry: testInfo.retry,
     targetChannelId: target.channelId,
@@ -381,8 +297,6 @@ export async function withMessageScrollerReadinessEvidence<T>(
       source: "playwright-page-request-events",
       interpretation: "client-side observation only; a request event is not server arrival evidence",
     },
-    serverEvidence,
-    apiOccupancy,
     unavailable: ["message-store-state", "receiver-ingress-generation"],
   };
 

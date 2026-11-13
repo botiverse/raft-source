@@ -49,7 +49,7 @@ test("staging onboarding auth entry is branded, usable, and leads to account cre
       "only the exact pre-deployment-environment staging artifact may omit that identity field",
     ).toBe(LEGACY_STAGING_IDENTITY_COMMIT);
   }
-  await expect(page.getByRole("heading", { name: "Sign In" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Sign in" })).toBeVisible();
   await expect(page.getByRole("textbox", { name: "Email" })).toBeVisible();
   await expect(page.getByRole("textbox", { name: "Password" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Continue with Google" })).toBeVisible();

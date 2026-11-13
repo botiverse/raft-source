@@ -38,7 +38,8 @@ import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
 import { gzipSync } from "node:zlib";
 import path from "node:path";
-import { currentDate, redactDiagnosticText } from "@botiverse/raft-shared";
+import { currentDate, privacyModeFromEnv, redactDiagnosticText } from "@botiverse/raft-shared";
+import { resolveMachineTraceUploadUrl } from "@botiverse/raft-shared/src/traceUploadUrl";
 
 import {
   computerDir,
@@ -71,7 +72,27 @@ const COMPUTER_BREADCRUMB_PREFIX = "diagnostics-marker-";
 const EXPECTED_WINDOW_SEC = 300;
 const RUNNER_LOG_TAIL_MAX_LINES = 120;
 const RUNNER_LOG_TAIL_MAX_LINE_CHARS = 1_000;
-const DEFAULT_TRACE_UPLOAD_URL = "https://slock-trace-upload.botiverse.dev";
+/** A forced upload's receiver for one attachment: the daemon uploader's own
+ *  machine-level rule (shared/src/traceUploadUrl.ts resolveMachineTraceUploadUrl:
+ *  env > the default for that attachment's server, which is none for a server
+ *  that is not Raft's). A diagnostics marker carries every running runner's
+ *  log tail and the Computer's own records, so it never goes to one attached
+ *  server's `machine:context.traceUploadUrl` (the daemon uploader treats
+ *  `daemon-trace-diag-*` the same way). */
+function forcedUploadReceiver(attachment: ServerAttachmentLite, options: DiagnosticsPushOptions): string | null {
+  return options.workerUrl ?? resolveMachineTraceUploadUrl(process.env, attachment.serverUrl);
+}
+
+/** RAFT_PRIVACY_MODE from the Computer's own env. Never throws: an invalid value
+ *  (the runner refuses to start on it, service.ts) counts as on here, so this
+ *  call stays a pure result. */
+function localPrivacyModeOn(): boolean {
+  try {
+    return privacyModeFromEnv(process.env);
+  } catch {
+    return true;
+  }
+}
 const TRACE_UPLOAD_SCOPE = "daemon-trace-bundle:create";
 type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
 
@@ -143,8 +164,11 @@ export interface DiagnosticsPushOptions {
   migrationAttemptId?: string;
   correlationId?: string;
   trigger?: "user_action" | "migration";
+  /** Overrides every attachment's receiver (tests). */
   workerUrl?: string;
   fetchImpl?: FetchLike;
+  /** RAFT_PRIVACY_MODE; default: the Computer's own env (an invalid value counts as on). */
+  privacyMode?: boolean;
 }
 
 function emit(opts: DiagnosticsPushOptions | undefined, event: ComputerApiEvent): void {
@@ -640,8 +664,9 @@ export async function diagnosticsPush(
   // --- UPLOAD_DISABLED gate: same env switch the Computer tracer honors.
   // If the tracer is disabled, the menu-bar's altKey-revealed action has
   // nothing to attach to anyway. Honest closed-reason instead of writing
-  // a marker that will sit on disk forever.
-  if (process.env.RAFT_COMPUTER_LOCAL_TRACE === "0") {
+  // a marker that will sit on disk forever. RAFT_PRIVACY_MODE likewise: no
+  // marker, and no forced upload to Raft's receiver.
+  if (process.env.RAFT_COMPUTER_LOCAL_TRACE === "0" || (options.privacyMode ?? localPrivacyModeOn())) {
     return { status: "failed", reason: "UPLOAD_DISABLED" };
   }
 
@@ -676,6 +701,13 @@ export async function diagnosticsPush(
     return { status: "failed", reason: "NO_RUNNER", ...(localBundle ? { localBundle } : {}) };
   }
 
+  // A forced upload goes only to a receiver the daemon's own rule names for
+  // that attachment's server. None for any running runner (every attachment
+  // is on a server that is not Raft's, nothing configured): nothing to upload.
+  if (options.forceUploadNow && runningRunners.every((a) => forcedUploadReceiver(a, options) === null)) {
+    return { status: "failed", reason: "UPLOAD_DISABLED" };
+  }
+
   const correlationId = options.correlationId ?? randomUUID();
   const markerPaths: string[] = [];
   const uploadResults: DiagnosticsForcedUploadResult[] = [];
@@ -690,7 +722,6 @@ export async function diagnosticsPush(
     })),
     ...(options.includeComputerTraceRecords ? await readComputerTraceRecords(slockHome) : []),
   ];
-  const workerUrl = options.workerUrl ?? process.env.SLOCK_DAEMON_TRACE_UPLOAD_URL ?? DEFAULT_TRACE_UPLOAD_URL;
 
   // 1. Upload-bearing markers: one per RUNNING runner, into that runner's
   // daemon `machineDir/traces` with the `daemon-trace-` glob-matching name so
@@ -707,7 +738,11 @@ export async function diagnosticsPush(
         extraLines,
       });
       markerPaths.push(markerPath);
-      if (options.forceUploadNow) {
+      const workerUrl = options.forceUploadNow ? forcedUploadReceiver(a, options) : null;
+      if (options.forceUploadNow && workerUrl === null) {
+        // This attachment's server has no receiver: its marker stays local.
+        uploadResults.push({ serverId: a.serverId, status: "failed", attempted: 0, uploaded: 0, errorClass: "UPLOAD_DISABLED" });
+      } else if (workerUrl !== null) {
         uploadResults.push(await forceUploadTraceFile({
           file: markerPath,
           attachment: a,

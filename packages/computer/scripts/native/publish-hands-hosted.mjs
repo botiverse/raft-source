@@ -2,7 +2,7 @@
 import { readFile, mkdtemp, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { downloadHandsCandidate } from './download-hands-candidate.mjs';
+import { DEFAULT_CANDIDATE_CHANNEL, downloadHandsCandidate } from './download-hands-candidate.mjs';
 import { pathToFileURL } from 'node:url';
 import { createHandsClient, resolveAppAndChannel, versionCodeFromVersion } from './publish-hands-release.mjs';
 import { loadHostedArtifacts, assertHostedAssetSet, verifyHostedRelease } from './hands-artifacts.mjs';
@@ -123,6 +123,8 @@ async function main() {
   const options = { manifestPath: args.manifest, artifactDir: args['artifact-dir'], appSlug: args.app,
     channel: args.channel, expectedVersion: args['expected-version'], sourceCommit: args['source-commit'],
     runId: args['run-id'], runUrl: args['run-url'], mode: args.mode,
+    // Promotion only: the channel the release candidate was published to.
+    candidateChannel: args['candidate-channel'] ?? DEFAULT_CANDIDATE_CHANNEL,
     apiBase: process.env.HANDS_API ?? 'https://hands.build', token: process.env.HANDS_BEARER_TOKEN,
     uploadAsset, activateRelease };
   options.api = createHandsClient({ apiBase: options.apiBase, token: options.token });
@@ -131,6 +133,7 @@ async function main() {
     if (options.mode === 'promote-existing' && !options.manifestPath) {
       candidateDir = await mkdtemp(join(tmpdir(), 'hands-candidate-'));
       Object.assign(options, await downloadHandsCandidate({ ...options, version: options.expectedVersion, dir: candidateDir }));
+      process.stderr.write(`promotion candidate ${options.expectedVersion} taken from Hands channel ${options.candidateChannel}\n`);
     }
     const result = await publishHosted(options);
     process.stdout.write(JSON.stringify(result) + '\n');

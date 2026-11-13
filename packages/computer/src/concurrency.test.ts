@@ -234,3 +234,21 @@ test("task #917: releaseHeldComputerMutationLock lets another command acquire wh
     await rm(home, { recursive: true, force: true });
   }
 });
+
+test("task #166 (S1): waitMs waits for a held lock and takes it once released", async () => {
+  await withHome(async (home) => {
+    let release: () => void = () => {};
+    let acquired: () => void = () => {};
+    const acquiredPromise = new Promise<void>((resolve) => { acquired = resolve; });
+    const releasePromise = new Promise<void>((resolve) => { release = resolve; });
+    const holding = withComputerMutationLock(home, async () => { acquired(); await releasePromise; });
+    await acquiredPromise;
+    // Released after 7 s: beyond the default ~5.6 s wait, inside waitMs.
+    setTimeout(() => release(), 7_000);
+    const started = Date.now();
+    const value = await withComputerMutationLock(home, async () => "ran", { waitMs: 15_000 });
+    await holding;
+    assert.equal(value, "ran");
+    assert.ok(Date.now() - started >= 6_500, "it waited for the holder");
+  });
+}, 30_000);

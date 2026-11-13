@@ -3,6 +3,11 @@ import { eq } from "drizzle-orm";
 
 import { getDb } from "../db/index";
 import { channels, messages } from "../db/schema";
+import { getChannelAgents } from "../services/channelService";
+import {
+  __setMessageServiceDepsForTests,
+  getSenderReadReceiptInFlightCountForTests,
+} from "../services/messageService";
 import { SlackBridgeFullFlowPreflightError } from "./slackBridgeFullFlowPreflight";
 
 import {
@@ -153,6 +158,40 @@ test("batch matrix is complete across topology, send mode, authority, frontend, 
     "expired Slack authority exists only on the ordinary external projection",
   );
   assert.deepEqual(SLACK_BRIDGE_SANDBOX_ONE_SHOT_PLAN.map((entry) => entry.step), [1, 2, 3, 4]);
+});
+
+test("joint background delivery stays in the database drain lifecycle after send returns", async () => {
+  let releaseDelivery!: () => void;
+  let deliveryStarted!: () => void;
+  const released = new Promise<void>((resolve) => { releaseDelivery = resolve; });
+  const started = new Promise<void>((resolve) => { deliveryStarted = resolve; });
+  const entry = frontendCases.find((entry) =>
+    entry.topology === "joint_channel" && entry.sendMode === "first" && entry.result === "socket_failure"
+  )!;
+  const pending = runSlackBridgeExecutableBatchCase(entry, {
+    async onDatabaseReady() {
+      __setMessageServiceDepsForTests({
+        // Isolate delivery ownership from the separately tracked sender cursor.
+        markRead: async () => undefined,
+        getChannelAgents: async (channelId) => {
+          deliveryStarted();
+          await released;
+          return getChannelAgents(channelId);
+        },
+      });
+    },
+  });
+  try {
+    await started;
+    // Settle the no-op sender read receipt. Delivery remains blocked above.
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.ok(getSenderReadReceiptInFlightCountForTests() > 0,
+      "joint delivery must remain registered until its database work completes");
+  } finally {
+    releaseDelivery();
+    await pending;
+  }
+  assert.equal(getSenderReadReceiptInFlightCountForTests(), 0);
 });
 
 test("expired authority cases derive topology and cardinality from their PGlite fixture", async () => {

@@ -3,7 +3,7 @@ import { useIntl } from "react-intl";
 import { Check } from "lucide-react";
 import MenuItem from "../ui/MenuItem";
 import type { SidebarSortMode } from "./sidebarSort";
-import { SIDEBAR_SORT_LABEL_ID } from "./Sidebar";
+import { SIDEBAR_SORT_LABEL_ID } from "../../features/sidebar/sections/sidebarSortSections";
 
 export function SectionSortModeMenuItem({ mode, checked, onSelect }: {
   mode: SidebarSortMode;

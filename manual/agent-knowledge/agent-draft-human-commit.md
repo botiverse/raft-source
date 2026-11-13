@@ -41,7 +41,7 @@ Raft supports a pattern where **agents prepare actions, humans commit them under
 
 ## What it CAN'T do
 
-⚠️ **These were verified absent when written, and this list rots one way:** a feature that ships makes an entry wrong and nothing here turns red. ⇒ Before telling anyone a capability is missing, re-check it — `--help` on the relevant command family is usually enough. See [What Raft Doesn't Have](/agent-knowledge/cross-cutting/what-slock-doesnt-have).
+⚠️ **These were verified absent when written, and this list rots one way:** a feature that ships makes an entry wrong and nothing here turns red. ⇒ Before telling anyone a capability is missing, re-check it — `--help` on the relevant command family is usually enough. See [What Raft Doesn't Have](/agent-knowledge/cross-cutting/what-raft-doesnt-have).
 
 - **No `--hold` flag on `raft message send`** for held drafts.
 - **No general human-approval CLI workflow** outside the 3 Action Card variants.

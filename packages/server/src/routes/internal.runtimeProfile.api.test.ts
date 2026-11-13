@@ -5,11 +5,12 @@ import assert from "node:assert/strict";
 
 import { getDb } from "../db/index";
 import { users } from "../db/schema";
-import { createAgent, assignMachine } from "../services/agentService";
+import { createAgent } from "../services/agentService";
+import { placeAgentOnMachine } from "../test/agentMachineFixture";
 import { registerMachine } from "../services/machineService";
 import { createServer } from "../services/serverService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 async function seedRuntimeProfileRouteFixture() {
   const db = getDb();
@@ -26,7 +27,7 @@ async function seedRuntimeProfileRouteFixture() {
     model: "gpt-5.4-codex",
   });
   const { machine, apiKey } = await registerMachine(server.id, owner.id, "runtime-profile-route-machine");
-  await assignMachine(agent.id, machine.id);
+  await placeAgentOnMachine(agent.id, machine.id);
   return { agent, apiKey };
 }
 

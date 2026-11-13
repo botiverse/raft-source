@@ -1,6 +1,6 @@
-import { memo, useCallback, useEffect, useRef } from "react";
+import { memo, useCallback, useEffect, useRef, useState } from "react";
 import { useIntl } from "react-intl";
-import { Bookmark, Copy, Link, MessageSquare } from "lucide-react";
+import { Bookmark, BookmarkMinus, Copy, Link } from "lucide-react";
 import {
   ContextMenu,
   ContextMenuContent,
@@ -9,7 +9,11 @@ import {
   ContextMenuTrigger,
   PanelToggleAction,
   ListRow,
+  Skeleton,
+  ScrollArea,
 } from "@botiverse/raft-ui";
+import { ThreadIcon } from "@botiverse/ricons";
+import { PLAN_CONFIG } from "@botiverse/raft-shared";
 import { useSavedStore } from "../../store/savedStore";
 import type { SavedEntry } from "../../store/savedStore";
 import { useAgentStore } from "../../store/agentStore";
@@ -22,7 +26,15 @@ import { formatRelativeTime } from "../../utils/relativeTime";
 import AvatarSlot from "../ui/AvatarSlot";
 import PanelHeader from "../ui/PanelHeader";
 import EmptyState from "../ui/EmptyState";
-import { ConversationCardSkeleton } from "../ui/Skeleton";
+import { SkeletonTextBar } from "../ui/Skeleton";
+import { useListSkeletonShown } from "../ui/useListSkeletonShown";
+import { ContentLoading } from "../ui/ContentLoading";
+import { PagePullToRefreshIndicator } from "../ui/PagePullToRefreshIndicator";
+import { usePagePullToRefresh } from "../../hooks/usePagePullToRefresh";
+import { showToast } from "../toastBridge";
+import { HistoryWindowBanner } from "../message/HistoryWindowNotices";
+
+const FREE_HISTORY_DAYS = PLAN_CONFIG.free.limits.messageHistoryDays;
 
 function stopKeyPropagation(event: React.KeyboardEvent) {
   event.stopPropagation();
@@ -33,6 +45,14 @@ function stopKeyPropagation(event: React.KeyboardEvent) {
 // consecutive rows from the 16px edge, the pressed overlay on hover and while
 // its context menu is open, and an inset ink ring for keyboard focus. It is a
 // div with the button role, since the row holds its own remove button.
+
+// The row's two parts, shared with its skeleton (SavedRowSkeleton): the
+// meta line (where, who, when) over the message, up to three lines of it.
+const SAVED_ROW_META_CLASS = "mb-1 flex min-w-0 items-center gap-2 text-caption";
+const SAVED_ROW_BODY_CLASS = "line-clamp-3 text-callout text-foreground wrap-break-word";
+// The unsave toggle at the row's end, and its box in the skeleton row.
+const SAVED_ROW_TOGGLE_SLOT_CLASS = "ml-auto shrink-0 self-center";
+const SAVED_ROW_TOGGLE_CLASS = "data-pressed:border-transparent data-pressed:bg-transparent data-pressed:text-foreground data-pressed:hover:bg-fill-medium";
 
 const SavedItem = memo(function SavedItem({ entry, onOpenEntry, onRemoveMessage, serverSlug }: {
   entry: SavedEntry;
@@ -103,8 +123,11 @@ const SavedItem = memo(function SavedItem({ entry, onOpenEntry, onRemoveMessage,
     <ContextMenu>
       <ContextMenuTrigger
         render={
+          // A list cell (raft-design patterns/lists.md): no line between
+          // saved messages, every state on the row's 8px-inset shape.
           <ListRow
             variant="plain"
+            cell
             render={<div />}
             role="button"
             tabIndex={0}
@@ -115,11 +138,13 @@ const SavedItem = memo(function SavedItem({ entry, onOpenEntry, onRemoveMessage,
         }
       >
         <div className="min-w-0 flex-1">
-          <div className="mb-1 flex min-w-0 items-center gap-2 text-caption">
-            <span className="shrink-0 text-foreground-hint">{channelLabel}</span>
+          <div className={SAVED_ROW_META_CLASS}>
+            {/* A long channel name truncates with the sender, so the thread
+                mark and the time stay whole in a narrow column. */}
+            <span className="min-w-0 truncate text-foreground-hint">{channelLabel}</span>
             {isThread && (
               <span className="inline-flex shrink-0 items-center gap-1 text-foreground-hint">
-                <MessageSquare size={12} />
+                <ThreadIcon width={12} height={12} />
                 {formatMessage({ id: "saved.threadLabel" })}
               </span>
             )}
@@ -130,7 +155,7 @@ const SavedItem = memo(function SavedItem({ entry, onOpenEntry, onRemoveMessage,
                 ) : entry.senderType === "external_projection" ? (
                   <AvatarSlot context="preview-mini" type="app" appAvatarUrl={entry.senderAvatarUrl} appInitials={senderName} />
                 ) : (
-                  <AvatarSlot context="preview-mini" type="human" humanAvatarUrl={senderMember?.avatarUrl} gravatarHash={senderMember?.gravatarHash} />
+                  <AvatarSlot context="preview-mini" type="human" humanAvatarUrl={senderMember?.avatarUrl} />
                 )}
                 <span className="truncate">{senderName}</span>
               </span>
@@ -139,23 +164,24 @@ const SavedItem = memo(function SavedItem({ entry, onOpenEntry, onRemoveMessage,
               {formatRelativeTime(entry.createdAt, locale) ?? ""}
             </span>
           </div>
-          <p className="line-clamp-3 text-callout text-foreground">
+          <p className={SAVED_ROW_BODY_CLASS}>
             {entry.content}
           </p>
         </div>
-        <div className="ml-auto shrink-0 self-center">
-          {/* Every row here is saved, so the filled bookmark carries the state
-              and the toggle stays a quiet icon button: a yellow sticker on each
-              row would paint the list yellow (Raft DS: yellow is for where you
-              are, and content stays on white paper). */}
+        <div className={SAVED_ROW_TOGGLE_SLOT_CLASS}>
+          {/* Every row here is saved, so the toggle is the remove action, drawn
+              as the message menu draws it (BookmarkMinus, icon standard v4: no
+              filled icon for a state), and stays a quiet icon button: a yellow
+              sticker on each row would paint the list yellow (Raft DS: yellow
+              is for where you are, and content stays on white paper). */}
           <PanelToggleAction
             pressed
             onKeyDown={stopKeyPropagation}
             onClick={handleRemoveButtonClick}
             aria-label={formatMessage({ id: "saved.remove" })}
-            className="data-pressed:border-transparent data-pressed:bg-transparent data-pressed:text-foreground data-pressed:hover:bg-fill-pressed"
+            className={SAVED_ROW_TOGGLE_CLASS}
           >
-            <Bookmark size={14} fill="currentColor" aria-hidden />
+            <BookmarkMinus size={14} aria-hidden />
           </PanelToggleAction>
         </div>
       </ContextMenuTrigger>
@@ -171,13 +197,55 @@ const SavedItem = memo(function SavedItem({ entry, onOpenEntry, onRemoveMessage,
         </ContextMenuItem>
         <ContextMenuSeparator />
         <ContextMenuItem onClick={handleRemove}>
-          <Bookmark size={14} />
+          <BookmarkMinus size={14} />
           <span>{formatMessage({ id: "saved.remove" })}</span>
         </ContextMenuItem>
       </ContextMenuContent>
     </ContextMenu>
   );
 });
+
+/**
+ * A saved message while the list loads: SavedItem's own row (a plain ListRow
+ * cell) and its meta and message lines with bars in them, so it is the loaded
+ * row's height: the meta line and one line of the message with a mouse on a
+ * desktop, two on a phone, where most messages wrap. The unsave toggle's box
+ * is kept (the toggle itself, invisible and inert), so the text column is the
+ * loaded row's width and the message wraps where it will (skeleton-vs-layout
+ * audit round 2: 350 vs 294px on a phone).
+ */
+export function SavedRowSkeleton() {
+  return (
+    <ListRow variant="plain" cell interactive={false} render={<div />} aria-hidden="true" data-skeleton="">
+      <div className="min-w-0 flex-1">
+        <div className={SAVED_ROW_META_CLASS}>
+          <span><SkeletonTextBar className="w-16" /></span>
+          <span className="inline-flex items-center gap-1">
+            <Skeleton className="size-3.5" />
+            <span><SkeletonTextBar className="w-20" /></span>
+          </span>
+          <span className="font-mono text-mono-meta"><SkeletonTextBar className="w-10" /></span>
+        </div>
+        {/* A div where the row has a p: a skeleton bar is a div. */}
+        <div className={SAVED_ROW_BODY_CLASS}>
+          <div><SkeletonTextBar className="w-3/4" /></div>
+          <div className="md:pointer-fine:hidden"><SkeletonTextBar className="w-1/2" /></div>
+        </div>
+      </div>
+      <div className={`${SAVED_ROW_TOGGLE_SLOT_CLASS} invisible`} data-saved-toggle-reserved="">
+        <PanelToggleAction pressed disabled tabIndex={-1} className={SAVED_ROW_TOGGLE_CLASS}>
+          <BookmarkMinus size={14} aria-hidden />
+        </PanelToggleAction>
+      </div>
+    </ListRow>
+  );
+}
+
+function SavedListSkeleton() {
+  const shown = useListSkeletonShown();
+  if (!shown) return null;
+  return Array.from({ length: 8 }, (_, index) => <SavedRowSkeleton key={index} />);
+}
 
 export default function SavedPanel({ embedded = false }: {
   /** Embedded hosts own the surrounding panel header and navigation. */
@@ -193,11 +261,17 @@ export default function SavedPanel({ embedded = false }: {
   const hasMore = useSavedStore((s) => s.hasMore);
   const loading = useSavedStore((s) => s.loading);
   const unsaveMessage = useSavedStore((s) => s.unsaveMessage);
+  // Saved messages behind the plan's 30-day window are not listed; a card
+  // counts them (cindyz, task #8, frame 16). A plan change reloads the list
+  // (socketBridge, server:plan-updated).
+  const historyHiddenCount = useSavedStore((s) => s.historyHiddenCount);
   const openThread = useThreadStore((s) => s.openThread);
   const serverSlug = useServerStore((s) => s.current?.slug);
   const serverId = useServerStore((s) => s.current?.id);
   const onMobileBack = useMobileBack(serverSlug ? `/s/${serverSlug}` : "/");
   const nav = useAppNavigate();
+  // A raft-ui ScrollArea: its overlay scrollbar takes no width, so the rows'
+  // shapes sit 8px from both of its edges on every platform.
   const scrollerRef = useRef<HTMLDivElement | null>(null);
   const loadMoreSentinelRef = useRef<HTMLDivElement | null>(null);
 
@@ -252,33 +326,78 @@ export default function SavedPanel({ embedded = false }: {
     return () => observer.disconnect();
   }, [hasMore, loadMore, loading, saved.length]);
 
+  // Saved is a snapshot (Raft DS › Navigation › Refreshing): on a phone a pull
+  // loads it again, under the pull's own spinner rather than the skeleton. A
+  // failure keeps the rows and says so in a toast.
+  const [refreshing, setRefreshing] = useState(false);
+  const firstLoad = loading && saved.length === 0 && historyHiddenCount === 0 && !refreshing;
+  const refreshSaved = useCallback(async () => {
+    setRefreshing(true);
+    const loaded = await loadSaved({ query: "", sortDirection: "desc" });
+    setRefreshing(false);
+    if (loaded === false) {
+      showToast({ title: formatMessage({ id: "saved.loadError" }), type: "warning" });
+    }
+  }, [formatMessage, loadSaved]);
+  const pull = usePagePullToRefresh(scrollerRef, {
+    onRefresh: refreshSaved,
+    disabled: !serverId || firstLoad,
+  });
+  // Saved messages older than the plan's window aren't listed; one line at
+  // the top says how many (cindyz, 2026-10-29: a Banner, as on search).
+  const historyCard = historyHiddenCount > 0 ? (
+    <HistoryWindowBanner surface="saved" className="px-(--column-margin) pb-1 pt-2" testId="saved-history-hidden">
+      {formatMessage(
+        { id: saved.length === 0 ? "saved.historyHidden.bannerAll" : "saved.historyHidden.banner" },
+        { count: historyHiddenCount, days: FREE_HISTORY_DAYS },
+      )}
+    </HistoryWindowBanner>
+  ) : null;
+
   return (
-    <div className="flex min-h-0 flex-1 flex-col bg-layer-canvas">
+    // A column of list cells: its head and rows share one edge, 20px at every
+    // width (raft-ui --column-margin; raft-design patterns/lists.md).
+    <div className="flex min-h-0 flex-1 flex-col bg-layer-canvas [--column-margin:20px]">
       {!embedded ? (
         <PanelHeader
           title={formatMessage({ id: "saved.header.title" })}
-          subtitle={formatMessage({ id: "saved.header.subtitle" }, { count: savedTotal })}
+          // No count before the list is read ("0 saved items" while it
+          // loads): the line's box stays, empty.
+          subtitle={firstLoad ? "\u00a0" : formatMessage({ id: "saved.header.subtitle" }, { count: savedTotal })}
           onMobileBack={onMobileBack}
         />
       ) : null}
 
       {/* Saved list */}
-      <div
+      <ScrollArea
         ref={scrollerRef}
         data-testid="saved-list-scroller"
-        className="flex-1 overflow-y-auto bg-layer-canvas py-1 safe-bottom"
+        className="flex-1 bg-layer-canvas"
+        // The content fills the area, so the empty state stays centred in it.
+        contentClassName="flex min-h-full flex-col py-1 safe-bottom"
+        // The scroller stays when the rows arrive, so it carries the busy state.
+        aria-busy={firstLoad || undefined}
       >
-        {loading && saved.length === 0 ? (
-          <ConversationCardSkeleton />
+        <PagePullToRefreshIndicator pull={pull} />
+        {firstLoad ? (
+          // Rows in the shape of SavedItem, after the 1s wait (task #154).
+          <div className="flex flex-col gap-0.5 py-1" data-testid="saved-loading-skeleton">
+            <SavedListSkeleton />
+          </div>
+        ) : saved.length === 0 && historyCard ? (
+          historyCard
         ) : saved.length === 0 ? (
           <EmptyState
-            className="flex h-full flex-col items-center justify-center"
+            className="flex flex-1 flex-col items-center justify-center"
             icon={<Bookmark size={36} />}
             title={formatMessage({ id: "emptyState.noSavedTitle" })}
             description={formatMessage({ id: "saved.emptyDescription" })}
           />
         ) : (
-          <div className="flex flex-col">
+          // A list of cells: 2px between rows, 8px at its ends with the
+          // scroller's own 4px.
+          <div className="flex flex-col gap-0.5 py-1">
+            {historyCard}
             {saved.map((entry) => (
               <SavedItem
                 key={entry.messageId}
@@ -293,18 +412,17 @@ export default function SavedPanel({ embedded = false }: {
                 ref={loadMoreSentinelRef}
                 data-testid="saved-infinite-scroll-sentinel"
                 className="flex min-h-10 items-center justify-center py-3"
-                aria-live="polite"
               >
                 {loading ? (
-                  <span className="font-mono text-mono-meta text-foreground-hint">{formatMessage({ id: "common.loading" })}</span>
+                  <ContentLoading>{formatMessage({ id: "common.loading" })}</ContentLoading>
                 ) : (
-                  <span className="sr-only">{formatMessage({ id: "saved.loadingMore" })}</span>
+                  <span role="status" className="sr-only">{formatMessage({ id: "saved.loadingMore" })}</span>
                 )}
               </div>
             )}
           </div>
         )}
-      </div>
+      </ScrollArea>
     </div>
   );
 }

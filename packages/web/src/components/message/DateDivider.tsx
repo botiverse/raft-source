@@ -1,6 +1,9 @@
 import { MessageListDateDivider } from "@botiverse/raft-ui";
+import { PLAN_CONFIG } from "@botiverse/raft-shared";
 import { useIntl } from "react-intl";
+import { useCurrentDay } from "../../hooks/useCurrentDay";
 import { useTimeFormatter } from "../../hooks/useTimeFormatter";
+import { formatDayLabel } from "../../utils/timeFormatting";
 
 /**
  * Day-boundary divider for the message timeline (task #44). Rendered before the
@@ -14,17 +17,25 @@ import { useTimeFormatter } from "../../hooks/useTimeFormatter";
 export function DateDivider({
   createdAt,
   sticky = false,
+  recentHistory = false,
   testId,
 }: {
   createdAt: string;
   sticky?: boolean;
+  /** The first day under the history paywall: "Last 30 days · <day>", so the eye sees where the window starts. */
+  recentHistory?: boolean;
   testId?: string;
 }) {
   const { formatMessage } = useIntl();
   const { options } = useTimeFormatter();
+  const timeZone = options.timeZone ?? undefined;
+  // Re-rendered when the day ends: a divider left on screen past midnight
+  // turns from "Today" to "Yesterday".
+  const today = useCurrentDay(timeZone);
   const label = formatDayLabel(createdAt, {
+    today,
     locale: options.locale,
-    timeZone: options.timeZone ?? undefined,
+    timeZone,
     todayLabel: formatMessage({ id: "message.dateDivider.today" }),
     yesterdayLabel: formatMessage({ id: "message.dateDivider.yesterday" }),
   });
@@ -39,35 +50,11 @@ export function DateDivider({
       </div>
     );
   }
-  return <MessageListDateDivider data-testid={testId}>{label}</MessageListDateDivider>;
-}
-
-/** "Today" / "Yesterday" / "Monday, June 30, 2026" in the viewer's timezone. */
-function formatDayLabel(createdAt: string, options: {
-  locale?: string | string[];
-  timeZone?: string;
-  todayLabel: string;
-  yesterdayLabel: string;
-}): string {
-  const date = new Date(createdAt);
-  if (Number.isNaN(date.getTime())) return "";
-
-  const now = new Date();
-  const yesterday = new Date(now);
-  yesterday.setDate(yesterday.getDate() - 1);
-
-  const { locale, timeZone } = options;
-  const key = (d: Date) => d.toLocaleDateString("en-CA", { year: "numeric", month: "2-digit", day: "2-digit", timeZone });
-  const dateKey = key(date);
-  if (dateKey === key(now)) return options.todayLabel;
-  if (dateKey === key(yesterday)) return options.yesterdayLabel;
-
-  const sameYear = date.getFullYear() === now.getFullYear();
-  return date.toLocaleDateString(locale, {
-    weekday: "long",
-    month: "long",
-    day: "numeric",
-    ...(sameYear ? {} : { year: "numeric" }),
-    timeZone,
-  });
+  return (
+    <MessageListDateDivider data-testid={testId}>
+      {recentHistory
+        ? formatMessage({ id: "message.historyPaywall.recentDividerWithDate" }, { days: PLAN_CONFIG.free.limits.messageHistoryDays, date: label })
+        : label}
+    </MessageListDateDivider>
+  );
 }

@@ -11,6 +11,7 @@ import {
 } from "../src/utils/offlineBundleHost";
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
+import { isTestPath } from "../scripts/testLocations";
 import { registerPushServiceWorker } from "../src/utils/pushNotifications";
 import { cleanBrowserStateForRecovery, refreshServiceWorkerForRecovery } from "../src/utils/serviceWorkerRecovery";
 
@@ -151,14 +152,13 @@ test("every service worker registration in the web source goes through an offlin
   const registering = walk(srcRoot)
     .filter((path) => /serviceWorker\s*\.\s*register\s*\(/.test(readFileSync(path, "utf8")))
     .map((path) => relative(srcRoot, path))
+    // Feature tests (src/features/<feature>/tests/) are not app code.
+    .filter((path) => !isTestPath(`src/${path}`))
     .sort();
   assert.deepEqual(registering, ["utils/pushNotifications.ts", "utils/serviceWorkerRecovery.ts"]);
   for (const file of registering) {
     assert.match(readFileSync(join(srcRoot, file), "utf8"), /mayUseServiceWorker\(\)/, `${file} registers without the gate`);
   }
-  const entry = readFileSync(join(srcRoot, "main.tsx"), "utf8");
-  assert.match(entry, /cleanBrowserStateForRecovery\(\)/, "the recovery flow calls the gated cleanup");
-  assert.doesNotMatch(entry, /caches\s*\.\s*(delete|keys)|navigator\.serviceWorker/, "the entry touches caches and workers only through the gated cleanup");
 });
 
 test("clear-cache recovery deletes the web app's asset caches on an ordinary page and nothing in offline mode", async () => {

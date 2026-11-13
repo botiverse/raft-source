@@ -87,3 +87,72 @@ test("legacy terminal without provenance remains readable without invented reaso
   assert.equal(result.status, "TERMINAL_ERROR");
   assert.equal(Object.hasOwn(result, "decision"), false);
 });
+
+test("a daemon's terminal error redelivers the message once, untracked, so a refusal never drops it", async ({ db }) => {
+  void db;
+  const input = await seed();
+  const orch = new AgentOrchestrator();
+  vi.spyOn(orch as any, "validateMachineAgentMessage").mockResolvedValue({ expectedLaunchId: input.identity.launchId, sessionId: input.identity.sessionId });
+  const sent: unknown[] = [];
+  vi.spyOn(orch as any, "sendAgentDeliveryWithAckRetry").mockImplementation(async (_machineId: unknown, msg: unknown) => { sent.push(msg); return true; });
+  const receipt = { type: "agent:delivery:terminal_error" as const, agentId: input.agentId, code: "UNSUPPORTED_DELIVERY_PATH" as const, mentionDelivery: { ...input.identity, occurrenceId: input.occurrenceId, messageId: input.messageId } };
+  await orch.handleMachineMessage(input.identity.machineId, receipt);
+  assert.equal(sent.length, 1);
+  const delivery = sent[0] as { type: string; agentId: string; message: { message_id: string }; mentionDelivery?: unknown; deliveryId?: string };
+  assert.equal(delivery.type, "agent:deliver");
+  assert.equal(delivery.agentId, input.agentId);
+  assert.equal(delivery.message.message_id, input.messageId);
+  assert.equal(delivery.mentionDelivery, undefined, "untracked: no second terminal error can come back");
+  assert.notEqual(delivery.deliveryId, input.occurrenceId);
+  // A repeated receipt finds the occurrence already terminal: no second copy.
+  await orch.handleMachineMessage(input.identity.machineId, receipt);
+  assert.equal(sent.length, 1);
+});
+
+for (const driftAtRefusal of [true, false]) {
+  test(`a refusal after a stage-receipt identity drift still redelivers once (server still drifted=${driftAtRefusal})`, async ({ db }) => {
+    void db;
+    // Bencher (v1.21.54 bench, daemon 1.0.61): the server's session moved between its
+    // decision and the daemon's daemon_received, so the stage receipt ended the
+    // occurrence as IDENTITY_DRIFT and sent nothing; the daemon's refusal then found
+    // the row already terminal and the message was lost.
+    const input = await seed();
+    const orch = new AgentOrchestrator();
+    const validate = vi.spyOn(orch as any, "validateMachineAgentMessage").mockResolvedValue({ expectedLaunchId: input.identity.launchId, sessionId: "newer-session" });
+    const sent: unknown[] = [];
+    vi.spyOn(orch as any, "sendAgentDeliveryWithAckRetry").mockImplementation(async (_machineId: unknown, msg: unknown) => { sent.push(msg); return true; });
+    const mentionDelivery = { ...input.identity, occurrenceId: input.occurrenceId, messageId: input.messageId };
+    await orch.handleMachineMessage(input.identity.machineId, { type: "agent:delivery:transition", agentId: input.agentId, stage: "daemon_received", outcome: "accepted", mentionDelivery });
+    assert.equal(sent.length, 0, "a stage drift alone sends nothing: the daemon may still deliver it");
+
+    if (!driftAtRefusal) validate.mockResolvedValue({ expectedLaunchId: input.identity.launchId, sessionId: input.identity.sessionId });
+    const refusal = { type: "agent:delivery:terminal_error" as const, agentId: input.agentId, code: "UNSUPPORTED_DELIVERY_PATH" as const, mentionDelivery };
+    await orch.handleMachineMessage(input.identity.machineId, refusal);
+    assert.equal(sent.length, 1);
+    const delivery = sent[0] as { type: string; message: { message_id: string }; mentionDelivery?: unknown };
+    assert.equal(delivery.type, "agent:deliver");
+    assert.equal(delivery.message.message_id, input.messageId);
+    assert.equal(delivery.mentionDelivery, undefined);
+    const row = await getMentionDeliveryOccurrence(input.messageId, input.agentId);
+    assert.ok(row);
+    assert.equal(row.terminalErrorCode, "IDENTITY_DRIFT");
+    assert.deepEqual(row.terminalDecision, { layer: "server", stage: "terminal_receipt", originalDaemonCode: "UNSUPPORTED_DELIVERY_PATH" });
+
+    await orch.handleMachineMessage(input.identity.machineId, refusal);
+    assert.equal(sent.length, 1, "a repeated refusal finds the drift already claimed");
+  });
+}
+
+test("an ACKed or daemon-terminal occurrence is never claimed by a later refusal", async ({ db }) => {
+  void db;
+  const input = await seed();
+  const orch = new AgentOrchestrator();
+  vi.spyOn(orch as any, "validateMachineAgentMessage").mockResolvedValue({ expectedLaunchId: input.identity.launchId, sessionId: input.identity.sessionId });
+  const sent: unknown[] = [];
+  vi.spyOn(orch as any, "sendAgentDeliveryWithAckRetry").mockImplementation(async (_machineId: unknown, msg: unknown) => { sent.push(msg); return true; });
+  const mentionDelivery = { ...input.identity, occurrenceId: input.occurrenceId, messageId: input.messageId };
+  await orch.handleMachineMessage(input.identity.machineId, { type: "agent:delivery:terminal_error", agentId: input.agentId, code: "DELIVERY_REJECTED", mentionDelivery });
+  assert.equal(sent.length, 1);
+  await orch.handleMachineMessage(input.identity.machineId, { type: "agent:delivery:terminal_error", agentId: input.agentId, code: "UNSUPPORTED_DELIVERY_PATH", mentionDelivery });
+  assert.equal(sent.length, 1, "only a stage-receipt drift is claimable");
+});

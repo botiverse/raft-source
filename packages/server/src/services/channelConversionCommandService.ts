@@ -4,8 +4,9 @@ import { asc, eq, sql } from "drizzle-orm";
 import { ChannelConversionFenceConflictError } from "./channelConversionFenceService";
 import { getDb } from "../db/index";
 import { channelConversionCommands } from "../db/schema";
+import { JointActorUnavailableError, lockJointUsersFirst } from "./jointHumanMembershipMirror";
 import {
-  ChannelConversionError, startChannelToJointConversion, retryChannelConversionJob,
+  ChannelConversionBusyError, ChannelConversionError, startChannelToJointConversion, retryChannelConversionJob,
   cancelChannelConversionJob, getChannelConversionJob,
   type ChannelConversionPrivacyRevalidator,
 } from "./channelConversionService";
@@ -30,7 +31,16 @@ export async function admitConversionCommand(input: {
   jobId?: string;
 }): Promise<CommandRow> {
   const db = getDb();
-  const [inserted] = await db.insert(channelConversionCommands).values(input).onConflictDoNothing().returning();
+  const inserted = await db.transaction(async (tx) => {
+    // The requester's users row first (lockJointUsersFirst; only locked: the
+    // start refuses a requester being deleted, executeConversionCommand), then
+    // the row, whose FK checks take the server's row before the requester's:
+    // taken only there, the users row closes a cycle with the requester's
+    // account deletion (users row FOR UPDATE, then the servers they own).
+    await lockJointUsersFirst(tx, { userIds: [input.requestedByUserId] });
+    const [row] = await tx.insert(channelConversionCommands).values(input).onConflictDoNothing().returning();
+    return row;
+  });
   if (inserted) {
     addTraceEvent("server.channel_conversion.command.admitted", { command_id: inserted.id, channel_id: inserted.sourceChannelId, command_kind: inserted.kind, outcome: "pending" });
     return inserted;
@@ -55,6 +65,23 @@ export async function executeConversionCommand(id: string, wait = true,
 ): Promise<CommandRow | null> {
   const db = getDb();
   return db.transaction(async (tx) => {
+    // A start writes the conversion job naming its requester (created_by_user_id):
+    // the requester's users row first (lockJointUsersFirst), before the command
+    // lock, the conversion lock and the source's server and channel rows (an
+    // FK check taking it only at the job insert closes a cycle with the
+    // requester's account deletion, which holds that row FOR UPDATE and then
+    // the servers they own). The command is read unlocked for its requester (a
+    // command's requester and kind never change) and read again under the
+    // command lock below. A requester retired or being deleted: the start is
+    // refused below, settling the command as failed.
+    const [admitted] = await tx.select({ kind: channelConversionCommands.kind, status: channelConversionCommands.status,
+      requestedByUserId: channelConversionCommands.requestedByUserId })
+      .from(channelConversionCommands).where(eq(channelConversionCommands.id, id)).limit(1);
+    const requesterUnavailable = admitted?.kind === "start" && admitted.status === "pending"
+      && await lockJointUsersFirst(tx, { actorUserId: admitted.requestedByUserId }).then(() => false, (error: unknown) => {
+        if (error instanceof JointActorUnavailableError) return true;
+        throw error;
+      });
     if (wait) await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${id}), 137)`);
     else {
       const lock = await tx.execute(sql`SELECT pg_try_advisory_xact_lock(hashtext(${id}), 137) AS acquired`);
@@ -65,6 +92,7 @@ export async function executeConversionCommand(id: string, wait = true,
     try {
       const job = await tx.transaction(async (operation) => {
         if (command.kind === "start") {
+          if (requesterUnavailable) throw new ChannelConversionError("This account is being deleted", "requester_unavailable");
           const started = await startChannelToJointConversion({ serverId: command.serverId, sourceChannelId: command.sourceChannelId,
             createdByUserId: command.requestedByUserId, transaction: operation, tracePreJobPhase,
             revalidateExternalPrivacy });
@@ -78,6 +106,14 @@ export async function executeConversionCommand(id: string, wait = true,
       addTraceEvent("server.channel_conversion.command.completed", { command_id: id, job_id: job.id, command_kind: command.kind, outcome: job.status });
       return completed;
     } catch (error) {
+      // The worker's resume of a pending command found a phase holding the
+      // conversion lock (its bounded wait ran out; the savepoint rolled back):
+      // leave the command pending for the next pass. A request (wait) settles
+      // it as failed with the 409 "in progress", which its caller answers.
+      if (!wait && error instanceof ChannelConversionBusyError) {
+        addTraceEvent("server.channel_conversion.command.busy", { command_id: id, command_kind: command.kind, outcome: "pending" });
+        return command;
+      }
       addTraceEvent("server.channel_conversion.command.failed", { command_id: id, command_kind: command.kind, outcome: "failed", error_class: error instanceof Error ? error.name : "UnknownError" });
       console.error("[ChannelConversionCommand] execution failed", { id, kind: command.kind, error });
       const [failed] = await tx.update(channelConversionCommands).set({ status: "failed", updatedAt: new Date(),

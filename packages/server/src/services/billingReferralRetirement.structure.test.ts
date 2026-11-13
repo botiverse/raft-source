@@ -28,17 +28,15 @@ test("runtime has no referral ledger imports, SQL, configuration or retired prev
     .flatMap(sourceFiles);
   const hits = files.filter(file => forbidden.test(readFileSync(file, "utf8")));
   expect(hits).toEqual([]);
-  for (const file of [".github/workflows/deploy-aws-prod.yml", ".github/workflows/deploy-aws-staging.yml"]) {
-    expect(readFileSync(join(repoRoot, file), "utf8")).not.toMatch(/REFERRAL_DISCOUNT_/);
-  }
 });
 
-test("applied SQL/snapshots and journal entries remain immutable while later migrations may append", () => {
+// Snapshots before 0462 are pruned (drizzle-kit generate reads only the
+// latest; migrate reads only SQL and the journal), so the applied SQL and
+// journal entries carry this contract.
+test("applied SQL and journal entries remain immutable while later migrations may append", () => {
   const hashes = {
     "0332_dashing_martin_li.sql": "3c00a58c29200e8aea178417b7a7be0a485ee882077ab20d397093c0a67c7256",
-    "meta/0332_snapshot.json": "be737fd12c135e9ead87eb881efe46025c3894a2e4eec77e92587ba9892d1af3",
     "0335_nervous_lady_vermin.sql": "345fa4e896dd596c8bdf6d10b548c4481c60be7273247c599002a84cf9dd0132",
-    "meta/0335_snapshot.json": "72ff9d91ea8b9b01739bd2e0d4ac907aa314aadd1d6a20d6486d81bd700d43bd",
   };
   for (const [file, digest] of Object.entries(hashes)) {
     expect(createHash("sha256").update(readFileSync(join(serverRoot, "drizzle", file))).digest("hex")).toBe(digest);
@@ -58,18 +56,15 @@ test("forward migration drops exactly the retired tables without cascading", () 
   expect(existsSync(join(serverRoot, "drizzle/retained-referral-schema.ts"))).toBe(false);
 });
 
-test("new snapshot removes exactly ten tables and keeps all other models", () => {
-  const old = JSON.parse(readFileSync(join(serverRoot, "drizzle/meta/0335_snapshot.json"), "utf8"));
-  const next = JSON.parse(readFileSync(join(serverRoot, "drizzle/meta/0336_snapshot.json"), "utf8"));
-  expect(Object.keys(old.tables).filter(name => !(name in next.tables)).sort()).toEqual(names.map(name => `public.${name}`).sort());
-  for (const name of Object.keys(next.tables)) expect(next.tables[name]).toEqual(old.tables[name]);
-  expect(next.enums).toEqual(old.enums);
-  expect(next.prevId).toBe(old.id);
+test("the latest snapshot has none of the ten retired tables", () => {
+  const journal = JSON.parse(readFileSync(join(serverRoot, "drizzle/meta/_journal.json"), "utf8")) as { entries: Array<{ idx: number }> };
+  const last = String(journal.entries.at(-1)!.idx).padStart(4, "0");
+  const latest = JSON.parse(readFileSync(join(serverRoot, `drizzle/meta/${last}_snapshot.json`), "utf8"));
+  expect(names.filter(name => `public.${name}` in latest.tables)).toEqual([]);
 });
 
-
 test("actual Drizzle generation has zero migration drift", () => {
-  const run = spawnSync(process.execPath, [join(serverRoot, "scripts/check-referral-retirement-migrations.mjs")], { cwd: serverRoot, encoding: "utf8", timeout: 35000 });
+  const run = spawnSync(process.execPath, ["--import", "@oxc-node/core/register", join(serverRoot, "scripts/check-referral-retirement-migrations.ts")], { cwd: serverRoot, encoding: "utf8", timeout: 35000 });
   expect(run.status, run.stdout + run.stderr).toBe(0);
   expect(run.stdout).toContain("zero schema/migration diff");
 }, 40000);

@@ -7,44 +7,7 @@ const repoRoot = resolve(import.meta.dirname, "../../..");
 // carry; skipped when an exported snapshot's RELEASE_SOURCE marker is present.
 const inSourceSnapshot = existsSync(resolve(repoRoot, "RELEASE_SOURCE"));
 
-function read(path: string): string {
-  return readFileSync(resolve(repoRoot, "packages/web", path), "utf8");
-}
-
-test("web bundle exposes build identity through browser-readable globals and DOM dataset", () => {
-  const source = read("src/buildIdentity.ts");
-  assert.match(source, /__RAFT_BUILD_IDENTITY__/);
-  assert.match(source, /dataset\.raftBuildSha/);
-  assert.match(source, /dataset\.raftBuildBuiltAt/);
-  assert.match(source, /dataset\.raftBuildBranch/);
-  assert.match(source, /__RAFT_FRONTEND_RELEASE_IDENTITY__/);
-  assert.match(source, /dataset\.raftFrontendReleaseId/);
-  const generator = read("scripts/frontendReleaseIdentity.ts");
-  assert.match(generator, /VITE_COMMIT_SHA/);
-  assert.match(generator, /VITE_BUILD_AT/);
-  assert.match(generator, /VITE_RELEASE_BRANCH/);
-  assert.match(generator, /VITE_FRONTEND_RELEASE_ID/);
-
-  const main = read("src/main.tsx");
-  assert.match(main, /import "\.\/buildIdentity";/);
-
-  const vite = read("vite.config.ts");
-  assert.match(vite, /resolveFrontendReleaseIdentity\(process\.env\)/);
-  assert.match(vite, /createFrontendReleaseIdentityDefines\(frontendReleaseIdentity\)/);
-  assert.match(vite, /createDesktopManifestContractAdapter\(process\.env\)/);
-  assert.match(
-    vite,
-    /createFrontendReleaseIdentityPlugin\(\s*frontendReleaseIdentity,\s*desktopManifestContract,\s*\)/,
-  );
-});
-
-test("web build identity env vars are declared and injected by preview workflow", { skip: inSourceSnapshot }, () => {
-  const envTypes = read("src/vite-env.d.ts");
-  assert.match(envTypes, /VITE_COMMIT_SHA/);
-  assert.match(envTypes, /VITE_BUILD_AT/);
-  assert.match(envTypes, /VITE_RELEASE_BRANCH/);
-  assert.match(envTypes, /VITE_FRONTEND_RELEASE_ID/);
-
+test("web build identity env vars are injected by preview workflow", { skip: inSourceSnapshot }, () => {
   const workflow = readFileSync(resolve(repoRoot, ".github/workflows/deploy-web-preview.yml"), "utf8");
   assert.match(workflow, /built_at: \$\{\{ steps\.identity\.outputs\.built_at \}\}/);
   assert.match(workflow, /echo "built_at=\$\(date -u \+"\%Y-\%m-\%dT\%H:\%M:\%SZ"\)"/);

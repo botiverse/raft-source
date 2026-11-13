@@ -54,6 +54,32 @@ test("writes only validated sanitized snapshots and classifies freshness", async
   assert.deepEqual((await staleService.read("machine-1", "codex")).state, "stale");
 });
 
+test("stores and serves each window's scope as the Computer sent it", async () => {
+  const backend = makeBackend();
+  const service = new RuntimeAccountUsageCacheService(backend, () => Date.parse("2026-08-02T02:20:00.000Z"));
+  const windows = [
+    { id: "w0_aaaaaaaaaaaa", label: "Current week (all models)", status: "ok", usedRatio: 0.6, scope: { kind: "account" } },
+    { id: "w1_bbbbbbbbbbbb", label: "Current week (Opus)", status: "limit_reached", usedRatio: 1, scope: { kind: "model", name: "Opus" } },
+    { id: "w2_cccccccccccc", label: "Current week (OAuth apps)", status: "ok", usedRatio: 0.1 },
+  ];
+  const sent = snapshot({ provider: "claude", accounts: [{ accountKey: "b".repeat(64), health: "ok", windows }] });
+  assert.ok(await service.write("machine-1", sent));
+  const read = await service.read("machine-1", "claude");
+  assert.deepEqual(read.snapshot?.accounts[0]?.windows, windows);
+});
+
+test("stores and serves a models scope (Antigravity's model groups) as the Computer sent it", async () => {
+  const backend = makeBackend();
+  const service = new RuntimeAccountUsageCacheService(backend, () => Date.parse("2026-08-02T02:20:00.000Z"));
+  const windows = [
+    { id: "w0_aaaaaaaaaaaa", label: "Gemini Models · Weekly", status: "limit_reached", usedRatio: 1, scope: { kind: "models", name: "Gemini Models" } },
+    { id: "w1_bbbbbbbbbbbb", label: "Claude and GPT models · 5h", status: "ok", usedRatio: 0.2, scope: { kind: "models", name: "Claude and GPT models" } },
+  ];
+  const sent = snapshot({ provider: "antigravity", accounts: [{ accountKey: "b".repeat(64), health: "ok", windows }] });
+  assert.ok(await service.write("machine-1", sent));
+  assert.deepEqual((await service.read("machine-1", "antigravity")).snapshot?.accounts[0]?.windows, windows);
+});
+
 test("rejects extra/raw fields instead of caching them", async () => {
   const backend = makeBackend();
   const service = new RuntimeAccountUsageCacheService(backend);

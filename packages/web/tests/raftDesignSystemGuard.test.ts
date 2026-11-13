@@ -42,7 +42,7 @@ function offenders(pattern: RegExp, allow: (rel: string, match: string) => boole
 }
 
 // Crash and stale-build screens must render without the design system, so
-// their literal styling is reviewed separately (scripts/check-color-tokens.mjs).
+// their literal styling is reviewed separately (scripts/check-color-tokens.ts).
 const STANDALONE_FALLBACKS = new Set([
   "src/components/errors/AppUpdateGate.tsx",
   "src/components/errors/RootErrorFallback.tsx",
@@ -51,8 +51,6 @@ const STANDALONE_FALLBACKS = new Set([
 test("no class is scoped to a theme family that no longer exists", () => {
   assert.deepEqual(offenders(/(?:^|[\s"'`{])(?:theme-brutal|theme-elegant):[^\s"'`}]+/g), []);
   assert.deepEqual(offenders(/in-data-\[theme=(?:brutal|elegant)\]/g), []);
-  const css = readFileSync(resolve(webRoot, "src/index.css"), "utf8");
-  assert.doesNotMatch(css, /@custom-variant theme-brutal|\[data-theme="(?:brutal|elegant)"\]/);
 });
 
 test("components do not branch on a theme family", () => {
@@ -73,15 +71,11 @@ test("legacy brutal palette and geometry classes are gone", () => {
 test("legacy composition classes are gone; controls come from raft-ui", () => {
   const legacyClasses = /(?<![\w-])(?:btn-brutal(?:-sm)?|btn-flat-sm|card-brutal|input-brutal)(?![\w-])/g;
   assert.deepEqual(offenders(legacyClasses), []);
-  const css = readFileSync(resolve(webRoot, "src/index.css"), "utf8");
-  assert.doesNotMatch(css, /\.(?:btn-brutal|btn-flat-sm|card-brutal|input-brutal)\b/);
 });
 
 test("the shell names no theme family; only the mode varies", () => {
   // raft-ui has no family axis, so the app keeps no family constant to pass.
   assert.deepEqual(offenders(/\b(?:APP_THEME_FAMILY|FEEDBACK_THEME_FAMILY)\b/g), []);
-  // The standalone feedback bundle (it may not import app startup) hands the
-  // SDK its style through the one shared constant.
-  const feedbackTheme = readFileSync(resolve(webRoot, "src/feedback/feedbackSdkTheme.ts"), "utf8");
-  assert.match(feedbackTheme, /export const FEEDBACK_SDK_THEME\b/);
+  // The feedback SDK (hands-feedback-react >= 0.5) takes no style prop at all.
+  assert.deepEqual(offenders(/\bFEEDBACK_SDK_THEME\b/g), []);
 });

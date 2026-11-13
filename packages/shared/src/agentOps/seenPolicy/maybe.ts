@@ -4,7 +4,7 @@
 // CLI's synchronous callers and an awaiting caller run the same code in the
 // same order.
 
-import type { MaybePromise } from "./store";
+import type { MaybePromise } from "../../maybePromise";
 
 export function isPromise<T>(value: MaybePromise<T>): value is Promise<T> {
   return typeof value === "object" && value !== null && typeof (value as { then?: unknown }).then === "function";

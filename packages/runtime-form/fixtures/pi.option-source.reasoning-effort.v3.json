@@ -1,0 +1,52 @@
+{
+  "protocolVersion": 1,
+  "runtimeId": "pi",
+  "schemaVersion": "pi.create.v1",
+  "sourceId": "reasoningEffort",
+  "kind": "dependent_select",
+  "pointer": "/reasoningEffort",
+  "dependsOn": "/model",
+  "optionsByValue": {
+    "default": [
+      {
+        "value": "",
+        "label": "Default"
+      },
+      {
+        "value": "off",
+        "label": "No reasoning"
+      },
+      {
+        "value": "minimal",
+        "label": "Minimal"
+      },
+      {
+        "value": "low",
+        "label": "Low"
+      },
+      {
+        "value": "medium",
+        "label": "Medium"
+      },
+      {
+        "value": "high",
+        "label": "High"
+      },
+      {
+        "value": "xhigh",
+        "label": "Extra high"
+      },
+      {
+        "value": "max",
+        "label": "Max"
+      }
+    ]
+  },
+  "defaultValueByValue": {
+    "default": ""
+  },
+  "customValueAllowedByValue": {},
+  "status": "fallback",
+  "reason": "missing_config",
+  "retryable": false
+}

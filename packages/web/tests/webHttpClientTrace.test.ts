@@ -3,7 +3,9 @@ import { parseTraceparent } from "@botiverse/raft-shared";
 import axios, { AxiosError, CanceledError } from "axios";
 import type { InternalAxiosRequestConfig } from "axios";
 import api from "../src/api/client";
+import type { CompletedTraceSpan } from "@botiverse/raft-shared";
 import {
+  __setWebHttpClientTraceSinkForTest,
   attachWebHttpClientTrace,
   finishWebHttpClientTrace,
   forwardHttpDiagnosticAttrs,
@@ -633,5 +635,36 @@ test("shared web API client still sends when tracing context generation fails", 
     storage.restore();
     if (originalCrypto) Object.defineProperty(globalThis, "crypto", originalCrypto);
     else Reflect.deleteProperty(globalThis, "crypto");
+  }
+});
+
+test("the polled reads' HTTP spans carry tab.visibility from the page's state at send time; other requests do not", () => {
+  const spans: CompletedTraceSpan[] = [];
+  __setWebHttpClientTraceSinkForTest({ record: (span) => void spans.push(span) });
+  const original = Object.getOwnPropertyDescriptor(globalThis, "document");
+  let visibility: DocumentVisibilityState = "visible";
+  Object.defineProperty(globalThis, "document", { configurable: true, value: { get visibilityState() { return visibility; } } });
+  const send = (url: string) => {
+    const config = { method: "get", url, headers: {} as Record<string, unknown> };
+    attachWebHttpClientTrace(config);
+    // The page hides while the request is out: the span keeps the state at send.
+    const atSend = visibility;
+    visibility = "visible";
+    finishWebHttpClientTrace(config, { statusCode: 200 });
+    visibility = atSend;
+  };
+  try {
+    send("/integrations/permission-updates");
+    send("/messages/sync?since_seq=5&limit=200&channel_id=c-1");
+    visibility = "hidden";
+    send("/channels/joint-invites");
+    send("/servers/server-1/seat-join-blocks");
+    send("/channels");
+    assert.deepEqual(spans.map((span) => span.attrs?.["tab.visibility"]), ["visible", "visible", "hidden", "hidden", undefined]);
+    assert.equal(spans.every((span) => span.name === "web.http.client"), true);
+  } finally {
+    if (original) Object.defineProperty(globalThis, "document", original);
+    else Reflect.deleteProperty(globalThis, "document");
+    __setWebHttpClientTraceSinkForTest(null);
   }
 });

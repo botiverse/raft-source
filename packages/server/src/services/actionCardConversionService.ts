@@ -1,6 +1,8 @@
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { currentDate, type ActionCardAction, type ActionCardMetadata } from "@botiverse/raft-shared";
 import { type DatabaseExecutor, type DatabaseTransaction } from "../db/index";
+import { assertActionCardNotExpired, type ActionCardPreparedFacts } from "./actionCardExpiry";
+import { withStoredActionCardSpec } from "./actionCardPresentation";
 import {
   actionCards,
   channels,
@@ -14,19 +16,33 @@ import {
   resolveChannelConversionLockTarget,
 } from "./channelConversionFenceService";
 
-/** The eight schema arms are intentionally closed. Unknown future cards must
+/** The schema arms are intentionally closed. Unknown future cards must
  * fail closed at the execution boundary until they get a conversion policy. */
 export const ACTION_CARD_CONVERSION_SCHEMA_POLICY: {
   [K in ActionCardAction["type"]]: "live" | "legacy_disabled";
 } = {
   "channel:create": "live",
   "agent:create": "live",
+  // As agent:create: the migration dialog's own route runs it, after a reconfirm like any other card.
+  "agent:migrate": "live",
   "channel:add_member": "live",
   "integration:approve_agent_login": "live",
   "integration:install_marketplace_app": "live",
   "integration:register_app": "live",
   "integration:update_app_registration": "legacy_disabled",
   "integration:recover_app_owner": "live",
+  // Fail-closed until someone decides what channel conversion should do with a pending connection
+  // card. This file's own rule: "Unknown future cards must fail closed at the execution boundary
+  // until they get a conversion policy." Marking it live to make a typecheck pass would be exactly
+  // the silent widening that rule exists to prevent.
+  "integration:connect_mcp": "legacy_disabled",
+  "feedback:submit": "live",
+  // No execution boundary to fail closed: the card only opens the upgrade
+  // dialog. It freezes and asks for reconfirmation like any other card.
+  "plan:upgrade": "live",
+  // Nothing leaves Raft when it is answered (its form handler records the
+  // answers): it freezes and asks for reconfirmation like any other card.
+  "question:ask": "live",
 };
 
 export const ACTION_CARD_CONVERSION_SCHEMA_TYPES = Object.freeze(
@@ -50,6 +66,7 @@ let actionCardConversionMutationForTest: ActionCardConversionMutationForTest | n
 let beforeLockedConfirmationReadForTest:
   | ((tx: DatabaseExecutor, messageId: string) => Promise<void>)
   | null = null;
+let betweenActionCardFreezeReadAndWriteForTest: (() => Promise<void>) | null = null;
 
 const actionCardSourceLockAuthorityBrand: unique symbol = Symbol("action-card-source-lock-authority");
 
@@ -102,6 +119,18 @@ export function setBeforeLockedActionCardConfirmationReadForTest(
   beforeLockedConfirmationReadForTest = hook;
 }
 
+/**
+ * Runs inside a conversion's freeze, after it read the cards it freezes and
+ * before it writes them: where a withdraw or an expiry would land if it did
+ * not wait for the source lock (actionCardFormSubmit.realPg.test.ts).
+ */
+export function setBetweenActionCardFreezeReadAndWriteForTest(hook: (() => Promise<void>) | null): void {
+  if (process.env.NODE_ENV !== "test") {
+    throw new Error("action-card conversion hooks are test-only");
+  }
+  betweenActionCardFreezeReadAndWriteForTest = hook;
+}
+
 export class ActionCardConversionFrozenError extends Error {
   readonly status = 409 as const;
   readonly code = "action_card_conversion_frozen" as const;
@@ -117,7 +146,7 @@ export class ActionCardReconfirmationRequiredError extends Error {
   readonly code = "action_card_reconfirmation_required" as const;
 
   constructor() {
-    super("This action card must be explicitly reconfirmed in the converted Joint channel before it can execute.");
+    super("Confirm this action card again before it runs. Other servers connected to this channel after it was created.");
     this.name = "ActionCardReconfirmationRequiredError";
   }
 }
@@ -146,6 +175,20 @@ export class ActionCardConfirmationVersionMismatchError extends Error {
     super("This action card confirmation is stale; reconfirm the card and retry.");
     this.name = "ActionCardConfirmationVersionMismatchError";
   }
+}
+
+/** A card-writability refusal from assertActionCardWritable*: an expected 409, not a server fault. */
+export type ActionCardConversionError =
+  | ActionCardConversionFrozenError
+  | ActionCardReconfirmationRequiredError
+  | ActionCardConfirmationRequiredError
+  | ActionCardConfirmationVersionMismatchError;
+
+export function isActionCardConversionError(err: unknown): err is ActionCardConversionError {
+  return err instanceof ActionCardConversionFrozenError
+    || err instanceof ActionCardReconfirmationRequiredError
+    || err instanceof ActionCardConfirmationRequiredError
+    || err instanceof ActionCardConfirmationVersionMismatchError;
 }
 
 export type ConversionActionCardJob = {
@@ -221,6 +264,7 @@ export async function freezeActionCardsForConversion(
   job: ConversionActionCardJob,
 ): Promise<number> {
   const rows = await actionCardScopeRows(tx, job.sourceChannelId);
+  await betweenActionCardFreezeReadAndWriteForTest?.();
   let changed = 0;
   for (const row of rows) {
     if (row.freezeState !== "ready" && row.freezeState !== "frozen") continue;
@@ -325,9 +369,15 @@ export async function resolveActionCardSourceChannelId(
   return typeof row?.sourceChannelId === "string" ? row.sourceChannelId : null;
 }
 
-/** Same-transaction execution/dialog/regular-writer gate. */
+/**
+ * Same-transaction execution/dialog/regular-writer gate. `serverId` is the
+ * request's server: a card that acts on another server (action_cards.server_id)
+ * is refused exactly like a missing card, so a caller cannot probe the state of
+ * another server's card by its message id.
+ */
 export async function assertActionCardWritableInTransaction(
   tx: DatabaseExecutor,
+  serverId: string,
   messageId: string,
   expectedConfirmationVersion?: number,
   options: {
@@ -341,7 +391,7 @@ export async function assertActionCardWritableInTransaction(
     conversionEpoch: actionCards.conversionEpoch,
     serverId: actionCards.serverId,
     carrierChannelId: messages.channelId,
-  }).from(actionCards).innerJoin(messages, eq(messages.id, actionCards.messageId)).where(eq(actionCards.messageId, messageId)).limit(1);
+  }).from(actionCards).innerJoin(messages, eq(messages.id, actionCards.messageId)).where(and(eq(actionCards.messageId, messageId), eq(actionCards.serverId, serverId))).limit(1);
   if (!initial) throw new ActionCardConversionFrozenError();
   const target = initial.sourceChannelId
     ? { serverId: initial.serverId, sourceChannelId: initial.sourceChannelId }
@@ -363,7 +413,7 @@ export async function assertActionCardWritableInTransaction(
     conversionJobId: actionCards.conversionJobId,
     serverId: actionCards.serverId,
     carrierChannelId: messages.channelId,
-  }).from(actionCards).innerJoin(messages, eq(messages.id, actionCards.messageId)).where(eq(actionCards.messageId, messageId)).limit(1);
+  }).from(actionCards).innerJoin(messages, eq(messages.id, actionCards.messageId)).where(and(eq(actionCards.messageId, messageId), eq(actionCards.serverId, serverId))).limit(1);
   if (!row) throw new ActionCardConversionFrozenError();
   if (target && row.sourceChannelId && row.sourceChannelId !== target.sourceChannelId) {
     throw new ActionCardConversionFrozenError(row.conversionEpoch);
@@ -469,10 +519,10 @@ export async function lockActionCardSourceInTransaction(
   return sourceLockAuthorityForTarget(target);
 }
 
-export async function assertActionCardWritable(messageId: string, confirmationVersion?: number): Promise<void> {
+export async function assertActionCardWritable(serverId: string, messageId: string, confirmationVersion?: number): Promise<void> {
   const { getDb } = await import("../db/index");
   await getDb().transaction(async (tx) => {
-    await assertActionCardWritableInTransaction(tx, messageId, confirmationVersion);
+    await assertActionCardWritableInTransaction(tx, serverId, messageId, confirmationVersion);
   });
 }
 
@@ -496,7 +546,7 @@ export async function getActionCardConversionContext(
 export async function reconfirmActionCard(
   tx: DatabaseTransaction,
   args: { messageId: string; userId: string },
-): Promise<{ metadata: ActionCardMetadata; confirmationVersion: number }> {
+): Promise<{ metadata: ActionCardMetadata; confirmationVersion: number; card: ActionCardPreparedFacts }> {
   const [row] = await tx.select({
     id: actionCards.id,
     state: actionCards.state,
@@ -520,10 +570,15 @@ export async function reconfirmActionCard(
     freezeState: actionCards.freezeState,
     sourceChannelId: actionCards.conversionSourceChannelId,
     conversionEpoch: actionCards.conversionEpoch,
+    actionType: actionCards.actionType,
+    requesterUserId: actionCards.requesterUserId,
+    createdAt: actionCards.createdAt,
     actionMetadata: messages.actionMetadata,
   }).from(actionCards).innerJoin(messages, eq(messages.id, actionCards.messageId)).where(eq(actionCards.messageId, args.messageId)).limit(1);
   if (!fresh || fresh.sourceChannelId !== row.sourceChannelId) throw new ActionCardConversionFrozenError();
   if (fresh.freezeState !== "reconfirm_required") throw new ActionCardConversionFrozenError();
+  // Confirming again would only re-open a card no path may complete any more.
+  if (fresh.state === "prepared") assertActionCardNotExpired(fresh);
   const [source] = await tx.select({ type: channels.type }).from(channels).where(eq(channels.id, fresh.sourceChannelId)).limit(1);
   if (!source || source.type !== "joint") throw new ActionCardConversionFrozenError();
   const fence = await getActiveChannelConversionFence(tx, fresh.sourceChannelId);
@@ -536,10 +591,12 @@ export async function reconfirmActionCard(
     updatedAt: currentDate(),
   }).where(and(eq(actionCards.id, row.id), eq(actionCards.freezeState, "reconfirm_required"))).returning({ confirmationVersion: actionCards.confirmationVersion });
   if (!updated) throw new ActionCardReconfirmationRequiredError();
-  const metadata = cardMetadataWithState(fresh.actionMetadata, "prepared", {
+  // A card stored before cards carried `presentation.card` gets one here, like any read of it.
+  const metadata = withStoredActionCardSpec(cardMetadataWithState(fresh.actionMetadata, "prepared", {
     reconfirmedAt: currentDate().toISOString(),
     confirmationVersion: updated.confirmationVersion,
-  }) as ActionCardMetadata;
+  })) as ActionCardMetadata;
   await tx.update(messages).set({ actionMetadata: metadata, updatedAt: currentDate() }).where(eq(messages.id, args.messageId));
-  return { metadata, confirmationVersion: updated.confirmationVersion };
+  // What the route serves the card with (servedActionCardMetadata); never stored.
+  return { metadata, confirmationVersion: updated.confirmationVersion, card: { createdAt: fresh.createdAt, requesterUserId: fresh.requesterUserId } };
 }

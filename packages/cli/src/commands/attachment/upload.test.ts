@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { CliError } from "../../core/errors";
+import { renderError } from "../../core/renderer";
 import {
   AttachmentUploadArgError,
   MAX_ATTACHMENT_UPLOAD_BYTES,
@@ -14,6 +15,7 @@ import {
   validateUploadFileSize,
 } from "./upload";
 import { globalFetchJsonTransport, setJsonTransportForTests } from "../../client";
+import { ATTACHMENT_UPLOAD_MAX_SIZE_BYTES } from "@botiverse/raft-shared/src/agentCliSurface";
 import { afterEach, beforeEach } from "vitest";
 // These tests stub globalThis.fetch; route the client's JSON transport (node:http
 // in production) through it.
@@ -160,7 +162,7 @@ test("attachment upload preserves server quota error code and next action", asyn
             data: null,
             error: "Monthly file upload quota exceeded. Free includes 100 MB of file uploads per month; upgrade to Pro for higher file upload limits.",
             errorCode: "FILE_UPLOAD_QUOTA_EXCEEDED",
-            suggestedNextAction: "Ask a server owner to open Settings > Billing and upgrade to Pro: https://app.example.test/s/team/settings/billing",
+            suggestedNextAction: "Say in the conversation that the file wasn't uploaded and why. If upgrading to Pro would help the person here, you can suggest that a server owner look at Settings > Billing: https://app.example.test/s/team/settings/billing",
           };
         },
       }),
@@ -176,7 +178,7 @@ test("attachment upload preserves server quota error code and next action", asyn
         assert.match(err.message, /Monthly file upload quota exceeded/);
         assert.equal(
           err.suggestedNextAction,
-          "Ask a server owner to open Settings > Billing and upgrade to Pro: https://app.example.test/s/team/settings/billing",
+          "Say in the conversation that the file wasn't uploaded and why. If upgrading to Pro would help the person here, you can suggest that a server owner look at Settings > Billing: https://app.example.test/s/team/settings/billing",
         );
         return true;
       },
@@ -469,6 +471,173 @@ test("attachment upload completes once after a lost PUT response recovers as 412
       "POST /internal/agent-api/attachment-upload-sessions",
       "POST /internal/agent-api/attachment-upload-sessions/33333333-3333-4333-8333-333333333333/complete",
     ]);
+    assert.match(output, /Attachment ID: 44444444-4444-4444-8444-444444444444/);
+  } finally {
+    globalThis.fetch = originalFetch;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// A file over the plan's limit that an upload session can still declare is
+// declared, so the server can say why it is refused (on Free: how to offer an
+// upgrade card); the refusal keeps the CLI's own wording.
+function overLimitUploadCtx(sessionResponse: Record<string, unknown> | null, requests: string[]) {
+  return {
+    io: {
+      stdout: { write: (_value: string) => true },
+      stderr: { write: () => true },
+    },
+    loadAgentContext: () => ({
+      agentId: "agent-1",
+      token: "sk_agent_test",
+      serverUrl: "https://api.example.test",
+      clientMode: "self-hosted-runner",
+      secretSource: "profile-credential-file",
+      activeCapabilities: null,
+    }),
+    createApiClient: () => ({
+      request: async (method: string, pathname: string, body?: unknown) => {
+        requests.push(`${method} ${pathname}`);
+        if (pathname === "/internal/agent-api/attachment-upload-capabilities") {
+          return { ok: true, status: 200, data: { directUploadEnabled: false, directUploadThresholdBytes: null, maxBytes: 4, sessionExpiresInSeconds: null }, error: null };
+        }
+        if (pathname === "/internal/agent-api/resolve-channel") {
+          return { ok: true, status: 200, data: { channelId: "11111111-1111-4111-8111-111111111111" }, error: null };
+        }
+        if (pathname === "/internal/agent-api/attachment-upload-sessions" && sessionResponse) {
+          assert.equal((body as { sizeBytes: number }).sizeBytes, 5, "declares the file's size, uploads nothing");
+          return sessionResponse;
+        }
+        if (pathname.endsWith("/complete")) {
+          return { ok: true, status: 200, data: { uploadId: "33333333-3333-4333-8333-333333333333", state: "completed", attachment: { id: "44444444-4444-4444-8444-444444444444", filename: "report.txt", mimeType: "text/plain", sizeBytes: 5, thumbnailUrl: null } }, error: null };
+        }
+        throw new Error(`Unexpected request ${method} ${pathname}`);
+      },
+      requestMultipart: async () => {
+        throw new Error("an over-limit file is never sent");
+      },
+    }),
+  };
+}
+
+test("attachment upload declares a file over the plan limit and keeps the server's next action for it", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "raft-attachment-upload-over-limit-"));
+  const filePath = path.join(dir, "report.txt");
+  fs.writeFileSync(filePath, "hello");
+  // The server's next action on Free (agentUpgradeCardHint): a sentence, then a heredoc to run as it is.
+  const hint = [
+    "The file was not uploaded: this server is on the Free plan and the file is over the Free plan's per-file limit. Pro would take it. Say in the conversation that the file wasn't uploaded and why, then offer an upgrade card unless that is clearly out of place here (put what the file is for in place of the <…>):",
+    "raft action prepare --target \"#general\" <<'RAFTACTION'",
+    "{\"type\":\"plan:upgrade\",\"gate\":\"upload_file_size\",\"reason\":\"<one sentence: what the file is for>\"}",
+    "RAFTACTION",
+  ].join("\n");
+  const requests: string[] = [];
+  const stderr: string[] = [];
+  try {
+    const ctx = overLimitUploadCtx({
+      ok: false,
+      status: 413,
+      data: null,
+      error: "Max 50MB per file",
+      errorCode: "ATTACHMENT_TOO_LARGE",
+      suggestedNextAction: hint,
+    }, requests);
+    await assert.rejects(
+      async () => { await attachmentUploadCommand.handler(ctx as never, { path: filePath, target: "#general" }); },
+      (err: unknown) => {
+        assert.ok(err instanceof CliError);
+        assert.equal(err.code, "INVALID_ARG");
+        assert.equal(err.message, "--path is 5B; max upload size is 4B");
+        assert.equal(err.suggestedNextAction, hint);
+        renderError({ stdout: { write: () => true }, stderr: { write: (chunk: string | Uint8Array) => { stderr.push(String(chunk)); return true; } } }, err);
+        return true;
+      },
+    );
+    assert.deepEqual(requests, [
+      "GET /internal/agent-api/attachment-upload-capabilities",
+      "POST /internal/agent-api/resolve-channel",
+      "POST /internal/agent-api/attachment-upload-sessions",
+    ]);
+    // Printed under "Next action:" with the heredoc's lines unindented, so its delimiter closes it when run.
+    assert.equal(stderr.join(""), [
+      "Error: --path is 5B; max upload size is 4B",
+      "Code: INVALID_ARG",
+      "Next action: The file was not uploaded: this server is on the Free plan and the file is over the Free plan's per-file limit. Pro would take it. Say in the conversation that the file wasn't uploaded and why, then offer an upgrade card unless that is clearly out of place here (put what the file is for in place of the <…>):",
+      "raft action prepare --target \"#general\" <<'RAFTACTION'",
+      "{\"type\":\"plan:upgrade\",\"gate\":\"upload_file_size\",\"reason\":\"<one sentence: what the file is for>\"}",
+      "RAFTACTION",
+      "",
+    ].join("\n"));
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("attachment upload refuses an over-limit file as before when the server does not explain it", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "raft-attachment-upload-over-limit-old-"));
+  const filePath = path.join(dir, "report.txt");
+  fs.writeFileSync(filePath, "hello");
+  try {
+    // An older server (direct uploads off answer 404 before any size check),
+    // or a proxy failure: the local refusal, and only a 413's next action is the file's.
+    for (const answer of [
+      { ok: false, status: 404, data: null, error: "HTTP 404", errorCode: "UPLOAD_SESSION_NOT_FOUND", suggestedNextAction: "not about this file" },
+      { ok: false, status: 502, data: null, error: "proxy failed", errorCode: "agent_proxy_failed" },
+    ]) {
+      const ctx = overLimitUploadCtx(answer, []);
+      await assert.rejects(
+        async () => { await attachmentUploadCommand.handler(ctx as never, { path: filePath, target: "#general" }); },
+        (err: unknown) => {
+          assert.ok(err instanceof CliError);
+          assert.equal(err.code, "INVALID_ARG", `status ${answer.status}`);
+          assert.equal(err.message, "--path is 5B; max upload size is 4B");
+          assert.equal(err.suggestedNextAction, undefined);
+          return true;
+        },
+      );
+    }
+
+    // Larger than any upload session can declare: refused before any request names the conversation.
+    fs.truncateSync(filePath, ATTACHMENT_UPLOAD_MAX_SIZE_BYTES + 1);
+    const tooLargeForAnyPlan: string[] = [];
+    await assert.rejects(
+      async () => {
+        await attachmentUploadCommand.handler(overLimitUploadCtx(null, tooLargeForAnyPlan) as never, { path: filePath, target: "#general" });
+      },
+      (err: unknown) => err instanceof CliError && err.code === "INVALID_ARG" && /max upload size is 4B$/.test(err.message),
+    );
+    assert.deepEqual(tooLargeForAnyPlan, ["GET /internal/agent-api/attachment-upload-capabilities"]);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("attachment upload sends a declared over-limit file through the session the server took", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "raft-attachment-upload-over-limit-taken-"));
+  const filePath = path.join(dir, "report.txt");
+  fs.writeFileSync(filePath, "hello");
+  const originalFetch = globalThis.fetch;
+  let puts = 0;
+  try {
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      puts += 1;
+      assert.equal(String(input), "https://r2.example.test/presigned-secret");
+      assert.equal(init?.method, "PUT");
+      return new Response(null, { status: 200 });
+    }) as typeof fetch;
+    // The plan changed since the capabilities read (maxBytes 4, direct uploads off): the server takes the file.
+    const requests: string[] = [];
+    const ctx = overLimitUploadCtx({ ok: true, status: 201, data: { uploadId: "33333333-3333-4333-8333-333333333333", attachmentId: "44444444-4444-4444-8444-444444444444", state: "pending", expiresAt: "2026-07-27T08:00:00.000Z", upload: { method: "PUT", url: "https://r2.example.test/presigned-secret", headers: { "Content-Type": "text/plain", "If-None-Match": "*" } } }, error: null }, requests);
+    let output = "";
+    ctx.io.stdout.write = (value: string) => { output += value; return true; };
+    await attachmentUploadCommand.handler(ctx as never, { path: filePath, target: "#general" });
+    assert.equal(puts, 1);
+    assert.deepEqual(requests, [
+      "GET /internal/agent-api/attachment-upload-capabilities",
+      "POST /internal/agent-api/resolve-channel",
+      "POST /internal/agent-api/attachment-upload-sessions",
+      "POST /internal/agent-api/attachment-upload-sessions/33333333-3333-4333-8333-333333333333/complete",
+    ], "one session, never multipart");
     assert.match(output, /Attachment ID: 44444444-4444-4444-8444-444444444444/);
   } finally {
     globalThis.fetch = originalFetch;

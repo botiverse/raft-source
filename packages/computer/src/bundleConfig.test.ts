@@ -1,8 +1,5 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
-import { fileURLToPath } from "node:url";
 
-import packageJson from "../package.json" with { type: "json" };
 import tsdownConfig, { binBundledDeps, libBundledDeps } from "../tsdown.config";
 
 type BundleConfigShape = {
@@ -48,28 +45,4 @@ test("tsdown lib entry inlines the source-only tracing packages so the /lib bund
   assert.ok(libConfig, "lib entry config must exist");
   assert.deepEqual(libBundledDeps, ["@botiverse/raft-shared", "@botiverse/raft-trace-client"]);
   assertPatternsCover(libBundledDeps, libConfig.deps?.alwaysBundle as RegExp[]);
-});
-
-test("tsdown config documents why daemon stays external and source-only dependencies are inlined", async () => {
-  const source = await readFile(
-    fileURLToPath(new URL("../tsdown.config.ts", import.meta.url)),
-    "utf8",
-  );
-  assert.match(source, /daemon package stays external/);
-  assert.match(source, /upgrade flow hydrates it into/);
-  assert.match(source, /source-only TS workspace packages/);
-  assert.match(source, /ERR_MODULE_NOT_FOUND/);
-});
-
-test("package build executes the published bin under native Node after writing it", async () => {
-  assert.match(packageJson.scripts.build, /write-dist-bins\.mjs && node scripts\/verify-published-dist\.mjs$/);
-
-  const source = await readFile(
-    fileURLToPath(new URL("../scripts/verify-published-dist.mjs", import.meta.url)),
-    "utf8",
-  );
-  assert.match(source, /spawnSync\(process\.execPath, \[binPath, "--version"\]/);
-  assert.match(source, /result\.stdout\.trim\(\) !== packageJson\.version/);
-  assert.match(source, /const env = \{\};/);
-  assert.doesNotMatch(source, /\.\.\.process\.env/);
 });

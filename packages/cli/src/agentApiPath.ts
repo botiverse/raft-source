@@ -62,6 +62,7 @@ export function buildAgentApiRoutePath<K extends AgentApiRouteKey>(
 
 interface CliAgentApiHttpClient {
   request<T>(method: string, pathname: string, body?: unknown, options?: { signal?: AbortSignal }): Promise<ApiResponse<T>>;
+  requestRawBody?<T>(method: string, pathname: string, bytes: Uint8Array, contentType?: string): Promise<ApiResponse<T>>;
   requestBinary?(method: string, pathname: string): Promise<BinaryResponse>;
   requestMultipart?<T>(method: string, pathname: string, form: FormData): Promise<ApiResponse<T>>;
 }
@@ -85,22 +86,27 @@ function rawTransportForClient(client: CliAgentApiHttpClient, options?: { signal
         return {
           ok: response.ok,
           status: response.status,
-          data: response.ok ? response.body : null,
+          // A refusal's body reaches the operations, as on the JSON path, so they
+          // can show the Server's sentence and next step for a failed download.
+          data: response.ok ? response.body : (response.errorBody ?? null),
           error: response.error,
           errorCode: response.errorCode,
+          suggestedNextAction: response.suggestedNextAction ?? null,
           proxy: response.proxy,
         };
       }
-      return options
-        ? client.request<unknown>(input.method, input.path, input.body, options)
-        : client.request<unknown>(input.method, input.path, input.body);
+      const response = options
+        ? await client.request<unknown>(input.method, input.path, input.body, options)
+        : await client.request<unknown>(input.method, input.path, input.body);
+      // A refusal's body (`details` and all) reaches the operations, as it does over fetch.
+      return response.ok || response.errorBody === undefined ? response : { ...response, data: response.errorBody };
     },
   };
 }
 
 /** Shared-contract client used by higher-level SDK operations inside the CLI. */
-export function createAgentApiContractSurfaceClient(client: CliAgentApiHttpClient) {
-  return createSharedAgentApiClient(rawTransportForClient(client));
+export function createAgentApiContractSurfaceClient(client: CliAgentApiHttpClient, options?: { signal?: AbortSignal }) {
+  return createSharedAgentApiClient(rawTransportForClient(client, options));
 }
 
 function cliErrorFromRawFailure(failure: AgentApiRawFailure): CliError {
@@ -213,6 +219,8 @@ function apiResponseFromClientResult<K extends AgentApiRouteKey>(
       errorCode: result.error.errorCode,
       suggestedNextAction: result.error.suggestedNextAction,
       proxy: result.error.proxy as ApiResponse<AgentApiResponseByRoute[K]>["proxy"],
+      // A refusal's whole body (`path`, `currentRevision`, `retry_after`, …), for commands that explain it.
+      ...(result.error.response !== undefined ? { errorBody: result.error.response } : {}),
     };
     if (response.status >= 500 && response.errorCode === "agent_proxy_failed") {
       throw apiFailureError(response, "CHECK_FAILED");
@@ -372,12 +380,17 @@ export function createAgentApiClient(client: CliAgentApiHttpClient, agentId: str
         body: AgentApiRequestBodyByRoute["messageReactionRemove"],
       ) =>
         requestClientAsApiResponse(agentApi.messages.removeReaction(params, body)),
+      updateCard: (
+        params: AgentApiRequestParamsByRoute["messageCardUpdate"],
+        body: AgentApiRequestBodyByRoute["messageCardUpdate"],
+      ) =>
+        requestClientAsApiResponse(agentApi.messages.updateCard(params, body)),
     },
     channels: {
       join: (params: AgentApiRequestParamsByRoute["channelJoin"]) =>
         requestClientAsApiResponse(agentApi.channels.join(params)),
-      leave: (params: AgentApiRequestParamsByRoute["channelLeave"]) =>
-        requestClientAsApiResponse(agentApi.channels.leave(params)),
+      leave: (params: AgentApiRequestParamsByRoute["channelLeave"], body: AgentApiRequestBodyByRoute["channelLeave"] = {}) =>
+        requestClientAsApiResponse(agentApi.channels.leave(params, body)),
     },
     mentions: {
       pendingActions: (query?: AgentApiRequestQueryByRoute["mentionActionsPending"]) =>
@@ -398,8 +411,8 @@ export function createAgentApiSurfaceClient(client: CliAgentApiHttpClient, optio
         requestClientAsApiResponse(agentApi.agent.context()),
     },
     server: {
-      info: () =>
-        requestClientAsApiResponse(agentApi.server.info()),
+      info: (query?: AgentApiRequestQueryByRoute["serverInfo"]) =>
+        requestClientAsApiResponse(agentApi.server.info(query)),
       update: (body: AgentApiRequestBodyByRoute["serverUpdate"]) =>
         requestClientAsApiResponse(agentApi.server.update(body)),
     },
@@ -416,6 +429,12 @@ export function createAgentApiSurfaceClient(client: CliAgentApiHttpClient, optio
         requestClientAsApiResponse(agentApi.knowledge.get(query)),
       search: (query: AgentApiRequestQueryByRoute["knowledgeSearch"]) =>
         requestClientAsApiResponse(agentApi.knowledge.search(query)),
+    },
+    context: {
+      search: (body: AgentApiRequestBodyByRoute["contextSearch"]) =>
+        requestClientAsApiResponse(agentApi.context.search(body)),
+      read: (body: AgentApiRequestBodyByRoute["contextRead"]) =>
+        requestClientAsApiResponse(agentApi.context.read(body)),
     },
     tasks: {
       list: (query: AgentApiRequestQueryByRoute["taskList"]) =>
@@ -438,8 +457,24 @@ export function createAgentApiSurfaceClient(client: CliAgentApiHttpClient, optio
         requestClientAsApiResponse(agentApi.tasks.convert(body)),
       amend: (body: AgentApiRequestBodyByRoute["taskAmend"]) =>
         requestClientAsApiResponse(agentApi.tasks.amend(body)),
+      view: (query: AgentApiRequestQueryByRoute["taskView"]) =>
+        requestClientAsApiResponse(agentApi.tasks.view(query)),
+      read: (query: AgentApiRequestQueryByRoute["taskRead"]) =>
+        requestClientAsApiResponse(agentApi.tasks.read(query)),
+      reply: (body: AgentApiRequestBodyByRoute["taskReply"]) =>
+        requestClientAsApiResponse(agentApi.tasks.reply(body)),
+      following: (query: AgentApiRequestQueryByRoute["taskFollowing"] = {}) =>
+        requestClientAsApiResponse(agentApi.tasks.following(query)),
+      follow: (body: AgentApiRequestBodyByRoute["taskFollow"]) =>
+        requestClientAsApiResponse(agentApi.tasks.follow(body)),
+      unfollow: (body: AgentApiRequestBodyByRoute["taskUnfollow"]) =>
+        requestClientAsApiResponse(agentApi.tasks.unfollow(body)),
       history: (query: AgentApiRequestQueryByRoute["taskHistory"]) =>
         requestClientAsApiResponse(agentApi.tasks.history(query)),
+    },
+    migrations: {
+      retry: () =>
+        requestClientAsApiResponse(agentApi.migrations.retry()),
     },
     reminders: {
       list: (query: AgentApiRequestQueryByRoute["reminderList"]) =>
@@ -492,12 +527,17 @@ export function createAgentApiSurfaceClient(client: CliAgentApiHttpClient, optio
         body: AgentApiRequestBodyByRoute["messageReactionRemove"],
       ) =>
         requestClientAsApiResponse(agentApi.messages.removeReaction(params, body)),
+      updateCard: (
+        params: AgentApiRequestParamsByRoute["messageCardUpdate"],
+        body: AgentApiRequestBodyByRoute["messageCardUpdate"],
+      ) =>
+        requestClientAsApiResponse(agentApi.messages.updateCard(params, body)),
     },
     channels: {
       join: (params: AgentApiRequestParamsByRoute["channelJoin"]) =>
         requestClientAsApiResponse(agentApi.channels.join(params)),
-      leave: (params: AgentApiRequestParamsByRoute["channelLeave"]) =>
-        requestClientAsApiResponse(agentApi.channels.leave(params)),
+      leave: (params: AgentApiRequestParamsByRoute["channelLeave"], body: AgentApiRequestBodyByRoute["channelLeave"] = {}) =>
+        requestClientAsApiResponse(agentApi.channels.leave(params, body)),
       mute: (params: AgentApiRequestParamsByRoute["channelMute"]) =>
         requestClientAsApiResponse(agentApi.channels.mute(params, {})),
       unmute: (params: AgentApiRequestParamsByRoute["channelUnmute"]) =>
@@ -522,10 +562,17 @@ export function createAgentApiSurfaceClient(client: CliAgentApiHttpClient, optio
     inbox: {
       list: (query: AgentApiRequestQueryByRoute["inboxList"]) =>
         requestClientAsApiResponse(agentApi.inbox.list(query)),
+      // RFC 081. `read` consumes what it returns (destructive_read): one attempt, never retried.
+      read: (body: AgentApiRequestBodyByRoute["inboxRead"]) =>
+        requestClientAsApiResponse(agentApi.inbox.read(body)),
+      dismiss: (body: AgentApiRequestBodyByRoute["inboxDismiss"]) =>
+        requestClientAsApiResponse(agentApi.inbox.dismiss(body)),
     },
     threads: {
       list: () =>
         requestClientAsApiResponse(agentApi.threads.list()),
+      follow: (body: AgentApiRequestBodyByRoute["threadFollow"]) =>
+        requestClientAsApiResponse(agentApi.threads.follow(body)),
       unfollow: (body: AgentApiRequestBodyByRoute["threadUnfollow"]) =>
         requestClientAsApiResponse(agentApi.threads.unfollow(body)),
     },
@@ -540,8 +587,8 @@ export function createAgentApiSurfaceClient(client: CliAgentApiHttpClient, optio
     integrations: {
       token: (body: AgentApiRequestBodyByRoute["integrationToken"]) =>
         requestClientAsApiResponse(agentApi.integrations.token(body)),
-      list: () =>
-        requestClientAsApiResponse(agentApi.integrations.list()),
+      list: (query: AgentApiRequestQueryByRoute["integrationList"] = {}) =>
+        requestClientAsApiResponse(agentApi.integrations.list(query)),
       marketplace: (query: AgentApiRequestQueryByRoute["integrationMarketplaceSearch"]) =>
         requestClientAsApiResponse(agentApi.integrations.marketplace(query)),
       login: (body: AgentApiRequestBodyByRoute["integrationLogin"]) =>

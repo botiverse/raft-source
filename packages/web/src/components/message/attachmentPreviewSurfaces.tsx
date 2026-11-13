@@ -1,9 +1,10 @@
 import {
   Button,
   Card,
-  CopyableCode,
-  CopyableCodeAction,
-  CopyableCodeRoot,
+  CodeBlock,
+  CodeBlockBody,
+  LOCATED_MS,
+  ScrollArea,
   Spinner,
   Tabs,
   TabsLabel,
@@ -13,16 +14,19 @@ import {
 import CloseButton from "../ui/CloseButton";
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import type { PointerEvent as ReactPointerEvent, ReactNode } from "react";
-import { Download, MessageSquareMore, Music, Plus, X } from "lucide-react";
+import { Music, Plus, X } from "lucide-react";
 import { useIntl } from "react-intl";
 import Banner from "../ui/Banner";
-import Lightbox from "../ui/Lightbox";
+import { XlsxPreviewEmpty } from "./XlsxPreviewEmpty";
 import SandboxedPreviewFrame from "../ui/SandboxedPreviewFrame";
 import CrossOriginPdfFrame from "../ui/CrossOriginPdfFrame";
 import MarkdownContent from "../markdown/MarkdownContent";
 import { createMarkdownOutlineHeadingComponents, extractMarkdownOutline, MarkdownOutlineNav } from "../markdown/MarkdownOutline";
 import AttachmentTooltip from "./attachmentTooltip";
 import { AttachmentCommentsPanel } from "./AttachmentCommentsPanel";
+import { AttachmentCommentMargin } from "./AttachmentCommentMargin";
+import type { AttachmentCommentMarginActions } from "./AttachmentCommentMargin";
+import { useAttachmentComments } from "./useAttachmentComments";
 import {
   captureNodeAnchor,
   captureSelectionAnchor,
@@ -36,12 +40,15 @@ import {
   openAttachmentPreviewExternalLink,
   validateAttachmentPreviewExternalLink,
 } from "./attachmentPreviewExternalLink";
+import LeavingRaftMark from "../ui/LeavingRaftMark";
 import type { AttachmentPreviewExternalLink } from "./attachmentPreviewExternalLink";
 import { createVideoSeekCoalescer } from "./videoTimestampSeekCoalesce";
 import { useAttachmentPreviewBridge } from "./attachmentPreviewBridge";
 import type { DocumentAttachmentPreview } from "./attachmentPreview";
 import type { Message } from "../../store/messageStore";
-import { AttachmentTypeBadge } from "./AttachmentTypeBadge";
+import { formatFileSizeBytes } from "../../utils/fileSizePresentation";
+import { FileViewerHeader, FileViewerShell } from "../FileViewerShell";
+import { INLINE_AUDIO_PREVIEW_CARD_CLASS } from "./attachmentPreviewLabels";
 
 /**
  * Attachment preview surfaces, extracted from MessageItem.
@@ -52,17 +59,7 @@ import { AttachmentTypeBadge } from "./AttachmentTypeBadge";
  * preview rather than growing a second implementation.
  */
 
-export const DOCUMENT_PREVIEW_LABEL_ID = {
-  csv: "message.messageItem.docPreviewCsv",
-  xlsx: "message.messageItem.docPreviewXlsx",
-  markdown: "message.messageItem.docPreviewMarkdown",
-  text: "message.messageItem.docPreviewText",
-  pdf: "message.messageItem.docPreviewPdf",
-} as const;
-
-// Header tooltips all sit under their buttons; one shared object keeps the
-// prop referentially stable for AttachmentTooltip.
-const TOOLTIP_SIDE_BOTTOM_PROPS = { side: "bottom" } as const;
+export { DOCUMENT_PREVIEW_LABEL_ID, INLINE_AUDIO_PREVIEW_CARD_CLASS } from "./attachmentPreviewLabels";
 
 export type PreviewCommentsContext = {
   attachmentId: string;
@@ -70,6 +67,19 @@ export type PreviewCommentsContext = {
   commentCount: number;
   parentMessage: Pick<Message, "id" | "channelId" | "senderId" | "senderType">;
 };
+
+/**
+ * Where a preview shows its comments (task #118). The margin, each comment
+ * beside the passage it is about, needs a document Raft renders itself and
+ * can measure, whose stored anchors name a place in it: Markdown (section +
+ * quote), plain text (lines) and CSV (rows). Everything else keeps the side
+ * panel: HTML and PDF render in a frame, a video has times not passages, an
+ * image has no text, and a spreadsheet's row anchors don't say which sheet
+ * they are on, so placing them could attach a comment to the wrong row.
+ */
+export function attachmentCommentSurface(kind: DocumentAttachmentPreview["kind"]): "margin" | "panel" {
+  return kind === "markdown" || kind === "text" || kind === "csv" ? "margin" : "panel";
+}
 
 export const PreviewCommentModeContext = createContext<{
   commentMode: boolean;
@@ -85,6 +95,7 @@ export function AttachmentPreviewShell({
   onDownload,
   layout = "fill",
   comments,
+  commentsSurface = "panel",
   copyText,
   onCopyError,
   children,
@@ -96,22 +107,47 @@ export function AttachmentPreviewShell({
   copyText?: string;
   /** Called when that copy attempt fails; the host decides how to surface it. */
   onCopyError?: (error: Error) => void;
-  // Markdown previews need the portal root itself to scroll so Chrome's
-  // native find-in-page can bring off-screen matches into view.
+  // Markdown previews open in the lightbox's document mode: one page-length
+  // body scrolls, so Chrome's native find-in-page brings off-screen matches
+  // into view.
   layout?: "fill" | "browser-find";
-  /** When set, the shell offers the attachment-comments panel (MVP §5). */
+  /** When set, the shell offers the attachment comments (MVP §5). */
   comments?: PreviewCommentsContext;
+  /**
+   * How those comments show: in the margin beside the document, or in the
+   * side panel ({@link attachmentCommentSurface} decides per preview kind).
+   */
+  commentsSurface?: "margin" | "panel";
   children: ReactNode;
 }) {
   const { formatMessage } = useIntl();
   const browserFindLayout = layout === "browser-find";
+  // Margin comments replace the panel, its Preview/Comment mode, the drawer
+  // and the phone sheet: the header button only shows or hides them, and they
+  // show from the start (comments.md: a comment belongs beside its passage).
+  const marginComments = comments && commentsSurface === "margin" ? comments : undefined;
+  const panelComments = marginComments ? undefined : comments;
+  const [marginShown, setMarginShown] = useState(true);
+  // The shell loads the margin's comments (the panel loads its own): its
+  // header button acts on whether there are any. On a file with no comments
+  // yet it is how a comment on the whole file starts, and there is nothing to
+  // hide; once there are comments it shows and hides them.
+  const marginData = useAttachmentComments(marginComments?.attachmentId ?? null);
+  const marginActions = useRef<AttachmentCommentMarginActions>(null);
+  const startsFileComment = marginData.comments !== null
+    && marginData.comments.length === 0
+    && marginData.pendingComments.length === 0;
+  const onMarginComments = useCallback(() => {
+    if (startsFileComment) marginActions.current?.commentOnFile();
+    else setMarginShown((shown) => !shown);
+  }, [startsFileComment]);
   const [commentsOpen, setCommentsOpen] = useState(false);
   // Sticky after first open: the panel keeps its mounted content (and fetched
   // comments) while the collapse animation runs and across reopen.
   const [panelMounted, setPanelMounted] = useState(false);
   const [pendingAnchor, setPendingAnchor] = useState<CommentAnchor | null>(null);
   const pendingAnchorRef = useRef<CommentAnchor | null>(null);
-  // Stryker disable all: behavior is pinned by attachmentCommentsPanelAnchor.behavior; remaining dependency-array mutants are equivalent for this ref + stable setter callback.
+  // Stryker disable all: behavior is pinned by attachmentCommentsPanelAnchor.behavior (removed in the 2026-11 web DOM test prune); remaining dependency-array mutants are equivalent for this ref + stable setter callback.
   const commitPendingAnchor = useCallback((anchor: CommentAnchor | null) => {
     pendingAnchorRef.current = anchor;
     setPendingAnchor(anchor);
@@ -126,7 +162,7 @@ export function AttachmentPreviewShell({
   // with slice 2 (bridge) — in slice 1 comment mode on HTML only opens the
   // panel (unanchored comments, same as today).
   const [mode, setMode] = useState<"preview" | "comment">("preview");
-  const commentMode = mode === "comment" && Boolean(comments);
+  const commentMode = mode === "comment" && Boolean(panelComments);
   // Selection made in natively-rendered previews is captured when a comment
   // session starts as a STRUCTURAL anchor (task #15 — heading/line/row,
   // carries its own quote, clickable jump-back). The v0 plain-quote draft
@@ -215,7 +251,7 @@ export function AttachmentPreviewShell({
       if (timer !== null) window.clearTimeout(timer);
     };
   }, [commentMode, commitPendingAnchor]);
-  // Stryker disable all: behavior is pinned by attachmentCommentsPanelAnchor.behavior; remaining dependency-array mutant is equivalent because commitPendingAnchor is stable by construction.
+  // Stryker disable all: behavior is pinned by attachmentCommentsPanelAnchor.behavior (removed in the 2026-11 web DOM test prune); remaining dependency-array mutant is equivalent because commitPendingAnchor is stable by construction.
   const pushAnchor = useCallback((anchor: CommentAnchor) => {
     commitPendingAnchor(anchor);
     setPanelMounted(true);
@@ -228,9 +264,6 @@ export function AttachmentPreviewShell({
   }, []);
   // Stryker disable next-line ArrowFunction: anchor-clear sync is covered by attachment comment Playwright flows.
   const clearPendingAnchor = useCallback(() => commitPendingAnchor(null), [commitPendingAnchor]);
-  const handleCopyError = useCallback((error: unknown) => {
-    onCopyError?.(error instanceof Error ? error : new Error(String(error)));
-  }, [onCopyError]);
   const previewCommentCtx = useMemo(
     // Stryker disable next-line ArrowFunction,ObjectLiteral: video timestamp pending-anchor propagation is covered by document attachment Playwright e2e.
     () => ({ commentMode, pendingAnchor, pushAnchor, getPendingAnchor, openPanel }),
@@ -252,104 +285,110 @@ export function AttachmentPreviewShell({
     }),
     [sheetState, closeComments],
   );
-  useEffect(() => {
-    const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key !== "Escape") return;
-      event.preventDefault();
-      event.stopPropagation();
-      onClose();
-    };
-    // keydown-global-exempt: preview escape inside <Lightbox> wrapper which moves focus into the overlay on open
-    document.addEventListener("keydown", handleKeyDown);
-    return () => document.removeEventListener("keydown", handleKeyDown);
-  }, [onClose]);
+  // browser-find (markdown) scrolls the document body, so the panel rides as a fixed drawer instead of splitting the
+  // scroller. On narrow viewports both layouts use the same full-width drawer. Both comment surfaces are fixed over
+  // the viewer, in the lightbox after its body (FileViewerShell's overlay), so the body's scrollbar never sits on them.
+  const overlay = panelComments ? (
+    <PreviewCommentModeContext.Provider value={previewCommentCtx}>
+      {panelComments && browserFindLayout ? (
+        /* Desktop markdown right-drawer (the browser-find layout has no flex
+           aside): slides in/out via translate so the push-left padding and
+           drawer move as one gesture. Narrow viewports use the bottom sheet
+           below instead. */
+        <div
+          className={`pointer-events-auto fixed bottom-0 right-0 z-control hidden w-full max-w-80 border-l border-t border-line-seam bg-layer-canvas transition-transform duration-300 ease-in-out sm:block ${
+            commentsOpen ? "translate-x-0" : "translate-x-full"
+          }`}
+          style={{ top: "calc(56px + env(safe-area-inset-top, 0px))" }}
+          onClick={(e) => e.stopPropagation()}
+          // inert (not just aria-hidden) while offscreen: removes the
+          // composer/buttons from the tab order too (Dozy review).
+          inert={!commentsOpen}
+        >
+          {panelMounted ? (
+            <AttachmentCommentsPanel
+              attachmentId={panelComments.attachmentId}
+              filename={panelComments.filename}
+              parentMessage={panelComments.parentMessage}
+              pendingAnchor={pendingAnchor}
+              getPendingAnchor={getPendingAnchor}
+              onAnchorCleared={clearPendingAnchor}
+            />
+          ) : null}
+        </div>
+      ) : null}
+      {panelComments ? (
+        /* Mobile 2-state bottom sheet (task #26, cindyz simplification):
+           collapsed (h-14, the panel's 56px PanelHeader) keeps the panel's
+           header visible as the sheet header — that row is the mobile entry; half (45dvh) is the working
+           state with the artifact still visible above. No full state, no
+           separate handle bar. Height transitions keep it one continuous
+           surface. */
+        <div
+          data-message-affordance="attachment-comments-sheet"
+          className={`pointer-events-auto fixed inset-x-0 bottom-0 z-control flex flex-col border-t border-line-seam bg-layer-canvas transition-[height] duration-300 ease-in-out sm:hidden ${
+            sheetState === "half" ? "h-[45dvh]" : "h-14"
+          }`}
+          onClick={(e) => e.stopPropagation()}
+        >
+          {/* No separate handle bar (cindyz 6/11): the panel's own control
+              row IS the sheet header — its chevron (sheetControls) expands/
+              collapses, and the collapsed state hides the body via
+              display:none (out of tab order — no inert games needed). */}
+          <AttachmentCommentsPanel
+            attachmentId={panelComments.attachmentId}
+            filename={panelComments.filename}
+            parentMessage={panelComments.parentMessage}
+            pendingAnchor={pendingAnchor}
+            getPendingAnchor={getPendingAnchor}
+            onAnchorCleared={clearPendingAnchor}
+            // A chip jump on mobile means "show me the artifact": run the
+            // full session boundary (Dozy review of a3a79538).
+            onAnchorJump={closeComments}
+            collapsedBody={sheetState === "collapsed"}
+            sheetControls={sheetControls}
+          />
+        </div>
+      ) : null}
+    </PreviewCommentModeContext.Provider>
+  ) : null;
 
   return (
-    <Lightbox
+    <FileViewerShell
       onClose={onClose}
+      layout={browserFindLayout ? "document" : "contained"}
       data-testid={browserFindLayout ? "attachment-preview-browser-find-scroll" : undefined}
-      backdropClass={browserFindLayout ? "bg-layer-sidebar" : undefined}
-      positionClass={browserFindLayout ? "fixed left-0 right-0 top-0 h-[100dvh] w-screen max-w-[100dvw] overflow-x-clip overflow-y-auto" : undefined}
-      lockBodyScroll={!browserFindLayout}
-      scrollIntoViewOnMount={browserFindLayout}
-      className={
-        browserFindLayout
-          ? // overflow-x-CLIP, not hidden: a hidden ancestor becomes a (non-
-            // scrolling) scroll container and silently defeats the header's
-            // sticky against the window scroller (cindyz: "header should be
-            // sticky", task #38). clip clips without capturing sticky.
-            "w-full max-w-[100dvw] overflow-x-clip bg-layer-sidebar"
-          : "flex flex-col items-center justify-center"
-      }
+      aria-label={filename}
+      overlay={overlay}
+      header={(
+        <FileViewerHeader
+          filename={filename}
+          {...(marginComments
+            ? {
+                // On a file with no comments it starts one, so it says so and
+                // is a plain button; once there are comments it shows and hides them.
+                commentsLabel: formatMessage({
+                  id: startsFileComment ? "message.attachmentComments.commentOnFile" : "message.attachmentComments.title",
+                }),
+                commentsOpen: startsFileComment ? undefined : marginShown,
+                commentsAffordance: "attachment-comments-toggle",
+                // Nothing to show and no way to add: no button.
+                onToggleComments: startsFileComment && !marginData.canComment ? undefined : onMarginComments,
+              }
+            : {
+                commentsLabel: formatMessage({ id: "message.messageItem.previewComment" }),
+                commentsOpen,
+                commentsAffordance: "attachment-preview-mode",
+                onToggleComments: panelComments ? (mode === "comment" ? exitCommentMode : enterCommentMode) : undefined,
+              })}
+          copyText={copyText}
+          onCopyError={onCopyError}
+          onDownload={onDownload}
+          onClose={onClose}
+        />
+      )}
     >
       <PreviewCommentModeContext.Provider value={previewCommentCtx}>
-      <div
-        className={
-          browserFindLayout
-            ? // fixed, not sticky: WebKit (iPadOS Safari) ignores sticky
-              // when <html> has overflow-y set by the browser-find layout.
-              "safe-top safe-left pointer-events-auto fixed left-0 right-0 top-0 z-10 max-w-[100dvw] overflow-x-clip border-b border-line-seam bg-layer-canvas"
-            : "safe-top safe-left pointer-events-auto absolute left-0 right-0 top-0 z-10 border-b border-line-seam bg-layer-canvas"
-        }
-        onClick={(e) => e.stopPropagation()}
-      >
-        <div className="flex h-14 items-center gap-3 px-4">
-          <AttachmentTooltip content={filename}>
-          <div className="flex min-w-0 flex-1 items-center gap-2">
-            <AttachmentTypeBadge
-              filename={filename}
-              data-testid="attachment-preview-type-badge"
-              className="h-4 w-8"
-            />
-            <span className="min-w-0 flex-1 truncate text-headline text-foreground">
-              {filename}
-            </span>
-          </div>
-          </AttachmentTooltip>
-          <div className="flex shrink-0 items-center gap-1.5">
-            {comments ? (
-              <Button
-                type="button"
-                size="icon-lg"
-                variant={commentsOpen ? "outline" : "ghost"}
-                data-message-affordance="attachment-preview-mode"
-                onClick={mode === "comment" ? exitCommentMode : enterCommentMode}
-                aria-label={formatMessage({ id: "message.messageItem.previewComment" })}
-                aria-pressed={commentsOpen}
-                data-comments-open={commentsOpen ? "true" : "false"}
-              >
-                <MessageSquareMore size={14} aria-hidden="true" />
-              </Button>
-            ) : null}
-            {copyText ? (
-              <CopyableCodeRoot
-                size="sm"
-                onError={handleCopyError}
-                className="w-auto shrink-0"
-                data-slot="copyable-code-root"
-              >
-                <CopyableCode className="sr-only" aria-hidden="true">{copyText}</CopyableCode>
-                <CopyableCodeAction
-                  size="icon-lg"
-                  variant="ghost"
-                  aria-label={formatMessage({ id: "common.lightbox.copy" })}
-                />
-              </CopyableCodeRoot>
-            ) : null}
-            <AttachmentTooltip content={formatMessage({ id: "common.lightbox.download" })} contentProps={TOOLTIP_SIDE_BOTTOM_PROPS}>
-              <Button type="button" size="icon-lg" variant="ghost" onClick={onDownload} aria-label={formatMessage({ id: "common.lightbox.download" })}>
-                <Download size={14} />
-              </Button>
-            </AttachmentTooltip>
-            <AttachmentTooltip content={formatMessage({ id: "common.lightbox.close" })} contentProps={TOOLTIP_SIDE_BOTTOM_PROPS}>
-              <CloseButton type="button" size="icon-lg" onClick={onClose} aria-label={formatMessage({ id: "common.lightbox.close" })}>
-                <X size={14} />
-              </CloseButton>
-            </AttachmentTooltip>
-          </div>
-        </div>
-      </div>
-      {browserFindLayout && <div className="safe-top h-14 w-full" aria-hidden="true" />}
       <div
         // data-anchor-scope: anchor jumps resolve ids/line markers inside the
         // ACTIVE preview only, never a background DOM (Dozy review note).
@@ -361,18 +400,24 @@ export function AttachmentPreviewShell({
         className={
           browserFindLayout
             ? `pointer-events-auto w-full max-w-[100dvw] overflow-x-clip bg-layer-sidebar transition-[padding-right] duration-300 ease-in-out ${
-                comments && commentsOpen ? "sm:pr-80" : ""
+                panelComments && commentsOpen ? "sm:pr-80" : ""
               }`
-            : "absolute bottom-0 left-0 right-0 overflow-hidden bg-layer-canvas"
-        }
-        style={
-          browserFindLayout
-            ? undefined
-            : { top: "calc(56px + env(safe-area-inset-top, 0px))" }
+            : "pointer-events-auto relative min-h-0 w-full flex-1 overflow-hidden bg-layer-canvas"
         }
         onClick={(e) => e.stopPropagation()}
       >
-        {!browserFindLayout && comments ? (
+        {marginComments ? (
+          <AttachmentCommentMargin
+            attachmentId={marginComments.attachmentId}
+            filename={marginComments.filename}
+            parentMessage={marginComments.parentMessage}
+            shown={marginShown || startsFileComment}
+            data={marginData}
+            actionsRef={marginActions}
+          >
+            {children}
+          </AttachmentCommentMargin>
+        ) : !browserFindLayout && panelComments ? (
           /* Stable tree: children keep their tree position whether the panel
              is open or closed, so toggling comments never remounts the
              preview (a sandboxed HTML/PDF iframe would otherwise reload and
@@ -394,9 +439,9 @@ export function AttachmentPreviewShell({
               <div className="h-full w-80">
                 {panelMounted ? (
                   <AttachmentCommentsPanel
-                    attachmentId={comments.attachmentId}
-                    filename={comments.filename}
-                    parentMessage={comments.parentMessage}
+                    attachmentId={panelComments.attachmentId}
+                    filename={panelComments.filename}
+                    parentMessage={panelComments.parentMessage}
                     pendingAnchor={pendingAnchor}
                     getPendingAnchor={getPendingAnchor}
                     onAnchorCleared={clearPendingAnchor}
@@ -409,71 +454,8 @@ export function AttachmentPreviewShell({
           children
         )}
       </div>
-      {/* browser-find (markdown) scrolls the portal root, so the panel rides
-          as a fixed drawer instead of splitting the scroll container. On
-          narrow viewports both layouts use the same full-width drawer. */}
-      {comments && browserFindLayout ? (
-        /* Desktop markdown right-drawer (the browser-find layout has no flex
-           aside): slides in/out via translate so the push-left padding and
-           drawer move as one gesture. Narrow viewports use the bottom sheet
-           below instead. */
-        <div
-          className={`pointer-events-auto fixed bottom-0 right-0 z-20 hidden w-full max-w-80 border-l border-t border-line-seam bg-layer-canvas transition-transform duration-300 ease-in-out sm:block ${
-            commentsOpen ? "translate-x-0" : "translate-x-full"
-          }`}
-          style={{ top: "calc(56px + env(safe-area-inset-top, 0px))" }}
-          onClick={(e) => e.stopPropagation()}
-          // inert (not just aria-hidden) while offscreen: removes the
-          // composer/buttons from the tab order too (Dozy review).
-          inert={!commentsOpen}
-        >
-          {panelMounted ? (
-            <AttachmentCommentsPanel
-              attachmentId={comments.attachmentId}
-              filename={comments.filename}
-              parentMessage={comments.parentMessage}
-              pendingAnchor={pendingAnchor}
-              getPendingAnchor={getPendingAnchor}
-              onAnchorCleared={clearPendingAnchor}
-            />
-          ) : null}
-        </div>
-      ) : null}
-      {comments ? (
-        /* Mobile 2-state bottom sheet (task #26, cindyz simplification):
-           collapsed (h-10) keeps the panel's control row visible as the sheet
-           header — that row is the mobile entry; half (45dvh) is the working
-           state with the artifact still visible above. No full state, no
-           separate handle bar. Height transitions keep it one continuous
-           surface. */
-        <div
-          data-message-affordance="attachment-comments-sheet"
-          className={`pointer-events-auto fixed inset-x-0 bottom-0 z-20 flex flex-col border-t border-line-seam bg-layer-canvas transition-[height] duration-300 ease-in-out sm:hidden ${
-            sheetState === "half" ? "h-[45dvh]" : "h-10"
-          }`}
-          onClick={(e) => e.stopPropagation()}
-        >
-          {/* No separate handle bar (cindyz 6/11): the panel's own control
-              row IS the sheet header — its chevron (sheetControls) expands/
-              collapses, and the collapsed state hides the body via
-              display:none (out of tab order — no inert games needed). */}
-          <AttachmentCommentsPanel
-            attachmentId={comments.attachmentId}
-            filename={comments.filename}
-            parentMessage={comments.parentMessage}
-            pendingAnchor={pendingAnchor}
-            getPendingAnchor={getPendingAnchor}
-            onAnchorCleared={clearPendingAnchor}
-            // A chip jump on mobile means "show me the artifact": run the
-            // full session boundary (Dozy review of a3a79538).
-            onAnchorJump={closeComments}
-            collapsedBody={sheetState === "collapsed"}
-            sheetControls={sheetControls}
-          />
-        </div>
-      ) : null}
       </PreviewCommentModeContext.Provider>
-    </Lightbox>
+    </FileViewerShell>
   );
 }
 
@@ -486,14 +468,13 @@ export function CsvPreviewPane({ preview, truncated }: { preview: Extract<Docume
         <span>{formatMessage({ id: "message.messageItem.csvPreview" })}</span>
         <span>{truncated ? formatMessage({ id: "message.messageItem.csvRowsFirst" }, { count: preview.rows.length }) : formatMessage({ id: "message.messageItem.csvRows" }, { count: preview.rowCount })}{formatMessage({ id: "message.messageItem.csvColumns" }, { count: preview.columnCount })}</span>
       </div>
-      {/* Horizontal-only scroller: wide tables must pan sideways, but the
+      {/* Horizontal-only ScrollArea in the card: wide tables pan sideways, the
           vertical axis flows into the document scroll so ⌘F reaches every
-          row. Known trade-off: the sticky thead pins to this wrapper (a
-          scroll container), not the viewport — wide-table panning beats a
-          pinned header here. */}
-      <Card className="overflow-x-auto">
+          row. Known trade-off: the sticky thead pins to this area (a scroll
+          container), not the viewport — wide-table panning beats a pinned header. */}
+      <Card><ScrollArea orientation="horizontal" overscroll="auto" role="region" aria-label={formatMessage({ id: "message.messageItem.csvPreview" })}>
         <table className="min-w-full border-collapse bg-layer-card">
-          <thead className="sticky top-0 z-10 bg-fill-muted">
+          <thead className="sticky top-0 z-sticky bg-fill-muted">
             <tr>
               {preview.headers.map((header, index) => (
                 <th key={`${header}-${index}`} className="max-w-[220px] border border-line-hairline px-2 py-1 text-left font-bold">
@@ -517,7 +498,7 @@ export function CsvPreviewPane({ preview, truncated }: { preview: Extract<Docume
             ))}
           </tbody>
         </table>
-      </Card>
+      </ScrollArea></Card>
       <div className="mt-2 text-foreground-hint">
         {truncated
           ? formatMessage({ id: "message.messageItem.csvTruncatedPerf" }, { count: preview.rows.length })
@@ -534,7 +515,7 @@ export function XlsxPreviewPane({ preview, truncated }: { preview: Extract<Docum
   const handleSheetChange = useCallback((next: string) => setActiveSheet(Number(next)), []);
   const selected = preview.sheets[Math.min(activeSheet, Math.max(0, preview.sheets.length - 1))];
   if (!selected) {
-    return <div className="w-full bg-layer-sidebar p-4 text-callout text-foreground-muted">{formatMessage({ id: "message.messageItem.xlsxEmpty" })}</div>;
+    return <XlsxPreviewEmpty className="bg-layer-sidebar" />;
   }
   const sheetTruncated = truncated || selected.truncated;
   const isEmpty = selected.headers.length === 0 && selected.rows.length === 0;
@@ -548,7 +529,8 @@ export function XlsxPreviewPane({ preview, truncated }: { preview: Extract<Docum
         <Tabs<string>
           value={String(activeSheet)}
           onValueChange={handleSheetChange}
-          className="mb-3 max-w-full overflow-x-auto pb-1"
+          // TabsList scrolls its own row when the sheets don't fit.
+          className="mb-3 min-w-0 max-w-full"
         >
           <TabsList aria-label={formatMessage({ id: "message.messageItem.xlsxSheetTabs" })}>
             {preview.sheets.map((sheet, index) => (
@@ -563,13 +545,11 @@ export function XlsxPreviewPane({ preview, truncated }: { preview: Extract<Docum
         </Tabs>
       ) : null}
       {isEmpty ? (
-        <Card className="p-4 font-sans text-callout font-semibold text-foreground-muted" data-testid="xlsx-preview-empty">
-          {formatMessage({ id: "message.messageItem.xlsxEmpty" })}
-        </Card>
+        <XlsxPreviewEmpty />
       ) : (
-        <Card className="overflow-x-auto">
+        <Card><ScrollArea orientation="horizontal" overscroll="auto" role="region" aria-label={formatMessage({ id: "message.messageItem.xlsxPreview" })}>
           <table className="min-w-full border-collapse bg-layer-card">
-            <thead className="sticky top-0 z-10 bg-fill-muted"><tr>{selected.headers.map((header, index) => (
+            <thead className="sticky top-0 z-sticky bg-fill-muted"><tr>{selected.headers.map((header, index) => (
               <th key={`${header}-${index}`} className="max-w-[220px] border border-line-hairline px-2 py-1 text-left font-bold"><AttachmentTooltip content={header}><span className="block truncate">{header || formatMessage({ id: "message.messageItem.columnFallback" }, { index: index + 1 })}</span></AttachmentTooltip></th>
             ))}</tr></thead>
             <tbody>{selected.rows.map((row, rowIndex) => (
@@ -578,7 +558,7 @@ export function XlsxPreviewPane({ preview, truncated }: { preview: Extract<Docum
               </tr>
             ))}</tbody>
           </table>
-        </Card>
+        </ScrollArea></Card>
       )}
       <div className="mt-2 text-foreground-hint">
         {sheetTruncated
@@ -589,22 +569,35 @@ export function XlsxPreviewPane({ preview, truncated }: { preview: Extract<Docum
   );
 }
 
-export function MarkdownPreviewPane({ markdown, truncated }: { markdown: string; truncated: boolean }) {
+export function MarkdownPreviewPane({
+  markdown,
+  truncated,
+  previewByteLength,
+  sourceByteLength,
+  onDownload,
+}: {
+  markdown: string;
+  truncated: boolean;
+  /** Bytes of the file the preview shows; set by the server when it cut. */
+  previewByteLength?: number;
+  /** The whole file's size in bytes, alongside previewByteLength. */
+  sourceByteLength?: number;
+  /** Download of the full file, offered from the truncation notice. */
+  onDownload?: () => void;
+}) {
   // Visual styling delegated to MarkdownContent so attachment preview shares
   // chat-body markdown primitives. The preview wrapper owns only the Slock
   // landing/blog-style reading shell: card, measure, and page padding.
   // stdrc 2026-05-08 #proj-uiux:6110c1ce (task #137).
   //
-  // The server caps the markdown preview to a byte prefix
-  // (markdownPreviewProvider.streamByteCap, 128KB) and returns
-  // `truncated: true` when the file is larger. Before #proj-uiux task #269
-  // this pane silently dropped that flag (CsvPreviewPane / TextPreviewPane
-  // already surface it): a user Cmd-F-searching for text that lives past the
-  // cut got no match and no explanation — "Cmd-F won't bring me to the
-  // content" (cindyz). Surface the boundary explicitly and point at Download
-  // (in the shell header) for the full file. Invariant: a truncated preview
-  // must visibly declare its boundary so absent matches read as "not in this
-  // preview", not "not in this file".
+  // The server previews at most MARKDOWN_PREVIEW_BYTE_LIMIT of a file, cut at
+  // its last whole line, and returns `truncated: true` with the sizes when the
+  // file is larger (task #164; before it, a markdown file over ~64 KB was
+  // refused and the click silently downloaded it). A truncated preview must
+  // visibly declare its boundary — how much it shows, and that find-in-page
+  // stops there — so absent matches read as "not in this preview", not "not
+  // in this file" (#proj-uiux task #269, cindyz), and it offers the download
+  // right there.
   const { formatMessage } = useIntl();
   const outline = useMemo(() => extractMarkdownOutline(markdown), [markdown]);
   const headingComponents = useMemo(
@@ -615,21 +608,36 @@ export function MarkdownPreviewPane({ markdown, truncated }: { markdown: string;
   return (
     <div className="min-h-[calc(100dvh-56px)] w-full max-w-[100dvw] overflow-x-clip bg-layer-sidebar px-4 py-8 md:px-8 md:py-10">
       <div className="mx-auto grid w-full max-w-3xl gap-6 xl:max-w-6xl xl:grid-cols-[16rem_minmax(0,48rem)] xl:items-start">
-        <div className="hidden xl:sticky xl:top-20 xl:block xl:max-h-[calc(100dvh-7rem)] xl:self-start xl:overflow-auto">
+        <ScrollArea tabIndex={-1} overscroll="auto" className="hidden xl:sticky xl:top-10 xl:block xl:max-h-[calc(100dvh-7rem)] xl:self-start">
           <MarkdownOutlineNav outline={outline} />
-        </div>
+        </ScrollArea>
         <div className="min-w-0">
           {truncated ? (
+            // Info, not warning: a shortened preview is a fact about the
+            // view, not a failure (the plain-text pane's "Truncated" is a
+            // neutral hint for the same reason).
             <Banner
-              intent="warning"
+              intent="info"
               density="lg"
               className="mb-4"
+              live={false}
               data-testid="markdown-preview-truncated"
+              title={previewByteLength !== undefined && sourceByteLength !== undefined
+                ? formatMessage(
+                  { id: "message.messageItem.markdownTruncatedTitle" },
+                  {
+                    shown: formatFileSizeBytes(previewByteLength, formatMessage),
+                    total: formatFileSizeBytes(sourceByteLength, formatMessage),
+                  },
+                )
+                : formatMessage({ id: "message.messageItem.markdownTruncatedTitleUnsized" })}
+              actions={onDownload ? (
+                <Button type="button" size="md" variant="default" onClick={onDownload} data-testid="markdown-preview-truncated-download">
+                  {formatMessage({ id: "message.messageItem.markdownTruncatedDownload" })}
+                </Button>
+              ) : undefined}
             >
-              {formatMessage(
-                { id: "message.messageItem.markdownTruncated" },
-                { b: (chunks) => <span key="b" className="font-bold">{chunks}</span> },
-              )}
+              {formatMessage({ id: "message.messageItem.markdownTruncatedBody" })}
             </Banner>
           ) : null}
           <Card
@@ -661,14 +669,20 @@ export function TextPreviewPane({ text, truncated }: { text: string; truncated: 
       </div>
       {/* Per-line elements (not one text node) so comment anchors can target
           and flash-highlight L<n> ranges (attachmentCommentAnchors). The
-          preview is byte-capped server-side, so line count stays bounded. */}
-      <pre className="min-h-full whitespace-pre-wrap break-words rounded-container border border-line-hairline bg-layer-code p-4 font-mono text-mono-code text-foreground">
-        {text.split(/\r?\n/).map((line, index) => (
-          <div key={index} data-anchor-line={index + 1}>
-            {line.length > 0 ? line : " "}
-          </div>
-        ))}
-      </pre>
+          preview is byte-capped server-side, so line count stays bounded.
+          raft-ui's CodeBlock frame, but the lines wrap: a file in the viewer
+          is read top to bottom, not scrolled sideways like a snippet. */}
+      <CodeBlock className="my-0">
+        <CodeBlockBody>
+          <pre className="whitespace-pre-wrap break-words">
+            {text.split(/\r?\n/).map((line, index) => (
+              <div key={index} data-anchor-line={index + 1}>
+                {line.length > 0 ? line : " "}
+              </div>
+            ))}
+          </pre>
+        </CodeBlockBody>
+      </CodeBlock>
     </div>
   );
 }
@@ -720,10 +734,19 @@ export function DocumentAttachmentPreviewModal({
       // level-only comments aren't worth the surface. Re-enable when a
       // controlled renderer (pdf.js) makes page+rect anchors honest.
       comments={preview.kind === "pdf" ? undefined : comments}
+      commentsSurface={attachmentCommentSurface(preview.kind)}
     >
       {preview.kind === "csv" ? <CsvPreviewPane preview={preview} truncated={truncated} /> : null}
       {preview.kind === "xlsx" ? <XlsxPreviewPane preview={preview} truncated={truncated} /> : null}
-      {preview.kind === "markdown" ? <MarkdownPreviewPane markdown={preview.markdown} truncated={truncated} /> : null}
+      {preview.kind === "markdown" ? (
+        <MarkdownPreviewPane
+          markdown={preview.markdown}
+          truncated={truncated}
+          previewByteLength={preview.previewByteLength}
+          sourceByteLength={preview.sourceByteLength}
+          onDownload={onDownload}
+        />
+      ) : null}
       {preview.kind === "text" ? <TextPreviewPane text={preview.text} truncated={truncated} /> : null}
       {preview.kind === "pdf" ? (
         // Threat model: PDFs are uploaded by any human or agent, so the bytes
@@ -846,8 +869,6 @@ export function AudioPreviewBody({
   );
 }
 
-/** The inline audio player's raft-ui Card: its width and inset. */
-export const INLINE_AUDIO_PREVIEW_CARD_CLASS = "w-full max-w-[min(28rem,calc(100vw-7rem))] p-2.5 text-left";
 
 
 function HtmlPreviewBody({
@@ -922,7 +943,9 @@ function HtmlPreviewBody({
   // Drag rect in overlay-local px while capturing; flash region in CONTENT px
   // (it must track the document as the bridge reports scrolling).
   const [drag, setDrag] = useState<{ x0: number; y0: number; x1: number; y1: number } | null>(null);
-  const [flashRegion, setFlashRegion] = useState<{ x: number; y: number; w: number; h: number } | null>(null);
+  // The region a comment's anchor jumped to, located for LOCATED_MS. `token`
+  // is the jump's, so a second jump to the same region restarts the highlight.
+  const [flashRegion, setFlashRegion] = useState<{ x: number; y: number; w: number; h: number; token: number } | null>(null);
   const overlayRef = useRef<HTMLDivElement | null>(null);
   // Monotonic token so a slow async locate() from an earlier jump can't apply
   // over a newer click — "last click wins", not "last response wins" (Dozy
@@ -952,11 +975,14 @@ function HtmlPreviewBody({
         const viewportWidth = geometry?.viewportWidth ?? 800;
         const viewportHeight = geometry?.viewportHeight ?? 600;
         scrollTo(Math.max(0, x - viewportWidth / 2), Math.max(0, y - viewportHeight / 3));
-        setFlashRegion({ x, y, w: Number.isFinite(w) ? w : 0, h: Number.isFinite(h) ? h : 0 });
-        // Marker is positioned from live bridge geometry, so there is no DOM
-        // animation to listen for — a fixed lifetime matching .anchor-flash
-        // retires it.
-        window.setTimeout(() => setFlashRegion(null), 1800);
+        setFlashRegion({ x, y, w: Number.isFinite(w) ? w : 0, h: Number.isFinite(h) ? h : 0, token });
+        // The marker is positioned from live bridge geometry; it lives as long
+        // as the located highlight. Each jump retires its own region (and only
+        // its own: a newer one shown since stays), even when a newer jump's
+        // locate was dropped and never replaced it.
+        window.setTimeout(() => {
+          setFlashRegion((region) => (region?.token === token ? null : region));
+        }, LOCATED_MS);
       };
       // Re-anchor the region by its stored quote in the CURRENT layout so the
       // marker tracks content reflow on resize (#29); fall back to the stored
@@ -1016,7 +1042,7 @@ function HtmlPreviewBody({
         <div
           role="status"
           data-message-affordance="attachment-preview-external-links-loading"
-          className="absolute inset-0 z-10 flex items-center justify-center bg-layer-canvas/75"
+          className="absolute inset-0 z-control flex items-center justify-center bg-layer-veil"
         >
           <div className="flex items-center gap-2 rounded-container bg-layer-popover px-3 py-2 text-callout font-semibold text-foreground shadow-float ring-1 ring-line-seam">
             <Spinner size="sm" aria-label={formatMessage({ id: "common.loadingLabel" })} /> {formatMessage({ id: "message.messageItem.preparingPreview" })}
@@ -1026,7 +1052,7 @@ function HtmlPreviewBody({
       {externalLinksReady ? (
         <div
           data-message-affordance="attachment-preview-external-link-hotspots"
-          className="pointer-events-none absolute inset-0 z-10 overflow-hidden"
+          className="pointer-events-none absolute inset-0 z-raised overflow-hidden"
         >
           {externalLinkHotspots.map(({ key, link, text, rect }) => (
             <AttachmentTooltip key={key} content={link.href}>
@@ -1047,7 +1073,7 @@ function HtmlPreviewBody({
           role="status"
           aria-live="polite"
           data-message-affordance="attachment-preview-external-link-fallback"
-          className="absolute inset-x-3 bottom-3 z-40 flex items-center gap-2 rounded-container bg-layer-popover p-2 pl-3 shadow-float ring-1 ring-line-seam"
+          className="absolute inset-x-3 bottom-3 z-float flex items-center gap-2 rounded-container bg-layer-popover p-2 pl-3 shadow-float ring-1 ring-line-seam"
         >
           <div className="min-w-0 flex-1">
             <div className="text-footnote font-bold text-foreground">{formatMessage({ id: "message.messageItem.browserBlockedTab" })}</div>
@@ -1064,11 +1090,12 @@ function HtmlPreviewBody({
           </div>
           <Button
             type="button"
-            size="sm"
+            size="md"
             variant="outline"
             onClick={openPendingExternalLink}
           >
             {formatMessage({ id: "message.messageItem.openLink" })}
+            <LeavingRaftMark data-icon="inline-end" />
           </Button>
           <CloseButton
             type="button"
@@ -1080,8 +1107,12 @@ function HtmlPreviewBody({
         </div>
       ) : null}
       {flashRegion && state ? (
+        // A located region of the document: square, no edge, raft-ui's located fade (states.md#located), but drawn
+        // over the page, so its fill is a see-through info tint (--located-tint), never the opaque row fill that hid the text.
         <div
-          className="anchor-flash pointer-events-none absolute z-10 rounded-[2px] border border-line-seam"
+          key={flashRegion.token}
+          data-located=""
+          className="pointer-events-none absolute z-raised [--located-tint:color-mix(in_oklch,var(--info)_35%,transparent)]"
           style={{
             left: flashRegion.x - state.scrollX,
             top: flashRegion.y - state.scrollY,
@@ -1094,7 +1125,7 @@ function HtmlPreviewBody({
         <div
           ref={overlayRef}
           data-message-affordance="attachment-html-comment-overlay"
-          className="absolute inset-0 z-20 cursor-crosshair touch-none"
+          className="absolute inset-0 z-control cursor-crosshair touch-none"
           onWheel={(e) => {
             scrollBy(e.deltaX, e.deltaY);
           }}
@@ -1147,7 +1178,7 @@ function HtmlPreviewBody({
             });
           }}
         >
-          <div className="pointer-events-none absolute left-1/2 top-3 z-30 -translate-x-1/2 rounded-chip bg-layer-hud px-2 py-1 text-caption text-foreground-on-hud shadow-float">
+          <div className="pointer-events-none absolute left-1/2 top-3 z-float -translate-x-1/2 rounded-chip bg-layer-hud px-2 py-1 text-caption text-foreground-on-hud shadow-float">
             {state
               ? formatMessage({ id: "message.messageItem.clickToComment" })
               : formatMessage({ id: "message.messageItem.cantLocateInPage" })}
@@ -1287,7 +1318,7 @@ function VideoPreviewBody({
         <AttachmentTooltip content={formatMessage({ id: "message.messageItem.attachTimestamp" }, { timestamp: formatVideoCommentTimestamp(videoState.time) })}>
           <Button
             type="button"
-            size="sm"
+            size="md"
             variant="outline"
             data-message-affordance="video-comment-add-timestamp"
             onClick={handleAddTimestampClick}

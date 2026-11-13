@@ -11,7 +11,7 @@ import {
 // Captures the share-preview contract: image sharing starts at one generic
 // Share... toolbar entry, then artifact and platform actions live in the
 // preview lightbox.
-test("non-contiguous selection renders real Share preview content with an X target", async ({ page, request }) => {
+test("non-contiguous selection renders real Share preview content with two artifact actions", async ({ page, request }) => {
   const seedState = await waitForSeedState();
   const login = await loginViaApi(request, seedState);
   await dismissOwnerOnboarding(request, seedState, login.accessToken);
@@ -21,7 +21,7 @@ test("non-contiguous selection renders real Share preview content with an X targ
   await page.waitForSelector('[data-testid="message-scroller"]');
   await page.waitForTimeout(800);
 
-  const tag = `sharex-${Date.now()}`;
+  const tag = `share-${Date.now()}`;
   const lines = [
     "PR is up for the multi-select share flow",
     "nice — does Share preview still produce a real PNG?",
@@ -43,20 +43,15 @@ test("non-contiguous selection renders real Share preview content with an X targ
   await page.getByText(`${tag} 2:`).first().click();
   await page.getByText(`${tag} 4:`).first().click();
   await expect(page.getByTestId("select-mode-count")).toHaveText("3 selected");
-  await expect(page.getByTestId("select-mode-share-x")).toHaveCount(0);
   await expect(page.getByTestId("select-mode-more")).toBeVisible();
 
   await openSelectModeMoreMenu(page);
   await expect(page.getByTestId("select-mode-share-open")).toBeVisible();
-  await expect(page.getByTestId("select-mode-share-open")).toHaveText(/Generate image/);
   await expect(page.getByTestId("select-mode-copy-md")).toBeVisible();
 
   await page.getByTestId("select-mode-share-open").click();
   const lightbox = page.getByTestId("select-share-lightbox");
   await expect(lightbox).toBeVisible({ timeout: 10000 });
-  await expect(page.getByTestId("select-share-lightbox-download")).toHaveText(/Download/);
-  await expect(page.getByTestId("select-share-lightbox-system-share")).toHaveCount(0);
-  await expect(page.getByTestId("select-share-lightbox-share-x")).toHaveText(/Share to X/);
 
   const renderedImage = lightbox.locator("img");
   await expect(renderedImage).toBeVisible();

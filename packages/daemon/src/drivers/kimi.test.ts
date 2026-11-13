@@ -97,6 +97,25 @@ test("parseLine: CompactionEnd emits compaction_finished", () => {
   assert.deepEqual(events, [{ kind: "compaction_finished" }]);
 });
 
+// task #26: the wire's ToolResult ends the ToolCall whose id it names; the
+// driver used to ignore it, so the daemon counted every call as running and a
+// stalled Kimi turn could not be recovered after its first tool call.
+test("parseLine: ToolResult ends the matching ToolCall with Kimi's exit code", () => {
+  const kimi = new KimiDriver();
+  const wire = (type: string, payload: unknown) => kimi.parseLine(JSON.stringify({ jsonrpc: "2.0", method: "event", params: { type, payload } }));
+  assert.deepEqual(wire("ToolCall", { type: "function", id: "tool_a", function: { name: "Shell", arguments: "{\"command\": \"false\"}" } }), [
+    { kind: "tool_call", name: "Shell", input: { command: "false" }, callId: "tool_a" },
+  ]);
+  assert.deepEqual(wire("ToolCall", { type: "function", id: "tool_b", function: { name: "ReadFile", arguments: "{}" } }).length, 1);
+  assert.deepEqual(wire("ToolResult", { tool_call_id: "tool_a", return_value: { is_error: true, output: "", message: "Command failed with exit code: 2." } }), [
+    { kind: "tool_output", name: "Shell", callId: "tool_a", ok: true, exitCode: 2 },
+  ]);
+  assert.deepEqual(wire("ToolResult", { tool_call_id: "tool_b", return_value: { is_error: false, output: "x" } }), [
+    { kind: "tool_output", name: "ReadFile", callId: "tool_b", ok: true },
+  ]);
+  assert.deepEqual(wire("ToolResult", { tool_call_id: "tool_b", return_value: { is_error: false } }), [], "an unopened id is dropped");
+});
+
 function withTempHome(cb: (home: string) => void) {
   const home = mkdtempSync(path.join(os.tmpdir(), "slock-kimi-"));
   try { cb(home); } finally { rmSync(home, { recursive: true, force: true }); }
@@ -145,7 +164,7 @@ test("kimi prompt and agent-config files are written owner-only (task #302)", ()
   if (process.platform === "win32") return; // POSIX permission bits do not apply
   const dir = mkdtempSync(path.join(os.tmpdir(), "kimi-mode-"));
   try {
-    const { systemPromptPath, agentFilePath } = writeKimiPromptFiles(dir, "standing prompt body", false);
+    const { systemPromptPath, agentFilePath } = writeKimiPromptFiles(dir, "standing prompt body");
     assert.equal(statSync(systemPromptPath).mode & 0o777, 0o600, "kimi system prompt file must be 0600");
     assert.equal(statSync(agentFilePath).mode & 0o777, 0o600, "kimi agent config file must be 0600");
   } finally {
@@ -155,25 +174,24 @@ test("kimi prompt and agent-config files are written owner-only (task #302)", ()
 
 
 // task #302 stock arm (XX, msg ff116b5e): the card is about EXISTING files, not
-// just newly created ones. On resume the prompt write is skipped, and even for
-// the agent file writeFileSync ignores `mode` when the file already exists — so
-// without an explicit chmod a pre-#302 0644 file stays 0644 forever.
+// just newly created ones. writeFileSync ignores `mode` when the file already
+// exists — so without an explicit chmod a pre-#302 0644 file stays 0644 forever.
 test("kimi prompt files already on disk at 0644 are tightened to 0600 on resume (task #302)", () => {
   if (process.platform === "win32") return; // POSIX permission bits do not apply
   const dir = mkdtempSync(path.join(os.tmpdir(), "kimi-stock-"));
   try {
-    const { systemPromptPath, agentFilePath } = writeKimiPromptFiles(dir, "original prompt", false);
+    const { systemPromptPath, agentFilePath } = writeKimiPromptFiles(dir, "original prompt");
     // Simulate a file created before this fix.
     chmodSync(systemPromptPath, 0o644);
     chmodSync(agentFilePath, 0o644);
     assert.equal(statSync(systemPromptPath).mode & 0o777, 0o644, "precondition: stock file is 0644");
 
-    const again = writeKimiPromptFiles(dir, "ignored on resume", true);
+    const again = writeKimiPromptFiles(dir, "current prompt");
 
     assert.equal(statSync(again.systemPromptPath).mode & 0o777, 0o600, "resume must tighten the existing prompt file");
     assert.equal(statSync(again.agentFilePath).mode & 0o777, 0o600, "resume must tighten the existing agent file");
-    // The resume path must still not clobber the prompt body.
-    assert.equal(readFileSync(again.systemPromptPath, "utf8"), "original prompt");
+    // Every launch, resume included, writes the current standing prompt.
+    assert.equal(readFileSync(again.systemPromptPath, "utf8"), "current prompt");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

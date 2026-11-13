@@ -13,7 +13,7 @@ import { createOAuthClient, requestAgentAccess } from "../services/oauthService"
 import { AGENT_APP_EVENT_RETENTION_AFTER_EXPIRY_MS, pruneExpiredAgentAppEvents } from "../services/agentAppEventsService";
 import type { AgentAppEventDetail, AgentAppEventListResponse } from "@botiverse/raft-shared";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 const SCOPES = ["agent:notification:write"];
 const DAY_MS = 24 * 60 * 60 * 1000;

@@ -22,6 +22,8 @@ test("parent_channel_id backfill fills pre-0297 thread rows in batches and the v
     Array.from({ length: 5 }, (_, i) => ({ channelId: i % 2 ? other.id : room.id, senderType: "user" as const, senderId: owner.id, content: `parent ${i}` })),
   ).returning();
 
+  // Emulate pre-CHECK orphan history; current writes must satisfy the cache invariant.
+  await db.execute(sql`ALTER TABLE channels DROP CONSTRAINT channels_parent_message_requires_channel`);
   await db.execute(sql`ALTER TABLE channels DISABLE TRIGGER channels_parent_channel_id_insert`);
   const legacy = await db.insert(channels).values([
     ...parents.map((parent, i) => ({ serverId: server.id, name: `pcid-bf-t${i}`, type: "thread" as const, parentMessageId: parent.id, deletedAt: i === 4 ? new Date() : null })),

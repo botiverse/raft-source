@@ -9,6 +9,7 @@ import {
   setAuthRefreshAttemptIdOnError,
 } from "./authErrors";
 import { authTokenSync } from "./authTokenSync";
+import { clientRequestHeaders } from "./clientPlatformHint";
 import {
   authStatusBucket,
   emitAuthTrace,
@@ -20,7 +21,7 @@ import type {
   WaitElapsedBucket,
   WebSpanHandle,
 } from "./webAuthTrace";
-import { assertValidDesktopRuntimeEnvironment, RUNTIME_API_BASE } from "../desktopRuntimeEnvironment";
+import { RUNTIME_API_BASE } from "../runtimeEndpoints";
 
 const API_BASE = RUNTIME_API_BASE;
 const REFRESH_RETRY_DELAYS_MS = [250, 750];
@@ -38,6 +39,10 @@ export type RefreshTokens = {
 
 export type AuthRefreshAttemptContext = {
   authRefreshAttemptId?: string;
+  // Sent only together with an attempt id: the server then keeps a durable
+  // receipt for the rotation, so a reply lost to a sleeping or offline client
+  // can be replayed later with the same old token and attempt id (#10977).
+  authRefreshInstallationId?: string;
 };
 
 type RotatedTokenObservation = RefreshTokens | string | null;
@@ -85,6 +90,11 @@ export function createRefreshCoordinator(params: {
   rotatedTokenWaitMs?: number;
   rotatedTokenPollMs?: number;
   createAuthRefreshAttemptId?: () => string;
+  // The attempt id for one refresh token, kept across failed tries and page
+  // loads, so every replay of that token is the same attempt to the server.
+  // Without it, ids are still shared by the tries of one refresh.
+  attemptIdForRefreshToken?: (refreshToken: string, create: () => string) => string;
+  readInstallationId?: () => string | undefined;
 }) {
   let refreshPromise: Promise<RefreshTokens> | null = null;
 
@@ -96,6 +106,27 @@ export function createRefreshCoordinator(params: {
   const rotatedTokenPollMs = params.rotatedTokenPollMs ?? DEFAULT_ROTATED_TOKEN_POLL_MS;
   const requestRefreshLock = params.requestRefreshLock ?? ((callback) => callback());
   const createAuthRefreshAttemptId = params.createAuthRefreshAttemptId ?? defaultAuthRefreshAttemptId;
+
+  // Correlation must not turn a recoverable refresh into a logout: a broken
+  // Web Crypto or storage just means no attempt id (and so no receipt).
+  function attemptIdFor(refreshToken: string): string | undefined {
+    try {
+      return params.attemptIdForRefreshToken
+        ? params.attemptIdForRefreshToken(refreshToken, createAuthRefreshAttemptId)
+        : createAuthRefreshAttemptId();
+    } catch {
+      return undefined;
+    }
+  }
+
+  function installationIdFor(authRefreshAttemptId: string | undefined): string | undefined {
+    if (!authRefreshAttemptId) return undefined;
+    try {
+      return params.readInstallationId?.();
+    } catch {
+      return undefined;
+    }
+  }
 
   function emitCrossTabSync(
     phase: "adopt_pair" | "adopt_refresh_token" | "wait_start" | "wait_observed" | "wait_timeout",
@@ -252,19 +283,22 @@ export function createRefreshCoordinator(params: {
     let rotatedTokenRetries = 0;
 
     while (true) {
+      // One attempt id per refresh token, shared by every try of it: a retry
+      // after a lost reply is then a replay of the same attempt, which the
+      // server answers from its receipt instead of a 401.
+      const authRefreshAttemptId = attemptIdFor(refreshToken);
+      const authRefreshInstallationId = installationIdFor(authRefreshAttemptId);
       for (let attempt = 0; attempt <= REFRESH_RETRY_DELAYS_MS.length; attempt += 1) {
-        // Correlation is observability-only. Browser entropy can fail because
-        // of a broken/blocked Web Crypto implementation; that must not turn a
-        // recoverable auth refresh into a logout. In that case, continue the
-        // real refresh without the optional attempt id/header.
-        let authRefreshAttemptId: string | undefined;
         try {
-          authRefreshAttemptId = createAuthRefreshAttemptId();
-        } catch {
-          authRefreshAttemptId = undefined;
-        }
-        try {
-          const tokens = await params.requestRefresh(refreshToken, { authRefreshAttemptId });
+          const tokens = await params.requestRefresh(refreshToken, {
+            authRefreshAttemptId,
+            ...(authRefreshInstallationId ? { authRefreshInstallationId } : {}),
+          });
+          // A session stored while this refresh was out (a sign-in completing
+          // on a login callback page, or another tab) wins: never write the
+          // older session back over it (#proj-workspace:f07141a9, Tenny).
+          const superseded = readRotatedTokens(refreshToken);
+          if (superseded) return superseded;
           params.writeTokens(tokens);
           params.onTokensRefreshed?.(tokens);
           return tokens;
@@ -330,6 +364,10 @@ export function createRefreshCoordinator(params: {
           // the server only revoking the old token after a successful rotation.
           if (attempt < REFRESH_RETRY_DELAYS_MS.length) {
             await sleep(REFRESH_RETRY_DELAYS_MS[attempt]);
+            // A session stored meanwhile (another tab, a sign-in) wins over
+            // resending the old token.
+            const stored = readRotatedTokens(refreshToken);
+            if (stored) return stored;
             continue;
           }
 
@@ -385,6 +423,56 @@ function requestBrowserRefreshLock<T>(callback: () => Promise<T>): Promise<T> {
   return locks.request(REFRESH_LOCK_NAME, callback);
 }
 
+// This browser profile / desktop install, for the server's durable rotation
+// receipts (the same contract the mobile app uses). Not a secret: alone it
+// replays nothing, the old refresh token is still required.
+const INSTALLATION_ID_KEY = "slock_auth_installation_id";
+// The attempt id of the stored refresh token, kept so a refresh that failed
+// while the device slept is replayed later as the same attempt. Keyed by a
+// fingerprint of the token, so a new session never reuses an old attempt.
+const REFRESH_ATTEMPT_KEY = "slock_auth_refresh_attempt";
+const INSTALLATION_ID_PATTERN = /^ari_[0-9a-f]{32}$/;
+const ATTEMPT_ID_PATTERN = /^arf_[0-9a-f]{16}$/;
+
+// FNV-1a, 64-bit. Only tells this token's slot from another's; a collision
+// would merely reuse an attempt id, which the server checks with the token.
+function refreshTokenFingerprint(refreshToken: string): string {
+  let hash = 0xcbf29ce484222325n;
+  for (let i = 0; i < refreshToken.length; i += 1) {
+    hash ^= BigInt(refreshToken.charCodeAt(i));
+    hash = (hash * 0x100000001b3n) & 0xffffffffffffffffn;
+  }
+  return hash.toString(16).padStart(16, "0");
+}
+
+function readBrowserInstallationId(): string | undefined {
+  const stored = localStorage.getItem(INSTALLATION_ID_KEY);
+  if (stored && INSTALLATION_ID_PATTERN.test(stored)) return stored;
+  const created = `ari_${randomHex(16)}`;
+  localStorage.setItem(INSTALLATION_ID_KEY, created);
+  return created;
+}
+
+function browserAttemptIdForRefreshToken(refreshToken: string, create: () => string): string {
+  const fingerprint = refreshTokenFingerprint(refreshToken);
+  try {
+    const stored = JSON.parse(localStorage.getItem(REFRESH_ATTEMPT_KEY) ?? "null") as
+      { fingerprint?: unknown; attemptId?: unknown } | null;
+    if (
+      stored?.fingerprint === fingerprint
+      && typeof stored.attemptId === "string"
+      && ATTEMPT_ID_PATTERN.test(stored.attemptId)
+    ) {
+      return stored.attemptId;
+    }
+  } catch {
+    // Unreadable slot: start a new attempt below.
+  }
+  const attemptId = create();
+  localStorage.setItem(REFRESH_ATTEMPT_KEY, JSON.stringify({ fingerprint, attemptId }));
+  return attemptId;
+}
+
 const browserRefreshCoordinator = createRefreshCoordinator({
   readAccessToken: () => localStorage.getItem("slock_access_token"),
   readRefreshToken: () => localStorage.getItem("slock_refresh_token"),
@@ -397,14 +485,19 @@ const browserRefreshCoordinator = createRefreshCoordinator({
   },
   subscribeToTokenUpdates: (listener) => authTokenSync.subscribe(listener),
   requestRefreshLock: requestBrowserRefreshLock,
+  attemptIdForRefreshToken: browserAttemptIdForRefreshToken,
+  readInstallationId: readBrowserInstallationId,
   requestRefresh: async (refreshToken, context) => {
-    assertValidDesktopRuntimeEnvironment();
-
     const { data } = await axios.post(`${API_BASE}/auth/refresh`, { refreshToken }, {
       timeout: AUTH_REFRESH_REQUEST_TIMEOUT_MS,
-      headers: context.authRefreshAttemptId
-        ? { "X-Slock-Auth-Refresh-Attempt-Id": context.authRefreshAttemptId }
-        : undefined,
+      headers: {
+        ...clientRequestHeaders(),
+        ...(context.authRefreshAttemptId ? { "X-Slock-Auth-Refresh-Attempt-Id": context.authRefreshAttemptId } : {}),
+        // The server rejects an installation id without an attempt id (400).
+        ...(context.authRefreshAttemptId && context.authRefreshInstallationId
+          ? { "X-Slock-Auth-Installation-Id": context.authRefreshInstallationId }
+          : {}),
+      },
     });
     return {
       accessToken: data.accessToken,

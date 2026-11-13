@@ -12,13 +12,10 @@ import type { ReactNode } from "react";
  *
  * Raft Design System: a preview is content, not a control — the card surface
  * (`bg-layer-card`), a hairline (`line`), the container radius from raft-ui's
- * Card, never an ink line or a lift. Hover lays the pressed wash over the
- * surface (`press-overlay`), so the card keeps its fill.
- *
- * No `active:` token: the press state inherits the hover styling (`:hover`
- * keeps matching while `:active` is true). This matches QuotedMessageCard's
- * pre-refactor hover-only behavior (stdrc 2026-05-23 #proj-theme:441c8b2b
- * cfd10230).
+ * Card, never an ink line or a lift. A preview is a card people read, so
+ * hover lays the subtle tier over the surface (`overlay-subtle`) and press
+ * the medium tier (`overlay-medium`), like every clickable thing (Raft
+ * Design System › States › Hover and press); the card keeps its fill.
  *
  * Layout is caller-supplied via `className`: PreviewShell only owns the
  * polymorphic root + skin tokens. QuotedMessageCard passes `group w-full
@@ -29,9 +26,12 @@ import type { ReactNode } from "react";
  *  the border tokens without the full bg + hover-bg skin. */
 export const PREVIEW_SHELL_BORDER = "border border-line-hairline";
 
-/** Full default skin: hairline + card surface + the pressed wash on hover +
- *  explicitly NO shadow. No `active:` token — press inherits hover. */
-export const PREVIEW_SHELL_SKIN = `${PREVIEW_SHELL_BORDER} bg-layer-card hover:press-overlay shadow-none`;
+/** Full default skin: hairline + card surface + explicitly NO shadow. */
+export const PREVIEW_SHELL_SKIN = `${PREVIEW_SHELL_BORDER} bg-layer-card shadow-none`;
+
+/** The subtle tier on hover and the medium tier on press: only a preview that
+ *  is a button reacts like one. */
+const PREVIEW_SHELL_PRESS = "hover:overlay-subtle active:overlay-medium";
 
 /** Muted / unavailable variant — the sunken fill with ink-3 text: the message
  *  it pointed at is gone, so there is nothing to lift on hover. */
@@ -68,12 +68,13 @@ export default function PreviewShell({
   const skin = variant === "muted" ? PREVIEW_SHELL_SKIN_MUTED : PREVIEW_SHELL_SKIN;
   // A clickable preview is reachable by keyboard: the shared DS focus ring.
   const focus = onClick ? " outline-none focus-visible:shadow-focus" : "";
+  const press = onClick && variant !== "muted" ? ` ${PREVIEW_SHELL_PRESS}` : "";
   return (
     <Card
       render={<Root />}
       {...(onClick ? { type: "button" as const, onClick } : {})}
       {...rest}
-      className={`${skin}${focus}${className ? ` ${className}` : ""}`}
+      className={`${skin}${press}${focus}${className ? ` ${className}` : ""}`}
     >
       {children}
     </Card>

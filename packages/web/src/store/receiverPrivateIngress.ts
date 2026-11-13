@@ -69,6 +69,14 @@ export function isReceiverPrivateIngressContextCurrent(
     && context.serverEpoch === useServerStore.getState().serverEpoch;
 }
 
+/** A stale read whose server is still the current one, with someone signed in:
+ * only who reads changed (a sign-in switch), so it can be read again for them. */
+export function isReadForAnotherPersonHere(context: ReceiverPrivateIngressContext): boolean {
+  return readCurrentPrincipalId() !== null
+    && context.serverId === (useServerStore.getState().current?.id ?? null)
+    && context.serverEpoch === useServerStore.getState().serverEpoch;
+}
+
 export function invalidateReceiverPrivateIngressContexts(): void {
   receiverPrivateIngressGeneration += 1;
 }

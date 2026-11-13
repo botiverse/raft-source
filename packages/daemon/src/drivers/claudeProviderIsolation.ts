@@ -10,6 +10,9 @@ export const LEGACY_CLAUDE_PROVIDER_CONFIG_DIR = path.join(".slock", "claude-pro
 const warnedLegacyClaudeProviderConfigDirs = new Set<string>();
 
 export const CLAUDE_CUSTOM_PROVIDER_HOST_ENV_KEYS = [
+  // A custom provider sets one of these two from its key (authType); the other
+  // must not leak in from the host and reach the gateway as a second credential.
+  "ANTHROPIC_API_KEY",
   "ANTHROPIC_AUTH_TOKEN",
   "ANTHROPIC_CUSTOM_HEADERS",
   "CLAUDE_CODE_OAUTH_TOKEN",
@@ -46,10 +49,11 @@ export const CLAUDE_CUSTOM_PROVIDER_HOST_ENV_KEYS = [
 ] as const;
 
 export function isClaudeCustomProviderConfig(config: AgentConfig): boolean {
-  const launchRuntimeFields = runtimeConfigToLaunchFields(hydrateRuntimeConfig(config));
-  return launchRuntimeFields.runtime === "claude"
-    && Boolean(launchRuntimeFields.envVars?.ANTHROPIC_BASE_URL)
-    && Boolean(launchRuntimeFields.envVars?.ANTHROPIC_API_KEY);
+  // Decided by the provider itself, not by which env vars it materializes: an
+  // auth_token provider sets ANTHROPIC_AUTH_TOKEN instead of ANTHROPIC_API_KEY
+  // and must be isolated just the same.
+  const runtimeConfig = hydrateRuntimeConfig(config);
+  return runtimeConfig.runtime === "claude" && runtimeConfig.provider?.kind === "custom";
 }
 
 function clearInheritedClaudeProviderEnv(

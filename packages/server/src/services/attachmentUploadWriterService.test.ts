@@ -20,12 +20,9 @@ import {
   ATTACHMENT_STORAGE_KEY_PREFIX,
   PUBLIC_CONTENT_V2_KEY_PREFIX,
   __setPublicContentStorageForTests,
+  __setStorageForTests,
   resetStorageForTests,
 } from "./storageService";
-import {
-  ATTACHMENT_ORIGINAL_STORAGE_V2_FEATURE_FLAG_KEY,
-  PUBLIC_DERIVED_STORAGE_V2_FEATURE_FLAG_KEY,
-} from "./featureFlagService";
 
 
 afterEach(async () => {
@@ -112,38 +109,6 @@ test("the common web and agent writer commits every transfer plan before its fir
   );
 });
 
-test("the common web and agent writer returns fresh writes to legacy storage when the kill switch is on", async () => {
-  const { owner, server, channel } = await fixture();
-  await getDb().update(featureFlags)
-    .set({ killSwitch: true })
-    .where(eq(featureFlags.key, ATTACHMENT_ORIGINAL_STORAGE_V2_FEATURE_FLAG_KEY));
-  const storage = new InspectingStorage();
-
-  const rows = await uploadAttachmentBuffers({
-    serverId: server.id,
-    channelId: channel.id,
-    uploaderId: owner.id,
-    uploaderType: "user",
-    files: [
-      { buffer: Buffer.from("legacy-one"), filename: "legacy-one.txt", mimeType: "text/plain" },
-      { buffer: Buffer.from("legacy-two"), filename: "legacy-two.txt", mimeType: "text/plain" },
-    ],
-    storage,
-    cdnStorage: null,
-    preview: {
-      canGenerate: () => false,
-      generateThumbnail: async () => Buffer.alloc(0),
-      isSvg: () => false,
-      generateSvgRasterPreview: async () => Buffer.alloc(0),
-    },
-    now: new Date("2026-08-12T00:00:00.000Z"),
-  });
-
-  assert.equal(rows.length, 2);
-  for (const row of rows) assert.equal(row.storageKey, `${server.id}/${row.id}.txt`);
-  assert.deepEqual(storage.puts.slice().sort(), rows.map((row) => row.storageKey).sort());
-});
-
 test("one failed PUT waits for every concurrent write to settle before cleanup becomes eligible", async () => {
   const { owner, server, channel } = await fixture();
   const secondEntered = deferred();
@@ -222,22 +187,6 @@ const svgPreviewWriter = {
   generateSvgRasterPreview: async () => Buffer.from("raster"),
 };
 
-// No migration seeds this flag; it is created in the feature flag admin.
-async function enablePublicDerivedStorageV2(): Promise<void> {
-  await getDb().insert(featureFlags).values({
-    key: PUBLIC_DERIVED_STORAGE_V2_FEATURE_FLAG_KEY,
-    description: "test",
-    enabled: true,
-    killSwitch: false,
-    randomizationUnit: "server",
-    defaultEnabled: true,
-    salt: PUBLIC_DERIVED_STORAGE_V2_FEATURE_FLAG_KEY,
-  }).onConflictDoUpdate({
-    target: featureFlags.key,
-    set: { enabled: true, defaultEnabled: true },
-  });
-}
-
 async function uploadSvg(
   input: Awaited<ReturnType<typeof fixture>>,
   cdnStorage: StorageBackend,
@@ -256,13 +205,12 @@ async function uploadSvg(
   return row;
 }
 
-test("fresh SVG thumbnails and raster previews use content/v2 keys when the public-content flag and config are on", async () => {
+test("fresh SVG thumbnails and raster previews use content/v2 keys when public-content storage is configured", async () => {
   const input = await fixture();
-  const previousBase = process.env.PUBLIC_CONTENT_BASE_URL;
+  const previousBase = process.env.CDN_BASE_URL;
   try {
-    process.env.PUBLIC_CONTENT_BASE_URL = "https://content.example.test";
+    process.env.CDN_BASE_URL = "https://cdn.example.test";
     __setPublicContentStorageForTests(recordingPreviewStorage());
-    await enablePublicDerivedStorageV2();
     const cdnStorage = recordingPreviewStorage();
 
     const row = await uploadSvg(input, cdnStorage);
@@ -275,36 +223,69 @@ test("fresh SVG thumbnails and raster previews use content/v2 keys when the publ
     ]);
   } finally {
     resetStorageForTests();
-    if (previousBase === undefined) delete process.env.PUBLIC_CONTENT_BASE_URL;
-    else process.env.PUBLIC_CONTENT_BASE_URL = previousBase;
+    if (previousBase === undefined) delete process.env.CDN_BASE_URL;
+    else process.env.CDN_BASE_URL = previousBase;
   }
 });
 
-test("fresh thumbnails stay on legacy keys when the flag is off or the public-content domain is missing", async () => {
+test("fresh thumbnails stay on legacy keys when the public-content domain is missing", async () => {
   const input = await fixture();
+  const previousCdnBase = process.env.CDN_BASE_URL;
   const previousBase = process.env.PUBLIC_CONTENT_BASE_URL;
   try {
-    process.env.PUBLIC_CONTENT_BASE_URL = "https://content.example.test";
     __setPublicContentStorageForTests(recordingPreviewStorage());
-    const flagOffStorage = recordingPreviewStorage();
-    const flagOff = await uploadSvg(input, flagOffStorage);
-    assert.equal(flagOff.thumbnailKey, `thumbs/${input.server.id}/${flagOff.id}.webp`, "the seeded flag is default-off");
-    assert.deepEqual(flagOffStorage.puts, [
-      `previews/${input.server.id}/${flagOff.id}.webp`,
-      `thumbs/${input.server.id}/${flagOff.id}.webp`,
-    ]);
-
-    await enablePublicDerivedStorageV2();
+    delete process.env.CDN_BASE_URL;
     delete process.env.PUBLIC_CONTENT_BASE_URL;
-    const missingDomain = await uploadSvg(input, recordingPreviewStorage());
+    const missingDomainStorage = recordingPreviewStorage();
+    const missingDomain = await uploadSvg(input, missingDomainStorage);
     assert.equal(
       missingDomain.thumbnailKey,
       `thumbs/${input.server.id}/${missingDomain.id}.webp`,
       "no content/v2 key may be persisted without a public domain to serve it",
     );
+    assert.deepEqual(missingDomainStorage.puts, [
+      `previews/${input.server.id}/${missingDomain.id}.webp`,
+      `thumbs/${input.server.id}/${missingDomain.id}.webp`,
+    ]);
   } finally {
     resetStorageForTests();
+    if (previousCdnBase === undefined) delete process.env.CDN_BASE_URL;
+    else process.env.CDN_BASE_URL = previousCdnBase;
     if (previousBase === undefined) delete process.env.PUBLIC_CONTENT_BASE_URL;
     else process.env.PUBLIC_CONTENT_BASE_URL = previousBase;
+  }
+});
+
+test("without the dedicated attachment bucket the writer keeps legacy keys instead of failing", async () => {
+  const { owner, server, channel } = await fixture();
+  const storage = new InspectingStorage();
+  __setStorageForTests(storage, { dedicatedAttachmentKeys: false });
+  try {
+    const rows = await uploadAttachmentBuffers({
+      serverId: server.id,
+      channelId: channel.id,
+      uploaderId: owner.id,
+      uploaderType: "user",
+      files: [
+        { buffer: Buffer.from("one"), filename: "one.txt", mimeType: "text/plain" },
+        { buffer: Buffer.from("two"), filename: "two.txt", mimeType: "text/plain" },
+      ],
+      storage,
+      cdnStorage: null,
+      preview: {
+        canGenerate: () => false,
+        generateThumbnail: async () => Buffer.alloc(0),
+        isSvg: () => false,
+        generateSvgRasterPreview: async () => Buffer.alloc(0),
+      },
+      now: new Date("2026-08-12T00:00:00.000Z"),
+    });
+    assert.equal(storage.puts.length, 2);
+    assert.deepEqual(
+      storage.puts.slice().sort(),
+      rows.map((row) => `${server.id}/${row.id}.txt`).sort(),
+    );
+  } finally {
+    resetStorageForTests();
   }
 });

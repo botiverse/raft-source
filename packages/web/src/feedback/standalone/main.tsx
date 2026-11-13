@@ -4,13 +4,34 @@ import { FeedbackProvider, FeedbackWorkspace } from "@botiverse/hands-feedback-r
 import type { HandsFeedbackTransport } from "@botiverse/hands-feedback-react";
 import { ThemeProvider, Button, Lightbox, LightboxContent, LightboxClose, LightboxStage, LightboxMedia } from "@botiverse/raft-ui";
 import { createHandsFeedbackTransport } from "../createHandsFeedbackTransport";
-import { FEEDBACK_SDK_THEME } from "../feedbackSdkTheme";
+import { displayLocaleTag, matchDisplayLocale } from "@botiverse/raft-shared/src/displayLocales";
 import { FEEDBACK_SESSION_UPDATED, createNativeFeedbackClient, emitFeedbackEvent, readFeedbackHost, sameFeedbackSession } from "./host";
-import type { FeedbackHost, FeedbackHostEvent } from "./host";
+import type { FeedbackHost, FeedbackHostEvent, FeedbackHostLocale } from "./host";
 import { createDiagnosticsSubmission } from "./diagnostics";
 import type { DiagnosticsActions, DiagnosticsState, DiagnosticsReference } from "./diagnostics";
-declare const __RAFT_FEEDBACK_COPY__: Record<"en" | "zh-CN", Record<string, string>>;
+import { FeedbackActionCardEntry, readFeedbackActionCardLink } from "./actionCard";
+import { feedbackTicketRouteId } from "../feedbackPaths";
+import type { FeedbackCardCopyId } from "../feedbackCardCopy";
+declare const __RAFT_FEEDBACK_COPY__: Record<FeedbackHostLocale, Record<string, string>>;
 import "./styles.css";
+
+// The page's own copy covers every host locale; the Hands SDK ships only en and
+// zh-CN, so a Traditional Chinese host gets its Chinese chrome (as the in-app
+// feedback dialog does) and every other host its English chrome.
+function feedbackSdkLocale(locale: FeedbackHostLocale): "en" | "zh-CN" {
+  return locale === "zh-CN" || locale === "zh-TW" ? "zh-CN" : "en";
+}
+
+function browserFeedbackLocale(language: string): FeedbackHostLocale {
+  return displayLocaleTag(matchDisplayLocale(language) ?? "en");
+}
+
+// Opened from a `feedback:submit` card in the app: its draft first (actionCard.tsx).
+const actionCardLink = readFeedbackActionCardLink(window.location.search);
+// Opened on one ticket (`?ticket=<id>`, a done feedback card's "View in Settings" in the app):
+// the workspace starts on it, and Back goes to the list. An id the ticket route cannot open
+// is the list, as the web's Settings link does; with a card link the card's flow decides.
+const ticketLink = feedbackTicketRouteId(new URLSearchParams(window.location.search).get("ticket"));
 
 function FeedbackPage({ host, authPending, onTerminal }: { host: FeedbackHost; authPending: boolean; onTerminal: (event: FeedbackHostEvent) => void }) {
   const initial = useRef(host);
@@ -27,9 +48,9 @@ function FeedbackPage({ host, authPending, onTerminal }: { host: FeedbackHost; a
   const returnToEdit = useCallback(() => diagnosticsActions.current?.returnToEdit(), []);
   const pendingSubmission = useRef<{ id: string; input: Parameters<HandsFeedbackTransport["createTicket"]>[0]; metadata: Promise<Record<string, string> | null>; prepared?: { ref: DiagnosticsReference | null; submissionId: string | null } } | null>(null);
   const activeSubmission = useRef<{ dispose: () => void } | null>(null);
+  const hostMetadata = useCallback(async () => { const current = readFeedbackHost() ?? initial.current; return { client_kind: current.session.clientKind, platform: current.session.clientKind, client_version: current.session.clientVersion, locale: current.session.locale }; }, []);
   const transport = useMemo(() => {
-    const metadata = async () => { const current = readFeedbackHost() ?? initial.current; return { client_kind: current.session.clientKind, platform: current.session.clientKind, client_version: current.session.clientVersion, locale: current.session.locale }; };
-    const ordinary = createHandsFeedbackTransport(client, { metadata });
+    const ordinary = createHandsFeedbackTransport(client, { metadata: hostMetadata });
     return { ...ordinary, async createTicket(input: Parameters<typeof ordinary.createTicket>[0]) {
       const current = readFeedbackHost();
       if (!current?.capabilities?.includes("diagnostics-upload-v1") || !current.diagnostics) return ordinary.createTicket(input);
@@ -37,7 +58,7 @@ function FeedbackPage({ host, authPending, onTerminal }: { host: FeedbackHost; a
       // Keep the exact payload and metadata for every attempt, even if the form or token changes.
       setWithoutDiagnostics(false);
       if (pendingSubmission.current?.id !== input.submissionId) {
-        pendingSubmission.current = { id: input.submissionId, input: { ...input, attachments: [...input.attachments] }, metadata: metadata() };
+        pendingSubmission.current = { id: input.submissionId, input: { ...input, attachments: [...input.attachments] }, metadata: hostMetadata() };
       }
       const pending = pendingSubmission.current;
       const snapshot = { ...pending.input, onAttachmentProgress: input.onAttachmentProgress };
@@ -54,7 +75,7 @@ function FeedbackPage({ host, authPending, onTerminal }: { host: FeedbackHost; a
       activeSubmission.current = flow;
       try { const result = await flow.result; pendingSubmission.current = null; return result; } finally { activeSubmission.current = null; }
     } };
-  }, [client]);
+  }, [client, hostMetadata]);
   useEffect(() => () => { activeSubmission.current?.dispose(); }, []);
   const alive = useRef(true);
   const attachmentController = useMemo(() => new AbortController(), []);
@@ -75,13 +96,15 @@ function FeedbackPage({ host, authPending, onTerminal }: { host: FeedbackHost; a
   const changePreview = useCallback((open: boolean) => { if (!open) setPreview(null); }, []);
   const messages = __RAFT_FEEDBACK_COPY__[host.session.locale];
   const sdkMessages = useMemo(() => ({ errorUnauthorized: messages[authPending ? "feedback.native.authRequired" : "feedback.native.authRestored"] }), [messages, authPending]);
+  const cardCopy = useCallback((id: FeedbackCardCopyId) => messages[id], [messages]);
+  const renderWorkspace = useCallback((initialTicketId?: string) => <div inert={diagnosticsState.phase !== "idle" || undefined} style={{ height: "100%" }}><FeedbackProvider transport={transport} locale={feedbackSdkLocale(host.session.locale)} messages={sdkMessages}>
+    <FeedbackWorkspace initialTicketId={initialTicketId} enablePullToRefresh hideHeaderTitle onOpenAttachment={openAttachment} onOpenPendingAttachment={openPending} />
+  </FeedbackProvider></div>, [diagnosticsState.phase, transport, host.session.locale, sdkMessages, openAttachment, openPending]);
   return <ThemeProvider mode={host.session.mode}>
     <div className="feedback-entry">
       {withoutDiagnostics && <p className="feedback-diagnostics-notice" role="status">{messages["feedback.native.diagnostics.unavailable"]}</p>}
       {error && <p role="alert">{messages["settings.about.feedbackAttachmentOpenError"]}</p>}
-      <div inert={diagnosticsState.phase !== "idle" || undefined} style={{ height: "100%" }}><FeedbackProvider transport={transport} locale={host.session.locale} theme={FEEDBACK_SDK_THEME} messages={sdkMessages}>
-        <FeedbackWorkspace enablePullToRefresh hideHeaderTitle onOpenAttachment={openAttachment} onOpenPendingAttachment={openPending} />
-      </FeedbackProvider></div>
+      {actionCardLink ? <FeedbackActionCardEntry client={client} link={actionCardLink} metadata={hostMetadata} copy={cardCopy} renderWorkspace={renderWorkspace} /> : renderWorkspace(ticketLink ?? undefined)}
       {diagnosticsState.phase !== "idle" && <div className="feedback-diagnostics-status" ref={diagnosticsDialog} tabIndex={-1} role="dialog" aria-modal="true" aria-label={messages["feedback.native.diagnosticsTitle"]}>
         <div className="feedback-diagnostics-card">
           <p role="status">{messages[diagnosticsState.phase === "failed" && diagnosticsState.rejected ? "feedback.native.diagnostics.rejected" : `feedback.native.diagnostics.${diagnosticsState.phase}`]}</p>
@@ -120,7 +143,7 @@ function FeedbackEntry() {
   }, [host]);
   // No login UI, token storage, main App, account bootstrap or server load.
   const session = host?.session ?? lastHost.current?.session;
-  const locale = session?.locale ?? (navigator.language.startsWith("zh") ? "zh-CN" : "en");
+  const locale = session?.locale ?? browserFeedbackLocale(navigator.language);
   return <ThemeProvider mode={session?.mode ?? (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light")}>
     {host ? <><div inert={authPending || undefined}><FeedbackPage host={host} authPending={authPending} onTerminal={onTerminal} /></div>{authPending && <p className="feedback-host-status feedback-auth-status" role="status">{__RAFT_FEEDBACK_COPY__[locale]["feedback.native.authRequired"]}</p>}</> : <p className="feedback-host-status" role="status">{__RAFT_FEEDBACK_COPY__[locale]["feedback.native.hostRequired"]}</p>}
   </ThemeProvider>;

@@ -26,7 +26,7 @@ import type {
   AppResolvedMode,
   AppThemePreferences,
 } from "./appTheme";
-import { appThemeChromeColor } from "./appThemeChrome";
+import { setSystemBarMode } from "./systemBarColor";
 
 // RUI reads matchMedia even when an explicit mode is supplied. Keep the
 // provider usable in non-browser test/SSR harnesses that do not install it.
@@ -61,8 +61,9 @@ function syncRootTheme(mode: AppResolvedMode): void {
   root.classList.toggle("light", mode === "light");
   root.classList.toggle("dark", mode === "dark");
   root.style.colorScheme = mode;
-  const meta = document.querySelector<HTMLMetaElement>('meta[name="theme-color"]');
-  if (meta) meta.content = appThemeChromeColor(mode);
+  // The system bar re-resolves whichever surface meets the top edge (a pushed
+  // page keeps paper) rather than being reset to the frame.
+  setSystemBarMode(mode);
 }
 
 function isDeviceThemeStorageKey(key: string | null): boolean {

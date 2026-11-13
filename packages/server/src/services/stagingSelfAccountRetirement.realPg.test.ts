@@ -9,12 +9,19 @@ import { closeDatabase, getDb, initDatabase } from "../db/index";
 import * as schema from "../db/schema";
 import { sessionFamilies, sessions, users } from "../db/schema";
 import { createSession, refreshSession, refreshSessionWithTrace } from "./sessionService";
+import { proofForPasswordLogin } from "./sessionIssueGate";
 import { retireStagingSelfAccount } from "./userService";
 
 const URL_ENV = "STAGING_SELF_ACCOUNT_RETIREMENT_REAL_PG_URL";
 const ADMIN_URL = process.env[URL_ENV];
 const REQUIRED = process.env.STAGING_SELF_ACCOUNT_RETIREMENT_REAL_PG_REQUIRED === "1";
 const MIGRATIONS = fileURLToPath(new URL("../../drizzle", import.meta.url));
+
+async function passwordProof(userId: string) {
+  const gate = await proofForPasswordLogin(userId);
+  if (gate.secondFactorRequired) throw new Error("unexpected second factor");
+  return gate.proof;
+}
 
 function dbUrl(adminUrl: string, databaseName: string): string {
   const parsed = new URL(adminUrl); parsed.pathname = `/${databaseName}`; return parsed.toString();
@@ -62,14 +69,15 @@ test("real PostgreSQL retirement wins queued session issuance and refresh at the
       passwordHash: "test-only", emailVerified: true,
       stagingSelfAccountCapabilityHash: createHash("sha256").update(capability).digest("hex"),
     }).returning();
-    const original = await createSession(user.id);
-    const durableOriginal = await createSession(user.id);
+    const original = await createSession(await passwordProof(user.id));
+    const durableOriginal = await createSession(await passwordProof(user.id));
+    const lateProof = await passwordProof(user.id);
 
     blocker = new pg.Client({ connectionString: url }); await blocker.connect();
     await blocker.query("BEGIN"); await blocker.query("SELECT id FROM users WHERE id=$1 FOR UPDATE", [user.id]);
     const retirement = retireStagingSelfAccount(user.id, user.id, capability);
     await waitForWaiters(blocker, 1);
-    const issuanceRejected = assert.rejects(createSession(user.id), /USER_RETIRED/);
+    const issuanceRejected = assert.rejects(createSession(lateProof), /USER_RETIRED/);
     const refresh = refreshSession(original.refreshToken);
     const durableRefresh = refreshSessionWithTrace(durableOriginal.refreshToken, { attemptId: "race-attempt", installationId: "race-install" });
     await waitForWaiters(blocker, 4);

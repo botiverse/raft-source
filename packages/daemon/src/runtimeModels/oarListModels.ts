@@ -3,8 +3,10 @@ import type { AvailableInstallation, ListModelsResult, ModelEntry, ModelLister }
 import {
   clearClockTimeout,
   setClockTimeout,
+  sanitizeRuntimeModelUnavailable,
   type RuntimeModelInfo,
   type RuntimeModelSourceOutcome,
+  type RuntimeModelUnavailable,
 } from "@botiverse/raft-shared";
 
 /**
@@ -14,7 +16,8 @@ import {
  * outcome kinds and error codes, never a new status (installed mobile apps
  * decode the status strictly).
  *
- *  - `ok` with models            → `live`
+ *  - `ok` with models            → `live` (disabled entries ride along as
+ *                                   `unavailable`, never in `models`)
  *  - `ok` with no models         → `no_models`
  *  - `unauthenticated`           → retryable `runtime_not_authenticated`
  *  - `unsupported`               → `onUnsupported` (the caller decides: for
@@ -38,6 +41,12 @@ export interface OarModelSourceInput {
   readonly label: (entry: ModelEntry) => string;
   /** Keep OAR's effort menu only when the runtime's launch path applies the chosen effort. */
   readonly keepReasoningEfforts: boolean;
+  /**
+   * Report the entry OAR marks `default` (the model a session uses with no
+   * `model` set) as the set's `default`, so the form preselects it. Opt-in:
+   * the other callers' forms keep their first-listed preselection.
+   */
+  readonly reportDefault?: boolean;
   readonly onUnsupported: (reason: string) => RuntimeModelSourceOutcome;
 }
 
@@ -50,7 +59,7 @@ const DEADLINE = Symbol("deadline");
  * second one, so one runtime never has two listings at once.
  *
  * Keyed by lister function, not by installation: correct while each lister
- * serves a single installation (OpenCode, the only OAR lister used here). A
+ * serves a single installation (OpenCode's `opencode`, Claude's host `claude`). A
  * lister serving several installations needs an installation-scoped key, or
  * one installation's request would join another's listing.
  */
@@ -90,7 +99,12 @@ export async function detectModelSourceViaOar(input: OarModelSourceInput): Promi
   switch (result.kind) {
     case "ok": {
       const models = projectOarModelEntries(result.models, input);
-      return models.length > 0 ? { kind: "live", value: { models } } : { kind: "no_models" };
+      const unavailable = projectOarUnavailableEntries(result.models, input, models);
+      const defaultId = input.reportDefault ? result.models.find((entry) => entry.default)?.id : undefined;
+      const reportedDefault = defaultId && models.some((model) => model.id === defaultId) ? defaultId : undefined;
+      return models.length > 0
+        ? { kind: "live", value: { models, ...(reportedDefault ? { default: reportedDefault } : {}), ...(unavailable ? { unavailable } : {}) } }
+        : { kind: "no_models" };
     }
     case "unauthenticated":
       return { kind: "error", retryable: true, code: "runtime_not_authenticated" };
@@ -123,4 +137,21 @@ export function projectOarModelEntries(
     });
   }
   return models;
+}
+
+/**
+ * The entries the runtime listed but disabled (`disabled.reason`, e.g. Claude
+ * Code's "upgrade" or plan notes), as a separate list so the picker can say why
+ * without offering them. Kept out of `models` for older clients, which offer
+ * every entry there. An id also listed as usable is not repeated.
+ */
+export function projectOarUnavailableEntries(
+  entries: readonly ModelEntry[],
+  options: Pick<OarModelSourceInput, "label">,
+  usable: readonly RuntimeModelInfo[],
+): RuntimeModelUnavailable[] | undefined {
+  const usableIds = new Set(usable.map((model) => model.id));
+  return sanitizeRuntimeModelUnavailable(entries
+    .filter((entry) => entry.disabled && !usableIds.has(entry.id))
+    .map((entry) => ({ id: entry.id, label: options.label(entry), reason: entry.disabled!.reason })));
 }

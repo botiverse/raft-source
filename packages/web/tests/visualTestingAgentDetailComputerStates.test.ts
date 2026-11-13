@@ -14,11 +14,9 @@ const fixture = JSON.parse(readFileSync(new URL("fixtureData.json", sharedDir), 
   machines: Record<string, { id: string; name: string; status: string }>;
   agents: Record<string, { id: string; machineKey: string | null; serverRole?: string }>;
 };
-const specSource = readFileSync(new URL("../../visual-testing/tests/react-provider.spec.ts", import.meta.url), "utf8");
 const manifest = JSON.parse(readFileSync(new URL("sharedCases.json", sharedDir), "utf8")) as {
   cases: Array<{ id: string; androidCaseHint?: string; capture?: { selector?: string } }>;
 };
-const casesSource = readFileSync(new URL("../visual-testing/VisualTestingCases.tsx", import.meta.url), "utf8");
 
 /** The state each fixture agent must encode, by construction. */
 const STATE_AGENTS = {
@@ -74,7 +72,7 @@ test("the long-name machine cannot fit one 390dp line, unlike the default machin
   assert.ok(longestUnbreakableRun(defaultName) < 40);
 });
 
-test("each state case is registered in the manifest and bound to its agent on both arms", () => {
+test("each state case is registered in the manifest and bound to its agent", () => {
   for (const [agentKey, expect] of Object.entries(STATE_AGENTS)) {
     const caseId = `screens.members.agent-detail.profile.${expect.caseSuffix}`;
     const entry = manifest.cases.find((c) => c.id === caseId);
@@ -82,11 +80,6 @@ test("each state case is registered in the manifest and bound to its agent on bo
     const agentId = fixture.agents[agentKey].id;
     assert.match(entry.androidCaseHint ?? "", new RegExp(`memberId=${agentId}(,|$)`), `${caseId}: androidCaseHint must open ${agentId}`);
     assert.equal(entry.capture?.selector, `[data-visual-case='${caseId}']`);
-    // Web side: the case must exist AND name the same fixture agent.
-    const block = casesSource.match(new RegExp(`"${caseId.replace(/\./g, "\\.")}": \\{[^}]*\\}`));
-    assert.ok(block, `${caseId} not declared in VisualTestingCases.tsx`);
-    assert.match(block[0], new RegExp(`agentKey: "${agentKey}"`), `${caseId}: web case must bind agentKey ${agentKey}`);
-    assert.match(block[0], /tab: "profile"/, `${caseId}: dotted suffix would be parsed as the tab; tab must be explicit`);
   }
 });
 
@@ -102,7 +95,7 @@ test("mutation control: a short or breakable name is rejected by the predicate",
 // "omitted" branch ("No role") and the role chip cell compares two renderings of
 // an absence instead of one value. The mock must forward it, because the app's
 // post-mount refetch replaces whatever the case file seeded.
-test("every fixture agent carries a server role and the /api/agents mock forwards it", () => {
+test("every fixture agent carries a server role", () => {
   const agents = Object.entries(fixture.agents);
   assert.ok(agents.length >= 10, `only ${agents.length} fixture agents — did the fixture shape change?`);
   for (const [key, agent] of agents) {
@@ -112,15 +105,10 @@ test("every fixture agent carries a server role and the /api/agents mock forward
     }
     assert.ok(agent.serverRole === "member" || agent.serverRole === "admin", `${key}.serverRole is ${JSON.stringify(agent.serverRole)}`);
   }
-  // Anchor on the fulfilling branch; the home-loading branch mentions the same path earlier.
   // Ten identical values would let a hardcoded "Member" chip pass: the fixture
   // must reach BOTH chips (text and colour differ) so the cell can fail (LiBai).
   const roles = new Set(agents.map(([, agent]) => agent.serverRole));
   assert.ok(roles.has("admin") && roles.has("member"), `fixture roles ${JSON.stringify([...roles])} must include both admin and member`);
-  const mock = specSource.match(/if \(pathname === "\/api\/agents"\) \{[\s\S]*?return;/);
-  assert.ok(mock, "/api/agents mock not found in react-provider.spec.ts");
-  // Accepts the plain read and the cast form `(agent as {...}).serverRole` used once noMembership has no role.
-  assert.match(mock[0], /serverRole: \(?agent(?: as \{[^}]*\})?\)?\.serverRole/, "the /api/agents mock must forward serverRole from the fixture agent");
 });
 
 // Batch 2: the bare-daemon branch of web's per-type version rule
@@ -139,11 +127,7 @@ test("the daemon-only machine is a bare daemon, unlike every other fixture machi
   assert.ok(others.every(([, m]) => m.isComputer === true), "some other fixture machine is already a bare daemon — then this cell is not the only input and the control is stale");
 });
 
-test("the loading-state case keeps the machines list in flight on both surfaces", () => {
+test("the loading-state case is registered in the shared manifest", () => {
   const caseId = "screens.members.agent-detail.profile.loading-state";
-  const block = casesSource.match(new RegExp(`"${caseId.replace(/\./g, "\\.")}": \\{[^}]*\\}`));
-  assert.ok(block, `${caseId} not declared in VisualTestingCases.tsx`);
-  assert.match(block[0], /machinesLoading: true/, "the web case must seed the machine store as loading");
   assert.ok(manifest.cases.some((c) => c.id === caseId), `${caseId} missing from sharedCases.json`);
-  assert.match(specSource, /screens\.members\.agent-detail\.profile\.loading-state[\s\S]{0,400}servers\/visual-server\/machines/, "the spec must hold the machines route in flight for this case");
 });

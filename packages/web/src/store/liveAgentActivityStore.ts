@@ -17,6 +17,7 @@ export interface LiveAgentActivityEvent {
   timestamp?: number;
   isHeartbeat?: boolean;
   isRefreshOnly?: boolean;
+  fromCoarseState?: boolean;
 }
 
 interface LiveAgentActivityState {

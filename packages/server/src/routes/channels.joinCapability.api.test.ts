@@ -10,14 +10,15 @@ import { asServerId } from "@botiverse/raft-shared";
 
 import { channelAgents, channelHumans, serverAgentMembers, serverMembers, users } from "../db/schema";
 import { getDb } from "../db/index";
-import { createAgent, assignMachine } from "../services/agentService";
+import { createAgent } from "../services/agentService";
+import { placeAgentOnMachine } from "../test/agentMachineFixture";
 import { mintAgentCredential } from "../services/agentCredentialService";
 import { addAgent, addHuman, createChannel } from "../services/channelService";
 import { registerMachine } from "../services/machineService";
 import { createServer } from "../services/serverService";
 import { channelRouter } from "./channels";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 async function seedUser(name: string) {
   const [user] = await getDb().insert(users).values({
@@ -77,7 +78,7 @@ test("human public-channel self-join reads joinPublicChannels from the caller's 
       method: "POST",
     });
     assert.equal(response.status, 403);
-    assert.deepEqual(await response.json(), { error: "Server role cannot join public channels" });
+    assert.deepEqual(await response.json(), { error: "Server role cannot join public channels", code: "join_not_allowed" });
     assert.equal(await isHumanInChannel(channel.id, outsider.id), false);
   } finally {
     if (routeServer) {
@@ -96,6 +97,7 @@ test("agent credential public-channel self-join requires joinPublicChannels", as
     agentId: agent.id,
     scopes: ["channels"],
     name: "join-capability-test",
+    issuedVia: "human",
     createdByUserId: owner.id,
   });
   await getDb().delete(serverAgentMembers).where(and(
@@ -108,7 +110,9 @@ test("agent credential public-channel self-join requires joinPublicChannels", as
     headers: { Authorization: `Bearer ${credential.apiKey}` },
   });
   assert.equal(response.status, 403);
-  assert.deepEqual(await response.json(), { error: "Server role cannot join public channels" });
+  const body = await response.json() as { code?: string; error?: string };
+  assert.equal(body.code, "server_role_cannot_join");
+  assert.match(body.error ?? "", /^Your server role can't join public channels/);
   assert.equal(await isAgentInChannel(channel.id, agent.id), false);
 });
 
@@ -118,7 +122,7 @@ test("legacy machine-on-behalf public-channel self-join requires joinPublicChann
   const agent = await createAgent(server.id, "join-capability-legacy-agent", { runtime: "codex" });
   const channel = await createChannel(server.id, "legacy-join-capability-public");
   const { machine, apiKey } = await registerMachine(server.id, owner.id, "join-capability-machine");
-  await assignMachine(agent.id, machine.id);
+  await placeAgentOnMachine(agent.id, machine.id);
   await getDb().delete(serverAgentMembers).where(and(
     eq(serverAgentMembers.serverId, server.id),
     eq(serverAgentMembers.agentId, agent.id),
@@ -129,7 +133,9 @@ test("legacy machine-on-behalf public-channel self-join requires joinPublicChann
     headers: { Authorization: `Bearer ${apiKey}` },
   });
   assert.equal(response.status, 403);
-  assert.deepEqual(await response.json(), { error: "Server role cannot join public channels" });
+  const body = await response.json() as { code?: string; error?: string };
+  assert.equal(body.code, "server_role_cannot_join");
+  assert.match(body.error ?? "", /^Your server role can't join public channels/);
   assert.equal(await isAgentInChannel(channel.id, agent.id), false);
 });
 
@@ -184,6 +190,7 @@ test("agent credential already-member self-join is an idempotent success before 
     agentId: agent.id,
     scopes: ["channels"],
     name: "idempotent-agent-join-test",
+    issuedVia: "human",
     createdByUserId: owner.id,
   });
   await getDb().delete(serverAgentMembers).where(and(
@@ -207,7 +214,7 @@ test("legacy machine already-member self-join is an idempotent success before ca
   const channel = await createChannel(server.id, "idempotent-legacy-join-public");
   await addAgent(channel.id, agent.id);
   const { machine, apiKey } = await registerMachine(server.id, owner.id, "idempotent-legacy-machine");
-  await assignMachine(agent.id, machine.id);
+  await placeAgentOnMachine(agent.id, machine.id);
   await getDb().delete(serverAgentMembers).where(and(
     eq(serverAgentMembers.serverId, server.id),
     eq(serverAgentMembers.agentId, agent.id),

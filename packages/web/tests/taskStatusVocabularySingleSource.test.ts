@@ -15,7 +15,7 @@ import { join, resolve } from "node:path";
 // copy survive.
 
 const TASK_DIR = resolve(import.meta.dirname, "../src/components/task");
-const STATUS_WORDS = ["Todo", "In Progress", "In Review", "Done", "Closed"];
+const STATUS_WORDS = ["Todo", "In progress", "In review", "Done", "Closed"];
 
 function sourceFiles(dir: string): string[] {
   return readdirSync(dir, { withFileTypes: true }).flatMap((e) => {

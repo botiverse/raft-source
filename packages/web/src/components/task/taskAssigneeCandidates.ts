@@ -14,7 +14,6 @@ type TaskAssigneeMember = {
   name?: string;
   displayName?: string | null;
   avatarUrl?: string | null;
-  gravatarHash?: string;
 };
 
 function representativeKey(member: TaskAssigneeMember): string {
@@ -23,7 +22,6 @@ function representativeKey(member: TaskAssigneeMember): string {
     member.displayName ?? "",
     member.name ?? "",
     member.avatarUrl ?? "",
-    member.gravatarHash ?? "",
   ]);
 }
 

@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
-import { access, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
-import { runLogin, runLogout } from "./login";
+import { runLogin, runLogout, runSessionLogin } from "./login";
 import { serverAttachmentPath, userSessionPath } from "./paths";
 
 async function withHome<T>(fn: (home: string) => Promise<T>): Promise<T> {
@@ -39,7 +39,7 @@ function captureOut(): { restore: () => void; text: () => string } {
   };
 }
 
-test("login prints verificationUriComplete from the web origin when provided", async () => {
+test("login (older server) prints the approval page from the web origin and the code to type, never a pre-filled link, then signs in as before", async () => {
   await withHome(async () => {
     let tokenPolls = 0;
     const server = await new Promise<Server>((resolve) => {
@@ -88,12 +88,15 @@ test("login prints verificationUriComplete from the web origin when provided", a
     }
 
     assert.equal(tokenPolls, 1);
-    assert.deepEqual(opened, ["https://slock-app-staging.botiverse.dev/login/device?user_code=ABCD-1234"]);
-    assert.match(cap.text(), /https:\/\/slock-app-staging\.botiverse\.dev\/login\/device\?user_code=ABCD-1234/);
-    assert.match(cap.text(), /To finish signing in, open this link in a browser:/);
+    assert.deepEqual(opened, ["https://slock-app-staging.botiverse.dev/login/device"]);
+    assert.match(cap.text(), /https:\/\/slock-app-staging\.botiverse\.dev\/login\/device\n/);
+    assert.doesNotMatch(cap.text(), /user_code=/);
+    assert.match(cap.text(), /Use `raft-computer attach \/<server>`/);
     assert.match(cap.text(), /opened automatically/);
-    assert.match(cap.text(), /If the page asks for a code: ABCD-1234/);
-    assert.match(cap.text(), /Keep this command running — sign-in completes here automatically/);
+    assert.match(cap.text(), /Then enter this code on the page: ABCD-1234/);
+    // An older server answered with a session: the old login outcome.
+    assert.match(cap.text(), /does not support one-time approvals yet/);
+    assert.match(cap.text(), /Logged in\. User session written to /);
     // Device approval is user-scoped: never point at a server-scoped surface.
     assert.doesNotMatch(cap.text(), /Connect Computer dialog/);
     assert.doesNotMatch(cap.text(), new RegExp(`${baseUrl.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/login/device`));
@@ -150,15 +153,13 @@ test("runLogin: failed browser auto-open keeps manual authorization URL visible"
       });
     }
 
-    assert.match(cap.text(), /To finish signing in, open this link in a browser:/);
-    assert.match(cap.text(), /https:\/\/app\.raft\.build\/login\/device\?user_code=ABCD-1234/);
-    assert.match(cap.text(), /If the page asks for a code: ABCD-1234/);
-    assert.match(cap.text(), /Keep this command running — sign-in completes here automatically/);
+    assert.match(cap.text(), /https:\/\/app\.raft\.build\/login\/device\n/);
+    assert.match(cap.text(), /Then enter this code on the page: ABCD-1234/);
     assert.doesNotMatch(cap.text(), /Connect Computer dialog/);
   });
 });
 
-test("runLogin: orchestrated approved event suppresses session path and Next hint", async () => {
+test("runSessionLogin (setup's legacy branch): orchestrated approved event suppresses session path and Next hint", async () => {
   await withHome(async () => {
     let tokenPolls = 0;
     const server = await new Promise<Server>((resolve) => {
@@ -197,7 +198,7 @@ test("runLogin: orchestrated approved event suppresses session path and Next hin
     const baseUrl = `http://127.0.0.1:${address.port}`;
     const cap = captureOut();
     try {
-      await runLogin({ serverUrl: baseUrl, orchestrated: true, openUrl: () => {} });
+      await runSessionLogin({ serverUrl: baseUrl, orchestrated: true, openUrl: () => {} });
     } finally {
       cap.restore();
       await new Promise<void>((resolve, reject) => {
@@ -231,7 +232,7 @@ async function fileExists(p: string): Promise<boolean> {
   }
 }
 
-test("runLogout: deletes the user session file and leaves per-server attachments untouched", async () => {
+test("runLogout: changes nothing — the user session file and per-server attachments stay — and says why", async () => {
   await withHome(async (home) => {
     const sessionPath = userSessionPath(home);
     await mkdir(dirname(sessionPath), { recursive: true });
@@ -247,44 +248,80 @@ test("runLogout: deletes the user session file and leaves per-server attachments
     } finally {
       cap.restore();
     }
-    assert.equal(await fileExists(sessionPath), false, "user session should be deleted");
+    assert.equal(await fileExists(sessionPath), true, "logout no longer deletes anything");
     assert.equal(await fileExists(attachPath), true, "per-server attachment must be untouched");
-    assert.match(cap.text(), /Logged out/);
+    assert.equal(
+      cap.text(),
+      "Nothing to log out of: this machine joins each server with a one-time approval and keeps no sign-in. Nothing was changed, and every connected server stays connected.\n" +
+        "To take this machine off a server, run `raft-computer detach /<server>`.\n",
+    );
   });
 });
 
-test("runLogout: idempotent when already logged out (no session file)", async () => {
-  await withHome(async () => {
+test("runLogin (current server): runs attach's approval for the server picked on the page, writes no user session", async () => {
+  await withHome(async (home) => {
+    const authorizeBodies: Array<Record<string, unknown>> = [];
+    const attachAuth: string[] = [];
+    const server = await new Promise<Server>((resolve) => {
+      const s = createServer((req, res) => {
+        const chunks: Buffer[] = [];
+        req.on("data", (c) => chunks.push(Buffer.from(c)));
+        req.on("end", () => {
+          const raw = Buffer.concat(chunks).toString("utf8");
+          const body = raw ? (JSON.parse(raw) as Record<string, unknown>) : {};
+          res.setHeader("content-type", "application/json");
+          if (req.url === "/api/auth/device/authorize") {
+            authorizeBodies.push(body);
+            res.statusCode = 201;
+            res.end(JSON.stringify({ deviceCode: "dvc_test", userCode: "ABCD-1234", verificationUri: "https://app.raft.build/login/device", expiresIn: 30, interval: 1 }));
+            return;
+          }
+          if (req.url === "/api/auth/device/token") {
+            res.statusCode = 200;
+            res.end(JSON.stringify({ kind: "computer_attach", attachToken: "dvat_loginAttachToken0123", expiresIn: 600, serverId: "11111111-1111-4111-8111-111111111111", serverSlug: "alpha", serverName: "Alpha" }));
+            return;
+          }
+          if (req.url === "/api/computer/attach") {
+            attachAuth.push(String(req.headers.authorization ?? ""));
+            res.statusCode = 201;
+            res.end(JSON.stringify({ apiKey: "sk_computer_login", serverMachineId: "cm-login", serverId: "11111111-1111-4111-8111-111111111111", serverSlug: "alpha", resumed: false }));
+            return;
+          }
+          if (req.url === "/internal/computer/preflight") {
+            res.statusCode = 200;
+            res.end(JSON.stringify({ ok: true }));
+            return;
+          }
+          res.statusCode = 404;
+          res.end("{}");
+        });
+      });
+      s.listen(0, "127.0.0.1", () => resolve(s));
+    });
+    const address = server.address();
+    assert.ok(address && typeof address === "object");
+    const baseUrl = `http://127.0.0.1:${address.port}`;
     const cap = captureOut();
     try {
-      await runLogout();
+      await runLogin({ serverUrl: baseUrl, openUrl: () => {} });
     } finally {
       cap.restore();
-    }
-    assert.match(cap.text(), /Already logged out/);
-  });
-});
-
-test("runLogin: device-authorize transport failure → DEVICE_AUTHORIZE_FAILED with server URL + actionable hint", async () => {
-  await withHome(async () => {
-    // Point at an unreachable port to force a transport failure.
-    const baseUrl = "http://127.0.0.1:1"; // port 1 — guaranteed unreachable
-    const cap = captureOut();
-    try {
-      await assert.rejects(
-        () => runLogin({ serverUrl: baseUrl }),
-        (e) => (e as { name?: string }).name === "CliExit",
-      );
-    } finally {
-      cap.restore();
+      await new Promise<void>((resolve, reject) => {
+        server.close((err) => (err ? reject(err) : resolve()));
+      });
     }
     const out = cap.text();
-    // Error code MUST remain stable (regression guard against accidental rename).
-    assert.match(out, /DEVICE_AUTHORIZE_FAILED/);
-    // Slice 3 enrichment: server URL embedded + actionable hint.
-    assert.match(out, /Could not start device login at/);
-    assert.match(out, /http:\/\/127\.0\.0\.1:1/);
-    assert.match(out, /Check that the server URL is correct and reachable/);
+    assert.match(out, /^Note: `raft-computer login` is no longer a separate step\. Use `raft-computer attach \/<server>`/);
+    assert.match(out, /Then enter this code on the page: ABCD-1234/);
+    assert.doesNotMatch(out, /If the page asks which server/);
+    assert.match(out, /Attached\. Computer state written to /);
+    assert.match(out, /Next: run `raft-computer start`/);
+    assert.doesNotMatch(out, /dvat_/);
+    assert.equal((authorizeBodies[0]!.grant as Record<string, unknown>).kind, "computer_attach");
+    assert.deepEqual(attachAuth, ["Bearer dvat_loginAttachToken0123"]);
+    assert.equal(await fileExists(userSessionPath(home)), false);
+    const saved = JSON.parse(await readFile(serverAttachmentPath(home, "11111111-1111-4111-8111-111111111111"), "utf8")) as { apiKey?: string };
+    assert.equal(saved.apiKey, "sk_computer_login");
   });
 });
 

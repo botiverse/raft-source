@@ -137,6 +137,7 @@ export function createReminderRuntime(options: ReminderRuntimeOptions) {
     | "wake_request_accepted"
     | "wake_request_error"
     | "acknowledged"
+    | "retired"
     | "error";
   interface OccurrenceState {
     ownerAgentId: string;
@@ -269,19 +270,21 @@ export function createReminderRuntime(options: ReminderRuntimeOptions) {
     return state;
   };
 
-  const acknowledgeOccurrence = (input: {
-    ownerAgentId: string;
-    reminderId: string;
-    version: number;
-  }) => {
+  /** Ends an occurrence that no longer waits for an ack, so its fired-but-unacknowledged alert doesn't go off. */
+  const endOccurrence = (
+    input: { ownerAgentId: string; reminderId: string; version: number },
+    phase: "acknowledged" | "retired",
+  ) => {
     const state = occurrencesByDue.get(dueKey(input));
     if (!state) return;
     state.acknowledged = true;
     if (state.alertTimer !== null) clock.clearTimeout(state.alertTimer);
     state.alertTimer = null;
-    emitOccurrence(state, "acknowledged");
+    emitOccurrence(state, phase);
     occurrencesByDue.delete(dueKey(input));
   };
+  const acknowledgeOccurrence = (input: { ownerAgentId: string; reminderId: string; version: number }) =>
+    endOccurrence(input, "acknowledged");
 
   const cache = new ReminderCache({
     clock: options.clock,
@@ -492,6 +495,36 @@ export function createReminderRuntime(options: ReminderRuntimeOptions) {
     }
   }
 
+  /**
+   * Drops the owner's un-acked local items of one reminder that the Server no
+   * longer lists, so `inbox check` doesn't show them as this Computer's copies:
+   * every one of a canceled reminder's (RFC 081 D21), or the ones `before` the
+   * revision a recurring reminder just fired at (D22). Nothing is acknowledged,
+   * here or on the Server. The fire's receipt is marked consumed, so a retry of
+   * that fire doesn't put the item back.
+   */
+  function retireLocalItems(ownerAgentId: string, reminderId: string, before?: number): void {
+    const inbox = options.getInbox(ownerAgentId);
+    const retired: number[] = [];
+    for (const item of inbox.list()) {
+      if (!isReminderDueInboxItem(item) || item.sourceRef.id !== reminderId) continue;
+      const version = Number(item.sourceRef.revision);
+      if (!Number.isSafeInteger(version) || version <= 0) continue;
+      if (before !== undefined && version >= before) continue;
+      if (inbox.findProtectingSeal(item)) continue;
+      const identity = createReminderDueIdentity({ ownerAgentId, reminderId, version });
+      cache.ackLocalItem(identity);
+      if (!inbox.retire(item.itemId)) continue;
+      endOccurrence(identity, "retired");
+      retired.push(version);
+    }
+    if (retired.length > 0) {
+      logger.info(
+        `[Daemon] Reminder ${reminderId} un-acked local item(s) dropped (agent=${ownerAgentId}, ${before === undefined ? "canceled" : `fired again at v${before}`}): v${retired.join(", v")}`,
+      );
+    }
+  }
+
   async function presentFire(job: ReminderJob, context: ReminderFireContext, fireOutcome: FireOutcome) {
     logger.info(`[Daemon] Reminder ${job.reminderId} fired locally (agent=${job.ownerAgentId})`);
     const inbox = options.getInbox(job.ownerAgentId);
@@ -537,6 +570,8 @@ export function createReminderRuntime(options: ReminderRuntimeOptions) {
       emitOccurrence(occurrence, "error", "mint_rejected");
       return { wakeEnqueued: false, retryStage: "inbox_materialization" as const };
     }
+    // A recurring reminder asks for its newest fire only (RFC 081 D22).
+    if (job.recurrence) retireLocalItems(job.ownerAgentId, job.reminderId, job.version);
     if (!occurrence.phaseTruth.app_item_materialized.state) {
       if (itemAlreadyPresent) {
         occurrence.phaseTruth = {
@@ -632,6 +667,9 @@ export function createReminderRuntime(options: ReminderRuntimeOptions) {
         case "reminder.cancel":
           void REMINDER_OWNER_FENCE_KINDS[message.type];
           const outcome = cache.cancel(message.reminderId, message.version, message.agentId);
+          // The message alone only disarms (a one-time reminder's last fire
+          // sends it too); `canceled` says the reminder itself was canceled.
+          if (outcome === "applied" && message.canceled) retireLocalItems(message.agentId, message.reminderId);
           trace(
             "daemon.app_source.receive",
             {
@@ -799,11 +837,14 @@ export function createReminderRuntime(options: ReminderRuntimeOptions) {
       // Best-effort convergence for current local cache records. A missing or
       // older cache record is exactly why this path asks the Server to
       // adjudicate the world revision, so it must not veto a Server proof.
-      cache.ackLocalItem(createReminderDueIdentity({
+      const identity = createReminderDueIdentity({
         ownerAgentId: agentId,
         reminderId: item.sourceRef.id,
         version,
-      }));
+      });
+      // The occurrence is acknowledged as on the local path, so its
+      // fired-but-unacknowledged alert does not go off after a Server ack.
+      if (cache.ackLocalItem(identity)) acknowledgeOccurrence(identity);
       return true;
     },
     replayPendingReceipts() {

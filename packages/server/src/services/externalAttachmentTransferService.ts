@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { currentDate } from "@botiverse/raft-shared";
-import { and, asc, eq, inArray, isNull, lte, ne, or, sql } from "drizzle-orm";
+import { and, asc, eq, gt, inArray, isNull, lte, ne, or, sql } from "drizzle-orm";
 
 import type { DatabaseExecutor, DatabaseTransaction } from "../db/index";
 import {
@@ -12,7 +12,9 @@ import {
   externalAttachmentTransferJobs,
   externalInboundEvents,
   externalOutboundDeliveries,
+  slackVerifiedIngressFileFacts,
 } from "../db/schema";
+import { hasVerifiedSlackFileFact, verifySlackInboundFile, type VerifiedSlackFileProof } from "./slackVerifiedInboundFileProvenance";
 
 export const EXTERNAL_ATTACHMENT_TRANSFER_LEASE_MS = 60_000;
 
@@ -131,6 +133,9 @@ async function requireInboundAuthority(
     connectionEpoch: number;
     bindingId: string;
     bindingEpoch: number;
+    verifiedRawEventId?: string;
+    existingFactId?: string;
+    providerFileId?: string;
   },
 ): Promise<void> {
   const [event] = await executor.select().from(externalInboundEvents)
@@ -157,8 +162,6 @@ async function requireInboundAuthority(
     .where(eq(externalActorProjections.id, input.sourceActorProjectionId)).limit(1);
   if (
     !projection
-    || projection.state !== "active"
-    || projection.deactivated
     || projection.provider !== input.provider
     || projection.appRegistrationId !== input.appRegistrationId
     || projection.installId !== input.installId
@@ -168,6 +171,15 @@ async function requireInboundAuthority(
       "authority_mismatch",
       "External attachment actor projection is missing or stale",
     );
+  }
+  if (projection.state !== "active" || projection.deactivated
+    || (input.provider === "slack" && ["unknown", "guest", "remote"].includes(projection.actorKind))) {
+    const storedProof = input.existingFactId && input.providerFileId
+      ? await hasVerifiedSlackFileFact(executor, { factId: input.existingFactId, eventId: input.inboundEventId,
+        projectionId: projection.id, providerFileId: input.providerFileId }) : false;
+    if (!(["human", "guest", "remote", "unknown"].includes(projection.actorKind)) || input.provider !== "slack" || (!input.verifiedRawEventId && !storedProof)) {
+      throw new ExternalAttachmentTransferError("authority_mismatch", "External attachment actor projection is missing or stale");
+    }
   }
 }
 
@@ -184,6 +196,7 @@ export type CreateInboundExternalAttachmentTransferInput = Readonly<{
   bindingEpoch: number;
   orderedPosition: number;
   sourceActorProjectionId: string;
+  verifiedSlackProof?: VerifiedSlackFileProof;
 }>;
 
 /**
@@ -212,7 +225,12 @@ export async function createInboundExternalAttachmentTransferWithExecutor(
     orderedPosition: nonNegative(rawInput.orderedPosition, "ordered position"),
     sourceActorProjectionId: bounded(rawInput.sourceActorProjectionId, "source actor projection ID", 160),
   };
-  await requireInboundAuthority(executor, input);
+  const verified = rawInput.verifiedSlackProof ? await verifySlackInboundFile(executor, {
+    eventId: input.inboundEventId, projectionId: input.sourceActorProjectionId, providerFileId: input.providerFileId,
+    orderedPosition: input.orderedPosition, proof: rawInput.verifiedSlackProof,
+  }) : null;
+  if (rawInput.verifiedSlackProof && !verified) throw new ExternalAttachmentTransferError("authority_mismatch", "Slack file custody proof is invalid");
+  await requireInboundAuthority(executor, { ...input, ...(verified ? { verifiedRawEventId: verified.rawEventId } : {}) });
 
   const insertedAssets = await executor.insert(externalAttachmentAssets).values({
     originDirection: "provider_inbound",
@@ -267,6 +285,15 @@ export async function createInboundExternalAttachmentTransferWithExecutor(
       "External attachment message occurrence conflicts with its frozen fact",
     );
   }
+  if (verified) {
+    await executor.insert(slackVerifiedIngressFileFacts).values({ factId: messageFact.id, rawEventId: verified.rawEventId,
+      normalizedPayloadDigest: verified.digest, createdAt: now }).onConflictDoNothing();
+    const [provenance] = await executor.select().from(slackVerifiedIngressFileFacts)
+      .where(eq(slackVerifiedIngressFileFacts.factId, messageFact.id)).limit(1);
+    if (!provenance || provenance.rawEventId !== verified.rawEventId || provenance.normalizedPayloadDigest !== verified.digest) {
+      throw new ExternalAttachmentTransferError("replay_conflict", "Slack file custody proof conflicts with the existing occurrence");
+    }
+  }
 
   const insertedJobs = await executor.insert(externalAttachmentTransferJobs).values({
     direction: "provider_inbound",
@@ -306,6 +333,11 @@ export type CreateOutboundExternalAttachmentTransferInput = Readonly<{
   sourceAttachmentId: string;
 }>;
 
+/** Older and direct-upload objects may lack a SHA-256. Compute it in the worker before provider I/O. */
+export function attachmentSha256OrNull(value: string | null): string | null {
+  return value && /^[0-9a-f]{64}$/.test(value) ? value : null;
+}
+
 /** Freezes one immutable Raft object before the first provider upload call. */
 export async function createOutboundExternalAttachmentTransferWithExecutor(
   executor: DatabaseExecutor,
@@ -337,12 +369,7 @@ export async function createOutboundExternalAttachmentTransferWithExecutor(
       "Outbound attachment source is missing, revoked, or belongs to another message",
     );
   }
-  if (!source.object.contentHash || !/^[0-9a-f]{64}$/.test(source.object.contentHash)) {
-    throw new ExternalAttachmentTransferError(
-      "source_unavailable",
-      "Outbound attachment source has no immutable SHA-256 digest",
-    );
-  }
+  const sourceDigest = attachmentSha256OrNull(source.object.contentHash);
 
   const inserted = await executor.insert(externalAttachmentTransferJobs).values({
     direction: "raft_outbound",
@@ -354,7 +381,7 @@ export async function createOutboundExternalAttachmentTransferWithExecutor(
     frozenFilename: source.projection.filename,
     frozenMimeType: source.object.mimeType,
     frozenSizeBytes: source.object.sizeBytes,
-    frozenContentDigest: source.object.contentHash,
+    frozenContentDigest: sourceDigest,
     phase: "ticket",
     state: "queued",
     nextAttemptAt: now,
@@ -376,7 +403,7 @@ export async function createOutboundExternalAttachmentTransferWithExecutor(
     || job.frozenFilename !== source.projection.filename
     || job.frozenMimeType !== source.object.mimeType
     || job.frozenSizeBytes !== source.object.sizeBytes
-    || job.frozenContentDigest !== source.object.contentHash
+    || (sourceDigest !== null && job.frozenContentDigest !== sourceDigest)
   ) {
     throw new ExternalAttachmentTransferError(
       "replay_conflict",
@@ -474,7 +501,7 @@ export async function releaseExternalAttachmentTransferClaimQueued(
     leaseExpiresAt: null,
     lastErrorClass: null,
     updatedAt: now,
-  }).where(claimPredicate(claim)).returning();
+  }).where(claimPredicate(claim, now)).returning();
   if (!job) throw new ExternalAttachmentTransferError("lease_lost", "Attachment transfer lease was lost");
   return job;
 }
@@ -639,7 +666,7 @@ export async function recordInboundExternalAttachmentStored(
     lastErrorClass: null,
     terminalAt: now,
     updatedAt: now,
-  }).where(claimPredicate(claim)).returning();
+  }).where(claimPredicate(claim, now)).returning();
   if (!updatedAsset || !updatedFact || !job) {
     throw new ExternalAttachmentTransferError("lease_lost", "Attachment transfer store lease was lost");
   }
@@ -743,20 +770,21 @@ export async function terminalizeInboundExternalAttachmentUnavailable(
     lastErrorClass: errorClass,
     terminalAt: now,
     updatedAt: now,
-  }).where(claimPredicate(claim)).returning();
+  }).where(claimPredicate(claim, now)).returning();
   if (!asset || !messageFact || !job) {
     throw new ExternalAttachmentTransferError("lease_lost", "Attachment transfer terminal lease was lost");
   }
   return { asset, messageFact, job };
 }
 
-function claimPredicate(claim: ExternalAttachmentTransferClaim) {
+function claimPredicate(claim: ExternalAttachmentTransferClaim, now: Date) {
   return and(
     eq(externalAttachmentTransferJobs.id, claim.job.id),
     eq(externalAttachmentTransferJobs.state, "leased"),
     eq(externalAttachmentTransferJobs.leaseId, claim.leaseId),
     eq(externalAttachmentTransferJobs.leaseOwner, claim.leaseOwner),
     eq(externalAttachmentTransferJobs.leaseGeneration, claim.leaseGeneration),
+    ...(claim.job.direction === "raft_outbound" ? [gt(externalAttachmentTransferJobs.leaseExpiresAt, now)] : []),
   );
 }
 
@@ -782,6 +810,44 @@ function phaseCanAdvance(
   return currentIndex >= 0 && (nextIndex === currentIndex || nextIndex === currentIndex + 1);
 }
 
+/** Extend an active source-hashing lease only while the current claimant still owns it. */
+export async function renewOutboundAttachmentSourceLease(
+  executor: DatabaseTransaction,
+  claim: ExternalAttachmentTransferClaim,
+  now: Date,
+): Promise<ExternalAttachmentTransferClaim> {
+  if (claim.job.direction !== "raft_outbound" || !["ticket", "upload"].includes(claim.job.phase)) {
+    throw new ExternalAttachmentTransferError("invalid_transition", "Only a private source/upload lease can be renewed");
+  }
+  const current = validDate(now, "source lease clock");
+  const [job] = await executor.update(externalAttachmentTransferJobs).set({
+    leaseExpiresAt: new Date(current.getTime() + 5 * 60_000), updatedAt: current,
+  }).where(claimPredicate(claim, current)).returning();
+  if (!job) throw new ExternalAttachmentTransferError("lease_lost", "Attachment transfer lease was lost");
+  return { ...claim, job };
+}
+
+/** Bind a previously hashless source to the bytes read under this lease before requesting an upload ticket. */
+export async function recordOutboundAttachmentSourceDigest(
+  executor: DatabaseTransaction,
+  claim: ExternalAttachmentTransferClaim,
+  digest: string,
+  now: Date,
+): Promise<ExternalAttachmentTransferClaim> {
+  if (claim.job.direction !== "raft_outbound" || claim.job.phase !== "ticket"
+    || !claim.job.leaseExpiresAt || claim.job.leaseExpiresAt <= now
+    || !/^[0-9a-f]{64}$/.test(digest)
+    || (claim.job.frozenContentDigest !== null && claim.job.frozenContentDigest !== digest)) {
+    throw new ExternalAttachmentTransferError("source_unavailable", "Attachment source bytes changed");
+  }
+  const [job] = await executor.update(externalAttachmentTransferJobs).set({
+    frozenContentDigest: digest,
+    updatedAt: validDate(now, "digest clock"),
+  }).where(claimPredicate(claim, now)).returning();
+  if (!job) throw new ExternalAttachmentTransferError("lease_lost", "Attachment transfer lease was lost");
+  return { ...claim, job };
+}
+
 export async function advanceExternalAttachmentTransferClaim(
   executor: DatabaseTransaction,
   claim: ExternalAttachmentTransferClaim,
@@ -797,7 +863,7 @@ export async function advanceExternalAttachmentTransferClaim(
   const [job] = await executor.update(externalAttachmentTransferJobs).set({
     phase: rawInput.nextPhase,
     updatedAt: now,
-  }).where(claimPredicate(claim)).returning();
+  }).where(claimPredicate(claim, now)).returning();
   if (!job) throw new ExternalAttachmentTransferError("lease_lost", "Attachment transfer lease was lost");
   return { ...claim, job };
 }
@@ -843,6 +909,8 @@ export async function recordInboundExternalAttachmentMetadata(
   await requireInboundAuthority(executor, {
     inboundEventId: messageFact.inboundEventId!,
     sourceActorProjectionId,
+    existingFactId: messageFact.id,
+    providerFileId: asset.providerFileId,
     provider: asset.provider,
     appRegistrationId: asset.appRegistrationId,
     installId: asset.installId,
@@ -979,7 +1047,7 @@ export async function recordOutboundExternalAttachmentTicket(
     assetId: asset.id,
     phase: "upload",
     updatedAt: now,
-  }).where(claimPredicate(claim)).returning();
+  }).where(claimPredicate(claim, now)).returning();
   if (!job) throw new ExternalAttachmentTransferError("lease_lost", "Attachment transfer lease was lost");
   return { asset, claim: { ...claim, job } };
 }
@@ -1006,7 +1074,7 @@ export async function releaseExternalAttachmentTransferClaimForRetry(
     leaseExpiresAt: null,
     lastErrorClass: errorClass,
     updatedAt: now,
-  }).where(claimPredicate(claim)).returning();
+  }).where(claimPredicate(claim, now)).returning();
   if (!job) throw new ExternalAttachmentTransferError("lease_lost", "Attachment transfer lease was lost");
   return job;
 }
@@ -1042,7 +1110,7 @@ export async function abandonOutboundAttachmentTicketForRetry(
     leaseExpiresAt: null,
     lastErrorClass: errorClass,
     updatedAt: now,
-  }).where(claimPredicate(claim)).returning();
+  }).where(claimPredicate(claim, now)).returning();
   if (!job) throw new ExternalAttachmentTransferError("lease_lost", "Attachment transfer lease was lost");
   return job;
 }
@@ -1069,7 +1137,7 @@ export async function markExternalAttachmentTransferOutcomeUnknown(
     leaseExpiresAt: null,
     lastErrorClass: bounded(rawInput.errorClass, "outcome error class", 160),
     updatedAt: now,
-  }).where(claimPredicate(claim)).returning();
+  }).where(claimPredicate(claim, now)).returning();
   if (!job) throw new ExternalAttachmentTransferError("lease_lost", "Attachment transfer lease was lost");
   return job;
 }
@@ -1107,7 +1175,7 @@ export async function terminalizeExternalAttachmentTransferClaim(
     lastErrorClass: errorClass,
     terminalAt: now,
     updatedAt: now,
-  }).where(claimPredicate(claim)).returning();
+  }).where(claimPredicate(claim, now)).returning();
   if (!job) throw new ExternalAttachmentTransferError("lease_lost", "Attachment transfer lease was lost");
   if (rawInput.state !== "completed" && job.assetId) {
     await executor.update(externalAttachmentAssets).set({

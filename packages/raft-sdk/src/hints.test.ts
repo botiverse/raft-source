@@ -18,6 +18,7 @@ import { createRaft, type Raft, type RaftNextOperation } from "./index";
 /** Typed methods outside the manifest (binary results) that a hint may point at as a code call. */
 const TYPED_ONLY: Record<string, (raft: Raft) => unknown> = {
   "attachments.download": (raft) => raft.attachments.download,
+  "artifacts.commentImage": (raft) => raft.artifacts.commentImage,
 };
 
 /**
@@ -90,9 +91,9 @@ test("hints: \"tool\" renders text and next.command as tool calls; the default s
     assert.deepEqual(outcome.next?.args, { target: "#ops", after: 11 });
   }
   assert.ok(cli.text.includes("— use raft attachment view to download]"));
-  assert.ok(cli.text.endsWith(`Newer exist: raft message read --target "#ops" --after 11`));
+  assert.ok(cli.text.endsWith(`Newer: raft message read --target "#ops" --after 11`));
   assert.ok(tool.text.includes(`— use attachments_download_url({ attachmentId: "att-1" }) to download]`));
-  assert.ok(tool.text.endsWith(`Newer exist: messages_read({ target: "#ops", after: 11 })`));
+  assert.ok(tool.text.endsWith(`Newer: messages_read({ target: "#ops", after: 11 })`));
   assert.ok(tool.data.messages[0]!.text.includes("attachments_download_url"), "message.text follows the style too");
   assert.ok(!/\braft [a-z]/.test(tool.text));
 
@@ -173,7 +174,7 @@ const FAILURE_RESPONSES: ReadonlyArray<{ label: string; status: number; body: Re
   { label: "bare CLI next action", status: 404, body: { error: "missing", suggestedNextAction: "raft message read --target 'agent-event:<full-event-id>'" } },
 ];
 
-test("hints: \"tool\": no failure's next step names a CLI command or flag", async () => {
+test("hints: \"tool\": no failure's sentence or next step names a CLI command or flag", async () => {
   let failures = 0;
   for (const response of FAILURE_RESPONSES) {
     const fetch = (async () => Response.json(response.body, { status: response.status })) as typeof globalThis.fetch;
@@ -183,10 +184,10 @@ test("hints: \"tool\": no failure's next step names a CLI command or flag", asyn
       if (!("ok" in outcome) || outcome.ok) continue;
       failures += 1;
       const where = `${op.name} on ${response.label}`;
-      for (const [field, value] of [["error.nextAction", outcome.error.nextAction], ["next.why", outcome.next?.why], ["next.command", outcome.next?.command]] as const) {
+      for (const [field, value] of [["error.message", outcome.error.message], ["error.nextAction", outcome.error.nextAction], ["next.why", outcome.next?.why], ["next.command", outcome.next?.command]] as const) {
         if (typeof value === "string") assert.doesNotMatch(value, CLI_NEXT_ACTION_PATTERN, `${where}: ${field} = ${value}`);
       }
-      assert.doesNotMatch(outcome.text.split("\n").filter((line) => line.startsWith("Next action:")).join("\n"), CLI_NEXT_ACTION_PATTERN, `${where}: text`);
+      assert.doesNotMatch(outcome.text.split("\n").filter((line) => line.startsWith("Next action:") || line.startsWith("Error:")).join("\n"), CLI_NEXT_ACTION_PATTERN, `${where}: text`);
     }
   }
   assert.ok(failures > FAILURE_RESPONSES.length * 10, `the fake failed enough calls (${failures})`);
@@ -204,4 +205,40 @@ test("attachment unavailable: the CLI style keeps the Server's Feedback Admin st
   assert.equal(tool.error.nextAction, "This id is not an attachment you can read. Use an attachment id from a message you can see.");
   assert.equal(tool.next?.why, tool.error.nextAction);
   assert.doesNotMatch(tool.text, /Feedback|raft /);
+});
+
+// Cindy 10-30: an `around` (or `before`) window with messages on both sides
+// named only one side; it names both, like the CLI's window header.
+test("a window with older and newer messages names both, each with the read that continues there", async () => {
+  const fetch = (async (input: RequestInfo | URL) => {
+    const p = new URL(String(input)).pathname.replace("/internal/agent-api", "");
+    if (p === "/history") return Response.json({ target: "#ops", messages: [line(10), line(11)], has_more: true, has_older: true, has_newer: true });
+    return Response.json({ error: `not in this fake: ${p}` }, { status: 500 });
+  }) as typeof fetch;
+  const raft = createRaft({ serverUrl: "https://raft.example", credential: "sk_agent_hints", fetch, hints: "tool" });
+  const read = await raft.messages.read({ target: "#ops", around: 10 });
+  assert.ok(read.ok);
+  if (!read.ok) return;
+  assert.ok(read.text.endsWith(
+    `Older: messages_read({ target: "#ops", before: 10 })\nNewer: messages_read({ target: "#ops", after: 11 })`,
+  ), read.text);
+});
+
+// A before read pages backward: with older and newer messages around it, its
+// next step is the older page, not the newer side it came from.
+test("a before read's next step continues to the older page while there is one", async () => {
+  const fetch = (async (input: RequestInfo | URL) => {
+    const p = new URL(String(input)).pathname.replace("/internal/agent-api", "");
+    if (p === "/history") return Response.json({ target: "#ops", messages: [line(10), line(11)], has_more: true, has_older: true, has_newer: true });
+    return Response.json({ error: `not in this fake: ${p}` }, { status: 500 });
+  }) as typeof fetch;
+  const raft = createRaft({ serverUrl: "https://raft.example", credential: "sk_agent_hints", fetch, hints: "tool" });
+  const back = await raft.messages.read({ target: "#ops", before: 12 });
+  assert.ok(back.ok);
+  if (!back.ok) return;
+  assert.deepEqual(back.next?.args, { target: "#ops", before: 10 });
+  const around = await raft.messages.read({ target: "#ops", around: 10 });
+  assert.ok(around.ok);
+  if (!around.ok) return;
+  assert.deepEqual(around.next?.args, { target: "#ops", after: 11 }, "other reads still prefer the newer page");
 });

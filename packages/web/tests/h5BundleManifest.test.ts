@@ -5,7 +5,7 @@ import {
   documentHeadersFromHeadersFile,
   isBundledPath,
   validateHosts,
-} from "../scripts/build-h5-bundle.mjs";
+} from "../scripts/build-h5-bundle";
 
 const bytes = (text: string) => new TextEncoder().encode(text);
 const sha = (text: string) => createHash("sha256").update(bytes(text)).digest("hex");
@@ -60,7 +60,7 @@ test("the manifest lists every bundled file with its own digest, size and conten
 });
 
 test("deployment plumbing and the service worker never enter the bundle", () => {
-  for (const path of ["sw.js", "_headers", "_routes.json", "_worker.js", ".vite/manifest.json", "robots.txt"]) {
+  for (const path of ["sw.js", "_headers", "_routes.json", "_worker.js", ".vite/manifest.json", "robots.txt", "assets/app-abcd1234.js.br"]) {
     assert.equal(isBundledPath(path), false, path);
   }
   assert.equal(isBundledPath("assets/sw.js-AAAAAAAA.js"), true);

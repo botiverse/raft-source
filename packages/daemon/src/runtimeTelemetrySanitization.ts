@@ -16,6 +16,7 @@ const RUNTIME_TELEMETRY_RESERVED_ATTR_KEYS = new Set([
   "computerVersion",
   "computer_version",
   "computer_version_present",
+  "computer_build_sha",
 ]);
 
 export function sanitizeRuntimeTelemetryPayloadAttrs(
@@ -27,4 +28,24 @@ export function sanitizeRuntimeTelemetryPayloadAttrs(
     sanitized[key] = value;
   }
   return sanitized;
+}
+
+/** The versions every runtime telemetry event carries, on either host. */
+export function runtimeTelemetryVersionAttrs(daemonVersion: string | null | undefined, computerVersion: string | null | undefined): Record<string, string | boolean> {
+  return {
+    ...(daemonVersion ? {
+      daemonVersion,
+      daemon_version: daemonVersion,
+      daemon_version_present: true,
+    } : {
+      daemon_version_present: false,
+    }),
+    ...(computerVersion ? {
+      computerVersion,
+      computer_version: computerVersion,
+      computer_version_present: true,
+    } : {
+      computer_version_present: false,
+    }),
+  };
 }

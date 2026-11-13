@@ -1,3 +1,10 @@
+import { feedbackWorkspacePath } from "../../feedback/feedbackPaths";
+import {
+  feedbackTicketPlatformFromSearch,
+  feedbackTicketPlatformParams,
+  rememberFeedbackTicketPlatform,
+} from "../../feedback/feedbackTicketPlatform";
+import { feedbackTicketSearch } from "../../feedback/feedbackTicketLink";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   FeedbackProvider,
@@ -22,14 +29,19 @@ import {
 import { useIntl } from "react-intl";
 import { useLocation, useNavigate } from "react-router-dom";
 import api from "../../api/client";
-import { FEEDBACK_SDK_THEME } from "../../feedback/feedbackSdkTheme";
 import { handsFeedbackTransport } from "../../feedback/handsFeedbackTransport";
+import { useFeedbackListDegraded } from "../../feedback/feedbackListDegradedState";
+import { useAgentFeedbackSent } from "../../feedback/agentFeedbackSentFlag";
 import { useMediaQuery } from "../../hooks/effectPrimitives";
 import { useMobileBack } from "../../hooks/useAppNavigate";
 import { useLocale } from "../../i18n/LocaleProvider";
+import { useAuthStore } from "../../store/authStore";
 import Banner from "../ui/Banner";
 import PanelHeader from "../ui/PanelHeader";
 import Tooltip from "../ui/Tooltip";
+import { useOverlayTitleBar } from "../topbar/overlayTitleBar";
+import { FeedbackAgentHint } from "./FeedbackAgentHint";
+import { FeedbackTicketLinkAction } from "./FeedbackTicketLinkAction";
 
 const FEEDBACK_SETTINGS_SEGMENT = "/settings/feedback";
 
@@ -69,15 +81,7 @@ export function feedbackWorkspaceRouteFromPath(
   return { view: "inbox" };
 }
 
-export function feedbackWorkspacePath(
-  basePath: string,
-  route: FeedbackWorkspaceRoute,
-): string {
-  if (route.view === "new") return `${basePath}/new`;
-  if (route.view === "ticket" && route.ticketId)
-    return `${basePath}/ticket/${encodeURIComponent(route.ticketId)}`;
-  return basePath;
-}
+export { feedbackWorkspacePath };
 
 function attachmentFilename(headers: unknown, fallback: string): string {
   if (!headers || typeof headers !== "object") return fallback;
@@ -110,6 +114,8 @@ function attachmentFilename(headers: unknown, fallback: string): string {
 export default function AboutFeedbackPanel() {
   const { locale } = useLocale();
   const { formatMessage } = useIntl();
+  // Desktop: the screenshot preview's toolbar is the window's title bar while open.
+  const previewTitleBar = useOverlayTitleBar();
   const location = useLocation();
   const navigate = useNavigate();
   const isMobile = useMediaQuery("(max-width: 767px)");
@@ -125,10 +131,13 @@ export default function AboutFeedbackPanel() {
     () => feedbackWorkspaceRouteFromPath(location.pathname),
     [location.pathname],
   );
+  // A link copied in a mobile App names the App its ticket lives in. Recorded
+  // while rendering (idempotent), before the workspace below reads the ticket.
+  if (pathRoute.view === "ticket" && pathRoute.ticketId)
+    rememberFeedbackTicketPlatform(pathRoute.ticketId, feedbackTicketPlatformFromSearch(location.search));
   const onSettingsBack = useMobileBack(settingsBackPath);
   const onWorkspaceBack = useMobileBack(feedbackBasePath);
-  const controlledRoute =
-    isMobile || pathRoute.view !== "inbox" ? pathRoute : undefined;
+  const workspaceRootRef = useRef<HTMLDivElement | null>(null);
   const [attachmentError, setAttachmentError] = useState(false);
   const [attachmentPreview, setAttachmentPreview] = useState<{
     filename: string;
@@ -162,7 +171,7 @@ export default function AboutFeedbackPanel() {
     try {
       const { data, headers } = await api.get<Blob>(
         `/product-feedback/tickets/${encodeURIComponent(input.ticketId)}/attachments/${encodeURIComponent(input.attachmentId)}`,
-        { responseType: "blob" },
+        { responseType: "blob", params: feedbackTicketPlatformParams(input.ticketId) },
       );
       if (previewRequestRef.current !== request) return;
       const url = URL.createObjectURL(data);
@@ -206,7 +215,11 @@ export default function AboutFeedbackPanel() {
         onWorkspaceBack();
       return;
     }
-    navigate(feedbackWorkspacePath(feedbackBasePath, nextRoute), {
+    // A mobile App's ticket keeps its `?platform=` (feedbackTicketPlatform.ts).
+    const search = nextRoute.view === "ticket" && nextRoute.ticketId
+      ? feedbackTicketSearch(nextRoute.ticketId)
+      : "";
+    navigate(`${feedbackWorkspacePath(feedbackBasePath, nextRoute)}${search}`, {
       replace: options?.replace,
     });
   }, [feedbackBasePath, location.pathname, navigate, onWorkspaceBack]);
@@ -220,7 +233,34 @@ export default function AboutFeedbackPanel() {
     if (!open) closeAttachmentPreview();
   }, [closeAttachmentPreview]);
 
+  const listDegraded = useFeedbackListDegraded();
   const isInbox = pathRoute.view === "inbox";
+  // A ticket and New feedback are pages of their own: the workspace draws
+  // their header (Back, the ticket's title, its status), which takes this
+  // page header's place instead of stacking under it.
+  const showPageHeader = isInbox;
+  // The agent hint (FeedbackAgentHint) sits on its own line under the inbox's
+  // toolbar (New feedback) and above the list. The inbox only: not on a
+  // ticket, and not in the composer, where the person already chose to write
+  // it. Not once they sent an agent's draft in this browser. Null otherwise,
+  // so the slot draws no empty inset.
+  const userId = useAuthStore((state) => state.user?.id);
+  const agentDraftSent = useAgentFeedbackSent(userId);
+  // The inbox's one notice line (DS: at most one banner in one place), between
+  // the toolbar and the list: Hands being briefly unavailable outranks the hint.
+  // Polite status, not an alert: the transport keeps retrying the first page,
+  // so the list stays loading (or keeps what it showed) instead of "no feedback".
+  const inboxNotice = useMemo(() => {
+    if (!showPageHeader) return null;
+    if (listDegraded) {
+      return (
+        <Banner intent="warning" density="sm" role="status" data-testid="settings-feedback-list-degraded">
+          {formatMessage({ id: "settings.about.feedbackListDegraded" })}
+        </Banner>
+      );
+    }
+    return agentDraftSent ? null : <FeedbackAgentHint />;
+  }, [showPageHeader, listDegraded, agentDraftSent, formatMessage]);
   const mobileBackProps = useMemo(
     () => isInbox
       ? {
@@ -233,36 +273,42 @@ export default function AboutFeedbackPanel() {
 
   return (
     <div className="slock-feedback-panel flex h-full min-h-0 flex-col bg-layer-canvas">
-      <PanelHeader
-        title={formatMessage({ id: "settings.about.feedbackTitle" })}
-        containerProps={PANEL_HEADER_CONTAINER_PROPS}
-        onMobileBack={isInbox ? onSettingsBack : undefined}
-        mobileBackProps={mobileBackProps}
-      />
-      {attachmentError && (
-        <Banner intent="warning" density="sm" className="mx-4 mt-3" role="alert">
-          {formatMessage({ id: "settings.about.feedbackAttachmentOpenError" })}
-        </Banner>
+      {showPageHeader && (
+        <PanelHeader
+          title={formatMessage({ id: "settings.about.feedbackTitle" })}
+          containerProps={PANEL_HEADER_CONTAINER_PROPS}
+          onMobileBack={isInbox ? onSettingsBack : undefined}
+          mobileBackProps={mobileBackProps}
+        />
       )}
-      <div className="min-h-0 flex-1">
+      {attachmentError && (
+        <div className="px-4 pt-3">
+          <Banner intent="warning" density="sm" role="alert">
+            {formatMessage({ id: "settings.about.feedbackAttachmentOpenError" })}
+          </Banner>
+        </div>
+      )}
+      <div className="min-h-0 flex-1" ref={workspaceRootRef}>
         <FeedbackProvider
           transport={handsFeedbackTransport}
-          theme={FEEDBACK_SDK_THEME}
-          locale={locale === "zh-cn" ? "zh-CN" : "en"}
+          // The feedback SDK ships en and zh-CN; a Traditional Chinese reader gets Chinese.
+          locale={locale === "zh-cn" || locale === "zh-tw" ? "zh-CN" : "en"}
         >
           <FeedbackWorkspace
             enablePullToRefresh={isMobile}
             hideHeaderTitle
-            {...(controlledRoute
-              ? {
-                  route: controlledRoute,
-                  onRouteChange: onWorkspaceRouteChange,
-                }
-              : {})}
+            // The URL drives the workspace at every width: a ticket and New
+            // feedback have addresses of their own (reload, Back, Copy link).
+            route={pathRoute}
+            onRouteChange={onWorkspaceRouteChange}
             onOpenAttachment={handleOpenAttachment}
             onOpenPendingAttachment={openPendingAttachment}
+            inboxNotice={inboxNotice}
           />
         </FeedbackProvider>
+        {pathRoute.view === "ticket" && pathRoute.ticketId && (
+          <FeedbackTicketLinkAction rootRef={workspaceRootRef} ticketId={pathRoute.ticketId} />
+        )}
       </div>
       {attachmentPreview && (
         <Lightbox
@@ -270,7 +316,7 @@ export default function AboutFeedbackPanel() {
           onOpenChange={handleLightboxOpenChange}
         >
           <LightboxContent aria-label={attachmentPreview.filename}>
-            <LightboxToolbar>
+            <LightboxToolbar {...previewTitleBar}>
               <LightboxTitle>{attachmentPreview.filename}</LightboxTitle>
               <LightboxActions>
                 <Tooltip content={formatMessage({ id: "common.lightbox.download" })}>

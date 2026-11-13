@@ -6,5 +6,6 @@ describe("minimumServerRoleWithCapability", () => {
     expect(minimumServerRoleWithCapability("createChannels")).toBe("member");
     expect(minimumServerRoleWithCapability("changeChannelVisibility")).toBe("admin");
     expect(minimumServerRoleWithCapability("manageBilling")).toBe("owner");
+    expect(minimumServerRoleWithCapability("manageSso")).toBe("owner");
   });
 });

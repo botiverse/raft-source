@@ -23,6 +23,9 @@ export type TraceFamilyName =
   | "slock.state.violation"
   | "slock.client_error"
   | "slock.media_preview.error"
+  | "slock.web.boot_timing"
+  | "slock.web.shell_keep_failed"
+  | "slock.context_view"
   | "server.db.query";
 
 export const TRACE_JOIN_KEYS = ["clientEventId"] as const;
@@ -69,7 +72,7 @@ export const TRACE_FAMILY_REGISTRY = [
     consumers: [
       {
         what: "Client crash daily scan and React crash incident detection",
-        how: "otel.logs query over throttled client-error events grouped by source/error/component",
+        how: "otel.logs query over throttled client-error events grouped by source/error/component; error_boundary, window_onerror and unhandled_rejection rows by errorFingerprint/topFrame, one crash found by clientTraceId",
         whoRuns: "Manjusaka",
         runbook: "Manjusaka daily-scan liveness ledger",
       },
@@ -83,6 +86,45 @@ export const TRACE_FAMILY_REGISTRY = [
       {
         what: "Daily count of inline media preview failures, checking that expired-link failures no longer show the codec warning (bug-triage task #14)",
         how: "otel.logs query over throttled media-preview error events (message = 'slock.media_preview.error') grouped by error_class/browser_family/url_refreshed",
+        whoRuns: "AndyLok",
+        runbook: "docs/observability/reading-telemetry.md",
+      },
+    ],
+  },
+  {
+    family: "slock.web.boot_timing",
+    privacyTier: "fleet-detection",
+    entityFilterableDimensions: [],
+    consumers: [
+      {
+        what: "Web boot timing in the daily app report: p50/p90 of content_ms (and bundle/auth_sent/auth/servers/frame/messages_sent/messages) by landing x browser_family x form_factor x platform, split by token_refreshed_first and nav_type; before/after for the load-time work (task #3 in #proj-frontend)",
+        how: "otel.logs query over one event per page load (message = 'slock.web.boot_timing') grouped by landing/browser_family/nav_type/outcome/releaseSha",
+        whoRuns: "AndyLok",
+        runbook: "docs/observability/reading-telemetry.md",
+      },
+    ],
+  },
+  {
+    family: "slock.web.shell_keep_failed",
+    privacyTier: "fleet-detection",
+    entityFilterableDimensions: [],
+    consumers: [
+      {
+        what: "Browsers whose service worker can't keep a new release's HTML, so they keep opening an older release (#triage:#165, a HarmonyOS browser stuck on web 1.21.42): which step fails, on which browsers",
+        how: "otel.logs query over events (message = 'slock.web.shell_keep_failed') grouped by step/browser_family/harmonyos/served_kept/releaseSha",
+        whoRuns: "AndyLok",
+        runbook: "docs/observability/reading-telemetry.md",
+      },
+    ],
+  },
+  {
+    family: "slock.context_view",
+    privacyTier: "fleet-detection",
+    entityFilterableDimensions: [],
+    consumers: [
+      {
+        what: "Why View Context sometimes looks unresponsive (#wg-ax:#28): the check's state when the menu opens and how long it took, clicks, and each answer's outcome and time from the click",
+        how: "otel.logs query over 'slock.context_view' events grouped by step/status/outcome, with wait_ms and total_ms percentiles; joined by time with server.agent_context_view.answered",
         whoRuns: "AndyLok",
         runbook: "docs/observability/reading-telemetry.md",
       },

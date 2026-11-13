@@ -77,6 +77,7 @@ async function buildFixture() {
     { jointChannelId: joint!.id, serverId: host.id, localChannelId: hostJoint.id, role: "host", joinedByUserId: owner.id },
     { jointChannelId: joint!.id, serverId: peer.id, localChannelId: peerJoint.id, role: "participant", joinedByUserId: peerOwner.id },
   ]);
+  await channelService.addHuman(hostJoint.id, owner.id);
   await db.insert(channelConversionJobs).values({
     serverId: host.id,
     sourceChannelId: hostJoint.id,

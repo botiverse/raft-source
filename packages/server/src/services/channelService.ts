@@ -1,10 +1,27 @@
+import { readSlackBotMentionAuthority } from "./slackBotMentionAuthority";
+import { acquireFeatureFlagReadLock, evaluateFeatureFlag } from "./featureFlagService";
+import { getComputedJointHumanPublicRowsForScopes, getComputedJointHumanPublicRows, getJointHumanDeliveryRows, resolveJointHumanEntrySql } from "./jointHumanMembershipAccess";
+import { assertJointReconnectReady } from "./jointMembershipDeparture";
+import { filterJointActiveEntries, filterJointHostSidesEmpty, filterJointPendingRemovalEntries, jointMembershipRemovalPendingSql } from "./jointHumanMembershipAccess";
+import { channelActorHasCapability, resolveChannelActorContext, lockComputedJointActor, resolveChannelActorContextsMany, type ChannelActorContext } from "../lib/channelActorPermissions";
+import { channelRemovalAudit, isJointMember, jointOfLocalChannel, recordChannelMembershipsEnded, removalActorContext, removalActorUserId, type ChannelRemovalActor } from "./channelMembershipAudit";
+import { jointConversationFamilySql, resolveJointHumanMembershipScopes, filterJointHumanMemberEntries } from "./jointHumanMembershipAccess";
+import { assertJointUsersLocked, JointActorUnavailableError, lockJointActorFirst, lockJointHumanAdmissionSource, lockJointUsersFirst, lockJointHumanMembershipChannel, prepareJointHumanMembershipMirror, withJointUsersGuessed } from "./jointHumanMembershipMirror";
+import { newAuditOperationId, recordIntegrationAuditEvents, serverAuditContextMetadata } from "./integrationAuditService";
+import { recordServerConnected, type ServerConnectedMode } from "./jointMemberConnectEffects";
+import { recordOrdinaryJointAdmissions } from "./jointAdmissionKind";
+import { lockJointLifecycle, lockJointLifecycleOfChannel } from "./jointLifecycleLock";
 import { revokeSocketAccess } from "../socket/accessRevocation";
+import { beginAgentReadAdvance, noteAgentReadAdvance, noteAgentThreadFollowResumed } from "./agentReadProgressService";
 import { createHash, randomInt, randomUUID } from "crypto";
 import { performance } from "node:perf_hooks";
 import type { QueryResultRow } from "pg";
-import { eq, and, isNull, isNotNull, sql, inArray, asc, desc, ne, or, type SQL } from "drizzle-orm";
+import { eq, and, isNull, isNotNull, sql, inArray, asc, desc, ne, or, type SQL, type SQLWrapper } from "drizzle-orm";
+import { ensureAllChannelHumanRows } from "./allChannelMembership";
+import { activeAppBotOrOrdinaryAgent, agentFindableBy, listedServerAgent, type AgentFinder } from "./agentMemberListPolicy";
 import { alias, unionAll } from "drizzle-orm/pg-core";
-import { getDb, getSqlTraceHash, withDbTraceAttributes, type DatabaseExecutor } from "../db/index";
+import { getDb, getSqlTraceHash, withDbTraceAttributes, type DatabaseExecutor, type DatabaseTransaction } from "../db/index";
+import type { RemovedMemberEffects } from "./serverService";
 import {
   getRisingWaveConnectionTimeoutMillis,
   getRisingWaveInboxItemsServingVersion,
@@ -16,6 +33,7 @@ import {
   UNIFIED_CHAIN_VIEWS,
   CONVERSATION_UNREAD_VIEW,
   withUnifiedChainTransition,
+  type UnifiedChainQuery,
   type RisingWavePoolState,
   type RisingWaveInboxItemsServingVersion,
   asRisingWaveOverload,
@@ -30,14 +48,22 @@ import {
   type SidebarUnreadTotalsQuery,
 } from "./conversationUnreadSource";
 import { getActivityReadSourceOverride } from "./activityReadSource";
-import { agentMigrationReceiptChannels, agentPrivateSurfaces, channels, channelAgents, channelHumans, dmChannelIdentities, agents, users, serverMembers, messages, userChannelReadCursors, userChannelInboxStates, userChannelDisplayPrefs, inboxTargetMuteStates, inboxSuppressionStates, agentChannelReadCursors, servers, threadFollows, agentActivityEvents, tasks, taskEvents, jointChannels, jointChannelServers, jointChannelInvites, readMutationAuthorities, channelMembershipRoleEvents, serverAgentMembers, externalMessageAuthorFacts, externalProjectionAvatarArtifacts, externalActorProjections, externalAddressabilityProjections, externalAppInstalls, externalAppRegistrations, externalChannelBindings } from "../db/schema";
-import { gt, gte, lt } from "drizzle-orm";
-import { acquireServerLock, assertGuestJoinableChannelCapacityAvailable, GUEST_JOINABLE_CHANNEL_LOCK_NAMESPACE, GuestJoinableChannelLimitError, isChannelReadOnlyByBillingFeature, withServerLock, withServerResourceLock } from "./planService";
-import { assertJointAdmission, freeServerIds, reconcileJointOverLimit, reconcileJointOverLimitFor, refreshJointEntitlementsBeforeAdmission } from "./jointChannelLimitService";
+import {
+  listSlackPairHeadsForHealth, SLACK_PAIR_HEAD_BATCH_SIZE, slackPairOutboundHold, type SlackPairOutboundHold,
+} from "./slackBridgePairQueue";
+import { agentLounges, agentMigrationReceiptChannels, agentPrivateSurfaces, channelLastPosts, channelLastPostsBackfill, channels, channelAgents, channelHumans, dmChannelIdentities, agents, users, serverMembers, messages, userChannelReadCursors, userChannelInboxStates, userChannelDisplayPrefs, inboxTargetMuteStates, inboxSuppressionStates, agentChannelReadCursors, servers, threadFollows, agentActivityEvents, tasks, taskEvents, jointChannels, jointChannelServers, jointChannelInvites, readMutationAuthorities, channelMembershipRoleEvents, serverAgentMembers, externalMessageAuthorFacts, externalProjectionAvatarArtifacts, externalActorProjections, externalAddressabilityProjections, externalAppInstalls, externalAppRegistrations, externalChannelBindings, channelExternalInvites } from "../db/schema";
+import { gt, gte, lt, not } from "drizzle-orm";
+import { AgentLoungeImmutableError, AgentLoungeOutsiderError, isAgentLoungeChannel, isLoungeOutsiderAgent, loungeSummariesForAgents, notAgentLoungeChannel } from "./agentLoungeService";
+import { acquireServerAdmissionLocks, acquireServerLock, getHistoryCutoff, getServerPlan, JOINT_HOST_LOCK_NAMESPACE, isChannelReadOnlyByBillingFeature, lockServerResourceInTransaction, withServerLock, withServerResourceLock } from "./planService";
+import { HISTORY_PREVIEW_CHARS, historyLimitedPreview } from "./historyPreview";
+import { assertCanUnarchiveExternalChannel, assertJointParticipantCanConnect } from "./externalChannelLimitService";
+import { reconcileExternalFreezesForChannel, reconcileExternalFreezesForJointConnect, reconcileServerExternalFreeze, reconcileServerExternalFreezes } from "./externalChannelFreezeService";
+import { assertFreeHostCanConnectFirstServer, assertJointAdmission, type ReleasingGuest, freeServerIds, preflightFreeHostJointCapacity, reconcileJointOverLimit, reconcileJointOverLimitFor, refreshJointEntitlementsBeforeAdmission } from "./jointChannelLimitService";
 import { getJointLimitStatesForJoints, resolveParentJointId } from "./jointChannelLimitState";
-export { GuestJoinableChannelLimitError } from "./planService";
-import { MAX_JOINT_CHANNEL_SERVERS, PLAN_CONFIG, channelTypeSupportsActivityMute, currentDate, currentTimeMs, formatInboxScopeCorruptionLine, getEffectiveLimits, makeInboxScopeReadFrontier, type AgentActivity, type InboxScopeCursorCorruption, type InboxScopeReadFrontier, type ServerId, type ServerPlan, type TraceAttributes, type TrajectoryEntry, CHANNEL_MANAGEMENT_CAPABILITIES, canAddChannelMembers, canGuestJoinChannel, canGuestPostToChannel, canGuestReadChannel, channelSupportsRoles, getChannelAdminBasis, hasEffectiveChannelCapability, type ChannelRole, type ServerRole } from "@botiverse/raft-shared";
-import { formatDmPeerRef, parseDmPeerRef, type DmPeerKind } from "@botiverse/raft-shared";
+import { getExternalFreezeAtForChannels } from "./externalChannelFreezeState";
+import { DEPRECATED_GRAVATAR_HASH, asServerId, EXTERNAL_CHANNELS_FEATURE_FLAG_KEY, MAX_JOINT_CHANNEL_SERVERS, PLAN_CONFIG, activityMuteSupportedFor, currentDate, currentTimeMs, formatInboxScopeCorruptionLine, getEffectiveLimits, makeInboxScopeReadFrontier, type AgentActivity, type InboxScopeCursorCorruption, type InboxScopeReadFrontier, type ServerId, type ServerPlan, type TraceAttributes, type TrajectoryEntry, CHANNEL_MANAGEMENT_CAPABILITIES, canAddChannelMembers, canGuestPostToChannel, canGuestReadChannel, channelSupportsRoles, getChannelAdminBasis, hasEffectiveChannelCapability, type ChannelRole, type ServerRole } from "@botiverse/raft-shared";
+import { actorRoleHasServerCapability } from "../lib/actorPermissions";
+import { channelTypeSupportsThreadSort, type ChannelThreadSort, RAFT_TASK_REF_SEPARATOR, formatDmPeerRef, formatRaftChannelTaskRef, isSubConversationType, parseDmPeerRef, type DmPeerKind, type MarkUnreadOutcome } from "@botiverse/raft-shared";
 import { DmTargetResolutionError } from "./dmTargetResolutionError";
 import { untracedDbQuery, type DbQueryTracer } from "../tracing/dbQueryTrace";
 import { MESSAGE_SHORT_ID_RE, uuidShortIdRange } from "../lib/messageId";
@@ -52,6 +78,7 @@ import {
 import { sendJointChannelInviteEmail } from "./emailService";
 import { normalizeEmail } from "./emailNormalization";
 import {
+  isSubConversationInboxKind,
   mapInboxPolicyRowsToItems,
   selectInboxPolicyActiveUnreadCount,
   selectInboxPolicyPageRows,
@@ -66,7 +93,7 @@ import {
   type ReadMutationAck,
 } from "./readMutationSequencer";
 import { activityPromotionAllowedByMuteSql, isActivityPromotionSuppressedByMute } from "./inboxMutePolicy";
-import { evaluateFeatureFlag, SERVER_GUEST_FEATURE_FLAG_KEY } from "./featureFlagService";
+import { taskConversationUnreadMessageSql } from "./inboxUnreadEligibility";
 import {
   clearChannelDoneSuppression,
   clearFollowedThreadSuppressionForAll,
@@ -95,7 +122,8 @@ import {
   listInstalledApps as listInstalledRapApps,
 } from "./rapRegistryStore";
 import { withChannelWriterFence, assertChannelWritableInTransaction } from "./channelConversionFenceService";
-import { assertActionCardWritableInTransaction } from "./actionCardConversionService";
+import { announceJointInvitesChanged, announceJointInvitesForJoints, coalesceListChanges } from "./listChangedRealtime";
+import { ActionCardConversionFrozenError, assertActionCardWritableInTransaction } from "./actionCardConversionService";
 
 interface ChannelServiceOptions {
   executor?: DatabaseExecutor;
@@ -103,10 +131,25 @@ interface ChannelServiceOptions {
   actionCardConfirmationVersion?: number;
 }
 
+/**
+ * The action-card gate for a member add, scoped to the channel's server: a card
+ * of another server is refused as if it did not exist. A missing channel scopes
+ * to no server, so it is refused the same way.
+ */
+async function assertChannelActionCardWritable(
+  executor: DatabaseExecutor,
+  channelId: string,
+  options: ChannelServiceOptions,
+): Promise<void> {
+  if (!options.actionCardMessageId) return;
+  const [channel] = await executor.select({ serverId: channels.serverId }).from(channels).where(eq(channels.id, channelId)).limit(1);
+  if (!channel) throw new ActionCardConversionFrozenError();
+  await assertActionCardWritableInTransaction(executor, channel.serverId, options.actionCardMessageId, options.actionCardConfirmationVersion);
+}
+
 export type JointChannelInviteValidationCode =
   | "joint_target_server_invalid"
-  | "joint_invitee_not_found"
-  | "joint_invitee_not_admin"
+  | "joint_invitee_unavailable"
   | "joint_invite_required"
   | "joint_invite_limit_exceeded";
 
@@ -150,6 +193,13 @@ export type JointChannelMetadata = {
    * joint is read-only (`jointBillingLocked`). Null when within the cap.
    */
   jointOverLimitGraceEndsAt?: string | null;
+  /**
+   * The viewing server's external channel freeze, on its external channels
+   * (ordinary ones too): from this time its side of the channel is
+   * read-only; before it the server is over the free plan's limit and will
+   * be. Null otherwise.
+   */
+  externalFreezeAt?: string | null;
 };
 
 export type ExternalBridgeMetadata = {
@@ -157,6 +207,16 @@ export type ExternalBridgeMetadata = {
     provider: "slack";
     providerConversationId: string;
     state: "active" | "paused" | "quarantined";
+    /** Why sync stopped; present only while the binding is not active
+     *  (e.g. the legacy `raft_privacy_mismatch` pause reason). */
+    stateReason?: string;
+    /** Present only while Raft messages for Slack are held: `waiting` is a
+     *  pair-level block with its actionable hint; `stalled` is a head message
+     *  that needs an admin retry. `since` is when it started. */
+    outbound?: SlackPairOutboundHold;
+    /** The Slack installation's state, present only while it is not active
+     *  (e.g. `reauth_required`): no pair of that installation syncs then. */
+    installState?: Exclude<typeof externalAppInstalls.$inferSelect["state"], "active">;
   };
 };
 
@@ -166,6 +226,8 @@ export type ChannelExternalMember = {
   displayName: string;
   handles: string[];
   actorKind: "human" | "guest" | "remote" | "bot" | "unknown";
+  /** A display-only external participant is not a selectable mention target. */
+  mentionable?: boolean;
   avatarUrl: string | null;
   /** Slack workspace display name for the external-identity panel
    *  ("from <workspace>" line). Provider-side ids stay server-side — the
@@ -182,6 +244,12 @@ export type JointServerMetadata = {
   isCurrentServer?: boolean;
   /** Whether the joint's free-server cap counts this server as free. */
   plan: "free" | "paid";
+  /**
+   * Active servers only: the joint's channel name on that server. Names are
+   * per server, so a ref another server's member wrote (`#their-name:#7`)
+   * maps to the reader's channel through this (task v2 refs).
+   */
+  channelName?: string;
 };
 
 export type JointPendingInviteMetadata = {
@@ -203,6 +271,12 @@ export type JointChannelProjection = {
   channel: typeof channels.$inferSelect;
 };
 
+/**
+ * A joint sub-conversation projection: a thread (parent = a message) or a
+ * task conversation (parent = a task, task v2). The local face lives in one
+ * server under its local parent channel; messages live only in the canonical
+ * row. Exactly one of canonicalParentMessageId / canonicalParentTaskId is set.
+ */
 export type JointThreadProjection = {
   jointThreadId: string;
   localThreadChannelId: string;
@@ -210,7 +284,9 @@ export type JointThreadProjection = {
   localServerId: string;
   localParentChannelId: string;
   canonicalParentChannelId: string;
-  canonicalParentMessageId: string;
+  kind: "thread" | "task";
+  canonicalParentMessageId: string | null;
+  canonicalParentTaskId: string | null;
   role: "host" | "participant";
   threadChannel: typeof channels.$inferSelect;
 };
@@ -251,6 +327,34 @@ function requiresExplicitMembership(type: string): boolean {
   return type === "private" || type === "joint";
 }
 
+/**
+ * The archived joint channels a host owner/admin sees without being in them:
+ * the host's own copy whose host side is empty, as when
+ * it was archived because the host side emptied (jointHostSideArchive.ts). It
+ * stays in the host's archived list so a host owner/admin can bring it back
+ * (POST /channels/:id/unarchive rejoins them; channelActorHasCapability).
+ * Never a Guest, a partner's copy, or a joint the host still has members in.
+ */
+async function hostRecoverableArchivedJointIds(
+  serverId: string,
+  serverRole: ServerRole | null,
+  rows: readonly { id: string; type: string; archivedAt: Date | null }[],
+  executor: DatabaseExecutor = getDb(),
+): Promise<Set<string>> {
+  const recoverable = new Set<string>();
+  if (serverRole !== "owner" && serverRole !== "admin") return recoverable;
+  const ids = rows.filter((row) => row.type === "joint" && row.archivedAt !== null).map((row) => row.id);
+  if (ids.length === 0) return recoverable;
+  const hostScopes = [...(await resolveJointHumanMembershipScopes({ localChannelIds: ids, serverId: asServerId(serverId) }, executor)).values()]
+    .filter((scope) => scope.entryServerId === scope.hostServerId);
+  const active = await filterJointActiveEntries(hostScopes, executor);
+  const empty = await filterJointHostSidesEmpty(hostScopes.map((scope) => scope.jointId), executor);
+  for (const scope of hostScopes) {
+    if (active.has(scope.localChannelId) && empty.has(scope.jointId)) recoverable.add(scope.localChannelId);
+  }
+  return recoverable;
+}
+
 async function resolveHumanServerRole(
   serverId: string,
   userId: string,
@@ -264,16 +368,71 @@ async function resolveHumanServerRole(
   return membership?.role ?? null;
 }
 
-async function isGuestFeatureEnabled(
+/**
+ * The one channel a Guest belongs to on this server (server_members
+ * .guest_channel_id), or null: not a Guest, or a legacy Guest with no binding,
+ * which reads nothing (#wg-rbac:#15). No rollout flag is involved.
+ */
+export async function getGuestChannelId(
   serverId: string,
   userId: string,
-  executor?: DatabaseExecutor,
-): Promise<boolean> {
-  return (await evaluateFeatureFlag({
-    key: SERVER_GUEST_FEATURE_FLAG_KEY,
-    serverId,
-    userId,
-  }, executor)).enabled;
+  executor: DatabaseExecutor = getDb(),
+): Promise<string | null> {
+  const [membership] = await executor
+    .select({ guestChannelId: serverMembers.guestChannelId })
+    .from(serverMembers)
+    .where(and(eq(serverMembers.serverId, serverId), eq(serverMembers.userId, userId), eq(serverMembers.role, "guest")))
+    .limit(1);
+  return membership?.guestChannelId ?? null;
+}
+
+/** A Guest's bound channel as a viewer may see it (matrix §1 "Guest in #x"). */
+export interface VisibleGuestChannel {
+  id: string;
+  name: string;
+}
+
+/**
+ * The bound channel of each listed Guest, kept only where `viewerId` may read
+ * that channel (filterUserAccessibleChannelIds), so a private channel's name
+ * never reaches someone outside it. Non-guests and hidden channels are absent.
+ */
+export async function resolveVisibleGuestChannels(
+  serverId: string,
+  viewerId: string,
+  userIds: readonly string[],
+  executor: DatabaseExecutor = getDb(),
+): Promise<Map<string, VisibleGuestChannel>> {
+  const result = new Map<string, VisibleGuestChannel>();
+  if (userIds.length === 0) return result;
+  const rows = await executor
+    .select({ userId: serverMembers.userId, channelId: channels.id, name: channels.name })
+    .from(serverMembers)
+    .innerJoin(channels, eq(channels.id, serverMembers.guestChannelId))
+    .where(and(
+      eq(serverMembers.serverId, serverId),
+      eq(serverMembers.role, "guest"),
+      inArray(serverMembers.userId, [...new Set(userIds)]),
+    ));
+  if (rows.length === 0) return result;
+  const visible = await filterUserAccessibleChannelIds(
+    [...new Set(rows.map((row) => row.channelId))], viewerId, asServerId(serverId), { executor },
+  );
+  for (const row of rows) {
+    if (visible.has(row.channelId)) result.set(row.userId, { id: row.channelId, name: row.name });
+  }
+  return result;
+}
+
+/** `rows` with `guestChannel` set: the visible bound channel for a Guest, else null. */
+export async function withVisibleGuestChannels<T extends { userId: string; role: string | null }>(
+  serverId: string,
+  viewerId: string,
+  rows: readonly T[],
+): Promise<Array<T & { guestChannel: VisibleGuestChannel | null }>> {
+  const guestIds = rows.filter((row) => row.role === "guest").map((row) => row.userId);
+  const channelsByGuest = await resolveVisibleGuestChannels(serverId, viewerId, guestIds);
+  return rows.map((row) => ({ ...row, guestChannel: channelsByGuest.get(row.userId) ?? null }));
 }
 
 export async function createChannel(
@@ -286,7 +445,7 @@ export async function createChannel(
   const creator = options.type && options.id ? { ...options, type: options.type, id: options.id } : undefined;
   const apply = async (tx: DatabaseExecutor) => {
     if (options.actionCardMessageId) {
-      await assertActionCardWritableInTransaction(tx, options.actionCardMessageId, options.actionCardConfirmationVersion);
+      await assertActionCardWritableInTransaction(tx, serverId, options.actionCardMessageId, options.actionCardConfirmationVersion);
     }
     const channel = await createChannelWithExecutor(tx, serverId, name, description, type);
     if (creator && type !== "joint") {
@@ -374,7 +533,7 @@ async function createChannelWithExecutor(
     const [countRow] = await executor
       .select({ count: sql<number>`count(*)::int` })
       .from(channels)
-      .where(and(eq(channels.serverId, serverId), inArray(channels.type, REGULAR_CHANNEL_TYPES), isNull(channels.deletedAt)));
+      .where(and(eq(channels.serverId, serverId), inArray(channels.type, REGULAR_CHANNEL_TYPES), isNull(channels.deletedAt), notAgentLoungeChannel(channels.id)));
     const count = countRow?.count ?? 0;
     if (count >= limits.maxChannels) {
       throw new Error(`Channel limit reached (${count}/${limits.maxChannels} on ${PLAN_CONFIG[plan].displayName} plan). Upgrade for more.`);
@@ -517,7 +676,12 @@ type JointInvitee = {
   role: "owner" | "admin";
 };
 
-export async function createJointChannel(input: CreateJointChannelInput) {
+/** The creation and its same-admin accepts (each its own transaction): one joint-invites:changed per invitee. */
+export function createJointChannel(input: CreateJointChannelInput) {
+  return coalesceListChanges(() => createJointChannelUncoalesced(input));
+}
+
+async function createJointChannelUncoalesced(input: CreateJointChannelInput) {
   const inviteRequests = normalizeJointInviteRequests(input);
   const db = getDb();
   const now = input.now ?? currentDate();
@@ -527,75 +691,139 @@ export async function createJointChannel(input: CreateJointChannelInput) {
     preResolvedTargets.push((await getJointInviteTargetServer(db, inviteRequest.targetServerSlug, input.hostServerId)).id);
   }
   await refreshJointEntitlementsBeforeAdmission(null, [input.hostServerId, ...preResolvedTargets], now);
+  // A joint nobody has joined yet does not use the free host's slot, so
+  // creating is not capped; the invites it sends are. Answer now rather than
+  // when an invitee accepts (that accept is the authoritative check).
+  await preflightFreeHostJointCapacity(input.hostServerId, now, { audience: "host" });
 
-  const result = await withServerLock(input.hostServerId, 3, async (tx) => {
-    const resolvedInviteRequests = [];
-    for (const inviteRequest of inviteRequests) {
-      const targetServer = await getJointInviteTargetServer(tx, inviteRequest.targetServerSlug, input.hostServerId);
-      const invitees = await resolveJointInvitees(tx, targetServer.id, inviteRequest.invitedPeople, inviteRequest.targetServerSlug);
-      resolvedInviteRequests.push({ targetServer, invitees, sameAdmin: inviteRequest.sameAdmin === true });
+  // The users rows this creation names (the creator, the initial members, the
+  // invitees), first (lockJointUsersFirst), before the host's lock and every
+  // server, member and J lock: an FK check taking a person's row only at the
+  // insert closes a cycle with their account deletion (users row FOR UPDATE,
+  // then the servers they own; the invitees own or administer the targets).
+  // The invitees are guessed unlocked and resolved again under the locks; a
+  // set that grew restarts the transaction, so no users row is taken late.
+  let result!: Awaited<ReturnType<typeof createJointChannelInTransaction>>;
+  for (let attempt = 0; ; attempt += 1) {
+    const guessedInvitees = await guessJointInviteeIds(db, input.hostServerId, inviteRequests);
+    try {
+      result = await db.transaction((tx) => createJointChannelInTransaction(tx, input, inviteRequests, guessedInvitees, now));
+      break;
+    } catch (err) {
+      if (!(err instanceof JointCreationInviteesChanged)) throw err;
+      if (attempt >= 2) throw new Error("The invited people changed while the channel was created; try again");
     }
-    // Contract v0.3 §18.6/§18.7: no per-host joint count; the new joint must
-    // fit the server and free-server caps with every invited target counted.
-    await assertJointAdmission(tx, null, {
-      kind: "invite",
-      targetServerIds: [input.hostServerId, ...resolvedInviteRequests.map((request) => request.targetServer.id)],
-    }, now);
+  }
 
-    const storageNamespaceId = await ensureJointStorageNamespace(tx, input.createdByUserId);
-    const storageChannel = await createJointStorageChannelWithExecutor(tx, storageNamespaceId);
-    const channel = await createChannelWithExecutor(tx, input.hostServerId, input.name, input.description, "joint");
+  const sameAdmin = await acceptSameAdminJointInvites(result.invites, result.sameAdminInviteIds, input.createdByUserId, result.creatorGeneration);
+  return { channel: result.channel, jointChannel: result.jointChannel, ...sameAdmin };
+}
+
+/** createJointChannel's invitees resolved under its locks include someone its users lock did not take: restart. */
+class JointCreationInviteesChanged extends Error {}
+
+/** The invitees createJointChannel will resolve, read without a lock (an unresolvable request guesses none: refused under the locks). */
+async function guessJointInviteeIds(db: DatabaseExecutor, hostServerId: string, inviteRequests: JointInviteRequest[]): Promise<string[]> {
+  const ids: string[] = [];
+  for (const inviteRequest of inviteRequests) {
+    try {
+      const targetServer = await getJointInviteTargetServer(db, inviteRequest.targetServerSlug, hostServerId);
+      const invitees = await resolveJointInvitees(db, targetServer.id, inviteRequest.invitedPeople, inviteRequest.targetServerSlug);
+      ids.push(...invitees.map((invitee) => invitee.userId));
+    } catch (err) {
+      if (!(err instanceof JointChannelInviteValidationError)) throw err;
+    }
+  }
+  return ids;
+}
+
+async function createJointChannelInTransaction(
+  tx: DatabaseTransaction,
+  input: CreateJointChannelInput,
+  inviteRequests: JointInviteRequest[],
+  guessedInvitees: readonly string[],
+  now: Date,
+) {
+  const lockedUserIds = new Set([input.createdByUserId, ...(input.userIds ?? []), ...guessedInvitees]);
+  // The creator retired or being deleted: refused (JointActorUnavailableError; the route answers as a creator who may not federate).
+  await lockJointUsersFirst(tx, { actorUserId: input.createdByUserId, userIds: [...lockedUserIds] });
+  await acquireServerLock(tx, input.hostServerId, 3);
+  const resolvedInviteRequests = [];
+  for (const inviteRequest of inviteRequests) {
+    const targetServer = await getJointInviteTargetServer(tx, inviteRequest.targetServerSlug, input.hostServerId);
+    const invitees = await resolveJointInvitees(tx, targetServer.id, inviteRequest.invitedPeople, inviteRequest.targetServerSlug);
+    if (invitees.some((invitee) => !lockedUserIds.has(invitee.userId))) throw new JointCreationInviteesChanged();
+    resolvedInviteRequests.push({ targetServer, invitees, sameAdmin: inviteRequest.sameAdmin === true });
+  }
+  // Contract v0.3 §18.6/§18.7: the new joint must fit the server and
+  // free-server caps with every invited target counted.
+  await assertJointAdmission(tx, null, {
+    kind: "invite",
+    targetServerIds: [input.hostServerId, ...resolvedInviteRequests.map((request) => request.targetServer.id)],
+    hostServerId: input.hostServerId,
+  }, now);
+
+  await lockJointHumanAdmissionSource(tx, input.hostServerId, [input.createdByUserId, ...(input.userIds ?? [])]);
+  const storageNamespaceId = await ensureJointStorageNamespace(tx, input.createdByUserId);
+  const storageChannel = await createJointStorageChannelWithExecutor(tx, storageNamespaceId);
+  const channel = await createChannelWithExecutor(tx, input.hostServerId, input.name, input.description, "joint");
+  // read-position: new conversation, no history before this join (no row = position 0)
+  await tx.insert(channelHumans)
+    .values([
+      { channelId: channel.id, userId: input.createdByUserId },
+      ...(input.userIds ?? []).map((userId) => ({ channelId: channel.id, userId })),
+    ])
+    .onConflictDoNothing();
+  if (input.agentIds?.length) {
     // read-position: new conversation, no history before this join (no row = position 0)
-    await tx.insert(channelHumans)
-      .values([
-        { channelId: channel.id, userId: input.createdByUserId },
-        ...(input.userIds ?? []).map((userId) => ({ channelId: channel.id, userId })),
-      ])
+    await tx.insert(channelAgents)
+      .values(input.agentIds.map((agentId) => ({ channelId: channel.id, agentId })))
       .onConflictDoNothing();
-    if (input.agentIds?.length) {
-      // read-position: new conversation, no history before this join (no row = position 0)
-      await tx.insert(channelAgents)
-        .values(input.agentIds.map((agentId) => ({ channelId: channel.id, agentId })))
-        .onConflictDoNothing();
-    }
+  }
 
-    const [joint] = await tx.insert(jointChannels).values({
-      canonicalChannelId: storageChannel.id,
-      createdByServerId: input.hostServerId,
-      createdByUserId: input.createdByUserId,
-    }).returning();
-    await tx.insert(jointChannelServers).values({
-      jointChannelId: joint.id,
-      serverId: input.hostServerId,
-      localChannelId: channel.id,
-      role: "host",
-      joinedByUserId: input.createdByUserId,
-    });
-
-    const invites = [];
-    const sameAdminInviteIds = new Set<string>();
-    for (const inviteRequest of resolvedInviteRequests) {
-      for (const invitee of inviteRequest.invitees) {
-        const invite = await createJointChannelInvite({
-          jointChannelId: joint.id,
-          fromServerId: input.hostServerId,
-          targetServerId: inviteRequest.targetServer.id,
-          invitedUserId: invitee.userId,
-          invitedByUserId: input.createdByUserId,
-          executor: tx,
-        });
-        invites.push(invite);
-        if (inviteRequest.sameAdmin && invitee.userId === input.createdByUserId) {
-          sameAdminInviteIds.add(invite.id);
-        }
-      }
-    }
-
-    return { channel, jointChannel: joint, invites, sameAdminInviteIds };
+  const [joint] = await tx.insert(jointChannels).values({
+    canonicalChannelId: storageChannel.id,
+    createdByServerId: input.hostServerId,
+    createdByUserId: input.createdByUserId,
+  }).returning();
+  await tx.insert(jointChannelServers).values({
+    jointChannelId: joint.id,
+    serverId: input.hostServerId,
+    localChannelId: channel.id,
+    role: "host",
+    joinedByUserId: input.createdByUserId,
   });
 
-  const sameAdmin = await acceptSameAdminJointInvites(result.invites, result.sameAdminInviteIds, input.createdByUserId);
-  return { channel: result.channel, jointChannel: result.jointChannel, ...sameAdmin };
+  // New J is not visible before this transaction commits. Its source FK
+  // exists now; never insert admissions before creating the projection.
+  const mirrorHumans = await prepareJointHumanMembershipMirror(tx, { channelIds: [channel.id] }, "join");
+  // The creator admitted everyone this creation adds, themselves included.
+  await mirrorHumans.apply(undefined, { actorUserId: input.createdByUserId });
+  // The creator's membership as this creation wrote it: the servers this
+  // same operation connects for them (same-admin) are sources of exactly it.
+  const creatorGeneration = (await tx.execute<{ generation: number }>(sql`SELECT generation FROM joint_channel_members
+    WHERE joint_channel_id=${joint.id}::uuid AND user_id=${input.createdByUserId}::uuid`)).rows.map((row) => Number(row.generation))[0];
+
+  const invites = [];
+  const sameAdminInviteIds = new Set<string>();
+  for (const inviteRequest of resolvedInviteRequests) {
+    for (const invitee of inviteRequest.invitees) {
+      const invite = await createJointChannelInvite({
+        jointChannelId: joint.id,
+        fromServerId: input.hostServerId,
+        targetServerId: inviteRequest.targetServer.id,
+        invitedUserId: invitee.userId,
+        invitedByUserId: input.createdByUserId,
+        executor: tx,
+      });
+      invites.push(invite);
+      if (inviteRequest.sameAdmin && invitee.userId === input.createdByUserId) {
+        sameAdminInviteIds.add(invite.id);
+      }
+    }
+  }
+
+  return { channel, jointChannel: joint, invites, sameAdminInviteIds, creatorGeneration };
 }
 
 /** The target server's projection created by a same-admin accept. */
@@ -609,11 +837,23 @@ export type SameAdminAcceptedProjection = Awaited<ReturnType<typeof acceptJointC
  * transaction commits so it takes the target server lock on its own, the same
  * way a link accept does. An accept that fails (e.g. the joint hit a limit in
  * between) falls back to the email flow, so the invite is never left silent.
+ *
+ * `creationGeneration`: these accepts are part of the joint's creation (the
+ * creator's membership generation that creation wrote). Each
+ * target that connects is a source of that membership, if it still is the
+ * creator's current one. A later invite on a shared channel passes none.
  */
+let sameAdminAcceptBarrier: ((inviteId: string) => Promise<void>) | null = null;
+/** Tests only: runs before each same-admin accept of a joint's creation (after the creation committed). */
+export function __setSameAdminAcceptBarrierForTests(barrier: ((inviteId: string) => Promise<void>) | null): void {
+  sameAdminAcceptBarrier = barrier;
+}
+
 async function acceptSameAdminJointInvites<T extends { id: string; toServerId: string }>(
   invites: T[],
   sameAdminInviteIds: ReadonlySet<string>,
   inviterUserId: string,
+  creationGeneration?: number,
 ) {
   const acceptedProjections: SameAdminAcceptedProjection[] = [];
   const emailInviteIds: string[] = [];
@@ -623,12 +863,13 @@ async function acceptSameAdminJointInvites<T extends { id: string; toServerId: s
       continue;
     }
     try {
-      const channel = await acceptJointChannelInvite({
+      await sameAdminAcceptBarrier?.(invite.id);
+      const channel = await acceptJointChannelInviteWithEntitlements({
         inviteId: invite.id,
         targetServerId: invite.toServerId,
         acceptedByUserId: inviterUserId,
         acceptedVia: "same_admin",
-      });
+      }, true, { creationGeneration, connectedAuditMode: "same_admin" });
       acceptedProjections.push(channel);
     } catch (err) {
       console.error("[JointChannel] same-admin accept failed; falling back to the invite email:", err);
@@ -686,7 +927,7 @@ function normalizeJointInviteRequests(input: Pick<CreateJointChannelInput, "targ
   return [...byTargetSlug.values()];
 }
 
-export async function inviteServerToJointChannel(input: {
+type InviteServerToJointChannelInput = {
   localChannelId: string;
   fromServerId: string;
   invitedByUserId: string;
@@ -694,7 +935,14 @@ export async function inviteServerToJointChannel(input: {
   invitedPeople: string[];
   /** See JointInviteRequest.sameAdmin. */
   sameAdmin?: boolean;
-}) {
+};
+
+/** The invites and their same-admin accepts (each its own transaction): one joint-invites:changed per invitee. */
+export function inviteServerToJointChannel(input: InviteServerToJointChannelInput) {
+  return coalesceListChanges(() => inviteServerToJointChannelUncoalesced(input));
+}
+
+async function inviteServerToJointChannelUncoalesced(input: InviteServerToJointChannelInput) {
   const targetSlug = input.targetServerSlug.trim();
   if (!targetSlug) {
     throw new JointChannelInviteValidationError("Invite server slug is required", "joint_invite_required");
@@ -716,14 +964,35 @@ export async function inviteServerToJointChannel(input: {
     ));
   if (preProjection) {
     const preTarget = await getJointInviteTargetServer(db, targetSlug, input.fromServerId);
-    await refreshJointEntitlementsBeforeAdmission(
-      await resolveParentJointId(db, preProjection.jointChannelId),
-      [preTarget.id],
-      now,
-    );
+    const preParentJointId = await resolveParentJointId(db, preProjection.jointChannelId) ?? preProjection.jointChannelId;
+    await refreshJointEntitlementsBeforeAdmission(preParentJointId, [preTarget.id], now);
+    // If no other server has joined yet, accepting this invite would use the
+    // host's free slot; reject early when another joint already uses it.
+    const [preJoint] = await db
+      .select({ hostServerId: jointChannels.createdByServerId })
+      .from(jointChannels)
+      .where(eq(jointChannels.id, preParentJointId));
+    if (preJoint) {
+      // Only the host's own admin is told the host's plan (#wg-rbac:#61). Another
+      // server inviting means one has joined, which the preflight skips: never refused today.
+      await preflightFreeHostJointCapacity(preJoint.hostServerId, now, {
+        audience: preJoint.hostServerId === input.fromServerId ? "host" : "outsider",
+        excludeJointId: preParentJointId,
+      });
+    }
   }
 
-  const result = await withServerResourceLock(input.fromServerId, 3, input.localChannelId, async (tx) => {
+  // The users rows the invites name first (lockJointUsersFirst): the inviter
+  // (the actor) and the invitees (they own or administer the target), before
+  // the host's ns-3 lock and the joint's: an FK check taking one only at the
+  // insert closes a cycle with their account deletion (users row FOR UPDATE,
+  // then the servers they own). The invitees are guessed unlocked and resolved
+  // again under the locks; a set that grew restarts (withJointUsersGuessed).
+  const inviteRequest = { targetServerSlug: targetSlug, invitedPeople };
+  const result = await withJointUsersGuessed(async () => [input.invitedByUserId, ...await guessJointInviteeIds(db, input.fromServerId, [inviteRequest])], (lockedUserIds) => db.transaction(async (tx) => {
+    // The inviter retired or being deleted: refused (JointActorUnavailableError; the route answers as one who may not federate).
+    await lockJointUsersFirst(tx, { actorUserId: input.invitedByUserId, userIds: [...lockedUserIds] });
+    await lockServerResourceInTransaction(tx, input.fromServerId, 3, input.localChannelId);
     const [projection] = await tx
       .select({ jointChannelId: jointChannelServers.jointChannelId })
       .from(jointChannelServers)
@@ -738,6 +1007,7 @@ export async function inviteServerToJointChannel(input: {
       throw new Error("Joint channel not found");
     }
 
+    await lockJointFederationAuthority(tx,input.localChannelId,input.fromServerId,input.invitedByUserId);
     const targetServer = await getJointInviteTargetServer(tx, targetSlug, input.fromServerId);
     // One lock on the parent joint row serializes invites from every
     // participant server, not just this server's projection (§18.7).
@@ -746,6 +1016,7 @@ export async function inviteServerToJointChannel(input: {
       targetServerIds: [targetServer.id],
     }, now);
     const invitees = await resolveJointInvitees(tx, targetServer.id, invitedPeople, targetSlug);
+    assertJointUsersLocked(lockedUserIds, invitees.map((invitee) => invitee.userId));
     const invites = [];
     const sameAdminInviteIds = new Set<string>();
     for (const invitee of invitees) {
@@ -763,7 +1034,7 @@ export async function inviteServerToJointChannel(input: {
       }
     }
     return { invites, sameAdminInviteIds };
-  });
+  }));
 
   return acceptSameAdminJointInvites(result.invites, result.sameAdminInviteIds, input.invitedByUserId);
 }
@@ -839,17 +1110,13 @@ async function resolveJointInvitees(
         eq(serverMembers.serverId, targetServerId),
         isEmail ? eq(users.email, lookup) : eq(users.name, lookup),
       ));
-    if (!invitee) {
+    // One answer whether nobody matches or the match is not an admin: two
+    // would let an inviter on another server test whether an email or handle
+    // belongs to this server's members. Both come after the same single query.
+    if (!invitee || (invitee.role !== "owner" && invitee.role !== "admin")) {
       throw new JointChannelInviteValidationError(
-        `Invited person not found in target server: ${invitedPerson}`,
-        "joint_invitee_not_found",
-        { targetServerSlug, invitee: invitedPerson, inviteeIndex },
-      );
-    }
-    if (invitee.role !== "owner" && invitee.role !== "admin") {
-      throw new JointChannelInviteValidationError(
-        `Invited person must be a target server admin: ${invitedPerson}`,
-        "joint_invitee_not_admin",
+        `Cannot invite ${invitedPerson}: invite an owner or admin of the target server`,
+        "joint_invitee_unavailable",
         { targetServerSlug, invitee: invitedPerson, inviteeIndex },
       );
     }
@@ -913,6 +1180,16 @@ export async function sendJointChannelInviteEmails(inviteIds: string[]) {
   })));
 }
 
+async function lockJointFederationAuthority(tx: DatabaseExecutor, localChannelId:string, serverId:string, userId:string) {
+  await lockJointHumanMembershipChannel(tx,localChannelId);
+  await lockComputedJointActor({serverId,channelId:localChannelId,actorType:"user",actorId:userId},tx);
+  const scope=(await resolveJointHumanMembershipScopes({localChannelIds:[localChannelId]},tx)).get(localChannelId);
+  if (scope) {
+    const context=await resolveChannelActorContext(serverId,localChannelId,"user",userId,tx);
+    if (!context || !channelActorHasCapability(context,"federateChannels")) throw new Error("Channel capability required");
+  }
+}
+
 export async function createJointChannelInvite(input: {
   jointChannelId: string;
   fromServerId: string;
@@ -920,8 +1197,67 @@ export async function createJointChannelInvite(input: {
   invitedUserId: string;
   invitedByUserId: string;
   executor?: DatabaseExecutor;
-}) {
-  const db = input.executor ?? getDb();
+}): Promise<typeof jointChannelInvites.$inferSelect> {
+  if (!input.executor) return getDb().transaction(tx=>createJointChannelInvite({...input,executor:tx}));
+  const db = input.executor;
+  const [source]=await db.select({id:jointChannelServers.localChannelId}).from(jointChannelServers)
+    .where(and(eq(jointChannelServers.jointChannelId,input.jointChannelId),eq(jointChannelServers.serverId,input.fromServerId)));
+  if (!source) throw new Error("Joint channel not found");
+  await lockJointFederationAuthority(db,source.id,input.fromServerId,input.invitedByUserId);
+  return insertJointChannelInvite(db, input);
+}
+
+/**
+ * The joint invite an external channel invite connects a server with
+ * (#wg-rbac:#16, P2a-3): from the host to `targetServerId`, for the target's
+ * owner or admin who connects or approved (`authorizerUserId`). The external
+ * invite is the authority for this one connection, so the inviter's current
+ * federation capability is not checked; they are recorded as its sender.
+ *
+ * Inside the caller's transaction, after the target server's admission and
+ * ns-3 locks (ADMISSION_LOCK_ORDER in planService). The accept that follows
+ * locks, in order, the target's prior local channel, its
+ * server and member rows, the joint's membership lock (J), JOINT_HOST and the
+ * joint row. Those are taken here first, before the joint invite row is
+ * upserted: every other writer of that row (createJointChannelInvite, resend,
+ * the invite route's admission) holds J and the joint row before it, so
+ * upserting first would close a cycle with them (Cody, real PG). The accept
+ * re-takes the same locks re-entrantly.
+ */
+export async function createExternalConnectJointInvite(tx: DatabaseTransaction, input: {
+  jointChannelId: string;
+  fromServerId: string;
+  targetServerId: string;
+  authorizerUserId: string;
+  joinerUserId: string;
+  inviterUserId: string | null;
+}): Promise<typeof jointChannelInvites.$inferSelect> {
+  const [prior] = await tx.select({ localChannelId: jointChannelServers.localChannelId }).from(jointChannelServers)
+    .where(and(eq(jointChannelServers.jointChannelId, input.jointChannelId), eq(jointChannelServers.serverId, input.targetServerId)));
+  if (prior) await lockJointHumanMembershipChannel(tx, prior.localChannelId);
+  await lockJointHumanAdmissionSource(tx, input.targetServerId, [input.authorizerUserId, input.joinerUserId]);
+  await prepareJointHumanMembershipMirror(tx, { jointIds: [input.jointChannelId] }, "join");
+  const parentJointId = await resolveParentJointId(tx, input.jointChannelId) ?? input.jointChannelId;
+  const [joint] = await tx.select({ hostServerId: jointChannels.createdByServerId }).from(jointChannels).where(eq(jointChannels.id, parentJointId));
+  if (!joint) throw new Error("Joint channel not found");
+  await acquireServerLock(tx, joint.hostServerId, JOINT_HOST_LOCK_NAMESPACE);
+  await tx.execute(sql`SELECT ${jointChannels.id} FROM ${jointChannels} WHERE ${jointChannels.id} = ${parentJointId} FOR UPDATE`);
+  return insertJointChannelInvite(tx, {
+    jointChannelId: input.jointChannelId,
+    fromServerId: input.fromServerId,
+    targetServerId: input.targetServerId,
+    invitedUserId: input.authorizerUserId,
+    invitedByUserId: input.inviterUserId,
+  });
+}
+
+async function insertJointChannelInvite(db: DatabaseExecutor, input: {
+  jointChannelId: string;
+  fromServerId: string;
+  targetServerId: string;
+  invitedUserId: string;
+  invitedByUserId: string | null;
+}): Promise<typeof jointChannelInvites.$inferSelect> {
   const [existing] = await db
     .select()
     .from(jointChannelServers)
@@ -953,52 +1289,39 @@ export async function createJointChannelInvite(input: {
       createdAt: currentDate(),
     },
   }).returning();
+  if (!invite) throw new Error("Joint channel invite not created");
+  // Every invite writer comes here, in its transaction: sent once that commits.
+  announceJointInvitesChanged([invite]);
   return invite;
 }
 
 export async function resendPendingJointChannelInvites(input: {
-  localChannelId: string;
-  fromServerId: string;
-  requestedByUserId: string;
+  localChannelId:string; fromServerId:string; requestedByUserId:string;
+  /** Spends the resend's emails (one per pending invitee) before any is sent; a throw rolls the resend back. */
+  admitResend?:(people:number)=>Promise<void>;
 }) {
-  const db = getDb();
-  const [projection] = await db
-    .select({ jointChannelId: jointChannelServers.jointChannelId })
-    .from(jointChannelServers)
-    .innerJoin(jointChannels, eq(jointChannels.id, jointChannelServers.jointChannelId))
-    .where(and(
-      eq(jointChannelServers.localChannelId, input.localChannelId),
-      eq(jointChannelServers.serverId, input.fromServerId),
-      eq(jointChannelServers.status, "active"),
-      eq(jointChannels.status, "active"),
-    ));
-  if (!projection) {
-    throw new Error("Joint channel not found");
-  }
-
-  const pendingRows = await db
-    .select({ id: jointChannelInvites.id })
-    .from(jointChannelInvites)
-    .where(and(
-      eq(jointChannelInvites.jointChannelId, projection.jointChannelId),
-      eq(jointChannelInvites.fromServerId, input.fromServerId),
-      eq(jointChannelInvites.status, "pending"),
-    ));
-  const inviteIds = pendingRows.map((row) => row.id);
-  if (inviteIds.length === 0) {
-    throw new Error("No pending joint channel invite found");
-  }
-
-  await db.update(jointChannelInvites)
-    .set({
-      invitedByUserId: input.requestedByUserId,
-      expiresAt: new Date(currentTimeMs() + JOINT_CHANNEL_INVITE_TTL_MS),
-      createdAt: currentDate(),
-    })
-    .where(inArray(jointChannelInvites.id, inviteIds));
-
+  const inviteIds=await getDb().transaction(async tx=>{
+    // The resender's users row first (the invites name them as their sender
+    // from now on), before the channel and the joint's locks; retired or
+    // being deleted (lockJointActorFirst): the neutral refusal.
+    await lockJointActorFirst(tx,input.requestedByUserId).catch(unusableActorAsNotFound);
+    await lockJointFederationAuthority(tx,input.localChannelId,input.fromServerId,input.requestedByUserId);
+    const [projection]=await tx.select({jointId:jointChannelServers.jointChannelId}).from(jointChannelServers)
+      .innerJoin(jointChannels,eq(jointChannels.id,jointChannelServers.jointChannelId))
+      .where(and(eq(jointChannelServers.localChannelId,input.localChannelId),eq(jointChannelServers.serverId,input.fromServerId),
+        eq(jointChannelServers.status,"active"),eq(jointChannels.status,"active")));
+    if(!projection) throw new Error("Joint channel not found");
+    const rows=await tx.update(jointChannelInvites).set({invitedByUserId:input.requestedByUserId,
+      expiresAt:new Date(currentTimeMs()+JOINT_CHANNEL_INVITE_TTL_MS),createdAt:currentDate()})
+      .where(and(eq(jointChannelInvites.jointChannelId,projection.jointId),eq(jointChannelInvites.fromServerId,input.fromServerId),
+        eq(jointChannelInvites.status,"pending"))).returning({id:jointChannelInvites.id,toServerId:jointChannelInvites.toServerId,invitedUserId:jointChannelInvites.invitedUserId});
+    if(!rows.length) throw new Error("No pending joint channel invite found");
+    if(input.admitResend) await input.admitResend(rows.length);
+    announceJointInvitesChanged(rows);
+    return rows.map(row=>row.id);
+  });
   await sendJointChannelInviteEmails(inviteIds);
-  return { ok: true, resentCount: inviteIds.length };
+  return {ok:true,resentCount:inviteIds.length};
 }
 
 export async function listPendingJointChannelInvites(serverId: string, userId: string) {
@@ -1041,28 +1364,152 @@ export async function listPendingJointChannelInvites(serverId: string, userId: s
   return rows.filter((row) => row.expiresAt.getTime() > now);
 }
 
-export async function acceptJointChannelInvite(input: {
+type AcceptJointChannelInviteInput = {
   inviteId: string;
   targetServerId: string;
+  /** The invited owner/admin of the target server: authorizes the connection. */
   acceptedByUserId: string;
+  /**
+   * Who is added to the joint channel on the target server; the accepter when
+   * absent. When another person (an external invite's joiner, P2a-3), they
+   * must be a current non-guest member of the target, checked under the same
+   * member locks as the accepter's role.
+   */
+  joinerUserId?: string;
   /** Audit only; authority checks are identical for both paths. */
   acceptedVia?: JointInviteAcceptedVia;
-}) {
+};
+export function acceptJointChannelInvite(input: AcceptJointChannelInviteInput) {
+  return acceptJointChannelInviteWithEntitlements(input,true,{connectedAuditMode:"joint_invite"});
+}
+
+/**
+ * The host's `servers` row FOR KEY SHARE before the joint's membership lock
+ * (J): the accept's `channel.server_connected` audit event references it
+ * (server_id), and that foreign key's KEY SHARE taken after J would close a
+ * J <-> server cycle with deleteServer (server row FOR UPDATE, then J), as
+ * externalInviteConnectService.connectJointChannel takes it.
+ */
+async function lockJointHostServerBeforeAudit(tx: DatabaseExecutor, hostServerId: string | null): Promise<void> {
+  if (hostServerId) await tx.execute(sql`SELECT id FROM servers WHERE id=${hostServerId}::uuid FOR KEY SHARE`);
+}
+
+/** The host (created_by_server_id) of the top-level joint of any joint id; null for a missing joint. */
+async function jointHostOfJoint(executor: DatabaseExecutor, jointChannelId: string): Promise<string | null> {
+  const parentJointId = await resolveParentJointId(executor, jointChannelId) ?? jointChannelId;
+  const [row] = await executor.select({ hostServerId: jointChannels.createdByServerId }).from(jointChannels).where(eq(jointChannels.id, parentJointId));
+  return row?.hostServerId ?? null;
+}
+
+/** A joint channel archived (its archive is shared by every active projection): no server joins it. */
+export class JointChannelArchivedError extends Error {
+  readonly code = "channel_archived";
+  constructor() {
+    super("This channel is archived");
+    this.name = "JointChannelArchivedError";
+  }
+}
+
+/**
+ * Under the joint's lifecycle lock (which archive/unarchive hold while they
+ * write): the joint is not archived. Read after the lock, so an archive that
+ * committed while this waited, or before it started, refuses the connection.
+ */
+async function assertJointOpenUnderLifecycle(tx: DatabaseExecutor, jointChannelId: string): Promise<void> {
+  const [archived] = await tx.select({ id: channels.id }).from(jointChannelServers)
+    .innerJoin(channels, eq(channels.id, jointChannelServers.localChannelId))
+    .where(and(eq(jointChannelServers.jointChannelId, jointChannelId), eq(jointChannelServers.status, "active"), isNotNull(channels.archivedAt)))
+    .limit(1);
+  if (archived) throw new JointChannelArchivedError();
+}
+
+/** Why an accept refused the people it names (authorizer's role, joiner's membership). */
+/** A same-admin accept of a joint's creation after the creator left, or left and rejoined another way: refused, nothing written. */
+export class JointCreationMembershipChangedError extends Error {
+  readonly code = "membership_changed";
+  constructor() {
+    super("The creator's membership changed since the channel was created");
+    this.name = "JointCreationMembershipChangedError";
+  }
+}
+
+export class JointInviteAccepterError extends Error {
+  constructor(readonly code: "authorizer_not_admin" | "joiner_not_member", message: string) {
+    super(message);
+    this.name = "JointInviteAccepterError";
+  }
+}
+
+/**
+ * Accept inside the caller's open transaction (an external invite's
+ * connection, P2a-3), with the authorizer and the joiner named apart: the
+ * accept's own transaction becomes a savepoint on the caller's (db/index
+ * scopeTransactions), so its writes commit or roll back with the caller's.
+ * Every check and write is the ordinary accept's; the caller refreshes
+ * entitlements before its transaction (refreshJointEntitlementsBeforeAdmission)
+ * and owes the post-commit effects and the `channel.server_connected` audit
+ * event (recordServerConnected, in its transaction).
+ */
+export function acceptJointChannelInviteInCallerTransaction(
+  input: AcceptJointChannelInviteInput & { joinerUserId: string },
+  /** A self_connect whose actor's host Guest seat the caller ends in this commit: the cap counts the two once (ReleasingGuest). */
+  options: { releasingGuest?: ReleasingGuest } = {},
+) {
+  return acceptJointChannelInviteWithEntitlements(input, false, options);
+}
+
+async function acceptJointChannelInviteWithEntitlements(
+  input: AcceptJointChannelInviteInput,
+  refreshEntitlements: boolean,
+  /** A batch accept has reconciled every server's external channel freeze already, before any joint row lock. */
+  options: {
+    externalFreezesReconciled?: boolean;
+    creationGeneration?: number;
+    releasingGuest?: ReleasingGuest;
+    /**
+     * A joint invite's own accept: this accept writes the `channel.server_connected`
+     * audit event when it connects the server. Absent inside an external
+     * connect's transaction, whose caller writes it.
+     */
+    connectedAuditMode?: Extract<ServerConnectedMode, "joint_invite" | "same_admin">;
+  } = {},
+) {
   const acceptedVia: JointInviteAcceptedVia = input.acceptedVia ?? "invitee";
+  const joinerUserId = input.joinerUserId ?? input.acceptedByUserId;
   assertJointChannelInviteId(input.inviteId);
   const now = currentDate();
   const [preInvite] = await getDb()
     .select({ jointChannelId: jointChannelInvites.jointChannelId })
     .from(jointChannelInvites)
     .where(eq(jointChannelInvites.id, input.inviteId));
-  if (preInvite) {
+  if (preInvite && refreshEntitlements) {
     await refreshJointEntitlementsBeforeAdmission(
       await resolveParentJointId(getDb(), preInvite.jointChannelId),
       [input.targetServerId],
       now,
     );
   }
-  return withServerLock(input.targetServerId, 3, async (tx) => {
+  // Unlocked, only to know whose admission lock to take; re-checked under it.
+  const preHostServerId = preInvite ? await jointHostOfJoint(getDb(), preInvite.jointChannelId) : null;
+  return getDb().transaction(async (tx) => {
+    // ADMISSION_LOCK_ORDER (planService): the connecting server's and the
+    // joint's host's admission locks first (the connecting server's
+    // one-external-channel rule; both their external channel freezes), then
+    // the connecting server's ns-3 lock. Re-entrant when a batch accept or an
+    // external connect already holds them.
+    await acquireServerAdmissionLocks(tx, preHostServerId ? [input.targetServerId, preHostServerId] : [input.targetServerId]);
+    await acquireServerLock(tx, input.targetServerId, 3);
+    // Unlocked, only to find which joint's lifecycle lock to take. Everything
+    // this accept uses is read below, under that lock (Cody f294a013): a
+    // metadata fan-out, an archive or a delete that committed while this
+    // waited is what the new projection is built from or refused on.
+    const [located] = await tx.select({ jointChannelId: jointChannelInvites.jointChannelId }).from(jointChannelInvites)
+      .where(eq(jointChannelInvites.id, input.inviteId));
+    if (!located) throw new Error("Joint channel invite not found");
+    // After the ns-3 lock, before any channel row: archive/unarchive and the
+    // metadata fan-out of the joint serialize with this new projection
+    // (jointLifecycleLock.ts).
+    await lockJointLifecycle(tx, located.jointChannelId);
     const fromProjection = alias(jointChannelServers, "joint_accept_from_projection");
     const displayChannel = alias(channels, "joint_accept_display_channel");
     const [invite] = await tx
@@ -1088,6 +1535,7 @@ export async function acceptJointChannelInvite(input: {
       .innerJoin(displayChannel, eq(displayChannel.id, fromProjection.localChannelId))
       .where(and(
         eq(jointChannelInvites.id, input.inviteId),
+        eq(jointChannelInvites.jointChannelId, located.jointChannelId),
         eq(jointChannelInvites.toServerId, input.targetServerId),
         eq(jointChannelInvites.invitedUserId, input.acceptedByUserId),
         eq(jointChannelInvites.status, "pending"),
@@ -1097,12 +1545,26 @@ export async function acceptJointChannelInvite(input: {
     if (!invite) {
       throw new Error("Joint channel invite not found");
     }
+    // Time after the locks.
     if (invite.expiresAt.getTime() <= currentTimeMs()) {
       await tx.update(jointChannelInvites)
         .set({ status: "expired" })
         .where(eq(jointChannelInvites.id, input.inviteId));
       throw new Error("Joint channel invite expired");
     }
+    // Sent only if this accept commits (afterAmbientCommit): the invitee's list loses it.
+    announceJointInvitesChanged([invite]);
+    await assertJointOpenUnderLifecycle(tx, invite.jointChannelId);
+    const [priorProjection] = await tx
+      .select({ localChannelId: jointChannelServers.localChannelId, status: jointChannelServers.status })
+      .from(jointChannelServers)
+      .where(and(
+        eq(jointChannelServers.jointChannelId, invite.jointChannelId),
+        eq(jointChannelServers.serverId, input.targetServerId),
+      ));
+    const existingProjection = priorProjection?.status === "active" ? priorProjection : undefined;
+    if (priorProjection) await lockJointHumanMembershipChannel(tx, priorProjection.localChannelId);
+    await lockJointHumanAdmissionSource(tx, input.targetServerId, [input.acceptedByUserId, joinerUserId]);
     const [acceptingMember] = await tx
       .select({ role: serverMembers.role })
       .from(serverMembers)
@@ -1111,24 +1573,54 @@ export async function acceptJointChannelInvite(input: {
         eq(serverMembers.userId, input.acceptedByUserId),
       ));
     if (!acceptingMember || (acceptingMember.role !== "owner" && acceptingMember.role !== "admin")) {
-      throw new Error("Only target server admins can accept joint channel invites");
+      throw new JointInviteAccepterError("authorizer_not_admin", "Only target server admins can accept joint channel invites");
+    }
+    if (joinerUserId !== input.acceptedByUserId) {
+      const [joiningMember] = await tx
+        .select({ role: serverMembers.role })
+        .from(serverMembers)
+        .where(and(
+          eq(serverMembers.serverId, input.targetServerId),
+          eq(serverMembers.userId, joinerUserId),
+        ));
+      if (!joiningMember || joiningMember.role === "guest") {
+        throw new JointInviteAccepterError("joiner_not_member", "The person joining is no longer a member of the target server");
+      }
     }
 
-    const [existingProjection] = await tx
-      .select({ localChannelId: jointChannelServers.localChannelId })
-      .from(jointChannelServers)
-      .where(and(
-        eq(jointChannelServers.jointChannelId, invite.jointChannelId),
-        eq(jointChannelServers.serverId, input.targetServerId),
-        eq(jointChannelServers.status, "active"),
-      ));
+    if (options.connectedAuditMode) await lockJointHostServerBeforeAudit(tx, preHostServerId);
+    // Before the capacity check's joint-row lock as well as before CH writes.
+    await prepareJointHumanMembershipMirror(tx, { jointIds: [invite.jointChannelId] }, "join");
+    const existingMember = await tx.execute(sql`SELECT 1 FROM joint_channel_members
+      WHERE joint_channel_id=${invite.jointChannelId}::uuid AND user_id=${joinerUserId}::uuid`);
+    const alreadyJoined = existingMember.rows.length>0;
+    // Part of the joint's creation: only while the creator still holds the
+    // membership that creation wrote (under the J lock, before any write).
+    // Left since, or left and rejoined another way: refused, nothing written
+    // (the same-admin caller falls back to the invite email).
+    if (options.creationGeneration !== undefined) {
+      const [current] = (await tx.execute<{ generation: number }>(sql`SELECT generation FROM joint_channel_members
+        WHERE joint_channel_id=${invite.jointChannelId}::uuid AND user_id=${joinerUserId}::uuid FOR UPDATE`)).rows;
+      if (!current || Number(current.generation) !== options.creationGeneration) throw new JointCreationMembershipChangedError();
+    }
+    // Part of the joint's creation (same-admin at create): this server is a
+    // source of the membership that creation wrote, only while it is still
+    // the joiner's current one (under the J and member locks above).
+    const recordCreationSource = async () => {
+      if (options.creationGeneration === undefined) return;
+      await recordOrdinaryJointAdmissions(tx, sql`SELECT m.joint_channel_id,m.user_id,${input.targetServerId}::uuid AS server_id,m.generation,
+          now() AS admitted_at,${input.acceptedByUserId}::uuid AS admitted_by
+        FROM joint_channel_members m
+        WHERE m.joint_channel_id=${invite.jointChannelId}::uuid AND m.user_id=${joinerUserId}::uuid AND m.generation=${options.creationGeneration}`);
+    };
+    await assertJointReconnectReady(tx, invite.jointChannelId, input.targetServerId);
     if (existingProjection) {
-      const joined = await tx.insert(channelHumans)
-        .values({ channelId: existingProjection.localChannelId, userId: input.acceptedByUserId })
+      const joined = alreadyJoined ? [] : await tx.insert(channelHumans)
+        .values({ channelId: existingProjection.localChannelId, userId: joinerUserId })
         .onConflictDoNothing()
         .returning({ userId: channelHumans.userId });
       if (joined.length > 0) {
-        await startReadPositionAtJoin(tx, "human", input.acceptedByUserId, existingProjection.localChannelId);
+        await startReadPositionAtJoin(tx, "human", joinerUserId, existingProjection.localChannelId);
       }
       await tx.update(jointChannelInvites)
         .set({
@@ -1146,14 +1638,45 @@ export async function acceptJointChannelInvite(input: {
           isNull(channels.deletedAt),
         ));
       if (!existingChannel) throw new Error("Joint channel projection not found");
+      const mirrorExisting = await prepareJointHumanMembershipMirror(tx, { channelIds: [existingProjection.localChannelId] }, "join");
+      await mirrorExisting.apply([joinerUserId], { actorUserId: input.acceptedByUserId });
+      await recordCreationSource();
       return existingChannel;
     }
 
+    const parentJointId = await resolveParentJointId(tx, invite.jointChannelId);
+    // The host whose admission lock was taken (it never changes; a joint
+    // found missing before the transaction has none to compare).
+    if (await jointHostOfJoint(tx, invite.jointChannelId) !== preHostServerId) throw new Error("Joint channel invite not found");
+    // ADMISSION_LOCK_ORDER rule 4: the free plan's external channel freeze
+    // rows before JOINT_HOST and the joint row lock below, counting the joint
+    // as connected (the projection is written after those checks).
+    if (!options.externalFreezesReconciled) {
+      await reconcileExternalFreezesForJointConnect(tx, {
+        parentJointId: parentJointId ?? invite.jointChannelId,
+        connectingServerIds: [input.targetServerId],
+        now,
+      });
+    }
+    // The first other server to connect makes this joint use the host's free
+    // slot: the one authoritative free-host check (JOINT_HOST lock, then the
+    // joint row lock, under this server's ns-3 lock).
+    await assertFreeHostCanConnectFirstServer(tx, parentJointId ?? invite.jointChannelId, input.targetServerId, now);
     // Accepting counts active participants plus this server, so an old free
     // invite cannot push a joint that is already over past the cap (§18.8).
-    const parentJointId = await resolveParentJointId(tx, invite.jointChannelId);
-    await assertJointAdmission(tx, parentJointId, { kind: "accept", serverId: input.targetServerId }, now);
+    // A host with external channels on lifts that cap; a free server newly
+    // connecting is then held to one external channel instead.
+    await assertJointAdmission(tx, parentJointId, { kind: "accept", serverId: input.targetServerId }, now,
+      options.releasingGuest ? { releasingGuest: options.releasingGuest } : {});
+    await assertJointParticipantCanConnect(tx, {
+      parentJointId: parentJointId ?? invite.jointChannelId,
+      targetServerId: input.targetServerId,
+      priorLocalChannelId: priorProjection?.localChannelId,
+      now,
+    });
 
+    if (priorProjection?.status === "disconnected") await tx.update(channels).set({deletedAt:now})
+      .where(eq(channels.id,priorProjection.localChannelId));
     const projection = await createChannelWithExecutor(
       tx,
       input.targetServerId,
@@ -1161,15 +1684,29 @@ export async function acceptJointChannelInvite(input: {
       invite.channelDescription ?? undefined,
       "joint",
     );
-    await tx.insert(channelHumans)
-      .values({ channelId: projection.id, userId: input.acceptedByUserId })
+    if (!alreadyJoined) await tx.insert(channelHumans)
+      .values({ channelId: projection.id, userId: joinerUserId })
       .onConflictDoNothing();
+    // A server that disconnected earlier still has its row (the primary key is
+    // joint + server); rejoining reuses it with the new local copy.
     await tx.insert(jointChannelServers).values({
       jointChannelId: invite.jointChannelId,
       serverId: input.targetServerId,
       localChannelId: projection.id,
       role: "participant",
       joinedByUserId: input.acceptedByUserId,
+    }).onConflictDoUpdate({
+      target: [jointChannelServers.jointChannelId, jointChannelServers.serverId],
+      set: {
+        localChannelId: projection.id,
+        role: "participant",
+        status: "active",
+        joinedByUserId: input.acceptedByUserId,
+        joinedAt: now,
+        disconnectedByUserId: null,
+        disconnectedAt: null,
+      },
+      setWhere: eq(jointChannelServers.status, "disconnected"),
     });
     await backfillJointThreadProjectionsForLocalParent(tx, {
       jointChannelId: invite.jointChannelId,
@@ -1186,7 +1723,19 @@ export async function acceptJointChannelInvite(input: {
       .select({ seq: sql<number>`COALESCE(MAX(${messages.seq}), 0)::int` })
       .from(messages)
       .where(eq(messages.channelId, invite.canonicalChannelId));
-    await startReadPositionAtJoin(tx, "human", input.acceptedByUserId, projection.id, canonicalLatest?.seq ?? 0);
+    await startReadPositionAtJoin(tx, "human", joinerUserId, projection.id, canonicalLatest?.seq ?? 0);
+    // Task v2: the joining server also gets a local face of every task
+    // conversation under the channel (same rule as threads).
+    const { backfillJointTaskConversationProjectionsForLocalParent } = await import("./taskConversationService");
+    await backfillJointTaskConversationProjectionsForLocalParent(tx, {
+      canonicalParentChannelId: invite.canonicalChannelId,
+      localParentProjection: {
+        serverId: input.targetServerId,
+        localChannelId: projection.id,
+        role: "participant",
+      },
+      joinedByUserId: input.acceptedByUserId,
+    });
     await tx.update(jointChannelInvites)
       .set({
         status: "accepted",
@@ -1195,8 +1744,78 @@ export async function acceptJointChannelInvite(input: {
         acceptedVia,
       })
       .where(eq(jointChannelInvites.id, input.inviteId));
+    // The target projection may have been created above, so resolve the new
+    // source after it exists, inside the same already-J-locked transaction.
+    const mirrorAccepted = await prepareJointHumanMembershipMirror(tx, { channelIds: [projection.id] }, "join");
+    await mirrorAccepted.apply([joinerUserId], { actorUserId: input.acceptedByUserId });
+    await recordCreationSource();
     if (parentJointId) await reconcileJointOverLimit(tx, parentJointId, now);
+    // This accept connected the server (an accept that found it connected
+    // returned above): one event on the host, naming the host's own copy. A
+    // host with no active copy (it disconnected itself, external channels
+    // off) has no row to write.
+    if (options.connectedAuditMode && preHostServerId && preHostServerId !== input.targetServerId) {
+      const [hostCopy] = await tx.select({ localChannelId: jointChannelServers.localChannelId }).from(jointChannelServers)
+        .where(and(
+          eq(jointChannelServers.jointChannelId, invite.jointChannelId),
+          eq(jointChannelServers.serverId, preHostServerId),
+          eq(jointChannelServers.role, "host"),
+          eq(jointChannelServers.status, "active"),
+        ));
+      if (hostCopy) await recordServerConnected(tx, {
+        mode: options.connectedAuditMode,
+        jointChannelId: invite.jointChannelId,
+        hostServerId: preHostServerId,
+        hostChannelId: hostCopy.localChannelId,
+        connectedServerId: input.targetServerId,
+        actorUserId: input.acceptedByUserId,
+      });
+    }
     return projection;
+  });
+}
+
+/** One acceptance operation, with a single pre-operation membership snapshot.
+ * Sequential independent accepts do not accumulate sources for existing J
+ * members. Every selected invite is personal and revalidated by the ordinary
+ * accept writer; failure rolls back all connection/membership writes. */
+export async function acceptJointChannelInvites(input:{inviteIds:readonly string[];acceptedByUserId:string}) {
+  const ids=[...new Set(input.inviteIds)];
+  if(ids.length===0 || ids.length>=MAX_JOINT_CHANNEL_SERVERS || ids.some(id=>!isJointChannelInviteId(id))) throw new Error("Invalid joint invite selection");
+  const db=getDb();
+  const invites=await db.select().from(jointChannelInvites).where(and(inArray(jointChannelInvites.id,ids),eq(jointChannelInvites.invitedUserId,input.acceptedByUserId),eq(jointChannelInvites.status,"pending")));
+  const jointId=invites[0]?.jointChannelId;
+  if(invites.length!==ids.length || !jointId || invites.some(invite=>invite.jointChannelId!==jointId)) throw new Error("Joint channel invite not found");
+  const serverIds=[...new Set(invites.map(invite=>invite.toServerId))].sort();
+  if(serverIds.length!==ids.length) throw new Error("Invalid joint invite selection");
+  await refreshJointEntitlementsBeforeAdmission(await resolveParentJointId(db,jointId) ?? jointId,serverIds,currentDate());
+  // Unlocked, only to know whose admission lock to take; each accept re-checks it under the lock.
+  const hostServerId=await jointHostOfJoint(db,jointId);
+  return db.transaction(async tx=>{
+    // ADMISSION_LOCK_ORDER (planService): every connecting server's and the host's admission lock, then the connecting servers' ns-3 locks, each in server-id order.
+    await acquireServerAdmissionLocks(tx,hostServerId?[...serverIds,hostServerId]:serverIds);
+    for(const serverId of serverIds) await acquireServerLock(tx,serverId,3);
+    await lockJointLifecycle(tx,jointId);
+    await assertJointOpenUnderLifecycle(tx,jointId);
+    const prior=await tx.select({id:jointChannelServers.localChannelId}).from(jointChannelServers)
+      .where(and(eq(jointChannelServers.jointChannelId,jointId),inArray(jointChannelServers.serverId,serverIds)));
+    for(const id of prior.map(row=>row.id).sort()) await lockJointHumanMembershipChannel(tx,id);
+    for(const serverId of serverIds) await lockJointHumanAdmissionSource(tx,serverId,[input.acceptedByUserId]);
+    await lockJointHostServerBeforeAudit(tx,hostServerId);
+    await prepareJointHumanMembershipMirror(tx,{jointIds:[jointId]},"join");
+    const before=await tx.execute(sql`SELECT 1 FROM joint_channel_members WHERE joint_channel_id=${jointId}::uuid AND user_id=${input.acceptedByUserId}::uuid`);
+    // ADMISSION_LOCK_ORDER rule 4: every server's external channel freeze
+    // row once, before the first accept takes the joint row lock.
+    await reconcileExternalFreezesForJointConnect(tx,{parentJointId:await resolveParentJointId(tx,jointId) ?? jointId,connectingServerIds:serverIds,now:currentDate()});
+    const accepted=[];
+    for(const invite of [...invites].sort((a,b)=>a.toServerId.localeCompare(b.toServerId))) {
+      accepted.push(await acceptJointChannelInviteWithEntitlements({inviteId:invite.id,targetServerId:invite.toServerId,acceptedByUserId:input.acceptedByUserId},false,{externalFreezesReconciled:true,connectedAuditMode:"joint_invite"}));
+    }
+    if(before.rows.length===0) await recordOrdinaryJointAdmissions(tx,sql`SELECT m.joint_channel_id,m.user_id,s.server_id,m.generation,
+        now() AS admitted_at,${input.acceptedByUserId}::uuid AS admitted_by
+      FROM joint_channel_members m CROSS JOIN (VALUES ${sql.join(serverIds.map(id=>sql`(${id}::uuid)`),sql`, `)}) s(server_id)
+      WHERE m.joint_channel_id=${jointId}::uuid AND m.user_id=${input.acceptedByUserId}::uuid`);
+    return accepted;
   });
 }
 
@@ -1206,6 +1825,12 @@ interface ChannelListOptions {
   archived?: ArchivedFilter;
   traceQuery?: DbQueryTracer;
   humanActivityMuteEnabled?: boolean;
+  /**
+   * Only these channels (GET /api/sync/changes rebuilding changed rows): the
+   * same rows the full list holds for them, filtered before any per-row work,
+   * and never the `#all` lazy insert (an id list is not "this server's list").
+   */
+  channelIds?: readonly string[];
 }
 
 export type ReadStateSnapshot = {
@@ -1245,10 +1870,8 @@ export async function getReadStateSnapshot(userId: string, channelId: string): P
  * Executor discipline: pass the CALLER's executor when inside a transaction —
  * the authority read must see the transaction's snapshot, and on
  * single-connection drivers (pglite) a global-getDb() read issued while the
- * caller's transaction holds the connection deadlocks the flow. Today the
- * ONLY transaction-scoped caller is activitySyncService (via getInboxItems);
- * any NEW tx-scoped caller MUST thread its executor — otherwise this
- * silently hangs (no RED).
+ * caller's transaction holds the connection deadlocks the flow. Transaction-
+ * scoped callers must thread their executor through this read.
  */
 /**
  * Read-state authority rows for a set of channels.
@@ -1284,6 +1907,7 @@ async function fetchReadStateAuthorityRows(
         (rc.user_id IS NOT NULL) AS "readCursorPresent",
         rc.read_state_version::int AS "readStateVersion",
         rc.last_read_seq::text AS "maxReadSeq",
+        COALESCE(rc.marked_unread, false) AS "markedUnread",
         lm.id::text AS "latestActivityMessageId",
         lm.seq::text AS "latestActivitySeq",
         COALESCE(lm.seq, parent_message.seq)::text AS "doneFrontierSeq"
@@ -1316,6 +1940,57 @@ async function fetchReadStateAuthorityRows(
   return result.rows as unknown as UnreadSummaryReadStateRow[];
 }
 
+/** One conversation the person marked unread (user_channel_read_cursors.marked_unread), with its cursor. */
+export type MarkedUnreadScope = { channelId: string; readStateVersion: number; maxReadSeq: string };
+
+/**
+ * The conversations of one server this person has marked unread (Mark as
+ * Unread with nothing countable past the cursor) and still sees: a channel or
+ * DM they are a member of, a thread or task conversation they follow and have
+ * not marked done. The one Postgres read behind "unread, no count" on the
+ * sidebar summary and in Activity (rows and the Unread filter): RisingWave
+ * does not carry the flag. Served by idx_user_channel_read_cursors_marked_unread
+ * (user_id) WHERE marked_unread, so it reads only the person's marked rows.
+ */
+async function loadMarkedUnreadScopes(
+  serverId: string,
+  userId: string,
+  traceQuery: DbQueryTracer,
+  executor: DatabaseExecutor = getDb(),
+): Promise<Map<string, MarkedUnreadScope>> {
+  const result = await traceQuery(
+    "channels.marked_unread_scopes",
+    () => executor.execute(sql`
+      SELECT rc.channel_id::text AS "channelId",
+             rc.read_state_version::int AS "readStateVersion",
+             rc.last_read_seq::text AS "maxReadSeq"
+      FROM user_channel_read_cursors rc
+      JOIN channels c ON c.id = rc.channel_id
+      WHERE rc.user_id = ${userId}::uuid
+        AND rc.marked_unread
+        AND c.server_id = ${serverId}::uuid
+        AND c.deleted_at IS NULL
+        AND c.archived_at IS NULL
+        AND CASE WHEN c.type IN ('thread', 'task')
+          THEN EXISTS (
+            SELECT 1 FROM thread_follows tf
+            WHERE tf.thread_channel_id = c.id
+              AND tf.follower_type = 'user'
+              AND tf.follower_id = ${userId}::uuid
+              AND tf.unfollowed_at IS NULL
+              AND tf.done_at IS NULL
+          )
+          ELSE EXISTS (
+            SELECT 1 FROM channel_humans ch
+            WHERE ch.channel_id = c.id AND ch.user_id = ${userId}::uuid
+          )
+        END
+    `),
+    (r) => ({ marked_unread_scope_count: r.rows.length }),
+  );
+  return new Map((result.rows as MarkedUnreadScope[]).map((row) => [row.channelId, row]));
+}
+
 function readFrontierFromAuthorityRow(row: UnreadSummaryReadStateRow): InboxScopeReadFrontier {
   const cursor = row.readCursorPresent
     ? {
@@ -1323,6 +1998,7 @@ function readFrontierFromAuthorityRow(row: UnreadSummaryReadStateRow): InboxScop
       maxReadSeq: row.maxReadSeq as string,
       latestActivityMessageId: row.latestActivityMessageId,
       latestActivitySeq: row.latestActivitySeq,
+      markedUnread: row.markedUnread === true,
     }
     : null;
   return makeInboxScopeReadFrontier(cursor, (c) => {
@@ -1368,15 +2044,35 @@ async function attachReadState<T extends { id: string }>(
   }));
 }
 
+/**
+ * The activity mute a person (or agent) sees for one stored mute row. The list
+ * (attachActivityMuteState) and every single-conversation read
+ * (getInboxTargetActivityMuteState) go through this one rule so they agree.
+ * An owner's DM with their assistant stays out of Activity by a row nobody
+ * chose (push_muted false, keepAssistantDmOutOfActivity): it reads as not
+ * muted, so it never looks like the owner muted it (and an agent DM offers no
+ * mute switch).
+ */
+function readActivityMuteState(
+  state: { activityMuted: boolean; muteFromSeq: number | null; pushMuted: boolean; prefsVersion: number } | undefined,
+): { activityMuted: boolean; muteFromSeq: number | null; prefsVersion: number } {
+  if (!state) return { activityMuted: false, muteFromSeq: null, prefsVersion: 0 };
+  const assistantDm = state.pushMuted === false && state.activityMuted;
+  const activityMuted = !assistantDm && state.activityMuted && state.muteFromSeq != null;
+  return { activityMuted, muteFromSeq: activityMuted ? state.muteFromSeq : null, prefsVersion: state.prefsVersion };
+}
+
 // `type` is required, not optional: this row set decides whether the API
 // announces a mute capability, and an absent type must fail the compile rather
 // than silently default to "supported" (that default is what let DMs claim a
-// control no surface renders — task #473).
+// control no surface renders — task #473). A DM is supported only when its id
+// is in `appBotDmIds` (the person's DMs with an App bot); agents pass none.
 async function attachActivityMuteState<T extends { id: string; type: string }>(
   rows: T[],
   receiverType: "user" | "agent",
   receiverId: string,
   enabled = true,
+  appBotDmIds: ReadonlySet<string> = new Set(),
 ): Promise<Array<T & { activityMuted?: boolean; muteFromSeq?: number | null; prefsVersion?: number; activityMuteSupported?: boolean }>> {
   if (rows.length === 0) return [];
   if (!enabled) {
@@ -1387,6 +2083,7 @@ async function attachActivityMuteState<T extends { id: string; type: string }>(
       sourceChannelId: inboxTargetMuteStates.sourceChannelId,
       activityMuted: inboxTargetMuteStates.activityMuted,
       muteFromSeq: inboxTargetMuteStates.muteFromSeq,
+      pushMuted: inboxTargetMuteStates.pushMuted,
       prefsVersion: inboxTargetMuteStates.prefsVersion,
     })
     .from(inboxTargetMuteStates)
@@ -1397,22 +2094,36 @@ async function attachActivityMuteState<T extends { id: string; type: string }>(
     ));
   const stateByChannel = new Map(states.map((state) => [state.sourceChannelId, state]));
   return rows.map((row) => {
-    const state = stateByChannel.get(row.id);
-    const activityMuted = !!state?.activityMuted && state.muteFromSeq != null;
-    const muteFromSeq = activityMuted ? state!.muteFromSeq : null;
+    const { activityMuted, muteFromSeq, prefsVersion } = readActivityMuteState(stateByChannel.get(row.id));
     return {
       ...row,
       activityMuted,
       muteFromSeq,
-      prefsVersion: state?.prefsVersion ?? 0,
-      activityMuteSupported: channelTypeSupportsActivityMute(row.type),
+      prefsVersion,
+      activityMuteSupported: activityMuteSupportedFor({ type: row.type, dmPeerIsAppBot: appBotDmIds.has(row.id) }),
     };
   });
 }
 
+/** attachActivityMuteState's `activityMuteSupported` for one conversation a person reads. */
+export async function userActivityMuteSupported(channel: { id: string; type: string }): Promise<boolean> {
+  if (channel.type !== "dm") return activityMuteSupportedFor({ type: channel.type });
+  const [appBot] = await getDb()
+    .select({ id: agents.id })
+    .from(channelAgents)
+    .innerJoin(agents, eq(channelAgents.agentId, agents.id))
+    .where(and(
+      eq(channelAgents.channelId, channel.id),
+      isNotNull(agents.managedByAppInstallId),
+      isNull(agents.deletedAt),
+    ))
+    .limit(1);
+  return activityMuteSupportedFor({ type: "dm", dmPeerIsAppBot: appBot !== undefined });
+}
+
 // Per-user message display prefs hydration (task #187 collapse-long-messages).
-// A missing row means the default: long messages collapse (collapseLongMessages
-// = true) at prefsVersion 0.
+// A missing row means the default: long messages render in full
+// (collapseLongMessages = false) at prefsVersion 0.
 async function attachUserChannelDisplayPrefs<T extends { id: string }>(
   rows: T[],
   userId: string,
@@ -1434,7 +2145,7 @@ async function attachUserChannelDisplayPrefs<T extends { id: string }>(
     const state = stateByChannel.get(row.id);
     return {
       ...row,
-      collapseLongMessages: state?.collapseLongMessages ?? true,
+      collapseLongMessages: state?.collapseLongMessages ?? false,
       displayPrefsVersion: state?.prefsVersion ?? 0,
     };
   });
@@ -1566,6 +2277,8 @@ async function attachLastMessageSummary<T extends { id: string }>(
   traceQuery: DbQueryTracer,
   queryName: string,
   countAttrName: string,
+  /** The reading server's plan history cutoff: a last message behind it shows 40 characters (services/historyWindow.ts). */
+  historyCutoff?: Date,
 ): Promise<Array<T & DMChannelLastMessageSummary>> {
   if (rows.length === 0) return [];
 
@@ -1581,6 +2294,9 @@ async function attachLastMessageSummary<T extends { id: string }>(
         latest.created_at AS "lastMessageAt",
         CASE
           WHEN length(latest.normalized_content) = 0 THEN NULL
+          ${historyCutoff ? sql`WHEN latest.created_at <= ${historyCutoff} AND length(latest.normalized_content) > ${HISTORY_PREVIEW_CHARS}
+            THEN left(latest.normalized_content, ${HISTORY_PREVIEW_CHARS - 1}) || '…'
+          WHEN latest.created_at <= ${historyCutoff} THEN latest.normalized_content` : sql``}
           WHEN length(latest.normalized_content) > 140 THEN left(latest.normalized_content, 139) || '…'
           ELSE latest.normalized_content
         END AS "lastMessagePreview",
@@ -1651,7 +2367,22 @@ async function attachLastMessageSummary<T extends { id: string }>(
   }));
 }
 
+/**
+ * Joint channel metadata, and on every row `externalFreezeAt`: the free plan's
+ * external channel freeze of the row's server (the viewing side), when this
+ * is one of its external channels (externalChannelFreezeState).
+ */
 export async function attachJointChannelMetadata<T extends { id: string; type: string; serverId: string }>(
+  rows: T[],
+): Promise<Array<T & JointChannelMetadata>> {
+  const [withJoint, freezeAtByChannelId] = await Promise.all([
+    attachJointOnlyMetadata(rows),
+    getExternalFreezeAtForChannels(getDb(), rows),
+  ]);
+  return withJoint.map((row) => ({ ...row, externalFreezeAt: freezeAtByChannelId.get(row.id) ?? null }));
+}
+
+async function attachJointOnlyMetadata<T extends { id: string; type: string; serverId: string }>(
   rows: T[],
 ): Promise<Array<T & JointChannelMetadata>> {
   const jointRows = rows.filter((row) => row.type === "joint");
@@ -1711,9 +2442,11 @@ export async function attachJointChannelMetadata<T extends { id: string; type: s
       serverName: servers.name,
       serverSlug: servers.slug,
       role: jointChannelServers.role,
+      channelName: channels.name,
     })
     .from(jointChannelServers)
     .innerJoin(servers, eq(servers.id, jointChannelServers.serverId))
+    .innerJoin(channels, eq(channels.id, jointChannelServers.localChannelId))
     .where(and(
       inArray(jointChannelServers.jointChannelId, jointIds),
       eq(jointChannelServers.status, "active"),
@@ -1812,6 +2545,7 @@ export async function attachJointChannelMetadata<T extends { id: string; type: s
         status: "active" as const,
         isCurrentServer: server.serverId === row.serverId,
         plan: planOf(server.serverId),
+        channelName: server.channelName,
       })),
       ...pendingServerRows.values(),
     ];
@@ -1838,6 +2572,8 @@ interface FollowedThreadsOptions {
   state?: "active" | "done" | "unfollowed" | "unfollowed_active";
   maxRows?: number;
   channelId?: string;
+  /** Only threads whose parent channel is one of these ids ([] = none). Activity "Pinned" scope. */
+  parentChannelIds?: readonly string[];
   q?: string;
   sort?: "asc" | "desc";
   /** Active follows only: just the threads with unread replies (all channels). */
@@ -1853,12 +2589,25 @@ interface FollowedThreadsOptions {
    * (scripts/followed-threads-path-diff.ts) and tests; no route sets it.
    */
   forceLegacyPath?: boolean;
+  /**
+   * Task v2: also list the task conversations (`channels.type = 'task'`) the
+   * user follows, as `kind: "task"` rows. The web followed-threads route and
+   * Activity's Done / Unfollowed lists set it whatever the reader's flag
+   * (task v2 per-task mode: a v2 task keeps its conversation after a
+   * rollback / on the flag-off side of a joint channel).
+   */
+  includeTaskConversations?: boolean;
 }
 
 interface ThreadSummaryOptions {
   traceQuery?: DbQueryTracer;
   userId?: string;
   parentMessageIds?: string[];
+  /**
+   * The reading server's plan history cutoff (services/historyWindow.ts): the
+   * newest replies a summary previews stay inside it. Counts are unchanged.
+   */
+  historyCutoff?: Date;
   /**
    * Default true. False skips the participants read entirely and returns an
    * empty `participantIds` for every thread. That read aggregates every sender
@@ -1867,6 +2616,15 @@ interface ThreadSummaryOptions {
    * anonymous public page) must not pay for it or read those ids at all.
    */
   includeParticipants?: boolean;
+  /**
+   * Resolve reply agents only among this server's agents, as the caller's
+   * parent rows do (the anonymous public page joins agents on its own server
+   * id). A reply whose agent belongs to another server gets the parent row's
+   * fallback: "Unknown agent", no avatar. Unset (member reads): agents resolve
+   * by id, as member message rows do (enrichWithSenderNames), which is what
+   * keeps a joint channel's participant-server agents named.
+   */
+  agentServerId?: string;
   parentMessageScopeSource?: "client" | "compat_recent" | "messages_page" | "messages_context";
 }
 
@@ -1882,15 +2640,20 @@ export async function attachExternalBridgeMetadata<T extends { id: string }>(
   const rows = await traceQuery(
     "channels.external_bridges_by_channels",
     () => getDb().select({
+      bindingId: externalChannelBindings.id,
+      bindingEpoch: externalChannelBindings.bindingEpoch,
       channelId: externalChannelBindings.channelId,
       provider: externalAppRegistrations.provider,
       providerConversationId: externalChannelBindings.providerConversationId,
       state: externalChannelBindings.state,
+      stateReason: externalChannelBindings.stateReason,
+      installState: externalAppInstalls.state,
     }).from(externalChannelBindings)
       .innerJoin(
         externalAppRegistrations,
         eq(externalAppRegistrations.id, externalChannelBindings.registrationId),
       )
+      .innerJoin(externalAppInstalls, eq(externalAppInstalls.id, externalChannelBindings.installId))
       .where(and(
         inArray(externalChannelBindings.channelId, list.map((channel) => channel.id)),
         inArray(externalChannelBindings.state, ["active", "paused", "quarantined"]),
@@ -1901,11 +2664,32 @@ export async function attachExternalBridgeMetadata<T extends { id: string }>(
       bridged_channels_count: result.length,
     }),
   );
-  const bridgeByChannelId = new Map(rows.map((row) => [row.channelId, {
-    provider: row.provider,
-    providerConversationId: row.providerConversationId,
-    state: row.state,
-  }]));
+  const active = rows.filter((row) => row.state === "active" && row.installState === "active");
+  const heads: Awaited<ReturnType<typeof listSlackPairHeadsForHealth>> = [];
+  for (let offset = 0; offset < active.length; offset += SLACK_PAIR_HEAD_BATCH_SIZE) {
+    const batch = active.slice(offset, offset + SLACK_PAIR_HEAD_BATCH_SIZE);
+    heads.push(...await traceQuery(
+      "channels.external_bridge_pair_heads",
+      () => listSlackPairHeadsForHealth(getDb(), batch.map((row) => ({ bindingId: row.bindingId, bindingEpoch: row.bindingEpoch }))),
+      (result) => ({ bridged_channels_count: batch.length, held_pairs_count: result.length }),
+    ));
+  }
+  const now = currentDate();
+  const outboundByBindingId = new Map(heads.flatMap((head) => {
+    const hold = slackPairOutboundHold(head, now);
+    return hold ? [[head.currentBindingId, hold] as const] : [];
+  }));
+  const bridgeByChannelId = new Map(rows.map((row) => {
+    const outbound = outboundByBindingId.get(row.bindingId);
+    return [row.channelId, {
+      provider: row.provider,
+      providerConversationId: row.providerConversationId,
+      state: row.state,
+      ...(row.state !== "active" && row.stateReason ? { stateReason: row.stateReason } : {}),
+      ...(outbound ? { outbound } : {}),
+      ...(row.installState !== "active" ? { installState: row.installState } : {}),
+    }];
+  }));
   return list.map((channel) => {
     const bridge = bridgeByChannelId.get(channel.id);
     return bridge ? { ...channel, bridge } : channel;
@@ -1921,27 +2705,42 @@ const LIST_ATTACH_CONCURRENCY = 3;
  * rows, so they run side by side (at most LIST_ATTACH_CONCURRENCY at once) and
  * are merged per row in the order the nested calls used to apply them.
  */
-async function attachUserChannelListState<T extends { id: string; type: string; serverId: string }>(
+async function attachUserChannelListState<T extends { id: string; type: string; serverId: string; archivedAt: Date | null }>(
   rows: T[],
   userId: string,
   humanActivityMuteEnabled: boolean,
   traceQuery: DbQueryTracer,
+  opts: { skipArchivedActivity?: boolean } = {},
 ) {
+  // Whole-list reads (no channelIds) skip the per-channel latest-message reads
+  // for archived channels: no client uses lastMessageAt or readState on an
+  // archived row of the list (#proj-data:#12), and a big server is mostly
+  // archived channels (prod: 617 of 683), each a cold index read. An archived
+  // row then carries no readState (the web leaves its read-state ledger as it
+  // is), lastMessageAt null and the legacy 0s. A lookup by id keeps them.
+  const activityRows = opts.skipArchivedActivity ? rows.filter((row) => row.archivedAt === null) : rows;
   const limit = createConcurrencyLimiter(LIST_ATTACH_CONCURRENCY);
   const [withMute, withDisplayPrefs, withReadState, withLastMessage, withJoint] = await Promise.all([
     limit(() => attachActivityMuteState(rows, "user", userId, humanActivityMuteEnabled)),
     limit(() => attachUserChannelDisplayPrefs(rows, userId)),
-    limit(() => attachReadState(rows, userId)),
-    limit(() => attachLastMessageAt(rows, traceQuery, "channels.last_messages_by_channels", "channels_count")),
+    limit(() => attachReadState(activityRows, userId)),
+    limit(() => attachLastMessageAt(activityRows, traceQuery, "channels.last_messages_by_channels", "channels_count")),
     limit(() => attachJointChannelMetadata(rows)),
   ]);
-  return rows.map((_row, index) => ({
-    ...withMute[index]!,
-    ...withDisplayPrefs[index]!,
-    ...withReadState[index]!,
-    ...withLastMessage[index]!,
-    ...withJoint[index]!,
-  }));
+  const readStateById = new Map(withReadState.map((row) => [row.id, row]));
+  const lastMessageById = new Map(withLastMessage.map((row) => [row.id, row]));
+  return rows.map((row, index) => {
+    const readState = readStateById.get(row.id);
+    return {
+      ...withMute[index]!,
+      ...withDisplayPrefs[index]!,
+      ...(readState
+        ? { maxReadSeq: readState.maxReadSeq, readStateVersion: readState.readStateVersion, readState: readState.readState }
+        : { maxReadSeq: 0, readStateVersion: 0, readState: undefined as InboxScopeReadFrontier | undefined }),
+      lastMessageAt: lastMessageById.get(row.id)?.lastMessageAt ?? null,
+      ...withJoint[index]!,
+    };
+  });
 }
 
 export async function listChannels(
@@ -1959,6 +2758,17 @@ export async function listChannels(
   ];
   if (archivedFilter === "exclude") conditions.push(isNull(channels.archivedAt));
   else if (archivedFilter === "only") conditions.push(isNotNull(channels.archivedAt));
+  const channelIds = opts?.channelIds;
+  if (channelIds) {
+    if (channelIds.length === 0) return [];
+    conditions.push(inArray(channels.id, [...new Set(channelIds)]));
+  } else {
+    // Agent lounges are not in the channel directory (browse, sidebar,
+    // forward-to; the other full-list callers are Guest-only and Guests
+    // never read a lounge): the web lists them from the DM list. A
+    // lookup by id (GET /api/channels/:id, sync) still returns them.
+    conditions.push(notAgentLoungeChannel(channels.id));
+  }
   const list = await traceQuery(
     "channels.list_by_server",
     () => db.select().from(channels)
@@ -1988,28 +2798,33 @@ export async function listChannels(
           }),
         ),
       ]);
-      const guestGateEnabled = serverRole === "guest" && await isGuestFeatureEnabled(serverId, userId);
+      const guestChannelId = serverRole === "guest" ? await getGuestChannelId(serverId, userId) : null;
       const joinedSet = new Set(memberships.map((m) => m.channelId));
+      const jointIds = list.filter(channel => channel.type === "joint").map(channel => channel.id);
+      const jointAccess = await filterUserAccessibleChannelIds(jointIds, userId, asServerId(serverId));
+      for (const id of jointIds) { if (jointAccess.has(id)) joinedSet.add(id); else joinedSet.delete(id); }
+      const recoverableJoints = await hostRecoverableArchivedJointIds(serverId, serverRole, list.filter((ch) => !joinedSet.has(ch.id)));
       const visibleChannels = list
         .filter((ch) => serverRole === "guest"
           ? canGuestReadChannel({
-              gateEnabled: guestGateEnabled,
               serverRole,
+              channelId: ch.id,
+              guestChannelId,
               channelType: ch.type,
-              channelName: ch.name,
-              allChannelHidden: isAllSystemChannel(ch) && !isEnabledAllChannel(ch),
-              guestVisible: ch.guestVisible,
-              guestJoinable: ch.guestJoinable,
               isChannelMember: joinedSet.has(ch.id),
+              // Joint rows: joinedSet holds filterUserAccessibleChannelIds (the guest joint rule).
+              jointEntry: ch.type === "joint" && joinedSet.has(ch.id),
               archived: ch.archivedAt !== null,
               deleted: ch.deletedAt !== null,
             })
-          : !requiresExplicitMembership(ch.type) || joinedSet.has(ch.id))
+          : !requiresExplicitMembership(ch.type) || joinedSet.has(ch.id) || recoverableJoints.has(ch.id))
         .map((ch) => ({
           ...ch,
           joined: serverRole === "guest" && isAllSystemChannel(ch) ? false : joinedSet.has(ch.id),
         }));
-      return attachUserChannelListState(visibleChannels, userId, opts?.humanActivityMuteEnabled ?? true, traceQuery);
+      return attachUserChannelListState(visibleChannels, userId, opts?.humanActivityMuteEnabled ?? true, traceQuery, {
+        skipArchivedActivity: !channelIds,
+      });
     }
     const visibleChannels = list.filter((ch) => ch.type === "channel");
     return attachJointChannelMetadata(
@@ -2018,7 +2833,7 @@ export async function listChannels(
   }
 
   let allChannel = list.find(isAllSystemChannel);
-  if (!allChannel) {
+  if (!allChannel && !channelIds) {
     const result = await db.insert(channels).values({
       serverId,
       name: "all",
@@ -2062,31 +2877,36 @@ export async function listChannels(
         }),
       ),
     ]);
-    const guestGateEnabled = serverRole === "guest" && await isGuestFeatureEnabled(serverId, userId);
+    const guestChannelId = serverRole === "guest" ? await getGuestChannelId(serverId, userId) : null;
     const joinedSet = new Set(memberships.map((m) => m.channelId));
+    const jointIds = visibleList.filter(channel => channel.type === "joint").map(channel => channel.id);
+    const jointAccess = await filterUserAccessibleChannelIds(jointIds, userId, asServerId(serverId));
+    for (const id of jointIds) { if (jointAccess.has(id)) joinedSet.add(id); else joinedSet.delete(id); }
+    const recoverableJoints = await hostRecoverableArchivedJointIds(serverId, serverRole, visibleList.filter((ch) => !joinedSet.has(ch.id)));
 
     const visibleChannels = visibleList
       .filter((ch) => serverRole === "guest"
         ? canGuestReadChannel({
-            gateEnabled: guestGateEnabled,
             serverRole,
+            channelId: ch.id,
+            guestChannelId,
             channelType: ch.type,
-            channelName: ch.name,
-            allChannelHidden: isAllSystemChannel(ch) && !isEnabledAllChannel(ch),
-            guestVisible: ch.guestVisible,
-            guestJoinable: ch.guestJoinable,
             isChannelMember: joinedSet.has(ch.id),
+            // Joint rows: joinedSet holds filterUserAccessibleChannelIds (the guest joint rule).
+            jointEntry: ch.type === "joint" && joinedSet.has(ch.id),
             archived: ch.archivedAt !== null,
             deleted: ch.deletedAt !== null,
           })
-        : !requiresExplicitMembership(ch.type) || joinedSet.has(ch.id))
+        : !requiresExplicitMembership(ch.type) || joinedSet.has(ch.id) || recoverableJoints.has(ch.id))
       .map((ch) => ({
         ...ch,
         joined: serverRole === "guest"
           ? !isAllSystemChannel(ch) && joinedSet.has(ch.id)
           : isEnabledAllChannel(ch) || joinedSet.has(ch.id),
       }));
-    return attachUserChannelListState(visibleChannels, userId, opts?.humanActivityMuteEnabled ?? true, traceQuery);
+    return attachUserChannelListState(visibleChannels, userId, opts?.humanActivityMuteEnabled ?? true, traceQuery, {
+      skipArchivedActivity: !channelIds,
+    });
   }
 
   const visibleChannels = visibleList.filter((ch) => ch.type === "channel");
@@ -2119,7 +2939,6 @@ export async function filterChannelIdsVisibleToHuman(
       name: channels.name,
       type: channels.type,
       guestVisible: channels.guestVisible,
-      guestJoinable: channels.guestJoinable,
       archivedAt: channels.archivedAt,
       deletedAt: channels.deletedAt,
     }).from(channels).where(and(
@@ -2132,20 +2951,22 @@ export async function filterChannelIdsVisibleToHuman(
       .from(channelHumans)
       .where(and(eq(channelHumans.userId, userId), inArray(channelHumans.channelId, ids))),
   ]);
-  const guestGateEnabled = serverRole === "guest" && await isGuestFeatureEnabled(serverId, userId, executor);
+  const guestChannelId = serverRole === "guest" ? await getGuestChannelId(serverId, userId, executor) : null;
   const joinedSet = new Set(memberships.map((membership) => membership.channelId));
+  const jointIds = rows.filter(channel => channel.type === "joint").map(channel => channel.id);
+  const jointAccess = await filterUserAccessibleChannelIds(jointIds, userId, asServerId(serverId), { executor });
+  for (const id of jointIds) { if (jointAccess.has(id)) joinedSet.add(id); else joinedSet.delete(id); }
   for (const ch of rows) {
     const allChannelHidden = isAllSystemChannel(ch) && !isEnabledAllChannel(ch);
     const readable = serverRole === "guest"
       ? canGuestReadChannel({
-          gateEnabled: guestGateEnabled,
           serverRole,
+          channelId: ch.id,
+          guestChannelId,
           channelType: ch.type,
-          channelName: ch.name,
-          allChannelHidden,
-          guestVisible: ch.guestVisible,
-          guestJoinable: ch.guestJoinable,
           isChannelMember: joinedSet.has(ch.id),
+          // Joint rows: joinedSet holds filterUserAccessibleChannelIds (the guest joint rule).
+          jointEntry: ch.type === "joint" && joinedSet.has(ch.id),
           archived: ch.archivedAt !== null,
           deleted: ch.deletedAt !== null,
         })
@@ -2169,6 +2990,92 @@ export async function getSystemAllChannel(serverId: string) {
   return channel ?? null;
 }
 
+/** updateChannel's refusal to change a joint channel's visibility (routes match it to answer 403). */
+export const JOINT_VISIBILITY_FIXED_MESSAGE = "External channels stay private, so you can't change this channel's visibility";
+
+/** addHuman's refusal to put a Guest in #all (routes match it to answer 403). */
+export const GUEST_ALL_CHANNEL_MESSAGE = "Guests can't be added to #all";
+
+/**
+ * A channel with an external relation stays private (cindyz, #wg-rbac:0829b5df):
+ * it is made public only once the relation is gone.
+ */
+export class ExternalMembersKeepPrivateError extends Error {
+  readonly code = "external_members_keep_private";
+  constructor() {
+    super("This channel has external members or pending external invites, so it stays private.");
+    this.name = "ExternalMembersKeepPrivateError";
+  }
+}
+
+/**
+ * Of `channelIds`, those with an external relation (#wg-rbac:#16): a Guest
+ * bound to the channel, or an open external invite to it (pending,
+ * awaiting approval or connecting, not expired). One statement for the whole
+ * list (both sides are indexed by channel). Not gated by external_channels_v1:
+ * a channel that is already external stays so with the flag off.
+ */
+export async function channelIdsWithExternalRelation(
+  channelIds: readonly string[],
+  db: DatabaseExecutor = getDb(),
+): Promise<Set<string>> {
+  const ids = [...new Set(channelIds)];
+  if (ids.length === 0) return new Set();
+  const rows = await unionAll(
+    db.select({ channelId: sql<string>`${serverMembers.guestChannelId}`.as("channel_id") }).from(serverMembers)
+      .where(and(eq(serverMembers.role, "guest"), inArray(serverMembers.guestChannelId, ids))),
+    db.select({ channelId: sql<string>`${channelExternalInvites.channelId}`.as("channel_id") }).from(channelExternalInvites)
+      .where(and(
+        inArray(channelExternalInvites.channelId, ids),
+        // Every open status (OPEN_EXTERNAL_INVITE_STATUSES), self_connecting included.
+        inArray(channelExternalInvites.status, ["pending", "awaiting_approval", "connecting", "self_connecting"]),
+        gt(channelExternalInvites.expiresAt, sql`now()`),
+      )),
+  );
+  return new Set(rows.map((row) => row.channelId));
+}
+
+async function hasExternalRelation(db: DatabaseExecutor, channelId: string): Promise<boolean> {
+  return (await channelIdsWithExternalRelation([channelId], db)).has(channelId);
+}
+
+/**
+ * Who reads `hasExternalRelation`: their role in the rows' Server and, for a
+ * Guest, the channel they are bound to (server_members.guest_channel_id).
+ */
+export type ExternalRelationViewer =
+  | { role: "guest"; guestChannelId: string | null }
+  | { role: Exclude<ServerRole, "guest"> | null };
+
+/**
+ * `hasExternalRelation` on channel payloads, for `viewer` in the rows'
+ * Server. A non-guest member of the Server the relation belongs to gets it
+ * on every eligible row; a joint channel's participant projection never does
+ * (its relations, if any, are the host's). A Guest gets it only on its own
+ * bound channel, always true (its binding is that channel's external
+ * relation, so it tells them nothing new), and on no other row. The field is
+ * omitted, not false, where it isn't given, and on DMs, threads and tasks.
+ * Rows must carry `jointRole` (attachJointChannelMetadata) for joint
+ * channels; one without it is skipped.
+ */
+export async function attachExternalRelations<T extends { id: string; type: string; jointRole?: "host" | "participant" | null }>(
+  rows: readonly T[],
+  viewer: ExternalRelationViewer,
+  db: DatabaseExecutor = getDb(),
+): Promise<Array<T & { hasExternalRelation?: boolean }>> {
+  if (viewer.role === "guest") {
+    const { guestChannelId } = viewer;
+    return rows.map((row) => (row.id === guestChannelId && (row.type === "channel" || row.type === "private" || row.type === "joint")
+      ? { ...row, hasExternalRelation: true }
+      : row));
+  }
+  if (viewer.role === null) return [...rows];
+  const eligible = rows.filter((row) => row.type === "channel" || row.type === "private" || (row.type === "joint" && row.jointRole === "host"));
+  const external = await channelIdsWithExternalRelation(eligible.map((row) => row.id), db);
+  const eligibleIds = new Set(eligible.map((row) => row.id));
+  return rows.map((row) => (eligibleIds.has(row.id) ? { ...row, hasExternalRelation: external.has(row.id) } : row));
+}
+
 export async function updateChannel(
   channelId: string,
   updates: {
@@ -2176,7 +3083,13 @@ export async function updateChannel(
     description?: string;
     type?: RegularChannelType;
     guestVisible?: boolean;
-    guestJoinable?: boolean;
+    threadSort?: ChannelThreadSort;
+    /**
+     * Channel announcements: the object id to store (null removes it), on
+     * every projection of a joint. Checked by the caller
+     * (channelAnnouncements.ts channelAnnouncementChange).
+     */
+    announcementArtifactId?: string | null;
   },
   executor?: DatabaseExecutor,
 ): Promise<typeof channels.$inferSelect> {
@@ -2195,17 +3108,24 @@ export async function updateChannel(
     throw new Error("Cannot edit DM channels");
   }
   if (channel.type === "joint" && updates.type !== undefined) {
-    throw new Error("Cannot change visibility for joint channels");
+    throw new Error(JOINT_VISIBILITY_FIXED_MESSAGE);
   }
-  if ((updates.guestVisible !== undefined || updates.guestJoinable !== undefined)
+  // An agent's lounge keeps its name and stays public (#proj-chat:#15); its
+  // description is the only thing an admin may edit.
+  if ((updates.name !== undefined && updates.name !== channel.name)
+    || (updates.type !== undefined && updates.type !== channel.type)
+    || updates.guestVisible === true) {
+    if (await isAgentLoungeChannel(channelId, db)) throw new AgentLoungeImmutableError();
+  }
+  if (updates.guestVisible !== undefined
     && channel.type !== "channel" && channel.type !== "private") {
     throw new Error("Guest access is supported only for ordinary channels");
   }
+  if (updates.threadSort !== undefined && !channelTypeSupportsThreadSort(channel.type)) {
+    throw new Error("Thread sort is supported only for ordinary channels");
+  }
   if (isAllSystemChannel(channel) && updates.name && updates.name !== "all") {
     throw new Error("Cannot rename the #all channel");
-  }
-  if (isAllSystemChannel(channel) && updates.guestJoinable === true) {
-    throw new Error("The #all channel does not support Guest joining");
   }
   if (!isAllSystemChannel(channel) && updates.name === SYSTEM_ALL_CHANNEL_KEY) {
     throw new Error('Channel name "all" is reserved');
@@ -2213,6 +3133,13 @@ export async function updateChannel(
   const allSystemVisibilityUpdate = isAllSystemChannel(channel)
     && updates.type !== undefined
     && updates.type !== channel.type;
+  // The one write that turns an ordinary channel public. Under the channel row
+  // lock (the PATCH route holds it already), as sending and accepting external
+  // invites lock it first: neither can add a relation beside this check.
+  if (updates.type === "channel" && !isAllSystemChannel(channel)) {
+    const [locked] = await db.select({ type: channels.type }).from(channels).where(eq(channels.id, channelId)).for("update");
+    if (locked?.type === "private" && await hasExternalRelation(db, channelId)) throw new ExternalMembersKeepPrivateError();
+  }
 
   const jointProjections = channel.type === "joint"
     ? await getActiveJointChannelProjectionsByLocalChannel(channelId, db)
@@ -2227,7 +3154,7 @@ export async function updateChannel(
       : [channel];
     for (const projectionChannel of projectionChannels) {
       const [existing] = await db
-        .select({ id: channels.id })
+        .select({ id: channels.id, archivedAt: channels.archivedAt, type: channels.type })
         .from(channels)
         .where(and(
           eq(channels.serverId, projectionChannel.serverId),
@@ -2237,6 +3164,11 @@ export async function updateChannel(
           isNull(channels.deletedAt)
         ));
       if (existing) {
+        // Named only on the renaming server: another joint server's archived
+        // channel is not this caller's to restore or open.
+        if (existing.archivedAt && projectionChannel.serverId === channel.serverId) {
+          throw new ArchivedNameCollisionError(updates.name, existing.id, existing.type);
+        }
         throw new Error(`Channel name "${updates.name}" is already taken`);
       }
     }
@@ -2245,6 +3177,8 @@ export async function updateChannel(
   const setValues: Record<string, unknown> = {};
   if (updates.name !== undefined) setValues.name = updates.name;
   if (updates.description !== undefined) setValues.description = updates.description || null;
+  if (updates.threadSort !== undefined && updates.threadSort !== channel.threadSort) setValues.threadSort = updates.threadSort;
+  if (updates.announcementArtifactId !== undefined) setValues.announcementArtifactId = updates.announcementArtifactId;
   if (allSystemVisibilityUpdate) {
     setValues.type = updates.type;
   } else if (updates.type !== undefined && updates.type !== channel.type) {
@@ -2254,23 +3188,8 @@ export async function updateChannel(
   const nextGuestVisible = nextType === "private" && !isAllSystemChannel(channel)
     ? false
     : updates.guestVisible ?? channel.guestVisible;
-  const nextGuestJoinable = isAllSystemChannel(channel)
-    ? false
-    : nextType === "private"
-      ? false
-      : updates.guestJoinable ?? channel.guestJoinable;
-  if (nextGuestJoinable && !nextGuestVisible) {
-    throw new Error("Guest-joinable channels must also be guest-visible");
-  }
-  if (!channel.guestJoinable && nextGuestJoinable && channel.archivedAt === null) {
-    await acquireServerLock(db, channel.serverId, GUEST_JOINABLE_CHANNEL_LOCK_NAMESPACE);
-    await assertGuestJoinableChannelCapacityAvailable(db, channel.serverId);
-  }
   if (updates.guestVisible !== undefined || (nextType === "private" && !isAllSystemChannel(channel))) {
     setValues.guestVisible = nextGuestVisible;
-  }
-  if (isAllSystemChannel(channel) || updates.guestJoinable !== undefined || nextType === "private") {
-    setValues.guestJoinable = nextGuestJoinable;
   }
 
   if (Object.keys(setValues).length === 0) {
@@ -2291,6 +3210,10 @@ export async function updateChannel(
         tx.delete(channelHumans).where(eq(channelHumans.channelId, channelId)),
         tx.delete(channelAgents).where(eq(channelAgents.channelId, channelId)),
       ]);
+    }
+    // Restoring #all gives the members their rows back (hiding deleted them above).
+    if (allSystemVisibilityUpdate && updates.type === "channel") {
+      await ensureAllChannelHumanRows(tx, channel.serverId);
     }
 
     const [updated] = await tx.select().from(channels).where(eq(channels.id, channelId));
@@ -2417,16 +3340,44 @@ async function ensureJointThreadProjectionForLocalParent(
     parentMessageId: null,
   }).returning();
 
-  await executor.insert(jointChannelServers).values({
+  const [mapping] = await executor.insert(jointChannelServers).values({
     jointChannelId: input.jointThreadId,
     serverId: input.localParentProjection.serverId,
     localChannelId: threadProjection.id,
     role: input.localParentProjection.role,
     status: "active",
     joinedByUserId: input.joinedByUserId,
-  }).onConflictDoNothing();
+  }).onConflictDoUpdate({
+    // A server that disconnected and rejoined: reuse its old row.
+    target: [jointChannelServers.jointChannelId, jointChannelServers.serverId],
+    set: {
+      localChannelId: threadProjection.id,
+      role: input.localParentProjection.role,
+      status: "active",
+      joinedByUserId: input.joinedByUserId,
+      joinedAt: currentDate(),
+      disconnectedByUserId: null,
+      disconnectedAt: null,
+    },
+    setWhere: eq(jointChannelServers.status, "disconnected"),
+  }).returning({ localChannelId: jointChannelServers.localChannelId });
+  if (mapping) return { localThreadChannelId: mapping.localChannelId, created: true };
 
-  return { localThreadChannelId: threadProjection.id, created: true };
+  // A concurrent request mapped this server's projection first (an active row,
+  // which the upsert leaves alone). Our row would be an unmapped thread nobody
+  // can see, and the caller would write into it: drop it, use the mapped one.
+  await executor.delete(channels).where(eq(channels.id, threadProjection.id));
+  const [winner] = await executor
+    .select({ localChannelId: jointChannelServers.localChannelId })
+    .from(jointChannelServers)
+    .where(and(
+      eq(jointChannelServers.jointChannelId, input.jointThreadId),
+      eq(jointChannelServers.serverId, input.localParentProjection.serverId),
+      eq(jointChannelServers.status, "active"),
+    ))
+    .limit(1);
+  if (!winner) throw new Error("Joint thread projection not found");
+  return { localThreadChannelId: winner.localChannelId, created: false };
 }
 
 async function backfillJointThreadProjectionsForLocalParent(
@@ -2480,6 +3431,7 @@ async function listActiveJointThreadProjectionRows(
   const localThread = alias(channels, "joint_thread_local_thread");
   const canonicalThread = alias(channels, "joint_thread_canonical_thread");
   const parentMessage = alias(messages, "joint_thread_parent_message");
+  const parentTask = alias(tasks, "joint_thread_parent_task");
   const parentJoint = alias(jointChannels, "joint_thread_parent_joint");
   const parentProjection = alias(jointChannelServers, "joint_thread_parent_projection");
 
@@ -2488,13 +3440,24 @@ async function listActiveJointThreadProjectionRows(
     eq(jointChannelServers.status, "active"),
     eq(parentJoint.status, "active"),
     eq(parentProjection.status, "active"),
-    eq(localThread.type, "thread"),
-    eq(canonicalThread.type, "thread"),
-    // The parent message is the durable local↔canonical Thread identity
-    // anchor. A swapped projection row must not silently redirect reads or
-    // writes to another canonical Thread that happens to share the parent
-    // channel; fail closed until the mapping is repaired.
-    sql`${parentMessage.threadId} = ${canonicalThread.id}::text`,
+    // Threads and task conversations (task v2) project the same way; a local
+    // face always has its canonical row's type.
+    inArray(canonicalThread.type, ["thread", "task"]),
+    sql`${localThread.type} = ${canonicalThread.type}`,
+    // The parent is the durable local↔canonical identity anchor: for a thread
+    // the parent message (stamped with the canonical thread id), for a task
+    // conversation the task (pointing at its canonical conversation, and the
+    // local face carrying the same task id). A swapped projection row must not
+    // silently redirect reads or writes to another canonical conversation that
+    // happens to share the parent channel; fail closed until it is repaired.
+    sql`(
+      (${canonicalThread.type} = 'thread' AND ${parentMessage.threadId} = ${canonicalThread.id}::text)
+      OR (
+        ${canonicalThread.type} = 'task'
+        AND ${parentTask.conversationChannelId} = ${canonicalThread.id}
+        AND ${localThread.taskId} = ${canonicalThread.taskId}
+      )
+    )`,
     isNull(localThread.deletedAt),
     isNull(canonicalThread.deletedAt),
   ];
@@ -2504,6 +3467,7 @@ async function listActiveJointThreadProjectionRows(
   if (input.canonicalThreadChannelIds) filters.push(inArray(jointChannels.canonicalChannelId, input.canonicalThreadChannelIds));
   if (input.serverId) filters.push(eq(jointChannelServers.serverId, input.serverId));
 
+  const canonicalParentChannelId = sql<string>`COALESCE(${parentMessage.channelId}, ${parentTask.channelId})`;
   const rows = await db
     .select({
       jointThreadId: jointChannels.id,
@@ -2511,8 +3475,10 @@ async function listActiveJointThreadProjectionRows(
       canonicalThreadChannelId: jointChannels.canonicalChannelId,
       localServerId: jointChannelServers.serverId,
       localParentChannelId: parentProjection.localChannelId,
-      canonicalParentChannelId: parentMessage.channelId,
+      canonicalParentChannelId,
+      canonicalType: canonicalThread.type,
       canonicalParentMessageId: canonicalThread.parentMessageId,
+      canonicalParentTaskId: canonicalThread.taskId,
       role: jointChannelServers.role,
       threadChannel: localThread,
     })
@@ -2520,8 +3486,15 @@ async function listActiveJointThreadProjectionRows(
     .innerJoin(jointChannels, eq(jointChannels.id, jointChannelServers.jointChannelId))
     .innerJoin(localThread, eq(localThread.id, jointChannelServers.localChannelId))
     .innerJoin(canonicalThread, eq(canonicalThread.id, jointChannels.canonicalChannelId))
-    .innerJoin(parentMessage, eq(parentMessage.id, canonicalThread.parentMessageId))
-    .innerJoin(parentJoint, eq(parentJoint.canonicalChannelId, parentMessage.channelId))
+    .leftJoin(parentMessage, and(
+      eq(parentMessage.id, canonicalThread.parentMessageId),
+      eq(canonicalThread.type, "thread"),
+    ))
+    .leftJoin(parentTask, and(
+      eq(parentTask.id, canonicalThread.taskId),
+      eq(canonicalThread.type, "task"),
+    ))
+    .innerJoin(parentJoint, eq(parentJoint.canonicalChannelId, canonicalParentChannelId))
     .innerJoin(parentProjection, and(
       eq(parentProjection.jointChannelId, parentJoint.id),
       eq(parentProjection.serverId, jointChannelServers.serverId),
@@ -2530,8 +3503,12 @@ async function listActiveJointThreadProjectionRows(
     .orderBy(asc(jointChannelServers.joinedAt));
 
   return rows
-    .filter((row): row is typeof row & { canonicalParentMessageId: string } => Boolean(row.canonicalParentMessageId))
-    .map((row) => ({ ...row, role: row.role as "host" | "participant" }));
+    .filter((row) => (row.canonicalType === "thread" ? Boolean(row.canonicalParentMessageId) : Boolean(row.canonicalParentTaskId)))
+    .map(({ canonicalType, ...row }) => ({
+      ...row,
+      kind: canonicalType === "task" ? "task" as const : "thread" as const,
+      role: row.role as "host" | "participant",
+    }));
 }
 
 export async function getJointThreadProjectionByLocalThread(
@@ -2581,29 +3558,14 @@ export async function getJointThreadProjectionForMember(
 
 export async function canUserSeeAgentThroughJointChannel(serverId: string, userId: string, agentId: string): Promise<boolean> {
   const db = getDb();
-  const localProjection = alias(jointChannelServers, "joint_profile_local_projection");
-  const peerProjection = alias(jointChannelServers, "joint_profile_peer_projection");
-  const [row] = await db
-    .select({ jointChannelId: localProjection.jointChannelId })
-    .from(localProjection)
-    .innerJoin(peerProjection, eq(peerProjection.jointChannelId, localProjection.jointChannelId))
-    .innerJoin(jointChannels, eq(jointChannels.id, localProjection.jointChannelId))
-    .innerJoin(channelHumans, and(
-      eq(channelHumans.channelId, localProjection.localChannelId),
-      eq(channelHumans.userId, userId),
-    ))
-    .innerJoin(channelAgents, and(
-      eq(channelAgents.channelId, peerProjection.localChannelId),
-      eq(channelAgents.agentId, agentId),
-    ))
-    .where(and(
-      eq(localProjection.serverId, serverId),
-      eq(localProjection.status, "active"),
-      eq(peerProjection.status, "active"),
-      eq(jointChannels.status, "active"),
-    ))
-    .limit(1);
-  return !!row;
+  const permission = await resolveJointHumanEntrySql({ serverId }, db);
+  const result = await db.execute(sql`SELECT 1 FROM joint_channel_servers local
+    JOIN joint_channel_servers peer ON peer.joint_channel_id=local.joint_channel_id AND peer.status='active'
+    JOIN channel_agents ca ON ca.channel_id=peer.local_channel_id AND ca.agent_id=${agentId}::uuid
+    JOIN agents a ON a.id=ca.agent_id AND a.server_id=peer.server_id AND a.deleted_at IS NULL
+    WHERE local.server_id=${serverId}::uuid AND ${permission(sql`local.local_channel_id`,sql`${userId}::uuid`)}
+      AND NOT (${jointMembershipRemovalPendingSql(sql`local.joint_channel_id`,"agent",sql`a.id`)}) LIMIT 1`);
+  return result.rows.length > 0;
 }
 
 /**
@@ -2661,6 +3623,10 @@ export async function listJointActivityProjectionChannelIdsForAgent(agentId: str
       eq(sourceProjection.localChannelId, channelAgents.channelId),
       eq(sourceProjection.status, "active"),
     ))
+    .innerJoin(jointChannels, and(
+      eq(jointChannels.id, sourceProjection.jointChannelId),
+      eq(jointChannels.status, "active"),
+    ))
     .innerJoin(siblingProjection, and(
       eq(siblingProjection.jointChannelId, sourceProjection.jointChannelId),
       eq(siblingProjection.status, "active"),
@@ -2671,98 +3637,35 @@ export async function listJointActivityProjectionChannelIdsForAgent(agentId: str
   return [...new Set(rows.map((row) => row.localChannelId))];
 }
 
-export async function getJointVisibleHumanServerId(serverId: string, requesterId: string, targetUserId: string): Promise<string | null> {
+/** null means invisible; a visible J identity may have no current source. */
+export async function getComputedJointVisibleHuman(serverId: string, requesterId: string, targetIds?: readonly string[]) {
   const db = getDb();
-  const localProjection = alias(jointChannelServers, "joint_human_profile_local_projection");
-  const peerProjection = alias(jointChannelServers, "joint_human_profile_peer_projection");
-  const peerHumans = alias(channelHumans, "joint_human_profile_peer_humans");
-  const [row] = await db
-    .select({ serverId: peerProjection.serverId })
-    .from(localProjection)
-    .innerJoin(peerProjection, eq(peerProjection.jointChannelId, localProjection.jointChannelId))
-    .innerJoin(jointChannels, eq(jointChannels.id, localProjection.jointChannelId))
-    .innerJoin(channelHumans, and(
-      eq(channelHumans.channelId, localProjection.localChannelId),
-      eq(channelHumans.userId, requesterId),
-    ))
-    .innerJoin(peerHumans, and(
-      eq(peerHumans.channelId, peerProjection.localChannelId),
-      eq(peerHumans.userId, targetUserId),
-    ))
-    .where(and(
-      eq(localProjection.serverId, serverId),
-      eq(localProjection.status, "active"),
-      eq(peerProjection.status, "active"),
-      eq(jointChannels.status, "active"),
-    ))
-    .limit(1);
-  return row?.serverId ?? null;
+  const projections = await db.select({ id: jointChannelServers.localChannelId }).from(jointChannelServers)
+    .innerJoin(channels, eq(channels.id, jointChannelServers.localChannelId))
+    .where(and(eq(jointChannelServers.serverId, serverId), eq(channels.type, "joint")));
+  const scopes = await resolveJointHumanMembershipScopes({ localChannelIds: projections.map(row => row.id) }, db);
+  const allowed = await filterJointHumanMemberEntries([...scopes.values()], requesterId, db);
+  const humans = new Map<string, Awaited<ReturnType<typeof getComputedJointHumanPublicRows>>[number]>();
+  const rows=await getComputedJointHumanPublicRowsForScopes([...scopes.values()].filter(scope=>allowed.has(scope.localChannelId)),targetIds,db);
+  for(const {human} of rows) if(!humans.has(human.id)) humans.set(human.id,human);
+  return humans;
+}
+
+export async function getJointVisibleHumanServerId(serverId: string, requesterId: string, targetUserId: string): Promise<string | null> {
+  const computed = await getComputedJointVisibleHuman(serverId, requesterId, [targetUserId]);
+  return computed.get(targetUserId)?.serverId || null;
 }
 
 export async function canUserSeeHumanThroughLocalChannel(serverId: string, requesterId: string, targetUserId: string): Promise<boolean> {
   if (requesterId === targetUserId) return true;
+  if ((await getComputedJointVisibleHuman(serverId, requesterId, [targetUserId])).has(targetUserId)) return true;
 
   const db = getDb();
   const requesterRole = await resolveHumanServerRole(serverId, requesterId);
   const targetHumans = alias(channelHumans, "hidden_profile_target_humans");
   if (requesterRole === "guest") {
-    if (!await isGuestFeatureEnabled(serverId, requesterId)) return false;
-    const requesterMemberships = new Set((await db
-      .select({ channelId: channelHumans.channelId })
-      .from(channelHumans)
-      .innerJoin(channels, and(
-        eq(channels.id, channelHumans.channelId),
-        eq(channels.serverId, serverId),
-        isNull(channels.deletedAt),
-      ))
-      .where(eq(channelHumans.userId, requesterId))).map((row) => row.channelId));
-    const targetChannels = await db
-      .select({
-        id: channels.id,
-        name: channels.name,
-        type: channels.type,
-        guestVisible: channels.guestVisible,
-        guestJoinable: channels.guestJoinable,
-        archivedAt: channels.archivedAt,
-        deletedAt: channels.deletedAt,
-      })
-      .from(targetHumans)
-      .innerJoin(channels, and(
-        eq(channels.id, targetHumans.channelId),
-        eq(channels.serverId, serverId),
-        isNull(channels.deletedAt),
-      ))
-      .where(eq(targetHumans.userId, targetUserId));
-    if (targetChannels.some((channel) => canGuestReadChannel({
-      gateEnabled: true,
-      serverRole: "guest",
-      channelType: channel.type,
-      channelName: channel.name,
-      allChannelHidden: isAllSystemChannel(channel) && !isEnabledAllChannel(channel),
-      guestVisible: channel.guestVisible,
-      guestJoinable: channel.guestJoinable,
-      isChannelMember: requesterMemberships.has(channel.id),
-      archived: channel.archivedAt !== null,
-      deleted: channel.deletedAt !== null,
-    }))) return true;
-
-    const allChannel = await getSystemAllChannel(serverId);
-    return Boolean(
-      allChannel
-      && await isServerHumanMember(serverId, targetUserId)
-      && canGuestReadChannel({
-        gateEnabled: true,
-        serverRole: "guest",
-        channelType: allChannel.type,
-        channelName: allChannel.name,
-        allChannelHidden: !isEnabledAllChannel(allChannel),
-        guestVisible: allChannel.guestVisible,
-        guestJoinable: allChannel.guestJoinable,
-        isChannelMember: false,
-        archived: allChannel.archivedAt !== null,
-        deleted: allChannel.deletedAt !== null,
-      })
-    );
+    // A Guest sees the people of its one readable channel, nobody else.
+    return (await guestReadableChannelHumanIds(serverId, requesterId, [targetUserId])).has(targetUserId);
   }
   const rows = await db
     .select({ name: channels.name, type: channels.type })
@@ -2781,7 +3684,92 @@ export async function canUserSeeHumanThroughLocalChannel(serverId: string, reque
   return rows.some((channel) => !isAllSystemChannel(channel));
 }
 
-export async function getHumanIdsVisibleThroughLocalChannels(serverId: string, requesterId: string): Promise<Set<string>> {
+/**
+ * canUserSeeHumanThroughLocalChannel for many people at once: the ones of
+ * `targetUserIds` it answers true for, in a fixed number of queries whatever
+ * their number. The same rule: the requester itself; for a Guest, the members
+ * of its one readable channel; for anyone else, anyone sharing a
+ * conversation of this server with them, not deleted and not #all.
+ */
+export async function canUserSeeHumansThroughLocalChannel(serverId: string, requesterId: string, targetUserIds: readonly string[]): Promise<Set<string>> {
+  const visible = new Set<string>(targetUserIds.includes(requesterId) ? [requesterId] : []);
+  const others = [...new Set(targetUserIds)].filter((id) => id !== requesterId);
+  if (others.length === 0) return visible;
+  const show = (ids: Iterable<string>) => { for (const id of ids) visible.add(id); };
+
+  if (await resolveHumanServerRole(serverId, requesterId) !== "guest") {
+    show(await getHumanIdsVisibleThroughLocalChannels(serverId, requesterId, others));
+    return visible;
+  }
+  show(await guestReadableChannelHumanIds(serverId, requesterId, others));
+  return visible;
+}
+
+/**
+ * Of `targetUserIds`, the people a Guest may see: members of its one channel,
+ * when that channel is readable to it (canGuestReadChannel). Empty for a
+ * legacy Guest with no binding.
+ */
+async function guestReadableChannelHumanIds(serverId: string, guestId: string, targetUserIds: readonly string[]): Promise<Set<string>> {
+  const db = getDb();
+  const guestChannelId = await getGuestChannelId(serverId, guestId, db);
+  if (!guestChannelId || targetUserIds.length === 0) return new Set();
+  const [channel] = await db.select({ id: channels.id, type: channels.type, archivedAt: channels.archivedAt, deletedAt: channels.deletedAt })
+    .from(channels)
+    .where(and(eq(channels.id, guestChannelId), eq(channels.serverId, serverId)))
+    .limit(1);
+  if (!channel) return new Set();
+  if (channel.type === "joint") {
+    // P3: the people of the whole joint channel (every server), when the
+    // Guest enters it through its host projection. Simplified cards only:
+    // the profile route reduces them (toChannelScopedHumanProfile).
+    if (channel.archivedAt !== null || channel.deletedAt !== null) return new Set();
+    if (!(await filterGuestJointEntries(serverId, guestId, guestChannelId, [channel], db)).has(channel.id)) return new Set();
+    return jointConversationHumanIds(guestChannelId, targetUserIds, db);
+  }
+  const members = await db.select({ userId: channelHumans.userId })
+    .from(channelHumans)
+    .where(and(eq(channelHumans.channelId, guestChannelId), inArray(channelHumans.userId, [guestId, ...targetUserIds])));
+  const memberIds = new Set(members.map((row) => row.userId));
+  if (!canGuestReadChannel({
+    serverRole: "guest",
+    channelId: channel.id,
+    guestChannelId,
+    channelType: channel.type,
+    isChannelMember: memberIds.has(guestId),
+    archived: channel.archivedAt !== null,
+    deleted: channel.deletedAt !== null,
+  })) return new Set();
+  return new Set(targetUserIds.filter((id) => memberIds.has(id)));
+}
+
+/**
+ * Of `targetUserIds`, the humans currently in the joint channel whose local
+ * projection is `localChannelId`, through any active entry of any server
+ * (resolveJointHumanEntrySql: J membership, guest rule).
+ */
+async function jointConversationHumanIds(localChannelId: string, targetUserIds: readonly string[], db: DatabaseExecutor): Promise<Set<string>> {
+  if (targetUserIds.length === 0) return new Set();
+  const [projection] = await db.select({ jointId: jointChannelServers.jointChannelId }).from(jointChannelServers)
+    .where(eq(jointChannelServers.localChannelId, localChannelId)).limit(1);
+  if (!projection) return new Set();
+  const allowed = await resolveJointHumanEntrySql({ jointIds: [projection.jointId] }, db);
+  const rows = await db.execute<{ userId: string }>(sql`
+    SELECT t.user_id::text AS "userId" FROM unnest(${sql.param([...new Set(targetUserIds)])}::uuid[]) AS t(user_id)
+    WHERE EXISTS (SELECT 1 FROM joint_channel_servers jp
+      WHERE jp.joint_channel_id=${projection.jointId}::uuid AND jp.status='active'
+        AND ${allowed(sql`jp.local_channel_id`, sql`t.user_id`)})`);
+  return new Set(rows.rows.map((row) => row.userId));
+}
+
+/**
+ * `candidateIds` narrows the answer to those humans in SQL (and drops #all
+ * there too), so a batched lookup reads at most "requester's channels x
+ * candidates" rows instead of every co-member (Ray, #11193). Without it the
+ * whole set is returned, as before.
+ */
+export async function getHumanIdsVisibleThroughLocalChannels(serverId: string, requesterId: string, candidateIds?: readonly string[]): Promise<Set<string>> {
+  if (candidateIds && candidateIds.length === 0) return new Set();
   const db = getDb();
   const visibleHumans = alias(channelHumans, "hidden_directory_visible_humans");
   const rows = await db
@@ -2791,51 +3779,30 @@ export async function getHumanIdsVisibleThroughLocalChannels(serverId: string, r
       type: channels.type,
     })
     .from(channelHumans)
-    .innerJoin(visibleHumans, eq(visibleHumans.channelId, channelHumans.channelId))
+    .innerJoin(visibleHumans, candidateIds
+      ? and(eq(visibleHumans.channelId, channelHumans.channelId), inArray(visibleHumans.userId, [...candidateIds]))
+      : eq(visibleHumans.channelId, channelHumans.channelId))
     .innerJoin(channels, and(
       eq(channels.id, channelHumans.channelId),
       eq(channels.serverId, serverId),
       isNull(channels.deletedAt),
+      candidateIds
+        ? not(and(eq(channels.name, SYSTEM_ALL_CHANNEL_KEY), inArray(channels.type, ["channel", "private"]))!)
+        : undefined,
     ))
     .where(eq(channelHumans.userId, requesterId));
 
-  return new Set(rows
-    .filter((channel) => !isAllSystemChannel(channel))
-    .map((channel) => channel.userId));
+  const visible = new Set(rows.filter(channel => !isAllSystemChannel(channel)).map(channel => channel.userId));
+  for (const id of (await getComputedJointVisibleHuman(serverId, requesterId, candidateIds)).keys()) visible.add(id);
+  return visible;
 }
 
 export async function getHumanIdsVisibleThroughJointChannels(serverId: string, requesterId: string): Promise<Set<string>> {
-  const db = getDb();
-  const localProjection = alias(jointChannelServers, "hidden_directory_joint_local_projection");
-  const peerProjection = alias(jointChannelServers, "hidden_directory_joint_peer_projection");
-  const peerHumans = alias(channelHumans, "hidden_directory_joint_peer_humans");
-  const rows = await db
-    .select({ userId: peerHumans.userId })
-    .from(localProjection)
-    .innerJoin(peerProjection, and(
-      eq(peerProjection.jointChannelId, localProjection.jointChannelId),
-      ne(peerProjection.serverId, serverId),
-    ))
-    .innerJoin(jointChannels, and(
-      eq(jointChannels.id, localProjection.jointChannelId),
-      eq(jointChannels.status, "active"),
-    ))
-    .innerJoin(channelHumans, and(
-      eq(channelHumans.channelId, localProjection.localChannelId),
-      eq(channelHumans.userId, requesterId),
-    ))
-    .innerJoin(peerHumans, eq(peerHumans.channelId, peerProjection.localChannelId))
-    .where(and(
-      eq(localProjection.serverId, serverId),
-      eq(localProjection.status, "active"),
-      eq(peerProjection.status, "active"),
-    ));
-
-  return new Set(rows.map((row) => row.userId));
+  return new Set((await getComputedJointVisibleHuman(serverId, requesterId)).keys());
 }
 
 export async function canUserSeeHumanThroughJointChannel(serverId: string, requesterId: string, targetUserId: string): Promise<boolean> {
-  return !!await getJointVisibleHumanServerId(serverId, requesterId, targetUserId);
+  return (await getComputedJointVisibleHuman(serverId, requesterId, [targetUserId])).has(targetUserId);
 }
 
 // Thread follows are delivery/inbox state, not access grants. Member removal
@@ -2848,19 +3815,32 @@ async function pruneThreadFollowsOutsideParentMembership(
   executor: DatabaseExecutor,
 ) {
   const start = currentTimeMs();
-  const userResult = await executor.execute(sql`
+  // The parent's live threads (parent message in the channel) and Task v2
+  // conversations (parent on the row), resolved once through their indexes.
+  // Matching each follow against them in the DELETE (EXISTS ... OR EXISTS)
+  // read every follow of the type: all of thread_follows (~2.3M rows), 6-9 s
+  // on production (#triage:#142).
+  const scope = await executor.execute<{ id: string }>(sql`
+    SELECT parent_threads.id
+    FROM ${channels} parent_threads
+    INNER JOIN ${messages} parent_messages
+      ON parent_messages.id = parent_threads.parent_message_id
+    WHERE parent_threads.type = 'thread'
+      AND parent_threads.deleted_at IS NULL
+      AND parent_messages.channel_id = ${parentChannelId}
+    UNION ALL
+    SELECT task_conversations.id
+    FROM ${channels} task_conversations
+    WHERE task_conversations.type = 'task'
+      AND task_conversations.deleted_at IS NULL
+      AND task_conversations.parent_channel_id = ${parentChannelId}
+  `);
+  const scopeIds = scope.rows.map((row) => row.id);
+  const inScope = sql`${threadFollows.threadChannelId} = ANY(${`{${scopeIds.join(",")}}`}::uuid[])`;
+  const userResult = scopeIds.length === 0 ? { rows: [] } : await executor.execute(sql`
     DELETE FROM ${threadFollows}
     WHERE ${threadFollows.followerType} = 'user'
-      AND EXISTS (
-        SELECT 1
-        FROM ${channels} parent_threads
-        INNER JOIN ${messages} parent_messages
-          ON parent_messages.id = parent_threads.parent_message_id
-        WHERE parent_threads.id = ${threadFollows.threadChannelId}
-          AND parent_threads.type = 'thread'
-          AND parent_threads.deleted_at IS NULL
-          AND parent_messages.channel_id = ${parentChannelId}
-      )
+      AND ${inScope}
       AND NOT EXISTS (
         SELECT 1
         FROM ${channelHumans}
@@ -2870,19 +3850,10 @@ async function pruneThreadFollowsOutsideParentMembership(
     RETURNING 1
   `);
 
-  const agentResult = await executor.execute(sql`
+  const agentResult = scopeIds.length === 0 ? { rows: [] } : await executor.execute(sql`
     DELETE FROM ${threadFollows}
     WHERE ${threadFollows.followerType} = 'agent'
-      AND EXISTS (
-        SELECT 1
-        FROM ${channels} parent_threads
-        INNER JOIN ${messages} parent_messages
-          ON parent_messages.id = parent_threads.parent_message_id
-        WHERE parent_threads.id = ${threadFollows.threadChannelId}
-          AND parent_threads.type = 'thread'
-          AND parent_threads.deleted_at IS NULL
-          AND parent_messages.channel_id = ${parentChannelId}
-      )
+      AND ${inScope}
       AND NOT EXISTS (
         SELECT 1
         FROM ${channelAgents}
@@ -2896,6 +3867,7 @@ async function pruneThreadFollowsOutsideParentMembership(
     user_row_count: userResult.rows.length,
     agent_row_count: agentResult.rows.length,
     row_count: userResult.rows.length + agentResult.rows.length,
+    scope_count: scopeIds.length,
     duration_ms: currentTimeMs() - start,
   });
 }
@@ -3165,10 +4137,24 @@ export async function getThreadParentChannelType(channel: { type: string; parent
  */
 export async function archiveChannel(
   channelId: string,
-  archivedByUserId: string,
+  /** Null for an archive no person asked for (a joint whose host side emptied). */
+  archivedByUserId: string | null,
   executor?: DatabaseExecutor,
+  opts?: ArchiveOptions,
 ): Promise<typeof channels.$inferSelect> {
-  if (!executor) return withChannelWriterFence(channelId, tx => archiveChannel(channelId, archivedByUserId, tx));
+  if (!executor) {
+    const endedGuests: EndedChannelGuest[] = [];
+    // The archiver's and the bound Guests' users rows first (lockJointUsersFirst; only locked: no route's refusal here).
+    const archived = await withJointUsersGuessed(async () => [archivedByUserId, ...await archiveBoundGuestIds(channelId)], (lockedUserIds) => withChannelWriterFence(channelId, async (tx) => {
+      endedGuests.length = 0;
+      await lockJointUsersFirst(tx, { userIds: [...lockedUserIds] });
+      await lockJointLifecycleOfChannel(tx, channelId);
+      return archiveChannel(channelId, archivedByUserId, tx, { endedGuests, lockedUserIds });
+    }));
+    await finishEndedChannelGuests(archived.serverId, endedGuests);
+    await revokeBoundGuestSockets(channelId);
+    return archived;
+  }
   await assertChannelWritableInTransaction(executor, channelId);
   const db = executor ?? getDb();
   const channel = await getChannel(channelId, { executor: db });
@@ -3182,11 +4168,14 @@ export async function archiveChannel(
     const projectionIds = projections.length > 0
       ? projections.map((projection) => projection.localChannelId)
       : [channelId];
-    const [updated] = await db.update(channels)
+    const archivedRows = await db.update(channels)
       .set({ archivedAt: currentDate(), archivedByUserId, archivedByAgentId: null })
       .where(inArray(channels.id, projectionIds))
       .returning();
-    return updated ?? channel;
+    await closeArchivedJointToExternalPeople(db, channel, archivedRows, archivedByUserId, opts);
+    await reconcileExternalFreezesAfterArchiveChange(db, channel, projections, true);
+    // This entry's row: callers announce on the channel they archived.
+    return archivedRows.find((row) => row.id === channelId) ?? archivedRows[0] ?? channel;
   }
 
   const applyArchive = async (tx: DatabaseExecutor) => {
@@ -3199,9 +4188,131 @@ export async function archiveChannel(
       return unchanged ?? channel;
     }
     await emitPublicChannelArchiveEvents(tx, updated, "human");
+    // Guests and open invites first: the freeze reconcile then counts the
+    // channel without them (clear-only, no admission locks on this path).
+    await closeArchivedChannelToExternalPeople(tx, updated, archivedByUserId, opts);
+    await reconcileExternalFreezesAfterArchiveChange(tx, updated, [], true);
     return updated;
   };
   return executor ? applyArchive(executor) : getDb().transaction(applyArchive);
+}
+
+/**
+ * Archiving or unarchiving a channel removes it from, or returns it to, the
+ * external channels of its server (and, for a joint, of every server active
+ * in it): the free plan's freeze follows in the same transaction. After the
+ * channel writes; no joint row is locked here.
+ */
+async function reconcileExternalFreezesAfterArchiveChange(
+  executor: DatabaseExecutor,
+  channel: { serverId: string },
+  projections: ReadonlyArray<{ serverId: string }>,
+  archived: boolean,
+): Promise<void> {
+  const serverIds = [...new Set([channel.serverId, ...projections.map((projection) => projection.serverId)])];
+  await reconcileServerExternalFreezes(executor, serverIds, currentDate(), { clearOnly: archived });
+}
+
+/**
+ * An archive's: `endedGuests` collects the Guests it removed (finished after
+ * commit); `lockedUserIds`, the users rows its transaction took first
+ * (lockJointUsersFirst: the archiver and the bound Guests guessed by
+ * archiveBoundGuestIds), against which the Guests read under the channel
+ * lock are checked (a new one restarts it: JointUsersLockSetChangedError).
+ */
+export interface ArchiveOptions {
+  endedGuests?: EndedChannelGuest[];
+  lockedUserIds?: ReadonlySet<string>;
+}
+
+/**
+ * The Guests an archive of `channelId` would remove (bound to it or, for a
+ * joint, to any active projection), read without a lock: the set its users
+ * lock takes first (withJointUsersGuessed), re-read under the channel lock.
+ */
+export async function archiveBoundGuestIds(channelId: string, executor: DatabaseExecutor = getDb()): Promise<string[]> {
+  const channelIds = [channelId, ...(await getActiveJointChannelProjectionsByLocalChannel(channelId, executor)).map((projection) => projection.localChannelId)];
+  return (await executor.select({ userId: serverMembers.userId }).from(serverMembers)
+    .where(and(eq(serverMembers.role, "guest"), inArray(serverMembers.guestChannelId, [...new Set(channelIds)]))))
+    .map((row) => row.userId);
+}
+
+/** A Guest whose server membership ended with its channel; finished after commit (finishEndedChannelGuests). */
+export interface EndedChannelGuest {
+  userId: string;
+  effects: RemovedMemberEffects;
+  /** The server it left, when not the archived channel's own (a joint's other projections). */
+  serverId?: string;
+}
+
+/**
+ * P3: archiving a joint channel closes it to external people as an ordinary
+ * channel's archive does (closeArchivedChannelToExternalPeople), on every
+ * projection it archived: open invites are revoked and each Guest bound to a
+ * projection leaves that projection's server. A membership write, so it does
+ * not read the host's external_channels_v1 (jointEntryIdentitySql's rule).
+ * The bound Guests' member rows are already locked, before J
+ * (lockBoundJointGuestMemberships).
+ */
+async function closeArchivedJointToExternalPeople(
+  tx: DatabaseExecutor,
+  channel: { id: string; serverId: string },
+  archivedRows: ReadonlyArray<typeof channels.$inferSelect>,
+  actorUserId: string | null,
+  opts: ArchiveOptions | undefined,
+): Promise<void> {
+  void channel;
+  if (archivedRows.length === 0) return;
+  for (const row of [...archivedRows].sort((a, b) => a.id.localeCompare(b.id))) {
+    const ended: EndedChannelGuest[] = [];
+    await closeArchivedChannelToExternalPeople(tx, row, actorUserId, { endedGuests: ended, lockedUserIds: opts?.lockedUserIds });
+    for (const guest of ended) opts?.endedGuests?.push({ ...guest, serverId: row.serverId });
+  }
+}
+
+/**
+ * Archiving ends a channel's ties to people outside the server, in the
+ * archive's transaction (owner decision 2026-11-03): its open invites and
+ * approval requests are revoked, and each Guest bound to it leaves the server,
+ * as on channel deletion. Unarchiving brings neither back: they need new
+ * invites. The channel row is locked by the caller; then the invite rows, the
+ * server and the Guests' membership rows (lock order of deleteChannel), each
+ * Guest re-checked under its lock, so one promoted meanwhile stays a member.
+ * The departure is recorded as `removed` by the archiving person (none for an
+ * agent), as for any removal. The archiver's and the Guests' users rows were
+ * taken first (`lockedUserIds`): a Guest bound since that guess restarts the
+ * archive (JointUsersLockSetChangedError), before any of its rows is taken.
+ */
+async function closeArchivedChannelToExternalPeople(
+  tx: DatabaseExecutor,
+  channel: typeof channels.$inferSelect,
+  actorUserId: string | null,
+  opts: ArchiveOptions | undefined,
+): Promise<void> {
+  const endedGuests = opts?.endedGuests;
+  // Under the channel row's lock (nothing binds a Guest to it without that lock).
+  const guestIds = await boundGuestIds(tx, channel.serverId, channel.id);
+  if (opts?.lockedUserIds) assertJointUsersLocked(opts.lockedUserIds, guestIds);
+  const { revokeOpenInvitesForArchivedChannel } = await import("./externalInviteService");
+  await revokeOpenInvitesForArchivedChannel(tx, channel.id, actorUserId);
+  if (guestIds.length === 0) return;
+  const { lockServerMembershipsAfterChannel, removeMemberInTransaction } = await import("./serverService");
+  await lockServerMembershipsAfterChannel(tx as DatabaseTransaction, channel.serverId, guestIds);
+  for (const userId of guestIds) {
+    const effects = await removeMemberInTransaction(tx as DatabaseTransaction, channel.serverId, userId, {
+      onlyIfGuestBoundTo: channel.id,
+      reason: "removed",
+      actorUserId,
+    });
+    if (effects) endedGuests?.push({ userId, effects });
+  }
+}
+
+/** After the archive's commit: the ended Guests' sockets, notifications and credentials, as for any removal. */
+export async function finishEndedChannelGuests(serverId: string, endedGuests: readonly EndedChannelGuest[]): Promise<void> {
+  if (endedGuests.length === 0) return;
+  const { finishRemovedMember } = await import("./serverService");
+  for (const guest of endedGuests) await finishRemovedMember(guest.serverId ?? serverId, guest.userId, guest.effects);
 }
 
 async function emitPublicChannelArchiveEvents(
@@ -3244,8 +4355,23 @@ export async function setLocalChannelArchivedByAgent(
   archivedByAgentId: string,
   archived: boolean,
   executor?: DatabaseExecutor,
+  opts?: ArchiveOptions,
 ): Promise<{ channel: typeof channels.$inferSelect; changed: boolean }> {
-  if (!executor) return withChannelWriterFence(channelId, tx => setLocalChannelArchivedByAgent(channelId, archivedByAgentId, archived, tx));
+  if (!executor) {
+    const admissionServerIds = archived ? [] : await unarchiveAdmissionServerIds(channelId);
+    const endedGuests: EndedChannelGuest[] = [];
+    // An archive's bound Guests' users rows first (lockJointUsersFirst), before the admission locks.
+    const result = await withJointUsersGuessed(async () => archived ? archiveBoundGuestIds(channelId) : [], (lockedUserIds) => withChannelWriterFence(channelId, async (tx) => {
+      endedGuests.length = 0;
+      await lockJointUsersFirst(tx, { userIds: [...lockedUserIds] });
+      await acquireServerAdmissionLocks(tx, admissionServerIds);
+      await lockJointLifecycleOfChannel(tx, channelId);
+      return setLocalChannelArchivedByAgent(channelId, archivedByAgentId, archived, tx, { endedGuests, lockedUserIds });
+    }));
+    await finishEndedChannelGuests(result.channel.serverId, endedGuests);
+    if (archived && result.channel.archivedAt) await revokeBoundGuestSockets(channelId);
+    return result;
+  }
   await assertChannelWritableInTransaction(executor, channelId);
   const db = executor ?? getDb();
   const current = await getChannel(channelId, { executor: db });
@@ -3255,6 +4381,7 @@ export async function setLocalChannelArchivedByAgent(
   }
   if (isAllSystemChannel(current)) throw new Error("The #all channel cannot be archived");
 
+  if (!archived && current.archivedAt) await assertUnarchiveKeepsExternalLimit(db, current);
   if (current.type === "joint") {
     // Same shape as the human joint archive: the archive is shared, so every
     // active projection flips together.
@@ -3271,6 +4398,8 @@ export async function setLocalChannelArchivedByAgent(
         archived ? isNull(channels.archivedAt) : isNotNull(channels.archivedAt),
       ))
       .returning();
+    if (archived) await closeArchivedJointToExternalPeople(db, current, changedRows, null, opts);
+    if (changedRows.length > 0) await reconcileExternalFreezesAfterArchiveChange(db, current, projections, archived);
     const updatedLocal = changedRows.find((row) => row.id === channelId);
     if (updatedLocal) return { channel: updatedLocal, changed: true };
     const [unchanged] = await db.select().from(channels).where(eq(channels.id, channelId)).limit(1);
@@ -3298,7 +4427,12 @@ export async function setLocalChannelArchivedByAgent(
       .returning();
 
     if (updated) {
-      if (archived) await emitPublicChannelArchiveEvents(tx, updated, "agent");
+      if (archived) {
+        await emitPublicChannelArchiveEvents(tx, updated, "agent");
+        // Guests and open invites before the freeze reconcile (clear-only on archive).
+        await closeArchivedChannelToExternalPeople(tx, updated, null, opts);
+      }
+      await reconcileExternalFreezesAfterArchiveChange(tx, updated, [], archived);
       return { channel: updated, changed: true };
     }
     const [unchanged] = await tx.select().from(channels).where(eq(channels.id, channelId)).limit(1);
@@ -3309,60 +4443,100 @@ export async function setLocalChannelArchivedByAgent(
 }
 
 /**
- * Unarchive a channel. Idempotent on already-active channels.
+ * The servers whose admission locks an unarchive takes first
+ * (ADMISSION_LOCK_ORDER rule 1; the conversion fence may come before): the
+ * channel's server and every server active in its joint. An unlocked read,
+ * for the caller to lock before anything else; the unarchive re-reads the
+ * joint under its lifecycle lock.
+ */
+export async function unarchiveAdmissionServerIds(channelId: string, executor: DatabaseExecutor = getDb()): Promise<string[]> {
+  const [channel] = await executor.select({ serverId: channels.serverId }).from(channels).where(eq(channels.id, channelId)).limit(1);
+  if (!channel) return [];
+  const projections = await getActiveJointChannelProjectionsByLocalChannel(channelId, executor);
+  return [...new Set([channel.serverId, ...projections.map((projection) => projection.serverId)])].sort();
+}
+
+/**
+ * An unarchive makes the channel external again: the free plan's one
+ * external channel rule applies as on an admission (free_external_limit).
+ */
+async function assertUnarchiveKeepsExternalLimit(executor: DatabaseExecutor, channel: { id: string; serverId: string; type: string }): Promise<void> {
+  const projections = channel.type === "joint" ? await getActiveJointChannelProjectionsByLocalChannel(channel.id, executor) : [];
+  await assertCanUnarchiveExternalChannel(executor, { channel, projections, now: currentDate() });
+}
+
+/**
+ * Unarchive a channel. Idempotent on already-active channels. Refuses
+ * (ExternalChannelLimitError, free_external_limit) when it would put a free
+ * server in more than one external channel.
  */
 export async function unarchiveChannel(channelId: string, executor?: DatabaseExecutor): Promise<typeof channels.$inferSelect> {
-  if (!executor) return withChannelWriterFence(channelId, tx => unarchiveChannel(channelId, tx));
+  if (!executor) {
+    const admissionServerIds = await unarchiveAdmissionServerIds(channelId);
+    return withChannelWriterFence(channelId, async (tx) => {
+      await acquireServerAdmissionLocks(tx, admissionServerIds);
+      await lockJointLifecycleOfChannel(tx, channelId);
+      return unarchiveChannel(channelId, tx);
+    });
+  }
   await assertChannelWritableInTransaction(executor, channelId);
   const db = executor ?? getDb();
   const channel = await getChannel(channelId, { executor: db });
   if (!channel) throw new Error("Channel not found");
   if (!REGULAR_CHANNEL_TYPES.includes(channel.type as RegularChannelType) && channel.type !== "joint") throw new Error("Only regular channels can be unarchived");
   if (!channel.archivedAt) return channel;
-
-  let guestJoinable = channel.guestJoinable;
-  if (guestJoinable) {
-    await acquireServerLock(db, channel.serverId, GUEST_JOINABLE_CHANNEL_LOCK_NAMESPACE);
-    try {
-      await assertGuestJoinableChannelCapacityAvailable(db, channel.serverId);
-    } catch (error) {
-      if (!(error instanceof GuestJoinableChannelLimitError)) throw error;
-      guestJoinable = false;
-    }
-  }
+  await assertUnarchiveKeepsExternalLimit(db, channel);
 
   if (channel.type === "joint") {
     const projections = await getActiveJointChannelProjectionsByLocalChannel(channelId, db);
     const projectionIds = projections.length > 0
       ? projections.map((projection) => projection.localChannelId)
       : [channelId];
-    const [updated] = await db.update(channels)
+    const unarchivedRows = await db.update(channels)
       .set({ archivedAt: null, archivedByUserId: null, archivedByAgentId: null })
       .where(inArray(channels.id, projectionIds))
       .returning();
-    return updated ?? channel;
+    await reconcileExternalFreezesAfterArchiveChange(db, channel, projections, false);
+    // This entry's row (as archiveChannel): callers announce on the channel they unarchived.
+    return unarchivedRows.find((row) => row.id === channelId) ?? unarchivedRows[0] ?? channel;
   }
 
   const [updated] = await db.update(channels)
-    .set({ archivedAt: null, archivedByUserId: null, archivedByAgentId: null, guestJoinable })
+    .set({ archivedAt: null, archivedByUserId: null, archivedByAgentId: null })
     .where(eq(channels.id, channelId))
     .returning();
+  await reconcileExternalFreezesAfterArchiveChange(db, channel, [], false);
   return updated;
 }
 
 /**
- * Source of truth for the archive write-gate. Returns true if the channel
- * exists and is archived. Threads inherit their parent's archived state, so
- * archiving a channel also freezes all of its threads.
+ * Archive state and effective root are read by the same walk. Threads/tasks
+ * inherit their parent's archived state. Ordinary sends reuse the root type
+ * without adding a separate DM eligibility query.
  */
-export async function isChannelArchived(channelId: string): Promise<boolean> {
+type ChannelArchiveState = { archived: boolean; rootType: typeof channels.$inferSelect.type | null };
+
+/**
+ * `lockRoot`: the root's archived state is decided by a FOR SHARE read of its
+ * row in the ambient transaction (the row archiveChannel and unarchiveChannel
+ * update), so an archive committed first is seen and a later one waits for the
+ * caller's commit. Only the root is locked: a thread's or task's own row is
+ * never archived (RFC 082 §4.6, the card edit's attempt admission).
+ */
+export type ChannelArchiveReadOptions = { lockRoot?: boolean };
+
+async function getChannelArchiveState(channelId: string, options: ChannelArchiveReadOptions = {}): Promise<ChannelArchiveState> {
   const channel = await getChannel(channelId);
-  if (!channel) return false;
-  if (channel.archivedAt) return true;
-  if (channel.type === "thread") {
+  if (!channel) return { archived: false, rootType: null };
+  if (channel.archivedAt) return { archived: true, rootType: channel.type };
+  // Task conversation (task v2): archived with its parent channel.
+  if (channel.type === "task") {
+    return channel.parentChannelId ? getChannelArchiveState(channel.parentChannelId, options) : { archived: false, rootType: channel.type };
+  }
+  if (isSubConversationType(channel.type)) {
     const jointThread = await getJointThreadProjectionByLocalThread(channelId, channel.serverId);
     if (jointThread) {
-      return isChannelArchived(jointThread.localParentChannelId);
+      return getChannelArchiveState(jointThread.localParentChannelId, options);
     }
   }
 
@@ -3372,10 +4546,19 @@ export async function isChannelArchived(channelId: string): Promise<boolean> {
       .select({ channelId: messages.channelId })
       .from(messages)
       .where(eq(messages.id, channel.parentMessageId));
-    if (!parentMsg) return false;
-    return isChannelArchived(parentMsg.channelId);
+    if (!parentMsg) return { archived: false, rootType: channel.type };
+    return getChannelArchiveState(parentMsg.channelId, options);
   }
-  return false;
+  if (options.lockRoot) {
+    const [root] = await getDb().select({ archivedAt: channels.archivedAt }).from(channels)
+      .where(eq(channels.id, channelId)).for("share");
+    return { archived: Boolean(root?.archivedAt), rootType: channel.type };
+  }
+  return { archived: false, rootType: channel.type };
+}
+
+export async function isChannelArchived(channelId: string, options: ChannelArchiveReadOptions = {}): Promise<boolean> {
+  return (await getChannelArchiveState(channelId, options)).archived;
 }
 
 export class ChannelArchivedError extends Error {
@@ -3401,13 +4584,20 @@ export class ArchivedNameCollisionError extends Error {
  * archived. Call from write-path code to freeze all mutations on archived
  * channels.
  */
-export async function assertChannelNotArchived(channelId: string): Promise<void> {
-  if (await isChannelArchived(channelId)) {
-    throw new ChannelArchivedError(channelId);
-  }
+export async function assertChannelNotArchived(channelId: string): Promise<Pick<ChannelArchiveState, "rootType"> | void> {
+  const state = await getChannelArchiveState(channelId);
+  if (state.archived) throw new ChannelArchivedError(channelId);
+  // The send path reuses the root already read by this archive walk; it must
+  // not run a second parent lookup just to decide whether this is a DM.
+  return { rootType: state.rootType };
 }
 
-export async function deleteChannel(channelId: string) {
+/**
+ * Soft-delete a channel. `options.deletedByUserId`: the person deleting it,
+ * recorded on a joint copy it retires (joint_channel_servers
+ * disconnected_by_user_id, joint_membership_departures actor_user_id).
+ */
+export async function deleteChannel(channelId: string, options: { deletedByUserId?: string } = {}) {
   const db = getDb();
   const channel = await getChannel(channelId, { includeDeleted: true });
 
@@ -3419,6 +4609,7 @@ export async function deleteChannel(channelId: string) {
   }
 
   const now = currentDate();
+  let endedGuests: Array<{ userId: string; effects: RemovedMemberEffects }> = [];
 
   // Channel is soft-deleted, so the FK `onDelete: cascade` never fires.
   // If we leave open tasks behind, users see them in the Tasks panel but
@@ -3431,226 +4622,633 @@ export async function deleteChannel(channelId: string) {
   // window — legacy `messages.task_*` or the canonical `tasks` table — so both
   // are closed here. Closing only one side would leave the other stuck open in
   // exactly the state this hook exists to prevent.
-  await withChannelWriterFence(channelId, async (tx) => {
-    await tx.update(messages)
-      .set({
-        taskStatus: "closed",
-        taskCompletedAt: now,
-        updatedAt: now,
-      })
-      .where(and(
-        eq(messages.channelId, channelId),
-        inArray(messages.taskStatus, ["todo", "in_progress", "in_review"]),
-      ));
-
-    // `closed_by_*` stays null: the enum is user|agent and this close has no
-    // human/agent actor. The actor is recorded on the audit event instead.
-    const autoClosed = await tx.update(tasks)
-      .set({
-        status: "closed",
-        completedAt: now,
-        closedAt: now,
-        revision: sql`${tasks.revision} + 1`,
-        updatedAt: now,
-      })
-      .where(and(
-        eq(tasks.channelId, channelId),
-        inArray(tasks.status, ["todo", "in_progress", "in_review"]),
-      ))
-      .returning({ id: tasks.id });
-
-    if (autoClosed.length > 0) {
-      await tx.insert(taskEvents).values(autoClosed.map((task) => ({
-        taskId: task.id,
-        eventType: "closed" as const,
-        actorType: "system" as const,
-        actorId: null,
-        payload: { status: "closed", reason: "channel_deleted", channelId },
-      })));
+  for (let attempt = 0; ; attempt += 1) {
+    // The Guests it removes, guessed unlocked: their users rows are taken first below.
+    const guessedGuests = await boundGuestIds(db, channel.serverId, channelId);
+    endedGuests = [];
+    try {
+      await withChannelWriterFence(channelId, (tx) => deleteChannelInTransaction(tx, channel, options, guessedGuests, now, endedGuests));
+      break;
+    } catch (err) {
+      if (!(err instanceof ChannelGuestsChanged)) throw err;
+      if (attempt >= 2) throw new Error("The channel's Guests changed while it was deleted; try again");
     }
+  }
 
-    await tx.update(channels)
-      .set({ deletedAt: now })
-      .where(eq(channels.id, channelId));
-  });
+  if (endedGuests.length > 0) {
+    const { finishRemovedMember } = await import("./serverService");
+    for (const guest of endedGuests) await finishRemovedMember(channel.serverId, guest.userId, guest.effects);
+  }
+}
+
+/** deleteChannel found, under the channel lock, a bound Guest its users lock did not take: restart. */
+class ChannelGuestsChanged extends Error {}
+
+async function deleteChannelInTransaction(
+  tx: DatabaseTransaction,
+  channel: { id: string; serverId: string },
+  options: { deletedByUserId?: string },
+  guessedGuests: readonly string[],
+  now: Date,
+  endedGuests: Array<{ userId: string; effects: RemovedMemberEffects }>,
+): Promise<void> {
+  const channelId = channel.id;
+  // The users rows first (lockJointUsersFirst): the deleter's (a joint
+  // copy's retirement names them) and the bound Guests' (their removal's
+  // departure and membership-end rows name them), before the channel row:
+  // taken only by those rows' FK checks, after the channel, server and
+  // member rows, a Guest's or the deleter's row closes a cycle with their
+  // account deletion (users row FOR UPDATE, then the servers they own).
+  // The deleter retired or being deleted: refused (JointActorUnavailableError).
+  await lockJointUsersFirst(tx, { actorUserId: options.deletedByUserId, userIds: guessedGuests });
+  // Global lock order channel -> server -> member -> joint -> channel
+  // membership. The channel row, then the server and its bound Guests'
+  // membership rows (read under the channel lock: nothing binds a Guest to a
+  // channel without it), before the joint mirror (#wg-rbac:#15).
+  await tx.select({ id: channels.id }).from(channels).where(eq(channels.id, channelId)).for("update");
+  const preliminaryGuests = await boundGuestIds(tx, channel.serverId, channelId);
+  if (preliminaryGuests.some((guestId) => !guessedGuests.includes(guestId))) throw new ChannelGuestsChanged();
+  if (preliminaryGuests.length > 0) {
+    const { lockServerMembershipsAfterChannel } = await import("./serverService");
+    await lockServerMembershipsAfterChannel(tx, channel.serverId, preliminaryGuests);
+  }
+  await lockJointHumanMembershipChannel(tx, channelId);
+  const mirrorHumans = await prepareJointHumanMembershipMirror(tx, { channelIds: [channelId] }, "retire");
+  await tx.update(messages)
+    .set({
+      taskStatus: "closed",
+      taskCompletedAt: now,
+      updatedAt: now,
+    })
+    .where(and(
+      eq(messages.channelId, channelId),
+      inArray(messages.taskStatus, ["todo", "in_progress", "in_review"]),
+    ));
+
+  // `closed_by_*` stays null: the enum is user|agent and this close has no
+  // human/agent actor. The actor is recorded on the audit event instead.
+  const autoClosed = await tx.update(tasks)
+    .set({
+      status: "closed",
+      completedAt: now,
+      closedAt: now,
+      revision: sql`${tasks.revision} + 1`,
+      updatedAt: now,
+      // A status change: Tasks-page activity (taskService.TASK_ACTIVITY_NOW).
+      lastActivityAt: sql`now()`,
+    })
+    .where(and(
+      eq(tasks.channelId, channelId),
+      // Backlog too: it isn't active, but it isn't over either, and a dead
+      // channel keeps nothing that may come back.
+      inArray(tasks.status, ["backlog", "todo", "in_progress", "in_review"]),
+    ))
+    .returning({ id: tasks.id });
+
+  if (autoClosed.length > 0) {
+    await tx.insert(taskEvents).values(autoClosed.map((task) => ({
+      taskId: task.id,
+      eventType: "closed" as const,
+      actorType: "system" as const,
+      actorId: null,
+      payload: { status: "closed", reason: "channel_deleted", channelId },
+    })));
+  }
+
+  await tx.update(channels)
+    .set({ deletedAt: now })
+    .where(eq(channels.id, channelId));
+  await mirrorHumans.apply(undefined, options.deletedByUserId ? { actorUserId: options.deletedByUserId } : {});
+
+  // A Guest exists only for this channel: deleting it ends its Guests' server
+  // membership through the normal removal, in the same commit (#wg-rbac:#15).
+  // Their membership rows are locked above; each is re-checked under that
+  // lock, so a Guest promoted meanwhile keeps its membership.
+  if (preliminaryGuests.length > 0) {
+    const { removeMemberInTransaction } = await import("./serverService");
+    for (const guestId of preliminaryGuests) {
+      const guest = { userId: guestId };
+      // Re-checked under the membership lock: a Guest promoted meanwhile keeps its membership.
+      const effects = await removeMemberInTransaction(tx, channel.serverId, guest.userId, { onlyIfGuestBoundTo: channelId, reason: "removed" });
+      if (!effects) continue;
+      // The server removal skips soft-deleted channels, and this one already is:
+      // drop the Guest's row here (read cursors stay, as for any removal).
+      await tx.delete(channelHumans).where(and(eq(channelHumans.channelId, channelId), eq(channelHumans.userId, guest.userId)));
+      endedGuests.push({ userId: guest.userId, effects });
+    }
+  }
+  // A deleted channel is no longer external: the free plan's freeze follows
+  // in the same commit (its Guests' removal above already reconciled).
+  await reconcileServerExternalFreeze(tx, channel.serverId, now, { clearOnly: true });
 }
 
 /** Payload reason marking an unassign the disconnect caused, not a person choosing. */
 export const TASK_UNASSIGN_REASON_JOINT_DISCONNECTED = "joint_channel_disconnected";
 
 /**
- * Clear assignees that no active projection can reach any more.
- *
- * `disconnectJointChannel` used to touch only the projection row and the local
- * channel, never `tasks`. The leaving side's cards fall into the existing
- * membership checks, but a card on the REMAINING side kept rendering "assigned
- * to X" while X had no active projection left to reach it — an identity claim
- * with nothing behind it.
- *
- * Reachability is re-derived with the same predicate `assignTask` uses
- * (`lockTaskAssigneeEligibility` in taskService): the union of members across
- * projections that are still `active`. A cheaper rule — "unassign everyone from
- * the departing server" — would be wrong, because a human is a GLOBAL logical
- * identity: someone who is a member via both the departing projection and a
- * surviving one is still reachable and must keep the task. Agents are
- * server-owned, so an agent on the departing server is not.
- *
- * Must run inside the disconnect transaction and AFTER the projection/channel
- * rows are updated, so it reads post-disconnect truth.
- *
- * `done` is excluded: its assignee is frozen and rewriting it would rewrite
- * history. `closed` is included — it can transition back to `todo`/
- * `in_progress`, so leaving a dangling assignee there only defers the same bug.
- * That matches `writeCanonicalUnclaim`, which also blocks `done` alone.
+ * With external_channels_v1 on for the host server, the host's copy of a joint
+ * channel can't be disconnected: its owner/admins may only remove the other servers
+ * (disconnectParticipantServerByHost, behind the same flag).
  */
-async function unassignUnreachableJointTasks(
-  tx: DatabaseExecutor,
-  jointChannelId: string,
-  disconnectedByUserId: string,
-  now: Date,
-) {
-  const [joint] = await tx
-    .select({ canonicalChannelId: jointChannels.canonicalChannelId })
-    .from(jointChannels)
-    .where(eq(jointChannels.id, jointChannelId))
-    .limit(1);
-  if (!joint) return;
-
-  const assigned = await tx
-    .select({
-      id: tasks.id,
-      claimedByType: tasks.claimedByType,
-      claimedById: tasks.claimedById,
-    })
-    .from(tasks)
-    .where(and(
-      eq(tasks.channelId, joint.canonicalChannelId),
-      isNotNull(tasks.claimedById),
-      ne(tasks.status, "done"),
-    ))
-    .for("update");
-  if (assigned.length === 0) return;
-
-  const activeProjection = and(
-    eq(jointChannelServers.jointChannelId, jointChannelId),
-    eq(jointChannelServers.status, "active"),
-  );
-  const liveLocalChannel = and(
-    eq(channels.id, jointChannelServers.localChannelId),
-    eq(channels.serverId, jointChannelServers.serverId),
-    isNull(channels.deletedAt),
-  );
-
-  const reachableUserRows = await tx
-    .select({ id: channelHumans.userId })
-    .from(jointChannelServers)
-    .innerJoin(channelHumans, eq(channelHumans.channelId, jointChannelServers.localChannelId))
-    .innerJoin(channels, liveLocalChannel)
-    .where(activeProjection);
-
-  const reachableAgentRows = await tx
-    .select({ id: channelAgents.agentId })
-    .from(jointChannelServers)
-    .innerJoin(channelAgents, eq(channelAgents.channelId, jointChannelServers.localChannelId))
-    .innerJoin(channels, liveLocalChannel)
-    .innerJoin(agents, and(
-      eq(agents.id, channelAgents.agentId),
-      eq(agents.serverId, jointChannelServers.serverId),
-      isNull(agents.deletedAt),
-    ))
-    .where(activeProjection);
-
-  const reachableUserIds = new Set(reachableUserRows.map((row) => row.id));
-  const reachableAgentIds = new Set(reachableAgentRows.map((row) => row.id));
-
-  for (const task of assigned) {
-    const assigneeType = task.claimedByType;
-    const assigneeId = task.claimedById;
-    if (!assigneeType || !assigneeId) continue;
-    const stillReachable = assigneeType === "user"
-      ? reachableUserIds.has(assigneeId)
-      : reachableAgentIds.has(assigneeId);
-    if (stillReachable) continue;
-
-    await tx.update(tasks)
-      .set({
-        claimedByType: null,
-        claimedById: null,
-        claimedAt: null,
-        revision: sql`${tasks.revision} + 1`,
-        updatedAt: now,
-      })
-      .where(eq(tasks.id, task.id));
-
-    // actorType stays "user" with the disconnecting user's id — a person did
-    // cause this, and `system` would lose who. `reason` is what separates it
-    // from a manual unclaim, so history never reads "they dropped it themselves".
-    await tx.insert(taskEvents).values({
-      taskId: task.id,
-      eventType: "assignee_changed" as const,
-      actorType: "user" as const,
-      actorId: disconnectedByUserId,
-      payload: {
-        assigneeType: null,
-        assigneeId: null,
-        previousAssigneeType: assigneeType,
-        previousAssigneeId: assigneeId,
-        reason: TASK_UNASSIGN_REASON_JOINT_DISCONNECTED,
-      },
-    });
+export class JointHostDisconnectError extends Error {
+  readonly code = "host_cannot_disconnect";
+  constructor() {
+    super("The host server can't disconnect from its own channel. Archive the channel instead.");
   }
 }
 
-export async function disconnectJointChannel(channelId: string, disconnectedByUserId: string) {
+/**
+ * A projection with bound Guests is not disconnected (P3, Cody/Tenny on PR
+ * #13205), whatever external_channels_v1 says: the disconnect would delete
+ * the channel the Guests are bound to and strand them. Remove them first.
+ */
+export class JointGuestsPresentError extends Error {
+  readonly code = "guests_present";
+  constructor() {
+    super("This channel has guests. Remove them before disconnecting this server.");
+  }
+}
+
+/**
+ * The writes of one projection's disconnect, after the caller authorized it
+ * and while it holds the projection's channel row (lockJointHumanMembershipChannel)
+ * and the actor's joint locks (lockComputedJointActor). Shared by a server
+ * disconnecting itself (disconnectJointChannel) and the host disconnecting a
+ * participant (disconnectParticipantServerByHost).
+ */
+async function disconnectJointProjectionInTransaction(
+  tx: DatabaseExecutor,
+  { channelId, serverId, projection, disconnectedByUserId, now }: {
+    channelId: string;
+    serverId: string;
+    projection: { jointChannelId: string; canonicalChannelId: string };
+    disconnectedByUserId: string;
+    now: Date;
+  },
+): Promise<void> {
+  // Under the projection's row lock (lockJointHumanMembershipChannel, taken by
+  // the caller), which a Guest's invite acceptance takes before binding: none slips in.
+  if (await boundGuestIds(tx, serverId, channelId).then((ids) => ids.length > 0)) throw new JointGuestsPresentError();
+  const mirrorHumans = await prepareJointHumanMembershipMirror(tx, { channelIds: [channelId] }, "disconnect");
+  await tx.execute(sql`SET LOCAL lock_timeout='2s'`);
+  await tx.execute(sql`SET LOCAL statement_timeout='5s'`);
+  await tx.update(jointChannelServers)
+    .set({
+      status: "disconnected",
+      disconnectedByUserId,
+      disconnectedAt: now,
+    })
+    .where(and(
+      eq(jointChannelServers.jointChannelId, projection.jointChannelId),
+      eq(jointChannelServers.localChannelId, channelId),
+    ));
+  // This copy's pending invites leave their invitees' lists (the mirror's
+  // apply below says so too).
+  await announceJointInvitesForJoints(tx, [projection.jointChannelId]);
+
+  await tx.update(channels)
+    .set({ deletedAt: now })
+    .where(eq(channels.id, channelId));
+
+  // This server's copies of the joint's threads go with it, so none stays
+  // active under a parent that is gone; rejoining reuses their rows.
+  const threadCopies = await tx
+    .select({ jointThreadId: jointChannelServers.jointChannelId, localChannelId: jointChannelServers.localChannelId })
+    .from(jointChannelServers)
+    .innerJoin(jointChannels, eq(jointChannels.id, jointChannelServers.jointChannelId))
+    .innerJoin(channels, eq(channels.id, jointChannels.canonicalChannelId))
+    .innerJoin(messages, eq(messages.id, channels.parentMessageId))
+    .where(and(
+      eq(messages.channelId, projection.canonicalChannelId),
+      eq(channels.type, "thread"),
+      eq(jointChannelServers.serverId, serverId),
+      eq(jointChannelServers.status, "active"),
+    ));
+  if (threadCopies.length > 0) {
+    await tx.update(jointChannelServers)
+      .set({ status: "disconnected", disconnectedByUserId, disconnectedAt: now })
+      .where(and(
+        inArray(jointChannelServers.jointChannelId, threadCopies.map((copy) => copy.jointThreadId)),
+        eq(jointChannelServers.serverId, serverId),
+        eq(jointChannelServers.status, "active"),
+      ));
+    await tx.update(channels)
+      .set({ deletedAt: now })
+      .where(and(inArray(channels.id, threadCopies.map((copy) => copy.localChannelId)), isNull(channels.deletedAt)));
+  }
+
+  // The departure this starts settles the assignees the disconnect made
+  // unreachable (jointMembershipDeparture.ts, reason joint_channel_disconnected).
+  // AFTER the two updates above and inside the same transaction: it reads this
+  // projection as already 'disconnected' and its local channel soft-deleted.
+  await mirrorHumans.apply(undefined, { actorUserId: disconnectedByUserId });
+
+  // The joint is no longer an external channel of this server, nor of the
+  // other side if it is left alone. Before the joint row write below
+  // (ADMISSION_LOCK_ORDER rule 4).
+  await reconcileExternalFreezesForChannel(tx, { serverId, jointChannelId: projection.jointChannelId, now, clearOnly: true });
+  // A free participant leaving can bring the joint back within the cap.
+  await reconcileJointOverLimitFor(tx, projection.jointChannelId, now);
+}
+
+/** An actor retired or being deleted (JointActorUnavailableError) answers as an unknown channel. */
+function unusableActorAsNotFound(err: unknown): never {
+  if (err instanceof JointActorUnavailableError) throw new Error("Channel not found");
+  throw err;
+}
+
+/**
+ * Disconnect this server's copy of a joint channel (another server's, never
+ * the host's: JointHostDisconnectError). Returns the joint and its canonical
+ * storage channel so the caller can tell the servers still connected. A
+ * participant's disconnect writes one `channel.server_disconnected` audit
+ * event (`byHost: false`) on its own server and one on the host, in the same
+ * commit.
+ */
+export async function disconnectJointChannel(
+  channelId: string,
+  disconnectedByUserId: string,
+): Promise<{ jointChannelId: string; canonicalChannelId: string }> {
   const db = getDb();
   const channel = await getChannel(channelId);
   if (!channel) throw new Error("Channel not found");
   if (channel.type !== "joint") throw new Error("Only joint channels can be disconnected");
 
   const now = currentDate();
-  await db.transaction(async (tx) => {
+  return db.transaction(async (tx) => {
+    await tx.execute(sql`SET LOCAL lock_timeout='2s'`);
+    await tx.execute(sql`SET LOCAL statement_timeout='5s'`);
     const [projection] = await tx
-      .select({ jointChannelId: jointChannelServers.jointChannelId })
+      .select({ jointChannelId: jointChannelServers.jointChannelId, canonicalChannelId: jointChannels.canonicalChannelId, role: jointChannelServers.role })
       .from(jointChannelServers)
+      .innerJoin(jointChannels, eq(jointChannels.id, jointChannelServers.jointChannelId))
       .where(and(
         eq(jointChannelServers.localChannelId, channelId),
         eq(jointChannelServers.status, "active"),
       ));
     if (!projection) throw new Error("Joint channel not found");
-
-    await tx.update(jointChannelServers)
-      .set({
-        status: "disconnected",
-        disconnectedByUserId,
-        disconnectedAt: now,
-      })
+    // The host's active copy, for its `channel.server_disconnected` audit
+    // event: read again after the disconnect's writes, under its locks. A
+    // host disconnecting itself (external channels off) writes no event.
+    const readHostCopy = async () => projection.role !== "participant" ? undefined : (await tx
+      .select({ serverId: jointChannelServers.serverId, localChannelId: jointChannelServers.localChannelId })
+      .from(jointChannelServers)
       .where(and(
         eq(jointChannelServers.jointChannelId, projection.jointChannelId),
-        eq(jointChannelServers.localChannelId, channelId),
-      ));
+        eq(jointChannelServers.role, "host"),
+        eq(jointChannelServers.status, "active"),
+        ne(jointChannelServers.serverId, channel.serverId),
+      )))[0];
+    const hostBefore = await readHostCopy();
 
-    await tx.update(channels)
-      .set({ deletedAt: now })
-      .where(eq(channels.id, channelId));
+    // Lock order, as disconnectParticipantServerByHost's (#13716): the actor's
+    // `users` row and this server's `servers` row FOR KEY SHARE (the
+    // projection row and the departure record name both; the audit events
+    // reference this server's and the host's, so the host's is taken with it,
+    // in id order as disconnectParticipantServerByHost does), BEFORE the channel
+    // row. Deleting this server takes its row FOR UPDATE, then J, then
+    // inserts a departure whose FK KEY-SHAREs this
+    // channel row; with the server row first taken after the channel row
+    // (lockComputedJointActor's FOR SHARE) each waited on the other
+    // (jointSelfDisconnectLockOrder.realPg.test.ts).
+    // Retired or being deleted (lockJointActorFirst): the neutral refusal.
+    await lockJointActorFirst(tx, disconnectedByUserId).catch(unusableActorAsNotFound);
+    await tx.execute(sql`SELECT id FROM servers WHERE id IN (${sql.join([channel.serverId, ...(hostBefore ? [hostBefore.serverId] : [])].map((id) => sql`${id}::uuid`), sql`, `)}) ORDER BY id FOR KEY SHARE`);
+    await lockJointHumanMembershipChannel(tx, channelId);
+    await lockComputedJointActor({ serverId: channel.serverId, channelId, actorType: "user", actorId: disconnectedByUserId }, tx);
+    // Under the locks: a server deleted meanwhile has no copy to disconnect.
+    const [server] = await tx.select({ deletedAt: servers.deletedAt }).from(servers).where(eq(servers.id, channel.serverId));
+    if (!server || server.deletedAt) throw new Error("Channel not found");
+    const context = await resolveChannelActorContext(channel.serverId, channelId, "user", disconnectedByUserId, tx);
+    if (context?.jointAuthority && (!context.canAccessChannel || !context.jointAuthority.inherited)) throw new Error("Channel capability required");
+    // A projection's role is fixed when it is created; nothing has been written yet.
+    if (projection.role === "host" && (await evaluateFeatureFlag({ key: EXTERNAL_CHANNELS_FEATURE_FLAG_KEY, serverId: channel.serverId, userId: disconnectedByUserId }, tx)).enabled) {
+      throw new JointHostDisconnectError();
+    }
+    await disconnectJointProjectionInTransaction(tx, { channelId, serverId: channel.serverId, projection, disconnectedByUserId, now });
+    // As the host's disconnect of a participant writes them (byHost: true):
+    // one event on each of the two servers, each naming its own copy, in
+    // this commit. One per channel: the thread copies that went with it
+    // write none. The actor's role is this server's, so only its own row has it.
+    if (projection.role === "participant") {
+      const hostCopy = hostBefore ? await readHostCopy() : undefined;
+      const host = hostCopy && hostCopy.serverId === hostBefore?.serverId ? hostCopy : undefined;
+      const operationId = newAuditOperationId();
+      await recordIntegrationAuditEvents([
+        ...(host ? [{ serverId: host.serverId, channelId: host.localChannelId, actorRole: undefined }] : []),
+        { serverId: channel.serverId, channelId, actorRole: context?.serverRole },
+      ].map(({ serverId, channelId: ownChannelId, actorRole }) => ({
+        serverId,
+        eventType: "channel.server_disconnected" as const,
+        outcome: "success" as const,
+        source: "web" as const,
+        actor: { type: "human" as const, id: disconnectedByUserId },
+        target: { type: "server", id: channel.serverId },
+        metadata: {
+          jointChannelId: projection.jointChannelId,
+          ...(host ? { hostServerId: host.serverId } : {}),
+          disconnectedServerId: channel.serverId,
+          channelId: ownChannelId,
+          byHost: false,
+          ...serverAuditContextMetadata({ actorRole, operationId }),
+        },
+      })), tx);
+    }
+    return { jointChannelId: projection.jointChannelId, canonicalChannelId: projection.canonicalChannelId };
+  }).then(async result => {
+    // The durable claim was committed with the denial list. A lost inline run
+    // is recovered on another replica; runtime effects never precede commit.
 
-    // Settle assignees the disconnect just made unreachable. This must run
-    // AFTER the two updates above and inside the same transaction: it re-derives
-    // reachability from the projections that are still active, so it depends on
-    // this projection already being 'disconnected' and its local channel already
-    // soft-deleted. Eager, not lazy-at-read — a stale assignee must never be
-    // observable, and read-time settlement would need every reader to remember.
-    await unassignUnreachableJointTasks(tx, projection.jointChannelId, disconnectedByUserId, now);
-    // A free participant leaving can bring the joint back within the cap.
-    await reconcileJointOverLimitFor(tx, projection.jointChannelId, now);
+    return result;
   });
 }
 
-async function deletePrivateChannelIfEmpty(channelId: string, db: DatabaseExecutor = getDb()) {
+/** POST /channels/:id/joint-servers/:serverId/disconnect on a copy that is not the host's active copy of a joint. */
+export class JointNotHostError extends Error {
+  readonly code = "not_joint_host";
+  constructor() {
+    super("Only the host server can disconnect another server. To leave, disconnect your own server instead.");
+  }
+}
+
+/** The server named is not an active participant of the host's joint (unknown, already gone, or the host itself). */
+export class JointServerNotConnectedError extends Error {
+  readonly code = "server_not_connected";
+  constructor() {
+    super("That server is not connected to this channel.");
+  }
+}
+
+let hostDisconnectBeforeLocksHookForTests: ((hostChannelId: string) => Promise<void>) | null = null;
+/** Tests only: awaited by disconnectParticipantServerByHost after its unlocked reads, before its transaction and locks (a window for the actor's access to change). */
+export function __setHostDisconnectBeforeLocksHookForTests(hook: ((hostChannelId: string) => Promise<void>) | null): void {
+  hostDisconnectBeforeLocksHookForTests = hook;
+}
+
+/**
+ * The host's owner/admin disconnects a participant server from a joint channel
+ * (external_channels_v1, evaluated for the host): the participant's
+ * projection goes exactly as its own disconnect would take it
+ * (disconnectJointProjectionInTransaction), with the host's admin recorded as
+ * who disconnected it, and one `channel.server_disconnected` audit event on
+ * each of the two servers in the same commit. A flag that is off answers as an
+ * unknown channel ("Channel not found"), so the feature stays hidden.
+ *
+ * Lock order, all before the first J lock (identity/resource rows -> flag
+ * share locks -> J, jointHumanMembershipAccess.ts acquireJointSourceExitFlagReadLock):
+ * 1. The actor's `users` row FOR KEY SHARE (lockJointActorFirst): the
+ *    participant's projection row and its departure record name the actor
+ *    (disconnected_by_user_id, actor_user_id FKs). Account deletion takes that
+ *    row FOR UPDATE first and then the person's owned servers, so it is taken
+ *    before anything else; an actor retired or being deleted is refused.
+ * 2. Both `servers` rows FOR KEY SHARE, in id order (as
+ *    externalInviteConnectService.ts does): the audit rows reference both
+ *    (server_id FK), B's departure record references B. Deleting a server
+ *    takes its row FOR UPDATE, then J, then inserts a
+ *    departure whose FK KEY-SHAREs the projection's channel row. Taking B's
+ *    row through an INSERT after J closes a J <-> B cycle (as the departure
+ *    worker, cleanJointMembershipDepartureBatch); taking it after the channel
+ *    rows closes a channel <-> B cycle with that departure INSERT (both
+ *    reproduced in jointHostDisconnectLockOrder.realPg.test.ts). KEY SHARE
+ *    conflicts only with FOR UPDATE, which a server's deletion, role change
+ *    or plan writer takes before any channel row.
+ * 3. The host's channel row (FOR NO KEY UPDATE: only read, as the archive and
+ *    a joint member removal take it), then the participant's (FOR UPDATE, as
+ *    its own disconnect takes it). The entry's row before any other
+ *    projection's, as withLockedChannelActorCapability then
+ *    lockJointProjectionWrite do.
+ * 4. The host's `servers` row FOR SHARE and the actor's host `server_members`
+ *    row FOR SHARE (channel -> server -> member,
+ *    lockServerMembershipsAfterChannel): a demotion or removal (FOR UPDATE on
+ *    the member row) can't interleave.
+ * 5. lockComputedJointActor (the same server/member rows again, the
+ *    source-exit flag, J) and the mirror's own J.
+ * 6. external_channels_v1's share lock, last and evaluated under it, as the
+ *    connect paths take it (revalidateUnderLocks): one order for that lock
+ *    and J everywhere. (The retired joint_member_connect_v1's lock sat before
+ *    J; #wg-rbac:#55.)
+ * Then everything is re-read: both projections, the participant server not
+ * deleted, the flag, the actor's role and that they can open the host's copy.
+ */
+export async function disconnectParticipantServerByHost(
+  hostChannelId: string,
+  targetServerId: string,
+  actorUserId: string,
+): Promise<{
+  jointChannelId: string;
+  canonicalChannelId: string;
+  hostServerId: string;
+  targetChannelId: string;
+}> {
+  const db = getDb();
+  const hostChannel = await getChannel(hostChannelId);
+  if (!hostChannel) throw new Error("Channel not found");
+  if (hostChannel.type !== "joint") throw new JointNotHostError();
+  const hostServerId = hostChannel.serverId;
+  await hostDisconnectBeforeLocksHookForTests?.(hostChannelId);
+
+  const now = currentDate();
+  return db.transaction(async (tx) => {
+    await tx.execute(sql`SET LOCAL lock_timeout='2s'`);
+    await tx.execute(sql`SET LOCAL statement_timeout='5s'`);
+    // Both projections of one active joint, read again under the locks below.
+    const readProjections = async () => {
+      const [host] = await tx
+        .select({ jointChannelId: jointChannelServers.jointChannelId, canonicalChannelId: jointChannels.canonicalChannelId, role: jointChannelServers.role })
+        .from(jointChannelServers)
+        .innerJoin(jointChannels, eq(jointChannels.id, jointChannelServers.jointChannelId))
+        .where(and(
+          eq(jointChannelServers.localChannelId, hostChannelId),
+          eq(jointChannelServers.serverId, hostServerId),
+          eq(jointChannelServers.status, "active"),
+          eq(jointChannels.status, "active"),
+        ));
+      if (!host || host.role !== "host") throw new JointNotHostError();
+      const [target] = await tx
+        .select({ localChannelId: jointChannelServers.localChannelId })
+        .from(jointChannelServers)
+        .innerJoin(channels, eq(channels.id, jointChannelServers.localChannelId))
+        .innerJoin(servers, eq(servers.id, jointChannelServers.serverId))
+        .where(and(
+          eq(jointChannelServers.jointChannelId, host.jointChannelId),
+          eq(jointChannelServers.serverId, targetServerId),
+          eq(jointChannelServers.role, "participant"),
+          eq(jointChannelServers.status, "active"),
+          isNull(channels.deletedAt),
+          isNull(servers.deletedAt),
+        ));
+      if (!target) throw new JointServerNotConnectedError();
+      return { host, targetChannelId: target.localChannelId };
+    };
+
+    const before = await readProjections();
+    // The order is the function comment's; every row lock precedes the first J lock.
+    // Retired or being deleted (lockJointActorFirst): as the flag off, the neutral refusal.
+    await lockJointActorFirst(tx, actorUserId).catch(unusableActorAsNotFound);
+    await tx.execute(sql`SELECT id FROM servers WHERE id IN (${hostServerId}::uuid, ${targetServerId}::uuid) ORDER BY id FOR KEY SHARE`);
+    await lockJointHumanMembershipChannel(tx, hostChannelId, "no key update");
+    await lockJointHumanMembershipChannel(tx, before.targetChannelId);
+    await tx.execute(sql`SELECT id FROM servers WHERE id=${hostServerId}::uuid FOR SHARE`);
+    await tx.execute(sql`SELECT user_id FROM server_members WHERE server_id=${hostServerId}::uuid AND user_id=${actorUserId}::uuid FOR SHARE`);
+    await lockComputedJointActor({ serverId: hostServerId, channelId: hostChannelId, actorType: "user", actorId: actorUserId }, tx);
+    // Last, after J, as every other holder takes it (revalidateUnderLocks,
+    // ADMISSION_LOCK_ORDER rule 5): a rule or kill-switch write then queues
+    // behind this transaction and never between its flag lock and its J.
+    await acquireFeatureFlagReadLock(tx, EXTERNAL_CHANNELS_FEATURE_FLAG_KEY);
+
+    // Under the locks: the joint, both projections, the flag and the actor's authority as they now are.
+    const { host, targetChannelId } = await readProjections();
+    if (targetChannelId !== before.targetChannelId) throw new JointServerNotConnectedError();
+    if (!(await evaluateFeatureFlag({ key: EXTERNAL_CHANNELS_FEATURE_FLAG_KEY, serverId: hostServerId, userId: actorUserId }, tx)).enabled) {
+      throw new Error("Channel not found");
+    }
+    const context = await resolveChannelActorContext(hostServerId, hostChannelId, "user", actorUserId, tx);
+    // Still an owner/admin of the host, still able to open its copy.
+    if (!context || !actorRoleHasServerCapability(context.serverRole, "federateChannels") || !context.canAccessChannel) {
+      throw new Error("Channel capability required");
+    }
+    // As disconnectJointChannel: the authority must be the inherited one.
+    if (context.jointAuthority && !context.jointAuthority.inherited) throw new Error("Channel capability required");
+
+    await disconnectJointProjectionInTransaction(tx, {
+      channelId: targetChannelId,
+      serverId: targetServerId,
+      projection: host,
+      disconnectedByUserId: actorUserId,
+      now,
+    });
+
+    const operationId = newAuditOperationId();
+    await recordIntegrationAuditEvents([
+      { serverId: hostServerId, channelId: hostChannelId },
+      { serverId: targetServerId, channelId: targetChannelId },
+    ].map(({ serverId, channelId }) => ({
+      serverId,
+      eventType: "channel.server_disconnected" as const,
+      outcome: "success" as const,
+      source: "web" as const,
+      actor: { type: "human" as const, id: actorUserId },
+      target: { type: "server", id: targetServerId },
+      metadata: {
+        jointChannelId: host.jointChannelId,
+        hostServerId,
+        disconnectedServerId: targetServerId,
+        channelId,
+        byHost: true,
+        ...serverAuditContextMetadata({ actorRole: context.serverRole, operationId }),
+      },
+    })), tx);
+    return { jointChannelId: host.jointChannelId, canonicalChannelId: host.canonicalChannelId, hostServerId, targetChannelId };
+  });
+}
+
+export type ServerJointConnection = {
+  channelId: string;
+  name: string;
+  role: "host" | "participant";
+  /** Humans from this server still on the local copy; 0 means nobody here can open it. */
+  memberCount: number;
+  isMember: boolean;
+  archived: boolean;
+  servers: Array<{ serverId: string; name: string; role: "host" | "participant" }>;
+};
+
+/**
+ * Every active joint copy owned by this server, for its owners and admins,
+ * including copies none of them is a member of (#raft-architecture task #22).
+ * Metadata only: no messages, members or agent activity.
+ */
+export async function listServerJointConnections(serverId: string, viewerUserId: string): Promise<ServerJointConnection[]> {
+  const db = getDb();
+  const rows = await db
+    .select({
+      jointChannelId: jointChannelServers.jointChannelId,
+      channelId: channels.id,
+      name: channels.name,
+      archivedAt: channels.archivedAt,
+      role: jointChannelServers.role,
+      memberCount: sql<number>`(SELECT count(*)::int FROM ${channelHumans} WHERE ${channelHumans.channelId} = ${channels.id})`,
+      isMember: sql<boolean>`EXISTS (SELECT 1 FROM ${channelHumans} WHERE ${channelHumans.channelId} = ${channels.id} AND ${channelHumans.userId} = ${viewerUserId})`,
+    })
+    .from(jointChannelServers)
+    .innerJoin(jointChannels, eq(jointChannels.id, jointChannelServers.jointChannelId))
+    .innerJoin(channels, eq(channels.id, jointChannelServers.localChannelId))
+    .where(and(
+      eq(jointChannelServers.serverId, serverId),
+      eq(jointChannelServers.status, "active"),
+      eq(jointChannels.status, "active"),
+      isNull(channels.deletedAt),
+      ne(channels.type, "thread"),
+    ))
+    .orderBy(asc(channels.name));
+  if (rows.length === 0) return [];
+
+  const peers = await db
+    .select({
+      jointChannelId: jointChannelServers.jointChannelId,
+      serverId: servers.id,
+      name: servers.name,
+      role: jointChannelServers.role,
+    })
+    .from(jointChannelServers)
+    .innerJoin(servers, eq(servers.id, jointChannelServers.serverId))
+    .where(and(
+      inArray(jointChannelServers.jointChannelId, [...new Set(rows.map((row) => row.jointChannelId))]),
+      eq(jointChannelServers.status, "active"),
+      isNull(servers.deletedAt),
+    ))
+    .orderBy(asc(jointChannelServers.joinedAt));
+  const peersByJoint = new Map<string, ServerJointConnection["servers"]>();
+  for (const peer of peers) {
+    const list = peersByJoint.get(peer.jointChannelId) ?? [];
+    list.push({ serverId: peer.serverId, name: peer.name, role: peer.role as "host" | "participant" });
+    peersByJoint.set(peer.jointChannelId, list);
+  }
+
+  return rows.map((row) => ({
+    channelId: row.channelId,
+    name: row.name,
+    role: row.role as "host" | "participant",
+    memberCount: Number(row.memberCount),
+    isMember: Boolean(row.isMember),
+    archived: row.archivedAt != null,
+    servers: peersByJoint.get(row.jointChannelId) ?? [],
+  }));
+}
+
+/**
+ * What removing a private channel's last member does: `delete` it (the web,
+ * after its "Leave and Delete Channel?" confirm, and an agent that passed
+ * `deleteIfLast`), or `refuse` with LastPrivateMemberError, which rolls the
+ * removal back with the transaction (an agent that didn't).
+ */
+export type LastPrivateMember = "delete" | "refuse";
+
+/** Thrown, with nothing changed (it rolls the removal back), when removing the last member would delete a private channel and the caller chose `refuse`; routes map it to 409 `last_member_deletes_channel`. */
+export class LastPrivateMemberError extends Error {
+  constructor() {
+    super("Removing the last member deletes this private channel and all its messages");
+    this.name = "LastPrivateMemberError";
+  }
+}
+
+/** Whether removing this member deleted the channel (it was private and now has no human or agent left). */
+export interface ChannelMemberRemoval {
+  channelDeleted: boolean;
+  /**
+   * Set when the person removed was a Guest of this channel: the Guest's
+   * server membership ended in the same commit (#wg-rbac:#15). The caller that
+   * owns the transaction runs finishRemovedMember after commit.
+   */
+  endedGuestMembership?: { serverId: string; effects: RemovedMemberEffects };
+}
+
+async function deletePrivateChannelIfEmpty(channelId: string, db: DatabaseExecutor = getDb(), lastMember: LastPrivateMember = "delete"): Promise<boolean> {
   const [channel] = await db
     .select({ type: channels.type, deletedAt: channels.deletedAt })
     .from(channels)
     .where(eq(channels.id, channelId));
-  if (!channel || channel.type !== "private" || channel.deletedAt) return;
+  if (!channel || channel.type !== "private" || channel.deletedAt) return false;
 
   const result = await db.execute(sql`
     SELECT
@@ -3660,11 +5258,13 @@ async function deletePrivateChannelIfEmpty(channelId: string, db: DatabaseExecut
   const [row] = result.rows as Array<{ humanCount?: number; agentCount?: number }>;
   const humanCount = row?.humanCount ?? 0;
   const agentCount = row?.agentCount ?? 0;
-  if (humanCount + agentCount > 0) return;
+  if (humanCount + agentCount > 0) return false;
+  if (lastMember === "refuse") throw new LastPrivateMemberError();
 
   await db.update(channels)
     .set({ deletedAt: currentDate() })
     .where(and(eq(channels.id, channelId), eq(channels.type, "private"), isNull(channels.deletedAt)));
+  return true;
 }
 
 /**
@@ -3679,7 +5279,8 @@ export async function getMessageStorageChannelIdWithExecutor(executor: DatabaseE
     .where(eq(channels.id, channelId))
     .limit(1);
   if (!channel) return channelId;
-  if (channel.type === "thread") {
+  // Sub-conversations (thread, task conversation): a joint local face stores in canonical.
+  if (isSubConversationType(channel.type)) {
     const jointThread = await getJointThreadProjectionByLocalThread(channelId, channel.serverId, executor);
     return jointThread?.canonicalThreadChannelId ?? channelId;
   }
@@ -3699,6 +5300,48 @@ export async function getMessageStorageChannelIdWithExecutor(executor: DatabaseE
 }
 
 /**
+ * getMessageStorageChannelIdWithExecutor for many local channels of one
+ * server at once, by the same rules: a joint channel's active projection
+ * stores in its canonical channel, a joint thread's local face in its
+ * canonical thread (the projection getJointThreadProjectionByLocalThread
+ * reads, which also gives the thread's local parent channel, as
+ * canUserAccessChannel uses it). Channels stored in themselves are absent.
+ * At most two queries, run together (joint channels, joint threads).
+ */
+export async function resolveLocalMessageStorage(
+  serverId: string,
+  channelRows: ReadonlyArray<{ id: string; type: string }>,
+  executor: DatabaseExecutor = getDb(),
+): Promise<Map<string, { storageChannelId: string; localParentChannelId?: string }>> {
+  const jointIds = channelRows.filter((row) => row.type === "joint").map((row) => row.id);
+  const threadIds = channelRows.filter((row) => row.type === "thread").map((row) => row.id);
+  const [jointRows, threadProjections] = await Promise.all([
+    jointIds.length === 0 ? [] : executor
+      .select({ localChannelId: jointChannelServers.localChannelId, canonicalChannelId: jointChannels.canonicalChannelId })
+      .from(jointChannelServers)
+      .innerJoin(jointChannels, eq(jointChannels.id, jointChannelServers.jointChannelId))
+      .where(and(
+        inArray(jointChannelServers.localChannelId, jointIds),
+        eq(jointChannelServers.serverId, serverId),
+        eq(jointChannelServers.status, "active"),
+        eq(jointChannels.status, "active"),
+      )),
+    threadIds.length === 0 ? [] : listActiveJointThreadProjectionRows({ localThreadChannelIds: threadIds, serverId }, executor),
+  ]);
+  const resolved = new Map<string, { storageChannelId: string; localParentChannelId?: string }>();
+  for (const row of jointRows) {
+    if (!resolved.has(row.localChannelId)) resolved.set(row.localChannelId, { storageChannelId: row.canonicalChannelId });
+  }
+  // Earliest-joined first, as getJointThreadProjectionByLocalThread takes the first.
+  for (const projection of threadProjections) {
+    if (!resolved.has(projection.localThreadChannelId)) {
+      resolved.set(projection.localThreadChannelId, { storageChannelId: projection.canonicalThreadChannelId, localParentChannelId: projection.localParentChannelId });
+    }
+  }
+  return resolved;
+}
+
+/**
  * A member's read position starts where they joined: everything already in the
  * conversation is read, for humans and agents alike, so "unread" is only ever
  * `seq > cursor`. Runs in the membership write's transaction. `throughSeq` defaults
@@ -3712,6 +5355,12 @@ export async function startReadPositionAtJoin(
   channelId: string,
   throughSeq?: number,
 ): Promise<void> {
+  if (principalKind === "human") {
+    const scope = (await resolveJointHumanMembershipScopes({ localChannelIds: [channelId] }, executor)).get(channelId);
+    if (scope && (await filterJointHumanMemberEntries([scope], principalId, executor)).has(channelId)) {
+      return; // Existing conversation member entering another face has not read it.
+    }
+  }
   let seq = throughSeq;
   if (seq === undefined) {
     const storageChannelId = await getMessageStorageChannelIdWithExecutor(executor, channelId);
@@ -3724,20 +5373,21 @@ export async function startReadPositionAtJoin(
   await raiseReadPositionForJoin(executor, principalKind, principalId, channelId, seq);
 }
 
+/** Thrown when someone tries to leave, or be removed from, #all; routes map it to 403. */
+export const ALL_CHANNEL_LEAVE_MESSAGE = "Cannot leave or remove from the #all channel";
+/** Thrown when an agent is removed from (or leaves) #all; routes map it to 403. */
+export const ALL_CHANNEL_REMOVE_MEMBERS_MESSAGE = "Cannot remove members from the #all channel";
+
 export async function addAgent(channelId: string, agentId: string, options: ChannelServiceOptions & { role?: "member" | "admin" } = {}): Promise<boolean> {
   if (!options.executor) {
     return withChannelWriterFence(channelId, async (tx) => {
-      if (options.actionCardMessageId) {
-        await assertActionCardWritableInTransaction(tx, options.actionCardMessageId, options.actionCardConfirmationVersion);
-      }
+      await assertChannelActionCardWritable(tx, channelId, options);
       return addAgent(channelId, agentId, { ...options, executor: tx });
     });
   }
   const db = options.executor ?? getDb();
   await assertChannelWritableInTransaction(db, channelId);
-  if (options.actionCardMessageId) {
-    await assertActionCardWritableInTransaction(db, options.actionCardMessageId, options.actionCardConfirmationVersion);
-  }
+  await assertChannelActionCardWritable(db, channelId, options);
   const [channel] = await db
     .select()
     .from(channels)
@@ -3745,7 +5395,7 @@ export async function addAgent(channelId: string, agentId: string, options: Chan
   if (!channel) {
     throw new Error("Channel not found");
   }
-  if (channel?.type === "thread") {
+  if (isSubConversationType(channel?.type)) {
     throw new Error("Thread membership is managed via follow/unfollow, not channel_agents");
   }
   const [agent] = await db
@@ -3763,6 +5413,17 @@ export async function addAgent(channelId: string, agentId: string, options: Chan
   if (isAllSystemChannel(channel)) {
     return false;
   }
+  if (channel.type === "joint") {
+    await lockJointHumanMembershipChannel(db,channelId);
+    await prepareJointHumanMembershipMirror(db,{channelIds:[channelId]},"join");
+    const scope = (await resolveJointHumanMembershipScopes({localChannelIds:[channelId]},db)).get(channelId);
+    if (!scope || !(await filterJointActiveEntries([scope],db)).has(channelId)
+      || (await filterJointPendingRemovalEntries([scope],"agent",agentId,db)).has(channelId)) throw new Error("Channel capability required");
+    // Pin J only; adding an agent must never manufacture human membership.
+  }
+  // Agent Lounge: only its own agent is ever a member (the database refuses
+  // the row too; this gives the caller a reason instead of a constraint error).
+  if (await isLoungeOutsiderAgent(channelId, agentId, db)) throw new AgentLoungeOutsiderError();
   const inserted = await db
     .insert(channelAgents)
     .values({ channelId, agentId, role: options.role ?? "member" })
@@ -3772,31 +5433,65 @@ export async function addAgent(channelId: string, agentId: string, options: Chan
   return inserted.length > 0;
 }
 
-export async function removeAgent(channelId: string, agentId: string, executor?: DatabaseExecutor): Promise<void> {
-  if (!executor) return withChannelWriterFence(channelId, tx => removeAgent(channelId, agentId, tx));
-  await assertChannelWritableInTransaction(executor, channelId);
-  const db = executor ?? getDb();
-  const channel = await getChannel(channelId, { executor: db });
-  if (channel?.type === "thread") {
-    throw new Error("Thread membership is managed via follow/unfollow, not channel_agents");
-  }
-  // Protect #all channel
-  if (channel && isAllSystemChannel(channel)) {
-    throw new Error("Cannot remove members from the #all channel");
-  }
-  await db.delete(channelAgents).where(
-    and(eq(channelAgents.channelId, channelId), eq(channelAgents.agentId, agentId))
-  );
-  await deletePrivateChannelIfEmpty(channelId, db);
+/** Agent membership is stored on its own server's local joint face. Host
+ * management must resolve that face rather than delete a host-only row. */
+export async function getJointAgentRemovalChannel(channelId: string, agentId: string, tx: DatabaseExecutor = getDb()) {
+  const channel = await getChannel(channelId, { executor: tx });
+  if (!channel || channel.type !== "joint") return channel;
+  const scope = (await resolveJointHumanMembershipScopes({ localChannelIds: [channelId] }, tx)).get(channelId);
+  if (!scope) return channel;
+  const rows = await tx.execute<{ channelId: string }>(sql`SELECT p.local_channel_id AS "channelId"
+    FROM joint_channel_servers p JOIN channel_agents ca ON ca.channel_id=p.local_channel_id
+    JOIN agents a ON a.id=ca.agent_id AND a.server_id=p.server_id
+    WHERE p.joint_channel_id=${scope.jointId}::uuid AND p.status='active' AND ca.agent_id=${agentId}::uuid LIMIT 1`);
+  return rows.rows[0] ? getChannel(rows.rows[0].channelId, { executor: tx }) : null;
 }
 
-async function getChannelAgentsRaw(channelId: string) {
-  return (await getChannelAgentsRawForChannels([channelId])).map(({ channelId: _channelId, ...agent }) => agent);
+export async function removeAgent(channelId: string, agentId: string, executor?: DatabaseExecutor, actor?: ChannelActorContext, lastMember: LastPrivateMember = "delete"): Promise<ChannelMemberRemoval> {
+  if (!executor) return withChannelWriterFence(channelId, tx => removeAgent(channelId, agentId, tx, actor, lastMember));
+  await assertChannelWritableInTransaction(executor, channelId);
+  const db = executor;
+  const channel = await getChannel(channelId, { executor: db });
+  if (isSubConversationType(channel?.type)) throw new Error("Thread membership is managed via follow/unfollow, not channel_agents");
+  if (channel && isAllSystemChannel(channel)) throw new Error(ALL_CHANNEL_REMOVE_MEMBERS_MESSAGE);
+  if (channel?.type === "joint") {
+    await lockJointHumanMembershipChannel(db, channelId);
+    if (actor) {
+      if (actor.channelId !== channelId || actor.serverId !== channel.serverId) throw new Error("Channel capability required");
+      await lockComputedJointActor({ serverId: actor.serverId, channelId, actorType: actor.actorType, actorId: actor.actorId }, db);
+      actor = await resolveChannelActorContext(actor.serverId, channelId, actor.actorType, actor.actorId, db) ?? undefined;
+      if (!actor) throw new Error("Channel capability required");
+    }
+    await prepareJointHumanMembershipMirror(db, { channelIds: [channelId] }, "remove");
+    {
+      const target = await getJointAgentRemovalChannel(channelId, agentId, db);
+      if (actor && (!channelActorHasCapability(actor, "removeChannelMembers", "agent")
+        || (!actor.jointAuthority?.isHostEntry && target && target.serverId !== actor.serverId))) throw new Error("Channel capability required");
+      if (!target) return { channelDeleted: false };
+      const scope = (await resolveJointHumanMembershipScopes({ localChannelIds: [channelId] }, db)).get(channelId)!;
+      await db.execute(sql`DELETE FROM channel_agents WHERE agent_id=${agentId}::uuid
+        AND channel_id IN (${jointConversationFamilySql(scope.jointId)})`);
+      return { channelDeleted: false };
+    }
+  }
+  await db.delete(channelAgents).where(and(eq(channelAgents.channelId, channelId), eq(channelAgents.agentId, agentId)));
+  return { channelDeleted: await deletePrivateChannelIfEmpty(channelId, db, lastMember) };
 }
+
+async function getChannelAgentsRaw(channelId: string, onlyIds?: readonly string[]) {
+  return (await getChannelAgentsRawForChannels([channelId], { onlyIds })).map(({ channelId: _channelId, ...agent }) => agent);
+}
+
+/**
+ * Members a roster read is narrowed to (GET /api/sync/changes rebuilding
+ * changed member rows): only these ids of each kind; a kind left out reads
+ * none. Absent = the whole roster.
+ */
+export type ChannelMemberFilter = { userIds: readonly string[]; agentIds: readonly string[] };
 
 /** getChannelAgentsRaw for several channels in one query; rows carry their channelId. */
-async function getChannelAgentsRawForChannels(channelIds: readonly string[], options: { name?: string; id?: string } = {}) {
-  if (channelIds.length === 0) return [];
+async function getChannelAgentsRawForChannels(channelIds: readonly string[], options: { name?: string; id?: string; onlyIds?: readonly string[] } = {}) {
+  if (channelIds.length === 0 || options.onlyIds?.length === 0) return [];
   const db = getDb();
   return db
     .select({
@@ -3826,8 +5521,10 @@ async function getChannelAgentsRawForChannels(channelIds: readonly string[], opt
     .where(and(
       inArray(channelAgents.channelId, [...channelIds]),
       isNull(agents.deletedAt),
+      activeAppBotOrOrdinaryAgent(),
       options.name === undefined ? undefined : eq(agents.name, options.name),
       options.id === undefined ? undefined : eq(agents.id, options.id),
+      options.onlyIds === undefined ? undefined : inArray(agents.id, [...options.onlyIds]),
     ))
     .orderBy(asc(channelAgents.addedAt));
 }
@@ -3836,9 +5533,11 @@ async function getChannelAgentsRawForChannels(channelIds: readonly string[], opt
  * The full agent audience of a server. This is the effective agent membership
  * of an enabled virtual `#all` channel: in the pre-virtualization model every
  * active agent had a real `channel_agents` row in `#all`, so the audience is
- * every active (non-deleted) agent on the server.
+ * every active (non-deleted) agent on the server, less removed App Bots and
+ * personal assistants (listedServerAgent).
  */
-async function getServerAudienceAgents(serverId: string, options: { name?: string } = {}) {
+async function getServerAudienceAgents(serverId: string, options: { name?: string; onlyIds?: readonly string[] } = {}) {
+  if (options.onlyIds?.length === 0) return [];
   const db = getDb();
   return db
     .select({
@@ -3856,9 +5555,33 @@ async function getServerAudienceAgents(serverId: string, options: { name?: strin
     .where(and(
       eq(agents.serverId, serverId),
       isNull(agents.deletedAt),
+      listedServerAgent(),
       options.name === undefined ? undefined : eq(agents.name, options.name),
+      options.onlyIds === undefined ? undefined : inArray(agents.id, [...options.onlyIds]),
     ))
     .orderBy(asc(agents.createdAt));
+}
+
+/**
+ * The channels whose member list shows this agent while
+ * activeAppBotOrOrdinaryAgent passes: the listable ones it has a membership
+ * row in, and its server's enabled `#all`. A removed App Bot keeps its rows,
+ * so removing or re-adding it changes these lists without a membership write;
+ * callers use this to tell open clients which lists to re-read.
+ */
+export async function getListableChannelsListingAgent(serverId: string, agentId: string): Promise<Array<{ id: string; type: string }>> {
+  return getDb()
+    .select({ id: channels.id, type: channels.type })
+    .from(channels)
+    .where(and(
+      eq(channels.serverId, serverId),
+      isNull(channels.deletedAt),
+      inArray(channels.type, LISTABLE_CHANNEL_TYPES),
+      or(
+        sql`exists (select 1 from ${channelAgents} where ${channelAgents.channelId} = ${channels.id} and ${channelAgents.agentId} = ${agentId})`,
+        and(eq(channels.name, SYSTEM_ALL_CHANNEL_KEY), eq(channels.type, "channel")),
+      ),
+    ));
 }
 
 /**
@@ -3874,11 +5597,25 @@ export async function getChannelAgents(channelId: string) {
   if (channel && isEnabledAllChannel(channel)) {
     return getServerAudienceAgents(channel.serverId);
   }
+  if(channel?.type==="joint") {
+    const db=getDb();
+    const scope=(await resolveJointHumanMembershipScopes({localChannelIds:[channelId]},db)).get(channelId);
+    if(!scope || !(await filterJointActiveEntries([scope],db)).has(channelId)) return [];
+    const rows=await getChannelAgentsRaw(channelId);
+    const denied=await db.execute<{id:string}>(sql`SELECT jmr.agent_id id FROM joint_membership_removals jmr
+      JOIN joint_membership_departures jmd ON jmd.id=jmr.departure_id
+      WHERE jmd.completed_at IS NULL AND jmd.joint_channel_id=${scope.jointId}::uuid AND jmr.remove_membership AND jmr.agent_id IS NOT NULL`);
+    const deniedIds=new Set(denied.rows.map(row=>row.id));
+    return rows.filter(row=>!deniedIds.has(row.id));
+  }
   return getChannelAgentsRaw(channelId);
 }
 
 export async function getAgentChannels(agentId: string, viewerUserId: string) {
   const db = getDb();
+  const memberChannels = await db.select({id: channelAgents.channelId}).from(channelAgents)
+    .where(eq(channelAgents.agentId, agentId));
+  const jointPermission = await resolveJointHumanEntrySql({localChannelIds: memberChannels.map(row => row.id)}, db);
   const viewerMembership = alias(channelHumans, "viewer_agent_channel_membership");
   const rows = await db
     .select({
@@ -3901,7 +5638,12 @@ export async function getAgentChannels(agentId: string, viewerUserId: string) {
         inArray(channels.type, LISTABLE_CHANNEL_TYPES),
         or(
           eq(channels.type, "channel"),
-          isNotNull(viewerMembership.userId),
+          and(ne(channels.type, "joint"), isNotNull(viewerMembership.userId)),
+          and(eq(channels.type, "joint"), jointPermission(channels.id, sql`${viewerUserId}::uuid`),
+            sql`EXISTS (SELECT 1 FROM agents a WHERE a.id=${agentId}::uuid
+              AND a.server_id=${channels.serverId} AND a.deleted_at IS NULL)`,
+            sql`NOT EXISTS (SELECT 1 FROM joint_channel_servers p WHERE p.local_channel_id=${channels.id}
+              AND ${jointMembershipRemovalPendingSql(sql`p.joint_channel_id`, "agent", sql`${agentId}::uuid`)})`),
         ),
         isNull(channels.deletedAt)
       )
@@ -3910,7 +5652,40 @@ export async function getAgentChannels(agentId: string, viewerUserId: string) {
   return attachActivityMuteState(rows, "agent", agentId);
 }
 
-export async function listChannelsForAgent(serverId: string, agentId: string) {
+let lastPostsBackfilledAt = 0;
+let lastPostsBackfilledCheckedAt = 0;
+
+/** Whether scripts/backfill-channel-last-posts.ts has completed (cached; a false is rechecked once a minute). */
+async function channelLastPostsBackfilled(): Promise<boolean> {
+  if (lastPostsBackfilledAt) return true;
+  if (Date.now() - lastPostsBackfilledCheckedAt < 60_000) return false;
+  lastPostsBackfilledCheckedAt = Date.now();
+  const [row] = await getDb().select({ at: channelLastPostsBackfill.completedAt }).from(channelLastPostsBackfill).limit(1);
+  if (row) lastPostsBackfilledAt = row.at.getTime();
+  return !!row;
+}
+
+/** Test seam: forget the cached backfill state. */
+export function __resetChannelLastPostsBackfillCacheForTests(): void {
+  lastPostsBackfilledAt = 0;
+  lastPostsBackfilledCheckedAt = 0;
+}
+
+/**
+ * Which channels an agent's directory covers: live ones (the default, what
+ * `server.info` lists), or only archived ones (read-only; `server info
+ * --channels --archived`). Either way the same visibility applies: public
+ * channels, plus private / joint ones the agent can access.
+ */
+export type AgentChannelDirectoryScope = "live" | "archived";
+
+/**
+ * The channels of one directory scope the agent can see, and what decided it:
+ * public channels (not another agent's lounge), plus private / joint / DM ones
+ * it is in (a joint one only while it can access it). Shared by the listing
+ * and the archived count so the two never disagree on visibility.
+ */
+async function visibleAgentDirectoryRows(serverId: string, agentId: string, scope: AgentChannelDirectoryScope) {
   const db = getDb();
   const memberships = await db
     .select({
@@ -3932,22 +5707,111 @@ export async function listChannelsForAgent(serverId: string, agentId: string) {
       eq(channels.serverId, serverId),
       inArray(channels.type, LISTABLE_CHANNEL_TYPES),
       isNull(channels.deletedAt),
-      isNull(channels.archivedAt),
+      scope === "archived" ? isNotNull(channels.archivedAt) : isNull(channels.archivedAt),
     ))
     .orderBy(asc(channels.createdAt));
 
-  const visibleChannels = list
-    .filter((ch) => !requiresExplicitMembership(ch.type) || joinedSet.has(ch.id))
-    .map((ch) => {
+  const jointContexts = await resolveChannelActorContextsMany(serverId,list.filter(row=>row.type==="joint").map(row=>row.id),"agent",agentId,db);
+  for (const channel of list) {
+    if (channel.type === "joint" && !jointContexts.get(channel.id)?.canAccessChannel) joinedSet.delete(channel.id);
+  }
+  // Agent Lounge: another agent's lounge is readable but never listed (not
+  // guided there, #proj-chat:30a58e4d); its own agent is a member and sees it.
+  const loungeIds = new Set((await db.select({ channelId: agentLounges.channelId })
+    .from(agentLounges)
+    .where(eq(agentLounges.serverId, serverId))).map((row) => row.channelId));
+  const listed = list.filter((ch) => (!requiresExplicitMembership(ch.type) && !loungeIds.has(ch.id)) || joinedSet.has(ch.id));
+  return { db, listed, joinedSet, membershipByChannel, agentServerMembership, jointContexts };
+}
+
+/**
+ * How many archived channels the agent can see (`server.info`
+ * archivedChannelCount): the same rule as `visibleAgentDirectoryRows` with
+ * scope archived, as one count. Public channels (not another agent's
+ * lounge) and private ones it is in are counted in SQL; a joint one it is in
+ * also needs its access resolved, so those few rows go through the same
+ * resolver the listing uses.
+ */
+export async function countArchivedChannelsForAgent(serverId: string, agentId: string): Promise<number> {
+  const db = getDb();
+  const isMember = sql`exists (select 1 from ${channelAgents} where ${channelAgents.channelId} = ${channels.id} and ${channelAgents.agentId} = ${agentId})`;
+  const isLounge = sql`exists (select 1 from ${agentLounges} where ${agentLounges.channelId} = ${channels.id})`;
+  const archivedHere = and(
+    eq(channels.serverId, serverId),
+    isNull(channels.deletedAt),
+    isNotNull(channels.archivedAt),
+  );
+  const [plain] = await db
+    .select({ count: sql<number>`count(*)::int` })
+    .from(channels)
+    .where(and(
+      archivedHere,
+      or(
+        and(eq(channels.type, "channel"), sql`not ${isLounge}`),
+        and(inArray(channels.type, ["channel", "private"]), isMember),
+      ),
+    ));
+  const jointIds = (await db
+    .select({ id: channels.id })
+    .from(channels)
+    .where(and(archivedHere, eq(channels.type, "joint"), isMember))).map((row) => row.id);
+  if (jointIds.length === 0) return plain?.count ?? 0;
+  const jointContexts = await resolveChannelActorContextsMany(serverId, jointIds, "agent", agentId, db);
+  return (plain?.count ?? 0) + jointIds.filter((id) => jointContexts.get(id)?.canAccessChannel).length;
+}
+
+export async function listChannelsForAgent(serverId: string, agentId: string, options: { scope?: AgentChannelDirectoryScope } = {}) {
+  const scope = options.scope ?? "live";
+  const { db, listed, membershipByChannel, agentServerMembership, jointContexts } = await visibleAgentDirectoryRows(serverId, agentId, scope);
+  // When a person or an agent last posted there (thread replies included); null: no posts yet.
+  // Left out until the one-time backfill has run: before that, no row is not "no posts".
+  const lastPostKnown = await channelLastPostsBackfilled();
+  // A joint projection's posts are stored in its canonical channel (the same
+  // mapping as resolveLocalMessageStorage: an active projection, type joint),
+  // so they are on the canonical row. Its own row holds only posts from before
+  // it was converted from a regular channel (moved, so no trigger wrote them
+  // to the canonical row): the later of the two.
+  const canonicalLastPosts = alias(channelLastPosts, "canonical_last_posts");
+  const lastPosts = listed.length === 0 || !lastPostKnown ? [] : await db
+    .select({
+      channelId: channels.id,
+      lastPostAt: sql<Date>`greatest(${channelLastPosts.lastPostAt}, ${canonicalLastPosts.lastPostAt})`.mapWith(channelLastPosts.lastPostAt),
+    })
+    .from(channels)
+    .leftJoin(jointChannelServers, and(
+      eq(jointChannelServers.localChannelId, channels.id),
+      eq(channels.type, "joint"),
+      eq(jointChannelServers.serverId, serverId),
+      eq(jointChannelServers.status, "active"),
+    ))
+    .leftJoin(jointChannels, and(eq(jointChannels.id, jointChannelServers.jointChannelId), eq(jointChannels.status, "active")))
+    .leftJoin(channelLastPosts, eq(channelLastPosts.channelId, channels.id))
+    .leftJoin(canonicalLastPosts, eq(canonicalLastPosts.channelId, jointChannels.canonicalChannelId))
+    .where(and(
+      inArray(channels.id, listed.map((ch) => ch.id)),
+      or(isNotNull(channelLastPosts.channelId), isNotNull(canonicalLastPosts.channelId)),
+    ));
+  const lastPostByChannel = new Map(lastPosts.map((row) => [row.channelId, row.lastPostAt.toISOString()]));
+  // `taskId` (task v2) is NULL on every listable channel, and
+  // `taskNumberHighWater` is the task number allocator's bookkeeping; keep both
+  // out of the agent-facing directory so its shape is unchanged. So is the
+  // stored announcement id: the serverInfo route adds the resolved
+  // `announcement` (channelAnnouncements.ts) while channel_announcement_v0 is on.
+  const visibleChannels = listed
+    .map(({ taskId: _taskId, taskNumberHighWater: _taskNumberHighWater, announcementArtifactId: _announcementArtifactId, ...ch }) => {
+      const jointContext = jointContexts.get(ch.id);
       const membership = membershipByChannel.get(ch.id);
       const joined = isEnabledAllChannel(ch) || Boolean(membership);
       const supportsChannelRoles = channelSupportsRoles(ch.type, ch.name) && !isAllSystemChannel(ch);
       return {
         ...ch,
         joined,
+        // Only on archived rows: live rows stay as they were (no "not archived" on every line).
+        ...(ch.archivedAt !== null ? { archived: true as const } : {}),
+        ...(lastPostKnown ? { lastPostAt: lastPostByChannel.get(ch.id) ?? null } : {}),
         channelRole: membership?.role ?? null,
         channelAuthorityRevision: membership?.authorityRevision ?? null,
-        channelAdminBasis: getChannelAdminBasis({
+        channelAdminBasis: jointContext?.jointAuthority ? jointContext.channelAdminBasis : getChannelAdminBasis({
           serverRole: agentServerMembership?.role ?? null,
           channelRole: membership?.role ?? null,
           isChannelMember: Boolean(membership),
@@ -3955,7 +5819,9 @@ export async function listChannelsForAgent(serverId: string, agentId: string) {
         }),
         channelCapabilities: Object.fromEntries(CHANNEL_MANAGEMENT_CAPABILITIES.map((capability) => [
           capability,
-          capability === "addChannelMembers"
+          // An archived channel is read-only: of the management actions only
+          // unarchiving (the archive capability) still applies; the rest are refused (409 channel_archived).
+          ch.archivedAt !== null && capability !== "archiveChannels" ? false : jointContext?.jointAuthority ? channelActorHasCapability(jointContext,capability) : capability === "addChannelMembers"
             ? canAddChannelMembers({
                 serverRole: agentServerMembership?.role ?? null,
                 admissionClass: "current_member",
@@ -3981,12 +5847,12 @@ export async function listChannelsForAgent(serverId: string, agentId: string) {
   // exact registry-derived rows for this authenticated agent. This keeps
   // arbitrary DMs and test-catalog app names out of the channel directory and
   // writable target surface.
-  const installedApps = await listInstalledRapApps(serverId);
+  const installedApps = scope === "archived" ? [] : await listInstalledRapApps(serverId);
   const builtInDmChannels = (await Promise.all(installedApps.map((app) =>
     getBuiltInConversationChannel(serverId, app.appId, agentId)
   )))
     .filter((channel): channel is NonNullable<typeof channel> => channel !== null)
-    .map((channel) => ({ ...channel, joined: true }));
+    .map(({ taskId: _taskId, taskNumberHighWater: _taskNumberHighWater, announcementArtifactId: _announcementArtifactId, ...channel }) => ({ ...channel, joined: true }));
   const visibleWithMuteState = await attachActivityMuteState(visibleChannels, "agent", agentId);
   const builtInDmWithoutMuteSurface = builtInDmChannels.map((channel) => ({
     ...channel,
@@ -4033,6 +5899,8 @@ export type DMChannel = {
 interface DMChannelListOptions {
   traceQuery?: DbQueryTracer;
   humanActivityMuteEnabled?: boolean;
+  /** Only these DMs (GET /api/sync/changes): the same rows the full list holds for them. */
+  channelIds?: readonly string[];
 }
 
 /**
@@ -4152,6 +6020,71 @@ export async function getReadableDMChannelForUser(channelId: string, currentUser
 }
 
 /**
+ * getReadableDMChannelForUser's `peerName` for many DM channels at once, in
+ * at most four queries however many channels: the same rules (an agent
+ * member first, else the durable identity: self, the other human, or a
+ * deleted agent of the channel's server). Absent where it would answer null.
+ */
+export async function getReadableDMPeerNamesForUser(channelIds: readonly string[], currentUserId: string): Promise<Map<string, string>> {
+  return new Map([...(await getReadableDMPeersForUser(channelIds, currentUserId))].map(([id, peer]) => [id, peer.name]));
+}
+
+/** getReadableDMPeerNamesForUser with each peer's display name too (null when it has none), as the sidebar labels the DM. */
+export async function getReadableDMPeersForUser(channelIds: readonly string[], currentUserId: string): Promise<Map<string, { type: "user" | "agent"; id: string; name: string; displayName: string | null }>> {
+  const names = new Map<string, { type: "user" | "agent"; id: string; name: string; displayName: string | null }>();
+  if (channelIds.length === 0) return names;
+  const db = getDb();
+  const agentPeers = await db
+    .select({ id: channels.id, agentId: channelAgents.agentId, peerName: sql<string>`COALESCE(${agents.name}, ${channels.name}, 'Agent')`, peerDisplayName: agents.displayName })
+    .from(channels)
+    .innerJoin(channelAgents, eq(channels.id, channelAgents.channelId))
+    .leftJoin(agents, eq(channelAgents.agentId, agents.id))
+    .innerJoin(channelHumans, and(eq(channels.id, channelHumans.channelId), eq(channelHumans.userId, currentUserId)))
+    .where(and(inArray(channels.id, [...channelIds]), eq(channels.type, "dm")));
+  for (const row of agentPeers) if (!names.has(row.id)) names.set(row.id, { type: "agent", id: row.agentId, name: row.peerName, displayName: row.peerDisplayName ?? null });
+
+  const rest = channelIds.filter((id) => !names.has(id));
+  if (rest.length === 0) return names;
+  const identities = await db
+    .select({ id: channels.id, serverId: channels.serverId, kind: dmChannelIdentities.kind, peerKey: dmChannelIdentities.peerKey })
+    .from(dmChannelIdentities)
+    .innerJoin(channels, and(eq(channels.id, dmChannelIdentities.channelId), eq(channels.serverId, dmChannelIdentities.serverId)))
+    .innerJoin(channelHumans, and(eq(channels.id, channelHumans.channelId), eq(channelHumans.userId, currentUserId)))
+    .where(and(inArray(channels.id, rest), eq(channels.type, "dm")));
+  const userPeer = new Map<string, string>();
+  const agentPeer = new Map<string, { agentId: string; serverId: string }>();
+  for (const identity of identities) {
+    const participantIds = identity.peerKey.split(":");
+    if (!participantIds.includes(currentUserId)) continue;
+    const other = participantIds.find((id) => id !== currentUserId);
+    if (identity.kind === "human_self") {
+      if (participantIds.length === 1) userPeer.set(identity.id, currentUserId);
+    } else if (identity.kind === "human_human") {
+      if (participantIds.length === 2 && other) userPeer.set(identity.id, other);
+    } else if (identity.kind === "human_agent") {
+      if (participantIds.length === 2 && other) agentPeer.set(identity.id, { agentId: other, serverId: identity.serverId });
+    }
+  }
+  const userIds = [...new Set(userPeer.values())];
+  const agentIds = [...new Set([...agentPeer.values()].map((peer) => peer.agentId))];
+  const [userRows, agentRows] = await Promise.all([
+    userIds.length > 0 ? db.select({ id: users.id, name: users.name, displayName: users.displayName }).from(users).where(inArray(users.id, userIds)) : [],
+    agentIds.length > 0 ? db.select({ id: agents.id, serverId: agents.serverId, name: agents.name, displayName: agents.displayName }).from(agents).where(inArray(agents.id, agentIds)) : [],
+  ]);
+  const userOf = new Map(userRows.map((row) => [row.id, row]));
+  const agentOf = new Map(agentRows.map((row) => [row.id, row]));
+  for (const [channelId, userId] of userPeer) {
+    const row = userOf.get(userId);
+    if (row?.name != null) names.set(channelId, { type: "user", id: row.id, name: row.name, displayName: row.displayName ?? null });
+  }
+  for (const [channelId, peer] of agentPeer) {
+    const row = agentOf.get(peer.agentId);
+    if (row && row.serverId === peer.serverId) names.set(channelId, { type: "agent", id: row.id, name: row.name, displayName: row.displayName ?? null });
+  }
+  return names;
+}
+
+/**
  * Select a DM channel with its peer info (user-DM, peer = the other user).
  */
 async function selectDMWithUserPeer(
@@ -4174,7 +6107,7 @@ async function selectDMWithUserPeer(
   if (!otherUserId) return null;
 
   const [peer] = await db
-    .select({ id: users.id, name: users.name, displayName: users.displayName, description: users.description, email: users.email, avatarUrl: users.avatarUrl })
+    .select({ id: users.id, name: users.name, displayName: users.displayName, description: users.description, avatarUrl: users.avatarUrl })
     .from(users)
     .where(eq(users.id, otherUserId));
   if (!peer) return null;
@@ -4194,7 +6127,7 @@ async function selectDMWithUserPeer(
     peerDisplayName: peer.displayName,
     peerDescription: peer.description,
     peerAvatarUrl: peer.avatarUrl,
-    peerGravatarHash: createHash("sha256").update(peer.email.trim().toLowerCase()).digest("hex"),
+    peerGravatarHash: DEPRECATED_GRAVATAR_HASH,
   };
 }
 
@@ -4202,6 +6135,63 @@ async function selectDMWithUserPeer(
  * Find or create a DM channel between a user and an agent.
  * Returns unified peer format.
  */
+/** The live DM between two people, without creating one. */
+export async function findHumanHumanDmChannelId(serverId: string, userId: string, otherUserId: string): Promise<string | null> {
+  if (userId === otherUserId) return null;
+  const [row] = await getDb()
+    .select({ id: channels.id })
+    .from(dmChannelIdentities)
+    .innerJoin(channels, eq(channels.id, dmChannelIdentities.channelId))
+    .where(and(
+      eq(dmChannelIdentities.serverId, serverId),
+      eq(channels.type, "dm"),
+      isNull(channels.deletedAt),
+      eq(dmChannelIdentities.kind, "human_human"),
+      eq(dmChannelIdentities.peerKey, dmIdentityKey([userId, otherUserId])),
+    ))
+    .orderBy(asc(channels.createdAt), asc(channels.id))
+    .limit(1);
+  return row?.id ?? null;
+}
+
+/** The live DM between this person and this agent, without creating one. */
+export async function findHumanAgentDmChannelId(serverId: string, userId: string, agentId: string): Promise<string | null> {
+  const [row] = await getDb()
+    .select({ id: channels.id })
+    .from(dmChannelIdentities)
+    .innerJoin(channels, eq(channels.id, dmChannelIdentities.channelId))
+    .where(and(
+      eq(dmChannelIdentities.serverId, serverId),
+      eq(channels.type, "dm"),
+      isNull(channels.deletedAt),
+      eq(dmChannelIdentities.kind, "human_agent"),
+      eq(dmChannelIdentities.peerKey, dmIdentityKey([userId, agentId])),
+    ))
+    .orderBy(asc(channels.createdAt), asc(channels.id))
+    .limit(1);
+  return row?.id ?? null;
+}
+
+// Identity reuse repairs legacy departures that removed channel_humans.
+// Select from current server membership so absent peers are never re-enrolled.
+// Conflict-do-nothing preserves an existing participant's role/join timestamp;
+// read cursors and inbox/display state are deliberately independent.
+async function restoreDmHumanParticipants(
+  tx: DatabaseExecutor,
+  serverId: string,
+  channelId: string,
+  userIds: readonly string[],
+): Promise<void> {
+  await tx.execute(sql`
+    INSERT INTO ${channelHumans} (channel_id, user_id)
+    SELECT ${channelId}::uuid, ${serverMembers.userId}
+    FROM ${serverMembers}
+    WHERE ${serverMembers.serverId} = ${serverId}
+      AND ${inArray(serverMembers.userId, [...new Set(userIds)])}
+    ON CONFLICT (channel_id, user_id) DO NOTHING
+  `);
+}
+
 export async function findOrCreateDM(serverId: string, userId: string, agentId: string): Promise<DMChannel | null> {
   const identityKind: DmIdentityKind = "human_agent";
   const identityKey = dmIdentityKey([userId, agentId]);
@@ -4239,6 +6229,7 @@ export async function findOrCreateDM(serverId: string, userId: string, agentId: 
         if (identified.deletedAt) {
           await tx.update(channels).set({ deletedAt: null }).where(eq(channels.id, identified.id));
         }
+        await restoreDmHumanParticipants(tx, serverId, identified.id, [userId]);
         return identified.id;
       }
 
@@ -4335,6 +6326,7 @@ export async function findOrCreateUserDM(
           if (existing.deletedAt) {
             await tx.update(channels).set({ deletedAt: null }).where(eq(channels.id, existing.id));
           }
+          await restoreDmHumanParticipants(tx, serverId, existing.id, [userId1]);
           return existing.id;
         }
 
@@ -4385,6 +6377,7 @@ export async function findOrCreateUserDM(
         if (identified.deletedAt) {
           await tx.update(channels).set({ deletedAt: null }).where(eq(channels.id, identified.id));
         }
+        await restoreDmHumanParticipants(tx, serverId, identified.id, [userId1, userId2]);
         return identified.id;
       }
 
@@ -4573,8 +6566,14 @@ export async function listDMChannels(
   userId: string,
   opts?: DMChannelListOptions,
 ): Promise<DMChannel[]> {
+  // Read beside the list's own queries, not after them (bootstrap path). An
+  // early return never awaits it: a failure then is not an unhandled rejection.
+  const historyCutoffPending = getServerPlan(serverId).then((plan) => getHistoryCutoff(plan));
+  historyCutoffPending.catch(() => {});
   const db = getDb();
   const traceQuery = opts?.traceQuery ?? untracedDbQuery;
+  if (opts?.channelIds && opts.channelIds.length === 0) return [];
+  const onlyIds = opts?.channelIds ? inArray(channels.id, [...new Set(opts.channelIds)]) : undefined;
 
   // The user's DMs with each peer, in one statement: agent DMs (the channel
   // has an agent), user DMs (no agent; the peer is the other human) and
@@ -4594,8 +6593,9 @@ export async function listDMChannels(
       peerName: agents.name,
       peerDisplayName: agents.displayName,
       peerDescription: agents.description,
-      peerEmail: sql<string | null>`null`.as("peer_email"),
       peerAvatarUrl: agents.avatarUrl,
+      // The agent is live (deletedAt below), so this is isAppBotAgent.
+      peerIsAppBot: sql<boolean>`${agents.managedByAppInstallId} is not null`.as("peer_is_app_bot"),
     })
     .from(channels)
     .innerJoin(channelAgents, eq(channels.id, channelAgents.channelId))
@@ -4607,6 +6607,7 @@ export async function listDMChannels(
       eq(channelHumans.userId, userId),
       isNull(channels.deletedAt),
       isNull(agents.deletedAt),
+      onlyIds,
     ));
   const userDMs = db
     .select({
@@ -4620,8 +6621,8 @@ export async function listDMChannels(
       peerName: users.name,
       peerDisplayName: users.displayName,
       peerDescription: users.description,
-      peerEmail: sql<string | null>`${users.email}`.as("peer_email"),
       peerAvatarUrl: users.avatarUrl,
+      peerIsAppBot: sql<boolean>`false`.as("peer_is_app_bot"),
     })
     .from(channels)
     .innerJoin(channelHumans, and(eq(channels.id, channelHumans.channelId), eq(channelHumans.userId, userId)))
@@ -4634,6 +6635,7 @@ export async function listDMChannels(
       isNull(channels.deletedAt),
       isNull(channelAgents.agentId), // No agent = user-DM
       ne(otherHuman.userId, userId), // the peer, not the current user
+      onlyIds,
     ));
   const selfDMs = db
     .select({
@@ -4647,8 +6649,8 @@ export async function listDMChannels(
       peerName: users.name,
       peerDisplayName: users.displayName,
       peerDescription: users.description,
-      peerEmail: sql<string | null>`${users.email}`.as("peer_email"),
       peerAvatarUrl: users.avatarUrl,
+      peerIsAppBot: sql<boolean>`false`.as("peer_is_app_bot"),
     })
     .from(channels)
     .innerJoin(dmChannelIdentities, and(
@@ -4666,6 +6668,7 @@ export async function listDMChannels(
       isNull(channels.deletedAt),
       isNull(channelAgents.agentId),
       sql`(SELECT count(*) FROM channel_humans WHERE channel_id = ${channels.id}) = 1`,
+      onlyIds,
     ));
   const [serverRole, peerDMRows] = await Promise.all([
     resolveHumanServerRole(serverId, userId),
@@ -4679,21 +6682,21 @@ export async function listDMChannels(
       }),
     ),
   ]);
-  if (serverRole === "guest" && !await isGuestFeatureEnabled(serverId, userId)) return [];
+  // A Guest has no DMs (#wg-rbac:#15).
+  if (serverRole === null || serverRole === "guest") return [];
 
-  const gravatarHash = (email: string | null) =>
-    email === null ? null : createHash("sha256").update(email.trim().toLowerCase()).digest("hex");
   // Agent DMs first, then user DMs, then self DMs (the order the sort below
   // breaks ties in).
   const kindOrder = { agent: 0, user: 1, self: 2 } as const;
   const allDMs: DMChannel[] = peerDMRows
     .map((row, index) => ({ row, index }))
     .sort((a, b) => kindOrder[a.row.peerKind] - kindOrder[b.row.peerKind] || a.index - b.index)
-    .map(({ row: { peerKind, peerEmail, ...row } }) => ({
+    .map(({ row: { peerKind, peerIsAppBot: _peerIsAppBot, ...row } }) => ({
       ...row,
-      peerGravatarHash: gravatarHash(peerEmail),
+      peerGravatarHash: peerKind === "agent" ? null : DEPRECATED_GRAVATAR_HASH,
       peerType: peerKind === "agent" ? "agent" as const : "user" as const,
     }));
+  const appBotDmIds = new Set(peerDMRows.filter((row) => row.peerIsAppBot).map((row) => row.id));
 
   // Sort by most recent message first, then by createdAt for DMs with no messages
   if (allDMs.length === 0) return allDMs;
@@ -4702,18 +6705,32 @@ export async function listDMChannels(
   // Each attach step reads its own table for the same rows; they run side by
   // side (at most LIST_ATTACH_CONCURRENCY at once) and are merged per row.
   const limit = createConcurrencyLimiter(LIST_ATTACH_CONCURRENCY);
-  const [withMute, withDisplayPrefs, withReadState, withLastMessage] = await Promise.all([
-    limit(() => attachActivityMuteState(allDMs, "user", userId, humanActivityMuteEnabled)),
+  // Agent Lounge: the agent's lounge rides on its DM row (only once one
+  // exists); the web keeps it under the DM. Unread comes from the unread
+  // summary by its channelId, as for any channel.
+  const [withMute, withDisplayPrefs, withReadState, withLastMessage, lounges] = await Promise.all([
+    limit(() => attachActivityMuteState(allDMs, "user", userId, humanActivityMuteEnabled, appBotDmIds)),
     limit(() => attachUserChannelDisplayPrefs(allDMs, userId)),
     limit(() => attachReadState(allDMs, userId)),
-    limit(() => attachLastMessageSummary(allDMs, traceQuery, "dm_channels.last_messages_by_channels", "dm_channels_count")),
+    limit(async () => attachLastMessageSummary(
+      allDMs,
+      traceQuery,
+      "dm_channels.last_messages_by_channels",
+      "dm_channels_count",
+      await historyCutoffPending,
+    )),
+    limit(() => loungeSummariesForAgents(allDMs.filter((dm) => dm.peerType === "agent").map((dm) => dm.peerId), userId)),
   ]);
-  const allDmsWithLastMessageSummary = allDMs.map((_dm, index) => ({
-    ...withMute[index]!,
-    ...withDisplayPrefs[index]!,
-    ...withReadState[index]!,
-    ...withLastMessage[index]!,
-  }));
+  const allDmsWithLastMessageSummary = allDMs.map((dm, index) => {
+    const lounge = dm.peerType === "agent" ? lounges.get(dm.peerId) : undefined;
+    return {
+      ...withMute[index]!,
+      ...withDisplayPrefs[index]!,
+      ...withReadState[index]!,
+      ...withLastMessage[index]!,
+      ...(lounge ? { lounge } : {}),
+    };
+  });
 
   return allDmsWithLastMessageSummary.sort((a, b) => {
     const aLast = a.lastMessageAt;
@@ -4834,6 +6851,8 @@ export interface AgentConversationSummary {
  * Human DMs are explicitly excluded.
  */
 export async function listAgentToAgentDMsForAgent(serverId: string, agentId: string): Promise<AgentConversationSummary[]> {
+  const historyCutoffPending = getServerPlan(serverId).then((plan) => getHistoryCutoff(plan));
+  historyCutoffPending.catch(() => {});
   const db = getDb();
   const otherAgentMembership = alias(channelAgents, "other_agent_membership");
 
@@ -4873,6 +6892,7 @@ export async function listAgentToAgentDMsForAgent(serverId: string, agentId: str
     .where(inArray(messages.channelId, rows.map((row) => row.id)))
     .orderBy(desc(messages.createdAt));
 
+  const historyCutoff = await historyCutoffPending;
   const latestByChannel = new Map<string, { content: string; createdAt: Date }>();
   for (const message of lastMessages) {
     if (message.messageType === "system") continue;
@@ -4892,7 +6912,10 @@ export async function listAgentToAgentDMsForAgent(serverId: string, agentId: str
         peerDisplayName: row.peerDisplayName,
         peerAvatarUrl: row.peerAvatarUrl,
         lastMessageAt: latest?.createdAt ?? null,
-        lastMessagePreview: latest?.content ?? null,
+        // Behind the plan's history window: 40 characters (services/historyWindow.ts).
+        lastMessagePreview: latest && historyCutoff && latest.createdAt <= historyCutoff
+          ? historyLimitedPreview(latest.content)
+          : latest?.content ?? null,
       };
     })
     .sort((a, b) => {
@@ -4918,6 +6941,28 @@ export async function listAgentToAgentDMsForAgent(serverId: string, agentId: str
  * user-auth paths. Callers must now assert the active server explicitly.
  * See #proj-security task #10 (2026-04-19).
  */
+/**
+ * P3 (guests in joint channels): of `candidates`, the joint channel a Guest of
+ * `serverId` enters. Only its bound channel can qualify, and only when that is
+ * the HOST's own projection, the host has external_channels_v1 on, no removal
+ * of the guest is pending, and the guest is a current joint member: its
+ * joint_channel_members row through the host entry
+ * (filterJointHumanMemberEntries). Flag off: nothing, exactly as before P3.
+ */
+export async function filterGuestJointEntries(
+  serverId: string,
+  userId: string,
+  guestChannelId: string | null,
+  candidates: ReadonlyArray<{ id: string; type: string }>,
+  db: DatabaseExecutor = getDb(),
+): Promise<Set<string>> {
+  if (!guestChannelId || !candidates.some((channel) => channel.id === guestChannelId && channel.type === "joint")) return new Set();
+  const scope = (await resolveJointHumanMembershipScopes({ serverId: asServerId(serverId), localChannelIds: [guestChannelId] }, db)).get(guestChannelId);
+  if (!scope || !scope.guestEntryEnabled || scope.entryServerId !== scope.hostServerId) return new Set();
+  if ((await filterJointPendingRemovalEntries([scope], "user", userId, db)).has(guestChannelId)) return new Set();
+  return filterJointHumanMemberEntries([scope], userId, db);
+}
+
 export async function canUserAccessChannel(
   channelId: string,
   userId: string,
@@ -4932,10 +6977,17 @@ export async function canUserAccessChannel(
   if (channel.serverId !== serverId) return false;
 
   const serverRole = await resolveHumanServerRole(serverId, userId, db);
+  if (serverRole === null) return false;
   if (serverRole === "guest") {
-    if (channel.type === "thread") {
+    // Task conversation (task v2): visibility is the parent channel's.
+    if (channel.type === "task") {
+      return channel.parentChannelId ? canUserAccessChannel(channel.parentChannelId, userId, serverId, opts) : false;
+    }
+    if (isSubConversationType(channel.type)) {
+      // A joint thread follows its local parent projection (P3: the Guest's
+      // bound host projection, through the joint guest rule).
       const jointThread = await getJointThreadProjectionByLocalThread(channelId, serverId, db);
-      if (jointThread) return false;
+      if (jointThread) return canUserAccessChannel(jointThread.localParentChannelId, userId, serverId, opts);
       if (!channel.parentMessageId) return false;
       const [parentMsg] = await db
         .select({ channelId: messages.channelId })
@@ -4943,16 +6995,18 @@ export async function canUserAccessChannel(
         .where(eq(messages.id, channel.parentMessageId));
       return parentMsg ? canUserAccessChannel(parentMsg.channelId, userId, serverId, opts) : false;
     }
-    const isChannelMember = await isChannelHuman(channelId, userId, db);
+    const guestChannelId = await getGuestChannelId(serverId, userId, db);
+    const jointEntry = channel.type === "joint"
+      ? (await filterGuestJointEntries(serverId, userId, guestChannelId, [channel], db)).has(channel.id)
+      : false;
+    const isChannelMember = channel.type === "joint" ? jointEntry : await isChannelHuman(channelId, userId, db);
     return canGuestReadChannel({
-      gateEnabled: await isGuestFeatureEnabled(serverId, userId, db),
       serverRole,
+      channelId: channel.id,
+      guestChannelId,
       channelType: channel.type,
-      channelName: channel.name,
-      allChannelHidden: isAllSystemChannel(channel) && !isEnabledAllChannel(channel),
-      guestVisible: channel.guestVisible,
-      guestJoinable: channel.guestJoinable,
       isChannelMember,
+      jointEntry,
       archived: channel.archivedAt !== null,
       deleted: channel.deletedAt !== null,
     });
@@ -4964,28 +7018,19 @@ export async function canUserAccessChannel(
   if (channel.type === "channel") return true;
 
   if (channel.type === "joint") {
-    const resolvedJoint = await resolveChannelAccess({
-      serverId,
-      channelId,
-      includeDeleted: opts?.includeDeleted,
-      executor: db,
-    });
-    if (!resolvedJoint || resolvedJoint.kind !== "joint") return false;
-    const [membership] = await db
-      .select({ userId: channelHumans.userId })
-      .from(jointChannelServers)
-      .innerJoin(channelHumans, eq(channelHumans.channelId, jointChannelServers.localChannelId))
-      .where(and(
-        eq(jointChannelServers.jointChannelId, resolvedJoint.jointChannelId),
-        eq(jointChannelServers.serverId, serverId),
-        eq(jointChannelServers.status, "active"),
-        eq(channelHumans.userId, userId),
-      ))
-      .limit(1);
-    return Boolean(membership);
+    const scope = (await resolveJointHumanMembershipScopes({ serverId, localChannelIds: [channelId] }, db)).get(channelId);
+    if (scope && (await filterJointPendingRemovalEntries([scope], "user", userId, db)).has(channelId)) return false;
+    return scope !== undefined && (await filterJointHumanMemberEntries([scope], userId, db)).has(channelId);
   }
 
-  if (channel.type === "thread") {
+  // Task conversation (task v2): the parent channel decides — for a joint
+  // local face that is this server's local channel; a canonical joint
+  // conversation's parent is storage and never grants access.
+  if (channel.type === "task") {
+    return channel.parentChannelId ? canUserAccessChannel(channel.parentChannelId, userId, serverId, opts) : false;
+  }
+
+  if (isSubConversationType(channel.type)) {
     const jointThread = await getJointThreadProjectionByLocalThread(channelId, serverId, db);
     if (jointThread) {
       return canUserAccessChannel(jointThread.localParentChannelId, userId, serverId, opts);
@@ -5053,6 +7098,7 @@ export async function filterUserAccessibleChannelIds(
   if (candidates.length === 0) return accessible;
 
   const serverRole = await resolveHumanServerRole(serverId, userId, db);
+  if (serverRole === null) return accessible;
   const batchable = candidates.filter((channel) => channel.type === "channel" || channel.type === "private" || channel.type === "joint" || channel.type === "dm");
   const threads = candidates.filter((channel) => channel.type === "thread");
   const fallback = candidates.filter((channel) => !batchable.includes(channel) && !threads.includes(channel));
@@ -5072,54 +7118,31 @@ export async function filterUserAccessibleChannelIds(
   }
 
   if (serverRole === "guest") {
-    const gateEnabled = batchable.length > 0 && await isGuestFeatureEnabled(serverId, userId, db);
+    const guestChannelId = batchable.length > 0 ? await getGuestChannelId(serverId, userId, db) : null;
+    const guestJointEntries = await filterGuestJointEntries(serverId, userId, guestChannelId, batchable, db);
     for (const channel of batchable) {
+      const jointEntry = channel.type === "joint" && guestJointEntries.has(channel.id);
       if (canGuestReadChannel({
-        gateEnabled,
         serverRole,
+        channelId: channel.id,
+        guestChannelId,
         channelType: channel.type,
-        channelName: channel.name,
-        allChannelHidden: isAllSystemChannel(channel) && !isEnabledAllChannel(channel),
-        guestVisible: channel.guestVisible,
-        guestJoinable: channel.guestJoinable,
-        isChannelMember: memberChannelIds.has(channel.id),
+        isChannelMember: channel.type === "joint" ? jointEntry : memberChannelIds.has(channel.id),
+        jointEntry,
         archived: channel.archivedAt !== null,
         deleted: channel.deletedAt !== null,
       })) accessible.add(channel.id);
     }
   } else {
     const visible = batchable.filter((channel) => !(isAllSystemChannel(channel) && !isEnabledAllChannel(channel)));
-    const jointIds = visible.filter((channel) => channel.type === "joint").map((channel) => channel.id);
-    // Joint: an active projection of the channel on this server (the
-    // resolveChannelAccess condition) AND the human is a member of some active
-    // local projection of that joint on this server.
-    const jointMembers = new Set<string>();
-    if (jointIds.length > 0) {
-      const memberProjection = alias(jointChannelServers, "member_projection");
-      const rows = await db
-        .selectDistinct({ localChannelId: jointChannelServers.localChannelId })
-        .from(jointChannelServers)
-        .innerJoin(jointChannels, eq(jointChannels.id, jointChannelServers.jointChannelId))
-        .innerJoin(memberProjection, and(
-          eq(memberProjection.jointChannelId, jointChannelServers.jointChannelId),
-          eq(memberProjection.serverId, serverId),
-          eq(memberProjection.status, "active"),
-        ))
-        .innerJoin(channelHumans, and(
-          eq(channelHumans.channelId, memberProjection.localChannelId),
-          eq(channelHumans.userId, userId),
-        ))
-        .where(and(
-          inArray(jointChannelServers.localChannelId, jointIds),
-          eq(jointChannelServers.serverId, serverId),
-          eq(jointChannelServers.status, "active"),
-          eq(jointChannels.status, "active"),
-        ));
-      for (const row of rows) jointMembers.add(row.localChannelId);
-    }
+    const allJointIds = visible.filter((channel) => channel.type === "joint").map((channel) => channel.id);
+    const jointScopes = await resolveJointHumanMembershipScopes({ serverId, localChannelIds: allJointIds }, db);
+    // Joint: J membership through this server's active entry.
+    const jointMembers = await filterJointHumanMemberEntries([...jointScopes.values()], userId, db);
+    const deniedJointEntries = await filterJointPendingRemovalEntries([...jointScopes.values()], "user", userId, db);
     for (const channel of visible) {
       if (channel.type === "channel") accessible.add(channel.id);
-      else if (channel.type === "joint") { if (jointMembers.has(channel.id)) accessible.add(channel.id); }
+      else if (channel.type === "joint") { if (jointMembers.has(channel.id) && !deniedJointEntries.has(channel.id)) accessible.add(channel.id); }
       else if (memberChannelIds.has(channel.id)) accessible.add(channel.id);
     }
   }
@@ -5171,7 +7194,9 @@ async function filterUserAccessibleThreadIds(
   for (const thread of threads) {
     const jointParent = jointParentByThread.get(thread.id);
     if (jointParent) {
-      if (serverRole !== "guest") parentByThread.set(thread.id, jointParent);
+      // A Guest reaches a joint thread through its bound host projection (P3);
+      // the parent check applies the guest rule.
+      parentByThread.set(thread.id, jointParent);
       continue;
     }
     if (thread.parentMessageId) {
@@ -5359,22 +7384,45 @@ export async function hasPriorChannelRelationship(
 }
 
 /**
- * Add a human user to a channel (inserts into channelHumans).
+ * Agent Lounge: a human's first post joins them (canUserPostToChannel already
+ * let them post). True when it joined them; false for any other channel or an
+ * existing member.
  */
-export async function addHuman(channelId: string, userId: string, options: ChannelServiceOptions & { role?: "member" | "admin" } = {}): Promise<boolean> {
+export async function ensureLoungeHumanMember(channelId: string, userId: string): Promise<boolean> {
+  if (!await isAgentLoungeChannel(channelId)) return false;
+  if (await isChannelHuman(channelId, userId)) return false;
+  return addHuman(channelId, userId);
+}
+
+/**
+ * Add a human user to a channel (inserts into channelHumans). `actorUserId`:
+ * the person who added them (themselves for a self-join), recorded as who
+ * admitted them when this makes them a joint member; none when no person did.
+ */
+export async function addHuman(channelId: string, userId: string, options: ChannelServiceOptions & {
+  role?: "member" | "admin";
+  actorUserId?: string;
+  boundGuest?: boolean;
+  /**
+   * A joint's channel row lock. A caller holding the archive's FOR NO KEY
+   * UPDATE (an unarchive that rejoins its host admin) keeps it: upgrading would
+   * wait on readers' FOR KEY SHARE (P3; withLockedChannelActorCapabilities).
+   */
+  jointChannelLock?: "update" | "no key update";
+} = {}): Promise<boolean> {
   if (!options.executor) {
     return withChannelWriterFence(channelId, async (tx) => {
-      if (options.actionCardMessageId) {
-        await assertActionCardWritableInTransaction(tx, options.actionCardMessageId, options.actionCardConfirmationVersion);
-      }
+      // Its own transaction: the person added and the one adding them first
+      // (lockJointUsersFirst; only locked), as withLockedChannelActorCapability
+      // takes them for a caller's transaction.
+      await lockJointUsersFirst(tx, { userIds: [userId, options.actorUserId] });
+      await assertChannelActionCardWritable(tx, channelId, options);
       return addHuman(channelId, userId, { ...options, executor: tx });
     });
   }
   const db = options.executor ?? getDb();
   await assertChannelWritableInTransaction(db, channelId);
-  if (options.actionCardMessageId) {
-    await assertActionCardWritableInTransaction(db, options.actionCardMessageId, options.actionCardConfirmationVersion);
-  }
+  await assertChannelActionCardWritable(db, channelId, options);
   const [channel] = await db
     .select({ id: channels.id, serverId: channels.serverId, name: channels.name, type: channels.type })
     .from(channels)
@@ -5382,75 +7430,57 @@ export async function addHuman(channelId: string, userId: string, options: Chann
   if (!channel) {
     throw new Error("Channel not found");
   }
-  if (channel?.type === "thread") {
+  if (isSubConversationType(channel?.type)) {
     throw new Error("Thread membership is managed via follow/unfollow, not channel_humans");
   }
+  if (channel.type === "joint") {
+    await lockJointHumanMembershipChannel(db, channelId, options.jointChannelLock);
+    await lockJointHumanAdmissionSource(db, channel.serverId, [userId]);
+  }
   const [member] = await db
-    .select({ userId: serverMembers.userId, role: serverMembers.role })
+    .select({ userId: serverMembers.userId, role: serverMembers.role, guestChannelId: serverMembers.guestChannelId })
     .from(serverMembers)
     .where(and(eq(serverMembers.serverId, channel.serverId), eq(serverMembers.userId, userId)));
   if (!member) {
     throw new Error("Human is not a member of this channel's server");
   }
   if (member.role === "guest" && options.role === "admin") {
-    throw new Error("Guest cannot be a channel admin");
+    throw new Error("Guests can't be channel admins");
+  }
+  // Agent Lounge: Guests never take part, and nobody manages it as channel admin.
+  if (channel.type === "channel" && (member.role === "guest" || options.role === "admin")
+    && await isAgentLoungeChannel(channelId, db)) {
+    throw new Error(member.role === "guest" ? "Guests cannot join an agent's lounge" : "An agent's lounge has no channel admins");
   }
   if (isAllSystemChannel(channel)) {
     if (member.role === "guest") {
-      throw new Error("Guest cannot be added to the #all channel");
+      throw new Error(GUEST_ALL_CHANNEL_MESSAGE);
     }
     return false;
   }
-  const inserted = await db
-    .insert(channelHumans)
-    .values({ channelId, userId, role: options.role ?? "member" })
-    .onConflictDoNothing()
-    .returning({ userId: channelHumans.userId });
-  if (inserted.length > 0) await startReadPositionAtJoin(db, "human", userId, channelId);
-  return inserted.length > 0;
-}
-
-export async function addGuestHumanIfAllowed(
-  channelId: string,
-  userId: string,
-): Promise<"joined" | "already_joined" | "forbidden"> {
-  return getDb().transaction(async (tx) => {
-    const [lockedChannel] = await tx.select().from(channels)
-      .where(eq(channels.id, channelId))
-      .for("update");
-    if (!lockedChannel) return "forbidden";
-
-    const [member] = await tx.select({ role: serverMembers.role })
-      .from(serverMembers)
-      .where(and(eq(serverMembers.serverId, lockedChannel.serverId), eq(serverMembers.userId, userId)))
-      .limit(1);
-    if (member?.role !== "guest") return "forbidden";
-
-    const [existing] = await tx.select({ userId: channelHumans.userId })
-      .from(channelHumans)
-      .where(and(eq(channelHumans.channelId, channelId), eq(channelHumans.userId, userId)))
-      .for("update")
-      .limit(1);
-    if (existing) return "already_joined";
-
-    const allowed = canGuestJoinChannel({
-      gateEnabled: await isGuestFeatureEnabled(lockedChannel.serverId, userId, tx),
-      serverRole: member.role,
-      channelType: lockedChannel.type,
-      channelName: lockedChannel.name,
-      allChannelHidden: isAllSystemChannel(lockedChannel) && !isEnabledAllChannel(lockedChannel),
-      guestVisible: lockedChannel.guestVisible,
-      guestJoinable: lockedChannel.guestJoinable,
-      isChannelMember: false,
-      archived: lockedChannel.archivedAt !== null,
-      deleted: lockedChannel.deletedAt !== null,
-    });
-    if (!allowed) return "forbidden";
-
-    return await addHuman(channelId, userId, { executor: tx })
-      ? "joined"
-      : "already_joined";
-  });
+  const mirrorHumans = await prepareJointHumanMembershipMirror(db, { channelIds: [channelId] }, "join");
+  const joint = mirrorHumans.coversChannel(channelId);
+  if (joint) {
+    // P3: a Guest joins a joint channel only as itself, bound to this
+    // projection (its external invite acceptance); the mirror's join then
+    // admits it only through the host projection with the host flag on.
+    // No member-add path adds a Guest.
+    if (member.role === "guest" && !(options.boundGuest && member.guestChannelId === channelId)) throw new Error("Channel capability required");
+    const existing = await db.execute<{ member: boolean }>(sql`SELECT EXISTS (
+      SELECT 1 FROM joint_channel_members m JOIN joint_channel_servers p ON p.joint_channel_id=m.joint_channel_id
+      WHERE p.local_channel_id=${channelId}::uuid AND m.user_id=${userId}::uuid
+    ) AS member`);
+    if (existing.rows[0]?.member) return false;
+  }
+  const inserted = joint
+    ? await db.insert(channelHumans).values({channelId,userId,role:"member"})
+      .onConflictDoUpdate({target:[channelHumans.channelId,channelHumans.userId],set:{role:"member",authorityRevision:sql`${channelHumans.authorityRevision}+1`}})
+      .returning({userId:channelHumans.userId})
+    : await db.insert(channelHumans).values({channelId,userId,role:options.role??"member"})
+      .onConflictDoNothing().returning({userId:channelHumans.userId});
+  if (inserted.length > 0 || joint) await startReadPositionAtJoin(db, "human", userId, channelId);
+  await mirrorHumans.apply([userId], options.actorUserId ? { actorUserId: options.actorUserId } : {});
+  return joint || inserted.length > 0;
 }
 
 /**
@@ -5464,14 +7494,37 @@ export async function getChannelMembershipAuthorityChannelId(
 ): Promise<string | null> {
   const channel = await getChannel(channelId, { executor });
   if (!channel) return null;
+  // Task conversation (task v2): its parent channel is on the row.
+  if (channel.type === "task") return channel.parentChannelId ?? null;
   if (channel.type !== "thread") return channel.id;
-  if (!channel.parentMessageId) return null;
+  return (await resolveThreadParent(channel, executor))?.parentChannelId ?? null;
+}
+
+/**
+ * The parent message of a thread and the local channel it hangs off. A joint
+ * thread's local projection carries no parent_message_id (the parent lives on
+ * the canonical thread): resolve it through the thread's own server's
+ * projection, whose parent message is canonical and whose parent channel is
+ * that server's projection of the parent joint channel. Null when neither
+ * exists, so callers fail closed.
+ */
+export async function resolveThreadParent(
+  thread: { id: string; serverId: string; parentMessageId: string | null },
+  executor: DatabaseExecutor = getDb(),
+): Promise<{ parentMessageId: string; parentChannelId: string } | null> {
+  if (!thread.parentMessageId) {
+    const projection = await getJointThreadProjectionByLocalThread(thread.id, thread.serverId, executor);
+    // Thread-only: a task conversation has no parent message.
+    return projection?.canonicalParentMessageId
+      ? { parentMessageId: projection.canonicalParentMessageId, parentChannelId: projection.localParentChannelId }
+      : null;
+  }
   const [parentMessage] = await executor
     .select({ channelId: messages.channelId })
     .from(messages)
-    .where(eq(messages.id, channel.parentMessageId))
+    .where(eq(messages.id, thread.parentMessageId))
     .limit(1);
-  return parentMessage?.channelId ?? null;
+  return parentMessage ? { parentMessageId: thread.parentMessageId, parentChannelId: parentMessage.channelId } : null;
 }
 
 export type ChannelMembershipActorType = "user" | "agent";
@@ -5526,7 +7579,20 @@ export async function changeChannelMembershipRole(input: {
     if (channel.archivedAt) {
       throw new ChannelMembershipRoleMutationError("channel_archived", "This channel is archived");
     }
+    // Agent Lounge: nobody manages it as channel admin (as addHuman/addAgent
+    // refuse); promotion would hand a member channel-level archive/unarchive.
+    if (input.nextRole === "admin" && channel.type === "channel" && await isAgentLoungeChannel(channel.id, tx)) {
+      throw new ChannelMembershipRoleMutationError("unsupported_channel_shape", "An agent's lounge has no channel admins");
+    }
 
+    await lockComputedJointActor({ serverId: input.serverId, channelId: input.channelId,
+      actorType: "user", actorId: input.requesterUserId,
+      humanSubjectIds: input.targetType === "user" ? [input.targetId] : [],
+    }, tx);
+    const jointContext = channel.type === "joint"
+      ? await resolveChannelActorContext(input.serverId, input.channelId, "user", input.requesterUserId, tx)
+      : null;
+    const jointRoles = jointContext?.jointAuthority !== undefined;
     // Channel row is always locked first. Membership rows are then locked in a
     // stable actor tuple order so promote/demote/remove races cannot deadlock.
     const lockOrder = [
@@ -5556,7 +7622,7 @@ export async function changeChannelMembershipRole(input: {
       eq(channelHumans.userId, input.requesterUserId),
     ));
     const requesterCanAccess = channel.type === "channel" || Boolean(requesterMembership);
-    const requesterAllowed = requesterCanAccess && hasEffectiveChannelCapability({
+    const requesterAllowed = jointRoles ? channelActorHasCapability(jointContext!, "changeChannelMemberRoles") : requesterCanAccess && hasEffectiveChannelCapability({
       serverRole: requesterServer?.role ?? null,
       channelRole: requesterMembership?.role ?? null,
       isChannelMember: Boolean(requesterMembership),
@@ -5575,6 +7641,22 @@ export async function changeChannelMembershipRole(input: {
       throw new ChannelMembershipRoleMutationError(code, "A channel admin cannot change their own channel role");
     }
 
+    // A qualified host J member need not have a CH row on this projection.
+    // Creating a host-side role record does not admit a new J member or move
+    // their read cursor. Another entry's admin status is deliberately irrelevant.
+    if (jointRoles && input.targetType === "user") {
+      const scope = (await resolveJointHumanMembershipScopes({ localChannelIds: [input.channelId] }, tx)).get(input.channelId)!;
+      if (!(await filterJointHumanMemberEntries([scope], input.targetId, tx)).has(input.channelId)) {
+        throw new ChannelMembershipRoleMutationError("channel_member_required", "Target must already be a channel member");
+      }
+      if (input.nextRole === "admin") {
+        const hostMember = await tx.execute(sql`SELECT 1 FROM server_members
+          WHERE server_id=${scope.hostServerId}::uuid AND user_id=${input.targetId}::uuid AND role<>'guest'`);
+        if (!hostMember.rows.length) throw new ChannelMembershipRoleMutationError("channel_member_required", "Target must be a current host member");
+      }
+      // read-position: existing member projection; J membership is unchanged, preserve all read cursors.
+      await tx.insert(channelHumans).values({ channelId: input.channelId, userId: input.targetId, role: "member" }).onConflictDoNothing();
+    }
     const targetMembership = input.targetType === "user"
       ? await tx.select({ role: channelHumans.role, authorityRevision: channelHumans.authorityRevision })
         .from(channelHumans)
@@ -5663,40 +7745,166 @@ export async function markChannelMembershipRoleEventDelivered(eventId: string) {
   }).where(eq(channelMembershipRoleEvents.id, eventId));
 }
 
-/** Remove a human from a channel. #all never has explicit human membership. */
-export async function removeHuman(channelId: string, userId: string, executor?: DatabaseExecutor): Promise<void> {
+/**
+ * Remove a human from a channel. #all never has explicit human membership.
+ * `removedBy` is required (ChannelRemovalActor): the person themselves, the
+ * person or agent acting on channel authority, or the system. A call without
+ * one is a programming error and removes nothing.
+ */
+export async function removeHuman(channelId: string, userId: string, removedBy: ChannelRemovalActor, executor?: DatabaseExecutor, lastMember: LastPrivateMember = "delete"): Promise<ChannelMemberRemoval> {
+  // Checked at run time too: an untyped caller must not fall back to a self-leave.
+  if (!removedBy || typeof removedBy !== "object") throw new Error("removeHuman requires an explicit actor");
   if (!executor) {
-    await withChannelWriterFence(channelId, tx => removeHuman(channelId, userId, tx));
+    const removal = await withChannelWriterFence(channelId, async (tx) => {
+      // Its own transaction (a self-leave, the system): the person removed and
+      // the one removing them first (lockJointUsersFirst; only locked: a person
+      // mid-deletion may still leave), as withLockedChannelActorCapability
+      // takes them for a caller's transaction.
+      await lockJointUsersFirst(tx, { userIds: [userId, removalActorUserId(userId, removedBy)] });
+      return removeHuman(channelId, userId, removedBy, tx, lastMember);
+    });
     // Executor callers own the surrounding transaction and invalidate after its
     // commit. A reconnect before commit could otherwise recover the old rooms.
-    await revokeSocketAccess({ userId });
-    return;
+    await finishChannelMemberRemoval(removal, userId);
+    return removal;
   }
   await assertChannelWritableInTransaction(executor, channelId);
   const db = executor ?? getDb();
+  let actor = removalActorContext(removedBy);
   const channel = await getChannel(channelId, { executor: db });
-  if (channel?.type === "thread") {
+  if (isSubConversationType(channel?.type)) {
     throw new Error("Thread membership is managed via follow/unfollow, not channel_humans");
   }
   if (channel && isAllSystemChannel(channel)) {
-    throw new Error("Cannot leave or remove from the #all channel");
+    throw new Error(ALL_CHANNEL_LEAVE_MESSAGE);
   }
-  await db.delete(channelHumans).where(
+  if (channel?.type === "joint") {
+    // FOR NO KEY UPDATE: a joint removal never deletes the joint channel, and
+    // a member's (or Guest's) read mutation holds its member row before the
+    // channel's FOR KEY SHARE (the admission fence); FOR UPDATE here would
+    // close a cycle with that read once this removal takes the member row
+    // (P3, Cody on PR #13205). Writers stay serialized.
+    await lockJointHumanMembershipChannel(db, channelId, "no key update");
+    if (actor) {
+      if (actor.channelId !== channelId || actor.serverId !== channel.serverId) throw new Error("Channel capability required");
+      await lockComputedJointActor({ serverId: actor.serverId, channelId, actorType: actor.actorType, actorId: actor.actorId, humanSubjectIds: [userId] },db);
+      actor = await resolveChannelActorContext(actor.serverId,channelId,actor.actorType,actor.actorId,db) ?? undefined;
+      if (!actor) throw new Error("Channel capability required");
+    }
+  }
+  // A Guest exists only for its one channel: leaving it, or being removed
+  // from it, ends the Guest's server membership in the same commit. The full
+  // server removal deletes the channel row itself, in its own lock order
+  // (servers -> member row -> channel_humans), so no Guest is left with only a
+  // server_members row (#wg-rbac:#15).
+  // The unlocked read only routes; the binding is re-checked under the
+  // membership lock, and a Guest promoted meanwhile takes the Member path.
+  if (channel && await isGuestBoundToChannel(db, channel.serverId, channelId, userId)) {
+    // Global lock order channel -> server -> member -> joint -> channel
+    // membership: the channel row first (also for a self-leave), so emptying a
+    // private channel cannot wait behind a deletion holding it.
+    // A joint channel is never deleted here: FOR NO KEY UPDATE, as above.
+    // An emptied private channel may be (deletePrivateChannelIfEmpty).
+    await db.select({ id: channels.id }).from(channels).where(eq(channels.id, channelId)).for(channel.type === "joint" ? "no key update" : "update");
+    const { removeMemberInTransaction } = await import("./serverService");
+    const actorUserId = removalActorUserId(userId, removedBy);
+    const removalAudit = channelRemovalAudit(userId, actor ?? removedBy);
+    const effects = await removeMemberInTransaction(db as DatabaseTransaction, channel.serverId, userId, {
+      onlyIfGuestBoundTo: channelId,
+      reason: actorUserId === userId ? "left" : "removed",
+      actorUserId: actorUserId ?? null,
+      // Every channel the Guest loses with its membership is audited there, by this actor.
+      channelAudit: { reason: "guest_unbind", actor: removalAudit.actor, actorRole: removalAudit.actorRole },
+    });
+    if (effects) {
+      return {
+        channelDeleted: await deletePrivateChannelIfEmpty(channelId, db, lastMember),
+        endedGuestMembership: { serverId: channel.serverId, effects },
+      };
+    }
+  }
+  const mirrorHumans = await prepareJointHumanMembershipMirror(db, { channelIds: [channelId] }, "remove");
+  if (mirrorHumans.coversChannel(channelId) && actor) {
+    if (!channelActorHasCapability(actor, "removeChannelMembers")) throw new Error("Channel capability required");
+  }
+  // A joint channel is audited once per joint, whichever copy the removal came through.
+  const joint = channel?.type === "joint" ? await jointOfLocalChannel(db, channelId) : null;
+  const wasJointMember = joint ? await isJointMember(db, joint.jointChannelId, userId) : false;
+  const deleted = await db.delete(channelHumans).where(
     and(eq(channelHumans.channelId, channelId), eq(channelHumans.userId, userId))
-  );
-  await deletePrivateChannelIfEmpty(channelId, db);
+  ).returning({ userId: channelHumans.userId });
+  // The person leaving or removing them; an agent or the system records none.
+  const mirrorActorUserId = removalActorUserId(userId, removedBy);
+  await mirrorHumans.apply([userId], mirrorActorUserId ? { actorUserId: mirrorActorUserId } : {});
+  const ended = deleted.length > 0 || (joint !== null && wasJointMember && !await isJointMember(db, joint.jointChannelId, userId));
+  if (channel && ended) {
+    // Same transaction as the removal: a failed audit write fails the removal.
+    await recordChannelMembershipsEnded(db, {
+      ...channelRemovalAudit(userId, actor ?? removedBy),
+      targetUserId: userId,
+      memberships: [{ serverId: channel.serverId, channelId, channelType: channel.type, joint }],
+    });
+  }
+  return { channelDeleted: await deletePrivateChannelIfEmpty(channelId, db, lastMember) };
+}
+
+/**
+ * An archived channel cuts its Guests off (cindyz 10-30): every request is
+ * refused by the read rule, and this drops their live connections so they stop
+ * receiving the channel at once. After the archive's commit.
+ */
+export async function revokeBoundGuestSockets(channelId: string): Promise<void> {
+  // A joint channel archives on every server at once: each server's projection
+  // may have Guests bound to it.
+  const channelIds = new Set([channelId]);
+  for (const projection of await getActiveJointChannelProjectionsByLocalChannel(channelId)) channelIds.add(projection.localChannelId);
+  const guests = await getDb().select({ userId: serverMembers.userId }).from(serverMembers)
+    .where(and(eq(serverMembers.role, "guest"), inArray(serverMembers.guestChannelId, [...channelIds])));
+  for (const guest of guests) await revokeSocketAccess({ userId: guest.userId });
+}
+
+async function boundGuestIds(db: DatabaseExecutor, serverId: string, channelId: string): Promise<string[]> {
+  return (await db.select({ userId: serverMembers.userId }).from(serverMembers)
+    .where(and(eq(serverMembers.serverId, serverId), eq(serverMembers.role, "guest"), eq(serverMembers.guestChannelId, channelId))))
+    .map((row) => row.userId);
+}
+
+async function isGuestBoundToChannel(db: DatabaseExecutor, serverId: string, channelId: string, userId: string): Promise<boolean> {
+  const [row] = await db.select({ userId: serverMembers.userId }).from(serverMembers)
+    .where(and(
+      eq(serverMembers.serverId, serverId),
+      eq(serverMembers.userId, userId),
+      eq(serverMembers.role, "guest"),
+      eq(serverMembers.guestChannelId, channelId),
+    ))
+    .limit(1);
+  return Boolean(row);
+}
+
+/**
+ * After a removeHuman commit: the socket revocation every removal owes, and,
+ * when a Guest's server membership ended with it, the rest of that removal.
+ * Callers that pass removeHuman their own transaction call this after commit.
+ */
+export async function finishChannelMemberRemoval(removal: ChannelMemberRemoval, userId: string): Promise<void> {
+  if (removal.endedGuestMembership) {
+    const { finishRemovedMember } = await import("./serverService");
+    await finishRemovedMember(removal.endedGuestMembership.serverId, userId, removal.endedGuestMembership.effects);
+    return;
+  }
+  await revokeSocketAccess({ userId });
 }
 
 /**
  * Get humans in a channel.
  */
-async function getChannelHumansRaw(channelId: string) {
-  return (await getChannelHumansRawForChannels([channelId])).map(({ channelId: _channelId, ...human }) => human);
+async function getChannelHumansRaw(channelId: string, onlyIds?: readonly string[]) {
+  return (await getChannelHumansRawForChannels([channelId], { onlyIds })).map(({ channelId: _channelId, ...human }) => human);
 }
 
 /** getChannelHumansRaw for several channels in one query; rows carry their channelId. */
-async function getChannelHumansRawForChannels(channelIds: readonly string[], options: { name?: string; id?: string } = {}) {
-  if (channelIds.length === 0) return [];
+async function getChannelHumansRawForChannels(channelIds: readonly string[], options: { name?: string; id?: string; onlyIds?: readonly string[] } = {}) {
+  if (channelIds.length === 0 || options.onlyIds?.length === 0) return [];
   const db = getDb();
   const rows = await db
     .select({
@@ -5709,7 +7917,6 @@ async function getChannelHumansRawForChannels(channelIds: readonly string[], opt
       displayName: users.displayName,
       description: users.description,
       avatarUrl: users.avatarUrl,
-      email: users.email,
       role: serverMembers.role,
       serverRole: serverMembers.role,
       channelRole: channelHumans.role,
@@ -5726,13 +7933,11 @@ async function getChannelHumansRawForChannels(channelIds: readonly string[], opt
       inArray(channelHumans.channelId, [...channelIds]),
       options.name === undefined ? undefined : eq(users.name, options.name),
       options.id === undefined ? undefined : eq(users.id, options.id),
+      options.onlyIds === undefined ? undefined : inArray(users.id, [...options.onlyIds]),
     ))
     .orderBy(asc(channelHumans.joinedAt));
 
-  return rows.map(({ email, ...rest }) => ({
-    ...rest,
-    gravatarHash: createHash("sha256").update(email.trim().toLowerCase()).digest("hex"),
-  }));
+  return rows.map((row) => ({ ...row, gravatarHash: DEPRECATED_GRAVATAR_HASH }));
 }
 
 /**
@@ -5754,7 +7959,8 @@ export function serverAudienceMemberCondition(serverId: string) {
  * membership of an enabled virtual `#all` channel. Guest visibility is a
  * separate read-only policy and never grants roster or delivery membership.
  */
-async function getServerAudienceHumans(serverId: string, options: { name?: string } = {}) {
+async function getServerAudienceHumans(serverId: string, options: { name?: string; onlyIds?: readonly string[] } = {}) {
+  if (options.onlyIds?.length === 0) return [];
   const db = getDb();
   const rows = await db
     .select({
@@ -5766,7 +7972,6 @@ async function getServerAudienceHumans(serverId: string, options: { name?: strin
       displayName: users.displayName,
       description: users.description,
       avatarUrl: users.avatarUrl,
-      email: users.email,
       role: serverMembers.role,
     })
     .from(serverMembers)
@@ -5775,13 +7980,11 @@ async function getServerAudienceHumans(serverId: string, options: { name?: strin
     .where(and(
       serverAudienceMemberCondition(serverId),
       options.name === undefined ? undefined : eq(users.name, options.name),
+      options.onlyIds === undefined ? undefined : inArray(users.id, [...options.onlyIds]),
     ))
     .orderBy(asc(serverMembers.joinedAt));
 
-  return rows.map(({ email, ...rest }) => ({
-    ...rest,
-    gravatarHash: createHash("sha256").update(email.trim().toLowerCase()).digest("hex"),
-  }));
+  return rows.map((row) => ({ ...row, gravatarHash: DEPRECATED_GRAVATAR_HASH }));
 }
 
 /**
@@ -5796,13 +7999,16 @@ export async function getChannelHumans(channelId: string) {
   if (channel && isEnabledAllChannel(channel)) {
     return getServerAudienceHumans(channel.serverId);
   }
+  if (channel?.type === "joint") {
+    return (await getJointHumanDeliveryRows([channelId])).map(({ channelId: _channelId, ...human }) => human);
+  }
   return getChannelHumansRaw(channelId);
 }
 
-async function getVirtualAllChannelMembers(serverId: string) {
+async function getVirtualAllChannelMembers(serverId: string, only?: ChannelMemberFilter) {
   const [agentList, humanList] = await Promise.all([
-    getServerAudienceAgents(serverId),
-    getServerAudienceHumans(serverId),
+    getServerAudienceAgents(serverId, { onlyIds: only?.agentIds }),
+    getServerAudienceHumans(serverId, { onlyIds: only?.userIds }),
   ]);
   return { agents: agentList, humans: humanList };
 }
@@ -5817,92 +8023,129 @@ export async function getChannelExternalMembers(
   now: Date = currentDate(),
 ): Promise<ChannelExternalMember[]> {
   const db = getDb();
-  const rows = await db.select({
-    id: externalActorProjections.id,
-    provider: externalActorProjections.provider,
-    displayName: externalActorProjections.displayName,
-    handles: externalActorProjections.handles,
-    actorKind: externalActorProjections.actorKind,
-    avatarUrl: externalProjectionAvatarArtifacts.publicUrl,
-    // workspaceName only — the members endpoint intentionally does not
-    // expose provider-side ids (installId/appRegistrationId/workspaceId/
-    // externalActorId). The external-identity panel reads provider,
-    // actorKind, displayName, avatarUrl, workspaceName.
-    workspaceName: externalAppInstalls.workspaceName,
-  }).from(externalAddressabilityProjections)
-    .innerJoin(
-      externalActorProjections,
-      eq(externalActorProjections.id, externalAddressabilityProjections.projectionId),
-    )
-    .innerJoin(
-      externalChannelBindings,
-      and(
-        sql`${externalChannelBindings.id}::text = ${externalAddressabilityProjections.bindingId}`,
-        eq(externalChannelBindings.bindingEpoch, externalAddressabilityProjections.bindingEpoch),
-        eq(externalChannelBindings.providerConversationId, externalAddressabilityProjections.conversationId),
-      ),
-    )
-    .leftJoin(
-      externalProjectionAvatarArtifacts,
-      and(
-        eq(externalProjectionAvatarArtifacts.id, externalActorProjections.avatarArtifactId),
-        eq(externalProjectionAvatarArtifacts.state, "active"),
-      ),
-    )
-    .leftJoin(
-      externalAppInstalls,
-      sql`${externalAppInstalls.id}::text = ${externalActorProjections.installId}`,
-    )
-    .where(and(
-      eq(externalChannelBindings.channelId, channelId),
-      eq(externalChannelBindings.state, "active"),
-      eq(externalAddressabilityProjections.state, "active"),
-      gt(externalAddressabilityProjections.expiresAt, now),
-      eq(externalActorProjections.state, "active"),
-      eq(externalActorProjections.deactivated, false),
-      eq(externalActorProjections.provider, "slack"),
-      eq(externalAddressabilityProjections.provider, externalActorProjections.provider),
-    ))
-    .orderBy(asc(externalActorProjections.displayName), asc(externalActorProjections.id));
+  return db.transaction(async tx => {
+    const rows = await tx.select({
+      id: externalActorProjections.id,
+      provider: externalActorProjections.provider,
+      displayName: externalActorProjections.displayName,
+      handles: externalActorProjections.handles,
+      actorKind: externalActorProjections.actorKind,
+      externalActorId: externalActorProjections.externalActorId,
+      appRegistrationId: externalActorProjections.appRegistrationId,
+      installId: externalActorProjections.installId,
+      workspaceId: externalActorProjections.workspaceId,
+      connectionEpoch: externalAddressabilityProjections.connectionEpoch,
+      bindingId: externalAddressabilityProjections.bindingId,
+      bindingEpoch: externalAddressabilityProjections.bindingEpoch,
+      conversationId: externalAddressabilityProjections.conversationId,
+      memberRevision: externalAddressabilityProjections.memberRevision,
+      contextRevision: externalAddressabilityProjections.contextRevision,
+      avatarUrl: externalProjectionAvatarArtifacts.publicUrl,
+      // workspaceName only — the members endpoint intentionally does not
+      // expose provider-side ids (installId/appRegistrationId/workspaceId/
+      // externalActorId). The external-identity panel reads provider,
+      // actorKind, displayName, avatarUrl, workspaceName.
+      workspaceName: externalAppInstalls.workspaceName,
+    }).from(externalAddressabilityProjections)
+      .innerJoin(
+        externalActorProjections,
+        eq(externalActorProjections.id, externalAddressabilityProjections.projectionId),
+      )
+      .innerJoin(
+        externalChannelBindings,
+        and(
+          sql`${externalChannelBindings.id}::text = ${externalAddressabilityProjections.bindingId}`,
+          eq(externalChannelBindings.bindingEpoch, externalAddressabilityProjections.bindingEpoch),
+          eq(externalChannelBindings.providerConversationId, externalAddressabilityProjections.conversationId),
+        ),
+      )
+      .leftJoin(
+        externalProjectionAvatarArtifacts,
+        and(
+          eq(externalProjectionAvatarArtifacts.id, externalActorProjections.avatarArtifactId),
+          eq(externalProjectionAvatarArtifacts.state, "active"),
+        ),
+      )
+      .leftJoin(
+        externalAppInstalls,
+        sql`${externalAppInstalls.id}::text = ${externalActorProjections.installId}`,
+      )
+      .where(and(
+        eq(externalChannelBindings.channelId, channelId),
+        eq(externalChannelBindings.state, "active"),
+        eq(externalAddressabilityProjections.state, "active"),
+        gt(externalAddressabilityProjections.expiresAt, now),
+        eq(externalActorProjections.state, "active"),
+        eq(externalActorProjections.deactivated, false),
+        eq(externalActorProjections.provider, "slack"),
+        eq(externalAddressabilityProjections.provider, externalActorProjections.provider),
+      ))
+      .orderBy(asc(externalActorProjections.displayName), asc(externalActorProjections.id));
 
-  const unique = new Map<string, ChannelExternalMember>();
-  for (const row of rows) {
-    if (row.provider !== "slack" || unique.has(row.id)) continue;
-    unique.set(row.id, {
-      id: row.id,
-      provider: row.provider,
-      displayName: row.displayName,
-      handles: row.handles,
-      actorKind: row.actorKind,
-      avatarUrl: row.avatarUrl,
-      workspaceName: row.workspaceName,
-    });
-  }
-  return [...unique.values()];
+    const remoteIds = [...new Set(rows.filter(row => row.actorKind === "remote").map(row => row.externalActorId))];
+    const botRows = remoteIds.length ? await tx.select({ id: externalActorProjections.id,
+      installId: externalActorProjections.installId, workspaceId: externalActorProjections.workspaceId,
+      appRegistrationId: externalActorProjections.appRegistrationId, userId: externalActorProjections.slackBotUserId })
+      .from(externalActorProjections).where(and(eq(externalActorProjections.provider, "slack"),
+        eq(externalActorProjections.actorKind, "bot"), inArray(externalActorProjections.slackBotUserId, remoteIds),
+        inArray(externalActorProjections.installId, [...new Set(rows.map(row => row.installId))]))) : [];
+    const unique = new Map<string, ChannelExternalMember>();
+    for (const row of rows) {
+      if (row.provider !== "slack" || unique.has(row.id)) continue;
+      const possible = row.actorKind === "remote" ? botRows.filter(bot => bot.userId === row.externalActorId
+        && bot.installId === row.installId && bot.workspaceId === row.workspaceId && bot.appRegistrationId === row.appRegistrationId) : [];
+      const mapping = possible.length === 1 ? await readSlackBotMentionAuthority({ executor: tx, botProjectionId: possible[0]!.id, now,
+        context: { provider: row.provider, appRegistrationId: row.appRegistrationId, installId: row.installId,
+          workspaceId: row.workspaceId, connectionEpoch: row.connectionEpoch, bindingId: row.bindingId, bindingEpoch: row.bindingEpoch,
+          conversationId: row.conversationId, memberRevision: row.memberRevision, contextRevision: row.contextRevision } }) : null;
+      let botAvatar: string | null = null;
+      if (mapping?.bot.avatarArtifactId) {
+        const [avatar] = await tx.select().from(externalProjectionAvatarArtifacts).where(and(
+          eq(externalProjectionAvatarArtifacts.id, mapping.bot.avatarArtifactId), eq(externalProjectionAvatarArtifacts.ownerType, "external_projection"),
+          eq(externalProjectionAvatarArtifacts.ownerId, mapping.bot.id), eq(externalProjectionAvatarArtifacts.state, "active"))).limit(1);
+        botAvatar = avatar?.publicUrl ?? null;
+      }
+      const id = mapping?.bot.id ?? row.id;
+      unique.set(id, { id, provider: row.provider, displayName: mapping?.bot.displayName ?? row.displayName,
+        handles: row.handles, actorKind: mapping ? "bot" : row.actorKind, mentionable: Boolean(mapping) || row.actorKind === "human",
+        avatarUrl: mapping ? botAvatar : row.avatarUrl, workspaceName: row.workspaceName });
+    }
+    return [...unique.values()];
+  });
 }
 
 export interface ChannelMembers {
-  agents: Awaited<ReturnType<typeof getServerAudienceAgents>>;
-  /** `servers` is set on joint rosters only (see ChannelMemberServer). */
-  humans: Array<Awaited<ReturnType<typeof getServerAudienceHumans>>[number] & { servers?: ChannelMemberServer[] }>;
+  /** `inViewerServer` as on humans: joint rosters only (the agent's own server is the viewed one). */
+  agents: Array<Awaited<ReturnType<typeof getServerAudienceAgents>>[number] & { inViewerServer?: boolean }>;
+  /** `servers` is set on joint rosters only (see ChannelMemberServer): the
+   * person's current sources minus the viewed server. `inViewerServer`
+   * (joint rosters only) says whether the
+   * person belongs to the viewed server, any role, for member-list grouping. */
+  humans: Array<Awaited<ReturnType<typeof getServerAudienceHumans>>[number] & { servers?: ChannelMemberServer[]; isManager?: boolean; inViewerServer?: boolean }>;
 }
 
 /**
  * Members = join/post authority (see thread contract in schema.ts).
  * Regular channels: read channel_humans + channel_agents directly.
  * Thread channels:  delegate to the parent channel/DM's members.
- * For "who gets notified" use getThreadFollowers instead.
+ * For "who gets notified" read thread_follows instead.
  * For enabled #all channels, derive members from the server audience.
+ * `only` reads just those members (see ChannelMemberFilter), each the row the
+ * whole roster holds for them.
  */
-export async function getChannelMembers(channelId: string): Promise<ChannelMembers> {
+export async function getChannelMembers(channelId: string, only?: ChannelMemberFilter): Promise<ChannelMembers> {
   const channel = await getChannel(channelId);
 
   // Threads delegate join/membership to their parent channel (or DM).
-  // Followers of a thread are exposed separately via getThreadFollowers.
+  // Followers of a thread live in thread_follows (attention, not membership).
+  // Task conversations (task v2) likewise: the parent channel's members.
+  if (channel?.type === "task") {
+    return channel.parentChannelId ? getChannelMembers(channel.parentChannelId, only) : { agents: [], humans: [] };
+  }
   if (channel?.type === "thread") {
     const jointThread = await getJointThreadProjectionByLocalThread(channelId, channel.serverId);
     if (jointThread) {
-      return getChannelMembers(jointThread.localParentChannelId);
+      return getChannelMembers(jointThread.localParentChannelId, only);
     }
   }
 
@@ -5913,80 +8156,120 @@ export async function getChannelMembers(channelId: string): Promise<ChannelMembe
       .from(messages)
       .where(eq(messages.id, channel.parentMessageId));
     if (!parentMsg) return { agents: [], humans: [] };
-    return getChannelMembers(parentMsg.channelId);
+    return getChannelMembers(parentMsg.channelId, only);
   }
 
   if (channel && isEnabledAllChannel(channel)) {
-    return getVirtualAllChannelMembers(channel.serverId);
+    return getVirtualAllChannelMembers(channel.serverId, only);
   }
 
   if (channel?.type === "joint") {
     const db = getDb();
-    const [projection] = await db
-      .select({ jointChannelId: jointChannelServers.jointChannelId })
-      .from(jointChannelServers)
-      .innerJoin(jointChannels, eq(jointChannels.id, jointChannelServers.jointChannelId))
-      .where(and(
-        eq(jointChannelServers.localChannelId, channelId),
-        eq(jointChannelServers.status, "active"),
-        eq(jointChannels.status, "active"),
-      ));
-    if (projection) {
-      const projections = await db
-        .select({ localChannelId: jointChannelServers.localChannelId })
-        .from(jointChannelServers)
-        .innerJoin(channels, eq(channels.id, jointChannelServers.localChannelId))
-        .where(and(
-          eq(jointChannelServers.jointChannelId, projection.jointChannelId),
-          eq(jointChannelServers.status, "active"),
-          isNull(channels.deletedAt),
-        ));
-      // The same person can belong to more than one server in a joint channel.
-      // Merge peer projections first so the projection being viewed always owns
-      // the final role and server metadata for duplicate identities.
-      const orderedProjections = [
-        ...projections.filter((row) => row.localChannelId !== channelId),
-        ...projections.filter((row) => row.localChannelId === channelId),
-      ];
-      const agentsById = new Map<string, Awaited<ReturnType<typeof getChannelAgentsRaw>>[number]>();
-      const humansById = new Map<string, Awaited<ReturnType<typeof getChannelHumansRaw>>[number]>();
-      const humanServersById = new Map<string, Map<string, ChannelMemberServer>>();
-      // Two queries for all projections instead of two per projection, so
-      // mention scope does not grow with the number of servers (§18.10.1).
-      const localIds = orderedProjections.map((row) => row.localChannelId);
-      const [agentRows, humanRows] = await Promise.all([
-        getChannelAgentsRawForChannels(localIds),
-        getChannelHumansRawForChannels(localIds),
-      ]);
-      for (const row of orderedProjections) {
-        for (const { channelId: agentChannelId, ...agent } of agentRows) {
-          if (agentChannelId === row.localChannelId) agentsById.set(agent.id, agent);
-        }
-        for (const { channelId: humanChannelId, ...human } of humanRows) {
-          if (humanChannelId !== row.localChannelId) continue;
-          humansById.set(human.id, human);
-          const servers = humanServersById.get(human.id) ?? new Map<string, ChannelMemberServer>();
-          servers.set(human.serverId, { id: human.serverId, name: human.serverName, slug: human.serverSlug });
-          humanServersById.set(human.id, servers);
-        }
-      }
-      // RFC 075 phase 1 (display only): every server a person participates
-      // through, i.e. every active projection with a channel_humans row for
-      // them. The single-valued server/role fields above stay as before
-      // (the viewed projection wins); `servers` lists that server first,
-      // then the rest by name.
-      const humans = [...humansById.values()].map((human) => ({
-        ...human,
-        servers: orderChannelMemberServers([...(humanServersById.get(human.id)?.values() ?? [])], channel.serverId),
-      }));
-      return { agents: [...agentsById.values()], humans };
+    const scope = (await resolveJointHumanMembershipScopes({ localChannelIds: [channelId] }, db)).get(channelId);
+    if (scope) {
+      if (!(await filterJointActiveEntries([scope], db)).has(channelId)) return { agents: [], humans: [] };
+      const projections = await getActiveJointChannelProjectionsByLocalChannel(channelId, db);
+      const rawAgents = await getChannelAgentsRawForChannels(projections.map(row => row.localChannelId), { onlyIds: only?.agentIds });
+      const denied = await db.execute<{ id: string }>(sql`SELECT jmr.agent_id id FROM joint_membership_removals jmr
+        JOIN joint_membership_departures jmd ON jmd.id=jmr.departure_id
+        WHERE jmd.completed_at IS NULL AND jmd.joint_channel_id=${scope.jointId}::uuid AND jmr.remove_membership AND jmr.agent_id IS NOT NULL`);
+      const deniedIds = new Set(denied.rows.map(row => row.id));
+      return { humans: await getComputedJointHumanPublicRows(scope, only?.userIds, db),
+        agents: [...new Map(rawAgents.filter(row => !deniedIds.has(row.id))
+          .map(({ channelId: _channelId, ...row }) => [row.id, { ...row, inViewerServer: row.serverId === channel.serverId }])).values()] };
     }
   }
 
-  const agentList = await getChannelAgentsRaw(channelId);
-  const humanList = await getChannelHumansRaw(channelId);
+  const agentList = await getChannelAgentsRaw(channelId, only?.agentIds);
+  const humanList = await getChannelHumansRaw(channelId, only?.userIds);
 
   return { agents: agentList, humans: humanList };
+}
+
+/** A member on a page of a roster (getChannelMemberPager); `role` is a person's in the channel's server, an agent's null. */
+export interface ChannelMemberPageRow {
+  id: string;
+  serverId: string;
+  name: string;
+  displayName: string | null;
+  avatarUrl: string | null;
+  role: string | null;
+}
+
+/**
+ * A page of a roster: members whose handle or display name matches the ILIKE
+ * `pattern`, after `after` by (handle, id), at most `limit`.
+ */
+export interface ChannelMemberPageQuery {
+  pattern: string;
+  after: { name: string; id: string } | null;
+  limit: number;
+}
+
+/** A roster read a page at a time: its people (not retired) and its agents, each by handle then id. */
+export interface ChannelMemberPager {
+  people(page: ChannelMemberPageQuery): Promise<ChannelMemberPageRow[]>;
+  agents(page: ChannelMemberPageQuery): Promise<ChannelMemberPageRow[]>;
+}
+
+/**
+ * getChannelMembers' roster of a channel, private channel or DM (its
+ * channel_humans and channel_agents rows; an enabled `#all`, the server
+ * audience) a page at a time in the database rather than whole, for a picker
+ * that offers the first few of a large one (platform/mentions). The same
+ * conditions as getChannelMembers' reads: people who are members of the
+ * channel's server (`#all`: serverAudienceMemberCondition), live agents that
+ * pass activeAppBotOrOrdinaryAgent (`#all`: listedServerAgent); and people who
+ * are not retired. Null for
+ * a roster getChannelMembers assembles from others (a joint channel's from
+ * every server's projection; a thread's or task's from its parent) and for no
+ * live channel: read those whole.
+ */
+export async function getChannelMemberPager(channelId: string): Promise<ChannelMemberPager | null> {
+  const channel = await getChannel(channelId);
+  if (!channel || !(channel.type === "channel" || channel.type === "private" || channel.type === "dm")) return null;
+  const serverAudience = isEnabledAllChannel(channel);
+  const db = getDb();
+  const afterKey = (name: SQLWrapper, id: SQLWrapper, after: ChannelMemberPageQuery["after"]) =>
+    after ? sql`(${name}, ${id}) > (${after.name}, ${after.id}::uuid)` : undefined;
+  return {
+    async people({ pattern, after, limit }) {
+      const columns = { id: users.id, serverId: serverMembers.serverId, name: users.name, displayName: users.displayName, avatarUrl: users.avatarUrl, role: serverMembers.role };
+      const matching = and(
+        isNull(users.retiredAt),
+        sql`(${users.name} ILIKE ${pattern} OR ${users.displayName} ILIKE ${pattern})`,
+        afterKey(users.name, users.id, after),
+      );
+      return serverAudience
+        ? db.select(columns).from(serverMembers)
+          .innerJoin(users, eq(users.id, serverMembers.userId))
+          .where(and(serverAudienceMemberCondition(channel.serverId), matching))
+          .orderBy(asc(users.name), asc(users.id)).limit(limit)
+        : db.select(columns).from(channelHumans)
+          .innerJoin(users, eq(users.id, channelHumans.userId))
+          .innerJoin(serverMembers, and(eq(serverMembers.serverId, channel.serverId), eq(serverMembers.userId, channelHumans.userId)))
+          .where(and(eq(channelHumans.channelId, channel.id), matching))
+          .orderBy(asc(users.name), asc(users.id)).limit(limit);
+    },
+    async agents({ pattern, after, limit }) {
+      const columns = { id: agents.id, serverId: agents.serverId, name: agents.name, displayName: agents.displayName, avatarUrl: agents.avatarUrl };
+      const matching = and(
+        isNull(agents.deletedAt),
+        serverAudience ? listedServerAgent() : activeAppBotOrOrdinaryAgent(),
+        sql`(${agents.name} ILIKE ${pattern} OR ${agents.displayName} ILIKE ${pattern})`,
+        afterKey(agents.name, agents.id, after),
+      );
+      const rows = serverAudience
+        ? await db.select(columns).from(agents)
+          .where(and(eq(agents.serverId, channel.serverId), matching))
+          .orderBy(asc(agents.name), asc(agents.id)).limit(limit)
+        : await db.select(columns).from(channelAgents)
+          .innerJoin(agents, eq(agents.id, channelAgents.agentId))
+          .where(and(eq(channelAgents.channelId, channel.id), matching))
+          .orderBy(asc(agents.name), asc(agents.id)).limit(limit);
+      return rows.map((row) => ({ ...row, role: null }));
+    },
+  };
 }
 
 /**
@@ -6000,26 +8283,17 @@ export interface ChannelMemberServer {
   slug: string;
 }
 
-/**
- * The `servers` an Agent's member listing shows for a human: every server the
- * person participates through in a joint roster, as `{ name, slug }`, with the
- * Agent's own server marked `yours: true` (the Agent cannot tell its own server
- * from the order or the slug alone), when at least one of them is not the
- * Agent's own server. Undefined otherwise (a non-joint roster, or a person only
- * on the Agent's own server), so ordinary listings are unchanged.
- */
+/** Source labels visible from this entry omit the entry itself. Other server
+ * identities never fill a missing source; an empty list has no badges. */
 export function agentVisibleMemberServers(
   member: { servers?: readonly ChannelMemberServer[] },
   viewerServerId: string,
 ): Array<{ name: string; slug: string; yours?: true }> | undefined {
   const servers = member.servers;
   if (!servers || servers.length === 0) return undefined;
-  if (servers.every((server) => server.id === viewerServerId)) return undefined;
-  return servers.map((server) => ({
-    name: server.name,
-    slug: server.slug,
-    ...(server.id === viewerServerId ? { yours: true as const } : {}),
-  }));
+  const visible = servers.filter(server => server.id !== viewerServerId);
+  if (!visible.length) return undefined;
+  return visible.map(server => ({ name: server.name, slug: server.slug }));
 }
 
 /** The viewed server first (when present), then the rest by name, then id. */
@@ -6041,6 +8315,11 @@ export function orderChannelMemberServers(
  */
 export async function getLocalChannelMemberIds(channelId: string) {
   const db = getDb();
+  const scope=(await resolveJointHumanMembershipScopes({localChannelIds:[channelId]},db)).get(channelId);
+  if(scope) {
+    const [humans,agents]=await Promise.all([getJointHumanDeliveryRows([channelId],db),getChannelAgents(channelId)]);
+    return {userIds:new Set(humans.map(row=>row.id)),agentIds:new Set(agents.map(row=>row.id))};
+  }
   const [agentRows, humanRows] = await Promise.all([
     db.select({ id: channelAgents.agentId }).from(channelAgents).where(eq(channelAgents.channelId, channelId)),
     db.select({ id: channelHumans.userId }).from(channelHumans).where(eq(channelHumans.channelId, channelId)),
@@ -6049,6 +8328,17 @@ export async function getLocalChannelMemberIds(channelId: string) {
     agentIds: new Set(agentRows.map((row) => row.id)),
     userIds: new Set(humanRows.map((row) => row.id)),
   };
+}
+
+/** Only manager selection, never a membership or visibility predicate. */
+export async function getJointHumanManagerCandidateIds(channelId:string,userIds:readonly string[]) {
+  const db=getDb(),scope=(await resolveJointHumanMembershipScopes({localChannelIds:[channelId]},db)).get(channelId);
+  if(!scope) return null;
+  if(!userIds.length || scope.entryServerId!==scope.hostServerId) return new Set<string>();
+  const rows=await db.execute<{id:string}>(sql`SELECT sm.user_id id FROM server_members sm
+    WHERE sm.server_id=${scope.hostServerId}::uuid AND sm.role='member'
+      AND sm.user_id IN (${sql.join(userIds.map(id=>sql`${id}::uuid`),sql`, `)})`);
+  return new Set(rows.rows.map(row=>row.id));
 }
 
 export interface ChannelRosterNameMatches {
@@ -6071,7 +8361,7 @@ type ChannelMembershipRole = (typeof channelAgents.$inferSelect)["role"];
  * exist (a public or private channel other than `#all`).
  */
 export function userChannelMembershipRow<Id extends string>(
-  channel: Omit<typeof channels.$inferSelect, "id"> & { id: Id },
+  channel: Omit<typeof channels.$inferSelect, "id" | "taskId" | "taskNumberHighWater" | "announcementArtifactId"> & { id: Id; lastPostAt?: string | null },
   channelRole: ChannelMembershipRole | undefined,
 ) {
   return {
@@ -6080,8 +8370,9 @@ export function userChannelMembershipRow<Id extends string>(
     name: channel.name,
     description: channel.description,
     type: channel.type,
+    // No `visitorVisible`: `listChannelsForAgent` rows carry the column as
+    // `guestVisible` only, and this row's shape stays theirs (user-info parity).
     guestVisible: channel.guestVisible,
-    guestJoinable: channel.guestJoinable,
     parentMessageId: channel.parentMessageId,
     parentChannelId: channel.parentChannelId,
     createdAt: channel.createdAt,
@@ -6089,7 +8380,15 @@ export function userChannelMembershipRow<Id extends string>(
     archivedByUserId: channel.archivedByUserId,
     archivedByAgentId: channel.archivedByAgentId,
     deletedAt: channel.deletedAt,
+    // A channel setting, not the caller's: `listChannelsForAgent` rows carry it
+    // as a column, so this row does too (user-info parity).
+    threadSort: channel.threadSort,
     joined: true,
+    // `listChannelsForAgent` carries `lastPostAt` once its one-time backfill
+    // has run (null = no posts yet; absent before that). Forward it verbatim so
+    // this route's row shape stays identical to the agent channel list's
+    // (user-info parity).
+    ...("lastPostAt" in channel ? { lastPostAt: channel.lastPostAt ?? null } : {}),
     ...(channelRole ? { channelRole } : {}),
   };
 }
@@ -6228,117 +8527,42 @@ type ChannelRosterRow = { id: string; name: string; serverSlug: string | null; r
  * of these joint channel projections, read by identity (agent or user id) in
  * two queries for any number of channels.
  *
- * Membership lives on the projections: each server's members are
- * `channel_agents`/`channel_humans` rows of that server's local `joint`
- * channel (agents only ever on their own server's; a person can belong to
- * several servers and so to several projections). While a projection and its
- * joint channel are active, its roster merges every active, live projection,
- * and the projection being viewed wins for a person on more than one;
- * otherwise (disconnected or closed) it is that projection's own rows alone.
+ * A person's row is their J membership (getComputedJointHumanPublicRowsForScopes);
+ * an agent's is its channel_agents row on any active, live projection of the
+ * joint. A channel with no joint projection reads its own rows, as
+ * getChannelMembers does.
  */
 async function getJointChannelRosterRowsForSubject(
   channelIds: readonly string[],
   subject: { kind: "agent" | "human"; id: string },
 ): Promise<Map<string, ChannelRosterRow>> {
   const db = getDb();
-  const peerProjection = alias(jointChannelServers, "subject_roster_peer_projection");
-  const peerChannel = alias(channels, "subject_roster_peer_channel");
-  const projectionRows = await db
-    .select({ channelId: jointChannelServers.localChannelId, peerChannelId: peerChannel.id })
-    .from(jointChannelServers)
-    .innerJoin(jointChannels, eq(jointChannels.id, jointChannelServers.jointChannelId))
-    .leftJoin(peerProjection, and(
-      eq(peerProjection.jointChannelId, jointChannelServers.jointChannelId),
-      eq(peerProjection.status, "active"),
-    ))
-    .leftJoin(peerChannel, and(eq(peerChannel.id, peerProjection.localChannelId), isNull(peerChannel.deletedAt)))
-    .where(and(
-      inArray(jointChannelServers.localChannelId, [...channelIds]),
-      eq(jointChannelServers.status, "active"),
-      eq(jointChannels.status, "active"),
-    ));
-  const projectionsByChannel = new Map<string, string[]>();
-  for (const row of projectionRows) {
-    const projections = projectionsByChannel.get(row.channelId) ?? [];
-    if (row.peerChannelId) projections.push(row.peerChannelId);
-    projectionsByChannel.set(row.channelId, projections);
+  const scopes = await resolveJointHumanMembershipScopes({localChannelIds:channelIds},db);
+  const result = new Map<string,ChannelRosterRow>();
+  const jointScopes=[...scopes.values()];
+  if(subject.kind==="human") {
+    for(const {localChannelId,human} of await getComputedJointHumanPublicRowsForScopes(jointScopes,[subject.id],db)) result.set(localChannelId,human);
+  } else if(jointScopes.length) {
+    const rows=await db.execute<{localChannelId:string;id:string;name:string;serverSlug:string}>(sql`
+      SELECT v.local_channel_id AS "localChannelId",a.id,a.name,s.slug AS "serverSlug"
+      FROM joint_channel_servers v JOIN joint_channels j ON j.id=v.joint_channel_id AND j.status='active'
+      JOIN channels vc ON vc.id=v.local_channel_id AND vc.deleted_at IS NULL
+      JOIN joint_channel_servers peer ON peer.joint_channel_id=v.joint_channel_id AND peer.status='active'
+      JOIN channels pc ON pc.id=peer.local_channel_id AND pc.deleted_at IS NULL
+      JOIN channel_agents ca ON ca.channel_id=peer.local_channel_id AND ca.agent_id=${subject.id}::uuid
+      JOIN agents a ON a.id=ca.agent_id AND a.server_id=peer.server_id AND a.deleted_at IS NULL
+      JOIN servers s ON s.id=a.server_id AND s.deleted_at IS NULL
+      WHERE v.local_channel_id IN (${sql.join(jointScopes.map(scope=>sql`${scope.localChannelId}::uuid`),sql`, `)})
+        AND v.status='active' AND NOT (${jointMembershipRemovalPendingSql(sql`v.joint_channel_id`,"agent",sql`a.id`)})`);
+    for(const {localChannelId,...row} of rows.rows) result.set(localChannelId,row);
   }
-  const rosterChannelsFor = (channelId: string) => {
-    const projections = projectionsByChannel.get(channelId);
-    if (!projections) return [channelId];
-    return [
-      ...projections.filter((projection) => projection !== channelId),
-      ...projections.filter((projection) => projection === channelId),
-    ];
-  };
-  const readIds = [...new Set(channelIds.flatMap(rosterChannelsFor))];
+  const unscoped = channelIds.filter((id) => !scopes.has(id));
+  if (!unscoped.length) return result;
   const rows: Array<ChannelRosterRow & { channelId: string }> = subject.kind === "agent"
-    ? await getChannelAgentsRawForChannels(readIds, { id: subject.id })
-    : await getChannelHumansRawForChannels(readIds, { id: subject.id });
-
-  const result = new Map<string, ChannelRosterRow>();
-  for (const channelId of channelIds) {
-    for (const projection of rosterChannelsFor(channelId)) {
-      for (const { channelId: rowChannelId, ...row } of rows) {
-        if (rowChannelId === projection) result.set(channelId, row);
-      }
-    }
-  }
+    ? await getChannelAgentsRawForChannels(unscoped, { id: subject.id })
+    : await getChannelHumansRawForChannels(unscoped, { id: subject.id });
+  for (const { channelId: rowChannelId, ...row } of rows) result.set(rowChannelId, row);
   return result;
-}
-
-/**
- * Followers = attention/notification authority (see thread contract in
- * schema.ts). Reads thread_follows and is the source of truth for
- * notifications, unread, done, and follow/unfollow. Never use this to decide
- * whether someone may post — that is governed by getChannelMembers and
- * canUserPostToChannel / canAgentPostToChannel.
- */
-export async function getThreadFollowers(threadChannelId: string) {
-  const db = getDb();
-
-  const agentList = await db
-    .select({
-      id: agents.id,
-      name: agents.name,
-      displayName: agents.displayName,
-      status: agents.status,
-      avatarUrl: agents.avatarUrl,
-    })
-    .from(threadFollows)
-    .innerJoin(agents, eq(agents.id, threadFollows.followerId))
-    .where(and(
-      eq(threadFollows.threadChannelId, threadChannelId),
-      eq(threadFollows.followerType, "agent"),
-      isNull(threadFollows.unfollowedAt),
-      isNull(agents.deletedAt),
-    ))
-    .orderBy(asc(threadFollows.createdAt));
-
-  const humanRows = await db
-    .select({
-      id: users.id,
-      name: users.name,
-      displayName: users.displayName,
-      description: users.description,
-      avatarUrl: users.avatarUrl,
-      email: users.email,
-    })
-    .from(threadFollows)
-    .innerJoin(users, eq(users.id, threadFollows.followerId))
-    .where(and(
-      eq(threadFollows.threadChannelId, threadChannelId),
-      eq(threadFollows.followerType, "user"),
-      isNull(threadFollows.unfollowedAt),
-    ))
-    .orderBy(asc(threadFollows.createdAt));
-
-  const humanList = humanRows.map(({ email, ...rest }) => ({
-    ...rest,
-    gravatarHash: createHash("sha256").update(email.trim().toLowerCase()).digest("hex"),
-  }));
-
-  return { agents: agentList, humans: humanList };
 }
 
 export type ManagedThreadAgentFollower = {
@@ -6358,6 +8582,26 @@ export async function getManagedThreadFollowerAudienceThreadChannelIds(threadCha
   if (!jointThread) return [threadChannelId];
   const projections = await getActiveJointThreadProjectionsByCanonicalThread(jointThread.canonicalThreadChannelId);
   return [...new Set(projections.map((projection) => projection.localThreadChannelId))];
+}
+
+/**
+ * The local thread projection that holds an Agent's follower row: the thread
+ * itself, or in a Joint Thread the projection on the Agent's own server (a
+ * follow is recorded against the follower's server's projection). Null when
+ * that server has no active projection of the thread.
+ */
+export async function getManagedFollowerThreadChannelIdForServer(
+  threadChannelId: string,
+  agentServerId: string,
+): Promise<string | null> {
+  const threadChannelIds = await getManagedThreadFollowerAudienceThreadChannelIds(threadChannelId);
+  if (threadChannelIds.length === 0) return null;
+  const [projection] = await getDb()
+    .select({ id: channels.id })
+    .from(channels)
+    .where(and(inArray(channels.id, threadChannelIds), eq(channels.serverId, agentServerId)))
+    .limit(1);
+  return projection?.id ?? null;
 }
 
 /**
@@ -6386,7 +8630,8 @@ export async function getManagedThreadAgentFollowers(threadChannelId: string): P
     .innerJoin(agents, eq(agents.id, threadFollows.followerId))
     .innerJoin(channels, and(
       eq(channels.id, threadFollows.threadChannelId),
-      eq(channels.type, "thread"),
+      // Task v2: a task conversation's followers are managed as a thread's.
+      inArray(channels.type, ["thread", "task"]),
       isNull(channels.deletedAt),
     ))
     .innerJoin(servers, eq(servers.id, channels.serverId))
@@ -6395,6 +8640,7 @@ export async function getManagedThreadAgentFollowers(threadChannelId: string): P
       eq(threadFollows.followerType, "agent"),
       isNull(threadFollows.unfollowedAt),
       isNull(agents.deletedAt),
+      activeAppBotOrOrdinaryAgent(),
     ))
     .orderBy(asc(threadFollows.createdAt));
 
@@ -6430,26 +8676,66 @@ function threadFollowerActivityEntry(input: {
   };
 }
 
+/** What the follower receipt names: a thread, or (task v2) a task conversation. */
+export type ManagedFollowerConversationKind = "thread" | "task";
+
 function formatThreadFollowerRemovalText(input: {
   actorLabel: string;
   threadLabel: string;
+  conversationKind?: ManagedFollowerConversationKind;
 }): string {
+  const noun = input.conversationKind === "task" ? "task" : "thread";
   return [
     `actor: ${input.actorLabel}`,
-    `thread: ${input.threadLabel}`,
-    "Ordinary thread updates stopped. Personal mentions and task assignments can still notify you. You can follow the thread again.",
+    `${noun}: ${input.threadLabel}`,
+    `Ordinary ${noun} updates stopped. Personal mentions and task assignments can still notify you. You can follow the ${noun} again.`,
   ].join("\n");
 }
 
 function formatThreadFollowerRestoreText(input: {
   actorLabel: string;
   threadLabel: string;
+  conversationKind?: ManagedFollowerConversationKind;
 }): string {
+  const noun = input.conversationKind === "task" ? "task" : "thread";
   return [
     `actor: ${input.actorLabel}`,
-    `thread: ${input.threadLabel}`,
-    "Thread updates resumed because your follower entry was restored.",
+    `${noun}: ${input.threadLabel}`,
+    `${noun === "task" ? "Task" : "Thread"} updates resumed because your follower entry was restored.`,
   ].join("\n");
+}
+
+/**
+ * Task v2: a task conversation's Agent followers are managed as a thread's.
+ * The task's creator stands where a thread's parent-message author does (a
+ * channel manager may always manage). Every live task-conversation row — a
+ * joint projection included — carries its task (channels_task_id_matches_type;
+ * only a deleted task's soft-deleted conversation has none), and
+ * the receipt names the task by its ref as seen from that row's parent
+ * channel (`#channel:#7`; a DM task: `Task #7`). Null fails closed.
+ */
+export async function resolveTaskConversationFollowerManagement(
+  conversation: { taskId: string | null; parentChannelId: string | null },
+  executor: DatabaseExecutor = getDb(),
+): Promise<{ taskId: string; createdByType: "user" | "agent"; createdById: string; label: string } | null> {
+  if (!conversation.taskId) return null;
+  const [task] = await executor
+    .select({ id: tasks.id, taskNumber: tasks.taskNumber, createdByType: tasks.createdByType, createdById: tasks.createdById })
+    .from(tasks)
+    .where(eq(tasks.id, conversation.taskId))
+    .limit(1);
+  if (!task) return null;
+  const [parent] = conversation.parentChannelId
+    ? await executor
+      .select({ name: channels.name, type: channels.type })
+      .from(channels)
+      .where(eq(channels.id, conversation.parentChannelId))
+      .limit(1)
+    : [];
+  const label = parent && parent.type !== "dm"
+    ? formatRaftChannelTaskRef(parent.name, task.taskNumber)
+    : `Task #${task.taskNumber}`;
+  return { taskId: task.id, createdByType: task.createdByType, createdById: task.createdById, label };
 }
 
 /**
@@ -6464,6 +8750,7 @@ export async function removeManagedAgentThreadFollower(input: {
   agentId: string;
   actorLabel: string;
   threadLabel: string;
+  conversationKind?: ManagedFollowerConversationKind;
   activity: AgentActivity;
   activityDetail: string;
 }): Promise<ManagedAgentThreadFollowerMutation> {
@@ -6541,7 +8828,7 @@ export async function removeManagedAgentThreadFollower(input: {
     const eventId = randomUUID();
     const token = removalToken.toISOString();
     const dedupeKey = `${removalPrefix}${token}`;
-    const title = "Removed from thread followers";
+    const title = input.conversationKind === "task" ? "Removed from task followers" : "Removed from thread followers";
     const text = formatThreadFollowerRemovalText(input);
     await tx.insert(agentActivityEvents).values({
       id: eventId,
@@ -6566,6 +8853,7 @@ export async function restoreManagedAgentThreadFollower(input: {
   agentId: string;
   actorLabel: string;
   threadLabel: string;
+  conversationKind?: ManagedFollowerConversationKind;
   activity: AgentActivity;
   activityDetail: string;
   removalToken: string;
@@ -6614,7 +8902,7 @@ export async function restoreManagedAgentThreadFollower(input: {
 
     const eventId = randomUUID();
     const dedupeKey = `${THREAD_FOLLOWER_RESTORED_ACTIVITY_PREFIX}${input.threadChannelId}:${canonicalToken}`;
-    const title = "Restored to thread followers";
+    const title = input.conversationKind === "task" ? "Restored to task followers" : "Restored to thread followers";
     const text = formatThreadFollowerRestoreText(input);
     const [latestActivityEvent] = await tx
       .select({ createdAt: agentActivityEvents.createdAt })
@@ -6652,13 +8940,31 @@ export async function isChannelHuman(
   userId: string,
   executor: DatabaseExecutor = getDb(),
 ): Promise<boolean> {
-  const db = executor;
-  const [row] = await db
-    .select({ userId: channelHumans.userId })
-    .from(channelHumans)
-    .where(and(eq(channelHumans.channelId, channelId), eq(channelHumans.userId, userId)));
-  return !!row;
+  const [row] = await executor
+    .select({ type: channels.type, userId: channelHumans.userId })
+    .from(channels)
+    .leftJoin(channelHumans, and(eq(channelHumans.channelId, channels.id), eq(channelHumans.userId, userId)))
+    .where(eq(channels.id, channelId));
+  if (row?.type === "joint") {
+    const scope = (await resolveJointHumanMembershipScopes({ localChannelIds: [channelId] }, executor)).get(channelId);
+    if (scope && (!(await filterJointActiveEntries([scope], executor)).has(channelId)
+      || (await filterJointPendingRemovalEntries([scope], "user", userId, executor)).has(channelId))) return false;
+    if (scope) {
+      return (await filterJointHumanMemberEntries([scope], userId, executor)).has(channelId);
+    }
+  }
+  return row?.userId != null;
 }
+
+/**
+ * `lockMembership`: the rows a posting verdict rests on are read FOR SHARE in
+ * the ambient transaction, by the same statement that decides. A removal
+ * committed first is then seen, and a later one waits for the caller's
+ * commit. Locking in a separate statement first is not enough: a row added
+ * after that lock is visible to the decision but not locked (RFC 082 §4.6,
+ * the card edit's attempt admission; peng, #12710).
+ */
+export type AgentPostingAuthorityOptions = { lockMembership?: boolean };
 
 /**
  * Check if an agent is in a channel (in channelAgents).
@@ -6667,13 +8973,18 @@ export async function isChannelAgent(
   channelId: string,
   agentId: string,
   executor: DatabaseExecutor = getDb(),
+  options: AgentPostingAuthorityOptions = {},
 ): Promise<boolean> {
   const db = executor;
-  const [row] = await db
+  const read = db
     .select({ agentId: channelAgents.agentId })
     .from(channelAgents)
     .where(and(eq(channelAgents.channelId, channelId), eq(channelAgents.agentId, agentId)));
-  return !!row;
+  const [row] = options.lockMembership ? await read.for("share") : await read;
+  if (!row) return false;
+  const scope = (await resolveJointHumanMembershipScopes({ localChannelIds: [channelId] }, db)).get(channelId);
+  return !scope || (await filterJointActiveEntries([scope], db)).has(channelId)
+    && !(await filterJointPendingRemovalEntries([scope], "agent", agentId, db)).has(channelId);
 }
 
 async function isServerHumanMember(serverId: string, userId: string): Promise<boolean> {
@@ -6685,17 +8996,19 @@ async function isServerHumanMember(serverId: string, userId: string): Promise<bo
   return !!row;
 }
 
-async function isServerAgent(serverId: string, agentId: string): Promise<boolean> {
+async function isServerAgent(serverId: string, agentId: string, options: AgentPostingAuthorityOptions = {}): Promise<boolean> {
   const db = getDb();
-  const [row] = await db
+  const read = db
     .select({ id: agents.id })
     .from(agents)
     .where(and(eq(agents.serverId, serverId), eq(agents.id, agentId), isNull(agents.deletedAt)));
+  const [row] = options.lockMembership ? await read.for("share") : await read;
   return !!row;
 }
 
 /**
  * Check if an agent can access (view) a channel.
+ * Only a live (not deleted) agent of the channel's own server can view.
  * Public channels: all server agents can view.
  * Private, joint channels, and DMs: only participating agents can view.
  */
@@ -6707,13 +9020,27 @@ export async function canAgentAccessChannel(channelId: string, agentId: string):
  * canAgentAccessChannel for several agents on one channel, in a fixed number
  * of queries: message delivery checks every recipient, and one check per agent
  * under Promise.all borrowed a pool connection each.
+ *
+ * Pinned to the channel's server: an agent of another server, or a deleted
+ * one, never has access, even to a public channel. (Callers used to pin it
+ * themselves; filterAgentAccessibleChannelIds is the batched form over many
+ * channels with the same rules.)
  */
 export async function filterAgentsWithChannelAccess(channelId: string, agentIds: readonly string[]): Promise<Set<string>> {
-  const ids = [...new Set(agentIds)];
-  if (ids.length === 0) return new Set();
+  if (agentIds.length === 0) return new Set();
   const db = getDb();
   const channel = await getChannel(channelId);
   if (!channel) return new Set();
+  const ids = (await db
+    .select({ id: agents.id })
+    .from(agents)
+    .where(and(
+      inArray(agents.id, [...new Set(agentIds)]),
+      eq(agents.serverId, channel.serverId),
+      isNull(agents.deletedAt),
+    )))
+    .map((row) => row.id);
+  if (ids.length === 0) return new Set();
 
   if (isAllSystemChannel(channel) && !isEnabledAllChannel(channel)) return new Set();
 
@@ -6731,11 +9058,16 @@ export async function filterAgentsWithChannelAccess(channelId: string, agentIds:
         eq(jointChannelServers.serverId, channel.serverId),
         eq(jointChannelServers.status, "active"),
         inArray(channelAgents.agentId, ids),
+        sql`NOT (${jointMembershipRemovalPendingSql(sql`${jointChannelServers.jointChannelId}`, "agent", sql`${channelAgents.agentId}`)})`,
       ));
     return new Set(memberships.map((row) => row.agentId));
   }
 
-  if (channel.type === "thread") {
+  if (channel.type === "task") {
+    return channel.parentChannelId ? filterAgentsWithChannelAccess(channel.parentChannelId, ids) : new Set();
+  }
+
+  if (isSubConversationType(channel.type)) {
     const jointThread = await getJointThreadProjectionByLocalThread(channelId, channel.serverId);
     if (jointThread) {
       return filterAgentsWithChannelAccess(jointThread.localParentChannelId, ids);
@@ -6756,6 +9088,204 @@ export async function filterAgentsWithChannelAccess(channelId: string, agentIds:
     .from(channelAgents)
     .where(and(eq(channelAgents.channelId, channelId), inArray(channelAgents.agentId, ids)));
   return new Set(members.map((row) => row.agentId));
+}
+
+/**
+ * canUserAccessChannel for several humans on one channel of `serverId`. For
+ * non-guests on a top-level conversation (channel, private, dm, joint) it
+ * runs a fixed number of queries; guests (whose reads also depend on their own
+ * guest gate) and any other channel type go through canUserAccessChannel
+ * itself, one human at a time, so the single check stays the source of truth
+ * for them. Like canUserAccessChannel it does not check that a non-guest is a
+ * member of the server; callers that need standing check it first.
+ */
+export async function filterUsersWithChannelAccess(channelId: string, userIds: readonly string[], serverId: ServerId): Promise<Set<string>> {
+  const ids = [...new Set(userIds)];
+  if (ids.length === 0) return new Set();
+  const db = getDb();
+  const channel = await getChannel(channelId);
+  if (!channel || channel.serverId !== serverId) return new Set();
+  const roles = new Map((await db
+    .select({ userId: serverMembers.userId, role: serverMembers.role })
+    .from(serverMembers)
+    .where(and(eq(serverMembers.serverId, serverId), inArray(serverMembers.userId, ids))))
+    .map((row) => [row.userId, row.role]));
+  const batchable = channel.type === "channel" || channel.type === "private" || channel.type === "dm" || channel.type === "joint";
+  const single = ids.filter((id) => !batchable || roles.get(id) === "guest");
+  const others = ids.filter((id) => !single.includes(id));
+  const accessible = new Set<string>();
+  for (const id of single) {
+    if (await canUserAccessChannel(channelId, id, serverId)) accessible.add(id);
+  }
+  if (others.length === 0 || (isAllSystemChannel(channel) && !isEnabledAllChannel(channel))) return accessible;
+
+  if (channel.type === "channel") {
+    for (const id of others) accessible.add(id);
+  } else if (channel.type === "joint") {
+    const resolvedJoint = await resolveChannelAccess({ serverId, channelId });
+    if (resolvedJoint?.kind === "joint") {
+      const rows = await db
+        .selectDistinct({ userId: channelHumans.userId })
+        .from(jointChannelServers)
+        .innerJoin(channelHumans, eq(channelHumans.channelId, jointChannelServers.localChannelId))
+        .where(and(
+          eq(jointChannelServers.jointChannelId, resolvedJoint.jointChannelId),
+          eq(jointChannelServers.serverId, serverId),
+          eq(jointChannelServers.status, "active"),
+          inArray(channelHumans.userId, others),
+        ));
+      for (const row of rows) accessible.add(row.userId);
+    }
+  } else {
+    // private and dm: an explicit membership row (a DM's human participants).
+    const rows = await db
+      .select({ userId: channelHumans.userId })
+      .from(channelHumans)
+      .where(and(eq(channelHumans.channelId, channelId), inArray(channelHumans.userId, others)));
+    for (const row of rows) accessible.add(row.userId);
+  }
+  return accessible;
+}
+
+/**
+ * Batched `canAgentAccessChannel` over many candidate channels of ONE server:
+ * returns the subset of `channelIds` the agent may view, with a constant
+ * number of queries independent of `channelIds.length`.
+ *
+ * Same rules as filterAgentsWithChannelAccess, plus the server pin: the agent
+ * must belong to `serverId` and not be deleted, and every channel must live
+ * in `serverId` (a thread's parent too). The #all system rule; public
+ * channels; private/dm by the agent's membership row; joint by the agent's
+ * membership of an active projection of that joint in this server; a thread
+ * through its parent (a joint thread's local parent projection, otherwise its
+ * parent message's channel), and a thread with neither through its own row.
+ */
+export async function filterAgentAccessibleChannelIds(
+  channelIds: readonly string[],
+  agentId: string,
+  serverId: ServerId,
+  opts?: { executor?: DatabaseExecutor },
+): Promise<Set<string>> {
+  const db = opts?.executor ?? getDb();
+  if (channelIds.length === 0) return new Set();
+  if (!await isLiveAgentOfServer(agentId, serverId, db)) return new Set();
+  return filterServerAgentAccessibleChannelIds(channelIds, agentId, serverId, db);
+}
+
+/** The agent server pin: a live (not deleted) agent of `serverId`. One query. */
+export async function isLiveAgentOfServer(agentId: string, serverId: ServerId, executor: DatabaseExecutor = getDb()): Promise<boolean> {
+  const [agent] = await executor
+    .select({ id: agents.id })
+    .from(agents)
+    .where(and(eq(agents.id, agentId), eq(agents.serverId, serverId), isNull(agents.deletedAt)))
+    .limit(1);
+  return Boolean(agent);
+}
+
+/** filterAgentAccessibleChannelIds once the agent is known to be a live agent of `serverId`. */
+async function filterServerAgentAccessibleChannelIds(
+  channelIds: readonly string[],
+  agentId: string,
+  serverId: ServerId,
+  db: DatabaseExecutor,
+): Promise<Set<string>> {
+  const accessible = new Set<string>();
+  // Same row filter as getChannel (not deleted) plus the cross-server guard.
+  const candidates = (await db
+    .select()
+    .from(channels)
+    .where(and(inArray(channels.id, [...new Set(channelIds)]), isNull(channels.deletedAt))))
+    .filter((channel) => channel.serverId === serverId)
+    .filter((channel) => !(isAllSystemChannel(channel) && !isEnabledAllChannel(channel)));
+  if (candidates.length === 0) return accessible;
+
+  const jointIds = candidates.filter((channel) => channel.type === "joint").map((channel) => channel.id);
+  const threads = candidates.filter((channel) => channel.type === "thread");
+  // Joint: an active projection of the channel on this server under an active
+  // joint (the resolveChannelAccess condition) AND the agent is a member of
+  // some active local projection of that joint on this server.
+  if (jointIds.length > 0) {
+    const memberProjection = alias(jointChannelServers, "agent_member_projection");
+    const rows = await db
+      .selectDistinct({ localChannelId: jointChannelServers.localChannelId })
+      .from(jointChannelServers)
+      .innerJoin(jointChannels, eq(jointChannels.id, jointChannelServers.jointChannelId))
+      .innerJoin(memberProjection, and(
+        eq(memberProjection.jointChannelId, jointChannelServers.jointChannelId),
+        eq(memberProjection.serverId, serverId),
+        eq(memberProjection.status, "active"),
+      ))
+      .innerJoin(channelAgents, and(
+        eq(channelAgents.channelId, memberProjection.localChannelId),
+        eq(channelAgents.agentId, agentId),
+      ))
+      .where(and(
+        inArray(jointChannelServers.localChannelId, jointIds),
+        eq(jointChannelServers.serverId, serverId),
+        eq(jointChannelServers.status, "active"),
+        eq(jointChannels.status, "active"),
+        sql`NOT (${jointMembershipRemovalPendingSql(jointChannelServers.jointChannelId, "agent", sql`${agentId}::uuid`)})`,
+      ));
+    for (const row of rows) accessible.add(row.localChannelId);
+  }
+
+  // Threads: a joint thread through its local parent projection, otherwise
+  // through its parent message's channel; neither => its own membership row.
+  const parentByThread = new Map<string, string>();
+  const unresolvedThreads = new Set<string>();
+  // Task conversations (task v2): through the channel the task is in
+  // (channels.parent_channel_id, the local parent on every face), as the
+  // single check filterAgentsWithChannelAccess does; a sub-conversation has
+  // no membership rows of its own, so without a parent it is not visible.
+  for (const channel of candidates) {
+    if (channel.type !== "task") continue;
+    if (channel.parentChannelId) parentByThread.set(channel.id, channel.parentChannelId);
+    else unresolvedThreads.add(channel.id);
+  }
+  if (threads.length > 0) {
+    for (const projection of await listActiveJointThreadProjectionRows({ localThreadChannelIds: threads.map((thread) => thread.id), serverId }, db)) {
+      if (!parentByThread.has(projection.localThreadChannelId)) parentByThread.set(projection.localThreadChannelId, projection.localParentChannelId);
+    }
+    const parentMessageIds = threads
+      .filter((thread) => !parentByThread.has(thread.id) && thread.parentMessageId)
+      .map((thread) => thread.parentMessageId!);
+    const parentChannelByMessage = new Map<string, string>();
+    if (parentMessageIds.length > 0) {
+      const rows = await db
+        .select({ id: messages.id, channelId: messages.channelId })
+        .from(messages)
+        .where(inArray(messages.id, [...new Set(parentMessageIds)]));
+      for (const row of rows) parentChannelByMessage.set(row.id, row.channelId);
+    }
+    for (const thread of threads) {
+      if (parentByThread.has(thread.id)) continue;
+      if (thread.parentMessageId) {
+        const parent = parentChannelByMessage.get(thread.parentMessageId);
+        if (parent) parentByThread.set(thread.id, parent);
+        else unresolvedThreads.add(thread.id);
+      }
+    }
+  }
+
+  const membershipIds = candidates
+    .filter((channel) => channel.type !== "channel" && channel.type !== "joint")
+    .filter((channel) => !parentByThread.has(channel.id) && !unresolvedThreads.has(channel.id))
+    .map((channel) => channel.id);
+  if (membershipIds.length > 0) {
+    const rows = await db
+      .select({ channelId: channelAgents.channelId })
+      .from(channelAgents)
+      .where(and(eq(channelAgents.agentId, agentId), inArray(channelAgents.channelId, membershipIds)));
+    for (const row of rows) accessible.add(row.channelId);
+  }
+  for (const channel of candidates) if (channel.type === "channel") accessible.add(channel.id);
+
+  const parentIds = [...new Set(parentByThread.values())];
+  if (parentIds.length > 0) {
+    const accessibleParents = await filterServerAgentAccessibleChannelIds(parentIds, agentId, serverId, db);
+    for (const [threadId, parentId] of parentByThread) if (accessibleParents.has(parentId)) accessible.add(threadId);
+  }
+  return accessible;
 }
 
 /**
@@ -6798,6 +9328,59 @@ async function agentFacingDmRef(serverId: string, peerName: string, peerKind: Dm
   return `dm:@${formatDmPeerRef(peerName, twins.has(peerName) ? peerKind : null)}`;
 }
 
+/**
+ * The other side of a DM as `userId` sees it (RFC 077: an assistant reading
+ * its owner's DMs names them from the owner's side): `alice`, `scout`, or with
+ * a `~human` / `~agent` suffix when a human and an agent share the name. The
+ * user themself for their own notes DM. Null when `userId` is not part of it.
+ */
+export async function resolveUserFacingDmPeerRef(serverId: string, userId: string, channelId: string): Promise<string | null> {
+  return (await resolveUserFacingDmPeer(serverId, userId, channelId))?.ref ?? null;
+}
+
+/** The other side of a DM from `userId`'s side: who it is and how to name it (`ref`, without `dm:@`). */
+export async function resolveUserFacingDmPeer(
+  serverId: string,
+  userId: string,
+  channelId: string,
+): Promise<{ id: string; type: DmPeerKind; ref: string } | null> {
+  const db = getDb();
+  const [identity] = await db
+    .select({ kind: dmChannelIdentities.kind, peerKey: dmChannelIdentities.peerKey })
+    .from(dmChannelIdentities)
+    .where(and(eq(dmChannelIdentities.channelId, channelId), eq(dmChannelIdentities.serverId, serverId)))
+    .limit(1);
+  const peerFor = async (id: string, name: string | null | undefined, type: DmPeerKind) =>
+    name ? { id, type, ref: (await agentFacingDmRef(serverId, name, type)).slice("dm:@".length) } : null;
+  const userName = async (id: string) => (await db.select({ name: users.name }).from(users).where(eq(users.id, id)).limit(1))[0]?.name;
+  const agentName = async (id: string) => (await db.select({ name: agents.name }).from(agents).where(and(eq(agents.id, id), eq(agents.serverId, serverId))).limit(1))[0]?.name;
+  if (identity) {
+    const participants = identity.peerKey.split(":");
+    if (!participants.includes(userId)) return null;
+    if (identity.kind === "human_self") return peerFor(userId, await userName(userId), "human");
+    const peerId = participants.find((id) => id !== userId);
+    if (!peerId) return null;
+    if (identity.kind === "human_human") return peerFor(peerId, await userName(peerId), "human");
+    if (identity.kind === "human_agent") return peerFor(peerId, await agentName(peerId), "agent");
+    return null;
+  }
+  // Legacy DMs without an identity row: the other member.
+  const [humanPeer] = await db
+    .select({ id: users.id, name: users.name })
+    .from(channelHumans)
+    .innerJoin(users, eq(channelHumans.userId, users.id))
+    .where(and(eq(channelHumans.channelId, channelId), sql`${channelHumans.userId} <> ${userId}`))
+    .limit(1);
+  if (humanPeer?.name) return peerFor(humanPeer.id, humanPeer.name, "human");
+  const [agentPeer] = await db
+    .select({ id: agents.id, name: agents.name })
+    .from(channelAgents)
+    .innerJoin(agents, eq(channelAgents.agentId, agents.id))
+    .where(eq(channelAgents.channelId, channelId))
+    .limit(1);
+  return agentPeer ? peerFor(agentPeer.id, agentPeer.name, "agent") : null;
+}
+
 export async function resolveAgentFacingChannelRef(
   serverId: string,
   agentId: string,
@@ -6808,7 +9391,7 @@ export async function resolveAgentFacingChannelRef(
   if (!await canAgentAccessChannel(channelId, agentId)) return null;
   // Task creation is top-level-only. Do not manufacture a #thread-name target
   // for an invalid historical row; that string is not part of the target DSL.
-  if (channel.type === "thread") return null;
+  if (isSubConversationType(channel.type)) return null;
   if (channel.type !== "dm") return `#${channel.name}`;
   // The agent's own private reminder conversation (no peer, no identity row).
   if (await getAgentPrivateSurfaceKind(agentId, channelId) === "reminders") return `dm:@${AGENT_REMINDERS_DM_PEER}`;
@@ -6938,6 +9521,33 @@ export async function listAgentFacingTaskChannelRefs(
       or(eq(channels.type, "channel"), isNotNull(channelAgents.agentId)),
     ));
   return resolveAgentFacingTaskChannelRefs(serverId, agentId, candidates);
+}
+
+/**
+ * Of these local channels, the ones where the agent can change a task now: not
+ * archived, and it is a member (or it is the enabled #all), which is what the
+ * task write routes ask of `canAgentPostToChannel` + `isChannelArchived`, in
+ * one query. For the idle task reminder, which must not chase a task whose
+ * every exit would be refused. A joint's removal in progress is not looked at:
+ * the channel still counts until the removal lands.
+ */
+export async function listAgentTaskWritableChannelIds(agentId: string, channelIds: readonly string[]): Promise<Set<string>> {
+  if (channelIds.length === 0) return new Set();
+  const rows = await getDb()
+    .select({ id: channels.id, name: channels.name, type: channels.type, memberAgentId: channelAgents.agentId })
+    .from(channels)
+    .leftJoin(channelAgents, and(
+      eq(channelAgents.channelId, channels.id),
+      eq(channelAgents.agentId, agentId),
+    ))
+    .where(and(
+      inArray(channels.id, [...channelIds]),
+      isNull(channels.deletedAt),
+      isNull(channels.archivedAt),
+    ));
+  return new Set(rows
+    .filter((row) => row.memberAgentId !== null || isEnabledAllChannel(row))
+    .map((row) => row.id));
 }
 
 /**
@@ -7085,9 +9695,19 @@ export async function canAgentReceiveChannelDelivery(
   const channel = await getChannel(channelId);
   if (!channel) return false;
 
+  // Task conversation (task v2): delivered like a thread — to active
+  // followers (or a personal mention) who can access the parent channel.
+  if (channel.type === "task") {
+    const parentAccess = channel.parentChannelId ? await canAgentAccessChannel(channel.parentChannelId, agentId) : false;
+    if (!parentAccess) return false;
+    return opts.personalMention ? true : isAgentActivelyFollowingThread(channelId, agentId);
+  }
+
   if (channel.type !== "thread") {
     return canAgentAccessChannel(channelId, agentId);
   }
+  // canAgentAccessChannel pins the server; the thread checks below need it too.
+  if (!await isServerAgent(channel.serverId, agentId)) return false;
 
   if (opts.personalMention) {
     return canAgentAccessThreadParentForDelivery(channelId, agentId);
@@ -7107,10 +9727,14 @@ export async function canUserPostToChannel(channelId: string, userId: string): P
   if (!channel) return false;
 
   const serverRole = await resolveHumanServerRole(channel.serverId, userId);
+  if (serverRole === null) return false;
   if (serverRole === "guest") {
-    if (channel.type === "thread") {
+    if (channel.type === "task") {
+      return channel.parentChannelId ? canUserPostToChannel(channel.parentChannelId, userId) : false;
+    }
+    if (isSubConversationType(channel.type)) {
       const jointThread = await getJointThreadProjectionByLocalThread(channelId, channel.serverId);
-      if (jointThread) return false;
+      if (jointThread) return canUserPostToChannel(jointThread.localParentChannelId, userId);
       if (!channel.parentMessageId) return false;
       const [parentMsg] = await getDb()
         .select({ channelId: messages.channelId })
@@ -7118,15 +9742,17 @@ export async function canUserPostToChannel(channelId: string, userId: string): P
         .where(eq(messages.id, channel.parentMessageId));
       return parentMsg ? canUserPostToChannel(parentMsg.channelId, userId) : false;
     }
+    const guestChannelId = await getGuestChannelId(channel.serverId, userId);
+    const jointEntry = channel.type === "joint"
+      ? (await filterGuestJointEntries(channel.serverId, userId, guestChannelId, [channel])).has(channel.id)
+      : false;
     return canGuestPostToChannel({
-      gateEnabled: await isGuestFeatureEnabled(channel.serverId, userId),
       serverRole,
+      channelId: channel.id,
+      guestChannelId,
       channelType: channel.type,
-      channelName: channel.name,
-      allChannelHidden: isAllSystemChannel(channel) && !isEnabledAllChannel(channel),
-      guestVisible: channel.guestVisible,
-      guestJoinable: channel.guestJoinable,
-      isChannelMember: await isChannelHuman(channelId, userId),
+      isChannelMember: channel.type === "joint" ? jointEntry : await isChannelHuman(channelId, userId),
+      jointEntry,
       archived: channel.archivedAt !== null,
       deleted: channel.deletedAt !== null,
     });
@@ -7135,7 +9761,13 @@ export async function canUserPostToChannel(channelId: string, userId: string): P
   if (isAllSystemChannel(channel) && !isEnabledAllChannel(channel)) return false;
   if (isEnabledAllChannel(channel)) return isServerHumanMember(channel.serverId, userId);
 
-  if (channel.type === "thread") {
+  // Task conversation (task v2): post authority = parent channel membership,
+  // exactly like a thread; following never grants it.
+  if (channel.type === "task") {
+    return channel.parentChannelId ? canUserPostToChannel(channel.parentChannelId, userId) : false;
+  }
+
+  if (isSubConversationType(channel.type)) {
     const jointThread = await getJointThreadProjectionByLocalThread(channelId, channel.serverId);
     if (jointThread) {
       return canUserPostToChannel(jointThread.localParentChannelId, userId);
@@ -7150,6 +9782,12 @@ export async function canUserPostToChannel(channelId: string, userId: string): P
       .where(eq(messages.id, channel.parentMessageId));
     if (!parentMsg) return false;
     return canUserPostToChannel(parentMsg.channelId, userId);
+  }
+
+  // Agent Lounge: any non-guest human of the Server may post (Guests returned
+  // above); the first post joins them (ensureLoungeHumanMember).
+  if (channel.type === "channel" && await isAgentLoungeChannel(channelId)) {
+    return isServerHumanMember(channel.serverId, userId);
   }
 
   return isChannelHuman(channelId, userId);
@@ -7169,7 +9807,7 @@ export const ASSISTANT_CHANNEL_FORBIDDEN_CODE = "assistant_channel_forbidden";
  * its DM with its owner, or a thread under that DM. Null when the agent is not
  * an assistant (the ordinary rules apply).
  */
-export async function assistantMayPostTo(channelId: string, agentId: string): Promise<boolean | null> {
+export async function assistantMayPostTo(channelId: string, agentId: string, options: AgentPostingAuthorityOptions = {}): Promise<boolean | null> {
   const db = getDb();
   const [agent] = await db
     .select({ ownerUserId: agents.assistantOwnerUserId })
@@ -7179,7 +9817,7 @@ export async function assistantMayPostTo(channelId: string, agentId: string): Pr
   const channel = await getChannel(channelId);
   if (!channel) return false;
   let dmChannelId = channelId;
-  if (channel.type === "thread") {
+  if (isSubConversationType(channel.type)) {
     if (!channel.parentChannelId) return false;
     dmChannelId = channel.parentChannelId;
     const parent = await getChannel(dmChannelId);
@@ -7187,31 +9825,39 @@ export async function assistantMayPostTo(channelId: string, agentId: string): Pr
   } else if (channel.type !== "dm") {
     return false;
   }
-  const [ownerRow] = await db
+  const ownerRead = db
     .select({ userId: channelHumans.userId })
     .from(channelHumans)
     .where(and(eq(channelHumans.channelId, dmChannelId), eq(channelHumans.userId, agent.ownerUserId)))
     .limit(1);
+  const [ownerRow] = options.lockMembership ? await ownerRead.for("share") : await ownerRead;
   if (!ownerRow) return false;
-  return isChannelAgent(dmChannelId, agentId);
+  return isChannelAgent(dmChannelId, agentId, db, options);
 }
 
-export async function canAgentPostToChannel(channelId: string, agentId: string): Promise<boolean> {
+export async function canAgentPostToChannel(channelId: string, agentId: string, options: AgentPostingAuthorityOptions = {}): Promise<boolean> {
   const channel = await getChannel(channelId);
   if (!channel) return false;
+  // Only a live agent of the channel's own server posts there (a thread's
+  // parent is re-checked by the recursion below).
+  if (!await isServerAgent(channel.serverId, agentId, options)) return false;
   // Before the #all shortcut below: that one lets any server agent post there.
-  const assistantVerdict = await assistantMayPostTo(channelId, agentId);
+  const assistantVerdict = await assistantMayPostTo(channelId, agentId, options);
   if (assistantVerdict !== null) return assistantVerdict;
 
   if (isAllSystemChannel(channel) && !isEnabledAllChannel(channel)) return false;
-  if (isEnabledAllChannel(channel)) return isServerAgent(channel.serverId, agentId);
+  if (isEnabledAllChannel(channel)) return isServerAgent(channel.serverId, agentId, options);
   // Private agent surfaces (dm:@reminders) are written by the server only.
   if (channel.type === "dm" && await isAgentPrivateSurfaceChannel(channelId)) return false;
 
-  if (channel.type === "thread") {
+  if (channel.type === "task") {
+    return channel.parentChannelId ? canAgentPostToChannel(channel.parentChannelId, agentId, options) : false;
+  }
+
+  if (isSubConversationType(channel.type)) {
     const jointThread = await getJointThreadProjectionByLocalThread(channelId, channel.serverId);
     if (jointThread) {
-      return canAgentPostToChannel(jointThread.localParentChannelId, agentId);
+      return canAgentPostToChannel(jointThread.localParentChannelId, agentId, options);
     }
   }
 
@@ -7222,10 +9868,10 @@ export async function canAgentPostToChannel(channelId: string, agentId: string):
       .from(messages)
       .where(eq(messages.id, channel.parentMessageId));
     if (!parentMsg) return false;
-    return canAgentPostToChannel(parentMsg.channelId, agentId);
+    return canAgentPostToChannel(parentMsg.channelId, agentId, options);
   }
 
-  return isChannelAgent(channelId, agentId);
+  return isChannelAgent(channelId, agentId, getDb(), options);
 }
 
 /**
@@ -7527,24 +10173,38 @@ async function findHumanPeerDm(
     .where(and(eq(serverMembers.serverId, serverId), eq(users.name, peerName)));
 
   for (const user of userResults) {
-    // Find DM channel between this agent and this user
-    const [dm] = await db
-      .select({ id: channels.id })
-      .from(channels)
-      .innerJoin(channelAgents, eq(channels.id, channelAgents.channelId))
-      .innerJoin(channelHumans, eq(channels.id, channelHumans.channelId))
-      .where(
-        and(
-          eq(channels.serverId, serverId),
-          eq(channels.type, "dm"),
-          eq(channelAgents.agentId, agentId),
-          eq(channelHumans.userId, user.id),
-          isNull(channels.deletedAt)
-        )
-      );
-    if (dm) return { channelId: dm.id, type: "dm" };
+    const dm = await findHumanAgentDm(serverId, agentId, user.id);
+    if (dm) return dm;
   }
   return null;
+}
+
+/**
+ * The existing DM between `agentId` and the human `userId` in this server, if
+ * any. The lookup `dm:@name` / `dm:@name~human` runs for each person with that
+ * name; the App-Bot-only `dm:sub:<sub>` runs it for the person the App's
+ * subject resolved to (agentWritableTarget).
+ */
+export async function findHumanAgentDm(
+  serverId: string,
+  agentId: string,
+  userId: string,
+): Promise<{ channelId: string; type: "dm" } | null> {
+  const [dm] = await getDb()
+    .select({ id: channels.id })
+    .from(channels)
+    .innerJoin(channelAgents, eq(channels.id, channelAgents.channelId))
+    .innerJoin(channelHumans, eq(channels.id, channelHumans.channelId))
+    .where(
+      and(
+        eq(channels.serverId, serverId),
+        eq(channels.type, "dm"),
+        eq(channelAgents.agentId, agentId),
+        eq(channelHumans.userId, userId),
+        isNull(channels.deletedAt)
+      )
+    );
+  return dm ? { channelId: dm.id, type: "dm" } : null;
 }
 
 async function findAgentPeerDm(
@@ -7591,12 +10251,19 @@ export async function resolveUserByName(serverId: string, name: string): Promise
   return user?.id || null;
 }
 
-export async function resolveAgentByName(serverId: string, name: string): Promise<string | null> {
+/**
+ * An agent of this server by its handle, as `finder` may find it: another
+ * person's personal assistant resolves as not found (agentFindableBy), so a
+ * handle never confirms that someone has one. `finder` is the human asking
+ * (their own assistant resolves) or the agent asking (itself resolves); `{}`
+ * finds no assistant at all.
+ */
+export async function resolveAgentByName(serverId: string, name: string, finder: AgentFinder): Promise<string | null> {
   const db = getDb();
   const [agent] = await db
     .select({ id: agents.id })
     .from(agents)
-    .where(and(eq(agents.serverId, serverId), eq(agents.name, name), isNull(agents.deletedAt)));
+    .where(and(eq(agents.serverId, serverId), eq(agents.name, name), isNull(agents.deletedAt), agentFindableBy(finder)));
   return agent?.id || null;
 }
 
@@ -7622,10 +10289,14 @@ export type ChannelFileEntry = {
   uploaderName: string | null;
   uploaderDisplayName: string | null;
   source: {
-    type: "channel" | "thread";
+    /** "task": a task v2 conversation under this channel (listed with `includeTaskConversations`). */
+    type: "channel" | "thread" | "task";
     channelId: string;
     parentMessageId: string | null;
     parentMessageShortId: string | null;
+    /** Task conversations only: the task the file was posted in. */
+    taskId?: string;
+    taskNumber?: number;
   };
 };
 
@@ -7634,15 +10305,54 @@ export type ChannelFilesCursor = {
   id: string;
 };
 
+type ListChannelFilesOptions = {
+  historyCutoff?: Date | null;
+  limit?: number;
+  cursor?: ChannelFilesCursor | null;
+  /**
+   * Task v2: also list attachments posted in the task conversations of this
+   * channel (canonical conversations, parent_channel_id = channelId). The
+   * route sets it whatever the reader's flag (task v2 per-task mode).
+   */
+  includeTaskConversations?: boolean;
+};
+
 export async function listChannelFiles(
   channelId: string,
-  opts: { historyCutoff?: Date | null; limit?: number; cursor?: ChannelFilesCursor | null } = {},
+  opts: ListChannelFilesOptions = {},
 ): Promise<ChannelFileEntry[]> {
-  const db = getDb();
   const limit = Math.max(1, Math.min(opts.limit ?? 500, 500));
+  const rows = await queryChannelFileRows(channelId, opts, opts.cursor ?? null, limit);
+  return rows.map(toChannelFileEntry);
+}
+
+/**
+ * Whether the history window leaves any of the channel's files out of
+ * listChannelFiles: one file posted before `historyCutoff`, in the same places
+ * the list looks (the channel, its threads, and with `includeTaskConversations`
+ * its task conversations).
+ */
+export async function hasChannelFilesBehindHistory(
+  channelId: string,
+  historyCutoff: Date,
+  opts: Pick<ListChannelFilesOptions, "includeTaskConversations"> = {},
+): Promise<boolean> {
+  const rows = await queryChannelFileRows(channelId, { ...opts, behindHistoryCutoff: historyCutoff }, null, 1);
+  return rows.length > 0;
+}
+
+async function queryChannelFileRows(
+  channelId: string,
+  opts: ListChannelFilesOptions & { behindHistoryCutoff?: Date },
+  cursor: ChannelFilesCursor | null,
+  limit: number,
+): Promise<Array<Record<string, unknown>>> {
+  const db = getDb();
   const historyCutoff = opts.historyCutoff ?? null;
-  const historyFilter = historyCutoff ? sql`AND m.created_at >= ${historyCutoff}` : sql``;
-  const cursor = opts.cursor ?? null;
+  // The files the window shows, or (behindHistoryCutoff) only those it hides.
+  const historyFilter = opts.behindHistoryCutoff
+    ? sql`AND m.created_at < ${opts.behindHistoryCutoff}`
+    : historyCutoff ? sql`AND m.created_at >= ${historyCutoff}` : sql``;
   const cursorFilter = cursor
     ? sql`AND (a.created_at < ${cursor.createdAt}::timestamptz OR (a.created_at = ${cursor.createdAt}::timestamptz AND a.id < ${cursor.id}))`
     : sql``;
@@ -7654,11 +10364,7 @@ export async function listChannelFiles(
           a.message_id,
           a.channel_id,
           a.filename,
-          a.mime_type,
-          a.size_bytes,
-          a.width,
-          a.height,
-          a.thumbnail_key,
+          a.object_id,
           a.created_at,
           a.uploader_type,
           a.uploader_id,
@@ -7686,11 +10392,7 @@ export async function listChannelFiles(
           a.message_id,
           a.channel_id,
           a.filename,
-          a.mime_type,
-          a.size_bytes,
-          a.width,
-          a.height,
-          a.thumbnail_key,
+          a.object_id,
           a.created_at,
           a.uploader_type,
           a.uploader_id,
@@ -7716,18 +10418,54 @@ export async function listChannelFiles(
         ORDER BY a.created_at DESC, a.id DESC
         LIMIT ${limit}
       )
+      ${opts.includeTaskConversations ? sql`
+      UNION ALL
+      (
+        SELECT
+          a.id,
+          a.message_id,
+          a.channel_id,
+          a.filename,
+          a.object_id,
+          a.created_at,
+          a.uploader_type,
+          a.uploader_id,
+          m.channel_id AS source_channel_id,
+          'task'::text AS source_type,
+          NULL::uuid AS parent_message_id
+        -- Task v2 conversations under this channel by parent_channel_id
+        -- (idx_channels_task_parent_channel), like the thread arm above.
+        FROM channels source_channel
+        INNER JOIN attachments a
+          ON a.channel_id = source_channel.id
+         AND a.message_id IS NOT NULL
+        INNER JOIN messages m
+          ON m.id = a.message_id
+         AND m.channel_id = source_channel.id
+        WHERE source_channel.parent_channel_id = ${channelId}
+          AND source_channel.type = 'task'
+          AND source_channel.deleted_at IS NULL
+          ${historyFilter}
+          ${cursorFilter}
+        ORDER BY a.created_at DESC, a.id DESC
+        LIMIT ${limit}
+      )` : sql``}
     )
     SELECT
       cf.id::text AS "id",
       cf.message_id::text AS "messageId",
       cf.channel_id::text AS "channelId",
       cf.filename AS "filename",
-      cf.mime_type AS "mimeType",
-      cf.size_bytes::int AS "sizeBytes",
-      cf.width::int AS "width",
-      cf.height::int AS "height",
-      cf.thumbnail_key AS "thumbnailKey",
-      cf.created_at::text AS "createdAt",
+      o.id::text AS "objectId",
+      o.mime_type AS "mimeType",
+      o.size_bytes::int AS "sizeBytes",
+      o.width::int AS "width",
+      o.height::int AS "height",
+      o.thumbnail_key AS "thumbnailKey",
+      -- UTC ISO with all six fractional digits, whatever the session time
+      -- zone: clients get one format, and the page cursor (compared exactly
+      -- against created_at) keeps microseconds that toISOString() would drop.
+      to_char(cf.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS "createdAt",
       cf.uploader_type AS "uploaderType",
       cf.uploader_id::text AS "uploaderId",
       CASE
@@ -7744,8 +10482,20 @@ export async function listChannelFiles(
       END AS "uploaderDisplayName",
       cf.source_channel_id::text AS "sourceChannelId",
       cf.source_type AS "sourceType",
-      cf.parent_message_id::text AS "parentMessageId"
+      cf.parent_message_id::text AS "parentMessageId",
+      source_task.id::text AS "sourceTaskId",
+      source_task.task_number AS "sourceTaskNumber"
     FROM candidate_files cf
+    -- Physical metadata comes from the object only, joined by primary key
+    -- after each arm's LIMIT (object_id is NOT NULL and a foreign key, so the
+    -- join always finds it).
+    LEFT JOIN attachment_objects o
+      ON o.id = cf.object_id
+    LEFT JOIN channels source_conversation
+      ON cf.source_type = 'task'
+     AND source_conversation.id = cf.source_channel_id
+    LEFT JOIN tasks source_task
+      ON source_task.id = source_conversation.task_id
     -- The uploader as a uuid (NULL when the stored id is not one), so the
     -- joins below are primary-key probes. Comparing id::text instead hides
     -- the primary keys: on a channel with 500 files that compared every file
@@ -7765,37 +10515,40 @@ export async function listChannelFiles(
     ORDER BY cf.created_at DESC, cf.id DESC
     LIMIT ${limit}
   `);
+  return rows.rows as Array<Record<string, unknown>>;
+}
 
-  return rows.rows.map((row) => {
-    const r = row as Record<string, unknown>;
-    const parentMessageId = typeof r.parentMessageId === "string" ? r.parentMessageId : null;
-    return {
-      id: String(r.id),
-      messageId: String(r.messageId),
-      channelId: String(r.channelId),
-      filename: String(r.filename),
-      mimeType: String(r.mimeType),
-      sizeBytes: Number(r.sizeBytes),
-      width: r.width == null ? null : Number(r.width),
-      height: r.height == null ? null : Number(r.height),
-      thumbnailKey: typeof r.thumbnailKey === "string" ? r.thumbnailKey : null,
-      createdAt: String(r.createdAt),
-      uploaderType: r.uploaderType === "agent"
-        ? "agent"
-        : r.uploaderType === "external_projection"
-          ? "external_projection"
-          : "user",
-      uploaderId: String(r.uploaderId),
-      uploaderName: typeof r.uploaderName === "string" ? r.uploaderName : null,
-      uploaderDisplayName: typeof r.uploaderDisplayName === "string" ? r.uploaderDisplayName : null,
-      source: {
-        type: r.sourceType === "thread" ? "thread" : "channel",
-        channelId: String(r.sourceChannelId),
-        parentMessageId,
-        parentMessageShortId: parentMessageId ? parentMessageId.slice(0, 8) : null,
-      },
-    };
-  });
+function toChannelFileEntry(r: Record<string, unknown>): ChannelFileEntry {
+  const parentMessageId = typeof r.parentMessageId === "string" ? r.parentMessageId : null;
+  return {
+    id: String(r.id),
+    messageId: String(r.messageId),
+    channelId: String(r.channelId),
+    filename: String(r.filename),
+    mimeType: String(r.mimeType),
+    sizeBytes: Number(r.sizeBytes),
+    width: r.width == null ? null : Number(r.width),
+    height: r.height == null ? null : Number(r.height),
+    thumbnailKey: typeof r.thumbnailKey === "string" ? r.thumbnailKey : null,
+    createdAt: String(r.createdAt),
+    uploaderType: r.uploaderType === "agent"
+      ? "agent"
+      : r.uploaderType === "external_projection"
+        ? "external_projection"
+        : "user",
+    uploaderId: String(r.uploaderId),
+    uploaderName: typeof r.uploaderName === "string" ? r.uploaderName : null,
+    uploaderDisplayName: typeof r.uploaderDisplayName === "string" ? r.uploaderDisplayName : null,
+    source: {
+      type: r.sourceType === "thread" ? "thread" : r.sourceType === "task" ? "task" : "channel",
+      channelId: String(r.sourceChannelId),
+      parentMessageId,
+      parentMessageShortId: parentMessageId ? parentMessageId.slice(0, 8) : null,
+      ...(r.sourceType === "task" && typeof r.sourceTaskId === "string"
+        ? { taskId: r.sourceTaskId, taskNumber: Number(r.sourceTaskNumber) }
+        : {}),
+    },
+  };
 }
 
 // ── Thread support ───────────────────────────────────────
@@ -7880,6 +10633,7 @@ async function listCanonicalThreadsForChannelParentMessages(
     ) latest ON TRUE
     WHERE c.type = 'thread'
       AND c.deleted_at IS NULL
+      AND c.parent_channel_id = ${channelId}
       AND pm.channel_id = ${channelId}
       AND c.parent_message_id IN (${sql.join(dedupedParentMessageIds.map((id) => sql`${id}`), sql`, `)})
     ORDER BY
@@ -7918,6 +10672,7 @@ async function listCanonicalThreadsForChannel(channelId: string): Promise<Canoni
     ) latest ON TRUE
     WHERE c.type = 'thread'
       AND c.deleted_at IS NULL
+      AND c.parent_channel_id = ${channelId}
       AND pm.channel_id = ${channelId}
     ORDER BY
       c.parent_message_id,
@@ -7930,15 +10685,51 @@ async function listCanonicalThreadsForChannel(channelId: string): Promise<Canoni
   return rows.rows as CanonicalThreadRow[];
 }
 
+/**
+ * Every thread channel under a parent channel, as the agent inbox keys them.
+ * A joint channel's threads are local projections with no parent message
+ * (task #24): they are found through the parent's projection, the canonical
+ * parent's threads, and each thread's projection on the same server -- the
+ * mapping loadLocalThreadParentChannelIds reads in the other direction. No
+ * status filter: callers purge, and a stale projection's inbox rows must go
+ * too.
+ */
 export async function listThreadChannelIdsForParentChannel(channelId: string): Promise<string[]> {
   const db = getDb();
   const rows = await db.execute(sql`
-    SELECT DISTINCT c.id::text AS "threadChannelId"
+    SELECT c.id::text AS "threadChannelId"
     FROM channels c
     INNER JOIN messages pm ON pm.id = c.parent_message_id
     WHERE c.type = 'thread'
       AND c.deleted_at IS NULL
+      AND c.parent_channel_id = ${channelId}
       AND pm.channel_id = ${channelId}
+    UNION
+    SELECT thread_projection.local_channel_id::text AS "threadChannelId"
+    FROM joint_channel_servers parent_projection
+    INNER JOIN joint_channels parent_joint ON parent_joint.id = parent_projection.joint_channel_id
+    INNER JOIN channels canonical_thread
+      ON canonical_thread.parent_channel_id = parent_joint.canonical_channel_id
+     AND canonical_thread.type = 'thread'
+     AND canonical_thread.deleted_at IS NULL
+    INNER JOIN joint_channels thread_joint ON thread_joint.canonical_channel_id = canonical_thread.id
+    INNER JOIN joint_channel_servers thread_projection
+      ON thread_projection.joint_channel_id = thread_joint.id
+     AND thread_projection.server_id = parent_projection.server_id
+    INNER JOIN channels local_thread
+      ON local_thread.id = thread_projection.local_channel_id
+     AND local_thread.type = 'thread'
+     AND local_thread.deleted_at IS NULL
+    WHERE parent_projection.local_channel_id = ${channelId}
+    UNION
+    -- Task v2 conversations of this channel: the canonical conversation of an
+    -- ordinary channel, or this server's projection under a local joint
+    -- channel (both name the channel as parent_channel_id).
+    SELECT task_conversation.id::text AS "threadChannelId"
+    FROM channels task_conversation
+    WHERE task_conversation.type = 'task'
+      AND task_conversation.deleted_at IS NULL
+      AND task_conversation.parent_channel_id = ${channelId}
   `);
   return (rows.rows as Array<{ threadChannelId: string }>).map((row) => row.threadChannelId);
 }
@@ -7954,6 +10745,7 @@ async function listRecentCanonicalThreadParentMessageIds(channelId: string, limi
     INNER JOIN messages pm ON pm.id = c.parent_message_id
     WHERE c.type = 'thread'
       AND c.deleted_at IS NULL
+      AND c.parent_channel_id = ${channelId}
       AND pm.channel_id = ${channelId}
     GROUP BY c.parent_message_id
     ORDER BY max(pm.seq) DESC, c.parent_message_id DESC
@@ -8145,6 +10937,32 @@ export async function getOrCreateThread(
   return { id: canonical.threadChannelId, serverId: parentChannel.serverId, parentMessageId, created: false };
 }
 
+/**
+ * The joint record of a canonical thread, created if missing. Two first opens
+ * at once both read "none" and both insert; canonical_channel_id is unique, so
+ * the loser's insert does nothing and it takes the winner's record. (Before the
+ * index both inserted, and their local threads hung off different records.)
+ */
+async function insertOrTakeJointThread(input: {
+  canonicalChannelId: string;
+  createdByServerId: string;
+  createdByUserId: string | null;
+}): Promise<string> {
+  const db = getDb();
+  const [inserted] = await db.insert(jointChannels).values({ ...input, status: "active" })
+    .onConflictDoNothing({ target: jointChannels.canonicalChannelId })
+    .returning({ id: jointChannels.id });
+  if (inserted) return inserted.id;
+
+  const [winner] = await db
+    .select({ id: jointChannels.id })
+    .from(jointChannels)
+    .where(eq(jointChannels.canonicalChannelId, input.canonicalChannelId))
+    .limit(1);
+  if (!winner) throw new Error("Joint thread not found");
+  return winner.id;
+}
+
 export async function getOrCreateThreadForChannel(
   parentChannelId: string,
   parentMessageId: string,
@@ -8192,12 +11010,11 @@ export async function getOrCreateThreadForChannel(
     ))
     .limit(1);
 
-  const jointThreadId = existingJointThread?.id ?? (await db.insert(jointChannels).values({
+  const jointThreadId = existingJointThread?.id ?? await insertOrTakeJointThread({
     canonicalChannelId: canonicalThread.id,
     createdByServerId: parentChannel.serverId,
     createdByUserId: creatorType === "user" ? creatorId : null,
-    status: "active",
-  }).returning({ id: jointChannels.id }))[0].id;
+  });
 
   const parentProjections = await getActiveJointChannelProjectionsByLocalChannel(parentChannelId);
   let localThreadId: string | null = null;
@@ -8239,6 +11056,7 @@ type ThreadSummaryLatestReply = {
   senderDisplayName: string;
   senderAvatarUrl: string | null;
   createdAt: string;
+  updatedAt: string;
 };
 
 type ThreadSummaryResult = {
@@ -8379,13 +11197,15 @@ export async function getThreadSummaries(
         latest.sender_id AS "senderId",
         latest.sender_type AS "senderType",
         latest.message_type AS "messageType",
-        latest.created_at AS "createdAt"
+        latest.created_at AS "createdAt",
+        latest.updated_at AS "updatedAt"
       FROM (VALUES ${sql.join(threadStorageRows, sql`, `)}) AS input_threads(thread_id, storage_thread_id)
       JOIN LATERAL (
-        SELECT m.id, m.seq, m.content, m.sender_id, m.sender_type, m.message_type, m.created_at
+        SELECT m.id, m.seq, m.content, m.sender_id, m.sender_type, m.message_type, m.created_at, m.updated_at
         FROM messages m
         WHERE m.channel_id = input_threads.storage_thread_id
           AND m.message_type <> 'system'
+          ${opts?.historyCutoff ? sql`AND m.created_at > ${opts.historyCutoff}` : sql``}
         ORDER BY m.seq DESC
         LIMIT 3
       ) latest ON true
@@ -8427,6 +11247,7 @@ export async function getThreadSummaries(
     senderType: "user" | "agent" | "external_projection";
     messageType: string;
     createdAt: string | Date;
+    updatedAt: string | Date;
   };
   const latestRows = latestReplyRows.rows as LatestReplyRow[];
   const replySenderUserIds = [...new Set(latestRows.filter((r) => r.senderType === "user" && r.messageType !== "system").map((r) => r.senderId))];
@@ -8452,7 +11273,10 @@ export async function getThreadSummaries(
         avatarUrl: agents.avatarUrl,
       })
       .from(agents)
-      .where(inArray(agents.id, replySenderAgentIds))),
+      .where(and(
+        inArray(agents.id, replySenderAgentIds),
+        opts?.agentServerId ? eq(agents.serverId, opts.agentServerId) : undefined,
+      ))),
     externalReplyMessageIds.length === 0 ? [] : limit(() => db
       .select({
         messageId: externalMessageAuthorFacts.messageId,
@@ -8498,6 +11322,7 @@ export async function getThreadSummaries(
       throw new Error("External projection thread reply is missing immutable author fact");
     }
   }
+  const unresolvedAgentName = opts?.agentServerId ? "Unknown agent" : "Agent";
   const latestRepliesByThreadId = new Map<string, ThreadSummaryLatestReply[]>();
   for (const row of latestRows) {
     const isSystem = row.messageType === "system";
@@ -8512,18 +11337,19 @@ export async function getThreadSummaries(
         ? "System"
         : row.senderType === "external_projection"
           ? (externalReplyNames.get(row.messageId) ?? "External user")
-          : (replySenderNames.get(row.senderId) ?? (row.senderType === "agent" ? "Agent" : "User")),
+          : (replySenderNames.get(row.senderId) ?? (row.senderType === "agent" ? unresolvedAgentName : "User")),
       senderDisplayName: isSystem
         ? "System"
         : row.senderType === "external_projection"
           ? (externalReplyNames.get(row.messageId) ?? "External user")
-          : (replySenderDisplayNames.get(row.senderId) ?? (row.senderType === "agent" ? "Agent" : "User")),
+          : (replySenderDisplayNames.get(row.senderId) ?? (row.senderType === "agent" ? unresolvedAgentName : "User")),
       senderAvatarUrl: isSystem
         ? null
         : row.senderType === "external_projection"
           ? (externalReplyAvatars.get(row.messageId) ?? null)
           : (replySenderAvatars.get(row.senderId) ?? null),
       createdAt: row.createdAt instanceof Date ? row.createdAt.toISOString() : String(row.createdAt),
+      updatedAt: row.updatedAt instanceof Date ? row.updatedAt.toISOString() : String(row.updatedAt),
     });
     latestRepliesByThreadId.set(row.threadChannelId, list);
   }
@@ -8645,9 +11471,11 @@ type FollowedThreadStatsSource = "rw_mv" | "pg_legacy";
  * RW view cannot answer (a per-thread activity upper bound) and consistency
  * reads inside an authority transaction ("history_cutoff" is now only the label
  * of an authority-transaction read that carries a cutoff; a cutoff alone no
- * longer reroutes a read to Postgres).
+ * longer reroutes a read to Postgres). "task_conversation": the followed task
+ * conversations (task v2), which rw_followed_threads_v5 does not carry (it is
+ * keyed on thread parent messages); a small, per-user Postgres read.
  */
-type FollowedThreadStatsPostgresReason = "history_cutoff" | "activity_upper_bound" | "authority_transaction";
+type FollowedThreadStatsPostgresReason = "history_cutoff" | "activity_upper_bound" | "authority_transaction" | "task_conversation";
 type FollowedThreadStatsFallbackReason = "none" | FollowedThreadStatsPostgresReason;
 
 const RISINGWAVE_FOLLOWED_THREAD_STATS_CONTRACT_VERSION = 1;
@@ -8889,10 +11717,20 @@ export async function getFollowedThreadStatsFromPostgres(
   // a system message the user caused (NULL causal actor = no exclusion), not a
   // noise subtype. These reads serve the documented RW gaps, so they must not
   // reintroduce the pre-063 rule.
-  const unreadPredicate = sql`m.seq > COALESCE(rc.last_read_seq, 0)
+  const threadUnreadPredicate = sql`m.seq > COALESCE(rc.last_read_seq, 0)
               AND NOT (m.sender_type = 'user' AND m.sender_id = ${userId})
               AND NOT COALESCE(m.message_type = 'system' AND m.causal_actor_type = 'user' AND m.causal_actor_id = ${userId}::text, FALSE)
               AND (m.system_subtype IS NULL OR m.system_subtype NOT IN ('channel.self_unfollow_thread', 'task.deleted_summary'))`;
+  // Task conversations (the only threads of a "task_conversation" read): replies
+  // are chat messages, not lifecycle lines -- the task row's and Activity's count.
+  // Their unread is on the same basis (taskConversationUnreadMessageSql), so
+  // "N new" never counts a lifecycle line.
+  const replyCountExpr = postgresReason === "task_conversation"
+    ? sql`count(m.id) FILTER (WHERE m.message_type = 'chat')`
+    : sql`count(m.id)`;
+  const unreadPredicate = postgresReason === "task_conversation"
+    ? sql`${threadUnreadPredicate} AND ${taskConversationUnreadMessageSql(sql`m`, sql`true`)}`
+    : threadUnreadPredicate;
 
   const statsRows = await traceQuery(
     "channels.followed_threads_stats_by_threads",
@@ -8908,7 +11746,7 @@ export async function getFollowedThreadStatsFromPostgres(
         SELECT
           input_threads.thread_id,
           input_threads.storage_thread_id,
-          count(m.id)::int AS reply_count,
+          ${replyCountExpr}::int AS reply_count,
           count(m.id) FILTER (WHERE ${unreadPredicate})::int AS unread_count,
           max(m.seq) AS latest_seq,
           min(m.seq) FILTER (WHERE ${unreadPredicate}) AS first_unread_seq
@@ -9055,29 +11893,133 @@ export const __testReadStateAuthority = { fetchReadStateAuthorityRows };
 // Inbox residue (follow, done, notified mention) is not access authority.
 // Resolve the shared guest policy before SQL pagination. null means the
 // ordinary-member policy; [] means a guest with no readable channels.
+/** For a Guest, every conversation it may read (its channel, that channel's threads and tasks); null for anyone else. */
+export async function guestReadableConversationIds(serverId: string, userId: string, executor: DatabaseExecutor = getDb()): Promise<string[] | null> {
+  return guestInboxChannelIds(serverId, userId, executor);
+}
+
 async function guestInboxChannelIds(serverId: string, userId: string, executor: DatabaseExecutor): Promise<string[] | null> {
   if (await resolveHumanServerRole(serverId, userId, executor) !== "guest") return null;
-  const gateEnabled = await isGuestFeatureEnabled(serverId, userId, executor);
-  if (!gateEnabled) return [];
-  const rows = await executor.select({ channel: channels, memberId: channelHumans.userId, parentChannelId: messages.channelId })
+  // A Guest's inbox is its one channel and that channel's threads and tasks.
+  const guestChannelId = await getGuestChannelId(serverId, userId, executor);
+  if (!guestChannelId) return [];
+  const [bound] = await executor.select({ channel: channels, memberId: channelHumans.userId })
     .from(channels).leftJoin(channelHumans, and(
       eq(channelHumans.channelId, channels.id), eq(channelHumans.userId, userId),
-    )).leftJoin(messages, eq(messages.id, channels.parentMessageId)).where(and(eq(channels.serverId, serverId), isNull(channels.deletedAt)));
-  const readable = rows.filter(({ channel, memberId }) => canGuestReadChannel({
-    gateEnabled, serverRole: "guest", channelType: channel.type, channelName: channel.name,
-    allChannelHidden: isAllSystemChannel(channel) && !isEnabledAllChannel(channel),
-    guestVisible: channel.guestVisible, guestJoinable: channel.guestJoinable,
-    isChannelMember: memberId !== null, archived: channel.archivedAt !== null, deleted: false,
-  })).map(({ channel }) => channel.id);
-  const parents = new Set(readable);
-  return [...readable, ...rows.filter(({ channel, parentChannelId }) =>
-    channel.type === "thread" && parentChannelId !== null && parents.has(parentChannelId),
-  ).map(({ channel }) => channel.id)];
+    )).where(and(eq(channels.id, guestChannelId), eq(channels.serverId, serverId)))
+    .limit(1);
+  const jointEntry = bound?.channel.type === "joint"
+    && (await filterGuestJointEntries(serverId, userId, guestChannelId, [bound.channel], executor)).has(bound.channel.id);
+  if (!bound || !canGuestReadChannel({
+    serverRole: "guest", channelId: bound.channel.id, guestChannelId, channelType: bound.channel.type,
+    isChannelMember: bound.channel.type === "joint" ? jointEntry : bound.memberId !== null, jointEntry,
+    archived: bound.channel.archivedAt !== null, deleted: bound.channel.deletedAt !== null,
+  })) return [];
+  if (bound.channel.type === "joint") {
+    // P3: a joint channel's threads and tasks are this server's local faces
+    // of canonical conversations under the joint's canonical channel.
+    const faces = await executor.execute<{ id: string }>(sql`
+      SELECT tp.local_channel_id::text AS id
+      FROM joint_channel_servers rp
+      JOIN joint_channels rj ON rj.id=rp.joint_channel_id
+      -- parent_channel_id is the validated parent cache (jointConversationFamilySql).
+      JOIN channels ct ON ct.parent_channel_id=rj.canonical_channel_id AND ct.type IN ('thread','task') AND ct.deleted_at IS NULL
+      JOIN joint_channels tj ON tj.canonical_channel_id=ct.id
+      JOIN joint_channel_servers tp ON tp.joint_channel_id=tj.id AND tp.server_id=rp.server_id AND tp.status='active'
+      JOIN channels lc ON lc.id=tp.local_channel_id AND lc.deleted_at IS NULL
+      WHERE rp.local_channel_id=${guestChannelId}::uuid AND rp.server_id=${serverId}::uuid`);
+    return [guestChannelId, ...faces.rows.map((row) => row.id)];
+  }
+  const children = await executor.select({ id: channels.id })
+    .from(channels).leftJoin(messages, eq(messages.id, channels.parentMessageId))
+    .where(and(eq(channels.serverId, serverId), isNull(channels.deletedAt), or(
+      and(eq(channels.type, "thread"), eq(messages.channelId, guestChannelId)),
+      // Task conversations (task v2) inherit their parent channel's readability.
+      and(eq(channels.type, "task"), eq(channels.parentChannelId, guestChannelId)),
+    )));
+  return [guestChannelId, ...children.map((row) => row.id)];
 }
 
 function guestInboxAccessSql(ids: string[] | null, channelId: SQL): SQL {
   return ids === null ? sql`true` : ids.length === 0 ? sql`false`
     : sql`${channelId} IN (${sql.join(ids.map(id => sql`${id}::uuid`), sql`, `)})`;
+}
+
+/**
+ * Task v2: the followed task conversations of the canonical Postgres Activity
+ * read, as a `UNION ALL` arm of its `followed_threads` CTE (same columns, in
+ * order, plus `conversation_kind`). A task conversation's parent is its task's
+ * channel, `channels.parent_channel_id` on every face (a joint channel's local
+ * conversation already points at this server's local channel), so no parent
+ * message and no joint parent mapping; messages live in the canonical
+ * conversation (joint storage mapping like a joint thread). Visibility is the
+ * thread rule against that parent: this server, live, public or a member.
+ * parent_message_preview is the task title (search matches it; the API row
+ * takes the title from the task itself). Mirrors rw_conversation_parent_v1 in
+ * infra/risingwave/sql/078-task-conversations.sql.
+ */
+function followedTaskConversationsLegacyInboxArm(opts: {
+  serverId: string;
+  userId: string;
+  guestAccess: string[] | null;
+  withTaskColumns: boolean;
+}): SQL {
+  const { serverId, userId, guestAccess } = opts;
+  return sql`SELECT
+        conv.id AS source_channel_id,
+        COALESCE(canonical_conv.id, conv.id) AS storage_channel_id,
+        NULL::uuid AS parent_message_id,
+        conv_parent.id AS parent_channel_id,
+        conv_parent.name AS parent_channel_name,
+        conv_parent.type::text AS parent_channel_type,
+        conv_task.title AS parent_message_preview,
+        NULL::text AS parent_message_sender_type,
+        NULL::text AS parent_message_sender_id,
+        NULL::timestamptz AS parent_message_created_at,
+        NULL::bigint AS parent_message_seq,
+        ${opts.withTaskColumns
+          ? sql`conv_task.task_number AS task_number,
+        conv_task.status AS task_status,
+        conv_task.claimed_by_type AS task_claimed_by_type,
+        conv_task.claimed_by_id AS task_claimed_by_id,`
+          : sql`COALESCE(conv_rc.last_read_seq, 0) AS last_read_seq,`}
+        'task'::text AS conversation_kind
+      FROM thread_follows conv_follow
+      INNER JOIN channels conv
+        ON conv.id = conv_follow.thread_channel_id
+       AND conv.type = 'task'
+       AND conv.server_id = ${serverId}
+       AND conv.deleted_at IS NULL
+      INNER JOIN tasks conv_task
+        ON conv_task.id = conv.task_id
+      LEFT JOIN joint_channel_servers conv_projection
+        ON conv_projection.local_channel_id = conv.id
+       AND conv_projection.server_id = ${serverId}
+       AND conv_projection.status = 'active'
+      LEFT JOIN joint_channels conv_joint
+        ON conv_joint.id = conv_projection.joint_channel_id
+       AND conv_joint.status = 'active'
+      LEFT JOIN channels canonical_conv
+        ON canonical_conv.id = conv_joint.canonical_channel_id
+       AND canonical_conv.type = 'task'
+       AND canonical_conv.deleted_at IS NULL
+      INNER JOIN channels conv_parent
+        ON conv_parent.id = conv.parent_channel_id
+       AND conv_parent.server_id = ${serverId}
+       AND conv_parent.archived_at IS NULL
+       AND conv_parent.deleted_at IS NULL
+      LEFT JOIN channel_humans conv_parent_member
+        ON conv_parent_member.channel_id = conv_parent.id
+       AND conv_parent_member.user_id = ${userId}
+      LEFT JOIN user_channel_read_cursors conv_rc
+        ON conv_rc.channel_id = conv.id
+       AND conv_rc.user_id = ${userId}
+      WHERE ${guestInboxAccessSql(guestAccess, sql`conv_parent.id`)}
+        AND conv_follow.follower_type = 'user'
+        AND conv_follow.follower_id = ${userId}
+        AND conv_follow.done_at IS NULL
+        AND conv_follow.unfollowed_at IS NULL
+        AND (conv_parent.type = 'channel' OR conv_parent_member.user_id IS NOT NULL)`;
 }
 
 /** One followed thread as GET /api/channels/threads/followed returns it. */
@@ -9124,8 +12066,37 @@ export type FollowedThread = {
   unfollowedAt: string | null;
 };
 
+/**
+ * Task v2: a followed task conversation in the followed-threads list
+ * (`includeTaskConversations`). Same fields as a thread row, keyed by the
+ * reader's LOCAL task conversation (`threadChannelId`), with the task in place
+ * of the parent message: `parentMessagePreview` is the task title, the
+ * "parent" author/time are the task's creator and creation time, and there is
+ * no parent message (`parentMessageId: null`; `latestActivityMessageId` is null
+ * until the first reply).
+ */
+export type FollowedTaskConversation = Omit<FollowedThread, "parentMessageId" | "latestActivityMessageId" | "taskId" | "taskNumber" | "taskStatus"> & {
+  kind: "task";
+  parentMessageId: null;
+  latestActivityMessageId: string | null;
+  taskId: string;
+  taskNumber: number;
+  taskTitle: string;
+  taskStatus: string;
+  /** The chat message the task hangs under and its time (its place in the
+   *  channel); null for a task under no message, or whose source is deleted. */
+  sourceMessageId: string | null;
+  sourceMessageCreatedAt: string | null;
+};
+
 /** One followed thread before stats and read state: its parent message, parent channel and task. */
 type FollowedThreadSourceRow = {
+  /** Task v2: set for a followed task conversation (its parent is the task, not a message). */
+  conversationKind?: "task";
+  taskTitle?: string | null;
+  /** Task v2: the message the task hangs under (task conversations only). */
+  sourceMessageId?: string | null;
+  sourceMessageCreatedAt?: Date | null;
   threadChannelId: string;
   storageThreadChannelId: string;
   parentMessageId: string | null;
@@ -9255,13 +12226,18 @@ export const RISINGWAVE_FOLLOWED_THREADS_ROWS_SQL = `
         AND v.user_id = $2
     `;
 
+function followedThreadParentChannelIdsSql(parentChannelIds: readonly string[], parentChannelId: SQL): SQL {
+  if (parentChannelIds.length === 0) return sql`false`;
+  return sql`(${parentChannelId})::text IN (${sql.join(parentChannelIds.map((id) => sql`${id.toLowerCase()}`), sql`, `)})`;
+}
+
 function followedThreadsLegacyReason(ctx: FollowedThreadsQueryContext): FollowedThreadsLegacyReason | null {
   if (ctx.opts?.forceLegacyPath) return "forced";
   if (ctx.guestAccess !== null) return "guest";
   if (ctx.state !== "active") return "state";
   if (ctx.opts?.executor) return "executor";
   if (ctx.opts?.q) return "search";
-  if (ctx.opts?.channelId) return "channel_filter";
+  if (ctx.opts?.channelId || ctx.opts?.parentChannelIds) return "channel_filter";
   if (ctx.opts?.maxRows != null) return "max_rows";
   return null;
 }
@@ -9346,6 +12322,7 @@ async function queryFollowedRegularThreads(
         isNull(parentChannels.deletedAt),
         sql`(${parentChannels.type} = 'channel' OR ${parentChannelHumans.userId} IS NOT NULL)`,
         opts?.channelId ? eq(parentMessages.channelId, opts.channelId) : undefined,
+        opts?.parentChannelIds ? followedThreadParentChannelIdsSql(opts.parentChannelIds, sql`${parentMessages.channelId}`) : undefined,
         searchPattern
           ? sql`(
               ${parentChannels.name} ILIKE ${searchPattern}
@@ -9474,6 +12451,7 @@ async function queryFollowedJointThreads(ctx: FollowedThreadsQueryContext): Prom
             ? sql`TRUE`
             : sql`tf.unfollowed_at IS NULL`}
         ${opts?.channelId ? sql`AND local_parent.id = ${opts.channelId}::uuid` : sql``}
+        ${opts?.parentChannelIds ? sql`AND ${followedThreadParentChannelIdsSql(opts.parentChannelIds, sql`local_parent.id`)}` : sql``}
         ${searchPattern ? sql`AND (
           local_parent.name ILIKE ${searchPattern}
           OR parent_msg.content ILIKE ${searchPattern}
@@ -9507,6 +12485,152 @@ async function queryFollowedJointThreads(ctx: FollowedThreadsQueryContext): Prom
     unfollowedAt: row.unfollowedAt ? new Date(row.unfollowedAt) : null,
     activityUpperBoundSeq: row.activityUpperBoundSeq == null ? null : Number(row.activityUpperBoundSeq),
   }));
+}
+
+/**
+ * Task v2: the task conversations the user follows, in the follow state of
+ * the read (ctx.state, as the thread queries: active, done, unfollowed,
+ * unfollowed_active -- Done history and the Unfollowed lists list them like
+ * threads), keyed by
+ * the user's LOCAL conversation on this server (the canonical conversation on
+ * an ordinary channel, this server's projection on a joint channel), with the
+ * task standing in for the parent message. Visibility is the thread rule on
+ * the conversation's parent channel (this server, not archived/deleted, public
+ * or a member; guests: readable parents only). Messages live in the canonical
+ * conversation (`tasks.conversation_channel_id`), so stats read it there and
+ * the read cursor stays on the local conversation. All Postgres: the RW
+ * followed-threads view is keyed on thread parent messages.
+ */
+async function loadFollowedTaskConversations(
+  ctx: FollowedThreadsQueryContext,
+  historyCutoff: Date | undefined,
+): Promise<LoadedFollowedThreads> {
+  const { serverId, userId, db, traceQuery, guestAccess, state, opts } = ctx;
+  const searchPattern = opts?.q ? `%${opts.q}%` : null;
+  // Same follow-state conditions, history order and row cap as
+  // queryFollowedRegularThreads / queryFollowedJointThreads.
+  const doneCondition = state === "done"
+    ? sql`tf.done_at IS NOT NULL`
+    : state === "active" || state === "unfollowed_active"
+      ? sql`tf.done_at IS NULL`
+      : sql`TRUE`;
+  const followCondition = state === "unfollowed" || state === "unfollowed_active"
+    ? sql`tf.unfollowed_at IS NOT NULL`
+    : state === "done"
+      ? sql`TRUE`
+      : sql`tf.unfollowed_at IS NULL`;
+  const historyOrder = state === "done" || state === "unfollowed"
+    ? sql`ORDER BY ${state === "done" ? sql`tf.done_at` : sql`tf.unfollowed_at`} ${opts?.sort === "asc" ? sql`ASC` : sql`DESC`}, tf.thread_channel_id ${opts?.sort === "asc" ? sql`ASC` : sql`DESC`} LIMIT ${opts?.maxRows ?? 101}`
+    : sql``;
+  const result = await traceQuery(
+    "channels.followed_task_conversations_by_user",
+    () => db.execute(sql`
+      SELECT
+        conversation.id::text AS "threadChannelId",
+        COALESCE(task.conversation_channel_id, conversation.id)::text AS "storageThreadChannelId",
+        parent.id::text AS "parentChannelId",
+        parent.name AS "parentChannelName",
+        parent.type AS "parentChannelType",
+        task.id::text AS "taskId",
+        task.task_number AS "taskNumber",
+        task.title AS "taskTitle",
+        task.status AS "taskStatus",
+        task.claimed_by_type AS "taskClaimedByType",
+        task.claimed_by_id AS "taskClaimedById",
+        task.created_by_type AS "createdByType",
+        task.created_by_id AS "createdById",
+        task.created_at AS "createdAt",
+        source.id::text AS "sourceMessageId",
+        source.created_at AS "sourceMessageCreatedAt",
+        tf.done_at AS "doneAt",
+        tf.unfollowed_at AS "unfollowedAt",
+        COALESCE(suppression.done_through_seq, 0) AS "activityUpperBoundSeq"
+      FROM ${threadFollows} tf
+      INNER JOIN ${channels} conversation
+        ON conversation.id = tf.thread_channel_id
+       AND conversation.type = 'task'
+       AND conversation.server_id = ${serverId}
+       AND conversation.deleted_at IS NULL
+      INNER JOIN ${tasks} task
+        ON task.id = conversation.task_id
+      -- Where the task sits in its channel: the message it hangs under.
+      LEFT JOIN ${messages} source
+        ON source.id = task.source_message_id
+       AND source.deleted_at IS NULL
+      INNER JOIN ${channels} parent
+        ON parent.id = conversation.parent_channel_id
+       AND parent.server_id = ${serverId}
+       AND parent.archived_at IS NULL
+       AND parent.deleted_at IS NULL
+      LEFT JOIN ${channelHumans} parent_member
+        ON parent_member.channel_id = parent.id
+       AND parent_member.user_id = ${userId}
+      -- The unfollow boundary (as for a thread): the paired mention suppression
+      -- keeps the exact seq written by the explicit unfollow.
+      LEFT JOIN ${inboxSuppressionStates} suppression
+        ON suppression.receiver_type = 'user'
+       AND suppression.receiver_id = ${userId}::uuid
+       AND suppression.target_kind = 'public_thread_mention'
+       AND suppression.target_channel_id = conversation.id
+      WHERE tf.follower_type = 'user'
+        AND tf.follower_id = ${userId}
+        AND ${doneCondition}
+        AND ${followCondition}
+        AND (parent.type = 'channel' OR parent_member.user_id IS NOT NULL)
+        AND ${guestInboxAccessSql(guestAccess, sql`parent.id`)}
+        ${opts?.channelId ? sql`AND parent.id = ${opts.channelId}::uuid` : sql``}
+        ${searchPattern ? sql`AND (parent.name ILIKE ${searchPattern} OR task.title ILIKE ${searchPattern})` : sql``}
+      ${historyOrder}
+    `),
+    (queryResult) => ({ followed_task_conversations_count: queryResult.rows.length }),
+  );
+  const threads: FollowedThreadSourceRow[] = (result.rows as Array<Record<string, unknown>>).map((row) => ({
+    conversationKind: "task",
+    taskTitle: String(row.taskTitle ?? ""),
+    sourceMessageId: (row.sourceMessageId as string | null) ?? null,
+    sourceMessageCreatedAt: row.sourceMessageCreatedAt ? new Date(row.sourceMessageCreatedAt as string | Date) : null,
+    threadChannelId: String(row.threadChannelId),
+    storageThreadChannelId: String(row.storageThreadChannelId),
+    parentMessageId: null,
+    parentChannelId: String(row.parentChannelId),
+    parentChannelName: String(row.parentChannelName ?? ""),
+    parentChannelType: String(row.parentChannelType),
+    parentMessageContent: String(row.taskTitle ?? ""),
+    parentMessageCreatedAt: new Date(row.createdAt as string | Date),
+    parentMessageSenderType: String(row.createdByType),
+    parentMessageSenderId: String(row.createdById),
+    parentMessageSeq: null,
+    taskId: String(row.taskId),
+    taskNumber: Number(row.taskNumber),
+    taskStatus: String(row.taskStatus),
+    taskClaimedByType: (row.taskClaimedByType as "agent" | "user" | null) ?? null,
+    taskClaimedById: (row.taskClaimedById as string | null) ?? null,
+    doneAt: (row.doneAt as Date | string | null) ?? null,
+    unfollowedAt: (row.unfollowedAt as Date | string | null) ?? null,
+    // The stats stop at the unfollow boundary only for the frozen Unfollowed
+    // history, as for threads (loadFollowedThreadsLegacy).
+    activityUpperBoundSeq: state === "unfollowed" && row.activityUpperBoundSeq != null ? Number(row.activityUpperBoundSeq) : null,
+  }));
+  if (threads.length === 0) return { threads: [], statsRows: [], readStateByThread: new Map() };
+  const statsRows = await getFollowedThreadStatsFromPostgres(
+    userId,
+    threads,
+    historyCutoff,
+    traceQuery,
+    "task_conversation",
+    db,
+  );
+  const readStates = await attachReadState(
+    threads.map((thread) => ({ id: thread.threadChannelId })),
+    userId,
+    db,
+    traceQuery,
+  );
+  return {
+    threads,
+    statsRows,
+    readStateByThread: new Map(readStates.map((readState) => [readState.id, readState])),
+  };
 }
 
 /** Every follow state, any caller: the Postgres list, v3 stats, the read-state authority read. */
@@ -9637,6 +12761,10 @@ async function loadActiveFollowedThreadsFromRisingWave(
     // path is the expensive Postgres read, and running it exactly while RW is
     // overloaded would move the load onto the primary.
     if (isRisingWaveOverloadedError(rw.error)) throw rw.error;
+    // Not configured is not a transient read failure: the legacy path needs
+    // RisingWave for the stats too, and with no follows would answer an empty
+    // list that hides the outage. The route answers 503 rw_unconfigured.
+    if (rw.error instanceof RisingWaveNotConfiguredError) throw rw.error;
     return null;
   }
   const followedIds = (followSet.rows as Array<{ threadChannelId: string }>).map((row) => row.threadChannelId);
@@ -9793,13 +12921,14 @@ async function loadActiveFollowedThreadsFromRisingWave(
       SELECT
         channel_id::text AS "channelId",
         read_state_version::int AS "readStateVersion",
-        last_read_seq::text AS "maxReadSeq"
+        last_read_seq::text AS "maxReadSeq",
+        marked_unread AS "markedUnread"
       FROM user_channel_read_cursors
       WHERE user_id = ${userId}
         AND channel_id IN (${sql.join(rwThreadIds.map((id) => sql`${id}::uuid`), sql`, `)})
     `),
     (result) => ({ input_count: rwThreadIds.length, read_cursor_rows_count: result.rows.length }),
-  )).rows as Array<{ channelId: string; readStateVersion: number; maxReadSeq: string }>;
+  )).rows as Array<{ channelId: string; readStateVersion: number; maxReadSeq: string; markedUnread: boolean }>;
   const cursorByThread = new Map(cursorRows.map((row) => [row.channelId, row]));
   const readStateByThread = new Map<string, ReadStateSnapshot>();
   for (const row of rwVisible) {
@@ -9809,6 +12938,7 @@ async function loadActiveFollowedThreadsFromRisingWave(
       readCursorPresent: cursor !== undefined,
       readStateVersion: cursor?.readStateVersion ?? null,
       maxReadSeq: cursor?.maxReadSeq ?? null,
+      markedUnread: cursor?.markedUnread === true,
       latestActivityMessageId: row.lastReplyMessageId,
       latestActivitySeq: row.lastReplySeqExact,
       doneFrontierSeq: row.lastReplySeqExact ?? row.parentMessageSeq,
@@ -9828,7 +12958,7 @@ export async function getFollowedThreads(
   serverId: string,
   userId: string,
   historyCutoff?: Date,
-  opts?: FollowedThreadsOptions,
+  opts?: FollowedThreadsOptions & { includeTaskConversations?: false },
 ): Promise<FollowedThread[]> {
   return (await loadFollowedThreads(serverId, userId, historyCutoff, opts)).threads;
 }
@@ -9906,9 +13036,21 @@ function selectFollowedThreadsPage(
 export async function loadFollowedThreads(
   serverId: string,
   userId: string,
+  historyCutoff: Date | undefined,
+  opts: FollowedThreadsOptions & { includeTaskConversations: boolean },
+): Promise<{ threads: Array<FollowedThread | FollowedTaskConversation>; next: FollowedThreadsCursor | null }>;
+export async function loadFollowedThreads(
+  serverId: string,
+  userId: string,
+  historyCutoff?: Date,
+  opts?: FollowedThreadsOptions & { includeTaskConversations?: false },
+): Promise<{ threads: FollowedThread[]; next: FollowedThreadsCursor | null }>;
+export async function loadFollowedThreads(
+  serverId: string,
+  userId: string,
   historyCutoff?: Date,
   opts?: FollowedThreadsOptions,
-): Promise<{ threads: FollowedThread[]; next: FollowedThreadsCursor | null }> {
+): Promise<{ threads: Array<FollowedThread | FollowedTaskConversation>; next: FollowedThreadsCursor | null }> {
   const db = opts?.executor ?? getDb();
   const traceQuery = opts?.traceQuery ?? untracedDbQuery;
   const guestAccess = await guestInboxChannelIds(serverId, userId, db);
@@ -9928,6 +13070,16 @@ export async function loadFollowedThreads(
       legacy_reason: legacyReason ?? "rw_failed",
     });
     loaded = await loadFollowedThreadsLegacy(ctx, historyCutoff);
+  }
+  if (opts?.includeTaskConversations) {
+    const taskConversations = await loadFollowedTaskConversations(ctx, historyCutoff);
+    if (taskConversations.threads.length > 0) {
+      loaded = {
+        threads: [...loaded.threads, ...taskConversations.threads],
+        statsRows: [...loaded.statsRows, ...taskConversations.statsRows],
+        readStateByThread: new Map([...loaded.readStateByThread, ...taskConversations.readStateByThread]),
+      };
+    }
   }
   const { statsRows, readStateByThread } = loaded;
   let threads = loaded.threads;
@@ -10019,21 +13171,25 @@ export async function loadFollowedThreads(
     const stats = statsMap.get(t.threadChannelId);
     const readState = readStateByThread.get(t.threadChannelId);
     // Free-plan history cutoff: the counts and lastReplyAt are served as-is (a
-    // product decision); only the content of a latest reply older than the
-    // cutoff is withheld. The parent preview is not cut (it never was).
+    // product decision); the content of a latest reply behind the cutoff is
+    // withheld, and a thread start behind it is a 40-character glimpse, the
+    // header Activity can't do without (cindyz, task #8).
     const latestReplyBeforeCutoff = historyCutoffMs !== undefined
       && stats?.lastReplyAt != null
-      && new Date(stats.lastReplyAt).getTime() < historyCutoffMs;
-    const latestActivityContent = latestReplyBeforeCutoff ? "" : stats?.lastReplyContent ?? t.parentMessageContent;
+      && new Date(stats.lastReplyAt).getTime() <= historyCutoffMs;
+    const parentBehindCutoff = historyCutoffMs !== undefined
+      && t.parentMessageCreatedAt.getTime() <= historyCutoffMs;
+    const parentContent = parentBehindCutoff ? historyLimitedPreview(t.parentMessageContent) ?? "" : t.parentMessageContent;
+    const latestActivityContent = latestReplyBeforeCutoff ? "" : stats?.lastReplyContent ?? parentContent;
     return {
       threadChannelId: t.threadChannelId,
       parentMessageId: t.parentMessageId!,
       parentChannelId: t.parentChannelId,
       parentChannelName: t.parentChannelName,
       parentChannelType: t.parentChannelType,
-      parentMessagePreview: t.parentMessageContent.length > 100
-        ? t.parentMessageContent.slice(0, 100) + "…"
-        : t.parentMessageContent,
+      parentMessagePreview: parentContent.length > 100
+        ? parentContent.slice(0, 100) + "…"
+        : parentContent,
       parentMessageSenderType: t.parentMessageSenderType,
       parentMessageSenderId: t.parentMessageSenderId,
       parentMessageCreatedAt: t.parentMessageCreatedAt.toISOString(),
@@ -10068,6 +13224,16 @@ export async function loadFollowedThreads(
       doneAt: t.doneAt ? new Date(t.doneAt).toISOString() : null,
       isFollowing: !t.unfollowedAt,
       unfollowedAt: t.unfollowedAt ? new Date(t.unfollowedAt).toISOString() : null,
+      // Task v2 (includeTaskConversations): a task conversation row. Its
+      // parentMessageId / zero-reply latestActivityMessageId are null.
+      ...(t.conversationKind === "task"
+        ? {
+          kind: "task" as const,
+          taskTitle: t.taskTitle ?? "",
+          sourceMessageId: t.sourceMessageId ?? null,
+          sourceMessageCreatedAt: t.sourceMessageCreatedAt ? t.sourceMessageCreatedAt.toISOString() : null,
+        }
+        : {}),
     };
   });
 
@@ -10104,23 +13270,63 @@ export type InboxFilter = "all" | "unread" | "mentions" | "unread_mentions";
 export type InboxScope = "dms" | "no_dms";
 
 export function isDmScopedInboxItem(item: InboxItem): boolean {
-  return item.kind === "thread" ? item.parentChannelType === "dm" : item.channelType === "dm";
+  return isSubConversationInboxItem(item) ? item.parentChannelType === "dm" : item.channelType === "dm";
 }
 
 function dmScopeSqlPredicate(alias: SQL): SQL {
-  return sql`AND (${alias}."channelType" = 'dm' OR (${alias}."kind" = 'thread' AND ${alias}."parentChannelType" = 'dm'))`;
+  return sql`AND (${alias}."channelType" = 'dm' OR (${alias}."kind" IN ('thread', 'task') AND ${alias}."parentChannelType" = 'dm'))`;
 }
 
 // Complement of dmScopeSqlPredicate. COALESCE: a NULL type column must count as
 // "not a DM" instead of dropping the row through NOT NULL = NULL.
 function nonDmScopeSqlPredicate(alias: SQL): SQL {
-  return sql`AND NOT COALESCE(${alias}."channelType" = 'dm' OR (${alias}."kind" = 'thread' AND ${alias}."parentChannelType" = 'dm'), false)`;
+  return sql`AND NOT COALESCE(${alias}."channelType" = 'dm' OR (${alias}."kind" IN ('thread', 'task') AND ${alias}."parentChannelType" = 'dm'), false)`;
 }
 
 function inboxScopeSqlPredicate(scope: InboxScope | undefined, alias: SQL): SQL {
   if (scope === "dms") return dmScopeSqlPredicate(alias);
   if (scope === "no_dms") return nonDmScopeSqlPredicate(alias);
   return sql``;
+}
+
+/**
+ * Activity "Pinned" scope: the row's group conversation (its own channel, or a
+ * thread's or task conversation's parent channel) is one of the user's pinned conversations. The
+ * route resolves the pinned channel ids (pinned channels plus the DM of each
+ * pinned agent/human peer). SYNC REQUIRED with the RisingWave serving query
+ * (pinnedChannelIdsParam) and isPinnedScopedInboxItem (unfollowed merge).
+ */
+export function isPinnedScopedInboxItem(item: InboxItem, pinnedChannelIds: ReadonlySet<string>): boolean {
+  const groupChannelId = item.kind === "thread" || item.kind === "task" ? item.parentChannelId : item.channelId;
+  return typeof groupChannelId === "string" && pinnedChannelIds.has(groupChannelId.toLowerCase());
+}
+
+function pinnedScopeSqlPredicate(pinnedChannelIds: readonly string[] | undefined, groupChannelId: SQL): SQL {
+  if (pinnedChannelIds === undefined) return sql``;
+  if (pinnedChannelIds.length === 0) return sql`AND false`;
+  return sql`AND (${groupChannelId})::text IN (${sql.join(pinnedChannelIds.map((id) => sql`${id}`), sql`, `)})`;
+}
+
+/**
+ * Activity rows by their own id (`ids` on the route): a channel/DM row's
+ * channelId, a thread/task row's threadChannelId, so a client can refresh a few
+ * rows after a sync change. Narrows the selected rows only, like the channel
+ * facet (groups and activeUnreadCount stay list-wide). SYNC REQUIRED with the
+ * RisingWave serving query (rowIdsParam) and the unfollowed merge.
+ */
+export function inboxItemRowId(item: InboxItem): string {
+  return item.kind === "thread" || item.kind === "task" ? item.threadChannelId : item.channelId;
+}
+
+function rowIdsSqlPredicate(rowIds: readonly string[] | undefined, rowId: SQL): SQL {
+  if (rowIds === undefined) return sql``;
+  if (rowIds.length === 0) return sql`AND false`;
+  return sql`AND (${rowId})::text IN (${sql.join(rowIds.map((id) => sql`${id}`), sql`, `)})`;
+}
+
+function normalizePinnedChannelIds(ids: readonly string[] | undefined): string[] | undefined {
+  if (ids === undefined) return undefined;
+  return [...new Set(ids.map((id) => id.toLowerCase()))].sort();
 }
 
 export type InboxGroupCount = {
@@ -10166,7 +13372,10 @@ export type InboxItem =
       readState?: InboxScopeReadFrontier;
       doneAt?: string | null;
     }
-  | {
+  | ThreadInboxItem
+  | TaskConversationInboxItem;
+
+export type ThreadInboxItem = {
       kind: "thread";
       threadChannelId: string;
       parentMessageId: string;
@@ -10206,6 +13415,33 @@ export type InboxItem =
       isFollowing?: boolean;
       unfollowedAt?: string | null;
     };
+
+
+/**
+ * Task v2: a task conversation's Activity row (kind "task"). The thread arm's
+ * fields (it is a sub-conversation: `threadChannelId` is its LOCAL
+ * conversation channel, `parentChannel*` the task's channel), with no parent
+ * message (`parentMessageId` null; `parentMessagePreview` is the task title,
+ * the parent sender fields are empty) and the task's identity.
+ */
+export type TaskConversationInboxItem = Omit<ThreadInboxItem, "kind" | "parentMessageId"> & {
+  kind: "task";
+  parentMessageId: null;
+  taskId: string | null;
+  taskTitle: string | null;
+};
+
+/** A thread or a task conversation row: both are keyed by `threadChannelId`. */
+export type SubConversationInboxItem = ThreadInboxItem | TaskConversationInboxItem;
+
+export function isSubConversationInboxItem(item: InboxItem): item is SubConversationInboxItem {
+  return isSubConversationInboxKind(item.kind);
+}
+
+/** The conversation an Activity row is about: a channel/DM, a thread or a task conversation. */
+export function inboxItemScopeChannelId(item: InboxItem): string {
+  return isSubConversationInboxItem(item) ? item.threadChannelId : item.channelId;
+}
 
 function readInboxGroupCounts(rows: readonly QueryResultRow[]): InboxGroupCount[] {
   const row = rows[0] as Record<string, unknown> | undefined;
@@ -10260,7 +13496,7 @@ async function attachReadStateToInboxItems(
   executor: DatabaseExecutor = getDb(),
 ): Promise<InboxItem[]> {
   const scopeIds = items
-    .map((item) => item.kind === "thread" ? item.threadChannelId : item.channelId)
+    .map((item) => (item.kind === "thread" || item.kind === "task") ? item.threadChannelId : item.channelId)
     .filter((id, index, list) => list.indexOf(id) === index);
   if (scopeIds.length === 0) return items;
   const states = await executor
@@ -10276,7 +13512,7 @@ async function attachReadStateToInboxItems(
     ));
   const stateByChannel = new Map(states.map((state) => [state.channelId, state]));
   return items.map((item) => {
-    const scopeId = item.kind === "thread" ? item.threadChannelId : item.channelId;
+    const scopeId = (item.kind === "thread" || item.kind === "task") ? item.threadChannelId : item.channelId;
     const state = stateByChannel.get(scopeId);
     return {
       ...item,
@@ -10337,6 +13573,7 @@ async function enrichInboxRowsWithReadCursorAuthority(
     row.readCursorPresent = authority?.readCursorPresent === true;
     row.readStateVersion = authority?.readStateVersion ?? null;
     row.maxReadSeq = authority?.maxReadSeq ?? null;
+    row.markedUnread = authority?.markedUnread === true;
     row.readStateActivityMessageId = authority?.latestActivityMessageId ?? null;
     row.readStateActivitySeq = authority?.latestActivitySeq ?? null;
     row.doneFrontierSeq = authority?.doneFrontierSeq ?? null;
@@ -10344,7 +13581,7 @@ async function enrichInboxRowsWithReadCursorAuthority(
 }
 
 function inboxScopeIdOfRow(row: InboxPolicySqlRow): string | null {
-  const value = row.kind === "thread" ? row.threadChannelId : row.channelId;
+  const value = (row.kind === "thread" || row.kind === "task") ? row.threadChannelId : row.channelId;
   return typeof value === "string" && value.length > 0 ? value : null;
 }
 
@@ -10405,7 +13642,7 @@ export async function getDoneInboxItems(
       FROM ${userChannelInboxStates} state
       INNER JOIN ${channels} c
         ON c.id = state.channel_id
-       AND c.type <> 'thread'
+       AND c.type NOT IN ('thread', 'task')
        AND c.deleted_at IS NULL
        AND c.archived_at IS NULL
       LEFT JOIN ${channelHumans} member
@@ -10474,15 +13711,22 @@ export async function getDoneInboxItems(
     doneAt: new Date(row.doneAt as string | Date).toISOString(),
   })) satisfies InboxItem[];
 
-  const followedThreads = await getFollowedThreads(serverId, userId, historyCutoff, {
+  const { threads: followedThreads } = await loadFollowedThreads(serverId, userId, historyCutoff, {
     state: "done",
     maxRows: fetchLimit,
     channelId: opts.channelId,
     q: opts.q,
     sort: opts.sort,
     traceQuery,
+    // Task v2: a done task conversation is Done history like a done thread.
+    includeTaskConversations: true,
   });
-  const threadItems = followedThreads.map((thread): InboxItem => ({
+  const threadItems = followedThreads.map((thread): InboxItem => "kind" in thread ? {
+    ...taskConversationHistoryInboxItem(thread),
+    doneAt: thread.doneAt,
+    isFollowing: thread.isFollowing,
+    unfollowedAt: thread.unfollowedAt,
+  } : ({
     kind: "thread",
     threadChannelId: thread.threadChannelId,
     parentMessageId: thread.parentMessageId,
@@ -10519,8 +13763,8 @@ export async function getDoneInboxItems(
   const combined = [...channelItems, ...threadItems].sort((a, b) => {
     const delta = new Date(a.doneAt ?? 0).getTime() - new Date(b.doneAt ?? 0).getTime();
     if (delta !== 0) return opts.sort === "asc" ? delta : -delta;
-    const aIdentity = `${a.kind}:${a.kind === "thread" ? a.threadChannelId : a.channelId}`;
-    const bIdentity = `${b.kind}:${b.kind === "thread" ? b.threadChannelId : b.channelId}`;
+    const aIdentity = `${a.kind}:${(a.kind === "thread" || a.kind === "task") ? a.threadChannelId : a.channelId}`;
+    const bIdentity = `${b.kind}:${(b.kind === "thread" || b.kind === "task") ? b.threadChannelId : b.channelId}`;
     const identityDelta = aIdentity.localeCompare(bIdentity);
     return opts.sort === "asc" ? identityDelta : -identityDelta;
   });
@@ -10545,6 +13789,8 @@ export async function getUnfollowedInboxItems(
     offset?: number;
     historyCutoff?: Date;
     channelId?: string;
+    /** Activity "Pinned" scope: only threads whose parent channel is one of these ids. */
+    pinnedChannelIds?: readonly string[];
     q?: string;
     sort?: "asc" | "desc";
     traceQuery?: DbQueryTracer;
@@ -10554,14 +13800,16 @@ export async function getUnfollowedInboxItems(
   const limit = Math.min(Math.max(opts.limit ?? 30, 1), 100);
   const offset = Math.max(opts.offset ?? 0, 0);
   const fetchLimit = limit + offset + 1;
-  const followedThreads = await getFollowedThreads(serverId, userId, opts.historyCutoff, {
+  const { threads: followedThreads } = await loadFollowedThreads(serverId, userId, opts.historyCutoff, {
     state: "unfollowed",
     maxRows: fetchLimit,
     channelId: opts.channelId,
+    parentChannelIds: opts.pinnedChannelIds,
     q: opts.q,
     sort: opts.sort,
     traceQuery: opts.traceQuery,
     executor: opts.executor,
+    includeTaskConversations: true,
   });
   const combined = followedThreads.map(unfollowedThreadInboxItem);
   const page = combined.slice(offset, offset + limit);
@@ -10572,9 +13820,57 @@ export async function getUnfollowedInboxItems(
   };
 }
 
-type FollowedThreadInboxSource = Awaited<ReturnType<typeof getFollowedThreads>>[number];
+type FollowedThreadInboxSource = FollowedThread | FollowedTaskConversation;
+
+/**
+ * A followed task conversation as a history Activity row (kind "task"): the
+ * thread fields, no parent message, the task's identity. Not read, no unread
+ * (history rows); the caller sets the follow/done state.
+ */
+function taskConversationHistoryInboxItem(thread: FollowedTaskConversation): TaskConversationInboxItem {
+  return {
+    kind: "task",
+    threadChannelId: thread.threadChannelId,
+    parentMessageId: null,
+    parentChannelId: thread.parentChannelId,
+    parentChannelName: thread.parentChannelName,
+    parentChannelType: thread.parentChannelType,
+    parentMessagePreview: thread.taskTitle,
+    parentMessageSenderType: "",
+    parentMessageSenderId: "",
+    latestActivityPreview: thread.latestActivityPreview,
+    latestActivitySenderType: thread.latestActivitySenderType,
+    latestActivitySenderId: thread.latestActivitySenderId,
+    latestActivitySenderName: thread.latestActivitySenderName,
+    latestActivityMessageId: thread.latestActivityMessageId ?? "",
+    latestActivitySeq: thread.latestActivitySeq ?? null,
+    firstUnreadMessageId: null,
+    firstMentionMessageId: null,
+    lastActivityAt: thread.lastActivityAt,
+    lastReplyAt: thread.lastReplyAt,
+    replyCount: thread.replyCount,
+    unreadCount: 0,
+    hasMention: false,
+    taskId: thread.taskId,
+    taskNumber: thread.taskNumber,
+    taskTitle: thread.taskTitle,
+    taskStatus: thread.taskStatus,
+    taskClaimedByName: thread.taskClaimedByName,
+    maxReadSeq: thread.maxReadSeq,
+    readStateVersion: thread.readStateVersion,
+    readState: thread.readState,
+  };
+}
 
 function unfollowedThreadInboxItem(thread: FollowedThreadInboxSource): InboxItem {
+  if ("kind" in thread) {
+    return {
+      ...taskConversationHistoryInboxItem(thread),
+      doneAt: null,
+      isFollowing: false,
+      unfollowedAt: thread.unfollowedAt,
+    };
+  }
   return {
     kind: "thread",
     threadChannelId: thread.threadChannelId,
@@ -10622,13 +13918,14 @@ async function getActiveUnfollowedInboxItems(
     executor?: DatabaseExecutor;
   },
 ): Promise<InboxItem[]> {
-  const threads = await getFollowedThreads(serverId, userId, opts.historyCutoff, {
+  const { threads } = await loadFollowedThreads(serverId, userId, opts.historyCutoff, {
     state: "unfollowed_active",
     channelId: opts.channelId,
     q: opts.q,
     sort: opts.sort,
     traceQuery: opts.traceQuery,
     executor: opts.executor,
+    includeTaskConversations: true,
   });
   return threads.map((thread) => ({
     ...unfollowedThreadInboxItem(thread),
@@ -10639,6 +13936,8 @@ async function getActiveUnfollowedInboxItems(
 }
 
 type InboxQueryResult = { rows: QueryResultRow[]; contractVersion?: number };
+/** The RW Activity read, with the conversations it found marked unread (loadMarkedUnreadScopes). */
+type RisingWaveInboxQueryResult = InboxQueryResult & { markedScopeIds: ReadonlySet<string> };
 
 const INBOX_PG_FALLBACK_QUERY_NAME = "channels.inbox_items_serving_rows_by_user";
 const INBOX_PG_FALLBACK_QUERY_IDENTITY = "inbox_items_serving_rows_v13";
@@ -10764,8 +14063,6 @@ export const __testInboxPgFallbackTimeout = {
   mergeAllPageKeyRows: mergeInboxAllPageKeyRows,
 };
 
-const UUID_TEXT_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
 /** pg_legacy: the canonical inline Postgres read (search, guest, authority transactions). */
 type InboxTraceBackend = "rw_mv" | "pg_legacy";
 type InboxTraceRoute = RisingWaveInboxTraceRoute;
@@ -10805,7 +14102,7 @@ function getRisingWaveInboxPool() {
 
 function queryRisingWaveInbox<T extends QueryResultRow = QueryResultRow>(
   pool: NonNullable<ReturnType<typeof getRisingWavePool>>,
-  queryText: string,
+  queryText: UnifiedChainQuery,
   values?: unknown[],
 ) {
   // TRANSITION: a missing current view is read from the newest older generation.
@@ -10904,7 +14201,7 @@ function legacyChatActivityPromotionAllowedSql(userId: string, muteFromSeq: SQL)
 // computed within the scope. SYNC REQUIRED with dmScopeSqlPredicate (canonical
 // Postgres) and isDmScopedInboxItem (unfollowed-thread merge).
 const RISINGWAVE_DM_SCOPE_PREDICATE =
-  "(i.channel_type = 'dm' OR (i.kind = 'thread' AND i.parent_channel_type = 'dm'))";
+  "(i.channel_type = 'dm' OR (i.kind IN ('thread', 'task') AND i.parent_channel_type = 'dm'))";
 
 function buildRisingWaveInboxItemsServingQuery(
   limit: number,
@@ -10914,8 +14211,23 @@ function buildRisingWaveInboxItemsServingQuery(
     includeMentionOnlyInAllAndUnread?: boolean;
     sort?: "asc" | "desc";
     servingViewOverride?: string;
-    /** Bind $8 (varchar[]): thread rows below these parents are left out of rows, groups and totals. */
-    excludeThreadParents?: boolean;
+    /**
+     * The serving view carries first_mention_message_id / mention_done_through_seq
+     * (rw_inbox_serving_v9 only; the transition fallback's older generations do
+     * not, and read NULL).
+     */
+    carriesFirstMention?: boolean;
+    /** Bind index (varchar[]): only rows whose group channel is one of these (Pinned scope). */
+    pinnedChannelIdsParam?: number;
+    /** Bind index (varchar[]): only rows whose own id is one of these (`ids`); narrows the selection, not groups. */
+    rowIdsParam?: number;
+    /** Bind index (varchar[]): thread rows below these parents are left out of rows, groups and totals. */
+    excludeThreadParentsParam?: number;
+    /**
+     * Bind index (varchar[]): conversations marked unread (no count). The Unread
+     * filter lists them too; they add a row to its totals and 0 to its counts.
+     */
+    markedScopeIdsParam?: number;
   } = {},
 ) {
   const sortDirection = opts.sort === "asc" ? "ASC" : "DESC";
@@ -10941,6 +14253,10 @@ function buildRisingWaveInboxItemsServingQuery(
     ? ""
     : `LEFT JOIN rw_messages latest_activity
         ON latest_activity.id = i.latest_activity_message_id`;
+  // A member row's anchor is the view's; a mention-only row's is resolved for
+  // the page (resolveRisingWaveMentionOnlyAnchors) from mentionDoneThroughSeq.
+  const firstMentionExpr = opts.carriesFirstMention ? "i.first_mention_message_id" : "NULL::varchar";
+  const mentionDoneThroughSeqExpr = opts.carriesFirstMention ? "i.mention_done_through_seq" : "NULL::bigint";
   const filterMentionOnlyPredicate = opts.includeMentionOnlyInAllAndUnread
     ? ""
     : `AND (
@@ -10952,8 +14268,17 @@ function buildRisingWaveInboxItemsServingQuery(
     : `AND ${mentionOnlyExpr} = false`;
   // Parents the receiver can no longer see (getInboxItemsFromRisingWave checks
   // them in Postgres). A NULL parent compares unknown and is kept.
-  const excludedThreadParentPredicate = opts.excludeThreadParents
-    ? "AND (i.kind <> 'thread' OR NOT COALESCE(i.parent_channel_id = ANY($8::varchar[]), false))"
+  const excludedThreadParentPredicate = opts.excludeThreadParentsParam
+    ? `AND (i.kind NOT IN ('thread', 'task') OR NOT COALESCE(i.parent_channel_id = ANY($${opts.excludeThreadParentsParam}::varchar[]), false))`
+    : "";
+  // Activity "Pinned" scope. SYNC REQUIRED with pinnedScopeSqlPredicate
+  // (canonical Postgres) and isPinnedScopedInboxItem (unfollowed merge).
+  const pinnedScopePredicate = opts.pinnedChannelIdsParam
+    ? `AND COALESCE((CASE WHEN i.kind IN ('thread', 'task') THEN i.parent_channel_id ELSE i.channel_id END) = ANY($${opts.pinnedChannelIdsParam}::varchar[]), false)`
+    : "";
+  // `ids`. SYNC REQUIRED with rowIdsSqlPredicate (canonical Postgres) and the unfollowed merge.
+  const rowIdsPredicate = opts.rowIdsParam
+    ? `AND COALESCE((CASE WHEN "kind" IN ('thread', 'task') THEN "threadChannelId" ELSE "channelId" END) = ANY($${opts.rowIdsParam}::varchar[]), false)`
     : "";
   // CONTRACT: RW serving must stay behavior-compatible with the inline Postgres
   // SQL in getInboxItems below. SYNC REQUIRED: any field, filter, unread-count,
@@ -10975,7 +14300,9 @@ function buildRisingWaveInboxItemsServingQuery(
         i.channel_type AS "channelType",
         i.last_message_id AS "lastMessageId",
         i.first_unread_message_id AS "firstUnreadMessageId",
-        i.last_message_at AS "lastMessageAtRaw",
+        -- A mention-only row (a mention where nothing else is unread) has no
+        -- latest message: its time is the mention's, which only activity_at carries.
+        COALESCE(i.last_message_at, i.activity_at) AS "lastMessageAtRaw",
         i.last_message_preview AS "lastMessagePreview",
         i.last_message_sender_type AS "lastMessageSenderType",
         i.last_message_sender_id AS "lastMessageSenderId",
@@ -10994,7 +14321,7 @@ function buildRisingWaveInboxItemsServingQuery(
         i.latest_activity_sender_id AS "latestActivitySenderId",
         i.latest_activity_message_id AS "latestActivityMessageId",
         ${latestActivitySeqExpr}::text AS "latestActivitySeq",
-        i.last_activity_at AS "lastActivityAtRaw",
+        COALESCE(i.last_activity_at, i.activity_at) AS "lastActivityAtRaw",
         i.last_reply_at AS "lastReplyAtRaw",
         i.reply_count::int AS "replyCount",
         i.task_number AS "taskNumber",
@@ -11003,6 +14330,8 @@ function buildRisingWaveInboxItemsServingQuery(
         i.task_claimed_by_id AS "taskClaimedById",
         NULL::text AS "taskClaimedByName",
         i.has_mention AS "hasMention",
+        ${firstMentionExpr} AS "firstMentionMessageId",
+        ${mentionDoneThroughSeqExpr} AS "mentionDoneThroughSeq",
         ${mentionOnlyExpr} AS "mentionOnly",
         i.last_read_seq AS "materializedLastReadSeq",
         -- NULL-preserving on purpose: presence is the structural "readCursorPresent"
@@ -11022,10 +14351,12 @@ function buildRisingWaveInboxItemsServingQuery(
       WHERE i.server_id = $1
         AND ${inboxReceiverExpr} = $2
         ${receiverTypePredicate}
-        AND ($3::text <> 'all' OR i.kind = 'thread' OR i.channel_type IN ('channel', 'private', 'joint', 'dm'))
+        AND ($3::text <> 'all' OR i.kind IN ('thread', 'task') OR i.channel_type IN ('channel', 'private', 'joint', 'dm'))
         AND (
           ($3::text = 'all')
-          OR ($3::text = 'unread' AND i.unread_count > 0)
+          OR ($3::text = 'unread' AND (i.unread_count > 0${opts.markedScopeIdsParam
+            ? ` OR COALESCE(COALESCE(i.channel_id, i.thread_channel_id) = ANY($${opts.markedScopeIdsParam}::varchar[]), false)`
+            : ""}))
           OR ($3::text = 'mentions' AND i.has_any_mention)
           OR ($3::text = 'unread_mentions' AND i.unread_count > 0 AND i.has_mention)
         )
@@ -11041,14 +14372,15 @@ function buildRisingWaveInboxItemsServingQuery(
         ${filterMentionOnlyPredicate}
         AND (COALESCE($7::text, '') <> 'dms' OR ${RISINGWAVE_DM_SCOPE_PREDICATE})
         AND (COALESCE($7::text, '') <> 'no_dms' OR NOT COALESCE(${RISINGWAVE_DM_SCOPE_PREDICATE}, false))
+        ${pinnedScopePredicate}
         ${excludedThreadParentPredicate}
     ),
     faceted AS (
       SELECT
         filtered.*,
-        CASE WHEN "kind" = 'thread' THEN "parentChannelId" ELSE "channelId" END AS "groupChannelId",
-        CASE WHEN "kind" = 'thread' THEN "parentChannelName" ELSE "channelName" END AS "groupChannelName",
-        CASE WHEN "kind" = 'thread' THEN "parentChannelType" ELSE "channelType" END AS "groupChannelType"
+        CASE WHEN "kind" IN ('thread', 'task') THEN "parentChannelId" ELSE "channelId" END AS "groupChannelId",
+        CASE WHEN "kind" IN ('thread', 'task') THEN "parentChannelName" ELSE "channelName" END AS "groupChannelName",
+        CASE WHEN "kind" IN ('thread', 'task') THEN "parentChannelType" ELSE "channelType" END AS "groupChannelType"
       FROM filtered
     ),
     group_counts AS (
@@ -11078,7 +14410,8 @@ function buildRisingWaveInboxItemsServingQuery(
       -- does not implement PostgreSQL's uuid cast. Route parsing has already
       -- validated channelId as a UUID, while every RW channel identity in this
       -- graph is varchar, so text equality preserves the channel facet exactly.
-      WHERE $5::text IS NULL OR "groupChannelId" = $5::text
+      WHERE ($5::text IS NULL OR "groupChannelId" = $5::text)
+        ${rowIdsPredicate}
     ),
     active_totals AS (
       SELECT
@@ -11087,10 +14420,11 @@ function buildRisingWaveInboxItemsServingQuery(
       WHERE i.server_id = $1
         AND ${inboxReceiverExpr} = $2
         ${receiverTypePredicate}
-        AND (i.kind = 'thread' OR i.channel_type IN ('channel', 'private', 'joint', 'dm'))
+        AND (i.kind IN ('thread', 'task') OR i.channel_type IN ('channel', 'private', 'joint', 'dm'))
         AND ($4::timestamptz IS NULL OR i.activity_at > $4::timestamptz)
         AND (COALESCE($7::text, '') <> 'dms' OR ${RISINGWAVE_DM_SCOPE_PREDICATE})
         AND (COALESCE($7::text, '') <> 'no_dms' OR NOT COALESCE(${RISINGWAVE_DM_SCOPE_PREDICATE}, false))
+        ${pinnedScopePredicate}
         ${activeMentionOnlyPredicate}
         ${excludedThreadParentPredicate}
     ),
@@ -11102,7 +14436,7 @@ function buildRisingWaveInboxItemsServingQuery(
       WHERE i.server_id = $1
         AND ${inboxReceiverExpr} = $2
         ${receiverTypePredicate}
-        AND i.kind = 'thread'
+        AND i.kind IN ('thread', 'task')
         AND i.parent_channel_id IS NOT NULL
         AND ($4::timestamptz IS NULL OR i.activity_at > $4::timestamptz)
     ),
@@ -11157,10 +14491,11 @@ function buildRisingWaveInboxItemsServingQuery(
         p."taskClaimedById",
         p."taskClaimedByName",
         (CASE WHEN p."mentionOnly" THEN p."hasAnyMention" ELSE p."hasMention" END) AS "hasMention",
-        -- TODO(firstMentionMessageId): materialize first_mention_message_id in
-        -- rw_inbox_items_v2 MV + parity; Postgres-path-first. Until then the RW
-        -- backend does not project this column, so the shared result mapper in
-        -- getInboxItems resolves row.firstMentionMessageId to null for RW rows.
+        p."firstMentionMessageId"::text AS "firstMentionMessageId",
+        p."mentionDoneThroughSeq"::text AS "mentionDoneThroughSeq",
+        -- For resolveRisingWaveMentionOnlyAnchors only. Not "mentionOnly": the
+        -- shared result mapper reads that name, and the RW path never fed it.
+        p."mentionOnly" AS "servedMentionOnly",
         p."materializedLastReadSeq",
         p."maxReadSeq",
         p."readStateVersion",
@@ -11200,6 +14535,10 @@ async function getInboxItemsFromRisingWave(
     channelId?: string;
     q?: string;
     scope?: InboxScope;
+    /** Pinned scope: only rows whose group channel is one of these ids. */
+    pinnedChannelIds?: readonly string[];
+    /** `ids`: only rows whose own id is one of these. */
+    rowIds?: readonly string[];
     historyCutoff?: Date;
     includeMentionOnlyInAllAndUnread?: boolean;
     sort?: "asc" | "desc";
@@ -11208,7 +14547,7 @@ async function getInboxItemsFromRisingWave(
     traceQuery: DbQueryTracer;
     executor?: DatabaseExecutor;
   },
-): Promise<InboxQueryResult> {
+): Promise<RisingWaveInboxQueryResult> {
   const client = getRisingWaveInboxPool();
   // CONTRACT: RisingWave is required. Unconfigured or a failed read throws;
   // there is no Postgres fallback. SYNC REQUIRED: error behavior changes here
@@ -11216,7 +14555,9 @@ async function getInboxItemsFromRisingWave(
   if (!client) throw new RisingWaveNotConfiguredError("Activity items");
 
   const pageLimit = Math.trunc(opts.limit + 1);
-  const pageOffset = Math.trunc(opts.offset);
+  // Bounded here too, for every caller: an offset past bigint fails the
+  // statement at prepare (offset=1e20, 11-04 10:24Z).
+  const pageOffset = Math.min(Math.trunc(opts.offset), Number.MAX_SAFE_INTEGER);
   const inboxItemsVersion = opts.servingVersion ?? getRisingWaveInboxItemsServingVersion();
   const requestedInboxItemsVersion = opts.requestedServingVersion ?? inboxItemsVersion;
   const versionForceReason = requestedInboxItemsVersion === 3 && inboxItemsVersion === 2
@@ -11242,61 +14583,92 @@ async function getInboxItemsFromRisingWave(
   // splits the metric series while the flag is ramping - that separation is the
   // point, and it disappears when the flag reaches 100% and the branch is
   // deleted.
-  const readPage = (excludedThreadParentIds: readonly string[]) => opts.traceQuery(
-    "channels.inbox_items_by_user",
-    () => queryRisingWaveInbox(client, buildRisingWaveInboxItemsServingQuery(pageLimit, pageOffset, inboxItemsVersion, {
-      includeMentionOnlyInAllAndUnread: opts.includeMentionOnlyInAllAndUnread,
-      sort: opts.sort,
-      servingViewOverride: servingView,
-      excludeThreadParents: excludedThreadParentIds.length > 0,
-    }), excludedThreadParentIds.length > 0 ? [...queryParams, [...excludedThreadParentIds]] : queryParams),
-    (queryRead) => ({
-      ...inboxTraceAttrs("rw_mv", opts.filter, "none", inboxItemsVersion),
-      backend: "risingwave",
-      contract_version: inboxItemsVersion,
-      "rw.acquire_wait_ms": Math.round(queryRead.acquireWaitMs),
-      "rw.pool.total_count": queryRead.poolState.rw_pool_total,
-      "rw.pool.idle_count": queryRead.poolState.rw_pool_idle,
-      "rw.pool.waiting_count": queryRead.poolState.rw_pool_waiting,
-      "rw.timeout_ms": getRisingWaveConnectionTimeoutMillis(),
-      "rw.pool.connection_timeout_ms": getRisingWaveConnectionTimeoutMillis(),
-      ...queryRead.poolState,
-      rw_inbox_items_version: inboxItemsVersion,
-      rw_inbox_items_requested_version: requestedInboxItemsVersion,
-      rw_inbox_items_version_forced: versionForceReason !== "none",
-      rw_inbox_items_version_force_reason: versionForceReason,
-      rw_inbox_visibility_v3_flag_enabled: requestedInboxItemsVersion === 3,
-      // 061 Stage 2: the serving view is no longer implied by the version -
-      // Still reported explicitly rather than hardcoded at the call site: the
-      // value a trace carries should be the view that was queried, so a future
-      // swap shows up here instead of hiding behind a literal.
-      rw_inbox_items_serving_view: servingView,
-      rw_inbox_items_derivation_chain: false,
-      // The flag is evaluated per server, so a server-gated rollout can only be
-      // compared against its control group if the serving event carries the
-      // dimension it was gated on. Nothing else on this event family does.
-      // The key must be exactly `server_id`: the ScopeDB row builder promotes
-      // only allowlisted attribute names into typed columns
-      // (PROMOTED_IDENTITY_ATTRS in shared/tracing/eventRows.ts), and anything
-      // else is dropped on that sink - a dotted key would be silently lost.
-      server_id: serverId,
-      filter: opts.filter,
-      limit: opts.limit,
-      offset: opts.offset,
-      history_cutoff_present: Boolean(opts.historyCutoff),
-      channel_id_present: Boolean(opts.channelId),
-      query_present: Boolean(opts.q),
-      scope: opts.scope ?? "all",
-      row_count: queryRead.result.rows.length,
-      excluded_thread_parent_count: excludedThreadParentIds.length,
-    }),
-    (error) => risingWaveInboxFailureAttrs({
-      route: opts.filter,
-      error,
-      contractVersion: inboxItemsVersion,
-      queryName: "channels.inbox_items_by_user",
-    }),
-  );
+  // Optional array binds take the next free index, in this order, only when
+  // present ($8 pinned ids, then the row ids, then the excluded thread parents,
+  // then the conversations marked unread for the Unread filter).
+  const pinnedChannelIds = opts.pinnedChannelIds ? [...opts.pinnedChannelIds] : undefined;
+  const rowIds = opts.rowIds ? [...opts.rowIds] : undefined;
+  // Marked unread (no count): stamped on the page's rows, and listed by the Unread filter.
+  const markedScopeIds = new Set((await loadMarkedUnreadScopes(serverId, userId, opts.traceQuery, opts.executor ?? getDb())).keys());
+  const markedForFilter = opts.filter === "unread" && markedScopeIds.size > 0 ? [...markedScopeIds] : undefined;
+  // Whether the last read answered from rw_inbox_serving_v9 (the generation
+  // with the first-mention columns), not a transition fallback.
+  let servedFirstMention = false;
+  const readPage = (excludedThreadParentIds: readonly string[]) => {
+    const params = [...queryParams];
+    const bind = (value: unknown) => params.push(value);
+    const pinnedChannelIdsParam = pinnedChannelIds ? bind(pinnedChannelIds) : undefined;
+    const rowIdsParam = rowIds ? bind(rowIds) : undefined;
+    const excludeThreadParentsParam = excludedThreadParentIds.length > 0 ? bind([...excludedThreadParentIds]) : undefined;
+    const markedScopeIdsParam = markedForFilter ? bind(markedForFilter) : undefined;
+    // The transition builds the text once per generation it tries; the last
+    // build is the one that answered.
+    const query = (resolved: (view: string) => string) => {
+      servedFirstMention = resolved(servingView) === UNIFIED_CHAIN_VIEWS.serving;
+      return buildRisingWaveInboxItemsServingQuery(pageLimit, pageOffset, inboxItemsVersion, {
+        includeMentionOnlyInAllAndUnread: opts.includeMentionOnlyInAllAndUnread,
+        sort: opts.sort,
+        servingViewOverride: servingView,
+        carriesFirstMention: servedFirstMention,
+        pinnedChannelIdsParam,
+        rowIdsParam,
+        excludeThreadParentsParam,
+        markedScopeIdsParam,
+      });
+    };
+    return opts.traceQuery(
+      "channels.inbox_items_by_user",
+      () => queryRisingWaveInbox(client, query, params),
+      (queryRead) => ({
+        ...inboxTraceAttrs("rw_mv", opts.filter, "none", inboxItemsVersion),
+        backend: "risingwave",
+        contract_version: inboxItemsVersion,
+        "rw.acquire_wait_ms": Math.round(queryRead.acquireWaitMs),
+        "rw.pool.total_count": queryRead.poolState.rw_pool_total,
+        "rw.pool.idle_count": queryRead.poolState.rw_pool_idle,
+        "rw.pool.waiting_count": queryRead.poolState.rw_pool_waiting,
+        "rw.timeout_ms": getRisingWaveConnectionTimeoutMillis(),
+        "rw.pool.connection_timeout_ms": getRisingWaveConnectionTimeoutMillis(),
+        ...queryRead.poolState,
+        rw_inbox_items_version: inboxItemsVersion,
+        rw_inbox_items_requested_version: requestedInboxItemsVersion,
+        rw_inbox_items_version_forced: versionForceReason !== "none",
+        rw_inbox_items_version_force_reason: versionForceReason,
+        rw_inbox_visibility_v3_flag_enabled: requestedInboxItemsVersion === 3,
+        // 061 Stage 2: the serving view is no longer implied by the version -
+        // Still reported explicitly rather than hardcoded at the call site: the
+        // value a trace carries should be the view that was queried, so a future
+        // swap shows up here instead of hiding behind a literal.
+        rw_inbox_items_serving_view: servingView,
+        rw_inbox_items_derivation_chain: false,
+        // The flag is evaluated per server, so a server-gated rollout can only be
+        // compared against its control group if the serving event carries the
+        // dimension it was gated on. Nothing else on this event family does.
+        // The key must be exactly `server_id`: the ScopeDB row builder promotes
+        // only allowlisted attribute names into typed columns
+        // (PROMOTED_IDENTITY_ATTRS in shared/tracing/eventRows.ts), and anything
+        // else is dropped on that sink - a dotted key would be silently lost.
+        server_id: serverId,
+        filter: opts.filter,
+        limit: opts.limit,
+        offset: opts.offset,
+        history_cutoff_present: Boolean(opts.historyCutoff),
+        channel_id_present: Boolean(opts.channelId),
+        query_present: Boolean(opts.q),
+        scope: pinnedChannelIds ? "pinned" : opts.scope ?? "all",
+        ...(pinnedChannelIds ? { pinned_channel_count: pinnedChannelIds.length } : {}),
+        ...(rowIds ? { row_id_count: rowIds.length } : {}),
+        row_count: queryRead.result.rows.length,
+        excluded_thread_parent_count: excludedThreadParentIds.length,
+      }),
+      (error) => risingWaveInboxFailureAttrs({
+        route: opts.filter,
+        error,
+        contractVersion: inboxItemsVersion,
+        queryName: "channels.inbox_items_by_user",
+      }),
+    );
+  };
   // Threads below a parent the receiver can no longer see (archived, deleted,
   // or a non-public parent they left) stay in the serving views until 077's
   // parent condition is built everywhere. Check the parents in Postgres, after
@@ -11318,6 +14690,9 @@ async function getInboxItemsFromRisingWave(
     });
     read = await readPage(invisibleParents);
   }
+  if (servedFirstMention) {
+    await resolveRisingWaveMentionOnlyAnchors(client, userId, read.result.rows, opts.traceQuery);
+  }
   recordRisingWaveInboxThreadReplyCountNullContractViolation(read.result.rows, {
     filter: opts.filter,
     servedVersion: inboxItemsVersion,
@@ -11326,7 +14701,114 @@ async function getInboxItemsFromRisingWave(
     forcedV2ForHistoryCutoff: versionForceReason === "history_cutoff",
     historyCutoff: Boolean(opts.historyCutoff),
   });
-  return { rows: read.result.rows, contractVersion: inboxItemsVersion };
+  return { rows: read.result.rows, contractVersion: inboxItemsVersion, markedScopeIds };
+}
+
+type RisingWaveMentionOnlyAnchorRow = {
+  servedMentionOnly?: unknown;
+  channelId?: unknown;
+  threadChannelId?: unknown;
+  mentionDoneThroughSeq?: unknown;
+  firstMentionMessageId?: unknown;
+  firstUnreadMessageId?: unknown;
+};
+
+/**
+ * The first-mention anchor of the page's mention-only rows, in one RisingWave
+ * read (none when the page has no such row). rw_inbox_serving_v9 carries a
+ * member row's anchor (the lowest-seq notifying mention after the read cursor,
+ * from rw_inbox_mention_v7) and leaves a mention-only row's NULL: as in the
+ * Postgres has_mention lateral, a mention-only row's anchor ignores the read
+ * cursor (it opens the @ even once read) and respects Done, i.e. the lowest-seq
+ * mention of the user that notifies (notifiable at send, or notified later)
+ * after the row's mention suppression position (mentionDoneThroughSeq). Like
+ * Postgres, the row's firstUnreadMessageId is that anchor too.
+ * The conversation is matched through its storage, as rw_inbox_mention_v7 maps
+ * a mention to its targets: a joint projection's mentions are those in its
+ * canonical storage or any active sibling projection. Served by
+ * idx_rw_message_mentions_v2_inbox (target_type, target_id, channel_id, ...).
+ * Fills the rows in place.
+ */
+async function resolveRisingWaveMentionOnlyAnchors(
+  client: NonNullable<ReturnType<typeof getRisingWavePool>>,
+  userId: string,
+  rows: readonly RisingWaveMentionOnlyAnchorRow[],
+  traceQuery: DbQueryTracer,
+): Promise<void> {
+  const targets = rows.flatMap((row) => {
+    if (row.servedMentionOnly !== true) return [];
+    const targetId = typeof row.channelId === "string" ? row.channelId
+      : typeof row.threadChannelId === "string" ? row.threadChannelId
+        : null;
+    if (targetId === null) return [];
+    const doneThroughSeq = typeof row.mentionDoneThroughSeq === "string" || typeof row.mentionDoneThroughSeq === "number"
+      ? BigInt(row.mentionDoneThroughSeq)
+      : 0n;
+    return [{ row, targetId, doneThroughSeq }];
+  });
+  if (targets.length === 0) return;
+  // One row per conversation of the page: each target's own Done position goes in
+  // as a parallel array (RW 3.0.3 has no multi-argument unnest; WITH ORDINALITY
+  // plus a subscript pairs them), and the anchor is aggregated in SQL, so the read
+  // returns at most the page's mention-only rows however many mentions the user has.
+  const byTarget = new Map(targets.map((target) => [target.targetId, target] as const));
+  const targetIds = [...byTarget.keys()];
+  const doneThroughSeqs = targetIds.map((targetId) => byTarget.get(targetId)!.doneThroughSeq.toString());
+  const minDoneThroughSeq = targets.reduce((min, target) => target.doneThroughSeq < min ? target.doneThroughSeq : min, targets[0]!.doneThroughSeq);
+  const read = await traceQuery(
+    "channels.inbox_mention_only_anchors",
+    () => queryRisingWaveInbox<{ target_id: string; message_id: string | null }>(client, `
+      WITH proj AS (
+        SELECT s.local_channel_id, j.canonical_channel_id
+        FROM rw_joint_channel_servers AS s
+        JOIN rw_joint_channels AS j ON j.id = s.joint_channel_id
+        WHERE s.status = 'active' AND j.status = 'active'
+      ), req AS (
+        SELECT t.target_id, ($3::bigint[])[CAST(t.ord AS INT)] AS done_through_seq
+        FROM unnest($2::varchar[]) WITH ORDINALITY AS t(target_id, ord)
+      ), targets AS (
+        SELECT r.target_id, r.done_through_seq, COALESCE(p.canonical_channel_id, r.target_id) AS storage_id
+        FROM req AS r
+        LEFT JOIN proj AS p ON p.local_channel_id = r.target_id
+      ), storage_channels AS (
+        SELECT storage_id AS channel_id FROM targets
+        UNION
+        SELECT p.local_channel_id FROM proj AS p JOIN targets AS t ON p.canonical_channel_id = t.storage_id
+      ), mm AS (
+        SELECT CAST(m.message_id AS VARCHAR) AS message_id, m.message_seq,
+               COALESCE(pj.canonical_channel_id, m.channel_id) AS storage_id
+        FROM rw_message_mentions_v2 AS m
+        LEFT JOIN proj AS pj ON pj.local_channel_id = m.channel_id
+        WHERE m.target_type = 'user'
+          AND m.target_id = $1
+          AND m.channel_id IN (SELECT channel_id FROM storage_channels)
+          AND (m.notifiable_at_send OR m.notified_at IS NOT NULL)
+          AND m.message_seq > $4::bigint
+      )
+      SELECT t.target_id, first_value(mm.message_id ORDER BY mm.message_seq) AS message_id
+      FROM targets AS t
+      JOIN mm ON mm.storage_id = t.storage_id AND mm.message_seq > t.done_through_seq
+      GROUP BY t.target_id
+    `, [userId, targetIds, doneThroughSeqs, minDoneThroughSeq.toString()]),
+    (queryRead) => ({
+      backend: "risingwave",
+      db_system: "risingwave",
+      target_count: targetIds.length,
+      row_count: queryRead.result.rows.length,
+      "rw.acquire_wait_ms": Math.round(queryRead.acquireWaitMs),
+      "rw.pool.total_count": queryRead.poolState.rw_pool_total,
+      "rw.pool.idle_count": queryRead.poolState.rw_pool_idle,
+      "rw.pool.waiting_count": queryRead.poolState.rw_pool_waiting,
+    }),
+    // A failed read (connection timeout, overload) is the case to diagnose.
+    () => ({ backend: "risingwave", db_system: "risingwave" }),
+  );
+  const anchors = new Map(read.result.rows.map((row) => [row.target_id, row.message_id] as const));
+  for (const target of targets) {
+    const messageId = anchors.get(target.targetId) ?? null;
+    target.row.firstMentionMessageId = messageId;
+    target.row.firstUnreadMessageId = messageId;
+  }
 }
 
 /**
@@ -11366,6 +14848,72 @@ async function findInvisibleThreadParentChannelIds(
     for (const row of rows) visible.add(row.id.toLowerCase());
   }
   return candidates.filter((id) => !visible.has(id.toLowerCase()));
+}
+
+/**
+ * Task v2: the task behind each task-conversation row (kind "task") of a page,
+ * by its conversation channel (channels.task_id), in one primary-key read.
+ * Neither backend carries the task's id or title (the RisingWave serving
+ * columns are those of the generation it replaces, so the transition fallback
+ * stays a rename); the number / status / claimant are filled when the backend
+ * left them NULL (the Postgres read joins tasks by parent message only).
+ * Runs before enrichInboxRowsWithProfileNames, which resolves the claimant's
+ * name.
+ */
+/** The fields of an Activity page row this enrichment reads and fills; the
+ *  rows carry more, which it leaves alone. */
+type InboxRowTaskIdentity = {
+  kind?: unknown;
+  threadChannelId?: unknown;
+  taskId?: string | null;
+  taskTitle?: string | null;
+  taskNumber?: number | null;
+  taskStatus?: string | null;
+  taskClaimedByType?: string | null;
+  taskClaimedById?: string | null;
+  taskClaimedByName?: string | null;
+};
+
+async function enrichInboxRowsWithTaskIdentity(
+  rows: InboxRowTaskIdentity[],
+  traceQuery: DbQueryTracer,
+  executor: DatabaseExecutor = getDb(),
+): Promise<void> {
+  const conversationIds = [...new Set(rows
+    .filter((row) => row.kind === "task" && typeof row.threadChannelId === "string" && UUID_TEXT_RE.test(row.threadChannelId))
+    .map((row) => row.threadChannelId as string))];
+  if (conversationIds.length === 0) return;
+  const taskRows = await traceQuery(
+    "channels.inbox_task_conversations",
+    () => executor
+      .select({
+        conversationId: channels.id,
+        taskId: tasks.id,
+        taskNumber: tasks.taskNumber,
+        title: tasks.title,
+        status: tasks.status,
+        claimedByType: tasks.claimedByType,
+        claimedById: tasks.claimedById,
+      })
+      .from(channels)
+      .innerJoin(tasks, eq(tasks.id, channels.taskId))
+      .where(inArray(channels.id, conversationIds)),
+    (result) => ({ input_count: conversationIds.length, result_count: result.length }),
+  );
+  const byConversation = new Map(taskRows.map((row) => [row.conversationId, row]));
+  for (const row of rows) {
+    if (row.kind !== "task") continue;
+    const task = typeof row.threadChannelId === "string" ? byConversation.get(row.threadChannelId) : undefined;
+    row.taskId = task?.taskId ?? null;
+    row.taskTitle = task?.title ?? null;
+    if (!task) continue;
+    if (row.taskNumber == null) row.taskNumber = task.taskNumber;
+    if (row.taskStatus == null) row.taskStatus = task.status;
+    if (row.taskClaimedById == null && row.taskClaimedByName == null) {
+      row.taskClaimedByType = task.claimedByType;
+      row.taskClaimedById = task.claimedById;
+    }
+  }
 }
 
 async function enrichInboxRowsWithProfileNames(
@@ -11602,7 +15150,7 @@ function recordRisingWaveInboxThreadReplyCountNullContractViolation(
   },
 ) {
   const nullThreadReplyCountRows = rows.filter((row) =>
-    row.kind === "thread" && row.replyCount == null
+    isSubConversationInboxKind(row.kind) && row.replyCount == null
   ).length;
   if (nullThreadReplyCountRows === 0) return;
 
@@ -11665,7 +15213,7 @@ async function getActivityUnreadTotalsBatchFromRisingWave(
        WHERE i.receiver_id = $1
          AND i.receiver_type = 'user'
          AND i.server_id = ANY($2)
-         AND i.kind = 'thread'
+         AND i.kind IN ('thread', 'task')
          AND NOT i.mention_only
          AND i.unread_count > 0
          AND i.parent_channel_id IS NOT NULL
@@ -11746,12 +15294,12 @@ export type InboxItemsResult = {
   activeUnreadCount: number;
 };
 
-function inboxItemActivityAt(item: InboxItem): string {
-  return item.kind === "thread" ? item.lastActivityAt : item.lastMessageAt;
+export function inboxItemActivityAt(item: InboxItem): string {
+  return (item.kind === "thread" || item.kind === "task") ? item.lastActivityAt : item.lastMessageAt;
 }
 
-function inboxItemIdentity(item: InboxItem): string {
-  return `${item.kind}:${item.kind === "thread" ? item.threadChannelId : item.channelId}`;
+export function inboxItemIdentity(item: InboxItem): string {
+  return `${item.kind}:${(item.kind === "thread" || item.kind === "task") ? item.threadChannelId : item.channelId}`;
 }
 
 function compareInboxItems(
@@ -11774,7 +15322,7 @@ function mergeActivityGroups(
 ): InboxGroupCount[] {
   const groups = new Map(active.map((group) => [group.channelId, { ...group }]));
   for (const item of unfollowed) {
-    if (item.kind !== "thread") continue;
+    if (item.kind !== "thread" && item.kind !== "task") continue;
     const current = groups.get(item.parentChannelId);
     if (!current) {
       groups.set(item.parentChannelId, {
@@ -11829,15 +15377,20 @@ async function getUnifiedActivityAllInboxItems(
     traceQuery: opts.traceQuery,
     executor: opts.executor,
   });
-  const scopedUnfollowed = opts.scope === "dms"
+  const dmScopedUnfollowed = opts.scope === "dms"
     ? allUnfollowed.filter(isDmScopedInboxItem)
     : opts.scope === "no_dms"
       ? allUnfollowed.filter((item) => !isDmScopedInboxItem(item))
       : allUnfollowed;
-  const pageUnfollowed = opts.channelId
-    ? scopedUnfollowed.filter((item) => item.kind === "thread" && item.parentChannelId === opts.channelId)
-    : scopedUnfollowed;
-  const activeItems = active.items.map((item): InboxItem => item.kind === "thread"
+  const pinnedChannelIdSet = opts.pinnedChannelIds ? new Set(normalizePinnedChannelIds(opts.pinnedChannelIds)) : null;
+  const scopedUnfollowed = pinnedChannelIdSet
+    ? dmScopedUnfollowed.filter((item) => isPinnedScopedInboxItem(item, pinnedChannelIdSet))
+    : dmScopedUnfollowed;
+  const rowIdSet = opts.rowIds ? new Set(opts.rowIds) : null;
+  const pageUnfollowed = scopedUnfollowed.filter((item) =>
+    (!opts.channelId || (isSubConversationInboxItem(item) && item.parentChannelId === opts.channelId))
+    && (!rowIdSet || rowIdSet.has(inboxItemRowId(item).toLowerCase())));
+  const activeItems = active.items.map((item): InboxItem => item.kind === "thread" || item.kind === "task"
     ? { ...item, isFollowing: true, unfollowedAt: null }
     : item);
   const activeKeys = new Set(activeItems.map(inboxItemIdentity));
@@ -11858,7 +15411,7 @@ async function getUnifiedActivityAllInboxItems(
 }
 
 async function buildRisingWaveInboxItemsResult(
-  result: InboxQueryResult,
+  result: RisingWaveInboxQueryResult,
   limit: number,
   traceQuery: DbQueryTracer,
   db: DatabaseExecutor,
@@ -11866,6 +15419,13 @@ async function buildRisingWaveInboxItemsResult(
   const rawRows = result.rows as InboxPolicySqlRow[];
   const page = selectInboxPolicyPageRows(rawRows, limit);
   const pageRows = page.rows;
+  // The serving views do not carry the flag: stamp it from the read's own
+  // marked-unread lookup (loadMarkedUnreadScopes).
+  for (const row of pageRows) {
+    const scopeId = inboxScopeIdOfRow(row);
+    row.markedUnread = scopeId !== null && result.markedScopeIds.has(scopeId);
+  }
+  await enrichInboxRowsWithTaskIdentity(pageRows, traceQuery, db);
   await enrichInboxRowsWithProfileNames(pageRows, traceQuery, db);
   const mappedItems = mapInboxPolicyRowsToItems(pageRows, logInboxScopeCorruption, "servingPair") as InboxItem[];
   return {
@@ -11880,7 +15440,62 @@ async function buildRisingWaveInboxItemsResult(
 
 export type InboxItemsQuery = NonNullable<Parameters<typeof getInboxItems>[2]>;
 
+/**
+ * Activity rows for one reader. On a plan with a history window, every preview
+ * of a message behind it (a thread's start, its latest activity, a channel's
+ * last message) is a 40-character glimpse (cindyz, task #8), whichever source
+ * served the page (RisingWave, the canonical read, a compositor). Done once
+ * here, after the source, so the paths can't disagree.
+ */
 export async function getInboxItems(
+  serverId: string,
+  userId: string,
+  opts: Parameters<typeof readInboxItems>[2] = {},
+): Promise<InboxItemsResult> {
+  const result = await readInboxItems(serverId, userId, opts);
+  return opts.historyCutoff ? cutInboxPreviewsBehindWindow(result, opts.historyCutoff, opts.executor ?? getDb()) : result;
+}
+
+async function cutInboxPreviewsBehindWindow(
+  result: InboxItemsResult,
+  cutoff: Date,
+  db: DatabaseExecutor,
+): Promise<InboxItemsResult> {
+  const isMessageId = (id: string | null | undefined): id is string => typeof id === "string" && UUID_TEXT_RE.test(id);
+  const ids = new Set<string>();
+  for (const item of result.items) {
+    if ("latestActivityMessageId" in item) {
+      if (item.kind === "thread" && isMessageId(item.parentMessageId)) ids.add(item.parentMessageId);
+      if (isMessageId(item.latestActivityMessageId)) ids.add(item.latestActivityMessageId);
+    } else if (isMessageId(item.lastMessageId)) {
+      ids.add(item.lastMessageId);
+    }
+  }
+  if (ids.size === 0) return result;
+  const rows = await db.select({ id: messages.id, createdAt: messages.createdAt }).from(messages)
+    .where(inArray(messages.id, [...ids]));
+  const behind = new Set(rows.filter((row) => row.createdAt.getTime() <= cutoff.getTime()).map((row) => row.id));
+  if (behind.size === 0) return result;
+  const glimpse = (text: string) => historyLimitedPreview(text) ?? "";
+  return {
+    ...result,
+    items: result.items.map((item): InboxItem => {
+      if (!("latestActivityMessageId" in item)) {
+        return behind.has(item.lastMessageId) ? { ...item, lastMessagePreview: glimpse(item.lastMessagePreview) } : item;
+      }
+      return {
+        ...item,
+        // A task's title (its parent preview) is its own, not a message.
+        ...(item.kind === "thread" && behind.has(item.parentMessageId) && { parentMessagePreview: glimpse(item.parentMessagePreview) }),
+        ...(behind.has(item.latestActivityMessageId) && { latestActivityPreview: glimpse(item.latestActivityPreview) }),
+      };
+    }),
+  };
+}
+
+const UUID_TEXT_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+async function readInboxItems(
   serverId: string,
   userId: string,
   opts: {
@@ -11891,6 +15506,19 @@ export async function getInboxItems(
     q?: string;
     /** Restrict every row, group and count to this scope. */
     scope?: InboxScope;
+    /**
+     * Activity "Pinned" scope: restrict every row, group and count to rows
+     * whose group channel (the row's channel, or a thread's parent) is one of
+     * these ids. Undefined = no restriction; [] = nothing.
+     */
+    pinnedChannelIds?: readonly string[];
+    /**
+     * `ids`: only rows whose own id (a channel/DM row's channelId, a thread/task
+     * row's threadChannelId) is one of these. Narrows rows and totalCount /
+     * totalUnreadCount like the channel facet; groups and activeUnreadCount
+     * stay list-wide. Undefined = no restriction; [] = nothing.
+     */
+    rowIds?: readonly string[];
     sort?: "asc" | "desc";
     historyCutoff?: Date;
     humanActivityMuteEnabled?: boolean;
@@ -11916,8 +15544,10 @@ export async function getInboxItems(
   const sortDirection = opts.sort === "asc" ? sql`ASC` : sql`DESC`;
   const historyCutoff = opts.historyCutoff;
   const traceQuery = opts.traceQuery ?? untracedDbQuery;
+  const pinnedChannelIds = normalizePinnedChannelIds(opts.pinnedChannelIds);
+  const rowIds = normalizePinnedChannelIds(opts.rowIds);
   if (filter === "all" && opts.includeUnfollowedThreads) {
-    return getUnifiedActivityAllInboxItems(serverId, userId, { ...opts, q }, limit, offset);
+    return getUnifiedActivityAllInboxItems(serverId, userId, { ...opts, q, pinnedChannelIds, rowIds }, limit, offset);
   }
   const humanActivityMuteEnabled = opts.humanActivityMuteEnabled ?? true;
   const humanMuteFromSeqSelect = humanActivityMuteEnabled
@@ -11958,6 +15588,8 @@ export async function getInboxItems(
       offset,
       channelId,
       scope: opts.scope,
+      pinnedChannelIds,
+      rowIds,
       sort: opts.sort,
       historyCutoff,
       includeMentionOnlyInAllAndUnread: humanActivityMuteEnabled,
@@ -11975,24 +15607,27 @@ export async function getInboxItems(
 
   const legacyActivityChannelFilterPredicate = channelId
     ? sql`AND CASE
-        WHEN activity."kind" = 'thread' THEN activity."parentChannelId"
+        WHEN activity."kind" IN ('thread', 'task') THEN activity."parentChannelId"
         ELSE activity."sourceChannelId"
       END = ${channelId}::uuid`
     : sql``;
   const legacyCombinedChannelFilterPredicate = channelId
     ? sql`AND CASE
-        WHEN combined."kind" = 'thread' THEN combined."parentChannelId"
+        WHEN combined."kind" IN ('thread', 'task') THEN combined."parentChannelId"
         ELSE combined."channelId"
       END = ${channelId}`
     : sql``;
-  const legacyActivityScopePredicate = inboxScopeSqlPredicate(opts.scope, sql`activity`);
-  const legacyCombinedScopePredicate = inboxScopeSqlPredicate(opts.scope, sql`combined`);
+  const legacyActivityScopePredicate = sql`${inboxScopeSqlPredicate(opts.scope, sql`activity`)}
+      ${pinnedScopeSqlPredicate(pinnedChannelIds, sql`CASE WHEN activity."kind" IN ('thread', 'task') THEN activity."parentChannelId" ELSE activity."sourceChannelId" END`)}`;
+  const legacyCombinedScopePredicate = sql`${inboxScopeSqlPredicate(opts.scope, sql`combined`)}
+      ${pinnedScopeSqlPredicate(pinnedChannelIds, sql`CASE WHEN combined."kind" IN ('thread', 'task') THEN combined."parentChannelId" ELSE combined."channelId" END`)}`;
   const legacySearchPattern = q ? `%${q}%` : null;
   const legacyActivitySearchPredicate = legacySearchPattern
     ? sql`AND (
         COALESCE(activity."channelName", '') ILIKE ${legacySearchPattern}
         OR COALESCE(activity."parentChannelName", '') ILIKE ${legacySearchPattern}
-        OR COALESCE(activity."parentMessagePreview", '') ILIKE ${legacySearchPattern}
+        OR (${historyCutoff ? sql`(activity."kind" <> 'thread' OR activity."parentMessageCreatedAt" > ${historyCutoff})` : sql`true`}
+          AND COALESCE(activity."parentMessagePreview", '') ILIKE ${legacySearchPattern})
         OR EXISTS (
           SELECT 1
           FROM messages search_message
@@ -12003,6 +15638,7 @@ export async function getInboxItems(
             ON search_message.sender_type = 'agent'
            AND search_agent.id::text = search_message.sender_id
           WHERE search_message.channel_id = activity."storageChannelId"
+            ${historyCutoff ? sql`AND search_message.created_at > ${historyCutoff}` : sql``}
             AND (
               search_message.content ILIKE ${legacySearchPattern}
               OR COALESCE(search_user.display_name, search_user.name, search_agent.display_name, search_agent.name, '') ILIKE ${legacySearchPattern}
@@ -12010,13 +15646,20 @@ export async function getInboxItems(
         )
       )`
     : sql``;
+  // Behind the history cutoff a preview is not searchable: a row's last
+  // message and latest activity are at "activityAt", a thread's start at
+  // "parentMessageCreatedAt" (a task's title is its own).
+  const legacyCombinedActivityInWindow = historyCutoff ? sql`combined."activityAt" > ${historyCutoff}` : sql`true`;
+  const legacyCombinedParentInWindow = historyCutoff
+    ? sql`(combined."kind" <> 'thread' OR combined."parentMessageCreatedAt" > ${historyCutoff})`
+    : sql`true`;
   const legacyCombinedSearchPredicate = legacySearchPattern
     ? sql`AND (
         COALESCE(combined."channelName", '') ILIKE ${legacySearchPattern}
         OR COALESCE(combined."parentChannelName", '') ILIKE ${legacySearchPattern}
-        OR COALESCE(combined."lastMessagePreview", '') ILIKE ${legacySearchPattern}
-        OR COALESCE(combined."parentMessagePreview", '') ILIKE ${legacySearchPattern}
-        OR COALESCE(combined."latestActivityPreview", '') ILIKE ${legacySearchPattern}
+        OR (${legacyCombinedActivityInWindow} AND COALESCE(combined."lastMessagePreview", '') ILIKE ${legacySearchPattern})
+        OR (${legacyCombinedParentInWindow} AND COALESCE(combined."parentMessagePreview", '') ILIKE ${legacySearchPattern})
+        OR (${legacyCombinedActivityInWindow} AND COALESCE(combined."latestActivityPreview", '') ILIKE ${legacySearchPattern})
         OR COALESCE(combined."lastMessageSenderName", '') ILIKE ${legacySearchPattern}
         OR COALESCE(combined."taskClaimedByName", '') ILIKE ${legacySearchPattern}
       )`
@@ -12027,8 +15670,17 @@ export async function getInboxItems(
   // SQL carries it per request so the canonical reads keep the same product
   // behavior. Empty fragments when no cutoff: zero plan-shape change.
   const legacyCutoffAndM = historyCutoff ? sql` AND m.created_at > ${historyCutoff}` : sql``;
+
   const legacyCutoffAndMm = historyCutoff ? sql` AND mm.created_at > ${historyCutoff}` : sql``;
 
+  // Marked unread (no count): the Unread filter lists these too (SYNC with
+  // the RisingWave read's markedScopeIdsParam); a row each, 0 to the counts.
+  const markedForUnreadFilter = filter === "unread"
+    ? [...(await loadMarkedUnreadScopes(serverId, userId, traceQuery, db)).keys()]
+    : [];
+  const legacyMarkedUnreadPredicate = markedForUnreadFilter.length > 0
+    ? sql`OR (${filter} = 'unread' AND (CASE WHEN combined."kind" IN ('thread', 'task') THEN combined."threadChannelId" ELSE combined."channelId" END)::text IN (${sql.join(markedForUnreadFilter.map((id) => sql`${id}`), sql`, `)}))`
+    : sql``;
   const readLegacyInboxItemsFromPostgres = () =>
     filter === "all"
       ? traceQuery(
@@ -12086,7 +15738,8 @@ export async function getInboxItems(
         pm.sender_id AS parent_message_sender_id,
         pm.created_at AS parent_message_created_at,
         pm.seq AS parent_message_seq,
-        COALESCE(rc.last_read_seq, 0) AS last_read_seq
+        COALESCE(rc.last_read_seq, 0) AS last_read_seq,
+        'thread'::text AS conversation_kind
       FROM thread_follows tf
       INNER JOIN channels t
         ON t.id = tf.thread_channel_id
@@ -12134,6 +15787,8 @@ export async function getInboxItems(
           AND tf.done_at IS NULL
           AND tf.unfollowed_at IS NULL
           AND (COALESCE(local_parent.type::text, parent_ch.type::text) = 'channel' OR parent_member.user_id IS NOT NULL)
+      UNION ALL
+      ${followedTaskConversationsLegacyInboxArm({ serverId, userId, guestAccess, withTaskColumns: false })}
     ),
     activity AS MATERIALIZED (
       SELECT
@@ -12166,7 +15821,7 @@ export async function getInboxItems(
       ) lm ON true
       UNION ALL
       SELECT
-        'thread' AS "kind",
+        t.conversation_kind AS "kind",
         t.source_channel_id AS "sourceChannelId",
         t.storage_channel_id AS "storageChannelId",
         NULL::text AS "channelName",
@@ -12192,6 +15847,9 @@ export async function getInboxItems(
         ORDER BY m.seq DESC
         LIMIT 1
       ) latest_reply ON true
+      -- A task conversation shows once it has a message (its creator follows it
+      -- from creation), as in the RisingWave chain.
+      WHERE t.conversation_kind = 'thread' OR latest_reply.created_at IS NOT NULL
       UNION ALL
       -- Notified outsider public-channel mentions: a user @-mentioned in a
       -- public channel they are NOT a member of gets a mention-only Activity
@@ -12320,16 +15978,16 @@ export async function getInboxItems(
     ),
     group_counts AS (
       SELECT
-        CASE WHEN "kind" = 'thread' THEN "parentChannelId" ELSE "sourceChannelId" END AS "groupChannelId",
-        CASE WHEN "kind" = 'thread' THEN "parentChannelName" ELSE "channelName" END AS "groupChannelName",
-        CASE WHEN "kind" = 'thread' THEN "parentChannelType" ELSE "channelType" END AS "groupChannelType",
+        CASE WHEN "kind" IN ('thread', 'task') THEN "parentChannelId" ELSE "sourceChannelId" END AS "groupChannelId",
+        CASE WHEN "kind" IN ('thread', 'task') THEN "parentChannelName" ELSE "channelName" END AS "groupChannelName",
+        CASE WHEN "kind" IN ('thread', 'task') THEN "parentChannelType" ELSE "channelType" END AS "groupChannelType",
         count(*)::int AS "groupCount",
         MAX("activityAt") AS "groupLastActivityAt"
       FROM filtered_activity
       GROUP BY
-        CASE WHEN "kind" = 'thread' THEN "parentChannelId" ELSE "sourceChannelId" END,
-        CASE WHEN "kind" = 'thread' THEN "parentChannelName" ELSE "channelName" END,
-        CASE WHEN "kind" = 'thread' THEN "parentChannelType" ELSE "channelType" END
+        CASE WHEN "kind" IN ('thread', 'task') THEN "parentChannelId" ELSE "sourceChannelId" END,
+        CASE WHEN "kind" IN ('thread', 'task') THEN "parentChannelName" ELSE "channelName" END,
+        CASE WHEN "kind" IN ('thread', 'task') THEN "parentChannelType" ELSE "channelType" END
     ),
     group_totals AS (
       SELECT
@@ -12345,6 +16003,7 @@ export async function getInboxItems(
       FROM filtered_activity activity
       WHERE true
       ${legacyActivityChannelFilterPredicate}
+      ${rowIdsSqlPredicate(rowIds, sql`activity."sourceChannelId"`)}
     ),
     totals AS (
       SELECT count(*)::int AS "totalCount"
@@ -12358,6 +16017,7 @@ export async function getInboxItems(
        AND m.seq > a."lastReadSeq"${legacyCutoffAndM}
        AND NOT (m.sender_type = 'user' AND m.sender_id = ${userId})
        AND ${legacyChatActivityPromotionAllowedSql(userId, sql`a."muteFromSeq"`)}
+       AND ${taskConversationUnreadMessageSql(sql`m`, sql`a."kind" = 'task'`)}
       WHERE NOT a."isOutsiderMention"
     ),
     page AS (
@@ -12370,7 +16030,7 @@ export async function getInboxItems(
     page_enriched AS (
       SELECT
         p."kind",
-        CASE WHEN p."kind" = 'thread' THEN NULL::text ELSE p."sourceChannelId"::text END AS "channelId",
+        CASE WHEN p."kind" IN ('thread', 'task') THEN NULL::text ELSE p."sourceChannelId"::text END AS "channelId",
         p."channelName",
         p."channelType",
         latest_message.id::text AS "lastMessageId",
@@ -12381,7 +16041,7 @@ export async function getInboxItems(
         latest_message.sender_id AS "lastMessageSenderId",
         COALESCE(su.display_name, su.name, sa.display_name, sa.name) AS "lastMessageSenderName",
         CASE WHEN p."isOutsiderMention" THEN 0 ELSE COALESCE(unread.unread_count, 0) END::int AS "unreadCount",
-        CASE WHEN p."kind" = 'thread' THEN p."sourceChannelId"::text ELSE NULL::text END AS "threadChannelId",
+        CASE WHEN p."kind" IN ('thread', 'task') THEN p."sourceChannelId"::text ELSE NULL::text END AS "threadChannelId",
         p."parentMessageId"::text AS "parentMessageId",
         p."parentChannelId"::text AS "parentChannelId",
         p."parentChannelName",
@@ -12395,8 +16055,8 @@ export async function getInboxItems(
         COALESCE(latest_message.id, p."parentMessageId")::text AS "latestActivityMessageId",
         COALESCE(latest_message.seq, p."parentMessageSeq")::text AS "latestActivitySeq",
         to_char((COALESCE(latest_message.created_at, p."parentMessageCreatedAt")) AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS.US') || '+00' AS "lastActivityAt",
-        CASE WHEN p."kind" = 'thread' THEN to_char((latest_message.created_at) AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS.US') || '+00' ELSE NULL::text END AS "lastReplyAt",
-        CASE WHEN p."kind" = 'thread' THEN COALESCE(reply_count.reply_count, 0)::int ELSE NULL::int END AS "replyCount",
+        CASE WHEN p."kind" IN ('thread', 'task') THEN to_char((latest_message.created_at) AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS.US') || '+00' ELSE NULL::text END AS "lastReplyAt",
+        CASE WHEN p."kind" IN ('thread', 'task') THEN COALESCE(reply_count.reply_count, 0)::int ELSE NULL::int END AS "replyCount",
         legacy_task.task_number AS "taskNumber",
         legacy_task.status AS "taskStatus",
         COALESCE(claimant_user.display_name, claimant_user.name, claimant_agent.display_name, claimant_agent.name) AS "taskClaimedByName",
@@ -12421,6 +16081,7 @@ export async function getInboxItems(
           AND m.seq > p."lastReadSeq"${legacyCutoffAndM}
           AND NOT (m.sender_type = 'user' AND m.sender_id = ${userId})
           AND ${legacyChatActivityPromotionAllowedSql(userId, sql`p."muteFromSeq"`)}
+          AND ${taskConversationUnreadMessageSql(sql`m`, sql`p."kind" = 'task'`)}
         ORDER BY m.seq ASC
         LIMIT 1
       ) first_unread ON true
@@ -12431,12 +16092,17 @@ export async function getInboxItems(
           AND m.seq > p."lastReadSeq"${legacyCutoffAndM}
           AND NOT (m.sender_type = 'user' AND m.sender_id = ${userId})
           AND ${legacyChatActivityPromotionAllowedSql(userId, sql`p."muteFromSeq"`)}
+          AND ${taskConversationUnreadMessageSql(sql`m`, sql`p."kind" = 'task'`)}
       ) unread ON true
       LEFT JOIN LATERAL (
         SELECT count(*)::int AS reply_count
         FROM messages m
-        WHERE p."kind" = 'thread'
+        WHERE p."kind" IN ('thread', 'task')
           AND m.channel_id = p."storageChannelId"
+          -- A task conversation's replies are its chat messages (people and
+          -- agents), not its lifecycle lines, as rw_task_conversation_replies_v1
+          -- and the task row count them; a thread counts every message.
+          AND (p."kind" = 'thread' OR m.message_type = 'chat')
       ) reply_count ON true
       LEFT JOIN LATERAL (
         SELECT true AS found, mm.message_id AS first_mention_message_id
@@ -12701,7 +16367,8 @@ export async function getInboxItems(
         legacy_task.task_number AS task_number,
         legacy_task.status AS task_status,
         legacy_task.claimed_by_type AS task_claimed_by_type,
-        legacy_task.claimed_by_id AS task_claimed_by_id
+        legacy_task.claimed_by_id AS task_claimed_by_id,
+        'thread'::text AS conversation_kind
       FROM thread_follows tf
       INNER JOIN channels t
         ON t.id = tf.thread_channel_id
@@ -12748,6 +16415,8 @@ export async function getInboxItems(
         AND tf.done_at IS NULL
         AND tf.unfollowed_at IS NULL
         AND (COALESCE(local_parent.type::text, parent_ch.type::text) = 'channel' OR parent_member.user_id IS NOT NULL)
+      UNION ALL
+      ${followedTaskConversationsLegacyInboxArm({ serverId, userId, guestAccess, withTaskColumns: true })}
     ),
     chat_items AS (
       SELECT
@@ -12769,6 +16438,7 @@ export async function getInboxItems(
         NULL::text AS "parentChannelName",
         NULL::text AS "parentChannelType",
         NULL::text AS "parentMessagePreview",
+        NULL::timestamptz AS "parentMessageCreatedAt",
         NULL::text AS "parentMessageSenderType",
         NULL::text AS "parentMessageSenderId",
         NULL::text AS "latestActivityPreview",
@@ -12865,6 +16535,7 @@ export async function getInboxItems(
         NULL::text AS "parentChannelName",
         NULL::text AS "parentChannelType",
         NULL::text AS "parentMessagePreview",
+        NULL::timestamptz AS "parentMessageCreatedAt",
         NULL::text AS "parentMessageSenderType",
         NULL::text AS "parentMessageSenderId",
         NULL::text AS "latestActivityPreview",
@@ -12912,6 +16583,7 @@ export async function getInboxItems(
         c.parent_channel_name AS "parentChannelName",
         c.parent_channel_type AS "parentChannelType",
         c.parent_message_preview AS "parentMessagePreview",
+        c.parent_message_created_at AS "parentMessageCreatedAt",
         c.parent_message_sender_type AS "parentMessageSenderType",
         c.parent_message_sender_id AS "parentMessageSenderId",
         c.latest_mention_preview AS "latestActivityPreview",
@@ -12935,7 +16607,7 @@ export async function getInboxItems(
     ),
     thread_items AS (
       SELECT
-        'thread' AS "kind",
+        t.conversation_kind AS "kind",
         NULL::text AS "channelId",
         NULL::text AS "channelName",
         NULL::text AS "channelType",
@@ -12953,6 +16625,7 @@ export async function getInboxItems(
         t.parent_channel_name AS "parentChannelName",
         t.parent_channel_type AS "parentChannelType",
         t.parent_message_preview AS "parentMessagePreview",
+        t.parent_message_created_at AS "parentMessageCreatedAt",
         t.parent_message_sender_type AS "parentMessageSenderType",
         t.parent_message_sender_id AS "parentMessageSenderId",
         COALESCE(latest.latest_preview, t.parent_message_preview) AS "latestActivityPreview",
@@ -12981,6 +16654,8 @@ export async function getInboxItems(
           count(*)::int AS reply_count
         FROM messages m
         WHERE m.channel_id = t.storage_channel_id
+          -- A task conversation counts its chat messages only (see the all branch).
+          AND (t.conversation_kind = 'thread' OR m.message_type = 'chat')
       ) stats ON true
       LEFT JOIN LATERAL (
         SELECT
@@ -13001,6 +16676,7 @@ export async function getInboxItems(
         WHERE m.channel_id = t.storage_channel_id
           AND m.seq > COALESCE(rc.last_read_seq, 0)${legacyCutoffAndM}
           AND NOT (m.sender_type = 'user' AND m.sender_id = ${userId})
+          AND ${taskConversationUnreadMessageSql(sql`m`, sql`t.conversation_kind = 'task'`)}
         ORDER BY m.seq ASC
         LIMIT 1
       ) first_unread ON true
@@ -13010,6 +16686,7 @@ export async function getInboxItems(
         WHERE m.channel_id = t.storage_channel_id
           AND m.seq > COALESCE(rc.last_read_seq, 0)${legacyCutoffAndM}
           AND NOT (m.sender_type = 'user' AND m.sender_id = ${userId})
+          AND ${taskConversationUnreadMessageSql(sql`m`, sql`t.conversation_kind = 'task'`)}
       ) unread ON true
       LEFT JOIN LATERAL (
         SELECT true AS found, mm.message_id AS first_mention_message_id
@@ -13040,6 +16717,8 @@ export async function getInboxItems(
       LEFT JOIN users claimant_user
         ON t.task_claimed_by_type = 'user'
        AND claimant_user.id::text = t.task_claimed_by_id
+      -- A task conversation shows once it has a message, as in the RisingWave chain.
+      WHERE t.conversation_kind = 'thread' OR latest.last_reply_at IS NOT NULL
     ),
     combined AS (
       SELECT * FROM chat_items
@@ -13082,12 +16761,14 @@ export async function getInboxItems(
         AND (
           ${filter} = 'all'
           OR (${filter} = 'unread' AND "unreadCount" > 0)
+          ${legacyMarkedUnreadPredicate}
           OR (${filter} = 'unread_mentions' AND "unreadCount" > 0 AND "hasMention" = true)
           OR (${filter} = 'mentions' AND EXISTS (
           SELECT 1 FROM message_mentions mm
           WHERE mm.target_type = 'user'
             AND mm.target_id = ${userId}::uuid
             AND (mm.notifiable_at_send OR mm.notified_at IS NOT NULL)
+            ${historyCutoff ? sql`AND mm.created_at > ${historyCutoff}` : sql``}
             AND (
               mm.channel_id::text = combined."mentionSourceChannelId"
               OR EXISTS (
@@ -13106,16 +16787,16 @@ export async function getInboxItems(
     ),
     group_counts AS (
       SELECT
-        CASE WHEN "kind" = 'thread' THEN "parentChannelId" ELSE "channelId" END AS "groupChannelId",
-        CASE WHEN "kind" = 'thread' THEN "parentChannelName" ELSE "channelName" END AS "groupChannelName",
-        CASE WHEN "kind" = 'thread' THEN "parentChannelType" ELSE "channelType" END AS "groupChannelType",
+        CASE WHEN "kind" IN ('thread', 'task') THEN "parentChannelId" ELSE "channelId" END AS "groupChannelId",
+        CASE WHEN "kind" IN ('thread', 'task') THEN "parentChannelName" ELSE "channelName" END AS "groupChannelName",
+        CASE WHEN "kind" IN ('thread', 'task') THEN "parentChannelType" ELSE "channelType" END AS "groupChannelType",
         count(*)::int AS "groupCount",
         MAX("activityAt") AS "groupLastActivityAt"
       FROM filtered
       GROUP BY
-        CASE WHEN "kind" = 'thread' THEN "parentChannelId" ELSE "channelId" END,
-        CASE WHEN "kind" = 'thread' THEN "parentChannelName" ELSE "channelName" END,
-        CASE WHEN "kind" = 'thread' THEN "parentChannelType" ELSE "channelType" END
+        CASE WHEN "kind" IN ('thread', 'task') THEN "parentChannelId" ELSE "channelId" END,
+        CASE WHEN "kind" IN ('thread', 'task') THEN "parentChannelName" ELSE "channelName" END,
+        CASE WHEN "kind" IN ('thread', 'task') THEN "parentChannelType" ELSE "channelType" END
     ),
     group_totals AS (
       SELECT
@@ -13131,6 +16812,7 @@ export async function getInboxItems(
       FROM filtered combined
       WHERE true
       ${legacyCombinedChannelFilterPredicate}
+      ${rowIdsSqlPredicate(rowIds, sql`CASE WHEN combined."kind" IN ('thread', 'task') THEN combined."threadChannelId" ELSE combined."channelId" END`)}
     ),
     totals AS (
       SELECT
@@ -13185,6 +16867,7 @@ export async function getInboxItems(
   const page = selectInboxPolicyPageRows(rawRows, limit);
   const pageRows = page.rows as any[];
 
+  await enrichInboxRowsWithTaskIdentity(pageRows, traceQuery, db);
   await enrichInboxRowsWithProfileNames(pageRows, traceQuery, db);
   recordInboxBackendSelected("pg_legacy", filter, "none", undefined, {
     inbox_pg_selection_reason: canonicalSelectionReason,
@@ -13203,8 +16886,8 @@ export async function getInboxItems(
   // PG canonical path: the read-cursor triple AND the union frontier pair
   // come from the SINGLE authority read (identical union to the list/unread
   // exits). The authority read runs on the SAME executor as the rest of the
-  // flow — required when the caller is inside a transaction (activity-sync
-  // authority tx), both for snapshot consistency and to avoid
+  // flow — required when the caller is inside a transaction, both for
+  // snapshot consistency and to avoid
   // single-connection (pglite) deadlock.
   await enrichInboxRowsWithReadCursorAuthority(pageRows, userId, traceQuery, db);
   const mappedItems = mapInboxPolicyRowsToItems(pageRows, logInboxScopeCorruption, "authority") as InboxItem[];
@@ -13282,6 +16965,8 @@ export type ReadStateMutationResult = {
   changed: boolean;
   /** Unread left after the write, when the sequencer computed it (see ReadMutationAck scopes). */
   unreadCount?: number;
+  /** Marked unread with nothing countable (see ReadMutationAck scopes); absent means false. */
+  markedUnread?: boolean;
 };
 
 export type InboxReadLatestResult = {
@@ -13296,6 +16981,7 @@ function readStateResultFromAckScope(scope: ReadMutationAck["scopes"][number]): 
     readStateVersion: scope.readStateVersion,
     changed: scope.changed,
     ...(typeof scope.unreadCount === "number" ? { unreadCount: scope.unreadCount } : {}),
+    ...(scope.markedUnread === true ? { markedUnread: true } : {}),
   };
 }
 
@@ -13323,7 +17009,7 @@ export async function markConversationReadLatest(serverId: string, userId: strin
   return { markedCount: scopes.filter((scope) => scope.changed).length, scopes };
 }
 
-export type ThreadFollowReason = "replied" | "authored" | "mentioned" | "manual";
+export type ThreadFollowReason = "replied" | "authored" | "mentioned" | "manual" | "assigned" | "saved";
 
 /**
  * Write thread attention state. Ordinary auto-follow callers intentionally do
@@ -13334,9 +17020,12 @@ export async function recordThreadFollow(
   followerType: "user" | "agent",
   followerId: string,
   threadChannelId: string,
-  parentMessageId: string,
+  /** Thread: its parent message. Task conversation (task v2): null + `opts.parentTaskId`. */
+  parentMessageId: string | null,
   reason: ThreadFollowReason,
   opts: {
+    /** Task conversation (task v2): the task it belongs to. */
+    parentTaskId?: string | null;
     reactivateUnfollowed?: boolean;
     preserveExistingReason?: boolean;
     /**
@@ -13346,9 +17035,18 @@ export async function recordThreadFollow(
      * its position. Omit only when the caller moves the position itself.
      */
     joinedThroughSeq?: number | "latest";
+    /** Run the writes in the caller's transaction (notifications/settings.ts setLevel). */
+    executor?: DatabaseExecutor;
   } = {},
 ) {
-  const db = getDb();
+  const db = opts.executor ?? getDb();
+  // Agent Lounge: following is subscribing, and other agents never subscribe
+  // there. Skipped, not refused: an automatic follow (say, of a message's
+  // author whose lounge binding was released) must not fail the post that
+  // triggered it. The agent route refuses with a reason before calling this.
+  if (followerType === "agent" && await isLoungeOutsiderAgent(threadChannelId, followerId, db)) {
+    return;
+  }
   const reactivateUnfollowed = opts.reactivateUnfollowed ?? false;
   const preserveExistingReason = opts.preserveExistingReason ?? false;
   const result = await db.execute(sql`
@@ -13363,6 +17061,7 @@ export async function recordThreadFollow(
       follower_type,
       follower_id,
       parent_message_id,
+      parent_task_id,
       reason,
       done_at,
       unfollowed_at
@@ -13372,6 +17071,7 @@ export async function recordThreadFollow(
       ${followerType},
       ${followerId}::uuid,
       ${parentMessageId}::uuid,
+      ${opts.parentTaskId ?? null}::uuid,
       ${reason},
       NULL,
       NULL
@@ -13379,8 +17079,20 @@ export async function recordThreadFollow(
     ON CONFLICT (thread_channel_id, follower_type, follower_id) DO UPDATE
     SET
       parent_message_id = EXCLUDED.parent_message_id,
+      parent_task_id = EXCLUDED.parent_task_id,
       reason = CASE
+        -- Thread contract D: a follow only a save started takes the new
+        -- reason (reply, mention, ...), so unsaving no longer releases it.
+        -- Before the rules below that keep an active follow's reason.
+        WHEN thread_follows.reason = 'saved' THEN EXCLUDED.reason
         WHEN ${preserveExistingReason} THEN thread_follows.reason
+        -- Task v2: replying in a task conversation keeps why an ACTIVE follow
+        -- began (the creator stays 'authored', the assignee 'assigned'); a
+        -- reply that (re)starts a follow records 'replied'.
+        WHEN EXCLUDED.reason = 'replied'
+          AND EXCLUDED.parent_task_id IS NOT NULL
+          AND thread_follows.unfollowed_at IS NULL
+          THEN thread_follows.reason
         ELSE EXCLUDED.reason
       END,
       -- Start of the current follow period: a re-follow after an unfollow
@@ -13391,11 +17103,19 @@ export async function recordThreadFollow(
         ELSE thread_follows.created_at
       END,
       done_at = NULL,
-      unfollowed_at = NULL
+      unfollowed_at = NULL,
+      -- An automatic re-follow (replying, being mentioned) ends a stored
+      -- 'mentions' (= unfollowed) level: back to NULL (default). An explicit
+      -- 'none' stays silent; 'all' / 'default' stay (contract §1.1).
+      notification_level = CASE
+        WHEN thread_follows.notification_level = 'mentions' THEN NULL
+        ELSE thread_follows.notification_level
+      END
     WHERE ${reactivateUnfollowed}
        OR thread_follows.unfollowed_at IS NULL
     RETURNING thread_channel_id,
-      NOT EXISTS (SELECT 1 FROM prev WHERE prev.unfollowed_at IS NULL) AS started
+      NOT EXISTS (SELECT 1 FROM prev WHERE prev.unfollowed_at IS NULL) AS started,
+      EXISTS (SELECT 1 FROM prev WHERE prev.unfollowed_at IS NOT NULL) AS reactivated
   `);
 
   if (result.rows.length > 0) {
@@ -13403,10 +17123,11 @@ export async function recordThreadFollow(
       followerType,
       followerId,
       threadChannelId,
+      executor: db,
     });
   }
-  const started = (result.rows[0] as { started?: boolean } | undefined)?.started === true;
-  if (started && opts.joinedThroughSeq !== undefined) {
+  const row = result.rows[0] as { started?: boolean; reactivated?: boolean } | undefined;
+  if (row?.started === true && opts.joinedThroughSeq !== undefined) {
     await startReadPositionAtJoin(
       db,
       followerType === "user" ? "human" : "agent",
@@ -13415,6 +17136,8 @@ export async function recordThreadFollow(
       opts.joinedThroughSeq === "latest" ? undefined : opts.joinedThroughSeq,
     );
   }
+  // Not inside a caller's transaction: a client reloading before the commit would still read "stopped following".
+  if (followerType === "agent" && row?.reactivated === true && !opts.executor) noteAgentThreadFollowResumed(threadChannelId);
 }
 
 /** Follow a thread manually (user). */
@@ -13427,58 +17150,283 @@ export async function followThread(userId: string, threadChannelId: string, pare
   });
 }
 
-/** Unfollow a thread for any supported follower type. */
+/**
+ * Follow a task conversation (task v2) by hand, for a person or an agent.
+ * `conversationChannelId` is the follower's LOCAL conversation. Like a manual
+ * thread follow, a person's existing messages read as read.
+ */
+export async function followTaskConversation(
+  followerType: "user" | "agent",
+  followerId: string,
+  conversationChannelId: string,
+): Promise<boolean> {
+  const [conversation] = await getDb()
+    .select({ taskId: channels.taskId })
+    .from(channels)
+    .where(and(eq(channels.id, conversationChannelId), eq(channels.type, "task"), isNull(channels.deletedAt)))
+    .limit(1);
+  if (!conversation?.taskId) return false;
+  await recordThreadFollow(followerType, followerId, conversationChannelId, null, "manual", {
+    parentTaskId: conversation.taskId,
+    reactivateUnfollowed: true,
+    ...(followerType === "agent" && { joinedThroughSeq: "latest" as const }),
+  });
+  if (followerType === "user") {
+    await markReadLatest(followerId, conversationChannelId).catch((error: unknown) => {
+      if (!isReadMutationFenceRefusal(error)) throw error;
+    });
+  }
+  return true;
+}
+
+/** What a follow row of this thread / task conversation names as its parent, or null when it is neither. */
+async function resolveThreadFollowParent(executor: DatabaseExecutor, threadChannelId: string, opts: { liveOnly?: boolean } = {}) {
+  const conditions = [eq(channels.id, threadChannelId), inArray(channels.type, ["thread", "task"])];
+  if (opts.liveOnly) conditions.push(isNull(channels.deletedAt));
+  const [thread] = await executor
+    .select({ type: channels.type, parentMessageId: channels.parentMessageId, taskId: channels.taskId })
+    .from(channels)
+    .where(and(...conditions))
+    .limit(1);
+  if (!thread) return null;
+  // Task conversation (task v2): the follow row names the task, not a message.
+  if (thread.type === "task") return thread.taskId ? { parentMessageId: null, parentTaskId: thread.taskId } : null;
+  const parentMessageId = thread.parentMessageId
+    ?? (await getJointThreadProjectionByLocalThread(threadChannelId, undefined, executor))?.canonicalParentMessageId
+    ?? null;
+  return parentMessageId ? { parentMessageId, parentTaskId: null } : null;
+}
+
+/**
+ * The thread a person's saved message belongs to, as their server shows it
+ * (thread contract D): a reply's own thread / task conversation, or for a
+ * top-level message the thread rooted at it, created as the Follow button
+ * creates it. Joint messages resolve to this server's projection. Null when
+ * the message has no thread here (deleted, or no projection on this server).
+ */
+export async function resolveSavedMessageThreadChannelId(serverId: string, userId: string, messageId: string): Promise<string | null> {
+  const message = await getMessage(messageId);
+  if (!message) return null;
+  const channel = await getChannel(message.channelId);
+  if (!channel) return null;
+  if (isSubConversationType(channel.type)) {
+    const [projection] = await getActiveJointThreadProjectionsByCanonicalThreadsForServer([channel.id], serverId);
+    if (projection) return projection.localThreadChannelId;
+    return channel.serverId === serverId ? channel.id : null;
+  }
+  let localParentChannelId = channel.id;
+  if (channel.serverId !== serverId || channel.type === "joint") {
+    const projection = (await getActiveJointChannelProjectionsByLocalChannel(channel.id))
+      .find((candidate) => candidate.serverId === serverId);
+    if (!projection) return null;
+    localParentChannelId = projection.localChannelId;
+  }
+  return (await getOrCreateThreadForChannel(localParentChannelId, messageId, userId, "user")).id;
+}
+
+/**
+ * Serializes a person's save-follow writes on one thread (savedService's save
+ * and unsave transactions): there may be no follow row to lock yet. Taken
+ * first in each transaction, so the two never wait on each other's rows.
+ */
+export async function lockSaveFollow(executor: DatabaseExecutor, userId: string, threadChannelId: string): Promise<void> {
+  await executor.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(${`saved-follow:${threadChannelId}:${userId}`}, 0))`);
+}
+
+/**
+ * Saving a message follows its thread (thread contract D), in the caller's
+ * transaction after lockSaveFollow, and only while a save of the person's is
+ * linked to the thread (checked in the statement). No row yet starts a
+ * follow with reason 'saved'; an unfollowed row is re-followed the same way
+ * when `reactivateUnfollowed`; an active follow is left exactly as it is,
+ * whatever its reason. True when this started a follow: the caller then
+ * moves the read position after commit (markThreadReadAfterFollowChange), as
+ * after a manual follow.
+ */
+export async function writeSaveFollow(
+  executor: DatabaseExecutor,
+  userId: string,
+  threadChannelId: string,
+  opts: { reactivateUnfollowed: boolean },
+): Promise<boolean> {
+  const parent = await resolveThreadFollowParent(executor, threadChannelId, { liveOnly: true });
+  if (!parent) return false;
+  const result = await executor.execute(sql`
+    INSERT INTO thread_follows (
+      thread_channel_id,
+      follower_type,
+      follower_id,
+      parent_message_id,
+      parent_task_id,
+      reason,
+      done_at,
+      unfollowed_at
+    )
+    SELECT
+      ${threadChannelId}::uuid,
+      'user',
+      ${userId}::uuid,
+      ${parent.parentMessageId}::uuid,
+      ${parent.parentTaskId}::uuid,
+      ${"saved" satisfies ThreadFollowReason},
+      NULL,
+      NULL
+    WHERE EXISTS (
+      SELECT 1 FROM user_saved
+      WHERE user_saved.user_id = ${userId}::uuid
+        AND user_saved.thread_channel_id = ${threadChannelId}::uuid
+    )
+    ON CONFLICT (thread_channel_id, follower_type, follower_id) DO UPDATE
+    SET
+      reason = EXCLUDED.reason,
+      created_at = now(),
+      done_at = NULL,
+      unfollowed_at = NULL,
+      -- As an automatic re-follow: a stored 'mentions' (= unfollowed) level ends.
+      notification_level = CASE
+        WHEN thread_follows.notification_level = 'mentions' THEN NULL
+        ELSE thread_follows.notification_level
+      END
+    WHERE thread_follows.unfollowed_at IS NOT NULL AND ${opts.reactivateUnfollowed}
+    RETURNING thread_channel_id
+  `);
+  if (result.rows.length === 0) return false;
+  await clearFollowedThreadSuppressionForReceiver({ followerType: "user", followerId: userId, threadChannelId, executor });
+  return true;
+}
+
+/**
+ * Unsaving, in the caller's transaction after lockSaveFollow: the person's
+ * follow of the thread goes only while saving is still its one reason
+ * (reason 'saved'; a reply, mention or manual follow since then replaced it,
+ * recordThreadFollow) and no other save of theirs is linked to the thread
+ * (checked in the statement). True when the follow was deleted.
+ */
+export async function releaseSaveFollow(executor: DatabaseExecutor, userId: string, threadChannelId: string): Promise<boolean> {
+  const deleted = await executor
+    .delete(threadFollows)
+    .where(and(
+      eq(threadFollows.threadChannelId, threadChannelId),
+      eq(threadFollows.followerType, "user"),
+      eq(threadFollows.followerId, userId),
+      eq(threadFollows.reason, "saved"),
+      isNull(threadFollows.unfollowedAt),
+      sql`NOT EXISTS (
+        SELECT 1 FROM user_saved
+        WHERE user_saved.user_id = ${userId}::uuid
+          AND user_saved.thread_channel_id = ${threadChannelId}::uuid
+      )`,
+    ))
+    .returning({ threadChannelId: threadFollows.threadChannelId });
+  return deleted.length > 0;
+}
+
+/** An unfollow's row writes (the follow row, a person's Done suppression), in `executor`'s transaction. */
+async function writeThreadUnfollowRows(
+  executor: DatabaseExecutor,
+  followerType: "user" | "agent",
+  followerId: string,
+  threadChannelId: string,
+): Promise<boolean> {
+  const parent = await resolveThreadFollowParent(executor, threadChannelId);
+  if (!parent) return false;
+  const now = currentDate();
+  await executor.insert(threadFollows).values({
+    threadChannelId,
+    followerType,
+    followerId,
+    parentMessageId: parent.parentMessageId,
+    parentTaskId: parent.parentTaskId,
+    reason: "manual",
+    doneAt: null,
+    unfollowedAt: now,
+  }).onConflictDoUpdate({
+    target: [threadFollows.threadChannelId, threadFollows.followerType, threadFollows.followerId],
+    set: { reason: "manual", unfollowedAt: now },
+  });
+  if (followerType === "user") {
+    await writeThreadDoneSuppression({
+      userId: followerId,
+      threadChannelId,
+      writeSite: INBOX_SUPPRESSION_WRITE_SITES.unfollowThreadForFollower,
+      executor,
+    });
+  }
+  return true;
+}
+
+/**
+ * The read-position move after a person's manual follow / unfollow (existing
+ * messages read as read). A read-state fence refusal (the follower left the
+ * Server meanwhile) must not fail it; any other error still surfaces.
+ */
+export async function markThreadReadAfterFollowChange(userId: string, threadChannelId: string): Promise<void> {
+  await markReadLatest(userId, threadChannelId).catch((error: unknown) => {
+    if (!isReadMutationFenceRefusal(error)) throw error;
+  });
+}
+
+/** Unfollow a thread or task conversation for any supported follower type. */
 export async function unfollowThreadForFollower(
   followerType: "user" | "agent",
   followerId: string,
   threadChannelId: string,
 ) {
-  const db = getDb();
-  const [thread] = await db
-    .select({ parentMessageId: channels.parentMessageId })
-    .from(channels)
-    .where(and(eq(channels.id, threadChannelId), eq(channels.type, "thread")))
-    .limit(1);
-  const parentMessageId = thread?.parentMessageId
-    ?? (await getJointThreadProjectionByLocalThread(threadChannelId))?.canonicalParentMessageId;
-  if (!parentMessageId) return;
-
-  await db.transaction(async (tx) => {
-    const now = currentDate();
-    await tx.insert(threadFollows).values({
-      threadChannelId,
-      followerType,
-      followerId,
-      parentMessageId,
-      reason: "manual",
-      doneAt: null,
-      unfollowedAt: now,
-    }).onConflictDoUpdate({
-      target: [threadFollows.threadChannelId, threadFollows.followerType, threadFollows.followerId],
-      set: { reason: "manual", unfollowedAt: now },
-    });
-
-    if (followerType === "user") {
-      await writeThreadDoneSuppression({
-        userId: followerId,
-        threadChannelId,
-        writeSite: INBOX_SUPPRESSION_WRITE_SITES.unfollowThreadForFollower,
-        executor: tx,
-      });
-    }
-  });
-
-  if (followerType === "user") {
-    // A read-state fence refusal must not fail the unfollow; any other error still surfaces.
-    await markReadLatest(followerId, threadChannelId).catch((error: unknown) => {
-      if (!isReadMutationFenceRefusal(error)) throw error;
-    });
-  }
+  const written = await getDb().transaction((tx) => writeThreadUnfollowRows(tx, followerType, followerId, threadChannelId));
+  if (!written) return false;
+  if (followerType === "user") await markThreadReadAfterFollowChange(followerId, threadChannelId);
+  return true;
 }
 
 /** Unfollow a thread (user). */
 export async function unfollowThread(userId: string, threadChannelId: string) {
   await unfollowThreadForFollower("user", userId, threadChannelId);
+}
+
+/**
+ * A person's manual follow or unfollow of a thread / task conversation named
+ * by its own channel id: only the row writes, in the caller's transaction, so
+ * notifications/settings.ts setLevel writes the follow state and the thread
+ * level together (contract §1.1). The caller moves the read position after
+ * commit (markThreadReadAfterFollowChange). False when the channel is not a
+ * live thread / task conversation.
+ */
+export async function writeUserThreadFollowState(
+  executor: DatabaseExecutor,
+  userId: string,
+  threadChannelId: string,
+  state: "follow" | "unfollow",
+): Promise<boolean> {
+  if (state === "unfollow") return writeThreadUnfollowRows(executor, "user", userId, threadChannelId);
+  const parent = await resolveThreadFollowParent(executor, threadChannelId, { liveOnly: true });
+  if (!parent) return false;
+  await recordThreadFollow("user", userId, threadChannelId, parent.parentMessageId, "manual", {
+    parentTaskId: parent.parentTaskId,
+    reactivateUnfollowed: true,
+    executor,
+  });
+  return true;
+}
+
+/**
+ * What the Follow button stores, named by the thread's own channel id, for
+ * tests and fixtures: the manual follow and the explicit thread level `all`
+ * in one transaction, then the read-position move. The button itself goes
+ * through notifications/settings.ts setLevel, which also bumps the prefs
+ * version and emits.
+ */
+export async function followThreadChannelForUser(userId: string, threadChannelId: string): Promise<boolean> {
+  const written = await getDb().transaction(async (tx) => {
+    if (!await writeUserThreadFollowState(tx, userId, threadChannelId, "follow")) return false;
+    await tx.update(threadFollows).set({ notificationLevel: "all" }).where(and(
+      eq(threadFollows.threadChannelId, threadChannelId),
+      eq(threadFollows.followerType, "user"),
+      eq(threadFollows.followerId, userId),
+    ));
+    return true;
+  });
+  if (written) await markThreadReadAfterFollowChange(userId, threadChannelId);
+  return written;
 }
 
 /** Mark a thread as done (hide from active list, auto-restores on new messages). */
@@ -13607,6 +17555,11 @@ export async function markRead(
   const resolved = typeof principal === "string"
     ? { kind: "human" as const, id: principal }
     : principal;
+  // Agent read progress (agentReadProgressService): the ack does not carry the
+  // position the read moved from, so it is read first, only while the flag is on.
+  const readProgress = resolved.kind === "agent"
+    ? await beginAgentReadAdvance({ serverId: channel.serverId, scopeId: channelId, agentId: resolved.id })
+    : null;
   const ack = await executeCompatibilityReadMutation({
     serverId: channel.serverId,
     principalKind: resolved.kind,
@@ -13615,13 +17568,15 @@ export async function markRead(
   });
   const scope = ack.scopes.find((candidate) => candidate.scopeId === channelId);
   if (!scope) return { channelId, maxReadSeq: 0, readStateVersion: 0, changed: false };
-  return readStateResultFromAckScope(scope);
+  const result = readStateResultFromAckScope(scope);
+  readProgress?.finish(result);
+  return result;
 }
 
 async function getMessageStorageChannelId(channelId: string): Promise<string> {
   const channel = await getChannel(channelId);
   if (!channel) return channelId;
-  if (channel.type === "thread") {
+  if (isSubConversationType(channel.type)) {
     const jointThread = await getJointThreadProjectionByLocalThread(channelId, channel.serverId);
     return jointThread?.canonicalThreadChannelId ?? channelId;
   }
@@ -13660,6 +17615,7 @@ export async function getInboxTargetActivityMuteState(
     .select({
       activityMuted: inboxTargetMuteStates.activityMuted,
       muteFromSeq: inboxTargetMuteStates.muteFromSeq,
+      pushMuted: inboxTargetMuteStates.pushMuted,
       prefsVersion: inboxTargetMuteStates.prefsVersion,
     })
     .from(inboxTargetMuteStates)
@@ -13670,10 +17626,7 @@ export async function getInboxTargetActivityMuteState(
     ))
     .limit(1);
 
-  const activityMuted = !!state?.activityMuted && state.muteFromSeq != null;
-  const result = state
-    ? { activityMuted, muteFromSeq: activityMuted ? state.muteFromSeq : null, prefsVersion: state.prefsVersion }
-    : { activityMuted: false, muteFromSeq: null, prefsVersion: 0 };
+  const result = readActivityMuteState(state);
   recordInboxMuteStateTrace("inbox.mute_state.read", {
     receiverType,
     receiverId,
@@ -13741,6 +17694,11 @@ export async function setInboxTargetActivityMuteState(opts: {
     return { activityMuted: false, muteFromSeq: null, prefsVersion: state.prefsVersion, changed: true };
   }
 
+  // An assistant DM's automatic row (mute_from_seq 0) reads as unmuted, so a
+  // mute here replaces it and starts at the next message: earlier assistant
+  // messages would then reach Activity. Only reachable while the route refuses
+  // muting assistant DMs (not App bots, ACTIVITY_MUTE_NOT_SUPPORTED); keep the
+  // row's start if that changes.
   const muteFromSeq = await getLatestMessageSeq(opts.sourceChannelId) + 1;
   const [state] = await db
     .insert(inboxTargetMuteStates)
@@ -13751,6 +17709,7 @@ export async function setInboxTargetActivityMuteState(opts: {
       sourceChannelId: opts.sourceChannelId,
       activityMuted: true,
       muteFromSeq,
+      pushMuted: true,
       prefsVersion: 1,
       createdAt: now,
       updatedAt: now,
@@ -13765,6 +17724,8 @@ export async function setInboxTargetActivityMuteState(opts: {
         serverId: opts.serverId,
         activityMuted: true,
         muteFromSeq,
+        // A person's own mute also silences push, an assistant DM's too.
+        pushMuted: true,
         prefsVersion: sql`${inboxTargetMuteStates.prefsVersion} + 1`,
         updatedAt: now,
       },
@@ -13809,7 +17770,7 @@ export async function getUserChannelMessageDisplayPrefs(
 
   const result = state
     ? { collapseLongMessages: state.collapseLongMessages, prefsVersion: state.prefsVersion }
-    : { collapseLongMessages: true, prefsVersion: 0 };
+    : { collapseLongMessages: false, prefsVersion: 0 };
   return { ...result, changed: false };
 }
 
@@ -13853,39 +17814,6 @@ export async function setUserChannelMessageDisplayPrefs(opts: {
       prefsVersion: userChannelDisplayPrefs.prefsVersion,
     });
   return { collapseLongMessages: opts.collapseLongMessages, prefsVersion: state.prefsVersion, changed: true };
-}
-
-export async function getActivityMutedUserIdsForMessage(opts: {
-  serverId: string;
-  sourceChannelId: string;
-  userIds: string[];
-  messageSeq: number;
-  piercedUserIds?: Set<string>;
-}): Promise<Set<string>> {
-  const db = getDb();
-  if (opts.userIds.length === 0) return new Set();
-  const rows = await db
-    .select({
-      receiverId: inboxTargetMuteStates.receiverId,
-      activityMuted: inboxTargetMuteStates.activityMuted,
-      muteFromSeq: inboxTargetMuteStates.muteFromSeq,
-    })
-    .from(inboxTargetMuteStates)
-    .where(and(
-      eq(inboxTargetMuteStates.receiverType, "user"),
-      eq(inboxTargetMuteStates.serverId, opts.serverId),
-      eq(inboxTargetMuteStates.sourceChannelId, opts.sourceChannelId),
-      inArray(inboxTargetMuteStates.receiverId, opts.userIds),
-    ));
-  const piercedUserIds = opts.piercedUserIds ?? new Set<string>();
-  return new Set(rows
-    .filter((row) => row.activityMuted && row.muteFromSeq != null && isActivityPromotionSuppressedByMute({
-      kind: "channel",
-      messageSeq: opts.messageSeq,
-      muteFromSeq: row.muteFromSeq,
-      personalMention: piercedUserIds.has(row.receiverId),
-    }))
-    .map((row) => row.receiverId));
 }
 
 export async function getActivityMutedAgentIdsForMessage(opts: {
@@ -13949,6 +17877,10 @@ export async function markReadLatest(
   const resolved = typeof principal === "string"
     ? { kind: "human" as const, id: principal }
     : principal;
+  // Read-all on an agent's behalf moves its read progress too (see markRead).
+  const readProgress = resolved.kind === "agent"
+    ? await beginAgentReadAdvance({ serverId: channel.serverId, scopeId: channelId, agentId: resolved.id })
+    : null;
   const ack = await executeCompatibilityReadMutation({
     serverId: channel.serverId,
     principalKind: resolved.kind,
@@ -13959,11 +17891,21 @@ export async function markReadLatest(
   });
   const scope = ack.scopes.find((candidate) => candidate.scopeId === channelId);
   if (!scope) return { channelId, maxReadSeq: 0, readStateVersion: 0, changed: false };
-  return readStateResultFromAckScope(scope);
+  const result = readStateResultFromAckScope(scope);
+  readProgress?.finish(result);
+  return result;
 }
 
-/** Mark a channel as unread by rewinding the read cursor to just before the latest unread-eligible message. */
-export async function markUnread(userId: string, channelId: string): Promise<ReadStateMutationResult & { unreadCount: number }> {
+/**
+ * Mark a conversation unread: rewind the read cursor to just before the latest
+ * unread-eligible message. With none (nothing others wrote past the cursor, e.g.
+ * a thread of only the person's own replies), the sequencer marks the scope
+ * unread instead (`markedUnread`, no count), so the mark always takes effect.
+ */
+export async function markUnread(
+  userId: string,
+  channelId: string,
+): Promise<ReadStateMutationResult & { unreadCount: number; markedUnread: boolean; outcome: MarkUnreadOutcome }> {
   const channel = await getChannel(channelId, { includeDeleted: true });
   if (!channel) throw new Error("Channel not found");
   const boundary = await resolveReadMutationUnreadBoundary({
@@ -13971,28 +17913,38 @@ export async function markUnread(userId: string, channelId: string): Promise<Rea
     principalId: userId,
     scopeId: channelId,
   });
-  if (boundary.latestUnreadEligibleSeq <= 0) {
-    return { channelId, maxReadSeq: 0, readStateVersion: 0, changed: false, unreadCount: 0 };
-  }
   const ack = await executeCompatibilityReadMutation({
     serverId: channel.serverId,
     principalId: userId,
     mutation: { kind: "row_unread", scopeId: channelId, throughSeq: boundary.throughSeq },
   });
   const scope = ack.scopes.find((candidate) => candidate.scopeId === channelId);
-  if (!scope) return { channelId, maxReadSeq: 0, readStateVersion: 0, changed: false, unreadCount: 0 };
+  if (!scope) {
+    return { channelId, maxReadSeq: 0, readStateVersion: 0, changed: false, unreadCount: 0, markedUnread: false, outcome: "nothing" };
+  }
+  const markedUnread = scope.markedUnread === true;
+  // Count and outcome are decided together in the sequencer's transaction.
+  // Only an ack minted by an older server process during a rolling deploy lacks
+  // the outcome; that one keeps the count from the boundary read before the
+  // write, and its outcome is read the way clients read an answer without it.
+  if (scope.unreadOutcome !== undefined && scope.unreadCount !== undefined) {
+    return { ...readStateResultFromAckScope(scope), unreadCount: scope.unreadCount, markedUnread, outcome: scope.unreadOutcome };
+  }
+  const unreadCount = Math.max(boundary.latestUnreadEligibleSeq - scope.maxReadSeq, 0);
   return {
     ...readStateResultFromAckScope(scope),
-    unreadCount: Math.max(boundary.latestUnreadEligibleSeq - scope.maxReadSeq, 0),
+    unreadCount,
+    markedUnread,
+    outcome: unreadCount > 0 ? "counted" : markedUnread ? "marked" : "nothing",
   };
 }
 
 /**
- * Sidebar unread comes from ONE RisingWave view, rw_conversation_unread_v3
- * (infra/risingwave/sql/076-cursor-decouple-consumers.sql), a projection of the
+ * Sidebar unread comes from ONE RisingWave view, rw_conversation_unread_v4
+ * (infra/risingwave/sql/078-task-conversations.sql), a projection of the
  * unified chain: rw_inbox_normal_v5 + muted subscriptions (full count,
- * rw_inbox_muted_full_v2) + rw_inbox_mention_v6. Every rule -- membership, muted, joint storage mapping,
- * followed-thread visibility, free-plan eligibility (rw_target_eligible_v1), the
+ * rw_inbox_muted_full_v1) + rw_inbox_mention_v7. Every rule -- membership, muted, joint storage mapping,
+ * followed-thread / task-conversation visibility, free-plan eligibility (rw_target_eligible_v1), the
  * unread predicate (own sends, self-caused system messages and noise subtypes
  * excluded) and mention admission -- lives in the chain, so these readers only
  * select. There is no Postgres fallback: with no RisingWave, or a failed read,
@@ -14106,7 +18058,7 @@ async function readSidebarUnreadTotals(
         AND receiver_id = $1
         AND server_id = ANY($2::varchar[])
         AND subscribed
-        AND kind <> 'thread'
+        AND kind NOT IN ('thread', 'task')
         AND unread_count > 0
       GROUP BY server_id`, [query.userId, query.serverIds]);
   const rows = read.result.rows.map((row) => ({
@@ -14187,6 +18139,7 @@ export async function getUnreadSummary(
 ): Promise<Record<string, ChannelUnreadSummaryEntry>> {
   const traceQuery = opts?.traceQuery ?? untracedDbQuery;
   const rows = await loadConversationUnreadSummaryRows(serverId, userId, true, traceQuery);
+  const marked = await loadMarkedUnreadScopes(serverId, userId, traceQuery);
 
   const summary: Record<string, ChannelUnreadSummaryEntry> = {};
   const readStateRows = new Map<string, UnreadSummaryReadStateRow>();
@@ -14211,6 +18164,28 @@ export async function getUnreadSummary(
     };
     readStateRows.set(row.targetId, readStateRowFromConversationUnreadRow(row));
   }
+  // Marked unread: unread with no count. An entry with nothing unread is added
+  // for it, and its read state is the cursor's (Postgres, where the flag is
+  // written, so version and flag agree), with RisingWave's latest message as
+  // the content frontier when it has the row.
+  for (const scope of marked.values()) {
+    summary[scope.channelId] ??= {
+      unreadCount: 0,
+      hasMention: false,
+      hasAnyMention: false,
+      readState: absentReadState,
+    };
+    const served = readStateRows.get(scope.channelId);
+    readStateRows.set(scope.channelId, {
+      channelId: scope.channelId,
+      readCursorPresent: true,
+      readStateVersion: scope.readStateVersion,
+      maxReadSeq: scope.maxReadSeq,
+      markedUnread: true,
+      latestActivityMessageId: served?.latestActivityMessageId ?? null,
+      latestActivitySeq: served?.latestActivitySeq ?? null,
+    });
+  }
   applyUnreadSummaryReadStates(
     summary,
     [...readStateRows.values()],
@@ -14221,6 +18196,10 @@ export async function getUnreadSummary(
   // The view only carries followed, not-done threads under a live parent the
   // user can see. Only those with unread replies reach the badge, so only
   // they are resolved: the lookup scales with unread threads, not follows.
+  // A task conversation keeps its own entry (Activity counts it) but gets no
+  // parentChannelId: its unread is not the channel's (stdrc 2026-10-31,
+  // #triage:c3f04178: "能进 activity 就行了"), since the channel can neither
+  // lead to it nor mark it read. Same rule as the web's followed-thread fold.
   const threadIds = rows
     .filter((row) => row.kind === "thread" && row.subscribed && row.unreadCount > 0)
     .map((row) => row.targetId);
@@ -14247,7 +18226,7 @@ async function loadFollowedThreadMentionIds(
 ): Promise<Set<string>> {
   try {
     const rows = await loadConversationUnreadSummaryRows(serverId, userId, false, traceQuery);
-    return new Set(rows.filter((row) => row.kind === "thread" && row.mentionUnread > 0).map((row) => row.targetId));
+    return new Set(rows.filter((row) => (row.kind === "thread" || row.kind === "task") && row.mentionUnread > 0).map((row) => row.targetId));
   } catch (error) {
     addTraceEvent("followed_threads.mentions.failed", { error_class: errorClassOf(error) });
     return new Set();
@@ -14294,7 +18273,9 @@ async function loadLocalThreadParentChannelIds(
        AND parent_projection.server_id = ${serverId}
        AND parent_projection.status = 'active'
       WHERE t.id IN (${sql.join(threadIds.map((id) => sql`${id}::uuid`), sql`, `)})
-        AND t.type = 'thread'
+        -- Task conversations (task v2) carry their local parent channel in
+        -- parent_channel_id on every face (own_parent arm).
+        AND t.type IN ('thread', 'task')
     `),
     (result) => ({
       input_count: threadIds.length,
@@ -14318,6 +18299,8 @@ export interface UnreadSummaryReadStateRow {
   readCursorPresent: boolean;
   readStateVersion: number | null;
   maxReadSeq: string | null;
+  /** The cursor row's marked_unread (false when absent or not carried by the reader). */
+  markedUnread?: boolean;
   latestActivityMessageId: string | null;
   latestActivitySeq: string | null;
   /** Done guard domain; parent fallback is included for zero-reply threads. */
@@ -14346,6 +18329,7 @@ export function applyUnreadSummaryReadStates(
         maxReadSeq: row.maxReadSeq as string,
         latestActivityMessageId: row.latestActivityMessageId,
         latestActivitySeq: row.latestActivitySeq,
+        markedUnread: row.markedUnread === true,
       }
       : null;
     entry.readState = makeInboxScopeReadFrontier(cursor, (c) => onCorrupt(row.channelId, c));
@@ -14459,6 +18443,9 @@ export async function getAgentLegacyReadCursors(
  * `storageChannelId` is where the rows live. They differ for a joint channel
  * or joint thread, whose rows are stored under the canonical id: checking the
  * local id there would find nothing and read through every unread row.
+ *
+ * The same statement also returns the position it moved from and the agent's
+ * server, for agent read progress (agentReadProgressService): no extra query.
  */
 export async function markAgentOwnSendRead(agentId: string, channelId: string, seq: number, storageChannelId: string = channelId) {
   const db = getDb();
@@ -14470,46 +18457,85 @@ export async function markAgentOwnSendRead(agentId: string, channelId: string, s
          WHERE agent_id = ${agentId} AND channel_id = ${channelId}),
         0
       ) AS seq
+    ), advanced AS (
+      INSERT INTO agent_channel_read_cursors (agent_id, channel_id, last_read_seq, updated_at)
+      SELECT ${agentId}, ${channelId}, ${seq}, now()
+      WHERE NOT EXISTS (
+        SELECT 1 FROM messages m, cursor_now
+        WHERE m.channel_id = ${storageChannelId}
+          AND m.seq > cursor_now.seq
+          AND m.seq < ${seq}
+          AND NOT (m.sender_type = 'agent' AND m.sender_id = ${agentId}::text)
+          AND NOT COALESCE(m.message_type = 'system' AND m.causal_actor_type = 'agent' AND m.causal_actor_id = ${agentId}::text, FALSE)
+          AND (m.system_subtype IS NULL OR m.system_subtype NOT IN ('channel.self_unfollow_thread', 'task.deleted_summary'))
+      )
+      ON CONFLICT (agent_id, channel_id) DO UPDATE SET
+        last_read_seq = EXCLUDED.last_read_seq,
+        updated_at = now()
+      WHERE agent_channel_read_cursors.last_read_seq < EXCLUDED.last_read_seq
+      RETURNING channel_id, last_read_seq
     )
-    INSERT INTO agent_channel_read_cursors (agent_id, channel_id, last_read_seq, updated_at)
-    SELECT ${agentId}, ${channelId}, ${seq}, now()
-    WHERE NOT EXISTS (
-      SELECT 1 FROM messages m, cursor_now
-      WHERE m.channel_id = ${storageChannelId}
-        AND m.seq > cursor_now.seq
-        AND m.seq < ${seq}
-        AND NOT (m.sender_type = 'agent' AND m.sender_id = ${agentId}::text)
-        AND NOT COALESCE(m.message_type = 'system' AND m.causal_actor_type = 'agent' AND m.causal_actor_id = ${agentId}::text, FALSE)
-        AND (m.system_subtype IS NULL OR m.system_subtype NOT IN ('channel.self_unfollow_thread', 'task.deleted_summary'))
-    )
-    ON CONFLICT (agent_id, channel_id) DO UPDATE SET
-      last_read_seq = EXCLUDED.last_read_seq,
-      updated_at = now()
-    WHERE agent_channel_read_cursors.last_read_seq < EXCLUDED.last_read_seq
-    RETURNING
-      channel_id::text AS "channelId",
-      last_read_seq::int AS "maxReadSeq"
+    SELECT
+      advanced.channel_id::text AS "channelId",
+      advanced.last_read_seq::int AS "maxReadSeq",
+      (SELECT seq FROM cursor_now)::text AS "priorSeq",
+      (SELECT server_id::text FROM agents WHERE id = ${agentId}::uuid) AS "serverId"
+    FROM advanced
   `);
-  const [advanced] = result.rows as Array<{ channelId: string; maxReadSeq: number }>;
-  if (advanced) return { ...advanced, changed: true };
+  const [advanced] = result.rows as Array<{ channelId: string; maxReadSeq: number; priorSeq: string | null; serverId: string | null }>;
+  if (advanced) {
+    noteAgentLegacyCursorAdvance(agentId, advanced);
+    return { channelId: advanced.channelId, maxReadSeq: advanced.maxReadSeq, changed: true };
+  }
   return { channelId, maxReadSeq: await getAgentLegacyReadCursor(agentId, channelId), changed: false };
 }
 
+/** Agent read progress for a legacy cursor write that moved (markAgentOwnSendRead, markAgentLegacyRead). */
+function noteAgentLegacyCursorAdvance(
+  agentId: string,
+  advanced: { channelId: string; maxReadSeq: number; priorSeq: string | null; serverId: string | null },
+): void {
+  if (!advanced.serverId) return;
+  noteAgentReadAdvance({
+    serverId: advanced.serverId,
+    scopeId: advanced.channelId,
+    agentId,
+    from: Number(advanced.priorSeq ?? 0),
+    to: Number(advanced.maxReadSeq),
+  });
+}
+
+/** The same statement also returns the position it moved from and the agent's server (agent read progress). */
 export async function markAgentLegacyRead(agentId: string, channelId: string, seq: number) {
   const db = getDb();
   const result = await db.execute(sql`
-    INSERT INTO agent_channel_read_cursors (agent_id, channel_id, last_read_seq, updated_at)
-    VALUES (${agentId}, ${channelId}, ${seq}, now())
-    ON CONFLICT (agent_id, channel_id) DO UPDATE SET
-      last_read_seq = EXCLUDED.last_read_seq,
-      updated_at = now()
-    WHERE agent_channel_read_cursors.last_read_seq < EXCLUDED.last_read_seq
-    RETURNING
-      channel_id::text AS "channelId",
-      last_read_seq::int AS "maxReadSeq"
+    WITH cursor_now AS (
+      SELECT COALESCE(
+        (SELECT last_read_seq FROM agent_channel_read_cursors
+         WHERE agent_id = ${agentId} AND channel_id = ${channelId}),
+        0
+      ) AS seq
+    ), advanced AS (
+      INSERT INTO agent_channel_read_cursors (agent_id, channel_id, last_read_seq, updated_at)
+      VALUES (${agentId}, ${channelId}, ${seq}, now())
+      ON CONFLICT (agent_id, channel_id) DO UPDATE SET
+        last_read_seq = EXCLUDED.last_read_seq,
+        updated_at = now()
+      WHERE agent_channel_read_cursors.last_read_seq < EXCLUDED.last_read_seq
+      RETURNING channel_id, last_read_seq
+    )
+    SELECT
+      advanced.channel_id::text AS "channelId",
+      advanced.last_read_seq::int AS "maxReadSeq",
+      (SELECT seq FROM cursor_now)::text AS "priorSeq",
+      (SELECT server_id::text FROM agents WHERE id = ${agentId}::uuid) AS "serverId"
+    FROM advanced
   `);
-  const [advanced] = result.rows as Array<{ channelId: string; maxReadSeq: number }>;
-  if (advanced) return { ...advanced, changed: true };
+  const [advanced] = result.rows as Array<{ channelId: string; maxReadSeq: number; priorSeq: string | null; serverId: string | null }>;
+  if (advanced) {
+    noteAgentLegacyCursorAdvance(agentId, advanced);
+    return { channelId: advanced.channelId, maxReadSeq: advanced.maxReadSeq, changed: true };
+  }
 
   await db
     .update(agentChannelReadCursors)
@@ -14539,11 +18565,24 @@ export async function markAgentLegacyRead(agentId: string, channelId: string, se
  * compatibility horizon, not model-seen proof. Freshness gates must continue
  * to ignore this cursor and read explicit model-seen provenance only.
  */
-export async function markAgentLegacyAckCheckpoint(agentId: string, seqs: number[]): Promise<void> {
+export type AgentReadPositionAdvance = {
+  /** The agent-facing conversation (the read cursor's channel). */
+  conversationId: string;
+  /** Where its rows are stored (a joint channel's canonical channel). */
+  storageId: string;
+  /** The read position before and after the ack. */
+  from: number;
+  to: number;
+  /** The acked seqs in (from, to]. */
+  acked: number[];
+};
+
+/** Returns the conversations whose read position the ack moved forward. */
+export async function markAgentLegacyAckCheckpoint(agentId: string, seqs: number[]): Promise<AgentReadPositionAdvance[]> {
   const normalizedSeqs = [...new Set(seqs
     .map((seq) => Math.floor(Number(seq)))
     .filter((seq) => Number.isInteger(seq) && seq > 0))];
-  if (normalizedSeqs.length === 0) return;
+  if (normalizedSeqs.length === 0) return [];
 
   // The cursor belongs to the conversation the agent was delivered: a message stored
   // under a joint channel's canonical channel (or thread) is acked on the agent's
@@ -14552,12 +18591,13 @@ export async function markAgentLegacyAckCheckpoint(agentId: string, seqs: number
   // channel (for a thread, of its parent channel), or a follower of the thread.
   const result = await getDb().execute(sql`
     WITH acked AS (
-      SELECT ${messages.channelId} AS storage_id, max(${messages.seq})::int AS max_seq
+      SELECT ${messages.channelId} AS storage_id, max(${messages.seq})::int AS max_seq,
+        array_agg(${messages.seq}::bigint) AS seqs
       FROM ${messages}
       WHERE ${inArray(messages.seq, normalizedSeqs)}
       GROUP BY ${messages.channelId}
     ), targets AS (
-      SELECT COALESCE(${jointChannelServers.localChannelId}, acked.storage_id) AS target_id, acked.max_seq
+      SELECT COALESCE(${jointChannelServers.localChannelId}, acked.storage_id) AS target_id, acked.storage_id, acked.max_seq, acked.seqs
       FROM acked
       INNER JOIN ${agents} ON ${agents.id} = ${agentId}
       LEFT JOIN ${jointChannels}
@@ -14567,7 +18607,10 @@ export async function markAgentLegacyAckCheckpoint(agentId: string, seqs: number
         AND ${jointChannelServers.serverId} = ${agents.serverId}
         AND ${jointChannelServers.status} = 'active'
     )
-    SELECT targets.target_id AS "channelId", targets.max_seq AS "maxSeq"
+    SELECT targets.target_id AS "channelId", targets.storage_id::text AS "storageId", targets.max_seq AS "maxSeq",
+      targets.seqs::text[] AS "seqs", ${channels.serverId}::text AS "serverId",
+      (SELECT COALESCE(c.last_read_seq8, CAST(c.last_read_seq AS BIGINT))::text FROM agent_channel_read_cursors c
+        WHERE c.agent_id = ${agentId} AND c.channel_id = targets.target_id) AS "priorSeq"
     FROM targets
     INNER JOIN ${channels} ON ${channels.id} = targets.target_id
     LEFT JOIN ${messages} AS parent ON parent.id = ${channels.parentMessageId}
@@ -14584,14 +18627,21 @@ export async function markAgentLegacyAckCheckpoint(agentId: string, seqs: number
           AND ${threadFollows.unfollowedAt} IS NULL
       )
   `);
-  const rows = (result.rows as Array<{ channelId: string; maxSeq: number | string }>)
-    .map((row) => ({ channelId: String(row.channelId), maxSeq: Number(row.maxSeq) }));
+  const rows = (result.rows as Array<{ channelId: string; storageId: string; maxSeq: number | string; seqs: string[] | null; serverId: string | null; priorSeq: string | null }>)
+    .map((row) => ({
+      channelId: String(row.channelId),
+      storageId: String(row.storageId),
+      maxSeq: Number(row.maxSeq),
+      seqs: (row.seqs ?? []).map(Number),
+      serverId: row.serverId === null ? null : String(row.serverId),
+      priorSeq: row.priorSeq === null ? 0 : Number(row.priorSeq),
+    }));
 
   // markAgentLegacyRead for every conversation in one statement: a cursor only
   // moves forward, and one that does not still has updated_at touched.
   const maxSeqByChannel = new Map<string, number>();
   for (const row of rows) maxSeqByChannel.set(row.channelId, Math.max(maxSeqByChannel.get(row.channelId) ?? 0, row.maxSeq));
-  if (maxSeqByChannel.size === 0) return;
+  if (maxSeqByChannel.size === 0) return [];
   const values = sql.join(
     [...maxSeqByChannel].map(([channelId, maxSeq]) => sql`(${agentId}::uuid, ${channelId}::uuid, ${maxSeq}::int, now())`),
     sql`, `,
@@ -14603,6 +18653,26 @@ export async function markAgentLegacyAckCheckpoint(agentId: string, seqs: number
       last_read_seq = GREATEST(agent_channel_read_cursors.last_read_seq, EXCLUDED.last_read_seq),
       updated_at = now()
   `);
+  // The read before the upsert: a concurrent advance in between only narrows what counts as passed.
+  const advances: AgentReadPositionAdvance[] = [];
+  for (const row of rows) {
+    if (row.maxSeq <= row.priorSeq) continue;
+    advances.push({
+      conversationId: row.channelId,
+      storageId: row.storageId,
+      from: row.priorSeq,
+      to: row.maxSeq,
+      acked: row.seqs.filter((seq) => seq > row.priorSeq && seq <= row.maxSeq),
+    });
+    // Agent read progress (agentReadProgressService): `/events` acks (an
+    // external agent's, or a `raft message check` that reaches the server; a
+    // hosted agent's is answered by its daemon and never gets here, RFC 081 §3),
+    // receive-ack and external-agent acks all move the position here.
+    if (row.serverId) {
+      noteAgentReadAdvance({ serverId: row.serverId, scopeId: row.channelId, agentId, from: row.priorSeq, to: row.maxSeq });
+    }
+  }
+  return advances;
 }
 
 export type AgentFollowedThreadListItem = {
@@ -14621,13 +18691,10 @@ export async function listAgentFollowedThreads(
   agentId: string,
 ): Promise<AgentFollowedThreadListItem[]> {
   const db = getDb();
-  const parentMessages = alias(messages, "agent_followed_thread_parent_messages");
-  const parentChannels = alias(channels, "agent_followed_thread_parent_channels");
 
   const rows = await db
     .select({
       threadChannelId: channels.id,
-      parentChannelId: parentChannels.id,
       parentMessageId: threadFollows.parentMessageId,
       followedAt: threadFollows.createdAt,
       reason: threadFollows.reason,
@@ -14640,12 +18707,6 @@ export async function listAgentFollowedThreads(
       eq(channels.serverId, serverId),
       isNull(channels.deletedAt),
     ))
-    .innerJoin(parentMessages, eq(parentMessages.id, threadFollows.parentMessageId))
-    .innerJoin(parentChannels, and(
-      eq(parentChannels.id, parentMessages.channelId),
-      eq(parentChannels.serverId, serverId),
-      isNull(parentChannels.deletedAt),
-    ))
     .where(and(
       eq(threadFollows.followerType, "agent"),
       eq(threadFollows.followerId, agentId),
@@ -14653,10 +18714,20 @@ export async function listAgentFollowedThreads(
     ))
     .orderBy(desc(threadFollows.createdAt), desc(threadFollows.threadChannelId));
 
+  // The LOCAL parent channel: a joint thread's projection has no parent
+  // message on this server (its follow row names the canonical parent, stored
+  // on the joint storage server), so the parent comes from the projection
+  // mapping, not from the parent message's channel (task #24).
+  const parentByThread = rows.length === 0
+    ? new Map<string, string>()
+    : await loadLocalThreadParentChannelIds(serverId, rows.map((row) => row.threadChannelId), untracedDbQuery);
+
   const items: AgentFollowedThreadListItem[] = [];
   for (const row of rows) {
+    const parentChannelId = parentByThread.get(row.threadChannelId);
+    if (!parentChannelId || !row.parentMessageId) continue;
     if (!await canAgentAccessChannel(row.threadChannelId, agentId)) continue;
-    const parentChannelRef = await resolveAgentFacingChannelRef(serverId, agentId, row.parentChannelId);
+    const parentChannelRef = await resolveAgentFacingChannelRef(serverId, agentId, parentChannelId);
     if (!parentChannelRef) continue;
     const parentMessageShortId = row.parentMessageId.slice(0, 8);
     items.push({
@@ -14675,7 +18746,7 @@ export async function listAgentFollowedThreads(
 
 /**
  * One (agent, target) row of the agent inbox view (UNIFIED_CHAIN_VIEWS.agentInbox,
- * rw_agent_inbox_v6 in infra/risingwave/sql/076-cursor-decouple-consumers.sql). The view owns
+ * rw_agent_inbox_v7 in infra/risingwave/sql/078-task-conversations.sql). The view owns
  * every offer rule: it holds ONLY the conversations the agent is offered (joined
  * through a membership or an active follow; admitted-stream unread, or a mention
  * unread beyond the admitted stream -- a mention after a mute pierces it),
@@ -14687,7 +18758,8 @@ export async function listAgentFollowedThreads(
 export interface AgentInboxChainRow {
   targetId: string;
   storageChannelId: string;
-  kind: "channel" | "dm" | "thread";
+  /** "task": a task conversation (task v2), a sub-conversation like a thread (078). */
+  kind: "channel" | "dm" | "thread" | "task";
   serverId: string;
   channelName: string;
   channelType: typeof channels.$inferSelect["type"];
@@ -14711,6 +18783,13 @@ export interface AgentInboxChainRow {
   activitySeq: number;
   /** channel_agents.added_at, or the active thread follow's created_at. */
   joinedAt: Date;
+  /**
+   * Task conversations only: the task's number and title (not view columns:
+   * readAgentInboxChainRows adds them from Postgres). The row's agent-facing
+   * target is the task ref `#parent:#N` (formatAgentInboxTarget).
+   */
+  taskNumber?: number | null;
+  taskTitle?: string | null;
 }
 
 export type AgentInboxChainSelection =
@@ -14786,7 +18865,7 @@ export async function readAgentInboxChainRows(
       activity_seq, joined_at
     FROM ${UNIFIED_CHAIN_VIEWS.agentInbox}
     WHERE ${where.join(" AND ")}${page}`, values);
-  return read.result.rows.map((row) => ({
+  const rows = read.result.rows.map((row): AgentInboxChainRow => ({
     targetId: String(row.target_id),
     storageChannelId: String(row.storage_channel_id),
     kind: row.kind as AgentInboxChainRow["kind"],
@@ -14808,6 +18887,31 @@ export async function readAgentInboxChainRows(
     activitySeq: Number(row.activity_seq),
     joinedAt: new Date(row.joined_at as string | Date),
   }));
+  await attachAgentInboxTaskIdentity(rows);
+  return rows;
+}
+
+/**
+ * Task v2: the number and title of the task behind each task-conversation row
+ * (kind "task"), by its conversation channel, in one primary-key read. Rows of
+ * other kinds are untouched; with no task rows nothing is read.
+ */
+async function attachAgentInboxTaskIdentity(rows: AgentInboxChainRow[]): Promise<void> {
+  const conversationIds = [...new Set(rows.filter((row) => row.kind === "task").map((row) => row.targetId))]
+    .filter((id) => UUID_TEXT_RE.test(id));
+  if (conversationIds.length === 0) return;
+  const taskRows = await getDb()
+    .select({ conversationId: channels.id, taskNumber: tasks.taskNumber, title: tasks.title })
+    .from(channels)
+    .innerJoin(tasks, eq(tasks.id, channels.taskId))
+    .where(inArray(channels.id, conversationIds));
+  const byConversation = new Map(taskRows.map((row) => [row.conversationId, row]));
+  for (const row of rows) {
+    if (row.kind !== "task") continue;
+    const task = byConversation.get(row.targetId);
+    row.taskNumber = task?.taskNumber ?? null;
+    row.taskTitle = task?.title ?? null;
+  }
 }
 
 export type AgentInboxTotals = { conversations: number; dms: number; mentions: number };
@@ -14829,6 +18933,63 @@ export async function readAgentInboxChainTotals(
     dms: Number(row.dms ?? 0),
     mentions: Number(row.mentions ?? 0),
   };
+}
+
+/**
+ * The seq columns of one (agent, target) row of the agent inbox view, or, for a
+ * target the agent has no row for (`inAgentInbox` false), the target's own
+ * progress in the chain (`targetLatestSeq`, rw_target_latest_v4).
+ */
+export type AgentInboxChainSeqRow = Pick<AgentInboxChainRow, "targetId" | "latestSeq" | "maxMentionSeq" | "lastReadSeq"> & {
+  inAgentInbox: boolean;
+  targetLatestSeq: number | null;
+};
+
+/**
+ * The seq columns of the agent's rows for `targetIds` (agent-facing channel
+ * ids): what `/events?wait_for=` re-checks while the chain catches up to a
+ * notice. The agent inbox view only has rows for conversations with something
+ * to offer, so a target with no row (the agent already read it, the message was
+ * deleted, the agent can no longer see it -- or the chain has not caught up
+ * yet) gets a second, per-target read of the conversation's own latest seq,
+ * only for those targets: at or past the notice's seq means the message is in
+ * the chain and there is simply nothing to deliver. Every target comes back.
+ * Null when RisingWave is not configured; throws on query failure (an overload
+ * as RisingWaveOverloadedError).
+ */
+export async function readAgentInboxChainTargetSeqs(
+  agentId: string,
+  targetIds: readonly string[],
+): Promise<AgentInboxChainSeqRow[] | null> {
+  const pool = getRisingWaveInboxPool();
+  if (!pool) return null;
+  if (targetIds.length === 0) return [];
+  const read = await queryRisingWaveInbox(pool, `SELECT target_id, latest_seq, max_mention_seq, last_read_seq
+    FROM ${UNIFIED_CHAIN_VIEWS.agentInbox}
+    WHERE agent_id = $1 AND target_id = ANY($2)`, [agentId, [...targetIds]]);
+  const rows = read.result.rows.map((row): AgentInboxChainSeqRow => ({
+    targetId: String(row.target_id),
+    latestSeq: toNullableNumber(row.latest_seq),
+    maxMentionSeq: toNullableNumber(row.max_mention_seq),
+    lastReadSeq: Number(row.last_read_seq ?? 0),
+    inAgentInbox: true,
+    targetLatestSeq: null,
+  }));
+  const found = new Set(rows.map((row) => row.targetId));
+  const missing = [...new Set(targetIds)].filter((targetId) => !found.has(targetId));
+  if (missing.length === 0) return rows;
+  const targetRead = await queryRisingWaveInbox(pool, `SELECT target_id, latest_seq
+    FROM rw_target_latest_v4
+    WHERE target_id = ANY($1)`, [missing]);
+  const targetLatest = new Map(targetRead.result.rows.map((row) => [String(row.target_id), toNullableNumber(row.latest_seq)] as const));
+  return [...rows, ...missing.map((targetId): AgentInboxChainSeqRow => ({
+    targetId,
+    latestSeq: null,
+    maxMentionSeq: null,
+    lastReadSeq: 0,
+    inAgentInbox: false,
+    targetLatestSeq: targetLatest.get(targetId) ?? null,
+  }))];
 }
 
 const AGENT_UNREAD_SUMMARY_MAX_TARGETS = 20;
@@ -14874,7 +19035,7 @@ export async function resolveAgentInboxDmRefs(
   for (const row of rows) {
     const channelId = row.kind === "dm"
       ? row.targetId
-      : row.kind === "thread" && row.parentChannelType === "dm" ? row.parentChannelId : null;
+      : (row.kind === "thread" || row.kind === "task") && row.parentChannelType === "dm" ? row.parentChannelId : null;
     if (!channelId) continue;
     const ids = byServer.get(row.serverId) ?? new Set<string>();
     ids.add(channelId);
@@ -14986,11 +19147,21 @@ export async function resolveAgentFacingDmPeerFace(
 /**
  * THE target of an agent inbox row, in the delivery target DSL (what
  * `raft message send/read --target` takes and live delivery prints):
- * `#chan`, `#chan:<parent short id>`, `dm:@peer`, `dm:@peer:<parent short id>`.
+ * `#chan`, `#chan:<parent short id>`, `dm:@peer`, `dm:@peer:<parent short id>`;
+ * a task conversation (task v2) is its task ref `#chan:#7` / `dm:@peer:#7`
+ * (what `raft task read/reply` take).
  * The resume summary and `raft inbox check` both label rows with it.
  */
 export function formatAgentInboxTarget(row: AgentInboxChainRow, dmRefs: ReadonlyMap<string, string>): string {
   if (row.kind === "dm") return dmRefs.get(row.targetId) ?? `dm:@${row.channelName}`;
+  if (row.kind === "task" && row.parentChannelName && row.taskNumber != null) {
+    if (row.parentChannelType === "dm") {
+      const parentRef = (row.parentChannelId ? dmRefs.get(row.parentChannelId) : undefined) ?? `dm:@${row.parentChannelName}`;
+      // The DM ref may carry a `~agent`/`~human` suffix, so append rather than reformat.
+      return `${parentRef}${RAFT_TASK_REF_SEPARATOR}${row.taskNumber}`;
+    }
+    return formatRaftChannelTaskRef(row.parentChannelName, row.taskNumber);
+  }
   if (row.kind === "thread" && row.parentMessageId && row.parentChannelName) {
     const shortId = row.parentMessageId.slice(0, 8);
     if (row.parentChannelType === "dm") {
@@ -15012,8 +19183,9 @@ export function formatAgentInboxTarget(row: AgentInboxChainRow, dmRefs: Readonly
 export async function getAgentUnreadCounts(
   agentId: string,
   chain: AgentInboxChainRow[],
+  resolvedDmRefs?: ReadonlyMap<string, string>,
 ): Promise<Record<string, number>> {
-  const dmRefs = await resolveAgentInboxDmRefs(agentId, chain);
+  const dmRefs = resolvedDmRefs ?? await resolveAgentInboxDmRefs(agentId, chain);
   const counts: Record<string, number> = {};
   for (const row of chain) {
     if (row.offeredUnread <= 0) continue;
@@ -15022,6 +19194,30 @@ export async function getAgentUnreadCounts(
     counts[target] = (counts[target] ?? 0) + row.offeredUnread;
   }
   return counts;
+}
+
+/**
+ * What a start's unread summary covers, by the same target the summary names:
+ * the conversations behind each target and the latest seq the chain showed for
+ * them. A completed first turn may settle these (unowedReadBacklog.ts), never
+ * further than this snapshot.
+ */
+export async function getAgentUnreadSummaryTargets(
+  agentId: string,
+  chain: AgentInboxChainRow[],
+  resolvedDmRefs?: ReadonlyMap<string, string>,
+): Promise<Map<string, Array<{ channelId: string; latestSeq: number }>>> {
+  const dmRefs = resolvedDmRefs ?? await resolveAgentInboxDmRefs(agentId, chain);
+  const targets = new Map<string, Array<{ channelId: string; latestSeq: number }>>();
+  for (const row of chain) {
+    if (row.offeredUnread <= 0 || row.latestSeq === null) continue;
+    if (row.kind === "dm" && !dmRefs.has(row.targetId)) continue;
+    const target = formatAgentInboxTarget(row, dmRefs);
+    const list = targets.get(target) ?? [];
+    list.push({ channelId: row.targetId, latestSeq: row.latestSeq });
+    targets.set(target, list);
+  }
+  return targets;
 }
 
 /**
@@ -15041,7 +19237,16 @@ export type AgentInboxView = "unread" | "mentions";
 
 export type AgentInboxConversation = {
   target: string;
-  kind: AgentInboxChainRow["kind"];
+  /**
+   * The contract's kinds (channel | dm | thread): a task conversation reads as
+   * "thread" here for older CLIs; `conversationKind: "task"` and the task fields
+   * say which (task v2).
+   */
+  kind: Exclude<AgentInboxChainRow["kind"], "task">;
+  conversationKind?: "task";
+  taskNumber?: number | null;
+  /** The task's title (task conversations; `raft inbox check` prints it). */
+  title?: string | null;
   unread: number;
   mentions: number;
   lastReadSeq: number;
@@ -15059,6 +19264,48 @@ export type AgentInboxList = {
 };
 
 /**
+ * The chain is derived from Postgres and trails it; the read position an ack
+ * or a read just wrote is authoritative. A row read through its newest message
+ * is dropped, a partly read one starts at the durable position. Without this, a
+ * drain that calls again right after acking would be handed the rows it just
+ * acked, and `raft inbox check` right after a `message read --after` would list
+ * the conversation as still unread (a phantom that lasts until the chain
+ * catches up).
+ */
+export async function withDurableAgentReadPositions(
+  agentId: string,
+  chain: AgentInboxChainRow[],
+): Promise<AgentInboxChainRow[]> {
+  if (chain.length === 0) return chain;
+  const cursorRows = await getDb()
+    .select({
+      channelId: agentChannelReadCursors.channelId,
+      lastReadSeq: sql<string>`COALESCE(${agentChannelReadCursors.lastReadSeq8}, ${agentChannelReadCursors.lastReadSeq})`,
+    })
+    .from(agentChannelReadCursors)
+    .where(and(
+      eq(agentChannelReadCursors.agentId, agentId),
+      inArray(agentChannelReadCursors.channelId, chain.map((row) => row.targetId)),
+    ));
+  const cursors = new Map(cursorRows.map((row) => [row.channelId, Number(row.lastReadSeq)]));
+  const adjusted: AgentInboxChainRow[] = [];
+  for (const row of chain) {
+    const cursor = cursors.get(row.targetId);
+    if (cursor === undefined || cursor <= row.lastReadSeq) {
+      adjusted.push(row);
+      continue;
+    }
+    if (cursor >= Math.max(row.latestSeq ?? 0, row.maxMentionSeq ?? 0)) continue;
+    adjusted.push({
+      ...row,
+      lastReadSeq: cursor,
+      firstUnreadSeq: row.firstUnreadSeq !== null && row.firstUnreadSeq > cursor ? row.firstUnreadSeq : null,
+    });
+  }
+  return adjusted;
+}
+
+/**
  * The agent's Activity panel: the conversations the view offers, newest activity
  * first, keyset-paged by activity seq in the view. A message belongs to exactly
  * one conversation and seq is global, so activity seqs are unique across rows and
@@ -15070,6 +19317,24 @@ export async function listAgentInbox(
   serverId: string,
   opts: { view: AgentInboxView; beforeSeq?: number; limit: number },
 ): Promise<AgentInboxList> {
+  return (await listAgentInboxWithShownTargets(agentId, serverId, opts)).list;
+}
+
+/**
+ * The inbox page, plus what it showed with a count: each listed target with
+ * unread, the conversations behind it and their latest seq. An external agent's
+ * end-of-turn report may settle those (externalTurnEndSnapshot.ts).
+ */
+export async function listAgentInboxWithShownTargets(
+  agentId: string,
+  serverId: string,
+  opts: { view: AgentInboxView; beforeSeq?: number; limit: number },
+): Promise<{
+  list: AgentInboxList;
+  shownTargets: Map<string, Array<{ channelId: string; latestSeq: number }>>;
+  /** The chain rows behind `list.items`, in the same order (RFC 081 rows read their first unread and preview from them). */
+  pageRows: AgentInboxChainRow[];
+}> {
   const pool = getRisingWaveInboxPool();
   if (!pool) throw new AgentInboxUnavailableError("Agent inbox source is not configured");
   let totals: AgentInboxTotals;
@@ -15106,11 +19371,26 @@ export async function listAgentInbox(
   } catch (error) {
     throw new AgentInboxUnavailableError("Agent inbox source read failed", { cause: error });
   }
-  const candidates = rows.filter((row) => !hidden.has(row.targetId));
+  // The durable read position wins over the trailing chain: a conversation the
+  // agent just read through is not listed (and not counted) as unread.
+  const visibleRows = rows.filter((row) => !hidden.has(row.targetId));
+  const durableRows = await withDurableAgentReadPositions(agentId, visibleRows);
+  const kept = new Set(durableRows.map((row) => row.targetId));
+  const readThrough = visibleRows.filter((row) => !kept.has(row.targetId));
+  if (readThrough.length > 0) {
+    totals = {
+      conversations: Math.max(0, totals.conversations - readThrough.length),
+      dms: Math.max(0, totals.dms - readThrough.filter((row) => row.kind === "dm").length),
+      mentions: Math.max(0, totals.mentions - readThrough.filter((row) => row.mentionUnread > 0).length),
+    };
+  }
+  const candidates = durableRows;
   const page = candidates.slice(0, opts.limit);
-  const hasMore = candidates.length > page.length;
+  // More exists whenever the read itself overflowed the page: rows dropped as
+  // read-through must not hide the conversations after them.
+  const hasMore = candidates.length > page.length || visibleRows.length > opts.limit;
 
-  for (const [channelId, ref] of await resolveAgentInboxDmRefs(agentId, page.filter((row) => row.kind === "thread"))) {
+  for (const [channelId, ref] of await resolveAgentInboxDmRefs(agentId, page.filter((row) => row.kind === "thread" || row.kind === "task"))) {
     dmRefs.set(channelId, ref);
   }
   const latestBySeq = await getAgentInboxLatestMessages(page.map((row) => row.activitySeq).filter((seq) => seq > 0));
@@ -15118,7 +19398,10 @@ export async function listAgentInbox(
     const latest = latestBySeq.get(row.activitySeq);
     return {
       target: formatAgentInboxTarget(row, dmRefs),
-      kind: row.kind,
+      kind: row.kind === "task" ? "thread" : row.kind,
+      ...(row.kind === "task"
+        ? { conversationKind: "task" as const, taskNumber: row.taskNumber ?? null, title: row.taskTitle ?? null }
+        : {}),
       unread: row.offeredUnread,
       mentions: row.mentionUnread,
       lastReadSeq: row.lastReadSeq,
@@ -15127,14 +19410,52 @@ export async function listAgentInbox(
       latestAt: latest?.createdAt ?? null,
     };
   });
-  const last = page.at(-1);
+  const shownTargets = new Map<string, Array<{ channelId: string; latestSeq: number }>>();
+  page.forEach((row, index) => {
+    if (row.offeredUnread <= 0 || row.latestSeq === null) return;
+    const target = items[index]!.target;
+    shownTargets.set(target, [...(shownTargets.get(target) ?? []), { channelId: row.targetId, latestSeq: row.latestSeq }]);
+  });
+  // An empty page (every row read through) still pages on from the rows it examined.
+  const last = page.at(-1) ?? visibleRows.slice(0, opts.limit).at(-1);
   return {
-    view: opts.view,
-    items,
-    hasMore,
-    nextBeforeSeq: hasMore && last ? last.activitySeq : null,
-    totals,
+    list: {
+      view: opts.view,
+      items,
+      hasMore,
+      nextBeforeSeq: hasMore && last ? last.activitySeq : null,
+      totals,
+    },
+    shownTargets,
+    pageRows: page,
   };
+}
+
+/**
+ * RFC 081 `inbox dismiss`: the agent's offered conversations whose activity
+ * is before `beforeSeq` (at most `limit`, newest first), or the one row of
+ * `targetIds`; corrected by the durable read position like the list, so a
+ * conversation read through is not offered again. Throws
+ * AgentInboxUnavailableError when the chain is not configured or fails.
+ */
+export async function readAgentInboxChainRowsForDismiss(
+  agentId: string,
+  opts: { beforeSeq: number; limit: number } | { targetIds: readonly string[] },
+): Promise<AgentInboxChainRow[]> {
+  const pool = getRisingWaveInboxPool();
+  if (!pool) throw new AgentInboxUnavailableError("Agent inbox source is not configured");
+  let rows: AgentInboxChainRow[];
+  try {
+    if ("targetIds" in opts) {
+      const wanted = new Set(opts.targetIds);
+      rows = wanted.size === 0 ? [] : (await readAgentInboxChainRows(pool, agentId)).filter((row) => wanted.has(row.targetId));
+    } else {
+      rows = await readAgentInboxChainRows(pool, agentId, { beforeSeq: opts.beforeSeq, limit: opts.limit });
+    }
+  } catch (error) {
+    throw new AgentInboxUnavailableError("Agent inbox source read failed", { cause: error });
+  }
+  return withDurableAgentReadPositions(agentId, rows);
 }
 
 /** Sender name and time of the given messages (seq is global), for one inbox page. */

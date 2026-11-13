@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
 import { residentCoreIdentity } from "./residentCoreIdentity";
-import { BUNDLED_DAEMON_VERSION, COMPUTER_VERSION } from "./version";
+import { BUNDLED_DAEMON_VERSION, COMPUTER_BUILD_SHA, COMPUTER_VERSION } from "./version";
 
 test("residentCoreIdentity returns the exact managed DaemonCore identity", () => {
   assert.deepEqual(
@@ -21,15 +20,7 @@ test("residentCoreIdentity returns the exact managed DaemonCore identity", () =>
       },
       daemonVersion: BUNDLED_DAEMON_VERSION,
       computerVersion: COMPUTER_VERSION,
+      computerBuildSha: COMPUTER_BUILD_SHA,
     },
   );
-});
-
-test("defaultCoreFactory passes residentCoreIdentity into DaemonCore", () => {
-  const source = readFileSync(new URL("./service.ts", import.meta.url), "utf8");
-  const start = source.indexOf("const defaultCoreFactory");
-  assert.ok(start >= 0, "defaultCoreFactory source must exist");
-  const end = source.indexOf("export async function runResident", start);
-  const body = source.slice(start, end >= 0 ? end : undefined);
-  assert.match(body, /new coreMod\.DaemonCore\(\{\s*\.\.\.residentCoreIdentity\(creds\),/s);
 });

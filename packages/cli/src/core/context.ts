@@ -4,6 +4,7 @@ import {
   loadAgentContext,
   type AgentContext,
 } from "../auth/env";
+import type { CliContinuationOptions } from "../commands/continuation/_runtime";
 import type { CliIo } from "./io";
 import { defaultCliIo } from "./io";
 import { CliError, type CliErrorCode } from "./errors";
@@ -11,6 +12,8 @@ import { CliError, type CliErrorCode } from "./errors";
 export interface CommandContext {
   io: CliIo;
   env: NodeJS.ProcessEnv;
+  /** The runtime's continuation options (tests): what a command that can pause runs with. */
+  continuations?: CliContinuationOptions;
   loadAgentContext(): AgentContext;
   createApiClient(agentContext: AgentContext): ApiClient;
 }
@@ -20,6 +23,8 @@ export interface CommandRuntimeOptions {
   env?: NodeJS.ProcessEnv;
   loadAgentContext?: (env?: NodeJS.ProcessEnv) => AgentContext;
   createApiClient?: (agentContext: AgentContext) => ApiClient;
+  /** Commands that pause for an answer, and `cont` (commands/continuation): the table, store and clock (tests). */
+  continuations?: CliContinuationOptions;
 }
 
 function bootstrapSuggestedNextAction(code: string): string | undefined {
@@ -51,6 +56,7 @@ export function createCommandContext(options: CommandRuntimeOptions = {}): Comma
   return {
     io,
     env,
+    ...(options.continuations ? { continuations: options.continuations } : {}),
     loadAgentContext() {
       try {
         return loadContext(env);

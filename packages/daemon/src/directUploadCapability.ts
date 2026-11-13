@@ -46,6 +46,13 @@ export interface CreateDirectUploadSessionOptions<TResponse extends DirectUpload
   timeoutMs?: number;
   /** Optional caller cancellation for every hop. Absent = today's behaviour. */
   signal?: AbortSignal;
+  /**
+   * Hold every hop to `workerUrl`'s origin: no redirects on the create POST
+   * or the PUT, and the PUT URL the worker returns must be on that origin, or
+   * the upload fails before any bytes are sent. For a receiver this daemon did
+   * not choose itself (a server-named trace upload URL). Absent = today's behaviour.
+   */
+  pinWorkerOrigin?: boolean;
 }
 
 export interface UploadWithSignedCapabilityOptions {
@@ -69,6 +76,18 @@ export interface UploadWithSignedCapabilityOptions {
   timeoutMs?: number;
   /** Optional caller cancellation for every hop (attestation, create, PUT). Absent = today's behaviour. */
   signal?: AbortSignal;
+  /**
+   * Hold every hop to `workerUrl`'s origin: no redirects on the create POST
+   * or the PUT, and the PUT URL the worker returns must be on that origin, or
+   * the upload fails before any bytes are sent. For a receiver this daemon did
+   * not choose itself (a server-named trace upload URL). Absent = today's behaviour.
+   */
+  pinWorkerOrigin?: boolean;
+}
+
+/** The worker named a PUT target off its own origin while `pinWorkerOrigin` was set. */
+export class DirectUploadTargetOriginError extends Error {
+  override name = "DirectUploadTargetOriginError";
 }
 
 /** Which hop of a signed direct upload failed. */
@@ -112,6 +131,15 @@ function withStatus(prefix: string, err: unknown, stage: DirectUploadStage): nev
 
 function joinUrl(base: string, path: string) {
   return `${base.replace(/\/+$/, "")}${path}`;
+}
+
+function sameOrigin(target: unknown, base: string): boolean {
+  if (typeof target !== "string") return false;
+  try {
+    return new URL(target).origin === new URL(base).origin;
+  } catch {
+    return false;
+  }
 }
 
 function jsonHeaders(apiKey?: string): Record<string, string> {
@@ -164,6 +192,7 @@ export async function createDirectUploadSession<TResponse extends DirectUploadCr
   fetchImpl = daemonFetch,
   timeoutMs = DEFAULT_CHAT_BRIDGE_TOOL_TIMEOUT_MS,
   signal,
+  pinWorkerOrigin = false,
 }: CreateDirectUploadSessionOptions<TResponse>): Promise<{ capability: DaemonScopeAttestation; response: TResponse }> {
   const capability = await requestDaemonScopeAttestation({
     serverUrl,
@@ -186,6 +215,7 @@ export async function createDirectUploadSession<TResponse extends DirectUploadCr
         attestation: capability.attestation,
       }),
       ...(signal ? { signal } : {}),
+      ...(pinWorkerOrigin ? { redirect: "error" as const } : {}),
     },
     {
       toolName: "daemon_direct_upload.create",
@@ -212,6 +242,7 @@ export async function uploadWithSignedCapability({
   fetchImpl = daemonFetch,
   timeoutMs = DEFAULT_CHAT_BRIDGE_TOOL_TIMEOUT_MS,
   signal,
+  pinWorkerOrigin = false,
 }: UploadWithSignedCapabilityOptions): Promise<{ capability: DaemonScopeAttestation; session: DirectUploadCreateResponse; uploadResponse: Response }> {
   const { capability, response: session } = await createDirectUploadSession({
     serverUrl,
@@ -225,8 +256,12 @@ export async function uploadWithSignedCapability({
     fetchImpl,
     timeoutMs,
     signal,
+    pinWorkerOrigin,
   });
   verifySession?.(capability, session);
+  if (pinWorkerOrigin && !sameOrigin(session.upload.url, workerUrl)) {
+    throw tagStage(new DirectUploadTargetOriginError("Upload target is not on the worker's origin"), "put");
+  }
 
   const { response: uploadResponse } = await executeResponseRequest(
     session.upload.url,
@@ -235,6 +270,7 @@ export async function uploadWithSignedCapability({
       headers: session.upload.headers ?? {},
       body: uploadBody,
       ...(signal ? { signal } : {}),
+      ...(pinWorkerOrigin ? { redirect: "error" as const } : {}),
     },
     {
       toolName: "daemon_direct_upload.put",

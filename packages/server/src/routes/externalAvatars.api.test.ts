@@ -10,7 +10,7 @@ import {
   resetStorageForTests,
 } from "../services/storageService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 async function seedActiveAvatarArtifact() {
   const db = getDb();

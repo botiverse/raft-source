@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+import { CLAUDE_LIVE, mockRuntimeFormsV2 } from "./runtimeFormV2Mock";
 
 /**
  * task #9: the ten conditional runtime-config fields, measured for real.
@@ -11,42 +12,19 @@ import { expect, test } from "@playwright/test";
  * that the harness never primes. So the fix is to supply that response, then
  * drive the UI the way a user would.
  *
- * The mocked payload mirrors the shape used by
- * packages/web/tests/schemaCreateAgentDialog.behavior.test.tsx rather than being
- * invented here, so it stays honest to the real contract.
+ * The runtime form is the protocol v2 one (task #8): the admission row must
+ * carry the `runtimeFormV2` marker, and the form and its option sources must
+ * load. They are served from the real Claude fixtures in
+ * packages/runtime-form/fixtures, so the fields, their order, visibility rules
+ * and copy are the server's, not invented here.
  */
 
 type Metrics = { fontSize: string; fontWeight: string; lineHeight: string };
 
 const CASE = "/visual-testing.html?case=components.members.create-agent.claude-dialog";
 
-const catalog = (machineId: string) => ({
-  context: "new_agent",
-  machineId,
-  options: [
-    {
-      runtimeId: "claude",
-      capabilityStatus: "available",
-      admissionStatus: "available_for_new",
-      admissionReason: null,
-      current: false,
-      availableForNew: true,
-      manageableForCurrentAgent: false,
-      canSelectInThisContext: true,
-    },
-  ],
-});
-
 async function primeCatalog(page: import("@playwright/test").Page) {
-  await page.route("**/runtime-options**", async (route) => {
-    const url = route.request().url();
-    const machineId = url.split("/machines/")[1]?.split("/")[0] ?? "";
-    await route.fulfill({
-      status: 200,
-      contentType: "application/json",
-      body: JSON.stringify(catalog(machineId)),
-    });
-  });
+  await mockRuntimeFormsV2(page, [CLAUDE_LIVE]);
 }
 
 /** DS TextField: input text is 16/24, at the body weight. */
@@ -85,23 +63,24 @@ test(`conditional runtime-config fields render and obey the field axis`, async (
     runtime: [...document.querySelectorAll('[data-slot="select-value"]')].map((v) => (v.textContent || "").trim())[1] ?? null,
   }));
   expect(afterCatalog.runtime, `runtime catalog primed and a runtime is selected`).toBe("Claude Code");
-  expect(afterCatalog.labels, `the Provider field is revealed by that selection`).toContain("Provider");
+  // Provider is required in the v2 Claude form, hence the asterisk.
+  expect(afterCatalog.labels, `the Provider field is revealed by that selection`).toContain("Provider*");
 
-  // Provider -> Custom reveals the API URL + API key pair.
-  const providerTrigger = page.locator('[data-slot="field"]').filter({ hasText: "Provider" })
-    .locator('[data-slot="button"]').first();
-  await providerTrigger.click();
-  await page.waitForTimeout(400);
-  const custom = page.locator('[data-slot="select-item"]').filter({ hasText: /custom/i }).first();
-  if (await custom.count()) {
-    await custom.click();
-    await page.waitForTimeout(700);
-  }
+  // Before Provider -> Custom, the pair is hidden by the form's visibility rule.
+  const before = (await page.locator('[data-slot="field-label"]').allTextContents()).map((l) => l.trim());
+  expect(before, `API URL hidden under the default provider`).not.toContain("API URL");
+
+  // Provider -> Custom reveals the API URL + API key pair. Provider is a v2
+  // option-source field, so it is a searchable combobox, not a Select.
+  await page.getByTestId("runtime-form-v2-provider").click();
+  await page.getByRole("option", { name: "Custom", exact: true }).click();
+  await page.waitForTimeout(700);
 
   const labels = (await page.locator('[data-slot="field-label"]').allTextContents()).map((l) => l.trim());
-  // The whole point: fields exist now that did not before the runtime was chosen.
-  expect(labels, `API URL revealed`).toContain("API URL*");
-  expect(labels, `API Key revealed`).toContain("API Key*");
+  // The whole point: fields exist now that did not before the provider was chosen.
+  // The v2 Claude form marks neither as required (no asterisk).
+  expect(labels, `API URL revealed`).toContain("API URL");
+  expect(labels, `API Key revealed`).toContain("API Key");
 
   // Now the acceptance itself: those newly-revealed controls must sit on the
   // field metric axis like every other field.
@@ -147,21 +126,20 @@ test(`the Advanced disclosure fields obey the field axis`, async ({ page }) => {
   expect(runtime, `runtime selected before opening Advanced`).toBe("Claude Code");
 
   // A second disclosure path, revealing a different set of conditional fields
-  // than Provider->Custom: the Claude command hint lives behind More.
+  // than Provider->Custom: the Claude command hint lives behind the disclosure.
   //
-  // ONE level, not two (@cindyz, 2026-09-03). The inner "Advanced" was removed
-  // — it existed to fence off what can break the agent, but "More" and
-  // "Advanced" both only mean "more stuff", so the nesting cost a click
-  // without carrying the message. Command and env vars now sit directly
-  // inside More.
-  const more = page.getByRole("button", { name: "More", exact: true }).first();
-  await expect(more, `"More" disclosure exists`).toHaveCount(1);
-  await more.click();
+  // ONE level, not two (@cindyz, 2026-09-03): nesting cost a click without
+  // carrying a message. The v2 form has a single "Advanced" disclosure (its
+  // `layout.advanced` fields: command and env vars); there is no outer "More".
+  await expect(page.getByRole("button", { name: "More", exact: true }), `no outer "More" disclosure`).toHaveCount(0);
+  const advanced = page.getByRole("button", { name: "Advanced", exact: true });
+  await expect(advanced, `exactly one "Advanced" disclosure exists`).toHaveCount(1);
+  await advanced.click();
   await page.waitForTimeout(500);
   await expect(
-    page.getByRole("button", { name: "Advanced", exact: true }),
-    `the nested "Advanced" disclosure must be gone — one level only`,
-  ).toHaveCount(0);
+    page.locator('button[aria-expanded]').filter({ hasText: /^(More|Advanced)$/ }),
+    `opening it reveals fields, not a nested disclosure — one level only`,
+  ).toHaveCount(1);
 
   const labels = (await page.locator('[data-slot="field-label"]').allTextContents()).map((l) => l.trim());
   expect(labels.some((l) => l.startsWith("Claude Command")), `command hint revealed`).toBe(true);

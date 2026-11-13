@@ -1,0 +1,104 @@
+/* The window's title bar, when a shell hands the top row to the page.
+ *
+ * Two shells draw their window without a title bar of their own and lay the
+ * window controls over the page's top row, both under the Window Controls
+ * Overlay (env(titlebar-area-*) gives the controls' geometry):
+ *   - the desktop app (Electron `titleBarOverlay`, every platform;
+ *     desktopTitleBar.ts sets the attributes below from its bridge);
+ *   - the installed web app (windowControlsOverlay.tsx; manifest display_override).
+ * One set of rules serves both, on every platform. They key off markers that only those shells
+ * set (data-raft-titlebar on the row, data-title-bar on <html>), so a plain
+ * browser tab is untouched.
+ * - Title bars become draggable regions (interactive children opt back out),
+ *   with a corner reserved for the window controls (overlay only, windowed only).
+ * Both shells are Chromium, which reads the prefixed -webkit-app-region.
+ */
+[data-raft-titlebar] {
+  -webkit-app-region: drag;
+}
+/* The window's safe areas: the corners and band the window controls are drawn
+ * over, published on <html> as raft-ui's frame insets (--raft-frame-inset-start
+ * / -end / -top; all 0 in a browser tab). raft-ui keeps the top bar's theme
+ * strip out of the end inset (frame-decor-top) and its tooltips out of the top
+ * band (they flip below their trigger). That includes macOS: the band is the
+ * window's title bar there too (drag region, traffic lights), as it already
+ * was for the installed web app on macOS. The top bar's own tooltips opened
+ * below it before as well (no room above); what the band changes is a control
+ * just under the bar, whose tooltip no longer rises into the title bar.
+ * Windows / Linux / the installed web app: minimize/maximize/close (and, in the
+ * installed web app, the browser's own menu) are drawn OVER the right end of the
+ * bar (data-title-bar="overlay"). Their corner comes from the Window Controls
+ * Overlay geometry (titlebar-area-* = the bar area clear of the controls, in CSS
+ * px so it follows zoom; on macOS the right corner is 0); without it (e.g. the
+ * desktop render smoke's plain window for Windows / Linux) fall back to
+ * Windows' 3 × 46px caption buttons, 48px tall. */
+html[data-title-bar="overlay"]:not([data-fullscreen]) {
+  --raft-frame-inset-end: calc(100vw - env(titlebar-area-x, 0px) - env(titlebar-area-width, calc(100vw - 138px)));
+  --raft-frame-inset-top: env(titlebar-area-height, 44px);
+}
+/* On macOS the traffic lights are drawn over the LEFT end as well
+ * (titlebar-area-x > 0, past the lights and their margin): data-title-bar-start
+ * ="overlay", set only then (windowControlsOverlayGeometry.ts), in the desktop
+ * app and the installed web app alike. */
+html[data-title-bar-start="overlay"]:not([data-fullscreen]) {
+  --raft-frame-inset-start: env(titlebar-area-x, 0px);
+}
+/* The title bar reserves those corners with padding. --raft-titlebar-inset-*
+ * are the same amounts, set only on a row that reserves them: they tell the
+ * web top bar about the corners, so it keeps its search field on the window
+ * centre (AppTopBar's edge balance), and pad full-window overlay headers. */
+html[data-title-bar="overlay"]:not([data-fullscreen]) [data-raft-titlebar] {
+  padding-right: var(--raft-frame-inset-end);
+  --raft-titlebar-inset-end: var(--raft-frame-inset-end);
+}
+html[data-title-bar-start="overlay"]:not([data-fullscreen]) [data-raft-titlebar] {
+  padding-left: var(--raft-frame-inset-start);
+  --raft-titlebar-inset-start: var(--raft-frame-inset-start);
+}
+[data-raft-titlebar]
+  :is(button, a, input, select, textarea, [role="button"], [contenteditable="true"]) {
+  -webkit-app-region: no-drag;
+}
+/* The ⌘K search overlay hangs off the top-bar search field (task #113), so its
+ * card overlaps the title-bar drag region. Chromium builds draggable regions
+ * geometrically (drag rects minus no-drag rects, regardless of stacking), so
+ * without this the card's top rows — its input — would drag the window instead
+ * of taking clicks. The overlay is portaled to <body>, outside [data-raft-titlebar]. */
+[data-testid="desktop-search-overlay"] {
+  -webkit-app-region: no-drag;
+}
+/* Task #121: while any dismiss-on-outside layer is open (see layerGuard.ts),
+ * the title bar stops being a drag region so a click there reaches the layer's
+ * backdrop / outside-press listener and dismisses it (Slack behaviour). Also
+ * declare the web's full-window backdrops no-drag directly, so even a click
+ * landing on them over the bar area is theirs. */
+html[data-raft-layer-open] [data-raft-titlebar] {
+  -webkit-app-region: no-drag;
+}
+[data-dismiss-layer] {
+  -webkit-app-region: no-drag;
+}
+/* Full-window overlays (file previews, lightboxes) cover the title bar with a
+ * header of their own, which becomes the window's title bar while it is open
+ * (overlayTitleBar.ts — Slack's file preview recipe). The row pads itself by
+ * these insets; here we publish them under the same conditions as the main
+ * bar, and make the row's empty area a drag region. It is declared after
+ * [data-dismiss-layer] and sits inside the overlay root, so it wins over the
+ * root's no-drag in Chromium's tree-order region build. Its controls opt out
+ * like the main bar's, and while a nested layer is open above the overlay (a
+ * menu from the header) the layer guard marks the row covered so a click there
+ * dismisses that layer. */
+[data-raft-overlay-titlebar] {
+  -webkit-app-region: drag;
+}
+html[data-title-bar="overlay"]:not([data-fullscreen]) [data-raft-overlay-titlebar] {
+  --raft-titlebar-inset-end: var(--raft-frame-inset-end);
+}
+html[data-title-bar-start="overlay"]:not([data-fullscreen]) [data-raft-overlay-titlebar] {
+  --raft-titlebar-inset-start: var(--raft-frame-inset-start);
+}
+[data-raft-overlay-titlebar]
+  :is(button, a, input, select, textarea, [role="button"], [contenteditable="true"], [data-raft-overlay-titlebar-no-drag]),
+[data-raft-overlay-titlebar][data-raft-overlay-titlebar-covered] {
+  -webkit-app-region: no-drag;
+}

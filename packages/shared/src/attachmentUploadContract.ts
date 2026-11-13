@@ -70,6 +70,27 @@ export const attachmentUploadCapabilitiesSchema = lazySchema("attachmentUploadCa
   sessionExpiresInSeconds: z.int().positive().max(86_400).nullable(),
 }).meta({ id: "AttachmentUploadCapabilities" }));
 
+/**
+ * What is left of the server's monthly file upload quota (Free or AppSumo), so the web
+ * composer can refuse a file at selection, as it does a file over `maxBytes`,
+ * and say how much is left and when it resets. `month` is the UTC month
+ * (`YYYY-MM`) the quota counts; it resets when the next one starts.
+ */
+export const attachmentMonthlyUploadSchema = lazySchema("attachmentMonthlyUploadSchema", () => z.strictObject({
+  source: z.literal("appsumo").optional(),
+  month: z.string().regex(/^\d{4}-\d{2}$/),
+  limitBytes: z.int().positive(),
+  remainingBytes: z.int().nonnegative(),
+}).meta({ id: "AttachmentMonthlyUpload" }));
+
+/**
+ * The web's capabilities: the agent API's (which the CLI parses strictly, so
+ * it never grows) plus the monthly quota, null where none applies (Pro).
+ */
+export const webAttachmentUploadCapabilitiesSchema = lazySchema("webAttachmentUploadCapabilitiesSchema", () => attachmentUploadCapabilitiesSchema.extend({
+  monthlyUpload: attachmentMonthlyUploadSchema.nullable(),
+}).meta({ id: "WebAttachmentUploadCapabilities" }));
+
 export const createAttachmentUploadSessionRequestSchema = lazySchema("createAttachmentUploadSessionRequestSchema", () => z.strictObject({
   channelId: z.uuid(),
   filename: z.string().min(1).max(255),
@@ -134,6 +155,13 @@ export const attachmentUploadForbiddenErrorSchema = flatError(
   "UPLOAD_FORBIDDEN",
   false,
 );
+/** A file the server's monthly upload quota has no room for (Free). */
+export const attachmentUploadQuotaExceededErrorSchema = lazySchema("attachmentUploadQuotaExceededErrorSchema", () => z.strictObject({
+  code: z.literal("FILE_UPLOAD_QUOTA_EXCEEDED"),
+  message: z.string().min(1),
+  retryable: z.literal(false),
+  monthlyUpload: attachmentMonthlyUploadSchema,
+}).meta({ id: "AttachmentUploadQuotaExceededError" }));
 export const attachmentUploadIdempotencyConflictErrorSchema = flatError(
   "AttachmentUploadIdempotencyConflictError",
   "UPLOAD_IDEMPOTENCY_CONFLICT",
@@ -207,7 +235,7 @@ export const attachmentUploadContract = {
     operationId: "getAttachmentUploadCapabilities",
     summary: "Get server-authoritative attachment upload limits",
     responses: {
-      200: { description: "Current upload capability", schema: attachmentUploadCapabilitiesSchema },
+      200: { description: "Current upload capability", schema: webAttachmentUploadCapabilitiesSchema },
     },
   }),
   list: defineOperation({
@@ -231,7 +259,10 @@ export const attachmentUploadContract = {
     responses: {
       201: { description: "Upload session created", schema: createAttachmentUploadSessionResponseSchema },
       400: { description: "Invalid upload request", schema: invalidUploadRequestErrorSchema },
-      403: { description: "Upload is forbidden", schema: attachmentUploadForbiddenErrorSchema },
+      403: {
+        description: "Upload is forbidden, or the monthly upload quota has no room for it",
+        schema: z.union([attachmentUploadForbiddenErrorSchema, attachmentUploadQuotaExceededErrorSchema]),
+      },
       409: { description: "Idempotency key conflicts with another request", schema: attachmentUploadIdempotencyConflictErrorSchema },
       413: { description: "Attachment is larger than the plan limit", schema: attachmentUploadTooLargeErrorSchema },
       429: { description: "Upload creation is rate limited", schema: attachmentUploadRateLimitedErrorSchema },

@@ -6,6 +6,8 @@ import { z } from "zod";
 import {
   ATTACHMENT_UPLOAD_MAX_SIZE_BYTES,
   attachmentUploadContract,
+  attachmentMonthlyUploadSchema,
+  attachmentUploadCapabilitiesSchema,
   createAttachmentUploadSessionRequestSchema,
   createAttachmentUploadSessionResponseSchema,
   attachmentUploadSessionSchema,
@@ -38,7 +40,7 @@ const readFixtureFile = (filename: string) => {
 };
 
 test("central OpenAPI registry keeps the attachment module additive, unmounted, and explicit by status", () => {
-  assert.deepEqual(Object.keys(openApiContractModules), ["attachmentUploads"]);
+  assert.deepEqual(Object.keys(openApiContractModules), ["attachmentUploads", "readState"]);
   assert.equal(openApiContractModules.attachmentUploads.operations, attachmentUploadContract);
   assert.deepEqual(Object.keys(attachmentUploadContract), ["capabilities", "list", "create", "complete", "cancel", "status"]);
   const operations = Object.values(attachmentUploadContract);
@@ -189,4 +191,14 @@ test("wire schemas are strict, bounded, and keep the presigned URL ephemeral", (
     },
   };
   assert.deepEqual(completeAttachmentUploadSessionResponseSchema.parse(completed), completed);
+});
+
+
+test("web monthly allowances retain AppSumo identity without relaxing the agent capability contract", () => {
+  const quota = { month: "2026-10", limitBytes: 1024 ** 3, remainingBytes: 0, source: "appsumo" };
+  assert.deepEqual(attachmentMonthlyUploadSchema.parse(quota), quota);
+  assert.equal(attachmentMonthlyUploadSchema.safeParse({ ...quota, source: "unknown" }).success, false);
+  const agent = { directUploadEnabled: false, directUploadThresholdBytes: null, maxBytes: 50 * 1024 ** 2, sessionExpiresInSeconds: null };
+  assert.equal(attachmentUploadCapabilitiesSchema.safeParse(agent).success, true);
+  assert.equal(attachmentUploadCapabilitiesSchema.safeParse({ ...agent, monthlyUpload: quota }).success, false);
 });

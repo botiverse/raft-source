@@ -22,6 +22,7 @@
  * flips a per-message query back into the loop shows up as O(N) growth
  * in the latency curve before it surfaces in Telescope.
  */
+import { randomUUID } from "node:crypto";
 import { initDatabase, getDb, closeDatabase } from "../../src/db/index";
 import {
   users,
@@ -32,6 +33,7 @@ import {
   channelAgents,
   agents,
   messages,
+  attachmentObjects,
   attachments,
 } from "../../src/db/schema";
 import { listMessages } from "../../src/services/messageService";
@@ -153,22 +155,33 @@ async function seed(messageCount: number) {
   const inserted = await db.insert(messages).values(rows).returning({ id: messages.id, seq: messages.seq });
 
   // 10% of messages get an attachment. Linked rows push
-  // `getAttachmentsForMessages` onto the hot path.
+  // `getAttachmentsForMessages` onto the hot path. Each projection names its
+  // own object, which carries the physical metadata.
+  const objectRows: typeof attachmentObjects.$inferInsert[] = [];
   const attachmentRows: typeof attachments.$inferInsert[] = [];
   for (let i = 0; i < inserted.length; i++) {
     if (i % 10 !== 0) continue;
+    const objectId = randomUUID();
+    objectRows.push({
+      id: objectId,
+      originServerId: SERVER_ID,
+      uploaderId: OWNER_USER_ID,
+      uploaderType: "user",
+      mimeType: "image/png",
+      sizeBytes: 1024,
+      storageKey: `bench/${i}.png`,
+    });
     attachmentRows.push({
+      objectId,
       messageId: inserted[i]!.id,
       channelId: CHANNEL_ID,
       uploaderId: OWNER_USER_ID,
       uploaderType: "user",
       filename: `bench-${i}.png`,
-      mimeType: "image/png",
-      sizeBytes: 1024,
-      storageKey: `bench/${i}.png`,
     });
   }
   if (attachmentRows.length > 0) {
+    await db.insert(attachmentObjects).values(objectRows);
     await db.insert(attachments).values(attachmentRows);
   }
 

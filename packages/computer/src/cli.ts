@@ -9,12 +9,13 @@
  * + per-server daemon children, all under one service.
  *
  * MVP control-plane surface (§6):
- *   login                              shared device-code user identity
- *   logout                             clear the saved user session
- *   attach <serverSlug>                add-not-replace per-server attach
+ *   login                              kept for old scripts: runs attach's approval
+ *   logout                             kept for old scripts: changes nothing
+ *   attach <serverSlug>                add-not-replace per-server attach (one-time approval)
  *   start [serverSlug]                 ensure service + per-server daemons
  *   stop                               stop the service + managed daemons
  *   status                             aggregate Computer view
+ *   detach <serverSlug>                revoke this machine's key there, then forget it
  *   doctor                             per-server health + login + service
  *   logs   [serverSlug | --service]
  *   runners list   [serverSlug]
@@ -34,10 +35,15 @@
  * admin-confirmed recovery) says otherwise. The old user-facing `detach`
  * command and implementation are intentionally absent; local disconnect and
  * destructive revoke/delete are not part of the ordinary V0 CLI surface.
+ * `detach <serverSlug>` (device-auth design §3.2) is not that command back:
+ * it is an explicit, confirmed revoke on the server first (axis 4), and only
+ * after the server confirms does it delete the local credential (axis 3), so
+ * a live server key is never left without its local holder (detach.ts).
  *
  * Verb-to-axis table:
  *   start/stop [serverSlug]            axis 1 only
  *   setup/attach <serverSlug>          axis 3 create/proof-resume only
+ *   detach <serverSlug>                axis 4 revoke, then axis 3 delete (confirmed)
  *   future enable/disable <serverSlug> axis 2 only
  *   service start/stop                 machine-scope axis 1 only
  *
@@ -50,27 +56,32 @@ import { randomUUID } from "node:crypto";
 import { Command } from "commander";
 
 import { runLogin, runLogout } from "./login";
-import { runAttach } from "./attach";
+import { runAttach, runAttachWithTokenFromStdin } from "./attach";
+import { readMachineTurnActivity } from "./turnActivity";
+import { parseForceUnbindIds, runDetach } from "./detach";
 import { runSetup } from "./setup";
-import { formatStatusReport } from "./status";
+import { formatStatusReport, printProcJobsStatus } from "./status";
 import { runRunnersList, runRunnersStop } from "./runners";
-import { runStart, runStop } from "./startStop";
+import { noteStartNeverRan, runStart, runStop, startAcceptsPartialReady, startNotesUpgradeStep, startWaitForCaller } from "./startStop";
 import { runResident, runService, isSeaBinary, RESIDENT_CLI_PATH_ENV_VAR } from "./service";
-import { runDoctor, runDoctorMigrationDetails } from "./doctorCli";
+import { runDoctor, runDoctorJson, runDoctorMigrationDetails } from "./doctorCli";
 import { runLogs } from "./logs";
 import { CliExit, info, fail, present } from "./output";
 import { createComputerApi } from "./lib/api";
 import { createComputerTracer } from "./lib/computerTracer";
-import { currentDate, currentTimeMs, type Tracer } from "@botiverse/raft-shared";
+import { COMPUTER_CLI_ATTACH_TOKEN_STDIN_FLAG, COMPUTER_CLI_CAPABILITIES, currentDate, currentTimeMs, type Tracer } from "@botiverse/raft-shared";
 import { withMutationLock } from "./concurrency";
 import { runChannelShow, runChannelSet, runChannelVersions } from "./channel";
-import { installerArgs, runInstallerAttended } from "./externalInstaller";
+import { installerArgs, runInstallerAttended, scrubInstallerOperationEnv } from "./externalInstaller";
 import { parseChannel, readChannel, SEMVER_RE } from "./lib/channelState";
 import {
   resolveUpgradeBaseUrl,
 } from "./computerRelease";
 import { ComputerServiceError } from "./services/errors";
-import { resolveRaftHome } from "./paths";
+import { formatCliFatalError } from "./networkError";
+import { deriveDefaultComputerName, resolveRaftHome } from "./paths";
+import { approvalOsLabel } from "./services/attachGrant";
+import { hostname as osHostname } from "node:os";
 import { resolveTargetServerId } from "./targetServer";
 import { DEFAULT_SLOCK_SERVER_URL } from "./serverUrl";
 import { BUNDLED_CLI_VERSION, BUNDLED_DAEMON_VERSION, COMPUTER_VERSION } from "./version";
@@ -81,9 +92,10 @@ import { migrateLegacyOsSupervisorInstall } from "./legacyOsSupervisorMigration"
 import { findLiveServicePidReadOnly } from "./internal/service-pid-fallback";
 import { isDegraded } from "./health";
 import { resetRunner } from "./reset";
-import { requestServiceRestartViaIpc } from "./serviceControl";
+import { isServiceConnectionLoss, requestServiceRestartViaIpc } from "./serviceControl";
 import { callerIsRunnerHosted } from "./restartReadiness";
 import { connectService } from "./lib/ipc-client";
+import { removeServiceAddedMallocEnv } from "./runnerChildEnv";
 
 function withCliExit<A extends unknown[]>(fn: (...args: A) => Promise<void>) {
   return async (...args: A) => {
@@ -290,6 +302,14 @@ async function requestLiveServiceRestart(
   try {
     await runtime.requestRestart(plan.slockHome, restartServiceParamsFor(prepared));
   } catch (err) {
+    // On Windows the service closes this connection to hand its named pipe to
+    // the replacement (task #924); the restart is then in progress, not failed.
+    if (isServiceConnectionLoss(err)) {
+      runtime.emitInfo(
+        `Service restart in progress (pid ${liveServicePid}); the service closed this connection to hand over to its replacement. Check with \`raft-computer status\`.`,
+      );
+      return;
+    }
     const detail = err instanceof Error ? err.message : String(err);
     runtime.emitFail(
       "RESTART_SERVICE_UNREACHABLE",
@@ -375,19 +395,19 @@ program
   .description("Raft Computer — connect this machine to Raft so agents can run here.")
   .version(COMPUTER_VERSION);
 
-// --- login (shared device-code) ---
+// --- login (kept for old docs/scripts: runs attach's one-time approval) ---
 program
   .command("login")
-  .description("Log in to Raft on this machine.")
+  .description("No longer needed: use `raft-computer attach <server>`. Runs the same approval.")
   .option("--server-url <url>", `Raft API base URL; defaults to ${SERVER_URL_ENV_DESC}`)
   .action(withCliExit(async (opts: { serverUrl?: string }) => {
     await runLogin({ serverUrl: opts.serverUrl });
   }));
 
-// --- logout (clear the saved user session) ---
+// --- logout (kept for old docs/scripts: there is no session to end) ---
 program
   .command("logout")
-  .description("Log out of Raft on this machine. Connected servers are kept.")
+  .description("No longer needed: this machine keeps no sign-in. Changes nothing.")
   .action(withCliExit(async () => {
     await runLogout();
   }));
@@ -398,13 +418,42 @@ program
   .argument("<serverSlug>", SERVER_SLUG_TARGET_DESC)
   .description("Connect this machine to one Raft server.")
   .option("--server-url <url>", `Raft API base URL; defaults to the saved user session, ${SERVER_URL_ENV_DESC}`)
-  .option("--name <name>", "Computer display name; defaults to a sanitized hostname")
+  .option("--name <name>", "Computer display name shown on the approval page; defaults to a sanitized hostname")
   .option("--no-start", "connect without starting Raft Computer")
   .option("--foreground", FOREGROUND_DESC)
-  .action(withCliExit(async (serverSlug: string, opts: { serverUrl?: string; name?: string; start?: boolean; foreground?: boolean }) => {
+  // Raft Desktop: it ran the approval itself (a one-time attach grant) and
+  // hands over the single-use `dvat_*` token on stdin, never on argv.
+  .option("--server-id <id>", "the server id the attach token was approved for (with --attach-token-stdin)")
+  .option(COMPUTER_CLI_ATTACH_TOKEN_STDIN_FLAG, "read a one-time attach token from stdin instead of asking for approval")
+  .option("--json", "print the result as one JSON line (with --attach-token-stdin)")
+  .action(withCliExit(async (serverSlug: string, opts: { serverUrl?: string; name?: string; start?: boolean; foreground?: boolean; serverId?: string; attachTokenStdin?: boolean; json?: boolean }) => {
+    if (opts.attachTokenStdin) {
+      await withMutationLock(() =>
+        runAttachWithTokenFromStdin({ serverSlug, serverId: opts.serverId, serverUrl: opts.serverUrl, name: opts.name, json: opts.json === true }),
+      );
+      return;
+    }
     await withMutationLock(() =>
       runAttach({ serverSlug, serverUrl: opts.serverUrl, name: opts.name, start: opts.start, foreground: opts.foreground }),
     );
+  }));
+
+// --- detach <serverSlug> (device-auth design §3.2) ---
+// Revoke this machine's key on one server (and the agent keys it issued),
+// then delete its local copy and stop that server's runner. Server first:
+// nothing local changes unless the server confirms (detach.ts).
+program
+  .command("detach")
+  .argument("<serverSlug>", SERVER_SLUG_TARGET_DESC)
+  .description("Disconnect this machine from one Raft server: revoke its key there, then remove it here.")
+  .option("-y, --yes", "skip the confirmation prompt")
+  .option(
+    "--force-unbind <agentIds>",
+    "other people's agents on this machine to unbind and stop with the detach: the ids a refused detach listed, comma-separated",
+  )
+  .action(withCliExit(async (serverSlug: string, opts: { yes?: boolean; forceUnbind?: string }) => {
+    const forceUnbind = parseForceUnbindIds(opts.forceUnbind);
+    await withMutationLock(() => runDetach({ serverSlug, yes: opts.yes, forceUnbind }));
   }));
 
 // --- setup <serverSlug> (task #41 PR-J3 — login + attach + start wrapper) ---
@@ -420,7 +469,7 @@ program
 program
   .command("setup")
   .argument("<serverSlug>", SERVER_SLUG_TARGET_DESC)
-  .description("Set up Raft Computer for one server: log in if needed, connect this machine, then start.")
+  .description("Set up Raft Computer for one server: approve this machine in the browser if needed, connect it, then start.")
   .option("--server-url <url>", `Raft API base URL; defaults to the saved user session, ${SERVER_URL_ENV_DESC}`)
   .option("--name <name>", "Computer display name for a new attachment; defaults to a sanitized hostname")
   .option("--machine <machineId>", "adopt the Computer/daemon row with this id (shown on the web Computers page) instead of matching local evidence")
@@ -466,17 +515,24 @@ program
   .description("Start Raft Computer in the background.")
   .option("--foreground", FOREGROUND_DESC)
   .action(withCliExit(async (serverSlug: string | undefined, opts: { foreground?: boolean }) => {
-    await withMutationLock(async (signal) =>
-      runStart(
+    const noteUpgradeStep = startNotesUpgradeStep();
+    let ran = false;
+    await withMutationLock(async (signal) => {
+      ran = true;
+      return runStart(
         {
           foreground: opts.foreground,
           serverId: serverSlug ? await resolveTargetServerId({ server: serverSlug }) : null,
           serverLabel: serverSlug ?? null,
           hostLifecycleOwner: "cli",
         },
-        { signal },
-      ),
-    );
+        { signal, ensureTimeoutMs: startWaitForCaller(), acceptPartialReady: startAcceptsPartialReady(), noteUpgradeStep },
+      );
+    }).catch(async (err: unknown) => {
+      // Refused before it ran (the mutation lock): runStart notes every other outcome itself.
+      if (!ran && noteUpgradeStep && !opts.foreground) await noteStartNeverRan(err);
+      throw err;
+    });
   }));
 
 // --- stop (graceful service shutdown) ---
@@ -493,8 +549,9 @@ program
 program
   .command("stop")
   .description("Stop Raft Computer and any agents it is running.")
-  .action(withCliExit(async () => {
-    await withMutationLock((signal) => runStop({ signal, hostLifecycleOwner: "cli" }));
+  .option("--jobs", "also stop the agents' background jobs (raft proc), which otherwise keep running")
+  .action(withCliExit(async (opts: { jobs?: boolean }) => {
+    await withMutationLock((signal) => runStop({ signal, hostLifecycleOwner: "cli", jobs: opts.jobs === true ? "stop" : "report" }));
   }));
 
 // --- restart [serverSlug] ---
@@ -533,13 +590,25 @@ program
         } catch { /* status remains useful when the service exits during readback */ }
       }
       // The installer repeats `nextStep` on its success line: what a person
-      // should do before Computer can run. Nothing to say once logged in.
-      const nextStep = report.loggedIn ? null : "run raft-computer login";
-      process.stdout.write(`${JSON.stringify({ ...report, attestation, nextStep })}\n`);
+      // should do before Computer can run. Nothing to say once a server is
+      // attached (or, on an older server, once logged in).
+      const nextStep = report.loggedIn || report.servers.length > 0 ? null : "run raft-computer setup /<server>";
+      // Agents mid-turn now (Raft Desktop's quiet point); null when a runner
+      // could not tell.
+      const turns = await readMachineTurnActivity(slockHome).catch(() => null);
+      const activeTurns = turns && turns.unknownServerIds.length === 0 ? turns.activeTurns : null;
+      // What a one-time attach approval names this machine (Raft Desktop asks
+      // the server for the grant before it hands the token to `attach`).
+      const approvalRequest = { machineName: deriveDefaultComputerName(), hostname: osHostname(), os: approvalOsLabel() };
+      // What this Computer's CLI can do for a caller (Raft Desktop enables a
+      // feature only when it is listed; packages/shared computerCliContract.ts).
+      const capabilities = [...COMPUTER_CLI_CAPABILITIES];
+      process.stdout.write(`${JSON.stringify({ ...report, attestation, nextStep, activeTurns, approvalRequest, capabilities })}\n`);
       return;
     }
     await present(async () => {
       formatStatusReport(await api.getStatus());
+      await printProcJobsStatus(slockHome);
     });
   }));
 
@@ -550,21 +619,17 @@ program
   .description("Check Raft Computer setup and connection health. Secrets are never printed.")
   .option("--fix", "after diagnosis, clean up stale local state when it is safe")
   .option("--migration-details", "show local legacy migration evidence and server-relative exclusion reasons")
-  .option(
-    "--unread-activity-dump <path>",
-    "save a private bounded unread/Activity self-diagnostic JSON file (never uploaded)",
-  )
+  .option("--json", "print the report as one JSON line (details redacted); exits 0 whenever it ran")
   .action(
     withCliExit(
       async (
         serverSlug: string | undefined,
-        opts: { fix?: boolean; migrationDetails?: boolean; unreadActivityDump?: string },
+        opts: { fix?: boolean; migrationDetails?: boolean; json?: boolean },
       ) => {
-        if (opts.migrationDetails && opts.unreadActivityDump) {
-          fail(
-            "INVALID_ARGUMENT",
-            "--migration-details and --unread-activity-dump are separate doctor reports; run them as separate commands.",
-          );
+        if (opts.json) {
+          const serverId = serverSlug ? await resolveTargetServerId({ server: serverSlug }) : undefined;
+          await runDoctorJson({ cleanup: opts.fix, serverId, serverLabel: serverSlug });
+          return;
         }
         if (opts.migrationDetails) {
           await runDoctorMigrationDetails({ serverLabel: serverSlug });
@@ -575,7 +640,6 @@ program
           cleanup: opts.fix,
           serverId: serverId,
           serverLabel: serverSlug,
-          unreadActivityDump: opts.unreadActivityDump,
         });
       },
     ),
@@ -662,8 +726,9 @@ program
   // subcommand `--version` is unreachable; keep `--target-version`.
   .option("--target-version <semver>", "install a specific version")
   .option("--allow-downgrade", "intend an older --target-version; going back to a version that worked is this")
+  .option("-y, --yes", "run unattended: no question, nothing read from stdin (Raft Desktop's Update Now)")
   .action(
-    withCliExit(async (opts: { channel?: string; targetVersion?: string; allowDowngrade?: boolean }) => {
+    withCliExit(async (opts: { channel?: string; targetVersion?: string; allowDowngrade?: boolean; yes?: boolean }) => {
       if (opts.targetVersion !== undefined && !SEMVER_RE.test(opts.targetVersion)) {
         fail("UPGRADE_VERSION_INVALID", `Invalid --target-version "${opts.targetVersion}". Expected semver like 1.0.31.`);
       }
@@ -673,7 +738,7 @@ program
       }
       // The installer decides everything from here: presence, the question,
       // settling unfinished work, the transaction, the one printed line.
-      const code = await runInstallerAttended(installerArgs({ targetVersion: opts.targetVersion, channel, allowDowngrade: opts.allowDowngrade }));
+      const code = await runInstallerAttended(installerArgs({ targetVersion: opts.targetVersion, channel, allowDowngrade: opts.allowDowngrade }), process.env, { unattended: opts.yes === true });
       if (code !== 0) throw new CliExit(code);
     }),
   );
@@ -685,12 +750,19 @@ program
   .action(withCliExit(async (opts: { slockHome?: string; raftHome?: string }) => {
     const home = opts.slockHome ?? opts.raftHome;
     if (home) process.env.SLOCK_HOME = home;
+    // The installer that started this service may have left its per-run
+    // variables in our environment; runners and agents inherit process.env,
+    // so drop them before anything is spawned (#proj-raft-computer:#32).
+    scrubInstallerOperationEnv(process.env);
     await runService();
   }));
 program
   .command("__run", { hidden: true })
   .argument("<serverId>", "server id this daemon child is bound to")
   .action(withCliExit(async (serverId: string) => {
+    // Before anything is spawned: runtimes and agent commands must not inherit
+    // the service's malloc settings (#wg-memory-usage:#36).
+    removeServiceAddedMallocEnv(process.env);
     await runResident(serverId);
   }));
 
@@ -722,11 +794,15 @@ async function runCli(): Promise<void> {
   // Execute on the injected release artifact, without reading account files or
   // contacting an OAuth service. A successful --version cannot detect missing
   // modules behind the SDK's lazy credential-derivation path.
-  if (process.argv[2] === "__verify-bundled-oauth" || process.argv[2] === "__verify-bundled-kimi") {
+  if (process.argv[2] === "__verify-bundled-oauth" || process.argv[2] === "__verify-bundled-kimi" || process.argv[2] === "__verify-bundled-oar") {
     const core = await import("@botiverse/raft-daemon/core");
     if (process.argv[2] === "__verify-bundled-oauth") {
       await core.verifyBundledPiOAuth();
       process.stdout.write("oauth-bundle-ok\n");
+    } else if (process.argv[2] === "__verify-bundled-oar") {
+      // RFC 060: the OAR host's runtimes (grok, qwen, qoder, codebuddy), their session paths and the observe entry, from the bundle.
+      await core.verifyBundledOarHost();
+      process.stdout.write("oar-bundle-ok\n");
     } else {
       // The SEA ships the kimi SDK as its own asset; load it like a launch would.
       await core.verifyBundledKimiSdk();
@@ -766,7 +842,7 @@ async function runCli(): Promise<void> {
 // A bare `import` (tests) still runs nothing.
 export function runCliAsMain(): void {
   runCli().catch((err: unknown) => {
-    process.stderr.write(`raft-computer: ${err instanceof Error ? err.message : String(err)}\n`);
+    process.stderr.write(formatCliFatalError(err));
     const debugStack = process.env.RAFT_COMPUTER_DEBUG_STACK;
     if (debugStack && err instanceof Error && err.stack) {
       process.stderr.write(`${err.stack}\n`);

@@ -16,6 +16,12 @@ import {
   safeProductFeedbackContentType,
   safeProductFeedbackFilename,
 } from "./productFeedbackConversationService";
+import type { DatabaseExecutor } from "../db/index";
+import {
+  ensureProductFeedbackRouteBinding,
+  productFeedbackRouteRootCommitment,
+  resetProductFeedbackRouteBindingCacheForTest,
+} from "./productFeedbackRouteBindingService";
 
 const ENV = {
   HANDS_FEEDBACK_BASE_URL: "https://hands.example/",
@@ -153,6 +159,33 @@ test("list strips unknown upstream keys and wraps Hands cursor", async () => {
   assert.equal(decodeProductFeedbackCursor(result.next_cursor!, {
     route: "ticket_list", userId: USER, ticketId: null, nowMs: 1_700_000_000_000,
   }, "cursor-secret"), "hands-next");
+});
+
+test("list passes each ticket's latest visible comment through, and drops a malformed one", async () => {
+  const latest = { author_type: "staff", body_preview: "Fixed in 1.21.30", created_at: 1_700_000_000_500 };
+  const result = await listProductFeedbackTickets({
+    userId: USER,
+    reporterId: "opaque-reporter",
+    limit: 20,
+    env: ENV,
+    now: () => 1_700_000_000_000,
+    fetchImpl: async () => Response.json({
+      tickets: [
+        ticket({ latest_comment: { ...latest, author_id: "must-not-cross" } }),
+        ticket({ id: "55555555-5555-4555-8555-555555555555", latest_comment: null }),
+        ticket({ id: "66666666-6666-4666-8666-666666666666", latest_comment: { ...latest, author_type: "admin" } }),
+        ticket({ id: "77777777-7777-4777-8777-777777777777" }),
+      ],
+      next_cursor: null,
+      unread_total: 0,
+    }),
+  });
+  // Only the three preview fields cross; an unknown author type is not a
+  // reason to fail the whole list, so that row just has no preview.
+  assert.deepEqual(result.tickets[0]?.latest_comment, latest);
+  assert.equal(result.tickets[1]?.latest_comment, null);
+  assert.equal(result.tickets[2]?.latest_comment, null);
+  assert.equal("latest_comment" in (result.tickets[3] ?? {}), false);
 });
 
 test("reporter sessions stay disabled unless the separate Raft flag is exactly true", () => {
@@ -403,6 +436,69 @@ test("unknown enum rejects the entire DTO and repeated invalid DTO opens the bre
   assert.equal(calls, 3, "open breaker must reject the fourth request without Hands traffic");
 });
 
+test("read breaker counts successes: a few failures among many successes keep it closed", async () => {
+  resetProductFeedbackBreakersForTest();
+  let calls = 0;
+  let fail = false;
+  let nowMs = 10_000;
+  const invoke = () => listProductFeedbackTickets({
+    userId: USER,
+    reporterId: "opaque-reporter",
+    limit: 20,
+    env: ENV,
+    now: () => nowMs,
+    fetchImpl: async () => {
+      calls += 1;
+      if (fail) throw new TypeError("fetch failed");
+      return listResponse();
+    },
+  });
+  for (let i = 0; i < 10; i += 1) await invoke();
+  fail = true;
+  for (let i = 0; i < 4; i += 1) await assert.rejects(invoke, ProductFeedbackConversationError);
+  fail = false;
+  await invoke();
+  assert.equal(calls, 15, "four failures against ten successes must not open the breaker");
+
+  // A minute later the successes have aged out; three failures open it again.
+  nowMs += 61_000;
+  fail = true;
+  for (let i = 0; i < 3; i += 1) await assert.rejects(invoke, ProductFeedbackConversationError);
+  await assert.rejects(invoke, (error) => (
+    error instanceof ProductFeedbackConversationError && error.diagnostic.stage === "breaker_open"
+  ));
+  assert.equal(calls, 18);
+});
+
+test("a read and a reporter-session mint are bounded when the caller passes no signal", async () => {
+  resetProductFeedbackBreakersForTest();
+  resetProductFeedbackReporterSessionCacheForTest();
+  const signals: Array<AbortSignal | null | undefined> = [];
+  await listProductFeedbackTickets({
+    userId: USER,
+    reporterId: "opaque-reporter",
+    limit: 20,
+    env: SESSION_ENV,
+    fetchImpl: async (url, init) => {
+      signals.push(init?.signal);
+      if (String(url).endsWith("/reporter-feedback/session")) {
+        return Response.json({
+          session_token: "hrps_v1_bounded",
+          expires_at: Math.floor(Date.now() / 1_000) + 60,
+          reporter_integration_id: INTEGRATION,
+          scopes: ["feedback:comment", "feedback:read"],
+        }, { status: 201 });
+      }
+      return listResponse();
+    },
+  });
+  assert.equal(signals.length, 2);
+  for (const signal of signals) {
+    assert.ok(signal instanceof AbortSignal, "every Hands call of a read carries a timeout signal");
+    assert.equal(signal.aborted, false);
+  }
+});
+
 test("breaker preserves integration error class after three 401 responses", async () => {
   resetProductFeedbackBreakersForTest();
   let calls = 0;
@@ -591,12 +687,39 @@ test("close rejects a mismatched upstream ticket receipt", async () => {
     code: "feedback_service_unavailable",
     failure_stage: "close_receipt",
     upstream_status: 200,
+    upstream_code: null,
     breaker_failures: 1,
     breaker_open: false,
   });
   const serialized = JSON.stringify(productFeedbackConversationFailureLog("close", caught));
   assert.doesNotMatch(serialized, new RegExp(TICKET));
   assert.doesNotMatch(serialized, /opaque-reporter/);
+});
+
+test("a Hands 503 with a classified code keeps the code, and only the code, in the close diagnostic", async () => {
+  resetProductFeedbackBreakersForTest();
+  let caught: unknown;
+  try {
+    await closeProductFeedbackTicket({
+      reporterId: "opaque-reporter",
+      ticketId: TICKET,
+      reason: "completed",
+      env: ENV,
+      now: () => 10_000,
+      fetchImpl: async () => Response.json(
+        { code: "REPORTER_BACKEND_UNAVAILABLE", message: "D1 DB is unavailable for opaque-reporter" },
+        { status: 503, headers: { "Retry-After": "1" } },
+      ),
+    });
+  } catch (error) {
+    caught = error;
+  }
+  assert.ok(caught instanceof ProductFeedbackConversationError);
+  assert.equal(caught.diagnostic.upstreamStatus, 503);
+  assert.equal(caught.diagnostic.upstreamCode, "REPORTER_BACKEND_UNAVAILABLE");
+  const serialized = JSON.stringify(productFeedbackConversationFailureLog("close", caught));
+  assert.match(serialized, /REPORTER_BACKEND_UNAVAILABLE/);
+  assert.doesNotMatch(serialized, /D1 DB is unavailable|opaque-reporter/);
 });
 
 test("close diagnostics distinguish upstream response, transport, and breaker-open failures", async () => {
@@ -622,6 +745,7 @@ test("close diagnostics distinguish upstream response, transport, and breaker-op
   assert.deepEqual(responseFailure.diagnostic, {
     stage: "upstream_response",
     upstreamStatus: 502,
+    upstreamCode: null,
     breakerFailures: 1,
     breakerOpen: false,
   });
@@ -631,6 +755,7 @@ test("close diagnostics distinguish upstream response, transport, and breaker-op
   assert.deepEqual(transportFailure.diagnostic, {
     stage: "upstream_transport",
     upstreamStatus: null,
+    upstreamCode: null,
     breakerFailures: 1,
     breakerOpen: false,
   });
@@ -649,6 +774,7 @@ test("close diagnostics distinguish upstream response, transport, and breaker-op
   assert.deepEqual(breakerFailure.diagnostic, {
     stage: "breaker_open",
     upstreamStatus: null,
+    upstreamCode: null,
     breakerFailures: 3,
     breakerOpen: true,
   });
@@ -689,4 +815,153 @@ test("attachment download does not call detail or mutate the authoritative read 
   assert.equal(result.metadata.size_bytes, 11);
   assert.equal(result.filename, "screen.png");
   result.abort();
+});
+
+// The route binding cached before each conversation call: a Hands 401 or 403
+// on the call drops it so the next request binds again; a 5xx or a timeout keeps it.
+const ROUTE_ROOT = Buffer.alloc(32, 7).toString("base64url");
+const BOUND_ENV = {
+  ...ENV,
+  HANDS_FEEDBACK_REPORTER_INTEGRATION_ID: INTEGRATION,
+  HANDS_FEEDBACK_ROUTE_SUBJECT_KEY_ID: "v1",
+  HANDS_FEEDBACK_ROUTE_SUBJECT_ROOT: ROUTE_ROOT,
+  HANDS_FEEDBACK_REPORTER_ID_SECRET: "reporter-id-secret",
+} as NodeJS.ProcessEnv;
+
+/** The root commitment row, already written: what the binding's one database check reads. */
+const committedRoot = {
+  insert: () => ({ values: () => ({ onConflictDoNothing: async () => undefined }) }),
+  select: () => ({
+    from: () => ({
+      where: async () => [{ commitment: productFeedbackRouteRootCommitment(ROUTE_ROOT, "hands-feedback-route-subject:v1") }],
+    }),
+  }),
+} as unknown as DatabaseExecutor;
+
+type HandsAnswer = number | "timeout";
+
+async function bindingPutsAround(
+  operation: "list" | "get",
+  answer: HandsAnswer,
+  env: NodeJS.ProcessEnv = BOUND_ENV,
+  failMint = false,
+): Promise<number> {
+  resetProductFeedbackBreakersForTest();
+  resetProductFeedbackReporterSessionCacheForTest();
+  resetProductFeedbackRouteBindingCacheForTest();
+  let puts = 0;
+  const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
+    const target = String(url);
+    if (init?.method === "PUT" && target.endsWith("/reporter-feedback/route-subject")) {
+      puts += 1;
+      return Response.json({ changed: false, subject_version: "v1" }, { status: 200 });
+    }
+    if (failMint && target.endsWith("/reporter-feedback/session")) return new Response("no", { status: answer as number });
+    if (answer === "timeout") throw new DOMException("The operation was aborted due to timeout", "TimeoutError");
+    return new Response("no", { status: answer });
+  }) as typeof fetch;
+  const bind = () => ensureProductFeedbackRouteBinding({ userId: USER, env, fetchImpl, executor: committedRoot });
+  const { reporterId } = await bind();
+  await bind();
+  assert.equal(puts, 1, "the binding is cached before the conversation call");
+  await assert.rejects(
+    operation === "list"
+      ? listProductFeedbackTickets({ userId: USER, reporterId, limit: 20, env, fetchImpl })
+      : getProductFeedbackTicket({ userId: USER, reporterId, ticketId: TICKET, commentLimit: 50, env, fetchImpl }),
+    ProductFeedbackConversationError,
+  );
+  await bind();
+  return puts;
+}
+
+test("a Hands 401 or 403 on a list or get drops the cached route binding", async () => {
+  for (const operation of ["list", "get"] as const) {
+    for (const status of [401, 403]) {
+      assert.equal(await bindingPutsAround(operation, status), 2, `${operation} ${status} binds again`);
+    }
+  }
+});
+
+test("a Hands 401 or 403 on the reporter session mint drops the cached route binding", async () => {
+  for (const status of [401, 403]) {
+    assert.equal(await bindingPutsAround("list", status, { ...BOUND_ENV, HANDS_FEEDBACK_CONVERSATION_SESSION_ENABLED: "true" }, true), 2);
+  }
+});
+
+test("a Hands 5xx or a timeout on a list or get keeps the cached route binding", async () => {
+  for (const operation of ["list", "get"] as const) {
+    for (const answer of [500, 503, "timeout"] as const) {
+      assert.equal(await bindingPutsAround(operation, answer), 1, `${operation} ${answer} keeps the binding`);
+    }
+  }
+});
+
+test("a Hands call carries the request's trace id as X-Trace-Id, and its span names the route without ids", async () => {
+  resetProductFeedbackBreakersForTest();
+  const { BasicTracer, MemoryTraceSink } = await import("@botiverse/raft-shared");
+  const { runWithTraceSpan } = await import("../tracing/semanticTrace");
+  const sink = new MemoryTraceSink();
+  const tracer = new BasicTracer({ sink });
+  const request = tracer.startSpan("server.http.request", { surface: "server", kind: "server" });
+  let sent: string | null = null;
+  await runWithTraceSpan(request, () => closeProductFeedbackTicket({
+    reporterId: "opaque-reporter",
+    ticketId: TICKET,
+    reason: "completed",
+    env: ENV,
+    fetchImpl: async (_url, init) => {
+      sent = new Headers(init?.headers).get("X-Trace-Id");
+      return Response.json({ id: TICKET, status: "closed", closure_reason: "completed", duplicate_of_ticket_id: null, updated_at: 1_700_000_000_030, changed: true });
+    },
+  }), tracer);
+  request.end("ok");
+  assert.equal(sent, request.context.traceId);
+  const span = sink.getAllSpans().find((s) => s.name === "server.product_feedback.hands_request");
+  assert.equal(span?.attrs?.hands_route, "/api/apps/:appId/reporter-feedback/:ticketId/close");
+  assert.doesNotMatch(JSON.stringify(span?.attrs), new RegExp(TICKET));
+});
+
+test("a background read marks nothing read, mints a session of its own outside the shared cache, and has no breaker", async () => {
+  resetProductFeedbackReporterSessionCacheForTest();
+  resetProductFeedbackBreakersForTest();
+  const now = 1_700_000_000_000;
+  let mints = 0;
+  let detailStatus = 200;
+  const detailUrls: URL[] = [];
+  const fetchImpl: typeof fetch = async (url, init) => {
+    if (String(url).endsWith("/reporter-feedback/session")) {
+      mints += 1;
+      return Response.json({
+        session_token: `hrps_v1_session-${mints}`,
+        expires_at: (now + 30_000) / 1_000,
+        reporter_integration_id: INTEGRATION,
+        scopes: ["feedback:comment", "feedback:read"],
+      }, { status: 201 });
+    }
+    if (String(url).includes("/reporter-feedback?")) return listResponse();
+    detailUrls.push(new URL(String(url)));
+    assert.match(new Headers(init?.headers).get("authorization") ?? "", /^Bearer hrps_v1_session-/);
+    if (detailStatus !== 200) return new Response("no", { status: detailStatus });
+    return Response.json({ ticket: ticket(), comments: [], attachments: [], next_comment_cursor: null, unread_total: 0 });
+  };
+  const background = () => getProductFeedbackTicket({
+    userId: USER, reporterId: "reporter-a-opaque", ticketId: TICKET, commentLimit: 100,
+    background: { signal: AbortSignal.timeout(5_000) }, env: SESSION_ENV, now: () => now, fetchImpl,
+  });
+  // A person's session is cached.
+  await listProductFeedbackTickets({ userId: USER, reporterId: "reporter-a-opaque", limit: 20, env: SESSION_ENV, now: () => now, fetchImpl });
+  assert.equal(mints, 1);
+  await background();
+  await background();
+  assert.equal(mints, 3, "each background read mints its own session, never from or into the cache");
+  assert.ok(detailUrls.every((url) => url.searchParams.get("mark_read") === "false"));
+  await listProductFeedbackTickets({ userId: USER, reporterId: "reporter-a-opaque", limit: 20, env: SESSION_ENV, now: () => now, fetchImpl });
+  assert.equal(mints, 3, "the person's cached session is still there");
+
+  // Background failures open no breaker, for people or for the job.
+  detailStatus = 503;
+  for (let index = 0; index < 5; index += 1) await assert.rejects(background(), ProductFeedbackConversationError);
+  detailStatus = 200;
+  await background();
+  await getProductFeedbackTicket({ userId: USER, reporterId: "reporter-a-opaque", ticketId: TICKET, commentLimit: 50, env: SESSION_ENV, now: () => now, fetchImpl });
 });

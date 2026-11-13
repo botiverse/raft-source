@@ -9,7 +9,7 @@ import { createServer } from "../services/serverService";
 import * as featureFlagService from "../services/featureFlagService";
 import { openTestApp } from "../test/integration/app";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 function hashSecret(value: string): string {
   return createHash("sha256").update(value).digest("hex");
@@ -18,7 +18,7 @@ function hashSecret(value: string): string {
 test("authorized operator identity still gets 404 for every removed feature-flag operator route", async () => {
   const authorityEnv = "FEATURE_FLAG_OPERATOR_PRINCIPAL_IDS";
   const previousAuthority = process.env[authorityEnv];
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const suffix = randomUUID();
     const [operator] = await getDb().insert(users).values({

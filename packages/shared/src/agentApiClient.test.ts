@@ -13,16 +13,19 @@ import type {
   AgentApiRawTransport,
   AgentApiRawTransportRequest,
 } from "./agentApiRawClient";
+import type { CoreAgentApiRouteKey } from "./agentApiContract";
+import { firstPartyAppAgentApiSamples } from "./apps/agentApiSamples";
 
 const raftbenchRunId = "00000000-0000-4000-8000-000000000001";
 const raftbenchCoverage = { from: "2026-10-17T00:00:00Z", to: "2026-10-18T00:00:00Z", fetchedMessages: 0, exhausted: true, stopReason: "window_end", notRead: ["Tool outcomes not read"] };
 const raftbenchContext = { runId: raftbenchRunId, revision: 1, sourceText: "Coverage: no synthetic source messages", sources: [], coverage: raftbenchCoverage, nextCursor: null };
 const raftbenchReport = { runId: raftbenchRunId, revision: 1, status: "complete", patterns: [], gaps: [] };
 const raftbenchReceipt = { runId: raftbenchRunId, revision: 1, status: "complete", receiptId: "00000000-0000-4000-8000-000000000002", coverage: raftbenchCoverage };
-const sdkFixtures: Record<AgentApiRouteKey, {
+const coreSdkFixtures: Record<CoreAgentApiRouteKey, {
   input: unknown[];
   response: unknown;
 }> = {
+  raftbenchFindings: { input: [{ limit: 5 }], response: { revision: 1, findings: [], total: 0, nextCursor: null, coverage: { historyFrom: null, scannedThroughAt: null, note: "Synthetic coverage" } } },
   raftbenchContext: { input: [{ runId: raftbenchRunId }], response: raftbenchContext },
   raftbenchSubmit: { input: [raftbenchReport], response: raftbenchReceipt },
   feedbackLocatorIngest: {
@@ -79,6 +82,8 @@ const sdkFixtures: Record<AgentApiRouteKey, {
       content: "# Index",
     },
   },
+  contextSearch: { input: [{ message_id: "0123abcd", query: "deploy" }], response: { ok: true, runtime: "claude", model: null, entryCount: 3, answer: { kind: "search", total: 0, matches: [] } } },
+  contextRead: { input: [{ message_id: "0123abcd", around: "m0.p0" }], response: { ok: true, runtime: "claude", model: null, entryCount: 3, answer: { kind: "read", found: false } } },
   knowledgeSearch: {
     input: [{
       query: "preview before merge",
@@ -153,6 +158,10 @@ const sdkFixtures: Record<AgentApiRouteKey, {
       timestamp: "2026-06-28T02:00:00.000Z",
     },
   },
+  messageCardUpdate: {
+    input: [{ messageId: asMessageId("msg-1") }, { card: { version: 1, root: "t", elements: { t: { type: "Text", props: { text: "Ready for testing" } } } }, expectedRevision: 1, idempotencyKey: "build-11900001-r2" }],
+    response: { ok: true, messageId: "msg-1", revision: 2, updatedAt: "2026-11-03T12:03:00.000Z", unnotifiedMentionHandles: [], notice: "Updating notifies no one. To tell someone, send a new message." },
+  },
   channelJoin: {
     input: [{ channelId: asChannelId("chan/with spaces") }],
     response: { ok: true },
@@ -207,6 +216,10 @@ const sdkFixtures: Record<AgentApiRouteKey, {
       channelId: "channel-1",
     },
   },
+  threadFollow: {
+    input: [{ thread: "#wg-raft-cli:abcd1234" }],
+    response: { ok: true, following: true, changed: true },
+  },
   threadUnfollow: {
     input: [{ thread: "#wg-raft-cli:abcd1234" }],
     response: { ok: true },
@@ -260,6 +273,78 @@ const sdkFixtures: Record<AgentApiRouteKey, {
       hasNewer: false,
     },
   },
+  assistantOwnerArtifact: {
+    input: [{ artifact: "https://app.raft.build/artifacts/pt_abc12345" }],
+    response: { owner: { userId: "33333333-3333-4333-8333-333333333333" }, artifact: { id: "pt_abc12345", url: "https://app.raft.build/artifacts/pt_abc12345", title: "Plan", description: null, home: { kind: "conversation", conversation: { id: "55555555-5555-4555-8555-555555555555", type: "channel", target: "#design" } }, author: { type: "user", name: "ada" }, version: 1, latestVersion: 1, commentCount: 0, position: 3, createdAt: "2026-11-12T00:00:00.000Z", updatedAt: "2026-11-12T00:00:00.000Z" }, versions: [], files: [{ path: "index.html", kind: "html", sizeBytes: 12, entry: true }], file: { kind: "text", path: "index.html", entry: true, contentType: "text/html", sizeBytes: 12, content: "<h1>Plan</h1>", truncated: false }, comments: { items: [], olderCursor: null, newestPosition: 3 } },
+  },
+  assistantOwnerArtifactPublish: {
+    input: [{ title: "Plan", files: [{ path: "index.html", content: "<h1>Plan</h1>" }] }],
+    response: { artifact: { id: "pt_abc12345", url: "https://app.raft.build/artifacts/pt_abc12345", version: 1, unchanged: false, homeConversationId: "55555555-5555-4555-8555-555555555555" } },
+  },
+  assistantOwnerActivity: {
+    input: [{ since: "2026-10-20T00:00:00.000Z" }],
+    response: { owner: { userId: "33333333-3333-4333-8333-333333333333" }, items: [], hasMore: false, nextSince: null },
+  },
+  assistantOwnerResolve: {
+    input: [{ name: "@ada" }],
+    response: { id: "88888888-8888-4888-8888-888888888888", type: "human", name: "ada" },
+  },
+  assistantCheckStateImport: {
+    input: [{ briefSent: "2026-10-20" }],
+    response: { briefToday: "due" },
+  },
+  assistantNotify: {
+    input: [{ check_id: "99999999-9999-4999-8999-999999999999", idempotency_key: "turn-1", items: [{ channelId: "55555555-5555-4555-8555-555555555555", summary: "@ada needs your OK" }] }],
+    response: { outcome: "sent", shown: 1, more: 0, dropped: [] },
+  },
+  assistantContactRules: {
+    input: [],
+    response: { rules: [{ id: "99999999-9999-4999-8999-999999999999", effect: "mute", subject: { kind: "dms" }, anytime: false, until: null, note: null, createdAt: "2026-10-21T00:00:00.000Z", line: "99999999 · mute your DMs" }], settings: { quiet: { from: "22:00", to: "08:00" }, brief: { at: "08:00" }, timezone: "UTC" }, lines: { quiet: "quiet 22:00-08:00 UTC", brief: "morning brief at 08:00 UTC", defaults: "By default…" } },
+  },
+  assistantContactRuleAdd: {
+    input: [{ effect: "mute", subject: "dms" }],
+    response: { rule: { id: "99999999-9999-4999-8999-999999999999", effect: "mute", subject: { kind: "dms" }, anytime: false, until: null, note: null, createdAt: "2026-10-21T00:00:00.000Z", line: "99999999 · mute your DMs" }, confirmation: "I won't tell you about your DMs anymore.", updated: false },
+  },
+  assistantContactRuleRemove: {
+    input: [{ ruleId: "99999999" }],
+    response: { confirmation: "Removed: mute your DMs." },
+  },
+  assistantContactSettings: {
+    input: [{ quiet: null }],
+    response: { settings: { quiet: null }, confirmation: "Quiet hours are off (UTC)." },
+  },
+  assistantOwnerSettings: {
+    input: [],
+    response: { settings: { theme: "space", storedTheme: "space", themeDecor: true, themeDecorShown: true, displayLanguage: "en", preferredTimezone: "Europe/Berlin" } },
+  },
+  assistantOwnerSettingsUpdate: {
+    input: [{ preferredTimezone: "Europe/Berlin" }],
+    response: { settings: { theme: "space", storedTheme: "space", themeDecor: true, themeDecorShown: true, displayLanguage: "en", preferredTimezone: "Europe/Berlin" }, changed: ["preferredTimezone"] },
+  },
+  assistantContactRulesImport: {
+    input: [{ rules: [] }],
+    response: { imported: 1, updated: 0, skipped: 0, legacy: 0 },
+  },
+  assistantToldRecord: {
+    input: [{ messageIds: ["77777777-7777-4777-8777-777777777777"], via: "notify" }],
+    response: { recorded: 1, skipped: 0 },
+  },
+  assistantToldList: {
+    input: [{ since: "2026-10-20T00:00:00.000Z" }],
+    response: { items: [], hasMore: false, nextCursor: null },
+  },
+  assistantSendAsOwner: {
+    input: [{ channelId: "55555555-5555-4555-8555-555555555555", content: "on it" }],
+    response: { messageId: "77777777-7777-4777-8777-777777777777", channelId: "55555555-5555-4555-8555-555555555555" },
+  },
+  assistantForwardAsOwner: {
+    input: [{ messages: ["77777777-7777-4777-8777-777777777777"], to: ["#design"], requestId: "99999999-9999-4999-8999-999999999999" }],
+    response: { results: [{ to: "#design", channelId: "55555555-5555-4555-8555-555555555555", status: "sent", messageId: "77777777-7777-4777-8777-777777777777" }] },
+  },
+  assistantSearchForwardTargets: {
+    input: [{ q: "des" }],
+    response: { targets: [{ label: "#design", to: "#design" }] },
+  },
   inboxList: {
     input: [{ view: "unread" }],
     response: {
@@ -278,6 +363,14 @@ const sdkFixtures: Record<AgentApiRouteKey, {
       nextBeforeSeq: null,
       totals: { conversations: 1, dms: 1, mentions: 0 },
     },
+  },
+  inboxRead: {
+    input: [{ target: "app:stamp/pr-13754", limit: 5 }],
+    response: { target: "app:stamp/pr-13754", kind: "app", entries: [{ id: "77777777-7777-4777-8777-777777777777", senderType: "third_party_app", senderName: "Stamp", content: "checks failed", mentioned: false }], unreadBefore: 3, remaining: 2, remainingCapped: false, consumed: false, nextCursor: null, app: { key: "stamp", name: "Stamp" }, related: { target: "#proj-workspace:#232" } },
+  },
+  inboxDismiss: {
+    input: [{ before: "2026-11-01" }],
+    response: { dismissed: 2, conversations: 1, appItems: 1, skippedNeedsAck: 1, earliestActivityAt: "2026-11-01T00:00:00.000Z", remaining: 0 },
   },
   agentContext: {
     input: [],
@@ -459,6 +552,48 @@ const sdkFixtures: Record<AgentApiRouteKey, {
       task: { taskNumber: 24, title: "Current title", description: null, revision: 2 },
       events: [],
     },
+  },
+  taskView: {
+    input: [{ channel: "#wg-raft-cli", task_number: 24 }],
+    response: {
+      taskRef: "#wg-raft-cli:#24",
+      task: { taskNumber: 24, status: "todo", title: "Current title", conversationAnchored: true },
+      following: true,
+      followReason: "authored",
+      conversation: { exists: true, replyCount: 0 },
+      sourceMessage: null,
+      earlierDiscussion: null,
+      recentMessages: [],
+      hasOlder: false,
+    },
+  },
+  taskFollowing: {
+    input: [{}],
+    response: { tasks: [{ taskRef: "#wg-raft-cli:#24", taskNumber: 24, title: "Current title", status: "todo", unread: 2, followedAt: "2026-08-05T00:00:00.000Z", reason: "authored" }] },
+  },
+  taskRead: {
+    input: [{ channel: "#wg-raft-cli", task_number: 24, after: "0" }],
+    response: { target: "#wg-raft-cli:#24", messages: [], has_more: false, has_older: false, has_newer: false },
+  },
+  taskReply: {
+    input: [{ channel: "#wg-raft-cli", task_number: 24, content: "on it", idempotencyKey: "k-1" }],
+    response: { ok: true, state: "sent", messageId: "11111111-1111-4111-8111-111111111111", messageSeq: 3 },
+  },
+  taskFollow: {
+    input: [{ channel: "#wg-raft-cli", task_number: 24 }],
+    response: { ok: true, taskRef: "#wg-raft-cli:#24", following: true, changed: true },
+  },
+  taskUnfollow: {
+    input: [{ channel: "#wg-raft-cli", task_number: 24, reason: "handed off" }],
+    response: { ok: true, taskRef: "#wg-raft-cli:#24", following: false, changed: true },
+  },
+  taskIdleNudge: {
+    input: [{ freshSession: false, backgroundTasks: 0 }],
+    response: { send: true, items: [{ ref: "#wg-raft-cli:#24", taskNumber: 24, channel: "#wg-raft-cli", title: "Current title", status: "todo", reason: "newly_assigned", why: "newly yours (assigned by @akko)" }], backlog: [], text: "[Raft task notice: 1 task is waiting on you.]" },
+  },
+  migrationRetry: {
+    input: [],
+    response: { migrationId: "11111111-1111-4111-8111-111111111111", supportRef: "mig_retry", targetMachineName: "studio-mac", note: "The source will stop you once you are idle, then move you." },
   },
   reminderList: {
     input: [{ status: "scheduled,fired" }],
@@ -836,6 +971,13 @@ const sdkFixtures: Record<AgentApiRouteKey, {
       metadata: { kind: "action-card" },
     },
   },
+  actionWithdraw: {
+    input: [{ messageId: "1a2b3c4d" }],
+    response: {
+      messageId: "msg-action-1",
+      metadata: { kind: "action-card" },
+    },
+  },
   attachmentUpload: {
     input: [],
     response: {
@@ -912,6 +1054,11 @@ const sdkFixtures: Record<AgentApiRouteKey, {
   pushWebhookDelete: { input: [], response: null },
   mentionsList: { input: [{ limit: "50" }], response: { mentions: [], has_more: false } },
 };
+/** Core's fixtures, then each app's samples (apps/agentApiSamples.ts). */
+const sdkFixtures: Record<AgentApiRouteKey, { input: unknown[]; response: unknown }> = {
+  ...coreSdkFixtures,
+  ...Object.fromEntries(Object.entries(firstPartyAppAgentApiSamples).map(([key, sample]) => [key, { input: sample.input, response: sample.response }])),
+} as Record<AgentApiRouteKey, { input: unknown[]; response: unknown }>;
 
 function _agentApiSdkPathParamBrandChecks(
   client: AgentApiClient,
@@ -1035,6 +1182,22 @@ test("SDK client returns discriminated errors for transport, HTTP, and validatio
     errorKind: "validation",
     reason: "response_contract_mismatch",
   });
+});
+
+test("the v1 messages.send refuses a card instead of dropping it, and points to the v2 send (RFC 082)", async () => {
+  let requests = 0;
+  const refused = await createAgentApiClient({
+    transport: {
+      request: async () => {
+        requests += 1;
+        return { ok: true, status: 200, error: null, data: { ok: true } };
+      },
+    },
+  }).messages.send({ target: "#wg-raft-cli", content: "hello", card: { version: 1, root: "root", elements: {} } } as never);
+  assert.equal(requests, 0, "nothing is sent");
+  assert.equal(refused.ok, false);
+  assert.equal(refused.ok ? null : refused.error.kind, "validation");
+  assert.match(refused.ok ? "" : refused.error.message, /sendV2.*raft\.messages\.send/);
 });
 
 test("SDK fetch transport applies typed auth, throttle, and retry without CLI profile state", async () => {

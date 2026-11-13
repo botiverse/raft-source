@@ -28,7 +28,7 @@ export type MessageSocketProjectionRow = Pick<MessageRow,
 
 export type MessageRealtimeTarget = {
   channelId: string;
-  channelType: "channel" | "private" | "joint" | "dm" | "thread";
+  channelType: "channel" | "private" | "joint" | "dm" | "thread" | "task";
   serverId: string;
 };
 

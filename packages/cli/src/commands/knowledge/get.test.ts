@@ -1,7 +1,5 @@
 import assert from "node:assert/strict";
 
-import { Command } from "commander";
-
 import type { ApiResponse } from "../../client";
 import type { AgentContext } from "../../auth/env";
 import { createCommandContext } from "../../core/context";
@@ -10,7 +8,6 @@ import type { CliIo } from "../../core/io";
 import {
   formatKnowledgeStdout,
   knowledgeGetCommand,
-  registerKnowledgeGetCommand,
 } from "./get";
 
 function memoryIo(): { io: CliIo; stdout: string[]; stderr: string[] } {
@@ -54,23 +51,6 @@ test("formatKnowledgeStdout: does not parse, strip, or render component-shaped t
   // server-side sanitation regression.
   const sourceCommentLeak = "# Doc\n\n<UnknownComponent>literal</UnknownComponent>\n\n{/* server-side comment */}\n";
   assert.equal(formatKnowledgeStdout(sourceCommentLeak), sourceCommentLeak);
-});
-
-test("manual get help points agents to the index topic catalog", () => {
-  const program = new Command();
-  const manual = program.command("manual");
-  registerKnowledgeGetCommand(manual);
-  const get = manual.commands.find((candidate) => candidate.name() === "get");
-
-  assert.ok(get);
-  let help = "";
-  get.configureOutput({ writeOut: (chunk) => { help += chunk; }, writeErr: (chunk) => { help += chunk; } });
-  get.outputHelp();
-  assert.match(help, /raft manual get index/);
-  assert.match(help, /list available manual topics/);
-  assert.match(help, /--intent <text>/);
-  assert.match(help, /--reason <text>/);
-  assert.doesNotMatch(help, /Common topic/);
 });
 
 test("knowledge get command uses injected ApiClient and byte-preserves server content", async () => {

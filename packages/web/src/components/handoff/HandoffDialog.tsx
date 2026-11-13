@@ -22,6 +22,7 @@ export default function HandoffDialog({ onClose }: { onClose: () => void }) {
       onClose={closeDialog}
       maxWidthClass="max-w-2xl"
       testId="handoff-dialog"
+      narrow="sheet"
     >
       <p className="mb-4 text-subhead text-foreground-muted">{formatMessage({ id: "handoff.dialog.subtitle" })}</p>
       <HandoffCreateFlow onClose={closeDialog} onStateChange={setFlowState} />

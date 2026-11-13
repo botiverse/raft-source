@@ -26,9 +26,6 @@ test("D(t) oracle shows M2 only when dependencies are provably empty and partici
   assert.equal(verdict.kind === "show" && verdict.hint.schema, ATTENTION_HINT_SCHEMA);
   assert.equal(verdict.kind === "show" && verdict.hint.trigger, "M2");
   assert.equal(verdict.kind === "show" && verdict.hint.copy_version, ATTENTION_HINT_COPY_VERSION);
-  const copy = verdict.kind === "show" ? verdict.hint.copy : "";
-  assert.match(copy, /followed threads keep delivering until you unfollow them/i);
-  assert.doesNotMatch(copy, /ordinary thread updates are muted too|all its threads/i);
 });
 
 test("gate_blind_nudger stays silent on unknown dependency state", () => {

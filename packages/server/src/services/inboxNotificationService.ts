@@ -16,10 +16,11 @@ import {
 } from "./inboxPolicyModel";
 import { isActivityPromotionSuppressedByMute } from "./inboxMutePolicy";
 import { addTraceEvent } from "../tracing/semanticTrace";
-import { enqueueMobilePushForInboxFacts } from "./pushService";
+import { enqueueNotificationsForFacts, type InboxFactNotificationContext } from "./notifications/enqueue";
 
 export type InboxNotificationReceiverType = "user" | "agent";
-export type InboxNotificationTargetKind = "channel" | "dm" | "thread";
+// `task`: a task conversation (task v2) — thread semantics, own display kind.
+export type InboxNotificationTargetKind = "channel" | "dm" | "thread" | "task";
 type InboxTraceDecisionState = "activity_promoted" | "activity_not_promoted";
 type InboxTraceDecisionReason = "eligible" | "muted" | "personal_mention_pierced" | "thread_independent" | "unfollowed_thread_ordinary";
 type InboxTraceRebuildState = "row_upserted" | "row_deleted" | "row_skipped";
@@ -76,8 +77,13 @@ function targetTraceJoinKey(target: InboxServingTarget) {
   return `${target.receiverType}:${target.receiverId}:${target.sourceChannelId}`;
 }
 
+/** Thread and task-conversation facts share the sub-conversation follow policy. */
+function isSubConversationFact(fact: Pick<InboxNotificationFactInput, "kind">): boolean {
+  return fact.kind === "thread" || fact.kind === "task";
+}
+
 function isSuppressedByUnfollowedThreadOrdinary(fact: InboxNotificationFactInput) {
-  return fact.kind === "thread"
+  return isSubConversationFact(fact)
     && fact.suppressionReason === "unfollowed_thread_ordinary"
     && fact.personalMention !== true;
 }
@@ -99,7 +105,7 @@ function traceInboxNotificationFactDecision(
   } else if (suppressedByUnfollowedThreadOrdinary) {
     reason = "unfollowed_thread_ordinary";
     negativeEvidenceBucket = "unfollowed_thread_not_muted_or_not_eligible";
-  } else if (fact.kind === "thread") {
+  } else if (isSubConversationFact(fact)) {
     reason = "thread_independent";
     negativeEvidenceBucket = "thread_follow_policy_not_evaluated";
   } else if (personalMention && muteFromSeq != null && fact.messageSeq >= muteFromSeq) {
@@ -344,12 +350,26 @@ function inboxFactInsertValues(fact: InboxNotificationFactInput): typeof inboxNo
   };
 }
 
+/**
+ * Record a send's inbox facts and, in the same transaction, its notification
+ * outbox rows (services/notifications/enqueue.ts): the facts that survive the
+ * mute / unfollowed-thread filters below are the one audience of every
+ * notification transport. `notification` describes the event (producer,
+ * mention-only public channel recipients); without it the facts notify as an
+ * ordinary message.
+ */
 export async function recordInboxNotificationFacts(
   facts: readonly InboxNotificationFactInput[],
   executor: DatabaseExecutor = getDb(),
+  notification?: InboxFactNotificationContext,
 ): Promise<number> {
-  if (facts.length === 0) return 0;
-  const muteStateCandidates = facts.filter((fact) => fact.kind !== "thread");
+  if (facts.length === 0) {
+    // Mention-only public channel recipients and a task's personal recipients
+    // have no fact but are notified.
+    if (notification) await enqueueNotificationsForFacts([], executor, notification);
+    return 0;
+  }
+  const muteStateCandidates = facts.filter((fact) => !isSubConversationFact(fact));
   let filteredFacts = facts;
   let muteByTarget = new Map<string, number | null>();
   if (muteStateCandidates.length > 0) {
@@ -366,6 +386,8 @@ export async function recordInboxNotificationFacts(
       .where(and(
         inArray(inboxTargetMuteStates.sourceChannelId, sourceChannelIds),
         inArray(inboxTargetMuteStates.receiverId, receiverIds),
+        // An assistant DM's row keeps it out of Activity, not off the phone.
+        eq(inboxTargetMuteStates.pushMuted, true),
       ));
     muteByTarget = new Map(muteRows.map((row) => [factTargetKey(row), row.muteFromSeq]));
   }
@@ -380,7 +402,10 @@ export async function recordInboxNotificationFacts(
     traceInboxNotificationFactDecision(fact, muteFromSeq, suppressedByMute);
     return !suppressedByMute && !isSuppressedByUnfollowedThreadOrdinary(fact);
   });
-  if (filteredFacts.length === 0) return 0;
+  if (filteredFacts.length === 0) {
+    if (notification) await enqueueNotificationsForFacts([], executor, notification);
+    return 0;
+  }
   const factsByIdentity = new Map<string, InboxNotificationFactInput>();
   for (const fact of filteredFacts) {
     const previous = factsByIdentity.get(factTraceJoinKey(fact));
@@ -449,7 +474,7 @@ export async function recordInboxNotificationFacts(
     }
   }
 
-  await enqueueMobilePushForInboxFacts(filteredFacts, executor);
+  await enqueueNotificationsForFacts(filteredFacts, executor, notification);
   // RFC 074 §2: ring the owner's assistant (if any) in this same transaction.
   await recordAssistantDoorbells(filteredFacts, executor);
   return filteredFacts.length;

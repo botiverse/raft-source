@@ -22,7 +22,7 @@ import { agents as agentsTable, attachments, attestedSendEvents, channelAgents, 
 import { createServer } from "../services/serverService";
 import { autoAssignMachine, createAgent } from "../services/agentService";
 import { AgentOrchestrator } from "../services/agentOrchestrator";
-import { createChannel, addAgent, addHuman, markAgentLegacyRead, getAgentLegacyReadCursor, getAgentUnreadCounts, getOrCreateThread, findOrCreateDM, removeAgent, listThreadChannelIdsForParentChannel, setInboxTargetActivityMuteState } from "../services/channelService";
+import { createChannel, addAgent, addHuman, markAgentLegacyRead, getAgentLegacyReadCursor, getAgentUnreadCounts, getOrCreateThread, findOrCreateDM, isChannelAgent, removeAgent, listThreadChannelIdsForParentChannel, setInboxTargetActivityMuteState } from "../services/channelService";
 import { broadcastAndDeliver, createMessage, __resetMessageServiceDepsForTests, __setExternalAgentInboxChainSelectorForTests, __setMessageServiceDepsForTests } from "../services/messageService";
 import { mintAgentCredential } from "../services/agentCredentialService";
 import { recordInboxNotificationFacts } from "../services/inboxNotificationService";
@@ -30,8 +30,9 @@ import * as attestedSendService from "../services/attestedSendService";
 import * as taskService from "../services/taskService";
 import { referenceAgentInboxChain } from "../test/agentInboxChainReference";
 import { withChannelDelivery } from "../test/orchestratorStub";
+import { insertAttachmentsWithObjects } from "../test/attachmentObjectFixture";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 type Fixture = {
   serverId: string;
@@ -89,6 +90,7 @@ async function seedFixture(): Promise<Fixture> {
     agentId: agent.id,
     scopes: ["send", "read"],
     name: "agent-api-send-test",
+    issuedVia: "computer",
     createdByUserId: null,
   });
 
@@ -450,7 +452,7 @@ test("agent-api idempotent replay returns the original only when target, content
 
     // A different ordered attachment set is the same conflict.
     const holder = await sendHumanMessage(fixture, "holds an attachment");
-    const [attachment] = await getDb().insert(attachments).values({
+    const [attachment] = await insertAttachmentsWithObjects(getDb(), {
       messageId: holder.id,
       channelId: fixture.channelId,
       uploaderId: fixture.agentId,
@@ -459,7 +461,7 @@ test("agent-api idempotent replay returns the original only when target, content
       mimeType: "text/plain",
       sizeBytes: 6,
       storageKey: `${fixture.serverId}/replay.txt`,
-    }).returning();
+    });
     const otherAttachments = await sendViaAgentApi(app.baseUrl, fixture, {
       ...request,
       idempotencyKey: `${request.idempotencyKey}-sendViaAgentApi`,
@@ -612,7 +614,8 @@ test("agent-api send checks the channel card only for a client that names the ve
     assert.equal(plain.body.state, "sent");
     assert.equal(plain.body.channelCard, undefined);
 
-    // Never seen in this context: held once, for the card alone, and nothing is posted.
+    // Never seen in this context, and nothing unread: sent, with the card in the
+    // reply (#wg-ax:#25). The card alone no longer holds the send.
     const before = await latestChannelMessages(fixture.channelId);
     const unseen = await sendViaAgentApiV2(app.baseUrl, fixture, {
       target,
@@ -621,12 +624,11 @@ test("agent-api send checks the channel card only for a client that names the ve
       seenCards: { channel: null },
     });
     assert.equal(unseen.status, 200);
-    assert.equal(unseen.body.state, "held");
-    assert.deepEqual(unseen.body.holdReasons, ["channel_card"]);
-    assert.equal(unseen.body.newMessageCount, 0);
+    assert.equal(unseen.body.state, "sent");
+    assert.equal(unseen.body.holdReasons, undefined);
     assert.deepEqual(unseen.body.channelCard, card);
     assert.equal(unseen.body.channelCardChanged, undefined);
-    assert.equal((await latestChannelMessages(fixture.channelId)).length, before.length);
+    assert.equal((await latestChannelMessages(fixture.channelId)).length, before.length + 1);
 
     // The current version: sent, no card.
     const seen = await sendViaAgentApiV2(app.baseUrl, fixture, {
@@ -673,8 +675,7 @@ test("agent-api send accepts the card version a history read returned, for the c
 
     const threadTarget = `#${fixture.channelName}:${parent.id.slice(0, 8)}`;
     const unseen = await sendViaAgentApiV2(app.baseUrl, fixture, { target: threadTarget, content: "in thread", seenUpToSeq: parent.seq, seenCards: { channel: null } });
-    assert.equal(unseen.body.state, "held");
-    assert.deepEqual(unseen.body.holdReasons, ["channel_card"]);
+    assert.equal(unseen.body.state, "sent", "the card alone no longer holds the send");
     assert.equal(unseen.body.channelCard?.id, fixture.channelId, "a thread carries its parent channel's card");
 
     const seen = await sendViaAgentApiV2(app.baseUrl, fixture, { target: threadTarget, content: "in thread", seenUpToSeq: parent.seq, seenCards: { channel: rev } });
@@ -774,8 +775,59 @@ test("agent-api send holds unread messages and an unseen channel card in one hol
     assert.equal(held.body.heldMessages?.[0]?.content, "news the agent has not seen");
 });
 
+test("freshness looks for the latest message only after the seen boundary; the hold, its context and the pass are unchanged", async ({ app }) => {
+    const fixture = await seedFixture();
+    const target = `#${fixture.channelName}`;
+    const human = await sendHumanMessage(fixture, "the one message someone else wrote");
+    // The agent writes most of the channel (#proj-o11y:#24).
+    let mine = await sendViaAgentApiV2(app.baseUrl, fixture, { target, content: "own 1", seenUpToSeq: human.seq });
+    for (const n of [2, 3, 4]) mine = await sendViaAgentApiV2(app.baseUrl, fixture, { target, content: `own ${n}`, seenUpToSeq: mine.body.messageSeq });
+    assert.equal(mine.body.state, "sent");
+
+    // Only its own messages after the boundary: sent, as before.
+    const ownOnly = await sendViaAgentApiV2(app.baseUrl, fixture, { target, content: "own only after", seenUpToSeq: human.seq });
+    assert.equal(ownOnly.body.state, "sent");
+
+    // A boundary past every message (a client overstating it): sent, as before (min(boundary, latest) passed).
+    const overstated = await sendViaAgentApiV2(app.baseUrl, fixture, { target, content: "overstated", seenUpToSeq: ownOnly.body.messageSeq + 1_000 });
+    assert.equal(overstated.body.state, "sent");
+    // Far beyond bigint (1e21 serializes as "1e+21"): still a pass, not a database error.
+    const absurd = await sendViaAgentApiV2(app.baseUrl, fixture, { target, content: "absurd boundary", seenUpToSeq: 1e21 });
+    assert.equal(absurd.status, 200);
+    assert.equal(absurd.body.state, "sent");
+
+    // Someone else wrote after the boundary: held with that message, as before.
+    await sendHumanMessage(fixture, "news after the boundary");
+    const held = await sendViaAgentApiV2(app.baseUrl, fixture, { target, content: "reply", seenUpToSeq: absurd.body.messageSeq });
+    assert.equal(held.body.state, "held");
+    assert.equal(held.body.newMessageCount, 1);
+    assert.equal(held.body.heldMessages?.[0]?.content, "news after the boundary");
+
+    // No boundary in the request: the unbounded search, held on the first message someone else wrote.
+    const noBoundary = await sendViaAgentApiV2(app.baseUrl, fixture, { target, content: "no boundary" });
+    assert.equal(noBoundary.body.state, "held");
+    assert.equal(noBoundary.body.newMessageCount, 2);
+});
+
+/** The agent leaves the fixture channel and joins it again itself (`raft channel join`). */
+async function selfJoinFixtureChannel(baseUrl: string, fixture: Fixture) {
+  await removeAgent(fixture.channelId, fixture.agentId);
+  const { apiKey } = await mintAgentCredential({
+    agentId: fixture.agentId,
+    scopes: ["send", "read", "channels"],
+    name: "agent-api-send-join",
+    issuedVia: "computer", createdByUserId: null,
+  });
+  const join = await fetch(`${baseUrl}/internal/agent-api/channels/${fixture.channelId}/join`, {
+    method: "POST",
+    headers: agentHeaders(apiKey),
+  });
+  assert.equal(join.status, 200, await join.clone().text());
+}
+
 test("agent-api channel first post returns recent-join drive-by attention once", async ({ app }) => {
     const fixture = await seedFixture();
+    await selfJoinFixtureChannel(app.baseUrl, fixture);
 
     const first = await sendViaAgentApi(app.baseUrl, fixture, {
       target: `#${fixture.channelName}`,
@@ -801,6 +853,21 @@ test("agent-api channel first post returns recent-join drive-by attention once",
     assert.equal(second.status, 200);
     assert.equal(second.body.state, "sent");
     assert.equal(second.body.attention, undefined);
+});
+
+test("agent-api channel first post: no join tip for an agent someone else added (it never joined to post)", async ({ app }) => {
+    // seedFixture adds the agent to the channel (as creating a channel with
+    // it does): a recent membership, no self-join.
+    const fixture = await seedFixture();
+
+    const first = await sendViaAgentApi(app.baseUrl, fixture, {
+      target: `#${fixture.channelName}`,
+      content: "first post of a member added by its owner",
+    });
+
+    assert.equal(first.status, 200);
+    assert.equal(first.body.state, "sent");
+    assert.equal(first.body.attention, undefined);
 });
 
 test("agent-api send returns sender-only pending mention actions on sent response", async ({ app }) => {
@@ -834,6 +901,52 @@ test("agent-api send returns sender-only pending mention actions on sent respons
     });
     assert.match(sent.body.pendingMentionActions[0].resolutionId, /^[0-9a-f-]{36}$/i);
     assert.match(sent.body.pendingMentionActions[0].expiresAt, /^\d{4}-\d{2}-\d{2}T/);
+});
+
+test("agent-api send names the agents it was delivered to: muted members only when @mentioned, never the sender", async ({ app }) => {
+    const fixture = await seedFixture();
+    const listener = await createAgent(fixture.serverId, "AgentApiDeliveredListener", { runtime: "external", model: "external" });
+    const muted = await createAgent(fixture.serverId, "AgentApiDeliveredMuted", { runtime: "external", model: "external" });
+    await addAgent(fixture.channelId, listener.id);
+    await addAgent(fixture.channelId, muted.id);
+    await setInboxTargetActivityMuteState({
+      receiverType: "agent",
+      receiverId: muted.id,
+      serverId: fixture.serverId,
+      sourceChannelId: fixture.channelId,
+      activityMuted: true,
+    });
+
+    const ordinary = await sendViaAgentApi(app.baseUrl, fixture, {
+      target: `#${fixture.channelName}`,
+      content: "an ordinary post",
+      seenUpToSeq: 0,
+    });
+    assert.equal(ordinary.status, 200);
+    assert.equal(ordinary.body.state, "sent");
+    assert.deepEqual(ordinary.body.deliveredToAgents, [listener.name]);
+
+    const mention = await sendViaAgentApi(app.baseUrl, fixture, {
+      target: `#${fixture.channelName}`,
+      content: `@${muted.name} please take a look`,
+      seenUpToSeq: ordinary.body.messageSeq,
+    });
+    assert.equal(mention.status, 200);
+    assert.deepEqual(mention.body.deliveredToAgents, [listener.name, muted.name].sort((a, b) => a.localeCompare(b)));
+});
+
+test("agent-api send returns an empty deliveredToAgents when the message reaches no other agent", async ({ app }) => {
+    const fixture = await seedFixture();
+
+    const sent = await sendViaAgentApi(app.baseUrl, fixture, {
+      target: `#${fixture.channelName}`,
+      content: "only the owner is here",
+      seenUpToSeq: 0,
+    });
+
+    assert.equal(sent.status, 200);
+    assert.equal(sent.body.state, "sent");
+    assert.deepEqual(sent.body.deliveredToAgents, []);
 });
 
 test("agent-api send cannot enumerate a hidden human directory through mention resolution", async ({ app }) => {
@@ -982,7 +1095,6 @@ test("agent-api send records route breakdown trace events", async ({ app }) => {
       "message_pipeline.frontend_emitted",
       "message_pipeline.sender_read_scheduled",
       "message_pipeline.agent_delivery.scheduled",
-      "message_pipeline.push_targets.built",
       "agent_api_send.commit.finished",
       "response.ready",
     ]) {
@@ -1240,7 +1352,7 @@ test("agent-api thread send: without a send-owned transaction, the deadlock is a
 test("agent-api send rejects attachment IDs already linked to another message", async ({ app }) => {
     const fixture = await seedFixture();
     const existingMessage = await sendHumanMessage(fixture, "message with original attachment");
-    const [attachment] = await getDb().insert(attachments).values({
+    const [attachment] = await insertAttachmentsWithObjects(getDb(), {
       messageId: existingMessage.id,
       channelId: fixture.channelId,
       uploaderId: fixture.agentId,
@@ -1249,7 +1361,7 @@ test("agent-api send rejects attachment IDs already linked to another message", 
       mimeType: "text/plain",
       sizeBytes: 12,
       storageKey: `${fixture.serverId}/already-linked.txt`,
-    }).returning();
+    });
 
     const sent = await sendViaAgentApi(app.baseUrl, fixture, {
       target: `#${fixture.channelName}`,
@@ -1327,6 +1439,7 @@ test("agent-api first reply to a channel thread requires parent channel membersh
       agentId: outsider.id,
       scopes: ["send", "read"],
       name: "agent-api-send-outsider-test",
+      issuedVia: "computer",
       createdByUserId: null,
     });
     const parent = await sendHumanMessage(fixture, "members only thread parent");
@@ -1339,7 +1452,7 @@ test("agent-api first reply to a channel thread requires parent channel membersh
     }, minted.apiKey);
 
     assert.equal(denied.status, 403);
-    assert.match(denied.body.error, /not a member of the parent channel/);
+    assert.match(denied.body.error, /aren't a member of its channel/);
 });
 
 test("agent-api thread target cloaks hidden private parent existence from non-member agents", async ({ app }) => {
@@ -1355,7 +1468,8 @@ test("agent-api thread target cloaks hidden private parent existence from non-me
     });
 
     assert.equal(denied.status, 404);
-    assert.match(denied.body.error, /Thread target not found or not replyable/);
+    assert.equal(denied.body.code, "target_not_found");
+    assert.match(denied.body.error, /^No thread you can reply in matches /);
 });
 
 test("agent-api first reply to a fresh DM thread creates the thread and sends", async ({ app }) => {
@@ -1398,8 +1512,9 @@ test("agent-api thread-target 404 explains unresolved reply target", async ({ ap
     });
 
     assert.equal(missing.status, 404);
-    assert.match(missing.body.error, /Thread target not found or not replyable/);
-    assert.match(missing.body.error, /parent message must exist/);
+    assert.equal(missing.body.code, "target_not_found");
+    assert.match(missing.body.error, /^No thread you can reply in matches /);
+    assert.match(missing.body.error, /that message must belong to the conversation named before it/);
 });
 
 test("agent-api send holds stale draft and returns inline held context", async ({ app }) => {
@@ -1680,6 +1795,33 @@ test("agent-api direct send without freshness boundary returns bounded first-tou
     const gate = events.find((event) => event.eventType === "gate_triggered");
     assert.equal(gate?.newMessageCount, 3);
     assert.equal((gate?.metadata as Record<string, unknown> | undefined)?.boundary_source, "none");
+});
+
+// One rule for agent-api sends and task writes (renderAgentFreshnessHold;
+// the legacy `/agent/:id/send` route keeps its own): a boundary of 0 with
+// nothing seen exactly proves nothing, so it holds like no boundary at all
+// (the bounded first-touch slice), not "5 unread" with 2 "skipped".
+test("agent-api send attesting seenUpToSeq 0 returns the same bounded first-touch context", async ({ app }) => {
+    const fixture = await seedFixture();
+    const history: Awaited<ReturnType<typeof sendHumanMessage>>[] = [];
+    for (let i = 0; i < 5; i += 1) {
+      history.push(await sendHumanMessage(fixture, `history message ${i + 1}`));
+    }
+
+    const held = await sendViaAgentApi(app.baseUrl, fixture, {
+      target: `#${fixture.channelName}`,
+      content: "agent-api draft attesting 0",
+      seenUpToSeq: 0,
+    });
+
+    assert.equal(held.body.state, "held");
+    assert.equal(held.body.newMessageCount, 3);
+    assert.equal(held.body.shownMessageCount, 3);
+    assert.equal(held.body.omittedMessageCount, 0);
+    assert.equal(held.body.seenUpToSeq, history[history.length - 1]!.seq);
+    const events = await getDb().select().from(attestedSendEvents);
+    const gate = events.find((event) => event.eventType === "gate_triggered");
+    assert.equal((gate?.metadata as Record<string, unknown> | undefined)?.boundary_source, "client_seen", "what was attested is recorded as before");
 });
 
 test("agent-api send-draft commits once seenUpToSeq reaches latest state", async ({ app }) => {
@@ -2518,7 +2660,7 @@ test("agent-api events and wake-hints require active follow plus current private
     assert.deepEqual(eventsBody.events?.map((event) => event.content), ["queued public event after private parent removal"]);
 });
 
-test("agent-api self-leave purges private channel inbox residue for parent and thread channels", async ({ app }) => {
+test("agent-api self-leave of a private channel as its last member: refused without deleteIfLast; with it, leaves and purges inbox residue for parent and thread channels", async ({ app }) => {
     const fixture = await seedFixture();
     const privateChannel = await createChannel(fixture.serverId, "agent-api-self-leave-private", "private surface", "private");
     await addAgent(privateChannel.id, fixture.agentId);
@@ -2528,6 +2670,7 @@ test("agent-api self-leave purges private channel inbox residue for parent and t
       agentId: fixture.agentId,
       scopes: ["channels"],
       name: "agent-api-channel-leave-test",
+      issuedVia: "computer",
       createdByUserId: null,
     });
     const purges: Array<{ agentId: string; channelIds: string[]; reason?: string }> = [];
@@ -2545,13 +2688,25 @@ test("agent-api self-leave purges private channel inbox residue for parent and t
       purges.push({ agentId, channelIds: [parentChannelId, ...threadChannelIds], reason });
     };
 
-    const res = await fetch(`${app.baseUrl}/internal/agent-api/channels/${privateChannel.id}/leave`, {
+    // The agent is the channel's last member: leaving would delete it, so without deleteIfLast nothing changes.
+    const refused = await fetch(`${app.baseUrl}/internal/agent-api/channels/${privateChannel.id}/leave`, {
       method: "POST",
       headers: agentHeaders(channelsCredential.apiKey),
     });
+    assert.equal(refused.status, 409);
+    assert.equal(((await refused.json()) as { code?: string }).code, "last_member_deletes_channel");
+    assert.equal(await isChannelAgent(privateChannel.id, fixture.agentId), true, "the refused leave changed nothing");
+    assert.deepEqual(purges, [], "nothing purged on a refused leave");
+
+    const res = await fetch(`${app.baseUrl}/internal/agent-api/channels/${privateChannel.id}/leave`, {
+      method: "POST",
+      headers: agentHeaders(channelsCredential.apiKey),
+      body: JSON.stringify({ deleteIfLast: true }),
+    });
     assert.equal(res.status, 200);
-    const body = await res.json() as { ok?: boolean; attention?: { stillArrives?: string[]; threadBoundary?: string; manageCommand?: string } };
+    const body = await res.json() as { ok?: boolean; channelDeleted?: boolean; attention?: { stillArrives?: string[]; threadBoundary?: string; manageCommand?: string } };
     assert.equal(body.ok, true);
+    assert.equal(body.channelDeleted, true);
     assert.ok(
       body.attention?.stillArrives?.some((line) => /followed threads still notify until you unfollow them/.test(line)),
       "self-leave should warn that public followed threads can still notify",
@@ -2595,6 +2750,7 @@ test("external agent delivery feeds /wake-hints via real deliverMessage and neve
       agentId: external.id,
       scopes: ["send", "read"],
       name: "ext-wake-test",
+      issuedVia: "computer",
       createdByUserId: null,
     });
 
@@ -2734,7 +2890,7 @@ test("held response carries true skipped count and the --before anchor, no debt 
  * join. Mutation-verified: reverting the cast turns it red.
  */
 test("agent-api thread hold renders with a resolved thread-top sender (uuid=text regression)", async () => {
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const fixture = await seedFixture();
     const parent = await sendHumanMessage(fixture, "please track delivery test coverage in this thread");
@@ -2771,7 +2927,7 @@ test("agent-api thread hold renders with a resolved thread-top sender (uuid=text
  * the thread-top sender resolved through the cast join.
  */
 test("agent-api DM-thread hold renders with a resolved thread-top sender (uuid=text regression)", async () => {
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const fixture = await seedFixture();
     const dm = await findOrCreateDM(fixture.serverId, fixture.ownerId, fixture.agentId);
@@ -3028,4 +3184,88 @@ test("agent-api held context on a joint channel uses the local projection name",
     channel_type: "channel",
     channel_name: local!.name,
   });
+});
+
+// A Free server's 30-day history window (services/historyWindow.ts): what it
+// hides can never be shown to the agent, so it is never unseen.
+test("agent-api send into a Free channel whose messages are all behind the history window is not held for them", async ({ app }) => {
+  const fixture = await seedFixture();
+  const old = await sendHumanMessage(fixture, "a decision from two months ago");
+  await getDb().execute(sql`UPDATE messages SET created_at = now() - interval '40 days' WHERE id = ${old.id}::uuid`);
+
+  const sent = await sendViaAgentApi(app.baseUrl, fixture, {
+    target: `#${fixture.channelName}`,
+    content: "first word here in a while",
+    seenUpToSeq: 0,
+  });
+  assert.equal(sent.status, 200, JSON.stringify(sent.body));
+  assert.equal(sent.body.state, "sent");
+
+  // A message inside the window is unseen as before.
+  await sendHumanMessage(fixture, "a new question");
+  const held = await sendViaAgentApi(app.baseUrl, fixture, {
+    target: `#${fixture.channelName}`,
+    content: "answer without reading",
+    seenUpToSeq: 0,
+  });
+  assert.equal(held.body.state, "held");
+  assert.deepEqual(held.body.heldMessages.map((message: { content?: string }) => message.content), ["a new question"]);
+});
+
+// Where seq does not follow created_at (an external projection keeps its
+// source's time, a replayed send its own), the window still goes by time.
+test("agent-api send is held for a recent message even when a message behind the window has a higher seq", async ({ app }) => {
+  const fixture = await seedFixture();
+  await sendHumanMessage(fixture, "a question from this morning");
+  const imported = await sendHumanMessage(fixture, "an imported message from two months ago");
+  await getDb().execute(sql`UPDATE messages SET created_at = now() - interval '40 days' WHERE id = ${imported.id}::uuid`);
+
+  const held = await sendViaAgentApi(app.baseUrl, fixture, {
+    target: `#${fixture.channelName}`,
+    content: "answer without reading",
+    seenUpToSeq: 0,
+  });
+  assert.equal(held.status, 200, JSON.stringify(held.body));
+  assert.equal(held.body.state, "held");
+  assert.deepEqual(held.body.heldMessages.map((message: { content?: string }) => message.content), ["a question from this morning"]);
+});
+
+test("agent-api send is not held by messages behind the window, whatever their seq order", async ({ app }) => {
+  const fixture = await seedFixture();
+  const older = await sendHumanMessage(fixture, "imported, from 40 days ago");
+  const oldest = await sendHumanMessage(fixture, "imported, from 50 days ago");
+  await getDb().execute(sql`UPDATE messages SET created_at = now() - interval '40 days' WHERE id = ${older.id}::uuid`);
+  await getDb().execute(sql`UPDATE messages SET created_at = now() - interval '50 days' WHERE id = ${oldest.id}::uuid`);
+
+  const sent = await sendViaAgentApi(app.baseUrl, fixture, {
+    target: `#${fixture.channelName}`,
+    content: "first word here in a while",
+    seenUpToSeq: 0,
+  });
+  assert.equal(sent.status, 200, JSON.stringify(sent.body));
+  assert.equal(sent.body.state, "sent");
+});
+
+test("agent-api thread hold leaves out a thread start behind the Free history window", async () => {
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
+  try {
+    const fixture = await seedFixture();
+    const parent = await sendHumanMessage(fixture, "the plan from two months ago");
+    await markAgentLegacyRead(fixture.agentId, fixture.channelId, parent.seq);
+    const thread = await getOrCreateThread(parent.id, fixture.ownerId, "user");
+    await getDb().execute(sql`UPDATE messages SET created_at = now() - interval '40 days' WHERE id = ${parent.id}::uuid`);
+    const reply = await createMessage(thread.id, "user", fixture.ownerId, "picking this back up today");
+
+    const held = await sendViaAgentApi(app.baseUrl, fixture, {
+      target: `#${fixture.channelName}:${parent.id.slice(0, 8)}`,
+      content: "stale thread reply",
+      seenUpToSeq: parent.seq,
+    });
+    assert.equal(held.status, 200, JSON.stringify(held.body));
+    assert.equal(held.body.state, "held");
+    assert.equal(held.body.heldMessages[0].id, reply.id);
+    assert.equal(held.body.threadParentMessage, undefined, "the thread start is behind the window");
+  } finally {
+    await app.close();
+  }
 });

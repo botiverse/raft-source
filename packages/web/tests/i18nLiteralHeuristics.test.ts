@@ -10,7 +10,7 @@ import {
   looksEnglish,
   looksLikeDisplayProse,
   templateLiteralResidue,
-} from "../scripts/i18n-literal-heuristics.mjs";
+} from "../scripts/i18n-literal-heuristics";
 
 test("looksEnglish skips CJK-mixed strings (half-migrated copy)", () => {
   // Pure CJK often fails later word checks too; mixed zh+en is the input where

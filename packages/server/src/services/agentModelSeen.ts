@@ -1,3 +1,4 @@
+import { isSubConversationType } from "@botiverse/raft-shared";
 import { and, asc, eq, gt, lte, ne, or } from "drizzle-orm";
 
 import { getDb } from "../db";
@@ -97,7 +98,7 @@ async function resolveStorageChannelId(
 ): Promise<string> {
   const channelId = channel.id;
   if (!serverId) return channelId;
-  if (channel.type === "thread") {
+  if (isSubConversationType(channel.type)) {
     const projection = await channelService.getJointThreadProjectionByLocalThread(channelId, serverId);
     return projection?.canonicalThreadChannelId ?? channelId;
   }

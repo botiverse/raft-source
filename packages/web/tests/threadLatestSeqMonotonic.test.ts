@@ -153,7 +153,7 @@ test("preserveNewerThreadActivity: newer seq wins even when replyCount is LOWER 
   // Incoming server row: genuinely newer seq but a LOWER replyCount.
   const incoming = thread({ latestActivityMessageId: "msg-true", latestActivitySeq: "10938105", replyCount: 3 });
 
-  const { items } = preserveNewerThreadActivity([incoming], [stale]);
+  const { items } = preserveNewerThreadActivity([incoming], [stale], false);
   assert.equal(items[0].latestActivityMessageId, "msg-true", "newer seq must win despite lower replyCount");
   assert.equal((items[0] as ThreadItem).latestActivitySeq, "10938105");
 });
@@ -162,7 +162,7 @@ test("preserveNewerThreadActivity: newer seq wins when replyCount is EQUAL too",
   const stale = thread({ latestActivityMessageId: "msg-stale", latestActivitySeq: "100", replyCount: 5 });
   rememberLocalThreadActivity(stale);
   const incoming = thread({ latestActivityMessageId: "msg-true", latestActivitySeq: "200", replyCount: 5 });
-  const { items } = preserveNewerThreadActivity([incoming], [stale]);
+  const { items } = preserveNewerThreadActivity([incoming], [stale], false);
   assert.equal(items[0].latestActivityMessageId, "msg-true");
 });
 
@@ -171,7 +171,7 @@ test("preserveNewerThreadActivity: older seq cannot overwrite newer (even with h
   rememberLocalThreadActivity(current);
   // An out-of-order old reply hydrated from the server: older seq, inflated replyCount.
   const incoming = thread({ latestActivityMessageId: "msg-old", latestActivitySeq: "10879336", replyCount: 99 });
-  const { items } = preserveNewerThreadActivity([incoming], [current]);
+  const { items } = preserveNewerThreadActivity([incoming], [current], false);
   assert.equal(items[0].latestActivityMessageId, "msg-new", "older seq must not overwrite newer");
   assert.equal((items[0] as ThreadItem).latestActivitySeq, "10938105");
 });
@@ -181,11 +181,11 @@ test("preserveNewerThreadActivity: same seq is idempotent (same message accepted
   rememberLocalThreadActivity(current);
   // Same seq + same messageId → accepted (no-op equivalent).
   const sameMsg = thread({ latestActivityMessageId: "msg-a", latestActivitySeq: "500", replyCount: 5 });
-  const r1 = preserveNewerThreadActivity([sameMsg], [current]);
+  const r1 = preserveNewerThreadActivity([sameMsg], [current], false);
   assert.equal(r1.items[0].latestActivityMessageId, "msg-a");
   // Same seq + different messageId → not newer → current preserved.
   const diffMsg = thread({ latestActivityMessageId: "msg-b", latestActivitySeq: "500", replyCount: 5 });
-  const r2 = preserveNewerThreadActivity([diffMsg], [current]);
+  const r2 = preserveNewerThreadActivity([diffMsg], [current], false);
   assert.equal(r2.items[0].latestActivityMessageId, "msg-a", "same seq with a different message must not replace current");
 });
 
@@ -195,7 +195,7 @@ test("preserveNewerThreadActivity: invalid incoming seq is fail-closed (does not
   // Incoming carries a non-canonical seq (leading zero) — must be treated as absent
   // and therefore must NOT win over the valid current seq.
   const incoming = thread({ latestActivityMessageId: "msg-bad", latestActivitySeq: "007", replyCount: 99 });
-  const { items } = preserveNewerThreadActivity([incoming], [current]);
+  const { items } = preserveNewerThreadActivity([incoming], [current], false);
   assert.equal(items[0].latestActivityMessageId, "msg-new", "invalid seq must be fail-closed, not parsed/guessed");
 });
 
@@ -206,7 +206,7 @@ test("preserveNewerThreadActivity: seq absent on BOTH sides is fail-closed (no r
   const current = thread({ latestActivityMessageId: "msg-a", latestActivitySeq: null, replyCount: 2 });
   rememberLocalThreadActivity(current);
   const higherCount = thread({ latestActivityMessageId: "msg-b", latestActivitySeq: null, replyCount: 5 });
-  const r1 = preserveNewerThreadActivity([higherCount], [current]);
+  const r1 = preserveNewerThreadActivity([higherCount], [current], false);
   assert.equal(r1.items[0].latestActivityMessageId, "msg-a", "both-seq-absent must fail closed, not use replyCount");
 });
 
@@ -216,7 +216,7 @@ test("preserveNewerThreadActivity: incoming has seq but local high-water lacks s
   const current = thread({ latestActivityMessageId: "msg-current", latestActivitySeq: null, replyCount: 5 });
   rememberLocalThreadActivity(current);
   const incoming = thread({ latestActivityMessageId: "msg-incoming", latestActivitySeq: "100", replyCount: 3 });
-  const { items } = preserveNewerThreadActivity([incoming], [current]);
+  const { items } = preserveNewerThreadActivity([incoming], [current], false);
   assert.equal(items[0].latestActivityMessageId, "msg-current", "local-seq-absent must fail closed even vs a valid incoming seq");
 });
 
@@ -226,7 +226,7 @@ test("preserveNewerThreadActivity: incoming lacks seq but local has seq -> fail-
   const current = thread({ latestActivityMessageId: "msg-current", latestActivitySeq: "100", replyCount: 5 });
   rememberLocalThreadActivity(current);
   const incoming = thread({ latestActivityMessageId: "msg-incoming", latestActivitySeq: null, replyCount: 99 });
-  const { items } = preserveNewerThreadActivity([incoming], [current]);
+  const { items } = preserveNewerThreadActivity([incoming], [current], false);
   assert.equal(items[0].latestActivityMessageId, "msg-current", "incoming-seq-absent must fail closed; replyCount must not veto");
 });
 
@@ -246,7 +246,7 @@ test("preserveNewerThreadActivity REVERSE FIXTURE: old-reply inflation then hydr
     latestActivitySeq: "10938105",
     replyCount: 6, // genuinely newer frontier, lower count
   });
-  const { items } = preserveNewerThreadActivity([trueNewer], [staleInflated]);
+  const { items } = preserveNewerThreadActivity([trueNewer], [staleInflated], false);
   assert.equal(items[0].latestActivityMessageId, "b11fe7af", "true newer seq must be restored");
   assert.equal((items[0] as ThreadItem).latestActivitySeq, "10938105");
 });

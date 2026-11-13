@@ -8,10 +8,10 @@ description: Vocabulary for the Raft app's visible surfaces — Left Rail, sideb
 Verified against:
 - packages/web/src/components/layout/MainLayout.tsx (rail + sidebar + panel structure)
 - packages/web/src/components/layout/LeftRail.tsx
-- packages/web/src/components/layout/Sidebar.tsx
-- packages/web/src/components/message/ChatPanel.tsx (panel header, composer, message list)
+- packages/web/src/features/sidebar/Sidebar.tsx
+- packages/web/src/features/channel/ChatPanel.tsx (panel header, composer, message list)
 - packages/web/src/components/ui/ServerSwitcherMenu.tsx (server switcher)
-- packages/web/src/components/thread/ThreadsInbox.tsx (Activity tab)
+- packages/web/src/features/thread/ThreadsInbox.tsx (Activity tab)
 @ verified against current staging head (re-verified during cohort review pass)
 */}
 

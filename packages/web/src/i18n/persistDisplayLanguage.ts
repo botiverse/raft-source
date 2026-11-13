@@ -3,7 +3,7 @@ import { useAuthStore } from "../store/authStore";
 import type { Locale } from "./locale";
 
 // Writeback half of the display_language loop. When called from the Settings
-// Save action, applies the chosen UI locale via `setLocale` (context +
+// display-language select (it applies at once), applies the chosen UI locale via `setLocale` (context +
 // localStorage), then persists it to the user's account and merges the server's
 // echo back so a subsequent read is consistent.
 //
@@ -20,8 +20,13 @@ import type { Locale } from "./locale";
 //     last. Serialization is per-principal, so a hung request for one user never
 //     blocks writes for another.
 //
-// A failed server write is non-fatal — the local switch already applied and
-// re-persists on the next change.
+// A failed server write does not undo the local switch here; the result tells
+// the caller, which decides (Settings puts the select back and says so).
+//   "saved"      the account holds `next`
+//   "local"      nobody is signed in: only this browser holds it
+//   "superseded" a newer selection was made while this one was in flight
+//   "failed"     the account write failed
+export type PersistDisplayLanguageResult = "saved" | "local" | "superseded" | "failed";
 
 // Per-principal monotonic intent counter and write chain. Keyed by user id;
 // module-level so concurrent calls coordinate.
@@ -31,14 +36,14 @@ const writeChainByPrincipal = new Map<string, Promise<void>>();
 export async function persistDisplayLanguage(
   next: Locale,
   setLocale: (locale: Locale) => void,
-): Promise<void> {
+): Promise<PersistDisplayLanguageResult> {
   // Optimistic local switch (context + storage) regardless of auth state.
   setLocale(next);
 
   const principalId = useAuthStore.getState().user?.id ?? null;
   // Not signed in → nothing to persist (PATCH /me requires auth). The local
   // switch stands and will persist once the user logs in and changes it.
-  if (principalId == null) return;
+  if (principalId == null) return "local";
 
   const myIntent = (latestIntentByPrincipal.get(principalId) ?? 0) + 1;
   latestIntentByPrincipal.set(principalId, myIntent);
@@ -46,18 +51,20 @@ export async function persistDisplayLanguage(
   const prior = writeChainByPrincipal.get(principalId) ?? Promise.resolve();
   const run = prior
     .catch(() => {})
-    .then(async () => {
+    .then(async (): Promise<PersistDisplayLanguageResult> => {
       try {
         const { data } = await api.patch("/auth/me", { displayLanguage: next });
         // Cross-principal guard: never publish into a different signed-in user.
-        if ((useAuthStore.getState().user?.id ?? null) !== principalId) return;
+        if ((useAuthStore.getState().user?.id ?? null) !== principalId) return "superseded";
         // Last-intent guard: a newer selection for this principal superseded us.
-        if (latestIntentByPrincipal.get(principalId) !== myIntent) return;
+        if (latestIntentByPrincipal.get(principalId) !== myIntent) return "superseded";
         useAuthStore.setState((state) => ({ user: state.user ? { ...state.user, ...data } : data }));
+        return "saved";
       } catch {
-        // Non-fatal: the local switch already applied; it re-persists on next change.
+        // The local switch stays; the caller is told so it can put it back.
+        return latestIntentByPrincipal.get(principalId) === myIntent ? "failed" : "superseded";
       }
     });
-  writeChainByPrincipal.set(principalId, run);
-  await run;
+  writeChainByPrincipal.set(principalId, run.then(() => undefined));
+  return run;
 }

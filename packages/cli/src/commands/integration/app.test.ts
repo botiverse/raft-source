@@ -839,6 +839,31 @@ test("integration app update JSON emits only the fixed mutation receipt", async 
   });
 });
 
+test("integration app update --client-key sends the new client id next to the App it names", async () => {
+  const { io, stdout } = memoryIo();
+  const requests: Array<{ path: string; body: unknown }> = [];
+  const ctx = createCommandContext({
+    io,
+    loadAgentContext: () => agentContext,
+    createApiClient: () => ({
+      request: async (_method: string, path: string, body?: unknown): Promise<ApiResponse<unknown>> => {
+        requests.push({ path, body });
+        return { ok: true, status: 200, error: null, data: { clientId: "client-1", clientKey: "demo-next", clientName: "Demo App", updatedFields: ["clientKey"] } };
+      },
+    }) as any,
+  });
+
+  await integrationAppUpdateCommand.handler(ctx, { client: "demo-app", clientKey: " demo-next " });
+
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0]!.path, "/internal/agent-api/integrations/app/update");
+  assert.deepEqual(
+    [(requests[0]!.body as { clientKey: string }).clientKey, (requests[0]!.body as { newClientKey: string }).newClientKey],
+    ["demo-app", "demo-next"],
+  );
+  assert.match(stdout.join(""), /demo-next\) updated: clientKey/);
+});
+
 test("integration app transfer-owner JSON emits a fixed audited no-op receipt", async () => {
   const { io, stdout } = memoryIo();
   const ctx = createCommandContext({
@@ -883,6 +908,16 @@ test("integration app transfer-owner JSON emits a fixed audited no-op receipt", 
 
 test("integration app distribution commands use the shared manage route without replaying share tokens", async () => {
   const { io, stdout } = memoryIo();
+  const shareLink = (action: string) => ({
+    id: "link-1",
+    targetServerSlug: "partner-team",
+    expiresAt: "2026-08-01T00:00:00.000Z",
+    revokedAt: action === "share_link_revoke" ? "2026-07-23T00:00:00.000Z" : null,
+    consumedAt: null,
+    lastUsedAt: null,
+    createdAt: "2026-07-23T00:00:00.000Z",
+    updatedAt: "2026-07-23T00:00:00.000Z",
+  });
   const requests: Array<{ method: string; path: string; body?: unknown }> = [];
   const ctx = createCommandContext({
     io,
@@ -907,25 +942,17 @@ test("integration app distribution commands use the shared manage route without 
             shareUrl: action === "share_link_create"
               ? "https://raft.example/integration-invites/raft_share_show_once"
               : undefined,
-            link: action.startsWith("share_link")
-              ? {
-                id: "link-1",
-                expiresAt: "2026-08-01T00:00:00.000Z",
-                revokedAt: action === "share_link_revoke" ? "2026-07-23T00:00:00.000Z" : null,
-                lastUsedAt: null,
-                createdAt: "2026-07-23T00:00:00.000Z",
-                updatedAt: "2026-07-23T00:00:00.000Z",
-              }
-              : undefined,
+            link: action.startsWith("share_link") ? shareLink(action) : undefined,
+            links: action === "share_link_get" || action === "share_link_revoke" ? [shareLink(action)] : undefined,
           },
         };
       },
     }) as any,
   });
 
-  await integrationAppShareLinkCreateCommand.handler(ctx, { client: "demo-app", expiresDays: "7" });
+  await integrationAppShareLinkCreateCommand.handler(ctx, { client: "demo-app", expiresDays: "7", targetServer: " partner-team " });
   await integrationAppShareLinkStatusCommand.handler(ctx, { client: "demo-app" });
-  await integrationAppShareLinkRevokeCommand.handler(ctx, { client: "demo-app" });
+  await integrationAppShareLinkRevokeCommand.handler(ctx, { client: "demo-app", targetServer: "partner-team" });
   await integrationAppRequestPublishCommand.handler(ctx, { client: "demo-app" });
   await integrationAppRequestUnpublishCommand.handler(ctx, { client: "demo-app" });
   await integrationAppClearLogoCommand.handler(ctx, { client: "demo-app" });
@@ -933,9 +960,9 @@ test("integration app distribution commands use the shared manage route without 
 
   assert.deepEqual(requests.map((request) => request.path), Array(7).fill("/internal/agent-api/integrations/app/manage"));
   assert.deepEqual(requests.map((request) => request.body), [
-    { clientKey: "demo-app", action: "share_link_create", expiresInDays: 7 },
+    { clientKey: "demo-app", action: "share_link_create", expiresInDays: 7, targetServerSlug: "partner-team" },
     { clientKey: "demo-app", action: "share_link_get", expiresInDays: undefined },
-    { clientKey: "demo-app", action: "share_link_revoke", expiresInDays: undefined },
+    { clientKey: "demo-app", action: "share_link_revoke", expiresInDays: undefined, targetServerSlug: "partner-team" },
     { clientKey: "demo-app", action: "request_publish", expiresInDays: undefined },
     { clientKey: "demo-app", action: "request_unpublish", expiresInDays: undefined },
     { clientKey: "demo-app", action: "clear_logo", expiresInDays: undefined },
@@ -944,7 +971,11 @@ test("integration app distribution commands use the shared manage route without 
   const rendered = stdout.join("");
   assert.match(rendered, /credential-like token/);
   assert.match(rendered, /https:\/\/raft\.example\/integration-invites\/raft_share_show_once/);
-  assert.match(rendered, /regenerate it to receive a usable URL/);
+  assert.match(rendered, /target server: partner-team/);
+  assert.match(rendered, /installs the app once, only on partner-team/);
+  assert.match(rendered, /one per target server:\n- partner-team: expires 2026-08-01T00:00:00.000Z/);
+  assert.match(rendered, /create a new link for that target to get a usable URL/);
+  assert.match(rendered, /Private share link revoked for Demo App \(demo-app\):\n- partner-team/);
   assert.match(rendered, /Marketplace review requested/);
   assert.match(rendered, /Marketplace removal requested/);
 });
@@ -971,9 +1002,32 @@ test("integration app share-link fails closed when the one-time URL is missing",
   });
 
   await assert.rejects(
-    async () => integrationAppShareLinkCreateCommand.handler(ctx, { client: "demo-app" }),
+    async () => integrationAppShareLinkCreateCommand.handler(ctx, { client: "demo-app", targetServer: "partner-team" }),
     /one-time private share URL/,
   );
+});
+
+test("integration app share-link needs --target-server before it contacts the server", async () => {
+  const { io } = memoryIo();
+  let requested = false;
+  const ctx = createCommandContext({
+    io,
+    loadAgentContext: () => agentContext,
+    createApiClient: () => ({
+      request: async (): Promise<ApiResponse<unknown>> => {
+        requested = true;
+        return { ok: true, status: 200, error: null, data: {} };
+      },
+    }) as any,
+  });
+
+  for (const targetServer of [undefined, "   "]) {
+    await assert.rejects(
+      async () => integrationAppShareLinkCreateCommand.handler(ctx, { client: "demo-app", targetServer }),
+      /--target-server is required/,
+    );
+  }
+  assert.equal(requested, false);
 });
 
 test("integration app logo uploads multipart bytes to the dedicated route", async () => {

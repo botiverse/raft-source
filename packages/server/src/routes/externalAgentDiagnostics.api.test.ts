@@ -16,7 +16,7 @@ import { createAgent } from "../services/agentService";
 import { mintAgentCredential, recordAgentCredentialUse } from "../services/agentCredentialService";
 import { __setAppWebhookEncryptionKeyForTests } from "../services/appWebhookConfigService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 __setAppWebhookEncryptionKeyForTests(Buffer.alloc(32, 7));
 
@@ -42,7 +42,7 @@ async function seed() {
   const server = await createServer("External Diagnostics", `ext-diag-${randomUUID().slice(0, 8)}`, owner.id);
   await getDb().insert(serverMembers).values({ serverId: server.id, userId: member.id, role: "member" });
   const external = await createAgent(server.id, `ExtDiag${randomUUID().slice(0, 6)}`, { runtime: "external", model: "external" });
-  const minted = await mintAgentCredential({ agentId: external.id, scopes: ["send", "read"], name: "ext-diag", createdByUserId: owner.id });
+  const minted = await mintAgentCredential({ agentId: external.id, scopes: ["send", "read"], name: "ext-diag", issuedVia: "human", createdByUserId: owner.id });
   return { owner, member, server, external, minted };
 }
 
@@ -129,6 +129,7 @@ test("external diagnostics: provider-backed agent reports provisioning and a gra
   assert.deepEqual(view.push, {
     registered: false, enabled: false, endpointHost: null, disabledReason: null, disabledAt: null,
     consecutiveFailures: 0, lastAttemptAt: null, lastDeliveryAt: null, lastError: null, nextAttemptAt: null,
+    probeStoppedAt: null, recovery: null,
   });
   assert.deepEqual(view.events, { lastCursorPullAt: null, pendingCursorAckCount: 0 });
   // The provider feature flag is off on this server: reported, not thrown.

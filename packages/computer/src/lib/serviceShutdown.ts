@@ -1,7 +1,17 @@
 import { currentTimeMs, setClockTimeout } from "@botiverse/raft-shared";
 import type { RunnerRecord } from "./runnerStateMachine";
 
-const SHUTDOWN_CHILD_WAIT_TIMEOUT_MS = 10_000;
+/**
+ * How long a stopping service waits for each runner before SIGKILL. A runner
+ * on SIGTERM stops its agents with the daemon's tree stop: up to 10 s grace,
+ * then SIGKILL and 5 s to confirm (AGENT_STOP_KILL_GRACE_MS +
+ * AGENT_STOP_KILL_CONFIRM_MS in packages/daemon/src/drivers/processStop.ts),
+ * agents in parallel. At 10 s the service cut that stop off halfway, so an
+ * agent's tree could outlive its runner. 18 s covers 15 s with margin and
+ * stays under launchd's default 20 s ExitTimeOut (Raft Desktop's launchd
+ * agent) and inside the installer's 45 s `raft-computer stop` budget.
+ */
+export const SHUTDOWN_CHILD_WAIT_TIMEOUT_MS = 18_000;
 
 export function evaluateShutdownBarrier(
   runners: Map<string, RunnerRecord>,

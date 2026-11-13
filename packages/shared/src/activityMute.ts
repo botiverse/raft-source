@@ -1,7 +1,7 @@
 /**
- * Canonical channel-type eligibility for human Activity mute.
+ * Canonical eligibility for human Activity mute.
  *
- * This predicate exists because server and web each carried their own copy and
+ * This module exists because server and web each carried their own copy and
  * they disagreed on exactly one type: `dm`. The server advertised
  * `activityMuteSupported: true` for every non-thread channel (so DMs claimed
  * support), while the web only ever renders the toggle for
@@ -11,9 +11,11 @@
  * `activityMuteSupported=true` while the DM DOM had zero `activity-mute-toggle`
  * nodes in both en and zh).
  *
- * Per-DM mute is documented as NOT a product feature — see
- * `manual/agent-knowledge/what-slock-doesnt-have.md` ("No per-DM mute. The
- * storage layer is per-target, but no user-reachable surface exposes it") and
+ * Per-DM mute exists only for a DM with an App bot (artin 2026-10-28,
+ * #proj-apps:6c85e2b5): a person can mute what an App posts to them, as they
+ * mute a channel. Every other DM (with a person or an ordinary agent) is still
+ * direct and cannot be muted — see
+ * `manual/agent-knowledge/what-raft-doesnt-have.md` and
  * `manual/agent-knowledge/notifications.md`. Storage being per-target is not a
  * feature; a capability claim has to be sourced from a reachable surface.
  *
@@ -31,9 +33,21 @@ export type ActivityMuteSupportedChannelType = (typeof ACTIVITY_MUTE_SUPPORTED_C
  * True when this channel type has a user-reachable Activity mute control.
  *
  * Deliberately excluded:
- * - `dm`    — no per-DM mute surface exists (see module doc).
+ * - `dm`    — only a DM with an App bot can be muted; see `activityMuteSupportedFor`.
  * - `thread` — threads inherit their parent channel's mute state.
  */
 export function channelTypeSupportsActivityMute(type: string | null | undefined): boolean {
   return (ACTIVITY_MUTE_SUPPORTED_CHANNEL_TYPES as readonly string[]).includes(type ?? "");
+}
+
+/**
+ * True when a person can Activity-mute this conversation: a channel type above,
+ * or a DM whose peer is an App bot that has not been removed.
+ */
+export function activityMuteSupportedFor(conversation: {
+  type: string | null | undefined;
+  dmPeerIsAppBot?: boolean;
+}): boolean {
+  if (conversation.type === "dm") return conversation.dmPeerIsAppBot === true;
+  return channelTypeSupportsActivityMute(conversation.type);
 }

@@ -1,0 +1,267 @@
+{
+  "protocolVersion": 3,
+  "runtimeId": "builtin",
+  "schemaVersion": "builtin-pi.create.v3",
+  "dataSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "providerId",
+      "model"
+    ],
+    "properties": {
+      "providerId": {
+        "type": "string",
+        "title": "Provider",
+        "minLength": 1,
+        "x-optionSource": "provider"
+      },
+      "apiKey": {
+        "type": "string",
+        "title": "API Key",
+        "minLength": 1,
+        "writeOnly": true
+      },
+      "baseUrl": {
+        "type": "string",
+        "title": "Base URL",
+        "minLength": 1,
+        "format": "uri"
+      },
+      "supportsImageInput": {
+        "type": "boolean",
+        "title": "Image input"
+      },
+      "loadLocalPlugins": {
+        "type": "boolean",
+        "title": "Load local Pi plugins"
+      },
+      "model": {
+        "type": "string",
+        "title": "Model",
+        "minLength": 1,
+        "x-optionSource": "model"
+      },
+      "envVars": {
+        "type": "object",
+        "title": "Environment Variables",
+        "additionalProperties": {
+          "type": "string"
+        }
+      },
+      "reasoningEffort": {
+        "type": "string",
+        "title": "Reasoning",
+        "x-optionSource": "reasoningEffort"
+      },
+      "contextWindow": {
+        "type": "string",
+        "title": "Context window (tokens)"
+      },
+      "maxOutputTokens": {
+        "type": "string",
+        "title": "Max output tokens"
+      }
+    },
+    "allOf": [
+      {
+        "if": {
+          "properties": {
+            "providerId": {
+              "pattern": "^connection:"
+            }
+          }
+        },
+        "else": {
+          "required": [
+            "apiKey"
+          ]
+        }
+      }
+    ]
+  },
+  "uiSchema": {
+    "order": [
+      "providerId",
+      "apiKey",
+      "baseUrl",
+      "supportsImageInput",
+      "model",
+      "reasoningEffort",
+      "contextWindow",
+      "maxOutputTokens",
+      "loadLocalPlugins",
+      "envVars"
+    ],
+    "layout": {
+      "advanced": [
+        "/contextWindow",
+        "/maxOutputTokens",
+        "/loadLocalPlugins",
+        "/envVars"
+      ]
+    },
+    "localization": {
+      "providerId": {
+        "label": "Provider",
+        "hint": "Built-in Pi is ready to use without local runtime setup. It uses the provider key entered here."
+      },
+      "apiKey": {
+        "label": "API Key",
+        "placeholder": "sk-..."
+      },
+      "baseUrl": {
+        "label": "Base URL",
+        "placeholder": "https://gateway.example.com/v1"
+      },
+      "supportsImageInput": {
+        "label": "Supports image input",
+        "hint": "Enable only when this gateway endpoint and model accept images."
+      },
+      "model": {
+        "label": "Model",
+        "placeholder": "Model ID",
+        "hint": "Use a model ID the selected provider supports."
+      },
+      "loadLocalPlugins": {
+        "label": "Load local Pi extensions",
+        "hint": "Load enabled Pi extensions installed on the computer running this agent. Applying changes restarts a running agent."
+      },
+      "envVars": {
+        "label": "Environment Variables",
+        "hint": "These will be injected into the runtime command environment."
+      },
+      "reasoningEffort": {
+        "label": "Reasoning"
+      },
+      "contextWindow": {
+        "label": "Context window (tokens)",
+        "placeholder": "200000",
+        "hint": "Optional. Overrides the model's context window. Leave empty to use the listed model's own value or Raft's default. A gateway can provide both limits automatically. [Learn more](https://docs.raft.build/developers/gateway-model-limits/)"
+      },
+      "maxOutputTokens": {
+        "label": "Max output tokens",
+        "placeholder": "8192",
+        "hint": "Optional. Overrides the most tokens the model may write in one reply. Leave empty to use the listed model's own value or Raft's default. A gateway can provide both limits automatically. [Learn more](https://docs.raft.build/developers/gateway-model-limits/)"
+      }
+    },
+    "rules": [
+      {
+        "scope": "#/properties/apiKey",
+        "effect": "HIDE",
+        "condition": {
+          "scope": "#/properties/providerId",
+          "schema": {
+            "pattern": "^connection:"
+          }
+        }
+      },
+      {
+        "scope": "#/properties/baseUrl",
+        "effect": "SHOW",
+        "condition": {
+          "scope": "#/properties/providerId",
+          "schema": {
+            "enum": [
+              "openai-compatible",
+              "anthropic-compatible"
+            ]
+          }
+        }
+      },
+      {
+        "scope": "#/properties/supportsImageInput",
+        "effect": "SHOW",
+        "condition": {
+          "scope": "#/properties/providerId",
+          "schema": {
+            "enum": [
+              "openai-compatible",
+              "anthropic-compatible"
+            ]
+          }
+        }
+      },
+      {
+        "scope": "#/properties/contextWindow",
+        "effect": "SHOW",
+        "condition": {
+          "scope": "#/properties/providerId",
+          "schema": {
+            "enum": [
+              "openai-compatible",
+              "anthropic-compatible",
+              "openrouter",
+              "connection:conn-gateway"
+            ]
+          }
+        }
+      },
+      {
+        "scope": "#/properties/maxOutputTokens",
+        "effect": "SHOW",
+        "condition": {
+          "scope": "#/properties/providerId",
+          "schema": {
+            "enum": [
+              "openai-compatible",
+              "anthropic-compatible",
+              "openrouter",
+              "connection:conn-gateway"
+            ]
+          }
+        }
+      }
+    ]
+  },
+  "capabilities": {
+    "providerKinds": [
+      "preset",
+      "gateway"
+    ],
+    "writeOnlyPointers": [
+      "/apiKey"
+    ],
+    "forbiddenPointers": [
+      "/hostUserState"
+    ]
+  },
+  "optionSources": {
+    "provider": {
+      "protocolVersion": 1,
+      "runtimeId": "builtin",
+      "schemaVersion": "builtin-pi.create.v3",
+      "sourceId": "provider",
+      "kind": "select",
+      "pointer": "/providerId"
+    },
+    "model": {
+      "protocolVersion": 1,
+      "runtimeId": "builtin",
+      "schemaVersion": "builtin-pi.create.v3",
+      "sourceId": "model",
+      "kind": "dependent_select",
+      "pointer": "/model",
+      "dependsOn": "/providerId"
+    },
+    "reasoningEffort": {
+      "kind": "select",
+      "sourceId": "reasoningEffort",
+      "pointer": "/reasoningEffort"
+    }
+  },
+  "writeOnlyKeepRequiresUnchanged": {
+    "/apiKey": [
+      "/providerId",
+      "/baseUrl"
+    ]
+  },
+  "values": {
+    "providerId": "connection:conn-off",
+    "model": "deepseek/deepseek-v4-pro",
+    "reasoningEffort": "",
+    "loadLocalPlugins": false,
+    "envVars": {}
+  },
+  "revision": "ff543db31eef547c8e5e2de8"
+}

@@ -268,6 +268,26 @@ export function serverHealthPath(slockHome: string, serverId: string): string {
   return path.join(serverDir(slockHome, serverId), "health.json");
 }
 
+/**
+ * The daemon machine-lock conflict the service last resolved for this runner
+ * by deferring to (or failing to verify) the lock's owner, so `start` can say
+ * so instead of waiting out its timeout (runnerLockConflict.ts).
+ */
+export function serverRunnerLockConflictPath(slockHome: string, serverId: string): string {
+  return path.join(serverDir(slockHome, serverId), "runner.lock-conflict.json");
+}
+
+/**
+ * One machine-lock conflict not yet relayed as telemetry: coarse facts only
+ * (no pid, no path). Whichever of this Computer's runners connects next
+ * claims it and emits `daemon.machine_lock.conflict` (runnerLockConflict.ts).
+ * Unlike the record above it survives the next spawn, so a Computer with a
+ * single server still reports once that runner gets through.
+ */
+export function serverRunnerLockConflictReportPath(slockHome: string, serverId: string): string {
+  return path.join(serverDir(slockHome, serverId), "runner.lock-conflict.report.json");
+}
+
 export function serverConnectedMarkerPath(slockHome: string, serverId: string): string {
   return path.join(serverDir(slockHome, serverId), "runner.connected");
 }
@@ -275,6 +295,39 @@ export function serverConnectedMarkerPath(slockHome: string, serverId: string): 
 /** The runner's latest memory sample (daemon processMemory.ts), shown by doctor. */
 export function serverRunnerMemoryPath(slockHome: string, serverId: string): string {
   return path.join(serverDir(slockHome, serverId), "runner.memory.json");
+}
+
+/** task #166: how many of this runner's agents are mid-turn (daemon turnActivitySnapshot.ts). */
+export function serverActivityPath(slockHome: string, serverId: string): string {
+  return path.join(serverDir(slockHome, serverId), "activity.json");
+}
+
+/** Reconciler step 13: service → runner, a web upgrade's drain request (shared computerUpgradeDrain.ts). */
+export const SERVER_UPGRADE_DRAIN_REQUEST_FILE = "upgrade-drain.json";
+
+export function serverUpgradeDrainRequestPath(slockHome: string, serverId: string): string {
+  return path.join(serverDir(slockHome, serverId), SERVER_UPGRADE_DRAIN_REQUEST_FILE);
+}
+
+/** Reconciler step 13: runner → service, how far the runner's drain is. */
+export function serverUpgradeDrainStatePath(slockHome: string, serverId: string): string {
+  return path.join(serverDir(slockHome, serverId), "upgrade-drain-state.json");
+}
+
+/**
+ * Raft Desktop's one-shot note after it moved this home from its embedded
+ * Computer to the official install (`{"from":"electron"}`; Desktop's
+ * computerPaths.ts migratedFromMarkerPath). Each runner's first ready says
+ * `migratedFrom: "electron"`; the file goes once every attached server has
+ * had it (migratedFromMarker.ts).
+ */
+export function migratedFromMarkerPath(slockHome: string): string {
+  return path.join(computerDir(slockHome), "migrated-from.json");
+}
+
+/** This server's runner has sent the note above (removed with it). */
+export function serverMigratedFromSentPath(slockHome: string, serverId: string): string {
+  return path.join(serverDir(slockHome, serverId), "migrated-from.sent");
 }
 
 export function serverRunnerStopIntentPath(slockHome: string, serverId: string): string {

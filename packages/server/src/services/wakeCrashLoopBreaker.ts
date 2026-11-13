@@ -29,6 +29,9 @@
  * store. Observation carrier: ids, classes, counts and times only.
  */
 import {
+  currentRandomUnit,
+  type CredentialInvalidReason,
+  isRuntimeAbsentStartFailure,
   NON_RETRYABLE_SPAWN_FAILURE_REASONS,
   RETRY_ONCE_SPAWN_FAILURE_REASONS,
   SPAWN_FAILURE_RETRY_ONCE_DELAY_MS,
@@ -46,6 +49,37 @@ export const WAKE_CRASH_LOOP_THRESHOLD = 3;
  * `applyWakeCrashLoopStartFailure`).
  */
 export const START_FAILURE_THRESHOLD = 5;
+/**
+ * A pause from start failures whose cause is usually outside the agent (a
+ * model queued or rate-limited for everyone) must not stay forever: after
+ * this cooldown one automatic wake may try again. A failed try re-pauses
+ * with the cooldown doubled, up to PAUSE_RETRY_MAX_MS; the runtime reaching
+ * readiness on that try lifts the pause.
+ */
+export const PAUSE_RETRY_BASE_MS = 30 * 60_000;
+export const PAUSE_RETRY_MAX_MS = 8 * 60 * 60_000;
+/**
+ * A provider outage pauses many agents at about the same moment; without
+ * spread their tries would stay aligned every round. Each try time is moved
+ * by up to ±10% of its cooldown. The stored cooldown stays exact, so the
+ * doubling stays 30m, 60m, … 8h; the jittered time may land up to 10% past
+ * 8h (not capped, so agents at the cap stay spread too).
+ */
+export const PAUSE_RETRY_JITTER_RATIO = 0.1;
+/** Start-failure reasons whose pause retries after a cooldown (see PAUSE_RETRY_BASE_MS). */
+export const PAUSE_RETRY_START_FAILURE_REASONS: readonly SpawnFailureReason[] = ["runtime_start_timeout", "runtime_repeated_failure"];
+/**
+ * Reconciler step 12 (#proj-raft-computer:#48, decision 3): start failures a
+ * runtime reports after it started, whose failures the daemon has already
+ * counted (the same error N times, N crashes in a row). The start's readiness
+ * reset this breaker's failed-start count, so counting them toward
+ * START_FAILURE_THRESHOLD would never reach it: they pause at the first
+ * report. A provider outage looks the same, so the pause retries by itself
+ * (PAUSE_RETRY_START_FAILURE_REASONS). `model_unsupported` and
+ * `session_needs_reset`, reported after a start too, pause at once anyway
+ * (NON_RETRYABLE_SPAWN_FAILURE_REASONS).
+ */
+export const DAEMON_COUNTED_START_FAILURE_REASONS: readonly SpawnFailureReason[] = ["runtime_repeated_failure"];
 
 export type WakeCrashLoopExitKind = WakeCrashLoopActivityDiagnostic["lastExitKind"];
 
@@ -147,7 +181,50 @@ export interface WakeCrashLoopEpisodeState {
    * next failure is reported again. Absent = null.
    */
   actionRequiredNotifiedFingerprint?: string | null;
+  /**
+   * A pause that retries by itself (PAUSE_RETRY_START_FAILURE_REASONS): from
+   * this time one automatic wake may start the agent. Absent = null (the
+   * pause waits for a person, as before).
+   */
+  pauseRetryAtMs?: number | null;
+  /** The cooldown that set `pauseRetryAtMs`; doubles on every try. Absent = null. */
+  pauseRetryCooldownMs?: number | null;
+  /** The start that is the current try; its readiness lifts the pause. Absent = null. */
+  pauseRetryLaunchId?: string | null;
+  /**
+   * Reconciler step 12: the try whose readiness lifted a self-retrying pause,
+   * and that try's cooldown. A runtime can fail only after it is ready (the
+   * same error again, a crash streak the daemon counted): when this same
+   * start then fails for a self-retrying reason, the pause comes back with
+   * that cooldown instead of starting over at PAUSE_RETRY_BASE_MS, so the
+   * tries keep doubling. Any later start forgets it. Absent = null.
+   */
+  pauseRetryReadyLaunchId?: string | null;
+  pauseRetryReadyCooldownMs?: number | null;
+  /**
+   * Reconciler step 12 follow-up: the owner was told that this
+   * `runtime_repeated_failure` pause's cooldown reached PAUSE_RETRY_MAX_MS
+   * (`pauseRetryCapNoticeDue`), written only after the notice was posted.
+   * Kept while the tries go on (also across a ready try that fails again,
+   * which comes back at the same cooldown); forgotten when the cooldown would
+   * start over: a later start outside the pause, a human start, a manual stop,
+   * a config change. Absent on older records (= not told).
+   */
+  pauseRetryCapNotified?: boolean;
 }
+
+/** The pause-retry fields of a state with no self-retrying pause. */
+const NO_PAUSE_RETRY = {
+  pauseRetryAtMs: null,
+  pauseRetryCooldownMs: null,
+  pauseRetryLaunchId: null,
+} as const satisfies Partial<WakeCrashLoopEpisodeState>;
+
+/** No ready try to come back to (see `pauseRetryReadyLaunchId`). */
+const NO_PAUSE_RETRY_READY = {
+  pauseRetryReadyLaunchId: null,
+  pauseRetryReadyCooldownMs: null,
+} as const satisfies Partial<WakeCrashLoopEpisodeState>;
 
 /** Token returned by `recordStart`; lets a failed dispatch roll the record back. */
 export interface WakeCrashLoopStartRecord {
@@ -196,6 +273,10 @@ export interface WakeCrashLoopRules {
   startFailureThreshold?: number;
   /** Default SPAWN_FAILURE_RETRY_ONCE_DELAY_MS. */
   retryOnceDelayMs?: number;
+  /** First cooldown of a self-retrying pause. Default PAUSE_RETRY_BASE_MS. */
+  pauseRetryBaseMs?: number;
+  /** Uniform [0, 1) source for the try-time jitter. Default `currentRandomUnit`; tests inject a fixed one. */
+  random?: () => number;
 }
 
 export const DEFAULT_WAKE_CRASH_LOOP_RULES: WakeCrashLoopRules = {
@@ -203,7 +284,29 @@ export const DEFAULT_WAKE_CRASH_LOOP_RULES: WakeCrashLoopRules = {
   threshold: WAKE_CRASH_LOOP_THRESHOLD,
   startFailureThreshold: START_FAILURE_THRESHOLD,
   retryOnceDelayMs: SPAWN_FAILURE_RETRY_ONCE_DELAY_MS,
+  pauseRetryBaseMs: PAUSE_RETRY_BASE_MS,
 };
+
+/** When a try is due: `cooldownMs` from now, moved by up to ±PAUSE_RETRY_JITTER_RATIO of it. */
+function jitteredPauseRetryAtMs(nowMs: number, cooldownMs: number, rules: WakeCrashLoopRules): number {
+  const unit = (rules.random ?? currentRandomUnit)();
+  return nowMs + Math.round(cooldownMs * (1 + PAUSE_RETRY_JITTER_RATIO * (2 * unit - 1)));
+}
+
+/** The pause retries by itself and its cooldown has run out: one automatic wake may try. */
+function isPauseRetryDue(state: WakeCrashLoopEpisodeState, nowMs: number): boolean {
+  const retryAtMs = state.pauseRetryAtMs ?? null;
+  return state.blocked && retryAtMs !== null && nowMs >= retryAtMs;
+}
+
+/**
+ * Whether automatic starts are refused now: blocked, unless the pause's
+ * cooldown has run out (then exactly the next start is its try, see
+ * `applyWakeCrashLoopStart`).
+ */
+export function wakeCrashLoopRefusesAutomaticStart(state: WakeCrashLoopEpisodeState, nowMs: number): boolean {
+  return state.blocked && !isPauseRetryDue(state, nowMs);
+}
 
 function hasStartFailureStreak(state: WakeCrashLoopEpisodeState): boolean {
   return (state.startFailureCount ?? 0) > 0 || (state.retryAfterMs ?? null) !== null;
@@ -236,6 +339,15 @@ export function applyWakeCrashLoopStart(
       catchupOwed: current.catchupOwed === true,
       actionRequiredNotifiedFingerprint: current.actionRequiredNotifiedFingerprint ?? null,
     };
+  } else if (!input.human && isPauseRetryDue(state, input.nowMs)) {
+    // This start is the pause's try. The next try is armed now, with the
+    // cooldown doubled, so a try that fails in any way (a typed failure, a
+    // crash, no report at all) leads to the next one; its readiness lifts
+    // the pause instead (`applyWakeCrashLoopStartSucceeded`).
+    const cooldownMs = Math.min(PAUSE_RETRY_MAX_MS, 2 * (state.pauseRetryCooldownMs ?? PAUSE_RETRY_BASE_MS));
+    state.pauseRetryCooldownMs = cooldownMs;
+    state.pauseRetryAtMs = jitteredPauseRetryAtMs(input.nowMs, cooldownMs, rules);
+    state.pauseRetryLaunchId = input.launchId;
   } else if (
     state.lastStartAtMs !== null
     && !state.lastStartCounted
@@ -248,6 +360,11 @@ export function applyWakeCrashLoopStart(
   state.lastStartAtMs = input.nowMs;
   state.lastStartLaunchId = input.launchId;
   state.lastStartCounted = false;
+  // A later start is not the ready try a pause could come back to.
+  Object.assign(state, NO_PAUSE_RETRY_READY);
+  // Outside a self-retrying pause the next one starts at the first cooldown
+  // again, so reaching the cap would be news again.
+  if (state.pauseRetryCapNotified === true && (state.pauseRetryCooldownMs ?? null) === null) state.pauseRetryCapNotified = false;
   // A new start supersedes any earlier carrier; the owed catch-up stays until delivered.
   state.catchupCarriedLaunchId = null;
   return state;
@@ -314,6 +431,12 @@ export type WakeCrashLoopStartFailureOutcome =
   | "retry_scheduled"
   /** Counted and automatic wakes are now blocked (needs the owner). */
   | "blocked"
+  /**
+   * A self-retrying pause's try failed for a reason outside
+   * PAUSE_RETRY_START_FAILURE_REASONS: the self-retry ends, the pause now
+   * waits for a person, with that reason.
+   */
+  | "pause_retry_ended"
   /** task #365: the RFC 071 breaker owns this start's failure: not counted here. */
   | "owned_by_terminal_breaker";
 
@@ -330,16 +453,37 @@ export type WakeCrashLoopStartFailureOutcome =
  *    `retryOnceDelayMs` so the server retries once after it;
  *  - any reason blocks once `startFailureThreshold` starts failed in a row.
  * A block keeps the last reason (`needsActionReason`) and owes the unread
- * catch-up to the start that follows it; so does a held retry.
+ * catch-up to the start that follows it; so does a held retry. A threshold
+ * block for a reason in PAUSE_RETRY_START_FAILURE_REASONS also arms its first
+ * automatic try after `pauseRetryBaseMs`. While blocked, failures are ignored,
+ * except one of a self-retrying pause's own try that only a person can fix
+ * (`startFailureNeedsPerson`): that ends the self-retry (`pause_retry_ended`).
+ * Any other failure of the try is just a failed try: the next one, already
+ * armed with the doubled cooldown, stands.
  */
 export function applyWakeCrashLoopStartFailure(
   current: WakeCrashLoopEpisodeState,
   input: { launchId: string | null; reason: string; lookupReason?: SpawnFailureLookupReason; nowMs: number },
   rules: WakeCrashLoopRules = DEFAULT_WAKE_CRASH_LOOP_RULES,
 ): { state: WakeCrashLoopEpisodeState; outcome: WakeCrashLoopStartFailureOutcome } {
-  if (current.blocked) return { state: current, outcome: "ignored" };
   if (input.launchId === null || input.launchId !== current.lastStartLaunchId) return { state: current, outcome: "ignored" };
   if ((current.startFailureOwnedLaunchId ?? null) === input.launchId) return { state: current, outcome: "owned_by_terminal_breaker" };
+  if (current.blocked) {
+    // `pauseRetryLaunchId` is cleared when a try ends the self-retry, so this
+    // applies once per try.
+    if ((current.pauseRetryLaunchId ?? null) !== input.launchId || !startFailureNeedsPerson(input.reason, input.lookupReason)) {
+      return { state: current, outcome: "ignored" };
+    }
+    return {
+      state: {
+        ...endPauseRetry(current, input.launchId, input.reason),
+        startFailureCount: (current.startFailureCount ?? 0) + 1,
+        lastStartFailureReason: input.reason,
+        lastStartFailureLaunchId: input.launchId,
+      },
+      outcome: "pause_retry_ended",
+    };
+  }
   if (current.lastStartFailureLaunchId === input.launchId) return { state: current, outcome: "ignored" };
   const previousCount = current.startFailureCount ?? 0;
   const count = previousCount + 1;
@@ -353,10 +497,19 @@ export function applyWakeCrashLoopStartFailure(
   const reason = input.reason as SpawnFailureReason;
   const retryOnce = RETRY_ONCE_SPAWN_FAILURE_REASONS.includes(reason);
   const block = NON_RETRYABLE_SPAWN_FAILURE_REASONS.includes(reason)
+    || DAEMON_COUNTED_START_FAILURE_REASONS.includes(reason)
     || isRuntimeAbsentStartFailure(reason, input.lookupReason)
     || (retryOnce && previousCount > 0 && current.lastStartFailureReason === input.reason)
     || count >= (rules.startFailureThreshold ?? START_FAILURE_THRESHOLD);
   if (block) {
+    // A try that was ready and then failed comes back with its own cooldown
+    // (already doubled when it started), not the first one.
+    const readyTryCooldownMs = (current.pauseRetryReadyLaunchId ?? null) === input.launchId
+      ? current.pauseRetryReadyCooldownMs ?? null
+      : null;
+    const pauseRetryCooldownMs = PAUSE_RETRY_START_FAILURE_REASONS.includes(reason)
+      ? readyTryCooldownMs ?? rules.pauseRetryBaseMs ?? PAUSE_RETRY_BASE_MS
+      : null;
     return {
       state: {
         ...counted,
@@ -366,6 +519,10 @@ export function applyWakeCrashLoopStartFailure(
         needsActionReason: input.reason,
         blockedByLaunchId: input.launchId,
         catchupOwed: true,
+        ...NO_PAUSE_RETRY_READY,
+        ...(pauseRetryCooldownMs === null
+          ? NO_PAUSE_RETRY
+          : { pauseRetryCooldownMs, pauseRetryAtMs: jitteredPauseRetryAtMs(input.nowMs, pauseRetryCooldownMs, rules), pauseRetryLaunchId: null }),
       },
       outcome: "blocked",
     };
@@ -380,12 +537,49 @@ export function applyWakeCrashLoopStartFailure(
 }
 
 /**
- * The computer does not have the agent's runtime (no CLI on PATH): retrying
- * cannot fix that, only installing it there or switching runtime. A lookup
- * that timed out or failed did not decide, so it counts like any failure.
+ * A failure of a self-retrying pause's try that only a person can fix (used
+ * only there; ordinary starts keep their own rules): a reason retrying cannot
+ * fix (NON_RETRYABLE_SPAWN_FAILURE_REASONS), a runtime confirmed missing on
+ * the computer, a malformed provider API key, a runtime version known not to
+ * work, or a retry-once reason (`model_not_found`). On an ordinary start the
+ * retry-once reason gets one retry a minute later in case the model list was
+ * momentarily empty; tries are at least 27 minutes apart, so here its first
+ * occurrence is already the confirmation. Transient reasons (the unclassified
+ * spawn failure, a credential mint or provider connection error, a proxy
+ * bind, an undecided runtime lookup) never end it.
  */
-export function isRuntimeAbsentStartFailure(reason: string, lookupReason: SpawnFailureLookupReason | undefined): boolean {
-  return reason === "runtime_not_found" && lookupReason !== "lookup_timed_out" && lookupReason !== "lookup_failed";
+export function startFailureNeedsPerson(reason: string, lookupReason: SpawnFailureLookupReason | undefined): boolean {
+  return NON_RETRYABLE_SPAWN_FAILURE_REASONS.includes(reason as SpawnFailureReason)
+    || RETRY_ONCE_SPAWN_FAILURE_REASONS.includes(reason as SpawnFailureReason)
+    || isRuntimeAbsentStartFailure(reason, lookupReason)
+    || reason === "provider_api_key_invalid"
+    || reason === "runtime_version_too_old";
+}
+
+/**
+ * Reconciler step 12 follow-up: a `runtime_repeated_failure` pause whose
+ * cooldown has reached PAUSE_RETRY_MAX_MS (its tries keep failing, now every
+ * 8 hours) and whose owner was not told yet. Asked after a failure report,
+ * so the try at the cap has failed; the caller posts the notice and then
+ * records it (`markPauseRetryCapNotified`).
+ */
+export function pauseRetryCapNoticeDue(state: WakeCrashLoopEpisodeState): boolean {
+  return state.blocked
+    && state.needsActionReason === "runtime_repeated_failure"
+    && (state.pauseRetryAtMs ?? null) !== null
+    && state.pauseRetryCooldownMs === PAUSE_RETRY_MAX_MS
+    && state.pauseRetryCapNotified !== true;
+}
+
+/** A self-retrying pause's try hit something only a person can fix: stop trying, keep the pause, with that reason. */
+function endPauseRetry(current: WakeCrashLoopEpisodeState, launchId: string, reason: string): WakeCrashLoopEpisodeState {
+  return {
+    ...current,
+    ...NO_PAUSE_RETRY,
+    lastLaunchId: launchId,
+    needsActionReason: reason,
+    blockedByLaunchId: launchId,
+  };
 }
 
 /**
@@ -421,13 +615,52 @@ export function applyWakeCrashLoopStartFailureOwned(
     state.blockedAtMs = null;
     state.needsActionReason = null;
     state.blockedByLaunchId = null;
+    Object.assign(state, NO_PAUSE_RETRY);
   }
   return { state, changed: true, withdrawn: true, unblocked };
 }
 
+/** Block reasons a sign-in fixes: a runtime error's `user_reauth`, a start failure's `runtime_login_required`. */
+const AUTH_CLASS_BLOCK_REASONS: ReadonlySet<string> = new Set(["user_reauth", "runtime_login_required"]);
+
+/**
+ * #proj-raft-computer:#48 (step 4b): the block reasons a restored credential
+ * reason lifts. A restored `user_reauth` proves a working sign-in for the
+ * runtime, which is also what a start's `runtime_login_required` waits for;
+ * a billing balance or a model's plan access restored lifts only its own.
+ */
+const CREDENTIAL_RESTORED_LIFTS: Readonly<Record<CredentialInvalidReason, ReadonlySet<string>>> = {
+  // Reconciler step 12: a working sign-in may be another account, whose plan
+  // may have the model (a start's `model_unsupported`).
+  user_reauth: new Set([...AUTH_CLASS_BLOCK_REASONS, "model_unsupported"]),
+  user_model_access: new Set(["user_model_access", "model_unsupported"]),
+  billing: new Set(["billing"]),
+};
+
+/**
+ * Block reasons a web login or provider connect for the agent's runtime
+ * lifts (`liftForCredentialsChange`): the sign-in ones, and (reconciler step
+ * 12) `model_unsupported`, since a new key or plan may have the model.
+ */
+const CREDENTIALS_CHANGE_LIFTS: ReadonlySet<string> = new Set([...AUTH_CLASS_BLOCK_REASONS, "model_unsupported"]);
+
+/**
+ * What lifts a credentials change: `credentials_change` (a web login or
+ * provider connect: `CREDENTIALS_CHANGE_LIFTS`), or `sign_in` (reconciler
+ * step 15, a terminal sign-in seen on disk: the sign-in blocks only, since a
+ * changed file may be a token refresh of the same account and plan).
+ */
+export type CredentialsChangeLiftScope = "credentials_change" | "sign_in";
+const CREDENTIALS_CHANGE_LIFTS_BY_SCOPE: Readonly<Record<CredentialsChangeLiftScope, ReadonlySet<string>>> = {
+  credentials_change: CREDENTIALS_CHANGE_LIFTS,
+  sign_in: AUTH_CLASS_BLOCK_REASONS,
+};
+
 export type WakeCrashLoopActionRequiredOutcome =
   /** Not the current start's error, or no start recorded: no change. */
   | "ignored"
+  /** The error came from a self-retrying pause's try: the self-retry ends, the pause takes this reason. */
+  | "pause_retry_ended"
   /** Already blocked: nothing new to hold. */
   | "already_blocked"
   /** Automatic wakes are now blocked until the owner acts. */
@@ -449,8 +682,13 @@ export function applyWakeCrashLoopActionRequired(
   if (input.launchId === null || input.launchId !== current.lastStartLaunchId) {
     return { state: current, outcome: "ignored", notify: false };
   }
-  if (current.blocked) return { state: current, outcome: "already_blocked", notify: false };
   const notify = (current.actionRequiredNotifiedFingerprint ?? null) !== input.fingerprint;
+  // A runtime that needs a login or a model fix during a self-retrying
+  // pause's try (Codex, Grok: before any output) ends the self-retry.
+  if (current.blocked && (current.pauseRetryLaunchId ?? null) === input.launchId) {
+    return { state: endPauseRetry(current, input.launchId, input.reason), outcome: "pause_retry_ended", notify };
+  }
+  if (current.blocked) return { state: current, outcome: "already_blocked", notify: false };
   return {
     state: {
       ...current,
@@ -466,13 +704,36 @@ export function applyWakeCrashLoopActionRequired(
   };
 }
 
-/** A start reported its runtime active: the failed-start streak is over. */
+/**
+ * A start made real progress: its runtime reached startup readiness (or, from
+ * a daemon without DAEMON_CAPABILITY_STARTUP_READINESS, reported active). The
+ * failed-start streak is over, and when this start was a self-retrying
+ * pause's try, so is the pause.
+ */
 export function applyWakeCrashLoopStartSucceeded(
   current: WakeCrashLoopEpisodeState,
   launchId: string,
-): { state: WakeCrashLoopEpisodeState; changed: boolean } {
-  if (current.lastStartLaunchId !== launchId || !hasStartFailureStreak(current)) return { state: current, changed: false };
-  return { state: { ...current, ...NO_START_FAILURE_STREAK }, changed: true };
+): { state: WakeCrashLoopEpisodeState; changed: boolean; unpaused: boolean } {
+  if (current.lastStartLaunchId !== launchId) return { state: current, changed: false, unpaused: false };
+  if (current.blocked && (current.pauseRetryLaunchId ?? null) === launchId) {
+    return {
+      state: {
+        ...current,
+        ...NO_START_FAILURE_STREAK,
+        ...NO_PAUSE_RETRY,
+        pauseRetryReadyLaunchId: launchId,
+        pauseRetryReadyCooldownMs: current.pauseRetryCooldownMs ?? null,
+        blocked: false,
+        blockedAtMs: null,
+        needsActionReason: null,
+        blockedByLaunchId: null,
+      },
+      changed: true,
+      unpaused: true,
+    };
+  }
+  if (!hasStartFailureStreak(current)) return { state: current, changed: false, unpaused: false };
+  return { state: { ...current, ...NO_START_FAILURE_STREAK }, changed: true, unpaused: false };
 }
 
 export type WakeCrashLoopAutomaticWakeHold =
@@ -481,7 +742,8 @@ export type WakeCrashLoopAutomaticWakeHold =
 
 /** Why an automatic wake may not start now, or null when it may. Human starts ignore this. */
 export function wakeCrashLoopAutomaticWakeHold(state: WakeCrashLoopEpisodeState, nowMs: number): WakeCrashLoopAutomaticWakeHold | null {
-  if (state.blocked) return { kind: "blocked", reason: state.needsActionReason ?? null };
+  if (wakeCrashLoopRefusesAutomaticStart(state, nowMs)) return { kind: "blocked", reason: state.needsActionReason ?? null };
+  if (state.blocked) return null;
   const retryAfterMs = state.retryAfterMs ?? null;
   if (retryAfterMs !== null && nowMs < retryAfterMs) return { kind: "retry_pending", retryAfterMs };
   return null;
@@ -590,6 +852,9 @@ export class WakeCrashLoopBreaker {
       threshold: options.threshold ?? WAKE_CRASH_LOOP_THRESHOLD,
       startFailureThreshold: options.startFailureThreshold ?? START_FAILURE_THRESHOLD,
       retryOnceDelayMs: options.retryOnceDelayMs ?? SPAWN_FAILURE_RETRY_ONCE_DELAY_MS,
+      // Capped like every later cooldown, so the sequence never shrinks.
+      pauseRetryBaseMs: Math.min(PAUSE_RETRY_MAX_MS, options.pauseRetryBaseMs ?? PAUSE_RETRY_BASE_MS),
+      random: options.random ?? currentRandomUnit,
     };
   }
 
@@ -627,6 +892,12 @@ export class WakeCrashLoopBreaker {
     return wakeCrashLoopAutomaticWakeHold((await this.read(agentId)).state, nowMs);
   }
 
+  /** When a self-retrying pause next tries, or null when the agent is not in one. */
+  async pauseRetryAtMs(agentId: string): Promise<number | null> {
+    const { state } = await this.read(agentId);
+    return state.blocked ? state.pauseRetryAtMs ?? null : null;
+  }
+
   /** task #1221: does the next start owe the unread catch-up (see `catchupOwed`)? */
   async isCatchupOwed(agentId: string): Promise<boolean> {
     return (await this.read(agentId)).state.catchupOwed === true;
@@ -637,6 +908,19 @@ export class WakeCrashLoopBreaker {
     await this.mutate(agentId, (state) => state.catchupOwed === true && state.lastStartLaunchId === launchId
       ? { state: { ...state, catchupCarriedLaunchId: launchId }, result: undefined, write: true }
       : { state, result: undefined, write: false });
+  }
+
+  /**
+   * task #1221: the catch-up a start built found nothing unread (the agent
+   * read the owed messages some other way, e.g. `raft message check` from a
+   * start that did not carry them): nothing is owed any more, so clear it.
+   * Otherwise the flag would outlive its messages and keep folding wakes into
+   * catch-ups until some start carried an unread message.
+   */
+  async clearCatchupOwedNothingUnread(agentId: string): Promise<boolean> {
+    return this.mutate(agentId, (state) => state.catchupOwed === true
+      ? { state: { ...state, catchupOwed: false, catchupCarriedLaunchId: null }, result: true, write: true }
+      : { state, result: false, write: false });
   }
 
   /**
@@ -679,10 +963,11 @@ export class WakeCrashLoopBreaker {
     });
   }
 
-  async recordManualStop(agentId: string): Promise<void> {
-    await this.mutate(agentId, (state) => ({
+  /** Returns the block the stop lifted (its reason), for the trace: a manual stop lifts any block. */
+  async recordManualStop(agentId: string): Promise<{ liftedBlock: { reason: string | null } | null }> {
+    return this.mutate(agentId, (state) => ({
       state: applyWakeCrashLoopManualStop(state),
-      result: undefined,
+      result: { liftedBlock: state.blocked ? { reason: state.needsActionReason ?? null } : null },
       write: true,
     }));
   }
@@ -710,22 +995,49 @@ export class WakeCrashLoopBreaker {
    */
   async recordStartFailure(
     agentId: string,
-    input: { launchId: string | null; reason: string; lookupReason?: SpawnFailureLookupReason; nowMs: number; noticeFingerprint?: string },
-  ): Promise<{ outcome: WakeCrashLoopStartFailureOutcome; blocked: boolean; startFailureCount: number; retryAfterMs: number | null; notify: boolean }> {
+    input: {
+      launchId: string | null;
+      reason: string;
+      lookupReason?: SpawnFailureLookupReason;
+      nowMs: number;
+      noticeFingerprint?: string;
+      /** Whether a plain block tells the owner (default true); an ended self-retry always does. */
+      noticeOnBlock?: boolean;
+    },
+  ): Promise<{
+    outcome: WakeCrashLoopStartFailureOutcome;
+    blocked: boolean;
+    startFailureCount: number;
+    retryAfterMs: number | null;
+    pauseRetryAtMs: number | null;
+    /** The pause reason before this failure (for `pause_retry_ended`, the self-retrying one). */
+    previousPauseReason: string | null;
+    notify: boolean;
+    /** This failure would tell the owner, who was already told about the same fingerprint, so `notify` is false. */
+    alreadyNotified: boolean;
+    /** See `pauseRetryCapNoticeDue`, on the resulting state. */
+    pauseRetryCapNoticeDue: boolean;
+  }> {
     return this.mutate(agentId, (state) => {
       const applied = applyWakeCrashLoopStartFailure(state, input, this.rules);
+      const tells = applied.outcome === "pause_retry_ended"
+        || (applied.outcome === "blocked" && input.noticeOnBlock !== false);
+      const toldBefore = input.noticeFingerprint !== undefined
+        && (state.actionRequiredNotifiedFingerprint ?? null) === input.noticeFingerprint;
       return {
         state: applied.state,
         write: applied.outcome !== "ignored",
         result: {
           outcome: applied.outcome,
+          previousPauseReason: state.blocked ? state.needsActionReason ?? null : null,
           blocked: applied.state.blocked,
           startFailureCount: applied.state.startFailureCount ?? 0,
           retryAfterMs: applied.state.retryAfterMs ?? null,
+          pauseRetryAtMs: applied.state.blocked ? applied.state.pauseRetryAtMs ?? null : null,
           // The owner is told once per fingerprint, as for a needs-action runtime error.
-          notify: applied.outcome === "blocked"
-            && input.noticeFingerprint !== undefined
-            && (state.actionRequiredNotifiedFingerprint ?? null) !== input.noticeFingerprint,
+          notify: tells && input.noticeFingerprint !== undefined && !toldBefore,
+          alreadyNotified: tells && toldBefore,
+          pauseRetryCapNoticeDue: pauseRetryCapNoticeDue(applied.state),
         },
       };
     });
@@ -735,10 +1047,18 @@ export class WakeCrashLoopBreaker {
   async recordActionRequired(
     agentId: string,
     input: { launchId: string | null; reason: string; fingerprint: string; nowMs: number },
-  ): Promise<{ outcome: WakeCrashLoopActionRequiredOutcome; notify: boolean }> {
+  ): Promise<{ outcome: WakeCrashLoopActionRequiredOutcome; notify: boolean; /** With `pause_retry_ended` only: the self-retrying reason it replaces. */ previousPauseReason?: string | null }> {
     return this.mutate(agentId, (state) => {
       const applied = applyWakeCrashLoopActionRequired(state, input);
-      return { state: applied.state, write: applied.outcome === "blocked", result: { outcome: applied.outcome, notify: applied.notify } };
+      return {
+        state: applied.state,
+        write: applied.outcome === "blocked" || applied.outcome === "pause_retry_ended",
+        result: {
+          outcome: applied.outcome,
+          notify: applied.notify,
+          ...(applied.outcome === "pause_retry_ended" ? { previousPauseReason: state.needsActionReason ?? null } : {}),
+        },
+      };
     });
   }
 
@@ -749,6 +1069,16 @@ export class WakeCrashLoopBreaker {
       : { state: { ...state, actionRequiredNotifiedFingerprint: fingerprint }, result: undefined, write: true });
   }
 
+  /**
+   * The owner was told the pause's tries reached the cap. Recorded only while
+   * that is still the case, so a recovery that raced the post wins.
+   */
+  async markPauseRetryCapNotified(agentId: string): Promise<boolean> {
+    return this.mutate(agentId, (state) => pauseRetryCapNoticeDue(state)
+      ? { state: { ...state, pauseRetryCapNotified: true }, result: true, write: true }
+      : { state, result: false, write: false });
+  }
+
   /** The runtime ran past the error the owner was told about: a later one is news again. */
   async forgetActionRequiredNotice(agentId: string): Promise<void> {
     await this.mutate(agentId, (state) => (state.actionRequiredNotifiedFingerprint ?? null) === null
@@ -757,10 +1087,10 @@ export class WakeCrashLoopBreaker {
   }
 
   /** See `applyWakeCrashLoopStartSucceeded`. */
-  async recordStartSucceeded(agentId: string, launchId: string): Promise<boolean> {
+  async recordStartSucceeded(agentId: string, launchId: string): Promise<{ changed: boolean; unpaused: boolean }> {
     return this.mutate(agentId, (state) => {
       const applied = applyWakeCrashLoopStartSucceeded(state, launchId);
-      return { state: applied.state, result: applied.changed, write: applied.changed };
+      return { state: applied.state, result: { changed: applied.changed, unpaused: applied.unpaused }, write: applied.changed };
     });
   }
 
@@ -784,10 +1114,15 @@ export class WakeCrashLoopBreaker {
       // report its failure. Forget that start so its late failure cannot block
       // the agent under the new configuration. A new configuration also makes
       // an error the owner was told about news again.
-      if (state.lastStartLaunchId === null && (state.actionRequiredNotifiedFingerprint ?? null) === null) {
+      // So does a pause's cooldown reaching the cap (the next one starts over).
+      if (state.lastStartLaunchId === null && (state.actionRequiredNotifiedFingerprint ?? null) === null && state.pauseRetryCapNotified !== true) {
         return { state, result: false, write: false };
       }
-      return { state: { ...state, lastStartLaunchId: null, actionRequiredNotifiedFingerprint: null }, result: false, write: true };
+      return {
+        state: { ...state, lastStartLaunchId: null, actionRequiredNotifiedFingerprint: null, ...(state.pauseRetryCapNotified === true ? { pauseRetryCapNotified: false } : {}) },
+        result: false,
+        write: true,
+      };
     });
   }
 
@@ -806,6 +1141,50 @@ export class WakeCrashLoopBreaker {
           catchupOwed: state.catchupOwed === true,
           actionRequiredNotifiedFingerprint: state.actionRequiredNotifiedFingerprint ?? null,
         },
+        result: true,
+        write: true,
+      }
+      : { state, result: false, write: false });
+  }
+
+  /**
+   * #proj-raft-computer:#46: a web login or provider connect for the agent's
+   * runtime succeeded on its Computer, so a block that was only about a
+   * rejected or missing sign-in (the runtime's `user_reauth`, a start's
+   * `runtime_login_required`) or a model the old key could not use
+   * (`model_unsupported`, reconciler step 12) may no longer apply. Same fresh episode as a
+   * config change (`liftForConfigChange`: the owed catch-up kept; a failure
+   * on the new account is news to the owner again); any other block stays.
+   * Wakes nothing: the next wake starts the agent. `sign_in`: the sign-in
+   * blocks only (`CredentialsChangeLiftScope`).
+   */
+  async liftForCredentialsChange(agentId: string, scope: CredentialsChangeLiftScope = "credentials_change"): Promise<boolean> {
+    const lifts = CREDENTIALS_CHANGE_LIFTS_BY_SCOPE[scope];
+    return this.mutate(agentId, (state) => state.blocked && lifts.has(state.needsActionReason ?? "")
+      ? {
+        state: { ...freshWakeCrashLoopEpisode(state.episode + 1), catchupOwed: state.catchupOwed === true },
+        result: true,
+        write: true,
+      }
+      : { state, result: false, write: false });
+  }
+
+  /**
+   * #proj-raft-computer:#48 (reconciler step 4b): the daemon no longer counts
+   * the agent's credential invalid for `reason` (a turn on it produced model
+   * output, a person stopped an agent on it, its model changed, its
+   * credentials changed). Lifts only a block that reason fixes
+   * (`CREDENTIAL_RESTORED_LIFTS`: `user_reauth` also lifts a start's
+   * `runtime_login_required`; a working sign-in or plan access lifts a
+   * start's `model_unsupported`); a billing balance restored says nothing
+   * about a rejected sign-in. Same fresh episode
+   * as a credentials change (`liftForCredentialsChange`); any other block
+   * stays. Wakes nothing.
+   */
+  async liftForCredentialRestored(agentId: string, reason: CredentialInvalidReason): Promise<boolean> {
+    return this.mutate(agentId, (state) => state.blocked && CREDENTIAL_RESTORED_LIFTS[reason].has(state.needsActionReason ?? "")
+      ? {
+        state: { ...freshWakeCrashLoopEpisode(state.episode + 1), catchupOwed: state.catchupOwed === true },
         result: true,
         write: true,
       }

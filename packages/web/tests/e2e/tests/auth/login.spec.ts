@@ -11,7 +11,7 @@ test.describe("P0 auth login", () => {
 
     await page.locator('input[type="email"]').fill(seedState.user.email);
     await page.locator('input[type="password"]').fill(seedState.user.password);
-    await page.getByRole("button", { name: "Sign In" }).click();
+    await page.getByRole("button", { name: "Sign in", exact: true }).click();
 
     await expect(page.getByRole("heading", { name: "Choose Server" })).toBeVisible();
     await page.getByRole("button", { name: /Playwright Server/ }).click();
@@ -26,10 +26,10 @@ test.describe("P0 auth login", () => {
 
     await page.locator('input[type="email"]').fill(seedState.user.email);
     await page.locator('input[type="password"]').fill(`${seedState.user.password}-wrong`);
-    await page.getByRole("button", { name: "Sign In" }).click();
+    await page.getByRole("button", { name: "Sign in", exact: true }).click();
 
     await expect(page.getByText("Incorrect email or password.")).toBeVisible();
-    await expect(page.getByRole("heading", { name: "Sign In" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Sign in" })).toBeVisible();
     await expect(page).toHaveURL(/\/$/);
   });
 });

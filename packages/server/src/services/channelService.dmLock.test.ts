@@ -1,6 +1,5 @@
 import { dbTest as test } from "../test/integration/dbTest";
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
 
 import { and, eq, isNull, sql } from "drizzle-orm";
 import { alias } from "drizzle-orm/pg-core";
@@ -49,7 +48,7 @@ test("findOrCreateUserDM creates one user-user DM under concurrent reversed call
   assert.equal(await countUserDms(server.id, owner.id, peer.id), 1);
 });
 
-test("findOrCreateUserDM returns the peer's uploaded avatar with normalized Gravatar fallback", async ({ db }) => {
+test("findOrCreateUserDM returns the peer's uploaded avatar and an empty deprecated peerGravatarHash", async ({ db }) => {
   const owner = await seedUser("dm-avatar-owner@slock.test", "dm-avatar-owner");
   const peerEmail = "  DM-Avatar-Peer@SLOCK.TEST  ";
   const peer = await seedUser(peerEmail, "dm-avatar-peer");
@@ -62,13 +61,12 @@ test("findOrCreateUserDM returns the peer's uploaded avatar with normalized Grav
   assert.equal(dm.peerType, "user");
   assert.equal(dm.peerId, peer.id);
   assert.equal(dm.peerAvatarUrl, avatarUrl);
-  assert.equal(
-    dm.peerGravatarHash,
-    createHash("sha256").update(peerEmail.trim().toLowerCase()).digest("hex"),
-  );
+  assert.equal(dm.peerGravatarHash, "");
 });
 
 test("listDMChannels attaches a bounded latest-message preview and sender name without extra queries", async ({ db }) => {
+  // A day ago: inside the Free plan's 30-day history window.
+  const dayAgo = Date.now() - 24 * 60 * 60 * 1000;
   const owner = await seedUser("dm-preview-owner@slock.test", "DM Preview Owner");
   const peer = await seedUser("dm-preview-peer@slock.test", "DM Preview Peer");
   const boundaryPeer = await seedUser("dm-preview-boundary@slock.test", "DM Preview Boundary");
@@ -95,28 +93,28 @@ test("listDMChannels attaches a bounded latest-message preview and sender name w
       senderType: "user",
       senderId: owner.id,
       content: "older message",
-      createdAt: new Date("2026-09-13T10:00:00.000Z"),
+      createdAt: new Date(dayAgo + 0 * 1000),
     },
     {
       channelId: userDm.id,
       senderType: "user",
       senderId: peer.id,
       content: `  ${"x".repeat(139)}\n\tyy  `,
-      createdAt: new Date("2026-09-13T10:02:00.000Z"),
+      createdAt: new Date(dayAgo + 120 * 1000),
     },
     {
       channelId: boundaryDm.id,
       senderType: "user",
       senderId: boundaryPeer.id,
       content: "b".repeat(140),
-      createdAt: new Date("2026-09-13T10:01:30.000Z"),
+      createdAt: new Date(dayAgo + 90 * 1000),
     },
     {
       channelId: agentDm.id,
       senderType: "agent",
       senderId: agent.id,
       content: " \n\t ",
-      createdAt: new Date("2026-09-13T10:01:00.000Z"),
+      createdAt: new Date(dayAgo + 60 * 1000),
     },
   ]);
 
@@ -131,7 +129,7 @@ test("listDMChannels attaches a bounded latest-message preview and sender name w
   });
 
   assert.deepEqual(dms.map((dm) => dm.id), [userDm.id, boundaryDm.id, agentDm.id, selfDm.id]);
-  assert.equal(dms[0]?.lastMessageAt?.toISOString(), "2026-09-13T10:02:00.000Z");
+  assert.equal(dms[0]?.lastMessageAt?.toISOString(), new Date(dayAgo + 120 * 1000).toISOString());
   assert.equal(dms[0]?.lastMessagePreview, `${"x".repeat(139)}…`);
   assert.ok((dms[0]?.lastMessagePreview?.length ?? Infinity) <= 140);
   assert.equal(dms[0]?.lastMessageSenderName, peer.displayName);

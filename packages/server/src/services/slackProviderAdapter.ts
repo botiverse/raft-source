@@ -1,3 +1,7 @@
+import type { SlackTestIdentityObserver } from "./slackInboundIdentityObservation";
+import type { SlackLifecycleMemberProfile } from "./slackChannelLifecycleObservation";
+import { parseSlackHistoryCursor, parseSlackReconciliationScan, type SlackReconciliationScan, type SlackReconciliationUnconfirmableReason } from "./slackReconciliationScan";
+import { CONFIRMED_THREAD_ROOT_MISSING, type ExternalProviderPreparation } from "./externalProviderPreparation";
 import { createHash, randomUUID } from "node:crypto";
 import {
   clearClockTimeout,
@@ -14,6 +18,7 @@ import {
   type SlackIngressAdmission,
 } from "./externalAppIngressService";
 import type { SlackBridgeRenderSnapshot } from "./externalDeliveryOutboxService";
+import type { SlackVerifiedIngressPayloadCrypto } from "./slackVerifiedIngressContracts";
 
 export const SLACK_PROVIDER_ADAPTER_CONTRACT_VERSION =
   "slack-provider-adapter.v1" as const;
@@ -44,18 +49,22 @@ export interface SlackBridgeProviderDispatchInput {
   reconciliationMarker: string;
   renderSnapshot: SlackBridgeRenderSnapshot;
   credentialHandle: SlackBridgeCredentialHandle;
+  /** Current I/O authority; the original render snapshot remains immutable. */
+  operationAuthority?: SlackProviderAuthorityFence;
+  /** Applied after current mention rendering without changing the frozen snapshot. */
+  decorateRenderedText?(text: string): string;
+  /** Recheck current membership at the last boundary before publishing a notification. */
+  resolveCurrentRenderMentions?(): Promise<Pick<SlackBridgeRenderSnapshot, "externalMentions" | "raftMentionSubstitutions">>;
 }
 
 export type SlackBridgeProviderDispatchOutcome =
   | { kind: "accepted"; providerMessageId: string; providerThreadId?: string | null; reconciled?: boolean }
   | { kind: "rate_limited"; retryAfterMs: number }
   | { kind: "transient_failure"; baseDelayMs: number }
-  | { kind: "deterministic_failure" }
+  | { kind: "deterministic_failure"; pairBlockedReason?: "provider_credential_revoked" | "provider_app_identity_conflict" | "provider_authority_identity_conflict" | "provider_conversation_identity_conflict" | "slack_not_in_channel" | "slack_permission_missing" | "slack_workspace_admin_required" | "slack_channel_not_found" | "slack_channel_archived" }
   | { kind: "outcome_unknown" };
 
-export type SlackBridgeProviderPreparation =
-  | { ready: false; reason: string }
-  | { ready: true; dispatch(): Promise<SlackBridgeProviderDispatchOutcome> };
+export type SlackBridgeProviderPreparation = ExternalProviderPreparation<SlackBridgeProviderDispatchOutcome>;
 
 export type SlackJsonPrimitive = string | number | boolean | null;
 export type SlackJsonValue =
@@ -80,14 +89,23 @@ export interface SlackProviderAuthorityFence {
   bindingEpoch: number;
 }
 
+export interface SlackAudienceCredentialResolver {
+  resolve(input: {
+    authority: SlackProviderAuthorityFence;
+    now: Date;
+  }): Promise<SlackBridgeCredentialHandle | null>;
+}
+
 export type SlackWebApiMethod =
   | "chat.postMessage"
+  | "chat.update"
   | "conversations.history"
   | "conversations.replies"
   | "reactions.add"
   | "reactions.remove"
   | "reactions.get"
   | "files.info"
+  | "bots.info"
   | "users.info"
   | "conversations.info"
   | "conversations.members";
@@ -143,7 +161,7 @@ export interface SlackProviderAuthorityQuarantineSink {
 }
 
 export type SlackProviderThreadAuthorityDecision =
-  | { active: false; reason: "missing" | "stale" | "mismatch" }
+  | { active: false; reason: "missing" | "stale" | "mismatch" | "conflict" | "unavailable" }
   | {
       active: true;
       fact: {
@@ -188,12 +206,6 @@ function validDate(value: Date): boolean {
   return Number.isFinite(value.getTime());
 }
 
-function exactStrings(left: readonly string[], right: readonly string[]): boolean {
-  const a = [...new Set(left.map((value) => value.trim()).filter(Boolean))].sort();
-  const b = [...new Set(right.map((value) => value.trim()).filter(Boolean))].sort();
-  return a.length === b.length && a.every((value, index) => value === b[index]);
-}
-
 function sha256(value: string): string {
   return createHash("sha256").update(value, "utf8").digest("hex");
 }
@@ -201,6 +213,7 @@ function sha256(value: string): string {
 function authorityFromDispatch(
   input: SlackBridgeProviderDispatchInput,
 ): SlackProviderAuthorityFence {
+  if (input.operationAuthority) return input.operationAuthority;
   const authority = input.renderSnapshot.bindingAuthority;
   return {
     installId: authority.installId,
@@ -316,7 +329,7 @@ async function quarantineBeforeTerminalFailure(input: {
   });
   return fenced === "fence_mismatch"
     ? { kind: "outcome_unknown" }
-    : { kind: "deterministic_failure" };
+    : { kind: "deterministic_failure", pairBlockedReason: input.reason };
 }
 
 export type SlackOutboundReconciliationResult =
@@ -326,7 +339,7 @@ export type SlackOutboundReconciliationResult =
     providerThreadId: string | null;
   }
   | { kind: "not_found" }
-  | { kind: "unavailable"; reason: string };
+  | { kind: "unavailable"; reason: string; retryAfterMs?: number; unconfirmable?: SlackReconciliationUnconfirmableReason };
 
 function slackMessageReconciliationMarker(message: SlackJsonObject): string | null {
   const metadata = isRecord(message.metadata) ? message.metadata : null;
@@ -355,27 +368,63 @@ function slackMessageIsFileShare(message: SlackJsonObject): boolean {
 export async function reconcileSlackOutboundDelivery(input: {
   transport: SlackWebApiTransport;
   leaseCredential(): Promise<SlackBridgeCredentialHandle | null>;
+  releaseCredential(handle: SlackBridgeCredentialHandle): Promise<void>;
   authority: SlackProviderAuthorityFence;
   reconciliationMarker: string;
   providerThreadId?: string | null;
   now: Date;
+  firstAttemptAt: Date;
+  providerAttempt: number;
+  scan?: SlackReconciliationScan | null;
+  saveScan?(scan: SlackReconciliationScan | null): Promise<void>;
   maxPages?: number;
 }): Promise<SlackOutboundReconciliationResult> {
   if (
-    !validDate(input.now)
+    !validDate(input.now) || !validDate(input.firstAttemptAt)
+    || input.firstAttemptAt.getTime() < 0 || input.firstAttemptAt > input.now
+    || !positiveSafeInteger(input.providerAttempt)
     || !/^[A-Za-z0-9_-]{43}$/.test(input.reconciliationMarker)
   ) return { kind: "unavailable", reason: "reconciliation_preflight_invalid" };
   const threadId = input.providerThreadId?.trim() || null;
   if (threadId && !/^[0-9]{1,20}\.[0-9]{1,20}$/.test(threadId)) {
     return { kind: "unavailable", reason: "reconciliation_thread_invalid" };
   }
-  const maxPages = input.maxPages ?? 10;
+  // Two default 15-second reads fit inside the worker's 60-second lease. Longer scans
+  // continue from durable progress on the next tick, never from page one.
+  const maxPages = input.maxPages ?? 2;
   if (!positiveSafeInteger(maxPages) || maxPages > 100) {
     return { kind: "unavailable", reason: "reconciliation_page_limit_invalid" };
   }
-  let cursor: string | null = null;
-  let match: { providerMessageId: string; providerThreadId: string | null } | null = null;
-  let sawBridgeBotWithoutMetadata = false;
+  const stamp = (ms: number) => `${Math.floor(ms / 1000)}.${String((ms % 1000) * 1000).padStart(6, "0")}`;
+  // This is an I/O search bound, not a message retention/age cutoff. Retain a
+  // minute before the first recorded attempt for host/provider clock skew.
+  const oldest = stamp(Math.max(0, input.firstAttemptAt.getTime() - 60_000));
+  const scopeKey = createHash("sha256").update(JSON.stringify([
+    input.authority.installId, input.authority.providerAppId, input.authority.providerAuthorityId,
+    input.authority.providerConversationId, input.authority.connectionEpoch,
+    input.authority.bindingId, input.authority.bindingEpoch, threadId, input.reconciliationMarker,
+  ])).digest("hex");
+  const previous = parseSlackReconciliationScan(input.scan);
+  const micros = (ts: string) => { const [sec, fraction] = ts.split("."); return BigInt(sec!) * (10n ** 20n) + BigInt(fraction!.padEnd(20, "0")); };
+  const fresh: SlackReconciliationScan = { schema: "slack-reconciliation-scan.v3", providerAttempt: input.providerAttempt,
+    scopeKey, oldest, latest: stamp(input.now.getTime() + 60_000), cursor: null, match: null, metadataMissing: previous?.metadataMissing ?? false, markerUnconfirmed: previous?.markerUnconfirmed ?? false, historyLimited: previous?.historyLimited ?? false };
+  let scan = previous && previous.providerAttempt === input.providerAttempt && previous.scopeKey === scopeKey
+    && previous.oldest === oldest && micros(previous.latest) <= micros(fresh.latest)
+    && micros(previous.latest) >= micros(oldest) ? previous : fresh;
+  if (scan.conclusion && Date.parse(scan.conclusion.recheckAt) > input.now.getTime()) {
+    return { kind: "unavailable", reason: scan.conclusion.reason, unconfirmable: scan.conclusion.reason,
+      retryAfterMs: Date.parse(scan.conclusion.recheckAt) - input.now.getTime() };
+  }
+  if (scan.conclusion) scan = { ...scan, conclusion: undefined };
+  let cursor = scan.cursor;
+  let match = scan.match;
+  // A completed observation can be checked again after a bounded cooldown:
+  // a verified original can now resolve uncertainty. Time alone is not evidence
+  // that an earlier potentially sent message never existed.
+  let sawBridgeBotWithoutMetadata = scan.metadataMissing;
+  let sawUnconfirmedMarker = scan.markerUnconfirmed;
+  let historyLimited = scan.historyLimited;
+  const visited = new Set(cursor ? [cursor] : []);
   for (let page = 0; page < maxPages; page += 1) {
     const body: SlackJsonObject = threadId
       ? {
@@ -383,16 +432,19 @@ export async function reconcileSlackOutboundDelivery(input: {
         ts: threadId,
         limit: 100,
         include_all_metadata: true,
+        oldest: scan.oldest, latest: scan.latest, inclusive: true,
         ...(cursor ? { cursor } : {}),
       }
       : {
         channel: input.authority.providerConversationId,
         limit: 100,
         include_all_metadata: true,
+        oldest: scan.oldest, latest: scan.latest, inclusive: true,
         ...(cursor ? { cursor } : {}),
       };
     const credentialHandle = await input.leaseCredential();
     if (!credentialHandle || !credentialMatchesAuthority(credentialHandle, input.authority, input.now)) {
+      if (credentialHandle) await input.releaseCredential(credentialHandle);
       return { kind: "unavailable", reason: "reconciliation_credential_unavailable" };
     }
     const result = await input.transport.call({
@@ -404,32 +456,71 @@ export async function reconcileSlackOutboundDelivery(input: {
     if (result.kind === "transport_failure") {
       return { kind: "unavailable", reason: `reconciliation_transport_${result.code}` };
     }
-    if (result.status === 429) return { kind: "unavailable", reason: "reconciliation_rate_limited" };
+    // Persist every observation that prevents absence BEFORE parsing the page.
+    // Malformed siblings or pagination must not erase an earlier witness when
+    // the message/visibility evidence disappears before the next read.
+    const observedMessages = Array.isArray(result.body.messages) ? result.body.messages.filter(isRecord) : [];
+    const markerObserved = observedMessages.some(message => slackMessageReconciliationMarker(message) === input.reconciliationMarker);
+    const metadataMissing = observedMessages.some(message => {
+      if (nonEmptyString(message.app_id) !== input.authority.providerAppId
+        || slackMessageIsFileShare(message) || slackMessageReconciliationMarker(message)) return false;
+      const ts = slackProviderMessageId(message);
+      return !ts || (micros(ts) >= micros(scan.oldest) && micros(ts) <= micros(scan.latest));
+    });
+    const limited = result.body.is_limited === true
+      && micros(scan.oldest) <= micros(stamp(Math.max(0, input.now.getTime() - 90 * 24 * 60 * 60_000 + 60_000)));
+    if ((markerObserved && !sawUnconfirmedMarker) || (metadataMissing && !sawBridgeBotWithoutMetadata) || (limited && !historyLimited)) {
+      sawUnconfirmedMarker ||= markerObserved;
+      sawBridgeBotWithoutMetadata ||= metadataMissing;
+      historyLimited ||= limited;
+      await input.saveScan?.({ ...scan, cursor, match, markerUnconfirmed: sawUnconfirmedMarker,
+        metadataMissing: sawBridgeBotWithoutMetadata, historyLimited });
+    }
+    if (result.status === 429) return { kind: "unavailable", reason: "reconciliation_rate_limited", retryAfterMs: parseRetryAfterMs(result.headers) };
+    if (result.body.error === "invalid_cursor" && cursor) {
+      await input.saveScan?.({ ...scan, cursor: null, match, metadataMissing: sawBridgeBotWithoutMetadata, markerUnconfirmed: sawUnconfirmedMarker, historyLimited });
+      return { kind: "unavailable", reason: "reconciliation_cursor_expired", retryAfterMs: 30_000 };
+    }
     if (result.status < 200 || result.status >= 300 || result.body.ok !== true) {
       return {
         kind: "unavailable",
         reason: nonEmptyString(result.body.error) ?? "reconciliation_provider_error",
       };
     }
+    if (result.body.has_more !== undefined && typeof result.body.has_more !== "boolean") {
+      return { kind: "unavailable", reason: "reconciliation_pagination_invalid" };
+    }
+    if (result.body.is_limited !== undefined && typeof result.body.is_limited !== "boolean") {
+      return { kind: "unavailable", reason: "reconciliation_pagination_invalid" };
+    }
     const messages = Array.isArray(result.body.messages)
       ? result.body.messages.filter(isRecord)
       : null;
-    if (!messages) return { kind: "unavailable", reason: "reconciliation_messages_invalid" };
+    if (!messages || messages.length !== (result.body.messages as SlackJsonValue[]).length) {
+      return { kind: "unavailable", reason: "reconciliation_messages_invalid" };
+    }
     for (const message of messages) {
-      const channel = nonEmptyString(message.channel);
-      if (channel && channel !== input.authority.providerConversationId) continue;
-      // Slack keeps the originating app_id on bot-authored history entries even
-      // when message metadata is omitted/stripped. Treat such an entry as a
-      // positive control: a missing marker is then ambiguous, never proof of
-      // absence. Human messages (and unrelated apps) do not affect not_found.
-      const authoredByBridgeApp = nonEmptyString(message.app_id) === input.authority.providerAppId;
-      // files.completeUploadExternal creates a file-share message in the same
-      // channel but has no metadata parameter by contract; it is not evidence
-      // that metadata on chat.postMessage entries is invisible.
-      if (authoredByBridgeApp && !slackMessageIsFileShare(message)) {
-        if (!slackMessageReconciliationMarker(message)) sawBridgeBotWithoutMetadata = true;
+      const timestamp = slackProviderMessageId(message);
+      if (!timestamp) return { kind: "unavailable", reason: "reconciliation_message_id_invalid" };
+      const marker = slackMessageReconciliationMarker(message);
+      const sourceAppId = nonEmptyString(message.app_id);
+      const authoredByBridgeApp = sourceAppId === input.authority.providerAppId;
+      const inWindow = micros(timestamp) >= micros(scan.oldest) && micros(timestamp) <= micros(scan.latest);
+      if (!inWindow) {
+        if (marker === input.reconciliationMarker && authoredByBridgeApp) {
+          return { kind: "unavailable", reason: "reconciliation_marker_outside_window" };
+        }
+        continue; // replies may include the root outside the requested interval
       }
-      if (slackMessageReconciliationMarker(message) !== input.reconciliationMarker) continue;
+      const channel = nonEmptyString(message.channel);
+      if (channel && channel !== input.authority.providerConversationId) {
+        return { kind: "unavailable", reason: "reconciliation_channel_conflict" };
+      }
+      if (marker !== input.reconciliationMarker) continue;
+      // Metadata can be copied by another app. Slack's message-level app_id is
+      // publishing authority, not a field inside the app-supplied metadata.
+      // It survives bot/credential rotation; a bot ID alone is not app proof.
+      if (!authoredByBridgeApp) continue;
       const providerMessageId = slackProviderMessageId(message);
       if (!providerMessageId) return { kind: "unavailable", reason: "reconciliation_message_id_invalid" };
       const messageThreadId = nonEmptyString(message.thread_ts);
@@ -440,23 +531,43 @@ export async function reconcileSlackOutboundDelivery(input: {
         providerMessageId,
         providerThreadId: threadId ? (messageThreadId ?? threadId) : null,
       };
-      if (match) return { kind: "unavailable", reason: "reconciliation_marker_conflict" };
+      if (threadId && messageThreadId && messageThreadId !== threadId) return { kind: "unavailable", reason: "reconciliation_thread_conflict" };
+      if (match && (match.providerMessageId !== found.providerMessageId || match.providerThreadId !== found.providerThreadId)) {
+        return { kind: "unavailable", reason: "reconciliation_marker_conflict" };
+      }
       match = found;
     }
     const responseMetadata = isRecord(result.body.response_metadata)
       ? result.body.response_metadata
       : null;
-    const nextCursor = responseMetadata ? nonEmptyString(responseMetadata.next_cursor) : null;
+    const rawCursor = responseMetadata?.next_cursor;
+    const nextCursor = parseSlackHistoryCursor(rawCursor);
+    if (rawCursor !== undefined && rawCursor !== null && rawCursor !== "" && !nextCursor) return { kind: "unavailable", reason: "reconciliation_cursor_invalid" };
     if (!nextCursor) {
-      if (match) return { kind: "found", ...match };
-      if (sawBridgeBotWithoutMetadata) {
-        return { kind: "unavailable", reason: "reconciliation_bridge_metadata_missing" };
+      if (result.body.has_more === true || (result.body.has_more !== false && rawCursor !== "")) {
+        return { kind: "unavailable", reason: "reconciliation_pagination_incomplete" };
       }
+      if (match) {
+        await input.saveScan?.(null);
+        return { kind: "found", ...match };
+      }
+      if (historyLimited || sawUnconfirmedMarker || sawBridgeBotWithoutMetadata) {
+        const reason = historyLimited ? "reconciliation_history_limited"
+          : sawUnconfirmedMarker ? "reconciliation_marker_unconfirmed" : "reconciliation_bridge_metadata_missing";
+        const retryAfterMs = 15 * 60_000;
+        await input.saveScan?.({ ...scan, cursor: null, match, metadataMissing: sawBridgeBotWithoutMetadata, markerUnconfirmed: sawUnconfirmedMarker, historyLimited,
+          conclusion: { reason, recheckAt: new Date(input.now.getTime() + retryAfterMs).toISOString() } });
+        return { kind: "unavailable", reason, unconfirmable: reason, retryAfterMs };
+      }
+      await input.saveScan?.(null);
       return { kind: "not_found" };
     }
+    if (visited.has(nextCursor)) return { kind: "unavailable", reason: "reconciliation_cursor_loop" };
     cursor = nextCursor;
+    visited.add(cursor);
+    await input.saveScan?.({ ...scan, conclusion: undefined, cursor, match, metadataMissing: sawBridgeBotWithoutMetadata, markerUnconfirmed: sawUnconfirmedMarker, historyLimited });
   }
-  return { kind: "unavailable", reason: "reconciliation_page_limit_exceeded" };
+  return { kind: "unavailable", reason: "reconciliation_scan_pending", retryAfterMs: 30_000 };
 }
 
 async function normalizePostMessageResult(input: {
@@ -541,6 +652,14 @@ async function normalizePostMessageResult(input: {
   if (AMBIGUOUS_PROVIDER_ERRORS.has(error) || input.result.status >= 500) {
     return { kind: "outcome_unknown" };
   }
+  if (["not_in_channel", "missing_scope", "no_permission", "access_denied", "app_access_restricted", "channel_not_found"].includes(error)) {
+    // channel_not_found can also mean access was revoked; it does not prove
+    // permanent deletion. Keep custody rather than declaring the target gone.
+    return { kind: "deterministic_failure", pairBlockedReason: error === "not_in_channel" ? "slack_not_in_channel"
+      : error === "channel_not_found" ? "slack_channel_not_found"
+        : error === "app_access_restricted" ? "slack_workspace_admin_required" : "slack_permission_missing" };
+  }
+  if (error === "is_archived") return { kind: "deterministic_failure", pairBlockedReason: "slack_channel_archived" };
   if (DETERMINISTIC_PROVIDER_ERRORS.has(error)) {
     return { kind: "deterministic_failure" };
   }
@@ -555,14 +674,50 @@ function escapeRegex(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-function renderSlackBridgeText(snapshot: SlackBridgeRenderSnapshot): string | null {
+export function ambiguousSlackMentionHandles(snapshot: SlackBridgeRenderSnapshot): Set<string> {
+  // A handle claimed by more than one DISTINCT provider target — an external
+  // fact and a Raft substitution, two external facts, or two Raft
+  // substitutions — is genuinely ambiguous: the same `@handle` text could
+  // mean any of them and there is no per-occurrence position data to tell
+  // them apart. Rather than letting pass order pick a winner (which would
+  // silently notify the wrong principal or drop a target), ambiguous handles
+  // stay literal — no Slack-side notification for any interpretation. Two
+  // rows that resolve to the SAME provider token are one target, not a
+  // collision.
+  const targetsByHandle = new Map<string, Set<string>>();
+  const noteHandle = (handle: string, providerToken: string) => {
+    const set = targetsByHandle.get(handle) ?? new Set<string>();
+    set.add(providerToken);
+    targetsByHandle.set(handle, set);
+  };
+  for (const mention of snapshot.externalMentions) {
+    noteHandle(mention.handleSnapshot, `<@${mention.externalActorId}>`);
+  }
+  for (const substitution of snapshot.raftMentionSubstitutions ?? []) {
+    noteHandle(substitution.handle, substitution.token);
+  }
+  return new Set(
+    [...targetsByHandle].filter(([, targets]) => targets.size > 1).map(([handle]) => handle),
+  );
+}
+
+export function renderSlackBridgeText(snapshot: SlackBridgeRenderSnapshot): string | null {
   let text = snapshot.sanitizedText;
-  const placeholders: Array<{ token: string; providerUserId: string }> = [];
+  const placeholders: Array<{
+    token: string;
+    providerUserId?: string;
+    providerToken?: string;
+  }> = [];
+  const ambiguousHandles = ambiguousSlackMentionHandles(snapshot);
   const mentions = [...snapshot.externalMentions]
+    .filter((mention) => !ambiguousHandles.has(mention.handleSnapshot))
     .sort((left, right) => right.handleSnapshot.length - left.handleSnapshot.length);
   for (const [index, mention] of mentions.entries()) {
+    // Protocol 3 readers can safely consume a bot fact before mapping support
+    // is enabled. Keep its handle literal; never turn a bot ID into a Slack ping.
+    if (/^B[A-Z0-9]{2,159}$/u.test(mention.externalActorId)) continue;
     if (
-      !/^[UW][A-Z0-9]{2,}$/.test(mention.externalActorId)
+      !/^[UW][A-Z0-9_]{2,}$/.test(mention.externalActorId)
       || !mention.handleSnapshot.trim()
       || /[@<>&\s\u0000-\u001f\u007f]/u.test(mention.handleSnapshot)
     ) return null;
@@ -574,14 +729,43 @@ function renderSlackBridgeText(snapshot: SlackBridgeRenderSnapshot): string | nu
     text = text.replace(pattern, (_match, prefix: string) => `${prefix}${token}`);
     placeholders.push({ token, providerUserId: mention.externalActorId });
   }
+  // Raft-principal mentions were frozen to their exact Slack token at
+  // enqueue (link/usergroup identity at send time, never re-derived here).
+  // A row that fails validation makes the whole render fail closed rather
+  // than leaking a malformed token — same posture as externalMentions above.
+  const raftSubstitutions = [...(snapshot.raftMentionSubstitutions ?? [])]
+    .filter((substitution) => !ambiguousHandles.has(substitution.handle))
+    .sort((left, right) => right.handle.length - left.handle.length);
+  for (const [index, substitution] of raftSubstitutions.entries()) {
+    if (
+      !substitution.handle.trim()
+      || /[@<>&\s\u0000-\u001f\u007f]/u.test(substitution.handle)
+      || !(substitution.kind === "user"
+        ? /^<@[UW][A-Z0-9_]{2,}>$/u.test(substitution.token)
+        : /^<!subteam\^S[A-Z0-9_]{2,}>$/u.test(substitution.token))
+    ) return null;
+    const placeholderToken = `\u0000RAFT_MENTION_${index}\u0000`;
+    const pattern = new RegExp(
+      `(^|[\\s([{])@${escapeRegex(substitution.handle)}(?=$|[\\s.,!?;:)}\\]])`,
+      "gu",
+    );
+    text = text.replace(pattern, (_match, prefix: string) => `${prefix}${placeholderToken}`);
+    placeholders.push({ token: placeholderToken, providerToken: substitution.token });
+  }
+  // Escape once, after every placeholder is in place: the NUL tokens contain
+  // no &<> characters and the provider tokens substitute in after escaping,
+  // so escaping at each stage would double-encode user text.
   text = escapeSlackMrkdwn(text);
   for (const placeholder of placeholders) {
-    text = text.replaceAll(placeholder.token, `<@${placeholder.providerUserId}>`);
+    text = text.replaceAll(
+      placeholder.token,
+      placeholder.providerToken ?? `<@${placeholder.providerUserId}>`,
+    );
   }
   return text;
 }
 
-function renderSlackBridgeUsername(authorName: string): string | null {
+export function renderSlackBridgeUsername(authorName: string): string | null {
   const suffix = " from Raft";
   const normalized = authorName.trim();
   const boundedName = Array.from(normalized).slice(0, 80 - suffix.length).join("").trimEnd();
@@ -590,13 +774,41 @@ function renderSlackBridgeUsername(authorName: string): string | null {
   return username;
 }
 
+/** What a bridged post carries in Slack's message metadata (reconciliation reads it back). */
+export interface SlackBridgeMessageMetadataInput {
+  deliveryId: string;
+  reconciliationMarker: string;
+  sourceMessageId: string;
+  sourcePermalink: string;
+  senderType: "user" | "agent";
+  connectionEpoch: number;
+  bindingEpoch: number;
+}
+
+function slackBridgeMessageMetadata(input: SlackBridgeMessageMetadataInput, cardRevision?: number): SlackJsonObject {
+  return {
+    event_type: "raft_message",
+    event_payload: {
+      delivery_id: input.deliveryId,
+      reconciliation_marker: input.reconciliationMarker,
+      source_message_id: input.sourceMessageId,
+      source_permalink: input.sourcePermalink,
+      source_sender_type: input.senderType,
+      connection_epoch: input.connectionEpoch,
+      binding_epoch: input.bindingEpoch,
+      ...(cardRevision !== undefined ? { card_revision: cardRevision } : {}),
+    },
+  };
+}
+
 function buildPostMessageRequest(input: {
   dispatch: SlackBridgeProviderDispatchInput;
   providerThreadId: string | null;
 }): SlackWebApiRequest | null {
   const authority = authorityFromDispatch(input.dispatch);
   const snapshot = input.dispatch.renderSnapshot;
-  const text = renderSlackBridgeText(snapshot);
+  const renderedText = renderSlackBridgeText(snapshot);
+  const text = renderedText === null ? null : input.dispatch.decorateRenderedText?.(renderedText) ?? renderedText;
   const username = renderSlackBridgeUsername(snapshot.authorName);
   if (!text || !username) {
     return null;
@@ -608,18 +820,15 @@ function buildPostMessageRequest(input: {
     unfurl_links: false,
     unfurl_media: false,
     username,
-    metadata: {
-      event_type: "raft_message",
-      event_payload: {
-        delivery_id: input.dispatch.deliveryId,
-        reconciliation_marker: input.dispatch.reconciliationMarker,
-        source_message_id: snapshot.sourceMessageId,
-        source_permalink: snapshot.sourcePermalink,
-        source_sender_type: snapshot.senderType,
-        connection_epoch: authority.connectionEpoch,
-        binding_epoch: authority.bindingEpoch,
-      },
-    },
+    metadata: slackBridgeMessageMetadata({
+      deliveryId: input.dispatch.deliveryId,
+      reconciliationMarker: input.dispatch.reconciliationMarker,
+      sourceMessageId: snapshot.sourceMessageId,
+      sourcePermalink: snapshot.sourcePermalink,
+      senderType: snapshot.senderType,
+      connectionEpoch: authority.connectionEpoch,
+      bindingEpoch: authority.bindingEpoch,
+    }),
   };
   if (snapshot.authorPresentation.avatar) {
     body.icon_url = snapshot.authorPresentation.avatar.publicUrl;
@@ -653,6 +862,8 @@ export function createSlackProviderPreparation(
       || input.deliveryId.trim().length === 0
       || !/^[A-Za-z0-9_-]{43}$/.test(input.reconciliationMarker)
       || !credentialMatchesAuthority(input.credentialHandle, authority, now)
+      || authority.providerAuthorityId !== input.renderSnapshot.bindingAuthority.providerAuthorityId
+      || authority.providerConversationId !== input.renderSnapshot.bindingAuthority.providerConversationId
     ) {
       return { ready: false, reason: "provider_preflight_receipt_invalid" };
     }
@@ -668,7 +879,9 @@ export function createSlackProviderPreparation(
         authority,
       });
       if (!thread.active) {
-        return { ready: false, reason: `provider_thread_receipt_${thread.reason}` };
+        return thread.reason === "missing"
+          ? { ready: false, disposition: "discard", reason: CONFIRMED_THREAD_ROOT_MISSING }
+          : { ready: false, reason: "provider_thread_receipt_" + thread.reason };
       }
       if (!providerThreadAuthorityMatches(authority, thread.fact)) {
         return { ready: false, reason: "provider_thread_receipt_mismatch" };
@@ -682,7 +895,14 @@ export function createSlackProviderPreparation(
     return {
       ready: true,
       dispatch() {
-        dispatched ??= dependencies.transport.call(request)
+        dispatched ??= (async () => {
+          if (!input.resolveCurrentRenderMentions) return dependencies.transport.call(request);
+          const mentions = await input.resolveCurrentRenderMentions();
+          const currentRequest = buildPostMessageRequest({ dispatch: { ...input,
+            renderSnapshot: { ...input.renderSnapshot, ...mentions } }, providerThreadId });
+          if (!currentRequest) throw new Error("Current Slack message render is invalid");
+          return dependencies.transport.call(currentRequest);
+        })()
           .then((result) => normalizePostMessageResult({
             result,
             authority,
@@ -696,6 +916,219 @@ export function createSlackProviderPreparation(
       },
     };
   };
+}
+
+// ---------------------------------------------------------------------------
+// RFC 082 §4.6: a card update edits its bridged Slack copy (chat.update), and
+// a read-back (conversations.history / conversations.replies by ts) tells
+// which card revision Slack shows. The edit is the original's structure: text
+// plus the original's metadata (with card_revision), never blocks or files.
+
+/** The send path's Slack length rule (outbound admission): no NUL and at most 40,000 UTF-8 bytes. */
+export const SLACK_BRIDGE_MAX_TEXT_BYTES = 40_000;
+
+export function slackBridgeTextWithinSendRule(text: string): boolean {
+  return text.length > 0 && !text.includes("\0") && Buffer.byteLength(text, "utf8") <= SLACK_BRIDGE_MAX_TEXT_BYTES;
+}
+
+/**
+ * A card edit's text, with every mention form as plain text (an update
+ * notifies no one, §4.2; the send-time mention rendering is not reused).
+ * Escaping `&`, `<` and `>` turns Slack markup (`<@U…>`, `<!subteam^…>`,
+ * `<!here>`, `<!channel>`, `<!everyone>`) into literal text, and a WORD JOINER
+ * after each `@` keeps `@handle`, `@here`, `@channel` and `@everyone` literal
+ * whatever the parse mode. Nothing else changes visibly.
+ */
+export function renderSlackCardEditText(content: string): string {
+  return escapeSlackMrkdwn(content).replace(/@(?=[\p{L}\p{N}_.-])/gu, "@⁠");
+}
+
+export interface SlackCardEditRequestInput {
+  credentialHandle: SlackBridgeCredentialHandle;
+  authority: SlackProviderAuthorityFence;
+  /** The confirmed original's Slack ts; never guessed. */
+  providerMessageId: string;
+  /** The revision's fallback text, as stored. */
+  content: string;
+  cardRevision: number;
+  /** The original post's metadata, unchanged apart from card_revision. */
+  original: SlackBridgeMessageMetadataInput;
+}
+
+/** The chat.update body: text plus the original's metadata and card_revision; no blocks, no attachments. */
+export function buildSlackCardEditRequest(input: SlackCardEditRequestInput): SlackWebApiRequest | null {
+  if (!/^[0-9]{1,20}\.[0-9]{1,20}$/u.test(input.providerMessageId)
+    || !Number.isSafeInteger(input.cardRevision) || input.cardRevision < 2
+    || !slackBridgeTextWithinSendRule(input.content)) return null;
+  return {
+    method: "chat.update",
+    credentialHandle: input.credentialHandle,
+    authority: input.authority,
+    body: {
+      channel: input.authority.providerConversationId,
+      ts: input.providerMessageId,
+      text: renderSlackCardEditText(input.content),
+      // Never link names or special mentions, whatever the text says.
+      parse: "none",
+      link_names: false,
+      metadata: slackBridgeMessageMetadata(input.original, input.cardRevision),
+    },
+  };
+}
+
+/**
+ * A kept failure: a recoverable access or channel state, shown to the pair's
+ * admins like a pair block. The same revision is tried again once the pair is
+ * usable; never proof the target is gone, never a refusal of the revision.
+ */
+export type SlackCardEditKeptReason =
+  | "slack_not_in_channel" | "slack_channel_not_found" | "slack_permission_missing"
+  | "slack_workspace_admin_required" | "slack_channel_archived" | "slack_channel_inactive"
+  | "slack_channel_restricted" | "provider_credential_revoked";
+
+export type SlackCardEditOutcome =
+  | { kind: "succeeded" }
+  /** Slack definitely did not apply it (not sent, or rate limited): try again later. */
+  | { kind: "not_sent"; reason: string; retryAfterMs: number }
+  | { kind: "unknown"; reason: string }
+  /** A definite, non-retryable refusal of this revision (msg_too_long and the like). */
+  | { kind: "refused"; reason: string }
+  | { kind: "message_not_found" }
+  | { kind: "kept"; reason: SlackCardEditKeptReason }
+  | { kind: "identity_changed"; reason: string };
+
+/** Content-level refusals of this revision's request: final for the revision (a newer one still goes). */
+const SLACK_CARD_EDIT_REFUSALS = new Set([
+  "msg_too_long", "edit_window_closed", "no_text", "invalid_arguments", "invalid_metadata_format",
+  "invalid_metadata_schema", "metadata_too_large", "metadata_must_be_sent_from_app", "invalid_blocks",
+  "invalid_blocks_format", "msg_blocks_too_long", "too_many_attachments",
+]);
+
+/** Access and channel-state errors: recoverable, so held and retried, never a refusal. */
+const SLACK_CARD_EDIT_KEPT: Record<string, SlackCardEditKeptReason> = {
+  not_in_channel: "slack_not_in_channel",
+  channel_not_found: "slack_channel_not_found",
+  missing_scope: "slack_permission_missing",
+  no_permission: "slack_permission_missing",
+  access_denied: "slack_permission_missing",
+  ekm_access_denied: "slack_permission_missing",
+  app_access_restricted: "slack_workspace_admin_required",
+  is_archived: "slack_channel_archived",
+  // A frozen or archived channel (Slack's chat.update): it can come back.
+  is_inactive: "slack_channel_inactive",
+  restricted_action: "slack_channel_restricted",
+  restricted_action_read_only_channel: "slack_channel_restricted",
+  restricted_action_thread_only_channel: "slack_channel_restricted",
+  restricted_action_thread_locked: "slack_channel_restricted",
+};
+
+/** Classify Slack's answer to one chat.update; anything not definite is unknown. */
+export function classifySlackCardEditResult(
+  result: SlackWebApiTransportResult,
+  expected: { authority: SlackProviderAuthorityFence; providerMessageId: string },
+): SlackCardEditOutcome {
+  if (result.kind === "transport_failure") {
+    return result.phase === "before_send"
+      ? { kind: "not_sent", reason: "slack_request_not_sent", retryAfterMs: DEFAULT_TRANSIENT_RETRY_BASE_MS }
+      : { kind: "unknown", reason: `slack_transport_${result.code}` };
+  }
+  const error = nonEmptyString(result.body.error);
+  if (result.status === 429 || error === "ratelimited" || error === "rate_limited") {
+    return { kind: "not_sent", reason: "slack_rate_limited", retryAfterMs: parseRetryAfterMs(result.headers) };
+  }
+  const observed = result.observedAuthority;
+  if ((observed?.providerAppId !== undefined && observed.providerAppId !== expected.authority.providerAppId)
+    || (observed?.providerAuthorityId !== undefined && observed.providerAuthorityId !== expected.authority.providerAuthorityId)) {
+    return { kind: "identity_changed", reason: "slack_identity_conflict" };
+  }
+  if (result.body.ok === true) {
+    // Only Slack's own receipt for this message in this conversation counts.
+    return result.status >= 200 && result.status < 300
+      && nonEmptyString(result.body.channel) === expected.authority.providerConversationId
+      && nonEmptyString(result.body.ts) === expected.providerMessageId
+      ? { kind: "succeeded" }
+      : { kind: "unknown", reason: "slack_receipt_mismatch" };
+  }
+  if (!error) return { kind: "unknown", reason: "slack_outcome_unknown" };
+  if (error === "message_not_found") return { kind: "message_not_found" };
+  if (error === "cant_update_message") return { kind: "identity_changed", reason: "slack_cant_update_message" };
+  if (AUTH_REVOKED_ERRORS.has(error)) return { kind: "kept", reason: "provider_credential_revoked" };
+  const kept = SLACK_CARD_EDIT_KEPT[error];
+  if (kept) return { kind: "kept", reason: kept };
+  if (AMBIGUOUS_PROVIDER_ERRORS.has(error) || result.status >= 500) return { kind: "unknown", reason: "slack_outcome_unknown" };
+  if (SLACK_CARD_EDIT_REFUSALS.has(error)) return { kind: "refused", reason: error };
+  return { kind: "unknown", reason: "slack_outcome_unknown" };
+}
+
+export type SlackCardReadBack =
+  /** The bridged message as Slack shows it; card_revision 1 is the original's first text. */
+  | { kind: "shown"; revision: number }
+  /** The message could not be read back (missing, not ours, no metadata, or Slack refused the read). */
+  | { kind: "unreadable"; reason: string }
+  /** Not read (rate limited or not sent): read again later, in the same stage. */
+  | { kind: "retry"; reason: string; retryAfterMs: number };
+
+/**
+ * Read back one bridged message by its ts and say which card revision it
+ * shows. Read-only. The message must be the bridge App's (Slack's app_id, not
+ * anything in the message) and carry this delivery's metadata.
+ */
+export async function readBackSlackCardRevision(input: {
+  transport: SlackWebApiTransport;
+  credentialHandle: SlackBridgeCredentialHandle;
+  authority: SlackProviderAuthorityFence;
+  providerMessageId: string;
+  providerThreadId: string | null;
+  deliveryId: string;
+}): Promise<SlackCardReadBack> {
+  const ts = input.providerMessageId;
+  const thread = input.providerThreadId && input.providerThreadId !== ts ? input.providerThreadId : null;
+  let result: SlackWebApiTransportResult;
+  try {
+    result = await input.transport.call({
+      method: thread ? "conversations.replies" : "conversations.history",
+      credentialHandle: input.credentialHandle,
+      authority: input.authority,
+      body: {
+        channel: input.authority.providerConversationId,
+        ...(thread ? { ts: thread } : {}),
+        latest: ts,
+        oldest: ts,
+        inclusive: true,
+        // A replies page always leads with its root.
+        limit: thread ? 2 : 1,
+        include_all_metadata: true,
+      },
+    });
+  } catch {
+    return { kind: "unreadable", reason: "readback_transport_exception" };
+  }
+  if (result.kind === "transport_failure") {
+    return result.phase === "before_send"
+      ? { kind: "retry", reason: "readback_not_sent", retryAfterMs: DEFAULT_TRANSIENT_RETRY_BASE_MS }
+      : { kind: "unreadable", reason: `readback_transport_${result.code}` };
+  }
+  if (result.status === 429 || result.body.error === "ratelimited") {
+    return { kind: "retry", reason: "readback_rate_limited", retryAfterMs: parseRetryAfterMs(result.headers) };
+  }
+  if (result.status < 200 || result.status >= 300 || result.body.ok !== true) {
+    return { kind: "unreadable", reason: `readback_${nonEmptyString(result.body.error) ?? "provider_error"}`.slice(0, 160) };
+  }
+  const messages = Array.isArray(result.body.messages) ? result.body.messages.filter(isRecord) : [];
+  const message = messages.find((candidate) => slackProviderMessageId(candidate) === ts);
+  if (!message) return { kind: "unreadable", reason: "readback_message_missing" };
+  if (nonEmptyString(message.app_id) !== input.authority.providerAppId) {
+    return { kind: "unreadable", reason: "readback_author_conflict" };
+  }
+  const metadata = isRecord(message.metadata) ? message.metadata : null;
+  const payload = metadata?.event_type === "raft_message" && isRecord(metadata.event_payload) ? metadata.event_payload : null;
+  if (!payload) return { kind: "unreadable", reason: "readback_metadata_missing" };
+  if (payload.delivery_id !== input.deliveryId) return { kind: "unreadable", reason: "readback_delivery_conflict" };
+  const revision = payload.card_revision;
+  if (revision === undefined) return { kind: "shown", revision: 1 };
+  return typeof revision === "number" && Number.isSafeInteger(revision) && revision >= 2
+    ? { kind: "shown", revision }
+    : { kind: "unreadable", reason: "readback_revision_invalid" };
 }
 
 export interface SlackOAuthCodeHandle {
@@ -736,6 +1169,8 @@ export type SlackOAuthExchangeTransportResult =
       providerTeamId: string;
       providerEnterpriseId: string | null;
       providerUserId: string;
+      /** Verified against users.info for this exact OAuth human and workspace. */
+      workspaceAdminVerified?: boolean;
       botUserId: string;
       providerBotId: string | null;
       workspaceName: string | null;
@@ -1334,9 +1769,8 @@ export function createSlackOAuthHttpTransport(
 
         // Verify the exact OAuth human with the newly issued bot token before
         // persisting or rotating the shared credential: a real, current,
-        // non-bot member of the workspace. Who may install the app at all is
-        // Slack's own policy (its app-approval settings); Raft does not add a
-        // workspace-admin requirement on top (yezizp, #wg-slack-bridge:54ae7275).
+        // non-bot member of the workspace. Carry the independently observed
+        // role to the transaction that decides whether this is a shared install.
         const userInfoResponse = await fetchImpl(userInfoEndpoint, {
           method: "POST",
           headers: {
@@ -1367,8 +1801,12 @@ export function createSlackOAuthHttpTransport(
           userInfoBody?.ok !== true
           || !installer
           || slackOAuthString(installer?.id) !== providerUserId
-          || installer?.deleted === true
-          || installer?.is_bot === true
+          || installer.team_id !== providerTeamId
+          || installer.deleted !== false
+          || installer.is_bot !== false
+          || installer.is_app_user === true
+          || installer.is_stranger === true
+          || installer.is_external === true
         ) {
           return { kind: "transport_failure", phase: "after_send" };
         }
@@ -1399,6 +1837,9 @@ export function createSlackOAuthHttpTransport(
           providerTeamId,
           providerEnterpriseId: slackOAuthString(enterprise?.id),
           providerUserId,
+          workspaceAdminVerified: installer.team_id === providerTeamId
+            && installer.deleted === false && installer.is_bot === false
+            && (installer.is_admin === true || installer.is_owner === true),
           botUserId,
           providerBotId: authBotId,
           workspaceName: slackOAuthString(team?.name),
@@ -1520,6 +1961,10 @@ export interface SlackEventsHttpRequest {
   secretResolver: ExternalIngressSecretResolver;
   payloadSealer: ExternalIngressPayloadSealer;
   runtimeResolver?: ExternalIngressRuntimeResolver;
+  verifiedIngressCrypto?: SlackVerifiedIngressPayloadCrypto;
+  testIdentityObserver?: SlackTestIdentityObserver;
+  requestLifecycleRefresh?(bindingId: string): void;
+  readLifecycleMemberProfile?(bindingId: string, providerUserId: string): Promise<SlackLifecycleMemberProfile | null>;
   now?: Date;
 }
 
@@ -1628,6 +2073,10 @@ export function createSlackEventsHttpAdapter(input: {
       secretResolver: request.secretResolver,
       payloadSealer: request.payloadSealer,
       runtimeResolver: request.runtimeResolver,
+      verifiedIngressCrypto: request.verifiedIngressCrypto,
+      testIdentityObserver: request.testIdentityObserver,
+      ...(request.requestLifecycleRefresh ? { requestLifecycleRefresh: request.requestLifecycleRefresh } : {}),
+      readLifecycleMemberProfile: request.readLifecycleMemberProfile,
       now: request.now,
     });
     if (result.kind === "url_verification") {
@@ -1656,6 +2105,17 @@ export interface SlackProviderUserFact {
   avatarUrlDigest: string | null;
   isBot: boolean;
   isDeleted: boolean;
+  observedAt: Date;
+}
+
+export interface SlackProviderBotFact {
+  providerBotId: string;
+  providerUserId: string | null;
+  providerAppId: string | null;
+  providerAuthorityId: string;
+  displayNameSnapshot: string | null;
+  avatarUrlDigest: string | null;
+  isDeleted: boolean | null;
   observedAt: Date;
 }
 
@@ -1755,6 +2215,47 @@ async function normalizeDirectoryFailure(input: {
     };
   }
   return null;
+}
+
+/** Provider lookup only; no user, member or mention authority is created here. */
+export async function lookupSlackProviderBot(input: {
+  transport: SlackWebApiTransport;
+  quarantineSink: SlackProviderAuthorityQuarantineSink;
+  credentialHandle: SlackBridgeCredentialHandle;
+  authority: SlackProviderAuthorityFence;
+  providerBotId: string;
+  now: Date;
+  /** Transient only; callers must pass through the restricted avatar materializer. */
+  onAvatarLocator?: (locator: string) => void;
+}): Promise<SlackProviderDirectoryOutcome<SlackProviderBotFact>> {
+  if (!validDate(input.now) || !/^B[A-Z0-9]{2,159}$/u.test(input.providerBotId)
+    || !credentialMatchesAuthority(input.credentialHandle, input.authority, input.now)) {
+    return { kind: "unavailable", reason: "deterministic" };
+  }
+  const result = await input.transport.call({ method: "bots.info", credentialHandle: input.credentialHandle,
+    authority: input.authority, body: { bot: input.providerBotId } });
+  const failure = await normalizeDirectoryFailure({ result, authority: input.authority, quarantineSink: input.quarantineSink });
+  if (failure) return failure;
+  if (result.kind !== "response" || !isRecord(result.body.bot)) return { kind: "unavailable", reason: "outcome_unknown" };
+  const bot = result.body.bot;
+  if (bot.id !== input.providerBotId) return { kind: "unavailable", reason: "identity_conflict" };
+  const user = bot.user_id == null ? null : nonEmptyString(bot.user_id);
+  const app = bot.app_id == null ? null : nonEmptyString(bot.app_id);
+  if ((bot.user_id != null && (!user || !/^[UW][A-Z0-9]{2,159}$/u.test(user)))
+    || (bot.app_id != null && (!app || !/^A[A-Z0-9]{2,159}$/u.test(app)))) {
+    return { kind: "unavailable", reason: "identity_conflict" };
+  }
+  const rawName = nonEmptyString(bot.name);
+  const name = rawName && Buffer.byteLength(rawName, "utf8") <= 512 && !/[\p{Cc}\p{Cf}]/u.test(rawName) ? rawName : null;
+  const icons = isRecord(bot.icons) ? bot.icons : {};
+  const avatarUrl = nonEmptyString(icons.image_72) ?? nonEmptyString(icons.image_48);
+  if (avatarUrl && Buffer.byteLength(avatarUrl, "utf8") <= 4096) {
+    try { input.onAvatarLocator?.(avatarUrl); } catch { /* a display hint cannot invalidate a verified profile */ }
+  }
+  return { kind: "fact", fact: { providerBotId: input.providerBotId, providerUserId: user, providerAppId: app,
+    providerAuthorityId: input.authority.providerAuthorityId, displayNameSnapshot: name,
+    avatarUrlDigest: avatarUrl ? sha256(avatarUrl) : null,
+    isDeleted: typeof bot.deleted === "boolean" ? bot.deleted : null, observedAt: input.now } };
 }
 
 export async function lookupSlackProviderUser(input: {

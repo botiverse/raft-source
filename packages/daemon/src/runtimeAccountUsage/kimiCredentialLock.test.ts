@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, utimesSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync, readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
@@ -100,6 +100,31 @@ test("task #1282: a lock reclaimed or removed under the daemon is reported as co
       return handle.isCompromised();
     }, { ...FAST, staleMs: 2000 });
     assert.deepEqual(result, { kind: "held", value: true });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a lock home this daemon creates is private and the sentinel is 0600; a sentinel that is a symbolic link is refused and its target untouched", async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "kimi-lock-v83-"));
+  try {
+    const home = path.join(root, ".kimi-code");
+    const target = path.join(home, "oauth", "kimi-code");
+    const held = await withKimiRefreshLock(target, async () => "ran", FAST);
+    assert.deepEqual(held, { kind: "held", value: "ran" });
+    assert.equal(statSync(home).mode & 0o777, 0o700);
+    assert.equal(statSync(path.dirname(target)).mode & 0o777, 0o700);
+    assert.equal(statSync(target).mode & 0o777, 0o600);
+
+    const victim = path.join(root, "victim");
+    writeFileSync(victim, "keep");
+    const linked = path.join(home, "oauth", "linked");
+    symlinkSync(victim, linked);
+    let ran = false;
+    const refused = await withKimiRefreshLock(linked, async () => { ran = true; return "ran"; }, FAST);
+    assert.equal(refused.kind, "unavailable");
+    assert.equal(ran, false);
+    assert.equal(readFileSync(victim, "utf8"), "keep");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

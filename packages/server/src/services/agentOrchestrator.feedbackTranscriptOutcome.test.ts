@@ -39,6 +39,9 @@ function replicaStore(): ReplicaStateStore {
     compareAndSetWakeCrashLoopState: async () => true,
     setAgentRuntimeError: async () => {},
     getAgentRuntimeError: async () => null,
+    setAgentContextViewAvailability: async () => {},
+    getAgentContextViewAvailability: async () => null,
+    clearAgentContextViewAvailability: async () => {},
     setMachineMeta: async () => {},
     getMachineMeta: async () => null,
     clearMachineMeta: async () => {},
@@ -371,4 +374,46 @@ test("O12 a malformed frame for an unrelated request never breaks message handli
   await h.deliver(MACHINE, typedResult(String(h.sent[0]!.requestId)) as never);
   const outcome = await pending as any;
   assert.equal(outcome.lookup?.reasonCode, "native_session_file_not_found");
+});
+
+// The daemon keeps an agent's config and session id in memory only. The
+// request carries the launch fields and the session id the server stores for
+// the agent, so a daemon that holds nothing (after its restart, or the
+// agent's terminal failure) can still find the session file.
+test("C1 the request carries the agent's runtime, model, session-home env var and stored session id; no other env var, no runtime settings, nothing else of its config", async () => {
+  const h = setup();
+  const envVars = { CODEX_HOME: "/srv/codex", ANTHROPIC_API_KEY: "sk-ant-secret", OPENAI_API_KEY: "sk-openai-secret", GROK_HOME: "/srv/grok" };
+  (h.orch as any).loadAgentForDelivery = async (agentId: string) => (agentId === AGENT
+    ? { id: AGENT, name: "secret-name", runtime: "codex", model: "gpt-5.6", runtimeConfig: { envVars: { ANTHROPIC_API_KEY: "sk-ant-in-runtime-config" } }, reasoningEffort: null, envVars, sessionId: "session-stored-on-server", serverId: "server-1", machineId: MACHINE }
+    : null);
+  const pending = h.request();
+  await vi.waitFor(() => assert.equal(h.sent.length, 1));
+  const lookup = h.sent[0]!.sessionLookup as Record<string, unknown>;
+  assert.equal(lookup.runtime, "codex");
+  assert.equal(lookup.model, "gpt-5.6");
+  assert.deepEqual(lookup.sessionHomeEnv, { CODEX_HOME: "/srv/codex" }, "only what the Codex session directory depends on");
+  assert.equal(lookup.sessionId, "session-stored-on-server");
+  assert.deepEqual(Object.keys(lookup).sort(), ["model", "runtime", "sessionHomeEnv", "sessionId"]);
+  // An agent's env vars are where API keys live: none of them is anywhere in the frame.
+  const frame = JSON.stringify(h.sent[0]);
+  for (const secret of ["sk-ant-secret", "sk-ant-in-runtime-config", "sk-openai-secret", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "secret-name", "/srv/grok"]) {
+    assert.equal(frame.includes(secret), false, secret);
+  }
+  await h.deliver(MACHINE, typedResult(String(h.sent[0]!.requestId)) as never);
+  await pending;
+});
+
+test("C2 a lookup that cannot be built never fails the request: it is sent without one", async () => {
+  for (const failure of ["missing", "throws"] as const) {
+    const h = setup();
+    (h.orch as any).loadAgentForDelivery = async () => {
+      if (failure === "throws") throw new Error("db unavailable");
+      return null;
+    };
+    const pending = h.request();
+    await vi.waitFor(() => assert.equal(h.sent.length, 1));
+    assert.equal("sessionLookup" in h.sent[0]!, false, failure);
+    await h.deliver(MACHINE, typedResult(String(h.sent[0]!.requestId)) as never);
+    await pending;
+  }
 });

@@ -31,8 +31,9 @@ import { Button, TooltipProvider } from "@botiverse/raft-ui";
 import AvatarSlot from "../ui/AvatarSlot";
 import { useServerStore } from "../../store/serverStore";
 import type { Server } from "../../store/serverStore";
+import type { ShortcutCombo } from "../../utils/keyboardShortcuts";
 import { getServerSwitcherTarget } from "../../utils/serverSwitcherNavigation";
-import { STRIP_DRAG_THRESHOLD_PX, reorderAfterDrag, stripCapacity, stripItems } from "./workspaceStripLayout";
+import { STRIP_DRAG_THRESHOLD_PX, reorderAfterDrag, stripItems } from "./workspaceStripLayout";
 import { WorkspaceStripButton, workspaceInitial } from "./WorkspaceStripButton";
 import { WorkspaceStripCurrentMark } from "./WorkspaceStripCurrentMark";
 import { WorkspaceStripSortableAvatar } from "./WorkspaceStripSortableAvatar";
@@ -56,14 +57,17 @@ function preventNativeDrag(event: DragEvent) {
   event.preventDefault();
 }
 
-export function WorkspaceStrip({ freePx, shortcutModifier = null, otherUnread = false }: {
-  freePx: number;
+export function WorkspaceStrip({ count: n, shortcutModifier = null, otherUnread = false }: {
+  /** How many avatars fit (stripCapacity, decided by the bar): 0 hides the strip. */
+  count: number;
   /** Another workspace with no avatar in the strip has unread: the current
    *  workspace's avatar carries that dot. */
   otherUnread?: boolean;
-  /** The host's "switch to workspace N" modifier ("⌘", "Ctrl+"), shown in
-   *  tooltips. Only the desktop app has that shortcut; in a browser ⌘1…⌘9
-   *  switch browser tabs, so the web passes nothing. */
+  /** The host's "switch to workspace N" modifier ("⌘", "Ctrl+"): where it is
+   *  set, the tooltips show ⌘N / Ctrl+N, drawn by KbdShortcut for the
+   *  platform (the host's modifier is the platform's command key). Only the
+   *  desktop app has that shortcut; in a browser ⌘1…⌘9 switch browser tabs,
+   *  so the web passes nothing. */
   shortcutModifier?: string | null;
 }) {
   const { formatMessage } = useIntl();
@@ -84,7 +88,6 @@ export function WorkspaceStrip({ freePx, shortcutModifier = null, otherUnread = 
     useSensor(KeyboardSensor, KEYBOARD_SENSOR_OPTIONS),
   );
 
-  const n = stripCapacity(freePx, servers.length);
   const { head, tail } = useMemo(() => {
     const { items, currentOutside } = stripItems(servers, currentId, n);
     // The out-of-range current workspace (last slot, after the divider) is not
@@ -94,6 +97,10 @@ export function WorkspaceStrip({ freePx, shortcutModifier = null, otherUnread = 
       : { head: items, tail: null };
   }, [servers, currentId, n]);
   const headIds = useMemo(() => head.map((s) => s.id), [head]);
+  // ⌘1…⌘9 by the switcher's order, one object per workspace, so an avatar's props stay the same between renders.
+  const shortcuts = useMemo(() => new Map<string, ShortcutCombo>(
+    shortcutModifier ? servers.slice(0, 9).map((server, index) => [server.id, { mod: true, key: String(index + 1) }]) : [],
+  ), [servers, shortcutModifier]);
   const active = activeId ? servers.find((s) => s.id === activeId) ?? null : null;
 
   const onPick = useCallback((server: Server) => {
@@ -141,11 +148,7 @@ export function WorkspaceStrip({ freePx, shortcutModifier = null, otherUnread = 
 
   if (head.length === 0 && !tail) return null;
 
-  const shortcutFor = (server: Server) => {
-    if (!shortcutModifier) return null;
-    const position = servers.indexOf(server);
-    return position >= 0 && position < 9 ? `${shortcutModifier}${position + 1}` : null;
-  };
+  const shortcutFor = (server: Server) => shortcuts.get(server.id) ?? null;
 
   return (
     <TooltipProvider>
@@ -185,7 +188,7 @@ export function WorkspaceStrip({ freePx, shortcutModifier = null, otherUnread = 
           <DragOverlay>
             {active ? (
               <div className="flex scale-110 items-center rounded-sticker shadow-float">
-                <Button variant="ghost" size="icon-sm" tabIndex={-1} aria-hidden>
+                <Button variant="ghost" size="icon-md" tabIndex={-1} aria-hidden>
                   <AvatarSlot context="creator-link" type="server" serverAvatarUrl={active.avatarUrl} serverInitial={workspaceInitial(active)} />
                 </Button>
               </div>

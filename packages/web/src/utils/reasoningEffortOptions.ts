@@ -1,6 +1,8 @@
 import {
-  BASE_REASONING_EFFORTS,
   REASONING_EFFORTS,
+  defaultReasoningEffortsForRuntime,
+  isReasoningEffortOfferedOnRuntime,
+  runtimeOffersUndeclaredReasoningEfforts,
   RUNTIME_MODELS,
 } from "@botiverse/raft-shared";
 import type {
@@ -16,7 +18,7 @@ import type { MessageId } from "../i18n/messages";
  * model's declared `supportedReasoningEfforts` (see `RUNTIME_MODELS.codex` —
  * the GPT-5.6 variants sol/terra expose all six efforts including `ultra`,
  * luna omits `ultra`). Labels come from the shared `REASONING_EFFORTS` catalog
- * (`xhigh` renders as "Extra High"). Models that don't declare a supported set
+ * (`xhigh` renders as "Extra high"). Models that don't declare a supported set
  * (e.g. Claude) fall back to the BASE set (low/medium/high/xhigh) — `max`/`ultra`
  * are opt-in only and must never leak to a non-declaring model (task #496).
  *
@@ -29,6 +31,8 @@ export function reasoningEffortLabelId(effort: string): MessageId | null {
 }
 
 export const REASONING_EFFORT_LABEL_ID: Record<ReasoningEffort, MessageId> = {
+  off: "agent.reasoningEffort.off",
+  minimal: "agent.reasoningEffort.minimal",
   low: "agent.reasoningEffort.low",
   medium: "agent.reasoningEffort.medium",
   high: "agent.reasoningEffort.high",
@@ -38,6 +42,8 @@ export const REASONING_EFFORT_LABEL_ID: Record<ReasoningEffort, MessageId> = {
 };
 
 export const REASONING_EFFORT_DESCRIPTION_ID: Partial<Record<ReasoningEffort, MessageId>> = {
+  off: "agent.reasoningEffort.offDescription",
+  minimal: "agent.reasoningEffort.minimalDescription",
   low: "agent.reasoningEffort.lowDescription",
   medium: "agent.reasoningEffort.mediumDescription",
   high: "agent.reasoningEffort.highDescription",
@@ -81,10 +87,13 @@ export function reasoningEffortOptionsForModel(
 ): ReasoningEffortOption[] {
   const supported = resolveModelInfo(runtime, modelId, liveModels)?.supportedReasoningEfforts;
   // Never fall back to the full catalog: models without a declared set get the
-  // BASE efforts only, so max/ultra can't leak to e.g. Claude (task #496).
+  // BASE efforts only, so max/ultra can't leak to e.g. Claude (task #496), or
+  // none where the runtime applies only listed levels (Antigravity).
   const allowed = supported && supported.length > 0
-    ? REASONING_EFFORTS.filter((effort) => supported.includes(effort.id))
-    : REASONING_EFFORTS.filter((effort) => BASE_REASONING_EFFORTS.includes(effort.id));
+    ? REASONING_EFFORTS.filter((effort) => supported.includes(effort.id) && isReasoningEffortOfferedOnRuntime(runtime, effort.id))
+    : runtimeOffersUndeclaredReasoningEfforts(runtime)
+      ? REASONING_EFFORTS.filter((effort) => defaultReasoningEffortsForRuntime(runtime).includes(effort.id))
+      : [];
   return allowed.map((effort) => ({
     value: effort.id,
     labelId: REASONING_EFFORT_LABEL_ID[effort.id],
@@ -109,7 +118,8 @@ export function reconcileReasoningEffort(
 ): ReasoningEffort | null {
   const info = resolveModelInfo(runtime, modelId, liveModels);
   const supported = info?.supportedReasoningEfforts;
-  if (!supported || supported.length === 0) return current;
+  // A model with no listed levels on a runtime that offers none for it: Default.
+  if (!supported || supported.length === 0) return runtimeOffersUndeclaredReasoningEfforts(runtime) ? current : null;
   if (current && supported.includes(current)) return current;
   const fallback = info?.defaultReasoningEffort;
   return fallback && supported.includes(fallback) ? (fallback as ReasoningEffort) : null;

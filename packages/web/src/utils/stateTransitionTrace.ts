@@ -14,9 +14,11 @@ export function __setStateTransitionEmitterForTest(next: StateTransitionEmitter 
   emitter = next ?? emitWebEvent;
 }
 
-export function emitStateTransitionTrace(input: StateTransitionTraceInput): void {
+/** `extraAttrs`: flat attributes beside key/meta (e.g. `tab.visibility`). */
+export function emitStateTransitionTrace(input: StateTransitionTraceInput, extraAttrs?: Readonly<Record<string, string>>): void {
   try {
-    emitter("slock.state.transition", buildStateTransitionTraceAttrs(input) as unknown as Record<string, unknown>);
+    const attrs = buildStateTransitionTraceAttrs(input) as unknown as Record<string, unknown>;
+    emitter("slock.state.transition", extraAttrs ? { ...attrs, ...extraAttrs } : attrs);
   } catch {
     // Trace emission must never affect state transitions.
   }

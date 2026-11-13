@@ -5,6 +5,10 @@
  */
 export const SLACK_BRIDGE_PRODUCT_FEATURE_FLAG_KEYS = {
   bridge: "slack_bridge_v0",
-  attachments: "slack_attachment_transfer",
-  reactions: "slack_reaction_sync",
 } as const;
+
+/** Old rows stay in storage during rolling upgrades but are not operator switches. */
+export const SLACK_BRIDGE_RETIRED_FEATURE_FLAG_KEYS = [
+  "slack_attachment_transfer",
+  "slack_reaction_sync",
+] as const;

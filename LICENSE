@@ -1,3 +1,69 @@
+# Raft License
+
+SPDX-License-Identifier: LicenseRef-Raft-License
+
+Raft Community Edition is licensed under the Functional Source License, Version 1.1, ALv2 Future License (FSL-1.1-ALv2), reproduced unmodified in Part II, with the additional conditions in Part I. Part I and Part II together are the "Raft License".
+
+This license applies to releases of the Software from November 13, 2026. Releases before that date stay under FSL-1.1-ALv2 alone.
+
+For a separate license or permission, email contact@raft.build.
+
+## Part I: Additional conditions
+
+### 1. Definitions
+
+a. A "Deployment" is one running installation of the server component of the Software, together with the database it uses.
+
+b. A "Human User Account" is any account on a Deployment that a natural person can use to post, edit, or take part in work. Guest accounts that can only take part in a single channel they were invited to, accounts that can only view content, and accounts used by software agents are not Human User Accounts.
+
+c. A "Raft User Interface" is any user interface built from the user interface code of the Software, even if it is modified, moved, or renamed.
+
+d. "Our Hosted Service" means any version of Raft that we, or anyone acting for us, host and offer to others, under any name or at any address.
+
+### 2. User limit
+
+a. Unless we have given you a separate license or written permission, a Deployment may have no more than 5 Human User Accounts (the "User Limit"), whatever you use it for, including your internal use, non-commercial education, non-commercial research, and every other Permitted Purpose in Part II.
+
+b. You may not remove, raise, or work around the User Limit built into the Software. Changing the Software does not change the User Limit in this license.
+
+### 3. Registration
+
+You may not let people create Human User Accounts on a Deployment by signing themselves up, for example through a public sign-up page. Human User Accounts must be created or invited by an administrator of the Deployment.
+
+### 4. Services for others
+
+Unless we have given you a separate license, you may not deploy, operate, maintain, host, or provide access to the Software for others for a fee or other compensation. This includes service, deployment, maintenance, hosting, membership and access fees, and anything similar. It also includes professional services under Permitted Purpose 4 in Part II. It does not cover fees or other compensation that come from your own internal use of the Software.
+
+### 5. Prohibited uses
+
+a. Competing Use, as defined in Part II, is still prohibited.
+
+b. Unless we have given you a separate license or written permission, you may not make the Software available to the public as a substitute for Our Hosted Service, whether or not you charge for it.
+
+### 6. Name and attribution
+
+a. You may not remove, hide, or change the "Powered by Raft Community Edition" notice or the Raft logo in a Raft User Interface, unless we have given you written permission.
+
+b. Our trademarks are covered by the Trademarks section of Part II. Unless we have given you written permission, when you distribute the Software or a modified version of it, you must make clear that it is based on “Raft Community Edition”. You may say your version is "based on Raft Community Edition", but you may not call it "Raft" or suggest that we made or endorse it.
+
+### 7. Support and updates
+
+We do not guarantee support, maintenance, updates, or security patches for Raft Community Edition. We may provide them at our discretion. If you have a separate license or agreement with us, support and updates are covered by it.
+
+### 8. Licenses and permissions in writing
+
+A separate license, a written permission (for example, to go above the User Limit), and a trademark permission are separate grants. Each must be given by us expressly and in writing, and covers only what it says. Email counts as writing. To ask for any of them, email contact@raft.build.
+
+### 9. Future license
+
+On the date a version of the Software becomes available under the Apache License, Version 2.0 through the Grant of Future License in Part II, the conditions in this Part I no longer apply to that version.
+
+### 10. Precedence and redistribution
+
+If Part I and Part II conflict, Part I controls. When you redistribute the Software, the copy or link required by Part II must cover this complete file, including Part I.
+
+## Part II: Functional Source License, Version 1.1, ALv2 Future License
+
 # Functional Source License, Version 1.1, ALv2 Future License
 
 ## Abbreviation

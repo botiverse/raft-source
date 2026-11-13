@@ -111,39 +111,9 @@ async function insertProjection(input: {
     uploaderId: input.userId,
     uploaderType: "user",
     filename: input.object.storageKey,
-    mimeType: input.object.mimeType,
-    sizeBytes: input.object.sizeBytes,
-    storageKey: input.object.storageKey,
-    thumbnailKey: input.object.thumbnailKey,
-    contentHash: input.object.contentHash,
-    width: input.object.width,
-    height: input.object.height,
     revokedAt: input.revokedAt,
     revokedById: input.revokedAt ? "inventory-test" : null,
     revokedByType: input.revokedAt ? "system" : null,
-  }).returning();
-  assert.ok(projection);
-  return projection;
-}
-
-async function insertObjectlessProjection(input: {
-  db: Database;
-  channelId: string;
-  userId: string;
-  storageKey: string;
-}) {
-  const [projection] = await input.db.insert(attachments).values({
-    id: randomUUID(),
-    objectId: null,
-    messageId: null,
-    pendingChannelId: input.channelId,
-    channelId: input.channelId,
-    uploaderId: input.userId,
-    uploaderType: "user",
-    filename: input.storageKey,
-    mimeType: "application/octet-stream",
-    sizeBytes: 10,
-    storageKey: input.storageKey,
   }).returning();
   assert.ok(projection);
   return projection;
@@ -281,24 +251,19 @@ test("read-only inspection persists nothing and upload receipt without a message
   }
 });
 
-test("verified objectless history satisfies byte coverage but not migration completion", async () => {
+test("objectless history cannot exist: the database refuses a projection without an object", async () => {
   const f = await fixture();
   try {
-    const storageKey = `${f.serverId}/legacy-objectless.bin`;
-    await insertObjectlessProjection({ ...f, storageKey });
-
-    const report = await inspectAttachmentArtifactInventory(f.db, {
-      evidenceSource: "legacy-objectless-coverage-test",
-      sourceRevision: "test-head",
-      observedAt: new Date("2026-08-12T10:00:00.000Z"),
-      attachmentStorage: new InventoryStorage(new Map([[storageKey, 10]])),
-      cdnStorage: null,
-    });
-
-    assert.equal(report.legacyObjectlessProjectionCount, 1);
-    assert.deepEqual(report.observations, { exists: 1, missing: 0, unverified: 0 });
-    assert.equal(report.coverageEligible, true, "inventory coverage includes pre-backfill objectless history");
-    assert.equal(report.fullMigrationEligible, false, "objectless backlog remains a completion blocker");
+    await assert.rejects(f.db.insert(attachments).values({
+      id: randomUUID(),
+      objectId: null as unknown as string,
+      messageId: null,
+      pendingChannelId: f.channelId,
+      channelId: f.channelId,
+      uploaderId: f.userId,
+      uploaderType: "user",
+      filename: `${f.serverId}/legacy-objectless.bin`,
+    }));
   } finally {
     await f.client.close();
   }

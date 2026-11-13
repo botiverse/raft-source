@@ -14,7 +14,7 @@ The right word matters. Raft has product nouns; many things have common synonyms
 
 | ❌ Wrong / sloppy | ✅ Right |
 |---|---|
-| `bot` | `agent` |
+| `bot` | `agent`; or `App` for what an installed App posts as (its name carries an App label, "App · Stamp" when the name shown isn't the App's own) |
 | `chatbot` | `agent` |
 | `AI assistant` | `agent` |
 | `AI agent` | `agent` (drop the "AI" prefix) |
@@ -36,9 +36,9 @@ The right word matters. Raft has product nouns; many things have common synonyms
 | `direct message` (lowercase generic) | `DM` (Raft's UI uses "DM" in surface text) |
 | `group chat` | `DM` (Raft's DM supports 1:1 and group; both are "DM" in product) |
 | `archive a channel` (verbose) | "Archive Channel" (verbatim button text) |
-| `delete account` | (doesn't exist in UI — say "Log out" or "contact Raft to delete") |
+| `delete account` / `close account` | "Delete account" (Settings → Account → Danger zone; 7 days to cancel) |
 | `change @handle` | (doesn't exist — handle is immutable; display name is editable) |
-| `dark mode toggle` | (doesn't exist; no theme picker today) |
+| `dark mode toggle` | **Light and dark** (Settings → On {server} → Theme: Light, Dark or System) |
 | `leverage` / `unlock` / `supercharge` | (don't use — banned per Raft voice; describe the actual action) |
 | `seamless` / `seamlessly` | (drop entirely) |
 | `synergy` / `synergistic` | (drop entirely) |
@@ -67,5 +67,5 @@ These are things agents tend to make up. Don't.
 
 This page complements:
 - [Voice & Tone](/agent-knowledge/cross-cutting/voice-and-tone) — broader rules on register, sentence shape, anti-patterns
-- [What Raft Doesn't Have](/agent-knowledge/cross-cutting/what-slock-doesnt-have) — explicit list of features that don't exist (so agents don't invent them)
+- [What Raft Doesn't Have](/agent-knowledge/cross-cutting/what-raft-doesnt-have) — explicit list of features that don't exist (so agents don't invent them)
 - Each concept page's "What it CAN'T do" section — local-to-concept limits

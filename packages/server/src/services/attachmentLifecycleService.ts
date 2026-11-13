@@ -41,6 +41,11 @@ import {
   assertChannelWritableInTransaction,
   assertChannelWritableOrConversionDrainInTransaction,
 } from "./channelConversionFenceService";
+import {
+  addAttachmentObjectHoldWithExecutor,
+  attachmentObjectHasHoldSql,
+  removeAttachmentObjectHoldsWithExecutor,
+} from "./attachmentObjectHoldService";
 
 export const ATTACHMENT_RESERVATION_TTL_MS = 60 * 60 * 1000;
 export const ATTACHMENT_LIFECYCLE_SWEEP_INTERVAL_MS = 15 * 60 * 1000;
@@ -155,6 +160,11 @@ export async function createAttachmentLifecycleFoundationWithExecutor(
       `Attachment reservation ${input.reservationId} was not created.`,
     );
   }
+  await addAttachmentObjectHoldWithExecutor(executor, {
+    holderType: "upload_reservation",
+    holderId: reservation.id,
+    objectId: reservation.objectId,
+  });
   return reservation;
 }
 
@@ -292,9 +302,17 @@ export async function consumeAttachmentReservationsWithExecutor(
       );
     }
   }
+  // The reservation's hold is handed to the linked attachment by the caller
+  // (linkAttachmentsToMessageWithExecutor), in this same transaction.
 }
 
-async function claimObjectGcIfUnreferencedWithExecutor(
+/**
+ * Queue the object for collection (gc_pending + a GC job) when nothing refers
+ * to it any more: no linked unrevoked attachment, no pending reservation, no
+ * hold. The caller holds the object FOR UPDATE. Returns the GC token, or null
+ * when it is still referenced or no longer active.
+ */
+export async function claimObjectGcIfUnreferencedWithExecutor(
   executor: DatabaseExecutor,
   objectId: string,
   now: Date,
@@ -314,6 +332,13 @@ async function claimObjectGcIfUnreferencedWithExecutor(
     ))
     .limit(1);
   if (activeProjection || pendingReservation) return null;
+  // Holds are the platform's authority: any holder (including future app
+  // holders that have no attachment row) keeps the bytes. The caller holds
+  // the object FOR UPDATE, which conflicts with addHold's FOR NO KEY UPDATE,
+  // so a hold either committed before this check or will find the object
+  // gc_pending.
+  const held = await executor.execute(sql`SELECT ${attachmentObjectHasHoldSql(objectId)} AS held`);
+  if ((held.rows as Array<{ held: boolean }>)[0]?.held) return null;
 
   const gcToken = randomUUID();
   const [claimed] = await executor.update(attachmentObjects).set({
@@ -371,6 +396,11 @@ export async function terminateAttachmentReservationWithExecutor(
     eq(attachmentUploadReservations.state, "pending"),
   )).returning();
   if (!updated) return null;
+  await removeAttachmentObjectHoldsWithExecutor(executor, [{
+    holderType: "upload_reservation",
+    holderId: reservation.id,
+    objectId: object.id,
+  }], now);
 
   // Remove only the rollback-compatible pending projection while holding the
   // same object/reservation fence. A concurrently consumed projection cannot

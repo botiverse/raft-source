@@ -6,6 +6,11 @@
       "revision": 2,
       "sourceSha256": "e47e0d12055c37c01c522f608e5d1b2e56378a588b24894f450468353791bdad",
       "change": "Baseline: first tracked revision. Every source before this one (including bindings generated from it) is treated as revision 1 and incompatible: Gate B2 replaced expectedRowVersion with throughActivitySeq and DifferenceIngress gained paging fields without a version change."
+    },
+    {
+      "revision": 3,
+      "sourceSha256": "1cbe55c751b86871408f84e9c98c7fcbe2dcd7b02214b64d66de574c8f72b263",
+      "change": "Retire the unused Activity snapshot/difference HTTP operations with the Web sync-core cutover path. Existing inbox, read-all and Done operations and binding model shapes are unchanged."
     }
   ]
 }

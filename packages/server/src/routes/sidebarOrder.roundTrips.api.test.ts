@@ -10,7 +10,7 @@ import { addHuman, createChannel, findOrCreateDM, findOrCreateUserDM, listChanne
 import { createMessage } from "../services/messageService";
 import { createServer, headers, seedUser } from "./channels.api.fixtures";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 type PgliteLike = { query: (...args: unknown[]) => Promise<unknown> };
 

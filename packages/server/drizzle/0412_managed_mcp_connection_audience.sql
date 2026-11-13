@@ -1,0 +1,12 @@
+-- MCP Apps: bind each Connection's secret to the endpoint it was authorized or validated against.
+--
+-- Defense in depth for endpoint changes: OAuth tokens are usable only while the App still points at
+-- exactly this URL, API-key values only while it points at the same origin. Admission and the OAuth
+-- refresh path both check it, so a secret is never sent to a server it was not entered for even if
+-- some write path forgets to clear it.
+--
+-- Rolling deploy: expand-only. A nullable column with no default is a metadata-only change. Older
+-- binaries neither read nor write it; NULL (every existing row, and rows an older binary inserts)
+-- keeps today's behaviour. If an older binary moves an App's endpoint without clearing a
+-- Connection, the stale value here makes new binaries refuse that Connection.
+ALTER TABLE "managed_mcp_credentials" ADD COLUMN "authorized_endpoint_url" text;

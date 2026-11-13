@@ -96,6 +96,10 @@ export class AgentStartCoordinator {
     return this.queuedByAgent.get(agentId);
   }
 
+  queuedItems(): IterableIterator<AgentStartQueueItem> {
+    return this.queuedByAgent.values();
+  }
+
   queueAgeMs(agentId: string, now: number): number {
     const item = this.queuedByAgent.get(agentId);
     return item ? Math.max(0, now - item.enqueuedAtMs) : 0;

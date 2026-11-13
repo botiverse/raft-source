@@ -14,7 +14,8 @@ type ExpectedOperations =
   | "createAttachmentUploadSession"
   | "getAttachmentUploadCapabilities"
   | "getAttachmentUploadSession"
-  | "listAttachmentUploadSessions";
+  | "listAttachmentUploadSessions"
+  | "markConversationUnread";
 
 type CapabilitiesBody = operations["getAttachmentUploadCapabilities"]["responses"][200]["content"]["application/json"];
 type StatusBody = operations["getAttachmentUploadSession"]["responses"][200]["content"]["application/json"];

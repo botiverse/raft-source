@@ -5,6 +5,7 @@ import { currentTimeMs, sanitizeAppLocalReturnPath } from "@botiverse/raft-share
 import { getDb, type DatabaseExecutor } from "../db/index";
 import { oauthTransactions, socialAuthCompletions, userAuthIdentities } from "../db/schema";
 import { getAppUrl as getConfiguredOrDefaultAppUrl } from "../config/appUrl";
+import { socialLoginAllowed } from "../edition";
 import { findExistingSocialLoginUser, getUserByEmail, SocialEmailConflictError } from "./userService";
 
 export type SocialAuthProvider = "google" | "github" | "apple";
@@ -212,6 +213,11 @@ function hashPkceVerifier(verifier: string): string {
   return base64Url(createHash("sha256").update(verifier).digest());
 }
 
+/** The S256 code challenge of a PKCE verifier (what a mobile OAuth request stores). */
+export function pkceS256Challenge(verifier: string): string {
+  return hashPkceVerifier(verifier);
+}
+
 function getConfiguredMobileReturnUris(): string[] {
   const configured = parseConfiguredMobileReturnUris(process.env.MOBILE_OAUTH_RETURN_URI);
   if (configured.length > 0) return configured;
@@ -349,6 +355,7 @@ function createNativeAppleClientSecret(): string {
 }
 
 export function isNativeAppleSignInConfigured(): boolean {
+  if (!socialLoginAllowed()) return false;
   if (!getNativeAppleClientId()) return false;
   return !!process.env.APPLE_IOS_CLIENT_SECRET || (
     !!process.env.APPLE_TEAM_ID &&
@@ -916,6 +923,7 @@ function toMobileOAuthCompletionResult(request: typeof oauthTransactions.$inferS
 }
 
 export async function getMobileOAuthCompletion(handoffCode: string, codeVerifier: string): Promise<MobileOAuthCompletionResult> {
+  assertSocialLoginAllowed();
   const database = getDb();
   const codeHash = hashValue(parseRequiredBoundedString(handoffCode, "handoffCode", 256));
   const verifier = parseRequiredBoundedString(codeVerifier, "codeVerifier", 256);
@@ -965,11 +973,30 @@ export async function markMobileOAuthCompletionConsumed(requestId: string): Prom
   }
 }
 
+/** A social sign-in code or token redeemed in an edition without social login (edition.ts). */
+export class SocialLoginUnavailableError extends Error {
+  readonly code = "provider_not_configured";
+  constructor() {
+    super("Social sign-in is not available on this server; sign in with your email and password instead.");
+    this.name = "SocialLoginUnavailableError";
+  }
+}
+
+/**
+ * The starts refuse through isSocialAuthProviderConfigured; this refuses what
+ * arrives with an already-issued code or token (provider callback, completion
+ * exchange, pending link), so none of it rests on "no start, no code".
+ */
+export function assertSocialLoginAllowed(): void {
+  if (!socialLoginAllowed()) throw new SocialLoginUnavailableError();
+}
+
 export function getSocialAuthProvider(providerId: string): SocialAuthProviderConfig | null {
   return SOCIAL_AUTH_PROVIDERS.find((provider) => provider.id === providerId) || null;
 }
 
 export function isSocialAuthProviderConfigured(provider: SocialAuthProvider): boolean {
+  if (!socialLoginAllowed()) return false;
   switch (provider) {
     case "google":
       return !!process.env.GOOGLE_CLIENT_ID && !!process.env.GOOGLE_CLIENT_SECRET;
@@ -1052,6 +1079,7 @@ export function buildAuthorizationUrl(
 }
 
 export async function exchangeProviderCode(provider: SocialAuthProvider, code: string): Promise<{ accessToken: string }> {
+  assertSocialLoginAllowed();
   switch (provider) {
     case "google": {
       const response = await fetch("https://oauth2.googleapis.com/token", {
@@ -1420,6 +1448,7 @@ function validateSocialAuthCompletion(provider: SocialAuthProvider, completion: 
 }
 
 export async function getSocialAuthCompletion(provider: SocialAuthProvider, code: string): Promise<SocialAuthCompletionResult> {
+  assertSocialLoginAllowed();
   const database = getDb();
   const codeHash = hashValue(code);
 
@@ -1437,6 +1466,7 @@ export async function getSocialAuthCompletion(provider: SocialAuthProvider, code
 }
 
 export async function exchangeSocialAuthCompletion(provider: SocialAuthProvider, code: string): Promise<SocialAuthCompletionResult> {
+  assertSocialLoginAllowed();
   const database = getDb();
   const codeHash = hashValue(code);
 
@@ -1483,6 +1513,7 @@ export interface PendingSocialLink {
 }
 
 async function convertCompletionToPendingLink(match: SQL): Promise<PendingSocialLink> {
+  assertSocialLoginAllowed();
   const database = getDb();
   const live = and(
     match,
@@ -1527,9 +1558,15 @@ export async function exchangeMobileConflictCompletionForPendingLink(requestId: 
   return convertCompletionToPendingLink(eq(socialAuthCompletions.id, requestId));
 }
 
-function parsePendingLinkTokenHash(token: string): string {
+/**
+ * The stored form of a pending link token: what a second-factor sign-in
+ * challenge carries in place of the token (services/secondFactor/signIn.ts).
+ */
+export function pendingSocialLinkTokenHash(token: string): string {
   return hashValue(parseRequiredBoundedString(token, "pendingLinkToken", 256));
 }
+
+const parsePendingLinkTokenHash = pendingSocialLinkTokenHash;
 
 async function loadLivePendingLink(tokenHash: string) {
   const database = getDb();
@@ -1546,7 +1583,13 @@ async function loadLivePendingLink(tokenHash: string) {
  * credential (an OAuth completion code) before the claim could refuse.
  */
 export async function assertPendingSocialLinkFor(token: string, userId: string | null | undefined): Promise<SocialAuthProfile> {
-  const row = await loadLivePendingLink(parsePendingLinkTokenHash(token));
+  return assertPendingSocialLinkForHash(parsePendingLinkTokenHash(token), userId);
+}
+
+/** assertPendingSocialLinkFor by the token's stored hash (pendingSocialLinkTokenHash). */
+export async function assertPendingSocialLinkForHash(tokenHash: string, userId: string | null | undefined): Promise<SocialAuthProfile> {
+  assertSocialLoginAllowed();
+  const row = await loadLivePendingLink(tokenHash);
   if (!row) throw new PendingSocialLinkError("pending_link_expired");
   if (!userId || row.userId !== userId) throw new PendingSocialLinkError("pending_link_account_mismatch");
   return pendingLinkProfile(row);
@@ -1575,7 +1618,16 @@ export async function claimPendingSocialLink(
   userId: string,
   database: DatabaseExecutor = getDb(),
 ): Promise<SocialAuthProfile> {
-  const tokenHash = parsePendingLinkTokenHash(token);
+  return claimPendingSocialLinkByHash(parsePendingLinkTokenHash(token), userId, database);
+}
+
+/** claimPendingSocialLink by the token's stored hash (pendingSocialLinkTokenHash). */
+export async function claimPendingSocialLinkByHash(
+  tokenHash: string,
+  userId: string,
+  database: DatabaseExecutor = getDb(),
+): Promise<SocialAuthProfile> {
+  assertSocialLoginAllowed();
   const [row] = await database.update(socialAuthCompletions).set({ status: "completed" }).where(and(
     eq(socialAuthCompletions.codeHash, tokenHash),
     eq(socialAuthCompletions.status, "pending_link"),

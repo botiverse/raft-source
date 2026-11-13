@@ -11,7 +11,7 @@ import type {
   MouseEvent,
 } from "react";
 import { IntlContext } from "react-intl";
-import { en } from "../../i18n/messages/en";
+import { enFallback } from "../../i18n/messages/enFallback";
 import ShowMoreToggle from "../ui/ShowMoreToggle";
 import {
   MessageTimelineKeepMessageVisibleContext,
@@ -231,7 +231,10 @@ export default function CollapsibleMessageContent({
         id={contentDomId}
         data-message-collapsible-content="true"
         data-message-collapsed={collapsed ? "true" : "false"}
-        className={collapsed ? "relative overflow-clip" : ""}
+        // The fold fades with a mask on the clipped box itself (raft-ui
+        // spacing.md › Edges fade), so a hovered, located or tinted row shows
+        // through the fade instead of a canvas-coloured band.
+        className={collapsed ? (overflows ? "relative overflow-clip mask-fade-b" : "relative overflow-clip") : ""}
         style={collapsed ? { maxHeight: COLLAPSED_MESSAGE_CONTENT_HEIGHT_PX } : undefined}
         onFocusCapture={(event) => {
           if (!collapsed) return;
@@ -245,13 +248,6 @@ export default function CollapsibleMessageContent({
         <div ref={contentRef} data-message-collapsible-measure="true">
           {children}
         </div>
-        {collapsed && overflows ? (
-          <div
-            aria-hidden="true"
-            data-message-collapse-fade="true"
-            className="pointer-events-none absolute inset-x-0 bottom-0 h-12 bg-gradient-to-t from-layer-canvas to-transparent"
-          />
-        ) : null}
       </div>
       {overflows ? (
         <MessageContentToggle
@@ -270,7 +266,7 @@ export default function CollapsibleMessageContent({
 
 function MessageContentTogglePlaceholder() {
   const intl = useContext(IntlContext);
-  const collapsedLabel = intl?.formatMessage({ id: "message.content.showMore" }) ?? en["message.content.showMore"];
+  const collapsedLabel = intl?.formatMessage({ id: "message.content.showMore" }) ?? enFallback["message.content.showMore"];
   return (
     <ShowMoreToggle
       expanded={false}
@@ -300,9 +296,9 @@ function MessageContentToggle({
   messageId,
 }: MessageContentToggleProps) {
   const intl = useContext(IntlContext);
-  const collapsedLabel = intl?.formatMessage({ id: "message.content.showMore" }) ?? en["message.content.showMore"];
+  const collapsedLabel = intl?.formatMessage({ id: "message.content.showMore" }) ?? enFallback["message.content.showMore"];
   // Stryker disable next-line StringLiteral: the missing-Intl fallback equals ShowMoreToggle's canonical default; active-provider English and Chinese labels are behavior-tested.
-  const expandedLabel = intl?.formatMessage({ id: "message.content.collapse" }) ?? en["message.content.collapse"];
+  const expandedLabel = intl?.formatMessage({ id: "message.content.collapse" }) ?? enFallback["message.content.collapse"];
   return (
     <ShowMoreToggle
       expanded={expanded}

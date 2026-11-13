@@ -18,7 +18,7 @@ import {
 
 const serverX = "00000000-0000-4000-8000-00000000cc01";
 const serverY = "00000000-0000-4000-8000-00000000cc02";
-const testAppOptions = { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false };
+const testAppOptions = { humanActivityMuteFlagDefaultEnabled: true };
 
 async function withFlag(key: string, run: () => Promise<void>): Promise<void> {
   const { close } = await openTestApp("pglite://", 0, testAppOptions);

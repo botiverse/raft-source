@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$comment": "Generated from packages/runtime-form/contract/runtime-form-v2.contract.json (sha256 8b82ac6e39a87e8d). Do not edit.",
+  "$comment": "Generated from packages/runtime-form/contract/runtime-form-v2.contract.json (sha256 3cb5909f1162bb26). Do not edit.",
   "$defs": {
     "Definition": {
       "type": "object",
@@ -14,7 +14,10 @@
       "properties": {
         "protocolVersion": {
           "type": "integer",
-          "const": 2
+          "enum": [
+            2,
+            3
+          ]
         },
         "runtimeId": {
           "type": "string"
@@ -80,6 +83,12 @@
           "type": "object",
           "additionalProperties": {
             "$ref": "#/$defs/FieldSchema"
+          }
+        },
+        "allOf": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ConditionalRequired"
           }
         }
       },
@@ -164,6 +173,12 @@
           "additionalProperties": {
             "$ref": "#/$defs/FieldCopy"
           }
+        },
+        "rules": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Rule"
+          }
         }
       },
       "additionalProperties": true
@@ -214,6 +229,46 @@
             "type": "string"
           }
         }
+      },
+      "additionalProperties": true
+    },
+    "Rule": {
+      "type": "object",
+      "description": "v3: JSONForms-style rule for the field at `scope`.",
+      "required": [
+        "scope",
+        "effect",
+        "condition"
+      ],
+      "properties": {
+        "scope": {
+          "type": "string"
+        },
+        "effect": {
+          "type": "string",
+          "enum": [
+            "SHOW",
+            "HIDE"
+          ]
+        },
+        "condition": {
+          "$ref": "#/$defs/Condition"
+        }
+      },
+      "additionalProperties": true
+    },
+    "Condition": {
+      "type": "object",
+      "description": "v3: `schema` is evaluated against the value at `scope` (`#` = the whole values object, `#/properties/<key>` = one field). Supported keywords: const, enum (structural equality: object key order does not count), pattern (a portable ECMAScript subset, unanchored unless the pattern anchors; see the package README), not, anyOf, allOf, properties. An absent value is evaluated as \"\". A schema using any other keyword, or a pattern outside the subset, is unsupported: the client treats the whole form as unavailable (new keywords need a required client capability). packages/runtime-form/fixtures/v3.conditions.conformance.json is the conformance table every client runs.",
+      "required": [
+        "scope",
+        "schema"
+      ],
+      "properties": {
+        "scope": {
+          "type": "string"
+        },
+        "schema": {}
       },
       "additionalProperties": true
     },
@@ -362,6 +417,22 @@
         },
         "retryable": {
           "type": "boolean"
+        },
+        "state": {
+          "type": "string",
+          "enum": [
+            "stale",
+            "unavailable"
+          ]
+        },
+        "fetchedAt": {
+          "type": "string"
+        },
+        "unavailableOptions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/UnavailableOption"
+          }
         }
       },
       "additionalProperties": true
@@ -413,6 +484,38 @@
       },
       "additionalProperties": true
     },
+    "UnavailableOption": {
+      "type": "object",
+      "description": "An option shown greyed in a select (OptionSource.unavailableOptions), never selectable as a new pick.",
+      "required": [
+        "value",
+        "label"
+      ],
+      "properties": {
+        "value": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "connectionId": {
+          "type": "string"
+        },
+        "underlyingProviderId": {
+          "type": "string"
+        },
+        "group": {
+          "type": "string"
+        },
+        "providerKind": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
+    },
     "SubmitRef": {
       "type": "object",
       "required": [
@@ -422,7 +525,10 @@
       "properties": {
         "protocolVersion": {
           "type": "integer",
-          "const": 2
+          "enum": [
+            2,
+            3
+          ]
         },
         "runtimeId": {
           "type": "string"
@@ -444,6 +550,38 @@
         "formValues": {
           "type": "object",
           "additionalProperties": {}
+        }
+      },
+      "additionalProperties": true
+    },
+    "ConditionalRequired": {
+      "type": "object",
+      "description": "v3: one `dataSchema.allOf` entry (JSON Schema if/then/else limited to `required`).",
+      "required": [
+        "if"
+      ],
+      "properties": {
+        "if": {},
+        "then": {
+          "$ref": "#/$defs/RequiredClause"
+        },
+        "else": {
+          "$ref": "#/$defs/RequiredClause"
+        }
+      },
+      "additionalProperties": true
+    },
+    "RequiredClause": {
+      "type": "object",
+      "required": [
+        "required"
+      ],
+      "properties": {
+        "required": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
         }
       },
       "additionalProperties": true

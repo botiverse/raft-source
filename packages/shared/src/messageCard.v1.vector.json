@@ -1,0 +1,3415 @@
+{
+  "contract": "message-card.v1",
+  "schemaVersion": 1,
+  "notes": "Shared contract for card messages (RFC 082), the v2.0 parts: the card `header` and the `Markdown`, `Fields` and `Divider` elements (RFC 082 §4.8). botiverse/slock packages/shared/src/messageCard.ts and messageCardMarkdown.ts; this file is pinned by messageCard.v1.vector.sha256. Compare as JSON values: key order is irrelevant, an absent key differs from a null one.\nschemaVersion 1 (2026-11-05): Markdown links take a message's schemes, http:, https: and mailto: (Tenny, #13224): bare and angle email autolinks and [x](mailto:…) are allowed; tel: and sms: are refused.\ndisplay (markdown[], schemaVersion 1, 2026-11-05; Tenny, #proj-apps:#49 0994342b): a case with \"display\": \"may_differ\" holds one of the three constructs RFC 082 §4.8 lets clients display differently: 4-space indentation, an undefined reference ([ref], [text][ref], [^ref] with no definition), character entities (&amp;, &lt;, &#169;, &#x42;, ...). The Server's verdict and agentText stay exact. A client checks such a case against the rule, not against `nodes` and `text`: it shows all of the content (every run of letters and digits in `text` appears in what it shows, in order; the construct's own characters, such as an entity as written or the brackets, may be shown too), it shows no link, no button and no mention chip, and nothing it shows is outside the allowlist (an indented code block drawn as a code block is a code block, which is in it). Every case without `display` is compared exactly. No other client difference is allowed.\ncards[]: `card` is what a sender sends. `verdict` is the Server's: accept or refuse (400 card_invalid with `problem.path` and `problem.limit`; `problem.node` with limit markdown). On accept: `parsed` is the stored card (defaults filled in: Fields mono false, and the v1 defaults); `agentText` is renderMessageCardMarkdown (what agents read under `card:`, at most 4000 code points); `fallback` is the content Raft stores when the sender wrote none (the same rendering, at most 500 code points, cut with …), or null with `fallbackProblem` when the card has nothing to derive it from (then the sender must write content). A client reads a stored card with the strict schema: every accepted card here is one a client must draw in full (the header, Markdown, Fields, Divider), and one it does not know must make it show the whole fallback, never part of the card.\nmarkdown[]: `content` is one Markdown element's content in { version: 1, root: \"m\", elements: { m: { type: \"Markdown\", props: { content } } } }. The parser is CommonMark + GFM (micromark / mdast-util-from-markdown with GFM, as remark-parse + remark-gfm), with Raft math ($…$ and $$…$$, not money), CJK-friendly emphasis, and indented code off. The allowlist (node types): paragraph, text, break, strong, emphasis, delete, inlineCode, code (fenced), list, listItem (not a task list item), blockquote, link (http:, https: or mailto:, case-insensitive, the schemes a message's links take, so GFM's email autolinks are links; a link must parse as a URL). Lists and quotes together nest at most 3 levels. On refuse: `found` lists every node outside it, outermost first, in document order (nothing inside one is looked at): `node` (the mdast type; taskListItem for a GFM task list item; link for a link to another scheme, such as tel: or sms:; list or blockquote nested too deep), its `source` slice, `line` and `column` (1-based); the Server refuses with the first. A client draws each `found` node as its `source` text (never rendered) and the rest as Markdown; its own parser must find the same nodes. On accept: `nodes` are the node types in the tree (root aside, sorted), `text` the values of its text, inlineCode and code nodes in order with a line break for each break node (what a reader sees, entities decoded), and `agentText` the agent text. No @name or #channel in Markdown is a mention or a channel link: clients draw no chips in it.",
+  "cards": [
+    {
+      "name": "header_full",
+      "note": "A header with a title, a subtitle and three tags, over Fields, a Divider, Markdown and a Button: the agent text starts with the header and carries the fields.",
+      "card": {
+        "version": 1,
+        "header": {
+          "title": "Play rejected this submission: 1.20.0",
+          "subtitle": "Raft Android · Google Play · production",
+          "tags": [
+            {
+              "text": "Failed",
+              "tone": "danger"
+            },
+            {
+              "text": "Policy",
+              "tone": "warning"
+            },
+            {
+              "text": "Android",
+              "tone": "neutral"
+            }
+          ]
+        },
+        "root": "root",
+        "elements": {
+          "root": {
+            "type": "Stack",
+            "props": {},
+            "children": [
+              "facts",
+              "rule",
+              "notes",
+              "open"
+            ]
+          },
+          "facts": {
+            "type": "Fields",
+            "props": {
+              "items": [
+                {
+                  "label": "Version",
+                  "value": "1.20.0 (12000003)",
+                  "mono": true
+                },
+                {
+                  "label": "Track",
+                  "value": "production"
+                },
+                {
+                  "label": "Reviewed",
+                  "value": "2026-11-05 09:12 UTC"
+                }
+              ]
+            }
+          },
+          "rule": {
+            "type": "Divider",
+            "props": {}
+          },
+          "notes": {
+            "type": "Markdown",
+            "props": {
+              "content": "Google says the **target API level** is too low.\n\n- raise `targetSdk` to 35\n- send it again for review"
+            }
+          },
+          "open": {
+            "type": "Button",
+            "props": {
+              "label": "Open in Play Console",
+              "action": {
+                "kind": "navigate",
+                "url": "https://play.google.com/console/"
+              }
+            }
+          }
+        }
+      },
+      "verdict": "accept",
+      "parsed": {
+        "version": 1,
+        "header": {
+          "title": "Play rejected this submission: 1.20.0",
+          "subtitle": "Raft Android · Google Play · production",
+          "tags": [
+            {
+              "text": "Failed",
+              "tone": "danger"
+            },
+            {
+              "text": "Policy",
+              "tone": "warning"
+            },
+            {
+              "text": "Android",
+              "tone": "neutral"
+            }
+          ]
+        },
+        "root": "root",
+        "elements": {
+          "root": {
+            "type": "Stack",
+            "props": {
+              "direction": "column",
+              "wrap": false
+            },
+            "children": [
+              "facts",
+              "rule",
+              "notes",
+              "open"
+            ]
+          },
+          "facts": {
+            "type": "Fields",
+            "props": {
+              "items": [
+                {
+                  "label": "Version",
+                  "value": "1.20.0 (12000003)",
+                  "mono": true
+                },
+                {
+                  "label": "Track",
+                  "value": "production",
+                  "mono": false
+                },
+                {
+                  "label": "Reviewed",
+                  "value": "2026-11-05 09:12 UTC",
+                  "mono": false
+                }
+              ]
+            }
+          },
+          "rule": {
+            "type": "Divider",
+            "props": {}
+          },
+          "notes": {
+            "type": "Markdown",
+            "props": {
+              "content": "Google says the **target API level** is too low.\n\n- raise `targetSdk` to 35\n- send it again for review"
+            }
+          },
+          "open": {
+            "type": "Button",
+            "props": {
+              "label": "Open in Play Console",
+              "variant": "default",
+              "action": {
+                "kind": "navigate",
+                "url": "https://play.google.com/console/"
+              }
+            }
+          }
+        }
+      },
+      "agentText": "**Play rejected this submission: 1.20.0**\nRaft Android · Google Play · production\n[Failed] [Policy] [Android]\n\n**Version:** `1.20.0 (12000003)`\n**Track:** production\n**Reviewed:** 2026-11-05 09:12 UTC\n\n---\n\nGoogle says the **target API level** is too low.\n\n- raise `targetSdk` to 35\n- send it again for review\n\n[Open in Play Console](https://play.google.com/console/)",
+      "fallback": "**Play rejected this submission: 1.20.0**\nRaft Android · Google Play · production\n[Failed] [Policy] [Android]\n\n**Version:** `1.20.0 (12000003)`\n**Track:** production\n**Reviewed:** 2026-11-05 09:12 UTC\n\n---\n\nGoogle says the **target API level** is too low.\n\n- raise `targetSdk` to 35\n- send it again for review\n\n[Open in Play Console](https://play.google.com/console/)"
+    },
+    {
+      "name": "header_tones_info_success_neutral",
+      "note": "Each tag tone (with header_tones_warning_danger: all five).",
+      "card": {
+        "version": 1,
+        "header": {
+          "title": "Deploy",
+          "tags": [
+            {
+              "text": "Info",
+              "tone": "info"
+            },
+            {
+              "text": "Done",
+              "tone": "success"
+            },
+            {
+              "text": "Note",
+              "tone": "neutral"
+            }
+          ]
+        },
+        "root": "root",
+        "elements": {
+          "root": {
+            "type": "Text",
+            "props": {
+              "text": "body"
+            }
+          }
+        }
+      },
+      "verdict": "accept",
+      "parsed": {
+        "version": 1,
+        "header": {
+          "title": "Deploy",
+          "tags": [
+            {
+              "text": "Info",
+              "tone": "info"
+            },
+            {
+              "text": "Done",
+              "tone": "success"
+            },
+            {
+              "text": "Note",
+              "tone": "neutral"
+            }
+          ]
+        },
+        "root": "root",
+        "elements": {
+          "root": {
+            "type": "Text",
+            "props": {
+              "text": "body",
+              "tone": "default",
+              "mono": false
+            }
+          }
+        }
+      },
+      "agentText": "**Deploy**\n[Info] [Done] [Note]\n\nbody",
+      "fallback": "**Deploy**\n[Info] [Done] [Note]\n\nbody"
+    },
+    {
+      "name": "header_tones_warning_danger",
+      "note": "Each tag tone (with header_tones_info_success_neutral: all five).",
+      "card": {
+        "version": 1,
+        "header": {
+          "title": "Deploy",
+          "tags": [
+            {
+              "text": "Slow",
+              "tone": "warning"
+            },
+            {
+              "text": "Down",
+              "tone": "danger"
+            }
+          ]
+        },
+        "root": "root",
+        "elements": {
+          "root": {
+            "type": "Text",
+            "props": {
+              "text": "body"
+            }
+          }
+        }
+      },
+      "verdict": "accept",
+      "parsed": {
+        "version": 1,
+        "header": {
+          "title": "Deploy",
+          "tags": [
+            {
+              "text": "Slow",
+              "tone": "warning"
+            },
+            {
+              "text": "Down",
+              "tone": "danger"
+            }
+          ]
+        },
+        "root": "root",
+        "elements": {
+          "root": {
+            "type": "Text",
+            "props": {
+              "text": "body",
+              "tone": "default",
+              "mono": false
+            }
+          }
+        }
+      },
+      "agentText": "**Deploy**\n[Slow] [Down]\n\nbody",
+      "fallback": "**Deploy**\n[Slow] [Down]\n\nbody"
+    },
+    {
+      "name": "header_title_only",
+      "note": "A header alone is something to derive the fallback from: its title.",
+      "card": {
+        "version": 1,
+        "header": {
+          "title": "Nightly build 42 passed"
+        },
+        "root": "root",
+        "elements": {
+          "root": {
+            "type": "Stack",
+            "props": {},
+            "children": []
+          }
+        }
+      },
+      "verdict": "accept",
+      "parsed": {
+        "version": 1,
+        "header": {
+          "title": "Nightly build 42 passed"
+        },
+        "root": "root",
+        "elements": {
+          "root": {
+            "type": "Stack",
+            "props": {
+              "direction": "column",
+              "wrap": false
+            },
+            "children": []
+          }
+        }
+      },
+      "agentText": "**Nightly build 42 passed**",
+      "fallback": "**Nightly build 42 passed**"
+    },
+    {
+      "name": "header_no_tags",
+      "note": "tags may be empty.",
+      "card": {
+        "version": 1,
+        "header": {
+          "title": "T",
+          "subtitle": "S",
+          "tags": []
+        },
+        "root": "root",
+        "elements": {
+          "root": {
+            "type": "Text",
+            "props": {
+              "text": "x"
+            }
+          }
+        }
+      },
+      "verdict": "accept",
+      "parsed": {
+        "version": 1,
+        "header": {
+          "title": "T",
+          "subtitle": "S",
+          "tags": []
+        },
+        "root": "root",
+        "elements": {
+          "root": {
+            "type": "Text",
+            "props": {
+              "text": "x",
+              "tone": "default",
+              "mono": false
+            }
+          }
+        }
+      },
+      "agentText": "**T**\nS\n\nx",
+      "fallback": "**T**\nS\n\nx"
+    },
+    {
+      "name": "header_text_escaped",
+      "note": "Header text is plain text: escaped in the agent text; an @name in it is inline code.",
+      "card": {
+        "version": 1,
+        "header": {
+          "title": "**Not bold** [x](https://e.example) @artin",
+          "subtitle": "# not a heading",
+          "tags": [
+            {
+              "text": "*a*",
+              "tone": "info"
+            },
+            {
+              "text": "@sage",
+              "tone": "neutral"
+            }
+          ]
+        },
+        "root": "root",
+        "elements": {
+          "root": {
+            "type": "Stack",
+            "props": {},
+            "children": []
+          }
+        }
+      },
+      "verdict": "accept",
+      "parsed": {
+        "version": 1,
+        "header": {
+          "title": "**Not bold** [x](https://e.example) @artin",
+          "subtitle": "# not a heading",
+          "tags": [
+            {
+              "text": "*a*",
+              "tone": "info"
+            },
+            {
+              "text": "@sage",
+              "tone": "neutral"
+            }
+          ]
+        },
+        "root": "root",
+        "elements": {
+          "root": {
+            "type": "Stack",
+            "props": {
+              "direction": "column",
+              "wrap": false
+            },
+            "children": []
+          }
+        }
+      },
+      "agentText": "**\\*\\*Not bold\\*\\* \\[x\\](https://e.example) `@artin`**\n\\# not a heading\n[\\*a\\*] [`@sage`]",
+      "fallback": "**\\*\\*Not bold\\*\\* \\[x\\](https://e.example) `@artin`**\n\\# not a heading\n[\\*a\\*] [`@sage`]"
+    },
+    {
+      "name": "header_not_an_element",
+      "note": "The header is not an element: 16 elements and a header are allowed.",
+      "card": {
+        "version": 1,
+        "header": {
+          "title": "Sixteen elements"
+        },
+        "root": "root",
+        "elements": {
+          "root": {
+            "type": "Stack",
+            "props": {},
+            "children": [
+              "more",
+              "t0",
+              "t1",
+              "t2",
+              "t3",
+              "t4",
+              "t5",
+              "t6",
+              "t7",
+              "t8",
+              "t9",
+              "t10"
+            ]
+          },
+          "more": {
+            "type": "Stack",
+            "props": {},
+            "children": [
+              "t11",
+              "t12",
+              "t13"
+            ]
+          },
+          "t0": {
+            "type": "Text",
+            "props": {
+              "text": "0"
+            }
+          },
+          "t1": {
+            "type": "Text",
+            "props": {
+              "text": "1"
+            }
+          },
+          "t2": {
+            "type": "Text",
+            "props": {
+              "text": "2"
+            }
+          },
+          "t3": {
+            "type": "Text",
+            "props": {
+              "text": "3"
+            }
+          },
+          "t4": {
+            "type": "Text",
+            "props": {
+              "text": "4"
+            }
+          },
+          "t5": {
+            "type": "Text",
+            "props": {
+              "text": "5"
+            }
+          },
+          "t6": {
+            "type": "Text",
+            "props": {
+              "text": "6"
+            }
+          },
+          "t7": {
+            "type": "Text",
+            "props": {
+              "text": "7"
+            }
+          },
+          "t8": {
+            "type": "Text",
+            "props": {
+              "text": "8"
+            }
+          },
+          "t9": {
+            "type": "Text",
+            "props": {
+              "text": "9"
+            }
+          },
+          "t10": {
+            "type": "Text",
+            "props": {
+              "text": "10"
+            }
+          },
+          "t11": {
+            "type": "Text",
+            "props": {
+              "text": "11"
+            }
+          },
+          "t12": {
+            "type": "Text",
+            "props": {
+              "text": "12"
+            }
+          },
+          "t13": {
+            "type": "Text",
+            "props": {
+              "text": "13"
+            }
+          }
+        }
+      },
+      "verdict": "accept",
+      "parsed": {
+        "version": 1,
+        "header": {
+          "title": "Sixteen elements"
+        },
+        "root": "root",
+        "elements": {
+          "root": {
+            "type": "Stack",
+            "props": {
+              "direction": "column",
+              "wrap": false
+            },
+            "children": [
+              "more",
+              "t0",
+              "t1",
+              "t2",
+              "t3",
+              "t4",
+              "t5",
+              "t6",
+              "t7",
+              "t8",
+              "t9",
+              "t10"
+            ]
+          },
+          "more": {
+            "type": "Stack",
+            "props": {
+              "direction": "column",
+              "wrap": false
+            },
+            "children": [
+              "t11",
+              "t12",
+              "t13"
+            ]
+          },
+          "t0": {
+            "type": "Text",
+            "props": {
+              "text": "0",
+              "tone": "default",
+              "mono": false
+            }
+          },
+          "t1": {
+            "type": "Text",
+            "props": {
+              "text": "1",
+              "tone": "default",
+              "mono": false
+            }
+          },
+          "t2": {
+            "type": "Text",
+            "props": {
+              "text": "2",
+              "tone": "default",
+              "mono": false
+            }
+          },
+          "t3": {
+            "type": "Text",
+            "props": {
+              "text": "3",
+              "tone": "default",
+              "mono": false
+            }
+          },
+          "t4": {
+            "type": "Text",
+            "props": {
+              "text": "4",
+              "tone": "default",
+              "mono": false
+            }
+          },
+          "t5": {
+            "type": "Text",
+            "props": {
+              "text": "5",
+              "tone": "default",
+              "mono": false
+            }
+          },
+          "t6": {
+            "type": "Text",
+            "props": {
+              "text": "6",
+              "tone": "default",
+              "mono": false
+            }
+          },
+          "t7": {
+            "type": "Text",
+            "props": {
+              "text": "7",
+              "tone": "default",
+              "mono": false
+            }
+          },
+          "t8": {
+            "type": "Text",
+            "props": {
+              "text": "8",
+              "tone": "default",
+              "mono": false
+            }
+          },
+          "t9": {
+            "type": "Text",
+            "props": {
+              "text": "9",
+              "tone": "default",
+              "mono": false
+            }
+          },
+          "t10": {
+            "type": "Text",
+            "props": {
+              "text": "10",
+              "tone": "default",
+              "mono": false
+            }
+          },
+          "t11": {
+            "type": "Text",
+            "props": {
+              "text": "11",
+              "tone": "default",
+              "mono": false
+            }
+          },
+          "t12": {
+            "type": "Text",
+            "props": {
+              "text": "12",
+              "tone": "default",
+              "mono": false
+            }
+          },
+          "t13": {
+            "type": "Text",
+            "props": {
+              "text": "13",
+              "tone": "default",
+              "mono": false
+            }
+          }
+        }
+      },
+      "agentText": "**Sixteen elements**\n\n11\n\n12\n\n13\n\n0\n\n1\n\n2\n\n3\n\n4\n\n5\n\n6\n\n7\n\n8\n\n9\n\n10",
+      "fallback": "**Sixteen elements**\n\n11\n\n12\n\n13\n\n0\n\n1\n\n2\n\n3\n\n4\n\n5\n\n6\n\n7\n\n8\n\n9\n\n10"
+    },
+    {
+      "name": "header_fourth_tag",
+      "note": "At most 3 tags; the path names the first one over.",
+      "card": {
+        "version": 1,
+        "header": {
+          "title": "T",
+          "tags": [
+            {
+              "text": "a",
+              "tone": "info"
+            },
+            {
+              "text": "b",
+              "tone": "info"
+            },
+            {
+              "text": "c",
+              "tone": "info"
+            },
+            {
+              "text": "d",
+              "tone": "info"
+            }
+          ]
+        },
+        "root": "root",
+        "elements": {
+          "root": {
+            "type": "Text",
+            "props": {
+              "text": "x"
+            }
+          }
+        }
+      },
+      "verdict": "refuse",
+      "problem": {
+        "path": "card.header.tags[3]",
+        "limit": "tags"
+      }
+    },
+    {
+      "name": "header_tag_tone_pink",
+      "note": "Tag tones are neutral, info, success, warning, danger only.",
+      "card": {
+        "version": 1,
+        "header": {
+          "title": "T",
+          "tags": [
+            {
+              "text": "a",
+              "tone": "pink"
+            }
+          ]
+        },
+        "root": "root",
+        "elements": {
+          "root": {
+            "type": "Text",
+            "props": {
+              "text": "x"
+            }
+          }
+        }
+      },
+      "verdict": "refuse",
+      "problem": {
+        "path": "card.header.tags[0].tone",
+        "limit": "prop"
+      }
+    },
+    {
+      "name": "header_tag_tone_badge_tone",
+      "note": "A Badge tone is not a tag tone.",
+      "card": {
+        "version": 1,
+        "header": {
+          "title": "T",
+          "tags": [
+            {
+              "text": "a",
+              "tone": "review"
+            }
+          ]
+        },
+        "root": "root",
+        "elements": {
+          "root": {
+            "type": "Text",
+            "props": {
+              "text": "x"
+            }
+          }
+        }
+      },
+      "verdict": "refuse",
+      "problem": {
+        "path": "card.header.tags[0].tone",
+        "limit": "prop"
+      }
+    },
+    {
+      "name": "header_tag_tone_missing",
+      "note": "A tag needs its tone.",
+      "card": {
+        "version": 1,
+        "header": {
+          "title": "T",
+          "tags": [
+            {
+              "text": "a"
+            }
+          ]
+        },
+        "root": "root",
+        "elements": {
+          "root": {
+            "type": "Text",
+            "props": {
+              "text": "x"
+            }
+          }
+        }
+      },
+      "verdict": "refuse",
+      "problem": {
+        "path": "card.header.tags[0].tone",
+        "limit": "prop"
+      }
+    },
+    {
+      "name": "header_tone_refused",
+      "note": "The header has no tone of its own.",
+      "card": {
+        "version": 1,
+        "header": {
+          "title": "T",
+          "tone": "danger"
+        },
+        "root": "root",
+        "elements": {
+          "root": {
+            "type": "Text",
+            "props": {
+              "text": "x"
+            }
+          }
+        }
+      },
+      "verdict": "refuse",
+      "problem": {
+        "path": "card.header",
+        "limit": "prop"
+      }
+    },
+    {
+      "name": "header_title_101",
+      "note": "title is 1-100 code points.",
+      "card": {
+        "version": 1,
+        "header": {
+          "title": "ttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttt"
+        },
+        "root": "root",
+        "elements": {
+          "root": {
+            "type": "Text",
+            "props": {
+              "text": "x"
+            }
+          }
+        }
+      },
+      "verdict": "refuse",
+      "problem": {
+        "path": "card.header.title",
+        "limit": "text"
+      }
+    },
+    {
+      "name": "header_title_100_astral",
+      "note": "Lengths are code points: 100 astral emoji are 100.",
+      "card": {
+        "version": 1,
+        "header": {
+          "title": "🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀"
+        },
+        "root": "root",
+        "elements": {
+          "root": {
+            "type": "Text",
+            "props": {
+              "text": "x"
+            }
+          }
+        }
+      },
+      "verdict": "accept",
+      "parsed": {
+        "version": 1,
+        "header": {
+          "title": "🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀"
+        },
+        "root": "root",
+        "elements": {
+          "root": {
+            "type": "Text",
+            "props": {
+              "text": "x",
+              "tone": "default",
+              "mono": false
+            }
+          }
+        }
+      },
+      "agentText": "**🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀**\n\nx",
+      "fallback": "**🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀**\n\nx"
+    },
+    {
+      "name": "header_title_empty",
+      "note": "title is 1-100 code points.",
+      "card": {
+        "version": 1,
+        "header": {
+          "title": ""
+        },
+        "root": "root",
+        "elements": {
+          "root": {
+            "type": "Text",
+            "props": {
+              "text": "x"
+            }
+          }
+        }
+      },
+      "verdict": "refuse",
+      "problem": {
+        "path": "card.header.title",
+        "limit": "text"
+      }
+    },
+    {
+      "name": "header_title_missing",
+      "note": "title is required.",
+      "card": {
+        "version": 1,
+        "header": {
+          "subtitle": "S"
+        },
+        "root": "root",
+        "elements": {
+          "root": {
+            "type": "Text",
+            "props": {
+              "text": "x"
+            }
+          }
+        }
+      },
+      "verdict": "refuse",
+      "problem": {
+        "path": "card.header.title",
+        "limit": "prop"
+      }
+    },
+    {
+      "name": "header_subtitle_two_lines",
+      "note": "subtitle is one line.",
+      "card": {
+        "version": 1,
+        "header": {
+          "title": "T",
+          "subtitle": "one\ntwo"
+        },
+        "root": "root",
+        "elements": {
+          "root": {
+            "type": "Text",
+            "props": {
+              "text": "x"
+            }
+          }
+        }
+      },
+      "verdict": "refuse",
+      "problem": {
+        "path": "card.header.subtitle",
+        "limit": "text"
+      }
+    },
+    {
+      "name": "header_subtitle_101",
+      "note": "subtitle is 1-100 code points.",
+      "card": {
+        "version": 1,
+        "header": {
+          "title": "T",
+          "subtitle": "sssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssss"
+        },
+        "root": "root",
+        "elements": {
+          "root": {
+            "type": "Text",
+            "props": {
+              "text": "x"
+            }
+          }
+        }
+      },
+      "verdict": "refuse",
+      "problem": {
+        "path": "card.header.subtitle",
+        "limit": "text"
+      }
+    },
+    {
+      "name": "header_tag_text_25",
+      "note": "A tag's text is 1-24 code points.",
+      "card": {
+        "version": 1,
+        "header": {
+          "title": "T",
+          "tags": [
+            {
+              "text": "xxxxxxxxxxxxxxxxxxxxxxxxx",
+              "tone": "info"
+            }
+          ]
+        },
+        "root": "root",
+        "elements": {
+          "root": {
+            "type": "Text",
+            "props": {
+              "text": "x"
+            }
+          }
+        }
+      },
+      "verdict": "refuse",
+      "problem": {
+        "path": "card.header.tags[0].text",
+        "limit": "text"
+      }
+    },
+    {
+      "name": "header_not_object",
+      "note": "header is an object.",
+      "card": {
+        "version": 1,
+        "header": "Title",
+        "root": "root",
+        "elements": {
+          "root": {
+            "type": "Text",
+            "props": {
+              "text": "x"
+            }
+          }
+        }
+      },
+      "verdict": "refuse",
+      "problem": {
+        "path": "card.header",
+        "limit": "shape"
+      }
+    },
+    {
+      "name": "size_without_header",
+      "note": "8 KiB of JSON or less (with header_counts_towards_size: the header is what tips it).",
+      "card": {
+        "version": 1,
+        "root": "root",
+        "elements": {
+          "root": {
+            "type": "Stack",
+            "props": {},
+            "children": [
+              "t0",
+              "t1",
+              "t2",
+              "t3",
+              "t4",
+              "t5",
+              "t6",
+              "t7",
+              "t8",
+              "t9",
+              "t10",
+              "t11"
+            ]
+          },
+          "t0": {
+            "type": "Text",
+            "props": {
+              "text": "éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé"
+            }
+          },
+          "t1": {
+            "type": "Text",
+            "props": {
+              "text": "éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé"
+            }
+          },
+          "t2": {
+            "type": "Text",
+            "props": {
+              "text": "éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé"
+            }
+          },
+          "t3": {
+            "type": "Text",
+            "props": {
+              "text": "éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé"
+            }
+          },
+          "t4": {
+            "type": "Text",
+            "props": {
+              "text": "éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé"
+            }
+          },
+          "t5": {
+            "type": "Text",
+            "props": {
+              "text": "éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé"
+            }
+          },
+          "t6": {
+            "type": "Text",
+            "props": {
+              "text": "éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé"
+            }
+          },
+          "t7": {
+            "type": "Text",
+            "props": {
+              "text": "éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé"
+            }
+          },
+          "t8": {
+            "type": "Text",
+            "props": {
+              "text": "éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé"
+            }
+          },
+          "t9": {
+            "type": "Text",
+            "props": {
+              "text": "éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé"
+            }
+          },
+          "t10": {
+            "type": "Text",
+            "props": {
+              "text": "éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé"
+            }
+          },
+          "t11": {
+            "type": "Text",
+            "props": {
+              "text": "éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé"
+            }
+          }
+        }
+      },
+      "verdict": "accept",
+      "parsed": {
+        "version": 1,
+        "root": "root",
+        "elements": {
+          "root": {
+            "type": "Stack",
+            "props": {
+              "direction": "column",
+              "wrap": false
+            },
+            "children": [
+              "t0",
+              "t1",
+              "t2",
+              "t3",
+              "t4",
+              "t5",
+              "t6",
+              "t7",
+              "t8",
+              "t9",
+              "t10",
+              "t11"
+            ]
+          },
+          "t0": {
+            "type": "Text",
+            "props": {
+              "text": "éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé",
+              "tone": "default",
+              "mono": false
+            }
+          },
+          "t1": {
+            "type": "Text",
+            "props": {
+              "text": "éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé",
+              "tone": "default",
+              "mono": false
+            }
+          },
+          "t2": {
+            "type": "Text",
+            "props": {
+              "text": "éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé",
+              "tone": "default",
+              "mono": false
+            }
+          },
+          "t3": {
+            "type": "Text",
+            "props": {
+              "text": "éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé",
+              "tone": "default",
+              "mono": false
+            }
+          },
+          "t4": {
+            "type": "Text",
+            "props": {
+              "text": "éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé",
+              "tone": "default",
+              "mono": false
+            }
+          },
+          "t5": {
+            "type": "Text",
+            "props": {
+              "text": "éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé",
+              "tone": "default",
+              "mono": false
+            }
+          },
+          "t6": {
+            "type": "Text",
+            "props": {
+              "text": "éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé",
+              "tone": "default",
+              "mono": false
+            }
+          },
+          "t7": {
+            "type": "Text",
+            "props": {
+              "text": "éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé",
+              "tone": "default",
+              "mono": false
+            }
+          },
+          "t8": {
+            "type": "Text",
+            "props": {
+              "text": "éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé",
+              "tone": "default",
+              "mono": false
+            }
+          },
+          "t9": {
+            "type": "Text",
+            "props": {
+              "text": "éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé",
+              "tone": "default",
+              "mono": false
+            }
+          },
+          "t10": {
+            "type": "Text",
+            "props": {
+              "text": "éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé",
+              "tone": "default",
+              "mono": false
+            }
+          },
+          "t11": {
+            "type": "Text",
+            "props": {
+              "text": "éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé",
+              "tone": "default",
+              "mono": false
+            }
+          }
+        }
+      },
+      "agentText": "éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé\n\néééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé\n\néééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé\n\néééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé\n\néééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé\n\néééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé\n\néééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé\n\néééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé\n\néééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé\n\néééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé\n\néééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé\n\néééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé",
+      "fallback": "éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé\n\nééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé…"
+    },
+    {
+      "name": "header_counts_towards_size",
+      "note": "The header counts towards the 8 KiB (the sender's JSON, UTF-8): the card of size_without_header with a header is over it.",
+      "card": {
+        "version": 1,
+        "header": {
+          "title": "🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀",
+          "subtitle": "🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀",
+          "tags": [
+            {
+              "text": "🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀",
+              "tone": "info"
+            }
+          ]
+        },
+        "root": "root",
+        "elements": {
+          "root": {
+            "type": "Stack",
+            "props": {},
+            "children": [
+              "t0",
+              "t1",
+              "t2",
+              "t3",
+              "t4",
+              "t5",
+              "t6",
+              "t7",
+              "t8",
+              "t9",
+              "t10",
+              "t11"
+            ]
+          },
+          "t0": {
+            "type": "Text",
+            "props": {
+              "text": "éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé"
+            }
+          },
+          "t1": {
+            "type": "Text",
+            "props": {
+              "text": "éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé"
+            }
+          },
+          "t2": {
+            "type": "Text",
+            "props": {
+              "text": "éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé"
+            }
+          },
+          "t3": {
+            "type": "Text",
+            "props": {
+              "text": "éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé"
+            }
+          },
+          "t4": {
+            "type": "Text",
+            "props": {
+              "text": "éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé"
+            }
+          },
+          "t5": {
+            "type": "Text",
+            "props": {
+              "text": "éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé"
+            }
+          },
+          "t6": {
+            "type": "Text",
+            "props": {
+              "text": "éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé"
+            }
+          },
+          "t7": {
+            "type": "Text",
+            "props": {
+              "text": "éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé"
+            }
+          },
+          "t8": {
+            "type": "Text",
+            "props": {
+              "text": "éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé"
+            }
+          },
+          "t9": {
+            "type": "Text",
+            "props": {
+              "text": "éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé"
+            }
+          },
+          "t10": {
+            "type": "Text",
+            "props": {
+              "text": "éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé"
+            }
+          },
+          "t11": {
+            "type": "Text",
+            "props": {
+              "text": "éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé"
+            }
+          }
+        }
+      },
+      "verdict": "refuse",
+      "problem": {
+        "path": "card",
+        "limit": "size"
+      }
+    },
+    {
+      "name": "markdown_alone",
+      "note": "A Markdown element alone is something to derive the fallback from.",
+      "card": {
+        "version": 1,
+        "root": "m",
+        "elements": {
+          "m": {
+            "type": "Markdown",
+            "props": {
+              "content": "Build **42** passed."
+            }
+          }
+        }
+      },
+      "verdict": "accept",
+      "parsed": {
+        "version": 1,
+        "root": "m",
+        "elements": {
+          "m": {
+            "type": "Markdown",
+            "props": {
+              "content": "Build **42** passed."
+            }
+          }
+        }
+      },
+      "agentText": "Build **42** passed.",
+      "fallback": "Build **42** passed."
+    },
+    {
+      "name": "markdown_2000",
+      "note": "content is 1-2000 code points.",
+      "card": {
+        "version": 1,
+        "root": "m",
+        "elements": {
+          "m": {
+            "type": "Markdown",
+            "props": {
+              "content": "mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm"
+            }
+          }
+        }
+      },
+      "verdict": "accept",
+      "parsed": {
+        "version": 1,
+        "root": "m",
+        "elements": {
+          "m": {
+            "type": "Markdown",
+            "props": {
+              "content": "mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm"
+            }
+          }
+        }
+      },
+      "agentText": "mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm",
+      "fallback": "mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm…"
+    },
+    {
+      "name": "markdown_2001",
+      "note": "content is 1-2000 code points.",
+      "card": {
+        "version": 1,
+        "root": "m",
+        "elements": {
+          "m": {
+            "type": "Markdown",
+            "props": {
+              "content": "mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm"
+            }
+          }
+        }
+      },
+      "verdict": "refuse",
+      "problem": {
+        "path": "card.elements.m.props.content",
+        "limit": "text"
+      }
+    },
+    {
+      "name": "markdown_empty",
+      "note": "content is 1-2000 code points.",
+      "card": {
+        "version": 1,
+        "root": "m",
+        "elements": {
+          "m": {
+            "type": "Markdown",
+            "props": {
+              "content": ""
+            }
+          }
+        }
+      },
+      "verdict": "refuse",
+      "problem": {
+        "path": "card.elements.m.props.content",
+        "limit": "text"
+      }
+    },
+    {
+      "name": "markdown_blank",
+      "note": "Whitespace only: nothing to derive a fallback from.",
+      "card": {
+        "version": 1,
+        "root": "m",
+        "elements": {
+          "m": {
+            "type": "Markdown",
+            "props": {
+              "content": "  \n "
+            }
+          }
+        }
+      },
+      "verdict": "accept",
+      "parsed": {
+        "version": 1,
+        "root": "m",
+        "elements": {
+          "m": {
+            "type": "Markdown",
+            "props": {
+              "content": "  \n "
+            }
+          }
+        }
+      },
+      "agentText": "",
+      "fallback": null,
+      "fallbackProblem": {
+        "path": "card",
+        "limit": "fallback"
+      }
+    },
+    {
+      "name": "markdown_unknown_prop",
+      "note": "Markdown takes content only.",
+      "card": {
+        "version": 1,
+        "root": "m",
+        "elements": {
+          "m": {
+            "type": "Markdown",
+            "props": {
+              "content": "x",
+              "html": true
+            }
+          }
+        }
+      },
+      "verdict": "refuse",
+      "problem": {
+        "path": "card.elements.m.props",
+        "limit": "prop"
+      }
+    },
+    {
+      "name": "markdown_heading_refused",
+      "note": "A refusal in Markdown names its node (more in markdown[]).",
+      "card": {
+        "version": 1,
+        "root": "m",
+        "elements": {
+          "m": {
+            "type": "Markdown",
+            "props": {
+              "content": "# Release notes"
+            }
+          }
+        }
+      },
+      "verdict": "refuse",
+      "problem": {
+        "path": "card.elements.m.props.content",
+        "limit": "markdown",
+        "node": "heading"
+      }
+    },
+    {
+      "name": "markdown_mentions",
+      "note": "@name and #channel in Markdown are text: no mention resolves (the send resolves mentions from content only), clients draw no chip, and the agent text sets each @name outside code and links as inline code; #channel stays as written.",
+      "card": {
+        "version": 1,
+        "root": "m",
+        "elements": {
+          "m": {
+            "type": "Markdown",
+            "props": {
+              "content": "Ping @artin and @sage@lagoon in #builds; `@code` stays; [ask @x](https://e.example/@y)"
+            }
+          }
+        }
+      },
+      "verdict": "accept",
+      "parsed": {
+        "version": 1,
+        "root": "m",
+        "elements": {
+          "m": {
+            "type": "Markdown",
+            "props": {
+              "content": "Ping @artin and @sage@lagoon in #builds; `@code` stays; [ask @x](https://e.example/@y)"
+            }
+          }
+        }
+      },
+      "agentText": "Ping `@artin` and `@sage@lagoon` in #builds; `@code` stays; [ask @x](https://e.example/@y)",
+      "fallback": "Ping `@artin` and `@sage@lagoon` in #builds; `@code` stays; [ask @x](https://e.example/@y)"
+    },
+    {
+      "name": "markdown_in_row",
+      "note": "A Markdown, Fields or Divider in a row is a block of its own: the row's line ends before it.",
+      "card": {
+        "version": 1,
+        "root": "root",
+        "elements": {
+          "root": {
+            "type": "Stack",
+            "props": {
+              "direction": "row"
+            },
+            "children": [
+              "a",
+              "m",
+              "b",
+              "d",
+              "c"
+            ]
+          },
+          "a": {
+            "type": "Badge",
+            "props": {
+              "text": "x"
+            }
+          },
+          "m": {
+            "type": "Markdown",
+            "props": {
+              "content": "*md*"
+            }
+          },
+          "b": {
+            "type": "Text",
+            "props": {
+              "text": "y"
+            }
+          },
+          "d": {
+            "type": "Divider",
+            "props": {}
+          },
+          "c": {
+            "type": "Text",
+            "props": {
+              "text": "z"
+            }
+          }
+        }
+      },
+      "verdict": "accept",
+      "parsed": {
+        "version": 1,
+        "root": "root",
+        "elements": {
+          "root": {
+            "type": "Stack",
+            "props": {
+              "direction": "row",
+              "wrap": false
+            },
+            "children": [
+              "a",
+              "m",
+              "b",
+              "d",
+              "c"
+            ]
+          },
+          "a": {
+            "type": "Badge",
+            "props": {
+              "text": "x",
+              "tone": "neutral"
+            }
+          },
+          "m": {
+            "type": "Markdown",
+            "props": {
+              "content": "*md*"
+            }
+          },
+          "b": {
+            "type": "Text",
+            "props": {
+              "text": "y",
+              "tone": "default",
+              "mono": false
+            }
+          },
+          "d": {
+            "type": "Divider",
+            "props": {}
+          },
+          "c": {
+            "type": "Text",
+            "props": {
+              "text": "z",
+              "tone": "default",
+              "mono": false
+            }
+          }
+        }
+      },
+      "agentText": "[x]\n\n*md*\n\ny\n\n---\n\nz",
+      "fallback": "[x]\n\n*md*\n\ny\n\n---\n\nz"
+    },
+    {
+      "name": "markdown_unclosed_fence",
+      "note": "An unclosed fenced code block runs to the end of the Markdown on screen; in the agent text it is closed, so the next element is not taken into it.",
+      "card": {
+        "version": 1,
+        "root": "root",
+        "elements": {
+          "root": {
+            "type": "Stack",
+            "props": {},
+            "children": [
+              "m",
+              "t"
+            ]
+          },
+          "m": {
+            "type": "Markdown",
+            "props": {
+              "content": "```sh\nnpm run build"
+            }
+          },
+          "t": {
+            "type": "Text",
+            "props": {
+              "text": "after"
+            }
+          }
+        }
+      },
+      "verdict": "accept",
+      "parsed": {
+        "version": 1,
+        "root": "root",
+        "elements": {
+          "root": {
+            "type": "Stack",
+            "props": {
+              "direction": "column",
+              "wrap": false
+            },
+            "children": [
+              "m",
+              "t"
+            ]
+          },
+          "m": {
+            "type": "Markdown",
+            "props": {
+              "content": "```sh\nnpm run build"
+            }
+          },
+          "t": {
+            "type": "Text",
+            "props": {
+              "text": "after",
+              "tone": "default",
+              "mono": false
+            }
+          }
+        }
+      },
+      "agentText": "```sh\nnpm run build\n```\n\nafter",
+      "fallback": "```sh\nnpm run build\n```\n\nafter"
+    },
+    {
+      "name": "markdown_cut_in_fallback",
+      "note": "The derived fallback is cut at 500 code points; a cut inside bold, a link or a code block still ends it.",
+      "card": {
+        "version": 1,
+        "root": "root",
+        "elements": {
+          "root": {
+            "type": "Stack",
+            "props": {},
+            "children": [
+              "m"
+            ]
+          },
+          "m": {
+            "type": "Markdown",
+            "props": {
+              "content": "word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word **bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold** [label label label label label label label label label label](https://e.example/x)"
+            }
+          }
+        }
+      },
+      "verdict": "accept",
+      "parsed": {
+        "version": 1,
+        "root": "root",
+        "elements": {
+          "root": {
+            "type": "Stack",
+            "props": {
+              "direction": "column",
+              "wrap": false
+            },
+            "children": [
+              "m"
+            ]
+          },
+          "m": {
+            "type": "Markdown",
+            "props": {
+              "content": "word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word **bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold** [label label label label label label label label label label](https://e.example/x)"
+            }
+          }
+        }
+      },
+      "agentText": "word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word **bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold** [label label label label label label label label label label](https://e.example/x)",
+      "fallback": "word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word **bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold bold …**"
+    },
+    {
+      "name": "fields_mono_default",
+      "note": "mono defaults to false; mono values are inline code in the agent text; labels and values are escaped plain text.",
+      "card": {
+        "version": 1,
+        "root": "f",
+        "elements": {
+          "f": {
+            "type": "Fields",
+            "props": {
+              "items": [
+                {
+                  "label": "Version",
+                  "value": "1.20.0 (12000003)",
+                  "mono": true
+                },
+                {
+                  "label": "Owner",
+                  "value": "@lagoon"
+                },
+                {
+                  "label": "Note*",
+                  "value": "a | b [c](d) # e"
+                }
+              ]
+            }
+          }
+        }
+      },
+      "verdict": "accept",
+      "parsed": {
+        "version": 1,
+        "root": "f",
+        "elements": {
+          "f": {
+            "type": "Fields",
+            "props": {
+              "items": [
+                {
+                  "label": "Version",
+                  "value": "1.20.0 (12000003)",
+                  "mono": true
+                },
+                {
+                  "label": "Owner",
+                  "value": "@lagoon",
+                  "mono": false
+                },
+                {
+                  "label": "Note*",
+                  "value": "a | b [c](d) # e",
+                  "mono": false
+                }
+              ]
+            }
+          }
+        }
+      },
+      "agentText": "**Version:** `1.20.0 (12000003)`\n**Owner:** `@lagoon`\n**Note\\*:** a | b \\[c\\](d) # e",
+      "fallback": "**Version:** `1.20.0 (12000003)`\n**Owner:** `@lagoon`\n**Note\\*:** a | b \\[c\\](d) # e"
+    },
+    {
+      "name": "fields_one_line",
+      "note": "Labels and values are plain text, one line each in the agent text.",
+      "card": {
+        "version": 1,
+        "root": "f",
+        "elements": {
+          "f": {
+            "type": "Fields",
+            "props": {
+              "items": [
+                {
+                  "label": "Steps",
+                  "value": "build\ntest\nship"
+                }
+              ]
+            }
+          }
+        }
+      },
+      "verdict": "accept",
+      "parsed": {
+        "version": 1,
+        "root": "f",
+        "elements": {
+          "f": {
+            "type": "Fields",
+            "props": {
+              "items": [
+                {
+                  "label": "Steps",
+                  "value": "build\ntest\nship",
+                  "mono": false
+                }
+              ]
+            }
+          }
+        }
+      },
+      "agentText": "**Steps:** build test ship",
+      "fallback": "**Steps:** build test ship"
+    },
+    {
+      "name": "fields_eight",
+      "note": "1-8 rows.",
+      "card": {
+        "version": 1,
+        "root": "f",
+        "elements": {
+          "f": {
+            "type": "Fields",
+            "props": {
+              "items": [
+                {
+                  "label": "L0",
+                  "value": "V0"
+                },
+                {
+                  "label": "L1",
+                  "value": "V1"
+                },
+                {
+                  "label": "L2",
+                  "value": "V2"
+                },
+                {
+                  "label": "L3",
+                  "value": "V3"
+                },
+                {
+                  "label": "L4",
+                  "value": "V4"
+                },
+                {
+                  "label": "L5",
+                  "value": "V5"
+                },
+                {
+                  "label": "L6",
+                  "value": "V6"
+                },
+                {
+                  "label": "L7",
+                  "value": "V7"
+                }
+              ]
+            }
+          }
+        }
+      },
+      "verdict": "accept",
+      "parsed": {
+        "version": 1,
+        "root": "f",
+        "elements": {
+          "f": {
+            "type": "Fields",
+            "props": {
+              "items": [
+                {
+                  "label": "L0",
+                  "value": "V0",
+                  "mono": false
+                },
+                {
+                  "label": "L1",
+                  "value": "V1",
+                  "mono": false
+                },
+                {
+                  "label": "L2",
+                  "value": "V2",
+                  "mono": false
+                },
+                {
+                  "label": "L3",
+                  "value": "V3",
+                  "mono": false
+                },
+                {
+                  "label": "L4",
+                  "value": "V4",
+                  "mono": false
+                },
+                {
+                  "label": "L5",
+                  "value": "V5",
+                  "mono": false
+                },
+                {
+                  "label": "L6",
+                  "value": "V6",
+                  "mono": false
+                },
+                {
+                  "label": "L7",
+                  "value": "V7",
+                  "mono": false
+                }
+              ]
+            }
+          }
+        }
+      },
+      "agentText": "**L0:** V0\n**L1:** V1\n**L2:** V2\n**L3:** V3\n**L4:** V4\n**L5:** V5\n**L6:** V6\n**L7:** V7",
+      "fallback": "**L0:** V0\n**L1:** V1\n**L2:** V2\n**L3:** V3\n**L4:** V4\n**L5:** V5\n**L6:** V6\n**L7:** V7"
+    },
+    {
+      "name": "fields_nine",
+      "note": "1-8 rows.",
+      "card": {
+        "version": 1,
+        "root": "f",
+        "elements": {
+          "f": {
+            "type": "Fields",
+            "props": {
+              "items": [
+                {
+                  "label": "L0",
+                  "value": "V0"
+                },
+                {
+                  "label": "L1",
+                  "value": "V1"
+                },
+                {
+                  "label": "L2",
+                  "value": "V2"
+                },
+                {
+                  "label": "L3",
+                  "value": "V3"
+                },
+                {
+                  "label": "L4",
+                  "value": "V4"
+                },
+                {
+                  "label": "L5",
+                  "value": "V5"
+                },
+                {
+                  "label": "L6",
+                  "value": "V6"
+                },
+                {
+                  "label": "L7",
+                  "value": "V7"
+                },
+                {
+                  "label": "L8",
+                  "value": "V8"
+                }
+              ]
+            }
+          }
+        }
+      },
+      "verdict": "refuse",
+      "problem": {
+        "path": "card.elements.f.props.items",
+        "limit": "fields"
+      }
+    },
+    {
+      "name": "fields_none",
+      "note": "1-8 rows.",
+      "card": {
+        "version": 1,
+        "root": "f",
+        "elements": {
+          "f": {
+            "type": "Fields",
+            "props": {
+              "items": []
+            }
+          }
+        }
+      },
+      "verdict": "refuse",
+      "problem": {
+        "path": "card.elements.f.props.items",
+        "limit": "fields"
+      }
+    },
+    {
+      "name": "fields_label_41",
+      "note": "label is 1-40 code points.",
+      "card": {
+        "version": 1,
+        "root": "f",
+        "elements": {
+          "f": {
+            "type": "Fields",
+            "props": {
+              "items": [
+                {
+                  "label": "lllllllllllllllllllllllllllllllllllllllll",
+                  "value": "v"
+                }
+              ]
+            }
+          }
+        }
+      },
+      "verdict": "refuse",
+      "problem": {
+        "path": "card.elements.f.props.items[0].label",
+        "limit": "text"
+      }
+    },
+    {
+      "name": "fields_value_201",
+      "note": "value is 1-200 code points.",
+      "card": {
+        "version": 1,
+        "root": "f",
+        "elements": {
+          "f": {
+            "type": "Fields",
+            "props": {
+              "items": [
+                {
+                  "label": "l",
+                  "value": "vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv"
+                }
+              ]
+            }
+          }
+        }
+      },
+      "verdict": "refuse",
+      "problem": {
+        "path": "card.elements.f.props.items[0].value",
+        "limit": "text"
+      }
+    },
+    {
+      "name": "fields_value_empty",
+      "note": "value is 1-200 code points.",
+      "card": {
+        "version": 1,
+        "root": "f",
+        "elements": {
+          "f": {
+            "type": "Fields",
+            "props": {
+              "items": [
+                {
+                  "label": "l",
+                  "value": ""
+                }
+              ]
+            }
+          }
+        }
+      },
+      "verdict": "refuse",
+      "problem": {
+        "path": "card.elements.f.props.items[0].value",
+        "limit": "text"
+      }
+    },
+    {
+      "name": "fields_unknown_key",
+      "note": "A row takes label, value and mono only.",
+      "card": {
+        "version": 1,
+        "root": "f",
+        "elements": {
+          "f": {
+            "type": "Fields",
+            "props": {
+              "items": [
+                {
+                  "label": "l",
+                  "value": "v",
+                  "tone": "danger"
+                }
+              ]
+            }
+          }
+        }
+      },
+      "verdict": "refuse",
+      "problem": {
+        "path": "card.elements.f.props.items[0]",
+        "limit": "prop"
+      }
+    },
+    {
+      "name": "divider",
+      "note": "A Divider takes no props; it alone is nothing to derive a fallback from (with content it is fine).",
+      "card": {
+        "version": 1,
+        "root": "d",
+        "elements": {
+          "d": {
+            "type": "Divider",
+            "props": {}
+          }
+        }
+      },
+      "verdict": "accept",
+      "parsed": {
+        "version": 1,
+        "root": "d",
+        "elements": {
+          "d": {
+            "type": "Divider",
+            "props": {}
+          }
+        }
+      },
+      "agentText": "---",
+      "fallback": null,
+      "fallbackProblem": {
+        "path": "card",
+        "limit": "fallback"
+      }
+    },
+    {
+      "name": "divider_with_prop",
+      "note": "A Divider takes no props.",
+      "card": {
+        "version": 1,
+        "root": "d",
+        "elements": {
+          "d": {
+            "type": "Divider",
+            "props": {
+              "style": "dashed"
+            }
+          }
+        }
+      },
+      "verdict": "refuse",
+      "problem": {
+        "path": "card.elements.d.props",
+        "limit": "prop"
+      }
+    },
+    {
+      "name": "divider_without_props",
+      "note": "props is required, as on every element.",
+      "card": {
+        "version": 1,
+        "root": "d",
+        "elements": {
+          "d": {
+            "type": "Divider"
+          }
+        }
+      },
+      "verdict": "refuse",
+      "problem": {
+        "path": "card.elements.d.props",
+        "limit": "prop"
+      }
+    },
+    {
+      "name": "divider_and_button_only",
+      "note": "Buttons and dividers alone are not enough to derive a fallback from.",
+      "card": {
+        "version": 1,
+        "root": "root",
+        "elements": {
+          "root": {
+            "type": "Stack",
+            "props": {},
+            "children": [
+              "d",
+              "b"
+            ]
+          },
+          "d": {
+            "type": "Divider",
+            "props": {}
+          },
+          "b": {
+            "type": "Button",
+            "props": {
+              "label": "Open",
+              "action": {
+                "kind": "navigate",
+                "url": "https://e.example/"
+              }
+            }
+          }
+        }
+      },
+      "verdict": "accept",
+      "parsed": {
+        "version": 1,
+        "root": "root",
+        "elements": {
+          "root": {
+            "type": "Stack",
+            "props": {
+              "direction": "column",
+              "wrap": false
+            },
+            "children": [
+              "d",
+              "b"
+            ]
+          },
+          "d": {
+            "type": "Divider",
+            "props": {}
+          },
+          "b": {
+            "type": "Button",
+            "props": {
+              "label": "Open",
+              "variant": "default",
+              "action": {
+                "kind": "navigate",
+                "url": "https://e.example/"
+              }
+            }
+          }
+        }
+      },
+      "agentText": "---\n\n[Open](https://e.example/)",
+      "fallback": null,
+      "fallbackProblem": {
+        "path": "card",
+        "limit": "fallback"
+      }
+    },
+    {
+      "name": "unknown_element",
+      "note": "An element type outside the catalog is still refused (a client shows the whole fallback for one).",
+      "card": {
+        "version": 1,
+        "root": "root",
+        "elements": {
+          "root": {
+            "type": "Stack",
+            "props": {},
+            "children": [
+              "img"
+            ]
+          },
+          "img": {
+            "type": "Image",
+            "props": {
+              "src": "https://e.example/a.png"
+            }
+          }
+        }
+      },
+      "verdict": "refuse",
+      "problem": {
+        "path": "card.elements.img.type",
+        "limit": "element_type"
+      }
+    },
+    {
+      "name": "version_2",
+      "note": "The card stays version 1.",
+      "card": {
+        "version": 2,
+        "root": "m",
+        "elements": {
+          "m": {
+            "type": "Markdown",
+            "props": {
+              "content": "x"
+            }
+          }
+        }
+      },
+      "verdict": "refuse",
+      "problem": {
+        "path": "card.version",
+        "limit": "shape"
+      }
+    }
+  ],
+  "markdown": [
+    {
+      "name": "inline_formatting",
+      "note": "Bold, italic, strikethrough, inline code and a link.",
+      "content": "**bold**, _italic_, *also italic*, ~~gone~~, ~one tilde~, `code` and [a link](https://example.com/a?b=1).",
+      "verdict": "accept",
+      "nodes": [
+        "delete",
+        "emphasis",
+        "inlineCode",
+        "link",
+        "paragraph",
+        "strong",
+        "text"
+      ],
+      "text": "bold, italic, also italic, gone, one tilde, code and a link.",
+      "agentText": "**bold**, _italic_, *also italic*, ~~gone~~, ~one tilde~, `code` and [a link](https://example.com/a?b=1)."
+    },
+    {
+      "name": "line_breaks",
+      "note": "Hard breaks (two spaces, a backslash) and a soft break; a client draws a soft break as a line break, as in messages.",
+      "content": "one  \ntwo\\\nthree\nfour",
+      "verdict": "accept",
+      "nodes": [
+        "break",
+        "paragraph",
+        "text"
+      ],
+      "text": "one\ntwo\nthree\nfour",
+      "agentText": "one  \ntwo\\\nthree\nfour"
+    },
+    {
+      "name": "fenced_code",
+      "note": "Fenced code, backticks and tildes, with a language.",
+      "content": "```ts\nconst x = 1;\n```\n\n~~~\nplain\n~~~",
+      "verdict": "accept",
+      "nodes": [
+        "code"
+      ],
+      "text": "const x = 1;plain",
+      "agentText": "```ts\nconst x = 1;\n```\n\n~~~\nplain\n~~~"
+    },
+    {
+      "name": "fenced_math_is_code",
+      "note": "A ```math fence is a code block: clients draw it as code, never as a formula.",
+      "content": "```math\nx^2\n```",
+      "verdict": "accept",
+      "nodes": [
+        "code"
+      ],
+      "text": "x^2",
+      "agentText": "```math\nx^2\n```"
+    },
+    {
+      "name": "indented_is_text",
+      "note": "Indented code is off, as in chat: four spaces of indentation are a paragraph (plain CommonMark would make a code block). Allowed difference 1 (RFC 082 §4.8): a client may draw a code block.",
+      "content": "    not code\n    still text",
+      "verdict": "accept",
+      "display": "may_differ",
+      "nodes": [
+        "paragraph",
+        "text"
+      ],
+      "text": "not code\nstill text",
+      "agentText": "    not code\n    still text"
+    },
+    {
+      "name": "cjk_emphasis",
+      "note": "CJK-friendly emphasis: `**中文**的` is bold before a CJK character (plain CommonMark leaves the stars as text).",
+      "content": "**中文**的说明，**注意：**这里",
+      "verdict": "accept",
+      "nodes": [
+        "paragraph",
+        "strong",
+        "text"
+      ],
+      "text": "中文的说明，注意：这里",
+      "agentText": "**中文**的说明，**注意：**这里"
+    },
+    {
+      "name": "intraword_underscore",
+      "note": "An underscore inside a word is text, never emphasis.",
+      "content": "snake_case_name and a_b_c",
+      "verdict": "accept",
+      "nodes": [
+        "paragraph",
+        "text"
+      ],
+      "text": "snake_case_name and a_b_c",
+      "agentText": "snake_case_name and a_b_c"
+    },
+    {
+      "name": "lists",
+      "note": "Bullet and ordered lists.",
+      "content": "1. one\n2. two\n\n- a\n- b\n\n* c",
+      "verdict": "accept",
+      "nodes": [
+        "list",
+        "listItem",
+        "paragraph",
+        "text"
+      ],
+      "text": "onetwoabc",
+      "agentText": "1. one\n2. two\n\n- a\n- b\n\n* c"
+    },
+    {
+      "name": "quote",
+      "note": "A quote with formatting in it.",
+      "content": "> quoted **text**\n> and more",
+      "verdict": "accept",
+      "nodes": [
+        "blockquote",
+        "paragraph",
+        "strong",
+        "text"
+      ],
+      "text": "quoted text\nand more",
+      "agentText": "> quoted **text**\n> and more"
+    },
+    {
+      "name": "nesting_3_lists",
+      "note": "Lists nest 3 levels.",
+      "content": "- a\n  - b\n    - c",
+      "verdict": "accept",
+      "nodes": [
+        "list",
+        "listItem",
+        "paragraph",
+        "text"
+      ],
+      "text": "abc",
+      "agentText": "- a\n  - b\n    - c"
+    },
+    {
+      "name": "nesting_4_lists",
+      "note": "A 4th level is refused (node list).",
+      "content": "- a\n  - b\n    - c\n      - d",
+      "verdict": "refuse",
+      "problem": {
+        "path": "card.elements.m.props.content",
+        "limit": "markdown",
+        "node": "list"
+      },
+      "found": [
+        {
+          "node": "list",
+          "source": "- d",
+          "line": 4,
+          "column": 7
+        }
+      ]
+    },
+    {
+      "name": "nesting_3_quotes",
+      "note": "Quotes nest 3 levels.",
+      "content": "> a\n> > b\n> > > c",
+      "verdict": "accept",
+      "nodes": [
+        "blockquote",
+        "paragraph",
+        "text"
+      ],
+      "text": "abc",
+      "agentText": "> a\n> > b\n> > > c"
+    },
+    {
+      "name": "nesting_4_quotes",
+      "note": "A 4th level is refused (node blockquote).",
+      "content": "> a\n> > b\n> > > c\n> > > > d",
+      "verdict": "refuse",
+      "problem": {
+        "path": "card.elements.m.props.content",
+        "limit": "markdown",
+        "node": "blockquote"
+      },
+      "found": [
+        {
+          "node": "blockquote",
+          "source": "> d",
+          "line": 4,
+          "column": 7
+        }
+      ]
+    },
+    {
+      "name": "nesting_3_mixed",
+      "note": "Lists and quotes count together: quote > list > quote is 3.",
+      "content": "> - a\n>   > b",
+      "verdict": "accept",
+      "nodes": [
+        "blockquote",
+        "list",
+        "listItem",
+        "paragraph",
+        "text"
+      ],
+      "text": "ab",
+      "agentText": "> - a\n>   > b"
+    },
+    {
+      "name": "nesting_4_mixed",
+      "note": "Lists and quotes count together: quote > list > quote > list is 4.",
+      "content": "> - a\n>   > - b",
+      "verdict": "refuse",
+      "problem": {
+        "path": "card.elements.m.props.content",
+        "limit": "markdown",
+        "node": "list"
+      },
+      "found": [
+        {
+          "node": "list",
+          "source": "- b",
+          "line": 2,
+          "column": 7
+        }
+      ]
+    },
+    {
+      "name": "autolink_angle_https",
+      "note": "A CommonMark autolink to https: is a link.",
+      "content": "see <https://example.com/a>",
+      "verdict": "accept",
+      "nodes": [
+        "link",
+        "paragraph",
+        "text"
+      ],
+      "text": "see https://example.com/a",
+      "agentText": "see <https://example.com/a>"
+    },
+    {
+      "name": "autolink_literal_https",
+      "note": "A bare https URL is a link (GFM); the sentence's full stop is not part of it.",
+      "content": "see https://example.com/path.",
+      "verdict": "accept",
+      "nodes": [
+        "link",
+        "paragraph",
+        "text"
+      ],
+      "text": "see https://example.com/path.",
+      "agentText": "see https://example.com/path."
+    },
+    {
+      "name": "autolink_literal_www",
+      "note": "A bare www. address is an http: link (GFM).",
+      "content": "www.example.com",
+      "verdict": "accept",
+      "nodes": [
+        "link",
+        "paragraph",
+        "text"
+      ],
+      "text": "www.example.com",
+      "agentText": "www.example.com"
+    },
+    {
+      "name": "autolink_literal_trailing_paren",
+      "note": "A bare URL in parentheses ends before the closing parenthesis (GFM).",
+      "content": "(see https://example.com/a)",
+      "verdict": "accept",
+      "nodes": [
+        "link",
+        "paragraph",
+        "text"
+      ],
+      "text": "(see https://example.com/a)",
+      "agentText": "(see https://example.com/a)"
+    },
+    {
+      "name": "autolink_angle_with_at",
+      "note": "An @ inside an angle autolink is part of the link.",
+      "content": "<https://example.com/@user>",
+      "verdict": "accept",
+      "nodes": [
+        "link",
+        "paragraph",
+        "text"
+      ],
+      "text": "https://example.com/@user",
+      "agentText": "<https://example.com/@user>"
+    },
+    {
+      "name": "autolink_literal_url_with_at",
+      "note": "An @ inside a URL is part of the link, not a mention.",
+      "content": "https://example.com/@user",
+      "verdict": "accept",
+      "nodes": [
+        "link",
+        "paragraph",
+        "text"
+      ],
+      "text": "https://example.com/@user",
+      "agentText": "https://example.com/@user"
+    },
+    {
+      "name": "autolink_angle_mailto",
+      "note": "<mailto:…> is a mailto: link, a scheme a message's links take: allowed.",
+      "content": "write to <mailto:a@example.com>",
+      "verdict": "accept",
+      "nodes": [
+        "link",
+        "paragraph",
+        "text"
+      ],
+      "text": "write to mailto:a@example.com",
+      "agentText": "write to <mailto:a@example.com>"
+    },
+    {
+      "name": "autolink_angle_email",
+      "note": "<a@b.c> is an email autolink, a mailto: link: allowed, as in a message.",
+      "content": "<foo@example.com>",
+      "verdict": "accept",
+      "nodes": [
+        "link",
+        "paragraph",
+        "text"
+      ],
+      "text": "foo@example.com",
+      "agentText": "<foo@example.com>"
+    },
+    {
+      "name": "autolink_literal_email",
+      "note": "A bare email address is a mailto: link (GFM): allowed, as in a message.",
+      "content": "mail ci@example.com",
+      "verdict": "accept",
+      "nodes": [
+        "link",
+        "paragraph",
+        "text"
+      ],
+      "text": "mail ci@example.com",
+      "agentText": "mail ci@example.com"
+    },
+    {
+      "name": "autolink_angle_tel",
+      "note": "<tel:…> is a link to tel:: refused (links are http:, https: or mailto:).",
+      "content": "call <tel:+15551234567>",
+      "verdict": "refuse",
+      "problem": {
+        "path": "card.elements.m.props.content",
+        "limit": "markdown",
+        "node": "link"
+      },
+      "found": [
+        {
+          "node": "link",
+          "source": "<tel:+15551234567>",
+          "line": 1,
+          "column": 6
+        }
+      ]
+    },
+    {
+      "name": "autolink_angle_other_scheme",
+      "note": "<custom:x> is a link to custom:: refused.",
+      "content": "<custom:thing>",
+      "verdict": "refuse",
+      "problem": {
+        "path": "card.elements.m.props.content",
+        "limit": "markdown",
+        "node": "link"
+      },
+      "found": [
+        {
+          "node": "link",
+          "source": "<custom:thing>",
+          "line": 1,
+          "column": 1
+        }
+      ]
+    },
+    {
+      "name": "link_mailto",
+      "note": "A mailto: link is allowed, as in a message.",
+      "content": "[x](mailto:a@b)",
+      "verdict": "accept",
+      "nodes": [
+        "link",
+        "paragraph",
+        "text"
+      ],
+      "text": "x",
+      "agentText": "[x](mailto:a@b)"
+    },
+    {
+      "name": "link_tel",
+      "note": "A tel: link is refused: links are http:, https: or mailto:.",
+      "content": "[x](tel:+15551234567)",
+      "verdict": "refuse",
+      "problem": {
+        "path": "card.elements.m.props.content",
+        "limit": "markdown",
+        "node": "link"
+      },
+      "found": [
+        {
+          "node": "link",
+          "source": "[x](tel:+15551234567)",
+          "line": 1,
+          "column": 1
+        }
+      ]
+    },
+    {
+      "name": "link_sms",
+      "note": "An sms: link is refused: links are http:, https: or mailto:.",
+      "content": "[x](sms:+15551234567)",
+      "verdict": "refuse",
+      "problem": {
+        "path": "card.elements.m.props.content",
+        "limit": "markdown",
+        "node": "link"
+      },
+      "found": [
+        {
+          "node": "link",
+          "source": "[x](sms:+15551234567)",
+          "line": 1,
+          "column": 1
+        }
+      ]
+    },
+    {
+      "name": "link_javascript",
+      "note": "Links are http:, https: and mailto: only.",
+      "content": "[x](javascript:alert(1))",
+      "verdict": "refuse",
+      "problem": {
+        "path": "card.elements.m.props.content",
+        "limit": "markdown",
+        "node": "link"
+      },
+      "found": [
+        {
+          "node": "link",
+          "source": "[x](javascript:alert(1))",
+          "line": 1,
+          "column": 1
+        }
+      ]
+    },
+    {
+      "name": "link_relative",
+      "note": "A relative link has no scheme: refused.",
+      "content": "[x](/settings)",
+      "verdict": "refuse",
+      "problem": {
+        "path": "card.elements.m.props.content",
+        "limit": "markdown",
+        "node": "link"
+      },
+      "found": [
+        {
+          "node": "link",
+          "source": "[x](/settings)",
+          "line": 1,
+          "column": 1
+        }
+      ]
+    },
+    {
+      "name": "link_fragment",
+      "note": "A fragment-only link has no scheme: refused.",
+      "content": "[x](#top)",
+      "verdict": "refuse",
+      "problem": {
+        "path": "card.elements.m.props.content",
+        "limit": "markdown",
+        "node": "link"
+      },
+      "found": [
+        {
+          "node": "link",
+          "source": "[x](#top)",
+          "line": 1,
+          "column": 1
+        }
+      ]
+    },
+    {
+      "name": "link_scheme_case",
+      "note": "Schemes are case-insensitive.",
+      "content": "[x](HTTPS://EXAMPLE.COM/)",
+      "verdict": "accept",
+      "nodes": [
+        "link",
+        "paragraph",
+        "text"
+      ],
+      "text": "x",
+      "agentText": "[x](HTTPS://EXAMPLE.COM/)"
+    },
+    {
+      "name": "link_title",
+      "note": "A link with a title is a link.",
+      "content": "[x](https://example.com \"Example\")",
+      "verdict": "accept",
+      "nodes": [
+        "link",
+        "paragraph",
+        "text"
+      ],
+      "text": "x",
+      "agentText": "[x](https://example.com \"Example\")"
+    },
+    {
+      "name": "entities_text",
+      "note": "Character references are text: `&lt;div&gt;` shows `<div>`, never an element; `&amp;` shows `&`. Allowed difference 3 (RFC 082 §4.8): a client may show an entity as written.",
+      "content": "a &amp; b &lt;div&gt; &#169; &copy;",
+      "verdict": "accept",
+      "display": "may_differ",
+      "nodes": [
+        "paragraph",
+        "text"
+      ],
+      "text": "a & b <div> © ©",
+      "agentText": "a &amp; b &lt;div&gt; &#169; &copy;"
+    },
+    {
+      "name": "entities_numeric",
+      "note": "Numeric character references, decimal and hex, and a named one in a word: text. Allowed difference 3 (RFC 082 §4.8): a client may show an entity as written.",
+      "content": "A&#x42;C &#8212; x&nbsp;y &#38;&#x26;",
+      "verdict": "accept",
+      "display": "may_differ",
+      "nodes": [
+        "paragraph",
+        "text"
+      ],
+      "text": "ABC — x y &&",
+      "agentText": "A&#x42;C &#8212; x&nbsp;y &#38;&#x26;"
+    },
+    {
+      "name": "bare_lt_amp",
+      "note": "A `<` or `&` that starts no tag or reference is text.",
+      "content": "a < b && c > d; 1 <2; x&y",
+      "verdict": "accept",
+      "nodes": [
+        "paragraph",
+        "text"
+      ],
+      "text": "a < b && c > d; 1 <2; x&y",
+      "agentText": "a < b && c > d; 1 <2; x&y"
+    },
+    {
+      "name": "almost_html_lt3",
+      "note": "Lines that are almost HTML stay text: `<3`, `a<b`, `< b>`, `<1st>`.",
+      "content": "<3 and a<b and < b> and <1st>",
+      "verdict": "accept",
+      "nodes": [
+        "paragraph",
+        "text"
+      ],
+      "text": "<3 and a<b and < b> and <1st>",
+      "agentText": "<3 and a<b and < b> and <1st>"
+    },
+    {
+      "name": "almost_html_unclosed",
+      "note": "An unclosed `<tag` is text.",
+      "content": "a <span class=\"x\" b",
+      "verdict": "accept",
+      "nodes": [
+        "paragraph",
+        "text"
+      ],
+      "text": "a <span class=\"x\" b",
+      "agentText": "a <span class=\"x\" b"
+    },
+    {
+      "name": "html_generic_type",
+      "note": "`<String>` is an HTML tag to CommonMark: refused; write it as inline code.",
+      "content": "List<String>",
+      "verdict": "refuse",
+      "problem": {
+        "path": "card.elements.m.props.content",
+        "limit": "markdown",
+        "node": "html"
+      },
+      "found": [
+        {
+          "node": "html",
+          "source": "<String>",
+          "line": 1,
+          "column": 5
+        }
+      ]
+    },
+    {
+      "name": "html_inline",
+      "note": "Inline HTML: refused (each tag found).",
+      "content": "x <b>bold</b> y",
+      "verdict": "refuse",
+      "problem": {
+        "path": "card.elements.m.props.content",
+        "limit": "markdown",
+        "node": "html"
+      },
+      "found": [
+        {
+          "node": "html",
+          "source": "<b>",
+          "line": 1,
+          "column": 3
+        },
+        {
+          "node": "html",
+          "source": "</b>",
+          "line": 1,
+          "column": 10
+        }
+      ]
+    },
+    {
+      "name": "html_block",
+      "note": "Block HTML: refused.",
+      "content": "<div>\nhi\n</div>",
+      "verdict": "refuse",
+      "problem": {
+        "path": "card.elements.m.props.content",
+        "limit": "markdown",
+        "node": "html"
+      },
+      "found": [
+        {
+          "node": "html",
+          "source": "<div>\nhi\n</div>",
+          "line": 1,
+          "column": 1
+        }
+      ]
+    },
+    {
+      "name": "html_comment",
+      "note": "An HTML comment: refused.",
+      "content": "a <!-- note --> b",
+      "verdict": "refuse",
+      "problem": {
+        "path": "card.elements.m.props.content",
+        "limit": "markdown",
+        "node": "html"
+      },
+      "found": [
+        {
+          "node": "html",
+          "source": "<!-- note -->",
+          "line": 1,
+          "column": 3
+        }
+      ]
+    },
+    {
+      "name": "html_escaped",
+      "note": "An escaped `<` is text.",
+      "content": "\\<b>not html\\</b>",
+      "verdict": "accept",
+      "nodes": [
+        "paragraph",
+        "text"
+      ],
+      "text": "<b>not html</b>",
+      "agentText": "\\<b>not html\\</b>"
+    },
+    {
+      "name": "heading_atx",
+      "note": "A heading: refused.",
+      "content": "# Title",
+      "verdict": "refuse",
+      "problem": {
+        "path": "card.elements.m.props.content",
+        "limit": "markdown",
+        "node": "heading"
+      },
+      "found": [
+        {
+          "node": "heading",
+          "source": "# Title",
+          "line": 1,
+          "column": 1
+        }
+      ]
+    },
+    {
+      "name": "heading_setext",
+      "note": "A setext heading: refused.",
+      "content": "Title\n=====",
+      "verdict": "refuse",
+      "problem": {
+        "path": "card.elements.m.props.content",
+        "limit": "markdown",
+        "node": "heading"
+      },
+      "found": [
+        {
+          "node": "heading",
+          "source": "Title\n=====",
+          "line": 1,
+          "column": 1
+        }
+      ]
+    },
+    {
+      "name": "thematic_break",
+      "note": "A horizontal rule: refused (a Divider element draws one).",
+      "content": "a\n\n***\n\nb",
+      "verdict": "refuse",
+      "problem": {
+        "path": "card.elements.m.props.content",
+        "limit": "markdown",
+        "node": "thematicBreak"
+      },
+      "found": [
+        {
+          "node": "thematicBreak",
+          "source": "***",
+          "line": 3,
+          "column": 1
+        }
+      ]
+    },
+    {
+      "name": "dash_rule_after_paragraph",
+      "note": "`---` under a line makes it a heading: refused.",
+      "content": "Title\n---",
+      "verdict": "refuse",
+      "problem": {
+        "path": "card.elements.m.props.content",
+        "limit": "markdown",
+        "node": "heading"
+      },
+      "found": [
+        {
+          "node": "heading",
+          "source": "Title\n---",
+          "line": 1,
+          "column": 1
+        }
+      ]
+    },
+    {
+      "name": "image",
+      "note": "An image: refused.",
+      "content": "![logo](https://example.com/logo.png)",
+      "verdict": "refuse",
+      "problem": {
+        "path": "card.elements.m.props.content",
+        "limit": "markdown",
+        "node": "image"
+      },
+      "found": [
+        {
+          "node": "image",
+          "source": "![logo](https://example.com/logo.png)",
+          "line": 1,
+          "column": 1
+        }
+      ]
+    },
+    {
+      "name": "table",
+      "note": "A table: refused.",
+      "content": "| a | b |\n| - | - |\n| 1 | 2 |",
+      "verdict": "refuse",
+      "problem": {
+        "path": "card.elements.m.props.content",
+        "limit": "markdown",
+        "node": "table"
+      },
+      "found": [
+        {
+          "node": "table",
+          "source": "| a | b |\n| - | - |\n| 1 | 2 |",
+          "line": 1,
+          "column": 1
+        }
+      ]
+    },
+    {
+      "name": "footnote",
+      "note": "A footnote: refused (the reference is found first).",
+      "content": "Text[^1]\n\n[^1]: note",
+      "verdict": "refuse",
+      "problem": {
+        "path": "card.elements.m.props.content",
+        "limit": "markdown",
+        "node": "footnoteReference"
+      },
+      "found": [
+        {
+          "node": "footnoteReference",
+          "source": "[^1]",
+          "line": 1,
+          "column": 5
+        },
+        {
+          "node": "footnoteDefinition",
+          "source": "[^1]: note",
+          "line": 3,
+          "column": 1
+        }
+      ]
+    },
+    {
+      "name": "reference_link",
+      "note": "A reference-style link: refused (the reference is found first).",
+      "content": "[docs][1]\n\n[1]: https://example.com",
+      "verdict": "refuse",
+      "problem": {
+        "path": "card.elements.m.props.content",
+        "limit": "markdown",
+        "node": "linkReference"
+      },
+      "found": [
+        {
+          "node": "linkReference",
+          "source": "[docs][1]",
+          "line": 1,
+          "column": 1
+        },
+        {
+          "node": "definition",
+          "source": "[1]: https://example.com",
+          "line": 3,
+          "column": 1
+        }
+      ]
+    },
+    {
+      "name": "definition_alone",
+      "note": "A link reference definition: refused.",
+      "content": "[1]: https://example.com",
+      "verdict": "refuse",
+      "problem": {
+        "path": "card.elements.m.props.content",
+        "limit": "markdown",
+        "node": "definition"
+      },
+      "found": [
+        {
+          "node": "definition",
+          "source": "[1]: https://example.com",
+          "line": 1,
+          "column": 1
+        }
+      ]
+    },
+    {
+      "name": "brackets_without_definition",
+      "note": "`[x]` with no definition is text, as are `[x][y]` and `[^1]` with none. Allowed difference 2 (RFC 082 §4.8): a client may draw an undefined reference differently, never as a link.",
+      "content": "[x] and [x][y] and [^1]",
+      "verdict": "accept",
+      "display": "may_differ",
+      "nodes": [
+        "paragraph",
+        "text"
+      ],
+      "text": "[x] and [x][y] and [^1]",
+      "agentText": "[x] and [x][y] and [^1]"
+    },
+    {
+      "name": "math_inline",
+      "note": "Inline math: refused.",
+      "content": "Area is $x^2$.",
+      "verdict": "refuse",
+      "problem": {
+        "path": "card.elements.m.props.content",
+        "limit": "markdown",
+        "node": "inlineMath"
+      },
+      "found": [
+        {
+          "node": "inlineMath",
+          "source": "$x^2$",
+          "line": 1,
+          "column": 9
+        }
+      ]
+    },
+    {
+      "name": "math_block",
+      "note": "Display math: refused.",
+      "content": "$$\nx^2\n$$",
+      "verdict": "refuse",
+      "problem": {
+        "path": "card.elements.m.props.content",
+        "limit": "markdown",
+        "node": "math"
+      },
+      "found": [
+        {
+          "node": "math",
+          "source": "$$\nx^2\n$$",
+          "line": 1,
+          "column": 1
+        }
+      ]
+    },
+    {
+      "name": "dollars_money",
+      "note": "Money is not math: `$5 to $10` stays text.",
+      "content": "From $5 to $10.",
+      "verdict": "accept",
+      "nodes": [
+        "paragraph",
+        "text"
+      ],
+      "text": "From $5 to $10.",
+      "agentText": "From $5 to $10."
+    },
+    {
+      "name": "task_list",
+      "note": "A task list item (GFM): refused.",
+      "content": "- [ ] write tests\n- [x] ship",
+      "verdict": "refuse",
+      "problem": {
+        "path": "card.elements.m.props.content",
+        "limit": "markdown",
+        "node": "taskListItem"
+      },
+      "found": [
+        {
+          "node": "taskListItem",
+          "source": "- [ ] write tests",
+          "line": 1,
+          "column": 1
+        },
+        {
+          "node": "taskListItem",
+          "source": "- [x] ship",
+          "line": 2,
+          "column": 1
+        }
+      ]
+    },
+    {
+      "name": "mentions_in_text",
+      "note": "`@name`, an escaped `\\@name` and `&#64;name` are text; the agent text sets each as inline code (an `@` the Server's parser reads, as in `a\\@b`, or the web's chips read, as in `&#64;name` and `_@name_`), so no reader takes it for a mention. It holds a character entity (`&#64;`): allowed difference 3 (RFC 082 §4.8).",
+      "content": "@artin, \\@sage, &#64;lagoon, _@eric_ and a\\@b",
+      "verdict": "accept",
+      "display": "may_differ",
+      "nodes": [
+        "emphasis",
+        "paragraph",
+        "text"
+      ],
+      "text": "@artin, @sage, @lagoon, @eric and a@b",
+      "agentText": "`@artin`, `@sage`, `@lagoon`, _`@eric`_ and a`@b`"
+    },
+    {
+      "name": "mentions_next_to_code",
+      "note": "An @name next to a backtick stays apart from it in the agent text; an unpaired backtick pairs with nothing.",
+      "content": "`x`@artin and a ` b @sage",
+      "verdict": "accept",
+      "nodes": [
+        "inlineCode",
+        "paragraph",
+        "text"
+      ],
+      "text": "x@artin and a ` b @sage",
+      "agentText": "`x` ``@artin`` and a ` b ``@sage``"
+    },
+    {
+      "name": "channel_refs_text",
+      "note": "`#channel` is text: no channel link.",
+      "content": "See #builds and <#builds>",
+      "verdict": "accept",
+      "nodes": [
+        "paragraph",
+        "text"
+      ],
+      "text": "See #builds and <#builds>",
+      "agentText": "See #builds and <#builds>"
+    }
+  ]
+}

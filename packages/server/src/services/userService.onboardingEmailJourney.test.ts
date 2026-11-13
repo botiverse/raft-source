@@ -11,7 +11,7 @@ import {
   resetOnboardingEmailJourneyTestOverrides,
   setOnboardingEmailJourneyConfigForTest,
 } from "./onboardingEmailJourneyService";
-import { completeProfile, createSocialUser, verifyEmail } from "./userService";
+import { completeProfile, createSocialUser, verifyEmailToken } from "./userService";
 
 
 function hashToken(token: string): string {
@@ -138,7 +138,7 @@ test("email verification enqueues onboarding welcome after marking the user veri
     expiresAt: new Date(Date.now() + 60_000),
   });
 
-  assert.equal(await verifyEmail(token), true);
+  assert.deepEqual(await verifyEmailToken(token), { userId: user.id, newlyVerified: true });
 
   const [verifiedUser] = await getDb().select()
     .from(users)

@@ -1,15 +1,14 @@
-import { useCallback, useEffect, useMemo, useRef } from "react";
+import { useCallback, useEffect, useMemo } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 import { useServerStore } from "../store/serverStore";
 import {
   useMobileNavStore,
   tabHomeFor,
-  railModeToMobileTab,
+  mobileTabForPath,
 } from "../store/mobileNavStore";
 import type {
   MobileTabId,
 } from "../store/mobileNavStore";
-import { useRailMode } from "./useSidebarTab";
 
 const MOBILE_BREAKPOINT_QUERY = "(max-width: 767px)";
 
@@ -18,95 +17,60 @@ function isMobileViewport(): boolean {
   return window.matchMedia(MOBILE_BREAKPOINT_QUERY).matches;
 }
 
-// Single hook used by MainLayout to (a) keep the active tab's stack
-// hydrated and synced to the current URL, (b) provide `selectTab` for
-// the mobile tab bar (restore-stack-top on switch, pop-to-root on tap
-// active).
+// Used by the phone tab bar: which tab the URL belongs to, and `selectTab`,
+// which lands on a tab's root as the user left it (design lead 2026-10-21:
+// each tab root keeps its filters and scroll position; pushed pages are not
+// kept). Tapping the selected tab is not a navigation at all: MobileTabBar
+// scrolls that root to the top, Activity to its next unread item
+// (useTabRootScroll).
 //
-// 4-tab mobile model (per @stdrc 2026-04-30 #proj-uiux:c8711d2a):
-// Chat / Tasks / Members / Settings. Computers is not a top-level
-// mobile tab — its routes live in the Settings stack.
+// Mobile tabs (stdrc / design lead 2026-10-21): Home / Activity / Tasks /
+// Search, then the server tab (stdrc 2026-10-22), which opens a popover and
+// holds no page. The server's own pages (Members, Computers, Settings) are
+// pushed from that popover and belong to no tab: `mobileTab` is null there.
+// /search is the Search tab's root.
 //
-// Back-button behavior is NOT driven by this stack — see `useMobileBack`
-// in useAppNavigate.ts. History → caller's fallbackPath, no stack pop
-// (stdrc msg=3e59ad5d, 2026-05-01, supersedes msg=548eda5f).
+// Back is not driven from here — see `useMobileBack` in useAppNavigate.ts:
+// browser history first, then the caller's fallbackPath (stdrc msg=3e59ad5d,
+// 2026-05-01).
 //
-// Desktop behavior is unchanged — these helpers gate on viewport size
-// and become no-ops on >=md screens.
+// Desktop is unchanged: nothing is recorded on >=md screens.
 export function useMobileNav() {
   const location = useLocation();
   const navigate = useNavigate();
   const serverSlug = useServerStore((s) => s.current?.slug ?? null);
   const pathBase = serverSlug ? `/s/${serverSlug}` : "";
-  const { railMode } = useRailMode();
-  const mobileTab = useMemo<MobileTabId>(() => railModeToMobileTab(railMode), [railMode]);
-  const hydrate = useMobileNavStore((s) => s.hydrate);
-  const push = useMobileNavStore((s) => s.push);
-  const popToRoot = useMobileNavStore((s) => s.popToRoot);
-
-  const lastSyncedPathRef = useRef<string | null>(null);
-
-  const currentPathAndSearch = useMemo(
-    () => `${location.pathname}${location.search}`,
-    [location.pathname, location.search],
+  const mobileTab = useMemo<MobileTabId | null>(
+    () => mobileTabForPath(location.pathname, pathBase),
+    [location.pathname, pathBase],
   );
+  const rememberRoot = useMobileNavStore((s) => s.rememberRoot);
 
-  // Hydrate the active tab on every URL change so that:
-  // - First time we land in a tab, [home, current] (or just [home] if at home)
-  // - Subsequent in-tab navigations push the new path onto the stack
-  //   (skipped when the URL change is itself a stack pop, which calls
-  //   navigate with the destination already at the new stack top).
-  //
-  // NOTE: This stack does NOT drive the back-button behavior. Per
-  // @stdrc's ruling in `#proj-uiux:c8711d2a` msg=3e59ad5d (2026-05-01,
-  // supersedes msg=548eda5f / msg=49bf9068), mobile back goes through
-  // browser history first and falls back directly to the caller's
-  // `fallbackPath` — the view-stack is no longer consulted by
-  // `useMobileBack` (see useAppNavigate.ts). The stack here remains the
-  // source of truth for two things only: (1) tab-switch memory — "when I
-  // come back to this tab, resume where I left off", and (2) popToRoot on
-  // double-tap of an active tab. So we tolerate a little inflation on
-  // browser-back (the top entry can be a path we've already visited)
-  // rather than try to detect pops here.
-  useEffect(() => {
-    if (!serverSlug || !isMobileViewport()) return;
-    if (lastSyncedPathRef.current === currentPathAndSearch) return;
-    hydrate(mobileTab, pathBase, currentPathAndSearch);
-    push(mobileTab, currentPathAndSearch);
-    lastSyncedPathRef.current = currentPathAndSearch;
-  }, [serverSlug, pathBase, mobileTab, currentPathAndSearch, hydrate, push]);
-
-  // Reset stacks when the active server changes — different /s/<slug>
-  // means different home paths and unrelated history.
+  // A different server has different roots. Declared first, so a server
+  // switch clears the old roots before the new URL is recorded.
   useEffect(() => {
     if (!serverSlug) return;
-    // Stacks are keyed by tab not by server, so clearing them on slug
-    // change keeps the next server's tabs starting fresh.
     useMobileNavStore.getState().reset();
-    lastSyncedPathRef.current = null;
   }, [serverSlug]);
+
+  // Record a tab root, with its query (its filters), each time the URL shows
+  // one. Search keeps its own state (raft:search-state), so its tab lands on
+  // bare /search and the page restores the rest.
+  useEffect(() => {
+    if (!serverSlug || !isMobileViewport() || mobileTab === null || mobileTab === "search") return;
+    const pathname = location.pathname.replace(/\/+$/, "") || "/";
+    if (pathname !== tabHomeFor(mobileTab, pathBase)) return;
+    rememberRoot(mobileTab, `${pathname}${location.search}`);
+  }, [serverSlug, pathBase, mobileTab, location.pathname, location.search, rememberRoot]);
 
   const selectTab = useCallback((mode: MobileTabId) => {
     if (!serverSlug) return;
-    const home = tabHomeFor(mode, pathBase);
-    // stdrc 2026-05-09 #proj-mobile:b1c622e5 task #11:
-    // Every tab tap goes to that tab's root, drops any per-tab sub-page
-    // memory. Previous behavior was iOS-style: tap inactive = restore
-    // last sub-page top, tap active = pop to root. That broke the
-    // "user can always reach tab root" invariant — sub-pages hide the
-    // tab bar, so once you'd drilled into tab A and switched away,
-    // tapping A again would drop you back into the sub-page with no
-    // tab bar; the only escape was browser-back, which would route
-    // through the OTHER tab you came from rather than to A's root.
-    // Now: tap-to-root for both active and inactive cases. Stack
-    // memory is reset for the target tab so the "drilled in" state
-    // doesn't reappear on the next tap either. Browser history is
-    // left intact (no `replace`) — back button still rewinds through
-    // visited surfaces normally.
-    popToRoot(mode);
-    lastSyncedPathRef.current = home;
-    navigate(home);
-  }, [serverSlug, pathBase, popToRoot, navigate]);
+    // stdrc 2026-05-09 #proj-mobile:b1c622e5 task #11: a tab tap lands on
+    // the tab's root, never on a pushed page left open in it (pushed pages
+    // hide the bar, so that would leave no way back to the root). Browser
+    // history is left intact (no `replace`).
+    navigate(useMobileNavStore.getState().roots[mode] ?? tabHomeFor(mode, pathBase));
+  }, [serverSlug, pathBase, navigate]);
 
-  return { selectTab, isMobile: isMobileViewport() };
+  return { selectTab, mobileTab, isMobile: isMobileViewport() };
 }

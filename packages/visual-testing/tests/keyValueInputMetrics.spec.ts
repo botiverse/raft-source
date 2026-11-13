@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+import { builtinSources, mockRuntimeFormsV2, runtimeFormFixture } from "./runtimeFormV2Mock";
 
 /**
  * Key/value rows are shared by RuntimeConfigFields (env vars) and AgentMcpTab
@@ -19,21 +20,21 @@ const CASE = (mode: Mode) =>
   `/visual-testing.html?case=screens.members.agent-detail.runtime-connection` +
   (mode === "dark" ? "&theme=dark" : "");
 
-async function primeConnections(page: import("@playwright/test").Page) {
-  await page.route("**/provider-connections", async (route) => {
-    await route.fulfill({
-      status: 200,
-      contentType: "application/json",
-      body: JSON.stringify({
-        connections: [{ id: "11111111-1111-4111-8111-111111111111", name: "ds official api", providerId: "deepseek", authMethod: "api_key", endpointUrl: null, supportsImageInput: false, enabled: true, status: "ready", configVersion: 1, credentialVersion: 1 }],
-        providerOptions: [{ providerId: "deepseek", label: "DeepSeek", authMethods: ["api_key"] }],
-      }),
-    });
-  });
+/**
+ * The runtime editor renders only the server-described v2 form (runtime form v1
+ * went in #11812), so the case's Built-in agent needs its edit form served: the
+ * real builtin.edit.json fixture, with one saved variable so the env-var rows
+ * (the key/value consumer measured here) exist. Its envVars field sits in the
+ * collapsed Advanced section, opened below.
+ */
+async function primeForm(page: import("@playwright/test").Page) {
+  const edit = runtimeFormFixture("builtin.edit.json") as { values: Record<string, unknown> };
+  edit.values = { ...edit.values, envVars: { OPENAI_LOG: "debug" } };
+  await mockRuntimeFormsV2(page, [{ runtimeId: "builtin", current: true, edit, sources: builtinSources() }]);
 }
 
 async function openRows(page: import("@playwright/test").Page, mode: Mode) {
-  await primeConnections(page);
+  await primeForm(page);
   await page.goto(CASE(mode));
   await page.getByRole("button", { name: "Edit runtime config" }).click({ timeout: 10_000 });
   // Agent Details uses an inline editor surface (not an ARIA dialog).  Readiness

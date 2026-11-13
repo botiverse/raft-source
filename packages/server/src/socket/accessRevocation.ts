@@ -3,7 +3,10 @@
 export type SocketAccessRevocation =
   /** `removedFromServerId` marks a membership removal: connections attached to
    * that server receive `server:membership-removed` as their last packet. */
-  | { userId: string; familyId?: string; removedFromServerId?: string }
+  | { userId: string; familyId?: string; removedFromServerId?: string;
+      /** Invalidate only this entry's transports; other server entries stay
+       * connected and may immediately subscribe/send/reconnect. */
+      entryServerId?: string }
   /** Every connection attached to the server (scope omitted or "all"), or only
    * its guest connections. */
   | { serverId: string; scope?: "all" | "guests" }

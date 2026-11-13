@@ -17,6 +17,7 @@ import {
   prepareExactLocalUpgradeLifecycleOperationResult,
   prepareLocalUpgradeLifecycleOperation,
   prepareLocalLifecycleOperations,
+  type MachineKeyLifecycleIntentResult,
 } from "./localLifecycleIntents";
 import { serverAttachmentPath, upgradeLogPath, userSessionPath } from "./paths";
 
@@ -25,8 +26,17 @@ const SECOND_SERVER_ID = "11111111-1111-4111-8111-222222222222";
 const OPERATION_ID = "22222222-2222-4222-8222-222222222222";
 const SECOND_OPERATION_ID = "33333333-3333-4333-8333-333333333333";
 
-async function startLifecycleIntentServer(onRequest: (authorization: string | undefined) => void) {
+async function startLifecycleIntentServer(
+  onRequest: (authorization: string | undefined) => void,
+  opts: { machineKeyRoute?: boolean } = {},
+) {
   const server = createServer(async (req, res) => {
+    if (req.url === "/internal/computer/lifecycle-operations" && !opts.machineKeyRoute) {
+      // An older server: the claimed internal prefix refuses unknown routes.
+      res.writeHead(401, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ code: "auth_policy_unregistered_path" }));
+      return;
+    }
     onRequest(req.headers.authorization);
     const chunks: Buffer[] = [];
     for await (const chunk of req) chunks.push(Buffer.from(chunk));
@@ -498,7 +508,7 @@ test("completed upgrade log retires only legacy shutdown phase for exact upgrade
   }
 });
 
-test("local lifecycle intent authority resolves a user session per server origin", async () => {
+test("on an older server (no machine-key route) local lifecycle intent authority resolves a user session per server origin", async () => {
   const home = await mkdtemp(join(tmpdir(), "raft-computer-lifecycle-origins-"));
   const ids = [
     "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
@@ -527,6 +537,7 @@ test("local lifecycle intent authority resolves a user session per server origin
           refreshed: false,
         };
       },
+      createMachineIntent: async () => ({ status: "route_unavailable" }),
       createIntent: async (serverUrl, accessToken, input) => {
         intentCalls.push({ serverUrl, accessToken, serverId: input.serverId });
         return { status: "accepted", operationId: input.operationId };
@@ -587,6 +598,91 @@ test("default local intent path never sends one origin's refresh credential to a
     assert.deepEqual(readPendingLifecycleAcknowledgements(home, SECOND_SERVER_ID), []);
   } finally {
     await Promise.all([originA.close(), originB.close()]);
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+async function writeAttachmentFile(home: string, serverId: string, serverUrl: string, apiKey: string, machineId: string) {
+  const file = serverAttachmentPath(home, serverId);
+  await mkdir(dirname(file), { recursive: true });
+  await writeFile(file, JSON.stringify({
+    kind: "computer-attachment",
+    serverId,
+    serverMachineId: `computer-${serverId}`,
+    machineId,
+    apiKey,
+    serverUrl,
+  }));
+}
+
+test("local start/stop/restart is recorded with each server's own Computer key, never a person's session", async () => {
+  const home = await mkdtemp(join(tmpdir(), "raft-computer-lifecycle-machine-key-"));
+  const seen: Array<{ url: string | undefined; authorization: string | undefined; body: unknown }> = [];
+  const server = createServer(async (req, res) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) chunks.push(Buffer.from(chunk));
+    const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { operationId: string };
+    seen.push({ url: req.url, authorization: req.headers.authorization, body });
+    res.writeHead(201, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ operationId: body.operationId, action: "restart" }));
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  try {
+    // A usable session for the same origin exists; it must not be used.
+    const sessionFile = userSessionPath(home);
+    await mkdir(dirname(sessionFile), { recursive: true });
+    await writeFile(sessionFile, JSON.stringify({ kind: "user-session", accessToken: "person-token", refreshToken: "r", serverUrl: url }));
+    await writeAttachmentFile(home, SERVER_ID, url, "sk_computer_one", "44444444-4444-4444-8444-444444444444");
+    await writeAttachmentFile(home, SECOND_SERVER_ID, url, "sk_computer_two", "55555555-5555-4555-8555-555555555555");
+
+    const prepared = await prepareLocalLifecycleOperations(home, "restart", [SERVER_ID, SECOND_SERVER_ID]);
+    assert.equal(prepared.length, 2);
+    assert.deepEqual(seen.map((r) => [r.url, r.authorization]), [
+      ["/internal/computer/lifecycle-operations", "Bearer sk_computer_one"],
+      ["/internal/computer/lifecycle-operations", "Bearer sk_computer_two"],
+    ]);
+    // No machine id is sent: the server takes it from the key.
+    for (const request of seen) {
+      assert.deepEqual(Object.keys(request.body as object).sort(), ["action", "operationId", "parentOperationId"]);
+    }
+    assert.deepEqual(readPendingLifecycleAcknowledgements(home, SERVER_ID).map((a) => a.operationId), [prepared[0]!.operationId, prepared[0]!.operationId]);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("only an older server's missing route falls back to the session; a refused key does not", async () => {
+  const home = await mkdtemp(join(tmpdir(), "raft-computer-lifecycle-fallback-"));
+  const ids = ["aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", OPERATION_ID, SECOND_OPERATION_ID];
+  const sessionCalls: string[] = [];
+  const machineKeyAnswers = new Map<string, MachineKeyLifecycleIntentResult>([
+    ["https://older.example.test", { status: "route_unavailable" }],
+    ["https://newer.example.test", { status: "rejected", code: "http_401" }],
+  ]);
+  try {
+    const prepared = await prepareLocalLifecycleOperations(home, "stop", [SERVER_ID, SECOND_SERVER_ID], {
+      readAttachment: async (_slockHome, serverId) => ({
+        kind: "computer-attachment",
+        serverId,
+        serverMachineId: `computer-${serverId}`,
+        machineId: "44444444-4444-4444-8444-444444444444",
+        apiKey: "sk_computer_test",
+        serverUrl: serverId === SERVER_ID ? "https://older.example.test" : "https://newer.example.test",
+      }),
+      ensureSession: async () => ({ status: "usable", accessToken: "person-token", refreshed: false }),
+      createMachineIntent: async (serverUrl) => machineKeyAnswers.get(serverUrl)!,
+      createIntent: async (serverUrl, _token, input) => {
+        sessionCalls.push(serverUrl);
+        return { status: "accepted", operationId: input.operationId };
+      },
+      createId: () => ids.shift()!,
+    });
+    assert.deepEqual(sessionCalls, ["https://older.example.test"]);
+    assert.deepEqual(prepared, [{ serverId: SERVER_ID, operationId: OPERATION_ID }]);
+    assert.deepEqual(readPendingLifecycleAcknowledgements(home, SECOND_SERVER_ID), []);
+  } finally {
     await rm(home, { recursive: true, force: true });
   }
 });

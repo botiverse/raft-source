@@ -5,6 +5,13 @@ import {
   cancelAttachmentUploadSession,
   uploadAttachmentFile,
 } from "../src/utils/directAttachmentUpload";
+import {
+  __setDirectPutFailureEmitterForTest,
+  directPutClientScheme,
+  directPutElapsedBucket,
+  directPutSentBucket,
+  directPutSizeBucket,
+} from "../src/utils/directPutFailureTrace";
 import type {
   AttachmentUploadApi,
 } from "../src/utils/directAttachmentUpload";
@@ -545,4 +552,267 @@ test("an uncertain plain-File PUT keeps the session and enters recovery without 
   assert.ok(calls.some((call) => call.method === "GET" && call.url.endsWith("/upload-1")));
   assert.equal(calls.filter((call) => call.url.endsWith("/complete")).length, 3);
   assert.equal(calls.some((call) => call.method === "DELETE" && call.url.endsWith("/upload-1")), false);
+});
+
+
+// ---------------------------------------------------------------------------
+// slock.attachment.direct_put_failed (#triage:#327): one event per failed
+// direct PUT, after recovery, with no URL / filename / id. Behaviour is
+// unchanged: these tests only add the trace assertions.
+// ---------------------------------------------------------------------------
+
+type EmittedEvent = Readonly<{ name: string; attrs: Record<string, unknown> }>;
+
+async function withDirectPutTrace(
+  protocol: string | undefined,
+  run: (emitted: EmittedEvent[]) => Promise<void>,
+): Promise<void> {
+  const emitted: EmittedEvent[] = [];
+  __setDirectPutFailureEmitterForTest((name, attrs) => { emitted.push({ name, attrs }); });
+  const hadLocation = Object.prototype.hasOwnProperty.call(globalThis, "location");
+  const previous = (globalThis as { location?: unknown }).location;
+  if (protocol !== undefined) {
+    Object.defineProperty(globalThis, "location", {
+      value: { protocol, host: "raft", href: `${protocol}//raft/` },
+      configurable: true,
+      writable: true,
+    });
+  }
+  try {
+    await run(emitted);
+  } finally {
+    __setDirectPutFailureEmitterForTest(null);
+    if (protocol !== undefined) {
+      if (hadLocation) {
+        Object.defineProperty(globalThis, "location", { value: previous, configurable: true, writable: true });
+      } else {
+        delete (globalThis as { location?: unknown }).location;
+      }
+    }
+  }
+}
+
+const pendingSession = {
+  uploadId: "upload-1",
+  state: "pending",
+  expiresAt: created.expiresAt,
+  attachment: null,
+  terminalReason: null,
+} as const;
+
+function assertNoSensitiveAttrs(attrs: Record<string, unknown>): void {
+  const serialized = JSON.stringify(attrs);
+  for (const secret of [created.upload.url, "payload.bin", "upload-1", "attachment-1", "channel-1", "raft/"]) {
+    assert.equal(serialized.includes(secret), false, `trace must not carry ${secret}`);
+  }
+}
+
+test("a status-less PUT network error (CORS-blocked preflight) is traced with recovery not_found and still asks for a retry", async () => {
+  const missing = responseError(404, {
+    code: "UPLOAD_OBJECT_NOT_FOUND",
+    message: "Uploaded object is not visible yet.",
+    retryable: true,
+    retryAfterMs: 1,
+  });
+  await withDirectPutTrace("app:", async (emitted) => {
+    const { api, calls } = makeApi({
+      capabilities,
+      create: [created],
+      status: [pendingSession],
+      complete: [missing, missing, missing],
+    });
+    let legacyCalls = 0;
+    await assert.rejects(
+      uploadAttachmentFile({
+        api,
+        file: fileOf(8),
+        channelId: "channel-1",
+        clientRequestId: "request-stable",
+        legacyUpload: async () => { legacyCalls += 1; return "must-not-run"; },
+        requestImpl: async () => {
+          throw Object.assign(new TypeError("Network Error"), { code: "ERR_NETWORK" });
+        },
+        sleep: async () => undefined,
+      }),
+      (error: unknown) => error instanceof AttachmentUploadClientError
+        && error.code === "UPLOAD_OBJECT_PUT_UNCERTAIN"
+        && error.retryable,
+    );
+    assert.equal(legacyCalls, 0, "tracing only: no fallback to the legacy upload");
+    assert.equal(calls.some((call) => call.method === "DELETE"), false, "the session is kept for a safe retry");
+    assert.equal(emitted.length, 1);
+    assert.equal(emitted[0]!.name, "slock.attachment.direct_put_failed");
+    assert.deepEqual(emitted[0]!.attrs, {
+      reason: "network_error",
+      http_status: null,
+      error_name: "TypeError",
+      error_code: "ERR_NETWORK",
+      size_bucket: "<10MB",
+      elapsed_bucket: "<1s",
+      sent_bucket: null,
+      client_scheme: "app",
+      recovery: "not_found",
+    });
+    assertNoSensitiveAttrs(emitted[0]!.attrs);
+  });
+});
+
+test("an HTTP 503 PUT is traced with its status and progress, and recovery that finds the object still succeeds", async () => {
+  await withDirectPutTrace("https:", async (emitted) => {
+    const { api } = makeApi({
+      capabilities,
+      create: [created],
+      status: [pendingSession],
+      complete: [completed],
+    });
+    const attachmentId = await uploadAttachmentFile({
+      api,
+      file: fileOf(8),
+      channelId: "channel-1",
+      clientRequestId: "request-stable",
+      legacyUpload: async () => "must-not-run",
+      requestImpl: async (config) => {
+        config.onUploadProgress?.({ loaded: 4, total: 8 } as never);
+        config.onUploadProgress?.({ loaded: 8, total: 8 } as never);
+        return { status: 503 };
+      },
+      sleep: async () => undefined,
+    });
+    assert.equal(attachmentId, "attachment-1");
+    assert.equal(emitted.length, 1);
+    assert.deepEqual(emitted[0]!.attrs, {
+      reason: "http_status",
+      http_status: 503,
+      error_name: null,
+      error_code: null,
+      size_bucket: "<10MB",
+      elapsed_bucket: "<1s",
+      sent_bucket: "100%",
+      client_scheme: "https",
+      recovery: "found",
+    });
+    assertNoSensitiveAttrs(emitted[0]!.attrs);
+  });
+});
+
+test("an HTTP 503 PUT whose object is absent keeps today's retryable error and is traced", async () => {
+  const missing = responseError(404, {
+    code: "UPLOAD_OBJECT_NOT_FOUND",
+    message: "Uploaded object is not visible yet.",
+    retryable: true,
+    retryAfterMs: 1,
+  });
+  await withDirectPutTrace(undefined, async (emitted) => {
+    const { api } = makeApi({
+      capabilities,
+      create: [created],
+      status: [pendingSession],
+      complete: [missing, missing, missing],
+    });
+    await assert.rejects(
+      uploadAttachmentFile({
+        api,
+        file: fileOf(8),
+        channelId: "channel-1",
+        clientRequestId: "request-stable",
+        legacyUpload: async () => "must-not-run",
+        requestImpl: async () => ({ status: 503 }),
+        sleep: async () => undefined,
+      }),
+      (error: unknown) => error instanceof AttachmentUploadClientError
+        && error.code === "UPLOAD_OBJECT_PUT_UNCERTAIN",
+    );
+    assert.equal(emitted.length, 1);
+    assert.equal(emitted[0]!.attrs.reason, "http_status");
+    assert.equal(emitted[0]!.attrs.http_status, 503);
+    assert.equal(emitted[0]!.attrs.recovery, "not_found");
+  });
+});
+
+test("a non-retryable PUT status is traced without recovery and still fails closed", async () => {
+  await withDirectPutTrace(undefined, async (emitted) => {
+    const { api, calls } = makeApi({ capabilities, create: [created] });
+    await assert.rejects(
+      uploadAttachmentFile({
+        api,
+        file: fileOf(8),
+        channelId: "channel-1",
+        clientRequestId: "request-stable",
+        legacyUpload: async () => "must-not-run",
+        requestImpl: async () => ({ status: 403 }),
+      }),
+      (error: unknown) => error instanceof AttachmentUploadClientError
+        && error.code === "UPLOAD_OBJECT_PUT_FAILED"
+        && error.message === "Direct object upload failed with HTTP 403.",
+    );
+    assert.ok(calls.some((call) => call.method === "DELETE" && call.url.endsWith("/upload-1")));
+    assert.equal(emitted.length, 1);
+    assert.equal(emitted[0]!.attrs.http_status, 403);
+    assert.equal(emitted[0]!.attrs.recovery, "not_attempted");
+  });
+});
+
+test("an aborted PUT is a cancel, not a failure, and emits no trace", async () => {
+  await withDirectPutTrace("app:", async (emitted) => {
+    const controller = new AbortController();
+    const { api } = makeApi({ capabilities, create: [created] });
+    await assert.rejects(
+      uploadAttachmentFile({
+        api,
+        file: fileOf(8),
+        channelId: "channel-1",
+        clientRequestId: "request-stable",
+        legacyUpload: async () => "must-not-run",
+        signal: controller.signal,
+        requestImpl: async () => {
+          controller.abort();
+          throw Object.assign(new Error("canceled"), { name: "CanceledError", code: "ERR_CANCELED" });
+        },
+      }),
+      (error: unknown) => (error as Error).name === "CanceledError",
+    );
+    assert.deepEqual(emitted, []);
+  });
+});
+
+test("a cancel that lands during recovery or races a 4xx emits no trace", async () => {
+  for (const status of [503, 403]) {
+    await withDirectPutTrace("app:", async (emitted) => {
+      const controller = new AbortController();
+      const { api } = makeApi({ capabilities, create: [created] });
+      await assert.rejects(
+        uploadAttachmentFile({
+          api,
+          file: fileOf(8),
+          channelId: "channel-1",
+          clientRequestId: "request-stable",
+          legacyUpload: async () => "must-not-run",
+          signal: controller.signal,
+          requestImpl: async () => {
+            controller.abort();
+            return { status };
+          },
+          sleep: async () => undefined,
+        }),
+      );
+      assert.deepEqual(emitted, [], `status ${status}`);
+    });
+  }
+});
+
+test("direct PUT trace buckets stay coarse", () => {
+  const MB = 1024 * 1024;
+  assert.equal(directPutSizeBucket(10 * MB), "10-50MB");
+  assert.equal(directPutSizeBucket(175 * MB), "50-200MB");
+  assert.equal(directPutSizeBucket(200 * MB), ">200MB");
+  assert.equal(directPutElapsedBucket(999), "<1s");
+  assert.equal(directPutElapsedBucket(30_000), "10-60s");
+  assert.equal(directPutElapsedBucket(600_000), ">5m");
+  assert.equal(directPutSentBucket(null, 100), null);
+  assert.equal(directPutSentBucket(0, 100), "<10%");
+  assert.equal(directPutSentBucket(60, 100), "50-90%");
+  assert.equal(directPutSentBucket(95, 100), "90-99%");
+  assert.equal(directPutClientScheme("app:"), "app");
+  assert.equal(directPutClientScheme("file:"), "other");
+  assert.equal(directPutClientScheme(undefined), "other");
 });

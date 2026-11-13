@@ -1,5 +1,6 @@
 import { fixturePasswordHash } from "../test/integration/credentials";
 import { createApiTest } from "../test/integration/apiTest";
+import { enableTaskV2ConversationsForServer } from "../test/integration/taskV2Flag";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 
@@ -12,7 +13,7 @@ import { createServer } from "./serverService";
 import * as messageService from "./messageService";
 import * as taskService from "./taskService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 /**
  * Source coverage after P3 closed the v1.4 compatibility window.
@@ -241,6 +242,56 @@ test("status filter cannot resurrect the suppressed twin of a backfilled task", 
 });
 
 test("host message reads project the canonical task fields back on", async ({ app }) => {
+  const { owner, channel } = await setupChannel("mixed-projection");
+  const legacy = await seedLegacyMessageTask(channel.id, owner.id, "legacy task body", 1);
+  // Task v2: createTasks writes no message (the task gets its own
+  // conversation, lazily), so the visible canonical host here is a converted chat
+  // message (a pre-v2 task).
+  const [convertedHost] = await getDb().insert(messages).values({
+    channelId: channel.id,
+    senderType: "user",
+    senderId: owner.id,
+    messageType: "chat",
+    content: "canonical task body",
+  }).returning();
+  const native = await taskService.convertMessageToTask(convertedHost!.id, "user", owner.id, channel.id);
+  assert.notEqual(typeof native, "string");
+  if (typeof native === "string") return;
+  const nativeHost = convertedHost!;
+  await enableTaskV2ConversationsForServer(channel.serverId);
+  const { hostMessages: v2HostMessages, tasks: [v2Task] } = await taskService.createTasks(channel.id, "user", owner.id, [{ title: "task v2 task" }]);
+  assert.deepEqual(v2HostMessages, [], "a task v2 task writes no message");
+  assert.equal(v2Task!.conversationChannelId, null, "its conversation is created lazily, on first use");
+  assert.equal(v2Task!.conversationAnchored, true, "its discussion is its own conversation");
+  await taskService.claimTask(native.id, "user", owner.id);
+
+  // Stored truth: the host message row itself has no task columns.
+  const [storedHost] = await getDb().select().from(messages).where(eq(messages.id, nativeHost.id));
+  assert.equal(storedHost.taskStatus, null);
+
+  // Published truth: the read path still hands out the `task_*` shape the CLI
+  // renders `[task #N status=... @assignee]` from, for BOTH representations.
+  const listed = await messageService.listMessages(channel.id, 50);
+  const byId = new Map(listed.map((row) => [row.id, row]));
+  assert.equal(listed.some((row) => row.content === "task v2 task"), false, "a task v2 task is never a history row");
+
+  const legacyRead = byId.get(legacy.id) as { taskStatus: string | null; taskNumber: number | null };
+  assert.equal(legacyRead.taskStatus, "todo");
+  assert.equal(legacyRead.taskNumber, 1);
+
+  const nativeRead = byId.get(nativeHost.id) as {
+    taskStatus: string | null;
+    taskNumber: number | null;
+    taskAssigneeId: string | null;
+    taskAssigneeName: string | null;
+  };
+  assert.equal(nativeRead.taskStatus, "in_progress", "claiming the canonical task must show on its host message");
+  assert.equal(nativeRead.taskNumber, native.taskNumber);
+  assert.equal(nativeRead.taskAssigneeId, owner.id);
+  assert.equal(nativeRead.taskAssigneeName, owner.name, "assignee handle must resolve, not leak an opaque id");
+});
+
+test("task v2 off (default): createTasks host message reads project the canonical task fields back on", async ({ app }) => {
   const { owner, channel } = await setupChannel("mixed-projection");
   const legacy = await seedLegacyMessageTask(channel.id, owner.id, "legacy task body", 1);
   const { tasks: [native], hostMessages: [nativeHost] } = await taskService.createTasks(

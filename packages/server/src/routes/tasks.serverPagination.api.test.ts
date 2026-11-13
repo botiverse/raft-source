@@ -6,12 +6,13 @@ import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { getDb } from "../db/index";
 import { channels, serverMembers, users } from "../db/schema";
-import { createChannel, addHuman } from "../services/channelService";
+import { createChannel, addHuman, findOrCreateDM } from "../services/channelService";
+import { createAgent } from "../services/agentService";
 import { createServer } from "../services/serverService";
 import * as taskService from "../services/taskService";
 import { TASKS_SERVER_RESPONSE_WARN_BYTES } from "./tasks";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 async function seedUser(email: string, name: string) {
   const db = getDb();
@@ -174,10 +175,11 @@ test("GET /api/tasks/server?detail=summary omits description bodies and keeps na
   assert.equal(body.tasks.length, 2);
 
   const expectedKeys = [
-    "channelId", "channelName", "channelType", "claimedAt", "claimedById",
-    "claimedByName", "claimedByType", "completedAt", "createdAt", "createdById",
+    "activityAt", "channelId", "channelName", "channelType", "claimedAt", "claimedById",
+    "claimedByName", "claimedByType", "completedAt", "conversationReplyCount", "createdAt", "createdById",
     "createdByName", "createdByType", "descriptionBytes", "hasDescription", "id",
-    "isLegacy", "messageId", "readOnlyReason", "revision", "source", "status", "taskNumber", "title",
+    "isLegacy", "lastActivityAt", "messageId", "readOnlyReason", "revision", "source", "sourceMessageId", "sourceRecorded",
+    "sourceSenderId", "sourceSenderType", "status", "taskNumber", "title",
     "updatedAt",
   ];
   for (const item of body.tasks) {
@@ -291,43 +293,50 @@ test("GET /api/tasks/server composes the status filter with pagination", async (
   assert.equal(inProgress.pages, 2, "2 in_progress at limit 1 must take 2 pages");
 });
 
-test("GET /api/tasks/server pagination returns exactly the legacy visibility set", async ({ app }) => {
+test("GET /api/tasks/server lists private-channel tasks to members only, never DM or archived tasks, legacy and paginated alike", async ({ app }) => {
   const db = getDb();
   const owner = await seedUser("vis-owner@slock.test", "vis-owner");
   const reader = await seedUser("vis-reader@slock.test", "vis-reader");
   const server = await createServer("Task Visibility", "task-visibility", owner.id);
   await db.insert(serverMembers).values({ serverId: server.id, userId: reader.id, role: "member" }).onConflictDoNothing();
+  const agent = await createAgent(server.id, "vis-agent", { runtime: "claude", model: "sonnet" });
 
   const open = await createChannel(server.id, "open-room");
   const closed = await createChannel(server.id, "closed-room", undefined, "private");
   const archived = await createChannel(server.id, "archived-room");
+  const dm = (await findOrCreateDM(server.id, owner.id, agent.id))!;
   await addHuman(open.id, owner.id);
   await addHuman(closed.id, owner.id);
   await addHuman(archived.id, owner.id);
 
   const { tasks: openTasks } = await taskService.createTasks(open.id, "user", owner.id, [{ title: "open-1" }, { title: "open-2" }]);
-  await taskService.createTasks(closed.id, "user", owner.id, [{ title: "closed-1" }]);
+  const { tasks: closedTasks } = await taskService.createTasks(closed.id, "user", owner.id, [{ title: "closed-1" }]);
   await taskService.createTasks(archived.id, "user", owner.id, [{ title: "archived-1" }]);
+  await taskService.createTasks(dm.id, "user", owner.id, [{ title: "dm-1" }]);
   await db.update(channels).set({ archivedAt: new Date() }).where(eq(channels.id, archived.id));
 
   const readerHeaders = authHeaders(await tokenForHuman(reader.email), server.id);
   const ownerHeaders = authHeaders(await tokenForHuman(owner.email), server.id);
 
-  // A non-member reader sees only the public channel's tasks, archived excluded.
+  // A non-member of the private channel sees only the public channel's tasks, archived excluded.
   const readerPages = await fetchAllPages(app.baseUrl, readerHeaders, "limit=1");
   assert.deepEqual(
     readerPages.items.map((task) => task.id).sort(),
     openTasks.map((task) => task.id).sort(),
   );
 
-  // The legacy server-wide filter is type IN (channel, joint) + non-archived:
-  // a private channel's tasks are invisible here even to its own member, and
-  // pagination must reproduce that exactly (no leak, no new visibility).
+  // The board is the visibility entry's public, private and joint channels,
+  // non-archived: the private channel's member sees its tasks; DM tasks stay
+  // off the board (product choice). Pagination reproduces the legacy read.
   const legacyRes = await fetch(`${app.baseUrl}/api/tasks/server`, { headers: ownerHeaders });
   assert.equal(legacyRes.status, 200);
   const legacyBody = await legacyRes.json() as { tasks: Array<{ id: string }> };
   const ownerPages = await fetchAllPages(app.baseUrl, ownerHeaders, "limit=1");
-  assert.equal(ownerPages.items.length, 2, "private and archived channel tasks stay invisible even to the owner");
+  assert.deepEqual(
+    ownerPages.items.map((task) => task.id).sort(),
+    [...openTasks, ...closedTasks].map((task) => task.id).sort(),
+    "public and private-member tasks; archived and DM tasks stay off the board",
+  );
   assert.deepEqual(
     ownerPages.items.map((task) => task.id).sort(),
     legacyBody.tasks.map((task) => task.id).sort(),

@@ -1,16 +1,13 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import {
-  SERVER_SYSTEM_ATTENTION_CONTRACT_VERSION,
-  USAGE_LIMIT_ATTENTION_FEATURE_FLAG_KEY,
-} from "@botiverse/raft-shared";
+import { SERVER_SYSTEM_ATTENTION_CONTRACT_VERSION } from "@botiverse/raft-shared";
 import type {
   ServerSystemAttentionResponse,
   UsageLimitAttentionNotification,
 } from "@botiverse/raft-shared";
 
 import api from "../../api/client";
-import { useServerFeatureFlag } from "../../store/serverFeatureFlags";
 import { useServerStore } from "../../store/serverStore";
+import { startVisiblePoll } from "../../utils/visiblePoll";
 
 const POLL_MS = 60_000;
 
@@ -23,11 +20,10 @@ export interface UsageLimitAttentionState {
 
 export function useUsageLimitAttention(): UsageLimitAttentionState {
   const serverId = useServerStore((state) => state.current?.id ?? null);
-  const gate = useServerFeatureFlag(USAGE_LIMIT_ATTENTION_FEATURE_FLAG_KEY);
   const [snapshot, setSnapshot] = useState<ServerSystemAttentionResponse | null>(null);
 
   const refresh = useCallback(async () => {
-    if (!serverId || !gate.enabled) {
+    if (!serverId) {
       setSnapshot(null);
       return;
     }
@@ -43,19 +39,14 @@ export function useUsageLimitAttention(): UsageLimitAttentionState {
       // snapshot failure by being re-derived from local Agent errors.
       setSnapshot(null);
     }
-  }, [gate.enabled, serverId]);
+  }, [serverId]);
 
   useEffect(() => {
     void refresh();
-    if (!serverId || !gate.enabled || typeof window === "undefined") return;
-    const timer = window.setInterval(() => void refresh(), POLL_MS);
-    const onFocus = () => void refresh();
-    window.addEventListener("focus", onFocus);
-    return () => {
-      window.clearInterval(timer);
-      window.removeEventListener("focus", onFocus);
-    };
-  }, [gate.enabled, refresh, serverId]);
+    if (!serverId || typeof window === "undefined") return;
+    // Paused while the page is hidden; one read when it shows again.
+    return startVisiblePoll(() => void refresh(), { intervalMs: POLL_MS, refreshOnFocus: true });
+  }, [refresh, serverId]);
 
   const markSeen = useCallback(async (incidentId: string) => {
     if (!serverId) return;

@@ -50,6 +50,7 @@ const originalGet = api.get.bind(api);
 
 function emptyPages() {
   return {
+    backlog: { nextCursor: null, loading: false, loaded: false },
     todo: { nextCursor: null, loading: false, loaded: false },
     in_progress: { nextCursor: null, loading: false, loaded: false },
     in_review: { nextCursor: null, loading: false, loaded: false },
@@ -306,7 +307,7 @@ test("a 400 (stale cursor) resets the lane so the next walk restarts from the be
 
 test("lane state survives for TypeScript-exhaustive statuses", () => {
   const pages = useTaskStore.getState().serverTaskPages;
-  const statuses: TaskStatus[] = ["todo", "in_progress", "in_review", "done", "closed"];
+  const statuses: TaskStatus[] = ["backlog", "todo", "in_progress", "in_review", "done", "closed"];
   for (const status of statuses) {
     assert.ok(pages[status], `missing page state for ${status}`);
   }

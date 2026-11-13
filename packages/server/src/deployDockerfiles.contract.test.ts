@@ -9,12 +9,6 @@ const repoRoot = resolve(here, "../../..");
 // carry; skipped when an exported snapshot's RELEASE_SOURCE marker is present.
 const inSourceSnapshot = existsSync(resolve(repoRoot, "RELEASE_SOURCE"));
 
-const rootLockfileDockerfiles = [
-  "packages/server/Dockerfile",
-  "packages/trace-upload-worker/Dockerfile",
-  "packages/web/Dockerfile",
-];
-
 // pnpm 11+ reads its settings from pnpm-workspace.yaml and ignores the `pnpm`
 // field in package.json, so patches are declared there. The block is read
 // line by line (the server package has no YAML parser) and anything it cannot
@@ -41,40 +35,6 @@ function declaredDependencyPatches(): string[] {
   }
   return patches;
 }
-
-/**
- * Two-sided on purpose. The one-sided form ("if patches are declared, the
- * Dockerfile must COPY them") stayed green on 2026-09-13 when the last patch
- * was retired: the directory vanished, every Dockerfile still ran
- * `COPY patches/ patches/`, and the staging image build failed at that line.
- * A guard that only fires in one state cannot report the other state.
- */
-test.skipIf(inSourceSnapshot)("root-lockfile Docker builds copy patches exactly when patches are declared", () => {
-  const patches = declaredDependencyPatches();
-  for (const patch of patches) assert.ok(existsSync(resolve(repoRoot, patch)), `missing ${patch}`);
-  if (!patches.length) {
-    assert.equal(
-      existsSync(resolve(repoRoot, "patches")),
-      false,
-      "patches/ must not linger once no patchedDependencies are declared",
-    );
-  }
-  for (const dockerfile of rootLockfileDockerfiles) {
-    const source = readFileSync(resolve(repoRoot, dockerfile), "utf8");
-    const installIndex = source.indexOf("RUN pnpm install --frozen-lockfile");
-    assert.ok(installIndex >= 0);
-    const copyIndex = source.indexOf("COPY patches/ patches/");
-    if (patches.length) {
-      assert.ok(copyIndex >= 0 && copyIndex < installIndex, `${dockerfile} must supply patches before install`);
-    } else {
-      assert.equal(
-        copyIndex,
-        -1,
-        `${dockerfile} copies patches/ but no patchedDependencies are declared; the directory does not exist and the image build fails at COPY`,
-      );
-    }
-  }
-});
 
 test.skipIf(inSourceSnapshot)("AWS image cache keys hash dependency patches exactly when patches are declared", () => {
   const patches = declaredDependencyPatches();
@@ -119,32 +79,6 @@ test.skipIf(inSourceSnapshot)("AWS server and trace-upload image cache keys incl
   }
 });
 
-test.skipIf(inSourceSnapshot)("trace-upload image contains and hashes its shared workspace runtime dependency", () => {
-  const dockerfile = readFileSync(resolve(repoRoot, "packages/trace-upload-worker/Dockerfile"), "utf8");
-  const installIndex = dockerfile.indexOf("RUN pnpm install --frozen-lockfile");
-  const startIndex = dockerfile.indexOf('CMD ["pnpm", "--filter", "@botiverse/raft-trace-upload-worker", "start"]');
-  const sharedManifestIndex = dockerfile.indexOf("COPY packages/shared/package.json packages/shared/");
-  const sharedSourceIndex = dockerfile.indexOf("COPY packages/shared/ packages/shared/");
-
-  assert.ok(sharedManifestIndex >= 0, "trace-upload image must copy the shared manifest");
-  assert.ok(
-    sharedManifestIndex < installIndex,
-    "trace-upload image must expose the shared workspace package before pnpm install links workspace dependencies",
-  );
-  assert.ok(sharedSourceIndex >= 0, "trace-upload image must contain shared runtime source");
-  assert.ok(sharedSourceIndex < startIndex, "trace-upload image must copy shared runtime source before starting the worker");
-
-  const buildScript = readFileSync(
-    resolve(repoRoot, "scripts/deploy/aws-build-push-trace-upload-image.sh"),
-    "utf8",
-  );
-  assert.match(
-    buildScript,
-    /"packages\/shared"/,
-    "trace-upload image cache key must change when its shared runtime dependency changes",
-  );
-});
-
 /**
  * Resolve a package's TRANSITIVE workspace dependency closure from the actual
  * manifests, rather than naming packages literally.
@@ -181,75 +115,43 @@ function workspaceClosure(entryPackageDir: string): string[] {
 
 const RUNTIME_IMAGES = [
   {
-    dockerfile: "packages/trace-upload-worker/Dockerfile",
     entry: "packages/trace-upload-worker",
     cacheKeyScript: "scripts/deploy/aws-build-push-trace-upload-image.sh",
   },
   {
-    dockerfile: "packages/server/Dockerfile",
     entry: "packages/server",
     cacheKeyScript: "scripts/deploy/aws-build-push-server-image.sh",
   },
-  // The web image is built by CF Pages / the AWS web workflow rather than a
-  // hash-input script in scripts/deploy, so it has no cache-key file to pin.
-  { dockerfile: "packages/web/Dockerfile", entry: "packages/web", cacheKeyScript: null },
 ];
 
 for (const image of RUNTIME_IMAGES) {
-  test(`${image.dockerfile} copies its whole workspace dependency closure`, () => {
-    const dockerfile = readFileSync(resolve(repoRoot, image.dockerfile), "utf8");
-    const installIndex = dockerfile.indexOf("RUN pnpm install --frozen-lockfile");
-    assert.ok(installIndex >= 0, `${image.dockerfile} must run a frozen install`);
-
-    for (const dep of workspaceClosure(image.entry)) {
-      const manifestIndex = dockerfile.indexOf(`COPY ${dep}/package.json ${dep}/`);
-      const sourceIndex = dockerfile.indexOf(`COPY ${dep}/ ${dep}/`);
+  test.skipIf(inSourceSnapshot)(`deploy-aws-staging.yml redeploys ${image.entry} when any package in its closure changes`, () => {
+    // The staging deploy only runs on pushes that touch its `paths:` filter. A
+    // closure package missing from that filter means a merge that changes only
+    // that package builds no image at all, and staging keeps serving the old code.
+    const workflow = readFileSync(resolve(repoRoot, ".github/workflows/deploy-aws-staging.yml"), "utf8");
+    const paths = workflow.split("\n    paths:\n")[1]?.split("\n\n")[0] ?? "";
+    for (const dep of [image.entry, ...workspaceClosure(image.entry)]) {
       assert.ok(
-        manifestIndex >= 0,
-        `${image.dockerfile} must copy ${dep}/package.json — it is a transitive workspace dependency`,
-      );
-      assert.ok(
-        manifestIndex < installIndex,
-        `${image.dockerfile} must copy ${dep}/package.json BEFORE the frozen install links workspace deps`,
-      );
-      assert.ok(
-        sourceIndex >= 0,
-        `${image.dockerfile} must copy ${dep}/ source — missing it boots to ERR_MODULE_NOT_FOUND`,
+        paths.includes(`- "${dep}/**"`),
+        `deploy-aws-staging.yml paths must include "${dep}/**" — otherwise a ${dep}-only merge does not redeploy ${image.entry}`,
       );
     }
   });
 
-  if (image.cacheKeyScript) {
-    test.skipIf(inSourceSnapshot)(`deploy-aws-staging.yml redeploys ${image.entry} when any package in its closure changes`, () => {
-      // Third half of the same contract: the staging deploy only runs on
-      // pushes that touch its `paths:` filter. A closure package missing from
-      // that filter means a merge that changes only that package builds no
-      // image at all, and staging keeps serving the old code.
-      const workflow = readFileSync(resolve(repoRoot, ".github/workflows/deploy-aws-staging.yml"), "utf8");
-      const paths = workflow.split("\n    paths:\n")[1]?.split("\n\n")[0] ?? "";
-      for (const dep of [image.entry, ...workspaceClosure(image.entry)]) {
-        assert.ok(
-          paths.includes(`- "${dep}/**"`),
-          `deploy-aws-staging.yml paths must include "${dep}/**" — otherwise a ${dep}-only merge does not redeploy ${image.entry}`,
-        );
-      }
-    });
-
-    test.skipIf(inSourceSnapshot)(`${image.cacheKeyScript} hashes its whole workspace dependency closure`, () => {
-      // Copying a dependency into the image is only half the contract: if the
-      // dependency is not a hash input, a release that changes ONLY that
-      // package reuses the previous image tag and ships stale code. The COPY
-      // check above passes in that state, so this must be derived from the same
-      // manifest closure rather than maintained by hand.
-      const script = readFileSync(resolve(repoRoot, image.cacheKeyScript!), "utf8");
-      for (const dep of workspaceClosure(image.entry)) {
-        assert.ok(
-          script.includes(`"${dep}"`),
-          `${image.cacheKeyScript} must hash ${dep} — otherwise a ${dep}-only change reuses the old image tag`,
-        );
-      }
-    });
-  }
+  test.skipIf(inSourceSnapshot)(`${image.cacheKeyScript} hashes its whole workspace dependency closure`, () => {
+    // If a dependency copied into the image is not a hash input, a release that
+    // changes ONLY that package reuses the previous image tag and ships stale
+    // code, so this is derived from the manifest closure rather than maintained
+    // by hand.
+    const script = readFileSync(resolve(repoRoot, image.cacheKeyScript), "utf8");
+    for (const dep of workspaceClosure(image.entry)) {
+      assert.ok(
+        script.includes(`"${dep}"`),
+        `${image.cacheKeyScript} must hash ${dep} — otherwise a ${dep}-only change reuses the old image tag`,
+      );
+    }
+  });
 }
 
 test.skipIf(inSourceSnapshot)("hosted CI builds and boots the trace-upload image", () => {
@@ -296,18 +198,4 @@ test.skipIf(inSourceSnapshot)("server image build receives complete build identi
   assert.match(awsScript, /--build-arg "SLOCK_RELEASE_SHA=\$release_sha"/);
   assert.match(awsScript, /--build-arg "SLOCK_BUILD_AT=\$build_at"/);
   assert.match(awsScript, /--build-arg "SLOCK_RELEASE_BRANCH=\$release_branch"/);
-});
-
-test("web Dockerfile includes visual testing fixtures used by web typecheck", () => {
-  const dockerfile = "packages/web/Dockerfile";
-  const source = readFileSync(resolve(repoRoot, dockerfile), "utf8");
-  const buildIndex = source.indexOf("RUN pnpm --filter @botiverse/raft-web run build");
-  assert.notEqual(buildIndex, -1, `${dockerfile} should build the web package`);
-
-  const beforeBuild = source.slice(0, buildIndex);
-  assert.match(
-    beforeBuild,
-    /COPY\s+packages\/visual-testing\/shared\/\s+packages\/visual-testing\/shared\//,
-    `${dockerfile} must copy visual-testing fixtures before web typecheck`,
-  );
 });

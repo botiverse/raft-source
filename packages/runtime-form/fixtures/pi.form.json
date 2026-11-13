@@ -3,9 +3,7 @@
   "runtimeId": "pi",
   "schemaVersion": "pi.create.v1",
   "requiredClientCapabilities": [
-    "select.custom_value",
-    "choice.labels",
-    "option_source.status"
+    "select.custom_value"
   ],
   "dataSchema": {
     "type": "object",
@@ -145,6 +143,14 @@
         "label": "Reasoning",
         "hint": "Available values depend on the selected model.",
         "choices": {
+          "off": {
+            "label": "No reasoning",
+            "description": "Answers directly, without a thinking phase"
+          },
+          "minimal": {
+            "label": "Minimal",
+            "description": "Very light reasoning for the fastest responses"
+          },
           "low": {
             "label": "Low",
             "description": "Fast responses with lighter reasoning"
@@ -158,7 +164,7 @@
             "description": "Greater reasoning depth for complex problems"
           },
           "xhigh": {
-            "label": "Extra High",
+            "label": "Extra high",
             "description": "Extra high reasoning depth for complex problems"
           },
           "max": {
@@ -179,6 +185,14 @@
         "label": "Reasoning",
         "hint": "Available values depend on the selected model.",
         "choices": {
+          "off": {
+            "label": "No reasoning",
+            "description": "Answers directly, without a thinking phase"
+          },
+          "minimal": {
+            "label": "Minimal",
+            "description": "Very light reasoning for the fastest responses"
+          },
           "low": {
             "label": "Low",
             "description": "Fast responses with lighter reasoning"
@@ -192,7 +206,7 @@
             "description": "Greater reasoning depth for complex problems"
           },
           "xhigh": {
-            "label": "Extra High",
+            "label": "Extra high",
             "description": "Extra high reasoning depth for complex problems"
           },
           "max": {

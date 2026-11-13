@@ -9,18 +9,26 @@ import { defineConfig } from "tsdown";
 //
 // `@botiverse/raft-shared` is a private source-only workspace package and MUST
 // be inlined into both the JS bundles and the d.ts (scripts/
-// check-packed-artifact.mjs rejects any `@botiverse/raft-shared` leak).
+// check-packed-artifact.ts rejects any `@botiverse/raft-shared` leak).
 // `zod` is a runtime `dependencies` entry but the rslib build bundled it
 // (autoExternal: false), so keep it inlined to preserve the artifact contract.
 // Regexes, not bare names: tsdown matches alwaysBundle against the full
 // specifier, so a bare "zod" would leave `zod/v4/...` subpath imports external.
 const alwaysBundle = [/^zod(\/|$)/, /^@botiverse\/raft-shared(\/|$)/];
 
-// Two public entries, `.` (program layer) and `./agent` (agent layer), built
+// Three public entries, `.` (program layer), `./agent` (agent layer) and
+// `./continuations` (experimental), built
 // together in each config so code they share lands in one shared chunk: a
 // class or Symbol (RaftSdkConfigurationError, SeenFrontier, the
 // raftbenchFailedReport brand) is then the same value from either entry.
-const entry = { index: "src/index.ts", agent: "src/agent.ts" };
+// `./app` (a Raft App's client with Server context, RFC 079) is built beside
+// them the same way.
+const entry = {
+  index: "src/index.ts",
+  agent: "src/agent.ts",
+  continuations: "src/continuations.ts",
+  app: "src/app.ts",
+};
 
 export default defineConfig([
   {

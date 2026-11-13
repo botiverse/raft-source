@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 import { useIntl } from "react-intl";
-import { Hash, MessageSquare } from "lucide-react";
+import { Hash } from "lucide-react";
 import {
   Badge,
   MessageQuotedPreviewAttachment,
@@ -16,7 +16,9 @@ import {
   MessageQuotedPreviewTimestamp,
   MessageQuotedPreviewUnavailable,
 } from "@botiverse/raft-ui";
+import { ThreadIcon } from "@botiverse/ricons";
 import type { BadgeProps } from "@botiverse/raft-ui";
+import { MessageQuotedPreviewAuthorDelegatedBy } from "@botiverse/raft-ui/wip";
 import AvatarSlot from "../AvatarSlot";
 import InlineMarkdownPreview from "../../markdown/InlineMarkdownPreview";
 import PreviewShell from "../PreviewShell";
@@ -30,14 +32,21 @@ export interface QuotedMessageCardProps {
   author: {
     name: string;
     avatar?: string;
-    gravatarHash?: string;
     kind: "agent" | "user" | "external_projection";
     subtitle?: string;
+    /** RFC 077: "(sent by Friday)" after the name, already in the reader's language. */
+    delegatedByLabel?: string;
   };
   content: string;
   attachments?: { label: string }[];
   onClick?: () => void;
   unavailable?: boolean;
+  /** The line an unavailable quote shows; defaults to "Message unavailable". */
+  unavailableText?: string;
+  /** A line in place of the message text (its header stays), e.g. a message
+   *  older than the plan's history window. The card is not a button then:
+   *  the line carries its own action. */
+  notice?: ReactNode;
 }
 
 export function Tag({
@@ -62,7 +71,7 @@ export function ThreadMarker() {
   const intl = useIntl();
   return (
     <span className="inline-flex items-center gap-1">
-      <MessageSquare size={14} className="shrink-0" aria-hidden="true" />
+      <ThreadIcon width={14} height={14} className="shrink-0" aria-hidden="true" />
       {intl.formatMessage({ id: "ui.quotedMessage.thread" })}
     </span>
   );
@@ -77,7 +86,7 @@ function CompactUserAvatar({ author }: { author: QuotedMessageCardProps["author"
     return <AvatarSlot context="compact-list" type="app" appAvatarUrl={author.avatar ?? null} appInitials={author.name} />;
   }
 
-  return <AvatarSlot context="compact-list" type="human" humanAvatarUrl={author.avatar ?? null} gravatarHash={author.gravatarHash ?? null} />;
+  return <AvatarSlot context="compact-list" type="human" humanAvatarUrl={author.avatar ?? null} />;
 }
 
 export default function QuotedMessageCard({
@@ -91,6 +100,8 @@ export default function QuotedMessageCard({
   attachments,
   onClick,
   unavailable = false,
+  unavailableText,
+  notice,
 }: QuotedMessageCardProps) {
   const intl = useIntl();
   if (unavailable) {
@@ -98,14 +109,14 @@ export default function QuotedMessageCard({
       <PreviewShell variant="muted" onClick={onClick} data-testid="quoted-message-card" className="group block w-full text-left">
         {/* The card is the frame here, so the part's own quote bar is dropped. */}
         <MessageQuotedPreviewUnavailable className="border-l-0 px-3 py-2.5">
-          <div>{intl.formatMessage({ id: "ui.quotedMessage.unavailable" })}</div>
+          <div>{unavailableText ?? intl.formatMessage({ id: "ui.quotedMessage.unavailable" })}</div>
         </MessageQuotedPreviewUnavailable>
       </PreviewShell>
     );
   }
 
   return (
-    <PreviewShell onClick={onClick} data-testid="quoted-message-card" className="group block w-full text-left">
+    <PreviewShell onClick={notice ? undefined : onClick} data-testid="quoted-message-card" className="group block w-full text-left">
       <div className="px-3 py-2.5">
         <MessageQuotedPreviewHeader className="mb-1 flex items-start gap-2">
           <div className="min-w-0 flex flex-1 flex-wrap items-center gap-x-1.5 gap-y-1">
@@ -119,6 +130,11 @@ export default function QuotedMessageCard({
               <MessageQuotedPreviewAuthorName className="min-w-0 truncate">
                 {author.name}
               </MessageQuotedPreviewAuthorName>
+              {author.delegatedByLabel ? (
+                <MessageQuotedPreviewAuthorDelegatedBy data-testid="quoted-message-delegated-by">
+                  {author.delegatedByLabel}
+                </MessageQuotedPreviewAuthorDelegatedBy>
+              ) : null}
               {author.subtitle ? (
                 <MessageQuotedPreviewAuthorMeta className="min-w-0 flex-1 max-w-fit truncate">
                   {author.subtitle}
@@ -149,9 +165,9 @@ export default function QuotedMessageCard({
         </MessageQuotedPreviewHeader>
         <MessageQuotedPreviewContent className="min-w-0">
           <MessageQuotedPreviewText className="line-clamp-2">
-            <InlineMarkdownPreview markdown={content} />
+            {notice ?? <InlineMarkdownPreview markdown={content} />}
           </MessageQuotedPreviewText>
-          {attachments?.length ? (
+          {!notice && attachments?.length ? (
             <MessageQuotedPreviewAttachments className="flex flex-wrap gap-1.5">
               {/* The raft-ui attachment part is itself the DS token chip
                   (22px, sunken fill, Space Mono), so the label sits in it

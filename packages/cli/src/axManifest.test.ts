@@ -16,7 +16,7 @@ const inSourceSnapshot = existsSync(path.join(ROOT, "RELEASE_SOURCE"));
 
 test("manifest covers both sides and the standing prompt", { skip: inSourceSnapshot }, async () => {
   const { buildManifest } = await import(
-    new URL("../../../scripts/generate-ax-manifest.mjs", import.meta.url).href
+    new URL("../../../scripts/generate-ax-manifest.ts", import.meta.url).href
   );
   const entries = buildManifest(ROOT).entries;
   assert.ok(entries.length >= 60, `suspiciously few surfaces (${entries.length}) — scanner broken?`);
@@ -27,7 +27,7 @@ test("manifest covers both sides and the standing prompt", { skip: inSourceSnaps
 
 test("branded mint-site gate is clean (raw `as Brand` casts only in declared utils)", { skip: inSourceSnapshot }, async () => {
   const { checkBrandedMintSites } = await import(
-    new URL("../../../scripts/ci/check-branded-mint-sites.mjs", import.meta.url).href
+    new URL("../../../scripts/ci/check-branded-mint-sites.ts", import.meta.url).href
   );
   assert.deepEqual(checkBrandedMintSites(ROOT), []);
 });
@@ -36,7 +36,7 @@ test("branded mint-site gate turns RED on a raw `as MachineCreateLock` outside m
   // Task #93 line G: MachineCreateLock is enrolled with machineService.ts as its only mint site. The same cast in any
   // other scanned file must be reported; inside the declared producer it must not.
   const { checkBrandedMintSites } = await import(
-    new URL("../../../scripts/ci/check-branded-mint-sites.mjs", import.meta.url).href
+    new URL("../../../scripts/ci/check-branded-mint-sites.ts", import.meta.url).href
   );
   const fs = await import("node:fs");
   const os = await import("node:os");

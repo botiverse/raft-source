@@ -42,24 +42,24 @@ test("create account is a standalone credential page without identity fields or 
   const { container } = renderPage();
 
   assert.ok(screen.getByRole("heading", { name: "Create your account" }));
-  assert.equal(container.querySelector("aside"), null);
+  assert.ok(container.querySelector("aside") === null);
   assert.equal(container.querySelectorAll("i.bg-palette-pink, i.bg-palette-yellow").length, 0);
-  assert.equal(container.querySelector('[class*="radial-gradient"]'), null);
-  assert.equal(container.querySelector('[class*="lg:grid-cols-[minmax(320px,2fr)_minmax(0,3fr)]"]'), null);
+  assert.ok(container.querySelector('[class*="radial-gradient"]') === null);
+  assert.ok(container.querySelector('[class*="lg:grid-cols-[minmax(320px,2fr)_minmax(0,3fr)]"]') === null);
   assert.ok(container.querySelector(".h-panel-header"));
   assert.ok(container.querySelector(".max-w-md"));
   // No future-step preview copy (Cat's principle: each line serves the current
   // step only; "X comes next" is low-value distraction here).
-  assert.equal(screen.queryByText(/come next/i), null);
+  assert.ok(screen.queryByText(/come next/i) === null);
   assert.ok(screen.getByLabelText("Email"));
   assert.ok(screen.getByLabelText("Password"));
   // Min-length is carried by the placeholder only; the redundant helper line is gone.
-  assert.equal(screen.queryByText("At least 8 characters."), null);
-  assert.equal(screen.queryByLabelText("Display name"), null);
-  assert.equal(screen.queryByLabelText("@handle"), null);
-  assert.equal(screen.queryByText("Profile picture"), null);
-  assert.equal(screen.queryByText(/Step \d/i), null);
-  assert.equal(screen.queryByText(/skips this step/i), null);
+  assert.ok(screen.queryByText("At least 8 characters.") === null);
+  assert.ok(screen.queryByLabelText("Display name") === null);
+  assert.ok(screen.queryByLabelText("@handle") === null);
+  assert.ok(screen.queryByText("Profile picture") === null);
+  assert.ok(screen.queryByText(/Step \d/i) === null);
+  assert.ok(screen.queryByText(/skips this step/i) === null);
 });
 
 test("create account submits email, password, and legal acceptance only", async () => {
@@ -104,24 +104,34 @@ test("create account exposes configured Google and GitHub entry buttons without 
     assert.ok(screen.getByRole("button", { name: "Continue with Google" }));
     assert.ok(screen.getByRole("button", { name: "Continue with GitHub" }));
   });
-  assert.equal(screen.queryByText(/goes straight to identity setup/i), null);
+  assert.ok(screen.queryByText(/goes straight to identity setup/i) === null);
 });
 
-test("a disabled Continue states its reason until the legal box is accepted", async () => {
-  // task #724: the user could not see why Continue was disabled. The reason is
-  // the unchecked legal box; show it as a persistent line and drop it once the
-  // box is checked, so it never reads as an error.
+test("sign-up reads checkbox, Continue, then the usage-data notice, with no disabled-reason line", async () => {
+  // cindyz, 2026-11-05: the usage-data notice sits directly under Continue, and
+  // the "Agree to the Terms ... to continue." line under it is gone (the
+  // checkbox label already says what is required).
   vi.spyOn(api, "get").mockImplementation(async () => ({ data: { providers: [] } }));
   renderPage();
 
-  const hintId = "auth.legalAcceptance.requiredHint";
-  // Copy comes through react-intl (both locales are supplied in the catalogs).
-  const hint = () => screen.queryByTestId("register-legal-hint");
-  assert.ok(hint(), "the reason line is visible while the legal box is unchecked");
-  assert.ok(screen.getByRole("button", { name: "Continue" }).hasAttribute("disabled"));
+  const checkbox = screen.getByRole("checkbox");
+  const submit = screen.getByRole("button", { name: "Continue" });
+  const notice = screen.getByTestId("legal-acceptance-usage-data-notice");
+  assert.equal(notice.textContent, "Raft collects usage data to improve the product. You can turn it off anytime in Settings.");
+  // Booleans only in assertions: a failing assert on a DOM node prints the whole jsdom graph.
+  const follows = (a: Element, b: Element) => (a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
+  assert.ok(follows(checkbox, submit), "Continue comes after the checkbox");
+  assert.ok(follows(submit, notice), "the notice comes after Continue");
+  assert.ok(submit.nextElementSibling === notice, "the notice is directly below Continue");
+  assert.ok(notice.closest("label") === null, "the notice is not part of the checkbox label");
+  assert.ok(notice.id !== "" && submit.getAttribute("aria-describedby") === notice.id, "Continue is described by the notice");
 
-  fireEvent.click(screen.getByRole("checkbox"));
-  await waitFor(() => assert.equal(hint(), null));
-  assert.equal(screen.getByRole("button", { name: "Continue" }).hasAttribute("disabled"), false);
-  assert.ok(hintId, "key stays wired");
+  assert.ok(submit.hasAttribute("disabled"));
+  assert.ok(screen.queryByText(/to continue\./) === null, "no disabled-reason line");
+  fireEvent.click(notice);
+  assert.equal((checkbox as HTMLButtonElement).getAttribute("aria-checked"), "false", "clicking the notice does not accept the terms");
+
+  fireEvent.click(checkbox);
+  await waitFor(() => assert.equal(screen.getByRole("button", { name: "Continue" }).hasAttribute("disabled"), false));
+  assert.ok(screen.getByTestId("legal-acceptance-usage-data-notice"), "the notice stays once the box is checked");
 });

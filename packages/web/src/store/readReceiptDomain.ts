@@ -4,6 +4,10 @@ export type PeerReadState = {
   peerKind: ReadReceiptPeerKind;
   peerId: string;
   maxReadSeq: number;
+  /** In a thread: this agent stopped following it. Absent: not known to have (agentsStoppedFollowing). */
+  stoppedFollowing?: true;
+  /** In a channel: this agent muted it. Absent: not known to have (agentsMutedChannel). */
+  mutedChannel?: true;
 };
 
 export type PeerReadSummary = {
@@ -63,7 +67,13 @@ export function normalizeReadReceiptHydrate(payload: unknown): ReadReceiptScope 
       const key = `${peerKind}:${peerId}`;
       if (seen.has(key)) return null;
       seen.add(key);
-      peers.push({ peerKind, peerId, maxReadSeq });
+      peers.push({
+        peerKind,
+        peerId,
+        maxReadSeq,
+        ...(item.stoppedFollowing === true ? { stoppedFollowing: true as const } : {}),
+        ...(item.mutedChannel === true ? { mutedChannel: true as const } : {}),
+      });
     }
     return { kind: "peers", peers };
   }
@@ -130,6 +140,55 @@ export function mergePeerReadAdvance(
   const peers = scope.peers.slice();
   peers[index] = { ...peers[index], maxReadSeq: update.maxReadSeq };
   return { kind: "peers", peers };
+}
+
+/**
+ * One `read_progress:updated` frame (agent_read_progress_v0; contract in
+ * shared agentReadProgress.ts): the latest read position of every agent that
+ * moved in one conversation. Null for a frame we cannot use; peers that are
+ * malformed are dropped one by one, the rest still apply.
+ */
+export type ReadProgressUpdated = {
+  scopeId: string;
+  peers: Array<{ peerId: string; maxReadSeq: number }>;
+};
+
+export function normalizeReadProgressUpdated(payload: unknown): ReadProgressUpdated | null {
+  if (!isRecord(payload) || typeof payload.scopeId !== "string" || payload.scopeId.length === 0) {
+    return null;
+  }
+  if (!Array.isArray(payload.peers)) return null;
+  const peers: ReadProgressUpdated["peers"] = [];
+  for (const item of payload.peers) {
+    if (!isRecord(item) || typeof item.peerId !== "string" || item.peerId.length === 0) continue;
+    const maxReadSeq = normalizeSeq(item.maxReadSeq);
+    if (maxReadSeq === null) continue;
+    peers.push({ peerId: item.peerId, maxReadSeq });
+  }
+  return peers.length > 0 ? { scopeId: payload.scopeId, peers } : null;
+}
+
+/**
+ * Apply a read-progress frame: agents only, only agents the hydrate exposed
+ * (a frame never adds a peer), and only forward, like mergePeerReadAdvance.
+ * The scope object is returned unchanged when nothing moved.
+ */
+export function mergeReadProgressPeers(
+  scope: ReadReceiptScope | undefined,
+  update: ReadProgressUpdated,
+): ReadReceiptScope | undefined {
+  if (!scope || scope.kind !== "peers") return scope;
+  let peers: PeerReadState[] | null = null;
+  for (const advance of update.peers) {
+    const current = peers ?? scope.peers;
+    const index = current.findIndex((peer) =>
+      peer.peerKind === "agent" && peer.peerId === advance.peerId
+    );
+    if (index < 0 || current[index].maxReadSeq >= advance.maxReadSeq) continue;
+    peers ??= scope.peers.slice();
+    peers[index] = { ...peers[index], maxReadSeq: advance.maxReadSeq };
+  }
+  return peers ? { kind: "peers", peers } : scope;
 }
 
 export function mergeReadReceiptHydrate(

@@ -38,6 +38,7 @@ const WEB_FIELD_FOR_MANIFEST_FIELD: { [K in CanonicalMessageField]: K & keyof Me
   attachments: "attachments",
   commentRef: "commentRef",
   conversationContext: "conversationContext",
+  deletedAt: "deletedAt",
   externalAuthor: "externalAuthor",
   mentions: "mentions",
   reactions: "reactions",
@@ -65,6 +66,7 @@ const MANIFEST_FIELD_FOR_WEB_FIELD: {
   attachments: "attachments",
   commentRef: "commentRef",
   conversationContext: "conversationContext",
+  deletedAt: "deletedAt",
   externalAuthor: "externalAuthor",
   mentions: "mentions",
   reactions: "reactions",
@@ -73,7 +75,7 @@ const MANIFEST_FIELD_FOR_WEB_FIELD: {
   senderName: "senderName",
 };
 
-test("web Message surface == canonical manifest (20 fields, both directions)", () => {
+test("web Message surface == canonical manifest (21 fields, both directions)", () => {
   const manifestFields = [
     ...CANONICAL_REQUIRED_MESSAGE_FIELDS,
     ...OPTIONAL_AGGREGATE_MESSAGE_FIELDS,

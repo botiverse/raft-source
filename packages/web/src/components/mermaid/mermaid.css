@@ -7,8 +7,15 @@
   background: var(--layer-code);
 }
 
-/* The last region (viewer, source or banner) rounds off inside the frame. */
-.r-mermaid-diagram > :last-child {
+/* The last region (viewer, source, loading, error or banner) rounds off
+   inside the frame. Each region is named by its own class, never a bare
+   `> :last-child`: WebKit tests an unanchored structural selector against
+   every element (webkitStructuralSelectors guard). */
+.r-mermaid-diagram > .r-mermaid-viewer:last-child,
+.r-mermaid-diagram > .r-mermaid-source:last-child,
+.r-mermaid-diagram > .r-mermaid-diagram__loading:last-child,
+.r-mermaid-diagram > .r-mermaid-render-error:last-child,
+.r-mermaid-diagram > [data-testid="mermaid-export-error"]:last-child {
   overflow: hidden;
   border-bottom-left-radius: 9px;
   border-bottom-right-radius: 9px;
@@ -17,7 +24,7 @@
 .r-mermaid-toolbar {
   position: sticky;
   top: 0;
-  z-index: 20;
+  z-index: var(--z-index-control);
   display: flex;
   align-items: center;
   justify-content: flex-end;
@@ -156,6 +163,8 @@
 .r-mermaid-zoom-media {
   pointer-events: auto;
   position: absolute;
+  /* The crossfading frames (0/1/2, MermaidFrameLayer) rank only in here. */
+  isolation: isolate;
   left: 50%;
   top: 50%;
 }
@@ -202,6 +211,23 @@
 @media (min-width: 768px) {
   .r-mermaid-fullscreen {
     padding: 1.5rem;
+  }
+}
+
+/* Desktop shell: the fullscreen view's first row is a title bar (toolbar, edge
+   to edge), so the frame's padding moves onto the stage below it. Doubled
+   class: wins over the padding rules above at every width. */
+.r-mermaid-fullscreen.r-mermaid-fullscreen--titlebar {
+  padding: 0;
+}
+
+.r-mermaid-fullscreen--titlebar > .r-mermaid-fullscreen__stage {
+  margin: 0.75rem;
+}
+
+@media (min-width: 768px) {
+  .r-mermaid-fullscreen--titlebar > .r-mermaid-fullscreen__stage {
+    margin: 1.5rem;
   }
 }
 

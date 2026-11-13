@@ -1,7 +1,10 @@
 import { create } from "zustand";
 import api from "../api/client";
-import { getWithRwOverloadRetry } from "../api/overloadRetry";
-import type { ServerRole } from "@botiverse/raft-shared";
+import { getRwRead } from "../api/overloadRetry";
+import { saveLastCounts } from "./lastCounts";
+import { getCurrentPrincipalId } from "./principalRuntime";
+import { parseChannelSideLayout } from "@botiverse/raft-shared";
+import type { ChannelSideLayout, GuestChannelField, RaftThemeId, ServerRole } from "@botiverse/raft-shared";
 import {
   DEFAULT_SIDEBAR_ORDER,
   applyServerEvent,
@@ -12,12 +15,16 @@ import type {
 } from "./events/serverEvents";
 import { serverPersistence } from "./serverPersistenceRegistry";
 import { triggerServerReset } from "./serverResetRegistry";
+import { currentActorScope, humanActorRow, registerLocalActorLookup, upsertActorsIfCurrent } from "./localTables/actorResolve";
 import { setAuthTraceServerIdGetter } from "../utils/webAuthTrace";
 import { setProductEventServerIdGetter } from "../analytics/track";
 import { normalizeSidebarPinnedRefs } from "../utils/sidebarPinnedRefs";
 import type { SidebarPinnedRef } from "../utils/sidebarPinnedRefs";
 import { notifyAllChannelMembersChanged } from "./channelMemberEvents";
+import { installServerThemeSync } from "../theme/serverTheme";
 import { hasChatSurfaces } from "../embed";
+import { markBootMilestone } from "../boot/bootTiming";
+import { isAccessTokenExpired } from "../utils/hostAccessTokenSync";
 import {
   parseServerUnreadSummaryRows,
   retainServerUnreadSummary,
@@ -29,6 +36,7 @@ import {
   normalizeSidebarSectionPlacements,
 } from "./sidebarSections";
 import type { SidebarCustomSection, SidebarSectionPlacement } from "./sidebarSections";
+import { localTableSession, writeServerList } from "./localTables/storeWriters";
 
 export type { SidebarCustomSection, SidebarSectionPlacement } from "./sidebarSections";
 
@@ -52,6 +60,10 @@ export interface Server {
   planDowngradedAt: string | null;
   role: ServerRole;
   serverPushMuted?: boolean;
+  /** The member's own theme here (null = Raft Yellow); from GET /servers. */
+  theme?: RaftThemeId | null;
+  /** The member shows the theme's pixel art on the frame; from GET /servers. */
+  themeDecor?: boolean;
   notificationPrefsVersion?: number;
   serverOrderVersion?: number;
   /** The server's public page is live (public and rolled out); from GET /servers. */
@@ -84,13 +96,21 @@ export interface ServerSettings {
 
 export type CommunityServerSlug = "community" | "community-cn";
 
-export interface ServerMember {
+export interface ServerMember extends GuestChannelField {
   userId: string;
   serverId?: string;
   serverName?: string | null;
   serverSlug?: string | null;
+  /** A channel roster's person only (rosterHumanAsMember): every server they
+   *  take part through, and the roster's "is one of the viewed server's". */
+  roster?: {
+    serverId?: string | null;
+    serverName?: string | null;
+    serverSlug?: string | null;
+    servers?: Array<{ id: string; name: string; slug: string }> | null;
+    inViewerServer?: boolean;
+  };
   email: string | null;
-  gravatarHash: string;
   name: string;
   displayName: string | null;
   description: string | null;
@@ -120,6 +140,8 @@ export interface SidebarOrderPreferences {
   hiddenDmIds: string[];
   channelPanelTabOrder: string[];
   agentPanelTabOrder: string[];
+  /** Where Thread, Tasks and Files stand right of a channel (task #165); null when this member never saved one. */
+  channelSideLayout: ChannelSideLayout | null;
   customSections: SidebarCustomSection[];
   sectionOrder: string[];
   sectionPlacements: SidebarSectionPlacement[];
@@ -127,65 +149,46 @@ export interface SidebarOrderPreferences {
   pinnedVersion: number;
 }
 
-export interface SubscriptionInfo {
-  status: "active" | "past_due" | "canceled" | "incomplete";
-  billingInterval: "monthly" | "annual";
-  currentPeriodStart?: string | null;
-  currentPeriodEnd: string | null;
-  cancelAtPeriodEnd: boolean;
+export type { BillingInfo, SubscriptionInfo } from "./billingInfo";
+import type { BillingInfo } from "./billingInfo";
+
+/**
+ * Boot: the server list asked for alongside the signed-in check rather than
+ * after it (they don't depend on each other on the wire). Held, not applied:
+ * loadServers takes it when the app's own gate lets it run (a signed-in,
+ * verified, set-up account), and only for the token it was asked with. A
+ * failure (401, 403 for an unverified account) applies nothing; loadServers
+ * then asks itself, as before.
+ */
+// `_retry` is read by the API client's response interceptor (client.ts).
+const EARLY_REQUEST_CONFIG = { _retry: true } as Parameters<typeof api.get>[1];
+
+let earlyServerList: { token: string; servers: Promise<Server[]> } | null = null;
+
+export function requestServerListEarly(): void {
+  if (earlyServerList) return;
+  let token: string | null = null;
+  try {
+    token = localStorage.getItem("slock_access_token");
+  } catch {
+    return;
+  }
+  if (!token || isAccessTokenExpired(token, Date.now())) return;
+  // `_retry`: a 401 here neither refreshes nor signs out; the app's own requests decide that.
+  const servers = api.get("/servers", EARLY_REQUEST_CONFIG).then(({ data }) => data as Server[]);
+  servers.catch(() => {});
+  earlyServerList = { token, servers };
 }
 
-export interface BillingInfo {
-  plan: string;
-  displayName: string;
-  serverPlan: string;
-  source: "server" | "subscription";
-  capacity: {
-    maxHumans: number;
-    maxAgents: number;
-    maxUniversalSeats: number;
-  };
-  usage: {
-    humans: number;
-    agents: number;
-    universalSeats: number;
-  };
-  provisioned: {
-    humans: number;
-    agents: number;
-    proPackQuantity: number;
-    trialFreePackQuantity: number;
-    firstPackTrialEndsAt?: string | null;
-  };
-  fileUploadQuota?: {
-    month: string;
-    plan: string;
-    limited: boolean;
-    enforced: boolean;
-    limitBytes: number;
-    usedBytes: number;
-    reservedBytes: number;
-    remainingBytes: number;
-  };
-  price: {
-    billingInterval: "monthly" | "annual";
-    monthlyUsd: number;
-    annualUsd: number | null;
-    discountPercent: number;
-    baseMonthlyUsd: number;
-    overageMonthlyUsd: number;
-    seatQuantity: number;
-    packQuantity: number;
-    humanSeatQuantity: number;
-    agentSeatQuantity: number;
-    agentSeatBlockQuantity: number;
-  } | null;
-  subscription: SubscriptionInfo | null;
-  stripeConfigured: boolean;
-  permissions: {
-    canReadBillingSummary: boolean;
-    canManageBilling: boolean;
-  };
+function takeEarlyServerList(): Promise<Server[]> | null {
+  const early = earlyServerList;
+  earlyServerList = null;
+  if (!early) return null;
+  try {
+    return early.token === localStorage.getItem("slock_access_token") ? early.servers : null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -203,6 +206,35 @@ export function coalesce(key: string, run: () => Promise<void>): Promise<void> {
   });
   inFlightLoaders.set(key, promise);
   return promise;
+}
+
+/**
+ * When each boot list last loaded successfully, by its coalesce key. The
+ * connect / first-join reloads skip a list loaded moments ago by the boot
+ * path (same request, same answer); reconnects and events always read again.
+ */
+const freshLoads = new Map<string, number>();
+/** The keys both sides use (the loaders mark, socketBridge checks). */
+export const bootListKey = {
+  servers: "servers:list",
+  sidebarOrder: (serverId: string, epoch: number) => `sidebar-order:${serverId}:${epoch}`,
+  channels: (serverId: string, epoch: number) => `channels:${serverId}:${epoch}`,
+};
+export function noteFreshLoad(key: string): void {
+  freshLoads.set(key, Date.now());
+}
+export function loadedWithin(key: string, ms: number): boolean {
+  const at = freshLoads.get(key);
+  return at !== undefined && Date.now() - at <= ms;
+}
+
+/**
+ * Let the coalesced load under `key` land, if one is in flight. A reload that
+ * must reflect something learnt now (sync/changes) waits for it and then
+ * issues its own request, instead of joining one sent earlier.
+ */
+export async function settleInFlightLoader(key: string): Promise<void> {
+  await inFlightLoaders.get(key)?.catch(() => undefined);
 }
 
 /**
@@ -254,10 +286,16 @@ interface ServerState {
 
   /** `fresh` skips joining a read already in flight, whose response may
    * predate the change the caller is reacting to. */
-  loadServers: (options?: { fresh?: boolean }) => Promise<void>;
+  /**
+   * `listOnly`: refresh the server list without the members / sidebar-order
+   * reads it otherwise triggers (sync/changes delivers those on their own).
+   */
+  loadServers: (options?: { fresh?: boolean; listOnly?: boolean }) => Promise<void>;
   loadSettings: (options?: { force?: boolean }) => Promise<ServerSettings | null>;
   updateServerOrder: (serverOrder: string[]) => Promise<void>;
   setCurrent: (server: Server) => void;
+  /** At boot, the link's server from the list kept on the device, before GET /servers (boot/openServerFromDevice). */
+  setCurrentFromDevice: (server: Server) => boolean;
   clearCurrent: () => void;
   createServer: (name: string, slug: string) => Promise<Server>;
   joinCommunityServer: (options?: { agreementId?: string | null; slug?: CommunityServerSlug }) => Promise<Server>;
@@ -271,7 +309,22 @@ interface ServerState {
   loadServerUnreadSummary: (options?: { force?: boolean }) => Promise<void>;
   loadSidebarOrder: () => Promise<void>;
   updateSidebarOrder: (updates: Partial<SidebarOrderPreferences>) => Promise<void>;
-  updateMemberRole: (userId: string, role: ServerRole) => Promise<void>;
+  /**
+   * The current user replied in a DM they had closed: the server already took
+   * it off their hidden list (task #59), so only the local copy changes.
+   */
+  reopenDmAfterOwnReply: (dmId: string) => void;
+  /**
+   * Stores `role` for `userId` on `options.serverId` (default: the current
+   * server). With `options.onlyIfRole`, the role is changed only while it is
+   * still that one: Undo must not overwrite a change made since. Resolves to
+   * `"changed"` when it was not that role any more, `"skipped"` without a server.
+   */
+  updateMemberRole: (
+    userId: string,
+    role: ServerRole,
+    options?: { serverId?: string; onlyIfRole?: ServerRole },
+  ) => Promise<"updated" | "changed" | "skipped">;
   removeMember: (userId: string) => Promise<void>;
   loadUsage: () => Promise<void>;
   loadBilling: () => Promise<void>;
@@ -329,6 +382,7 @@ function normalizeSidebarOrderResponse(
     hiddenDmIds: record.hiddenDmIds === undefined ? fallback.hiddenDmIds : normalizeStringArray(record.hiddenDmIds),
     channelPanelTabOrder: record.channelPanelTabOrder === undefined ? fallback.channelPanelTabOrder : normalizeStringArray(record.channelPanelTabOrder),
     agentPanelTabOrder: record.agentPanelTabOrder === undefined ? fallback.agentPanelTabOrder : normalizeStringArray(record.agentPanelTabOrder),
+    channelSideLayout: record.channelSideLayout === undefined ? fallback.channelSideLayout : parseChannelSideLayout(record.channelSideLayout),
     customSections,
     sectionOrder: normalizeSidebarSectionOrder(
       record.sectionOrder === undefined ? fallback.sectionOrder : record.sectionOrder,
@@ -399,6 +453,68 @@ function applyServerSwitch(
   void get().loadSettings();
 }
 
+/** The current server is not one of this person's any more: no current server, nothing of it kept. */
+function dropCurrentServer(
+  server: Server,
+  set: (partial: Partial<ServerState>) => void,
+  get: () => ServerState,
+) {
+  serverPersistence.clearLastServerSlug(server.slug);
+  applyServerDomainEvent({ kind: "patch", patch: "membership-removed", serverId: server.id }, set, get);
+  set({
+    members: [],
+    membersLoadError: false,
+    usage: null,
+    loadingUsage: false,
+    billing: null,
+    loadingBilling: false,
+    settings: null,
+    loadingSettings: false,
+  });
+  triggerServerReset();
+}
+
+// The server a link opens, taken from the server list kept on the device
+// (store/localTables) before GET /servers answers, so its conversation loads
+// in the same round trip as the list (docs/frontend/boot-requests.md). Until
+// the list confirms it, it is only shown: nothing is written to the server on
+// its behalf (Tenny, #triage:458d78f1), so reads wait (messageStore).
+let unconfirmedCurrentId: string | null = null;
+const confirmedListeners = new Set<() => void>();
+
+/** Whether the current server came from the network's list (always, except in the first moments of a boot from the device). */
+export function isCurrentServerConfirmed(): boolean {
+  // Sign-out or another switch replaced it: whatever is current now came from the network.
+  return unconfirmedCurrentId === null || useServerStore.getState().current?.id !== unconfirmedCurrentId;
+}
+
+/** Called once the device's current server is confirmed by GET /servers. */
+export function onCurrentServerConfirmed(listener: () => void): () => void {
+  confirmedListeners.add(listener);
+  return () => confirmedListeners.delete(listener);
+}
+
+/**
+ * GET /servers answered while the current server came from the device: it is
+ * confirmed, or it was not in the list (removed meanwhile) and is dropped as
+ * a removal is. Returns whether it was confirmed.
+ */
+function settleDeviceServer(
+  set: (partial: Partial<ServerState>) => void,
+  get: () => ServerState,
+): boolean {
+  const id = unconfirmedCurrentId;
+  unconfirmedCurrentId = null;
+  const current = get().current;
+  if (!id || current?.id !== id) return false;
+  if (!get().servers.some((server) => server.id === id)) {
+    dropCurrentServer(current, set, get);
+    return false;
+  }
+  for (const listener of [...confirmedListeners]) listener();
+  return true;
+}
+
 export const useServerStore = create<ServerState>((set, get) => ({
   servers: [],
   current: null,
@@ -420,20 +536,34 @@ export const useServerStore = create<ServerState>((set, get) => ({
     // stores can all trigger this within the same window; coalesce concurrent
     // calls onto one request (later genuine refreshes still fetch).
     if (options.fresh) await inFlightLoaders.get("servers:list")?.catch(() => undefined);
+    const early = options.fresh ? null : takeEarlyServerList();
     return coalesce("servers:list", async () => {
+      const session = localTableSession();
       try {
-        const { data } = await api.get("/servers");
-        const servers = data as Server[];
+        const servers = await (early ?? Promise.reject(new Error("no early list")))
+          .catch(async () => (await api.get("/servers")).data as Server[]);
 
         serverPersistence.clearLegacyServerId();
         applyServerDomainEvent({ kind: "hydrate", source: "servers", servers }, set, get);
+        const fromDevice = unconfirmedCurrentId !== null;
+        const confirmed = fromDevice && settleDeviceServer(set, get);
         set({ loading: false });
+        writeServerList(session, get().servers);
+        noteFreshLoad(bootListKey.servers);
+        markBootMilestone("servers");
 
         // Loaders are no-ops without a current server and capture serverEpoch
         // themselves, so this is safe for URL-resolved and empty startup states.
-        get().loadMembers();
-        if (hasChatSurfaces()) get().loadSidebarOrder();
+        // A server taken from the device loaded them when it became current.
+        if (!confirmed && !options.listOnly) {
+          get().loadMembers();
+          if (hasChatSurfaces()) get().loadSidebarOrder();
+        }
       } catch {
+        // A server opened from the device stays only with the network's word:
+        // without it the boot ends as it did before, with no current server.
+        if (unconfirmedCurrentId !== null && get().current?.id === unconfirmedCurrentId) get().clearCurrent();
+        unconfirmedCurrentId = null;
         set({ loading: false });
       }
     });
@@ -513,7 +643,16 @@ export const useServerStore = create<ServerState>((set, get) => ({
   },
 
   setCurrent: (server) => {
+    unconfirmedCurrentId = null;
     applyServerSwitch(server, set, get);
+  },
+
+  setCurrentFromDevice: (server) => {
+    // Only before the network's list and any other choice of server.
+    if (!get().loading || get().current) return false;
+    applyServerSwitch(server, set, get);
+    unconfirmedCurrentId = server.id;
+    return true;
   },
 
   clearCurrent: () => {
@@ -639,19 +778,7 @@ export const useServerStore = create<ServerState>((set, get) => ({
     const stillMember = get().servers.some((server) => server.id === serverId);
     if (stillMember) return false;
 
-    serverPersistence.clearLastServerSlug(currentServer.slug);
-    applyServerDomainEvent({ kind: "patch", patch: "membership-removed", serverId }, set, get);
-    set({
-      members: [],
-      membersLoadError: false,
-      usage: null,
-      loadingUsage: false,
-      billing: null,
-      loadingBilling: false,
-      settings: null,
-      loadingSettings: false,
-    });
-    triggerServerReset();
+    dropCurrentServer(currentServer, set, get);
     return true;
   },
 
@@ -660,11 +787,17 @@ export const useServerStore = create<ServerState>((set, get) => ({
     if (!serverId) return;
     await coalesce(`members:${serverId}`, async () => {
       const epoch = get().serverEpoch;
+      const actorScope = currentActorScope();
       set({ membersLoadError: false });
       try {
         const { data } = await api.get(`/servers/${serverId}/members`);
         if (get().serverEpoch !== epoch) return;
         set({ members: data, membersLoadError: false });
+        // Upsert, not a full replace: a hidden directory answers with part of
+        // the server, and the table also holds joint channels' other people.
+        if (actorScope && Array.isArray(data)) {
+          upsertActorsIfCurrent(actorScope, (data as ServerMember[]).map((member) => humanActorRow(member.userId, member, serverId)));
+        }
       } catch {
         if (get().serverEpoch !== epoch) return;
         set({ membersLoadError: true });
@@ -675,8 +808,10 @@ export const useServerStore = create<ServerState>((set, get) => ({
   loadSidebarOrder: async () => {
     const serverId = get().current?.id;
     if (!serverId) return;
-    await coalesce(`sidebar-order:${serverId}`, async () => {
-      const epoch = get().serverEpoch;
+    // The epoch is in the key (as dm-channels): after A → B → A a call for the
+    // new A must not join A's first request, which returns without hydrating.
+    const epoch = get().serverEpoch;
+    await coalesce(bootListKey.sidebarOrder(serverId, epoch), async () => {
       try {
         const { data } = await api.get(`/servers/${serverId}/sidebar-order`);
         if (get().serverEpoch !== epoch) return;
@@ -687,6 +822,7 @@ export const useServerStore = create<ServerState>((set, get) => ({
           epoch,
           sidebarOrder: normalizeSidebarOrderResponse(data),
         }, set, get);
+        noteFreshLoad(bootListKey.sidebarOrder(serverId, epoch));
       } catch {
         if (get().serverEpoch !== epoch) return;
         applyServerDomainEvent({
@@ -694,7 +830,8 @@ export const useServerStore = create<ServerState>((set, get) => ({
           source: "sidebar-order",
           serverId,
           epoch,
-          sidebarOrder: DEFAULT_SIDEBAR_ORDER,
+          // A copy: read (and failed), unlike the reset value (isSidebarOrderLoaded).
+          sidebarOrder: { ...DEFAULT_SIDEBAR_ORDER },
         }, set, get);
       }
     });
@@ -711,18 +848,29 @@ export const useServerStore = create<ServerState>((set, get) => ({
     await coalesce("server-unread-summary", async () => {
       const epoch = get().serverEpoch;
       try {
-        const { data } = await getWithRwOverloadRetry("/servers/unread-summary");
+        const { data, stale } = await getRwRead("summary", "/servers/unread-summary");
         if (get().serverEpoch !== epoch) return;
         const next = parseServerUnreadSummaryRows(data);
         set((prev) => ({
           serverUnreadCounts: retainServerUnreadSummary(prev.serverUnreadCounts, next),
         }));
+        // Task #164: the last clean summary is what a later boot shows while RW is unavailable.
+        if (!stale) saveLastCounts(getCurrentPrincipalId(), get().current?.id, { summary: get().serverUnreadCounts });
       } catch {
         // best-effort cross-server badges; keep the previous snapshot on failure
       }
     });
   },
 
+  reopenDmAfterOwnReply: (dmId) => {
+    const { sidebarOrder } = get();
+    if (!sidebarOrder.hiddenDmIds.includes(dmId)) return;
+    applyServerDomainEvent({
+      kind: "patch",
+      patch: "sidebar-order-set",
+      sidebarOrder: { ...sidebarOrder, hiddenDmIds: sidebarOrder.hiddenDmIds.filter((id) => id !== dmId) },
+    }, set, get);
+  },
   updateSidebarOrder: async (updates) => {
     const { current, serverEpoch } = get();
     if (!current) return;
@@ -747,6 +895,7 @@ export const useServerStore = create<ServerState>((set, get) => ({
       hiddenDmIds: updates.hiddenDmIds ?? sidebarOrder.hiddenDmIds,
       channelPanelTabOrder: updates.channelPanelTabOrder ?? sidebarOrder.channelPanelTabOrder,
       agentPanelTabOrder: updates.agentPanelTabOrder ?? sidebarOrder.agentPanelTabOrder,
+      channelSideLayout: updates.channelSideLayout !== undefined ? updates.channelSideLayout : sidebarOrder.channelSideLayout,
       customSections: updates.customSections ?? sidebarOrder.customSections,
       sectionOrder: updates.sectionOrder ?? sidebarOrder.sectionOrder,
       sectionPlacements: updates.sectionPlacements ?? sidebarOrder.sectionPlacements,
@@ -820,16 +969,27 @@ export const useServerStore = create<ServerState>((set, get) => ({
     await performUpdate();
   },
 
-  updateMemberRole: async (userId, role) => {
-    const { current } = get();
-    if (!current) return;
-    await api.patch(`/servers/${current.id}/members/${userId}`, { role });
+  updateMemberRole: async (userId, role, options) => {
+    const serverId = options?.serverId ?? get().current?.id;
+    if (!serverId) return "skipped";
+    const onCurrentServer = () => get().current?.id === serverId;
+    if (options?.onlyIfRole) {
+      // The current server's member list is live; another server's is asked for.
+      const storedRole = onCurrentServer()
+        ? get().members.find((member) => member.userId === userId)?.role
+        : ((await api.get(`/servers/${serverId}/members`)).data as ServerMember[])
+          .find((member) => member.userId === userId)?.role;
+      if (storedRole !== options.onlyIfRole) return "changed";
+    }
+    await api.patch(`/servers/${serverId}/members/${userId}`, { role });
+    if (!onCurrentServer()) return "updated";
     set((state) => ({
       members: state.members.map((member) =>
         member.userId === userId ? { ...member, role } : member
       ),
     }));
     notifyAllChannelMembersChanged();
+    return "updated";
   },
 
   removeMember: async (userId) => {
@@ -887,4 +1047,8 @@ export const useServerStore = create<ServerState>((set, get) => ({
 // Provide the active serverId to the L4 web auth trace producer synchronously,
 // without webAuthTrace importing this store (which would create an import cycle).
 setAuthTraceServerIdGetter(() => useServerStore.getState().current?.id);
+registerLocalActorLookup((ref) => ref.kind === "human" && useServerStore.getState().members.some((member) => member.userId === ref.id));
 setProductEventServerIdGetter(() => useServerStore.getState().current?.id);
+// <html> wears the current server's theme (data-theme), applied in the same
+// update that makes a server current so no frame shows the previous one's.
+installServerThemeSync(useServerStore);

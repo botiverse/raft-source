@@ -11,17 +11,15 @@ import {
   attachments,
   channels,
   externalActorProjections,
-  featureFlags,
   servers,
   users,
 } from "../db/schema";
 import type { StorageBackend } from "./storageService";
-import { ATTACHMENT_STORAGE_KEY_PREFIX } from "./storageService";
+import { ATTACHMENT_STORAGE_KEY_PREFIX, __setStorageForTests, resetStorageForTests } from "./storageService";
 import {
   externalInboundAttachmentIntentState,
   storeExternalInboundAttachment,
 } from "./externalInboundAttachmentStorageService";
-import { ATTACHMENT_ORIGINAL_STORAGE_V2_FEATURE_FLAG_KEY } from "./featureFlagService";
 
 const NOW = new Date("2026-09-05T01:00:00.000Z");
 
@@ -125,10 +123,6 @@ test("provider bytes stream into one pending externally-attributed canonical pro
   assert.deepEqual(writes.get(object.storageKey), body);
   assert.equal(await externalInboundAttachmentIntentState(state.db, messageFactId), "completed");
 
-  await state.db.update(featureFlags)
-    .set({ killSwitch: true })
-    .where(eq(featureFlags.key, ATTACHMENT_ORIGINAL_STORAGE_V2_FEATURE_FLAG_KEY));
-
   async function* mustNotReadAgain(): AsyncIterable<Uint8Array> {
     throw new Error("idempotent replay consumed provider bytes");
   }
@@ -151,37 +145,6 @@ test("provider bytes stream into one pending externally-attributed canonical pro
   assert.equal(replay.id, first.id);
   assert.equal((await state.db.select().from(attachments)).length, 1);
   assert.equal((await state.db.select().from(attachmentObjects)).length, 1);
-});
-
-test("the attachment-original kill switch returns fresh external writes to the legacy route", async () => {
-  const state = await fixture();
-  await state.db.update(featureFlags)
-    .set({ killSwitch: true })
-    .where(eq(featureFlags.key, ATTACHMENT_ORIGINAL_STORAGE_V2_FEATURE_FLAG_KEY));
-  const writes = new Map<string, Buffer>();
-  const body = Buffer.from("legacy external", "utf8");
-  async function* bytes() { yield body; }
-
-  const attachment = await storeExternalInboundAttachment({
-    assetId: randomUUID(),
-    messageFactId: randomUUID(),
-    serverId: state.server.id,
-    channelId: state.channel.id,
-    uploaderId: state.actor.id,
-    uploaderType: "external_projection",
-    filename: "legacy.txt",
-    mimeType: "text/plain",
-    declaredSizeBytes: body.length,
-    maximumSizeBytes: 1024,
-    bytes: bytes(),
-    storage: memoryStorage(writes),
-    db: state.db,
-    now: NOW,
-  });
-  const [object] = await state.db.select().from(attachmentObjects)
-    .where(eq(attachmentObjects.id, attachment.objectId!));
-  assert.equal(object.storageKey, `${state.server.id}/${attachment.id}.txt`);
-  assert.deepEqual(writes.get(object.storageKey), body);
 });
 
 test("a stream that exceeds provider metadata publishes no attachment projection", async () => {
@@ -395,4 +358,35 @@ test("a provider byte generator that throws on first read rejects storeExternalI
   assert.equal(streamPathUsed, false, "provider bytes must be buffered before storage, never streamed");
   assert.equal(writes.size, 0);
   assert.equal((await state.db.select().from(attachments)).length, 0);
+});
+
+test("without the dedicated attachment bucket a fresh external attachment keeps a legacy key", async () => {
+  const state = await fixture();
+  const writes = new Map<string, Buffer>();
+  const body = Buffer.from("no-dedicated-bucket", "utf8");
+  __setStorageForTests(memoryStorage(writes), { dedicatedAttachmentKeys: false });
+  try {
+    const stored = await storeExternalInboundAttachment({
+      assetId: randomUUID(),
+      messageFactId: randomUUID(),
+      serverId: state.server.id,
+      channelId: state.channel.id,
+      uploaderId: state.actor.id,
+      uploaderType: "external_projection",
+      filename: "provider.txt",
+      mimeType: "text/plain",
+      declaredSizeBytes: body.length,
+      maximumSizeBytes: 1024,
+      bytes: (async function* () { yield body; })(),
+      storage: memoryStorage(writes),
+      db: state.db,
+      now: NOW,
+    });
+    const [object] = await state.db.select().from(attachmentObjects)
+      .where(eq(attachmentObjects.id, stored.objectId!));
+    assert.equal(object.storageKey, `${state.server.id}/${stored.id}.txt`);
+    assert.deepEqual(writes.get(object.storageKey), body);
+  } finally {
+    resetStorageForTests();
+  }
 });

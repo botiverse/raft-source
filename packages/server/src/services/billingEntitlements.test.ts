@@ -1,6 +1,7 @@
 import { dbTest as test } from "../test/integration/dbTest";
 import { closeTestDatabase } from "../test/integration/database";
 import assert from "node:assert/strict";
+import { vi } from "vitest";
 import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { PRO_AGENT_SEAT_BLOCK_SIZE } from "@botiverse/raft-shared";
@@ -10,6 +11,8 @@ import { createAgent } from "./agentService";
 import {
   assertAgentCapacityAvailable,
   getHistoryCutoff,
+  getServerPlan,
+  getServerHistoryWindow,
   getServerBillingEntitlement,
   getServerBillingUsage,
   isChannelReadOnlyByBillingFeature,
@@ -18,6 +21,7 @@ import {
 import { addMember, createServer } from "./serverService";
 import { createChannel, getOrCreateThread } from "./channelService";
 import { createMessage } from "./messageService";
+import { seedBoundGuest } from "../test/guestFixture";
 
 
 afterEach(async () => {
@@ -41,9 +45,9 @@ test("billing usage excludes Guests from paid human seats", async ({ db }) => {
   const member = await seedUser("guest-seat-member");
   const server = await createServer("Guest seats", `guest-seats-${randomUUID()}`, owner.id);
   await db.insert(serverMembers).values([
-    { serverId: server.id, userId: guest.id, role: "guest" },
     { serverId: server.id, userId: member.id, role: "member" },
   ]);
+  await seedBoundGuest({ serverId: server.id, userId: guest.id }, db);
 
   const usage = await getServerBillingUsage(db, server.id);
   assert.equal(usage.humans, 2, "owner and Member consume seats; Guest does not");
@@ -318,4 +322,143 @@ test("partner plan remains Founder-equivalent with non-entitling or active subsc
     });
     await requireTeamBillingFeature(db, server.id, "Joint channels", AFTER_FULL_FEATURE_TRIAL);
   }
+});
+
+// AppSumo fixtures exercise the stored-license reader, not a mocked plan switch.
+async function seedAppSumoGrant(serverId: string, ownerId: string, tier: 1 | 2 | 3 | 4 = 1) {
+  const { appSumoLicenses, appSumoLicenseBindings } = await import("../db/schema");
+  const { parseAppSumoLicenseKey } = await import("./appSumoContracts");
+  const key = parseAppSumoLicenseKey(randomUUID())!;
+  await getDb().insert(appSumoLicenses).values({
+    productId: "233088", licenseKey: key, tier, status: "active", verifiedAt: new Date(),
+  });
+  await getDb().insert(appSumoLicenseBindings).values({
+    serverId, productId: "233088", originalLicenseKey: key, currentLicenseKey: key,
+    boundByUserId: ownerId, activatedAt: new Date(),
+  });
+  return key;
+}
+
+test("plan and history reads use one server query before activation, while Pro and after revocation", async ({ db }) => {
+  const owner = await seedUser("appsumo-read-owner");
+  const server = await createServer("AppSumo reads", `appsumo-read-${randomUUID()}`, owner.id);
+  await seedAppSumoGrant(server.id, owner.id);
+  // Model the lifecycle writer's compatibility projection; hot reads do not resolve licenses.
+  for (const plan of ["free", "pro", "free"] as const) {
+    await db.update(servers).set({ plan }).where(eq(servers.id, server.id));
+    const select = vi.spyOn(db, "select");
+    try {
+      const actualPlan = await getServerPlan(server.id);
+      assert.equal(select.mock.calls.length, 1, "ordinary plan read must not join the license tables");
+      assert.equal(actualPlan, plan);
+      select.mockClear();
+      const history = await getServerHistoryWindow(server.id, AFTER_FULL_FEATURE_TRIAL);
+      assert.equal(history.plan, plan);
+      assert.equal(history.cutoff?.toISOString(), getHistoryCutoff(plan, AFTER_FULL_FEATURE_TRIAL)?.toISOString());
+      assert.equal(select.mock.calls.length, 1, "history read must not join the license tables");
+    } finally {
+      select.mockRestore();
+    }
+  }
+  assert.equal(await getServerPlan(randomUUID()), "free");
+});
+
+test("AppSumo admits the included humans and agents together, but cannot borrow spare seats", async ({ db }) => {
+  const owner = await seedUser("appsumo-owner");
+  const second = await seedUser("appsumo-second");
+  const third = await seedUser("appsumo-third");
+  const server = await createServer("AppSumo", `appsumo-${randomUUID()}`, owner.id);
+  await seedAppSumoGrant(server.id, owner.id);
+  await addMember(server.id, second.id);
+  await assert.rejects(() => addMember(server.id, third.id), /Human.*limit|human.*limit|human.*seat/i);
+  for (let i = 0; i < 10; i++) await createAgent(server.id, `agent-${i}`, { runtime: "external" });
+  await assert.rejects(() => createAgent(server.id, "agent-over", { runtime: "external" }), /Agent.*limit|agent.*limit/i);
+  const entitlement = await getServerBillingEntitlement(db, server.id);
+  assert.equal(entitlement.source, "appsumo");
+  assert.deepEqual(entitlement.capacity, { maxHumans: 2, maxAgents: 10, maxUniversalSeats: -1 });
+  await requireTeamBillingFeature(db, server.id, "Agent migration", AFTER_FULL_FEATURE_TRIAL);
+  const { getBillingSummary, createCheckoutSession } = await import("./billingService");
+  const summary = await getBillingSummary(server.id);
+  assert.equal(summary.price, null);
+  assert.equal(summary.subscription, null);
+  assert.equal(summary.appsumo?.tier, 1);
+  assert.equal(JSON.stringify(summary).includes("currentLicenseKey"), false);
+  await assert.rejects(() => createCheckoutSession(server.id, owner.id, "https://raft.build/ok", "https://raft.build/cancel"), /AppSumo/);
+});
+
+test("AppSumo monthly uploads reserve the exact allowance, release failures and reset at UTC month", async ({ db }) => {
+  const { withFileUploadQuota, getFileUploadQuotaSummary, FileUploadQuotaExceededError, buildFileUploadQuotaExceededResponse } = await import("./fileUploadQuotaService");
+  const owner = await seedUser("appsumo-upload-owner");
+  const server = await createServer("AppSumo uploads", `appsumo-upload-${randomUUID()}`, owner.id);
+  await seedAppSumoGrant(server.id, owner.id);
+  const now = new Date("2026-10-31T23:59:00Z");
+  await assert.rejects(() => withFileUploadQuota(server.id, 123, async () => { throw new Error("upload failed"); }, now), /upload failed/);
+  assert.equal((await getFileUploadQuotaSummary(server.id, now)).reservedBytes, 0);
+  await withFileUploadQuota(server.id, 1024 ** 3, async () => "ok", now);
+  const summary = await getFileUploadQuotaSummary(server.id, now);
+  assert.equal(summary.appsumo?.tier, 1);
+  const refusal = await buildFileUploadQuotaExceededResponse(server.id, new FileUploadQuotaExceededError(summary, 1), "human");
+  assert.match(refusal.error, /AppSumo/);
+  assert.doesNotMatch(refusal.suggestedNextAction, /upgrade to Pro/i);
+  assert.equal(summary.usedBytes, 1024 ** 3);
+  assert.equal(summary.limitBytes, 1024 ** 3);
+  assert.equal(summary.remainingBytes, 0);
+  await assert.rejects(() => withFileUploadQuota(server.id, 1, async () => "no", now), FileUploadQuotaExceededError);
+  assert.equal((await getFileUploadQuotaSummary(server.id, new Date("2026-11-01T00:00:00Z"))).usedBytes, 0);
+});
+
+test("AppSumo hosted Joint cap counts connections, permits an upgrade and preserves existing channels on downgrade", async ({ db }) => {
+  const { createJointChannel, acceptJointChannelInvite } = await import("./channelService");
+  const { countHostedJointChannels } = await import("./jointChannelLimitService");
+  const { appSumoLicenses } = await import("../db/schema");
+  const owner = await seedUser("appsumo-joint-owner");
+  const peerOwner = await seedUser("appsumo-joint-peer");
+  const host = await createServer("AppSumo host", `appsumo-joint-${randomUUID()}`, owner.id);
+  const peer = await createServer("Peer", `appsumo-peer-${randomUUID()}`, peerOwner.id);
+  await db.update(servers).set({ plan: "partner" }).where(eq(servers.id, peer.id));
+  const licenseKey = await seedAppSumoGrant(host.id, owner.id);
+  const makeJoint = () => createJointChannel({
+    hostServerId: host.id, createdByUserId: owner.id, name: `joint-${randomUUID().slice(0, 8)}`,
+    jointInvites: [{ targetServerSlug: peer.slug, invitedPeople: [peerOwner.email] }],
+  });
+  const pending = await makeJoint();
+  assert.equal(await countHostedJointChannels(db, host.id), 0, "unaccepted invitations consume no slot");
+  for (let i = 0; i < 2; i++) {
+    const joint = await makeJoint();
+    await acceptJointChannelInvite({ inviteId: joint.invites[0].id, targetServerId: peer.id, acceptedByUserId: peerOwner.id });
+  }
+  assert.equal(await countHostedJointChannels(db, host.id), 2);
+  const acceptPending = () => acceptJointChannelInvite({ inviteId: pending.invites[0].id, targetServerId: peer.id, acceptedByUserId: peerOwner.id });
+  await assert.rejects(acceptPending, (error: Error & { code?: string }) => error.code === "joint_channel_plan_limit_reached");
+  await db.update(appSumoLicenses).set({ tier: 2 }).where(eq(appSumoLicenses.licenseKey, licenseKey));
+  await acceptPending();
+  assert.equal(await countHostedJointChannels(db, host.id), 3);
+  await db.update(appSumoLicenses).set({ tier: 1 }).where(eq(appSumoLicenses.licenseKey, licenseKey));
+  assert.equal(await countHostedJointChannels(db, host.id), 3, "downgrade preserves the existing channels");
+  await assert.rejects(makeJoint, (error: Error & { code?: string }) => error.code === "joint_channel_plan_limit_reached");
+});
+
+
+test("internal plans outrank a stored AppSumo grant and active Stripe conflicts remain visible", async ({ db }) => {
+  const { getBillingSummary } = await import("./billingService");
+  const owner = await seedUser("source-precedence");
+  const server = await createServer("Sources", `sources-${randomUUID()}`, owner.id);
+  await seedAppSumoGrant(server.id, owner.id);
+  for (const plan of ["partner", "founder"] as const) {
+    await db.update(servers).set({ plan }).where(eq(servers.id, server.id));
+    const entitlement = await getServerBillingEntitlement(db, server.id);
+    assert.equal(entitlement.plan, plan);
+    assert.equal(entitlement.source, "server");
+    assert.equal(entitlement.appsumo, undefined);
+    assert.deepEqual(entitlement.capacity, { maxHumans: -1, maxAgents: -1, maxUniversalSeats: -1 });
+  }
+  await db.update(servers).set({ plan: "pro" }).where(eq(servers.id, server.id));
+  await insertProSubscription({ serverId: server.id, ownerId: owner.id });
+  const summary = await getBillingSummary(server.id);
+  assert.equal(summary.source, "appsumo");
+  assert.equal(summary.sourceConflict, "appsumo_stripe");
+  assert.equal(summary.subscription?.status, "active");
+  assert.ok(summary.subscription?.currentPeriodEnd);
+  assert.equal(summary.subscription?.cancelAtPeriodEnd, false);
+  assert.equal(summary.appsumo?.tier, 1);
 });

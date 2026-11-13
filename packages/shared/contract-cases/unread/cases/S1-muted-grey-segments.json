@@ -1,0 +1,47 @@
+{
+  "formatVersion": 1,
+  "id": "S1-muted-grey-segments",
+  "rule": "S1",
+  "title": "A muted channel's grey count shows both the unread and the threads segment",
+  "why": "The grey count shows the same segments as the loud badge (5 · threads 1). Decided by artin (#proj-mobile:966d7abd, 2026-10-29): web's behaviour.",
+  "status": "agreed",
+  "sources": {
+    "web": [
+      "packages/web/src/features/sidebar/rows/ChannelUnreadSegments.tsx"
+    ],
+    "app": [
+      "compose/shared/src/commonMain/kotlin/build/raft/app/RaftHomeComponents.kt (homeChannelRowMarks quietLabel)"
+    ]
+  },
+  "knownGaps": [
+    {
+      "client": "app",
+      "reason": "adopt decision (artin 10-29): the app's grey count shows one number (the unread, else the threads).",
+      "followUp": "#proj-mobile:#70 (decision #proj-mobile:966d7abd)"
+    }
+  ],
+  "given": {
+    "conversation": {
+      "id": "channel-1",
+      "kind": "channel"
+    },
+    "row": {
+      "joined": true,
+      "muted": true,
+      "unread": 5,
+      "threads": 1
+    }
+  },
+  "steps": [],
+  "expect": {
+    "state": {
+      "rowDisplay": {
+        "kind": "quiet",
+        "segments": {
+          "unread": 5,
+          "threads": 1
+        }
+      }
+    }
+  }
+}

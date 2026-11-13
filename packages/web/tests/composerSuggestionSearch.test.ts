@@ -134,3 +134,26 @@ test("basic degraded search normalizes channel and member scope prefixes like th
   assert.deepEqual(rankBasicComposerSuggestions("#design", channels).map((suggestion) => suggestion.name), ["design"]);
   assert.deepEqual(rankBasicComposerSuggestions("@ray", members).map((suggestion) => suggestion.handle), ["ray"]);
 });
+
+test("an entry's tier orders comparable matches; an exact name still leads and a loose match still trails", () => {
+  const entry = (index: number, name: string, tier?: number): ComposerSuggestionSearchEntry<string> => ({
+    index, suggestion: name, fields: [{ raw: name, priority: 0 }], ...(tier === undefined ? {} : { tier }),
+  });
+  // Strong matches (a prefix and a word start): the tier decides, in both rankers.
+  const strong = [entry(0, "onboarding-old", 2), entry(1, "wg-onboarding-v3"), entry(2, "onboarding-new", 1)];
+  assert.deepEqual(rankComposerSuggestions("onboarding", strong), ["wg-onboarding-v3", "onboarding-new", "onboarding-old"]);
+  assert.deepEqual(rankBasicComposerSuggestions("onboarding", strong), ["wg-onboarding-v3", "onboarding-new", "onboarding-old"]);
+
+  // An exact name in a higher tier still comes first, and a loose fuzzy match in tier 0 still last.
+  const mixed = [entry(0, "dev-sign-off"), entry(1, "design-system", 1), entry(2, "design", 1)];
+  assert.deepEqual(rankComposerSuggestions("design", mixed), ["design", "design-system", "dev-sign-off"]);
+
+  // Archived prefix matches can't push a live word-start match off the capped list.
+  const many = [...Array.from({ length: 40 }, (_, index) => entry(index, `onboarding-${index}`, 2)), entry(40, "wg-onboarding-v3")];
+  const ranked = rankComposerSuggestions("onboarding", many);
+  assert.equal(ranked[0], "wg-onboarding-v3");
+  assert.equal(ranked.length, 30);
+  // Nor can 40 loose tier-0 matches push out an exact name in a higher tier.
+  const loose = [...Array.from({ length: 40 }, (_, index) => entry(index, `d-e-s-i-g-n-${index}`)), entry(40, "design", 1)];
+  assert.equal(rankComposerSuggestions("design", loose)[0], "design");
+});

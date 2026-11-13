@@ -1,0 +1,49 @@
+{
+  "formatVersion": 1,
+  "id": "R11-dm-muted-mention",
+  "rule": "R11",
+  "title": "A muted DM with an unread mention stays quiet: grey count, muted name",
+  "why": "Muted is the only thing that makes a DM quiet, and nothing pierces it: a mention (or following) does not make a muted DM loud; its count is grey and its name muted. Decided by artin (#proj-mobile:966d7abd, 2026-10-29): web's behaviour.",
+  "status": "agreed",
+  "sources": {
+    "web": [
+      "packages/web/src/utils/channelUnreadIndicator.ts (getDmUnreadIndicatorState)",
+      "packages/web/src/features/sidebar/rows/DmRow.tsx (tone)",
+      "packages/web/src/features/sidebar/rows/SidebarPeerRowBody.tsx"
+    ],
+    "app": [
+      "compose/shared/src/commonMain/kotlin/build/raft/app/RaftHomeComponents.kt (homeConversationBadgeProjection: mentionPierced/followed are loud)"
+    ]
+  },
+  "knownGaps": [
+    {
+      "client": "app",
+      "reason": "adopt decision (artin 10-29): the app makes a muted DM loud when a mention pierces the mute or the DM is followed.",
+      "followUp": "#proj-mobile:#70 (decision #proj-mobile:966d7abd)"
+    }
+  ],
+  "given": {
+    "conversation": {
+      "id": "dm-1",
+      "kind": "dm"
+    },
+    "row": {
+      "joined": true,
+      "muted": true,
+      "unread": 2,
+      "mention": true
+    }
+  },
+  "steps": [],
+  "expect": {
+    "state": {
+      "rowDisplay": {
+        "kind": "quiet",
+        "segments": {
+          "unread": 2
+        },
+        "unreadTone": false
+      }
+    }
+  }
+}

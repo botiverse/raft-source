@@ -86,7 +86,7 @@ export default function ServerSetupHandoffStep({
             context="profile-hero"
             type="agent"
             agentAvatarUrl="pixel:mug"
-            className="onboarding-cindy-entrance z-10"
+            className="onboarding-cindy-entrance z-raised"
           />
         </div>
 

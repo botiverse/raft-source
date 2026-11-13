@@ -25,7 +25,7 @@ import { startFeedbackAgentEventTail } from "../../../daemon/src/feedbackAgentEv
 import { handleRequest, type TraceUploadWorkerEnv } from "../../../trace-upload-worker/src/index";
 import { legacyHandleRequest1bceea852 } from "../../../trace-upload-worker/src/testing/legacyTraceBundles1bceea852";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 const SECRET = "agent-event-tail-e2e-secret";
 const WORKER_URL = "https://trace-worker.test";
 
@@ -55,7 +55,7 @@ async function seed() {
 async function withApp(fn: (baseUrl: string, ids: Awaited<ReturnType<typeof seed>>) => Promise<void>) {
   const previous = process.env.SCOPE_ATTESTATION_SECRET;
   process.env.SCOPE_ATTESTATION_SECRET = SECRET;
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     await fn(app.baseUrl, await seed());
   } finally {

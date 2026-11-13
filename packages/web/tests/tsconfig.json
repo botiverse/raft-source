@@ -1,8 +1,9 @@
 {
-  "//": "Config for tests under tests/ (the nearest tsconfig for Vitest's transform). Inherits the app's compilerOptions (notably jsx: react-jsx). include covers tests/ AND ../src so the transform applies automatic JSX to imported src components too (not just in-test components). Tests are NOT part of the app's `tsc --noEmit` typecheck (separate config).",
+  "//": "Config for tests under tests/ (the nearest tsconfig for Vitest's transform). Inherits the app's compilerOptions (notably jsx: react-jsx). include covers tests/ AND ../src so the transform applies automatic JSX to imported src components too (not just in-test components). Tests are NOT part of the app's `tsc --noEmit` typecheck (separate config). Feature tests in ../src/features/<feature>/tests/ are covered by the ../src include; exclude is reset so the app config's exclude of them is not inherited.",
   "extends": "../tsconfig.json",
   "compilerOptions": {
     "types": ["d3-selection", "d3-zoom", "react", "react-dom", "vitest/globals"]
   },
-  "include": ["**/*.ts", "**/*.tsx", "../src/**/*.ts", "../src/**/*.tsx"]
+  "include": ["**/*.ts", "**/*.tsx", "../src/**/*.ts", "../src/**/*.tsx"],
+  "exclude": []
 }

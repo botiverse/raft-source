@@ -1,6 +1,24 @@
 import assert from "node:assert/strict";
 
+import type { RuntimeAccountUsageSnapshot } from "@botiverse/raft-shared";
 import { RuntimeAccountUsageClient } from "../src/utils/runtimeAccountUsageClient";
+
+function validSnapshot(): RuntimeAccountUsageSnapshot {
+  return {
+    protocolVersion: 2,
+    provider: "codex",
+    collectedAt: "2026-11-02T03:00:00.000Z",
+    staleAfter: "2026-11-02T03:25:00.000Z",
+    collectorVersion: "1.6.2",
+    accounts: [{
+      accountKey: "d".repeat(64),
+      maskedLabel: "man****email@company.com",
+      planLabel: "Pro",
+      health: "ok",
+      windows: [{ id: "primary", label: "7 days", status: "ok", usedRatio: 0.42, resetsAt: "2026-11-09T03:00:00.000Z" }],
+    }],
+  };
+}
 
 test("dedupes cache reads and keeps a 60-second client cache", async () => {
   let now = 1_000;
@@ -54,7 +72,7 @@ test("dedupes refreshes and enforces a two-minute client cooldown", async () => 
 test("a fresh refresh result is written into the read cache in the read-path shape", async () => {
   let now = 1_000;
   let reads = 0;
-  const freshSnapshot = { protocolVersion: 2, provider: "codex" } as unknown as never;
+  const freshSnapshot = validSnapshot();
   const client = new RuntimeAccountUsageClient(
     async () => {
       reads += 1;
@@ -72,6 +90,23 @@ test("a fresh refresh result is written into the read cache in the read-path sha
   assert.equal(reads, 0);
 });
 
+test("a refresh whose snapshot is outside the schema is neither returned nor cached", async () => {
+  // The Computers page crashed on `windows.find` when a computer reported an
+  // account whose `windows` was not an array (#triage:#151).
+  const snapshot = validSnapshot();
+  const malformed = { ...snapshot, accounts: [{ ...snapshot.accounts[0]!, windows: { primary: snapshot.accounts[0]!.windows[0] } }] };
+  const client = new RuntimeAccountUsageClient(
+    async () => ({ state: "missing", snapshot: null }),
+    async () => ({ accepted: true, state: "fresh" as const, snapshot: malformed as never }),
+  );
+  assert.deepEqual(await client.refresh("server", "machine", "codex", "manual"), {
+    accepted: true,
+    state: "fresh",
+    snapshot: null,
+  });
+  assert.deepEqual(await client.read("server", "machine", "codex"), { state: "missing", snapshot: null });
+});
+
 test("a timed-out refresh result passes through unchanged", async () => {
   const client = new RuntimeAccountUsageClient(
     async () => ({ state: "missing", snapshot: null }),
@@ -81,4 +116,23 @@ test("a timed-out refresh result passes through unchanged", async () => {
     accepted: true,
     state: "timeout",
   });
+});
+
+test("a read's answer without a snapshot holding its accounts is `missing`, never a crash for the views that read `snapshot.accounts`", async () => {
+  const answers: unknown[] = [
+    undefined,
+    {},
+    { state: "missing" },
+    { state: "fresh" },
+    { state: "stale", snapshot: { accounts: "not a list" } },
+    { state: "later-state", snapshot: null },
+  ];
+  for (const answer of answers) {
+    const client = new RuntimeAccountUsageClient(async () => answer as never, async () => ({ accepted: false, state: "cooldown" }));
+    assert.deepEqual(await client.read("server-1", "machine-1", "codex"), { state: "missing", snapshot: null }, JSON.stringify(answer));
+  }
+  const unsupported = new RuntimeAccountUsageClient(async () => ({ state: "unsupported", snapshot: null }), async () => ({ accepted: false, state: "unsupported" }));
+  assert.deepEqual(await unsupported.read("server-1", "machine-1", "antigravity"), { state: "unsupported", snapshot: null });
+  const fresh = new RuntimeAccountUsageClient(async () => ({ state: "fresh", snapshot: validSnapshot() }), async () => ({ accepted: false, state: "cooldown" }));
+  assert.deepEqual(await fresh.read("server-1", "machine-1", "codex"), { state: "fresh", snapshot: validSnapshot() });
 });

@@ -4,8 +4,8 @@ import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { test } from "vitest";
-import { SERVER_CAPABILITY_RUNTIME_DETECTION_ASYNC_V1, type MachineToServerMessage, type ServerToMachineMessage } from "@botiverse/raft-shared";
-import { DaemonCore, type RuntimeDetection } from "./core";
+import { SERVER_CAPABILITY_MIGRATION_BACKUP_IGNORE_SOURCES_V1, SERVER_CAPABILITY_RUNTIME_DETECTION_ASYNC_V1, type MachineToServerMessage, type ServerToMachineMessage } from "@botiverse/raft-shared";
+import { DaemonCore, migrationSummaryMayReportIgnoreSources, type RuntimeDetection } from "./core";
 import type { WebSocketLike } from "./connection";
 import type { RuntimeDetectionRoundOptions, RuntimeDetectionRoundResult } from "./runtimeDetectionRound";
 
@@ -364,4 +364,77 @@ test("task #1268: a round's final frame prepared while a synchronous ready overt
     assert.deepEqual(s.readyFrames().at(-1)!.runtimes, ["sync-runtime"], "the older round result must not land after the synchronous inventory");
     assert.equal(s.readyFrames().length, 2, "pending, then the synchronous inventory; the stale final frame is dropped");
   }, { getComputerLifecycleReadyAcks: async () => { calls++; if (calls === 2) await gate; return []; } });
+});
+
+// Same precedence as asyncDetectionAllowed above: machine:context wins over the
+// handshake header, which counts only until the context arrives.
+const MIGRATION_IGNORE_SOURCES = SERVER_CAPABILITY_MIGRATION_BACKUP_IGNORE_SOURCES_V1;
+const acceptsIgnoreSources = (core: DaemonCore) =>
+  (core as unknown as { serverAcceptsMigrationIgnoreSources(): boolean }).serverAcceptsMigrationIgnoreSources();
+
+test("migration ignore sources: granted by machine:context → true, even without the header", async () => {
+  await withCore(async ({ core, sockets }) => {
+    const socket = sockets[0]!;
+    socket.emitUpgrade(null);
+    socket.emitOpen();
+    socket.emitContext([MIGRATION_IGNORE_SOURCES]);
+    await tick();
+    assert.equal(acceptsIgnoreSources(core), true);
+  });
+});
+
+test("migration ignore sources: header only, before any machine:context → true", async () => {
+  await withCore(async ({ core, sockets }) => {
+    const socket = sockets[0]!;
+    socket.emitUpgrade([MIGRATION_IGNORE_SOURCES]);
+    socket.emitOpen();
+    await tick();
+    assert.equal(acceptsIgnoreSources(core), true);
+  });
+});
+
+test("migration ignore sources: neither header nor context → false", async () => {
+  await withCore(async ({ core, sockets }) => {
+    const socket = sockets[0]!;
+    socket.emitUpgrade(null);
+    socket.emitOpen();
+    assert.equal(acceptsIgnoreSources(core), false);
+    socket.emitContext();
+    await tick();
+    assert.equal(acceptsIgnoreSources(core), false);
+  });
+});
+
+test("migration ignore sources: header says yes but machine:context does not → false (the context wins)", async () => {
+  await withCore(async ({ core, sockets }) => {
+    const socket = sockets[0]!;
+    socket.emitUpgrade([MIGRATION_IGNORE_SOURCES]);
+    socket.emitOpen();
+    socket.emitContext([]);
+    await tick();
+    assert.equal(acceptsIgnoreSources(core), false);
+  });
+});
+
+test("migration ignore sources: a conflicting machine:context → false, whatever it advertises", async () => {
+  await withCore(async ({ core, sockets }) => {
+    const socket = sockets[0]!;
+    socket.emitUpgrade([MIGRATION_IGNORE_SOURCES]);
+    socket.emitOpen();
+    socket.emitContext([MIGRATION_IGNORE_SOURCES]);
+    await tick();
+    assert.equal(acceptsIgnoreSources(core), true);
+    socket.emitServerMessage({ type: "machine:context", machineId: "machine-test", serverId: "server-other", capabilities: [MIGRATION_IGNORE_SOURCES] });
+    await tick();
+    assert.equal(acceptsIgnoreSources(core), false);
+  });
+});
+
+test("per-source ignore counts need both the Server and the target Computer to accept them", () => {
+  // The target parses the control manifest strictly: a Computer before 1.0.60 rejects the field,
+  // so the source sends it only when its lease says the target accepts it.
+  assert.equal(migrationSummaryMayReportIgnoreSources(true, { targetAcceptsIgnoreSources: true }), true);
+  assert.equal(migrationSummaryMayReportIgnoreSources(true, {}), false);
+  assert.equal(migrationSummaryMayReportIgnoreSources(true, { targetAcceptsIgnoreSources: false }), false);
+  assert.equal(migrationSummaryMayReportIgnoreSources(false, { targetAcceptsIgnoreSources: true }), false);
 });

@@ -1,0 +1,55 @@
+// The check Worker for Raft's workspace Artifacts (src/checkWorker.ts; README.md). A Worker
+// of its own: every minute it leases publish checks from Raft and, each in an invocation of its
+// own, opens the version's ticket top-level in Cloudflare's headless browser (the BROWSER
+// binding), and posts the screenshots and findings back. Build: pnpm run build. Deployed by
+// .github/workflows/deploy-check-worker.yml only (`--env staging` / `--env production`), never by
+// hand.
+//
+// The top level is no deployment: its RAFT_API_ORIGIN is empty, so a Worker deployed from it
+// leases nothing (it logs `raft-check.misconfigured`). Each environment repeats its bindings and
+// vars (wrangler inherits neither).
+{
+  "name": "raft-artifact-check-local",
+  "main": "src/checkWorker.ts",
+  "compatibility_date": "2026-07-24",
+  // @cloudflare/puppeteer needs Node's Buffer and friends.
+  "compatibility_flags": ["nodejs_compat"],
+  // No host at all: the Worker only runs its cron. A workers.dev host would need its deploy token to
+  // read the account's subdomain (account-wide), and the token is scoped to this one Worker.
+  "workers_dev": false,
+  "preview_urls": false,
+  // Every minute; a run leases within RUN_BUDGET_MS and hands each check to an invocation of its
+  // own through the Worker's loopback, ctx.exports.default (src/runner.ts, src/dispatch.ts): no
+  // binding here for it, so none for the deploy to read back.
+  "triggers": { "crons": ["* * * * *"] },
+  // Workers Logs: the lines carry ids, codes and counts only (src/log.ts); no traces (they would
+  // record subrequests).
+  "observability": { "enabled": true },
+  "browser": { "binding": "BROWSER" },
+  "vars": {
+    // Raft's API, an https origin; required.
+    "RAFT_API_ORIGIN": "",
+    // Warm browsers (src/pool.ts): "on" reuses the account's free Browser Rendering sessions,
+    // "off" launches one per check and closes it. Off here and on staging: the sessions are one
+    // list per Cloudflare account, so at most one environment of an account pools
+    // (scripts/deploy-config.ts checks it; README "Warm browsers").
+    "CHECK_BROWSER_POOL": "off"
+  },
+  // Secret (never here): ARTIFACTS_CHECK_WORKER_TOKEN, at least 32 random bytes, the server's
+  // ARTIFACTS_CHECK_WORKER_TOKEN; kept in the deployment's secret store and set on the Worker
+  // from there by automation, not by hand. README "Token rotation".
+  "env": {
+    "staging": {
+      "name": "raft-artifact-check-staging",
+      "triggers": { "crons": ["* * * * *"] },
+      "browser": { "binding": "BROWSER" },
+      "vars": { "RAFT_API_ORIGIN": "https://api-aws-staging.botiverse.dev", "CHECK_BROWSER_POOL": "off" }
+    },
+    "production": {
+      "name": "raft-artifact-check",
+      "triggers": { "crons": ["* * * * *"] },
+      "browser": { "binding": "BROWSER" },
+      "vars": { "RAFT_API_ORIGIN": "https://api.raft.build", "CHECK_BROWSER_POOL": "on" }
+    }
+  }
+}

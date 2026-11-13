@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { appendOAuthAuthorizationParams, isSafeOAuthReturnUrl } from "./oauthRedirect";
+import { appendOAuthAuthorizationParams, appendOAuthErrorParams, isSafeOAuthReturnUrl } from "./oauthRedirect";
 
 test("OAuth navigation rejects executable, relative and non-TLS remote callbacks", () => {
   for (const url of [
@@ -20,4 +20,21 @@ test("OAuth navigation preserves registered callback query and encodes code/stat
     assert.equal(result.searchParams.get("state"), "state#value");
     assert.equal(result.origin, new URL(callback).origin);
   }
+});
+
+test("OAuth error callbacks carry error, description and state, never a code, and only to safe URLs", () => {
+  const result = new URL(appendOAuthErrorParams(
+    "https://client.test/cb?source=raft&code=stale",
+    "invalid_scope",
+    { description: "not approved: openid", state: "state#value" },
+  ));
+  assert.equal(result.searchParams.get("error"), "invalid_scope");
+  assert.equal(result.searchParams.get("error_description"), "not approved: openid");
+  assert.equal(result.searchParams.get("state"), "state#value");
+  assert.equal(result.searchParams.get("source"), "raft");
+  assert.equal(result.searchParams.has("code"), false);
+  const bare = new URL(appendOAuthErrorParams("https://client.test/cb", "invalid_scope"));
+  assert.equal(bare.searchParams.has("error_description"), false);
+  assert.equal(bare.searchParams.has("state"), false);
+  assert.throws(() => appendOAuthErrorParams("javascript:alert(1)", "invalid_scope"), /returnUrl/);
 });

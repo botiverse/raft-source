@@ -1,18 +1,36 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
+import tailwindcss from "@tailwindcss/vite";
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { resolve } from "node:path";
+import { DISPLAY_LOCALES, displayLocaleTag } from "@botiverse/raft-shared/src/displayLocales";
 import { fileURLToPath } from "node:url";
+import { FEEDBACK_CARD_COPY_IDS } from "./src/feedback/feedbackCardCopy";
+import { pageMetaCspPlugin } from "./scripts/pageMetaCsp";
+import { registeredVarFallbacksPlugin } from "./scripts/registeredVarFallbacks";
 const root = fileURLToPath(new URL(".", import.meta.url));
-const copyKeys = ["feedback.native.diagnostics.edit", "feedback.native.diagnostics.rejected", "feedback.native.diagnostics.unavailable", "feedback.native.diagnosticsTitle", "feedback.native.diagnostics.preparing", "feedback.native.diagnostics.uploading", "feedback.native.diagnostics.submitting", "feedback.native.diagnostics.failed", "feedback.native.diagnostics.skip", "feedback.native.diagnostics.retry", "feedback.native.diagnostics.omit", "feedback.native.hostRequired", "feedback.native.authRequired", "feedback.native.authRestored", "settings.about.feedbackTitle", "settings.about.feedbackAttachmentOpenError", "common.lightbox.close"];
-const copy = Object.fromEntries(["en", "zh-cn"].map(locale => {
-  const source = readFileSync(resolve(root, `src/i18n/messages/${locale}.ts`), "utf8");
-  const entries = Object.fromEntries(copyKeys.map(key => {
-    const line = source.split("\n").find(line => line.trimStart().startsWith(`${JSON.stringify(key)}:`));
-    if (!line) throw new Error(`Missing feedback copy ${locale}/${key}`);
-    return [key, JSON.parse(line.trim().slice(JSON.stringify(key).length + 1).trim().replace(/,$/, ""))];
-  }));
-  return [locale === "zh-cn" ? "zh-CN" : "en", entries];
+// The page's own ids, plus the `feedback:submit` card form's (standalone/actionCard.tsx).
+const copyKeys = [...FEEDBACK_CARD_COPY_IDS, "feedback.native.diagnostics.edit", "feedback.native.diagnostics.rejected", "feedback.native.diagnostics.unavailable", "feedback.native.diagnosticsTitle", "feedback.native.diagnostics.preparing", "feedback.native.diagnostics.uploading", "feedback.native.diagnostics.submitting", "feedback.native.diagnostics.failed", "feedback.native.diagnostics.skip", "feedback.native.diagnostics.retry", "feedback.native.diagnostics.omit", "feedback.native.hostRequired", "feedback.native.authRequired", "feedback.native.authRestored", "settings.about.feedbackTitle", "settings.about.feedbackAttachmentOpenError", "common.lightbox.close"];
+// One copy per display locale, keyed by its BCP 47 tag: the session locale a
+// native host sends (host.ts FEEDBACK_HOST_LOCALES).
+// A catalog other than en and zh-cn may lack an id (it renders the English
+// until backfilled), so such a key takes en's value; en must have them all.
+function catalogValue(locale: string, key: string): string | undefined {
+  const lines = readFileSync(resolve(root, `src/i18n/messages/${locale}.ts`), "utf8").split("\n");
+  const index = lines.findIndex(line => line.trimStart().startsWith(`${JSON.stringify(key)}:`));
+  if (index < 0) return undefined;
+  // A long value sits on the line after its key.
+  const rest = lines[index].trim().slice(JSON.stringify(key).length + 1).trim() || lines[index + 1].trim();
+  return JSON.parse(rest.replace(/,$/, ""));
+}
+const englishCopy = Object.fromEntries(copyKeys.map(key => {
+  const value = catalogValue("en", key);
+  if (value === undefined) throw new Error(`Missing feedback copy en/${key}`);
+  return [key, value];
+}));
+const copy = Object.fromEntries(DISPLAY_LOCALES.map(locale => {
+  const entries = Object.fromEntries(copyKeys.map(key => [key, catalogValue(locale, key) ?? englishCopy[key]]));
+  return [displayLocaleTag(locale), entries];
 }));
 export default defineConfig({
   define: { __RAFT_FEEDBACK_COPY__: JSON.stringify(copy) },
@@ -21,7 +39,7 @@ export default defineConfig({
   envDir: root,
   base: "/feedback/",
   resolve: { alias: { "/src": resolve(root, "src") } },
-  plugins: [react(), {
+  plugins: [react(), tailwindcss({ optimize: true }), registeredVarFallbacksPlugin(), pageMetaCspPlugin(), {
     name: "feedback-entry-boundary",
     generateBundle() {
       const forbidden = [...this.getModuleIds()].filter(id => id.startsWith(resolve(root, "src") + "/") && !id.startsWith(resolve(root, "src/feedback") + "/"));

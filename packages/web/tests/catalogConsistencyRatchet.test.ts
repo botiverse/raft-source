@@ -81,22 +81,46 @@ const KNOWN_DRIFT: ReadonlyArray<readonly [string, readonly string[]]> = [
   // machine BULK actions by ruling — 重新启动/完全重置并重启 (agent dialog) vs
   // 重启/完整重置并重启 (machine list bulk actions). Ruled-permanent.
   ["Restart", ["重启", "重新启动"]],
-  ["Full Reset & Restart", ["完全重置并重启", "完整重置并重启"]],
-  ["Clear All", ["清空选择", "清除筛选"]],
+  // 2026-10-20, #triage:cf541187 (task #35 follow-up): xxchan asked to shorten
+  // "Save Message" to "Save"; Tenny ruled the two senses distinct (bookmark
+  // 收藏, the Saved list, vs form 保存) under this table's distinct-sense rule.
+  ["Save", ["保存", "收藏"]],
+  ["Full reset & restart", ["完全重置并重启", "完整重置并重启"]],
+  // 2026-11-05, #proj-raft-ui:10ce032d (sentence case, #12979): thirteen pairs of
+  // English strings that differed only in case ("Add Another" / "Add another")
+  // collided once both became sentence case. Ruled by @Hasaki (zh-cn copy owner,
+  // asked by @Jasper in place of @AngLee, who is not on this server): eleven were
+  // one sense and converged; "Clear all" in the Computer agent list clears the
+  // agent selection (the toggle beside Select all), so its English became
+  // "Clear selection", which is what zh-cn/es/pt-br/ja already said.
+  // "From" stays different: the search filter names the message's SENDER (发送者,
+  // matching search.fromWithName 「发送者：{name}」), while the profile and device
+  // login rows name where someone or something comes FROM (来自: a source server,
+  // a device). ja/ko/zh-tw make the same split (送信者 / 보낸 사람 / 傳送者).
   ["From", ["发送者", "来自"]],
   // @Cat 2026-09-24, #proj-uiux:9c7fb599 bfe8f8b0: externalIdentity.kind.human
   // is a participant TYPE (人类), not a server member. composer.actorType.human
   // and search.badgeHuman refer to MEMBERS (人类成员). Keep English Human in
   // both contexts; adding "member" would break the sibling Agent/Computer labels.
   ["Human", ["人类", "人类成员"]],
+  // @cindyz 2026-10-29, #wg-announcement:b1994a43 205120c6: the sidebar
+  // announcement stack's button reads "Next" in English. It moves to the next
+  // announcement (下一条), a distinct sense from a wizard's next step (下一步).
+  ["Next", ["下一条", "下一步"]],
   ["Open", ["开放", "打开"]],
   ["Private", ["私密", "私有"]],
   ["Read", ["已读", "读取"]],
   ["Recent", ["最新", "最近"]],
+  // #proj-workspace:#249, raised for a ruling in its PR: an Artifact comment thread reopened
+  // (重新打开, the sense of resolve/reopen) vs a RaftBench item sent back to review (重新复核).
+  ["Reopen", ["重新复核", "重新打开"]],
+  // @Hasaki 2026-11-06 (zh-cn copy owner, dm Kirby↔Hasaki 2f46160f), ruled: View Context's
+  // "Verified" means the restored context was checked word for word against what the model
+  // received (已核对), not identity verification of an email or SSO domain (已验证). ja makes
+  // the same split (照合済み). Ruled-permanent.
+  ["Verified", ["已核对", "已验证"]],
   ["Working…", ["处理中…", "工作中…"]],
   ["Workspace", ["工作区", "工作空间"]],
-  ["active", ["active", "已连接"]],
-  ["{count} new", ["{count} 条新回复", "{count} 条新消息"]],
   ["{count} selected", ["已选 {count} 个", "已选 {count} 条"]],
 ];
 

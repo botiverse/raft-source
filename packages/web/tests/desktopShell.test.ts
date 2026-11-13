@@ -1,4 +1,4 @@
-import { isElectronDesktopShell, shareableWebOrigin } from "../src/utils/desktopShell";
+import { isElectronDesktopShell, shareableWebOrigin, shareableWebUrl } from "../src/utils/desktopShell";
 
 type MutableGlobal = typeof globalThis & { window?: unknown };
 
@@ -42,5 +42,28 @@ describe("shareableWebOrigin", () => {
     (globalThis as MutableGlobal).window = { raftDesktop: { isDesktop: true }, location: { origin: "app://raft" } };
     // desktop defaults to isElectronDesktopShell() (reads the global) -> true.
     expect(shareableWebOrigin(undefined, undefined, "https://app.raft.build")).toBe("https://app.raft.build");
+  });
+});
+
+describe("shareableWebUrl", () => {
+  it("keeps the page's path, query and hash on the compiled frontend origin in the desktop shell", () => {
+    // The bug: Upgrade to Pro sent app://raft/... as the Stripe return URL and
+    // the server's redirect check answered "Invalid redirect URL".
+    expect(shareableWebUrl(true, "app://raft/s/acme/settings/plan?tab=billing#seats", "https://app.raft.build"))
+      .toBe("https://app.raft.build/s/acme/settings/plan?tab=billing#seats");
+  });
+
+  it("returns the page URL unchanged on the Web app", () => {
+    expect(shareableWebUrl(false, "https://raft.build/s/acme/settings/plan", "https://app.raft.build"))
+      .toBe("https://raft.build/s/acme/settings/plan");
+  });
+
+  it("does not fabricate an origin when the desktop build has no VITE_FRONTEND_URL", () => {
+    expect(shareableWebUrl(true, "app://raft/s/acme", "")).toBe("app://raft/s/acme");
+  });
+
+  it("wires the real host by default", () => {
+    (globalThis as MutableGlobal).window = { raftDesktop: { isDesktop: true }, location: { href: "app://raft/s/acme/settings/plan" } };
+    expect(shareableWebUrl(undefined, undefined, "https://app.raft.build")).toBe("https://app.raft.build/s/acme/settings/plan");
   });
 });

@@ -2,7 +2,7 @@
  * TEST-ONLY reference for the sidebar unread view.
  *
  * GET /channels/unread (bare and summary) and GET /servers/unread-summary read ONE
- * source: rw_conversation_unread_v3 (plus, for the summary, a request-time public
+ * source: rw_conversation_unread_v4 (plus, for the summary, a request-time public
  * channel `hasNew` arm), through channelService's conversation unread reader. CI
  * has no RisingWave, so this derives the same rows from Postgres with the SAME
  * semantics as the view; src/test/setup/risingWaveReadReference.ts installs it for
@@ -11,16 +11,17 @@
  *
  * This is a stand-in for the RW view, not a product path. KEEP IT IN SYNC with the
  * SQL it mirrors:
- *   - infra/risingwave/sql/076-cursor-decouple-consumers.sql
- *                                                rw_conversation_unread_v3
- *   - infra/risingwave/sql/067-mention-v6.sql    rw_inbox_mention_v6
+ *   - infra/risingwave/sql/078-task-conversations.sql
+ *                                                rw_conversation_unread_v4, rw_inbox_mention_v7,
+ *                                                rw_conversation_parent_v1
  *   - infra/risingwave/sql/075-inbox-cursor-decouple.sql
- *                                                rw_inbox_normal_v5, rw_inbox_muted_full_v2
+ *                                                rw_inbox_normal_v5
+ *   - infra/risingwave/sql/066-conversation-unread-v1.sql
+ *                                                rw_inbox_muted_full_v1
  *   - infra/risingwave/sql/063-chain-v5.sql      rw_muted_subs_v1
  *   - infra/risingwave/sql/063-unified-inbox-chain.sql
- *                                                rw_message_target_v3, rw_target_latest_v4,
- *                                                rw_target_eligible_v1, rw_receiver_cursors_v1,
- *                                                rw_subs_v2
+ *                                                rw_message_target_v3, rw_receiver_cursors_v1,
+ *                                                rw_subs_v2, rw_target_latest_v4, rw_target_eligible_v1
  *   - infra/risingwave/sql/061-inbox-derivation-chain.sql
  *                                                rw_thread_parent_v3, rw_message_preview_v1
  *   - channelService readConversationUnreadSummaryRows / readSidebarUnreadTotals
@@ -35,19 +36,26 @@
  *     user's own sends, system messages whose causal actor is the user (a NULL
  *     causal actor never excludes), and the noise subtypes
  *     channel.self_unfollow_thread / task.deleted_summary.
+ *   - task conversations (channels.type = 'task') are sub-conversations like
+ *     threads (rw_conversation_parent_v1): reached through a follow, parent = the
+ *     task's channel (channels.parent_channel_id); their rows say kind 'task'
+ *     and their unread counts chat messages only (the reply basis: no
+ *     lifecycle lines; rw_task_conversation_unread_v1).
  *   - mention arm (v6): message_mentions for the user (any admission flag). A
  *     mention stored under a joint local projection id (the SENDER's projection) is
  *     first mapped to its canonical storage, then fanned out to every local target.
  *     Visible through membership, parent membership, an active follow, or
  *     notified_at -- the notified outsider admission only for a non-projected target;
- *     mention_unread counts seq > cursor, total_mentions all of them. A row that
+ *     mention_unread counts seq > cursor among the mentions that notify
+ *     (notifiable_at_send, or notified_at set later; 078), total_mentions all of
+ *     them. A row that
  *     exists only through this arm has subscribed = false.
  *   - free-plan eligibility is per target: a free-plan target whose latest message
  *     is older than 30 days has no row at all (both arms).
  *   - joint projections: target_id is the LOCAL projection; messages and mentions
  *     are counted from the canonical storage channel.
- *   - a thread row exists only while followed, not done, under a live (not deleted,
- *     not archived) parent the user can see: public, or a member of it.
+ *   - a thread / task conversation row exists only while followed, not done, under a
+ *     live (not deleted, not archived) parent the user can see: public, or a member.
  *   - public arm (reader, not view): the server's live public ('channel') channels
  *     the user has not joined, eligible, whose latest seq is past the user's cursor.
  */
@@ -68,7 +76,7 @@ const NOISE_SUBTYPES = sql`('channel.self_unfollow_thread', 'task.deleted_summar
 const CANONICAL_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 /**
- * Every rw_conversation_unread_v3 row of one user, restricted to the given servers.
+ * Every rw_conversation_unread_v4 row of one user, restricted to the given servers.
  *
  * Cost is bounded by the user's own targets (memberships, follows, mentions in the
  * given servers), never by the size of messages/channels: the view's per-target
@@ -134,10 +142,12 @@ export async function referenceConversationUnreadViewRows(
       LEFT JOIN user_channel_inbox_states AS st
         ON st.user_id = ch.user_id AND st.channel_id = c.id
       WHERE ch.user_id = ${user} AND c.server_id::text = ANY(${servers})
-    ), mention_storage AS (         -- rw_inbox_mention_v6: a sender-projection id -> canonical storage
-      -- Only idx_message_mentions_inbox columns; notified_at is read per row below,
+    ), mention_storage AS (         -- rw_inbox_mention_v7: a sender-projection id -> canonical storage
+      -- idx_message_mentions_inbox columns plus whether the mention notifies (the
+      -- mention_unread filter); notified_at as an admission is read per row below,
       -- and only where membership/follow visibility does not already admit the row.
-      SELECT m.channel_id, m.message_seq, COALESCE(pj.canonical_channel_id, m.channel_id) AS storage_id
+      SELECT m.channel_id, m.message_seq, COALESCE(pj.canonical_channel_id, m.channel_id) AS storage_id,
+             (m.notifiable_at_send OR m.notified_at IS NOT NULL) AS notifies
       FROM message_mentions AS m
       LEFT JOIN proj AS pj ON pj.local_channel_id = m.channel_id
       WHERE m.target_type = 'user' AND m.target_id = ${user}
@@ -185,9 +195,13 @@ export async function referenceConversationUnreadViewRows(
                     THEN (SELECT MAX(m.created_at) FROM messages AS m WHERE m.channel_id = t.storage_id) END AS latest_at
       ) AS l
     ), target_unread AS (           -- the view's unread count, for subscribed targets only
+      -- A task conversation's is on the reply basis (rw_task_conversation_unread_v1):
+      -- chat messages only, no lifecycle lines.
       SELECT tl.target_id,
              (SELECT COUNT(*) FROM messages AS m
-              WHERE m.channel_id = tl.storage_id AND ${unreadPredicate}) AS unread
+              WHERE m.channel_id = tl.storage_id AND ${unreadPredicate}
+                AND (m.message_type = 'chat'
+                     OR NOT EXISTS (SELECT 1 FROM channels AS tc WHERE tc.id = tl.target_id AND tc.type = 'task'))) AS unread
       FROM target_latest AS tl
       LEFT JOIN receiver_cursors AS rc ON rc.channel_id = tl.target_id
       WHERE tl.eligible
@@ -201,7 +215,7 @@ export async function referenceConversationUnreadViewRows(
       LEFT JOIN target_unread AS tu ON tu.target_id = s.target_id
       LEFT JOIN receiver_cursors AS rc ON rc.channel_id = s.target_id
       GROUP BY s.kind, s.target_id, s.server_id, s.done_at, rc.last_read_seq
-    ), muted_full AS (              -- rw_inbox_muted_full_v2
+    ), muted_full AS (              -- rw_inbox_muted_full_v1
       SELECT s.kind, s.target_id, s.server_id, s.done_at,
              MAX(g.latest_seq) AS latest_seq,
              CAST(SUM(COALESCE(tu.unread, 0)) AS BIGINT) AS unread_count
@@ -210,7 +224,7 @@ export async function referenceConversationUnreadViewRows(
       LEFT JOIN target_unread AS tu ON tu.target_id = s.target_id
       LEFT JOIN receiver_cursors AS rc ON rc.channel_id = s.target_id
       GROUP BY s.kind, s.target_id, s.server_id, s.done_at, rc.last_read_seq
-    ), thread_parent AS (           -- rw_thread_parent_v3, for candidate threads
+    ), thread_parent AS (           -- rw_conversation_parent_v1 (rw_thread_parent_v3 + task conversations), for candidates
       SELECT c.id AS thread_channel_id, m.channel_id AS parent_channel_id
       FROM channels AS c
       JOIN messages AS m ON m.id = c.parent_message_id
@@ -226,7 +240,12 @@ export async function referenceConversationUnreadViewRows(
       LEFT JOIN proj AS pl ON pl.canonical_channel_id = m.channel_id AND pl.server_id = lt.server_id
       JOIN channels AS pc2 ON pc2.id = COALESCE(pl.local_channel_id, m.channel_id)
       WHERE lt.type = 'thread' AND lt.id IN (SELECT target_id FROM cand)
-    ), mention_vis AS (             -- rw_inbox_mention_v6's per-target joins, evaluated once per target
+      UNION ALL
+      SELECT tc.id, tc.parent_channel_id
+      FROM channels AS tc
+      JOIN channels AS tpc ON tpc.id = tc.parent_channel_id
+      WHERE tc.type = 'task' AND tc.id IN (SELECT target_id FROM cand)
+    ), mention_vis AS (             -- rw_inbox_mention_v7's per-target joins, evaluated once per target
       -- channel_humans (channel_id, user_id) and thread_follows (thread, type, follower)
       -- are unique, so each EXISTS stands for the view's 0-or-1-row LEFT JOIN.
       SELECT map.storage_id, map.target_id, map.projected, c.type, c.server_id,
@@ -243,16 +262,16 @@ export async function referenceConversationUnreadViewRows(
       JOIN channels AS c ON c.id = map.target_id AND c.deleted_at IS NULL AND c.archived_at IS NULL
       LEFT JOIN thread_parent AS tp ON tp.thread_channel_id = map.target_id
       WHERE c.server_id::text = ANY(${servers})
-    ), mention AS (                 -- rw_inbox_mention_v6 (user arm)
-      SELECT CASE WHEN v.type = 'thread' THEN 'thread' WHEN v.type = 'dm' THEN 'dm' ELSE 'channel' END AS kind,
+    ), mention AS (                 -- rw_inbox_mention_v7 (user arm)
+      SELECT CASE WHEN v.type IN ('thread', 'task') THEN 'thread' WHEN v.type = 'dm' THEN 'dm' ELSE 'channel' END AS kind,
              v.target_id, v.server_id,
-             COUNT(*) FILTER (WHERE mm.message_seq > COALESCE(rc.last_read_seq, 0)) AS mention_unread,
+             COUNT(*) FILTER (WHERE mm.message_seq > COALESCE(rc.last_read_seq, 0) AND mm.notifies) AS mention_unread,
              COUNT(*) AS total_mentions
       FROM mention_storage AS mm
       JOIN mention_vis AS v ON v.storage_id = mm.storage_id
       LEFT JOIN receiver_cursors AS rc ON rc.channel_id = v.target_id
-      WHERE (v.type <> 'thread' AND v.member)
-         OR (v.type = 'thread' AND (v.parent_member OR v.following))
+      WHERE (v.type NOT IN ('thread', 'task') AND v.member)
+         OR (v.type IN ('thread', 'task') AND (v.parent_member OR v.following))
          -- (target, channel_id, message_seq) is one mention row: seq identifies the
          -- message and (message_id, target_type, target_id) is unique.
          OR (NOT v.projected AND EXISTS (
@@ -278,7 +297,9 @@ export async function referenceConversationUnreadViewRows(
       FROM n
       FULL JOIN mention AS mn ON mn.target_id = n.target_id
     )
-    SELECT u.server_id::text AS server_id, u.target_id::text AS target_id, u.kind, u.subscribed,
+    SELECT u.server_id::text AS server_id, u.target_id::text AS target_id,
+           CASE WHEN u.kind = 'thread' AND uc_target.type = 'task' THEN 'task' ELSE u.kind END AS kind,
+           u.subscribed,
            u.unread_count, u.mention_unread, u.total_mentions,
            COALESCE(u.latest_seq, tl.latest_seq)::text AS latest_seq,
            tl.latest_message_id::text AS latest_message_id,
@@ -286,6 +307,7 @@ export async function referenceConversationUnreadViewRows(
            CAST(uc.last_read_seq AS BIGINT)::text AS last_read_seq,
            uc.read_state_version
     FROM u
+    LEFT JOIN channels AS uc_target ON uc_target.id = u.target_id
     LEFT JOIN target_latest AS tl ON tl.target_id = u.target_id
     LEFT JOIN user_channel_read_cursors AS uc ON uc.user_id = ${user} AND uc.channel_id = u.target_id
     LEFT JOIN thread_parent AS tp ON tp.thread_channel_id = u.target_id AND u.kind = 'thread'
@@ -376,7 +398,7 @@ export const referenceConversationUnreadSource: ConversationUnreadSource = {
   async sidebarTotals({ serverIds, userId }: SidebarUnreadTotalsQuery) {
     const totals = new Map<string, number>();
     for (const row of await referenceConversationUnreadViewRows(userId, serverIds)) {
-      if (!row.subscribed || row.kind === "thread" || row.unreadCount <= 0) continue;
+      if (!row.subscribed || row.kind === "thread" || row.kind === "task" || row.unreadCount <= 0) continue;
       totals.set(row.serverId, (totals.get(row.serverId) ?? 0) + row.unreadCount);
     }
     return [...totals].map(([serverId, unreadCount]) => ({ serverId, unreadCount }));

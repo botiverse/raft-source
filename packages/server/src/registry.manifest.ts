@@ -41,6 +41,8 @@ export interface BuiltInMachineMessageContext {
     status?: "ok" | "error",
   ): void;
   emit(event: string, payload: unknown): void;
+  /** The Socket.IO server, for user-scoped side effects (null before it is attached). */
+  io: import("socket.io").Server | null;
 }
 
 export interface BuiltInMachineMessageDispatch {

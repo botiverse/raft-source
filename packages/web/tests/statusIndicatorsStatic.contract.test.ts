@@ -8,8 +8,8 @@
  * 144 fps / 80% GPU main thread; only the dots paused → 2 fps / 3%.
  * Raft Design System: status lights never animate, so the allowlist of
  * bounded waits that may pulse is empty (AddMachineDialog's "waiting for
- * connection" banner left it with a static pixel). Add a site only with a
- * product decision.
+ * connection" banner left it; since raft-ui 0.22 that banner leads with a
+ * Spinner, not a status light). Add a site only with a product decision.
  */
 import assert from "node:assert/strict";
 import { readFileSync, readdirSync, statSync } from "node:fs";
@@ -33,12 +33,6 @@ test("every activity maps to one of the five fixed presence lights (never an ani
   for (const activity of AGENT_ACTIVITIES) {
     assert.ok(lights.has(activityPresence(activity)), activity);
   }
-});
-
-test("StatusDot has no pulse prop", () => {
-  const dot = readFileSync(join(src, "components/ui/StatusDot.tsx"), "utf8");
-  assert.doesNotMatch(dot, /\bpulse\?\s*:/);
-  assert.doesNotMatch(dot, /animate-pulse/);
 });
 
 test("no status indicator is rendered with `pulse` outside the explicit allowlist", () => {

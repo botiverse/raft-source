@@ -1,20 +1,52 @@
 import { AgentProxyBindError, RuntimeExecutableNotFoundError, RuntimeModelNotFoundError } from "./spawnFailureErrors";
+import { RuntimeAuthHost } from "./runtimeAuth/runtimeAuthHost";
+import type { CredentialDiskWatch } from "./credentialDiskWatch";
+import type { RuntimeLimitResetRedeemer, RuntimeLimitResetsReader } from "./runtimeAccountUsage/limitReset";
+import { cursorSdkAvailable } from "./oarLoader";
+import { type RuntimeModelSourceOutcome, SERVER_CAPABILITY_RUNTIME_AUTH_V1, SERVER_CAPABILITY_RUNTIME_AUTH_V2, SERVER_CAPABILITY_RUNTIME_CREDENTIALS_CHANGED_V1, runtimeAuthLogoutRuntimesOfComputer, runtimeAuthRuntimesOfComputer, type RuntimeAuthRuntime, type RuntimeAuthStatus, type RuntimeAuthLoginId, type RuntimeAuthProviderConnectInput, type AgentMigrationTransportLeaseMessage } from "@botiverse/raft-shared";
 import assert from "node:assert/strict";
 import { createHash, randomBytes } from "node:crypto";
 import { existsSync, readFileSync, rmSync } from "node:fs";
 import { EventEmitter } from "node:events";
-import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { execFileSync, type ChildProcess } from "node:child_process";
 import { asAxSurfaceText, type AxSurfaceText,
   AGENT_MIGRATION_CAPABILITY,
+  AGENT_MIGRATION_TARGET_IGNORE_SOURCES_CAPABILITY,
+  AGENT_MIGRATION_SOURCE_USER_IGNORE_CAPABILITY,
+  AGENT_MIGRATION_SOURCE_DRAIN_CAPABILITY,
+  AGENT_MIGRATION_AGENT_RETRY_CAPABILITY,
   AGENT_MIGRATION_RESUMABLE_PROTOCOL,
+  COMPUTER_CAPABILITY_SERVICE_IPC_UNREACHABLE,
   COMPUTER_CAPABILITY_SUPERVISOR_MUTATIONS,
+  COMPUTER_UPGRADE_DRAIN_MAX_DEADLINE_MS,
+  DAEMON_CAPABILITY_COMPUTER_UPGRADE_DRAIN_V1,
   DAEMON_CAPABILITY_RUNTIME_OUTCOME_V1,
+  DAEMON_CAPABILITY_AGENT_CONTEXT_VIEW_V0,
+  DAEMON_CAPABILITY_AGENT_CONTEXT_SEARCH_V0,
+  DAEMON_CAPABILITY_AGENT_CONTEXT_VIEW_CODEX_ROOT_V1,
+  asAgentContextViewRequestId,
+  DAEMON_CAPABILITY_RUNTIME_HOST_OAR,
+  DAEMON_CAPABILITY_RUNTIME_HOST_OAR_CODEX,
+  DAEMON_CAPABILITY_RUNTIME_HOST_OAR_CURSOR,
+  DAEMON_CAPABILITY_RUNNER_CREDENTIAL_RECONCILE_V1,
+  DAEMON_CAPABILITY_AGENT_CONFIG_PUSH,
+  DAEMON_CAPABILITY_MODEL_LIMITS_REPORT_V1,
   SERVER_CAPABILITY_RUNTIME_OUTCOME_ACK_V1,
   SERVER_CAPABILITY_START_SPAWN_ERROR_V1,
+  SERVER_CAPABILITY_MIGRATION_USER_IGNORE_RECEIPT_V1,
+  SERVER_CAPABILITY_MIGRATION_SOURCE_DRAIN_PROGRESS_V1,
+  SERVER_CAPABILITY_RUNTIME_ACCOUNT_USAGE_LIMIT_RESETS_V1,
+  SERVER_CAPABILITY_RUNTIME_ACCOUNT_USAGE_WINDOW_SCOPE_V1,
+  SERVER_CAPABILITY_RUNTIME_ACCOUNT_USAGE_WINDOW_SCOPE_V2,
+  DAEMON_CAPABILITY_RUNTIME_LIMIT_RESET,
+  DAEMON_CAPABILITY_RUNTIME_ACCOUNT_USAGE_ANTIGRAVITY,
+  DAEMON_CAPABILITY_RUNTIME_LIMIT_RESET_CLAUDE_KINDS,
+  type RuntimeLimitResetKind,
+  type RuntimeLimitResetResult,
   createTraceScopeTracer,
   eventsForSpan,
   formatTraceparent,
@@ -24,6 +56,7 @@ import { asAxSurfaceText, type AxSurfaceText,
   type ComputerLifecycleExecutionAck,
   type MachineToServerMessage,
   type RuntimeAccountUsageProvider,
+  type RuntimeLimitResetIdempotencyKey,
   type RuntimeAccountUsageSnapshot,
   type ServerToMachineMessage,
   AGENT_MIGRATION_COMMIT_MARKER_PATH,
@@ -35,6 +68,9 @@ import {
 } from "@botiverse/raft-shared/src/apps/cleaner/configProtocol";
 import { REMINDER_FIRE_REQUEST_CAPABILITY } from "@botiverse/raft-shared/src/apps/reminder/protocol";
 import { AgentProcessManager } from "./agentProcessManager";
+import { providerLimitCredentialKey } from "./providerLimitLedger";
+import { spawn as spawnProcess } from "node:child_process";
+import { RuntimeProcessLedger, RUNTIME_PROCESS_LEDGER_FILE } from "./drivers/runtimeProcessLedger";
 import { lookupCommandOnPath } from "./drivers/probe";
 import { OpenCodeDriver } from "./drivers/opencode";
 import { isRuntimeModelDetectionLookupReason } from "@botiverse/raft-shared";
@@ -44,27 +80,57 @@ import type { AgentAppInboxStore } from "./agentAppInbox";
 import { AGENT_MIGRATION_WORKSPACE_BACKUP_DIRECTORY } from "./agentMigrationWorkspaceArchive";
 import {
   DAEMON_CORE_TRACE_ATTR_CONTRACTS,
-  DaemonCore,
+  DaemonCore as RealDaemonCore,
+  type ComputerControlContext,
+  type DaemonCoreOptions,
   selectWakeDeliveryIndex,
   detectRuntimes,
   migrationTransferFailureCode,
   migrationTransferFailureDetailCode,
+  unsafeAgentIdOf,
+  withConfigRevision,
+  pollMigrationResumableControl,
   retryMigrationTargetStep,
   type MigrationTargetImportView,
   parseDaemonCliArgs,
   readDaemonVersion,
   resolveRaftCliPath,
+  runtimeModelCatalogFrame,
   sanitizeCatalogModels,
   subscribeDaemonLogs,
 } from "./core";
 import { streamAgentMigrationResumableBundle, validateAgentMigrationControlManifest } from "./agentMigrationResumableBundle";
 import { getDaemonMachineLockId } from "./machineLock";
+import { ProcJobManager } from "./procJobs";
 import type { RuntimeDriver, ParsedEvent, SpawnContext, SpawnResult } from "./drivers/index";
 import type { ConnectionOptions, WebSocketLike } from "./connection";
 import { FakeClock } from "./testing/fakeClock";
 import { traceRows } from "./testing/traceRows";
 import { hostIdHashForServer, readHardwareId } from "./hostIdentity";
 import { makeDeterministicTracer } from "./testing/deterministicTracer";
+
+/**
+ * The daemon under test never runs real runtime detection. Detection starts
+ * CLI children (since #11103 a detected Claude Code is asked for its models
+ * through OAR), which can outlive a test on a host where a runtime is
+ * installed; a test that intercepts process.kill then catches their cleanup
+ * and the child leaks. A test about detection passes its own
+ * `runtimeDetector` or `runtimeDetectionRound` (core.runtimeDetection.test.ts
+ * covers the real round). A test whose own detector lists a real runtime id
+ * still gets that runtime's model listing after ready.
+ */
+class DaemonCore extends RealDaemonCore {
+  constructor(options: DaemonCoreOptions) {
+    super({
+      runtimeDetector: () => ({ ids: [], versions: {} }),
+      runtimeDetectionRound: () => ({
+        result: Promise.resolve({ status: "complete", detection: { ids: [], versions: {} }, durationMs: 0 }),
+        cancel: () => {},
+      }),
+      ...options,
+    });
+  }
+}
 
 
 /**
@@ -132,6 +198,11 @@ class FakeChildProcess extends EventEmitter {
   }
 }
 
+const TEST_MODEL_LIMITS = {
+  contextWindow: { value: 200_000, source: "raft_default" },
+  maxTokens: { value: 8192, source: "raft_default" },
+} as const;
+
 class FakeDriver implements RuntimeDriver {
   readonly id = "codex";
   readonly lifecycle: RuntimeDriver["lifecycle"];
@@ -139,7 +210,7 @@ class FakeDriver implements RuntimeDriver {
     chat: "slock_cli",
     runtimeControl: "none",
   } as const;
-  readonly session = { recovery: "resume_or_fresh" } as const;
+  readonly session = { recovery: "resume_or_fresh", compaction: "reported", compactionFailure: "does_not_stick" } as const;
   readonly model = { detectedModelsVerifiedAs: "suggestion_only" } as const;
   readonly supportsStdinNotification: boolean;
   readonly busyDeliveryMode = "none" as const;
@@ -166,6 +237,11 @@ class FakeDriver implements RuntimeDriver {
   parseLine(line: string): ParsedEvent[] {
     if (line === "turn_end") return [{ kind: "turn_end", sessionId: "session-1" }];
     if (line === "text") return [{ kind: "text", text: "model output" }];
+    // task #1357 item 1: as the Pi runtime session does, the revision of the config the spawn was built from.
+    if (line === "model_limits") {
+      const configRevision = this.spawnCalls.at(-1)?.config.configRevision;
+      return [{ kind: "model_limits", sessionId: "session-1", configRevision: typeof configRevision === "number" ? configRevision : null, modelLimits: TEST_MODEL_LIMITS }];
+    }
     return [];
   }
 
@@ -550,6 +626,285 @@ test("DaemonCore refreshes one runtime usage provider and emits only the sanitiz
   }
 });
 
+describe("DaemonCore limit reset", () => {
+  const KEY = "0f6b1f8e-5c3a-4c55-9c1e-6a7b8c9d0e1f" as RuntimeLimitResetIdempotencyKey;
+  const usage = (resets: number): RuntimeAccountUsageSnapshot => ({
+    protocolVersion: 2,
+    provider: "codex",
+    collectedAt: "2026-11-07T10:00:00.000Z",
+    staleAfter: "2026-11-07T10:30:00.000Z",
+    collectorVersion: "test",
+    accounts: [{ accountKey: "a".repeat(64), maskedLabel: "tea****r@example.com", health: "rate_limited", limitResetsAvailable: resets, windows: [] }],
+  });
+
+  async function withCore(
+    options: {
+      serverCapabilities: string[];
+      redeem?: (provider: RuntimeAccountUsageProvider, key: string) => Promise<RuntimeLimitResetResult>;
+      read?: () => Promise<RuntimeAccountUsageSnapshot>;
+      redeemer?: RuntimeLimitResetRedeemer;
+      reader?: RuntimeLimitResetsReader;
+      platform?: NodeJS.Platform;
+    },
+    run: (input: { socket: FakeWebSocket; events: string[]; traceRows: () => Array<{ name: string; attrs?: Record<string, unknown> }> }) => Promise<void>,
+  ) {
+    const dataDir = await mkdtemp(path.join(os.tmpdir(), "slock-daemon-limit-reset-test-"));
+    const sockets: FakeWebSocket[] = [];
+    const events: string[] = [];
+    const { sink, tracer, traceId } = makeDeterministicTracer();
+    const core = new DaemonCore({
+      serverUrl: "https://daemon.example.com",
+      apiKey: "sk_machine_test",
+      dataDir,
+      tracer,
+      runtimeDetector: () => ({ ids: [], versions: {} }),
+      runtimeAccountUsageCollector: async (provider) => {
+        events.push(`read:${provider}`);
+        return options.read ? options.read() : usage(1);
+      },
+      ...(options.redeem ? {
+        runtimeLimitResetRedeemer: async (provider: RuntimeAccountUsageProvider, key: string) => {
+          events.push(`redeem:${provider}:${key}`);
+          return options.redeem!(provider, key);
+        },
+      } : {}),
+      ...(options.redeemer ? { runtimeLimitResetRedeemer: options.redeemer } : {}),
+      ...(options.reader ? { runtimeLimitResetsReader: options.reader } : {}),
+      ...(options.platform ? { platform: options.platform } : {}),
+      connectionOptions: { wsFactory: () => { const socket = new FakeWebSocket(); sockets.push(socket); return socket; } },
+    });
+    try {
+      core.start();
+      const socket = sockets[0]!;
+      socket.emitOpen({ machineContext: false });
+      socket.emitServerMessage({ type: "machine:context", machineId: "machine-test", serverId: "server-test", capabilities: options.serverCapabilities });
+      await run({ socket, events, traceRows: () => traceRows(sink, traceId) as Array<{ name: string; attrs?: Record<string, unknown> }> });
+    } finally {
+      await core.stop();
+      await rm(dataDir, { recursive: true, force: true });
+    }
+  }
+
+  const results = (socket: FakeWebSocket) => socket.sent.filter((message): message is Extract<MachineToServerMessage, { type: "machine:runtime_account_usage:limit_reset:result" }> =>
+    (message as { type?: string }).type === "machine:runtime_account_usage:limit_reset:result");
+
+  test("advertises the capability, redeems with the server's key, then reads usage and answers with both", async () => {
+    await withCore({ serverCapabilities: [SERVER_CAPABILITY_RUNTIME_ACCOUNT_USAGE_LIMIT_RESETS_V1], redeem: async () => ({ kind: "reset" }) }, async ({ socket, events, traceRows }) => {
+      await waitFor(() => socket.sent.some((message) => (message as { type?: string }).type === "ready"), "ready");
+      const ready = socket.sent.find((message) => (message as { type?: string }).type === "ready") as { capabilities?: string[] };
+      assert.ok(ready.capabilities?.includes(DAEMON_CAPABILITY_RUNTIME_LIMIT_RESET));
+      assert.ok(ready.capabilities?.includes(DAEMON_CAPABILITY_RUNTIME_ACCOUNT_USAGE_ANTIGRAVITY), "its OAR reads Antigravity's usage");
+
+      socket.emitServerMessage({ type: "machine:runtime_account_usage:limit_reset:redeem", requestId: "redeem-1", provider: "codex", idempotencyKey: KEY });
+      await waitFor(() => results(socket).length === 1, "limit reset result");
+      assert.deepEqual(events, [`redeem:codex:${KEY}`, "read:codex"], "the key as given, and usage read after the redeem");
+      assert.deepEqual(results(socket)[0], { type: "machine:runtime_account_usage:limit_reset:result", requestId: "redeem-1", result: { kind: "reset" }, snapshot: usage(1) });
+      const trace = traceRows().find((row) => row.name === "daemon.runtime_account_usage.limit_reset");
+      assert.equal(trace?.attrs?.outcome, "reset");
+      assert.equal(trace?.attrs?.snapshot_sent, true);
+      assert.ok(!JSON.stringify(traceRows()).includes(KEY), "the key is never traced");
+    });
+  });
+
+  test("a Claude redeem carries the kind clicked to the redeemer; a bad kind is dropped; the Claude capability is advertised on Linux", async () => {
+    const asked: unknown[] = [];
+    const redeemer: RuntimeLimitResetRedeemer = async (provider, idempotencyKey, kind, observe) => {
+      asked.push({ provider, idempotencyKey, kind });
+      observe?.({ oarOutcome: "not_attempted:busy" });
+      return { kind: "unsupported", reason: "not_attempted" };
+    };
+    await withCore({ serverCapabilities: [SERVER_CAPABILITY_RUNTIME_ACCOUNT_USAGE_LIMIT_RESETS_V1], redeemer, platform: "linux" }, async ({ socket, traceRows }) => {
+      await waitFor(() => socket.sent.some((message) => (message as { type?: string }).type === "ready"), "ready");
+      const ready = socket.sent.find((message) => (message as { type?: string }).type === "ready") as { capabilities?: string[] };
+      assert.ok(ready.capabilities?.includes(DAEMON_CAPABILITY_RUNTIME_LIMIT_RESET_CLAUDE_KINDS), "OAR drives Claude Code on Linux, whatever its version");
+
+      socket.emitServerMessage({ type: "machine:runtime_account_usage:limit_reset:redeem", requestId: "redeem-c1", provider: "claude", idempotencyKey: KEY, kind: "fable" });
+      await waitFor(() => results(socket).length === 1, "limit reset result");
+      assert.deepEqual(asked, [{ provider: "claude", idempotencyKey: KEY, kind: "fable" }]);
+      assert.deepEqual(results(socket)[0]?.result, { kind: "unsupported", reason: "not_attempted" });
+      const trace = traceRows().find((row) => row.name === "daemon.runtime_account_usage.limit_reset");
+      assert.deepEqual(
+        { provider: trace?.attrs?.provider, outcome: trace?.attrs?.outcome, reason: trace?.attrs?.reason, reset_kind: trace?.attrs?.reset_kind, oar_outcome: trace?.attrs?.oar_outcome },
+        { provider: "claude", outcome: "unsupported", reason: "not_attempted", reset_kind: "fable", oar_outcome: "not_attempted:busy" },
+      );
+
+      socket.emitServerMessage({ type: "machine:runtime_account_usage:limit_reset:redeem", requestId: "redeem-c3", provider: "claude", idempotencyKey: KEY, kind: "monthly" as RuntimeLimitResetKind });
+      await waitFor(() => traceRows().some((row) => row.attrs?.outcome === "message_dropped"), "dropped message traced");
+      assert.equal(asked.length, 1);
+      assert.equal(results(socket).length, 1);
+    });
+  });
+
+  test("on macOS the Claude capability is not advertised: OAR cannot drive Claude Code there, so the card keeps offering nothing", async () => {
+    await withCore({ serverCapabilities: [], platform: "darwin" }, async ({ socket }) => {
+      await waitFor(() => socket.sent.some((message) => (message as { type?: string }).type === "ready"), "ready");
+      const ready = socket.sent.find((message) => (message as { type?: string }).type === "ready") as { capabilities?: string[] };
+      assert.ok(ready.capabilities?.includes(DAEMON_CAPABILITY_RUNTIME_LIMIT_RESET), "Codex resets are unchanged");
+      assert.ok(!ready.capabilities?.includes(DAEMON_CAPABILITY_RUNTIME_LIMIT_RESET_CLAUDE_KINDS));
+    });
+  });
+
+  test("a read of the resets held goes to the reader with the caller's consent as given, and answers once", async () => {
+    const asked: unknown[] = [];
+    const reader: RuntimeLimitResetsReader = async (provider, input, observe) => {
+      asked.push(input);
+      if (provider !== "claude") return { kind: "unsupported", reason: "capability_unavailable" };
+      observe?.({ oarOutcome: "inspected", claudeVersion: "2.1.322" });
+      return { kind: "read", resets: [{ kind: "five_hour", state: "not_checked" }, { kind: "weekly", state: "available", resetsLeft: 1, expiresText: "Nov 16, 4:59pm" }, { kind: "fable", state: "none" }, { kind: "full", state: "unknown" }] };
+    };
+    const reads = (socket: FakeWebSocket) => socket.sent.filter((message): message is Extract<MachineToServerMessage, { type: "machine:runtime_account_usage:limit_resets:read:result" }> =>
+      (message as { type?: string }).type === "machine:runtime_account_usage:limit_resets:read:result");
+    await withCore({ serverCapabilities: [], reader }, async ({ socket, events, traceRows }) => {
+      socket.emitServerMessage({ type: "machine:runtime_account_usage:limit_resets:read", requestId: "read-1", provider: "claude", atFiveHourLimit: false });
+      await waitFor(() => reads(socket).length === 1, "read result");
+      assert.deepEqual(asked, [{ atFiveHourLimit: false, atFiveHourLimitConsent: false, includeFiveHour: false }]);
+      assert.equal(reads(socket)[0]?.result.kind, "read");
+      assert.deepEqual(events, [], "a read spends nothing, so usage is not read again");
+      const trace = traceRows().find((row) => row.name === "daemon.runtime_account_usage.limit_reset");
+      assert.deepEqual(
+        { operation: trace?.attrs?.operation, outcome: trace?.attrs?.outcome, available_kinds: trace?.attrs?.available_kinds, unknown_kinds: trace?.attrs?.unknown_kinds, claude_version: trace?.attrs?.claude_version, oar_outcome: trace?.attrs?.oar_outcome },
+        { operation: "read", outcome: "read", available_kinds: 1, unknown_kinds: 1, claude_version: "2.1.322", oar_outcome: "inspected" },
+      );
+      assert.ok(!JSON.stringify(traceRows()).includes("Nov 16"), "what the screen said is never traced");
+
+      // A message that does not say the account is clear of its 5-hour limit is treated as at it.
+      socket.emitServerMessage({ type: "machine:runtime_account_usage:limit_resets:read", requestId: "read-2", provider: "claude", atFiveHourLimitConsent: true, includeFiveHour: true } as unknown as ServerToMachineMessage);
+      await waitFor(() => reads(socket).length === 2, "second read result");
+      assert.deepEqual(asked[1], { atFiveHourLimit: true, atFiveHourLimitConsent: true, includeFiveHour: true });
+
+      socket.emitServerMessage({ type: "machine:runtime_account_usage:limit_resets:read", requestId: "read-3", provider: "codex", atFiveHourLimit: false });
+      await waitFor(() => reads(socket).length === 3, "third read result");
+      assert.deepEqual(reads(socket)[2]?.result, { kind: "unsupported", reason: "capability_unavailable" });
+    });
+  });
+
+  test("a second redeem landing while the first one's usage read runs reads usage again on its own", async () => {
+    const SECOND = "1f6b1f8e-5c3a-4c55-9c1e-6a7b8c9d0e1f" as RuntimeLimitResetIdempotencyKey;
+    let releaseReads = () => {};
+    const readsHeld = new Promise<void>((resolve) => { releaseReads = resolve; });
+    let finishSecond = (_result: RuntimeLimitResetResult) => {};
+    const secondRedeem = new Promise<RuntimeLimitResetResult>((resolve) => { finishSecond = resolve; });
+    await withCore({
+      serverCapabilities: [SERVER_CAPABILITY_RUNTIME_ACCOUNT_USAGE_LIMIT_RESETS_V1],
+      redeem: async (_provider, key) => (key === KEY ? { kind: "reset" } : secondRedeem),
+      read: async () => { await readsHeld; return usage(1); },
+    }, async ({ socket, events }) => {
+      socket.emitServerMessage({ type: "machine:runtime_account_usage:limit_reset:redeem", requestId: "redeem-a", provider: "codex", idempotencyKey: KEY });
+      socket.emitServerMessage({ type: "machine:runtime_account_usage:limit_reset:redeem", requestId: "redeem-b", provider: "codex", idempotencyKey: SECOND });
+      await waitFor(() => events.includes("read:codex"), "first redeem's usage read started");
+      finishSecond({ kind: "reset" });
+      await waitFor(() => events.filter((event) => event === "read:codex").length === 2, "second redeem reads usage after its own redeem");
+      releaseReads();
+      await waitFor(() => results(socket).length === 2, "both results");
+    });
+  });
+
+  test("a redeem that throws is unknown, and usage is still read", async () => {
+    await withCore({ serverCapabilities: [SERVER_CAPABILITY_RUNTIME_ACCOUNT_USAGE_LIMIT_RESETS_V1], redeem: async () => { throw new Error("network"); } }, async ({ socket, events }) => {
+      socket.emitServerMessage({ type: "machine:runtime_account_usage:limit_reset:redeem", requestId: "redeem-2", provider: "codex", idempotencyKey: KEY });
+      await waitFor(() => results(socket).length === 1, "limit reset result");
+      assert.deepEqual(results(socket)[0]?.result, { kind: "unknown" });
+      assert.deepEqual(events, [`redeem:codex:${KEY}`, "read:codex"]);
+    });
+  });
+
+  test("an older server never sees limitResetsAvailable, in a refresh or after a redeem", async () => {
+    await withCore({ serverCapabilities: [], redeem: async () => ({ kind: "nothing_to_reset" }) }, async ({ socket }) => {
+      socket.emitServerMessage({ type: "machine:runtime_account_usage:limit_reset:redeem", requestId: "redeem-3", provider: "codex", idempotencyKey: KEY });
+      socket.emitServerMessage({ type: "machine:runtime_account_usage:refresh", requestId: "usage-3", provider: "codex", reason: "manual" });
+      await waitFor(() => results(socket).length === 1, "limit reset result");
+      await waitFor(() => socket.sent.some((message) => (message as { type?: string }).type === "machine:runtime_account_usage:snapshot"), "snapshot");
+      const { limitResetsAvailable: _dropped, ...stripped } = usage(1).accounts[0]!;
+      assert.deepEqual(results(socket)[0]?.snapshot?.accounts, [stripped]);
+      const refresh = socket.sent.find((message) => (message as { type?: string }).type === "machine:runtime_account_usage:snapshot") as { snapshot: RuntimeAccountUsageSnapshot };
+      assert.deepEqual(refresh.snapshot.accounts, [stripped]);
+    });
+  });
+
+  test("window scopes reach a server that reads them, and never an older one", async () => {
+    const scoped = (): RuntimeAccountUsageSnapshot => ({
+      ...usage(1),
+      provider: "claude",
+      accounts: [{
+        accountKey: "a".repeat(64),
+        health: "ok",
+        windows: [
+          { id: "w0_aaaaaaaaaaaa", label: "Current week (all models)", status: "ok", usedRatio: 0.6, scope: { kind: "account" } },
+          { id: "w1_bbbbbbbbbbbb", label: "Current week (Opus)", status: "ok", usedRatio: 0.4, scope: { kind: "model", name: "Opus" } },
+        ],
+      }],
+    });
+    const snapshotOf = (socket: FakeWebSocket) => (socket.sent.find((message) => (message as { type?: string }).type === "machine:runtime_account_usage:snapshot") as { snapshot: RuntimeAccountUsageSnapshot }).snapshot;
+    await withCore({ serverCapabilities: [SERVER_CAPABILITY_RUNTIME_ACCOUNT_USAGE_WINDOW_SCOPE_V1], read: async () => scoped() }, async ({ socket }) => {
+      socket.emitServerMessage({ type: "machine:runtime_account_usage:refresh", requestId: "usage-s1", provider: "claude", reason: "manual" });
+      await waitFor(() => socket.sent.some((message) => (message as { type?: string }).type === "machine:runtime_account_usage:snapshot"), "snapshot");
+      assert.deepEqual(snapshotOf(socket).accounts[0]!.windows.map((window) => window.scope), [{ kind: "account" }, { kind: "model", name: "Opus" }]);
+    });
+    await withCore({ serverCapabilities: [], read: async () => scoped() }, async ({ socket }) => {
+      socket.emitServerMessage({ type: "machine:runtime_account_usage:refresh", requestId: "usage-s2", provider: "claude", reason: "manual" });
+      await waitFor(() => socket.sent.some((message) => (message as { type?: string }).type === "machine:runtime_account_usage:snapshot"), "snapshot");
+      assert.ok(snapshotOf(socket).accounts[0]!.windows.every((window) => !("scope" in window)), "an older server's strict schema would refuse the snapshot");
+    });
+  });
+
+  test("a models scope (Antigravity's model groups) reaches a V2 server; a V1 server gets that window unscoped, the rest as is", async () => {
+    const grouped = (): RuntimeAccountUsageSnapshot => ({
+      ...usage(1),
+      provider: "antigravity",
+      accounts: [{
+        accountKey: "a".repeat(64),
+        health: "ok",
+        windows: [
+          { id: "w0_aaaaaaaaaaaa", label: "Gemini Models · Weekly", status: "limit_reached", usedRatio: 1, scope: { kind: "models", name: "Gemini Models" } },
+          { id: "w1_bbbbbbbbbbbb", label: "Claude and GPT models · Weekly", status: "ok", usedRatio: 0.3, scope: { kind: "models", name: "Claude and GPT models" } },
+          { id: "w2_cccccccccccc", label: "Opus", status: "ok", usedRatio: 0.4, scope: { kind: "model", name: "Opus" } },
+        ],
+      }],
+    });
+    const snapshotOf = (socket: FakeWebSocket) => (socket.sent.find((message) => (message as { type?: string }).type === "machine:runtime_account_usage:snapshot") as { snapshot: RuntimeAccountUsageSnapshot }).snapshot;
+    const scopesSentTo = async (serverCapabilities: string[]) => {
+      let scopes: unknown[] = [];
+      await withCore({ serverCapabilities, read: async () => grouped() }, async ({ socket }) => {
+        socket.emitServerMessage({ type: "machine:runtime_account_usage:refresh", requestId: "usage-g1", provider: "antigravity", reason: "manual" });
+        await waitFor(() => socket.sent.some((message) => (message as { type?: string }).type === "machine:runtime_account_usage:snapshot"), "snapshot");
+        const windows = snapshotOf(socket).accounts[0]!.windows;
+        assert.deepEqual(windows.map((window) => window.status), ["limit_reached", "ok", "ok"], "the windows themselves are unchanged");
+        scopes = windows.map((window) => ("scope" in window ? window.scope : "absent"));
+      });
+      return scopes;
+    };
+    assert.deepEqual(
+      await scopesSentTo([SERVER_CAPABILITY_RUNTIME_ACCOUNT_USAGE_WINDOW_SCOPE_V1, SERVER_CAPABILITY_RUNTIME_ACCOUNT_USAGE_WINDOW_SCOPE_V2]),
+      [{ kind: "models", name: "Gemini Models" }, { kind: "models", name: "Claude and GPT models" }, { kind: "model", name: "Opus" }],
+    );
+    assert.deepEqual(
+      await scopesSentTo([SERVER_CAPABILITY_RUNTIME_ACCOUNT_USAGE_WINDOW_SCOPE_V1]),
+      ["absent", "absent", { kind: "model", name: "Opus" }],
+      "a V1 server's strict schema would refuse the whole snapshot for a models scope",
+    );
+    assert.deepEqual(await scopesSentTo([]), ["absent", "absent", "absent"]);
+  });
+
+  test("a refresh's trace carries the most limit resets an account reports (#oar-raft:#3)", async () => {
+    await withCore({ serverCapabilities: [SERVER_CAPABILITY_RUNTIME_ACCOUNT_USAGE_LIMIT_RESETS_V1], redeem: async () => ({ kind: "reset" }) }, async ({ socket, traceRows }) => {
+      socket.emitServerMessage({ type: "machine:runtime_account_usage:refresh", requestId: "usage-9", provider: "codex", reason: "manual" });
+      await waitFor(() => traceRows().some((row) => row.name === "daemon.runtime_account_usage.refresh"), "refresh traced");
+      const row = traceRows().find((candidate) => candidate.name === "daemon.runtime_account_usage.refresh")!;
+      assert.equal(row.attrs?.limit_resets_available, usage(1).accounts[0]!.limitResetsAvailable);
+    });
+  });
+
+  test("a malformed redeem is dropped without reaching OAR", async () => {
+    await withCore({ serverCapabilities: [SERVER_CAPABILITY_RUNTIME_ACCOUNT_USAGE_LIMIT_RESETS_V1], redeem: async () => ({ kind: "reset" }) }, async ({ socket, events, traceRows }) => {
+      socket.emitServerMessage({ type: "machine:runtime_account_usage:limit_reset:redeem", requestId: "redeem-4", provider: "codex", idempotencyKey: "short" as RuntimeLimitResetIdempotencyKey });
+      socket.emitServerMessage({ type: "machine:runtime_account_usage:limit_reset:redeem", requestId: "redeem-5", provider: "nope" as RuntimeAccountUsageProvider, idempotencyKey: KEY });
+      await waitFor(() => traceRows().filter((row) => row.name === "daemon.runtime_account_usage.limit_reset").length === 2, "drops traced");
+      assert.deepEqual(events, []);
+      assert.equal(results(socket).length, 0);
+    });
+  });
+});
+
 test("DaemonCore pushes each ready runtime's model catalog after ready, and again after a rescan", async () => {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "slock-daemon-model-catalog-test-"));
   const sockets: FakeWebSocket[] = [];
@@ -557,9 +912,10 @@ test("DaemonCore pushes each ready runtime's model catalog after ready, and agai
     serverUrl: "https://daemon.example.com",
     apiKey: "sk_machine_test",
     dataDir,
-    // claude has a static model source; the unknown runtime has neither a
+    // copilot has a static model source (claude now asks Claude Code, so it
+    // would spawn a real claude on a dev box); the unknown runtime has neither a
     // driver nor a static list, so it must produce no catalog frame.
-    runtimeDetector: () => ({ ids: ["claude", "no-such-runtime"], versions: {} }),
+    runtimeDetector: () => ({ ids: ["copilot", "no-such-runtime"], versions: {} }),
     connectionOptions: {
       wsFactory: () => {
         const socket = new FakeWebSocket();
@@ -576,21 +932,104 @@ test("DaemonCore pushes each ready runtime's model catalog after ready, and agai
     socket.emitOpen();
     const catalogs = () => socket.sent.filter((message): message is Extract<MachineToServerMessage, { type: "machine:runtime_models:catalog" }> =>
       typeof message === "object" && message !== null && (message as { type?: string }).type === "machine:runtime_models:catalog");
-    await waitFor(() => catalogs().length === 1, "claude catalog after ready");
+    await waitFor(() => catalogs().length === 1, "copilot catalog after ready");
 
     const readyIndex = socket.sent.findIndex((message) => (message as { type?: string }).type === "ready");
     const catalogIndex = socket.sent.indexOf(catalogs()[0]!);
     assert.ok(readyIndex >= 0 && readyIndex < catalogIndex, "the catalog follows ready");
-    const [claude] = catalogs();
-    assert.equal(claude!.runtime, "claude");
-    assert.ok(claude!.models.length > 0);
-    for (const model of claude!.models) {
+    const [copilot] = catalogs();
+    assert.equal(copilot!.runtime, "copilot");
+    assert.ok(copilot!.models.length > 0);
+    for (const model of copilot!.models) {
       assert.deepEqual(Object.keys(model).sort(), ["id", "label"], "only id and label cross the wire");
     }
 
     socket.emitServerMessage({ type: "machine:runtimes:rescan" });
-    await waitFor(() => catalogs().length === 2, "claude catalog after rescan");
-    assert.deepEqual(catalogs().map((message) => message.runtime), ["claude", "claude"]);
+    await waitFor(() => catalogs().length === 2, "copilot catalog after rescan");
+    assert.deepEqual(catalogs().map((message) => message.runtime), ["copilot", "copilot"]);
+  } finally {
+    await core.stop();
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("a Pi sign-out while a catalog round is already detecting clears the list in the round queued behind it", async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "slock-daemon-model-catalog-pi-clear-test-"));
+  const sockets: FakeWebSocket[] = [];
+  const detections: Array<(outcome: RuntimeModelSourceOutcome) => void> = [];
+  const core = new DaemonCore({
+    serverUrl: "https://daemon.example.com",
+    apiKey: "sk_machine_test",
+    dataDir,
+    runtimeDetector: () => ({ ids: ["pi"], versions: {} }),
+    // Each detection waits until the test answers it.
+    runtimeModelDetector: () => new Promise<RuntimeModelSourceOutcome>((resolve) => { detections.push(resolve); }),
+    connectionOptions: { wsFactory: () => { const socket = new FakeWebSocket(); sockets.push(socket); return socket; } },
+  });
+  try {
+    core.start();
+    const socket = sockets[0]!;
+    socket.emitOpen();
+    const catalogs = () => socket.sent.filter((message): message is Extract<MachineToServerMessage, { type: "machine:runtime_models:catalog" }> =>
+      (message as { type?: string }).type === "machine:runtime_models:catalog");
+    await waitFor(() => detections.length === 1, "the connect round is detecting Pi's models");
+
+    // The last Pi provider is signed out from the web while that detection (from before) runs.
+    (core as unknown as { rescanRuntimes(runtime: string): void }).rescanRuntimes("pi");
+    await flush();
+    detections[0]!({ kind: "live", value: { models: [{ id: "anthropic/opus", label: "Opus · Anthropic" }] } });
+    await waitFor(() => catalogs().length === 1, "the old round reports what it read");
+    assert.equal(catalogs()[0]!.authoritative, undefined, "a detection that began before the change does not take its clear");
+
+    await waitFor(() => detections.length === 2, "the queued round detects again");
+    detections[1]!({ kind: "no_models" });
+    await waitFor(() => catalogs().length === 2, "the queued round answers for the change");
+    assert.deepEqual(catalogs()[1], { type: "machine:runtime_models:catalog", runtime: "pi", models: [], authoritative: true });
+  } finally {
+    await core.stop();
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("reconciler step 15 (B13): a missing-runtime local stop makes the core re-detect runtimes once, after the delay", async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "slock-daemon-absent-redetect-test-"));
+  const sockets: FakeWebSocket[] = [];
+  let detections = 0;
+  const core = new DaemonCore({
+    serverUrl: "https://daemon.example.com",
+    apiKey: "sk_machine_test",
+    dataDir,
+    runtimeAbsentRedetectDelayMs: 50,
+    runtimeDetector: () => {
+      detections += 1;
+      return { ids: ["copilot"], versions: {} };
+    },
+    connectionOptions: {
+      wsFactory: () => {
+        const socket = new FakeWebSocket();
+        sockets.push(socket);
+        return socket;
+      },
+    },
+  });
+
+  try {
+    core.start();
+    const socket = sockets[0];
+    assert.ok(socket);
+    socket.emitOpen();
+    const readies = () => socket.sent.filter((message) => (message as { type?: string }).type === "ready").length;
+    await waitFor(() => readies() === 1, "the first ready");
+    const detectionsBefore = detections;
+
+    // Two agents of the runtime stop in the same moment: one re-detection.
+    (core as any).scheduleRuntimeRedetectAfterAbsent("copilot");
+    (core as any).scheduleRuntimeRedetectAfterAbsent("copilot");
+    assert.equal(readies(), 1, "nothing before the delay");
+    await waitFor(() => readies() === 2, "the re-detection's ready");
+    assert.ok(detections > detectionsBefore, "the detector ran again");
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.equal(readies(), 2, "one ready for both stops");
   } finally {
     await core.stop();
     await rm(dataDir, { recursive: true, force: true });
@@ -755,6 +1194,67 @@ test("DaemonCore logs a missing optional runtime at INFO but installed-and-broke
   }
 });
 
+test("DaemonCore removes stale agent-token files older daemons left, at startup, and leaves symlinks alone", { skip: process.platform === "win32" }, async () => {
+  const rootDir = await mkdtemp(path.join(os.tmpdir(), "slock-daemon-stale-agent-token-test-"));
+  const sockets: FakeWebSocket[] = [];
+  const { sink, tracer } = makeDeterministicTracer();
+  const computerKey = "sk_computer_left_by_an_older_daemon";
+  const transportRoot = path.join(rootDir, "cli-transport");
+  const agentsDir = path.join(rootDir, "agents");
+  const staleTokens = [
+    path.join(transportRoot, "agent-a", "launch-1", "agent-token"),
+    path.join(transportRoot, "agent-a", "launch-2", "agent-token"),
+    path.join(transportRoot, "agent-b", "pid-4242", "agent-token"),
+    // The location before cli-transport: the agent's workspace.
+    path.join(agentsDir, "agent-a", ".slock", "agent-token"),
+  ];
+  const linkTarget = path.join(rootDir, "outside", "agent-token");
+  const tokenLink = path.join(transportRoot, "agent-b", "launch-3", "agent-token");
+  const keptWorkspaceFile = path.join(agentsDir, "agent-a", ".slock", "runtime-sessions.keep");
+  let core: DaemonCore | null = null;
+  try {
+    for (const file of [...staleTokens, linkTarget]) {
+      await mkdir(path.dirname(file), { recursive: true });
+      await writeFile(file, computerKey, { mode: 0o600 });
+    }
+    await writeFile(keptWorkspaceFile, "keep");
+    await mkdir(path.dirname(tokenLink), { recursive: true });
+    await symlink(linkTarget, tokenLink);
+
+    core = new DaemonCore({
+      serverUrl: "https://daemon.example.com",
+      apiKey: "sk_computer_test",
+      dataDir: agentsDir,
+      slockHome: rootDir,
+      tracer,
+      runtimeDetector: () => ({ ids: [], versions: {} }),
+      connectionOptions: {
+        wsFactory: () => {
+          const socket = new FakeWebSocket();
+          sockets.push(socket);
+          return socket;
+        },
+      },
+    });
+    core.start();
+    sockets[0]?.emitOpen();
+    await waitFor(() => (sockets[0]?.sent ?? []).some((message) => (message as { type?: string }).type === "ready"), "ready on first connect");
+
+    for (const file of staleTokens) assert.equal(existsSync(file), false, `${path.relative(rootDir, file)} must be removed`);
+    assert.equal((await lstat(tokenLink)).isSymbolicLink(), true, "a symlink named agent-token is left alone");
+    assert.equal(readFileSync(linkTarget, "utf8"), computerKey, "the symlink's target is untouched");
+    assert.equal(readFileSync(keptWorkspaceFile, "utf8"), "keep");
+    const removal = traceRows(sink).filter((row) => row.name === "daemon.stale_agent_tokens.removed");
+    assert.equal(removal.length, 1);
+    assert.equal(removal[0]?.attrs?.removed_count, 4);
+    assert.equal(removal[0]?.attrs?.skipped_count, 1);
+    assert.ok(!JSON.stringify(removal).includes(computerKey) && !JSON.stringify(removal).includes(rootDir), "counts only: no contents, no paths");
+  } finally {
+    await core?.stop();
+    await rm(rootDir, { recursive: true, force: true });
+  }
+});
+
 test("DaemonCore does not re-detect model catalogs on a quick reconnect; rescan always pushes", async () => {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "slock-daemon-model-catalog-throttle-test-"));
   const sockets: FakeWebSocket[] = [];
@@ -818,6 +1318,85 @@ test("DaemonCore does not re-detect model catalogs on a quick reconnect; rescan 
   }
 });
 
+test("reconciler step 15 (B12): a detection that differs from live processes' own CLI version is traced once per runtime with a count; nothing restarts", async () => {
+  const rootDir = await mkdtemp(path.join(os.tmpdir(), "slock-daemon-cli-version-drift-test-"));
+  const sockets: FakeWebSocket[] = [];
+  const { sink, tracer } = makeDeterministicTracer();
+  const persistent = new FakeDriver({ supportsStdinNotification: true });
+  const perTurn = new FakeDriver({ supportsStdinNotification: false });
+  const versions: Record<string, string> = { codex: "codex-cli 0.150.0", cursor: "2026.01.01" };
+  let manager: AgentProcessManager | null = null;
+  const core = new DaemonCore({
+    serverUrl: "https://daemon.example.com",
+    apiKey: "sk_machine_test",
+    dataDir: path.join(rootDir, "agents"),
+    slockHome: rootDir,
+    tracer,
+    runtimeDetector: () => ({ ids: Object.keys(versions), versions: { ...versions } }),
+    connectionOptions: {
+      wsFactory: () => {
+        const socket = new FakeWebSocket();
+        sockets.push(socket);
+        return socket;
+      },
+    },
+    agentManagerFactory: (sendToServer, daemonApiKey, options) => {
+      manager = new AgentProcessManager(sendToServer, daemonApiKey, {
+        dataDir: options?.dataDir,
+        serverUrl: options?.serverUrl ?? "https://daemon.example.com",
+        driverResolver: (runtimeId) => (runtimeId === "cursor" ? perTurn : persistent),
+        defaultAgentEnvVarsProvider: options?.defaultAgentEnvVarsProvider,
+        tracer: options?.tracer,
+      });
+      return manager;
+    },
+  });
+  const drifts = () => traceRows(sink).filter((row) => row.name === "daemon.agent.cli_version_drift").map((row) => row.attrs);
+  const readyCount = (socket: FakeWebSocket) => socket.sent.filter((message) => (message as { type?: string }).type === "ready").length;
+  try {
+    core.start();
+    const socket = sockets[0]!;
+    socket.emitOpen();
+    await waitFor(() => readyCount(socket) === 1, "first ready");
+    for (const [agentId, runtime] of [["agent-1", "codex"], ["agent-2", "codex"], ["agent-3", "cursor"]] as const) {
+      socket.emitServerMessage({ type: "agent:start", agentId, config: makeConfig({ runtime, sessionId: `session-${agentId}` }), launchId: `launch-${agentId}` });
+    }
+    await waitFor(() => persistent.children.length === 2 && perTurn.children.length === 1, "three live processes");
+    // Each process's own version, as its first turn latches it from the detection then.
+    const ap = (agentId: string) => (manager as any).agents.get(agentId);
+    for (const agentId of ["agent-1", "agent-2", "agent-3"]) ap(agentId).runtimeCliVersion = versions[ap(agentId).config.runtime];
+    assert.deepEqual(manager!.liveRuntimeCliVersions(), [
+      { runtime: "codex", version: "codex-cli 0.150.0" },
+      { runtime: "codex", version: "codex-cli 0.150.0" },
+    ], "a per-turn process has no live session to drift");
+
+    // Same versions: no drift.
+    socket.emitServerMessage({ type: "machine:runtimes:rescan" });
+    await waitFor(() => readyCount(socket) === 2, "ready after a rescan with the same versions");
+    assert.deepEqual(drifts(), []);
+
+    // Both CLIs upgraded on disk: one event for codex (two live agents), none for the per-turn runtime.
+    versions.codex = "codex-cli 0.163.0";
+    versions.cursor = "2026.02.01";
+    socket.emitServerMessage({ type: "machine:runtimes:rescan" });
+    await waitFor(() => readyCount(socket) === 3, "ready after the upgrade");
+    const rows = drifts();
+    assert.equal(rows.length, 1, "one event per runtime per detection, not per agent");
+    assert.deepEqual(
+      { runtime: rows[0]?.runtime, from_version: rows[0]?.from_version, to_version: rows[0]?.to_version, direction: rows[0]?.direction, live_agents: rows[0]?.live_agents, from_versions: rows[0]?.from_versions },
+      { runtime: "codex", from_version: "codex-cli 0.150.0", to_version: "codex-cli 0.163.0", direction: "upgrade", live_agents: 2, from_versions: 1 },
+    );
+    assert.ok(!JSON.stringify(rows).includes("agent-1"), "a count, never agent ids");
+    assert.equal(persistent.children.length, 2, "measure only: nothing restarts");
+    assert.equal(ap("agent-1").runtimeCliVersion, "codex-cli 0.150.0", "a process keeps its own version");
+  } finally {
+    // The machine-level version record is written after each detection; let it land before cleanup.
+    await (core as any).runtimeCliVersionWrite;
+    await core.stop();
+    await rm(rootDir, { recursive: true, force: true });
+  }
+});
+
 test("DaemonCore starts at most one connect-triggered catalog round per interval even when every round is cut short (task #354 flapping)", async () => {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "slock-daemon-model-catalog-flap-test-"));
   const sockets: FakeWebSocket[] = [];
@@ -868,6 +1447,19 @@ test("DaemonCore starts at most one connect-triggered catalog round per interval
     if (core) await core.stop();
     await rm(dataDir, { recursive: true, force: true });
   }
+});
+
+test("a catalog frame clears a runtime's list only after a sign-in change says it has no models", () => {
+  const live: RuntimeModelSourceOutcome = { kind: "live", value: { models: [{ id: "anthropic/opus", label: "Opus · Anthropic" }] } };
+  assert.deepEqual(runtimeModelCatalogFrame("pi", live, false), { type: "machine:runtime_models:catalog", runtime: "pi", models: [{ id: "anthropic/opus", label: "Opus · Anthropic" }] });
+  assert.deepEqual(runtimeModelCatalogFrame("pi", live, true), { type: "machine:runtime_models:catalog", runtime: "pi", models: [{ id: "anthropic/opus", label: "Opus · Anthropic" }] }, "a list is a list, authoritative or not");
+  assert.deepEqual(runtimeModelCatalogFrame("pi", { kind: "no_models" }, true), { type: "machine:runtime_models:catalog", runtime: "pi", models: [], authoritative: true }, "the last provider signed out: the old models go");
+  // A routine probe never clears: the server keeps its copy, as before.
+  assert.equal(runtimeModelCatalogFrame("pi", { kind: "no_models" }, false), null);
+  assert.equal(runtimeModelCatalogFrame("codex", { kind: "no_models" }, false), null);
+  // A failed detection says nothing about the models, sign-in change or not.
+  assert.equal(runtimeModelCatalogFrame("pi", { kind: "error", retryable: true }, true), null);
+  assert.equal(runtimeModelCatalogFrame("pi", { kind: "unsupported" }, true), null);
 });
 
 test("sanitizeCatalogModels caps entries, strips control characters and never rewrites ids", () => {
@@ -940,6 +1532,31 @@ test("DaemonCore joins overlapping probes: two usage refreshes run the collector
   }
 });
 
+test("DaemonCore says on ready when the Computer runner cannot reach its service", async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "slock-daemon-service-ipc-cap-test-"));
+  const sockets: FakeWebSocket[] = [];
+  const core = new DaemonCore({
+    serverUrl: "https://daemon.example.com",
+    apiKey: "sk_machine_test",
+    dataDir,
+    runtimeDetector: () => ({ ids: [], versions: {} }),
+    onComputerControl: () => {},
+    computerControlViaSupervisor: true,
+    computerServiceIpcUnreachable: true,
+    connectionOptions: { wsFactory: () => { const socket = new FakeWebSocket(); sockets.push(socket); return socket; } },
+  });
+  try {
+    core.start();
+    sockets[0]!.emitOpen();
+    const ready = sockets[0]!.sent.find((msg): msg is Extract<MachineToServerMessage, { type: "ready" }> =>
+      typeof msg === "object" && msg !== null && (msg as { type?: string }).type === "ready");
+    assert.equal(ready?.capabilities?.includes(COMPUTER_CAPABILITY_SERVICE_IPC_UNREACHABLE), true);
+  } finally {
+    await core.stop();
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
 test("DaemonCore advertises machine-wide Computer controls only for supervisor-relay builds", async () => {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "slock-daemon-computer-control-cap-test-"));
   const sockets: FakeWebSocket[] = [];
@@ -970,6 +1587,7 @@ test("DaemonCore advertises machine-wide Computer controls only for supervisor-r
       typeof msg === "object" && msg !== null && (msg as { type?: string }).type === "ready"
     );
     assert.equal(ready?.capabilities?.includes(COMPUTER_CAPABILITY_SUPERVISOR_MUTATIONS), true);
+    assert.equal(ready?.capabilities?.includes(COMPUTER_CAPABILITY_SERVICE_IPC_UNREACHABLE), false, "reachable unless the Computer says otherwise");
 
     await core.stop();
     core = null;
@@ -1097,7 +1715,12 @@ async function flush(): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, 0));
 }
 
-async function waitFor(predicate: () => boolean, label: string, timeoutMs = 5_000): Promise<void> {
+// 15 s, not 5 s: under CI load (280+ daemon test files in parallel) a real
+// spawn through AgentProcessManager has taken longer than 5 s (staging run
+// 42447975903, no daemon change since the green run before it). A passing
+// wait returns as soon as the predicate holds, so only a failing test waits
+// longer; the test timeout is 30 s (vitest.config.ts).
+async function waitFor(predicate: () => boolean, label: string, timeoutMs = 15_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (predicate()) return;
@@ -1400,7 +2023,9 @@ test("daemon credential-proxy trace contract preserves only typed cutover eviden
     surface: "daemon",
     kind: "client",
     attrs: {
+      agentId: "agent-proxy-contract",
       route_family: "tasks/claim",
+      route_path_version: "v2",
       method: "POST",
       trace_context_state: "continued",
       proxy_launch_id_present: true,
@@ -1418,11 +2043,22 @@ test("daemon credential-proxy trace contract preserves only typed cutover eviden
       response_complete: false,
       failure_class: "mid_response_transport",
       cause_code: "ECONNRESET",
+      third_party_ack_mode: "lease",
+      third_party_served_count: 2,
+      upstream_layer: "tcp",
+      target_host_class: "api.raft.build",
+      via_http_proxy: true,
+      connect_attempted_addresses: 2,
+      connect_timed_out_addresses: 1,
       raw_error: "secret body",
     },
   });
 
   const [recorded] = traceRows(sink, traceId);
+  assert.equal(recorded.attrs?.agentId, "agent-proxy-contract");
+  assert.equal(recorded.attrs?.route_path_version, "v2");
+  assert.equal(recorded.attrs?.third_party_ack_mode, "lease");
+  assert.equal(recorded.attrs?.third_party_served_count, 2);
   assert.equal(recorded.attrs?.route_family, "tasks/claim");
   assert.equal(recorded.attrs?.method, "POST");
   assert.equal(recorded.attrs?.trace_context_state, "continued");
@@ -1436,6 +2072,11 @@ test("daemon credential-proxy trace contract preserves only typed cutover eviden
   assert.equal(recorded.attrs?.response_complete, false);
   assert.equal(recorded.attrs?.failure_class, "mid_response_transport");
   assert.equal(recorded.attrs?.cause_code, "ECONNRESET");
+  assert.equal(recorded.attrs?.upstream_layer, "tcp");
+  assert.equal(recorded.attrs?.target_host_class, "api.raft.build");
+  assert.equal(recorded.attrs?.via_http_proxy, true);
+  assert.equal(recorded.attrs?.connect_attempted_addresses, 2);
+  assert.equal(recorded.attrs?.connect_timed_out_addresses, 1);
   assert.equal(recorded.attrs?.raw_url, undefined);
   assert.equal(recorded.attrs?.raw_error, undefined);
 });
@@ -2172,6 +2813,441 @@ test("DaemonCore streams a source bundle: each chunk is recorded and uploaded be
   }
 });
 
+/**
+ * A source run for a lease carrying `userIgnoreAdditions`, against a fake
+ * Server that advertises `serverCapabilities`. Returns what the Server saw.
+ */
+async function runUserIgnoreSourceMigration(input: {
+  name: string;
+  serverCapabilities: string[];
+  prepare: (workspace: string) => Promise<void>;
+  paths: string[];
+}) {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), `raft-daemon-migration-user-ignore-${input.name}-`));
+  const sockets: FakeWebSocket[] = [];
+  const migrationId = `migration-user-ignore-${input.name}`;
+  const transportGeneration = `transport-generation-user-ignore-${input.name}`;
+  const leaseId = `lease-user-ignore-${input.name}`;
+  const base = `/internal/computer/agent-migrations/by-id/${migrationId}/resumable`;
+  const progressReports: Array<Record<string, unknown>> = [];
+  const transportLost: Array<Record<string, unknown>> = [];
+  const requested: string[] = [];
+  let control: Parameters<typeof validateAgentMigrationControlManifest>[0] | null = null;
+  let done = false;
+  const transferServer = await withHttpServer(async (req, res) => {
+    const json = (status: number, body: unknown) => {
+      res.statusCode = status;
+      res.setHeader("Content-Type", "application/json");
+      res.end(JSON.stringify(body));
+    };
+    requested.push(`${req.method} ${req.url}`);
+    if (req.method === "POST" && req.url?.startsWith(`${base}/stream-chunks/`)) {
+      await readRequestBody(req);
+      json(200, { ok: true, uploaded: true });
+      return;
+    }
+    if (req.method === "POST" && req.url === `${base}/control`) {
+      const body = JSON.parse((await readRequestBody(req)).toString("utf8")) as { control: NonNullable<typeof control> };
+      control = body.control;
+      json(200, { controlSha256: validateAgentMigrationControlManifest(body.control).sha256 });
+      return;
+    }
+    if (req.method === "GET" && req.url?.startsWith(`${base}/chunks?`)) {
+      json(200, { complete: true, migrationGeneration: transportGeneration, leaseId, chunks: [] });
+      return;
+    }
+    if (req.method === "POST" && req.url === `${base}/upload-complete`) {
+      await readRequestBody(req);
+      done = true;
+      json(200, { ok: true, state: "ready" });
+      return;
+    }
+    if (req.method === "POST" && req.url === `${base}/source-progress`) {
+      progressReports.push(JSON.parse((await readRequestBody(req)).toString("utf8")) as Record<string, unknown>);
+      json(200, { ok: true });
+      return;
+    }
+    if (req.method === "POST" && req.url === `${base}/source-quiesced`) {
+      await readRequestBody(req);
+      json(200, { ok: true });
+      return;
+    }
+    if (req.method === "POST" && req.url === `/internal/computer/agent-migrations/by-id/${migrationId}/transport-lost`) {
+      transportLost.push(JSON.parse((await readRequestBody(req)).toString("utf8")) as Record<string, unknown>);
+      done = true;
+      json(200, { ok: true });
+      return;
+    }
+    res.statusCode = 404;
+    res.end("not found");
+  });
+  const workspace = path.join(dataDir, "agent-user-ignore");
+  let core: DaemonCore | null = null;
+  try {
+    await mkdir(workspace, { recursive: true });
+    await writeFile(path.join(workspace, "MEMORY.md"), "memory\n");
+    await input.prepare(workspace);
+    core = new DaemonCore({
+      serverUrl: transferServer.baseUrl,
+      apiKey: "sk_machine_test",
+      dataDir,
+      slockHome: dataDir,
+      runtimeDetector: () => ({ ids: [], versions: {} }),
+      connectionOptions: {
+        wsFactory: () => {
+          const socket = new FakeWebSocket();
+          sockets.push(socket);
+          return socket;
+        },
+      },
+    });
+    core.start();
+    const socket = sockets[0];
+    assert.ok(socket);
+    socket.emitOpen({ machineContext: false });
+    socket.emitServerMessage({
+      type: "machine:context",
+      machineId: "machine-test",
+      serverId: "server-test",
+      capabilities: input.serverCapabilities,
+    });
+    socket.emitServerMessage({
+      type: "machine:migration_transport:lease",
+      agentId: "agent-user-ignore",
+      migrationId,
+      migrationRef: "mig_USERIGNORESOURCEAAAAAA",
+      migrationGeneration: `agent_migration:${migrationId}:7`,
+      sessionId: "session-user-ignore",
+      provider: "object_store",
+      leaseSource: "server",
+      role: "source",
+      transferKind: "upload",
+      bearerToken: "source-token",
+      expiresAt: "2999-07-09T13:00:00.000Z",
+      maxBytes: 104857600,
+      controlUrl: base,
+      leaseId,
+      transportGeneration,
+      sourceMachineId: "source-machine-user-ignore",
+      targetMachineId: "target-machine-user-ignore",
+      expectedMigrationRevision: 7,
+      userIgnoreAdditions: { paths: input.paths, addedBy: "Alice", addedAt: "2026-11-04T08:30:00Z" },
+    });
+    await waitFor(() => done, "source run ends");
+    // A progress report is fire-and-forget; let one in flight land.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const userFile = await readFile(path.join(workspace, ".raftbackupignore.user"), "utf8").catch(() => null);
+    return { control: control as Parameters<typeof validateAgentMigrationControlManifest>[0] | null, progressReports, transportLost, requested, userFile };
+  } finally {
+    if (core) await core.stop();
+    await transferServer.close();
+    await rm(dataDir, { recursive: true, force: true });
+  }
+}
+
+test("a source lease's user ignore additions are written before packing, and the receipt goes only to a Server that accepts it", async () => {
+  const prepare = async (workspace: string) => {
+    await mkdir(path.join(workspace, "data"), { recursive: true });
+    await writeFile(path.join(workspace, "data", "big.bin"), randomBytes(4096));
+    await writeFile(path.join(workspace, "keep.txt"), "keep\n");
+  };
+  const receipt = { written: 1, alreadyPresent: 0, rejected: [{ path: "MEMORY.md", reason: "forced_keep" }] };
+
+  const accepting = await runUserIgnoreSourceMigration({
+    name: "accepting",
+    serverCapabilities: [SERVER_CAPABILITY_MIGRATION_USER_IGNORE_RECEIPT_V1],
+    prepare,
+    paths: ["data", "MEMORY.md"],
+  });
+  assert.deepEqual(accepting.transportLost, []);
+  assert.equal(accepting.userFile, "# added by Alice at 2026-11-04T08:30:00.000Z (Raft)\ndata\n");
+  assert.deepEqual(accepting.control?.transferSummary.excludedIgnored?.largest, [{ path: "data", bytes: 4096 }]);
+  // The bundle carries MEMORY.md, keep.txt and the user file, never data/.
+  assert.equal(accepting.control?.archive.entryCount, 3);
+  assert.deepEqual(accepting.progressReports[0], {
+    migrationGeneration: "transport-generation-user-ignore-accepting",
+    phase: "scanning",
+    files: 0,
+    bytes: 0,
+    userIgnoreAdditions: receipt,
+  });
+  assert.equal(accepting.progressReports.filter((report) => "userIgnoreAdditions" in report).length, 1);
+
+  const older = await runUserIgnoreSourceMigration({ name: "older", serverCapabilities: [], prepare, paths: ["data", "MEMORY.md"] });
+  assert.deepEqual(older.transportLost, []);
+  assert.equal(older.userFile, accepting.userFile);
+  assert.equal(older.control?.archive.entryCount, 3);
+  // Exactly as before: no immediate report, and the first throttled one waits out the interval.
+  assert.deepEqual(older.progressReports, []);
+});
+
+test("a source that cannot write the user ignore additions fails the migration with the reason before it packs", async () => {
+  const outside = await mkdtemp(path.join(os.tmpdir(), "raft-daemon-migration-user-ignore-outside-"));
+  try {
+    const target = path.join(outside, "target.txt");
+    await writeFile(target, "outside\n");
+    const failed = await runUserIgnoreSourceMigration({
+      name: "symlink",
+      serverCapabilities: [SERVER_CAPABILITY_MIGRATION_USER_IGNORE_RECEIPT_V1],
+      prepare: (workspace) => symlink(target, path.join(workspace, ".raftbackupignore.user")),
+      paths: ["data"],
+    });
+    assert.deepEqual(failed.transportLost, [{
+      role: "source",
+      transferKind: "upload",
+      code: "MIGRATION_USER_IGNORE_WRITE_FAILED",
+      transportGeneration: "transport-generation-user-ignore-symlink",
+      detailCode: "MIGRATION_USER_IGNORE_WRITE_FAILED:symlink",
+      message: "MIGRATION_USER_IGNORE_WRITE_FAILED:symlink",
+    }]);
+    assert.equal(failed.control, null);
+    assert.equal(failed.requested.some((request) => request.includes("/stream-chunks/")), false, "nothing was packed");
+    assert.equal(await readFile(target, "utf8"), "outside\n");
+  } finally {
+    await rm(outside, { recursive: true, force: true });
+  }
+});
+
+test("DaemonCore fails a source upload that gets no response from object storage for 5 minutes instead of retrying until the lease expires", async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "raft-daemon-migration-unreachable-test-"));
+  const sockets: FakeWebSocket[] = [];
+  const migrationId = "migration-unreachable";
+  const transportGeneration = "transport-generation-unreachable";
+  const leaseId = "lease-unreachable";
+  const base = `/internal/computer/agent-migrations/by-id/${migrationId}/resumable`;
+  const byId = `/internal/computer/agent-migrations/by-id/${migrationId}`;
+  // Object storage is a closed port: every PUT fails before any HTTP response.
+  const closed = await withHttpServer((_req, res) => { res.end(); });
+  const unreachableUrl = `${closed.baseUrl}/object-store/chunk-0`;
+  await closed.close();
+  const transportLost: Array<{ detailCode?: string }> = [];
+  const transferServer = await withHttpServer(async (req, res) => {
+    const json = (status: number, body: unknown) => {
+      res.statusCode = status;
+      res.setHeader("Content-Type", "application/json");
+      res.end(JSON.stringify(body));
+    };
+    if (req.method === "POST" && req.url?.startsWith(`${base}/stream-chunks/`)) {
+      await readRequestBody(req);
+      json(200, { ok: true, uploaded: false, url: unreachableUrl });
+      return;
+    }
+    if (req.method === "POST" && (req.url === `${base}/source-quiesced` || req.url === `${base}/source-progress`)) {
+      await readRequestBody(req);
+      json(200, { ok: true });
+      return;
+    }
+    if (req.method === "POST" && req.url === `${byId}/transport-lost`) {
+      transportLost.push(JSON.parse((await readRequestBody(req)).toString("utf8")));
+      json(200, { ok: true });
+      return;
+    }
+    res.statusCode = 404;
+    res.end("not found");
+  });
+  const { sink, tracer } = makeDeterministicTracer();
+  const realNow = Date.now;
+  let skewMs = 0;
+  Date.now = () => realNow() + skewMs;
+  let core: DaemonCore | null = null;
+  try {
+    await mkdir(path.join(dataDir, "agent-unreachable"), { recursive: true });
+    await writeFile(path.join(dataDir, "agent-unreachable", "MEMORY.md"), "stays on the source\n");
+    core = new DaemonCore({
+      tracer,
+      serverUrl: transferServer.baseUrl,
+      apiKey: "sk_machine_test",
+      dataDir,
+      slockHome: dataDir,
+      runtimeDetector: () => ({ ids: [], versions: {} }),
+      connectionOptions: {
+        wsFactory: () => {
+          const socket = new FakeWebSocket();
+          sockets.push(socket);
+          return socket;
+        },
+      },
+    });
+    core.start();
+    const socket = sockets[0];
+    assert.ok(socket);
+    socket.emitOpen();
+    socket.emitServerMessage({
+      type: "machine:migration_transport:lease",
+      agentId: "agent-unreachable",
+      migrationId,
+      migrationRef: "mig_UNREACHABLESOURCEAAAAA",
+      migrationGeneration: `agent_migration:${migrationId}:7`,
+      sessionId: "session-unreachable",
+      provider: "object_store",
+      leaseSource: "server",
+      role: "source",
+      transferKind: "upload",
+      bearerToken: "source-token",
+      expiresAt: "2999-07-09T13:00:00.000Z",
+      maxBytes: 104857600,
+      controlUrl: base,
+      leaseId,
+      transportGeneration,
+      sourceMachineId: "source-machine-unreachable",
+      targetMachineId: "target-machine-unreachable",
+      expectedMigrationRevision: 7,
+    });
+
+    const uploadRetries = () => traceRows(sink).filter((row) =>
+      row.name === "daemon.migration_transport.resumable"
+      && row.attrs?.outcome === "retry"
+      && row.attrs?.operation === "chunk_upload");
+    await waitFor(() => uploadRetries().length > 0, "the first upload attempt fails and is retried");
+    assert.equal(uploadRetries()[0]!.attrs?.http_status, null);
+    assert.equal(transportLost.length, 0, "a short outage is retried, not reported");
+    skewMs = 5 * 60 * 1000;
+    await waitFor(() => transportLost.length > 0, "the upload gives up and reports the transport lost");
+    assert.equal(transportLost[0]!.detailCode, "MIGRATION_OBJECT_STORE_UNREACHABLE");
+  } finally {
+    Date.now = realNow;
+    if (core) await core.stop();
+    await transferServer.close();
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("unsafeAgentIdOf accepts one path segment and refuses anything that leaves the workspace root", () => {
+  for (const ok of ["9d4329f3-67ae-40d0-b705-c184f087e274", "agent-streamed", "a.b"]) {
+    assert.equal(unsafeAgentIdOf({ type: "agent:start", agentId: ok }), null, ok);
+  }
+  assert.equal(unsafeAgentIdOf({ type: "machine:context" }), null, "a message without agentId");
+  for (const bad of ["", ".", "..", "../victim", "a/b", "a\\b", "C:victim", "a\0b"]) {
+    assert.equal(unsafeAgentIdOf({ type: "agent:reset-workspace", agentId: bad }), bad, JSON.stringify(bad));
+  }
+  assert.equal(unsafeAgentIdOf({ type: "agent:start", agentId: 7 }), "7");
+});
+
+test("DaemonCore refuses a workspace reset whose agentId would reach outside its data directory", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "raft-daemon-unsafe-agent-id-test-"));
+  const dataDir = path.join(root, "agents");
+  const victim = path.join(root, "victim");
+  const sockets: FakeWebSocket[] = [];
+  const { sink, tracer } = makeDeterministicTracer();
+  let core: DaemonCore | null = null;
+  try {
+    await mkdir(dataDir, { recursive: true });
+    await mkdir(victim, { recursive: true });
+    await writeFile(path.join(victim, "keep.txt"), "not an agent workspace\n");
+    await mkdir(path.join(dataDir, "agent-ok"), { recursive: true });
+    core = new DaemonCore({
+      tracer,
+      serverUrl: "http://127.0.0.1:9",
+      apiKey: "sk_machine_test",
+      dataDir,
+      slockHome: root,
+      runtimeDetector: () => ({ ids: [], versions: {} }),
+      connectionOptions: {
+        wsFactory: () => {
+          const socket = new FakeWebSocket();
+          sockets.push(socket);
+          return socket;
+        },
+      },
+    });
+    core.start();
+    const socket = sockets[0];
+    assert.ok(socket);
+    socket.emitOpen();
+    socket.emitServerMessage({ type: "agent:reset-workspace", agentId: "../victim" });
+    socket.emitServerMessage({ type: "agent:reset-workspace", agentId: "agent-ok" });
+
+    await waitFor(() => !existsSync(path.join(dataDir, "agent-ok")), "a well-formed reset still runs");
+    assert.ok(existsSync(path.join(victim, "keep.txt")), "the directory outside dataDir is untouched");
+    const refused = traceRows(sink).filter((row) => row.name === "daemon.server_message.unsafe_agent_id");
+    assert.equal(refused.length, 1);
+    assert.equal(refused[0]!.attrs?.message_type, "agent:reset-workspace");
+  } finally {
+    if (core) await core.stop();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("DaemonCore never sends a migration control request, or its machine key, to an origin other than its server", async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "raft-daemon-migration-cross-origin-test-"));
+  const sockets: FakeWebSocket[] = [];
+  const migrationId = "migration-cross-origin";
+  const base = `/internal/computer/agent-migrations/by-id/${migrationId}/resumable`;
+  const foreignRequests: Array<{ url?: string; authorization?: string }> = [];
+  const foreign = await withHttpServer(async (req, res) => {
+    foreignRequests.push({ url: req.url, authorization: req.headers.authorization });
+    await readRequestBody(req);
+    res.statusCode = 200;
+    res.setHeader("Content-Type", "application/json");
+    res.end(JSON.stringify({ ok: true }));
+  });
+  const transportLost: Array<{ detailCode?: string }> = [];
+  const server = await withHttpServer(async (req, res) => {
+    if (req.method === "POST" && req.url === `/internal/computer/agent-migrations/by-id/${migrationId}/transport-lost`) {
+      transportLost.push(JSON.parse((await readRequestBody(req)).toString("utf8")));
+      res.statusCode = 200;
+      res.setHeader("Content-Type", "application/json");
+      res.end(JSON.stringify({ ok: true }));
+      return;
+    }
+    res.statusCode = 404;
+    res.end("not found");
+  });
+  let core: DaemonCore | null = null;
+  try {
+    await mkdir(path.join(dataDir, "agent-cross-origin"), { recursive: true });
+    await writeFile(path.join(dataDir, "agent-cross-origin", "MEMORY.md"), "stays on the source\n");
+    core = new DaemonCore({
+      serverUrl: server.baseUrl,
+      apiKey: "sk_machine_test",
+      dataDir,
+      slockHome: dataDir,
+      runtimeDetector: () => ({ ids: [], versions: {} }),
+      connectionOptions: {
+        wsFactory: () => {
+          const socket = new FakeWebSocket();
+          sockets.push(socket);
+          return socket;
+        },
+      },
+    });
+    core.start();
+    const socket = sockets[0];
+    assert.ok(socket);
+    socket.emitOpen();
+    socket.emitServerMessage({
+      type: "machine:migration_transport:lease",
+      agentId: "agent-cross-origin",
+      migrationId,
+      migrationRef: "mig_CROSSORIGINSOURCEAAAAA",
+      migrationGeneration: `agent_migration:${migrationId}:7`,
+      sessionId: "session-cross-origin",
+      provider: "object_store",
+      leaseSource: "server",
+      role: "source",
+      transferKind: "upload",
+      bearerToken: "source-token",
+      expiresAt: "2999-07-09T13:00:00.000Z",
+      maxBytes: 104857600,
+      controlUrl: `${foreign.baseUrl}${base}`,
+      leaseId: "lease-cross-origin",
+      transportGeneration: "transport-generation-cross-origin",
+      sourceMachineId: "source-machine-cross-origin",
+      targetMachineId: "target-machine-cross-origin",
+      expectedMigrationRevision: 7,
+    });
+
+    await waitFor(() => transportLost.length > 0, "the transfer is refused and reported to the Computer's own server");
+    assert.equal(transportLost[0]!.detailCode, "MIGRATION_CONTROL_URL_CROSS_ORIGIN");
+    assert.deepEqual(foreignRequests, [], "nothing, and no machine key, reached the other origin");
+  } finally {
+    if (core) await core.stop();
+    await foreign.close();
+    await server.close();
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
 test("DaemonCore downloads target chunks three at a time, imports the bundle and drives start-transfer, flip-machine and arrived by migration id", async () => {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "raft-daemon-migration-target-import-test-"));
   const sourceWorkspace = path.join(dataDir, "source-workspace");
@@ -2377,6 +3453,98 @@ test("DaemonCore downloads target chunks three at a time, imports the bundle and
       .map((entry) => path.basename(String(entry)));
     assert.ok(leftover.includes("arrival-report-v2.json"));
     assert.ok(!leftover.some((name) => name === "chunks" || name.endsWith(".chunk") || name.startsWith("extracting-")));
+  } finally {
+    if (core) await core.stop();
+    await transferServer.close();
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("DaemonCore keeps one target control wait, without resetting its backoff, when the same lease is re-sent", async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "raft-daemon-migration-control-wait-resend-test-"));
+  const sockets: FakeWebSocket[] = [];
+  const migrationId = "migration-control-wait-resend";
+  const base = `/internal/computer/agent-migrations/by-id/${migrationId}/resumable`;
+  let controlPolls = 0;
+  const pollTimes: number[] = [];
+  let ended = false;
+  const transferServer = await withHttpServer(async (req, res) => {
+    if (req.method === "GET" && req.url?.startsWith(`${base}/control?role=target`)) {
+      controlPolls += 1;
+      pollTimes.push(performance.now());
+      res.statusCode = ended ? 410 : 409;
+      res.setHeader("Content-Type", "application/json");
+      res.end(JSON.stringify(ended
+        ? { code: "MIGRATION_TRANSFER_ENDED" }
+        : { code: "MIGRATION_CONTROL_MANIFEST_MISSING" }));
+      return;
+    }
+    if (req.method === "POST") await readRequestBody(req);
+    res.statusCode = 404;
+    res.end("not found");
+  });
+  const lease = {
+    type: "machine:migration_transport:lease" as const,
+    agentId: "agent-control-wait-resend",
+    migrationId,
+    migrationRef: "mig_CONTROLWAITRESENDAAAAA",
+    migrationGeneration: `agent_migration:${migrationId}:4`,
+    sessionId: "session-control-wait-resend",
+    provider: "object_store" as const,
+    leaseSource: "server" as const,
+    role: "target" as const,
+    transferKind: "download" as const,
+    bearerToken: "target-token",
+    expiresAt: "2999-07-09T13:00:00.000Z",
+    maxBytes: 104857600,
+    controlUrl: base,
+    leaseId: "lease-control-wait-resend",
+    transportGeneration: "transport-generation-control-wait-resend",
+    sourceMachineId: "source-machine-control-wait-resend",
+    targetMachineId: "target-machine-control-wait-resend",
+    expectedMigrationRevision: 4,
+  };
+  let core: DaemonCore | null = null;
+  try {
+    core = new DaemonCore({
+      serverUrl: transferServer.baseUrl,
+      apiKey: "sk_machine_test",
+      dataDir,
+      slockHome: dataDir,
+      runtimeDetector: () => ({ ids: [], versions: {} }),
+      connectionOptions: {
+        wsFactory: () => {
+          const socket = new FakeWebSocket();
+          sockets.push(socket);
+          return socket;
+        },
+      },
+    });
+    core.start();
+    const socket = sockets[0];
+    assert.ok(socket);
+    socket.emitOpen();
+    socket.emitServerMessage(lease);
+
+    // Polls 1..6 sleep 25, 50, 100, 200, 400 ms between them; after the sixth
+    // the loop sleeps 800 ms.
+    await waitFor(() => controlPolls >= 6, "target polls the control six times");
+    const pollsBeforeResend = controlPolls;
+    for (let i = 0; i < 3; i += 1) socket.emitServerMessage({ ...lease });
+
+    // 410 still stops the wait.
+    ended = true;
+    await waitFor(() => controlPolls > pollsBeforeResend, "the backed-off poll sees 410");
+    // Timers only ever fire late, so a slow runner can only widen these gaps:
+    // a second wait or a restarted backoff would poll within ~25-50 ms.
+    const gapsAfterResend = pollTimes.slice(pollsBeforeResend - 1).map((at, i, all) => (i === 0 ? Infinity : at - all[i - 1]!));
+    assert.ok(
+      gapsAfterResend.every((gap) => gap >= 400),
+      `a re-sent lease neither starts a second control wait nor restarts the backoff at 25 ms (gaps ${gapsAfterResend.slice(1).map(Math.round).join(", ")} ms)`,
+    );
+    const pollsAtEnd = controlPolls;
+    await new Promise((resolve) => setTimeout(resolve, 1_800));
+    assert.equal(controlPolls, pollsAtEnd, "no poll after 410");
   } finally {
     if (core) await core.stop();
     await transferServer.close();
@@ -2935,7 +4103,7 @@ test("detectRuntimes treats driver probe unavailable as authoritative", async ()
     assert.equal(detection.ids.includes("opencode"), false);
     assert.match(detection.versions.opencode ?? "", /requires >= 1\.14\.30/);
     const span = traceRows(sink, traceId).find((candidate) => candidate.name === "daemon.runtime.detect");
-    assert.equal(span?.attrs?.known_runtime_count, 12);
+    assert.equal(span?.attrs?.known_runtime_count, 15);
     assert.equal(span?.attrs?.detected_runtime_count, detection.ids.length);
     const opencodeEvent = eventsForSpan(sink, traceId, "daemon.runtime.detect")
       .find((event) => event.attrs?.runtime === "opencode");
@@ -2972,6 +4140,38 @@ test("detectRuntimes carries the structured not_installed reason for runtimes mi
     else process.env.PATH = oldPath;
     if (oldHome === undefined) delete process.env.HOME;
     else process.env.HOME = oldHome;
+    await rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("detectRuntimes reports an OAR-only runtime (Qwen Code, Qoder, CodeBuddy Code) only where the OAR host runs", async () => {
+  const tmp = await mkdtemp(path.join(os.tmpdir(), "slock-runtime-detect-oar-only-"));
+  const binDir = path.join(tmp, "bin");
+  const oldPath = process.env.PATH;
+  const oldDisabled = process.env.RAFT_DAEMON_OAR_HOST_DISABLED;
+  try {
+    await mkdir(binDir, { recursive: true });
+    for (const binary of ["qwen", "qodercli", "codebuddy"]) {
+      await writeFile(path.join(binDir, binary), "#!/bin/sh\necho '0.4.0'\n", "utf8");
+      await chmod(path.join(binDir, binary), 0o755);
+    }
+    process.env.PATH = `${binDir}${path.delimiter}${oldPath ?? ""}`;
+    delete process.env.RAFT_DAEMON_OAR_HOST_DISABLED;
+    const enabled = detectRuntimes();
+    assert.equal(enabled.ids.includes("qwen"), true);
+    assert.equal(enabled.ids.includes("qoder"), true);
+    assert.equal(enabled.ids.includes("codebuddy"), true, "found as `codebuddy` on PATH");
+    assert.equal(enabled.versions.qwen, "0.4.0");
+    process.env.RAFT_DAEMON_OAR_HOST_DISABLED = "1";
+    const disabled = detectRuntimes();
+    assert.equal(disabled.ids.includes("qwen"), false, "nothing could run it");
+    assert.equal(disabled.ids.includes("qoder"), false);
+    assert.equal(disabled.ids.includes("codebuddy"), false);
+  } finally {
+    if (oldPath === undefined) delete process.env.PATH;
+    else process.env.PATH = oldPath;
+    if (oldDisabled === undefined) delete process.env.RAFT_DAEMON_OAR_HOST_DISABLED;
+    else process.env.RAFT_DAEMON_OAR_HOST_DISABLED = oldDisabled;
     await rm(tmp, { recursive: true, force: true });
   }
 });
@@ -3017,6 +4217,7 @@ test("DaemonCore scopes daemon traces with daemon and computer versions", async 
       apiKey: "sk_machine_test",
       daemonVersion: "0.55.6",
       computerVersion: "0.0.23",
+      computerBuildSha: "0570bc5395d3",
       dataDir,
       tracer,
       runtimeDetector: () => ({ ids: [], versions: {} }),
@@ -3040,6 +4241,7 @@ test("DaemonCore scopes daemon traces with daemon and computer versions", async 
     assert.equal(readySpan.attrs?.daemon_version_present, true);
     assert.equal(readySpan.attrs?.computer_version, "0.0.23");
     assert.equal(readySpan.attrs?.computer_version_present, true);
+    assert.equal(readySpan.attrs?.computer_build_sha, "0570bc5395d3");
 
     await core.stop();
     core = null;
@@ -3737,6 +4939,487 @@ test("task #917: every upgrade control failure settles the request, not only the
   }
 });
 
+// Reconciler step 13 (PR 3): the Server's `drain` reaches the Computer's
+// upgrade relay clamped, only on a runner with the drain channel; without it
+// (an old Server) the relay sees exactly what it saw before.
+// RED proof: drop `...(drain ? { drain } : {})` and the first upgrade's
+// context has no drain.
+test("step 13: a computer:upgrade with drain hands the clamped drain to the relay; without drain, or on a runner without the channel, none", async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "slock-daemon-upgrade-drain-test-"));
+  const run = async (withChannel: boolean, messages: ServerToMachineMessage[]) => {
+    const sockets: FakeWebSocket[] = [];
+    const contexts: ComputerControlContext[] = [];
+    const core = new DaemonCore({
+      serverUrl: "https://daemon.example.com",
+      apiKey: "sk_machine_test",
+      dataDir,
+      runtimeDetector: () => ({ ids: [], versions: {} }),
+      onComputerControl: async (_action, ctx) => { contexts.push(ctx); },
+      ...(withChannel ? { computerUpgradeDrainPaths: { requestPath: path.join(dataDir, "upgrade-drain.json"), statePath: path.join(dataDir, "upgrade-drain-state.json") } } : {}),
+      connectionOptions: {
+        wsFactory: () => {
+          const socket = new FakeWebSocket();
+          sockets.push(socket);
+          return socket;
+        },
+      },
+    });
+    try {
+      core.start();
+      sockets[0]!.emitOpen();
+      const ready = () => sockets[0]!.sent.find((message) => (message as { type?: string }).type === "ready") as { capabilities?: string[] } | undefined;
+      await waitFor(() => ready() !== undefined, "ready");
+      for (const message of messages) sockets[0]!.emitServerMessage(message);
+      await waitFor(() => contexts.length === messages.length, "relayed");
+      return { contexts, capabilities: ready()!.capabilities ?? [] };
+    } finally {
+      await core.stop();
+    }
+  };
+  try {
+    const managed = await run(true, [
+      { type: "computer:upgrade", requestId: "up-1", operationId: "up-1", targetVersion: "9.9.9", drain: { deadlineMs: 60 * 60_000 } },
+      { type: "computer:upgrade", requestId: "up-2", operationId: "up-2", targetVersion: "9.9.9" },
+      { type: "computer:upgrade", requestId: "up-3", operationId: "up-3", targetVersion: "9.9.9", drain: { deadlineMs: -1 } },
+    ]);
+    assert.ok(managed.capabilities.includes(DAEMON_CAPABILITY_COMPUTER_UPGRADE_DRAIN_V1));
+    assert.deepEqual(managed.contexts.map((ctx) => [ctx.requestId, ctx.drain]), [
+      ["up-1", { deadlineMs: COMPUTER_UPGRADE_DRAIN_MAX_DEADLINE_MS }],
+      ["up-2", undefined],
+      ["up-3", undefined],
+    ]);
+    const raw = await run(false, [
+      { type: "computer:upgrade", requestId: "up-4", operationId: "up-4", targetVersion: "9.9.9", drain: { deadlineMs: 60_000 } },
+    ]);
+    assert.equal(raw.capabilities.includes(DAEMON_CAPABILITY_COMPUTER_UPGRADE_DRAIN_V1), false);
+    assert.equal(raw.contexts[0]!.drain, undefined);
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+// Tenny f8ae3b79 condition 2, through the core: the drain the service's
+// request began is let go when the Server connection comes back.
+// RED proof: drop `this.upgradeDrain?.onConnected()` in handleConnect and no
+// `reconnected` release is recorded.
+test("step 13: a drain begun from the service's request ends on a re-established Server connection", async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "slock-daemon-upgrade-drain-reconnect-test-"));
+  const sockets: FakeWebSocket[] = [];
+  const events: Array<{ name: string; attrs: Record<string, unknown> }> = [];
+  const requestPath = path.join(dataDir, "upgrade-drain.json");
+  const statePath = path.join(dataDir, "upgrade-drain-state.json");
+  let core: DaemonCore | null = null;
+  const named = (name: string) => events.filter((event) => event.name === name);
+  try {
+    core = new DaemonCore({
+      serverUrl: "https://daemon.example.com",
+      apiKey: "sk_machine_test",
+      dataDir,
+      runtimeDetector: () => ({ ids: [], versions: {} }),
+      computerUpgradeDrainPaths: { requestPath, statePath },
+      connectionOptions: {
+        minReconnectDelayMs: 1,
+        wsFactory: () => {
+          const socket = new FakeWebSocket();
+          sockets.push(socket);
+          return socket;
+        },
+      },
+    });
+    const record = (core as any).recordDaemonEvent.bind(core);
+    (core as any).recordDaemonEvent = (name: string, attrs: Record<string, unknown> = {}, ...rest: unknown[]) => {
+      events.push({ name, attrs });
+      return record(name, attrs, ...rest);
+    };
+    core.start();
+    sockets[0]!.emitOpen();
+    await writeFile(requestPath, JSON.stringify({ formatVersion: 1, requestId: "up-r", origin: true, deadlineAtMs: Date.now() + 60_000, servicePid: process.pid }));
+    await waitFor(() => named("daemon.computer_upgrade.drain.began").length === 1, "the drain begins at the next poll");
+    const state = JSON.parse(await readFile(statePath, "utf8")) as { requestId: string; finished?: string };
+    assert.equal(state.requestId, "up-r");
+    await waitFor(() => sockets[0]!.sent.some((message) => (message as { type?: string }).type === "computer:upgrade:draining"), "the origin runner reports it");
+    sockets[0]!.terminate();
+    await waitFor(() => sockets.length === 2, "replacement websocket");
+    sockets[1]!.emitOpen();
+    await waitFor(() => named("daemon.computer_upgrade.drain.released").length === 1, "released");
+    assert.equal(named("daemon.computer_upgrade.drain.released")[0]!.attrs.reason, "reconnected");
+    assert.equal((JSON.parse(await readFile(statePath, "utf8")) as { finished?: string }).finished, "quiet", "no agents: it had finished quiet, which the service already read");
+    assert.equal((core as any).upgradeDrain.activeRequestId, null);
+    await new Promise((resolve) => setTimeout(resolve, 1_200));
+    assert.equal(named("daemon.computer_upgrade.drain.began").length, 1, "not begun again for the same request");
+  } finally {
+    if (core) await core.stop();
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("task #34: ready carries the Computer's installer repair hint; a change after a failed upgrade is sent once, newest read last", async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "slock-daemon-installer-repair-hint-test-"));
+  const sockets: FakeWebSocket[] = [];
+  const HINT = { reason: "unrecovered_operation" as const };
+  // Reads after ready: the first is slow and sees no hint, the second is fast
+  // and sees the hint again. Serialized, the newer read is the one left standing.
+  const reads: Array<{ delayMs: number; hint: typeof HINT | null }> = [{ delayMs: 40, hint: null }, { delayMs: 0, hint: HINT }];
+  let core: DaemonCore | null = null;
+  try {
+    let readyRead = true;
+    core = new DaemonCore({
+      serverUrl: "https://daemon.example.com",
+      apiKey: "sk_machine_test",
+      dataDir,
+      runtimeDetector: () => ({ ids: [], versions: {} }),
+      getComputerInstallerRepairHint: async () => {
+        if (readyRead) { readyRead = false; return HINT; }
+        const read = reads.shift() ?? { delayMs: 0, hint: HINT };
+        await new Promise<void>((resolve) => setTimeout(resolve, read.delayMs));
+        return read.hint;
+      },
+      onComputerControl: async () => {
+        throw new Error("UPGRADE_INSTALLER_FAILED: An earlier installation could not be recovered.");
+      },
+      connectionOptions: {
+        wsFactory: () => {
+          const socket = new FakeWebSocket();
+          sockets.push(socket);
+          return socket;
+        },
+      },
+    });
+    core.start();
+    const socket = sockets[0]!;
+    socket.emitOpen();
+    const ready = () => socket.sent.find((message) => (message as { type?: string }).type === "ready") as { installerRepairHint?: unknown } | undefined;
+    for (let i = 0; i < 20 && !ready(); i += 1) await new Promise<void>((resolve) => setTimeout(resolve, 5));
+    assert.deepEqual(ready()?.installerRepairHint, HINT);
+    const changes = () => socket.sent.filter((message) => (message as { type?: string }).type === "machine:installer_repair_hint");
+    socket.emitServerMessage({ type: "computer:upgrade", requestId: "upgrade-a", operationId: "upgrade-a" });
+    socket.emitServerMessage({ type: "computer:upgrade", requestId: "upgrade-b", operationId: "upgrade-b" });
+    for (let i = 0; i < 40 && changes().length < 2; i += 1) await new Promise<void>((resolve) => setTimeout(resolve, 5));
+    assert.deepEqual(changes(), [
+      { type: "machine:installer_repair_hint", hint: null },
+      { type: "machine:installer_repair_hint", hint: HINT },
+    ]);
+    socket.emitServerMessage({ type: "computer:upgrade", requestId: "upgrade-c", operationId: "upgrade-c" });
+    await new Promise<void>((resolve) => setTimeout(resolve, 20));
+    assert.equal(changes().length, 2, "an unchanged hint is not sent again");
+  } finally {
+    if (core) await core.stop();
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("Raft Desktop's move: the first ready to the server carries migratedFrom, once; the Computer is told it went out; a reconnect's ready does not carry it", async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "slock-daemon-migrated-from-test-"));
+  const sockets: FakeWebSocket[] = [];
+  let reads = 0;
+  let sent = 0;
+  let core: DaemonCore | null = null;
+  try {
+    core = new DaemonCore({
+      serverUrl: "https://daemon.example.com",
+      apiKey: "sk_machine_test",
+      dataDir,
+      runtimeDetector: () => ({ ids: [], versions: {} }),
+      getComputerMigratedFrom: async () => { reads += 1; return sent === 0 ? "electron" : null; },
+      onComputerMigratedFromSent: async () => { sent += 1; },
+      connectionOptions: {
+        wsFactory: () => {
+          const socket = new FakeWebSocket();
+          sockets.push(socket);
+          return socket;
+        },
+      },
+    });
+    core.start();
+    sockets[0]!.emitOpen();
+    const readies = (socket: FakeWebSocket) => socket.sent.filter((message) => (message as { type?: string }).type === "ready") as Array<{ migratedFrom?: unknown }>;
+    await waitFor(() => readies(sockets[0]!).length > 0 && sent === 1, "first ready");
+    assert.equal(readies(sockets[0]!)[0]!.migratedFrom, "electron");
+    for (const later of readies(sockets[0]!).slice(1)) assert.equal(later.migratedFrom, undefined, "later readies on this connection do not repeat it");
+    const readsAfterFirst = reads;
+    sockets[0]!.terminate();
+    await waitFor(() => sockets.length === 2, "replacement websocket");
+    sockets[1]!.emitOpen();
+    await waitFor(() => readies(sockets[1]!).length > 0, "ready after the reconnect");
+    assert.equal(readies(sockets[1]!)[0]!.migratedFrom, undefined);
+    assert.equal(sent, 1, "acknowledged once");
+    assert.equal(reads, readsAfterFirst, "not even read again in this process");
+  } finally {
+    if (core) await core.stop();
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("a daemon without the Computer seam (or one that reads nothing) sends no migratedFrom", async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "slock-daemon-migrated-from-none-test-"));
+  const sockets: FakeWebSocket[] = [];
+  let core: DaemonCore | null = null;
+  try {
+    core = new DaemonCore({
+      serverUrl: "https://daemon.example.com",
+      apiKey: "sk_machine_test",
+      dataDir,
+      runtimeDetector: () => ({ ids: [], versions: {} }),
+      getComputerMigratedFrom: async () => { throw new Error("EACCES"); },
+      connectionOptions: { wsFactory: () => { const socket = new FakeWebSocket(); sockets.push(socket); return socket; } },
+    });
+    core.start();
+    sockets[0]!.emitOpen();
+    await waitFor(() => sockets[0]!.sent.some((message) => (message as { type?: string }).type === "ready"), "ready");
+    const ready = sockets[0]!.sent.find((message) => (message as { type?: string }).type === "ready") as Record<string, unknown>;
+    assert.equal("migratedFrom" in ready, false, "a failed read never blocks or fills the ready");
+  } finally {
+    if (core) await core.stop();
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("remote upgrade steps from the Computer's log go out as trace events after ready, then are acked", async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "slock-daemon-upgrade-steps-test-"));
+  const sockets: FakeWebSocket[] = [];
+  const { sink, tracer } = makeDeterministicTracer();
+  const collected: boolean[] = [];
+  let acked = 0;
+  let core: DaemonCore | null = null;
+  try {
+    core = new DaemonCore({
+      serverUrl: "https://daemon.example.com",
+      apiKey: "sk_machine_test",
+      dataDir,
+      tracer,
+      runtimeDetector: () => ({ ids: [], versions: {} }),
+      getComputerLastUpgradeReceipt: async () => ({ targetVersion: "1.0.51", outcome: "rolled_back", reason: "1.0.51 didn't start" }),
+      collectComputerUpgradeSteps: async ({ relayedInReady }) => {
+        collected.push(relayedInReady);
+        return {
+          events: [{
+            requestId: "req-1", step: "rolled_back", outcome: "failed", atMs: 1, deliveredLateMs: 1_900_000, afterDeadline: true,
+            fromVersion: "1.0.50", targetVersion: "1.0.51", durationMs: 40_000, errorCode: "candidate_start_failed", reason: "1.0.51 didn't start",
+            diagnostic: "candidate did not become ready", startFailure: "exited", startExitCode: 1,
+            installerVersion: "0.4.0", receiptOutcome: "rolled_back", engineDiagnostic: "probe failed: candidate was not started successfully",
+            enginePhase: "rolled-back", engineOutcome: "rolled-back", engineReason: "probe failed",
+            lastStartSlot: "previous", lastStartVersion: "1.0.50", lastStartSucceeded: false, lastStartFailure: "exited", lastStartExitCode: 2,
+            afterReceipt: true,
+          }],
+          ack: async () => { acked += 1; },
+        };
+      },
+      watchComputerUpgradeOutcome: async () => { throw new Error("a ready that carried the receipt needs no watch"); },
+      connectionOptions: {
+        wsFactory: () => {
+          const socket = new FakeWebSocket();
+          sockets.push(socket);
+          return socket;
+        },
+      },
+    });
+    core.start();
+    sockets[0]!.emitOpen();
+    for (let i = 0; i < 20 && acked === 0; i += 1) await new Promise<void>((resolve) => setTimeout(resolve, 5));
+    assert.deepEqual(collected, [true], "the ready carried the receipt");
+    assert.equal(acked, 1);
+    const step = traceRows(sink).find((row) => row.name === "daemon.computer_upgrade.step");
+    assert.deepEqual(step?.attrs && {
+      request_id: step.attrs.request_id, step: step.attrs.step, outcome: step.attrs.outcome, error_code: step.attrs.error_code,
+      from_version: step.attrs.from_version, after_deadline: step.attrs.after_deadline, delivered_late_ms: step.attrs.delivered_late_ms, status: step.attrs.status,
+      diagnostic: step.attrs.diagnostic, start_failure: step.attrs.start_failure, start_exit_code: step.attrs.start_exit_code,
+      installer_version: step.attrs.installer_version, receipt_outcome: step.attrs.receipt_outcome, engine_diagnostic: step.attrs.engine_diagnostic,
+      engine_phase: step.attrs.engine_phase, engine_outcome: step.attrs.engine_outcome, engine_reason: step.attrs.engine_reason,
+      last_start_slot: step.attrs.last_start_slot, last_start_version: step.attrs.last_start_version, last_start_succeeded: step.attrs.last_start_succeeded,
+      last_start_failure: step.attrs.last_start_failure, last_start_exit_code: step.attrs.last_start_exit_code, after_receipt: step.attrs.after_receipt,
+    }, {
+      request_id: "req-1", step: "rolled_back", outcome: "failed", error_code: "candidate_start_failed",
+      from_version: "1.0.50", after_deadline: true, delivered_late_ms: 1_900_000, status: "error",
+      diagnostic: "candidate did not become ready", start_failure: "exited", start_exit_code: 1,
+      installer_version: "0.4.0", receipt_outcome: "rolled_back", engine_diagnostic: "probe failed: candidate was not started successfully",
+      engine_phase: "rolled-back", engine_outcome: "rolled-back", engine_reason: "probe failed",
+      last_start_slot: "previous", last_start_version: "1.0.50", last_start_succeeded: false, last_start_failure: "exited", last_start_exit_code: 2,
+      after_receipt: true,
+    });
+    assert.equal(traceRows(sink).some((row) => row.name === "daemon.connect.lifecycle_error"), false);
+  } finally {
+    if (core) await core.stop();
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("the Computer's device session retire outcome goes out once as a trace event after ready", async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "slock-daemon-retire-report-test-"));
+  const sockets: FakeWebSocket[] = [];
+  const { sink, tracer } = makeDeterministicTracer();
+  let calls = 0;
+  let core: DaemonCore | null = null;
+  try {
+    core = new DaemonCore({
+      serverUrl: "https://daemon.example.com",
+      apiKey: "sk_machine_test",
+      dataDir,
+      tracer,
+      runtimeDetector: () => ({ ids: [], versions: {} }),
+      // Claimed: the first call takes it, later ones get null.
+      collectComputerDeviceSessionRetire: async () => {
+        calls += 1;
+        return calls === 1 ? { reason: "no_matching_key", deleted: true, keysTried: 1, attempt: 1, httpStatus: 403, logout: "ok" } : null;
+      },
+      connectionOptions: { wsFactory: () => { const socket = new FakeWebSocket(); sockets.push(socket); return socket; } },
+    });
+    core.start();
+    sockets[0]!.emitOpen();
+    await waitFor(() => traceRows(sink).some((row) => row.name === "daemon.computer.device_session_retire"), "retire event");
+    const rows = traceRows(sink).filter((row) => row.name === "daemon.computer.device_session_retire");
+    assert.equal(rows.length, 1);
+    const attrs = rows[0]!.attrs ?? {};
+    assert.deepEqual(
+      { reason: attrs.reason, deleted: attrs.deleted, keys_tried: attrs.keys_tried, attempt: attrs.attempt, http_status: attrs.http_status, logout: attrs.logout, status: attrs.status },
+      { reason: "no_matching_key", deleted: true, keys_tried: 1, attempt: 1, http_status: 403, logout: "ok", status: "ok" },
+    );
+  } finally {
+    if (core) await core.stop();
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("machine-lock conflicts other runners of the Computer exited on go out once each after ready, coarse only", async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "slock-daemon-lock-conflict-relay-test-"));
+  const sockets: FakeWebSocket[] = [];
+  const { sink, tracer } = makeDeterministicTracer();
+  let calls = 0;
+  let core: DaemonCore | null = null;
+  try {
+    core = new DaemonCore({
+      serverUrl: "https://daemon.example.com",
+      apiKey: "sk_machine_test",
+      dataDir,
+      tracer,
+      runtimeDetector: () => ({ ids: [], versions: {} }),
+      // Claimed: the first call takes them, later ones get none.
+      collectComputerMachineLockConflicts: async () => {
+        calls += 1;
+        return calls === 1
+          ? [{ ownerStartReadable: false, lockAgeDays: "gt_30" }, { ownerStartReadable: null, lockAgeDays: "unknown" }]
+          : [];
+      },
+      connectionOptions: { wsFactory: () => { const socket = new FakeWebSocket(); sockets.push(socket); return socket; } },
+    });
+    core.start();
+    sockets[0]!.emitOpen();
+    const conflictRows = () => traceRows(sink).filter((row) => row.name === "daemon.machine_lock.conflict");
+    await waitFor(() => conflictRows().length === 2, "conflict events");
+    assert.equal(calls, 1);
+    assert.deepEqual(
+      conflictRows().map(({ attrs = {} }) => ({
+        platform: attrs.platform,
+        owner_start_readable: attrs.owner_start_readable,
+        lock_age_days: attrs.lock_age_days,
+        status: attrs.status,
+      })),
+      [
+        { platform: process.platform, owner_start_readable: false, lock_age_days: "gt_30", status: "error" },
+        { platform: process.platform, owner_start_readable: undefined, lock_age_days: "unknown", status: "error" },
+      ],
+    );
+  } finally {
+    if (core) await core.stop();
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("a daemon that took over a stale machine lock says so once, without a pid or a path; a released lock is no reclaim", async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "slock-daemon-lock-reclaim-test-"));
+  const machineStateDir = path.join(dataDir, "machines");
+  const lockDir = path.join(machineStateDir, getDaemonMachineLockId("sk_machine_test"), "daemon.lock");
+  await mkdir(lockDir, { recursive: true });
+  // A lock dir its writer never finished (no owner.json), long enough ago.
+  const old = new Date(Date.now() - 120_000);
+  await utimes(lockDir, old, old);
+  const startCore = () => {
+    const { sink, tracer } = makeDeterministicTracer();
+    const core = new DaemonCore({
+      serverUrl: "https://daemon.example.com",
+      apiKey: "sk_machine_test",
+      dataDir,
+      machineStateDir,
+      tracer,
+      runtimeDetector: () => ({ ids: [], versions: {} }),
+      connectionOptions: { wsFactory: () => new FakeWebSocket() },
+    });
+    core.start();
+    return { core, reclaimed: () => traceRows(sink).filter((row) => row.name === "daemon.machine_lock.reclaimed") };
+  };
+  let first: ReturnType<typeof startCore> | null = null;
+  let second: ReturnType<typeof startCore> | null = null;
+  try {
+    first = startCore();
+    const rows = first.reclaimed();
+    assert.equal(rows.length, 1);
+    const attrs = rows[0]!.attrs ?? {};
+    assert.deepEqual(
+      { reason: attrs.reason, platform: attrs.platform, identity_source: attrs.identity_source, status: attrs.status },
+      { reason: "incomplete", platform: process.platform, identity_source: undefined, status: "ok" },
+    );
+    assert.ok(!JSON.stringify(rows[0]).includes(machineStateDir), "no path in the event");
+    assert.ok(!Object.values(attrs).includes(process.pid), "no pid in the event");
+    await first.core.stop();
+    first = null;
+
+    second = startCore();
+    assert.equal(second.reclaimed().length, 0);
+  } finally {
+    if (first) await first.core.stop();
+    if (second) await second.core.stop();
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("remote upgrade: a restored service whose receipt appears after ready settles the request with upgrade:done", async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "slock-daemon-upgrade-late-receipt-test-"));
+  const sockets: FakeWebSocket[] = [];
+  const { sink, tracer } = makeDeterministicTracer();
+  let watches = 0;
+  let core: DaemonCore | null = null;
+  try {
+    core = new DaemonCore({
+      serverUrl: "https://daemon.example.com",
+      apiKey: "sk_machine_test",
+      dataDir,
+      tracer,
+      runtimeDetector: () => ({ ids: [], versions: {} }),
+      getComputerLastUpgradeReceipt: async () => null,
+      collectComputerUpgradeSteps: async () => ({ events: [], ack: async () => {} }),
+      watchComputerUpgradeOutcome: async () => {
+        watches += 1;
+        return { requestId: "req-rb", outcome: "rolled_back", reason: "1.0.51 didn't start\ncorrectly" };
+      },
+      connectionOptions: {
+        wsFactory: () => {
+          const socket = new FakeWebSocket();
+          sockets.push(socket);
+          return socket;
+        },
+      },
+    });
+    core.start();
+    const socket = sockets[0]!;
+    socket.emitOpen();
+    const done = () => socket.sent.find((message) => (message as { type?: string }).type === "computer:upgrade:done");
+    for (let i = 0; i < 20 && !done(); i += 1) await new Promise<void>((resolve) => setTimeout(resolve, 5));
+    assert.deepEqual(done(), {
+      type: "computer:upgrade:done",
+      requestId: "req-rb",
+      ok: false,
+      code: "upgrade_rolled_back",
+      reason: "1.0.51 didn't start correctly",
+    });
+    assert.equal(watches, 1);
+    const reported = traceRows(sink).find((row) => row.name === "daemon.computer_upgrade.step" && row.attrs?.step === "reported");
+    assert.equal(reported?.attrs?.via, "late_receipt");
+    assert.equal(reported?.attrs?.outcome, "ok");
+  } finally {
+    if (core) await core.stop();
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
 test("DaemonCore ready reports migration transport as not provisioned when no transport is configured", async () => {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "slock-daemon-migration-transport-ready-none-test-"));
   const sockets: FakeWebSocket[] = [];
@@ -3770,7 +5453,7 @@ test("DaemonCore ready reports migration transport as not provisioned when no tr
       provisioned: false,
       endpoint: null,
       leaseSource: null,
-      capabilities: [AGENT_MIGRATION_CAPABILITY],
+      capabilities: [AGENT_MIGRATION_CAPABILITY, AGENT_MIGRATION_TARGET_IGNORE_SOURCES_CAPABILITY, AGENT_MIGRATION_SOURCE_USER_IGNORE_CAPABILITY, AGENT_MIGRATION_SOURCE_DRAIN_CAPABILITY, AGENT_MIGRATION_AGENT_RETRY_CAPABILITY],
       // No live transfer run in a fresh process: the server may re-provision.
       activeLeases: [],
       observedAt: ready.migrationTransport?.observedAt,
@@ -3992,7 +5675,7 @@ test("DaemonCore applies object-store migration transfer lease and re-emits prov
     const serverReady = readyMessages().find((msg) => msg.migrationTransport?.leaseSource === "server");
     assert.equal(serverReady?.migrationTransport?.provisioned, true);
     assert.equal(serverReady?.migrationTransport?.endpoint, null);
-    assert.deepEqual(serverReady?.migrationTransport?.capabilities, [AGENT_MIGRATION_CAPABILITY]);
+    assert.deepEqual(serverReady?.migrationTransport?.capabilities, [AGENT_MIGRATION_CAPABILITY, AGENT_MIGRATION_TARGET_IGNORE_SOURCES_CAPABILITY, AGENT_MIGRATION_SOURCE_USER_IGNORE_CAPABILITY, AGENT_MIGRATION_SOURCE_DRAIN_CAPABILITY, AGENT_MIGRATION_AGENT_RETRY_CAPABILITY]);
     assert.equal(serverReady?.migrationTransport?.provider, "object_store");
     assert.equal(serverReady?.migrationTransport?.role, "source");
     assert.equal(serverReady?.migrationTransport?.transferKind, "upload");
@@ -4485,6 +6168,7 @@ test("DaemonCore derives default agent dataDir from SLOCK_HOME", async () => {
           setTracer: () => {},
           stopAll: async () => {},
           getRunningAgentIds: () => [],
+          getHeldRunnerCredentialIds: () => [],
           resendPendingServerWakes: () => {},
           startAgent: async () => {},
           stopAgent: () => {},
@@ -4538,6 +6222,7 @@ test("DaemonCore echoes skills list requestId on success and fallback replies", 
         setTracer: () => {},
         stopAll: async () => {},
         getRunningAgentIds: () => [],
+        getHeldRunnerCredentialIds: () => [],
         resendPendingServerWakes: () => {},
         getAgentSessionId: () => null,
         getAgentLaunchId: () => null,
@@ -4775,6 +6460,7 @@ test("DaemonCore releases machine lock even when agent shutdown fails", async ()
     agentManagerFactory: () => ({
       stopAll: () => Promise.reject(shutdownError),
       getRunningAgentIds: () => [],
+      getHeldRunnerCredentialIds: () => [],
       resendPendingServerWakes: () => {},
       getAgentSessionId: () => null,
       getAgentLaunchId: () => null,
@@ -4945,6 +6631,62 @@ test("DaemonCore ACKs an accepted start dispatch and never spawns its replay twi
   }
 });
 
+test("View Context: DaemonCore advertises agent-context-view:v0, hands a request to the agent manager and asks for availability after ready", async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "slock-daemon-core-test-"));
+  const sockets: FakeWebSocket[] = [];
+  const requests: unknown[] = [];
+  const availabilityTriggers: string[] = [];
+  let connectedServerId: (() => string | null) | undefined;
+  const core = new DaemonCore({
+    serverUrl: "https://daemon.example.com",
+    apiKey: "sk_machine_test",
+    dataDir,
+    connectionOptions: {
+      wsFactory: (_url: string, _options?: Parameters<NonNullable<ConnectionOptions["wsFactory"]>>[1]) => {
+        const socket = new FakeWebSocket();
+        sockets.push(socket);
+        return socket;
+      },
+    },
+    agentManagerFactory: (sendToServer, daemonApiKey, options) => {
+      connectedServerId = options?.connectedServerId;
+      const manager = new AgentProcessManager(sendToServer, daemonApiKey, {
+        dataDir: options?.dataDir,
+        serverUrl: options?.serverUrl ?? "https://daemon.example.com",
+        driverResolver: () => new FakeDriver(),
+      });
+      manager.handleAgentContextViewRequest = async (frame) => {
+        requests.push(frame);
+      };
+      manager.reportAgentContextViewAvailability = (trigger) => {
+        availabilityTriggers.push(trigger);
+      };
+      return manager;
+    },
+  });
+  try {
+    // The agent manager learns which server this daemon serves (its View Context data is kept per server).
+    assert.equal(connectedServerId?.(), null);
+    core.start();
+    const socket = sockets[0]!;
+    openAckingServer(socket);
+    await waitFor(() => socket.sent.some((msg) => (msg as { type?: string }).type === "ready"), "ready");
+    const ready = socket.sent.find((msg) => (msg as { type?: string }).type === "ready") as { capabilities?: string[] };
+    assert.equal(ready.capabilities?.includes(DAEMON_CAPABILITY_AGENT_CONTEXT_VIEW_V0), true);
+    assert.equal(ready.capabilities?.includes(DAEMON_CAPABILITY_AGENT_CONTEXT_SEARCH_V0), true);
+    assert.equal(ready.capabilities?.includes(DAEMON_CAPABILITY_AGENT_CONTEXT_VIEW_CODEX_ROOT_V1), true);
+    assert.equal(connectedServerId?.(), "server-test");
+    await waitFor(() => availabilityTriggers.includes("ready"), "availability after ready");
+    const frame = { type: "agent:context_view_request", requestId: asAgentContextViewRequestId("ctxv_0123456789abcdef0123")!, agentId: "agent-1", messageId: "m-1", maxBytes: 1000 } as const;
+    socket.emitServerMessage(frame);
+    await waitFor(() => requests.length === 1, "request handed over");
+    assert.deepEqual(requests[0], frame);
+  } finally {
+    await core.stop();
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
 test("RFC 071: DaemonCore advertises runtime outcomes, acks processInstanceId only on a rebind, and threads catchupBatchId to the echo", async () => {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "slock-daemon-core-test-"));
   const driver = new FakeDriver({ supportsStdinNotification: true });
@@ -5044,6 +6786,121 @@ test("RFC 071: DaemonCore advertises runtime outcomes, acks processInstanceId on
   }
 });
 
+test("an OAR-only runtime on a Computer with the OAR host turned off fails its start with the reason, never reaching the legacy host", async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "slock-daemon-core-test-"));
+  const driver = new FakeDriver({ supportsStdinNotification: true });
+  const sockets: FakeWebSocket[] = [];
+  const previousDisabled = process.env.SLOCK_AGENT_RUNNER_CREDENTIALS_DISABLED;
+  process.env.SLOCK_AGENT_RUNNER_CREDENTIALS_DISABLED = "1";
+  const core = new DaemonCore({
+    serverUrl: "https://daemon.example.com",
+    apiKey: "sk_machine_test",
+    dataDir,
+    oarHost: false,
+    connectionOptions: {
+      wsFactory: () => {
+        const socket = new FakeWebSocket();
+        sockets.push(socket);
+        return socket;
+      },
+    },
+    agentManagerFactory: (sendToServer, daemonApiKey, options) =>
+      new AgentProcessManager(sendToServer, daemonApiKey, {
+        dataDir: options?.dataDir,
+        serverUrl: options?.serverUrl ?? "https://daemon.example.com",
+        driverResolver: () => driver,
+        tracer: options?.tracer,
+        daemonInstanceId: options?.daemonInstanceId,
+      }),
+  });
+  type Outcome = Extract<MachineToServerMessage, { type: "agent:start:outcome" }>;
+  type Activity = Extract<MachineToServerMessage, { type: "agent:activity" }>;
+  try {
+    core.start();
+    const socket = sockets[0]!;
+    openAckingServer(socket);
+    socket.emitServerMessage({
+      type: "agent:start",
+      agentId: "agent-1",
+      startDispatchId: "dispatch-1",
+      launchId: "launch-1",
+      config: makeConfig({ runtime: "qwen", agentCredentialKey: "sk_agent_test" }),
+    });
+    const outcomes = () => socket.sent.filter((msg): msg is Outcome => (msg as { type?: string }).type === "agent:start:outcome");
+    await waitFor(() => outcomes().length >= 1, "start outcome");
+    assert.equal(driver.spawnCalls.length, 0);
+    assert.deepEqual(outcomes().map((frame) => frame.result), [{ kind: "not_spawned", reason: "start_rejected" }]);
+    const failure = socket.sent.find((msg): msg is Activity =>
+      (msg as { type?: string }).type === "agent:activity" && (msg as Activity).detailKind === "runtime_unavailable");
+    assert.match(failure?.detail ?? "", /Qwen Code runs only on the OAR host, which is turned off on this Computer \(RAFT_DAEMON_OAR_HOST_DISABLED\)/);
+  } finally {
+    if (previousDisabled === undefined) delete process.env.SLOCK_AGENT_RUNNER_CREDENTIALS_DISABLED;
+    else process.env.SLOCK_AGENT_RUNNER_CREDENTIALS_DISABLED = previousDisabled;
+    await core.stop();
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("a start whose env vars set PATH or NODE_OPTIONS still starts: the Computer records the names and does not refuse", async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "slock-daemon-core-test-"));
+  const driver = new FakeDriver({ supportsStdinNotification: true });
+  const sockets: FakeWebSocket[] = [];
+  const previousDisabled = process.env.SLOCK_AGENT_RUNNER_CREDENTIALS_DISABLED;
+  process.env.SLOCK_AGENT_RUNNER_CREDENTIALS_DISABLED = "1";
+  const core = new DaemonCore({
+    serverUrl: "https://daemon.example.com",
+    apiKey: "sk_machine_test",
+    dataDir,
+    connectionOptions: {
+      wsFactory: () => {
+        const socket = new FakeWebSocket();
+        sockets.push(socket);
+        return socket;
+      },
+    },
+    agentManagerFactory: (sendToServer, daemonApiKey, options) =>
+      new AgentProcessManager(sendToServer, daemonApiKey, {
+        dataDir: options?.dataDir,
+        serverUrl: options?.serverUrl ?? "https://daemon.example.com",
+        driverResolver: () => driver,
+        tracer: options?.tracer,
+        daemonInstanceId: options?.daemonInstanceId,
+      }),
+  });
+  type Outcome = Extract<MachineToServerMessage, { type: "agent:start:outcome" }>;
+  type Activity = Extract<MachineToServerMessage, { type: "agent:activity" }>;
+  try {
+    core.start();
+    const socket = sockets[0]!;
+    openAckingServer(socket);
+    socket.emitServerMessage({
+      type: "agent:start",
+      agentId: "agent-1",
+      startDispatchId: "dispatch-1",
+      launchId: "launch-1",
+      config: makeConfig({
+        agentCredentialKey: "sk_agent_test",
+        envVars: { PATH: "/opt/evil-bin:/usr/bin", NODE_OPTIONS: "--require /tmp/evil.js", ANTHROPIC_BASE_URL: "https://example.com" },
+      }),
+    });
+    await waitFor(() => driver.spawnCalls.length >= 1, "spawn");
+    // xxchan (#proj-raft-computer:bbea62a0): the server refuses new writes of
+    // these names; the Computer only records them, so existing agents keep running.
+    assert.equal(driver.spawnCalls[0]?.config.envVars?.NODE_OPTIONS, "--require /tmp/evil.js");
+    const outcomes = socket.sent.filter((msg): msg is Outcome => (msg as { type?: string }).type === "agent:start:outcome");
+    assert.ok(!outcomes.some((frame) => frame.result.kind === "not_spawned"), "the start is not refused");
+    const refused = socket.sent.find((msg): msg is Activity =>
+      (msg as { type?: string }).type === "agent:activity" && (msg as Activity).spawnFailure?.reason === "env_var_not_allowed");
+    assert.equal(refused, undefined);
+    assert.doesNotMatch(JSON.stringify(socket.sent), /evil/);
+  } finally {
+    if (previousDisabled === undefined) delete process.env.SLOCK_AGENT_RUNNER_CREDENTIALS_DISABLED;
+    else process.env.SLOCK_AGENT_RUNNER_CREDENTIALS_DISABLED = previousDisabled;
+    await core.stop();
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
 test("RFC 071: DaemonCore settles a start it rejects before any process as not_spawned(start_rejected), exactly once", async () => {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "slock-daemon-core-test-"));
   const driver = new FakeDriver({ supportsStdinNotification: true });
@@ -5085,14 +6942,6 @@ test("RFC 071: DaemonCore settles a start it rejects before any process as not_s
       launchId: "launch-1",
       config: makeConfig({ agentCredentialKey: undefined }),
     });
-    // Retired start type: rejected outright.
-    socket.emitServerMessage({
-      type: "agent:start:wiki",
-      agentId: "agent-2",
-      launchId: "launch-2",
-      config: makeConfig(),
-      wikiWorkspacePack: { protocolVersion: 1, packId: "pack-1", files: [] },
-    });
     // The process manager settles its own failure: spawn failed before a
     // child existed. DaemonCore's failure report must not add a second result.
     driver.spawn = () => { throw new Error("spawn ENOENT"); };
@@ -5103,13 +6952,12 @@ test("RFC 071: DaemonCore settles a start it rejects before any process as not_s
       launchId: "launch-3",
       config: makeConfig(),
     });
-    await waitFor(() => outcomes(socket).length >= 3, "three start outcomes");
+    await waitFor(() => outcomes(socket).length >= 2, "two start outcomes");
     await new Promise((resolve) => setTimeout(resolve, 50));
     assert.equal(driver.spawnCalls.length, 0);
     assert.equal(socket.sent.filter((msg) => (msg as { type?: string }).type === "agent:process_spawned").length, 0);
     assert.deepEqual(outcomes(socket).map((frame) => [frame.agentId, frame.launchId, frame.result]).sort(), [
       ["agent-1", "launch-1", { kind: "not_spawned", reason: "start_rejected" }],
-      ["agent-2", "launch-2", { kind: "not_spawned", reason: "start_rejected" }],
       ["agent-3", "launch-3", { kind: "not_spawned", reason: "spawn_failed" }],
     ]);
   } finally {
@@ -5812,7 +7660,13 @@ test("DaemonCore mints a runner credential before starting an agent", async () =
   const sockets: FakeWebSocket[] = [];
   const mintCalls: Array<{ url: string; headers: Headers; body: any }> = [];
   const revokeCalls: Array<{ url: string; headers: Headers; method?: string }> = [];
+  // A host of its own, and only its mints and revokes count: an earlier test's
+  // daemon can still reach this process-global mock (staging run 42565160244),
+  // as in the ready and rebind tests (#13633).
+  const serverUrl = "https://daemon-mint-first.example.com";
   const restoreFetch = installDaemonFetchMockForTests((async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = new URL(String(input));
+    if (url.origin !== serverUrl) return new Response(null, { status: 404 });
     if (init?.method === "DELETE") {
       revokeCalls.push({
         url: String(input),
@@ -5820,6 +7674,9 @@ test("DaemonCore mints a runner credential before starting an agent", async () =
         method: init.method,
       });
       return new Response(null, { status: 204 });
+    }
+    if (init?.method !== "POST" || !/^\/internal\/computer\/runners\/[^/]+\/credentials$/.test(url.pathname)) {
+      return new Response(null, { status: 404 });
     }
     mintCalls.push({
       url: String(input),
@@ -5833,7 +7690,7 @@ test("DaemonCore mints a runner credential before starting an agent", async () =
   }) as typeof fetch);
 
   const core = new DaemonCore({
-    serverUrl: "https://daemon.example.com",
+    serverUrl,
     apiKey: "sk_machine_test",
     dataDir,
     connectionOptions: {
@@ -5846,7 +7703,7 @@ test("DaemonCore mints a runner credential before starting an agent", async () =
     agentManagerFactory: (sendToServer, daemonApiKey, options) =>
       new AgentProcessManager(sendToServer, daemonApiKey, {
         dataDir: options?.dataDir,
-        serverUrl: options?.serverUrl ?? "https://daemon.example.com",
+        serverUrl: options?.serverUrl ?? serverUrl,
         driverResolver: () => driver,
         defaultAgentEnvVarsProvider: options?.defaultAgentEnvVarsProvider,
         tracer: options?.tracer,
@@ -5883,6 +7740,217 @@ test("DaemonCore mints a runner credential before starting an agent", async () =
   } finally {
     restoreFetch();
     await core.stop();
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+// #wg-rbac:#27: a start the hosts rebind onto the running process runs on that
+// process's runner credential. Minting one for it left a key nothing used and
+// nothing revoked, valid on the server for good.
+// Teeth: mint unconditionally in handleAgentStart -> a second mint -> RED.
+test("DaemonCore mints no runner credential for a start that rebinds the running process; stop revokes the running one once", async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "slock-daemon-core-test-"));
+  const driver = new FakeDriver();
+  const sockets: FakeWebSocket[] = [];
+  // A host of its own: late requests from an earlier test's daemon reach
+  // this process-global mock too, and must not count as this test's mints.
+  const serverUrl = "https://daemon-rebind-creds.example.com";
+  const requests: string[] = [];
+  let minted = 0;
+  const revokedPaths: string[] = [];
+  const restoreFetch = installDaemonFetchMockForTests((async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = new URL(String(input));
+    requests.push(`${init?.method ?? "GET"} ${url.origin}${url.pathname}`);
+    // Only this host's revokes count, as only its mints do: a late DELETE from
+    // an earlier test's daemon reached this process-global mock too.
+    if (init?.method === "DELETE") {
+      if (url.origin === serverUrl) revokedPaths.push(url.pathname);
+      return new Response(null, { status: 204 });
+    }
+    // Only a mint counts (see the ready test below).
+    if (url.origin !== serverUrl || init?.method !== "POST" || !/^\/internal\/computer\/runners\/[^/]+\/credentials$/.test(url.pathname)) {
+      return new Response(null, { status: 404 });
+    }
+    minted += 1;
+    return new Response(JSON.stringify({ apiKey: `sk_agent_minted_${minted}`, credentialId: `cred-${minted}` }), {
+      status: 201,
+      headers: { "content-type": "application/json" },
+    });
+  }) as typeof fetch);
+
+  const core = new DaemonCore({
+    serverUrl,
+    apiKey: "sk_machine_test",
+    dataDir,
+    connectionOptions: {
+      wsFactory: (_url: string, _options?: Parameters<NonNullable<ConnectionOptions["wsFactory"]>>[1]) => {
+        const socket = new FakeWebSocket();
+        sockets.push(socket);
+        return socket;
+      },
+    },
+    agentManagerFactory: (sendToServer, daemonApiKey, options) =>
+      new AgentProcessManager(sendToServer, daemonApiKey, {
+        dataDir: options?.dataDir,
+        serverUrl: options?.serverUrl ?? serverUrl,
+        driverResolver: () => driver,
+        defaultAgentEnvVarsProvider: options?.defaultAgentEnvVarsProvider,
+        tracer: options?.tracer,
+      }),
+  });
+
+  try {
+    core.start();
+    const socket = sockets[0];
+    assert.ok(socket, "wsFactory should create a websocket");
+    socket.emitOpen();
+
+    socket.emitServerMessage({
+      type: "agent:start",
+      agentId: "agent-1",
+      startDispatchId: "dispatch-1",
+      launchId: "launch-1",
+      config: makeConfig({ agentCredentialKey: null }),
+    });
+    await waitFor(() => minted === 1 && driver.spawnCalls.length === 1, "fresh start mints once and spawns");
+    assert.equal(driver.spawnCalls[0]?.config.agentCredentialId, "cred-1");
+
+    socket.emitServerMessage({
+      type: "agent:start",
+      agentId: "agent-1",
+      startDispatchId: "dispatch-2",
+      launchId: "launch-2",
+      config: makeConfig({ agentCredentialKey: null }),
+    });
+    await waitFor(() => socket.sent.some((message) => (message as { type?: string; startDispatchId?: string }).type === "agent:start:ack"
+      && (message as { startDispatchId?: string }).startDispatchId === "dispatch-2"), "rebound start acked");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(minted, 1, "the rebound start mints no credential");
+    assert.equal(driver.spawnCalls.length, 1, "the start is rebound, not spawned");
+    assert.deepEqual(revokedPaths, [], "the running process's credential is not revoked by the rebind");
+
+    driver.children[0]?.kill();
+    await waitFor(() => revokedPaths.length === 1, "running credential revoked at exit");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.deepEqual(revokedPaths, ["/internal/computer/runners/agent-1/credentials/cred-1"]);
+  } finally {
+    restoreFetch();
+    await core.stop();
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+// #wg-rbac:#27: every ready declares runner-credential reconcile and lists the
+// runner credentials the daemon's processes hold, read when the frame is
+// built: none before any start, both live processes' after a reconnect, and
+// no longer the one whose process ended.
+// Teeth: drop the legacy host's list from AgentHostRouter.getHeldRunnerCredentialIds -> RED.
+test("DaemonCore ready lists the runner credentials its live processes hold, with the reconcile capability", async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "slock-daemon-core-test-"));
+  const driver = new FakeDriver();
+  const sockets: FakeWebSocket[] = [];
+  // A host of its own: late requests from an earlier test's daemon reach
+  // this process-global mock too, and must not count as this test's mints.
+  const serverUrl = "https://daemon-ready-creds.example.com";
+  const requests: string[] = [];
+  let minted = 0;
+  const revokedPaths: string[] = [];
+  const restoreFetch = installDaemonFetchMockForTests((async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = new URL(String(input));
+    requests.push(`${init?.method ?? "GET"} ${url.origin}${url.pathname}`);
+    // Only this host's revokes count, as only its mints do: a late DELETE from
+    // an earlier test's daemon reached this process-global mock too.
+    if (init?.method === "DELETE") {
+      if (url.origin === serverUrl) revokedPaths.push(url.pathname);
+      return new Response(null, { status: 204 });
+    }
+    // Only a mint counts: any other request through this process-global mock
+    // (another test's late daemon, an upload) made `minted` run ahead of the
+    // spawns, and the spawn waits below never matched (staging run 42513552475).
+    if (url.origin !== serverUrl || init?.method !== "POST" || !/^\/internal\/computer\/runners\/[^/]+\/credentials$/.test(url.pathname)) {
+      return new Response(null, { status: 404 });
+    }
+    minted += 1;
+    return new Response(JSON.stringify({ apiKey: `sk_agent_minted_${minted}`, credentialId: `cred-${minted}` }), {
+      status: 201,
+      headers: { "content-type": "application/json" },
+    });
+  }) as typeof fetch);
+  type ReadyFrame = { type: "ready"; capabilities?: string[]; runnerCredentialIds?: string[] };
+  const readiesOn = (socket: FakeWebSocket | undefined): ReadyFrame[] =>
+    (socket?.sent ?? []).filter((message): message is ReadyFrame => (message as { type?: string }).type === "ready");
+  const reconnect = async (): Promise<FakeWebSocket> => {
+    const count = sockets.length;
+    sockets.at(-1)?.terminate();
+    await waitFor(() => sockets.length === count + 1, "replacement websocket");
+    const socket = sockets.at(-1)!;
+    socket.emitOpen();
+    await waitFor(() => readiesOn(socket).length > 0, "ready after reconnect");
+    return socket;
+  };
+  const assertReadyLists = (socket: FakeWebSocket, expected: string[], label: string) => {
+    for (const ready of readiesOn(socket)) {
+      assert.equal(ready.capabilities?.includes(DAEMON_CAPABILITY_RUNNER_CREDENTIAL_RECONCILE_V1), true, label);
+      assert.deepEqual([...(ready.runnerCredentialIds ?? ["(absent)"])].sort(), expected, label);
+    }
+  };
+
+  const core = new DaemonCore({
+    serverUrl,
+    apiKey: "sk_machine_test",
+    dataDir,
+    connectionOptions: {
+      minReconnectDelayMs: 1,
+      wsFactory: (_url: string, _options?: Parameters<NonNullable<ConnectionOptions["wsFactory"]>>[1]) => {
+        const socket = new FakeWebSocket();
+        sockets.push(socket);
+        return socket;
+      },
+    },
+    agentManagerFactory: (sendToServer, daemonApiKey, options) =>
+      new AgentProcessManager(sendToServer, daemonApiKey, {
+        dataDir: options?.dataDir,
+        serverUrl: options?.serverUrl ?? serverUrl,
+        driverResolver: () => driver,
+        defaultAgentEnvVarsProvider: options?.defaultAgentEnvVarsProvider,
+        tracer: options?.tracer,
+      }),
+  });
+
+  try {
+    core.start();
+    const first = sockets[0];
+    assert.ok(first, "wsFactory should create a websocket");
+    first.emitOpen();
+    await waitFor(() => readiesOn(first).length > 0, "first ready");
+    assertReadyLists(first, [], "no agent: the capability with an empty list");
+
+    for (const [index, agentId] of ["agent-1", "agent-2"].entries()) {
+      first.emitServerMessage({
+        type: "agent:start",
+        agentId,
+        startDispatchId: `dispatch-${agentId}`,
+        launchId: `launch-${agentId}`,
+        config: makeConfig({ agentCredentialKey: null }),
+      });
+      // An exact target per agent: `spawnCalls.length === minted` alone already
+      // holds for agent-2 on agent-1's state, before agent-2's mint is sent.
+      const expected = index + 1;
+      await waitFor(() => minted === expected && driver.spawnCalls.length === expected && driver.spawnCalls.at(-1)?.config.agentCredentialId === `cred-${expected}`, `${agentId} spawned (minted ${minted}, spawned ${driver.spawnCalls.map((call) => call.config.agentCredentialId).join(",")}; requests ${requests.join(" | ")})`);
+    }
+    assert.equal(minted, 2);
+
+    const second = await reconnect();
+    assertReadyLists(second, ["cred-1", "cred-2"], "both live processes' credentials");
+
+    driver.children[0]?.kill();
+    await waitFor(() => revokedPaths.length === 1, "ended process's credential revoked");
+    const third = await reconnect();
+    assertReadyLists(third, ["cred-2"], "the ended process's credential is gone");
+  } finally {
+    // Stopping revokes cred-2 through the mocked fetch.
+    await core.stop();
+    restoreFetch();
     await rm(dataDir, { recursive: true, force: true });
   }
 });
@@ -5967,8 +8035,18 @@ test("DaemonCore retries transient runner credential mint failure before spawn",
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "slock-daemon-core-test-"));
   const driver = new FakeDriver();
   const sockets: FakeWebSocket[] = [];
+  // A host of its own: the fetch mock is process-global, so late requests from
+  // an earlier test's daemon (same agent id, same default host) must not count
+  // as this test's mints (seen on CI: 6 !== 3).
+  const serverUrl = "https://daemon-mint-retry.example.com";
+  const mintPath = "/internal/computer/runners/agent-1/credentials";
   let calls = 0;
-  const restoreFetch = installDaemonFetchMockForTests((async () => {
+  const restoreFetch = installDaemonFetchMockForTests((async (input: string | URL | Request, init?: RequestInit) => {
+    const url = new URL(input instanceof Request ? input.url : String(input));
+    const method = init?.method ?? (input instanceof Request ? input.method : "GET");
+    if (url.origin !== serverUrl || url.pathname !== mintPath || method !== "POST") {
+      return new Response(null, { status: 404 });
+    }
     calls += 1;
     if (calls < 3) {
       return new Response(JSON.stringify({ error: "temporary unavailable", code: "server_restarting" }), {
@@ -5983,7 +8061,7 @@ test("DaemonCore retries transient runner credential mint failure before spawn",
   }) as typeof fetch);
 
   const core = new DaemonCore({
-    serverUrl: "https://daemon.example.com",
+    serverUrl,
     apiKey: "sk_machine_test",
     dataDir,
     connectionOptions: {
@@ -5996,7 +8074,7 @@ test("DaemonCore retries transient runner credential mint failure before spawn",
     agentManagerFactory: (sendToServer, daemonApiKey, options) =>
       new AgentProcessManager(sendToServer, daemonApiKey, {
         dataDir: options?.dataDir,
-        serverUrl: options?.serverUrl ?? "https://daemon.example.com",
+        serverUrl: options?.serverUrl ?? serverUrl,
         driverResolver: () => driver,
         defaultAgentEnvVarsProvider: options?.defaultAgentEnvVarsProvider,
         tracer: options?.tracer,
@@ -7397,6 +9475,12 @@ const wakeD = (over: Record<string, unknown> = {}) => ({
   type: "agent:deliver", agentId: "agent-1", seq: 1, message: {}, ...over,
 }) as never;
 
+test("task #26: selectWakeDeliveryIndex never promotes server context to the wake slot", () => {
+  const ownerFacts = { sender_type: "system", channel_id: "onboarding-context", content: "owner_name=Ada" };
+  assert.equal(selectWakeDeliveryIndex([wakeD({ message: ownerFacts }), wakeD({})]), 1, "the real message wakes, not the facts");
+  assert.equal(selectWakeDeliveryIndex([wakeD({ message: ownerFacts })]), -1);
+});
+
 test("selectWakeDeliveryIndex never promotes a mention delivery to the wake slot", () => {
   // the whole list is mentions ⇒ nothing may be promoted
   assert.equal(selectWakeDeliveryIndex([
@@ -7491,8 +9575,8 @@ test("DaemonCore answers an agent:deliver for an agent with no process and no sn
   }
 });
 
-test("retired Wiki wire requests reject without installing a workspace or starting an Agent", async () => {
-  const dataDir = await mkdtemp(path.join(os.tmpdir(), "raft-retired-wiki-"));
+test("a server message type this Computer does not know is ignored: no reply, no workspace, no Agent", async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "raft-unknown-type-"));
   const socket = new FakeWebSocket();
   const core = new DaemonCore({
     serverUrl: "https://daemon.example.com",
@@ -7505,21 +9589,91 @@ test("retired Wiki wire requests reject without installing a workspace or starti
     core.start();
     socket.emitOpen();
     await waitFor(() => socket.sent.some((m) => (m as { type?: string }).type === "ready"), "ready");
-    const ready = socket.sent.find((m) => (m as { type?: string }).type === "ready") as Extract<MachineToServerMessage, { type: "ready" }>;
-    assert.equal(ready.capabilities?.includes("wiki-workspace-pack:v1"), false);
-    const pack = { protocolVersion: 1 as const, packId: "retired", files: [] };
-    socket.emitServerMessage({ type: "agent:workspace:ensure-wiki", agentId: "retired-agent", requestId: "retired-request", pack });
-    socket.emitServerMessage({ type: "agent:start:wiki", agentId: "retired-agent", config: makeConfig(), wikiWorkspacePack: pack });
-    const response = socket.sent.find((m) => (m as { type?: string }).type === "agent:workspace:wiki_ensured") as Extract<MachineToServerMessage, { type: "agent:workspace:wiki_ensured" }>;
-    assert.equal(response.success, false);
-    assert.deepEqual(response.files, []);
-    assert.match(response.error ?? "", /retired/);
-    assert.ok(socket.sent.some((m) => (m as { type?: string; status?: string }).type === "agent:status" && (m as { status?: string }).status === "inactive"));
-    assert.equal(existsSync(path.join(dataDir, "agents", "retired-agent")), false);
+    // A removed wire type (here the retired Wiki start) from an older Server.
+    socket.emitServerMessage({ type: "agent:start:wiki", agentId: "unknown-type-agent", config: makeConfig() } as unknown as ServerToMachineMessage);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(socket.sent.some((m) => JSON.stringify(m).includes("unknown-type-agent")), false);
+    assert.equal(existsSync(path.join(dataDir, "unknown-type-agent")), false);
+    assert.equal(existsSync(path.join(dataDir, "agents", "unknown-type-agent")), false);
   } finally {
     await core.stop();
     await rm(dataDir, { recursive: true, force: true });
   }
+});
+
+test("target control wait backs off from 25 ms to a 15 s cap while the source packs, and stops on 410", async () => {
+  const signal = new AbortController().signal;
+  let now = 0;
+  const waits: number[] = [];
+  const wait = async (delayMs: number) => {
+    waits.push(delayMs);
+    now += delayMs;
+  };
+
+  // A source that packs for 30 minutes: every poll answers "not ready" (409).
+  const packingMs = 30 * 60_000;
+  let polls = 0;
+  const control = await pollMigrationResumableControl({
+    expiresAtMs: 6 * 60 * 60_000,
+    signal,
+    wait,
+    nowMs: () => now,
+    poll: async () => {
+      polls += 1;
+      return now >= packingMs ? "control" : null;
+    },
+  });
+  assert.equal(control, "control");
+  assert.deepEqual(
+    waits.slice(0, 11),
+    [25, 50, 100, 200, 400, 800, 1_600, 3_200, 6_400, 12_800, 15_000],
+    "fast for the first seconds, then doubles up to the cap",
+  );
+  assert.ok(waits.slice(10).every((delayMs) => delayMs === 15_000), "stays at the 15 s cap");
+  assert.ok(polls <= 135, `30 minutes of waiting costs ${polls} polls, not ~900 at the old 2 s cap`);
+  assert.ok(now - packingMs < 15_000, "the control is picked up within one cap of being ready");
+
+  // A quick source: ready after ~1 s is picked up within the fast phase.
+  now = 0;
+  waits.length = 0;
+  await pollMigrationResumableControl({
+    expiresAtMs: 6 * 60 * 60_000,
+    signal,
+    wait,
+    nowMs: () => now,
+    poll: async () => (now >= 1_000 ? "control" : null),
+  });
+  assert.ok(now < 1_600, `a quick migration is not delayed (${now} ms)`);
+
+  // The last sleep is clamped to the lease, then the wait gives up.
+  now = 0;
+  waits.length = 0;
+  await assert.rejects(
+    pollMigrationResumableControl({ expiresAtMs: 20_000, signal, wait, nowMs: () => now, poll: async () => null }),
+    /MIGRATION_LEASE_EXPIRED/,
+  );
+  assert.equal(now, 20_000);
+
+  // A non-retryable answer (410) stops at once, without another sleep.
+  now = 0;
+  waits.length = 0;
+  polls = 0;
+  await assert.rejects(
+    pollMigrationResumableControl({
+      expiresAtMs: 6 * 60 * 60_000,
+      signal,
+      wait,
+      nowMs: () => now,
+      poll: async () => {
+        polls += 1;
+        if (polls === 4) throw new Error("MIGRATION_CONTROL_DOWNLOAD_FAILED:410");
+        return null;
+      },
+    }),
+    /MIGRATION_CONTROL_DOWNLOAD_FAILED:410/,
+  );
+  assert.equal(polls, 4);
+  assert.deepEqual(waits, [25, 50, 100]);
 });
 
 test("target control steps retry transient failures and never replay a step that already committed", async () => {
@@ -7684,6 +9838,60 @@ test("source bundle-build progress is throttled, flushes the last skipped report
     await core.stop();
     await server.close();
     await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("the user-ignore receipt is dropped after a 4xx, so the reports go on without it; a 5xx keeps it for the next report", async () => {
+  const receipt = { written: 1, alreadyPresent: 0, rejected: [] };
+  for (const [status, carriedAgain] of [[400, false], [503, true]] as const) {
+    const dataDir = await mkdtemp(path.join(os.tmpdir(), "raft-daemon-migration-receipt-test-"));
+    const migrationId = `migration-receipt-${status}`;
+    const reports: Array<Record<string, unknown>> = [];
+    const server = await withHttpServer(async (req, res) => {
+      reports.push(JSON.parse((await readRequestBody(req)).toString("utf8")) as Record<string, unknown>);
+      res.statusCode = reports.length === 1 ? status : 200;
+      res.end("{}");
+    });
+    const realNow = Date.now;
+    let now = 1_000_000;
+    Date.now = () => now;
+    const core = new DaemonCore({
+      serverUrl: server.baseUrl,
+      apiKey: "sk_machine_test",
+      dataDir,
+      slockHome: dataDir,
+      runtimeDetector: () => ({ ids: [], versions: {} }),
+    });
+    try {
+      const internals = core as unknown as {
+        serverContextCapabilities: Set<string>;
+        createMigrationSourceProgressReporter: (
+          lease: Record<string, unknown>,
+          signal: AbortSignal,
+          userIgnoreReceipt: { written: number; alreadyPresent: number; rejected: never[] },
+        ) => (progress: { phase: "scanning" | "packing"; files: number; bytes: number }) => void;
+      };
+      internals.serverContextCapabilities = new Set([SERVER_CAPABILITY_MIGRATION_USER_IGNORE_RECEIPT_V1]);
+      const reporter = internals.createMigrationSourceProgressReporter({
+        migrationId,
+        transportGeneration: "generation-receipt",
+        bearerToken: "token-receipt",
+        controlUrl: `/internal/computer/agent-migrations/by-id/${migrationId}/resumable`,
+      }, new AbortController().signal, receipt);
+      await waitFor(() => reports.length === 1, "immediate report");
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      assert.deepEqual(reports[0]?.userIgnoreAdditions, receipt);
+      now += 30_000;
+      reporter({ phase: "scanning", files: 4, bytes: 40 });
+      await waitFor(() => reports.length === 2, "next report");
+      assert.equal("userIgnoreAdditions" in reports[1]!, carriedAgain, `after ${status}`);
+      assert.equal(reports[1]?.files, 4);
+    } finally {
+      Date.now = realNow;
+      await core.stop();
+      await server.close();
+      await rm(dataDir, { recursive: true, force: true });
+    }
   }
 });
 
@@ -8083,6 +10291,55 @@ test("DaemonCore stop span records who stopped it and how long it ran", async ()
   }
 });
 
+test("reconciler step 15: a Computer runner's stop after its key was refused is traced with its outcome", async () => {
+  const rootDir = await mkdtemp(path.join(os.tmpdir(), "slock-daemon-revoked-stop-test-"));
+  const { sink, tracer, traceId } = makeDeterministicTracer();
+  const core = new DaemonCore({
+    serverUrl: "https://daemon.example.com",
+    apiKey: "sk_machine_test",
+    dataDir: path.join(rootDir, "agents"),
+    slockHome: rootDir,
+    tracer,
+    runtimeDetector: () => ({ ids: [], versions: {} }),
+    connectionOptions: { wsFactory: () => new FakeWebSocket() },
+  });
+  try {
+    core.start();
+    await core.stop({ source: "machine_key_revoked" });
+    const stop = traceRows(sink, traceId).find((span) => span.name === "daemon.lifecycle.stop");
+    assert.equal(stop?.attrs?.stop_source, "machine_key_revoked");
+    core.recordMachineKeyRevokedStop({
+      reason: "computer_revoked",
+      outcome: "deadline",
+      agentCount: 2,
+      remainingAgentCount: 1,
+      durationMs: 20_000,
+      deadlineMs: 20_000,
+    });
+    const event = traceRows(sink, traceId).find((row) => row.name === "daemon.machine_key.revoked_stop");
+    assert.deepEqual(
+      {
+        reason: event?.attrs?.reason,
+        outcome: event?.attrs?.outcome,
+        agent_count: event?.attrs?.agent_count,
+        remaining_agent_count: event?.attrs?.remaining_agent_count,
+        duration_ms: event?.attrs?.duration_ms,
+        deadline_ms: event?.attrs?.deadline_ms,
+      },
+      {
+        reason: "computer_revoked",
+        outcome: "deadline",
+        agent_count: 2,
+        remaining_agent_count: 1,
+        duration_ms: 20_000,
+        deadline_ms: 20_000,
+      },
+    );
+  } finally {
+    await rm(rootDir, { recursive: true, force: true });
+  }
+});
+
 test("DaemonCore answers a host identity request with its per-server hash, and only after authenticated context", async () => {
   const rootDir = await mkdtemp(path.join(os.tmpdir(), "slock-daemon-host-identity-"));
   const sockets: FakeWebSocket[] = [];
@@ -8123,5 +10380,1467 @@ test("DaemonCore answers a host identity request with its per-server hash, and o
   } finally {
     await core.stop();
     await rm(rootDir, { recursive: true, force: true });
+  }
+});
+
+// ─── task #17: runtime auth at the core boundary ───
+class RecordingRuntimeAuthHost extends RuntimeAuthHost {
+  readonly calls: string[] = [];
+  constructor() {
+    super({ loadRuntime: async () => { throw new Error("no OAR in core tests"); }, kimiStatus: async () => ({ kind: "unknown" }), loadKimiAuth: async () => { throw new Error("no Kimi SDK in core tests"); }, loadProviderAuth: async () => null, send: () => undefined, recordEvent: () => undefined, now: () => 0, serverReads: () => null });
+  }
+  override async reportStatus(trigger: string): Promise<void> { this.calls.push(`report:${trigger}`); }
+  override startLogin(loginId: RuntimeAuthLoginId, runtime: string, region?: string, providerId?: string): void {
+    this.calls.push(`start:${runtime}${region ? `@${region}` : ""}${providerId ? `/${providerId}` : ""}:${loginId}`);
+  }
+  override async logout(requestId: string, runtime: string, providerId?: string): Promise<void> { this.calls.push(`logout:${runtime}${providerId ? `/${providerId}` : ""}:${requestId}`); }
+  override submitCode(loginId: RuntimeAuthLoginId, code: string): void { this.calls.push(`code:${loginId}:${code.length}`); }
+  override cancelLogin(): void { this.calls.push("cancel"); }
+  override async listProviders(requestId: string, runtime: string): Promise<void> { this.calls.push(`providers:${runtime}:${requestId}`); }
+  override async connectProvider(requestId: string, runtime: string, input: RuntimeAuthProviderConnectInput): Promise<void> {
+    this.calls.push(`connect:${runtime}:${requestId}:${input.providerId}:${input.apiKey.length}`);
+  }
+}
+
+test("task #17: malformed runtime-auth messages are dropped at the core boundary; a code is never logged", async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "slock-daemon-runtime-auth-test-"));
+  const sockets: FakeWebSocket[] = [];
+  const { sink, tracer, traceId } = makeDeterministicTracer();
+  const host = new RecordingRuntimeAuthHost();
+  const core = new DaemonCore({
+    serverUrl: "https://daemon.example.com",
+    apiKey: "sk_machine_test",
+    dataDir,
+    tracer,
+    runtimeDetector: () => ({ ids: [], versions: {} }),
+    runtimeAuthHost: host,
+    connectionOptions: { wsFactory: () => { const socket = new FakeWebSocket(); sockets.push(socket); return socket; } },
+  });
+  const loginId = "rtl_aaaaaaaaaaaaaaaaaaaaaaaa";
+  try {
+    core.start();
+    const socket = sockets[0]!;
+    socket.emitOpen();
+    const send = (message: unknown) => socket.emitServerMessage(message as ServerToMachineMessage);
+    send({ type: "machine:runtime_auth:login:start", loginId: "not-a-login-id", runtime: "claude" });
+    send({ type: "machine:runtime_auth:login:start", loginId, runtime: "cursor" });
+    // Kimi's start needs the region the person chose; no other runtime's takes one.
+    send({ type: "machine:runtime_auth:login:start", loginId, runtime: "kimi" });
+    send({ type: "machine:runtime_auth:login:start", loginId, runtime: "kimi", region: "auto" });
+    send({ type: "machine:runtime_auth:login:start", loginId, runtime: "claude", region: "global" });
+    send({ type: "machine:runtime_auth:login:code", loginId, code: 42 });
+    send({ type: "machine:runtime_auth:login:code", loginId, code: "secret\nline" });
+    send({ type: "machine:runtime_auth:login:start", loginId, runtime: "claude" });
+    send({ type: "machine:runtime_auth:login:start", loginId, runtime: "kimi", region: "mainland-cn" });
+    send({ type: "machine:runtime_auth:login:code", loginId, code: "secret-code#state" });
+    await waitFor(() => host.calls.some((call) => call.startsWith("code:")), "the valid code");
+    assert.deepEqual(host.calls.filter((call) => !call.startsWith("report:")), [
+      `start:claude:${loginId}`,
+      `start:kimi@mainland-cn:${loginId}`,
+      `code:${loginId}:17`,
+    ]);
+    const dropped = traceRows(sink, traceId).filter((row) => row.name === "daemon.runtime_auth.message_dropped");
+    assert.equal(dropped.length, 7);
+    assert.ok(!JSON.stringify(traceRows(sink, traceId)).includes("secret"), "no trace carries a code");
+  } finally {
+    await core.stop();
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("Pi's login and logout name a provider, and no other runtime's do: anything else is dropped", async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "slock-daemon-runtime-auth-pi-test-"));
+  const sockets: FakeWebSocket[] = [];
+  const { sink, tracer, traceId } = makeDeterministicTracer();
+  const host = new RecordingRuntimeAuthHost();
+  const core = new DaemonCore({
+    serverUrl: "https://daemon.example.com",
+    apiKey: "sk_machine_test",
+    dataDir,
+    tracer,
+    runtimeDetector: () => ({ ids: [], versions: {} }),
+    runtimeAuthHost: host,
+    connectionOptions: { wsFactory: () => { const socket = new FakeWebSocket(); sockets.push(socket); return socket; } },
+  });
+  const loginId = "rtl_bbbbbbbbbbbbbbbbbbbbbbbb";
+  try {
+    core.start();
+    const socket = sockets[0]!;
+    socket.emitOpen();
+    const send = (message: unknown) => socket.emitServerMessage(message as ServerToMachineMessage);
+    send({ type: "machine:runtime_auth:login:start", loginId, runtime: "pi" });
+    send({ type: "machine:runtime_auth:login:start", loginId, runtime: "pi", providerId: "../auth" });
+    send({ type: "machine:runtime_auth:login:start", loginId, runtime: "claude", providerId: "anthropic" });
+    send({ type: "machine:runtime_auth:logout", requestId: "req-a", runtime: "pi" });
+    send({ type: "machine:runtime_auth:logout", requestId: "req-b", runtime: "codex", providerId: "openai" });
+    send({ type: "machine:runtime_auth:login:start", loginId, runtime: "pi", providerId: "github-copilot" });
+    send({ type: "machine:runtime_auth:logout", requestId: "req-c", runtime: "pi", providerId: "deepseek" });
+    await waitFor(() => host.calls.some((call) => call.startsWith("logout:")), "the valid logout");
+    assert.deepEqual(host.calls.filter((call) => !call.startsWith("report:")), [
+      `start:pi/github-copilot:${loginId}`,
+      "logout:pi/deepseek:req-c",
+    ]);
+    assert.equal(traceRows(sink, traceId).filter((row) => row.name === "daemon.runtime_auth.message_dropped").length, 5);
+  } finally {
+    await core.stop();
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("task #17: runtime auth status is reported only to a server that advertises it", async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "slock-daemon-runtime-auth-cap-test-"));
+  const sockets: FakeWebSocket[] = [];
+  const host = new RecordingRuntimeAuthHost();
+  const core = new DaemonCore({
+    serverUrl: "https://daemon.example.com",
+    apiKey: "sk_machine_test",
+    dataDir,
+    runtimeDetector: () => ({ ids: ["claude"], versions: { claude: "2.1.304" } }),
+    runtimeAuthHost: host,
+    connectionOptions: { wsFactory: () => { const socket = new FakeWebSocket(); sockets.push(socket); return socket; } },
+  });
+  try {
+    core.start();
+    const socket = sockets[0]!;
+    socket.emitOpen();
+    await waitFor(() => socket.sent.some((message) => (message as { type?: string }).type === "ready" && Array.isArray((message as { runtimes?: unknown }).runtimes)), "ready with an inventory");
+    await flush();
+    assert.deepEqual(host.calls, [], "a server that does not read it gets no report and no status query runs");
+    const ready = socket.sent.find((message): message is Extract<MachineToServerMessage, { type: "ready" }> => (message as { type?: string }).type === "ready");
+    assert.deepEqual(runtimeAuthRuntimesOfComputer(ready?.capabilities ?? []), ["claude", "codex", "kimi", "qoder", "qwen", "antigravity", "pi", "grok", "opencode", "codebuddy"], "the server may send Kimi, Qoder, Antigravity, Pi, Grok, OpenCode and CodeBuddy sign-ins and Qwen provider connects here");
+    assert.deepEqual(runtimeAuthLogoutRuntimesOfComputer(ready?.capabilities ?? []), ["claude", "codex", "kimi", "antigravity", "pi", "grok", "opencode", "codebuddy"], "and Antigravity (OAR 0.98), Pi, Grok (OAR 0.99), OpenCode (OAR 0.100) and CodeBuddy sign-outs");
+
+    socket.emitServerMessage({ type: "machine:context", machineId: "machine-test", serverId: "server-test", capabilities: [SERVER_CAPABILITY_RUNTIME_AUTH_V1] } as ServerToMachineMessage);
+    await waitFor(() => host.calls.length > 0, "a report once the server says it reads one");
+    assert.deepEqual(host.calls, ["report:context"]);
+
+    // The same reader again changes nothing; one that reads more runtimes gets a new report.
+    socket.emitServerMessage({ type: "machine:context", machineId: "machine-test", serverId: "server-test", capabilities: [SERVER_CAPABILITY_RUNTIME_AUTH_V1] } as ServerToMachineMessage);
+    socket.emitServerMessage({ type: "machine:context", machineId: "machine-test", serverId: "server-test", capabilities: [SERVER_CAPABILITY_RUNTIME_AUTH_V1, SERVER_CAPABILITY_RUNTIME_AUTH_V2] } as ServerToMachineMessage);
+    await waitFor(() => host.calls.length > 1, "a report for the V2 reader");
+    assert.deepEqual(host.calls, ["report:context", "report:context"]);
+  } finally {
+    await core.stop();
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+// ─── Reconciler step 15 (PR 3): a terminal sign-in lifts the server's sign-in pauses ───
+class FreshStatusRuntimeAuthHost extends RecordingRuntimeAuthHost {
+  status: RuntimeAuthStatus | null = { kind: "logged_in" };
+  override async reportFreshStatus(trigger: string, runtime: RuntimeAuthRuntime): Promise<RuntimeAuthStatus | null> {
+    this.calls.push(`fresh:${trigger}:${runtime}`);
+    return this.status;
+  }
+}
+
+async function sharedCredentialCore(capabilities: string[]) {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "slock-daemon-shared-credentials-test-"));
+  const home = path.join(dataDir, "home");
+  const authFile = path.join(home, ".codex", "auth.json");
+  await mkdir(path.dirname(authFile), { recursive: true });
+  await writeFile(authFile, "{\"tokens\":{\"access_token\":\"old\"}}");
+  const sockets: FakeWebSocket[] = [];
+  const host = new FreshStatusRuntimeAuthHost();
+  const { sink, tracer, traceId } = makeDeterministicTracer();
+  const core = new DaemonCore({
+    serverUrl: "https://daemon.example.com",
+    apiKey: "sk_machine_test",
+    dataDir,
+    tracer,
+    runtimeDetector: () => ({ ids: ["codex"], versions: { codex: "0.130.0" } }),
+    runtimeAuthHost: host,
+    credentialDiskWatch: { baseEnv: () => ({}), homeDir: home, platform: "linux", cwd: home, setInterval: () => ({}), clearInterval: () => undefined },
+    connectionOptions: { wsFactory: () => { const socket = new FakeWebSocket(); sockets.push(socket); return socket; } },
+  });
+  core.start();
+  const socket = sockets[0]!;
+  socket.emitOpen();
+  await waitFor(() => socket.sent.some((message) => (message as { type?: string }).type === "ready" && Array.isArray((message as { runtimes?: unknown }).runtimes)), "ready with an inventory");
+  socket.emitServerMessage({ type: "machine:context", machineId: "machine-test", serverId: "server-test", capabilities } as ServerToMachineMessage);
+  await flush();
+  const watch = (core as unknown as { credentialDiskWatch: CredentialDiskWatch }).credentialDiskWatch;
+  let mtime = Date.now() / 1000;
+  const signIn = async (token: string) => {
+    await writeFile(authFile, `{"tokens":{"access_token":"${token}"}}`);
+    mtime += 60;
+    await utimes(authFile, mtime, mtime);
+  };
+  const frames = () => socket.sent.filter((message) => (message as { type?: string }).type === "machine:runtime_credentials:changed");
+  const outcomes = () => traceRows(sink, traceId).filter((row) => row.name === "daemon.runtime_credentials.changed");
+  const close = async () => { await core.stop(); await rm(dataDir, { recursive: true, force: true }); };
+  return { host, watch, signIn, frames, outcomes, close, sink, traceId, home };
+}
+
+const CREDENTIALS_CHANGED_SERVER = [SERVER_CAPABILITY_RUNTIME_AUTH_V1, SERVER_CAPABILITY_RUNTIME_CREDENTIALS_CHANGED_V1];
+
+test("PR 3: a shared Codex sign-in on disk with a fresh logged_in status sends one machine:runtime_credentials:changed {runtime}", async () => {
+  const t = await sharedCredentialCore(CREDENTIALS_CHANGED_SERVER);
+  try {
+    assert.deepEqual(t.watch.sharedRuntimes, ["codex"], "the detected runtime the server reads");
+    assert.equal(t.watch.running, true);
+    await t.watch.check();
+    await flush();
+    assert.deepEqual(t.host.calls.filter((call) => call.startsWith("fresh:")), [], "no change: no status query");
+    assert.deepEqual(t.frames(), []);
+
+    await t.signIn("new");
+    await t.watch.check();
+    await waitFor(() => t.outcomes().length === 1, "the change handled");
+    assert.deepEqual(t.host.calls.filter((call) => call.startsWith("fresh:")), ["fresh:credentials_changed_on_disk:codex"]);
+    // The runtime only: no path, digest or account crosses the wire.
+    assert.deepEqual(t.frames(), [{ type: "machine:runtime_credentials:changed", runtime: "codex" }]);
+    assert.ok(!JSON.stringify(traceRows(t.sink, t.traceId)).includes(t.home), "no trace carries a path");
+
+    await t.watch.check();
+    await flush();
+    assert.equal(t.frames().length, 1, "no second frame without a second change");
+  } finally {
+    await t.close();
+  }
+});
+
+test("PR 3: a change whose fresh status is logged_out, unknown or absent sends no frame", async () => {
+  const t = await sharedCredentialCore(CREDENTIALS_CHANGED_SERVER);
+  try {
+    const statuses: Array<RuntimeAuthStatus | null> = [{ kind: "logged_out" }, { kind: "unknown" }, null];
+    for (const [index, status] of statuses.entries()) {
+      t.host.status = status;
+      // Past the per-runtime gap between two reported changes.
+      (t.watch as unknown as { shared: Map<string, { lastReportedAtMs: number | null }> }).shared.get("codex")!.lastReportedAtMs = null;
+      await t.signIn(`token-${index}`);
+      await t.watch.check();
+      await waitFor(() => t.outcomes().length === index + 1, `change ${index} handled`);
+    }
+    assert.equal(t.host.calls.filter((call) => call.startsWith("fresh:")).length, 3, "each change ran the status query");
+    assert.deepEqual(t.frames(), []);
+    assert.deepEqual(t.outcomes().map((row) => row.attrs?.auth_status), ["logged_out", "unknown", "none"]);
+  } finally {
+    await t.close();
+  }
+});
+
+test("PR 3: a server without the capability gets no frame and the shared homes are not watched (an old server)", async () => {
+  const t = await sharedCredentialCore([SERVER_CAPABILITY_RUNTIME_AUTH_V1]);
+  try {
+    assert.deepEqual(t.watch.sharedRuntimes, []);
+    assert.equal(t.watch.running, false, "no timer");
+    await t.signIn("new");
+    await t.watch.check();
+    await flush();
+    assert.deepEqual(t.host.calls.filter((call) => call.startsWith("fresh:")), []);
+    assert.deepEqual(t.frames(), []);
+  } finally {
+    await t.close();
+  }
+});
+
+// ── RFC 060 OAR host ────────────────────────────────────────────────────────
+
+test("RFC 060: ready offers runtime-host:oar unless the daemon's OAR host is off", async () => {
+  for (const [oarHost, expected] of [[undefined, true], [false, false]] as const) {
+    const dataDir = await mkdtemp(path.join(os.tmpdir(), "slock-daemon-oar-ready-test-"));
+    const sockets: FakeWebSocket[] = [];
+    const core = new DaemonCore({
+      serverUrl: "https://daemon.example.com",
+      apiKey: "sk_machine_test",
+      dataDir,
+      runtimeDetector: () => ({ ids: [], versions: {} }),
+      ...(oarHost === undefined ? {} : { oarHost }),
+      connectionOptions: {
+        wsFactory: () => {
+          const socket = new FakeWebSocket();
+          sockets.push(socket);
+          return socket;
+        },
+      },
+    });
+    try {
+      core.start();
+      sockets[0]!.emitOpen();
+      await waitFor(() => sockets[0]!.sent.some((msg) => (msg as { type?: string }).type === "ready"), "ready");
+      const ready = sockets[0]!.sent.find((msg): msg is Extract<MachineToServerMessage, { type: "ready" }> =>
+        (msg as { type?: string }).type === "ready")!;
+      assert.equal(ready.capabilities?.includes(DAEMON_CAPABILITY_RUNTIME_HOST_OAR), expected);
+      assert.equal(ready.capabilities?.includes(DAEMON_CAPABILITY_RUNTIME_HOST_OAR_CODEX), expected);
+      // #oar-raft:#10: with the OAR host, where this daemon can run the Cursor SDK's child (a daemon
+      // dependency; the platform, SEA, Node and resolve rules: oarCursorLaunch.test.ts).
+      assert.equal(ready.capabilities?.includes(DAEMON_CAPABILITY_RUNTIME_HOST_OAR_CURSOR), expected && cursorSdkAvailable());
+    } finally {
+      await core.stop();
+      await rm(dataDir, { recursive: true, force: true });
+    }
+  }
+});
+
+test("reconciler step 11c: the OAR host marks its spec-stop handbacks in the legacy host's store, which the legacy refusal reads", async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "slock-daemon-handback-test-"));
+  const core = new DaemonCore({
+    serverUrl: "https://daemon.example.com",
+    apiKey: "sk_machine_test",
+    dataDir,
+    runtimeDetector: () => ({ ids: [], versions: {} }),
+    openOarSession: () => { throw new Error("not opened"); },
+  });
+  try {
+    const oarHost = (core as any).agentHosts.oar;
+    assert.ok(oarHost, "the OAR host is wired");
+    assert.equal(oarHost.specHandbacks, (core as any).agentManager.specHandbacks);
+  } finally {
+    await core.stop();
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+/**
+ * The Server's managed MCP tools endpoint for a test whose OAR Grok start asks
+ * for the agent's tools (#14331): answered with no tools, only for that URL;
+ * every other request still goes to the guarded fetch.
+ */
+function stubManagedMcpTools(serverUrl: string): () => void {
+  const original = globalThis.fetch;
+  const toolsUrl = `${serverUrl}/internal/agent-api/mcp/tools`;
+  return installDaemonFetchMockForTests((async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+    const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+    if (url.split("?")[0] !== toolsUrl) return original(input, init);
+    return new Response(JSON.stringify({ catalogVersion: 1, tools: [] }), { status: 200, headers: { "content-type": "application/json" } });
+  }) as typeof fetch);
+}
+
+test("RFC 060 + RFC 071: an OAR-hosted grok start reports through the outbox like a driver start (spawned, E2 echo, rebind, exited)", async () => {
+  const rootDir = await mkdtemp(path.join(os.tmpdir(), "slock-daemon-oar-core-test-"));
+  const dataDir = path.join(rootDir, "agents");
+  const binDir = path.join(rootDir, "bin");
+  await mkdir(binDir, { recursive: true });
+  // prepareGrokLaunch resolves the CLI on PATH; the session itself is OAR's scripted runtime.
+  await writeFile(path.join(binDir, "grok"), "#!/bin/sh\nexit 0\n");
+  await chmod(path.join(binDir, "grok"), 0o755);
+  const restoreFetch = stubManagedMcpTools("https://daemon.example.com");
+  const previousPath = process.env.PATH;
+  process.env.PATH = `${binDir}${path.delimiter}${previousPath ?? ""}`;
+  const { scriptedRuntime } = await import("@botiverse/oar/testing");
+  const inputs: string[] = [];
+  const runtime = scriptedRuntime({ turn: (turn) => { inputs.push(turn.input); turn.say("ok"); } });
+  const sockets: FakeWebSocket[] = [];
+  const core = new DaemonCore({
+    serverUrl: "https://daemon.example.com",
+    apiKey: "sk_machine_test",
+    dataDir,
+    slockHome: rootDir,
+    slockCliPath: process.execPath,
+    // Grok Build itself at a checked version (#oar-raft:#4): other programs in the slot keep the driver.
+    runtimeDetector: () => ({ ids: ["grok"], versions: { grok: "grok 1.0.77" } }),
+    openOarSession: (launch) => runtime.session({ kind: "available", via: "bundled" }, launch.options),
+    connectionOptions: {
+      wsFactory: () => {
+        const socket = new FakeWebSocket();
+        sockets.push(socket);
+        return socket;
+      },
+    },
+  });
+  type Sent = MachineToServerMessage;
+  const sentOfType = <T extends Sent["type"]>(socket: FakeWebSocket, type: T) =>
+    socket.sent.filter((msg): msg is Extract<Sent, { type: T }> => (msg as { type?: string }).type === type);
+  try {
+    core.start();
+    const socket = sockets[0]!;
+    openAckingServer(socket);
+    await waitFor(() => sentOfType(socket, "ready").length > 0, "ready");
+    const ready = sentOfType(socket, "ready")[0]!;
+    const grokConfig = makeConfig({ runtime: "grok", model: "default", runtimeHost: "oar", sessionId: "grok-session-1" });
+    socket.emitServerMessage({
+      type: "agent:start",
+      agentId: "agent-1",
+      startDispatchId: "dispatch-1",
+      launchId: "launch-1",
+      config: grokConfig,
+      resumeMessages: [{
+        channel_id: "channel-1",
+        channel_name: "general",
+        channel_type: "channel",
+        sender_id: "user-1",
+        sender_name: "richard",
+        sender_type: "human",
+        content: "owed while paused",
+        timestamp: "2026-09-29T10:00:00.000Z",
+        message_id: "m1",
+        seq: 1,
+      }],
+      catchupBatchId: "batch-1",
+    });
+    await waitFor(() => sentOfType(socket, "agent:process_spawned").length === 1, "process spawned");
+    const spawned = sentOfType(socket, "agent:process_spawned")[0]!;
+    assert.equal(spawned.launchId, "launch-1");
+    assert.equal(spawned.daemonInstanceId, ready.daemonInstanceId);
+    const firstAck = sentOfType(socket, "agent:start:ack").find((ack) => ack.startDispatchId === "dispatch-1");
+    assert.equal(firstAck?.queueState, "starting");
+
+    await waitFor(() => sentOfType(socket, "agent:runtime:outcome").length === 1, "turn_completed");
+    assert.match(inputs[0] ?? "", /owed while paused/, "the resume catch-up rides the first input");
+    assert.deepEqual(sentOfType(socket, "agent:runtime:outcome")[0]!.outcome, {
+      kind: "turn_completed", textEvents: 1, toolCalls: 0, catchupBatchId: "batch-1", catchupRenderedRows: 1,
+    });
+
+    socket.emitServerMessage({ type: "agent:start", agentId: "agent-1", startDispatchId: "dispatch-2", launchId: "launch-2", config: grokConfig });
+    await waitFor(() => sentOfType(socket, "agent:start:ack").some((ack) => ack.startDispatchId === "dispatch-2"), "rebind ack");
+    const rebindAck = sentOfType(socket, "agent:start:ack").find((ack) => ack.startDispatchId === "dispatch-2")!;
+    assert.equal(rebindAck.queueState, "running");
+    assert.equal(rebindAck.processInstanceId, spawned.processInstanceId);
+    await waitFor(() => sentOfType(socket, "agent:start:outcome").some((frame) => frame.launchId === "launch-2"), "rebound");
+    assert.deepEqual(sentOfType(socket, "agent:start:outcome").find((frame) => frame.launchId === "launch-2")!.result, { kind: "rebound", processInstanceId: spawned.processInstanceId });
+
+    socket.emitServerMessage({ type: "agent:stop", agentId: "agent-1" });
+    await waitFor(() => sentOfType(socket, "agent:process_exited").length === 1, "process exited");
+    const exited = sentOfType(socket, "agent:process_exited")[0]!;
+    assert.deepEqual(
+      { processInstanceId: exited.processInstanceId, spawnLaunchId: exited.spawnLaunchId, launchId: exited.launchId },
+      { processInstanceId: spawned.processInstanceId, spawnLaunchId: "launch-1", launchId: "launch-2" },
+    );
+    assert.deepEqual(core.getRunningAgentIds(), []);
+  } finally {
+    restoreFetch();
+    await core.stop();
+    process.env.PATH = previousPath;
+    await rm(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("RFC 060 + reconciler step 5: the daemon stop resolves only after the OAR runtime's ledger record is written: nothing writes into the machine dir after it", { skip: process.platform === "win32" }, async () => {
+  const rootDir = await mkdtemp(path.join(os.tmpdir(), "slock-daemon-oar-stop-ledger-"));
+  const dataDir = path.join(rootDir, "agents");
+  const binDir = path.join(rootDir, "bin");
+  await mkdir(binDir, { recursive: true });
+  await writeFile(path.join(binDir, "grok"), "#!/bin/sh\nexit 0\n");
+  await chmod(path.join(binDir, "grok"), 0o755);
+  const restoreFetch = stubManagedMcpTools("https://daemon.example.com");
+  const previousPath = process.env.PATH;
+  process.env.PATH = `${binDir}${path.delimiter}${previousPath ?? ""}`;
+  // The OAR runtime the open hook records: a real group-leading child, so its identity read is real.
+  const runtimeChild = spawnProcess("sleep", ["30"], { detached: true, stdio: "ignore" });
+  // The open hook's listing of this daemon's children is held until the stop has begun: the race, forced.
+  let listingStarted = false;
+  let releaseListing!: () => void;
+  const listingGate = new Promise<void>((resolve) => { releaseListing = resolve; });
+  const { scriptedRuntime } = await import("@botiverse/oar/testing");
+  const runtime = scriptedRuntime({ turn: (turn) => { turn.say("ok"); } });
+  const sockets: FakeWebSocket[] = [];
+  const core = new DaemonCore({
+    serverUrl: "https://daemon.example.com",
+    apiKey: "sk_machine_test",
+    dataDir,
+    slockHome: rootDir,
+    slockCliPath: process.execPath,
+    runtimeDetector: () => ({ ids: ["grok"], versions: { grok: "grok 1.0.77" } }),
+    openOarSession: (launch) => runtime.session({ kind: "available", via: "bundled" }, launch.options),
+    agentManagerFactory: (sendToServer, daemonApiKey, options) => new AgentProcessManager(sendToServer, daemonApiKey, {
+      ...options,
+      serverUrl: options?.serverUrl ?? "https://daemon.example.com",
+      runtimeProcessLedger: {
+        tree: {
+          listProcesses: async () => {
+            listingStarted = true;
+            await listingGate;
+            return [{ pid: runtimeChild.pid!, ppid: process.pid, pgid: runtimeChild.pid! }];
+          },
+        },
+      },
+    }),
+    connectionOptions: {
+      wsFactory: () => {
+        const socket = new FakeWebSocket();
+        sockets.push(socket);
+        return socket;
+      },
+    },
+  });
+  const machineDir = path.join(rootDir, "machines", getDaemonMachineLockId("sk_machine_test"));
+  const ledgerFile = path.join(machineDir, "runtime-processes.json");
+  let stopping: Promise<void> | null = null;
+  try {
+    core.start();
+    const socket = sockets[0]!;
+    openAckingServer(socket);
+    await waitFor(() => socket.sent.some((msg) => (msg as { type?: string }).type === "ready"), "ready");
+    socket.emitServerMessage({
+      type: "agent:start",
+      agentId: "agent-1",
+      startDispatchId: "dispatch-1",
+      launchId: "launch-1",
+      config: makeConfig({ runtime: "grok", model: "default", runtimeHost: "oar", sessionId: "grok-session-1" }),
+    });
+    await waitFor(() => listingStarted, "the open hook's listing");
+    const ledgerBefore = await readFile(ledgerFile, "utf8");
+
+    let stopped = false;
+    stopping = core.stop().then(() => { stopped = true; });
+    await waitFor(() => socket.sent.some((msg) => (msg as { type?: string }).type === "agent:process_exited"), "agent stopped");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(stopped, false, "the stop waits for the ledger update still running");
+    assert.equal(await readFile(ledgerFile, "utf8"), ledgerBefore, "and that update has not written yet");
+
+    releaseListing();
+    await stopping;
+    stopping = null;
+    const recorded = JSON.parse(await readFile(ledgerFile, "utf8")) as { processes: Array<{ pid: number; agentId: string; host: string }> };
+    assert.deepEqual(recorded.processes.map((record) => [record.pid, record.agentId, record.host]), [[runtimeChild.pid, "agent-1", "oar"]], "written before the stop resolved");
+  } finally {
+    restoreFetch();
+    releaseListing();
+    await (stopping ?? core.stop());
+    runtimeChild.kill("SIGKILL");
+    process.env.PATH = previousPath;
+    await rm(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("a Qwen provider connect reaches the auth host checked, its key in no trace; anything malformed is dropped", async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "slock-daemon-runtime-auth-provider-test-"));
+  const sockets: FakeWebSocket[] = [];
+  const { sink, tracer, traceId } = makeDeterministicTracer();
+  const host = new RecordingRuntimeAuthHost();
+  const core = new DaemonCore({
+    serverUrl: "https://daemon.example.com",
+    apiKey: "sk_machine_test",
+    dataDir,
+    tracer,
+    runtimeDetector: () => ({ ids: [], versions: {} }),
+    runtimeAuthHost: host,
+    connectionOptions: { wsFactory: () => { const socket = new FakeWebSocket(); sockets.push(socket); return socket; } },
+  });
+  const KEY = "sk-provider-secret-key-0123456789";
+  // Everything the daemon logs, through its logger and straight to the console.
+  const logs: string[] = [];
+  const unsubscribeLogs = subscribeDaemonLogs((event) => { logs.push(`${event.line} ${String(event.error ?? "")}`); });
+  const consoleOriginals = (["log", "info", "warn", "error", "debug"] as const).map((name) => [name, console[name]] as const);
+  for (const [name] of consoleOriginals) {
+    console[name] = (...args: unknown[]) => { logs.push(args.map((arg) => (typeof arg === "string" ? arg : JSON.stringify(arg) ?? String(arg))).join(" ")); };
+  }
+  try {
+    core.start();
+    const socket = sockets[0]!;
+    socket.emitOpen();
+    const send = (message: unknown) => socket.emitServerMessage(message as ServerToMachineMessage);
+    const connect = { type: "machine:runtime_auth:connect_provider", requestId: "req-1", runtime: "qwen", providerId: "deepseek", apiKey: KEY };
+    send({ ...connect, runtime: "claude" }); // no provider key for Claude Code
+    send({ ...connect, runtime: "grok" });
+    send({ ...connect, apiKey: `${KEY} two` });
+    send({ ...connect, providerId: "../x" });
+    send({ ...connect, requestId: "" });
+    send({ ...connect, baseUrl: "file:///etc/passwd" });
+    send({ type: "machine:runtime_auth:providers", requestId: "req-list", runtime: "codex" });
+    send({ type: "machine:runtime_auth:providers", requestId: "req-list", runtime: "qwen" });
+    send({ ...connect });
+    await waitFor(() => host.calls.some((call) => call.startsWith("connect:")), "the valid connect");
+    // The handler itself, on a message object this test keeps: the key is gone from it once handled.
+    const kept = { ...connect, requestId: "req-2" };
+    (core as unknown as { handleMessage(msg: unknown): void }).handleMessage(kept);
+    assert.ok(!("apiKey" in kept), "the message no longer holds the key after handling");
+    const refused = { ...connect, requestId: "" };
+    (core as unknown as { handleMessage(msg: unknown): void }).handleMessage(refused);
+    assert.ok(!("apiKey" in refused), "nor after a refused one");
+    assert.deepEqual(host.calls.filter((call) => !call.startsWith("report:")), [
+      "providers:qwen:req-list",
+      `connect:qwen:req-1:deepseek:${KEY.length}`,
+      `connect:qwen:req-2:deepseek:${KEY.length}`,
+    ]);
+    const dropped = traceRows(sink, traceId).filter((row) => row.name === "daemon.runtime_auth.message_dropped");
+    assert.equal(dropped.length, 8);
+    assert.ok(!JSON.stringify(traceRows(sink, traceId)).includes("sk-provider-secret"), "no trace carries the key, valid or not");
+    assert.ok(logs.some((line) => line.includes("machine:runtime_auth:connect_provider")), "the connects were logged, by type");
+    assert.ok(!logs.join("\n").includes("sk-provider-secret"), "no daemon log line carries the key, valid or not");
+  } finally {
+    unsubscribeLogs();
+    for (const [name, original] of consoleOriginals) console[name] = original;
+    await core.stop();
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("reconciler step 5: with local trace off, the runtime process ledger still starts with the machine lock: a crashed daemon's live orphan is reaped and starts wait for it", { skip: process.platform === "win32" }, async () => {
+  const rootDir = await mkdtemp(path.join(os.tmpdir(), "slock-daemon-orphan-sweep-"));
+  const dataDir = path.join(rootDir, "agents");
+  const machineStateDir = path.join(rootDir, "machines");
+  const apiKey = "sk_machine_test";
+  const machineDir = path.join(machineStateDir, getDaemonMachineLockId(apiKey));
+  await mkdir(machineDir, { recursive: true });
+  // What a crashed daemon left: a runtime in its own group that ignores
+  // SIGTERM, with a grandchild, reparented; recorded in the ledger.
+  const pidFile = path.join(rootDir, "orphan.pid");
+  const grandchildFile = path.join(rootDir, "grandchild.pid");
+  const runtimeScript = `process.on("SIGTERM", () => {}); const c = require("child_process").spawn("sleep", ["60"], { stdio: "ignore" }); require("fs").writeFileSync(${JSON.stringify(grandchildFile)}, String(c.pid)); setInterval(() => {}, 1000);`;
+  const crashed = spawnProcess(process.execPath, ["-e", `const r = require("child_process").spawn(process.execPath, ["-e", ${JSON.stringify(runtimeScript)}], { detached: true, stdio: "ignore" }); require("fs").writeFileSync(${JSON.stringify(pidFile)}, String(r.pid)); r.unref();`], { stdio: "ignore" });
+  await new Promise((resolve) => crashed.on("exit", resolve));
+  const readPid = async (file: string) => Number((await readFile(file, "utf8").catch(() => "")).trim()) || 0;
+  let orphanPid = 0;
+  let grandchildPid = 0;
+  for (let i = 0; i < 200 && !(orphanPid && grandchildPid); i += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    orphanPid = await readPid(pidFile);
+    grandchildPid = await readPid(grandchildFile);
+  }
+  const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+  assert.ok(orphanPid > 0 && grandchildPid > 0, "precondition: the orphan and its grandchild run");
+  await new RuntimeProcessLedger(path.join(machineDir, RUNTIME_PROCESS_LEDGER_FILE)).record(orphanPid, { agentId: "agent-1", launchId: "launch-old", host: "legacy" });
+
+  const previousLocalTrace = process.env.SLOCK_DAEMON_LOCAL_TRACE;
+  process.env.SLOCK_DAEMON_LOCAL_TRACE = "0";
+  const events: string[] = [];
+  const reapedAttrs: Array<Record<string, unknown>> = [];
+  const driver = new FakeDriver();
+  let started: Promise<unknown> = Promise.resolve();
+  const core = new DaemonCore({
+    serverUrl: "https://daemon.example.com",
+    apiKey,
+    dataDir,
+    machineStateDir,
+    localTrace: true,
+    connectionOptions: { wsFactory: () => new FakeWebSocket() },
+    agentManagerFactory: (sendToServer, daemonApiKey, options) => {
+      const manager = new AgentProcessManager(sendToServer, daemonApiKey, {
+        ...options,
+        dataDir: options?.dataDir,
+        serverUrl: options?.serverUrl ?? "https://daemon.example.com",
+        driverResolver: () => driver,
+        stopKill: { graceMs: 300, confirmMs: 2_000 },
+      });
+      const record = (manager as any).recordDaemonEvent.bind(manager);
+      (manager as any).recordDaemonEvent = (name: string, attrs: Record<string, unknown> = {}, ...rest: unknown[]) => {
+        events.push(name);
+        if (name === "daemon.agent.orphan.reaped") reapedAttrs.push(attrs);
+        return record(name, attrs, ...rest);
+      };
+      return manager;
+    },
+  });
+  try {
+    core.start();
+    assert.equal(existsSync(path.join(machineDir, "traces")), false, "precondition: no local trace sink");
+    started = (core as any).agentManager.startAgent("agent-1", {
+      name: "agent", displayName: "Agent", description: "d", model: "m", runtime: "codex", reasoningEffort: null, envVars: null,
+      sessionId: null, serverUrl: "https://daemon.example.com", authToken: apiKey, agentCredentialKey: "sk_agent_test", agentCredentialId: null,
+    } as AgentConfig).catch(() => {});
+    await waitFor(() => events.includes("daemon.agent.orphan.reaped"), "the orphan sweep", 5_000);
+
+    assert.equal(alive(orphanPid), false, "the orphan is reaped");
+    await waitFor(() => !alive(grandchildPid), "the grandchild's death", 2_000);
+    assert.equal(reapedAttrs[0]?.pids, String(orphanPid));
+    assert.equal(reapedAttrs[0]?.escalated_count, 1, "SIGTERM ignored: SIGKILLed after the grace");
+    const waiting = events.indexOf("daemon.agent.start.waiting_for_orphan_reap");
+    assert.ok(waiting >= 0 && waiting < events.indexOf("daemon.agent.orphan.reaped"), "the agent's start waited for the reap");
+    assert.equal(driver.spawnCalls.length === 0 || events.indexOf("daemon.agent.orphan.reaped") < events.indexOf("daemon.agent.spawn.started"), true, "nothing spawned before the reap");
+  } finally {
+    await core.stop();
+    if (previousLocalTrace === undefined) delete process.env.SLOCK_DAEMON_LOCAL_TRACE;
+    else process.env.SLOCK_DAEMON_LOCAL_TRACE = previousLocalTrace;
+    for (const pid of [orphanPid, grandchildPid]) if (pid > 0 && alive(pid)) process.kill(pid, "SIGKILL");
+    // The start runs on after the reap and can still be writing the agent's
+    // workspace when `core.stop()` returns (stop does not wait for in-flight
+    // starts): let it settle, and retry the removal (ENOTEMPTY when a file
+    // lands mid-rm, seen on CI). The timer covers a start that reached the
+    // capability gate after the outbox stopped, which never settles.
+    let settleTimer: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([started, new Promise((resolve) => { settleTimer = setTimeout(resolve, 5_000); })]);
+    clearTimeout(settleTimer);
+    await rm(rootDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+  }
+});
+
+// Reconciler step 11a: `agent:config` is ordered before any host sees it.
+// RED proof: skip `acceptPush` in handleAgentConfigMessage and the stale
+// revisions 4 and 6 replace the applied config; drop the `noteStart` call and
+// revision 4 (older than the start's 5) applies.
+test("DaemonCore orders agent:config by revision: older than the start or the last push is dropped, the newer one applies", async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "slock-daemon-core-test-"));
+  const driver = new FakeDriver();
+  const sockets: FakeWebSocket[] = [];
+  let manager!: AgentProcessManager;
+  const core = new DaemonCore({
+    serverUrl: "https://daemon.example.com",
+    apiKey: "sk_machine_test",
+    dataDir,
+    oarHost: false,
+    connectionOptions: {
+      wsFactory: (_url: string, _options?: Parameters<NonNullable<ConnectionOptions["wsFactory"]>>[1]) => {
+        const socket = new FakeWebSocket();
+        sockets.push(socket);
+        return socket;
+      },
+    },
+    agentManagerFactory: (sendToServer, daemonApiKey, options) => {
+      manager = new AgentProcessManager(sendToServer, daemonApiKey, {
+        dataDir: options?.dataDir,
+        serverUrl: options?.serverUrl ?? "https://daemon.example.com",
+        driverResolver: () => driver,
+        tracer: options?.tracer,
+      });
+      return manager;
+    },
+  });
+
+  try {
+    core.start();
+    const socket = sockets[0]!;
+    socket.emitOpen();
+    await waitFor(() => socket.sent.some((message) => (message as { type?: string }).type === "ready"), "ready");
+    const ready = socket.sent.find((message) => (message as { type?: string }).type === "ready") as { capabilities: string[] };
+    assert.ok(ready.capabilities.includes(DAEMON_CAPABILITY_AGENT_CONFIG_PUSH));
+
+    socket.emitServerMessage({ type: "agent:start", agentId: "agent-1", config: makeConfig({ model: "sonnet" }), configRevision: 5 });
+    await waitFor(() => driver.spawnCalls.length === 1, "agent spawn");
+    const configOf = () => (manager as any).agents.get("agent-1").config as AgentConfig;
+
+    socket.emitServerMessage({ type: "agent:config", agentId: "agent-1", config: makeConfig({ model: "haiku" }), revision: 4 });
+    assert.equal(configOf().model, "sonnet", "older than the start's config");
+    socket.emitServerMessage({ type: "agent:config", agentId: "agent-1", config: makeConfig({ model: "opus" }), revision: 7 });
+    assert.equal(configOf().model, "opus");
+    socket.emitServerMessage({ type: "agent:config", agentId: "agent-1", config: makeConfig({ model: "haiku" }), revision: 6 });
+    assert.equal(configOf().model, "opus", "an older push arriving later is dropped");
+    assert.equal(driver.spawnCalls.length, 1, "a push never starts a process");
+  } finally {
+    await core.stop();
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+// Reconciler step 11d: every ready reports the config revision each running
+// agent applied, so the server re-sends a push lost on the way; the highest
+// one applied, so a stale start that kept a newer push reports the newer one.
+// RED proof: drop `runningAgentConfigRevisions` from the ready frame and no
+// revision is reported.
+test("DaemonCore ready reports each running agent's applied config revision: a re-sent push advances it, a stale start does not lower it", async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "slock-daemon-core-test-"));
+  const driver = new FakeDriver();
+  const sockets: FakeWebSocket[] = [];
+  let manager!: AgentProcessManager;
+  type ReadyFrame = { type: "ready"; runningAgents: string[]; runningAgentConfigRevisions?: Record<string, number> };
+  const readiesOn = (socket: FakeWebSocket): ReadyFrame[] =>
+    socket.sent.filter((message): message is ReadyFrame => (message as { type?: string }).type === "ready");
+  const reconnect = async (): Promise<FakeWebSocket> => {
+    const count = sockets.length;
+    sockets.at(-1)?.terminate();
+    await waitFor(() => sockets.length === count + 1, "replacement websocket");
+    const socket = sockets.at(-1)!;
+    socket.emitOpen();
+    await waitFor(() => readiesOn(socket).length > 0, "ready after reconnect");
+    return socket;
+  };
+  const reportedOn = (socket: FakeWebSocket) => readiesOn(socket).at(-1)!.runningAgentConfigRevisions;
+  const core = new DaemonCore({
+    serverUrl: "https://daemon.example.com",
+    apiKey: "sk_machine_test",
+    dataDir,
+    oarHost: false,
+    connectionOptions: {
+      minReconnectDelayMs: 1,
+      wsFactory: (_url: string, _options?: Parameters<NonNullable<ConnectionOptions["wsFactory"]>>[1]) => {
+        const socket = new FakeWebSocket();
+        sockets.push(socket);
+        return socket;
+      },
+    },
+    agentManagerFactory: (sendToServer, daemonApiKey, options) => {
+      manager = new AgentProcessManager(sendToServer, daemonApiKey, {
+        dataDir: options?.dataDir,
+        serverUrl: options?.serverUrl ?? "https://daemon.example.com",
+        driverResolver: () => driver,
+        tracer: options?.tracer,
+      });
+      return manager;
+    },
+  });
+
+  try {
+    core.start();
+    const first = sockets[0]!;
+    first.emitOpen();
+    await waitFor(() => readiesOn(first).length > 0, "first ready");
+    assert.deepEqual(reportedOn(first), {}, "nothing runs");
+
+    first.emitServerMessage({ type: "agent:start", agentId: "agent-1", config: makeConfig({ model: "sonnet" }), configRevision: 5 });
+    // An older server's start names no revision: not reported, so never compared.
+    first.emitServerMessage({ type: "agent:start", agentId: "agent-2", config: makeConfig({ model: "sonnet" }) });
+    await waitFor(() => driver.spawnCalls.length === 2, "both agents spawned");
+    const configOf = () => (manager as any).agents.get("agent-1").config as AgentConfig;
+
+    // The push of revision 6 is lost with the first socket; the ready says 5.
+    const second = await reconnect();
+    assert.deepEqual(readiesOn(second).at(-1)!.runningAgents.sort(), ["agent-1", "agent-2"]);
+    assert.deepEqual(reportedOn(second), { "agent-1": 5 });
+
+    // The server re-sends it on the new connection: applied, the next ready says 6.
+    second.emitServerMessage({ type: "agent:config", agentId: "agent-1", config: makeConfig({ model: "opus" }), revision: 6 });
+    assert.equal(configOf().model, "opus");
+    const third = await reconnect();
+    assert.deepEqual(reportedOn(third), { "agent-1": 6 });
+
+    // A push of 9, then a start of 8 (stale): the running config stays 9's, and so does the report.
+    third.emitServerMessage({ type: "agent:config", agentId: "agent-1", config: makeConfig({ model: "haiku" }), revision: 9 });
+    third.emitServerMessage({ type: "agent:start", agentId: "agent-1", config: makeConfig({ model: "sonnet" }), configRevision: 8 });
+    await waitFor(() => configOf().model === "haiku", "the newer pushed config kept");
+    const fourth = await reconnect();
+    assert.equal(configOf().model, "haiku");
+    assert.deepEqual(reportedOn(fourth), { "agent-1": 9 });
+  } finally {
+    await core.stop();
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+// task #1357 item 1: the daemon reports the limits of every session it builds
+// with the revision of the config it was built from (stamped from
+// `agent:start` / `agent:config`), declares the capability, and sends each
+// live session's last report again after a reconnect: the same frame, with no
+// new spawn.
+// RED proof: drop withConfigRevision on the start and the spawn has no
+// revision, so nothing is reported; drop the re-send after ready and the
+// reconnect carries no frame; stamp the push onto the running session and the
+// cached report claims revision 6.
+test("DaemonCore reports a session's model limits with its build revision and re-sends the same frame after a reconnect", async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "slock-daemon-core-test-"));
+  const driver = new FakeDriver();
+  const sockets: FakeWebSocket[] = [];
+  let manager!: AgentProcessManager;
+  type LimitsFrame = Extract<MachineToServerMessage, { type: "agent:model_limits" }>;
+  const framesOn = (socket: FakeWebSocket): LimitsFrame[] =>
+    socket.sent.filter((message): message is LimitsFrame => (message as { type?: string }).type === "agent:model_limits");
+  const readiesOn = (socket: FakeWebSocket) => socket.sent.filter((message) => (message as { type?: string }).type === "ready") as Array<{ capabilities: string[] }>;
+  const reconnect = async (): Promise<FakeWebSocket> => {
+    const count = sockets.length;
+    sockets.at(-1)?.terminate();
+    await waitFor(() => sockets.length === count + 1, "replacement websocket");
+    const socket = sockets.at(-1)!;
+    socket.emitOpen();
+    await waitFor(() => readiesOn(socket).length > 0, "ready after reconnect");
+    return socket;
+  };
+  const core = new DaemonCore({
+    serverUrl: "https://daemon.example.com",
+    apiKey: "sk_machine_test",
+    dataDir,
+    oarHost: false,
+    connectionOptions: {
+      minReconnectDelayMs: 1,
+      wsFactory: (_url: string, _options?: Parameters<NonNullable<ConnectionOptions["wsFactory"]>>[1]) => {
+        const socket = new FakeWebSocket();
+        sockets.push(socket);
+        return socket;
+      },
+    },
+    agentManagerFactory: (sendToServer, daemonApiKey, options) => {
+      manager = new AgentProcessManager(sendToServer, daemonApiKey, {
+        dataDir: options?.dataDir,
+        serverUrl: options?.serverUrl ?? "https://daemon.example.com",
+        driverResolver: () => driver,
+        tracer: options?.tracer,
+        daemonInstanceId: options?.daemonInstanceId,
+      });
+      return manager;
+    },
+  });
+
+  try {
+    core.start();
+    const first = sockets[0]!;
+    first.emitOpen();
+    await waitFor(() => readiesOn(first).length > 0, "first ready");
+    assert.ok(readiesOn(first)[0]!.capabilities.includes(DAEMON_CAPABILITY_MODEL_LIMITS_REPORT_V1));
+
+    first.emitServerMessage({ type: "agent:start", agentId: "agent-1", launchId: "launch-1", config: makeConfig(), configRevision: 5 });
+    await waitFor(() => driver.spawnCalls.length === 1, "agent spawn");
+    assert.equal(driver.spawnCalls[0]!.config.configRevision, 5, "the spawn's config carries the start's revision");
+    driver.children[0]!.stdout.emit("data", Buffer.from("model_limits\n"));
+    await waitFor(() => framesOn(first).length === 1, "limits frame");
+    const sent = framesOn(first)[0]!;
+    assert.equal(typeof sent.daemonInstanceId, "string");
+    assert.equal(sent.daemonInstanceId, (readiesOn(first)[0] as { daemonInstanceId?: string }).daemonInstanceId, "the frame names the instance its ready declared");
+    assert.deepEqual({ ...sent, observedAtMs: 0 }, {
+      type: "agent:model_limits",
+      v: 1,
+      agentId: "agent-1",
+      launchId: "launch-1",
+      sessionId: "session-1",
+      configRevision: 5,
+      daemonInstanceId: sent.daemonInstanceId,
+      seq: 1,
+      observedAtMs: 0,
+      runtime: "codex",
+      modelLimits: TEST_MODEL_LIMITS,
+    });
+
+    // A push applied to the running process: its config takes revision 6, the
+    // session it runs was built from 5 and still says so.
+    first.emitServerMessage({ type: "agent:config", agentId: "agent-1", config: makeConfig({ description: "renamed" }), revision: 6 });
+    assert.equal(((manager as any).agents.get("agent-1").config as AgentConfig).configRevision, 6);
+    assert.equal(framesOn(first).length, 1, "a push builds no session, so it reports nothing");
+
+    const second = await reconnect();
+    await waitFor(() => framesOn(second).length === 1, "limits frame re-sent after ready");
+    assert.deepEqual(framesOn(second)[0], sent, "the same session result: same revision, seq and observation time");
+    const readyIndex = second.sent.findIndex((message) => (message as { type?: string }).type === "ready");
+    assert.ok(second.sent.indexOf(framesOn(second)[0]!) > readyIndex, "sent after the ready that declares the capability");
+    assert.equal(driver.spawnCalls.length, 1, "nothing restarted to get it");
+  } finally {
+    await core.stop();
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("withConfigRevision stamps a known revision and leaves a config without one untouched", () => {
+  const config = makeConfig();
+  assert.equal(withConfigRevision(config, undefined), config);
+  assert.equal(withConfigRevision(config, Number.NaN), config);
+  assert.deepEqual(withConfigRevision(config, 3), { ...config, configRevision: 3 });
+  assert.equal(config.configRevision, undefined, "the original is not mutated");
+});
+
+// Reconciler step 14 (Q-H): a /migrate source stops the agent only once it
+// is quiet (the step 13 drain for that agent: core stopMigrationSourceAgent).
+// RED proof: put back the immediate `stopAgent(wait, silent)` and the busy
+// agent is killed and quiesced before its turn end, and the held delivery
+// test sees the quiesce at once.
+async function withMigrationSourceAgent(
+  fn: (ctx: {
+    core: DaemonCore;
+    socket: FakeWebSocket;
+    driver: FakeDriver;
+    child: FakeChildProcess;
+    manager: () => AgentProcessManager;
+    /** In order: "kill", and the resumable control steps the source posted ("source-quiesced", then the bundle's, …). */
+    steps: string[];
+    cancelAcks: Array<Record<string, unknown>>;
+    sendLease: (extra?: Partial<AgentMigrationTransportLeaseMessage>) => void;
+    sendCancel: () => void;
+    deliver: (seq: number, content: string) => void;
+    sourceDrainEvents: () => Array<Record<string, unknown>>;
+    /** The bodies posted to source-progress, in order. */
+    progressReports: Array<Record<string, unknown>>;
+  }) => Promise<void>,
+  options: {
+    /** Capabilities the Server's machine:context advertises (default: none). */
+    serverCapabilities?: string[];
+    /** source-progress answers this status, or drops the connection (default: 200). */
+    sourceProgress?: number | "drop";
+  } = {},
+): Promise<void> {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "raft-daemon-migration-source-drain-test-"));
+  const agentId = "agent-source-drain";
+  const migrationId = "migration-source-drain";
+  const migrationRef = "mig_DRAINDRAINDRAINDRAINAA";
+  const transportGeneration = "transport-generation-source-drain";
+  const sessionId = "session-source-drain";
+  const base = `/internal/computer/agent-migrations/by-id/${migrationId}`;
+  const steps: string[] = [];
+  const cancelAcks: Array<Record<string, unknown>> = [];
+  const progressReports: Array<Record<string, unknown>> = [];
+  const transferServer = await withHttpServer(async (req, res) => {
+    await readRequestBody(req).then((body) => {
+      if (req.url === `${base}/cancel-ack`) cancelAcks.push(JSON.parse(body.toString("utf8")) as Record<string, unknown>);
+      if (req.url === `${base}/resumable/source-progress`) progressReports.push(JSON.parse(body.toString("utf8")) as Record<string, unknown>);
+    });
+    if (req.url?.startsWith(`${base}/resumable/`)) steps.push(req.url.slice(`${base}/resumable/`.length));
+    res.setHeader("Content-Type", "application/json");
+    if (req.url === `${base}/resumable/source-progress` && options.sourceProgress !== undefined) {
+      if (options.sourceProgress === "drop") {
+        req.socket.destroy();
+        return;
+      }
+      res.statusCode = options.sourceProgress;
+      res.end(JSON.stringify({ code: "test", error: "test" }));
+      return;
+    }
+    if (req.url === `${base}/resumable/source-quiesced` || req.url === `${base}/resumable/source-progress` || req.url === `${base}/cancel-ack` || req.url === `${base}/transport-lost`) {
+      res.statusCode = 200;
+      res.end(JSON.stringify({ ok: true }));
+      return;
+    }
+    // The bundle's first step: the flow went on past the quiesce; stop it here.
+    res.statusCode = 409;
+    res.end(JSON.stringify({ code: "migration_test_stop", error: "test stops here" }));
+  });
+  const { sink, tracer } = makeDeterministicTracer();
+  let manager: AgentProcessManager | null = null;
+  const driver = new FakeDriver({ supportsStdinNotification: true });
+  const sockets: FakeWebSocket[] = [];
+  const core = new DaemonCore({
+    serverUrl: transferServer.baseUrl,
+    apiKey: "sk_machine_test",
+    dataDir,
+    slockHome: dataDir,
+    machineStateDir: path.join(dataDir, "machines"),
+    tracer,
+    runtimeDetector: () => ({ ids: [], versions: {} }),
+    connectionOptions: {
+      wsFactory: () => {
+        const socket = new FakeWebSocket();
+        sockets.push(socket);
+        return socket;
+      },
+    },
+    agentManagerFactory: (sendToServer, daemonApiKey, options) => {
+      manager = new AgentProcessManager(sendToServer, daemonApiKey, {
+        dataDir: options?.dataDir,
+        serverUrl: options?.serverUrl ?? "https://daemon.example.com",
+        driverResolver: () => driver,
+        defaultAgentEnvVarsProvider: options?.defaultAgentEnvVarsProvider,
+        tracer: options?.tracer,
+      });
+      return manager;
+    },
+  });
+  try {
+    await mkdir(path.join(dataDir, agentId), { recursive: true });
+    await writeFile(path.join(dataDir, agentId, "notes.md"), "workspace\n");
+    core.start();
+    const socket = sockets[0];
+    assert.ok(socket);
+    socket.emitOpen({ machineContext: false });
+    socket.emitServerMessage({ type: "machine:context", machineId: "machine-test", serverId: "server-test", capabilities: options.serverCapabilities ?? [] });
+    socket.emitServerMessage({ type: "agent:start", agentId, config: makeConfig({ sessionId: "session-1" }), launchId: "launch-1" });
+    await waitFor(() => driver.children.length === 1, "the agent's process");
+    const child = driver.children[0]!;
+    const kill = child.kill.bind(child);
+    child.kill = (signal) => { steps.push("kill"); return kill(signal); };
+    await fn({
+      core,
+      socket,
+      driver,
+      child,
+      manager: () => manager!,
+      steps,
+      cancelAcks,
+      sendLease: (extra = {}) => socket.emitServerMessage({
+        type: "machine:migration_transport:lease",
+        agentId,
+        migrationId,
+        migrationRef,
+        migrationGeneration: `agent_migration:${migrationId}:6`,
+        sessionId,
+        provider: "object_store",
+        leaseSource: "server",
+        role: "source",
+        transferKind: "upload",
+        bearerToken: "source-token",
+        expiresAt: "2999-07-09T13:00:00.000Z",
+        maxBytes: 104857600,
+        controlUrl: `${base}/resumable`,
+        leaseId: "lease-source-drain",
+        transportGeneration,
+        sourceMachineId: "source-machine",
+        targetMachineId: "target-machine",
+        expectedMigrationRevision: 6,
+        ...extra,
+      }),
+      sendCancel: () => socket.emitServerMessage({
+        type: "machine:migration:cancel",
+        agentId,
+        migrationId,
+        migrationRef,
+        transportGeneration,
+        cancelGeneration: "migration_cancel_generation_source_drain_1",
+        migrationRevision: 7,
+        sessionId,
+        role: "source",
+        disposition: "pre_flip_source_authoritative",
+        stopAgent: false,
+      }),
+      deliver: (seq, content) => socket.emitServerMessage({
+        type: "agent:deliver",
+        agentId,
+        seq,
+        message: {
+          channel_id: "channel-1",
+          channel_name: "general",
+          channel_type: "channel",
+          sender_id: "user-1",
+          sender_name: "tygg",
+          sender_type: "human",
+          content,
+          timestamp: new Date(0).toISOString(),
+          seq,
+          message_id: `msg-${seq}`,
+        },
+      }),
+      sourceDrainEvents: () => traceRows(sink)
+        .filter((row) => row.name === "daemon.migration_transport.source_drain")
+        .map((row) => row.attrs ?? {}),
+      progressReports,
+    });
+  } finally {
+    await core.stop();
+    await transferServer.close();
+    await rm(dataDir, { recursive: true, force: true });
+  }
+}
+
+const FAR_DRAIN_UNTIL = "2999-07-09T12:00:00.000Z";
+
+test("migration source: a busy agent is stopped only after its turn end; a delivery meanwhile is held and not delivered here; then the flow goes on", async () => {
+  await withMigrationSourceAgent(async (ctx) => {
+    ctx.sendLease({ sourceDrainUntil: FAR_DRAIN_UNTIL });
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.deepEqual(ctx.steps, [], "the first turn runs: no stop, no quiesce yet");
+    ctx.deliver(77, "held during the migration");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.deepEqual(ctx.steps, [], "a held delivery does not keep it busy, nor stop it");
+
+    ctx.child.stdout.emit("data", Buffer.from("turn_end\n"));
+    await waitFor(() => ctx.steps.some((step) => !["kill", "source-quiesced", "source-progress"].includes(step)), "the flow past the quiesce (the bundle's chunk plan)");
+    assert.deepEqual(ctx.steps.slice(0, 2), ["kill", "source-quiesced"], "stopped once quiet, then quiesced");
+    assert.equal(ctx.child.stdinWrites.some((chunk) => chunk.includes("held during the migration")), false, "not delivered on the source");
+    assert.equal(ctx.driver.spawnCalls.length, 1, "not started again here");
+    const [event] = ctx.sourceDrainEvents();
+    assert.equal(event?.outcome, "quiet");
+    assert.equal(event?.hit_deadline, false);
+    assert.ok(Number(event?.waited_ms) >= 150, `waited ${String(event?.waited_ms)} ms`);
+    assert.equal(event?.deadline_ms, 600_000, "clamped to 10 min");
+  });
+});
+
+test("migration source: an agent that never gets quiet is stopped at the deadline", async () => {
+  await withMigrationSourceAgent(async (ctx) => {
+    ctx.sendLease({ sourceDrainUntil: new Date(Date.now() + 300).toISOString() });
+    await waitFor(() => ctx.steps.includes("source-quiesced"), "the quiesce at the deadline");
+    assert.deepEqual(ctx.steps.slice(0, 2), ["kill", "source-quiesced"]);
+    const [event] = ctx.sourceDrainEvents();
+    assert.equal(event?.outcome, "deadline");
+    assert.equal(event?.hit_deadline, true);
+    assert.equal(event?.not_quiet_reason, "agent_busy");
+    assert.ok(Number(event?.waited_ms) >= 200, `waited ${String(event?.waited_ms)} ms`);
+  });
+});
+
+test("migration source: an idle agent is stopped at once", async () => {
+  await withMigrationSourceAgent(async (ctx) => {
+    ctx.child.stdout.emit("data", Buffer.from("turn_end\n"));
+    await flush();
+    ctx.sendLease({ sourceDrainUntil: FAR_DRAIN_UNTIL });
+    await waitFor(() => ctx.steps.includes("source-quiesced"), "the quiesce");
+    const [event] = ctx.sourceDrainEvents();
+    assert.equal(event?.outcome, "quiet");
+    assert.ok(Number(event?.waited_ms) < 1_000);
+  });
+});
+
+test("migration source: a lease without sourceDrainUntil (an older Server) stops at once, as before", async () => {
+  await withMigrationSourceAgent(async (ctx) => {
+    ctx.sendLease();
+    await waitFor(() => ctx.steps.includes("source-quiesced"), "the quiesce");
+    assert.deepEqual(ctx.steps.slice(0, 2), ["kill", "source-quiesced"], "killed mid-turn: today's behaviour");
+    assert.deepEqual(ctx.sourceDrainEvents(), []);
+  });
+});
+
+test("migration source: cancelled during the wait, the hold is released, the agent keeps running and gets the held delivery", async () => {
+  await withMigrationSourceAgent(async (ctx) => {
+    ctx.sendLease({ sourceDrainUntil: FAR_DRAIN_UNTIL });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    ctx.deliver(78, "held then released");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    ctx.sendCancel();
+    await waitFor(() => ctx.cancelAcks.length === 1, "the cancel acknowledgement");
+    assert.equal(ctx.cancelAcks[0]!.outcome, "cleaned");
+    const [event] = ctx.sourceDrainEvents();
+    assert.equal(event?.outcome, "aborted");
+    ctx.child.stdout.emit("data", Buffer.from("turn_end\n"));
+    await waitFor(() => ctx.child.stdinWrites.some((chunk) => chunk.includes("held then released")), "the held delivery");
+    assert.deepEqual(ctx.steps, [], "never stopped nor quiesced");
+  });
+});
+
+// tygg: an agent that cannot work (here: verification_required on its
+// credential) is not waited for when only a turn would settle what keeps it
+// (a delivery written to stdin that no turn took). The stop, the quiesce and
+// the bundle follow as for a quiet one, and nothing is reported read. RED
+// proof: drop agentStopWaitReason from the legacy host's computeDrainProgress
+// and this waits until FAR_DRAIN_UNTIL (the test times out).
+test("migration source: an agent that cannot run, idle, is not waited for; traced not_runnable; nothing is reported read", async () => {
+  await withMigrationSourceAgent(async (ctx) => {
+    ctx.child.stdout.emit("data", Buffer.from("turn_end\n"));
+    await flush();
+    const manager = ctx.manager() as any;
+    const ap = manager.agents.get("agent-source-drain");
+    ap.deliveryConsumption.recordWrite("delivery-1", "stdin_idle_delivery", Date.now());
+    manager.lifecycleRecords.providerLimitLedger.recordInvalid(
+      providerLimitCredentialKey("agent-source-drain", ap.config),
+      { invalidReason: "user_reauth", recordedAtMs: Date.now(), code: "verification_required" },
+      { host: "legacy" },
+    );
+    const sentBefore = ctx.socket.sent.length;
+    ctx.sendLease({ sourceDrainUntil: FAR_DRAIN_UNTIL });
+    await waitFor(() => ctx.steps.includes("source-quiesced"), "the quiesce");
+    assert.deepEqual(ctx.steps.slice(0, 2), ["kill", "source-quiesced"], "stopped, then quiesced: the contract steps still run");
+    const [event] = ctx.sourceDrainEvents();
+    assert.equal(event?.outcome, "not_runnable");
+    assert.equal(event?.not_runnable_reason, "credential_invalid");
+    assert.equal(event?.not_waited_for, "delivery_in_flight");
+    assert.ok(Number(event?.waited_ms) < 1_000, `waited ${String(event?.waited_ms)} ms`);
+    const readFrames = ctx.socket.sent.slice(sentBefore).filter((frame) => ["agent:model-seen", "agent:turn:ended"].includes((frame as { type?: string }).type ?? ""));
+    assert.deepEqual(readFrames, [], "nothing reported read: unread on the server for the target");
+  });
+});
+
+test("migration source: the agent not running here is not waited for", async () => {
+  await withMigrationSourceAgent(async (ctx) => {
+    ctx.socket.emitServerMessage({ type: "agent:stop", agentId: "agent-source-drain" });
+    await waitFor(() => ctx.steps.includes("kill"), "the owner's stop");
+    ctx.sendLease({ sourceDrainUntil: FAR_DRAIN_UNTIL });
+    await waitFor(() => ctx.steps.includes("source-quiesced"), "the quiesce");
+    assert.equal(ctx.sourceDrainEvents()[0]?.outcome, "not_running");
+  });
+});
+
+// The source tells the Server it is waiting for the agent (phase draining),
+// once, as the drain begins, and only a Server that advertises
+// SERVER_CAPABILITY_MIGRATION_SOURCE_DRAIN_PROGRESS_V1. RED proof
+// (reverse-verified): drop the reportMigrationSourceDraining call and the
+// first test sees no report.
+const SOURCE_DRAIN_PROGRESS = { serverCapabilities: [SERVER_CAPABILITY_MIGRATION_SOURCE_DRAIN_PROGRESS_V1] };
+
+test("migration source: a busy agent's drain is reported once as draining, with its deadline and turn, before the stop", async () => {
+  await withMigrationSourceAgent(async (ctx) => {
+    const drainUntil = new Date(Date.now() + 60_000).toISOString();
+    ctx.sendLease({ sourceDrainUntil: drainUntil });
+    await waitFor(() => ctx.progressReports.length === 1, "the draining report");
+    assert.deepEqual(ctx.steps, ["source-progress"], "reported while still waiting: no stop, no quiesce yet");
+    assert.deepEqual(ctx.progressReports[0], {
+      migrationGeneration: "transport-generation-source-drain",
+      phase: "draining",
+      drainUntil,
+      waitingFor: "turn",
+    });
+    ctx.child.stdout.emit("data", Buffer.from("turn_end\n"));
+    await waitFor(() => ctx.steps.includes("source-quiesced"), "the quiesce");
+    assert.deepEqual(ctx.steps.slice(0, 3), ["source-progress", "kill", "source-quiesced"]);
+    assert.equal(ctx.progressReports.filter((report) => report.phase === "draining").length, 1, "exactly one");
+  }, SOURCE_DRAIN_PROGRESS);
+});
+
+test("migration source: a Server without the drain progress capability gets no draining report", async () => {
+  await withMigrationSourceAgent(async (ctx) => {
+    ctx.sendLease({ sourceDrainUntil: new Date(Date.now() + 300).toISOString() });
+    await waitFor(() => ctx.steps.includes("source-quiesced"), "the quiesce at the deadline");
+    assert.deepEqual(ctx.steps.slice(0, 2), ["kill", "source-quiesced"]);
+    assert.equal(ctx.progressReports.some((report) => report.phase === "draining"), false);
+  });
+});
+
+test("migration source: an agent not running here, or already idle, is not reported as draining", async () => {
+  await withMigrationSourceAgent(async (ctx) => {
+    ctx.socket.emitServerMessage({ type: "agent:stop", agentId: "agent-source-drain" });
+    await waitFor(() => ctx.steps.includes("kill"), "the owner's stop");
+    ctx.sendLease({ sourceDrainUntil: FAR_DRAIN_UNTIL });
+    await waitFor(() => ctx.steps.includes("source-quiesced"), "the quiesce");
+    assert.equal(ctx.sourceDrainEvents()[0]?.outcome, "not_running");
+    assert.equal(ctx.progressReports.some((report) => report.phase === "draining"), false);
+  }, SOURCE_DRAIN_PROGRESS);
+  await withMigrationSourceAgent(async (ctx) => {
+    ctx.child.stdout.emit("data", Buffer.from("turn_end\n"));
+    await flush();
+    ctx.sendLease({ sourceDrainUntil: FAR_DRAIN_UNTIL });
+    await waitFor(() => ctx.steps.includes("source-quiesced"), "the quiesce");
+    assert.equal(ctx.sourceDrainEvents()[0]?.outcome, "quiet");
+    assert.equal(ctx.progressReports.some((report) => report.phase === "draining"), false);
+  }, SOURCE_DRAIN_PROGRESS);
+});
+
+for (const sourceProgress of [503, "drop"] as const) {
+  test(`migration source: a draining report that fails (${String(sourceProgress)}) costs the drain and stop nothing`, async () => {
+    await withMigrationSourceAgent(async (ctx) => {
+      ctx.sendLease({ sourceDrainUntil: FAR_DRAIN_UNTIL });
+      await waitFor(() => ctx.progressReports.length === 1, "the draining report");
+      ctx.child.stdout.emit("data", Buffer.from("turn_end\n"));
+      await waitFor(() => ctx.steps.includes("source-quiesced"), "the quiesce");
+      assert.deepEqual(ctx.steps.slice(0, 3), ["source-progress", "kill", "source-quiesced"]);
+      assert.equal(ctx.sourceDrainEvents()[0]?.outcome, "quiet");
+    }, { ...SOURCE_DRAIN_PROGRESS, sourceProgress });
+  });
+}
+
+// `raft proc` step 2 (#proj-raft-computer:#59): which stops end an agent's
+// jobs. Real processes (POSIX). The core's job manager is replaced by one with
+// a short grace and user systemd off, on the same machine dir. RED proofs
+// (reverse-verified): drop the agent:stop wiring and the owner_stop job
+// survives; stop jobs on every agent:stop and the lifecycle job dies; drop the
+// workspace-delete or migration call and those jobs survive.
+const procPosix = process.platform !== "win32";
+
+async function useTestProcJobs(core: DaemonCore): Promise<ProcJobManager> {
+  const internals = core as unknown as { procJobManager: ProcJobManager | null; machineLock: { machineDir: string } | null };
+  await waitFor(() => internals.machineLock !== null && internals.procJobManager !== null, "the machine lock and job manager");
+  await internals.procJobManager!.close();
+  const manager = await ProcJobManager.open({
+    machineDir: internals.machineLock!.machineDir,
+    graceMs: 300,
+    confirmMs: 2_000,
+    rotateIntervalMs: 0,
+    userSystemd: false,
+  });
+  internals.procJobManager = manager;
+  return manager;
+}
+
+async function startProcSleep(manager: ProcJobManager, agentId: string, name: string): Promise<number> {
+  const env = Object.fromEntries(Object.entries(process.env).filter((entry): entry is [string, string] => typeof entry[1] === "string"));
+  const result = await manager.start(agentId, { name, argv: ["sleep", "60"], cwd: os.tmpdir(), env, stableEntryDir: null, runtime: "claude", launchId: null });
+  assert.ok(result.ok, JSON.stringify(result));
+  return result.job.pid;
+}
+
+function procGroupAlive(pgid: number): boolean {
+  try {
+    process.kill(-pgid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+async function withProcJobsCore(fn: (ctx: { core: DaemonCore; socket: FakeWebSocket; manager: ProcJobManager; dataDir: string; pids: number[] }) => Promise<void>): Promise<void> {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "slock-daemon-proc-stop-test-"));
+  const sockets: FakeWebSocket[] = [];
+  const core = new DaemonCore({
+    serverUrl: "https://daemon.example.com",
+    apiKey: "sk_machine_test",
+    dataDir,
+    slockHome: dataDir,
+    machineStateDir: path.join(dataDir, "machines"),
+    runtimeDetector: () => ({ ids: [], versions: {} }),
+    connectionOptions: {
+      wsFactory: () => {
+        const socket = new FakeWebSocket();
+        sockets.push(socket);
+        return socket;
+      },
+    },
+  });
+  const pids: number[] = [];
+  try {
+    core.start();
+    const socket = sockets[0];
+    assert.ok(socket);
+    socket.emitOpen();
+    const manager = await useTestProcJobs(core);
+    await fn({ core, socket, manager, dataDir, pids });
+  } finally {
+    for (const pid of pids) {
+      try { process.kill(-pid, "SIGKILL"); } catch { /* gone */ }
+    }
+    await core.stop();
+    await rm(dataDir, { recursive: true, force: true });
+  }
+}
+
+test.skipIf(!procPosix)("raft proc: the owner's Stop ends the agent's jobs; a lifecycle stop, no reason or an unknown one leaves them running", async () => {
+  await withProcJobsCore(async ({ socket, manager, pids }) => {
+    const owner = await startProcSleep(manager, "agent-owner", "web");
+    const lifecycle = await startProcSleep(manager, "agent-lifecycle", "web");
+    const bare = await startProcSleep(manager, "agent-bare", "web");
+    const odd = await startProcSleep(manager, "agent-odd", "web");
+    const other = await startProcSleep(manager, "agent-other", "web");
+    pids.push(owner, lifecycle, bare, odd, other);
+
+    socket.emitServerMessage({ type: "agent:stop", agentId: "agent-lifecycle", reason: "lifecycle" } as ServerToMachineMessage);
+    socket.emitServerMessage({ type: "agent:stop", agentId: "agent-bare" });
+    socket.emitServerMessage({ type: "agent:stop", agentId: "agent-odd", reason: "something-new" } as unknown as ServerToMachineMessage);
+    socket.emitServerMessage({ type: "agent:stop", agentId: "agent-owner", reason: "owner_stop" } as ServerToMachineMessage);
+    await waitFor(() => !procGroupAlive(owner), "the owner_stop job's group gone");
+    assert.equal((await manager.list("agent-owner"))[0]?.state, "exited");
+    // Given the same time the owner's job took, plus a grace.
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    for (const pid of [lifecycle, bare, odd, other]) assert.equal(procGroupAlive(pid), true, `job ${pid} still running`);
+    assert.equal((await manager.list("agent-lifecycle"))[0]?.state, "running");
+  });
+});
+
+test.skipIf(!procPosix)("raft proc: a deleted agent's workspace takes its jobs with it, and only its", async () => {
+  await withProcJobsCore(async ({ socket, manager, dataDir, pids }) => {
+    const agentId = "agent-deleted";
+    await mkdir(path.join(dataDir, agentId), { recursive: true });
+    const deleted = await startProcSleep(manager, agentId, "bot");
+    const kept = await startProcSleep(manager, "agent-kept", "bot");
+    pids.push(deleted, kept);
+    socket.emitServerMessage({ type: "machine:workspace:delete", directoryName: agentId });
+    await waitFor(() => !procGroupAlive(deleted), "the deleted agent's job gone");
+    assert.equal(existsSync(path.join(dataDir, agentId)), false);
+    assert.equal(procGroupAlive(kept), true);
+  });
+});
+
+test.skipIf(!procPosix)("raft proc: an agent migrating away has its jobs stopped before the source quiesces", async () => {
+  await withMigrationSourceAgent(async (ctx) => {
+    const manager = await useTestProcJobs(ctx.core);
+    const pid = await startProcSleep(manager, "agent-source-drain", "web");
+    const other = await startProcSleep(manager, "agent-stays", "web");
+    try {
+      ctx.sendLease();
+      await waitFor(() => ctx.steps.includes("source-quiesced"), "the quiesce");
+      assert.equal(procGroupAlive(pid), false, "stopped before the quiesce");
+      assert.equal(procGroupAlive(other), true);
+    } finally {
+      for (const each of [pid, other]) {
+        try { process.kill(-each, "SIGKILL"); } catch { /* gone */ }
+      }
+    }
+  });
+});
+
+test.skipIf(!procPosix)("raft proc: once stop() resolves nothing writes proc-jobs.json (no sweep, no exit seen later); the next start opens a new manager", async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "slock-daemon-proc-close-test-"));
+  const sockets: FakeWebSocket[] = [];
+  const core = new DaemonCore({
+    serverUrl: "https://daemon.example.com",
+    apiKey: "sk_machine_test",
+    dataDir,
+    slockHome: dataDir,
+    machineStateDir: path.join(dataDir, "machines"),
+    runtimeDetector: () => ({ ids: [], versions: {} }),
+    connectionOptions: {
+      wsFactory: () => {
+        const socket = new FakeWebSocket();
+        sockets.push(socket);
+        return socket;
+      },
+    },
+  });
+  const internals = core as unknown as { procJobManager: ProcJobManager | null; machineLock: { machineDir: string } | null };
+  let pid = 0;
+  try {
+    core.start();
+    sockets[0]!.emitOpen();
+    const manager = await useTestProcJobs(core);
+    const machineDir = internals.machineLock!.machineDir;
+    const ledger = path.join(machineDir, "proc-jobs.json");
+    const env = Object.fromEntries(Object.entries(process.env).filter((entry): entry is [string, string] => typeof entry[1] === "string"));
+    // Exits on its own shortly after stop(): a live manager would record that exit.
+    const started = await manager.start("agent-close", { name: "brief", argv: ["sh", "-c", "sleep 0.4"], cwd: os.tmpdir(), env, stableEntryDir: null, runtime: "claude", launchId: null });
+    assert.ok(started.ok, JSON.stringify(started));
+    pid = started.job.pid;
+    await core.stop();
+    const before = await readFile(ledger, "utf8");
+    const beforeMtime = (await stat(ledger)).mtimeMs;
+    assert.equal(internals.procJobManager, null);
+    assert.equal((manager as unknown as { timer: unknown }).timer, null, "the sweep is stopped");
+    await waitFor(() => !procGroupAlive(pid), "the job's own exit");
+    manager.sweep();
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    assert.equal(await readFile(ledger, "utf8"), before);
+    assert.equal((await stat(ledger)).mtimeMs, beforeMtime);
+    assert.equal((JSON.parse(before) as { jobs: Array<{ state: string }> }).jobs[0]?.state, "running", "left for the next daemon to find");
+    // close is idempotent.
+    await manager.close();
+
+    core.start();
+    await waitFor(() => internals.procJobManager !== null, "a new job manager");
+    assert.notEqual(internals.procJobManager, manager);
+    await internals.procJobManager!.ready;
+    const [job] = await internals.procJobManager!.list("agent-close");
+    assert.equal(job?.state, "exited", "the next manager finds it gone");
+  } finally {
+    if (pid) {
+      try { process.kill(-pid, "SIGKILL"); } catch { /* gone */ }
+    }
+    await core.stop();
+    await rm(dataDir, { recursive: true, force: true });
   }
 });

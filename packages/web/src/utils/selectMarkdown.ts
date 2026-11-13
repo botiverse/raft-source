@@ -1,6 +1,6 @@
 import type { IntlShape } from "react-intl";
 import type { Message } from "../store/messageStore";
-import api from "../api/client";
+import { dataUrlToBlob } from "./dataUrlBlob";
 
 type FormatMessage = IntlShape["formatMessage"];
 
@@ -121,9 +121,9 @@ export async function copyPngDataUrlToClipboard(dataUrl: string): Promise<void> 
     throw new Error("Image clipboard is not supported in this browser");
   }
 
-  const pngBlob = fetch(dataUrl).then(async (response) => {
-    if (!response.ok) throw new Error("Unable to read the generated image");
-    const blob = await response.blob();
+  // Decoded in place, not fetched: Raft Desktop's page policy refuses `fetch` of a data URL (#triage:#352).
+  const pngBlob = Promise.resolve().then(() => {
+    const blob = dataUrlToBlob(dataUrl);
     return blob.type === "image/png" ? blob : new Blob([blob], { type: "image/png" });
   });
 
@@ -135,66 +135,5 @@ export async function copyPngDataUrlToClipboard(dataUrl: string): Promise<void> 
 }
 
 export async function dataUrlToPngFile(dataUrl: string, filename: string): Promise<File> {
-  const response = await fetch(dataUrl);
-  const blob = await response.blob();
-  return new File([blob], filename, { type: "image/png" });
-}
-
-export type ShareArtifactResponse = {
-  id: string;
-  url: string;
-  imageUrl: string;
-};
-
-export async function createSelectedMessagesShareArtifact(
-  file: File,
-  channelId: string,
-): Promise<ShareArtifactResponse> {
-  const form = new FormData();
-  form.append("channelId", channelId);
-  form.append("image", file, file.name || "raft-thread.png");
-  const { data } = await api.post<ShareArtifactResponse>("/share-artifacts/message-selection", form);
-  return data;
-}
-
-export function buildShareArtifactXIntentUrl(
-  shareUrl: string,
-  formatMessage?: FormatMessage,
-): string {
-  const viaRaft = formatMessage
-    ? formatMessage({ id: "message.share.viaRaft" })
-    : "via Raft";
-  return `https://twitter.com/intent/tweet?url=${encodeURIComponent(shareUrl)}&text=${encodeURIComponent(viaRaft)}`;
-}
-
-function shouldOpenXIntentInNewTab(): boolean {
-  if (typeof window === "undefined") return false;
-  if (window.innerWidth < 768) return false;
-  return !/Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
-}
-
-function openXIntentInNewTab(intent: string): boolean {
-  // Do not pass noopener/noreferrer as a feature string here: Chrome can
-  // return null even after opening the tab, which would trigger the fallback
-  // and replace the Slock tab. Harden opener manually after success instead.
-  const opened = window.open(intent, "_blank");
-  if (!opened) return false;
-  try {
-    opened.opener = null;
-  } catch {
-    // Cross-browser best effort: if the browser opened the tab, do not also
-    // navigate the Slock tab just because opener hardening failed.
-  }
-  return true;
-}
-
-export function navigateShareArtifactToX(
-  shareUrl: string,
-  formatMessage?: FormatMessage,
-): void {
-  const intent = buildShareArtifactXIntentUrl(shareUrl, formatMessage);
-  if (shouldOpenXIntentInNewTab()) {
-    if (openXIntentInNewTab(intent)) return;
-  }
-  window.location.assign(intent);
+  return new File([dataUrlToBlob(dataUrl)], filename, { type: "image/png" });
 }

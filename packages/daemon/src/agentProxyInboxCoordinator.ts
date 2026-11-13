@@ -28,9 +28,13 @@ export function buildAgentProxyInboxCoordinator(input: {
   getContextId?: AgentProxyInboxCoordinator["getContextId"];
   getAllPendingMessages: NonNullable<AgentProxyInboxCoordinator["getAllPendingMessages"]>;
   consumeVisibleMessages: AgentProxyInboxCoordinator["consumeVisibleMessages"];
+  recordHeldWriteSpan?: AgentProxyInboxCoordinator["recordHeldWriteSpan"];
+  getHeldWriteSpan?: AgentProxyInboxCoordinator["getHeldWriteSpan"];
+  getThreadTargetOfMessage?: AgentProxyInboxCoordinator["getThreadTargetOfMessage"];
   recordTrace: TraceRecorder;
   recordFreshnessDecisionActivity: (decision: AgentProxyFreshnessDecision, producerFactId: string) => void;
   recordSendOutcome?: AgentProxyInboxCoordinator["recordSendOutcome"];
+  recordMessageCommitted?: AgentProxyInboxCoordinator["recordMessageCommitted"];
 }): AgentProxyInboxCoordinator {
   return {
     getBoundary: input.getBoundary,
@@ -40,6 +44,9 @@ export function buildAgentProxyInboxCoordinator(input: {
     getContextId: input.getContextId,
     getAllPendingMessages: input.getAllPendingMessages,
     consumeVisibleMessages: input.consumeVisibleMessages,
+    ...(input.recordHeldWriteSpan ? { recordHeldWriteSpan: input.recordHeldWriteSpan } : {}),
+    ...(input.getHeldWriteSpan ? { getHeldWriteSpan: input.getHeldWriteSpan } : {}),
+    ...(input.getThreadTargetOfMessage ? { getThreadTargetOfMessage: input.getThreadTargetOfMessage } : {}),
     recordInboxSnapshot: (projection) => input.recordTrace("daemon.agent.inbox_projection.snapshot", {
       agentId: input.agentId,
       source: projection.source,
@@ -89,5 +96,6 @@ export function buildAgentProxyInboxCoordinator(input: {
       }
     },
     ...(input.recordSendOutcome ? { recordSendOutcome: input.recordSendOutcome } : {}),
+    ...(input.recordMessageCommitted ? { recordMessageCommitted: input.recordMessageCommitted } : {}),
   };
 }

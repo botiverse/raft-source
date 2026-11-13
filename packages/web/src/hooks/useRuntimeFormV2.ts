@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { missingRuntimeFormV2Capabilities, parseRuntimeFormV2 } from "@botiverse/raft-runtime-form";
 import type {
   ParsedRuntimeFormV2,
@@ -7,6 +7,7 @@ import type {
 } from "@botiverse/raft-runtime-form";
 
 import api from "../api/client";
+import { runtimeFormV2ClientCapabilityParams } from "../utils/runtimeFormV2ClientCapabilities";
 import { useLocale } from "../i18n/LocaleProvider";
 import { htmlLangForLocale } from "../i18n/locale";
 import type { Locale } from "../i18n/locale";
@@ -14,8 +15,8 @@ import { useServerStore } from "../store/serverStore";
 
 /**
  * `requiredClientCapabilities` this web client implements. A v2 form that needs
- * anything else is unavailable here and the caller falls back to its v1/legacy
- * form (packages/runtime-form README, "Protocol v2").
+ * anything else is unavailable here: the caller shows the form-unavailable
+ * notice and blocks create/save (packages/runtime-form README, "Protocol v2").
  */
 export const WEB_RUNTIME_FORM_V2_CAPABILITIES: ReadonlySet<string> = new Set<string>([
   // Combobox for a select whose source allows a typed value (RuntimeFormV2Fields).
@@ -41,9 +42,23 @@ export type RuntimeFormV2State =
       /** Sources being re-requested right now. */
       retryingSourceIds?: readonly string[];
     }
-  | { status: "error"; errorCode?: string }
-  /** The form needs client capabilities this build lacks: use the legacy form. */
+  | {
+      status: "error";
+      errorCode?: string;
+      /** Fetch the whole form again (a failed load, e.g. a network error). */
+      reload?: () => void;
+    }
+  /**
+   * The form needs client capabilities this build lacks. There is no other form
+   * to fall back to: shown as unavailable, and create/save stay blocked.
+   */
   | { status: "unsupported"; missingCapabilities: string[] };
+
+/**
+ * A runtime whose admission row has no v2 form marker (no catalog runtime today):
+ * nothing to load, so it is shown and blocked like an unsupported form.
+ */
+export const RUNTIME_FORM_V2_UNAVAILABLE: RuntimeFormV2State = { status: "unsupported", missingCapabilities: [] };
 
 /**
  * v2 form copy is server-sent: ask for it in the app's display language, not the
@@ -59,7 +74,7 @@ const runtimeFormV2Base = (serverId: string, machineId: string, runtimeId: strin
   `/servers/${serverId}/machines/${machineId}/runtime-forms/v2/${encodeURIComponent(runtimeId)}`;
 
 /**
- * A source whose request failed, for a form that uses `option_source.status`:
+ * A source whose request failed (any form; per-source status is always on):
  * the same "unavailable" the server would send, retryable, without a reason
  * (shown as a generic message). The form stays usable around it.
  */
@@ -88,13 +103,13 @@ async function loadRuntimeFormV2Source(
   const suffix = query.toString();
   const url = `${base}/option-sources/${encodeURIComponent(sourceId)}${suffix ? `?${suffix}` : ""}`;
   try {
-    const { data } = await api.get(url, { headers });
+    const { data } = await api.get(url, { headers, params: runtimeFormV2ClientCapabilityParams() });
     return data as RuntimeFormV2OptionSource;
   } catch (error) {
-    // Forms without option_source.status keep the old contract: a failed
-    // source fails the whole form (with the server's error code). A stale
-    // revision always propagates: the caller refetches the whole form.
-    if (isFormRevisionStale(error) || !form.requiredClientCapabilities.includes("option_source.status")) throw error;
+    // Per-source status is always supported: a failed source marks only its
+    // own field unavailable, never the whole form. A stale revision always
+    // propagates: the caller refetches the whole form.
+    if (isFormRevisionStale(error)) throw error;
     return unreachableSource(form, sourceId);
   }
 }
@@ -111,13 +126,13 @@ async function loadRuntimeFormV2(
   attempt = 0,
 ): Promise<Exclude<RuntimeFormV2State, { status: "idle" | "loading" }>> {
   // Edit reads the same form plus the agent's current values from the agent itself.
-  const { data } = await api.get(agentId ? `/agents/${encodeURIComponent(agentId)}/runtime-form` : base, { headers });
+  const { data } = await api.get(agentId ? `/agents/${encodeURIComponent(agentId)}/runtime-form` : base, { headers, params: runtimeFormV2ClientCapabilityParams() });
   const form = parseRuntimeFormV2(data);
   if (!form) return { status: "error" };
   const missingCapabilities = missingRuntimeFormV2Capabilities(form, WEB_RUNTIME_FORM_V2_CAPABILITIES);
   // Checked before any option source is loaded: an unavailable form is not rendered at all.
   if (missingCapabilities.length > 0) return { status: "unsupported", missingCapabilities };
-  // Each source loads on its own: with option_source.status one failing source
+  // Each source loads on its own: one failing source
   // is reported on its field (loadRuntimeFormV2Source) and never fails the form.
   try {
     const sources = Object.fromEntries(await Promise.all(Object.keys(form.optionSources).map(async (sourceId) =>
@@ -135,7 +150,8 @@ async function loadRuntimeFormV2(
  * Protocol v2 create form for one runtime on one Computer: the current form as
  * the server describes it, plus its option lists. Tolerant by contract; only a
  * body that is not a v2 form at all, or a failed request, is an error. A form
- * requiring client capabilities this build lacks is "unsupported".
+ * requiring client capabilities this build lacks is "unsupported" (unavailable:
+ * the caller blocks create/save; there is no legacy form to fall back to).
  */
 export function useRuntimeFormV2(
   machineId: string | null | undefined,
@@ -145,7 +161,10 @@ export function useRuntimeFormV2(
   const serverId = useServerStore((state) => state.current?.id);
   const { locale } = useLocale();
   // The locale is part of the key: switching language reloads the form's copy.
-  const requestKey = serverId && machineId && runtimeId ? `${serverId}\0${machineId}\0${runtimeId}\0${agentId ?? ""}\0${locale}` : "";
+  // `attempt` is bumped by `reload`: a new key refetches the whole form.
+  const [attempt, setAttempt] = useState(0);
+  const reload = useCallback(() => setAttempt((value) => value + 1), []);
+  const requestKey = serverId && machineId && runtimeId ? `${serverId}\0${machineId}\0${runtimeId}\0${agentId ?? ""}\0${locale}\0${attempt}` : "";
   const [state, setState] = useState<{ requestKey: string; value: RuntimeFormV2State }>({ requestKey: "", value: { status: "idle" } });
 
   // One snapshot per request key; each branch replaces the whole object.
@@ -177,16 +196,25 @@ export function useRuntimeFormV2(
         return;
       }
       const inFlight = new Set<string>();
-      const retrySource = (sourceId: string) => {
+      // Sources whose list is keyed by this source's field (v3: a reasoning
+      // effort keyed by model); re-requested once their parent answers.
+      const dependentsOf = (sourceId: string) => {
+        const key = loaded.form.optionSources[sourceId]?.key;
+        return Object.values(loaded.form.optionSources).filter((ref) => key !== undefined && ref.dependsOn === key).map((ref) => ref.sourceId);
+      };
+      const reloadSource = (sourceId: string, refresh: boolean) => {
         if (cancelled || gen !== generation || inFlight.has(sourceId)) return;
         inFlight.add(sourceId);
         updateReady((ready) => ({ ...ready, retryingSourceIds: [...inFlight] }));
-        void loadRuntimeFormV2Source(base, loaded.form, sourceId, true, headers)
+        void loadRuntimeFormV2Source(base, loaded.form, sourceId, refresh, headers)
           .then(
             (source) => {
               inFlight.delete(sourceId);
               if (cancelled || gen !== generation) return;
               updateReady((ready) => ({ ...ready, sources: { ...ready.sources, [sourceId]: source }, retryingSourceIds: [...inFlight] }));
+              // The parent's fresh answer is cached server-side: dependents
+              // follow without asking the Computer again.
+              for (const dependent of dependentsOf(sourceId)) reloadSource(dependent, false);
             },
             (error: unknown) => {
               inFlight.delete(sourceId);
@@ -220,6 +248,7 @@ export function useRuntimeFormV2(
             },
           );
       };
+      const retrySource = (sourceId: string) => reloadSource(sourceId, true);
       setState({ requestKey, value: { ...loaded, retrySource } });
     };
     const reinstallError = (error: unknown): void => {
@@ -231,7 +260,12 @@ export function useRuntimeFormV2(
     return () => { cancelled = true; };
   }, [agentId, locale, machineId, requestKey, runtimeId, serverId]);
 
+  // A stable object per snapshot, so a caller's effects do not rerun every render.
+  const value = useMemo(
+    () => state.value.status === "error" ? { ...state.value, reload } : state.value,
+    [reload, state.value],
+  );
   if (!requestKey) return { status: "idle" };
   if (state.requestKey !== requestKey) return { status: "loading" };
-  return state.value;
+  return value;
 }

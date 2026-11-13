@@ -19,7 +19,7 @@ import { ForwardToastProvider } from "./components/message/ForwardToastProvider"
  * here means a new required context reaches every host on its next build.
  *
  * Contract for adding a provider: add it here, and add a probe for the hook it
- * backs to tests/appProviders.behavior.test.tsx so hosts are proven complete.
+ * backs to tests/appProviders.behavior.test.tsx (removed in the 2026-11 web DOM test prune) so hosts are proven complete.
  *
  * Hosts customise only through the props below — never by wrapping a subset:
  * - `router`: the react-router router (web + desktop: BrowserRouter; tests:

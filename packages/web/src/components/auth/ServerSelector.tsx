@@ -1,13 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { ChangeEvent, FormEvent } from "react";
+import type { FormEvent, ReactNode } from "react";
 import { useIntl } from "react-intl";
 import { clearClockTimeout, setClockTimeout } from "@botiverse/raft-shared";
 import { useServerStore } from "../../store/serverStore";
 import type { Server } from "../../store/serverStore";
 import { useAuthStore } from "../../store/authStore";
 import Banner from "../ui/Banner";
-import TextLink from "../ui/TextLink";
-import { Input, Button, ListRowGroup } from "@botiverse/raft-ui";
+import { Input, Button, ListRowGroup, TextLink } from "@botiverse/raft-ui";
 import CenteredCardFrame from "./CenteredCardFrame";
 import { AuthPageIntro } from "./AuthPageFrame";
 import FormField from "../ui/FormField";
@@ -17,13 +16,13 @@ import ServerCreatePreview from "./ServerCreatePreview";
 import SignedInAs from "./SignedInAs";
 import { requestHostedOnboardingServerSwitch } from "../../embed/hostBridge";
 import { ServerOptionCard } from "./ServerOptionCard";
+import { useServerNameAndSlug } from "./useServerNameAndSlug";
+import { DeploymentUserLimitText } from "../ui/DeploymentUserLimitText";
+import { isDeploymentUserLimitRefusal } from "../../utils/deploymentUserLimit";
 
 interface ServerSelectorProps {
   onSelect: (server: Server) => void;
 }
-
-const toSlug = (value: string) =>
-  value.toLowerCase().replace(/[^a-z0-9-]/g, "-");
 
 export default function ServerSelector({ onSelect }: ServerSelectorProps) {
   const { formatMessage } = useIntl();
@@ -47,10 +46,11 @@ export default function ServerSelector({ onSelect }: ServerSelectorProps) {
   useEffect(() => {
     if (!hasServers) setView("create");
   }, [hasServers]);
-  const [name, setName] = useState("");
-  const [slug, setSlug] = useState("");
-  const [slugTouched, setSlugTouched] = useState(false);
+  const { name, slug, handleNameChange, handleSlugChange, reset: resetNameAndSlug } = useServerNameAndSlug();
   const [error, setError] = useState("");
+  // Creating it refused at the Raft License's user limit: its sentence has a mail link, so it is not a string.
+  const [userLimitRefused, setUserLimitRefused] = useState(false);
+  const shownError: ReactNode = userLimitRefused ? <DeploymentUserLimitText /> : error;
   const [switchPending, setSwitchPending] = useState(false);
   const switchTimeoutRef = useRef<ReturnType<typeof setClockTimeout> | null>(null);
 
@@ -77,23 +77,12 @@ export default function ServerSelector({ onSelect }: ServerSelectorProps) {
     }, 5000);
   }, [onSelect, formatMessage]);
 
-  const handleNameChange = useCallback((e: ChangeEvent<HTMLInputElement>) => {
-    setName(e.target.value);
-    if (!slugTouched) setSlug(toSlug(e.target.value));
-  }, [slugTouched]);
-
-  const handleSlugChange = useCallback((e: ChangeEvent<HTMLInputElement>) => {
-    setSlugTouched(true);
-    setSlug(toSlug(e.target.value));
-  }, []);
-
   const handleCancelCreate = useCallback(() => {
     setView("choose");
-    setName("");
-    setSlug("");
-    setSlugTouched(false);
+    resetNameAndSlug();
     setError("");
-  }, []);
+    setUserLimitRefused(false);
+  }, [resetNameAndSlug]);
 
   const handleShowCreate = useCallback(() => {
     setView("create");
@@ -106,10 +95,15 @@ export default function ServerSelector({ onSelect }: ServerSelectorProps) {
   const handleCreate = async (e: FormEvent) => {
     e.preventDefault();
     setError("");
+    setUserLimitRefused(false);
     try {
       const server = await createServer(name, slug);
       onSelect(server);
     } catch (err: any) {
+      if (isDeploymentUserLimitRefusal(err)) {
+        setUserLimitRefused(true);
+        return;
+      }
       setError(err.response?.data?.error || formatMessage({ id: "pages.serverSelector.createFailed" }));
     }
   };
@@ -149,9 +143,9 @@ export default function ServerSelector({ onSelect }: ServerSelectorProps) {
               </p>
             </div>
             <form onSubmit={handleCreate} className="flex flex-col gap-3">
-              {error && (
+              {shownError && (
                 <Banner intent="warning">
-                  {error}
+                  {shownError}
                 </Banner>
               )}
               <FormField
@@ -210,10 +204,10 @@ export default function ServerSelector({ onSelect }: ServerSelectorProps) {
             title={formatMessage({ id: "pages.serverSelector.createHeadingB" })}
           />
 
-          <form onSubmit={handleCreate} className="space-y-3">
-            {error && (
+          <form onSubmit={handleCreate} className="stack-y-3">
+            {shownError && (
               <Banner intent="warning">
-                {error}
+                {shownError}
               </Banner>
             )}
             <FormField label={formatMessage({ id: "pages.serverSelector.serverNameLabel" })}>
@@ -239,7 +233,7 @@ export default function ServerSelector({ onSelect }: ServerSelectorProps) {
               {hasServers && (
                 <Button
                   type="button"
-                  variant="ghost"
+                  variant="default"
                   size="lg"
                   className="flex-1"
                   onClick={handleCancelCreate}

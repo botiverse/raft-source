@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import fc from "fast-check";
-import { ATTENTION_HINT_COPY_VERSION, ATTENTION_HINT_SCHEMA } from "@botiverse/raft-shared";
+import { ATTENTION_HINT_COPY_VERSION, ATTENTION_HINT_SCHEMA, thirdPartyEventInboxItemTarget } from "@botiverse/raft-shared";
 
 import {
   AGENT_INBOX_TARGET_ROW_KEYS,
@@ -470,4 +470,72 @@ for (const [label, bad] of [["Infinity", Infinity], ["fraction", 1.5], ["negativ
 test("#143 count domain control: a valid positive integer still passes", () => {
   const rows = projectAgentInboxSnapshot([], new Map([["#ok", 2]]));
   assert.equal(rows[0]?.suppressedCount, 2);
+});
+
+test("RFC 081: an event's inbox_item_target buckets it under its app item only when the caller opts in", () => {
+  const event = (seq: number, inbox_item_target?: string): AgentInboxProjectionMessage => ({
+    message_id: `${String(seq).padStart(8, "0")}-0000-4000-8000-000000000000`,
+    seq,
+    channel_type: "dm",
+    channel_name: "third-party-agent-events:agent-123",
+    sender_type: "third_party_app",
+    sender_name: "stamp-bot",
+    third_party_event: { id: `e-${seq}`, kind: "notification", client_id: "stamp", client_name: "Stamp", ...(inbox_item_target ? { inbox_item_target } : {}) },
+  });
+  const messages = [event(1, "app:stamp/pr-1"), event(2, "app:stamp/pr-1"), event(3, "app:stamp"), event(4)];
+
+  // Default (the server's External Agent push, and the daemon with inbox items off): one grouped row.
+  const grouped = projectAgentInboxSnapshot(messages);
+  assert.deepEqual(grouped.map((row) => [row.target, row.pendingCount]), [["dm:@third-party-agent-events:agent-123", 4]]);
+  assert.deepEqual(projectAgentInboxSnapshot(messages, undefined, {}), grouped);
+
+  const items = projectAgentInboxSnapshot(messages, undefined, { appInboxItemTargets: true });
+  assert.deepEqual(items.map((row) => [row.target, row.pendingCount]), [
+    ["dm:@third-party-agent-events:agent-123", 1],
+    ["app:stamp", 1],
+    ["app:stamp/pr-1", 2],
+  ]);
+});
+
+test("#wg-ax:#24: an app item's count is the Server's inbox_item_unread, never below what was pushed, only with inbox items", () => {
+  const event = (seq: number, target: string, unread?: unknown): AgentInboxProjectionMessage => ({
+    message_id: `${String(seq).padStart(8, "0")}-0000-4000-8000-000000000000`,
+    seq,
+    channel_type: "dm",
+    channel_name: "third-party-agent-events:agent-123",
+    sender_type: "third_party_app",
+    sender_name: "stamp-bot",
+    third_party_event: { id: `e-${seq}`, kind: "notification", client_id: "stamp", client_name: "Stamp", inbox_item_target: target, ...(unread === undefined ? {} : { inbox_item_unread: unread as number }) },
+  });
+  // One pushed event on an item that holds 4 (3 joined it without a wake): the row says 4.
+  const merged = projectAgentInboxSnapshot([event(1, "app:stamp/pr-1", 4)], undefined, { appInboxItemTargets: true });
+  assert.deepEqual(merged.map((row) => [row.target, row.pendingCount]), [["app:stamp/pr-1", 4]]);
+  // Never below what is here; the largest of the pushed ones counts.
+  const two = projectAgentInboxSnapshot([event(1, "app:stamp/pr-1", 1), event(2, "app:stamp/pr-1", 3)], undefined, { appInboxItemTargets: true });
+  assert.equal(two[0]!.pendingCount, 3);
+  const stale = projectAgentInboxSnapshot([event(1, "app:stamp/pr-1", 1), event(2, "app:stamp/pr-1")], undefined, { appInboxItemTargets: true });
+  assert.equal(stale[0]!.pendingCount, 2);
+  // Not believed when it is not a positive integer in range.
+  for (const bad of [0, -2, 2.5, "9", Number.NaN, 10_000_000]) {
+    assert.equal(projectAgentInboxSnapshot([event(1, "app:stamp/pr-1", bad)], undefined, { appInboxItemTargets: true })[0]!.pendingCount, 1, String(bad));
+  }
+  // Inbox items off: the grouped row counts what is here.
+  assert.equal(projectAgentInboxSnapshot([event(1, "app:stamp/pr-1", 4)])[0]!.pendingCount, 1);
+});
+
+test("RFC 081: thirdPartyEventInboxItemTarget accepts only a well-formed app: target", () => {
+  const read = (value: unknown) => thirdPartyEventInboxItemTarget({ third_party_event: { inbox_item_target: value as string } });
+  assert.deepEqual(read("app:stamp/pr-1"), { target: "app:stamp/pr-1", objectRef: "pr-1" });
+  assert.deepEqual(read("app:stamp/a/b"), { target: "app:stamp/a/b", objectRef: "a/b" });
+  assert.deepEqual(read("app:stamp"), { target: "app:stamp" });
+  assert.equal(thirdPartyEventInboxItemTarget({}), null);
+  assert.equal(thirdPartyEventInboxItemTarget({ third_party_event: null }), null);
+  for (const bad of [
+    undefined, null, 7, {}, "", "app:", "app:/x", "app:stamp/", "stamp", "#general", " app:stamp", "app:stamp ",
+    "app:st amp", "app:stamp/a\tb", "app:stamp/a\nb", "app:stamp/a\u0000b", "app:stamp/a‮b", "app:stamp/a​b",
+    "app:stamp/a\"b", "app:stamp/a\\b", "app:stamp/a`b", "app:stamp/$x", `app:${"k".repeat(509)}`,
+  ]) {
+    assert.equal(read(bad), null, JSON.stringify(bad));
+  }
+  assert.notEqual(read(`app:${"k".repeat(508)}`), null);
 });

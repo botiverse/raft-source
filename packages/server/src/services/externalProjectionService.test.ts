@@ -25,15 +25,15 @@ import {
 import {
   createCanonicalExternalMessage,
   insertCanonicalExternalMessage,
+  insertSlackProvisionalProfileMessage,
   loadExternalMessageAuthors,
   resolveExternalMentionFromDurableAuthority,
 } from "./externalProjectionService";
-import { deliverMessagesToAgents, listMessagesByIds } from "./messageService";
+import { deliverMessagesToAgents, listMessagesByIds, isSlackBridgedExternalMessage } from "./messageService";
 import { convertMessageToTask } from "./taskService";
 import { searchMessagesForUser } from "./searchService";
 import { listSaved, saveMessage } from "./savedService";
 import { getFollowedThreads, getThreadSummaries } from "./channelService";
-import { normalizeRowForTest } from "./activitySyncService";
 
 
 afterEach(async () => {
@@ -196,7 +196,7 @@ test("canonical external message freezes human attribution, replays idempotently
   assert.equal("externalAuthor" in delivered[0], false);
 });
 
-test("canonical writer rejects stale, non-human, and mismatched authority with zero canonical residue", async () => {
+test("canonical writer rejects stale, unsupported, and mismatched authority with zero canonical residue", async () => {
   const surface = await seedExternalProjectionSurface();
   const input = canonicalInput(surface);
 
@@ -213,6 +213,54 @@ test("canonical writer rejects stale, non-human, and mismatched authority with z
     (await surface.db.select().from(messages).where(eq(messages.senderType, "external_projection"))).length,
     0,
   );
+  assert.equal((await surface.db.select().from(externalMessageAuthorFacts)).length, 0);
+});
+
+test("Slack bot authors retain their external identity without acquiring Raft authority", async () => {
+  const surface = await seedExternalProjectionSurface();
+  await surface.db.update(externalActorProjections).set({ actorKind: "bot", externalActorId: "B_ALERT", displayName: "Alert Bot" })
+    .where(eq(externalActorProjections.id, surface.actor.id));
+  const input = { ...canonicalInput(surface), externalActorId: "B_ALERT" };
+  const beforeMembers = (await surface.db.select().from(serverMembers)).length;
+  const beforeAgents = (await surface.db.select().from(agents)).length;
+  const created = await createCanonicalExternalMessage(input);
+  assert.equal(created.kind, "created");
+  assert.equal(created.message.senderType, "external_projection");
+  assert.equal(created.author.actorKind, "bot");
+  assert.equal(created.author.displayName, "Alert Bot");
+  const [projected] = await listMessagesByIds([created.message.id]);
+  assert.ok(projected);
+  assert.equal(projected?.externalAuthor?.actorKind, "bot");
+  const delivered: any[] = [];
+  await deliverMessagesToAgents({ deliverMessage: async (_id: string, payload: unknown) => {
+    delivered.push(payload);
+    return { status: "queued" };
+  } } as any, [projected], "ignored");
+  assert.equal(delivered.length, 1);
+  assert.equal(delivered[0].sender_type, "third_party_app");
+  assert.equal(delivered[0].external_message.actor_kind, "bot");
+  assert.equal(delivered[0].mentioned, false);
+  assert.equal("task_status" in delivered[0], false);
+  assert.equal((await createCanonicalExternalMessage(input)).message.id, created.message.id);
+  assert.equal((await surface.db.select().from(serverMembers)).length, beforeMembers);
+  assert.equal((await surface.db.select().from(agents)).length, beforeAgents);
+  assert.equal((await surface.db.select().from(messageMentions)).length, 0);
+  assert.equal(await convertMessageToTask(created.message.id, "user", surface.owner.id, surface.channel.id),
+    "external projection messages cannot be claimed as tasks");
+  await surface.db.update(externalActorProjections).set({ state: "tombstoned" })
+    .where(eq(externalActorProjections.id, surface.actor.id));
+  await assert.rejects(createCanonicalExternalMessage({ ...input, externalMessageId: "new-message" }), /actor authority is not current/);
+});
+
+test("bot support does not enable other providers or stale Slack identities", async () => {
+  const surface = await seedExternalProjectionSurface();
+  await surface.db.update(externalActorProjections).set({ actorKind: "bot" })
+    .where(eq(externalActorProjections.id, surface.actor.id));
+  const input = canonicalInput(surface);
+  await assert.rejects(createCanonicalExternalMessage({ ...input, actorProjectionRevision: input.actorProjectionRevision + 1 }), /actor authority is not current/);
+  await surface.db.update(externalActorProjections).set({ provider: "other" })
+    .where(eq(externalActorProjections.id, surface.actor.id));
+  await assert.rejects(createCanonicalExternalMessage({ ...input, provider: "other" }), /actor authority is not current/);
   assert.equal((await surface.db.select().from(externalMessageAuthorFacts)).length, 0);
 });
 
@@ -290,6 +338,7 @@ test("Human search, saved, and thread projections preserve immutable external at
     userId: surface.owner.id,
     channelId: surface.channel.id,
     query: "hello",
+    historyCutoff: undefined,
   });
   const searchResult = search.results.find((result) => result.id === root.message.id);
   assert.equal(searchResult?.senderType, "external_projection");
@@ -307,20 +356,12 @@ test("Human search, saved, and thread projections preserve immutable external at
   assert.equal(latestReply?.senderType, "external_projection");
   assert.equal(latestReply?.senderName, "Alice External");
   assert.equal(latestReply?.senderAvatarUrl, surface.avatar.publicUrl);
-  const [followedThread] = await getFollowedThreads(surface.server.id, surface.owner.id);
+  // Saving root also followed the thread rooted at it (thread contract D): pick the reply's thread.
+  const followedThread = (await getFollowedThreads(surface.server.id, surface.owner.id))
+    .find((candidate) => candidate.threadChannelId === thread.id);
   assert.equal(followedThread?.latestActivitySenderType, "external_projection");
   assert.equal(followedThread?.latestActivitySenderName, "Alice External");
   assert.ok(followedThread);
-  const activityRow = normalizeRowForTest({
-    kind: "thread",
-    firstMentionMessageId: null,
-    ...followedThread,
-  }, new Map());
-  assert.equal(activityRow.type, "thread");
-  if (activityRow.type === "thread") {
-    assert.equal(activityRow.latestActivitySenderKind, "external_projection");
-    assert.equal(activityRow.latestActivitySenderName, "Alice External");
-  }
 
   await surface.db.update(externalActorProjections)
     .set({ displayName: "Mutated Current Actor" })
@@ -334,6 +375,7 @@ test("Human search, saved, and thread projections preserve immutable external at
     userId: surface.owner.id,
     channelId: surface.channel.id,
     query: "hello",
+    historyCutoff: undefined,
   });
   const revokedSearchResult = revokedSearch.results.find((result) => result.id === root.message.id);
   assert.equal(revokedSearchResult?.senderName, "Alice External");
@@ -375,6 +417,7 @@ test("external message reads fail closed when immutable author facts are missing
       userId: surface.owner.id,
       channelId: surface.channel.id,
       query: "hello",
+      historyCutoff: undefined,
     }),
     /search row is missing immutable author fact/i,
   );
@@ -447,4 +490,33 @@ test("external mention authority fails closed on stale time and Raft-handle coll
     eq(externalAddressabilityProjections.bindingId, context.bindingId),
   ));
   assert.equal(addressabilityRows.length, 1, "read-only resolution must not mutate durable addressability authority");
+  await surface.db.update(externalActorProjections).set({ actorKind: "unknown" }).where(eq(externalActorProjections.id, surface.actor.id));
+  assert.deepEqual(await resolveExternalMentionFromDurableAuthority({ rawHandle: "@alice", explicitProjectionId: surface.actor.id,
+    raftPrincipalCollision: false, context, now: new Date("2026-07-31T01:00:00.000Z") }),
+    { kind: "not_resolved", reason: "actor_not_m0_addressable" });
+});
+
+test("bounded Slack profile fallback never grants identity or revives an inactive actor", async () => {
+  const surface = await seedExternalProjectionSurface();
+  await surface.db.update(externalActorProjections).set({ actorKind: "unknown", displayName: "U-ALICE" })
+    .where(eq(externalActorProjections.id, surface.actor.id));
+  const input = canonicalInput(surface);
+  await assert.rejects(createCanonicalExternalMessage(input), /actor authority is not current/);
+  const fallback = { ...input };
+  const timing = { receivedAt: input.createdAt, now: new Date(input.createdAt.getTime() + 11 * 60_000) };
+  const insert = (value: typeof input) => surface.db.transaction(executor => insertSlackProvisionalProfileMessage({ ...value, executor }, timing));
+  await assert.rejects(surface.db.transaction(executor => insertSlackProvisionalProfileMessage({ ...input, executor },
+    { ...timing, now: new Date(input.createdAt.getTime() + 9 * 60_000) })), /wait has not elapsed/);
+  await assert.rejects(insert({ ...fallback, workspaceId: "wrong-workspace" }), /actor authority is not current/);
+  await assert.rejects(insert({ ...fallback, actorProjectionRevision: input.actorProjectionRevision + 1 }), /actor authority is not current/);
+  await surface.db.update(externalActorProjections).set({ deactivated: true }).where(eq(externalActorProjections.id, surface.actor.id));
+  await assert.rejects(insert(fallback), /actor authority is not current/);
+  await surface.db.update(externalActorProjections).set({ deactivated: false, provider: "other" }).where(eq(externalActorProjections.id, surface.actor.id));
+  await assert.rejects(insert({ ...fallback, provider: "other" }), /wait has not elapsed/);
+  await surface.db.update(externalActorProjections).set({ provider: "slack" }).where(eq(externalActorProjections.id, surface.actor.id));
+  const result = await insert(fallback);
+  assert.equal(result.kind, "created"); assert.equal(result.author.actorKind, "unknown");
+  assert.equal(result.author.displayName, "U-ALICE");
+  assert.equal(isSlackBridgedExternalMessage({ ...result.message, externalAuthor: result.author }), false, "unknown authors remain inert in agent reads");
+  assert.equal((await surface.db.select().from(messages)).length, 1);
 });

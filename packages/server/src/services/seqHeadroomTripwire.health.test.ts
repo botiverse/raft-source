@@ -7,6 +7,11 @@ import { createApiTest } from "../test/integration/apiTest";
 // a seeded critical-range seq and asserts the full chain health -> probe ->
 // MAX(seq) query -> structured log, plus the throttle. Deleting the app.ts
 // call site, the DB query, or the log emission each goes RED here.
+//
+// The same tooth runs against /livez: the ALB health check polls /livez, so in
+// production that route is what drives the probe every few seconds. /health is
+// then only called by deploy smoke checks and gates. Losing the /livez call
+// site would leave the tripwire running only around deploys.
 import assert from "node:assert/strict";
 
 import { getDb } from "../db/index";
@@ -17,7 +22,7 @@ import {
   resetSeqHeadroomThrottleForTest,
 } from "./seqHeadroomTripwire";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 const CRITICAL_SEQ = Math.ceil(INT4_MAX * SEQ_HEADROOM_CRITICAL_RATIO) + 7;
 
@@ -35,7 +40,7 @@ async function waitForHeadroomLogs(
   }
 }
 
-test("health polling drives the tripwire: probe fires, logs once, throttles", async ({ app }) => {
+test.for(["/health", "/livez"] as const)("%s polling drives the tripwire: probe fires, logs once, throttles", async (path, { app }) => {
 
   onTestFinished(async () => {
     await app.close();
@@ -76,7 +81,7 @@ test("health polling drives the tripwire: probe fires, logs once, throttles", as
       .filter((line) => line.includes("seq_headroom"));
 
   resetSeqHeadroomThrottleForTest();
-  const first = await fetch(`${app.baseUrl}/health`);
+  const first = await fetch(`${app.baseUrl}${path}`);
   assert.equal(first.status, 200);
 
   // The probe is fire-and-forget off the health path; wait for its log.
@@ -86,7 +91,7 @@ test("health polling drives the tripwire: probe fires, logs once, throttles", as
   assert.match(afterFirst[0], new RegExp(`maxSeq=${CRITICAL_SEQ}\\b`), "log must carry the real DB MAX(seq)");
 
   // Throttle: an immediate second poll must not re-query or re-log.
-  const second = await fetch(`${app.baseUrl}/health`);
+  const second = await fetch(`${app.baseUrl}${path}`);
   assert.equal(second.status, 200);
   await new Promise((resolve) => setTimeout(resolve, 300));
   assert.equal(headroomLogs().length, 1, "second poll within the throttle window must be a no-op");
@@ -94,7 +99,7 @@ test("health polling drives the tripwire: probe fires, logs once, throttles", as
   // Positive control: with the throttle reset, the same poll logs again —
   // proving the silence above came from the throttle, not from a dead probe.
   resetSeqHeadroomThrottleForTest();
-  const third = await fetch(`${app.baseUrl}/health`);
+  const third = await fetch(`${app.baseUrl}${path}`);
   assert.equal(third.status, 200);
   const afterThird = await waitForHeadroomLogs(headroomLogs, 2);
   assert.equal(afterThird.length, 2, "throttle reset must re-arm the probe");

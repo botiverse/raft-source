@@ -15,6 +15,7 @@ import {
   agentApiSendV2BodySchema,
   agentApiTaskCreateBodySchema,
   agentApiTaskEnvelopeSchema,
+  agentApiAssistantSendAsOwnerBodySchema,
   agentApiTaskResourceReceiptBodySchema,
   buildAgentApiRouteManifest,
   computeAgentApiManifestVersion,
@@ -26,6 +27,8 @@ import {
 import { AGENT_API_MANIFEST_VERSION, AGENT_API_ROUTE_MANIFEST } from "./generated/agentApiRoutes";
 import { AGENT_API_ROUTE_META, getAgentApiRetryPolicy, toAgentApiToolAnnotations } from "./agentApiRouteMeta";
 import { AGENT_API_DESCRIPTION_SCHEMA, buildAgentApiDescription } from "./agentApiDescription";
+import type { CoreAgentApiRouteKey } from "./agentApiContract";
+import { firstPartyAppAgentApiSamples } from "./apps/agentApiSamples";
 
 test("agent-api v1 remains passthrough while v2 validates typed mention identity", () => {
   const mention = {
@@ -354,6 +357,14 @@ test("task-create contract accepts only canonical @handle assignees", () => {
   }
 });
 
+test("assistant send-as-owner takes a channelId or a dmWith handle (the Server enforces exactly one)", () => {
+  assert.deepEqual(agentApiAssistantSendAsOwnerBodySchema.parse({ dmWith: " @alice~human ", content: "hi" }), { dmWith: "@alice~human", content: "hi" });
+  const channelId = "55555555-5555-4555-8555-555555555555";
+  assert.deepEqual(agentApiAssistantSendAsOwnerBodySchema.parse({ channelId, content: "hi" }), { channelId, content: "hi" });
+  assert.throws(() => agentApiAssistantSendAsOwnerBodySchema.parse({ dmWith: "   ", content: "hi" }), { name: "ZodError" });
+  assert.throws(() => agentApiAssistantSendAsOwnerBodySchema.parse({ dmWith: "@alice" }), { name: "ZodError" });
+});
+
 test("task-create response requires authoritative persisted state, including omitted-assignee nulls", () => {
   const unassigned = {
     tasks: [{
@@ -445,7 +456,8 @@ test("agent-api manifest records request and response contract presence", () => 
 
 test("agent-api response contracts parse representative envelopes", () => {
   const coverage = { from: "2026-10-17T00:00:00Z", to: "2026-10-18T00:00:00Z", fetchedMessages: 0, exhausted: true, stopReason: "window_end", notRead: [] };
-  const samples: Record<AgentApiRouteKey, unknown> = {
+  const coreSamples: Record<CoreAgentApiRouteKey, unknown> = {
+    raftbenchFindings: { revision: 1, findings: [], total: 0, nextCursor: null, coverage: { historyFrom: null, scannedThroughAt: null, note: "Synthetic coverage" } },
     raftbenchContext: { runId: "00000000-0000-4000-8000-000000000001", revision: 1, sourceText: "Synthetic source", sources: [], coverage, nextCursor: null },
     raftbenchSubmit: { runId: "00000000-0000-4000-8000-000000000001", revision: 1, status: "complete", receiptId: "00000000-0000-4000-8000-000000000002", coverage },
     feedbackLocatorIngest: {
@@ -490,6 +502,8 @@ test("agent-api response contracts parse representative envelopes", () => {
       contentType: "text/markdown",
       content: "# Index",
     },
+    contextSearch: { ok: true, runtime: "claude", model: null, entryCount: 3, answer: { kind: "search", total: 0, matches: [] } },
+    contextRead: { ok: true, runtime: "claude", model: null, entryCount: 3, answer: { kind: "read", found: false } },
     knowledgeSearch: {
       ok: true,
       query: "preview before merge",
@@ -585,6 +599,7 @@ test("agent-api response contracts parse representative envelopes", () => {
       content: "hello",
       reactions: [],
     },
+    messageCardUpdate: { ok: true, messageId: "msg-1", revision: 2, updatedAt: "2026-11-03T12:03:00.000Z", unnotifiedMentionHandles: [], notice: "Updating notifies no one. To tell someone, send a new message." },
     channelJoin: {
       ok: true,
     },
@@ -642,6 +657,7 @@ test("agent-api response contracts parse representative envelopes", () => {
     resolveChannel: {
       channelId: "channel-1",
     },
+    threadFollow: { ok: true, following: true, changed: false },
     threadUnfollow: {
       ok: true,
     },
@@ -685,6 +701,24 @@ test("agent-api response contracts parse representative envelopes", () => {
       hasOlder: false,
       hasNewer: false,
     },
+    assistantOwnerArtifact: { owner: { userId: "33333333-3333-4333-8333-333333333333" }, artifact: { id: "pt_abc12345", url: "https://app.raft.build/artifacts/pt_abc12345", title: "Plan", description: null, home: { kind: "conversation", conversation: { id: "55555555-5555-4555-8555-555555555555", type: "channel", target: "#design" } }, author: { type: "user", name: "ada" }, version: 1, latestVersion: 1, commentCount: 0, position: 3, createdAt: "2026-11-12T00:00:00.000Z", updatedAt: "2026-11-12T00:00:00.000Z" }, versions: [], files: [{ path: "index.html", kind: "html", sizeBytes: 12, entry: true }], file: { kind: "text", path: "index.html", entry: true, contentType: "text/html", sizeBytes: 12, content: "<h1>Plan</h1>", truncated: false }, comments: { items: [], olderCursor: null, newestPosition: 3 } },
+    assistantOwnerArtifactPublish: { artifact: { id: "pt_abc12345", url: "https://app.raft.build/artifacts/pt_abc12345", version: 1, unchanged: false, homeConversationId: "55555555-5555-4555-8555-555555555555" } },
+    assistantOwnerActivity: { owner: { userId: "33333333-3333-4333-8333-333333333333" }, items: [], hasMore: false, nextSince: null },
+    assistantOwnerResolve: { id: "88888888-8888-4888-8888-888888888888", type: "human", name: "ada" },
+    assistantCheckStateImport: { briefToday: "due" },
+    assistantNotify: { outcome: "sent", shown: 1, more: 0, dropped: [] },
+    assistantContactRules: { rules: [{ id: "99999999-9999-4999-8999-999999999999", effect: "mute", subject: { kind: "dms" }, anytime: false, until: null, note: null, createdAt: "2026-10-21T00:00:00.000Z", line: "99999999 · mute your DMs" }], settings: { quiet: { from: "22:00", to: "08:00" }, brief: { at: "08:00" }, timezone: "UTC" }, lines: { quiet: "quiet 22:00-08:00 UTC", brief: "morning brief at 08:00 UTC", defaults: "By default…" } },
+    assistantContactRuleAdd: { rule: { id: "99999999-9999-4999-8999-999999999999", effect: "mute", subject: { kind: "dms" }, anytime: false, until: null, note: null, createdAt: "2026-10-21T00:00:00.000Z", line: "99999999 · mute your DMs" }, confirmation: "I won't tell you about your DMs anymore.", updated: false },
+    assistantContactRuleRemove: { confirmation: "Removed: mute your DMs." },
+    assistantContactSettings: { settings: { quiet: null }, confirmation: "Quiet hours are off (UTC)." },
+    assistantOwnerSettings: { settings: { theme: "space", storedTheme: "space", themeDecor: true, themeDecorShown: true, displayLanguage: "en", preferredTimezone: "Europe/Berlin" } },
+    assistantOwnerSettingsUpdate: { settings: { theme: "space", storedTheme: "space", themeDecor: true, themeDecorShown: true, displayLanguage: "en", preferredTimezone: "Europe/Berlin" }, changed: ["preferredTimezone"] },
+    assistantContactRulesImport: { imported: 1, updated: 0, skipped: 0, legacy: 0 },
+    assistantToldRecord: { recorded: 1, skipped: 0 },
+    assistantToldList: { items: [], hasMore: false, nextCursor: null },
+    assistantSendAsOwner: { messageId: "77777777-7777-4777-8777-777777777777", channelId: "55555555-5555-4555-8555-555555555555" },
+    assistantForwardAsOwner: { results: [{ to: "#design", channelId: "55555555-5555-4555-8555-555555555555", status: "sent", messageId: "77777777-7777-4777-8777-777777777777" }, { to: "#ops", channelId: "66666666-6666-4666-8666-666666666666", status: "failed", code: "retracted_by_owner", error: "Your owner retracted the message this forward sent here; do not send it again unless your owner asks you to." }] },
+    assistantSearchForwardTargets: { targets: [{ label: "#design", to: "#design" }], omitted: "assistant_reads_dms_off", omittedReason: "Your owner has not let you read their DMs, so people, agents and DMs (and threads in DMs) are left out of these results." },
     inboxList: {
       view: "unread",
       items: [{
@@ -701,6 +735,8 @@ test("agent-api response contracts parse representative envelopes", () => {
       nextBeforeSeq: null,
       totals: { conversations: 1, dms: 1, mentions: 0 },
     },
+    inboxRead: { target: "app:stamp/pr-13754", kind: "app", entries: [{ id: "77777777-7777-4777-8777-777777777777", senderType: "third_party_app", senderName: "Stamp", content: "checks failed", mentioned: false }], unreadBefore: 3, remaining: 2, remainingCapped: false, consumed: false, nextCursor: null, app: { key: "stamp", name: "Stamp" }, related: { target: "#proj-workspace:#232" } },
+    inboxDismiss: { dismissed: 2, conversations: 1, appItems: 1, skippedNeedsAck: 1, earliestActivityAt: "2026-11-01T00:00:00.000Z", remaining: 0 },
     serverUpdate: {
       id: "server-1",
       name: "Renamed Server",
@@ -837,6 +873,24 @@ test("agent-api response contracts parse representative envelopes", () => {
       task: { taskNumber: 24, title: "Current title", description: "Current criteria", revision: 2 },
       events: [],
     },
+    taskFollowing: { tasks: [{ taskRef: "#wg-raft-cli:#24", taskNumber: 24, title: "Current title", status: "todo", unread: 2, followedAt: "2026-08-05T00:00:00.000Z", reason: "authored" }] },
+    taskView: {
+      taskRef: "#wg-raft-cli:#24",
+      task: { taskNumber: 24, status: "todo", title: "Current title", conversationAnchored: true },
+      following: true,
+      followReason: "authored",
+      conversation: { exists: true, replyCount: 0 },
+      sourceMessage: null,
+      earlierDiscussion: null,
+      recentMessages: [],
+      hasOlder: false,
+    },
+    taskRead: { target: "#wg-raft-cli:#24", messages: [], has_more: false, has_older: false, has_newer: false },
+    taskReply: { ok: true, state: "sent", messageId: "11111111-1111-4111-8111-111111111111", messageSeq: 3 },
+    taskFollow: { ok: true, taskRef: "#wg-raft-cli:#24", following: true, changed: true },
+    taskUnfollow: { ok: true, taskRef: "#wg-raft-cli:#24", following: false, changed: false },
+    taskIdleNudge: { send: true, items: [{ ref: "#wg-raft-cli:#24", taskNumber: 24, channel: "#wg-raft-cli", title: "Current title", status: "todo", reason: "newly_assigned", why: "newly yours (assigned by @akko)" }], backlog: [], text: "[Raft task notice: 1 task is waiting on you.]" },
+    migrationRetry: { migrationId: "11111111-1111-4111-8111-111111111111", supportRef: "mig_retry", targetMachineName: "studio-mac", note: "The source will stop you once you are idle, then move you." },
     reminderList: {
       reminders: [{
         reminderId: "reminder-1",
@@ -1146,6 +1200,10 @@ test("agent-api response contracts parse representative envelopes", () => {
       messageId: "msg-action-1",
       metadata: { kind: "action-card", state: "prepared" },
     },
+    actionWithdraw: {
+      messageId: "msg-action-1",
+      metadata: { kind: "action-card", state: "withdrawn" },
+    },
     attachmentUpload: {
       id: "attachment-1",
       filename: "log.txt",
@@ -1195,6 +1253,11 @@ test("agent-api response contracts parse representative envelopes", () => {
     pushWebhookDelete: null,
     mentionsList: { mentions: [], has_more: false },
   };
+  // Core's samples, then each app's (apps/agentApiSamples.ts).
+  const samples = {
+    ...coreSamples,
+    ...Object.fromEntries(Object.entries(firstPartyAppAgentApiSamples).map(([key, sample]) => [key, sample.response])),
+  } as Record<AgentApiRouteKey, unknown>;
 
   for (const key of Object.keys(samples) as AgentApiRouteKey[]) {
     assert.deepEqual(parseAgentApiResponse(key, samples[key]), samples[key]);

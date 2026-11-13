@@ -24,7 +24,7 @@ import { createApiTest } from "../test/integration/apiTest";
 import assert from "node:assert/strict";
 
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 const TARGET_PATH = "/api/agents/agent-unknown/credentials";
 

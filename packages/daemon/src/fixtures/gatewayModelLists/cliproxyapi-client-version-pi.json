@@ -1,0 +1,223 @@
+{
+  "models": [
+    {
+      "slug": "gpt-6.1-sol",
+      "prefer_websockets": true,
+      "support_verbosity": true,
+      "default_verbosity": "low",
+      "apply_patch_tool_type": "freeform",
+      "web_search_tool_type": "text_and_image",
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "supports_image_detail_original": true,
+      "truncation_policy": {
+        "mode": "tokens",
+        "limit": 10000
+      },
+      "supports_parallel_tool_calls": true,
+      "tool_mode": "code_mode_only",
+      "multi_agent_version": "v2",
+      "multi_agent_reasoning_effort": "xhigh",
+      "use_responses_lite": true,
+      "supports_reasoning_effort_updates": true,
+      "include_skills_usage_instructions": false,
+      "include_apps_usage_instructions": false,
+      "include_plugin_usage_instructions": false,
+      "guardian": null,
+      "node_repl_auto_review_required": true,
+      "node_repl_disabled": false,
+      "requires_sandboxed_review": false,
+      "allow_only_codex_cloud_agent_orchestrator": false,
+      "allow_only_chatgpt_workspace_executor": false,
+      "auto_review_model_override": null,
+      "model_specialty": null,
+      "context_window": 500000,
+      "max_context_window": 872000,
+      "auto_compact_token_limit": null,
+      "comp_hash": "3000",
+      "default_reasoning_summary": "none",
+      "display_name": "GPT-6.1-Sol",
+      "description": "Latest workhorse model for coding and everyday work.",
+      "default_reasoning_level": "low",
+      "supported_reasoning_levels": [
+        {
+          "effort": "low",
+          "description": "Fast responses with lighter reasoning"
+        },
+        {
+          "effort": "medium",
+          "description": "Balances speed and reasoning depth for everyday tasks"
+        },
+        {
+          "effort": "high",
+          "description": "Greater reasoning depth for complex problems"
+        },
+        {
+          "effort": "xhigh",
+          "description": "Extra high reasoning depth for complex problems"
+        },
+        {
+          "effort": "max",
+          "description": "Maximum reasoning depth for the hardest problems"
+        },
+        {
+          "effort": "ultra",
+          "description": "Maximum reasoning with automatic task delegation"
+        }
+      ],
+      "shell_type": "shell_command",
+      "visibility": "list",
+      "minimal_client_version": "0.153.0",
+      "supported_in_api": true,
+      "availability_nux": {
+        "message": "..."
+      },
+      "upgrade": null,
+      "priority": 1,
+      "model_messages": {
+        "instructions_template": "You are Codex, ..."
+      },
+      "experimental_supported_tools": [
+        "send_user_message_async",
+        "clock"
+      ],
+      "available_in_plans": [
+        "business",
+        "edu"
+      ],
+      "supports_search_tool": true,
+      "supports_experimental_context": false,
+      "default_service_tier": null,
+      "service_tiers": [
+        {
+          "id": "priority",
+          "name": "Fast",
+          "description": "2x speed, increased usage"
+        }
+      ],
+      "additional_speed_tiers": [
+        "fast"
+      ],
+      "supports_reasoning_summary_parameter": true,
+      "supports_reasoning_summaries": true,
+      "base_instructions": "You are Codex, ...",
+      "available_access_programs": {
+        "cyber": [
+          "standard"
+        ]
+      }
+    },
+    {
+      "slug": "glm-5.2",
+      "prefer_websockets": false,
+      "support_verbosity": true,
+      "default_verbosity": "low",
+      "apply_patch_tool_type": "freeform",
+      "web_search_tool_type": "text_and_image",
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "supports_image_detail_original": true,
+      "truncation_policy": {
+        "mode": "tokens",
+        "limit": 10000
+      },
+      "supports_parallel_tool_calls": true,
+      "tool_mode": "code_mode_only",
+      "multi_agent_version": "v2",
+      "multi_agent_reasoning_effort": "xhigh",
+      "use_responses_lite": true,
+      "supports_reasoning_effort_updates": true,
+      "include_skills_usage_instructions": false,
+      "include_apps_usage_instructions": false,
+      "include_plugin_usage_instructions": false,
+      "guardian": null,
+      "node_repl_auto_review_required": true,
+      "node_repl_disabled": false,
+      "requires_sandboxed_review": false,
+      "allow_only_codex_cloud_agent_orchestrator": false,
+      "allow_only_chatgpt_workspace_executor": false,
+      "auto_review_model_override": null,
+      "model_specialty": null,
+      "context_window": 202752,
+      "max_context_window": 202752,
+      "auto_compact_token_limit": null,
+      "comp_hash": "3000",
+      "default_reasoning_summary": "none",
+      "display_name": "glm-5.2",
+      "description": "glm-5.2",
+      "default_reasoning_level": "low",
+      "supported_reasoning_levels": [
+        {
+          "effort": "low",
+          "description": "Fast responses with lighter reasoning"
+        },
+        {
+          "effort": "medium",
+          "description": "Balances speed and reasoning depth for everyday tasks"
+        },
+        {
+          "effort": "high",
+          "description": "Greater reasoning depth for complex problems"
+        },
+        {
+          "effort": "xhigh",
+          "description": "Extra high reasoning depth for complex problems"
+        },
+        {
+          "effort": "max",
+          "description": "Maximum reasoning depth for the hardest problems"
+        },
+        {
+          "effort": "ultra",
+          "description": "Maximum reasoning with automatic task delegation"
+        }
+      ],
+      "shell_type": "shell_command",
+      "visibility": "list",
+      "minimal_client_version": "0.153.0",
+      "supported_in_api": true,
+      "availability_nux": {
+        "message": "..."
+      },
+      "upgrade": null,
+      "priority": 100,
+      "model_messages": {
+        "instructions_template": "You are Codex, ..."
+      },
+      "experimental_supported_tools": [
+        "send_user_message_async",
+        "clock"
+      ],
+      "available_in_plans": [
+        "business",
+        "edu"
+      ],
+      "supports_search_tool": true,
+      "supports_experimental_context": false,
+      "default_service_tier": null,
+      "service_tiers": [],
+      "additional_speed_tiers": [
+        "fast"
+      ],
+      "supports_reasoning_summary_parameter": true,
+      "supports_reasoning_summaries": true,
+      "base_instructions": "You are Codex, ...",
+      "available_access_programs": {
+        "cyber": [
+          "standard"
+        ]
+      },
+      "max_tokens": 131072
+    },
+    {
+      "slug": "limitless",
+      "display_name": "limitless",
+      "description": "limitless",
+      "visibility": "list"
+    }
+  ]
+}

@@ -43,7 +43,9 @@ function parseTokenUsageTelemetry(message: JsonRpcMessage): ParsedEvent | null {
     lastOutputTokens: finiteNumber(last?.outputTokens),
     modelContextWindow,
     cachedInputRatio: ratio(cachedInputTokens, inputTokens),
-    contextUtilization: ratio(totalTokens, modelContextWindow),
+    // How full the context is after the last model call; the session totals
+    // keep growing across calls and passed 1000x the window on a long session.
+    contextUtilization: ratio(finiteNumber(last?.totalTokens), modelContextWindow),
   });
   if (Object.keys(attrs).length === 0) return null;
   return {

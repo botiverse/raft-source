@@ -218,3 +218,14 @@ test("billing plan presentation keeps Partner distinct from Founder, Pro, and Fr
     getBillingPlanPresentation({ plan: "partner", displayName: "Ignored", currentHumanSeats: 0, currentAgentSeats: 0, currentSeatQuantity: 0, proAgentSeatFractionLabel: "0.1" }),
   );
 });
+
+test("AppSumo lifetime grants never expose Stripe purchase or modification controls", () => {
+  for (const subscriptionStatus of [null, "active", "past_due", "canceled"] as const) {
+    assert.deepEqual(getBillingControlsState({ plan: "pro", source: "appsumo", subscriptionStatus }), {
+      hasEntitlingSubscription: false,
+      canCheckout: false,
+      canUpdatePacks: false,
+      canOpenPortal: false,
+    });
+  }
+});

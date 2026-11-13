@@ -44,6 +44,10 @@ export const IPC_ERROR_CODES = [
   // `IPC_MALFORMED_FRAME`, which is a wire-format code and steered users to
   // `raft-computer doctor` for a condition doctor cannot fix.
   "UPGRADE_START_REJECTED",
+  // The service does not know the requested method (a newer client talking
+  // to an older service feature-detects on this instead of reading the
+  // wire-format `IPC_MALFORMED_FRAME`).
+  "IPC_METHOD_UNSUPPORTED",
 ] as const;
 
 export type IpcErrorCode = (typeof IPC_ERROR_CODES)[number];
@@ -333,6 +337,12 @@ export type UpgradeStartParams =
       /** Route post-restart completion only through the Server that authorized it. */
       originServerId: string;
       trigger: "web";
+      /**
+       * Reconciler step 13: the Server asked to wait (at most this long,
+       * clamped again by the service) for every runner's agents to be quiet
+       * before the installer is spawned. Absent: no drain, as before.
+       */
+      drain?: { deadlineMs: number };
     };
 
 
@@ -384,7 +394,12 @@ export type ResetRunnerResult =
  * caller can attach to its event stream instead of starting a new one.
  */
 export interface UpgradeStartResult {
-  status: "started" | "already-running";
+  /**
+   * `draining` (reconciler step 13): the installer is resolved and the
+   * runners drain; the service spawns it after the drain. A failure from
+   * here on is written as the request's receipt (waitForRemoteUpgradeFailureReceipt).
+   */
+  status: "started" | "already-running" | "draining";
   upgradeId: string;
   /** Exact requested version; absent while the installer resolves a channel. */
   targetVersion?: string;

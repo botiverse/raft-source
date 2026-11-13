@@ -22,7 +22,7 @@ import {
 } from "../db/schema";
 import { __testRisingWaveInbox, getFollowedThreads, RISINGWAVE_FOLLOWED_THREADS_ROWS_SQL } from "./channelService";
 import { __setActivityReadSourceForTests, type ActivityReadSource } from "./activityReadSource";
-import { addMember } from "./serverService";
+import { seedBoundGuest } from "../test/guestFixture";
 import {
   installRisingWaveReadReferences,
   referenceActivityReadSource,
@@ -409,8 +409,8 @@ test("guests, other states, search, channel filter and row caps take the legacy 
   const owner = await seed.human();
   const guest = await seed.human();
   const server = await seed.server({ owner });
-  await addMember(server.id, guest.id, "guest");
-  const channel = await seed.channel({ server, members: [owner, guest] });
+  const channel = await seed.channel({ server, members: [owner] });
+  await seedBoundGuest({ serverId: server.id, userId: guest.id, channelId: channel.id }, db);
   const t = await insertThread(db, { serverId: server.id, channelId: channel.id, authorId: owner.id, content: "parent", createdAt: at(0) });
   await follow(db, t.thread.id, t.parent.id, guest.id);
   await follow(db, t.thread.id, t.parent.id, owner.id);

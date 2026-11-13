@@ -74,7 +74,7 @@ export type ConversionResources = Partial<Record<ConversionResourceScope, Partia
 const progressSchema = z.object({
   version: z.literal(1).default(1), ledgerVersion: z.literal(2).optional(), finalizedAt: z.string().optional(),
   lockedAt: z.string().optional(), preparedAt: z.string().optional(), preparedThreads: count.optional(),
-  preparedThreadsCursor: z.string().optional(), verifiedAt: z.string().optional(),
+  preparedThreadsCursor: z.string().optional(), preparedTaskConversations: count.optional(), verifiedAt: z.string().optional(),
   audienceCutoverAt: z.string().optional(), residualCleanupAt: z.string().optional(),
   rollbackAt: z.string().optional(), rollbackState: z.enum(["restored", "retained"]).optional(),
   sourceLock: z.enum(["released", "retained"]).optional(), retryState: z.enum(["running", "awaiting_retry"]).optional(),

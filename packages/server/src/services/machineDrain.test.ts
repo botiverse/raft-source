@@ -9,6 +9,7 @@ import {
   MACHINE_DRAIN_CLOSE_CODE,
   MACHINE_DRAIN_CLOSE_REASON,
   closeConnectionsForDrain,
+  spreadClosesForDrain,
   type DrainClosableSocket,
 } from "./machineDrain";
 
@@ -286,4 +287,42 @@ test.skipIf(inSourceSnapshot)("drain window invariant: every target group's dere
     !/>=\s*\d+\s*\+\s*\d+/.test(tftest),
     "the drain-window invariant must compare against var.drain_spread_seconds, not a copied literal",
   );
+});
+
+test("browser and SSE closes use the same even spread, and skipped items keep their slot", async () => {
+  // ~911 browser sockets on one task at v1.21.19; they used to close in one
+  // tick. Every 4th one is already gone and returns false.
+  const clock = fakeClock();
+  const closeTimes: number[] = [];
+  const items = Array.from({ length: 912 }, (_, index) => index);
+  const result = await spreadClosesForDrain(items, (index) => {
+    if (index % 4 === 3) return false;
+    closeTimes.push(clock.now());
+    return true;
+  }, { spreadMs: 120_000, sleep: clock.sleep, now: clock.now });
+
+  assert.equal(result.closed, 684);
+  assert.equal(closeTimes[0], 0);
+  // The last closed item is index 910: due at 120000 * 910 / 912.
+  assert.equal(closeTimes.at(-1), (120_000 * 910) / 912);
+  assert.equal(result.spanMs, (120_000 * 910) / 912);
+  // No more than one close in any 100 ms: nothing bunches up.
+  const perBucket = new Map<number, number>();
+  for (const at of closeTimes) perBucket.set(Math.floor(at / 100), (perBucket.get(Math.floor(at / 100)) ?? 0) + 1);
+  assert.ok(Math.max(...perBucket.values()) <= 1);
+});
+
+test("a close that throws is warned and skipped; later connections still close and the promise resolves", async () => {
+  const clock = fakeClock();
+  const closedItems: number[] = [];
+  const warnings: string[] = [];
+  const result = await spreadClosesForDrain([0, 1, 2, 3], (index) => {
+    if (index === 1) throw new Error("socket already destroyed");
+    closedItems.push(index);
+    return true;
+  }, { spreadMs: 4_000, sleep: clock.sleep, now: clock.now, warn: (message) => warnings.push(message) });
+
+  assert.deepEqual(closedItems, [0, 2, 3]);
+  assert.equal(result.closed, 3);
+  assert.equal(warnings.length, 1);
 });

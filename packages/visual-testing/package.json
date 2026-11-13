@@ -1,7 +1,7 @@
 {
   "name": "@botiverse/raft-visual-testing",
   "version": "0.1.0",
-  "license": "FSL-1.1-ALv2",
+  "license": "LicenseRef-Raft-License",
   "description": "Slock cross-provider visual testing CLI and shared case manifest.",
   "type": "module",
   "exports": {
@@ -23,7 +23,9 @@
     "report": "node src/cli.mjs report",
     "site": "node src/cli.mjs site",
     "publish": "node src/cli.mjs publish-gh-pages",
-    "test:model": "node --test tests/pi-model.test.mjs"
+    "test:model": "node --import @oxc-node/core/register --test tests/pi-model.test.ts",
+    "test:site": "node --import @oxc-node/core/register --test tests/siteApplicability.test.ts",
+    "test:shots": "node --import @oxc-node/core/register --test tests/visualShots.test.ts"
   },
   "files": [
     "README.md",

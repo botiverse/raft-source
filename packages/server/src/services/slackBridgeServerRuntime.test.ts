@@ -1,10 +1,10 @@
 import { dbTest as test } from "../test/integration/dbTest";
 import { closeTestDatabase, openTestDatabase } from "../test/integration/database";
 import assert from "node:assert/strict";
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 
 import { SLACK_BRIDGE_FEATURE_FLAG_KEYS } from "@botiverse/raft-shared";
-import { eq } from "drizzle-orm";
+import { desc, eq } from "drizzle-orm";
 import { getDb } from "../db/index";
 import {
   agents,
@@ -22,10 +22,15 @@ import {
   externalBindingAudienceSnapshots,
   externalChannelBindings,
   externalHumanIdentityLinks,
+  slackUsergroupIdentities,
+  type SlackUsergroupRecoveryRef,
   externalInboundEvents,
   externalMessageLinks,
   externalOutboundDeliveries,
+  externalDeliveryPartitions,
+  slackAttachmentPlanRollout,
   featureFlags,
+  messageMentions,
   messages,
   oauthClientInstalls,
   oauthClients,
@@ -57,6 +62,7 @@ import {
   SLACK_BRIDGE_CREDENTIAL_KEY_ID,
 } from "./slackBridgeEnvSecrets";
 import { createSlackBridgeServerRuntimeFromEnv } from "./slackBridgeServerRuntime";
+import { refreshSlackConversationAuthority } from "./slackBridgeProvisioningControlPlane";
 import { withChannelDelivery } from "../test/orchestratorStub";
 
 // Built at runtime so secret scanners don't flag this test sample.
@@ -270,6 +276,16 @@ async function seedManagedAudience(privacyClass: "public" | "private" = "private
     linkEpoch: 1,
     observedConnectionEpoch: 2,
   });
+  // Human mentions render through a managed usergroup, not an OAuth link.
+  await db.insert(slackUsergroupIdentities).values({
+    installId: install.id,
+    serverId: server.id,
+    principalKind: "user",
+    principalId: owner.id,
+    recoveryRef: randomBytes(24).toString("hex") as SlackUsergroupRecoveryRef,
+    providerUsergroupId: "S_MANAGED_OWNER",
+    humanCanonical: true,
+  });
   await db.insert(externalAddressabilityProjections).values({
     projectionId: projection.id,
     provider: "slack",
@@ -443,20 +459,11 @@ test("managed runtime resolves the trusted IM Bridges destination from the claim
 
 test("attachment authority rejects a stale server-grant epoch with the canonical binding fence", async () => {
   const seeded = await seedManagedAudience("public");
+  // A retained legacy child flag stays off; attachment authority follows master.
   await getDb().insert(featureFlags).values({
     key: SLACK_BRIDGE_FEATURE_FLAG_KEYS.attachmentTransfer,
-    description: "Slack attachment transfer",
-    enabled: true,
-    defaultEnabled: false,
-    killSwitch: false,
-    randomizationUnit: "server",
-    salt: SLACK_BRIDGE_FEATURE_FLAG_KEYS.attachmentTransfer,
-  });
-  await createFeatureFlagRule({
-    flagKey: SLACK_BRIDGE_FEATURE_FLAG_KEYS.attachmentTransfer,
-    stage: "server",
-    decision: "allow",
-    values: [seeded.server.id],
+    description: "Retired attachment flag", enabled: true, defaultEnabled: false,
+    killSwitch: false, randomizationUnit: "server", salt: SLACK_BRIDGE_FEATURE_FLAG_KEYS.attachmentTransfer,
   });
   const runtime = await createSlackBridgeServerRuntimeFromEnv(MANAGED_ENV, {
     db: getDb(),
@@ -477,6 +484,10 @@ test("attachment authority rejects a stale server-grant epoch with the canonical
   const authorityIsCurrent = runtime.inboundAttachmentWorkerDependencies.authorityIsCurrent;
   assert.ok(authorityIsCurrent);
   assert.equal(await authorityIsCurrent(authority, seeded.projection.id, getDb()), true);
+  await updateFeatureFlagRule(SLACK_BRIDGE_FEATURE_FLAG_KEYS.master, seeded.masterRule.id, { decision: "deny" });
+  assert.equal(await authorityIsCurrent(authority, seeded.projection.id, getDb()), "paused");
+  await updateFeatureFlagRule(SLACK_BRIDGE_FEATURE_FLAG_KEYS.master, seeded.masterRule.id, { decision: "allow" });
+  assert.equal(await authorityIsCurrent(authority, seeded.projection.id, getDb()), true);
 
   await getDb().update(externalAppServerGrants).set({ grantEpoch: 2 })
     .where(eq(externalAppServerGrants.id, seeded.grant.id));
@@ -496,6 +507,7 @@ test("managed server lifecycle consumes the database human resolver on start, ev
   const seeded = await seedManagedAudience();
   let installGrantCalls = 0;
   let audienceCalls = 0;
+  let allowRunClaim = true;
   let privacyCalls = 0;
   let mentionCalls = 0;
   const humanUsergroupMarkers: string[] = [];
@@ -523,6 +535,9 @@ test("managed server lifecycle consumes the database human resolver on start, ev
     db: getDb(),
     now: () => runtimeNow,
     lifecycleIntervalMs: 1_000,
+    claimLifecycleRun: async () => allowRunClaim
+      ? { held: async () => true, end() {} }
+      : null,
     lifecycleClock: {
       scheduleEvery(fn, intervalMs) {
         assert.equal(intervalMs, 1_000);
@@ -589,13 +604,26 @@ test("managed server lifecycle consumes the database human resolver on start, ev
           headers: { "content-type": "application/json" },
         });
       }
-      if (String(url).startsWith("https://slack.com/api/usergroups.create")) {
+      if (String(url).startsWith("https://slack.com/api/usergroups.create") || String(url).startsWith("https://slack.com/api/usergroups.update")) {
         // Bound-channel humans get managed usergroups alongside Agents.
         const request = JSON.parse(String(init?.body)) as Record<string, string>;
         humanUsergroupMarkers.push(String(request.description));
         return new Response(JSON.stringify({
           ok: true,
           usergroup: { id: "SMANAGEDHUMAN", ...request, date_delete: 0 },
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      if (String(url).startsWith("https://slack.com/api/users.info")) {
+        const requestUrl = new URL(String(url));
+        const providerUserId = requestUrl.searchParams.get("user") ?? "";
+        return new Response(JSON.stringify({
+          ok: true,
+          user: {
+            id: providerUserId,
+            name: providerUserId.toLowerCase(),
+            is_bot: providerUserId === "U_MANAGED_BOT",
+            profile: { display_name: providerUserId },
+          },
         }), { status: 200, headers: { "content-type": "application/json" } });
       }
       audienceCalls += 1;
@@ -629,7 +657,7 @@ test("managed server lifecycle consumes the database human resolver on start, ev
   assert.equal(privacyCalls, 1, "server start verifies provider privacy separately");
   assert.equal(mentionCalls, 1, "server start reconciles Agent mention handles");
   assert.ok(
-    humanUsergroupMarkers.some((marker) => marker.startsWith(`raft-user:${seeded.server.id}:`)),
+    humanUsergroupMarkers.includes("Raft member"),
     "server start reconciles paired-channel human mention handles",
   );
   const startSnapshot = await getDb().select().from(externalBindingAudienceSnapshots);
@@ -639,14 +667,23 @@ test("managed server lifecycle consumes the database human resolver on start, ev
   await runtime.requestLifecycleReconcile?.();
   await waitForReceipt(2);
   assert.equal(installGrantCalls, 1, "fresh install authority is not re-read on every event");
-  assert.equal(audienceCalls, 2, "post-ingress event reconciliation reaches the provider");
-  assert.equal(privacyCalls, 2, "post-ingress event refreshes privacy freshness");
-  assert.equal(mentionCalls, 2, "post-ingress event reconciliation refreshes Agent handles");
+  assert.equal(audienceCalls, 2, "explicit reconciliation reaches the provider");
+  assert.equal(privacyCalls, 2, "explicit reconciliation refreshes privacy freshness");
+  assert.equal(mentionCalls, 2, "explicit reconciliation refreshes Agent handles");
 
+  allowRunClaim = false;
+  const deniedPass = await runtime.requestLifecycleReconcile?.();
+  assert.deepEqual(deniedPass, { kind: "completed", trigger: "event", bindingCount: 0 });
+  assert.deepEqual([installGrantCalls, audienceCalls, privacyCalls, mentionCalls], [1, 2, 2, 2],
+    "a replica without the whole-pass claim must do no provider work");
+  const snapshotsBeforePeriodic = (await getDb().select().from(externalBindingAudienceSnapshots)).length;
+  allowRunClaim = true;
   periodic();
   await waitForReceipt(3);
   assert.equal(installGrantCalls, 1, "fresh install authority is not re-read on every tick");
-  assert.equal(audienceCalls, 3, "persistent periodic reconciliation reaches the provider");
+  assert.equal(audienceCalls, 2, "periodic reconciliation reuses a coherent fresh member snapshot");
+  assert.equal((await getDb().select().from(externalBindingAudienceSnapshots)).length, snapshotsBeforePeriodic,
+    "an unchanged fresh periodic pass must not append another audience revision");
   assert.equal(privacyCalls, 3, "periodic reconciliation refreshes privacy freshness");
   assert.equal(mentionCalls, 3, "periodic reconciliation refreshes Agent handles");
 
@@ -722,11 +759,31 @@ test("managed server lifecycle consumes the database human resolver on start, ev
   await waitForReceipt(8);
   assert.equal(
     audienceCalls,
-    audienceCallsAfterPrivacyBackoff,
-    "removing the task #8 human link fails closed before Slack provider access",
+    audienceCallsAfterPrivacyBackoff + 1,
+    "per-member OAuth links are no longer a private refresh prerequisite",
   );
   const unavailableSnapshot = await getDb().select().from(externalBindingAudienceSnapshots);
-  assert.equal(unavailableSnapshot.at(-1)?.status, "unavailable");
+  assert.equal(
+    unavailableSnapshot.at(-1)?.status,
+    "matched",
+    "private audience observation matches on provider member fact alone",
+  );
+
+  const callsBeforeRenewal = audienceCalls;
+  await getDb().update(externalBindingAudienceSnapshots).set({
+    expiresAt: new Date(runtimeNow.getTime() + 10 * 60_000),
+  });
+  const receiptsBeforeRenewal = receipts.length;
+  periodic();
+  await waitForReceipt(receiptsBeforeRenewal + 1);
+  assert.equal(audienceCalls, callsBeforeRenewal + 1, "the shared fallback renews before the existing authority expires");
+  await getDb().update(externalAddressabilityProjections).set({ contextRevision: 999 });
+  const receiptsBeforeDrift = receipts.length;
+  periodic();
+  await waitForReceipt(receiptsBeforeDrift + 1);
+  assert.equal(audienceCalls, callsBeforeRenewal + 2, "a real authority mismatch cannot reuse a fresh snapshot");
+  const callsBeforePause = audienceCalls;
+  const snapshotsBeforePause = (await getDb().select().from(externalBindingAudienceSnapshots)).length;
 
   await getDb().update(externalChannelBindings).set({
     state: "paused",
@@ -734,10 +791,10 @@ test("managed server lifecycle consumes the database human resolver on start, ev
   });
   const pausedResult = await runtime.requestLifecycleReconcile?.();
   assert.deepEqual(pausedResult, { kind: "completed", trigger: "event", bindingCount: 0 });
-  assert.equal(audienceCalls, audienceCallsAfterPrivacyBackoff);
+  assert.equal(audienceCalls, callsBeforePause);
   assert.equal(
     (await getDb().select().from(externalBindingAudienceSnapshots)).length,
-    unavailableSnapshot.length,
+    snapshotsBeforePause,
     "inactive bindings do not append audience snapshots",
   );
 
@@ -746,7 +803,7 @@ test("managed server lifecycle consumes the database human resolver on start, ev
   await runtime.requestLifecycleReconcile?.();
   assert.equal(
     audienceCalls,
-    audienceCallsAfterPrivacyBackoff,
+    callsBeforePause,
     "stopped runtime rejects later event reconciliation",
   );
 });
@@ -940,6 +997,18 @@ test("managed server start owns ordinary Raft to Slack admission and delivery", 
           },
         });
       }
+      if (method === "users.info") {
+        const providerUserId = new URL(String(url)).searchParams.get("user") ?? "";
+        return new Response(JSON.stringify({
+          ok: true,
+          user: {
+            id: providerUserId,
+            name: providerUserId.toLowerCase(),
+            is_bot: providerUserId === "U_MANAGED_BOT",
+            profile: { display_name: providerUserId },
+          },
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
       if (method === "conversations.members") {
         return new Response(JSON.stringify({
           ok: true,
@@ -995,6 +1064,18 @@ test("managed server start owns ordinary Raft to Slack admission and delivery", 
     updatedAt: staleSince,
   });
   await getDb().update(externalBindingAudienceSnapshots).set({ status: "mismatch" });
+  await waitFor(async () => {
+    const [partition] = await getDb().select().from(externalDeliveryPartitions)
+      .where(eq(externalDeliveryPartitions.bindingId, seeded.binding.id));
+    return partition?.authorityBlockedReason === "runtime_authority_inactive_or_mismatched:frozen_audience_snapshot_missing_or_expired";
+  }, "managed outbound pair authority block");
+  const [waitingPartition] = await getDb().select().from(externalDeliveryPartitions)
+    .where(eq(externalDeliveryPartitions.bindingId, seeded.binding.id));
+  assert.equal(waitingPartition?.authorityBlockedAt?.toISOString(), NOW.toISOString(), "the queue clock starts at the first block, not at message creation");
+  assert.equal((await getDb().select().from(externalOutboundDeliveries))[0]?.state, "queued");
+  assert.deepEqual(authorityAlerts, [], "an old message is not overdue until the authority block ages");
+  assert.equal(postedBodies.length, 0);
+  workerNow = new Date(NOW.getTime() + EXTERNAL_DELIVERY_AUTHORITY_OVERDUE_MS);
   await waitFor(async () => authorityAlerts.length === 1, "managed outbound overdue authority alert");
   assert.equal(
     postedBodies.length,
@@ -1012,14 +1093,14 @@ test("managed server start owns ordinary Raft to Slack admission and delivery", 
     bindingId: seeded.binding.id,
     bindingEpoch: seeded.binding.bindingEpoch,
     partitionPosition: 1,
-    blockReason: "runtime_authority_inactive_or_mismatched",
-    observedAt: NOW.toISOString(),
+    blockReason: "runtime_authority_inactive_or_mismatched:frozen_audience_snapshot_missing_or_expired",
+    observedAt: workerNow.toISOString(),
     deliveryAgeMs: EXTERNAL_DELIVERY_AUTHORITY_OVERDUE_MS,
     requiredAction: "restore_authority_or_audited_skip",
   });
 
   await getDb().update(externalBindingAudienceSnapshots).set({ status: "matched" });
-  workerNow = new Date(NOW.getTime() + EXTERNAL_DELIVERY_AUTHORITY_BACKOFF_BASE_MS);
+  workerNow = new Date(workerNow.getTime() + 2 * EXTERNAL_DELIVERY_AUTHORITY_BACKOFF_BASE_MS);
   await waitFor(async () => {
     const [delivery] = await getDb().select().from(externalOutboundDeliveries);
     return delivery?.state === "accepted";
@@ -1028,6 +1109,10 @@ test("managed server start owns ordinary Raft to Slack admission and delivery", 
   const [delivery] = await getDb().select().from(externalOutboundDeliveries);
   assert.equal(delivery?.sourceMessageId, message.id);
   assert.equal(delivery?.state, "accepted");
+  const [recoveredPartition] = await getDb().select().from(externalDeliveryPartitions)
+    .where(eq(externalDeliveryPartitions.bindingId, seeded.binding.id));
+  assert.equal(recoveredPartition?.authorityBlockedAt, null);
+  assert.equal(recoveredPartition?.authorityBlockedReason, null);
   assert.equal(postedBodies.length, 1);
   assert.equal((postedBodies[0] as { channel?: string }).channel, "G_MANAGED_PRIVATE");
   assert.match(
@@ -1049,6 +1134,172 @@ test("managed server start owns ordinary Raft to Slack admission and delivery", 
     "runtime stop must uninstall ordinary outbound admission",
   );
   assert.equal(postedBodies.length, 1);
+});
+
+test("managed outbound renders a Raft-principal mention as its frozen Slack token", async ({ onTestFinished }) => {
+  const seeded = await seedManagedAudience();
+  let firstReceipt: (() => void) | null = null;
+  const started = new Promise<void>((resolve) => {
+    firstReceipt = resolve;
+  });
+  const postedBodies: unknown[] = [];
+  let workerNow = NOW;
+  const runtime = await createSlackBridgeServerRuntimeFromEnv(MANAGED_ENV, {
+    db: getDb(),
+    now: () => workerNow,
+    lifecycleIntervalMs: 60_000,
+    inboundWorkerIntervalMs: 60_000,
+    outboundWorkerIntervalMs: 250,
+    outboundWorkerLeaseOwner: "managed-runtime-outbound-test",
+    onLifecycleReceipt() {
+      firstReceipt?.();
+      firstReceipt = null;
+    },
+    fetch: (async (url, init) => {
+      const method = new URL(String(url)).pathname.split("/").at(-1);
+      if (method === "auth.test") {
+        return new Response(JSON.stringify({
+          ok: true,
+          team_id: "T_MANAGED_RUNTIME",
+          user_id: "U_MANAGED_BOT",
+          bot_id: "B_MANAGED_BOT",
+        }), {
+          status: 200,
+          headers: {
+            "content-type": "application/json",
+            "x-oauth-scopes": SLACK_BRIDGE_REQUIRED_BOT_SCOPES.join(","),
+          },
+        });
+      }
+      if (method === "users.info") {
+        const providerUserId = new URL(String(url)).searchParams.get("user") ?? "";
+        return new Response(JSON.stringify({
+          ok: true,
+          user: {
+            id: providerUserId,
+            name: providerUserId.toLowerCase(),
+            is_bot: providerUserId === "U_MANAGED_BOT",
+            profile: { display_name: providerUserId },
+          },
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      if (method === "conversations.members") {
+        return new Response(JSON.stringify({
+          ok: true,
+          members: ["U_MANAGED_OWNER", "U_MANAGED_BOT"],
+          response_metadata: { next_cursor: "" },
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      if (method === "usergroups.list") {
+        return new Response(JSON.stringify({ ok: true, usergroups: [] }), {
+          status: 200, headers: { "content-type": "application/json" },
+        });
+      }
+      if (method === "usergroups.create" || method === "usergroups.update") {
+        const request = JSON.parse(String(init?.body)) as Record<string, string>;
+        return new Response(JSON.stringify({
+          ok: true,
+          usergroup: { id: "S_MANAGED_OWNER", ...request, date_delete: 0 },
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      if (method === "chat.postMessage") {
+        postedBodies.push(JSON.parse(String(init?.body)));
+        return new Response(JSON.stringify({
+          ok: true,
+          channel: "G_MANAGED_PRIVATE",
+          ts: "1786601594.810619",
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      throw new Error(`unexpected Slack method ${method}`);
+    }) as typeof fetch,
+  } as any);
+  assert.ok(runtime);
+  onTestFinished(async () => runtime.stop());
+  runtime.start();
+  await started;
+
+  const [agent] = await getDb().insert(agents).values({
+    serverId: seeded.server.id,
+    name: "managed-mention-agent",
+    runtime: "codex",
+  }).returning();
+  await getDb().insert(channelAgents).values({ channelId: seeded.channel.id, agentId: agent.id });
+
+  // Reviewer probe: this workspace human was first provisioned from another server.
+  const firstServer = await createServer("First workspace server", `first-${randomUUID()}`, seeded.owner.id);
+  await getDb().update(slackUsergroupIdentities).set({ serverId: firstServer.id })
+    .where(eq(slackUsergroupIdentities.principalId, seeded.owner.id));
+
+  // Humans and agents now both render through slack_usergroup_identities: the
+  // owner gets a managed usergroup whose <!subteam^…> token freezes at enqueue.
+  await broadcastAndDeliver(createIo(), noopOrchestrator, {
+    channelId: seeded.channel.id,
+    senderType: "agent",
+    senderId: agent.id,
+    senderName: agent.name,
+    content: `ack @${seeded.owner.name}`,
+  });
+
+  const deliveries = await getDb().select().from(externalOutboundDeliveries);
+  assert.equal(deliveries.length, 1, "the managed runtime must enqueue the outbound delivery");
+  const mentionRows = await getDb().select().from(messageMentions);
+  assert.equal(mentionRows.length, 1, "the @handle must resolve to a Raft mention row first");
+  assert.deepEqual(
+    mentionRows.map((row) => ({
+      targetType: row.targetType,
+      targetId: row.targetId,
+      handle: row.handleAtSendTime,
+    })),
+    [{ targetType: "user", targetId: seeded.owner.id, handle: seeded.owner.name }],
+  );
+  const [delivery] = deliveries;
+  const snapshot = delivery?.renderSnapshot as {
+    raftMentionSubstitutions?: Array<{ kind: string; handle: string; token: string }>;
+  } | undefined;
+  assert.deepEqual(
+    Object.keys(snapshot ?? {}).sort(),
+    [
+      "attachments", "authorName", "authorPresentation", "bindingAuthority",
+      "canonicalConversationId", "canonicalRootMessageId", "enqueueRuntimeRevision",
+      "externalMentions", "level", "raftMentionSubstitutions", "sanitizedText",
+      "schema", "senderId", "senderType", "sourceMessageId", "sourceMessageSeq",
+      "sourcePermalink",
+    ],
+    "stored snapshot carries the substitution field",
+  );
+  assert.deepEqual(snapshot?.raftMentionSubstitutions, [{
+    kind: "usergroup",
+    handle: seeded.owner.name,
+    token: "<!subteam^S_MANAGED_OWNER>",
+    installId: seeded.install.id,
+    bindingId: seeded.binding.id,
+    bindingEpoch: seeded.binding.bindingEpoch,
+  }], "enqueue must freeze the Raft-principal mention to its provider token");
+
+  await waitFor(async () => {
+    const [row] = await getDb().select().from(externalOutboundDeliveries);
+    return row?.state === "accepted";
+  }, "managed outbound acceptance with mention");
+  assert.equal(postedBodies.length, 1);
+  const postedText = String((postedBodies[0] as { text?: string }).text);
+  assert.match(postedText, /<!subteam\^S_MANAGED_OWNER>/);
+  assert.ok(
+    !new RegExp(`@${seeded.owner.name}\\b`, "u").test(postedText),
+    "the raw @handle must not survive substitution",
+  );
+  await getDb().insert(slackUsergroupIdentities).values({
+    installId: seeded.install.id, serverId: seeded.server.id, principalKind: "user", principalId: seeded.owner.id,
+    recoveryRef: randomBytes(24).toString("hex") as SlackUsergroupRecoveryRef,
+    providerUsergroupId: "S_RETIRED_LOCAL_ALIAS", humanCanonical: false,
+  });
+  await broadcastAndDeliver(createIo(), noopOrchestrator, {
+    channelId: seeded.channel.id, senderType: "agent", senderId: agent.id, senderName: agent.name,
+    content: `again @${seeded.owner.name}`,
+  });
+  const [latest] = await getDb().select().from(externalOutboundDeliveries).orderBy(desc(externalOutboundDeliveries.partitionPosition)).limit(1);
+  const latestSnapshot = latest.renderSnapshot as { raftMentionSubstitutions?: Array<{ token: string }> };
+  assert.deepEqual(latestSnapshot.raftMentionSubstitutions?.map((mention) => mention.token), ["<!subteam^S_MANAGED_OWNER>"],
+    "new outbound messages use the workspace canonical group, never a retired local alias");
 });
 
 test("zero-policy public thread reply follows the exact accepted root link", async ({ onTestFinished }) => {
@@ -1084,6 +1335,18 @@ test("zero-policy public thread reply follows the exact accepted root link", asy
             "x-oauth-scopes": SLACK_BRIDGE_REQUIRED_BOT_SCOPES.join(","),
           },
         });
+      }
+      if (method === "users.info") {
+        const providerUserId = new URL(String(url)).searchParams.get("user") ?? "";
+        return new Response(JSON.stringify({
+          ok: true,
+          user: {
+            id: providerUserId,
+            name: providerUserId.toLowerCase(),
+            is_bot: providerUserId === "U_MANAGED_BOT",
+            profile: { display_name: providerUserId },
+          },
+        }), { status: 200, headers: { "content-type": "application/json" } });
       }
       if (method === "conversations.members") {
         return new Response(JSON.stringify({
@@ -1223,6 +1486,18 @@ test("managed active binding drops OFF-window Raft messages without replay after
           },
         });
       }
+      if (method === "users.info") {
+        const providerUserId = new URL(String(url)).searchParams.get("user") ?? "";
+        return new Response(JSON.stringify({
+          ok: true,
+          user: {
+            id: providerUserId,
+            name: providerUserId.toLowerCase(),
+            is_bot: providerUserId === "U_MANAGED_BOT",
+            profile: { display_name: providerUserId },
+          },
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
       if (method === "conversations.members") {
         return new Response(JSON.stringify({
           ok: true,
@@ -1291,4 +1566,253 @@ test("managed active binding drops OFF-window Raft messages without replay after
   assert.equal(delivery?.sourceMessageId, onMessage.id);
   assert.notEqual(delivery?.sourceMessageId, offMessage.id);
   assert.equal(postedBodies.length, 1);
+});
+
+async function maintenanceFixture(loseAfterMethod?: string) {
+  const seeded = await seedManagedAudience();
+  const calls: string[] = [];
+  const errors: unknown[] = [];
+  let held = true;
+  let finish!: () => void;
+  const finished = new Promise<void>((resolve) => { finish = resolve; });
+  const runtime = await createSlackBridgeServerRuntimeFromEnv(MANAGED_ENV, {
+    db: getDb(), now: () => NOW,
+    lifecycleClock: { scheduleEvery: () => "fixture", clear() {} },
+    claimLifecycleRun: async () => ({ held: async () => held, end: finish }),
+    onLifecycleError(error) { errors.push(error); },
+    fetch: (async (url, init) => {
+      const target = new URL(String(url));
+      const method = target.pathname.split("/").at(-1)!;
+      calls.push(method);
+      if (method === loseAfterMethod) held = false;
+      let body: Record<string, unknown>;
+      switch (method) {
+        case "auth.test":
+          body = { ok: true, app_id: "A_MANAGED_RUNTIME", team_id: "T_MANAGED_RUNTIME",
+            user_id: "U_MANAGED_BOT", bot_id: "B_MANAGED_BOT" };
+          break;
+        case "usergroups.list": body = { ok: true, usergroups: [] }; break;
+        case "usergroups.create":
+        case "usergroups.update":
+          body = { ok: true, usergroup: { ...JSON.parse(String(init?.body)), id: "S_COMPACT_OWNER", date_delete: 0 } };
+          break;
+        case "conversations.info":
+          body = { ok: true, channel: { id: "G_MANAGED_PRIVATE", is_private: true,
+            is_archived: false, is_member: true } };
+          break;
+        case "conversations.members":
+          body = { ok: true, members: ["U_MANAGED_OWNER", "U_MANAGED_BOT",
+            ...(loseAfterMethod === "users.info" ? ["U_SECOND_MEMBER"] : [])],
+            response_metadata: { next_cursor: "" } };
+          break;
+        case "users.info": {
+          const id = target.searchParams.get("user");
+          body = { ok: true, user: { id, name: id, is_bot: false, profile: { display_name: id } } };
+          break;
+        }
+        default: throw new Error(`unexpected maintenance provider method ${method}`);
+      }
+      return new Response(JSON.stringify(body), { status: 200,
+        headers: { "content-type": "application/json", "x-oauth-scopes": SLACK_BRIDGE_REQUIRED_BOT_SCOPES.join(",") } });
+    }) as typeof fetch,
+  });
+  assert.ok(runtime);
+  return { seeded, runtime, calls, errors, finished };
+}
+
+for (const method of ["auth.test", "usergroups.list", "conversations.info", "conversations.members", "users.info"]) {
+  test(`lost maintenance claim after ${method} stops subsequent provider work`, async () => {
+    const fixture = await maintenanceFixture(method);
+    fixture.runtime.start();
+    try {
+      await fixture.finished;
+      assert.deepEqual(fixture.errors, []);
+      assert.equal(fixture.calls.at(-1), method, "no later provider operation may begin after ownership loss");
+      assert.equal(fixture.calls.filter((value) => value === method).length, 1);
+      assert.equal((await getDb().select().from(externalBindingAudienceSnapshots)).length, 1,
+        "cancellation must not append an unavailable audience observation");
+    } finally { await fixture.runtime.stop(); }
+  });
+}
+
+test("fresh member reuse rejects expired, revoked and superseded credentials", async () => {
+  const fixture = await maintenanceFixture();
+  fixture.runtime.start();
+  try {
+    await fixture.finished;
+    assert.deepEqual(fixture.errors, []);
+    const provider = {
+      readInstallGrant: async () => ({ kind: "unverified" as const }),
+      readWorkspace: async () => ({ oauth: "unverified" as const, directory: { kind: "unverified" as const } }),
+      readConversationAudience: async () => ({ kind: "unverified" as const }),
+    };
+    const refresh = () => refreshSlackConversationAuthority({ db: getDb(), provider,
+      bindingId: fixture.seeded.binding.id, now: NOW, reuseFresh: true });
+    assert.equal((await refresh()).audienceStatus, "matched", "the control has a coherent fresh member snapshot");
+    for (const values of [
+      { expiresAt: NOW },
+      { expiresAt: null, state: "revoked" as const, revokedAt: NOW },
+      { state: "active" as const, revokedAt: null, credentialRevision: 2 },
+    ]) {
+      await getDb().update(externalAppCredentials).set(values);
+      const result = await refresh();
+      assert.equal(result.audienceStatus, "unavailable");
+      assert.equal(result.reason, "credential_unavailable");
+    }
+  } finally { await fixture.runtime.stop(); }
+});
+
+test("identity observation defaults off and is scoped to explicit channel IDs", async () => {
+  const disabled = await createSlackBridgeServerRuntimeFromEnv(MANAGED_ENV);
+  assert.ok(disabled);
+  assert.equal(disabled.testIdentityObserver, undefined);
+  disabled.stop();
+  const invalid = await createSlackBridgeServerRuntimeFromEnv({ ...MANAGED_ENV,
+    SLACK_BRIDGE_OBSERVE_CHANNEL_IDS: "CTEST,invalid" });
+  assert.ok(invalid);
+  assert.equal(invalid.testIdentityObserver, undefined);
+  invalid.stop();
+  const enabled = await createSlackBridgeServerRuntimeFromEnv({ ...MANAGED_ENV,
+    SLACK_BRIDGE_OBSERVE_CHANNEL_IDS: "CTEST,GTEST,CTEST" });
+  assert.deepEqual(enabled?.testIdentityObserver?.providerConversationIds, ["CTEST", "GTEST"]);
+  enabled?.stop();
+});
+
+test("invalid observation scope logs a fixed warning without echoing configuration", async () => {
+  const messages: unknown[][] = [];
+  const originalWarn = console.warn;
+  console.warn = (...args: unknown[]) => { messages.push(args); };
+  try {
+    const runtime = await createSlackBridgeServerRuntimeFromEnv({ ...MANAGED_ENV,
+      SLACK_BRIDGE_OBSERVE_CHANNEL_IDS: "private-invalid-value" });
+    assert.ok(runtime);
+    assert.equal(runtime.testIdentityObserver, undefined);
+    assert.deepEqual(messages, [["Slack identity observation configuration is invalid; observation disabled"]]);
+    runtime.stop();
+  } finally {
+    console.warn = originalWarn;
+  }
+});
+
+
+test("managed deployment environment drives the attachment DB control after start and can pause it", async () => {
+  let providerCalls = 0;
+  const env = { ...MANAGED_ENV, SLACK_BRIDGE_ATTACHMENT_FALLBACK_ENABLED: "true",
+    SLACK_BRIDGE_ATTACHMENT_FALLBACK_CONFIG_GENERATION: "1", SLACK_BRIDGE_ATTACHMENT_FALLBACK_VERIFIED_RELEASE: "a".repeat(40), SLACK_BRIDGE_ATTACHMENT_FALLBACK_VERIFIED_BY: "@test-verifier" };
+  const create = (input: NodeJS.ProcessEnv) => createSlackBridgeServerRuntimeFromEnv(input, { now: () => NOW,
+    fetch: (async () => { providerCalls++; throw new Error("no Slack work exists"); }) as typeof fetch });
+  const waitForGeneration = async (generation: number) => {
+    for (let turn = 0; turn < 100; turn++) {
+      const [state] = await getDb().select().from(slackAttachmentPlanRollout);
+      if (state?.configGeneration === generation) return state;
+      await new Promise(resolve => setTimeout(resolve, 20));
+    }
+    throw new Error("deployment configuration did not reach the real control row");
+  };
+  const runtime = await create(env);
+  assert.ok(runtime);
+  assert.equal((await getDb().select().from(slackAttachmentPlanRollout)).length, 0, "composition does not mutate before start");
+  runtime.start();
+  try {
+    const state = await waitForGeneration(1);
+    assert.equal(state.enabled, true);
+    assert.equal(state.verifiedBy, "@test-verifier");
+  }
+  finally { await runtime.stop(); }
+  const paused = await create({ ...env, SLACK_BRIDGE_ATTACHMENT_FALLBACK_ENABLED: "false",
+    SLACK_BRIDGE_ATTACHMENT_FALLBACK_CONFIG_GENERATION: "2" });
+  assert.ok(paused); paused.start();
+  try {
+    const state = await waitForGeneration(2);
+    assert.equal(state.enabled, false); assert.equal(state.minimumWriterVersion, 1);
+  } finally { await paused.stop(); }
+  assert.equal(providerCalls, 0, "the deployment change itself performs no provider I/O");
+});
+
+test("managed runtime drains a verified Slack receipt after the durable switch is enabled", async ({ onTestFinished }) => {
+  const { enableTestSlackIngress } = await import("../test/integration/slackIngressRollout");
+  const { enqueueSlackVerifiedIngress } = await import("./slackVerifiedIngressInbox");
+  const { createSlackVerifiedIngressEnvCrypto } = await import("./slackVerifiedIngressEnvCrypto");
+  const { SLACK_BRIDGE_PAYLOAD_KEY_ID, slackBridgeKeyFromEnv } = await import("./slackBridgeEnvSecrets");
+  const seeded = await seedManagedAudience();
+  let lifecycleReady!: () => void;
+  const started = new Promise<void>(resolve => { lifecycleReady = resolve; });
+  const runtime = await createSlackBridgeServerRuntimeFromEnv(MANAGED_ENV, {
+    db: getDb(), now: () => NOW, lifecycleIntervalMs: 60_000,
+    inboundWorkerIntervalMs: 20, verifiedIngressWorkerIntervalMs: 20,
+    onLifecycleReceipt: () => lifecycleReady(),
+    fetch: (async (url) => {
+      if (String(url) === "https://slack.com/api/auth.test") return new Response(JSON.stringify({
+        ok: true, app_id: "A_MANAGED_RUNTIME", team_id: "T_MANAGED_RUNTIME", user_id: "U_MANAGED_BOT", bot_id: "B_MANAGED_BOT",
+      }), { status: 200, headers: { "content-type": "application/json", "x-oauth-scopes": SLACK_BRIDGE_REQUIRED_BOT_SCOPES.join(",") } });
+      return new Response(JSON.stringify({ ok: true, members: ["U_MANAGED_OWNER", "U_MANAGED_BOT"],
+        response_metadata: { next_cursor: "" } }), { status: 200, headers: { "content-type": "application/json" } });
+    }) as typeof fetch,
+  });
+  assert.ok(runtime);
+  onTestFinished(async () => runtime.stop());
+  runtime.start();
+  await started;
+  const authority = await resolveExternalBindingAuthority({ serverId: seeded.server.id, bindingId: seeded.binding.id,
+    expectedConnectionEpoch: seeded.install.connectionEpoch, expectedBindingEpoch: seeded.binding.bindingEpoch, now: NOW }, getDb());
+  assert.equal(authority.active, true);
+  await enableTestSlackIngress();
+  const aad = { purpose: "slack-verified-ingress" as const, version: 1 as const,
+    registrationId: seeded.registration.id, environment: "production" as const,
+    providerAppId: seeded.registration.providerAppId, providerAuthorityId: seeded.install.providerAuthorityId,
+    providerConversationId: seeded.binding.providerConversationId, providerEventId: "Ev_MANAGED_VERIFIED" };
+  const bytes = Buffer.from(JSON.stringify({ type: "event_callback", api_app_id: aad.providerAppId,
+    team_id: aad.providerAuthorityId, event_id: aad.providerEventId, event: { type: "message", channel: aad.providerConversationId,
+      user: seeded.projection.externalActorId, ts: `${Math.floor(NOW.getTime() / 1000)}.001234`, text: "runtime verified message" } }));
+  const crypto = createSlackVerifiedIngressEnvCrypto({ key: slackBridgeKeyFromEnv(MANAGED_ENV.SLACK_BRIDGE_PAYLOAD_ENCRYPTION_KEY,
+    "SLACK_BRIDGE_PAYLOAD_ENCRYPTION_KEY"), keyId: SLACK_BRIDGE_PAYLOAD_KEY_ID,
+    registrationId: aad.registrationId, environment: aad.environment, providerAppId: aad.providerAppId });
+  const sealed = await crypto.seal({ bytes, aad });
+  await enqueueSlackVerifiedIngress({ db: getDb(), aad, rawDigest: createHash("sha256").update(bytes).digest("hex"),
+    encryptedPayload: sealed.encryptedPayload, envelopeKeyId: sealed.envelopeKeyId, now: NOW,
+    validateEndpoint: async () => true });
+  await waitFor(async () => (await getDb().select().from(messages).where(eq(messages.content, "runtime verified message"))).length === 1,
+    "verified raw receipt to canonical message", 10_000);
+  await runtime.stop();
+});
+
+test("managed startup applies reviewed ingress deployment config before starting workers", async () => {
+  const { readSlackIngressRollout } = await import("./slackVerifiedIngressRollout");
+  const { slackVerifiedIngressRollout } = await import("../db/schema");
+  const env = { ...MANAGED_ENV, SLACK_BRIDGE_VERIFIED_INGRESS_ENABLED: "false",
+    SLACK_BRIDGE_VERIFIED_INGRESS_CONFIG_GENERATION: "1" };
+  const runtime = await createSlackBridgeServerRuntimeFromEnv(env, { db: getDb(), now: () => NOW });
+  assert.ok(runtime);
+  const [policy] = await getDb().select().from(slackVerifiedIngressRollout);
+  assert.equal(policy.configGeneration, 1);
+  assert.equal((await readSlackIngressRollout(getDb())).mode, "legacy");
+  await runtime.stop();
+  const errors: unknown[] = [];
+  await assert.rejects(createSlackBridgeServerRuntimeFromEnv({ ...env, SLACK_BRIDGE_VERIFIED_INGRESS_ENABLED: "true",
+    SLACK_BRIDGE_VERIFIED_INGRESS_RELEASE_RECORD: "00000000-0000-4000-8000-000000000022" },
+  { db: getDb(), now: () => NOW, onInboundError: error => errors.push(error) }), /could not be applied/);
+  assert.equal(errors.length, 1);
+});
+
+test("managed runtime wires the payload rotation keyring through the actual normalized worker", async () => {
+  const baseEnv = { ...MANAGED_ENV, SLACK_BRIDGE_ENVIRONMENT: "test", APP_URL: "http://127.0.0.1:5173" };
+  const old = await createSlackBridgeServerRuntimeFromEnv(baseEnv); assert.ok(old);
+  const aad = { purpose: "external-inbound-normalized-event" as const, aadVersion: 1 as const, schemaVersion: 1 as const,
+    provider: "slack" as const, environment: "test" as const, appRegistrationId: MANAGED_ENV.SLACK_BRIDGE_REGISTRATION_ID!,
+    installId: "install", workspaceId: "T1", providerAuthorityId: "T1", providerConversationId: "C1",
+    providerEventId: "Ev1", bindingId: "binding", bindingEpoch: 1, connectionEpoch: 1, runtimeRevision: "r1",
+    raftChannelId: "channel", privacyClass: "public" as const };
+  const sealed = await old.payloadSealer.sealNormalizedPayload({ plaintext: "before rotation", aad });
+  await old.stop();
+  const rotated = await createSlackBridgeServerRuntimeFromEnv({ ...baseEnv, SLACK_BRIDGE_PAYLOAD_ACTIVE_KEY_ID: "env:next",
+    SLACK_BRIDGE_PAYLOAD_DECRYPTION_KEYS: JSON.stringify({ "env:next": Buffer.alloc(32, 44).toString("base64") }) });
+  assert.ok(rotated);
+  const plaintext = await rotated.inboundWorkerDependencies.decryptNormalizedPayload({ eventId: "event-1",
+    ciphertext: sealed.encryptedPayload, envelopeKeyId: sealed.envelopeKeyId, aad });
+  assert.equal(plaintext, "before rotation");
+  const next = await rotated.payloadSealer.sealNormalizedPayload({ plaintext: "after rotation", aad });
+  assert.equal(next.envelopeKeyId, "env:next");
+  assert.equal(await rotated.inboundWorkerDependencies.decryptNormalizedPayload({ eventId: "event-2",
+    ciphertext: next.encryptedPayload, envelopeKeyId: next.envelopeKeyId, aad }), "after rotation");
+  await rotated.stop();
 });

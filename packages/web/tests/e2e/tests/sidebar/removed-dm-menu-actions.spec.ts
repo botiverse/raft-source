@@ -60,13 +60,13 @@ async function verifyConversationActions(
   channelId: string,
   expectedPinnedRef: PinnedRef,
 ) {
-  await openRowMenu(page, channelId, "Mark as Unread");
+  await openRowMenu(page, channelId, "Mark as unread");
   const [unreadResponse] = await Promise.all([
     page.waitForResponse((response) =>
       response.request().method() === "POST"
       && response.url().includes(`/api/channels/${channelId}/unread`)
     ),
-    page.getByRole("menuitem", { name: "Mark as Unread" }).click(),
+    page.getByRole("menuitem", { name: "Mark as unread" }).click(),
   ]);
   expect(unreadResponse.ok()).toBeTruthy();
   expect((await unreadResponse.json() as { unreadCount: number }).unreadCount).toBe(1);
@@ -85,8 +85,8 @@ async function verifyConversationActions(
     return includesPinnedRef(order.pinned, expectedPinnedRef);
   }).toBe(false);
 
-  await openRowMenu(page, channelId, "Close Chat");
-  await page.getByRole("menuitem", { name: "Close Chat" }).click();
+  await openRowMenu(page, channelId, "Close chat");
+  await page.getByRole("menuitem", { name: "Close chat" }).click();
   await expect.poll(async () => {
     const order = await getSidebarOrder(request, seedState, accessToken);
     return order.hiddenDmIds.includes(channelId);

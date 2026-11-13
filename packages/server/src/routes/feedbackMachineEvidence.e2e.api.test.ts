@@ -37,7 +37,7 @@ import { collectObservedFailureSummary } from "../../../daemon/src/observedFailu
 import { handleRequest, type TraceUploadWorkerEnv } from "../../../trace-upload-worker/src/index";
 import { legacyHandleRequest } from "../../../trace-upload-worker/src/testing/legacyTraceBundlesA8039c677";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 const SECRET = "feedback-evidence-e2e-secret";
 const WORKER_URL = "https://trace-worker.test";
 const DIAGNOSTIC_KEYS = ["observedFailureSummary", "feedbackTraceTail", "feedbackMachineState"] as const;
@@ -217,7 +217,7 @@ function assertTranscriptStored(o: ChainOutcome, label: string): void {
 async function withApp<T>(fn: (app: Awaited<ReturnType<typeof openTestApp>>) => Promise<T>): Promise<T> {
   const previousSecret = process.env.SCOPE_ATTESTATION_SECRET;
   process.env.SCOPE_ATTESTATION_SECRET = SECRET;
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     return await fn(app);
   } finally {

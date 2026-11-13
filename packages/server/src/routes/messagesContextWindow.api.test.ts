@@ -8,7 +8,7 @@ import { createServer as createServerService } from "../services/serverService";
 import { createChannel as createChannelService, addHuman } from "../services/channelService";
 import { createMessage } from "../services/messageService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 // task #17 (staging load speed): the thread panel needs only the parent
 // message, but GET /api/messages/context/:id always returned 15 messages on

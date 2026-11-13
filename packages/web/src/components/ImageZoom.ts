@@ -22,8 +22,9 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react
 // gated + low-freq + short-lived; no hot-path coupling.
 //
 // Gesture inputs:
-//   PC desktop: Ctrl/Cmd + scroll wheel = continuous zoom; double-click =
-//               toggle fit ↔ 2x; drag = pan when scale > 1; "0" key = reset.
+//   PC desktop: Ctrl/Cmd + scroll wheel = continuous zoom; click (image
+//               lightbox) = toggle fit ↔ actual size; double-click (Mermaid)
+//               = toggle fit ↔ 2x; drag = pan when scale > 1; "0" key = reset.
 //   Mac/PC trackpad: pinch-spread (browsers synthesize as wheel + ctrlKey:true)
 //                    flows through the same continuous-zoom path.
 //   Mobile: pinch (two-finger) = continuous zoom; double-tap = toggle;
@@ -32,7 +33,7 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react
 export const MIN_SCALE = 1; // never zoom out below fit-to-viewport
 export const MAX_SCALE = 4;
 export const MAX_DYNAMIC_SCALE = 16;
-const ZOOMED_SCALE_TARGET = 2; // double-click target
+const ZOOMED_SCALE_TARGET = 2; // double-click target; floor for click-to-actual-size
 const DOUBLE_TAP_WINDOW_MS = 350;
 const DOUBLE_TAP_RADIUS_PX = 24;
 const TAP_MOVEMENT_TOLERANCE_PX = 10;
@@ -93,6 +94,22 @@ export function imageDimensionsToMaxScale(dimensions: {
   if (naturalWidth <= 0 || naturalHeight <= 0 || clientWidth <= 0 || clientHeight <= 0) return MAX_SCALE;
   const naturalRatio = Math.max(naturalWidth / clientWidth, naturalHeight / clientHeight);
   return Math.max(MAX_SCALE, Math.min(MAX_DYNAMIC_SCALE, naturalRatio));
+}
+
+/**
+ * Click-to-zoom target: the scale at which the fitted image shows its natural
+ * pixels, never below the classic 2x step so small images still visibly zoom.
+ * Callers clamp it to the dynamic max scale.
+ */
+export function imageDimensionsToActualSizeScale(dimensions: {
+  naturalWidth: number;
+  naturalHeight: number;
+  clientWidth: number;
+  clientHeight: number;
+}): number {
+  const { naturalWidth, naturalHeight, clientWidth, clientHeight } = dimensions;
+  if (naturalWidth <= 0 || naturalHeight <= 0 || clientWidth <= 0 || clientHeight <= 0) return ZOOMED_SCALE_TARGET;
+  return Math.max(ZOOMED_SCALE_TARGET, naturalWidth / clientWidth, naturalHeight / clientHeight);
 }
 
 export interface ImageZoomState {
@@ -182,6 +199,13 @@ export interface ImageZoomController extends ImageZoomState {
   layoutSettleRef: (settler: ImageZoomLayoutSettler | null) => void;
   /** Double-click handler — toggles fit ↔ 2x. */
   onDoubleClick: (event: React.MouseEvent<HTMLElement>) => void;
+  /**
+   * Mouse single-click handler — toggles fit ↔ actual size (natural pixels,
+   * at least 2x) when the click lands on the media. Returns true when the
+   * click was consumed: a toggle, or the release of a pan drag. Touch taps
+   * return false so mobile keeps double-tap and the host's own tap handling.
+   */
+  onClick: (event: React.MouseEvent<HTMLElement>) => boolean;
   /** Mouse-drag pan when zoomed. */
   onPointerDown: (event: React.PointerEvent<HTMLElement>) => void;
   onPointerMove: (event: React.PointerEvent<HTMLElement>) => void;
@@ -258,6 +282,7 @@ export function useImageZoom({
     startTY: number;
   } | null>(null);
   const lastTapRef = useRef<{ time: number; x: number; y: number } | null>(null);
+  const pressRef = useRef<{ x: number; y: number; pointerType: string } | null>(null);
 
   const getMaxScale = useCallback(() => {
     const el = imageElRef.current;
@@ -307,7 +332,10 @@ export function useImageZoom({
         : "none";
     }
     el.style.cursor = dragRef.current ? "grabbing" : nextIsZoomed ? "zoom-out" : "zoom-in";
-    el.style.willChange = nextIsTransformed ? "transform" : "auto";
+    // Keep the layer promoted while an animated zoom-out is still running;
+    // dropping it at the start makes the browser re-raster a huge image
+    // mid-animation.
+    el.style.willChange = nextIsTransformed || programmaticZoomTargetRef.current ? "transform" : "auto";
   }, [scaleMode]);
 
   const settleImageTransform = useCallback((next: ImageZoomState) => {
@@ -484,28 +512,8 @@ export function useImageZoom({
     commitTransform(next);
   }, [applyImageTransform, cancelProgrammaticZoom, commitTransform, stopWheelMomentum]);
 
-  const zoomBy = useCallback((factor: number) => {
-    if (!Number.isFinite(factor) || factor <= 0) return;
+  const transitionTo = useCallback((target: ImageZoomState) => {
     stopWheelMomentum();
-
-    const current = { ...liveTransformRef.current };
-    const queuedTarget = programmaticZoomTargetRef.current;
-    const nextScale = setScaleClamped((queuedTarget?.scale ?? current.scale) * factor);
-    const stageRect = wheelTargetElRef.current?.getBoundingClientRect();
-    const target = stageRect
-      ? zoomAroundClientPoint(
-          current,
-          nextScale,
-          (stageRect.left + stageRect.right) / 2,
-          (stageRect.top + stageRect.bottom) / 2,
-        )
-      : { ...current, scale: nextScale };
-
-    if (
-      Math.abs(target.scale - current.scale) <= 0.000_001 &&
-      Math.abs(target.translateX - current.translateX) <= 0.000_001 &&
-      Math.abs(target.translateY - current.translateY) <= 0.000_001
-    ) return;
     cancelProgrammaticZoom();
     cancelLayoutSettle();
 
@@ -540,10 +548,33 @@ export function useImageZoom({
     cancelProgrammaticZoom,
     commitTransform,
     programmaticZoomAnimationMs,
-    setScaleClamped,
     stopWheelMomentum,
-    zoomAroundClientPoint,
   ]);
+
+  const zoomBy = useCallback((factor: number) => {
+    if (!Number.isFinite(factor) || factor <= 0) return;
+    stopWheelMomentum();
+
+    const current = { ...liveTransformRef.current };
+    const queuedTarget = programmaticZoomTargetRef.current;
+    const nextScale = setScaleClamped((queuedTarget?.scale ?? current.scale) * factor);
+    const stageRect = wheelTargetElRef.current?.getBoundingClientRect();
+    const target = stageRect
+      ? zoomAroundClientPoint(
+          current,
+          nextScale,
+          (stageRect.left + stageRect.right) / 2,
+          (stageRect.top + stageRect.bottom) / 2,
+        )
+      : { ...current, scale: nextScale };
+
+    if (
+      Math.abs(target.scale - current.scale) <= 0.000_001 &&
+      Math.abs(target.translateX - current.translateX) <= 0.000_001 &&
+      Math.abs(target.translateY - current.translateY) <= 0.000_001
+    ) return;
+    transitionTo(target);
+  }, [setScaleClamped, stopWheelMomentum, transitionTo, zoomAroundClientPoint]);
 
   useEffect(() => {
     settleImageTransform({ scale, translateX, translateY });
@@ -648,8 +679,48 @@ export function useImageZoom({
     [applyCommittedTransform, reset, setScaleClamped, zoomAroundClientPoint],
   );
 
+  const onClick = useCallback(
+    (event: React.MouseEvent<HTMLElement>) => {
+      const press = pressRef.current;
+      pressRef.current = null;
+      if (
+        press &&
+        (Math.abs(event.clientX - press.x) > TAP_MOVEMENT_TOLERANCE_PX ||
+          Math.abs(event.clientY - press.y) > TAP_MOVEMENT_TOLERANCE_PX)
+      ) {
+        return true;
+      }
+      if (press?.pointerType === "touch") return false;
+      const el = imageElRef.current;
+      if (!el) return false;
+      const rect = el.getBoundingClientRect();
+      const onMedia = event.target === el ||
+        (event.clientX >= rect.left && event.clientX <= rect.right &&
+          event.clientY >= rect.top && event.clientY <= rect.bottom);
+      if (!onMedia) return false;
+
+      const current = liveTransformRef.current;
+      if (Math.abs(current.scale - MIN_SCALE) > 0.001 || current.translateX !== 0 || current.translateY !== 0) {
+        transitionTo({ scale: MIN_SCALE, translateX: 0, translateY: 0 });
+        return true;
+      }
+      const actualSize = el instanceof HTMLImageElement
+        ? imageDimensionsToActualSizeScale({
+            naturalWidth: el.naturalWidth,
+            naturalHeight: el.naturalHeight,
+            clientWidth: el.clientWidth,
+            clientHeight: el.clientHeight,
+          })
+        : ZOOMED_SCALE_TARGET;
+      transitionTo(zoomAroundClientPoint(current, setScaleClamped(actualSize), event.clientX, event.clientY));
+      return true;
+    },
+    [setScaleClamped, transitionTo, zoomAroundClientPoint],
+  );
+
   const onPointerDown = useCallback(
     (event: React.PointerEvent<HTMLElement>) => {
+      pressRef.current = { x: event.clientX, y: event.clientY, pointerType: event.pointerType };
       cancelProgrammaticZoom();
       cancelLayoutSettle();
       const current = liveTransformRef.current;
@@ -835,6 +906,7 @@ export function useImageZoom({
     wheelTargetRef,
     layoutSettleRef,
     onDoubleClick,
+    onClick,
     onPointerDown,
     onPointerMove,
     onPointerUp,

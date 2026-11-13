@@ -1,5 +1,5 @@
 {
-  "$comment": "Runtime form protocol v2: the single source for the TypeScript and Kotlin wire types. Edit this file, then run `pnpm --filter @botiverse/raft-runtime-form contract:generate`. Every type is open: receivers must ignore keys they do not know (README, Protocol v2).",
+  "$comment": "Runtime form protocol v2 and v3: the single source for the TypeScript and Kotlin wire types. Edit this file, then run `pnpm --filter @botiverse/raft-runtime-form contract:generate`. Every type is open: receivers must ignore keys they do not know (README, Protocol v2 and Protocol v3).",
   "name": "RuntimeFormV2",
   "kotlinPackage": "build.raft.app.data.runtimeform.v2",
   "types": {
@@ -8,7 +8,11 @@
       "fields": {
         "protocolVersion": {
           "type": "int",
-          "const": 2
+          "enum": [
+            2,
+            3
+          ],
+          "doc": "2, or 3 when the request advertised `runtime_form.v3` (query `clientCapabilities`). A v2 parser rejects 3 (fail closed). v3 differs from v2 only in: `uiSchema.rules` instead of `uiSchema.visibility`, `dataSchema.allOf` conditional required, no `x-optionsFrom` (a reasoning effort is an `x-optionSource` dependent_select), no `x-connectionOwned` (a HIDE rule + conditional required), unavailable options only in `OptionSource.unavailableOptions` (never `Option.unavailable`), `revision` on every form, and `requiredClientCapabilities` empty (v3 implies the v2 names)."
         },
         "runtimeId": {
           "type": "string"
@@ -35,7 +39,7 @@
         "revision": {
           "type": "string",
           "optional": true,
-          "doc": "Opaque token identifying this exact form build (entry version + relevant server flags + scope). Sent only on the v2 form endpoints. A client that fetches option sources for this form should pass it back as ?formRevision=<token>; see OptionSource for the three outcomes. Clients that do not know it keep working: the parameter is optional."
+          "doc": "Opaque token identifying this exact form build (entry version + relevant server flags + scope; on v3 also the saved connections named in rule conditions). Sent only on the v2/v3 form endpoints: on v2 only for saved-connection forms, on v3 on every form. A client that fetches option sources for this form should pass it back as ?formRevision=<token>; see OptionSource for the three outcomes. Clients that do not know it keep working: the parameter is optional."
         },
         "values": {
           "type": "map<json>",
@@ -60,6 +64,11 @@
         },
         "properties": {
           "type": "map<FieldSchema>"
+        },
+        "allOf": {
+          "type": "ConditionalRequired[]",
+          "optional": true,
+          "doc": "v3 only. Conditional required: each entry's `if` is a condition schema evaluated against the whole form values (Condition rules: supported keywords, absent value = \"\"); when it holds, the names in `then.required` are required, otherwise those in `else.required`. A field hidden by a rule is never required. Top-level `required` stays unconditional."
         }
       }
     },
@@ -93,13 +102,14 @@
         "x-optionsFrom": {
           "type": "OptionsFrom",
           "optional": true,
-          "kotlinName": "optionsFrom"
+          "kotlinName": "optionsFrom",
+          "doc": "v2 only. On v3 a field whose choices follow another field's option is an `x-optionSource` dependent_select."
         },
         "x-connectionOwned": {
           "type": "bool",
           "optional": true,
           "kotlinName": "connectionOwned",
-          "doc": "capability `provider.saved_connection`. True on a field whose value a selected saved provider connection owns (the writeOnly secret, a gateway URL/capability field). While the field that offers connection options holds a connection selection, a client renders this field disabled with a placeholder, treats it as not required, and keeps it out of formValues entirely (never an empty string); moving the selection off a connection restores this field's own visibility and required rules and clears its value. Sent only to forms that declare the capability."
+          "doc": "capability `provider.saved_connection`. True on a field whose value a selected saved provider connection owns (the writeOnly secret, a gateway URL/capability field). While the field that offers connection options holds a connection selection, a client renders this field disabled with a placeholder, treats it as not required, and keeps it out of formValues entirely (never an empty string); moving the selection off a connection restores this field's own visibility and required rules and clears its value. Sent only to forms that declare the capability. v2 only: v3 expresses the same with a HIDE rule and `dataSchema.allOf`."
         },
         "additionalProperties": {
           "type": "json",
@@ -135,11 +145,17 @@
         },
         "visibility": {
           "type": "VisibilityRule[]",
-          "optional": true
+          "optional": true,
+          "doc": "v2 only (v3: `rules`)."
         },
         "localization": {
           "type": "map<FieldCopy>",
           "optional": true
+        },
+        "rules": {
+          "type": "Rule[]",
+          "optional": true,
+          "doc": "v3 only. At most one rule per field (compound conditions use condition.scope \"#\"). A field hidden by a rule is not validated, not required and not submitted."
         }
       }
     },
@@ -171,6 +187,37 @@
         "in": {
           "type": "string[]",
           "kotlinName": "values"
+        }
+      }
+    },
+    "Rule": {
+      "doc": "v3: JSONForms-style rule for the field at `scope`.",
+      "fields": {
+        "scope": {
+          "type": "string",
+          "doc": "The field the rule applies to: `#/properties/<key>`."
+        },
+        "effect": {
+          "type": "string",
+          "enum": [
+            "SHOW",
+            "HIDE"
+          ],
+          "doc": "SHOW: visible only while the condition holds. HIDE: hidden while it holds. Any other effect is unsupported: the client treats the whole form as unavailable."
+        },
+        "condition": {
+          "type": "Condition"
+        }
+      }
+    },
+    "Condition": {
+      "doc": "v3: `schema` is evaluated against the value at `scope` (`#` = the whole values object, `#/properties/<key>` = one field). Supported keywords: const, enum (structural equality: object key order does not count), pattern (a portable ECMAScript subset, unanchored unless the pattern anchors; see the package README), not, anyOf, allOf, properties. An absent value is evaluated as \"\". A schema using any other keyword, or a pattern outside the subset, is unsupported: the client treats the whole form as unavailable (new keywords need a required client capability). packages/runtime-form/fixtures/v3.conditions.conformance.json is the conformance table every client runs.",
+      "fields": {
+        "scope": {
+          "type": "string"
+        },
+        "schema": {
+          "type": "json"
         }
       }
     },
@@ -267,7 +314,8 @@
         },
         "customValueAllowedByValue": {
           "type": "map<bool>",
-          "optional": true
+          "optional": true,
+          "doc": "dependent_select only, keyed like optionsByValue. true with no listed options for that value: a free-text field (blank start). true with listed options: a combobox, as `customValueAllowed`, starting at defaultValueByValue. The server sends it only to a client that advertises `dependent_select.custom_value_with_options` (query `clientCapabilities`, comma-separated, on the definition, edit-form, option-source and submit requests; optional, never in requiredClientCapabilities); any other client gets that value list-only, as before the capability existed; the server decides how each value is stored (an unlisted typed one as a custom value; a listed one normally as a preset, though other fields may make it an override: Built-in Pi stores a listed OpenRouter model saved with a limit as a custom model). false/absent: pick from the list."
         },
         "customValueAllowed": {
           "type": "bool",
@@ -282,7 +330,7 @@
             "unavailable"
           ],
           "optional": true,
-          "doc": "capability `option_source.status`. live: the list came from the Computer's probe. fallback: the probe was not live and the list is the bundled one (usable; show `reason`). unavailable: no list at all; `options` is []. One status per source, worst wins (unavailable > fallback > live), dependent_select included (there is no per-value status). A source-level failure is reported here, never as a form-level error, and never makes a client fall back to v1 (v1 fallback is only for a form-level 404 or protocol error). Client obligations: unavailable + required field: show the status and (when retryable) a retry, and block submit; unavailable + optional field: hide the field. Retry = request the same source again with `?refresh=1`; the server then bypasses any cache (the Computer's probe gate already single-flights concurrent probes)."
+          "doc": "capability `option_source.status`. live: the list came from the Computer's probe. fallback: the probe was not live and the list is the bundled one (usable; show `reason`). unavailable: no list at all; `options` is []. One status per source, worst wins (unavailable > fallback > live), dependent_select included (there is no per-value status). A source-level failure is reported here, never as a form-level error, and never makes a client fall back to v1 (v1 fallback is only for a form-level 404 or protocol error). Client obligations: unavailable + required field: show the status and (when retryable) a retry, and block submit; unavailable + optional field: hide the field. Retry = request the same source again with `?refresh=1`; the server then asks the Computer again, bypassing its model-list cache (the Computer's probe gate already single-flights concurrent probes), and answers from its own last-good copy (`state: stale`) only when the Computer does not answer in time."
         },
         "reason": {
           "type": "string",
@@ -301,6 +349,25 @@
           "type": "bool",
           "optional": true,
           "doc": "capability `option_source.status`. Whether retrying may change the answer: true for probe_timeout, probe_failed, machine_offline and no_models (the user may add models); false for missing_config and unsupported. Absent or false when status is live."
+        },
+        "state": {
+          "type": "string",
+          "enum": [
+            "stale",
+            "unavailable"
+          ],
+          "optional": true,
+          "doc": "capability `option_source.status`; sent next to `status` and additive to it (a client that ignores it keeps the `status` rules). Present only when the Computer did not answer this request in time; absent when it answered, or when the server knows its state (offline). stale: the list is the last one it reported, received at `fetchedAt`; `status` is then `fallback` with reason `probe_timeout` (retryable), so a client that ignores `state` still shows a usable list with a retry. unavailable: the server has no earlier list; `status`/`reason` (probe_timeout) say what is shown instead. The server keeps waiting for the Computer in the background and caches a late answer, so a retry usually gets it. Clients must accept an unknown state (treat it as absent)."
+        },
+        "fetchedAt": {
+          "type": "string",
+          "optional": true,
+          "doc": "capability `option_source.status`. ISO 8601 time the server received the list shown with `state: stale`; absent otherwise."
+        },
+        "unavailableOptions": {
+          "type": "UnavailableOption[]",
+          "optional": true,
+          "doc": "Additive; no requiredClientCapabilities entry. Options that exist but cannot be picked now, kept OUT of `options` so a client that ignores this field never offers them: models this Computer's runtime itself listed as disabled (never models from Raft's bundled catalog: when the Computer provides a list, that list alone decides), and on v3 also saved provider connections that are not selectable (disabled, missing credential; `connectionId` set). Render them after the listed options as a disabled, non-selectable group: by `group` when present (`saved`: the saved providers group), else \"Not available on this computer\"; never submit one as a new pick. v3: a current value equal to an entry shows selected-and-unavailable and blocks saving (`option_unavailable`), except on a source with `customValueAllowed`, where it is accepted as a typed value. A client that ignores the field loses only the hint. The server never accepts a value as listed because it appears here (a source with `customValueAllowed` still accepts any typed value, as before)."
         }
       }
     },
@@ -346,12 +413,48 @@
         "unavailable": {
           "type": "bool",
           "optional": true,
-          "doc": "capability `provider.saved_connection`. Edit only: the agent's currently bound connection is not selectable right now (disabled, missing credential, retired). It stays visible, keeps the agent's stored value, and blocks save until the user picks something else — a silent rewrite never happens."
+          "doc": "capability `provider.saved_connection`. Edit only: the agent's currently bound connection is not selectable right now (disabled, missing credential, retired). It stays visible, keeps the agent's stored value, and blocks save until the user picks something else — a silent rewrite never happens. v2 only: v3 sends such an option in OptionSource.unavailableOptions instead."
         },
         "unavailableReason": {
           "type": "string",
           "optional": true,
-          "doc": "capability `provider.saved_connection`. Localized-safe reason key for `unavailable` (e.g. disabled, missing_credential, retired, not_found)."
+          "doc": "capability `provider.saved_connection`. Localized-safe reason key for `unavailable` (e.g. disabled, missing_credential, retired, not_found). v2 only."
+        }
+      }
+    },
+    "UnavailableOption": {
+      "doc": "An option shown greyed in a select (OptionSource.unavailableOptions), never selectable as a new pick.",
+      "fields": {
+        "value": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string",
+          "optional": true,
+          "doc": "Why it is not available, as plain text: for a model, the runtime's own reason (untrusted runtime text, already trimmed and length-capped by the server); for a saved connection, server copy in the request language. Render as plain text only. Absent when there is no reason; the client then shows the disabled row without a description."
+        },
+        "connectionId": {
+          "type": "string",
+          "optional": true,
+          "doc": "v3: set on a saved provider connection that is not selectable (value === \"connection:\" + connectionId)."
+        },
+        "underlyingProviderId": {
+          "type": "string",
+          "optional": true,
+          "doc": "v3: the connection's provider id, as Option.underlyingProviderId."
+        },
+        "group": {
+          "type": "string",
+          "optional": true,
+          "doc": "v3: display group, as Option.group (`saved` for a connection)."
+        },
+        "providerKind": {
+          "type": "string",
+          "optional": true,
+          "doc": "v3: as Option.providerKind."
         }
       }
     },
@@ -359,7 +462,11 @@
       "fields": {
         "protocolVersion": {
           "type": "int",
-          "const": 2
+          "enum": [
+            2,
+            3
+          ],
+          "doc": "2 or 3 (the protocolVersion of the form the client rendered); formValues have the same semantics on both."
         },
         "runtimeId": {
           "type": "string"
@@ -374,6 +481,33 @@
         },
         "formValues": {
           "type": "map<json>"
+        }
+      }
+    },
+    "ConditionalRequired": {
+      "doc": "v3: one `dataSchema.allOf` entry (JSON Schema if/then/else limited to `required`).",
+      "fields": {
+        "if": {
+          "type": "json",
+          "kotlinName": "ifSchema",
+          "doc": "Condition schema over the whole values object (see Condition.schema)."
+        },
+        "then": {
+          "type": "RequiredClause",
+          "optional": true,
+          "kotlinName": "thenClause"
+        },
+        "else": {
+          "type": "RequiredClause",
+          "optional": true,
+          "kotlinName": "elseClause"
+        }
+      }
+    },
+    "RequiredClause": {
+      "fields": {
+        "required": {
+          "type": "string[]"
         }
       }
     }

@@ -1,9 +1,10 @@
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Page } from "@playwright/test";
+import { homeChannelListFollowedThreads } from "../../web/visual-testing/homeChannelList";
+import { CLAUDE_LIVE, runtimeFormV2Response } from "./runtimeFormV2Mock";
 
 const require = createRequire(import.meta.url);
 const { test, expect } = require("@playwright/test");
@@ -22,11 +23,14 @@ type VisualCase = {
   baselineStatus?: string;
   skip?: boolean | { enabled?: boolean };
   viewport?: { width: number; height: number; density: number };
+  theme?: "light" | "dark";
   capture?: {
     selector?: string;
     crop?: string;
     contract?: string;
     interactions?: VisualInteraction[];
+    // Opt-in full-length ("long screenshot") capture, read by every provider.
+    fullLength?: boolean | { maxHeight?: number };
   };
   variants?: Array<{
     id: string;
@@ -37,92 +41,23 @@ type VisualCase = {
 
 const testDir = dirname(fileURLToPath(import.meta.url));
 const packageRoot = resolve(testDir, "..");
-const GOOGLE_FONT_CSS_URL =
-  "https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Space+Mono:wght@400;700&display=swap";
-// raft-ui's own fonts.css (imported by packages/web/src/index.css as
-// `@import "raft-ui/fonts.css"`) opens with this exact Google Fonts import.
-// It is a legitimate request from the app, not a leak: it gets the same
-// treatment as the app's own imports above — fulfilled with the bundled local
-// font CSS, so the run stays offline and deterministic. Copy the URL verbatim
-// from packages/web/node_modules/raft-ui/dist/fonts.css when raft-ui changes it.
-const RAFT_UI_FONT_CSS_URL =
-  "https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300..700&family=Space+Mono:wght@400;700&display=swap";
-const GOOGLE_FONT_CSS_URLS = new Set([
-  GOOGLE_FONT_CSS_URL,
-  "https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&display=swap",
-  RAFT_UI_FONT_CSS_URL,
-]);
-const webFontRoot = resolve(packageRoot, "../web/src/assets/fonts");
-const visualFontCssSource = readFileSync(resolve(webFontRoot, "fonts.css"), "utf8");
-if (createHash("sha256").update(visualFontCssSource).digest("hex")
-  !== "062661ae65973cc7bd9fcc3d82309060b4360581ee7ed72dd45138402e580344") {
-  throw new Error("visual font CSS digest mismatch: packages/web/src/assets/fonts/fonts.css");
-}
-const VISUAL_FONT_CSS = visualFontCssSource
-  .replace(/url\(\.\/([^)]+)\)/g, "url('/src/assets/fonts/$1')");
-const VISUAL_FONT_ASSETS = new Map([
-  [
-    "/src/assets/fonts/space-grotesk-0.ttf",
-    {
-      path: resolve(packageRoot, "../web/src/assets/fonts/space-grotesk-0.ttf"),
-      sha256: "ec926d5065eaca49a48f96e312bbae0bbc5733c24215cf5dfabbdccee926fef7",
-    },
-  ],
-  [
-    "/src/assets/fonts/space-grotesk-1.ttf",
-    {
-      path: resolve(packageRoot, "../web/src/assets/fonts/space-grotesk-1.ttf"),
-      sha256: "3e699ead1876244fa392243054ddefe7cf631b488438828a8a100731a22ab995",
-    },
-  ],
-  [
-    "/src/assets/fonts/space-grotesk-2.ttf",
-    {
-      path: resolve(packageRoot, "../web/src/assets/fonts/space-grotesk-2.ttf"),
-      sha256: "6c0346b8d297ebdc225832833e03e884a26ad99d265ecd3924d46e1ba285ea87",
-    },
-  ],
-  [
-    "/src/assets/fonts/space-grotesk-3.ttf",
-    {
-      path: resolve(packageRoot, "../web/src/assets/fonts/space-grotesk-3.ttf"),
-      sha256: "3e756954468ff1cb302dae0414262e72f76a67d87bef3fa1f3226cd0fb9b2d85",
-    },
-  ],
-  [
-    "/src/assets/fonts/space-mono-4.ttf",
-    {
-      path: resolve(packageRoot, "../web/src/assets/fonts/space-mono-4.ttf"),
-      sha256: "829aad32ab9525358de2a7ebc718d05a6b335e67421aad5e1e09cd1fa796af4e",
-    },
-  ],
-  [
-    "/src/assets/fonts/space-mono-5.ttf",
-    {
-      path: resolve(packageRoot, "../web/src/assets/fonts/space-mono-5.ttf"),
-      sha256: "5be2b984cdb8befc8ad1871d10f1aa8337f7d2bae3c6bf0ce720d0745ac1a8ec",
-    },
-  ],
-  [
-    "https://fonts.gstatic.com/s/hankengrotesk/v12/ieVn2YZDLWuGJpnzaiwFXS9tYtpd59CxCis4.woff2",
-    {
-      path: resolve(webFontRoot, "hanken-grotesk-quotes.woff2"),
-      sha256: "1f21c6eaa0000f3329cfcfac966b43d5bebf5aa610303e33294ac31bc6f4bb59",
-    },
-  ],
-]);
-
-for (const asset of VISUAL_FONT_ASSETS.values()) {
-  let contents: Buffer;
-  try {
-    contents = readFileSync(asset.path);
-  } catch (error) {
-    throw new Error(`visual font asset missing: ${asset.path}`, { cause: error });
-  }
-  const actual = createHash("sha256").update(contents).digest("hex");
-  if (actual !== asset.sha256) {
-    throw new Error(`visual font asset digest mismatch: ${asset.path}`);
-  }
+// The app serves its own fonts (packages/web/src/fonts.css, woff2 files in
+// src/assets/fonts): no Google Fonts request is expected, and every face the
+// fonts.css declares is requested from the app's own origin. The woff2 names
+// come from that stylesheet, so a font update needs no change here.
+const webFontCss = readFileSync(resolve(packageRoot, "../web/src/fonts.css"), "utf8");
+const VISUAL_FONT_FILES = new Set(
+  [...webFontCss.matchAll(/url\(\.\/assets\/fonts\/([^)]+\.woff2)\)/g)].map(([, file]) => file),
+);
+if (VISUAL_FONT_FILES.size === 0) throw new Error("no fonts found in packages/web/src/fonts.css");
+// Served under its source name (dev) or the source name plus a content hash
+// (build); the longest match wins (space-grotesk-latin vs space-grotesk-latin-ext).
+function visualFontFile(pathname: string): string | undefined {
+  const name = pathname.split("/").pop() ?? "";
+  if (!name.endsWith(".woff2")) return undefined;
+  return [...VISUAL_FONT_FILES]
+    .filter((file) => name === file || name.startsWith(`${file.slice(0, -".woff2".length)}-`))
+    .sort((a, b) => b.length - a.length)[0];
 }
 const reactRepoRoot = process.env.SLOCK_REACT_REPO_DIR
   ? resolve(process.env.SLOCK_REACT_REPO_DIR)
@@ -142,6 +77,7 @@ const savedMessagesFixture = JSON.parse(readFileSync(resolve(packageRoot, "share
 const searchResultsFixture = JSON.parse(readFileSync(resolve(packageRoot, "shared/searchResultsFixture.json"), "utf8"));
 const activityResultsFixture = JSON.parse(readFileSync(resolve(packageRoot, "shared/activityResultsFixture.json"), "utf8"));
 const tasksFixture = JSON.parse(readFileSync(resolve(packageRoot, "shared/tasksFixture.json"), "utf8"));
+const HOME_CHANNEL_LIST_CASE_IDS = new Set(["screens.home.channel-list", "screens.home.channel-list.dark"]);
 const fxOwner = fixtureData.humans.owner;
 const fxDesigner = fixtureData.humans.designer;
 const fxCindy = fixtureData.agents.cindy;
@@ -226,6 +162,10 @@ function caseUrl(visualCase: VisualCase): string {
       params.set(key, String(value));
     }
   }
+  // The page takes its mode from `?theme=` (VisualTestingCases requestedMode):
+  // a case's own `theme` must reach the URL, or a dark case is drawn light.
+  // A variant prop still wins, as before.
+  if (visualCase.theme === "dark" && !params.has("theme")) params.set("theme", "dark");
   return `/visual-testing.html?${params.toString()}`;
 }
 
@@ -313,26 +253,8 @@ async function quietApi(page: any, caseId: string): Promise<VisualFontRouteState
   await page.route("**/*", (route: any) => {
     const requestUrl = route.request().url();
     const parsedUrl = new URL(requestUrl);
-    if (GOOGLE_FONT_CSS_URLS.has(requestUrl)) {
-      visualFonts.served.add(requestUrl);
-      route.fulfill({
-        status: 200,
-        contentType: "text/css; charset=utf-8",
-        body: VISUAL_FONT_CSS,
-      });
-      return;
-    }
-    const fontAsset = VISUAL_FONT_ASSETS.get(parsedUrl.pathname)
-      ?? VISUAL_FONT_ASSETS.get(requestUrl);
-    if (fontAsset) {
-      visualFonts.served.add(requestUrl);
-      route.fulfill({
-        status: 200,
-        contentType: parsedUrl.pathname.endsWith(".woff2") ? "font/woff2" : "font/ttf",
-        path: fontAsset.path,
-      });
-      return;
-    }
+    const fontFile = visualFontFile(parsedUrl.pathname);
+    if (fontFile) visualFonts.served.add(fontFile);
     if (parsedUrl.hostname === "fonts.googleapis.com" || parsedUrl.hostname === "fonts.gstatic.com") {
       visualFonts.unexpectedExternalUrls.push(requestUrl);
       route.fulfill({ status: 502, body: "unexpected external visual font request" });
@@ -374,40 +296,27 @@ async function quietApi(page: any, caseId: string): Promise<VisualFontRouteState
       return;
     }
     // components.members.create-agent.claude-custom-provider-dialog drives
-    // provider-mode -> Custom, but that control only exists once a runtime is
-    // selected — and the runtime select is populated from this endpoint, not from
-    // the case fixture. Without a catalog the select renders empty, nothing is
-    // selectable, provider-mode never mounts, and the setup's first click times
-    // out. That is the whole of this case's long-standing failure.
+    // Provider -> Custom, but that field only exists once a runtime is selected
+    // AND its form has loaded. The runtime select is populated from
+    // `…/runtime-options`, not from the case fixture, and the runtime form is
+    // the protocol v2 one (task #8): the admission row must carry the
+    // `runtimeFormV2` marker, then the form and its option sources load from
+    // `…/runtime-forms/v2/claude[/option-sources/:id]`. Without them the dialog
+    // shows "Runtime configuration is unavailable" and the setup's first click
+    // times out. Served from the real Claude fixtures (runtimeFormV2Mock.ts).
     //
     // Scoped to this one case on purpose: serving a catalog to every case would
     // auto-select a runtime everywhere and change unrelated visual baselines.
-    if (
-      caseId === "components.members.create-agent.claude-custom-provider-dialog"
-      && pathname.endsWith("/runtime-options")
-    ) {
-      const machineId = pathname.split("/machines/")[1]?.split("/")[0] ?? null;
-      route.fulfill({
-        status: 200,
-        contentType: "application/json",
-        body: JSON.stringify({
-          context: "new_agent",
-          machineId,
-          options: [
-            {
-              runtimeId: "claude",
-              capabilityStatus: "available",
-              admissionStatus: "available_for_new",
-              admissionReason: null,
-              current: false,
-              availableForNew: true,
-              manageableForCurrentAgent: false,
-              canSelectInThisContext: true,
-            },
-          ],
-        }),
-      });
-      return;
+    if (caseId === "components.members.create-agent.claude-custom-provider-dialog") {
+      const runtimeForm = runtimeFormV2Response(pathname, [CLAUDE_LIVE]);
+      if (runtimeForm) {
+        route.fulfill({
+          status: runtimeForm.status,
+          contentType: "application/json",
+          body: JSON.stringify(runtimeForm.body),
+        });
+        return;
+      }
     }
     // components.channel.members.add-panel clicks the add-member entry, but that
     // entry is gated on `showAddEntry = !membersLoading && canAddChannelMembers`
@@ -484,12 +393,23 @@ async function quietApi(page: any, caseId: string): Promise<VisualFontRouteState
                 },
               },
               senderAvatarUrl: null,
-              senderGravatarHash: null,
             },
           ],
           threadChannelId: "channel-anchor-1",
           viewer: { canComment: true },
         }),
+      });
+      return;
+    }
+    // The composer asks the server for the upload ceiling on every selection
+    // and keeps a file it can't check as "Not checked" (attachmentUploadLimit.ts).
+    // Answer as a Pro server would: a ceiling far above the fixture files and
+    // no monthly quota, so a picked image previews ready to send.
+    if (pathname.endsWith("/attachments/upload-capabilities")) {
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ maxBytes: 100 * 1024 * 1024, monthlyUpload: null }),
       });
       return;
     }
@@ -510,7 +430,6 @@ async function quietApi(page: any, caseId: string): Promise<VisualFontRouteState
         body: JSON.stringify({
           id: fxOwner.id,
           email: fxOwner.email,
-          gravatarHash: "",
           name: fxOwner.name,
           displayName: fxOwner.displayName,
           description: null,
@@ -557,7 +476,8 @@ async function quietApi(page: any, caseId: string): Promise<VisualFontRouteState
     if (pathname.endsWith("/integrations/marketplace")) {
       // components.settings.integrations.permission-review: the Slack Bridge
       // listing carries a pending outbound-permission revision so the app
-      // detail shows the requested groups plus the reviewer approve action.
+      // detail shows the requested groups waiting for review (decided in App
+      // Admin, so there is no approve action here).
       const pendingPermissionReview = caseId === "components.settings.integrations.permission-review";
       route.fulfill({
         status: 200,
@@ -577,7 +497,6 @@ async function quietApi(page: any, caseId: string): Promise<VisualFontRouteState
             appNotificationReviewPending: pendingPermissionReview,
             appNotificationPendingGroups: pendingPermissionReview ? ["server", "agent"] : null,
             appNotificationPendingEvents: pendingPermissionReview ? ["server.plan_changed"] : null,
-            canReviewAppNotifications: pendingPermissionReview,
           },
           {
             id: "market_github", serverId: fxServer.id, clientId: "client_github_issues",
@@ -660,15 +579,14 @@ async function quietApi(page: any, caseId: string): Promise<VisualFontRouteState
       });
       return;
     }
-    if (pathname.endsWith("/servers/visual-server/members/visual-human-1/profile")) {
+    if (pathname.endsWith(`/servers/${fxServer.id}/members/${fxOwner.id}/profile`)) {
       route.fulfill({
         status: 200,
         contentType: "application/json",
         body: JSON.stringify({
-          userId: fxOwner.memberId,
+          userId: fxOwner.id,
           serverId: fxServer.id,
           email: fxOwner.email,
-          gravatarHash: "",
           name: fxOwner.name,
           displayName: fxOwner.displayName,
           description: fxOwner.description,
@@ -687,10 +605,9 @@ async function quietApi(page: any, caseId: string): Promise<VisualFontRouteState
         contentType: "application/json",
         body: JSON.stringify([
           {
-            userId: fxOwner.memberId,
+            userId: fxOwner.id,
             serverId: fxServer.id,
             email: fxOwner.email,
-            gravatarHash: "",
             name: fxOwner.name,
             displayName: fxOwner.displayName,
             description: fxOwner.description,
@@ -703,7 +620,6 @@ async function quietApi(page: any, caseId: string): Promise<VisualFontRouteState
             userId: fxDesigner.id,
             serverId: fxServer.id,
             email: fxDesigner.email,
-            gravatarHash: "",
             name: fxDesigner.name,
             displayName: fxDesigner.displayName,
             description: fxDesigner.description,
@@ -716,7 +632,6 @@ async function quietApi(page: any, caseId: string): Promise<VisualFontRouteState
             userId: fixtureData.humans.jiacheng.id,
             serverId: fxServer.id,
             email: fixtureData.humans.jiacheng.email,
-            gravatarHash: "",
             name: fixtureData.humans.jiacheng.name,
             displayName: fixtureData.humans.jiacheng.displayName,
             description: fixtureData.humans.jiacheng.description,
@@ -882,7 +797,6 @@ async function quietApi(page: any, caseId: string): Promise<VisualFontRouteState
             name: fxOwner.name,
             displayName: fxOwner.displayName,
             avatarUrl: null,
-            gravatarHash: "",
           },
           createdAgents: agent.createdAgents.map((created: any) => ({
             id: created.id,
@@ -1014,6 +928,13 @@ async function quietApi(page: any, caseId: string): Promise<VisualFontRouteState
       });
       return;
     }
+    if (pathname === "/api/servers/unread-summary" && HOME_CHANNEL_LIST_CASE_IDS.has(caseId)) {
+      // screens.home.channel-list: one server, nothing unread elsewhere, so
+      // the workspace pill carries no other-server dot (the Android fixture
+      // has a single server too).
+      route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify([]) });
+      return;
+    }
     if (pathname === "/api/servers/unread-summary") {
       // Marks the OTHER primed server (visual-alt-server) unread so the
       // titlebar badge shows its pink server-unread dot
@@ -1022,7 +943,15 @@ async function quietApi(page: any, caseId: string): Promise<VisualFontRouteState
         status: 200,
         contentType: "application/json",
         body: JSON.stringify([
-          { serverId: "visual-alt-server", unreadCount: 3, serverPushMuted: false },
+          {
+            serverId: "visual-alt-server",
+            unreadCount: 3,
+            serverPushMuted: false,
+            // The titlebar's other-server dot reads only the Activity count
+            // (hasOtherServerActivityUnread). Scoped to the titlebar board so
+            // other cases priming visual-alt-server keep their captures.
+            ...(caseId === "components.home.titlebar.states" ? { activityUnreadCount: 3 } : {}),
+          },
         ]),
       });
       return;
@@ -1031,10 +960,13 @@ async function quietApi(page: any, caseId: string): Promise<VisualFontRouteState
       // Must mirror the render host's primed useSavedStore state (shared
       // savedMessagesFixture.json) — an empty payload here wiped the saved
       // list the moment SavedPanel's mount effect reconciled (task #334).
+      // The fixture's hasMore makes the panel auto-load the next page; that
+      // page is empty, or the same three rows would append again (6 rows).
+      const isNextPage = Number(parsedUrl.searchParams.get("offset") ?? 0) > 0;
       route.fulfill({
         status: 200,
         contentType: "application/json",
-        body: JSON.stringify(savedMessagesFixture),
+        body: JSON.stringify(isNextPage ? { ...savedMessagesFixture, saved: [], hasMore: false } : savedMessagesFixture),
       });
       return;
     }
@@ -1048,6 +980,25 @@ async function quietApi(page: any, caseId: string): Promise<VisualFontRouteState
         status: 200,
         contentType: "application/json",
         body: JSON.stringify({ tasks: tasksFixture.tasks }),
+      });
+      return;
+    }
+    if (pathname === "/api/channels/threads/followed" && HOME_CHANNEL_LIST_CASE_IDS.has(caseId)) {
+      // Must mirror the render host's primed useThreadStore.followedThreads
+      // (fixtureData.json homeChannelList): the Sidebar's mount-time
+      // loadInbox() reloads followed threads, and an empty answer would drop
+      // the #mobile row's thread count.
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          threads: homeChannelListFollowedThreads(
+            fixtureData.homeChannelList.channels,
+            fxOwner.id,
+            fxTimes.entityCreatedAtIso,
+            fxTimes.recentActivityAtIso,
+          ),
+        }),
       });
       return;
     }
@@ -1342,14 +1293,13 @@ async function quietApi(page: any, caseId: string): Promise<VisualFontRouteState
           ],
           humans: [
             {
-              id: fxOwner.memberId,
-              userId: fxOwner.memberId,
+              id: fxOwner.id,
+              userId: fxOwner.id,
               serverId: fxServer.id,
               name: fxOwner.name,
               displayName: fxOwner.displayName,
               description: fxOwner.description,
               avatarUrl: null,
-              gravatarHash: "",
               email: fxOwner.email,
               role: fxOwner.role,
               joinedAt: fxTimes.memberJoinedAtIso,
@@ -1470,6 +1420,18 @@ async function quietApi(page: any, caseId: string): Promise<VisualFontRouteState
       });
       return;
     }
+    // The Apps tab also lists the server's MCP Apps since #9782, from the Agent's MCP catalogue
+    // (ManagedMcpAgentCatalogResponse in packages/shared/src/managedMcp.ts). The shared fixture
+    // has no MCP Apps, so the catalogue is empty; the catch-all below has no `servers` array,
+    // and the tab crashed on it.
+    if (/^\/api\/mcp\/agents\/[^/]+$/.test(pathname)) {
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ servers: [], recommendations: [] }),
+      });
+      return;
+    }
     // Events are paginated; the integrations list below still returns an array.
     if (/^\/api\/integrations\/agents\/[^/]+\/events$/.test(pathname)) {
       route.fulfill({
@@ -1497,18 +1459,6 @@ async function quietApi(page: any, caseId: string): Promise<VisualFontRouteState
 }
 
 async function seedVisualCase(page: Page, visualCase: VisualCase) {
-  const props = visualCase.variants?.[0]?.props || {};
-  if (visualCase.id === "components.auth.register.inputs") {
-    await page.locator("input[type='email']").fill(String(props.registerEmail || fixtureData.registerForm.email));
-    await page.locator("input[type='password']").fill(String(props.registerPassword || fixtureData.registerForm.password));
-    return;
-  }
-  if (visualCase.id === "screens.auth.profile-setup") {
-    await page.locator("input[name='username']").fill(String(props.profileSetupHandle || "new_designer"));
-    await page.locator("input[name='name']").fill(String(props.profileSetupDisplayName || "New Designer"));
-    return;
-  }
-
   if (visualCase.id === "components.thread.composer.image-preview") {
     // Opaque 128x128 PNG rasterized from the same SVG art the visual file
     // fixtures use (yellow ground, pink sun, black mountain), so the React
@@ -1584,27 +1534,227 @@ async function applyInteractions(page: Page, visualCase: VisualCase) {
 }
 
 async function applyCaseFixtureState(page: Page, visualCase: VisualCase) {
+  if (visualCase.id === "components.home.titlebar.states") {
+    // Each declared state renders in its own iframe of the host (see
+    // HomeTitlebarVisualCaseView); wait until every frame has settled.
+    const frames = page.locator("iframe[data-titlebar-frame]");
+    const count = await frames.count();
+    expect(count).toBeGreaterThan(0);
+    for (let index = 0; index < count; index += 1) {
+      const stateId = await frames.nth(index).getAttribute("data-titlebar-frame");
+      await page
+        .frameLocator(`iframe[data-titlebar-frame='${stateId}']`)
+        .locator("[data-titlebar-state-ready='true']")
+        .waitFor({ state: "attached", timeout: 15_000 });
+    }
+    await page.waitForTimeout(240);
+    return;
+  }
   if (visualCase.id === "components.settings.account.password-expanded") {
-    await page.getByRole("button", { name: "Change Password" }).first().click();
+    await page.getByRole("button", { name: "Change password" }).first().click();
     const submit = page.locator("form button[type='submit']").last();
     await submit.waitFor({ state: "visible" });
     await submit.scrollIntoViewIfNeeded();
     return;
   }
   if (visualCase.id !== "components.members.create-agent.claude-custom-provider-dialog") return;
-  await page.getByTestId("runtime-provider-mode-select").click();
+  // The v2 Claude form (packages/runtime-form/fixtures/claude.form.json):
+  // Provider is an option-source field, so a searchable combobox; Custom reveals
+  // API URL / Authentication / API Key; the Claude Command input sits behind the
+  // form's single "Advanced" disclosure. Placeholders are the form's own copy.
+  await page.getByTestId("runtime-form-v2-provider").click();
   await page.getByRole("option", { name: "Custom", exact: true }).click();
   await page.getByPlaceholder("https://gateway.example.com").fill("https://gateway.example.com");
   await page.getByPlaceholder("sk-ant-...").fill("visual-test-key");
-  // #7207 removed the nested Advanced disclosure: MORE now reveals Reasoning /
-  // MODE / Claude Command / env vars directly, so the Claude Command input is
-  // reachable straight after MORE. The extra Advanced click this used to need
-  // now waits forever on a button that no longer exists.
-  await page.getByRole("button", { name: "More", exact: true }).click();
+  await page.getByRole("button", { name: "Advanced", exact: true }).click();
   await page.getByPlaceholder("claude").fill("claude");
   await page.locator(".fixed.inset-0").evaluate((element) => {
     element.scrollTop = 0;
   });
+}
+
+// Full-length capture (opt-in via sharedCases.json `capture.fullLength`).
+// Shared contract with the Android provider (KmpVisualScreenshotCaptureTest
+// expandToFullLength): find the largest visible vertical scroller that still
+// has content below the fold, grow the viewport by exactly that overflow, and
+// repeat until nothing overflows (or the cap is hit). Fixed chrome (header,
+// tabs, composer, bottom bar) keeps its real top/bottom position, like a phone
+// long screenshot; a case with no overflowing scroller stays one screen. The
+// case root counts as a scroller when it clips its content (see below).
+// Heights are CSS px == dp, so equal layouts give equal image heights.
+const FULL_LENGTH_DEFAULT_MAX_HEIGHT = 2700;
+const FULL_LENGTH_MAX_ITERATIONS = 6;
+
+type FullLengthResult = {
+  requested: true;
+  baseViewportHeight: number;
+  expandedViewportHeight: number;
+  initialOverflowPx: number;
+  residualOverflowPx: number;
+  iterations: number;
+  capped: boolean;
+  maxHeight: number;
+  scroller: string | null;
+};
+
+function fullLengthMaxHeight(visualCase: VisualCase): number | null {
+  const flag = visualCase.capture?.fullLength;
+  if (!flag) return null;
+  if (typeof flag === "object" && Number.isFinite(flag.maxHeight) && Number(flag.maxHeight) > 0) {
+    return Number(flag.maxHeight);
+  }
+  return FULL_LENGTH_DEFAULT_MAX_HEIGHT;
+}
+
+async function measureMainScrollerOverflow(page: Page, selector: string) {
+  return page.evaluate((sel) => {
+    const root = document.querySelector<HTMLElement>(sel);
+    const scope = root || document.body;
+    const viewportHeight = window.innerHeight;
+    const viewportWidth = window.innerWidth;
+    let best: { overflow: number; area: number; describe: string } | null = null;
+    for (const el of [scope, ...Array.from(scope.querySelectorAll<HTMLElement>("*"))]) {
+      const overflowY = getComputedStyle(el).overflowY;
+      const isScroller = overflowY === "auto" || overflowY === "scroll" || overflowY === "overlay";
+      // The case root itself counts when it CLIPS content: most render-host
+      // wrappers are `height: 844; overflow: hidden` blocks whose flex-1 panels
+      // are never height-constrained, so the page is cut at 844 instead of
+      // scrolling inside its own scroller (a phone would scroll it).
+      const isClippingRoot = el === root && (overflowY === "hidden" || overflowY === "clip");
+      if (!isScroller && !isClippingRoot) continue;
+      // Content outside the scroller's viewport, above OR below the fold: a
+      // bottom-anchored message list (scrolled to the newest message, or a
+      // column-reverse container) hides its history ABOVE the fold. Growing the
+      // viewport reveals it upward while the header stays on top and the
+      // composer at the bottom, like Android's reverseLayout list.
+      const overflow = el.scrollHeight - el.clientHeight;
+      if (overflow <= 1) continue;
+      const maxScroll = el.scrollHeight - el.clientHeight;
+      const bottomAnchored =
+        (el.scrollTop > 0 && el.scrollTop >= maxScroll - 2) || getComputedStyle(el).flexDirection === "column-reverse";
+      if (bottomAnchored) el.setAttribute("data-vt-full-length-bottom-anchored", "1");
+      const rect = el.getBoundingClientRect();
+      const visibleWidth = Math.min(rect.right, viewportWidth) - Math.max(rect.left, 0);
+      const visibleHeight = Math.min(rect.bottom, viewportHeight) - Math.max(rect.top, 0);
+      if (visibleWidth <= 0 || visibleHeight <= 0) continue;
+      const area = visibleWidth * visibleHeight;
+      if (!best || area > best.area) {
+        const testId = el.getAttribute("data-testid");
+        const describe = `${el.tagName.toLowerCase()}${testId ? `[data-testid=${testId}]` : ""}${
+          typeof el.className === "string" && el.className ? `.${el.className.trim().split(/\s+/).slice(0, 4).join(".")}` : ""
+        }`;
+        best = { overflow: Math.ceil(el.scrollHeight - el.clientHeight), area, describe };
+      }
+    }
+    // A content-sized case root (no scroller of its own, e.g. the tasks panel
+    // wrapper) that runs past the fold makes the document scroll instead. Its
+    // overflow is how far the root's bottom edge sits below the viewport.
+    if (root && root !== document.body) {
+      const rect = root.getBoundingClientRect();
+      const rootOverflow = Math.ceil(rect.bottom - viewportHeight);
+      const visibleWidth = Math.min(rect.right, viewportWidth) - Math.max(rect.left, 0);
+      const visibleHeight = Math.min(rect.bottom, viewportHeight) - Math.max(rect.top, 0);
+      const area = visibleWidth * visibleHeight;
+      if (rootOverflow > 1 && visibleWidth > 0 && visibleHeight > 0 && (!best || area >= best.area)) {
+        best = { overflow: rootOverflow, area, describe: `document (case root bottom ${Math.round(rect.bottom)})` };
+      }
+    }
+    return best;
+  }, selector);
+}
+
+// Measure until two reads 400ms apart agree: route content (member detail,
+// settings tabs) can still be streaming in when the capture's settle wait
+// ends, and a measure taken against the half-rendered page reported "nothing
+// to scroll" for some agent-profile cases in run 41606353258 while the same
+// case grew to 1543px in the run before.
+async function measureStableOverflow(page: Page, selector: string) {
+  // "Nothing to scroll" must hold for four reads (1.2s), since that is the
+  // answer a still-loading page gives.
+  let previous = await measureMainScrollerOverflow(page, selector);
+  let agreeing = 0;
+  for (let attempt = 0; attempt < 12; attempt += 1) {
+    await page.waitForTimeout(400);
+    const next = await measureMainScrollerOverflow(page, selector);
+    agreeing = (next?.overflow ?? 0) === (previous?.overflow ?? 0) ? agreeing + 1 : 0;
+    previous = next;
+    if (agreeing >= (next ? 1 : 3)) return next;
+  }
+  return previous;
+}
+
+async function expandToFullLength(page: Page, selector: string, visualCase: VisualCase): Promise<FullLengthResult | null> {
+  const maxHeight = fullLengthMaxHeight(visualCase);
+  if (maxHeight == null) return null;
+  const size = page.viewportSize() || { width: 390, height: 844 };
+  const base = size.height;
+  let height = base;
+  let initialOverflow = 0;
+  let residual = 0;
+  let capped = false;
+  let iterations = 0;
+  let scroller: string | null = null;
+  for (; iterations < FULL_LENGTH_MAX_ITERATIONS; iterations += 1) {
+    const measured = await measureStableOverflow(page, selector);
+    if (!measured) {
+      residual = 0;
+      break;
+    }
+    if (iterations === 0) initialOverflow = measured.overflow;
+    scroller = scroller || measured.describe;
+    residual = measured.overflow;
+    const next = Math.min(maxHeight, height + measured.overflow);
+    if (next <= height) {
+      capped = true;
+      break;
+    }
+    // The render host pins case roots to the viewport with an inline pixel
+    // height (style={{ height: 844 }}); grow any element pinned that way with
+    // the viewport so the page itself, not just the window, gets taller.
+    await page.evaluate(({ sel, from, to }) => {
+      const root = document.querySelector<HTMLElement>(sel) || document.body;
+      for (const el of [root, ...Array.from(root.querySelectorAll<HTMLElement>("*"))]) {
+        if (el.style.height === `${from}px`) el.style.height = `${to}px`;
+        if (el.style.maxHeight === `${from}px`) el.style.maxHeight = `${to}px`;
+        if (el.style.minHeight === `${from}px`) el.style.minHeight = `${to}px`;
+      }
+    }, { sel: selector, from: height, to: next });
+    height = next;
+    await page.setViewportSize({ width: size.width, height });
+    await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(() => r(null)))));
+    await page.waitForTimeout(150);
+  }
+  if (height !== base) {
+    // Scrollers that no longer overflow have nothing to reset; one that still
+    // does (capped) goes back to its start like a long screenshot: the top for
+    // a normal page, the newest message for a bottom-anchored list (Android's
+    // reversed list scrolls to index 0, which is the same message).
+    await page.evaluate((sel) => {
+      const root = document.querySelector<HTMLElement>(sel) || document.body;
+      for (const el of [root, ...Array.from(root.querySelectorAll<HTMLElement>("*"))]) {
+        if (el.getAttribute("data-vt-full-length-bottom-anchored") === "1") {
+          if (getComputedStyle(el).flexDirection === "column-reverse") el.scrollTop = 0;
+          else el.scrollTop = el.scrollHeight;
+        } else if (el.scrollTop > 0) {
+          el.scrollTop = 0;
+        }
+      }
+    }, selector);
+  }
+  console.log(
+    `full-length case=${visualCase.id} base=${base} expanded=${height} initialOverflow=${initialOverflow} residual=${residual} iterations=${iterations} capped=${capped} scroller=${scroller}`,
+  );
+  return {
+    requested: true,
+    baseViewportHeight: base,
+    expandedViewportHeight: height,
+    initialOverflowPx: initialOverflow,
+    residualOverflowPx: residual,
+    iterations,
+    capped,
+    maxHeight,
+    scroller,
+  };
 }
 
 async function assertVisualFontsReady(page: Page, visualFonts: VisualFontRouteState) {
@@ -1637,15 +1787,9 @@ async function assertVisualFontsReady(page: Page, visualFonts: VisualFontRouteSt
   });
 
   expect(visualFonts.unexpectedExternalUrls).toEqual([]);
-  // The app's font CSS import is raft-ui's (index.css `@import "raft-ui/fonts.css"`);
-  // the legacy Space Grotesk URL stays in GOOGLE_FONT_CSS_URLS for other surfaces.
-  expect(visualFonts.served.has(RAFT_UI_FONT_CSS_URL)).toBe(true);
-  for (const assetUrl of VISUAL_FONT_ASSETS.keys()) {
-    const served = assetUrl.startsWith("/")
-      ? [...visualFonts.served].some((url) => new URL(url).pathname === assetUrl)
-      : visualFonts.served.has(assetUrl);
-    expect(served).toBe(true);
-  }
+  // Every face the web's fonts.css declares is requested (unicode-range only
+  // loads a subset whose characters render, and the probes above load each).
+  expect([...visualFonts.served].sort()).toEqual([...VISUAL_FONT_FILES].sort());
   for (const face of faces) {
     expect(face.computedFamily).toContain(face.family);
     expect(face.loadedStatuses.length).toBeGreaterThan(0);
@@ -1653,166 +1797,197 @@ async function assertVisualFontsReady(page: Page, visualFonts: VisualFontRouteSt
   }
 }
 
+// Let every finite running animation and transition (a sheet's slide-in, a
+// dialog's fade) reach its end before anything is measured or captured. The
+// fixed 120ms wait above is shorter than raft-ui's sheet entry, so a dialog case
+// (create-channel, create-agent) was captured a few pixels short of its resting
+// place, by a different amount each run. Infinite ones (spinners, the working
+// pulse) never finish and are left running; capped at 2s.
+async function settleFiniteAnimations(page: Page) {
+  await page.evaluate(async () => {
+    const finite = document.getAnimations().filter((animation) => {
+      const end = animation.effect?.getComputedTiming().endTime;
+      return animation.playState === "running" && typeof end === "number" && Number.isFinite(end);
+    });
+    await Promise.race([
+      Promise.all(finite.map((animation) => animation.finished.catch(() => undefined))),
+      new Promise((resolve) => setTimeout(resolve, 2_000)),
+    ]);
+    await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+  });
+}
+
+// Below the width where the app and the web go wide (the app at 744dp, the web's
+// `md` at 768px) a case is a phone screen: capture it as a phone browser renders
+// it, a touch screen with a coarse pointer and no hover (`hasTouch`, `isMobile`)
+// at the case's density. Without that every `pointer-coarse:` / `(hover: none)`
+// style (44px rows and hit areas, touch control sizes) was drawn with its
+// desktop mouse value and compared against the apps' touch layout. Wider cases
+// stay a desktop: fine pointer, hover.
+const PHONE_MAX_WIDTH = 743;
+
+function touchContextFor(visualCase: VisualCase) {
+  const viewport = visualCase.viewport || { width: 390, height: 844, density: 1 };
+  const phone = viewport.width <= PHONE_MAX_WIDTH;
+  return {
+    hasTouch: phone,
+    isMobile: phone,
+    ...(phone && viewport.density ? { deviceScaleFactor: viewport.density } : {}),
+  };
+}
+
 for (const visualCase of cases) {
-  test(`react visual provider ${visualCase.id}`, async ({ page }) => {
-    page.on("console", (message: any) => {
-      if (message.type() === "error") {
-        console.log(`browser console error: ${message.text()}`);
-      }
-    });
-    page.on("pageerror", (error: Error) => {
-      console.log(`browser pageerror: ${error.message}`);
-    });
-    const visualFonts = await quietApi(page, visualCase.id);
-    // Every case renders against the fixture's declared instant, like the Android
-    // visual host does (VisualFixtureData.Locale.NOW_EPOCH_MILLIS). Without this,
-    // relative labels ("75 days ago" on screens.members.agent-detail.reminders)
-    // drift with the CI wall clock and the cell can never be stable (task #536, S1).
-    // billing.trial keeps its own instant below: its fixture is built around it.
-    const fixtureNowEpochMillis = Number(fixtureData.locale?.nowEpochMillis);
-    if (!Number.isFinite(fixtureNowEpochMillis)) {
-      throw new Error("visual-testing/shared/fixtureData.json must declare locale.nowEpochMillis");
-    }
-    if (visualCase.id !== "components.settings.billing.trial") {
-      await page.clock.setFixedTime(new Date(fixtureNowEpochMillis));
-    }
-    if (visualCase.id === "components.settings.billing.trial") {
-      await page.clock.setFixedTime(new Date("2026-05-15T12:00:00.000Z"));
-      await page.addInitScript(() => {
-        const fixed = new Date("2026-05-15T12:00:00.000Z").getTime();
-        const RealDate = Date;
-        class FixedDate extends RealDate {
-          constructor(...args: ConstructorParameters<DateConstructor>) {
-            super(...(args.length ? args : [fixed]));
-          }
-          static now() {
-            return fixed;
-          }
+  test.describe(() => {
+  test.use(touchContextFor(visualCase));
+    test(`react visual provider ${visualCase.id}`, async ({ page }) => {
+      page.on("console", (message: any) => {
+        if (message.type() === "error") {
+          console.log(`browser console error: ${message.text()}`);
         }
-        FixedDate.UTC = RealDate.UTC;
-        FixedDate.parse = RealDate.parse;
-        FixedDate.prototype = RealDate.prototype;
-        window.Date = FixedDate as DateConstructor;
-        globalThis.Date = FixedDate as DateConstructor;
       });
-    }
-    const viewport = visualCase.viewport || { width: 390, height: 844, density: 1 };
-    await page.setViewportSize({ width: viewport.width, height: viewport.height });
-    await page.goto(caseUrl(visualCase));
-    await assertVisualFontsReady(page, visualFonts);
-    // The render host shows an explicit panel for unregistered case ids.
-    // Fail here so body/viewport-selector cases cannot screenshot it as a
-    // plausible-looking baseline.
-    const unknownCase = page.locator("[data-visual-unknown-case]");
-    if ((await unknownCase.count()) > 0) {
-      const reported = await unknownCase.first().getAttribute("data-visual-unknown-case");
-      throw new Error(
-        `render host does not recognize case id '${visualCase.id}' (reported '${reported}'); register it in VisualTestingCases.tsx before capturing`,
-      );
-    }
-    await seedVisualCase(page, visualCase);
-    await applyInteractions(page, visualCase);
-    await applyCaseFixtureState(page, visualCase);
-    await page.waitForTimeout(120);
+      page.on("pageerror", (error: Error) => {
+        console.log(`browser pageerror: ${error.message}`);
+      });
+      const visualFonts = await quietApi(page, visualCase.id);
+      // Every case renders against the fixture's declared instant, like the Android
+      // visual host does (VisualFixtureData.Locale.NOW_EPOCH_MILLIS). Without this,
+      // relative labels ("75 days ago" on screens.members.agent-detail.reminders)
+      // drift with the CI wall clock and the cell can never be stable (task #536, S1).
+      const fixtureNowEpochMillis = Number(fixtureData.locale?.nowEpochMillis);
+      if (!Number.isFinite(fixtureNowEpochMillis)) {
+        throw new Error("visual-testing/shared/fixtureData.json must declare locale.nowEpochMillis");
+      }
+      await page.clock.setFixedTime(new Date(fixtureNowEpochMillis));
+      const viewport = visualCase.viewport || { width: 390, height: 844, density: 1 };
+      await page.setViewportSize({ width: viewport.width, height: viewport.height });
+      // components.thread.forward-modal relies on the phone context above: (hover: none),
+      // so the target picker opens without focusing its search (#12083).
+      await page.goto(caseUrl(visualCase));
+      await assertVisualFontsReady(page, visualFonts);
+      // The render host shows an explicit panel for unregistered case ids.
+      // Fail here so body/viewport-selector cases cannot screenshot it as a
+      // plausible-looking baseline.
+      const unknownCase = page.locator("[data-visual-unknown-case]");
+      if ((await unknownCase.count()) > 0) {
+        const reported = await unknownCase.first().getAttribute("data-visual-unknown-case");
+        throw new Error(
+          `render host does not recognize case id '${visualCase.id}' (reported '${reported}'); register it in VisualTestingCases.tsx before capturing`,
+        );
+      }
+      await seedVisualCase(page, visualCase);
+      await applyInteractions(page, visualCase);
+      await applyCaseFixtureState(page, visualCase);
+      await page.waitForTimeout(120);
+      await settleFiniteAnimations(page);
 
-    const selector = visualCase.capture?.selector || `[data-visual-case='${visualCase.id}']`;
-    const target = page.locator(selector).first();
-    if ((await target.count()) === 0) {
-      const visualCount = await page.locator("[data-visual-case]").count();
-      const html = await page.locator("body").evaluate((body) => body.innerHTML.slice(0, 500));
-      console.log(`visual provider debug case=${visualCase.id} url=${page.url()} visualCount=${visualCount} body=${html}`);
-    }
-    await expect(target).toBeVisible();
+      const selector = visualCase.capture?.selector || `[data-visual-case='${visualCase.id}']`;
+      const target = page.locator(selector).first();
+      if ((await target.count()) === 0) {
+        const visualCount = await page.locator("[data-visual-case]").count();
+        const html = await page.locator("body").evaluate((body) => body.innerHTML.slice(0, 500));
+        console.log(`visual provider debug case=${visualCase.id} url=${page.url()} visualCount=${visualCount} body=${html}`);
+      }
+      await expect(target).toBeVisible();
 
-    const outputDir = resolve(resultRoot, "react");
-    mkdirSync(outputDir, { recursive: true });
-    const imagePath = resolve(outputDir, `${visualCase.id}.png`);
-    const captureContract = visualCase.capture?.contract || "component-bounds";
-    const isViewportPortalCapture = captureContract === "viewport-with-portal";
-    // full-height is the sanctioned exception to the viewport-clamp parity
-    // contract below: it captures the WHOLE scrollable route at content height
-    // (390 wide, height follows content) to pair with the Android eager
-    // full-height capture (task #388) that renders every item beyond the
-    // viewport. Normal captures stay clamped because android cannot render
-    // beyond its viewport.
-    const isFullHeightCapture = captureContract === "full-height";
-    // Parity contract: the diff engine pads and never rescales, so react
-    // captures must not exceed the android-capturable window (android cannot
-    // render beyond its viewport). Element screenshots capture the full
-    // bounding box even when it overflows the viewport, so clamp them to the
-    // viewport intersection; element crops within the viewport keep the
-    // existing element-screenshot behavior unchanged.
-    let clampedRect: { x: number; y: number; width: number; height: number } | null = null;
-    if (!isViewportPortalCapture && !isFullHeightCapture) {
-      const box = await target.boundingBox();
-      const viewportSize = page.viewportSize() || { width: viewport.width, height: viewport.height };
-      if (box && (box.x < 0 || box.y < 0 || box.x + box.width > viewportSize.width || box.y + box.height > viewportSize.height)) {
-        const x = Math.max(box.x, 0);
-        const y = Math.max(box.y, 0);
-        const width = Math.min(box.x + box.width, viewportSize.width) - x;
-        const height = Math.min(box.y + box.height, viewportSize.height) - y;
-        if (width > 0 && height > 0) {
-          clampedRect = { x, y, width, height };
+      const outputDir = resolve(resultRoot, "react");
+      mkdirSync(outputDir, { recursive: true });
+      const imagePath = resolve(outputDir, `${visualCase.id}.png`);
+      const captureContract = visualCase.capture?.contract || "component-bounds";
+      // Grow the viewport to content height BEFORE the clamp below reads it, so
+      // every contract (element, viewport-with-portal, body) captures the long
+      // page with the same code path as a one-screen capture.
+      const fullLength = await expandToFullLength(page, selector, visualCase);
+      const captureViewport = fullLength
+        ? { ...viewport, height: fullLength.expandedViewportHeight }
+        : viewport;
+      const isViewportPortalCapture = captureContract === "viewport-with-portal";
+      // full-height is the sanctioned exception to the viewport-clamp parity
+      // contract below: it captures the WHOLE scrollable route at content height
+      // (390 wide, height follows content) to pair with the Android eager
+      // full-height capture (task #388) that renders every item beyond the
+      // viewport. Normal captures stay clamped because android cannot render
+      // beyond its viewport.
+      const isFullHeightCapture = captureContract === "full-height";
+      // Parity contract: the diff engine pads and never rescales, so react
+      // captures must not exceed the android-capturable window (android cannot
+      // render beyond its viewport). Element screenshots capture the full
+      // bounding box even when it overflows the viewport, so clamp them to the
+      // viewport intersection; element crops within the viewport keep the
+      // existing element-screenshot behavior unchanged.
+      let clampedRect: { x: number; y: number; width: number; height: number } | null = null;
+      if (!isViewportPortalCapture && !isFullHeightCapture) {
+        const box = await target.boundingBox();
+        const viewportSize = page.viewportSize() || { width: captureViewport.width, height: captureViewport.height };
+        if (box && (box.x < 0 || box.y < 0 || box.x + box.width > viewportSize.width || box.y + box.height > viewportSize.height)) {
+          const x = Math.max(box.x, 0);
+          const y = Math.max(box.y, 0);
+          const width = Math.min(box.x + box.width, viewportSize.width) - x;
+          const height = Math.min(box.y + box.height, viewportSize.height) - y;
+          if (width > 0 && height > 0) {
+            clampedRect = { x, y, width, height };
+          }
         }
       }
-    }
-    let fullHeightPx: number | null = null;
-    if (isFullHeightCapture) {
-      // Let the layout settle at full content height before measuring/capturing.
-      await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => r(null))));
-      fullHeightPx = await page.evaluate(() =>
-        Math.ceil(
-          Math.max(
-            document.documentElement.scrollHeight,
-            document.body ? document.body.scrollHeight : 0,
+      let fullHeightPx: number | null = null;
+      if (isFullHeightCapture) {
+        // Let the layout settle at full content height before measuring/capturing.
+        await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => r(null))));
+        fullHeightPx = await page.evaluate(() =>
+          Math.ceil(
+            Math.max(
+              document.documentElement.scrollHeight,
+              document.body ? document.body.scrollHeight : 0,
+            ),
           ),
+        );
+      }
+      if (isFullHeightCapture) {
+        await page.screenshot({ path: imagePath, fullPage: true });
+      } else if (isViewportPortalCapture) {
+        await page.screenshot({ path: imagePath });
+      } else if (clampedRect) {
+        await page.screenshot({ path: imagePath, clip: clampedRect });
+      } else {
+        await target.screenshot({ path: imagePath });
+      }
+      const rect = isFullHeightCapture
+        ? { x: 0, y: 0, width: viewport.width, height: fullHeightPx ?? viewport.height }
+        : isViewportPortalCapture
+          ? { x: 0, y: 0, width: captureViewport.width, height: captureViewport.height }
+          : clampedRect || (await target.boundingBox());
+      const roundedRect = rect
+        ? {
+            x: Math.round(rect.x),
+            y: Math.round(rect.y),
+            width: Math.round(rect.width),
+            height: Math.round(rect.height),
+          }
+        : null;
+      writeFileSync(
+        resolve(outputDir, `${visualCase.id}.metadata.json`),
+        JSON.stringify(
+          {
+            provider: "react",
+            providerType: "react-playwright",
+            caseId: visualCase.id,
+            image: `visual-testing-results/react/${visualCase.id}.png`,
+            viewport,
+            captureViewport,
+            selector,
+            crop: {
+              mode: visualCase.capture?.crop || "element",
+              contract: captureContract,
+              rect: roundedRect,
+              targetRect: roundedRect,
+              outset: null,
+            },
+            fullLength,
+            capturedAt: new Date().toISOString(),
+          },
+          null,
+          2,
         ),
       );
-    }
-    if (isFullHeightCapture) {
-      await page.screenshot({ path: imagePath, fullPage: true });
-    } else if (isViewportPortalCapture) {
-      await page.screenshot({ path: imagePath });
-    } else if (clampedRect) {
-      await page.screenshot({ path: imagePath, clip: clampedRect });
-    } else {
-      await target.screenshot({ path: imagePath });
-    }
-    const rect = isFullHeightCapture
-      ? { x: 0, y: 0, width: viewport.width, height: fullHeightPx ?? viewport.height }
-      : isViewportPortalCapture
-        ? { x: 0, y: 0, width: viewport.width, height: viewport.height }
-        : clampedRect || (await target.boundingBox());
-    const roundedRect = rect
-      ? {
-          x: Math.round(rect.x),
-          y: Math.round(rect.y),
-          width: Math.round(rect.width),
-          height: Math.round(rect.height),
-        }
-      : null;
-    writeFileSync(
-      resolve(outputDir, `${visualCase.id}.metadata.json`),
-      JSON.stringify(
-        {
-          provider: "react",
-          providerType: "react-playwright",
-          caseId: visualCase.id,
-          image: `visual-testing-results/react/${visualCase.id}.png`,
-          viewport,
-          selector,
-          crop: {
-            mode: visualCase.capture?.crop || "element",
-            contract: captureContract,
-            rect: roundedRect,
-            targetRect: roundedRect,
-            outset: null,
-          },
-          capturedAt: new Date().toISOString(),
-        },
-        null,
-        2,
-      ),
-    );
+    });
   });
 }

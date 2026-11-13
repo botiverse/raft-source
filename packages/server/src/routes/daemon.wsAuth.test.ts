@@ -20,6 +20,11 @@ import {
 } from "../services/computerCredentialService";
 import argon2 from "argon2";
 import type { AgentOrchestrator } from "../services/agentOrchestrator";
+import {
+  MACHINE_CONNECT_FAILURES_PER_ADDRESS_MAX,
+  MACHINE_CONNECT_RATE_LIMIT_MAX,
+  __resetMachineConnectRateLimitForTests,
+} from "../services/machineConnectRateLimit";
 
 
 // task #88 (#wg-raft-computer 2026-06-05): pins the /daemon/connect auth
@@ -67,9 +72,17 @@ const capturingTracer = {
   },
 };
 
+// Task #374: which machine ids the stub treats as held duplicates.
+const heldDuplicateMachineIds = new Set<string>();
+const handshakeHoldChecks: string[] = [];
+
 const noopOrchestrator = {
   registerMachine: async (...args: unknown[]) => {
     registeredPrincipalKinds.push(String(args[4] ?? "unknown"));
+  },
+  refuseHeldDuplicateAtHandshake: async (machineId: string) => {
+    handshakeHoldChecks.push(machineId);
+    return heldDuplicateMachineIds.has(machineId);
   },
   handleMachineMessage: async () => {},
   handleMachineDisconnect: async () => {},
@@ -190,6 +203,11 @@ beforeAll(async () => {
   port = typeof addr === "object" && addr ? addr.port : 0;
 });
 
+// Every test starts with fresh connect budgets (they are per key and per address).
+beforeEach(() => {
+  __resetMachineConnectRateLimitForTests();
+});
+
 afterAll(async () => {
   await new Promise<void>((resolve) => httpServer.close(() => resolve()));
   // The exception test below deliberately closes the DB to force a query
@@ -239,6 +257,36 @@ test("revoked computer attachment → 401 computer_revoked", async () => {
   assert.equal(res.status, 401);
   assert.equal(res.reason, "computer_revoked");
   assertRejectSpanContract("computer_revoked", "computer_lookup");
+});
+
+test("a revoked key's rejection is remembered: the next attempt gets the same 401 without verifying; an unlinked one is not remembered", async () => {
+  const userId = await seedUser();
+  const server = await createRaftServer("Cache Co", `ws-cache-${randomUUID()}`, userId);
+  const { machine } = await registerMachine(server.id, userId, "m");
+  const revoked = await generateComputerApiKeyMaterial();
+  await getDb().insert(computers).values({
+    serverId: server.id, name: "cached-revoked", apiKeyHash: revoked.apiKeyHash, apiKeyPrefix: revoked.apiKeyPrefix,
+    attachedByUserId: userId, machineId: machine.id, revokedAt: new Date(),
+  });
+  const first = await attemptConnect(revoked.apiKey);
+  assert.equal(first.reason, "computer_revoked");
+  assert.equal(lastSpan().endAttrs?.rejection_cached, undefined);
+  assert.equal(lastSpan().endAttrs?.argon2_verify_count, 1, "the first rejection verifies");
+  const second = await attemptConnect(revoked.apiKey);
+  assert.equal(second.status, 401);
+  assert.equal(second.reason, "computer_revoked", "the daemon sees the same answer");
+  assertRejectSpanContract("computer_revoked", "computer_lookup");
+  assert.equal(lastSpan().endAttrs?.rejection_cached, true);
+  assert.equal(lastSpan().endAttrs?.argon2_verify_count, 0, "no verify for a remembered rejection");
+
+  const unlinked = await generateComputerApiKeyMaterial();
+  await getDb().insert(computers).values({
+    serverId: server.id, name: "cached-unlinked", apiKeyHash: unlinked.apiKeyHash, apiKeyPrefix: unlinked.apiKeyPrefix,
+    attachedByUserId: userId, machineId: null,
+  });
+  assert.equal((await attemptConnect(unlinked.apiKey)).reason, "computer_machine_unlinked");
+  assert.equal((await attemptConnect(unlinked.apiKey)).reason, "computer_machine_unlinked");
+  assert.equal(lastSpan().endAttrs?.rejection_cached, undefined, "a machine can be linked again, so it is verified every time");
 });
 
 test("same prefix but non-verifying key → 401 computer_key_hash_mismatch", async () => {
@@ -401,6 +449,46 @@ test("valid computer attachment → 101 accepted; span carries ids, never the ke
   assert.equal(typeof span.startAttrs.api_key_fingerprint, "string");
 });
 
+// Task #374: a held duplicate must be refused before the upgrade. A daemon
+// resets its reconnect backoff when a socket opens, so an after-open close
+// makes an old daemon retry at once; a rejected handshake never opens.
+test("task #374: a held duplicate machine is refused with 409 before the upgrade and never registers", async () => {
+  const userId = await seedUser();
+  const server = await createRaftServer("Dup Co", `ws-dup-${randomUUID()}`, userId);
+  await addMember(server.id, userId, "owner");
+  const { machine } = await registerMachine(server.id, userId, "dup-m");
+  const mat = await generateComputerApiKeyMaterial();
+  await getDb().insert(computers).values({
+    serverId: server.id,
+    name: "dup-box",
+    apiKeyHash: mat.apiKeyHash,
+    apiKeyPrefix: mat.apiKeyPrefix,
+    attachedByUserId: userId,
+    machineId: machine.id,
+  });
+  heldDuplicateMachineIds.add(machine.id);
+  const registeredBefore = registeredPrincipalKinds.length;
+  try {
+    const res = await attemptConnect(mat.apiKey);
+    assert.equal(res.status, 409);
+    assert.equal(res.reason, "duplicate_machine_connection_held");
+    assert.notEqual(res.open, true, "the socket never opens, so the daemon's backoff is not reset");
+    assert.equal(registeredPrincipalKinds.length, registeredBefore, "nothing is registered or replaced");
+    assert.ok(handshakeHoldChecks.includes(machine.id));
+    const span = lastSpan();
+    assert.equal(span.endAttrs?.outcome, "refused");
+    assert.equal(span.endAttrs?.reason, "duplicate_machine_connection_held");
+    assert.equal(span.endAttrs?.machine_id, machine.id);
+    assert.doesNotMatch(JSON.stringify(span), new RegExp(mat.apiKey));
+  } finally {
+    heldDuplicateMachineIds.delete(machine.id);
+  }
+
+  // Control: once the hold is gone the same key upgrades normally.
+  const ok = await attemptConnect(mat.apiKey);
+  assert.equal(ok.open, true);
+});
+
 test("argon2 cost on the auth span: 0 when no candidate, 1 on a legacy key's first connect, 0 from the auth cache", async () => {
   const userId = await seedUser();
   const server = await createRaftServer("Argon2 Cost Co", `ws-a2-${randomUUID()}`, userId);
@@ -459,6 +547,79 @@ test("task #1268: the accepted 101 response carries Raft-Server-Capabilities wit
   assert.deepEqual([...headerCaps].sort(), [...(context.capabilities ?? [])].sort(), "header and machine:context declare the same list");
 });
 
+async function seedLiveComputerKey(label: string): Promise<{ apiKey: string; machineId: string }> {
+  const userId = await seedUser();
+  const server = await createRaftServer(`Loop ${label}`, `ws-loop-${label}-${randomUUID()}`, userId);
+  await addMember(server.id, userId, "owner");
+  const { machine } = await registerMachine(server.id, userId, `loop-${label}`);
+  const mat = await generateComputerApiKeyMaterial();
+  await getDb().insert(computers).values({
+    serverId: server.id, name: `loop-${label}`, apiKeyHash: mat.apiKeyHash, apiKeyPrefix: mat.apiKeyPrefix,
+    attachedByUserId: userId, machineId: machine.id,
+  });
+  return { apiKey: mat.apiKey, machineId: machine.id };
+}
+
+test("2026-10-20 incident: two daemons sharing one key in a reconnect loop are capped before any credential work", async () => {
+  const { apiKey } = await seedLiveComputerKey("pair");
+  const argon2Before = spans.filter((span) => span.name === "server.daemon.connect.auth" && (span.endAttrs?.argon2_verify_count as number) > 0).length;
+  // Two daemons on one host kick each other off and reconnect at once: 40 attempts back to back.
+  const results: ConnectResult[] = [];
+  for (let attempt = 0; attempt < 40; attempt += 1) results.push(await attemptConnect(apiKey));
+  const opened = results.filter((result) => result.open).length;
+  const limited = results.filter((result) => result.status === 429);
+  assert.equal(opened, MACHINE_CONNECT_RATE_LIMIT_MAX, "only the window's budget reaches the server");
+  assert.equal(limited.length, 40 - MACHINE_CONNECT_RATE_LIMIT_MAX);
+  assert.ok(limited.every((result) => result.reason === "connect_rate_limited"));
+  const limitedSpans = spans.filter((span) => span.name === "server.daemon.connect.auth" && span.endAttrs?.outcome === "rate_limited");
+  assert.ok(limitedSpans.length >= limited.length);
+  assert.ok(limitedSpans.every((span) => span.endAttrs?.argon2_verify_count === undefined), "a refused attempt never verifies the key");
+  const argon2After = spans.filter((span) => span.name === "server.daemon.connect.auth" && (span.endAttrs?.argon2_verify_count as number) > 0).length;
+  assert.ok(argon2After - argon2Before <= MACHINE_CONNECT_RATE_LIMIT_MAX, "argon2 runs at most once per admitted attempt");
+
+  // Another machine's key is unaffected by this key's loop.
+  const other = await seedLiveComputerKey("other");
+  assert.equal((await attemptConnect(other.apiKey)).open, true);
+});
+
+test("429 carries Retry-After; random keys from one address are capped by failed verifications", async () => {
+  // Random, invalid keys: each a fresh key budget, so only the failure budget stops them.
+  const statuses: number[] = [];
+  let retryAfter: string | undefined;
+  for (let attempt = 0; attempt < MACHINE_CONNECT_FAILURES_PER_ADDRESS_MAX + 5; attempt += 1) {
+    const res = await new Promise<{ status: number; retryAfter?: string }>((resolve) => {
+      const ws = new WebSocket(`ws://127.0.0.1:${port}/daemon/connect`, { headers: { Authorization: `Bearer sk_computer_${randomUUID().replace(/-/g, "")}` } });
+      ws.on("unexpected-response", (_req, response) => {
+        const value = response.headers["retry-after"];
+        response.resume();
+        ws.terminate();
+        resolve({ status: response.statusCode ?? 0, retryAfter: Array.isArray(value) ? value[0] : value });
+      });
+      ws.on("open", () => { ws.close(); resolve({ status: 101 }); });
+      ws.on("error", () => {});
+    });
+    statuses.push(res.status);
+    if (res.status === 429) retryAfter = res.retryAfter;
+  }
+  assert.equal(statuses.filter((status) => status === 401).length, MACHINE_CONNECT_FAILURES_PER_ADDRESS_MAX);
+  assert.equal(statuses.filter((status) => status === 429).length, 5);
+  assert.ok(Number(retryAfter) >= 1, "Retry-After names whole seconds");
+});
+
+test("a key that verified before still connects from an address whose failure budget is spent", async () => {
+  const { apiKey } = await seedLiveComputerKey("verified");
+  assert.equal((await attemptConnect(apiKey)).open, true, "verifies once");
+  for (let attempt = 0; attempt < MACHINE_CONNECT_FAILURES_PER_ADDRESS_MAX; attempt += 1) {
+    await attemptConnect(`sk_computer_${randomUUID().replace(/-/g, "")}`);
+  }
+  const random = await attemptConnect(`sk_computer_${randomUUID().replace(/-/g, "")}`);
+  assert.equal(random.status, 429, "the address budget is spent for unknown keys");
+  assert.equal(random.reason, "auth_failure_rate_limited");
+  assert.equal((await attemptConnect(apiKey)).open, true, "the verified key passes it");
+  const fresh = await seedLiveComputerKey("never-verified");
+  assert.equal((await attemptConnect(fresh.apiKey)).status, 429, "a valid key that never verified from here waits like any other");
+});
+
 // MUST be the last test: it closes the DB to force the auth lookup to throw,
 // exercising the exception branch (500). The `afterAll` hook tolerates the
 // already-closed DB.
@@ -477,3 +638,4 @@ test("auth resolution throws → 500; span ended outcome=error reason=exception,
   assert.equal(dump.includes(apiKey), false);
   assert.equal(dump.includes("sk_computer_"), false);
 });
+

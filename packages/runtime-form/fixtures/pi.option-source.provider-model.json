@@ -12,20 +12,26 @@
         "value": "deepseek/deepseek-v4-pro",
         "label": "DeepSeek V4 Pro",
         "supportedReasoningEfforts": [
+          "off",
+          "minimal",
           "low",
           "medium",
           "high",
-          "xhigh"
+          "xhigh",
+          "max"
         ]
       },
       {
         "value": "deepseek/deepseek-flash",
         "label": "DeepSeek V4.1 Flash",
         "supportedReasoningEfforts": [
+          "off",
+          "minimal",
           "low",
           "medium",
           "high",
-          "xhigh"
+          "xhigh",
+          "max"
         ]
       }
     ]

@@ -6,9 +6,9 @@ import { cleanup, fireEvent, render, screen, within } from "@testing-library/rea
 import { MemoryRouter, useLocation } from "react-router-dom";
 
 import api from "../src/api/client";
-import AgentDetailPanel from "../src/components/agent/AgentDetailPanel";
-import Sidebar from "../src/components/layout/Sidebar";
-import MachineDetailPanel from "../src/components/machine/MachineDetailPanel";
+import { AgentDetailPanel } from "../src/features/agent/AgentDetailPanel";
+import { Sidebar } from "../src/features/sidebar/Sidebar";
+import { MachineDetailPanel } from "../src/features/computer/MachineDetailPanel";
 import type { Agent } from "../src/store/agentStore";
 import { useAgentStore } from "../src/store/agentStore";
 import { useAuthStore } from "../src/store/authStore";
@@ -165,13 +165,13 @@ test("mounted agent detail closes an open delete confirmation when deletion is o
   seedStores();
   const view = render(wrap(createElement(AgentDetailPanel, { agent })));
 
-  fireEvent.click(await screen.findByRole("button", { name: "Archive Agent" }));
+  fireEvent.click(await screen.findByRole("button", { name: "Archive agent" }));
   assert.ok(await screen.findByRole("dialog"));
 
   view.rerender(wrap(createElement(AgentDetailPanel, {
     agent: { ...agent, deletedAt: "2026-08-22T01:00:00.000Z" },
   })));
-  assert.equal(screen.queryByRole("dialog"), null, "observed deletion must dismiss the open dialog");
+  assert.ok(screen.queryByRole("dialog") === null, "observed deletion must dismiss the open dialog");
   assert.equal(screen.getByTestId("location").textContent, "/s/server/members");
 });
 
@@ -182,11 +182,11 @@ test("mounted agent delete success closes locally without navigating", async () 
     deleteAgent: async (id: string) => { deletedAgents.push(id); },
   } as never);
   const agentView = render(wrap(createElement(AgentDetailPanel, { agent })));
-  fireEvent.click(screen.getByRole("button", { name: "Archive Agent" }));
+  fireEvent.click(screen.getByRole("button", { name: "Archive agent" }));
   await act(async () => {
-    fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Archive Agent" }));
+    fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Archive" }));
   });
-  assert.equal(screen.queryByRole("dialog"), null);
+  assert.ok(screen.queryByRole("dialog") === null);
   assert.deepEqual(deletedAgents, [agent.id]);
   assert.equal(screen.getByTestId("location").textContent, "/s/server/members");
   agentView.unmount();
@@ -204,23 +204,36 @@ test("mounted computer delete success closes locally without navigating", async 
     createElement(MachineDetailPanel, { machine, hideHeader: true }),
     "/s/server/settings/computers/machine-1",
   ));
-  fireEvent.click(screen.getByRole("button", { name: "Delete Computer" }));
+  fireEvent.click(screen.getByRole("button", { name: "Delete computer" }));
   await act(async () => {
-    fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Delete Computer" }));
+    fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Delete computer" }));
   });
-  assert.equal(screen.queryByRole("dialog"), null);
+  assert.ok(screen.queryByRole("dialog") === null);
   assert.deepEqual(deletedMachines, [machine.id]);
   assert.equal(screen.getByTestId("location").textContent, "/s/server/settings/computers/machine-1");
 });
 
+// The Sidebar's agent menu is the chat sidebar's agent row now (the Members
+// sidebar and its member rows went with the Members page, 2026-11-05): the
+// agent's row under Direct messages, from its DM.
 test("the mounted Sidebar agent menu does not fabricate an unreachable delete confirmation", async () => {
   seedStores();
-  render(wrap(createElement(Sidebar)));
+  // The sidebar holds its DM rows behind a skeleton until the DMs have loaded.
+  useChannelStore.setState({
+    dmsLoading: false,
+    dmChannels: [{
+      id: "dm-agent-1", name: "helper", description: null, type: "dm", createdAt: "2026-08-22T00:00:00.000Z",
+      peerType: "agent", peerId: "agent-1", peerName: "helper", peerDisplayName: "Helper",
+    }],
+  } as never);
+  render(wrap(createElement(Sidebar), "/s/server"));
 
-  const row = await screen.findByRole("button", { name: "Helper" });
+  await screen.findAllByRole("button", { name: "Helper" });
+  // The row itself (its avatar is a second "Helper" control inside it).
+  const row = screen.getAllByRole("button", { name: "Helper" }).find((el) => el.getAttribute("data-slot") === "sidebar-item");
+  assert.ok(row, "the agent's sidebar row");
   fireEvent.contextMenu(row, { clientX: 120, clientY: 160 });
-  assert.ok(await screen.findByRole("menuitem", { name: "Message" }));
-  assert.ok(screen.getByRole("menuitem", { name: "Restart / Reset" }));
-  assert.equal(screen.queryByRole("menuitem", { name: "Archive Agent" }), null);
-  assert.equal(screen.queryByRole("dialog"), null);
+  assert.ok(await screen.findByRole("menuitem", { name: "Pin" }), "the agent row's menu is open");
+  assert.ok(screen.queryByRole("menuitem", { name: "Archive agent" }) === null);
+  assert.ok(screen.queryByRole("dialog") === null);
 });

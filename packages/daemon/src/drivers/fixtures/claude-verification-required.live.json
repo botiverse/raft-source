@@ -1,0 +1,151 @@
+{
+  "at": "2026-11-12T11:04:02.223843+00:00",
+  "prompt": {
+    "rc": 1,
+    "events": [
+      {
+        "type": "assistant",
+        "message": {
+          "diagnostics": null,
+          "id": "<id>",
+          "container": null,
+          "model": "<synthetic>",
+          "role": "assistant",
+          "stop_details": null,
+          "stop_reason": "stop_sequence",
+          "stop_sequence": "",
+          "type": "message",
+          "usage": {
+            "output_tokens_details": "<redacted>",
+            "input_tokens": "<redacted>",
+            "output_tokens": "<redacted>",
+            "cache_creation_input_tokens": "<redacted>",
+            "cache_read_input_tokens": "<redacted>",
+            "server_tool_use": {
+              "web_search_requests": 0,
+              "web_fetch_requests": 0
+            },
+            "service_tier": null,
+            "cache_creation": {
+              "ephemeral_1h_input_tokens": "<redacted>",
+              "ephemeral_5m_input_tokens": "<redacted>"
+            },
+            "inference_geo": null,
+            "iterations": null,
+            "speed": null,
+            "fallback_credit": null
+          },
+          "content": [
+            {
+              "type": "text",
+              "text": "API Error: Your account can't receive replies from Claude right now. You can find the next step in the Anthropic Verification Portal: https://portal.anthropic.com/verify"
+            }
+          ],
+          "context_management": null
+        },
+        "parent_tool_use_id": null,
+        "session_id": "<redacted>",
+        "uuid": "<id>",
+        "timestamp": "2026-11-12T11:04:02.689Z",
+        "error": "verification_required",
+        "request_id": "<redacted>",
+        "is_api_error_message": true,
+        "api_error_status": 403,
+        "api_error_code": "verification_required",
+        "api_error_origin": "first_party"
+      },
+      {
+        "duration_api_ms": 0,
+        "stop_reason": "stop_sequence",
+        "session_id": "<redacted>",
+        "total_cost_usd": 0,
+        "usage": {
+          "output_tokens_details": "<redacted>",
+          "input_tokens": "<redacted>",
+          "cache_creation_input_tokens": "<redacted>",
+          "cache_read_input_tokens": "<redacted>",
+          "output_tokens": "<redacted>",
+          "server_tool_use": {
+            "web_search_requests": 0,
+            "web_fetch_requests": 0
+          },
+          "service_tier": "standard",
+          "cache_creation": {
+            "ephemeral_1h_input_tokens": "<redacted>",
+            "ephemeral_5m_input_tokens": "<redacted>"
+          },
+          "inference_geo": "",
+          "iterations": [],
+          "speed": "standard",
+          "fallback_credit": null
+        },
+        "modelUsage": {},
+        "permission_denials": [],
+        "terminal_reason": "api_error",
+        "fast_mode_state": "off",
+        "fast_mode_disabled_reason": "sdk_opt_in_required",
+        "subagent_stats": {
+          "spawned": 0,
+          "requested": {
+            "background": 0,
+            "foreground": 0,
+            "unset": 0
+          },
+          "started_in_background": 0,
+          "max_depth": 0,
+          "spawned_by_subagents": 0,
+          "completed": 0,
+          "failed": 0,
+          "killed": {
+            "parent": 0,
+            "user": 0,
+            "system": 0
+          },
+          "refused": {
+            "depth_limit": 0,
+            "concurrency_limit": 0,
+            "budget": 0
+          },
+          "by_type": {}
+        },
+        "safety_stops": 0,
+        "is_error": true,
+        "num_turns": 1,
+        "subtype": "success",
+        "api_error_status": 403,
+        "api_error_code": "verification_required",
+        "api_error_origin": "first_party",
+        "result": "API Error: Your account can't receive replies from Claude right now. You can find the next step in the Anthropic Verification Portal: https://portal.anthropic.com/verify",
+        "type": "result",
+        "duration_ms": 293,
+        "uuid": "<id>",
+        "queued_turn_count": 0,
+        "result_index": 0,
+        "model_usage_since_last_result": {},
+        "credential_expires_at": "2026-11-18T11:15:44.472Z"
+      }
+    ],
+    "stderr": ""
+  },
+  "auth_after": {
+    "at": "2026-11-12T11:04:03.442957+00:00",
+    "rc": 0,
+    "result": {
+      "loggedIn": true,
+      "authMethod": "claude.ai",
+      "apiProvider": "firstParty",
+      "analyticsDisabled": false,
+      "projectsDirectory": "<redacted>",
+      "configDirectory": "<redacted>",
+      "loginExpiresAt": "2026-11-18T11:15:44.472Z",
+      "email": "<redacted>",
+      "orgId": "<redacted>",
+      "orgName": "<redacted>",
+      "subscriptionType": "max",
+      "storedClaudeAiLogin": true,
+      "planTier": "max_20x"
+    },
+    "stderr": ""
+  },
+  "source": "Claude Code 2.1 live `claude -p --output-format stream-json` stdout (prompt.events) and `claude auth status` after it, on an account held for verification; ids, usage, account and paths redacted"
+}

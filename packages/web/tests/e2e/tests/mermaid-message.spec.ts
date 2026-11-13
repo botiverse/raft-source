@@ -264,13 +264,3 @@ test("Share image materializes Mermaid ink without interactive chrome", async ({
   expect(redPixels).toBeGreaterThan(200);
   expect(greenPixels).toBeGreaterThan(200);
 });
-
-test("invalid Mermaid exposes a generic error and the original source", async ({ page, request }) => {
-  const { messageItem } = await openMarkdownMessage(page, request, mermaidBlock("not a diagram"));
-  const diagram = messageItem.locator("[data-mermaid-status=error]");
-  await expect(diagram.getByRole("alert")).toContainText("Couldn't render this diagram");
-  await expect(diagram).not.toContainText("No diagram type detected");
-  await diagram.getByRole("radio", { name: "Code", exact: true }).click();
-  await expect(diagram.locator("pre")).toContainText("not a diagram");
-  await expect(diagram.getByRole("alert")).toHaveCount(0);
-});

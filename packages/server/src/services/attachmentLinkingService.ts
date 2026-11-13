@@ -7,7 +7,13 @@ import {
   lockAttachmentReservationsForConsumeWithExecutor,
 } from "./attachmentLifecycleService";
 import { assertChannelWritableInTransaction } from "./channelConversionFenceService";
+import {
+  AttachmentObjectHoldError,
+  addAttachmentObjectHoldsWithExecutor,
+  transferAttachmentObjectHoldsWithExecutor,
+} from "./attachmentObjectHoldService";
 import { UUID_RE } from "../lib/messageId";
+import { type ResolvedAttachment, withAttachmentObjectMetadata } from "./attachmentRecord";
 
 export type AttachmentLinkErrorCode =
   | "attachment_id_invalid"
@@ -92,7 +98,7 @@ function attachmentOrderMatches(
 export async function getAttachmentsForMessagesWithExecutor(
   executor: DatabaseExecutor,
   messageIds: string[],
-): Promise<Map<string, typeof attachments.$inferSelect[]>> {
+): Promise<Map<string, ResolvedAttachment[]>> {
   if (messageIds.length === 0) return new Map();
   const rows = await executor
     .select({
@@ -100,7 +106,7 @@ export async function getAttachmentsForMessagesWithExecutor(
       object: attachmentObjects,
     })
     .from(attachments)
-    .leftJoin(attachmentObjects, eq(attachmentObjects.id, attachments.objectId))
+    .innerJoin(attachmentObjects, eq(attachmentObjects.id, attachments.objectId))
     .where(inArray(attachments.messageId, [...new Set(messageIds)]))
     .orderBy(
       asc(attachments.messageId),
@@ -109,25 +115,13 @@ export async function getAttachmentsForMessagesWithExecutor(
       asc(attachments.id),
     );
 
-  const byMessage = new Map<string, typeof attachments.$inferSelect[]>();
+  const byMessage = new Map<string, ResolvedAttachment[]>();
   for (const { projection, object } of rows) {
     if (!projection.messageId || projection.revokedAt) continue;
-    // Once a projection has an object binding, physical metadata comes only
-    // from that immutable active object. A missing/non-active object fails
-    // closed instead of silently falling back to mutable legacy columns.
-    if (projection.objectId && (!object || object.lifecycleState !== "active")) continue;
-    const row = object
-      ? {
-          ...projection,
-          mimeType: object.mimeType,
-          sizeBytes: object.sizeBytes,
-          storageKey: object.storageKey,
-          thumbnailKey: object.thumbnailKey,
-          contentHash: object.contentHash,
-          width: object.width,
-          height: object.height,
-        }
-      : projection;
+    // Physical metadata comes only from the projection's immutable object
+    // (object_id is NOT NULL); a non-active object fails closed.
+    if (object.lifecycleState !== "active") continue;
+    const row = withAttachmentObjectMetadata(projection, object);
     const current = byMessage.get(projection.messageId) ?? [];
     current.push(row);
     byMessage.set(projection.messageId, current);
@@ -138,7 +132,7 @@ export async function getAttachmentsForMessagesWithExecutor(
 export async function getAttachmentsForMessageWithExecutor(
   executor: DatabaseExecutor,
   messageId: string,
-): Promise<typeof attachments.$inferSelect[]> {
+): Promise<ResolvedAttachment[]> {
   return (await getAttachmentsForMessagesWithExecutor(executor, [messageId])).get(messageId) ?? [];
 }
 
@@ -158,7 +152,7 @@ export async function linkAttachmentsToMessageWithExecutor(
   mode: AttachmentLinkMode = "new",
   now?: Date,
   hooks: AttachmentLinkHooks = {},
-): Promise<typeof attachments.$inferSelect[]> {
+): Promise<ResolvedAttachment[]> {
   assertWellFormedAttachmentIds(attachmentIds);
   assertNoDuplicateAttachmentIds(attachmentIds);
 
@@ -201,6 +195,8 @@ export async function linkAttachmentsToMessageWithExecutor(
       uploaderId: attachments.uploaderId,
       messageId: attachments.messageId,
       channelId: attachments.channelId,
+      objectId: attachments.objectId,
+      revokedAt: attachments.revokedAt,
     })
     .from(attachments)
     .where(inArray(attachments.id, attachmentIds))
@@ -248,6 +244,34 @@ export async function linkAttachmentsToMessageWithExecutor(
     }
   }
 
+  // The linked attachment now holds its bytes. A pending reservation (same id
+  // as its attachment) hands its hold over in one UPDATE, so the object is
+  // never without a hold; a row without a reservation adds a new hold.
+  try {
+    await transferAttachmentObjectHoldsWithExecutor(executor, rows.flatMap((row) => {
+      if (row.revokedAt) return [];
+      const to = { holderType: "attachment" as const, holderId: row.id, objectId: row.objectId };
+      const reservation = reservations.get(row.id);
+      return reservation?.state === "pending" && reservation.objectId === row.objectId
+        ? [{ from: { holderType: "upload_reservation" as const, holderId: reservation.id, objectId: row.objectId }, to }]
+        : [];
+    }), now);
+    await addAttachmentObjectHoldsWithExecutor(executor, rows.flatMap((row) => {
+      if (row.revokedAt) return [];
+      const reservation = reservations.get(row.id);
+      return reservation?.state === "pending" && reservation.objectId === row.objectId
+        ? []
+        : [{ holderType: "attachment" as const, holderId: row.id, objectId: row.objectId }];
+    }));
+  } catch (error) {
+    if (error instanceof AttachmentObjectHoldError) {
+      throw new AttachmentLinkError(
+        "attachment_not_found",
+        "One or more attachments are no longer stored. Re-upload the file and send the new attachment ID.",
+      );
+    }
+    throw error;
+  }
   await consumeAttachmentReservationsWithExecutor(executor, reservations, messageId, now);
 
   const linked = await getAttachmentsForMessageWithExecutor(executor, messageId);

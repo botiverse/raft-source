@@ -1,4 +1,5 @@
 import {
+  foldAgentOneLineText,
   AGENT_INBOX_PREVIEW_MAX_CHARS,
   shortIdFromSourceRef,
   type AgentInboxAppItem,
@@ -48,10 +49,8 @@ export function reminderItemId(sourceRef: AgentInboxSourceRef): string | null {
 export const REMINDER_INBOX_TITLE_TRUNCATION_MARKER = "\u2026";
 
 export function projectReminderInboxTitle(title: string): string | undefined {
-  const singleLine = title
-    .replace(/[\u0000-\u001f\u007f]+/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
+  // Every universal line separator too (NEL is outside both ranges).
+  const singleLine = foldAgentOneLineText(title.replace(/[\u0000-\u001f\u007f]+/g, " "));
   if (singleLine.length <= AGENT_INBOX_PREVIEW_MAX_CHARS) return singleLine || undefined;
   // A shortened title must read as incomplete. A silent cut yields a
   // well-formed value (a version, id or count with its tail missing) that the
@@ -80,6 +79,17 @@ export const REMINDER_AGENT_INBOX_REGISTRY: AgentAppInboxRegistry = {
           ? `raft reminder ack --id ${shortIdFromSourceRef(sourceRef)} --revision ${sourceRef.revision}`
           : null,
       materializeItemId: reminderItemId,
+      // The Server records a reminder's ack (`reminder_source_acknowledgements`)
+      // and lists it in `inbox check`; a local-only ack left the two disagreeing
+      // (RFC 081 D7, #wg-ax:#17). Always, with REMINDER_SERVER_ACK_CAPABILITY declared.
+      ackAuthority: "server",
+      // Refused, the same revision would be refused again: the current ack
+      // lines are in `raft inbox check`. Unanswered, the same ack (full id,
+      // as on those lines) is safe to run again.
+      ackFailureNextAction: ({ sourceRef, outcome }) =>
+        outcome === "refused"
+          ? "Nothing was acknowledged. raft inbox check lists this reminder's current ack: lines; ack those."
+          : `Retry in a few seconds; it is safe to run the same ack again: raft reminder ack --id ${sourceRef.id} --revision ${sourceRef.revision}`,
     },
   },
 };

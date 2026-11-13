@@ -85,19 +85,13 @@
 export { ComputerError, isComputerError } from "./errors";
 export { createComputerApi } from "./api";
 export {
-  convergeAppHostLifecycle,
   convergeCliHostLifecycle,
   readHostLifecycleMarker,
-  removeHostLifecycle,
-  resolveStableDispatcherPath,
 } from "../macosLoginCarrier";
 export type {
-  AppHostLifecycleDeps,
   HostLifecycleConvergenceResult,
   HostLifecycleMarker,
   HostLifecycleOwner,
-  HostLifecycleRemovalDeps,
-  HostLifecycleRemovalResult,
   MacosHostLifecycleDeps,
 } from "../macosLoginCarrier";
 export { createComputerTracer } from "./computerTracer";
@@ -220,6 +214,12 @@ export { ComputerServiceError } from "../services/errors";
 // `userSessionPath` is exposed so consumers that need to read the session
 // directly don't have to reconstruct the path.
 export { resolveRaftHome, userSessionPath } from "../paths";
+// The machine name a Computer gives itself by default (from the hostname):
+// Raft Desktop asks for its approval under the same name the CLI would use.
+export { deriveDefaultComputerName } from "../paths";
+// The OS label an approval request carries (what the approval page shows).
+export { approvalOsLabel } from "../services/attachGrant";
+export type { AttachWithTokenInput } from "../services/attachGrant";
 export { withComputerMutationLock } from "../concurrency";
 export { resolveServerUrl, resolveServerUrlEnv } from "../serverUrl";
 
@@ -247,6 +247,13 @@ export { DEFAULT_UPGRADE_BASE_URL, fetchCdnLatestVersion } from "../computerRele
 // silently re-launch the GUI instead of starting the supervisor.
 // (#wg-raft-computer:f2a02081 BUG 5.)
 export { runService, runResident } from "../service";
+// The `__detect-runtimes` child mode, for the same adapters: the hosted daemon
+// re-execs its host with that mode for every runtime detection round
+// (resolveSelfExec), so an adapter's argv guard must route it here too.
+export { runRuntimeDetectionChildEntry as runRuntimeDetectionChild } from "../runtimeDetectionEntry";
 
 // Shared bootstrap launcher for standalone Computer consumers.
 export { installerArgs, installerCommand } from "../externalInstaller";
+
+export { readMachineTurnActivity } from "../turnActivity";
+export type { MachineTurnActivity } from "../turnActivity";

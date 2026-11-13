@@ -5,28 +5,11 @@
 // Node/undici fetch does not reliably behave like curl here unless we pass an
 // explicit dispatcher, so Computer login/attach must do it at the request seam.
 import { fetch, ProxyAgent, type Dispatcher } from "undici";
+import { shouldBypassProxy } from "@botiverse/raft-shared/src/noProxy";
 
 const fetchDispatcherCache = new Map<string, Dispatcher>();
 type UndiciRequestInit = NonNullable<Parameters<typeof fetch>[1]>;
 type ProxyAwareRequestInit = UndiciRequestInit & { dispatcher?: Dispatcher };
-
-function getDefaultPort(protocol: string): string {
-  switch (protocol) {
-    case "https:":
-      return "443";
-    case "http:":
-      return "80";
-    default:
-      return "";
-  }
-}
-
-function hostMatchesNoProxyEntry(hostname: string, ruleHost: string): boolean {
-  if (!ruleHost) return false;
-  const normalizedRule = ruleHost.replace(/^\*\./, ".").replace(/^\./, "").toLowerCase();
-  const normalizedHost = hostname.toLowerCase();
-  return normalizedHost === normalizedRule || normalizedHost.endsWith(`.${normalizedRule}`);
-}
 
 function getProxyUrlForTarget(targetUrl: string, env: NodeJS.ProcessEnv): string | undefined {
   const protocol = new URL(targetUrl).protocol;
@@ -39,26 +22,6 @@ function getProxyUrlForTarget(targetUrl: string, env: NodeJS.ProcessEnv): string
     default:
       return env.ALL_PROXY || env.all_proxy;
   }
-}
-
-export function shouldBypassProxy(targetUrl: string, env: NodeJS.ProcessEnv): boolean {
-  const rawNoProxy = env.NO_PROXY || env.no_proxy;
-  if (!rawNoProxy) return false;
-
-  const url = new URL(targetUrl);
-  const hostname = url.hostname.toLowerCase();
-  const port = url.port || getDefaultPort(url.protocol);
-
-  return rawNoProxy
-    .split(",")
-    .map((entry) => entry.trim())
-    .filter(Boolean)
-    .some((entry) => {
-      if (entry === "*") return true;
-      const [ruleHost, rulePort] = entry.split(":", 2);
-      if (rulePort && rulePort !== port) return false;
-      return hostMatchesNoProxyEntry(hostname, ruleHost);
-    });
 }
 
 export function buildFetchDispatcher(

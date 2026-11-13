@@ -1,14 +1,24 @@
+import { HumanSeatLimitError } from "./planService";
 import { and, count, eq, isNull, sql } from "drizzle-orm";
 import { createHash, randomBytes } from "node:crypto";
-import { PLAN_CONFIG, formatBillingCapacityLimitMessage, getBillingCapacityLimitState, validateEmailAddress } from "@botiverse/raft-shared";
-import { getDb } from "../db/index";
-import { agents, serverInvites, serverJoinLinks, serverMembers, servers, users } from "../db/schema";
+import { PLAN_CONFIG, PRO_SEAT_ADD_FEATURE_FLAG_KEY, formatBillingCapacityLimitMessage, getBillingCapacityLimitState, validateEmailAddress, type ServerRole } from "@botiverse/raft-shared";
+import { getDb, type DatabaseTransaction } from "../db/index";
+import { agents, serverInvites, serverJoinLinks, serverMembers, serverMembershipDepartures, servers, users } from "../db/schema";
 import { sendInviteEmail } from "./emailService";
 import { normalizeEmail } from "./emailNormalization";
 import * as serverService from "./serverService";
+import { lockJointUsersFirst, withJointUsersGuessed } from "./jointHumanMembershipMirror";
+import { missingAllChannelHumanUserIds } from "./allChannelMembership";
+import { getActorServerRoleInServer } from "../lib/actorPermissions";
+import { listedServerAgent } from "./agentMemberListPolicy";
 import * as serverAgreementService from "./serverAgreementService";
 import { refreshSubscriptionForServerIfStale } from "./billingService";
+import { evaluateFeatureFlag } from "./featureFlagService";
+import { enforceServerInviteEmailRate } from "./serverInviteEmailLimits";
+import { deploymentUserLimitReached } from "./deploymentUserLimit";
 import {
+  acquireServerLock,
+  SERVER_MEMBERSHIP_ADMISSION_LOCK_NAMESPACE,
   assertHumanCapacityAvailable,
   getServerBillingEntitlement,
   getServerBillingUsage,
@@ -39,6 +49,20 @@ export interface InviteInfo {
   insideCountsHidden: boolean;
   humanSeatLimitReached: boolean;
   humanSeatLimitMessage: string | null;
+  /**
+   * The seats are full and pro_seat_add is on for this server (task #10): the
+   * page offers someone signed out only Sign In / Create Account, and tells
+   * someone signed in that the owners were told (POST /api/invites/seat-blocked).
+   * The server answers it because a visitor who isn't signed in can't
+   * evaluate the flag.
+   */
+  seatNoticeEnabled: boolean;
+  /**
+   * The source-available deployment already has as many people as the Raft
+   * License allows (deploymentUserLimit.ts): joining works only for someone
+   * who already counts. Always false in the cloud edition.
+   */
+  deploymentUserLimitReached: boolean;
   agreement: serverAgreementService.PublicAgreement | null;
 }
 
@@ -55,7 +79,7 @@ async function getServerMemberAgentCounts(
     db
       .select({ n: count() })
       .from(agents)
-      .where(and(eq(agents.serverId, serverId), isNull(agents.deletedAt))),
+      .where(and(eq(agents.serverId, serverId), isNull(agents.deletedAt), listedServerAgent())),
   ]);
   return {
     memberCount: memberRow[0]?.n ?? 0,
@@ -67,6 +91,8 @@ async function getServerMemberAgentCounts(
 export interface InviteAcceptResult {
   serverId: string;
   serverName: string;
+  /** Set when the person was a Guest of the server and the invite made them a member. */
+  promotedFromGuest?: { previousRole: ServerRole; role: ServerRole };
 }
 
 async function assertServerCanInviteHuman(serverId: string): Promise<void> {
@@ -80,6 +106,7 @@ async function assertServerCanInviteHuman(serverId: string): Promise<void> {
 async function getHumanSeatLimitState(serverId: string): Promise<{
   humanSeatLimitReached: boolean;
   humanSeatLimitMessage: string | null;
+  seatNoticeEnabled: boolean;
 }> {
   const db = getDb();
   await refreshSubscriptionForServerIfStale(serverId);
@@ -87,14 +114,19 @@ async function getHumanSeatLimitState(serverId: string): Promise<{
   const usage = await getServerBillingUsage(db, serverId);
   const limitState = getBillingCapacityLimitState(entitlement.capacity, usage, "human");
   if (limitState.reached) {
+    // Only Pro seats (not a plan's member cap) are what an owner adds and the notice is about.
+    const seatNotice = limitState.limitType === "universal"
+      && (await evaluateFeatureFlag({ key: PRO_SEAT_ADD_FEATURE_FLAG_KEY, serverId })).enabled;
     return {
       humanSeatLimitReached: true,
       humanSeatLimitMessage: formatBillingCapacityLimitMessage("human", limitState, PLAN_CONFIG[entitlement.plan].displayName),
+      seatNoticeEnabled: seatNotice,
     };
   }
   return {
     humanSeatLimitReached: false,
     humanSeatLimitMessage: null,
+    seatNoticeEnabled: false,
   };
 }
 
@@ -171,13 +203,19 @@ export interface ServerJoinLinkRecord {
   revokedAt: Date | null;
 }
 
+/** A stored invite's role. "guest" survives only on old rows, which acceptInvite refuses. */
 export type InvitableServerRole = "member" | "guest";
 
+/**
+ * A server invite always makes a Member: a Guest belongs to one channel and is
+ * invited to it by an external invite (#wg-rbac:#15), so a Guest server invite
+ * would create a Guest with no channel (#wg-rbac:#47).
+ */
 export async function createInvite(
   serverId: string,
   invitedEmail: string,
   invitedByUserId: string,
-  role: InvitableServerRole = "member",
+  role: "member" = "member",
 ): Promise<{ id: string; invitedEmail: string; expiresAt: Date; role: InvitableServerRole }> {
   const db = getDb();
   const emailError = validateEmailAddress(invitedEmail);
@@ -192,8 +230,9 @@ export async function createInvite(
     .where(eq(users.email, normalizedInvitedEmail));
 
   if (existingUser.length > 0) {
-    const isMember = await serverService.isMember(serverId, existingUser[0].id);
-    if (isMember) {
+    // A Guest may be invited: accepting promotes them (promoteGuestByInvite).
+    const memberRole = await getActorServerRoleInServer(serverId, "user", existingUser[0].id);
+    if (memberRole && memberRole !== "guest") {
       throw new Error("This user is already a member of this server");
     }
   }
@@ -211,7 +250,10 @@ export async function createInvite(
     throw new Error("An invite has already been sent to this email");
   }
 
-  if (role !== "guest") await assertServerCanInviteHuman(serverId);
+  await assertServerCanInviteHuman(serverId);
+
+  // One email per invite: the server's and the inviter's daily budget (serverInviteEmailLimits.ts).
+  await enforceServerInviteEmailRate({ serverId, inviterUserId: invitedByUserId });
 
   if (existing) {
     await db.delete(serverInvites).where(eq(serverInvites.id, existing.id));
@@ -327,7 +369,27 @@ export async function revokeJoinLink(linkId: string, serverId: string): Promise<
     ));
 }
 
-export async function getInviteInfo(token: string): Promise<InviteInfo | null> {
+/** An invite or join link that still lets someone in, and the server it is for. */
+export interface LiveInvite {
+  kind: "email" | "join_link";
+  serverId: string;
+  serverName: string;
+  hideHumansFromMembers: boolean;
+  /** Who sent the email invite or made the join link. */
+  inviterUserId: string;
+  /** What joining grants: the email invite's role; a join link makes members. */
+  role: InvitableServerRole;
+  /** The email invite's address (only its owner accepts it); null for a join link. */
+  invitedEmail: string | null;
+}
+
+/**
+ * The invite behind `token` while it still lets someone in: a pending,
+ * unexpired email invite, or a join link not revoked, expired or used up; on
+ * a server that still exists. Null otherwise. invite-info and the seat notice
+ * (seatJoinBlockService) read it the same way.
+ */
+export async function findLiveInvite(token: string): Promise<LiveInvite | null> {
   const db = getDb();
   const tokenHash = hashToken(token);
 
@@ -339,82 +401,74 @@ export async function getInviteInfo(token: string): Promise<InviteInfo | null> {
       expiresAt: serverInvites.expiresAt,
       serverId: serverInvites.serverId,
       invitedByUserId: serverInvites.invitedByUserId,
+      invitedEmail: serverInvites.invitedEmail,
       role: serverInvites.role,
     })
     .from(serverInvites)
     .where(eq(serverInvites.tokenHash, tokenHash));
 
+  let invite: Omit<LiveInvite, "serverName" | "hideHumansFromMembers">;
   if (emailInvite) {
     if (emailInvite.status !== "pending" || isExpired(emailInvite.expiresAt)) return null;
-
-    const [server] = await db
-      .select({ name: servers.name, deletedAt: servers.deletedAt, hideHumansFromMembers: servers.hideHumansFromMembers })
-      .from(servers)
-      .where(eq(servers.id, emailInvite.serverId));
-
-    if (!server || server.deletedAt) return null;
-
-    const [inviter] = await db
-      .select({ name: users.name })
-      .from(users)
-      .where(eq(users.id, emailInvite.invitedByUserId));
-
-    const counts = await getServerMemberAgentCounts(emailInvite.serverId, {
-      hideInsideCounts: server.hideHumansFromMembers,
-    });
-    const humanSeatLimit = emailInvite.role === "guest"
-      ? { humanSeatLimitReached: false, humanSeatLimitMessage: null }
-      : await getHumanSeatLimitState(emailInvite.serverId);
-    return {
+    invite = {
       kind: "email",
-      serverName: server.name,
-      inviterName: inviter?.name || "Someone",
-      agreement: await serverAgreementService.getActiveAgreement(emailInvite.serverId),
-      ...humanSeatLimit,
-      ...counts,
+      serverId: emailInvite.serverId,
+      inviterUserId: emailInvite.invitedByUserId,
+      role: emailInvite.role,
+      invitedEmail: emailInvite.invitedEmail,
     };
-  }
+  } else {
+    const [joinLink] = await db
+      .select({
+        serverId: serverJoinLinks.serverId,
+        createdByUserId: serverJoinLinks.createdByUserId,
+        expiresAt: serverJoinLinks.expiresAt,
+        maxUses: serverJoinLinks.maxUses,
+        useCount: serverJoinLinks.useCount,
+        revokedAt: serverJoinLinks.revokedAt,
+      })
+      .from(serverJoinLinks)
+      .where(eq(serverJoinLinks.token, token));
 
-  const [joinLink] = await db
-    .select({
-      id: serverJoinLinks.id,
-      serverId: serverJoinLinks.serverId,
-      createdByUserId: serverJoinLinks.createdByUserId,
-      expiresAt: serverJoinLinks.expiresAt,
-      maxUses: serverJoinLinks.maxUses,
-      useCount: serverJoinLinks.useCount,
-      revokedAt: serverJoinLinks.revokedAt,
-    })
-    .from(serverJoinLinks)
-    .where(eq(serverJoinLinks.token, token));
-
-  if (!joinLink) return null;
-  if (joinLink.revokedAt || isExpired(joinLink.expiresAt) || isExhausted(joinLink.maxUses, joinLink.useCount)) {
-    return null;
+    if (!joinLink) return null;
+    if (joinLink.revokedAt || isExpired(joinLink.expiresAt) || isExhausted(joinLink.maxUses, joinLink.useCount)) {
+      return null;
+    }
+    invite = { kind: "join_link", serverId: joinLink.serverId, inviterUserId: joinLink.createdByUserId, role: "member", invitedEmail: null };
   }
 
   const [server] = await db
     .select({ name: servers.name, deletedAt: servers.deletedAt, hideHumansFromMembers: servers.hideHumansFromMembers })
     .from(servers)
-    .where(eq(servers.id, joinLink.serverId));
+    .where(eq(servers.id, invite.serverId));
 
   if (!server || server.deletedAt) return null;
+  return { ...invite, serverName: server.name, hideHumansFromMembers: server.hideHumansFromMembers };
+}
+
+export async function getInviteInfo(token: string): Promise<InviteInfo | null> {
+  const db = getDb();
+  const invite = await findLiveInvite(token);
+  if (!invite) return null;
 
   const [inviter] = await db
     .select({ name: users.name })
     .from(users)
-    .where(eq(users.id, joinLink.createdByUserId));
+    .where(eq(users.id, invite.inviterUserId));
 
-  const counts = await getServerMemberAgentCounts(joinLink.serverId, {
-    hideInsideCounts: server.hideHumansFromMembers,
+  const counts = await getServerMemberAgentCounts(invite.serverId, {
+    hideInsideCounts: invite.hideHumansFromMembers,
   });
-  const humanSeatLimit = await getHumanSeatLimitState(joinLink.serverId);
+  const humanSeatLimit = invite.role === "guest"
+    ? { humanSeatLimitReached: false, humanSeatLimitMessage: null, seatNoticeEnabled: false }
+    : await getHumanSeatLimitState(invite.serverId);
   return {
-    kind: "join_link",
-    serverName: server.name,
-    inviterName: inviter?.name || null,
-    agreement: await serverAgreementService.getActiveAgreement(joinLink.serverId),
+    kind: invite.kind,
+    serverName: invite.serverName,
+    inviterName: invite.kind === "email" ? inviter?.name || "Someone" : inviter?.name || null,
+    agreement: await serverAgreementService.getActiveAgreement(invite.serverId),
     ...humanSeatLimit,
+    deploymentUserLimitReached: await deploymentUserLimitReached(),
     ...counts,
   };
 }
@@ -431,6 +485,14 @@ export async function acceptInvite(
 
   if (emailInvite) {
     if (emailInvite.status !== "pending") throw new Error("This invite has already been used");
+    // A Guest belongs to one channel and is invited to that channel (#wg-rbac:#15).
+    // A server invite stored with the Guest role from before can no longer be
+    // accepted: it would create a Guest with no channel. Refused, never turned
+    // into a Member invite (more access than was offered).
+    if (emailInvite.role === "guest") {
+      await db.update(serverInvites).set({ status: "expired" }).where(and(eq(serverInvites.id, emailInvite.id), eq(serverInvites.status, "pending")));
+      throw new Error("This invite has been revoked");
+    }
     if (isExpired(emailInvite.expiresAt)) {
       await db.update(serverInvites).set({ status: "expired" }).where(eq(serverInvites.id, emailInvite.id));
       throw new Error("This invite has expired");
@@ -448,31 +510,24 @@ export async function acceptInvite(
     const server = await serverService.getServer(emailInvite.serverId);
     if (!server) throw new Error("This server no longer exists");
 
-    const isMember = await serverService.isMember(emailInvite.serverId, userId);
-    if (isMember) {
-      throw new Error("You are already a member of this server");
-    }
-
-    await db.transaction(async (tx) => {
-      const agreement = await serverAgreementService.requireSelfServeAgreement(tx, emailInvite.serverId, agreementInput);
-      // The role the inviter chose, not a hardcoded default. A guest invite that
-      // silently produced a member would hand out more access than was offered.
-      await serverService.addMember(emailInvite.serverId, userId, emailInvite.role, {
-        executor: tx,
-        agreementAudit: {
-          actorUserId: userId,
-          source: "invite",
-          agreementId: agreement?.id ?? null,
-          ipAddress: agreementInput?.ipAddress,
-          userAgent: agreementInput?.userAgent,
-        },
-      });
-      await tx.update(serverInvites).set({ status: "accepted" }).where(eq(serverInvites.id, emailInvite.id));
+    const admitted = await admitByInvite({
+      serverId: emailInvite.serverId,
+      userId,
+      inviterUserId: emailInvite.invitedByUserId,
+      agreementInput,
+      consume: async (tx) => {
+        const [used] = await tx.update(serverInvites).set({ status: "accepted" })
+          .where(and(eq(serverInvites.id, emailInvite.id), eq(serverInvites.status, "pending")))
+          .returning({ id: serverInvites.id });
+        if (!used) throw new Error("This invite has already been used");
+      },
     });
+    if (admitted.kind === "already_member") throw new Error("You are already a member of this server");
 
     return {
       serverId: emailInvite.serverId,
       serverName: server.name,
+      ...(admitted.kind === "promoted" ? { promotedFromGuest: admitted.promoted } : {}),
     };
   }
 
@@ -485,60 +540,228 @@ export async function acceptInvite(
   const server = await serverService.getServer(joinLink.serverId);
   if (!server) throw new Error("This server no longer exists");
 
-  await db.transaction(async (tx) => {
-    const agreement = await serverAgreementService.requireSelfServeAgreement(tx, joinLink.serverId, agreementInput);
-    const joinedThisServer = await serverService.addMember(joinLink.serverId, userId, "member", {
-      executor: tx,
-      agreementAudit: {
-        actorUserId: userId,
-        source: "invite",
-        agreementId: agreement?.id ?? null,
-        ipAddress: agreementInput?.ipAddress,
-        userAgent: agreementInput?.userAgent,
-      },
-    });
-
-    if (joinedThisServer) {
-      const [consumed] = await tx
-        .update(serverJoinLinks)
-        .set({ useCount: sql`${serverJoinLinks.useCount} + 1` })
-        .where(and(
-          eq(serverJoinLinks.id, joinLink.id),
-          isNull(serverJoinLinks.revokedAt),
-          sql`(${serverJoinLinks.expiresAt} is null or ${serverJoinLinks.expiresAt} > now())`,
-          sql`(${serverJoinLinks.maxUses} is null or ${serverJoinLinks.useCount} < ${serverJoinLinks.maxUses})`,
-        ))
-        .returning({ id: serverJoinLinks.id });
-
-      if (!consumed) {
-        const [current] = await tx
-          .select({
-            revokedAt: serverJoinLinks.revokedAt,
-            expiresAt: serverJoinLinks.expiresAt,
-            maxUses: serverJoinLinks.maxUses,
-            useCount: serverJoinLinks.useCount,
-          })
-          .from(serverJoinLinks)
-          .where(eq(serverJoinLinks.id, joinLink.id));
-
-        if (!current || current.revokedAt) {
-          throw new Error("This invite has been revoked");
-        }
-        if (isExpired(current.expiresAt)) {
-          throw new Error("This invite has expired");
-        }
-        if (isExhausted(current.maxUses, current.useCount)) {
-          throw new Error("This invite has already reached its usage limit");
-        }
-        throw new Error("This invite is no longer valid");
-      }
-    }
+  const admitted = await admitByInvite({
+    serverId: joinLink.serverId,
+    userId,
+    inviterUserId: joinLink.createdByUserId,
+    agreementInput,
+    consume: (tx) => consumeJoinLinkUse(tx, joinLink.id),
   });
 
+  // A member opening a join link again is let through (it changes and uses nothing), as before.
   return {
     serverId: joinLink.serverId,
     serverName: server.name,
+    ...(admitted.kind === "promoted" ? { promotedFromGuest: admitted.promoted } : {}),
   };
+}
+
+/** Counts one use of a join link, or refuses when it stopped letting people in since it was read. */
+async function consumeJoinLinkUse(tx: DatabaseTransaction, joinLinkId: string): Promise<void> {
+  const [consumed] = await tx
+    .update(serverJoinLinks)
+    .set({ useCount: sql`${serverJoinLinks.useCount} + 1` })
+    .where(and(
+      eq(serverJoinLinks.id, joinLinkId),
+      isNull(serverJoinLinks.revokedAt),
+      sql`(${serverJoinLinks.expiresAt} is null or ${serverJoinLinks.expiresAt} > now())`,
+      sql`(${serverJoinLinks.maxUses} is null or ${serverJoinLinks.useCount} < ${serverJoinLinks.maxUses})`,
+    ))
+    .returning({ id: serverJoinLinks.id });
+  if (consumed) return;
+
+  const [current] = await tx
+    .select({
+      revokedAt: serverJoinLinks.revokedAt,
+      expiresAt: serverJoinLinks.expiresAt,
+      maxUses: serverJoinLinks.maxUses,
+      useCount: serverJoinLinks.useCount,
+    })
+    .from(serverJoinLinks)
+    .where(eq(serverJoinLinks.id, joinLinkId));
+
+  if (!current || current.revokedAt) {
+    throw new Error("This invite has been revoked");
+  }
+  if (isExpired(current.expiresAt)) {
+    throw new Error("This invite has expired");
+  }
+  if (isExhausted(current.maxUses, current.useCount)) {
+    throw new Error("This invite has already reached its usage limit");
+  }
+  throw new Error("This invite is no longer valid");
+}
+
+type InviteAdmission =
+  | { kind: "joined" }
+  | { kind: "promoted"; promoted: { previousRole: ServerRole; role: ServerRole } }
+  | { kind: "already_member" };
+
+/**
+ * Lets the person behind a server invite or join link in, deciding under the
+ * host's SERVER_MEMBERSHIP_ADMISSION lock (the one external invite accepts
+ * take) whether they join, are promoted from Guest, or are already a member:
+ *
+ * - not a member: added as a member (a conflicting insert is refused, never
+ *   taken for success);
+ * - a Guest (#wg-rbac:#16, Cody): promoted by the transition an owner or
+ *   admin makes by hand (transitionMemberRole: a seat is needed, the channel
+ *   binding is cleared, channel memberships and read positions stay), made as
+ *   the person who sent the invite or made the link, and only while the
+ *   locked row is a Guest (expectedRole). If they may no longer promote (left, or no
+ *   longer an owner or admin), the invite no longer lets anyone in;
+ * - already an owner, admin or member: nothing changes and nothing is used.
+ *
+ * The invite or link is used (`consume`) in the same transaction. Lock order:
+ * the invitee, inviter and missing #all audience's users rows in id order,
+ * the admission lock, the server row FOR UPDATE (the strength promotion
+ * needs, so it is never upgraded from FOR SHARE), the member, then the invite
+ * or link. #all's missing audience is guessed unlocked and checked at its
+ * insert; a larger set restarts the transaction before consuming the invite.
+ */
+async function admitByInvite(input: {
+  serverId: string;
+  userId: string;
+  inviterUserId: string;
+  agreementInput: serverAgreementService.SelfServeAgreementInput | undefined;
+  consume: (tx: DatabaseTransaction) => Promise<void>;
+}): Promise<InviteAdmission> {
+  const admission = await withJointUsersGuessed(
+    async () => [input.userId, input.inviterUserId, ...await missingAllChannelHumanUserIds(getDb(), input.serverId)],
+    (lockedUserIds) => getDb().transaction(async (tx): Promise<{ admission: InviteAdmission; transition: serverService.ServerMemberRoleTransitionResult | null }> => {
+      // The person's and the inviter's users rows first (lockJointUsersFirst;
+      // only locked, as before): a Guest's promotion below names both (the
+      // role audit, the joint mirror), and taking them only there, after the
+      // server row FOR UPDATE, closes a cycle with either one's account
+      // deletion (users row FOR UPDATE, then the servers they own).
+      // A third human can reveal #all for existing people too, including an
+      // owner who is neither inviter nor invitee. Their channel_humans FKs
+      // must not wait on account deletion after we hold the Server lock.
+      await lockJointUsersFirst(tx, { userIds: [...lockedUserIds] });
+      await acquireServerLock(tx, input.serverId, SERVER_MEMBERSHIP_ADMISSION_LOCK_NAMESPACE);
+      // Under these locks nothing changes whether or how they are in.
+      const role = await serverService.lockServerMembershipForAdmission(tx, input.serverId, input.userId);
+      if (role && role !== "guest") return { admission: { kind: "already_member" }, transition: null };
+      const agreement = await serverAgreementService.requireSelfServeAgreement(tx, input.serverId, input.agreementInput);
+
+      if (role === "guest") {
+        let transition: serverService.ServerMemberRoleTransitionResult;
+        try {
+          // Re-takes the server and member rows already held FOR UPDATE.
+          transition = await serverService.transitionMemberRoleInTransaction(tx, {
+            serverId: input.serverId,
+            actorUserId: input.inviterUserId,
+            targetUserId: input.userId,
+            // A Guest invite is refused before this (acceptInvite): invites make members.
+            nextRole: "member",
+            expectedRole: "guest",
+          });
+        } catch (err) {
+          if (err instanceof serverService.ServerMemberRoleTransitionError) {
+            // Cannot happen under the member lock; refused (nothing used) rather than trusted.
+            if (err.code === "role_changed") return { admission: { kind: "already_member" }, transition: null };
+            throw new Error("This invite is no longer valid");
+          }
+          throw err;
+        }
+        await serverAgreementService.insertMembershipAgreementAudit(tx, {
+          serverId: input.serverId,
+          subjectType: "user",
+          subjectId: input.userId,
+          actorUserId: input.userId,
+          source: "invite",
+          agreementId: agreement?.id ?? null,
+          agreementVersion: agreement?.version ?? null,
+          ipAddress: input.agreementInput?.ipAddress,
+          userAgent: input.agreementInput?.userAgent,
+        });
+        await input.consume(tx);
+        return {
+          admission: { kind: "promoted", promoted: { previousRole: transition.previousRole, role: transition.nextRole } },
+          transition,
+        };
+      }
+
+      const added = await serverService.addMember(input.serverId, input.userId, "member", {
+        executor: tx,
+        allChannelLockedUserIds: lockedUserIds,
+        agreementAudit: {
+          actorUserId: input.userId,
+          source: "invite",
+          agreementId: agreement?.id ?? null,
+          ipAddress: input.agreementInput?.ipAddress,
+          userAgent: input.agreementInput?.userAgent,
+        },
+      });
+      // Cannot happen with the member row locked absent under the admission
+      // lock; a conflict is refused (nothing used), never taken for success.
+      if (!added) throw new Error("You are already a member of this server");
+      await input.consume(tx);
+      return { admission: { kind: "joined" }, transition: null };
+  }));
+  if (admission.transition) await serverService.finishMemberRoleTransition(input.userId, admission.transition);
+  return admission.admission;
+}
+
+export type SsoAdmission =
+  | { kind: "joined" }
+  | { kind: "already_member" }
+  | { kind: "seats_full" }
+  | { kind: "agreement_required" }
+  /** Removed from this Server, or left it as a Guest: only being added again (an invite, a direct add) brings them back. */
+  | { kind: "rejoin_needs_invite" };
+
+/**
+ * SSO auto-join (rfcs/083-server-sso.md §6.1): the person signed in with the
+ * Server's SSO connection and the owner turned auto-join on. The admission
+ * lock and agreement check of admitByInvite, but it never changes an
+ * existing membership: a guest (perhaps a contractor) stays a guest. A full
+ * Server or an agreement the person has not accepted does not fail the
+ * sign-in: they are simply not added, and the caller tells them.
+ *
+ * Nor does it bring back someone an owner or admin removed from this Server
+ * (Warden 7cba3414): their departure row for this Server says `removed`
+ * (anyone's doing but their own: an owner or admin, a channel admin removing
+ * a Guest, a Guest's channel ending), nor someone who left as a Guest (auto-
+ * join would make them a full member). A member leaving on their own (`left`)
+ * does not count, nor does another Server's removal, and joining again by
+ * any route (addMember) clears the row.
+ */
+export async function admitBySso(input: {
+  serverId: string;
+  userId: string;
+  agreementInput?: serverAgreementService.SelfServeAgreementInput;
+}): Promise<SsoAdmission> {
+  try {
+    return await getDb().transaction(async (tx): Promise<SsoAdmission> => {
+      await acquireServerLock(tx, input.serverId, SERVER_MEMBERSHIP_ADMISSION_LOCK_NAMESPACE);
+      const role = await serverService.lockServerMembershipForAdmission(tx, input.serverId, input.userId);
+      if (role) return { kind: "already_member" };
+      const [departure] = await tx.select({ reason: serverMembershipDepartures.reason, role: serverMembershipDepartures.role })
+        .from(serverMembershipDepartures)
+        .where(and(eq(serverMembershipDepartures.serverId, input.serverId), eq(serverMembershipDepartures.userId, input.userId)));
+      // A Guest who left is not made a member either: promotion is an admin's call.
+      if (departure?.reason === "removed" || departure?.role === "guest") {
+        return { kind: "rejoin_needs_invite" };
+      }
+      const agreement = await serverAgreementService.requireSelfServeAgreement(tx, input.serverId, input.agreementInput);
+      const added = await serverService.addMember(input.serverId, input.userId, "member", {
+        executor: tx,
+        agreementAudit: {
+          actorUserId: input.userId,
+          source: "sso",
+          agreementId: agreement?.id ?? null,
+          ipAddress: input.agreementInput?.ipAddress,
+          userAgent: input.agreementInput?.userAgent,
+        },
+      });
+      return added ? { kind: "joined" } : { kind: "already_member" };
+    });
+  } catch (err) {
+    if (err instanceof HumanSeatLimitError) return { kind: "seats_full" };
+    if (err instanceof serverAgreementService.AgreementRequiredError) return { kind: "agreement_required" };
+    throw err;
+  }
 }
 
 export async function listPendingInvites(serverId: string) {

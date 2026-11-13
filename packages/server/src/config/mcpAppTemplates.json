@@ -1,0 +1,200 @@
+{
+  "templates": [
+    {
+      "key": "notion",
+      "name": "Notion",
+      "description": "Search and update the Notion workspace you authorize.",
+      "homepageUrl": "https://www.notion.so",
+      "logoUrl": "https://app.raft.build/app-logos/notion.svg",
+      "category": "Productivity & Collaboration",
+      "endpointUrl": "https://mcp.notion.com/mcp",
+      "authKind": "oauth"
+    },
+    {
+      "key": "linear",
+      "name": "Linear",
+      "description": "Find, create, and update Linear issues, projects, and comments.",
+      "homepageUrl": "https://linear.app",
+      "logoUrl": "https://app.raft.build/app-logos/linear.svg",
+      "category": "Productivity & Collaboration",
+      "endpointUrl": "https://mcp.linear.app/mcp",
+      "authKind": "oauth"
+    },
+    {
+      "key": "atlassian",
+      "name": "Jira and Confluence",
+      "description": "Issues and knowledge in the Atlassian site you authorize.",
+      "homepageUrl": "https://www.atlassian.com",
+      "logoUrl": "https://app.raft.build/app-logos/atlassian.svg",
+      "category": "Productivity & Collaboration",
+      "endpointUrl": "https://mcp.atlassian.com/v2/mcp",
+      "authKind": "oauth"
+    },
+    {
+      "key": "figma",
+      "name": "Figma",
+      "description": "Design context from Figma. Account access and OAuth client compatibility must be verified.",
+      "homepageUrl": "https://www.figma.com",
+      "logoUrl": "https://app.raft.build/app-logos/figma.svg",
+      "category": "Productivity & Collaboration",
+      "endpointUrl": "https://mcp.figma.com/mcp",
+      "authKind": "oauth",
+      "status": "retired"
+    },
+    {
+      "key": "gmail",
+      "name": "Gmail",
+      "description": "Email access. Requires Google Workspace Developer Preview, API enablement, and an OAuth client.",
+      "homepageUrl": "https://mail.google.com",
+      "logoUrl": "https://app.raft.build/app-logos/gmail.png",
+      "category": "Productivity & Collaboration",
+      "endpointUrl": "https://gmailmcp.googleapis.com/mcp/v1",
+      "authKind": "oauth"
+    },
+    {
+      "key": "drive",
+      "name": "Google Drive",
+      "description": "Files and search. Requires Google Workspace Developer Preview, API enablement, and an OAuth client.",
+      "homepageUrl": "https://drive.google.com",
+      "logoUrl": "https://app.raft.build/app-logos/drive.png",
+      "category": "Productivity & Collaboration",
+      "endpointUrl": "https://drivemcp.googleapis.com/mcp/v1",
+      "authKind": "oauth"
+    },
+    {
+      "key": "calendar",
+      "name": "Google Calendar",
+      "description": "Calendars and events. Requires Google Workspace Developer Preview, API enablement, and an OAuth client.",
+      "homepageUrl": "https://calendar.google.com",
+      "logoUrl": "https://app.raft.build/app-logos/calendar.png",
+      "category": "Productivity & Collaboration",
+      "endpointUrl": "https://calendarmcp.googleapis.com/mcp/v1",
+      "authKind": "oauth"
+    },
+    {
+      "key": "sentry",
+      "name": "Sentry",
+      "description": "Errors and debugging context in your Sentry organization.",
+      "homepageUrl": "https://sentry.io",
+      "logoUrl": "https://app.raft.build/app-logos/sentry.ico",
+      "category": "Productivity & Collaboration",
+      "endpointUrl": "https://mcp.sentry.dev/mcp",
+      "authKind": "oauth"
+    },
+    {
+      "key": "airtable",
+      "name": "Airtable",
+      "description": "Bases and records in the Airtable workspace you authorize.",
+      "homepageUrl": "https://airtable.com",
+      "logoUrl": "https://app.raft.build/app-logos/airtable.ico",
+      "category": "Productivity & Collaboration",
+      "endpointUrl": "https://mcp.airtable.com/mcp",
+      "authKind": "oauth",
+      "status": "retired"
+    },
+    {
+      "key": "monday",
+      "name": "monday.com",
+      "description": "Boards and work items. Workspace administrators may need to allow the callback URL.",
+      "homepageUrl": "https://monday.com",
+      "logoUrl": "https://app.raft.build/app-logos/monday.png",
+      "category": "Productivity & Collaboration",
+      "endpointUrl": "https://mcp.monday.com/mcp",
+      "authKind": "oauth"
+    },
+    {
+      "key": "asana",
+      "name": "Asana",
+      "description": "Tasks and projects. Register an OAuth client before connecting.",
+      "homepageUrl": "https://asana.com",
+      "logoUrl": "https://app.raft.build/app-logos/asana.ico",
+      "category": "Productivity & Collaboration",
+      "endpointUrl": "https://mcp.asana.com/v2/mcp",
+      "authKind": "oauth",
+      "status": "retired"
+    },
+    {
+      "key": "hubspot",
+      "name": "HubSpot",
+      "description": "CRM context. Requires a HubSpot auth app and account authorization.",
+      "homepageUrl": "https://www.hubspot.com",
+      "logoUrl": "https://app.raft.build/app-logos/hubspot.png",
+      "category": "Productivity & Collaboration",
+      "endpointUrl": "https://mcp.hubspot.com/",
+      "authKind": "oauth",
+      "status": "retired"
+    },
+    {
+      "key": "stripe",
+      "name": "Stripe",
+      "description": "Stripe account tools. Choose a test account and review tool permissions before use.",
+      "homepageUrl": "https://stripe.com",
+      "logoUrl": "https://app.raft.build/app-logos/stripe.svg",
+      "category": "Productivity & Collaboration",
+      "endpointUrl": "https://mcp.stripe.com/",
+      "authKind": "oauth"
+    },
+    {
+      "key": "supabase",
+      "name": "Supabase",
+      "description": "Supabase projects. Project-specific URL parameters are not yet supported by Raft.",
+      "homepageUrl": "https://supabase.com",
+      "logoUrl": "https://app.raft.build/app-logos/supabase.png",
+      "category": "Productivity & Collaboration",
+      "endpointUrl": "https://mcp.supabase.com/mcp",
+      "authKind": "oauth"
+    },
+    {
+      "key": "sheets",
+      "name": "Google Sheets",
+      "description": "Spreadsheets. Requires Google Workspace Developer Preview, API enablement, and an OAuth client.",
+      "homepageUrl": "https://sheets.google.com",
+      "logoUrl": "https://app.raft.build/app-logos/sheets.png",
+      "category": "Productivity & Collaboration",
+      "endpointUrl": "https://sheetsmcp.googleapis.com/mcp/v1",
+      "authKind": "oauth"
+    },
+    {
+      "key": "docs",
+      "name": "Google Docs",
+      "description": "Documents. Requires Google Workspace Developer Preview, API enablement, and an OAuth client.",
+      "homepageUrl": "https://docs.google.com",
+      "logoUrl": "https://app.raft.build/app-logos/docs.png",
+      "category": "Productivity & Collaboration",
+      "endpointUrl": "https://docsmcp.googleapis.com/mcp/v1",
+      "authKind": "oauth"
+    },
+    {
+      "key": "slides",
+      "name": "Google Slides",
+      "description": "Presentations. Requires Google Workspace Developer Preview, API enablement, and an OAuth client.",
+      "homepageUrl": "https://slides.google.com",
+      "logoUrl": "https://app.raft.build/app-logos/slides.png",
+      "category": "Productivity & Collaboration",
+      "endpointUrl": "https://slidesmcp.googleapis.com/mcp/v1",
+      "authKind": "oauth"
+    },
+    {
+      "key": "workiq",
+      "name": "Microsoft 365 Work IQ",
+      "description": "Microsoft 365 context. Requires tenant setup, delegated permissions, and an OAuth client.",
+      "homepageUrl": "https://www.microsoft.com/microsoft-365",
+      "logoUrl": "https://app.raft.build/app-logos/workiq.png",
+      "category": "Productivity & Collaboration",
+      "endpointUrl": "https://workiq.svc.cloud.microsoft/mcp",
+      "authKind": "oauth",
+      "status": "retired"
+    },
+    {
+      "key": "canva",
+      "name": "Canva",
+      "description": "Designs in your Canva account. Requires OAuth client setup before connecting.",
+      "homepageUrl": "https://www.canva.com",
+      "logoUrl": "https://app.raft.build/app-logos/canva.svg",
+      "category": "Productivity & Collaboration",
+      "endpointUrl": "https://api.canva.com/connect/v1/mcp",
+      "authKind": "oauth",
+      "status": "retired"
+    }
+  ]
+}

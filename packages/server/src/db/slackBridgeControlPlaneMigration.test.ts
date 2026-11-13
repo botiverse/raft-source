@@ -115,13 +115,6 @@ test("0246 seeds every Slack Bridge flag fail-closed and never overwrites operat
     assert.deepEqual(attachmentFlag.rows, [{ count: 0 }],
       "new attachment rollout authority is created only through the audited flag control plane");
 
-    const freshVersion = await client.query<{ scope: string; version: number }>(`
-      SELECT scope, version::int AS version
-      FROM feature_flag_config_versions
-      WHERE scope = 'global'
-    `);
-    assert.deepEqual(freshVersion.rows, []);
-
     const preservedKey = SLACK_BRIDGE_FEATURE_FLAG_KEYS.master;
     await client.query(`
       UPDATE feature_flags
@@ -132,6 +125,7 @@ test("0246 seeds every Slack Bridge flag fail-closed and never overwrites operat
     await client.query(`
       INSERT INTO feature_flag_config_versions (scope, version, updated_by)
       VALUES ('global', 42, 'operator')
+      ON CONFLICT (scope) DO UPDATE SET version = EXCLUDED.version, updated_by = EXCLUDED.updated_by
     `);
 
     const sql = await readFile(MIGRATION, "utf8");

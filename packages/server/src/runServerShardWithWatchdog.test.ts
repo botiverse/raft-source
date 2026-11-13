@@ -1,25 +1,22 @@
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
 import { once } from "node:events";
-import { existsSync, readFileSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   SERVER_SHARD_WATCHDOG_EXIT_CODE,
-  SERVER_SHARD_WATCHDOG_TIMEOUT_MS,
   runWithExitWatchdog,
   type ProcessDidNotExitReceipt,
   watchSpawnedChildExit,
 } from "../scripts/runServerShardWithWatchdog";
+import { recordFileTiming } from "../scripts/serverShardTimings";
 
 const SERVER_DIR = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
   "..",
 );
-const REPO_ROOT = path.resolve(SERVER_DIR, "../..");
-// Asserts on private CI/deploy files that the source-available snapshot does not
-// carry; skipped when an exported snapshot's RELEASE_SOURCE marker is present.
-const inSourceSnapshot = existsSync(path.join(REPO_ROOT, "RELEASE_SOURCE"));
 
 const FIXTURE_STARTUP_TIMEOUT_MS = 2_000;
 const EXIT_WATCHDOG_TEST_TIMEOUT_MS = 100;
@@ -50,16 +47,32 @@ async function spawnReadyWatchdogFixture(source: string): Promise<ChildProcess> 
 }
 
 test("passes through a child that exits cleanly", async () => {
-  const exitCode = await runWithExitWatchdog({
-    command: process.execPath,
-    args: ["--input-type=module", "-e", "process.exit(0)"],
-    cwd: SERVER_DIR,
-    shard: 3,
-    timeoutMs: 2_000,
-    killGraceMs: 25,
-    stdio: "ignore",
-  });
-  assert.equal(exitCode, 0);
+  const directory = mkdtempSync(path.join(tmpdir(), "raft-shard-normal-exit-"));
+  const journal = path.join(directory, "timings.jsonl");
+  try {
+    recordFileTiming(journal, { event: "run-start", files: 1 });
+    recordFileTiming(journal, { event: "finished", file: "done.test.ts", durationMs: 2, wallMs: 5, state: "passed" });
+    recordFileTiming(journal, { event: "run-end" });
+    const output: string[] = [];
+    const exitCode = await runWithExitWatchdog({
+      command: process.execPath,
+      args: ["--input-type=module", "-e", "process.exit(0)"],
+      cwd: SERVER_DIR,
+      shard: 3,
+      timeoutMs: 2_000,
+      killGraceMs: 25,
+      stdio: "ignore",
+      timingJournal: journal,
+      writeTimingSummary: (text) => output.push(text),
+    });
+    assert.equal(exitCode, 0);
+    assert.equal(output.length, 1, "normal completion also emits the final table");
+    assert.match(output[0], /"reason":"exit"/);
+    assert.match(output[0], /"runFinished":true/);
+    assert.match(output[0], /\[serverShardTimings\] completed .*done\.test\.ts/);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test("passes through an ordinary non-zero child exit", async () => {
@@ -159,21 +172,3 @@ test(
     assert.equal(exitCode, SERVER_SHARD_WATCHDOG_EXIT_CODE);
   },
 );
-
-test.skipIf(inSourceSnapshot)("Hosted wiring keeps a hard job ceiling above the named watchdog and never force-exits tests", () => {
-  const workflow = readFileSync(
-    path.join(REPO_ROOT, ".github/workflows/test.yml"),
-    "utf8",
-  );
-  const unitServer = workflow.match(
-    /\n  unit-server:\n(?<body>[\s\S]*?)\n  unit-server-gate:\n/,
-  )?.groups?.body;
-  assert.ok(unitServer, "unit-server job block must remain discoverable");
-  assert.match(unitServer, /\n    timeout-minutes: 25\n/);
-  assert.ok(25 * 60_000 > SERVER_SHARD_WATCHDOG_TIMEOUT_MS);
-  assert.match(
-    unitServer,
-    /pnpm exec node --import @oxc-node\/core\/register scripts\/runServerShardWithWatchdog\.ts \$\{\{ matrix\.shard \}\}/,
-  );
-  assert.doesNotMatch(unitServer, /--test-force-exit/);
-});

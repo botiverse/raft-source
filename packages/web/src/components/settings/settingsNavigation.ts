@@ -1,47 +1,54 @@
 import {
   BadgeInfo,
   Bell,
-  Blocks,
   Building2,
   CreditCard,
   FlaskConical,
   Languages,
   KeyRound,
-  Link2,
-  MessageSquare,
-  Network,
+  ArrowLeftRight,
+  Palette,
   Shield,
   Type,
   User,
+  AppWindow,
+  BellDot,
 } from "lucide-react";
-import type {
-  LucideIcon,
-} from "lucide-react";
+import { FeedbackIcon } from "@botiverse/ricons";
+import type { ComponentType, SVGProps } from "react";
 import type { MessageId } from "../../i18n/messages/en";
 import type { ServerCapabilities, ServerRole } from "@botiverse/raft-shared";
 
 const IM_BRIDGES_LABEL = "IM Bridges";
+// The on-screen titles come from SETTINGS_TAB_TITLE_ID; these are the legacy English fields.
+const THEME_LABEL = "Theme";
+const SERVER_NOTIFICATIONS_LABEL = "Notifications";
+
+/** A lucide or raft-ui icon component. */
+type SettingsTabIcon = ComponentType<SVGProps<SVGSVGElement>>;
 
 export const SETTINGS_TABS = [
   { id: "account", label: "Account", title: "Account", icon: User },
   { id: "language-region", label: "Language & Region", title: "Language & Region", icon: Languages },
   { id: "appearance", label: "Appearance", title: "Appearance", icon: Type },
   { id: "notifications", label: "Notifications", title: "Notifications", icon: Bell },
+  // The member's own settings in the current server (its theme, its mute).
+  { id: "theme", label: THEME_LABEL, title: THEME_LABEL, icon: Palette },
+  { id: "server-notifications", label: SERVER_NOTIFICATIONS_LABEL, title: SERVER_NOTIFICATIONS_LABEL, icon: BellDot },
   { id: "server", label: "Server Profile", title: "Server Profile", icon: Building2 },
   { id: "billing", label: "Plan & Billing", title: "Plan & Billing", icon: CreditCard },
   { id: "administration", label: "Administration", title: "Administration", icon: Shield },
-  { id: "im-bridges", label: IM_BRIDGES_LABEL, title: IM_BRIDGES_LABEL, icon: Network },
-  { id: "integrations", label: "Applications", title: "Applications", icon: Link2 },
+  { id: "im-bridges", label: IM_BRIDGES_LABEL, title: IM_BRIDGES_LABEL, icon: ArrowLeftRight },
+  { id: "integrations", label: "Applications", title: "Applications", icon: AppWindow },
   { id: "labs", label: "Labs", title: "Labs", icon: FlaskConical },
-  { id: "mcp", label: "MCP Servers", title: "MCP Servers", icon: Blocks },
   { id: "providers", label: "AI Providers", title: "AI Providers", icon: KeyRound },
   { id: "about", label: "About", title: "About", icon: BadgeInfo },
-  { id: "feedback", label: "Feedback", title: "My Feedback", icon: MessageSquare },
+  { id: "feedback", label: "Feedback", title: "My Feedback", icon: FeedbackIcon },
 ] as const satisfies ReadonlyArray<{
   id: string;
   label: string;
   title: string;
-  icon: LucideIcon;
+  icon: SettingsTabIcon;
 }>;
 
 export type SettingsTabId = typeof SETTINGS_TABS[number]["id"];
@@ -49,9 +56,7 @@ export type SettingsTabId = typeof SETTINGS_TABS[number]["id"];
 export function canOpenSettingsTab(
   tab: SettingsTabId,
   capabilities: ServerCapabilities,
-  role?: ServerRole | null,
 ): boolean {
-  if (role === "guest" && (tab === "integrations" || tab === "mcp")) return false;
   if (tab === "billing") return capabilities.viewBilling;
   if (tab === "administration") {
     return capabilities.changeMemberRoles
@@ -60,6 +65,15 @@ export function canOpenSettingsTab(
       || capabilities.editServerSettings;
   }
   return true;
+}
+
+/**
+ * Everyone opens Applications, a guest too: it holds each person's own
+ * link-preview answers (LinkPreviewConsentsRow). The server's Apps, MCP Apps
+ * included, and everything that manages or lists them, are not for guests.
+ */
+export function canViewServerApplications(role: ServerRole | null | undefined): boolean {
+  return role !== "guest";
 }
 
 export const SETTINGS_LABEL_BY_ID: Record<SettingsTabId, string> = Object.fromEntries(
@@ -83,8 +97,9 @@ export const SETTINGS_TAB_TITLE_ID: Record<SettingsTabId, MessageId> = {
   "language-region": "settings.tabs.languageRegion",
   appearance: "settings.tabs.appearance",
   notifications: "settings.tabs.notifications",
+  theme: "settings.tabs.theme",
+  "server-notifications": "settings.tabs.notifications",
   server: "settings.tabs.server",
-  mcp: "settings.tabs.mcp",
   providers: "settings.tabs.providers",
   labs: "settings.tabs.labs",
   billing: "settings.tabs.billingHeader",
@@ -94,13 +109,15 @@ export const SETTINGS_TAB_TITLE_ID: Record<SettingsTabId, MessageId> = {
   feedback: "settings.about.feedbackWorkspaceTitle",
 };
 
-export const SETTINGS_ICON_BY_ID: Record<SettingsTabId, LucideIcon> = Object.fromEntries(
+export const SETTINGS_ICON_BY_ID: Record<SettingsTabId, SettingsTabIcon> = Object.fromEntries(
   SETTINGS_TABS.map((tab) => [tab.id, tab.icon]),
-) as Record<SettingsTabId, LucideIcon>;
+) as Record<SettingsTabId, SettingsTabIcon>;
 
 const SETTINGS_ROUTE_ALIASES: Readonly<Record<string, SettingsTabId>> = {
   applications: "integrations",
-  "mcp-servers": "mcp",
+  // MCP Apps are Applications; the retired MCP Servers page's links land there.
+  mcp: "integrations",
+  "mcp-servers": "integrations",
   browser: "notifications",
   labs: "labs",
   moderation: "administration",
@@ -118,12 +135,16 @@ export function settingsTabIdForRouteSlug(slug: string | undefined): SettingsTab
 
 export function settingsRouteSlugForTab(tab: SettingsTabId): string {
   if (tab === "integrations") return "applications";
-  if (tab === "mcp") return "mcp-servers";
   return tab;
 }
 
+/** A settings slug that names Applications (its own, or an old alias of it). */
+export function isSettingsApplicationsSlug(slug: string | undefined): boolean {
+  return settingsTabIdForRouteSlug(slug) === "integrations";
+}
+
 export function legacySettingsRouteRedirectSlug(slug: string | undefined): string | null {
-  if (slug !== "integrations" && slug !== "browser" && slug !== "moderation") return null;
+  if (slug !== "integrations" && slug !== "browser" && slug !== "moderation" && slug !== "mcp" && slug !== "mcp-servers") return null;
   const tab = settingsTabIdForRouteSlug(slug);
   return tab ? settingsRouteSlugForTab(tab) : null;
 }

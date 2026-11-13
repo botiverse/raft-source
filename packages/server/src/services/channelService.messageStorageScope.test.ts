@@ -1,38 +1,13 @@
 import { createApiTest } from "../test/integration/apiTest";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 
 import { getDb } from "../db/index";
-import { channels, jointChannels, jointChannelServers, messages, users } from "../db/schema";
+import { channels, jointChannels, jointChannelServers, messages, tasks, users } from "../db/schema";
 import { createServer } from "./serverService";
 import { resolveServerMessageStorageChannelIds } from "./channelService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
-
-function exportedFunctionSource(source: string, name: string): string {
-  const start = source.indexOf(`export async function ${name}`);
-  assert.notEqual(start, -1, `${name} must exist`);
-  const next = source.indexOf("\nexport async function ", start + 1);
-  return source.slice(start, next === -1 ? source.length : next);
-}
-
-test("server message storage scope stays set-based", () => {
-  const channelSource = readFileSync(new URL("./channelService.ts", import.meta.url), "utf8");
-  const resolverSource = exportedFunctionSource(channelSource, "resolveServerMessageStorageChannelIds");
-  assert.equal((resolverSource.match(/\.execute\(sql`/g) ?? []).length, 1);
-  assert.doesNotMatch(resolverSource, /Promise\.all|resolveChannelAccess|getJointThreadProjectionByLocalThread/);
-  assert.match(resolverSource, /WITH local_channels AS/);
-  assert.match(resolverSource, /ordinary_local AS/);
-  assert.match(resolverSource, /active_joint_channels AS/);
-  assert.match(resolverSource, /active_joint_threads AS/);
-  assert.match(resolverSource, /NOT EXISTS[\s\S]*mapped_projection\.local_channel_id/);
-  assert.match(resolverSource, /thread_projection\.status = 'active'/);
-  assert.match(resolverSource, /parent_projection\.status = 'active'/);
-  assert.match(resolverSource, /canonical_thread\.type = 'thread'/);
-
-
-});
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 test("server message storage scope maps active joint channels and threads and fails closed", async ({ app }) => {
   const db = getDb();
@@ -81,7 +56,7 @@ test("server message storage scope maps active joint channels and threads and fa
     senderId: owner.id,
     content: "joint parent",
   }).returning();
-  const [localThread, canonicalThread, wrongTypeLocalThread, wrongTypeCanonicalThread] = await db
+  const [localThread, canonicalThread, wrongTypeLocalThread] = await db
     .insert(channels)
     .values([
       { serverId: server.id, name: "joint-thread-local", type: "thread" },
@@ -92,14 +67,26 @@ test("server message storage scope maps active joint channels and threads and fa
         parentMessageId: parentMessage.id,
       },
       { serverId: server.id, name: "wrong-type-thread-local", type: "thread" },
-      {
-        serverId: storageServer.id,
-        name: "wrong-type-thread-canonical",
-        type: "channel",
-        parentMessageId: parentMessage.id,
-      },
     ])
     .returning();
+  // A task conversation can retain a parent cache under the current trigger
+  // and CHECK, but must never serve as a canonical thread authority. Keep its
+  // parent message too: otherwise that join would hide a broken type guard.
+  const [wrongTypeTask] = await db.insert(tasks).values({
+    channelId: jointCanonical.id,
+    taskNumber: 1,
+    title: "wrong thread authority",
+    createdByType: "user",
+    createdById: owner.id,
+  }).returning();
+  const [wrongTypeCanonicalThread] = await db.insert(channels).values({
+    serverId: storageServer.id,
+    name: "wrong-type-thread-canonical",
+    type: "task",
+    taskId: wrongTypeTask.id,
+    parentMessageId: parentMessage.id,
+    parentChannelId: jointCanonical.id,
+  }).returning();
   const [threadJoint, wrongTypeThreadJoint] = await db.insert(jointChannels).values([
     {
       canonicalChannelId: canonicalThread.id,

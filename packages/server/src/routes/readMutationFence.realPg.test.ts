@@ -25,7 +25,7 @@ import { recordInboxNotificationFacts } from "../services/inboxNotificationServi
 import { createMessage } from "../services/messageService";
 import { createServer } from "../services/serverService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 const REAL_PG_URL = process.env.ACTOR_MEMBERSHIP_FENCE_REAL_PG_URL;
 const REAL_PG_REQUIRED = process.env.ACTOR_MEMBERSHIP_FENCE_REAL_PG_REQUIRED === "1";
@@ -43,7 +43,6 @@ async function withRealPgApp(run: (app: TestApp, observer: pg.Pool) => Promise<v
     await migrateRealPgTestDatabase(observer, MIGRATIONS_FOLDER);
     const app = await openTestApp(REAL_PG_URL, 0, {
       humanActivityMuteFlagDefaultEnabled: true,
-      onboardingOpenerFlagDefaultEnabled: false,
       skipAuthRateLimit: true,
     });
     try {
@@ -230,7 +229,7 @@ test("real PG route: POST /internal/agent-api/send still answers held when the a
     const seeded = await seed();
     const agent = await createAgent(seeded.server.id, "ReadRouteFenceBot", { runtime: "claude", model: "sonnet" });
     await addAgent(seeded.channel.id, agent.id);
-    const { apiKey } = await mintAgentCredential({ agentId: agent.id, scopes: ["send", "read"], name: "read-route-fence", createdByUserId: null });
+    const { apiKey } = await mintAgentCredential({ agentId: agent.id, scopes: ["send", "read"], name: "read-route-fence", issuedVia: "computer", createdByUserId: null });
     await markAgentLegacyRead(agent.id, seeded.channel.id, Number(seeded.latest.seq));
     const fresh = await createMessage(seeded.channel.id, "user", seeded.owner.id, "read-route-fence fresh unread");
     await recordInboxNotificationFacts([{
@@ -281,5 +280,44 @@ test("real PG route: POST /api/channels/:id/unread still succeeds for a demoted 
     const [member] = await getDb().select({ role: serverMembers.role }).from(serverMembers)
       .where(and(eq(serverMembers.serverId, seeded.server.id), eq(serverMembers.userId, seeded.actor.id)));
     assert.equal(member?.role, "member", "the demotion committed");
+  });
+});
+
+// #12135 follow-up: a level write (thread Follow / Unfollow, PUT /notification-levels) bumps the level counter in
+// user_notification_level_versions, never the member row, so it does not wait behind the fences that hold the row
+// FOR SHARE. Before, the bump was an UPDATE of server_members and queued behind every such holder.
+test("real PG route: a level write does not wait on the member row held FOR SHARE, and its version keeps rising", REAL_PG_TEST, async () => {
+  await withRealPgApp(async (app, observer) => {
+    const seeded = await seed();
+    const put = async (scope: "channel", id: string, level: string) => {
+      const res = await fetch(`${app.baseUrl}/api/notification-levels`, {
+        method: "PUT",
+        headers: { Authorization: `Bearer ${seeded.token}`, "X-Server-Id": seeded.server.id, "Content-Type": "application/json" },
+        body: JSON.stringify({ scope, id, level }),
+        signal: AbortSignal.timeout(LOCK_WAIT_TIMEOUT_MS),
+      });
+      assert.equal(res.status, 200, await res.clone().text());
+      return await res.json() as { prefsVersion: number };
+    };
+    // A version handed out by the legacy column is never reused.
+    await getDb().update(serverMembers).set({ notificationPrefsVersion: 41 })
+      .where(and(eq(serverMembers.serverId, seeded.server.id), eq(serverMembers.userId, seeded.actor.id)));
+    const session = await observer.connect();
+    try {
+      await session.query("BEGIN");
+      await session.query("SELECT 1 FROM server_members WHERE server_id = $1 AND user_id = $2 FOR SHARE", [seeded.server.id, seeded.actor.id]);
+      const channel = await put("channel", seeded.channel.id, "mentions");
+      const unfollowed = await post(app, seeded, "/api/channels/threads/unfollow", { threadChannelId: seeded.thread.id });
+      assert.equal(unfollowed.status, 200, await unfollowed.clone().text());
+      const followed = await post(app, seeded, "/api/channels/threads/follow", { parentMessageId: seeded.parent.id });
+      assert.equal(followed.status, 200, await followed.clone().text());
+      const again = await put("channel", seeded.channel.id, "all");
+      assert.equal(channel.prefsVersion, 42);
+      assert.equal(again.prefsVersion, 45, "Unfollow and Follow each moved the version");
+      await session.query("COMMIT");
+    } finally {
+      await session.query("ROLLBACK").catch(() => undefined);
+      session.release();
+    }
   });
 });

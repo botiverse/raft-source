@@ -118,7 +118,25 @@ export function detectNodeHostKind(options: NodeHostKindOptions = {}): NodeHostK
 export interface NodeHostLaunch {
   command: string;
   env: NodeJS.ProcessEnv;
+  /** Node options that go before the script entry: `command ...execArgv <entry> ...args`. */
+  execArgv: string[];
 }
+
+/**
+ * Electron in Node mode still sets `process.versions.electron`, and CLI
+ * parsers read that as "a packaged Electron app, argv[1] is the first user
+ * argument". commander's no-argument `parse()` (`_prepareUserArgs`, from
+ * "electron") and yargs' `hideBin` both make that call and only treat argv[1]
+ * as the script when `process.defaultApp` is set. We always launch
+ * `<electron> <script> ...`, which is the default-app shape, so the preload
+ * says so; otherwise the script path becomes a phantom first argument
+ * (`opencli list` -> "unknown command '<bin path>'", task #159).
+ * A data: URL keeps it one argument with no file to ship.
+ */
+export const ELECTRON_NODE_SCRIPT_EXEC_ARGV: readonly string[] = [
+  "--import",
+  "data:text/javascript,process.defaultApp=true",
+];
 
 /**
  * Raised when the current host cannot run a JavaScript entry and no Node host
@@ -161,11 +179,11 @@ export function resolveNodeHostLaunch(options: NodeHostLaunchOptions = {}): Node
 
   // Electron can be told to behave as Node.
   if (hostKind === "electron") {
-    return { command, env: { ...env, ELECTRON_RUN_AS_NODE: "1" } };
+    return { command, env: { ...env, ELECTRON_RUN_AS_NODE: "1" }, execArgv: [...ELECTRON_NODE_SCRIPT_EXEC_ARGV] };
   }
 
   // A real Node host runs the entry as-is.
-  if (hostKind === "node") return { command, env };
+  if (hostKind === "node") return { command, env, execArgv: [] };
 
   // `sea` cannot be switched into a Node mode, and `unknown` is by definition
   // a host whose capabilities we have not established. Neither may fall back

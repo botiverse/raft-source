@@ -1,0 +1,328 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raft.build/contract-cases/unread/case.schema.json",
+  "title": "Unread contract case",
+  "description": "One unread/thread rule both clients (web and the app) must agree on: a starting state, a sequence of abstract acts, and what the client sends and shows. See README.md in this directory.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["formatVersion", "id", "rule", "title", "status", "given", "steps"],
+  "properties": {
+    "formatVersion": {
+      "description": "Version of this format. A loader skips (and reports) a case whose version it does not know.",
+      "const": 1
+    },
+    "id": {
+      "description": "Same as the file name without `.json`.",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9-]*$"
+    },
+    "rule": {
+      "description": "The rule in the #proj-mobile:#70 inventory (R1..R12) or a display gap (S1..).",
+      "type": "string",
+      "pattern": "^[RS][0-9]+$"
+    },
+    "title": { "type": "string", "minLength": 1 },
+    "why": { "description": "Why the rule is what it is, in a sentence or two.", "type": "string" },
+    "status": {
+      "description": "`agreed`: `expect` is the rule. `pending-product-decision`: the clients differ and nobody has chosen yet; `decision.candidates` records each candidate and loaders skip-and-report the case.",
+      "enum": ["agreed", "pending-product-decision"]
+    },
+    "sources": {
+      "description": "Where each side implements the rule today (paths, optionally with line numbers). Documentation only.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "web": { "$ref": "#/$defs/stringList" },
+        "app": { "$ref": "#/$defs/stringList" },
+        "server": { "$ref": "#/$defs/stringList" }
+      }
+    },
+    "knownGaps": {
+      "description": "An agreed rule a client does not follow yet. That client's loader skips the case and reports the reason; the gap is removed when the client is fixed.",
+      "type": "array",
+      "items": { "$ref": "#/$defs/knownGap" }
+    },
+    "given": { "$ref": "#/$defs/given" },
+    "steps": {
+      "description": "Acts in order. May be empty: then the case is about how `given` is shown.",
+      "type": "array",
+      "items": { "$ref": "#/$defs/step" }
+    },
+    "checkpoints": {
+      "description": "Expectations part-way through (after a given step).",
+      "type": "array",
+      "items": { "$ref": "#/$defs/checkpoint" }
+    },
+    "expect": { "$ref": "#/$defs/expectation" },
+    "decision": { "$ref": "#/$defs/decision" }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "status": { "const": "agreed" } } },
+      "then": {
+        "required": ["expect"],
+        "properties": { "expect": true, "decision": false }
+      }
+    },
+    {
+      "if": { "properties": { "status": { "const": "pending-product-decision" } } },
+      "then": {
+        "required": ["decision"],
+        "properties": { "decision": true, "expect": false, "checkpoints": false, "knownGaps": false }
+      }
+    }
+  ],
+  "$defs": {
+    "stringList": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "client": { "enum": ["web", "app"] },
+    "knownGap": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["client", "reason"],
+      "properties": {
+        "client": { "$ref": "#/$defs/client" },
+        "reason": { "type": "string", "minLength": 1 },
+        "followUp": { "description": "Task or PR that closes the gap.", "type": "string" }
+      }
+    },
+    "given": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["conversation"],
+      "properties": {
+        "conversation": {
+          "description": "The conversation the case is about. Its `id` is the one in request paths and event payloads.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["id", "kind"],
+          "properties": {
+            "id": { "type": "string", "minLength": 1 },
+            "kind": { "enum": ["channel", "thread", "dm"] }
+          }
+        },
+        "openThread": {
+          "description": "The thread the person has open (its conversation id) when the case starts.",
+          "type": "string",
+          "minLength": 1
+        },
+        "row": { "$ref": "#/$defs/row" },
+        "jumpTarget": {
+          "description": "The unread followed thread a jump pill targets, as the followed-threads list describes it. `null` = the field is absent (an older server).",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["parentInHistory", "repliesInHistory"],
+          "properties": {
+            "parentInHistory": { "type": ["boolean", "null"] },
+            "repliesInHistory": { "type": ["boolean", "null"] }
+          }
+        }
+      }
+    },
+    "row": {
+      "description": "The conversation's row inputs, as the unread summary and the client's stores hold them.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["joined", "muted", "unread"],
+      "properties": {
+        "joined": { "type": "boolean" },
+        "muted": { "description": "Activity muted by the person.", "type": "boolean" },
+        "unread": { "description": "The conversation's own unread count (a seq distance, not a row count).", "type": "integer", "minimum": 0 },
+        "threads": { "description": "Followed threads under it with unread replies (threads, not replies).", "type": "integer", "minimum": 0 },
+        "hasNew": { "description": "The summary's `hasNew`: a not-joined channel with messages past the cursor (no exact count).", "type": "boolean" },
+        "markedUnread": { "description": "Marked unread with nothing countable.", "type": "boolean" },
+        "mention": { "description": "An unread mention of the person.", "type": "boolean" }
+      }
+    },
+    "step": {
+      "type": "object",
+      "required": ["act"],
+      "oneOf": [
+        {
+          "description": "The person picks Mark as Unread.",
+          "additionalProperties": false,
+          "required": ["act", "surface"],
+          "properties": {
+            "act": { "const": "markUnread" },
+            "surface": {
+              "description": "threadMenu: the open thread's own menu (header or a message in it). activityRow: an Activity row's menu or swipe. conversationRow: a sidebar/Home row's menu. channelMessage: a message's menu in the open channel.",
+              "enum": ["threadMenu", "activityRow", "conversationRow", "channelMessage"]
+            }
+          }
+        },
+        {
+          "description": "The server answers the earliest request that has no answer yet.",
+          "additionalProperties": false,
+          "required": ["act", "status"],
+          "properties": {
+            "act": { "const": "serverResponds" },
+            "status": { "type": "integer", "minimum": 100, "maximum": 599 },
+            "body": { "type": "object" },
+            "from": {
+              "description": "olderServer: an answer from a server older than the current contract (not checked against it).",
+              "enum": ["olderServer"]
+            }
+          }
+        },
+        {
+          "description": "A realtime (socket) event arrives.",
+          "additionalProperties": false,
+          "required": ["act", "type", "payload"],
+          "properties": {
+            "act": { "const": "realtimeEvent" },
+            "type": { "description": "The socket event name, e.g. read_state:updated.", "type": "string", "minLength": 1 },
+            "payload": { "type": "object" }
+          }
+        },
+        {
+          "description": "A reply from someone else arrives in the open thread. visible: it is on screen, so an auto-read would fire.",
+          "additionalProperties": false,
+          "required": ["act", "visible"],
+          "properties": {
+            "act": { "const": "replyArrives" },
+            "visible": { "type": "boolean" }
+          }
+        },
+        {
+          "description": "The person leaves the open thread (closes it or opens another one).",
+          "additionalProperties": false,
+          "required": ["act"],
+          "properties": { "act": { "const": "leaveThread" } }
+        },
+        {
+          "description": "The person taps the jump-to-unread-thread pill for `given.jumpTarget`.",
+          "additionalProperties": false,
+          "required": ["act"],
+          "properties": { "act": { "const": "jumpToUnreadThread" } }
+        },
+        {
+          "description": "The jump to the thread's parent finishes. historyLimited: it landed on the history paywall instead of the parent.",
+          "additionalProperties": false,
+          "required": ["act", "historyLimited"],
+          "properties": {
+            "act": { "const": "jumpLands" },
+            "historyLimited": { "type": "boolean" }
+          }
+        }
+      ]
+    },
+    "request": {
+      "description": "A mutating request (GET requests are never asserted).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["method", "path"],
+      "properties": {
+        "method": { "enum": ["POST", "PUT", "PATCH", "DELETE"] },
+        "path": { "description": "The server path including /api, with the given ids.", "type": "string", "pattern": "^/api/" }
+      }
+    },
+    "state": {
+      "description": "What the client shows. Only the listed keys are asserted.",
+      "type": "object",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "properties": {
+        "outcome": {
+          "description": "What the Mark as Unread answer means: counted, marked, nothing, or pending (202: admitted, result unknown).",
+          "enum": ["counted", "marked", "nothing", "pending"]
+        },
+        "unreadState": {
+          "description": "The unread state an act leaves on the conversation: none, a number, or the marked-unread dot. How a row draws it (given joined/muted) is rowDisplay.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind"],
+          "properties": {
+            "kind": { "enum": ["none", "count", "dot"] },
+            "count": { "type": "integer", "minimum": 1 }
+          },
+          "if": { "properties": { "kind": { "const": "count" } } },
+          "then": { "required": ["count"], "properties": { "count": true } },
+          "else": { "properties": { "count": false } }
+        },
+        "toast": {
+          "description": "The toast shown by the last act, by abstract id (markUnreadNothing, markUnreadFailed), or null for none.",
+          "type": ["string", "null"]
+        },
+        "holdActive": {
+          "description": "Auto-read is held for the conversation (it stays unread while open).",
+          "type": "boolean"
+        },
+        "threadUnreadCleared": {
+          "description": "The thread's unread was read away (locally and with the server).",
+          "type": "boolean"
+        },
+        "rowDisplay": { "$ref": "#/$defs/rowDisplay" }
+      }
+    },
+    "rowDisplay": {
+      "description": "How the conversation's sidebar/Home row shows unread.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind"],
+      "properties": {
+        "kind": {
+          "description": "loud: the pink count badge. quiet: a grey number. newDot: the quiet dot of a not-joined channel with new messages. markedDot: the quiet dot of a marked-unread row. none.",
+          "enum": ["loud", "quiet", "newDot", "markedDot", "none"]
+        },
+        "segments": {
+          "description": "The numbers shown; an absent segment is not shown.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "unread": { "type": "integer", "minimum": 1 },
+            "threads": { "type": "integer", "minimum": 1 }
+          }
+        },
+        "unreadTone": { "description": "The row's name is in the unread (bold) tone.", "type": "boolean" }
+      }
+    },
+    "expectation": {
+      "type": "object",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "properties": {
+        "requests": {
+          "description": "Every mutating request sent since the case started, in order. Absent = not asserted; [] = none.",
+          "type": "array",
+          "items": { "$ref": "#/$defs/request" }
+        },
+        "state": { "$ref": "#/$defs/state" }
+      }
+    },
+    "checkpoint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["afterStep"],
+      "minProperties": 2,
+      "properties": {
+        "afterStep": { "description": "1-based index into `steps`.", "type": "integer", "minimum": 1 },
+        "requests": { "$ref": "#/$defs/expectation/properties/requests" },
+        "state": { "$ref": "#/$defs/state" }
+      }
+    },
+    "decision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["question", "owner", "candidates"],
+      "properties": {
+        "question": { "type": "string", "minLength": 1 },
+        "owner": { "description": "Who decides.", "type": "string", "minLength": 1 },
+        "candidates": {
+          "type": "array",
+          "minItems": 2,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id", "summary", "currentBehaviourOf", "expect"],
+            "properties": {
+              "id": { "type": "string", "pattern": "^[a-z][a-zA-Z0-9-]*$" },
+              "summary": { "type": "string", "minLength": 1 },
+              "currentBehaviourOf": { "description": "The clients that behave like this today.", "type": "array", "items": { "$ref": "#/$defs/client" } },
+              "checkpoints": { "type": "array", "items": { "$ref": "#/$defs/checkpoint" } },
+              "expect": { "$ref": "#/$defs/expectation" }
+            }
+          }
+        }
+      }
+    }
+  }
+}

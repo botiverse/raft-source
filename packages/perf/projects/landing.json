@@ -1,0 +1,5 @@
+{
+  "project": "landing",
+  "envs": { "production": { "origin": "https://raft.build" } },
+  "pages": [{ "name": "home", "path": "/", "ready": { "selector": "main h1" } }]
+}

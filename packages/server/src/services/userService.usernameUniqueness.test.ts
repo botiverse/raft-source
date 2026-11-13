@@ -6,7 +6,7 @@ import { CURRENT_LEGAL_ACCEPTANCE } from "@botiverse/raft-shared";
 
 import { createSocialUser } from "./userService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 test("concurrent social signups retain unique-name retry semantics", async ({ app }) => {
   const suffix = randomUUID().slice(0, 8);

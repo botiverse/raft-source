@@ -3,17 +3,17 @@ import assert from "node:assert/strict";
 import { randomBytes, randomUUID } from "node:crypto";
 
 import argon2 from "argon2";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 
 import { getDb } from "../db/index";
-import { users, machines } from "../db/schema";
+import { computers, integrationAuditEvents, users, machines } from "../db/schema";
 import { openTestApp } from "../test/integration/app";
-import { signAccessToken } from "../middleware/auth";
+import { accessTokenForTest } from "../test/integration/credentials";
 import { createServer, addMember, transitionMemberRole } from "../services/serverService";
 import { extractApiKeyFingerprint, extractApiKeyPrefix, registerMachine } from "../services/machineService";
 import { __setMachinePrincipalFenceHandlerForTests } from "../replicaRouter";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 // task #39 PR-J1 regression guard — legacy daemon adoption surface
 // (RFC v0.8 v8.2 §5.11 / §10.13).
@@ -41,7 +41,7 @@ async function withEnv<T>(
   const oldGate = process.env.SLOCK_DEVICE_LOGIN_ENABLED;
   if (enabled) delete process.env.SLOCK_DEVICE_LOGIN_ENABLED;
   else process.env.SLOCK_DEVICE_LOGIN_ENABLED = "false";
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     return await fn(app);
   } finally {
@@ -64,7 +64,7 @@ async function seedUser(label = "adopt"): Promise<{ id: string; bearer: string }
       emailVerified: true,
     })
     .returning();
-  return { id: u.id, bearer: signAccessToken(u.id) };
+  return { id: u.id, bearer: await accessTokenForTest(u.id) };
 }
 
 test("adopt-legacy: surface 404 when gate explicitly disabled", async () => {
@@ -326,6 +326,40 @@ test("adopt-legacy A3: server admin can adopt another user's row and retry resum
       .from(machines)
       .where(eq(machines.id, machine.id));
     assert.notEqual(row.legacyKeyMigratedAt, null);
+
+    // The first adoption moved another member's machine: audited once (the
+    // retry is a resume, not a second move), naming who moved it and whose it was.
+    const moved = await db.select().from(integrationAuditEvents).where(and(
+      eq(integrationAuditEvents.serverId, server.id),
+      eq(integrationAuditEvents.eventType, "computer.legacy_adopted_by_other"),
+    ));
+    assert.equal(moved.length, 1);
+    assert.equal(moved[0]!.actorId, admin.id);
+    assert.equal(moved[0]!.subjectId, owner.id);
+    assert.equal(moved[0]!.targetId, firstBody.computerId);
+    assert.equal(moved[0]!.metadata.via, "session");
+    assert.equal(moved[0]!.metadata.machineAddedByUserId, owner.id);
+    assert.equal(moved[0]!.metadata.grantId, undefined);
+
+    // Only the resume rotated a key: one computer.key_rotated, without the key.
+    const rotated = await db.select().from(integrationAuditEvents).where(and(
+      eq(integrationAuditEvents.serverId, server.id),
+      eq(integrationAuditEvents.eventType, "computer.key_rotated"),
+    ));
+    assert.equal(rotated.length, 1);
+    assert.equal(rotated[0]!.actorType, "human");
+    assert.equal(rotated[0]!.actorId, admin.id);
+    assert.equal(rotated[0]!.requesterId, admin.id, "the admin attached the Computer on the first adoption");
+    assert.equal(rotated[0]!.targetType, "computer");
+    assert.equal(rotated[0]!.targetId, firstBody.computerId);
+    assert.deepEqual(rotated[0]!.metadata, {
+      computerId: firstBody.computerId,
+      computerName: "admin-adopted-computer",
+      machineId: machine.id,
+      reason: "adoption_resume",
+      actorRole: "admin",
+    });
+    assert.ok(!JSON.stringify(rotated).includes(secondBody.apiKey));
   });
 });
 
@@ -360,6 +394,134 @@ test("adopt-legacy A3: row creator keeps adoption authority after demotion to me
       .from(machines)
       .where(eq(machines.id, machine.id));
     assert.notEqual(row.legacyKeyMigratedAt, null);
+  });
+});
+
+async function adoptByDaemonId(app: Awaited<ReturnType<typeof openTestApp>>, bearer: string, serverSlug: string, daemonId: string) {
+  const res = await fetch(`${app.baseUrl}/api/computer/adopt-legacy`, {
+    method: "POST",
+    headers: jsonHeaders({ Authorization: `Bearer ${bearer}` }),
+    body: JSON.stringify({ serverSlug, daemonId }),
+  });
+  return { status: res.status, body: (await res.json()) as { code?: string; apiKey?: string; computerId?: string; resumed?: boolean } };
+}
+
+async function computerPreflightStatus(app: Awaited<ReturnType<typeof openTestApp>>, apiKey: string): Promise<number> {
+  const res = await fetch(`${app.baseUrl}/internal/computer/preflight`, {
+    method: "POST",
+    headers: jsonHeaders({ Authorization: `Bearer ${apiKey}` }),
+    body: "{}",
+  });
+  return res.status;
+}
+
+test("adopt-legacy A3: registrant without registerMachines cannot re-adopt a machine whose attached Computer was revoked", async () => {
+  await withEnv(true, async (app) => {
+    const owner = await seedUser("owner");
+    const registrant = await seedUser("registrant");
+    const slug = `adopt-daemon-${randomUUID()}`;
+    const server = await createServer("Adopt Co", slug, owner.id);
+    await addMember(server.id, registrant.id, "admin");
+
+    // Attached through the regular attach flow while admin: legacyKeyMigratedAt stays NULL.
+    const attach = await fetch(`${app.baseUrl}/api/computer/attach`, {
+      method: "POST",
+      headers: jsonHeaders({ Authorization: `Bearer ${registrant.bearer}` }),
+      body: JSON.stringify({ serverSlug: slug, name: "attached-computer" }),
+    });
+    assert.equal(attach.status, 201);
+    const { machineId } = (await attach.json()) as { machineId: string };
+
+    await transitionMemberRole({ serverId: server.id, actorUserId: owner.id, targetUserId: registrant.id, nextRole: "member" });
+    const revoke = await fetch(`${app.baseUrl}/api/servers/${server.id}/machines/${machineId}/revoke-computer-key`, {
+      method: "POST",
+      headers: jsonHeaders({ Authorization: `Bearer ${owner.bearer}`, "X-Server-Id": server.id }),
+      body: "{}",
+    });
+    assert.equal(revoke.status, 200);
+
+    const db = getDb();
+    const before = await db.select({ id: computers.id }).from(computers).where(eq(computers.machineId, machineId));
+
+    const refused = await adoptByDaemonId(app, registrant.bearer, slug, machineId);
+    assert.equal(refused.status, 403);
+    assert.equal(refused.body.code, "requires_admin");
+
+    const after = await db.select({ id: computers.id }).from(computers).where(eq(computers.machineId, machineId));
+    assert.equal(after.length, before.length, "no new Computer row");
+    const [row] = await db
+      .select({ legacyKeyMigratedAt: machines.legacyKeyMigratedAt })
+      .from(machines)
+      .where(eq(machines.id, machineId));
+    assert.equal(row.legacyKeyMigratedAt, null, "refusal leaves the machine row untouched");
+
+    // An admin keeps the authority to adopt it.
+    const adopted = await adoptByDaemonId(app, owner.bearer, slug, machineId);
+    assert.equal(adopted.status, 201);
+    assert.equal(adopted.body.resumed, false);
+  });
+});
+
+test("adopt-legacy A2/A3: registrant without registerMachines cannot rotate a Computer an admin attached", async () => {
+  await withEnv(true, async (app) => {
+    const owner = await seedUser("owner");
+    const registrant = await seedUser("registrant");
+    const slug = `adopt-daemon-${randomUUID()}`;
+    const server = await createServer("Adopt Co", slug, owner.id);
+    await addMember(server.id, registrant.id, "member");
+    const { machine, apiKey: legacyKey } = await registerMachine(server.id, registrant.id, "member-daemon");
+
+    const adminAdopted = await adoptByDaemonId(app, owner.bearer, slug, machine.id);
+    assert.equal(adminAdopted.status, 201);
+    const adminKey = adminAdopted.body.apiKey!;
+
+    const byDaemonId = await adoptByDaemonId(app, registrant.bearer, slug, machine.id);
+    assert.equal(byDaemonId.status, 403);
+    assert.equal(byDaemonId.body.code, "requires_admin");
+
+    const byFingerprint = await fetch(`${app.baseUrl}/api/computer/adopt-legacy`, {
+      method: "POST",
+      headers: jsonHeaders({ Authorization: `Bearer ${registrant.bearer}` }),
+      body: JSON.stringify({ serverSlug: slug, legacyMachineId: machine.id, apiKeyFingerprint: extractApiKeyFingerprint(legacyKey) }),
+    });
+    assert.equal(byFingerprint.status, 403);
+    assert.equal((await byFingerprint.json() as { code?: string }).code, "requires_admin");
+
+    assert.equal(await computerPreflightStatus(app, adminKey), 200, "the admin's Computer key still authenticates");
+    const db = getDb();
+    const rotated = await db.select().from(integrationAuditEvents).where(and(
+      eq(integrationAuditEvents.serverId, server.id),
+      eq(integrationAuditEvents.eventType, "computer.key_rotated"),
+    ));
+    assert.equal(rotated.length, 0);
+
+    // The admin can still resume their own adoption.
+    const resumed = await adoptByDaemonId(app, owner.bearer, slug, machine.id);
+    assert.equal(resumed.status, 201);
+    assert.equal(resumed.body.resumed, true);
+    assert.equal(resumed.body.computerId, adminAdopted.body.computerId);
+  });
+});
+
+test("adopt-legacy A3: member registrant adopts a never-migrated machine and resumes their own adoption", async () => {
+  await withEnv(true, async (app) => {
+    const owner = await seedUser("owner");
+    const registrant = await seedUser("registrant");
+    const slug = `adopt-daemon-${randomUUID()}`;
+    const server = await createServer("Adopt Co", slug, owner.id);
+    await addMember(server.id, registrant.id, "member");
+    const { machine } = await registerMachine(server.id, registrant.id, "member-daemon");
+
+    const first = await adoptByDaemonId(app, registrant.bearer, slug, machine.id);
+    assert.equal(first.status, 201);
+    assert.equal(first.body.resumed, false);
+
+    const second = await adoptByDaemonId(app, registrant.bearer, slug, machine.id);
+    assert.equal(second.status, 201);
+    assert.equal(second.body.resumed, true);
+    assert.equal(second.body.computerId, first.body.computerId);
+    assert.notEqual(second.body.apiKey, first.body.apiKey);
+    assert.equal(await computerPreflightStatus(app, second.body.apiKey!), 200);
   });
 });
 
@@ -601,7 +763,6 @@ test("adopt-legacy D: caller not member of machine's server → 403 not_authoriz
       actorUserId: owner.id,
       targetUserId: stranger.id,
       nextRole: "admin",
-      guestTransitionsEnabled: true,
     });
     const nowAdmin = await fetch(`${app.baseUrl}/api/computer/adopt-legacy`, {
       method: "POST",

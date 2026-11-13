@@ -7,6 +7,7 @@ import { joinRaftChannelByTarget } from "@botiverse/raft-shared/src/agentCliSurf
 import { createAgentApiContractSurfaceClient } from "../../agentApiPath";
 import { defineCommand, registerCliCommand } from "../../core/command";
 import type { CommandRuntimeOptions } from "../../core/context";
+import { rateLimitedResponseError } from "../../core/apiFailure";
 import { CliError } from "../../core/errors";
 import { writeText, adoptCliReplyText } from "../../core/renderer";
 
@@ -47,6 +48,10 @@ export const channelJoinCommand = defineCommand(
       { target },
     );
     if (!result.ok) {
+      const rateLimited = result.error.kind === "http"
+        ? rateLimitedResponseError({ status: result.error.status, errorBody: result.error.response })
+        : null;
+      if (rateLimited) throw rateLimited;
       const code = result.operation === "validate_target"
         ? "INVALID_TARGET"
         : result.operation === "resolve_target"

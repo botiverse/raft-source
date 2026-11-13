@@ -11,6 +11,10 @@
  *
  * Machine-level, one file for all runners on this Raft home: runtime CLIs are
  * found the same way by every runner of the service.
+ *
+ * A runtime that ships with the Computer (`RuntimeDriver.shipsWithComputer`:
+ * builtin, pi, kimi-sdk) is not a CLI on PATH: its version goes down exactly
+ * when the Computer does, so it has no record here and never a notice.
  */
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
@@ -84,17 +88,27 @@ export function compareRuntimeCliVersions(a: string, b: string): number | null {
  * the next state. A runtime not detected this round keeps its record (it may
  * be a probe that did not finish), and a downgrade notice clears once the
  * detected version is back at or above the version it fell from.
+ *
+ * `shippedWithComputer` runtimes are not compared, and what an earlier
+ * Computer recorded for them is dropped: a notice it wrote stops showing, and
+ * a Computer from before this rule, started after a downgrade to it, finds no
+ * earlier version to warn about.
  */
 export function observeRuntimeCliVersions(
   state: RuntimeCliVersionState,
   detected: Record<string, string>,
   now: Date,
+  shippedWithComputer: ReadonlySet<string>,
 ): { changes: RuntimeCliVersionChange[]; next: RuntimeCliVersionState } {
   const changes: RuntimeCliVersionChange[] = [];
   const versions = { ...state.versions };
   const downgrades = { ...state.downgrades };
+  for (const runtime of shippedWithComputer) {
+    delete versions[runtime];
+    delete downgrades[runtime];
+  }
   for (const [runtime, to] of Object.entries(detected)) {
-    if (!to) continue;
+    if (!to || shippedWithComputer.has(runtime)) continue;
     const from = versions[runtime];
     versions[runtime] = to;
     const notice = downgrades[runtime];
@@ -109,6 +123,60 @@ export function observeRuntimeCliVersions(
     }
   }
   return { changes, next: { schemaVersion: 1, versions, downgrades } };
+}
+
+export interface RuntimeCliVersionDrift {
+  runtime: string;
+  /** The live processes' version; the most common one when they differ. */
+  from: string;
+  /** The version this detection found. */
+  to: string;
+  /** Of `to` against every drifted process's version; `unknown` when not comparable or not the same for all. */
+  direction: "upgrade" | "downgrade" | "unknown";
+  /** Live processes of this runtime whose version differs from `to`. */
+  liveAgents: number;
+  /** How many different versions those processes run. */
+  fromVersions: number;
+}
+
+/**
+ * Reconciler step 15 (B12, measure only): the live processes whose own CLI
+ * version differs from what this detection found, one entry per runtime.
+ * Pure. A runtime this detection did not report has no drift (its probe may
+ * not have finished), nor does a process whose version is the same.
+ */
+export function runtimeCliVersionDrift(
+  live: ReadonlyArray<{ runtime: string; version: string }>,
+  detected: Record<string, string>,
+): RuntimeCliVersionDrift[] {
+  const byRuntime = new Map<string, Map<string, number>>();
+  for (const { runtime, version } of live) {
+    const to = detected[runtime];
+    if (!to || !version || version === to) continue;
+    const counts = byRuntime.get(runtime) ?? new Map<string, number>();
+    counts.set(version, (counts.get(version) ?? 0) + 1);
+    byRuntime.set(runtime, counts);
+  }
+  const drifts: RuntimeCliVersionDrift[] = [];
+  for (const [runtime, counts] of byRuntime) {
+    const to = detected[runtime]!;
+    let from = "";
+    let fromCount = 0;
+    let liveAgents = 0;
+    const directions = new Set<RuntimeCliVersionDrift["direction"]>();
+    for (const [version, count] of counts) {
+      liveAgents += count;
+      if (count > fromCount) {
+        from = version;
+        fromCount = count;
+      }
+      const cmp = compareRuntimeCliVersions(to, version);
+      directions.add(cmp === null || cmp === 0 ? "unknown" : cmp > 0 ? "upgrade" : "downgrade");
+    }
+    const direction = directions.size === 1 ? [...directions][0]! : "unknown";
+    drifts.push({ runtime, from, to, direction, liveAgents, fromVersions: counts.size });
+  }
+  return drifts;
 }
 
 export async function writeRuntimeCliVersionState(slockHome: string, state: RuntimeCliVersionState): Promise<void> {

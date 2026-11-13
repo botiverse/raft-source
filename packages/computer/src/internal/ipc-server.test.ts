@@ -23,6 +23,7 @@ import { dirname, join } from "node:path";
 import { connectService } from "../lib/ipc-client";
 import { ServiceClientError, type RequestMethodMap } from "../lib/types";
 import { createIpcServer, type IpcServer, type RequestHandlerMap } from "./ipc-server";
+import { probeServiceIpc } from "../residentLifecycleBridge";
 
 // Canonical `ComputerStatusReport` fixture — matches the lib/types.ts
 // `ServiceStatusResult` shape exactly so handler return types
@@ -164,7 +165,7 @@ test("ipc-server — handler throwing non-ServiceClientError normalizes to IPC_M
   });
 });
 
-test("ipc-server — request for unknown method responds with IPC_MALFORMED_FRAME", async () => {
+test("task #166: ipc-server — request for unknown method responds with the typed IPC_METHOD_UNSUPPORTED", async () => {
   await withHarness({}, async ({ installRoot }) => {
     const client = await connectService(installRoot);
     await assert.rejects(
@@ -172,7 +173,7 @@ test("ipc-server — request for unknown method responds with IPC_MALFORMED_FRAM
       () => client.request("service-status", undefined),
       (err: unknown) => {
         assert.ok(err instanceof ServiceClientError);
-        assert.equal(err.code, "IPC_MALFORMED_FRAME");
+        assert.equal(err.code, "IPC_METHOD_UNSUPPORTED");
         return true;
       },
     );
@@ -432,4 +433,13 @@ test("POSIX IPC protects its directory before accepting clients", async () => {
     assert.equal((await stat(dirname(socketPath))).mode & 0o777, 0o700);
     assert.equal((await stat(socketPath)).mode & 0o777, 0o600);
   });
+});
+
+test("probeServiceIpc: true while the service listens, false once it is gone", async () => {
+  let root = "";
+  await withHarness({ "service-status": async () => STATUS_FIXTURE }, async ({ installRoot }) => {
+    root = installRoot;
+    assert.equal(await probeServiceIpc(installRoot), true);
+  });
+  assert.equal(await probeServiceIpc(root, 1_000), false);
 });

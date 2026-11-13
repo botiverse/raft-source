@@ -19,6 +19,11 @@
  *
  * no_models is retryable because the user may add models on the Computer;
  * missing_config and unsupported need a change the form cannot make.
+ *
+ * `state` (additive, next to `status`; computerProbeCacheService), only when
+ * the Computer did not answer in time: stale when the list is its last good
+ * one (then `fallback` + probe_timeout, with `fetchedAt`); unavailable when
+ * there is no earlier list (the resolver's probe_timeout answer above).
  */
 import type {
   RuntimeFormV2OptionSourceReason,
@@ -27,6 +32,8 @@ import type {
 import type { RuntimeModelSourceOutcome } from "@botiverse/raft-shared";
 
 import { RouteFailureError } from "../tracing/routeFailure";
+import type { ComputerProbeFreshness } from "./computerProbeCacheService";
+import type { RuntimeFormV2OptionSourceBody } from "./runtimeFormV2Registry";
 
 export const RUNTIME_FORM_V2_REASON_RETRYABLE: Readonly<Record<RuntimeFormV2OptionSourceReason, boolean>> = Object.freeze({
   probe_timeout: true,
@@ -75,4 +82,25 @@ export function optionSourceStatusFields(
 ): RuntimeFormV2SourceStatusFields {
   if (reason === null) return { status: "live" };
   return { status: hasOptions ? "fallback" : "unavailable", reason, retryable: RUNTIME_FORM_V2_REASON_RETRYABLE[reason] };
+}
+
+/**
+ * Add the probe's `state` to a v2 source that reports a `status` (sources
+ * without one, such as a static provider select, stay as they are); a probe
+ * the Computer answered in time adds nothing, so those bodies are unchanged. A stale
+ * list is not live: it is reported as a `fallback` that timed out, so a client
+ * that ignores `state` still offers a retry.
+ */
+export function optionSourceWithProbeState(
+  source: RuntimeFormV2OptionSourceBody,
+  freshness: ComputerProbeFreshness,
+): RuntimeFormV2OptionSourceBody {
+  if (source.status === undefined || freshness.state === "ok") return source;
+  if (freshness.state === "unavailable") return { ...source, state: "unavailable" };
+  return {
+    ...source,
+    ...(source.status === "live" ? optionSourceStatusFields("probe_timeout", true) : {}),
+    state: "stale",
+    fetchedAt: freshness.fetchedAt,
+  };
 }

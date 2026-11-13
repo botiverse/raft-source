@@ -64,6 +64,15 @@ export const RAFT_OAUTH_SCOPES_SUPPORTED = Object.keys(RAFT_OAUTH_SCOPE_CATALOG)
 export const RAFT_OAUTH_DEFAULT_ALLOWED_SCOPES = RAFT_OAUTH_SCOPES_SUPPORTED
   .filter((scope) => RAFT_OAUTH_SCOPE_CATALOG[scope].defaultAllowed);
 
+/**
+ * The scopes an app may request: its explicit allowed scopes, or the defaults
+ * when it declares none. An installation records this set as what its
+ * installer approved (`oauth_client_installs.approved_scopes`).
+ */
+export function effectiveAllowedOAuthScopes(allowedScopes: readonly string[] | null | undefined): string[] {
+  return [...(allowedScopes?.length ? allowedScopes : RAFT_OAUTH_DEFAULT_ALLOWED_SCOPES)];
+}
+
 export const RAFT_OAUTH_PUBLIC_DISCOVERY_SCOPES = RAFT_OAUTH_SCOPES_SUPPORTED
   .filter((scope) => RAFT_OAUTH_SCOPE_CATALOG[scope].publicDiscovery);
 

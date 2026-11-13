@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { auth } from "@modelcontextprotocol/sdk/client/auth.js";
+import { StreamableHTTPError } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { getDb } from "../db/index";
 import {
   managedMcpCredentials,
@@ -54,7 +55,11 @@ afterEach(async () => {
   else process.env.SLOCK_MCP_CREDENTIAL_KEY = originalCredentialKey;
 });
 
-async function seedOAuthConnection() {
+/**
+ * `"custom"`: a URL App at connection-a, for tests that move the endpoint. A recommended App
+ * (Linear) cannot be moved or switched to a custom provider (template_field_locked).
+ */
+async function seedOAuthConnection(kind: "linear" | "custom" = "linear") {
   const [user] = await getDb()
     .insert(users)
     .values({
@@ -73,10 +78,10 @@ async function seedOAuthConnection() {
   const connection = await createManagedMcpServer({
     serverId: server.id,
     userId: user.id,
-    name: "Linear",
-    provider: "linear",
+    name: kind === "linear" ? "Linear" : "Connection A",
+    provider: kind,
     authMode: "oauth",
-    endpointUrl: "https://mcp.linear.app/mcp",
+    endpointUrl: kind === "linear" ? "https://mcp.linear.app/mcp" : "https://connection-a.example.test/mcp",
   });
   const storage = {
     redirectUrl: "https://raft.example.test/api/mcp/oauth/callback",
@@ -223,7 +228,9 @@ test("disconnect invalidates pending OAuth callbacks before clearing credentials
     .select()
     .from(managedMcpCredentials)
     .where(eq(managedMcpCredentials.mcpServerId, connection.id));
-  assert.equal(credential.encryptedOAuth, null);
+  const signedOut = decryptManagedMcpSecret(credential.encryptedOAuth!) as ManagedMcpOAuthStorage;
+  assert.equal(signedOut.tokens, undefined);
+  assert.equal(signedOut.clientInformation, undefined);
 });
 
 test("provider-denied OAuth callbacks consume pending state and leave the connection recoverable", async () => {
@@ -331,6 +338,7 @@ test("expired managed MCP access tokens refresh and persist without reconnecting
 test("revoked refresh tokens require reconnect while transient requests keep the connection", async () => {
   const { server, connection } = await seedRefreshableOAuthConnection();
   let revokedRefreshRequests = 0;
+  const warnings = captureReconnectWarnings();
   await assert.rejects(
     () => withManagedMcpOAuth(server.id, connection.id, async (_managedServer, provider) => {
       try {
@@ -340,7 +348,7 @@ test("revoked refresh tokens require reconnect while transient requests keep the
             revokedRefreshRequests += 1;
             return new Response(JSON.stringify({
               error: "invalid_grant",
-              error_description: "refresh token revoked",
+              error_description: `refresh token revoked for ${SYNTHETIC_PRIVATE_TEXT}`,
             }), { status: 400, headers: { "Content-Type": "application/json" } });
           },
         });
@@ -350,13 +358,18 @@ test("revoked refresh tokens require reconnect while transient requests keep the
     }),
     ManagedMcpGatewayError,
   );
+  warnings.restore();
   assert.equal(revokedRefreshRequests, 1);
+  assert.deepEqual(warnings.entries.map(({ cause, category, hadRefreshToken }) => ({ cause, category, hadRefreshToken })), [
+    { cause: "refresh_refused", category: "invalid_grant", hadRefreshToken: true },
+  ]);
+  assert.ok(!JSON.stringify(warnings.entries).includes(SYNTHETIC_PRIVATE_TEXT), "the provider's text never reaches the log");
   let [storedConnection] = await getDb()
     .select()
     .from(managedMcpServers)
     .where(eq(managedMcpServers.id, connection.id));
   assert.equal(storedConnection.oauthStatus, "error");
-  assert.equal(storedConnection.lastCheckError, "OAuth authorization expired; reconnect required");
+  assert.equal(storedConnection.lastCheckError, "OAuth renewal refused by the provider (invalid_grant); reconnect required");
   const [revokedCredential] = await getDb()
     .select()
     .from(managedMcpCredentials)
@@ -579,6 +592,7 @@ test("a reconnect verdict from stale credentials does not overwrite a newer gran
     await provider.saveTokens({ access_token: `newer-access-${saves}`, refresh_token: `newer-refresh-${saves}`, token_type: "Bearer" });
   });
   let attempts = 0;
+  const warnings = captureReconnectWarnings();
   // Each attempt is rejected as unauthorized after another call saved a newer
   // grant: the first is retried, the second gives up, but its verdict came
   // from credentials that are no longer the stored ones, so it must not mark
@@ -591,13 +605,96 @@ test("a reconnect verdict from stale credentials does not overwrite a newer gran
     }),
     ManagedMcpGatewayError,
   );
+  warnings.restore();
   assert.equal(attempts, 2);
+  assert.deepEqual(warnings.entries, [], "a verdict the fence rejected is not logged as reconnect-required");
   const [storedConnection] = await getDb()
     .select()
     .from(managedMcpServers)
     .where(eq(managedMcpServers.id, connection.id));
   assert.equal(storedConnection.oauthStatus, "connected");
   assert.equal(storedConnection.lastCheckError, null);
+});
+
+test("a refresh that the provider refuses as invalid_client is recorded as a refused client, without the provider's text", async () => {
+  const { server, connection } = await seedRefreshableOAuthConnection();
+  // A user's own client: the SDK's invalidate-all after invalid_client keeps it, so the retry ends
+  // in sign-in required rather than registering a new client.
+  const [seededCredential] = await getDb()
+    .select()
+    .from(managedMcpCredentials)
+    .where(eq(managedMcpCredentials.mcpServerId, connection.id));
+  const storage = decryptManagedMcpSecret(seededCredential.encryptedOAuth!) as ManagedMcpOAuthStorage;
+  delete storage.clientInformation;
+  storage.configuredClient = { clientId: "own-client", clientSecret: "own-secret", tokenEndpointAuthMethod: "client_secret_post" };
+  await getDb()
+    .update(managedMcpCredentials)
+    .set({ encryptedOAuth: encryptManagedMcpSecret(storage) })
+    .where(eq(managedMcpCredentials.mcpServerId, connection.id));
+  const resourceMetadata = storage.discoveryState!.resourceMetadata;
+  const authorizationServerMetadata = storage.discoveryState!.authorizationServerMetadata;
+  const json = (body: unknown, status = 200) =>
+    new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
+  let refreshRequests = 0;
+  const warnings = captureReconnectWarnings();
+  await assert.rejects(
+    () => withManagedMcpOAuth(server.id, connection.id, async (_managedServer, provider) => {
+      try {
+        await auth(provider, {
+          serverUrl: new URL("https://mcp.linear.app/mcp"),
+          fetchFn: async (input: string | URL | Request) => {
+            const url = String(input instanceof Request ? input.url : input);
+            if (url.includes("oauth-protected-resource")) return json(resourceMetadata);
+            if (url.includes("oauth-authorization-server") || url.includes("openid-configuration")) return json(authorizationServerMetadata);
+            if (url === "https://auth.example.test/token") {
+              refreshRequests += 1;
+              return json({ error: "invalid_client", error_description: `client disabled for ${SYNTHETIC_PRIVATE_TEXT}` }, 401);
+            }
+            return new Response("not found", { status: 404 });
+          },
+        });
+      } catch (error) {
+        throw normalizeManagedMcpClientError(error, false, "oauth");
+      }
+    }),
+    ManagedMcpGatewayError,
+  );
+  warnings.restore();
+  assert.equal(refreshRequests, 1);
+  const [storedConnection] = await getDb()
+    .select()
+    .from(managedMcpServers)
+    .where(eq(managedMcpServers.id, connection.id));
+  assert.equal(storedConnection.oauthStatus, "error");
+  assert.equal(storedConnection.lastCheckError, "OAuth renewal refused by the provider (OAuth client rejected); reconnect required");
+  assert.deepEqual(warnings.entries.map(({ cause, category, hadRefreshToken }) => ({ cause, category, hadRefreshToken })), [
+    { cause: "client_refused", category: null, hadRefreshToken: true },
+  ]);
+  assert.ok(!JSON.stringify(warnings.entries).includes(SYNTHETIC_PRIVATE_TEXT));
+  assert.ok(!storedConnection.lastCheckError?.includes(SYNTHETIC_PRIVATE_TEXT));
+});
+
+test("an endpoint rejection is recorded as its HTTP status only, in the status and the log", async () => {
+  const { server, connection } = await seedRefreshableOAuthConnection();
+  const warnings = captureReconnectWarnings();
+  await assert.rejects(
+    () => withManagedMcpOAuth(server.id, connection.id, async () => {
+      throw normalizeManagedMcpClientError(
+        new StreamableHTTPError(403, `Error POSTing to endpoint: {"error":"forbidden","message":"${SYNTHETIC_PRIVATE_TEXT}"}`),
+        false,
+        "oauth",
+      );
+    }),
+    ManagedMcpGatewayError,
+  );
+  warnings.restore();
+  const [storedConnection] = await getDb()
+    .select()
+    .from(managedMcpServers)
+    .where(eq(managedMcpServers.id, connection.id));
+  assert.equal(storedConnection.lastCheckError, "OAuth authorization rejected (HTTP 403); reconnect required");
+  assert.deepEqual(warnings.entries.map(({ cause, category }) => ({ cause, category })), [{ cause: "rejected", category: "HTTP 403" }]);
+  assert.ok(!JSON.stringify(warnings.entries).includes(SYNTHETIC_PRIVATE_TEXT));
 });
 
 test("a call that fails for a reason other than reconnect is not repeated", async () => {
@@ -614,7 +711,7 @@ test("a call that fails for a reason other than reconnect is not repeated", asyn
 });
 
 test("OAuth token persistence cannot revive connection A after an identity update to B", async () => {
-  const { user, server, connection } = await seedOAuthConnection();
+  const { user, server, connection } = await seedOAuthConnection("custom");
   let operationStarted!: () => void;
   let releaseOperation!: () => void;
   const started = new Promise<void>((resolve) => {
@@ -673,7 +770,7 @@ test("OAuth token persistence cannot revive connection A after an identity updat
 });
 
 test("an OAuth callback for connection A is rejected before provider I/O after update to B", async () => {
-  const { user, server, connection } = await seedOAuthConnection();
+  const { user, server, connection } = await seedOAuthConnection("custom");
   const state = "connection-a-callback";
   await replacePendingManagedMcpOAuthAttempt({
     serverId: server.id,
@@ -721,7 +818,7 @@ test("an OAuth callback for connection A is rejected before provider I/O after u
 });
 
 test("an OAuth tool lease rejects connection A before provider I/O after update to B", async () => {
-  const { user, server, connection } = await seedOAuthConnection();
+  const { user, server, connection } = await seedOAuthConnection("custom");
   await updateManagedMcpServer({
     serverId: server.id,
     userId: user.id,
@@ -767,7 +864,7 @@ test("an OAuth tool lease rejects connection A before provider I/O after update 
 });
 
 test("a catalog result from connection A cannot overwrite connection B", async () => {
-  const { user, server, connection } = await seedOAuthConnection();
+  const { user, server, connection } = await seedOAuthConnection("custom");
   let fetchStarted!: () => void;
   let releaseFetch!: () => void;
   const started = new Promise<void>((resolve) => {
@@ -815,3 +912,58 @@ test("a catalog result from connection A cannot overwrite connection B", async (
   assert.deepEqual(storedServer.toolCatalog, []);
   assert.equal(storedServer.lastCheckError, null);
 });
+
+test("⭐ the App's OAuth status reaches its default Connection, so a connected App is callable and an expired one is not", async () => {
+  // Seeded the way production data looks right after this release: the App's oauth_status says
+  // connected, but nothing has yet written the Connection's own auth_status (it starts needs_auth).
+  const seeded = await seedRefreshableOAuthConnection();
+  const { createAgent } = await import("./agentService");
+  const { executeManagedMcpCall } = await import("./managedMcpService");
+  const agent = await createAgent(seeded.server.id, `oauth-agent-${randomUUID().slice(0, 8)}`);
+  await getDb().update(managedMcpServers)
+    .set({ toolCatalog: [{ name: "search", inputSchema: { type: "object" } }] })
+    .where(eq(managedMcpServers.id, seeded.connection.id));
+  const [app] = await getDb().select().from(managedMcpServers).where(eq(managedMcpServers.id, seeded.connection.id));
+  let toolCalls = 0;
+  const call = () => executeManagedMcpCall(seeded.server.id, agent.id, {
+    mcpServerId: app.id, toolName: "search", arguments: {}, expectedConfigVersion: app.configVersion, expectedAssignmentVersion: 1,
+  }, undefined, async () => { toolCalls += 1; return { content: [], isError: false }; });
+  const connectionStatus = async () => (await getDb().select().from(managedMcpCredentials)
+    .where(eq(managedMcpCredentials.mcpServerId, app.id)))[0].authStatus;
+
+  // An OAuth round that ends with the App connected (here a transient tool failure, which keeps the
+  // connection) goes through the same status write the sign-in callback uses.
+  await assert.rejects(
+    () => withManagedMcpOAuth(seeded.server.id, app.id, async () => {
+      throw new ManagedMcpGatewayError("MCP server could not be reached", "managed_mcp_unreachable");
+    }),
+    ManagedMcpGatewayError,
+  );
+  assert.equal(await connectionStatus(), "ready", "⭐ connected App ⇒ ready default Connection");
+  await call();
+  assert.equal(toolCalls, 1, "⭐ and an Agent's call is admitted");
+
+  // The authorization expires: the Connection follows, and the Agent is refused with login_required.
+  await assert.rejects(
+    () => withManagedMcpOAuth(seeded.server.id, app.id, async () => {
+      throw new ManagedMcpGatewayError("MCP OAuth authorization expired; reconnect from Settings", "managed_mcp_oauth_required");
+    }),
+    ManagedMcpGatewayError,
+  );
+  assert.equal(await connectionStatus(), "expired");
+  await assert.rejects(call(), (error: unknown) => error instanceof ManagedMcpServiceError);
+  assert.equal(toolCalls, 1);
+});
+
+/** Short, unlabelled private text a provider could put in an error; no redactor pattern matches it. */
+const SYNTHETIC_PRIVATE_TEXT = "alice.private@example.test pin 4821";
+
+function captureReconnectWarnings(): { entries: Array<Record<string, unknown>>; restore: () => void } {
+  const entries: Array<Record<string, unknown>> = [];
+  const original = console.warn;
+  console.warn = (...args: unknown[]) => {
+    if (args[0] === "mcp.oauth.reconnect_required") entries.push(args[1] as Record<string, unknown>);
+    else original(...args);
+  };
+  return { entries, restore: () => { console.warn = original; } };
+}

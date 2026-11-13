@@ -9,7 +9,7 @@
 //
 // The only user key product data may carry is the AnalyticsId read from
 // user_analytics_ids. This module is its single mint site
-// (scripts/ci/check-branded-mint-sites.mjs).
+// (scripts/ci/check-branded-mint-sites.ts).
 
 import { randomUUID } from "node:crypto";
 import { eq, inArray } from "drizzle-orm";
@@ -116,28 +116,29 @@ export async function resolveProductAnalyticsGate(
 
 /**
  * The legacy Postgres `product_events` written from client clicks (the
- * onboarding wizard route) predate this gate and keep the real actor id for
- * their existing readers (the Daily Brief). They still honor the two explicit
- * "no"s: a workspace with product analytics off, and a user who turned "Share
- * usage data" off. TEMPORARY EXCEPTION: a user who has not chosen is still
- * recorded, with their real id, unlike the gate (not chosen = not sharing).
- * Once the default is decided (RFC-067 §9.4, cindyz), this path follows it.
+ * onboarding wizard route), and the web push log's interaction rows, keep the
+ * real actor id for their readers (the Daily Brief, the push funnel), but
+ * follow the same switches as everything else: the workspace switch and the
+ * user's effective "Share usage data" choice. `serverId` null: no workspace
+ * applies (the request named none it may use), only the user's choice.
  */
 export async function legacyProductEventsAllowed(
   db: DatabaseExecutor,
-  input: { userId: string; serverId: ServerId },
+  input: { userId: string; serverId: ServerId | null },
 ): Promise<boolean> {
   const [user] = await db
     .select({ shareUsageData: users.shareUsageData })
     .from(users)
     .where(eq(users.id, input.userId))
     .limit(1);
+  if (!(user?.shareUsageData ?? SHARE_USAGE_DATA_DEFAULT)) return false;
+  if (input.serverId === null) return true;
   const [server] = await db
     .select({ enabled: servers.productAnalyticsEnabled })
     .from(servers)
     .where(eq(servers.id, input.serverId))
     .limit(1);
-  return user?.shareUsageData !== false && server?.enabled !== false;
+  return server?.enabled !== false;
 }
 
 /**

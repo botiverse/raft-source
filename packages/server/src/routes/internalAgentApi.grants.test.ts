@@ -17,13 +17,14 @@ import { getDb } from "../db/index";
 import { agentScopes, channelAgents, tasks, users } from "../db/schema";
 import { fixturePasswordHash } from "../test/integration/credentials";
 import { createServer } from "../services/serverService";
-import { createAgent, assignMachine } from "../services/agentService";
+import { createAgent } from "../services/agentService";
+import { placeAgentOnMachine } from "../test/agentMachineFixture";
 import { createChannel, addAgent, addHuman } from "../services/channelService";
 import { registerMachine } from "../services/machineService";
 import { mintAgentCredential } from "../services/agentCredentialService";
 import { resetAgentScopesToDefault, updateAgentScopes } from "../services/agentScopesService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 async function seedGrantFixture() {
   const db = getDb();
@@ -43,11 +44,12 @@ async function seedGrantFixture() {
   const joinChannel = await createChannel(server.id, `grants-join-${suffix.slice(0, 8)}`);
   await addHuman(joinChannel.id, owner.id);
   const { machine, apiKey: machineApiKey } = await registerMachine(server.id, owner.id, "agent-api-grants-machine");
-  await assignMachine(agent.id, machine.id);
+  await placeAgentOnMachine(agent.id, machine.id);
   const minted = await mintAgentCredential({
     agentId: agent.id,
     scopes: ["channels", "tasks"],
     name: "grants-test",
+    issuedVia: "computer",
     createdByUserId: null,
   });
   return {

@@ -1,15 +1,18 @@
-import { useCallback, useMemo, useState } from "react";
-import type { ReactNode } from "react";
+import { useCallback, useMemo, useRef, useState } from "react";
+import type { ReactNode, RefObject } from "react";
 import { useIntl } from "react-intl";
 import type { Locale } from "../i18n/locale";
 import { mergedMessages } from "../i18n/messages";
 import type { MessageId } from "../i18n/messages";
 import Banner from "./ui/Banner";
+import { trackConfirmDialogClosed } from "../analytics/confirmUndo";
+import type { ConfirmDialogName } from "../analytics/confirmUndo";
+import { DialogActions, DialogCommit, NarrowDialogContent } from "./ui/NarrowDialog";
+import { isSecondFactorStepUpCancelled } from "./settings/secondFactorStepUp";
 import {
   Dialog,
   DialogBody,
   DialogClose,
-  DialogContent,
   DialogFooter,
   DialogHeader,
   DialogTitle,
@@ -25,6 +28,8 @@ interface ConfirmDialogProps {
   cancelLabel?: string;
   loadingLabel?: string;
   confirmIcon?: ReactNode;
+  /** After the label, such as the ↗ of a confirm that leaves Raft (design: Navigation › Links that leave Raft). */
+  confirmTrailingIcon?: ReactNode;
   onConfirm: () => Promise<void> | void;
   onClose: () => void;
   confirmDisabled?: boolean;
@@ -33,7 +38,7 @@ interface ConfirmDialogProps {
   confirmVariant?: ButtonProps["variant"];
   /** Hide the secondary cancel action for informational acknowledgement dialogs. */
   hideCancel?: boolean;
-  /** Stacking layer (0 = default z-50, 1 = z-60 for nested dialogs) */
+  /** Stacking layer (0 = default z-dialog, 1 = z-dialog-layer for nested dialogs) */
   layer?: number;
   /** Optional test id for the confirm button (e2e selection) */
   confirmTestId?: string;
@@ -41,14 +46,20 @@ interface ConfirmDialogProps {
   closeOnConfirm?: boolean;
   /** Width utility for dialogs with richer body content. */
   maxWidthClass?: string;
+  /**
+   * The raft-ui Dialog size, instead of `maxWidthClass`: `md` for a small task
+   * built on this frame, such as a list with a control per row (Raft DS ›
+   * Dialog › Variants). Confirmations keep the default.
+   */
+  size?: "sm" | "md";
   /** Render interactive/rich body content without the default warning banner frame. */
   plainMessage?: boolean;
   /** Action button size. Default `lg` is the DS default 44px button, the
    *  size every modal dialog footer uses (Dialog README: the actions are
-   *  ordinary `rf-btn`s). `xs`, `sm` and `md` all render the DS small 32px
-   *  button; keep them for confirmations embedded in an already-dense
-   *  surface (a card or a row), never for a modal. */
-  actionSize?: "xs" | "sm" | "md" | "lg";
+   *  ordinary `rf-btn`s). `md` is the DS small 32px button; keep it for
+   *  confirmations embedded in an already-dense surface (a card or a row),
+   *  never for a modal. */
+  actionSize?: "md" | "lg";
   /** Caller-owned semantic foreground override for the confirm action. */
   confirmClassName?: string;
   /**
@@ -57,9 +68,36 @@ interface ConfirmDialogProps {
    * migrated, so the chrome follows the display locale. The old English
    * default (#5117, partial rollout) left a Chinese dialog with an English
    * "Cancel" whenever a caller forgot to opt in. Pass an explicit locale for an
-   * independently localized surface such as the billing WebView.
+   * independently localized surface such as the billing WebView. Catalogs other
+   * than en load on demand (i18n/messages), so an explicit locale must already
+   * be loaded (loadLocaleMessages) or its chrome reads as English.
    */
   chromeLocale?: Locale | "active";
+  /**
+   * Phone presentation (< 768px; NarrowDialog). `centered` (default) is the
+   * card in the middle; raft-ui moves it up while the keyboard is open, so a
+   * typed field (the name to delete, a reason to reject) stays in view.
+   * `sheet` moves the confirm to the head of a bottom sheet, for a
+   * confirmation with more to fill than one field.
+   */
+  narrow?: "centered" | "sheet";
+  /**
+   * Where focus goes when it closes, when the control that opened it is gone
+   * (Raft DS › Accessibility: the nearest related element, never the page).
+   */
+  finalFocus?: RefObject<HTMLElement | null> | (() => boolean);
+  /**
+   * `cancel`: focus starts on Cancel instead of the dialog's first control
+   * (×), as in a raft-ui AlertDialog, whose first control is Cancel. For a
+   * confirm that takes something away, so Enter right after it opens doesn't
+   * act. Ignored with `hideCancel`.
+   */
+  initialFocus?: "cancel";
+  /**
+   * A dangerous action's confirm (#proj-analytics:#17): records `confirm_dialog_closed`,
+   * `confirmed` when the person presses the confirm (once), else `cancelled` when they close it.
+   */
+  analyticsDialog?: ConfirmDialogName;
 }
 
 /**
@@ -81,6 +119,7 @@ export default function ConfirmDialog({
   cancelLabel,
   loadingLabel,
   confirmIcon,
+  confirmTrailingIcon,
   onConfirm,
   onClose,
   confirmDisabled = false,
@@ -90,10 +129,17 @@ export default function ConfirmDialog({
   confirmTestId,
   closeOnConfirm = true,
   maxWidthClass = "max-w-sm",
+  size,
   plainMessage = false,
   actionSize = "lg",
   confirmClassName,  chromeLocale = "active",
+  narrow = "centered",
+  finalFocus,
+  initialFocus,
+  analyticsDialog,
 }: ConfirmDialogProps) {
+  const confirmedRef = useRef(false);
+  const cancelRef = useRef<HTMLButtonElement | null>(null);
   const { formatMessage } = useIntl();
   const fixedChromeMessages = useMemo(
     () => (chromeLocale === "active" ? null : mergedMessages(chromeLocale)),
@@ -117,9 +163,15 @@ export default function ConfirmDialog({
   // own structure.
   const dangerFrame = confirmTone === "danger" && !plainMessage;
 
+  const closeLabel = formatChromeMessage(
+    loading ? "common.confirm.actionInProgress" : "common.confirm.closeDialog",
+  );
+
   const handleClose = useCallback(() => {
-    if (!loading) onClose();
-  }, [loading, onClose]);
+    if (loading) return;
+    if (analyticsDialog && !confirmedRef.current) trackConfirmDialogClosed(analyticsDialog, "cancelled");
+    onClose();
+  }, [analyticsDialog, loading, onClose]);
 
   const handleOpenChange = useCallback(
     (nextOpen: boolean) => {
@@ -129,6 +181,10 @@ export default function ConfirmDialog({
   );
 
   const handleConfirm = useCallback(async () => {
+    if (analyticsDialog && !confirmedRef.current) {
+      confirmedRef.current = true;
+      trackConfirmDialogClosed(analyticsDialog, "confirmed");
+    }
     setLoading(true);
     setError(null);
     try {
@@ -140,13 +196,15 @@ export default function ConfirmDialog({
       }
     } catch (err) {
       setLoading(false);
+      // "Verify it's you" closed: nothing happened, the dialog stays as it was.
+      if (isSecondFactorStepUpCancelled(err)) return;
       const axiosErr = err as { response?: { data?: { error?: string } } };
       setError(
         axiosErr.response?.data?.error ||
           (err instanceof Error ? err.message : formatChromeMessage("common.confirm.somethingWentWrong")),
       );
     }
-  }, [onConfirm, closeOnConfirm, onClose, formatChromeMessage]);
+  }, [analyticsDialog, onConfirm, closeOnConfirm, onClose, formatChromeMessage]);
 
   return (
     <Dialog
@@ -157,25 +215,32 @@ export default function ConfirmDialog({
       disablePointerDismissal
       onOpenChange={handleOpenChange}
     >
-      <DialogContent
+      <NarrowDialogContent
+        narrow={narrow}
+        finalFocus={finalFocus}
+        initialFocus={initialFocus === "cancel" && !hideCancel ? cancelRef : undefined}
         layer={(layer ?? 0) >= 1 ? 1 : 0}
-        className={maxWidthClass}
+        size={size}
+        className={size ? undefined : maxWidthClass}
         aria-modal="true"
         aria-busy={loading}
+        title={title}
+        closeLabel={closeLabel}
+        closeDisabled={loading}
+        header={(
+          <DialogHeader>
+            <DialogTitle>{title}</DialogTitle>
+            <DialogClose
+              disabled={loading}
+              aria-label={closeLabel}
+            />
+          </DialogHeader>
+        )}
       >
-        <DialogHeader>
-          <DialogTitle>{title}</DialogTitle>
-          <DialogClose
-            disabled={loading}
-            aria-label={formatChromeMessage(
-              loading ? "common.confirm.actionInProgress" : "common.confirm.closeDialog",
-            )}
-          />
-        </DialogHeader>
 
         {/* font-normal: confirmation copy is regular-weight body text (DS
             Dialog body 15/20 ink-2), matching JointConversionConfirmDialog. */}
-        <DialogBody className="font-normal">
+        {message === null && !error ? null : <DialogBody className="font-normal">
           {/* The title establishes the action and this is its one explanation.
               Repeating the same warning inside a second coloured panel made
               confirmations read like two competing pieces of content, so a
@@ -206,11 +271,16 @@ export default function ConfirmDialog({
               {error}
             </Banner>
           )}
-        </DialogBody>
+        </DialogBody>}
 
-        <DialogFooter className="flex-wrap">
+        {/* raft-ui 0.22 DialogFooter (#673): one row, Cancel then the commit,
+            stacking full width (commit on top) only when the row doesn't fit.
+            No flex-wrap here: a wrapped row never overflows, so it would
+            keep the footer from stacking. */}
+        <DialogActions as={DialogFooter}>
           {!hideCancel && (
             <Button
+              ref={cancelRef}
               onClick={handleClose}
               disabled={loading}
               size={actionSize}
@@ -220,22 +290,27 @@ export default function ConfirmDialog({
               {cancelLabel ?? formatChromeMessage("common.confirm.cancel")}
             </Button>
           )}
-          <Button
-            data-testid={confirmTestId}
-            onClick={handleConfirm}
-            disabled={loading || confirmDisabled}
-            size={actionSize}
-            variant={confirmTone}
-            className={`whitespace-nowrap disabled:pointer-events-none disabled:cursor-not-allowed ${confirmClassName ?? ""}`.trim()}
-            aria-busy={loading}
-            aria-label={loading ? resolvedProcessingEllipsis : undefined}
-          >
-            {loading && <Spinner size="xs" aria-label={resolvedProcessing} />}
-            {!loading && confirmIcon}
-            {loading ? resolvedProcessingEllipsis : resolvedConfirmLabel}
-          </Button>
-        </DialogFooter>
-      </DialogContent>
+          <DialogCommit>
+            {(inHead) => (
+              <Button
+                data-testid={confirmTestId}
+                onClick={handleConfirm}
+                disabled={loading || confirmDisabled}
+                size={inHead ? "md" : actionSize}
+                variant={confirmTone}
+                className={`whitespace-nowrap disabled:pointer-events-none disabled:cursor-not-allowed ${confirmClassName ?? ""}`.trim()}
+                aria-busy={loading}
+                aria-label={loading ? resolvedProcessingEllipsis : undefined}
+              >
+                {loading && <Spinner size="xs" aria-label={resolvedProcessing} />}
+                {!loading && confirmIcon}
+                {loading ? resolvedProcessingEllipsis : resolvedConfirmLabel}
+                {!loading && confirmTrailingIcon}
+              </Button>
+            )}
+          </DialogCommit>
+        </DialogActions>
+      </NarrowDialogContent>
     </Dialog>
   );
 }

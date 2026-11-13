@@ -5,7 +5,7 @@ import { dismissLayerProps } from "./dismissLayer";
  * Invisible click-outside catcher for context menus and drawer overlays.
  *
  * Replaces the recurring pattern:
- *   <div className="fixed inset-0 z-50" onClick={close} onContextMenu={...} />
+ *   <div className="fixed inset-0 z-popup" onClick={close} onContextMenu={...} />
  *
  * Used in: SavedPanel ctx menu, MessageItem ctx menu, Sidebar server-switcher
  * ctx menu (including the iOS phantom-click shield variant).
@@ -14,16 +14,17 @@ import { dismissLayerProps } from "./dismissLayer";
  * prevents a swipe intended to dismiss a floating menu from panning the page
  * behind it. This does NOT mutate body styles or own ESC handling — those
  * lifecycle concerns still belong to the parent.
+ *
+ * It sits on the popup layer (`z-popup`) with the menu it belongs to; what is
+ * over what is the DOM order, so render it before the menu (or after it, for a
+ * shield that must cover the menu too).
  */
 export default function DismissBackdrop({
   onDismiss,
-  zIndex = 50,
   trapContextMenu = false,
   stopPropagation = false,
 }: {
   onDismiss: () => void;
-  /** CSS z-index value. Default 50. */
-  zIndex?: number;
   /** If true, also intercepts right-click (prevents native context menu). */
   trapContextMenu?: boolean;
   /** If true, stops propagation instead of calling onDismiss (iOS phantom-click shield). */
@@ -31,11 +32,10 @@ export default function DismissBackdrop({
 }) {
   return createPortal(
     <div
-      // Same marker contract as Modal's root: full-window dismiss layer (task #121).
+      // The dismiss-layer marker: a full-window dismiss layer (task #121).
       data-slot="dismiss-backdrop"
       {...dismissLayerProps}
-      className="fixed inset-0 touch-none"
-      style={{ zIndex }}
+      className="fixed inset-0 z-popup touch-none"
       onClick={
         stopPropagation
           ? (e) => { e.stopPropagation(); e.preventDefault(); }

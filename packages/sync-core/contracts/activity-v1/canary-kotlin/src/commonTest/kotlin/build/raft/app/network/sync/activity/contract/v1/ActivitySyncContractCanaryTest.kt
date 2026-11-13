@@ -136,7 +136,7 @@ class ActivitySyncContractCanaryTest {
             // Kotlin canary has no manifest reader, and claiming otherwise
             // would be a comment describing work the code does not do.
             // Manifest equality is enforced repo-side by
-            // tools/verify-contract.mjs, which pins the manifest against the
+            // tools/verify-contract.ts, which pins the manifest against the
             // real generated files.
             64,
             ACTIVITY_SYNC_TYPESPEC_SHA256.length,
@@ -147,7 +147,7 @@ class ActivitySyncContractCanaryTest {
         )
         // The contract identity the client compares with the server's
         // X-Raft-Contract header. Equality with revisions.json is enforced
-        // repo-side by tools/verify-contract.mjs.
+        // repo-side by tools/verify-contract.ts.
         assertEquals(ACTIVITY_SYNC_CONTRACT, envelope.contract)
         assertTrue(ACTIVITY_SYNC_CONTRACT_REVISION >= 2, "revision 1 is the untracked pre-ledger shape")
         val ingresses = envelope.steps

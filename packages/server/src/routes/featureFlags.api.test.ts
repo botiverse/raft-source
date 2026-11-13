@@ -8,13 +8,15 @@ import { getDb } from "../db/index";
 import { users } from "../db/schema";
 import { createServer } from "../services/serverService";
 import {
-  ATTACHMENT_COMMENTS_FEATURE_FLAG_KEY,
   createFeatureFlag,
   createFeatureFlagRule,
   setFeatureFlagKillSwitch,
 } from "../services/featureFlagService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
+
+// A default-on, server-randomized flag owned by this test.
+const DEFAULT_ON_FLAG_KEY = "api_default_on_v0";
 
 // Flag fixtures are built through the service layer on purpose. Flag administration
 // lives in the standalone Feature Flag Admin Worker, so the main server exposes no
@@ -33,7 +35,7 @@ function authHeaders(token: string) {
 }
 
 test("feature flags API: product eval is member-scoped and honours rules", async () => {
-  const { baseUrl, close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const { baseUrl, close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const db = getDb();
     const passwordHash = await argon2.hash("password123");
@@ -55,15 +57,22 @@ test("feature flags API: product eval is member-scoped and honours rules", async
     const ownerToken = await tokenForHuman(owner.email);
     const outsiderToken = await tokenForHuman(outsider.email);
 
+    await createFeatureFlag({
+      key: DEFAULT_ON_FLAG_KEY,
+      randomizationUnit: "server",
+      defaultEnabled: true,
+      salt: DEFAULT_ON_FLAG_KEY,
+    });
+
     const productEval = await fetch(`${baseUrl}/api/feature-flags/evaluate`, {
       method: "POST",
       headers: authHeaders(ownerToken),
-      body: JSON.stringify({ serverId: server.id, keys: [ATTACHMENT_COMMENTS_FEATURE_FLAG_KEY] }),
+      body: JSON.stringify({ serverId: server.id, keys: [DEFAULT_ON_FLAG_KEY] }),
     });
     assert.equal(productEval.status, 200, await productEval.clone().text());
     assert.deepEqual((await productEval.json()) as unknown, {
       evaluations: [{
-        key: ATTACHMENT_COMMENTS_FEATURE_FLAG_KEY,
+        key: DEFAULT_ON_FLAG_KEY,
         enabled: true,
         reason: "default",
       }],
@@ -72,7 +81,7 @@ test("feature flags API: product eval is member-scoped and honours rules", async
     const outsiderEval = await fetch(`${baseUrl}/api/feature-flags/evaluate`, {
       method: "POST",
       headers: authHeaders(outsiderToken),
-      body: JSON.stringify({ serverId: server.id, keys: [ATTACHMENT_COMMENTS_FEATURE_FLAG_KEY] }),
+      body: JSON.stringify({ serverId: server.id, keys: [DEFAULT_ON_FLAG_KEY] }),
     });
     assert.equal(outsiderEval.status, 403);
 
@@ -144,17 +153,17 @@ test("feature flags API: product eval is member-scoped and honours rules", async
     });
     assert.equal(invalidPlatformEval.status, 400);
 
-    await setFeatureFlagKillSwitch(ATTACHMENT_COMMENTS_FEATURE_FLAG_KEY, true);
+    await setFeatureFlagKillSwitch(DEFAULT_ON_FLAG_KEY, true);
 
     const productEvalAfterKill = await fetch(`${baseUrl}/api/feature-flags/evaluate`, {
       method: "POST",
       headers: authHeaders(ownerToken),
-      body: JSON.stringify({ serverId: server.id, keys: [ATTACHMENT_COMMENTS_FEATURE_FLAG_KEY] }),
+      body: JSON.stringify({ serverId: server.id, keys: [DEFAULT_ON_FLAG_KEY] }),
     });
     assert.equal(productEvalAfterKill.status, 200);
     assert.deepEqual((await productEvalAfterKill.json()) as unknown, {
       evaluations: [{
-        key: ATTACHMENT_COMMENTS_FEATURE_FLAG_KEY,
+        key: DEFAULT_ON_FLAG_KEY,
         enabled: false,
         reason: "kill_switch",
       }],
@@ -165,7 +174,7 @@ test("feature flags API: product eval is member-scoped and honours rules", async
 });
 
 test("feature flags API: client facts from the mobile body drive client rules and never fail the request", async () => {
-  const { baseUrl, close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const { baseUrl, close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const [owner] = await getDb().insert(users).values({
       email: "feature-api-client@slock.test",
@@ -235,6 +244,39 @@ test("feature flags API: client facts from the mobile body drive client rules an
       assert.deepEqual(await evaluate(extra), { key: "api_client_v0", enabled: false, reason: "default" }, JSON.stringify(extra));
     }
   } finally {
+    await close();
+  }
+});
+
+// Raft's app hosts were here (#11375) and moved to the per-deploy client config
+// (GET /api/public/client-config, publicClientConfig.api.test.ts): this answer is
+// the flags only, whatever the deployment's hosts are.
+test("feature flags API: the answer is the flags only; Raft's app hosts are not in it", async () => {
+  const { baseUrl, close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
+  const before = { APP_URL: process.env.APP_URL, APP_PERMALINK_HOSTS: process.env.APP_PERMALINK_HOSTS };
+  try {
+    const [owner] = await getDb().insert(users).values({
+      email: "feature-api-hosts@slock.test",
+      name: "feature-api-hosts",
+      passwordHash: await argon2.hash("password123"),
+      emailVerified: true,
+      profileSetupCompletedAt: new Date(),
+    }).returning();
+    const server = await createServer("Feature API Hosts", "feature-api-hosts", owner.id);
+    const token = await tokenForHuman(owner.email);
+    process.env.APP_URL = "https://chat.example.test";
+    process.env.APP_PERMALINK_HOSTS = "https://raft-staging.pages.dev, Staging.Example.Dev";
+    for (const body of [{ serverId: server.id, platform: "web", keys: ["api_hosts_v0"] }, { keys: ["api_hosts_v0"] }]) {
+      const response = await fetch(`${baseUrl}/api/feature-flags/evaluate`, { method: "POST", headers: authHeaders(token), body: JSON.stringify(body) });
+      assert.equal(response.status, 200, await response.clone().text());
+      const answer = (await response.json()) as Record<string, unknown>;
+      assert.deepEqual(Object.keys(answer), ["evaluations"], JSON.stringify(body));
+    }
+  } finally {
+    if (before.APP_URL === undefined) delete process.env.APP_URL;
+    else process.env.APP_URL = before.APP_URL;
+    if (before.APP_PERMALINK_HOSTS === undefined) delete process.env.APP_PERMALINK_HOSTS;
+    else process.env.APP_PERMALINK_HOSTS = before.APP_PERMALINK_HOSTS;
     await close();
   }
 });

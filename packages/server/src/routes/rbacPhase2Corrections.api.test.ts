@@ -8,9 +8,10 @@ import { serverMembers, servers, users } from "../db/schema";
 import { registerMachine } from "../services/machineService";
 import { createServer } from "../services/serverService";
 import { createApiTest } from "../test/integration/apiTest";
+import { seedBoundGuest } from "../test/guestFixture";
 import { fixturePasswordHash, tokenForHuman } from "../test/integration/credentials";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 async function seedUser(label: string) {
   const [user] = await getDb().insert(users).values({
@@ -35,8 +36,8 @@ async function seedRoles(label: string) {
   await getDb().insert(serverMembers).values([
     { serverId: server.id, userId: admin.id, role: "admin" },
     { serverId: server.id, userId: member.id, role: "member" },
-    { serverId: server.id, userId: guest.id, role: "guest" },
   ]);
+  await seedBoundGuest({ serverId: server.id, userId: guest.id });
   const tokens = {
     owner: await tokenForHuman(owner.email),
     admin: await tokenForHuman(admin.email),
@@ -62,7 +63,6 @@ test("Server details give Owner/Admin/Member the member profile and Guest only t
     plan: "founder",
     translationEnabled: true,
     publiclyVisible: true,
-    publicGuestJoinEnabled: true,
   }).where(eq(servers.id, server.id));
 
   for (const role of ["owner", "admin", "member"] as const) {

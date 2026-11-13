@@ -19,7 +19,7 @@ import { registerMachine } from "../services/machineService";
 import { attachComputer } from "../services/computerCredentialService";
 import { verifyScopeAttestation } from "../lib/scopeAttestation";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 async function seed() {
   const db = getDb();
@@ -48,7 +48,7 @@ function machineHeaders(apiKey: string): Record<string, string> {
 test("POST /internal/machine/scope-attestation signs a short-lived machine capability", async () => {
   const previousSecret = process.env.SCOPE_ATTESTATION_SECRET;
   process.env.SCOPE_ATTESTATION_SECRET = "daemon-scope-test-secret";
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const { server, machine, apiKey } = await seed();
 
@@ -96,7 +96,7 @@ test("POST /internal/machine/scope-attestation signs a short-lived machine capab
 test("POST /internal/machine/scope-attestation accepts a Computer attachment credential", async () => {
   const previousSecret = process.env.SCOPE_ATTESTATION_SECRET;
   process.env.SCOPE_ATTESTATION_SECRET = "daemon-scope-test-secret";
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const { server, owner } = await seed();
     const computer = await attachComputer({
@@ -152,7 +152,7 @@ test("POST /internal/machine/scope-attestation accepts a Computer attachment cre
 test("POST /internal/machine/scope-attestation records sanitized breakdown trace events", async () => {
   const previousSecret = process.env.SCOPE_ATTESTATION_SECRET;
   process.env.SCOPE_ATTESTATION_SECRET = "daemon-scope-test-secret";
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const sink = new MemoryTraceSink();
     app.app.set("serverTracer", new BasicTracer({ sink }));
@@ -206,7 +206,7 @@ test("POST /internal/machine/scope-attestation signs daemon trace bundle metadat
   const previousDeploymentEnv = process.env.DEPLOYMENT_ENV;
   process.env.SCOPE_ATTESTATION_SECRET = "daemon-scope-test-secret";
   process.env.DEPLOYMENT_ENV = "staging";
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const { server, machine, apiKey } = await seed();
     const bundleSha256 = "a".repeat(64);
@@ -282,7 +282,7 @@ test("POST /internal/machine/scope-attestation signs daemon trace bundle metadat
 test("POST /internal/machine/scope-attestation rejects non-machine auth", async () => {
   const previousSecret = process.env.SCOPE_ATTESTATION_SECRET;
   process.env.SCOPE_ATTESTATION_SECRET = "daemon-scope-test-secret";
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const res = await fetch(`${app.baseUrl}/internal/machine/scope-attestation`, {
       method: "POST",
@@ -302,7 +302,7 @@ test("POST /internal/machine/scope-attestation rejects non-machine auth", async 
 test("POST /internal/machine/scope-attestation fails closed when signing is not configured", async () => {
   const previousSecret = process.env.SCOPE_ATTESTATION_SECRET;
   delete process.env.SCOPE_ATTESTATION_SECRET;
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const { apiKey } = await seed();
     const res = await fetch(`${app.baseUrl}/internal/machine/scope-attestation`, {
@@ -325,7 +325,7 @@ test("POST /internal/machine/scope-attestation fails closed when signing is not 
 test("POST /internal/machine/scope-attestation rejects unsupported scopes", async () => {
   const previousSecret = process.env.SCOPE_ATTESTATION_SECRET;
   process.env.SCOPE_ATTESTATION_SECRET = "daemon-scope-test-secret";
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const { apiKey } = await seed();
     const res = await fetch(`${app.baseUrl}/internal/machine/scope-attestation`, {
@@ -348,7 +348,7 @@ test("POST /internal/machine/scope-attestation rejects unsupported scopes", asyn
 test("POST /internal/machine/scope-attestation rejects caller-provided audience/resource", async () => {
   const previousSecret = process.env.SCOPE_ATTESTATION_SECRET;
   process.env.SCOPE_ATTESTATION_SECRET = "daemon-scope-test-secret";
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const { apiKey } = await seed();
 
@@ -361,7 +361,7 @@ test("POST /internal/machine/scope-attestation rejects caller-provided audience/
       }),
     });
     assert.equal(audienceRes.status, 400);
-    assert.deepEqual(await audienceRes.json(), { error: "audience is derived from scope" });
+    assert.deepEqual(await audienceRes.json(), { code: "scope_attestation_invalid", errorCode: "scope_attestation_invalid", error: "audience is derived from scope" });
 
     const resourceRes = await fetch(`${app.baseUrl}/internal/machine/scope-attestation`, {
       method: "POST",
@@ -372,7 +372,7 @@ test("POST /internal/machine/scope-attestation rejects caller-provided audience/
       }),
     });
     assert.equal(resourceRes.status, 400);
-    assert.deepEqual(await resourceRes.json(), { error: "resource is derived from scope" });
+    assert.deepEqual(await resourceRes.json(), { code: "scope_attestation_invalid", errorCode: "scope_attestation_invalid", error: "resource is derived from scope" });
   } finally {
     if (previousSecret === undefined) delete process.env.SCOPE_ATTESTATION_SECRET;
     else process.env.SCOPE_ATTESTATION_SECRET = previousSecret;
@@ -385,7 +385,7 @@ test("daemon trace bundle attestation accepts producer-claimed dev environment o
   const previousDeploymentEnv = process.env.DEPLOYMENT_ENV;
   process.env.SCOPE_ATTESTATION_SECRET = "daemon-scope-test-secret";
   process.env.DEPLOYMENT_ENV = "staging";
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const { apiKey } = await seed();
     const bundleSha256 = "b".repeat(64);
@@ -420,7 +420,7 @@ test("daemon trace bundle attestation rejects producer-claimed dev environment o
   const previousDeploymentEnv = process.env.DEPLOYMENT_ENV;
   process.env.SCOPE_ATTESTATION_SECRET = "daemon-scope-test-secret";
   process.env.DEPLOYMENT_ENV = "production";
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const { apiKey } = await seed();
     const bundleSha256 = "c".repeat(64);
@@ -455,7 +455,7 @@ test("daemon trace bundle attestation rejects unknown producer-claimed deploymen
   const previousDeploymentEnv = process.env.DEPLOYMENT_ENV;
   process.env.SCOPE_ATTESTATION_SECRET = "daemon-scope-test-secret";
   process.env.DEPLOYMENT_ENV = "staging";
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const { apiKey } = await seed();
     const bundleSha256 = "d".repeat(64);
@@ -490,7 +490,7 @@ test("daemon trace bundle attestation falls back to server deployment when produ
   const previousDeploymentEnv = process.env.DEPLOYMENT_ENV;
   process.env.SCOPE_ATTESTATION_SECRET = "daemon-scope-test-secret";
   process.env.DEPLOYMENT_ENV = "staging";
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const { apiKey } = await seed();
     const bundleSha256 = "e".repeat(64);
@@ -581,7 +581,7 @@ async function postTraceBundleAttestation(
 test("daemon trace bundle attestation strips the three feedback diagnostic fields (valid or malformed) with a warning and a trace event", async () => {
   const previousSecret = process.env.SCOPE_ATTESTATION_SECRET;
   process.env.SCOPE_ATTESTATION_SECRET = "daemon-scope-test-secret";
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   const warnings: string[] = [];
   const warn = vi.spyOn(console, "warn").mockImplementation((...args: unknown[]) => { warnings.push(args.map(String).join(" ")); });
   try {
@@ -622,7 +622,7 @@ test("daemon trace bundle attestation strips the three feedback diagnostic field
 test("daemon trace bundle attestation still works for an older daemon that sends no observedFailureSummary", async () => {
   const previousSecret = process.env.SCOPE_ATTESTATION_SECRET;
   process.env.SCOPE_ATTESTATION_SECRET = "daemon-scope-test-secret";
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const { apiKey } = await seed();
     const { status, metadata } = await postTraceBundleAttestation(app.baseUrl, apiKey, {});
@@ -642,7 +642,7 @@ test("daemon trace bundle attestation still works for an older daemon that sends
 test("daemon trace bundle attestation carries machine_log_tail kind and bounded tail counters, dropping malformed ones", async () => {
   const previousSecret = process.env.SCOPE_ATTESTATION_SECRET;
   process.env.SCOPE_ATTESTATION_SECRET = "daemon-scope-test-secret";
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const { apiKey } = await seed();
     const valid = await postTraceBundleAttestation(app.baseUrl, apiKey, {
@@ -707,7 +707,7 @@ function machineStateFixture(): Record<string, unknown> {
 async function withSigningApp(fn: (app: Awaited<ReturnType<typeof openTestApp>>) => Promise<void>): Promise<void> {
   const previousSecret = process.env.SCOPE_ATTESTATION_SECRET;
   process.env.SCOPE_ATTESTATION_SECRET = "daemon-scope-test-secret";
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     await fn(app);
   } finally {

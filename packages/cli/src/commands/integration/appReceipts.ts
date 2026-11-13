@@ -135,16 +135,23 @@ export function projectAppManageReceipt(
     publishStatus: data.publishStatus,
     logoUrl: data.logoUrl,
     shareUrl: data.shareUrl,
-    link: data.link === undefined || data.link === null
-      ? data.link
-      : {
-        id: data.link.id,
-        expiresAt: data.link.expiresAt,
-        revokedAt: data.link.revokedAt,
-        lastUsedAt: data.link.lastUsedAt,
-        createdAt: data.link.createdAt,
-        updatedAt: data.link.updatedAt,
-      },
+    link: data.link === undefined || data.link === null ? data.link : projectShareLinkReceipt(data.link),
+    ...(data.links !== undefined ? { links: data.links.map(projectShareLinkReceipt) } : {}),
+  };
+}
+
+function projectShareLinkReceipt(
+  link: NonNullable<AgentApiIntegrationAppManageResponse["link"]>,
+): NonNullable<AgentApiIntegrationAppManageResponse["link"]> {
+  return {
+    id: link.id,
+    ...(link.targetServerSlug !== undefined ? { targetServerSlug: link.targetServerSlug } : {}),
+    expiresAt: link.expiresAt,
+    revokedAt: link.revokedAt,
+    ...(link.consumedAt !== undefined ? { consumedAt: link.consumedAt } : {}),
+    lastUsedAt: link.lastUsedAt,
+    createdAt: link.createdAt,
+    updatedAt: link.updatedAt,
   };
 }
 

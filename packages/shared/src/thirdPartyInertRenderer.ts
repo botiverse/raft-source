@@ -11,6 +11,8 @@
  * - Structured values such as normalized domains, callback URLs, categories, and
  *   closed scope enums do not belong here; those should be rendered from
  *   server-normalized values at the call site.
+ * - Raft's own system apps' event content is not app-controlled and is not
+ *   rendered here (docs/development/third-party-rendering.md).
  */
 
 import { extractRaftRefTargets, type RaftRefTarget } from "./raftRefs";
@@ -47,9 +49,21 @@ function escapeAgentMarkupLiterals(value: string): string {
     .replace(/>/g, "&gt;"));
 }
 
+/**
+ * `owner/repo#123` or `PR#12`: a number glued to the word before it is an issue
+ * reference, not a channel, so it reads as written. Latin only, so `看#123`
+ * stays a ref, and numbers only: `foo#general` is still rewritten.
+ */
+function isGluedIssueNumber(value: string, ref: { start: number; end: number; target: RaftRefTarget }): boolean {
+  return ref.target.kind === "channel"
+    && ref.start > 0
+    && /[A-Za-z0-9_/.-]/.test(value[ref.start - 1]!)
+    && /^#[0-9]+$/.test(value.slice(ref.start, ref.end));
+}
+
 export function neutralizeRaftRefLiterals(value: string): string {
   const refs = extractRaftRefTargets(value, { dedupe: false, includeMarkdownCode: false })
-    .filter((ref) => ref.start < ref.end)
+    .filter((ref) => ref.start < ref.end && !isGluedIssueNumber(value, ref))
     .sort((a, b) => a.start - b.start || b.end - a.end);
 
   if (refs.length === 0) return value;
@@ -98,6 +112,10 @@ function neutralRaftRefLabel(target: RaftRefTarget): string {
     case "dm-thread":
       return `dm:user:${target.peerName}:${target.threadShortId}`;
     case "task":
+      // Fixed neutral spelling, independent of RAFT_TASK_REF_SEPARATOR: it
+      // must never contain `#` / `@`, whatever the live ref syntax becomes.
+      if (target.channelName !== undefined) return `task:channel:${target.channelName}/${target.taskNumber}`;
+      if (target.peerName !== undefined) return `task:dm:user:${target.peerName}/${target.taskNumber}`;
       return `task:${target.taskNumber}`;
     case "message":
       return target.threadParentShortId
@@ -115,9 +133,32 @@ export function renderThirdPartyInertText(input: RenderThirdPartyInertTextInput)
   return neutralizeRaftRefLiterals(escapeAgentMarkupLiterals(clampText(raw)));
 }
 
+/**
+ * `JSON.stringify` escapes every control character below U+0020 but leaves
+ * NEL (U+0085) and the Unicode line and paragraph separators raw, and a
+ * universal-newline reader breaks lines on them. They can only stand inside a
+ * string there, so their `\u` escapes keep the JSON valid and equal.
+ */
+function stringifyPayloadJson(value: Record<string, unknown>): string {
+  return JSON.stringify(value, null, 2).replace(/[\u0085\u2028\u2029]/g, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`);
+}
+
 /** Render an ingress-bounded JSON payload without hiding fields from the agent. */
 export function renderThirdPartyInertJson(value: Record<string, unknown>): string {
-  return neutralizeRaftRefLiterals(escapeAgentMarkupLiterals(JSON.stringify(value, null, 2)));
+  return neutralizeRaftRefLiterals(escapeAgentMarkupLiterals(stringifyPayloadJson(value)));
+}
+
+/**
+ * An app event's payload as an agent reads it, on every client (the daemon's
+ * runtime input, `raft message check|read`, the SDK): as written for Raft's
+ * own system apps (`system_app`, which only the Server sets, from the event's
+ * row), inert for every other app and whenever the marker is absent
+ * (docs/development/third-party-rendering.md).
+ */
+export function renderThirdPartyEventPayload(event: { payload: Record<string, unknown>; system_app?: string | null }): string {
+  return typeof event.system_app === "string" && event.system_app.length > 0
+    ? stringifyPayloadJson(event.payload)
+    : renderThirdPartyInertJson(event.payload);
 }
 
 export function renderThirdPartyInertDisclosure(fields: RenderThirdPartyInertDisclosureFieldInput[]): string {

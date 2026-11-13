@@ -1,4 +1,5 @@
 import { fixturePasswordHash } from "../test/integration/credentials";
+import { traceIdentityHash } from "../tracing/traceIdentity";
 import { createApiTest } from "../test/integration/apiTest";
 // External agent inbox: for an external agent delivery, ack and read are the
 // same act, so its durable unread IS what it has not yet received. Persisted
@@ -31,7 +32,7 @@ import { recordInboxNotificationFacts } from "../services/inboxNotificationServi
 import { referenceAgentInboxChain } from "../test/agentInboxChainReference";
 import { withChannelDelivery } from "../test/orchestratorStub";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 // CI has no RisingWave: the chain read is served by the test-only reference
 // derivation of the same view. `chainReads` counts pulls that read the chain.
@@ -64,6 +65,7 @@ async function seedExternalFixture() {
     agentId: agent.id,
     scopes: ["send", "read"],
     name: "external-inbox-test",
+    issuedVia: "computer",
     createdByUserId: null,
   });
   return {
@@ -331,6 +333,8 @@ test("inbox unavailable: no persisted messages and no fallback; buffered items a
   assert.deepEqual(first.events.map((e) => e.message_id), [event.message_id]);
   assert.equal(first.inbox_hint, null);
   assert.equal(pullEvent(sink)?.attrs?.outcome, "inbox_unavailable");
+  // Nothing was read, so the pull claims no conversation count (not a misleading 0).
+  assert.equal("conversation_count" in (pullEvent(sink)?.attrs ?? {}), false);
   assert.equal(await getAgentLegacyReadCursor(f.agentId, f.channelId), unread.seq - 1, "the unread row stays unread");
 
   chainAvailable = true;
@@ -384,6 +388,10 @@ test("the pull records one aggregate trace event without raw ids", async ({ app 
   assert.equal(event.attrs?.last_read_seq, acked.seq);
   assert.equal(event.attrs?.chain_latest_seq, unread2.seq);
   assert.equal(typeof event.attrs?.duration_ms, "number");
+  // The one conversation this pull read, as its keyed hash, never the raw id.
+  assert.equal(event.attrs?.conversation_count, 1);
+  assert.equal(typeof event.attrs?.conversation_id_hash, "string");
+  assert.equal(event.attrs?.conversation_id_hash, traceIdentityHash("conversation_id_hash", f.channelId));
   const attrs = event.attrs ?? {};
   assert.equal("agent_id" in attrs, false);
   assert.equal("channel_id" in attrs, false);

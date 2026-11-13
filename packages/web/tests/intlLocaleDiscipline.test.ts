@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { readdirSync, readFileSync } from "node:fs";
 import { relative, resolve } from "node:path";
+import { isTestPath } from "../scripts/testLocations";
 import ts from "typescript";
 
 const repoRoot = resolve(import.meta.dirname, "..");
@@ -10,7 +11,8 @@ function sourceFiles(directory: string): string[] {
   return readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
     const path = resolve(directory, entry.name);
     if (entry.isDirectory()) return sourceFiles(path);
-    return /\.(?:ts|tsx)$/.test(entry.name) ? [path] : [];
+    // Feature tests (src/features/<feature>/tests/) are not app code.
+    return /\.(?:ts|tsx)$/.test(entry.name) && !isTestPath(relative(repoRoot, path)) ? [path] : [];
   });
 }
 

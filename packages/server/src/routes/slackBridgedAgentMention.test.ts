@@ -24,7 +24,7 @@ import {
   deliverMessagesToAgents,
 } from "../services/messageService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 // CI has no RisingWave: the external agent inbox pull reads the test-only
 // reference derivation of the agent inbox chain.
@@ -51,6 +51,7 @@ async function seedFixture() {
     agentId,
     scopes: ["send", "read"],
     name: `slack-mention-${agentId}`,
+    issuedVia: "computer",
     createdByUserId: null,
   })).apiKey;
 

@@ -28,7 +28,7 @@ import { AgentOrchestrator } from "../services/agentOrchestrator";
 import { referenceAgentInboxChain } from "../test/agentInboxChainReference";
 import { __setExternalAgentInboxChainSelectorForTests } from "../services/messageService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 __setExternalAgentInboxChainSelectorForTests(async (agentId: string) => ({ source: "chain", rows: await referenceAgentInboxChain(agentId) }));
 
@@ -71,7 +71,7 @@ async function seedFixture() {
 type Fixture = Awaited<ReturnType<typeof seedFixture>>;
 
 async function mintExternal(f: Fixture) {
-  return mintAgentCredential({ agentId: f.externalId, scopes: ["read", "send"], createdByUserId: f.ownerId, name: "stream" });
+  return mintAgentCredential({ agentId: f.externalId, scopes: ["read", "send"], issuedVia: "human", createdByUserId: f.ownerId, name: "stream" });
 }
 
 async function openStream(baseUrl: string, apiKey: string) {
@@ -150,6 +150,25 @@ test("a revoked credential's open stream ends at the next heartbeat (no broadcas
   });
 });
 
+test("an expired credential's open stream ends at the next heartbeat, as expired (#wg-rbac:#27)", async ({ app }) => {
+  await withEnv({ SLOCK_WAKE_STREAM_HEARTBEAT_MS: "300" }, async () => {
+    const f = await seedFixture();
+    app.app.set("agentOrchestrator", new AgentOrchestrator());
+    const credential = await mintExternal(f);
+    const res = await openStream(app.baseUrl, credential.apiKey);
+    const stream = streamReader(res.body!);
+    const warm = await stream.read(800);
+    assert.equal(warm.ended, false, "an unexpired credential keeps its stream");
+
+    await getDb().update(agentCredentials).set({ expiresAt: new Date(Date.now() - 1) }).where(eq(agentCredentials.id, credential.credentialId));
+    const after = await stream.read(3000);
+    stream.cancel();
+    assert.equal(after.ended, true, `stream must end after expiry: ${after.raw.slice(-200)}`);
+    assert.match(after.raw, /event: credential-expired\ndata: \{"code":"agent_credential_expired"\}/);
+    assert.doesNotMatch(after.raw, /credential-revoked/);
+  });
+});
+
 test("a deleted agent's open stream ends at the next heartbeat", async ({ app }) => {
   await withEnv({ SLOCK_WAKE_STREAM_HEARTBEAT_MS: "300" }, async () => {
     const f = await seedFixture();
@@ -161,6 +180,37 @@ test("a deleted agent's open stream ends at the next heartbeat", async ({ app })
     const after = await readUntilEnd(res.body!, 3000);
     assert.equal(after.ended, true, "deleted agent loses the stream");
   });
+});
+
+test("deleting an agent revokes every live credential of it in the same transaction (#wg-rbac:#27)", async ({ app: _app }) => {
+  const f = await seedFixture();
+  const [a, b] = [await mintExternal(f), await mintExternal(f)];
+  const { deleteAgent } = await import("../services/agentService");
+  await deleteAgent(f.externalId);
+  const rows = await getDb().select({ id: agentCredentials.id, revokedAt: agentCredentials.revokedAt, reason: agentCredentials.revokedReason })
+    .from(agentCredentials).where(eq(agentCredentials.agentId, f.externalId));
+  for (const id of [a.credentialId, b.credentialId]) {
+    const row = rows.find((r) => r.id === id);
+    assert.ok(row?.revokedAt, `${id} revoked`);
+    assert.equal(row?.reason, "agent_deleted");
+  }
+  assert.equal(rows.filter((r) => r.revokedAt === null).length, 0, "no live credential of a deleted agent");
+});
+
+test("a key minted while its agent is being deleted is refused, not left live (#wg-rbac:#27)", async ({ app: _app }) => {
+  const f = await seedFixture();
+  const { deleteAgent } = await import("../services/agentService");
+  const { __setMintBeforeLockHookForTests } = await import("../services/agentCredentialService");
+  // The deletion lands after the agent check and the slow hash, before the insert.
+  __setMintBeforeLockHookForTests(async (agentId) => { await deleteAgent(agentId); });
+  try {
+    await assert.rejects(mintExternal(f), /agent_missing/);
+  } finally {
+    __setMintBeforeLockHookForTests(null);
+  }
+  const live = await getDb().select({ id: agentCredentials.id }).from(agentCredentials)
+    .where(eq(agentCredentials.agentId, f.externalId));
+  assert.equal(live.filter(Boolean).length, 0, "no credential row was written for the deleted agent");
 });
 
 // ── 1(b) prompt close via the revocation broadcast ──────────────────────────
@@ -292,11 +342,11 @@ test("the service-level guard refuses managed agents when requested and still se
   void db;
   const f = await seedFixture();
   await assert.rejects(
-    mintAgentCredential({ agentId: f.managedId, scopes: ["read"], createdByUserId: f.ownerId, requireExternalRuntime: true }),
+    mintAgentCredential({ agentId: f.managedId, scopes: ["read"], issuedVia: "human", createdByUserId: f.ownerId, requireExternalRuntime: true }),
     /agent_not_external/,
   );
   // The Computer runner path does not set the flag and keeps working.
-  const runner = await mintAgentCredential({ agentId: f.managedId, scopes: ["read"], createdByUserId: null });
+  const runner = await mintAgentCredential({ agentId: f.managedId, scopes: ["read"], issuedVia: "computer", createdByUserId: null });
   assert.ok(runner.apiKey.startsWith("sk_agent_"));
 });
 
@@ -340,6 +390,17 @@ test("default scopes are the least-privilege external-agent set; elevated scopes
     assert.equal(self!.displayName, "Renamed External");
     const [other] = await getDb().select({ displayName: agents.displayName }).from(agents).where(eq(agents.id, f.managedId));
     assert.notEqual(other!.displayName, "Renamed External");
+    // Refusal slice 8: the profile checks answer through refuse() (agentRouteRefusals.agentProfileUpdateFields).
+    const profileRefused = async (path: string, init: RequestInit) => {
+      const res = await fetch(`${app.baseUrl}/internal/agent-api${path}`, { method: "POST", ...init, headers: { ...init.headers, Authorization: `Bearer ${minted.apiKey}` } });
+      const body = await res.json() as { code?: string; errorCode?: string; error?: string };
+      return [res.status, body.code, body.errorCode];
+    };
+    const json = (body: unknown): RequestInit => ({ headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    assert.deepEqual(await profileRefused("/profile", json({})), [400, "PROFILE_UPDATE_NO_FIELDS", "PROFILE_UPDATE_NO_FIELDS"]);
+    assert.deepEqual(await profileRefused("/profile", json({ avatarUrl: "https://x.example/a.png" })), [400, "PROFILE_AVATAR_URL_BAD_FORMAT", "PROFILE_AVATAR_URL_BAD_FORMAT"]);
+    assert.deepEqual(await profileRefused("/profile", json({ displayName: "x".repeat(81) })), [400, "profile_display_name_invalid", "profile_display_name_invalid"]);
+    assert.deepEqual(await profileRefused("/profile/avatar", {}), [400, "avatar_file_required", "avatar_file_required"]);
     // The SERVER avatar stays behind `server`.
     const serverAvatar = await fetch(`${app.baseUrl}/internal/agent-api/server/avatar`, {
       method: "POST",
@@ -397,7 +458,7 @@ test("re-login rotates: the profile's previous credential is revoked atomically,
 
     // Another agent's credential cannot be named; nothing is minted or revoked.
     const foreignAgent = await createAgent(f.serverId, "CredSecForeign", { runtime: "external", model: "external" });
-    const foreign = await mintAgentCredential({ agentId: foreignAgent.id, scopes: ["read"], createdByUserId: f.ownerId });
+    const foreign = await mintAgentCredential({ agentId: foreignAgent.id, scopes: ["read"], issuedVia: "human", createdByUserId: f.ownerId });
     const before = await getDb().select({ id: agentCredentials.id }).from(agentCredentials).where(eq(agentCredentials.agentId, f.externalId));
     const rejected = await mintVia({ replacesCredentialId: foreign.credentialId });
     assert.equal(rejected.status, 400);

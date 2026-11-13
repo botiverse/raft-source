@@ -5,7 +5,7 @@ import type { StateStorage } from "zustand/middleware";
 import {
   normalizeRecentConversationIds,
   pushRecentConversation,
-} from "../components/search/recentConversations";
+} from "../features/search/recentConversations";
 
 // Per server+user list of the conversations the user opened, most recent
 // first. Feeds the desktop ⌘K overlay's empty state (task #113). Same shape and

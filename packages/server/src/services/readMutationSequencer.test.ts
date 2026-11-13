@@ -1,3 +1,4 @@
+import { fillJointMembersFromChannelHumans } from "../test/jointMemberFill";
 import { dbTest as test } from "../test/integration/dbTest";
 import { closeTestDatabase } from "../test/integration/database";
 import assert from "node:assert/strict";
@@ -5,7 +6,7 @@ import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 
-import { and, eq, inArray } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 
 import { closeDatabase, getDb } from "../db/index";
 import {
@@ -16,7 +17,6 @@ import {
   agentChannelReadCursors,
   channelAgents,
   channelHumans,
-  featureFlags,
   channels,
   jointChannels,
   jointChannelServers,
@@ -33,6 +33,7 @@ import {
 } from "../db/schema";
 import { createAgent } from "./agentService";
 import { markChannelInboxDone } from "./channelService";
+import { seedBoundGuest } from "../test/guestFixture";
 import {
   awaitPostPersistReadMutation,
   drainSenderReadReceiptsForTests,
@@ -44,6 +45,7 @@ import {
   claimNextFairReadMutation,
   claimNextReadMutation,
   compactTerminalReadMutations,
+  setBeforeCompactionDeleteForTests,
   CompatibilityReadMutationPendingError,
   drainReadMutationOutbox,
   executeCompatibilityReadMutation,
@@ -658,6 +660,30 @@ test("identical global read-all is a zero-write terminal and partial change adva
   );
 });
 
+test("row_unread decides its count and outcome from the state it wrote: a countable message arriving after the boundary read is counted", async ({ db }) => {
+  const { owner, sender, server } = await seedScopes();
+  const [scope] = await db.insert(channels).values({ serverId: server.id, name: "read-scope-race", type: "channel" }).returning();
+  await db.insert(channelHumans).values({ channelId: scope.id, userId: owner.id });
+  await db.insert(messages).values({ channelId: scope.id, senderType: "user", senderId: owner.id, content: "mine", seq: 1 });
+  // The boundary read before the write found nothing countable (throughSeq 0)...
+  await admitReadMutation({
+    serverId: server.id,
+    principalId: owner.id,
+    mutationId: randomUUID(),
+    mutation: { kind: "row_unread", scopeId: scope.id, throughSeq: 0 },
+  });
+  // ...and the peer's message lands before the write's transaction.
+  await db.insert(messages).values({ channelId: scope.id, senderType: "user", senderId: sender.id, content: "news", seq: 2 });
+
+  const ack = await executeReadMutationClaim({ claim: await claim({ serverId: server.id, principalId: owner.id }) });
+  const [written] = ack.scopes;
+  assert.equal(written?.unreadOutcome, "counted");
+  // Counted implies a count, from the same read: the seq distance from the
+  // written cursor (0) to the latest countable message (2), the /unread measure.
+  assert.equal(written?.maxReadSeq, 0);
+  assert.equal(written?.unreadCount, 2);
+});
+
 test("absent cursor unread versions only a real target and concurrent admissions preserve effect count", async ({ db }) => {
   const { owner, server, scopeA, scopeB } = await seedScopes();
   await admitReadMutation({
@@ -673,6 +699,8 @@ test("absent cursor unread versions only a real target and concurrent admissions
     readStateVersion: 1,
     lastAppliedAuthoritySeq: 1,
     changed: true,
+    unreadCount: 1,
+    unreadOutcome: "counted",
   });
 
   await admitReadMutation({
@@ -689,6 +717,9 @@ test("absent cursor unread versions only a real target and concurrent admissions
     readStateVersion: 0,
     lastAppliedAuthoritySeq: 0,
     changed: false,
+    // No cursor: the peer's messages already count.
+    unreadCount: 1,
+    unreadOutcome: "counted",
   });
   assert.equal((await getDb().select().from(userChannelReadCursors).where(eq(
     userChannelReadCursors.channelId,
@@ -812,6 +843,7 @@ test("joint channel and thread resolve only through active local projections and
     role: "host",
     status: "active",
   });
+  await fillJointMembersFromChannelHumans();
   const [parentMessage] = await getDb().insert(messages).values({
     channelId: canonicalParent.id,
     senderType: "user",
@@ -841,6 +873,7 @@ test("joint channel and thread resolve only through active local projections and
     role: "host",
     status: "active",
   });
+  await fillJointMembersFromChannelHumans();
   await getDb().insert(messages).values({
     channelId: canonicalThread.id,
     senderType: "user",
@@ -1146,6 +1179,101 @@ test("closeDatabase surfaces sender read receipt failures before fixture teardow
   assert.equal(getSenderReadReceiptInFlightCountForTests(), 0);
 });
 
+test("compaction takes the oldest expired rows across both terminal states, up to the limit", async ({ db }) => {
+  void db;
+  const { owner, server } = await seedAuthority();
+  const ids: string[] = [];
+  for (let index = 0; index < 4; index += 1) {
+    const mutationId = randomUUID();
+    ids.push(mutationId);
+    await admitReadMutation({ serverId: server.id, principalId: owner.id, mutationId, mutation: { kind: "global_read_all" } });
+    await executeReadMutationClaim({ claim: await claim({ serverId: server.id, principalId: owner.id }) });
+  }
+  // Interleave the two terminal states by age: applied 01-01, retired 01-02,
+  // applied 01-03, retired 01-04. A limit of 3 must take the three oldest,
+  // whichever state each one is in.
+  for (const [index, mutationId] of ids.entries()) {
+    await getDb().update(readMutations).set({
+      state: index % 2 === 0 ? "applied" : "retired_no_effect",
+      terminalAt: new Date(`2026-01-0${index + 1}T00:00:00.000Z`),
+    }).where(eq(readMutations.mutationId, mutationId));
+  }
+
+  const result = await compactTerminalReadMutations({ before: new Date("2026-07-21T00:00:00.000Z"), limit: 3 });
+  assert.equal(result.compacted, 3);
+  const left = await getDb().select({ mutationId: readMutations.mutationId }).from(readMutations)
+    .where(inArray(readMutations.mutationId, ids));
+  assert.deepEqual(left.map((row) => row.mutationId), [ids[3]], "only the newest expired row is left");
+});
+
+test("one principal's expired rows move together, and a chunk that changes mid-move rolls back whole", async ({ db }) => {
+  void db;
+  const { owner, server } = await seedAuthority();
+  const ids: string[] = [];
+  for (let index = 0; index < 3; index += 1) {
+    const mutationId = randomUUID();
+    ids.push(mutationId);
+    await admitReadMutation({ serverId: server.id, principalId: owner.id, mutationId, mutation: { kind: "global_read_all" } });
+    await executeReadMutationClaim({ claim: await claim({ serverId: server.id, principalId: owner.id }) });
+  }
+  await getDb().update(readMutations).set({ terminalAt: new Date("2026-01-01T00:00:00.000Z") })
+    .where(inArray(readMutations.mutationId, ids));
+
+  // A row that cannot be deleted mid-move (as if the drain had changed it):
+  // the whole chunk must stay, tombstones included.
+  await getDb().execute(sql.raw(`
+    CREATE OR REPLACE FUNCTION test_keep_one_read_mutation() RETURNS trigger AS $$
+    BEGIN
+      IF OLD.mutation_id = '${ids[1]}'::uuid THEN RETURN NULL; END IF;
+      RETURN OLD;
+    END $$ LANGUAGE plpgsql
+  `));
+  await getDb().execute(sql.raw(`
+    CREATE TRIGGER test_keep_one_read_mutation BEFORE DELETE ON read_mutations
+      FOR EACH ROW EXECUTE FUNCTION test_keep_one_read_mutation()
+  `));
+  const blocked = await compactTerminalReadMutations({ before: new Date("2026-07-21T00:00:00.000Z") });
+  assert.equal(blocked.compacted, 0, "a chunk with a row that changed mid-move moves nothing");
+  assert.equal((await getDb().select().from(readMutations).where(inArray(readMutations.mutationId, ids))).length, 3);
+  assert.equal((await getDb().select().from(readMutationTombstones).where(inArray(readMutationTombstones.mutationId, ids))).length, 0,
+    "no tombstone without its delete");
+
+  await getDb().execute(sql.raw("DROP TRIGGER test_keep_one_read_mutation ON read_mutations"));
+  await getDb().execute(sql.raw("DROP FUNCTION test_keep_one_read_mutation()"));
+  const moved = await compactTerminalReadMutations({ before: new Date("2026-07-21T00:00:00.000Z") });
+  assert.equal(moved.compacted, 3, "all three of the principal's rows move in one go");
+  assert.equal((await getDb().select().from(readMutations).where(inArray(readMutations.mutationId, ids))).length, 0);
+  assert.equal((await getDb().select().from(readMutationTombstones).where(inArray(readMutationTombstones.mutationId, ids))).length, 3);
+});
+
+test("a row whose digest changes between the identity check and the delete rolls the chunk back", async ({ db }) => {
+  void db;
+  const { owner, server } = await seedAuthority();
+  const ids: string[] = [];
+  for (let index = 0; index < 2; index += 1) {
+    const mutationId = randomUUID();
+    ids.push(mutationId);
+    await admitReadMutation({ serverId: server.id, principalId: owner.id, mutationId, mutation: { kind: "global_read_all" } });
+    await executeReadMutationClaim({ claim: await claim({ serverId: server.id, principalId: owner.id }) });
+  }
+  await getDb().update(readMutations).set({ terminalAt: new Date("2026-01-01T00:00:00.000Z") })
+    .where(inArray(readMutations.mutationId, ids));
+  setBeforeCompactionDeleteForTests(async (tx) => {
+    await tx.execute(sql`UPDATE read_mutations SET terminal_digest = terminal_digest || '-changed' WHERE mutation_id = ${ids[0]}::uuid`);
+  });
+  try {
+    const result = await compactTerminalReadMutations({ before: new Date("2026-07-21T00:00:00.000Z") });
+    assert.equal(result.compacted, 0, "a row that no longer matches its tombstone moves nothing in its chunk");
+  } finally {
+    setBeforeCompactionDeleteForTests(null);
+  }
+  const rows = await getDb().select().from(readMutations).where(inArray(readMutations.mutationId, ids));
+  assert.equal(rows.length, 2, "both rows stay");
+  assert.ok(!rows.some((row) => row.terminalDigest?.endsWith("-changed")), "the in-chunk change rolled back too");
+  assert.equal((await getDb().select().from(readMutationTombstones).where(inArray(readMutationTombstones.mutationId, ids))).length, 0, "no tombstone stays");
+  assert.equal((await compactTerminalReadMutations({ before: new Date("2026-07-21T00:00:00.000Z") })).compacted, 2, "the next pass moves both");
+});
+
 test("atomic compaction preserves permanent exact replay after the 90-day horizon", async ({ db }) => {
   const { owner, server } = await seedAuthority();
   const mutationId = randomUUID();
@@ -1276,7 +1404,7 @@ test.skipIf(inSourceSnapshot)("staging integration CI pins the real-PostgreSQL s
   const workflow = await readFile(new URL("../../../../.github/workflows/test.yml", import.meta.url), "utf8");
   const integrationJob = workflow.match(/\n  integration-contracts:\n(?<body>[\s\S]*?)(?=\n  [a-z][a-z0-9-]+:\n)/)?.groups?.body;
   assert.ok(integrationJob, "integration job must remain present");
-  assert.match(integrationJob, /services:\s*\n\s+postgres:\s*\n\s+image: postgres:16-alpine/);
+  assert.match(integrationJob, /services:\s*\n\s+postgres:\s*\n\s+image: postgres:17-alpine/);
   assert.match(integrationJob, /--health-cmd "pg_isready -U read_mutation_ci -d postgres"/);
   const focusedStep = integrationJob.match(
     /- name: Read mutation sequencer real PostgreSQL contract(?<body>[\s\S]*?)(?=\n\s+- name:)/,
@@ -1419,6 +1547,7 @@ test("conversation read-all uses local joint cursors with canonical message fron
   await db.insert(jointChannelServers).values({
     jointChannelId: jointParent.id, serverId: server.id, localChannelId: localParent.id, role: "host", status: "active",
   });
+  await fillJointMembersFromChannelHumans();
   const [parent] = await db.insert(messages).values({
     channelId: storageParent.id, senderType: "user", senderId: owner.id, content: "canonical parent", seq: 10,
   }).returning();
@@ -1432,6 +1561,7 @@ test("conversation read-all uses local joint cursors with canonical message fron
   await db.insert(jointChannelServers).values({
     jointChannelId: jointThread.id, serverId: server.id, localChannelId: localThread.id, role: "host", status: "active",
   });
+  await fillJointMembersFromChannelHumans();
   await db.insert(threadFollows).values({
     followerType: "user", followerId: owner.id, threadChannelId: localThread.id, parentMessageId: parent.id, reason: "manual",
   });
@@ -1450,18 +1580,19 @@ test("conversation read-all uses local joint cursors with canonical message fron
 });
 
 
-test("conversation read-all rechecks Guest gate and hidden all policy at execution", async ({ db }) => {
-  const { owner, sender, server, scopeA } = await seedScopes();
-  await db.update(serverMembers).set({ role: "guest" }).where(and(eq(serverMembers.serverId, server.id), eq(serverMembers.userId, owner.id)));
-  await db.update(featureFlags).set({ defaultEnabled: false }).where(eq(featureFlags.key, "server_guest_v0"));
-  const execute = () => executeCompatibilityReadMutation({
+test("conversation read-all rechecks the Guest's one channel and hidden all policy at execution", async ({ db }) => {
+  const { owner, sender, server, scopeA, scopeB } = await seedScopes();
+  // A Guest bound to another channel reads nothing here (#wg-rbac:#15).
+  await seedBoundGuest({ serverId: server.id, userId: owner.id }, db);
+  const execute = (scopeId = scopeA.id) => executeCompatibilityReadMutation({
     serverId: server.id, principalId: owner.id,
-    mutation: { kind: "conversation_read_all", scopeId: scopeA.id },
+    mutation: { kind: "conversation_read_all", scopeId },
   });
-  assert.deepEqual((await execute()).scopes, [], "disabled Guest access cannot advance cursors");
-  await db.update(featureFlags).set({ defaultEnabled: true }).where(eq(featureFlags.key, "server_guest_v0"));
+  assert.deepEqual((await execute()).scopes, [], "a Guest of another channel cannot advance this one's cursors");
+  await seedBoundGuest({ serverId: server.id, userId: owner.id, channelId: scopeA.id }, db);
   assert.equal((await execute()).scopes.find((scope) => scope.scopeId === scopeA.id)?.maxReadSeq, 2,
-    "joined regular Guest channel remains readable");
+    "the Guest's joined channel remains readable");
+  assert.deepEqual((await execute(scopeB.id)).scopes, [], "another channel it is a member of is not its channel");
   await db.update(channels).set({ name: "all", type: "private" }).where(eq(channels.id, scopeA.id));
   await db.insert(messages).values({ channelId: scopeA.id, senderType: "user", senderId: sender.id, content: "hidden activity", seq: 3 });
   assert.deepEqual((await execute()).scopes, [], "stale membership never exposes hidden #all activity");

@@ -1,8 +1,10 @@
-import { and, desc, eq, inArray } from "drizzle-orm";
-import { failpoints, type AgentMessage } from "@botiverse/raft-shared";
+import { and, asc, desc, eq, inArray, or } from "drizzle-orm";
+import { failpoints, type AgentMessage, type AgentMessageSourceTask } from "@botiverse/raft-shared";
 import { getDb, type DatabaseExecutor } from "../db/index";
-import { agents, taskEvents, tasks, users } from "../db/schema";
+import { agents, channels, messages, taskEvents, tasks, users } from "../db/schema";
 import { UUID_RE } from "../lib/messageId";
+import { isTaskV2ConversationsEnabled } from "./taskConversationsGate";
+import { isV2Task } from "./taskV2Mode";
 
 export const TASK_CURRENT_PROJECTION_SOURCE = "tasks_current_projection" as const;
 
@@ -37,7 +39,7 @@ export interface ProjectedTaskCurrentText {
  * from `tasks` on read instead of duplicated on write.
  */
 export interface ProjectedMessageTaskFields {
-  taskStatus: "todo" | "in_progress" | "in_review" | "done" | "closed";
+  taskStatus: "backlog" | "todo" | "in_progress" | "in_review" | "done" | "closed";
   taskNumber: number;
   taskAssigneeType: "user" | "agent" | null;
   taskAssigneeId: string | null;
@@ -69,6 +71,12 @@ type TaskCurrentProjectionRow = {
 
 type TaskProjectionLoadOptions = {
   failClosed?: boolean;
+  /**
+   * The server the reading agent is on. Task v2 is decided per reader's
+   * server: a joint channel's tasks live on the shared storage server, whose
+   * flag says nothing about the reader's. Without it, the task's own server.
+   */
+  readerServerId?: string;
 };
 
 /**
@@ -276,8 +284,150 @@ export function toAgentTaskCurrentProjection(
   };
 }
 
+/**
+ * Task v2: every task hanging under each given chat message, ascending by
+ * number, as the agent-facing `source_tasks` list: the tasks created from it
+ * (`tasks.source_message_id`) and a task created before task v2 that was
+ * posted as (or converted from) it (`tasks.message_id`), so on a flag-on
+ * server every task bracket names tasks by ref (`[tasks #proj:#7 …]`). Only
+ * where the reader's server has task v2 conversations on
+ * (`task_v2_conversations_v0`), or for a message with a v2 task under it
+ * (per-task mode: it keeps its ref after a rollback / on the flag-off side of
+ * a joint channel): elsewhere the map has no entry and agents keep the pre-v2
+ * single `[task #N status=…]` bracket.
+ * Anchors are never source messages, so they never get an entry.
+ *
+ * The task lookup (`source_message_id IN … OR message_id IN …`) runs only when
+ * a reader's server has task v2 conversations on: this is on the agent
+ * delivery, history and freshness paths, and a server without task v2 has no
+ * source tasks to list. The reader's server is the given one, or else the
+ * servers of the messages themselves (primary-key reads). A message with a v2
+ * task under it read where the flag is off (after a rollback) keeps the task
+ * commands and the conversation, but loses the bracket.
+ */
+export async function loadAgentSourceTasksByMessageId(
+  messageIds: readonly string[],
+  executor: DatabaseExecutor = getDb(),
+  options: TaskProjectionLoadOptions = {},
+): Promise<Map<string, AgentMessageSourceTask[]>> {
+  const ids = [...new Set(messageIds.filter((id) => UUID_RE.test(id)))];
+  const bySource = new Map<string, AgentMessageSourceTask[]>();
+  if (ids.length === 0) return bySource;
+  try {
+    const readerServerIds = options.readerServerId
+      ? [options.readerServerId]
+      : [...new Set((await executor
+        .selectDistinct({ serverId: channels.serverId })
+        .from(messages)
+        .innerJoin(channels, eq(channels.id, messages.channelId))
+        .where(inArray(messages.id, ids))).map((row) => row.serverId))];
+    let anyReaderEnabled = false;
+    for (const serverId of readerServerIds) {
+      if (await isTaskV2ConversationsEnabled(serverId, executor)) {
+        anyReaderEnabled = true;
+        break;
+      }
+    }
+    if (!anyReaderEnabled) return bySource;
+    const rows = await executor
+      .select({
+        sourceMessageId: tasks.sourceMessageId,
+        hostMessageId: tasks.messageId,
+        taskNumber: tasks.taskNumber,
+        status: tasks.status,
+        claimedByType: tasks.claimedByType,
+        claimedById: tasks.claimedById,
+        ownConversation: tasks.ownConversation,
+        conversationChannelId: tasks.conversationChannelId,
+        serverId: channels.serverId,
+      })
+      .from(tasks)
+      .innerJoin(channels, eq(channels.id, tasks.channelId))
+      .where(or(inArray(tasks.sourceMessageId, ids), inArray(tasks.messageId, ids)))
+      .orderBy(asc(tasks.taskNumber));
+    if (rows.length === 0) return bySource;
+    const idSet = new Set(ids);
+    // A task hangs under its source message, or (pre-v2) its host message.
+    const anchorOf = (row: { sourceMessageId: string | null; hostMessageId: string | null }) => (
+      row.sourceMessageId && idSet.has(row.sourceMessageId)
+        ? row.sourceMessageId
+        : row.hostMessageId && idSet.has(row.hostMessageId) ? row.hostMessageId : null
+    );
+
+    const enabledServers = new Set<string>();
+    const flagServerOf = (row: { serverId: string }) => options.readerServerId ?? row.serverId;
+    for (const serverId of new Set(rows.map(flagServerOf))) {
+      if (await isTaskV2ConversationsEnabled(serverId, executor)) enabledServers.add(serverId);
+    }
+    // Per-task mode (./taskV2Mode): a v2 task is listed whatever the reader's
+    // flag; a message listing one lists every task under it, so its bracket
+    // stays complete.
+    const listedAnchors = new Set(rows
+      .filter((row) => anchorOf(row) && (enabledServers.has(flagServerOf(row)) || isV2Task(row)))
+      .map((row) => anchorOf(row)!));
+    const visible = rows.filter((row) => listedAnchors.has(anchorOf(row) ?? ""));
+    if (visible.length === 0) return bySource;
+
+    const names = new Map<string, string>();
+    const userIds = [...new Set(visible.filter((row) => row.claimedByType === "user" && row.claimedById).map((row) => row.claimedById!))];
+    const agentIds = [...new Set(visible.filter((row) => row.claimedByType === "agent" && row.claimedById).map((row) => row.claimedById!))];
+    if (userIds.length > 0) {
+      for (const row of await executor.select({ id: users.id, name: users.name }).from(users).where(inArray(users.id, userIds))) {
+        names.set(`user:${row.id}`, row.name);
+      }
+    }
+    if (agentIds.length > 0) {
+      for (const row of await executor.select({ id: agents.id, name: agents.name }).from(agents).where(inArray(agents.id, agentIds))) {
+        names.set(`agent:${row.id}`, row.name);
+      }
+    }
+
+    for (const row of visible) {
+      const anchor = anchorOf(row)!;
+      const list = bySource.get(anchor) ?? [];
+      list.push({
+        number: row.taskNumber,
+        status: row.status,
+        assignee_type: row.claimedByType === "user" ? "human" : row.claimedByType ?? null,
+        assignee_id: row.claimedById ?? null,
+        assignee_name: row.claimedById ? names.get(`${row.claimedByType}:${row.claimedById}`) ?? null : null,
+      });
+      bySource.set(anchor, list);
+    }
+    return bySource;
+  } catch (err) {
+    if (options.failClosed) throw err;
+    console.error("[messageTaskProjection] source task load failed:", err);
+    return new Map();
+  }
+}
+
+/**
+ * Attach `source_tasks` (task v2, see loadAgentSourceTasksByMessageId) to
+ * agent-facing message rows keyed by `id`. Rows without tasks — and every
+ * row on a server without task v2 conversations — come back unchanged.
+ */
+export async function withAgentSourceTasks<T extends { id?: unknown; senderType?: unknown }>(
+  rows: T[],
+  executor?: DatabaseExecutor,
+  readerServerId?: string,
+): Promise<Array<T & { source_tasks?: AgentMessageSourceTask[] }>> {
+  const ids = rows
+    .filter((row) => row.senderType !== "external_projection")
+    .map((row) => row.id)
+    .filter((id): id is string => typeof id === "string");
+  if (ids.length === 0) return rows;
+  const sourceTasks = await loadAgentSourceTasksByMessageId(ids, executor, readerServerId ? { readerServerId } : {});
+  if (sourceTasks.size === 0) return rows;
+  return rows.map((row) => {
+    const list = typeof row.id === "string" && row.senderType !== "external_projection" ? sourceTasks.get(row.id) : undefined;
+    return list ? { ...row, source_tasks: list } : row;
+  });
+}
+
 function withoutQueuedTaskFields(message: AgentMessage): AgentMessage {
   const {
+    source_tasks: _sourceTasks,
     task_status: _taskStatus,
     task_number: _taskNumber,
     task_assignee_type: _taskAssigneeType,
@@ -316,9 +466,19 @@ export async function refreshQueuedAgentTaskProjections(
     executor,
     { failClosed: true },
   );
+  // Task v2: the tasks hanging under each message (flag-on servers only).
+  const sourceTasks = await loadAgentSourceTasksByMessageId(
+    persistedMessageIds,
+    executor,
+    { failClosed: true },
+  );
 
   return queuedMessages.map((queuedMessage) => {
-    const message = withoutQueuedTaskFields(queuedMessage);
+    const stripped = withoutQueuedTaskFields(queuedMessage);
+    const sourceTaskList = queuedMessage.message_id && queuedMessage.sender_type !== "third_party_app"
+      ? sourceTasks.get(queuedMessage.message_id)
+      : undefined;
+    const message: AgentMessage = sourceTaskList ? { ...stripped, source_tasks: sourceTaskList } : stripped;
     const fact = queuedMessage.message_id ? facts.get(queuedMessage.message_id) : undefined;
     if (!fact) return message;
 

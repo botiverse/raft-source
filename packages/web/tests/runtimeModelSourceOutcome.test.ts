@@ -1,13 +1,10 @@
 import assert from "node:assert/strict";
 import { RUNTIME_MODELS } from "@botiverse/raft-shared";
 import {
-  builtInCatalogCapabilityIsLive,
   parseRuntimeModelSourcePayload,
-  projectBuiltInPresetModelOptions,
   projectBundledRuntimeModelSuggestions,
   projectRuntimeModelLabelPresentation,
   projectRuntimeModelSourcePresentation,
-  runtimeModelSelectionIsRunnable,
 } from "../src/hooks/useRuntimeModels";
 import type {
   RuntimeModelSourceState,
@@ -30,8 +27,6 @@ test("failed Grok detection preserves its reason and offers only unverified know
   assert.equal(presentation.fromMachine, false);
   assert.ok(presentation.models.some((m) => m.id === "grok-4.6"));
   assert.ok(presentation.models.every((m) => m.verified === "suggestion_only"));
-  assert.equal(runtimeModelSelectionIsRunnable({ runtime: "grok", source, model: "grok-4.6", customMode: false, customAllowed: false }), true);
-  assert.equal(runtimeModelSelectionIsRunnable({ runtime: "grok", source, model: "invented-model", customMode: false, customAllowed: false }), false);
   assert.deepEqual(parseRuntimeModelSourcePayload({ kind: "error", retryable: true, code: "secret arbitrary text" }), { kind: "error", retryable: true });
 });
 
@@ -43,12 +38,6 @@ test("only terminal non-live states offer unverified fallback; pending requests 
       assert.ok(presentation.models.length > 0);
       assert.ok(presentation.models.every((m) => m.verified === "suggestion_only"));
     }
-    assert.equal(runtimeModelSelectionIsRunnable({
-      source,
-      model: "kimi-code/kimi-for-coding",
-      customMode: false,
-      customAllowed: false,
-    }), false, source.kind);
   }
 });
 
@@ -150,18 +139,19 @@ test("Built-in catalog provenance survives parsing while malformed and legacy pa
       },
     },
   });
-  assert.equal(builtInCatalogCapabilityIsLive(parsed), true);
+  const catalogOf = (source: RuntimeModelSourceState) => source.kind === "live" ? source.value.catalog : undefined;
+  assert.deepEqual(catalogOf(parsed), { protocolVersion: 1, runtime: "builtin", runtimeVersion: "0.84.3" });
   assert.equal(
-    builtInCatalogCapabilityIsLive(
+    catalogOf(
       parseRuntimeModelSourcePayload({
         models: [{ id: "openrouter/model-a", label: "Model A" }],
       }),
     ),
-    false,
+    undefined,
     "new Web must not upgrade an old daemon list into a capability",
   );
   assert.equal(
-    builtInCatalogCapabilityIsLive(
+    catalogOf(
       parseRuntimeModelSourcePayload({
         kind: "live",
         value: {
@@ -174,44 +164,8 @@ test("Built-in catalog provenance survives parsing while malformed and legacy pa
         },
       }),
     ),
-    false,
+    undefined,
   );
-});
-
-test("Built-in presets remain editable and detection never replaces the selected identity", () => {
-  const providerModels = [
-    { id: "openrouter/model-a", label: "Model A" },
-    { id: "openrouter/model-b", label: "Model B" },
-  ];
-  const live: RuntimeModelSourceState = {
-    kind: "live",
-    value: {
-      models: [{ id: "openrouter/model-a", label: "Machine A" }],
-      catalog: {
-        protocolVersion: 1,
-        runtime: "builtin",
-        runtimeVersion: "0.84.3",
-      },
-    },
-  };
-  assert.deepEqual(
-    projectBuiltInPresetModelOptions({
-      providerModels,
-      persistedModel: "openrouter/model-b",
-    }),
-    [
-      { id: "openrouter/model-a", label: "Model A" },
-      { id: "openrouter/model-b", label: "Model B" },
-    ],
-  );
-  for (const source of [...NON_LIVE, { kind: "live", value: { models: [] } } as const]) {
-    assert.equal(runtimeModelSelectionIsRunnable({ source, model: "openrouter/model-a", customMode: false, customAllowed: false, builtInPreset: true }), true);
-  }
-  assert.deepEqual(projectBuiltInPresetModelOptions({ providerModels, persistedModel: "provider/preserved-exact-id" }), [
-    ...providerModels, { id: "provider/preserved-exact-id", label: "provider/preserved-exact-id" },
-  ]);
-  assert.equal(runtimeModelSelectionIsRunnable({ source: live, model: "openrouter/model-b", customMode: false, customAllowed: false, builtInPreset: true }), true,
-    "a successful detection is advisory in the selector; runtime admission owns rejection");
 });
 
 test("dynamic bundled metadata is suggestion-only even when the legacy catalog claimed launchable", () => {
@@ -244,107 +198,57 @@ test("declared static sources remain labeled during confirmation without becomin
 
   assert.deepEqual(presentation.models, staticClaude.models);
   assert.equal(presentation.loading, true);
-  assert.equal(presentation.source.kind, "loading");
-  assert.equal(runtimeModelSelectionIsRunnable({
-    source: presentation.source,
-    model: "opus",
-    customMode: false,
-    customAllowed: true,
-  }), false, "loading presentation must not impersonate a confirmed live source");
+  assert.equal(presentation.source.kind, "loading", "loading presentation must not impersonate a confirmed live source");
 });
 
-test("only live membership, explicit provider catalogs, or allowed custom overrides are runnable", () => {
-  const live: RuntimeModelSourceState = {
-    kind: "live",
-    value: { models: [{ id: "machine/live", label: "Machine live" }] },
-  };
-  assert.equal(runtimeModelSelectionIsRunnable({ source: live, model: "machine/live", customMode: false, customAllowed: false }), true);
-  assert.equal(runtimeModelSelectionIsRunnable({ source: live, model: "bundled/fake", customMode: false, customAllowed: false }), false);
-  assert.equal(runtimeModelSelectionIsRunnable({ source: { kind: "error", retryable: true }, model: "custom/safe", customMode: true, customAllowed: true }), true);
-  assert.equal(runtimeModelSelectionIsRunnable({ source: { kind: "error", retryable: true }, model: "custom/forbidden", customMode: true, customAllowed: false }), false);
-  assert.equal(runtimeModelSelectionIsRunnable({ source: { kind: "no_models" }, model: "provider/model", customMode: false, customAllowed: false, providerCatalog: true }), true,
-  );
-  assert.equal(
-    runtimeModelSelectionIsRunnable({
-      source: live,
-      model: "machine/live",
-      customMode: false,
-      customAllowed: false,
-      builtInPreset: true,
-    }),
-    true,
-    "a legacy live list cannot block Built-in preset selection",
-  );
-  assert.equal(
-    runtimeModelSelectionIsRunnable({
-      source: {
-        ...live,
-        value: {
-          ...live.value,
-          catalog: {
-            protocolVersion: 1,
-            runtime: "builtin",
-            runtimeVersion: "0.84.3",
-          },
-        },
-      },
-      model: "machine/live",
-      customMode: false,
-      customAllowed: false,
-      builtInPreset: true,
-    }),
-    true,
-  );
-  assert.equal(
-    runtimeModelSelectionIsRunnable({
-      source: { kind: "error", retryable: true },
-      model: "persisted/legacy",
-      customMode: false,
-      customAllowed: false,
-      persistedModel: "persisted/legacy",
-      builtInPreset: true,
-    }),
-    true,
-    "an unchanged stored selection stays editable without becoming a new catalog write",
-  );
-  assert.equal(runtimeModelSelectionIsRunnable({ source: { kind: "unsupported" }, model: "default", modelIgnored: true, customMode: false, customAllowed: false }), true);
-});
-
-test("Cursor fallback stays suggestion-only and selecting it requires the matching runtime", () => {
+test("Cursor fallback stays suggestion-only", () => {
   for (const source of [
     { kind: "no_models" } as const,
     { kind: "error", retryable: true } as const,
   ]) {
     assert.ok(projectRuntimeModelSourcePresentation("cursor", source).models.every((m) => m.verified === "suggestion_only"));
-    assert.equal(runtimeModelSelectionIsRunnable({ runtime: "cursor", source, model: "auto", customMode: false, customAllowed: true }), true);
     assert.equal(
       projectBundledRuntimeModelSuggestions("cursor")
         .find((model) => model.id === "auto")?.verified,
       "suggestion_only",
     );
-    assert.equal(runtimeModelSelectionIsRunnable({
-      source,
-      model: "auto",
-      customMode: false,
-      customAllowed: true,
-    }), false, `${source.kind}: create`);
-    assert.equal(runtimeModelSelectionIsRunnable({
-      source,
-      model: "auto",
-      customMode: false,
-      customAllowed: true,
-      persistedModel: "auto",
-    }), false, `${source.kind}: edit`);
   }
+});
 
-  assert.equal(runtimeModelSelectionIsRunnable({
-    source: {
-      kind: "live",
-      value: { models: [{ id: "auto", label: "Auto" }], default: "auto" },
+test("a live Claude list keeps its disabled models out of the selectable list and adds no bundled models", () => {
+  const source = parseRuntimeModelSourcePayload({
+    kind: "live",
+    value: {
+      models: [
+        { id: "opus", label: "Claude Opus (Opus 5.5)" },
+        { id: "claude-opus-5-5", label: "Claude Opus 5.5" },
+        { id: "claude-haiku-4-5-20251001", label: "Claude Haiku 4.5" },
+      ],
+      unavailable: [
+        { id: "claude-opus-9", label: "Claude Opus 9", reason: `  Upgrade\n Claude Code ${"x".repeat(400)}` },
+        { id: "claude-opus-9", label: "dup", reason: "dup" },
+        { id: 42, label: "bad" },
+      ],
     },
-    model: "auto",
-    customMode: false,
-    customAllowed: true,
-    persistedModel: "auto",
-  }), true);
+    // Older clients read only these legacy fields: usable models only.
+    models: [{ id: "opus", label: "Claude Opus (Opus 5.5)" }],
+  });
+  assert.equal(source.kind, "live");
+  const presentation = projectRuntimeModelSourcePresentation("claude", source);
+  assert.deepEqual(presentation.models.map((m) => m.id), ["opus", "claude-opus-5-5", "claude-haiku-4-5-20251001"]);
+  assert.deepEqual(presentation.unavailable.map((m) => m.id), ["claude-opus-9"], "bundled models the list lacks are not added");
+  const [disabled] = presentation.unavailable;
+  assert.ok(disabled?.runtimeReason?.startsWith("Upgrade Claude Code x"));
+  assert.ok((disabled?.runtimeReason?.length ?? 0) <= 200);
+});
+
+test("the bundled catalog, a live list without disabled models, and non-live states show no unavailable models", () => {
+  const bundled = parseRuntimeModelSourcePayload({ kind: "live", value: { models: RUNTIME_MODELS.claude } });
+  assert.deepEqual(projectRuntimeModelSourcePresentation("claude", bundled).unavailable, []);
+  // A live list with no disabled models: nothing greyed, whatever the bundled catalog holds.
+  const oldDaemon = parseRuntimeModelSourcePayload({ kind: "live", value: { models: [{ id: "opus", label: "Claude Opus" }] } });
+  assert.deepEqual(projectRuntimeModelSourcePresentation("claude", oldDaemon).unavailable, []);
+  for (const source of NON_LIVE) {
+    assert.deepEqual(projectRuntimeModelSourcePresentation("claude", source).unavailable, [], source.kind);
+  }
 });

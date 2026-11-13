@@ -9,7 +9,7 @@ import { createAgent } from "./agentService";
 import { startOnboardingBriefingOnActivation } from "./onboardingBriefingOnActivation";
 import type { AgentOrchestrator } from "./agentOrchestrator";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 /**
  * The hole this closes, in the user's words: click "Let's Go" while the computer is asleep,

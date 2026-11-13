@@ -11,6 +11,7 @@ import { getDb } from "../db/index";
 import { actionCards, oauthClientInstalls, oauthClientMaintainers, oauthClients, serverAgentMembers } from "../db/schema";
 import { isMessageShortId, UUID_RE, uuidShortIdRange } from "../lib/messageId";
 import { oauthClientIsUserManagedPredicate } from "./oauthClientManagementPolicy";
+import { oauthClientHasKey } from "./oauthClientKeys";
 
 const REGISTER_APP_ACTION = "integration:register_app";
 
@@ -164,7 +165,7 @@ async function findOwnedCommittedApp(opts: {
       eq(oauthClients.appType, "third_party_global"),
     ),
   ];
-  if (opts.clientKey) conditions.push(eq(oauthClients.clientId, opts.clientKey));
+  if (opts.clientKey) conditions.push(oauthClientHasKey(opts.clientKey));
   if (opts.internalClientId) conditions.push(eq(oauthClients.id, opts.internalClientId));
   if (admin) {
     const [row] = await getDb()

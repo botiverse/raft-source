@@ -27,6 +27,7 @@
 //   context (or after the version moved) and a short form, or nothing,
 //   after that.
 
+import { foldAgentOneLineText } from "../agentMessageText";
 import { agentChannelRef, channelVisibility } from "../agentText/server";
 import { formatHint, RAFT_HINTS, type RaftHintStyle } from "./hint";
 
@@ -66,13 +67,26 @@ export const PASSIVE_RESOURCES = {
   // Version: `channelCardRev`. The first read of the channel, or of a thread
   // in it, in a context carries the card, and so does the first read after
   // the card changed. A send names the version its context has: never seen
-  // holds the send once, an older version comes back with the reply.
+  // and nothing unread sends it with the card in the reply (#wg-ax:#25); never
+  // seen with unread messages holds it once with them; an older version
+  // comes back with the reply.
   // Id: the channel ref (`#name`), the base of every target in the channel.
   channel: {
     revSource: "content-hash",
     policy: "once",
     activeCommand: (id, style) => formatHint(RAFT_HINTS.channelInfo(id), style),
     touchedBy: ["message read", "message send"],
+  },
+  // What a top-level channel or DM read leaves out: its "Coverage:" sentence
+  // (thread replies are read from their thread targets). Version: hash of the
+  // sentence. The first top-level read of the conversation in a context
+  // prints it; later ones do not. A thread read or a send does not count:
+  // neither prints it. Id: the conversation's target (`#name`, `dm:@peer`).
+  "read.coverage": {
+    revSource: "content-hash",
+    policy: "once",
+    activeCommand: (id, style) => formatHint(RAFT_HINTS.messageRead({ target: id }), style),
+    touchedBy: ["message read"],
   },
   // Who sent a message: the sender's profile description and, for a human web
   // sender, the time zone the message was sent from, shown next to the name in
@@ -184,6 +198,13 @@ export interface ThreadWindowMessage {
   /** ISO time, shown as UTC `HH:MM`. */
   timestamp?: string | null;
   content?: string | null;
+  /** Files attached to it: the preview names how many, and the window then points to the read. */
+  attachmentCount?: number;
+}
+
+/** The attachment count a message as the Server sends it carries (`attachments` array), for a window preview. */
+export function windowAttachmentCount(message: { attachments?: unknown }): number {
+  return Array.isArray(message.attachments) ? message.attachments.length : 0;
 }
 
 export interface ThreadWindow {
@@ -207,47 +228,83 @@ export interface ThreadWindow {
  */
 export const THREAD_WINDOW_PREVIEW_CHARS = 160;
 
+function threadWindowPreviewPoints(message: ThreadWindowMessage): string[] {
+  return Array.from(foldAgentOneLineText(message.content ?? ""));
+}
+
 function threadWindowPreview(message: ThreadWindowMessage): string {
-  const raw = (message.content ?? "").replace(/\s+/g, " ").trim();
-  const points = Array.from(raw);
+  const points = threadWindowPreviewPoints(message);
   const shown = points.slice(0, THREAD_WINDOW_PREVIEW_CHARS).join("");
   const hidden = points.length - Math.min(points.length, THREAD_WINDOW_PREVIEW_CHARS);
   const date = message.timestamp ? new Date(message.timestamp) : null;
   const time = date && !Number.isNaN(date.getTime()) ? date.toISOString().slice(11, 16) : "";
   const head = [message.sender ? `@${message.sender}` : "", time].filter(Boolean).join(" ");
   const marker = hidden > 0 ? `…⟨${hidden} more chars⟩` : "";
-  return `  │ ${head ? `${head}  ` : ""}${shown}${marker}`;
+  const files = message.attachmentCount ?? 0;
+  const attached = files > 0 ? `${shown || marker ? " " : ""}⟨${files} attachment${files === 1 ? "" : "s"}⟩` : "";
+  return `  │ ${head ? `${head}  ` : ""}${shown}${marker}${attached}`;
 }
 
 /**
  * The window form of a conversation: the thread start when it is older than
  * the window, how many earlier messages were skipped and the command for
- * them, the latest messages as bounded previews, and the command for the full
- * text. It is a map to decide from, not the conversation: whether and how deep
- * to read is the agent's call. Lines, without a trailing newline.
+ * them, the latest messages as bounded previews, and, when the window leaves
+ * something out, the command to read it. It is a map to decide from, not the
+ * conversation: whether and how deep to read is the agent's call. Lines,
+ * without a trailing newline.
  */
 export function renderThreadWindow(form: ThreadWindow, style: RaftHintStyle = "cli"): string[] {
   const { target, start, messages } = form;
   const seqs = messages.map((m) => Number(m.seq)).filter((s) => Number.isFinite(s) && s > 0);
   const firstShownSeq = form.firstShownSeq ?? (seqs.length > 0 ? Math.min(...seqs) : undefined);
   const lines: string[] = [];
-  if (start && (firstShownSeq === undefined || start.seq < firstShownSeq)) {
+  const shownStart = start && (firstShownSeq === undefined || start.seq < firstShownSeq) ? start : undefined;
+  if (shownStart) {
     lines.push(`  ┌ Thread start ${"─".repeat(28)}`);
-    lines.push(threadWindowPreview(start));
+    lines.push(threadWindowPreview(shownStart));
   }
   if (form.omittedCount > 0 && firstShownSeq !== undefined) {
     const older = formatHint(RAFT_HINTS.messageRead({ target, before: firstShownSeq }), style);
     lines.push(
       `  ├ ⋯ ${form.omittedCount} earlier message${form.omittedCount === 1 ? "" : "s"} skipped in this notice. `
-      + `Older exist: ${older}. ⋯`,
+      + `Older: ${older} ⋯`,
     );
   }
   if (messages.length > 0) {
     lines.push(`  ├ Latest ${form.shownCount ?? messages.length} ${"─".repeat(28)}`);
     for (const message of messages) lines.push(threadWindowPreview(message));
   }
-  lines.push(`  └ Previews are truncated. Full text: ${PASSIVE_RESOURCES.thread.activeCommand(target, style)}`);
+  const read = PASSIVE_RESOURCES.thread.activeCommand(target, style);
+  const gap = threadWindowGap(form);
+  lines.push(gap === "none_shown"
+    ? `  └ Not shown here. Read them: ${read}`
+    : gap === "cut"
+    ? `  └ Previews are truncated. Full text: ${read}`
+    : gap === "left_out"
+    ? `  └ Not all of it is shown here. Read it: ${read}`
+    : `  └ ${"─".repeat(40)}`);
   return lines;
+}
+
+/**
+ * What the window leaves out, if anything: no message shown, a preview cut,
+ * or something else left out (an attachment, skipped messages with no "Older
+ * exist" line, fewer lines than the count it names). `null` when what is
+ * shown is the whole of it, and reading again would print it twice. The
+ * window's last line and an SDK hold's `next` both follow this.
+ */
+export function threadWindowGap(form: ThreadWindow): "none_shown" | "cut" | "left_out" | null {
+  const { start, messages } = form;
+  const seqs = messages.map((m) => Number(m.seq)).filter((s) => Number.isFinite(s) && s > 0);
+  const firstShownSeq = form.firstShownSeq ?? (seqs.length > 0 ? Math.min(...seqs) : undefined);
+  const shownStart = start && (firstShownSeq === undefined || start.seq < firstShownSeq) ? start : undefined;
+  if (messages.length === 0) return "none_shown";
+  const shown = [...(shownStart ? [shownStart] : []), ...messages];
+  if (shown.some((m) => threadWindowPreviewPoints(m).length > THREAD_WINDOW_PREVIEW_CHARS)) return "cut";
+  const leftOut = shown.some((m) => (m.attachmentCount ?? 0) > 0)
+    || (form.omittedCount > 0 && firstShownSeq === undefined)
+    || (form.shownCount ?? messages.length) > messages.length;
+  return leftOut ? "left_out" : null;
 }
 
 // ---- channel (policy "once") ----
@@ -266,7 +323,7 @@ export interface ChannelCard {
 export const CHANNEL_CARD_DESCRIPTION_CHARS = 300;
 
 function displayedDescription(card: ChannelCard): string {
-  return (card.description ?? "").replace(/\s+/g, " ").trim();
+  return foldAgentOneLineText(card.description ?? "");
 }
 
 /**
@@ -292,15 +349,15 @@ export function channelCardRev(card: ChannelCard): string {
 /**
  * The card as the agent sees it: one line with the channel, its visibility,
  * archived state and description (whitespace collapsed), then the equivalent
- * command, which shows a capped description in full. An archived channel has
- * no equivalent command (`raft channel info` lists live channels only), so
- * its card carries the whole description and no pointer.
+ * command, which shows a capped description in full. An archived channel's
+ * card carries the whole description and no pointer.
  * `changed`: the agent saw an older version of this card in this context.
  */
 export function renderChannelCard(card: ChannelCard, options: { changed?: boolean; descriptionChars?: number; style?: RaftHintStyle } = {}): string[] {
   const ref = agentChannelRef(card.name, card.type);
   const archived = card.archived === true;
-  const status = [channelVisibility(card), ...(archived ? ["archived"] : [])].join(", ");
+  // Archived: say it is read-only here, where the agent reads before it replies.
+  const status = [channelVisibility(card), ...(archived ? ["archived", "read-only"] : [])].join(", ");
   const points = Array.from(displayedDescription(card));
   const cap = archived ? points.length : (options.descriptionChars ?? CHANNEL_CARD_DESCRIPTION_CHARS);
   const hidden = points.length - Math.min(points.length, cap);
@@ -353,7 +410,7 @@ export function peerCardHasContent(card: PeerCard): boolean {
 export function renderPeerCard(card: PeerCard, options: { descriptionChars?: number; style?: RaftHintStyle } = {}): string[] {
   const status = [card.kind, ...(card.timezone ? [card.timezone] : [])].join(", ");
   const cap = options.descriptionChars ?? CHANNEL_CARD_DESCRIPTION_CHARS;
-  const points = Array.from((card.description ?? "").replace(/\s+/g, " ").trim());
+  const points = Array.from(foldAgentOneLineText(card.description ?? ""));
   const hidden = points.length - Math.min(points.length, cap);
   const description = points.length > 0
     ? `${points.slice(0, cap).join("")}${hidden > 0 ? `…⟨${hidden} more chars⟩` : ""}`

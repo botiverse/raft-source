@@ -14,6 +14,7 @@ type Row = {
   hasMention?: boolean;
   lastReplyAt: string | null;
   parentMessageCreatedAt?: string;
+  conversationKind?: "thread" | "task";
 };
 
 function thread(id: string, parentChannelId: string, unreadCount: number, extra: Partial<Row> = {}): Row {
@@ -30,6 +31,17 @@ describe("summarizeParentThreadUnread", () => {
     ];
     expect(summarizeParentThreadUnread(threads, "general")).toEqual({ count: 2, hasMention: false });
     expect(summarizeParentThreadUnread(threads, "random")).toEqual({ count: 1, hasMention: false });
+  });
+
+  it("leaves out task conversations, whose unread shows in Activity only", () => {
+    // The channel cannot lead to a task conversation or mark it read, so an
+    // unread one (even with a mention) never lights the channel's mark.
+    const threads = [
+      thread("t1", "general", 2),
+      thread("c1", "general", 3, { conversationKind: "task", hasMention: true }),
+    ];
+    expect(summarizeParentThreadUnread(threads, "general")).toEqual({ count: 1, hasMention: false });
+    expect(summarizeParentThreadUnread([threads[1]!], "general")).toBe(NO_PARENT_THREAD_UNREAD);
   });
 
   it("lights the mention only from a thread that still has unread replies", () => {

@@ -1,71 +1,42 @@
-import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { ambientProcessEnv } from "../processEnvPatch";
 import { createRequire } from "node:module";
 import path from "node:path";
-import { hydrateRuntimeConfig, kPromotedSlotPath, resolveLiveExecutablePath, runtimeConfigToLaunchFields, type AgentConfig } from "@botiverse/raft-shared";
+import {
+  CLI_STABLE_ENTRY_DIRNAME,
+  enabledAppsEnvValue,
+  hydrateRuntimeConfig,
+  kPromotedSlotPath,
+  RAFT_CLI_ENTRY_ENV,
+  RAFT_CLI_STABLE_ENTRY,
+  RAFT_ENABLED_APPS_ENV,
+  runtimeConfigToLaunchFields,
+  type AgentConfig,
+} from "@botiverse/raft-shared";
 import type { SpawnContext } from "./types";
 import { buildCliSystemPrompt, type SystemPromptOptions } from "./systemPrompt";
 import type { AxSurfaceText } from "@botiverse/raft-shared";
+import { migrateLegacyBridgeArtifacts } from "../legacyBridgeArtifacts";
 import { SLOCK_HOME_ENV, resolveRaftHome } from "../raftHome";
 import { registerAgentCredentialProxy } from "../agentCredentialProxy";
 import { configPassiveAx, publishSpawnContextGeneration } from "../contextGeneration";
 import { LOOPBACK_NO_PROXY, applyLoopbackNoProxyEnv } from "../loopbackNoProxy";
 import { detectNodeHostKind, resolveNodeHostLaunch, type NodeHostKind } from "./nodeHostLaunch";
+import { liveHostExecutablePath } from "./liveHostExecutable";
 
-/** `dev:ino` of a file, or null when the platform cannot report one. */
-export function executableFileIdentity(path: string): string | null {
-  try {
-    const stat = statSync(path);
-    return stat.ino > 0 ? `${stat.dev}:${stat.ino}` : null;
-  } catch {
-    return null;
-  }
-}
-
-let readProcSelfExeForHost: () => string | null = () => {
-  try {
-    return readlinkSync("/proc/self/exe");
-  } catch {
-    return null;
-  }
-};
-
-/** Test seam: a test that fakes process.execPath cannot fake /proc/self/exe. */
-export function setProcSelfExeReaderForTests(reader: (() => string | null) | null): void {
-  readProcSelfExeForHost = reader ?? (() => {
-    try {
-      return readlinkSync("/proc/self/exe");
-    } catch {
-      return null;
-    }
-  });
-}
-
-// Captured at module load, i.e. before any later K promotion or staging can
-// rename or replace the file behind process.execPath.
-const STARTUP_EXECUTABLE_IDENTITY = executableFileIdentity(process.execPath);
-
-/**
- * The running binary's re-execable path for a SEA / unrecognised host. A K
- * upgrade promotes the experiment slot to stable by renaming it under the
- * running process, so the startup `process.execPath` can name a path that no
- * longer exists; see liveExecutablePath in shared.
- */
-export function liveHostExecutablePath(execPath: string = process.execPath): string {
-  return resolveLiveExecutablePath({
-    execPath,
-    platform: process.platform,
-    exists: existsSync,
-    readProcSelfExe: readProcSelfExeForHost,
-    identityOf: executableFileIdentity,
-    startupIdentity: STARTUP_EXECUTABLE_IDENTITY,
-  });
-}
+// The live-path helper lives in its own module so light importers (the
+// runtime detection round) can use it without this module's graph.
+export { executableFileIdentity, liveHostExecutablePath, setProcSelfExeReaderForTests } from "./liveHostExecutable";
 
 const shellSingleQuote = (value: string) => `'${value.replace(/'/g, `'\\''`)}'`;
 const powershellSingleQuote = (value: string) => `'${value.replace(/'/g, "''")}'`;
 const DEFAULT_ACTIVE_CAPABILITIES = "send,read,mentions,tasks,reactions,server,channels,knowledge";
 const CLI_TRANSPORT_TRACE_DIR_ENV = "SLOCK_CLI_TRANSPORT_TRACE_DIR";
+// The agent's runtime id, for the CLI's trace spans (`runtime` attr). New, so
+// only the canonical RAFT_ name: a SLOCK_ alias exists only for names older
+// readers already use.
+export const RAFT_CURRENT_RUNTIME_ENV = "RAFT_CURRENT_RUNTIME";
 const safePathPart = (value: string) => value.replace(/[^a-zA-Z0-9_.-]/g, "_");
 const RAW_CREDENTIAL_ENV_DENYLIST = [
   "SLOCK_AGENT_CREDENTIAL_KEY",
@@ -76,6 +47,18 @@ const EXTERNAL_PROFILE_ENV_DENYLIST = [
   "RAFT_PROFILE_DIR",
   "SLOCK_PROFILE_DIR",
 ] as const;
+// One Computer upgrade's own operation variables: the Computer sets them only on
+// the installer it launches for a web upgrade, but an installer that started the
+// Computer from its own env passed them on to the service, the daemon and every
+// agent. An agent's `raft-computer upgrade` then reused that old operation id and
+// `remote:` approval label (#proj-raft-computer:#32). Configuration such as
+// RAFT_COMPUTER_INSTALLER_CHANNEL stays: an agent's upgrade keeps the user's channel.
+const COMPUTER_UPGRADE_OPERATION_ENV_DENYLIST = [
+  "RAFT_COMPUTER_OPERATION_ID",
+  "RAFT_COMPUTER_APPROVED_BY",
+  "RAFT_COMPUTER_NON_INTERACTIVE",
+  "RAFT_COMPUTER_INSTALLER_CALLER",
+] as const;
 const WORKSPACE_CLI_TRANSPORT_FILENAMES = [
   "agent-token",
   "slock",
@@ -84,6 +67,9 @@ const WORKSPACE_CLI_TRANSPORT_FILENAMES = [
   "raft",
   "raft.cmd",
   "raft.ps1",
+  "cont",
+  "cont.cmd",
+  "cont.ps1",
   "opencli",
   "opencli.cmd",
 ] as const;
@@ -317,6 +303,41 @@ function buildPs1LaunchForwardingGuard(ownSlockDir: string): string {
   ].join("\r\n");
 }
 
+/**
+ * `cont <id> [choice]` (the answer's text on stdin) answers a command that
+ * paused to ask the agent something (exit 10, shared/src/continuations). It
+ * runs the `raft` wrapper beside it as `raft __continue`, so it holds no
+ * credentials of its own and follows raft's launch forwarding. Phase 1:
+ * every continuation is the raft CLI's, so cont only dispatches to raft;
+ * routing an id to the program that paused it comes when the continuation
+ * framework is extracted into its own package.
+ */
+function writeContWrappers(slockDir: string, platform: NodeJS.Platform): void {
+  writeFileSync(
+    path.join(slockDir, "cont"),
+    `#!/usr/bin/env bash\n# cont <id> [choice]: answer a paused raft command (raft __continue).\nexec "$(dirname "$0")/raft" __continue "$@"\n`,
+    { mode: 0o755 },
+  );
+  if (platform !== "win32") return;
+  writeFileSync(path.join(slockDir, "cont.cmd"), [
+    "@echo off",
+    "@REM cont <id> [choice]: answer a paused raft command (raft __continue).",
+    '"%~dp0raft.cmd" __continue %*',
+    "",
+  ].join("\r\n"));
+  writeFileSync(path.join(slockDir, "cont.ps1"), [
+    "# cont <id> [choice]: answer a paused raft command (raft __continue).",
+    "$raft = Join-Path $PSScriptRoot 'raft.ps1'",
+    "if ($MyInvocation.ExpectingInput) {",
+    "  $input | & $raft __continue @args",
+    "} else {",
+    "  & $raft __continue @args",
+    "}",
+    "exit $LASTEXITCODE",
+    "",
+  ].join("\r\n"));
+}
+
 function isDaemonGeneratedWrapper(filePath: string): boolean {
   try {
     const body = readFileSync(filePath, "utf8");
@@ -386,6 +407,8 @@ export function upgradeExistingAgentWrappers(
   for (const entry of entries) {
     const launchDir = path.join(agentRoot, entry);
     if (launchDir === currentSlockDir) continue;
+    // The stable entry is not a launch: its wrappers never forward.
+    if (entry === CLI_STABLE_ENTRY_DIRNAME) continue;
     let launchDirStats;
     try {
       launchDirStats = lstatSync(launchDir);
@@ -464,7 +487,7 @@ export function deriveOpencliFallbackCandidates(binPath: string): string[] {
 // builds without the dep, broken install) so the spawn can still proceed
 // without opencli on PATH.
 let cachedOpencliBinPath: string | null | undefined;
-function resolveOpencliBinPath(): string | null {
+export function resolveOpencliBinPath(): string | null {
   if (cachedOpencliBinPath !== undefined) return cachedOpencliBinPath;
   try {
     const require = createRequire(import.meta.url);
@@ -505,9 +528,25 @@ function resolveOpencliBinPath(): string | null {
   }
 }
 
+/** The transport directory a spawn with `ctx` uses (what prepareCliTransport creates). */
+export function spawnCliTransportDir(ctx: Pick<SpawnContext, "slockHome" | "agentId" | "launchId">): string {
+  return buildCliTransportDir(ctx.slockHome ? path.resolve(ctx.slockHome) : resolveRaftHome(), ctx.agentId, ctx.launchId);
+}
+
 /** The per-launch transport directory `prepareCliTransport` creates and injects as SLOCK_CLI_TRANSPORT_DIR. */
 export function buildCliTransportDir(slockHome: string, agentId: string, launchId?: string | null): string {
   return path.join(slockHome, "cli-transport", safePathPart(agentId), buildCliTransportLaunchPart(launchId));
+}
+
+/**
+ * The agent's stable CLI entry (#proj-raft-computer:#58): one directory per
+ * agent that every launch rewrites with `raft`/`slock` wrappers using that
+ * launch's own proxy credential. A process that outlives its session (nohup,
+ * a background job) calls it instead of a launch's wrapper; the proxy serves
+ * it with the agent's current launch and refuses it once no launch is live.
+ */
+export function buildCliStableEntryDir(slockHome: string, agentId: string): string {
+  return path.join(slockHome, "cli-transport", safePathPart(agentId), CLI_STABLE_ENTRY_DIRNAME);
 }
 
 function buildCliTransportLaunchPart(launchId?: string | null): string {
@@ -563,8 +602,11 @@ export function writeOpencliWrapper(
   // could not identify.
   const nodeHost = hostKind === "electron" || hostKind === "node"
     ? resolveNodeHostLaunch({ env: ambientProcessEnv(), execIsElectron, seaProbe })
-    : { command: liveHostExecutablePath(), env: ambientProcessEnv() };
+    : { command: liveHostExecutablePath(), env: ambientProcessEnv(), execArgv: [] };
   const electronNodeMode = execIsElectron && nodeHost.env.ELECTRON_RUN_AS_NODE === "1";
+  // opencli parses with commander's argument-less parse(), which misreads
+  // Electron's Node mode; see ELECTRON_NODE_SCRIPT_EXEC_ARGV (task #159).
+  const hostExecArgv = electronNodeMode ? nodeHost.execArgv : [];
   const fallbacks = deriveOpencliFallbackCandidates(opencliBinPath);
   // If the resolved path is already gone, bake the best existing fallback as
   // the primary so the wrapper works even before the exec-time block runs.
@@ -577,10 +619,10 @@ export function writeOpencliWrapper(
     ? ""
     : `if [ ! -e "$OPENCLI_BIN" ]; then\n${fallbacks.map((candidate, i) =>
       `  ${i === 0 ? "if" : "elif"} [ -e ${shellSingleQuote(candidate)} ]; then OPENCLI_BIN=${shellSingleQuote(candidate)};`).join("\n")}\n  fi\nfi\n`;
-  writeFileSync(
+  writeReplacingFile(
     path.join(slockDir, "opencli"),
-    `#!/usr/bin/env bash\nOPENCLI_BIN=${shellSingleQuote(binPath)}\n${posixFallbackBlock}${electronNodeMode ? "export ELECTRON_RUN_AS_NODE=1\n" : ""}exec ${shellSingleQuote(nodeHost.command)} "$OPENCLI_BIN" "$@"\n`,
-    { mode: 0o755 },
+    `#!/usr/bin/env bash\nOPENCLI_BIN=${shellSingleQuote(binPath)}\n${posixFallbackBlock}${electronNodeMode ? "export ELECTRON_RUN_AS_NODE=1\n" : ""}exec ${[nodeHost.command, ...hostExecArgv].map(shellSingleQuote).join(" ")} "$OPENCLI_BIN" "$@"\n`,
+    0o755,
   );
   if (platform === "win32") {
     const opencliCmdBody = [
@@ -593,11 +635,44 @@ export function writeOpencliWrapper(
       `set "OPENCLI_BIN=${binPath}"`,
       ...fallbacks.map((candidate) => `if not exist "%OPENCLI_BIN%" set "OPENCLI_BIN=${candidate}"`),
       ...(electronNodeMode ? [`set "ELECTRON_RUN_AS_NODE=1"`] : []),
-      `"${nodeHost.command}" "%OPENCLI_BIN%" %*`,
+      `${[nodeHost.command, ...hostExecArgv].map((arg) => `"${arg}"`).join(" ")} "%OPENCLI_BIN%" %*`,
       "",
     ].join("\r\n") + "\r\n";
-    writeFileSync(path.join(slockDir, "opencli.cmd"), opencliCmdBody);
+    writeReplacingFile(path.join(slockDir, "opencli.cmd"), opencliCmdBody, 0o644);
   }
+}
+
+/**
+ * Replace `file` with `body`: a fresh temp file nobody can guess, created
+ * exclusively, then renamed over it. A rename replaces a link at `file`
+ * instead of writing through it, so a link planted there never redirects
+ * the write.
+ */
+function writeReplacingFile(file: string, body: string, mode: number): void {
+  const temp = `${file}.${randomBytes(6).toString("hex")}.tmp`;
+  try {
+    writeFileSync(temp, body, { mode, flag: "wx" });
+    renameSync(temp, file);
+  } catch (error) {
+    rmSync(temp, { force: true });
+    throw error;
+  }
+}
+
+/** A real directory and, in it, a plain file or nothing: what the restart refresh may rewrite in a workspace. */
+function isPlainWorkspaceWrapper(slockDir: string, names: readonly string[]): boolean {
+  try {
+    if (!lstatSync(slockDir).isDirectory()) return false;
+  } catch {
+    return false;
+  }
+  return names.every((name) => {
+    try {
+      return lstatSync(path.join(slockDir, name)).isFile();
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code === "ENOENT";
+    }
+  });
 }
 
 /**
@@ -622,20 +697,34 @@ export function regenerateExistingOpencliWrappers(
   platform: NodeJS.Platform = process.platform,
   // Injectable for tests; production resolves the daemon's opencli once.
   opencliBinPath: string | null = resolveOpencliBinPath(),
-): { scanned: number; rewritten: number } {
-  if (!opencliBinPath) return { scanned: 0, rewritten: 0 };
+): { scanned: number; rewritten: number; skipped: number } {
+  if (!opencliBinPath) return { scanned: 0, rewritten: 0, skipped: 0 };
   let entries: string[];
   try {
     entries = readdirSync(agentsRoot);
   } catch {
-    return { scanned: 0, rewritten: 0 };
+    return { scanned: 0, rewritten: 0, skipped: 0 };
   }
   let scanned = 0;
   let rewritten = 0;
+  let skipped = 0;
+  const names = platform === "win32" ? ["opencli", "opencli.cmd"] : ["opencli"];
   for (const entry of entries) {
+    // These are in the agents' workspaces, which the agents can write: a
+    // `.slock` or wrapper that is a link would turn this refresh, run at every
+    // daemon start, into a write anywhere the daemon can write.
     const slockDir = path.join(agentsRoot, entry, ".slock");
-    if (!existsSync(path.join(slockDir, "opencli"))) continue;
+    let wrapper;
+    try {
+      wrapper = lstatSync(path.join(slockDir, "opencli"));
+    } catch {
+      continue;
+    }
     scanned++;
+    if (!wrapper.isFile() || !isPlainWorkspaceWrapper(slockDir, names)) {
+      skipped++;
+      continue;
+    }
     try {
       writeOpencliWrapper(slockDir, opencliBinPath, platform);
       rewritten++;
@@ -643,7 +732,63 @@ export function regenerateExistingOpencliWrappers(
       /* tolerate a single bad workspace */
     }
   }
-  return { scanned, rewritten };
+  return { scanned, rewritten, skipped };
+}
+
+/**
+ * Daemon-startup pass: remove every `agent-token` older daemons left behind,
+ * in each launch directory under `<slockHome>/cli-transport/<agentId>/` and in
+ * each agent workspace's `.slock/` (the location before that). Such a file may
+ * hold the Computer's own key, readable by the agent's runtime, and nothing
+ * else prunes old launch directories; current daemons never write one.
+ *
+ * Only a regular file named exactly `agent-token` is removed. A symlink, at the
+ * file or at any directory on the way, is left alone and never followed: a
+ * race that swaps a checked directory could only make the daemon unlink an
+ * `agent-token` the same-uid agent can already unlink itself. Never throws;
+ * returns counts only.
+ */
+export function removeStaleAgentTokenFiles(slockHome: string, agentsRoot: string): { removed: number; skipped: number } {
+  const counts = { removed: 0, skipped: 0 };
+  const removeIn = (dir: string): void => {
+    const tokenFile = path.join(dir, "agent-token");
+    try {
+      if (!lstatSync(tokenFile).isFile()) {
+        counts.skipped++;
+        return;
+      }
+      rmSync(tokenFile);
+      counts.removed++;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") counts.skipped++;
+    }
+  };
+  for (const agentDir of plainSubdirectories(path.join(slockHome, "cli-transport"))) {
+    for (const launchDir of plainSubdirectories(agentDir)) removeIn(launchDir);
+  }
+  for (const workspace of plainSubdirectories(agentsRoot)) {
+    const slockDir = path.join(workspace, ".slock");
+    if (isPlainDirectory(slockDir)) removeIn(slockDir);
+  }
+  return counts;
+}
+
+/** Directories directly inside `dir`, symlinks excluded; none when `dir` is not itself a plain directory. */
+function plainSubdirectories(dir: string): string[] {
+  if (!isPlainDirectory(dir)) return [];
+  try {
+    return readdirSync(dir).map((name) => path.join(dir, name)).filter(isPlainDirectory);
+  } catch {
+    return [];
+  }
+}
+
+function isPlainDirectory(dir: string): boolean {
+  try {
+    return lstatSync(dir).isDirectory();
+  } catch {
+    return false;
+  }
 }
 
 function windowsUtf8Env(): Record<string, string> {
@@ -670,22 +815,57 @@ function posixLoopbackNoProxyPrelude(): string {
 }
 
 function cmdLoopbackNoProxyLines(): string[] {
+  // Windows aliases environment-variable names case-insensitively, so reading
+  // both spellings would append the same caller value twice.
   return [
     `set "SLOCK_LOOPBACK_NO_PROXY=${LOOPBACK_NO_PROXY}"`,
     `set "SLOCK_EXISTING_NO_PROXY=%NO_PROXY%"`,
-    `if defined no_proxy (if defined SLOCK_EXISTING_NO_PROXY (set "SLOCK_EXISTING_NO_PROXY=%SLOCK_EXISTING_NO_PROXY%,%no_proxy%") else set "SLOCK_EXISTING_NO_PROXY=%no_proxy%")`,
     `if defined SLOCK_EXISTING_NO_PROXY (set "NO_PROXY=%SLOCK_LOOPBACK_NO_PROXY%,%SLOCK_EXISTING_NO_PROXY%") else set "NO_PROXY=%SLOCK_LOOPBACK_NO_PROXY%"`,
     `set "no_proxy=%NO_PROXY%"`,
   ];
 }
 
+/**
+ * Every process environment variable the PowerShell wrapper sets or removes
+ * (task #384). The wrapper snapshots these before the call and restores them
+ * after it; a contract test fails if the wrapper touches a name not listed.
+ */
+export const POWERSHELL_WRAPPER_ENV_NAMES = [
+  "PYTHONIOENCODING",
+  "PYTHONUTF8",
+  "LANG",
+  "LC_ALL",
+  "RAFT_PROFILE",
+  "SLOCK_PROFILE",
+  "RAFT_PROFILE_DIR",
+  "SLOCK_PROFILE_DIR",
+  "NO_PROXY",
+  "SLOCK_AGENT_ID",
+  "SLOCK_SERVER_URL",
+  "SLOCK_AGENT_PROXY_URL",
+  "SLOCK_AGENT_PROXY_TOKEN_FILE",
+  "SLOCK_AGENT_ACTIVE_CAPABILITIES",
+  "ELECTRON_RUN_AS_NODE",
+  // The stable entry's own (cli-transport/<agent>/current/raft.ps1).
+  RAFT_CLI_ENTRY_ENV,
+  "SLOCK_HOME",
+  "SLOCK_CLI_TRANSPORT_DIR",
+  "SLOCK_AGENT_LAUNCH_DIR",
+] as const;
+
 function powershellLoopbackNoProxyLines(): string[] {
+  // Keep the caller's bypasses, but normalize them with the same Windows
+  // case-insensitive semantics so repeated wrapper calls are idempotent.
   return [
     `$loopbackNoProxy = ${powershellSingleQuote(LOOPBACK_NO_PROXY)}`,
-    "$existingNoProxy = @($env:NO_PROXY, $env:no_proxy) | Where-Object { $_ }",
-    "if ($existingNoProxy.Count -gt 0) { $mergedNoProxy = \"$loopbackNoProxy,$($existingNoProxy -join ',')\" } else { $mergedNoProxy = $loopbackNoProxy }",
-    "$env:NO_PROXY = $mergedNoProxy",
-    "$env:no_proxy = $mergedNoProxy",
+    "$existingNoProxy = if ($env:NO_PROXY) { $env:NO_PROXY -split ',' } else { @() }",
+    "$seenNoProxy = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)",
+    "$mergedNoProxy = [System.Collections.Generic.List[string]]::new()",
+    "foreach ($entry in (@($loopbackNoProxy -split ',') + @($existingNoProxy))) {",
+    "  $trimmed = $entry.Trim()",
+    "  if ($trimmed -and $seenNoProxy.Add($trimmed)) { [void]$mergedNoProxy.Add($trimmed) }",
+    "}",
+    "$env:NO_PROXY = $mergedNoProxy -join ','",
   ];
 }
 
@@ -711,29 +891,6 @@ export function buildCliTransportSystemPrompt(
   return buildCliSystemPrompt(config, opts);
 }
 
-/**
- * The env every tool an agent runs must get: an overlay that, applied on top of
- * the daemon's own process.env, yields exactly the prepared spawnEnv. It holds
- * every spawnEnv value plus `undefined` for daemon keys spawnEnv deleted
- * (credentials, profile selectors, proxy vars); Node's spawn omits undefined
- * values, so those keys are unset. Child-process runtimes get spawnEnv
- * directly; the in-process Kimi SDK runtime executes tools from the daemon
- * process and must layer this overlay on its tool env.
- */
-export function toolEnvFromSpawnEnv(
-  spawnEnv: NodeJS.ProcessEnv,
-  baseEnv: NodeJS.ProcessEnv = process.env,
-): Record<string, string | undefined> {
-  const env: Record<string, string | undefined> = {};
-  for (const key of Object.keys(baseEnv)) {
-    if (spawnEnv[key] === undefined) env[key] = undefined;
-  }
-  for (const [key, value] of Object.entries(spawnEnv)) {
-    if (typeof value === "string") env[key] = value;
-  }
-  return env;
-}
-
 /** PATH from an env object; on Windows the name matches in any case. */
 function readEnvPath(env: Record<string, string | undefined> | undefined, caseInsensitive: boolean): string | undefined {
   if (!env) return undefined;
@@ -757,10 +914,9 @@ export async function prepareCliTransport(
   seaProbe?: () => boolean | undefined,
 ): Promise<{
   slockDir: string;
-  tokenFile: string;
   /**
    * Local proxy URL for the daemon-held sk_agent_* credential, or null when
-   * the daemon has not been provisioned with one (legacy sk_machine_* path).
+   * the launch has none (the runtime then gets no Raft credential at all).
    * The spawned runtime env and daemon-owned wrapper never receive the
    * proxy token value; the wrapper points the short-lived CLI process at a
    * daemon-owned 0600 token file outside the workspace.
@@ -768,6 +924,15 @@ export async function prepareCliTransport(
   agentCredentialProxyUrl: string | null;
   wrapperPath: string;
   spawnEnv: NodeJS.ProcessEnv;
+  /**
+   * The part of `spawnEnv` the launch sets itself, without the daemon's own
+   * environment under it: the agent's configured env vars, the driver's extra
+   * variables, Raft's identity and CLI transport variables, PATH with the
+   * wrapper dir in front, and NO_PROXY with the loopback entries. The same
+   * removals apply. For a runtime that starts from an empty environment
+   * (Cursor on OAR, `envBase: "clean"`; oarCursorLaunch.ts).
+   */
+  launchEnv: Record<string, string>;
   slockHome: string;
 }> {
   // Same reasoning as the wrapper writer above: a SEA reaches its own `__cli`
@@ -811,20 +976,24 @@ export async function prepareCliTransport(
   const slockHome = ctx.slockHome ? path.resolve(ctx.slockHome) : resolveRaftHome();
 
   // Transport bootstrap, shared by every CLI-swapped runtime:
-  // 1. Keep the auth token out of child-process args / env by writing it to a
-  //    daemon-owned file outside the model workspace.
+  // 1. Keep the agent's runner credential in the daemon behind a local proxy;
+  //    the runtime gets only a proxy token file outside the model workspace.
   // 2. Write a local `slock` wrapper that execs the bundled monorepo CLI via
   //    an absolute path, so agent behavior does not depend on a host-global
   //    `slock` install or PATH ordering.
   // 3. Prepend that wrapper directory to PATH for the spawned runtime.
   cleanupWorkspaceCliTransportFiles(ctx.workingDirectory);
-  const slockDir = buildCliTransportDir(slockHome, ctx.agentId, ctx.launchId);
+  // Older daemons wrote an MCP entry launching `chat-bridge --auth-token
+  // <machine bearer>` into the workspace (#proj-raft-computer task #38). Remove
+  // exactly that entry; user MCP servers and other settings stay. Never throws.
+  migrateLegacyBridgeArtifacts(ctx.workingDirectory, ctx.agentId, { machineKey: ctx.daemonApiKey || null });
+  const slockDir = spawnCliTransportDir(ctx);
   mkdirSync(slockDir, { recursive: true });
   // RFC 072 §7.2: this spawn's context id (new, or the resumed session's),
   // written before the process exists so the CLI's first invocation reads it.
+  // Planned by whoever holds the driver (its compaction declaration).
   publishSpawnContextGeneration(slockDir, {
     runtime: ctx.config.runtime,
-    resumeSessionId: ctx.config.sessionId,
     passiveAx: configPassiveAx(ctx.config),
     plan: ctx.contextGeneration,
   });
@@ -833,26 +1002,29 @@ export async function prepareCliTransport(
     writeFileSync(launchCreatedAtFile, Date.now().toString().padStart(13, "0"), { mode: 0o644 });
   }
 
-  const tokenFile = path.join(slockDir, "agent-token");
+  // Older daemons wrote the Computer's own key (`sk_computer_*` /
+  // `sk_machine_*`) here for the wrapper. Never leave it readable to the
+  // runtime or its tool shell.
+  rmSync(path.join(slockDir, "agent-token"), { force: true });
 
   // `rfcs/034-slock-credential-rfc.zh.html#section-credential-isolation` —
   // server session worker runner credential wiring.
   //
-  // When the server attaches an `sk_agent_*` credential to AgentConfig
-  // (minted by the Computer per Computer RFC §5.1 / step 3d), keep the bearer
-  // in the daemon process and expose only a localhost proxy affordance to the
-  // `slock` wrapper. The spawned runtime env and model workspace never receive
-  // the raw key, the proxy token value, or a readable key-file pointer. Legacy
-  // `agent-token` is reserved for old daemon / legacy-machine launches, not
-  // for managed-runner mint failure fallback.
+  // Every launch carries an `sk_agent_*` credential the Computer minted for
+  // it: `buildSpawnConfig` mints one or fails the start
+  // (`runner_credential_mint_failed`). Keep the bearer in the daemon process
+  // and expose only a localhost proxy affordance to the `slock` wrapper. The
+  // spawned runtime env and model workspace never receive the raw key, the
+  // proxy token value, or a readable key-file pointer. The Computer's own key
+  // is never a stand-in: a launch without a runner credential (only a caller
+  // that skips `buildSpawnConfig`, such as a driver test) gets no Raft
+  // credential, and the CLI says so when it runs.
   const agentCredentialKey = ctx.config.agentCredentialKey;
+  const stableEntryDir = buildCliStableEntryDir(slockHome, ctx.agentId);
+  const stableEntryPath = path.join(stableEntryDir, platform === "win32" ? "raft.cmd" : "raft");
   let agentCredentialProxy: { proxyUrl: string; proxyToken: string } | null = null;
   let agentCredentialProxyTokenFile: string | null = null;
   if (typeof agentCredentialKey === "string" && agentCredentialKey.length > 0) {
-    // A workspace may have a legacy token from a previous daemon version or a
-    // prior legacy-machine launch. A successful managed-runner launch must not
-    // leave that machine bearer readable to the runtime/tool shell.
-    rmSync(tokenFile, { force: true });
     agentCredentialProxy = await registerAgentCredentialProxy({
       agentId: ctx.agentId,
       launchId: ctx.launchId,
@@ -860,18 +1032,21 @@ export async function prepareCliTransport(
       apiKey: agentCredentialKey,
       activeCapabilities: DEFAULT_ACTIVE_CAPABILITIES,
       inboxCoordinator: ctx.agentCredentialProxyInboxCoordinator,
+      recordMessageCommitted: ctx.agentCredentialProxyMessageCommitted,
+      recordSendOutcome: ctx.agentCredentialProxySendOutcome,
+      inboxItems: ctx.agentCredentialProxyInboxItems,
       appInbox: ctx.agentAppInbox,
       tracer: ctx.tracer,
       daemonVersion: ctx.daemonVersion,
       computerVersion: ctx.computerVersion,
+      runtime: ctx.config.runtime,
+      stableEntryPath,
     });
     const launchPart = buildCliTransportLaunchPart(ctx.launchId);
     const proxyTokenDir = path.join(slockHome, "agent-proxy-tokens", safePathPart(ctx.agentId));
     mkdirSync(proxyTokenDir, { recursive: true, mode: 0o700 });
     agentCredentialProxyTokenFile = path.join(proxyTokenDir, `${launchPart}.token`);
     writeFileSync(agentCredentialProxyTokenFile, agentCredentialProxy.proxyToken, { mode: 0o600 });
-  } else {
-    writeFileSync(tokenFile, ctx.config.authToken || ctx.daemonApiKey, { mode: 0o600 });
   }
 
   // Write wrappers so `raft ...` (canonical) and `slock ...` (legacy alias)
@@ -893,16 +1068,15 @@ export async function prepareCliTransport(
   // Identity-side vars (always required):
   //   SLOCK_AGENT_ID   — which agent the CLI should act as
   //   SLOCK_SERVER_URL — which server the CLI should reach
-  // Credential vars (one of two paths, mutually exclusive):
-  //   proxy path     → SLOCK_AGENT_PROXY_URL + SLOCK_AGENT_PROXY_TOKEN_FILE
-  //                    + SLOCK_AGENT_ACTIVE_CAPABILITIES
-  //   non-proxy path → SLOCK_AGENT_TOKEN_FILE (legacy daemon-token fallback)
-  // We never inline raw token *contents* — only the path to the token file
-  // (file mode 0o600, written elsewhere). Same secret surface as before.
+  // Credential vars (only with a runner credential; none otherwise):
+  //   SLOCK_AGENT_PROXY_URL + SLOCK_AGENT_PROXY_TOKEN_FILE
+  //   + SLOCK_AGENT_ACTIVE_CAPABILITIES
+  // We never inline raw token *contents* — only the path to the proxy token
+  // file (file mode 0o600, written above).
   const posixIdentityPrefix = `SLOCK_AGENT_ID=${shellSingleQuote(ctx.agentId)} SLOCK_SERVER_URL=${shellSingleQuote(ctx.config.serverUrl)} `;
   const posixCredentialPrefix = posixIdentityPrefix + (agentCredentialProxy
     ? `SLOCK_AGENT_PROXY_URL=${shellSingleQuote(agentCredentialProxy.proxyUrl)} SLOCK_AGENT_PROXY_TOKEN_FILE=${shellSingleQuote(agentCredentialProxyTokenFile!)} SLOCK_AGENT_ACTIVE_CAPABILITIES=${shellSingleQuote(DEFAULT_ACTIVE_CAPABILITIES)} `
-    : `SLOCK_AGENT_TOKEN_FILE=${shellSingleQuote(tokenFile)} `);
+    : "");
   // Exec-time fallback mirrors the spawn-time one: the tree can mutate AFTER
   // the wrapper is written but before the agent's next command runs.
   const posixCliFallbackBlock = cliPath === "__cli" || cliFallbackCandidates.length === 0
@@ -916,10 +1090,30 @@ export async function prepareCliTransport(
     ? `RAFT_HOST=${shellSingleQuote(nodeHost.command)}\n[ -e "$RAFT_HOST" ] || RAFT_HOST=${shellSingleQuote(hostPromotedPath)}\n`
     : "";
   const posixHostRef = hostPromotedPath ? '"$RAFT_HOST"' : shellSingleQuote(nodeHost.command);
-  const posixBody =
-    `#!/usr/bin/env bash\n${buildPosixLaunchForwardingGuard(slockDir)}\nunset RAFT_PROFILE SLOCK_PROFILE RAFT_PROFILE_DIR SLOCK_PROFILE_DIR\n${posixLoopbackNoProxyPrelude()}\nSLOCK_CLI=${shellSingleQuote(cliPath)}\n${posixCliFallbackBlock}${electronNodeMode ? "export ELECTRON_RUN_AS_NODE=1\n" : ""}${posixHostPrelude}${posixCredentialPrefix}exec ${posixHostRef} "$SLOCK_CLI" "$@"\n`;
+  const posixWrapperBody = (head: string, entryPrefix: string) =>
+    `#!/usr/bin/env bash\n${head}\nunset RAFT_PROFILE SLOCK_PROFILE RAFT_PROFILE_DIR SLOCK_PROFILE_DIR\n${posixLoopbackNoProxyPrelude()}\nSLOCK_CLI=${shellSingleQuote(cliPath)}\n${posixCliFallbackBlock}${electronNodeMode ? "export ELECTRON_RUN_AS_NODE=1\n" : ""}${posixHostPrelude}${posixCredentialPrefix}${entryPrefix}exec ${posixHostRef} "$SLOCK_CLI" "$@"\n`;
+  const posixBody = posixWrapperBody(buildPosixLaunchForwardingGuard(slockDir), "");
   writeFileSync(posixWrapper, posixBody, { mode: 0o755 });
   writeFileSync(posixRaftWrapper, posixBody, { mode: 0o755 });
+  // The stable entry runs the CLI exactly as this launch's wrapper does, as
+  // this launch (its transport dir, so the CLI reads this launch's context),
+  // and says so to the proxy. It has no launch-forwarding guard: it is the
+  // one entry a process that outlived its launch should call.
+  const stableEntryEnv: Array<[string, string]> = [
+    [RAFT_CLI_ENTRY_ENV, RAFT_CLI_STABLE_ENTRY],
+    [SLOCK_HOME_ENV, slockHome],
+    [SLOCK_CLI_TRANSPORT_DIR_ENV, slockDir],
+    [SLOCK_AGENT_LAUNCH_DIR_ENV, path.basename(slockDir)],
+  ];
+  const stableEntryHead = `# ${DAEMON_GENERATED_MARKER} stable entry: rewritten at every launch of this agent; uses only that launch's credential`;
+  const stableEntryBodies: Array<[string, string, number]> = [];
+  if (agentCredentialProxy) {
+    const posixStableBody = posixWrapperBody(
+      stableEntryHead,
+      stableEntryEnv.map(([name, value]) => `${name}=${shellSingleQuote(value)} `).join(""),
+    );
+    stableEntryBodies.push(["slock", posixStableBody, 0o755], ["raft", posixStableBody, 0o755]);
+  }
 
   if (platform === "win32") {
     const cmdWrapper = path.join(slockDir, "slock.cmd");
@@ -928,14 +1122,14 @@ export async function prepareCliTransport(
       `set "SLOCK_AGENT_ID=${ctx.agentId}"\r\nset "SLOCK_SERVER_URL=${ctx.config.serverUrl}"\r\n`;
     const cmdCredentialLine = cmdIdentityLines + (agentCredentialProxy
       ? `set "SLOCK_AGENT_PROXY_URL=${agentCredentialProxy.proxyUrl}"\r\nset "SLOCK_AGENT_PROXY_TOKEN_FILE=${agentCredentialProxyTokenFile!}"\r\nset "SLOCK_AGENT_ACTIVE_CAPABILITIES=${DEFAULT_ACTIVE_CAPABILITIES}"\r\n`
-      : `set "SLOCK_AGENT_TOKEN_FILE=${tokenFile}"\r\n`);
+      : "");
     const cmdCliFallbackLines = cliPath === "__cli"
       ? []
       : cliFallbackCandidates.map((candidate) =>
         `if not exist "%SLOCK_CLI%" set "SLOCK_CLI=${candidate}"`);
-    const cmdBody = [
+    const cmdWrapperBody = (head: string, entryLines: string[]) => [
       "@echo off",
-      buildCmdLaunchForwardingGuard(slockDir),
+      head,
       "set PYTHONIOENCODING=utf-8",
       "set PYTHONUTF8=1",
       "set LANG=C.UTF-8",
@@ -947,6 +1141,7 @@ export async function prepareCliTransport(
       'set "SLOCK_PROFILE_DIR="',
       ...cmdLoopbackNoProxyLines(),
       cmdCredentialLine.trimEnd(),
+      ...entryLines,
       `set "SLOCK_CLI=${cliPath}"`,
       ...cmdCliFallbackLines,
       ...(electronNodeMode ? [`set "ELECTRON_RUN_AS_NODE=1"`] : []),
@@ -955,8 +1150,16 @@ export async function prepareCliTransport(
         : [`"${nodeHost.command}" "%SLOCK_CLI%" %*`]),
       "",
     ].filter((line) => line.length > 0).join("\r\n") + "\r\n";
+    const cmdBody = cmdWrapperBody(buildCmdLaunchForwardingGuard(slockDir), []);
     writeFileSync(cmdWrapper, cmdBody);
     writeFileSync(cmdRaftWrapper, cmdBody);
+    if (agentCredentialProxy) {
+      const cmdStableBody = cmdWrapperBody(
+        `@REM ${stableEntryHead.slice(2)}\r\nsetlocal`,
+        stableEntryEnv.map(([name, value]) => `set "${name}=${value}"`),
+      );
+      stableEntryBodies.push(["slock.cmd", cmdStableBody, 0o644], ["raft.cmd", cmdStableBody, 0o644]);
+    }
 
     const psWrapper = path.join(slockDir, "slock.ps1");
     const psRaftWrapper = path.join(slockDir, "raft.ps1");
@@ -972,44 +1175,75 @@ export async function prepareCliTransport(
           `$env:SLOCK_AGENT_PROXY_TOKEN_FILE=${powershellSingleQuote(agentCredentialProxyTokenFile!)}`,
           `$env:SLOCK_AGENT_ACTIVE_CAPABILITIES=${powershellSingleQuote(DEFAULT_ACTIVE_CAPABILITIES)}`,
         ]
-        : [
-          `$env:SLOCK_AGENT_TOKEN_FILE=${powershellSingleQuote(tokenFile)}`,
-        ]),
+        : []),
     ];
-    const psBody = [
-      buildPs1LaunchForwardingGuard(slockDir),
+    const psWrapperBody = (head: string, entryLines: string[]) => [
+      head,
       "$ErrorActionPreference = 'Stop'",
       "$utf8NoBom = [System.Text.UTF8Encoding]::new($false)",
-      "[Console]::OutputEncoding = $utf8NoBom",
-      "$OutputEncoding = $utf8NoBom",
-      "$env:PYTHONIOENCODING = 'utf-8'",
-      "$env:PYTHONUTF8 = '1'",
-      "$env:LANG = 'C.UTF-8'",
-      "$env:LC_ALL = 'C.UTF-8'",
-      "Remove-Item Env:RAFT_PROFILE,Env:SLOCK_PROFILE,Env:RAFT_PROFILE_DIR,Env:SLOCK_PROFILE_DIR -ErrorAction SilentlyContinue",
-      ...powershellLoopbackNoProxyLines(),
-      ...psCredentialLines,
-      ...(electronNodeMode ? ["$env:ELECTRON_RUN_AS_NODE = '1'"] : []),
-      `$node = ${powershellSingleQuote(nodeHost.command)}`,
-      ...(hostPromotedPath ? [`if (-not (Test-Path $node)) { $node = ${powershellSingleQuote(hostPromotedPath)} }`] : []),
-      `$cli = ${powershellSingleQuote(cliPath)}`,
+      // task #384: a .ps1 runs in the caller's PowerShell process, so every
+      // `$env:` write and `[Console]::OutputEncoding` change outlives the call.
+      // Snapshot each touched name (unset stays unset) and restore it in the
+      // finally below, so a session looks the same before and after `raft`.
+      `$raftSavedEnv = @{}`,
+      `foreach ($raftEnvName in @(${POWERSHELL_WRAPPER_ENV_NAMES.map(powershellSingleQuote).join(", ")})) { $raftSavedEnv[$raftEnvName] = [Environment]::GetEnvironmentVariable($raftEnvName, 'Process') }`,
+      "$raftSavedConsoleEncoding = [Console]::OutputEncoding",
+      "try {",
+      "  [Console]::OutputEncoding = $utf8NoBom",
+      "  $OutputEncoding = $utf8NoBom",
+      "  $env:PYTHONIOENCODING = 'utf-8'",
+      "  $env:PYTHONUTF8 = '1'",
+      "  $env:LANG = 'C.UTF-8'",
+      "  $env:LC_ALL = 'C.UTF-8'",
+      "  Remove-Item Env:RAFT_PROFILE,Env:SLOCK_PROFILE,Env:RAFT_PROFILE_DIR,Env:SLOCK_PROFILE_DIR -ErrorAction SilentlyContinue",
+      ...powershellLoopbackNoProxyLines().map((line) => `  ${line}`),
+      ...psCredentialLines.map((line) => `  ${line}`),
+      ...entryLines.map((line) => `  ${line}`),
+      ...(electronNodeMode ? ["  $env:ELECTRON_RUN_AS_NODE = '1'"] : []),
+      `  $node = ${powershellSingleQuote(nodeHost.command)}`,
+      ...(hostPromotedPath ? [`  if (-not (Test-Path $node)) { $node = ${powershellSingleQuote(hostPromotedPath)} }`] : []),
+      `  $cli = ${powershellSingleQuote(cliPath)}`,
       ...(cliPath === "__cli" || cliFallbackCandidates.length === 0 ? [] : [
-        "if (-not (Test-Path $cli)) {",
-        `  foreach ($candidate in @(${cliFallbackCandidates.map(powershellSingleQuote).join(", ")})) {`,
-        "    if (Test-Path $candidate) { $cli = $candidate; break }",
+        "  if (-not (Test-Path $cli)) {",
+        `    foreach ($candidate in @(${cliFallbackCandidates.map(powershellSingleQuote).join(", ")})) {`,
+        "      if (Test-Path $candidate) { $cli = $candidate; break }",
+        "    }",
         "  }",
-        "}",
       ]),
-      "if ($MyInvocation.ExpectingInput) {",
-      "  $input | & $node $cli @args",
-      "} else {",
-      "  & $node $cli @args",
+      "  if ($MyInvocation.ExpectingInput) {",
+      "    $input | & $node $cli @args",
+      "  } else {",
+      "    & $node $cli @args",
+      "  }",
+      "  $raftExitCode = $LASTEXITCODE",
+      "} finally {",
+      "  foreach ($raftEnvName in $raftSavedEnv.Keys) { [Environment]::SetEnvironmentVariable($raftEnvName, $raftSavedEnv[$raftEnvName], 'Process') }",
+      "  [Console]::OutputEncoding = $raftSavedConsoleEncoding",
       "}",
-      "exit $LASTEXITCODE",
+      "exit $raftExitCode",
       "",
     ].join("\r\n");
+    const psBody = psWrapperBody(buildPs1LaunchForwardingGuard(slockDir), []);
     writeFileSync(psWrapper, psBody);
     writeFileSync(psRaftWrapper, psBody);
+    if (agentCredentialProxy) {
+      const psStableBody = psWrapperBody(
+        stableEntryHead,
+        stableEntryEnv.map(([name, value]) => `$env:${name}=${powershellSingleQuote(value)}`),
+      );
+      stableEntryBodies.push(["slock.ps1", psStableBody, 0o644], ["raft.ps1", psStableBody, 0o644]);
+    }
+  }
+  writeContWrappers(slockDir, platform);
+  if (stableEntryBodies.length > 0) {
+    // Last writer wins: the newest launch of the agent. Each file is replaced
+    // atomically, so a process running the entry meanwhile reads one whole
+    // wrapper, the previous launch's or this one's.
+    mkdirSync(stableEntryDir, { recursive: true });
+    for (const [name, body, mode] of stableEntryBodies) {
+      writeReplacingFile(path.join(stableEntryDir, name), body, mode);
+    }
+    writeContWrappers(stableEntryDir, platform);
   }
 
   // Expose @jackwener/opencli on the spawned runtime's PATH via the same
@@ -1047,13 +1281,18 @@ export async function prepareCliTransport(
     ?? readEnvPath(launchRuntimeFields.envVars ?? undefined, caseInsensitive)
     ?? readEnvPath(daemonEnv, caseInsensitive)
     ?? "";
-  const spawnEnv: Record<string, string | undefined> = {
-    ...daemonEnv,
+  // Everything the launch sets over the daemon's own environment.
+  const launchOwned: Record<string, string | undefined> = {
     FORCE_COLOR: "0",
     ...(launchRuntimeFields.envVars || {}),
     ...extraEnv,
     ...(platform === "win32" ? windowsUtf8Env() : {}),
     ...runtimeContextEnv(ctx.config),
+    // After the agent's configured env vars: the daemon's value wins.
+    [RAFT_CURRENT_RUNTIME_ENV]: ctx.config.runtime || "claude",
+    // The first-party apps on for its Server, so the CLI skips asking an app
+    // that is off (shared enabledAppsEnv.ts); unset when the Server didn't say.
+    ...(ctx.config.enabledApps ? { [RAFT_ENABLED_APPS_ENV]: enabledAppsEnvValue(ctx.config.enabledApps) } : {}),
     [SLOCK_HOME_ENV]: slockHome,
     SLOCK_AGENT_ID: ctx.agentId,
     ...(ctx.launchId ? { SLOCK_AGENT_LAUNCH_ID: ctx.launchId } : {}),
@@ -1063,6 +1302,7 @@ export async function prepareCliTransport(
     [SLOCK_CLI_TRANSPORT_DIR_ENV]: slockDir,
     PATH: `${slockDir}${path.delimiter}${basePath}`,
   };
+  const spawnEnv: Record<string, string | undefined> = { ...daemonEnv, ...launchOwned };
   if (caseInsensitive) {
     // One PATH only: a child given both `Path` and `PATH` keeps whichever
     // sorts first, which is `PATH` here, but leave no second copy to pick.
@@ -1084,19 +1324,27 @@ export async function prepareCliTransport(
   for (const key of EXTERNAL_PROFILE_ENV_DENYLIST) {
     delete spawnEnv[key];
   }
+  for (const key of COMPUTER_UPGRADE_OPERATION_ENV_DENYLIST) {
+    delete spawnEnv[key];
+  }
   delete spawnEnv.SLOCK_AGENT_PROXY_URL;
   delete spawnEnv.SLOCK_AGENT_PROXY_TOKEN;
   delete spawnEnv.SLOCK_AGENT_PROXY_TOKEN_FILE;
   delete spawnEnv.SLOCK_AGENT_ACTIVE_CAPABILITIES;
   delete spawnEnv.SLOCK_AGENT_TOKEN_FILE;
   applyLoopbackNoProxyEnv(spawnEnv);
+  const launchEnv: Record<string, string> = {};
+  for (const key of [...Object.keys(launchOwned), "NO_PROXY", "no_proxy"]) {
+    const value = spawnEnv[key];
+    if (value !== undefined) launchEnv[key] = value;
+  }
 
   return {
     slockDir,
     slockHome,
-    tokenFile,
     agentCredentialProxyUrl: agentCredentialProxy?.proxyUrl ?? null,
     wrapperPath,
     spawnEnv: spawnEnv as NodeJS.ProcessEnv,
+    launchEnv,
   };
 }

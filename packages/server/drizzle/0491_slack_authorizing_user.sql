@@ -1,0 +1,1 @@
+ALTER TABLE "external_app_install_server_grants" ADD COLUMN "provider_authorizing_user_id" text;

@@ -9,7 +9,8 @@ type ServerMemberRoleRef = {
 type ChannelHumanRoleRef = {
   id: string;
   serverId?: string;
-  role: ServerRole;
+  /** Null for another server's person in a joint roster. */
+  role: ServerRole | null;
 };
 
 function isLocalRole(serverId: string | null | undefined, expectedServerId: string | null | undefined) {

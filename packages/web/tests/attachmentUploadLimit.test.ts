@@ -1,8 +1,16 @@
 import assert from "node:assert/strict";
 import {
   resetAttachmentUploadLimitForTests,
-  resolveAttachmentUploadLimitBytes,
+  resolveAttachmentUploadLimits,
 } from "../src/utils/attachmentUploadLimit";
+import type { AttachmentUploadLimitSource } from "../src/utils/attachmentUploadLimit";
+import { useMonthlyUploadQuotaStore } from "../src/store/monthlyUploadQuotaStore";
+import { useServerStore } from "../src/store/serverStore";
+
+/** The single-file ceiling the composer would check against, or null. */
+async function resolveAttachmentUploadLimitBytes(api: AttachmentUploadLimitSource): Promise<number | null> {
+  return (await resolveAttachmentUploadLimits(api))?.maxBytes ?? null;
+}
 
 function source(responses: Array<{ data: unknown } | Error>) {
   const calls: string[] = [];
@@ -21,6 +29,7 @@ function source(responses: Array<{ data: unknown } | Error>) {
 
 beforeEach(() => {
   resetAttachmentUploadLimitForTests();
+  useMonthlyUploadQuotaStore.setState({ serverId: null, quota: null });
 });
 
 test("reports the ceiling the server served, verbatim", async () => {
@@ -110,4 +119,22 @@ test("a failed lookup does not poison later attempts", async () => {
 
   const recovered = source([{ data: { maxBytes: 8192 } }]);
   assert.equal(await resolveAttachmentUploadLimitBytes(recovered), 8192);
+});
+
+test("the monthly quota comes with the ceiling, and the upload entries learn it", async () => {
+  useServerStore.setState({ current: { id: "server-1" } as never });
+  const monthlyUpload = { month: "2026-10", limitBytes: 100 * 1024 * 1024, remainingBytes: 512 * 1024 };
+  const api = source([{ data: { maxBytes: 50 * 1024 * 1024, monthlyUpload } }]);
+
+  assert.deepEqual(await resolveAttachmentUploadLimits(api), { maxBytes: 50 * 1024 * 1024, monthlyUpload });
+  assert.deepEqual(useMonthlyUploadQuotaStore.getState(), { serverId: "server-1", quota: monthlyUpload });
+});
+
+test("no monthly quota (Pro), or a server too old to say, is none", async () => {
+  useServerStore.setState({ current: { id: "server-1" } as never });
+  for (const data of [{ maxBytes: 4096, monthlyUpload: null }, { maxBytes: 4096 }, { maxBytes: 4096, monthlyUpload: { month: "soon" } }]) {
+    resetAttachmentUploadLimitForTests();
+    assert.deepEqual(await resolveAttachmentUploadLimits(source([{ data }])), { maxBytes: 4096, monthlyUpload: null }, JSON.stringify(data));
+    assert.equal(useMonthlyUploadQuotaStore.getState().quota, null);
+  }
 });

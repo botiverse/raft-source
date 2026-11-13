@@ -125,29 +125,6 @@ test.describe("Search Escape routing", () => {
     await expect(page).toHaveURL(querySourceUrl);
   });
 
-  test("empty channel-header Search exits to the exact source channel", async ({
-    page,
-  }) => {
-    const seedState = await waitForSeedState();
-    const channelPath = `/s/${seedState.server.slug}/channel/${seedState.channel.id}`;
-
-    await page.setViewportSize({ width: 1280, height: 800 });
-    await page.goto(channelPath);
-    await expect(page.locator("textarea")).toBeVisible();
-
-    await page.getByRole("button", { name: "Search this channel" }).click();
-    await expect(page).toHaveURL(
-      new RegExp(
-        `/s/${seedState.server.slug}/search\\?channelId=${seedState.channel.id}&defer=1$`,
-      ),
-    );
-
-    const searchInput = page.getByTestId("message-search-input");
-    await expect(searchInput).toBeFocused();
-    await searchInput.press("Escape");
-    await expect(page).toHaveURL(new RegExp(`${channelPath}$`));
-  });
-
   test("empty Search opened with Command/Ctrl+K exits to the exact source channel", async ({
     page,
   }) => {

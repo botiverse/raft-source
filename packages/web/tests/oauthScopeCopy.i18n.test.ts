@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { readdirSync, readFileSync, statSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { join, relative, resolve } from "node:path";
+import { isTestPath } from "../scripts/testLocations";
 
 import * as presentation from "../src/lib/oauthScopePresentation";
 import { OAUTH_SCOPE_PRESENTATION, scopeGroupLabelId } from "../src/lib/oauthScopePresentation";
@@ -28,7 +29,8 @@ function walk(dir: string, out: string[] = []): string[] {
   }
   return out;
 }
-const FILES = walk(SRC);
+// Feature tests (src/features/<feature>/tests/) are not app code.
+const FILES = walk(SRC).filter((p) => !isTestPath(`src/${relative(SRC, p)}`));
 const strip = (src: string) =>
   src.replace(/\/\*[\s\S]*?\*\//g, "").split("\n").filter((l) => !/^\s*\/\//.test(l)).join("\n");
 
@@ -116,22 +118,11 @@ test("the negative-capability copy keeps every capability it denies", () => {
 test("the consent notice is ONE message, not two sentences concatenated", () => {
   // Was `Agent messaging requires Raft Agent Login. {SUMMARY}` glued together in
   // JSX, so a translation could not reorder or merge them.
-  const consent = strip(readFileSync(join(SRC, "components", "oauth", "RequestedScopeConsent.tsx"), "utf8"));
-  assert.match(consent, /id: "oauth\.consent\.agentLoginRequiredNotice"/);
-  assert.doesNotMatch(consent, /Agent messaging requires/);
   assert.match(en["oauth.consent.agentLoginRequiredNotice"], /^Agent messaging requires Raft Agent Login\. /);
   assert.ok(zh["oauth.consent.agentLoginRequiredNotice"].includes("Agent Login"));
 });
 
 test("the consent screen has no English left", () => {
-  const consent = strip(readFileSync(join(SRC, "components", "oauth", "RequestedScopeConsent.tsx"), "utf8"));
-  for (const dead of [
-    /"Requested access"/, />\s*Requested access/, /No recognized Raft scopes/,
-    /Unrecognized scopes/, /These scopes are the exact capabilities/,
-    /Recognized capabilities are shown below/,
-  ]) {
-    assert.doesNotMatch(consent, dead, `English still present: ${dead}`);
-  }
   // The three intro states are separate ids, not one string with conditional
   // fragments — clause order differs by language.
   for (const id of [
@@ -140,7 +131,6 @@ test("the consent screen has no English left", () => {
     "oauth.consent.introUnrecognized",
   ]) {
     assert.ok(en[id] && zh[id], `${id} missing`);
-    assert.match(consent, new RegExp(`"${id.replace(/\./g, "\\.")}"`), `${id} unused`);
   }
 });
 

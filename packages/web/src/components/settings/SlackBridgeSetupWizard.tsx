@@ -1,3 +1,4 @@
+import { ComboboxSelect } from "@botiverse/raft-ui/wip";
 import { useCallback, useEffect, useMemo, useReducer, useState } from "react";
 import { AlertTriangle, CheckCircle2, Plus, RefreshCw } from "lucide-react";
 import { useIntl } from "react-intl";
@@ -6,15 +7,6 @@ import {
   Badge,
   Button,
   Card,
-  Select,
-  SelectContent,
-  SelectIcon,
-  SelectItem,
-  SelectItemIndicator,
-  SelectItemText,
-  SelectList,
-  SelectTrigger,
-  SelectValue,
   Separator,
   Step,
   Steps,
@@ -35,6 +27,7 @@ import {
 import type {
   SlackBridgeChannelPair,
   SlackBridgeHealthAction,
+  SlackBridgeProvisioningFailureReason,
   SlackBridgeHealthReason,
   SlackBridgeHealthState,
   SlackBridgePreflightCheckId,
@@ -43,7 +36,10 @@ import type {
   SlackBridgeSetupSnapshot,
   SlackBridgeSetupStage,
 } from "./slackBridgeProvisioning";
+import { SLACK_BRIDGE_FAILURE_REASON_MESSAGE_ID, slackBridgeErrorMessageId } from "./slackBridgeErrors";
 import { RemovePairButton } from "./RemovePairButton";
+import { slackPairWaitingReasonId } from "../channel/slackSyncHeaderState";
+import { SlackAttachmentSourceBanner, SlackCardEditNoticeBanner } from "./SlackBridgeNoticeBanners";
 
 type SlackBridgeDisplayStage = "connect" | "channels" | "health";
 
@@ -85,6 +81,8 @@ const HEALTH_REASON_ID: Record<SlackBridgeHealthReason, MessageId> = {
   connection_failed: "settings.slackBridge.reason.connectionFailed",
   scope_mismatch: "settings.slackBridge.reason.scopeMismatch",
   verification_required: "settings.slackBridge.reason.verificationRequired",
+  delivery_blocked: "settings.slackBridge.reason.deliveryBlocked",
+  pair_waiting: "settings.slackBridge.pairWaitingDescription",
 };
 
 const HEALTH_ACTION_ID: Record<SlackBridgeHealthAction, MessageId> = {
@@ -100,6 +98,7 @@ const HEALTH_ACTION_ID: Record<SlackBridgeHealthAction, MessageId> = {
   repair_binding: "settings.slackBridge.action.repairBinding",
   repair_audience: "settings.slackBridge.action.repairAudience",
   retry_verification: "settings.slackBridge.action.retryVerification",
+  retry_delivery: "settings.slackBridge.retryDelivery",
 };
 
 const PREFLIGHT_LABEL_ID: Record<SlackBridgePreflightCheckId, MessageId> = {
@@ -151,19 +150,52 @@ function mentionSyncHintId(slackError: string | null): MessageId | null {
   return MENTION_SYNC_HINT_ID[slackError] ?? "settings.slackBridge.mentionSyncGeneric";
 }
 
-const FAILING_SURFACE_ID: Record<Exclude<SlackBridgeSetupSnapshot["rawHealth"]["failingSurface"], null>, MessageId> = {
+const FAILING_SURFACE_ID: Record<Exclude<NonNullable<SlackBridgeSetupSnapshot["rawHealth"]>["failingSurface"], null>, MessageId> = {
   install: "settings.slackBridge.surface.install",
   credential: "settings.slackBridge.surface.credential",
   binding: "settings.slackBridge.surface.binding",
   audience: "settings.slackBridge.surface.audience",
   connection: "settings.slackBridge.surface.connection",
   scope: "settings.slackBridge.surface.scope",
+  delivery: "settings.slackBridge.surface.delivery",
 };
 
 function displayStage(stage: SlackBridgeSetupStage): SlackBridgeDisplayStage {
   if (stage === "connect" || stage === "oauth") return "connect";
   if (stage === "health") return "health";
   return "channels";
+}
+
+/**
+ * A connection authorized before Raft recorded who authorized it cannot prove
+ * that its private channels are visible to that person, so their pairs stop
+ * verifying (Channel audience fails) and retrying cannot help. Say so where the
+ * failure shows, with the one action that fixes it.
+ */
+function AuthorizerMissingNotice({ canReauthorize, busy, onReauthorize }: {
+  canReauthorize: boolean;
+  busy: boolean;
+  onReauthorize: () => void;
+}) {
+  const { formatMessage } = useIntl();
+  return (
+    <Banner
+      intent="warning"
+      density="sm"
+      withIcon
+      title={formatMessage({ id: "settings.slackBridge.authorizerMissingTitle" })}
+      actions={canReauthorize ? (
+        <Button size="md" variant="default" disabled={busy} onClick={onReauthorize} data-testid="slack-bridge-authorizer-missing-reauthorize">
+          {formatMessage({ id: "settings.slackBridge.reauthorize" })}
+        </Button>
+      ) : undefined}
+      data-testid="slack-bridge-authorizer-missing"
+    >
+      {formatMessage({ id: canReauthorize
+        ? "settings.slackBridge.authorizerMissingDescription"
+        : "settings.slackBridge.authorizerMissingReadOnly" })}
+    </Banner>
+  );
 }
 
 function StepRail({ stage }: { stage: SlackBridgeSetupStage }) {
@@ -182,21 +214,23 @@ function StepRail({ stage }: { stage: SlackBridgeSetupStage }) {
 function PreflightResults({
   preflight,
   passed,
+  failureMessageId = "settings.slackBridge.preflightNotPassed",
 }: {
   preflight: NonNullable<SlackBridgeSetupSnapshot["preflight"]>;
   passed: boolean;
+  failureMessageId?: MessageId;
 }) {
   const { formatMessage } = useIntl();
   const checks = new Map(preflight.checks.map((check) => [check.id, check.state]));
   return (
-    <div className="mt-3 space-y-3">
+    <div className="mt-3 stack-y-3">
       {passed ? (
         <Banner intent="success" density="sm" role="status" icon={<CheckCircle2 size={16} />}>
           {formatMessage({ id: "settings.slackBridge.preflightPassed" })}
         </Banner>
       ) : (
         <Banner intent="warning" density="sm" icon={<AlertTriangle size={16} />}>
-          {formatMessage({ id: "settings.slackBridge.preflightNotPassed" })}
+          {formatMessage({ id: failureMessageId })}
         </Banner>
       )}
       <ul className="grid gap-2 sm:grid-cols-2">
@@ -216,6 +250,96 @@ function PreflightResults({
   );
 }
 
+function channelPairKey(pair: { raftChannelId: string; slackChannelId: string }): string {
+  return `${pair.raftChannelId}:${pair.slackChannelId}`;
+}
+
+/** A saved pair that no longer matches current channel authority. */
+function PairInvalidNote({ reason }: { reason: SlackBridgeProvisioningFailureReason }) {
+  const { formatMessage } = useIntl();
+  return (
+    <span className="block text-footnote font-normal text-warning-strong" data-testid="slack-bridge-pair-invalid">
+      {formatMessage(
+        { id: "settings.slackBridge.pairNoLongerValid" },
+        { reason: formatMessage({ id: SLACK_BRIDGE_FAILURE_REASON_MESSAGE_ID[reason] }) },
+      )}
+    </span>
+  );
+}
+
+type StalledDelivery = NonNullable<NonNullable<SlackBridgeSetupSnapshot["rawHealth"]>["outboundDeliveries"]>[number];
+
+function DeliveryRetryButton({ delivery, onRetry, disabled, channelName }: {
+  delivery: StalledDelivery;
+  onRetry: (delivery: StalledDelivery) => void;
+  disabled: boolean;
+  channelName: string;
+}) {
+  const { formatMessage } = useIntl();
+  const retry = useCallback(() => onRetry(delivery), [delivery, onRetry]);
+  return (
+    <div className="min-w-0 max-w-full stack-y-2">
+      <div className="text-callout [overflow-wrap:anywhere]">{formatMessage({ id: "settings.slackBridge.retryChannel" }, { channel: channelName })}</div>
+      <Button size="md" variant="outline" disabled={disabled || delivery.retryRequested} onClick={retry}>
+        {formatMessage({ id: delivery.retryRequested ? "settings.slackBridge.retryDeliveryRequested" : "settings.slackBridge.retryDelivery" })}
+      </Button>
+    </div>
+  );
+}
+
+function InboundReplayButton({ bindingId, bindingEpoch, eventId, reason, busy, onReplay }: {
+  bindingId: string; bindingEpoch: number; eventId?: string; reason?: string; busy: boolean;
+  onReplay: (event: { bindingId: string; bindingEpoch: number; eventId?: string; reason?: string }) => void;
+}) {
+  const { formatMessage } = useIntl();
+  const replay = useCallback(() => onReplay(eventId
+    ? { bindingId, bindingEpoch, eventId }
+    : { bindingId, bindingEpoch, reason }), [bindingId, bindingEpoch, eventId, reason, onReplay]);
+  return <Button className={eventId ? "ml-2" : undefined} size="md" variant="outline" disabled={busy} onClick={replay}>
+    {formatMessage({ id: eventId ? "settings.slackBridge.inboundReplay" : "settings.slackBridge.inboundReplayBatch" })}
+  </Button>;
+}
+
+function InboundIsolationNotice({ snapshot, channelNames, canManage, busy, onReplayInbound }: {
+  snapshot: SlackBridgeSetupSnapshot;
+  channelNames: Map<string, string>;
+  canManage: boolean;
+  busy: boolean;
+  onReplayInbound?: (event: { bindingId: string; bindingEpoch: number; eventId?: string; reason?: string }) => void;
+}) {
+  const { formatDate, formatMessage } = useIntl();
+  const health = snapshot.rawHealth;
+  if (!health || (!health.inboundIsolated?.length && !health.inboundIsolatedSummary?.count)) return null;
+  return <Banner className="mt-4" intent="warning" density="sm" withIcon
+    title={formatMessage({ id: "settings.slackBridge.inboundHeldTitle" })} data-testid="slack-inbound-isolated">
+    <p>{formatMessage({ id: "settings.slackBridge.inboundHeldDescription" })}</p>
+    {health.inboundIsolatedSummary && <p>{formatMessage({ id: "settings.slackBridge.inboundHeldSummary" }, {
+      count: health.inboundIsolatedSummary.count,
+      undisplayed: health.inboundIsolatedSummary.undisplayed,
+    })}{health.inboundIsolatedSummary.oldestFirstFailureAt && <> {formatMessage({ id: "settings.slackBridge.inboundHeldOldest" })} <time dateTime={health.inboundIsolatedSummary.oldestFirstFailureAt}>{formatDate(health.inboundIsolatedSummary.oldestFirstFailureAt, { dateStyle: "medium", timeStyle: "short", timeZone: "UTC" })}</time></>}</p>}
+    {canManage && onReplayInbound && (health.inboundIsolatedGroups ?? []).map(group => <div key={`${group.bindingId}:${group.reason}`}>
+      {formatMessage({ id: "settings.slackBridge.inboundHeldGroup" }, {
+        channel: channelNames.get(group.raftChannelId) ?? formatMessage({ id: "settings.slackBridge.raftChannel" }),
+        reason: formatMessage({ id: group.reason === "bot_sync_disabled" ? "settings.slackBridge.inboundHeldBotDisabled" : group.reason === "bot_outbound_pending" ? "settings.slackBridge.inboundHeldOutbound" : group.reason === "bot_identity_pending" || group.reason === "actor_identity_pending" ? "settings.slackBridge.inboundHeldIdentity" : "settings.slackBridge.inboundHeldFormat" }),
+        count: group.count,
+      })} <InboundReplayButton bindingId={group.bindingId} bindingEpoch={group.bindingEpoch} reason={group.reason} busy={busy} onReplay={onReplayInbound} />
+    </div>)}
+    <ul className="mt-3 stack-y-2">
+      {(health.inboundIsolated ?? []).map((event) => <li key={event.eventId} className="min-w-0 max-w-full">
+        <span>{formatMessage({ id: "settings.slackBridge.inboundHeldItem" }, {
+          channel: channelNames.get(event.raftChannelId) ?? formatMessage({ id: "settings.slackBridge.raftChannel" }),
+          reason: formatMessage({ id: event.reason === "bot_sync_disabled" ? "settings.slackBridge.inboundHeldBotDisabled" : event.reason === "bot_outbound_pending" ? "settings.slackBridge.inboundHeldOutbound" : event.reason === "bot_identity_pending" || event.reason === "actor_identity_pending"
+            ? "settings.slackBridge.inboundHeldIdentity" : "settings.slackBridge.inboundHeldFormat" }),
+        })}</span>
+        {event.heldAt && <time className="ml-2" dateTime={event.heldAt}>{formatDate(event.heldAt,
+          { dateStyle: "medium", timeStyle: "short", timeZone: "UTC" })}</time>}
+        {canManage && onReplayInbound && <InboundReplayButton bindingId={event.bindingId} bindingEpoch={event.bindingEpoch}
+          eventId={event.eventId} busy={busy} onReplay={onReplayInbound} />}
+      </li>)}
+    </ul>
+  </Banner>;
+}
+
 function HealthPanel({
   snapshot,
   channelNames,
@@ -223,6 +347,8 @@ function HealthPanel({
   onManage,
   busy,
   onRefresh,
+  onRetryDelivery,
+  onReplayInbound,
 }: {
   snapshot: SlackBridgeSetupSnapshot;
   channelNames: { raft: Map<string, string>; slack: Map<string, string> };
@@ -230,13 +356,29 @@ function HealthPanel({
   onManage: () => void;
   busy: boolean;
   onRefresh: () => void;
+  onRetryDelivery?: (delivery: { bindingId: string; bindingEpoch: number; deliveryId: string; providerAttempts: number }) => void;
+  onReplayInbound?: (event: { bindingId: string; bindingEpoch: number; eventId?: string; reason?: string }) => void;
 }) {
   const { formatDate, formatMessage } = useIntl();
   const [showInviteHelp, setShowInviteHelp] = useState(false);
   const toggleInviteHelp = useCallback(() => setShowInviteHelp((visible) => !visible), []);
-  const health = projectSlackBridgeHealth(snapshot.rawHealth);
-  const mentionSync = snapshot.rawHealth.agentMentionSync;
-  const mentionSyncHint = mentionSync ? mentionSyncHintId(mentionSync.slackError) : null;
+  // Providers predating these diagnostics may have no health snapshot. Treat
+  // absent fields as unverified rather than crashing or claiming health.
+  const rawHealth = {
+    ...snapshot.rawHealth,
+    install: snapshot.rawHealth?.install ?? null,
+    credential: snapshot.rawHealth?.credential ?? null,
+    bindings: snapshot.rawHealth?.bindings ?? [],
+    audiences: snapshot.rawHealth?.audiences ?? [],
+    lastVerifiedAt: snapshot.rawHealth?.lastVerifiedAt ?? null,
+    agentMentionSync: snapshot.rawHealth?.agentMentionSync ?? null,
+    failingSurface: snapshot.rawHealth?.failingSurface ?? null,
+  };
+  const health = projectSlackBridgeHealth(rawHealth);
+  const mentionSync = rawHealth.agentMentionSync;
+  const mentionCleanupPending = mentionSync?.state === "synced" && mentionSync.slackError === "cleanup_pending";
+  const mentionSyncHint = mentionCleanupPending ? "settings.slackBridge.mentionCleanupPending"
+    : mentionSync ? mentionSyncHintId(mentionSync.slackError) : null;
   const mappedChannelsWithAccessIssues = snapshot.channelPairs
     .map((pair) => snapshot.slackChannels.find((channel) => channel.id === pair.slackChannelId))
     .filter((channel): channel is NonNullable<typeof channel> => channel?.isMember !== true);
@@ -262,13 +404,13 @@ function HealthPanel({
           <Badge appearance="soft" variant="default">{snapshot.workspaceName}</Badge>
         )}
       </div>
-      {mentionSync?.state === "degraded" && mentionSyncHint && (
+      {(mentionSync?.state === "degraded" || mentionCleanupPending) && mentionSyncHint && (
         <Banner
           className="mt-4"
           intent="info"
           density="sm"
           withIcon
-          title={formatMessage({ id: "settings.slackBridge.mentionSyncTitle" })}
+          title={formatMessage({ id: mentionCleanupPending ? "settings.slackBridge.mentionCleanupTitle" : "settings.slackBridge.mentionSyncTitle" })}
           data-testid="slack-mention-sync-hint"
         >
           <p>{formatMessage(
@@ -303,16 +445,16 @@ function HealthPanel({
               },
             )}</p>
           <div className="mt-3 flex flex-wrap gap-2">
-            <Button size="sm" variant="ghost" onClick={toggleInviteHelp}>
+            <Button size="md" variant="ghost" onClick={toggleInviteHelp}>
               {formatMessage({ id: "settings.slackBridge.showInviteSteps" })}
             </Button>
-            <Button size="sm" variant="outline" disabled={busy} onClick={onRefresh}>
+            <Button size="md" variant="outline" disabled={busy} onClick={onRefresh}>
               <RefreshCw size={16} />
               {formatMessage({ id: "settings.slackBridge.refreshAndRecheck" })}
             </Button>
           </div>
           {showInviteHelp && (
-            <ol className="mt-3 list-decimal space-y-1 pl-5">
+            <ol className="mt-3 list-decimal stack-y-1 pl-5">
               <li>{formatMessage({ id: "settings.slackBridge.inviteStepOpen" })}</li>
               <li>{formatMessage({ id: "settings.slackBridge.inviteStepInvite" })}</li>
               <li>{formatMessage({ id: "settings.slackBridge.inviteStepReturn" })}</li>
@@ -320,6 +462,45 @@ function HealthPanel({
           )}
         </Banner>
       )}
+      {(rawHealth.outboundPairBlocks?.length ?? 0) > 0 && (
+        <Banner className="mt-4" intent="warning" density="sm" withIcon
+          title={formatMessage({ id: "settings.slackBridge.pairWaitingTitle" })}
+          data-testid="slack-pair-delivery-waiting">
+          <p>{formatMessage({ id: "settings.slackBridge.pairWaitingDescription" })}</p>
+          <ul className="mt-2 stack-y-1">
+            {rawHealth.outboundPairBlocks?.map((block) => (
+              <li key={block.bindingId}>
+                {formatMessage({ id: "settings.slackBridge.pairWaitingItem" }, {
+                  channel: channelNames.raft.get(block.raftChannelId) ?? formatMessage({ id: "settings.slackBridge.raftChannel" }),
+                  reason: formatMessage({ id: slackPairWaitingReasonId(block) }),
+                })}
+              </li>
+            ))}
+          </ul>
+        </Banner>
+      )}
+      <SlackAttachmentSourceBanner issues={rawHealth.attachmentSourceIssues} channelNames={channelNames.raft} busy={busy} onRefresh={onRefresh} />
+      <SlackCardEditNoticeBanner notices={rawHealth.cardEditNotices} channelNames={channelNames.raft} />
+      {(rawHealth.outboundDeliveries?.length ?? 0) > 0 && (
+        <Banner className="mt-4" intent="warning" density="sm" withIcon
+          title={formatMessage({ id: "settings.slackBridge.reason.deliveryBlocked" })}
+          data-testid="slack-delivery-recovery">
+          <p>{formatMessage({ id: "settings.slackBridge.retryDeliveryDescription" })}</p>
+          <div className="mt-3 flex flex-wrap gap-2">
+            {canManage && onRetryDelivery && rawHealth.outboundDeliveries?.map((delivery) => {
+              const binding = rawHealth.bindings.find((candidate) => candidate.id === delivery.bindingId);
+              return <DeliveryRetryButton key={delivery.deliveryId} delivery={delivery} onRetry={onRetryDelivery}
+                disabled={busy || binding?.state !== "active"}
+                channelName={channelNames.raft.get(delivery.raftChannelId) ?? formatMessage({ id: "settings.slackBridge.raftChannel" })} />;
+            })}
+            <Button size="md" variant="ghost" disabled={busy} onClick={onRefresh}>
+              {formatMessage({ id: "settings.slackBridge.refreshAndRecheck" })}
+            </Button>
+          </div>
+        </Banner>
+      )}
+      <InboundIsolationNotice snapshot={snapshot} channelNames={channelNames.raft} canManage={canManage}
+        busy={busy} onReplayInbound={onReplayInbound} />
       <dl className="mt-4 grid gap-3 sm:grid-cols-3">
         <div>
           <dt className="text-footnote font-medium text-foreground-hint">{formatMessage({ id: "settings.slackBridge.lastVerifiedLabel" })}</dt>
@@ -358,14 +539,14 @@ function HealthPanel({
             {formatMessage({ id: "settings.slackBridge.selectedPairs" })}
           </SectionEyebrow>
           {canManage && (
-            <Button size="sm" variant="outline" onClick={onManage}>
+            <Button size="md" variant="outline" onClick={onManage}>
               {formatMessage({ id: "settings.slackBridge.managePairs" })}
             </Button>
           )}
         </div>
-        <ul className="mt-2 space-y-1.5">
+        <ul className="mt-2 stack-y-1.5">
           {snapshot.channelPairs.map((pair) => (
-            <li key={`${pair.raftChannelId}:${pair.slackChannelId}`} className="rounded-control bg-fill-muted px-3 py-2 text-callout font-semibold text-foreground">
+            <li key={channelPairKey(pair)} className="rounded-control bg-fill-muted px-3 py-2 text-callout font-semibold text-foreground">
               {formatMessage(
                 { id: "settings.slackBridge.channelPair" },
                 {
@@ -373,6 +554,7 @@ function HealthPanel({
                   slackName: channelNames.slack.get(pair.slackChannelId),
                 },
               )}
+              {pair.invalidReason && <PairInvalidNote reason={pair.invalidReason} />}
             </li>
           ))}
         </ul>
@@ -390,7 +572,7 @@ interface SlackBridgeSetupWizardProps {
 interface WizardState {
   view: SlackBridgeProvisioningView | null;
   busy: boolean;
-  error: boolean;
+  error: MessageId | null;
   partialSuccess: boolean;
   pairs: SlackBridgeChannelPair[];
   raftChannelId: string;
@@ -403,7 +585,7 @@ interface WizardState {
 type WizardAction =
   | { type: "start" }
   | { type: "view"; view: SlackBridgeProvisioningView }
-  | { type: "error"; partialSuccess?: boolean }
+  | { type: "error"; partialSuccess?: boolean; message?: MessageId }
   | { type: "pairs"; pairs: SlackBridgeChannelPair[] }
   | { type: "raft_channel"; channelId: string }
   | { type: "slack_channel"; channelId: string }
@@ -415,7 +597,7 @@ type WizardAction =
 const INITIAL_WIZARD_STATE: WizardState = {
   view: null,
   busy: false,
-  error: false,
+  error: null,
   partialSuccess: false,
   pairs: [],
   raftChannelId: "",
@@ -428,7 +610,7 @@ const INITIAL_WIZARD_STATE: WizardState = {
 function wizardReducer(state: WizardState, action: WizardAction): WizardState {
   switch (action.type) {
     case "start":
-      return { ...state, busy: true, error: false, partialSuccess: false };
+      return { ...state, busy: true, error: null, partialSuccess: false };
     case "view": {
       const snapshot = action.view.kind === "ready" ? action.view.snapshot : null;
       if (snapshot?.stage === "channels") {
@@ -436,7 +618,7 @@ function wizardReducer(state: WizardState, action: WizardAction): WizardState {
           ...state,
           view: action.view,
           busy: false,
-          error: false,
+          error: null,
           partialSuccess: false,
           pairs: snapshot.channelPairs,
           raftChannelId: snapshot.raftChannels[0]?.id ?? "",
@@ -450,7 +632,7 @@ function wizardReducer(state: WizardState, action: WizardAction): WizardState {
         ...state,
         view: action.view,
         busy: false,
-        error: false,
+        error: null,
         partialSuccess: false,
         disconnectConfirmed: false,
         pairs: snapshot?.channelPairs ?? state.pairs,
@@ -459,7 +641,7 @@ function wizardReducer(state: WizardState, action: WizardAction): WizardState {
       };
     }
     case "error":
-      return { ...state, busy: false, error: true, partialSuccess: action.partialSuccess ?? false };
+      return { ...state, busy: false, error: action.message ?? "settings.slackBridge.operationFailed", partialSuccess: action.partialSuccess ?? false };
     case "pairs":
       return { ...state, pairs: action.pairs };
     case "raft_channel":
@@ -494,7 +676,7 @@ function wizardReducer(state: WizardState, action: WizardAction): WizardState {
           ...state,
           view: action.view,
           busy: false,
-          error: false,
+          error: null,
           partialSuccess: false,
           raftChannelId,
           slackChannelId,
@@ -546,6 +728,10 @@ export default function SlackBridgeSetupWizard({
   }, [provider]);
 
   const snapshot = view?.kind === "ready" ? view.snapshot : null;
+  const invalidReasonByPair = useMemo(() => new Map(
+    (snapshot?.channelPairs ?? []).flatMap((pair) =>
+      pair.invalidReason ? [[channelPairKey(pair), pair.invalidReason] as const] : []),
+  ), [snapshot]);
 
   const channelNames = useMemo(() => {
     const raft = new Map(snapshot?.raftChannels.map((channel) => [channel.id, channel.name]) ?? []);
@@ -558,7 +744,11 @@ export default function SlackBridgeSetupWizard({
     try {
       dispatch({ type: "view", view: await operation() });
     } catch (cause) {
-      dispatch({ type: "error", partialSuccess: cause instanceof SlackBridgePartialUpdateError });
+      dispatch({
+        type: "error",
+        partialSuccess: cause instanceof SlackBridgePartialUpdateError,
+        message: slackBridgeErrorMessageId(cause instanceof SlackBridgePartialUpdateError ? cause.cause : cause),
+      });
     }
   }, []);
 
@@ -609,12 +799,12 @@ export default function SlackBridgeSetupWizard({
     [pairs],
   );
 
-  const selectRaftChannel = useCallback((value: string | null) => {
-    if (value != null) dispatch({ type: "raft_channel", channelId: value });
+  const selectRaftChannel = useCallback((value: string | number | null) => {
+    if (typeof value === "string") dispatch({ type: "raft_channel", channelId: value });
   }, []);
 
-  const selectSlackChannel = useCallback((value: string | null) => {
-    if (value != null) dispatch({ type: "slack_channel", channelId: value });
+  const selectSlackChannel = useCallback((value: string | number | null) => {
+    if (typeof value === "string") dispatch({ type: "slack_channel", channelId: value });
   }, []);
 
   const savePairs = useCallback(() => {
@@ -628,8 +818,12 @@ export default function SlackBridgeSetupWizard({
   const cancelDisconnect = useCallback(() => dispatch({ type: "cancel_disconnect" }), []);
 
   const pairValidation = validateSlackBridgeChannelPairs(pairs);
+  // Already-saved pairs are kept as-is by the server even if they went stale;
+  // only new pairs must use a Slack channel the Raft app has joined.
+  const savedPairKeys = new Set((snapshot?.channelPairs ?? []).map(channelPairKey));
   const pairsUseMemberChannels = pairs.every((pair) =>
-    snapshot?.slackChannels.find((channel) => channel.id === pair.slackChannelId)?.isMember === true);
+    savedPairKeys.has(channelPairKey(pair))
+    || snapshot?.slackChannels.find((channel) => channel.id === pair.slackChannelId)?.isMember === true);
   const pairChangesValid = editingMappings && pairs.length === 0
     ? true
     : pairValidation.valid && pairsUseMemberChannels;
@@ -660,13 +854,27 @@ export default function SlackBridgeSetupWizard({
   const selectedSlackChannelIsMember = snapshot?.slackChannels
     .find((channel) => channel.id === slackChannelId)?.isMember === true;
   const preflightPassed = isSlackBridgePreflightPassed(snapshot?.preflight ?? null);
-  const disconnectConnectionEpoch = Number(snapshot?.rawHealth?.install?.epochs.connection ?? NaN);
+  const existingActiveBridge = (snapshot?.rawHealth?.bindings?.length ?? 0) > 0
+    && !!snapshot?.rawHealth?.bindings?.every((binding) => binding.state === "active");
+  const verificationReason = existingActiveBridge && snapshot?.rawHealth
+    ? projectSlackBridgeHealth(snapshot.rawHealth).reason : "verification_required";
+  const preflightFailureMessageId: MessageId = existingActiveBridge
+    ? HEALTH_REASON_ID[verificationReason === "healthy" ? "verification_required" : verificationReason]
+    : "settings.slackBridge.preflightNotPassed";
+  const disconnectConnectionEpoch = Number(snapshot?.rawHealth?.install?.epochs?.connection ?? NaN);
   const canDisconnect = canManage
     && !!provider.disconnect
     && snapshot?.stage !== "connect"
     && snapshot?.rawHealth?.install?.state !== "revoked"
     && Number.isSafeInteger(disconnectConnectionEpoch)
     && disconnectConnectionEpoch > 0;
+
+  const retryDelivery = useCallback((delivery: { bindingId: string; bindingEpoch: number; deliveryId: string; providerAttempts: number }) => {
+    if (provider.retryDelivery) void mutate(() => provider.retryDelivery!(delivery));
+  }, [mutate, provider]);
+  const replayInbound = useCallback((event: { bindingId: string; bindingEpoch: number; eventId?: string; reason?: string }) => {
+    if (provider.replayInbound) void mutate(() => provider.replayInbound!(event));
+  }, [mutate, provider]);
 
   const retryFinishSetup = useCallback(() => {
     void mutate(() => verifyAndEnableSlackBridge(provider));
@@ -695,6 +903,10 @@ export default function SlackBridgeSetupWizard({
       .catch(() => dispatch({ type: "error" }));
   }, [onOAuthRedirect, provider]);
 
+  // The pairs-editing area keeps its own hint; elsewhere the notice carries the action.
+  const showAuthorizerMissing = !!snapshot?.needsSlackReauthorization
+    && (snapshot.stage === "enable" || (snapshot.stage === "health" && !editingMappings));
+
   if (busy && !view) {
     return <Card className="p-4 text-callout text-foreground-muted">{formatMessage({ id: "settings.slackBridge.loading" })}</Card>;
   }
@@ -710,14 +922,12 @@ export default function SlackBridgeSetupWizard({
   if (!snapshot) return null;
 
   return (
-    <Card render={<section />} className="space-y-4 p-4" data-testid="slack-bridge-setup-wizard">
+    <Card render={<section />} className="stack-y-4 p-4" data-testid="slack-bridge-setup-wizard">
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div className="min-w-0">
           <SectionEyebrow as="div">{formatMessage({ id: "settings.slackBridge.eyebrow" })}</SectionEyebrow>
+          {/* The title and the step rail say it; each step keeps its own setup line (setup steps are out of scope for cuts). */}
           <h3 className="mt-1 text-headline text-foreground">{formatMessage({ id: "settings.slackBridge.title" })}</h3>
-          <p className="mt-1 max-w-2xl text-footnote text-foreground-muted">
-            {formatMessage({ id: "settings.slackBridge.description" })}
-          </p>
         </div>
         {!canManage && (
           <Badge appearance="soft" variant="muted">
@@ -728,11 +938,8 @@ export default function SlackBridgeSetupWizard({
       <StepRail stage={snapshot.stage} />
       {error && (
         <Banner intent="warning" density="sm" withIcon>
-          {formatMessage({
-            id: partialSuccess
-              ? "settings.slackBridge.mappingPartialFailure"
-              : "settings.slackBridge.operationFailed",
-          })}
+          {partialSuccess && <p>{formatMessage({ id: "settings.slackBridge.mappingPartialFailure" })}</p>}
+          {(!partialSuccess || error !== "settings.slackBridge.operationFailed") && <p>{formatMessage({ id: error })}</p>}
         </Banner>
       )}
 
@@ -741,7 +948,7 @@ export default function SlackBridgeSetupWizard({
           <div className="text-subhead font-semibold text-foreground">{formatMessage({ id: "settings.slackBridge.connectTitle" })}</div>
           <p className="mt-1 text-footnote text-foreground-muted">{formatMessage({ id: "settings.slackBridge.connectDescription" })}</p>
           {canManage && (
-            <Button className="mt-3" variant="accent" size="sm" disabled={busy} onClick={connectAndAuthorize}>
+            <Button className="mt-3" variant="accent" size="md" disabled={busy} onClick={connectAndAuthorize}>
               {formatMessage({ id: "settings.slackBridge.connect" })}
             </Button>
           )}
@@ -756,7 +963,7 @@ export default function SlackBridgeSetupWizard({
             <Button
               className="mt-3"
               variant="accent"
-              size="sm"
+              size="md"
               disabled={busy}
               onClick={authorize}
             >
@@ -767,7 +974,12 @@ export default function SlackBridgeSetupWizard({
       )}
 
       {(snapshot.stage === "channels" || (snapshot.stage === "health" && editingMappings)) && (
-        <div className="space-y-3 border-t border-line-hairline pt-4">
+        <div className="@container stack-y-3 border-t border-line-hairline pt-4">
+          {snapshot.needsSlackReauthorization && (
+            <Banner intent="warning" density="sm" data-testid="slack-bridge-private-reauthorize-hint">
+              {formatMessage({ id: "settings.slackBridge.privateReauthorizationHint" })}
+            </Banner>
+          )}
           <div>
             <div className="text-subhead font-semibold text-foreground">{formatMessage({ id: "settings.slackBridge.channelsTitle" })}</div>
             <p className="mt-1 text-footnote text-foreground-muted">{formatMessage({ id: "settings.slackBridge.channelsDescription" })}</p>
@@ -783,94 +995,80 @@ export default function SlackBridgeSetupWizard({
           </p>
           {canManage && (
             <div
-              className="grid gap-x-2 gap-y-1 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto]"
+              className="grid gap-x-2 gap-y-1 @lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto]"
               data-testid="slack-bridge-channel-pair-grid"
             >
               <FormField label={formatMessage({ id: "settings.slackBridge.raftChannel" })} size="compact">
-                <Select
-                  value={raftChannelId}
+                <ComboboxSelect
+                  value={raftChannelId || null}
                   onValueChange={selectRaftChannel}
-                  items={raftChannelOptions}
-                >
-                  <SelectTrigger className="w-full" aria-label={formatMessage({ id: "settings.slackBridge.raftChannel" })}>
-                    <SelectValue />
-                    <SelectIcon />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectList>
-                      {raftChannelOptions.map((option) => (
-                        <SelectItem key={option.value} value={option.value}>
-                          <SelectItemText>{option.label}</SelectItemText>
-                          <SelectItemIndicator />
-                        </SelectItem>
-                      ))}
-                    </SelectList>
-                  </SelectContent>
-                </Select>
+                  options={raftChannelOptions}
+                  aria-label={formatMessage({ id: "settings.slackBridge.raftChannel" })}
+                  placeholder={formatMessage({ id: "settings.slackBridge.searchChannels" })}
+                  emptyContent={formatMessage({ id: "settings.slackBridge.noMatchingChannels" })}
+                  disabled={busy}
+                  showArrow
+                  autoHighlight
+                />
               </FormField>
               <FormField
                 label={formatMessage({ id: "settings.slackBridge.slackChannel" })}
                 size="compact"
               >
-                <Select
-                  value={slackChannelId}
+                <ComboboxSelect
+                  value={slackChannelId || null}
                   onValueChange={selectSlackChannel}
-                  items={slackChannelOptions}
-                >
-                  <SelectTrigger className="w-full" aria-label={formatMessage({ id: "settings.slackBridge.slackChannel" })}>
-                    <SelectValue />
-                    <SelectIcon />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectList>
-                      {slackChannelOptions.map((option) => (
-                        <SelectItem key={option.value} value={option.value} disabled={option.disabled}>
-                          <SelectItemText>{option.label}</SelectItemText>
-                          <SelectItemIndicator />
-                        </SelectItem>
-                      ))}
-                    </SelectList>
-                  </SelectContent>
-                </Select>
+                  options={slackChannelOptions}
+                  aria-label={formatMessage({ id: "settings.slackBridge.slackChannel" })}
+                  placeholder={formatMessage({ id: "settings.slackBridge.searchChannels" })}
+                  emptyContent={formatMessage({ id: "settings.slackBridge.noMatchingChannels" })}
+                  disabled={busy}
+                  showArrow
+                  autoHighlight
+                />
               </FormField>
               <p
-                className="text-caption text-foreground-hint sm:col-start-2 sm:row-start-2"
+                className="text-caption text-foreground-hint @lg:col-start-2 @lg:row-start-2"
                 data-testid="slack-bridge-channel-membership-hint"
               >
                 {formatMessage({ id: "settings.slackBridge.slackChannelMembershipHint" })}
               </p>
               <div
-                className="flex items-center gap-2 self-end sm:col-start-3 sm:row-start-1"
+                className="flex items-center gap-2 self-end @lg:col-start-3 @lg:row-start-1"
                 data-testid="slack-bridge-channel-pair-actions"
               >
-                <Button size="sm" variant="outline" disabled={!raftChannelId || !slackChannelId || !selectedSlackChannelIsMember} onClick={addPair}>
+                <Button size="md" variant="outline" disabled={!raftChannelId || !slackChannelId || !selectedSlackChannelIsMember} onClick={addPair}>
                   <Plus size={16} />
                   {formatMessage({ id: "settings.slackBridge.addPair" })}
                 </Button>
-                <Button size="sm" variant="ghost" disabled={busy} onClick={refresh}>
+                <Button size="md" variant="ghost" disabled={busy} onClick={refresh}>
                   <RefreshCw size={16} />
                   {formatMessage({ id: "settings.slackBridge.refreshChannels" })}
                 </Button>
               </div>
             </div>
           )}
-          <ul className="space-y-2" aria-label={formatMessage({ id: "settings.slackBridge.selectedPairs" })}>
-            {pairs.map((pair) => (
-              <li key={`${pair.raftChannelId}:${pair.slackChannelId}`} className="flex min-h-11 items-center justify-between gap-3 rounded-control bg-fill-muted px-3 py-2 text-callout font-semibold text-foreground">
-                <span>
-                  {formatMessage(
-                    { id: "settings.slackBridge.channelPair" },
-                    {
-                      raftName: channelNames.raft.get(pair.raftChannelId),
-                      slackName: channelNames.slack.get(pair.slackChannelId),
-                    },
+          <ul className="stack-y-2" aria-label={formatMessage({ id: "settings.slackBridge.selectedPairs" })}>
+            {pairs.map((pair) => {
+              const invalidReason = invalidReasonByPair.get(channelPairKey(pair));
+              return (
+                <li key={channelPairKey(pair)} className="flex min-h-11 items-center justify-between gap-3 rounded-control bg-fill-muted px-3 py-2 text-callout font-semibold text-foreground">
+                  <span>
+                    {formatMessage(
+                      { id: "settings.slackBridge.channelPair" },
+                      {
+                        raftName: channelNames.raft.get(pair.raftChannelId),
+                        slackName: channelNames.slack.get(pair.slackChannelId),
+                      },
+                    )}
+                    {invalidReason && <PairInvalidNote reason={invalidReason} />}
+                  </span>
+                  {canManage && (
+                    <RemovePairButton pair={pair} onRemove={removePair} />
                   )}
-                </span>
-                {canManage && (
-                  <RemovePairButton pair={pair} onRemove={removePair} />
-                )}
-              </li>
-            ))}
+                </li>
+              );
+            })}
           </ul>
           {!pairChangesValid && pairs.length > 0 && (
             <Banner intent="warning" density="sm">{formatMessage({ id: "settings.slackBridge.pairInvalid" })}</Banner>
@@ -879,7 +1077,7 @@ export default function SlackBridgeSetupWizard({
             <div className="flex justify-end">
               <Button
                 variant="accent"
-                size="sm"
+                size="md"
                 disabled={!pairChangesValid || busy || (editingMappings && !mappingBaseline)}
                 onClick={savePairs}
               >
@@ -902,7 +1100,7 @@ export default function SlackBridgeSetupWizard({
             <PreflightResults preflight={snapshot.preflight} passed={preflightPassed} />
           )}
           {canManage && (
-            <Button className="mt-3" variant="accent" size="sm" disabled={busy} onClick={retryFinishSetup}>
+            <Button className="mt-3" variant="accent" size="md" disabled={busy} onClick={retryFinishSetup}>
               {formatMessage({ id: "settings.slackBridge.retryFinishSetup" })}
             </Button>
           )}
@@ -910,29 +1108,38 @@ export default function SlackBridgeSetupWizard({
       )}
 
       {snapshot.stage === "enable" && (
-        <div className="space-y-3 border-t border-line-hairline pt-4">
+        <div className="stack-y-3 border-t border-line-hairline pt-4">
+          {showAuthorizerMissing && (
+            <AuthorizerMissingNotice canReauthorize={canReauthorize} busy={busy} onReauthorize={reauthorize} />
+          )}
           {snapshot.preflight ? (
-            <PreflightResults preflight={snapshot.preflight} passed={preflightPassed} />
+            <PreflightResults preflight={snapshot.preflight} passed={preflightPassed} failureMessageId={preflightFailureMessageId} />
           ) : (
             <Banner intent="warning" density="sm" icon={<AlertTriangle size={16} />}>
-              {formatMessage({ id: "settings.slackBridge.preflightNotPassed" })}
+              {formatMessage({ id: preflightFailureMessageId })}
             </Banner>
           )}
           {canManage && (
             <div className="flex justify-end">
               <Button
-                variant="accent"
-                size="sm"
+                variant={showAuthorizerMissing ? "outline" : "accent"}
+                size="md"
                 disabled={busy}
                 onClick={enableBridge}
               >
-                {formatMessage({ id: "settings.slackBridge.retryFinishSetup" })}
+                {formatMessage({ id: existingActiveBridge
+                  ? "settings.slackBridge.action.retryVerification" : "settings.slackBridge.retryFinishSetup" })}
               </Button>
             </div>
           )}
         </div>
       )}
 
+      {snapshot.stage === "health" && showAuthorizerMissing && (
+        <AuthorizerMissingNotice canReauthorize={canReauthorize} busy={busy} onReauthorize={reauthorize} />
+      )}
+      {snapshot.stage !== "health" && <InboundIsolationNotice snapshot={snapshot} channelNames={channelNames.raft}
+        canManage={canManage} busy={busy} onReplayInbound={provider.replayInbound ? replayInbound : undefined} />}
       {snapshot.stage === "health" && !editingMappings && (
         <HealthPanel
           snapshot={snapshot}
@@ -941,17 +1148,24 @@ export default function SlackBridgeSetupWizard({
           onManage={startEditingMappings}
           busy={busy}
           onRefresh={refresh}
+          onRetryDelivery={provider.retryDelivery ? retryDelivery : undefined}
+          onReplayInbound={provider.replayInbound ? replayInbound : undefined}
         />
       )}
 
+      {canReauthorize && snapshot.workspaceName && (
+        <p className="break-words text-caption text-foreground-muted" data-testid="slack-bridge-reauthorize-workspace">
+          {formatMessage({ id: "settings.slackBridge.reauthorizeWorkspace" }, { workspace: snapshot.workspaceName })}
+        </p>
+      )}
       {canDisconnect && !disconnectConfirmed && (
         <div className="flex flex-wrap justify-end gap-2" data-testid="slack-bridge-connection-actions">
-          {canReauthorize && (
-            <Button size="sm" variant="outline" disabled={busy} onClick={reauthorize} data-testid="slack-bridge-reauthorize">
+          {canReauthorize && !showAuthorizerMissing && (
+            <Button size="md" variant="outline" disabled={busy} onClick={reauthorize} data-testid="slack-bridge-reauthorize">
               {formatMessage({ id: "settings.slackBridge.reauthorize" })}
             </Button>
           )}
-          <Button variant="warning" size="sm" disabled={busy} onClick={confirmDisconnect}>
+          <Button variant="warning" size="md" disabled={busy} onClick={confirmDisconnect}>
             {formatMessage({ id: "settings.slackBridge.disconnect" })}
           </Button>
         </div>
@@ -960,12 +1174,12 @@ export default function SlackBridgeSetupWizard({
         <Banner intent="destructive" density="sm" data-testid="slack-bridge-disconnect-confirmation">
           <p>{formatMessage({ id: "settings.slackBridge.disconnectDescription" })}</p>
           <div className="mt-3 flex flex-wrap justify-end gap-2">
-            <Button size="sm" variant="ghost" disabled={busy} onClick={cancelDisconnect}>
+            <Button size="md" variant="ghost" disabled={busy} onClick={cancelDisconnect}>
               {formatMessage({ id: "settings.common.cancel" })}
             </Button>
             <Button
               variant="danger"
-              size="sm"
+              size="md"
               disabled={busy}
               onClick={disconnect}
             >

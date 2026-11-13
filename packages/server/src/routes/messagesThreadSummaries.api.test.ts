@@ -8,7 +8,7 @@ import { addMember, createServer as createServerService } from "../services/serv
 import { createChannel as createChannelService, getOrCreateThread, addHuman } from "../services/channelService";
 import { createMessage } from "../services/messageService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 // task #809 (inline replies cold path, feedback: reply blocks jumped on every
 // channel entry): GET /api/messages/channel/:channelId now carries

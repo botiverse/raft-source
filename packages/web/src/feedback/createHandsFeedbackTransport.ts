@@ -10,6 +10,14 @@ import type {
   HandsFeedbackTransport,
 } from "@botiverse/hands-feedback-react";
 import type { AxiosInstance } from "axios";
+import { feedbackTicketPlatformParams } from "./feedbackTicketPlatform";
+import { productFeedbackForm } from "./productFeedbackForm";
+import {
+  FEEDBACK_LIST_DEGRADED_OK,
+  degradedRetryAfterMs,
+  isDegradedFeedbackPage,
+} from "./productFeedbackListContract";
+import type { ApiDegradedTicketPage } from "./productFeedbackListContract";
 
 type ApiTicket = {
   id: string;
@@ -25,6 +33,12 @@ type ApiTicket = {
   unread_count: number;
   attachment_count: number;
   comment_count: number;
+  /** List pages only; absent from detail responses and older servers. */
+  latest_comment?: {
+    author_type: "reporter" | "staff" | "system";
+    body_preview: string;
+    created_at: number;
+  } | null;
 };
 type ApiComment = {
   id: string;
@@ -55,6 +69,33 @@ type ApiTicketDetail = {
   unread_total: number;
 };
 
+/**
+ * A degraded first page is retried, never shown: starting at the server's
+ * `retry_after_seconds`, doubling up to this cap, until a real page arrives or
+ * the list's signal aborts (unmount, a newer load).
+ */
+const DEGRADED_RETRY_MAX_MS = 60_000;
+
+/** Resolves after `ms`; rejects (and clears the timer) as soon as `signal` aborts. */
+function waitForRetry(ms: number, signal: AbortSignal | undefined): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const aborted = () => signal?.reason ?? new DOMException("Aborted", "AbortError");
+    if (signal?.aborted) {
+      reject(aborted());
+      return;
+    }
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(aborted());
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
 function ticketKind(kind: ApiTicket["kind"]): FeedbackKind {
   return kind === "feedback" ? "feedback" : "bug";
 }
@@ -73,6 +114,17 @@ function mapTicket(ticket: ApiTicket): FeedbackTicketSummary {
     unreadCount: ticket.unread_count,
     attachmentCount: ticket.attachment_count,
     commentCount: ticket.comment_count,
+    ...(ticket.latest_comment === undefined
+      ? {}
+      : {
+          latestComment: ticket.latest_comment
+            ? {
+                authorType: ticket.latest_comment.author_type,
+                bodyPreview: ticket.latest_comment.body_preview,
+                createdAt: ticket.latest_comment.created_at,
+              }
+            : null,
+        }),
   };
 }
 
@@ -177,12 +229,24 @@ function createUploadProgressReporter(
 export function createHandsFeedbackTransport(api: AxiosInstance, options: {
   metadata?: () => Promise<Record<string, string> | null>;
   captureUnread?: () => (count: number) => void;
+  /**
+   * Like `captureUnread`, for a list page's `unread_total`: captured when the
+   * read is sent, called with a real page's total (not a degraded page's).
+   */
+  captureListUnread?: () => (count: number) => void;
+  /**
+   * The first page is degraded and being retried (true), or a retry ended:
+   * a real page, an error, or the list went away (false). The host shows
+   * "can't load right now, retrying" meanwhile.
+   */
+  onListDegradedChange?: (degraded: boolean) => void;
   diagnostics?: { r2_key: string; filename: string; content_type: string; size: number } | null;
 } = {}): HandsFeedbackTransport {
 async function getTicket(
   input: Parameters<HandsFeedbackTransport["getTicket"]>[0],
 ): Promise<FeedbackTicketDetail> {
   const updateUnread = options.captureUnread?.() ?? (() => {});
+  const platformParams = feedbackTicketPlatformParams(input.ticketId);
   try {
     const { data } = await api.get<ApiTicketDetail>(
       `/product-feedback/tickets/${encodeURIComponent(input.ticketId)}`,
@@ -190,33 +254,72 @@ async function getTicket(
         params: {
           comment_limit: input.commentLimit,
           ...(input.commentCursor ? { comment_cursor: input.commentCursor } : {}),
+          ...platformParams,
         },
         signal: input.signal,
       },
     );
-    updateUnread(data.unread_total);
+    // A mobile App's ticket answers with that App's unread total, not the
+    // web's: the web's count stays as it is.
+    if (platformParams.platform === undefined) updateUnread(data.unread_total);
     return mapDetail(data);
   } catch (error) {
     throw feedbackTransportError(error);
   }
 }
 
+// The first-page read currently waiting out a degraded answer, if any. Only
+// that read may end the degraded state on abort or error; a real page from any
+// read ends it.
+let degradedRead: object | null = null;
+function setListDegraded(read: object, degraded: boolean) {
+  if (degraded) {
+    const changed = degradedRead === null;
+    degradedRead = read;
+    if (changed) options.onListDegradedChange?.(true);
+    return;
+  }
+  if (degradedRead !== read) return;
+  degradedRead = null;
+  options.onListDegradedChange?.(false);
+}
+
 return {
   async listTickets(input) {
+    const read = {};
+    const updateUnread = options.captureListUnread?.() ?? (() => {});
+    let retryMs: number | null = null;
     try {
-      const { data } = await api.get<ApiTicketPage>("/product-feedback/tickets", {
-        params: {
-          limit: input.limit,
-          ...(input.cursor ? { cursor: input.cursor } : {}),
-        },
-        signal: input.signal,
-      });
-      return {
-        tickets: data.tickets.map(mapTicket),
-        nextCursor: data.next_cursor,
-        unreadTotal: data.unread_total,
-      };
+      for (;;) {
+        const { data } = await api.get<ApiTicketPage | ApiDegradedTicketPage>("/product-feedback/tickets", {
+          params: {
+            limit: input.limit,
+            // Only the first page can degrade (server #12566); a later page
+            // still 503s, since an empty page there would read as the end.
+            ...(input.cursor ? { cursor: input.cursor } : FEEDBACK_LIST_DEGRADED_OK),
+          },
+          signal: input.signal,
+        });
+        if (!isDegradedFeedbackPage(data)) {
+          if (degradedRead) setListDegraded(degradedRead, false);
+          updateUnread(data.unread_total);
+          return {
+            tickets: data.tickets.map(mapTicket),
+            nextCursor: data.next_cursor,
+            unreadTotal: data.unread_total,
+          };
+        }
+        // Not "no feedback", and unread_total is unknown (null): resolving
+        // would draw the empty state and report an unread count. Keep the SDK
+        // loading (or showing the list it has) and ask again.
+        setListDegraded(read, true);
+        retryMs = retryMs === null
+          ? Math.min(degradedRetryAfterMs(data), DEGRADED_RETRY_MAX_MS)
+          : Math.min(retryMs * 2, DEGRADED_RETRY_MAX_MS);
+        await waitForRetry(retryMs, input.signal);
+      }
     } catch (error) {
+      setListDegraded(read, false);
       throw feedbackTransportError(error);
     }
   },
@@ -227,7 +330,7 @@ return {
     try {
       const { data } = await api.get<Blob>(
         `/product-feedback/tickets/${encodeURIComponent(input.ticketId)}/attachments/${encodeURIComponent(input.attachmentId)}`,
-        { responseType: "blob", signal: input.signal },
+        { responseType: "blob", params: feedbackTicketPlatformParams(input.ticketId), signal: input.signal },
       );
       return data;
     } catch (error) {
@@ -236,13 +339,12 @@ return {
   },
 
   async createTicket(input) {
-    const form = new FormData();
-    form.set("type", input.kind === "feedback" ? "idea" : "problem");
-    form.set("message", input.message);
-    const desktopMetadata = await options.metadata?.();
-    if (desktopMetadata) form.set("metadata", JSON.stringify(desktopMetadata));
-    form.set("submission_id", input.submissionId);
-    form.set("may_contact", "false");
+    const form = productFeedbackForm({
+      type: input.kind === "feedback" ? "idea" : "problem",
+      message: input.message,
+      submissionId: input.submissionId,
+      metadata: await options.metadata?.(),
+    });
     if (options.diagnostics) form.set("diagnostics", JSON.stringify(options.diagnostics));
     input.attachments.forEach((attachment) => {
       form.append("attachments", attachment, attachment.name);
@@ -282,7 +384,7 @@ return {
       await api.post(
         `/product-feedback/tickets/${encodeURIComponent(input.ticketId)}/comments`,
         form,
-        { signal: input.signal, onUploadProgress },
+        { params: feedbackTicketPlatformParams(input.ticketId), signal: input.signal, onUploadProgress },
       );
       reportProgress(input.attachments, 1, input.onAttachmentProgress);
       return await getTicket({
@@ -300,7 +402,7 @@ return {
       await api.post(
         `/product-feedback/tickets/${encodeURIComponent(input.ticketId)}/close`,
         { reason: input.reason },
-        { signal: input.signal },
+        { params: feedbackTicketPlatformParams(input.ticketId), signal: input.signal },
       );
       return await getTicket({
         ticketId: input.ticketId,

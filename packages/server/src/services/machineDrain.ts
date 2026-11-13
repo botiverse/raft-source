@@ -32,8 +32,10 @@ export const MACHINE_DRAIN_CLOSE_REASON = "server_draining";
  * without changing the infra side and CI goes red, in both directions. */
 export const DEFAULT_DRAIN_CLOSE_SPREAD_MS = 120_000;
 /** Margin the drain window must keep beyond the spread: last-1001 -> daemon
- * reconnect (0-5s) + registration + slow-machine slack. */
-export const DRAIN_SPREAD_MARGIN_MS = 60_000;
+ * reconnect (0-5s) + registration + slow-machine slack. Measured on the
+ * 2026-11-05 prod rollout (120s spread): last-1001 -> registered p50 4.6s,
+ * p99 20.1s, 0.6% over 30s, none lost (zhiqiang chose 30s + 30s). */
+export const DRAIN_SPREAD_MARGIN_MS = 30_000;
 
 export interface DrainCloseResult {
   /** Sockets a close frame was sent to. */
@@ -65,22 +67,57 @@ export interface DrainCloseResult {
  */
 export async function closeConnectionsForDrain(
   connections: Iterable<MachineDrainConnection>,
-  options?: {
-    /** Total window to spread the closes across. Default DEFAULT_DRAIN_CLOSE_SPREAD_MS. */
-    spreadMs?: number;
-    /** Injectable for tests. */
-    sleep?: (ms: number) => Promise<void>;
-    /** Injectable clock for tests (ms). */
-    now?: () => number;
-    warn?: (message: string, reason: unknown) => void;
-  },
+  options?: DrainSpreadOptions,
+): Promise<DrainCloseResult> {
+  const warn = options?.warn ?? ((message: string, reason: unknown) => console.warn(`[Slock] ${message}:`, reason));
+  return spreadClosesForDrain(connections, (conn) => {
+    if (conn.ws.readyState !== conn.ws.OPEN) return false;
+    try {
+      conn.ws.close(MACHINE_DRAIN_CLOSE_CODE, MACHINE_DRAIN_CLOSE_REASON);
+      return true;
+    } catch (err) {
+      warn(`Failed to send drain close to machine ${conn.machineId}`, err);
+      return false;
+    }
+  }, options);
+}
+
+export interface DrainSpreadOptions {
+  /** Total window to spread the closes across. Default DEFAULT_DRAIN_CLOSE_SPREAD_MS. */
+  spreadMs?: number;
+  /** Injectable for tests. */
+  sleep?: (ms: number) => Promise<void>;
+  /** Injectable clock for tests (ms). */
+  now?: () => number;
+  warn?: (message: string, reason: unknown) => void;
+}
+
+/**
+ * The pacing behind closeConnectionsForDrain, for any kind of long-lived
+ * connection (browser Socket.IO transports and SSE streams use it too).
+ * `close` returns whether it actually closed something; skipped items still
+ * take their slot, so the spread stays even. A `close` that throws is warned
+ * and counted as skipped: one bad connection must not stop the rest (they
+ * would then all be cut together at SIGTERM) or reject the promise of a
+ * drain that callers start detached.
+ *
+ * Browser and SSE connections used to be closed all at once at drain start.
+ * With ECS draining every old task together, that put every open tab's
+ * reconnect and page reload on Neon in the same second: about half of
+ * requests over 1 s in the cutover minute at v1.21.27 and v1.21.28
+ * (#proj-o11y:7c3aaf2e).
+ */
+export async function spreadClosesForDrain<T>(
+  items: Iterable<T>,
+  close: (item: T) => boolean,
+  options?: DrainSpreadOptions,
 ): Promise<DrainCloseResult> {
   const spreadMs = options?.spreadMs ?? DEFAULT_DRAIN_CLOSE_SPREAD_MS;
   const sleep = options?.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   const now = options?.now ?? (() => Date.now());
   const warn = options?.warn ?? ((message: string, reason: unknown) => console.warn(`[Slock] ${message}:`, reason));
 
-  const snapshot = [...connections];
+  const snapshot = [...items];
   const n = snapshot.length;
   let closed = 0;
   let firstCloseAt: number | null = null;
@@ -92,17 +129,17 @@ export async function closeConnectionsForDrain(
   // faithful acceptance reading.
   const start = now();
   for (let index = 0; index < n; index += 1) {
-    const conn = snapshot[index];
-    if (conn.ws.readyState === conn.ws.OPEN) {
-      try {
-        conn.ws.close(MACHINE_DRAIN_CLOSE_CODE, MACHINE_DRAIN_CLOSE_REASON);
-        closed += 1;
-        const at = now();
-        if (firstCloseAt === null) firstCloseAt = at;
-        lastCloseAt = at;
-      } catch (err) {
-        warn(`Failed to send drain close to machine ${conn.machineId}`, err);
-      }
+    let didClose = false;
+    try {
+      didClose = close(snapshot[index]);
+    } catch (err) {
+      warn("Failed to close a connection during drain", err);
+    }
+    if (didClose) {
+      closed += 1;
+      const at = now();
+      if (firstCloseAt === null) firstCloseAt = at;
+      lastCloseAt = at;
     }
     // Pace the NEXT close: close i+1 is due at start + spreadMs*(i+1)/n. The
     // last close needs no trailing sleep.

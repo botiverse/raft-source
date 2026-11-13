@@ -18,7 +18,7 @@ import { mintAgentCredential } from "../services/agentCredentialService";
 import { createAgent } from "../services/agentService";
 import { createServer } from "../services/serverService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 async function createUser(prefix: string) {
   const suffix = randomUUID();
@@ -255,12 +255,14 @@ test("Server Labs API enforces human/agent role parity, one cursor CAS, no-op, a
     agentId: agent.id,
     scopes: ["read", "server"],
     name: "labs-api-agent",
+    issuedVia: "human",
     createdByUserId: owner.id,
   });
   const readOnlyAgentCredential = await mintAgentCredential({
     agentId: agent.id,
     scopes: ["read"],
     name: "labs-api-read-only-agent",
+    issuedVia: "human",
     createdByUserId: owner.id,
   });
 

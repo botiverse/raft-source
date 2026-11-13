@@ -376,16 +376,19 @@ const SHAPES: ScopeShape[] = [
 const PRINCIPALS: ReadMutationPrincipalKind[] = ["human", "agent"];
 const RECEIVER_DATA: ReceiverData[] = ["cursor", "facts", "both"];
 
+// Each data variant gets a fresh server, principal and scope. Only the
+// database lifecycle is shared within one shape/principal/operation group.
 for (const shape of SHAPES) {
   for (const principalKind of PRINCIPALS) {
-    for (const receiverData of RECEIVER_DATA) {
-      const cell = `${EXPECTED_AUTHORITY[shape]} / ${shape} / ${principalKind} / ${receiverData}`;
+    const group = `${EXPECTED_AUTHORITY[shape]} / ${shape} / ${principalKind}`;
 
-      test(`task #64 sequenced read-all stays within receiver-owned data: ${cell}`, async ({ db }) => {
-        assert.ok(db, "the database fixture is initialized");
+    test(`task #64 sequenced read-all stays within receiver-owned data: ${group}`, async ({ db }) => {
+      assert.ok(db, "the database fixture is initialized");
+      for (const receiverData of RECEIVER_DATA) {
+        const cell = `${group} / ${receiverData}`;
         const seeded = await seedResidueScope({ shape, principalKind, receiverData });
         const authority = await inspectChannelReadAllScopeAuthorityForTests({ ...seeded, principalKind });
-        assert.equal(authority, EXPECTED_AUTHORITY[shape], "the intended residue branch resolves");
+        assert.equal(authority, EXPECTED_AUTHORITY[shape], `${cell}: the intended residue branch resolves`);
 
         const mutationId = randomUUID();
         const admission = await admitReadMutation({
@@ -395,7 +398,7 @@ for (const shape of SHAPES) {
           mutationId,
           mutation: { kind: "channel_read_all", scopeId: seeded.scopeId },
         });
-        assert.equal(admission.outcome, "ADMITTED");
+        assert.equal(admission.outcome, "ADMITTED", `${cell}: admission`);
         const claim = await claimNextReadMutation({
           serverId: seeded.serverId,
           principalKind,
@@ -403,9 +406,9 @@ for (const shape of SHAPES) {
           leaseOwner: "task64",
           leaseMs: 60_000,
         });
-        assert.ok(claim, "the admitted mutation is claimable");
+        assert.ok(claim, `${cell}: the admitted mutation is claimable`);
         const ack = await executeReadMutationClaim({ claim });
-        assertAckBounded(ack, RECEIVER_OWNED_MAX, "applied ack");
+        assertAckBounded(ack, RECEIVER_OWNED_MAX, `${cell}: applied ack`);
 
         const replay = await admitReadMutation({
           serverId: seeded.serverId,
@@ -414,18 +417,21 @@ for (const shape of SHAPES) {
           mutationId,
           mutation: { kind: "channel_read_all", scopeId: seeded.scopeId },
         });
-        assert.equal(replay.outcome, "ALREADY_TERMINAL");
-        assertAckBounded(replay.ack as AckLike, RECEIVER_OWNED_MAX, "replayed ack");
+        assert.equal(replay.outcome, "ALREADY_TERMINAL", `${cell}: replay`);
+        assertAckBounded(replay.ack as AckLike, RECEIVER_OWNED_MAX, `${cell}: replayed ack`);
 
         const cursor = await readCursor(principalKind, seeded.principalId, seeded.scopeId);
-        assert.ok(cursor <= RECEIVER_OWNED_MAX, `stored cursor ${cursor} exceeds receiver-owned max ${RECEIVER_OWNED_MAX}`);
-      });
+        assert.ok(cursor <= RECEIVER_OWNED_MAX, `${cell}: stored cursor ${cursor} exceeds receiver-owned max ${RECEIVER_OWNED_MAX}`);
+      }
+    });
 
-      test(`task #64 compatibility read-all (HTTP read-all path) stays within receiver-owned data: ${cell}`, async ({ db }) => {
-        assert.ok(db, "the database fixture is initialized");
+    test(`task #64 compatibility read-all (HTTP read-all path) stays within receiver-owned data: ${group}`, async ({ db }) => {
+      assert.ok(db, "the database fixture is initialized");
+      for (const receiverData of RECEIVER_DATA) {
+        const cell = `${group} / ${receiverData}`;
         const seeded = await seedResidueScope({ shape, principalKind, receiverData });
         const authority = await inspectChannelReadAllScopeAuthorityForTests({ ...seeded, principalKind });
-        assert.equal(authority, EXPECTED_AUTHORITY[shape], "the intended residue branch resolves");
+        assert.equal(authority, EXPECTED_AUTHORITY[shape], `${cell}: the intended residue branch resolves`);
 
         const ack = await executeCompatibilityReadMutation({
           serverId: seeded.serverId,
@@ -433,11 +439,11 @@ for (const shape of SHAPES) {
           principalId: seeded.principalId,
           mutation: { kind: "channel_read_all", scopeId: seeded.scopeId },
         });
-        assertAckBounded(ack, RECEIVER_OWNED_MAX, "compatibility ack");
+        assertAckBounded(ack, RECEIVER_OWNED_MAX, `${cell}: compatibility ack`);
         const cursor = await readCursor(principalKind, seeded.principalId, seeded.scopeId);
-        assert.ok(cursor <= RECEIVER_OWNED_MAX, `stored cursor ${cursor} exceeds receiver-owned max ${RECEIVER_OWNED_MAX}`);
-      });
-    }
+        assert.ok(cursor <= RECEIVER_OWNED_MAX, `${cell}: stored cursor ${cursor} exceeds receiver-owned max ${RECEIVER_OWNED_MAX}`);
+      }
+    });
   }
 }
 

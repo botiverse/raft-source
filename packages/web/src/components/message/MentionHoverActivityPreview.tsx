@@ -2,7 +2,7 @@ import { useIntl } from "react-intl";
 import { ChevronRight } from "lucide-react";
 import { Separator } from "@botiverse/raft-ui";
 import type { IntlShape } from "react-intl";
-import { formatActivityText, getActivityText } from "../../utils/activity";
+import { formatActivityText, freshnessHoldLabelId, getActivityText } from "../../utils/activity";
 import type { TrajectoryLogEntry } from "../../store/agentStore";
 import { getToolLogLabel, shouldHideToolStartInActivityLog } from "@botiverse/raft-shared";
 import type { AgentActivity } from "@botiverse/raft-shared";
@@ -27,9 +27,9 @@ interface MentionHoverActivityPreviewProps {
    * card, because that surface is the one that can dismiss it first — see the
    * `close()`-before-navigate rule the sibling mention/avatar clicks follow.
    *
-   * Optional: the card also renders where there is nothing to open (settings
-   * member graph), and the heading stays static text there rather than
-   * offering a dead click.
+   * Optional: the card also renders where there is nothing to open (no
+   * agent-activity handler from its host), and the heading stays static text
+   * there rather than offering a dead click.
    */
   onOpenActivity?: () => void;
 }
@@ -55,6 +55,9 @@ const PREVIEW_ENTRY_KINDS: ReadonlySet<string> = new Set(
 
 function isVisibleTrajectoryPreviewEntry(item: TrajectoryLogEntry): boolean {
   if (!PREVIEW_ENTRY_KINDS.has(item.entry.kind)) return false;
+  // A freshness hold arrives as a status row and an action entry with the
+  // same label; show it once, like the raw log.
+  if (item.entry.kind === "status" && item.entry.detailKind === "freshness_hold") return false;
   return item.entry.kind !== "tool_start" || !shouldHideToolStartInActivityLog(item.entry.toolName);
 }
 
@@ -71,7 +74,10 @@ function getTrajectoryPreviewText(item: TrajectoryLogEntry, formatMessage?: Intl
       return entry.text || (formatMessage
         ? formatMessage({ id: "mention.activity.output" })
         : "Output");
-    case "slock_action":
+    case "slock_action": {
+      const freshnessHold = freshnessHoldLabelId(entry.title);
+      return freshnessHold && formatMessage ? formatMessage({ id: freshnessHold }) : entry.title;
+    }
     case "system":
       return entry.title;
     case "compaction_started":
@@ -154,7 +160,7 @@ export default function MentionHoverActivityPreview({ entries, formatTimestamp, 
           {formatMessage({ id: "activity.preview.recentActivity" })}
         </SectionEyebrow>
       )}
-      <div className="space-y-1.5">
+      <div className="stack-y-1.5">
         {recentEntries.map((entry) => (
           <div
             key={entry.key}

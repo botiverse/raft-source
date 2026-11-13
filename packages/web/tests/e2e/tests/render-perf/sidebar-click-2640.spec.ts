@@ -58,14 +58,14 @@ async function createSiblingChannel(
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../../..");
 const PROBE_PATH = resolve(repoRoot, ".render-perf/probe.iife.js");
-const PROBE_BUILD_SCRIPT = resolve(repoRoot, "tests/render-perf/buildProbe.mjs");
+const PROBE_BUILD_SCRIPT = resolve(repoRoot, "tests/render-perf/buildProbe.ts");
 
 // The probe IIFE is a build artifact (gitignored) — esbuild-bundle the bippy
 // probe source on demand so CI doesn't need a separate pre-step. Cheap (~100ms)
 // and idempotent; only runs if the artifact is missing.
 test.beforeAll(() => {
   if (!existsSync(PROBE_PATH)) {
-    execFileSync("node", [PROBE_BUILD_SCRIPT], { cwd: repoRoot, stdio: "inherit" });
+    execFileSync("node", ["--import", "@oxc-node/core/register", PROBE_BUILD_SCRIPT], { cwd: repoRoot, stdio: "inherit" });
   }
 });
 

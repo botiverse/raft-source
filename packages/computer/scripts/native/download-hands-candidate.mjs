@@ -7,14 +7,32 @@ import { createHash } from 'node:crypto';
 import { isHandsStorageLocation } from './hands-artifacts.mjs';
 import { resolveAppAndChannel, versionCodeFromVersion } from './publish-hands-release.mjs';
 
-/** Promotion reads the already hosted candidate, never rebuilds it or consults
- * a legacy CDN namespace. Each downloaded file is checked before use. */
-export async function downloadHandsCandidate({ api, apiBase, appSlug, version, sourceCommit, dir, fetchImpl = fetch }) {
-  const { appId, channelId } = await resolveAppAndChannel(api, appSlug, 'alpha');
+/** Release candidates publish to the `candidate` Hands channel. Versions whose
+ * rc predates that channel were published to `alpha`; promotion falls back to
+ * it only when the candidate channel holds no release for the version. */
+export const DEFAULT_CANDIDATE_CHANNEL = 'candidate';
+export const LEGACY_CANDIDATE_CHANNEL = 'alpha';
+
+async function findCandidateReleases(api, appSlug, channelSlug, version) {
+  const { appId, channelId } = await resolveAppAndChannel(api, appSlug, channelSlug);
   const query = new URLSearchParams({ channel: channelId, product_type: 'cli-binary', release_type: 'stable', version_code: String(versionCodeFromVersion(version)) });
   const releases = (await api('GET', `/api/apps/${appId}/releases?${query}`)).releases;
-  const matches = (releases ?? []).filter(r => r.version_name === version && ['active', 'superseded'].includes(r.status));
-  if (matches.length !== 1) throw new Error('promotion requires one published alpha candidate');
+  return { appId, matches: (releases ?? []).filter(r => r.version_name === version && ['active', 'superseded'].includes(r.status)) };
+}
+
+/** Promotion reads the already hosted candidate, never rebuilds it or consults
+ * a legacy CDN namespace. Each downloaded file is checked before use. */
+export async function downloadHandsCandidate({ api, apiBase, appSlug, version, sourceCommit, dir, fetchImpl = fetch,
+  candidateChannel = DEFAULT_CANDIDATE_CHANNEL, fallbackChannel = LEGACY_CANDIDATE_CHANNEL }) {
+  let channel = candidateChannel;
+  let { appId, matches } = await findCandidateReleases(api, appSlug, channel, version);
+  // Only "no release for this version" falls back; an ambiguous candidate
+  // channel or a missing channel is an error, never a reason to read alpha.
+  if (matches.length === 0 && fallbackChannel && fallbackChannel !== candidateChannel) {
+    channel = fallbackChannel;
+    ({ appId, matches } = await findCandidateReleases(api, appSlug, channel, version));
+  }
+  if (matches.length !== 1) throw new Error(`promotion requires one published candidate for ${version} on ${candidateChannel}${channel !== candidateChannel ? ` or ${channel}` : ''}; found ${matches.length}`);
   const release = matches[0];
   const build = await api('GET', `/api/apps/${appId}/builds/${release.build_id}`);
   const provenance = typeof build.provenance_json === 'string' ? JSON.parse(build.provenance_json) : build.provenance_json;
@@ -59,5 +77,5 @@ export async function downloadHandsCandidate({ api, apiBase, appSlug, version, s
     if (size !== Number(asset.size_bytes) || hash.digest('hex') !== asset.file_hash) throw new Error('candidate bytes differ from frozen identity');
     downloaded.set(file, identity);
   }
-  return { manifestPath: join(dir, 'manifest.json'), artifactDir: dir };
+  return { manifestPath: join(dir, 'manifest.json'), artifactDir: dir, candidateChannel: channel };
 }

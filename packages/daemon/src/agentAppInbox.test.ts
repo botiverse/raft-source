@@ -555,6 +555,90 @@ test("ack writes durable exact source tombstone and a remint clears only that ex
   }
 });
 
+test("retire drops a durable item without acknowledging its source, across a restart, and a seal refuses it", () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "agent-app-inbox-retire-"));
+  const storage = createTestStorage(dir);
+  try {
+    let beforeAckCalls = 0;
+    const first = storeWithFixture({
+      storage,
+      ownerAgentId: "agent-a",
+      beforeAck: () => { beforeAckCalls += 1; return true; },
+    });
+    const retired = first.mint({ appId: "test.fixture", notificationClass: "due", sourceRef: REF_R1 });
+    const sealed = first.mint({ appId: "test.fixture", notificationClass: "due", sourceRef: REF_OTHER });
+    assert.equal(retired.ok && sealed.ok, true);
+    if (!retired.ok || !sealed.ok) return;
+    assert.equal(first.sealSources({
+      sources: [{ appId: sealed.item.appId, notificationClass: sealed.item.notificationClass, sourceRef: sealed.item.sourceRef }],
+      owner: "@Stone",
+      until: "release deployed",
+    })?.length, 1);
+
+    assert.equal(first.retire(retired.item.itemId), true);
+    assert.equal(first.retire(retired.item.itemId), false, "the store holds no such item any more");
+    assert.equal(first.retire(sealed.item.itemId), false, "a sealed item stays");
+    assert.equal(beforeAckCalls, 0, "the source is not asked: nothing was read");
+    assert.deepEqual(first.list().map((item) => item.itemId), [sealed.item.itemId]);
+    assert.deepEqual(first.listAcknowledgedSources(), [], "no ack is recorded, so none is sent to the Server");
+    assert.equal(first.isSourceAcknowledged({ appId: "test.fixture", notificationClass: "due", sourceRef: REF_R1 }), false);
+
+    const restored = createAgentAppInboxStore({ registry: FIXTURE_REGISTRY, storage });
+    assert.deepEqual(restored.list().map((item) => item.itemId), [sealed.item.itemId]);
+    assert.deepEqual(restored.listAcknowledgedSources(), []);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("dismiss removes like retire, records no acknowledged source, and is traced as dismissed", () => {
+  const traces: Array<{ name: string; attrs: Record<string, unknown> }> = [];
+  const store = storeWithFixture({ ownerAgentId: "agent-a", trace: (name, attrs) => { traces.push({ name, attrs }); } });
+  const minted = store.mint({ appId: "test.fixture", notificationClass: "over_threshold", sourceRef: REF_MEASURE_A });
+  if (!minted.ok) throw new Error(`mint failed: ${minted.message}`);
+  assert.equal(store.dismiss(minted.item.itemId), true);
+  assert.deepEqual(store.list(), []);
+  assert.deepEqual(store.listAcknowledgedSources(), []);
+  assert.equal(store.dismiss(minted.item.itemId), false, "nothing left to dismiss");
+  assert.deepEqual(
+    traces.filter((trace) => trace.name === "daemon.app_inbox.ack").map((trace) => trace.attrs.outcome),
+    ["dismissed"],
+  );
+});
+
+// The hosts tell an item that came back from one still held by its
+// createdAtMs (appInboxItemNoticed): the id is the same either way.
+test("createdAtMs is kept by a mint of an item the store still holds, and is new for a mint after the item was removed", () => {
+  let now = 1_000;
+  const store = storeWithFixture({ nowMs: () => now });
+  const mint = () => {
+    const minted = store.mint({ appId: "test.fixture", notificationClass: "over_threshold", sourceRef: REF_MEASURE_A });
+    if (!minted.ok) throw new Error(`mint failed: ${minted.message}`);
+    return minted.item;
+  };
+  const first = mint();
+  assert.equal(first.createdAtMs, 1_000);
+
+  now += 60_000;
+  const updated = mint();
+  assert.equal(updated.itemId, first.itemId);
+  assert.equal(updated.createdAtMs, 1_000, "an update in place keeps it");
+
+  for (const remove of [
+    () => store.ack(first.itemId),
+    () => store.retire(first.itemId),
+    () => store.dismiss(first.itemId),
+    () => store.dropTransient() === 1,
+    () => { store.clear(); return true; },
+  ]) {
+    assert.equal(remove(), true);
+    now += 60_000;
+    const again = mint();
+    assert.equal(again.itemId, first.itemId, "the same id as before");
+    assert.equal(again.createdAtMs, now, "minted anew");
+  }
+});
+
 test("transient items drop on process-boundary; until_source_read survives dropTransient", () => {
   let n = 0;
   const store = storeWithFixture({

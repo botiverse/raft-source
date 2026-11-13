@@ -1,3 +1,4 @@
+import { fillJointMembersFromChannelHumans } from "../test/jointMemberFill";
 import { createApiTest } from "../test/integration/apiTest";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
@@ -26,7 +27,7 @@ import {
   type AttachmentAuthorityPrincipal,
 } from "./attachmentAuthorityService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 async function seedUser(db: Database, label: string) {
   const suffix = randomUUID();
@@ -86,9 +87,6 @@ async function seedProjection(
     uploaderId: input.uploaderId,
     uploaderType: "user",
     filename: `${projectionId}.txt`,
-    mimeType: "text/plain",
-    sizeBytes: 8,
-    storageKey: `authority/${objectId}`,
     ...(input.revoked
       ? {
           revokedAt: new Date(),
@@ -113,7 +111,7 @@ async function readable(
   });
 }
 
-test("attachment authority characterizes public, private, DM, thread, user, agent, and server-scoped machine reads", async ({ app }) => {
+test("attachment authority characterizes public, private, DM, thread, user and agent reads, and refuses machine reads", async ({ app }) => {
   const db = getDb();
   const owner = await seedUser(db, "authority-owner");
   const deniedUser = await seedUser(db, "authority-denied");
@@ -170,7 +168,8 @@ test("attachment authority characterizes public, private, DM, thread, user, agen
   for (const projectionId of projections) {
     assert.ok(await readable(projectionId, server.id, { type: "user", id: owner.id }));
     assert.ok(await readable(projectionId, server.id, { type: "agent", id: allowedAgent.id }));
-    assert.ok(await readable(projectionId, server.id, { type: "machine", id: randomUUID() }));
+    // Machine credentials do not read attachments (#10670), on any server.
+    assert.equal(await readable(projectionId, server.id, { type: "machine", id: randomUUID() }), null);
     assert.equal(await readable(projectionId, otherServer.id, { type: "machine", id: randomUUID() }), null);
   }
 
@@ -180,6 +179,27 @@ test("attachment authority characterizes public, private, DM, thread, user, agen
     assert.equal(await readable(projectionId, server.id, { type: "user", id: deniedUser.id }), null);
     assert.equal(await readable(projectionId, server.id, { type: "agent", id: deniedAgent.id }), null);
   }
+});
+
+test("attachment authority pins agents to the request server: another server's agent or a deleted agent reads nothing", async ({ app }) => {
+  const db = getDb();
+  const owner = await seedUser(db, "authority-pin-owner");
+  const otherOwner = await seedUser(db, "authority-pin-other-owner");
+  const server = await createServer("Attachment Pin", `attachment-pin-${randomUUID()}`, owner.id);
+  const otherServer = await createServer("Attachment Pin Other", `attachment-pin-other-${randomUUID()}`, otherOwner.id);
+  const ownAgent = await seedAgent(db, server.id, "authority-pin-own-agent");
+  const otherServerAgent = await seedAgent(db, otherServer.id, "authority-pin-other-agent");
+  const deletedAgent = await seedAgent(db, server.id, "authority-pin-deleted-agent");
+  await db.update(agents).set({ deletedAt: new Date() }).where(eq(agents.id, deletedAgent.id));
+
+  const [publicChannel] = await db.insert(channels).values({ serverId: server.id, name: `authority-pin-public-${randomUUID()}`, type: "channel" }).returning();
+  const [message] = await db.insert(messages).values({ channelId: publicChannel.id, senderType: "user", senderId: owner.id, content: "public" }).returning();
+  const projectionId = await seedProjection(db, { messageId: message.id, channelId: publicChannel.id, serverId: server.id, uploaderId: owner.id });
+
+  assert.ok(await readable(projectionId, server.id, { type: "agent", id: ownAgent.id }), "witness: this server's agent reads it");
+  // canAgentAccessChannel used to answer true for a public channel and any agent id.
+  assert.equal(await readable(projectionId, server.id, { type: "agent", id: otherServerAgent.id }), null);
+  assert.equal(await readable(projectionId, server.id, { type: "agent", id: deletedAgent.id }), null);
 });
 
 test("attachment authority resolves both joint channel and joint thread faces without exposing canonical storage", async ({ app }) => {
@@ -215,6 +235,7 @@ test("attachment authority resolves both joint channel and joint thread faces wi
     { channelId: localA.id, agentId: agentA.id },
     { channelId: localB.id, agentId: agentB.id },
   ]);
+  await fillJointMembersFromChannelHumans();
 
   const [jointParent] = await db.insert(messages).values({
     channelId: canonical.id,
@@ -237,6 +258,7 @@ test("attachment authority resolves both joint channel and joint thread faces wi
     { jointChannelId: jointThread.id, serverId: serverA.id, localChannelId: localThreadA.id, role: "host", joinedByUserId: ownerA.id },
     { jointChannelId: jointThread.id, serverId: serverB.id, localChannelId: localThreadB.id, role: "participant", joinedByUserId: ownerB.id },
   ]);
+  await fillJointMembersFromChannelHumans();
 
   const [jointMessage, jointThreadMessage] = await db.insert(messages).values([
     { channelId: canonical.id, senderType: "user", senderId: ownerA.id, content: "joint message" },
@@ -263,8 +285,9 @@ test("attachment authority resolves both joint channel and joint thread faces wi
     const threadContext = await readable(jointThreadProjection, serverId, { type: "agent", id: agentId });
     assert.equal(channelContext?.localHostChannel.id, expectedChannelIds[0]);
     assert.equal(threadContext?.localHostChannel.id, expectedChannelIds[1]);
-    assert.ok(await readable(jointProjection, serverId, { type: "machine", id: randomUUID() }));
-    assert.ok(await readable(jointThreadProjection, serverId, { type: "machine", id: randomUUID() }));
+    // Machine credentials do not read attachments (#10670), joint faces included.
+    assert.equal(await readable(jointProjection, serverId, { type: "machine", id: randomUUID() }), null);
+    assert.equal(await readable(jointThreadProjection, serverId, { type: "machine", id: randomUUID() }), null);
   }
 
   assert.equal(await readable(jointProjection, serverB.id, { type: "user", id: ownerA.id }), null);
@@ -308,20 +331,18 @@ test("attachment authority fails closed for pending, revoked, missing-object, an
     uploaderId: owner.id,
     lifecycleState: "gc_pending",
   });
-  const legacyProjectionId = randomUUID();
-  await db.insert(attachments).values({
-    id: legacyProjectionId,
+  // A projection without an object cannot exist: object_id is NOT NULL.
+  await assert.rejects(db.insert(attachments).values({
+    id: randomUUID(),
+    objectId: null as unknown as string,
     messageId: message.id,
     channelId: channel.id,
     uploaderId: owner.id,
     uploaderType: "user",
     filename: "legacy.txt",
-    mimeType: "text/plain",
-    sizeBytes: 8,
-    storageKey: "authority/legacy",
-  });
+  }));
 
-  for (const projectionId of [pending, revoked, gcPending, legacyProjectionId, randomUUID()]) {
+  for (const projectionId of [pending, revoked, gcPending, randomUUID()]) {
     assert.equal(await resolveBoundAttachmentAuthorityContext({
       projectionId,
       requestServerId: asServerId(server.id),

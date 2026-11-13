@@ -17,6 +17,11 @@
  *
  *   const session = await runDeviceCodeLogin({ serverUrl, onUserAction });
  *
+ * That session flow is what `raft agent list` uses to read the agents a
+ * person may key. `raft agent login start` / `wait` instead ask for an
+ * `agent_key` grant (`authorizeDeviceCode({ grant })` + `pollAgentKey`): the
+ * token poll answers with the agent's own `sk_agent_*` once, never a session.
+ *
  * `onUserAction` is invoked once the server has returned the
  * verification URI + user_code so the caller can render
  * "Open <uri>, enter <code>". This separates UX from transport so
@@ -25,16 +30,15 @@
 
 import { undiciFetch as fetch } from "../proxy";
 
+/**
+ * What a person needs to approve the login: the approval page's fixed address
+ * and the code to type there. Never a link with the code in it (RFC 8628
+ * `verification_uri_complete`): such a link lets someone send a person a
+ * login of theirs to approve in one click, so the CLI ignores one even from
+ * a server that still sends it, and the approval page never reads it.
+ */
 export interface DeviceCodeLoginUserAction {
   verificationUri: string;
-  /**
-   * RFC 8628 `verification_uri_complete` — the verification URI with the
-   * user_code pre-filled as a query param. When present this is the single
-   * link to hand the user (they click + approve, no code typing). The server
-   * builds it (`deviceAuth.ts` buildVerificationUri) and the web approval
-   * page reads `?user_code=` to pre-fill (`DeviceLoginPage.tsx`).
-   */
-  verificationUriComplete?: string;
   userCode: string;
   expiresInSeconds: number;
 }
@@ -48,10 +52,47 @@ export interface DeviceAuthorization {
   deviceCode: string;
   userCode: string;
   verificationUri: string;
-  verificationUriComplete?: string;
   expiresInSeconds: number;
   intervalMs: number;
 }
+
+/** The client name the raft CLI gives the approval page when the caller names none. */
+export const DEFAULT_DEVICE_LOGIN_CLIENT_NAME = "raft-cli";
+
+/**
+ * A one-time `agent_key` grant (server `deviceLoginGrantService`): the person
+ * approving picks the agent on the page, and the token poll returns that
+ * agent's own key. `agentId` only names the agent asked for; the page never
+ * lets it steer the pick. The machine fields are shown to the person as the
+ * requester's own (unverified) account of itself.
+ */
+export interface AgentKeyGrantRequest {
+  kind: "agent_key";
+  machineName: string;
+  hostname: string | null;
+  os: string | null;
+  agentId?: string;
+}
+
+/** The key an approved `agent_key` grant returns, exactly once. */
+export interface AgentKeyCredential {
+  credentialId: string;
+  apiKey: string;
+  scopes: string[];
+  agentId: string;
+  agentName: string;
+  serverId: string;
+}
+
+/**
+ * What the token poll gave for an `agent_key` login. A server from before
+ * one-time grants ignores `grant` and answers with a device session instead;
+ * that answer is told apart by its shape (no `kind: "agent_key"`), and only
+ * then is it read as a session.
+ */
+export type AgentKeyTokenResult =
+  | { kind: "agent_key"; credential: AgentKeyCredential }
+  | { kind: "legacy_session"; session: DeviceCodeLoginResult };
 
 export interface RunDeviceCodeLoginOptions {
   serverUrl: string;
@@ -110,6 +151,7 @@ const ACTIONABLE_ERROR_MESSAGES: Record<string, string> = {
   device_code_consumed: "This login code has already been used. Run `raft agent login` again.",
   device_code_invalid:
     "Unknown / malformed device code. Run `raft agent login` again to start a fresh flow.",
+  token_response_invalid: "The server's answer to the login was not a usable agent key or session. Nothing was saved.",
 };
 
 export function describeDeviceCodeLoginError(code: string): string {
@@ -141,9 +183,6 @@ export async function runDeviceCodeLogin(
   // --- step 2: hand the verification surface to the caller ---
   await options.onUserAction({
     verificationUri: authorization.verificationUri,
-    ...(authorization.verificationUriComplete
-      ? { verificationUriComplete: authorization.verificationUriComplete }
-      : {}),
     userCode: authorization.userCode,
     expiresInSeconds: authorization.expiresInSeconds,
   });
@@ -172,6 +211,8 @@ export async function runDeviceCodeLogin(
 export async function authorizeDeviceCode(options: {
   serverUrl: string;
   clientName?: string;
+  /** Ask for a one-time grant instead of a device session. */
+  grant?: AgentKeyGrantRequest;
   fetchImpl?: typeof fetch;
 }): Promise<DeviceAuthorization> {
   const httpFetch = options.fetchImpl ?? fetch;
@@ -181,7 +222,8 @@ export async function authorizeDeviceCode(options: {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
-      ...(options.clientName ? { clientName: options.clientName } : {}),
+      clientName: options.clientName || DEFAULT_DEVICE_LOGIN_CLIENT_NAME,
+      ...(options.grant ? { grant: options.grant } : {}),
     }),
   });
   if (!authorizeRes.ok) {
@@ -195,7 +237,6 @@ export async function authorizeDeviceCode(options: {
     deviceCode?: string;
     userCode?: string;
     verificationUri?: string;
-    verificationUriComplete?: string;
     expiresIn?: number;
     interval?: number;
   };
@@ -213,12 +254,17 @@ export async function authorizeDeviceCode(options: {
     deviceCode: authorizeBody.deviceCode,
     userCode: authorizeBody.userCode,
     verificationUri: absolutize(authorizeBody.verificationUri),
-    ...(authorizeBody.verificationUriComplete
-      ? { verificationUriComplete: absolutize(authorizeBody.verificationUriComplete) }
-      : {}),
     expiresInSeconds: authorizeBody.expiresIn ?? 600,
     intervalMs: (authorizeBody.interval ?? 5) * 1000,
   };
+}
+
+interface PollOptions {
+  serverUrl: string;
+  deviceCode: string;
+  pollIntervalMs: number;
+  deadlineMs: number;
+  fetchImpl?: typeof fetch;
 }
 
 /**
@@ -229,13 +275,69 @@ export async function authorizeDeviceCode(options: {
  *
  * Throws `DeviceCodeLoginError` with a stable `code` on terminal failure.
  */
-export async function pollDeviceToken(options: {
-  serverUrl: string;
-  deviceCode: string;
-  pollIntervalMs: number;
-  deadlineMs: number;
-  fetchImpl?: typeof fetch;
-}): Promise<DeviceCodeLoginResult> {
+export async function pollDeviceToken(options: PollOptions): Promise<DeviceCodeLoginResult> {
+  const session = readSession(await pollTokenAnswer(options));
+  if (!session) {
+    throw new DeviceCodeLoginError(
+      "token_response_invalid",
+      "Server's token response was missing accessToken / refreshToken / userId.",
+    );
+  }
+  return session;
+}
+
+/**
+ * Step 3 for an `agent_key` login: poll until approved, then return the key
+ * the server issued (or, from a server older than one-time grants, the device
+ * session it answered with instead). The key is returned exactly once by the
+ * server; the caller must save it or lose it.
+ *
+ * Throws `DeviceCodeLoginError` with a stable `code` on terminal failure.
+ */
+export async function pollAgentKey(options: PollOptions): Promise<AgentKeyTokenResult> {
+  const body = await pollTokenAnswer(options);
+  if (body?.kind === "agent_key") {
+    const credential = readAgentKeyCredential(body);
+    if (!credential) {
+      throw new DeviceCodeLoginError("token_response_invalid", describeDeviceCodeLoginError("token_response_invalid"));
+    }
+    return { kind: "agent_key", credential };
+  }
+  // Only an answer that is not a grant answer is ever read as a session.
+  const session = body && body.kind === undefined ? readSession(body) : null;
+  if (!session) {
+    throw new DeviceCodeLoginError("token_response_invalid", describeDeviceCodeLoginError("token_response_invalid"));
+  }
+  return { kind: "legacy_session", session };
+}
+
+function readAgentKeyCredential(body: Record<string, unknown>): AgentKeyCredential | null {
+  const { credentialId, apiKey, scopes, agentId, agentName, serverId } = body;
+  if (
+    typeof apiKey !== "string" || !/^sk_agent_[A-Za-z0-9_-]+$/.test(apiKey)
+    || typeof credentialId !== "string" || !credentialId
+    || typeof agentId !== "string" || !agentId
+    || typeof agentName !== "string"
+    || typeof serverId !== "string" || !serverId
+    || !Array.isArray(scopes) || !scopes.every((scope) => typeof scope === "string")
+  ) {
+    return null;
+  }
+  return { credentialId, apiKey, scopes: scopes as string[], agentId, agentName, serverId };
+}
+
+function readSession(body: Record<string, unknown> | null): DeviceCodeLoginResult | null {
+  const { accessToken, refreshToken, userId } = body ?? {};
+  if (typeof accessToken !== "string" || !accessToken
+    || typeof refreshToken !== "string" || !refreshToken
+    || typeof userId !== "string" || !userId) {
+    return null;
+  }
+  return { accessToken, refreshToken, userId };
+}
+
+/** Poll until a 200 and return its JSON body (null when unparsable). */
+async function pollTokenAnswer(options: PollOptions): Promise<Record<string, unknown> | null> {
   const httpFetch = options.fetchImpl ?? fetch;
   const base = options.serverUrl.replace(/\/+$/, "");
 
@@ -255,22 +357,7 @@ export async function pollDeviceToken(options: {
       continue;
     }
     if (tokenRes.ok) {
-      const tokenBody = (await tokenRes.json()) as {
-        accessToken?: string;
-        refreshToken?: string;
-        userId?: string;
-      };
-      if (!tokenBody.accessToken || !tokenBody.refreshToken || !tokenBody.userId) {
-        throw new DeviceCodeLoginError(
-          "token_response_invalid",
-          "Server's token response was missing accessToken / refreshToken / userId.",
-        );
-      }
-      return {
-        accessToken: tokenBody.accessToken,
-        refreshToken: tokenBody.refreshToken,
-        userId: tokenBody.userId,
-      };
+      return safeJson(tokenRes);
     }
     const tokenError = await safeJson(tokenRes);
     const code = typeof tokenError?.code === "string" ? tokenError.code : "token_failed";

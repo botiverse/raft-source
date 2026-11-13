@@ -4,7 +4,7 @@ import path from "node:path";
 import { hydrateRuntimeConfig, runtimeConfigToLaunchFields, type AgentConfig } from "@botiverse/raft-shared";
 import { isClaudeCustomProviderConfig } from "./claudeProviderIsolation";
 import type { RuntimeProbeResult } from "./types";
-import { firstExistingPath, formatCommandLookupTiming, lookupCommandOnPath, lookupCommandOnPathAsync, readCommandVersion, resolveHomePath, type CommandLookup, type ProbeDeps } from "./probe";
+import { firstExistingPath, formatCommandLookupTiming, lookupCommandOnPath, lookupCommandOnPathAsync, readCommandVersion, readCommandVersionAsync, resolveHomePath, type CommandLookup, type ProbeDeps } from "./probe";
 import { resolveRuntimeLaunch, resolveWindowsDirectLaunch, type DirectLaunch, type WindowsLaunchDeps } from "./windowsLaunch";
 
 export const CLAUDE_DESKTOP_CLI_RELATIVE_PATH = path.join("Applications", "Claude Code URL Handler.app", "Contents", "MacOS", "claude");
@@ -17,6 +17,16 @@ export const CLAUDE_DISALLOWED_TOOLS = [
   "CronCreate",
   "CronList",
   "CronDelete",
+  // claude.ai Artifact tools, offered once the session is labelled `raft`
+  // rather than `sdk-cli` (#triage:c73bf864): publishing there leaves the
+  // work on the operator's claude.ai account, out of sight in Raft.
+  "Artifact",
+  "ArtifactComments",
+  "ArtifactData",
+  "ArtifactCheck",
+  // Also on for a `raft` label: files feedback, optionally with the session
+  // transcript, to Anthropic (gated on their side; #proj-raft-computer:bbea62a0).
+  "SendFeedback",
 ].join(",");
 
 export function resolveClaudeCommand(deps: ProbeDeps = {}): string | null {
@@ -50,6 +60,18 @@ async function lookupClaudeCommandAsync(deps: ProbeDeps): Promise<CommandLookup>
     CLAUDE_DESKTOP_CLI_SYSTEM_PATH,
   ], deps);
   return desktop ? { command: desktop } : lookup;
+}
+
+/** {@link resolveClaudeCommand} off the event loop: the host's own `claude`, ignoring any agent's configured command. */
+export async function resolveClaudeCommandAsync(deps: ProbeDeps = {}): Promise<string | null> {
+  return (await lookupClaudeCommandAsync(deps)).command;
+}
+
+/** The host's own `claude` and what `claude --version` prints (null when that read failed); null when it is not installed. */
+export async function readClaudeInstallationAsync(deps: ProbeDeps = {}): Promise<{ command: string; version: string | null } | null> {
+  const command = await resolveClaudeCommandAsync(deps);
+  if (!command) return null;
+  return { command, version: await readCommandVersionAsync(command, [], deps) };
 }
 
 /** task #1277 — {@link resolveClaudeLaunchCommand} off the event loop; a configured command needs no lookup. */

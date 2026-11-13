@@ -6,16 +6,20 @@ import {
   currentDate,
   setClockTimeout,
 } from "@botiverse/raft-shared";
-import { and, eq, gt, isNull, lte, or } from "drizzle-orm";
+import { and, eq, isNull, lte, or, sql } from "drizzle-orm";
 
 import { getDb, type Database, type DatabaseTransaction } from "../db/index";
+import { getRedis, isRedisAvailable } from "../redis";
+import { claimSlackMentionReconcile, redisSlackMentionReconcileClaimStore, releaseSlackMentionReconcileClaim, type SlackMentionReconcileClaim } from "./slackMentionReconcileClaim";
 import {
   externalAppCredentials,
   externalAppInstalls,
+  externalAppRegistrations,
   externalChannelBindings,
   externalMessageLinks,
+  slackUsergroupIdentities,
 } from "../db/schema";
-import type { SlackAudienceCredentialResolver } from "./slackAudienceRefreshService";
+import type { SlackAudienceCredentialResolver } from "./slackProviderAdapter";
 import type { SlackBridgeCredentialCipher } from "./slackBridgeEnvSecrets";
 import type { ExternalAttachmentAuthority } from "./externalAttachmentProviderAdapter";
 import {
@@ -36,9 +40,12 @@ import type {
   SlackBridgeProvisioningProviderAuthority,
   SlackBridgeProvisioningProviderResult,
   SlackBridgeProvisioningProviderUser,
+  SlackBridgeWorkspaceDirectory,
+  SlackBridgeWorkspaceObservation,
 } from "./slackBridgeProvisioningControlPlane";
 import {
   SLACK_BRIDGE_CREDENTIAL_LEASE_SCHEMA,
+  renderSlackBridgeUsername,
   type SlackBridgeCredentialHandle,
   type SlackJsonObject,
   type SlackProviderAuthorityFence,
@@ -51,6 +58,18 @@ import {
   findAnyCurrentExternalInstallServerGrantAuthority,
   resolveExternalInstallServerGrantAuthority,
 } from "./externalInstallServerGrantAuthority";
+import { traceSlackWebApiRequest } from "./slackWebApiTrace";
+import { lockSlackInstallCredential, type SlackCredentialLockRequest } from "./slackBridgeRowLocks";
+import {
+  type SlackUsergroupIdentity,
+  bindSlackUsergroupIdentity,
+  listSlackUsergroupIdentities,
+  reserveSlackUsergroupIdentity,
+  setCanonicalSlackHumanUsergroup,
+  slackUsergroupDescription,
+  slackUsergroupIdentityMarker,
+  slackUsergroupRecoveryDescription,
+} from "./slackUsergroupIdentityStore";
 import {
   parseSlackAgentUsergroupMarker,
   parseSlackHumanUsergroupMarker,
@@ -60,11 +79,20 @@ import {
   slackAgentHandleCandidates,
   slackAgentUsergroupMarker,
   slackHumanHandleCandidates,
-  slackHumanUsergroupMarker,
 } from "./slackMentionTokens";
+
+import {
+  slackHumanMentionSnapshotSchema, slackMentionWriteFailuresSchema, slackMentionFingerprint,
+  slackMentionCapabilitySchema, SlackMentionUnsupportedError, newSlackMentionAuthorizationId,
+  SLACK_MENTION_FAILURE_BACKOFF_MS, SLACK_HUMAN_RECONCILE_INTERVAL_MS, SlackMentionRateLimitedError,
+} from "./slackMentionReconcileState";
+
+const localMentionWorkspaceClaims = new Map<string, string>();
 
 const DEFAULT_CREDENTIAL_LEASE_TTL_MS = 60_000;
 const DEFAULT_FETCH_TIMEOUT_MS = 15_000;
+// A joined-member lookup runs before the Events API acknowledgement.
+const JOIN_PROFILE_FETCH_TIMEOUT_MS = 1_500;
 const DEFAULT_ATTACHMENT_DOWNLOAD_TIMEOUT_MS = 5 * 60_000;
 const MAX_PROVIDER_REQUEST_BYTES = 256 * 1024;
 const MAX_PROVIDER_RESPONSE_BYTES = 1_000_000;
@@ -89,6 +117,7 @@ const SLACK_QUERY_METHODS = new Set([
   "conversations.replies",
   "reactions.get",
   "usergroups.list",
+  "bots.info",
   "users.info",
 ]);
 
@@ -125,8 +154,22 @@ export interface SlackBridgeAudienceProviderRuntime {
   stop(): Promise<void>;
 }
 
+/** How a revoke of an install's stored token at Slack went (the closed-server purge). */
+export type SlackInstallTokenRevokeOutcome =
+  | { kind: "revoked" }
+  /** No credential row, or its material does not unseal: nothing Raft holds to revoke. */
+  | { kind: "no_credential" }
+  | { kind: "failed"; failure: string };
+
 export interface SlackBridgeProviderRuntime extends SlackBridgeAudienceProviderRuntime {
   provisioningProvider: SlackBridgeProvisioningProvider;
+  /**
+   * auth.revoke for an install's stored bot token, for the closed-server
+   * purge: it needs no live server authority (the server is closed), only the
+   * install's credential. A token Slack already treats as dead counts as
+   * revoked. One call; the caller decides on retries.
+   */
+  revokeInstallToken(installId: string): Promise<SlackInstallTokenRevokeOutcome>;
   resolveUsers(
     authority: SlackBridgeProvisioningProviderAuthority,
     providerUserIds: readonly string[],
@@ -278,22 +321,16 @@ function slackUsergroupNameCandidates(input: {
   displayName: string;
   serverName: string;
   serverSlug: string;
-  id: string;
   label: string;
 }): string[] {
-  // Slack autocomplete shows usergroup *names* workspace-wide; carrying the
-  // Raft server name in the name makes principals from other servers on a
-  // shared Slack workspace self-evident ("Huarong (agent) · botiverse"). Agent
-  // names keep the " (agent)" label in every variant so Slack users can tell
-  // Agents from humans. The handle stays the bare Raft handle either way.
-  const bare = Array.from(input.displayName.trim())
-    .slice(0, SLACK_USERGROUP_NAME_LIMIT - input.label.length)
-    .join("");
+  // Names are visible workspace-wide. Keep the Raft server in every variant
+  // and disambiguate collisions without exposing a member's internal UUID.
   return [...new Set([
     slackUsergroupNameWithSuffix(input.displayName, input.serverName, input.label),
     slackUsergroupNameWithSuffix(input.displayName, input.serverSlug, input.label),
-    slackUsergroupNameWithSuffix(input.displayName, input.id.slice(0, 8), input.label),
-    bare ? `${bare}${input.label}` : "",
+    ...[2, 3, 4, 5].map((ordinal) => slackUsergroupNameWithSuffix(
+      input.displayName, `${input.serverName} (${ordinal})`, input.label,
+    )),
   ].filter(Boolean))];
 }
 
@@ -307,7 +344,6 @@ function slackAgentMentionPrincipal(candidate: SlackBridgeAgentMentionCandidate)
       displayName: candidate.displayName,
       serverName: candidate.serverName,
       serverSlug: candidate.serverSlug,
-      id: candidate.agentId,
       label: SLACK_AGENT_USERGROUP_NAME_LABEL,
     }),
   };
@@ -317,13 +353,12 @@ function slackHumanMentionPrincipal(candidate: SlackBridgeHumanMentionCandidate)
   return {
     kind: "user",
     id: candidate.userId,
-    marker: slackHumanUsergroupMarker(candidate.serverId, candidate.userId),
+    marker: `workspace-user:${candidate.userId}`,
     handleCandidates: slackHumanHandleCandidates(candidate),
     nameCandidates: slackUsergroupNameCandidates({
       displayName: candidate.displayName,
-      serverName: candidate.serverName,
-      serverSlug: candidate.serverSlug,
-      id: candidate.userId,
+      serverName: "Raft",
+      serverSlug: "raft",
       label: "",
     }),
   };
@@ -405,6 +440,104 @@ function providerQuery(body: Record<string, unknown>): string | null {
  * tokens remain encrypted at rest with an env master key; plaintext exists
  * only inside a claimed lease and is released before provider I/O.
  */
+/** A failed channel listing must not erase a successful, identity-matched auth.test. */
+export async function readSlackWorkspaceObservation(
+  authority: SlackBridgeProvisioningProviderAuthority,
+  query: (method: string, body: Record<string, unknown>) => Promise<SlackBridgeProvisioningProviderResult<Record<string, unknown>>>,
+): Promise<SlackBridgeWorkspaceObservation> {
+  const auth = await query("auth.test", {}).catch(() => ({ kind: "unverified" as const }));
+  if (auth.kind !== "fact") return { oauth: auth.kind, directory: { kind: "unverified" } };
+  const observedTeamId = auth.fact.team_id;
+  const observedAppId = auth.fact.api_app_id;
+  const observedBotUserId = auth.fact.user_id;
+  if (
+    observedTeamId !== authority.providerAuthorityId
+    || (observedAppId !== undefined && observedAppId !== authority.providerAppId)
+    || (observedBotUserId !== undefined && observedBotUserId !== authority.botUserId)
+  ) return { oauth: "failed", directory: { kind: "unverified" } };
+  const directory = await (async (): Promise<SlackBridgeProvisioningProviderResult<SlackBridgeWorkspaceDirectory>> => {
+    const workspaceName = nonEmpty(auth.fact.team, 512) ? auth.fact.team : null;
+    const channels = new Map<string, {
+      id: string;
+      name: string;
+      privacyClass: "public" | "private";
+      isMember: boolean;
+    }>();
+    const seenCursors = new Set<string>();
+    let cursor: string | null = null;
+    for (let page = 0; page < MAX_PROVIDER_PAGES; page += 1) {
+      const body: Record<string, unknown> = {
+        exclude_archived: true,
+        limit: 200,
+        types: "public_channel,private_channel",
+      };
+      if (cursor) body.cursor = cursor;
+      const response = await query("conversations.list", body);
+      if (response.kind !== "fact") return response;
+      if (!Array.isArray(response.fact.channels)) return { kind: "unverified" };
+      for (const item of response.fact.channels) {
+        if (!record(item)) return { kind: "unverified" };
+        if (item.is_archived === true) continue;
+        if (!nonEmpty(item.id, 160) || !nonEmpty(item.name, 512) || typeof item.is_private !== "boolean") {
+          return { kind: "unverified" };
+        }
+        const privacyClass = item.is_private === true ? "private" as const : "public" as const;
+        const isMember = item.is_member === true;
+        const previous = channels.get(item.id);
+        if (previous && (
+          previous.name !== item.name
+          || previous.privacyClass !== privacyClass
+          || previous.isMember !== isMember
+        )) {
+          return { kind: "unverified" };
+        }
+        channels.set(item.id, { id: item.id, name: item.name, privacyClass, isMember });
+      }
+      const next = nextCursor(response.fact);
+      if (next === undefined) return { kind: "unverified" };
+      if (next === null) {
+        return {
+          kind: "fact",
+          fact: {
+            workspaceName,
+            channels: [...channels.values()].sort((left, right) => left.id.localeCompare(right.id)),
+          },
+        };
+      }
+      if (seenCursors.has(next)) return { kind: "unverified" };
+      seenCursors.add(next);
+      cursor = next;
+    }
+    return { kind: "unverified" };
+  })().catch(() => ({ kind: "unverified" as const }));
+  return { oauth: "passed", directory };
+}
+
+export async function readSlackConversationMember(
+  input: { providerConversationId: string; providerUserId: string },
+  query: (body: Record<string, unknown>) => Promise<SlackBridgeProvisioningProviderResult<Record<string, unknown>>>,
+): Promise<SlackBridgeProvisioningProviderResult<boolean>> {
+  if (!nonEmpty(input.providerConversationId, 160) || !nonEmpty(input.providerUserId, 160)) return { kind: "unverified" };
+  const cursors = new Set<string>();
+  let cursor: string | null = null;
+  for (let page = 0; page < MAX_PROVIDER_PAGES; page += 1) {
+    const body: Record<string, unknown> = { channel: input.providerConversationId, limit: 200 };
+    if (cursor) body.cursor = cursor;
+    const response = await query(body);
+    if (response.kind !== "fact") return response;
+    if (!Array.isArray(response.fact.members)
+      || response.fact.members.some(value => !nonEmpty(value, 160))) return { kind: "unverified" };
+    if (response.fact.members.includes(input.providerUserId)) return { kind: "fact", fact: true };
+    const next = nextCursor(response.fact);
+    if (next === undefined) return { kind: "unverified" };
+    if (next === null) return { kind: "fact", fact: false };
+    if (cursors.has(next)) return { kind: "unverified" };
+    cursors.add(next);
+    cursor = next;
+  }
+  return { kind: "unverified" };
+}
+
 export function createSlackBridgeProviderRuntime(
   dependencies: SlackBridgeProviderRuntimeDependencies,
 ): SlackBridgeProviderRuntime {
@@ -449,71 +582,41 @@ export function createSlackBridgeProviderRuntime(
     ));
   };
 
+  // Lock order: slackBridgeRowLocks.ts (install, binding, credential, grant).
   const selectCredential = async (
     tx: Tx,
-    request: {
-      installId: string;
-      providerAppId: string;
-      providerAuthorityId: string;
-      connectionEpoch: number;
-      credentialRevision: number;
-      binding?: Pick<SlackProviderAuthorityFence, "bindingId" | "bindingEpoch" | "providerConversationId">;
-    },
+    request: SlackCredentialLockRequest,
     requestedAt: Date,
   ) => {
-    const fields = {
-      serverId: externalAppInstalls.serverId,
-      installId: externalAppInstalls.id,
-      registrationId: externalAppInstalls.registrationId,
-      installState: externalAppInstalls.state,
-      providerAppId: externalAppInstalls.providerAppId,
-      providerTeamId: externalAppInstalls.providerTeamId,
-      providerAuthorityId: externalAppInstalls.providerAuthorityId,
-      botUserId: externalAppInstalls.botUserId,
-      connectionEpoch: externalAppInstalls.connectionEpoch,
-      installCredentialRevision: externalAppInstalls.credentialRevision,
-      credentialId: externalAppCredentials.id,
-      credentialState: externalAppCredentials.state,
-      encryptedMaterial: externalAppCredentials.encryptedMaterial,
-      envelopeKeyId: externalAppCredentials.envelopeKeyId,
-      aadVersion: externalAppCredentials.aadVersion,
-      credentialRevision: externalAppCredentials.credentialRevision,
+    const locked = await lockSlackInstallCredential(tx, request, requestedAt);
+    if (!locked) return [];
+    const { install, binding, credential } = locked;
+    const row = {
+      serverId: install.serverId,
+      installId: install.id,
+      registrationId: install.registrationId,
+      installState: install.state,
+      providerAppId: install.providerAppId,
+      providerTeamId: install.providerTeamId,
+      providerAuthorityId: install.providerAuthorityId,
+      botUserId: install.botUserId,
+      connectionEpoch: install.connectionEpoch,
+      installCredentialRevision: install.credentialRevision,
+      credentialId: credential.id,
+      credentialState: credential.state,
+      encryptedMaterial: credential.encryptedMaterial,
+      envelopeKeyId: credential.envelopeKeyId,
+      aadVersion: credential.aadVersion,
+      credentialRevision: credential.credentialRevision,
     };
-    const common = and(
-      eq(externalAppInstalls.id, request.installId),
-      eq(externalAppInstalls.state, "active"),
-      eq(externalAppInstalls.providerAppId, request.providerAppId),
-      eq(externalAppInstalls.providerAuthorityId, request.providerAuthorityId),
-      eq(externalAppInstalls.connectionEpoch, request.connectionEpoch),
-      eq(externalAppInstalls.credentialRevision, request.credentialRevision),
-      eq(externalAppCredentials.state, "active"),
-      eq(externalAppCredentials.credentialRevision, request.credentialRevision),
-      or(isNull(externalAppCredentials.expiresAt), gt(externalAppCredentials.expiresAt, requestedAt)),
-      or(isNull(externalAppCredentials.leaseExpiresAt), lte(externalAppCredentials.leaseExpiresAt, requestedAt)),
-    );
-    if (request.binding) {
-      return tx.select({
-        ...fields,
-        bindingServerId: externalChannelBindings.serverId,
-        bindingRegistrationId: externalChannelBindings.registrationId,
-        bindingGrantEpoch: externalChannelBindings.grantEpoch,
-      }).from(externalAppCredentials)
-        .innerJoin(externalAppInstalls, eq(externalAppInstalls.id, externalAppCredentials.installId))
-        .innerJoin(externalChannelBindings, and(
-          eq(externalChannelBindings.id, request.binding.bindingId),
-          eq(externalChannelBindings.installId, externalAppInstalls.id),
-        ))
-        .where(and(
-          common,
-          eq(externalChannelBindings.state, "active"),
-          eq(externalChannelBindings.providerConversationId, request.binding.providerConversationId),
-          eq(externalChannelBindings.connectionEpoch, request.connectionEpoch),
-          eq(externalChannelBindings.bindingEpoch, request.binding.bindingEpoch),
-        )).for("update").limit(2);
-    }
-    return tx.select(fields).from(externalAppCredentials)
-      .innerJoin(externalAppInstalls, eq(externalAppInstalls.id, externalAppCredentials.installId))
-      .where(common).for("update").limit(2);
+    return [binding
+      ? {
+          ...row,
+          bindingServerId: binding.serverId,
+          bindingRegistrationId: binding.registrationId,
+          bindingGrantEpoch: binding.grantEpoch,
+        }
+      : row];
   };
 
   const claimCredential = async (
@@ -618,6 +721,7 @@ export function createSlackBridgeProviderRuntime(
     method: string;
     body: Record<string, unknown>;
     accessToken: string;
+    timeoutMs?: number;
   }): Promise<SlackWebApiTransportResult> => {
     const queryMethod = SLACK_QUERY_METHODS.has(input.method);
     const requestBody = queryMethod ? providerQuery(input.body) : JSON.stringify(input.body);
@@ -626,9 +730,28 @@ export function createSlackBridgeProviderRuntime(
     }
     const requestUrl = `https://slack.com/api/${input.method}`
       + (queryMethod && requestBody ? `?${requestBody}` : "");
+    // One client span per outbound Web API request (method, status, 429,
+    // Retry-After); before_send rejections above never reach Slack.
+    return traceSlackWebApiRequest(input.method, () => sendWithToken({
+      accessToken: input.accessToken,
+      queryMethod,
+      requestBody,
+      requestUrl,
+      timeoutMs: input.timeoutMs,
+    }));
+  };
+
+  const sendWithToken = async (input: {
+    accessToken: string;
+    queryMethod: boolean;
+    requestBody: string;
+    requestUrl: string;
+    timeoutMs?: number;
+  }): Promise<SlackWebApiTransportResult> => {
+    const { queryMethod, requestBody, requestUrl } = input;
     const controller = new AbortController();
     providerAbortControllers.add(controller);
-    const timeout = setClockTimeout(() => controller.abort(), fetchTimeoutMs);
+    const timeout = setClockTimeout(() => controller.abort(), Math.min(input.timeoutMs ?? fetchTimeoutMs, fetchTimeoutMs));
     let receivedHeaders = false;
     try {
       const response = await fetcher(requestUrl, {
@@ -679,46 +802,39 @@ export function createSlackBridgeProviderRuntime(
 
   const resolveAttachmentCredentialRequest = async (authority: ExternalAttachmentAuthority) => {
     if (authority.provider !== "slack" || authority.workspaceId !== authority.providerAuthorityId) return null;
+    const [historical] = await db.select({ channelId: externalChannelBindings.channelId,
+      environment: externalAppRegistrations.environment }).from(externalChannelBindings)
+      .innerJoin(externalAppInstalls, eq(externalAppInstalls.id, externalChannelBindings.installId))
+      .innerJoin(externalAppRegistrations, eq(externalAppRegistrations.id, externalChannelBindings.registrationId))
+      .where(and(eq(externalChannelBindings.id, authority.bindingId),
+        eq(externalChannelBindings.installId, authority.installId),
+        eq(externalChannelBindings.registrationId, authority.appRegistrationId),
+        eq(externalChannelBindings.providerConversationId, authority.providerConversationId),
+        eq(externalAppInstalls.providerAuthorityId, authority.providerAuthorityId),
+        eq(externalAppRegistrations.provider, "slack"))).limit(1);
+    if (!historical) return null;
     const rows = await db.select({
-      installId: externalAppInstalls.id,
-      registrationId: externalAppInstalls.registrationId,
-      installState: externalAppInstalls.state,
-      providerAppId: externalAppInstalls.providerAppId,
-      providerAuthorityId: externalAppInstalls.providerAuthorityId,
-      connectionEpoch: externalAppInstalls.connectionEpoch,
-      credentialRevision: externalAppInstalls.credentialRevision,
-      bindingId: externalChannelBindings.id,
-      bindingState: externalChannelBindings.state,
-      providerConversationId: externalChannelBindings.providerConversationId,
-      bindingConnectionEpoch: externalChannelBindings.connectionEpoch,
-      bindingEpoch: externalChannelBindings.bindingEpoch,
+      installId: externalAppInstalls.id, providerAppId: externalAppInstalls.providerAppId,
+      providerAuthorityId: externalAppInstalls.providerAuthorityId, connectionEpoch: externalAppInstalls.connectionEpoch,
+      credentialRevision: externalAppInstalls.credentialRevision, bindingId: externalChannelBindings.id,
+      providerConversationId: externalChannelBindings.providerConversationId, bindingEpoch: externalChannelBindings.bindingEpoch,
     }).from(externalAppInstalls)
       .innerJoin(externalChannelBindings, eq(externalChannelBindings.installId, externalAppInstalls.id))
+      .innerJoin(externalAppRegistrations, eq(externalAppRegistrations.id, externalAppInstalls.registrationId))
       .where(and(
-        eq(externalAppInstalls.id, authority.installId),
-        eq(externalAppInstalls.registrationId, authority.appRegistrationId),
         eq(externalAppInstalls.providerAuthorityId, authority.providerAuthorityId),
-        eq(externalAppInstalls.connectionEpoch, authority.connectionEpoch),
+        eq(externalAppInstalls.registrationId, authority.appRegistrationId),
         eq(externalAppInstalls.state, "active"),
-        eq(externalChannelBindings.id, authority.bindingId),
+        eq(externalChannelBindings.registrationId, authority.appRegistrationId),
+        eq(externalChannelBindings.channelId, historical.channelId),
         eq(externalChannelBindings.providerConversationId, authority.providerConversationId),
-        eq(externalChannelBindings.connectionEpoch, authority.connectionEpoch),
-        eq(externalChannelBindings.bindingEpoch, authority.bindingEpoch),
+        eq(externalChannelBindings.connectionEpoch, externalAppInstalls.connectionEpoch),
         eq(externalChannelBindings.state, "active"),
+        eq(externalAppRegistrations.environment, historical.environment),
+        eq(externalAppRegistrations.provider, "slack"),
       )).limit(2);
     if (rows.length !== 1) return null;
     const row = rows[0]!;
-    if (
-      row.installState !== "active"
-      || row.bindingState !== "active"
-      || row.registrationId !== authority.appRegistrationId
-      || row.providerAuthorityId !== authority.providerAuthorityId
-      || row.connectionEpoch !== authority.connectionEpoch
-      || row.bindingConnectionEpoch !== authority.connectionEpoch
-      || row.bindingEpoch !== authority.bindingEpoch
-      || row.bindingId !== authority.bindingId
-      || row.providerConversationId !== authority.providerConversationId
-    ) return null;
     return {
       installId: row.installId,
       providerAppId: row.providerAppId,
@@ -1117,7 +1233,12 @@ export function createSlackBridgeProviderRuntime(
       },
       async complete({ authority, completion }) {
         assertAuthority(authority);
+        const username = renderSlackBridgeUsername(completion.author.displayName);
         const body = await providerCall(authority, "files.completeUploadExternal", {
+          ...(username ? { username } : {}),
+          ...(completion.author.avatarPublicUrl
+            ? { icon_url: completion.author.avatarPublicUrl }
+            : { icon_emoji: completion.author.fallbackKind === "agent" ? ":robot_face:" : ":bust_in_silhouette:" }),
           files: completion.providerFileIds.map((id) => ({ id })),
           channel_id: completion.providerConversationId,
           ...(completion.providerRootThreadId ? { thread_ts: completion.providerRootThreadId } : {}),
@@ -1318,8 +1439,9 @@ export function createSlackBridgeProviderRuntime(
     authority: SlackBridgeProvisioningProviderAuthority,
     method: string,
     body: Record<string, unknown>,
+    timeoutMs?: number,
   ): Promise<SlackBridgeProvisioningProviderResult<Record<string, unknown>>> => {
-    const result = await provisioningCallWithMetadata(authority, method, body);
+    const result = await provisioningCallWithMetadata(authority, method, body, timeoutMs);
     return result.kind === "fact"
       ? { kind: "fact", fact: result.fact.body }
       : result;
@@ -1329,10 +1451,12 @@ export function createSlackBridgeProviderRuntime(
     authority: SlackBridgeProvisioningProviderAuthority,
     method: string,
     body: Record<string, unknown>,
+    timeoutMs?: number,
   ): Promise<SlackBridgeProvisioningProviderResult<{
     body: Record<string, unknown>;
     headers: Readonly<Record<string, string | undefined>>;
   }>> => {
+    if (authority.isRunHeld && !await authority.isRunHeld()) return { kind: "unverified" };
     const lease = await claimCredential({
       installId: authority.installId,
       providerAppId: authority.providerAppId,
@@ -1349,13 +1473,15 @@ export function createSlackBridgeProviderRuntime(
     );
     if (
       stopped
+      || (authority.isRunHeld && !await authority.isRunHeld())
       || lease.expiresAt <= authority.now
       || !exactProvisioningAuthority(authority, lease.authority)
     ) return { kind: "unverified" };
-    const result = await callWithToken({ method, body, accessToken: lease.accessToken });
+    const result = await callWithToken({ method, body, accessToken: lease.accessToken, timeoutMs });
     if (result.kind !== "response") return { kind: "unverified" };
     const responseBody = result.body as Record<string, unknown>;
-    if (result.status === 429 || result.status >= 500) return { kind: "unverified" };
+    if (result.status === 429) return { kind: "unverified", retryAfterMs: retryAfterMs(result.headers) };
+    if (result.status >= 500) return { kind: "unverified" };
     if (responseBody.ok !== true) {
       const slackError = typeof responseBody.error === "string"
         ? responseBody.error.slice(0, 160)
@@ -1413,13 +1539,23 @@ export function createSlackBridgeProviderRuntime(
     if (listed.kind !== "fact") return listed;
     if (!Array.isArray(listed.fact.usergroups)) return { kind: "unverified" };
     const requested = new Set(input.providerUsergroupIds);
+    const identities = await listSlackUsergroupIdentities(db, authority.installId, input.serverId);
     const handles: SlackBridgeAgentMentionHandle[] = [];
     const humanHandles: SlackBridgeHumanMentionHandle[] = [];
     for (const raw of listed.fact.usergroups) {
       const group = parseSlackAgentUsergroup(raw);
       if (!group) return { kind: "unverified" };
-      if (!requested.has(group.id) || group.disabled) continue;
-      const marker = parseSlackAgentUsergroupMarker(group.description);
+      if (!requested.has(group.id)) continue;
+      const identity = identities.find((row) => row.providerUsergroupId === group.id
+        || (row.providerUsergroupId === null && slackUsergroupRecoveryDescription(row) === group.description));
+      // Retired human aliases remain identity locators for queued old tokens;
+      // the inbound worker still requires current channel membership. Agent
+      // groups retain their existing enabled-only behavior.
+      if (group.disabled && identity?.principalKind !== "user") continue;
+      // A known provider id is authoritative; human-readable descriptions are
+      // not interpreted as names/handles or trusted as identity metadata.
+      const description = identity ? slackUsergroupIdentityMarker(identity) : group.description;
+      const marker = parseSlackAgentUsergroupMarker(description);
       if (marker && marker.serverId === input.serverId) {
         handles.push({
           agentId: marker.agentId,
@@ -1428,10 +1564,12 @@ export function createSlackBridgeProviderRuntime(
         });
         continue;
       }
-      const humanMarker = parseSlackHumanUsergroupMarker(group.description);
-      if (humanMarker && humanMarker.serverId === input.serverId) {
+      const humanMarker = parseSlackHumanUsergroupMarker(description);
+      const humanUserId = identity?.principalKind === "user" ? identity.principalId
+        : humanMarker?.serverId === input.serverId ? humanMarker.userId : null;
+      if (humanUserId) {
         humanHandles.push({
-          userId: humanMarker.userId,
+          userId: humanUserId,
           providerUsergroupId: group.id,
           handle: group.handle.toLocaleLowerCase("en-US"),
         });
@@ -1491,70 +1629,36 @@ export function createSlackBridgeProviderRuntime(
     },
 
     async readWorkspace(authority) {
-      if (stopped || !validDate(authority.now)) return { kind: "unverified" };
-      const auth = await provisioningCall(authority, "auth.test", {});
-      if (auth.kind !== "fact") return auth;
-      const observedTeamId = auth.fact.team_id;
-      const observedAppId = auth.fact.api_app_id;
-      const observedBotUserId = auth.fact.user_id;
-      if (
-        observedTeamId !== authority.providerAuthorityId
-        || (observedAppId !== undefined && observedAppId !== authority.providerAppId)
-        || (observedBotUserId !== undefined && observedBotUserId !== authority.botUserId)
-      ) return { kind: "failed" };
-      const workspaceName = nonEmpty(auth.fact.team, 512) ? auth.fact.team : null;
-      const channels = new Map<string, {
-        id: string;
-        name: string;
-        privacyClass: "public" | "private";
-        isMember: boolean;
-      }>();
-      const seenCursors = new Set<string>();
-      let cursor: string | null = null;
-      for (let page = 0; page < MAX_PROVIDER_PAGES; page += 1) {
-        const body: Record<string, unknown> = {
-          exclude_archived: true,
-          limit: 200,
-          types: "public_channel,private_channel",
-        };
-        if (cursor) body.cursor = cursor;
-        const response = await provisioningCall(authority, "conversations.list", body);
-        if (response.kind !== "fact") return response;
-        if (!Array.isArray(response.fact.channels)) return { kind: "unverified" };
-        for (const item of response.fact.channels) {
-          if (!record(item)) return { kind: "unverified" };
-          if (item.is_archived === true) continue;
-          if (!nonEmpty(item.id, 160) || !nonEmpty(item.name, 512)) {
-            return { kind: "unverified" };
-          }
-          const privacyClass = item.is_private === true ? "private" as const : "public" as const;
-          const isMember = item.is_member === true;
-          const previous = channels.get(item.id);
-          if (previous && (
-            previous.name !== item.name
-            || previous.privacyClass !== privacyClass
-            || previous.isMember !== isMember
-          )) {
-            return { kind: "unverified" };
-          }
-          channels.set(item.id, { id: item.id, name: item.name, privacyClass, isMember });
-        }
-        const next = nextCursor(response.fact);
-        if (next === undefined) return { kind: "unverified" };
-        if (next === null) {
-          return {
-            kind: "fact",
-            fact: {
-              workspaceName,
-              channels: [...channels.values()].sort((left, right) => left.id.localeCompare(right.id)),
-            },
-          };
-        }
-        if (seenCursors.has(next)) return { kind: "unverified" };
-        seenCursors.add(next);
-        cursor = next;
+      if (stopped || !validDate(authority.now)) {
+        return { oauth: "unverified", directory: { kind: "unverified" } };
       }
-      return { kind: "unverified" };
+      return readSlackWorkspaceObservation(authority, (method, body) => provisioningCall(authority, method, body));
+    },
+
+    async readUserProfile(authority) {
+      if (stopped || !validDate(authority.now) || !nonEmpty(authority.providerUserId, 160)) return { kind: "unverified" };
+      const response = await provisioningCall(authority, "users.info", { user: authority.providerUserId }, JOIN_PROFILE_FETCH_TIMEOUT_MS);
+      if (response.kind !== "fact") return response;
+      const raw = response.fact.user;
+      if (!record(raw) || raw.deleted === true || typeof raw.is_bot !== "boolean") return { kind: "unverified" };
+      const user = slackProvisioningUser(raw, authority.providerUserId);
+      return user && user.displayName !== authority.providerUserId ? { kind: "fact", fact: user } : { kind: "unverified" };
+    },
+
+    async readConversationState(authority) {
+      if (stopped || !validDate(authority.now) || !nonEmpty(authority.providerConversationId, 160)) return { kind: "unverified" };
+      const response = await provisioningCall(authority, "conversations.info", { channel: authority.providerConversationId });
+      if (response.kind !== "fact") return response;
+      const channel = response.fact.channel;
+      if (!record(channel) || channel.id !== authority.providerConversationId || !nonEmpty(channel.name, 200)
+        || typeof channel.is_archived !== "boolean" || typeof channel.is_member !== "boolean") return { kind: "unverified" };
+      return { kind: "fact", fact: { id: channel.id, name: channel.name, isArchived: channel.is_archived, isMember: channel.is_member } };
+    },
+
+    async readConversationMember(authority) {
+      if (stopped || !validDate(authority.now) || !nonEmpty(authority.providerConversationId, 160)
+        || !nonEmpty(authority.providerUserId, 160)) return { kind: "unverified" };
+      return readSlackConversationMember(authority, body => provisioningCall(authority, "conversations.members", body));
     },
 
     async readConversationAudience(authority) {
@@ -1616,12 +1720,12 @@ export function createSlackBridgeProviderRuntime(
     },
 
     async reconcileAgentMentionHandles(authority, request) {
-      const humanCandidates = request.humanCandidates;
+      let humanCandidates = request.humanCandidates;
       if (
         stopped
         || !validDate(authority.now)
         || !nonEmpty(request.serverId, 160)
-        || request.candidates.length + (humanCandidates?.length ?? 0) > 200
+        || request.candidates.length > 200
         || request.candidates.some((candidate) => (
           candidate.serverId !== request.serverId
           || !nonEmpty(candidate.agentId, 160)
@@ -1644,7 +1748,56 @@ export function createSlackBridgeProviderRuntime(
           !== (humanCandidates?.length ?? 0)
       ) return { kind: "unverified" };
 
-      const listed = await provisioningCall(authority, "usergroups.list", {
+      const observedNow = () => Math.max(authority.now.getTime(), now().getTime());
+      const [install] = await db.select({
+        rateLimitedUntil: externalAppInstalls.slackMentionRateLimitedUntil,
+        humanSnapshot: externalAppInstalls.slackHumanMentionSnapshot,
+        capability: externalAppInstalls.slackMentionCapability,
+      }).from(externalAppInstalls).where(and(
+        eq(externalAppInstalls.id, authority.installId),
+        eq(externalAppInstalls.connectionEpoch, authority.connectionEpoch),
+        eq(externalAppInstalls.credentialRevision, authority.credentialRevision),
+        eq(externalAppInstalls.state, "active"),
+      )).limit(1);
+      if (!install) return { kind: "unverified" };
+      const capability = slackMentionCapabilitySchema.safeParse(install.capability);
+      if (capability.success && capability.data.result === "paid_teams_only"
+        && capability.data.connectionEpoch === authority.connectionEpoch
+        && capability.data.credentialRevision === authority.credentialRevision) {
+        return { kind: "failed", slackError: "paid_teams_only" };
+      }
+      if (install.rateLimitedUntil && install.rateLimitedUntil.getTime() > observedNow()) {
+        return { kind: "unverified", retryAfterMs: install.rateLimitedUntil.getTime() - observedNow() };
+      }
+      const mentionAuthorizationId = capability.success ? capability.data.authorizationId : null;
+      const candidateSetHash = slackMentionFingerprint({
+        authorizationId: mentionAuthorizationId,
+        connectionEpoch: authority.connectionEpoch, credentialRevision: authority.credentialRevision,
+        humans: [...(humanCandidates ?? [])].map(slackHumanMentionPrincipal)
+          .map(({ id, handleCandidates, nameCandidates }) => ({ id, handleCandidates, nameCandidates }))
+          .sort((a, b) => a.id.localeCompare(b.id)),
+      });
+      const storedSnapshot = slackHumanMentionSnapshotSchema.safeParse(install.humanSnapshot);
+      const cachedHumans = humanCandidates !== undefined && storedSnapshot.success
+        && storedSnapshot.data.candidateSetHash === candidateSetHash
+        && Date.parse(storedSnapshot.data.nextAttemptAt) > observedNow()
+        ? storedSnapshot.data : null;
+      // One workspace human pass per candidate version/interval. Other servers
+      // reuse its result while still reconciling their own Agent groups.
+      if (cachedHumans) humanCandidates = undefined;
+      const mentionCall: typeof provisioningCall = async (...args) => {
+        const result = await provisioningCall(...args);
+        // Stop this entire workspace pass on the first deterministic plan
+        // refusal, including reads: further principals cannot succeed either.
+        if (result.kind === "failed" && result.slackError === "paid_teams_only") {
+          throw new SlackMentionUnsupportedError(capability.success ? capability.data : null);
+        }
+        if (result.kind === "unverified" && result.retryAfterMs !== undefined) {
+          throw new SlackMentionRateLimitedError(result.retryAfterMs);
+        }
+        return result;
+      };
+      const listed = await mentionCall(authority, "usergroups.list", {
         include_count: false,
         include_disabled: true,
       });
@@ -1657,37 +1810,91 @@ export function createSlackBridgeProviderRuntime(
         groups.push(group);
       }
 
-      // Only groups carrying this server's marker for a kind being reconciled
-      // are managed here: an Agent-only request (no `humanCandidates`) never
-      // touches human groups, and foreign/plain groups are never touched.
+      // Agents stay server-scoped; known human identities are workspace-wide.
+      // Agent-only requests leave humans untouched. Unknown legacy markers
+      // are adopted only for this server; foreign/plain groups stay untouched.
       const managedPrefixes = [
         `${RAFT_AGENT_USERGROUP_MARKER_PREFIX}${request.serverId}:`,
-        ...(humanCandidates ? [`${RAFT_HUMAN_USERGROUP_MARKER_PREFIX}${request.serverId}:`] : []),
+        ...(humanCandidates ? [`${RAFT_HUMAN_USERGROUP_MARKER_PREFIX}${request.serverId}:`, "workspace-user:"] : []),
       ];
+      const identities = await listSlackUsergroupIdentities(db, authority.installId, request.serverId);
+      const identitiesByMarker = new Map<string, (typeof identities)[number]>();
+      for (const row of identities) {
+        const marker = slackUsergroupIdentityMarker(row);
+        const kept = identitiesByMarker.get(marker);
+        const keptGroup = kept && groups.find((group) => group.id === kept.providerUsergroupId);
+        const candidateGroup = groups.find((group) => group.id === row.providerUsergroupId);
+        if (!kept || (candidateGroup && !candidateGroup.disabled && (!keptGroup || keptGroup.disabled))) {
+          identitiesByMarker.set(marker, row);
+        }
+      }
       // Two replicas racing a create can leave two groups with the same
       // exact marker (same server, same principal). Keep one — enabled
       // first, then the lowest id — and disable the rest below, so the race
       // heals on the next pass instead of failing every pass. Groups are
       // matched by their full marker only, never by name or handle.
       const managedByMarker = new Map<string, SlackAgentUsergroup>();
+      const managedMarkerByGroupId = new Map<string, string>();
       const duplicateManaged: SlackAgentUsergroup[] = [];
       for (const group of groups) {
-        if (!managedPrefixes.some((prefix) => group.description.startsWith(prefix))) continue;
-        const kept = managedByMarker.get(group.description);
+        const identity = identities.find((row) => row.providerUsergroupId === group.id
+          || slackUsergroupRecoveryDescription(row) === group.description);
+        const legacyHuman = parseSlackHumanUsergroupMarker(group.description);
+        const marker = identity ? slackUsergroupIdentityMarker(identity)
+          : legacyHuman?.serverId === request.serverId ? `workspace-user:${legacyHuman.userId}` : group.description;
+        if (!managedPrefixes.some((prefix) => marker.startsWith(prefix))) continue;
+        // Parse legacy descriptions strictly before adopting them. The legacy
+        // path exists only to migrate already-provisioned groups in place.
+        const agent = parseSlackAgentUsergroupMarker(marker);
+        const human = legacyHuman?.serverId === request.serverId ? legacyHuman : parseSlackHumanUsergroupMarker(marker);
+        if (!agent && !human && identity?.principalKind !== "user") continue;
+        managedMarkerByGroupId.set(group.id, marker);
+        if (!identitiesByMarker.has(marker)) identitiesByMarker.set(marker,
+          await reserveSlackUsergroupIdentity(db, {
+            installId: authority.installId, serverId: request.serverId,
+            principalKind: agent ? "agent" : "user", principalId: agent?.agentId ?? human!.userId,
+          }));
+        const kept = managedByMarker.get(marker);
         if (!kept) {
-          managedByMarker.set(group.description, group);
+          managedByMarker.set(marker, group);
           continue;
         }
-        const preferNew = kept.disabled !== group.disabled
-          ? kept.disabled
-          : group.id < kept.id;
+        const boundId = identitiesByMarker.get(marker)?.providerUsergroupId;
+        const alreadyBound = boundId === group.id || boundId === kept.id;
+        const preferNew = alreadyBound ? boundId === group.id
+          : kept.disabled !== group.disabled ? kept.disabled : group.id < kept.id;
         duplicateManaged.push(preferNew ? kept : group);
-        if (preferNew) managedByMarker.set(group.description, group);
+        if (preferNew) managedByMarker.set(marker, group);
       }
       // Checked before every write: a holder whose claim lapsed (renewal
       // refused, or its last confirmed window elapsed) sends nothing more and
       // reports `unverified`, which never rewrites the persisted state.
       const claimLost = async () => request.isClaimHeld !== undefined && !(await request.isClaimHeld());
+      const mentionWrite = async (
+        identity: SlackUsergroupIdentity, method: string, body: Record<string, unknown>,
+      ): Promise<SlackBridgeProvisioningProviderResult<Record<string, unknown>>> => {
+        const fingerprint = slackMentionFingerprint({
+          authorizationId: mentionAuthorizationId,
+          connectionEpoch: authority.connectionEpoch, credentialRevision: authority.credentialRevision, method, body,
+        });
+        const stored = slackMentionWriteFailuresSchema.safeParse(identity.mentionWriteFailures);
+        const failures = stored.success ? stored.data.filter((failure) => Date.parse(failure.retryAt) > observedNow()) : [];
+        const blocked = failures.find((failure) => failure.fingerprint === fingerprint);
+        if (blocked) return { kind: "failed", slackError: blocked.slackError };
+        if (await claimLost()) return { kind: "unverified" };
+        const result = await mentionCall(authority, method, body);
+        if (result.kind === "failed") {
+          if (await claimLost()) return { kind: "unverified" };
+          const next = [...failures.filter((failure) => failure.fingerprint !== fingerprint), {
+            fingerprint, slackError: result.slackError ?? "unknown_error",
+            retryAt: new Date(observedNow() + SLACK_MENTION_FAILURE_BACKOFF_MS).toISOString(),
+          }];
+          await db.update(slackUsergroupIdentities).set({ mentionWriteFailures: next })
+            .where(eq(slackUsergroupIdentities.id, identity.id));
+          identity.mentionWriteFailures = next;
+        }
+        return result;
+      };
       // Agents first, then humans: an Agent keeps first claim on a handle.
       const principals: SlackMentionPrincipal[] = [
         ...[...request.candidates]
@@ -1703,6 +1910,7 @@ export function createSlackBridgeProviderRuntime(
       const handles: SlackBridgeAgentMentionHandle[] = [];
       const humanHandles: SlackBridgeHumanMentionHandle[] = [];
       const failures: SlackBridgeAgentMentionReconcileFailure[] = [];
+      const cleanupFailures: { slackError: string | null }[] = [];
       const recordFailure = (
         principal: SlackMentionPrincipal,
         slackError: string | null,
@@ -1720,21 +1928,32 @@ export function createSlackBridgeProviderRuntime(
         // disable pass still runs. The failure (with Slack's error) is
         // reported to the caller; the next tick retries.
         const marker = principal.marker;
+        const identity = identitiesByMarker.get(marker) ?? await reserveSlackUsergroupIdentity(db, {
+          installId: authority.installId, serverId: request.serverId,
+          principalKind: principal.kind, principalId: principal.id,
+        });
+        identitiesByMarker.set(marker, identity);
         let group = managedByMarker.get(marker) ?? null;
+        if (group) {
+          if (await claimLost()) return { kind: "unverified" };
+          await bindSlackUsergroupIdentity(db, identity, group.id);
+        }
+        const description = slackUsergroupDescription(principal.kind);
+        // A previously confirmed human group observed missing/disabled cannot
+        // remain an outbound destination during a cached enable/create refusal.
+        if (principal.kind === "user" && (!group || group.disabled)
+          && !(await setCanonicalSlackHumanUsergroup(db, identity, false, async () => !(await claimLost())))) {
+          return { kind: "unverified" };
+        }
         if (group) {
           occupied.delete(group.handle.toLocaleLowerCase("en-US"));
           occupiedNames.delete(group.name.toLocaleLowerCase("en-US"));
           if (group.disabled) {
             let enabled: SlackBridgeProvisioningProviderResult<Record<string, unknown>>;
             if (await claimLost()) return { kind: "unverified" };
-            try {
-              enabled = await provisioningCall(authority, "usergroups.enable", {
-                usergroup: group.id,
-              });
-            } catch {
-              recordFailure(principal, null, true);
-              continue;
-            }
+            enabled = await mentionWrite(identity, "usergroups.enable", {
+              usergroup: group.id,
+            });
             if (enabled.kind !== "fact") {
               recordFailure(
                 principal,
@@ -1750,7 +1969,7 @@ export function createSlackBridgeProviderRuntime(
         // refuses (e.g. the handle is a Slack username, which usergroups.list
         // never shows), so the reconcile would never converge and every tick
         // would spend a rate-limited write on it.
-        const keptHandle = group && principal.handleCandidates.includes(group.handle)
+        const keptHandle = group && (principal.kind === "user" || principal.handleCandidates.includes(group.handle))
           ? group.handle
           : null;
         const keptName = group && principal.nameCandidates.includes(group.name)
@@ -1775,28 +1994,23 @@ export function createSlackBridgeProviderRuntime(
           }
           let write: SlackBridgeProvisioningProviderResult<Record<string, unknown>> | null = null;
           const needsWrite = !group
-            || group.name !== name || group.handle !== handle || group.description !== marker;
+            || group.name !== name || group.handle !== handle || group.description !== description;
           if (needsWrite && await claimLost()) return { kind: "unverified" };
-          try {
-            if (!group) {
-              write = await provisioningCall(authority, "usergroups.create", {
-                name,
-                handle,
-                description: marker,
-              });
-            } else if (
-              group.name !== name || group.handle !== handle || group.description !== marker
-            ) {
-              write = await provisioningCall(authority, "usergroups.update", {
-                usergroup: group.id,
-                name,
-                handle,
-                description: marker,
-              });
-            }
-          } catch {
-            recordFailure(principal, null, true);
-            break;
+          if (!group) {
+            write = await mentionWrite(identity, "usergroups.create", {
+              name,
+              handle,
+              description: slackUsergroupRecoveryDescription(identity),
+            });
+          } else if (
+            group.name !== name || group.handle !== handle || group.description !== description
+          ) {
+            write = await mentionWrite(identity, "usergroups.update", {
+              usergroup: group.id,
+              name,
+              handle,
+              description,
+            });
           }
           if (!write) {
             reconciled = { group: group!, handle, name };
@@ -1824,9 +2038,18 @@ export function createSlackBridgeProviderRuntime(
             continue;
           }
           const observed = parseSlackAgentUsergroup(write.fact.usergroup);
-          if (!observed || observed.description !== marker || observed.handle !== handle) {
+          const expectedDescription = group ? description : slackUsergroupRecoveryDescription(identity);
+          if (!observed || observed.description !== expectedDescription || observed.handle !== handle) {
             recordFailure(principal, null, false);
             break;
+          }
+          if (await claimLost()) return { kind: "unverified" };
+          await bindSlackUsergroupIdentity(db, identity, observed.id);
+          if (!group) {
+            // Persist identity before removing the recovery reference. If this
+            // write fails, the next reconcile finds the same group by its id.
+            group = observed;
+            continue;
           }
           reconciled = { group: observed, handle, name };
           break;
@@ -1839,6 +2062,7 @@ export function createSlackBridgeProviderRuntime(
         if (principal.kind === "agent") {
           handles.push({ agentId: principal.id, providerUsergroupId: group.id, handle });
         } else {
+          if (!(await setCanonicalSlackHumanUsergroup(db, identity, true, async () => !(await claimLost())))) return { kind: "unverified" };
           humanHandles.push({ userId: principal.id, providerUsergroupId: group.id, handle });
         }
       }
@@ -1847,26 +2071,173 @@ export function createSlackBridgeProviderRuntime(
         ...[...managedByMarker].filter(([marker]) => !desiredMarkers.has(marker)).map(([, group]) => group),
         ...duplicateManaged,
       ];
+      const humanCleanupFailures: { slackError: string | null }[] = [];
       for (const group of retired) {
-        if (group.disabled) continue;
+        const marker = managedMarkerByGroupId.get(group.id)!;
+        const writeIdentity = identities.find((row) => row.providerUsergroupId === group.id) ?? identitiesByMarker.get(marker);
+        if (!writeIdentity) return { kind: "unverified" };
+        const recordCleanupFailure = (slackError: string | null) => {
+          cleanupFailures.push({ slackError });
+          if (writeIdentity.principalKind === "user") humanCleanupFailures.push({ slackError });
+        };
+        const retiredIdentity = identities.find((row) => row.providerUsergroupId === group.id);
+        if (retiredIdentity?.principalKind === "user" && !(await setCanonicalSlackHumanUsergroup(db, retiredIdentity, false, async () => !(await claimLost())))) return { kind: "unverified" };
+        if (!group.disabled) {
+          if (await claimLost()) return { kind: "unverified" };
+          const disabled = await mentionWrite(writeIdentity, "usergroups.disable", { usergroup: group.id });
+          if (disabled.kind !== "fact") {
+            recordCleanupFailure(disabled.kind === "failed" ? disabled.slackError ?? null : null);
+            continue;
+          }
+        }
+        const entry = [...managedByMarker].find(([, kept]) => kept.id === group.id);
+        const identity = identitiesByMarker.get(marker);
+        if (entry && identity) {
+          if (await claimLost()) return { kind: "unverified" };
+          await bindSlackUsergroupIdentity(db, identity, group.id);
+        }
+        const kind = parseSlackAgentUsergroupMarker(marker) ? "agent" : "user";
+        const description = slackUsergroupDescription(kind);
+        if (group.description !== description) {
+          if (await claimLost()) return { kind: "unverified" };
+          const cleaned = await mentionWrite(writeIdentity, "usergroups.update", { usergroup: group.id, description });
+          if (cleaned.kind !== "fact") recordCleanupFailure(cleaned.kind === "failed" ? cleaned.slackError ?? null : null);
+        }
+      }
+      if (humanCandidates !== undefined) {
         if (await claimLost()) return { kind: "unverified" };
-        const disabled = await provisioningCall(authority, "usergroups.disable", {
-          usergroup: group.id,
-        });
-        if (disabled.kind !== "fact") return { kind: disabled.kind, slackError: disabled.kind === "failed" ? disabled.slackError : undefined };
+        await db.update(externalAppInstalls).set({ slackHumanMentionSnapshot: {
+          candidateSetHash, nextAttemptAt: new Date(observedNow() + SLACK_HUMAN_RECONCILE_INTERVAL_MS).toISOString(),
+          handles: humanHandles,
+          failures: failures.flatMap((failure) => failure.userId ? [{ userId: failure.userId, slackError: failure.slackError, transient: failure.transient }] : []),
+          cleanupFailures: humanCleanupFailures,
+        } }).where(eq(externalAppInstalls.id, authority.installId));
       }
       return {
         kind: "fact",
         fact: {
           handles,
-          ...(humanCandidates ? { humanHandles } : {}),
-          failures,
+          ...(cachedHumans ? { humanHandles: cachedHumans.handles }
+            : humanCandidates !== undefined ? { humanHandles } : {}),
+          failures: [...failures, ...(cachedHumans?.failures ?? [])],
+          cleanupFailures: [...cleanupFailures, ...(cachedHumans?.cleanupFailures ?? [])],
         },
       };
     },
   };
 
+  // Serialize the entire list/create/bind/cleanup sequence at the common
+  // provider seam, including interactive enable and background lifecycle calls.
+  // Reserving one DB row alone cannot stop two creates from both losing their
+  // recovery description after concurrent provider responses.
+  const reconcileMentionHandles = provisioningProvider.reconcileAgentMentionHandles!;
+  provisioningProvider.reconcileAgentMentionHandles = async (authority, request) => {
+    const key = `slock:slack-bridge:mention-write:${authority.installId}`;
+    const token = randomUUID();
+    let claim: SlackMentionReconcileClaim | null;
+    const redis = isRedisAvailable() ? getRedis() : null;
+    if (redis) {
+      claim = await claimSlackMentionReconcile({
+        store: redisSlackMentionReconcileClaimStore(redis), key, token,
+        ttlMs: 30_000, renewEveryMs: 10_000,
+      });
+    } else {
+      if (process.env.NODE_ENV === "production") return { kind: "unverified" };
+      if (localMentionWorkspaceClaims.has(key)) return { kind: "unverified" };
+      localMentionWorkspaceClaims.set(key, token);
+      claim = {
+        held: async () => localMentionWorkspaceClaims.get(key) === token,
+        end: () => { if (localMentionWorkspaceClaims.get(key) === token) localMentionWorkspaceClaims.delete(key); },
+      };
+    }
+    if (!claim) return { kind: "unverified" };
+    try {
+      return await reconcileMentionHandles(authority, {
+        ...request,
+        isClaimHeld: async () => {
+          if (stopped) return false;
+          const callerHeld = !request.isClaimHeld || await request.isClaimHeld();
+          return callerHeld && await claim.held() && !stopped;
+        },
+      });
+    } catch (error) {
+      if (error instanceof SlackMentionUnsupportedError) {
+        if (stopped || !(await claim.held()) || (request.isClaimHeld && !(await request.isClaimHeld()))) {
+          return { kind: "unverified" };
+        }
+        // A delayed response from an old token must not disable the new
+        // install's capability after reauthorization or reinstallation.
+        const [updated] = await db.update(externalAppInstalls).set({
+          slackMentionCapability: {
+            authorizationId: error.observedCapability?.authorizationId ?? newSlackMentionAuthorizationId(),
+            result: "paid_teams_only",
+            connectionEpoch: authority.connectionEpoch,
+            credentialRevision: authority.credentialRevision,
+          },
+        }).where(and(
+          eq(externalAppInstalls.id, authority.installId),
+          eq(externalAppInstalls.connectionEpoch, authority.connectionEpoch),
+          eq(externalAppInstalls.credentialRevision, authority.credentialRevision),
+          eq(externalAppInstalls.state, "active"),
+          // A shared-server install can renew consent without rotating the
+          // token; its new authorization id also fences old provider results.
+          error.observedCapability === null
+            ? sql`${externalAppInstalls.slackMentionCapability} IS NULL`
+            : eq(externalAppInstalls.slackMentionCapability, error.observedCapability),
+        )).returning({ id: externalAppInstalls.id });
+        return updated ? { kind: "failed", slackError: "paid_teams_only" } : { kind: "unverified" };
+      }
+      if (error instanceof SlackMentionRateLimitedError) {
+        const until = new Date(Math.max(authority.now.getTime(), now().getTime()) + Math.max(1_000, error.retryAfterMs));
+        await db.update(externalAppInstalls).set({
+          slackMentionRateLimitedUntil: sql`greatest(${externalAppInstalls.slackMentionRateLimitedUntil}, ${until})`,
+        }).where(eq(externalAppInstalls.id, authority.installId));
+        return { kind: "unverified", retryAfterMs: error.retryAfterMs };
+      }
+      return { kind: "unverified" };
+    } finally {
+      claim.end();
+      // Do not leave TTL spacing here: another server in the same lifecycle
+      // batch must be able to proceed. A release error falls back to the TTL.
+      if (redis) await releaseSlackMentionReconcileClaim(redis, key, token).catch(() => false);
+    }
+  };
+
+  const revokeInstallToken = async (installId: string): Promise<SlackInstallTokenRevokeOutcome> => {
+    const [row] = await db.select({
+      serverId: externalAppInstalls.serverId,
+      providerAppId: externalAppInstalls.providerAppId,
+      providerTeamId: externalAppInstalls.providerTeamId,
+      botUserId: externalAppInstalls.botUserId,
+      encryptedMaterial: externalAppCredentials.encryptedMaterial,
+      envelopeKeyId: externalAppCredentials.envelopeKeyId,
+      aadVersion: externalAppCredentials.aadVersion,
+    }).from(externalAppInstalls)
+      .innerJoin(externalAppCredentials, eq(externalAppCredentials.installId, externalAppInstalls.id))
+      .where(eq(externalAppInstalls.id, installId))
+      .limit(1);
+    if (!row || !nonEmpty(row.providerTeamId) || !nonEmpty(row.botUserId)) return { kind: "no_credential" };
+    const material = dependencies.credentialCipher.unseal({
+      serverId: row.serverId,
+      providerAppId: row.providerAppId,
+      providerTeamId: row.providerTeamId,
+      botUserId: row.botUserId,
+      encryptedMaterial: row.encryptedMaterial,
+      envelopeKeyId: row.envelopeKeyId,
+      aadVersion: row.aadVersion,
+    });
+    if (!material) return { kind: "no_credential" };
+    const result = await callWithToken({ method: "auth.revoke", body: {}, accessToken: material.accessToken });
+    if (result.kind === "transport_failure") return { kind: "failed", failure: `transport_${result.code}` };
+    if (result.body.ok === true) return { kind: "revoked" };
+    const error = typeof result.body.error === "string" ? result.body.error : `http_${result.status}`;
+    // Already dead at Slack: nothing left to revoke.
+    if (["invalid_auth", "token_revoked", "account_inactive", "not_authed", "token_expired"].includes(error)) return { kind: "revoked" };
+    return { kind: "failed", failure: error.slice(0, 64) };
+  };
+
   return {
+    revokeInstallToken,
     credentialResolver,
     transport,
     inboundAttachmentTransport,

@@ -1,0 +1,51 @@
+{
+  "formatVersion": 1,
+  "id": "R1-outcome-field-counted",
+  "rule": "R1",
+  "title": "The server's outcome `counted` is what the answer means",
+  "why": "The server decides the outcome in the read-state transaction from the state it wrote; clients read it instead of inferring.",
+  "status": "agreed",
+  "sources": {
+    "web": [
+      "packages/shared/src/readStateContract.ts (resolveMarkUnreadOutcome)",
+      "packages/web/src/store/inboxStore.ts (markScopeUnread)",
+      "packages/web/src/store/messageStore.ts (markUnread)"
+    ],
+    "app": [
+      "compose/shared/src/commonMain/kotlin/build/raft/app/data/MarkUnreadOutcome.kt"
+    ],
+    "server": [
+      "packages/shared/src/readStateContract.ts (markConversationUnreadResponseSchema)",
+      "packages/server/src/routes/channels.ts (POST /channels/:id/unread)"
+    ]
+  },
+  "given": {
+    "conversation": {
+      "id": "thread-1",
+      "kind": "thread"
+    }
+  },
+  "steps": [
+    {
+      "act": "markUnread",
+      "surface": "activityRow"
+    },
+    {
+      "act": "serverResponds",
+      "status": 200,
+      "body": {
+        "ok": true,
+        "unreadCount": 3,
+        "maxReadSeq": 40,
+        "readStateVersion": 7,
+        "markedUnread": false,
+        "outcome": "counted"
+      }
+    }
+  ],
+  "expect": {
+    "state": {
+      "outcome": "counted"
+    }
+  }
+}

@@ -23,7 +23,7 @@ import {
   requireSelfServeAgreement,
 } from "../services/serverAgreementService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 async function createServer(name: string, slug: string, ownerId: string) {
   const server = await createServerService(name, slug, ownerId);

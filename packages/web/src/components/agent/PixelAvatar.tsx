@@ -2,8 +2,10 @@ import { memo, useContext, useMemo, useState } from "react";
 import type { Context } from "react";
 import { IntlContext } from "react-intl";
 
-import pixelAvatars from "../../../assets/avatars/pixelAvatars.json";
-import { en } from "../../i18n/messages/en";
+import pixelAvatars from "@botiverse/raft-shared/assets/pixelAvatars.json" with { type: "json" };
+import { generatePixelAvatar } from "@botiverse/raft-shared/src/pixelAvatarGenerator";
+import { enFallback } from "../../i18n/messages/enFallback";
+import ottieUrl from "../../assistant/otter/wave.webp";
 
 /**
  * Pixel art avatar system for agents.
@@ -13,10 +15,12 @@ import { en } from "../../i18n/messages/en";
  * inflating every style/layout pass over the timeline and sidebar.
  * Stored as avatarUrl = "pixel:key" (predefined) or "pixel:random:seed" (generated).
  *
- * Canonical palette + sprite data live in assets/avatars/pixelAvatars.json
- * (grid rows as compact 8-char palette-letter strings); this module expands
- * them into render-time shapes. The seeded-random generator below stays in
- * code — only the hand-drawn sprites are data. Drift guard:
+ * Canonical palette + sprite data live in packages/shared/assets/pixelAvatars.json
+ * (grid rows as compact 8-char palette-letter strings), which the server's
+ * pixelAvatarService reads too; this module expands them into render-time
+ * shapes. The seeded-random generator stays in
+ * code (packages/shared/src/pixelAvatarGenerator.ts, shared with the server's
+ * pixelAvatarService) — only the hand-drawn sprites are data. Drift guard:
  * tests/pixelAvatarJson.test.ts.
  */
 
@@ -36,9 +40,9 @@ type OptionalAvatarIntl = {
 
 // 8×8 pixel art definitions, expanded from the JSON's compact row strings
 // ("_KKKKKK_" → PaletteKey[]). A bg letter resolves through the palette; a
-// literal `#hex` bg (the reserved finch/mug one-offs — soft-sky #D7F3FB and
-// soft-cream #F8EEDF, intentionally NOT promoted into `C`) passes through
-// as-is. Entry order follows the JSON and drives the picker grid order.
+// literal `#hex` bg (the reserved finch/mug/ottie one-offs — soft-sky #D7F3FB,
+// soft-cream #F8EEDF and pale-water #DDEFF2, intentionally NOT promoted into `C`) passes through
+// as-is. Entry order follows the JSON (series order, reserved last).
 const AVATARS: Record<string, { grid: PaletteKey[][]; bg: string }> = Object.fromEntries(
   Object.entries(pixelAvatars.avatars).map(([key, { bg, grid }]) => [
     key,
@@ -50,15 +54,21 @@ const AVATARS: Record<string, { grid: PaletteKey[][]; bg: string }> = Object.fro
 );
 
 // Avatar keys reserved for specific agents — must not be picked at random
-// (CreateAgentDialog) or surfaced in the manual picker grid
-// (AgentDetailPanel). `finch` and `mug` belong to the Cindy OA agent only
+// (CreateAgentDialog) or surfaced in the manual picker
+// (AgentProfileEditDialog). `finch` and `mug` belong to the Cindy OA agent only
 // (Duoyu 2026-06-02 DM, cindyz approved; mug FINAL locked by cindyz
 // 2026-07-01, supersedes the earlier orange mugWink shipped in #3616).
+// `ottie` is every personal assistant's avatar, set only by the server; the
+// web draws the otter art for it (AgentAvatar), the sprite is the fallback.
 export const RESERVED_AVATAR_KEYS: readonly string[] = pixelAvatars.reservedKeys;
 
 export const AVATAR_KEYS = Object.keys(AVATARS).filter(
   (k) => !RESERVED_AVATAR_KEYS.includes(k),
 );
+
+/** The picker's themed sets of exactly 8 avatars, in picker order. Every
+ *  key in AVATAR_KEYS is in exactly one series; reserved keys are in none. */
+export const AVATAR_SERIES: readonly { key: string; avatars: readonly string[] }[] = pixelAvatars.series;
 
 /** Default avatar key used when agent has no avatar set */
 export const DEFAULT_AVATAR_KEY = pixelAvatars.defaultKey;
@@ -67,85 +77,27 @@ export function getAvatarData(key: string) {
   return AVATARS[key] || null;
 }
 
-// --- Seeded random pixel avatar generator ---
-
-/** Simple seeded PRNG (mulberry32) */
-function mulberry32(seed: number): () => number {
-  return () => {
-    seed |= 0;
-    seed = (seed + 0x6d2b79f5) | 0;
-    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
-
-/** Hash a string to a 32-bit integer */
-function hashString(str: string): number {
-  let hash = 0;
-  for (let i = 0; i < str.length; i++) {
-    hash = ((hash << 5) - hash + str.charCodeAt(i)) | 0;
-  }
-  return hash;
-}
-
-/**
- * Pre-defined harmonious color schemes: [background, foreground].
- * Each scheme pairs a light bg with a contrasting fg for clean identicon look.
- */
-const COLOR_SCHEMES: [string, PaletteKey][] = [
-  [C.C, "K"],   // cyan bg, black fg
-  [C.Y, "K"],   // yellow bg, black fg
-  [C.L, "K"],   // lime bg, black fg
-  [C.P, "W"],   // pink bg, white fg
-  [C.V, "K"],   // lavender bg, black fg
-  ["#1E1E1C", "C"],  // dark bg, cyan fg
-  ["#1E1E1C", "G"],  // dark bg, green fg
-  ["#1E1E1C", "P"],  // dark bg, pink fg
-  ["#1E1E1C", "Y"],  // dark bg, yellow fg
-  ["#1E1E1C", "V"],  // dark bg, lavender fg
-  [C.O, "K"],   // orange bg, black fg
-  [C.C, "W"],   // cyan bg, white fg
-];
+// --- Seeded random pixel avatar generator (packages/shared/src/pixelAvatarGenerator.ts) ---
 
 /** Cache for generated avatars to avoid recalculating */
 const generatedCache = new Map<string, { grid: PaletteKey[][]; bg: string }>();
 
-/**
- * Generate a deterministic 8×8 identicon-style pixel avatar from a seed string.
- * Uses a 5×8 grid (center column + left half mirrored to right) for vertical symmetry,
- * with a single foreground color on a harmonious background — similar to GitHub identicons.
- */
+/** The shared seeded generator, memoized per seed. */
 function generateAvatar(seed: string): { grid: PaletteKey[][]; bg: string } {
   const cached = generatedCache.get(seed);
   if (cached) return cached;
 
-  const rng = mulberry32(hashString(seed));
-  const scheme = COLOR_SCHEMES[Math.floor(rng() * COLOR_SCHEMES.length)];
-  const bg = scheme[0];
-  const fg = scheme[1];
-
-  // Generate a 4×8 half-grid (left side), then mirror horizontally.
-  // ~45% fill rate gives recognizable shapes without being too dense or sparse.
-  const grid: PaletteKey[][] = [];
-  for (let y = 0; y < 8; y++) {
-    const left: PaletteKey[] = [];
-    for (let x = 0; x < 4; x++) {
-      left.push(rng() < 0.45 ? fg : "_");
-    }
-    // Mirror: columns 0-3 then 3-0 (8 wide, center columns 3,4 share same value)
-    grid.push([left[0], left[1], left[2], left[3], left[3], left[2], left[1], left[0]]);
-  }
-
-  const result = { grid, bg };
+  const result = generatePixelAvatar(seed);
   generatedCache.set(seed, result);
   return result;
 }
 
-/** Sprite data for a key: a predefined sprite, or "random:<seed>" generated. */
-export function getPixelAvatarData(avatarKey: string): { grid: PaletteKey[][]; bg: string } | null {
+/** Sprite data for a key: a predefined sprite, or "random:<seed>" generated.
+ *  A key this build doesn't know (e.g. an avatar added after it shipped)
+ *  draws the default avatar rather than nothing. */
+export function getPixelAvatarData(avatarKey: string): { grid: PaletteKey[][]; bg: string } {
   if (avatarKey.startsWith("random:")) return generateAvatar(avatarKey.slice(7));
-  return AVATARS[avatarKey] || null;
+  return AVATARS[avatarKey] ?? AVATARS[DEFAULT_AVATAR_KEY];
 }
 
 function svgDataUrl(svg: string): string {
@@ -214,8 +166,13 @@ export function isCustomAvatar(avatarUrl: string | null): boolean {
   return !avatarUrl.startsWith("pixel:");
 }
 
+/** Every personal assistant's fixed avatar (set only by the server). */
+export const ASSISTANT_AVATAR_URL = "pixel:ottie";
+
 /** Render an agent avatar — custom image if uploaded, pixel art otherwise.
- *  Either one fills its frame: put it inside an AvatarSlot. */
+ *  Either one fills its frame: put it inside an AvatarSlot. A personal
+ *  assistant (`pixel:ottie`) shows the otter art; the `ottie` sprite in
+ *  pixelAvatars.json is only for surfaces without it (server SVG, mobile). */
 export const AgentAvatar = memo(function AgentAvatar({
   avatarUrl,
 }: {
@@ -223,8 +180,19 @@ export const AgentAvatar = memo(function AgentAvatar({
 }) {
   // Some legacy test render trees mount this shared leaf without IntlProvider.
   const intl = useContext(IntlContext as unknown as Context<OptionalAvatarIntl | null>);
-  const avatarAlt = intl?.formatMessage({ id: "agent.avatar.alt" }) ?? en["agent.avatar.alt"];
+  const avatarAlt = intl?.formatMessage({ id: "agent.avatar.alt" }) ?? enFallback["agent.avatar.alt"];
   const [failedCustomUrl, setFailedCustomUrl] = useState<string | null>(null);
+  if (avatarUrl === ASSISTANT_AVATAR_URL) {
+    return (
+      <img
+        src={ottieUrl}
+        alt={avatarAlt}
+        draggable={false}
+        className="size-full shrink-0 object-cover"
+        data-agent-ottie-avatar="true"
+      />
+    );
+  }
   if (isCustomAvatar(avatarUrl) && avatarUrl !== failedCustomUrl) {
     return (
       <img

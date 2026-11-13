@@ -6,7 +6,7 @@ import {
   currentDate,
   setClockTimeout,
 } from "@botiverse/raft-shared";
-import { and, eq, gt, isNull, lte, or } from "drizzle-orm";
+import { and, eq, isNull, lte, or } from "drizzle-orm";
 
 import { getDb, type Database } from "../db/index";
 import {
@@ -15,7 +15,8 @@ import {
   externalChannelBindings,
   externalMessageLinks,
 } from "../db/schema";
-import type { SlackAudienceCredentialResolver } from "./slackAudienceRefreshService";
+import type { SlackAudienceCredentialResolver } from "./slackProviderAdapter";
+import { lockSlackInstallCredential } from "./slackBridgeRowLocks";
 import {
   SLACK_BRIDGE_CREDENTIAL_LEASE_SCHEMA,
   type SlackBridgeCredentialHandle,
@@ -195,43 +196,37 @@ export function createSlackBridgeAwsAudienceProviderRuntime(
       const leaseId = `slack-audience:${randomUUID()}`;
       const leaseExpiresAt = new Date(requestedAt.getTime() + leaseTtlMs);
       const row = await runtimeDb.transaction(async (tx) => {
-        const candidates = await tx.select({
-          installState: externalAppInstalls.state,
-          installRegistrationId: externalAppInstalls.registrationId,
-          installProviderAppId: externalAppInstalls.providerAppId,
-          installProviderTeamId: externalAppInstalls.providerTeamId,
-          installProviderAuthorityId: externalAppInstalls.providerAuthorityId,
-          installBotUserId: externalAppInstalls.botUserId,
-          installConnectionEpoch: externalAppInstalls.connectionEpoch,
-          installCredentialRevision: externalAppInstalls.credentialRevision,
-          credentialId: externalAppCredentials.id,
-          credentialState: externalAppCredentials.state,
-          encryptedMaterial: externalAppCredentials.encryptedMaterial,
-          envelopeKeyId: externalAppCredentials.envelopeKeyId,
-          aadVersion: externalAppCredentials.aadVersion,
-          credentialRevision: externalAppCredentials.credentialRevision,
-        }).from(externalAppCredentials)
-          .innerJoin(externalAppInstalls, eq(externalAppInstalls.id, externalAppCredentials.installId))
-          .innerJoin(externalChannelBindings, and(
-            eq(externalChannelBindings.id, authority.bindingId),
-            eq(externalChannelBindings.installId, externalAppInstalls.id),
-          ))
-          .where(and(
-            eq(externalAppInstalls.id, authority.installId),
-            eq(externalAppInstalls.state, "active"),
-            eq(externalAppInstalls.providerAppId, authority.providerAppId),
-            eq(externalAppInstalls.providerAuthorityId, authority.providerAuthorityId),
-            eq(externalAppInstalls.connectionEpoch, authority.connectionEpoch),
-            eq(externalAppInstalls.credentialRevision, authority.credentialRevision),
-            eq(externalChannelBindings.state, "active"),
-            eq(externalChannelBindings.providerConversationId, authority.providerConversationId),
-            eq(externalChannelBindings.connectionEpoch, authority.connectionEpoch),
-            eq(externalChannelBindings.bindingEpoch, authority.bindingEpoch),
-            eq(externalAppCredentials.state, "active"),
-            eq(externalAppCredentials.credentialRevision, authority.credentialRevision),
-            or(isNull(externalAppCredentials.expiresAt), gt(externalAppCredentials.expiresAt, requestedAt)),
-            or(isNull(externalAppCredentials.leaseExpiresAt), lte(externalAppCredentials.leaseExpiresAt, requestedAt)),
-          )).for("update").limit(2);
+        // Lock order: slackBridgeRowLocks.ts (install, binding, credential).
+        const locked = await lockSlackInstallCredential(tx, {
+          installId: authority.installId,
+          providerAppId: authority.providerAppId,
+          providerAuthorityId: authority.providerAuthorityId,
+          connectionEpoch: authority.connectionEpoch,
+          credentialRevision: authority.credentialRevision,
+          binding: {
+            bindingId: authority.bindingId,
+            bindingEpoch: authority.bindingEpoch,
+            providerConversationId: authority.providerConversationId,
+          },
+        }, requestedAt);
+        const candidates = locked
+          ? [{
+              installState: locked.install.state,
+              installRegistrationId: locked.install.registrationId,
+              installProviderAppId: locked.install.providerAppId,
+              installProviderTeamId: locked.install.providerTeamId,
+              installProviderAuthorityId: locked.install.providerAuthorityId,
+              installBotUserId: locked.install.botUserId,
+              installConnectionEpoch: locked.install.connectionEpoch,
+              installCredentialRevision: locked.install.credentialRevision,
+              credentialId: locked.credential.id,
+              credentialState: locked.credential.state,
+              encryptedMaterial: locked.credential.encryptedMaterial,
+              envelopeKeyId: locked.credential.envelopeKeyId,
+              aadVersion: locked.credential.aadVersion,
+              credentialRevision: locked.credential.credentialRevision,
+            }]
+          : [];
         if (candidates.length !== 1) return null;
         const current = candidates[0]!;
         if (

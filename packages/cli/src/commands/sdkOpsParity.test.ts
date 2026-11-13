@@ -1,6 +1,7 @@
 /**
  * Text parity between CLI commands and the SDK operations that mirror them
- * (`createRaft().users.info` / `channels.info` / `tasks.show`, implemented in
+ * (`createRaft().users.info` / `channels.info` / `tasks.show` /
+ * `actions.withdraw` / `artifacts.check`, implemented in
  * shared agentOps). Each case runs the real CLI argv (registryPin harness) and
  * the shared operation against the SAME fake Agent API responses, and asserts
  * the CLI's stdout equals the operation's `text` byte for byte; for misses,
@@ -8,7 +9,7 @@
  */
 import { expect, test } from "vitest";
 
-import { channelInfo, createAgentApiClient, showTask, userInfo, type AgentApiClient, type RaftOutcome } from "@botiverse/raft-shared";
+import { artifactsCheck, channelInfo, createAgentApiClient, showTask, userInfo, withdrawQuestionCard, type AgentApiClient, type RaftOutcome } from "@botiverse/raft-shared";
 
 import { runPinned, type FakeRoute } from "./registryPin/harness";
 
@@ -150,7 +151,7 @@ test("channels.info text is the CLI's `raft channel info` (roles, capabilities, 
 
 test("tasks.show text is the CLI's `raft task show` (three description states, done tasks, misses)", async () => {
   const tasks = [
-    { taskNumber: 1, status: "done", title: "Ship it", description: "multi\nline description", createdByName: "richard" },
+    { taskNumber: 1, status: "done", title: "Ship it", description: "multi\nline description", createdByName: "richard", createdByHandle: "richard" },
     { taskNumber: 2, status: "todo", title: "Plan", description: null },
     { taskNumber: 3, status: "in_progress", title: "Omitted description" },
     { taskNumber: 4 },
@@ -164,4 +165,41 @@ test("tasks.show text is the CLI's `raft task show` (three description states, d
   await expectSameMiss(["task", "show", "--target", "#general", "--number", "9"], empty, (api) => showTask(api, { target: "#general", taskNumber: 9 }), "NOT_FOUND");
   const complete: FakeRoute[] = [{ path: /\/tasks\?/, data: { tasks, pagination: { mode: "complete", truncated: false } } }];
   await expectSameMiss(["task", "show", "--target", "#general", "--number", "9"], complete, (api) => showTask(api, { target: "#general", taskNumber: 9 }), "NOT_FOUND");
+});
+
+test("actions.withdraw text is the CLI's `raft action withdraw` (withdrawn, already withdrawn, asked anyone, misses)", async () => {
+  const id = "1a2b3c4d-1111-4222-8333-444455556666";
+  const action = { type: "question:ask", ref: "deploy-1", addressee: { kind: "user", userId: "00000000-0000-4000-8000-000000000001", handle: "tenny" }, questions: [{ id: "window", kind: "text", text: "Which window?" }] };
+  const route = (data: Record<string, unknown>): FakeRoute[] => [{ method: "POST", path: /\/actions\/[^/]+\/withdraw$/, data: { messageId: id, metadata: { kind: "action-card", state: "withdrawn", action }, ...data } }];
+  for (const routes of [route({}), route({ alreadyWithdrawn: true }), route({ metadata: { kind: "action-card", state: "withdrawn", action: { ...action, addressee: { kind: "anyone" } } } })]) {
+    await expectSameText(["action", "withdraw", "--message", "1a2b3c4d"], routes, (api) => withdrawQuestionCard(api, { messageId: "1a2b3c4d" }));
+  }
+  const missing: FakeRoute[] = [{ method: "POST", path: /\/withdraw$/, response: { ok: false, status: 404, error: "No question card with that message id", errorCode: "NOT_FOUND", data: null } }];
+  await expectSameMiss(["action", "withdraw", "--message", "ffffffff"], missing, (api) => withdrawQuestionCard(api, { messageId: "ffffffff" }), "NOT_FOUND");
+});
+
+test("artifacts.check text is the CLI's `raft artifact check` (none, pending, running, failed, skipped, done with no screenshots kept, misses)", async () => {
+  const check = (status: string | null, over: Record<string, unknown> = {}) => ({
+    artifact: { id: "pt_abc", title: "Workspace prototype", currentVersion: 13 },
+    version: 13,
+    check: status === null ? null : {
+      id: "5f0c2d1e-7a2b-4c3d-9e8f-0a1b2c3d4e5f", status, skipReason: null, errorClass: null, findings: null,
+      createdAt: "2026-11-04T10:00:00.000Z", finishedAt: status === "pending" || status === "running" ? null : "2026-11-04T10:01:12.000Z", screenshots: [],
+      ...over,
+    },
+  });
+  // A done check with screenshots differs on purpose: the CLI saves them and lists the files, the operation saves none.
+  for (const data of [
+    check(null),
+    check("pending"),
+    check("running"),
+    check("failed", { errorClass: "load_error:net_error" }),
+    check("skipped", { skipReason: "unchanged" }),
+    check("done", { findings: { consoleErrors: [{ message: "boom", source: "app.js", line: 3 }], blockedResources: [], blank: false, phoneOverflow: null } }),
+  ]) {
+    const routes: FakeRoute[] = [{ path: /\/artifacts\/pt_abc\/check$/, data }];
+    await expectSameText(["artifact", "check", "pt_abc"], routes, (api) => artifactsCheck(api, { artifact: "pt_abc" }));
+  }
+  const hidden: FakeRoute[] = [{ path: /\/check/, response: { ok: false, status: 404, error: "not visible", errorCode: "NOT_VISIBLE", data: null } }];
+  await expectSameMiss(["artifact", "check", "pt_zzz"], hidden, (api) => artifactsCheck(api, { artifact: "pt_zzz" }), "NOT_FOUND");
 });

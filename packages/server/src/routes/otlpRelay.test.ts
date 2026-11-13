@@ -72,6 +72,28 @@ test("otlp relay forwards raw body to configured telescope endpoint", async () =
   assert.equal(Buffer.from(calls[0].init.body as Uint8Array).toString("utf8"), rawBody.toString("utf8"));
 });
 
+test("RAFT_PRIVACY_MODE: the relay forwards nothing, even when fully configured", async () => {
+  const { res, result } = createResponse();
+  let calls = 0;
+
+  await otlpRelayHandler(
+    createRequest({ authorization: "Bearer expected", contentType: "application/json" }) as any,
+    res as any,
+    {
+      authorization: "Bearer expected",
+      targetUrl: "https://telescope.test",
+      privacyMode: true,
+      fetch: async () => {
+        calls += 1;
+        return new Response("", { status: 200 });
+      },
+    },
+  );
+
+  assert.equal(result.statusCode, 404);
+  assert.equal(calls, 0);
+});
+
 test("otlp relay rejects oversized bodies before forwarding", async () => {
   const { res, result } = createResponse();
   let fetchCalled = false;

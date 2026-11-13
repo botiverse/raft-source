@@ -96,7 +96,7 @@ let body = "";
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", (chunk) => {
   body += chunk;
-  writeFileSync(capturePath, JSON.stringify({ argv: process.argv.slice(2), stdin: body }));
+  writeFileSync(capturePath, JSON.stringify({ argv: process.argv.slice(2), stdin: body, entrypoint: process.env.CLAUDE_CODE_ENTRYPOINT, autoMemory: process.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY }));
   process.exit(0);
 });
 setTimeout(() => {
@@ -107,24 +107,37 @@ setTimeout(() => {
       { mode: 0o755 },
     );
 
-    const result = await driver.spawn(makeSpawnContext(tmp, {
-      runtimeConfig: {
-        version: 1,
-        runtime: "claude",
-        provider: { kind: "default" },
-        model: { kind: "preset", id: "sonnet" },
-        mode: { kind: "default" },
-        command: fakeClaudePath,
-      },
-    }));
+    // A daemon launched from inside another Claude Code session inherits this.
+    const inheritedEntrypoint = process.env.CLAUDE_CODE_ENTRYPOINT;
+    process.env.CLAUDE_CODE_ENTRYPOINT = "sdk-cli";
+    let result: Awaited<ReturnType<typeof driver.spawn>>;
+    try {
+      result = await driver.spawn(makeSpawnContext(tmp, {
+        runtimeConfig: {
+          version: 1,
+          runtime: "claude",
+          provider: { kind: "default" },
+          model: { kind: "preset", id: "sonnet" },
+          mode: { kind: "default" },
+          command: fakeClaudePath,
+        },
+      }));
+    } finally {
+      if (inheritedEntrypoint === undefined) delete process.env.CLAUDE_CODE_ENTRYPOINT;
+      else process.env.CLAUDE_CODE_ENTRYPOINT = inheritedEntrypoint;
+    }
     await once(result.process, "exit");
 
     const capture = JSON.parse(readFileSync(capturePath, "utf8")) as {
       argv: string[];
       stdin: string;
+      entrypoint?: string;
+      autoMemory?: string;
       timeout?: boolean;
     };
     assert.equal(capture.timeout, undefined);
+    assert.equal(capture.entrypoint, "raft", "the session is labelled raft, overriding an inherited sdk-cli");
+    assert.equal(capture.autoMemory, "1", "Claude Code auto memory is off; the workspace MEMORY.md is the only one");
     assert.equal(capture.argv[capture.argv.indexOf("--input-format") + 1], "stream-json");
     assert.equal(capture.argv[capture.argv.indexOf("--output-format") + 1], "stream-json");
     assert.equal(capture.argv[capture.argv.indexOf("--model") + 1], "sonnet");
@@ -283,7 +296,7 @@ process.exit(0);
   }
 });
 
-test("claude custom provider spawn clears inherited Claude provider env", async () => {
+async function spawnCustomProviderCapture(provider: Record<string, unknown>) {
   const tmp = mkdtempSync(path.join(os.tmpdir(), "slock-claude-command-"));
   const capturePath = path.join(tmp, "capture.json");
   const fakeClaudePath = path.join(tmp, "fake-claude.mjs");
@@ -303,9 +316,10 @@ process.stdin.on("data", () => {
   writeFileSync(capturePath, JSON.stringify({
     hostProviderEnvPresent: Object.fromEntries(clearedKeys.map((key) => [
       key,
-      Object.prototype.hasOwnProperty.call(process.env, key),
+      Object.prototype.hasOwnProperty.call(process.env, key) && process.env[key] === "host-" + key,
     ])),
     anthropicApiKey: process.env.ANTHROPIC_API_KEY,
+    anthropicAuthToken: process.env.ANTHROPIC_AUTH_TOKEN,
     anthropicBaseUrl: process.env.ANTHROPIC_BASE_URL,
   }));
   process.exit(0);
@@ -318,7 +332,7 @@ process.stdin.on("data", () => {
       runtimeConfig: {
         version: 1,
         runtime: "claude",
-        provider: { kind: "custom", apiUrl: "https://gateway.example.test/v1", apiKey: "sk-ant-test" },
+        provider,
         model: { kind: "preset", id: "sonnet" },
         mode: { kind: "default" },
         reasoningEffort: null,
@@ -327,16 +341,12 @@ process.stdin.on("data", () => {
     }));
     await once(result.process, "exit");
 
-    const capture = JSON.parse(readFileSync(capturePath, "utf8")) as {
+    return JSON.parse(readFileSync(capturePath, "utf8")) as {
       hostProviderEnvPresent: Record<string, boolean>;
       anthropicApiKey?: string;
+      anthropicAuthToken?: string;
       anthropicBaseUrl?: string;
     };
-    for (const key of CLAUDE_CUSTOM_PROVIDER_HOST_ENV_KEYS) {
-      assert.equal(capture.hostProviderEnvPresent[key], false, `${key} should be absent`);
-    }
-    assert.equal(capture.anthropicApiKey, "sk-ant-test");
-    assert.equal(capture.anthropicBaseUrl, "https://gateway.example.test/v1");
   } finally {
     for (const key of CLAUDE_CUSTOM_PROVIDER_HOST_ENV_KEYS) {
       const previous = previousProviderEnv.get(key);
@@ -348,6 +358,31 @@ process.stdin.on("data", () => {
     }
     rmSync(tmp, { recursive: true, force: true });
   }
+}
+
+test("claude custom provider spawn clears inherited Claude provider env", async () => {
+  const capture = await spawnCustomProviderCapture({ kind: "custom", apiUrl: "https://gateway.example.test/v1", apiKey: "sk-ant-test" });
+  for (const key of CLAUDE_CUSTOM_PROVIDER_HOST_ENV_KEYS) {
+    assert.equal(capture.hostProviderEnvPresent[key], false, `host ${key} should not reach the runtime`);
+  }
+  assert.equal(capture.anthropicApiKey, "sk-ant-test");
+  assert.equal(capture.anthropicAuthToken, undefined);
+  assert.equal(capture.anthropicBaseUrl, "https://gateway.example.test/v1");
+});
+
+test("claude custom provider with a Bearer token sends ANTHROPIC_AUTH_TOKEN and no host ANTHROPIC_API_KEY", async () => {
+  const capture = await spawnCustomProviderCapture({
+    kind: "custom",
+    apiUrl: "https://gateway.example.test/v1",
+    apiKey: "bearer-test",
+    authType: "auth_token",
+  });
+  for (const key of CLAUDE_CUSTOM_PROVIDER_HOST_ENV_KEYS) {
+    assert.equal(capture.hostProviderEnvPresent[key], false, `host ${key} should not reach the runtime`);
+  }
+  assert.equal(capture.anthropicAuthToken, "bearer-test");
+  assert.equal(capture.anthropicApiKey, undefined);
+  assert.equal(capture.anthropicBaseUrl, "https://gateway.example.test/v1");
 });
 
 test("claude custom provider warns once when legacy isolated config dir exists", async () => {
@@ -434,6 +469,8 @@ test("claude custom provider launch only clears inherited provider env", () => {
     assert.equal(Object.prototype.hasOwnProperty.call(env, "CLAUDE_CONFIG_DIR"), false);
     assert.equal(Object.prototype.hasOwnProperty.call(env, "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST"), false);
     for (const key of CLAUDE_CUSTOM_PROVIDER_HOST_ENV_KEYS) {
+      // The provider sets ANTHROPIC_API_KEY itself, so that one is not cleared.
+      if (key === "ANTHROPIC_API_KEY") continue;
       assert.equal(Object.prototype.hasOwnProperty.call(env, key), true, `${key} should be cleared`);
       assert.equal(env[key], undefined);
     }
@@ -555,4 +592,25 @@ test("task #1277 (launch): a claude spawn with an already-cancelled launch signa
     process.env.PATH = previousPath;
     rmSyncLC(root, { recursive: true, force: true });
   }
+});
+
+test("task #25 step 2: ClaudeDriver encodes the stream-json interrupt control request", () => {
+  const driver = new ClaudeDriver();
+  assert.deepEqual(JSON.parse(driver.encodeInterruptRequest()), {
+    type: "control_request",
+    request_id: "raft-interrupt-1",
+    request: { subtype: "interrupt" },
+  });
+  assert.equal(JSON.parse(driver.encodeInterruptRequest()).request_id, "raft-interrupt-2");
+});
+
+test("#proj-runtime:#41: claude driver stops one subagent with stop_task by its task id; its answer is not an event", () => {
+  const driver = new ClaudeDriver();
+  const first = JSON.parse(driver.encodeSubagentInterruptRequest("a95d2fee03aad9ac2"));
+  assert.deepEqual(first, { type: "control_request", request_id: "raft-stop-task-1", request: { subtype: "stop_task", task_id: "a95d2fee03aad9ac2" } });
+  assert.equal(JSON.parse(driver.encodeSubagentInterruptRequest("b")).request_id, "raft-stop-task-2", "each request has its own id");
+  // As captured on 2.1.304: the success answer, and the stopped task's own end.
+  assert.deepEqual(driver.parseLine(JSON.stringify({ type: "control_response", response: { subtype: "success", request_id: "raft-stop-task-1", response: {} } })), []);
+  const ended = driver.parseLine(JSON.stringify({ type: "system", subtype: "task_notification", task_id: "a95d2fee03aad9ac2", tool_use_id: "toolu_spawn1", status: "stopped" }));
+  assert.deepEqual(ended.map((event) => [event.kind, (event as { taskStatus?: string }).taskStatus]), [["subagent_progress", "stopped"]]);
 });

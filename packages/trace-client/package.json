@@ -1,18 +1,21 @@
 {
   "name": "@botiverse/raft-trace-client",
   "version": "0.0.1",
-  "license": "FSL-1.1-ALv2",
+  "license": "LicenseRef-Raft-License",
   "private": true,
   "type": "module",
   "main": "src/index.ts",
   "scripts": {
     "test": "vitest run",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsrs --noEmit",
+    "typecheck:tsc": "tsc --noEmit"
   },
   "devDependencies": {
-    "@botiverse/raft-shared": "workspace:*",
     "@types/node": "^25.5.0",
     "typescript": "^6.0.3",
     "vitest": "^5.0.3"
+  },
+  "dependencies": {
+    "@botiverse/raft-shared": "workspace:*"
   }
 }

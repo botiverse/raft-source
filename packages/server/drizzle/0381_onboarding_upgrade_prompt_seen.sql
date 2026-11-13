@@ -1,0 +1,1 @@
+ALTER TABLE "server_members" ADD COLUMN "setup_upgrade_prompt_seen_at" timestamp with time zone;

@@ -177,7 +177,7 @@ test("acceptInvite compares invite email case-insensitively for legacy mixed-cas
 // Provenance: task #69. Storing the invited role is only half of it — accepting
 // has to honour it. Before this, acceptInvite passed a hardcoded "member", so a
 // Guest invite would have produced a full member and nothing would have said so.
-test("acceptInvite grants the role stored on the invite, not a hardcoded member", async ({ db: database }) => {
+test("acceptInvite grants the stored member role, not a hardcoded one, and refuses a stored Guest invite", async ({ db: database }) => {
   const db = getDb();
 
   const mk = async (id: string, email: string, name: string) => (await db.insert(users).values({
@@ -216,11 +216,12 @@ test("acceptInvite grants the role stored on the invite, not a hardcoded member"
     return row?.role;
   };
 
-  assert.equal(
-    await accept("a".repeat(64), guestInvitee, "guest"),
-    "guest",
-    "a Guest invite must produce a Guest, or the inviter gave away more access than they chose",
-  );
+  // A stored Guest server invite is refused, never turned into a membership:
+  // a Guest belongs to one channel and is invited to that channel (#wg-rbac:#15).
+  await assert.rejects(accept("a".repeat(64), guestInvitee, "guest"), /This invite has been revoked/);
+  const [guestRow] = await db.select({ role: serverMembers.role }).from(serverMembers)
+    .where(and(eq(serverMembers.serverId, server.id), eq(serverMembers.userId, guestInvitee.id)));
+  assert.equal(guestRow, undefined, "no Guest without a channel, and no Member either");
   assert.equal(
     await accept("b".repeat(64), memberInvitee, "member"),
     "member",

@@ -4,19 +4,72 @@
 // never a raw server body (binding constraint).
 import { fetch } from "undici";
 import { computerFetch } from "./proxy";
+import { isValidServerId } from "./paths";
+import { COMPUTER_VERSION } from "./version";
 import { classifyAdoptLegacyAccessResponse, type AdoptLegacyAccessResult } from "./lib/adoptLegacyResponse";
 
 export interface DeviceAuthorizeResult {
   deviceCode: string;
   userCode: string;
   verificationUri: string;
-  verificationUriComplete?: string;
   expiresIn: number;
   interval: number;
 }
 
+/**
+ * A one-time grant asked for at authorize (device-auth design v2 §3.1): "add
+ * this machine to a server", the server picked on the approval page. An
+ * older server ignores it and answers the poll with a session instead.
+ */
+export interface ComputerAttachGrantRequest {
+  kind: "computer_attach";
+  machineName: string;
+  hostname: string;
+  os: string;
+}
+
+/**
+ * A one-time grant for `raft-computer setup`'s legacy-daemon migration: "move
+ * this machine's old daemon on a server over", the server picked on the
+ * approval page. The token it yields reads only the approver's own legacy
+ * roster on that server and adopts one old daemon there, once: one of those,
+ * or by its machine id another member's when the approver is an owner or admin. A server
+ * older than this grant kind refuses it at authorize (DeviceGrantRejectedError).
+ */
+export interface ComputerMigrateGrantRequest {
+  kind: "computer_migrate";
+  machineName: string;
+  hostname: string;
+  os: string;
+}
+
+export type DeviceGrantRequest = ComputerAttachGrantRequest | ComputerMigrateGrantRequest;
+
+export const ATTACH_TOKEN_PREFIX = "dvat_";
+export const MIGRATE_TOKEN_PREFIX = "dvmt_";
+
+/**
+ * The server refused the grant itself at authorize (400 `grant_invalid` /
+ * `grant_kind_unsupported`): a server that has one-time grants but not this
+ * kind. Nothing was started there.
+ */
+export class DeviceGrantRejectedError extends Error {
+  constructor(readonly code: string) {
+    super(`the server does not support this kind of approval (${code})`);
+    this.name = "DeviceGrantRejectedError";
+  }
+}
+
+/** Per-request budget for one device-token poll. */
+export const DEVICE_TOKEN_TIMEOUT_MS = 15_000;
+
 export type DeviceTokenResult =
+  /** A device session: the legacy (grant-less) answer, also what a server older than one-time grants returns for a grant. */
   | { status: "success"; accessToken: string; refreshToken: string; userId: string }
+  /** A one-time attach token (`dvat_*`, single use, minutes) for the server the person picked. Never a session. */
+  | { status: "attach_token"; attachToken: string; serverId: string; serverSlug: string }
+  /** A migrate token (`dvmt_*`, minutes) for the server the person picked: the legacy roster and one adoption there. Never a session. */
+  | { status: "migrate_token"; migrateToken: string; serverId: string; serverSlug: string }
   | { status: "pending" }
   | { status: "denied" }
   | { status: "expired" }
@@ -29,16 +82,27 @@ export class DeviceAuthClient {
     return new URL(p, this.baseUrl).toString();
   }
 
-  async authorize(clientName: string): Promise<DeviceAuthorizeResult> {
+  async authorize(clientName: string, grant?: DeviceGrantRequest): Promise<DeviceAuthorizeResult> {
     const res = await computerFetch(this.url("/api/auth/device/authorize"), {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ clientName }),
+      // #wg-device-auth:#1: the Server records the requester's User-Agent on
+      // the authorization, so a login can be traced to the Computer version
+      // that started it (undici's default names no version).
+      headers: { "Content-Type": "application/json", "User-Agent": `raft-computer/${COMPUTER_VERSION}` },
+      body: JSON.stringify(grant ? { clientName, grant } : { clientName }),
     });
     if (res.status === 404) {
       throw new Error(
         "device login is not enabled on this server (ask an admin to unset SLOCK_DEVICE_LOGIN_ENABLED or set it back to a non-false value; this surface is on by default since PR-G — upgrade the server if you are on an older build)",
       );
+    }
+    if (res.status === 400 && grant) {
+      const refused = (await res.json().catch(() => null)) as Record<string, unknown> | null;
+      const code = refused && typeof refused.code === "string" ? refused.code : null;
+      // grant_kind_unsupported: the server does not know this kind (REFUSAL_CODES).
+      // grant_invalid: what Servers from before that code answer for an unknown
+      // kind; drop it once no supported Server answers that way.
+      if (code === "grant_kind_unsupported" || code === "grant_invalid") throw new DeviceGrantRejectedError(code);
     }
     if (res.status !== 201) {
       throw new Error(`device authorize failed (HTTP ${res.status}) — check --server-url / server version`);
@@ -50,13 +114,61 @@ export class DeviceAuthClient {
     return body;
   }
 
-  async token(deviceCode: string): Promise<DeviceTokenResult> {
+  /**
+   * One poll. Bounded by DEVICE_TOKEN_TIMEOUT_MS so a stalled socket fails
+   * (TimeoutError) instead of hanging the poll; `signal` (the caller's
+   * cancel) aborts it too.
+   */
+  async token(deviceCode: string, signal?: AbortSignal): Promise<DeviceTokenResult> {
+    const timeout = AbortSignal.timeout(DEVICE_TOKEN_TIMEOUT_MS);
     const res = await computerFetch(this.url("/api/auth/device/token"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ deviceCode }),
+      signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
     });
     const body = (await res.json().catch(() => null)) as Record<string, unknown> | null;
+    // A one-time grant's answer is recognised by its shape: `kind` plus a
+    // `dvat_*` token. A session is only ever taken from an answer that is not
+    // a grant answer, so an answer carrying both is never read as a session.
+    if (res.status === 200 && body && body.kind === "computer_attach") {
+      if (
+        typeof body.attachToken === "string" &&
+        body.attachToken.startsWith(ATTACH_TOKEN_PREFIX) &&
+        typeof body.serverId === "string" &&
+        // A server id names a local directory (servers/<id>/): only a UUID.
+        isValidServerId(body.serverId) &&
+        typeof body.serverSlug === "string" &&
+        body.serverSlug.length > 0
+      ) {
+        return {
+          status: "attach_token",
+          attachToken: body.attachToken,
+          serverId: body.serverId,
+          serverSlug: body.serverSlug,
+        };
+      }
+      return { status: "error", code: "unexpected_response" };
+    }
+    if (res.status === 200 && body && body.kind === "computer_migrate") {
+      if (
+        typeof body.migrateToken === "string" &&
+        body.migrateToken.startsWith(MIGRATE_TOKEN_PREFIX) &&
+        body.migrateToken.length > MIGRATE_TOKEN_PREFIX.length &&
+        typeof body.serverId === "string" &&
+        isValidServerId(body.serverId) &&
+        typeof body.serverSlug === "string" &&
+        body.serverSlug.length > 0
+      ) {
+        return {
+          status: "migrate_token",
+          migrateToken: body.migrateToken,
+          serverId: body.serverId,
+          serverSlug: body.serverSlug,
+        };
+      }
+      return { status: "error", code: "unexpected_response" };
+    }
     if (res.status === 200 && body && typeof body.accessToken === "string") {
       return {
         status: "success",
@@ -73,50 +185,6 @@ export class DeviceAuthClient {
   }
 }
 
-export type UnreadActivityDiagnosticResult =
-  | { status: "success"; snapshot: Record<string, unknown> }
-  | { status: "auth_required" }
-  | { status: "forbidden" }
-  | { status: "error"; code: "request_failed" | "unexpected_shape" | `http_${number}` };
-
-/**
- * Fetch the current session receiver's Server-owned unread/Activity
- * diagnostic snapshot. This transport deliberately performs no local unread
- * query and does not accept any user/agent/session identity. The caller must
- * run the one shared validator before serialization or disk side effects.
- */
-export class UnreadActivityDiagnosticClient {
-  constructor(
-    private readonly baseUrl: string,
-    private readonly accessToken: string,
-  ) {}
-
-  async get(serverId?: string): Promise<UnreadActivityDiagnosticResult> {
-    const url = new URL("/api/diagnostics/unread-activity", this.baseUrl);
-    if (serverId) url.searchParams.set("serverId", serverId);
-    let response: Awaited<ReturnType<typeof fetch>>;
-    try {
-      response = await computerFetch(url.toString(), {
-        method: "GET",
-        headers: {
-          Accept: "application/json",
-          Authorization: `Bearer ${this.accessToken}`,
-        },
-      });
-    } catch {
-      return { status: "error", code: "request_failed" };
-    }
-    if (response.status === 401) return { status: "auth_required" };
-    if (response.status === 403) return { status: "forbidden" };
-    if (response.status !== 200) return { status: "error", code: `http_${response.status}` };
-
-    const snapshot = await response.json().catch(() => null) as unknown;
-    if (snapshot === null || typeof snapshot !== "object" || Array.isArray(snapshot)) {
-      return { status: "error", code: "unexpected_shape" };
-    }
-    return { status: "success", snapshot: snapshot as Record<string, unknown> };
-  }
-}
 // --- Computer attach (RFC v0.8 contract v3 §6/§9) ---
 // `attach` consumes an existing USER session (from `login`) to create/
 // resume this machine's Computer attachment, then runs the §9 read-only
@@ -209,6 +277,9 @@ export class ComputerAttachClient {
         resumed: body.resumed === true,
       };
     }
+    // A one-time attach token the server refused (invalid / expired / used /
+    // for another server): its own codes, never "session expired".
+    if (code && code.startsWith("attach_token_")) return { status: "error", code };
     if (res.status === 401) return { status: "error", code: "session_invalid" };
     // The server distinguishes "you're a member but lack the manageMachines
     // capability" (requires_admin) from the membership/existence collapse
@@ -260,6 +331,9 @@ export class ComputerAttachClient {
       };
     }
     const code = body && typeof body.code === "string" ? (body.code as string) : undefined;
+    // A migrate token the server no longer takes (expired / used / revoked):
+    // the credential needs renewing, like an expired session.
+    if (isMigrateTokenRefusal(code)) return { status: "auth_required" };
     if (res.status === 401) {
       if (code === "legacy_key_invalid") return { status: "legacy_key_invalid" };
       if (code === "auth_required") return { status: "auth_required" };
@@ -316,6 +390,9 @@ export class ComputerAttachClient {
       };
     }
     const code = body && typeof body.code === "string" ? (body.code as string) : undefined;
+    // A migrate token the server no longer takes (expired / used / revoked):
+    // the credential needs renewing, like an expired session.
+    if (isMigrateTokenRefusal(code)) return { status: "auth_required" };
     if (res.status === 401) {
       if (code === "legacy_key_invalid") return { status: "legacy_key_invalid" };
       if (code === "auth_required") return { status: "auth_required" };
@@ -332,8 +409,9 @@ export class ComputerAttachClient {
 
   /**
    * POST /api/computer/adopt-legacy — user-authed manual server-row adoption.
-   * The target Server's `manageMachines` permission authorizes a row bound to
-   * that Server; caller row ownership and local fingerprint bytes are not required.
+   * A row bound to the target Server that is the caller's own, or any row
+   * there for a caller with `registerMachines`; local fingerprint bytes are
+   * not required.
    */
   async adoptLegacyByDaemonId(input: {
     serverSlug: string;
@@ -369,6 +447,9 @@ export class ComputerAttachClient {
       };
     }
     const code = body && typeof body.code === "string" ? (body.code as string) : undefined;
+    // A migrate token the server no longer takes (expired / used / revoked):
+    // the credential needs renewing, like an expired session.
+    if (isMigrateTokenRefusal(code)) return { status: "auth_required" };
     if (res.status === 401) {
       if (code === "auth_required") return { status: "auth_required" };
       return { status: "unexpected_response", httpStatus: res.status, ...(code ? { code } : {}) };
@@ -408,6 +489,11 @@ export class ComputerAttachClient {
       body && typeof body.code === "string" ? (body.code as string) : `http_${res.status}`;
     return { ok: false, code };
   }
+}
+
+/** A migrate token (`dvmt_*`) the server refused as expired, used or unknown. */
+function isMigrateTokenRefusal(code: unknown): boolean {
+  return code === "migrate_token_invalid" || code === "migrate_token_expired" || code === "migrate_token_consumed";
 }
 
 // --- Legacy machine roster (RFC v9.9 §X.2) ---
@@ -649,7 +735,7 @@ export class LegacyMachinesClient {
         .filter((entry): entry is LegacyMachineRosterEntry => entry !== null);
       return { status: "success", entries };
     }
-    if (res.status === 401) return { status: "auth_required" };
+    if (res.status === 401 || isMigrateTokenRefusal(body?.code)) return { status: "auth_required" };
     if (res.status === 403) return { status: "not_authorized" };
     if (res.status === 404) return { status: "disabled" };
     const code = body && typeof body.code === "string" ? (body.code as string) : `http_${res.status}`;
@@ -693,7 +779,7 @@ export class LegacyMachinesClient {
         .filter((entry): entry is LegacyMachineManualEntry => entry !== null);
       return { status: "success", entries };
     }
-    if (res.status === 401) return { status: "auth_required" };
+    if (res.status === 401 || isMigrateTokenRefusal(body?.code)) return { status: "auth_required" };
     if (res.status === 403) return { status: "not_authorized" };
     if (res.status === 404) return { status: "disabled" };
     const code = body && typeof body.code === "string" ? (body.code as string) : `http_${res.status}`;
@@ -838,4 +924,151 @@ export class RunnersClient {
     const code = body && typeof body.code === "string" ? (body.code as string) : `http_${res.status}`;
     return { status: "error", code };
   }
+}
+
+// --- This Computer's own row and detach (device-auth PR 3c) ---
+// Authenticated with the server's own sk_computer_* from runner.state.json,
+// never a person's session. The server answers for the key's own Computer
+// only.
+
+/**
+ * An older server has no such route: under the claimed `/internal/computer/`
+ * prefix its auth registry answers 401 `auth_policy_unregistered_path`; any
+ * other path answers 404. Never a reason to try another credential on its own:
+ * a plain 401 means the key itself was refused.
+ */
+export function isMachineKeyRouteUnavailable(status: number, body: Record<string, unknown> | null): boolean {
+  return status === 404 || (status === 401 && body?.code === "auth_policy_unregistered_path");
+}
+
+export interface ComputerSelf {
+  computerId: string;
+  computerName: string;
+  serverId: string;
+  machineId: string;
+  machineName: string;
+  agentCount: number;
+}
+
+export type ComputerSelfResult =
+  | { status: "success"; computer: ComputerSelf }
+  /** An older server without GET /internal/computer/self. */
+  | { status: "route_unavailable" }
+  | { status: "unauthorized"; code: string }
+  | { status: "error"; code: string };
+
+/** Someone else's agent on this machine that refused a detach (409 `others_agents_on_computer`). */
+export interface DetachBlockingAgent {
+  id: string;
+  name: string;
+  /** Who it belongs to; null when nobody can be asked (an agent made it, or its person left). */
+  ownerName: string | null;
+}
+
+export type ComputerDetachResult =
+  | { status: "detached" }
+  /**
+   * Other people's agents run on this machine (409 `others_agents_on_computer`):
+   * nothing was revoked until they are moved or named in `forceAgentIds`.
+   */
+  | { status: "others_agents"; agents: DetachBlockingAgent[] }
+  /** An older server without POST /internal/computer/detach. */
+  | { status: "route_unavailable" }
+  /** The server refused this key (revoked, unknown, or a legacy machine key). */
+  | { status: "unauthorized"; httpStatus: number; code: string }
+  | { status: "error"; code: string };
+
+function bodyCode(status: number, body: Record<string, unknown> | null): string {
+  return body && typeof body.code === "string" ? body.code : `http_${status}`;
+}
+
+export class ComputerSelfClient {
+  constructor(
+    private readonly baseUrl: string,
+    private readonly computerApiKey: string,
+  ) {}
+
+  private url(p: string): string {
+    return new URL(p, this.baseUrl).toString();
+  }
+
+  async self(): Promise<ComputerSelfResult> {
+    let res: Awaited<ReturnType<typeof fetch>>;
+    try {
+      res = await computerFetch(this.url("/internal/computer/self"), {
+        method: "GET",
+        headers: { Authorization: `Bearer ${this.computerApiKey}` },
+      });
+    } catch {
+      return { status: "error", code: "request_failed" };
+    }
+    const body = (await res.json().catch(() => null)) as Record<string, unknown> | null;
+    if (isMachineKeyRouteUnavailable(res.status, body)) return { status: "route_unavailable" };
+    const raw = body?.computer;
+    if (res.status === 200 && raw && typeof raw === "object") {
+      const c = raw as Record<string, unknown>;
+      if (typeof c.computerId === "string" && typeof c.machineId === "string" && typeof c.serverId === "string") {
+        return {
+          status: "success",
+          computer: {
+            computerId: c.computerId,
+            computerName: typeof c.computerName === "string" ? c.computerName : "",
+            serverId: c.serverId,
+            machineId: c.machineId,
+            machineName: typeof c.machineName === "string" ? c.machineName : "",
+            agentCount: typeof c.agentCount === "number" && Number.isFinite(c.agentCount)
+              ? Math.max(0, Math.trunc(c.agentCount))
+              : 0,
+          },
+        };
+      }
+      return { status: "error", code: "invalid_response" };
+    }
+    if (res.status === 401 || res.status === 403) return { status: "unauthorized", code: bodyCode(res.status, body) };
+    return { status: "error", code: bodyCode(res.status, body) };
+  }
+
+  /**
+   * POST /internal/computer/detach: revoke this key and the runner keys its
+   * machine minted. `forceAgentIds`: other people's agents on this machine to
+   * unbind and stop with it (the ids a previous `others_agents` answer listed).
+   */
+  async detach(forceAgentIds: readonly string[] = []): Promise<ComputerDetachResult> {
+    let res: Awaited<ReturnType<typeof fetch>>;
+    try {
+      res = await computerFetch(this.url("/internal/computer/detach"), {
+        method: "POST",
+        headers: { Authorization: `Bearer ${this.computerApiKey}`, "Content-Type": "application/json" },
+        body: forceAgentIds.length > 0 ? JSON.stringify({ forceAgentIds }) : "{}",
+      });
+    } catch {
+      return { status: "error", code: "request_failed" };
+    }
+    const body = (await res.json().catch(() => null)) as Record<string, unknown> | null;
+    if (isMachineKeyRouteUnavailable(res.status, body)) return { status: "route_unavailable" };
+    if (res.status === 200 && body?.ok === true) return { status: "detached" };
+    if (res.status === 409 && body?.code === "others_agents_on_computer" && Array.isArray(body.agents)) {
+      return { status: "others_agents", agents: parseDetachBlockingAgents(body.agents) };
+    }
+    if (res.status === 401 || res.status === 403) {
+      return { status: "unauthorized", httpStatus: res.status, code: bodyCode(res.status, body) };
+    }
+    return { status: "error", code: bodyCode(res.status, body) };
+  }
+}
+
+function parseDetachBlockingAgents(raw: unknown[]): DetachBlockingAgent[] {
+  const agents: DetachBlockingAgent[] = [];
+  for (const item of raw) {
+    if (!item || typeof item !== "object") continue;
+    const agent = item as Record<string, unknown>;
+    if (typeof agent.id !== "string" || agent.id.length === 0) continue;
+    const owner = agent.owner && typeof agent.owner === "object" ? agent.owner as Record<string, unknown> : null;
+    agents.push({
+      id: agent.id,
+      name: typeof agent.name === "string" ? agent.name : "",
+      ownerName: owner && typeof owner.name === "string" ? owner.name : null,
+    });
+  }
+  return agents;
 }

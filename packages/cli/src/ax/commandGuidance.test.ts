@@ -14,6 +14,8 @@ import { DatabaseSync } from "node:sqlite";
 import { defineCommand, registerCliCommand } from "../core/command";
 import { CliExit } from "../core/errors";
 import { probeLedgerWritable, resolveStateDbPath } from "../state/agentLedger";
+import { readPassiveRenderCountsForTest } from "../state/passiveRenderCountsTestReader";
+import { __setCliTraceSinkForTest, type CliTraceSpanRecord } from "../transportTrace";
 import { attachGuidanceToHelp, GUIDANCE_HOLD_HEADER, MAX_GUIDANCE_CHARS, MAX_GUIDANCE_LINES } from "./commandGuidance";
 
 const AGENT = "guidance-agent";
@@ -131,6 +133,28 @@ test("C2 an unchanged re-run executes", async () => {
   const second = await run(s.env);
   assert.equal(second.executed, true);
   assert.equal(second.stdout, "created\n", "no guidance once delivered in this context");
+});
+
+test("each guided run leaves one cli.guidance.decision span: the hold, then the re-run, with the same args hash and context (#wg-ax:#25)", async () => {
+  const s = seat();
+  s.setSignal("ctx-A");
+  const spans: CliTraceSpanRecord[] = [];
+  __setCliTraceSinkForTest((record) => { spans.push(record); });
+  try {
+    await run(s.env);
+    await run(s.env);
+  } finally {
+    __setCliTraceSinkForTest(null);
+  }
+  const decisions = spans.filter((span) => span.name === "cli.guidance.decision");
+  assert.deepEqual(decisions.map((span) => span.attrs.decision), ["hold", "pass"]);
+  for (const span of decisions) {
+    assert.equal(span.attrs.command, "task create");
+    assert.equal(span.attrs.context_id, "ctx-A");
+    assert.equal(span.attrs.agentId, AGENT);
+    assert.match(String(span.attrs.args_hash), /^[0-9a-f]{16}$/);
+  }
+  assert.equal(decisions[0]!.attrs.args_hash, decisions[1]!.attrs.args_hash, "an unchanged re-run has the same hash");
 });
 
 test("C3 a new context, and C4 a changed guidance text, each hold once more", async () => {
@@ -347,4 +371,19 @@ test("a pre-release observations table without context_id gains the column and r
   const rows = check.prepare("SELECT COUNT(*) AS n FROM observations").get() as { n: number };
   check.close();
   assert.equal(Number(rows.n), 1, "migrated in place, not dropped");
+});
+
+test("held and attached guidance is counted for the daemon's turn report; --help and plain runs are not", async () => {
+  const s = seat();
+  s.setSignal("ctx-A");
+  const held = await run(s.env);
+  await run(s.env);
+  await help(s.env);
+  s.setSignal("ctx-B", false);
+  const attached = await run(s.env);
+  const attachedGuidance = attached.stdout.slice(0, -"created\n".length);
+  assert.deepEqual(readPassiveRenderCountsForTest(AGENT, s.env), [
+    { contextId: "ctx-A", kind: "command_guidance", renders: 1, chars: held.stdout.length, bytes: Buffer.byteLength(held.stdout, "utf8") },
+    { contextId: "ctx-B", kind: "command_guidance", renders: 1, chars: attachedGuidance.length, bytes: Buffer.byteLength(attachedGuidance, "utf8") },
+  ]);
 });

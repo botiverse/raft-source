@@ -1,14 +1,60 @@
+import { LocalAgentInboxes } from "./localAgentInboxes";
+import { recordAgentSystemRestart } from "./agentOperatorEvents";
+import { inboxItemsLaunch, inboxItemsOnWith } from "./inboxItemsLaunch";
 import { EventEmitter } from "node:events";
+import { AgentActivityStateFanout } from "./agentActivityStateFanout";
+import { AGENT_ACTIVITY_STATE_EVENT, agentActivityCapableServerRoom, agentActivityRoom } from "@botiverse/raft-shared";
 import { closeConnectionsForDrain, MACHINE_DRAIN_CLOSE_CODE, MACHINE_DRAIN_CLOSE_REASON } from "./machineDrain";
 import crypto from "node:crypto";
 import type { Server as SocketServer } from "socket.io";
+import { agentActivityStateRoom, agentEventRoom, socketUserServerRoom } from "../socket/platformScope";
+import { projectRuntimeErrorActivityDetail } from "./agentRuntimeErrorVisibility";
 import type { WebSocket } from "ws";
 import {
+  DAEMON_LOG_TURN_BOUNDARIES,
+  isRuntimeProgressEntry,
+  readDaemonTurnSummary,
   summarizeTurnsFromLog,
   type ActivityTurnOutcome,
   type ExternalHookTurnBoundary,
   type ActivityTurnSummary,
+  DAEMON_CAPABILITY_RUNTIME_HOST_OAR,
+  DAEMON_CAPABILITY_RUNTIME_HOST_OAR_CODEX,
+  DAEMON_CAPABILITY_RUNTIME_HOST_OAR_CURSOR,
+  DAEMON_CAPABILITY_RUNTIME_HOST_OAR_GROK,
+  DAEMON_CAPABILITY_AGENT_CONFIG_PUSH,
+  DAEMON_CAPABILITY_CONTROL_START_CATCHUP_V1,
   DAEMON_CAPABILITY_SEQUENCED_STATUS,
+  DAEMON_CAPABILITY_INTERRUPT_SUBAGENT,
+  DAEMON_CAPABILITY_INTERRUPT_TURN,
+  DAEMON_CAPABILITY_COMPUTER_UPGRADE_DRAIN_V1,
+  COMPUTER_UPGRADE_DRAIN_MAX_DEADLINE_MS,
+  COMPUTER_UPGRADE_DRAIN_MAX_LISTED_AGENTS,
+  DAEMON_CAPABILITY_STARTUP_READINESS,
+  parseCredentialRestoredMessage,
+  parseRuntimeReadinessReport,
+  RUNTIME_AUTH_LOGOUT_RELAY_BUDGET_MS,
+  RUNTIME_AUTH_PROVIDER_RELAY_BUDGET_MS,
+  RUNTIME_AUTH_RUNTIMES,
+  asRuntimeAuthLoginId,
+  runtimeAuthLoginEventSchema,
+  runtimeAuthLoginResultSchema,
+  runtimeAuthProviderConnectResultSchema,
+  runtimeAuthProvidersResultSchema,
+  runtimeAuthLogoutRuntimesOfComputer,
+  runtimeAuthRuntimesOfComputer,
+  runtimeAuthStatusReportSchema,
+  isRuntimeAuthRuntime,
+  runtimeAuthSupports,
+  type RuntimeAuthLoginEventPush,
+  type RuntimeAuthLoginResultPush,
+  type RuntimeAuthLogoutResult,
+  type RuntimeAuthProviderConnectInput,
+  type RuntimeAuthProviderConnectResult,
+  type RuntimeAuthProvidersResult,
+  type RuntimeAuthRuntime,
+  type AgentSubagentInterruptOutcome,
+  type AgentTurnInterruptOutcome,
   DAEMON_CAPABILITY_RUNTIME_OUTCOME_V1,
   type AgentWakeRefusedReason,
   asMachineId,
@@ -21,12 +67,14 @@ import {
   type RaftAgentStatus,
   createTraceScopeTracer,
   currentDate,
+  currentRandomUnit,
   currentTimeMs,
   failpoints,
   formatTraceparent,
   getStaticRuntimeModelSourceSet,
   getToolActivityLabel,
   hydrateRuntimeConfig,
+  sharedCredentialsAuthRuntime,
   isAgentActivityDetailKind,
   isExternalAgentRuntime,
   noopTracer,
@@ -34,8 +82,14 @@ import {
   PROVIDER_PROBE_BUDGET_MS,
   PROVIDER_PROBE_RELAY_BUDGET_MS,
   RUNTIME_ACCOUNT_USAGE_RELAY_BUDGET_MS,
+  RUNTIME_LIMIT_RESET_RELAY_BUDGET_MS,
+  RUNTIME_LIMIT_RESET_CLAUDE_RELAY_BUDGET_MS,
+  DAEMON_CAPABILITY_RUNTIME_LIMIT_RESET,
+  runtimeAccountUsageReadableWith,
+  DAEMON_CAPABILITY_RUNTIME_LIMIT_RESET_CLAUDE_KINDS,
   normalizeActivityDetailKind,
   parseTraceparent,
+  runtimeConfigForLaunch,
   runtimeConfigToLaunchFields,
   runtimeModelSourceOutcomeFromSet,
   runtimeModelDetectionRequestTimeoutMs,
@@ -48,9 +102,19 @@ import {
   type MachineDiskStatus,
   isMachineDiskLow,
   isValidMachineDiskStatus,
+  type MachineMemoryStatus,
+  isValidMachineMemoryStatus,
   type MachineShutdownReason,
   type ComputerLifecycleExecutionAck,
   type AgentConfig,
+  type AgentServerFeatures,
+  TASK_V2_CONVERSATIONS_FEATURE_FLAG_KEY,
+  AGENT_CONTEXT_VIEW_FEATURE_FLAG_KEY,
+  AGENT_INBOX_ITEMS_FEATURE_FLAG_KEY,
+  AGENT_CONTEXT_VIEW_AVAILABILITY_TYPE,
+  DAEMON_CAPABILITY_AGENT_CONTEXT_VIEW_V0,
+  readAgentContextViewAvailability,
+  type AgentContextViewRequestMessage,
   type WorkspaceDirectoryInfo,
   type FileNode,
   type TrajectoryEntry,
@@ -65,6 +129,9 @@ import {
   type AgentActivityDetailKind,
   type AgentActivityKind,
   type AgentRuntimeErrorState,
+  boundedRuntimeErrorDetail,
+  GENERIC_RUNTIME_ERROR_MESSAGE,
+  isRuntimeErrorDetailActivity,
   type TraceAttributes,
   type TraceContext,
   type TraceStatus,
@@ -75,6 +142,8 @@ import {
   type AgentMigrationTransportLeaseSource,
   type AgentMigrationTransportReady,
   type FeedbackTranscriptReportTimeSource,
+  type FeedbackTranscriptSessionLookup,
+  runtimeSessionHomeEnvVars,
   type FeedbackMachineEvidenceOutcome,
   type FeedbackTranscriptLookupOutcome,
   type FeedbackTranscriptOutcomeObjectPlan,
@@ -87,13 +156,36 @@ import {
   type DeliveryConsumptionActivityDiagnostic,
   type WakeCrashLoopActivityDiagnostic,
   type SpawnFailureActivityDiagnostic,
-  type DeviceClass,
+  type ToolStuckActivityDiagnostic,
+  type CredentialHoldActivityDiagnostic,
   isDeviceClass,
+  isHostProvider,
+  isDaemonInstallKind,
+  isComputerMigratedFrom,
+  parseComputerInstallerRepairHint,
+  type ComputerInstallerRepairHint,
+  type DaemonInstallKind,
+  normalizeOsRelease,
+  normalizeOsId,
+  normalizeOsIdLike,
   AGENT_MIGRATION_CAPABILITY,
+  AGENT_MIGRATION_TARGET_IGNORE_SOURCES_CAPABILITY,
   MODEL_SEEN_MAX_ITEMS_PER_REPORT,
   MACHINE_DUPLICATE_CONNECTION_CLOSE_CODE,
   MACHINE_DUPLICATE_CONNECTION_CLOSE_REASON,
   MACHINE_DUPLICATE_CONNECTION_HELD_CLOSE_REASON,
+  evaluateComputerVersionGate,
+  compareComputerVersions,
+  isComputerSemver,
+  AGENT_TURN_ENDED_OUTCOMES,
+  isOarOnlyRuntime,
+  isRuntimeAbsentStartFailure,
+  COMPUTER_CAPABILITY_SERVICE_IPC_UNREACHABLE,
+  readyRunnerCredentialIds,
+  type AgentStopReason,
+  type ComputerVersionGate,
+  type RuntimeLimitResetIdempotencyKey,
+  type RuntimeLimitResetKind,
 } from "@botiverse/raft-shared";
 import {
   FeedbackTranscriptLateResults,
@@ -109,6 +201,9 @@ import { wakeRequestAppRefTraceAttrs } from "./wakeRequestAppRef";
 import type { AppConfigWireSnapshot } from "@botiverse/raft-shared/src/appConfigTransport";
 import { RouteFailureError } from "../tracing/routeFailure";
 import { applyAgentModelSeen as applyAgentModelSeenToReadPosition } from "./agentModelSeen";
+import { TurnEndUnreadSnapshots, snapshotForUnreadSummary, type UnreadSummarySnapshotTargets } from "./turnEndUnreadSnapshot";
+import { owedReadBacklogTargets, settleUnowedReadBacklog, type UnowedReadBacklogTarget } from "./unowedReadBacklog";
+import { getDb } from "../db/index";
 import { AgentMigrationSourceArchiveError } from "./agentMigrationSourceArchive";
 import { composeReminderSnapshot } from "../apps/reminder/snapshotComposition";
 import { resolveBuiltInMachineMessageDispatch } from "../registry.manifest";
@@ -149,28 +244,50 @@ import {
 import * as agentService from "./agentService";
 import * as agentMigrationService from "./agentMigrationService";
 import * as agentRuntimeProfileService from "./agentRuntimeProfileService";
+import { listModelLimitsAgents, parseAgentModelLimitsFrame, recordAgentModelLimitsReport } from "./agentModelLimitsService";
 import * as machineService from "./machineService";
+import { computerVersionFloor as sharedComputerVersionFloor } from "./computerVersionFloorService";
 import * as computerHostIdentityService from "./computerHostIdentityService";
 import { isHostIdHash } from "./computerHostIdentityService";
 import * as channelService from "./channelService";
 import * as messageService from "./messageService";
 import * as oauthService from "./oauthService";
+import { partitionDeliverableSystemAppEventMessages } from "./systemAppDeliveryGuards";
+import { renderPushedMessages } from "./agentFacingContent";
+import {
+  daemonReportsDeliveredThirdPartyEvents,
+  listManagedAgentsWithPendingThirdPartyEvents,
+  planReconnectRedelivery,
+  redeliverPendingThirdPartyAgentEvents,
+  resolveOutageStart,
+  type OutageStart,
+} from "./thirdPartyAgentEventRedelivery";
 import * as mentionDeliveryOccurrenceService from "./mentionDeliveryOccurrenceService";
 import * as agentActivityLogService from "./agentActivityLogService";
 import * as computerLifecycleOperationService from "./computerLifecycleOperationService";
 import { dispatchPendingAgentArchiveOps, type AgentArchiveDispatchPort } from "./agentArchiveService";
 import * as computerUpgradeRequestService from "./computerUpgradeRequestService";
+import type { ComputerUpgradeDrainProgress } from "./computerUpgradeRequestService";
 import {
   recordComputerOfflineTransition,
   recordComputerOnlineTransition,
 } from "./computerOutageNotificationService";
 import { legacyRuntimeStateFromActivity } from "./legacyActivityStateInference";
 import { recordAgentContextReturned } from "../tracing/agentContextReturnTrace";
-import { CONSTRUCTED_WAKE_CONTEXT_FEATURE_FLAG_KEY, evaluateFeatureFlag, PASSIVE_AX_FEATURE_FLAG_KEY, REMINDER_APP_FEATURE_FLAG_KEY, SUBAGENT_DELEGATION_FEATURE_FLAG_KEY, VAULT_APP_FEATURE_FLAG_KEY } from "./featureFlagService";
+import { agentIdHashAttrs } from "../tracing/traceIdentity";
+import { reminderAppActiveForServerStrict } from "./reminderAppGate";
+import { AgentTypingRegistry, parseAgentSendIntentFrame, type AgentSendIntentOutcome, type AgentTypingTargetPreview } from "./agentTypingService";
+import { previewAgentPostTarget } from "../routes/agentWritableTarget";
+import { previewAgentTaskReplyTarget } from "./agentTypingTaskTarget";
+import { READY_WAKE_LOST_DELIVERIES_FEATURE_FLAG_KEY, RUNNER_CREDENTIAL_RECONCILE_FEATURE_FLAG_KEY, agentRuntimeOarDisabled, agentRuntimeOarFeatureFlagKey, evaluateFeatureFlag, evaluateFeatureFlags, PASSIVE_AX_FEATURE_FLAG_KEY, PI_SESSION_ROTATION_FEATURE_FLAG_KEY, REMINDER_APP_FEATURE_FLAG_KEY, WAKE_RECYCLE_OAR_FEATURE_FLAG_KEY, WAKE_RECYCLE_TIER_GATE_FEATURE_FLAG_KEY, WAKE_RECYCLE_WARM_FEATURE_FLAG_KEY, TURN_END_COMPACTION_FEATURE_FLAG_KEY, SUBAGENT_DELEGATION_FEATURE_FLAG_KEY, VAULT_APP_FEATURE_FLAG_KEY, type AgentRuntimeOarFeatureFlagKey } from "./featureFlagService";
 import { runtimeAccountUsageCacheService } from "./runtimeAccountUsageCacheService";
+import { runtimeAuthService } from "./runtimeAuthService";
+import { openAfterReplicaHop, sealForReplicaHop, type ReplicaHopRefusal } from "./runtimeAuthReplicaSeal";
 import { usageLimitAttentionService } from "./usageLimitAttentionService";
-import { machineRuntimeModelCatalogService } from "./machineRuntimeModelCatalogService";
+import { applyRuntimeModelCatalogReport, machineRuntimeModelCatalogService } from "./machineRuntimeModelCatalogService";
 import { getComputerLinkedMachineAttachers } from "./computerCredentialService";
+import { findAccessRevokedMachineIds } from "./computerAgents";
+import { RUNNER_CREDENTIAL_RECONCILE_GRACE_MS, countRunnerCredentialsNotHeld, revokeRunnerCredentialsNotHeld } from "./agentCredentialService";
 import {
   evaluateBroadcastPolicy,
   isQueuedComputerUpgradePolicyCompatible,
@@ -179,6 +296,7 @@ import {
   type EvaluateComputerBroadcastPolicyInput,
 } from "./computerBroadcastPolicyService";
 import type { PersistedAgentActivityHint } from "./agentActivityLogService";
+import { continuesEmptyWake, lastTextOf, type RunningTurn } from "./activityTurnMerge";
 import * as reminderService from "../apps/reminder/service";
 import { agentHasScope, existingAgentsHaveScope } from "./agentScopesService";
 import {
@@ -195,11 +313,15 @@ import {
   runtimeErrorRequiredAction,
 } from "./legacyAgentLifecycleAdapter";
 import { normalizeDeliveryConsumptionActivityDiagnostic } from "./deliveryConsumptionActivityDiagnostic";
-import { isRuntimeAbsentStartFailure, WakeCrashLoopBreaker, type WakeCrashLoopExit, type WakeCrashLoopStartRecord } from "./wakeCrashLoopBreaker";
+import { DEFAULT_WAKE_CRASH_LOOP_RULES, PAUSE_RETRY_BASE_MS, PAUSE_RETRY_MAX_MS, PAUSE_RETRY_START_FAILURE_REASONS, WakeCrashLoopBreaker, type WakeCrashLoopExit, type WakeCrashLoopStartRecord } from "./wakeCrashLoopBreaker";
 import { postAgentActionRequiredNotice } from "./agentActionRequiredNoticeService";
+import { readinessNoticeKey, readinessNoticePlan, releaseReadinessNotices, storeRuntimeReadinessReport } from "./runtimeReadinessService";
+import { postAutomaticWakePausedNotice } from "./automaticWakePausedNotice";
 import { isLegacyStartFailureDetail, isLegacyUnkindedStartFailure, legacySpawnFailureCarrier } from "./legacySpawnFailure";
 import { normalizeExternalSubagentMarker } from "./externalSubagentMarker";
 import { normalizeSpawnFailureActivityDiagnostic } from "./spawnFailureActivityDiagnostic";
+import { normalizeToolStuckActivityDiagnostic } from "./toolStuckActivityDiagnostic";
+import { normalizeCredentialHoldActivityDiagnostic } from "./credentialHoldActivityDiagnostic";
 import { createAgentLifecycleEvent, type AgentLifecycleEventType } from "./agentLifecycleEvents";
 import {
   applyAgentLifecycleProjectionPlan,
@@ -224,6 +346,8 @@ import {
   reduceDaemonActivitySignal,
   rewriteDaemonActivityEntries,
   reduceRuntimeErrorActivityAction,
+  runtimeErrorClearsOnlyOnModelOutput,
+  isModelOutputRecoveryFrame,
   reduceDaemonSessionLifecycle,
   reduceDaemonStatusLifecycle,
   reduceAgentMigrationControlLifecycle,
@@ -266,11 +390,14 @@ export {
   type WakePlanInput,
 } from "./agentLifecycleReducer";
 import { getServerPlan, getHistoryCutoff } from "./planService";
+import { agentConfigRevisionInputs } from "./agentConfigRevision";
+import { loadAgentMigrationReadiness } from "./agentMigrationReadiness";
 import {
   REPLICA_ID,
   type MachineDuplicateHold,
   routeStartIntent,
   START_INTENT_OWNER_MOVED,
+  START_INTENT_UNANSWERED,
   StartIntentOwnerMovedError,
   StartIntentRemoteError,
   StartIntentTimeoutError,
@@ -285,6 +412,8 @@ import {
   routeInboxDeliveryWithReceipt,
   fingerprintAgentRuntimeError,
   publishExternalWakeSignal,
+  publishAgentTypingPosted,
+  type AgentTypingPostedSignal,
   type MachineCommandRouteResult,
   type RoutedInboxDeliveryOptions,
   type RoutedInboxDeliveryReceipt,
@@ -292,6 +421,7 @@ import {
 } from "../replicaRouter";
 import {
   redisReplicaStateStore,
+  type AgentContextViewAvailabilityRecord,
   type AgentRuntimeErrorMirror,
   type MachineMeta,
   type PersistedActivityTypedCarriers,
@@ -322,6 +452,7 @@ import {
   machineDuplicateConnectionActionsTotal,
 } from "../metrics";
 import type { ComputerSourceFact } from "./computerBroadcastPolicyService";
+import { enabledFirstPartyAppIdsStrict } from "./firstPartyAppFlags";
 import {
   MachineCatalogAuthority,
   MachineCatalogStaleError,
@@ -330,6 +461,7 @@ import {
 import {
   BuiltInModelCatalogError,
   assertBuiltInPresetSupportedByCatalog,
+  isBuiltInCatalogCheckedSelection,
   type BuiltInModelCatalogValidation,
 } from "./builtinModelCatalogCompatibility";
 
@@ -343,12 +475,19 @@ interface MachineConnection {
   connectionEpochId: string;
   replicaGeneration: string | null;
   heartbeatTimer: unknown | null;
+  // Task #354: WebSocket protocol-level keepalive, separate from the 30s
+  // application heartbeat above. Null when disabled.
+  wsPingTimer: unknown | null;
   runtimeAccountUsageTimer: unknown | null;
   lastPong: number;
   lastIngressAt: number;
   // When this connection was accepted; SLI 4 failure outcomes are bucketed by
   // connection age (task #432). Optional so hand-built test connections compile.
   connectedAt?: number;
+  // When this replica saw the machine's previous socket close (taken from
+  // machineLastDisconnectAt when this connection registered): a candidate
+  // outage start for the app-event reconnect pass.
+  previousCloseAt?: number;
   // Task #1295: when this connection last sent any agent:deliver:ack; a recent
   // one defers due delivery re-sends.
   lastDeliveryAckAt?: number;
@@ -375,6 +514,9 @@ interface MachineConnection {
     reported: boolean;
   };
   capabilities: Set<string>;
+  // Reconciler step 13: the Computer's latest `computer:upgrade:draining`
+  // (in memory, this connection only; the request row does not change).
+  upgradeDrain?: ComputerUpgradeDrainProgress;
   // Runtimes reported in the daemon `ready` message, held in-memory so
   // server-authoritative readiness (ServerSetupProjectionGate) derives runtime
   // from the SAME live "Ready" event as the client card — no DB-persist lag,
@@ -391,12 +533,21 @@ interface MachineConnection {
   runtimeDetection?: MachineRuntimeDetectionState | null;
   // Latest `machine:disk_status` of this connection; null until reported.
   diskStatus?: MachineDiskStatus | null;
+  // Latest `machine:memory_status` of this connection; null until reported.
+  memoryStatus?: MachineMemoryStatus | null;
+  // #proj-raft-computer task #34: advisory, the installer needs a repair run on
+  // the machine (`ready.installerRepairHint`, then `machine:installer_repair_hint`);
+  // null when there is nothing to hint and for Computers that never report it.
+  installerRepairHint?: ComputerInstallerRepairHint | null;
   migrationTransport: MachineMigrationTransportState | null;
   shutdownIntent: MachineShutdownIntent | null;
   traceContext?: MachineConnectTraceContext;
   // Managed-Computer bundle version (`@botiverse/raft-computer`), reported in
   // `ready` when this connection is a Computer; null for a raw daemon.
   computerVersion: string | null;
+  // Below the Computer version floor (computerVersionFloorService): set on
+  // `ready`, refreshed by the periodic sweep. `enforced` holds agent work.
+  versionGate?: ComputerVersionGate | null;
   // RFC 069 §8: the daemon process on this connection (from `ready`); sequenced
   // status frames from any other daemon process are stale.
   daemonInstanceId: string | null;
@@ -405,6 +556,15 @@ interface MachineConnection {
   // `agent:runtime:outcome_unreliable` notice). `agent:runtime-outcome-v1`
   // does not apply to them.
   runtimeOutcomeUnreliableAgents?: Set<string>;
+  // #wg-rbac:#27: set by this connection's first `ready`; only that one
+  // reconciles runner credentials (a later ready can miss a start's key
+  // whose mint response is still on its way).
+  runnerCredentialReconcileSeen?: boolean;
+  // Reconciler step 11d: the config revision re-sent to each agent on this
+  // connection after a `ready` reported an older applied one. One re-send per
+  // revision per connection: a daemon that keeps reporting the older revision
+  // (the push failed to apply) is not sent it again until it reconnects.
+  configResentRevisions?: Map<string, number>;
 }
 
 // Daemon-reported capabilities we persist then reflect to the client card. Held
@@ -474,10 +634,24 @@ interface CapabilitiesPersistPayload {
   runtimeDetection?: MachineRuntimeDetectionState;
   hostname?: string;
   os?: string;
-  /** Validated against DEVICE_CLASSES; null when absent (unknown / older daemon). */
-  deviceClass?: DeviceClass | null;
+  /** Validated device class, host provider and OS release; each null when absent (unknown / older daemon). */
+  host?: machineService.MachineHostFacts;
   daemonVersion?: string | null;
   computerVersion?: string | null;
+}
+
+/**
+ * Reconciler step 11d: `ready.runningAgentConfigRevisions`, the revision each
+ * running agent applied on the daemon, checked (untrusted wire data). Entries
+ * that are not a finite number are left out: that agent is not compared.
+ */
+function readyAgentConfigRevisions(value: unknown): Map<string, number> {
+  const revisions = new Map<string, number>();
+  if (!value || typeof value !== "object" || Array.isArray(value)) return revisions;
+  for (const [agentId, revision] of Object.entries(value)) {
+    if (typeof revision === "number" && Number.isFinite(revision)) revisions.set(agentId, revision);
+  }
+  return revisions;
 }
 
 function normalizeRuntimeVersions(value: unknown, runtimes: readonly string[]): Record<string, string> {
@@ -590,6 +764,11 @@ function normalizeMigrationTransportReady(
   };
 }
 
+/** `MachineMeta.installerRepairHint`: JSON of the report, or null when there is nothing to hint. */
+function installerRepairHintMeta(hint: ComputerInstallerRepairHint | null): string | null {
+  return hint ? JSON.stringify(hint) : null;
+}
+
 function machineMetaFromMigrationTransport(
   migrationTransport: MachineMigrationTransportState | null,
 ): Pick<MachineMeta,
@@ -679,13 +858,19 @@ const systemOrchestratorClock: OrchestratorClock = {
   clearTimeout: (timer) => clearTimeout(timer as ReturnType<typeof setTimeout>),
 };
 
-export function runtimeAccountUsageProvidersForRuntimes(runtimes: readonly string[]): RuntimeAccountUsageProvider[] {
+/**
+ * The usage providers to read on a Computer with these runtimes and daemon
+ * capabilities: Antigravity only where the daemon reads it
+ * (DAEMON_CAPABILITY_RUNTIME_ACCOUNT_USAGE_ANTIGRAVITY).
+ */
+export function runtimeAccountUsageProvidersForRuntimes(runtimes: readonly string[], daemonCapabilities: Iterable<string>): RuntimeAccountUsageProvider[] {
   const providers = new Set<RuntimeAccountUsageProvider>();
   for (const runtime of runtimes) {
-    if (runtime === "claude" || runtime === "codex" || runtime === "grok") providers.add(runtime);
+    if (runtime === "claude" || runtime === "codex" || runtime === "grok" || runtime === "antigravity") providers.add(runtime);
     if (runtime === "kimi" || runtime === "kimi-sdk") providers.add("kimi");
   }
-  return [...providers];
+  const capabilities = [...daemonCapabilities];
+  return [...providers].filter((provider) => runtimeAccountUsageReadableWith(provider, capabilities));
 }
 
 export function runtimeAccountUsageIntervalMs(machineId: string): number {
@@ -724,6 +909,14 @@ function readBooleanEnv(name: string): boolean {
 
 function readAnyBooleanEnv(names: string[]): boolean {
   return names.some((name) => readBooleanEnv(name));
+}
+
+function readNonNegativeIntegerEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 0) return fallback;
+  return Math.floor(parsed);
 }
 
 function readPositiveIntegerEnv(name: string, fallback: number): number {
@@ -821,7 +1014,7 @@ function liveActivityRootTraceAttrs(
   };
 }
 
-function oldestInboxMessageAgeMs(messages: AgentMessage[], now: number): number | undefined {
+function oldestInboxMessageAgeMs(messages: readonly AgentMessage[], now: number): number | undefined {
   let oldest: number | undefined;
   for (const message of messages) {
     if (!message.timestamp) continue;
@@ -833,7 +1026,14 @@ function oldestInboxMessageAgeMs(messages: AgentMessage[], now: number): number 
 }
 
 interface MachineDisconnectContext {
-  cause?: "heartbeat_timeout" | "socket_close" | "socket_error" | "computer_machine_unlinked" | "legacy_machine_key_migrated";
+  cause?:
+    | "heartbeat_timeout"
+    | "socket_close"
+    | "socket_error"
+    | "computer_machine_unlinked"
+    | "legacy_machine_key_migrated"
+    | "machine_credential_rotated"
+    | "machine_credential_revoked";
   closeCode?: number;
   closeReason?: string;
   errorMessage?: string;
@@ -843,6 +1043,8 @@ interface MachineDisconnectContext {
 const MACHINE_UNLINKED_CLOSE_CODE = 4001;
 const MACHINE_UNLINKED_CLOSE_REASON = "computer_machine_unlinked";
 const LEGACY_PRINCIPAL_FENCED_CLOSE_CODE = 4002;
+/** The machine's credential changed (rotated / revoked); the daemon reconnects and the handshake decides. */
+const MACHINE_CREDENTIAL_CHANGED_CLOSE_CODE = 4004;
 const LEGACY_PRINCIPAL_FENCED_CLOSE_REASON = "legacy_machine_key_migrated";
 // Task #374: 4003, shared with the daemon, which picks its backoff from the reason.
 const DUPLICATE_MACHINE_CONNECTION_CLOSE_CODE = MACHINE_DUPLICATE_CONNECTION_CLOSE_CODE;
@@ -855,6 +1057,18 @@ const DUPLICATE_MACHINE_CONNECTION_CLOSE_CODE = MACHINE_DUPLICATE_CONNECTION_CLO
 export function reportedHostnameHash(hostname: unknown): string | null {
   if (typeof hostname !== "string" || !hostname.trim()) return null;
   return crypto.createHash("sha256").update(hostname.trim().toLowerCase(), "utf8").digest("hex").slice(0, 12);
+}
+
+/** First daemon release that waits 5 minutes after a duplicate refusal (#9348). */
+const DUPLICATE_RECONNECT_DELAY_DAEMON_VERSION = "1.0.47";
+
+/**
+ * True when a daemon version predates the duplicate reconnect delay, or is
+ * unknown (a version that never reported is far more likely old than new).
+ */
+export function daemonLacksDuplicateReconnectDelay(version: string | null | undefined): boolean {
+  if (!version || !isComputerSemver(version)) return true;
+  return compareComputerVersions(version, DUPLICATE_RECONNECT_DELAY_DAEMON_VERSION) < 0;
 }
 
 /** Task #374 enforcement is off unless SLOCK_MACHINE_DUPLICATE_CONNECTION_ENFORCEMENT is 1/true. */
@@ -887,7 +1101,7 @@ interface PendingAgentDeliveryAck {
   timer: unknown | null;
   attempts: number;
   parked: boolean;
-  parkedReason?: "machine_offline";
+  parkedReason?: "machine_offline" | "computer_version_held";
   /** When the current parked period began; bounds how long a record may stay parked. */
   parkedAt?: number;
   /**
@@ -942,10 +1156,7 @@ interface GaveUpAgentDelivery {
   labels: ReturnType<typeof agentDeliverySloLabels>;
 }
 
-type AgentStartMessage = Extract<
-  ServerToMachineMessage,
-  { type: "agent:start" | "agent:start:wiki" }
->;
+type AgentStartMessage = Extract<ServerToMachineMessage, { type: "agent:start" }>;
 
 type AgentStartDispatchTerminalReason =
   /** task #365: the daemon refused the start as claimed against an earlier connection. */
@@ -967,25 +1178,20 @@ interface PendingAgentStartAck {
   nextRetryAt: number | null;
 }
 
-interface AgentInbox {
-  inbox: AgentMessage[];
-  pendingReceive: {
-    resolve: (messages: AgentMessage[]) => void;
-    timer: ReturnType<typeof setTimeout>;
-    finish: (messages: AgentMessage[]) => void;
-  } | null;
-}
-
 interface StartAgentOptions {
   /**
    * Daemon-requested wake for a due app-inbox item (task #1103), the one
    * automatic retry after a retry-once start failure (see
    * `RETRY_ONCE_SPAWN_FAILURE_REASONS`), or `internal`: the spawn-error retry
-   * sweep (task #365). All are automatic starts, never a human start.
+   * sweep (task #365), or `ready_owed`: the wake a daemon `ready` owes an
+   * agent whose wake a restart lost (reconciler step 13 F9,
+   * startReadyOwedWakePass; never forwarded to another replica). All are
+   * automatic starts, never a human start.
    */
-  startCause?: "app_inbox_wake" | "start_failure_retry" | "internal";
+  startCause?: "app_inbox_wake" | "start_failure_retry" | "internal" | "ready_owed";
   /**
-   * task #365, set only by `startAgent` for an `internal` start: the epoch of
+   * task #365, set only for an `internal` start (startAgentForRetry) and a
+   * `ready_owed` one (F9, the socket whose `ready` owes it): the epoch of
    * this replica's socket for the agent's machine when it decided to run the
    * start here. The start is stamped with it, so the daemon refuses it on
    * any other connection.
@@ -1018,7 +1224,7 @@ interface TerminalStartContext {
  * stands in for the message wakes its hold refused, so it is a message cause:
  * automatic, never human.
  */
-function lifecycleStartCause(options: StartAgentOptions): "message" | "manual" | "resume" | "app_inbox_wake" | "internal" {
+function lifecycleStartCause(options: StartAgentOptions): "message" | "manual" | "resume" | "app_inbox_wake" | "internal" | "ready_owed" {
   if (options.startCause === "start_failure_retry") return "message";
   return options.startCause ?? (options.wakeMessage ? "message" : options.resumePrompt ? "resume" : "manual");
 }
@@ -1031,7 +1237,7 @@ export type TerminalStartRefusal = TerminalWakeRefusal;
 
 export type AgentStartDispatchResult =
   | { outcome: "dispatched" }
-  | { outcome: "skipped"; reason: "manual_stop" | "wake_lock_held" | "wake_crash_loop_blocked" | TerminalStartRefusal };
+  | { outcome: "skipped"; reason: "manual_stop" | "wake_lock_held" | "wake_crash_loop_blocked" | "computer_version_unsupported" | "computer_access_revoked" | TerminalStartRefusal };
 
 /** RFC 071 §9: the server-authored detail of a `terminal_failure_paused` activity (ids/classes/times only). */
 export function terminalBlockDetail(view: TerminalBlockView): string {
@@ -1080,6 +1286,9 @@ export class KimiReasoningEffortUpgradeRequiredError extends Error {
 
 type StopAgentReason = "manual" | "internal";
 
+/** Reconciler step 11b: whether `applyAgentConfig` sent the agent's daemon its new config. */
+export type AgentConfigApplyOutcome = "pushed" | "not_pushed";
+
 /** Whether the stop reached the daemon. False: only the server-side state changed. */
 export interface AgentStopResult {
   delivered: boolean;
@@ -1112,6 +1321,8 @@ interface CachedAgentState {
   expectedLaunchId: string | null;
   launchGuardMode: "legacy" | "guarded";
   serverId: string;
+  /** Set for a personal assistant: its events reach only this user (agentEventRoom). */
+  assistantOwnerUserId: string | null;
   name: string;
   displayName: string | null;
   description: string | null;
@@ -1127,6 +1338,20 @@ interface CachedAgentState {
   reasoningEffort: RuntimeReasoningEffort | null;
   envVars: Record<string, string> | null;
 }
+
+/**
+ * task #25 step 2: the daemon may wait up to 10 s for a native interrupt to
+ * end the turn before it restarts the runtime instead, then answers.
+ */
+const INTERRUPT_TURN_RELAY_BUDGET_MS = 20_000;
+
+export type AgentTurnInterruptRequestResult =
+  | { outcome: AgentTurnInterruptOutcome; toolName?: string; stuckForMs?: number }
+  | { outcome: "computer_offline" | "computer_upgrade_required" };
+
+export type AgentSubagentInterruptRequestResult =
+  | { outcome: AgentSubagentInterruptOutcome }
+  | { outcome: "computer_offline" | "computer_upgrade_required" };
 
 type ActivitySnapshot = {
   activity: AgentActivityKind;
@@ -1148,6 +1373,18 @@ type ActivitySnapshot = {
    * a failed start. The daemon's typed reason, passed through unchanged.
    */
   spawnFailure?: SpawnFailureActivityDiagnostic;
+  /**
+   * task #25: the daemon's stuck-tool state, whatever the detail kind. The
+   * daemon puts it on every frame while the agent is stuck, so it is exactly
+   * the latest daemon frame's value; any other write clears it.
+   */
+  toolStuck?: ToolStuckActivityDiagnostic;
+  /**
+   * Reconciler step 4b: present only while detailKind === "idle" and the
+   * daemon's idle frame showed the credential-invalid held notice. The
+   * daemon's typed reason, passed through unchanged; any other write drops it.
+   */
+  credentialHold?: CredentialHoldActivityDiagnostic;
 };
 
 type ActivityClockSnapshot = {
@@ -1166,6 +1403,10 @@ type VisibleActivity = {
   wakeCrashLoop?: WakeCrashLoopActivityDiagnostic;
   /** task #1123: the daemon's typed spawn-failure reason, when the served snapshot is runtime_unavailable. */
   spawnFailure?: SpawnFailureActivityDiagnostic;
+  /** task #25: the agent is stuck on a tool call, whatever the served detail kind. */
+  toolStuck?: ToolStuckActivityDiagnostic;
+  /** Reconciler step 4b: the held notice's typed reason, when the served snapshot is an idle frame showing it. */
+  credentialHold?: CredentialHoldActivityDiagnostic;
 };
 
 type MachineReachability = "local" | "remote" | "offline" | "none" | "external-reported";
@@ -1178,6 +1419,13 @@ type MachineReachability = "local" | "remote" | "offline" | "none" | "external-r
  * clears the mirrored field.
  */
 function snapshotTypedCarriers(snapshot: ActivitySnapshot): ActivityTypedCarriers | undefined {
+  const kindCarrier = kindTypedCarrier(snapshot);
+  // task #25: not tied to a detail kind; rides along with any of them.
+  if (!snapshot.toolStuck) return kindCarrier;
+  return { ...kindCarrier, toolStuck: snapshot.toolStuck };
+}
+
+function kindTypedCarrier(snapshot: ActivitySnapshot): ActivityTypedCarriers | undefined {
   if (snapshot.detailKind === "delivery_unconsumed" && snapshot.deliveryConsumption) {
     return { deliveryConsumption: snapshot.deliveryConsumption };
   }
@@ -1186,6 +1434,9 @@ function snapshotTypedCarriers(snapshot: ActivitySnapshot): ActivityTypedCarrier
   }
   if (snapshot.detailKind === "runtime_unavailable" && snapshot.spawnFailure) {
     return { spawnFailure: snapshot.spawnFailure };
+  }
+  if (snapshot.detailKind === "idle" && snapshot.credentialHold) {
+    return { credentialHold: snapshot.credentialHold };
   }
   return undefined;
 }
@@ -1202,6 +1453,8 @@ function activitySnapshotFromPersisted(persisted: PersistedAgentActivity | null)
     ...(carriers?.deliveryConsumption ? { deliveryConsumption: carriers.deliveryConsumption } : {}),
     ...(carriers?.wakeCrashLoop ? { wakeCrashLoop: carriers.wakeCrashLoop } : {}),
     ...(carriers?.spawnFailure ? { spawnFailure: carriers.spawnFailure } : {}),
+    ...(carriers?.toolStuck ? { toolStuck: carriers.toolStuck } : {}),
+    ...(carriers?.credentialHold ? { credentialHold: carriers.credentialHold } : {}),
   };
 }
 
@@ -1260,7 +1513,7 @@ type RuntimeContextMachine = {
 
 export type AgentLifecycleAction = "start" | "stop" | "reset" | "wake";
 export type AgentLifecycleOutcome = "attempted" | "completed" | "failed" | "skipped" | "suppressed";
-export type AgentLifecycleCause = "message" | "manual" | "resume" | "app_inbox_wake" | "internal" | "restart" | "session" | "full";
+export type AgentLifecycleCause = "message" | "manual" | "resume" | "app_inbox_wake" | "internal" | "ready_owed" | "restart" | "session" | "full";
 
 export interface StaleActivitySweepPlanInput {
   isTransient: boolean;
@@ -1660,105 +1913,6 @@ export function planStopAction(input: StopPlanInput): StopPlanAction {
   return input.reason === "manual" ? "persist-stopped" : "persist-inactive";
 }
 
-export interface ReceivePlanInput {
-  hasBufferedMessages: boolean;
-  block: boolean;
-}
-
-export type ReceivePlanAction =
-  | "return-buffered"
-  | "return-empty"
-  | "install-waiter";
-
-export function planReceiveAction(input: ReceivePlanInput): ReceivePlanAction {
-  if (input.hasBufferedMessages) {
-    return "return-buffered";
-  }
-  return input.block ? "install-waiter" : "return-empty";
-}
-
-export interface AckPartitionInput {
-  inbox: AgentMessage[];
-  ackedSeqs: Set<number>;
-  ackedMessageIds?: Set<string>;
-}
-
-export interface AckPartitionResult {
-  removed: AgentMessage[];
-  retained: AgentMessage[];
-}
-
-export function partitionAcknowledgedMessages(input: AckPartitionInput): AckPartitionResult {
-  const removed: AgentMessage[] = [];
-  const retained: AgentMessage[] = [];
-
-  for (const message of input.inbox) {
-    if (
-      (message.seq && input.ackedSeqs.has(message.seq))
-      || (!message.seq && message.message_id && input.ackedMessageIds?.has(message.message_id))
-    ) {
-      removed.push(message);
-    } else {
-      retained.push(message);
-    }
-  }
-
-  return { removed, retained };
-}
-
-export interface TargetScopedAckPartitionInput {
-  inbox: AgentMessage[];
-  channelId: string;
-  ackedSeqs: Set<number>;
-}
-
-export function partitionTargetScopedAcknowledgedMessages(input: TargetScopedAckPartitionInput): AckPartitionResult {
-  const removed: AgentMessage[] = [];
-  const retained: AgentMessage[] = [];
-
-  for (const message of input.inbox) {
-    if (message.channel_id === input.channelId && message.seq && input.ackedSeqs.has(message.seq)) {
-      removed.push(message);
-    } else {
-      retained.push(message);
-    }
-  }
-
-  return { removed, retained };
-}
-
-export interface TargetScopedAckUpToSeqPartitionInput {
-  inbox: AgentMessage[];
-  channelId: string;
-  maxSeq: number;
-}
-
-export function partitionTargetScopedMessagesUpToSeq(input: TargetScopedAckUpToSeqPartitionInput): AckPartitionResult {
-  const removed: AgentMessage[] = [];
-  const retained: AgentMessage[] = [];
-
-  for (const message of input.inbox) {
-    if (message.channel_id === input.channelId && message.seq && message.seq <= input.maxSeq) {
-      removed.push(message);
-    } else {
-      retained.push(message);
-    }
-  }
-
-  return { removed, retained };
-}
-
-export interface LocalInboxEnqueuePlanInput {
-  hasSeqDuplicate: boolean;
-  hasMessageIdDuplicate: boolean;
-}
-
-export type LocalInboxEnqueuePlanAction = "enqueue" | "skip-duplicate";
-
-export function planLocalInboxEnqueueAction(input: LocalInboxEnqueuePlanInput): LocalInboxEnqueuePlanAction {
-  return input.hasSeqDuplicate || input.hasMessageIdDuplicate ? "skip-duplicate" : "enqueue";
-}
-
 export interface LocalDeliveryGatePlanInput {
   hasAgent: boolean;
   status: AgentStatus | null;
@@ -1796,6 +1950,8 @@ interface StopApplyContext {
   serverId: string;
   machineId: string | null;
   reason: StopAgentReason;
+  /** The `agent:stop` reason for the daemon; absent: none is sent (a lifecycle stop). */
+  daemonReason?: AgentStopReason;
   previousStatus: AgentStatus;
   nextStatus: AgentStatus;
 }
@@ -1959,12 +2115,6 @@ function normalizeRoutedInboxDeliveryReceipt(
   return { status: "dropped", reason: "cross_replica_receipt_unavailable" };
 }
 
-interface LocalInboxApplyContext {
-  inbox: AgentInbox;
-  message: AgentMessage;
-  notifyPendingReceive?: boolean;
-}
-
 interface LocalDeliveryGateApplyContext {
   action: LocalDeliveryGatePlanAction;
   agentId: string;
@@ -1978,12 +2128,6 @@ interface SendToMachineApplyContext {
   sendLocally: () => boolean;
   reroute: () => Promise<boolean | MachineCommandRouteResult>;
   onRouteResult?: (result: MachineCommandRouteResult) => void;
-}
-
-interface ReceiveApplyContext {
-  agentId: string;
-  timeoutMs: number;
-  signal?: AbortSignal;
 }
 
 interface RoutedOwnershipApplyContext {
@@ -2005,6 +2149,33 @@ export type ReadyReconcilePlanAction =
   | "mark-wakeable-not-running"
   | "mark-inactive-offline"
   | "stay-offline";
+
+/** F9: one `ready`'s owed-wake pass (startReadyOwedWakePass). */
+interface ReadyOwedWakeRun {
+  agentIds: string[];
+  serverId: string;
+  /** The socket whose `ready` this is: the pass stops once it is replaced, and its starts carry it. */
+  connectionEpochId: string;
+}
+
+/**
+ * F9: the conversations the agent is offered unread in past its read position,
+ * from its inbox chain rows, each up to the newest message it is offered: the
+ * latest message where it is subscribed, the latest @mention of it where it is
+ * not (a muted channel, where only a mention pierces the mute). The chain view
+ * owns the offer rules (membership, active follow, mute), the same rules that
+ * decide which messages are delivered (and so wake) at all.
+ */
+export function readyOwedCandidateTargets(rows: readonly channelService.AgentInboxChainRow[]): UnowedReadBacklogTarget[] {
+  const targets: UnowedReadBacklogTarget[] = [];
+  for (const row of rows) {
+    if (row.offeredUnread <= 0) continue;
+    const throughSeq = row.subscribed ? row.latestSeq : row.maxMentionSeq;
+    if (throughSeq === null || throughSeq <= row.lastReadSeq) continue;
+    targets.push({ channelId: row.targetId, throughSeq });
+  }
+  return targets;
+}
 
 export function planReadyReconcileAction(input: ReadyReconcilePlanInput): ReadyReconcilePlanAction {
   if (input.running) {
@@ -2100,7 +2271,21 @@ const DAEMON_INGRESS_RATE_LIMITED_MESSAGE_TYPES = new Set<MachineToServerMessage
   // would stall that agent's queue (no ack) or lose evidence (ack), and the
   // daemon's stop-and-wait already bounds their rate.
   "agent:runtime:outcome_unreliable",
+  // Agent typing line: best-effort UI hint; a drop only shortens the line.
+  "agent:send_intent",
+  // A daemon asks at most once per (re)connect and per change burst; a drop
+  // only leaves its agents on the values they have until the next change.
+  "server:features:request",
+  // #68: sent on connect and on change only; each may store and notify, so
+  // a flood is dropped (DAEMON_INGRESS_TYPE_MAX_EVENTS). A dropped report is
+  // superseded by the next one (its full snapshot, a higher seq).
+  "machine:runtime_readiness",
 ]);
+
+/** Per-type budgets below the default, for message types that are rare by design. */
+const DAEMON_INGRESS_TYPE_MAX_EVENTS: Partial<Record<MachineToServerMessage["type"], number>> = {
+  "machine:runtime_readiness": 20,
+};
 
 type DaemonIngressRateLimitWindow = {
   startedAt: number;
@@ -2178,6 +2363,14 @@ function rehydrateStartIntentError(error: unknown): unknown {
   }
   if (name === "CrossReplicaQueueReceiptUnavailableError") return new CrossReplicaQueueReceiptUnavailableError();
   return error;
+}
+
+/**
+ * #wg-rbac:#57: a daemon activity frame whose detail is a runtime error's text:
+ * an error activity, or a runtime-error / crash detail kind.
+ */
+export function isDaemonRuntimeErrorActivityFrame(msg: Pick<Extract<MachineToServerMessage, { type: "agent:activity" }>, "activity" | "activityKind" | "detailKind">): boolean {
+  return isRuntimeErrorDetailActivity({ activity: msg.activityKind ?? msg.activity, detailKind: msg.detailKind });
 }
 
 function daemonActivityJoinTraceAttrs(msg: Extract<MachineToServerMessage, { type: "agent:activity" }>): Record<string, unknown> {
@@ -2364,6 +2557,8 @@ const EXTERNAL_TURN_SUMMARY_WINDOW_ROWS = 400;
 const EXTERNAL_TURN_SUMMARY_REFOLD_ROWS = 2000;
 /** A reported "online" followed by "working" within this is one turn (status streams flap). */
 const EXTERNAL_SOFT_END_GRACE_MS = 15_000;
+/** Most activity rows read for the running turn on an overview load (one long turn fits). */
+const RUNNING_TURN_ROWS = 2000;
 
 const EXTERNAL_STATUS_REPORT_PROVENANCE = "external/status-reported:";
 
@@ -2451,16 +2646,6 @@ function externalLogOnlyEntries(entries: readonly TrajectoryEntry[]): Trajectory
 
 function isExternalHookEntry(entry: TrajectoryEntry): boolean {
   return typeof entry.producerFactId === "string" && entry.producerFactId.startsWith(`${EXTERNAL_AGENT_ACTIVITY_PROVENANCE}:`);
-}
-
-/** A daemon-sent summary is stored only if its times and counts are sane. */
-function isPlausibleTurnSummary(summary: unknown): summary is ActivityTurnSummary {
-  if (!summary || typeof summary !== "object") return false;
-  const value = summary as Partial<ActivityTurnSummary>;
-  return value.v === 1
-    && typeof value.startedAt === "number" && Number.isFinite(value.startedAt)
-    && typeof value.endedAt === "number" && Number.isFinite(value.endedAt) && value.endedAt >= value.startedAt
-    && typeof value.outcome === "string" && Array.isArray(value.actions) && Array.isArray(value.problems);
 }
 
 export function mapExternalPluginActivityEvent(event: ExternalAgentActivityEvent): MappedExternalPluginActivity | null {
@@ -2787,6 +2972,7 @@ function buildExternalPluginProducerFactId(eventId: string): string {
 type ResetApplyContext = {
   agentId: string;
   serverId: string | null;
+  assistantOwnerUserId: string | null;
   mode: "restart" | "session" | "full";
   previousStatus: AgentStatus | null;
   machineId: string | null;
@@ -2865,7 +3051,32 @@ const WORKSPACE_DELETE_TIMED_OUT = "Delete timed out";
 
 export class AgentOrchestrator extends EventEmitter {
   private io: SocketServer | null = null;
+  /** #wg-rbac:#57: who may read an agent's runtime error text, per agent, briefly cached. */
+  static readonly RUNTIME_ERROR_VIEWER_CACHE_TTL_MS = 30_000;
+  private static readonly RUNTIME_ERROR_VIEWER_CACHE_MAX = 10_000;
+  private readonly runtimeErrorViewerCache = new Map<string, { userIds: string[]; readAtMs: number }>();
+  /** The coarse agent state for capable clients (agentActivityStateFanout.ts). */
+  protected readonly agentActivityStateFanout = new AgentActivityStateFanout(
+    (room, payload) => {
+      this.io?.to(room).emit(AGENT_ACTIVITY_STATE_EVENT, payload);
+    },
+    {
+      now: () => this.clock.now(),
+      setTimeout: (fn, ms) => this.clock.setTimeout(fn, ms),
+      clearTimeout: (timer) => this.clock.clearTimeout(timer),
+    },
+  );
+  /** Agent typing line: live `agent:send_intent` calls on this replica (agentTypingService). */
+  protected readonly agentTyping = new AgentTypingRegistry({
+    now: () => this.clock.now(),
+    emit: (room, event, payload) => this.emitAgentTyping(room, event, payload),
+    previewTarget: (serverId, agentId, target) => this.previewAgentTypingTarget(serverId, agentId, target),
+  });
   private machineConnections = new Map<string, MachineConnection>();
+  /** Computer connections held by this process; read by the per-task load sample. */
+  get machineConnectionCount(): number {
+    return this.machineConnections.size;
+  }
   private machineCatalogAuthority = new MachineCatalogAuthority((machineId) => {
     const conn = this.machineConnections.get(machineId);
     return conn?.replicaGeneration
@@ -2901,12 +3112,43 @@ export class AgentOrchestrator extends EventEmitter {
   // Insertion order is give-up order, so the oldest tombstones come first.
   private gaveUpAgentDeliveries = new Map<string, GaveUpAgentDelivery>();
   private pendingAgentStartAcks = new Map<string, PendingAgentStartAck>();
+  /**
+   * When this replica last saw each machine's socket close, until the next
+   * connection of that machine registers here and takes it (previousCloseAt).
+   * In memory: another replica's closes are not here.
+   */
+  private machineLastDisconnectAt = new Map<string, number>();
+  /** App-event reconnect passes in flight, by machine (`ready` does not await them; shutdown does). */
+  private readonly thirdPartyEventReconnectPasses = new Map<string, Promise<void>>();
+  /** F9: the owed-wake pass in flight per machine, and the `ready` that came during it (run once more after it). */
+  private readonly readyOwedWakePasses = new Map<string, { done: Promise<void>; rerun: ReadyOwedWakeRun | null }>();
+  /** F9: when this server process may take its next owed-wake check (READY_OWED_WAKE_GLOBAL_INTERVAL_MS apart). */
+  private readyOwedWakeNextSlotAtMs = 0;
+  private readyOwedWakeStopped = false;
+  private readonly readyOwedWakeRandom: () => number;
   // replica-local: agents a start is being prepared for on this replica, until
   // its dispatch is recorded in pendingAgentStartAcks (see startAgentHere).
   private readonly startsInProgress = new Set<string>();
   private terminalAgentStartDispatches = new Map<string, AgentStartDispatchTerminalReason>();
-  private agentInboxes = new Map<string, AgentInbox>();
+  private readonly localInboxes = new LocalAgentInboxes();
   private agentActivity = new Map<string, ActivitySnapshot>();
+  /**
+   * The stale phase each agent's busy-preserve diagnostics were last recorded
+   * for, keyed on the snapshot's observed time (task #proj-o11y:#25, Tenny
+   * 9652d110). The stale sweep keeps a busy snapshot without writing it, so the
+   * same agent stays stale and used to emit `busy_preserved` and a
+   * `preserve_rebroadcast` shadow verdict every 30 s on every replica: about a
+   * million lines an hour, growing with uptime, with nothing changing. Now one
+   * pair per stale phase; a new observation starts a new phase.
+   */
+  private readonly busyPreservedPhase = new Map<string, string>();
+  /**
+   * Preserve legs skipped as repeats of an already recorded phase since the
+   * previous sweep span closed (`preserved_repeat_count`). Probe-timeout
+   * fallbacks fire after their sweep span ends, so their repeats land in the
+   * next span: right in total, one cycle late per span.
+   */
+  private busyPreservedRepeats = 0;
   /**
    * task #1116: carrier captured from an accepted `agent:activity` frame with
    * detailKind "delivery_unconsumed", consumed by the very next snapshot write
@@ -2925,10 +3167,16 @@ export class AgentOrchestrator extends EventEmitter {
    * survives a replica switch and only a human start/resume clears it.
    */
   private readonly wakeCrashLoopBreaker: WakeCrashLoopBreaker;
+  /**
+   * The unread summary each agent's current launch was started with, until that
+   * launch's first turn ends (`agent:turn:ended`): a completed turn settles the
+   * conversations it owes nothing in (unowedReadBacklog.ts).
+   */
+  private readonly turnEndUnreadSnapshots = new TurnEndUnreadSnapshots(() => this.clock.now());
   /** task #1228 ①: timed-out feedback transcript requests whose late result is still recorded. */
   private readonly feedbackTranscriptLateResults = new FeedbackTranscriptLateResults(() => this.clock.now());
   /** RFC 071 part 3: commits outbox frames (state + watermark in one write) before they are acked. */
-  private readonly terminalFailureBreaker = new TerminalFailureBreaker(redisTerminalFailureBreakerStore);
+  private readonly terminalFailureBreaker: TerminalFailureBreaker;
   /** RFC 071 §9: the last block shown per agent, so a block is projected once. */
   private readonly projectedTerminalBlocks = new Map<string, string>();
   /** RFC 071 part 3: handle outbox frames only when the server advertises the ack capability (dormant). */
@@ -2943,6 +3191,19 @@ export class AgentOrchestrator extends EventEmitter {
    * without a carrier is not the same observation (XX, #7793 review).
    */
   private pendingSpawnFailure = new Map<string, SpawnFailureActivityDiagnostic | null>();
+  /**
+   * task #25: the stuck-tool state of the daemon frame being applied, set just
+   * before the frame's lifecycle plan runs and removed after it. Only that
+   * frame's snapshot write takes it; every other write (a server-authored
+   * state, a sweep) clears the snapshot's state.
+   */
+  private pendingToolStuck = new Map<string, ToolStuckActivityDiagnostic>();
+  /**
+   * Reconciler step 4b: the credential-hold carrier of the daemon frame being
+   * ingested (null: the frame had none), taken by its snapshot write only, so
+   * a fresh idle frame always decides and the latest frame is the state.
+   */
+  private pendingCredentialHold = new Map<string, CredentialHoldActivityDiagnostic | null>();
   private activityDebounceTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private agentStateCache = new Map<string, CachedAgentState>();
   private resetInProgress = new Map<string, "restart" | "session" | "full">();
@@ -3042,6 +3303,14 @@ export class AgentOrchestrator extends EventEmitter {
   // often, and ends as parked_expired after the max age (task #432).
   private static AGENT_DELIVERY_PARKED_PROBE_MS = 30_000;
   private static AGENT_DELIVERY_PARKED_MAX_MS = 30 * 60_000;
+  /**
+   * A delivery held for a Computer below the version floor waits for the
+   * upgrade, not for a reconnect, so it outlives the offline park; bounded so
+   * a machine that never comes back does not keep it in memory forever. The
+   * message itself stays in the durable inbox either way.
+   */
+  private static AGENT_DELIVERY_VERSION_HELD_MAX_MS = 7 * 24 * 60 * 60_000;
+  protected computerVersionFloor = sharedComputerVersionFloor;
   // A mention that reached the daemon (daemon_pending) stays an in-flight cycle
   // until its final ack or terminal error, at most this long (task #432).
   private static AGENT_DELIVERY_HELD_MAX_MS = 30 * 60_000;
@@ -3050,6 +3319,18 @@ export class AgentOrchestrator extends EventEmitter {
   // stalled ~2 min acked 53 deliveries 4-6s after the server gave up).
   private static AGENT_DELIVERY_GAVE_UP_TOMBSTONE_MS = 10 * 60_000;
   private static AGENT_DELIVERY_GAVE_UP_TOMBSTONE_MAX = 10_000;
+  /**
+   * Task #354: interval for WebSocket protocol ping frames on machine
+   * connections. Some machines sit behind a middlebox (proxy/NAT/VPN) that
+   * drops connections idle for ~12-20s, which is shorter than the 30s
+   * application heartbeat, so every connection died before its first ping and
+   * the daemon reconnected in a loop (close 1006 on daemons 1.0.16-1.0.25).
+   * A ping frame is answered by the `ws` client with a pong automatically, so
+   * this keeps the path non-idle for every daemon version without a daemon
+   * release. Deliberately emits no span: it would be one row per machine every
+   * few seconds. 0 disables it.
+   */
+  private static MACHINE_WS_PING_DEFAULT_INTERVAL_MS = 5_000;
   private static AGENT_START_ACK_TIMEOUT_MS = 5_000;
   private static AGENT_START_ACK_MAX_ATTEMPTS = 24;
   private static AGENT_START_TERMINAL_CACHE_SIZE = 1_024;
@@ -3091,11 +3372,14 @@ export class AgentOrchestrator extends EventEmitter {
   private readonly daemonIngressRateLimitMaxEvents: number;
   private readonly daemonIngressRateLimitMaxEventsPerMachine: number;
   private readonly daemonIngressRateLimitDisabled: boolean;
+  private readonly machineWsPingIntervalMs: number;
 
   constructor(
     private readonly replicaStateStore: ReplicaStateStore = redisReplicaStateStore,
     private readonly clock: OrchestratorClock = systemOrchestratorClock,
     private readonly tracer: Tracer = noopTracer,
+    /** Uniform [0, 1) source for timing jitter (the pause-retry try times); injected like the clock. */
+    random: () => number = currentRandomUnit,
   ) {
     super();
     this.daemonIngressRateLimitWindowMs = readPositiveIntegerEnv(
@@ -3111,10 +3395,21 @@ export class AgentOrchestrator extends EventEmitter {
       AgentOrchestrator.DAEMON_INGRESS_RATE_LIMIT_DEFAULT_MAX_EVENTS_PER_MACHINE,
     );
     this.daemonIngressRateLimitDisabled = readBooleanEnv("SLOCK_DISABLE_DAEMON_INGRESS_RATE_LIMIT");
+    this.machineWsPingIntervalMs = readNonNegativeIntegerEnv(
+      "SLOCK_MACHINE_WS_PING_INTERVAL_MS",
+      AgentOrchestrator.MACHINE_WS_PING_DEFAULT_INTERVAL_MS,
+    );
+    this.readyOwedWakeRandom = random;
+    // The combined claim records a pause's try too: same jitter source.
+    this.terminalFailureBreaker = new TerminalFailureBreaker(redisTerminalFailureBreakerStore, { ...DEFAULT_WAKE_CRASH_LOOP_RULES, random });
     this.wakeCrashLoopBreaker = new WakeCrashLoopBreaker({
       getWakeCrashLoopState: (agentId) => this.replicaStateStore.getWakeCrashLoopState(agentId),
       compareAndSetWakeCrashLoopState: (agentId, expectedVersion, state) =>
         this.replicaStateStore.compareAndSetWakeCrashLoopState(agentId, expectedVersion, state),
+    }, {
+      // First cooldown before a start-timeout pause tries again by itself.
+      pauseRetryBaseMs: readPositiveIntegerEnv("SLOCK_START_FAILURE_PAUSE_RETRY_MS", PAUSE_RETRY_BASE_MS),
+      random,
     });
     provideAgentDeliveryPending(this.agentDeliveryPendingProvider);
   }
@@ -3389,10 +3684,44 @@ export class AgentOrchestrator extends EventEmitter {
    * Signal-driven status writes (ready reconcile, daemon `agent:status`/`agent:session`)
    * gate on the in-memory cache, but the cache is replica-local and never
    * invalidated cross-replica. Route signal writes through the DB-layer guard so
-   * a stale `active` cache on another replica cannot resurrect a stopped agent.
+   * a stale `active` cache on another replica cannot resurrect a stopped agent,
+   * and a process on a Computer the agent was moved away from cannot overwrite
+   * its status or session (the write is fenced by `machineId` in SQL).
    */
-  protected async persistAgentStatusFromSignal(agentId: string, status: AgentStatus, sessionId?: string) {
-    return agentService.updateAgentStatusFromSignal(agentId, status, sessionId);
+  protected async persistAgentStatusFromSignal(
+    agentId: string,
+    status: AgentStatus,
+    write: { machineId: string; sessionId?: string },
+  ): Promise<agentService.AgentSignalStatusWriteOutcome> {
+    return agentService.updateAgentStatusFromSignal(agentId, status, write);
+  }
+
+  /**
+   * The signal write seam behind the lifecycle projection writer. A write the
+   * Machine fence drops means this replica's cache still places the agent on
+   * the signal's Computer: evict it so the next read reloads the row.
+   */
+  private async persistAgentStatusFromSignalFenced(
+    agentId: string,
+    status: AgentStatus,
+    write: { machineId: string | null; sessionId?: string },
+  ): Promise<agentService.AgentSignalStatusWriteOutcome> {
+    const outcome = write.machineId
+      ? await this.persistAgentStatusFromSignal(agentId, status, {
+        machineId: write.machineId,
+        ...(write.sessionId !== undefined ? { sessionId: write.sessionId } : {}),
+      })
+      : "machine_fenced";
+    if (outcome === "machine_fenced") {
+      this.agentStateCache.delete(agentId);
+      this.recordEvent("agent.status.signal.machine_fenced", {
+        outcome: "dropped",
+        reason: write.machineId ? "agent_not_on_signal_machine" : "signal_machine_unknown",
+        next_status: status,
+        session_present: write.sessionId !== undefined,
+      });
+    }
+    return outcome;
   }
 
   protected async invalidatePersistedAgentSessionFromSignal(
@@ -3407,8 +3736,20 @@ export class AgentOrchestrator extends EventEmitter {
     return agentService.setAgentLastRuntimeError(agentId, lastRuntimeError);
   }
 
-  protected async clearPersistedAgentLastRuntimeError(agentId: string) {
-    return agentService.clearAgentLastRuntimeError(agentId);
+  protected async clearPersistedAgentLastRuntimeError(agentId: string): Promise<agentService.AgentRuntimeErrorClearResult | null> {
+    return agentService.clearAgentLastRuntimeErrorUnlessBilling(agentId);
+  }
+
+  /** task #1351 proof-and-clear: the BillingError this frame proves recovered, removed; null when nothing matched. */
+  protected async clearPersistedBillingErrorOnRecovery(
+    agentId: string,
+    frame: agentService.RuntimeErrorFrameEvidence,
+  ): Promise<AgentRuntimeErrorState | null> {
+    return agentService.clearAgentBillingErrorOnRecovery(agentId, frame);
+  }
+
+  protected async stampPersistedRuntimeErrorRecoveryLaunch(agentId: string, launchId: string): Promise<AgentRuntimeErrorState | null> {
+    return agentService.stampAgentRuntimeErrorRecoveryLaunch(agentId, launchId);
   }
 
   protected async loadAgentForSessionBroadcast(agentId: string) {
@@ -3510,7 +3851,12 @@ export class AgentOrchestrator extends EventEmitter {
     return this.machineConnections.get(machineId)?.connectionEpochId;
   }
 
-  private lifecycleProjectionWriterDeps(): AgentLifecycleProjectionWriterDeps {
+  /**
+   * `stopReason`: the `agent:stop` reason an awaited stop send carries (only
+   * an explicit stop sets one: the owner's Stop, or the stop before a delete).
+   * Best-effort lifecycle stops never carry one.
+   */
+  private lifecycleProjectionWriterDeps(options: { stopReason?: AgentStopReason } = {}): AgentLifecycleProjectionWriterDeps {
     return {
       broadcastActivity: (agentId, activity, detail, detailKind, entries, nowOverride, options) =>
         this.broadcastActivity(agentId, activity, detail, detailKind, entries, nowOverride, options),
@@ -3523,12 +3869,12 @@ export class AgentOrchestrator extends EventEmitter {
           site: "lifecycle_plan",
           planKind: signal.planKind,
         }),
-      clearInbox: (agentId) => this.clearAgentInbox(agentId),
+      clearInbox: (agentId) => this.localInboxes.clear(agentId),
       clearLaunchGuard: (agentId) => this.clearLaunchGuard(agentId),
       maybeResolveStartingActivity: (agentId, span) => this.maybeResolveStartingActivity(agentId, span),
       persistAgentStatus: (agentId, status, sessionId) => this.persistAgentStatus(agentId, status, sessionId),
-      persistAgentStatusFromSignal: (agentId, status, sessionId) =>
-        this.persistAgentStatusFromSignal(agentId, status, sessionId),
+      persistAgentStatusFromSignal: (agentId, status, write) =>
+        this.persistAgentStatusFromSignalFenced(agentId, status, write),
       releaseWakeLock: (agentId) => this.releaseWakeLock(agentId),
       terminalizeFreshnessHold: (agentId, reason, span) => this.terminalizeFreshnessHold(agentId, reason, span),
       sendBestEffortStopToMachine: (machineId, agentId) => this.sendBestEffortToMachine(
@@ -3537,7 +3883,10 @@ export class AgentOrchestrator extends EventEmitter {
         `best-effort lifecycle stop send failed for agent ${agentId}`,
       ),
       sendStopToMachine: async (machineId, agentId) => {
-        const sent = await this.sendToMachine(machineId, { type: "agent:stop", agentId });
+        const sent = await this.sendToMachine(
+          machineId,
+          options.stopReason ? { type: "agent:stop", agentId, reason: options.stopReason } : { type: "agent:stop", agentId },
+        );
         if (!sent) {
           console.warn(`[Orchestrator] stopAgent ${agentId}: machine ${machineId} unreachable, applying lifecycle projection anyway`);
         }
@@ -3558,6 +3907,7 @@ export class AgentOrchestrator extends EventEmitter {
         void this.sweepComputerLifecycleOperations().catch(() => {});
         void this.dispatchPendingComputerLifecycleOperations().catch(() => {});
         void this.dispatchPendingAgentArchiveOps().catch(() => {});
+        void this.sweepComputerVersionGates().catch(() => {});
       }, 30_000);
     }
     if (this.runtimeOutcomeAckEnabled && !this.spawnErrorRetryTimer) {
@@ -3575,9 +3925,9 @@ export class AgentOrchestrator extends EventEmitter {
    * goes 90s without an update, we first ask the agent's daemon for
    * ground truth via `agent:activity_probe`. The daemon's response
    * arrives via the existing `agent:activity` upstream channel and
-   * cancels the fallback. If the machine is unreachable, we fall back
-   * to the legacy synth-online behaviour. If a connected daemon probe
-   * times out, we preserve the last busy state instead of inventing
+   * cancels the fallback. Expired non-local shadows are disposed without
+   * publishing activity. If a connected daemon probe times out, we preserve
+   * the last busy state instead of inventing
    * online/idle: a missed probe is not proof that a long tool call
    * finished.
    *
@@ -3590,15 +3940,63 @@ export class AgentOrchestrator extends EventEmitter {
       "server.agent.stale_activity.sweep",
       { parent: null, attrs: { replica_id: REPLICA_ID } },
       () => this.sweepStaleActivitiesInSpan(),
-      (staleCount) => ({ attrs: { stale_count: staleCount } }),
+      ({ staleCount, evictedCount }) => {
+        const preservedRepeatCount = this.busyPreservedRepeats;
+        this.busyPreservedRepeats = 0;
+        return { attrs: {
+          stale_count: staleCount,
+          preserved_repeat_count: preservedRepeatCount,
+          evicted_count: evictedCount,
+          activity_cache_size: this.agentActivity.size,
+        } };
+      },
     );
   }
 
-  private async sweepStaleActivitiesInSpan(): Promise<number> {
+  private async sweepStaleActivitiesInSpan(): Promise<{ staleCount: number; evictedCount: number }> {
     const now = this.clock.now();
     const pendingWork: Promise<void>[] = [];
     let staleCount = 0;
-    for (const [agentId, entry] of this.agentActivity) {
+    let evictedCount = 0;
+    const snapshots = [...this.agentActivity.entries()];
+    const expired = (entry: ActivitySnapshot) => now - entry.updatedAt > AgentOrchestrator.ACTIVITY_STALE_SEC * 1000;
+    const hasLocalMachine = [...this.machineConnections.keys()].some((id) => this.hasMachineLocally(id));
+    // evictCache() also invalidates placement on config/session changes. A
+    // missing cached agent is not proof that its Computer is remote. Resolve
+    // only these misses in bounded batches, without adding a per-agent query.
+    const missingPlacements = hasLocalMachine
+      ? snapshots.filter(([id, entry]) => (
+        expired(entry) && !this.isServerActivityBlock(entry.detailKind) && !this.agentStateCache.has(id)
+      )).map(([id]) => id)
+      : [];
+    const resolvedPlacements = new Map<string, string | null>();
+    for (let offset = 0; offset < missingPlacements.length; offset += 500) {
+      const ids = missingPlacements.slice(offset, offset + 500);
+      try {
+        const rows = await this.loadAgentPlacements(ids);
+        for (const id of ids) resolvedPlacements.set(id, null);
+        for (const row of rows) resolvedPlacements.set(row.id, row.deletedAt ? null : row.machineId);
+      } catch {
+        // Keep unresolved entries on lookup failure; retry next sweep.
+        this.recordEvent("server.agent.stale_activity.placement_lookup_failed", { agent_count: ids.length });
+      }
+    }
+    for (const [agentId, entry] of snapshots) {
+      // A real activity frame may have replaced the snapshot during a lookup.
+      if (this.agentActivity.get(agentId) !== entry) continue;
+      const cached = this.agentStateCache.get(agentId);
+      const machineId = cached ? cached.machineId : resolvedPlacements.get(agentId) ?? null;
+      const placementKnown = Boolean(cached) || !hasLocalMachine || resolvedPlacements.has(agentId);
+      // Server-authored blocks remain authority even on a non-owner. Ordinary
+      // shadows are read through Redis by getActivity and must not accumulate
+      // over the fleet's ownership history. Expire by write clock, including
+      // idle/error rows, without changing the owner's shared state.
+      if (expired(entry) && !this.isServerActivityBlock(entry.detailKind) && placementKnown
+        && (!machineId || !this.hasMachineLocally(machineId))) {
+        this.forgetLocalActivitySnapshot(agentId);
+        evictedCount += 1;
+        continue;
+      }
       const action = planStaleActivitySweepAction({
         isTransient: this.isTransientActivity(entry.activity),
         ageSec: (now - this.getActivityObservedAtMs(entry)) / 1000,
@@ -3607,21 +4005,8 @@ export class AgentOrchestrator extends EventEmitter {
       if (action === "keep-current") continue;
       staleCount += 1;
 
-      // Resolve the agent's machine from the in-memory state cache. If
-      // we have no cached entry (rare in steady state — the agent was
-      // never seen by this replica), fast-path straight to synth-online.
-      // If the machine is not connected locally but Redis still says a
-      // different replica owns the machine, this replica is a non-owner:
-      // preserve the busy state instead of inventing online.
-      //
-      // NOTE: this cache can be stale during a machine migration (the
-      // agent moved but cache still points at the old machine). In
-      // that window the probe goes to the wrong daemon → no response
-      // → 5s fallback refreshes the existing busy state instead of
-      // synth'ing online. Migration-aware probe routing can be a
-      // follow-up. (@Tenny note d8459ab7)
-      const cached = this.agentStateCache.get(agentId);
-      const machineId = cached?.machineId ?? null;
+      // Ask a locally connected Computer for a fresh observation. Missing or
+      // uncertain placement only produces diagnostics; it cannot establish idle.
       if (!machineId) {
         this.applyStaleActivitySweepAction({ action, agentId, now });
         continue;
@@ -3645,7 +4030,7 @@ export class AgentOrchestrator extends EventEmitter {
       pendingWork.push(this.issueActivityProbe(agentId, machineId, now));
     }
     await Promise.allSettled(pendingWork);
-    return staleCount;
+    return { staleCount, evictedCount };
   }
 
   private async handleStaleActivityWithoutLocalMachine(
@@ -3754,6 +4139,16 @@ export class AgentOrchestrator extends EventEmitter {
       return;
     }
 
+    // One diagnostic pair per stale phase: the snapshot is not rewritten here,
+    // so a repeat of the same phase carries no new information.
+    // Keyed on the observed clock and the content: a synthetic rewrite keeps
+    // observedAtMs but may change the activity or its kind, which is a new phase.
+    const phase = `${current.observedAtMs ?? current.updatedAt}:${current.activity}:${current.detailKind ?? ""}`;
+    if (this.busyPreservedPhase.get(agentId) === phase) {
+      this.busyPreservedRepeats += 1;
+      return;
+    }
+    this.busyPreservedPhase.set(agentId, phase);
     const serverId = this.agentStateCache.get(agentId)?.serverId ?? "unknown";
     // A probe timeout is not a new runtime or delivery observation. Keep the
     // existing snapshot in memory, but do not re-broadcast it: re-emitting a
@@ -4509,11 +4904,19 @@ export class AgentOrchestrator extends EventEmitter {
     // task #1123: a failed start keeps its typed carrier too; runtime_unavailable
     // without a carrier keeps the plain shape so untyped callers see no change.
     const carriesSpawnFailure = snapshot.detailKind === "runtime_unavailable" && snapshot.spawnFailure !== undefined;
+    // Reconciler step 4b: so does an idle status showing the held notice.
+    const carriesCredentialHold = snapshot.detailKind === "idle" && snapshot.credentialHold !== undefined;
+    // #wg-rbac:#57: a runtime error / crash detail keeps its kind, so every
+    // reader can project it per viewer even on a non-error activity.
+    const carriesRuntimeErrorDetail = isRuntimeErrorDetailActivity({ activity: null, detailKind: snapshot.detailKind });
     if (
-      snapshot.detailKind !== "delivery_unconsumed"
+      !carriesRuntimeErrorDetail
+      && snapshot.detailKind !== "delivery_unconsumed"
       && snapshot.detailKind !== "wake_crash_loop_blocked"
       && snapshot.detailKind !== "terminal_failure_paused"
       && !carriesSpawnFailure
+      && !carriesCredentialHold
+      && !snapshot.toolStuck
     ) {
       return this.formatActivity(snapshot.activity, snapshot.detail);
     }
@@ -4524,7 +4927,124 @@ export class AgentOrchestrator extends EventEmitter {
       ...(snapshot.deliveryConsumption ? { deliveryConsumption: snapshot.deliveryConsumption } : {}),
       ...(snapshot.wakeCrashLoop ? { wakeCrashLoop: snapshot.wakeCrashLoop } : {}),
       ...(snapshot.spawnFailure ? { spawnFailure: snapshot.spawnFailure } : {}),
+      ...(snapshot.toolStuck ? { toolStuck: snapshot.toolStuck } : {}),
+      ...(carriesCredentialHold ? { credentialHold: snapshot.credentialHold } : {}),
     };
+  }
+
+  /**
+   * A start made real progress (see `applyWakeCrashLoopStartSucceeded`): its
+   * owed catch-up reached the runtime, the failed-start streak ends, and a
+   * self-retrying pause whose try this was lifts.
+   */
+  private async observeStartProgress(agentId: string, launchId: string): Promise<{ changed: boolean; unpaused: boolean }> {
+    await this.wakeCrashLoopBreaker.confirmCatchupDelivered(agentId, launchId);
+    const progress = await this.wakeCrashLoopBreaker.recordStartSucceeded(agentId, launchId);
+    if (progress.unpaused) {
+      this.clearPauseRetry(agentId);
+      this.recordEvent("wake.block_lifted", { cause: "pause_retry_succeeded" });
+    }
+    return progress;
+  }
+
+  private readonly pauseRetryTimers = new Map<string, unknown>();
+
+  /**
+   * The pause-retry timer lives in this replica's memory only, so a restart,
+   * a deploy or a machine moving to another replica loses it. The replica
+   * that receives the machine's `ready` re-arms it for every agent there
+   * still in a self-retrying pause, from the record's current retry time
+   * (replacing any timer it still holds, which may be stale); a time already
+   * past fires promptly. Two fires at the same instant start the agent once
+   * because of the start path's own guards (the replica wake lock and
+   * `startsInProgress`), not the breaker. The breaker's compare-and-set only
+   * moves `pauseRetryAtMs` forward when a try starts, so a later re-arm or
+   * fire finds nothing due. Best effort.
+   */
+  private async rearmPauseRetry(agentId: string): Promise<void> {
+    try {
+      const retryAtMs = await this.wakeCrashLoopBreaker.pauseRetryAtMs(agentId);
+      // No clear on null: this read can race a pause committed meanwhile
+      // (frames from one socket run concurrently), and a timer whose record
+      // has no retry time already does nothing when it fires.
+      if (retryAtMs === null) return;
+      this.schedulePauseRetry(agentId, retryAtMs);
+      this.recordEvent("wake.pause_retry.rearmed", { due: retryAtMs <= this.clock.now() });
+    } catch (error) {
+      console.warn(`[Agent ${agentId}] Re-arming the pause retry failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  private clearPauseRetry(agentId: string): void {
+    const timer = this.pauseRetryTimers.get(agentId);
+    if (timer === undefined) return;
+    this.pauseRetryTimers.delete(agentId);
+    this.clock.clearTimeout(timer);
+  }
+
+  /**
+   * The try of a self-retrying pause (see PAUSE_RETRY_BASE_MS), at
+   * `retryAtMs`. Process-local and best effort, like the retry-once retry: if
+   * this replica goes away first, the first message after that time is the
+   * try instead. Each try arms the next one (cooldown doubled) in the
+   * breaker, so the chain follows the breaker's time and ends when the pause
+   * does or the time stops moving forward.
+   */
+  private schedulePauseRetry(agentId: string, retryAtMs: number): void {
+    this.clearPauseRetry(agentId);
+    const timer = this.scheduleUnrefOnClock(() => {
+      this.pauseRetryTimers.delete(agentId);
+      void (async () => {
+        // A person, a config change or another replica's try may have moved on.
+        const due = await this.wakeCrashLoopBreaker.pauseRetryAtMs(agentId);
+        if (due === null) return;
+        if (due > this.clock.now()) {
+          this.schedulePauseRetry(agentId, due);
+          return;
+        }
+        const result = await this.startAgent(agentId, { startCause: "start_failure_retry" });
+        if (result.outcome === "dispatched") await recordAgentSystemRestart(agentId, new Date(this.clock.now()));
+        this.recordEvent("wake.pause_retry", {
+          outcome: result.outcome,
+          ...(result.outcome === "skipped" ? { reason: result.reason } : {}),
+        });
+        const next = await this.wakeCrashLoopBreaker.pauseRetryAtMs(agentId);
+        if (next !== null && next > due) this.schedulePauseRetry(agentId, next);
+      })().catch((error: unknown) => console.warn(`[Agent ${agentId}] Retry of a paused agent did not dispatch: ${error instanceof Error ? error.message : String(error)}`));
+    }, Math.max(0, retryAtMs - this.clock.now()) + START_FAILURE_RETRY_SLACK_MS);
+    this.pauseRetryTimers.set(agentId, timer);
+  }
+
+  /**
+   * A self-retrying pause's try hit something only a person can fix (a start
+   * failure or a runtime error that needs the owner): no more tries by
+   * itself, the pause now waits for a person with the new reason.
+   */
+  private recordPauseRetryEnded(
+    agentId: string,
+    input: { previousReason: string | null; reason: string; runtime: string | null; model: string | null },
+  ): void {
+    this.clearPauseRetry(agentId);
+    this.recordEvent("wake.pause_retry.ended", {
+      previous_reason: input.previousReason ?? undefined,
+      reason: input.reason,
+      runtime: input.runtime ?? undefined,
+      model: input.model ?? undefined,
+    });
+    const cached = this.agentStateCache.get(agentId);
+    this.recordLifecycleEvent({
+      agentId,
+      machineId: cached?.machineId ?? null,
+      action: "wake",
+      outcome: "suppressed",
+      cause: "message",
+      previousStatus: cached?.status ?? null,
+      detail: "pause_retry_ended",
+    });
+    console.warn(
+      `[Agent ${agentId}] Pause retry ended: the try needs the owner (${input.reason}, was ${input.previousReason ?? "unknown"}); `
+      + "a manual start or a runtime config change lifts it",
+    );
   }
 
   /**
@@ -4538,26 +5058,46 @@ export class AgentOrchestrator extends EventEmitter {
     agentId: string,
     launchId: string | null,
     carrier: SpawnFailureActivityDiagnostic,
-    where: { runtime: string; machineId: string },
+    where: { runtime: string; machineId: string; model: string | null },
   ): Promise<SpawnFailureActivityDiagnostic> {
     try {
       const nowMs = this.clock.now();
       const runtimeAbsent = isRuntimeAbsentStartFailure(carrier.reason, carrier.lookupReason);
-      // The owner hears once per runtime and computer that the runtime is missing there.
-      const noticeFingerprint = runtimeAbsent ? `runtime_not_found:${where.runtime}:${where.machineId}` : undefined;
+      // Reconciler step 12: a runtime that kept failing after it started
+      // (`runtime_repeated_failure`) pauses and retries by itself too, but
+      // its owner is not told then: the start-timeout notice's copy is about
+      // starts that never come up, and a provider outage would tell every
+      // owner at once. The agent's page shows the pause. Once its cooldown
+      // reaches the cap the owner is told, once (`pauseRetryCapNoticeDue`).
+      const startTimeout = carrier.reason === "runtime_start_timeout";
+      // The owner hears once per runtime and computer that the runtime is
+      // missing there, and once per runtime and model that starts time out.
+      // A self-retrying pause whose try fails for another reason is news too
+      // (the first notice said Raft would retry by itself): once per reason.
+      const noticeFingerprint = runtimeAbsent
+        ? `runtime_not_found:${where.runtime}:${where.machineId}`
+        : `${carrier.reason}:${where.runtime}:${where.model ?? ""}`;
       const result = await this.wakeCrashLoopBreaker.recordStartFailure(agentId, {
         launchId,
         reason: carrier.reason,
         ...(carrier.lookupReason ? { lookupReason: carrier.lookupReason } : {}),
         nowMs,
-        ...(noticeFingerprint ? { noticeFingerprint } : {}),
+        noticeFingerprint,
+        noticeOnBlock: runtimeAbsent || startTimeout,
       });
       this.recordEvent("wake.start_failure", {
         outcome: result.outcome,
+        ...agentIdHashAttrs(agentId),
         reason: carrier.reason,
         start_failure_count: result.startFailureCount,
         blocked: result.blocked,
         launch_id_present: launchId !== null,
+        // Why automatic wakes are paused, and for what: a reason shared by many
+        // agents at once (a provider outage) shows up as one pause_reason.
+        ...(result.outcome === "blocked" || result.outcome === "pause_retry_ended"
+          ? { pause_reason: carrier.reason, runtime: where.runtime, model: where.model ?? undefined }
+          : {}),
+        ...(result.pauseRetryAtMs !== null ? { pause_retry_in_ms: Math.max(0, result.pauseRetryAtMs - nowMs) } : {}),
       });
       if (result.outcome === "blocked") {
         const cached = this.agentStateCache.get(agentId);
@@ -4572,19 +5112,63 @@ export class AgentOrchestrator extends EventEmitter {
         });
         console.warn(
           `[Agent ${agentId}] Automatic wakes paused: start failed (${carrier.reason}, ${result.startFailureCount} in a row); `
-          + "a manual start or a runtime config change lifts it",
+          + (result.pauseRetryAtMs !== null
+            ? `tries again by itself at ${new Date(result.pauseRetryAtMs).toISOString()}; a manual start or a runtime config change lifts it now`
+            : "a manual start or a runtime config change lifts it"),
         );
+      }
+      if (result.outcome === "pause_retry_ended") {
+        this.recordPauseRetryEnded(agentId, { previousReason: result.previousPauseReason, reason: carrier.reason, runtime: where.runtime, model: where.model });
       }
       if (result.outcome === "retry_scheduled" && result.retryAfterMs !== null) {
         this.scheduleStartFailureRetry(agentId, result.retryAfterMs - nowMs);
       }
-      if (result.notify && noticeFingerprint) {
+      // A pause that tries again by itself: arm its try (a failed try's report
+      // finds the next one already armed in the breaker).
+      if (result.pauseRetryAtMs !== null) this.schedulePauseRetry(agentId, result.pauseRetryAtMs);
+      if (result.notify && startTimeout) {
+        const notified = await this.postStartTimeoutPausedNotice(agentId, {
+          runtime: where.runtime,
+          model: where.model,
+          failedStarts: result.startFailureCount,
+          retryInMs: result.pauseRetryAtMs !== null ? Math.max(0, result.pauseRetryAtMs - nowMs) : null,
+        });
+        this.recordEvent("wake.start_timeout_paused.owner_notice", { outcome: notified ? "posted" : "no_owner", runtime: where.runtime });
+        if (notified) await this.wakeCrashLoopBreaker.markActionRequiredNotified(agentId, noticeFingerprint);
+      } else if (result.notify && runtimeAbsent) {
         const notified = await this.postRuntimeUnavailableNotice(agentId, where);
         this.recordEvent("wake.runtime_unavailable.owner_notice", { outcome: notified ? "posted" : "no_owner", runtime: where.runtime });
         // Only a posted notice counts as told: a failed post is retried on the next block.
         if (notified) await this.wakeCrashLoopBreaker.markActionRequiredNotified(agentId, noticeFingerprint);
+      } else if (result.notify) {
+        const notified = await this.postStartFailurePausedNotice(agentId, { runtime: where.runtime, reason: carrier.reason });
+        this.recordEvent("wake.start_failure_paused.owner_notice", { outcome: notified ? "posted" : "no_owner", reason: carrier.reason });
+        if (notified) await this.wakeCrashLoopBreaker.markActionRequiredNotified(agentId, noticeFingerprint);
+      } else if (result.alreadyNotified) {
+        // The owner was already told about this runtime and computer (or
+        // model, or reason): say so, or the pause reads as a missing notice.
+        const notice = startTimeout ? "start_timeout_paused" : runtimeAbsent ? "runtime_unavailable" : "start_failure_paused";
+        this.recordEvent(`wake.${notice}.owner_notice`, {
+          outcome: "already_notified",
+          ...(notice === "start_failure_paused" ? { reason: carrier.reason } : { runtime: where.runtime }),
+        });
       }
-      return result.blocked ? { ...carrier, autoRestartPaused: true } : carrier;
+      if (result.pauseRetryCapNoticeDue) await this.notifyPauseRetryCapped(agentId, { runtime: where.runtime, reason: carrier.reason });
+      if (!result.blocked) return carrier;
+      // A transient failure of a self-retrying pause's try is just a failed
+      // try: show the pause it stays in (its own copy says Raft tries again by
+      // itself), not that reason's "fix it, then restart" copy. The daemon's
+      // detail still says what happened.
+      const pauseReason = PAUSE_RETRY_START_FAILURE_REASONS.find((reason) => reason === result.previousPauseReason);
+      const shown: SpawnFailureActivityDiagnostic = result.pauseRetryAtMs !== null && pauseReason !== undefined && pauseReason !== carrier.reason
+        ? { reason: pauseReason, autoRestartPaused: true }
+        : { ...carrier, autoRestartPaused: true };
+      // Reconciler step 12 follow-up: the next try's time is the server's own
+      // (the daemon's carrier never brings one: the normalizer drops it), and
+      // only for a pause that retries by itself.
+      delete shown.pauseRetryAtMs;
+      if (result.pauseRetryAtMs !== null && PAUSE_RETRY_START_FAILURE_REASONS.includes(shown.reason)) shown.pauseRetryAtMs = result.pauseRetryAtMs;
+      return shown;
     } catch (error) {
       console.error(`[Agent ${agentId}] Failed to record a start failure:`, error);
       return carrier;
@@ -4615,21 +5199,28 @@ export class AgentOrchestrator extends EventEmitter {
         notify: result.notify,
         launch_id_present: input.launchId !== null,
       });
-      if (result.outcome !== "blocked") return;
-      const cached = this.agentStateCache.get(agentId);
-      this.recordLifecycleEvent({
-        agentId,
-        machineId: cached?.machineId ?? null,
-        action: "wake",
-        outcome: "suppressed",
-        cause: "message",
-        previousStatus: cached?.status ?? null,
-        detail: "runtime_action_required",
-      });
-      console.warn(
-        `[Agent ${agentId}] Automatic wakes paused: runtime error needs the owner (${input.requiredAction}); `
-        + "a manual start or a runtime config change lifts it",
-      );
+      if (result.outcome === "pause_retry_ended") {
+        const cached = this.agentStateCache.get(agentId);
+        this.recordPauseRetryEnded(agentId, { previousReason: result.previousPauseReason ?? null, reason: input.requiredAction, runtime: cached?.runtime ?? null, model: cached?.model ?? null });
+      } else if (result.outcome !== "blocked") {
+        return;
+      }
+      if (result.outcome === "blocked") {
+        const cached = this.agentStateCache.get(agentId);
+        this.recordLifecycleEvent({
+          agentId,
+          machineId: cached?.machineId ?? null,
+          action: "wake",
+          outcome: "suppressed",
+          cause: "message",
+          previousStatus: cached?.status ?? null,
+          detail: "runtime_action_required",
+        });
+        console.warn(
+          `[Agent ${agentId}] Automatic wakes paused: runtime error needs the owner (${input.requiredAction}); `
+          + "a manual start or a runtime config change lifts it",
+        );
+      }
       if (!result.notify) return;
       const notified = await this.postRuntimeActionRequiredNotice(agentId, input.requiredAction);
       this.recordEvent("wake.runtime_action_required.owner_notice", { outcome: notified ? "posted" : "no_owner" });
@@ -4656,6 +5247,47 @@ export class AgentOrchestrator extends EventEmitter {
     return postAgentActionRequiredNotice(this.io, this, { agentId, notice: { kind: "runtime_error", requiredAction } });
   }
 
+  protected async postStartFailurePausedNotice(
+    agentId: string,
+    input: { runtime: string; reason: string },
+  ): Promise<boolean> {
+    if (!this.io) return false;
+    return postAgentActionRequiredNotice(this.io, this, { agentId, notice: { kind: "start_failure_paused", ...input } });
+  }
+
+  /**
+   * Reconciler step 12 follow-up: a `runtime_repeated_failure` pause's tries
+   * reached the 8-hour cap and the last one failed too. Tell the owner once
+   * (the breaker's `pauseRetryCapNotified`, recorded only after a posted
+   * notice, so a failed post is tried again on the next failed try).
+   */
+  private async notifyPauseRetryCapped(agentId: string, input: { runtime: string; reason: string }): Promise<void> {
+    try {
+      const notified = await this.postPauseRetryCappedNotice(agentId, { ...input, retryEveryMs: PAUSE_RETRY_MAX_MS });
+      this.recordEvent("wake.pause_retry_capped.owner_notice", { outcome: notified ? "posted" : "no_owner", reason: input.reason, runtime: input.runtime });
+      if (notified) await this.wakeCrashLoopBreaker.markPauseRetryCapNotified(agentId);
+    } catch (error) {
+      // Best effort: the pause itself stands; the next failed try asks again.
+      console.warn(`[Agent ${agentId}] Telling the owner the pause retries reached the cap failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  protected async postPauseRetryCappedNotice(
+    agentId: string,
+    input: { runtime: string; reason: string; retryEveryMs: number },
+  ): Promise<boolean> {
+    if (!this.io) return false;
+    return postAgentActionRequiredNotice(this.io, this, { agentId, notice: { kind: "pause_retry_capped", ...input } });
+  }
+
+  protected async postStartTimeoutPausedNotice(
+    agentId: string,
+    input: { runtime: string; model: string | null; failedStarts: number; retryInMs: number | null },
+  ): Promise<boolean> {
+    if (!this.io) return false;
+    return postAgentActionRequiredNotice(this.io, this, { agentId, notice: { kind: "runtime_start_timeout", ...input } });
+  }
+
   protected async postRuntimeUnavailableNotice(
     agentId: string,
     where: { runtime: string; machineId: string },
@@ -4674,16 +5306,18 @@ export class AgentOrchestrator extends EventEmitter {
    * the unread catch-up the hold owed.
    */
   private scheduleStartFailureRetry(agentId: string, delayMs: number): void {
-    const timer = this.scheduleOnClock(() => {
+    this.scheduleUnrefOnClock(() => {
       void this.startAgent(agentId, { startCause: "start_failure_retry" }).then(
-        (result) => this.recordEvent("wake.start_failure_retry", {
-          outcome: result.outcome,
-          ...(result.outcome === "skipped" ? { reason: result.reason } : {}),
-        }),
+        async (result) => {
+          if (result.outcome === "dispatched") await recordAgentSystemRestart(agentId, new Date(this.clock.now()));
+          this.recordEvent("wake.start_failure_retry", {
+            outcome: result.outcome,
+            ...(result.outcome === "skipped" ? { reason: result.reason } : {}),
+          });
+        },
         (error: unknown) => console.warn(`[Agent ${agentId}] Retry after a failed start did not dispatch: ${error instanceof Error ? error.message : String(error)}`),
       );
     }, Math.max(0, delayMs) + START_FAILURE_RETRY_SLACK_MS);
-    (timer as { unref?: () => void } | null)?.unref?.();
   }
 
   /**
@@ -4692,11 +5326,18 @@ export class AgentOrchestrator extends EventEmitter {
    * only when a runtime value actually differs (`runtimeValuesChanged`);
    * field presence alone is not a change.
    */
-  async liftWakeBlockForConfigChange(agentId: string, options: { runtimeValuesChanged?: boolean } = {}): Promise<void> {
+  async liftWakeBlockForConfigChange(agentId: string, options: { runtimeValuesChanged?: boolean; runtimeOrModelChanged?: boolean } = {}): Promise<void> {
     if (await this.wakeCrashLoopBreaker.liftForConfigChange(agentId)) {
       this.recordEvent("wake.block_lifted", { cause: "runtime_config_changed" });
     }
     if (options.runtimeValuesChanged === true) await this.liftTerminalBreaker(agentId, "runtime_config_changed");
+    // #triage:#263: an error the old runtime or model reported (a usage limit
+    // above all) says nothing about the new one; it stayed until that model
+    // produced output or someone stopped the agent. Cleared like a manual stop
+    // clears it: a BillingError stays (task #1351, the row decides).
+    if (options.runtimeOrModelChanged === true && await this.clearLastRuntimeError(agentId)) {
+      this.recordEvent("runtime_error_state.cleared", { reason: "runtime_or_model_changed" });
+    }
   }
 
   /**
@@ -5086,10 +5727,30 @@ export class AgentOrchestrator extends EventEmitter {
       undefined,
       { ...(observation.snapshot.lastLaunchId ? { launchId: observation.snapshot.lastLaunchId } : {}) },
     );
+    // Tell the owner once per trip: `blockedNow` is true only on the exit
+    // that moved the breaker to blocked (one compare-and-set winner across
+    // replicas); later exits while blocked are rejected as already_blocked,
+    // and only a reset (human start, manual stop) lets it trip again.
+    void this.noticeAutomaticWakePaused(agentId, observation.snapshot.earlyExitCount);
+  }
+
+  private async noticeAutomaticWakePaused(agentId: string, earlyExits: number): Promise<void> {
+    try {
+      const outcome = await this.postAutomaticWakePausedNotice(agentId, { earlyExits });
+      this.recordEvent("wake_crash_loop.owner_notice", { outcome });
+    } catch (error) {
+      console.error(`[Agent ${agentId}] Failed to tell the owner that automatic wakes are paused:`, error);
+    }
+  }
+
+  protected async postAutomaticWakePausedNotice(agentId: string, input: { earlyExits: number }): Promise<"posted" | "no_owner" | "no_socket_server"> {
+    if (!this.io) return "no_socket_server";
+    return (await postAutomaticWakePausedNotice(this.io, this, { agentId, earlyExits: input.earlyExits })) ? "posted" : "no_owner";
   }
 
   private formatRuntimeErrorActivity(error: AgentRuntimeErrorState): VisibleActivity {
-    return this.formatActivity("error", error.message);
+    // #wg-rbac:#57: a row stored before ingest scrubbing is scrubbed on read.
+    return this.formatActivity("error", boundedRuntimeErrorDetail(error.message));
   }
 
   private async rememberRuntimeError(agentId: string, error: AgentRuntimeErrorState): Promise<boolean> {
@@ -5101,6 +5762,11 @@ export class AgentOrchestrator extends EventEmitter {
     // Redis carry that, so they never differ from the row.
     const durable = await this.persistAgentLastRuntimeError(agentId, error);
     if (!durable) return false;
+    if (error.errorClass === "BillingError" && durable.occurrenceId !== error.occurrenceId) {
+      // task #1351: the stored BillingError is not provably older (a replay,
+      // or a late 402 from another launch): it keeps its evidence.
+      this.recordEvent("runtime_error_state.write_refused", { reason: "billing_not_newer", stored_class: durable.errorClass ?? "untyped" });
+    }
 
     this.updateCache(agentId, { lastRuntimeError: durable });
     // gamma-2 shadow: the error state is daemon-reported ground truth
@@ -5112,8 +5778,10 @@ export class AgentOrchestrator extends EventEmitter {
       site: "runtime_error",
     });
     const now = this.clock.now();
-    const errorObservedAtMs = Date.parse(error.at);
-    this.writeAgentActivitySnapshot(agentId, "error", error.message, "runtime_error", now, {
+    // The row's error, not the incoming one: a refused BillingError write
+    // (task #1351) must not show its own text over the stored occurrence.
+    const errorObservedAtMs = Date.parse(durable.at);
+    this.writeAgentActivitySnapshot(agentId, "error", boundedRuntimeErrorDetail(durable.message), "runtime_error", now, {
       observedAtMs: Number.isFinite(errorObservedAtMs) ? errorObservedAtMs : now,
       arbitration: {
         observationClass: "observed",
@@ -5124,13 +5792,30 @@ export class AgentOrchestrator extends EventEmitter {
     return true;
   }
 
+  /**
+   * Clear any stored runtime error except a BillingError, as the database
+   * decides (agentService.clearAgentLastRuntimeErrorUnlessBilling). Only a
+   * clear that removed a row's error updates the cache, the activity, Redis and
+   * open pages; when the row kept its error (a BillingError), this replica's
+   * cache takes what the row holds instead.
+   */
   private async clearLastRuntimeError(agentId: string): Promise<boolean> {
+    const cachedBefore = this.agentStateCache.get(agentId);
     // A Redis tombstone must never outrun the durable clear. Keeping all local
     // projections unchanged on rejection also prevents this replica from
     // claiming recovery that persistence did not accept.
-    const persisted = await this.clearPersistedAgentLastRuntimeError(agentId);
-    if (!persisted) return false;
+    const result = await this.clearPersistedAgentLastRuntimeError(agentId);
+    if (!result) return false;
+    if (!result.cleared) {
+      await this.syncCachedRuntimeError(agentId, result.current);
+      return false;
+    }
+    await this.applyRuntimeErrorCleared(agentId, cachedBefore);
+    return true;
+  }
 
+  /** After the row's error was removed: the cache, the error->online activity, Redis, then open pages. */
+  private async applyRuntimeErrorCleared(agentId: string, cachedBefore: CachedAgentState | undefined): Promise<void> {
     this.updateCache(agentId, { lastRuntimeError: null });
     const current = this.agentActivity.get(agentId);
     if (current?.activity === "error") {
@@ -5150,7 +5835,57 @@ export class AgentOrchestrator extends EventEmitter {
       });
     }
     await this.mirrorAgentRuntimeError(agentId, null);
-    return persisted;
+    await this.broadcastRuntimeErrorCleared(agentId, cachedBefore);
+  }
+
+  /** task #1351: a stale replica cache takes the stored error the database just reported. */
+  private async syncCachedRuntimeError(agentId: string, durable: AgentRuntimeErrorState | null): Promise<void> {
+    const cached = this.agentStateCache.get(agentId);
+    if (!cached || JSON.stringify(cached.lastRuntimeError ?? null) === JSON.stringify(durable)) return;
+    this.updateCache(agentId, { lastRuntimeError: durable });
+    this.recordEvent("runtime_error_state.cache_resynced", { present: durable !== null, error_class: durable?.errorClass ?? "none" });
+    await this.mirrorAgentRuntimeError(agentId, durable);
+  }
+
+  /**
+   * task #1351: a start armed `launchId`. If the database holds a BillingError
+   * now, that launch came after it: stamp it on that record (R2 of
+   * agentService.clearAgentBillingErrorOnRecovery). Best effort: without the stamp the error is
+   * only kept longer.
+   */
+  private async stampRuntimeErrorRecoveryLaunch(agentId: string, launchId: string | undefined): Promise<void> {
+    if (launchId === undefined) return;
+    try {
+      const stamped = await this.stampPersistedRuntimeErrorRecoveryLaunch(agentId, launchId);
+      if (stamped) {
+        this.updateCache(agentId, { lastRuntimeError: stamped });
+        this.recordEvent("runtime_error_state.recovery_launch_stamped", { error_class: stamped.errorClass ?? "untyped" });
+      }
+    } catch (err) {
+      console.warn(
+        `[Orchestrator] Failed to stamp the recovery launch on agent ${agentId}'s runtime error:`,
+        err instanceof Error ? err.message : err,
+      );
+    }
+  }
+
+  /**
+   * task #1351: open agent pages show the stored error (the billing banner and
+   * the other typed banners) from the agent record; tell them to re-read it
+   * (`agent:updated`, as a profile change does) once its clear is durable.
+   */
+  private async broadcastRuntimeErrorCleared(agentId: string, cached: CachedAgentState | undefined): Promise<void> {
+    if (!this.io) return;
+    try {
+      const agent = cached ?? await this.getCachedAgent(agentId);
+      if (!agent) return;
+      this.io.to(agentEventRoom(agent.serverId, agent.assistantOwnerUserId)).emit("agent:updated", { agentId });
+    } catch (err) {
+      console.warn(
+        `[Orchestrator] Failed to announce runtime error clear for agent ${agentId}:`,
+        err instanceof Error ? err.message : err,
+      );
+    }
   }
 
   private async mirrorAgentRuntimeError(
@@ -5179,19 +5914,32 @@ export class AgentOrchestrator extends EventEmitter {
     atMs?: number;
     /** #688(c): the normalized typed diagnostic that established this state, if any. */
     typed?: RuntimeErrorActivityDiagnostic | null;
+    /** task #1351: the setting frame's daemon process and sequence (kept for a BillingError). */
+    daemonInstanceId?: string;
+    clientSeq?: number;
   }): AgentRuntimeErrorState {
     const typed = input.typed ? {
       errorClass: input.typed.errorClass,
       errorReason: input.typed.errorReason,
       fingerprint: input.typed.fingerprint,
       reasonProvenance: input.typed.reasonProvenance,
+      // #proj-raft-computer:#48: what the owner must do, so the web can say it.
+      ...(input.typed.requiredAction ? { requiredAction: input.typed.requiredAction } : {}),
     } : {};
     return {
-      message: input.detail || "Agent encountered an error",
+      message: boundedRuntimeErrorDetail(input.detail) || GENERIC_RUNTIME_ERROR_MESSAGE,
       at: new Date(input.atMs ?? this.clock.now()).toISOString(),
       ...(input.launchId !== undefined ? { launchId: input.launchId } : {}),
       actionRequired: true,
       ...typed,
+      // task #1351: a BillingError is cleared only by proof against its own
+      // occurrence and set-frame evidence; other classes keep their shape.
+      ...(input.typed?.errorClass === "BillingError" ? {
+        occurrenceId: crypto.randomUUID(),
+        ...(typeof input.daemonInstanceId === "string" ? { daemonInstanceId: input.daemonInstanceId } : {}),
+        // Compared in SQL as bigint: only a safe integer is evidence.
+        ...(Number.isSafeInteger(input.clientSeq) ? { clientSeq: input.clientSeq } : {}),
+      } : {}),
     };
   }
 
@@ -5795,6 +6543,7 @@ export class AgentOrchestrator extends EventEmitter {
       expectedLaunchId: existing?.expectedLaunchId ?? null,
       launchGuardMode: existing?.launchGuardMode ?? "legacy",
       serverId: agent.serverId,
+      assistantOwnerUserId: agent.assistantOwnerUserId,
       name: agent.name,
       displayName: agent.displayName,
       description: agent.description,
@@ -6101,6 +6850,108 @@ export class AgentOrchestrator extends EventEmitter {
   /** Remove agent from cache */
   evictCache(agentId: string) {
     this.agentStateCache.delete(agentId);
+    this.runtimeErrorViewerCache.delete(agentId);
+  }
+
+  /**
+   * When the agent was last observed idle (`online`: its turn ended; `offline`:
+   * its runtime is gone), as the observation time the server recorded (never
+   * later than when it arrived); null while it is busy or nothing is known.
+   * The WeChat turn record starts a new turn at a hand-off only after such an
+   * observation (wechatTurn.ts). Reads the shared activity (Redis: the
+   * runtime's `/activity` reports reach any replica) and this replica's own,
+   * whichever was written last.
+   */
+  async getTurnIdleObservedAtMs(agentId: string): Promise<number | null> {
+    const local = this.agentActivity.get(agentId) ?? null;
+    const shared = await this.replicaStateStore.getAgentActivity(agentId).catch(() => null);
+    const latest = !shared ? local : !local ? shared : shared.updatedAt >= local.updatedAt ? shared : local;
+    if (!latest || (latest.activity !== "online" && latest.activity !== "offline")) return null;
+    return typeof latest.observedAtMs === "number" ? latest.observedAtMs : null;
+  }
+
+  /** After an agent is deleted (committed): its held coarse state is dropped, not sent. */
+  forgetAgentActivity(agentId: string) {
+    this.forgetLocalActivitySnapshot(agentId);
+    this.agentActivityStateFanout.forget(agentId);
+    void this.replicaStateStore.clearAgentContextViewAvailability(agentId).catch((err) => {
+      console.warn(`[AgentOrchestrator] Failed to clear context view availability for ${agentId}:`, err);
+    });
+  }
+
+  private isServerActivityBlock(kind: AgentActivityDetailKind | undefined): boolean {
+    return kind === "wake_crash_loop_blocked" || kind === "terminal_failure_paused";
+  }
+
+  /** Local cache disposal only: never clear the current owner's shared state. */
+  private forgetLocalActivitySnapshot(agentId: string) {
+    this.agentActivity.delete(agentId);
+    this.busyPreservedPhase.delete(agentId);
+    const debounce = this.activityDebounceTimers.get(agentId);
+    if (debounce) clearTimeout(debounce);
+    this.activityDebounceTimers.delete(agentId);
+    for (const [probeId, probe] of this.pendingActivityProbes) {
+      if (probe.agentId !== agentId) continue;
+      clearTimeout(probe.fallbackTimer);
+      this.pendingActivityProbes.delete(probeId);
+    }
+  }
+
+  /** View Context: the latest availability report stored for the agent (any replica), or null. */
+  async getAgentContextViewAvailability(agentId: string): Promise<AgentContextViewAvailabilityRecord | null> {
+    return this.replicaStateStore.getAgentContextViewAvailability(agentId);
+  }
+
+  /**
+   * Whether the Computer's daemon advertised `capability` on its current
+   * connection, from any replica: the live connection when local, else the
+   * owner's mirrored ready capabilities (readProbeCarrierFact).
+   */
+  /**
+   * task #1357 item 1: an input of the agents' `modelLimits` signal changed
+   * (their session, their config revision): clients re-read them. Only
+   * agents that have such a signal are told. Best effort.
+   */
+  async notifyModelLimitsChanged(where: { agentIds: readonly string[] }): Promise<void> {
+    if (!this.io) return;
+    try {
+      for (const agent of await listModelLimitsAgents(where)) {
+        this.io.to(agentEventRoom(agent.serverId, agent.assistantOwnerUserId)).emit("agent:updated", { agentId: agent.id });
+      }
+    } catch (err) {
+      console.warn(`[ModelLimits] agent:updated push failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  /**
+   * `machineAdvertisesCapability` for a start decision: a failed read (the
+   * shared store) counts as "not declared" and is logged, never failing the
+   * start.
+   */
+  private async machineDeclaresCapabilityForStart(machineId: string | null | undefined, capability: string): Promise<boolean> {
+    if (!machineId) return false;
+    try {
+      return await this.machineAdvertisesCapability(machineId, capability);
+    } catch (err) {
+      console.warn(`[Machine ${machineId}] capability ${capability} unreadable for a start, treated as not declared: ${err instanceof Error ? err.message : String(err)}`);
+      return false;
+    }
+  }
+
+  async machineAdvertisesCapability(machineId: string, capability: string): Promise<boolean> {
+    const local = this.machineConnections.get(machineId);
+    if (local) return local.capabilities.has(capability);
+    return (await this.readProbeCarrierFact(machineId))?.capabilities.includes(capability) === true;
+  }
+
+  /**
+   * View Context: send one `agent:context_view_request` to the Computer from
+   * any replica (locally, or through the owner replica). Fire and forget: the
+   * daemon answers with a result POST, never a frame. False when no replica
+   * holds the Computer's connection.
+   */
+  async sendAgentContextViewRequest(machineId: string, message: AgentContextViewRequestMessage): Promise<boolean> {
+    return this.sendToMachine(machineId, message);
   }
 
   // Machine WebSocket management
@@ -6178,6 +7029,24 @@ export class AgentOrchestrator extends EventEmitter {
       outcome: "started",
     });
     conn.heartbeatTimer = this.clock.scheduleRepeated(() => this.onMachineHeartbeatTick(machineId, conn), 30_000);
+    this.startMachineWsPing(conn);
+  }
+
+  private startMachineWsPing(conn: MachineConnection) {
+    if (conn.wsPingTimer) this.clock.cancelRepeated(conn.wsPingTimer);
+    conn.wsPingTimer = null;
+    if (this.machineWsPingIntervalMs <= 0) return;
+    conn.wsPingTimer = this.clock.scheduleRepeated(() => {
+      // Only an OPEN socket can carry a ping; `ws` throws otherwise. Closing
+      // and closed sockets are cleaned up by clearMachineConnection.
+      if (conn.ws.readyState !== 1) return;
+      try {
+        conn.ws.ping();
+      } catch {
+        // Best effort: a failed keepalive must never affect the connection's
+        // bookkeeping. The 30s heartbeat still owns liveness decisions.
+      }
+    }, this.machineWsPingIntervalMs);
   }
 
   protected async loadRuntimeAccountUsageAttacher(serverId: string, machineId: string): Promise<string | null> {
@@ -6199,7 +7068,7 @@ export class AgentOrchestrator extends EventEmitter {
     try {
       await usageLimitAttentionService.ingest(machineId, parsed);
     } catch (error) {
-      // Attention is a gated side projection. It must never break the existing
+      // Attention is a side projection of the usage snapshot. It must never break the existing
       // usage cache write or a correlated manual-refresh response.
       console.warn("[UsageLimitAttention] projection failed", {
         machineId,
@@ -6211,7 +7080,7 @@ export class AgentOrchestrator extends EventEmitter {
   protected async collectScheduledRuntimeAccountUsage(machineId: string, conn: MachineConnection): Promise<void> {
     if (this.machineConnections.get(machineId) !== conn || !conn.runtimes) return;
     if (!await this.isRuntimeAccountUsageDataBoundaryAuthorized(machineId, conn)) return;
-    for (const provider of runtimeAccountUsageProvidersForRuntimes(conn.runtimes)) {
+    for (const provider of runtimeAccountUsageProvidersForRuntimes(conn.runtimes, conn.capabilities)) {
       if (!await runtimeAccountUsageCacheService.tryAcquireRefresh(machineId, provider)) continue;
       await this.requestRuntimeAccountUsageRefresh(machineId, provider, "scheduled");
     }
@@ -6264,9 +7133,9 @@ export class AgentOrchestrator extends EventEmitter {
     hostname?: string,
     os?: string,
     daemonVersion?: string | null,
-    deviceClass?: DeviceClass | null,
+    host?: machineService.MachineHostFacts,
   ) {
-    await machineService.updateMachineRuntimes(machineId, runtimes, hostname, os, daemonVersion, deviceClass);
+    await machineService.updateMachineRuntimes(machineId, runtimes, hostname, os, daemonVersion, host);
   }
 
   /**
@@ -6348,6 +7217,13 @@ export class AgentOrchestrator extends EventEmitter {
    */
   private scheduleOnClock(fn: () => void, ms: number): unknown {
     return this.clock.setTimeout(fn, ms);
+  }
+
+  /** `scheduleOnClock` for a timer that must not hold the process open (the start-failure retries). */
+  private scheduleUnrefOnClock(fn: () => void, ms: number): unknown {
+    const timer = this.scheduleOnClock(fn, ms);
+    (timer as { unref?: () => void } | null)?.unref?.();
+    return timer;
   }
 
   private nextCapabilitiesGeneration(machineId: string): number {
@@ -6434,7 +7310,7 @@ export class AgentOrchestrator extends EventEmitter {
         await this.runInTraceSpan(
           "server.machine.capabilities.persist",
           { attrs: { machine_id: machineId, attempt: state.attempt + 1 } },
-          () => this.persistMachineCapabilities(machineId, payload.runtimes, payload.hostname, payload.os, payload.daemonVersion, payload.deviceClass),
+          () => this.persistMachineCapabilities(machineId, payload.runtimes, payload.hostname, payload.os, payload.daemonVersion, payload.host),
         );
       } catch (err) {
         const failed = this.capabilitiesWrites.get(machineId);
@@ -6512,9 +7388,14 @@ export class AgentOrchestrator extends EventEmitter {
           ...(conn.runtimeDetection ? { runtimeDetection: conn.runtimeDetection } : {}),
           hostname: payload.hostname,
           os: payload.os,
-          deviceClass: payload.deviceClass ?? null,
+          deviceClass: payload.host?.deviceClass ?? null,
+          hostProvider: payload.host?.hostProvider ?? null,
+          osRelease: payload.host?.osRelease ?? null,
+          osId: payload.host?.osId ?? null,
+          osIdLike: payload.host?.osIdLike ?? null,
           daemonVersion: payload.daemonVersion,
           computerVersion: payload.computerVersion,
+          versionGate: conn.versionGate ?? null,
         });
       }
       await this.liftRuntimeUnavailableBlocks(machineId, payload.runtimes);
@@ -6621,29 +7502,47 @@ export class AgentOrchestrator extends EventEmitter {
     );
   }
 
-  private peekLocalInboxWakeMessage(agentId: string): AgentMessage | null {
-    return this.agentInboxes.get(agentId)?.inbox[0] ?? null;
+  /**
+   * Buffered messages that may be handed over again (agent:start wake, gated
+   * inbox flush): system-app events go through their app's delivery guard
+   * (systemAppDeliveryGuards), and the ones it vetoes are dropped from the
+   * buffer; the ones it withholds (fail closed) stay buffered, not handed
+   * over. Order kept; with no guarded system-app event, no query. Callers
+   * skip the call (and its await) when no message is a third-party event.
+   */
+  private async guardBufferedSystemAppEvents(agentId: string, messages: AgentMessage[]): Promise<AgentMessage[]> {
+    const { deliverable, vetoed } = await partitionDeliverableSystemAppEventMessages(messages, agentId);
+    if (vetoed.length > 0) this.discardUndeliverableMessages(agentId, vetoed);
+    return deliverable;
   }
 
-  private removeLocalInboxWakeMessage(agentId: string, message: AgentMessage): boolean {
-    const inbox = this.agentInboxes.get(agentId);
-    if (!inbox || inbox.inbox.length === 0) return false;
-
-    const index = inbox.inbox.findIndex((candidate) => {
-      if (message.seq && candidate.seq === message.seq) return true;
-      return Boolean(!message.seq && message.message_id && candidate.message_id === message.message_id);
-    });
-    if (index < 0) return false;
-
-    inbox.inbox.splice(index, 1);
-    return true;
+  /**
+   * False when `message` (a third-party event; callers skip the call for any
+   * other message) is a system-app event its app's delivery guard does not
+   * allow now (a vetoed one is expired by the check).
+   */
+  protected async isSystemAppEventDeliverable(agentId: string, message: AgentMessage): Promise<boolean> {
+    const { deliverable } = await partitionDeliverableSystemAppEventMessages([message], agentId);
+    return deliverable.length === 1;
   }
 
   private async maybeWakePendingInboxAfterReady(
     machineId: string,
     agent: ReadyReconcileAgent,
   ): Promise<boolean> {
-    const wakeMessage = this.peekLocalInboxWakeMessage(agent.id);
+    if (!this.localInboxes.peekFirst(agent.id)) {
+      return false;
+    }
+    if (this.machineConnections.get(machineId)?.versionGate?.enforced) {
+      // Held for the version floor: the message stays queued for after the upgrade.
+      return false;
+    }
+    // The wake hands the message over in agent:start: the oldest buffered
+    // message a system-app delivery guard does not keep back.
+    const buffered = this.localInboxes.peek(agent.id);
+    const [wakeMessage] = buffered.some((message) => message.third_party_event)
+      ? await this.guardBufferedSystemAppEvents(agent.id, buffered)
+      : buffered;
     if (!wakeMessage) {
       return false;
     }
@@ -6690,7 +7589,7 @@ export class AgentOrchestrator extends EventEmitter {
     // The pending message is now embedded in agent:start as wakeMessage. Daemon
     // startup-wake messages are not sent as agent:deliver, so they do not emit
     // a delivery ack to drain this replay inbox entry.
-    const removed = this.removeLocalInboxWakeMessage(agent.id, wakeMessage);
+    const removed = this.localInboxes.removeWakeMessage(agent.id, wakeMessage);
     this.recordEvent("machine.ready.pending_inbox_wake.started", {
       agent_id: agent.id,
       machine_id: machineId,
@@ -6761,6 +7660,10 @@ export class AgentOrchestrator extends EventEmitter {
 
     const hadHeartbeatTimer = Boolean(conn.heartbeatTimer);
     if (conn.heartbeatTimer) this.clock.cancelRepeated(conn.heartbeatTimer);
+    if (conn.wsPingTimer) {
+      this.clock.cancelRepeated(conn.wsPingTimer);
+      conn.wsPingTimer = null;
+    }
     if (conn.runtimeAccountUsageTimer) this.clock.cancelRepeated(conn.runtimeAccountUsageTimer);
     // Cancel any in-flight capabilities-persist retry: once the daemon is gone
     // there is nothing to converge, and the next `ready` on reconnect re-enqueues.
@@ -7059,10 +7962,12 @@ export class AgentOrchestrator extends EventEmitter {
           connectionEpochId,
           replicaGeneration: null,
           heartbeatTimer: null,
+          wsPingTimer: null,
           runtimeAccountUsageTimer: null,
           lastPong: this.clock.now(),
           lastIngressAt: this.clock.now(),
           connectedAt: this.clock.now(),
+          previousCloseAt: this.machineLastDisconnectAt.get(machineId),
           daemonVersion: null,
           capabilities: new Set(),
           runtimes: null,
@@ -7076,6 +7981,9 @@ export class AgentOrchestrator extends EventEmitter {
 
         this.startMachineHeartbeat(machineId, conn);
 
+        // Taken by this connection: a later `ready` on another session must
+        // not find an older session's close here.
+        this.machineLastDisconnectAt.delete(machineId);
         this.machineConnections.set(machineId, conn);
 
         // A legacy handshake can authenticate immediately before the adoption
@@ -7153,8 +8061,13 @@ export class AgentOrchestrator extends EventEmitter {
             return;
           }
           conn.replicaGeneration = replicaGeneration;
+          // machine_id + server_id (plain, as on the connect span and the
+          // daemon's events) let a rollout readout join each Computer's
+          // disconnect with the task it re-registered on (instance_id, version).
           this.recordEvent("machine.replica.register_committed", {
             outcome: "committed",
+            machine_id: machineId,
+            server_id: serverId,
             ...connectionTraceAttrs,
           });
         } catch (err) {
@@ -7253,6 +8166,40 @@ export class AgentOrchestrator extends EventEmitter {
   async unregisterMachine(machineId: string): Promise<void> {
     this.cancelPendingMachineDisconnect(machineId);
     await this.clearMachineConnection(machineId, true);
+  }
+
+  /**
+   * Closes this replica's socket for `machineId`, if it holds one authenticated
+   * by the key that changed. Any close makes the daemon reconnect; the
+   * handshake then accepts the new key or refuses the old one with its usual
+   * reason. Reached on every replica through dropMachineConnectionEverywhere.
+   */
+  async dropMachineConnectionForCredentialChange(
+    machineId: string,
+    reason: "credential_rotated" | "credential_revoked",
+  ): Promise<boolean> {
+    const conn = this.machineConnections.get(machineId);
+    // Only the connection the changed key authenticated: rotating the legacy
+    // sk_machine_* key leaves a Computer connection on the same machine alone,
+    // and revoking a Computer leaves a legacy one alone.
+    const affectedPrincipal = reason === "credential_rotated" ? "legacy_machine" : "computer";
+    if (!conn || conn.principalKind !== affectedPrincipal) return false;
+    const closeReason = `machine_${reason}` as const;
+    try {
+      conn.ws.close(MACHINE_CREDENTIAL_CHANGED_CLOSE_CODE, closeReason);
+    } catch {
+      // `handleMachineDisconnect` below still removes server-side ownership.
+    }
+    await this.handleMachineDisconnect(machineId, conn.ws, {
+      cause: closeReason,
+      closeCode: MACHINE_CREDENTIAL_CHANGED_CLOSE_CODE,
+      closeReason,
+    });
+    const pending = this.pendingMachineDisconnects.get(machineId);
+    if (pending) {
+      await this.applyMachineDisconnectProjection(machineId, pending);
+    }
+    return true;
   }
 
   async disconnectMachineForUnlink(machineId: string): Promise<boolean> {
@@ -7377,7 +8324,23 @@ export class AgentOrchestrator extends EventEmitter {
     }
   }
 
-  /** Runtime binary/package versions reported by the current daemon ready frame. */
+  /**
+   * #proj-raft-computer task #34: advisory hint that the Computer's installer
+   * needs a repair run on the machine (owner memory, else the Redis mirror);
+   * null when there is nothing to hint or it was never reported (older Computers).
+   */
+  async getMachineInstallerRepairHint(machineId: string): Promise<ComputerInstallerRepairHint | null> {
+    const local = this.machineConnections.get(machineId);
+    if (local) return local.installerRepairHint ?? null;
+    if (!this.replicaStateStore.isAvailable()) return null;
+    try {
+      const raw = (await this.replicaStateStore.getMachineMeta(machineId))?.installerRepairHint;
+      return raw ? parseComputerInstallerRepairHint(JSON.parse(raw)) : null;
+    } catch {
+      return null;
+    }
+  }
+
   /** Latest disk report of a connected machine (owner memory, else the Redis mirror). */
   async getMachineDiskStatus(machineId: string): Promise<MachineDiskStatus | null> {
     const local = this.machineConnections.get(machineId);
@@ -7392,6 +8355,21 @@ export class AgentOrchestrator extends EventEmitter {
     }
   }
 
+  /** Latest memory report of a connected machine (owner memory, else the Redis mirror). */
+  async getMachineMemoryStatus(machineId: string): Promise<MachineMemoryStatus | null> {
+    const local = this.machineConnections.get(machineId);
+    if (local) return local.memoryStatus ?? null;
+    if (!this.replicaStateStore.isAvailable()) return null;
+    try {
+      const meta = await this.replicaStateStore.getMachineMeta(machineId);
+      const memory = { availableBytes: Number(meta?.memoryAvailableBytes), totalBytes: Number(meta?.memoryTotalBytes) };
+      return isValidMachineMemoryStatus(memory) ? memory : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Runtime binary/package versions reported by the current daemon ready frame. */
   async getMachineRuntimeVersions(machineId: string): Promise<Record<string, string>> {
     const local = this.machineConnections.get(machineId);
     if (local) return { ...(local.runtimeVersions ?? {}) };
@@ -7444,14 +8422,34 @@ export class AgentOrchestrator extends EventEmitter {
     machineId: string,
     targetVersion: string,
     requestId: string,
+    options: { drainMs?: number | null } = {},
   ): Promise<{ sent: boolean }> {
     const sent = await this.sendToMachine(machineId, {
       type: "computer:upgrade",
       operationId: requestId,
       requestId,
       targetVersion,
+      ...(options.drainMs ? { drain: { deadlineMs: options.drainMs } } : {}),
     });
     return { sent };
+  }
+
+  /**
+   * Reconciler step 13: how long a web upgrade of this Computer first waits
+   * for its agents to finish their work, or null when its daemon cannot
+   * drain (it does not advertise DAEMON_CAPABILITY_COMPUTER_UPGRADE_DRAIN_V1:
+   * the upgrade runs at once, as before). No flag (Tenny Q-E); the daemon
+   * clamps it again.
+   */
+  async computerUpgradeDrainMs(machineId: string): Promise<number | null> {
+    return (await this.machineAdvertisesCapability(machineId, DAEMON_CAPABILITY_COMPUTER_UPGRADE_DRAIN_V1))
+      ? COMPUTER_UPGRADE_DRAIN_MAX_DEADLINE_MS
+      : null;
+  }
+
+  /** Reconciler step 13: the latest drain report of a Computer connected to this replica. */
+  getComputerUpgradeDrain(machineId: string): ComputerUpgradeDrainProgress | null {
+    return this.machineConnections.get(machineId)?.upgradeDrain ?? null;
   }
   protected claimPendingComputerLifecycleDispatches(machineIds: string[]) {
     return computerLifecycleOperationService.claimPendingComputerLifecycleDispatches(machineIds);
@@ -7465,9 +8463,13 @@ export class AgentOrchestrator extends EventEmitter {
     return computerLifecycleOperationService.markComputerLifecycleCommandSent(operationId);
   }
 
-  protected async loadComputerBroadcastMachine(machineId: string): Promise<{ os: string | null } | null> {
+  protected async loadComputerBroadcastMachine(
+    machineId: string,
+  ): Promise<{ os: string | null; installKind: DaemonInstallKind | null } | null> {
     const machine = await machineService.getMachine(asMachineId(machineId));
-    return machine ? { os: machine.os } : null;
+    return machine
+      ? { os: machine.os, installKind: isDaemonInstallKind(machine.installKind) ? machine.installKind : null }
+      : null;
   }
 
   protected evaluateComputerBroadcastPolicy(
@@ -7499,6 +8501,8 @@ export class AgentOrchestrator extends EventEmitter {
               requestedTargetVersion: operation.targetVersion,
               now: new Date(this.clock.now()),
               serverId: operation.serverId,
+              serviceUnreachable: this.hasMachineCapability(operation.machineId, COMPUTER_CAPABILITY_SERVICE_IPC_UNREACHABLE),
+              installKind: machine?.installKind ?? null,
             });
             if (decision.reasonCode === "hands_unavailable") {
               // A temporary release-authority outage is not a withdrawn target.
@@ -7551,6 +8555,114 @@ export class AgentOrchestrator extends EventEmitter {
         },
         (outcome) => ({ status: outcome === "refused" ? "error" : "ok", attrs: { outcome } }),
       );
+    }
+  }
+
+  /**
+   * Agent work for this machine is held: it is below the Computer version
+   * floor and the deadline has passed (computerVersionFloorService). The owner
+   * replica reads its connection; another replica evaluates the mirrored
+   * version. Unknown machine state is not held (offline is handled apart).
+   */
+  async isMachineAgentWorkHeld(machineId: string): Promise<boolean> {
+    const local = this.machineConnections.get(machineId);
+    if (local) return local.versionGate?.enforced === true;
+    const nowMs = this.clock.now();
+    if (!this.computerVersionFloor.enforcementDue(nowMs)) return false;
+    const serverId = await this.serverIdOfMachine(machineId);
+    if (!serverId) return false;
+    const policy = await this.computerVersionFloor.policy(nowMs, serverId);
+    if (!policy?.enforcementEnabled) return false;
+    const fact = await this.getMachineComputerVersionFact(machineId);
+    if (!fact) return false;
+    return evaluateComputerVersionGate(fact.version, policy, nowMs)?.enforced === true;
+  }
+
+  /**
+   * Reconciler step 15 (B15): the machine's Computer access was revoked (its
+   * key, and any other way it could connect: findAccessRevokedMachineIds), so
+   * it can never come back under it. Its agents stay bound (Tenny Q-7) and
+   * get no starts or wakes until they are moved or the key is live again. A
+   * machine connected here is not revoked: a revoke drops its socket after
+   * commit (deviceSessionKeys.closeDeviceSessionKeys), and while it is still
+   * up it can run what it is sent. A failed read is not revoked (the start
+   * then goes on as before and finds the machine offline).
+   */
+  async isMachineAccessRevoked(machineId: string): Promise<boolean> {
+    if (this.machineConnections.has(machineId)) return false;
+    try {
+      return (await findAccessRevokedMachineIds(getDb(), [machineId])).has(machineId);
+    } catch (error) {
+      console.warn(`[Machine ${machineId}] Computer access check failed: ${error instanceof Error ? error.message : String(error)}`);
+      return false;
+    }
+  }
+
+  /** A machine's server never changes, so the lookup is cached. */
+  private readonly machineServerIds = new Map<string, string>();
+  private async serverIdOfMachine(machineId: string): Promise<string | null> {
+    const known = this.machineServerIds.get(machineId);
+    if (known) return known;
+    const machine = await machineService.getMachine(asMachineId(machineId)).catch(() => null);
+    if (!machine) return null;
+    this.machineServerIds.set(machineId, machine.serverId);
+    return machine.serverId;
+  }
+
+  /**
+   * Re-evaluate one connection's version gate (on `ready`, and every sweep so
+   * a deadline passing or the emergency stop flipping takes effect without a
+   * reconnect). Enforcing and lifting are trace events; a change is pushed to
+   * the web as `machine:capabilities.versionGate`.
+   */
+  private async refreshMachineVersionGate(machineId: string, conn: MachineConnection, cause: "ready" | "sweep"): Promise<void> {
+    let gate: ComputerVersionGate | null;
+    try {
+      gate = await this.computerVersionFloor.gate(conn.computerVersion, this.clock.now(), conn.serverId);
+    } catch (error) {
+      console.warn(`[Machine ${machineId}] version gate evaluation failed: ${error instanceof Error ? error.message : String(error)}`);
+      return;
+    }
+    const before = cause === "ready" ? undefined : conn.versionGate ?? null;
+    conn.versionGate = gate;
+    const changed = cause === "sweep" && JSON.stringify(before) !== JSON.stringify(gate);
+    if (changed) {
+      this.io?.to(`server:${conn.serverId}`).emit("machine:capabilities", { machineId, versionGate: gate });
+    }
+    const attrs = {
+      machine_id: machineId,
+      server_id: conn.serverId,
+      computer_version: conn.computerVersion ?? "",
+      cause,
+      held_agents: new Set([...this.pendingAgentDeliveryAcks.values()]
+        .filter((pending) => pending.machineId === machineId && pending.parkedReason === "computer_version_held")
+        .map((pending) => pending.msg.agentId)).size,
+    };
+    if (gate?.enforced && (cause === "ready" || before?.enforced !== true)) {
+      this.recordEvent("server.computer.version_gate.enforced", { ...attrs, reason: gate.reason, min_version: gate.minVersion });
+      return;
+    }
+    if (gate?.enforced) return;
+    if (cause === "sweep") {
+      if (before?.enforced) this.recordEvent("server.computer.version_gate.lifted", { ...attrs, lifted_by: "policy" });
+      return;
+    }
+    // On `ready`: lifted when the version this machine last reported would be
+    // held under the policy now in force (upgraded or reinstalled since).
+    const policy = await this.computerVersionFloor.policy(this.clock.now(), conn.serverId).catch(() => null);
+    if (!policy?.enforcementEnabled) return;
+    const previous = await machineService.getRecordedMachineComputerVersion(machineId).catch(() => undefined);
+    if (previous === undefined) return;
+    if (evaluateComputerVersionGate(previous, policy, this.clock.now())?.enforced) {
+      this.recordEvent("server.computer.version_gate.lifted", { ...attrs, lifted_by: "upgrade", previous_version: previous ?? "" });
+    }
+  }
+
+  private async sweepComputerVersionGates(): Promise<void> {
+    for (const [machineId, conn] of this.machineConnections) {
+      // Not evaluated until this connection's `ready` (versionGate undefined).
+      if (conn.versionGate === undefined) continue;
+      await this.refreshMachineVersionGate(machineId, conn, "sweep");
     }
   }
 
@@ -7660,7 +8772,26 @@ export class AgentOrchestrator extends EventEmitter {
     machineId: string,
     msg: Extract<ServerToMachineMessage, { type: "machine:migration_transport:lease" }>,
   ): Promise<void> {
-    await this.sendRequiredToMachine(machineId, msg, "Machine WebSocket not ready for migration transfer lease");
+    await this.sendRequiredToMachine(
+      machineId,
+      await this.withTargetIgnoreSourcesAcceptance(msg),
+      "Machine WebSocket not ready for migration transfer lease",
+    );
+  }
+
+  /**
+   * Every source lease send (start, re-provision, reconnect) passes here, so
+   * the flag follows what the target advertises now. A hosted target is not a
+   * machine and gets no flag: the source keeps the summary it always sent.
+   */
+  private async withTargetIgnoreSourcesAcceptance(
+    msg: Extract<ServerToMachineMessage, { type: "machine:migration_transport:lease" }>,
+  ): Promise<Extract<ServerToMachineMessage, { type: "machine:migration_transport:lease" }>> {
+    if (msg.role !== "source") return msg;
+    const target = await this.getMachineMigrationTransport(msg.targetMachineId);
+    return target?.capabilities?.includes(AGENT_MIGRATION_TARGET_IGNORE_SOURCES_CAPABILITY)
+      ? { ...msg, targetAcceptsIgnoreSources: true }
+      : msg;
   }
 
   protected getMachineResponseRelay() { return machineResponseRelay; }
@@ -7887,6 +9018,7 @@ export class AgentOrchestrator extends EventEmitter {
   protected async prepareStartLaunchGuard(agentId: string, machineId: string | null): Promise<string | undefined> {
     const launchId = await this.planStartLaunchId(machineId);
     this.armStartLaunchGuard(agentId, launchId);
+    await this.stampRuntimeErrorRecoveryLaunch(agentId, launchId);
     return launchId;
   }
 
@@ -8019,6 +9151,8 @@ export class AgentOrchestrator extends EventEmitter {
 
   /** Close all machine connections and timers (for graceful shutdown). */
   async shutdown(): Promise<void> {
+    this.stopReadyOwedWakePasses();
+    this.localInboxes.clearAll();
     if (this.spawnErrorRetryTimer) {
       this.clock.cancelRepeated(this.spawnErrorRetryTimer);
       this.spawnErrorRetryTimer = null;
@@ -8031,6 +9165,8 @@ export class AgentOrchestrator extends EventEmitter {
       clearTimeout(timer);
     }
     this.activityDebounceTimers.clear();
+    for (const timer of this.pauseRetryTimers.values()) this.clock.clearTimeout(timer);
+    this.pauseRetryTimers.clear();
     for (const pending of this.pendingMachineDisconnects.values()) {
       this.clock.clearTimeout(pending.timer);
     }
@@ -8124,7 +9260,9 @@ export class AgentOrchestrator extends EventEmitter {
         ),
       });
       this.emit(`machine:disconnect:${machineId}`, disconnectContext);
+      this.machineLastDisconnectAt.set(machineId, this.clock.now());
       await this.clearMachineConnection(machineId, false);
+      this.agentTyping.endForMachine(machineId);
       this.dispatchComputerLifecycleDisconnectObservation({
         machineId,
         serverId,
@@ -8140,6 +9278,11 @@ export class AgentOrchestrator extends EventEmitter {
         span.end("ok", { attrs: { outcome: "duplicate_closed_local_only", server_id: serverId } });
         return;
       }
+
+      // task #17: the Computer cancels its running logins when the connection
+      // drops (their link, code and result cannot cross it); end them here
+      // too, so the person sees it now rather than at the login's TTL.
+      void this.endRuntimeAuthLoginsForMachine(machineId, connectionEpochId ?? null);
 
       this.cancelPendingMachineDisconnect(machineId);
       const pending: PendingMachineDisconnectProjection = {
@@ -8387,7 +9530,7 @@ export class AgentOrchestrator extends EventEmitter {
             );
 
             // Clean up inbox
-            if (this.clearAgentInbox(agent.id)) {
+            if (this.localInboxes.clear(agent.id)) {
               pendingReceivesResolvedCount += 1;
             }
           }
@@ -8483,7 +9626,7 @@ export class AgentOrchestrator extends EventEmitter {
     const messageTypeDecision = this.planDaemonIngressRateLimitBucket({
       windows: this.daemonIngressRateLimitWindows,
       key: `${machineId}:${messageType}`,
-      limit: this.daemonIngressRateLimitMaxEvents,
+      limit: Math.min(this.daemonIngressRateLimitMaxEvents, DAEMON_INGRESS_TYPE_MAX_EVENTS[messageType] ?? Number.POSITIVE_INFINITY),
       scope: "message_type",
       messageType,
     });
@@ -8582,6 +9725,48 @@ export class AgentOrchestrator extends EventEmitter {
     });
   }
 
+  /**
+   * #wg-rbac:#27: the first `ready` of a connection said which runner
+   * credentials the daemon holds; revoke this Machine's others
+   * (revokeRunnerCredentialsNotHeld). Not awaited: it delays nothing in the
+   * ready, and a failure only leaves them for the next connection.
+   */
+  private startRunnerCredentialReconcile(machineId: string, serverId: string, heldIds: string[], readyAtMs: number): void {
+    const now = new Date(this.clock.now());
+    void (async () => {
+      if ((await evaluateFeatureFlag({ key: RUNNER_CREDENTIAL_RECONCILE_FEATURE_FLAG_KEY, serverId })).enabled !== true) {
+        // Switch off: count what it would revoke (writes nothing) and log it per Machine.
+        const counted = await countRunnerCredentialsNotHeld({
+          machineId,
+          heldIds,
+          issuedBefore: new Date(readyAtMs - RUNNER_CREDENTIAL_RECONCILE_GRACE_MS),
+          now,
+        });
+        this.recordEvent("server.machine.runner_credentials.reconciled", {
+          outcome: counted === null ? "refused_too_many" : "count_only",
+          machine_id: machineId,
+          held_count: heldIds.length,
+          would_revoke_count: counted?.wouldRevoke ?? 0,
+          would_revoke_used_24h_count: counted?.usedLast24h ?? 0,
+        });
+        return;
+      }
+      const revoked = await revokeRunnerCredentialsNotHeld({
+        machineId,
+        heldIds,
+        issuedBefore: new Date(readyAtMs - RUNNER_CREDENTIAL_RECONCILE_GRACE_MS),
+        now,
+      });
+      this.recordEvent("server.machine.runner_credentials.reconciled", {
+        outcome: revoked === null ? "refused_too_many" : "ok",
+        held_count: heldIds.length,
+        revoked_count: revoked ?? 0,
+      });
+    })().catch((error) => {
+      this.recordEvent("server.machine.runner_credentials.reconciled", { outcome: "error", error_class: errorClassOf(error) });
+    });
+  }
+
   async handleMachineMessage(machineId: string, msg: MachineToServerMessage, ws?: WebSocket) {
     const conn = this.machineConnections.get(machineId);
     // A replaced socket can still have a buffered message callback queued.
@@ -8643,6 +9828,7 @@ export class AgentOrchestrator extends EventEmitter {
           emit: (event, payload) => {
             this.io?.to(`server:${agent.serverId}`).emit(event, payload);
           },
+          io: this.io,
         }),
         "traceparent" in msg && typeof msg.traceparent === "string" ? parseTraceparent(msg.traceparent) : null,
       );
@@ -8729,6 +9915,95 @@ export class AgentOrchestrator extends EventEmitter {
         break;
       }
 
+      case "machine:runtime_account_usage:limit_reset:result":
+      {
+        // The usage read after the redeem goes into the private cache through
+        // the same boundary as any snapshot, and before the reply is forwarded,
+        // so the person's answer and the cache agree. The reply itself is
+        // forwarded without its snapshot when the boundary refuses it.
+        if (!conn) break;
+        const authorized = await this.isRuntimeAccountUsageDataBoundaryAuthorized(machineId, conn);
+        if (authorized && msg.snapshot !== undefined) {
+          // A failed cache write must not lose the person's answer: they
+          // need to know whether a reset was spent; the card re-reads usage.
+          await this.writeRuntimeAccountUsageSnapshot(machineId, msg.snapshot).catch((error: unknown) => {
+            addTraceEvent("runtime_account_usage.limit_reset.snapshot_write_failed", { machine_id: machineId, error_class: errorClassOf(error) });
+          });
+        }
+        const { snapshot: _snapshot, ...withoutSnapshot } = msg;
+        void this.getMachineResponseRelay().forward(machineId, authorized ? msg : withoutSnapshot,
+          (event, attrs) => this.recordMachineResponseRelay(event, attrs));
+        break;
+      }
+
+      // task #17: runtime login / logout (docs/contracts/runtime-auth.md).
+      case "machine:runtime_auth:status": {
+        // Same boundary as the usage cache: only a Computer with an attaching
+        // human may populate a status that names (masked) accounts.
+        if (!conn || !await this.isRuntimeAccountUsageDataBoundaryAuthorized(machineId, conn)) break;
+        const parsed = runtimeAuthStatusReportSchema.safeParse(msg.report);
+        if (!parsed.success) {
+          addTraceEvent("runtime_auth.status.rejected", { machine_id: machineId });
+          break;
+        }
+        await runtimeAuthService.recordStatus(machineId, parsed.data);
+        // Content-free: each viewer re-reads the machine through its own permission check.
+        this.io?.to(`server:${conn.serverId}`).emit("machine:runtime_auth:updated", { machineId });
+        break;
+      }
+      case "machine:runtime_auth:login:event":
+      case "machine:runtime_auth:login:result": {
+        if (!conn || !await this.isRuntimeAccountUsageDataBoundaryAuthorized(machineId, conn)) break;
+        await this.relayRuntimeAuthLogin(machineId, msg);
+        break;
+      }
+      // Reconciler step 15: a terminal sign-in on this Computer (its shared
+      // credential changed on disk and a fresh status query read it signed
+      // in). Only this machine's own connection, only a runtime this server
+      // knows; it lifts this machine's agents of that runtime on the shared
+      // sign-in, sign-in pauses only. A status report alone never lifts.
+      // #proj-raft-computer:#68: the facts only the daemon observes (its
+      // logins). Stored and shown; never enforced here (the daemon holds the
+      // agents), so a lost "recovered" report cannot block them.
+      case "machine:runtime_readiness": {
+        if (!conn) break;
+        await this.ingestRuntimeReadiness(machineId, conn.serverId, msg);
+        break;
+      }
+      case "machine:runtime_credentials:changed": {
+        if (!conn) break;
+        if (!isRuntimeAuthRuntime(msg.runtime)) {
+          addTraceEvent("runtime_credentials.changed.dropped", { machine_id: machineId, reason: "unknown_runtime" });
+          break;
+        }
+        // Every lift starts a fresh crash-loop episode: at most one disk lift
+        // per machine and runtime per window, so a credential file that keeps
+        // changing on an unusable account cannot cycle the breaker.
+        let claimed = false;
+        try {
+          claimed = (await this.replicaStateStore.claimDiskCredentialLift?.(machineId, msg.runtime)) ?? false;
+        } catch (err) {
+          addTraceEvent("runtime_credentials.changed.throttled", { machine_id: machineId, runtime: msg.runtime, reason: "claim_failed", error_class: errorClassOf(err) });
+          break;
+        }
+        if (!claimed) {
+          addTraceEvent("runtime_credentials.changed.throttled", { machine_id: machineId, runtime: msg.runtime, reason: "window" });
+          break;
+        }
+        await this.liftRuntimeCredentialBlocks(machineId, msg.runtime, "disk");
+        break;
+      }
+
+      case "machine:runtime_auth:logout:result":
+      case "machine:runtime_auth:providers:result":
+      case "machine:runtime_auth:connect_provider:result":
+      // Which Claude limit resets the account holds: no snapshot, nothing cached; relayed to the person who asked.
+      case "machine:runtime_account_usage:limit_resets:read:result":
+        if (!conn) break;
+        void this.getMachineResponseRelay().forward(machineId, msg,
+          (event, attrs) => this.recordMachineResponseRelay(event, attrs));
+        break;
+
       case "machine:host_identity":
       {
         // Same-machine grouping: stored only while the flag is on for this
@@ -8748,6 +10023,13 @@ export class AgentOrchestrator extends EventEmitter {
         if (!isValidMachineDiskStatus(disk)) break;
         const wasLow = isMachineDiskLow(conn.diskStatus);
         conn.diskStatus = disk;
+        // One row per report keeps a disk history per machine in ScopeDB.
+        this.recordEvent("server.machine.disk_sample", {
+          machine_id: machineId,
+          daemon_version: conn.daemonVersion ?? "unknown",
+          disk_available_bytes: disk.availableBytes,
+          disk_total_bytes: disk.totalBytes,
+        });
         this.replicaStateStore
           .setMachineMeta(machineId, {
             diskAvailableBytes: String(disk.availableBytes),
@@ -8765,6 +10047,50 @@ export class AgentOrchestrator extends EventEmitter {
         break;
       }
 
+      case "machine:memory_status":
+      {
+        // Read on demand (machine picker); no client push for a 5-minute report.
+        if (!conn) break;
+        const memory = { availableBytes: msg.availableBytes, totalBytes: msg.totalBytes };
+        if (!isValidMachineMemoryStatus(memory)) break;
+        conn.memoryStatus = memory;
+        // One row per report (every 5 minutes per Computer) keeps a memory
+        // history per machine in ScopeDB; the meta above holds only the latest.
+        this.recordEvent("server.machine.memory_sample", {
+          machine_id: machineId,
+          daemon_version: conn.daemonVersion ?? "unknown",
+          memory_available_bytes: memory.availableBytes,
+          memory_total_bytes: memory.totalBytes,
+        });
+        this.replicaStateStore
+          .setMachineMeta(machineId, {
+            memoryAvailableBytes: String(memory.availableBytes),
+            memoryTotalBytes: String(memory.totalBytes),
+          })
+          .catch(() => {});
+        break;
+      }
+
+
+      case "machine:installer_repair_hint":
+      {
+        if (!conn) break;
+        const hint = parseComputerInstallerRepairHint(msg.hint);
+        const changed = JSON.stringify(hint) !== JSON.stringify(conn.installerRepairHint ?? null);
+        conn.installerRepairHint = hint;
+        this.replicaStateStore
+          .setMachineMeta(machineId, { installerRepairHint: installerRepairHintMeta(hint) })
+          .catch(() => {});
+        // The machine list carries the hint.
+        if (changed) {
+          this.io?.to(`server:${conn.serverId}`).emit("machine:updated", {
+            serverId: conn.serverId,
+            machineId,
+          });
+        }
+        break;
+      }
+
       case "machine:runtime_models:catalog":
       {
         // Proactive model-list report (task #700). The catalog is display
@@ -8772,7 +10098,7 @@ export class AgentOrchestrator extends EventEmitter {
         // usage boundary; it is still validated strictly at the boundary and
         // a malformed report keeps the previous copy.
         if (conn) {
-          await machineRuntimeModelCatalogService.writeRuntime(machineId, msg.runtime, msg.models);
+          await applyRuntimeModelCatalogReport(machineRuntimeModelCatalogService, machineId, msg);
         }
         break;
       }
@@ -8813,10 +10139,48 @@ export class AgentOrchestrator extends EventEmitter {
         break;
       }
 
+      case "computer:upgrade:draining": {
+        // Reconciler step 13: the Computer waits for its agents before its
+        // installer runs. Kept on the connection and pushed to the web; the
+        // request row (and its stretched deadline) is unchanged.
+        if (!conn || typeof msg.requestId !== "string") break;
+        const progress: ComputerUpgradeDrainProgress = {
+          requestId: msg.requestId,
+          deadlineAt: typeof msg.deadlineAt === "string" ? msg.deadlineAt : "",
+          live: Number.isSafeInteger(msg.live) ? msg.live : 0,
+          notQuietAgentIds: Array.isArray(msg.notQuietAgentIds)
+            ? msg.notQuietAgentIds.filter((id): id is string => typeof id === "string").slice(0, COMPUTER_UPGRADE_DRAIN_MAX_LISTED_AGENTS)
+            : [],
+          ...(msg.finished === "quiet" || msg.finished === "deadline" || msg.finished === "ended" ? { finished: msg.finished } : {}),
+        };
+        const first = conn.upgradeDrain?.requestId !== progress.requestId;
+        conn.upgradeDrain = progress;
+        if (first || progress.finished) {
+          this.recordEvent("server.computer.upgrade_request.draining", {
+            request_id: progress.requestId,
+            machine_id: machineId,
+            live: progress.live,
+            not_quiet: progress.notQuietAgentIds.length,
+            finished: progress.finished ?? "",
+          });
+        }
+        try {
+          const open = await computerUpgradeRequestService.getOpenComputerUpgradeRequest(machineId);
+          if (open && open.id === progress.requestId) {
+            this.io?.to(`server:${conn.serverId}`).emit("machine:upgrade-request", { machineId, upgradeRequest: computerUpgradeRequestService.projectComputerUpgradeRequest(open, progress) });
+          }
+        } catch (error) {
+          console.warn(`[Orchestrator] upgrade drain progress for ${machineId} not pushed: ${error instanceof Error ? error.message : String(error)}`);
+        }
+        break;
+      }
+
       case "computer:upgrade:done": {
-        // Remote upgrade v2: the request never reached the installer, so no
-        // reconnect will carry a receipt for it. A refusal settles the request
-        // by id now (scoped to this machine) instead of at the deadline.
+        // Remote upgrade v2: the request never reached the installer, the
+        // installer gave up without stopping the service, or it restored the
+        // old service before writing its receipt; no reconnect will carry a
+        // receipt for it. A failure settles the request by id now (scoped to
+        // this machine) instead of at the deadline.
         // `ok: true` means the installer started; the reconnect settles it.
         if (msg.ok) break;
         try {
@@ -8824,19 +10188,43 @@ export class AgentOrchestrator extends EventEmitter {
             machineId,
             requestId: msg.requestId,
             reason: msg.reason ?? msg.code ?? "computer_refused",
+            code: msg.code ?? null,
+            observedVersion: conn?.computerVersion ?? null,
             now: new Date(this.clock.now()),
           });
-          this.recordEvent("server.computer.upgrade_request.refused", {
-            // No open request: the id is not a web upgrade request (e.g. a
-            // lifecycle-operation upgrade), so keep the Computer's own reason.
-            ...(settled
-              ? computerUpgradeRequestService.computerUpgradeRequestTraceAttrs(settled)
-              : { reason: computerUpgradeRequestService.traceSafeUpgradeReason(msg.reason) }),
-            request_id: msg.requestId,
-            machine_id: machineId,
-            code: msg.code ?? "",
-            outcome: settled ? "settled" : "no_open_request",
-          });
+          if (settled && settled.outcome === null) {
+            // An `unresolved` installer receipt: recorded on the still-open
+            // request, which a later installer worker may yet finish; the
+            // deadline sweep settles it failed if not. The web keeps the
+            // request in progress, so nothing is pushed.
+            this.recordEvent("server.computer.upgrade_request.unresolved_recorded", {
+              ...computerUpgradeRequestService.computerUpgradeRequestTraceAttrs(settled),
+              code: msg.code ?? "",
+              via: "upgrade_done",
+            });
+            break;
+          }
+          if (settled) {
+            this.recordEvent("server.computer.upgrade_request.refused", {
+              ...computerUpgradeRequestService.computerUpgradeRequestTraceAttrs(settled),
+              request_id: msg.requestId,
+              machine_id: machineId,
+              code: msg.code ?? "",
+              outcome: "settled",
+            });
+          } else {
+            // No open request: already settled (a second report of the same
+            // outcome), expired, or not a web upgrade request at all (a
+            // lifecycle-operation upgrade, an old Computer replaying a stale
+            // refusal). Counted on its own so it does not bury real refusals.
+            this.recordEvent("server.computer.upgrade_request.done_unmatched", {
+              request_id: msg.requestId,
+              machine_id: machineId,
+              code: msg.code ?? "",
+              // For a lifecycle-operation upgrade this is the only clue.
+              reason: computerUpgradeRequestService.traceSafeUpgradeReason(msg.reason),
+            });
+          }
           if (settled && conn) {
             this.io?.to(`server:${conn.serverId}`).emit("machine:upgrade-request", { machineId, upgradeRequest: computerUpgradeRequestService.projectComputerUpgradeRequest(settled) });
           }
@@ -8882,7 +10270,7 @@ export class AgentOrchestrator extends EventEmitter {
               },
             },
             async () => {
-              this.io?.to(`server:${relayConn.serverId}`).emit(msg.type, { machineId, ...msg });
+              this.io?.to(`server:${relayConn.serverId}`).emit(msg.type, computerRestartDoneWebFrame(machineId, msg));
               if (!msg.ok) {
                 const reason = msg.error === "control_busy" || msg.error === "self_relaunch_unavailable"
                   ? msg.error
@@ -8921,6 +10309,11 @@ export class AgentOrchestrator extends EventEmitter {
           conn.capabilities = new Set((msg.capabilities ?? []).filter((capability) => typeof capability === "string" && capability.trim()));
         }
         const readyCapturedAtMs = ingressAtMs;
+        // #wg-rbac:#27: decided before the first await, so of two readies
+        // handled concurrently only the connection's first reconciles.
+        const firstReady = conn ? !conn.runnerCredentialReconcileSeen : false;
+        if (conn) conn.runnerCredentialReconcileSeen = true;
+        const heldRunnerCredentialIds = firstReady ? readyRunnerCredentialIds(msg) : null;
         // task #1268: a `pending` ready carries no inventory and must not touch
         // `machines.runtimes`; an `incomplete` ready keeps the unprobed runtimes'
         // previous state. Both are status, fanned out as `runtimeDetection`.
@@ -8989,12 +10382,24 @@ export class AgentOrchestrator extends EventEmitter {
             hostname_present: Boolean(msg.hostname),
             os_present: Boolean(msg.os),
             ...(conn?.osVariant ? { os_variant: conn.osVariant } : {}),
+            ...(isDaemonInstallKind(msg.installKind) ? { install_kind: msg.installKind } : {}),
+            // The first ready to this server after Raft Desktop moved the
+            // Computer from its embedded one (COMPUTER_MIGRATED_FROM): how the
+            // data team counts migrated machines that came back. A value
+            // outside the list is never recorded, only flagged.
+            ...(isComputerMigratedFrom(msg.migratedFrom) ? { migrated_from: msg.migratedFrom } : {}),
+            ...(msg.migratedFrom !== undefined && !isComputerMigratedFrom(msg.migratedFrom) ? { migrated_from_invalid: true } : {}),
             ...projectMachineConnectTraceAttrs(conn?.traceContext ?? buildRuntimeTraceContext()),
           },
         });
         const actionCounts: Record<string, number> = {};
         let invalid_status_count = 0;
         let requestStartCount = 0;
+        // Managed agents assigned to this machine: their pending app events are
+        // re-delivered once the reconcile below is done.
+        let readyManagedAgentIds: string[] = [];
+        // F9: the agents left wakeable and not running with no buffered wake (startReadyOwedWakePass).
+        const readyOwedWakeCandidates: string[] = [];
         let foreignRunningCount = 0;
         let foreignRunningStoppedCount = 0;
         await this.runInActiveSpan(span, async () => {
@@ -9016,6 +10421,7 @@ export class AgentOrchestrator extends EventEmitter {
               conn.runtimeOutcomeUnreliableAgents = new Set((msg.runtimeOutcomeUnreliableAgents ?? []).filter((id) => typeof id === "string" && id.length > 0));
               conn.computerVersion = msg.computerVersion ?? null;
               conn.migrationTransport = migrationTransport;
+              conn.installerRepairHint = parseComputerInstallerRepairHint(msg.installerRepairHint);
               void this.dispatchPendingComputerLifecycleOperations().catch(() => {});
               // Only this Computer: a sweep of every Computer on the replica per
               // `ready` multiplied in reconnect waves (prod 10-16 20:54Z, one ECS
@@ -9040,16 +10446,32 @@ export class AgentOrchestrator extends EventEmitter {
                   runtimeVersions: JSON.stringify(runtimeVersions),
                   hostname: msg.hostname ?? null,
                   os: msg.os ?? null,
+                  installerRepairHint: installerRepairHintMeta(parseComputerInstallerRepairHint(msg.installerRepairHint)),
                   ...machineMetaFromMigrationTransport(migrationTransport),
                   ...(conn ? this.probeCarrierMetaFields(conn, runtimeVersions) : {}),
                 })
                 .catch(() => {});
             }
+            // Before the version is persisted: a lift compares against the last recorded one.
+            if (conn) await this.refreshMachineVersionGate(machineId, conn, "ready");
             await this.recordReportedMachineComputerVersion(
               machineId,
               msg.computerVersion,
               "ready",
             );
+            // #proj-raft-computer task #38: the daemon found this machine's current
+            // key where an agent could read it. Kept only while it is the stored key.
+            const exposure = msg.legacyCredentialExposure;
+            if (exposure && typeof exposure.foundAt === "string" && typeof exposure.keyFingerprint === "string"
+              && /^[0-9a-f]{16}$/.test(exposure.keyFingerprint) && !Number.isNaN(Date.parse(exposure.foundAt))) {
+              try {
+                const foundAt = new Date(Math.min(Date.parse(exposure.foundAt), this.clock.now()));
+                const stored = await machineService.recordCredentialExposure(machineId, { foundAt, keyFingerprint: exposure.keyFingerprint });
+                this.recordEvent("server.machine.credential_exposure.reported", { outcome: stored ? "stored" : "not_current_key" });
+              } catch (error) {
+                console.warn(`[Orchestrator] credential exposure not stored for ${machineId}: ${error instanceof Error ? error.message : String(error)}`);
+              }
+            }
             // Remote upgrade v2: the reported version settles any open request.
             try {
               const settled = await computerUpgradeRequestService.observeComputerVersionForUpgradeRequests({
@@ -9058,8 +10480,20 @@ export class AgentOrchestrator extends EventEmitter {
                 receipt: msg.lastUpgradeReceipt ?? null,
                 now: new Date(this.clock.now()),
               });
-              if (settled) {
-                this.recordEvent("server.computer.upgrade_request.settled", computerUpgradeRequestService.computerUpgradeRequestTraceAttrs(settled));
+              if (settled && settled.outcome === null) {
+                // An `unresolved` receipt, recorded on the still-open request
+                // (see computer:upgrade:done); nothing settles yet.
+                this.recordEvent("server.computer.upgrade_request.unresolved_recorded", {
+                  ...computerUpgradeRequestService.computerUpgradeRequestTraceAttrs(settled),
+                  via: "ready",
+                });
+              } else if (settled) {
+                // A late success replaces the outcome the deadline gave it
+                // (`replaces_outcome`): count it once, not as both.
+                this.recordEvent("server.computer.upgrade_request.settled", {
+                  ...computerUpgradeRequestService.computerUpgradeRequestTraceAttrs(settled),
+                  ...("replacedOutcome" in settled ? { replaces_outcome: settled.replacedOutcome } : {}),
+                });
                 if (conn) this.io?.to(`server:${conn.serverId}`).emit("machine:upgrade-request", { machineId, upgradeRequest: computerUpgradeRequestService.projectComputerUpgradeRequest(settled) });
               }
             } catch (error) {
@@ -9096,6 +10530,7 @@ export class AgentOrchestrator extends EventEmitter {
                   os: msg.os,
                   daemonVersion: msg.daemonVersion,
                   computerVersion: msg.computerVersion ?? null,
+                  versionGate: conn.versionGate ?? null,
                 });
               }
               this.recordEvent("machine.capabilities.detection_pending", {
@@ -9114,7 +10549,15 @@ export class AgentOrchestrator extends EventEmitter {
                 ...(runtimeDetection ? { runtimeDetection } : {}),
                 hostname: msg.hostname,
                 os: msg.os,
-                deviceClass: isDeviceClass(msg.deviceClass) ? msg.deviceClass : null,
+                host: {
+                  deviceClass: isDeviceClass(msg.deviceClass) ? msg.deviceClass : null,
+                  hostProvider: isHostProvider(msg.hostProvider) ? msg.hostProvider : null,
+                  osRelease: normalizeOsRelease(msg.osRelease),
+                  osId: normalizeOsId(msg.osId),
+                  osIdLike: normalizeOsIdLike(msg.osIdLike),
+                  installKind: isDaemonInstallKind(msg.installKind) ? msg.installKind : null,
+                  nodeOnPath: typeof msg.nodeOnPath === "boolean" ? msg.nodeOnPath : null,
+                },
                 daemonVersion: msg.daemonVersion,
                 computerVersion: msg.computerVersion,
               });
@@ -9129,6 +10572,7 @@ export class AgentOrchestrator extends EventEmitter {
             try {
               const runningSet = new Set(msg.runningAgents);
               const machineAgents = await this.loadAgentsForReadyReconcile(machineId);
+              readyManagedAgentIds = machineAgents.filter((agent) => !isExternalAgentRuntime(agent.runtime)).map((agent) => agent.id);
               this.recordEvent("machine.ready.agents.loaded", {
                 outcome: "loaded",
                 agents_count: machineAgents.length,
@@ -9139,6 +10583,7 @@ export class AgentOrchestrator extends EventEmitter {
                 // processes of an earlier daemon instance can no longer be seen
                 // to exit on this connection unless that instance's queue replays.
                 if (readyDaemonInstanceId) await this.observeTerminalDaemonReady(agent.id, readyDaemonInstanceId);
+                await this.rearmPauseRetry(agent.id);
                 const running = runningSet.has(agent.id);
                 const narrowedStatus = narrowReadyReconcileStatus(agent.status);
                 if (!narrowedStatus) {
@@ -9179,10 +10624,15 @@ export class AgentOrchestrator extends EventEmitter {
                 }
                 actionCounts[action] = (actionCounts[action] ?? 0) + 1;
                 await this.applyReadyReconcileAction(machineId, agent, action);
-                if (action === "mark-wakeable-not-running" && await this.maybeWakePendingInboxAfterReady(machineId, agent)) {
-                  requestStartCount += 1;
+                if (action === "mark-wakeable-not-running") {
+                  if (await this.maybeWakePendingInboxAfterReady(machineId, agent)) {
+                    requestStartCount += 1;
+                  } else if (!isExternalAgentRuntime(agent.runtime)) {
+                    readyOwedWakeCandidates.push(agent.id);
+                  }
                 }
               }
+              if (conn) await this.resendLostAgentConfigs(conn, machineAgents, runningSet, readyAgentConfigRevisions(msg.runningAgentConfigRevisions));
               ({ foreign: foreignRunningCount, stopped: foreignRunningStoppedCount } = await this.reconcileForeignRunningAgents(
                 machineId,
                 msg.runningAgents.filter((agentId) => !machineAgents.some((agent) => agent.id === agentId)),
@@ -9245,6 +10695,14 @@ export class AgentOrchestrator extends EventEmitter {
             }
             this.retryPendingAgentDeliveriesForMachine(machineId, "ready_reconcile");
             this.retryPendingAgentStartsForMachine(machineId, "ready_reconcile");
+            // App events have no durable chain row, so the resume catch-up
+            // never carries one whose push was lost during a real outage:
+            // send them again (this replica holds the socket). Not awaited,
+            // so it delays neither the retries above nor this span.
+            this.startThirdPartyEventReconnectPass(machineId, readyManagedAgentIds, conn);
+            // F9: wake the agents whose wake the restart lost. Not awaited.
+            this.startReadyOwedWakePass(machineId, readyOwedWakeCandidates, conn);
+            if (heldRunnerCredentialIds && conn) this.startRunnerCredentialReconcile(machineId, conn.serverId, heldRunnerCredentialIds, readyCapturedAtMs);
             span.end("ok", {
               attrs: {
                 outcome: "processed",
@@ -9396,6 +10854,12 @@ export class AgentOrchestrator extends EventEmitter {
                 span,
               );
               liveActivityAttrs = liveActivityRootTraceAttrs(result.liveActivityResult);
+              if (result.dbStatusMachineFenced) {
+                // The agent lives on another Computer now: this process's exit
+                // or start is not the agent's (no crash-loop or start progress).
+                finish("dropped", { reason: "machine_fenced", action, next_status: nextStatus, ...liveActivityAttrs });
+                return;
+              }
               if (action === "persist-active" || action === "persist-inactive" || action === "persist-stopped") {
                 this.recordEvent("agent.status.persisted", {
                   outcome: "persisted",
@@ -9424,9 +10888,15 @@ export class AgentOrchestrator extends EventEmitter {
             // refuses frames without exit evidence or whose launchId does not
             // match the current start. `stopped` is operator intent and never
             // counts.
-            if (normalizedStatus === "active" && typeof msg.launchId === "string") {
-              await this.wakeCrashLoopBreaker.confirmCatchupDelivered(msg.agentId, msg.launchId);
-              await this.wakeCrashLoopBreaker.recordStartSucceeded(msg.agentId, msg.launchId);
+            // A daemon with DAEMON_CAPABILITY_STARTUP_READINESS reports `active`
+            // when the process exists; only its `agent:runtime:ready` (the
+            // runtime's first output) is progress. Older daemons: `active` is.
+            if (
+              normalizedStatus === "active"
+              && typeof msg.launchId === "string"
+              && !conn?.capabilities.has(DAEMON_CAPABILITY_STARTUP_READINESS)
+            ) {
+              await this.observeStartProgress(msg.agentId, msg.launchId);
             }
             if (normalizedStatus === "inactive") {
               const exit = (msg as { exit?: { code: number | null; signal: string | null } }).exit;
@@ -9456,6 +10926,12 @@ export class AgentOrchestrator extends EventEmitter {
       }
 
       case "agent:activity": {
+        // #wg-rbac:#57: the one point where a runtime error's text enters the
+        // server. Scrub and cap it here, so the activity snapshot, the stored
+        // last_runtime_error and every push carry only the bounded text.
+        if (isDaemonRuntimeErrorActivityFrame(msg) && typeof msg.detail === "string") {
+          msg.detail = boundedRuntimeErrorDetail(msg.detail);
+        }
         const joinTraceAttrs = daemonActivityJoinTraceAttrs(msg);
         const span = this.tracer.startSpan("server.agent.activity.ingest", {
           parent: getCurrentTraceContext(),
@@ -9788,18 +11264,63 @@ export class AgentOrchestrator extends EventEmitter {
                 ),
               );
             }
-            const currentRuntimeError = this.agentStateCache.get(msg.agentId)?.lastRuntimeError ?? agent.lastRuntimeError ?? null;
+            let currentRuntimeError = this.agentStateCache.get(msg.agentId)?.lastRuntimeError ?? agent.lastRuntimeError ?? null;
             // #688(b): a crash is durable typed authority only when it rides a valid
             // typed RuntimeErrorActivityDiagnostic carrier (normalized server-side).
             const normalizedTypedRuntimeError = normalizeRuntimeErrorActivityDiagnostic(
               (msg as { runtimeError?: RuntimeErrorActivityDiagnostic | Record<string, unknown> | null } | null)?.runtimeError ?? null,
             );
-            const runtimeErrorAction = reduceRuntimeErrorActivityAction({
+            let runtimeErrorAction = reduceRuntimeErrorActivityAction({
               signal: activitySignal,
               currentErrorPresent: currentRuntimeError !== null,
+              currentErrorClearsOnlyOnModelOutput: runtimeErrorClearsOnlyOnModelOutput(currentRuntimeError),
               isHeartbeat: msg.isHeartbeat,
               typedRuntimeCarrierPresent: normalizedTypedRuntimeError !== null,
             });
+            // task #1351: every model-output frame that got past the dedupe,
+            // launch guard and heartbeat checks above asks the database, in this
+            // frame and whatever this replica's cache shows, whether it proves a
+            // stored BillingError recovered (one proof-and-clear statement; no
+            // write when nothing matches). Nothing else clears a BillingError.
+            let billingRecoveryUnproven = false;
+            if (isModelOutputRecoveryFrame({ signal: activitySignal, isHeartbeat: msg.isHeartbeat, entries: msg.entries })) {
+              const cachedBefore = this.agentStateCache.get(msg.agentId);
+              // Best effort, like the recovery stamp: a failed proof keeps the
+              // error (shown longer) and never fails this frame's ingest.
+              const removed = await this.clearPersistedBillingErrorOnRecovery(msg.agentId, {
+                launchId: msg.launchId ?? null,
+                daemonInstanceId: msg.daemonInstanceId ?? null,
+                clientSeq: Number.isSafeInteger(msg.clientSeq) ? msg.clientSeq as number : null,
+              }).catch((err: unknown) => {
+                console.warn(`[Orchestrator] Billing recovery proof failed for agent ${msg.agentId}:`, err);
+                this.recordEvent("runtime_error_state.preserved", { reason: "billing_proof_failed", error_class: errorClassOf(err) });
+                return null;
+              });
+              if (removed) {
+                await this.applyRuntimeErrorCleared(msg.agentId, cachedBefore);
+                await this.forgetRuntimeActionRequiredNotice(msg.agentId);
+                this.recordEvent("runtime_error_state.cleared", {
+                  // Trace label only, read off the removed row; the SQL decided.
+                  reason: typeof msg.launchId === "string" && removed.recoveryLaunchId === msg.launchId && removed.launchId !== msg.launchId
+                    ? "billing_recovery_launch"
+                    : "billing_same_launch_seq",
+                  detail_kind: detailKind,
+                });
+                currentRuntimeError = null;
+                runtimeErrorAction = "preserve";
+              } else if (currentRuntimeError?.errorClass === "BillingError") {
+                // Unproven. The row may hold a generic error this cache missed
+                // (clear it, as this frame would), else the cache learns the row.
+                if (await this.clearLastRuntimeError(msg.agentId)) {
+                  this.recordEvent("runtime_error_state.cleared", { reason: "strong_typed_runtime_progress", detail_kind: detailKind });
+                  currentRuntimeError = null;
+                } else {
+                  currentRuntimeError = this.agentStateCache.get(msg.agentId)?.lastRuntimeError ?? null;
+                  billingRecoveryUnproven = currentRuntimeError?.errorClass === "BillingError";
+                }
+                runtimeErrorAction = "preserve";
+              }
+            }
             // task #1116: capture the typed delivery-consumption carrier so the
             // snapshot write below can attach it. Observation only — no action.
             if (detailKind === "delivery_unconsumed") {
@@ -9847,6 +11368,7 @@ export class AgentOrchestrator extends EventEmitter {
                   ? await this.observeStartFailure(msg.agentId, typeof msg.launchId === "string" ? msg.launchId : null, spawnFailure, {
                     runtime: agent.runtime,
                     machineId,
+                    model: spawnFailure.model ?? agent.model ?? null,
                   })
                   : null,
               );
@@ -9856,7 +11378,9 @@ export class AgentOrchestrator extends EventEmitter {
               && (activity === "online" || activity === "working" || activity === "thinking");
             if (shouldPreserveVisibleRuntimeError) {
               this.recordEvent("runtime_error_state.preserved", {
-                reason: activitySignal.source === "legacy_detail_kind_missing"
+                reason: billingRecoveryUnproven
+                  ? "billing_recovery_unproven"
+                  : activitySignal.source === "legacy_detail_kind_missing"
                   ? "weak_legacy_signal"
                   : msg.isHeartbeat !== false
                     ? "heartbeat_or_unclassified_frame"
@@ -9882,6 +11406,18 @@ export class AgentOrchestrator extends EventEmitter {
               });
               return;
             }
+            // task #25: this frame's stuck-tool state, taken by its snapshot
+            // write only. A frame without it clears the state.
+            const toolStuck = normalizeToolStuckActivityDiagnostic(
+              (msg as { toolStuck?: ToolStuckActivityDiagnostic | Record<string, unknown> | null }).toolStuck ?? null,
+            );
+            if (toolStuck) this.pendingToolStuck.set(msg.agentId, toolStuck);
+            else this.pendingToolStuck.delete(msg.agentId);
+            // Reconciler step 4b: likewise this frame's credential-hold reason
+            // (an older daemon never sends one: the plain idle status).
+            this.pendingCredentialHold.set(msg.agentId, normalizeCredentialHoldActivityDiagnostic(
+              (msg as { credentialHold?: CredentialHoldActivityDiagnostic | Record<string, unknown> | null }).credentialHold ?? null,
+            ));
             const result = await applyAgentLifecycleProjectionPlan(
               reduceDaemonActivityLifecycle({
                 action,
@@ -9909,12 +11445,17 @@ export class AgentOrchestrator extends EventEmitter {
               }),
               this.lifecycleProjectionWriterDeps(),
               span,
-            );
+            ).finally(() => {
+              this.pendingToolStuck.delete(msg.agentId);
+              this.pendingCredentialHold.delete(msg.agentId);
+            });
             if (runtimeErrorAction === "set") {
               const persisted = await this.rememberRuntimeError(msg.agentId, this.buildRuntimeErrorState({
                 detail: msg.detail,
                 launchId: msg.launchId,
                 typed: normalizedTypedRuntimeError,
+                daemonInstanceId: msg.daemonInstanceId,
+                clientSeq: typeof msg.clientSeq === "number" ? msg.clientSeq : undefined,
               }));
               this.recordEvent("runtime_error_state.persisted", {
                 action_required: true,
@@ -9922,7 +11463,10 @@ export class AgentOrchestrator extends EventEmitter {
                 detail_kind: detailKind,
               });
               const requiredAction = runtimeErrorRequiredAction(normalizedTypedRuntimeError);
-              if (persisted && requiredAction && normalizedTypedRuntimeError) {
+              // #proj-raft-computer:#68: a login fact the daemon enforces and
+              // reports (`machine:runtime_readiness`): shown, but no wake
+              // pause and no per-agent notice here (one per login instead).
+              if (persisted && requiredAction && normalizedTypedRuntimeError && !normalizedTypedRuntimeError.readinessCode) {
                 await this.observeRuntimeActionRequired(msg.agentId, {
                   launchId: typeof msg.launchId === "string" ? msg.launchId : null,
                   requiredAction,
@@ -9930,12 +11474,15 @@ export class AgentOrchestrator extends EventEmitter {
                 });
               }
             } else if (runtimeErrorAction === "clear") {
-              await this.clearLastRuntimeError(msg.agentId);
-              await this.forgetRuntimeActionRequiredNotice(msg.agentId);
-              this.recordEvent("runtime_error_state.cleared", {
-                reason: "strong_typed_runtime_progress",
-                detail_kind: detailKind,
-              });
+              if (await this.clearLastRuntimeError(msg.agentId)) {
+                await this.forgetRuntimeActionRequiredNotice(msg.agentId);
+                this.recordEvent("runtime_error_state.cleared", {
+                  reason: "strong_typed_runtime_progress",
+                  detail_kind: detailKind,
+                });
+              } else if (this.agentStateCache.get(msg.agentId)?.lastRuntimeError?.errorClass === "BillingError") {
+                this.recordEvent("runtime_error_state.preserved", { reason: "billing_in_store", detail_kind: detailKind });
+              }
             }
             if (result.liveActivityResult) {
               this.recordEvent("status.read_model.updated", {
@@ -10000,6 +11547,8 @@ export class AgentOrchestrator extends EventEmitter {
         if (!this.shouldAcceptLifecycleEvent(machineId, agent, msg.type, msg.launchId)) {
           break;
         }
+        // Read before the projection below updates the cached agent in place.
+        const previousSessionId = agent.sessionId;
         this.acknowledgePendingAgentStartFromLifecycle(
           msg.agentId,
           msg.launchId,
@@ -10040,12 +11589,30 @@ export class AgentOrchestrator extends EventEmitter {
             }),
             this.lifecycleProjectionWriterDeps(),
           );
+          // task #1357 item 1: which stored limits report applies follows the
+          // session; clients re-read (the status is derived from the database).
+          if (result.dbStatusMachineFenced) break;
+          if (previousSessionId !== msg.sessionId) void this.notifyModelLimitsChanged({ agentIds: [msg.agentId] });
           if (action === "persist-active-session") {
             if (result.dbStatusApplied === false) {
               this.agentStateCache.delete(msg.agentId);
             } else {
-              await this.clearLastRuntimeError(msg.agentId);
-              this.broadcastAgentSession(agent.serverId, msg.agentId, msg.sessionId);
+              // A session report is not model output: a provider-limit or
+              // billing error stays until the provider serves a request
+              // (runtimeErrorClearsOnlyOnModelOutput).
+              const currentRuntimeError = this.agentStateCache.get(msg.agentId)?.lastRuntimeError ?? agent.lastRuntimeError ?? null;
+              if (runtimeErrorClearsOnlyOnModelOutput(currentRuntimeError)) {
+                this.recordEvent("runtime_error_state.preserved", {
+                  reason: currentRuntimeError?.errorClass === "BillingError"
+                    ? "billing_session_signal"
+                    : "provider_limit_session_signal",
+                  detail_kind: "session",
+                });
+              } else {
+                // Never a BillingError, even when this replica's cache is stale.
+                await this.clearLastRuntimeError(msg.agentId);
+              }
+              this.broadcastAgentSession(agent, msg.sessionId);
               if (msg.launchId) {
                 await this.recoverDurableMentionDeliveriesForAgent(msg.agentId, {
                   machineId,
@@ -10072,8 +11639,54 @@ export class AgentOrchestrator extends EventEmitter {
         const invalidated = await this.invalidatePersistedAgentSessionFromSignal(msg.agentId, msg.sessionId, machineId);
         if (invalidated) {
           this.updateCache(msg.agentId, { sessionId: null });
-          this.broadcastAgentSession(agent.serverId, msg.agentId, null);
+          this.broadcastAgentSession(agent, null);
         }
+        break;
+      }
+
+      case "agent:context_view_availability": {
+        // View Context: keep the latest report per agent with the Computer
+        // that sent it; the status route ignores one from another Computer.
+        const report = readAgentContextViewAvailability(msg);
+        if (!report) {
+          console.debug(`[Machine ${machineId}] Dropping malformed ${AGENT_CONTEXT_VIEW_AVAILABILITY_TYPE}`);
+          break;
+        }
+        const span = this.tracer.startSpan("server.agent_context_view.availability.ingest", {
+          surface: "server",
+          kind: "consumer",
+          attrs: {
+            event_kind: "agent_context_view_availability",
+            agent_id: report.agentId,
+            machine_id: machineId,
+            server_id: conn?.serverId,
+            runtime: report.runtime,
+            supported: report.supported,
+          },
+        });
+        await runWithTraceSpan(span, async () => {
+          const agent = await this.validateMachineAgentMessage(machineId, conn?.serverId ?? null, report.agentId, msg.type);
+          if (!agent) {
+            span.end("ok", { attrs: { outcome: "invalid-agent", reason: "invalid_agent" } });
+            return;
+          }
+          if (!this.hasMachineCapability(machineId, DAEMON_CAPABILITY_AGENT_CONTEXT_VIEW_V0)) {
+            span.end("ok", { attrs: { outcome: "not-advertised", reason: "capability_missing" } });
+            return;
+          }
+          const { type: _type, ...stored } = report;
+          try {
+            await this.replicaStateStore.setAgentContextViewAvailability(report.agentId, {
+              machineId,
+              report: stored,
+              receivedAt: new Date(this.clock.now()).toISOString(),
+            });
+            span.end("ok", { attrs: { outcome: "recorded", reason: "report_recorded" } });
+          } catch (err) {
+            console.warn(`[Machine ${machineId}] Failed to store context view availability for ${report.agentId}:`, err);
+            span.end("error", { attrs: { outcome: "record-failed", reason: "record_failed", error_class: errorClassOf(err) } });
+          }
+        });
         break;
       }
 
@@ -10123,19 +11736,65 @@ export class AgentOrchestrator extends EventEmitter {
             return;
           }
           try {
-            await agentRuntimeProfileService.recordAgentRuntimeProfile({
+            const recorded = await agentRuntimeProfileService.recordAgentRuntimeProfile({
               serverId: agent.serverId,
               agentId: msg.agentId,
               machineId,
               daemonVersion: conn?.daemonVersion ?? context.machine.daemonVersion ?? null,
               facts: msg.facts,
             });
+            // Reconciler step 11b: a config applied when idle shows up as a new
+            // running runtime or model; clients re-read the agent on agent:updated.
+            if (recorded.runtimeIdentityChanged) {
+              this.io?.to(agentEventRoom(agent.serverId, agent.assistantOwnerUserId)).emit("agent:updated", { agentId: msg.agentId });
+            }
             span.end("ok", { attrs: { outcome: "recorded", reason: "profile_recorded" } });
           } catch (err) {
             console.error(`[Machine ${machineId}] Failed to record runtime profile for ${msg.agentId}:`, err);
             span.end("error", { attrs: { outcome: "record-failed", reason: "record_failed", error_class: errorClassOf(err) } });
           }
         }, scopedTracer);
+        break;
+      }
+
+      case "agent:model_limits": {
+        // task #1357 item 1: the limits a Pi session registered. Untrusted
+        // wire data: validated whole. Accepted only from the agent's current
+        // Computer and, while the launch guard is armed, for its launch; the
+        // write itself re-checks the Computer and the revision in the
+        // database and keeps the newest report (agentModelLimitsService), so
+        // a stale, late or re-sent report never replaces a newer one also
+        // when the guard is not armed (legacy mode, after a server restart).
+        // The launch check is the side-effect-free one: a display report must
+        // not resolve a starting activity the way a rejected lifecycle event does.
+        const frame = parseAgentModelLimitsFrame(msg);
+        if (!frame) {
+          console.warn(`[Machine ${machineId}] Dropping malformed agent:model_limits`);
+          break;
+        }
+        // Bound to the daemon process the server recognises: this frame came
+        // in on the machine's current connection (a superseded socket's
+        // frames stop at the top of handleMachineMessage) and names the
+        // instance that connection's ready declared. A late frame of an old
+        // process, or of one before a server restart, is dropped here.
+        if (!conn?.daemonInstanceId || frame.daemonInstanceId !== conn.daemonInstanceId) {
+          console.warn(`[Machine ${machineId}] Dropping agent:model_limits for ${frame.agentId}: not from the current daemon instance`);
+          break;
+        }
+        // The write touches only this instance's own row
+        // (agentModelLimitsService), so a frame that pauses below while its
+        // process is replaced can never overwrite another process's result.
+        const agent = await this.validateMachineAgentMessage(machineId, conn.serverId ?? null, frame.agentId, msg.type);
+        if (!agent) break;
+        if (this.getLifecycleEventAcceptanceAction(agent, frame.launchId) !== "accept") break;
+        try {
+          const outcome = await recordAgentModelLimitsReport({ serverId: agent.serverId, machineId, frame });
+          if (outcome === "stored") {
+            this.io?.to(agentEventRoom(agent.serverId, agent.assistantOwnerUserId)).emit("agent:updated", { agentId: frame.agentId });
+          }
+        } catch (err) {
+          console.error(`[Machine ${machineId}] Failed to record model limits for ${frame.agentId}:`, err);
+        }
         break;
       }
 
@@ -10320,6 +11979,11 @@ export class AgentOrchestrator extends EventEmitter {
         break;
       }
 
+      case "agent:send_intent": {
+        await this.handleAgentSendIntent(machineId, conn?.serverId ?? null, msg);
+        break;
+      }
+
       case "agent:model-seen": {
         await this.runInTraceSpan(
           "server.agent.model_seen.ingest",
@@ -10360,6 +12024,105 @@ export class AgentOrchestrator extends EventEmitter {
               advanced_count: advanced,
               unchanged_count: unchanged,
               ignored_items_count: msg.items.length - items.length,
+            };
+          },
+          (attrs) => ({ attrs }),
+        );
+        break;
+      }
+
+      case "agent:runtime:ready": {
+        await this.runInTraceSpan(
+          "server.agent.runtime_ready.ingest",
+          { kind: "consumer", attrs: { agent_id: msg.agentId, machine_id: machineId } },
+          async (): Promise<TraceAttributes> => {
+            if (typeof msg.launchId !== "string" || !msg.launchId) return { outcome: "dropped", reason: "invalid_frame" };
+            const agent = await this.validateMachineAgentMessage(machineId, conn?.serverId ?? null, msg.agentId, msg.type);
+            if (!agent) return { outcome: "dropped", reason: "invalid_agent" };
+            // The breaker itself ignores a launch that is not its current start.
+            const progress = await this.observeStartProgress(msg.agentId, msg.launchId);
+            return { outcome: progress.changed ? "streak_cleared" : "unchanged", unpaused: progress.unpaused };
+          },
+          (attrs) => ({ attrs }),
+        );
+        break;
+      }
+
+      // #proj-raft-computer:#48 (reconciler step 4b): the daemon no longer
+      // counts this agent's credential invalid for `reason` (and the agent
+      // had shown that error or the held notice). Only a wake block of the
+      // same reason lifts. Older daemons never send it; their blocks lift on
+      // a login or a person's start, as before.
+      case "agent:credential:restored": {
+        await this.runInTraceSpan(
+          "server.agent.credential_restored.ingest",
+          { kind: "consumer", attrs: { agent_id: msg.agentId, machine_id: machineId } },
+          async (): Promise<TraceAttributes> => {
+            const restored = parseCredentialRestoredMessage(msg);
+            if (!restored) return { outcome: "dropped", reason: "invalid_frame" };
+            const agent = await this.validateMachineAgentMessage(machineId, conn?.serverId ?? null, restored.agentId, msg.type);
+            if (!agent) return { outcome: "dropped", reason: "invalid_agent" };
+            const lifted = await this.wakeCrashLoopBreaker.liftForCredentialRestored(restored.agentId, restored.reason);
+            if (lifted) {
+              this.recordEvent("wake.block_lifted", {
+                cause: "credential_restored",
+                source: "daemon_frame",
+                release_cause: restored.releaseCause,
+                lifted_reason: restored.reason,
+                launch_id_present: restored.launchId !== null,
+              });
+            }
+            return {
+              outcome: lifted ? "block_lifted" : "unchanged",
+              credential_invalid_reason: restored.reason,
+              release_cause: restored.releaseCause,
+            };
+          },
+          (attrs) => ({ attrs }),
+        );
+        break;
+      }
+
+      case "agent:turn:ended": {
+        await this.runInTraceSpan(
+          "server.agent.turn_ended.ingest",
+          {
+            kind: "consumer",
+            attrs: {
+              agent_id: msg.agentId,
+              machine_id: machineId,
+              outcome: typeof msg.outcome === "string" ? msg.outcome : "invalid",
+            },
+          },
+          async (): Promise<TraceAttributes> => {
+            if (
+              typeof msg.launchId !== "string" || !msg.launchId
+              || !(AGENT_TURN_ENDED_OUTCOMES as readonly unknown[]).includes(msg.outcome)
+              || !Array.isArray(msg.shownUnreadTargets)
+            ) {
+              return { outcome: "dropped", reason: "invalid_frame" };
+            }
+            const agent = await this.validateMachineAgentMessage(machineId, conn?.serverId ?? null, msg.agentId, msg.type);
+            if (!agent) return { outcome: "dropped", reason: "invalid_agent" };
+            // Only the launch the guard expects: a stale launch's frame must not
+            // settle (or consume) the current launch's snapshot.
+            if (this.getLifecycleEventAcceptanceAction(agent, msg.launchId) !== "accept") {
+              return { outcome: "dropped", reason: "stale_launch" };
+            }
+            const taken = this.turnEndUnreadSnapshots.take(msg.agentId, {
+              launchId: msg.launchId,
+              outcome: msg.outcome,
+              shownUnreadTargets: msg.shownUnreadTargets.filter((target): target is string => typeof target === "string"),
+            });
+            if (taken.kind !== "settle") return { outcome: "skipped", reason: taken.kind };
+            const settled = await this.settleUnowedReadBacklog(msg.agentId, taken.targets);
+            return {
+              outcome: "settled",
+              shown_target_count: taken.shownCount,
+              ignored_target_count: taken.ignoredCount,
+              conversation_count: settled.conversations,
+              message_count: settled.messages,
+              kept_conversation_count: settled.keptConversations,
             };
           },
           (attrs) => ({ attrs }),
@@ -10442,37 +12205,33 @@ export class AgentOrchestrator extends EventEmitter {
         ) {
           break;
         }
-        if (
-          msg.mentionDelivery.launchId !== agent.expectedLaunchId
-          || msg.mentionDelivery.sessionId !== agent.sessionId
-        ) {
-          const terminal = await mentionDeliveryOccurrenceService.recordMentionDeliveryIdentityDriftForIdentity({
-            occurrenceId: msg.mentionDelivery.occurrenceId,
-            agentId: msg.agentId,
-            messageId: msg.mentionDelivery.messageId,
-            identity: msg.mentionDelivery,
-            stage: "terminal_receipt",
-            originalDaemonCode: msg.code,
-          });
-          if (terminal) this.clearPendingAgentDeliveryAck({
-            agentId: msg.agentId,
-            seq: terminal.deliveryPayload?.seq ?? 0,
-            deliveryId: msg.mentionDelivery.occurrenceId,
-          }, "terminal");
-          break;
-        }
-        const terminal = await mentionDeliveryOccurrenceService.recordMentionDeliveryTerminalError({
+        const receipt = {
           occurrenceId: msg.mentionDelivery.occurrenceId,
           agentId: msg.agentId,
           messageId: msg.mentionDelivery.messageId,
           identity: msg.mentionDelivery,
-          code: msg.code,
-        });
-        if (terminal) this.clearPendingAgentDeliveryAck({
-          agentId: msg.agentId,
-          seq: terminal.deliveryPayload?.seq ?? 0,
-          deliveryId: msg.mentionDelivery.occurrenceId,
-        }, "terminal");
+        };
+        const terminal = (
+          msg.mentionDelivery.launchId !== agent.expectedLaunchId
+          || msg.mentionDelivery.sessionId !== agent.sessionId
+        )
+          ? await mentionDeliveryOccurrenceService.recordMentionDeliveryIdentityDriftForIdentity({
+            ...receipt,
+            stage: "terminal_receipt",
+            originalDaemonCode: msg.code,
+          })
+          : await mentionDeliveryOccurrenceService.recordMentionDeliveryTerminalError({ ...receipt, code: msg.code });
+        // Already ended at the daemon's stage receipt (IDENTITY_DRIFT), which sent
+        // nothing: this refusal says the message was not delivered (Bencher).
+        const claimed = terminal ?? await mentionDeliveryOccurrenceService.claimStageDriftForDaemonTerminal({ ...receipt, code: msg.code });
+        if (claimed) {
+          this.clearPendingAgentDeliveryAck({
+            agentId: msg.agentId,
+            seq: claimed.deliveryPayload?.seq ?? 0,
+            deliveryId: msg.mentionDelivery.occurrenceId,
+          }, "terminal");
+          await this.redeliverUntrackedAfterMentionTerminal(machineId, msg.agentId, claimed.deliveryPayload, msg.code);
+        }
         break;
       }
 
@@ -10845,14 +12604,47 @@ export class AgentOrchestrator extends EventEmitter {
         break;
       }
 
+      // The current flag-derived agent config fields of the Server this
+      // connection is bound to (shared featuresChanged.ts), never another's.
+      // A failed evaluation or send answers nothing: the daemon keeps the
+      // values it has (an evaluation that failed must never read as "all off").
+      case "server:features:request": {
+        const serverId = conn?.serverId ?? null;
+        if (!serverId || typeof msg.requestId !== "string" || !msg.requestId || msg.requestId.length > 128) break;
+        try {
+          const features = await this.agentServerFeaturesStrict(serverId);
+          const sendResult = await this.trySendAppTransport(machineId, {
+            type: "server:features",
+            requestId: msg.requestId,
+            serverId,
+            features,
+          });
+          if (sendResult.outcome !== "sent") {
+            console.warn(`[Machine ${machineId}] server:features not sent (${sendResult.reason})`);
+          }
+        } catch (err) {
+          console.warn(`[Machine ${machineId}] server:features evaluation failed; not answering`, err);
+        }
+        break;
+      }
+
       case "agent:skills:list_result":
         this.observeAgentSkillsListResult(machineId, msg);
         this.emit(`machine:response:${machineId}`, msg);
         break;
 
+      // task #25 step 2: the daemon's answer to a stop-this-turn request; the
+      // person's request may be waiting on another replica.
+      case "agent:interrupt-turn:result":
+      // #proj-runtime:#41: the daemon's answer to a stop-this-sub-agent request.
+      case "agent:interrupt-subagent:result":
+        this.emit(`machine:response:${machineId}`, msg);
+        void this.getMachineResponseRelay().forward(machineId, msg,
+          (event, attrs) => this.recordMachineResponseRelay(event, attrs));
+        break;
+
       case "agent:workspace:file_tree":
       case "agent:workspace:file_content":
-      case "agent:workspace:wiki_ensured":
       case "machine:workspace:scan_result":
       case "machine:workspace:delete_result":
       case "machine:migration:source_workspace_archive_result":
@@ -11143,6 +12935,33 @@ export class AgentOrchestrator extends EventEmitter {
   }
 
   /**
+   * Task #374: refuse a held duplicate during the WebSocket handshake, before
+   * the upgrade. Daemons reset their reconnect backoff when a socket opens, so
+   * the after-open close in registerMachine makes an old daemon retry at once;
+   * a rejected handshake never opens, and the daemon's backoff keeps growing
+   * (to 30 s on 1.0.18). Returns true when the caller must answer 409 and not
+   * upgrade. registerMachine keeps its own check for a hold that appears
+   * between the handshake and registration.
+   */
+  async refuseHeldDuplicateAtHandshake(machineId: string): Promise<boolean> {
+    const hold = await this.heldDuplicateMachineConnection(machineId);
+    if (!hold) return false;
+    // Daemons since 1.0.47 (#9348) wait 5 minutes after the after-open 4003
+    // refusal; a handshake rejection reaches them as a normal failure (<=30 s
+    // backoff) until their release handles 409 the same way. Keep them on the
+    // 4003 path; only daemons without that delay, or of unknown version, are
+    // refused here.
+    if (!daemonLacksDuplicateReconnectDelay(hold.closedDaemonVersion)) return false;
+    machineDuplicateConnectionActionsTotal.inc({
+      action: "refused_held_handshake",
+      daemon_version: daemonVersionLabel(hold.closedDaemonVersion),
+    });
+    await this.replicaStateStore.touchMachineDuplicateHold?.(machineId, AgentOrchestrator.DUPLICATE_HOLD_TTL_SECONDS)
+      .catch(() => {});
+    return true;
+  }
+
+  /**
    * Task #374: whether a new connection for `machineId` must be refused because
    * the winner of an earlier duplicate decision is still alive. Fails open: any
    * read error, a missing record or a winner that stopped renewing lets the
@@ -11213,12 +13032,18 @@ export class AgentOrchestrator extends EventEmitter {
     });
   }
 
-  async pushReminderCancel(agentId: string, sourceId: string, version: number): Promise<boolean> {
+  /**
+   * Disarms the reminder on its owner's Computer. `canceled`: the reminder
+   * itself was canceled (not its last fire, not a move to the Reminder App),
+   * so the Computer also drops its un-acked local items of it (RFC 081 D21).
+   */
+  async pushReminderCancel(agentId: string, sourceId: string, version: number, opts: { canceled?: boolean } = {}): Promise<boolean> {
     const outgoing = {
       type: "reminder.cancel",
       agentId,
       reminderId: sourceId,
       version,
+      ...(opts.canceled ? { canceled: true as const } : {}),
     } satisfies ServerToMachineMessage;
     const agent = await agentService.getAgent(agentId, false, {
       dbCallsite: "agent_orchestrator.reminder_push",
@@ -11459,9 +13284,9 @@ export class AgentOrchestrator extends EventEmitter {
     machineId: string,
     agent: CachedAgentState,
   ): Promise<void> {
-    const inbox = this.agentInboxes.get(agent.id);
-    if (!inbox || inbox.inbox.length === 0) return;
-    const oldestMessageAgeMs = oldestInboxMessageAgeMs(inbox.inbox, this.clock.now());
+    const inbox = this.localInboxes.snapshot(agent.id);
+    if (!inbox || inbox.messages.length === 0) return;
+    const oldestMessageAgeMs = oldestInboxMessageAgeMs(inbox.messages, this.clock.now());
     const span = this.tracer.startSpan("server.runtime_profile.gated_inbox.flush", {
       parent: getCurrentTraceContext(),
       surface: "server",
@@ -11473,14 +13298,18 @@ export class AgentOrchestrator extends EventEmitter {
         server_id: agent.serverId,
         agent_id_present: Boolean(agent.id),
         machine_id_present: true,
-        inbox_count: inbox.inbox.length,
+        inbox_count: inbox.messages.length,
         oldest_message_age_ms: oldestMessageAgeMs,
         oldest_message_age_bucket: durationMsBucket(oldestMessageAgeMs),
       },
     });
     let sentCount = 0;
     let sendFailedCount = 0;
-    for (const message of [...inbox.inbox]) {
+    const buffered = [...inbox.messages];
+    const flushed = buffered.some((message) => message.third_party_event)
+      ? await this.guardBufferedSystemAppEvents(agent.id, buffered)
+      : buffered;
+    for (const message of flushed) {
       const deliveryId = crypto.randomUUID();
       const sent = await this.sendAgentDeliveryWithAckRetry(machineId, {
         type: "agent:deliver",
@@ -11577,9 +13406,10 @@ export class AgentOrchestrator extends EventEmitter {
           conn.ws.send(JSON.stringify(msg));
           return true;
         },
+        // A provider connect's API key crosses Redis sealed (runtimeAuthReplicaSeal.ts).
         reroute: () => this.routeMachineCommandCrossReplica(
           machineId,
-          msg,
+          sealForReplicaHop(machineId, msg),
           this.getRoutableLocalMachineIds(),
         ),
         onRouteResult: options.onRouteResult,
@@ -11827,6 +13657,10 @@ export class AgentOrchestrator extends EventEmitter {
   }
 
   /** Move the agent's read position over messages its daemon reported the model was shown. */
+  protected settleUnowedReadBacklog(agentId: string, targets: Parameters<typeof settleUnowedReadBacklog>[2]) {
+    return settleUnowedReadBacklog(getDb(), agentId, targets);
+  }
+
   protected applyAgentModelSeen(input: Parameters<typeof applyAgentModelSeenToReadPosition>[0]) {
     return applyAgentModelSeenToReadPosition(input);
   }
@@ -12472,7 +14306,7 @@ export class AgentOrchestrator extends EventEmitter {
   private parkPendingAgentDeliveryAck(
     key: string,
     pending: PendingAgentDeliveryAck,
-    reason: "machine_offline",
+    reason: "machine_offline" | "computer_version_held",
   ): void {
     if (pending.timer) {
       this.clock.clearTimeout(pending.timer);
@@ -12511,10 +14345,27 @@ export class AgentOrchestrator extends EventEmitter {
     const pending = this.pendingAgentDeliveryAcks.get(key);
     if (!pending?.parked) return;
     pending.timer = null;
-    if (this.clock.now() - (pending.parkedAt ?? this.clock.now()) >= AgentOrchestrator.AGENT_DELIVERY_PARKED_MAX_MS) {
+    const versionHeld = pending.parkedReason === "computer_version_held";
+    const maxParkedMs = versionHeld
+      ? AgentOrchestrator.AGENT_DELIVERY_VERSION_HELD_MAX_MS
+      : AgentOrchestrator.AGENT_DELIVERY_PARKED_MAX_MS;
+    if (this.clock.now() - (pending.parkedAt ?? this.clock.now()) >= maxParkedMs) {
       this.recordAgentDeliveryOutcome(pending, "parked_expired");
       this.pendingAgentDeliveryAcks.delete(key);
       return;
+    }
+    if (versionHeld) {
+      let held: boolean;
+      try {
+        held = await this.isMachineAgentWorkHeld(pending.machineId);
+      } catch {
+        held = true;
+      }
+      if (this.pendingAgentDeliveryAcks.get(key) !== pending || !pending.parked) return;
+      if (held) {
+        this.scheduleParkedAgentDeliveryProbe(key, pending);
+        return;
+      }
     }
     let machineStatus: "online" | "offline";
     try {
@@ -12573,6 +14424,17 @@ export class AgentOrchestrator extends EventEmitter {
       return {
         allowed: false,
         reason: "mention_identity_drift",
+        currentMachineId: agent.machineId,
+        currentStatus: agent.status,
+      };
+    }
+
+    // The ack retry re-sends the first push of a system-app event: its
+    // delivery guard is asked again (the recipient may have lost access).
+    if (pending.msg.message.third_party_event && !await this.isSystemAppEventDeliverable(pending.msg.agentId, pending.msg.message)) {
+      return {
+        allowed: false,
+        reason: "system_app_delivery_withheld",
         currentMachineId: agent.machineId,
         currentStatus: agent.status,
       };
@@ -12722,14 +14584,40 @@ export class AgentOrchestrator extends EventEmitter {
           machine_status: machineStatus,
           retry_reason: reason,
         });
+        if (machineStatus === "online" && await this.isMachineAgentWorkHeld(pending.machineId)) {
+          this.parkPendingAgentDeliveryAck(key, pending, "computer_version_held");
+          span.end("ok", {
+            attrs: {
+              outcome: "parked",
+              reason: "computer_version_held",
+              wake_action: gate.wakeAction,
+              current_status: gate.currentStatus,
+            },
+          });
+          return;
+        }
         if (machineStatus === "offline") {
           this.parkPendingAgentDeliveryAck(key, pending, "machine_offline");
+          // An app event has no durable chain row: this park is what the
+          // machine-ready / sweep re-delivery (thirdPartyAgentEventRedelivery)
+          // recovers. Tie it to the event.
+          const thirdPartyEventId = pending.msg.message.third_party_event?.id;
+          if (thirdPartyEventId) {
+            this.recordEvent("server.third_party_event.parked", {
+              outcome: "parked_machine_offline",
+              third_party_event_id: thirdPartyEventId,
+              agent_id: pending.msg.agentId,
+              machine_id: pending.machineId,
+              deliveryId: pending.msg.deliveryId,
+            });
+          }
           span.end("ok", {
             attrs: {
               outcome: "parked",
               reason: "machine_offline",
               wake_action: gate.wakeAction,
               current_status: gate.currentStatus,
+              ...(thirdPartyEventId ? { third_party_event_id: thirdPartyEventId, third_party_event_outcome: "parked_machine_offline" } : {}),
             },
           });
           return;
@@ -12774,11 +14662,46 @@ export class AgentOrchestrator extends EventEmitter {
     });
   }
 
+  /**
+   * A daemon ended a tracked mention with a terminal error: the tracking is
+   * over, but the message has not reached the agent (every code is about the
+   * delivery path or the tracking, never about the message). Send it once
+   * more as a plain delivery, under the ordinary ack-retry cycle, so no
+   * daemon refusal drops a message (Tenny, P1: a fresh Claude session refused
+   * tracked mentions and nothing redelivered them). Only the call whose
+   * terminal write won comes here, so it is sent once; a daemon that already
+   * holds or saw the message drops the copy as a duplicate.
+   */
+  private async redeliverUntrackedAfterMentionTerminal(
+    machineId: string,
+    agentId: string,
+    payload: AgentMessage | null | undefined,
+    code: string,
+  ): Promise<void> {
+    if (!payload) return;
+    console.warn("[MentionDelivery] terminal error; redelivering untracked", { agentId, code, seq: payload.seq ?? 0 });
+    await this.sendAgentDeliveryWithAckRetry(machineId, {
+      type: "agent:deliver",
+      agentId,
+      message: payload,
+      seq: payload.seq ?? 0,
+      deliveryId: crypto.randomUUID(),
+    }, `untracked redelivery after mention terminal error failed for agent ${agentId}`);
+  }
+
   protected async sendAgentDeliveryWithAckRetry(
     machineId: string,
     msg: Extract<ServerToMachineMessage, { type: "agent:deliver" }>,
     errorContext: string,
   ): Promise<boolean> {
+    // An app event's content as the pull paths hand it over: an external app's
+    // inert, Raft's own system apps' as a message (agentFacingContent.ts). Done
+    // before tracking, so a retry or a delivery-rejected wake reuses it.
+    if (msg.message.sender_type === "third_party_app") {
+      const serverId = this.agentStateCache.get(msg.agentId)?.serverId ?? this.machineConnections.get(machineId)?.serverId;
+      const [message] = await renderPushedMessages([msg.message], msg.agentId, serverId);
+      msg = { ...msg, message: message! };
+    }
     // Glimpse layer-1 input duplication: the server offers this body to the agent.
     // No launch: the cached expected launch is this instance's and can be stale.
     recordAgentContextReturned({
@@ -12787,6 +14710,15 @@ export class AgentOrchestrator extends EventEmitter {
       channelId: msg.message.channel_id,
       seqs: [msg.seq],
     });
+    // Below the Computer version floor: hold the delivery, unsent, until the
+    // machine reconnects on a supported version (the park probe re-checks).
+    if (await this.isMachineAgentWorkHeld(machineId).catch(() => false)) {
+      this.trackPendingAgentDeliveryAck(machineId, msg);
+      const key = this.findAgentDeliveryAckKey(msg.agentId, msg.seq, msg.deliveryId);
+      const pending = key ? this.pendingAgentDeliveryAcks.get(key) : undefined;
+      if (key && pending) this.parkPendingAgentDeliveryAck(key, pending, "computer_version_held");
+      return false;
+    }
     const localAtSend = this.hasMachineLocally(machineId);
     if (localAtSend) {
       this.trackPendingAgentDeliveryAck(machineId, msg);
@@ -12841,6 +14773,15 @@ export class AgentOrchestrator extends EventEmitter {
     return await context.fallback();
   }
 
+  /** This replica's ready machine connections and the Server each one serves. */
+  listLocalMachineServers(): Array<{ machineId: string; serverId: string }> {
+    const result: Array<{ machineId: string; serverId: string }> = [];
+    for (const [machineId, conn] of this.machineConnections.entries()) {
+      if (conn.ws.readyState === 1) result.push({ machineId, serverId: conn.serverId });
+    }
+    return result;
+  }
+
   /** Send directly to a local machine connection (used by ReplicaRouter callback) */
   sendToLocalMachine(machineId: string, msg: ServerToMachineMessage): boolean {
     const conn = this.machineConnections.get(machineId);
@@ -12854,7 +14795,13 @@ export class AgentOrchestrator extends EventEmitter {
     return this.resolveRoutedMachineOwnership(
       machineId,
       localMachineIds,
-      () => this.handleLocalRoutedMachineCommand(machineId, msg),
+      () => {
+        // A provider connect arrives sealed; only the socket's own replica opens it.
+        const opened = openAfterReplicaHop(machineId, msg);
+        if (opened.ok) return this.handleLocalRoutedMachineCommand(machineId, opened.message);
+        this.refuseSealedConnect(machineId, opened.reason, opened.requestId);
+        return true;
+      },
       async () => normalizeMachineCommandRouteResult(
         await this.routeMachineCommandCrossReplica(machineId, msg, localMachineIds),
       ).routed,
@@ -12864,7 +14811,7 @@ export class AgentOrchestrator extends EventEmitter {
 
   private async handleLocalRoutedMachineCommand(machineId: string, msg: ServerToMachineMessage): Promise<boolean> {
     if (
-      (msg.type === "agent:start" || msg.type === "agent:start:wiki")
+      msg.type === "agent:start"
       && msg.startDispatchId
       && this.terminalAgentStartDispatches.has(msg.startDispatchId)
     ) {
@@ -12891,7 +14838,7 @@ export class AgentOrchestrator extends EventEmitter {
       this.armStartLaunchGuard(msg.agentId, msg.launchId);
     }
     if (
-      (msg.type === "agent:start" || msg.type === "agent:start:wiki")
+      msg.type === "agent:start"
       && msg.startDispatchId
     ) {
       return await this.sendAgentStartWithAckRetry(
@@ -13227,6 +15174,12 @@ export class AgentOrchestrator extends EventEmitter {
     if (pending.timer) this.clock.clearTimeout(pending.timer);
     this.recordAgentDeliveryOutcome(pending, "converted_to_wake");
     this.pendingAgentDeliveryAcks.delete(key);
+    // The start re-sends the first push: a system-app event goes through its
+    // delivery guard again; one it does not allow ends here.
+    if (pending.msg.message.third_party_event && !await this.isSystemAppEventDeliverable(msg.agentId, pending.msg.message)) {
+      trace("system_app_delivery_withheld");
+      return;
+    }
     let result: AgentStartDispatchResult;
     try {
       result = await this.startAgent(msg.agentId, {
@@ -13324,25 +15277,13 @@ export class AgentOrchestrator extends EventEmitter {
     await agentService.resetAgentSession(agentId, status);
   }
 
-  private broadcastAgentSession(serverId: string, agentId: string, sessionId: string | null) {
-    this.io?.to(`server:${serverId}`).emit("agent:session", { agentId, sessionId });
+  private broadcastAgentSession(agent: Pick<CachedAgentState, "id" | "serverId" | "assistantOwnerUserId">, sessionId: string | null) {
+    this.io?.to(agentEventRoom(agent.serverId, agent.assistantOwnerUserId)).emit("agent:session", { agentId: agent.id, sessionId });
   }
 
   private releaseWakeLock(agentId: string) {
     if (!this.replicaStateStore.isAvailable()) return;
     this.replicaStateStore.releaseWakeLock(agentId).catch(() => {});
-  }
-
-  private clearAgentInbox(agentId: string): boolean {
-    const inbox = this.agentInboxes.get(agentId);
-    let resolvedPendingReceive = false;
-    if (inbox?.pendingReceive) {
-      clearTimeout(inbox.pendingReceive.timer);
-      inbox.pendingReceive.resolve([]);
-      resolvedPendingReceive = true;
-    }
-    this.agentInboxes.delete(agentId);
-    return resolvedPendingReceive;
   }
 
   protected getResetMode(agentId: string): "restart" | "session" | "full" | null {
@@ -13462,7 +15403,10 @@ export class AgentOrchestrator extends EventEmitter {
   async startAgent(agentId: string, options: StartAgentOptions = {}): Promise<AgentStartDispatchResult> {
     // task #365: an `internal` start is never forwarded; see startAgentForRetry.
     if (options.startCause === "internal") throw new Error("internal starts go through startAgentForRetry");
-    const routed = this.mayRunOnOwner(agentId) ? await this.runOnOwner(agentId, { kind: "start", options }) : null;
+    // F9: only the replica holding the socket whose `ready` owes the wake starts it (an older owner would not know the cause).
+    const { startCause } = options;
+    if (startCause === "ready_owed") throw new Error("ready owed wakes go through startReadyOwedWakePass");
+    const routed = this.mayRunOnOwner(agentId) ? await this.runOnOwner(agentId, { kind: "start", options: { ...options, startCause } }) : null;
     if (!routed) return this.startAgentHere(agentId, options);
     return routed as AgentStartDispatchResult;
   }
@@ -13557,40 +15501,13 @@ export class AgentOrchestrator extends EventEmitter {
   }
 
   /**
-   * RFC 070 constructed wake context, per server, default OFF. Evaluated at
-   * every agent start so turning the flag off takes effect on the next start;
-   * any evaluation failure keeps it off.
+   * A runtime's RFC 060 OAR flag, per server, default off, riding only the
+   * agent:start config. Evaluated at every agent start; any evaluation
+   * failure keeps it off. (The server features flags are read by
+   * evaluateAgentServerFeatures.)
    */
-  protected async constructedWakeContextEnabled(serverId: string | null | undefined): Promise<boolean> {
-    if (!serverId) return false;
-    try {
-      return (await evaluateFeatureFlag({ key: CONSTRUCTED_WAKE_CONTEXT_FEATURE_FLAG_KEY, serverId })).enabled === true;
-    } catch (error) {
-      console.warn(`[AgentOrchestrator] ${CONSTRUCTED_WAKE_CONTEXT_FEATURE_FLAG_KEY} evaluation failed; leaving it off`, error);
-      return false;
-    }
-  }
-
-  /**
-   * Sub-agent delegation prompt, per server, default OFF. Evaluated at every
-   * agent start; any evaluation failure keeps it off.
-   */
-  protected async subagentDelegationEnabled(serverId: string | null | undefined): Promise<boolean> {
-    if (!serverId) return false;
-    try {
-      return (await evaluateFeatureFlag({ key: SUBAGENT_DELEGATION_FEATURE_FLAG_KEY, serverId })).enabled === true;
-    } catch (error) {
-      console.warn(`[AgentOrchestrator] ${SUBAGENT_DELEGATION_FEATURE_FLAG_KEY} evaluation failed; leaving it off`, error);
-      return false;
-    }
-  }
-
-  /**
-   * Reminder / Vault app rollout flags, per server, default off. Evaluated at
-   * every agent start; any evaluation failure keeps the flag off.
-   */
-  protected async appRolloutFlagEnabled(
-    key: typeof REMINDER_APP_FEATURE_FLAG_KEY | typeof VAULT_APP_FEATURE_FLAG_KEY,
+  protected async startConfigFlagEnabled(
+    key: AgentRuntimeOarFeatureFlagKey,
     serverId: string | null | undefined,
   ): Promise<boolean> {
     if (!serverId) return false;
@@ -13602,15 +15519,233 @@ export class AgentOrchestrator extends EventEmitter {
     }
   }
 
-  /** task #359: RFC 072 §7 passive AX, per server, default off (see featureFlagService). */
-  protected async passiveAxEnabled(serverId: string | null | undefined): Promise<boolean> {
-    if (!serverId) return false;
+  /**
+   * The `AgentConfig` fields this Server's flags decide, the same for every
+   * agent of it (shared `AGENT_SERVER_FEATURE_KEYS`), as `agent:start` sets
+   * them: a boolean present only when on. Lenient: an evaluation group that
+   * fails reads as off (each per-server flag, the Reminder app's install
+   * check, the first-party apps), and the other groups still count. The same
+   * evaluation as agentServerFeaturesStrict, so the two never drift.
+   */
+  protected async agentServerFeatures(serverId: string | null): Promise<AgentServerFeatures> {
+    if (!serverId) return { enabledApps: [] };
+    return this.evaluateAgentServerFeatures(serverId, "off");
+  }
+
+  /**
+   * agentServerFeatures for `server:features:request`, without its failure
+   * fallbacks: any evaluation failure throws, so the request is answered with
+   * nothing (the daemon keeps its values) instead of "all off", which would
+   * restart every agent and tell it that its apps were turned off.
+   */
+  protected async agentServerFeaturesStrict(serverId: string): Promise<AgentServerFeatures> {
+    return this.evaluateAgentServerFeatures(serverId, "throw");
+  }
+
+  /**
+   * The one evaluation behind both: the per-server flags in one batch, then
+   * the Reminder app's install check (the same gate as the legacy-write
+   * refusal: the flag, or installed and migrated) and the first-party apps.
+   * `onFailure` decides what a failed group gives: "throw", or "off" (logged).
+   */
+  private async evaluateAgentServerFeatures(serverId: string, onFailure: "throw" | "off"): Promise<AgentServerFeatures> {
+    const group = async <T>(name: string, read: () => Promise<T>, off: T): Promise<T> => {
+      if (onFailure === "throw") return read();
+      try {
+        return await read();
+      } catch (error) {
+        console.warn(`[AgentOrchestrator] ${name} evaluation failed; leaving it off`, error);
+        return off;
+      }
+    };
+    const keys = [
+      SUBAGENT_DELEGATION_FEATURE_FLAG_KEY,
+      PASSIVE_AX_FEATURE_FLAG_KEY,
+      REMINDER_APP_FEATURE_FLAG_KEY,
+      VAULT_APP_FEATURE_FLAG_KEY,
+      PI_SESSION_ROTATION_FEATURE_FLAG_KEY,
+      // Wake recycle on the OAR host (#proj-runtime:#54): resume facts from the session summary, and its cold-idle stop.
+      WAKE_RECYCLE_OAR_FEATURE_FLAG_KEY,
+      // Wake recycle gated on the cache tier the session last wrote (#proj-runtime:#54 phase 2).
+      WAKE_RECYCLE_TIER_GATE_FEATURE_FLAG_KEY,
+      // Native compaction at a turn end past a size threshold (#proj-runtime:#54 phase 3).
+      TURN_END_COMPACTION_FEATURE_FLAG_KEY,
+      // Warm wake recycle: a large session is stopped at a clean turn end and starts fresh (#proj-runtime:#54, RFC 070 §6.5).
+      WAKE_RECYCLE_WARM_FEATURE_FLAG_KEY,
+      // Task v2: the prompt teaches task conversations (`raft task reply`, refs).
+      TASK_V2_CONVERSATIONS_FEATURE_FLAG_KEY,
+      // View Context: the daemon keeps its send index and answers view requests.
+      AGENT_CONTEXT_VIEW_FEATURE_FLAG_KEY,
+      // RFC 081: the wake-up and the prompt teach `raft inbox read` only where the server answers it.
+      AGENT_INBOX_ITEMS_FEATURE_FLAG_KEY,
+    ] as const;
+    const readFlags = async (batch: readonly (typeof keys)[number][]) => {
+      const answers = await evaluateFeatureFlags(batch.map((key) => ({ key, serverId })));
+      return batch.filter((_, index) => answers[index]?.enabled === true);
+    };
+    let on: Set<string>;
     try {
-      return (await evaluateFeatureFlag({ key: PASSIVE_AX_FEATURE_FLAG_KEY, serverId })).enabled === true;
+      on = new Set<string>(await readFlags(keys));
     } catch (error) {
-      console.warn(`[AgentOrchestrator] ${PASSIVE_AX_FEATURE_FLAG_KEY} evaluation failed; leaving it off`, error);
-      return false;
+      if (onFailure === "throw") throw error;
+      // A failure may belong to one flag's rules (an audience, a lab, a
+      // plan): read each flag on its own, so only the failing one reads as
+      // off and the others keep agent:start's prompt paired with the gates
+      // that read them (reminderAppGate, taskConversationsGate).
+      console.warn("[AgentOrchestrator] server feature flags batch evaluation failed; reading each flag on its own", error);
+      on = new Set<string>();
+      for (const key of keys) {
+        if ((await group(key, () => readFlags([key]), [])).length > 0) on.add(key);
+      }
     }
+    const reminderApp = await group(
+      "Reminder app install",
+      () => reminderAppActiveForServerStrict(serverId, on.has(REMINDER_APP_FEATURE_FLAG_KEY)),
+      false,
+    );
+    // First-party apps on for this server (their registry ids), always sent
+    // (empty: none on), so a current daemon can tell it from an older
+    // server's absent field. The Reminder and Vault apps stay on their
+    // booleans, which older daemons read.
+    const enabledApps = await group("first-party app flags", () => enabledFirstPartyAppIdsStrict(serverId), [] as string[]);
+    const features: AgentServerFeatures = {};
+    if (on.has(SUBAGENT_DELEGATION_FEATURE_FLAG_KEY)) features.subagentDelegation = true;
+    if (on.has(PASSIVE_AX_FEATURE_FLAG_KEY)) features.passiveAx = true;
+    if (reminderApp) features.reminderApp = true;
+    if (on.has(VAULT_APP_FEATURE_FLAG_KEY)) features.vaultApp = true;
+    if (on.has(PI_SESSION_ROTATION_FEATURE_FLAG_KEY)) features.piSessionRotation = true;
+    if (on.has(WAKE_RECYCLE_OAR_FEATURE_FLAG_KEY)) features.wakeRecycleOar = true;
+    if (on.has(WAKE_RECYCLE_TIER_GATE_FEATURE_FLAG_KEY)) features.wakeRecycleTierGate = true;
+    if (on.has(TURN_END_COMPACTION_FEATURE_FLAG_KEY)) features.turnEndCompaction = true;
+    if (on.has(WAKE_RECYCLE_WARM_FEATURE_FLAG_KEY)) features.wakeRecycleWarm = true;
+    if (on.has(TASK_V2_CONVERSATIONS_FEATURE_FLAG_KEY)) features.taskConversations = true;
+    if (on.has(AGENT_CONTEXT_VIEW_FEATURE_FLAG_KEY)) features.agentContextView = true;
+    // RFC 081: the flag and a launch time (RAFT_INBOX_ITEMS_LAUNCH_AT), the same switch the inbox routes answer by.
+    // The launch time rides beside it (only then), so the daemon can tell reminders fired after launch (D9, D16).
+    const inboxItemsLaunchAt = inboxItemsOnWith(on.has(AGENT_INBOX_ITEMS_FEATURE_FLAG_KEY)) ? inboxItemsLaunch()?.at.toISOString() : undefined;
+    if (inboxItemsLaunchAt !== undefined) {
+      features.inboxItems = true;
+      features.inboxItemsLaunchAt = inboxItemsLaunchAt;
+    }
+    features.enabledApps = enabledApps;
+    return features;
+  }
+
+  /**
+   * RFC 060: whether this start asks the daemon for its OAR host. Only a
+   * daemon that advertised `runtime-host:oar` on this connection reads
+   * `runtimeHost`; an older Computer never advertised it and keeps its
+   * drivers whatever the flag says (no version comparison: the capability is
+   * the contract). Then the runtime's own flag, per server, default off
+   * (Codex has none: `runtime-host:oar:codex` decides); the server kill switch
+   * turns every runtime off.
+   */
+  protected async agentRuntimeOarRequested(
+    machineId: string | null | undefined,
+    serverId: string | null | undefined,
+    runtime: string | null | undefined,
+  ): Promise<boolean> {
+    if (!this.hasMachineCapability(machineId, DAEMON_CAPABILITY_RUNTIME_HOST_OAR)) return false;
+    // No legacy driver to choose instead: its flag admitted it at create/switch.
+    if (isOarOnlyRuntime(runtime)) return true;
+    if (agentRuntimeOarDisabled()) return false;
+    // Codex: no flag (retired, #raft-architecture:#32). Earlier Computers
+    // advertise the OAR host with an unfinished Codex launch, so the
+    // capability alone decides.
+    if (runtime === "codex") return this.hasMachineCapability(machineId, DAEMON_CAPABILITY_RUNTIME_HOST_OAR_CODEX);
+    const key = agentRuntimeOarFeatureFlagKey(runtime);
+    if (!key) return false;
+    // Earlier Computers carry a Grok launch without the fixes it needs by default (#oar-raft:#4).
+    if (runtime === "grok" && !this.hasMachineCapability(machineId, DAEMON_CAPABILITY_RUNTIME_HOST_OAR_GROK)) return false;
+    // #oar-raft:#10: only a Computer that can load the Cursor SDK (Linux, non-SEA) runs Cursor on OAR.
+    if (runtime === "cursor" && !this.hasMachineCapability(machineId, DAEMON_CAPABILITY_RUNTIME_HOST_OAR_CURSOR)) return false;
+    return this.startConfigFlagEnabled(key, serverId);
+  }
+
+  /**
+   * Agent typing line (`agent:send_intent`). Same ownership and launch checks
+   * as the other per-agent frames; the registry then resolves the target
+   * read-only and emits to the conversation room.
+   */
+  private async handleAgentSendIntent(machineId: string, serverId: string | null, msg: unknown): Promise<AgentSendIntentOutcome | "invalid_frame" | "invalid_agent" | "stale_launch" | "failed"> {
+    const frame = parseAgentSendIntentFrame(msg);
+    if (!frame) return "invalid_frame";
+    const agent = await this.validateMachineAgentMessage(machineId, serverId, frame.agentId, "agent:send_intent");
+    if (!agent || !agent.machineId) return "invalid_agent";
+    if (this.getLifecycleEventAcceptanceAction(agent, frame.launchId) !== "accept") return "stale_launch";
+    try {
+      return await this.agentTyping.handle({ id: agent.id, serverId: agent.serverId, machineId: agent.machineId }, frame);
+    } catch (err) {
+      console.warn(`[Machine ${machineId}] agent:send_intent for ${frame.agentId} failed`, err);
+      return "failed";
+    }
+  }
+
+  /**
+   * Agent typing line: the agent's message landed (the agent send route).
+   * The call that posted it is usually still running (`send … && raft task
+   * update …`) and its daemon keeps refreshing `start`; close the agent's
+   * lines into that conversation and mark their calls ended, here and on the
+   * replica holding the agent's machine socket. A thread is matched by its
+   * root message. Never throws.
+   */
+  async endAgentTypingForPostedMessage(input: {
+    agentId: string;
+    serverId: string;
+    channelId: string;
+    channelType: string;
+    target?: string;
+  }): Promise<void> {
+    try {
+      let signal: AgentTypingPostedSignal;
+      if (input.channelType === "thread" || input.channelType === "task") {
+        const thread = await channelService.getChannel(input.channelId);
+        if (thread?.type === "task") {
+          // Task v2: the line is keyed by the task conversation itself (its
+          // own room), whatever type the posting surface reported.
+          signal = { agentId: input.agentId, channelId: thread.id, parentMessageId: null };
+        } else {
+          if (!thread?.parentMessageId) return;
+          signal = { agentId: input.agentId, channelId: thread.parentChannelId ?? null, parentMessageId: thread.parentMessageId };
+        }
+      } else {
+        signal = { agentId: input.agentId, channelId: input.channelId, parentMessageId: null };
+      }
+      if (input.target !== undefined) signal.target = input.target;
+      this.handleRoutedAgentTypingPosted(signal);
+      // Typing state lives on the replica holding the agent's machine socket:
+      // tell that one only (no-op when it's this replica).
+      const machineId = (await this.getCachedAgent(input.agentId))?.machineId ?? null;
+      await publishAgentTypingPosted(signal, machineId);
+    } catch (err) {
+      console.warn(`[AgentOrchestrator] agent typing end for ${input.agentId}'s message failed`, err);
+    }
+  }
+
+  /** Agent typing line: an agent's message landed (this replica's send, or another's via Redis). */
+  handleRoutedAgentTypingPosted(signal: AgentTypingPostedSignal): void {
+    const conversation = signal.parentMessageId !== null
+      ? { channelId: signal.channelId, parentMessageId: signal.parentMessageId }
+      : signal.channelId !== null
+        ? { channelId: signal.channelId, parentMessageId: null }
+        : null;
+    if (!conversation) return;
+    this.agentTyping.endForPostedMessage(signal.agentId, conversation, signal.target);
+  }
+
+  /**
+   * Test seam: the read-only target resolution of the typing line. A task v2
+   * ref (`raft task reply "#chan:#7"`) resolves to the task's conversation;
+   * anything else is a message target.
+   */
+  protected async previewAgentTypingTarget(serverId: string, agentId: string, target: string): Promise<AgentTypingTargetPreview | null> {
+    return await previewAgentTaskReplyTarget(serverId, agentId, target)
+      ?? await previewAgentPostTarget(serverId, agentId, target);
+  }
+
+  /** The conversation room only; never `server:<id>` (the server room carries no targets). */
+  protected emitAgentTyping(room: string, event: string, payload: unknown): void {
+    this.io?.to(room).emit(event, payload);
   }
 
   protected ownerAcceptsIntents(replicaId: string): Promise<boolean> {
@@ -13642,11 +15777,13 @@ export class AgentOrchestrator extends EventEmitter {
       case "start":
         return this.startAgentHere(request.agentId, intent.options);
       case "stop":
-        await this.stopAgentHere(request.agentId, intent.reason);
+        await this.stopAgentHere(request.agentId, intent.reason, intent.daemonReason);
         return { outcome: "done" };
       case "reset":
         await this.resetAgentHere(request.agentId, intent.mode, intent.options);
         return { outcome: "done" };
+      case "config":
+        return { outcome: "config", pushed: await this.applyAgentConfigHere(request.agentId) === "pushed" };
     }
   }
 
@@ -13689,6 +15826,108 @@ export class AgentOrchestrator extends EventEmitter {
     }
   }
 
+  /**
+   * Reconciler step 11b: the `AgentConfig` the agent runs on, from the
+   * database, as both `agent:start` and `agent:config` send it. Reads only:
+   * no cache write, wake lock or catalog authority (the start takes those).
+   */
+  protected async buildAgentConfig(agent: PersistedAgentRow): Promise<AgentConfig> {
+    const normalizedRuntimeConfig = hydrateRuntimeConfig(agent);
+    const launchRuntimeFields = runtimeConfigToLaunchFields(normalizedRuntimeConfig);
+    const machine = agent.machineId ? await this.loadRuntimeContextMachine(asMachineId(agent.machineId)) : null;
+    const daemonVersion = agent.machineId ? this.getMachineDaemonVersion(agent.machineId) : null;
+    const config: AgentConfig = {
+      name: agent.name,
+      displayName: agent.displayName,
+      description: agent.description,
+      model: launchRuntimeFields.model,
+      runtime: launchRuntimeFields.runtime,
+      // As it launches: a daemon derives launch flags from this with its own
+      // bundled rules, so a model that no longer runs fast is sent without fast
+      // mode for daemons that predate that rule.
+      runtimeConfig: runtimeConfigForLaunch(normalizedRuntimeConfig),
+      reasoningEffort: launchRuntimeFields.reasoningEffort,
+      executionMode: agent.executionMode,
+      envVars: launchRuntimeFields.envVars,
+      sessionId: agent.sessionId,
+      serverUrl: process.env.SERVER_URL || `http://localhost:${process.env.PORT || 3001}`,
+      authToken: "", // Current daemons ignore it: the Computer mints a runner credential per launch
+      // RFC 070 constructed wake context is always on (the
+      // `constructed_wake_context` flag was retired on 2026-10-23). Current
+      // daemons ignore this field; it is sent only for older daemons, which
+      // treat absent or false as off.
+      constructedWakeContext: true,
+      runtimeContext: {
+        agentId: agent.id,
+        serverId: agent.serverId,
+        machineId: agent.machineId,
+        machineName: machine?.name ?? null,
+        machineDescription: machine?.description ?? null,
+        machineHostname: machine?.hostname ?? null,
+        machineOs: machine?.os ?? null,
+        daemonVersion,
+        workspacePath: null,
+      },
+    };
+    const runtimeProfileControl = await agentRuntimeProfileService.getPendingRuntimeProfileControl(agent.id);
+    if (runtimeProfileControl) {
+      config.runtimeProfileControl = runtimeProfileControl;
+    }
+    // The Server's flag-derived fields, the same ones `server:features` answers.
+    Object.assign(config, await this.agentServerFeatures(agent.serverId));
+    // RFC 060: run this launch on the daemon's OAR host (capable daemons only, per-runtime flag).
+    if (await this.agentRuntimeOarRequested(agent.machineId, agent.serverId, launchRuntimeFields.runtime)) {
+      config.runtimeHost = "oar";
+    }
+
+    // task #319 — installed-app catalog rides agent:start config (server-level
+    // data, identical for all agents on this server). A catalog failure must
+    // never block or break agent start; the daemon degrades to no section.
+    try {
+      const installedApps = await oauthService.listInstalledAppPromptCatalog(agent.serverId);
+      if (installedApps.length > 0) {
+        config.installedApps = installedApps;
+      }
+    } catch (err) {
+      this.tracer.emitEvent("server.agent.installed_app_catalog_failed", {
+        surface: "server",
+        attrs: {
+          agent_id: agent.id,
+          server_id: agent.serverId,
+          error: err instanceof Error ? err.message : String(err),
+        },
+      });
+    }
+
+    // How close the workspace is to a migration's size limits, for the
+    // daemon's .raftbackupignore reminder. Not in the runtime spec, so it never
+    // restarts the agent. Like the catalog, a failure never blocks a start:
+    // the field is left out.
+    try {
+      config.migrationReadiness = await loadAgentMigrationReadiness(agent.id);
+    } catch (err) {
+      this.tracer.emitEvent("server.agent.migration_readiness_failed", {
+        surface: "server",
+        attrs: {
+          agent_id: agent.id,
+          server_id: agent.serverId,
+          error: err instanceof Error ? err.message : String(err),
+        },
+      });
+    }
+
+    // The parts of the launch the daemon's runtime spec compares but cannot
+    // see in the config (its managed MCP servers, its provider connection's
+    // key and endpoint). Like the catalog above, a failure never blocks a
+    // start: the field is left out, which the daemon reads as no change.
+    try {
+      Object.assign(config, await agentConfigRevisionInputs(agent.serverId, agent.id));
+    } catch (err) {
+      console.warn(`[Agent ${agent.id}] Config revision inputs unavailable; leaving them out:`, err instanceof Error ? err.message : err);
+    }
+    return config;
+  }
+
   private async startAgentHereUnguarded(agentId: string, options: StartAgentOptions = {}): Promise<AgentStartDispatchResult> {
     const { resumePrompt, wakeMessageTransient } = options;
     let { wakeMessage } = options;
@@ -13713,9 +15952,10 @@ export class AgentOrchestrator extends EventEmitter {
       );
     }
     // A manual stop is the one truly offline state: neither a message wake, a
-    // daemon app-inbox wake (task #1103), the start-failure retry nor the
-    // spawn-error retry sweep (task #365) may undo it; only a manual start does.
-    if ((wakeMessage || options.startCause === "app_inbox_wake" || options.startCause === "start_failure_retry" || options.startCause === "internal") && previousStatus === "stopped") {
+    // daemon app-inbox wake (task #1103), the start-failure retry, the
+    // spawn-error retry sweep (task #365) nor a `ready` owed wake (F9) may
+    // undo it; only a manual start does.
+    if ((wakeMessage || options.startCause === "app_inbox_wake" || options.startCause === "start_failure_retry" || options.startCause === "internal" || options.startCause === "ready_owed") && previousStatus === "stopped") {
       this.updateCache(agentId, { status: "stopped" });
       this.recordLifecycleEvent({
         agentId,
@@ -13726,6 +15966,43 @@ export class AgentOrchestrator extends EventEmitter {
         previousStatus,
       });
       return { outcome: "skipped", reason: "manual_stop" };
+    }
+    // Reconciler step 15 (B15): the Computer's access was revoked: no start
+    // or wake, a manual one included, can reach it. Refused before the
+    // breakers so none of this is counted as a crash or a failed start; a
+    // wake message stays in the durable inbox, as for a manual stop.
+    if (agent.machineId && await this.isMachineAccessRevoked(agent.machineId)) {
+      this.recordLifecycleEvent({
+        agentId,
+        machineId: agent.machineId,
+        action: "wake",
+        outcome: "suppressed",
+        cause: startCause,
+        previousStatus,
+        detail: "computer_access_revoked",
+      });
+      this.recordEvent("server.agent.wake.suppressed", {
+        agent_id: agentId,
+        machine_id: agent.machineId,
+        start_cause: startCause,
+        reason: "computer_access_revoked",
+      });
+      return { outcome: "skipped", reason: "computer_access_revoked" };
+    }
+    // Below the Computer version floor past its deadline: no agent runs on
+    // this machine, not even on a manual start, until it is upgraded. A wake
+    // message stays in the durable inbox, as for a manual stop.
+    if (agent.machineId && await this.isMachineAgentWorkHeld(agent.machineId)) {
+      this.recordLifecycleEvent({
+        agentId,
+        machineId: agent.machineId,
+        action: "wake",
+        outcome: "suppressed",
+        cause: startCause,
+        previousStatus,
+        detail: "computer_version_unsupported",
+      });
+      return { outcome: "skipped", reason: "computer_version_unsupported" };
     }
     // task #1119: after consecutive early exits, automatic wakes (message,
     // app-inbox, rejected-delivery conversion) are paused for the episode;
@@ -13895,6 +16172,7 @@ export class AgentOrchestrator extends EventEmitter {
       expectedLaunchId: launchGuardBeforeStart.expectedLaunchId,
       launchGuardMode: launchGuardBeforeStart.launchGuardMode,
       serverId: agent.serverId,
+      assistantOwnerUserId: agent.assistantOwnerUserId,
       name: agent.name,
       displayName: agent.displayName,
       description: agent.description,
@@ -13908,71 +16186,7 @@ export class AgentOrchestrator extends EventEmitter {
     };
     this.agentStateCache.set(agentId, state);
 
-    const machine = agent.machineId ? await this.loadRuntimeContextMachine(asMachineId(agent.machineId)) : null;
-    const daemonVersion = agent.machineId ? this.getMachineDaemonVersion(agent.machineId) : null;
-    const config: AgentConfig = {
-      name: agent.name,
-      displayName: agent.displayName,
-      description: agent.description,
-      model: launchRuntimeFields.model,
-      runtime: launchRuntimeFields.runtime,
-      runtimeConfig: normalizedRuntimeConfig,
-      reasoningEffort: launchRuntimeFields.reasoningEffort,
-      executionMode: agent.executionMode,
-      envVars: launchRuntimeFields.envVars,
-      sessionId: agent.sessionId,
-      serverUrl: process.env.SERVER_URL || `http://localhost:${process.env.PORT || 3001}`,
-      authToken: "", // Daemon will use its own API key
-      runtimeContext: {
-        agentId: agent.id,
-        serverId: agent.serverId,
-        machineId: agent.machineId,
-        machineName: machine?.name ?? null,
-        machineDescription: machine?.description ?? null,
-        machineHostname: machine?.hostname ?? null,
-        machineOs: machine?.os ?? null,
-        daemonVersion,
-        workspacePath: null,
-      },
-    };
-    const runtimeProfileControl = await agentRuntimeProfileService.getPendingRuntimeProfileControl(agentId);
-    if (runtimeProfileControl) {
-      config.runtimeProfileControl = runtimeProfileControl;
-    }
-    if (await this.constructedWakeContextEnabled(agent.serverId)) {
-      config.constructedWakeContext = true;
-    }
-    if (await this.subagentDelegationEnabled(agent.serverId)) {
-      config.subagentDelegation = true;
-    }
-    if (await this.passiveAxEnabled(agent.serverId)) {
-      config.passiveAx = true;
-    }
-    if (await this.appRolloutFlagEnabled(REMINDER_APP_FEATURE_FLAG_KEY, agent.serverId)) {
-      config.reminderApp = true;
-    }
-    if (await this.appRolloutFlagEnabled(VAULT_APP_FEATURE_FLAG_KEY, agent.serverId)) {
-      config.vaultApp = true;
-    }
-
-    // task #319 — installed-app catalog rides agent:start config (server-level
-    // data, identical for all agents on this server). A catalog failure must
-    // never block or break agent start; the daemon degrades to no section.
-    try {
-      const installedApps = await oauthService.listInstalledAppPromptCatalog(agent.serverId);
-      if (installedApps.length > 0) {
-        config.installedApps = installedApps;
-      }
-    } catch (err) {
-      this.tracer.emitEvent("server.agent.installed_app_catalog_failed", {
-        surface: "server",
-        attrs: {
-          agent_id: agentId,
-          server_id: agent.serverId,
-          error: err instanceof Error ? err.message : String(err),
-        },
-      });
-    }
+    const config = await this.buildAgentConfig(agent);
 
     // RFC 071 §4.3: whether this start goes through the terminal claim. Always
     // false while RUNTIME_OUTCOME_ACK_ENABLED is false (no store read).
@@ -13989,6 +16203,7 @@ export class AgentOrchestrator extends EventEmitter {
     // Query unread rows so resume can deterministically re-drive durable
     // messages that arrived while a manual-stopped/sessioned agent was offline.
     let unreadSummary: Record<string, number> | undefined;
+    let unreadSnapshot: UnreadSummarySnapshotTargets = new Map();
     let resumeMessages: AgentMessage[] | undefined;
     // RFC 071 §6: the obligation batch's inputs (only with `terminalObligation`).
     let obligationBatch: messageService.AgentResumeCatchupResult["obligationBatch"];
@@ -14003,7 +16218,9 @@ export class AgentOrchestrator extends EventEmitter {
     // RFC 071 §6: every start while a terminal obligation exists builds the
     // catch-up from the durable chain, even with no session, and folds a wake.
     const catchupReplacesWake = (catchupOwed || terminalObligation !== null) && wakeMessage !== undefined && !wakeMessageTransient;
-    if (agent.sessionId || catchupOwed || terminalObligation !== null) {
+    // F9: a `ready` owed wake carries no wake message; the catch-up is what it
+    // owes, so it is built with or without a session.
+    if (agent.sessionId || catchupOwed || terminalObligation !== null || options.startCause === "ready_owed") {
       const span = this.tracer.startSpan("server.agent.resume_catchup.prepare", {
         surface: "server",
         kind: "internal",
@@ -14042,8 +16259,12 @@ export class AgentOrchestrator extends EventEmitter {
           });
           const plan = await getServerPlan(agent.serverId);
           const historyCutoff = getHistoryCutoff(plan);
-          const counts = await channelService.getAgentUnreadCounts(agentId, chain);
-          if (Object.keys(counts).length > 0) unreadSummary = channelService.capAgentUnreadSummary(counts);
+          const dmRefs = await channelService.resolveAgentInboxDmRefs(agentId, chain);
+          const counts = await channelService.getAgentUnreadCounts(agentId, chain, dmRefs);
+          if (Object.keys(counts).length > 0) {
+            unreadSummary = channelService.capAgentUnreadSummary(counts);
+            unreadSnapshot = snapshotForUnreadSummary(await channelService.getAgentUnreadSummaryTargets(agentId, chain, dmRefs), unreadSummary);
+          }
           if ((!wakeMessage || catchupReplacesWake) && !resumePrompt) {
             const catchup = await messageService.getAgentResumeCatchupMessages(
               agentId,
@@ -14051,6 +16272,14 @@ export class AgentOrchestrator extends EventEmitter {
               terminalObligation ? { chain, obligation: terminalObligation } : { chain },
             );
             obligationBatch = catchup.obligationBatch;
+            // task #1221: the owed catch-up has nothing left unread (read
+            // since): it is settled, not owed to a later start.
+            if (catchupOwed && catchup.messages.length === 0) {
+              await this.wakeCrashLoopBreaker.clearCatchupOwedNothingUnread(agentId).catch((err: unknown) => {
+                console.warn(`[Agent ${agentId}] owed catch-up with nothing unread not cleared: ${err instanceof Error ? err.message : String(err)}`);
+              });
+              span.addEvent("resume_catchup.owed_settled", { outcome: "nothing_unread", reason: "nothing_unread" });
+            }
             if (catchup.messages.length > 0) {
               resumeMessages = catchup.messages;
               // The daemon ignores resumeMessages when a wake message is present,
@@ -14172,6 +16401,7 @@ export class AgentOrchestrator extends EventEmitter {
       terminalClaim = claimed;
     }
     this.armStartLaunchGuard(agentId, launchId);
+    await this.stampRuntimeErrorRecoveryLaunch(agentId, launchId);
     const startDispatchId = crypto.randomUUID();
     // task #358: a caller's own resume prompt or a wake message already gives
     // the agent something true to act on. Otherwise, if the catch-up could not
@@ -14184,6 +16414,21 @@ export class AgentOrchestrator extends EventEmitter {
     // Every such build also settles the owed conversations the read cursor
     // has passed (RFC 6 "read cursor"), even when no row is left to render.
     const rendersCatchup = Boolean(resumeMessages && resumeMessages.length > 0 && !wakeMessage && !startResumePrompt);
+    // RFC 071 F9: a daemon without DAEMON_CAPABILITY_CONTROL_START_CATCHUP_V1
+    // renders only the release notice of a start that also carries
+    // runtimeProfileControl, and drops the catch-up. When the catch-up is one
+    // the server tracks (#1221 owed, or a terminal obligation), the control is
+    // left off this start so the catch-up goes through: the notice stays
+    // pending and comes with a later start. (The OAR host of such a daemon does
+    // not even ack a notice that came with a start, so leaving it on would
+    // drop the catch-up on every start.)
+    const controlStartRendersCatchup = rendersCatchup && config.runtimeProfileControl
+      ? await this.machineDeclaresCapabilityForStart(agent.machineId, DAEMON_CAPABILITY_CONTROL_START_CATCHUP_V1)
+      : false;
+    if (rendersCatchup && config.runtimeProfileControl && !controlStartRendersCatchup && (catchupOwed || terminalObligation !== null)) {
+      delete config.runtimeProfileControl;
+      this.recordEvent("server.agent.start.runtime_profile_control_deferred", { agent_id: agentId, reason: "daemon_without_control_start_catchup" });
+    }
     const catchupBatchId = terminalClaim && terminalObligation && obligationBatch && launchId
       ? await this.recordTerminalCatchupBuild(agentId, launchId, terminalObligation, obligationBatch, rendersCatchup ? resumeMessages! : null, foldedWakeAppended)
       : null;
@@ -14200,9 +16445,14 @@ export class AgentOrchestrator extends EventEmitter {
         resume_prompt_source: resumePrompt ? "caller" : startResumePrompt ? "catchup_unverified" : "none",
       },
     });
+    // App events in the wake and resume messages as the pull paths hand them over (agentFacingContent.ts).
+    if (wakeMessage) [wakeMessage] = await renderPushedMessages([wakeMessage], agentId, agent.serverId);
+    if (resumeMessages) resumeMessages = await renderPushedMessages(resumeMessages, agentId, agent.serverId);
     const startFields = {
       agentId,
       config,
+      // Reconciler step 11b: the revision this config was read at (an `agent:config` at or below it is stale).
+      ...(typeof agent.configRevision === "number" ? { configRevision: agent.configRevision } : {}),
       wakeMessage,
       wakeMessageTransient: wakeMessage ? wakeMessageTransient : undefined,
       ...(resumeMessages ? { resumeMessages } : {}),
@@ -14229,6 +16479,8 @@ export class AgentOrchestrator extends EventEmitter {
         : terminalClaim && terminalControl === "automatic" ? this.claimTimeConnectionEpoch(agent.machineId) : {}),
     };
     const startMessage: ServerToMachineMessage = { type: "agent:start", ...startFields };
+    // Replaces what the previous launch left; settled only by this launch's first completed turn.
+    this.turnEndUnreadSnapshots.record(agentId, launchId ?? undefined, unreadSnapshot);
     // task #1119: record the start BEFORE the dispatch leaves this replica, so
     // an exit that becomes visible while the send is still in flight already
     // has its start on record (review counterexample: a fast crash landed at
@@ -14255,7 +16507,12 @@ export class AgentOrchestrator extends EventEmitter {
         // task #1221: only a start that actually carries the owed catch-up
         // (resumeMessages the daemon will use: no wake message, no resume
         // prompt) can clear it, and only once its runtime reports active.
-        if (catchupOwed && launchId && resumeMessages && resumeMessages.length > 0 && !wakeMessage && !resumePrompt) {
+        // RFC 071 F9: a control start carries it only on a daemon that renders
+        // both (the control was taken off this start otherwise, above).
+        if (
+          catchupOwed && launchId && resumeMessages && resumeMessages.length > 0 && !wakeMessage && !resumePrompt
+          && (!config.runtimeProfileControl || controlStartRendersCatchup)
+        ) {
           await this.wakeCrashLoopBreaker.markCatchupCarried(agentId, launchId);
         }
         if (options.requireQueueReceipt) {
@@ -14287,6 +16544,17 @@ export class AgentOrchestrator extends EventEmitter {
         }
         // RFC 071 §9: a dispatched start ends any shown block; the next one is shown again.
         this.projectedTerminalBlocks.delete(agentId);
+        // A person's start (Retry, restart) lifted a wake block, e.g. one for
+        // a rejected credential (reconciler step 4b trace). Only once the
+        // start left: a failed send rolls the block back.
+        if (humanStart && wakeCrashLoopStartRecord?.previous.blocked) {
+          this.recordEvent("wake.block_lifted", {
+            cause: "human_start",
+            source: "server_retry",
+            release_cause: "human_start",
+            lifted_reason: wakeCrashLoopStartRecord.previous.needsActionReason ?? null,
+          });
+        }
         if (terminalControl === "human_start") {
           // RFC 071 outbox: a human start is the daemon's only way out of
           // unreliable outcome storage; its next `ready` lists the agent again
@@ -14346,9 +16614,7 @@ export class AgentOrchestrator extends EventEmitter {
     this.advanceActivityIngestEpoch(agentId);
 
     // Init inbox
-    if (!this.agentInboxes.has(agentId)) {
-      this.agentInboxes.set(agentId, { inbox: [], pendingReceive: null });
-    }
+    this.localInboxes.ensure(agentId);
 
     // TODO(lifecycle-v2/server-producer): manual/lazy/resume start is
     // server-owned. Construct the canonical runtime_spawned event at the start
@@ -14429,10 +16695,20 @@ export class AgentOrchestrator extends EventEmitter {
   async stopAgent(
     agentId: string,
     reason: StopAgentReason = "manual",
-    options: { withinReset?: boolean } = {},
+    options: {
+      withinReset?: boolean;
+      /**
+       * What the daemon is told (`agent:stop` `reason`): `owner_stop` from a
+       * person's Stop (the agent's Stop, the channel's stop-all, an assistant
+       * pause), `deleted` from the stop before an agent or account delete.
+       * Absent: no reason (a lifecycle stop; `raft proc` jobs keep running).
+       */
+      daemonReason?: AgentStopReason;
+    } = {},
   ): Promise<AgentStopResult> {
-    if (this.mayRunOnOwner(agentId) && await this.runOnOwner(agentId, { kind: "stop", reason })) return { delivered: true };
-    const result = await this.stopAgentHere(agentId, reason);
+    const { daemonReason } = options;
+    if (this.mayRunOnOwner(agentId) && await this.runOnOwner(agentId, { kind: "stop", reason, ...(daemonReason ? { daemonReason } : {}) })) return { delivered: true };
+    const result = await this.stopAgentHere(agentId, reason, daemonReason);
     if (result.delivered) return result;
     // No replica holds the machine socket, so the daemon was not told.
     if (reason === "manual") {
@@ -14457,9 +16733,27 @@ export class AgentOrchestrator extends EventEmitter {
     throw new RouteFailureError("daemon_offline", `Agent ${agentId} stop could not reach its Computer`);
   }
 
-  protected async stopAgentHere(agentId: string, reason: StopAgentReason = "manual"): Promise<AgentStopResult> {
+  protected async stopAgentHere(
+    agentId: string,
+    reason: StopAgentReason = "manual",
+    daemonReason?: AgentStopReason,
+  ): Promise<AgentStopResult> {
+    // Agent typing line: a stopped (or about-to-be-deleted) agent is not typing.
+    this.agentTyping.endForAgent(agentId);
     // task #1119: an operator stop is intent, not a crash; forget the streak.
-    if (reason === "manual") await this.wakeCrashLoopBreaker.recordManualStop(agentId);
+    // It also lifts a block (a person's "try again", e.g. Retry on a rejected
+    // credential): reconciler step 4b traces that lift.
+    if (reason === "manual") {
+      const { liftedBlock } = await this.wakeCrashLoopBreaker.recordManualStop(agentId);
+      if (liftedBlock) {
+        this.recordEvent("wake.block_lifted", {
+          cause: "manual_stop",
+          source: "server_retry",
+          release_cause: "explicit_stop",
+          lifted_reason: liftedBlock.reason,
+        });
+      }
+    }
     // RFC 071 §5: not E3. A probe in flight is cleared (half_open → open, step unchanged).
     if (reason === "manual" && this.runtimeOutcomeAckEnabled) {
       await this.terminalFailureBreaker.recordManualStop(agentId, this.clock.now()).catch((error: unknown) => {
@@ -14476,6 +16770,7 @@ export class AgentOrchestrator extends EventEmitter {
       serverId: agent.serverId,
       machineId: agent.machineId,
       reason,
+      ...(daemonReason ? { daemonReason } : {}),
       previousStatus,
       nextStatus,
     };
@@ -14536,11 +16831,17 @@ export class AgentOrchestrator extends EventEmitter {
               runtimeState: "not_running",
             }),
           }),
-          this.lifecycleProjectionWriterDeps(),
+          this.lifecycleProjectionWriterDeps(context.daemonReason ? { stopReason: context.daemonReason } : {}),
           span,
         );
         if (context.reason === "manual") {
-          await this.clearLastRuntimeError(context.agentId);
+          // task #1351: a Stop does not top up a provider balance, so a stored
+          // BillingError (and its banner) stays; every other error clears. The
+          // database decides, not this replica's cache.
+          const cleared = await this.clearLastRuntimeError(context.agentId);
+          if (!cleared && this.agentStateCache.get(context.agentId)?.lastRuntimeError?.errorClass === "BillingError") {
+            this.recordEvent("runtime_error_state.preserved", { reason: "billing_manual_stop", detail_kind: "manual_stop" });
+          }
         }
         if (context.reason === "internal") {
           const nextIngestEpoch = this.advanceActivityIngestEpoch(context.agentId);
@@ -14607,6 +16908,109 @@ export class AgentOrchestrator extends EventEmitter {
     await this.resetAgentHere(agentId, mode, options);
   }
 
+  /**
+   * Reconciler step 11b: send the agent's current config to the daemon that
+   * runs it, which restarts the agent on it once idle. Runs on the replica
+   * that holds the machine's socket (only the intent's kind crosses replicas).
+   * `not_pushed`: nothing was sent (the daemon lacks
+   * `DAEMON_CAPABILITY_AGENT_CONFIG_PUSH`, the agent is not running there, the
+   * machine is not connected, or the owner replica is an older build), and
+   * the caller applies its own fallback. Never throws: the change it follows
+   * has already committed.
+   */
+  async applyAgentConfig(agentId: string): Promise<AgentConfigApplyOutcome> {
+    try {
+      if (this.mayRunOnOwner(agentId)) {
+        const routed = await this.runOnOwner(agentId, { kind: "config" });
+        if (routed) return routed.outcome === "config" && routed.pushed ? "pushed" : "not_pushed";
+      }
+      return await this.applyAgentConfigHere(agentId);
+    } catch (error) {
+      const unanswered = error instanceof StartIntentRemoteError && error.failure.name === START_INTENT_UNANSWERED;
+      this.recordEvent("server.agent.config_push", {
+        agent_id: agentId,
+        outcome: "not_pushed",
+        reason: unanswered ? "owner_without_config_intent" : "route_failed",
+        error_class: errorClassOf(error),
+      });
+      return "not_pushed";
+    }
+  }
+
+  protected async applyAgentConfigHere(agentId: string): Promise<AgentConfigApplyOutcome> {
+    const notPushed = (reason: string): AgentConfigApplyOutcome => {
+      this.recordEvent("server.agent.config_push", { agent_id: agentId, outcome: "not_pushed", reason });
+      return "not_pushed";
+    };
+    const agent = await this.loadAgentForStart(agentId);
+    const machineId = agent?.machineId;
+    if (!agent || !machineId) return notPushed("no_machine");
+    if (!this.machineConnections.has(machineId)) return notPushed("machine_not_local");
+    if (!this.hasMachineCapability(machineId, DAEMON_CAPABILITY_AGENT_CONFIG_PUSH)) return notPushed("daemon_without_capability");
+    // `active`: the agent runs, or is being started, on that machine (a
+    // process exit or a stop persists `inactive`/`stopped`). A config change
+    // for an agent that does not run reaches it with its next start.
+    if (agent.status !== "active") return notPushed("agent_not_running");
+    const frame: ServerToMachineMessage = {
+      type: "agent:config",
+      agentId,
+      config: await this.buildAgentConfig(agent),
+      revision: agent.configRevision,
+    };
+    if (!this.sendAgentConfigLocally(machineId, frame)) return notPushed("send_failed");
+    this.recordEvent("server.agent.config_push", {
+      agent_id: agentId,
+      machine_id: machineId,
+      outcome: "pushed",
+      revision: agent.configRevision,
+    });
+    return "pushed";
+  }
+
+  /**
+   * Reconciler step 11d: after a `ready`, send the config again to each
+   * running agent whose daemon applied an older revision than the database's
+   * (the push was lost: the socket dropped with it in flight, or the daemon
+   * was not connected). The daemon reports the highest revision it applied,
+   * also when an older start kept a newer pushed config (11a's stale start),
+   * so this never re-sends a config the daemon chose to keep. Bounded to one
+   * re-send per agent and revision per connection: a daemon reporting the
+   * older revision again (a second `ready`, or a push it did not apply) is
+   * not sent it again until it reconnects. Agents the daemon reports no
+   * revision for (older daemons, a revision it does not know) are not
+   * compared; `applyAgentConfig` checks the capability and the agent's status.
+   */
+  private async resendLostAgentConfigs(
+    conn: MachineConnection,
+    machineAgents: ReadonlyArray<{ id: string; configRevision: number }>,
+    runningSet: ReadonlySet<string>,
+    applied: ReadonlyMap<string, number>,
+  ): Promise<void> {
+    if (applied.size === 0) return;
+    const resent = conn.configResentRevisions ??= new Map();
+    for (const agent of machineAgents) {
+      const appliedRevision = applied.get(agent.id);
+      if (appliedRevision === undefined || !runningSet.has(agent.id)) continue;
+      if (appliedRevision >= agent.configRevision) continue;
+      // Claimed before the await: two readies handled concurrently re-send once.
+      if ((resent.get(agent.id) ?? -Infinity) >= agent.configRevision) {
+        this.recordEvent("server.agent.config_resend", { agent_id: agent.id, outcome: "skipped", reason: "already_resent", revision: agent.configRevision, applied_revision: appliedRevision });
+        continue;
+      }
+      resent.set(agent.id, agent.configRevision);
+      const outcome = await this.applyAgentConfig(agent.id);
+      this.recordEvent("server.agent.config_resend", { agent_id: agent.id, outcome, revision: agent.configRevision, applied_revision: appliedRevision });
+    }
+  }
+
+  /** Local socket only: an `agent:config` never crosses Redis (its env vars may hold secrets). */
+  protected sendAgentConfigLocally(machineId: string, frame: ServerToMachineMessage): boolean {
+    const conn = this.machineConnections.get(machineId);
+    if (!conn || conn.ws.readyState !== 1) return false;
+    conn.ws.send(JSON.stringify(frame));
+    return true;
+  }
+
   protected async resetAgentHere(
     agentId: string,
     mode: "restart" | "session" | "full",
@@ -14639,6 +17043,7 @@ export class AgentOrchestrator extends EventEmitter {
       const context: ResetApplyContext = {
         agentId,
         serverId: agentBefore?.serverId ?? null,
+        assistantOwnerUserId: agentBefore?.assistantOwnerUserId ?? null,
         mode,
         previousStatus,
         machineId: agentBefore?.machineId ?? null,
@@ -14672,7 +17077,7 @@ export class AgentOrchestrator extends EventEmitter {
       await this.resetPersistedAgentSession(context.agentId, resetStatus);
       this.updateCache(context.agentId, { sessionId: null, status: resetStatus });
       if (context.serverId) {
-        this.broadcastAgentSession(context.serverId, context.agentId, null);
+        this.broadcastAgentSession({ id: context.agentId, serverId: context.serverId, assistantOwnerUserId: context.assistantOwnerUserId }, null);
       }
       this.clearLaunchGuard(context.agentId);
       this.advanceActivityIngestEpoch(context.agentId);
@@ -14821,6 +17226,401 @@ export class AgentOrchestrator extends EventEmitter {
    * budget). The command carries no credential; the daemon materializes with
    * its own machine auth.
    */
+  /**
+   * task #17: forwards a login's event or result to the person who started
+   * it, on their own sockets only (the user room spans replicas through the
+   * Socket.IO adapter). A login this Computer does not own is dropped.
+   */
+  private async relayRuntimeAuthLogin(
+    machineId: string,
+    msg: Extract<MachineToServerMessage, { type: "machine:runtime_auth:login:event" | "machine:runtime_auth:login:result" }>,
+  ): Promise<void> {
+    const loginId = typeof msg.loginId === "string" ? asRuntimeAuthLoginId(msg.loginId) : null;
+    const session = loginId ? await runtimeAuthService.getSession(loginId) : null;
+    if (!loginId || !session || session.machineId !== machineId) {
+      addTraceEvent("runtime_auth.login.relay_dropped", { machine_id: machineId, type: msg.type, reason: session ? "other_machine" : "unknown_login" });
+      return;
+    }
+    const room = `user:${session.requesterUserId}`;
+    if (msg.type === "machine:runtime_auth:login:event") {
+      const event = runtimeAuthLoginEventSchema.safeParse(msg.event);
+      if (!event.success) return;
+      const push: RuntimeAuthLoginEventPush & { serverId: string } = { serverId: session.serverId, machineId, runtime: session.runtime, loginId, event: event.data };
+      this.io?.to(room).emit("runtime_auth:login:event", push);
+      addTraceEvent("runtime_auth.login.event", { machine_id: machineId, runtime: session.runtime, kind: event.data.kind });
+      return;
+    }
+    const result = runtimeAuthLoginResultSchema.safeParse(msg.result);
+    const checked = result.success ? result.data : { kind: "failed" as const, reason: "process_failed" as const };
+    await runtimeAuthService.endLogin(session);
+    if (checked.kind === "logged_in") await this.liftRuntimeCredentialBlocks(machineId, session.runtime, "login");
+    const push: RuntimeAuthLoginResultPush & { serverId: string } = { serverId: session.serverId, machineId, runtime: session.runtime, loginId, result: checked };
+    this.io?.to(room).emit("runtime_auth:login:result", push);
+    addTraceEvent("runtime_auth.login.result", {
+      machine_id: machineId,
+      runtime: session.runtime,
+      user_id: session.requesterUserId,
+      outcome: checked.kind,
+      ...("reason" in checked ? { reason: checked.reason } : {}),
+      duration_ms: this.clock.now() - session.startedAtMs,
+    });
+  }
+
+  private async endRuntimeAuthLoginsForMachine(machineId: string, connectionEpochId: string | null): Promise<void> {
+    try {
+      for (const runtime of RUNTIME_AUTH_RUNTIMES) {
+        const session = await runtimeAuthService.getActiveSession(machineId, runtime);
+        if (!session || session.machineId !== machineId) continue;
+        // Only the logins this very connection ran. When either side has no
+        // connection id it cannot be told apart from a newer connection's, so
+        // it is left to its TTL rather than ended by a late disconnect.
+        if (!session.connectionEpochId || !connectionEpochId || session.connectionEpochId !== connectionEpochId) continue;
+        await runtimeAuthService.endLogin(session);
+        const push: RuntimeAuthLoginResultPush & { serverId: string } = { serverId: session.serverId, machineId, runtime, loginId: session.loginId, result: { kind: "cancelled" } };
+        this.io?.to(`user:${session.requesterUserId}`).emit("runtime_auth:login:result", push);
+        addTraceEvent("runtime_auth.login.result", { machine_id: machineId, runtime, user_id: session.requesterUserId, outcome: "cancelled", reason: "computer_disconnected" });
+      }
+    } catch (err) {
+      console.warn(`[RuntimeAuth ${machineId}] Failed to end logins on disconnect:`, errorClassOf(err));
+    }
+  }
+
+  /**
+   * task #17: whether this Computer can take a web login or logout now, the
+   * runtimes its daemon signs in (Kimi and Qoder only from one with
+   * DAEMON_CAPABILITY_RUNTIME_AUTH_V2), and the connection that would run it
+   * (a login is bound to it, so a late disconnect of an older connection
+   * cannot end a newer one's login). `logoutRuntimes`: those it also signs
+   * out (Antigravity only from one with
+   * DAEMON_CAPABILITY_RUNTIME_AUTH_ANTIGRAVITY_LOGOUT).
+   */
+  async runtimeAuthAvailability(machineId: string): Promise<
+    | { state: "ok"; connectionEpochId: string | null; runtimes: readonly RuntimeAuthRuntime[]; logoutRuntimes: readonly RuntimeAuthRuntime[] }
+    | { state: "computer_offline" | "computer_upgrade_required" }
+  > {
+    const fact = await this.readProbeCarrierFact(machineId);
+    if (!fact) return { state: "computer_offline" };
+    const runtimes = runtimeAuthRuntimesOfComputer(fact.capabilities);
+    if (runtimes.length === 0) return { state: "computer_upgrade_required" };
+    return { state: "ok", connectionEpochId: fact.connectionEpochId ?? null, runtimes, logoutRuntimes: runtimeAuthLogoutRuntimesOfComputer(fact.capabilities) };
+  }
+
+  /** task #17: a login start, code or cancel; rejects with RouteFailureError daemon_offline when the Computer cannot be reached. */
+  async sendRuntimeAuthCommand(machineId: string, message: Extract<ServerToMachineMessage, { type: "machine:runtime_auth:login:start" | "machine:runtime_auth:login:code" | "machine:runtime_auth:login:cancel" }>): Promise<void> {
+    await this.sendRequiredToMachine(machineId, message);
+  }
+
+  /**
+   * task #17: logs a runtime out on the Computer and returns OAR's answer.
+   * `providerId`: the one provider to sign out, for a runtime that signs in
+   * per provider (Pi); checked by the caller (`runtimeAuthProviderIdFits`).
+   */
+  async logoutRuntime(machineId: string, runtime: RuntimeAuthRuntime, providerId?: string): Promise<RuntimeAuthLogoutResult> {
+    const requestId = crypto.randomUUID();
+    const response = await this.getMachineResponseRelay().request({
+      requestId, machineId, type: "machine:runtime_auth:logout:result",
+    }, RUNTIME_AUTH_LOGOUT_RELAY_BUDGET_MS, () => this.sendRequiredToMachine(machineId, {
+      type: "machine:runtime_auth:logout",
+      requestId,
+      runtime,
+      ...(providerId ? { providerId } : {}),
+    }), (event, attrs) => this.recordMachineResponseRelay(event, attrs));
+    if (response.type !== "machine:runtime_auth:logout:result") throw new Error("Unexpected logout response");
+    return response.result;
+  }
+
+  /**
+   * Whether this Computer's daemon reads the provider's usage
+   * (`runtimeAccountUsageReadableWith`): `unknown` while it is offline (the
+   * cache answers then).
+   */
+  async runtimeAccountUsageReadable(machineId: string, provider: RuntimeAccountUsageProvider): Promise<"readable" | "unsupported" | "unknown"> {
+    if (runtimeAccountUsageReadableWith(provider, [])) return "readable";
+    const fact = await this.readProbeCarrierFact(machineId);
+    if (!fact) return "unknown";
+    return runtimeAccountUsageReadableWith(provider, fact.capabilities) ? "readable" : "unsupported";
+  }
+
+  /** Whether this Computer is online and its daemon spends limit resets (DAEMON_CAPABILITY_RUNTIME_LIMIT_RESET). */
+  async runtimeLimitResetAvailability(machineId: string): Promise<"ok" | "computer_offline" | "computer_upgrade_required"> {
+    const fact = await this.readProbeCarrierFact(machineId);
+    if (!fact) return "computer_offline";
+    return fact.capabilities.includes(DAEMON_CAPABILITY_RUNTIME_LIMIT_RESET) ? "ok" : "computer_upgrade_required";
+  }
+
+  /**
+   * Whether this Computer is online and its daemon answers Claude limit
+   * resets by kind (DAEMON_CAPABILITY_RUNTIME_LIMIT_RESET_CLAUDE_KINDS: a
+   * Computer on Linux; one before OAR 0.102 also only with a tested Claude
+   * Code).
+   */
+  async claudeLimitResetAvailability(machineId: string): Promise<"ok" | "computer_offline" | "computer_upgrade_required"> {
+    const fact = await this.readProbeCarrierFact(machineId);
+    if (!fact) return "computer_offline";
+    return fact.capabilities.includes(DAEMON_CAPABILITY_RUNTIME_LIMIT_RESET_CLAUDE_KINDS) ? "ok" : "computer_upgrade_required";
+  }
+
+  /**
+   * Spends one of the provider account's limit resets on the Computer, with
+   * the idempotency key as the person's click minted it, and returns the
+   * Computer's outcome and the usage it read right after (already written to
+   * the cache by the inbound switch). Rejects with RouteFailureError
+   * daemon_offline / daemon_timeout; after a timeout it is not known whether
+   * a reset was spent, so the caller retries with the same key. `kind`: the
+   * one Claude reset the person chose (only to a Computer with
+   * DAEMON_CAPABILITY_RUNTIME_LIMIT_RESET_CLAUDE_KINDS); Claude Code takes
+   * longer, so it has its own relay budget.
+   */
+  async redeemRuntimeLimitReset(
+    machineId: string,
+    provider: RuntimeAccountUsageProvider,
+    idempotencyKey: RuntimeLimitResetIdempotencyKey,
+    kind?: RuntimeLimitResetKind,
+  ): Promise<Extract<MachineToServerMessage, { type: "machine:runtime_account_usage:limit_reset:result" }>> {
+    const requestId = crypto.randomUUID();
+    const response = await this.getMachineResponseRelay().request({
+      requestId, machineId, type: "machine:runtime_account_usage:limit_reset:result",
+    }, kind ? RUNTIME_LIMIT_RESET_CLAUDE_RELAY_BUDGET_MS : RUNTIME_LIMIT_RESET_RELAY_BUDGET_MS, () => this.sendRequiredToMachine(machineId, {
+      type: "machine:runtime_account_usage:limit_reset:redeem",
+      requestId,
+      provider,
+      idempotencyKey,
+      ...(kind ? { kind } : {}),
+    }), (event, attrs) => this.recordMachineResponseRelay(event, attrs));
+    if (response.type !== "machine:runtime_account_usage:limit_reset:result") throw new Error("Unexpected limit reset response");
+    return response;
+  }
+
+  /**
+   * Reads which limit resets the provider account holds on the Computer
+   * (Claude: its daemon opens Claude Code's command for each kind and
+   * cancels it). Only on a person's click. `atFiveHourLimit` is what the
+   * cached usage says (anything but a clear "not at the limit" is `true`);
+   * the Computer refuses a read there unless `atFiveHourLimitConsent`.
+   * Rejects with RouteFailureError daemon_offline / daemon_timeout.
+   */
+  async readRuntimeLimitResets(
+    machineId: string,
+    provider: RuntimeAccountUsageProvider,
+    input: { atFiveHourLimit: boolean; atFiveHourLimitConsent: boolean; includeFiveHour: boolean },
+  ): Promise<Extract<MachineToServerMessage, { type: "machine:runtime_account_usage:limit_resets:read:result" }>> {
+    const requestId = crypto.randomUUID();
+    const response = await this.getMachineResponseRelay().request({
+      requestId, machineId, type: "machine:runtime_account_usage:limit_resets:read:result",
+    }, RUNTIME_LIMIT_RESET_CLAUDE_RELAY_BUDGET_MS, () => this.sendRequiredToMachine(machineId, {
+      type: "machine:runtime_account_usage:limit_resets:read",
+      requestId,
+      provider,
+      atFiveHourLimit: input.atFiveHourLimit,
+      ...(input.atFiveHourLimitConsent ? { atFiveHourLimitConsent: true } : {}),
+      ...(input.includeFiveHour ? { includeFiveHour: true } : {}),
+    }), (event, attrs) => this.recordMachineResponseRelay(event, attrs));
+    if (response.type !== "machine:runtime_account_usage:limit_resets:read:result") throw new Error("Unexpected limit resets read response");
+    return response;
+  }
+
+  /**
+   * A sealed provider connect this replica could not open: nothing is sent to
+   * the Computer. One that cannot be opened at all (sent in the clear,
+   * changed, sealed with another secret) is answered at once as
+   * `relay_failed`, so the person is told instead of waiting out the relay
+   * budget. An expired or replayed copy is not answered: the person who
+   * sent it is no longer waiting, or the first copy is already on its way.
+   */
+  private refuseSealedConnect(machineId: string, reason: ReplicaHopRefusal, requestId: string | null): void {
+    addTraceEvent("runtime_auth.connect_provider.hop_refused", { machine_id: machineId, reason });
+    if (!requestId || reason === "expired" || reason === "replayed") return;
+    void this.getMachineResponseRelay().forward(machineId, {
+      type: "machine:runtime_auth:connect_provider:result",
+      requestId,
+      result: { kind: "failed", reason: "relay_failed" },
+    }, (event, attrs) => this.recordMachineResponseRelay(event, attrs));
+  }
+
+  /**
+   * The model providers a runtime with `connect_provider` (Qwen Code) offers
+   * on the Computer, read there for the person choosing one. Typed failures
+   * as for a logout: daemon_offline, daemon_timeout.
+   */
+  async listRuntimeProviders(machineId: string, runtime: RuntimeAuthRuntime): Promise<RuntimeAuthProvidersResult> {
+    if (!runtimeAuthSupports(runtime, "connect_provider")) throw new Error(`${runtime} has no provider connect`);
+    const requestId = crypto.randomUUID();
+    const response = await this.getMachineResponseRelay().request({
+      requestId, machineId, type: "machine:runtime_auth:providers:result",
+    }, RUNTIME_AUTH_PROVIDER_RELAY_BUDGET_MS, () => this.sendRequiredToMachine(machineId, {
+      type: "machine:runtime_auth:providers",
+      requestId,
+      runtime,
+    }), (event, attrs) => this.recordMachineResponseRelay(event, attrs));
+    if (response.type !== "machine:runtime_auth:providers:result") throw new Error("Unexpected providers response");
+    const parsed = runtimeAuthProvidersResultSchema.safeParse(response.result);
+    return parsed.success ? parsed.data : { kind: "failed", reason: "invalid_response" };
+  }
+
+  /**
+   * Saves a provider's API key in the runtime's settings on the Computer.
+   * The key is sent once, in this one command over the Computer's socket
+   * (sealed if it crosses replicas), and kept nowhere: not in the reply
+   * record, not in a trace, not in a log. The reply carries the outcome only.
+   */
+  async connectRuntimeProvider(machineId: string, runtime: RuntimeAuthRuntime, input: RuntimeAuthProviderConnectInput): Promise<RuntimeAuthProviderConnectResult> {
+    if (!runtimeAuthSupports(runtime, "connect_provider")) throw new Error(`${runtime} has no provider connect`);
+    const requestId = crypto.randomUUID();
+    const response = await this.getMachineResponseRelay().request({
+      requestId, machineId, type: "machine:runtime_auth:connect_provider:result",
+    }, RUNTIME_AUTH_PROVIDER_RELAY_BUDGET_MS, () => this.sendRequiredToMachine(machineId, {
+      type: "machine:runtime_auth:connect_provider",
+      requestId,
+      runtime,
+      ...input,
+    }), (event, attrs) => this.recordMachineResponseRelay(event, attrs));
+    if (response.type !== "machine:runtime_auth:connect_provider:result") throw new Error("Unexpected connect response");
+    const parsed = runtimeAuthProviderConnectResultSchema.safeParse(response.result);
+    const result: RuntimeAuthProviderConnectResult = parsed.success ? parsed.data : { kind: "failed", reason: "invalid_response" };
+    if (result.kind === "connected") await this.liftRuntimeCredentialBlocks(machineId, runtime, "connect_provider");
+    return result;
+  }
+
+  /**
+   * #proj-raft-computer:#68: store the Computer's readiness report unless an
+   * older one (`seq` not above the stored), tell every viewer of the
+   * Computer and its agents to re-read (content-free: each read is trimmed
+   * for its viewer), and tell the owner once about each blocked fact that
+   * just appeared, one notice listing the agents it holds, at most once a day
+   * per login and code (readinessFactsToNotify), claimed in the store's
+   * transaction so racing reports tell once; a claim nobody was told about
+   * is given back. Best effort.
+   */
+  private async ingestRuntimeReadiness(machineId: string, serverId: string, msg: unknown): Promise<void> {
+    const report = parseRuntimeReadinessReport(msg);
+    if (!report) return;
+    try {
+      const receivedAtMs = this.clock.now();
+      const stored = await storeRuntimeReadinessReport(machineId, report, new Date(receivedAtMs));
+      if (!stored) return;
+      this.io?.to(`server:${serverId}`).emit("machine:updated", { serverId, machineId });
+      const agents = await this.loadAgentsForReadyReconcile(machineId);
+      for (const room of new Set(agents.map((agent) => agentEventRoom(agent.serverId, agent.assistantOwnerUserId)))) {
+        this.io?.to(room).emit("agent:updated", { machineId });
+      }
+      const fresh = stored.toNotify;
+      if (fresh.length === 0) return;
+      const told: string[] = [];
+      if (!this.io) {
+        await releaseReadinessNotices(machineId, fresh.map((fact) => readinessNoticeKey(fact)!), receivedAtMs);
+        return;
+      }
+      const machine = await machineService.getMachine(asMachineId(machineId));
+      const candidates = agents.map((agent) => ({ ...agent, ownerUserId: agent.creatorType === "user" ? agent.creatorId : null }));
+      for (const fact of fresh) {
+        const plan = readinessNoticePlan(fact, candidates, machine?.ownerUserId ?? machine?.userId ?? null);
+        if (!plan || fact.resource.kind !== "login") continue;
+        const machineLogin = fact.resource.key.startsWith("shared:");
+        const runtime = machineLogin ? fact.resource.key.slice("shared:".length) : candidates.find((agent) => agent.id === plan.agents[0]!.id)?.runtime ?? "claude";
+        const agentNames = plan.agents.map((agent) => agent.name);
+        // One notice, in the DM with the first affected agent that has one with the recipient.
+        for (const agent of plan.agents) {
+          const posted = await postAgentActionRequiredNotice(this.io, this, {
+            agentId: agent.id,
+            ownerUserId: plan.recipientUserId,
+            notice: { kind: "readiness_blocked", code: fact.code, runtime, computerName: machine?.name ?? "", machineLogin, agentNames },
+          }).catch(() => false);
+          if (posted) {
+            told.push(readinessNoticeKey(fact)!);
+            break;
+          }
+        }
+      }
+      const untold = fresh.map((fact) => readinessNoticeKey(fact)!).filter((key) => !told.includes(key));
+      await releaseReadinessNotices(machineId, untold, receivedAtMs);
+    } catch (error) {
+      console.warn(`[Machine ${machineId}] Runtime readiness report failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  /**
+   * #proj-raft-computer:#46 stop-gap: a web login or provider connect for
+   * `runtime` succeeded on this Computer. Agents there on that runtime's
+   * machine-shared credentials (`sharedCredentialsAuthRuntime`: not one with
+   * its own credential home in its env vars or its own provider) were paused
+   * only because the old sign-in was rejected or missing: they wake normally
+   * again, as after a runtime config change, but only that block is lifted.
+   * Nothing is started here. The daemon clears its own side
+   * (AgentProcessManager.noteRuntimeCredentialsChanged). Best effort.
+   * `disk` (reconciler step 15, the daemon's
+   * `machine:runtime_credentials:changed`): a sign-in in a terminal, which
+   * lifts the sign-in pauses only (`liftForCredentialsChange` scope `sign_in`).
+   */
+  private async liftRuntimeCredentialBlocks(machineId: string, runtime: RuntimeAuthRuntime, reason: "login" | "connect_provider" | "disk"): Promise<void> {
+    try {
+      for (const agent of await this.loadAgentsForReadyReconcile(machineId)) {
+        if (sharedCredentialsAuthRuntime(agent) !== runtime) continue;
+        if (await this.wakeCrashLoopBreaker.liftForCredentialsChange(agent.id, reason === "disk" ? "sign_in" : "credentials_change")) {
+          this.recordEvent("wake.block_lifted", {
+            cause: "runtime_credentials_changed",
+            source: "credentials_change",
+            release_cause: "credentials_changed",
+            runtime,
+            credentials_change: reason,
+          });
+        }
+      }
+    } catch (error) {
+      console.warn(`[Machine ${machineId}] Lifting sign-in pauses after a ${reason} failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  /**
+   * task #25 step 2: a person stops the agent's current turn; the agent keeps
+   * running. Works from any replica: the computer's capability comes from the
+   * cross-replica carrier fact and the daemon's answer through the response
+   * relay. A computer whose daemon predates the command is told apart, so the
+   * person can be asked to upgrade it instead of waiting for a timeout.
+   */
+  async interruptAgentTurn(agentId: string, machineId: string | null): Promise<AgentTurnInterruptRequestResult> {
+    if (!machineId) return { outcome: "not_running" };
+    const fact = await this.readProbeCarrierFact(machineId);
+    if (!fact) return { outcome: "computer_offline" };
+    if (!fact.capabilities.includes(DAEMON_CAPABILITY_INTERRUPT_TURN)) return { outcome: "computer_upgrade_required" };
+    const requestId = crypto.randomUUID();
+    const response = await this.getMachineResponseRelay().request({
+      requestId, machineId, type: "agent:interrupt-turn:result", agentId,
+    }, INTERRUPT_TURN_RELAY_BUDGET_MS, () => this.sendRequiredToMachine(machineId, {
+      type: "agent:interrupt-turn",
+      agentId,
+      requestId,
+    }), (event, attrs) => this.recordMachineResponseRelay(event, attrs));
+    if (response.type !== "agent:interrupt-turn:result") throw new Error("Unexpected interrupt-turn response");
+    return {
+      outcome: response.outcome,
+      ...(typeof response.toolName === "string" ? { toolName: response.toolName } : {}),
+      ...(typeof response.stuckForMs === "number" ? { stuckForMs: response.stuckForMs } : {}),
+    };
+  }
+
+  /**
+   * #proj-runtime:#41: a person stops one of the agent's running sub-agents;
+   * the agent and its other sub-agents keep running. Same carrier and relay
+   * as interruptAgentTurn.
+   */
+  async interruptAgentSubagent(agentId: string, machineId: string | null, subagentTaskId: string): Promise<AgentSubagentInterruptRequestResult> {
+    if (!machineId) return { outcome: "not_running" };
+    const fact = await this.readProbeCarrierFact(machineId);
+    if (!fact) return { outcome: "computer_offline" };
+    if (!fact.capabilities.includes(DAEMON_CAPABILITY_INTERRUPT_SUBAGENT)) return { outcome: "computer_upgrade_required" };
+    const requestId = crypto.randomUUID();
+    const response = await this.getMachineResponseRelay().request({
+      requestId, machineId, type: "agent:interrupt-subagent:result", agentId,
+    }, INTERRUPT_TURN_RELAY_BUDGET_MS, () => this.sendRequiredToMachine(machineId, {
+      type: "agent:interrupt-subagent",
+      agentId,
+      requestId,
+      subagentTaskId,
+    }), (event, attrs) => this.recordMachineResponseRelay(event, attrs));
+    if (response.type !== "agent:interrupt-subagent:result") throw new Error("Unexpected interrupt-subagent response");
+    return { outcome: response.outcome };
+  }
+
   async requestProviderProbe(
     machineId: string,
     input: { requestId: string; probeId: string; runtime: string; model: string },
@@ -15048,12 +17848,8 @@ export class AgentOrchestrator extends EventEmitter {
       })
     | null
   > {
-    if (
-      config.runtime !== "builtin" ||
-      config.provider.kind !== "preset" ||
-      config.model.kind !== "preset"
-    )
-      return null;
+    if (!isBuiltInCatalogCheckedSelection(config)) return null;
+    const requestedModel = config.model.kind === "preset" ? config.model.id : config.model.name;
     let detection: MachineRuntimeModelDetection;
     try {
       detection = await this.detectMachineRuntimeModelsWithAuthority(
@@ -15067,7 +17863,7 @@ export class AgentOrchestrator extends EventEmitter {
         "builtin_catalog_unavailable",
         "The target Computer's Built-in model catalog is unavailable. Retry after the Computer reconnects.",
         {
-          requestedModel: config.model.id,
+          requestedModel,
           daemonVersion: connection?.daemonVersion ?? null,
           computerVersion: connection?.computerVersion ?? null,
           recovery: "retry",
@@ -15428,6 +18224,31 @@ export class AgentOrchestrator extends EventEmitter {
   }
 
   /**
+   * The launch fields and stored session id of an agent, for a feedback
+   * transcript request (FeedbackTranscriptSessionLookup): what the session
+   * lookup needs of the values `buildAgentConfig` puts in an `agent:start`,
+   * and of the env vars only those the session directory depends on.
+   * Null when the agent cannot be read.
+   */
+  private async feedbackTranscriptSessionLookup(agentId: string): Promise<FeedbackTranscriptSessionLookup | null> {
+    try {
+      const agent = await this.loadAgentForDelivery(agentId);
+      if (!agent) return null;
+      const launch = runtimeConfigToLaunchFields(hydrateRuntimeConfig(agent));
+      return {
+        runtime: launch.runtime,
+        model: launch.model,
+        // Never the agent's runtime settings or its other env vars (provider keys live there).
+        sessionHomeEnv: runtimeSessionHomeEnvVars(launch.runtime, launch.envVars),
+        sessionId: agent.sessionId,
+      };
+    } catch (err) {
+      console.warn(`[Agent ${agentId}] Feedback transcript session lookup unavailable; the daemon will use its own memory:`, err instanceof Error ? err.message : err);
+      return null;
+    }
+  }
+
+  /**
    * Ask the daemon to collect the agent's current session transcript and upload
    * it as a trace bundle linked to a feedback report. This is intentionally
    * fire-and-forget from the HTTP route's perspective: callers receive a job id
@@ -15475,6 +18296,8 @@ export class AgentOrchestrator extends EventEmitter {
     const { machineId } = result;
 
     const requestId = crypto.randomUUID();
+    // Never a reason to fail the request: without it the daemon answers from its own memory, as before.
+    const sessionLookup = await this.feedbackTranscriptSessionLookup(agentId);
 
     return new Promise(async (resolve, reject) => {
       const timeout = setTimeout(() => {
@@ -15531,6 +18354,9 @@ export class AgentOrchestrator extends EventEmitter {
           requestId,
           feedbackReportGeneratedAt: reportWindow.reportGeneratedAt,
           feedbackReportTimeSource: reportWindow.reportTimeSource,
+          // A daemon that holds nothing for the agent (after its restart, or
+          // the agent's terminal failure) finds the session file with it.
+          ...(sessionLookup ? { sessionLookup } : {}),
           // Only ever true after the route verified the reporter owns the machine.
           ...(options.includeMachineLogTail ? { includeMachineLogTail: true } : {}),
         });
@@ -15721,6 +18547,426 @@ export class AgentOrchestrator extends EventEmitter {
     return results;
   }
 
+  /** The persisted last heartbeat of a machine (the last pong of any replica's connection), if any. */
+  protected async loadMachineLastHeartbeat(machineId: string): Promise<Date | null> {
+    return (await machineService.getMachine(asMachineId(machineId)))?.lastHeartbeat ?? null;
+  }
+
+  /**
+   * App event ids this replica still re-sends itself: an ack-retry record
+   * (live or parked) or a pending start carrying one. Re-delivery skips them,
+   * so a short outage does not reach the daemon twice.
+   */
+  private thirdPartyEventIdsInFlight(): string[] {
+    const ids = new Set<string>();
+    for (const pending of this.pendingAgentDeliveryAcks.values()) {
+      const id = pending.msg.message.third_party_event?.id;
+      if (id) ids.add(id);
+    }
+    for (const pending of this.pendingAgentStartAcks.values()) {
+      const wake = (pending.msg as { wakeMessage?: AgentMessage }).wakeMessage;
+      if (wake?.third_party_event?.id) ids.add(wake.third_party_event.id);
+    }
+    return [...ids];
+  }
+
+  /**
+   * The outage start for the reconnect pass (resolveOutageStart): the persisted
+   * last heartbeat, replaced by this replica's close time of the previous
+   * connection when that is not earlier. A failed heartbeat read is not
+   * "unknown, use the close time": the pass is skipped.
+   */
+  private async machineOutageStart(
+    machineId: string,
+    conn: { connectedAt?: number; previousCloseAt?: number } | undefined,
+    connectedAtMs: number,
+  ): Promise<OutageStart> {
+    let lastHeartbeat: Date | null | "read_failed";
+    try {
+      lastHeartbeat = await this.loadMachineLastHeartbeat(machineId);
+    } catch {
+      lastHeartbeat = "read_failed";
+    }
+    return resolveOutageStart({ lastHeartbeat, closedAt: conn?.previousCloseAt, connectedAt: connectedAtMs });
+  }
+
+  /** Starts the reconnect pass for a `ready` without waiting for it (shutdown does). */
+  private startThirdPartyEventReconnectPass(
+    machineId: string,
+    agentIds: readonly string[],
+    conn: { connectedAt?: number; previousCloseAt?: number; daemonVersion: string | null } | undefined,
+  ): void {
+    const pass = this.runThirdPartyEventReconnectPass(machineId, agentIds, conn)
+      .finally(() => {
+        if (this.thirdPartyEventReconnectPasses.get(machineId) === pass) this.thirdPartyEventReconnectPasses.delete(machineId);
+      });
+    this.thirdPartyEventReconnectPasses.set(machineId, pass);
+  }
+
+  /** F9 load control: a pass starts after a uniform random delay in [0, this) from its `ready`. */
+  static readonly READY_OWED_WAKE_MAX_DELAY_MS = 30_000;
+  /** F9 load control: owed-wake checks run at most this many at a time per machine. */
+  static readonly READY_OWED_WAKE_MACHINE_CONCURRENCY = 2;
+  /**
+   * F9 load control: owed-wake checks start at least this far apart across the
+   * whole server process (at most 10 a second), whatever the number of
+   * machines: a rolling server deploy reconnects every machine at once.
+   */
+  static readonly READY_OWED_WAKE_GLOBAL_INTERVAL_MS = 100;
+  /**
+   * F9 time floor (Tenny): only messages created at most this long before the
+   * check are owed to this wake. Deliveries a restart lost are recent by
+   * definition; an older owed backlog stays with the existing paths (the next
+   * message, a reminder, a manual start, the agent's own inbox check).
+   */
+  static readonly READY_OWED_WAKE_MAX_AGE_MS = 24 * 60 * 60_000;
+
+  private readonly readyOwedWakeSleeps = new Set<{ handle: unknown; resolve: () => void }>();
+
+  private sleepForReadyOwedWake(ms: number): Promise<void> {
+    if (ms <= 0 || this.readyOwedWakeStopped) return Promise.resolve();
+    return new Promise((resolve) => {
+      const sleep = { handle: null as unknown, resolve };
+      sleep.handle = this.clock.setTimeout(() => {
+        this.readyOwedWakeSleeps.delete(sleep);
+        resolve();
+      }, ms);
+      this.readyOwedWakeSleeps.add(sleep);
+    });
+  }
+
+  private stopReadyOwedWakePasses(): void {
+    this.readyOwedWakeStopped = true;
+    for (const sleep of this.readyOwedWakeSleeps) {
+      this.clock.clearTimeout(sleep.handle);
+      sleep.resolve();
+    }
+    this.readyOwedWakeSleeps.clear();
+  }
+
+  /** The next process-wide owed-wake slot (READY_OWED_WAKE_GLOBAL_INTERVAL_MS apart); resolves when it is due. */
+  private takeReadyOwedWakeSlot(): Promise<void> {
+    const now = this.clock.now();
+    const at = Math.max(now, this.readyOwedWakeNextSlotAtMs);
+    this.readyOwedWakeNextSlotAtMs = at + AgentOrchestrator.READY_OWED_WAKE_GLOBAL_INTERVAL_MS;
+    return this.sleepForReadyOwedWake(at - now);
+  }
+
+  /**
+   * Reconciler step 13 F9: a daemon `ready` wakes the agents whose wake a
+   * restart lost. Before this, `ready` woke an agent only for a message this
+   * replica still buffered in memory (maybeWakePendingInboxAfterReady); a
+   * delivery the daemon had acked and then lost with its process (restart,
+   * crash, upgrade), or a wake lost with the server replica, stayed unread
+   * with nothing to wake the agent.
+   *
+   * Who: the agents the ready reconcile left wakeable and not running
+   * (`mark-wakeable-not-running`: status active, no reset) with no buffered
+   * wake, managed runtimes only. Only what the restart lost wakes them, never
+   * "any unread" (Tenny, step 13 Q-D):
+   *
+   *   - offered: a conversation the chain view offers the agent unread in, up
+   *     to the newest message it is offered (readyOwedCandidateTargets: the
+   *     same membership, follow and mute rules that decide delivery, and with
+   *     it the wake of a not-running agent: planWakeAction `attempt-wake`);
+   *   - not consumed: past the agent's read position in Postgres. On a
+   *     Computer that position moves when the model is shown a message
+   *     (`agent:model-seen`), when the agent reads it itself (`raft message
+   *     check` / `raft inbox check`), or replies after it; for a daemon
+   *     without model-seen, at its delivery ack. A message the agent read
+   *     mid-turn through the CLI is therefore never owed (Otter);
+   *   - owed: a DM (or a thread in one), an unread @mention of the agent, or
+   *     an unread message assigning it a task (owedReadBacklogTargets, the
+   *     rule a completed first turn settles everything else by,
+   *     unowedReadBacklog.ts). Plain channel traffic, a muted channel's
+   *     messages and anything already read never wake;
+   *   - recent: the owed message was created at most
+   *     READY_OWED_WAKE_MAX_AGE_MS (24 h) before the check (Tenny): what a
+   *     restart lost is recent; older backlog stays with the existing paths;
+   *   - new to this wake: created after the check of the last owed wake
+   *     dispatched for the agent (`ready_owed_wake_at` in the replica state
+   *     store, shared by every replica, 24 h TTL, written only for a dispatched
+   *     start). Each owed message wakes the agent through this path at most
+   *     once, even if the woken agent never reads it and the daemon keeps
+   *     restarting. Without the mark (store unreadable) nothing is woken.
+   *
+   * Every gate of a start still applies (startAgentHere: manual stop, the
+   * version floor, the wake-crash-loop pause, the terminal-failure breaker
+   * with its billing/credential failures; planWakeAction: migrations and
+   * resets). The start carries no wake message: its catch-up, built with or
+   * without a session, is what it owes.
+   *
+   * Load: not awaited by the `ready`; starts after a random delay
+   * (READY_OWED_WAKE_MAX_DELAY_MS), checks READY_OWED_WAKE_MACHINE_CONCURRENCY
+   * agents at a time, each check on a process-wide slot
+   * (READY_OWED_WAKE_GLOBAL_INTERVAL_MS); one pass per machine (a `ready`
+   * during it runs it once more afterwards); it stops once the socket is
+   * replaced. Behind READY_WAKE_LOST_DELIVERIES_FEATURE_FLAG_KEY (default on).
+   */
+  private startReadyOwedWakePass(machineId: string, agentIds: readonly string[], conn: MachineConnection | undefined): void {
+    if (agentIds.length === 0 || !conn || this.readyOwedWakeStopped) return;
+    const run: ReadyOwedWakeRun = { agentIds: [...agentIds], serverId: conn.serverId, connectionEpochId: conn.connectionEpochId };
+    const inFlight = this.readyOwedWakePasses.get(machineId);
+    if (inFlight) {
+      inFlight.rerun = run;
+      this.recordEvent("machine.ready.owed_wake.deferred", { machine_id: machineId, agents_count: run.agentIds.length });
+      return;
+    }
+    const state: { done: Promise<void>; rerun: ReadyOwedWakeRun | null } = { done: Promise.resolve(), rerun: null };
+    this.readyOwedWakePasses.set(machineId, state);
+    state.done = (async () => {
+      let next: ReadyOwedWakeRun | null = run;
+      while (next && !this.readyOwedWakeStopped) {
+        state.rerun = null;
+        await this.runReadyOwedWakePass(machineId, next);
+        next = state.rerun;
+      }
+    })().finally(() => {
+      if (this.readyOwedWakePasses.get(machineId) === state) this.readyOwedWakePasses.delete(machineId);
+    });
+  }
+
+  /** Waits for the owed-wake passes in flight (tests). */
+  async awaitReadyOwedWakePasses(): Promise<void> {
+    // fanout-ok: awaits promises already in flight (one per machine pass); no I/O is started here.
+    await Promise.all([...this.readyOwedWakePasses.values()].map((state) => state.done));
+  }
+
+  private isReadyOwedWakeConnectionCurrent(machineId: string, run: ReadyOwedWakeRun): boolean {
+    return !this.readyOwedWakeStopped && this.machineConnections.get(machineId)?.connectionEpochId === run.connectionEpochId;
+  }
+
+  /** READY_WAKE_LOST_DELIVERIES_FEATURE_FLAG_KEY: no flag row is on; an evaluation failure is off. */
+  protected async isReadyOwedWakeEnabled(serverId: string): Promise<boolean> {
+    try {
+      const evaluation = await evaluateFeatureFlag({ key: READY_WAKE_LOST_DELIVERIES_FEATURE_FLAG_KEY, serverId });
+      return evaluation.reason === "missing_flag" ? true : evaluation.enabled;
+    } catch (error) {
+      console.warn(`[Orchestrator] ${READY_WAKE_LOST_DELIVERIES_FEATURE_FLAG_KEY} not evaluated for server ${serverId}; the ready owed wake is skipped:`, error instanceof Error ? error.message : error);
+      return false;
+    }
+  }
+
+  /** Never throws. */
+  private async runReadyOwedWakePass(machineId: string, run: ReadyOwedWakeRun): Promise<void> {
+    const counts = { checked: 0, owed: 0, started: 0 };
+    try {
+      await this.sleepForReadyOwedWake(Math.floor(this.readyOwedWakeRandom() * AgentOrchestrator.READY_OWED_WAKE_MAX_DELAY_MS));
+      if (!this.isReadyOwedWakeConnectionCurrent(machineId, run)) {
+        this.recordEvent("machine.ready.owed_wake.skipped", { machine_id: machineId, reason: "connection_replaced" });
+        return;
+      }
+      if (!await this.isReadyOwedWakeEnabled(run.serverId)) {
+        this.recordEvent("machine.ready.owed_wake.skipped", { machine_id: machineId, reason: "flag_off" });
+        return;
+      }
+      const queue = [...run.agentIds];
+      const worker = async () => {
+        for (let agentId = queue.shift(); agentId !== undefined; agentId = queue.shift()) {
+          await this.takeReadyOwedWakeSlot();
+          if (!this.isReadyOwedWakeConnectionCurrent(machineId, run)) {
+            queue.length = 0;
+            return;
+          }
+          counts.checked += 1;
+          const outcome = await this.maybeWakeOwedAfterReady(machineId, agentId, run);
+          if (outcome !== "nothing_owed") counts.owed += 1;
+          if (outcome === "started") counts.started += 1;
+        }
+      };
+      await Promise.all(Array.from({ length: Math.min(AgentOrchestrator.READY_OWED_WAKE_MACHINE_CONCURRENCY, queue.length) }, worker));
+      this.recordEvent("machine.ready.owed_wake.finished", {
+        machine_id: machineId,
+        agents_count: run.agentIds.length,
+        checked_count: counts.checked,
+        owed_count: counts.owed,
+        started_count: counts.started,
+      });
+    } catch (err) {
+      console.error(`[Orchestrator] ready owed wake pass failed for machine ${machineId}:`, err);
+      this.recordEvent("machine.ready.owed_wake.failed", { machine_id: machineId, error_class: errorClassOf(err), ...counts });
+    }
+  }
+
+  /**
+   * Test seam: the conversations the agent owes something in past its read
+   * position, created since `createdSince` (null: the chain is unavailable).
+   */
+  protected async readReadyOwedTargets(agentId: string, createdSince: Date): Promise<string[] | null> {
+    const inbox = await this.selectResumeInbox(agentId);
+    if (inbox.source === "unavailable") return null;
+    const targets = readyOwedCandidateTargets(inbox.rows);
+    if (targets.length === 0) return [];
+    return owedReadBacklogTargets(getDb(), agentId, targets, { createdSince });
+  }
+
+  private async maybeWakeOwedAfterReady(
+    machineId: string,
+    agentId: string,
+    run: ReadyOwedWakeRun,
+  ): Promise<"nothing_owed" | "started" | "suppressed"> {
+    const suppressed = (reason: string, attrs: Record<string, unknown> = {}) => {
+      this.recordEvent("machine.ready.owed_wake.suppressed", { agent_id: agentId, machine_id: machineId, reason, ...attrs });
+      return "suppressed" as const;
+    };
+    // The agent may have been woken, stopped or moved since its `ready`.
+    const cached = this.agentStateCache.get(agentId);
+    if (!cached || cached.machineId !== machineId || cached.status !== "active" || cached.runtimeState !== "not_running") return "nothing_owed";
+    if (this.startsInProgress.has(agentId) || this.hasPendingAgentStartForAgent(agentId)) return "nothing_owed";
+    // A buffered message wakes the agent through its own path.
+    if (this.localInboxes.peekFirst(agentId)) return "nothing_owed";
+    // The owed set is read as of now: messages created after it are the next wake's.
+    const checkedAtMs = this.clock.now();
+    let lastWakeAtMs: number | null;
+    try {
+      if (!this.replicaStateStore.getReadyOwedWakeAt || !this.replicaStateStore.setReadyOwedWakeAt) {
+        return suppressed("wake_mark_unavailable");
+      }
+      lastWakeAtMs = await this.replicaStateStore.getReadyOwedWakeAt(agentId);
+    } catch (err) {
+      return suppressed("wake_mark_unavailable", { error_class: errorClassOf(err) });
+    }
+    const createdSinceMs = Math.max(
+      checkedAtMs - AgentOrchestrator.READY_OWED_WAKE_MAX_AGE_MS,
+      lastWakeAtMs === null ? Number.NEGATIVE_INFINITY : lastWakeAtMs + 1,
+    );
+    let owed: string[] | null;
+    try {
+      owed = await this.readReadyOwedTargets(agentId, new Date(createdSinceMs));
+    } catch (err) {
+      return suppressed("owed_read_failed", { error_class: errorClassOf(err) });
+    }
+    if (owed === null) return suppressed("chain_unavailable");
+    if (owed.length === 0) return "nothing_owed";
+    const wakeInput = await this.loadWakePlanInput(agentId, cached.status);
+    const action = planWakeAction(wakeInput);
+    this.recordEvent("machine.ready.owed_wake.planned", {
+      agent_id: agentId,
+      machine_id: machineId,
+      owed_conversation_count: owed.length,
+      session_id_present: Boolean(cached.sessionId),
+      action,
+    });
+    if (action !== "attempt-wake") return suppressed(action);
+    let result: AgentStartDispatchResult;
+    try {
+      result = await this.startAgentHere(agentId, { startCause: "ready_owed", localConnectionEpochId: run.connectionEpochId });
+    } catch (err) {
+      return suppressed("start_failed", { error_class: errorClassOf(err) });
+    }
+    if (result.outcome !== "dispatched") return suppressed(result.reason);
+    // Only a dispatched start marks the wake; a refused one leaves the next ready free to wake.
+    let markWritten = true;
+    try {
+      await this.replicaStateStore.setReadyOwedWakeAt(agentId, checkedAtMs);
+    } catch (err) {
+      markWritten = false;
+      console.warn(`[Orchestrator] ready owed wake mark not written for agent ${agentId}; a later ready may wake it again:`, err instanceof Error ? err.message : err);
+    }
+    this.recordEvent("machine.ready.owed_wake.started", {
+      agent_id: agentId,
+      machine_id: machineId,
+      owed_conversation_count: owed.length,
+      wake_mark_written: markWritten,
+      previous_wake_mark_present: lastWakeAtMs !== null,
+    });
+    return "started";
+  }
+
+  /** Waits, at most `timeoutMs`, for the reconnect passes in flight (shutdown, tests). */
+  async awaitThirdPartyEventReconnectPasses(timeoutMs = 10_000): Promise<void> {
+    const passes = [...this.thirdPartyEventReconnectPasses.values()];
+    if (passes.length === 0) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([
+      Promise.all(passes).then(() => undefined),
+      new Promise<void>((resolve) => { timer = setTimeout(resolve, timeoutMs); timer.unref?.(); }),
+    ]);
+    if (timer) clearTimeout(timer);
+  }
+
+  /**
+   * The app-event reconnect pass for a machine's `ready`
+   * (thirdPartyAgentEventRedelivery): only after an outage longer than a
+   * parked ack-retry record lives, with a known start, from a daemon that
+   * reports delivered events; otherwise traced as skipped. Never throws.
+   */
+  protected async runThirdPartyEventReconnectPass(
+    machineId: string,
+    agentIds: readonly string[],
+    conn: { connectedAt?: number; previousCloseAt?: number; daemonVersion: string | null } | undefined,
+  ): Promise<void> {
+    if (agentIds.length === 0) return;
+    try {
+      const reconnectedAtMs = conn?.connectedAt ?? this.clock.now();
+      const plan = planReconnectRedelivery({
+        daemonVersion: conn?.daemonVersion,
+        outageStart: await this.machineOutageStart(machineId, conn, reconnectedAtMs),
+        reconnectedAt: new Date(reconnectedAtMs),
+        parkedMaxMs: AgentOrchestrator.AGENT_DELIVERY_PARKED_MAX_MS,
+      });
+      if (plan.action !== "run") {
+        this.recordEvent("server.third_party_event.redeliver_skipped", {
+          trigger: "machine_ready",
+          outcome: plan.action,
+          machine_id: machineId,
+          ...("outageMs" in plan ? { outage_ms_bucket: durationMsBucket(plan.outageMs) } : {}),
+        });
+        return;
+      }
+      await redeliverPendingThirdPartyAgentEvents({
+        trigger: "machine_ready",
+        outageStartedAt: plan.outageStartedAt,
+        agentIds,
+        excludeEventIds: this.thirdPartyEventIdsInFlight(),
+        parkedMaxMs: AgentOrchestrator.AGENT_DELIVERY_PARKED_MAX_MS,
+        deliverer: this,
+        tracer: this.tracer,
+        machineId,
+      });
+    } catch (err) {
+      console.error(`[Orchestrator] third-party event reconnect pass failed for machine ${machineId}:`, err);
+      this.recordEvent("server.third_party_event.redeliver_failed", {
+        outcome: "failed",
+        trigger: "machine_ready",
+        machine_id: machineId,
+        error_class: errorClassOf(err),
+      });
+    }
+  }
+
+  /**
+   * The re-delivery sweep (safety net): the managed agents whose computer is
+   * connected to this replica, with a daemon that reports delivered events,
+   * and that have a pending app event.
+   */
+  async sweepPendingThirdPartyAgentEvents(): Promise<void> {
+    const machineIds: string[] = [];
+    let oldDaemons = 0;
+    for (const machineId of this.getRoutableLocalMachineIds()) {
+      if (daemonReportsDeliveredThirdPartyEvents(this.machineConnections.get(machineId)?.daemonVersion)) machineIds.push(machineId);
+      else oldDaemons += 1;
+    }
+    if (oldDaemons > 0) {
+      this.recordEvent("server.third_party_event.redeliver_skipped", { trigger: "sweep", outcome: "skipped_old_daemon", machines_count: oldDaemons });
+    }
+    if (machineIds.length === 0) return;
+    try {
+      const agentIds = await listManagedAgentsWithPendingThirdPartyEvents({ machineIds, parkedMaxMs: AgentOrchestrator.AGENT_DELIVERY_PARKED_MAX_MS });
+      await redeliverPendingThirdPartyAgentEvents({
+        trigger: "sweep",
+        agentIds,
+        excludeEventIds: this.thirdPartyEventIdsInFlight(),
+        parkedMaxMs: AgentOrchestrator.AGENT_DELIVERY_PARKED_MAX_MS,
+        deliverer: this,
+        tracer: this.tracer,
+      });
+    } catch (err) {
+      console.error("[Orchestrator] third-party event sweep failed:", err);
+      this.recordEvent("server.third_party_event.redeliver_failed", { outcome: "failed", trigger: "sweep", error_class: errorClassOf(err) });
+    }
+  }
+
   /**
    * Deliver one message to one agent. `gates` carries this agent's row and
    * channel access when the caller already read them for a whole channel
@@ -15805,7 +19051,7 @@ export class AgentOrchestrator extends EventEmitter {
       }
     }
     if (options.reconcileNonMemberMention) {
-      this.reconcileQueuedNonMemberMention(agentId, message);
+      this.localInboxes.reconcileNonMemberMention(agentId, message);
     }
     // External agents are supplied/observed, never Slock-launched
     // (SHA-V0-006C): there is no managed wake path for them. Signal the
@@ -16023,6 +19269,7 @@ export class AgentOrchestrator extends EventEmitter {
         delivery_correlation_id: deliveryId,
         message_id_present: Boolean(message.message_id),
         seq: message.seq ?? 0,
+        ...(message.third_party_event?.id ? { third_party_event_id: message.third_party_event.id } : {}),
       },
     });
     span.addEvent("server.deliver.enqueued", {
@@ -16203,6 +19450,8 @@ export class AgentOrchestrator extends EventEmitter {
         }
         if (
           startResult.reason === "manual_stop"
+          || startResult.reason === "computer_version_unsupported"
+          || startResult.reason === "computer_access_revoked"
           || startResult.reason === "wake_crash_loop_blocked"
           || startResult.reason === "terminal_failure_paused"
           || startResult.reason === "terminal_failure_probe_in_flight"
@@ -16326,65 +19575,18 @@ export class AgentOrchestrator extends EventEmitter {
       reconcileNonMemberMention?: boolean;
     } = {},
   ) {
-    let inbox = this.agentInboxes.get(agentId);
-    if (!inbox) {
-      inbox = { inbox: [], pendingReceive: null };
-      this.agentInboxes.set(agentId, inbox);
-    }
-
-    if (
-      options.reconcileNonMemberMention === true
-      && this.reconcileQueuedNonMemberMention(agentId, message)
-    ) {
-      return;
-    }
-
-    const action = planLocalInboxEnqueueAction({
-      hasSeqDuplicate: Boolean(message.seq && inbox.inbox.some((queued) => queued.seq === message.seq)),
-      hasMessageIdDuplicate: Boolean(!message.seq && message.message_id && inbox.inbox.some((queued) => queued.message_id === message.message_id)),
-    });
-    if (action === "enqueue") {
-      this.applyLocalInboxEnqueue({
-        inbox,
-        message,
-        notifyPendingReceive: options.notifyPendingReceive ?? true,
-      });
-    }
-  }
-
-  private reconcileQueuedNonMemberMention(agentId: string, message: AgentMessage): boolean {
-    const inbox = this.agentInboxes.get(agentId);
-    if (!inbox || !message.seq || message.non_member_mention === true) return false;
-
-    const duplicateIndex = inbox.inbox.findIndex((queued) => queued.seq === message.seq);
-    if (duplicateIndex < 0 || inbox.inbox[duplicateIndex]?.non_member_mention !== true) return false;
-    inbox.inbox[duplicateIndex] = message;
-    return true;
-  }
-
-  protected applyLocalInboxEnqueue(context: LocalInboxApplyContext) {
-    context.inbox.inbox.push(context.message);
-    if (context.inbox.inbox.length > 1000) {
-      context.inbox.inbox.shift();
-    }
-
-    if (context.notifyPendingReceive !== false && context.inbox.pendingReceive) {
-      clearTimeout(context.inbox.pendingReceive.timer);
-      context.inbox.pendingReceive.resolve([...context.inbox.inbox]);
-      context.inbox.pendingReceive = null;
-    }
+    this.localInboxes.enqueue(agentId, message, options);
   }
 
   async receiveMessages(agentId: string, block: boolean, timeoutMs: number, signal?: AbortSignal): Promise<AgentMessage[]> {
     if (await this.isRaftBenchServiceAgent(agentId)) {
-      const buffered = this.agentInboxes.get(agentId);
-      if (buffered) buffered.inbox = buffered.inbox.filter(message => message.third_party_event?.client_id === "system.raftbench");
+      this.localInboxes.retain(agentId, message => message.third_party_event?.client_id === "system.raftbench");
     }
     if (await agentRuntimeProfileService.isRuntimeProfileMigrationGated(agentId)) {
       const agent = await this.getCachedAgent(agentId);
-      const inbox = this.agentInboxes.get(agentId);
       const pendingMigration = await agentRuntimeProfileService.getPendingRuntimeProfileMigration(agentId);
-      const oldestMessageAgeMs = oldestInboxMessageAgeMs(inbox?.inbox ?? [], this.clock.now());
+      const inbox = this.localInboxes.snapshot(agentId);
+      const oldestMessageAgeMs = oldestInboxMessageAgeMs(inbox?.messages ?? [], this.clock.now());
       const pendingAgeMs = pendingMigration?.migratingSince
         ? Math.max(0, this.clock.now() - pendingMigration.migratingSince.getTime())
         : undefined;
@@ -16405,8 +19607,8 @@ export class AgentOrchestrator extends EventEmitter {
           migration_status: pendingMigration?.migrationStatus,
           pending_age_ms: pendingAgeMs,
           pending_age_bucket: durationMsBucket(pendingAgeMs),
-          inbox_count: inbox?.inbox.length ?? 0,
-          pending_receive_present: Boolean(inbox?.pendingReceive),
+          inbox_count: inbox?.messages.length ?? 0,
+          pending_receive_present: inbox?.receiving ?? false,
           oldest_message_age_ms: oldestMessageAgeMs,
           oldest_message_age_bucket: durationMsBucket(oldestMessageAgeMs),
           block,
@@ -16465,27 +19667,7 @@ export class AgentOrchestrator extends EventEmitter {
       span.end("ok", { attrs: { outcome: "gated_by_runtime_profile_migration", reason: "runtime_profile_migration_gate" } });
       return [];
     }
-    let inbox = this.agentInboxes.get(agentId);
-    if (!inbox) {
-      inbox = { inbox: [], pendingReceive: null };
-      this.agentInboxes.set(agentId, inbox);
-    }
-
-    const action = planReceiveAction({
-      hasBufferedMessages: inbox.inbox.length > 0,
-      block,
-    });
-
-    if (action === "return-buffered") {
-      return Promise.resolve([...inbox.inbox]);
-    }
-
-    if (action === "return-empty") return Promise.resolve([]);
-    return this.installReceiveWaiter({
-      agentId,
-      timeoutMs,
-      signal,
-    });
+    return this.localInboxes.receive(agentId, block, timeoutMs, signal);
   }
 
   /**
@@ -16494,130 +19676,15 @@ export class AgentOrchestrator extends EventEmitter {
    * a pending receive waiter and without acknowledging delivery.
    */
   peekPendingMessages(agentId: string): AgentMessage[] {
-    const inbox = this.agentInboxes.get(agentId);
-    return inbox ? [...inbox.inbox] : [];
-  }
-
-  protected installReceiveWaiter(context: ReceiveApplyContext): Promise<AgentMessage[]> {
-    return new Promise((resolve) => {
-      let finished = false;
-      let timer: ReturnType<typeof setTimeout>;
-      let cleanupAbortListener = () => {};
-
-      const finish = (messages: AgentMessage[]) => {
-        if (finished) return;
-        finished = true;
-        clearTimeout(timer);
-        cleanupAbortListener();
-        const ib = this.agentInboxes.get(context.agentId);
-        if (ib?.pendingReceive === pendingReceive) {
-          ib.pendingReceive = null;
-        }
-        resolve(messages);
-      };
-
-      timer = setTimeout(() => {
-        // Return empty — the bridge returns a "take a rest" hint to the agent,
-        // keeping the process alive until new messages arrive via stdin.
-        finish([]);
-      }, context.timeoutMs);
-
-      const pendingReceive = { resolve, timer, finish };
-      const inbox = this.agentInboxes.get(context.agentId);
-
-      // Only one blocked receive can be active per agent. If a second long-poll
-      // arrives, supersede the old waiter so it doesn't hang indefinitely or let
-      // a stale abort/timeout clear the newer waiter.
-      if (inbox?.pendingReceive) {
-        inbox.pendingReceive.finish([]);
-      }
-
-      // If the HTTP connection is aborted, clean up gracefully
-      if (context.signal) {
-        const onAbort = () => finish([]);
-        if (context.signal.aborted) {
-          finish([]);
-          return;
-        }
-        context.signal.addEventListener("abort", onAbort, { once: true });
-        cleanupAbortListener = () => context.signal?.removeEventListener("abort", onAbort);
-      }
-
-      if (!inbox) {
-        this.agentInboxes.set(context.agentId, { inbox: [], pendingReceive });
-        return;
-      }
-      inbox.pendingReceive = pendingReceive;
-    });
+    return this.localInboxes.peek(agentId);
   }
 
   acknowledgeDeliveredMessages(agentId: string, seqs: number[], messageIds: string[] = []): { removedCount: number } {
-    if (seqs.length === 0 && messageIds.length === 0) return { removedCount: 0 };
-    const inbox = this.agentInboxes.get(agentId);
-    if (!inbox || inbox.inbox.length === 0) return { removedCount: 0 };
-
-    const { removed, retained } = partitionAcknowledgedMessages({
-      inbox: inbox.inbox,
-      ackedSeqs: new Set(seqs),
-      ackedMessageIds: new Set(messageIds),
-    });
-
-    if (removed.length === 0) return { removedCount: 0 };
-    inbox.inbox = retained;
-    return { removedCount: removed.length };
+    return this.localInboxes.acknowledge(agentId, seqs, messageIds);
   }
 
   discardUndeliverableMessages(agentId: string, messages: AgentMessage[]): { removedCount: number } {
-    if (messages.length === 0) return { removedCount: 0 };
-    const inbox = this.agentInboxes.get(agentId);
-    if (!inbox || inbox.inbox.length === 0) return { removedCount: 0 };
-
-    const seqs = new Set<number>();
-    const seqlessMessageIds = new Set<string>();
-    for (const message of messages) {
-      if (Number.isInteger(message.seq) && (message.seq ?? 0) > 0) {
-        seqs.add(message.seq!);
-      } else if (message.message_id) {
-        seqlessMessageIds.add(message.message_id);
-      }
-    }
-    if (seqs.size === 0 && seqlessMessageIds.size === 0) return { removedCount: 0 };
-
-    const retained: AgentMessage[] = [];
-    let removedCount = 0;
-    for (const queued of inbox.inbox) {
-      const matchesSeq = Number.isInteger(queued.seq) && seqs.has(queued.seq!);
-      const matchesSeqlessId = !queued.seq && Boolean(queued.message_id) && seqlessMessageIds.has(queued.message_id!);
-      if (matchesSeq || matchesSeqlessId) {
-        removedCount += 1;
-      } else {
-        retained.push(queued);
-      }
-    }
-
-    if (removedCount === 0) return { removedCount: 0 };
-    inbox.inbox = retained;
-    return { removedCount };
-  }
-
-  private discardMessagesForChannels(agentId: string, channelIds: readonly string[]): { removedCount: number } {
-    const channelIdSet = new Set(channelIds.filter((id) => typeof id === "string" && id.length > 0));
-    if (channelIdSet.size === 0) return { removedCount: 0 };
-    const inbox = this.agentInboxes.get(agentId);
-    if (!inbox || inbox.inbox.length === 0) return { removedCount: 0 };
-
-    const retained: AgentMessage[] = [];
-    let removedCount = 0;
-    for (const queued of inbox.inbox) {
-      if (channelIdSet.has(queued.channel_id)) {
-        removedCount += 1;
-      } else {
-        retained.push(queued);
-      }
-    }
-    if (removedCount === 0) return { removedCount: 0 };
-    inbox.inbox = retained;
-    return { removedCount };
+    return this.localInboxes.discard(agentId, messages);
   }
 
   async purgeAgentInboxForChannels(
@@ -16625,7 +19692,7 @@ export class AgentOrchestrator extends EventEmitter {
     channelIds: readonly string[],
     reason = "channel_membership_removed",
   ): Promise<{ localRemovedCount: number; machineSent: boolean }> {
-    const local = this.discardMessagesForChannels(agentId, channelIds);
+    const local = this.localInboxes.discardForChannels(agentId, channelIds);
     const agent = await this.getCachedAgent(agentId);
     let machineSent = false;
     const dedupedChannelIds = [...new Set(channelIds.filter((id) => typeof id === "string" && id.length > 0))];
@@ -16655,35 +19722,11 @@ export class AgentOrchestrator extends EventEmitter {
   }
 
   acknowledgeDeliveredMessagesForChannel(agentId: string, channelId: string, seqs: number[]): { removedCount: number } {
-    if (seqs.length === 0) return { removedCount: 0 };
-    const inbox = this.agentInboxes.get(agentId);
-    if (!inbox || inbox.inbox.length === 0) return { removedCount: 0 };
-
-    const { removed, retained } = partitionTargetScopedAcknowledgedMessages({
-      inbox: inbox.inbox,
-      channelId,
-      ackedSeqs: new Set(seqs),
-    });
-
-    if (removed.length === 0) return { removedCount: 0 };
-    inbox.inbox = retained;
-    return { removedCount: removed.length };
+    return this.localInboxes.acknowledgeForChannel(agentId, channelId, seqs);
   }
 
   acknowledgeDeliveredMessagesForChannelUpToSeq(agentId: string, channelId: string, maxSeq: number): { removedCount: number } {
-    if (!Number.isInteger(maxSeq) || maxSeq <= 0) return { removedCount: 0 };
-    const inbox = this.agentInboxes.get(agentId);
-    if (!inbox || inbox.inbox.length === 0) return { removedCount: 0 };
-
-    const { removed, retained } = partitionTargetScopedMessagesUpToSeq({
-      inbox: inbox.inbox,
-      channelId,
-      maxSeq,
-    });
-
-    if (removed.length === 0) return { removedCount: 0 };
-    inbox.inbox = retained;
-    return { removedCount: removed.length };
+    return this.localInboxes.acknowledgeForChannelUpToSeq(agentId, channelId, maxSeq);
   }
 
   /**
@@ -16751,13 +19794,12 @@ export class AgentOrchestrator extends EventEmitter {
       // wake_crash_loop_blocked, serve it as-is on every replica. A human
       // start writes the next snapshot and thereby lifts it.
       // RFC 071 §9: the terminal-failure breaker's block is server-authored the same way.
-      const isServerBlock = (kind: string | undefined) => kind === "wake_crash_loop_blocked" || kind === "terminal_failure_paused";
-      const blockedSnapshot = isServerBlock(activityCached?.detailKind)
+      const blockedSnapshot = this.isServerActivityBlock(activityCached?.detailKind)
         ? activityCached
         : !activityCached && this.replicaStateStore.isAvailable()
           ? (redisActivity ??= activitySnapshotFromPersisted(await this.readAgentActivityForActivity(agentId, prefetched)))
           : null;
-      if (blockedSnapshot && isServerBlock(blockedSnapshot.detailKind)) {
+      if (blockedSnapshot && this.isServerActivityBlock(blockedSnapshot.detailKind)) {
         const blocked = this.formatActivityFromSnapshot(blockedSnapshot);
         span.end("ok", { attrs: { outcome: blocked.activity, source: activityCached ? "local-cache" : "redis", typed_state: blockedSnapshot.detailKind } });
         return blocked;
@@ -17017,6 +20059,17 @@ export class AgentOrchestrator extends EventEmitter {
         : current?.spawnFailure)
       : undefined;
     this.pendingSpawnFailure.delete(agentId);
+    const toolStuck = this.pendingToolStuck.get(agentId);
+    this.pendingToolStuck.delete(agentId);
+    // Reconciler step 4b: the held notice's reason rides only an idle write.
+    // A daemon frame always decides (its carrier, or none); only a write that
+    // did not come from one keeps the current observation.
+    const credentialHold = nextDetailKind === "idle"
+      ? (this.pendingCredentialHold.has(agentId)
+        ? this.pendingCredentialHold.get(agentId) ?? undefined
+        : current?.credentialHold)
+      : undefined;
+    this.pendingCredentialHold.delete(agentId);
     const snapshot: ActivitySnapshot = {
       activity: nextActivity,
       detail: nextDetail,
@@ -17026,6 +20079,8 @@ export class AgentOrchestrator extends EventEmitter {
       ...(deliveryConsumption ? { deliveryConsumption } : {}),
       ...(wakeCrashLoop ? { wakeCrashLoop } : {}),
       ...(spawnFailure ? { spawnFailure } : {}),
+      ...(toolStuck ? { toolStuck } : {}),
+      ...(credentialHold ? { credentialHold } : {}),
     };
 
     this.agentActivity.set(agentId, snapshot);
@@ -17292,11 +20347,15 @@ export class AgentOrchestrator extends EventEmitter {
    * replayed frame rewrites the same row. Best effort: the log row stands.
    */
   private async persistDaemonTurnSummaries(agentId: string, entries: readonly TrajectoryEntry[]): Promise<void> {
-    const turns = entries.flatMap((entry) => (
-      entry.kind === "turn_summary" && isPlausibleTurnSummary(entry.summary)
-        ? [{ turnKey: `daemon:${entry.summary.startedAt}`, summary: entry.summary }]
-        : []
-    ));
+    // Stored as a producer may report it (readDaemonTurnSummary): only the
+    // ActivityTurnSummary fields, rebuilt from their known shapes; an
+    // implausible summary (bad times, an unreadable trigger) is not stored.
+    // What the server attaches, `running` and anything else are never the
+    // daemon's to set.
+    const turns = entries.flatMap((entry) => {
+      const summary = entry.kind === "turn_summary" ? readDaemonTurnSummary(entry.summary) : undefined;
+      return summary ? [{ turnKey: `daemon:${summary.startedAt}`, summary }] : [];
+    });
     if (turns.length === 0) return;
     try {
       await this.upsertTurnSummaries(agentId, turns);
@@ -17315,6 +20374,48 @@ export class AgentOrchestrator extends EventEmitter {
     options: { limit?: number; before?: agentActivityLogService.TurnSummaryCursor } = {},
   ): Promise<{ summaries: agentActivityLogService.StoredTurnSummary[]; next?: agentActivityLogService.TurnSummaryCursor }> {
     return this.loadTurnSummaries(agentId, options);
+  }
+
+  /** One stored turn of the agent by row id, or null. */
+  async getTurnSummary(agentId: string, id: string): Promise<agentActivityLogService.StoredTurnSummary | null> {
+    return agentActivityLogService.getAgentTurnSummary(agentId, id);
+  }
+
+  /**
+   * The turn still running (Activity overview, task #17): the agent's activity
+   * rows after `afterMs` (the newest finished turn's end; null when none has
+   * finished, then its latest rows) folded the way its finished turns are, by
+   * the external agent's own boundaries or the daemon's. Null when no turn is
+   * open in them. Its `endedAt` is now. The rows alone cannot say the agent is
+   * still busy (an error or a lost idle leaves a turn open): callers ask only
+   * while its live activity is working or thinking. At most RUNNING_TURN_ROWS
+   * rows from the turn's start: a longer turn's counts stop there.
+   */
+  async getRunningTurn(agentId: string, afterMs: number | null): Promise<RunningTurn | null> {
+    const loaded = afterMs === null
+      ? await this.loadPersistedActivityLog(agentId, RUNNING_TURN_ROWS)
+      : await this.loadPersistedActivityLogAfter(agentId, afterMs, RUNNING_TURN_ROWS);
+    const external = this.externalHookTurnAgents.has(agentId)
+      || loaded.some((row) => isExternalHookEntry(row.entry) || externalReportedStatus(row.entry) !== null);
+    // As in rebuildExternalTurnSummaries: a hosted subagent's steps are never a parent turn's.
+    const rows = external ? loaded.filter((row) => !(row.entry as SubagentLineage).subagent) : loaded;
+    const boundaries = external ? externalTurnBoundaries(rows, this.externalHookTurnAgents.has(agentId)) : DAEMON_LOG_TURN_BOUNDARIES;
+    if (rows.length === 0) return null;
+    const now = this.clock.now();
+    const sends = await this.loadAgentSentMessagesBetween(agentId, Math.min(...rows.map((row) => row.timestamp)), now);
+    const { turns, open } = summarizeTurnsFromLog(rows, { ...boundaries, sends });
+    if (!open) return null;
+    const turn = { ...open.summary, endedAt: Math.max(now, open.summary.startedAt) };
+    const continuesPreviousTurn = !external && isRuntimeProgressEntry(rows[open.startIndex]!.entry);
+    // A newer daemon holds an empty wake and stores it only with the work
+    // that follows (TurnSummaryTracker), so until then it is in these rows
+    // alone, closed by its idle: the work takes its trigger and start here,
+    // as the stored turn will.
+    const wake = turns.at(-1)?.summary;
+    if (continuesPreviousTurn && !turn.trigger && wake && continuesEmptyWake(wake, turn.startedAt)) {
+      return { turn: { ...turn, startedAt: wake.startedAt, trigger: wake.trigger, ...lastTextOf(turn, wake) }, continuesPreviousTurn };
+    }
+    return { turn, continuesPreviousTurn };
   }
 
   protected async loadTurnSummaries(
@@ -17363,7 +20464,7 @@ export class AgentOrchestrator extends EventEmitter {
       // so a window that starts before this turn's UserPromptSubmit arrived
       // does not fall back to statuses and key the turn differently.
       if (rows.some((row) => externalHookBoundary(row.entry) !== null)) this.externalHookTurnAgents.add(agentId);
-      const turns = summarizeTurnsFromLog(rows, { ...externalTurnBoundaries(rows, this.externalHookTurnAgents.has(agentId)), sends }).filter((turn) => turn.summary.endedAt >= touchedFromMs || boundary !== null);
+      const turns = summarizeTurnsFromLog(rows, { ...externalTurnBoundaries(rows, this.externalHookTurnAgents.has(agentId)), sends }).turns.filter((turn) => turn.summary.endedAt >= touchedFromMs || boundary !== null);
       if (turns.length === 0) return;
       await this.upsertTurnSummaries(agentId, turns.map((turn) => {
         const start = rows[turn.startIndex]!.entry;
@@ -17521,6 +20622,13 @@ export class AgentOrchestrator extends EventEmitter {
       const spawnFailure = detailKind === "runtime_unavailable"
         ? this.agentActivity.get(agentId)?.spawnFailure
         : undefined;
+      // task #25: the stuck-tool state of the snapshot this emit is for.
+      const toolStuck = joinKeys?.carriers ? joinKeys.carriers.toolStuck : current?.toolStuck;
+      // Reconciler step 4b: the held notice's reason rides the idle emit of
+      // the snapshot this emit is for.
+      const credentialHold = detailKind === "idle"
+        ? (joinKeys?.carriers ? joinKeys.carriers.credentialHold : current?.credentialHold)
+        : undefined;
       const publicPayload = {
         agentId,
         activity,
@@ -17532,6 +20640,8 @@ export class AgentOrchestrator extends EventEmitter {
         ...(deliveryConsumption ? { deliveryConsumption } : {}),
         ...(wakeCrashLoop ? { wakeCrashLoop } : {}),
         ...(spawnFailure ? { spawnFailure } : {}),
+        ...(toolStuck ? { toolStuck } : {}),
+        ...(credentialHold ? { credentialHold } : {}),
         // Daemon socket-message join keys (task #136). `serverSeq` is the
         // server-side monotonic identity for THIS broadcast; `clientSeq`
         // is the daemon-side monotonic identity for the inbound message
@@ -17546,12 +20656,46 @@ export class AgentOrchestrator extends EventEmitter {
         ...(joinKeys?.isHeartbeat !== undefined ? { isHeartbeat: joinKeys.isHeartbeat } : {}),
         ...(joinKeys?.isRefreshOnly !== undefined ? { isRefreshOnly: joinKeys.isRefreshOnly } : {}),
       };
+      // #wg-rbac:#57: an error activity's text reaches only the agent's
+      // managers (the creator, `editAgents`; an assistant's owner, who alone is
+      // in its agentEventRoom). Every other socket gets the code and its fixed
+      // sentence, or the generic message. The managers' sockets on this server
+      // are taken out of the member push and get theirs in their own rooms.
+      const runtimeErrorPush = isRuntimeErrorDetailActivity({ activity, detailKind })
+        ? await this.runtimeErrorActivityPush(agent, agentId, { activity, detailKind, detail }, publicPayload)
+        : null;
       const doEmit = () => {
+        if (runtimeErrorPush) {
+          const { memberPayload, managerPayload, managerRooms } = runtimeErrorPush;
+          this.io?.to(agentEventRoom(agent.serverId, agent.assistantOwnerUserId)).except(agentActivityCapableServerRoom(agent.serverId)).except(managerRooms).emit("agent:activity", memberPayload);
+          this.io?.to(agentActivityRoom(agentId)).except(managerRooms).emit("agent:activity", memberPayload);
+          if (managerRooms.length > 0) this.io?.to(managerRooms).emit("agent:activity", managerPayload);
+        }
         // Server and joint projection rooms can include members who may not be
         // allowed to inspect the agent's private workspace/action trajectory.
         // Keep raw entries behind the creator/admin activity-log hydration path.
-        this.io?.to(`server:${agent.serverId}`).emit("agent:activity", publicPayload);
-        void this.emitJointActivityToProjectionRooms(agent.id, agent.serverId, publicPayload);
+        // A client that declared AGENT_ACTIVITY_SUBSCRIPTIONS_CAPABILITY is in
+        // the server's capable room: it gets the detail only for the agents it
+        // subscribed to (their own room), and the coarse state for all (the
+        // fanout below). Every other client (the mobile App, an old web tab)
+        // keeps the server-wide push unchanged (#proj-frontend:#8).
+        // A personal assistant's activity reaches only its owner (agentEventRoom):
+        // anyone else would learn that its owner is using it right now.
+        if (!runtimeErrorPush) {
+          this.io?.to(agentEventRoom(agent.serverId, agent.assistantOwnerUserId)).except(agentActivityCapableServerRoom(agent.serverId)).emit("agent:activity", publicPayload);
+          this.io?.to(agentActivityRoom(agentId)).emit("agent:activity", publicPayload);
+        }
+        this.agentActivityStateFanout.observe(agentActivityStateRoom(agent.serverId, agent.assistantOwnerUserId), agentId, activity, timestamp, nextSeq);
+        // Joint membership exposes basic presence, never the agent's unrelated
+        // work summary, diagnostics, or runtime correlation identifiers.
+        void this.emitJointActivityToProjectionRooms(agent.id, agent.serverId, {
+          agentId,
+          activity,
+          activityKind: activity,
+          detail: "",
+          timestamp,
+          serverSeq: nextSeq,
+        });
       };
       // Injectable seam for the realtime push. Per cache-coherence contract
       // CC-006 the push is best-effort (drop/delay/reorder) and MUST NOT be
@@ -17567,6 +20711,57 @@ export class AgentOrchestrator extends EventEmitter {
     }
   }
 
+  /**
+   * #wg-rbac:#57: the two pushes of an error activity. A personal assistant's
+   * agentEventRoom is its owner's alone, so its one push is the manager's.
+   * When the managers cannot be read, nobody gets the text (they re-read it
+   * over REST).
+   */
+  private async runtimeErrorActivityPush<P extends { detail: string }>(
+    agent: CachedAgentState,
+    agentId: string,
+    shown: { activity: AgentActivityKind; detailKind: AgentActivityDetailKind; detail: string },
+    payload: P,
+  ): Promise<{ memberPayload: P & { errorCode?: string }; managerPayload: P & { errorCode?: string }; managerRooms: string[] }> {
+    const lastRuntimeError = this.agentStateCache.get(agentId)?.lastRuntimeError ?? agent.lastRuntimeError ?? null;
+    const manager = projectRuntimeErrorActivityDetail({ ...shown, lastRuntimeError }, "manager");
+    const member = projectRuntimeErrorActivityDetail({ ...shown, lastRuntimeError }, "member");
+    const managerPayload = { ...payload, ...manager };
+    if (agent.assistantOwnerUserId) {
+      return { memberPayload: managerPayload, managerPayload, managerRooms: [] };
+    }
+    let managerUserIds: string[] = [];
+    try {
+      managerUserIds = await this.runtimeErrorDetailViewerUserIds(agentId);
+    } catch (err) {
+      this.recordEvent("runtime_error_detail.viewers_unavailable", { error_class: errorClassOf(err) });
+    }
+    return {
+      memberPayload: { ...payload, ...member },
+      managerPayload,
+      managerRooms: managerUserIds.map((userId) => socketUserServerRoom(userId, agent.serverId)),
+    };
+  }
+
+  /**
+   * The managers of an agent, read at most once per RUNTIME_ERROR_VIEWER_CACHE_TTL_MS
+   * per agent (an error can be pushed in bursts). A role or creator change
+   * takes effect within the TTL; a failed read is not cached.
+   */
+  private async runtimeErrorDetailViewerUserIds(agentId: string): Promise<string[]> {
+    const now = this.clock.now();
+    const cached = this.runtimeErrorViewerCache.get(agentId);
+    if (cached && now - cached.readAtMs < AgentOrchestrator.RUNTIME_ERROR_VIEWER_CACHE_TTL_MS) return cached.userIds;
+    const userIds = await this.loadRuntimeErrorDetailViewerUserIds(agentId);
+    if (this.runtimeErrorViewerCache.size >= AgentOrchestrator.RUNTIME_ERROR_VIEWER_CACHE_MAX) this.runtimeErrorViewerCache.clear();
+    this.runtimeErrorViewerCache.set(agentId, { userIds, readAtMs: now });
+    return userIds;
+  }
+
+  protected async loadRuntimeErrorDetailViewerUserIds(agentId: string): Promise<string[]> {
+    return agentService.listAgentRuntimeErrorDetailViewerUserIds(agentId);
+  }
+
   private async emitJointActivityToProjectionRooms(
     agentId: string,
     sourceServerId: string,
@@ -17575,7 +20770,7 @@ export class AgentOrchestrator extends EventEmitter {
     try {
       const channelIds = await this.loadJointActivityProjectionChannelIdsForAgent(agentId, sourceServerId);
       for (const channelId of channelIds) {
-        this.io?.to(`channel:${channelId}`).emit("agent:activity", payload);
+        this.io?.to(`channel:${channelId}`).except(`server:${sourceServerId}`).emit("agent:activity", payload);
       }
     } catch (err) {
       console.error("[AgentOrchestrator] Failed to fan out joint activity", err);
@@ -17586,3 +20781,24 @@ export class AgentOrchestrator extends EventEmitter {
     return channelService.listJointActivityProjectionChannelIdsForAgent(agentId, sourceServerId);
   }
 }
+
+/**
+ * The web copy of a `computer:restart:done` receipt: only the declared fields, with
+ * the server's own `machineId` last so the daemon cannot name another machine. The
+ * daemon's frame used to be spread whole into every web client in the server room.
+ */
+export function computerRestartDoneWebFrame(
+  machineId: string,
+  msg: { type: "computer:restart:done"; requestId: string; ok: boolean; error?: string },
+): { type: "computer:restart:done"; machineId: string; requestId: string; ok: boolean; error?: string } {
+  const frame: { type: "computer:restart:done"; machineId: string; requestId: string; ok: boolean; error?: string } = {
+    type: msg.type,
+    machineId,
+    requestId: String(msg.requestId),
+    ok: msg.ok === true,
+  };
+  if (typeof msg.error === "string") frame.error = msg.error.slice(0, COMPUTER_RESTART_ERROR_MAX_LENGTH);
+  return frame;
+}
+
+const COMPUTER_RESTART_ERROR_MAX_LENGTH = 200;

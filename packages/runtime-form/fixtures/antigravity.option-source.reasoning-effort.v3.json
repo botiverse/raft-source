@@ -1,0 +1,34 @@
+{
+  "protocolVersion": 1,
+  "runtimeId": "antigravity",
+  "schemaVersion": "antigravity.edit.v1",
+  "sourceId": "reasoningEffort",
+  "kind": "dependent_select",
+  "pointer": "/reasoningEffort",
+  "dependsOn": "/model",
+  "optionsByValue": {
+    "gemini-3.8-flash": [
+      {
+        "value": "",
+        "label": "Default"
+      },
+      {
+        "value": "low",
+        "label": "Low"
+      },
+      {
+        "value": "medium",
+        "label": "Medium"
+      },
+      {
+        "value": "high",
+        "label": "High"
+      }
+    ]
+  },
+  "defaultValueByValue": {
+    "gemini-3.8-flash": "medium"
+  },
+  "customValueAllowedByValue": {},
+  "status": "live"
+}

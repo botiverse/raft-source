@@ -1,5 +1,5 @@
 import { useCallback } from "react";
-import { Button } from "@botiverse/raft-ui";
+import { Button, MarkdownLink, TextLinkExternalIcon } from "@botiverse/raft-ui";
 import { useIntl } from "react-intl";
 import Banner from "../ui/Banner";
 import { setPublicVisitorConsent } from "../../analytics/publicVisitorConsent";
@@ -38,22 +38,23 @@ export default function PublicCookieConsent({ onDone }: { onDone: () => void }) 
       title={formatMessage({ id: "pages.publicServer.cookieConsent.title" })}
       actions={(
         <div className="flex items-center gap-2">
-          <Button size="sm" variant="outline" onClick={accept} data-testid="public-cookie-consent-accept">
+          <Button size="md" variant="outline" onClick={accept} data-testid="public-cookie-consent-accept">
             {formatMessage({ id: "pages.publicServer.cookieConsent.accept" })}
           </Button>
-          <Button size="sm" variant="outline" onClick={decline} data-testid="public-cookie-consent-decline">
+          <Button size="md" variant="outline" onClick={decline} data-testid="public-cookie-consent-decline">
             {formatMessage({ id: "pages.publicServer.cookieConsent.decline" })}
           </Button>
         </div>
       )}
     >
-      <span className="text-callout max-sm:text-footnote">
+      <span>
         {formatMessage({ id: "pages.publicServer.cookieConsent.body" })}
-        {/* raft-ui has no general text link; same plain anchor as AnnouncementModal.
+        {/* A link inside the sentence: raft-ui's prose link (MarkdownLink).
             The gap is a margin, not a space literal: Chinese copy takes no space. */}
-        <a href={PRIVACY_POLICY_URL} target="_blank" rel="noopener noreferrer" className="ml-1 text-foreground-link underline decoration-2 underline-offset-2 hover:decoration-attention" data-testid="public-cookie-consent-privacy">
+        <MarkdownLink href={PRIVACY_POLICY_URL} target="_blank" rel="noopener noreferrer" className="ml-1" data-testid="public-cookie-consent-privacy">
           {formatMessage({ id: "pages.publicServer.cookieConsent.privacyLink" })}
-        </a>
+          <TextLinkExternalIcon label={formatMessage({ id: "common.opensInNewTab" })} />
+        </MarkdownLink>
       </span>
     </Banner>
   );

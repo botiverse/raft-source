@@ -5,6 +5,7 @@ import {
 import type {
   MainLayoutSocketBridgeSocket,
 } from "../src/store/socketBridge";
+import { useServerStore } from "../src/store/serverStore";
 import { useAgentStore } from "../src/store/agentStore";
 import type { Agent } from "../src/store/agentStore";
 import { useLiveAgentActivityStore } from "../src/store/liveAgentActivityStore";
@@ -15,6 +16,7 @@ import {
   setAuthTracePrincipalIdGetter,
   setAuthTraceServerIdGetter,
 } from "../src/utils/webAuthTrace";
+import { setAgentActivityTraceRandomForTests } from "../src/utils/webAgentActivityTrace";
 
 const originalCrypto = Object.getOwnPropertyDescriptor(globalThis, "crypto");
 const originalLocalStorage = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
@@ -45,6 +47,7 @@ function makeAgent(overrides: Partial<Agent> = {}): Agent {
 }
 
 function resetAgentStore() {
+  useServerStore.setState({ current: { id: "server-1" } as NonNullable<ReturnType<typeof useServerStore.getState>["current"]> });
   useLiveAgentActivityStore.getState().clear();
   useAgentStore.setState({
     agents: [makeAgent()],
@@ -128,6 +131,8 @@ afterEach(() => {
   if (originalLocalStorage) Object.defineProperty(globalThis, "localStorage", originalLocalStorage);
   else Reflect.deleteProperty(globalThis, "localStorage");
   __resetAuthTraceForTest();
+  // Also forgets each agent's last received activity, so every test starts from a first push.
+  setAgentActivityTraceRandomForTests(null);
   setAuthTraceServerIdGetter(() => undefined);
   setAuthTracePrincipalIdGetter(() => undefined);
   resetAgentStore();
@@ -267,4 +272,24 @@ test("agent:activity socket handler forwards probe refresh provenance without ad
   assert.equal(state.activityLogs["agent-1"]?.length, 1);
   assert.equal(state.agentActivityObservedAt["agent-1"], 21_000);
   assert.equal(state.agentActivitySeq["agent-1"], 2);
+});
+
+
+test("joint peer presence updates its profile but cannot enter the current server working summary", () => {
+  resetAgentStore();
+  const oldCurrent = useServerStore.getState().current;
+  useServerStore.setState({ current: { id: "server-1" } as typeof oldCurrent });
+  useAgentStore.setState({ agents: [makeAgent(), makeAgent({ id: "peer", serverId: "server-2" })] });
+  try {
+    const handler = agentActivityHandler();
+    handler({ agentId: "peer", activity: "working", detail: "", timestamp: 1000 });
+    handler({ agentId: "unknown-peer", activity: "working", timestamp: 1000 });
+    assert.equal(useLiveAgentActivityStore.getState().items.length, 0);
+    assert.equal(useAgentStore.getState().agentActivities.peer.activity, "working");
+    handler({ agentId: "agent-1", activity: "working", detail: "Local work", timestamp: 1000 });
+    assert.deepEqual(useLiveAgentActivityStore.getState().items.map((item) => item.agentId), ["agent-1"]);
+  } finally {
+    useServerStore.setState({ current: oldCurrent });
+    resetAgentStore();
+  }
 });

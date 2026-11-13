@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -8,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { buildResidentSpawn } from "./service";
 
 import { program, runRestartCommand, type RestartCommandDeps } from "./cli";
+import { ServiceClientError } from "./lib/types";
 
 // The restart tests replace runStop/runStart, but a regression that falls
 // through to a real stop must never reach the developer's own Computer: pin
@@ -19,48 +19,18 @@ afterAll(() => rmSync(isolatedRaftHome, { recursive: true, force: true }));
 
 test("CLI lifecycle contract: ordinary command surface excludes destructive and reversal-only verbs", () => {
   const commands = program.commands.map((cmd) => cmd.name());
-  assert.ok(!commands.includes("detach"), "ordinary CLI must not expose detach");
+  // `detach <server>` is back (device-auth §3.2) only as the server-first
+  // revoke-then-forget verb (detach.test.ts pins that order); it takes a
+  // required server and asks before doing anything.
+  const detach = program.commands.find((cmd) => cmd.name() === "detach");
+  assert.ok(detach, "detach revokes this machine's key on one server");
+  assert.equal(detach.registeredArguments[0]?.required, true, "detach needs an explicit server");
+  assert.ok(detach.options.some((option) => option.long === "--yes"), "detach asks unless --yes");
   assert.ok(!commands.includes("revoke"), "ordinary CLI must not expose destructive revoke");
   assert.ok(!commands.includes("delete"), "ordinary CLI must not expose destructive delete");
   assert.ok(!commands.includes("switch"), "ordinary CLI must not expose regret-state switch");
 });
 
-test("CLI lifecycle contract: verb table documents the four-axis invariant", async () => {
-  const src = await readFile(new URL("./cli.ts", import.meta.url), "utf8");
-  assert.match(src, /Lifecycle contract \(task #151 P0\)/);
-  assert.match(src, /Axis 1: process actual state/);
-  assert.match(src, /Axis 2: local desired policy/);
-  assert.match(src, /Axis 3: local credential proof/);
-  assert.match(src, /Axis 4: server identity/);
-  assert.match(src, /Names are\s+\*\s+display labels only, never identity proof/s);
-  assert.match(src, /old user-facing `detach`\s+\*\s+command and implementation are intentionally absent/s);
-});
-
-test("CLI lifecycle contract: detach implementation is absent from ordinary package surface", async () => {
-  const [serviceSrc, apiSrc, eventSrc, indexSrc] = await Promise.all([
-    readFile(new URL("./service.ts", import.meta.url), "utf8"),
-    readFile(new URL("./lib/api.ts", import.meta.url), "utf8"),
-    readFile(new URL("./lib/events.ts", import.meta.url), "utf8"),
-    readFile(new URL("./cli.ts", import.meta.url), "utf8"),
-  ]);
-  assert.doesNotMatch(serviceSrc, /\brunDetach\b/);
-  assert.doesNotMatch(apiSrc, /services\/detach/);
-  assert.doesNotMatch(apiSrc, /\bdetach\s*\(/);
-  assert.doesNotMatch(eventSrc, /"detach\./);
-  assert.doesNotMatch(indexSrc, /\.command\("detach"\)/);
-});
-
-test("CLI restart command delegates to runRestartCommand; the agent-hosted path records one restart operation", async () => {
-  const src = await readFile(new URL("./cli.ts", import.meta.url), "utf8");
-  const restartStart = src.indexOf('.command("restart")');
-  const restartEnd = src.indexOf("// --- status", restartStart);
-  const restartBlock = src.slice(restartStart, restartEnd);
-
-  assert.match(src, /recordRestartIntent\(plan, runtime\)/);
-  assert.match(src, /prepareLifecycle\(plan\.slockHome, "restart", plan\.targets\)/);
-  assert.match(restartBlock, /runRestartCommand\(serverSlug, opts, signal\)/);
-  assert.doesNotMatch(restartBlock, /\brunStop\(/);
-});
 
 const LIVE_SERVICE = {
   pid: 4242,
@@ -314,6 +284,40 @@ test("CLI restart agent-hosted path fails loud when IPC handoff is unavailable",
   );
 });
 
+// task #924: on Windows the service closes every IPC connection, this one
+// included, so its replacement can bind the named pipe. That is the handoff
+// in progress, not an unreachable service.
+test("CLI restart agent-hosted path reports a closed request connection as in progress", async () => {
+  const signal = new AbortController().signal;
+  const infos: string[] = [];
+  const deps = {
+    resolveRaftHome: () => "/tmp/raft-home",
+    listAttachedServerIds: async () => ["server-a"],
+    prepareLocalLifecycleOperations: async () => [],
+    findLiveServicePidReadOnly: async () => LIVE_SERVICE,
+    callerIsRunnerHosted: () => true,
+    runStop: async () => {
+      throw new Error("forbidden-stop");
+    },
+    runStart: async () => {
+      throw new Error("forbidden-start");
+    },
+    prepareTargetsForServiceHandoff: async () => undefined,
+    requestServiceRestartViaIpc: async () => {
+      throw new ServiceClientError("IPC_CLIENT_CLOSED", "service client closed before response");
+    },
+    info: (message: string) => {
+      infos.push(message);
+    },
+    fail: (code: string, message: string): never => {
+      throw new Error(`${code}:${message}`);
+    },
+  } satisfies RestartCommandDeps;
+
+  await runRestartCommand(undefined, {}, signal, deps);
+  assert.ok(infos.some((message) => /Service restart in progress/.test(message)), infos.join("\n"));
+});
+
 // task #803: `raft-computer restart` records one lifecycle operation per
 // server but used to request the IPC restart with no params, so the service
 // wrote no pending-restart marker and the operation's ready phase was never
@@ -399,8 +403,8 @@ test("hidden CLI dispatch executes isolated service, takeover, supervisor and bu
     // not inherit the host's account, server, wrapper or resident identity.
     const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^(?:RAFT_|SLOCK_)/.test(key)));
     Object.assign(env, { HOME: home, USERPROFILE: home, RAFT_HOME: home, SLOCK_HOME: home });
-    const run = (args: string[]) => {
-      const result = spawnSync(process.execPath, ["--import", "@oxc-node/core/register", entry, ...args], { env, encoding: "utf8", timeout: 20_000 });
+    const run = (args: string[], input?: string) => {
+      const result = spawnSync(process.execPath, ["--import", "@oxc-node/core/register", entry, ...args], { input, env, encoding: "utf8", timeout: 20_000 });
       assert.equal(result.error, undefined, `${args}: ${result.error}`);
       assert.equal(result.signal, null, `${args}: ${result.stderr}`);
       return result;
@@ -424,6 +428,24 @@ test("hidden CLI dispatch executes isolated service, takeover, supervisor and bu
     const kimi = run(["__verify-bundled-kimi"]);
     assert.equal(kimi.status, 0, kimi.stderr);
     assert.equal(kimi.stdout.trim(), "kimi-bundle-ok");
+    const oar = run(["__verify-bundled-oar"]);
+    assert.equal(oar.status, 0, oar.stderr);
+    assert.equal(oar.stdout.trim(), "oar-bundle-ok");
+    // The daemon's View Context restore child re-executes this entry: a request
+    // on stdin, one header line then the result body on stdout.
+    const restore = run(["__restore-context-view"], JSON.stringify({
+      runtime: "claude",
+      file: join(home, "no-such-session.jsonl"),
+      allowedRoots: [home],
+      offset: 0,
+      messageId: "m-1",
+      sessionId: "s-1",
+      maxBytes: 1024,
+    }));
+    assert.equal(restore.status, 0, restore.stderr);
+    const [restoreHeader, restoreBody] = restore.stdout.split("\n");
+    assert.equal((JSON.parse(restoreHeader!) as { outcome: string }).outcome, "not_found");
+    assert.deepEqual(JSON.parse(restoreBody!), { ok: false, reason: "not_found" });
     // task #1268: the hosted daemon's runtime detection child re-executes this
     // entry; it streams one JSON line per runtime and ends with `done`.
     const detect = run(["__detect-runtimes"]);

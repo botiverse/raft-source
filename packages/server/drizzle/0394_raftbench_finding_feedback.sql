@@ -1,0 +1,1 @@
+ALTER TABLE "raftbench_findings" ADD COLUMN "feedback" jsonb DEFAULT '{}'::jsonb NOT NULL;

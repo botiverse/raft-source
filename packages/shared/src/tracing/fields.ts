@@ -79,6 +79,8 @@ export const TRACE_B0_FIELD_DEFINITIONS = defineTraceFields([
   { key: "machine_id", fieldClass: "query_axis", placement: "span", valueKind: "identity", highCardinality: true },
   { key: "agent_id", fieldClass: "query_axis", placement: "span_or_event", valueKind: "identity", highCardinality: true },
   { key: "agent_id_hash", fieldClass: "query_axis", placement: "span_or_event", valueKind: "identity", highCardinality: true },
+  { key: "claimed_agent_id_hash", fieldClass: "query_axis", placement: "span_or_event", valueKind: "identity", highCardinality: true },
+  { key: "key_prefix_hash", fieldClass: "query_axis", placement: "span_or_event", valueKind: "identity", highCardinality: true },
   { key: "server_id_hash", fieldClass: "query_axis", placement: "span_or_event", valueKind: "identity", highCardinality: true },
   { key: "trace_user_id", fieldClass: "query_axis", placement: "span_or_event", valueKind: "identity", highCardinality: true },
   { key: "job_id", fieldClass: "query_axis", placement: "span_or_event", valueKind: "identity", highCardinality: true },

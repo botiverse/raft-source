@@ -129,7 +129,7 @@ export default function RequestedScopeConsent({
       <div className="mt-1 text-callout text-foreground-muted">
         {requestedAccessCopy}
       </div>
-      <Card className="mt-3 space-y-3 p-3">
+      <Card className="mt-3 stack-y-3 p-3">
         {renderEmptyRecognizedScopes()}
         {(["identity", "agent_directory", "agent_messaging"] as OAuthScopeTier[]).map(renderTierScopes)}
         {renderAgentInboundNotice()}

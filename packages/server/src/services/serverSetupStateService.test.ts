@@ -20,7 +20,6 @@ import {
   type ServerSetupStateRepository,
 } from "./serverSetupStateService";
 import { OFFICIAL_ONBOARDING_AGENT_IDENTITY } from "./officialOnboardingAgentIdentity";
-import { GROK_RUNTIME_FEATURE_FLAG_KEY } from "./featureFlagService";
 
 
 function cloneState(state: ServerSetupState): ServerSetupState {
@@ -70,6 +69,7 @@ const LIVE_READY: ServerSetupLiveFacts = {
   officialOnboardingAgent: "usable",
   ownerSurveyPending: false,
   ownerHandoffPending: false,
+  ownerUpgradePromptPending: false,
   actorIsOwner: true,
 };
 
@@ -251,6 +251,7 @@ test("projection names live blockers without changing the durable phase", () => 
     officialOnboardingAgent: "missing",
     ownerSurveyPending: false,
     ownerHandoffPending: false,
+    ownerUpgradePromptPending: false,
     actorIsOwner: true,
   }), {
     surface: "computer_runtime",
@@ -268,7 +269,7 @@ test("projection names live blockers without changing the durable phase", () => 
     runtimeOptions: [],
     hasConnectedComputer: true,
     offlineComputers: [],
-    postSetup: { surveyPending: false, handoffPending: false },
+    postSetup: { surveyPending: false, upgradePending: false, handoffPending: false },
   });
 
   assert.equal(projectServerSetup(deferred, {
@@ -277,6 +278,7 @@ test("projection names live blockers without changing the durable phase", () => 
     officialOnboardingAgent: "missing",
     ownerSurveyPending: false,
     ownerHandoffPending: false,
+    ownerUpgradePromptPending: false,
     actorIsOwner: true,
   }).gateReason, "runtime_not_ready");
 
@@ -291,6 +293,7 @@ test("projection names live blockers without changing the durable phase", () => 
     officialOnboardingAgent: "missing",
     ownerSurveyPending: false,
     ownerHandoffPending: false,
+    ownerUpgradePromptPending: false,
     actorIsOwner: true,
   }).blocksChat, true);
 });
@@ -309,6 +312,7 @@ test("a legacy deferred row reads non-blocking from status alone, with no timest
     officialOnboardingAgent: "missing",
     ownerSurveyPending: false,
     ownerHandoffPending: false,
+    ownerUpgradePromptPending: false,
     actorIsOwner: true,
   });
   assert.equal(projection.blocksChat, false, "a legacy deferred owner must not be re-locked during rollout");
@@ -331,6 +335,7 @@ test("the projection carries the runtime verdict, so the browser never has to gu
     officialOnboardingAgent: "missing" as const,
     ownerSurveyPending: false,
     ownerHandoffPending: false,
+    ownerUpgradePromptPending: false,
     actorIsOwner: true,
   };
 
@@ -360,6 +365,7 @@ test("handoff is owed only to flow completions, never grandfathered/admin_overri
     officialOnboardingAgent: "usable" as const,
     ownerSurveyPending: false,
     ownerHandoffPending: true,
+    ownerUpgradePromptPending: false,
     actorIsOwner: true,
   };
 
@@ -403,11 +409,12 @@ test("a legacy row the backfill missed fails OPEN: nobody is locked out by a NUL
     ...LIVE_READY,
     ownerSurveyPending: true,   // signup_survey_completed_at IS NULL (pre-migration user)
     ownerHandoffPending: true,  // setup_handoff_acknowledged_at IS NULL (column is new)
+    ownerUpgradePromptPending: false,
     actorIsOwner: true,
   };
 
   const projection = projectServerSetup(legacyMissedByBackfill, everythingNull);
-  assert.deepEqual(projection.postSetup, { surveyPending: false, handoffPending: false });
+  assert.deepEqual(projection.postSetup, { surveyPending: false, upgradePending: false, handoffPending: false });
   assert.equal(projection.blocksChat, false, "a NULL must never block someone out of their own server");
 });
 
@@ -422,7 +429,7 @@ test("setting up a server is the owner's business — an admin is not shown the 
   });
   assert.equal(projection.surface, "none");
   assert.equal(projection.gateReason, "insufficient_permission");
-  assert.deepEqual(projection.postSetup, { surveyPending: false, handoffPending: false });
+  assert.deepEqual(projection.postSetup, { surveyPending: false, upgradePending: false, handoffPending: false });
   assert.equal(projection.blocksChat, false, "an admin must never be blocked out of chat by someone else's setup");
 
   await assert.rejects(
@@ -445,12 +452,12 @@ test("post-setup screens: one eligibility, owner-only, and driven by the ACK, no
 
   // 1. Owner who finished the real flow and has not answered/acknowledged: both are owed.
   const normal = projectServerSetup(makeState({ status: "complete", completionReason: "normal" }), owed);
-  assert.deepEqual(normal.postSetup, { surveyPending: true, handoffPending: true });
+  assert.deepEqual(normal.postSetup, { surveyPending: true, upgradePending: false, handoffPending: true });
 
   // 2. Same, having deferred and come back: still the real flow.
   assert.deepEqual(
     projectServerSetup(makeState({ status: "complete", completionReason: "complete_after_defer" }), owed).postSetup,
-    { surveyPending: true, handoffPending: true },
+    { surveyPending: true, upgradePending: false, handoffPending: true },
   );
 
   // 3. Existing servers never went through onboarding. They owe NOTHING — and that must
@@ -459,7 +466,7 @@ test("post-setup screens: one eligibility, owner-only, and driven by the ACK, no
   for (const reason of ["grandfathered", "admin_override"] as const) {
     assert.deepEqual(
       projectServerSetup(makeState({ status: "complete", completionReason: reason }), owed).postSetup,
-      { surveyPending: false, handoffPending: false },
+      { surveyPending: false, upgradePending: false, handoffPending: false },
       `${reason} must owe neither screen`,
     );
   }
@@ -471,7 +478,7 @@ test("post-setup screens: one eligibility, owner-only, and driven by the ACK, no
       makeState({ status: "complete", completionReason: "normal" }),
       { ...owed, actorIsOwner: false },
     ).postSetup,
-    { surveyPending: false, handoffPending: false },
+    { surveyPending: false, upgradePending: false, handoffPending: false },
   );
 
   // 5. The handoff follows the ACKNOWLEDGMENT, never the briefing's delivery. An owner who
@@ -484,6 +491,38 @@ test("post-setup screens: one eligibility, owner-only, and driven by the ACK, no
     ).postSetup.handoffPending,
     false,
   );
+});
+
+test("post-setup Pro step: owed only before the handoff, to the owner of a real setup", () => {
+  const owed = {
+    ...LIVE_READY,
+    ownerSurveyPending: true,
+    ownerHandoffPending: true,
+    ownerUpgradePromptPending: true,
+    actorIsOwner: true,
+  };
+  const normal = makeState({ status: "complete", completionReason: "normal" });
+
+  assert.deepEqual(
+    projectServerSetup(normal, owed).postSetup,
+    { surveyPending: true, upgradePending: true, handoffPending: true },
+  );
+
+  // Answered or not Free: the resolver reports the fact as not owed.
+  assert.equal(projectServerSetup(normal, { ...owed, ownerUpgradePromptPending: false }).postSetup.upgradePending, false);
+
+  // After "Let's Go" the step never comes back, whatever the other facts say.
+  assert.equal(projectServerSetup(normal, { ...owed, ownerHandoffPending: false }).postSetup.upgradePending, false);
+
+  // Same eligibility as the survey and handoff: not for admins, not for servers that skipped onboarding.
+  assert.equal(projectServerSetup(normal, { ...owed, actorIsOwner: false }).postSetup.upgradePending, false);
+  for (const reason of ["grandfathered", "admin_override"] as const) {
+    assert.equal(
+      projectServerSetup(makeState({ status: "complete", completionReason: reason }), owed).postSetup.upgradePending,
+      false,
+      `${reason} must not owe the Pro step`,
+    );
+  }
 });
 
 test("actor-aware resolver hides setup from agents and non-managers", async () => {
@@ -506,7 +545,7 @@ test("actor-aware resolver hides setup from agents and non-managers", async () =
     runtimeOptions: [],
     hasConnectedComputer: false,
     offlineComputers: [],
-    postSetup: { surveyPending: false, handoffPending: false },
+    postSetup: { surveyPending: false, upgradePending: false, handoffPending: false },
   });
   assert.equal(agent.getLiveReads(), 0);
 
@@ -570,7 +609,7 @@ test("one owner's completion completes the server for every co-owner", async () 
   assert.equal(projection.phase, "complete");
   assert.equal(projection.gateReason, "setup_complete");
   assert.equal(projection.blocksChat, false);
-  assert.deepEqual(projection.postSetup, { surveyPending: false, handoffPending: false });
+  assert.deepEqual(projection.postSetup, { surveyPending: false, upgradePending: false, handoffPending: false });
   assert.equal(coOwner.repository.state?.status, "not_started", "projection needs no backfill write");
   assert.equal(coOwner.getServerCompletedReads(), 1);
   assert.equal(coOwner.getLiveReads(), 0);
@@ -787,7 +826,7 @@ test("resolveServerSetupLiveFacts reads persisted runtimes cross-replica, so Nex
   assert.equal(projectServerSetup(inProgress, deprecatedOnly).surface, "computer_runtime");
 });
 
-test("setup readiness uses new-admission policy instead of raw Grok capability", async ({ onTestFinished }) => {
+test("setup readiness counts a Grok-only computer as ready without a feature flag", async ({ onTestFinished }) => {
   await openTestDatabase("pglite://");
   onTestFinished(async () => closeTestDatabase());
   const db = getDb();
@@ -812,24 +851,21 @@ test("setup readiness uses new-admission policy instead of raw Grok capability",
     machineId: machine.id,
   });
 
-  const orchestrator = { getMachineStatus: async () => "online" as const };
-  const disabled = await resolveServerSetupLiveFacts(server.id, owner.id, orchestrator);
-  assert.equal(disabled.runtime, "not_ready");
-  assert.equal(disabled.runtimeOptions?.some((option) => option.runtimeId === "grok"), false);
-
+  // A leftover rule from the retired grok_runtime_v0 rollout is ignored.
   await db.insert(featureFlagRules).values({
     id: randomUUID(),
-    flagKey: GROK_RUNTIME_FEATURE_FLAG_KEY,
+    flagKey: "grok_runtime_v0",
     stage: "server",
     priority: 0,
-    decision: "allow",
+    decision: "deny",
     values: [server.id],
   });
 
-  const enabled = await resolveServerSetupLiveFacts(server.id, owner.id, orchestrator);
-  assert.equal(enabled.runtime, "ready_other");
+  const orchestrator = { getMachineStatus: async () => "online" as const };
+  const facts = await resolveServerSetupLiveFacts(server.id, owner.id, orchestrator);
+  assert.equal(facts.runtime, "ready_other");
   assert.equal(
-    enabled.runtimeOptions?.find((option) => option.runtimeId === "grok")?.canSelectInThisContext,
+    facts.runtimeOptions?.find((option) => option.runtimeId === "grok")?.canSelectInThisContext,
     true,
   );
 });

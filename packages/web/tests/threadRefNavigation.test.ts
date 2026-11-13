@@ -5,6 +5,7 @@ import {
   captureThreadRouteAuthorityGuard,
   consumeThreadRefHandoffSearch,
   executeThreadRefHandoffOnce,
+  isThreadRefParentChannelUnlisted,
   findThreadRefParentChannel,
   isThreadRouteAuthorityCurrent,
   findThreadParentMessageIdByShortId,
@@ -289,6 +290,41 @@ test("production handoff consumes before await and a thrown resolve cannot repla
   );
   assert.equal(resolveCalls, 2, "a fresh nonce for the same target remains actionable");
   assert.deepEqual(events, ["consume", "failure", "consume-new", "open"]);
+});
+
+test("a handoff says whether it failed locally (channel not listed, no request) or on resolve", async () => {
+  const reasons: string[] = [];
+  const base = {
+    consumedHandoffs: new Set<string>(),
+    serverSlug: "host",
+    serverEpoch: 7,
+    consume: () => {},
+    resolve: async () => null,
+    getAuthority: () => ({ serverSlug: "host", serverEpoch: 7 }),
+    onOpen: () => {},
+    onFailure: (reason: string) => { reasons.push(reason); },
+  };
+  const intent = { serverSlug: "host", parentChannelName: "src", shortId: "abcdef12" };
+  assert.equal(await executeThreadRefHandoffOnce({ ...base, channels: [], intent: { ...intent, handoffId: "n-1" } }), "failed");
+  assert.equal(
+    await executeThreadRefHandoffOnce({
+      ...base,
+      channels: [{ id: "host-src", name: "src", type: "channel" }],
+      intent: { ...intent, handoffId: "n-2" },
+    }),
+    "failed",
+  );
+  assert.deepEqual(reasons, ["channel_not_listed", "unresolved"]);
+});
+
+test("only a channel name missing from the list counts as not listed: not a DM, a shared name or a different id", () => {
+  const intent = { serverSlug: "host", parentChannelName: "src", shortId: "abcdef12" };
+  const src = { id: "host-src", name: "src", type: "channel" };
+  assert.equal(isThreadRefParentChannelUnlisted(intent, "host", []), true);
+  assert.equal(isThreadRefParentChannelUnlisted(intent, "host", [src, { ...src, id: "host-src-2" }]), false, "shared name");
+  assert.equal(isThreadRefParentChannelUnlisted({ ...intent, parentChannelId: "gone" }, "host", [src]), false, "different id");
+  assert.equal(isThreadRefParentChannelUnlisted({ ...intent, parentChannelType: "dm" }, "host", []), false, "dm");
+  assert.equal(isThreadRefParentChannelUnlisted(intent, "other", []), false, "other server");
 });
 
 test("production handoff tombstones have bounded FIFO retention", async () => {

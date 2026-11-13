@@ -13,6 +13,14 @@ import type { ParsedEvent } from "./drivers/types";
  */
 export const DELIVERY_CONSUMPTION_OBSERVATION_THRESHOLD = 3;
 
+/**
+ * Reconciler step 6: how long input written into a running turn keeps the
+ * process from reading as idle after that turn ends, unless a new turn
+ * starts first (`queuedInputPending`). The old features-restart settle
+ * window, now applied only when such a write is known to have landed.
+ */
+export const QUEUED_INPUT_SETTLE_MS = 10_000;
+
 export type DeliveryWritePath =
   | "stdin_idle_delivery"
   | "stdin_turn_end_delivery"
@@ -66,11 +74,28 @@ export class DeliveryConsumptionWatch {
   private lastDeliveryError: { atMs: number; errorClass: string } | null = null;
   /** Whether a model-visible event (thinking/text/tool) happened in the current turn. */
   private turnHadContent = false;
+  /** Writes since the last consumption signal that nothing explains: only these cross the threshold (`recordWrite` `expected`). */
+  private unexplained = 0;
+  /** Writes that landed into the running turn since the last turn end (`recordWrite` `intoRunningTurn`). */
+  private midTurnWrites = 0;
+  /** What the last turn end left queued for a next turn; `taken` once a turn started after it, until that turn's end. */
+  private queuedForNextTurnState: { count: number; turnEndAtMs: number; taken: boolean } | null = null;
 
   constructor(private readonly threshold: number = DELIVERY_CONSUMPTION_OBSERVATION_THRESHOLD) {}
 
-  /** A stdin write succeeded. Returns the observation to record. */
-  recordWrite(key: string | null, path: DeliveryWritePath, nowMs: number): DeliveryWriteObservation {
+  /**
+   * A stdin write succeeded. Returns the observation to record.
+   * `intoRunningTurn`: written while a turn runs (a busy write). Events of
+   * that same turn reset the unconsumed count, yet a runtime may only have
+   * queued it for a turn of its own after the turn end; see
+   * `queuedForNextTurn`.
+   * `expected`: the runtime has a reason not to answer yet (a turn is running,
+   * or it is waiting on its own background task). Counted and traced as any
+   * write, but it can't cross the threshold: queueing there is normal
+   * (#triage:eedc43fe, a 3.5 min background task read as "not consuming").
+   */
+  recordWrite(key: string | null, path: DeliveryWritePath, nowMs: number, intoRunningTurn = false, expected = intoRunningTurn): DeliveryWriteObservation {
+    if (intoRunningTurn) this.midTurnWrites += 1;
     if (this.unconsumed === 0) {
       this.episode += 1;
       this.firstUnconsumedAtMs = nowMs;
@@ -79,7 +104,8 @@ export class DeliveryConsumptionWatch {
     this.lastDeliveryAtMs = nowMs;
     this.lastDeliveryKey = key;
     this.lastDeliveryPath = path;
-    return { ...this.snapshot(), thresholdCrossed: this.unconsumed === this.threshold };
+    if (!expected) this.unexplained += 1;
+    return { ...this.snapshot(), thresholdCrossed: !expected && this.unexplained === this.threshold };
   }
 
   /** A model-driven runtime event arrived for the live launch. */
@@ -87,11 +113,14 @@ export class DeliveryConsumptionWatch {
     if (kind === "turn_end") {
       this.lastRuntimeResult = { kind: "completed", atMs: nowMs, empty: !this.turnHadContent };
       this.turnHadContent = false;
+      this.queuedForNextTurnState = this.midTurnWrites > 0 ? { count: this.midTurnWrites, turnEndAtMs: nowMs, taken: false } : null;
+      this.midTurnWrites = 0;
     } else {
       this.turnHadContent = true;
     }
     this.lastConsumption = { kind, atMs: nowMs };
     this.unconsumed = 0;
+    this.unexplained = 0;
     this.firstUnconsumedAtMs = null;
   }
 
@@ -100,12 +129,42 @@ export class DeliveryConsumptionWatch {
     this.lastRuntimeResult = { kind: "error", atMs: nowMs, errorClass };
     this.turnHadContent = false;
     this.unconsumed = 0;
+    this.unexplained = 0;
     this.firstUnconsumedAtMs = null;
   }
 
   /** The daemon failed to write. Not consumption; recorded separately and never resets the counter. */
   recordDeliveryError(errorClass: string, nowMs: number): void {
     this.lastDeliveryError = { atMs: nowMs, errorClass };
+  }
+
+  /**
+   * The runtime did model work (the caller passes every main-session model
+   * event): after a turn end that left input queued, that is a turn starting
+   * on it, which runs until its own turn end (`recordConsumption`).
+   */
+  noteTurnStarted(): void {
+    if (this.queuedForNextTurnState) this.queuedForNextTurnState.taken = true;
+  }
+
+  /**
+   * Writes that landed while the last turn ran, as of its turn end. Not
+   * consumption evidence either way: the turn's own events may have taken
+   * them, or the runtime may run them as its next turn right after the turn
+   * end. `taken`: a turn started since, and has not ended.
+   */
+  queuedForNextTurn(): { count: number; turnEndAtMs: number; taken: boolean } | null {
+    return this.queuedForNextTurnState ? { ...this.queuedForNextTurnState } : null;
+  }
+
+  /**
+   * Whether such writes may still be, or are being, run: a turn started on
+   * them and has not ended, or none has and the turn end is less than
+   * `settleMs` ago.
+   */
+  queuedInputPending(nowMs: number, settleMs: number = QUEUED_INPUT_SETTLE_MS): boolean {
+    const queued = this.queuedForNextTurnState;
+    return queued !== null && (queued.taken || nowMs - queued.turnEndAtMs < settleMs);
   }
 
   snapshot(): DeliveryConsumptionSnapshot {

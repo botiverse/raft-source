@@ -19,6 +19,7 @@ import {
   MessageForwardedBundleItemMeta,
   MessageForwardedBundleItems,
   MessageForwardedBundleSource,
+  MessageForwardedBundleSourceLabel,
   MessageImageGalleryPreview,
 } from "@botiverse/raft-ui";
 import { useTimeFormatter } from "../../hooks/useTimeFormatter";
@@ -28,6 +29,8 @@ import { fetchInlineAttachmentUrls } from "./inlineAttachmentUrlCache";
 import { AttachmentChip } from "./AttachmentChip";
 import { isDocumentPreviewAttachment } from "./attachmentPreview";
 import type { MessageAttachment } from "../../store/messageStore";
+import { getMessageBodyFontSizeClass, getMessageBodyFontSizeStyle, useAppearanceStore } from "../../store/appearanceStore";
+import { isHeicImageMimeType } from "../../utils/imageMimeTypes";
 
 export interface ForwardedBundleAttachmentSnapshot {
   id?: string;
@@ -59,6 +62,10 @@ export interface ForwardedBundleItem {
   sourceTargetId?: string | null;
   sourceThreadId?: string | null;
   parentChannelId?: string | null;
+  /** A task discussion's source (public sources only): the task, its number and title. */
+  sourceTaskId?: string | null;
+  sourceTaskNumber?: number | null;
+  sourceTaskTitle?: string | null;
   sourceMessageId?: string | null;
   sourceAuthorSnapshot?: ForwardedBundleSenderSnapshot;
   sourceCreatedAt?: string;
@@ -84,7 +91,9 @@ export function isForwardedBundleMetadata(value: unknown): value is ForwardedBun
 
 function isForwardedImagePreview(attachment: ForwardedBundleAttachmentSnapshot) {
   const mimeType = attachment.mimeType?.split(";")[0]?.trim().toLowerCase();
-  if (mimeType === "image/svg+xml") return false;
+  // The gallery loads the raw file: SVG is active content and HEIC does not
+  // decode outside Safari, so both stay file chips.
+  if (mimeType === "image/svg+xml" || isHeicImageMimeType(mimeType)) return false;
   if (mimeType?.startsWith("image/")) return true;
   return /\.(?:avif|gif|jpe?g|png|webp)$/i.test(attachment.filename);
 }
@@ -154,6 +163,9 @@ function sourceLabel(item: ForwardedBundleItem | undefined, formatMessage: IntlS
         ? formatMessage({ id: "message.forwardedBundle.fromSource" }, { target: target.label })
         : formatMessage({ id: "message.forwardedBundle.fromThread" }, { target: target.label });
     }
+    // A task discussion: `from #android:#7 · <task title>`; without the title (older bundles), as today.
+    const taskTitle = target.type === "task" ? item?.sourceTaskTitle?.trim() : undefined;
+    if (taskTitle) return formatMessage({ id: "message.forwardedBundle.fromTask" }, { target: target.label, title: taskTitle });
     return formatMessage({ id: "message.forwardedBundle.fromSource" }, { target: target.label });
   }
   return null;
@@ -170,9 +182,14 @@ function canOpenSourceLabel(item: ForwardedBundleItem | undefined) {
 
 function ForwardedBundleContent({ item }: { item: ForwardedBundleItem }) {
   const content = item.contentSnapshot || "";
+  const messageBodyFontSize = useAppearanceStore((s) => s.messageBodyFontSize);
 
   return (
-    <MessageForwardedBundleItemContent data-testid="forwarded-bundle-content">
+    <MessageForwardedBundleItemContent
+      data-testid="forwarded-bundle-content"
+      className={getMessageBodyFontSizeClass(messageBodyFontSize)}
+      style={getMessageBodyFontSizeStyle(messageBodyFontSize)}
+    >
       <MarkdownContent source={content} density="compact" enableMermaid />
     </MessageForwardedBundleItemContent>
   );
@@ -229,10 +246,13 @@ function ForwardedBundleImageTile({
   const handleOpen = useCallback(() => {
     onOpen?.(attachment);
   }, [onOpen, attachment]);
+  // A source that failed to load shows the placeholder icon, not a broken image.
+  const [failedSrc, setFailedSrc] = useState<string | null>(null);
+  const handleImageError = useCallback(() => setFailedSrc(resolvedSrc ?? null), [resolvedSrc]);
   return (
     <MessageForwardedBundleGalleryTile data-testid="forwarded-bundle-image">
-      {resolvedSrc ? (
-        <img src={resolvedSrc} alt={attachment.filename} loading="lazy" />
+      {resolvedSrc && resolvedSrc !== failedSrc ? (
+        <img src={resolvedSrc} alt={attachment.filename} loading="lazy" onError={handleImageError} />
       ) : (
         <div className="flex h-full w-full items-center justify-center bg-fill-muted text-foreground-hint">
           <ImageIcon aria-hidden size={18} />
@@ -316,7 +336,7 @@ function ForwardedBundleAttachments({
     : attachments;
 
   return (
-    <div className="mt-1.5 space-y-1.5">
+    <div className="mt-1.5 stack-y-1.5">
       {imageAttachments.length > 0 ? (
         <ForwardedBundleImageGallery attachments={imageAttachments} onOpen={onOpenAttachment} />
       ) : null}
@@ -397,9 +417,9 @@ export default function ForwardedBundleCard({
             </MessageForwardedBundleSource>
           </AttachmentTooltip>
         ) : label ? (
-          <MessageForwardedBundleSource data-testid="forwarded-bundle-source-label">
+          <MessageForwardedBundleSourceLabel data-testid="forwarded-bundle-source-label">
             {label}
-          </MessageForwardedBundleSource>
+          </MessageForwardedBundleSourceLabel>
         ) : null}
       </MessageForwardedBundleHeader>
       <MessageForwardedBundleItems collapsed={forceExpanded ? false : undefined}>

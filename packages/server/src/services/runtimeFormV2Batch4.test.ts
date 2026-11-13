@@ -23,6 +23,7 @@ import {
 } from "@botiverse/raft-runtime-form";
 import {
   BASE_REASONING_EFFORTS,
+  PI_REASONING_EFFORTS,
   parseRuntimeConfig,
   REASONING_EFFORT_RUNTIMES,
   RUNTIME_FAST_MODE_RUNTIMES,
@@ -31,6 +32,8 @@ import {
   type RuntimeConfig,
   type RuntimeModelInfo,
   type RuntimeModelSourceOutcome,
+  PI_BUILTIN_PROVIDER_DEFAULT_MODELS,
+  PI_BUILTIN_PROVIDER_MODELS,
 } from "@botiverse/raft-shared";
 
 import { reasoningEffortOptionsForModel } from "../../../web/src/utils/reasoningEffortOptions";
@@ -38,12 +41,8 @@ import {
   buildRuntimeConfig,
   PI_BUILTIN_PROVIDER_IDS,
   PI_PROVIDER_CONFIGURED,
-  piBuiltinProviderDefaultModel,
-  piBuiltinProviderModels,
   supportsRuntimeApiUrl,
   supportsRuntimeCommand,
-  supportsRuntimeCustomModelName,
-  supportsRuntimePiProvider,
 } from "../../../web/src/utils/runtimeConfigForm";
 import { RouteFailureError } from "../tracing/routeFailure";
 import { runtimeFormV1Entry } from "./runtimeFormDefinitionService";
@@ -60,6 +59,17 @@ import {
   type RuntimeFormOptionSourceContext,
 } from "./runtimeFormV2Registry";
 import { RUNTIME_FORM_V2_REASON_RETRYABLE } from "./runtimeFormV2SourceStatus";
+
+// Frozen from the retired web legacy form (task #8, PR #11812): the runtimes whose
+// model field accepted a typed custom name. The v2 forms must keep matching it.
+const LEGACY_CUSTOM_MODEL_NAME_RUNTIMES = new Set(["builtin", "claude", "codex", "cursor", "copilot", "pi"]);
+const supportsRuntimeCustomModelName = (runtime: string) => LEGACY_CUSTOM_MODEL_NAME_RUNTIMES.has(runtime);
+// The retired legacy form offered Pi's provider picker for Pi only; its model
+// lists and defaults came straight from the shared Pi catalog.
+const supportsRuntimePiProvider = (runtime: string) => runtime === "pi";
+const piBuiltinProviderModels = (providerId: string) => PI_BUILTIN_PROVIDER_MODELS[providerId] ?? null;
+const piBuiltinProviderDefaultModel = (providerId: string) =>
+  PI_BUILTIN_PROVIDER_DEFAULT_MODELS[providerId as keyof typeof PI_BUILTIN_PROVIDER_DEFAULT_MODELS] ?? null;
 
 const wire = (value: unknown) => JSON.parse(JSON.stringify(value)) as Record<string, unknown>;
 const piForm = () => parseRuntimeFormV2(wire(buildRuntimeFormV2("pi")))!;
@@ -105,12 +115,12 @@ test("pi form: fields by kind, in order, each model/effort pair shown for its pr
 test("pi declares exactly the capabilities its legacy form needs", () => {
   const form = buildRuntimeFormV2("pi");
   const parsed = piForm();
-  // Custom model (supportsRuntimeCustomModelName) → select.custom_value; a
-  // reasoning effort (REASONING_EFFORT_RUNTIMES) → choice.labels; a model list
-  // from the Computer's probe → option_source.status.
+  // Custom model (supportsRuntimeCustomModelName) → select.custom_value. Its
+  // effort labels (choice.labels) and probed model list (option_source.status)
+  // are always on and never listed.
   assert.equal(supportsRuntimeCustomModelName("pi"), true);
   assert.equal(REASONING_EFFORT_RUNTIMES.has("pi"), true);
-  assert.deepEqual(form.requiredClientCapabilities, ["select.custom_value", "choice.labels", "option_source.status"]);
+  assert.deepEqual(form.requiredClientCapabilities, ["select.custom_value"]);
   // Nothing the legacy form lacks: no fast mode, API URL or command for Pi.
   const keys = parsed.fields.map((field) => field.key);
   assert.equal(RUNTIME_FAST_MODE_RUNTIMES.has("pi"), false);
@@ -219,10 +229,10 @@ test("the Configured model source: the Pi probe's list when live, else the bundl
   assert.equal(live.source.customValueAllowed, true);
   assert.equal(live.source.defaultValue, LIVE[1]!.id);
   assert.deepEqual((live.source.options as Array<{ value: string }>).map((option) => option.value), LIVE.map((model) => model.id));
-  // Efforts as the legacy picker offers them for Pi: the BASE set for every model.
+  // Efforts as the legacy picker offers them for Pi: every Pi thinking level for every model.
   for (const option of live.source.options as Array<{ value: string; supportedReasoningEfforts: string[]; defaultReasoningEffort?: string }>) {
     assert.deepEqual(option.supportedReasoningEfforts, reasoningEffortOptionsForModel("pi", option.value, LIVE).map((effort) => effort.value));
-    assert.deepEqual(option.supportedReasoningEfforts, [...BASE_REASONING_EFFORTS]);
+    assert.deepEqual(option.supportedReasoningEfforts, [...PI_REASONING_EFFORTS]);
     assert.equal("defaultReasoningEffort" in option, false);
   }
 
@@ -467,9 +477,15 @@ test("a Configured model only the live list names is stored as a preset (legacy 
   assert.equal(config.reasoningEffort, "high");
   assert.deepEqual(config.provider, { kind: "default" });
   assertSameAsLegacy(config as unknown as Record<string, unknown>, legacy({ model: LIVE[0]!.id, effort: "high" }), "same as the legacy pick from the live list");
-  // Pi models declare no efforts: outside the BASE set is refused at the field.
+  // Pi offers every Pi thinking level for every model (Pi maps one a model
+  // does not take); a value outside that set is refused at the field.
+  for (const effort of ["off", "minimal", "max"]) {
+    const accepted = await reconcile({ provider: "configured", model: LIVE[0]!.id, reasoningEffort: effort }, LIVE);
+    assert.equal(accepted.result.kind, "updated", effort);
+    assert.equal((accepted.result as { runtimeConfig: RuntimeConfig }).runtimeConfig.reasoningEffort, effort);
+  }
   assert.deepEqual(
-    (await reconcile({ provider: "configured", model: LIVE[0]!.id, reasoningEffort: "max" }, LIVE)).result,
+    (await reconcile({ provider: "configured", model: LIVE[0]!.id, reasoningEffort: "ultra" }, LIVE)).result,
     { kind: "rejected", issue: { code: "reasoning_effort_not_supported", pointer: "/formValues/reasoningEffort" } },
   );
   // A typed model the live list does not name stays custom.

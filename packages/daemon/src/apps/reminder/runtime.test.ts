@@ -227,6 +227,34 @@ test("one occurrence exposes fired, materialized, wake-request, and ack faces in
   }
 });
 
+test("a Server-authorized ack of a locally fired reminder acknowledges its occurrence, so no late delivery alert fires", async () => {
+  const harness = createHarness({ notifyInbox: async () => false });
+  try {
+    harness.runtime.handleServerMessage({
+      type: "reminder.upsert",
+      agentId: AGENT_B,
+      reminder: makeJob({ fireAt: new Date(5).toISOString() }),
+    });
+    harness.clock.advanceBy(5);
+    await new Promise((resolve) => setImmediate(resolve));
+    await acceptLatestRequest(harness, AGENT_B);
+
+    const [item] = harness.getInbox(AGENT_B).list();
+    assert.ok(item);
+    assert.equal(harness.runtime.beforeServerAuthorizedAck(AGENT_B, item), true);
+    assert.equal(
+      harness.traces.filter((trace) =>
+        trace.name === "daemon.app_schedule.occurrence" && trace.attrs.phase === "acknowledged"
+      ).length,
+      1,
+    );
+    harness.clock.advanceBy(15 * 60 * 1_000);
+    assert.equal(harness.traces.some((trace) => trace.name === "daemon.app_schedule.delivery_alert"), false);
+  } finally {
+    harness.cleanup();
+  }
+});
+
 test("materialized-but-not-woken occurrence fails loud after the bounded ack age", async () => {
   const harness = createHarness({ notifyInbox: async () => false });
   try {
@@ -947,6 +975,100 @@ test("local source ACK rejects a stale item after the same reminder has an activ
       "old revision must not be accepted once a newer active fire item exists",
     );
     assert.equal(harness.getInbox(AGENT_B).list().length, 1);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+/** Arms `job`, lets it come due and has the Server accept the fire: its item is then in the owner's Inbox. */
+async function fireAccepted(harness: ReturnType<typeof createHarness>, job: ReminderJob) {
+  harness.runtime.handleServerMessage({ type: "reminder.upsert", agentId: job.ownerAgentId, reminder: job });
+  harness.clock.advanceBy(Math.max(0, Date.parse(job.fireAt) - harness.clock.now()));
+  await new Promise((resolve) => setImmediate(resolve));
+  const request = await acceptLatestRequest(harness, job.ownerAgentId);
+  assert.equal(request.reminderId, job.reminderId);
+  assert.equal(request.version, job.version);
+}
+
+const itemRevisionsOf = (harness: ReturnType<typeof createHarness>, agentId: string, reminderId: string) =>
+  harness.getInbox(agentId).list()
+    .filter((item) => item.sourceRef.id === reminderId)
+    .map((item) => Number(item.sourceRef.revision))
+    .sort((a, b) => a - b);
+
+test("D21: a cancel that says the reminder was canceled drops its un-acked local items; the disarm after a last fire keeps them", async () => {
+  const harness = createHarness();
+  try {
+    const canceled = makeJob({ fireAt: new Date(5).toISOString(), version: 8 });
+    const other = makeJob({
+      reminderId: "22222222-2222-4222-8222-222222222222",
+      fireAt: new Date(10).toISOString(),
+      version: 3,
+    });
+    await fireAccepted(harness, canceled);
+    await fireAccepted(harness, other);
+
+    // What the Server sends once a one-time reminder has fired: only a disarm.
+    harness.runtime.handleServerMessage({ type: "reminder.cancel", agentId: AGENT_B, reminderId: canceled.reminderId, version: 8 });
+    harness.runtime.handleServerMessage({ type: "reminder.cancel", agentId: AGENT_B, reminderId: other.reminderId, version: 3 });
+    assert.deepEqual(itemRevisionsOf(harness, AGENT_B, canceled.reminderId), [8]);
+    assert.deepEqual(itemRevisionsOf(harness, AGENT_B, other.reminderId), [3]);
+
+    // Another owner's envelope can't clear it.
+    harness.runtime.handleServerMessage({ type: "reminder.cancel", agentId: AGENT_A, reminderId: canceled.reminderId, version: 9, canceled: true });
+    assert.deepEqual(itemRevisionsOf(harness, AGENT_B, canceled.reminderId), [8]);
+
+    harness.runtime.handleServerMessage({ type: "reminder.cancel", agentId: AGENT_B, reminderId: canceled.reminderId, version: 9, canceled: true });
+    assert.deepEqual(itemRevisionsOf(harness, AGENT_B, canceled.reminderId), [], "the canceled reminder's item is gone");
+    assert.deepEqual(itemRevisionsOf(harness, AGENT_B, other.reminderId), [3], "another reminder's item is untouched");
+    assert.deepEqual(harness.getInbox(AGENT_B).listAcknowledgedSources(), [], "nothing was acknowledged, so no ack is sent to the Server");
+
+    const phasesOf = (reminderId: string) => harness.traces
+      .filter((trace) => trace.name === "daemon.app_schedule.occurrence" && Object.values(trace.attrs).includes(reminderId))
+      .map((trace) => trace.attrs.phase);
+    assert.equal(phasesOf(canceled.reminderId).includes("retired"), true);
+    assert.equal(phasesOf(canceled.reminderId).includes("acknowledged"), false);
+
+    harness.clock.advanceBy(15 * 60 * 1_000);
+    const alerted = (reminderId: string) => harness.traces.some((trace) =>
+      trace.name === "daemon.app_schedule.delivery_alert" && Object.values(trace.attrs).includes(reminderId)
+    );
+    assert.equal(alerted(canceled.reminderId), false, "a canceled reminder's fire no longer waits for an ack");
+    assert.equal(alerted(other.reminderId), true, "the other fire still does");
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test("D22: a recurring reminder that fires again drops its earlier un-acked local item; a one-time reminder keeps every revision's", async () => {
+  const harness = createHarness();
+  try {
+    const recurrence = { kind: "interval" as const, description: "every 5 ms" };
+    const recurring = makeJob({ fireAt: new Date(5).toISOString(), version: 8, recurrence });
+    await fireAccepted(harness, recurring);
+    assert.deepEqual(itemRevisionsOf(harness, AGENT_B, recurring.reminderId), [8]);
+    await fireAccepted(harness, { ...recurring, fireAt: new Date(10).toISOString(), version: 9 });
+    assert.deepEqual(itemRevisionsOf(harness, AGENT_B, recurring.reminderId), [9], "only the newest fire asks for an ack");
+    await fireAccepted(harness, { ...recurring, fireAt: new Date(15).toISOString(), version: 10 });
+    assert.deepEqual(itemRevisionsOf(harness, AGENT_B, recurring.reminderId), [10]);
+
+    // A one-time reminder that was rescheduled and fired again: the Server lists both fires.
+    const oneTime = makeJob({
+      reminderId: "22222222-2222-4222-8222-222222222222",
+      fireAt: new Date(20).toISOString(),
+      version: 3,
+    });
+    await fireAccepted(harness, oneTime);
+    await fireAccepted(harness, { ...oneTime, fireAt: new Date(25).toISOString(), version: 4 });
+    assert.deepEqual(itemRevisionsOf(harness, AGENT_B, oneTime.reminderId), [3, 4]);
+
+    assert.deepEqual(itemRevisionsOf(harness, AGENT_B, recurring.reminderId), [10]);
+    assert.deepEqual(harness.getInbox(AGENT_B).listAcknowledgedSources(), [], "nothing was acknowledged, so no ack is sent to the Server");
+    harness.clock.advanceBy(15 * 60 * 1_000);
+    const alertedRevisions = harness.traces
+      .filter((trace) => trace.name === "daemon.app_schedule.delivery_alert" && Object.values(trace.attrs).includes(recurring.reminderId))
+      .length;
+    assert.equal(alertedRevisions, 1, "only the newest fire still waits for an ack");
   } finally {
     harness.cleanup();
   }

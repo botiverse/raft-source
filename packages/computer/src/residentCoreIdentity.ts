@@ -1,5 +1,5 @@
 import type { DaemonCoreOptions } from "@botiverse/raft-daemon/core";
-import { BUNDLED_DAEMON_VERSION, COMPUTER_VERSION } from "./version";
+import { BUNDLED_DAEMON_VERSION, COMPUTER_BUILD_SHA, COMPUTER_VERSION } from "./version";
 
 export interface ResidentCoreIdentityCredentials {
   serverId: string;
@@ -12,7 +12,7 @@ export function residentCoreIdentity(
   creds: ResidentCoreIdentityCredentials,
 ): Pick<
   DaemonCoreOptions,
-  "serverUrl" | "apiKey" | "machineOwnerProvenance" | "daemonVersion" | "computerVersion"
+  "serverUrl" | "apiKey" | "machineOwnerProvenance" | "daemonVersion" | "computerVersion" | "computerBuildSha"
 > {
   return {
     serverUrl: creds.serverUrl,
@@ -24,5 +24,6 @@ export function residentCoreIdentity(
     },
     daemonVersion: BUNDLED_DAEMON_VERSION,
     computerVersion: COMPUTER_VERSION,
+    computerBuildSha: COMPUTER_BUILD_SHA,
   };
 }

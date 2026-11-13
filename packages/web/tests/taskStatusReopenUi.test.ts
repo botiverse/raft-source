@@ -18,26 +18,15 @@ const closedTask: Task = {
   updatedAt: "2026-07-24T00:00:00.000Z",
 };
 
-test("closed task status menus let the assignee either reconsider or resume directly", () => {
-  assert.deepEqual(
-    getTaskStatusOptions(closedTask, "user-1", false),
-    [
-      { id: "closed", labelId: "task.status.closed" },
-      { id: "todo", labelId: "task.status.reopenToTodo" },
-      { id: "in_progress", labelId: "task.status.inProgress" },
-    ],
-  );
-});
-
-test("admin status menus keep force overrides while naming the semantic reopen action", () => {
-  assert.deepEqual(
-    getTaskStatusOptions(closedTask, "admin-1", true),
-    [
-      { id: "todo", labelId: "task.status.reopenToTodo" },
-      { id: "in_progress", labelId: "task.status.inProgress" },
-      { id: "in_review", labelId: "task.status.inReview" },
-      { id: "done", labelId: "task.status.done" },
-      { id: "closed", labelId: "task.status.closed" },
-    ],
-  );
+test("a closed task's menu offers every status and names the reopen action", () => {
+  const expected = [
+    { id: "todo", labelId: "task.status.reopenToTodo" },
+    { id: "in_progress", labelId: "task.status.inProgress" },
+    { id: "in_review", labelId: "task.status.inReview" },
+    { id: "done", labelId: "task.status.done" },
+    { id: "closed", labelId: "task.status.closed" },
+  ];
+  // Members and admins get the same menu: there are no transition limits.
+  assert.deepEqual(getTaskStatusOptions(closedTask, "user-1", false, false), expected);
+  assert.deepEqual(getTaskStatusOptions(closedTask, "admin-1", true, false), expected);
 });

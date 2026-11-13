@@ -1,0 +1,1320 @@
+{
+  "contract": "settings-search.v1",
+  "schemaVersion": 1,
+  "notes": "The settings the web's Settings search finds (botiverse/slock packages/shared/src/settingsSearch.v1.json; rules: raft-design design/products/raft-chat/settings.md#searching-settings). The App keeps its own index (artin, #proj-raft-ui:#204), using the same id for the same setting where it can, so /settings/<page>#<id> opens the web's page at that setting from either. Names, descriptions, sections and pages are the web's own strings, looked up by id; this file holds where a setting is, which of the web and the desktop app have it, and the other words people use for it. `page` is the web settings slug. `experimental`: not shown in results. `aliases`: other words per display locale; a locale without its own list uses en, and en is always searched too. Where a setting's row has no description (HelperText step 1 cut it), its aliases keep that description's key terms, in each display locale, so the old words still find it.",
+  "entries": [
+    {
+      "id": "display-name",
+      "page": "account",
+      "section": "account",
+      "platforms": [
+        "web",
+        "desktop"
+      ],
+      "aliases": {
+        "en": [
+          "name",
+          "nickname"
+        ],
+        "zh-cn": [
+          "昵称",
+          "名字",
+          "名称"
+        ]
+      }
+    },
+    {
+      "id": "username",
+      "page": "account",
+      "section": "account",
+      "platforms": [
+        "web",
+        "desktop"
+      ],
+      "aliases": {
+        "en": [
+          "handle",
+          "@"
+        ],
+        "zh-cn": [
+          "用户名",
+          "账号名"
+        ]
+      }
+    },
+    {
+      "id": "email",
+      "page": "account",
+      "section": "account",
+      "platforms": [
+        "web",
+        "desktop"
+      ],
+      "aliases": {
+        "en": [
+          "mail",
+          "e-mail"
+        ],
+        "zh-cn": [
+          "邮箱",
+          "电子邮件"
+        ]
+      }
+    },
+    {
+      "id": "password",
+      "page": "account",
+      "section": "security",
+      "platforms": [
+        "web",
+        "desktop"
+      ],
+      "aliases": {
+        "en": [
+          "change password",
+          "sign in",
+          "login"
+        ],
+        "zh-cn": [
+          "密码",
+          "改密码",
+          "登录"
+        ]
+      }
+    },
+    {
+      "id": "passkeys",
+      "page": "account",
+      "section": "security",
+      "platforms": [
+        "web",
+        "desktop"
+      ],
+      "aliases": {
+        "en": [
+          "passkey",
+          "face id",
+          "touch id",
+          "fingerprint",
+          "face",
+          "screen lock",
+          "instead of a password"
+        ],
+        "zh-cn": [
+          "通行密钥",
+          "指纹",
+          "面容",
+          "屏幕锁",
+          "不用输密码"
+        ],
+        "zh-tw": [
+          "指紋",
+          "臉部辨識",
+          "螢幕鎖定"
+        ],
+        "ja": [
+          "指紋",
+          "顔",
+          "画面ロック"
+        ],
+        "ko": [
+          "지문",
+          "얼굴 인식",
+          "화면 잠금"
+        ],
+        "es": [
+          "huella digital",
+          "rostro",
+          "bloqueo de pantalla"
+        ],
+        "pt-br": [
+          "impressão digital",
+          "rosto",
+          "bloqueio de tela"
+        ],
+        "ru": [
+          "отпечаток пальца",
+          "лицо",
+          "блокировка экрана"
+        ]
+      }
+    },
+    {
+      "id": "two-step",
+      "page": "account",
+      "section": "security",
+      "platforms": [
+        "web",
+        "desktop"
+      ],
+      "aliases": {
+        "en": [
+          "2fa",
+          "mfa",
+          "totp",
+          "two-factor",
+          "verification code"
+        ],
+        "zh-cn": [
+          "两步验证",
+          "二次验证",
+          "验证码",
+          "双重验证"
+        ]
+      }
+    },
+    {
+      "id": "sign-out",
+      "page": "account",
+      "section": "session",
+      "platforms": [
+        "web",
+        "desktop"
+      ],
+      "aliases": {
+        "en": [
+          "log out",
+          "logout",
+          "sign off"
+        ],
+        "zh-cn": [
+          "退出登录",
+          "登出",
+          "注销"
+        ]
+      }
+    },
+    {
+      "id": "delete-account",
+      "page": "account",
+      "section": "danger-zone",
+      "platforms": [
+        "web",
+        "desktop"
+      ],
+      "aliases": {
+        "en": [
+          "remove account",
+          "close account"
+        ],
+        "zh-cn": [
+          "删除账号",
+          "注销账号"
+        ]
+      }
+    },
+    {
+      "id": "display-language",
+      "page": "language-region",
+      "section": "language",
+      "platforms": [
+        "web",
+        "desktop"
+      ],
+      "aliases": {
+        "en": [
+          "language",
+          "locale",
+          "english",
+          "chinese",
+          "interface",
+          "app language"
+        ],
+        "zh-cn": [
+          "语言",
+          "显示语言",
+          "中文",
+          "英文",
+          "界面",
+          "界面语言"
+        ],
+        "zh-tw": [
+          "介面",
+          "顯示語言"
+        ],
+        "ja": [
+          "表示言語",
+          "アプリ画面"
+        ],
+        "ko": [
+          "표시 언어",
+          "앱 화면"
+        ],
+        "es": [
+          "interfaz",
+          "idioma de la interfaz"
+        ],
+        "pt-br": [
+          "interface",
+          "idioma da interface"
+        ],
+        "ru": [
+          "язык интерфейса",
+          "интерфейс"
+        ]
+      }
+    },
+    {
+      "id": "translation-mode",
+      "page": "language-region",
+      "section": "language",
+      "platforms": [
+        "web",
+        "desktop"
+      ],
+      "aliases": {
+        "en": [
+          "translate",
+          "translation",
+          "auto translate",
+          "manual",
+          "original"
+        ],
+        "zh-cn": [
+          "翻译",
+          "自动翻译",
+          "自动",
+          "手动",
+          "原文"
+        ],
+        "zh-tw": [
+          "自動",
+          "手動",
+          "原文"
+        ],
+        "ja": [
+          "自動",
+          "手動",
+          "原文"
+        ],
+        "ko": [
+          "자동",
+          "수동",
+          "원문"
+        ],
+        "es": [
+          "automático",
+          "manual",
+          "original",
+          "traducir"
+        ],
+        "pt-br": [
+          "automático",
+          "manual",
+          "original",
+          "traduzir"
+        ],
+        "ru": [
+          "авто",
+          "вручную",
+          "оригинал",
+          "перевести"
+        ]
+      }
+    },
+    {
+      "id": "time-format",
+      "page": "language-region",
+      "section": "date-time",
+      "platforms": [
+        "web",
+        "desktop"
+      ],
+      "aliases": {
+        "en": [
+          "12-hour",
+          "24-hour",
+          "clock",
+          "am pm",
+          "display only"
+        ],
+        "zh-cn": [
+          "时间格式",
+          "12小时",
+          "24小时",
+          "时钟",
+          "仅显示"
+        ],
+        "zh-tw": [
+          "僅影響顯示"
+        ],
+        "ja": [
+          "表示のみ"
+        ],
+        "ko": [
+          "표시 방식"
+        ],
+        "es": [
+          "visualización"
+        ],
+        "pt-br": [
+          "exibição"
+        ],
+        "ru": [
+          "отображение"
+        ]
+      }
+    },
+    {
+      "id": "timezone",
+      "page": "language-region",
+      "section": "date-time",
+      "platforms": [
+        "web",
+        "desktop"
+      ],
+      "aliases": {
+        "en": [
+          "time zone",
+          "utc",
+          "timestamps",
+          "local time",
+          "scheduling"
+        ],
+        "zh-cn": [
+          "时区",
+          "时差",
+          "时间戳",
+          "本地时间",
+          "排程"
+        ],
+        "zh-tw": [
+          "時間戳記",
+          "本地時間",
+          "排程"
+        ],
+        "ja": [
+          "タイムスタンプ",
+          "ローカル",
+          "スケジュール"
+        ],
+        "ko": [
+          "현지 시간",
+          "일정"
+        ],
+        "es": [
+          "marcas de tiempo",
+          "hora local",
+          "programación"
+        ],
+        "pt-br": [
+          "horários locais",
+          "agendamento"
+        ],
+        "ru": [
+          "местное время",
+          "планирование"
+        ]
+      }
+    },
+    {
+      "id": "message-font-size",
+      "page": "appearance",
+      "section": "appearance",
+      "platforms": [
+        "web",
+        "desktop"
+      ],
+      "aliases": {
+        "en": [
+          "font",
+          "text size",
+          "zoom",
+          "message text",
+          "headings",
+          "code blocks",
+          "inline code"
+        ],
+        "zh-cn": [
+          "字号",
+          "字体大小",
+          "文字大小",
+          "字体",
+          "消息文本",
+          "标题",
+          "代码块",
+          "内联代码"
+        ],
+        "zh-tw": [
+          "文字大小",
+          "標題",
+          "程式碼區塊",
+          "行內程式碼"
+        ],
+        "ja": [
+          "文字サイズ",
+          "見出し",
+          "コードブロック",
+          "インラインコード"
+        ],
+        "ko": [
+          "텍스트 크기",
+          "제목",
+          "코드 블록",
+          "인라인 코드"
+        ],
+        "es": [
+          "tamaño del texto",
+          "encabezados",
+          "bloques de código",
+          "código en línea"
+        ],
+        "pt-br": [
+          "tamanho do texto",
+          "títulos",
+          "blocos de código",
+          "código em linha"
+        ],
+        "ru": [
+          "размер текста",
+          "заголовки",
+          "блоки кода",
+          "встроенный код"
+        ]
+      }
+    },
+    {
+      "id": "live-agent-activity",
+      "page": "appearance",
+      "section": "appearance",
+      "platforms": [
+        "web",
+        "desktop"
+      ],
+      "aliases": {
+        "en": [
+          "activity",
+          "working",
+          "what agents are doing",
+          "home bar",
+          "top of the window",
+          "above the composer"
+        ],
+        "zh-cn": [
+          "实时动态",
+          "工作中",
+          "agent 动态",
+          "首页顶栏",
+          "窗口顶部",
+          "正在工作"
+        ],
+        "zh-tw": [
+          "正在工作",
+          "首頁列",
+          "視窗頂端"
+        ],
+        "ja": [
+          "作業中",
+          "ホームバー",
+          "ウィンドウ上部"
+        ],
+        "ko": [
+          "작업 중",
+          "홈 바",
+          "창 상단"
+        ],
+        "es": [
+          "trabajando",
+          "barra de inicio",
+          "parte superior de la ventana"
+        ],
+        "pt-br": [
+          "trabalhando",
+          "barra de início",
+          "topo da janela"
+        ],
+        "ru": [
+          "работают",
+          "главная",
+          "вверху окна"
+        ]
+      }
+    },
+    {
+      "id": "show-agent-model",
+      "page": "appearance",
+      "section": "appearance",
+      "platforms": [
+        "web",
+        "desktop"
+      ],
+      "aliases": {
+        "en": [
+          "model",
+          "opus",
+          "sonnet",
+          "agent model",
+          "next to its name"
+        ],
+        "zh-cn": [
+          "模型",
+          "显示模型",
+          "名字旁"
+        ],
+        "zh-tw": [
+          "模型"
+        ],
+        "ja": [
+          "モデル",
+          "エージェント名"
+        ],
+        "ko": [
+          "모델",
+          "에이전트 이름"
+        ],
+        "es": [
+          "modelo"
+        ],
+        "pt-br": [
+          "modelo"
+        ],
+        "ru": [
+          "модель"
+        ]
+      }
+    },
+    {
+      "id": "show-sender-description",
+      "page": "appearance",
+      "section": "appearance",
+      "platforms": [
+        "web",
+        "desktop"
+      ],
+      "aliases": {
+        "en": [
+          "description",
+          "bio",
+          "member description",
+          "agent description",
+          "author row"
+        ],
+        "zh-cn": [
+          "描述",
+          "简介",
+          "成员描述"
+        ],
+        "zh-tw": [
+          "描述",
+          "簡介"
+        ],
+        "ja": [
+          "説明",
+          "プロフィール"
+        ],
+        "ko": [
+          "소개",
+          "설명"
+        ],
+        "es": [
+          "descripción"
+        ],
+        "pt-br": [
+          "descrição"
+        ],
+        "ru": [
+          "описание"
+        ]
+      }
+    },
+    {
+      "id": "hide-empty-sidebar-sections",
+      "page": "appearance",
+      "section": "sidebar",
+      "platforms": [
+        "web",
+        "desktop"
+      ],
+      "aliases": {
+        "en": [
+          "sidebar",
+          "empty sections",
+          "pinned",
+          "direct messages",
+          "joint channels"
+        ],
+        "zh-cn": [
+          "侧栏",
+          "空分组",
+          "隐藏分组",
+          "置顶",
+          "私信",
+          "联合频道"
+        ],
+        "zh-tw": [
+          "側邊欄",
+          "已釘選",
+          "私訊",
+          "聯合頻道"
+        ],
+        "ja": [
+          "サイドバー",
+          "ピン留め",
+          "ダイレクトメッセージ",
+          "共同チャンネル"
+        ],
+        "ko": [
+          "사이드바",
+          "고정됨",
+          "다이렉트 메시지",
+          "공동 채널"
+        ],
+        "es": [
+          "barra lateral",
+          "fijados",
+          "mensajes directos",
+          "canales compartidos"
+        ],
+        "pt-br": [
+          "barra lateral",
+          "fixados",
+          "mensagens diretas",
+          "canais compartilhados"
+        ],
+        "ru": [
+          "боковая панель",
+          "закреплённые",
+          "личные сообщения",
+          "общие каналы"
+        ]
+      }
+    },
+    {
+      "id": "send-with",
+      "page": "appearance",
+      "section": "message-box",
+      "platforms": [
+        "web",
+        "desktop"
+      ],
+      "aliases": {
+        "en": [
+          "enter",
+          "return",
+          "send key",
+          "new line",
+          "shortcut",
+          "cmd enter",
+          "ctrl enter"
+        ],
+        "zh-cn": [
+          "回车",
+          "换行",
+          "发送键",
+          "发送方式",
+          "快捷键"
+        ]
+      }
+    },
+    {
+      "id": "push-notifications",
+      "page": "notifications",
+      "section": "push",
+      "platforms": [
+        "web",
+        "desktop"
+      ],
+      "aliases": {
+        "en": [
+          "push",
+          "notification",
+          "web push",
+          "background",
+          "muted"
+        ],
+        "zh-cn": [
+          "推送",
+          "通知",
+          "网页推送",
+          "后台",
+          "静音"
+        ],
+        "zh-tw": [
+          "網頁推播",
+          "背景",
+          "靜音"
+        ],
+        "ja": [
+          "Web プッシュ",
+          "バックグラウンド",
+          "ミュート"
+        ],
+        "ko": [
+          "웹 푸시",
+          "백그라운드",
+          "음소거"
+        ],
+        "es": [
+          "push web",
+          "segundo plano",
+          "silenciado"
+        ],
+        "pt-br": [
+          "push da web",
+          "segundo plano",
+          "silenciado"
+        ],
+        "ru": [
+          "web push",
+          "в фоне",
+          "отключить уведомления"
+        ]
+      }
+    },
+    {
+      "id": "pause-notifications",
+      "page": "notifications",
+      "section": "pause-schedule",
+      "platforms": [
+        "web",
+        "desktop"
+      ],
+      "aliases": {
+        "en": [
+          "do not disturb",
+          "dnd",
+          "snooze",
+          "mute"
+        ],
+        "zh-cn": [
+          "暂停通知",
+          "勿扰",
+          "免打扰",
+          "静音"
+        ]
+      }
+    },
+    {
+      "id": "quiet-hours",
+      "page": "notifications",
+      "section": "pause-schedule",
+      "platforms": [
+        "web",
+        "desktop"
+      ],
+      "aliases": {
+        "en": [
+          "do not disturb",
+          "dnd",
+          "night",
+          "schedule"
+        ],
+        "zh-cn": [
+          "免打扰时段",
+          "勿扰",
+          "夜间"
+        ]
+      }
+    },
+    {
+      "id": "notification-preview",
+      "page": "notifications",
+      "section": "content",
+      "platforms": [
+        "web",
+        "desktop"
+      ],
+      "aliases": {
+        "en": [
+          "preview",
+          "privacy",
+          "lock screen",
+          "what notifications show",
+          "every device"
+        ],
+        "zh-cn": [
+          "通知预览",
+          "隐私",
+          "锁屏",
+          "通知里显示什么",
+          "所有设备"
+        ],
+        "zh-tw": [
+          "通知要顯示什麼",
+          "所有裝置"
+        ],
+        "ja": [
+          "通知に表示する内容",
+          "すべてのデバイス"
+        ],
+        "ko": [
+          "알림 내용",
+          "모든 기기"
+        ],
+        "es": [
+          "lo que muestran las notificaciones",
+          "todos los dispositivos"
+        ],
+        "pt-br": [
+          "o que as notificações mostram",
+          "todos os dispositivos"
+        ],
+        "ru": [
+          "что показывать в уведомлениях",
+          "все устройства"
+        ]
+      }
+    },
+    {
+      "id": "notification-sound",
+      "page": "notifications",
+      "section": "content",
+      "platforms": [
+        "web",
+        "desktop"
+      ],
+      "aliases": {
+        "en": [
+          "sound",
+          "ringtone",
+          "audio",
+          "play a sound",
+          "every device"
+        ],
+        "zh-cn": [
+          "提示音",
+          "声音",
+          "铃声",
+          "播放声音",
+          "所有设备"
+        ],
+        "zh-tw": [
+          "播放音效",
+          "所有裝置"
+        ],
+        "ja": [
+          "サウンド",
+          "すべてのデバイス"
+        ],
+        "ko": [
+          "소리",
+          "모든 기기"
+        ],
+        "es": [
+          "sonido",
+          "todos los dispositivos"
+        ],
+        "pt-br": [
+          "som",
+          "todos os dispositivos"
+        ],
+        "ru": [
+          "звук",
+          "все устройства"
+        ]
+      }
+    },
+    {
+      "id": "notification-followed-thread-replies",
+      "page": "notifications",
+      "section": "content",
+      "platforms": [
+        "web",
+        "desktop"
+      ],
+      "aliases": {
+        "en": [
+          "thread notifications",
+          "followed threads",
+          "task replies",
+          "only mentions",
+          "every device"
+        ],
+        "zh-cn": [
+          "消息列通知",
+          "关注的消息列",
+          "任务回复",
+          "只通知@我",
+          "所有设备"
+        ],
+        "zh-tw": [
+          "討論串通知",
+          "追蹤的討論串",
+          "所有裝置"
+        ],
+        "ja": [
+          "スレッドの通知",
+          "フォロー中のスレッド",
+          "すべてのデバイス"
+        ],
+        "ko": [
+          "스레드 알림",
+          "팔로우한 스레드",
+          "모든 기기"
+        ],
+        "es": [
+          "notificaciones de hilos",
+          "hilos que sigo",
+          "todos los dispositivos"
+        ],
+        "pt-br": [
+          "notificações de threads",
+          "threads que sigo",
+          "todos os dispositivos"
+        ],
+        "ru": [
+          "уведомления веток",
+          "подписанные ветки",
+          "все устройства"
+        ]
+      }
+    },
+    {
+      "id": "theme",
+      "page": "theme",
+      "section": "theme",
+      "platforms": [
+        "web",
+        "desktop"
+      ],
+      "aliases": {
+        "en": [
+          "dark",
+          "dark mode",
+          "light",
+          "night",
+          "color scheme",
+          "follow your device",
+          "this device"
+        ],
+        "zh-cn": [
+          "主题",
+          "深色",
+          "夜间",
+          "暗色",
+          "浅色",
+          "跟随设备",
+          "此设备"
+        ],
+        "zh-tw": [
+          "淺色",
+          "深色",
+          "跟隨裝置"
+        ],
+        "ja": [
+          "ライト",
+          "ダーク",
+          "デバイスの設定"
+        ],
+        "ko": [
+          "라이트",
+          "다크",
+          "기기 설정"
+        ],
+        "es": [
+          "claro",
+          "oscuro",
+          "dispositivo"
+        ],
+        "pt-br": [
+          "claro",
+          "escuro",
+          "dispositivo"
+        ],
+        "ru": [
+          "светлая",
+          "тёмная",
+          "тема устройства"
+        ]
+      }
+    },
+    {
+      "id": "server-theme",
+      "page": "theme",
+      "section": "theme",
+      "platforms": [
+        "web",
+        "desktop"
+      ],
+      "aliases": {
+        "en": [
+          "color",
+          "colour",
+          "skin",
+          "pixel art"
+        ],
+        "zh-cn": [
+          "服务器主题",
+          "颜色",
+          "配色",
+          "皮肤"
+        ]
+      }
+    },
+    {
+      "id": "mute-server",
+      "page": "server-notifications",
+      "section": "notifications",
+      "platforms": [
+        "web",
+        "desktop"
+      ],
+      "aliases": {
+        "en": [
+          "mute",
+          "silence",
+          "do not disturb"
+        ],
+        "zh-cn": [
+          "静音这个服务器",
+          "静音",
+          "勿扰",
+          "通知"
+        ]
+      }
+    },
+    {
+      "id": "server-name",
+      "page": "server",
+      "section": "profile",
+      "platforms": [
+        "web",
+        "desktop"
+      ],
+      "aliases": {
+        "en": [
+          "rename",
+          "workspace name"
+        ],
+        "zh-cn": [
+          "服务器名称",
+          "改名",
+          "工作区名称"
+        ]
+      }
+    },
+    {
+      "id": "public-access",
+      "page": "server",
+      "section": "public-access",
+      "platforms": [
+        "web",
+        "desktop"
+      ],
+      "aliases": {
+        "en": [
+          "public",
+          "share",
+          "guest"
+        ],
+        "zh-cn": [
+          "公开访问",
+          "公开",
+          "分享",
+          "游客"
+        ]
+      }
+    },
+    {
+      "id": "leave-server",
+      "page": "server",
+      "section": "danger-zone",
+      "platforms": [
+        "web",
+        "desktop"
+      ],
+      "aliases": {
+        "en": [
+          "leave",
+          "quit"
+        ],
+        "zh-cn": [
+          "退出服务器",
+          "离开"
+        ]
+      }
+    },
+    {
+      "id": "plan",
+      "page": "billing",
+      "section": "plan",
+      "platforms": [
+        "web",
+        "desktop"
+      ],
+      "aliases": {
+        "en": [
+          "billing",
+          "subscription",
+          "invoice",
+          "upgrade",
+          "payment"
+        ],
+        "zh-cn": [
+          "套餐",
+          "付费",
+          "订阅",
+          "发票",
+          "升级"
+        ]
+      }
+    },
+    {
+      "id": "invite-links",
+      "page": "administration",
+      "section": "invites",
+      "platforms": [
+        "web",
+        "desktop"
+      ],
+      "aliases": {
+        "en": [
+          "invite",
+          "link",
+          "add people"
+        ],
+        "zh-cn": [
+          "邀请链接",
+          "邀请",
+          "加人"
+        ]
+      }
+    },
+    {
+      "id": "single-sign-on",
+      "page": "administration",
+      "section": "sign-in",
+      "platforms": [
+        "web",
+        "desktop"
+      ],
+      "aliases": {
+        "en": [
+          "sso",
+          "saml",
+          "okta",
+          "google workspace",
+          "identity provider",
+          "email domains",
+          "idp"
+        ],
+        "zh-cn": [
+          "单点登录",
+          "SSO",
+          "企业登录",
+          "身份提供方",
+          "邮箱域名"
+        ],
+        "zh-tw": [
+          "身分識別提供者",
+          "電子郵件網域",
+          "單一登入"
+        ],
+        "ja": [
+          "ID プロバイダー",
+          "メールドメイン"
+        ],
+        "ko": [
+          "ID 공급자",
+          "이메일 도메인"
+        ],
+        "es": [
+          "proveedor de identidad",
+          "dominios"
+        ],
+        "pt-br": [
+          "provedor de identidade",
+          "domínios"
+        ],
+        "ru": [
+          "провайдер удостоверений",
+          "домены"
+        ]
+      }
+    },
+    {
+      "id": "member-permissions",
+      "page": "administration",
+      "section": "permissions",
+      "platforms": [
+        "web",
+        "desktop"
+      ],
+      "aliases": {
+        "en": [
+          "permissions",
+          "roles",
+          "who can"
+        ],
+        "zh-cn": [
+          "成员权限",
+          "权限",
+          "角色"
+        ]
+      }
+    },
+    {
+      "id": "ai-providers",
+      "page": "providers",
+      "section": "connections",
+      "platforms": [
+        "web",
+        "desktop"
+      ],
+      "aliases": {
+        "en": [
+          "api key",
+          "anthropic",
+          "openai",
+          "claude",
+          "provider"
+        ],
+        "zh-cn": [
+          "AI 提供方",
+          "密钥",
+          "API 密钥"
+        ]
+      }
+    },
+    {
+      "id": "desktop-app",
+      "page": "about",
+      "section": "about",
+      "platforms": [
+        "web",
+        "desktop"
+      ],
+      "aliases": {
+        "en": [
+          "download",
+          "mac",
+          "windows",
+          "install",
+          "raft desktop",
+          "computer"
+        ],
+        "zh-cn": [
+          "桌面 App",
+          "下载",
+          "安装",
+          "桌面版",
+          "电脑"
+        ],
+        "zh-tw": [
+          "Raft Desktop",
+          "電腦"
+        ],
+        "ja": [
+          "Raft Desktop",
+          "コンピューター"
+        ],
+        "ko": [
+          "Raft Desktop",
+          "컴퓨터"
+        ],
+        "es": [
+          "Raft Desktop",
+          "computadora"
+        ],
+        "pt-br": [
+          "Raft Desktop",
+          "computador"
+        ],
+        "ru": [
+          "Raft Desktop",
+          "компьютер"
+        ]
+      }
+    }
+  ]
+}

@@ -1,0 +1,86 @@
+{
+  "formatVersion": 1,
+  "id": "R1-202-then-not-marked-while-there",
+  "rule": "R1",
+  "title": "A 202, then a read-state event that nothing was marked, while the person is still there: the nothing toast",
+  "why": "The event is the answer the 202 deferred. While the hold is still active (the person is still in the thread) it is told exactly as a 200 `nothing` would tell it. Decided by Tenny (#proj-mobile:#70).",
+  "status": "agreed",
+  "sources": {
+    "server": [
+      "packages/shared/src/readStateContract.ts (readMutationPendingResponseSchema)"
+    ],
+    "web": [
+      "packages/web/src/store/inboxStore.ts (markScopeUnread)"
+    ],
+    "app": [
+      "compose/shared/src/commonMain/kotlin/build/raft/app/SharedThreadStore.kt"
+    ]
+  },
+  "knownGaps": [
+    {
+      "client": "web",
+      "reason": "Web resolves a 202 at once as `nothing` and does not wait for the read-state event; the thread-menu path shows no nothing toast at all.",
+      "followUp": "#proj-mobile:#70: web consumes the outcome with 202 as pending"
+    }
+  ],
+  "given": {
+    "conversation": {
+      "id": "thread-1",
+      "kind": "thread"
+    },
+    "openThread": "thread-1"
+  },
+  "steps": [
+    {
+      "act": "markUnread",
+      "surface": "threadMenu"
+    },
+    {
+      "act": "serverResponds",
+      "status": 202,
+      "body": {
+        "code": "READ_MUTATION_PENDING",
+        "status": "admitted",
+        "outcome": "unknown",
+        "mutationId": "00000000-0000-4000-8000-000000000001",
+        "authoritySeq": 12,
+        "frontierUrl": "/api/read-mutations/frontier?mutationId=00000000-0000-4000-8000-000000000001"
+      }
+    },
+    {
+      "act": "realtimeEvent",
+      "type": "read_state:updated",
+      "payload": {
+        "serverId": "server-1",
+        "scopeId": "thread-1",
+        "maxReadSeq": 40,
+        "readStateVersion": 8,
+        "markedUnread": false
+      }
+    }
+  ],
+  "checkpoints": [
+    {
+      "afterStep": 2,
+      "state": {
+        "outcome": "pending",
+        "toast": null,
+        "holdActive": true
+      }
+    }
+  ],
+  "expect": {
+    "requests": [
+      {
+        "method": "POST",
+        "path": "/api/channels/thread-1/unread"
+      }
+    ],
+    "state": {
+      "unreadState": {
+        "kind": "none"
+      },
+      "toast": "markUnreadNothing"
+    }
+  }
+}

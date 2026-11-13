@@ -1,17 +1,27 @@
-import CloseButton from "../ui/CloseButton";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useIntl } from "react-intl";
-import { Bell, Check, X } from "lucide-react";
+import { Bell, Check } from "lucide-react";
 import { useAppNavigate } from "../../hooks/useAppNavigate";
 import {
-  enablePushNotifications,
+  ensurePushSubscriptionIfAllowed,
   getPushPermissionState,
   isPushSubscribed,
   recordWebPushPromptEvent,
+  rememberedPushEndpoint,
 } from "../../utils/pushNotifications";
+import {
+  buildPushSubscribeFailure,
+  clearPushSubscribeFailure,
+  pushSubscribeFailureDetail,
+  readPushSubscribeFailure,
+  rememberPushSubscribeFailure,
+  shouldAutoRetryPushSubscribe,
+} from "../../utils/pushSubscribeFailure";
+import { enablePushAndRecord } from "../../utils/pushEnableRecording";
 import Banner from "../ui/Banner";
-import { Button } from "@botiverse/raft-ui";
+import { Button, TextLink } from "@botiverse/raft-ui";
 import type { MessageId } from "../../i18n/messages";
+import { requestComposerFocus } from "./composerFocusRequest";
 
 export const NOTIFICATION_ACTIVATION_DISMISSED_SESSION_KEY =
   "raft:notification-activation-banner-dismissed:v1";
@@ -82,28 +92,55 @@ function activationErrorMessageId(
 
 export default function NotificationActivationBanner({
   placement,
+  composerChannelId,
 }: {
   placement: Placement;
+  /** The composer under the banner: when the banner goes, focus moves to
+   *  its frame, the next element, never to the document. */
+  composerChannelId: string;
 }) {
   const { formatMessage } = useIntl();
   const nav = useAppNavigate();
   const [permission, setPermission] = useState<PermissionState>(() => getPushPermissionState());
+  const openNotificationSettings = useCallback(() => {
+    void recordWebPushPromptEvent({
+      event: "web_push_prompt_settings_opened",
+      trigger: PROMPT_TRIGGER,
+      permissionBefore: permission,
+      permissionAfter: permission,
+    });
+    nav.toSettings("notifications");
+  }, [nav, permission]);
   const [dismissed, setDismissed] = useState(wasDismissedThisSession);
   const [confirmingDismissal, setConfirmingDismissal] = useState(false);
   const [busy, setBusy] = useState(false);
   const [errorId, setErrorId] = useState<MessageId | null>(null);
   const reconcileInFlightRef = useRef(false);
   const promptShownRecordedRef = useRef(false);
+  const confirmationRef = useRef<HTMLDivElement>(null);
 
   const reconcilePermission = useCallback(async () => {
     const nextPermission = getPushPermissionState();
     setPermission(nextPermission);
-    if (nextPermission !== "granted" || reconcileInFlightRef.current) return;
+    if (nextPermission !== "granted") {
+      // Permission moved away from granted: a later grant is a new episode.
+      if (nextPermission !== "unsupported") clearPushSubscribeFailure();
+      return;
+    }
+    if (reconcileInFlightRef.current) return;
 
     reconcileInFlightRef.current = true;
     try {
       if (!(await isPushSubscribed())) {
-        const result = await enablePushNotifications();
+        // A re-subscribe that already failed here is not retried (or re-logged)
+        // on every focus: only once permission, the endpoint or the app
+        // version changed, the backoff passed, or the user pressed Enable.
+        if (!shouldAutoRetryPushSubscribe({ permission: "granted", endpoint: rememberedPushEndpoint() })) return;
+        // The automatic path: never re-subscribes a browser the user disabled
+        // push in (design §8); only the Enable button below clears that.
+        const result = await ensurePushSubscriptionIfAllowed();
+        if (result === "opted_out") return;
+        const failure = result === "unavailable" || result === "error" ? readPushSubscribeFailure() : null;
         void recordWebPushPromptEvent({
           event: result === "granted"
             ? "web_push_subscription_saved"
@@ -112,15 +149,24 @@ export default function NotificationActivationBanner({
           result,
           permissionBefore: "granted",
           permissionAfter: getPushPermissionState(),
+          ...(failure ? { detail: pushSubscribeFailureDetail(failure) } : {}),
         });
       }
-    } catch {
+    } catch (err) {
+      const failure = buildPushSubscribeFailure({
+        kind: "unexpected",
+        error: err,
+        permission: "granted",
+        endpoint: rememberedPushEndpoint(),
+      });
+      rememberPushSubscribeFailure(failure);
       void recordWebPushPromptEvent({
         event: "web_push_subscription_failed",
         trigger: AUTO_RESOLVE_TRIGGER,
         result: "error",
         permissionBefore: "granted",
         permissionAfter: getPushPermissionState(),
+        detail: pushSubscribeFailureDetail(failure),
       });
     } finally {
       setPermission(getPushPermissionState());
@@ -155,52 +201,39 @@ export default function NotificationActivationBanner({
   }, [permission, visible]);
 
   const handleEnable = useCallback(async () => {
-    const permissionBefore = getPushPermissionState();
     setBusy(true);
     setErrorId(null);
-    let result: Awaited<ReturnType<typeof enablePushNotifications>>;
-    try {
-      result = await enablePushNotifications();
-    } catch {
-      result = "error";
-    }
-    const permissionAfter = getPushPermissionState();
-
-    void recordWebPushPromptEvent({
-      event: "web_push_native_result",
-      trigger: PROMPT_TRIGGER,
-      result,
-      permissionBefore,
-      permissionAfter,
-    });
-    if (result === "granted") {
-      void recordWebPushPromptEvent({
-        event: "web_push_subscription_saved",
-        trigger: PROMPT_TRIGGER,
-        result,
-        permissionBefore,
-        permissionAfter,
-      });
-    } else if (result === "unavailable" || result === "error") {
-      void recordWebPushPromptEvent({
-        event: "web_push_subscription_failed",
-        trigger: PROMPT_TRIGGER,
-        result,
-        permissionBefore,
-        permissionAfter,
-      });
-      setErrorId(activationErrorMessageId(result));
-    }
-
-    setPermission(permissionAfter);
+    const result = await enablePushAndRecord(PROMPT_TRIGGER);
+    if (result === "unavailable" || result === "error") setErrorId(activationErrorMessageId(result));
+    setPermission(getPushPermissionState());
     setBusy(false);
   }, []);
 
+  // Dismiss goes away under the pointer, so focus moves on to the composer
+  // before the confirmation replaces the banner.
   const handleDismiss = useCallback(() => {
+    void recordWebPushPromptEvent({
+      event: "web_push_prompt_dismissed",
+      trigger: PROMPT_TRIGGER,
+      permissionBefore: permission,
+      permissionAfter: permission,
+    });
     rememberDismissalForSession();
+    requestComposerFocus(composerChannelId, "user");
     setErrorId(null);
     setConfirmingDismissal(true);
-  }, []);
+  }, [composerChannelId, permission]);
+
+  // The confirmation closes by itself; focus is left where it is unless it
+  // was inside (on its Settings link), which would drop it to the document.
+  // Its own timer, not the person: an async request, so it never takes focus
+  // from a field or an open dialog.
+  const handleConfirmationEnd = useCallback(() => {
+    if (confirmationRef.current?.contains(document.activeElement)) {
+      requestComposerFocus(composerChannelId, "async");
+    }
+    setDismissed(true);
+  }, [composerChannelId]);
 
   if (!visible) return null;
 
@@ -209,10 +242,13 @@ export default function NotificationActivationBanner({
   // already separates the banner from the form. Measuring the bottom spacing
   // through the form's border and pt-3 padding hid the real gap behind the
   // composer line and made the two sides read asymmetric in every theme.
-  const placementClassName = placement === "desktop" ? "mx-3 mb-0 mt-2 w-auto min-w-0" : "";
+  // Its sides are the composer frame's: ChatPanel's notice stack keeps the
+  // composer's edge (COMPOSER_EDGE_CLASS), so no side margin here.
+  const placementClassName = placement === "desktop" ? "mb-0 mt-2" : "";
   if (confirmingDismissal) {
     return (
       <Banner
+        ref={confirmationRef}
         intent="info"
         density="sm"
         icon={<Check size={16} className="mt-0.5 shrink-0" />}
@@ -221,13 +257,12 @@ export default function NotificationActivationBanner({
         data-testid="notification-activation-dismiss-confirm"
       >
         <span className="font-bold">{formatMessage({ id: "message.notificationActivation.hiddenForNow" })} </span>
-        <button
-          type="button"
-          onClick={() => nav.toSettings("notifications")}
-          className="font-semibold underline decoration-[1.5px] underline-offset-[3px]"
+        <TextLink
+          onClick={openNotificationSettings}
+          variant="strong"
         >
           {formatMessage({ id: "message.notificationActivation.settingsNotifications" })}
-        </button>
+        </TextLink>
         <div
           aria-hidden="true"
           className="notification-activation-progress absolute inset-x-0 bottom-0 h-1 bg-foreground"
@@ -237,32 +272,35 @@ export default function NotificationActivationBanner({
         <span
           aria-hidden="true"
           className="notification-activation-dismiss-timer pointer-events-none absolute size-px opacity-0"
-          onAnimationEnd={() => setDismissed(true)}
+          onAnimationEnd={handleConfirmationEnd}
         />
       </Banner>
     );
   }
 
   const isMobile = placement === "mobile";
+  // A banner with a button closes with a ghost Dismiss just before it, never
+  // a × (Raft Design System › Banner).
   const actions = (
-    <div className="flex items-center gap-2">
+    <>
       <Button
-        size="sm"
+        type="button"
+        size="md"
+        variant="ghost"
+        onClick={handleDismiss}
+      >
+        {formatMessage({ id: "message.notificationActivation.dismiss" })}
+      </Button>
+      <Button
+        type="button"
+        size="md"
         variant="outline"
         disabled={busy}
         onClick={handleEnable}
       >
         {formatMessage({ id: busy ? "message.notificationActivation.enabling" : "message.notificationActivation.enable" })}
       </Button>
-      <CloseButton
-        type="button"
-        onClick={handleDismiss}
-        className="shrink-0"
-        aria-label={formatMessage({ id: "message.notificationActivation.hideReminderAria" })}
-      >
-        <X size={16} />
-      </CloseButton>
-    </div>
+    </>
   );
 
   return (
@@ -281,7 +319,8 @@ export default function NotificationActivationBanner({
         ? formatMessage({ id: "message.notificationActivation.mobileBody" })
         : formatMessage({ id: "message.notificationActivation.desktopBody" })}
       {errorId ? (
-        <div role="alert" className="mt-1 font-semibold text-danger-strong">
+        // Recoverable (try again, or in Settings): warning, not danger.
+        <div role="alert" className="mt-1 font-semibold text-warning-strong">
           {formatMessage({ id: errorId })}
         </div>
       ) : null}

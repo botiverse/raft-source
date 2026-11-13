@@ -22,6 +22,7 @@ const CONNECT_POLL_INTERVAL_MS = 3000;
 export function useComputerConnectionWatch({
   active,
   pendingMachineId = "",
+  includeAlreadyOnline = true,
 }: {
   // True while the user is being asked to run the setup command. Going false
   // clears the baseline, so a re-entry starts a fresh attempt.
@@ -29,6 +30,9 @@ export function useComputerConnectionWatch({
   // A machine row registered up-front (legacy add-machine path). Empty for the
   // Computer setup command, which creates its own row.
   pendingMachineId?: string;
+  // Whether a computer of this user's that was already online when the attempt
+  // began counts as connected (see resolveComputerConnectionProgress).
+  includeAlreadyOnline?: boolean;
 }) {
   const machines = useMachineStore((state) => state.machines);
   const loadMachines = useMachineStore((state) => state.loadMachines);
@@ -54,9 +58,9 @@ export function useComputerConnectionWatch({
   const progress = useMemo(
     () =>
       baseline
-        ? resolveComputerConnectionProgress(machines, pendingMachineId, baseline)
+        ? resolveComputerConnectionProgress(machines, pendingMachineId, baseline, { includeAlreadyOnline })
         : ({ state: "idle", machine: null, requiresConfirmation: false } as const),
-    [machines, pendingMachineId, baseline],
+    [machines, pendingMachineId, baseline, includeAlreadyOnline],
   );
 
   useEffect(() => {

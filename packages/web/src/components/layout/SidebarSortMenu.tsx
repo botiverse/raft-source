@@ -1,7 +1,7 @@
 import { useCallback, useMemo } from "react";
 import type { Dispatch, MouseEvent, SetStateAction } from "react";
 import { useIntl } from "react-intl";
-import { ArrowUpDown } from "lucide-react";
+import { ArrowDownUp } from "lucide-react";
 import { Popover, PopoverTrigger, SidebarSectionControl } from "@botiverse/raft-ui";
 import Tooltip from "../ui/Tooltip";
 import SelectionPopover from "../ui/SelectionPopover";
@@ -9,8 +9,8 @@ import type { SidebarSortMode } from "./sidebarSort";
 import {
   SIDEBAR_SORT_LABEL_ID,
   SIDEBAR_SORT_MODES,
-} from "./Sidebar";
-import type { SidebarSortSection } from "./Sidebar";
+} from "../../features/sidebar/sections/sidebarSortSections";
+import type { SidebarSortSection } from "../../features/sidebar/sections/sidebarSortSections";
 
 export function SidebarSortMenu({
   section,
@@ -72,7 +72,7 @@ export function SidebarSortMenu({
             />
           )}
         >
-          <ArrowUpDown size={16} />
+          <ArrowDownUp />
         </PopoverTrigger>
       </Tooltip>
       <SelectionPopover

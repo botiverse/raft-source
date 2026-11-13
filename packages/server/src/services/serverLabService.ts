@@ -16,6 +16,7 @@ import {
   actorRoleHasServerCapability,
   getActorServerRoleInServer,
 } from "../lib/actorPermissions";
+import { notifyServerLabFeatureFlagsChanged } from "./featureFlagChangeNotifier";
 
 export type ServerLabActor = {
   type: "human" | "agent";
@@ -448,7 +449,7 @@ export async function setServerLabsAccess(input: {
     );
   }
 
-  return getDb().transaction(async (tx) => {
+  const result = await getDb().transaction(async (tx) => {
     await lockLiveServer(tx, input.serverId);
     const access = await readAccess(tx, input.serverId);
     if (access.version !== input.expectedVersion) {
@@ -493,6 +494,9 @@ export async function setServerLabsAccess(input: {
       labs: await readModelInTransaction(tx, input.serverId, role),
     };
   });
+  // Every lab rule may now evaluate differently for this Server's clients.
+  if (result.applied) notifyServerLabFeatureFlagsChanged(input.serverId, null);
+  return result;
 }
 
 export async function setServerLabEnrollment(input: {
@@ -513,7 +517,7 @@ export async function setServerLabEnrollment(input: {
     );
   }
 
-  return getDb().transaction(async (tx) => {
+  const result = await getDb().transaction(async (tx) => {
     await lockLiveServer(tx, input.serverId);
     const access = await readAccess(tx, input.serverId);
     if (access.version !== input.expectedVersion) {
@@ -614,4 +618,6 @@ export async function setServerLabEnrollment(input: {
       labs: await readModelInTransaction(tx, input.serverId, role),
     };
   });
+  if (result.applied) notifyServerLabFeatureFlagsChanged(input.serverId, input.labKey);
+  return result;
 }

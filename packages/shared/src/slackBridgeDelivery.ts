@@ -236,20 +236,26 @@ export function planSlackBridgePartitionWork(
         automaticRedispatchAllowed:
           delivery.ambiguityBudgetProviderAttempts
             < SLACK_BRIDGE_MAX_AUTOMATIC_PROVIDER_ATTEMPTS_AFTER_AMBIGUITY
-          && !ageBudgetExhausted(
-            parseTimestamp(delivery.firstDispatchedAt) ?? input.now.getTime(),
-            input.now.getTime(),
-          ),
+,
       };
   }
 }
 
-function firstDispatchMs(snapshot: SlackBridgeOutboundDeliverySnapshot, nowMs: number): number {
-  return parseTimestamp(snapshot.firstDispatchedAt) ?? nowMs;
+/** A provider delay can outlive the automatic budget after an audited attempt. */
+export function needsSlackBridgeManualRetry(
+  delivery: Pick<SlackBridgeOutboundDeliverySnapshot,
+    "state" | "ambiguityBudgetProviderAttempts" | "dispatchedFailureAttempts" | "firstDispatchedAt">,
+  _now: Date,
+): boolean {
+  if (delivery.state === "dead" || delivery.state === "outcome_unknown") return true;
+  return delivery.state === "retry_wait" && (
+    delivery.ambiguityBudgetProviderAttempts >= SLACK_BRIDGE_MAX_AUTOMATIC_PROVIDER_ATTEMPTS_AFTER_AMBIGUITY
+    || delivery.dispatchedFailureAttempts >= SLACK_BRIDGE_MAX_FAILURE_ATTEMPTS
+  );
 }
 
-function ageBudgetExhausted(firstDispatchMsValue: number, nowMs: number): boolean {
-  return nowMs - firstDispatchMsValue >= SLACK_BRIDGE_MAX_DELIVERY_AGE_MS;
+function firstDispatchMs(snapshot: SlackBridgeOutboundDeliverySnapshot, nowMs: number): number {
+  return parseTimestamp(snapshot.firstDispatchedAt) ?? nowMs;
 }
 
 function withProviderAttempt(
@@ -314,21 +320,8 @@ export function applySlackBridgeProviderAttemptResult(
     };
   }
 
-  if (ageBudgetExhausted(attempt.firstDispatchedAtMs, nowMs)) {
-    const dispatchedFailureAttempts = snapshot.dispatchedFailureAttempts
-      + (result.kind === "transient_failure" || result.kind === "deterministic_failure" ? 1 : 0);
-    return {
-      ...base,
-      state: "dead",
-      ambiguityBudgetProviderAttempts: snapshot.ambiguityBudgetProviderAttempts
-        + (result.kind === "rate_limited" ? 0 : 1),
-      dispatchedFailureAttempts,
-      nextAttemptAt: null,
-      automaticRedispatchAllowed: false,
-      reason: "age_budget_exhausted",
-    };
-  }
-
+  // Provider Retry-After is binding. Queue age is not a delivery cutoff;
+  // unavailable pairs may resume much later without losing their place.
   if (result.kind === "rate_limited") {
     if (!Number.isFinite(result.retryAfterMs) || result.retryAfterMs < 0) {
       throw new Error("Slack Bridge Retry-After must be a non-negative finite duration");
@@ -349,7 +342,7 @@ export function applySlackBridgeProviderAttemptResult(
       ...base,
       state: "dead",
       ambiguityBudgetProviderAttempts: snapshot.ambiguityBudgetProviderAttempts + 1,
-      dispatchedFailureAttempts: snapshot.dispatchedFailureAttempts + 1,
+      dispatchedFailureAttempts: Math.min(SLACK_BRIDGE_MAX_FAILURE_ATTEMPTS, snapshot.dispatchedFailureAttempts + 1),
       nextAttemptAt: null,
       automaticRedispatchAllowed: false,
       reason: "deterministic_failure",
@@ -381,7 +374,7 @@ export function applySlackBridgeProviderAttemptResult(
     throw new Error("Slack Bridge retry requires finite base delay and jitter in [0, 1)");
   }
 
-  const dispatchedFailureAttempts = snapshot.dispatchedFailureAttempts + 1;
+  const dispatchedFailureAttempts = Math.min(SLACK_BRIDGE_MAX_FAILURE_ATTEMPTS, snapshot.dispatchedFailureAttempts + 1);
   if (dispatchedFailureAttempts >= SLACK_BRIDGE_MAX_FAILURE_ATTEMPTS) {
     return {
       ...base,

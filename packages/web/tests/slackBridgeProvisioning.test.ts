@@ -215,3 +215,21 @@ test("channel pairs are one-to-one on both Raft and Slack sides", () => {
     { valid: false, reason: "duplicate_slack_channel" },
   );
 });
+
+
+test("a stalled outgoing head makes an otherwise connected bridge degraded", () => {
+  const result = projectSlackBridgeHealth({ ...healthyRaw, failingSurface: "delivery", outboundDeliveries: [{
+    bindingId: "binding-1", bindingEpoch: 7, raftChannelId: "raft-general", deliveryId: "delivery-1", providerAttempts: 3,
+    state: "dead", retryRequested: false,
+  }] });
+  assert.equal(result.state, "degraded");
+  assert.equal(result.reason, "delivery_blocked");
+  assert.equal(result.action, "retry_delivery");
+});
+
+test("a missing thread receipt reports a blocked bridge without promising a resend", () => {
+  const result = projectSlackBridgeHealth({ ...healthyRaw, failingSurface: "delivery", outboundDeliveries: [] });
+  assert.equal(result.state, "degraded");
+  assert.equal(result.reason, "delivery_blocked");
+  assert.equal(result.action, "retry_verification");
+});

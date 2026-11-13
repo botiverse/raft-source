@@ -4,7 +4,7 @@
 // daemon proxy transport log cannot answer "what did the server say".
 import assert from "node:assert/strict";
 
-import { apiFailureError, proxyFailureNextAction } from "./apiFailure";
+import { apiFailureError, proxyFailureNextAction, rateLimitedResponseError } from "./apiFailure";
 
 const AGENT_STEP =
   "Retry once in a few seconds; if the command writes something, first check whether it already took effect, so it is not done twice. "
@@ -113,4 +113,35 @@ test("post_response_local points at the local daemon, not the server (task #369)
   assert.notEqual(action, TRANSPORT_LOG_HINT);
   assert.match(action, /local daemon fault, not a server or network failure/);
   assert.doesNotMatch(action, /before attributing it to the server/);
+});
+
+// Core's write budgets (the server's agentApiWriteLimits.ts): a 429 RATE_LIMITED
+// says how long to wait and is retryable, whichever command got it.
+const RATE_LIMITED_BODY = {
+  error: "This agent made too many task changes: the limit is 120 a minute. Retry in 23 seconds.",
+  code: "RATE_LIMITED",
+  details: { operation: "tasks.assign", limit: 120, windowSeconds: 60, retryAfterSeconds: 23 },
+};
+
+test("a 429 RATE_LIMITED: the Server's sentence, retryable, the wait in the next action", () => {
+  const err = apiFailureError(
+    { status: 429, error: RATE_LIMITED_BODY.error, errorCode: "RATE_LIMITED", suggestedNextAction: null, errorBody: RATE_LIMITED_BODY },
+    "ASSIGN_FAILED",
+  );
+  assert.equal(err.code, "RATE_LIMITED");
+  assert.equal(err.message, RATE_LIMITED_BODY.error);
+  assert.equal(err.retryable, true);
+  assert.equal(err.suggestedNextAction, "Wait 23 seconds, then run the same command again (the refused request changed nothing).");
+});
+
+test("a 429 RATE_LIMITED whose sentence isn't one short line gets a stand-in from its details", () => {
+  const err = rateLimitedResponseError({ status: 429, errorBody: { ...RATE_LIMITED_BODY, error: "line one\nline two" } });
+  assert.ok(err);
+  assert.equal(err.message, "Too many writes of this kind: the limit is 120 per 60 seconds. Retry in 23 seconds.");
+  assert.equal(err.retryable, true);
+});
+
+test("not a 429 RATE_LIMITED body: no rate-limit error", () => {
+  assert.equal(rateLimitedResponseError({ status: 429, errorBody: { error: "slow down", code: "BUSY" } }), null);
+  assert.equal(rateLimitedResponseError({ status: 400, errorBody: RATE_LIMITED_BODY }), null);
 });

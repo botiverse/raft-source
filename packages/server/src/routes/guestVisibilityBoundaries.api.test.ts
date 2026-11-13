@@ -1,20 +1,50 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { createApiTest } from "../test/integration/apiTest";
 import { getDb } from "../db/index";
-import { channels, featureFlagRules, messages } from "../db/schema";
-import { SERVER_GUEST_FEATURE_FLAG_KEY } from "../services/featureFlagService";
-import { transitionMemberRole } from "../services/serverService";
+import { onSocketAccessRevoked } from "../socket/accessRevocation";
+import { channelHumans, messages } from "../db/schema";
 import { createMessage } from "../services/messageService";
-import { markThreadDone, unfollowThread } from "../services/channelService";
+import { addHuman, createChannel, markThreadDone, unfollowThread } from "../services/channelService";
 import { emitTaskCreated } from "../services/taskRealtimeEvents";
-import { headers, recordTestInboxFact, seedThreadFixture } from "./channels.api.fixtures";
+import { headers, recordTestInboxFact, seedThreadFixture, type Fixtures } from "./channels.api.fixtures";
+import { seedBoundGuest } from "../test/guestFixture";
 
 const requireWeb = createRequire(new URL("../../../web/package.json", import.meta.url));
 const { io: clientIo } = requireWeb("socket.io-client");
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
+
+// A Guest reads only its one bound channel, while it is a member (#wg-rbac:#15).
+// "Hidden": the follower is a Guest of another channel, and a member of the
+// parent channel all the same, which grants it nothing.
+async function bindGuestElsewhere(f: Fixtures, opts: { memberOfParent?: boolean } = {}) {
+  const home = await createChannel(f.serverId, `guest-home-${randomUUID().slice(0, 8)}`, undefined, "private");
+  await seedBoundGuest({ serverId: f.serverId, userId: f.followerId, channelId: home.id });
+  if (opts.memberOfParent !== false) await addHuman(f.parentChannelId, f.followerId);
+  return home;
+}
+// "Visible": the follower is a Guest of the parent channel itself.
+async function bindGuestToParent(f: Fixtures) {
+  await seedBoundGuest({ serverId: f.serverId, userId: f.followerId, channelId: f.parentChannelId });
+}
+// Revocation: the owner removes the Guest from its channel.
+function removeGuestFromParent(baseUrl: string, f: Fixtures) {
+  return fetch(`${baseUrl}/api/channels/${f.parentChannelId}/members/user/${f.followerId}`, { method: "DELETE", headers: headers(f.ownerToken, f.serverId) });
+}
+/** Archiving the Guest's channel ends its server membership too (owner decision 2026-11-03). */
+function archiveGuestParent(baseUrl: string, f: Fixtures) {
+  return fetch(`${baseUrl}/api/channels/${f.parentChannelId}/archive`, { method: "POST", headers: headers(f.ownerToken, f.serverId) });
+}
+/**
+ * Cuts the Guest off while it stays a Guest of the server: its channel row
+ * goes, its binding stays (every product path that does this, removal and
+ * archive, now ends the membership as well).
+ */
+async function cutGuestOffParent(f: Fixtures): Promise<void> {
+  await getDb().delete(channelHumans).where(and(eq(channelHumans.channelId, f.parentChannelId), eq(channelHumans.userId, f.followerId)));
+}
 const waitEvent = (socket: any, event: string, timeoutMs = 500) => new Promise<any>((resolve, reject) => {
   const timer = setTimeout(() => reject(new Error(`no ${event}`)), timeoutMs);
   socket.once(event, (value: any) => { clearTimeout(timer); resolve(value); });
@@ -22,8 +52,7 @@ const waitEvent = (socket: any, event: string, timeoutMs = 500) => new Promise<a
 
 test("Guest cannot read metadata, subscribe, or receive task content for a hidden public channel", async ({ app }) => {
   const f = await seedThreadFixture(app.baseUrl);
-  await getDb().insert(featureFlagRules).values({ id: randomUUID(), flagKey: SERVER_GUEST_FEATURE_FLAG_KEY, stage: "server", priority: 0, decision: "allow", values: [f.serverId] });
-  await transitionMemberRole({ serverId: f.serverId, actorUserId: f.ownerId, targetUserId: f.followerId, nextRole: "guest", guestTransitionsEnabled: true });
+  await bindGuestElsewhere(f);
   const guestHeaders = headers(f.followerToken, f.serverId);
   for (const suffix of ["", "/members", "/agents"]) {
     const response = await fetch(`${app.baseUrl}/api/channels/${f.parentChannelId}${suffix}`, { headers: guestHeaders });
@@ -49,8 +78,7 @@ test("Guest cannot read metadata, subscribe, or receive task content for a hidde
 
 test("Guest broad sync omits hidden public-channel content", async ({ app }) => {
   const f = await seedThreadFixture(app.baseUrl);
-  await getDb().insert(featureFlagRules).values({ id: randomUUID(), flagKey: SERVER_GUEST_FEATURE_FLAG_KEY, stage: "server", priority: 0, decision: "allow", values: [f.serverId] });
-  await transitionMemberRole({ serverId: f.serverId, actorUserId: f.ownerId, targetUserId: f.followerId, nextRole: "guest", guestTransitionsEnabled: true });
+  await bindGuestElsewhere(f);
   const response = await fetch(`${app.baseUrl}/api/messages/sync?since_seq=0`, { headers: headers(f.followerToken, f.serverId) });
   assert.equal(response.status, 200);
   assert.equal(JSON.stringify(await response.json()).includes(f.parentMessageId), false);
@@ -58,8 +86,9 @@ test("Guest broad sync omits hidden public-channel content", async ({ app }) => 
 
 test("Guest cannot mutate read state on a hidden public channel", async ({ app }) => {
   const f = await seedThreadFixture(app.baseUrl);
-  await getDb().insert(featureFlagRules).values({ id: randomUUID(), flagKey: SERVER_GUEST_FEATURE_FLAG_KEY, stage: "server", priority: 0, decision: "allow", values: [f.serverId] });
-  await transitionMemberRole({ serverId: f.serverId, actorUserId: f.ownerId, targetUserId: f.followerId, nextRole: "guest", guestTransitionsEnabled: true });
+  // Not a member of it either: a member row would be a prior relationship,
+  // whose own residue read-all retires without saying anything of the channel.
+  await bindGuestElsewhere(f, { memberOfParent: false });
   const guestHeaders = headers(f.followerToken, f.serverId);
   const statuses = await Promise.all([["read", { seq: 1 }], ["read-all", {}], ["unread", {}]].map(async ([suffix, body]) => (
     await fetch(`${app.baseUrl}/api/channels/${f.parentChannelId}/${suffix}`, {
@@ -71,8 +100,7 @@ test("Guest cannot mutate read state on a hidden public channel", async ({ app }
 
 test("Guest does not receive metadata-bearing server-room events", async ({ app }) => {
   const f = await seedThreadFixture(app.baseUrl);
-  await getDb().insert(featureFlagRules).values({ id: randomUUID(), flagKey: SERVER_GUEST_FEATURE_FLAG_KEY, stage: "server", priority: 0, decision: "allow", values: [f.serverId] });
-  await transitionMemberRole({ serverId: f.serverId, actorUserId: f.ownerId, targetUserId: f.followerId, nextRole: "guest", guestTransitionsEnabled: true });
+  await bindGuestElsewhere(f);
   const guestSocket = clientIo(app.baseUrl, { auth: { token: f.followerToken, serverId: f.serverId }, transports: ["websocket"], autoConnect: false });
   const ownerSocket = clientIo(app.baseUrl, { auth: { token: f.ownerToken, serverId: f.serverId }, transports: ["websocket"], autoConnect: false });
   try {
@@ -87,45 +115,64 @@ test("Guest does not receive metadata-bearing server-room events", async ({ app 
   } finally { guestSocket.disconnect(); ownerSocket.disconnect(); }
 });
 
-test("member socket is disconnected when the member is downgraded to Guest", async ({ app }) => {
+test("a member is never downgraded to Guest: the change is refused and its socket stays", async ({ app }) => {
   const f = await seedThreadFixture(app.baseUrl);
-  await getDb().insert(featureFlagRules).values({ id: randomUUID(), flagKey: SERVER_GUEST_FEATURE_FLAG_KEY, stage: "server", priority: 0, decision: "allow", values: [f.serverId] });
   const socket = clientIo(app.baseUrl, { auth: { token: f.followerToken, serverId: f.serverId }, transports: ["websocket"], autoConnect: false });
   try {
     const ready = waitEvent(socket, "rooms:joined", 4_000); socket.connect(); await ready;
     assert.equal(app.io.sockets.sockets.get(socket.id)!.rooms.has(`channel:${f.parentChannelId}`), true);
-    const disconnected = waitEvent(socket, "disconnect", 4_000);
+    const disconnected = waitEvent(socket, "disconnect", 500);
     const response = await fetch(`${app.baseUrl}/api/servers/${f.serverId}/members/${f.followerId}`, {
       method: "PATCH", headers: headers(f.ownerToken, f.serverId), body: JSON.stringify({ role: "guest" }),
     });
-    assert.equal(response.status, 200);
-    await disconnected;
+    // Guests are invited to a channel (#wg-rbac:#15), never made from members.
+    assert.equal(response.status, 403);
+    await assert.rejects(disconnected, /no disconnect/);
+    assert.equal(app.io.sockets.sockets.get(socket.id)!.rooms.has(`channel:${f.parentChannelId}`), true);
   } finally { socket.disconnect(); }
 });
 
-test("revoking guestVisible evicts connected Guests from the channel room", async ({ app }) => {
+test("removing a Guest from its channel evicts its connected socket from the channel room", async ({ app }) => {
   const f = await seedThreadFixture(app.baseUrl);
-  await getDb().insert(featureFlagRules).values({ id: randomUUID(), flagKey: SERVER_GUEST_FEATURE_FLAG_KEY, stage: "server", priority: 0, decision: "allow", values: [f.serverId] });
-  await getDb().update(channels).set({ guestVisible: true }).where(eq(channels.id, f.parentChannelId));
-  await transitionMemberRole({ serverId: f.serverId, actorUserId: f.ownerId, targetUserId: f.followerId, nextRole: "guest", guestTransitionsEnabled: true });
+  await bindGuestToParent(f);
   const socket = clientIo(app.baseUrl, { auth: { token: f.followerToken, serverId: f.serverId }, transports: ["websocket"], autoConnect: false });
   try {
     const ready = waitEvent(socket, "rooms:joined", 4_000); socket.connect(); await ready;
     const serverSocket = app.io.sockets.sockets.get(socket.id)!;
     assert.equal(serverSocket.rooms.has(`channel:${f.parentChannelId}`), true);
-    const response = await fetch(`${app.baseUrl}/api/channels/${f.parentChannelId}`, {
-      method: "PATCH", headers: headers(f.ownerToken, f.serverId), body: JSON.stringify({ guestVisible: false }),
-    });
-    assert.equal(response.status, 200);
+    const response = await removeGuestFromParent(app.baseUrl, f);
+    assert.equal(response.status, 200, await response.clone().text());
     assert.equal(serverSocket.rooms.has(`channel:${f.parentChannelId}`), false);
+  } finally { socket.disconnect(); }
+});
+
+test("archiving a Guest's channel drops its live connection after commit (#wg-rbac:#15)", async ({ app }) => {
+  const f = await seedThreadFixture(app.baseUrl);
+  await bindGuestToParent(f);
+  const socket = clientIo(app.baseUrl, { auth: { token: f.followerToken, serverId: f.serverId }, transports: ["websocket"], autoConnect: false });
+  try {
+    const ready = waitEvent(socket, "rooms:joined", 4_000); socket.connect(); await ready;
+    const serverSocket = app.io.sockets.sockets.get(socket.id)!;
+    assert.equal(serverSocket.rooms.has(`channel:${f.parentChannelId}`), true);
+    // The archive ends the Guest's server membership: after commit its
+    // connections are revoked as a removal from the server.
+    const revoked: unknown[] = [];
+    const stop = onSocketAccessRevoked(async (revocation) => { revoked.push(revocation); });
+    try {
+      const response = await archiveGuestParent(app.baseUrl, f);
+      assert.equal(response.status, 200, await response.clone().text());
+    } finally { stop(); }
+    assert.equal(serverSocket.rooms.has(`channel:${f.parentChannelId}`), false);
+    assert.ok(revoked.some((revocation) => {
+      const r = revocation as { userId?: string; removedFromServerId?: string };
+      return r.userId === f.followerId && r.removedFromServerId === f.serverId;
+    }), "the archive revokes the Guest as a removal from the server");
   } finally { socket.disconnect(); }
 });
 
 for (const state of ["followed", "done", "unfollowed"] as const) test(`Guest revoked visibility removes ${state} parent preview`, async ({ app }) => {
   const f = await seedThreadFixture(app.baseUrl);
-  await getDb().insert(featureFlagRules).values({ id: randomUUID(), flagKey: SERVER_GUEST_FEATURE_FLAG_KEY, stage: "server", priority: 0, decision: "allow", values: [f.serverId] });
-  await getDb().update(channels).set({ guestVisible: true }).where(eq(channels.id, f.parentChannelId));
-  await transitionMemberRole({ serverId: f.serverId, actorUserId: f.ownerId, targetUserId: f.followerId, nextRole: "guest", guestTransitionsEnabled: true });
+  await bindGuestToParent(f);
   const old = await createMessage(f.threadId, "user", f.ownerId, "old-visible-reply");
   await recordTestInboxFact({ serverId: f.serverId, receiverId: f.followerId, kind: "thread", sourceChannelId: f.threadId, message: old });
   if (state === "done") await markThreadDone(f.followerId, f.threadId, String(old.seq));
@@ -133,7 +180,43 @@ for (const state of ["followed", "done", "unfollowed"] as const) test(`Guest rev
   const guestHeaders = headers(f.followerToken, f.serverId);
   const path = state === "followed" ? "channels/threads/followed" : `channels/inbox/${state}`;
   const before = await fetch(`${app.baseUrl}/api/${path}`, { headers: guestHeaders }); assert.equal(before.status, 200); assert.ok(JSON.stringify(await before.json()).includes(f.threadId));
-  const revoke = await fetch(`${app.baseUrl}/api/channels/${f.parentChannelId}`, { method: "PATCH", headers: headers(f.ownerToken, f.serverId), body: JSON.stringify({ guestVisible: false }) }); assert.equal(revoke.status, 200);
+  await cutGuestOffParent(f);
   await getDb().update(messages).set({ content: "new-parent-content-after-visibility-revocation" }).where(eq(messages.id, f.parentMessageId));
   const after = await fetch(`${app.baseUrl}/api/${path}`, { headers: guestHeaders }); assert.equal(after.status, 200); assert.equal(JSON.stringify(await after.json()).includes("new-parent-content-after-visibility-revocation"), false);
+});
+
+test("Guest cannot save or read saved messages from a hidden public channel", async ({ app }) => {
+  const f = await seedThreadFixture(app.baseUrl);
+  await bindGuestToParent(f);
+  const reply = await createMessage(f.threadId, "user", f.ownerId, "saved-thread-reply");
+  const guestHeaders = headers(f.followerToken, f.serverId);
+  const save = (messageId: string) => fetch(`${app.baseUrl}/api/channels/saved`, { method: "POST", headers: guestHeaders, body: JSON.stringify({ messageId }) });
+  const list = async () => (await fetch(`${app.baseUrl}/api/channels/saved`, { headers: guestHeaders })).json();
+  const check = async () => (await fetch(`${app.baseUrl}/api/channels/saved/check`, { method: "POST", headers: guestHeaders, body: JSON.stringify({ messageIds: [f.parentMessageId, reply.id] }) })).json();
+
+  // Visible to the guest: both the channel message and its thread reply save and list.
+  assert.equal((await save(f.parentMessageId)).status, 200);
+  assert.equal((await save(reply.id)).status, 200);
+  const visible = await list();
+  assert.equal(visible.total, 2);
+  assert.deepEqual(new Set((await check()).savedIds), new Set([f.parentMessageId, reply.id]));
+
+  // Hidden from the guest (cut off from its channel; it stays a Guest): earlier
+  // saves stop listing, counting and checking, and new saves are refused.
+  await cutGuestOffParent(f);
+  await getDb().update(messages).set({ content: "hidden-content-after-revocation" }).where(eq(messages.id, f.parentMessageId));
+  const hidden = await list();
+  assert.equal(hidden.total, 0);
+  assert.equal(hidden.saved.length, 0);
+  assert.equal(JSON.stringify(hidden).includes("hidden-content-after-revocation"), false);
+  assert.deepEqual((await check()).savedIds, []);
+  await fetch(`${app.baseUrl}/api/channels/saved/${f.parentMessageId}`, { method: "DELETE", headers: guestHeaders });
+  await fetch(`${app.baseUrl}/api/channels/saved/${reply.id}`, { method: "DELETE", headers: guestHeaders });
+  assert.equal((await save(f.parentMessageId)).status, 404);
+  assert.equal((await save(reply.id)).status, 404);
+
+  // A member keeps saving public-channel messages unchanged.
+  const ownerSave = await fetch(`${app.baseUrl}/api/channels/saved`, { method: "POST", headers: headers(f.ownerToken, f.serverId), body: JSON.stringify({ messageId: f.parentMessageId }) });
+  assert.equal(ownerSave.status, 200);
+  assert.equal((await (await fetch(`${app.baseUrl}/api/channels/saved`, { headers: headers(f.ownerToken, f.serverId) })).json()).total, 1);
 });

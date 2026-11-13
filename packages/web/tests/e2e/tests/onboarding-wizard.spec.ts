@@ -3,6 +3,7 @@ import type { APIRequestContext, Browser, Page } from "@playwright/test";
 import { CURRENT_LEGAL_ACCEPTANCE } from "@botiverse/raft-shared";
 import { waitForSeedState } from "../fixtures/seedState";
 import type { PlaywrightSeedState } from "../fixtures/seedState";
+import { expectTimelineRendered } from "../fixtures/timeline";
 
 type Login = { accessToken: string; refreshToken: string };
 type RegisteredLogin = Login & { user: { id: string } };
@@ -177,18 +178,11 @@ async function expectGrandfatheredSetupStaysOutOfOnboarding(
       handoffPending: false,
     },
   });
-  await expect(page.getByTestId("onboarding-wizard-modal")).toHaveCount(0);
   await expect(page.getByTestId("server-setup-survey")).toHaveCount(0);
   await expect(page.getByText("Set up your server")).toHaveCount(0);
 }
 
 test.describe.serial("Onboarding wizard", () => {
-  test("pre-existing seeded membership does not backfill-trigger the wizard", async ({ page }) => {
-    const seedState = await waitForSeedState();
-    await page.goto(`/s/${seedState.server.slug}`);
-    await expect(page.getByTestId("onboarding-wizard-modal")).toHaveCount(0);
-  });
-
   test("setup P0 remains mandatory when legacy opt-out state is stored", async ({
     browser,
     request,
@@ -204,9 +198,6 @@ test.describe.serial("Onboarding wizard", () => {
 
       const first = await openServer(browser, login, server.slug);
       await expectMandatoryServerSetupGate(request, seedState, login, server.id, first.page);
-      await expect(first.page.getByText("Don't remind me again")).toHaveCount(0);
-      await expect(first.page.getByTestId("onboarding-wizard-close")).toHaveCount(0);
-      await expect(first.page.getByTestId("onboarding-skip-button")).toHaveCount(0);
       await first.page.keyboard.press("Escape");
       await expectMandatoryServerSetupGate(request, seedState, login, server.id, first.page);
       await first.context.close();
@@ -253,27 +244,10 @@ test.describe.serial("Onboarding wizard", () => {
 
       const { context, page } = await openServer(browser, login, seedState.server.slug);
       await expectGrandfatheredSetupStaysOutOfOnboarding(request, seedState, login, page);
-      await expect(page.getByText("Seed message 150")).toBeVisible();
+      await expectTimelineRendered(page);
       await context.close();
     } finally {
       await restoreReferralSkip(request, seedState, login);
-    }
-  });
-
-  test("invited member is not pulled into the removed legacy referral wizard", async ({ browser, request }) => {
-    const seedState = await waitForSeedState();
-    const memberLogin = await loginSeedUser(request, seedState, seedState.extraHuman);
-
-    try {
-      await resetReferralSource(request, seedState, memberLogin);
-
-      const { context, page } = await openServer(browser, memberLogin, seedState.server.slug);
-      await expect(page.getByTestId("onboarding-wizard-modal")).toHaveCount(0);
-      await expect(page.getByText("HOW DID YOU FIND US?")).toHaveCount(0);
-      await expect(page.getByText("Seed message 150")).toBeVisible();
-      await context.close();
-    } finally {
-      await restoreReferralSkip(request, seedState, memberLogin);
     }
   });
 });

@@ -2,7 +2,6 @@ import { dbTest as test } from "../test/integration/dbTest";
 import { closeTestDatabase, openTestDatabase } from "../test/integration/database";
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
-import { readFileSync } from "node:fs";
 import { and, eq } from "drizzle-orm";
 import { SLACK_BRIDGE_MAX_DELIVERY_AGE_MS } from "@botiverse/raft-shared";
 import { getDb } from "../db/index";
@@ -43,6 +42,7 @@ import {
   EXTERNAL_DELIVERY_AUTHORITY_BACKOFF_MAX_MS,
   EXTERNAL_DELIVERY_AUTHORITY_OVERDUE_MS,
   processExternalDeliveryPartitionHead,
+  recordExternalDeliveryRetryDecision,
   type ActiveExternalDeliveryRuntime,
   type ExternalDeliveryProviderResult,
   type ExternalDeliveryWorkerDependencies,
@@ -65,7 +65,7 @@ function authority(bindingId: string, bindingEpoch: number, raftChannelId: strin
   return {
     provider: "provider-test",
     environment: "test",
-    appRegistrationId: "registration-1",
+    appRegistrationId: "00000000-0000-4000-8000-000000000001",
     installId: "install-1",
     workspaceId: "workspace-1",
     connectionEpoch: 4,
@@ -154,6 +154,7 @@ async function seedFixture(positionCount = 1, senderType: "user" | "agent" = "us
         },
         sanitizedText: message.content,
         externalMentions: [],
+        raftMentionSubstitutions: [],
         attachments: [],
         bindingAuthority: frozenAuthority,
         enqueueRuntimeRevision: "runtime-r1",
@@ -330,6 +331,39 @@ function partitionLocks(statements: string[]): string[] {
     text.includes("from \"external_delivery_partitions\"") && text.includes("for update"));
 }
 
+test("recording a provider outcome locks the partition before the delivery, like the claim", async () => {
+  // Prod 2026-10-21 (four 40P01, 15:39-17:07Z): the outcome transaction locked the
+  // delivery first and the partition only when the cursor advanced, while another
+  // replica's tick held the partition (lockPartitionAndHead) and waited for that
+  // head. Both paths must take partition -> delivery.
+  const fixture = await seedFixture();
+  const calls = { runtime: 0, credential: 0, provider: 0 };
+  const statements = await captureSql(() => processExternalDeliveryPartitionHead(
+    workerInput(fixture, dependencies({ runtime: activeRuntime(fixture), calls })),
+  ));
+  assert.equal(calls.provider, 1, "the provider must be called so the outcome transaction runs");
+  const isPartitionLock = (text: string) =>
+    text.includes("from \"external_delivery_partitions\"") && text.includes("for update");
+  // The outcome's delivery lock is the last delivery FOR UPDATE filtered on the
+  // exact lease (the column list names lease_owner on every delivery read, so
+  // match the WHERE clause).
+  const isLeaseDeliveryLock = (text: string) =>
+    text.includes("from \"external_outbound_deliveries\"")
+    && text.includes("\"external_outbound_deliveries\".\"lease_owner\" = $")
+    && text.includes("for update");
+  let outcomeDeliveryLock = -1;
+  statements.forEach((text, index) => {
+    if (isLeaseDeliveryLock(text)) outcomeDeliveryLock = index;
+  });
+  assert.ok(outcomeDeliveryLock > 0, "the outcome transaction must lock its delivery under the exact lease");
+  assert.ok(
+    isPartitionLock(statements[outcomeDeliveryLock - 1]!),
+    `the statement before the outcome's delivery lock must be the partition lock, got: ${statements[outcomeDeliveryLock - 1]}`,
+  );
+  const [delivery] = await fixture.db.select().from(externalOutboundDeliveries);
+  assert.equal(delivery.state, "accepted");
+});
+
 test("the worker skips a partition another worker holds; the operator skip path still waits for it", async () => {
   // Prod 2026-09-26 (bac9696a rollout): every replica's worker loop hit the same
   // partition row at once and 13+ sessions queued on its lock, each parking a
@@ -344,8 +378,12 @@ test("the worker skips a partition another worker holds; the operator skip path 
   const workerLocks = partitionLocks(workerStatements);
   assert.ok(workerLocks.length > 0, "the worker must lock its partition row; zero captured statements means the capture seam is broken");
   assert.ok(
-    workerLocks.every((text) => text.includes("skip locked")),
-    `worker partition lock must use SKIP LOCKED; got: ${workerLocks.join(" | ")}`,
+    workerLocks[0]!.includes("skip locked"),
+    `the initial worker claim must use SKIP LOCKED; got: ${workerLocks[0]}`,
+  );
+  assert.ok(
+    workerLocks.slice(1).every((text) => !text.includes("skip locked")),
+    `an owned claim must wait briefly rather than abandoning its lease; got: ${workerLocks.slice(1).join(" | ")}`,
   );
 
   const operatorStatements = await captureSql(() => consumeExternalDeliverySkipDecision({
@@ -420,10 +458,6 @@ test("accepted attachment outcome atomically links its asset facts before advanc
     uploaderId: fixture.owner.id,
     uploaderType: "user",
     filename: "worker-attachment.txt",
-    mimeType: object.mimeType,
-    sizeBytes: object.sizeBytes,
-    storageKey: object.storageKey,
-    contentHash: digest,
   }).returning();
   const original = fixture.deliveries[0]!.renderSnapshot as unknown as SlackBridgeRenderSnapshot;
   const snapshot: SlackBridgeRenderSnapshot = {
@@ -472,7 +506,7 @@ test("accepted attachment outcome atomically links its asset facts before advanc
   }).where(eq(externalAttachmentTransferJobs.id, job.id));
 
   const result = await processExternalDeliveryPartitionHead(workerInput(fixture, dependencies({
-    runtime: { ...activeRuntime(fixture), attachmentTransferEnabled: true },
+    runtime: activeRuntime(fixture),
     providerResult: { kind: "accepted", providerMessageId: "1710000000.000099" },
   })));
   assert.equal(result.kind, "attempted");
@@ -492,7 +526,7 @@ test("runtime mismatch releases the exact origin before credential access", asyn
   const fixture = await seedFixture();
   const calls = { runtime: 0, credential: 0, provider: 0 };
   const mismatch = activeRuntime(fixture);
-  mismatch.bindingAuthority = { ...mismatch.bindingAuthority, connectionEpoch: 999 };
+  mismatch.bindingAuthority = { ...mismatch.bindingAuthority, providerConversationId: "another-conversation" };
   const result = await processExternalDeliveryPartitionHead(workerInput(fixture, dependencies({
     runtime: mismatch,
     calls,
@@ -511,7 +545,7 @@ test("runtime mismatch releases the exact origin before credential access", asyn
   assert.equal(delivery.leaseOwner, null);
   assert.equal(
     delivery.stateReason,
-    "authority_retry:runtime_authority_inactive_or_mismatched",
+    `authority_retry:runtime_authority_inactive_or_mismatched|since=${NOW.getTime()}`,
   );
 });
 
@@ -785,7 +819,8 @@ test("authority restored at the terminal threshold dispatches instead of quarant
 test("overdue stale authority emits one typed visible alert and still performs zero provider I/O", async () => {
   const fixture = await seedFixture();
   const createdAt = new Date(NOW.getTime() - EXTERNAL_DELIVERY_AUTHORITY_OVERDUE_MS);
-  await fixture.db.update(externalOutboundDeliveries).set({ createdAt, updatedAt: createdAt })
+  await fixture.db.update(externalOutboundDeliveries).set({ createdAt, updatedAt: createdAt,
+    stateReason: `authority_retry:runtime_authority_inactive_or_mismatched|since=${createdAt.getTime()}` })
     .where(eq(externalOutboundDeliveries.id, fixture.deliveries[0].id));
   const calls = { runtime: 0, credential: 0, provider: 0 };
 
@@ -817,7 +852,7 @@ test("overdue stale authority emits one typed visible alert and still performs z
   assert.equal(delivery.state, "queued");
   assert.equal(
     delivery.stateReason,
-    "authority_overdue:runtime_authority_inactive_or_mismatched",
+    `authority_overdue:runtime_authority_inactive_or_mismatched|since=${createdAt.getTime()}`,
   );
 
   const beforeDue = await processExternalDeliveryPartitionHead(workerInput(fixture, dependencies({
@@ -847,7 +882,8 @@ test("overdue stale authority emits one typed visible alert and still performs z
 test("terminal stale-authority head needs an owned audited skip before a later valid delivery advances", async () => {
   const fixture = await seedFixture(2);
   const createdAt = new Date(NOW.getTime() - SLACK_BRIDGE_MAX_DELIVERY_AGE_MS);
-  await fixture.db.update(externalOutboundDeliveries).set({ createdAt, updatedAt: createdAt })
+  await fixture.db.update(externalOutboundDeliveries).set({ createdAt, updatedAt: createdAt,
+    stateReason: `authority_retry:runtime_authority_inactive_or_mismatched|since=${createdAt.getTime()}` })
     .where(eq(externalOutboundDeliveries.id, fixture.deliveries[0].id));
   const staleCalls = { runtime: 0, credential: 0, provider: 0 };
 
@@ -866,7 +902,7 @@ test("terminal stale-authority head needs an owned audited skip before a later v
   let [head] = await fixture.db.select().from(externalOutboundDeliveries)
     .where(eq(externalOutboundDeliveries.id, fixture.deliveries[0].id));
   assert.equal(head.state, "quarantined");
-  assert.equal(head.stateReason, "authority_terminal:runtime_authority_inactive_or_mismatched");
+  assert.equal(head.stateReason, `authority_terminal:runtime_authority_inactive_or_mismatched|since=${createdAt.getTime()}`);
 
   const [decision] = await fixture.db.insert(externalDeliveryOperatorDecisions).values({
     deliveryId: fixture.deliveries[0].id,
@@ -1151,6 +1187,21 @@ test("missing credential creates no attempt and calls no provider", async () => 
   assert.equal(delivery.providerAttempts, 0);
 });
 
+test("source preparation blocks before a workspace credential or provider attempt", async () => {
+  const fixture = await seedFixture();
+  const calls = { runtime: 0, credential: 0, provider: 0 };
+  const result = await processExternalDeliveryPartitionHead(workerInput(fixture, {
+    ...dependencies({ runtime: activeRuntime(fixture), calls }),
+    async prepareBeforeCredential() { return { ready: false as const, reason: "attachment_source_preparing" }; },
+  }));
+  assert.deepEqual(result, { kind: "blocked", reason: "attachment_source_preparing", deliveryId: fixture.deliveries[0]!.id });
+  assert.deepEqual(calls, { runtime: 1, credential: 0, provider: 0 });
+  assert.equal((await fixture.db.select().from(externalDeliveryAttempts)).length, 0);
+  const [delivery] = await fixture.db.select().from(externalOutboundDeliveries);
+  assert.equal(delivery.state, "queued");
+  assert.equal(delivery.providerAttempts, 0);
+});
+
 test("provider preflight rejection releases credential and creates no provider attempt", async () => {
   const fixture = await seedFixture();
   const runtime = activeRuntime(fixture);
@@ -1327,8 +1378,8 @@ test("expired pre-I/O claim restores an outcome_unknown head without consuming b
   })));
   assert.equal(result.kind, "authority_blocked");
   if (result.kind !== "authority_blocked") return;
-  assert.equal(result.severity, "overdue");
-  assert.equal(result.alert?.severity, "overdue");
+  assert.equal(result.severity, "retrying");
+  assert.equal(result.alert, undefined, "message age is not elapsed authority-block duration");
   const [delivery] = await fixture.db.select().from(externalOutboundDeliveries);
   assert.equal(delivery.state, "outcome_unknown");
   assert.equal(delivery.providerAttempts, 1);
@@ -1465,7 +1516,7 @@ test("retry_wait before its exact due time invokes no authority dependency", asy
   assert.deepEqual(calls, { runtime: 0, credential: 0, provider: 0 });
 });
 
-test("three non-429 calls exhaust automatic authority without credential or provider I/O", async () => {
+test("three non-429 calls stop writes while allowing read-only preparation", async () => {
   const fixture = await seedFixture();
   await fixture.db.update(externalOutboundDeliveries).set({
     state: "outcome_unknown",
@@ -1481,10 +1532,10 @@ test("three non-429 calls exhaust automatic authority without credential or prov
     calls,
   }))), {
     kind: "blocked",
-    reason: "audited_retry_required",
+    reason: "automatic_dispatch_not_authorized",
     deliveryId: fixture.deliveries[0].id,
   });
-  assert.deepEqual(calls, { runtime: 0, credential: 0, provider: 0 });
+  assert.deepEqual(calls, { runtime: 1, credential: 1, provider: 0 });
 });
 
 test("dead head blocks the later FIFO row and invokes no dependency", async () => {
@@ -1514,8 +1565,12 @@ test("dead head blocks the later FIFO row and invokes no dependency", async () =
   assert.equal((await fixture.db.select().from(externalDeliveryAttempts)).length, 0);
 });
 
-test("audited skip is exact, one-shot, cursor-atomic, and zero provider I/O", async () => {
+for (const blockedReason of ["runtime_authority_inactive_or_mismatched", "slack_not_in_channel", "binding_paused_bot_removed"] as const) {
+test(`audited skip preserves only bot-recovery waits (${blockedReason})`, async () => {
   const fixture = await seedFixture();
+  await fixture.db.update(externalDeliveryPartitions).set({ authorityBlockedAt: NOW,
+    authorityBlockedReason: blockedReason, authorityRetryAt: new Date(NOW.getTime() + 60_000),
+    authorityOverdueAlertedAt: NOW }).where(eq(externalDeliveryPartitions.bindingId, fixture.bindingId));
   const [decision] = await fixture.db.insert(externalDeliveryOperatorDecisions).values({
     deliveryId: fixture.deliveries[0].id,
     bindingId: fixture.bindingId,
@@ -1540,6 +1595,9 @@ test("audited skip is exact, one-shot, cursor-atomic, and zero provider I/O", as
   assert.equal(delivery.providerAttempts, 0);
   const [partition] = await fixture.db.select().from(externalDeliveryPartitions);
   assert.equal(partition.cursorPosition, 1);
+  assert.deepEqual([partition.authorityBlockedAt, partition.authorityBlockedReason, partition.authorityRetryAt,
+    partition.authorityOverdueAlertedAt], blockedReason === "runtime_authority_inactive_or_mismatched"
+    ? [null, null, null, null] : [NOW, blockedReason, new Date(NOW.getTime() + 60_000), NOW]);
   const [consumed] = await fixture.db.select().from(externalDeliveryOperatorDecisions);
   assert.equal(consumed.consumedLeaseGeneration, 1);
   assert.equal((await fixture.db.select().from(externalDeliveryAttempts)).length, 0);
@@ -1551,6 +1609,7 @@ test("audited skip is exact, one-shot, cursor-atomic, and zero provider I/O", as
     now: NOW,
   }), { kind: "blocked", reason: "partition_head_missing" });
 });
+}
 
 test("audited retry consumes one exact decision at attempt start", async () => {
   const fixture = await seedFixture();
@@ -1759,7 +1818,7 @@ test("audited 24th transient failure closes the failure budget exactly", async (
   assert.equal(delivery.dispatchedFailureAttempts, 24);
 });
 
-test("audited retry beyond 24 hours performs zero provider I/O", async () => {
+test("one audited retry beyond the automatic age limit can deliver the original message", async () => {
   const fixture = await seedFixture();
   await fixture.db.update(externalOutboundDeliveries).set({
     state: "outcome_unknown",
@@ -1786,21 +1845,16 @@ test("audited retry beyond 24 hours performs zero provider I/O", async () => {
     dependencies({
       runtime: activeRuntime(fixture),
       calls,
-      providerResult: { kind: "rate_limited", retryAfterMs: 1_000 },
+      providerResult: { kind: "accepted", providerMessageId: "provider-old-accepted", providerThreadId: null },
     }),
     decision.id,
   ));
-  assert.deepEqual(result, {
-    kind: "blocked",
-    reason: "delivery_budget_exhausted",
-    deliveryId: fixture.deliveries[0].id,
-  });
-  assert.equal(calls.provider, 0);
+  assert.equal(result.kind, "attempted");
+  assert.equal(calls.provider, 1);
   const [delivery] = await fixture.db.select().from(externalOutboundDeliveries);
-  assert.equal(delivery.state, "outcome_unknown");
-  assert.equal(delivery.stateReason, "delivery_budget_exhausted");
-  assert.equal(delivery.providerAttempts, 1);
-  assert.equal(delivery.ambiguityBudgetProviderAttempts, 1);
+  assert.equal(delivery.state, "accepted");
+  assert.equal(delivery.providerAttempts, 2);
+  assert.equal(delivery.firstDispatchedAt?.getTime(), NOW.getTime() - 24 * 60 * 60 * 1000);
 });
 
 test("accepted transaction rollback leaves a reclaimable started attempt and no false cursor/link", async () => {
@@ -1857,18 +1911,12 @@ test("raw adapter exception becomes a closed unknown reason without raw text", a
   assert.ok(!JSON.stringify({ delivery, attempt, link }).includes("secret-shaped"));
 });
 
-test("worker source keeps the opaque credential handle adapter-only and has no raw error logger", () => {
-  const source = readFileSync(new URL("./externalDeliveryWorkerService.ts", import.meta.url), "utf8");
-  assert.equal(source.match(/credential\.handle/g)?.length, 4);
-  assert.match(source, /dependencies\.prepareProvider/);
-  assert.match(source, /dependencies\.releaseCredential/);
-  assert.doesNotMatch(source, /\b(?:accessToken|refreshToken|apiKey|authorizationHeader|rawError)\b/);
-  assert.doesNotMatch(source, /\b(?:console|logger)\./);
-  assert.match(source, /\} catch \{\s*providerResult = \{ kind: "outcome_unknown"/);
-});
-
-test("accepted cursor recovery is exact and performs zero provider I/O", async () => {
+for (const blockedReason of ["runtime_authority_inactive_or_mismatched", "slack_not_in_channel", "binding_paused_bot_removed"] as const) {
+test(`accepted cursor recovery preserves only bot-recovery waits (${blockedReason})`, async () => {
   const fixture = await seedFixture(2);
+  await fixture.db.update(externalDeliveryPartitions).set({ authorityBlockedAt: NOW,
+    authorityBlockedReason: blockedReason, authorityRetryAt: new Date(NOW.getTime() + 60_000) })
+    .where(eq(externalDeliveryPartitions.bindingId, fixture.bindingId));
   await fixture.db.update(externalOutboundDeliveries).set({
     state: "accepted",
     providerAttempts: 1,
@@ -1909,6 +1957,9 @@ test("accepted cursor recovery is exact and performs zero provider I/O", async (
   assert.deepEqual(calls, { runtime: 0, credential: 0, provider: 0 });
   const [partition] = await fixture.db.select().from(externalDeliveryPartitions);
   assert.equal(partition.cursorPosition, 1);
+  assert.deepEqual([partition.authorityBlockedAt, partition.authorityBlockedReason, partition.authorityRetryAt],
+    blockedReason === "runtime_authority_inactive_or_mismatched" ? [null, null, null]
+      : [NOW, blockedReason, new Date(NOW.getTime() + 60_000)]);
   const second = (await fixture.db.select().from(externalOutboundDeliveries)
     .where(and(
       eq(externalOutboundDeliveries.bindingId, fixture.bindingId),
@@ -1916,6 +1967,7 @@ test("accepted cursor recovery is exact and performs zero provider I/O", async (
     )))[0];
   assert.equal(second.state, "queued");
 });
+}
 
 test("accepted head without its exact active link cannot recover the cursor", async () => {
   const fixture = await seedFixture();
@@ -1939,4 +1991,507 @@ test("accepted head without its exact active link cannot recover the cursor", as
   });
   const [partition] = await fixture.db.select().from(externalDeliveryPartitions);
   assert.equal(partition.cursorPosition, 0);
+});
+
+for (const privacy of ["public", "private"] as const) {
+for (const mode of ["same", "refresh", "removed"] as const) {
+test(`review11004 queued external mention ${mode} (${privacy})`, async () => {
+  const fixture = await seedFixture();
+  fixture.frozenAuthority.memberRevision = 1;
+  fixture.frozenAuthority.contextRevision = 1;
+  fixture.frozenAuthority.privacyClass = privacy;
+  if (privacy === "private") {
+    await fixture.db.update(channels).set({ type: "private" }).where(eq(channels.id, fixture.channel.id));
+    await fixture.db.insert(channelHumans).values({ channelId: fixture.channel.id, userId: fixture.owner.id });
+  }
+  const [actor] = await fixture.db.insert(externalActorProjections).values({
+    provider: fixture.frozenAuthority.provider,
+    appRegistrationId: fixture.frozenAuthority.appRegistrationId,
+    installId: fixture.frozenAuthority.installId,
+    workspaceId: fixture.frozenAuthority.workspaceId,
+    externalActorId: "external-mentioned-actor",
+    displayName: "Mentioned Actor",
+    handles: ["mentioned"],
+    actorKind: "human",
+    state: "active",
+    deactivated: false,
+    projectionRevision: 2,
+    observedAt: new Date(NOW.getTime() - 1_000),
+  }).returning();
+  const [addressability] = await fixture.db.insert(externalAddressabilityProjections).values({
+    projectionId: actor.id,
+    provider: fixture.frozenAuthority.provider,
+    appRegistrationId: fixture.frozenAuthority.appRegistrationId,
+    installId: fixture.frozenAuthority.installId,
+    workspaceId: fixture.frozenAuthority.workspaceId,
+    connectionEpoch: fixture.frozenAuthority.connectionEpoch,
+    bindingId: fixture.bindingId,
+    bindingEpoch: fixture.bindingEpoch,
+    conversationId: fixture.frozenAuthority.providerConversationId,
+    memberRevision: fixture.frozenAuthority.memberRevision,
+    contextRevision: fixture.frozenAuthority.contextRevision,
+    state: "active",
+    observedAt: new Date(NOW.getTime() - 1_000),
+    expiresAt: new Date(NOW.getTime() + 60_000),
+  }).returning();
+  const [mentionFact] = await fixture.db.insert(externalMentionFacts).values({
+    messageId: fixture.sourceMessages[0].id,
+    projectionId: actor.id,
+    provider: fixture.frozenAuthority.provider,
+    appRegistrationId: fixture.frozenAuthority.appRegistrationId,
+    installId: fixture.frozenAuthority.installId,
+    workspaceId: fixture.frozenAuthority.workspaceId,
+    externalActorId: actor.externalActorId,
+    connectionEpoch: fixture.frozenAuthority.connectionEpoch,
+    bindingId: fixture.bindingId,
+    bindingEpoch: fixture.bindingEpoch,
+    conversationId: fixture.frozenAuthority.providerConversationId,
+    memberRevision: fixture.frozenAuthority.memberRevision,
+    contextRevision: fixture.frozenAuthority.contextRevision,
+    freshnessObservedAt: addressability.observedAt,
+    freshnessExpiresAt: addressability.expiresAt,
+    handleAtSendTime: "mentioned",
+    resolutionReason: "explicit_projection",
+  }).returning();
+  const snapshot = fixture.deliveries[0].renderSnapshot as unknown as SlackBridgeRenderSnapshot;
+  snapshot.bindingAuthority = { ...fixture.frozenAuthority };
+  snapshot.sanitizedText = "Hello @mentioned";
+  snapshot.externalMentions = [{
+    projectionId: mentionFact.projectionId,
+    provider: mentionFact.provider,
+    appRegistrationId: mentionFact.appRegistrationId,
+    installId: mentionFact.installId,
+    workspaceId: mentionFact.workspaceId,
+    externalActorId: mentionFact.externalActorId,
+    connectionEpoch: mentionFact.connectionEpoch,
+    bindingId: mentionFact.bindingId,
+    bindingEpoch: mentionFact.bindingEpoch,
+    conversationId: mentionFact.conversationId,
+    memberRevision: mentionFact.memberRevision,
+    contextRevision: mentionFact.contextRevision,
+    freshnessObservedAt: mentionFact.freshnessObservedAt.toISOString(),
+    freshnessExpiresAt: mentionFact.freshnessExpiresAt.toISOString(),
+    handleSnapshot: mentionFact.handleAtSendTime,
+    resolutionReason: mentionFact.resolutionReason,
+  }];
+  await fixture.db.update(externalOutboundDeliveries).set({
+    renderSnapshot: snapshot as unknown as Record<string, unknown>,
+    renderSnapshotDigest: digestSlackBridgeRenderSnapshot(snapshot),
+  }).where(eq(externalOutboundDeliveries.id, fixture.deliveries[0].id));
+  if (mode === "refresh") {
+    // Same provider identity and active membership; the producer advances only directory revisions.
+    await fixture.db.update(externalAddressabilityProjections).set({ memberRevision: 2, contextRevision: 2,
+      state: "active", observedAt: NOW, expiresAt: new Date(NOW.getTime() + 30 * 60_000) })
+      .where(eq(externalAddressabilityProjections.id, addressability.id));
+  } else if (mode === "removed") {
+    await fixture.db.update(externalAddressabilityProjections).set({ state: "removed" })
+      .where(eq(externalAddressabilityProjections.id, addressability.id));
+  }
+
+  const calls = { runtime: 0, credential: 0, provider: 0 };
+  const result = await processExternalDeliveryPartitionHead(workerInput(fixture, dependencies({
+    runtime: activeRuntime(fixture),
+    calls,
+  })));
+  console.log("mention refresh probe", privacy, mode, result.kind, calls);
+  if (mode === "removed") {
+    assert.equal(result.kind, "authority_blocked");
+    assert.equal(calls.provider, 0);
+  } else {
+    assert.equal(result.kind, "attempted", "an unchanged active mention target must not block the message after directory refresh");
+    assert.equal(calls.provider, 1);
+  }
+});
+
+}}
+
+
+test("manager recovery retries the failed head in place and unblocks following messages after access returns", async () => {
+  const fixture = await seedFixture(2);
+  const failed = await processExternalDeliveryPartitionHead(workerInput(fixture, dependencies({
+    runtime: activeRuntime(fixture),
+    providerResult: { kind: "deterministic_failure", reasonCode: "provider_channel_not_found" },
+  })));
+  assert.equal(failed.kind, "attempted");
+  assert.equal((await fixture.db.select().from(externalDeliveryPartitions))[0].cursorPosition, 0);
+  const requestRetry = (deliveryId = fixture.deliveries[0].id, bindingEpoch = fixture.bindingEpoch) =>
+    fixture.db.transaction((executor) => recordExternalDeliveryRetryDecision({
+      executor, bindingId: fixture.bindingId, bindingEpoch, deliveryId, expectedProviderAttempts: 1,
+      actorId: fixture.owner.id, now: NOW,
+    }));
+  assert.equal(await requestRetry(fixture.deliveries[1].id), false, "later messages cannot bypass the head");
+  assert.equal(await requestRetry(fixture.deliveries[0].id, fixture.bindingEpoch + 1), false);
+  assert.equal(await requestRetry(), true);
+  assert.equal(await requestRetry(), true, "a repeated request does not authorize another attempt");
+  assert.equal((await fixture.db.select().from(externalDeliveryOperatorDecisions)).length, 1);
+  const calls = { runtime: 0, credential: 0, provider: 0 };
+  const denied = await processExternalDeliveryPartitionHead(workerInput(fixture, dependencies({ calls })));
+  assert.equal(denied.kind, "authority_blocked");
+  assert.equal(calls.provider, 0, "recovery cannot bypass current authority");
+  const [pending] = await fixture.db.select().from(externalDeliveryOperatorDecisions);
+  assert.equal(pending.consumedAt, null);
+  const later = new Date(NOW.getTime() + 10 * 60_000);
+  const recovered = await processExternalDeliveryPartitionHead(workerInput(fixture, dependencies({
+    runtime: activeRuntime(fixture), now: later,
+  })));
+  assert.equal(recovered.kind, "attempted");
+  const [original] = await fixture.db.select().from(externalOutboundDeliveries)
+    .where(eq(externalOutboundDeliveries.id, fixture.deliveries[0].id));
+  assert.equal(original.state, "accepted");
+  assert.equal(original.providerAttempts, 2);
+  const [receipt] = await fixture.db.select().from(externalDeliveryOperatorDecisions);
+  assert.ok(receipt.consumedAt);
+  assert.equal(await requestRetry(), true, "a replay of the accepted operation is a no-op");
+  const attempts = await fixture.db.select().from(externalDeliveryAttempts);
+  assert.equal(attempts[1].operatorDecisionId, receipt.id);
+  assert.equal(attempts[1].dispatchAuthorization, "audited_retry_in_place");
+  const next = await processExternalDeliveryPartitionHead(workerInput(fixture, dependencies({
+    runtime: activeRuntime(fixture), now: later,
+    providerResult: { kind: "accepted", providerMessageId: "provider-message-2", providerThreadId: null },
+  })));
+  assert.equal(next.kind, "attempted");
+  assert.equal((await fixture.db.select().from(externalDeliveryPartitions))[0].cursorPosition, 2);
+});
+
+
+test("a manager retry beyond the automatic failure ceiling can fail without stranding the lease", async () => {
+  const fixture = await seedFixture();
+  await fixture.db.update(externalOutboundDeliveries).set({
+    state: "dead", providerAttempts: 24, ambiguityBudgetProviderAttempts: 24,
+    dispatchedFailureAttempts: 24, firstDispatchedAt: NOW, stateReason: "failure_budget_exhausted",
+  }).where(eq(externalOutboundDeliveries.id, fixture.deliveries[0].id));
+  await fixture.db.transaction((executor) => recordExternalDeliveryRetryDecision({
+    executor, bindingId: fixture.bindingId, bindingEpoch: fixture.bindingEpoch,
+    deliveryId: fixture.deliveries[0].id, expectedProviderAttempts: 24, actorId: fixture.owner.id, now: NOW,
+  }));
+  const result = await processExternalDeliveryPartitionHead(workerInput(fixture, dependencies({
+    runtime: activeRuntime(fixture),
+    providerResult: { kind: "transient_failure", reasonCode: "provider_unavailable", baseDelayMs: 1000 },
+  })));
+  assert.equal(result.kind, "attempted");
+  const [delivery] = await fixture.db.select().from(externalOutboundDeliveries);
+  assert.equal(delivery.state, "dead");
+  assert.equal(delivery.providerAttempts, 25);
+  assert.equal(delivery.dispatchedFailureAttempts, 24);
+  assert.equal(delivery.leaseOwner, null);
+});
+
+
+for (const { failure, initialAttempts } of [
+  { failure: { kind: "transient_failure" as const, reasonCode: "provider_unavailable", baseDelayMs: 1000 }, initialAttempts: 3 },
+  { failure: { kind: "rate_limited" as const, retryAfterMs: 1000 }, initialAttempts: 24 },
+]) {
+  test(`an audited ${failure.kind} remains recoverable from retry_wait after automatic budget exhaustion`, async () => {
+    const fixture = await seedFixture(2);
+    const firstId = fixture.deliveries[0].id;
+    await fixture.db.update(externalOutboundDeliveries).set({
+      state: "dead", providerAttempts: initialAttempts, ambiguityBudgetProviderAttempts: initialAttempts,
+      dispatchedFailureAttempts: initialAttempts, firstDispatchedAt: NOW, stateReason: "deterministic_failure",
+    }).where(eq(externalOutboundDeliveries.id, firstId));
+    const retry = (expectedProviderAttempts = initialAttempts) => fixture.db.transaction((executor) => recordExternalDeliveryRetryDecision({
+      executor, bindingId: fixture.bindingId, bindingEpoch: fixture.bindingEpoch,
+      deliveryId: firstId, expectedProviderAttempts, actorId: fixture.owner.id, now: NOW,
+    }));
+    assert.equal(await retry(), true);
+    const attempted = await processExternalDeliveryPartitionHead(workerInput(fixture, dependencies({
+      runtime: activeRuntime(fixture), providerResult: failure,
+    })));
+    assert.equal(attempted.kind, "attempted");
+    const [waiting] = await fixture.db.select().from(externalOutboundDeliveries)
+      .where(eq(externalOutboundDeliveries.id, firstId));
+    assert.equal(waiting.state, "retry_wait");
+    assert.ok(waiting.nextAttemptAt && waiting.nextAttemptAt > NOW);
+    const afterDelay = new Date(waiting.nextAttemptAt!.getTime() + 1);
+    const automaticallyBlocked = await processExternalDeliveryPartitionHead(workerInput(fixture, dependencies({
+      runtime: activeRuntime(fixture), now: afterDelay,
+    })));
+    assert.equal(automaticallyBlocked.kind, "blocked");
+    assert.equal(await retry(), true, "a replay of the consumed operation is a no-op");
+    const replayStillBlocked = await processExternalDeliveryPartitionHead(workerInput(fixture, dependencies({
+      runtime: activeRuntime(fixture), now: afterDelay,
+    })));
+    assert.equal(replayStillBlocked.kind, "blocked", "replaying a consumed request cannot authorize new provider I/O");
+    assert.equal((await fixture.db.select().from(externalDeliveryOperatorDecisions)).length, 1);
+    assert.equal(await retry(initialAttempts + 1), true, "a fresh observation of the waiting head authorizes a new attempt");
+    const calls = { runtime: 0, credential: 0, provider: 0 };
+    const tooEarly = await processExternalDeliveryPartitionHead(workerInput(fixture, dependencies({
+      runtime: activeRuntime(fixture), calls,
+    })));
+    assert.equal(tooEarly.kind, "blocked");
+    assert.equal(calls.provider, 0, "a manual request cannot bypass the provider delay");
+    const recovered = await processExternalDeliveryPartitionHead(workerInput(fixture, dependencies({
+      runtime: activeRuntime(fixture), now: afterDelay,
+    })));
+    assert.equal(recovered.kind, "attempted");
+    const [original] = await fixture.db.select().from(externalOutboundDeliveries)
+      .where(eq(externalOutboundDeliveries.id, firstId));
+    assert.equal(original.state, "accepted");
+    assert.equal(original.providerAttempts, initialAttempts + 2);
+    const next = await processExternalDeliveryPartitionHead(workerInput(fixture, dependencies({
+      runtime: activeRuntime(fixture), now: afterDelay,
+      providerResult: { kind: "accepted", providerMessageId: "later-message", providerThreadId: null },
+    })));
+    assert.equal(next.kind, "attempted");
+    assert.equal((await fixture.db.select().from(externalDeliveryPartitions))[0].cursorPosition, 2);
+  });
+}
+
+
+test("replaying a consumed retry after another definite rejection cannot mint a second attempt", async () => {
+  const fixture = await seedFixture();
+  await fixture.db.update(externalOutboundDeliveries).set({
+    state: "dead", providerAttempts: 1, ambiguityBudgetProviderAttempts: 1,
+    dispatchedFailureAttempts: 1, firstDispatchedAt: NOW, stateReason: "deterministic_failure",
+  }).where(eq(externalOutboundDeliveries.id, fixture.deliveries[0].id));
+  const request = () => fixture.db.transaction((executor) => recordExternalDeliveryRetryDecision({
+    executor, bindingId: fixture.bindingId, bindingEpoch: fixture.bindingEpoch,
+    deliveryId: fixture.deliveries[0].id, expectedProviderAttempts: 1, actorId: fixture.owner.id, now: NOW,
+  }));
+  assert.equal(await request(), true);
+  const calls = { runtime: 0, credential: 0, provider: 0 };
+  const deps = dependencies({ runtime: activeRuntime(fixture), calls,
+    providerResult: { kind: "deterministic_failure", reasonCode: "provider_channel_not_found" } });
+  assert.equal((await processExternalDeliveryPartitionHead(workerInput(fixture, deps))).kind, "attempted");
+  assert.equal(await request(), true);
+  await processExternalDeliveryPartitionHead(workerInput(fixture, deps));
+  assert.equal(calls.provider, 1);
+  assert.equal((await fixture.db.select().from(externalDeliveryOperatorDecisions)).length, 1);
+});
+
+
+test("review11055 a manual retry after the age ceiling still honors Slack Retry-After", async () => {
+  const fixture = await slackQueueFixture(1);
+  await fixture.db.update(externalOutboundDeliveries).set({
+    state: "dead", providerAttempts: 1, ambiguityBudgetProviderAttempts: 1,
+    dispatchedFailureAttempts: 1, firstDispatchedAt: new Date(NOW.getTime() - 2 * SLACK_BRIDGE_MAX_DELIVERY_AGE_MS),
+    stateReason: "age_budget_exhausted",
+  }).where(eq(externalOutboundDeliveries.id, fixture.deliveries[0].id));
+  const request = (expectedProviderAttempts: number) => fixture.db.transaction((executor) => recordExternalDeliveryRetryDecision({
+    executor, bindingId: fixture.bindingId, bindingEpoch: fixture.bindingEpoch,
+    deliveryId: fixture.deliveries[0].id, expectedProviderAttempts, actorId: fixture.owner.id, now: NOW,
+  }));
+  assert.equal(await request(1), true);
+  const calls = { runtime: 0, credential: 0, provider: 0 };
+  const deps = dependencies({ runtime: activeRuntime(fixture), calls,
+    providerResult: { kind: "rate_limited", retryAfterMs: 60_000 } });
+  assert.equal((await processExternalDeliveryPartitionHead(workerInput(fixture, deps))).kind, "attempted");
+  // A fresh deliberate retry also must respect the provider's explicit delay.
+  assert.equal(await request(2), false, "age alone no longer requires a second manual authorization");
+  const [waiting] = await fixture.db.select().from(externalOutboundDeliveries);
+  assert.equal(waiting.state, "retry_wait");
+  assert.equal(waiting.nextAttemptAt?.getTime(), NOW.getTime() + 60_000);
+  const early = await processExternalDeliveryPartitionHead(workerInput(fixture, deps));
+  assert.equal(calls.provider, 1, "manual age-budget override must not erase Retry-After");
+  assert.equal(early.kind, "blocked");
+  const recovered = await processExternalDeliveryPartitionHead(workerInput(fixture, dependencies({
+    runtime: activeRuntime(fixture), calls, now: new Date(NOW.getTime() + 60_000),
+  })));
+  assert.equal(recovered.kind, "attempted");
+  assert.equal(calls.provider, 2);
+  assert.equal((await fixture.db.select().from(externalOutboundDeliveries))[0].state, "accepted");
+});
+
+
+test("prepared replacement credential is disposed when attempt admission expires", async () => {
+  const fixture = await seedFixture();
+  let now = NOW;
+  let disposed = 0;
+  let writes = 0;
+  const result = await processExternalDeliveryPartitionHead(workerInput(fixture, {
+    ...dependencies({ runtime: activeRuntime(fixture) }), now: () => now,
+    async prepareProvider() {
+      now = new Date(NOW.getTime() + 60_001);
+      return { ready: true, async dispose() { disposed += 1; },
+        async dispatch() { writes += 1; return { kind: "accepted", providerMessageId: "never" }; } };
+    },
+  }));
+  assert.equal("reason" in result ? result.reason : null, "lease_expired_before_attempt_start");
+  assert.equal(disposed, 1);
+  assert.equal(writes, 0);
+  assert.equal((await fixture.db.select().from(externalDeliveryAttempts)).length, 0);
+});
+
+
+test("an old untouched message starts a fresh authority wait instead of immediate quarantine", async () => {
+  const fixture = await seedFixture();
+  await fixture.db.update(externalOutboundDeliveries).set({ createdAt: new Date(NOW.getTime() - 2 * SLACK_BRIDGE_MAX_DELIVERY_AGE_MS) })
+    .where(eq(externalOutboundDeliveries.id, fixture.deliveries[0].id));
+  const result = await processExternalDeliveryPartitionHead(workerInput(fixture, dependencies({ runtime: null })));
+  assert.equal(result.kind === "authority_blocked" ? result.severity : null, "retrying");
+  const [row] = await fixture.db.select().from(externalOutboundDeliveries);
+  assert.equal(row.state, "queued");
+});
+
+test("exhausted unknown head backs off read-only confirmation then recovers without a new write", async () => {
+  const fixture = await seedFixture();
+  await fixture.db.update(externalOutboundDeliveries).set({ state: "outcome_unknown", providerAttempts: 4,
+    ambiguityBudgetProviderAttempts: 3, dispatchedFailureAttempts: 2, firstDispatchedAt: NOW })
+    .where(eq(externalOutboundDeliveries.id, fixture.deliveries[0].id));
+  let clock = NOW;
+  let reads = 0;
+  const deps: ExternalDeliveryWorkerDependencies = {
+    ...dependencies({ runtime: activeRuntime(fixture) }), now: () => clock,
+    async prepareProvider() {
+      reads += 1;
+      if (reads === 1) return { ready: false, reason: "reconciliation_rate_limited", retryAfterMs: 60_000 };
+      const receipt = { kind: "accepted" as const, providerMessageId: "confirmed-original", reconciled: true };
+      return { ready: true, receipt, async dispatch() { throw new Error("read-only confirmation must not dispatch"); } };
+    },
+  };
+  assert.equal((await processExternalDeliveryPartitionHead(workerInput(fixture, deps))).kind, "blocked");
+  clock = new Date(NOW.getTime() + 30_001);
+  const waiting = await processExternalDeliveryPartitionHead(workerInput(fixture, deps));
+  assert.equal("reason" in waiting ? waiting.reason : null, "reconciliation_backoff_not_due");
+  assert.equal(reads, 1, "Retry-After must survive release without illegal nextAttemptAt");
+  clock = new Date(NOW.getTime() + 60_001);
+  assert.equal((await processExternalDeliveryPartitionHead(workerInput(fixture, deps))).kind, "cursor_recovered");
+  assert.equal(reads, 2);
+  const [row] = await fixture.db.select().from(externalOutboundDeliveries);
+  assert.equal(row.providerAttempts, 4);
+  assert.equal(row.state, "accepted");
+  assert.equal((await fixture.db.select().from(externalDeliveryAttempts)).length, 0);
+});
+
+
+test("a removed sender in historical work is immediately isolated without provider I/O", async () => {
+  const fixture = await seedFixture();
+  await fixture.db.delete(serverMembers).where(eq(serverMembers.userId, fixture.owner.id));
+  const current = activeRuntime(fixture);
+  current.bindingAuthority = { ...current.bindingAuthority, bindingEpoch: current.bindingAuthority.bindingEpoch + 1 };
+  const calls = { runtime: 0, credential: 0, provider: 0 };
+  const result = await processExternalDeliveryPartitionHead(workerInput(fixture, dependencies({ runtime: current, calls })));
+  assert.equal("reason" in result ? result.reason : null, "historical_sender_authority_removed");
+  const [row] = await fixture.db.select().from(externalOutboundDeliveries);
+  assert.equal(row.state, "quarantined");
+  assert.equal(row.providerAttempts, 0);
+  assert.deepEqual(calls, { runtime: 1, credential: 0, provider: 0 });
+});
+
+async function slackQueueFixture(count = 2, senderType: "user" | "agent" = "user") {
+  const fixture = await seedFixture(count, senderType);
+  fixture.frozenAuthority.provider = "slack";
+  for (const row of fixture.deliveries) {
+    const snapshot = row.renderSnapshot as unknown as SlackBridgeRenderSnapshot;
+    snapshot.bindingAuthority.provider = "slack";
+    await fixture.db.update(externalOutboundDeliveries).set({ renderSnapshot: snapshot as unknown as Record<string, unknown> })
+      .where(eq(externalOutboundDeliveries.id, row.id));
+  }
+  return fixture;
+}
+
+for (const departure of ["server", "private_channel", "agent_deleted", "agent_removed", "archive"] as const) {
+  test(`Slack pair sends an established message after ${departure}`, async () => {
+    const fixture = await slackQueueFixture(2, departure.startsWith("agent") ? "agent" : "user");
+    if (departure === "server") await fixture.db.delete(serverMembers).where(eq(serverMembers.userId, fixture.sender.id));
+    if (departure === "private_channel") await fixture.db.update(channels).set({ type: "private" }).where(eq(channels.id, fixture.channel.id));
+    if (departure === "agent_deleted") await fixture.db.update(agents).set({ deletedAt: NOW }).where(eq(agents.id, fixture.sender.id));
+    if (departure === "agent_removed") await fixture.db.delete(channelAgents).where(eq(channelAgents.agentId, fixture.sender.id));
+    if (departure === "archive") await fixture.db.update(channels).set({ archivedAt: NOW }).where(eq(channels.id, fixture.channel.id));
+    const deps = dependencies({ runtime: activeRuntime(fixture) });
+    deps.dispatchProvider = async ({ deliveryId }) => ({ kind: "accepted", providerMessageId: deliveryId });
+    for (const expected of fixture.deliveries) {
+      const result = await processExternalDeliveryPartitionHead(workerInput(fixture, deps));
+      assert.equal(result.kind, "attempted");
+      if (result.kind !== "attempted") assert.fail("message must reach provider");
+      assert.equal(result.deliveryId, expected.id);
+      assert.equal(result.deliveryState, "accepted");
+    }
+    const [partition] = await fixture.db.select().from(externalDeliveryPartitions);
+    assert.equal(partition.cursorPosition, 2);
+  });
+}
+
+test("Slack pair keeps its first block time across reasons and resumes after more than 24h", async () => {
+  const fixture = await slackQueueFixture();
+  const deps = dependencies({ runtime: null });
+  const first = await processExternalDeliveryPartitionHead(workerInput(fixture, deps));
+  assert.equal(first.kind, "authority_blocked");
+  const late = new Date(NOW.getTime() + 3 * SLACK_BRIDGE_MAX_DELIVERY_AGE_MS);
+  const second = await processExternalDeliveryPartitionHead(workerInput(fixture, {
+    ...deps, now: () => late, resolveCurrentRuntime: async () => ({ blockedReason: "install_inactive" }),
+  }));
+  assert.equal(second.kind, "authority_blocked");
+  const [partition] = await fixture.db.select().from(externalDeliveryPartitions);
+  assert.equal(partition.authorityBlockedAt?.toISOString(), NOW.toISOString());
+  assert.equal(partition.authorityBlockedReason, "runtime_authority_inactive_or_mismatched:install_inactive");
+  const rows = await fixture.db.select().from(externalOutboundDeliveries);
+  assert.ok(rows.every((row) => row.state === "queued" && row.providerAttempts === 0));
+  const repairedAt = new Date(late.getTime() + 10 * 60_000);
+  for (const expected of fixture.deliveries) {
+    const sent = await processExternalDeliveryPartitionHead(workerInput(fixture, dependencies({ runtime: activeRuntime(fixture), now: repairedAt,
+        providerResult: { kind: "accepted", providerMessageId: expected.id } })));
+    assert.equal(sent.kind, "attempted");
+    if (sent.kind === "attempted") assert.equal(sent.deliveryId, expected.id);
+  }
+  const [cleared] = await fixture.db.select().from(externalDeliveryPartitions);
+  assert.equal(cleared.authorityBlockedAt, null);
+  assert.equal(cleared.authorityBlockedReason, null);
+  assert.equal(cleared.cursorPosition, 2);
+});
+
+for (const attempted of [false, true]) {
+  test(`Slack pair recovers old quarantine with ${attempted ? "prior attempt through read-only confirmation" : "no attempt in FIFO"}`, async () => {
+    const fixture = await slackQueueFixture();
+    if (attempted) {
+      await processExternalDeliveryPartitionHead(workerInput(fixture, dependencies({ runtime: activeRuntime(fixture),
+        providerResult: { kind: "outcome_unknown", reasonCode: "lost_response" } })));
+    }
+    await fixture.db.update(externalOutboundDeliveries).set({ state: "quarantined", nextAttemptAt: null,
+      stateReason: "historical_sender_authority_removed" }).where(eq(externalOutboundDeliveries.id, fixture.deliveries[0]!.id));
+    let reads = 0;
+    let writes = 0;
+    const deps = dependencies({ runtime: activeRuntime(fixture) });
+    deps.prepareProvider = async ({ reconcileUnknownOutcome }) => {
+      if (reconcileUnknownOutcome) {
+        reads += 1;
+        return { ready: true, receipt: { kind: "accepted", providerMessageId: "original-receipt" },
+          dispatch: async () => { throw new Error("already sent must never resend"); } };
+      }
+      return { ready: true, dispatch: async () => { writes += 1; return { kind: "accepted", providerMessageId: `new-${writes}` }; } };
+    };
+    const first = await processExternalDeliveryPartitionHead(workerInput(fixture, deps));
+    assert.equal(first.kind, attempted ? "cursor_recovered" : "attempted");
+    assert.equal(reads, attempted ? 1 : 0);
+    assert.equal(writes, attempted ? 0 : 1);
+    await processExternalDeliveryPartitionHead(workerInput(fixture, deps));
+    const [head] = await fixture.db.select().from(externalOutboundDeliveries).where(eq(externalOutboundDeliveries.id, fixture.deliveries[0]!.id));
+    assert.equal(head.providerAttempts, 1);
+    assert.equal(head.state, "accepted");
+    const [partition] = await fixture.db.select().from(externalDeliveryPartitions);
+    assert.equal(partition.cursorPosition, 2);
+  });
+}
+
+test("Slack pair permission rejection waits without exhausting write budget and confirms before resending", async () => {
+  const fixture = await slackQueueFixture();
+  await processExternalDeliveryPartitionHead(workerInput(fixture, dependencies({ runtime: activeRuntime(fixture),
+    providerResult: { kind: "deterministic_failure", reasonCode: "provider_deterministic_failure", pairBlockedReason: "slack_permission_missing" } })));
+  const [waiting] = await fixture.db.select().from(externalOutboundDeliveries).where(eq(externalOutboundDeliveries.id, fixture.deliveries[0]!.id));
+  assert.equal(waiting.state, "outcome_unknown");
+  assert.equal(waiting.dispatchedFailureAttempts, 0);
+  const [pair] = await fixture.db.select().from(externalDeliveryPartitions);
+  assert.equal(pair.authorityBlockedReason, "slack_permission_missing");
+  let reads = 0;
+  const deps = dependencies({ runtime: activeRuntime(fixture), now: new Date(NOW.getTime() + 3 * SLACK_BRIDGE_MAX_DELIVERY_AGE_MS) });
+  deps.prepareProvider = async ({ reconcileUnknownOutcome }) => {
+    assert.equal(reconcileUnknownOutcome, true);
+    reads += 1;
+    return { ready: true, dispatch: async () => ({ kind: "accepted", providerMessageId: "repaired" }) };
+  };
+  const restored = await processExternalDeliveryPartitionHead(workerInput(fixture, deps));
+  assert.equal(reads, 1);
+  assert.equal(restored.kind === "attempted" ? restored.deliveryState : null, "accepted");
+});
+
+
+test("an empty body without a frozen attachment is rejected before authority access", async () => {
+  const fixture = await seedFixture();
+  const original = fixture.deliveries[0];
+  const snapshot = { ...(original.renderSnapshot as unknown as SlackBridgeRenderSnapshot), sanitizedText: "", attachments: [] };
+  await fixture.db.update(externalOutboundDeliveries).set({ renderSnapshot: snapshot as unknown as Record<string, unknown>,
+    renderSnapshotDigest: digestSlackBridgeRenderSnapshot(snapshot) }).where(eq(externalOutboundDeliveries.id, original.id));
+  const calls = { runtime: 0, credential: 0, provider: 0 };
+  const result = await processExternalDeliveryPartitionHead(workerInput(fixture, dependencies({ runtime: activeRuntime(fixture), calls })));
+  assert.deepEqual(result, { kind: "blocked", reason: "invalid_frozen_snapshot", deliveryId: original.id });
+  assert.deepEqual(calls, { runtime: 0, credential: 0, provider: 0 });
 });

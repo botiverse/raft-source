@@ -122,8 +122,11 @@ export function hostAccessTokenSurfaceForPathname(
 ): HostAccessTokenSurface | null {
   const normalized = pathname.replace(/\/+$/, "") || "/";
   if (/^(?:\/s\/[^/]+)?\/computers$/.test(normalized)) return "computers";
-  // The agent page (/agent/:agentId) hosts the native Apps entry.
-  if (/^(?:\/s\/[^/]+)?\/agent\/[^/]+$/.test(normalized)) return "agent";
+  // The Apps page (#proj-apps task #22) holds what Settings › Applications did.
+  if (/^(?:\/s\/[^/]+)?\/apps$/.test(normalized)) return "marketplace";
+  // The agent page (/agent/:agentId) hosts the native Apps entry; its
+  // activity-only page (/agent/:agentId/activity) is the app's Activity tab.
+  if (/^(?:\/s\/[^/]+)?\/agent\/[^/]+(?:\/activity)?$/.test(normalized)) return "agent";
   const match = /^(?:\/s\/[^/]+)?\/settings\/(billing|applications|integrations|administration)$/.exec(normalized);
   if (!match) return null;
   if (match[1] === "billing") return "billing";
@@ -131,18 +134,32 @@ export function hostAccessTokenSurfaceForPathname(
   return "administration";
 }
 
-export function accessTokenSubject(accessToken: string | null): string | null {
+function accessTokenClaims(accessToken: string | null): { sub?: unknown; type?: unknown; exp?: unknown } | null {
   if (!accessToken) return null;
   const payload = accessToken.split(".")[1];
   if (!payload) return null;
   try {
     const normalized = payload.replace(/-/g, "+").replace(/_/g, "/");
     const padded = normalized.padEnd(Math.ceil(normalized.length / 4) * 4, "=");
-    const decoded = JSON.parse(globalThis.atob(padded)) as { sub?: unknown; type?: unknown };
-    return decoded.type === "access" && nonEmptyString(decoded.sub) ? decoded.sub : null;
+    return JSON.parse(globalThis.atob(padded)) as { sub?: unknown; type?: unknown; exp?: unknown };
   } catch {
     return null;
   }
+}
+
+export function accessTokenSubject(accessToken: string | null): string | null {
+  const claims = accessTokenClaims(accessToken);
+  return claims?.type === "access" && nonEmptyString(claims.sub) ? claims.sub : null;
+}
+
+/**
+ * Whether an access token's own `exp` says it has expired (or will within
+ * `skewMs`). Unsigned read, used only to pick refresh-first over a request
+ * that would 401; a token without a readable `exp` counts as not expired.
+ */
+export function isAccessTokenExpired(accessToken: string | null, nowMs: number, skewMs = 30_000): boolean {
+  const exp = accessTokenClaims(accessToken)?.exp;
+  return typeof exp === "number" && Number.isFinite(exp) && exp * 1000 - skewMs <= nowMs;
 }
 
 /**

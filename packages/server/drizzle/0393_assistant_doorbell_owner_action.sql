@@ -1,0 +1,1 @@
+ALTER TABLE "assistant_doorbell_sources" ADD COLUMN "owner_action" boolean DEFAULT false NOT NULL;

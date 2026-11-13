@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { resolve, relative } from "node:path";
+import { isTestPath } from "../scripts/testLocations";
 
 /**
  * Fail-closed focus contract for global key listeners (focus-trap sweep, task #21).
@@ -70,7 +71,8 @@ function markerAbove(lines: string[], idx: number): { kind: "focus" | "exempt" |
 }
 
 test("every keydown listener declares a focus-on-open or specific exemption marker", () => {
-  const files = collectTsxFiles(srcRoot);
+  // Feature tests (src/features/<feature>/tests/) are not app code.
+  const files = collectTsxFiles(srcRoot).filter((file) => !isTestPath(relative(repoRoot, file)));
   const violations: string[] = [];
   let listenerCount = 0;
 
@@ -97,6 +99,8 @@ test("every keydown listener declares a focus-on-open or specific exemption mark
 
   // Guard against the regex silently matching nothing (e.g. a refactor that
   // renames addEventListener) — would otherwise make this test vacuously pass.
-  assert.ok(listenerCount >= 15, `expected to scan many keydown listeners, found ${listenerCount}`);
+  // The shortcut registry's dispatcher (features/shortcuts/dispatcher.ts) took most of the app's global keydown
+  // listeners and every Esc layer (#proj-frontend:#37): about ten remain, the dispatcher's own among them.
+  assert.ok(listenerCount >= 8, `expected to scan many keydown listeners, found ${listenerCount}`);
   assert.deepEqual(violations, [], `\n${violations.join("\n")}\n`);
 });

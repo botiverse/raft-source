@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { ELECTRON_NODE_SCRIPT_EXEC_ARGV } from "./nodeHostLaunch";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
@@ -66,7 +67,6 @@ test("buildGeminiSpawnEnv enables trusted workspace and Slock CLI transport", as
     assert.ok(transportDir, "transport wrapper directory should be prepended to PATH");
     assert.ok(transportDir.startsWith(path.join(process.env.SLOCK_HOME!, "cli-transport", "agent-1", "launch-1")));
     assert.ok(!transportDir.startsWith(workspaceSlockDir), "transport files should not live in the model workspace");
-    const tokenFile = path.join(transportDir, "agent-token");
 
     assert.equal(spawnEnv.GEMINI_CLI_TRUST_WORKSPACE, "true");
     assert.equal(spawnEnv.FORCE_COLOR, "0");
@@ -76,7 +76,7 @@ test("buildGeminiSpawnEnv enables trusted workspace and Slock CLI transport", as
     assert.equal(spawnEnv.SLOCK_AGENT_TOKEN_FILE, undefined);
     assert.equal(spawnEnv.SLOCK_AGENT_TOKEN, undefined);
     assert.ok(spawnEnv.PATH?.startsWith(`${transportDir}${path.delimiter}`));
-    assert.equal(readFileSync(tokenFile, "utf8"), "agent-token");
+    assert.ok(!existsSync(path.join(transportDir, "agent-token")), "no token file without a runner credential");
     assert.ok(existsSync(path.join(transportDir, "slock")));
   });
 });
@@ -210,7 +210,7 @@ test("resolveGeminiSpawn enables Node mode for a packaged Electron host", () => 
   });
 
   assert.equal(resolved.command, electronExecutable);
-  assert.deepEqual(resolved.args, [entry, "--yolo"]);
+  assert.deepEqual(resolved.args, [...ELECTRON_NODE_SCRIPT_EXEC_ARGV, entry, "--yolo"]);
   assert.equal(resolved.env.BASE_ENV, "present");
   assert.equal(resolved.env.ELECTRON_RUN_AS_NODE, "1");
 });
@@ -289,7 +289,27 @@ test("parseLine: tool_use event emits tool_call", () => {
     kind: "tool_call",
     name: "run_shell_command",
     input: { command: "ls -la", description: "List files" },
+    callId: "run_shell_command_123_0",
   });
+});
+
+// task #26: `tool_result` ends the call its `tool_id` names; the driver used to
+// ignore it, so the daemon counted every Gemini call as still running.
+test("parseLine: tool_result ends the matching tool_use", () => {
+  const driver = new GeminiDriver();
+  driver.parseLine(JSON.stringify({ type: "tool_use", tool_name: "run_shell_command", tool_id: "a", parameters: {} }));
+  driver.parseLine(JSON.stringify({ type: "tool_use", tool_name: "read_file", tool_id: "b", parameters: {} }));
+  assert.deepEqual(driver.parseLine(JSON.stringify({ type: "tool_result", tool_id: "b", status: "error", error: { type: "POLICY_VIOLATION", message: "no" } })), [
+    { kind: "tool_output", name: "read_file", callId: "b", ok: false },
+  ]);
+  assert.deepEqual(driver.parseLine(JSON.stringify({ type: "tool_result", tool_id: "a", status: "success", output: "x" })), [
+    { kind: "tool_output", name: "run_shell_command", callId: "a", ok: true },
+  ]);
+  assert.deepEqual(
+    driver.parseLine(JSON.stringify({ type: "tool_result", tool_id: "a", status: "success" })),
+    [],
+    "a result for a call that is not open is dropped",
+  );
 });
 
 test("parseLine: result success emits turn_end", () => {

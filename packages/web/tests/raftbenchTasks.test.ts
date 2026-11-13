@@ -8,11 +8,17 @@ const fact = (patch: Partial<TaskFact> = {}): TaskFact => ({ id: "t1", channelId
 const row = (patch = {}) => ({ ...fact(), claimedByType: "agent", ...patch });
 test("separates closed/active/unknown owner from done and uses only valid done elapsed times", () => {
   const r = summarizeTasks([fact(), fact({ id: "t2", status: "closed", owner: "user" }), fact({ id: "t3", status: "in_review", owner: null }), fact({ id: "t4", completedAt: "2026-10-01T06:00:00Z" }), fact({ id: "t5", completedAt: "2026-09-30T00:00:00Z" })]);
-  expect(r.statuses).toEqual({ todo: 0, in_progress: 0, in_review: 1, done: 3, closed: 1 });
+  expect(r.statuses).toEqual({ backlog: 0, todo: 0, in_progress: 0, in_review: 1, done: 3, closed: 1 });
   expect(r.owners).toEqual({ user: 1, agent: 3, unassigned: 1 });
   expect(r.medianHours).toBe(4);
   expect(r.durationSamples).toBe(2);
   expect(summarizeTasks([]).medianHours).toBeNull();
+});
+test("a backlog row is a valid task, not an invalid snapshot", async () => {
+  vi.mocked(api.get).mockResolvedValueOnce({ data: { tasks: [row({ status: "backlog" })], next_cursor: null } });
+  const result = await loadTaskSnapshot("s1", new AbortController().signal);
+  expect(result.tasks.map((task) => task.status)).toEqual(["backlog"]);
+  expect(summarizeTasks(result.tasks).statuses.backlog).toBe(1);
 });
 test("walks ACL-filtered summary pages with server/cancellation context and drops bodies", async () => {
   vi.mocked(api.get).mockResolvedValueOnce({ data: { tasks: [row({ description: "not retained" })], next_cursor: "next" } }).mockResolvedValueOnce({ data: { tasks: [row({ id: "t2", channelId: "c2" })], next_cursor: null } });

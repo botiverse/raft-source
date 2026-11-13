@@ -8,7 +8,6 @@ import type {
   HandsFeedbackTransport,
 } from "@botiverse/hands-feedback-react";
 import "@botiverse/hands-feedback-react/styles.css";
-import { FEEDBACK_SDK_THEME } from "../src/feedback/feedbackSdkTheme";
 
 const TRIAL_TICKET_ID = "feedback-sdk-trial-ticket";
 const FIXTURE_NOW = Date.UTC(2026, 6, 25, 15, 0, 0);
@@ -156,7 +155,7 @@ export default function FeedbackSdkTrial({
         className="overflow-hidden bg-layer-canvas"
         style={{ width: narrow ? 390 : 760, height: narrow ? 844 : 720 }}
       >
-        <FeedbackProvider transport={trialTransport} theme={FEEDBACK_SDK_THEME} locale="en">
+        <FeedbackProvider transport={trialTransport} locale="en">
           <FeedbackWorkspace
             {...(detail ? { initialTicketId: TRIAL_TICKET_ID } : {})}
           />

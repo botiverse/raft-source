@@ -1,3 +1,4 @@
+import { newSlackMentionAuthorizationId } from "./slackMentionReconcileState";
 import { dbTest as test } from "../test/integration/dbTest";
 import { closeTestDatabase, openTestDatabase } from "../test/integration/database";
 import assert from "node:assert/strict";
@@ -14,11 +15,9 @@ import {
   externalAppServerGrants,
   externalBindingAudienceSnapshots,
   externalChannelBindings,
-  externalHumanIdentityLinks,
   externalOAuthAttempts,
   oauthClientInstalls,
   oauthClients,
-  serverMembers,
   servers,
   users
 } from "../db/schema";
@@ -31,9 +30,7 @@ import {
   getExternalAppRegistrationMetadata,
   markExternalOAuthExchangeUnknown,
   resolveExternalBindingAuthority,
-  revokeExternalHumanIdentityLink,
 } from "./externalAppControlPlaneService";
-import { reconcileSlackPrivateAudience } from "./slackBindingLifecycleService";
 
 
 beforeEach(async () => {
@@ -152,12 +149,14 @@ async function completeInstall(
   providerUserId = "U_TEST_OWNER",
   encryptedMaterial = "sealed:test-only-ciphertext",
   installedScopes = ["chat:write", "channels:history"],
+  workspaceAdminVerified = true,
 ) {
   return completeExternalOAuthAttempt({
     attemptId,
     providerAppId: seeded.registration.providerAppId,
     providerTeamId: teamId,
     providerUserId,
+    workspaceAdminVerified,
     botUserId: "U_TEST_BOT",
     providerBotId: "B_TEST_BOT",
     workspaceName: "Test Workspace",
@@ -315,16 +314,13 @@ test("OAuth completion atomically installs only exact scopes and sealed credenti
       && error.code === "external_app_not_authorized",
   );
   assert.equal((await getDb().select().from(externalAppInstalls)).length, 0);
-  assert.equal((await getDb().select().from(externalHumanIdentityLinks)).length, 0);
 
   const completed = await completeInstall(seeded, claimed.attemptId);
   assert.equal(completed.connectionEpoch, 1);
   assert.equal(completed.credentialRevision, 1);
-  assert.equal(completed.identityLinkEpoch, 1);
   const [install] = await getDb().select().from(externalAppInstalls);
   const [credential] = await getDb().select().from(externalAppCredentials);
   const [attempt] = await getDb().select().from(externalOAuthAttempts);
-  const [identityLink] = await getDb().select().from(externalHumanIdentityLinks);
   assert.equal(install.state, "active");
   assert.equal(install.serverId, seeded.server.id);
   assert.deepEqual(install.installedScopes, ["channels:history", "chat:write"]);
@@ -332,14 +328,6 @@ test("OAuth completion atomically installs only exact scopes and sealed credenti
   assert.equal(credential.encryptedMaterial, "sealed:test-only-ciphertext");
   assert.equal(attempt.status, "consumed");
   assert.ok(attempt.consumedAt);
-  assert.equal(identityLink.serverId, seeded.server.id);
-  assert.equal(identityLink.installId, install.id);
-  assert.equal(identityLink.userId, seeded.owner.id);
-  assert.equal(identityLink.providerAuthorityId, "T_TEST_WORKSPACE");
-  assert.equal(identityLink.providerUserId, "U_TEST_OWNER");
-  assert.equal(identityLink.state, "active");
-  assert.equal(identityLink.linkEpoch, 1);
-  assert.equal(identityLink.observedConnectionEpoch, 1);
 });
 
 test("OAuth completion refuses to install after the claimed server is deleted", async () => {
@@ -359,14 +347,13 @@ test("OAuth completion refuses to install after the claimed server is deleted", 
   );
   assert.equal((await getDb().select().from(externalAppInstalls)).length, 0);
   assert.equal((await getDb().select().from(externalAppCredentials)).length, 0);
-  assert.equal((await getDb().select().from(externalHumanIdentityLinks)).length, 0);
   assert.equal(
     (await getDb().select().from(externalOAuthAttempts))[0]?.status,
     "exchanging",
   );
 });
 
-test("OAuth reauthorization refreshes the same explicit human link with monotonic epochs", async () => {
+test("OAuth reauthorization refreshes the same install with monotonic epochs", async () => {
   const seeded = await seedControlPlane();
   const first = await beginAndClaim(seeded);
   const firstCompleted = await completeInstall(
@@ -376,6 +363,7 @@ test("OAuth reauthorization refreshes the same explicit human link with monotoni
     "U_TEST_OWNER",
   );
   const second = await beginAndClaim(seeded);
+  assert.equal(second.begun.providerTeamId, "T_TEST_WORKSPACE", "reauthorization hints the existing workspace by team id");
   const secondCompleted = await completeInstall(
     seeded,
     second.claimed.attemptId,
@@ -383,132 +371,64 @@ test("OAuth reauthorization refreshes the same explicit human link with monotoni
     "U_TEST_OWNER",
   );
 
-  assert.equal(firstCompleted.identityLinkEpoch, 1);
+  assert.equal(firstCompleted.connectionEpoch, 1);
   assert.equal(secondCompleted.connectionEpoch, 2);
-  assert.equal(secondCompleted.identityLinkEpoch, 2);
-  const links = await getDb().select().from(externalHumanIdentityLinks);
-  assert.equal(links.length, 1);
-  assert.equal(links[0]!.state, "active");
-  assert.equal(links[0]!.linkEpoch, 2);
-  assert.equal(links[0]!.observedConnectionEpoch, 2);
+  assert.equal(secondCompleted.credentialRevision, 2);
 });
 
-test("OAuth reauthorization replaces one Raft human's Slack identity without losing history", async () => {
-  const seeded = await seedControlPlane();
-  const first = await beginAndClaim(seeded);
-  await completeInstall(seeded, first.claimed.attemptId, "T_TEST_WORKSPACE", "U_OLD_OWNER");
-  const second = await beginAndClaim(seeded);
-  const completed = await completeInstall(
-    seeded,
-    second.claimed.attemptId,
-    "T_TEST_WORKSPACE",
-    "U_NEW_OWNER",
-  );
-
-  assert.equal(completed.identityLinkEpoch, 2);
-  const links = await getDb().select().from(externalHumanIdentityLinks)
-    .orderBy(externalHumanIdentityLinks.linkEpoch);
-  assert.equal(links.length, 2);
-  assert.deepEqual(links.map((link) => ({
-    providerUserId: link.providerUserId,
-    state: link.state,
-    linkEpoch: link.linkEpoch,
-    revokeReason: link.revokeReason,
-  })), [{
-    providerUserId: "U_OLD_OWNER",
-    state: "revoked",
-    linkEpoch: 1,
-    revokeReason: "provider_identity_replaced",
-  }, {
-    providerUserId: "U_NEW_OWNER",
-    state: "active",
-    linkEpoch: 2,
-    revokeReason: null,
-  }]);
-  assert.ok(links[0]!.revokedAt);
-});
-
-test("one Slack human cannot be claimed by another Raft human and OAuth persistence rolls back", async () => {
-  const seeded = await seedControlPlane();
-  const first = await beginAndClaim(seeded);
-  const installed = await completeInstall(
-    seeded,
-    first.claimed.attemptId,
-    "T_TEST_WORKSPACE",
-    "U_SHARED_HUMAN",
-  );
-  const [other] = await getDb().insert(users).values({
-    email: `external-app-other-${randomUUID()}@raft.test`,
-    name: `external-app-other-${randomUUID().slice(0, 8)}`,
-    displayName: "Other External App Admin",
-    passwordHash: "hash",
-    emailVerified: true,
-  }).returning();
-  await getDb().insert(serverMembers).values({
-    serverId: seeded.server.id,
-    userId: other.id,
-    role: "admin",
+for (const otherWorkspaceExists of [false, true]) {
+  test(`reauthorization cannot add a second workspace (${otherWorkspaceExists ? "shared install" : "new install"})`, async () => {
+    const seeded = await seedControlPlane();
+    const first = await beginAndClaim(seeded);
+    // Start both attempts before there is a selected workspace: completion must
+    // recheck the selection, rather than trusting only the authorization start.
+    const wrongWorkspaceAttempt = await beginAndClaim(seeded);
+    const original = await completeInstall(seeded, first.claimed.attemptId);
+    const [channel] = await getDb().insert(channels).values({
+      serverId: seeded.server.id, name: `workspace-fence-${randomUUID()}`, type: "channel",
+    }).returning();
+    await getDb().insert(externalChannelBindings).values({
+      serverId: seeded.server.id, registrationId: seeded.registration.id,
+      installId: original.installId, channelId: channel.id,
+      providerConversationId: "C_ORIGINAL", providerConversationKind: "public_channel",
+      privacyClass: "public", grantEpoch: seeded.grant.grantEpoch,
+      connectionEpoch: original.connectionEpoch, bindingEpoch: 1,
+      consentedByType: "human", consentedById: seeded.owner.id, consentedAt: new Date(),
+    });
+    if (otherWorkspaceExists) {
+      const server = await createServer("Other workspace server", `other-workspace-${randomUUID()}`, seeded.owner.id);
+      await getDb().insert(oauthClientInstalls).values({
+        serverId: server.id, clientId: seeded.client.id, installedByUserId: seeded.owner.id,
+      });
+      const [grant] = await getDb().insert(externalAppServerGrants).values({
+        serverId: server.id, registrationId: seeded.registration.id, grantEpoch: 1,
+        grantedManifestVersion: 1, grantedManifestHash: "manifest-v1",
+        grantedCapabilities: ["external_projection", "channel_events"],
+        grantedByType: "human", grantedById: seeded.owner.id,
+      }).returning();
+      const other = { ...seeded, server, grant };
+      const attempt = await beginAndClaim(other);
+      await completeInstall(other, attempt.claimed.attemptId, "T_OTHER_WORKSPACE");
+    }
+    const snapshot = async () => ({
+      installs: await getDb().select().from(externalAppInstalls),
+      credentials: await getDb().select().from(externalAppCredentials),
+      associations: await getDb().select().from(externalAppInstallServerGrants),
+      bindings: await getDb().select().from(externalChannelBindings),
+    });
+    const before = await snapshot();
+    await assert.rejects(
+      completeInstall(seeded, wrongWorkspaceAttempt.claimed.attemptId, "T_OTHER_WORKSPACE"),
+      (error: unknown) => error instanceof ExternalAppControlPlaneError
+        && error.code === "external_app_workspace_mismatch"
+        && error.message.includes("another Slack workspace"),
+    );
+    assert.deepEqual(await snapshot(), before, "failed reauthorization must leave both workspaces and original bindings unchanged");
+    const [attempt] = await getDb().select().from(externalOAuthAttempts)
+      .where(eq(externalOAuthAttempts.id, wrongWorkspaceAttempt.claimed.attemptId));
+    assert.equal(attempt.status, "exchanging", "the completion transaction must roll back");
   });
-  const conflicting = await beginAndClaim(seeded, other.id);
-
-  await assert.rejects(
-    completeInstall(
-      seeded,
-      conflicting.claimed.attemptId,
-      "T_TEST_WORKSPACE",
-      "U_SHARED_HUMAN",
-    ),
-    (error: unknown) =>
-      error instanceof ExternalAppControlPlaneError
-      && error.code === "external_app_install_conflict",
-  );
-  const [install] = await getDb().select().from(externalAppInstalls);
-  const [credential] = await getDb().select().from(externalAppCredentials);
-  const links = await getDb().select().from(externalHumanIdentityLinks);
-  assert.equal(install.id, installed.installId);
-  assert.equal(install.connectionEpoch, 1);
-  assert.equal(install.credentialRevision, 1);
-  assert.equal(credential.credentialRevision, 1);
-  assert.equal(links.length, 1);
-  assert.equal(links[0]!.userId, seeded.owner.id);
-  assert.equal(
-    (await getDb().select().from(externalOAuthAttempts)
-      .where(eq(externalOAuthAttempts.id, conflicting.claimed.attemptId)))[0]!.status,
-    "exchanging",
-  );
-});
-
-test("explicit human identity revocation is epoch-fenced and durable", async () => {
-  const seeded = await seedControlPlane();
-  const attempt = await beginAndClaim(seeded);
-  const completed = await completeInstall(seeded, attempt.claimed.attemptId);
-
-  assert.deepEqual(await revokeExternalHumanIdentityLink({
-    serverId: seeded.server.id,
-    installId: completed.installId,
-    userId: seeded.owner.id,
-    expectedLinkEpoch: 2,
-    reason: "test unlink",
-  }), { revoked: false, linkEpoch: null });
-  assert.deepEqual(await revokeExternalHumanIdentityLink({
-    serverId: seeded.server.id,
-    installId: completed.installId,
-    userId: seeded.owner.id,
-    expectedLinkEpoch: 1,
-    reason: "test unlink",
-  }), { revoked: true, linkEpoch: 1 });
-  assert.deepEqual(await revokeExternalHumanIdentityLink({
-    serverId: seeded.server.id,
-    installId: completed.installId,
-    userId: seeded.owner.id,
-    expectedLinkEpoch: 1,
-    reason: "duplicate unlink",
-  }), { revoked: false, linkEpoch: null });
-  const [link] = await getDb().select().from(externalHumanIdentityLinks);
-  assert.equal(link.state, "revoked");
-  assert.equal(link.revokeReason, "test unlink");
-  assert.ok(link.revokedAt);
-});
+}
 
 test("ambiguous provider exchange is terminally fenced from automatic state reuse", async () => {
   const seeded = await seedControlPlane();
@@ -533,6 +453,12 @@ test("one provider workspace install is shared across two independently granted 
   const seeded = await seedControlPlane();
   const first = await beginAndClaim(seeded);
   const firstInstall = await completeInstall(seeded, first.claimed.attemptId);
+  const oldCapability = {
+    authorizationId: newSlackMentionAuthorizationId(), result: "paid_teams_only" as const,
+    connectionEpoch: firstInstall.connectionEpoch, credentialRevision: firstInstall.credentialRevision,
+  };
+  await getDb().update(externalAppInstalls).set({ slackMentionCapability: oldCapability })
+    .where(eq(externalAppInstalls.id, firstInstall.installId));
   const [firstBoundChannel] = await getDb().insert(channels).values({
     serverId: seeded.server.id,
     name: `slack-first-bound-${randomUUID()}`,
@@ -603,6 +529,13 @@ test("one provider workspace install is shared across two independently granted 
     expectedRedirectUri: "https://raft.test/api/external-apps/slack/oauth/callback",
   });
 
+  const secondSeed = { ...seeded, owner: secondOwner, server: secondServer, grant: secondGrant };
+  await assert.rejects(completeInstall(secondSeed, secondClaim.attemptId, "T_TEST_WORKSPACE",
+    "U_SECOND_OWNER", "sealed:must-not-overwrite", ["chat:write", "channels:history"], false),
+  (error: unknown) => error instanceof ExternalAppControlPlaneError && error.code === "external_app_not_authorized");
+  assert.equal((await getDb().select().from(externalAppInstallServerGrants)).length, 1,
+    "a non-admin must not gain a server grant to the existing workspace");
+
   const second = await completeInstall(
     { ...seeded, owner: secondOwner, server: secondServer, grant: secondGrant },
     secondClaim.attemptId,
@@ -612,9 +545,13 @@ test("one provider workspace install is shared across two independently granted 
   );
   const installs = await getDb().select().from(externalAppInstalls);
   const serverGrants = await getDb().select().from(externalAppInstallServerGrants);
+  assert.equal(serverGrants.find(row => row.serverId === secondServer.id)?.providerAuthorizingUserId, "U_SECOND_OWNER");
   const credentials = await getDb().select().from(externalAppCredentials);
   assert.equal(installs.length, 1, "the workspace token must not be copied per server");
   assert.equal(credentials.length, 1, "the shared install must retain one credential row");
+  assert.equal(installs[0]!.slackMentionCapability?.result, "unverified",
+    "fresh consent must re-probe a plan limitation even when sharing the existing token");
+  assert.notEqual(installs[0]!.slackMentionCapability?.authorizationId, oldCapability.authorizationId);
   assert.equal(credentials[0]!.encryptedMaterial, "sealed:test-only-ciphertext");
   assert.equal(second.installId, installs[0]!.id);
   assert.equal(second.connectionEpoch, 1, "granting a second server must not rotate the shared workspace credential");
@@ -974,7 +911,7 @@ test("public binding authority is a secret-free same-epoch fact and fails closed
   });
 });
 
-test("private binding requires the exact fresh matched audience snapshot", async () => {
+test("private binding carries audience observations as refresh metadata, not an authority gate", async () => {
   const seeded = await seedControlPlane();
   const { claimed } = await beginAndClaim(seeded);
   const completed = await completeInstall(seeded, claimed.attemptId);
@@ -1008,6 +945,9 @@ test("private binding requires the exact fresh matched audience snapshot", async
       consentedAt: now,
     })
     .returning();
+  // Private parity rule: audience snapshot rows are refresh observations, not
+  // authority coordinates. A mismatched observation does not gate authority;
+  // the outbound dispatch gate alone decides from the newest snapshot.
   await getDb().insert(externalBindingAudienceSnapshots).values({
     bindingId: binding.id,
     bindingEpoch: 4,
@@ -1020,32 +960,30 @@ test("private binding requires the exact fresh matched audience snapshot", async
     observedAt: new Date(now.getTime() - 60_000),
     expiresAt: new Date(now.getTime() + 30 * 60_000),
   });
-
-  assert.deepEqual(
-    await resolveExternalBindingAuthority({
-      serverId: seeded.server.id,
-      bindingId: binding.id,
-      expectedConnectionEpoch: 1,
-      expectedBindingEpoch: 4,
-      now,
-    }),
-    { active: false, reason: "audience_mismatch" },
-  );
+  const mismatchActive = await resolveExternalBindingAuthority({
+    serverId: seeded.server.id,
+    bindingId: binding.id,
+    expectedConnectionEpoch: 1,
+    expectedBindingEpoch: 4,
+    now,
+  });
+  assert.equal(mismatchActive.active, true);
+  if (!mismatchActive.active) assert.fail("expected private binding authority");
+  assert.equal(mismatchActive.fact.audienceRevision, 7);
+  assert.equal(mismatchActive.fact.privacyClass, "private");
 
   await getDb()
     .update(externalBindingAudienceSnapshots)
     .set({ status: "unavailable" })
     .where(eq(externalBindingAudienceSnapshots.bindingId, binding.id));
-  assert.deepEqual(
-    await resolveExternalBindingAuthority({
-      serverId: seeded.server.id,
-      bindingId: binding.id,
-      expectedConnectionEpoch: 1,
-      expectedBindingEpoch: 4,
-      now,
-    }),
-    { active: false, reason: "audience_unavailable" },
-  );
+  const unavailableActive = await resolveExternalBindingAuthority({
+    serverId: seeded.server.id,
+    bindingId: binding.id,
+    expectedConnectionEpoch: 1,
+    expectedBindingEpoch: 4,
+    now,
+  });
+  assert.equal(unavailableActive.active, true);
 
   await getDb()
     .update(externalBindingAudienceSnapshots)
@@ -1062,109 +1000,6 @@ test("private binding requires the exact fresh matched audience snapshot", async
   if (!active.active) assert.fail("expected private binding authority");
   assert.equal(active.fact.audienceRevision, 7);
   assert.equal(active.fact.privacyClass, "private");
-
-  const memberRowsBefore = await getDb().select().from(serverMembers);
-  assert.deepEqual(await reconcileSlackPrivateAudience({
-    serverId: seeded.server.id,
-    bindingId: binding.id,
-    expectedConnectionEpoch: 1,
-    expectedBindingEpoch: 4,
-    expectedAudienceRevision: 7,
-    observation: {
-      kind: "observed",
-      externalMemberIds: ["U_B", "U_A", "U_A"],
-      raftAuthorizedProviderMemberIds: ["U_A", "U_B"],
-    },
-    observedAt: new Date(now.getTime() + 1_000),
-    expiresAt: new Date(now.getTime() + 31 * 60_000),
-  }), {
-    kind: "recorded",
-    status: "matched",
-    audienceRevision: 8,
-    externalMemberCount: 2,
-    raftMemberCount: 2,
-  });
-  assert.deepEqual(await reconcileSlackPrivateAudience({
-    serverId: seeded.server.id,
-    bindingId: binding.id,
-    expectedConnectionEpoch: 1,
-    expectedBindingEpoch: 4,
-    expectedAudienceRevision: 8,
-    observation: {
-      kind: "observed",
-      externalMemberIds: ["U_A", "U_B", "U_EXTERNAL_ONLY"],
-      raftAuthorizedProviderMemberIds: ["U_A", "U_B"],
-    },
-    observedAt: new Date(now.getTime() + 2_000),
-    expiresAt: new Date(now.getTime() + 32 * 60_000),
-  }), {
-    kind: "recorded",
-    status: "mismatch",
-    audienceRevision: 9,
-    externalMemberCount: 3,
-    raftMemberCount: 2,
-  });
-  assert.deepEqual(
-    await resolveExternalBindingAuthority({
-      serverId: seeded.server.id,
-      bindingId: binding.id,
-      expectedConnectionEpoch: 1,
-      expectedBindingEpoch: 4,
-      now: new Date(now.getTime() + 3_000),
-    }),
-    { active: false, reason: "audience_mismatch" },
-  );
-  assert.deepEqual(await reconcileSlackPrivateAudience({
-    serverId: seeded.server.id,
-    bindingId: binding.id,
-    expectedConnectionEpoch: 1,
-    expectedBindingEpoch: 4,
-    expectedAudienceRevision: 9,
-    observation: { kind: "unavailable", reason: "provider_rate_limited" },
-    observedAt: new Date(now.getTime() + 3_000),
-    expiresAt: new Date(now.getTime() + 33 * 60_000),
-  }), {
-    kind: "recorded",
-    status: "unavailable",
-    audienceRevision: 10,
-    externalMemberCount: 0,
-    raftMemberCount: 0,
-  });
-  assert.deepEqual(
-    await resolveExternalBindingAuthority({
-      serverId: seeded.server.id,
-      bindingId: binding.id,
-      expectedConnectionEpoch: 1,
-      expectedBindingEpoch: 4,
-      now: new Date(now.getTime() + 4_000),
-    }),
-    { active: false, reason: "audience_unavailable" },
-  );
-  const snapshotCount = (await getDb().select().from(externalBindingAudienceSnapshots)).length;
-  assert.deepEqual(await reconcileSlackPrivateAudience({
-    serverId: seeded.server.id,
-    bindingId: binding.id,
-    expectedConnectionEpoch: 1,
-    expectedBindingEpoch: 4,
-    expectedAudienceRevision: 9,
-    observation: {
-      kind: "observed",
-      externalMemberIds: ["U_A"],
-      raftAuthorizedProviderMemberIds: ["U_A"],
-    },
-    observedAt: new Date(now.getTime() + 4_000),
-    expiresAt: new Date(now.getTime() + 34 * 60_000),
-  }), { kind: "fence_mismatch" });
-  assert.equal(
-    (await getDb().select().from(externalBindingAudienceSnapshots)).length,
-    snapshotCount,
-    "stale audience revisions must not append a snapshot",
-  );
-  assert.deepEqual(
-    await getDb().select().from(serverMembers),
-    memberRowsBefore,
-    "audience reconciliation must never add or remove Raft members",
-  );
 });
 
 test("second server shares install when install scopes cover requested; rejects when install is missing a required scope", async () => {

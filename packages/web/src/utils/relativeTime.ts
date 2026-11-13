@@ -51,6 +51,22 @@ function zhMixedScriptSpacing(value: string): string {
     .replace(/([\u4e00-\u9fff\u3400-\u4dbf])\s*(\d)/g, "$1 $2");
 }
 
+/** The zh digit/CJK spacing, for text this file's formatters didn't produce (a row's clock: "下午 5:20"). */
+export function withZhSpacing(value: string, locale: string | string[]): string {
+  return isZhLocale(locale) ? zhMixedScriptSpacing(value) : value;
+}
+
+const MINUTE_MS = 60_000;
+const HOUR_MS = 60 * MINUTE_MS;
+const DAY_MS = 24 * HOUR_MS;
+
+/** The unit a span is counted in: minutes under an hour, hours under a day, then days. */
+function relativeStep(absMs: number): { unit: "minute" | "hour" | "day"; ms: number } {
+  if (absMs < HOUR_MS) return { unit: "minute", ms: MINUTE_MS };
+  if (absMs < DAY_MS) return { unit: "hour", ms: HOUR_MS };
+  return { unit: "day", ms: DAY_MS };
+}
+
 export function formatRelativeTime(value: string | null | undefined, locale: string | string[]): string | null {
   if (!value) return null;
   const date = new Date(value);
@@ -58,16 +74,26 @@ export function formatRelativeTime(value: string | null | undefined, locale: str
   const diffMs = date.getTime() - currentTimeMs();
   const absMs = Math.abs(diffMs);
   const rtf = getRelativeTimeFormat(locale, { numeric: "auto" });
-
-  const minute = 60_000;
-  const hour = 60 * minute;
-  const day = 24 * hour;
-
-  let rendered: string;
-  if (absMs < hour) rendered = rtf.format(Math.round(diffMs / minute), "minute");
-  else if (absMs < day) rendered = rtf.format(Math.round(diffMs / hour), "hour");
-  else rendered = rtf.format(Math.round(diffMs / day), "day");
+  const { unit, ms } = relativeStep(absMs);
+  const rendered = rtf.format(Math.round(diffMs / ms), unit);
   return isZhLocale(locale) ? zhMixedScriptSpacing(rendered) : rendered;
+}
+
+/**
+ * How long ago, as short as it gets ("9d ago", "9 天前"), for a phone's tight lines. The same steps as
+ * `formatRelativeTime`, with `numeric: "always"`: its "this minute" and "yesterday" are the long forms here. A clock
+ * a little behind the server's reads as just now, never "in 0m" (the negated zero is what says past). Where a locale's
+ * narrow form only marks the past with a minus (Russian: "-9 дн."), which reads as a sum, it says `short` ("9 дн. назад").
+ */
+export function formatShortRelativeTime(value: string | null | undefined, locale: string | string[]): string | null {
+  if (!value) return null;
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return null;
+  const age = Math.max(0, currentTimeMs() - date.getTime());
+  const { unit, ms } = relativeStep(age);
+  const count = -Math.round(age / ms);
+  const narrow = formatRelativeTimeParts(count, unit, locale, { numeric: "always", style: "narrow" });
+  return /^[-\u2212]/.test(narrow) ? formatRelativeTimeParts(count, unit, locale, { numeric: "always", style: "short" }) : narrow;
 }
 
 /**

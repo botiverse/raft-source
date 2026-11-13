@@ -29,8 +29,8 @@ export async function agentServerRoleRequiredBody(input: {
   action: string;
   /**
    * Set when the channel-admin role in this channel would also allow it. On a
-   * joint channel that is only JOINT_CHANNEL_ADMIN_CAPABILITIES (shared
-   * name/description, this server's member roles); callers leave it unset otherwise.
+   * joint channel only a host-appointed manager's (shared name/description);
+   * callers leave it unset otherwise.
    */
   channelAdminIn?: string;
 }): Promise<AgentServerRoleRequiredBody> {

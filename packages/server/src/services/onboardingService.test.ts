@@ -1,27 +1,20 @@
 import assert from "node:assert/strict";
 import {
   buildOwnerOpenerV2Messages,
-  ONBOARDING_OPENER_V2_FEATURE_FLAG_KEY,
   ONBOARDING_DAY2_RECAP_TITLE,
   ONBOARDING_DAY2_RECAP_VERSION,
   __resetOnboardingServiceDepsForTests,
   __setOnboardingServiceDepsForTests,
   computeOnboardingDay2FireAt,
   onboardingDay2ReminderId,
+  ownerOpenerStorageKey,
   resolveOnboardingDay2Timezone,
-  triggerAgentIntroInAllChannel,
   triggerAllChannelUnlockOnboarding,
   triggerCrossChannelHint,
   triggerNewAgentAllChannelGreeting,
   triggerNewMemberOnboarding,
   triggerOwnerOnboardingOnAgentActivation,
 } from "./onboardingService";
-
-const OPENER_V2_ON = {
-  key: ONBOARDING_OPENER_V2_FEATURE_FLAG_KEY,
-  enabled: true,
-  reason: "flag_on",
-};
 
 afterEach(() => {
   __resetOnboardingServiceDepsForTests();
@@ -76,11 +69,6 @@ function makeDeps(overrides: Record<string, unknown> = {}): any {
     broadcastSystemMessage: async () => {},
     deliverSystemNoticeToAgent: async () => {},
     broadcastAndDeliver: async () => {},
-    evaluateFeatureFlag: async () => ({
-      key: ONBOARDING_OPENER_V2_FEATURE_FLAG_KEY,
-      enabled: false,
-      reason: "missing_flag",
-    }),
     createOwnerOpenerArtifactAttachment: async () => ({
       id: "team-mode-attachment",
       filename: "team-mode.html",
@@ -144,6 +132,15 @@ function makeServer(overrides: Record<string, unknown> = {}) {
   };
 }
 
+test("owner opener: a fresh one takes an attachments/v2 key where the dedicated bucket exists; a replay keeps its first key", () => {
+  const ids = { serverId: "s1", id: "a1", objectId: "o1" };
+  assert.equal(ownerOpenerStorageKey({ ...ids, persisted: null, dedicated: true }), "attachments/v2/s1/server/a1/o1.html");
+  // No dedicated bucket (some self-hosted deployments): the legacy key, as before.
+  assert.equal(ownerOpenerStorageKey({ ...ids, persisted: null, dedicated: false }), "s1/onboarding/a1.html");
+  // An opener made before the move stays under the key it was written with.
+  assert.equal(ownerOpenerStorageKey({ ...ids, persisted: "s1/onboarding/a1.html", dedicated: true }), "s1/onboarding/a1.html");
+});
+
 test("D2 recap uses the owner's timezone and the next calendar day's 10:00", () => {
   assert.equal(
     computeOnboardingDay2FireAt(new Date("2026-07-21T08:00:00.000Z"), "UTC").toISOString(),
@@ -172,122 +169,12 @@ test("D2 recap reminder title fits the fire wake and stays user-facing", () => {
   assert.doesNotMatch(ONBOARDING_DAY2_RECAP_TITLE, /invite/i);
 });
 
-test("triggerAgentIntroInAllChannel skips agents that already sent their #all intro", async () => {
-  let markAttempts = 0;
-  let delivered = false;
-
-  __setOnboardingServiceDepsForTests(makeDeps({
-    getAgent: async () => makeAgent({ allChannelIntroSentAt: new Date("2026-04-21T09:00:00.000Z") }),
-    tryMarkAllChannelIntroSent: async () => {
-      markAttempts += 1;
-      return true;
-    },
-  }) as any);
-
-  const agentOrchestrator = {
-    async deliverMessage() {
-      delivered = true;
-    },
-  } as any;
-
-  const sent = await triggerAgentIntroInAllChannel(makeIo(), agentOrchestrator, "server-1", "agent-1");
-
-  assert.equal(sent, false);
-  assert.equal(markAttempts, 0);
-  assert.equal(delivered, false);
-});
-
-test("triggerAgentIntroInAllChannel skips when server disables #all greetings", async () => {
-  let markAttempts = 0;
-  let delivered = false;
-
-  __setOnboardingServiceDepsForTests(makeDeps({
-    getServerOnboardingSettings: async () => ({
-      onboardingAgentId: null,
-      agentAllChannelGreetingEnabled: false,
-      onboardingWizardEnabled: true,
-    }),
-    tryMarkAllChannelIntroSent: async () => {
-      markAttempts += 1;
-      return true;
-    },
-  }) as any);
-
-  const agentOrchestrator = {
-    async deliverMessage() {
-      delivered = true;
-    },
-  } as any;
-
-  const sent = await triggerAgentIntroInAllChannel(makeIo(), agentOrchestrator, "server-1", "agent-1");
-
-  assert.equal(sent, false);
-  assert.equal(markAttempts, 0);
-  assert.equal(delivered, false);
-});
-
-test("triggerAgentIntroInAllChannel persists a claim and visible agent intro", async () => {
-  let addAgentCalls = 0;
-  let markAttempts = 0;
-  let sentMessage: any = null;
-
-  __setOnboardingServiceDepsForTests(makeDeps({
-    tryMarkAllChannelIntroSent: async () => {
-      markAttempts += 1;
-      return true;
-    },
-    addAgent: async () => {
-      addAgentCalls += 1;
-    },
-    broadcastAndDeliver: async (_io: any, _agentOrchestrator: any, message: Record<string, unknown>) => {
-      sentMessage = message;
-    },
-  }) as any);
-
-  const agentOrchestrator = {} as any;
-
-  const sent = await triggerAgentIntroInAllChannel(makeIo(), agentOrchestrator, "server-1", "agent-1");
-
-  assert.equal(sent, true);
-  assert.equal(markAttempts, 1);
-  assert.equal(addAgentCalls, 0, "virtual #all intro should not persist agent membership rows");
-  assert.equal(sentMessage?.channelId, "channel-all");
-  assert.equal(sentMessage?.senderType, "agent");
-  assert.equal(sentMessage?.senderId, "agent-1");
-  assert.equal(sentMessage?.senderName, "Peng");
-  assert.match(String(sentMessage?.content), /^Hi, I'm Peng\./);
-  assert.match(String(sentMessage?.content), /Runtime engineer/);
-  assert.match(String(sentMessage?.content), /What language would you like to use\?/);
-});
-
-test("triggerAgentIntroInAllChannel rolls back the claim when delivery fails", async () => {
-  let rollbackCalledWith: any = null;
-
-  __setOnboardingServiceDepsForTests(makeDeps({
-    clearAllChannelIntroSentClaim: async (agentId: string, claimedAt: Date) => {
-      rollbackCalledWith = { agentId, claimedAt };
-    },
-    broadcastAndDeliver: async () => {
-      throw new Error("daemon offline");
-    },
-  }) as any);
-
-  await assert.rejects(
-    triggerAgentIntroInAllChannel(makeIo(), {} as any, "server-1", "agent-1"),
-    /daemon offline/,
-  );
-
-  assert.equal(rollbackCalledWith?.agentId, "agent-1");
-  assert.ok(rollbackCalledWith?.claimedAt instanceof Date);
-});
-
 test("triggerNewAgentAllChannelGreeting delivers an agentic (non-canned) greeting instruction to the new agent", async () => {
   let markAttempts = 0;
   let deliveredTo: string | null = null;
   let deliveredMessage: any = null;
 
   __setOnboardingServiceDepsForTests(makeDeps({
-    evaluateFeatureFlag: async () => OPENER_V2_ON,
     tryMarkAllChannelIntroSent: async () => {
       markAttempts += 1;
       return true;
@@ -314,37 +201,11 @@ test("triggerNewAgentAllChannelGreeting delivers an agentic (non-canned) greetin
   assert.doesNotMatch(String(deliveredMessage?.content), /^Hi, I'm/);
 });
 
-test("triggerNewAgentAllChannelGreeting is opener-v2 only (no-op when flag off)", async () => {
-  let delivered = false;
-  let markAttempts = 0;
-
-  __setOnboardingServiceDepsForTests(makeDeps({
-    // default makeDeps flag is disabled
-    tryMarkAllChannelIntroSent: async () => {
-      markAttempts += 1;
-      return true;
-    },
-  }) as any);
-
-  const agentOrchestrator = {
-    async deliverMessage() {
-      delivered = true;
-    },
-  } as any;
-
-  const sent = await triggerNewAgentAllChannelGreeting(makeIo(), agentOrchestrator, "server-1", "agent-1");
-
-  assert.equal(sent, false);
-  assert.equal(markAttempts, 0);
-  assert.equal(delivered, false);
-});
-
 test("triggerNewAgentAllChannelGreeting stays silent until #all is unlocked", async () => {
   let delivered = false;
   let markAttempts = 0;
 
   __setOnboardingServiceDepsForTests(makeDeps({
-    evaluateFeatureFlag: async () => OPENER_V2_ON,
     // #all still private → not an enabled #all → ensureAllChannel returns null
     listChannels: async () => [{ id: "channel-all", name: "all", type: "private" }],
     tryMarkAllChannelIntroSent: async () => {
@@ -370,7 +231,6 @@ test("triggerNewAgentAllChannelGreeting respects the agentAllChannelGreetingEnab
   let delivered = false;
 
   __setOnboardingServiceDepsForTests(makeDeps({
-    evaluateFeatureFlag: async () => OPENER_V2_ON,
     getServerOnboardingSettings: async () => ({
       onboardingAgentId: null,
       agentAllChannelGreetingEnabled: false,
@@ -394,7 +254,6 @@ test("triggerNewAgentAllChannelGreeting skips an agent that already greeted", as
   let delivered = false;
 
   __setOnboardingServiceDepsForTests(makeDeps({
-    evaluateFeatureFlag: async () => OPENER_V2_ON,
     getAgent: async () => makeAgent({ allChannelIntroSentAt: new Date("2026-04-21T09:00:00.000Z") }),
   }) as any);
 
@@ -414,7 +273,6 @@ test("triggerNewAgentAllChannelGreeting rolls back the claim when delivery fails
   let rollbackCalledWith: any = null;
 
   __setOnboardingServiceDepsForTests(makeDeps({
-    evaluateFeatureFlag: async () => OPENER_V2_ON,
     clearAllChannelIntroSentClaim: async (agentId: string, claimedAt: Date) => {
       rollbackCalledWith = { agentId, claimedAt };
     },
@@ -433,85 +291,6 @@ test("triggerNewAgentAllChannelGreeting rolls back the claim when delivery fails
 
   assert.equal(rollbackCalledWith?.agentId, "agent-1");
   assert.ok(rollbackCalledWith?.claimedAt instanceof Date);
-});
-
-test("triggerOwnerOnboardingOnAgentActivation routes the owner onboarding instruction into #all", async () => {
-  // Per cindyz directive 2026-05-27 (#proj-onboarding:3e24c78f, task #42):
-  // owner onboarding must happen in the main #all channel — no extra private
-  // `onboarding-<owner>` channel is created. #all is a virtual channel, so the
-  // instruction broadcast can target #all directly without persisting membership.
-  const broadcasts: Array<{ channelId: string; content: string; targetAgentIds?: string[] }> = [];
-  const agentNotices: Array<{ agentId: string; channelId: string; content: string }> = [];
-  const createCalls: any[] = [];
-  const addedAgentChannels: string[] = [];
-
-  __setOnboardingServiceDepsForTests(makeDeps({
-    getServer: async () => makeServer(),
-    getMemberOnboardingPreferences: async () => ({ onboardingDmSentAt: null }),
-    getAgent: async () => makeAgent({
-      id: "agent-1",
-      serverId: "server-1",
-      name: "Cindy",
-      description: "Onboarding Assistant",
-    }),
-    tryMarkAllChannelIntroSent: async () => true,
-    getUser: async () => ({ id: "owner-1", name: "Cindy Zhao", signupSurveyCompletedAt: new Date(), signupRole: "engineering_leader" }),
-    listChannels: async () => [{ id: "channel-all", name: "all", type: "channel" }],
-    createChannel: async (...args: any[]) => {
-      createCalls.push(args);
-      return { id: "should-not-be-created", name: args[1], type: args[3] };
-    },
-    addAgent: async (channelId: string) => {
-      addedAgentChannels.push(channelId);
-    },
-    broadcastSystemMessage: async (
-      _io: any,
-      _agentOrchestrator: any,
-      channelId: string,
-      content: string,
-      opts?: { targetAgentIds?: string[] },
-    ) => {
-      broadcasts.push({ channelId, content, targetAgentIds: opts?.targetAgentIds });
-    },
-    deliverSystemNoticeToAgent: async (_orch: any, agentId: string, notice: any) => {
-      agentNotices.push({ agentId, channelId: notice.channel_id, content: notice.content });
-    },
-    updateMemberOnboardingPreferences: async () => {},
-  }) as any);
-
-  const fired = await triggerOwnerOnboardingOnAgentActivation(makeIo(), makeReminderSyncOrchestrator(), "server-1", "agent-1");
-  assert.equal(fired, true);
-
-  // No private `onboarding-<owner>` channel should have been created.
-  assert.equal(
-    createCalls.some((args) => typeof args[1] === "string" && args[1].startsWith("onboarding-")),
-    false,
-    "owner onboarding must not create an extra onboarding-<owner> channel",
-  );
-
-  // The instruction is Cindy's briefing — it names her playbook files and CLI
-  // commands. It must reach the agent WITHOUT being written into #all, where every
-  // human would read her whole prompt.
-  const ownerNotice = agentNotices.find((n) => n.channelId === "channel-all");
-  assert.ok(ownerNotice, "owner onboarding instruction must be delivered to the agent");
-  assert.equal(ownerNotice.agentId, "agent-1");
-  assert.match(ownerNotice.content, /in #all channel/);
-  assert.equal(
-    broadcasts.find((b) => b.channelId === "channel-all" && /Onboarding task/.test(b.content)),
-    undefined,
-    "the instruction must NOT be broadcast into the channel",
-  );
-
-  assert.deepEqual(addedAgentChannels, [], "virtual #all must not persist onboarding agent membership rows");
-
-  // Action-card regression guard (#proj-permission msg=f398b0d8, xxchan
-  // 2026-05-10): instruction must point Cindy at the action-card playbook.
-  // The survey answer must actually reach her, as the label she reads (not the raw id).
-  assert.match(ownerNotice.content, /their role is: Tech lead/);
-  assert.match(ownerNotice.content, /Pitch Raft and pick a starting point that fits that/);
-  assert.match(ownerNotice.content, /raft action prepare/);
-  assert.match(ownerNotice.content, /onboarding_playbook\.md/);
-  assert.match(ownerNotice.content, /onboarding_knowledge_faq\.md/);
 });
 
 // The briefing is a transient wake, not a stored message: delivered to an agent whose
@@ -560,7 +339,6 @@ test("a dropped ledger wake does not count as briefed, so the next activation re
       { id: "channel-all", name: "all", type: "channel" },
       { id: "owner-channel", name: "onboarding-owner", type: "channel" },
     ],
-    evaluateFeatureFlag: async () => OPENER_V2_ON,
     broadcastAndDeliver: async () => ({ id: "message-1" }),
     getOrCreateThread: async () => ({ id: "team-mode-thread" }),
     createOwnerOpenerArtifactAttachment: async () => ({ id: "team-mode-attachment", filename: "team-mode.html" }),
@@ -598,7 +376,6 @@ for (const [state, expectOpener] of [["ready", true], ["pending", false], ["fail
         { id: "channel-all", name: "all", type: "channel" },
         { id: "owner-channel", name: "onboarding-owner", type: "channel" },
       ],
-      evaluateFeatureFlag: async () => OPENER_V2_ON,
       broadcastAndDeliver: async () => ({ id: "message-1" }),
       getOrCreateThread: async () => ({ id: "team-mode-thread" }),
       createOwnerOpenerArtifactAttachment: async () => ({ id: "team-mode-attachment", filename: "team-mode.html" }),
@@ -655,15 +432,6 @@ function recordingOrchestrator(delivered: string[], status: "queued" | "dropped"
     pushReminderUpsert: async () => false,
   } as any;
 }
-
-test("hosted Cindy takes the opener-v2 path even where the server has opener v2 off", async () => {
-  const delivered: string[] = [];
-  __setOnboardingServiceDepsForTests(hostedCindyDeps({
-    evaluateFeatureFlag: async () => ({ key: ONBOARDING_OPENER_V2_FEATURE_FLAG_KEY, enabled: false, reason: "missing_flag" }),
-  }) as any);
-  assert.equal(await triggerOwnerOnboardingOnAgentActivation(makeIo(), recordingOrchestrator(delivered), "server-1", "agent-1"), true);
-  assert.deepEqual(delivered, ["onboarding-owner-facts-server-1", "opener-v2-ledger-server-1"]);
-});
 
 test("a trigger that loses the opener claim briefs and posts nothing", async () => {
   const delivered: string[] = [];
@@ -793,11 +561,6 @@ test("triggerOwnerOnboardingOnAgentActivation seeds opener v2 after adding Cindy
       addedAgents.push({ channelId, agentId });
       if (channelId === "owner-channel") ownerChannelAgents.add(agentId);
     },
-    evaluateFeatureFlag: async () => ({
-      key: ONBOARDING_OPENER_V2_FEATURE_FLAG_KEY,
-      enabled: true,
-      reason: "server_rule",
-    }),
     createOwnerOpenerArtifactAttachment: async (input: any) => {
       artifactInputs.push(input);
       return { id: "team-mode-attachment", filename: "team-mode.html" };
@@ -970,11 +733,6 @@ test("triggerOwnerOnboardingOnAgentActivation does not resend opener v2 and idem
         "workflow_migration_or_create_agent_card",
       ],
     }),
-    evaluateFeatureFlag: async () => ({
-      key: ONBOARDING_OPENER_V2_FEATURE_FLAG_KEY,
-      enabled: true,
-      reason: "server_rule",
-    }),
     broadcastAndDeliver: async () => {
       visibleMessages += 1;
     },
@@ -1030,7 +788,6 @@ test("D2 reminder schedule failure retries independently without resending opene
       { id: "channel-all", name: "all", type: "channel" },
       { id: "owner-channel", name: "onboarding-owner", type: "private" },
     ],
-    evaluateFeatureFlag: async () => OPENER_V2_ON,
     broadcastAndDeliver: async () => {
       visibleMessages += 1;
       return { id: `message-${visibleMessages}` };
@@ -1273,11 +1030,6 @@ test("triggerAllChannelUnlockOnboarding sends instruction exactly once via atomi
   let claimCalled = false;
 
   __setOnboardingServiceDepsForTests(makeDeps({
-    evaluateFeatureFlag: async () => ({
-      key: ONBOARDING_OPENER_V2_FEATURE_FLAG_KEY,
-      enabled: true,
-      reason: "server_rule",
-    }),
     listAgents: async () => [makeAgent({ id: "agent-1" }), makeAgent({ id: "agent-2", name: "second" })],
     getServer: async () => makeServer(),
     getAgent: async () => makeAgent({ id: "agent-1" }),
@@ -1300,11 +1052,6 @@ test("triggerAllChannelUnlockOnboarding unlocks when the 3rd member is a human",
   const broadcasts: Array<{ content: string }> = [];
 
   __setOnboardingServiceDepsForTests(makeDeps({
-    evaluateFeatureFlag: async () => ({
-      key: ONBOARDING_OPENER_V2_FEATURE_FLAG_KEY,
-      enabled: true,
-      reason: "server_rule",
-    }),
     // Just the Cindy OA, but the server now has 2 humans (owner + 1 invited) —
     // 1 agent + 2 humans = 3 members must unlock #all.
     listAgents: async () => [makeAgent({ id: "agent-1" })],
@@ -1331,11 +1078,6 @@ test("triggerAllChannelUnlockOnboarding stays hidden below 3 members (owner + OA
   let claimCalled = false;
 
   __setOnboardingServiceDepsForTests(makeDeps({
-    evaluateFeatureFlag: async () => ({
-      key: ONBOARDING_OPENER_V2_FEATURE_FLAG_KEY,
-      enabled: true,
-      reason: "server_rule",
-    }),
     // Baseline onboarding: solo owner (1 human) + OA (1 agent) = 2 members.
     listAgents: async () => [makeAgent({ id: "agent-1" })],
     listServerMemberIds: async () => ["owner-user"],
@@ -1357,11 +1099,6 @@ test("triggerAllChannelUnlockOnboarding skips when atomic claim loses (concurren
   let broadcastCount = 0;
 
   __setOnboardingServiceDepsForTests(makeDeps({
-    evaluateFeatureFlag: async () => ({
-      key: ONBOARDING_OPENER_V2_FEATURE_FLAG_KEY,
-      enabled: true,
-      reason: "server_rule",
-    }),
     listAgents: async () => [makeAgent({ id: "agent-1" }), makeAgent({ id: "agent-2" }), makeAgent({ id: "agent-3" })],
     getServer: async () => makeServer(),
     getAgent: async () => makeAgent({ id: "agent-1" }),
@@ -1376,17 +1113,31 @@ test("triggerAllChannelUnlockOnboarding skips when atomic claim loses (concurren
   assert.equal(broadcastCount, 0);
 });
 
+test("triggerAllChannelUnlockOnboarding counts no personal assistant toward the team, as #all's own threshold doesn't", async () => {
+  let claims = 0;
+
+  __setOnboardingServiceDepsForTests(makeDeps({
+    listAgents: async () => [makeAgent({ id: "agent-1" }), makeAgent({ id: "assistant-1", assistantOwnerUserId: "owner-1" })],
+    listServerMemberIds: async () => ["owner-1"],
+    getServer: async () => makeServer(),
+    getAgent: async () => makeAgent({ id: "agent-1" }),
+    listChannels: async () => [{ id: "channel-all", name: "all", type: "channel" }],
+    tryClaimAllChannelUnlockInstruction: async () => { claims += 1; return true; },
+    clearAllChannelUnlockInstructionClaim: async () => {},
+    broadcastSystemMessage: async () => {},
+  }) as any);
+
+  const fired = await triggerAllChannelUnlockOnboarding(makeIo(), {} as any, "server-1");
+  assert.equal(fired, false, "one person and one agent are not yet a team");
+  assert.equal(claims, 0);
+});
+
 test("triggerAllChannelUnlockOnboarding rolls back claim on send failure and retries", async () => {
   let markerValue: Date | null = null;
   let sendAttempts = 0;
   let clearCalledWithClaimedAt: Date | null = null;
 
   const baseDeps = {
-    evaluateFeatureFlag: async () => ({
-      key: ONBOARDING_OPENER_V2_FEATURE_FLAG_KEY,
-      enabled: true,
-      reason: "server_rule",
-    }),
     listAgents: async () => [makeAgent({ id: "agent-1" }), makeAgent({ id: "agent-2", name: "second" })],
     getServer: async () => makeServer(),
     getAgent: async () => makeAgent({ id: "agent-1" }),
@@ -1430,11 +1181,6 @@ test("triggerAllChannelUnlockOnboarding concurrent callers: only the winner send
   let claimCallCount = 0;
 
   const sharedDeps = {
-    evaluateFeatureFlag: async () => ({
-      key: ONBOARDING_OPENER_V2_FEATURE_FLAG_KEY,
-      enabled: true,
-      reason: "server_rule",
-    }),
     listAgents: async () => [makeAgent({ id: "agent-1" }), makeAgent({ id: "agent-2", name: "second" })],
     getServer: async () => makeServer(),
     getAgent: async () => makeAgent({ id: "agent-1" }),
@@ -1469,11 +1215,6 @@ test("triggerCrossChannelHint fires during active wizard step and suppresses aft
   let prefsUpdated = false;
 
   const makeHintDeps = (wizardStep: string | null, hintShownAt: Date | null = null) => makeDeps({
-    evaluateFeatureFlag: async () => ({
-      key: ONBOARDING_OPENER_V2_FEATURE_FLAG_KEY,
-      enabled: true,
-      reason: "server_rule",
-    }),
     getServer: async () => makeServer(),
     getMemberOnboardingPreferences: async () => ({
       crossChannelHintShownAt: hintShownAt,

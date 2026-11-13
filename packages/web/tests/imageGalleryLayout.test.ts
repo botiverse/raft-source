@@ -1,7 +1,5 @@
 import assert from "node:assert/strict";
 import { buildMessageImageGalleryRows } from "@botiverse/raft-ui";
-import { existsSync, readdirSync, readFileSync } from "node:fs";
-import { resolve } from "node:path";
 import {
   buildImageInlineFallbackKey,
   getImageGalleryPreviewSrc,
@@ -16,31 +14,6 @@ import {
 } from "../src/components/message/urlImageFallback";
 import type { MessageAttachment } from "../src/store/messageStore";
 
-const repoRoot = resolve(import.meta.dirname, "..");
-const srcRoot = resolve(repoRoot, "src");
-
-function strykerBackupSrc(): string | null {
-  const tmp = resolve(repoRoot, ".stryker-tmp");
-  if (!existsSync(tmp)) return null;
-  const backup = readdirSync(tmp).find((entry) => entry.startsWith("backup-"));
-  return backup ? resolve(tmp, backup, "src") : null;
-}
-
-function readSource(path: string): string {
-  const sourcePath = path.replace(/^src\//, "");
-  const backupSrc = strykerBackupSrc();
-  const backupPath = backupSrc ? resolve(backupSrc, sourcePath) : null;
-  return readFileSync(backupPath && existsSync(backupPath) ? backupPath : resolve(srcRoot, sourcePath), "utf8");
-}
-
-const source = readSource("components/message/MessageItem.tsx");
-// The gallery tile (and its fit/reserve helpers) moved out of MessageItem into
-// its own file in task #709; its assertions read that file.
-const galleryItemSource = readSource("components/message/GalleryImageItem.tsx");
-const fallbackSource = readSource("components/message/urlImageFallback.ts");
-const inputSource = readSource("components/message/MessageInput.tsx");
-const messageStoreSource = readSource("store/messageStore.ts");
-
 function imageAttachment(overrides: Partial<MessageAttachment> = {}): MessageAttachment {
   return {
     id: "att-1",
@@ -53,41 +26,6 @@ function imageAttachment(overrides: Partial<MessageAttachment> = {}): MessageAtt
     ...overrides,
   };
 }
-
-test("image gallery layout delegates to the shared raft-ui row builder", () => {
-  // The rowing rules (ratio thresholds, wide images taking their own row,
-  // rows of three with a lone four splitting two-and-two, the single-image
-  // reserve box) live in raft-ui's buildMessageImageGalleryRows and are
-  // covered by its own tests. slock keeps only the call and the item slot;
-  // the item slot itself lives in GalleryImageItem since task #709.
-  assert.match(source, /buildMessageImageGalleryRows/);
-  assert.match(source, /const imageRows = buildMessageImageGalleryRows\(renderedImages\)/);
-  assert.match(source, /<MessageImageGalleryRow/);
-  assert.match(source, /<GalleryImageItem[\s\S]{0,400}layout=\{item\}/);
-  assert.match(galleryItemSource, /<MessageImageGalleryItem[\s\S]{0,120}layout=\{layout\}/);
-  assert.match(source, /const att = renderedImages\[item\.index\]/);
-  // No local builder may creep back in.
-  for (const gallerySource of [source, galleryItemSource]) {
-    assert.doesNotMatch(gallerySource, /function classifyImageAspect|function buildImageGalleryRows/);
-    assert.doesNotMatch(gallerySource, /getImageGalleryRowClasses|getSingleImageReserveStyle|SINGLE_IMAGE_MAX_WIDTH/);
-  }
-});
-
-test("single-image reserve space comes from the shared layout contract", () => {
-  // The reserve box now flows through the builder's per-item layout (which
-  // raft-ui asserts), while the consumer surface and intrinsic size hints
-  // stay here, in the extracted gallery tile.
-  assert.match(source, /layout=\{item\}/);
-  assert.match(galleryItemSource, /layout=\{layout\}/);
-  assert.doesNotMatch(source, /getSingleImageReserveStyle|style=\{imageReserveStyle\}/);
-  assert.doesNotMatch(galleryItemSource, /getSingleImageReserveStyle|style=\{imageReserveStyle\}/);
-  assert.match(galleryItemSource, /width=\{att\.width \?\? undefined\}/);
-  assert.match(galleryItemSource, /height=\{att\.height \?\? undefined\}/);
-  // The tile surface (DS media frame: hairline + sunken fill) is the recipe's.
-  assert.doesNotMatch(galleryItemSource, /bg-palette-cream/);
-  assert.doesNotMatch(source, /border-2 border-black bg-transparent/);
-  assert.doesNotMatch(galleryItemSource, /border-2 border-black bg-transparent/);
-});
 
 test("the migrated builder produces the same rows slock pinned before the port", () => {
   // Same inputs as the pre-migration suite: the delegation must not change
@@ -117,53 +55,23 @@ test("the migrated builder produces the same rows slock pinned before the port",
   ]);
 });
 
-test("optimistic image attachments carry local dimensions when available", () => {
-  assert.match(inputSource, /previewWidth\?: number;/);
-  assert.match(inputSource, /previewHeight\?: number;/);
-  assert.match(inputSource, /function readLocalImageDimensions\(previewUrl: string\)/);
-  assert.match(inputSource, /const width = image\.naturalWidth;/);
-  assert.match(inputSource, /const height = image\.naturalHeight;/);
-  assert.match(inputSource, /readLocalImageDimensions\(pending\.preview\)/);
-  assert.match(inputSource, /previewWidth: dimensions\.width/);
-  assert.match(inputSource, /previewHeight: dimensions\.height/);
-  assert.match(inputSource, /width: pf\.previewWidth \?\? null/);
-  assert.match(inputSource, /height: pf\.previewHeight \?\? null/);
-});
-
-test("sent image attachments keep local previews across optimistic handoff", () => {
-  assert.match(messageStoreSource, /function mergeOptimisticAttachmentPreviews/);
-  assert.match(messageStoreSource, /localPreviewUrl: attachment\.localPreviewUrl \?\? local\.localPreviewUrl/);
-  assert.match(messageStoreSource, /width: attachment\.width \?\? local\.width \?\? null/);
-  assert.match(messageStoreSource, /height: attachment\.height \?\? local\.height \?\? null/);
-
-  const submitStart = inputSource.indexOf("const handleSubmit = useCallback(async");
-  const catchStart = inputSource.indexOf("} catch (err) {", submitStart);
-  assert.notEqual(submitStart, -1, "handleSubmit not found");
-  assert.notEqual(catchStart, -1, "handleSubmit catch block not found");
-  const successfulSubmitPath = inputSource.slice(submitStart, catchStart);
-  assert.doesNotMatch(successfulSubmitPath, /URL\.revokeObjectURL/);
-});
-
 test("sent image attachments with preserved local previews are no longer optimistic", () => {
-  assert.match(fallbackSource, /export function isOptimisticAttachment\(att: Pick<MessageAttachment, "id">\): boolean \{/);
-  assert.match(fallbackSource, /return att\.id\.startsWith\("optimistic-att-"\);/);
   assert.equal(isOptimisticAttachment(imageAttachment({ id: "optimistic-att-5" })), true);
   assert.equal(isOptimisticAttachment(imageAttachment({ id: "att-5", localPreviewUrl: "blob:local" })), false);
-  assert.match(source, /from "\.\/urlImageFallback";/);
-  assert.match(source, /imagePreviewAttachments\.filter\(\(att\) => !isOptimisticAttachment\(att\)\)/);
-  assert.match(source, /const isOptimistic = isOptimisticAttachment\(att\);/);
-  assert.doesNotMatch(source, /const isOptimistic = !!att\.localPreviewUrl/);
 });
 
-test("image attachments without thumbnails still open the lightbox fallback", () => {
-  assert.match(source, /imagePreviewAttachments\.filter\(\(att\) => !isOptimisticAttachment\(att\)\)/);
-  // open() gained a third arg (per-attachment comment contexts, task #10);
-  // the contract is the index fallback, not the exact arity.
-  assert.match(source, /if \(isPreviewableImageAttachment\(att\) && !isOptimistic\) \{[\s\S]*?useImageLightboxStore\.getState\(\)\.open\([\s\S]{0,160}?imageIndex >= 0 \? imageIndex : 0/);
+test("HEIC previews inline only through a raster, never by fetching the raw file", () => {
+  // Raw HEIC does not decode outside Safari: without a server thumbnail (or a
+  // local preview the composer already decoded) it is a file card.
+  const heic = (overrides: Partial<MessageAttachment> = {}) => imageAttachment({ filename: "IMG_3535.heic", mimeType: "image/heic", ...overrides });
+  assert.equal(isPreviewableImageAttachment(heic()), false);
+  assert.equal(isPreviewableImageAttachment(heic({ mimeType: "IMAGE/HEIF; x=y" })), false);
+  assert.equal(isPreviewableImageAttachment(heic({ thumbnailUrl: "/thumb.webp" })), true);
+  assert.equal(isPreviewableImageAttachment(heic({ localPreviewUrl: "blob:decoded" })), true);
+  assert.equal(buildImageInlineFallbackKey([heic({ id: "att-heic" })]), "", "no raw-URL fetch for HEIC");
 });
 
 test("image attachments without thumbnails fetch an inline URL for direct gallery rendering", () => {
-  assert.match(source, /const imageFallbackKey = useMemo/);
   assert.equal(isPreviewableImageAttachment(imageAttachment({ mimeType: " IMAGE/PNG ; charset=utf-8" })), true);
   assert.equal(isPreviewableImageAttachment(imageAttachment({ mimeType: "text/plain" })), false);
   assert.equal(isPreviewableImageAttachment(imageAttachment({
@@ -197,18 +105,6 @@ test("image attachments without thumbnails fetch an inline URL for direct galler
   ]), "att-1|att-6");
   assert.deepEqual(splitImageInlineFallbackKey("att-1|att-6"), ["att-1", "att-6"]);
   assert.deepEqual(splitImageInlineFallbackKey(""), []);
-  assert.match(source, /buildImageInlineFallbackKey\(message\.attachments\)/);
-  assert.match(fallbackSource, /shouldFetchImageInlineFallback\(att\)/);
-  // The inline URL fetch moved into a shared cache so the same attachment is
-  // requested once instead of once per rendered tile (an attachment-dense
-  // channel was tripping the 120/min download limiter and rendering broken
-  // images). The gallery must route through it; the URL lives in the cache.
-  assert.match(source, /fetchInlineAttachmentUrls\(attachmentIds\)/);
-  assert.match(
-    readFileSync(resolve(repoRoot, "src/components/message/inlineAttachmentUrlCache.ts"), "utf8"),
-    /`\/attachments\/\$\{attachmentId\}\/url\?disposition=inline`/,
-  );
-
   assert.equal(getImageGalleryPreviewSrc({
     id: "att-1",
     localPreviewUrl: "blob:local",
@@ -239,7 +135,6 @@ test("image attachments without thumbnails fetch an inline URL for direct galler
     thumbnailUrl: null,
     rasterPreviewUrl: null,
   }, { "att-1": "/inline.png" }), undefined);
-  assert.match(source, /getImageGalleryPreviewSrc\(att, imageFallbackUrls\)/);
 
   assert.equal(shouldRenderImageAsAttachmentChip({
     id: "att-1",
@@ -268,24 +163,4 @@ test("image attachments without thumbnails fetch an inline URL for direct galler
     "att-1": "/inline.png",
     "att-2": "/second.png",
   }, "att-1"), { "att-2": "/second.png" });
-  assert.match(source, /shouldRenderImageAsAttachmentChip\(att, imageFallbackUrls\)/);
-});
-
-test("image gallery download affordance does not reuse the lightbox preview hit target", () => {
-  // The tile is its own component file since task #709; slice from its
-  // download handler to the end of that file (the tile is its last component).
-  const galleryStart = galleryItemSource.indexOf("const handleDownloadImage");
-  assert.notEqual(galleryStart, -1, "thumbnail download handler not found");
-  assert.match(source, /<GalleryImageItem\b/, "MessageItem must render the gallery tile");
-  const gallerySource = galleryItemSource.slice(galleryStart);
-
-  assert.match(gallerySource, /event\.preventDefault\(\);/);
-  assert.match(gallerySource, /event\.stopPropagation\(\);/);
-  assert.match(gallerySource, /void onDownload\(att\);/);
-  // aria labels migrated to react-intl (message.messageItem.previewFile/downloadFile).
-  assert.match(gallerySource, /aria-label=\{formatMessage\(\{ id: "message\.messageItem\.previewFile" \}, \{ filename: att\.filename \}\)\}/);
-  assert.match(gallerySource, /data-message-affordance="image-download"/);
-  assert.match(gallerySource, /aria-label=\{formatMessage\(\{ id: "message\.messageItem\.downloadFile" \}, \{ filename: att\.filename \}\)\}/);
-  assert.doesNotMatch(gallerySource, /<span[\s\S]{0,160}?data-message-affordance="image-download"/);
-  assert.doesNotMatch(source, /<span[\s\S]{0,160}?data-message-affordance="image-download"/);
 });

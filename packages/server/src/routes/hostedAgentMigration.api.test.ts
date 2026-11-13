@@ -5,7 +5,7 @@ import { createApiTest } from "../test/integration/apiTest";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
-import { AGENT_MIGRATION_CAPABILITY, AGENT_MIGRATION_HOSTED_FEATURE_FLAG_KEY, ANTIPROTON_HOSTED_RUNTIME_FEATURE_FLAG_KEY, AGENT_MIGRATION_FEATURE_FLAG_KEY } from "@botiverse/raft-shared";
+import { AGENT_MIGRATION_CAPABILITY, AGENT_MIGRATION_HOSTED_FEATURE_FLAG_KEY, ANTIPROTON_HOSTED_RUNTIME_FEATURE_FLAG_KEY } from "@botiverse/raft-shared";
 import { getDb } from "../db/index";
 import { agentMigrationHostedTargets, agentMigrations, agentRuntimeProvisions, featureFlagRules, featureFlags, machines, servers, users } from "../db/schema";
 import { createFeatureFlag } from "../services/featureFlagService";
@@ -13,7 +13,7 @@ import { createServer } from "../services/serverService";
 import { createAgent } from "../services/agentService";
 import { __setAgentRuntimeProviderTransportForTests } from "../services/agentRuntimeProviderService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 const limits = { maxTotalBytes: 10485760, maxFiles: 2000, maxFileBytes: 2097152 };
 const ENV = {
   SLOCK_PROVIDER_CREDENTIAL_KEY: Buffer.alloc(32, 7).toString("base64"),
@@ -56,7 +56,6 @@ async function setup(baseUrl: string, slug: string, options: { hostedFlag?: bool
   }).returning();
   const server = await createServer(`Hosted ${slug}`, slug, owner.id);
   await db.update(servers).set({ plan: "founder" }).where(eq(servers.id, server.id));
-  await allow(AGENT_MIGRATION_FEATURE_FLAG_KEY, server.id);
   await allow(ANTIPROTON_HOSTED_RUNTIME_FEATURE_FLAG_KEY, server.id);
   if (options.hostedFlag !== false) {
     // No migration seeds this flag: absent means off. Turning it on is an admin creating it with a rule.
@@ -151,7 +150,7 @@ test("hosted is refused where the provider is not enabled, and a bad model is re
   });
 });
 
-test("hosted migration has its own default-off gate, even where migration, Pro and the hosted runtime are all on", async ({ app }) => {
+test("hosted migration has its own default-off gate, even where Pro and the hosted runtime are both on", async ({ app }) => {
   await withEnv(async () => {
     const leases = stubOrchestrator(app);
     const { agent, migrate, confirm } = await setup(app.baseUrl, "hosted-gate", { hostedFlag: false });
@@ -163,5 +162,18 @@ test("hosted migration has its own default-off gate, even where migration, Pro a
     const confirmed = await confirm({ migrationRef: "mig_abcdefghijklmnopqrstuv", expectedRevision: 1 });
     assert.equal(confirmed.status, 403);
     assert.equal((await confirmed.json() as { code: string }).code, "HOSTED_TARGET_UNAVAILABLE");
+  });
+});
+
+test("hosted migration still needs Pro: a free server with the hosted flags on is refused before any lease", async ({ app }) => {
+  await withEnv(async () => {
+    const leases = stubOrchestrator(app);
+    const { agent, server, migrate } = await setup(app.baseUrl, "hosted-free");
+    await getDb().update(servers).set({ plan: "free" }).where(eq(servers.id, server.id));
+    const res = await migrate({ target: { kind: "hosted" } });
+    assert.equal(res.status, 403, await res.clone().text());
+    assert.equal((await res.json() as { code: string }).code, "MIGRATION_PRO_PLAN_REQUIRED");
+    assert.deepEqual(leases, []);
+    assert.deepEqual(await getDb().select().from(agentMigrations).where(eq(agentMigrations.agentId, agent.id)), []);
   });
 });

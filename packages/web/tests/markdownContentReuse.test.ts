@@ -93,5 +93,5 @@ test("real markdown attachment preview delegates its document body to MarkdownCo
   assert.match(paragraph.className, /mb-3/);
   assert.ok(code);
   assert.match(code.className, /\[font-size:0\.875em\]/);
-  assert.equal(container.querySelector("[data-testid='markdown-preview-truncated']"), null);
+  assert.ok(container.querySelector("[data-testid='markdown-preview-truncated']") === null);
 });

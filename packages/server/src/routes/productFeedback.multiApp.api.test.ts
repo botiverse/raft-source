@@ -1,4 +1,4 @@
-import { fixturePasswordHash } from "../test/integration/credentials";
+import { accessTokenForTest, fixturePasswordHash } from "../test/integration/credentials";
 import { createApiTest } from "../test/integration/apiTest";
 import assert from "node:assert/strict";
 import { createServer as createHttpServer, type IncomingMessage } from "node:http";
@@ -6,8 +6,7 @@ import type { AddressInfo } from "node:net";
 
 import { eq } from "drizzle-orm";
 import { getDb } from "../db/index";
-import { featureFlags, integrationSecretCommitments, users } from "../db/schema";
-import { signAccessToken } from "../middleware/auth";
+import { integrationSecretCommitments, users } from "../db/schema";
 import { resetProductFeedbackRouteBindingCacheForTest } from "../services/productFeedbackRouteBindingService";
 import {
   resetProductFeedbackBreakersForTest,
@@ -15,9 +14,11 @@ import {
 } from "../services/productFeedbackConversationService";
 import {
   CachedProductFeedbackApps,
-  PRODUCT_FEEDBACK_MULTI_APP_FLAG,
   setProductFeedbackAppsForTest,
 } from "../services/productFeedbackApps";
+import { FEEDBACK_SUBMIT_FORM_ID, type ActionCardMetadata } from "@botiverse/raft-shared";
+import { prepareActionCard } from "../services/actionCardsService";
+import { headers, post, seed } from "../test/actionCardFormFixture";
 
 const test = createApiTest();
 
@@ -138,18 +139,6 @@ async function withEnv<T>(baseUrl: string, run: () => Promise<T>): Promise<T> {
   }
 }
 
-async function enableMultiAppFlag(): Promise<void> {
-  await getDb().insert(featureFlags).values({
-    key: PRODUCT_FEEDBACK_MULTI_APP_FLAG,
-    description: "test multi-app feedback",
-    enabled: true,
-    killSwitch: false,
-    randomizationUnit: "user",
-    defaultEnabled: true,
-    salt: "product-feedback-multi-app-test",
-  });
-}
-
 async function seedToken(): Promise<string> {
   const [user] = await getDb().insert(users).values({
     email: "multi-feedback@slock.test",
@@ -159,7 +148,7 @@ async function seedToken(): Promise<string> {
     emailVerified: true,
     profileSetupCompletedAt: new Date(),
   }).returning();
-  return signAccessToken(user!.id);
+  return accessTokenForTest(user!.id);
 }
 
 function submitForm(clientKind: string): FormData {
@@ -172,9 +161,8 @@ function submitForm(clientKind: string): FormData {
   return form;
 }
 
-test("flag on: an Android submit and list reach the Android app with its own token and route root", async ({ app }) => {
+test("an Android submit and list reach the Android app with its own token and route root", async ({ app }) => {
   await withUpstream(async (baseUrl, requests) => withEnv(baseUrl, async () => {
-    await enableMultiAppFlag();
     const token = await seedToken();
     const submitted = await fetch(`${app.baseUrl}/api/product-feedback`, {
       method: "POST",
@@ -206,9 +194,75 @@ test("flag on: an Android submit and list reach the Android app with its own tok
   }));
 });
 
-test("flag on: a mobile source with no app answers 503 without touching the legacy app", async ({ app }) => {
+test("a feedback card's form sent from the App files in that App's app; from the web, in the web app", async ({ app }) => {
   await withUpstream(async (baseUrl, requests) => withEnv(baseUrl, async () => {
-    await enableMultiAppFlag();
+    const f = await seed(app);
+    const cases: Array<[string, Record<string, string>, string, string, string]> = [
+      ["Android", { "X-Raft-Client-Platform": "android", "User-Agent": "Raft/1.13.0+456 (Android 14; release) Mobile" }, "raft-feedback-android", "qk_android", "android"],
+      ["iPad", { "X-Raft-Client-Platform": "ios", "User-Agent": "Raft/1.13.0+456 (iPad; iPadOS 18.1; release) Mobile" }, "raft-feedback-ios", "qk_ios", "ios"],
+      ["a browser", { "X-Raft-Client-Platform": "browser" }, "raft-web", "qk_legacy", "web"],
+    ];
+    for (const [label, client, appSlug, clientKey, source] of cases) {
+      const card = await prepareActionCard({
+        serverId: f.server.id,
+        requesterAgentId: f.agent.id,
+        targetChannelId: f.channel.id,
+        action: { type: "feedback:submit", feedbackType: "idea", message: `feedback from ${label}` },
+      });
+      const before = requests.length;
+      const sent = await post(app.baseUrl, f, "alice", `${card.messageId}/execute`, {
+        expectedState: "prepared",
+        expectedConfirmationVersion: 1,
+        form: { id: FEEDBACK_SUBMIT_FORM_ID, values: { type: "idea", message: `feedback from ${label}` } },
+      }, client);
+      assert.equal(sent.status, 200, `${label}: ${sent.text}`);
+      const submits = requests.slice(before).filter((request) => request.method === "POST" && request.url.endsWith("/feedback"));
+      assert.deepEqual(submits.map((request) => [request.url, request.headers["x-hands-client-key"]]), [[`/public/v2/apps/${appSlug}/feedback`, clientKey]], label);
+      // The card records the app it was filed into (S0.3): only that client reads the ticket.
+      assert.deepEqual(sent.body.metadata.result, { kind: "product-feedback", ticketId: "ticket-1", reference: null, source }, label);
+    }
+  }));
+});
+
+test("a feedback card sent from its dialog or the App's page records the app it was filed into as the result's source", async ({ app }) => {
+  await withUpstream(async (baseUrl, requests) => withEnv(baseUrl, async () => {
+    const f = await seed(app);
+    // The App's feedback page (standalone/main.tsx: X-Raft-Client-Kind and the host's facts); the web's dialog sends neither.
+    const page = (kind: string) => ({ headers: { "X-Raft-Client-Kind": kind }, metadata: { client_kind: kind, platform: kind, client_version: "1.13.0" } });
+    const cases: Array<[string, { headers: Record<string, string>; metadata: Record<string, string> } | null, string, string]> = [
+      ["the Android App's page", page("android"), "raft-feedback-android", "android"],
+      ["the iOS App's page", page("ios"), "raft-feedback-ios", "ios"],
+      ["the web's dialog", null, "raft-web", "web"],
+    ];
+    for (const [label, client, appSlug, source] of cases) {
+      const card = await prepareActionCard({
+        serverId: f.server.id,
+        requesterAgentId: f.agent.id,
+        targetChannelId: f.channel.id,
+        action: { type: "feedback:submit", feedbackType: "idea", message: `feedback from ${label}` },
+      });
+      const form = new FormData();
+      form.set("type", "idea");
+      form.set("message", `feedback from ${label}`);
+      if (client) form.set("metadata", JSON.stringify(client.metadata));
+      form.set("submission_id", "88888888-8888-4888-8888-888888888888");
+      form.set("may_contact", "false");
+      form.set("action_card_message_id", card.messageId);
+      form.set("expected_confirmation_version", "1");
+      const { "Content-Type": _json, ...auth } = headers(f, "alice");
+      const before = requests.length;
+      const sent = await fetch(`${app.baseUrl}/api/product-feedback`, { method: "POST", headers: { ...auth, ...client?.headers }, body: form });
+      assert.equal(sent.status, 201, `${label}: ${await sent.clone().text()}`);
+      const submits = requests.slice(before).filter((request) => request.method === "POST" && request.url.endsWith("/feedback"));
+      assert.deepEqual(submits.map((request) => request.url), [`/public/v2/apps/${appSlug}/feedback`], label);
+      const body = await sent.json() as { action_card?: { metadata: ActionCardMetadata } };
+      assert.deepEqual(body.action_card?.metadata.result, { kind: "product-feedback", ticketId: "ticket-1", reference: null, source }, label);
+    }
+  }));
+});
+
+test("a mobile source with no app answers 503 without touching the legacy app", async ({ app }) => {
+  await withUpstream(async (baseUrl, requests) => withEnv(baseUrl, async () => {
     const token = await seedToken();
     const warnings: string[] = [];
     const originalWarn = console.warn;
@@ -237,9 +291,8 @@ test("flag on: a mobile source with no app answers 503 without touching the lega
   }));
 });
 
-test("flag on: a route binding failure answers 503 and logs its reason without any value", async ({ app }) => {
+test("a route binding failure answers 503 and logs its reason without any value", async ({ app }) => {
   await withUpstream(async (baseUrl, requests) => withEnv(baseUrl, async () => {
-    await enableMultiAppFlag();
     const token = await seedToken();
     // A malformed shared root (hex, not 43-char base64url) fails route binding before Hands.
     const badRoot = "ab".repeat(32);
@@ -279,22 +332,23 @@ test("flag on: a route binding failure answers 503 and logs its reason without a
   }));
 });
 
-test("flag on: web without its own entry keeps the legacy web app; flag off ignores the apps JSON", async ({ app }) => {
+test("with no feature flag row, Android lists in its own app and web (with or without the header) in the legacy web app", async ({ app }) => {
   await withUpstream(async (baseUrl, requests) => withEnv(baseUrl, async () => {
     const token = await seedToken();
-    const flagOff = await fetch(`${app.baseUrl}/api/product-feedback/tickets`, {
+    const android = await fetch(`${app.baseUrl}/api/product-feedback/tickets`, {
       headers: { Authorization: `Bearer ${token}`, "X-Raft-Client-Kind": "android" },
     });
-    assert.equal(flagOff.status, 200);
-    assert.ok(requests.at(-1)?.url.startsWith(`/api/apps/${LEGACY_APP_ID}/reporter-feedback?`), "flag off: legacy app");
+    assert.equal(android.status, 200);
+    assert.ok(requests.at(-1)?.url.startsWith(`/api/apps/${ANDROID_APP_ID}/reporter-feedback?`), "android: its own app");
 
-    await enableMultiAppFlag();
-    resetProductFeedbackRouteBindingCacheForTest();
-    const web = await fetch(`${app.baseUrl}/api/product-feedback/tickets`, {
-      headers: { Authorization: `Bearer ${token}` },
-    });
-    assert.equal(web.status, 200);
-    assert.ok(requests.at(-1)?.url.startsWith(`/api/apps/${LEGACY_APP_ID}/reporter-feedback?`), "web: legacy app");
+    for (const clientKind of [null, "web"]) {
+      resetProductFeedbackRouteBindingCacheForTest();
+      const web = await fetch(`${app.baseUrl}/api/product-feedback/tickets`, {
+        headers: { Authorization: `Bearer ${token}`, ...(clientKind ? { "X-Raft-Client-Kind": clientKind } : {}) },
+      });
+      assert.equal(web.status, 200);
+      assert.ok(requests.at(-1)?.url.startsWith(`/api/apps/${LEGACY_APP_ID}/reporter-feedback?`), `web (${clientKind ?? "no header"}): legacy app`);
+    }
   }));
 });
 
@@ -310,9 +364,8 @@ test("an unknown client kind on a conversation request is invalid", async ({ app
   }));
 });
 
-test("flag on: an Android ticket id is not found from any other source, on every ticket endpoint", async ({ app }) => {
+test("an Android ticket id is not found from any other source, on every ticket endpoint", async ({ app }) => {
   await withUpstream(async (baseUrl, requests) => withEnv(baseUrl, async () => {
-    await enableMultiAppFlag();
     const token = await seedToken();
     for (const clientKind of ["ios", "web"] as const) {
       const headers = { Authorization: `Bearer ${token}`, "X-Raft-Client-Kind": clientKind };
@@ -345,9 +398,64 @@ test("flag on: an Android ticket id is not found from any other source, on every
   }));
 });
 
-test("flag on: a list cursor minted for Android does not replay on iOS", async ({ app }) => {
+test("platform=android on a ticket request asks the Android app from the web, on every ticket endpoint, whatever the client's own kind", async ({ app }) => {
   await withUpstream(async (baseUrl, requests) => withEnv(baseUrl, async () => {
-    await enableMultiAppFlag();
+    const token = await seedToken();
+    // No header and "web" are the web app; "ios" shows that the named app wins over the caller's own.
+    for (const clientKind of [null, "web", "ios"] as const) {
+      const headers = { Authorization: `Bearer ${token}`, ...(clientKind ? { "X-Raft-Client-Kind": clientKind } : {}) };
+      const before = requests.length;
+      const comment = new FormData();
+      comment.set("body", "reply to a ticket filed in the Android App");
+      comment.set("submission_id", "44444444-4444-4444-8444-444444444444");
+      const ticket = `${app.baseUrl}/api/product-feedback/tickets/${ANDROID_TICKET_ID}`;
+      await Promise.all([
+        fetch(`${ticket}?platform=android`, { headers }),
+        fetch(`${ticket}/comments?platform=android`, { method: "POST", headers, body: comment }),
+        fetch(`${ticket}/close?platform=android`, {
+          method: "POST",
+          headers: { ...headers, "Content-Type": "application/json" },
+          body: JSON.stringify({ reason: "completed" }),
+        }),
+        fetch(`${ticket}/attachments/55555555-5555-4555-8555-555555555555?platform=android`, { headers }),
+      ]);
+      const ticketRequests = requests.slice(before).filter((request) => request.url.includes(ANDROID_TICKET_ID));
+      assert.equal(ticketRequests.length, 4, `${clientKind ?? "no header"}: each endpoint asked one app once`);
+      for (const request of ticketRequests) {
+        assert.ok(request.url.startsWith(`/api/apps/${ANDROID_APP_ID}/`), `${clientKind ?? "no header"} must ask the Android app: ${request.url}`);
+        assert.equal(request.headers.authorization, "Bearer android_token");
+      }
+    }
+  }));
+});
+
+test("the list does not take platform: it stays in the caller's own app", async ({ app }) => {
+  await withUpstream(async (baseUrl, requests) => withEnv(baseUrl, async () => {
+    const token = await seedToken();
+    const web = await fetch(`${app.baseUrl}/api/product-feedback/tickets?platform=android`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    assert.equal(web.status, 200);
+    assert.ok(requests.at(-1)?.url.startsWith(`/api/apps/${LEGACY_APP_ID}/reporter-feedback?`), "web: its own app");
+  }));
+});
+
+test("a platform that is not one feedback app is invalid, also when the header is valid", async ({ app }) => {
+  await withUpstream(async (baseUrl, requests) => withEnv(baseUrl, async () => {
+    const token = await seedToken();
+    for (const query of ["platform=symbian", "platform=", "platform=android&platform=ios"]) {
+      const response = await fetch(`${app.baseUrl}/api/product-feedback/tickets/${ANDROID_TICKET_ID}?${query}`, {
+        headers: { Authorization: `Bearer ${token}`, "X-Raft-Client-Kind": "android" },
+      });
+      assert.equal(response.status, 400, query);
+      assert.equal((await response.json() as { code: string }).code, "feedback_invalid");
+    }
+    assert.equal(requests.length, 0);
+  }));
+});
+
+test("a list cursor minted for Android does not replay on iOS", async ({ app }) => {
+  await withUpstream(async (baseUrl, requests) => withEnv(baseUrl, async () => {
     const token = await seedToken();
     const androidList = await fetch(`${app.baseUrl}/api/product-feedback/tickets`, {
       headers: { Authorization: `Bearer ${token}`, "X-Raft-Client-Kind": "android" },

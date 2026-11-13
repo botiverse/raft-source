@@ -1,11 +1,14 @@
 // `raft attachment upload --path <filepath> [--target <target>]`
-// → POST /internal/agent-api/resolve-channel  (target → channelId, when --target given)
 // → GET  /internal/agent-api/attachment-upload-capabilities
+// → POST /internal/agent-api/resolve-channel  (target → channelId, when --target given)
 // → POST /internal/agent-api/upload           (small files: multipart)
 // → POST /internal/agent-api/attachment-upload-sessions + direct PUT + complete
-//                                             (large files: streamed to object storage)
+//                                             (large files: streamed to object storage;
+//                                             also how a file over the plan limit is
+//                                             declared, so the server says why)
 //
-// Returns the attachment id; pass it to `raft message send --attachment-id`.
+// Returns the attachment id; pass it to `raft message send --attachment-id`
+// (`raft task reply <ref> --attachment-id` for a task ref).
 //
 // Note: v0 server's /upload endpoint still requires a channelId in the multipart
 // body. The CLI surface no longer requires --channel (per locked v0 spec), but
@@ -18,15 +21,16 @@ import { basename } from "node:path";
 import { finished } from "node:stream/promises";
 
 import type { Command } from "commander";
-import { setClockTimeout } from "@botiverse/raft-shared/src/agentCliSurface";
+import { ATTACHMENT_UPLOAD_MAX_SIZE_BYTES, setClockTimeout } from "@botiverse/raft-shared/src/agentCliSurface";
 
 import { defineCommand, registerCliCommand } from "../../core/command";
 import type { CommandRuntimeOptions } from "../../core/context";
-import { cliError } from "../../core/errors";
+import { CliError, cliError } from "../../core/errors";
 import { writeText, adoptCliReplyText } from "../../core/renderer";
 import { formatAttachmentUploaded } from "./_format";
 import { createAgentApiSurfaceClient } from "../../agentApiPath";
 import { apiFailureError } from "../_apiFailure";
+import { proxyAwareFetch } from "../../proxy";
 import { PEER_KIND_OPTION, resolveTargetAlias, type TargetAliasOpts } from "../_target";
 
 // Compatibility fallback for servers that predate the capability endpoint.
@@ -117,12 +121,37 @@ export function inferUploadMimeType(
     || "application/octet-stream";
 }
 
+function uploadSizeLimitMessage(size: number, maxBytes: number): string {
+  return `--path is ${formatBytes(size)}; max upload size is ${formatBytes(maxBytes)}`;
+}
+
+/**
+ * Declare a file over the plan's limit to an upload session: the session if
+ * the server takes it, else the local refusal, with the server's next action
+ * when it refused the file for size (413). A proxy or transport failure says
+ * nothing about the file, so the local refusal stands then too.
+ */
+async function declareOverLimitFile<T extends { ok: boolean; status: number; suggestedNextAction?: string | null }>(
+  createUploadSession: () => Promise<T>,
+  size: number,
+  maxBytes: number,
+): Promise<T> {
+  let declared: T;
+  try {
+    declared = await createUploadSession();
+  } catch (err) {
+    if (err instanceof CliError) throw cliError("INVALID_ARG", uploadSizeLimitMessage(size, maxBytes), { cause: err });
+    throw err;
+  }
+  if (declared.ok) return declared;
+  throw cliError("INVALID_ARG", uploadSizeLimitMessage(size, maxBytes), {
+    suggestedNextAction: declared.status === 413 ? declared.suggestedNextAction ?? undefined : undefined,
+  });
+}
+
 export function validateUploadFileSize(size: number, maxBytes = MAX_ATTACHMENT_UPLOAD_BYTES): void {
   if (size > maxBytes) {
-    throw new AttachmentUploadArgError(
-      "INVALID_ARG",
-      `--path is ${formatBytes(size)}; max upload size is ${formatBytes(maxBytes)}`,
-    );
+    throw new AttachmentUploadArgError("INVALID_ARG", uploadSizeLimitMessage(size, maxBytes));
   }
   if (size === 0) {
     throw new AttachmentUploadArgError(
@@ -148,7 +177,9 @@ export async function putFileToPresignedUrl(
   sizeBytes: number,
   url: string,
   signedHeaders: Readonly<Record<string, string>>,
-  fetchImpl: typeof fetch = fetch,
+  // The presigned URL is object storage, not the Raft server: it must honor
+  // HTTPS_PROXY / NO_PROXY like the server requests do.
+  fetchImpl: typeof fetch = (input, init) => proxyAwareFetch(input as string | URL, init),
 ): Promise<"uploaded" | "already_exists"> {
   for (let attempt = 0; attempt < 2; attempt += 1) {
     const body = createReadStream(filePath);
@@ -284,11 +315,20 @@ export const attachmentUploadCommand = defineCommand(
               sessionExpiresInSeconds: null,
             }
           : throwUploadFailure(capabilityResponse, "UPLOAD_CAPABILITY_FAILED");
-      try {
-        validateUploadFileSize(stat.size, capability.maxBytes);
-      } catch (err) {
-        if (err instanceof AttachmentUploadArgError) throw cliError(err.code, err.message, { cause: err });
-        throw err;
+      // A file over the plan's limit that an upload session can still declare
+      // is declared, so the server refuses it and can say why (on Free, a file
+      // Pro would take comes with how to offer an upgrade card). Anything
+      // larger, or a server without the capability endpoint, is refused here.
+      const declareOverLimit = capabilityResponse.ok
+        && stat.size > capability.maxBytes
+        && stat.size <= ATTACHMENT_UPLOAD_MAX_SIZE_BYTES;
+      if (!declareOverLimit) {
+        try {
+          validateUploadFileSize(stat.size, capability.maxBytes);
+        } catch (err) {
+          if (err instanceof AttachmentUploadArgError) throw cliError(err.code, err.message, { cause: err });
+          throw err;
+        }
       }
 
       const resolved = await agentApi.channels.resolve({ target });
@@ -298,18 +338,24 @@ export const attachmentUploadCommand = defineCommand(
       }
       const channelId = resolved.data!.channelId!;
 
-      const useDirectUpload = capability.directUploadEnabled
+      const createUploadSession = () => agentApi.attachments.createUploadSession({
+        channelId,
+        filename,
+        mimeType: uploadMimeType,
+        sizeBytes: stat.size,
+        clientRequestId: randomUUID(),
+      });
+      const directUploadApplies = capability.directUploadEnabled
         && capability.directUploadThresholdBytes !== null
         && stat.size >= capability.directUploadThresholdBytes;
+      // The session a direct upload goes through. A declared over-limit file
+      // has one only if the server takes it (the plan changed since the
+      // capabilities read); otherwise it was refused as before.
+      const created = declareOverLimit
+        ? await declareOverLimitFile(createUploadSession, stat.size, capability.maxBytes)
+        : directUploadApplies ? await createUploadSession() : null;
 
-      if (useDirectUpload) {
-        const created = await agentApi.attachments.createUploadSession({
-          channelId,
-          filename,
-          mimeType: uploadMimeType,
-          sizeBytes: stat.size,
-          clientRequestId: randomUUID(),
-        });
+      if (created) {
         if (!created.ok) throwUploadFailure(created);
 
         const uploadId = created.data!.uploadId;
@@ -334,7 +380,7 @@ export const attachmentUploadCommand = defineCommand(
           const completed = await agentApi.attachments.completeUploadSession({ uploadId });
           if (completed.ok) {
             const attachment = completed.data!.attachment;
-            writeText(ctx.io, formatAttachmentUploaded(attachment));
+            writeText(ctx.io, formatAttachmentUploaded(attachment, target));
             return;
           }
           const retryable = completed.errorCode === "UPLOAD_OBJECT_NOT_FOUND"
@@ -357,7 +403,7 @@ export const attachmentUploadCommand = defineCommand(
       const res = await agentApi.attachments.upload(form);
       if (!res.ok) throwUploadFailure(res);
       const d = res.data!;
-      writeText(ctx.io, formatAttachmentUploaded(d));
+      writeText(ctx.io, formatAttachmentUploaded(d, target));
   },
 );
 

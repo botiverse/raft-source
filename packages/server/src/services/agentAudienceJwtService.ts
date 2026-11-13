@@ -8,8 +8,9 @@ import { recordIntegrationAuditEvent } from "./integrationAuditService";
 import { agentJwtIssuanceCounter } from "../metrics";
 
 import { oauthClientIsUserManagedPredicate } from "./oauthClientManagementPolicy";
+import { oauthClientHasKey } from "./oauthClientKeys";
 
-export type AgentJwtDenialReason = "agent_unavailable" | "membership_missing" | "app_unavailable" | "installation_unavailable" | "grant_revoked";
+export type AgentJwtDenialReason = "agent_unavailable" | "membership_missing" | "app_unavailable" | "installation_unavailable" | "scope_not_approved" | "grant_revoked";
 export class AgentAudienceJwtError extends Error {
   readonly code = "AGENT_JWT_NOT_AUTHORIZED" as const;
   constructor(readonly reason: AgentJwtDenialReason = "app_unavailable") {
@@ -38,14 +39,14 @@ export async function issueAgentAudienceJwt(input: { serverId: string; agentId: 
       // Serialize first-use grant creation and client disable/scope contraction.
       // App and installation changes take the same row locks before commit.
       const [client] = await tx.select({ id: oauthClients.id, serverId: oauthClients.serverId, appType: oauthClients.appType, clientId: oauthClients.clientId, allowedScopes: oauthClients.allowedScopes, createdByUserId: oauthClients.createdByUserId }).from(oauthClients).where(and(
-        eq(oauthClients.clientId, input.service), oauthClientIsUserManagedPredicate(), eq(oauthClients.enabled, true),
+        oauthClientHasKey(input.service), oauthClientIsUserManagedPredicate(), eq(oauthClients.enabled, true),
       )).for("update");
       if (!client || !scopes.every((scope) => client.allowedScopes?.includes(scope))) {
         throw new AgentAudienceJwtError();
       }
       const source = client.serverId === server.id;
       const [installation] = await tx.select({
-        id: oauthClientInstalls.id, status: oauthClientInstalls.status,
+        id: oauthClientInstalls.id, status: oauthClientInstalls.status, approvedScopes: oauthClientInstalls.approvedScopes,
       }).from(oauthClientInstalls).where(and(
         eq(oauthClientInstalls.clientId, client.id), eq(oauthClientInstalls.serverId, server.id),
       )).for("share");
@@ -53,6 +54,11 @@ export async function issueAgentAudienceJwt(input: { serverId: string; agentId: 
         || (client.appType === "third_party_global" && (!installation || installation.status !== "active"))
         || (installation && installation.status !== "active")) {
         throw new AgentAudienceJwtError("installation_unavailable");
+      }
+      // A third-party app's login scopes count only once its installer
+      // approved them; ones the developer added later wait (task #2, #proj-apps).
+      if (client.appType === "third_party_global" && !scopes.every((scope) => installation?.approvedScopes.includes(scope))) {
+        throw new AgentAudienceJwtError("scope_not_approved");
       }
       // Unavailable private Apps share the unknown-App refusal. JWT is a
       // built-in Agent Login credential: no per-App or per-installation switch.
@@ -84,7 +90,8 @@ export async function issueAgentAudienceJwt(input: { serverId: string; agentId: 
       const jti = randomUUID();
       const token = signAgentAccessJwt({
         issuer: oidcIssuer(undefined, server.slug),
-        agentId: agent.id, clientId: client.clientId, serverId: server.id,
+        // RFC 084 §4: the id the agent asked for (the lookup above made it one of this App's).
+        agentId: agent.id, clientId: input.service, serverId: server.id,
         serverSlug: server.slug, serverRole: membership.role,
         agentName: agent.name, displayName: agent.displayName ?? agent.name,
         jti, now,
@@ -100,7 +107,7 @@ export async function issueAgentAudienceJwt(input: { serverId: string; agentId: 
         target: { type: "oauth_grant", id: grant.id },
         metadata: { clientKey: client.clientId, grantId: grant.id, jti, expiresAt },
       });
-      return { access_token: token, token_type: "Bearer" as const, audience: client.clientId, expires_in: 300 as const, expires_at: expiresAt };
+      return { access_token: token, token_type: "Bearer" as const, audience: input.service, expires_in: 300 as const, expires_at: expiresAt };
     });
     agentJwtIssuanceCounter.inc({ client_id: metricClient, outcome: "issued", reason: "none" });
     return issued;

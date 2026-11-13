@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readdir, rm, symlink, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, rm, symlink, truncate, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
@@ -13,6 +13,7 @@ import {
 } from "./raftDiskJanitor";
 import {
   AGENT_MIGRATION_WORKSPACE_BACKUP_MAX_AGE_MS,
+  AGENT_MIGRATION_WORKSPACE_BACKUP_MAX_BYTES_PER_AGENT,
   AGENT_MIGRATION_WORKSPACE_BACKUP_MAX_PER_AGENT,
 } from "./agentMigrationWorkspaceArchive";
 
@@ -102,17 +103,17 @@ test("janitor clears only migration generations idle for over a week", async () 
   });
 });
 
-test("janitor applies the keep-3 / 30-day backup rule to every agent and reports each removal", async () => {
+test("janitor applies the keep-3 / 7-day backup rule to every agent and reports each removal", async () => {
   await withHome(async (home) => {
     const backups = path.join(home, "migration-workspace-backups");
-    // Agent A: one backup past 30 days, never migrated again.
+    // Agent A: one backup past the 7-day limit, never migrated again.
     await writeBytes(path.join(backups, "agent-a", "mig-1", "MEMORY.md"), 400);
     await age(path.join(backups, "agent-a", "mig-1"), AGENT_MIGRATION_WORKSPACE_BACKUP_MAX_AGE_MS + DAY_MS);
     // Agent B: four recent backups; the oldest is over the per-agent cap.
     for (let index = 0; index <= AGENT_MIGRATION_WORKSPACE_BACKUP_MAX_PER_AGENT; index += 1) {
       const name = index === 0 ? "preexisting-mig-0" : `mig-${index}`;
       await writeBytes(path.join(backups, "agent-b", name, "f"), 10);
-      await age(path.join(backups, "agent-b", name), (10 - index) * DAY_MS);
+      await age(path.join(backups, "agent-b", name), (5 - index) * DAY_MS);
     }
 
     const result = await runRaftDiskJanitor({ slockHome: home, now: NOW });
@@ -122,11 +123,89 @@ test("janitor applies the keep-3 / 30-day backup rule to every agent and reports
     assert.deepEqual(
       result.backupsRemoved.sort((left, right) => left.ownerAgentId.localeCompare(right.ownerAgentId)),
       [
-        { ownerAgentId: "agent-a", backupKind: "migration", ageDays: 31, freedBytes: 400 },
-        { ownerAgentId: "agent-b", backupKind: "preexisting", ageDays: 10, freedBytes: 10 },
+        { ownerAgentId: "agent-a", backupKind: "migration", ageDays: 8, freedBytes: 400 },
+        { ownerAgentId: "agent-b", backupKind: "preexisting", ageDays: 5, freedBytes: 10 },
       ],
     );
     assert.equal(result.backupsFreedBytes, 410);
+  });
+});
+
+test("janitor removes older backups once an agent's kept backups exceed the size cap, never the newest", async () => {
+  await withHome(async (home) => {
+    const backups = path.join(home, "migration-workspace-backups");
+    // Sparse files: apparent size is what the janitor measures.
+    const sparse = async (filePath: string, bytes: number): Promise<void> => {
+      await writeBytes(filePath, 0);
+      await truncate(filePath, bytes);
+    };
+    const cap = AGENT_MIGRATION_WORKSPACE_BACKUP_MAX_BYTES_PER_AGENT;
+    // Agent A: newest alone is over the cap; it stays, the two older go.
+    await sparse(path.join(backups, "agent-a", "mig-new", "big"), cap + 1);
+    await sparse(path.join(backups, "agent-a", "mig-mid", "f"), 1_000);
+    await sparse(path.join(backups, "agent-a", "mig-old", "f"), 2_000);
+    await age(path.join(backups, "agent-a", "mig-new"), 1 * DAY_MS);
+    await age(path.join(backups, "agent-a", "mig-mid"), 2 * DAY_MS);
+    await age(path.join(backups, "agent-a", "mig-old"), 3 * DAY_MS);
+    // Agent B: newest two fit together, the third would push past the cap.
+    await sparse(path.join(backups, "agent-b", "mig-1", "f"), cap / 2);
+    await sparse(path.join(backups, "agent-b", "mig-2", "f"), cap / 4);
+    await sparse(path.join(backups, "agent-b", "mig-3", "f"), cap / 2);
+    await age(path.join(backups, "agent-b", "mig-1"), 1 * DAY_MS);
+    await age(path.join(backups, "agent-b", "mig-2"), 2 * DAY_MS);
+    await age(path.join(backups, "agent-b", "mig-3"), 3 * DAY_MS);
+
+    const result = await runRaftDiskJanitor({ slockHome: home, now: NOW });
+
+    assert.deepEqual(await readdir(path.join(backups, "agent-a")), ["mig-new"]);
+    assert.deepEqual((await readdir(path.join(backups, "agent-b"))).sort(), ["mig-1", "mig-2"]);
+    assert.deepEqual(
+      result.backupsRemoved.sort((left, right) => left.ownerAgentId.localeCompare(right.ownerAgentId) || left.ageDays - right.ageDays),
+      [
+        { ownerAgentId: "agent-a", backupKind: "migration", ageDays: 2, freedBytes: 1_000 },
+        { ownerAgentId: "agent-a", backupKind: "migration", ageDays: 3, freedBytes: 2_000 },
+        { ownerAgentId: "agent-b", backupKind: "migration", ageDays: 3, freedBytes: cap / 2 },
+      ],
+    );
+    assert.equal(result.sweepOutcome, "complete");
+  });
+});
+
+test("once a backup goes for size, every older backup goes too, however small", async () => {
+  await withHome(async (home) => {
+    const backups = path.join(home, "migration-workspace-backups");
+    const cap = AGENT_MIGRATION_WORKSPACE_BACKUP_MAX_BYTES_PER_AGENT;
+    const sizes = [["mig-new", cap * 0.75], ["mig-mid", cap * 0.4], ["mig-old", 1_000]] as const;
+    for (const [index, [name, bytes]] of sizes.entries()) {
+      const file = path.join(backups, "agent-a", name, "f");
+      await writeBytes(file, 0);
+      await truncate(file, bytes);
+      await age(path.join(backups, "agent-a", name), (index + 1) * DAY_MS);
+    }
+
+    await runRaftDiskJanitor({ slockHome: home, now: NOW });
+
+    assert.deepEqual(await readdir(path.join(backups, "agent-a")), ["mig-new"]);
+  });
+});
+
+test("sizing large backups never starves the count / 7-day rule of other agents", async () => {
+  await withHome(async (home) => {
+    const backups = path.join(home, "migration-workspace-backups");
+    // Many small files: sizing these alone would use up the whole budget.
+    for (const name of ["mig-1", "mig-2", "mig-3"]) {
+      for (let file = 0; file < 20; file += 1) {
+        await writeBytes(path.join(backups, "agent-big", name, `f${file}`), 1);
+      }
+      await age(path.join(backups, "agent-big", name), DAY_MS);
+    }
+    await writeBytes(path.join(backups, "agent-old", "mig-1", "MEMORY.md"), 10);
+    await age(path.join(backups, "agent-old", "mig-1"), AGENT_MIGRATION_WORKSPACE_BACKUP_MAX_AGE_MS + DAY_MS);
+
+    await runRaftDiskJanitor({ slockHome: home, now: NOW, budget: createRaftDiskWalkBudget({ maxEntries: 5 }) });
+
+    assert.deepEqual(await readdir(path.join(backups, "agent-old")), []);
+    assert.equal((await readdir(path.join(backups, "agent-big"))).length, 3);
   });
 });
 

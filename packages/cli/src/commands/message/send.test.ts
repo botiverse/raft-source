@@ -134,6 +134,14 @@ test("typed mention selectors bind one actor type and id per visible handle", ()
   );
 });
 
+test("an anonymous search sender cannot be bound as a structured mention", () => {
+  for (const selector of ["human::Slack", "agent::Slack", "third_party_app::Slack"]) {
+    assert.throws(() => parseMentionSelector(selector),
+      (error: unknown) => error instanceof SendContentError && error.code === "INVALID_MENTION_SELECTOR");
+  }
+  assert.deepEqual(parseMentionSelectors(undefined), [], "a reply with no mention selector does not invent one");
+});
+
 test("resolveSendContent rejects empty stdin", async () => {
   await assert.rejects(
     () => resolveSendContent(Readable.from([])),
@@ -467,6 +475,17 @@ test("send-draft on an expired draft fails with SEND_DRAFT_EXPIRED, returns the 
   assert.deepEqual(lookupSavedDraft("agent-expired-draft", "#room"), { status: "missing" });
 });
 
+test("formatHeldSendOutput for a card alone offers sending nothing first, without the 'someone already answered' example", () => {
+  const out = formatHeldSendOutput("#ops", {
+    newMessageCount: 0,
+    heldMessages: [],
+    holdReasons: ["channel_card"],
+    channelCard: { id: "c-ops", name: "ops", type: "channel", description: "Release coordination." },
+  });
+  assert.match(String(out), /choose one path\.\nIf what you just read already says what you meant to say, or makes your message unnecessary, send nothing\. Delete the draft:\n {2}raft message send --discard-draft --target "#ops"\n/);
+  assert.doesNotMatch(String(out), /someone already answered/);
+});
+
 test("formatHeldSendOutput frames held context as bounded latest messages", () => {
   const out = formatHeldSendOutput("#room", {
     producerFactId: "freshness_decision_fact:cli-held-readout",
@@ -486,14 +505,20 @@ test("formatHeldSendOutput frames held context as bounded latest messages", () =
   // (never a seq span — seqs are server-global), stated with the exact
   // recovery command; no release announcement, no debt bookkeeping.
   assert.match(out, /43 earlier messages skipped in this notice\./);
-  assert.match(out, /Older exist: raft message read --target "#room" --before 4301\./);
+  assert.match(out, /Older: raft message read --target "#room" --before 4301 ⋯/);
   assert.doesNotMatch(out, /no longer block/);
   assert.doesNotMatch(out, /never shown to you/);
   assert.match(out, /├ Latest 3/);
   assert.match(out, /@alice.*forty four/);
-  assert.match(out, /Previews are truncated\. Full text: raft message read --target "#room"/);
+  // Every preview fits: no full-text command (nothing more to read there), the window just closes.
+  assert.doesNotMatch(out, /Previews are truncated/);
+  assert.match(out, /└ ─{40}\n/);
   assert.match(out, /After reviewing the current state of this conversation/);
-  assert.match(out, /You can also choose not to send anything\./);
+  // #wg-ax:#6: not sending comes first, with the command that deletes the draft.
+  assert.match(
+    out,
+    /choose one path\.\nIf what you just read already says what you meant to say \(for example, someone already answered\), or makes your message unnecessary, send nothing\. Delete the draft:\n {2}raft message send --discard-draft --target "#room"\nOtherwise, to update the draft/,
+  );
   assert.doesNotMatch(out, /dismiss-draft/);
   assert.doesNotMatch(out, /[一-鿿]/);
   // The lineage note is no longer rendered to the agent (task #263): it named the
@@ -617,11 +642,10 @@ test("formatHeldSendOutput renders canonical agent-visible message fields", () =
     ],
   });
 
-  // Task #41 digest: one truncated preview line per message — sender + body
-  // head; the full canonical rendering lives behind the read command instead
-  // of being injected wholesale.
+  // Task #41 digest: one preview line per message — sender + body head. A
+  // short body is whole, so no read command follows (nothing left out).
   assert.match(out, /@tygg.*recent context/);
-  assert.match(out, /Previews are truncated\. Full text: raft message read --target "dm:@tygg"/);
+  assert.doesNotMatch(out, /Previews are truncated/);
   assert.doesNotMatch(out, /@unknown/);
 });
 
@@ -1461,7 +1485,9 @@ test("freshness hold recovery sends the saved draft with open empty non-TTY stdi
   let sendCount = 0;
   let recoveryStdin: PassThrough | undefined;
   const createApiClient = () => ({
-    request: async (_method: string, _path: string, body?: Record<string, unknown>) => {
+    request: async (_method: string, path: string, body?: Record<string, unknown>) => {
+      // The held send reads the agent context for the continuation pilot flag; this Server has none.
+      if (path === "/internal/agent-api/context") return { ok: false, status: 404, error: "not found", data: null };
       effects.push("api");
       bodies.push(body ?? {});
       sendCount += 1;
@@ -2604,23 +2630,8 @@ test("send renders pending mention actions only on sent responses", async () => 
     }),
   }) as never;
 
-  await assert.rejects(
-    async () => messageSendCommand.handler(ctx, [], { target: "#room" }),
-    (err: unknown) => {
-      assert.ok(err instanceof CliError);
-      assert.equal(err.code, "MENTION_DELIVERY_FAILED");
-      assert.equal(err.effect, "message_queued");
-      assert.equal(err.retryable, false);
-      assert.equal(err.draftSaved, false);
-      assert.match(err.message, /message-1/);
-      assert.match(err.message, /status=queued/);
-      assert.match(err.message, /status=not_queued/);
-      assert.match(err.suggestedNextAction ?? "", new RegExp(`raft mention notify ${PENDING_ACTION_ID}`));
-      assert.match(err.suggestedNextAction ?? "", /message is already queued/);
-      assert.doesNotMatch(err.suggestedNextAction ?? "", /raft message send/);
-      return true;
-    },
-  );
+  // The message is committed, so a partial result exits 0.
+  await messageSendCommand.handler(ctx, [], { target: "#room" });
 
   const out = stdout.join("");
   assert.equal(stdout.length, 1, "the partial result and queued receipt must use one deterministic buffer");
@@ -2716,18 +2727,8 @@ test("send-draft mention partial reports queued effect and no retained draft", a
     },
   }) as never;
 
-  await assert.rejects(
-    async () => messageSendCommand.handler(ctx, [], { target: "#room", sendDraft: true }),
-    (err: unknown) => {
-      assert.ok(err instanceof CliError);
-      assert.equal(err.code, "MENTION_DELIVERY_FAILED");
-      assert.equal(err.effect, "message_queued");
-      assert.equal(err.retryable, false);
-      assert.equal(err.draftSaved, false);
-      assert.match(err.suggestedNextAction ?? "", /Do not resend the queued message/);
-      return true;
-    },
-  );
+  // The message is committed, so a partial result exits 0.
+  await messageSendCommand.handler(ctx, [], { target: "#room", sendDraft: true });
 
   assert.equal(bodies.length, 1);
   assert.equal(bodies[0]?.sendDraft, true);
@@ -2757,24 +2758,8 @@ test("send warns when an authored mention resolved to no visible target", async 
     }),
   }) as never;
 
-  await assert.rejects(
-    async () => messageSendCommand.handler(ctx, [], { target: "#room" }),
-    (err: unknown) => {
-      assert.ok(err instanceof CliError);
-      assert.equal(err.code, "MENTION_DELIVERY_FAILED");
-      assert.equal(err.effect, "message_queued");
-      assert.equal(err.retryable, false);
-      assert.equal(err.draftSaved, false);
-      assert.match(err.message, /message-unresolved/);
-      assert.match(err.message, /1 @mention status=not_queued/);
-      assert.match(err.suggestedNextAction ?? "", /literal prose/);
-      assert.match(err.suggestedNextAction ?? "", /verify the exact handle/);
-      assert.match(err.suggestedNextAction ?? "", /send only a corrected follow-up mention/);
-      assert.match(err.suggestedNextAction ?? "", /Do not resend the queued message/);
-      assert.doesNotMatch(err.suggestedNextAction ?? "", /raft mention notify|raft message send/);
-      return true;
-    },
-  );
+  // The message is committed, so a partial result exits 0.
+  await messageSendCommand.handler(ctx, [], { target: "#room" });
 
   const out = stdout.join("");
   assert.equal(stdout.length, 1);
@@ -2786,6 +2771,28 @@ test("send warns when an authored mention resolved to no visible target", async 
   assert.match(out, /literal name or prose/);
   assert.match(out, /Message queued to #room\. Message ID: message-unresolved/);
   assert.doesNotMatch(out, /Message sent|raft mention notify/);
+  assert.equal(stderr.join(""), "");
+});
+
+test("send names the agents the message was delivered to, under the sent line", async () => {
+  process.env.SLOCK_CLI_CONSUMED_SEQ_STATE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "slock-cli-consumed-delivered-"));
+  process.env.SLOCK_CLI_DRAFT_STATE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "slock-cli-drafts-delivered-"));
+  recordConsumedSeqs("agent-send-attest", { "#room": 77 });
+
+  const { ctx, stdout, stderr } = sendHarness();
+  ctx.createApiClient = () => ({
+    request: async () => ({
+      ok: true,
+      status: 200,
+      error: null,
+      data: { ok: true, state: "sent", messageId: "message-delivered-1", deliveredToAgents: ["Archer", "Otter"] },
+    }),
+  }) as never;
+
+  await messageSendCommand.handler(ctx, [], { target: "#room" });
+
+  assert.match(stdout.join(""), /^Message sent to #room\. Message ID: message-delivered-1\. Thread: "#room:message-"\nDelivered to 2 agents: Archer, Otter\.\n/);
+  assert.doesNotMatch(stdout.join(""), /@Archer|@Otter/);
   assert.equal(stderr.join(""), "");
 });
 
@@ -2817,49 +2824,32 @@ test("send --json exposes layered message and mention effects without an extra w
     }),
   }) as never;
 
-  await assert.rejects(
-    async () => messageSendCommand.handler(ctx, [], { target: "#room", json: true }),
-    (err: unknown) => {
-      assert.ok(err instanceof CliError);
-      assert.equal(err.code, "MENTION_DELIVERY_FAILED");
-      assert.equal(err.effect, "message_queued");
-      assert.equal(err.retryable, false);
-      assert.equal(err.draftSaved, false);
-      assert.equal(err.outputMode, "json");
-      assert.match(err.message, /message-json/);
-      assert.match(err.suggestedNextAction ?? "", new RegExp(`raft mention notify ${PENDING_ACTION_ID}`));
-      assert.match(err.suggestedNextAction ?? "", /message is already queued/);
-      assert.doesNotMatch(err.suggestedNextAction ?? "", /raft message send/);
-      assert.deepEqual(err.details, {
-        result: {
-          ok: true,
-          state: "partial",
-          messageId: "message-json",
-          message: {
-            status: "queued",
-            id: "message-json",
-          },
-          pendingMentionActions: [{
-            resolutionId: PENDING_ACTION_ID,
-            messageId: "message-json",
-            targetHandle: "@Noel",
-            status: "not_queued",
-            reason: "not_in_conversation",
-            consequence: "This @mention did not notify anyone.",
-            expiresAt: "2026-07-29T05:13:06.368Z",
-            recoveryCommand: `raft mention notify ${PENDING_ACTION_ID}`,
-          }],
-        },
-      });
-      return true;
+  // A partial result exits 0 with the partial payload on stdout.
+  await messageSendCommand.handler(ctx, [], { target: "#room", json: true });
+  assert.deepEqual(JSON.parse(stdout.join("")), {
+    ok: true,
+    state: "partial",
+    messageId: "message-json",
+    message: {
+      status: "queued",
+      id: "message-json",
     },
-  );
+    pendingMentionActions: [{
+      resolutionId: PENDING_ACTION_ID,
+      messageId: "message-json",
+      targetHandle: "@Noel",
+      status: "not_queued",
+      reason: "not_in_conversation",
+      consequence: "This @mention did not notify anyone.",
+      expiresAt: "2026-07-29T05:13:06.368Z",
+      recoveryCommand: `raft mention notify ${PENDING_ACTION_ID}`,
+    }],
+  });
 
   assert.equal(stderr.join(""), "");
-  assert.equal(stdout.join(""), "");
 });
 
-test("send --json mention partial renders one queued-effect error envelope", async () => {
+test("send --json mention partial exits 0 with one partial-result document", async () => {
   process.env.SLOCK_CLI_CONSUMED_SEQ_STATE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "slock-cli-consumed-mention-json-envelope-"));
   process.env.SLOCK_CLI_DRAFT_STATE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "slock-cli-drafts-mention-json-envelope-"));
   const stdout: string[] = [];
@@ -2902,25 +2892,19 @@ test("send --json mention partial renders one queued-effect error envelope", asy
     }) as never,
   });
 
-  await assert.rejects(
-    () => program.parseAsync(["node", "raft", "send", "--json", "--target", "#room"]),
-    /CliExit\(1\)/,
-  );
+  await program.parseAsync(["node", "raft", "send", "--json", "--target", "#room"]);
 
-  assert.equal(stdout.join(""), "");
-  const rendered = stderr.join("");
-  assert.equal(rendered.trim().split("\n").length, 1, "JSON error mode must render one document");
+  assert.equal(stderr.join(""), "");
+  const rendered = stdout.join("");
+  assert.equal(rendered.trim().split("\n").length, 1, "JSON mode must render one document");
   const parsed = JSON.parse(rendered);
-  assert.equal(parsed.ok, false);
-  assert.equal(parsed.error.code, "MENTION_DELIVERY_FAILED");
-  assert.equal(parsed.error.effect, "message_queued");
-  assert.equal(parsed.error.retryable, false);
-  assert.deepEqual(parsed.details.result.message, {
+  assert.equal(parsed.state, "partial");
+  assert.deepEqual(parsed.message, {
     status: "queued",
     id: "message-json-envelope",
   });
-  assert.equal(parsed.details.result.pendingMentionActions[0].reason, "not_in_conversation");
-  assert.equal(parsed.details.result.pendingMentionActions[0].recoveryCommand, `raft mention notify ${PENDING_ACTION_ID}`);
+  assert.equal(parsed.pendingMentionActions[0].reason, "not_in_conversation");
+  assert.equal(parsed.pendingMentionActions[0].recoveryCommand, `raft mention notify ${PENDING_ACTION_ID}`);
 });
 
 test("send --json exposes unresolved mention warnings as a partial result", async () => {
@@ -2943,42 +2927,29 @@ test("send --json exposes unresolved mention warnings as a partial result", asyn
     }),
   }) as never;
 
-  await assert.rejects(
-    async () => messageSendCommand.handler(ctx, [], { target: "#room", json: true }),
-    (err: unknown) => {
-      assert.ok(err instanceof CliError);
-      assert.equal(err.code, "MENTION_DELIVERY_FAILED");
-      assert.equal(err.effect, "message_queued");
-      assert.equal(err.retryable, false);
-      assert.equal(err.draftSaved, false);
-      assert.equal(err.outputMode, "json");
-      assert.deepEqual(err.details, {
-        result: {
-          ok: true,
-          state: "partial",
-          messageId: "message-unresolved-json",
-          unresolvedMentionHandles: ["@wenyi"],
-          message: {
-            status: "queued",
-            id: "message-unresolved-json",
-          },
-          pendingMentionActions: [],
-          unresolvedMentionWarnings: [{
-            targetHandle: "@wenyi",
-            status: "not_queued",
-            reason: "unknown_or_not_visible",
-            consequence: "This @mention did not notify anyone.",
-            expiresAt: null,
-            recoveryCommand: null,
-          }],
-        },
-      });
-      return true;
+  // A partial result exits 0 with the partial payload on stdout.
+  await messageSendCommand.handler(ctx, [], { target: "#room", json: true });
+  assert.deepEqual(JSON.parse(stdout.join("")), {
+    ok: true,
+    state: "partial",
+    messageId: "message-unresolved-json",
+    unresolvedMentionHandles: ["@wenyi"],
+    message: {
+      status: "queued",
+      id: "message-unresolved-json",
     },
-  );
+    pendingMentionActions: [],
+    unresolvedMentionWarnings: [{
+      targetHandle: "@wenyi",
+      status: "not_queued",
+      reason: "unknown_or_not_visible",
+      consequence: "This @mention did not notify anyone.",
+      expiresAt: null,
+      recoveryCommand: null,
+    }],
+  });
 
   assert.equal(stderr.join(""), "");
-  assert.equal(stdout.join(""), "");
 });
 
 test("send renders recent-join first-post mute tip on sent responses", async () => {
@@ -3453,4 +3424,103 @@ test("5xx guidance is only attached when a draft was actually saved", () => {
   const notSaved = markSendFailureDraftSaved(new Error("boom"), false);
   assert.ok(notSaved instanceof CliError);
   assert.equal(notSaved.suggestedNextAction, undefined);
+});
+
+test("a send over the message budget (429 RATE_LIMITED): nothing sent, the draft kept, how long to wait and the command that sends it", async () => {
+  process.env.SLOCK_CLI_CONSUMED_SEQ_STATE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "slock-cli-consumed-send-rate-limited-"));
+  process.env.SLOCK_CLI_DRAFT_STATE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "slock-cli-drafts-send-rate-limited-"));
+  const body = {
+    error: "This agent sent too many messages: the limit is 60 a minute. Retry in 23 seconds.",
+    code: "RATE_LIMITED",
+    details: { operation: "messages.sendV2", limit: 60, windowSeconds: 60, retryAfterSeconds: 23 },
+  };
+  const stdout: string[] = [];
+  const stderr: string[] = [];
+  const io = {
+    stdin: Readable.from(["send body\n"]),
+    stdout: { write: (chunk: string | Uint8Array) => { stdout.push(String(chunk)); return true; } },
+    stderr: { write: (chunk: string | Uint8Array) => { stderr.push(String(chunk)); return true; } },
+  } as never;
+  const program = new Command();
+  program.exitOverride();
+  registerCliCommand(program, messageSendCommand, {
+    io,
+    env: {},
+    loadAgentContext: () => ({
+      agentId: "agent-send-rate-limited",
+      serverUrl: "http://stub.local",
+      clientMode: "self-hosted-runner",
+      profileSlug: "t",
+    }) as never,
+    createApiClient: () => ({
+      request: async (_method: string, requestPath: string) => {
+        if (requestPath === "/internal/agent-api/context") return { ok: false, status: 404, error: "not found", data: null };
+        return { ok: false, status: 429, error: body.error, errorCode: "RATE_LIMITED", data: null, errorBody: body };
+      },
+    }) as never,
+  });
+
+  await assert.rejects(
+    () => program.parseAsync(["node", "raft", "send", "--target", "#room"]),
+    /CliExit\(1\)/,
+  );
+
+  assert.deepEqual(stdout, []);
+  const rendered = stderr.join("");
+  assert.match(rendered, /Error: This agent sent too many messages: the limit is 60 a minute\. Retry in 23 seconds\./);
+  assert.match(rendered, /Code: RATE_LIMITED/);
+  assert.match(rendered, /Retryable: yes/);
+  assert.match(rendered, /Draft saved: yes/);
+  assert.match(rendered, /Nothing was sent; your message is saved as a draft\. Wait 23 seconds, then send it:\nraft message send --send-draft --target "#room"/);
+  assert.doesNotMatch(rendered, /UNKNOWN/);
+  assert.equal(getSavedDraft("agent-send-rate-limited", "#room")?.content, "send body\n");
+});
+
+test("a reviewer-isolation send over the message budget: the draft kept, and the send-draft command bound to this send's key", async () => {
+  process.env.SLOCK_CLI_CONSUMED_SEQ_STATE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "slock-cli-consumed-send-rate-limited-ri-"));
+  process.env.SLOCK_CLI_DRAFT_STATE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "slock-cli-drafts-send-rate-limited-ri-"));
+  const body = {
+    error: "This agent sent too many messages: the limit is 60 a minute. Retry in 7 seconds.",
+    code: "RATE_LIMITED",
+    details: { operation: "messages.sendV2", limit: 60, windowSeconds: 60, retryAfterSeconds: 7 },
+  };
+  const ctx = createCommandContext({
+    io: {
+      stdin: Readable.from(["independent verdict\n"]),
+      stdout: { write: () => true },
+      stderr: { write: () => true },
+    } as never,
+    env: {},
+    loadAgentContext: () => ({
+      agentId: "agent-reviewer-rate-limited",
+      serverUrl: "http://stub.local",
+      clientMode: "self-hosted-runner",
+      profileSlug: "t",
+    }) as never,
+    createApiClient: () => ({
+      request: async (_method: string, requestPath: string) => {
+        if (requestPath === "/internal/agent-api/context") return { ok: false, status: 404, error: "not found", data: null };
+        return { ok: false, status: 429, error: body.error, errorCode: "RATE_LIMITED", data: null, errorBody: body };
+      },
+    }) as never,
+  });
+
+  await assert.rejects(
+    async () => {
+      await Promise.resolve(messageSendCommand.handler(ctx, [], { target: "#reviews:blind", reviewerIsolation: true }));
+    },
+    (err: unknown) => {
+      assert.ok(err instanceof CliError);
+      assert.equal(err.code, "RATE_LIMITED");
+      assert.equal(err.retryable, true);
+      assert.equal(err.draftSaved, true);
+      const key = getSavedDraft("agent-reviewer-rate-limited", "#reviews:blind")?.idempotencyKey;
+      assert.ok(key);
+      assert.equal(
+        err.suggestedNextAction,
+        `Nothing was sent; your message is saved as a draft. Wait 7 seconds, then send it:\nraft message send --reviewer-isolation --send-draft --expected-draft-key "${key}" --target "#reviews:blind"`,
+      );
+      return true;
+    },
+  );
 });

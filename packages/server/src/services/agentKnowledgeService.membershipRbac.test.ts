@@ -38,7 +38,7 @@ test("the documented channel-admin capability set equals the implementation's cl
   // acts and is refused, or worse, asks a human to grant a role that cannot
   // help. These identifiers are server-level only, so the topic must not name
   // them as things a channel role grants.
-  for (const notGranted of ["deleteChannels", "changeChannelVisibility", "federateChannels"]) {
+  for (const notGranted of ["deleteChannels", "changeChannelVisibility", "manageVisitorAccess", "federateChannels"]) {
     assert.ok(
       !CHANNEL_ADMIN_CAPABILITIES.includes(notGranted as never),
       `${notGranted} must stay out of the channel-admin set`,
@@ -97,9 +97,12 @@ test("the add-member rule documents Guest as a shipped but non-manageable role",
   // can already be selected by the role-management UI.
   assert.deepEqual([...MANAGEABLE_SERVER_ROLES], ["owner", "admin", "member"]);
 
+  // The body names no Guest (cindyz 2026-11-05, #proj-docs msg bbc1e8c5); it
+  // used to pass only through `manageGuestAccess`, which left the channel-admin
+  // set (#wg-rbac:#51). The predicate below still pins the Guest denial.
   const doc = await resolveAgentKnowledgeDoc("membership");
   assert.ok(doc);
-  assert.match(doc.content, /guest/i, "the topic must document the shipped Guest role");
+  assert.doesNotMatch(doc.content, /`guest`/, "the topic does not offer Guest as a manageable role");
   for (const role of MANAGEABLE_SERVER_ROLES) {
     assert.match(doc.content, new RegExp("`" + role + "`"), `the topic must name the ${role} role`);
   }

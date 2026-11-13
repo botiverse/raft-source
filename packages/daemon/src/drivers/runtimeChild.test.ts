@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import type { ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { logger } from "../logger";
-import { guardRuntimeChild, takeEarlyChildEvents } from "./runtimeChild";
+import { AGENT_STOP_KILL_GRACE_MS } from "./processStop";
+import { guardRuntimeChild, runtimeChildProcessGroupOptions, takeEarlyChildEvents } from "./runtimeChild";
 
 type FakeChild = ChildProcess & EventEmitter & { kills: string[] };
 
@@ -46,7 +47,10 @@ test("task #366: a child no session takes over is abandoned: logged, output drop
   assert.equal(warn.mock.calls.length, 1);
   assert.match(String(warn.mock.calls[0]![0]), /abandoning .*not taken over within 10000ms.*errors=EACCES/);
   assert.deepEqual(child.kills, ["SIGTERM"]);
-  vi.advanceTimersByTime(5_000);
+  // Reconciler step 5: the one stop grace (was a separate 5 s here).
+  vi.advanceTimersByTime(AGENT_STOP_KILL_GRACE_MS - 1);
+  assert.deepEqual(child.kills, ["SIGTERM"]);
+  vi.advanceTimersByTime(1);
   assert.deepEqual(child.kills, ["SIGTERM", "SIGKILL"], "still alive after SIGTERM: SIGKILL");
 
   out(child).emit("data", Buffer.from("more"));
@@ -83,4 +87,23 @@ test("task #366: a child handed over in time is never abandoned, and the hand-of
   vi.advanceTimersByTime(60_000);
   assert.equal(warn.mock.calls.length, 0);
   assert.deepEqual(child.kills, []);
+});
+
+test("reconciler step 5: an abandoned child's SIGKILL takes its tree (its process group)", () => {
+  vi.useFakeTimers();
+  vi.spyOn(logger, "warn").mockImplementation(() => {});
+  const child = fakeChild();
+  const trees: number[] = [];
+  guardRuntimeChild(child, { killTree: (pid) => void trees.push(pid) });
+
+  vi.advanceTimersByTime(10_000 + AGENT_STOP_KILL_GRACE_MS);
+
+  assert.deepEqual(trees, [4242]);
+  assert.deepEqual(child.kills, ["SIGTERM", "SIGKILL"]);
+});
+
+test("reconciler step 5: runtime children lead their own process group on POSIX; Windows keeps the console (taskkill /T walks the tree)", () => {
+  assert.deepEqual(runtimeChildProcessGroupOptions("linux"), { detached: true });
+  assert.deepEqual(runtimeChildProcessGroupOptions("darwin"), { detached: true });
+  assert.deepEqual(runtimeChildProcessGroupOptions("win32"), { detached: false });
 });

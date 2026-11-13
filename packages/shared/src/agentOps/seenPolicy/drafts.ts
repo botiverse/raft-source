@@ -4,19 +4,42 @@
 // counter and the seen snapshot (sparse exact seqs) it was held with.
 
 import { agentApiStructuredMentionSchema, type AgentApiStructuredMention } from "../../agentApiMessageContract";
-import type { CommandStateStore, MaybePromise } from "./store";
+import type { MessageCardInput } from "../../messageCard";
+import type { MaybePromise } from "../../maybePromise";
+import type { CommandStateStore } from "./store";
 import { normalizeExactSeqs } from "./consumedSeqs";
 import { andThen } from "./maybe";
+
+/**
+ * Why a draft is waiting: the server held its send (`held`), or the CLI asked
+ * to confirm a top-level target after a thread was read (`thread_confirmation`).
+ * A draft saved without one (older CLIs) is a held one.
+ */
+export type SavedDraftCause = "held" | "thread_confirmation";
+
+const SAVED_DRAFT_CAUSES: ReadonlySet<string> = new Set<SavedDraftCause>(["held", "thread_confirmation"]);
+
+/** A stored cause, or undefined when absent or not one this version knows. */
+export function savedDraftCauseOf(value: unknown): SavedDraftCause | undefined {
+  return typeof value === "string" && SAVED_DRAFT_CAUSES.has(value) ? value as SavedDraftCause : undefined;
+}
 
 export interface SavedDraft {
   content: string;
   attachmentIds: string[];
   idempotencyKey?: string;
   mentions?: AgentApiStructuredMention[];
+  /**
+   * RFC 082: the card a card message was sent with (`raft message send
+   * --card`), as the sender wrote it; `content` is then its fallback and may
+   * be empty. Sending the draft sends the card again.
+   */
+  card?: MessageCardInput;
   savedAt: number;
   reholdCount: number;
   seenUpToSeq?: number;
   seenExactSeqs?: number[];
+  cause?: SavedDraftCause;
 }
 
 /**
@@ -52,6 +75,9 @@ export function lookupSavedDraft(store: CommandStateStore, target: string, now: 
     const idempotencyKey = typeof draft.idempotencyKey === "string" && draft.idempotencyKey.trim().length > 0
       ? draft.idempotencyKey.trim()
       : undefined;
+    const cause = savedDraftCauseOf(draft.cause);
+    // The CLI checked the card before saving it, and the Server checks it again at send.
+    const card = draft.card && typeof draft.card === "object" && !Array.isArray(draft.card) ? draft.card as MessageCardInput : undefined;
     if (now() - savedAt > DEFAULT_LOCAL_DRAFT_TTL_MS) {
       const expired: SavedDraftLookup = { status: "expired", savedAt, content: draft.content };
       // Keyed on savedAt: a fresher draft a concurrent send just saved survives.
@@ -74,10 +100,12 @@ export function lookupSavedDraft(store: CommandStateStore, target: string, now: 
         attachmentIds,
         ...(idempotencyKey ? { idempotencyKey } : {}),
         ...(mentions && mentions.length > 0 ? { mentions } : {}),
+        ...(card ? { card } : {}),
         savedAt,
         reholdCount,
         seenUpToSeq,
         ...(seenExactSeqs.length > 0 ? { seenExactSeqs } : {}),
+        ...(cause ? { cause } : {}),
       },
     };
   });
@@ -94,10 +122,12 @@ export function setSavedDraft(store: CommandStateStore, target: string, draft: S
     attachmentIds: draft.attachmentIds,
     ...(draft.idempotencyKey ? { idempotencyKey: draft.idempotencyKey } : {}),
     ...(draft.mentions && draft.mentions.length > 0 ? { mentions: draft.mentions } : {}),
+    ...(draft.card ? { card: draft.card } : {}),
     savedAt: draft.savedAt,
     reholdCount: draft.reholdCount,
     ...(draft.seenUpToSeq !== undefined ? { seenUpToSeq: draft.seenUpToSeq } : {}),
     ...(seenExactSeqs.length > 0 ? { seenExactSeqs } : {}),
+    ...(draft.cause ? { cause: draft.cause } : {}),
   });
 }
 

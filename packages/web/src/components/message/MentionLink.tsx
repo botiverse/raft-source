@@ -1,18 +1,18 @@
 import { useContext, useRef, useCallback } from "react";
 import type { ReactNode } from "react";
 import { IntlContext } from "react-intl";
-import { MessageReferenceText, PreviewCard, PreviewCardContent, PreviewCardTrigger } from "@botiverse/raft-ui";
+import { MessageReferenceReadMark, MessageReferenceText, PreviewCard, PreviewCardContent, PreviewCardTrigger } from "@botiverse/raft-ui";
 import type { ExternalMessageAuthorProjection } from "@botiverse/raft-shared";
-import { en } from "../../i18n/messages/en";
+import { enFallback } from "../../i18n/messages/enFallback";
 import { useAuthStore } from "../../store/authStore";
+import { useAgentStore } from "../../store/agentStore";
 import type { Agent } from "../../store/agentStore";
 import { useReadReceiptStore } from "../../store/readReceiptStore";
 import { projectAgentReadReceipt } from "../../store/readReceiptDomain";
 import type { ServerMember } from "../../store/serverStore";
 import type { ChannelExternalMember } from "../../hooks/useChannelMembers";
-import ProfilePreviewCardContent from "./ProfilePreviewCardContent";
+import ProfilePreviewCardContent from "./DeferredProfilePreviewCardContent";
 import { ExternalIdentityPreviewBody } from "./ExternalIdentityPreviewCard";
-import Tooltip from "../ui/Tooltip";
 import { useMessageReadReceiptScope } from "./messageReadReceiptScope";
 
 interface MentionLinkProps {
@@ -36,11 +36,15 @@ interface MentionLinkProps {
    *  panel via `useProfileStore.openExternalProfile` (same flow a Slack-
    *  authored message avatar uses). */
   onNavigateExternal?: (profile: ExternalMessageAuthorProjection) => void;
+  /** Draw a mention of the person reading as the yellow "you" sticker (default).
+   *  False: bold ink like anyone else's, for text that names people rather than
+   *  mentioning them (an action card's values). */
+  highlightSelf?: boolean;
 }
 
-export default function MentionLink({ mentionType, mentionId, onNavigate, onNavigateAgent, onNavigateHuman, onNavigateExternal, children, fallbackLabel, fallbackAgent, fallbackMember, fallbackExternal }: MentionLinkProps) {
+export default function MentionLink({ mentionType, mentionId, onNavigate, onNavigateAgent, onNavigateHuman, onNavigateExternal, children, fallbackLabel, fallbackAgent, fallbackMember, fallbackExternal, highlightSelf = true }: MentionLinkProps) {
   const viewerUserId = useAuthStore((s) => s.user?.id ?? null);
-  const isSelfMention = mentionType === "user" && viewerUserId === mentionId;
+  const isSelfMention = highlightSelf && mentionType === "user" && viewerUserId === mentionId;
   const previewActionsRef = useRef<{ close: () => void; unmount: () => void } | null>(null);
   const handleNavigate = useCallback(() => {
     if (onNavigate) {
@@ -65,7 +69,12 @@ export default function MentionLink({ mentionType, mentionId, onNavigate, onNavi
   // #693: read state for THIS agent on THIS message. Only agent mentions carry
   // a badge; human read state is deliberately not surfaced (artin 2026-07-27).
   const readScope = useMessageReadReceiptScope();
-  const agentReadEligible = mentionType === "agent" && !!readScope?.enabled;
+  // App-owned bots carry no read semantics a sender can act on — the badge's
+  // "has this agent seen it" question has no operational answer for them, so
+  // the mention renders without the corner mark (yezizp, 2026-10-21).
+  const mentionedAgent = useAgentStore((s) => (mentionType === "agent" ? s.agents.find((a) => a.id === mentionId) : undefined));
+  const isManagedBot = Boolean((mentionedAgent ?? fallbackAgent)?.managedByAppInstallId);
+  const agentReadEligible = mentionType === "agent" && !!readScope?.enabled && !isManagedBot;
   // Select a PRIMITIVE: returning `{read}` here would hand useSyncExternalStore a
   // fresh object every render and loop forever ("Maximum update depth exceeded").
   const agentReadState = useReadReceiptStore((state): "read" | "unread" | "unknown" => {
@@ -78,32 +87,24 @@ export default function MentionLink({ mentionType, mentionId, onNavigate, onNavi
     if (projected === null) return "unknown";
     return projected.read ? "read" : "unread";
   });
-  // "unknown" = summary-only scope, not hydrated, or not a peer. Render nothing
-  // rather than implying "unread".
-  const readLabelId = agentReadState === "read"
-    ? "message.mention.agentRead"
-    : "message.mention.agentUnread";
-  const readLabel = intl?.formatMessage({ id: readLabelId }) ?? en[readLabelId];
-  const readBadge = agentReadState === "unknown"
-    ? null
-    : (
-      <Tooltip content={readLabel}>
-      <span
-        data-mention-read-state={agentReadState}
-        data-testid={`mention-read-${mentionId}`}
-        aria-label={readLabel}
-        // The mention is inline text, so the span's box top sits well above the
-        // glyphs (line-height), which made a `-top-1` badge read as floating
-        // above the row rather than sitting on the mention's corner. Anchor it
-        // down onto the corner and slightly further right (artin, 7-28).
-        // A DS square pixel (radius 2, ink edge): lime once read, a white
-        // sticker until then.
-        className={`pointer-events-none absolute -right-1.5 top-0 size-2 shrink-0 rounded-[2px] border-[1.5px] border-sticker-ink ${
- agentReadState === "read" ? "bg-success" : "bg-sticker-paper"
- }`}
-      />
-      </Tooltip>
-    );
+  // "unknown" = summary-only scope, not hydrated, or not a peer: the card says
+  // nothing rather than implying "Not read yet".
+  // A read mention carries raft-ui's read mark at its top right: a bare lime
+  // check, no light and no box. An unread one shows nothing, and its hover
+  // card says "Not read yet" (message-item.md, "Read receipts on a mention",
+  // raft-ui 0.34).
+  const readLabel = intl?.formatMessage({ id: "message.mention.agentRead" }) ?? enFallback["message.mention.agentRead"];
+  const mentionContent = agentReadState === "read"
+    ? (
+      <>
+        {children}
+        <MessageReferenceReadMark data-testid={`mention-read-${mentionId}`} data-mention-read-state="read">
+          {readLabel}
+        </MessageReferenceReadMark>
+      </>
+    )
+    : children;
+  const readReceipt = agentReadState === "unknown" ? undefined : agentReadState;
 
   // External (provider-side) mentions carry no Raft principal, but hover and
   // click follow the same affordances as @human/@agent (yezizp): hover shows
@@ -160,7 +161,7 @@ export default function MentionLink({ mentionType, mentionId, onNavigate, onNavi
     );
   }
 
-  const trigger = (
+  return (
     <PreviewCard actionsRef={previewActionsRef}>
       <PreviewCardTrigger
         delay={200}
@@ -168,13 +169,12 @@ export default function MentionLink({ mentionType, mentionId, onNavigate, onNavi
         render={(
           <MessageReferenceText
             variant={isSelfMention ? "primary" : "secondary"}
-            className="cursor-default"
-            render={<a href="#">{children}</a>}
+            render={<a href="#">{mentionContent}</a>}
           />
         )}
         onClick={handleTriggerClick}
       >
-        {children}
+        {mentionContent}
       </PreviewCardTrigger>
       <PreviewCardContent sideOffset={6} collisionPadding={6}>
         <ProfilePreviewCardContent
@@ -183,23 +183,9 @@ export default function MentionLink({ mentionType, mentionId, onNavigate, onNavi
           fallbackLabel={fallbackLabel}
           fallbackAgent={fallbackAgent}
           fallbackMember={fallbackMember}
+          readReceipt={readReceipt}
         />
       </PreviewCardContent>
     </PreviewCard>
-  );
-
-  if (!readBadge) return trigger;
-
-  // The badge hangs off the mention's own top-right corner, so it travels with
-  // the token as the markdown line wraps.
-  return (
-    // `mr-2` reserves the badge's own width. The badge is absolutely positioned
-    // so it contributes no layout, and without this the following word collides
-    // with it. This wrapper only renders when a badge exists, so unbadged
-    // mentions keep their natural spacing.
-    <span className="relative mr-2 inline-block align-baseline">
-      {trigger}
-      {readBadge}
-    </span>
   );
 }

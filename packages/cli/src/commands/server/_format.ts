@@ -33,7 +33,7 @@ type PageInfo = AgentPageInfo;
 
 export const formatServerInfo = axSurface(
   "Server overview: runtime context, channels, agents, humans.",
-  (data: ServerData): string => formatAgentServerInfo(data),
+  (data: ServerData, now?: number): string => formatAgentServerInfo(data, "cli", now),
   {
     examples: [{ args: [{ serverRole: "member", runtimeContext: { agentId: "00000000-0000-0000-0000-000000000001", runtime: "claude", model: "claude-fable-5", daemonVersion: "1.0.23" }, channels: [sampleChannel, { id: "c-2", name: "private-x", joined: false, type: "private", description: null }], agents: [sampleAgentInfo], humans: [sampleHumanInfo] }] }],
   },
@@ -57,9 +57,21 @@ export const formatServerSummary = axSurface(
 
 export const formatServerChannels = axSurface(
   "Channel listing page.",
-  (channels: ChannelInfo[], page?: PageInfo): string => formatAgentServerChannels(channels, page),
+  (channels: ChannelInfo[], page?: PageInfo, now?: number, archivedNotShown?: { count: number; listCommand: string }): string =>
+    formatAgentServerChannels(channels, page, now, archivedNotShown),
   {
-    examples: [{ args: [[sampleChannel, { id: "c-3", name: "old-things", joined: true, type: "channel", archived: true, muted: true }]] }],
+    examples: [
+      {
+        args: [[sampleChannel], { total: 1, offset: 0, limit: 50 }, undefined, { count: 2, listCommand: "raft server info --channels --archived" }],
+      },
+      { args: [[sampleChannel, { id: "c-3", name: "old-things", joined: true, type: "channel", archived: true, muted: true }]] },
+      {
+        args: [[
+          { ...sampleChannel, lastPostAt: "2026-10-18T07:12:40.000Z" },
+          { id: "c-4", name: "empty-room", joined: false, type: "channel", lastPostAt: null },
+        ], undefined, Date.parse("2026-10-21T08:30:00.000Z")],
+      },
+    ],
   },
 );
 

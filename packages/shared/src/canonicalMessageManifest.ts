@@ -17,7 +17,7 @@
  *   `CanonicalMessageRow` — G2 mobile half. T8 verifies both ends by hash.
  */
 
-export const CANONICAL_MESSAGE_MANIFEST_VERSION = 6 as const;
+export const CANONICAL_MESSAGE_MANIFEST_VERSION = 7 as const;
 
 export type CanonicalFieldClass = "canonicalRequired" | "optionalAggregate";
 
@@ -93,7 +93,7 @@ const present = { messageNew: "present", enrichedUpdated: "present", taskStatusU
 const enrichedOnly = { messageNew: "present", enrichedUpdated: "present", taskStatusUpdated: "absent" } as const;
 const newOnly = { messageNew: "present", enrichedUpdated: "absent", taskStatusUpdated: "absent" } as const;
 
-/** Top-level canonical fields: 10 required + 10 optionalAggregate = 20. */
+/** Top-level canonical fields: 10 required + 11 optionalAggregate = 21. */
 export const CANONICAL_MESSAGE_FIELD_DESCRIPTORS = Object.freeze([
   // —— canonicalRequired (fail-closed; resolved rows use non-null types for
   //    id/channelId/senderType/senderId/content/createdAt) ——
@@ -112,6 +112,12 @@ export const CANONICAL_MESSAGE_FIELD_DESCRIPTORS = Object.freeze([
   { name: "attachments", class: "optionalAggregate", wireType: "array<attachment>", nullable: false, mergePolicy: "present-overwrite", presence: enrichedOnly },
   { name: "commentRef", class: "optionalAggregate", wireType: "object<commentRef>", nullable: true, mergePolicy: "shared-null-preserve", presence: enrichedOnly },
   { name: "conversationContext", class: "optionalAggregate", wireType: "object<conversationContext>", nullable: false, mergePolicy: "present-overwrite", presence: newOnly },
+  // RFC 077 retraction (v7): ISO time the owner retracted a delegated message, else null. Absent on the
+  // task-status projector; retraction is one-way, so absent=preserve never resurrects a retracted row.
+  // One-way: a null never clears an earlier deletedAt either (stricter than plain present-overwrite).
+  // Web reference: `mergeIncomingMessage` / `keepDelegationFacts` (DELEGATION_FACT_KEYS) in
+  // packages/web/src/store/messageStore.ts.
+  { name: "deletedAt", class: "optionalAggregate", wireType: "string", nullable: true, mergePolicy: "present-overwrite", presence: enrichedOnly },
   { name: "externalAuthor", class: "optionalAggregate", wireType: "object<externalAuthor>", nullable: true, mergePolicy: "present-overwrite", presence: enrichedOnly },
   { name: "mentions", class: "optionalAggregate", wireType: "array<mention>", nullable: false, mergePolicy: "present-overwrite", presence: enrichedOnly },
   { name: "reactions", class: "optionalAggregate", wireType: "array<reaction>", nullable: false, mergePolicy: "present-overwrite", presence: enrichedOnly },
@@ -186,7 +192,9 @@ export const CANONICAL_NESTED_WIRE_SHAPES = Object.freeze({
     { name: "externalActorId", wireType: "string", nullable: false },
     { name: "externalConversationId", wireType: "string", nullable: false },
     { name: "externalMessageId", wireType: "string", nullable: false },
+    { name: "identityKind", wireType: "string-union-raw", nullable: false, optionalKey: true },
     { name: "installId", wireType: "string", nullable: false },
+    { name: "profileFallback", wireType: "string-union-raw", nullable: false, optionalKey: true },
     { name: "projectionId", wireType: "string", nullable: false },
     { name: "provider", wireType: "string", nullable: false },
     { name: "workspaceId", wireType: "string", nullable: false },
@@ -224,8 +232,11 @@ export const CANONICAL_MESSAGE_EXCLUSIONS = Object.freeze({
   }),
   /** Emitted but consumed by no canonical client surface. */
   emittedUnconsumed: Object.freeze({
-    fields: ["updatedAt"] as readonly string[],
-    migrationStatus: "web canonical zero-consumption; mobile legacy consumption to retire in round-2 (label/event-key/SQL cache -> (epoch,seq,id/revision) adjudication)",
+    // RFC 077: delegatedBy / delegatedByAgentId (sent by an assistant for its owner) ride every
+    // message row; promote to canonical when the web / mobile label consumes them. deletedAt
+    // (retracted) was promoted to an optionalAggregate canonical field in manifest v7.
+    fields: ["updatedAt", "delegatedBy", "delegatedByAgentId"] as readonly string[],
+    migrationStatus: "web canonical zero-consumption; mobile legacy consumption to retire in round-2 (label/event-key/SQL cache -> (epoch,seq,id/revision) adjudication); RFC 077 delegation fields: web/mobile label pending (Kirby / Lagoon)",
   }),
   /** Viewer-scoped nested metadata: shared broadcasts strip these; truth comes
    *  only from actor-scoped HTTP / receiver-private surfaces. */
@@ -250,7 +261,7 @@ export const CANONICAL_MESSAGE_EXCLUSIONS = Object.freeze({
 export type CanonicalMessageField =
   | "channelId" | "content" | "createdAt" | "id" | "messageType" | "randomId"
   | "senderId" | "senderType" | "seq" | "threadId"
-  | "actionMetadata" | "attachments" | "commentRef" | "conversationContext"
+  | "actionMetadata" | "attachments" | "commentRef" | "conversationContext" | "deletedAt"
   | "externalAuthor" | "mentions" | "reactions" | "senderDescription" | "senderMembershipStatus" | "senderName";
 
 export interface CanonicalMessageManifest {

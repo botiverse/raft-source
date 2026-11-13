@@ -1,11 +1,13 @@
 import { CircleCheck, Info, OctagonAlert, TriangleAlert } from "lucide-react";
-import type { HTMLAttributes, ReactNode } from "react";
+import type { HTMLAttributes, ReactNode, Ref } from "react";
 import {
   Banner,
   BannerAction,
+  BannerClose,
   BannerDescription,
   BannerTitle,
 } from "@botiverse/raft-ui";
+import Tooltip from "./Tooltip";
 
 /**
  * Thin product adapter over the public RUI Banner composition. RUI owns the
@@ -34,7 +36,18 @@ const INTENT_DEFAULT_ICON: Record<BannerIntent, ReactNode> = {
   success: <CircleCheck size={20} aria-hidden="true" />,
 };
 
-export interface BannerProps extends Omit<HTMLAttributes<HTMLDivElement>, "title"> {
+/** `onClose` renders raft-ui's `BannerClose` (the ×) for a banner with no
+ *  button; `closeLabel`, required with it, is its localized accessible name
+ *  and tooltip. A banner that has `actions` closes with a ghost Dismiss among
+ *  them instead (Raft Design System › Banner). */
+type BannerCloseProps =
+  | { onClose?: () => void; closeLabel: string }
+  | { onClose?: undefined; closeLabel?: undefined };
+
+interface BannerBaseProps extends Omit<HTMLAttributes<HTMLDivElement>, "title"> {
+  /** The banner's root element, e.g. to tell whether focus is inside it
+   *  before it goes away. */
+  ref?: Ref<HTMLDivElement>;
   /** Semantic status forwarded to the RUI recipe. */
   intent: BannerIntent;
   /** Density forwarded to the RUI size register. */
@@ -53,13 +66,17 @@ export interface BannerProps extends Omit<HTMLAttributes<HTMLDivElement>, "title
    *  precedence over `withIcon`. Useful for waiting indicators
    *  (pulsing dot) or task-specific icons. */
   icon?: ReactNode;
-  /** Optional right-aligned action slot (e.g. a button or link). */
+  /** Optional action slot: the banner's one button, with a ghost Dismiss
+   *  before it when the banner can be dismissed. raft-ui places it at the
+   *  bottom right; don't put a × here, use `onClose`. */
   actions?: ReactNode;
   /** RUI's Banner announces itself as a live `role="alert"`. Pass `false`
    *  for a notice that is part of the page (read before acting) rather than
    *  news, so assistive tech does not interrupt with it. */
   live?: boolean;
 }
+
+export type BannerProps = BannerBaseProps & BannerCloseProps;
 
 export default function AppBanner({
   intent,
@@ -69,6 +86,8 @@ export default function AppBanner({
   icon,
   withIcon = false,
   actions,
+  onClose,
+  closeLabel,
   live = true,
   className = "",
   ...rest
@@ -80,6 +99,11 @@ export default function AppBanner({
       {title ? <BannerTitle>{title}</BannerTitle> : null}
       {children ? <BannerDescription>{children}</BannerDescription> : null}
       {actions ? <BannerAction>{actions}</BannerAction> : null}
+      {onClose ? (
+        <Tooltip content={closeLabel}>
+          <BannerClose type="button" onClick={onClose} aria-label={closeLabel} />
+        </Tooltip>
+      ) : null}
     </Banner>
   );
 }

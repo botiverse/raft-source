@@ -4,6 +4,7 @@ import type { ComposerSuggestionSearchEntry, ComposerSuggestionSearchField } fro
 interface ComposerSuggestionWorkerEntry {
   index: number;
   fields: ComposerSuggestionSearchField[];
+  tier?: number;
 }
 
 interface ComposerSuggestionWorkerRequest {
@@ -30,6 +31,7 @@ self.onmessage = (event: MessageEvent<ComposerSuggestionWorkerRequest>) => {
       index: entry.index,
       suggestion: entry.index,
       fields: entry.fields,
+      tier: entry.tier,
     }));
   }
   const indexes = rankComposerSuggestions(message.query, cachedEntries);

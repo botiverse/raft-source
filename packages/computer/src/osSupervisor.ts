@@ -178,6 +178,11 @@ function buildSystemdDefinition(
     "Restart=always",
     "RestartSec=2",
     "KillMode=control-group",
+    // One agent's process killed by the kernel OOM killer must not stop the
+    // whole Computer: systemd's default OOMPolicy=stop does (#triage:#169,
+    // reproduced on Ubuntu 24.04). Allowed in user units; older systemd
+    // ignores the unknown key with a warning.
+    "OOMPolicy=continue",
     "",
     "[Install]",
     "WantedBy=default.target",

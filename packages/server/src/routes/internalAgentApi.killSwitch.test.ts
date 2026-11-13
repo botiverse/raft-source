@@ -13,7 +13,7 @@ import { createChannel, addAgent, addHuman } from "../services/channelService";
 import { registerMachine } from "../services/machineService";
 import { mintAgentCredential } from "../services/agentCredentialService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 type KillSwitchFixture = {
   agentId: string;
@@ -50,6 +50,7 @@ async function seedKillSwitchFixture(): Promise<KillSwitchFixture> {
     agentId: agent.id,
     scopes: ["read"],
     name: "kill-switch-agent",
+    issuedVia: "computer",
     createdByUserId: null,
   });
 
@@ -69,7 +70,7 @@ test("experimental internal surfaces have a stable operator kill switch", async 
     warnings.push(args);
   };
 
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const fixture = await seedKillSwitchFixture();
 

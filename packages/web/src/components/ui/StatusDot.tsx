@@ -37,7 +37,7 @@ export type StatusDotPresence = Presence;
  *   colour. `presence` wins over `activity`, which wins over `tone`.
  * - `external` forces the external (cyan) light regardless of the rest
  *   (SHA-V0-014: no managed liveness for external agents).
- * - `size` is the physical-fit axis. `md` (default) = the 9px DS pixel
+ * - `size` is the physical-fit axis. `md` (default) = the 10px DS pixel
  *   (headers, sidebar, members, machine detail). `sm` = 8px for inline text
  *   (profile preview cards, activity log). `lg` = 11px for avatar overlays.
  * - No `pulse`: status dots mark AMBIENT states and never animate (task #136 —
@@ -56,7 +56,8 @@ export interface StatusDotProps extends Omit<SpanPassthroughProps, "children"> {
   /** When true, renders the external (cyan) presence light regardless of
    *  `activity`. For external agents (SHA-V0-014) — no managed liveness. */
   external?: boolean;
-  /** Size variant. `md` (default) = 9px DS pixel. `sm` = 8px for inline
+  /** Size variant. `md` (default) = 10px DS pixel (raft-ui
+   *  Status md, status.md#sizes: even, so it centres in even rows). `sm` = 8px for inline
    *  text. `lg` = 11px for avatar overlays. */
   size?: "sm" | "md" | "lg";
 }

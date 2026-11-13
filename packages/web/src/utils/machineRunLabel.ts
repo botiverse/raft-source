@@ -1,6 +1,8 @@
-// Run-kind label for the Computer list rows. Rows that were connected with the
-// retired standalone daemon (`isComputer: false`) read "legacy"; there is no
-// daemon release line left to name. Online/offline is driven by
+// The run label on the Computer list rows: "Offline", the version when it is
+// online ("v1.2", a version fact; the status light says it is online), or
+// "Online" when it has not reported one. Rows that were connected with the
+// retired standalone daemon (`isComputer: false`) read "legacy v1.2"; there
+// is no daemon release line left to name. Online/offline is driven by
 // `status` — NOT by the presence of a version string. `computerVersion` /
 // `daemonVersion` only flow from the owning replica's in-memory connection map,
 // so a non-owner REST read can return `status="online"` with `version=null`;
@@ -29,11 +31,10 @@ export type MachineRunLabelDescriptor =
   | { id: "machine.runLabel.daemonOnline"; values?: undefined; isOffline: false };
 
 export function machineRunLabel(m: MachineRunLabelInput): MachineRunLabel {
-  const kind = m.isComputer ? "computer" : "legacy";
-  if (m.status !== "online") return { text: `${kind} offline`, isOffline: true };
+  if (m.status !== "online") return { text: "Offline", isOffline: true };
   const version = m.isComputer ? m.computerVersion : m.daemonVersion;
-  if (version) return { text: `${kind} v${version}`, isOffline: false };
-  return { text: `${kind} online`, isOffline: false };
+  if (version) return { text: m.isComputer ? `v${version}` : `legacy v${version}`, isOffline: false };
+  return { text: "Online", isOffline: false };
 }
 
 export function getMachineRunLabelDescriptor(m: MachineRunLabelInput): MachineRunLabelDescriptor {

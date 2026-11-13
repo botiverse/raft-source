@@ -24,7 +24,7 @@ export default function SurfaceListItem({
       className={[
         "min-w-0 w-full px-4 py-3 transition-colors",
         selected ? "bg-info-soft" : "bg-layer-card",
-        interactive && !selected ? "hover:press-overlay active:press-overlay" : "",
+        interactive && !selected ? "hover:overlay-subtle active:overlay-medium" : "",
         className,
       ].join(" ")}
       {...props}

@@ -1,0 +1,74 @@
+-- Makes "at most one UNRESOLVED action card per request" a database guarantee (task #21).
+--
+-- `ensureMcpConnectionCard()` read for an open card and then inserted one in a SEPARATE
+-- transaction. Two concurrent refusals for the same (Agent, MCP server) could both see nothing and
+-- both post a card, so the operator gets two Connect prompts for one pending thing (@Huarong).
+-- `action_cards` had uniqueness only on `message_id`, which does not constrain that at all.
+--
+-- ⚠️ A code-level guard cannot hold this. The check and the write were not in one transaction, and
+-- moving them together would still only bind THIS caller -- any other producer of the same card type
+-- would bypass it. The invariant belongs on the data, which is the same lesson that produced 0410:
+-- enforcement in a layer is not enforcement.
+--
+-- `dedupe_key` is NULL for every existing card type, so nothing changes for them: the partial index
+-- only constrains rows that opt in by setting it. Scoped to `state = 'prepared'` on purpose -- an
+-- executed or dismissed card no longer represents a pending request, so the next genuine refusal
+-- must be free to raise a fresh one. That is also what makes the card lifecycle work: consume the
+-- card, and the next `login_required` legitimately produces a new one.
+--
+-- Cost, measured rather than asserted.
+--
+-- ⚠️ An earlier version of this comment called both statements "index-only", which reads as harmless
+-- and is wrong (@Huarong). `ADD COLUMN ... NULL` really is metadata-only in PG11+, but a plain
+-- `CREATE UNIQUE INDEX` SCANS `action_cards` and, because the migrator wraps each file in ONE
+-- transaction, holds a lock blocking writes to that table until the file commits.
+--
+-- "Partial index" invites the wrong intuition: `dedupe_key` is added right here, so every existing
+-- row is NULL and the index is EMPTY. The build cost is the heap scan evaluating the predicate, and
+-- it tracks TABLE SIZE, not index size.
+--
+-- MEASURED on real PostgreSQL 16, 4 concurrent action-card writers, one transaction, lock_timeout=5s
+-- (`migration0411LockWindow.realPg.test.ts`):
+--
+--   action_cards rows   migration     max blocked write   index size
+--              20,000     7ms            9-10ms              8 KiB   <- production-representative
+--             200,000     20-90ms        24-113ms            8 KiB
+--   deadlocks 0 - timeouts 0 - index stays one page (it indexes nothing yet)
+--
+-- ⚠️ Ranges, not points: repeated runs of the same scale varied ~4x (200k came in at both 20ms and
+-- 90ms on the same machine). So do NOT read a stable per-row slope out of this. That variance is
+-- itself an argument for guarding with an explicit BUDGET rather than an extrapolated cost curve.
+--
+-- The probe ASSERTS budgets rather than printing numbers, in two tiers set by @Manjusaka (SRE DRI):
+--   20k rows  <= 250ms   judgement tier, from the user-visible "complete within 3s" write budget
+--                        (one migration should not eat more than ~1/10 of it)
+--   200k rows <= 1000ms  early-warning tier, so 10x growth has an answer that goes RED rather than
+--                        nobody noticing until 1M rows
+-- ⛔ If either fails, the remedy is NOT a bigger budget -- it is to rebuild this index with
+-- CREATE UNIQUE INDEX CONCURRENTLY as a post-migration step (that implementation is at 5b0d302d2).
+--
+-- ⚠️ EXCEPTION, with its precondition recorded here rather than left to memory (@Manjusaka):
+-- the standing rule this shift is that a new unique index on an EXISTING table is built
+-- CONCURRENTLY, because tables only grow and nobody re-reviews a landed migration later. This file
+-- is a deliberate SMALL-TABLE exception, granted on measurement plus production cardinality --
+-- explicitly not on "it looks small":
+--
+--   prod reltuples ~= 19.6k @ 2026-09-17 (Ray, read-only: primary DIRECT, BEGIN READ ONLY, no
+--   count(*)); action_cards total 16 MB (heap 13 MB / indexes 3.4 MB)
+--   => ~10ms at that size.
+--
+-- ⚠️ CORRECTION to an earlier version of this note (@Huarong): it compared the build time against
+-- the 5s `lock_timeout`, which is not a safety margin. `lock_timeout` bounds how long a statement
+-- WAITS TO ACQUIRE a lock, not how long it HOLDS one. The only automatic ceiling is the migration's
+-- 60s `statement_timeout`, and concurrent writers set no lock timeout of their own. The real bound
+-- is an explicit write-blocking budget, asserted in the probe; at this cardinality the MEASURED
+-- blocking is ~12-26ms, which is what justifies the exception -- not its distance from a timeout
+-- that was never going to stop it.
+--
+-- ⇒ If `action_cards` ever exceeds ~1M rows, a further index of this kind must instead be built with
+-- `CREATE UNIQUE INDEX CONCURRENTLY` as a post-migration step (it cannot run here: no transaction
+-- block). That is the condition under which this exception stops applying.
+--
+-- No backfill: existing cards keep NULL and stay unconstrained.
+ALTER TABLE "action_cards" ADD COLUMN "dedupe_key" text;--> statement-breakpoint
+CREATE UNIQUE INDEX "idx_action_cards_open_dedupe" ON "action_cards" USING btree ("dedupe_key") WHERE "action_cards"."dedupe_key" is not null and "action_cards"."state" = 'prepared';

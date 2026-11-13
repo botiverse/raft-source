@@ -1,5 +1,7 @@
 import {
   createRaftChannelRefRegex,
+  createRaftChannelTaskRefRegex,
+  createRaftDmTaskRefRegex,
   createRaftChannelThreadRefRegex,
   createRaftDmRefRegex,
   createRaftDmThreadRefRegex,
@@ -29,4 +31,12 @@ export function createDmThreadRefRegex(): RegExp {
 
 export function createDmRefRegex(): RegExp {
   return createRaftDmRefRegex();
+}
+
+export function createChannelTaskRefRegex(): RegExp {
+  return createRaftChannelTaskRefRegex();
+}
+
+export function createDmTaskRefRegex(): RegExp {
+  return createRaftDmTaskRefRegex();
 }

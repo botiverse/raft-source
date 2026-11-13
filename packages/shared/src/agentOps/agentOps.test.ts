@@ -62,9 +62,9 @@ test("projectRaftMessage renders the canonical header line and reply target for 
     assert.equal(message.target, target);
     assert.equal(message.text, text);
   }
-  const withTask = projectRaftMessage({ ...sampleMessage, senderType: "agent", senderName: "Alice", sender_type: undefined, sender_name: undefined, task_status: "in_progress", task_number: 42, task_assignee_id: "a-1", task_assignee_name: "Alice" });
+  const withTask = projectRaftMessage({ ...sampleMessage, senderType: "agent", senderName: "Alice", sender_type: undefined, sender_name: undefined, task_status: "in_progress", task_number: 42, task_assignee_id: "a-1", task_assignee_type: "agent", task_assignee_name: "Alice" });
   assert.equal(withTask?.sender.type, "agent");
-  assert.deepEqual(withTask?.task, { number: 42, status: "in_progress", assigneeName: "Alice" });
+  assert.deepEqual(withTask?.task, { number: 42, status: "in_progress", assigneeName: "Alice", assigneeId: "a-1", assigneeType: "agent" });
   assert.match(withTask?.text ?? "", / \[task #42 status=in_progress assignee=@Alice\]$/);
 });
 
@@ -240,6 +240,62 @@ test("listInbox is the Activity panel: the open command per row and exactly one 
   assert.equal(outcome.text.split("\n").filter((line) => line.startsWith("Next:")).length, 1);
 });
 
+test("listInbox asks for inbox items; a Server that lists them gets every item with its inbox.read call (RFC 081 D15)", async () => {
+  const calls: Array<{ method: string; path: string; body: unknown }> = [];
+  const REM = "76d9397d-1111-4222-8333-444455556666";
+  const api = client(() => Response.json({
+    view: "unread",
+    items: [
+      { target: "dm:@tygg", kind: "dm", unread: 1, mentions: 0, lastReadSeq: 0, activitySeq: 90, latestSenderName: "tygg", latestAt: T },
+    ],
+    rows: [
+      { target: "dm:@tygg", kind: "conversation", conversationKind: "dm", unread: 1, mentions: 0, lastReadSeq: 0, activitySeq: 90, latestSender: { name: "tygg", type: "user" }, preview: "look at this", previewTruncated: false, firstUnreadAt: T, latestAt: T, preLaunch: false },
+      { target: "app:stamp/pr-13754", kind: "app", objectRef: "pr-13754", app: { key: "stamp", name: "Stamp" }, related: { target: "#general:#7" }, unread: 2, latestSender: { name: "Stamp", type: "app" }, preview: "checks failed", previewTruncated: true, firstUnreadAt: T, latestAt: T, preLaunch: false },
+      { target: `reminder:${REM.slice(0, 8)}`, kind: "reminder", app: { key: "system.reminder", name: "Reminder" }, ack: [{ app: "system.reminder", id: REM, revision: "2" }], unread: 1, latestSender: null, preview: "check the deploy", previewTruncated: false, firstUnreadAt: T, latestAt: T, preLaunch: false },
+    ],
+    preLaunch: { count: 4, before: "2026-11-10" },
+    omitted: { app: 3, reminder: 0 },
+    hasMore: false,
+    nextBeforeSeq: null,
+    totals: { conversations: 1, dms: 1, mentions: 0 },
+  }), calls);
+  const outcome = await listInbox(api, {}, { hints: "tool" });
+  assert.match(calls[0]?.path ?? "", /items=true/);
+  assert.equal(outcome.ok, true);
+  if (!outcome.ok) return;
+  assert.equal(outcome.data.conversations.length, 1, "the conversation-only list stays");
+  assert.deepEqual(outcome.data.items?.map((item) => item.target), ["dm:@tygg", "app:stamp/pr-13754", `reminder:${REM.slice(0, 8)}`]);
+  assert.equal(outcome.data.items?.[1]?.objectRef, "pr-13754");
+  assert.match(outcome.data.items?.[1]?.readCommand ?? "", /^inbox_read\(/);
+  assert.deepEqual(outcome.data.preLaunch, { count: 4, before: "2026-11-10" });
+  assert.deepEqual(outcome.data.omitted, { app: 3, reminder: 0 });
+  assert.equal(outcome.next?.kind, "read_item");
+  assert.deepEqual(outcome.next?.args, { target: "dm:@tygg" });
+  assert.match(outcome.text, /^Inbox: 1 unread conversation \(1 DM, 0 with mentions\)\. 4 app items, 1 reminder\. Newest activity first\./);
+  assert.match(outcome.text, /Not listed: 3 more app items; read the ones above first\./);
+  assert.doesNotMatch(outcome.text, /predate/, "no dismiss operation: a tool caller gets no pre-launch line");
+  assert.doesNotMatch(outcome.text, /raft inbox (check|read)/);
+  assert.equal(outcome.text.split("\n").filter((line) => line.startsWith("Next:")).length, 1);
+
+  const cli = await listInbox(api, {});
+  assert.equal(cli.ok, true);
+  if (!cli.ok) return;
+  assert.match(cli.text, /read: raft inbox read --target "app:stamp\/pr-13754"/);
+  assert.match(cli.text, /dismiss without reading: raft inbox dismiss --before 2026-11-10/);
+});
+
+test("listInbox on a Server without inbox items: conversations only, no items field", async () => {
+  const api = client(() => Response.json({
+    view: "unread", items: [], hasMore: false, nextBeforeSeq: null, totals: { conversations: 0, dms: 0, mentions: 0 },
+  }));
+  const outcome = await listInbox(api, {});
+  assert.equal(outcome.ok, true);
+  if (!outcome.ok) return;
+  assert.equal(outcome.state, "empty");
+  assert.equal("items" in outcome.data, false);
+  assert.match(outcome.text, /^Inbox: nothing unread\./);
+});
+
 // ── read → frontier → send ───────────────────────────────────────────────
 
 test("readHistory advances the frontier to the Server's model-seen boundary, and an around lookup records exact seqs only", async () => {
@@ -281,6 +337,40 @@ test("readHistory with consume: false asks the Server not to mark the page read 
 
   await readHistory(api, { target: "#general" }, frontier);
   assert.equal(calls[1]?.path, "/internal/agent-api/history?channel=%23general", "the default request is unchanged");
+});
+
+test("readHistory says when the plan's history window hid messages, as the CLI does", async () => {
+  const note = "Older messages are hidden: this server is on the Free plan, which keeps the last 30 days. Upgrading to Pro restores the full history.";
+  let answer: Record<string, unknown> = {
+    target: "#general",
+    messages: [sampleMessage],
+    has_more: false, has_older: false, has_newer: false,
+    last_read_seq: 900, model_seen_up_to_seq: 1200, unread_after_seq: 900, read_through_seq: 1200,
+    historyLimited: true, historyLimitMessage: note,
+  };
+  const api = client(() => Response.json(answer));
+
+  const unread = await readHistory(api, { target: "#general", unread: true }, new SeenFrontier());
+  assert.equal(unread.ok && unread.data.historyLimitMessage, note);
+  assert.ok(unread.ok && unread.text.startsWith(`${note}\n`), "the note leads the text");
+
+  answer = { target: "#general", messages: [], has_more: false, has_older: false, has_newer: false, last_read_seq: null, historyLimited: true, historyLimitMessage: note };
+  const empty = await readHistory(api, { target: "#general" }, new SeenFrontier());
+  assert.equal(empty.ok && empty.text, `${note}\nNo messages in #general.`);
+
+  // Everything after the read position was hidden: the read moved it over them.
+  answer = { target: "#general", messages: [], has_more: false, has_older: false, has_newer: false, last_read_seq: 900, unread_after_seq: 900, read_through_seq: 1199, historyLimited: true, historyLimitMessage: note };
+  const emptyUnread = await readHistory(api, { target: "#general", unread: true }, new SeenFrontier());
+  assert.equal(emptyUnread.ok && emptyUnread.text, `${note}\nNo unread messages in #general. You have read through seq 1199.`);
+
+  answer = { target: "#general", messages: [], has_more: false, has_older: false, has_newer: false, last_read_seq: null, historyLimited: true };
+  const noMessage = await readHistory(api, { target: "#general" }, new SeenFrontier());
+  assert.equal(noMessage.ok && noMessage.text, "Message history is limited on this plan.\nNo messages in #general.");
+
+  answer = { target: "#general", messages: [], has_more: false, has_older: false, has_newer: false, last_read_seq: null };
+  const plain = await readHistory(api, { target: "#general" }, new SeenFrontier());
+  assert.equal(plain.ok && plain.text, "No messages in #general.");
+  assert.equal(plain.ok && plain.data.historyLimitMessage, undefined);
 });
 
 test("readHistory with unread: true reads from the read position, continues with the same call, and fails closed on an old Server", async () => {
@@ -383,6 +473,7 @@ test("sendMessage attests the frontier, surfaces a hold as an interrupt, and a r
   assert.equal(first.next?.kind, "resend");
   assert.deepEqual(first.next?.args, { target: "#general" }, "no continuation rides on next");
   assert.match(first.next?.why ?? "", /frontier\.recordHeld\(interrupt\)/);
+  assert.equal(first.next?.command, undefined, "the held text shows all of it: next does not send the model to read it again");
   assert.match(first.text, /^Held — 2 unread messages in #general\. Your message was not sent\./);
   assert.equal(interrupt.context, first.text);
   assert.equal("resend" in interrupt || "continuation" in interrupt || "data" in first, false, "no closures, no continuation");
@@ -439,13 +530,43 @@ test("held messages without conversation fields are projected under the send tar
   assert.equal(short.interrupt.contextComplete, false);
   assert.deepEqual(short.interrupt.resume, { idempotencyKey: "k-1" }, "resume is still offered (in-process: the key to call again with)");
   assert.deepEqual(short.next?.args, { target: "dm:@cody" });
-  assert.match(short.next?.why ?? "", /not all of them are shown here; read the conversation/);
-  // The held text is the CLI's (formatAgentHold): the count, then the command for the full text.
+  assert.match(short.next?.why ?? "", /interrupt\.context does not show all of them in full; read the conversation/);
+  assert.equal(short.next?.command, 'raft message read --target "dm:@cody"');
+  // The held text is the CLI's (formatAgentHold): the count, then (nothing shown) the command to read them.
   assert.match(short.text, /^Held — 1 unread message in dm:@cody\. Your message was not sent\./);
-  assert.match(short.text, /Full text: raft message read --target "dm:@cody"/);
-  assert.match(short.text, /Not all of them are shown here: read the conversation first \(raft message read --target "dm:@cody"\), then send it again with idempotencyKey "k-1"\./);
+  assert.match(short.text, /Not shown here\. Read them: raft message read --target "dm:@cody"/);
+  assert.match(short.text, /Not all of them are shown here: read the conversation first \(raft message read --target "dm:@cody"\)\. Then: If what you just read already says what you meant to say \(for example, someone already answered\), or makes your message unnecessary, send nothing\. Otherwise, to send it unchanged, send it again with idempotencyKey "k-1"\./);
   assert.equal(frontier.recordHeld(short.interrupt), false, "an incomplete preview is never attested");
   assert.deepEqual(frontier.attestation("dm:@cody"), { seenExactSeqs: [] });
+});
+
+test("sendMessage names the agents the message was delivered to, as the CLI does; [] and not counted print nothing", async () => {
+  const many = Array.from({ length: 12 }, (_, i) => `agent${String(i + 1).padStart(2, "0")}`);
+  const sentWith = (extra: Record<string, unknown>, messageId: string) =>
+    sendMessage(client(() => Response.json({ ok: true, state: "sent", messageId, ...extra })), { target: "#general", content: "hi" });
+
+  const two = await sentWith({ deliveredToAgents: ["Archer", "Otter"] }, "m-4");
+  assert.ok(two.ok && two.state === "sent");
+  assert.deepEqual(two.data.deliveredToAgents, ["Archer", "Otter"]);
+  assert.equal(two.text, "Message sent to #general. Message ID: m-4\nDelivered to 2 agents: Archer, Otter.");
+
+  const one = await sentWith({ deliveredToAgents: ["Otter"] }, "m-5");
+  assert.ok(one.ok && one.state === "sent");
+  assert.equal(one.text, "Message sent to #general. Message ID: m-5\nDelivered to 1 agent: Otter.");
+
+  const crowd = await sentWith({ deliveredToAgents: many }, "m-6");
+  assert.ok(crowd.ok && crowd.state === "sent");
+  assert.equal(crowd.text, `Message sent to #general. Message ID: m-6\nDelivered to 12 agents: ${many.slice(0, 10).join(", ")} and 2 more.`);
+
+  const none = await sentWith({ deliveredToAgents: [] }, "m-7");
+  assert.ok(none.ok && none.state === "sent");
+  assert.deepEqual(none.data.deliveredToAgents, []);
+  assert.equal(none.text, "Message sent to #general. Message ID: m-7");
+
+  const uncounted = await sentWith({}, "m-8");
+  assert.ok(uncounted.ok && uncounted.state === "sent");
+  assert.equal(uncounted.data.deliveredToAgents, null);
+  assert.equal(uncounted.text, "Message sent to #general. Message ID: m-8");
 });
 
 test("sendMessage retries a request that never reached the Server, with the same key, and gives up after three attempts", async () => {
@@ -532,6 +653,34 @@ test("claimTasks surfaces a freshness hold as an interrupt: resume is the identi
   assert.equal(again.ok && again.state, "claimed");
 });
 
+test("a hold's next names the read exactly when its held text does", async () => {
+  const held = (heldMessages: unknown[]) => client(() => Response.json({
+    ok: true, state: "held", outcome: "held", subtype: "freshness", reason: "newer_messages_available", decision: "syncing_hold",
+    producerFactId: "f", available_actions: [], heldMessages, newMessageCount: heldMessages.length, shownMessageCount: heldMessages.length, omittedMessageCount: 0, seenUpToSeq: 1210,
+  }));
+  const row = (content: string, extra: Record<string, unknown> = {}) => ({ id: UUID_B, channelId: "c-1", seq: 1210, senderType: "human", senderName: "richard", content, createdAt: T, timestamp: T, ...extra });
+  const read = 'raft message read --target "#general"';
+  // A claim's context is the task's own conversation, where its lines land.
+  const claimRead = 'raft task read "#general:#1"';
+  const cases: Array<[string, unknown, string | undefined, RegExp]> = [
+    ["whole", row("newer"), undefined, /\n  └ ─+\n/],
+    ["cut", row("x".repeat(200)), read, /Previews are truncated\. Full text: raft message read/],
+    ["attachment", row("see file", { attachments: [{ id: "a-1", filename: "plan.md" }] }), read, /Not all of it is shown here\. Read it: raft message read/],
+  ];
+  for (const [name, message, command, text] of cases) {
+    const sent = await sendMessage(held([message]), { target: "#general", content: "hi", idempotencyKey: "k-1" });
+    if (!isInterrupted(sent)) return assert.fail(`${name}: expected a send interrupt, got ${JSON.stringify(sent).slice(0, 300)}`);
+    assert.match(sent.text, text, `${name}: held text`);
+    assert.equal(sent.next?.command, command, `${name}: send next agrees with the text`);
+    assert.equal(sent.next?.kind, "resend");
+    const claim = await claimTasks(held([message]), { target: "#general", taskNumbers: [1] });
+    if (!isInterrupted(claim)) return assert.fail(`${name}: expected a claim interrupt, got ${JSON.stringify(claim).slice(0, 300)}`);
+    assert.equal(claim.next?.command, command && claimRead, `${name}: claim next agrees with the text`);
+    assert.equal(claim.next?.kind, "retry_claim");
+    assert.match(claim.next?.why ?? "", command ? /read them/ : /interrupt\.context shows them/);
+  }
+});
+
 // ── wake ─────────────────────────────────────────────────────────────────
 
 test("verifyInboxNotice accepts a correctly signed notice and rejects the rest, with no time window", async () => {
@@ -539,7 +688,7 @@ test("verifyInboxNotice accepts a correctly signed notice and rejects the rest, 
   const notice = {
     schema: "raft-agent-inbox-notice.v1", noticeId: "ntc_1", recipientAgentId: "agent-1", occurredAt: "2020-01-01T00:00:00.000Z",
     text: "Inbox update: 1 message pending your read across all conversations; 1 changed target",
-    targets: [{ target: "#proj-sdk:2ad6c504", channelId: "c-1", channelType: "thread", pendingCount: 1, firstPendingMsgId: "m-1", latestMsgId: "m-1", latestSenderName: "Tenny", latestSenderType: "agent", flags: ["mention", "thread"] }],
+    targets: [{ target: "#proj-sdk:2ad6c504", channelId: "c-1", channelType: "thread", pendingCount: 1, firstPendingMsgId: "m-1", latestMsgId: "m-1", latestSeq: "42", latestSenderName: "Tenny", latestSenderType: "agent", flags: ["mention", "thread"] }],
   };
   const body = new TextEncoder().encode(JSON.stringify(notice));
   const signature = `sha256=${createHmac("sha256", secret).update(body).digest("hex")}`;
@@ -551,6 +700,7 @@ test("verifyInboxNotice accepts a correctly signed notice and rejects the rest, 
   assert.equal(ok.notice.deliveryId, "ntc_1");
   assert.equal(ok.notice.targets[0]?.target, "#proj-sdk:2ad6c504");
   assert.equal(ok.notice.targets[0]?.mentionsYou, true);
+  assert.equal(ok.notice.targets[0]?.latestSeq, "42", "the latest seq, for /events wait_for");
 
   const record = await verifyInboxNotice({ headers: { "X-Raft-Signature-256": signature }, body, secret });
   assert.equal(record.ok, true, "plain header records work too");

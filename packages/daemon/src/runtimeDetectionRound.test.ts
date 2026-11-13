@@ -144,6 +144,36 @@ test("task #1268: deadline default and env override; self-exec re-runs this entr
   assert.equal(selfExec.args[selfExec.args.length - 1], "__detect-runtimes");
 });
 
+// The detection child is the running program again, and argv[1] means a
+// different thing per host. Packaged Raft Desktop's `__run` has argv
+// `[<app>, "", "__run", <id>]`; replaying argv[1] made the child
+// `<app> "" __detect-runtimes`, which the app's argv guard did not route, so it
+// booted (or, with the GUI open, quit as) a second GUI instance: child_failed.
+test("detection self-exec per host: node script, SEA, packaged and dev Electron app, Electron as Node", () => {
+  const APP = "/Applications/Raft Desktop.app/Contents/MacOS/Raft Desktop";
+  const base = { execArgv: [] as string[], isSea: false };
+  assert.deepEqual(
+    defaultRuntimeDetectionSelfExec({ ...base, execPath: "/usr/bin/node", execArgv: ["--import", "@oxc-node/core/register"], argv: ["/usr/bin/node", "/repo/src/index.ts", "__run", "s"] }),
+    { command: "/usr/bin/node", args: ["--import", "@oxc-node/core/register", "/repo/src/index.ts", "__detect-runtimes"] },
+  );
+  assert.deepEqual(
+    defaultRuntimeDetectionSelfExec({ ...base, execPath: "/opt/raft-computer", argv: ["/opt/raft-computer", "__run", "s"], isSea: true }),
+    { command: "/opt/raft-computer", args: ["__detect-runtimes"] },
+  );
+  assert.deepEqual(
+    defaultRuntimeDetectionSelfExec({ ...base, execPath: APP, argv: [APP, "", "__run", "s"], electronVersion: "44.7.0", electronProcessType: "browser" }),
+    { command: APP, args: ["__detect-runtimes"] },
+  );
+  assert.deepEqual(
+    defaultRuntimeDetectionSelfExec({ ...base, execPath: "/e/Electron", argv: ["/e/Electron", ".", "__run", "s"], electronVersion: "44.7.0", electronProcessType: "browser", electronDefaultApp: true }),
+    { command: "/e/Electron", args: [".", "__detect-runtimes"] },
+  );
+  assert.deepEqual(
+    defaultRuntimeDetectionSelfExec({ ...base, execPath: APP, argv: [APP, "/app.asar/node_modules/@botiverse/raft-daemon/dist/index.js"], electronVersion: "44.7.0" }),
+    { command: APP, args: ["/app.asar/node_modules/@botiverse/raft-daemon/dist/index.js", "__detect-runtimes"] },
+  );
+});
+
 // Reviewer acceptance (Huaihuai, #9665): cleanup must be observed with the
 // production helper on a real child + grandchild, and "kill requested" must
 // never be reported as "cleaned up".

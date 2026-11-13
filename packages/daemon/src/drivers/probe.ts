@@ -21,8 +21,12 @@ export interface ProbeDeps {
   homeDir?: string;
   warn?: (message: string) => void;
   existsSyncFn?: (filePath: string) => boolean;
+  /** task #1358 — monotonic clock stand-in (ms) for probe-cache expiry; defaults to performance.now(). */
+  nowFn?: () => number;
   /** Optional fs.statSync stand-in (mtime/size probe cache keys). */
   statSyncFn?: (filePath: string) => { mtimeMs: number; size: number };
+  /** Optional stand-in for OAR's `desktopBuildExecutables` (the Codex Desktop build CLIs in a Windows `bin` folder, newest first). */
+  codexDesktopBuildsFn?: (bin: string) => readonly string[];
   execFileSyncFn?: typeof execFileSync;
   /** Optional fs.readFileSync stand-in (Windows batch wrapper parsing). */
   readFileSyncFn?: (filePath: string, encoding: "utf8") => string;
@@ -119,7 +123,7 @@ function summarizeWindowsEnvironmentError(error: unknown): string {
 // Get-Command 0.2–0.44 s, environment read 0.2–0.4 s, none truncated; a user
 // reported 1.0–1.2 s PowerShell starts, which CI does not reproduce). It is
 // the same budget the environment read below already had, so one lookup is
-// bounded by 2 × 5000 ms; the daemon's runtime start timeout (2 min) and the
+// bounded by 2 × 5000 ms; the daemon's runtime start timeout (2 min, 10 for OpenCode) and the
 // per-runtime detection loop sit above it, both far larger.
 export const WINDOWS_COMMAND_RESOLVE_TIMEOUT_MS = 5000;
 /** Budget for the Machine/User environment read that precedes a Windows lookup. */
@@ -679,19 +683,55 @@ export async function resolveCommandOnPathAsync(command: string, deps: ProbeDeps
 
 /** {@link readCommandVersion} off the event loop. */
 export async function readCommandVersionAsync(command: string, args: string[] = [], deps: ProbeDeps = {}): Promise<string | null> {
+  const read = await readCommandVersionDetailedAsync(command, args, deps);
+  return read.kind === "version" ? read.version : null;
+}
+
+/** Budget for one `<command> --version` child. */
+export const COMMAND_VERSION_TIMEOUT_MS = 5000;
+
+/**
+ * task #1365 — what one `--version` read found, keeping why it failed. A
+ * failed read is classified like any probe child (timeout, permission, other)
+ * and carries a short path-free cause (code, exit status, signal); it is never a
+ * version. "empty_output" is a child that exited 0 and printed nothing.
+ */
+export type CommandVersionRead =
+  | { kind: "version"; version: string }
+  | {
+    kind: "failed";
+    reason: Exclude<RuntimeProbeUnavailableReason, "not_installed" | "unsupported_version">;
+    detail: string;
+  };
+
+function describeVersionReadFailure(error: unknown): string {
+  // Structured fields only: stderr can carry local paths, and this cause ends
+  // up in user-visible copy.
+  const typed = (error ?? {}) as { code?: unknown; status?: unknown; signal?: unknown };
+  const parts: string[] = [];
+  if (typed.code === "ETIMEDOUT") parts.push(`did not finish within ${COMMAND_VERSION_TIMEOUT_MS} ms`);
+  else if (typeof typed.code === "string") parts.push(`error ${typed.code}`);
+  if (typeof typed.status === "number") parts.push(`exit status ${typed.status}`);
+  if (typeof typed.signal === "string") parts.push(`signal ${typed.signal}`);
+  return parts.length > 0 ? parts.join(", ") : "failed without a status";
+}
+
+/** {@link readCommandVersionAsync} keeping the failure's classification and cause; a cancel is rethrown, never a verdict. */
+export async function readCommandVersionDetailedAsync(command: string, args: string[] = [], deps: ProbeDeps = {}): Promise<CommandVersionRead> {
   const env = await withWindowsUserEnvironmentAsync(deps.env ?? ambientProcessEnv(), deps);
   const runChild = deps.runProbeChildFn ?? runProbeChild;
   try {
     const { stdout } = await runChild(command, [...args, "--version"], {
       env,
       ...(deps.cwd ? { cwd: deps.cwd } : {}),
-      timeoutMs: 5000,
+      timeoutMs: COMMAND_VERSION_TIMEOUT_MS,
       platform: deps.platform ?? process.platform,
       signal: deps.signal,
     });
-    return stdout.trim().split(/\r?\n/)[0] || null;
+    const version = stdout.trim().split(/\r?\n/)[0];
+    return version ? { kind: "version", version } : { kind: "failed", reason: "probe_failed", detail: "exited 0 without printing a version" };
   } catch (error) {
     rethrowIfAborted(error, deps.signal);
-    return null;
+    return { kind: "failed", reason: classifyProbeExecFailure(error), detail: describeVersionReadFailure(error) };
   }
 }

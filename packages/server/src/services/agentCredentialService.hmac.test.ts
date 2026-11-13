@@ -41,7 +41,7 @@ async function seedExternalAgent() {
 }
 
 async function mint(agentId: string) {
-  return mintAgentCredential({ agentId, scopes: ["read"], createdByUserId: null });
+  return mintAgentCredential({ agentId, scopes: ["read"], issuedVia: "computer", createdByUserId: null });
 }
 
 async function storedHmac(credentialId: string): Promise<Buffer | null> {

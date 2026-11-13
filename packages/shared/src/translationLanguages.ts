@@ -9,6 +9,7 @@ const SUPPORTED_TRANSLATION_LANGUAGE_CODES = [
   "de",
   "pt-br",
   "it",
+  "ru",
 ] as const;
 
 export type SupportedTranslationLanguageCode = typeof SUPPORTED_TRANSLATION_LANGUAGE_CODES[number];
@@ -27,6 +28,7 @@ export const SUPPORTED_TRANSLATION_LANGUAGES: ReadonlyArray<{
   { value: "de", label: "German" },
   { value: "pt-br", label: "Portuguese (Brazil)" },
   { value: "it", label: "Italian" },
+  { value: "ru", label: "Russian" },
 ];
 
 const SUPPORTED_TRANSLATION_LANGUAGE_SET = new Set<string>(
@@ -56,4 +58,29 @@ export function normalizeTranslationLanguageCode(
   }
 
   return null;
+}
+
+// Tags whose CLDR display name reads better than the code's own: Simplified /
+// Traditional Chinese by script rather than by region, Brazilian Portuguese.
+const DISPLAY_NAME_TAGS: Partial<Record<SupportedTranslationLanguageCode, string>> = {
+  "zh-cn": "zh-Hans",
+  "zh-tw": "zh-Hant",
+  "pt-br": "pt-BR",
+};
+
+/**
+ * A translation language's name in the reader's UI language (`uiLocaleTag`, a
+ * BCP 47 tag), from CLDR via Intl.DisplayNames: 日本語 UI shows 英語, 韓国語…
+ * Falls back to the English label where Intl.DisplayNames is unavailable.
+ */
+export function translationLanguageName(
+  code: SupportedTranslationLanguageCode,
+  uiLocaleTag: string,
+): string {
+  const fallback = SUPPORTED_TRANSLATION_LANGUAGES.find((language) => language.value === code)?.label ?? code;
+  try {
+    return new Intl.DisplayNames([uiLocaleTag], { type: "language" }).of(DISPLAY_NAME_TAGS[code] ?? code) ?? fallback;
+  } catch {
+    return fallback;
+  }
 }

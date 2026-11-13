@@ -131,7 +131,7 @@ test("Free upload accounting from the trial is enforced after the trial ends", a
   );
 });
 
-test("Free upload quota exceeded response includes Billing URL and action hint", async () => {
+test("Free upload quota exceeded response includes Billing URL and a next action for a person or an agent", async () => {
   const previousAppUrl = process.env.APP_URL;
   process.env.APP_URL = "https://app.example.test";
   try {
@@ -148,11 +148,18 @@ test("Free upload quota exceeded response includes Billing URL and action hint",
       );
     assert.ok(err instanceof FileUploadQuotaExceededError);
 
-    const body = await buildFileUploadQuotaExceededResponse(server.id, err);
+    // A person (the web upload route) is told to ask an owner.
+    const body = await buildFileUploadQuotaExceededResponse(server.id, err, "human");
     assert.equal(body.errorCode, "FILE_UPLOAD_QUOTA_EXCEEDED");
     assert.equal(body.billingUrl, `https://app.example.test/s/${server.slug}/settings/billing`);
-    assert.match(body.suggestedNextAction, /Settings > Billing/);
-    assert.match(body.suggestedNextAction, new RegExp(`/s/${server.slug}/settings/billing`));
+    assert.equal(body.suggestedNextAction, `Ask a server owner to open Settings > Billing and upgrade to Pro: https://app.example.test/s/${server.slug}/settings/billing`);
+    // An agent says why in the conversation, and may suggest Pro: Raft never requires payment (cindyz).
+    const agentBody = await buildFileUploadQuotaExceededResponse(server.id, err, "agent");
+    assert.deepEqual({ ...agentBody, suggestedNextAction: undefined }, { ...body, suggestedNextAction: undefined }, "only the next action differs");
+    assert.equal(
+      agentBody.suggestedNextAction,
+      `Say in the conversation that the file wasn't uploaded and why. If upgrading to Pro would help the person here, you can suggest that a server owner look at Settings > Billing: https://app.example.test/s/${server.slug}/settings/billing`,
+    );
   } finally {
     if (previousAppUrl === undefined) delete process.env.APP_URL;
     else process.env.APP_URL = previousAppUrl;

@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 
-import { and, desc, eq, gt, inArray, lte, not, sql } from "drizzle-orm";
+import { and, desc, eq, gt, inArray, lte, ne, not, sql } from "drizzle-orm";
 
 import { getDb } from "../db/index";
 import {
@@ -43,6 +43,19 @@ export type FreshnessMessageAnchorOptions = {
     senderType: "user" | "agent";
     senderId: string;
   };
+  /**
+   * The plan's history cutoff (services/historyWindow.ts): only messages
+   * created after it. What the window hides is never unseen; filtering by
+   * time, not by a seq boundary, holds even where seq does not follow
+   * created_at (an external projection keeps its source's time).
+   */
+  createdAfter?: Date;
+  /**
+   * Only people's and agents' words: system notices (lifecycle lines and the
+   * like) are left out. A task write's own checks already cover the state
+   * those lines restate (agentWriteLanding.ts `counts: "chat"`).
+   */
+  chatOnly?: boolean;
 };
 
 /**
@@ -50,8 +63,11 @@ export type FreshnessMessageAnchorOptions = {
  * listed only when every field of its text is either in the actor's request,
  * in the successful response to that request, or the actor's own name
  * (#proj-runtime task #1255). This is not proof the actor read the response.
- * Not listed, so they keep holding: `task.lifecycle_thread` (its text carries
- * the task title; the status-update response does not) and `channel.rename`
+ * `task.lifecycle_thread` (created from a message, took, released, assigned,
+ * status) names the task's number, title and status, all in the claim /
+ * create / unclaim / assign / update-status response; listed so an agent's
+ * next task write in that conversation is not held on its own line
+ * (#wg-task-v2:98488173). Not listed, so it keeps holding: `channel.rename`
  * (its "from" name is read outside the update lock and is not returned). A new
  * kind holds until someone checks it and adds it here.
  */
@@ -64,6 +80,7 @@ export const SELF_CAUSED_FRESHNESS_EXEMPT_SUBTYPES = [
   "task.created_summary",
   "task.assignment_receipt",
   "task.converted_summary",
+  "task.lifecycle_thread",
 ] as const;
 
 function excludeSenderConditions(excludeSender: NonNullable<FreshnessMessageAnchorOptions["excludeSender"]>) {
@@ -106,6 +123,8 @@ function messageAnchorConditions(channelId: string, options?: FreshnessMessageAn
   if (options?.excludeSender) {
     conditions.push(...excludeSenderConditions(options.excludeSender));
   }
+  if (options?.createdAfter) conditions.push(gt(messages.createdAt, options.createdAfter));
+  if (options?.chatOnly) conditions.push(ne(messages.messageType, "system"));
   return conditions;
 }
 
@@ -376,13 +395,25 @@ function agentAttentionConditions(
   if (options?.excludeSender) {
     conditions.push(...excludeSenderConditions(options.excludeSender));
   }
+  // Every query on these facts joins the message row.
+  if (options?.createdAfter) conditions.push(gt(messages.createdAt, options.createdAfter));
+  if (options?.chatOnly) conditions.push(ne(messages.messageType, "system"));
   return conditions;
 }
 
 export async function getLatestAgentAttentionAnchor(
   agentId: string,
   channelId: string,
-  options?: FreshnessMessageAnchorOptions,
+  options?: FreshnessMessageAnchorOptions & {
+    /**
+     * Only facts after this seq: the caller's model-seen boundary. Anything
+     * at or before it cannot be unseen, and without the bound an agent that
+     * wrote most of a channel walked back through every fact of its own
+     * messages (excluded only after the join) on each gated write
+     * (#proj-o11y:#24). Not found means nothing after it, not "no message".
+     */
+    afterSeq?: number;
+  },
 ): Promise<{ seq: number; messageId: string | null }> {
   const db = getDb();
   const [latest] = await db
@@ -392,7 +423,7 @@ export async function getLatestAgentAttentionAnchor(
     })
     .from(inboxNotificationFacts)
     .innerJoin(messages, eq(messages.id, inboxNotificationFacts.messageId))
-    .where(and(...agentAttentionConditions(agentId, channelId, 0, options)))
+    .where(and(...agentAttentionConditions(agentId, channelId, Math.min(Number.MAX_SAFE_INTEGER, Math.max(0, Math.floor(options?.afterSeq ?? 0))), options)))
     .orderBy(desc(inboxNotificationFacts.messageSeq))
     .limit(1);
   return latest ? { seq: latest.seq, messageId: latest.messageId } : { seq: 0, messageId: null };
@@ -507,6 +538,8 @@ export async function getFormalMentionFacts(
   lastSeenSeq: number,
   latestSeq: number,
   excludeExactSeqs?: number[],
+  /** As `FreshnessMessageAnchorOptions.createdAfter`. */
+  createdAfter?: Date,
 ): Promise<{
   count: number;
   firstMessageId: string | null;
@@ -526,13 +559,17 @@ export async function getFormalMentionFacts(
   ];
   const excludedSeqs = normalizedExactSeqs(excludeExactSeqs, lastSeenSeq);
   if (excludedSeqs.length > 0) conditions.push(not(inArray(messageMentions.messageSeq, excludedSeqs)));
-  const rows = await db
+  const select = db
     .select({
       messageId: messageMentions.messageId,
       handleAtSendTime: messageMentions.handleAtSendTime,
     })
-    .from(messageMentions)
-    .where(and(...conditions))
+    .from(messageMentions);
+  const rows = await (createdAfter
+    ? select
+      .innerJoin(messages, eq(messages.id, messageMentions.messageId))
+      .where(and(...conditions, gt(messages.createdAt, createdAfter)))
+    : select.where(and(...conditions)))
     .orderBy(messageMentions.messageSeq);
 
   return {

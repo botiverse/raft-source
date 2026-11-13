@@ -10,7 +10,7 @@ const inSourceSnapshot = existsSync(join(projectDir, "RELEASE_SOURCE"));
 const workflowPath = join(projectDir, ".github", "workflows", "test.yml");
 const cliPackagePath = join(projectDir, "packages", "cli", "package.json");
 const cliManifestPath = join(projectDir, "packages", "cli", "test-execution-manifest.json");
-const cliManifestRunnerPath = join(projectDir, "packages", "cli", "scripts", "run-tests-with-manifest.mjs");
+const cliManifestRunnerPath = join(projectDir, "packages", "cli", "scripts", "run-tests-with-manifest.ts");
 
 type CliExecutionManifest = {
   schemaVersion: number;
@@ -29,11 +29,11 @@ type CliExecutionManifest = {
 };
 
 const expectedCliCaseCounts = new Map([
-  ["src/client.test.ts", 25],
-  ["src/commands/action/prepare.test.ts", 21],
-  ["src/commands/message/_format.test.ts", 61],
-  ["src/commands/task/_format.test.ts", 28],
-  ["src/parserOutput.test.ts", 10],
+  ["src/client.test.ts", 29],
+  ["src/commands/action/prepare.test.ts", 30],
+  ["src/commands/message/_format.test.ts", 79],
+  ["src/commands/task/_format.test.ts", 37],
+  ["src/parserOutput.test.ts", 3],
 ]);
 
 function unitFastBody(workflow: string): string {
@@ -195,10 +195,10 @@ test("Raft CLI package test script validates the per-file execution manifest wit
   const cliPackage = JSON.parse(readFileSync(cliPackagePath, "utf8")) as {
     scripts?: Record<string, string>;
   };
-  assert.equal(cliPackage.scripts?.test, "node scripts/run-tests-with-manifest.mjs");
+  assert.equal(cliPackage.scripts?.test, "node --import @oxc-node/core/register scripts/run-tests-with-manifest.ts");
   assert.equal(
     cliPackage.scripts?.["test:update-manifest"],
-    "node scripts/run-tests-with-manifest.mjs --update-manifest",
+    "node --import @oxc-node/core/register scripts/run-tests-with-manifest.ts --update-manifest",
   );
 
   const runner = readFileSync(cliManifestRunnerPath, "utf8");

@@ -11,7 +11,6 @@ type MemberRoleActionsProps = {
   isAllChannel: boolean;
   roleCapabilitiesEnabled: boolean;
   currentUserId: string | undefined;
-  roleActionsEnabled: boolean;
   roleChangingKey: string | null;
   changeMemberRole: (targetType: "user" | "agent", memberId: string, role: "member" | "admin") => Promise<void>;
   formatMessage: IntlShape["formatMessage"];
@@ -28,7 +27,6 @@ export function MemberRoleActions({
   isAllChannel,
   roleCapabilitiesEnabled,
   currentUserId,
-  roleActionsEnabled,
   roleChangingKey,
   changeMemberRole,
   formatMessage,
@@ -47,8 +45,7 @@ export function MemberRoleActions({
     && protectedServerAdmin
     && effectiveRole !== "member";
   const canChangeRole = !isArchived && !isAllChannel && member.canChangeChannelRole;
-  const showRoleAction = roleActionsEnabled
-    && (canChangeRole || canExplainProtectedDemote);
+  const showRoleAction = canChangeRole || canExplainProtectedDemote;
   const nextRole = effectiveRole === "member" ? "admin" : "member";
   const key = `${targetType}:${member.id}`;
 

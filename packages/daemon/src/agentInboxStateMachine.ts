@@ -1,3 +1,4 @@
+import type { AgentGatedWriteAction } from "@botiverse/raft-shared";
 import {
   buildApmFreshnessDecisionProducerFactId,
   projectApmHeldFreshnessEnvelope,
@@ -5,7 +6,7 @@ import {
   type ApmHeldFreshnessEnvelopeBody,
 } from "./apmStateMachine";
 
-export type AgentInboxStateMachineAction = "send" | "task_claim" | "task_update" | "task_amend";
+export type AgentInboxStateMachineAction = AgentGatedWriteAction;
 
 export type AgentInboxStateMachineMessage = {
   seq?: number;

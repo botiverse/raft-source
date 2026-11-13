@@ -1,14 +1,17 @@
-import { useUIStore } from "./uiStore";
 import { create } from "zustand";
 import type { ExternalMessageAuthorProjection } from "@botiverse/raft-shared";
 
-export type ProfileType = "agent" | "human" | "external";
+export type ProfileType = "agent" | "human" | "computer" | "external";
 
 interface ProfileState {
   /** Type of profile currently open */
   profileType: ProfileType | null;
   /** ID of the entity whose profile is open */
   profileId: string | null;
+  /** The channel a person's profile was opened from: its profile names their
+   *  servers in that channel (`?channelId=`, #wg-rbac:#58). Null when opened
+   *  from no channel (a Computer's owner, the URL alone). */
+  profileChannelId: string | null;
   /** Frozen attribution payload for an external-message identity detail. */
   externalProfile: ExternalMessageAuthorProjection | null;
   /** Channel anchor needed to restore an external identity from browser history. */
@@ -32,7 +35,7 @@ interface ProfileState {
 
   /** Open a profile panel */
   openProfile: (
-    type: "agent" | "human",
+    type: "agent" | "human" | "computer",
     id: string,
     options?: {
       /**
@@ -42,6 +45,8 @@ interface ProfileState {
        */
       defaultAgentTabIntent?: string;
       openSource?: "channel" | "thread";
+      /** The channel (a thread's parent) the person was opened from. */
+      channelId?: string | null;
     },
   ) => void;
   /** Open the standard profile panel for a provider-owned message author. */
@@ -59,6 +64,7 @@ interface ProfileState {
 export const useProfileStore = create<ProfileState>((set) => ({
   profileType: null,
   profileId: null,
+  profileChannelId: null,
   externalProfile: null,
   externalProfileChannelId: null,
   externalProfileIsMention: false,
@@ -66,11 +72,14 @@ export const useProfileStore = create<ProfileState>((set) => ({
   openSource: null,
   defaultAgentTabIntent: null,
 
+  // Focus Mode stays on while a profile is open: the layout already shows the
+  // channel beside the profile (isThreadMaximized), and closing the profile
+  // returns to the focused thread.
   openProfile: (type, id, options) => {
-    useUIStore.getState().restoreThreadLayout();
     set((state) => ({
       profileType: type,
       profileId: id,
+      profileChannelId: options?.channelId ?? null,
       externalProfile: null,
       externalProfileChannelId: null,
       externalProfileIsMention: false,
@@ -83,10 +92,10 @@ export const useProfileStore = create<ProfileState>((set) => ({
   },
 
   openExternalProfile: (id, profile, options) => {
-    useUIStore.getState().restoreThreadLayout();
     set((state) => ({
       profileType: "external",
       profileId: id,
+      profileChannelId: null,
       externalProfile: profile,
       externalProfileChannelId: options.channelId,
       externalProfileIsMention: options.isMention ?? false,
@@ -104,6 +113,7 @@ export const useProfileStore = create<ProfileState>((set) => ({
     set({
       profileType: null,
       profileId: null,
+      profileChannelId: null,
       externalProfile: null,
       externalProfileChannelId: null,
       openSource: null,

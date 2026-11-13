@@ -25,7 +25,18 @@ export interface DecisionEventInput<
   attrs?: Partial<Record<AttributeKey, DecisionScalar>>;
 }
 
-const FORBIDDEN_DECISION_ATTRIBUTE_KEY = /content|message|prompt|stack|path|url|token|secret|query|payload|body/i;
+// Keys that name raw content are never allowed. `message` and `path` are allowed only as the
+// noun of a bounded identifier or counter (message_id, message_count, path_kind, ...), never on
+// their own or as text (message, message_text, path, file_path). The key check is a second line
+// of defence: string values stay safe only through each contract's own validator.
+const FORBIDDEN_DECISION_ATTRIBUTE_KEY = /content|prompt|stack|url|token|secret|query|payload|body/i;
+const CONTENT_NOUN_KEY = /message|path/i;
+const BOUNDED_NOUN_SUFFIX = /_(id|id_hash|count|n|present|kind|type|seq|len|bucket)$/i;
+
+function isUnsafeDecisionAttributeKey(key: string): boolean {
+  if (FORBIDDEN_DECISION_ATTRIBUTE_KEY.test(key)) return true;
+  return CONTENT_NOUN_KEY.test(key) && !BOUNDED_NOUN_SUFFIX.test(key);
+}
 
 export function buildDecisionEventAttrs<
   Action extends string,
@@ -49,7 +60,7 @@ export function buildDecisionEventAttrs<
     reason: input.reason,
   };
   for (const [key, value] of Object.entries(input.attrs ?? {})) {
-    if (!(contract.attributeKeys as readonly string[]).includes(key) || FORBIDDEN_DECISION_ATTRIBUTE_KEY.test(key)) {
+    if (!(contract.attributeKeys as readonly string[]).includes(key) || isUnsafeDecisionAttributeKey(key)) {
       throw new Error(`Decision event ${contract.name} rejected undeclared or unsafe attribute`);
     }
     if (typeof value !== "string" && typeof value !== "number" && typeof value !== "boolean") {

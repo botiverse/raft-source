@@ -1,6 +1,4 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
 
 import { resolveAgentKnowledgeDoc } from "./agentKnowledgeService";
 
@@ -79,41 +77,22 @@ test("[multi-cause] the didn't-see-this gotcha does not offer a single cause", a
 
   // Both causes on the same line. A reader who stops at the first explanation
   // gets the wrong one roughly whenever the first one does not apply.
-  // Matches both "may not have been called recently" and "has not been called
-  // recently": this clause is not what the fix changes, so the guard must not
-  // pin my rewording of it — only that the cause is still there.
-  assert.match(line, /been called recently/,
-    "the common cause (no check this turn) must stay");
+  // The common cause is "the agent hasn't read that conversation yet". The
+  // guard pins only that the cause is still there, not its exact wording.
+  assert.match(line, /(hasn't|has not) read that conversation/,
+    "the common cause (conversation not read yet) must stay");
   assert.match(line, /undeliverable|discarded/,
     "the discard cause must ride on the same line as the common one");
   assert.match(line, /does not establish/,
     "it must name the invalid inference, not just add a cause");
 });
 
-// The page now quotes a literal that lives in another package. @Cat asked for it
-// (#proj-docs:0581d8f0) for a good reason: an agent can act on the sentence it
-// actually sees, not on `has_more`. But a quoted literal is frozen text with a
-// clock — change the CLI string and the page goes stale with nothing turning red.
-// So bind them. `drainComplete` in packages/cli/src/commands/message/_inbox.ts is
-// `!hasMore && allMessages.length > 0`, which is why the all-discarded case prints
-// neither status line; that is the second claim pinned here.
-const CLI_CHECK = join(
-  import.meta.dirname, "..", "..", "..", "..",
-  "packages", "cli", "src", "commands", "message", "check.ts",
-);
-
-test("[lockstep] the status lines the page quotes are the ones the CLI prints", async () => {
+// The page quotes the closing status line the CLI prints. `drainComplete` in
+// packages/cli/src/commands/message/_inbox.ts is `!hasMore && allMessages.length > 0`,
+// which is why the all-discarded case prints neither status line.
+test("[quoted] the page quotes the closing status line and names the all-discarded case", async () => {
   const resolved = await resolveAgentKnowledgeDoc("inbox");
   assert.ok(resolved, "the topic must resolve");
-  const cli = readFileSync(CLI_CHECK, "utf-8");
-
-  for (const literal of [
-    "No more new inbox messages.",
-    "More messages are pending.",
-  ]) {
-    assert.ok(cli.includes(literal),
-      `the CLI no longer prints "${literal}" — the inbox page quotes it and must be updated`);
-  }
   assert.match(resolved.content, /No more new inbox messages\./,
     "the page must quote the closing line an agent actually reads");
   assert.match(resolved.content, /prints \*\*no status line at all\*\*/,

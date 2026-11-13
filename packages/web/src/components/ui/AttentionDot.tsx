@@ -37,7 +37,7 @@ type SpanPassthroughProps = HTMLAttributes<HTMLSpanElement> &
 import Tooltip from "./Tooltip";
 
 export interface AttentionDotProps extends Omit<SpanPassthroughProps, "children"> {
-  /** Size variant. `lg` (default) = the 9px DS pixel — use everywhere by
+  /** Size variant. `lg` (default) = the 10px DS pixel (status.md#sizes) — use everywhere by
    *  default. `sm` = 6px — compact-only, reach for it only when the parent
    *  can not fit `lg`. Size is physical fit, not priority. */
   size?: "sm" | "lg";
@@ -50,7 +50,7 @@ export interface AttentionDotProps extends Omit<SpanPassthroughProps, "children"
 
 const SIZE_CLASS: Record<NonNullable<AttentionDotProps["size"]>, string> = {
   sm: "size-1.5 rounded-[1px] border",
-  lg: "size-[9px] rounded-[2px] border-[1.5px]",
+  lg: "size-2.5 rounded-[2px] border-[1.5px]",
 };
 
 export default function AttentionDot({

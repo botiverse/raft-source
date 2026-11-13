@@ -2,13 +2,25 @@ import assert from "node:assert/strict";
 import {
   buildRuntimeErrorActivityDiagnostic,
   buildRuntimeErrorDiagnosticEnvelope,
+  credentialInvalidReasonOf,
   formatRuntimeBillingExhaustedMessage,
   formatRuntimeInputTooLargeMessage,
   formatRuntimeLoginRequiredMessage,
   formatRuntimePlanAccessMessage,
   formatRuntimeStartTimeoutMessage,
   isRuntimePlanAccessErrorText,
+  buildBoundedVisibleCrashDetail,
+  MAX_VISIBLE_CRASH_DETAIL_CHARS,
+  scrubRuntimeErrorDiagnosticText,
+  runtimeErrorTraceClassAttrs,
 } from "./runtimeErrorDiagnostics";
+import {
+  boundedRuntimeErrorDetail,
+  classifyRuntimeErrorCode,
+  MAX_VISIBLE_RUNTIME_ERROR_DETAIL_CHARS,
+  scrubRuntimeErrorText,
+} from "@botiverse/raft-shared";
+import { recoverableRuntimeDeliveryBackoffReason, recoverableRuntimeProcessCloseReason } from "./runtimeErrorDeliveryPolicy";
 
 test("buildRuntimeErrorDiagnosticEnvelope classifies and bounds provider errors", () => {
   const envelope = buildRuntimeErrorDiagnosticEnvelope(
@@ -301,6 +313,48 @@ test("buildRuntimeErrorDiagnosticEnvelope classifies provider connection failure
   assert.equal(refused.spanAttrs.turn_reason, "provider_connection_error");
 });
 
+// task #927: Grok CLI (reqwest) reports a request it could not send with no
+// socket code. It is a connection error for diagnosis and delivery backoff;
+// the process-close policy is unchanged (socket evidence only).
+const REQWEST_SEND_FAILURE = "reqwest error stream: error sending request for url (https://cli-chat-proxy.grok.com/v1/responses)";
+
+test("a reqwest request-send failure is a provider connection error, and more specific classes still win", () => {
+  const sendFailure = buildRuntimeErrorDiagnosticEnvelope(REQWEST_SEND_FAILURE);
+  assert.equal(sendFailure.spanAttrs.runtime_error_class, "ProviderConnectionError");
+  assert.equal(sendFailure.spanAttrs.turn_reason, "provider_connection_error");
+  assert.equal(sendFailure.spanAttrs.runtime_error_action ?? "none", "none", "no new recovery action");
+
+  const cases: Array<[string, string]> = [
+    [`${REQWEST_SEND_FAILURE}: operation timed out`, "TimeoutError"],
+    [`${REQWEST_SEND_FAILURE}: HTTP 401 Unauthorized`, "AuthError"],
+    [`${REQWEST_SEND_FAILURE}: HTTP 429 Too Many Requests`, "RateLimitError"],
+    [`GrokApiError: ${REQWEST_SEND_FAILURE}`, "GrokApiError"],
+    ["request failed", "RuntimeError"],
+    ["error sending request", "RuntimeError"],
+  ];
+  for (const [text, expected] of cases) {
+    assert.equal(buildRuntimeErrorDiagnosticEnvelope(text).spanAttrs.runtime_error_class, expected, text);
+  }
+});
+
+test("a reqwest request-send failure moves the delivery backoff reason but not the process-close policy", () => {
+  assert.equal(recoverableRuntimeDeliveryBackoffReason(REQWEST_SEND_FAILURE, null, null), "provider_connection_error");
+  assert.equal(recoverableRuntimeProcessCloseReason(REQWEST_SEND_FAILURE, null, null), null, "a close on this text alone is not recoverable, as before");
+  assert.equal(
+    recoverableRuntimeProcessCloseReason(`${REQWEST_SEND_FAILURE}: connection reset (ECONNRESET)`, null, null),
+    "provider_connection_error",
+    "socket evidence keeps its recoverable close",
+  );
+  assert.equal(recoverableRuntimeProcessCloseReason("API Error: Unable to connect to API (ECONNRESET)", null, null), "provider_connection_error");
+  // Every earlier route into a recoverable connection close is kept, not only socket codes.
+  assert.equal(recoverableRuntimeProcessCloseReason("ProviderConnectionError: transport unavailable", null, null), "provider_connection_error");
+  assert.equal(
+    recoverableRuntimeProcessCloseReason(`ProviderConnectionError: ${REQWEST_SEND_FAILURE}`, null, null),
+    "provider_connection_error",
+    "an explicit class name with the new phrase keeps its recoverable close",
+  );
+});
+
 test("buildRuntimeErrorDiagnosticEnvelope classifies provider timeout codes", () => {
   const timeout = buildRuntimeErrorDiagnosticEnvelope("API Error: model request failed with ETIMEDOUT");
   assert.equal(timeout.spanAttrs.runtime_error_class, "TimeoutError");
@@ -326,10 +380,25 @@ test("formatRuntimeLoginRequiredMessage gives action-oriented runtime copy", () 
   );
 });
 
-test("formatRuntimeStartTimeoutMessage gives bounded-startup guidance", () => {
+test("formatRuntimeStartTimeoutMessage names the provider as the likely cause, generic for most runtimes", () => {
   assert.equal(
-    formatRuntimeStartTimeoutMessage("gemini"),
-    "Gemini CLI did not finish starting on this machine. Check that Gemini CLI is installed, logged in, and can run non-interactively, then retry starting this agent.",
+    formatRuntimeStartTimeoutMessage("gemini", { timeoutMs: 120_000, model: "gemini-3.1-pro-preview" }),
+    "Gemini CLI did not finish starting within 2 minutes. Its model provider may be slow or rate-limited; also check that Gemini CLI is installed, logged in, and can run non-interactively on this machine, then retry starting this agent.",
+  );
+  assert.equal(
+    formatRuntimeStartTimeoutMessage("codex", { timeoutMs: 2_500 }),
+    "Codex CLI did not finish starting within 3 seconds. Its model provider may be slow or rate-limited; also check that Codex CLI is installed, logged in, and can run non-interactively on this machine, then retry starting this agent.",
+  );
+});
+
+test("formatRuntimeStartTimeoutMessage names an OpenCode model and its free tier", () => {
+  assert.equal(
+    formatRuntimeStartTimeoutMessage("opencode", { timeoutMs: 120_000, model: "opencode/mimo-v2.6-flash-free" }),
+    "OpenCode did not finish starting within 2 minutes. The selected model (opencode/mimo-v2.6-flash-free, free tier) may be slow to respond, queued or rate-limited by its provider. Try again later, or switch to another model.",
+  );
+  assert.equal(
+    formatRuntimeStartTimeoutMessage("opencode", { timeoutMs: 60_000, model: "anthropic/claude-sonnet-5" }),
+    "OpenCode did not finish starting within 1 minute. The selected model (anthropic/claude-sonnet-5) may be slow to respond, queued or rate-limited by its provider. Try again later, or switch to another model.",
   );
 });
 
@@ -489,4 +558,113 @@ test("formatRuntimePlanAccessMessage names the plan and the model, not a login",
   assert.match(message, /Switch this agent to a model the plan includes, or upgrade the plan, then retry starting this agent\./);
   assert.doesNotMatch(message, /log in/i);
   assert.doesNotMatch(formatRuntimePlanAccessMessage("codex", null), /\(\)/);
+});
+
+// #proj-raft-computer:#46, reconciler step 4a: which runtime errors make the
+// agent's credential invalid (the process is kept, deliveries wait for the
+// credential). Exactly the existing classification; Codex's 403 "Usage not
+// included in your plan" is the plan, so plan access (it used to be a
+// non-sticky terminal failure, retried into the same 403).
+test("credentialInvalidReasonOf: rejected sign-in, plan without the model, exhausted billing; nothing else", () => {
+  assert.equal(credentialInvalidReasonOf("Your access token could not be refreshed because you have since logged out or signed in to another account. Please sign in again."), "user_reauth");
+  assert.equal(credentialInvalidReasonOf("API Error: 403 Forbidden: invalid api key"), "user_reauth");
+  assert.equal(credentialInvalidReasonOf("HTTP 403: Your plan does not include the model gpt-5-pro"), "user_model_access");
+  const codexPlan = "unexpected status 403 Forbidden: Usage not included in your plan";
+  assert.equal(credentialInvalidReasonOf(codexPlan), "user_model_access");
+  assert.equal(buildRuntimeErrorDiagnosticEnvelope(codexPlan).spanAttrs.runtime_error_action, "user_model_access");
+  assert.equal(buildRuntimeErrorActivityDiagnostic(codexPlan).requiredAction, "user_model_access");
+  assert.equal(credentialInvalidReasonOf("402 Grok Build usage balance exhausted"), "billing");
+  assert.equal(credentialInvalidReasonOf("Your credit balance is too low to access the API"), "billing");
+  for (const message of [
+    "You've hit your usage limit. Upgrade your plan or try again later.",
+    "API Error: 429 Too Many Requests",
+    "API Error: 403 Request not allowed",
+    "The requested model is not supported for this account.",
+    "stream closed before response.completed",
+  ]) {
+    assert.equal(credentialInvalidReasonOf(message), null, message);
+  }
+});
+
+test("#wg-rbac:#57: the daemon's scrubber and bound are shared's, and its fixed rewrites carry the server's codes", () => {
+  assert.equal(scrubRuntimeErrorDiagnosticText, scrubRuntimeErrorText, "one scrubber for daemon and server");
+  assert.equal(MAX_VISIBLE_CRASH_DETAIL_CHARS, MAX_VISIBLE_RUNTIME_ERROR_DETAIL_CHARS);
+  assert.equal(buildBoundedVisibleCrashDetail(`${"x".repeat(600)}`), boundedRuntimeErrorDetail(`${"x".repeat(600)}`));
+  for (const runtime of ["claude", "codex", "builtin", "pi", "qwen", "qoder", "gemini"]) {
+    assert.equal(classifyRuntimeErrorCode({ message: formatRuntimeLoginRequiredMessage(runtime) }), "auth_required", runtime);
+    assert.equal(classifyRuntimeErrorCode({ message: formatRuntimeInputTooLargeMessage(runtime) }), "input_too_large", runtime);
+    assert.equal(classifyRuntimeErrorCode({ message: formatRuntimeBillingExhaustedMessage(runtime) }), "billing", runtime);
+    assert.equal(classifyRuntimeErrorCode({ message: formatRuntimePlanAccessMessage(runtime, "glm-5") }), "model_unavailable", runtime);
+  }
+});
+
+// AndyLok: Claude's limit errors alone had 102 fingerprints because the text
+// carries the reset time. What changes between occurrences of one error
+// (times, dates, waits, time zones, numbers) is not part of its fingerprint;
+// its words are.
+test("a runtime error's fingerprint ignores reset times, dates, durations and time zones, not its words", () => {
+  const fingerprint = (text: string) => buildRuntimeErrorDiagnosticEnvelope(text).spanAttrs.runtime_error_fingerprint;
+  const sameKind: Array<[string, string]> = [
+    ["You've hit your weekly limit · resets 1pm (UTC)", "You've hit your weekly limit · resets 11:30 pm (America/New_York)"],
+    ["Claude usage limit reached [01:24:56]", "Claude usage limit reached [23:05:01]"],
+    ["5-hour limit reached ∙ resets Nov 14, 2026 3am (Europe/London)", "5-hour limit reached ∙ resets December 2 10pm (Asia/Shanghai)"],
+    ["Rate limited, retry in 30s (resets 2026-11-12T11:04:02Z)", "Rate limited, retry in 2 minutes (resets 2026-11-13T00:00:00+08:00)"],
+    ["Limit resets Monday at 9am PST", "Limit resets Friday at 17:00 GMT+8"],
+  ];
+  for (const [a, b] of sameKind) assert.equal(fingerprint(a), fingerprint(b), `${a} / ${b}`);
+
+  const kinds = [
+    "You've hit your weekly limit · resets 1pm (UTC)",
+    "You've hit your session limit · resets 1pm (UTC)",
+    "API Error: 529 Overloaded",
+    "API Error: Connection error.",
+    "Prompt is too long",
+    "OAuth token has expired. Please run /login",
+  ];
+  assert.equal(new Set(kinds.map(fingerprint)).size, kinds.length, "different errors keep different fingerprints");
+});
+
+// AndyLok: one invalid-model error from a custom Codex provider (DeepSeek)
+// had 3 fingerprints in 3 turns. Ids minted per request are not part of it.
+test("a runtime error's fingerprint ignores request ids, uuids and hex ids, not its words", () => {
+  const fingerprint = (text: string) => buildRuntimeErrorDiagnosticEnvelope(text).spanAttrs.runtime_error_fingerprint;
+  const body = (model: string) => `unexpected status 400 Bad Request: {"error":{"message":"The supported API model names are deepseek-flash, deepseek-v4-pro, but you passed ${model}.","type":"invalid_request_error","param":null,"code":"invalid_request_error"}}, url: https://api.deepseek.com/v1/chat/completions`;
+  const variants = [
+    `${body("deepseek-chat-does-not-exist")}, request id: 3f2a9c1e-7b4d-4e8a-9c1f-2d3e4f5a6b7c`,
+    `${body("deepseek-chat-does-not-exist")}, request id: 0b7d14aa-2c3e-4f50-8a61-9d0e1f2a3b4c`,
+    `${body("deepseek-chat-does-not-exist")}, request id: req_8Hk2LmQ9xZ4tR7vP1nB3`,
+    `${body("deepseek-chat-does-not-exist")}, request id: 9a8b7c6d5e4f3a2b1c0d`,
+  ];
+  assert.equal(new Set(variants.map(fingerprint)).size, 1, "one error, one fingerprint");
+  assert.equal(
+    fingerprint(`${body("deepseek-chat-does-not-exist")}, cf-ray: 8f1a2b3c4d5e6f70-SJC`),
+    fingerprint(`${body("deepseek-chat-does-not-exist")}, cf-ray: 90aa11bb22cc33dd-HKG`),
+  );
+  const bare = "The supported API model names are deepseek-flash, deepseek-v4-pro, but you passed deepseek-chat-does-not-exist.";
+  assert.equal(fingerprint(`${bare} (request id: a1b2c3d4)`), fingerprint(`${bare} (request id: 77e0ff12)`));
+  assert.equal(fingerprint(`${bare} trace chatcmpl-9Zx81Kq2Lm`), fingerprint(`${bare} trace chatcmpl-4Ab7Cd9Ef0`));
+
+  // A different model name, or a different error, keeps its own fingerprint.
+  assert.notEqual(fingerprint(variants[0]!), fingerprint(`${body("gpt-oss-120b")}, request id: 3f2a9c1e-7b4d-4e8a-9c1f-2d3e4f5a6b7c`));
+  assert.notEqual(fingerprint(variants[0]!), fingerprint("unexpected status 401 Unauthorized: invalid api key, request id: 3f2a9c1e-7b4d-4e8a-9c1f-2d3e4f5a6b7c"));
+});
+
+test("a runtime error's trace class comes from the typed provider error, then the text, then the reported status", () => {
+  const traceClass = (message: string, providerError?: { codes?: string[]; httpStatus?: number }) =>
+    runtimeErrorTraceClassAttrs(buildRuntimeErrorDiagnosticEnvelope(message), message, providerError);
+  // Typed codes decide, whatever the wording.
+  assert.deepEqual(traceClass("You've hit your limit · resets 1pm (UTC)", { codes: ["rate_limit"], httpStatus: 429 }), { runtime_error_class: "RateLimitError", turn_reason: "rate_limited", runtime_error_http_status: 429 });
+  assert.equal(traceClass("Your credit balance is empty", { codes: ["billing_error"] }).runtime_error_class, "BillingError");
+  assert.equal(traceClass("Account needs verifying", { codes: ["verification_required"], httpStatus: 403 }).runtime_error_class, "AuthError");
+  assert.equal(traceClass("Overloaded", { codes: ["unknown_code", "server_error"], httpStatus: 529 }).runtime_error_class, "ProviderServerError");
+  // No typed code: the text classifier, then the wording it does not know, then the status.
+  assert.equal(traceClass("API Error: 502 Bad Gateway").runtime_error_class, "ProviderServerError");
+  assert.equal(traceClass("OAuth token has expired. Please run /login", { httpStatus: 401 }).runtime_error_class, "AuthError");
+  assert.equal(traceClass("Prompt is too long", { codes: ["invalid_request"], httpStatus: 400 }).runtime_error_class, "InputTooLargeError");
+  assert.equal(traceClass("Auto-compact failed: conversation could not be summarized").runtime_error_class, "InputTooLargeError");
+  assert.equal(traceClass("API Error: Connection error.").runtime_error_class, "ProviderConnectionError");
+  assert.equal(traceClass("Claude AI usage limit reached|1731400000").runtime_error_class, "RateLimitError");
+  assert.equal(traceClass("Something went wrong", { codes: ["unknown"], httpStatus: 503 }).runtime_error_class, "ProviderServerError");
+  // Nothing typed or recognisable: RuntimeError, no status.
+  assert.deepEqual(traceClass("Execution failed"), { runtime_error_class: "RuntimeError", turn_reason: "unclassified_runtime_error" });
 });

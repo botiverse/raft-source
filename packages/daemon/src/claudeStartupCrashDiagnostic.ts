@@ -12,6 +12,8 @@ import type { RuntimeErrorActivityDiagnostic } from "@botiverse/raft-shared";
 
 export { buildBoundedVisibleCrashDetail, MAX_VISIBLE_CRASH_DETAIL_CHARS };
 
+const CLAUDE_ROOT_REFUSAL = "--dangerously-skip-permissions cannot be used with root/sudo privileges for security reasons";
+
 /** Structural slice of the daemon AgentProcess the carrier builder needs (kept
  * local so this diagnostic module does not depend on agentProcessManager). */
 type CrashProcessSlice = {
@@ -31,15 +33,20 @@ type CrashProcessSlice = {
 export function buildClaudeStartupCrashRuntimeError(
   ap: CrashProcessSlice,
   closeBeforeTurnBoundary: boolean,
+  exitCode?: number | null,
 ): RuntimeErrorActivityDiagnostic | undefined {
   if (ap.driver.id !== "claude") return undefined;
   if (!closeBeforeTurnBoundary) return undefined;
-  const message = ap.lastRuntimeError || (Array.isArray(ap.recentStderr) ? ap.recentStderr.at(-1) : undefined);
+  const rootRefusal = isClaudeRootRefusal(ap, closeBeforeTurnBoundary, exitCode);
+  const message = rootRefusal ? CLAUDE_ROOT_REFUSAL : ap.lastRuntimeError || (Array.isArray(ap.recentStderr) ? ap.recentStderr.at(-1) : undefined);
   if (!message || message.length === 0) return undefined;
-  return buildRuntimeErrorActivityDiagnostic(message, {
+  const diagnostic = buildRuntimeErrorActivityDiagnostic(message, {
     reasonProvenance: "daemon_fallback",
     nativeReasonPresent: false,
   });
+  return rootRefusal
+    ? { ...diagnostic, errorClass: "RootPrivilegesError", errorReason: "root_privileges" }
+    : diagnostic;
 }
 
 /** #688 exported projection shape (structurally compatible with the daemon
@@ -63,4 +70,18 @@ export function buildBoundedVisibleCrashProjection(
     ?.map((e) => e.kind === "text" ? { ...e, text: buildBoundedVisibleCrashDetail(String(e.text)) } : e) as TextProjectionEntry[]
     ?? [{ kind: "text", text: `Error: ${detail}` }];
   return { detail, entries };
+}
+
+/** Current confirmed CLI refusal: other exit codes deliberately keep generic diagnostics. */
+function isClaudeRootRefusal(ap: CrashProcessSlice, closeBeforeTurnBoundary: boolean, exitCode?: number | null): boolean {
+  return exitCode === 1 && ap.driver.id === "claude" && closeBeforeTurnBoundary
+    && [ap.lastRuntimeError, ...(ap.recentStderr ?? [])].some((line) => line?.trim() === CLAUDE_ROOT_REFUSAL);
+}
+
+/** Fixed copy and a stable presentation code; never project arbitrary stderr. */
+export function buildClaudeStartupCrashActivity(ap: CrashProcessSlice, closeBeforeTurnBoundary: boolean, summary: string, exitCode: number | null): { detail: string; detailKind: "runtime_crashed" | "claude_root_privileges" } {
+  if (isClaudeRootRefusal(ap, closeBeforeTurnBoundary, exitCode)) {
+    return { detailKind: "claude_root_privileges", detail: "Claude Code cannot start with root or sudo privileges while permission checks are disabled. Run Raft Computer as a non-root user, then start the agent again." };
+  }
+  return { detailKind: "runtime_crashed", detail: `Crashed (${summary})` };
 }

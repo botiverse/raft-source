@@ -1,9 +1,11 @@
 import { and, eq } from "drizzle-orm";
 import { getDb, type Database, type DatabaseExecutor } from "../db/index";
 import { attachments, messages } from "../db/schema";
-import { buildSearchText } from "./searchService";
+import { buildSearchText } from "./searchTokenizer";
 import { getThumbnailUrl, normalizeAttachmentFilename, resolveAttachmentMimeType } from "../routes/attachments";
 import { AttachmentLinkError, linkAttachmentsToMessageWithExecutor } from "./attachmentLinkingService";
+import type { ResolvedAttachment } from "./attachmentRecord";
+import { sameMessageCard } from "./messageCardService";
 
 type LinkedAttachment = {
   id: string;
@@ -43,9 +45,9 @@ export class AgentSendIdempotencyConflictError extends Error {
   readonly status = 409 as const;
   readonly code = "idempotency_key_reused" as const;
   readonly suggestedNextAction = "use a new idempotencyKey for different content";
-  readonly mismatch: "target" | "content" | "attachments";
+  readonly mismatch: "target" | "content" | "attachments" | "card";
 
-  constructor(mismatch: "target" | "content" | "attachments") {
+  constructor(mismatch: "target" | "content" | "attachments" | "card") {
     super(`idempotencyKey was already used for a message with a different ${mismatch}; use a new idempotencyKey for different content`);
     this.name = "AgentSendIdempotencyConflictError";
     this.mismatch = mismatch;
@@ -54,12 +56,27 @@ export class AgentSendIdempotencyConflictError extends Error {
 
 let dbOverride: (() => Database) | null = null;
 
+/** The keyed send a race hook sees: who, under which key, and what it would store (a card's metadata, or null). */
+type AgentSendRaceScope = { senderId: string; agentSendKey: string; actionMetadata: unknown };
+type AgentSendRaceHooks = {
+  /** In the send's transaction, before its insert: every check before it passed. */
+  beforeInsert?: (send: AgentSendRaceScope) => Promise<void>;
+  /** In the transaction of a send whose insert won the key, before it commits. */
+  afterInsert?: (send: AgentSendRaceScope) => Promise<void>;
+};
+let raceHooksForTests: AgentSendRaceHooks = {};
+
+/** Real-PG race tests: hold keyed sends before and after the insert the unique index decides. */
+export function __setAgentSendRaceHooksForTests(hooks: AgentSendRaceHooks): void {
+  raceHooksForTests = hooks;
+}
+
 function resolveDb(): Database {
   return dbOverride ? dbOverride() : getDb();
 }
 
 function toLinkedAttachment(
-  attachment: typeof attachments.$inferSelect,
+  attachment: ResolvedAttachment,
 ): LinkedAttachment {
   return {
     id: attachment.id,
@@ -78,14 +95,23 @@ export async function createOrReplayAgentSend<TInserted = never>(opts: {
   content: string;
   agentSendKey: string;
   attachmentIds?: string[];
+  /** Stored on a new message as `action_metadata` (RFC 082: a message card's). */
+  actionMetadata?: unknown | null;
   /**
-   * Agent-facing sends (`idempotencyKey`): a replay whose target, content or
-   * ordered attachment set differs from the committed message is refused with
+   * Agent-facing sends (`idempotencyKey`): a replay whose target, content,
+   * card (RFC 082) or ordered attachment set differs from the committed message is refused with
    * AgentSendIdempotencyConflictError instead of reporting the original as
    * sent. Server-internal producers that key re-runs of mutable templates
    * (e.g. onboarding openers) leave this off and keep replaying the original.
    */
   rejectMismatchedReplay?: boolean;
+  /**
+   * False when `content` is not the sender's: the fallback Raft derived from
+   * a message card (RFC 082 §4.1). A replay then compares the card alone, as
+   * the derived content follows from it and a Server deployed between the two
+   * attempts may derive it differently. Default true.
+   */
+  senderWroteContent?: boolean;
   /**
    * Runs at the start of the transaction, before the source insert attempts to
    * allocate messages.seq. Outbound admission uses it to serialize eligible
@@ -107,6 +133,8 @@ export async function createOrReplayAgentSend<TInserted = never>(opts: {
   const run = async (tx: DatabaseExecutor): Promise<ReplayableAgentSendResult<TInserted>> => {
 
     if (opts.beforeInsert) await opts.beforeInsert(tx);
+    const raceScope = { senderId, agentSendKey, actionMetadata: opts.actionMetadata ?? null };
+    await raceHooksForTests.beforeInsert?.(raceScope);
     const [insertedMessage] = await tx
       .insert(messages)
       .values({
@@ -117,6 +145,7 @@ export async function createOrReplayAgentSend<TInserted = never>(opts: {
         content,
         messageType: "chat",
         searchText: buildSearchText(content),
+        actionMetadata: opts.actionMetadata ?? null,
       })
       .onConflictDoNothing()
       .returning();
@@ -134,6 +163,7 @@ export async function createOrReplayAgentSend<TInserted = never>(opts: {
           ? (opts.onInserted as (executor: DatabaseExecutor, message: typeof messages.$inferSelect) => Promise<TInserted>)(tx, insertedMessage)
           : (opts.onInserted as (input: AgentSendInsertedTransactionInput) => Promise<TInserted>)({ executor: tx, message: insertedMessage, attachments: projectedAttachments }))
         : null;
+      await raceHooksForTests.afterInsert?.(raceScope);
 
       return {
         replayed: false,
@@ -160,13 +190,18 @@ export async function createOrReplayAgentSend<TInserted = never>(opts: {
       throw new Error("Agent send replay lookup failed after idempotency conflict");
     }
     // A replay must be the same send: same target, content and (below) the
-    // same ordered attachment set.
+    // same ordered attachment set. Compared on what the sender sent, never on
+    // what Raft generated: a card's derived fallback is not compared (RFC 082 §4.1).
     if (opts.rejectMismatchedReplay) {
       if (replayedMessage.channelId !== channelId) {
         throw new AgentSendIdempotencyConflictError("target");
       }
-      if (replayedMessage.content !== content) {
+      if (opts.senderWroteContent !== false && replayedMessage.content !== content) {
         throw new AgentSendIdempotencyConflictError("content");
+      }
+      // RFC 082: the same key with another card (or a card where there was none) is another send.
+      if (!sameMessageCard(replayedMessage.actionMetadata, opts.actionMetadata)) {
+        throw new AgentSendIdempotencyConflictError("card");
       }
     }
 

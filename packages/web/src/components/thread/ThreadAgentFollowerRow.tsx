@@ -4,7 +4,7 @@ import { useCallback } from "react";
 import { useIntl } from "react-intl";
 import type { ThreadAgentFollower } from "../../store/threadAgentFollowerStore";
 import { useProfileStore } from "../../store/profileStore";
-import { AgentActivityInfo, JointPeerBadge, agentStatusFallbackActivity } from "../agent/ChannelMembers";
+import { AgentActivityInfo, JointPeerBadge, agentStatusFallbackActivity } from "../agent/channelMemberParts";
 import { ChannelMemberRow } from "../channel/ChannelMemberList";
 import type { Agent } from "../../store/agentStore";
 import { setCachedAgentProfile } from "../profile/profileFallbackCache";
@@ -19,24 +19,27 @@ function followerAgentStatus(status: string | null | undefined): Agent["status"]
     : status === "stopped" ? "stopped" : "inactive";
 }
 
-export function ThreadAgentFollowerRow({ agent, canManage, removing, currentServerId, onRemove }: {
+export function ThreadAgentFollowerRow({ agent, canManage, removing, currentServerId, onRemove, onOpenProfile }: {
   agent: ThreadAgentFollower;
   canManage: boolean | undefined;
   removing: boolean;
   currentServerId: string | undefined;
   onRemove: (agentId: string, agentLabel: string) => Promise<void>;
+  /** Opens the profile where the owner shows it (the task dialog); the app's
+   *  profile panel otherwise. */
+  onOpenProfile?: (agentId: string) => void;
 }) {
   const { formatMessage } = useIntl();
   const openProfile = useProfileStore((state) => state.openProfile);
   const agentLabel = agent.displayName || agent.name;
+  // The server decides per Agent (`canRemove`): in a joint channel the host's
+  // owner/admin or appointed manager may remove any server's Agent; another
+  // server's admin only its own server's (#triage:#225).
   const canRemoveAgent = canManage && agent.canRemove !== false;
   const serverLabel = agent.serverName || agent.serverSlug;
   const removeLabel = canRemoveAgent
     ? formatMessage({ id: "thread.followers.remove" }, { agent: agentLabel })
-    : formatMessage({ id: "thread.followers.peerRemoveUnavailable" }, {
-      agent: agentLabel,
-      server: serverLabel || formatMessage({ id: "thread.followers.peerServer" }),
-    });
+    : formatMessage({ id: "thread.followers.peerRemoveHostOnly" });
 
   const openAgentProfile = useCallback(() => {
     setCachedAgentProfile(currentServerId, {
@@ -59,8 +62,9 @@ export function ThreadAgentFollowerRow({ agent, canManage, removing, currentServ
       deletedAt: null,
       createdAt: "",
     });
-    openProfile("agent", agent.id);
-  }, [agent, currentServerId, openProfile]);
+    if (onOpenProfile) onOpenProfile(agent.id);
+    else openProfile("agent", agent.id);
+  }, [agent, currentServerId, onOpenProfile, openProfile]);
 
   const handleRemoveClick = useCallback(() => {
     if (!canRemoveAgent) return;
@@ -93,7 +97,7 @@ export function ThreadAgentFollowerRow({ agent, canManage, removing, currentServ
           <Tooltip content={removeLabel}>
             <Button
               type="button"
-              size="icon-sm"
+              size="icon-md"
               variant="ghost"
               className={canRemoveAgent ? undefined : "cursor-not-allowed"}
               disabled={!canRemoveAgent || removing}

@@ -79,18 +79,18 @@ export default function AgreementBody({ source }: { source: string }) {
   }
 
   return (
-    <div className="space-y-2 whitespace-pre-wrap break-words">
+    <div className="stack-y-2 whitespace-pre-wrap break-words">
       {blocks.map((block, index) => {
         if (block.type === "ul") {
           return (
-            <ul key={index} className="list-disc space-y-1 pl-5">
+            <ul key={index} className="list-disc stack-y-1 pl-5">
               {block.items.map((item, itemIndex) => <li key={itemIndex}>{item}</li>)}
             </ul>
           );
         }
         if (block.type === "ol") {
           return (
-            <ol key={index} className="list-decimal space-y-1 pl-5">
+            <ol key={index} className="list-decimal stack-y-1 pl-5">
               {block.items.map((item, itemIndex) => <li key={itemIndex}>{item}</li>)}
             </ol>
           );

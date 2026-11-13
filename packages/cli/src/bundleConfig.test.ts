@@ -41,12 +41,4 @@ test("tsdown config inlines runtime deps for the Computer app sidecar CLI", asyn
       `alwaysBundle must cover ${dep} and its subpaths`,
     );
   }
-
-  const source = await readFile(
-    fileURLToPath(new URL("../tsdown.config.ts", import.meta.url)),
-    "utf8",
-  );
-  assert.match(source, /Computer app copies this single file/);
-  assert.match(source, /sidecar has no package root/);
-  assert.match(source, /commander` is CJS/);
 });

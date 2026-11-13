@@ -13,6 +13,8 @@ import {
   resolveAttachmentLifecycleDatabaseNow,
 } from "./attachmentLifecycleService";
 import { assertChannelWritableInTransaction } from "./channelConversionFenceService";
+import { addAttachmentObjectHoldWithExecutor } from "./attachmentObjectHoldService";
+import { type ResolvedAttachment, withAttachmentObjectMetadata } from "./attachmentRecord";
 
 export type PendingAttachmentProjectionInput = {
   id: string;
@@ -59,9 +61,9 @@ function resolveChargeMonth(value: string | undefined, now: Date): string {
 }
 
 /**
- * Phase B dual writer. The immutable object, exactly-once logical-object
- * charge, and creator-owned pending projection commit together while every
- * legacy projection column remains populated for rollback.
+ * The immutable object (the only home of the physical metadata),
+ * exactly-once logical-object charge, and creator-owned pending projection
+ * commit together.
  *
  * Callers must provide a transaction executor and a durable transfer intent
  * that was committed before storage I/O. This helper adopts the written keys;
@@ -72,7 +74,7 @@ export async function createPendingAttachmentProjectionWithExecutor(
   executor: DatabaseTransaction,
   input: PendingAttachmentProjectionInput,
   explicitNow?: Date,
-): Promise<typeof attachments.$inferSelect> {
+): Promise<ResolvedAttachment> {
   await assertChannelWritableInTransaction(executor, input.channelId);
   const now = await resolveAttachmentLifecycleDatabaseNow(executor, explicitNow);
   const projectionId = input.id;
@@ -122,29 +124,30 @@ export async function createPendingAttachmentProjectionWithExecutor(
     uploaderId: input.uploaderId,
     uploaderType: input.uploaderType,
     filename: input.filename,
-    mimeType: input.mimeType,
-    sizeBytes: input.sizeBytes,
+  }).returning();
+
+  return withAttachmentObjectMetadata(projection, {
     storageKey: input.storageKey,
     thumbnailKey: input.thumbnailKey ?? null,
     contentHash: input.contentHash ?? null,
+    mimeType: input.mimeType,
+    sizeBytes: input.sizeBytes,
     width: input.width ?? null,
     height: input.height ?? null,
-  }).returning();
-
-  return projection;
+  });
 }
 
 /**
  * Creates an occurrence-owned pending projection for an existing immutable
  * object without charging or materializing the shared bytes again. This stays
  * on the canonical projection-writer boundary so reservation/projection
- * atomicity, rollback columns, and deterministic replay have one authority.
+ * atomicity and deterministic replay have one authority.
  */
 export async function createIdempotentPendingAttachmentProjectionForExistingObjectWithExecutor(
   executor: DatabaseTransaction,
   input: ExistingObjectPendingAttachmentProjectionInput,
   explicitNow?: Date,
-): Promise<typeof attachments.$inferSelect> {
+): Promise<ResolvedAttachment> {
   const now = await resolveAttachmentLifecycleDatabaseNow(executor, explicitNow);
   const [object] = await executor.select().from(attachmentObjects)
     .where(eq(attachmentObjects.id, input.objectId)).for("update").limit(1);
@@ -170,10 +173,6 @@ export async function createIdempotentPendingAttachmentProjectionForExistingObje
       || existing.uploaderId !== input.uploaderId
       || existing.uploaderType !== input.uploaderType
       || existing.filename !== input.filename
-      || existing.mimeType !== object.mimeType
-      || existing.sizeBytes !== object.sizeBytes
-      || existing.storageKey !== object.storageKey
-      || existing.contentHash !== object.contentHash
       || existing.revokedAt !== null
       || !reservation
       || reservation.objectId !== object.id
@@ -184,7 +183,7 @@ export async function createIdempotentPendingAttachmentProjectionForExistingObje
     ) {
       throw new Error(`Existing attachment projection replay conflict for ${input.id}`);
     }
-    return existing;
+    return withAttachmentObjectMetadata(existing, object);
   }
 
   await executor.insert(attachmentUploadReservations).values({
@@ -200,6 +199,11 @@ export async function createIdempotentPendingAttachmentProjectionForExistingObje
     createdAt: now,
     updatedAt: now,
   });
+  await addAttachmentObjectHoldWithExecutor(executor, {
+    holderType: "upload_reservation",
+    holderId: input.id,
+    objectId: object.id,
+  });
   const [projection] = await executor.insert(attachments).values({
     id: input.id,
     objectId: object.id,
@@ -211,16 +215,9 @@ export async function createIdempotentPendingAttachmentProjectionForExistingObje
     uploaderId: input.uploaderId,
     uploaderType: input.uploaderType,
     filename: input.filename,
-    mimeType: object.mimeType,
-    sizeBytes: object.sizeBytes,
-    storageKey: object.storageKey,
-    thumbnailKey: object.thumbnailKey,
-    contentHash: object.contentHash,
-    width: object.width,
-    height: object.height,
   }).returning();
   if (!projection) throw new Error(`Existing attachment projection was not created for ${input.id}`);
-  return projection;
+  return withAttachmentObjectMetadata(projection, object);
 }
 
 function sameNullable<T>(actual: T | null, expected: T | null | undefined): boolean {
@@ -242,13 +239,6 @@ function projectionReplayMatches(
     && creatorMatches
     && bindingMatches
     && projection.filename === input.filename
-    && projection.mimeType === input.mimeType
-    && projection.sizeBytes === input.sizeBytes
-    && projection.storageKey === input.storageKey
-    && sameNullable(projection.thumbnailKey, input.thumbnailKey)
-    && sameNullable(projection.contentHash, input.contentHash)
-    && sameNullable(projection.width, input.width)
-    && sameNullable(projection.height, input.height)
     && projection.revokedAt === null;
 }
 
@@ -273,15 +263,10 @@ async function validateExistingIdempotentProjection(
   executor: DatabaseTransaction,
   projection: typeof attachments.$inferSelect,
   input: PendingAttachmentProjectionInput & { id: string; objectId: string },
-): Promise<typeof attachments.$inferSelect> {
+): Promise<ResolvedAttachment> {
   if (!projectionReplayMatches(projection, input)) {
     throw new Error(`Attachment projection replay conflict for ${input.id}`);
   }
-  // Phase B must remain compatible with artifacts written before the object
-  // boundary. The locked legacy row is authoritative for this deterministic
-  // replay and Phase C will backfill it without creating a historical charge.
-  if (projection.objectId === null) return projection;
-
   const [object] = await executor.select().from(attachmentObjects)
     .where(eq(attachmentObjects.id, projection.objectId)).limit(1);
   if (!object || !objectReplayMatches(object, input)) {
@@ -308,7 +293,7 @@ async function validateExistingIdempotentProjection(
   )) {
     throw new Error(`Attachment reservation replay conflict for ${input.id}`);
   }
-  return projection;
+  return withAttachmentObjectMetadata(projection, object);
 }
 
 /**
@@ -321,7 +306,7 @@ export async function createIdempotentPendingAttachmentProjectionWithExecutor(
   executor: DatabaseTransaction,
   input: PendingAttachmentProjectionInput & { id: string; objectId: string },
   explicitNow?: Date,
-): Promise<typeof attachments.$inferSelect> {
+): Promise<ResolvedAttachment> {
   await assertChannelWritableInTransaction(executor, input.channelId);
   const now = await resolveAttachmentLifecycleDatabaseNow(executor, explicitNow);
   const [existing] = await executor.select().from(attachments)
@@ -373,13 +358,6 @@ export async function createIdempotentPendingAttachmentProjectionWithExecutor(
       uploaderId: input.uploaderId,
       uploaderType: input.uploaderType,
       filename: input.filename,
-      mimeType: input.mimeType,
-      sizeBytes: input.sizeBytes,
-      storageKey: input.storageKey,
-      thumbnailKey: input.thumbnailKey ?? null,
-      contentHash: input.contentHash ?? null,
-      width: input.width ?? null,
-      height: input.height ?? null,
     }).onConflictDoNothing();
   }
 

@@ -40,14 +40,38 @@ export class ManagedMcpGatewayError extends Error {
       | "managed_mcp_endpoint_blocked"
       | "managed_mcp_unreachable"
       | "managed_mcp_oauth_required"
+      | "managed_mcp_oauth_client_registration_unsupported"
       | "managed_mcp_endpoint_auth_rejected"
       | "managed_mcp_catalog_invalid"
       | "managed_mcp_result_too_large"
       | "managed_mcp_result_invalid",
+    options?: ErrorOptions,
   ) {
-    super(message);
+    super(message, options);
     this.name = "ManagedMcpGatewayError";
   }
+}
+
+// A private marker for this guard's own DNS refusal. An unrelated EACCES must not be
+// reported as a network-policy decision, even when undici wraps it in a fetch error.
+class ManagedMcpLookupBlockedError extends Error {
+  readonly code = "EACCES";
+
+  constructor() {
+    super("MCP endpoint resolved to a blocked address");
+    this.name = "ManagedMcpLookupBlockedError";
+  }
+}
+
+function isManagedMcpLookupBlocked(error: unknown): boolean {
+  const seen = new Set<Error>();
+  let current = error;
+  while (current instanceof Error && !seen.has(current)) {
+    if (current instanceof ManagedMcpLookupBlockedError) return true;
+    seen.add(current);
+    current = current.cause;
+  }
+  return false;
 }
 
 /**
@@ -67,7 +91,7 @@ export function normalizeManagedMcpClientError(error: unknown, timedOut: boolean
       || endpointRejected
       || (error instanceof OAuthError && !(error instanceof ServerError) && !(error instanceof TemporarilyUnavailableError));
     if (oauthFailureRequiresReconnect) {
-      return new ManagedMcpGatewayError("MCP OAuth authorization expired; reconnect from Settings", "managed_mcp_oauth_required");
+      return new ManagedMcpGatewayError("MCP OAuth authorization expired; reconnect from Settings", "managed_mcp_oauth_required", { cause: error });
     }
   } else if (endpointRejected) {
     return new ManagedMcpGatewayError(
@@ -75,11 +99,13 @@ export function normalizeManagedMcpClientError(error: unknown, timedOut: boolean
         ? "MCP endpoint rejected the configured credentials (401/403)"
         : "MCP endpoint rejected the request (401/403) without credentials configured for it",
       "managed_mcp_endpoint_auth_rejected",
+      { cause: error },
     );
   }
   return new ManagedMcpGatewayError(
     timedOut ? "MCP request timed out" : "MCP server could not be reached",
     "managed_mcp_unreachable",
+    { cause: error },
   );
 }
 
@@ -120,8 +146,12 @@ async function safeLookup(
 ): Promise<void> {
   try {
     const addresses = await dns.promises.lookup(hostname, { all: true, verbatim: true });
-    if (addresses.length === 0 || addresses.some(({ address }) => !isManagedMcpAddressAllowed(address))) {
-      callback(Object.assign(new Error("MCP endpoint resolved to a blocked address"), { code: "EACCES" }), "", 0);
+    if (addresses.length === 0) {
+      callback(Object.assign(new Error("MCP endpoint did not resolve to an address"), { code: "EACCES" }), "", 0);
+      return;
+    }
+    if (addresses.some(({ address }) => !isManagedMcpAddressAllowed(address))) {
+      callback(new ManagedMcpLookupBlockedError(), "", 0);
       return;
     }
     if ("all" in options && options.all) {
@@ -136,21 +166,30 @@ async function safeLookup(
   }
 }
 
-export function createSafeFetch(): { fetch: typeof globalThis.fetch; close: () => Promise<void> } {
+export function createSafeFetch(
+  // Non-MCP callers keep their existing fetch error contract.
+  opts: { timeoutMs?: number; reportPolicyRefusal?: boolean } = {},
+): { fetch: typeof globalThis.fetch; close: () => Promise<void> } {
+  const timeoutMs = opts.timeoutMs ?? MCP_TIMEOUT_MS;
   const dispatcher = new Agent({
     connect: { lookup: safeLookup as never },
-    headersTimeout: MCP_TIMEOUT_MS,
-    bodyTimeout: MCP_TIMEOUT_MS,
+    headersTimeout: timeoutMs,
+    bodyTimeout: timeoutMs,
     maxResponseSize: MCP_MAX_HTTP_RESPONSE_BYTES,
   });
   const fetch = ((input: URL | RequestInfo, init?: RequestInit) => {
     const rawUrl = input instanceof URL ? input.toString() : typeof input === "string" ? input : input.url;
     validateManagedMcpEndpoint(rawUrl);
     return undiciFetch(input as never, {
-      ...(init ?? {}),
+      ...init,
       redirect: "error",
       dispatcher,
-    } as never) as unknown as Promise<Response>;
+    } as never).catch((error: unknown) => {
+      if (opts.reportPolicyRefusal && isManagedMcpLookupBlocked(error)) {
+        throw new ManagedMcpGatewayError("The server's network security check blocked this address", "managed_mcp_endpoint_blocked", { cause: error });
+      }
+      throw error;
+    }) as unknown as Promise<Response>;
   }) as unknown as typeof globalThis.fetch;
   return { fetch, close: () => dispatcher.close() };
 }
@@ -252,6 +291,90 @@ export function normalizeManagedMcpClientErrorForConnection(
   return normalizeManagedMcpClientError(error, timedOut, effectiveAuthKind);
 }
 
+const OAUTH_FAILURE_DETAIL_MAX = 300;
+const OAUTH_ERROR_CODE = /^[a-z0-9_.-]{1,64}$/iu;
+const SECRET_KEYS = "access_token|refresh_token|id_token|client_secret|code_verifier|code|password|secret|token|api[_-]?key|authorization";
+// A quoted value is replaced whole (it may contain spaces); an unquoted one up to its delimiter.
+const QUOTED_SECRET_ASSIGNMENT = new RegExp(`\\b(${SECRET_KEYS})(["']?\\s*[:=]\\s*)("|')(?:(?!\\3)[^\\\\]|\\\\.)*\\3`, "giu");
+const SECRET_ASSIGNMENT = new RegExp(`\\b(${SECRET_KEYS})(["']?\\s*[:=]\\s*["']?)[^\\s"'&,;]+`, "giu");
+const BEARER = /\b(bearer|basic)\s+[^\s"',;]+/giu;
+// Opaque credentials (Google access tokens, JWTs) are long unbroken runs; URLs break on "/" and ":".
+const OPAQUE = /[A-Za-z0-9._~+-]{40,}/gu;
+
+function redactOAuthFailureText(text: string): string {
+  return text
+    .replace(BEARER, "$1 [redacted]")
+    .replace(QUOTED_SECRET_ASSIGNMENT, "$1$2$3[redacted]$3")
+    .replace(SECRET_ASSIGNMENT, "$1$2[redacted]")
+    .replace(OPAQUE, "[redacted]")
+    .replace(/\s+/gu, " ")
+    .trim();
+}
+
+/** Only a provider's human-readable message field; any other body shape yields nothing. */
+function httpErrorMessage(body: string): string | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object") return null;
+  const record = parsed as { error?: unknown; error_description?: unknown; message?: unknown };
+  const nested = record.error && typeof record.error === "object" ? (record.error as { message?: unknown }).message : undefined;
+  const candidate = [nested, record.error_description, record.message].find((value) => typeof value === "string" && value.trim());
+  return typeof candidate === "string" ? candidate : null;
+}
+
+/**
+ * The provider's own reason behind a failed sign-in step, safe for a Connection's status line and
+ * a log entry: the OAuth error code with its description, or the MCP endpoint's HTTP status with
+ * the message field of its JSON error (Google says which API is disabled there). Only those fields
+ * are read, credential-shaped text is redacted before truncation, and anything else, including
+ * Raft's own internal errors, yields null so the caller shows a generic line.
+ */
+export function managedMcpOAuthFailureDetail(error: unknown): string | null {
+  let root: unknown = error;
+  while (root instanceof ManagedMcpGatewayError && root.cause !== undefined) root = root.cause;
+  let detail: string;
+  if (root instanceof OAuthError) {
+    const code = OAUTH_ERROR_CODE.test(root.errorCode) ? root.errorCode : "oauth_error";
+    // The SDK wraps a body that is not an OAuth error as `HTTP <status>: ... Raw body: <body>`;
+    // keep only the status from it, never the body.
+    const unparsed = /Invalid OAuth error response|Raw body:/u.test(root.message);
+    const status = unparsed ? /^HTTP (\d{3})\b/u.exec(root.message)?.[1] : undefined;
+    const description = unparsed
+      ? (status ? `HTTP ${status}` : "")
+      : root.message && root.message !== root.errorCode ? redactOAuthFailureText(root.message) : "";
+    detail = description ? `${code}: ${description}` : code;
+  } else if (root instanceof StreamableHTTPError && root.code !== undefined && root.code > 0) {
+    const body = root.message.replace(/^Streamable HTTP error: (Error POSTing to endpoint: )?/u, "");
+    const message = httpErrorMessage(body);
+    detail = message ? `HTTP ${root.code}: ${redactOAuthFailureText(message)}` : `HTTP ${root.code}`;
+  } else {
+    return null;
+  }
+  return detail.length > OAUTH_FAILURE_DETAIL_MAX ? `${detail.slice(0, OAUTH_FAILURE_DETAIL_MAX - 1)}…` : detail;
+}
+
+/**
+ * The provider's failure as a fixed vocabulary only: a standard OAuth error code (RFC 6749 / 6750) or
+ * an HTTP status. Unlike `managedMcpOAuthFailureDetail` it never carries provider-supplied text, so
+ * it can go on a tool call's status line and into the log.
+ */
+const STANDARD_OAUTH_ERROR_CODES = new Set([
+  "invalid_request", "invalid_client", "invalid_grant", "unauthorized_client", "unsupported_grant_type",
+  "invalid_scope", "invalid_token", "insufficient_scope", "access_denied", "server_error", "temporarily_unavailable",
+]);
+
+export function managedMcpOAuthFailureCategory(error: unknown): string | null {
+  let root: unknown = error;
+  while (root instanceof ManagedMcpGatewayError && root.cause !== undefined) root = root.cause;
+  if (root instanceof OAuthError) return STANDARD_OAUTH_ERROR_CODES.has(root.errorCode) ? root.errorCode : "oauth_error";
+  if (root instanceof StreamableHTTPError && Number.isInteger(root.code) && root.code! >= 100 && root.code! <= 599) return `HTTP ${root.code}`;
+  return null;
+}
+
 async function withClient<T>(
   endpoint: string,
   headers: Record<string, string>,
@@ -263,7 +386,7 @@ async function withClient<T>(
   const controller = new AbortController();
   const timeout = setClockTimeout(() => controller.abort(), MCP_TIMEOUT_MS);
   const client = new Client({ name: "raft-managed-mcp", version: "1.0.0" });
-  const safeFetch = createSafeFetch();
+  const safeFetch = createSafeFetch({ reportPolicyRefusal: true });
   try {
     const transport = new StreamableHTTPClientTransport(url, {
       fetch: safeFetch.fetch,
@@ -282,26 +405,65 @@ async function withClient<T>(
   }
 }
 
+export async function collectManagedMcpTools(client: Pick<Client, "listTools">, signal: AbortSignal): Promise<ManagedMcpToolCatalogEntry[]> {
+  const tools: ManagedMcpToolCatalogEntry[] = [];
+  const cursors = new Set<string>();
+  let cursor: string | undefined;
+  do {
+    const page = await client.listTools(cursor ? { cursor } : undefined, { signal, timeout: MCP_TIMEOUT_MS });
+    tools.push(...normalizeManagedMcpToolCatalog(page.tools));
+    // Check cumulative count/size and duplicate names, not just each page.
+    normalizeManagedMcpToolCatalog(tools);
+    cursor = page.nextCursor;
+    if (cursor !== undefined) {
+      if (!cursor || cursors.has(cursor) || cursors.size >= MANAGED_MCP_MAX_TOOLS_PER_SERVER) {
+        throw new ManagedMcpGatewayError("MCP tool pagination did not terminate", "managed_mcp_catalog_invalid");
+      }
+      cursors.add(cursor);
+    }
+  } while (cursor !== undefined);
+  return tools;
+}
+
 export async function listManagedMcpTools(endpoint: string, headers: Record<string, string>): Promise<ManagedMcpToolCatalogEntry[]> {
   return withClient(endpoint, headers, async (client, signal) => {
-    const result = await client.listTools(undefined, { signal, timeout: MCP_TIMEOUT_MS });
-    return normalizeManagedMcpToolCatalog(result.tools);
+    return collectManagedMcpTools(client, signal);
   });
+}
+
+/**
+ * Why starting a sign-in failed. Providers such as Google publish neither a registration endpoint
+ * nor client metadata document support, so automatic registration cannot work there; the SDK
+ * reports that only as a plain Error with this wording, which the test pins against the SDK.
+ */
+export function managedMcpOAuthStartError(error: unknown): ManagedMcpGatewayError {
+  if (error instanceof ManagedMcpGatewayError && error.code === "managed_mcp_endpoint_blocked") return error;
+  if (error instanceof Error && error.message.includes("does not support dynamic client registration")) {
+    return new ManagedMcpGatewayError(
+      "This MCP server does not support automatic client registration; register an OAuth client with the provider and enter it",
+      "managed_mcp_oauth_client_registration_unsupported",
+    );
+  }
+  return new ManagedMcpGatewayError(
+    "MCP OAuth setup failed; check the client configuration and provider requirements",
+    "managed_mcp_unreachable",
+  );
 }
 
 export async function startManagedMcpOAuth(
   endpoint: string,
   provider: OAuthClientProvider,
+  /** Tests only: answers discovery in place of the network. */
+  fetchFn?: typeof fetch,
 ): Promise<"AUTHORIZED" | "REDIRECT"> {
   const url = validateManagedMcpEndpoint(endpoint);
-  const safeFetch = createSafeFetch();
+  const safeFetch = createSafeFetch({ reportPolicyRefusal: true });
   try {
-    return await auth(provider, { serverUrl: url, fetchFn: safeFetch.fetch });
+    // The client's scope, when set, is the whole request; the SDK falls back to the server's
+    // full scopes_supported only when it is not.
+    return await auth(provider, { serverUrl: url, scope: provider.clientMetadata.scope, fetchFn: fetchFn ?? safeFetch.fetch });
   } catch (error) {
-    throw new ManagedMcpGatewayError(
-      error instanceof Error ? `MCP OAuth setup failed: ${error.message}` : "MCP OAuth setup failed",
-      "managed_mcp_unreachable",
-    );
+    throw managedMcpOAuthStartError(error);
   } finally {
     await safeFetch.close().catch(() => undefined);
   }
@@ -311,19 +473,22 @@ export async function completeManagedMcpOAuth(
   endpoint: string,
   provider: OAuthClientProvider,
   authorizationCode: string,
+  /** Tests only: answers discovery and the token endpoint in place of the network. */
+  fetchFn?: typeof fetch,
 ): Promise<void> {
   const url = validateManagedMcpEndpoint(endpoint);
-  const safeFetch = createSafeFetch();
+  const safeFetch = createSafeFetch({ reportPolicyRefusal: true });
   try {
-    const result = await auth(provider, { serverUrl: url, authorizationCode, fetchFn: safeFetch.fetch });
+    const result = await auth(provider, { serverUrl: url, authorizationCode, fetchFn: fetchFn ?? safeFetch.fetch });
     if (result !== "AUTHORIZED") {
       throw new ManagedMcpGatewayError("MCP OAuth did not complete", "managed_mcp_oauth_required");
     }
   } catch (error) {
     if (error instanceof ManagedMcpGatewayError) throw error;
     throw new ManagedMcpGatewayError(
-      error instanceof Error ? `MCP OAuth token exchange failed: ${error.message}` : "MCP OAuth token exchange failed",
+      "MCP OAuth token exchange failed; check the client configuration and reconnect",
       "managed_mcp_unreachable",
+      { cause: error },
     );
   } finally {
     await safeFetch.close().catch(() => undefined);
@@ -335,8 +500,7 @@ export async function listManagedMcpOAuthTools(
   provider: OAuthClientProvider,
 ): Promise<ManagedMcpToolCatalogEntry[]> {
   return withClient(endpoint, {}, async (client, signal) => {
-    const result = await client.listTools(undefined, { signal, timeout: MCP_TIMEOUT_MS });
-    return normalizeManagedMcpToolCatalog(result.tools);
+    return collectManagedMcpTools(client, signal);
   }, provider);
 }
 

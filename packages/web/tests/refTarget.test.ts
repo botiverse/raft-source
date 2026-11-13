@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { formatRaftChannelTaskRef as T, formatRaftDmTaskRef as D } from "@botiverse/raft-shared";
 import {
   parseRefToken,
   resolveRef,
@@ -205,4 +206,31 @@ test("dm + dm-thread forms resolve against dm channels", async () => {
     "toDmMessage:D1:PARENT_FROM_BACKEND",
     "openThread:D1:PARENT_FROM_BACKEND",
   ]);
+});
+
+test("task refs (#channel/7, dm:@peer/7) parse before the channel/DM forms and open via ctx.openTask", async () => {
+  assert.deepEqual(parseRefToken(T("proj", 7)), { channelName: "proj", taskNumber: 7 });
+  assert.deepEqual(parseRefToken(D("Bernard", 2)), { dmPeer: "Bernard", taskNumber: 2 });
+  assert.equal(parseRefToken(`${T("proj", 7)}a`), null);
+
+  const channels = [
+    ch({ id: "C1", name: "proj" }),
+    ch({ id: "J1", name: "shared-local", type: "joint" }),
+    ch({ id: "D1", type: "dm", name: "dm-bernard", peerName: "Bernard" }),
+  ];
+  const opened: string[] = [];
+  const { ctx } = makeCtx(channels, { openTask: (channelId, n) => { opened.push(`${channelId}/${n}`); } });
+
+  for (const raw of [T("proj", 7), T("Shared-Local", 3), D("Bernard", 2)]) {
+    const r = resolveRefTarget(raw, ctx)!;
+    assert.equal(r.kind, "task", raw);
+    assert.equal(r.resolvable, true, raw);
+    await r.navigate();
+  }
+  assert.deepEqual(opened, ["C1/7", "J1/3", "D1/2"]);
+  assert.equal(resolveRefTarget(T("Shared-Local", 3), ctx)!.label, T("Shared-Local", 3));
+
+  // A channel the reader cannot see, or no task opener: plain text.
+  assert.equal(resolveRefTarget(T("nowhere", 7), ctx)!.resolvable, false);
+  assert.equal(resolveRefTarget(T("proj", 7), makeCtx(channels).ctx)!.resolvable, false);
 });

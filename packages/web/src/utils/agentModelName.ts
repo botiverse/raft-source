@@ -1,6 +1,5 @@
 // "Show the model name next to an agent's name" — an appearance option
-// (@WAWQAQ 2026-09-10). It's a normal web feature whose DEFAULT differs by
-// platform (on in the desktop shell, off on web/mobile — see appearanceStore);
+// (@WAWQAQ 2026-09-10). On by default on web and desktop (see appearanceStore);
 // once the toggle is stored, the display simply follows the toggle everywhere.
 import { getModelLabel } from "@botiverse/raft-shared";
 import { useAppearanceStore } from "../store/appearanceStore";

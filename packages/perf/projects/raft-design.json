@@ -1,0 +1,5 @@
+{
+  "project": "raft-design",
+  "envs": { "production": { "origin": "https://raft-design.botiverse.build" } },
+  "pages": [{ "name": "home", "path": "/", "ready": { "selector": "#site-main h1" } }]
+}

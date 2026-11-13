@@ -31,7 +31,13 @@ import type { RunnerState } from "./state";
 /** Classification of a per-server daemon child exit — the state machine's
  *  input alphabet for exit events. Lives here (not service.ts) so the pure
  *  layer never imports the supervisor (decycle R0). */
-export type ChildExitClass = "graceful" | "config-error" | "already-running" | "unlinked-terminal" | "crash";
+export type ChildExitClass =
+  | "graceful"
+  | "config-error"
+  | "already-running"
+  | "unlinked-terminal"
+  | "external-stop"
+  | "crash";
 
 /**
  * In-memory supervision record for one per-server daemon runner. Replaces
@@ -41,8 +47,9 @@ export type ChildExitClass = "graceful" | "config-error" | "already-running" | "
  *   - `child` present  ⇔ a live daemon process is currently registered.
  *   - `externalPid` present ⇔ a live daemon is holding the machine lock but is
  *                         not a child of this supervisor (service restart /
- *                         orphan adoption). It is spawn-blocking and can be
- *                         signaled by pid, but has no ChildProcess handle.
+ *                         orphan adoption). It is spawn-blocking and is never
+ *                         signalled: the service did not start it, and the
+ *                         pid came from a lock file (runnerLockConflict.ts).
  *   - `lifecycle`       the §3.2 state; canonical for "may we spawn?".
  *   - `backoffUntil`    epoch-ms; while `now < backoffUntil` a
  *                       crashed/stopped runner is NOT yet eligible to
@@ -76,6 +83,8 @@ export const RUNNER_TRIGGER = {
   exitAlreadyRunning: "exit-already-running",
   exitLockOwnerGone: "exit-lock-owner-gone",
   exitUnlinked: "exit-unlinked",
+  exitExternalStop: "exit-external-stop",
+  exitExternalStopDegraded: "exit-external-stop-degraded",
   operatorStop: "operator-stop",
   shutdownStop: "shutdown-stop",
   reset: "reset",
@@ -96,7 +105,10 @@ export type RunnerTrigger = (typeof RUNNER_TRIGGER)[keyof typeof RUNNER_TRIGGER]
  *   - crash, budget breached (≥DEGRADED_THRESHOLD in window) → `degraded`
  *     (stop the crash-restart spin per v6 §3.3).
  *   - crash, under budget → `crashed` (eligible to respawn after backoff).
- *   - graceful (code 0 / SIGTERM / SIGINT, not an operator stop) →
+ *   - external-stop (a SIGTERM the service did not send), budget breached
+ *     → `degraded` (an external killer must not drive an endless respawn
+ *     loop); under budget → `stopped` (respawn after backoff, as graceful).
+ *   - graceful (code 0 / SIGINT, not an operator stop) →
  *     `stopped` (the reconciler respawns it iff the server is still
  *     wanted; the canonical "stop for good" path clears managed.flag,
  *     which makes the server unwanted and the respawn a no-op).
@@ -112,6 +124,7 @@ export function nextRunnerStateOnExit(
   if (exitClass === "already-running") return "running";
   if (exitClass === "unlinked-terminal") return "degraded";
   if (exitClass === "crash") return budgetBreached ? "degraded" : "crashed";
+  if (exitClass === "external-stop") return budgetBreached ? "degraded" : "stopped";
   return "stopped";
 }
 
@@ -125,6 +138,9 @@ export function exitTrigger(exitClass: ChildExitClass, budgetBreached: boolean):
   if (exitClass === "unlinked-terminal") return RUNNER_TRIGGER.exitUnlinked;
   if (exitClass === "crash") {
     return budgetBreached ? RUNNER_TRIGGER.exitCrashDegraded : RUNNER_TRIGGER.exitCrash;
+  }
+  if (exitClass === "external-stop") {
+    return budgetBreached ? RUNNER_TRIGGER.exitExternalStopDegraded : RUNNER_TRIGGER.exitExternalStop;
   }
   return RUNNER_TRIGGER.exitGraceful;
 }

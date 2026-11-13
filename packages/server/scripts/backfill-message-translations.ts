@@ -4,8 +4,7 @@
  *
  * Required env:
  *   DATABASE_URL=<target database branch URL>
- *   TRANSLATION_SSM_ENVIRONMENT=<staging|production> (deployed mode), or the
- *   explicit local provider environment used by tests/development.
+ *   The configured translation provider and its credentials.
  *
  * The script never logs message content or translated content. It defaults to
  * dry-run mode; pass --write to insert/update message_translations rows.
@@ -21,7 +20,7 @@ import {
   hashMessageContent,
   isMessageTranslationCodeOrLinkOnly,
   providerInfoFromResolved,
-  resolveProviderFromRuntimeConfig,
+  resolveProviderFromEnv,
   type ResolvedTranslationProvider,
   type Detection,
   type LedgerProviderInfo,
@@ -786,7 +785,7 @@ async function main(): Promise<void> {
   const options = parseArgs(process.argv.slice(2));
   const databaseUrl = process.env.DATABASE_URL;
   if (!databaseUrl) throw new Error("DATABASE_URL is required");
-  const resolved = await resolveProviderFromRuntimeConfig();
+  const resolved = resolveProviderFromEnv();
   const providerInfo = providerInfoFromResolved(resolved);
   const maxCharsPerMinute = options.maxCharsPerMinute ?? defaultLimiterForProvider(providerInfo.providerName);
   const pool = new pg.Pool({ connectionString: databaseUrl, max: 4 });

@@ -8,6 +8,7 @@ import type {
   AttachmentPreviewExternalLink,
 } from "../src/components/message/attachmentPreviewExternalLink";
 import { parseExternalLinkHotspots } from "../src/components/message/attachmentPreviewBridge";
+import { resetRaftAppHostsForTests, setRaftAppHosts } from "../src/store/raftAppHosts";
 
 const appOrigin = "https://app.raft.build";
 
@@ -60,6 +61,35 @@ test("attachment preview rejects non-HTTPS, credentials, private/internal hosts,
       { ok: false, reason },
       href,
     );
+  }
+});
+
+// Tenny (#proj-workspace:fbc76200): every Raft app host this deployment's
+// server lists (its appHosts(), from the client config:
+// store/raftAppHosts.ts) is Raft's own origin too, beside the fixed list and
+// botiverse.dev. Only stricter: before the list arrives, the fixed rules alone.
+test("attachment preview refuses a host on the server's app hosts list as internal_origin, read when the link is checked; look-alikes and subdomains are not on it", () => {
+  const configured = "https://raft-staging.pages.dev/s/acme/channel/c1?msg=m1";
+  try {
+    assert.equal(validateAttachmentPreviewExternalLink(configured, appOrigin).ok, true, "before the list arrives: an ordinary public host");
+
+    setRaftAppHosts(["app.raft.build", "chat.example.dev", "raft-staging.pages.dev"]);
+    for (const href of [configured, "https://RAFT-STAGING.pages.dev./x", "https://chat.example.dev/"]) {
+      assert.deepEqual(validateAttachmentPreviewExternalLink(href, appOrigin), { ok: false, reason: "internal_origin" }, href);
+    }
+    // The fixed list and the botiverse.dev rule still hold.
+    assert.deepEqual(validateAttachmentPreviewExternalLink("https://api.slock.ai/v1", appOrigin), { ok: false, reason: "internal_origin" });
+    assert.deepEqual(validateAttachmentPreviewExternalLink("https://api-aws-staging.botiverse.dev/", appOrigin), { ok: false, reason: "internal_origin" });
+    for (const href of [
+      "https://raft-staging.pages.dev.evil.example/",
+      "https://sub.raft-staging.pages.dev/",
+      "https://evil-raft-staging.pages.dev/",
+      "https://pages.dev/",
+    ]) {
+      assert.equal(validateAttachmentPreviewExternalLink(href, appOrigin).ok, true, href);
+    }
+  } finally {
+    resetRaftAppHostsForTests();
   }
 });
 

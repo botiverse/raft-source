@@ -1,6 +1,6 @@
 import type { Request, Response } from "express";
 import { normalizeTranslationLanguageCode } from "@botiverse/raft-shared";
-import { translateMessagesBatch, TranslationFeatureUnavailableError, type TranslationMode } from "../services/messageTranslationService";
+import { translateMessagesBatch, type TranslationMode } from "../services/messageTranslationService";
 import { getServerTranslationSettings } from "../services/serverService";
 import { addTraceEvent } from "../tracing/semanticTrace";
 import { sendJsonServerError } from "./errorResponse";
@@ -64,10 +64,6 @@ export async function messageTranslationBatchHandler(req: Request, res: Response
     });
     res.json({ results });
   } catch (err) {
-    if (err instanceof TranslationFeatureUnavailableError) {
-      res.status(403).json({ error: err.message });
-      return;
-    }
     sendJsonServerError(req, res, { error: "Failed to translate messages", logPrefix: "Message translation batch error:", err });
   }
 }

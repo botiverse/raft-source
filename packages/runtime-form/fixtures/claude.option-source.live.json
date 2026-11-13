@@ -1,0 +1,53 @@
+{
+  "protocolVersion": 1,
+  "runtimeId": "claude",
+  "schemaVersion": "claude.create.v1",
+  "sourceId": "model",
+  "kind": "select",
+  "pointer": "/model",
+  "options": [
+    {
+      "value": "opus",
+      "label": "Claude Opus (Opus 5.5)",
+      "supportedReasoningEfforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ]
+    },
+    {
+      "value": "claude-opus-5-5",
+      "label": "Claude Opus 5.5",
+      "supportedReasoningEfforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ]
+    },
+    {
+      "value": "claude-sonnet-5-5",
+      "label": "Claude Sonnet 5.5",
+      "supportedReasoningEfforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ]
+    }
+  ],
+  "defaultValue": "opus",
+  "customValueAllowed": true,
+  "status": "live",
+  "unavailableOptions": [
+    {
+      "value": "claude-opus-9",
+      "label": "Claude Opus 9",
+      "reason": "Update Claude Code to use this model"
+    }
+  ]
+}

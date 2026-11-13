@@ -1,5 +1,7 @@
+import { AGENT_GATED_WRITES, type AgentGatedWriteAction } from "./agentWriteLanding";
+
 export interface ApmFreshnessDecisionProducerInput {
-  action: "send" | "task_claim" | "task_update" | "task_amend";
+  action: AgentGatedWriteAction;
   decision: "local_hold" | "syncing_hold" | "forward" | "bypass";
   freshnessContextMode?: "inline" | "withheld";
   target?: string;
@@ -167,13 +169,7 @@ export function projectApmHeldFreshnessActivity(input: {
   messageCount: number;
 }): ApmHeldFreshnessActivityProjection {
   const messageNoun = input.messageCount === 1 ? "message" : "messages";
-  const title = input.action === "send"
-    ? "Send held by freshness check"
-    : input.action === "task_claim"
-      ? "Task claim held by freshness check"
-      : input.action === "task_amend"
-        ? "Task amendment held by freshness check"
-        : "Task update held by freshness check";
+  const title = AGENT_GATED_WRITES[input.action].heldTitle;
   const countLine = input.decision === "syncing_hold"
     ? `unreviewed synced context for this target: ${input.messageCount} ${messageNoun}`
     : `new messages: ${input.messageCount} newer ${messageNoun}`;

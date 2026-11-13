@@ -20,7 +20,6 @@
   "humans": {
     "owner": {
       "id": "visual-user",
-      "memberId": "visual-human-1",
       "name": "artin",
       "displayName": "artin",
       "handle": "@artin",
@@ -266,7 +265,7 @@
       "displayName": "Daemon Only Probe",
       "avatar": "pixel:robot",
       "avatarLabel": "DO",
-      "description": "Bound to a bare daemon (not a managed Computer): web shows Connected · daemon vX, never a computer version.",
+      "description": "Bound to a bare daemon (not a managed Computer): web shows Connected · legacy vX, never a computer version.",
       "status": "active",
       "serverRole": "member",
       "activity": "working",
@@ -422,5 +421,27 @@
     "image": { "filename": "composer-preview.png", "mimeType": "image/png", "sizeBytes": 131072 },
     "pdf": { "filename": "release-notes.pdf", "mimeType": "application/pdf", "sizeBytes": 438272 },
     "zip": { "filename": "android-smoke-log.zip", "mimeType": "application/zip", "sizeBytes": 1887436 }
+  },
+  "homeChannelList": {
+    "comment": "Phone Home rows for screens.home.channel-list and screens.home.channel-list.dark (same rows, light and dark). The one source for both providers: the React host (VisualTestingCases.tsx primeHomeChannelListStores, the playwright stubs) reads it here; Android reads the generated VisualFixtureData.HomeChannelList (CHANNELS / DIRECT_MESSAGES row lists) in HomeChannelListVisualHost.kt. Server id/slug are fixtureData.server. Every row carries every field so both sides map rows uniformly. mention (the @ sticker) and followedThreadsWithNewReplies (the [thread] N count) are drawn on both; the Android app does not load them from the server yet, only this fixture sets them. No row is selected: a phone Home root never shows one.",
+    "serverName": "Raft Design",
+    "savedTotal": 5,
+    "activityUnreadCount": 0,
+    "pinnedChannelIds": ["channel-announcements"],
+    "channels": [
+      { "id": "channel-announcements", "name": "announcements", "type": "channel", "unread": 3, "mention": false, "followedThreadsWithNewReplies": 0, "muted": false, "draft": false },
+      { "id": "channel-partners-sync", "name": "partners-sync", "type": "joint", "unread": 2, "mention": false, "followedThreadsWithNewReplies": 0, "muted": false, "draft": false },
+      { "id": "channel-release", "name": "release", "type": "channel", "unread": 5, "mention": true, "followedThreadsWithNewReplies": 0, "muted": false, "draft": false },
+      { "id": "channel-mobile", "name": "mobile", "type": "channel", "unread": 0, "mention": false, "followedThreadsWithNewReplies": 2, "muted": false, "draft": false },
+      { "id": "channel-ops-alerts", "name": "ops-alerts", "type": "channel", "unread": 12, "mention": false, "followedThreadsWithNewReplies": 0, "muted": true, "draft": false },
+      { "id": "channel-roadmap", "name": "roadmap", "type": "private", "unread": 0, "mention": false, "followedThreadsWithNewReplies": 0, "muted": false, "draft": true },
+      { "id": "channel-long-name", "name": "visual-parity-and-release-readiness-for-every-phone", "type": "channel", "unread": 0, "mention": false, "followedThreadsWithNewReplies": 0, "muted": false, "draft": false }
+    ],
+    "directMessages": [
+      { "id": "dm-agent-cindy", "peerType": "agent", "peerId": "agent-cindy", "name": "Cindy", "avatarLabel": "CI", "unread": 0, "runtime": "codex", "activity": "working", "activityDetail": "Capturing visual testing baselines" },
+      { "id": "dm-agent-builder", "peerType": "agent", "peerId": "agent-builder", "name": "Builder", "avatarLabel": "BU", "unread": 4, "runtime": "claude", "activity": "online", "activityDetail": null },
+      { "id": "dm-agent-product-ux", "peerType": "agent", "peerId": "agent-product-ux", "name": "Product UX", "avatarLabel": "PR", "unread": 0, "runtime": "claude", "activity": "online", "activityDetail": null },
+      { "id": "dm-human-jiacheng", "peerType": "user", "peerId": "visual-human-jiacheng", "name": "Jiacheng from the infrastructure reliability team", "avatarLabel": "JI", "unread": 1, "runtime": null, "activity": null, "activityDetail": null }
+    ]
   }
 }

@@ -12,8 +12,10 @@
  * The import hook makes completion immediate; the sweep in the importer loop
  * is the backstop for a lost hook, a restart, and the cases with no hook.
  */
+import { lockMachineIfTakesAgents } from "./computerAgents";
+import { agentConfigValues, recordAgentConfigChange } from "./agentConfigChangeEvents";
 import { and, asc, eq, gt, isNotNull, isNull, ne, or, sql } from "drizzle-orm";
-import { currentDate, type RuntimeConfig, type ReasoningEffort } from "@botiverse/raft-shared";
+import { currentDate, type RuntimeConfig, type LegacyColumnReasoningEffort } from "@botiverse/raft-shared";
 import { getDb } from "../db/index";
 import {
   agentCredentials,
@@ -38,7 +40,8 @@ import type { AgentOrchestrator } from "./agentOrchestrator";
 import { decryptProviderSecret } from "./agentRuntimeProviderService";
 import { probeProviderAgent } from "./agentRuntimeProvisionService";
 import { HOSTED_MIGRATION_IMPORT_SOURCE, hostedRuntimeSnapshotScope } from "./hostedAgentMigrationService";
-import { getStorage, type StorageBackend } from "./storageService";
+import type { StorageBackend } from "./storageService";
+import { hostedMigrationFileSetStorage } from "./hostedMigrationFileSet";
 import { recordTraceEvent } from "../tracing/semanticTrace";
 
 /** An `arriving` hosted row with no import this long needs a person, ahead of the provider's 24 h import window. */
@@ -134,15 +137,18 @@ export async function cleanUpCompletedHostedMigration(migration: AgentMigrationR
       : await recordAgentMigrationSourceArchiveAttemptFailed({ migrationId: migration.id, errorCode: archive.errorCode, now });
     if (updated) await deps.onMigrationUpdated?.(updated);
   }
-  await deleteHostedMigrationFileSet(migration.id, deps.storage === undefined ? getStorage() : deps.storage, now);
+  await deleteHostedMigrationFileSet(migration.id, deps.storage, now);
 }
 
-async function deleteHostedMigrationFileSet(migrationId: string, storage: StorageBackend | null, now: Date): Promise<void> {
+/** `injected`: a test's storage; otherwise the bucket the key itself names (hostedMigrationFileSetStorage). */
+async function deleteHostedMigrationFileSet(migrationId: string, injected: StorageBackend | null | undefined, now: Date): Promise<void> {
   const [hosted] = await getDb().select({ key: agentMigrationHostedTargets.fileSetObjectKey })
     .from(agentMigrationHostedTargets)
     .where(eq(agentMigrationHostedTargets.migrationId, migrationId))
     .limit(1);
-  if (!hosted?.key || !storage) return;
+  if (!hosted?.key) return;
+  const storage = injected === undefined ? hostedMigrationFileSetStorage(hosted.key) : injected;
+  if (!storage) return;
   try {
     await storage.delete(hosted.key);
   } catch (error) {
@@ -201,20 +207,40 @@ export async function revertHostedAgentMigration(input: { agentId: string; now?:
       runtimeConfig: RuntimeConfig | null;
       envVars: Record<string, string> | null;
     };
+    const [before] = await tx.select({ serverId: agents.serverId, runtime: agents.runtime, model: agents.model, reasoningEffort: agents.reasoningEffort })
+      .from(agents).where(eq(agents.id, row.migration.agentId)).limit(1).for("update");
+    // Back onto the source Computer only while it still takes agents: one whose
+    // key was revoked (or that was removed) since leaves the agent unbound and
+    // stopped, for its owner to move (computerAgents.ts).
+    const backOnSource = snapshot.machineId !== null && await lockMachineIfTakesAgents(tx, snapshot.machineId);
     const [restored] = await tx.update(agents)
       .set({
         runtime: snapshot.runtime,
         model: snapshot.model,
         runtimeConfig: secret.runtimeConfig,
-        reasoningEffort: snapshot.reasoningEffort as ReasoningEffort | null,
+        // The snapshot copied this legacy column, so it holds a legacy value.
+        reasoningEffort: snapshot.reasoningEffort as LegacyColumnReasoningEffort | null,
         envVars: secret.envVars,
-        machineId: snapshot.machineId,
+        machineId: backOnSource ? snapshot.machineId : null,
+        ...(backOnSource ? { machineReleaseReason: null, machineReleasedAt: null } : {}),
+        ...(backOnSource ? {} : { status: "stopped" as const }),
         sessionId: null,
         updatedAt: now,
       })
       .where(and(eq(agents.id, row.migration.agentId), isNull(agents.machineId), isNull(agents.deletedAt)))
-      .returning({ id: agents.id });
+      .returning({ id: agents.id, runtime: agents.runtime, model: agents.model, reasoningEffort: agents.reasoningEffort });
     if (!restored) return null;
+    if (before) {
+      await recordAgentConfigChange(tx, {
+        serverId: before.serverId,
+        agentId: restored.id,
+        source: "hosted_migration_revert",
+        actor: { kind: "system" },
+        before: agentConfigValues(before),
+        after: agentConfigValues(restored),
+        changedAt: now,
+      });
+    }
     await tx.update(agentCredentials)
       .set({ revokedAt: now, revokedReason: "agent_migration_reverted" })
       .where(and(eq(agentCredentials.agentId, row.migration.agentId), isNull(agentCredentials.revokedAt)));
@@ -291,8 +317,7 @@ export async function sweepHostedAgentMigrations(deps: HostedMigrationCompletion
     .innerJoin(agentMigrationHostedTargets, eq(agentMigrationHostedTargets.migrationId, agentMigrations.id))
     .where(and(eq(agentMigrations.state, "completed"), isNotNull(agentMigrationHostedTargets.fileSetObjectKey)))
     .limit(SWEEP_BATCH);
-  const storage = deps.storage === undefined ? getStorage() : deps.storage;
-  for (const { id } of leftovers) await deleteHostedMigrationFileSet(id, storage, now);
+  for (const { id } of leftovers) await deleteHostedMigrationFileSet(id, deps.storage, now);
   return changed;
 }
 

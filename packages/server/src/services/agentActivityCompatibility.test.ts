@@ -214,3 +214,15 @@ test("Redis activity cache decodes a mirrored spawnFailure carrier and drops mal
     "model travels only with model_not_found",
   );
 });
+
+// Reconciler step 4b: the held notice's typed reason is mirrored beside the
+// idle snapshot so a non-owner replica serves it too; only a known reason.
+test("Redis activity cache decodes a mirrored credentialHold carrier and drops unknown reasons", () => {
+  const idle = (carriers: unknown) => projectAgentActivityFromRedisHash({
+    activity: "online", detail: "held", detailKind: "idle", updatedAt: "1", carriers: JSON.stringify(carriers),
+  })?.carriers;
+  assert.deepEqual(idle({ credentialHold: { reason: "user_model_access", model: "not-echoed" } }), { credentialHold: { reason: "user_model_access" } });
+  assert.deepEqual(idle({ credentialHold: { reason: "billing" } }), { credentialHold: { reason: "billing" } });
+  assert.equal(idle({ credentialHold: { reason: "quota" } }), undefined, "an unknown reason is dropped, not propagated");
+  assert.equal(idle({ credentialHold: "user_reauth" }), undefined, "a non-object value is dropped");
+});

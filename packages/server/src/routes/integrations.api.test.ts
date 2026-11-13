@@ -1,11 +1,14 @@
+import { vi } from "vitest";
 import { fixturePasswordHash, tokenForHuman } from "../test/integration/credentials";
 import { createApiTest } from "../test/integration/apiTest";
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
+import sharp from "sharp";
 
 import { and, eq, inArray } from "drizzle-orm";
 
 import {
+  agentCredentials,
   agents,
   appBotBindings,
   externalAppRegistrations,
@@ -22,8 +25,12 @@ import {
   users,
 } from "../db/schema";
 import { getDb } from "../db/index";
+import { expectedAppPermissionsBody, expectedAppPermissionsJson } from "../test/integration/appPermissions";
 import { createHangingStorageTestHarness } from "../test/hangingStorageTestHarness";
+import { installRecordingLogoStorage } from "../test/recordingLogoStorage";
+import { approvePermissionReview, decidePublishReview, reviewRefusalCode } from "../test/marketplaceReviewFixture";
 import { addMember, createServer } from "../services/serverService";
+import * as oauthService from "../services/oauthService";
 import {
   __resetOAuthServiceDbForTests,
   __setOAuthServiceDbForTests,
@@ -39,13 +46,13 @@ import {
   transferClientOwnershipForAgent,
   updateOAuthClientForAgent,
 } from "../services/oauthService";
+import * as agentService from "../services/agentService";
 import { createAgent } from "../services/agentService";
 import {
   __setAppWebhookEncryptionKeyForTests,
   configureAppWebhook,
 } from "../services/appWebhookConfigService";
 import {
-  approvePendingAppOutboundPermissionRevision,
   createAppOutboundPermissionRevision,
   updateAppInstallationGrant,
   updateAppInstallationSubscriptions,
@@ -59,7 +66,7 @@ import {
   resetStorageForTests,
 } from "../services/storageService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 const ONE_BY_ONE_GIF = Buffer.from(
   "R0lGODdhAQABAIABAP///wAAACwAAAAAAQABAAACAkQBADs=",
@@ -108,6 +115,39 @@ async function seedRetiredBuiltInOAuthClient(input: {
     returnUrl: input.returnUrl ?? null,
   }).returning();
   return { client, clientSecret };
+}
+
+/** Seed a server-local OAuth client with a KNOWN secret — client credentials
+ * are what the bot-status and bot-token routes authenticate (createOAuthClient
+ * never returns its raw secret). */
+async function seedOAuthClientWithSecret(input: {
+  serverId: string;
+  createdByUserId: string;
+  clientId: string;
+  name: string;
+  description?: string | null;
+  enableBot?: boolean;
+}) {
+  const clientSecret = `test_secret_${randomUUID()}`;
+  const [client] = await getDb().insert(oauthClients).values({
+    serverId: input.serverId,
+    createdByUserId: input.createdByUserId,
+    clientId: input.clientId,
+    clientSecretHash: createHash("sha256").update(clientSecret).digest("hex"),
+    clientSecret: null,
+    name: input.name,
+    description: input.description ?? null,
+    appType: "server_local",
+    enabled: true,
+    publishStatus: "published",
+    humanMarketplaceVisible: true,
+    enableBot: input.enableBot ?? false,
+  }).returning();
+  return { client, clientSecret };
+}
+
+function clientBasicAuth(clientId: string, secret: string) {
+  return `Basic ${Buffer.from(`${clientId}:${secret}`).toString("base64")}`;
 }
 
 test("new slock_builtin registration fails before persistence or audit", async ({ app: _app }) => {
@@ -418,7 +458,7 @@ test("App Notifications management exposes truthful state without replaying secr
     assert.equal("signing_secret" in developerState.webhook, false);
     assert.equal(JSON.stringify(developerState).includes(configured.signing_secret), false);
 
-    const approved = await approvePendingAppOutboundPermissionRevision({
+    const approved = await approvePermissionReview({
       clientId: client.id,
       reviewerUserId: developer.id,
     });
@@ -443,6 +483,7 @@ test("App Notifications management exposes truthful state without replaying secr
     const installRes = await fetch(`${app.baseUrl}/api/integrations/marketplace/${client.id}/install`, {
       method: "POST",
       headers: headers(installerToken, installServer.id),
+      body: await expectedAppPermissionsJson(client.id),
     });
     assert.equal(installRes.status, 200);
     const [installation] = await getDb().select({ id: oauthClientInstalls.id })
@@ -506,7 +547,7 @@ test("App Notifications management exposes truthful state without replaying secr
       }),
     });
     assert.equal(eventExpansionRes.status, 200);
-    assert.ok(await approvePendingAppOutboundPermissionRevision({ clientId: client.id, reviewerUserId: developer.id }));
+    assert.ok(await approvePermissionReview({ clientId: client.id, reviewerUserId: developer.id }));
 
     const effectiveRead = await fetch(installStateUrl, { headers: headers(installerToken, installServer.id) });
     assert.equal(effectiveRead.status, 200);
@@ -535,11 +576,12 @@ test("App Notifications management exposes truthful state without replaying secr
       }),
     });
     assert.equal(groupExpansionRes.status, 200);
-    assert.ok(await approvePendingAppOutboundPermissionRevision({ clientId: client.id, reviewerUserId: developer.id }));
+    assert.ok(await approvePermissionReview({ clientId: client.id, reviewerUserId: developer.id }));
 
     const pendingInstallerRead = await fetch(installStateUrl, { headers: headers(installerToken, installServer.id) });
     assert.equal(pendingInstallerRead.status, 200);
     const pendingInstallerState = await pendingInstallerRead.json() as {
+      requested_scopes: string[];
       requested_groups: string[];
       approved_groups: string[];
       effective_events: string[];
@@ -563,9 +605,14 @@ test("App Notifications management exposes truthful state without replaying secr
     ]);
     assert.equal(preApprovalSubscription.status, 400);
 
+    // Approve Update sends back the set the page read.
     const grantRes = await fetch(`${installStateUrl}/grant`, {
       method: "PUT",
       headers: headers(installerToken, installServer.id),
+      body: JSON.stringify({
+        expected_scopes: pendingInstallerState.requested_scopes,
+        expected_groups: pendingInstallerState.requested_groups,
+      }),
     });
     assert.equal(grantRes.status, 200);
     const agentAuthority = await mintGroups(["agent"]);
@@ -618,7 +665,7 @@ test("App Notifications management exposes truthful state without replaying secr
       }),
     });
     assert.equal(reExpansionRes.status, 200);
-    assert.ok(await approvePendingAppOutboundPermissionRevision({ clientId: client.id, reviewerUserId: developer.id }));
+    assert.ok(await approvePermissionReview({ clientId: client.id, reviewerUserId: developer.id }));
     const reExpandedRead = await fetch(installStateUrl, { headers: headers(installerToken, installServer.id) });
     assert.equal(reExpandedRead.status, 200);
     const reExpandedState = await reExpandedRead.json() as {
@@ -1137,7 +1184,8 @@ test("external-registration-bound OAuth clients are hidden and immutable while o
     ["PATCH", `/api/integrations/clients/${platformClient.id}`, { name: "mutated" }],
     ["POST", `/api/integrations/clients/${platformClient.id}/regenerate-secret`],
     ["POST", `/api/integrations/clients/${platformClient.id}/request-unpublish`],
-    ["POST", `/api/integrations/clients/${platformClient.id}/share-link`],
+    ["POST", `/api/integrations/clients/${platformClient.id}/share-links`, { targetServerSlug: installServer.slug }],
+    ["GET", `/api/integrations/clients/${platformClient.id}/share-links`],
     ["GET", `/api/integrations/clients/${platformClient.id}/app-notifications`],
     ["PUT", `/api/integrations/clients/${platformClient.id}/app-notifications/permissions`, { groups: [], events: [] }, 403],
     ["PUT", `/api/integrations/clients/${platformClient.id}/app-notifications/webhook`, { endpointUrl: "https://events.example.test/bridge" }, 403],
@@ -1161,7 +1209,7 @@ test("external-registration-bound OAuth clients are hidden and immutable while o
     const response = await fetch(`${app.baseUrl}${path}`, {
       method,
       headers: installHeaders,
-      ...(method === "PUT" ? { body: JSON.stringify({}) } : {}),
+      ...(method === "PUT" ? { body: JSON.stringify({ expected_scopes: [], expected_groups: [] }) } : {}),
     });
     assert.equal(response.status, 404, `${method} ${path}: ${await response.clone().text()}`);
   }
@@ -1196,6 +1244,7 @@ test("external-registration-bound OAuth clients are hidden and immutable while o
   assert.equal(await updateAppInstallationGrant({
     installationId: platformInstalls[1]!.id,
     actorUserId: installOwner.id,
+    expected: { scopes: [], groups: [] },
   }), null);
   assert.equal(await updateAppInstallationSubscriptions({
     installationId: platformInstalls[1]!.id,
@@ -1289,7 +1338,6 @@ test("external-registration-bound OAuth clients are hidden and immutable while o
 
 test("marketplace publish review and install keeps third-party apps out of server-local install semantics", async ({ app }) => {
 
-  const previousReviewers = process.env.SLOCK_MARKETPLACE_REVIEWER_USER_IDS;
   try {
     const suffix = randomUUID();
     const publisher = await seedUser(`integrations-publisher-${suffix}@slock.test`, `Publisher ${suffix}`);
@@ -1300,7 +1348,6 @@ test("marketplace publish review and install keeps third-party apps out of serve
     const installerServer = await createServer("Installer Server", `installer-${suffix}`, installer.id);
     await addMember(publisherServer.id, reviewer.id, "admin");
     await addMember(installerServer.id, member.id, "member");
-    process.env.SLOCK_MARKETPLACE_REVIEWER_USER_IDS = reviewer.id;
     const publisherAgent = await createAgent(publisherServer.id, "PublisherBot", {
       runtime: "claude",
       model: "sonnet",
@@ -1359,18 +1406,11 @@ test("marketplace publish review and install keeps third-party apps out of serve
       .update(oauthClients)
       .set({ publishStatus: "publish_requested", updatedAt: new Date() })
       .where(eq(oauthClients.id, blankDescriptionTarget.client.id));
-    const blankDescriptionReviewRes = await fetch(`${app.baseUrl}/api/integrations/clients/${blankDescriptionTarget.client.id}/review-publish`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${reviewerToken}`,
-        "X-Server-Id": publisherServer.id,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ status: "published" }),
-    });
-    assert.equal(blankDescriptionReviewRes.status, 400);
-    const blankDescriptionReviewBody = await blankDescriptionReviewRes.json() as { error: string };
-    assert.match(blankDescriptionReviewBody.error, /description is required/);
+    // Publishing without a description is refused (RVW06) and changes nothing.
+    await assert.rejects(
+      decidePublishReview({ clientId: blankDescriptionTarget.client.id, reviewerUserId: reviewer.id, decision: "approve" }),
+      (error: unknown) => reviewRefusalCode(error) === "RVW06",
+    );
     const [blankDescriptionAfterReview] = await getDb()
       .select({ appType: oauthClients.appType, publishStatus: oauthClients.publishStatus })
       .from(oauthClients)
@@ -1504,18 +1544,8 @@ test("marketplace publish review and install keeps third-party apps out of serve
         && metadata.publishStatus === "publish_requested";
     }));
 
-    const nonReviewerRes = await fetch(`${app.baseUrl}/api/integrations/clients/${client.id}/review-publish`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${publisherToken}`,
-        "X-Server-Id": publisherServer.id,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ status: "published" }),
-    });
-    assert.equal(nonReviewerRes.status, 403);
-
-    const approveRes = await fetch(`${app.baseUrl}/api/integrations/clients/${client.id}/review-publish`, {
+    // Raft has no review route: App Admin decides (#proj-apps task #19).
+    const publishReviewRoute = await fetch(`${app.baseUrl}/api/integrations/clients/${client.id}/review-publish`, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${reviewerToken}`,
@@ -1524,8 +1554,9 @@ test("marketplace publish review and install keeps third-party apps out of serve
       },
       body: JSON.stringify({ status: "published" }),
     });
-    assert.equal(approveRes.status, 200);
-    const approved = await approveRes.json() as { id: string; appType: string; publishStatus: string };
+    assert.equal(publishReviewRoute.status, 404);
+
+    const { client: approved } = await decidePublishReview({ clientId: client.id, reviewerUserId: reviewer.id, decision: "approve" });
     assert.equal(approved.id, client.id);
     assert.equal(approved.appType, "third_party_global");
     assert.equal(approved.publishStatus, "published");
@@ -1682,7 +1713,9 @@ test("marketplace publish review and install keeps third-party apps out of serve
       headers: {
         Authorization: `Bearer ${installerToken}`,
         "X-Server-Id": installerServer.id,
+        "Content-Type": "application/json",
       },
+      body: await expectedAppPermissionsJson(client.id),
     });
     assert.equal(installRes.status, 200);
     const installed = await installRes.json() as { id: string; appType: string };
@@ -1695,34 +1728,9 @@ test("marketplace publish review and install keeps third-party apps out of serve
       .where(eq(oauthClientInstalls.clientId, client.id));
     assert.equal(installRows.length, 2);
 
-    const rejectPublishedRes = await fetch(`${app.baseUrl}/api/integrations/clients/${client.id}/review-publish`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${reviewerToken}`,
-        "X-Server-Id": publisherServer.id,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ status: "rejected", rejectionReason: "offline requests must approve private or keep published" }),
+    const { client: offlineRejected } = await decidePublishReview({
+      clientId: client.id, reviewerUserId: reviewer.id, decision: "reject", reason: "keep listed for launch week",
     });
-    assert.equal(rejectPublishedRes.status, 400);
-
-    const installRowsAfterRejectedReviewAttempt = await getDb()
-      .select({ id: oauthClientInstalls.id })
-      .from(oauthClientInstalls)
-      .where(eq(oauthClientInstalls.clientId, client.id));
-    assert.equal(installRowsAfterRejectedReviewAttempt.length, 2);
-
-    const rejectOfflineRequestRes = await fetch(`${app.baseUrl}/api/integrations/clients/${client.id}/review-publish`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${reviewerToken}`,
-        "X-Server-Id": publisherServer.id,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ status: "published", rejectionReason: "keep listed for launch week" }),
-    });
-    assert.equal(rejectOfflineRequestRes.status, 200);
-    const offlineRejected = await rejectOfflineRequestRes.json() as { id: string; appType: string; publishStatus: string; publishRejectionReason: string | null };
     assert.equal(offlineRejected.id, client.id);
     assert.equal(offlineRejected.appType, "third_party_global");
     assert.equal(offlineRejected.publishStatus, "published");
@@ -1817,7 +1825,12 @@ test("marketplace publish review and install keeps third-party apps out of serve
     assert.equal(uninstalled.clientId, client.id);
     assert.equal(uninstalled.revokedGrantCount, 1);
     assert.equal(uninstalled.revokedTokenCount, 1);
-    assert.equal(uninstalled.deniedPendingRequestCount, 1);
+    // Every request that could still produce a token is denied (#10678): the
+    // pending one, and the auto-approved one whose code was never exchanged.
+    assert.equal(uninstalled.deniedPendingRequestCount, 2);
+    const requestStates = await getDb().select({ id: oauthAccessRequests.id, status: oauthAccessRequests.status })
+      .from(oauthAccessRequests).where(inArray(oauthAccessRequests.id, [pendingRequest.id, agentRequest.requestId]));
+    assert.deepEqual(requestStates.map((row) => row.status), ["denied", "denied"]);
 
     const installRowsAfterUninstall = await getDb()
       .select({ id: oauthClientInstalls.id })
@@ -1862,7 +1875,9 @@ test("marketplace publish review and install keeps third-party apps out of serve
       headers: {
         Authorization: `Bearer ${installerToken}`,
         "X-Server-Id": installerServer.id,
+        "Content-Type": "application/json",
       },
+      body: await expectedAppPermissionsJson(client.id),
     });
     assert.equal(reinstallBeforeOfflineApprovalRes.status, 200);
 
@@ -1934,17 +1949,7 @@ test("marketplace publish review and install keeps third-party apps out of serve
       installId: externalInstallBeforeOffline.id, serverId: installerServer.id, agentId: externalBot.id, handle: externalBot.name,
     });
 
-    const approveOfflineRequestRes = await fetch(`${app.baseUrl}/api/integrations/clients/${client.id}/review-publish`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${reviewerToken}`,
-        "X-Server-Id": publisherServer.id,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ status: "private" }),
-    });
-    assert.equal(approveOfflineRequestRes.status, 200);
-    const offlineApproved = await approveOfflineRequestRes.json() as { id: string; appType: string; publishStatus: string; humanMarketplaceVisible: boolean };
+    const { client: offlineApproved } = await decidePublishReview({ clientId: client.id, reviewerUserId: reviewer.id, decision: "approve" });
     assert.equal(offlineApproved.id, client.id);
     assert.equal(offlineApproved.appType, "third_party_global");
     assert.equal(offlineApproved.publishStatus, "private");
@@ -1997,7 +2002,9 @@ test("marketplace publish review and install keeps third-party apps out of serve
       headers: {
         Authorization: `Bearer ${installerToken}`,
         "X-Server-Id": installerServer.id,
+        "Content-Type": "application/json",
       },
+      body: await expectedAppPermissionsJson(client.id),
     });
     assert.equal(installAfterOfflineApprovalRes.status, 404);
 
@@ -2022,7 +2029,7 @@ test("marketplace publish review and install keeps third-party apps out of serve
     const otherLookup = await fetch(`${app.baseUrl}/api/oauth/clients/lookup?client_id=${client.clientId}&server_id=${installerServer.id}`, {
       headers: { Authorization: `Bearer ${installerToken}` },
     });
-    assert.equal(otherLookup.status, 404);
+    assert.equal(otherLookup.status, 403);
     const humanAuthorize = await fetch(`${app.baseUrl}/api/oauth/authorize/human`, {
       method: "POST",
       headers: { Authorization: `Bearer ${publisherToken}`, "Content-Type": "application/json" },
@@ -2091,21 +2098,7 @@ test("marketplace publish review and install keeps third-party apps out of serve
     assert.equal(republishRequested.publishStatus, "publish_requested");
     assert.equal(republishRequested.humanMarketplaceVisible, false);
 
-    const approveRepublishRes = await fetch(`${app.baseUrl}/api/integrations/clients/${client.id}/review-publish`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${reviewerToken}`,
-        "X-Server-Id": publisherServer.id,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ status: "published" }),
-    });
-    assert.equal(approveRepublishRes.status, 200);
-    const republished = await approveRepublishRes.json() as {
-      appType: string;
-      publishStatus: string;
-      humanMarketplaceVisible: boolean;
-    };
+    const { client: republished } = await decidePublishReview({ clientId: client.id, reviewerUserId: reviewer.id, decision: "approve" });
     assert.equal(republished.appType, "third_party_global");
     assert.equal(republished.publishStatus, "published");
     assert.equal(republished.humanMarketplaceVisible, true);
@@ -2174,11 +2167,6 @@ test("marketplace publish review and install keeps third-party apps out of serve
         && metadata.installedCount === 1;
     }));
   } finally {
-    if (previousReviewers === undefined) {
-      delete process.env.SLOCK_MARKETPLACE_REVIEWER_USER_IDS;
-    } else {
-      process.env.SLOCK_MARKETPLACE_REVIEWER_USER_IDS = previousReviewers;
-    }
     await app.close();
   }
 });
@@ -2225,16 +2213,19 @@ test("private shared app invites install canonical third-party clients without m
   const marketplaceBeforeShare = await marketplaceBeforeShareRes.json() as Array<{ id: string }>;
   assert.equal(marketplaceBeforeShare.some((item) => item.id === client.id), false);
 
-  const memberShareRes = await fetch(`${app.baseUrl}/api/integrations/clients/${client.id}/share-link`, {
+  const memberShareRes = await fetch(`${app.baseUrl}/api/integrations/clients/${client.id}/share-links`, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${memberToken}`,
       "X-Server-Id": publisherServer.id,
+      "Content-Type": "application/json",
     },
+    body: JSON.stringify({ targetServerSlug: installerServer.slug }),
   });
   assert.equal(memberShareRes.status, 403);
 
-  const shareRes = await fetch(`${app.baseUrl}/api/integrations/clients/${client.id}/share-link`, {
+  // A link always names its one target Server.
+  const untargetedShareRes = await fetch(`${app.baseUrl}/api/integrations/clients/${client.id}/share-links`, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${publisherToken}`,
@@ -2243,12 +2234,32 @@ test("private shared app invites install canonical third-party clients without m
     },
     body: JSON.stringify({ expiresInDays: 14 }),
   });
+  assert.equal(untargetedShareRes.status, 400);
+  assert.equal((await untargetedShareRes.json() as { code: string }).code, "share_link_target_required");
+  assert.equal((await getDb().select({ id: oauthClientShareLinks.id }).from(oauthClientShareLinks)
+    .where(eq(oauthClientShareLinks.clientId, client.id))).length, 0, "a refused create stores nothing");
+
+  const shareRes = await fetch(`${app.baseUrl}/api/integrations/clients/${client.id}/share-links`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${publisherToken}`,
+      "X-Server-Id": publisherServer.id,
+      "Content-Type": "application/json",
+    },
+    // Typed loosely: stored trimmed and lowercased.
+    body: JSON.stringify({ expiresInDays: 14, targetServerSlug: ` ${installerServer.slug.toUpperCase()} ` }),
+  });
   assert.equal(shareRes.status, 200);
+  const shareText = await shareRes.clone().text();
   const share = await shareRes.json() as {
     client: { id: string; appType: string; publishStatus: string; humanMarketplaceVisible: boolean; clientSecret?: string };
-    link: { id: string; expiresAt: string | null; revokedAt: string | null };
+    link: { id: string; targetServerSlug: string | null; expiresAt: string | null; revokedAt: string | null; consumedAt: string | null };
     token: string;
   };
+  assert.equal(share.link.targetServerSlug, installerServer.slug);
+  assert.equal(share.link.consumedAt, null);
+  assert.equal(shareText.includes(installerServer.id), false, "creation never echoes the resolved target id");
+  assert.equal(shareText.includes(installerServer.name), false, "creation never echoes the resolved target name");
   assert.equal(share.client.id, client.id);
   assert.equal(share.client.appType, "third_party_global");
   assert.equal(share.client.publishStatus, "private");
@@ -2257,19 +2268,21 @@ test("private shared app invites install canonical third-party clients without m
   assert.match(share.token, /^raft_share_[0-9a-f]{64}$/);
   assert.equal(share.link.revokedAt, null);
 
-  const shareLinkRows = await getDb().select({ id: oauthClientShareLinks.id }).from(oauthClientShareLinks).where(eq(oauthClientShareLinks.clientId, client.id));
-  assert.equal(shareLinkRows.length, 1);
+  const shareLinkRows = await getDb().select({ id: oauthClientShareLinks.id, targetServerId: oauthClientShareLinks.targetServerId })
+    .from(oauthClientShareLinks).where(eq(oauthClientShareLinks.clientId, client.id));
+  assert.deepEqual(shareLinkRows, [{ id: share.link.id, targetServerId: installerServer.id }], "the slug resolved to the target Server at creation");
 
-  const activeShareRes = await fetch(`${app.baseUrl}/api/integrations/clients/${client.id}/share-link`, {
+  const activeShareRes = await fetch(`${app.baseUrl}/api/integrations/clients/${client.id}/share-links`, {
     headers: {
       Authorization: `Bearer ${publisherToken}`,
       "X-Server-Id": publisherServer.id,
     },
   });
   assert.equal(activeShareRes.status, 200);
-  const activeShare = await activeShareRes.json() as { id: string; token?: string };
-  assert.equal(activeShare.id, share.link.id);
-  assert.equal(activeShare.token, undefined);
+  const activeShare = await activeShareRes.json() as { links: Array<{ id: string; targetServerSlug: string | null; token?: string; targetServerId?: string }> };
+  assert.deepEqual(activeShare.links.map((link) => [link.id, link.targetServerSlug]), [[share.link.id, installerServer.slug]]);
+  assert.equal(activeShare.links[0]?.token, undefined);
+  assert.equal(activeShare.links[0]?.targetServerId, undefined);
 
   const publisherMarketplaceRes = await fetch(`${app.baseUrl}/api/integrations/marketplace`, {
     headers: {
@@ -2278,8 +2291,13 @@ test("private shared app invites install canonical third-party clients without m
     },
   });
   assert.equal(publisherMarketplaceRes.status, 200);
-  const publisherMarketplace = await publisherMarketplaceRes.json() as Array<{ id: string }>;
-  assert.equal(publisherMarketplace.some((item) => item.id === client.id), false);
+  // Listed for the publisher only as its own installation (Installed tab,
+  // Review permissions; #triage:59b61529): a private share, never in the
+  // Marketplace tab.
+  const publisherMarketplace = await publisherMarketplaceRes.json() as Array<{ id: string; privateShared: boolean; installStatus: string | null }>;
+  const publisherOwnRow = publisherMarketplace.find((item) => item.id === client.id);
+  assert.equal(publisherOwnRow?.privateShared, true);
+  assert.equal(publisherOwnRow?.installStatus, "active");
 
   const publisherUninstallRes = await fetch(`${app.baseUrl}/api/integrations/marketplace/${client.id}/install`, {
     method: "DELETE",
@@ -2319,12 +2337,29 @@ test("private shared app invites install canonical third-party clients without m
   });
   assert.equal(agentRequestBeforeInstall.status, 404);
 
+  // Someone outside the target sees exactly what a bad token gets; a plain
+  // member of the target is told whom to ask.
+  const badTokenInviteRes = await fetch(`${app.baseUrl}/api/integration-invites/raft_share_${"0".repeat(64)}`, {
+    headers: { Authorization: `Bearer ${installerToken}` },
+  });
+  assert.equal(badTokenInviteRes.status, 404);
+  const invalidInvite = await badTokenInviteRes.json();
+  assert.deepEqual(invalidInvite, { error: "This private app invite is invalid or has expired", code: "private_app_invite_invalid" });
+  const outsiderInviteBeforeRes = await fetch(`${app.baseUrl}/api/integration-invites/${share.token}`, {
+    headers: { Authorization: `Bearer ${outsiderToken}` },
+  });
+  assert.equal(outsiderInviteBeforeRes.status, 404);
+  assert.deepEqual(await outsiderInviteBeforeRes.json(), invalidInvite);
+  const adminRequired = {
+    error: `An owner or admin of ${installerServer.name} needs to install this app`,
+    code: "private_app_invite_admin_required",
+    targetServer: { name: installerServer.name, slug: installerServer.slug },
+  };
   const memberInviteRes = await fetch(`${app.baseUrl}/api/integration-invites/${share.token}`, {
     headers: { Authorization: `Bearer ${memberToken}` },
   });
-  assert.equal(memberInviteRes.status, 200);
-  const memberInvite = await memberInviteRes.json() as { manageableServers: Array<{ id: string }> };
-  assert.deepEqual(memberInvite.manageableServers, []);
+  assert.equal(memberInviteRes.status, 403);
+  assert.deepEqual(await memberInviteRes.json(), adminRequired);
 
   const inviteRes = await fetch(`${app.baseUrl}/api/integration-invites/${share.token}`, {
     headers: { Authorization: `Bearer ${installerToken}` },
@@ -2345,15 +2380,24 @@ test("private shared app invites install canonical third-party clients without m
   assert.equal(invite.manageableServers[0]?.role, "owner");
   assert.equal(invite.manageableServers[0]?.installedAt, null);
 
-  const memberInstallRes = await fetch(`${app.baseUrl}/api/integration-invites/${share.token}/install`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${memberToken}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ serverId: installerServer.id }),
-  });
-  assert.equal(memberInstallRes.status, 403);
+  const refusedInstalls: Array<[string, string, number, unknown]> = [
+    [memberToken, installerServer.id, 403, adminRequired], // the target, without owner/admin
+    [outsiderToken, outsiderServer.id, 404, invalidInvite], // an owner, of another Server
+  ];
+  for (const [token, serverId, status, body] of refusedInstalls) {
+    const res = await fetch(`${app.baseUrl}/api/integration-invites/${share.token}/install`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ serverId, ...await expectedAppPermissionsBody(client.id) }),
+    });
+    assert.equal(res.status, status);
+    assert.deepEqual(await res.json(), body);
+  }
+  assert.deepEqual((await getDb().select({ serverId: oauthClientInstalls.serverId }).from(oauthClientInstalls)
+    .where(eq(oauthClientInstalls.clientId, client.id))).map((row) => row.serverId), [publisherServer.id]);
 
   const installRes = await fetch(`${app.baseUrl}/api/integration-invites/${share.token}/install`, {
     method: "POST",
@@ -2361,7 +2405,7 @@ test("private shared app invites install canonical third-party clients without m
       Authorization: `Bearer ${installerToken}`,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({ serverId: installerServer.id }),
+    body: JSON.stringify({ serverId: installerServer.id, ...await expectedAppPermissionsBody(client.id) }),
   });
   assert.equal(installRes.status, 200);
   const installedInvite = await installRes.json() as {
@@ -2371,6 +2415,29 @@ test("private shared app invites install canonical third-party clients without m
   assert.equal(installedInvite.client.id, client.id);
   assert.ok(installedInvite.client.installedAt);
   assert.ok(installedInvite.manageableServers[0]?.installedAt);
+
+  // Single use: the install spent the link.
+  const [usedLink] = await getDb().select().from(oauthClientShareLinks).where(eq(oauthClientShareLinks.id, share.link.id));
+  assert.ok(usedLink?.consumedAt);
+  assert.ok(usedLink?.revokedAt);
+  const reinstallRes = await fetch(`${app.baseUrl}/api/integration-invites/${share.token}/install`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${installerToken}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ serverId: installerServer.id, ...await expectedAppPermissionsBody(client.id) }),
+  });
+  assert.equal(reinstallRes.status, 404);
+  assert.deepEqual(await reinstallRes.json(), invalidInvite);
+  const usedInviteRes = await fetch(`${app.baseUrl}/api/integration-invites/${share.token}`, {
+    headers: { Authorization: `Bearer ${installerToken}` },
+  });
+  assert.equal(usedInviteRes.status, 404);
+  const linksAfterUseRes = await fetch(`${app.baseUrl}/api/integrations/clients/${client.id}/share-links`, {
+    headers: { Authorization: `Bearer ${publisherToken}`, "X-Server-Id": publisherServer.id },
+  });
+  assert.deepEqual(await linksAfterUseRes.json(), { links: [] });
 
   const installedRows = await getDb()
     .select({ serverId: oauthClientInstalls.serverId })
@@ -2427,7 +2494,23 @@ test("private shared app invites install canonical third-party clients without m
   });
   assert.equal(humanAuthorizeAfterInstall.status, 200);
 
-  const revokeShareRes = await fetch(`${app.baseUrl}/api/integrations/clients/${client.id}/share-link`, {
+  // A revoked link is refused; revoking leaves the installation it made alone.
+  const outsiderShareRes = await fetch(`${app.baseUrl}/api/integrations/clients/${client.id}/share-links`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${publisherToken}`,
+      "X-Server-Id": publisherServer.id,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ targetServerSlug: outsiderServer.slug }),
+  });
+  assert.equal(outsiderShareRes.status, 200);
+  const outsiderShare = await outsiderShareRes.json() as { link: { id: string }; token: string };
+  const outsiderInviteRes = await fetch(`${app.baseUrl}/api/integration-invites/${outsiderShare.token}`, {
+    headers: { Authorization: `Bearer ${outsiderToken}` },
+  });
+  assert.equal(outsiderInviteRes.status, 200);
+  const revokeShareRes = await fetch(`${app.baseUrl}/api/integrations/clients/${client.id}/share-links/${outsiderShare.link.id}`, {
     method: "DELETE",
     headers: {
       Authorization: `Bearer ${publisherToken}`,
@@ -2436,10 +2519,11 @@ test("private shared app invites install canonical third-party clients without m
   });
   assert.equal(revokeShareRes.status, 200);
 
-  const inviteAfterRevokeRes = await fetch(`${app.baseUrl}/api/integration-invites/${share.token}`, {
+  const inviteAfterRevokeRes = await fetch(`${app.baseUrl}/api/integration-invites/${outsiderShare.token}`, {
     headers: { Authorization: `Bearer ${outsiderToken}` },
   });
   assert.equal(inviteAfterRevokeRes.status, 404);
+  assert.deepEqual(await inviteAfterRevokeRes.json(), invalidInvite);
 
   const agentRequestAfterRevoke = await fetch(`${app.baseUrl}/api/oauth/requests/agent`, {
     method: "POST",
@@ -2529,14 +2613,16 @@ test("private shared app invites install canonical third-party clients without m
     "app.deleted",
     "private_share.installed",
     "private_share.link_created",
+    "private_share.link_created",
     "private_share.link_revoked",
     "private_share.uninstalled",
   ]);
-  const linkCreatedAudit = auditRows.find((row) => row.eventType === "private_share.link_created");
+  const linkCreatedAudit = auditRows.find((row) => row.eventType === "private_share.link_created" && row.metadata.shareLinkId === share.link.id);
   assert.equal(linkCreatedAudit?.serverId, publisherServer.id);
   assert.equal(linkCreatedAudit?.actorId, publisher.id);
   assert.equal(linkCreatedAudit?.metadata.clientKey, client.clientId);
-  assert.equal(linkCreatedAudit?.metadata.shareLinkId, share.link.id);
+  assert.equal(linkCreatedAudit?.metadata.targetServerSlug, installerServer.slug);
+  assert.equal("targetServerId" in (linkCreatedAudit?.metadata ?? {}), false, "the source Server's audit never says whether the slug resolved");
   assert.equal("token" in (linkCreatedAudit?.metadata ?? {}), false);
   assert.equal("tokenHash" in (linkCreatedAudit?.metadata ?? {}), false);
 
@@ -2577,14 +2663,14 @@ test("private shared app publish request is idempotent after share converts it t
 
   const publisherToken = await tokenForHuman(publisher.email);
 
-  const shareRes = await fetch(`${app.baseUrl}/api/integrations/clients/${client.id}/share-link`, {
+  const shareRes = await fetch(`${app.baseUrl}/api/integrations/clients/${client.id}/share-links`, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${publisherToken}`,
       "X-Server-Id": publisherServer.id,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({ expiresInDays: 14 }),
+    body: JSON.stringify({ expiresInDays: 14, targetServerSlug: `share-publish-elsewhere-${suffix.slice(0, 8)}` }),
   });
   assert.equal(shareRes.status, 200);
   const share = await shareRes.json() as {
@@ -2650,7 +2736,6 @@ test("private shared app publish request is idempotent after share converts it t
 
 test("publish review and private sharing remain compatible in either order", async ({ app }) => {
 
-  const previousReviewers = process.env.SLOCK_MARKETPLACE_REVIEWER_USER_IDS;
   try {
     const suffix = randomUUID();
     const publisher = await seedUser(`integrations-review-share-publisher-${suffix}@slock.test`, `Review Share Publisher ${suffix}`);
@@ -2659,7 +2744,6 @@ test("publish review and private sharing remain compatible in either order", asy
     const publisherServer = await createServer("Review Then Share Publisher", `review-share-publisher-${suffix}`, publisher.id);
     const installerServer = await createServer("Review Then Share Installer", `review-share-installer-${suffix}`, installer.id);
     await addMember(publisherServer.id, reviewer.id, "admin");
-    process.env.SLOCK_MARKETPLACE_REVIEWER_USER_IDS = reviewer.id;
 
     const localOnly = await createOAuthClient({
       serverId: publisherServer.id,
@@ -2686,7 +2770,6 @@ test("publish review and private sharing remain compatible in either order", asy
 
     const publisherToken = await tokenForHuman(publisher.email);
     const installerToken = await tokenForHuman(installer.email);
-    const reviewerToken = await tokenForHuman(reviewer.email);
 
     for (const clientId of [localOnly.client.id, reviewThenShare.client.id]) {
       const requestRes = await fetch(`${app.baseUrl}/api/integrations/clients/${clientId}/request-publish`, {
@@ -2701,28 +2784,20 @@ test("publish review and private sharing remain compatible in either order", asy
       assert.equal(requestRes.status, 200);
     }
 
-    const localRejectRes = await fetch(`${app.baseUrl}/api/integrations/clients/${localOnly.client.id}/review-publish`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${reviewerToken}`,
-        "X-Server-Id": publisherServer.id,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ status: "rejected", rejectionReason: "Remain local" }),
+    const { client: localRejected } = await decidePublishReview({
+      clientId: localOnly.client.id, reviewerUserId: reviewer.id, decision: "reject", reason: "Remain local",
     });
-    assert.equal(localRejectRes.status, 200);
-    const localRejected = await localRejectRes.json() as { appType: string; publishStatus: string };
     assert.equal(localRejected.appType, "server_local");
     assert.equal(localRejected.publishStatus, "rejected");
 
-    const shareRes = await fetch(`${app.baseUrl}/api/integrations/clients/${reviewThenShare.client.id}/share-link`, {
+    const shareRes = await fetch(`${app.baseUrl}/api/integrations/clients/${reviewThenShare.client.id}/share-links`, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${publisherToken}`,
         "X-Server-Id": publisherServer.id,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({ expiresInDays: 14 }),
+      body: JSON.stringify({ expiresInDays: 14, targetServerSlug: installerServer.slug }),
     });
     assert.equal(shareRes.status, 200);
     const share = await shareRes.json() as {
@@ -2744,7 +2819,7 @@ test("publish review and private sharing remain compatible in either order", asy
         Authorization: `Bearer ${installerToken}`,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({ serverId: installerServer.id }),
+      body: JSON.stringify({ serverId: installerServer.id, ...await expectedAppPermissionsBody(reviewThenShare.client.id) }),
     });
     assert.equal(installRes.status, 200);
 
@@ -2760,18 +2835,12 @@ test("publish review and private sharing remain compatible in either order", asy
       .where(eq(oauthClientInstalls.clientId, reviewThenShare.client.id));
     assert.deepEqual(installedRows.map((row) => row.serverId).sort(), [publisherServer.id, installerServer.id].sort());
   } finally {
-    if (previousReviewers === undefined) {
-      delete process.env.SLOCK_MARKETPLACE_REVIEWER_USER_IDS;
-    } else {
-      process.env.SLOCK_MARKETPLACE_REVIEWER_USER_IDS = previousReviewers;
-    }
     await app.close();
   }
 });
 
 test("private share installs survive marketplace review and keep invite installs available", async ({ app }) => {
 
-  const previousReviewers = process.env.SLOCK_MARKETPLACE_REVIEWER_USER_IDS;
   try {
     const suffix = randomUUID();
     const publisher = await seedUser(`integrations-share-review-publisher-${suffix}@slock.test`, `Share Review Publisher ${suffix}`);
@@ -2784,7 +2853,6 @@ test("private share installs survive marketplace review and keep invite installs
     const pendingServer = await createServer("Share Review Pending", `share-review-pending-${suffix}`, pendingOwner.id);
     const outsiderServer = await createServer("Share Review Outsider", `share-review-outsider-${suffix}`, outsider.id);
     await addMember(publisherServer.id, reviewer.id, "admin");
-    process.env.SLOCK_MARKETPLACE_REVIEWER_USER_IDS = reviewer.id;
     const installedAgent = await createAgent(installedServer.id, "ShareReviewBot", {
       runtime: "claude",
       model: "sonnet",
@@ -2805,19 +2873,23 @@ test("private share installs survive marketplace review and keep invite installs
     const installedToken = await tokenForHuman(installedOwner.email);
     const pendingToken = await tokenForHuman(pendingOwner.email);
     const outsiderToken = await tokenForHuman(outsider.email);
-    const reviewerToken = await tokenForHuman(reviewer.email);
 
-    const shareRes = await fetch(`${app.baseUrl}/api/integrations/clients/${client.id}/share-link`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${publisherToken}`,
-        "X-Server-Id": publisherServer.id,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ expiresInDays: 14 }),
-    });
-    assert.equal(shareRes.status, 200);
-    const share = await shareRes.json() as { token: string };
+    const createShare = async (targetServerSlug: string) => {
+      const res = await fetch(`${app.baseUrl}/api/integrations/clients/${client.id}/share-links`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${publisherToken}`,
+          "X-Server-Id": publisherServer.id,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ expiresInDays: 14, targetServerSlug }),
+      });
+      assert.equal(res.status, 200);
+      return await res.json() as { token: string };
+    };
+    // One link per target Server; both stay active side by side.
+    const share = await createShare(installedServer.slug);
+    const pendingShare = await createShare(pendingServer.slug);
 
     const installRes = await fetch(`${app.baseUrl}/api/integration-invites/${share.token}/install`, {
       method: "POST",
@@ -2825,7 +2897,7 @@ test("private share installs survive marketplace review and keep invite installs
         Authorization: `Bearer ${installedToken}`,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({ serverId: installedServer.id }),
+      body: JSON.stringify({ serverId: installedServer.id, ...await expectedAppPermissionsBody(client.id) }),
     });
     assert.equal(installRes.status, 200);
 
@@ -2868,7 +2940,7 @@ test("private share installs survive marketplace review and keep invite installs
     });
     assert.equal(renameRes.status, 200);
 
-    const requestedInviteRes = await fetch(`${app.baseUrl}/api/integration-invites/${share.token}`, {
+    const requestedInviteRes = await fetch(`${app.baseUrl}/api/integration-invites/${pendingShare.token}`, {
       headers: { Authorization: `Bearer ${pendingToken}` },
     });
     assert.equal(requestedInviteRes.status, 200);
@@ -2877,13 +2949,13 @@ test("private share installs survive marketplace review and keep invite installs
     assert.equal(requestedInvite.client.name, "Private Shared Review App Renamed");
     assert.equal(requestedInvite.client.publishStatus, "publish_requested");
 
-    const installWhileRequestedRes = await fetch(`${app.baseUrl}/api/integration-invites/${share.token}/install`, {
+    const installWhileRequestedRes = await fetch(`${app.baseUrl}/api/integration-invites/${pendingShare.token}/install`, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${pendingToken}`,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({ serverId: pendingServer.id }),
+      body: JSON.stringify({ serverId: pendingServer.id, ...await expectedAppPermissionsBody(client.id) }),
     });
     assert.equal(installWhileRequestedRes.status, 200);
 
@@ -2936,29 +3008,21 @@ test("private share installs survive marketplace review and keep invite installs
     assert.equal(beforeReject.installs.length, 3);
     assert.ok(beforeReject.grants.length > 0);
 
-    const rejectRes = await fetch(`${app.baseUrl}/api/integrations/clients/${client.id}/review-publish`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${reviewerToken}`,
-        "X-Server-Id": publisherServer.id,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ status: "rejected", rejectionReason: "Not ready for public discovery" }),
+    const { client: rejected } = await decidePublishReview({
+      clientId: client.id, reviewerUserId: reviewer.id, decision: "reject", reason: "Not ready for public discovery",
     });
-    assert.equal(rejectRes.status, 200);
-    const rejected = await rejectRes.json() as { appType: string; publishStatus: string; humanMarketplaceVisible: boolean };
     assert.equal(rejected.appType, "third_party_global");
     assert.equal(rejected.publishStatus, "rejected");
     assert.equal(rejected.humanMarketplaceVisible, false);
 
-    const replacementShareRes = await fetch(`${app.baseUrl}/api/integrations/clients/${client.id}/share-link`, {
+    const replacementShareRes = await fetch(`${app.baseUrl}/api/integrations/clients/${client.id}/share-links`, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${publisherToken}`,
         "X-Server-Id": publisherServer.id,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({ expiresInDays: 14 }),
+      body: JSON.stringify({ expiresInDays: 14, targetServerSlug: outsiderServer.slug }),
     });
     assert.equal(replacementShareRes.status, 200);
     const replacementShare = await replacementShareRes.json() as { token: string };
@@ -2995,11 +3059,6 @@ test("private share installs survive marketplace review and keep invite installs
     const outsiderMarketplaceAfterReject = await outsiderMarketplaceAfterRejectRes.json() as Array<{ id: string }>;
     assert.equal(outsiderMarketplaceAfterReject.some((entry) => entry.id === client.id), false);
   } finally {
-    if (previousReviewers === undefined) {
-      delete process.env.SLOCK_MARKETPLACE_REVIEWER_USER_IDS;
-    } else {
-      process.env.SLOCK_MARKETPLACE_REVIEWER_USER_IDS = previousReviewers;
-    }
     await app.close();
   }
 });
@@ -3203,8 +3262,11 @@ test("server-local permission save atomically installs its source and grants ins
   const headers = (token: string, serverId = server.id) => ({
     Authorization: `Bearer ${token}`, "X-Server-Id": serverId, "Content-Type": "application/json",
   });
-  const localAgent = await createAgent(server.id, "LocalAppVisible", { runtime: "codex" });
+  const localAgent = await createAgent(server.id, "LocalAppVisible", { runtime: "external", model: "sonnet" });
   const foreignAgent = await createAgent(foreign.id, "LocalAppHidden", { runtime: "codex" });
+  // Another person's personal assistant: only its owner finds it, never an App.
+  const assistant = await createAgent(server.id, "LocalAppAssistant", { runtime: "codex", creatorType: "user", creatorId: member.id, kind: "personal_assistant" });
+  await getDb().update(agents).set({ assistantOwnerUserId: member.id }).where(eq(agents.id, assistant.id));
   const permissionUrl = `${app.baseUrl}/api/integrations/clients/${client.id}/app-notifications/permissions`;
   const save = (token: string, serverId = server.id, groups = ["agent"], events = groups.includes("agent") ? ["agent.status_changed"] : []) => fetch(permissionUrl, {
     method: "PUT", headers: headers(token, serverId),
@@ -3241,12 +3303,38 @@ test("server-local permission save atomically installs its source and grants ins
   assert.equal(credential.installation_id, installation.id);
   assert.equal(credential.server_id, server.id);
   const read = () => fetch(`${app.baseUrl}/api/app-installation/agents`, { headers: { Authorization: `Bearer ${credential.access_token}` } });
+  const { client: botClient } = await createOAuthClient({
+    serverId: server.id, createdByUserId: owner.id, name: "Directory Bot App",
+    clientId: `directory-bot-${suffix}`, enableBot: true,
+  });
+  const [botInstall] = await getDb().insert(oauthClientInstalls).values({
+    serverId: server.id, clientId: botClient.id, installedByUserId: owner.id, status: "active", botGrant: "pending",
+  }).returning();
+  const setBot = (action: "grant" | "revoke") => fetch(`${app.baseUrl}/api/integrations/clients/${botClient.id}/install/bot`, {
+    method: "POST", headers: headers(ownerToken), body: JSON.stringify({ action }),
+  });
+  const grant = await setBot("grant");
+  assert.equal(grant.status, 200, await grant.clone().text());
+  const bot = (await grant.json() as { bot: { agentId: string } }).bot;
   const agentRead = await read();
   assert.equal(agentRead.status, 200);
-  const projected = await agentRead.json() as { agents: Array<{ id: string; avatar_url: string | null }> };
+  const projected = await agentRead.json() as { agents: Array<{ id: string; avatar_url: string | null; runtime: string; model: string; is_app_bot: boolean }> };
   assert.ok(projected.agents.some((agent) => agent.id === localAgent.id));
   assert.equal(projected.agents.some((agent) => agent.id === foreignAgent.id), false);
+  assert.equal(projected.agents.some((agent) => agent.id === assistant.id), false, "a personal assistant is not in an App's agent list");
   const localProjection = projected.agents.find((agent) => agent.id === localAgent.id)!;
+  const botProjection = projected.agents.find((agent) => agent.id === bot.agentId)!;
+  assert.deepEqual([localProjection.runtime, localProjection.model], [botProjection.runtime, botProjection.model], "the same runtime and model do not identify a Bot");
+  assert.equal(localProjection.is_app_bot, false, "ordinary external Agent is not an App Bot");
+  assert.equal(botProjection.is_app_bot, true, "an active managed Bot is marked");
+  assert.equal(JSON.stringify(botProjection).includes(botInstall!.id), false, "do not disclose the managing installation");
+  assert.equal("managed_by_app_install_id" in botProjection, false);
+  assert.equal((await setBot("revoke")).status, 200);
+  const disabled = await (await read()).json() as typeof projected;
+  assert.equal(disabled.agents.some((agent) => agent.id === bot.agentId), false, "disabled Bots remain hidden");
+  assert.equal((await setBot("grant")).status, 200);
+  const reenabled = await (await read()).json() as typeof projected;
+  assert.equal(reenabled.agents.find((agent) => agent.id === bot.agentId)?.is_app_bot, true);
   assert.match(localProjection.avatar_url!, /^https?:\/\//);
   const storedAvatar = await getDb().select({ avatarUrl: agents.avatarUrl }).from(agents).where(eq(agents.id, localAgent.id));
   assert.equal(storedAvatar[0].avatarUrl, "pixel:random:installation-picture", "normalization is a response projection, not a storage rewrite");
@@ -3417,7 +3505,7 @@ test("POST /api/integrations/clients/:clientId/install/bot creates and manages a
   const server = await createServer("App Bot Server", `app-bot-${suffix.slice(0, 8)}`, owner.id);
   await addMember(server.id, member.id, "member");
 
-  const { client } = await createOAuthClient({
+  const { client, clientSecret } = await createOAuthClient({
     serverId: server.id,
     createdByUserId: owner.id,
     clientId: `bot-app-${suffix.slice(0, 8)}`,
@@ -3474,6 +3562,164 @@ test("POST /api/integrations/clients/:clientId/install/bot creates and manages a
   const usage = await getServerBillingUsage(getDb(), server.id);
   assert.equal(usage.agents, 0, "managed bot excluded from seat count");
 
+  // List endpoint resolves the owning app (yezizp's "Unknown app" bug: the
+  // panel renders from list data, and only the detail route had the join).
+  const listRes = await fetch(`${app.baseUrl}/api/agents`, {
+    headers: { Authorization: `Bearer ${ownerToken}`, "X-Server-Id": server.id },
+  });
+  assert.equal(listRes.status, 200);
+  const listBody = await listRes.json() as Array<{ id: string; managedByApp?: { name: string; logoUrl: string | null } | null }>;
+  const listedBot = listBody.find((a) => a.id === grantBody.bot.agentId);
+  assert.ok(listedBot, "bot appears in the agent list");
+  assert.equal(listedBot.managedByApp?.name, "Bot App", "list endpoint resolves managedByApp");
+
+  // Avatar fences: neither an admin nor the bot itself may override the app
+  // logo the identity follows (Cardy's write-path finding).
+  const tinyPng = Buffer.from("89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000d4944415478da63fcffff3f030005fe02fea72d994d0000000049454e44ae426082", "hex");
+  const adminAvatarRes = await fetch(`${app.baseUrl}/api/agents/${grantBody.bot.agentId}/avatar`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${ownerToken}`, "X-Server-Id": server.id, "Content-Type": "image/png" },
+    body: tinyPng,
+  });
+  assert.equal(adminAvatarRes.status, 403, "admin avatar upload must be fenced for managed bots");
+  const adminAvatarBody = await adminAvatarRes.json() as { code?: string };
+  assert.equal(adminAvatarBody.code, "app_bot_avatar_managed", "403 must come from the bot fence, not the capability check");
+
+  // The JSON PATCH path is fenced too (Cardy: it returned 200 and wrote).
+  const patchRes = await fetch(`${app.baseUrl}/api/agents/${grantBody.bot.agentId}`, {
+    method: "PATCH",
+    headers: { Authorization: `Bearer ${ownerToken}`, "X-Server-Id": server.id, "Content-Type": "application/json" },
+    body: JSON.stringify({ avatarUrl: "https://cdn.example/override.png" }),
+  });
+  assert.equal(patchRes.status, 403, "JSON PATCH avatarUrl must be fenced for managed bots");
+  const patchBody = await patchRes.json() as { code?: string };
+  assert.equal(patchBody.code, "app_bot_avatar_managed");
+  const [unchanged] = await getDb().select({ avatarUrl: agents.avatarUrl }).from(agents).where(eq(agents.id, grantBody.bot.agentId));
+  assert.equal(unchanged?.avatarUrl ?? null, null, "no avatar row write slipped through");
+
+  // P4b: the app publishes the bot's status with client credentials; the
+  // detail read carries it, and the bot's name/description follow the app's
+  // live values (not the grant-time snapshot).
+  const statusRes = await fetch(`${app.baseUrl}/api/oauth/installations/${install.id}/bot-status`, {
+    method: "PUT",
+    headers: { Authorization: clientBasicAuth(client.clientId, clientSecret), "Content-Type": "application/json" },
+    body: JSON.stringify({ text: "Indexing 2,341 packages" }),
+  });
+  assert.equal(statusRes.status, 200, "bot-status accepts the app's client credentials");
+  const detailRes = await fetch(`${app.baseUrl}/api/agents/${grantBody.bot.agentId}`, {
+    headers: { Authorization: `Bearer ${ownerToken}`, "X-Server-Id": server.id },
+  });
+  const detailBody = await detailRes.json() as { managedByApp?: { botStatusText?: string | null } };
+  assert.equal(detailBody.managedByApp?.botStatusText, "Indexing 2,341 packages", "detail carries the app-published status");
+
+  // App rename propagates: update the client's name, the managedByApp join
+  // must reflect the new value without a re-grant.
+  await getDb().update(oauthClients).set({ name: "Bot App Renamed", description: "Now tracks PyPI too" }).where(eq(oauthClients.id, client.id));
+  const detail2Res = await fetch(`${app.baseUrl}/api/agents/${grantBody.bot.agentId}`, {
+    headers: { Authorization: `Bearer ${ownerToken}`, "X-Server-Id": server.id },
+  });
+  const detail2Body = await detail2Res.json() as { managedByApp?: { name?: string; description?: string | null } };
+  assert.equal(detail2Body.managedByApp?.name, "Bot App Renamed", "bot identity follows the app's live name");
+  assert.equal(detail2Body.managedByApp?.description, "Now tracks PyPI too", "bot identity follows the app's live description");
+
+  // Clearing the status publishes silence, not a stale line.
+  const clearRes = await fetch(`${app.baseUrl}/api/oauth/installations/${install.id}/bot-status`, {
+    method: "PUT",
+    headers: { Authorization: clientBasicAuth(client.clientId, clientSecret), "Content-Type": "application/json" },
+    body: JSON.stringify({ text: null }),
+  });
+  assert.equal(clearRes.status, 200);
+  const detail3Res = await fetch(`${app.baseUrl}/api/agents/${grantBody.bot.agentId}`, {
+    headers: { Authorization: `Bearer ${ownerToken}`, "X-Server-Id": server.id },
+  });
+  const detail3Body = await detail3Res.json() as { managedByApp?: { botStatusText?: string | null } };
+  assert.equal(detail3Body.managedByApp?.botStatusText ?? null, null, "cleared status stays cleared");
+
+  // A revoked grant must refuse the write atomically — the grant is a
+  // condition of the UPDATE, so a revoke that lands mid-request still wins.
+  await getDb().update(oauthClientInstalls).set({ botGrant: "revoked" }).where(eq(oauthClientInstalls.id, install.id));
+  const revokedRes = await fetch(`${app.baseUrl}/api/oauth/installations/${install.id}/bot-status`, {
+    method: "PUT",
+    headers: { Authorization: clientBasicAuth(client.clientId, clientSecret), "Content-Type": "application/json" },
+    body: JSON.stringify({ text: "should not land" }),
+  });
+  assert.equal(revokedRes.status, 403, "revoked grant must refuse bot-status");
+  const [revokedRow] = await getDb().select({ botStatusText: oauthClientInstalls.botStatusText }).from(oauthClientInstalls).where(eq(oauthClientInstalls.id, install.id));
+  assert.equal(revokedRow?.botStatusText ?? null, null, "revoked write must leave no status behind");
+  // A disabled binding cannot publish either — the grant is restored first
+  // so this isolates the binding-state gate from the revoked-grant refusal.
+  await getDb().update(oauthClientInstalls).set({ botGrant: "granted" }).where(eq(oauthClientInstalls.id, install.id));
+  await getDb().update(appBotBindings).set({ state: "disabled", disabledAt: new Date() }).where(eq(appBotBindings.installId, install.id));
+  const disabledRes = await fetch(`${app.baseUrl}/api/oauth/installations/${install.id}/bot-status`, {
+    method: "PUT", headers: { Authorization: clientBasicAuth(client.clientId, clientSecret), "Content-Type": "application/json" }, body: JSON.stringify({ text: "DISABLED WRITE" })
+  });
+  const [disabledRow] = await getDb().select({ text: oauthClientInstalls.botStatusText }).from(oauthClientInstalls).where(eq(oauthClientInstalls.id, install.id));
+  assert.ok(disabledRes.status === 403 && disabledRow.text === null, `disabled binding status=${disabledRes.status} persisted=${disabledRow.text}`);
+  await getDb().update(appBotBindings).set({ state: "active", disabledAt: null }).where(eq(appBotBindings.installId, install.id));
+  await getDb().update(oauthClientInstalls).set({ botGrant: "granted" }).where(eq(oauthClientInstalls.id, install.id));
+
+  // Deterministic interleaving (Cardy's probe): pause the status UPDATE after
+  // its reads, complete a real revoke over HTTP, then release — the write
+  // must not land on the revoked install.
+  const database = getDb(); const originalUpdate = database.update.bind(database);
+  let reached!: () => void; let release!: () => void;
+  const atWrite = new Promise<void>(r => { reached = r; });
+  const resume = new Promise<void>(r => { release = r; });
+  const spy = vi.spyOn(database, 'update').mockImplementation((...args) => {
+    const builder = originalUpdate(...args as Parameters<typeof originalUpdate>);
+    if (args[0] !== oauthClientInstalls) return builder;
+    return new Proxy(builder, { get(target, key, receiver) {
+      if (key !== 'set') return Reflect.get(target, key, receiver);
+      return (values: Record<string, unknown>) => {
+        const query = target.set(values as never);
+        if (values.botStatusText !== 'LATE AFTER REVOKE') return query;
+        return new Proxy(query, { get(q, field, rec) {
+          if (field !== 'where') return Reflect.get(q, field, rec);
+          return (...conditions: Parameters<typeof q.where>) => {
+            const built = q.where(...conditions);
+            return new Proxy(built, { get(b, prop, rec2) {
+              if (prop !== 'returning') return Reflect.get(b, prop, rec2);
+              return (...cols: Parameters<typeof b.returning>) => { reached(); return resume.then(() => b.returning(...cols)); };
+            }});
+          };
+        }});
+      };
+    }});
+  });
+  const late = fetch(`${app.baseUrl}/api/oauth/installations/${install.id}/bot-status`, {
+    method: 'PUT', headers: { Authorization: clientBasicAuth(client.clientId, clientSecret), 'Content-Type': 'application/json' }, body: JSON.stringify({ text: 'LATE AFTER REVOKE' })
+  });
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([atWrite, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('status write hook not reached')), 5000); })]);
+    if (timer) clearTimeout(timer);
+    const revoked = await call(ownerToken, { action: 'revoke' }); assert.equal(revoked.status, 200);
+    release(); const lateRes = await late;
+    const [after] = await database.select({ grant: oauthClientInstalls.botGrant, text: oauthClientInstalls.botStatusText }).from(oauthClientInstalls).where(eq(oauthClientInstalls.id, install.id));
+    assert.equal(lateRes.status, 403, `late write must refuse 403, got ${lateRes.status}`);
+    assert.ok(after.text !== 'LATE AFTER REVOKE', `stored=${after.text}`);
+  } finally { if (timer) clearTimeout(timer); release(); spy.mockRestore(); await late.catch(() => {}); }
+  await getDb().update(oauthClientInstalls).set({ botGrant: "granted" }).where(eq(oauthClientInstalls.id, install.id));
+
+  // App edits must notify open bot profiles (Cardy's probe): PATCH the client
+  // and an agent:updated must reach the room, so open panels re-read.
+  const events: string[] = []; const to = app.io.to.bind(app.io);
+  const notifySpy = vi.spyOn(app.io, 'to').mockImplementation((...args) => {
+    const room = to(...args as Parameters<typeof to>);
+    return new Proxy(room, { get(target, key, receiver) {
+      if (key !== 'emit') return Reflect.get(target, key, receiver);
+      return (event: string, ...payload: unknown[]) => { events.push(event); return Reflect.apply(target.emit, target, [event, ...payload]); };
+    }});
+  });
+  try {
+    const edit = await fetch(`${app.baseUrl}/api/integrations/clients/${client.id}`, { method: 'PATCH', headers: { Authorization: `Bearer ${ownerToken}`, 'X-Server-Id': server.id, 'Content-Type': 'application/json' }, body: JSON.stringify({ name: 'New open-window name', description: null }) });
+    assert.equal(edit.status, 200);
+    const fresh = await fetch(`${app.baseUrl}/api/agents/${grantBody.bot.agentId}`, { headers: { Authorization: `Bearer ${ownerToken}`, 'X-Server-Id': server.id } });
+    const data = await fresh.json() as { managedByApp: { name: string } };
+    assert.equal(data.managedByApp.name, 'New open-window name');
+    assert.ok(events.includes('agent:updated'), `App edit succeeded and a fresh GET is current, but emitted events=${JSON.stringify(events)}`);
+  } finally { notifySpy.mockRestore(); }
+
   // Revoke → disabled
   const revokeRes = await call(ownerToken, { action: "revoke" });
   assert.equal(revokeRes.status, 200);
@@ -3482,16 +3728,434 @@ test("POST /api/integrations/clients/:clientId/install/bot creates and manages a
   assert.ok(disabled?.disabledAt);
 });
 
-test("POST /api/app-bot/token exchanges OAuth access token for bot sk_agent_* + revocation 401", async ({ app }) => {
+// The Bot key is bought with the App's own client
+// credentials on its own installation, never with a delegated access token;
+// rotation is explicit and every outcome is audited.
+test("POST /api/oauth/installations/:installationId/bot-token issues the Bot key to its own App only, rotates explicitly, audits", async ({ app }) => {
   const suffix = randomUUID();
+  const short = suffix.slice(0, 8);
   const owner = await seedUser(`bot-token-owner-${suffix}@slock.test`, `bot-token-owner-${suffix}`);
-  const server = await createServer("App Bot Token Server", `app-bot-token-${suffix.slice(0, 8)}`, owner.id);
+  const server = await createServer("App Bot Token Server", `app-bot-token-${short}`, owner.id);
+  const { client, clientSecret } = await createOAuthClient({
+    serverId: server.id,
+    createdByUserId: owner.id,
+    clientId: `bot-app-${short}`,
+    name: "Bot App",
+    enableBot: true,
+  });
+  const { client: other, clientSecret: otherSecret } = await createOAuthClient({
+    serverId: server.id,
+    createdByUserId: owner.id,
+    clientId: `other-app-${short}`,
+    name: "Other App",
+  });
+  const [install] = await getDb().insert(oauthClientInstalls).values({
+    serverId: server.id,
+    clientId: client.id,
+    installedByUserId: owner.id,
+    status: "active",
+    botGrant: "pending",
+  }).returning();
+  const ownerToken = await tokenForHuman(owner.email);
+  const setBotGrant = (action: "grant" | "revoke") => fetch(`${app.baseUrl}/api/integrations/clients/${client.id}/install/bot`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${ownerToken}`, "X-Server-Id": server.id, "Content-Type": "application/json" },
+    body: JSON.stringify({ action }),
+  });
+  const basic = (key: string, secret: string) => `Basic ${Buffer.from(`${key}:${secret}`).toString("base64")}`;
+  const appAuth = basic(client.clientId, clientSecret);
+  const exchange = (authorization: string, body: Record<string, unknown> = {}, installationId: string = install.id) =>
+    fetch(`${app.baseUrl}/api/oauth/installations/${installationId}/bot-token`, {
+      method: "POST",
+      headers: { Authorization: authorization, "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  const whoami = (apiKey: string) => fetch(`${app.baseUrl}/internal/agent-api/`, {
+    headers: { Authorization: `Bearer ${apiKey}` },
+  });
+
+  const grantRes = await setBotGrant("grant");
+  assert.equal(grantRes.status, 200, await grantRes.clone().text());
+  const { bot } = await grantRes.json() as { bot: { agentId: string } };
+
+  // A live delegated access token for this App on this Server is not enough:
+  // that was the hole, on the new route and on the retired one.
+  const rawToken = `oauth-token-${suffix}`;
+  await getDb().insert(oauthAccessTokens).values({
+    serverId: server.id,
+    principalType: "human",
+    userId: owner.id,
+    clientId: client.id,
+    tokenHash: createHash("sha256").update(rawToken).digest("hex"),
+    scopes: ["openid", "profile"],
+    expiresAt: new Date(Date.now() + 3_600_000),
+  });
+  assert.equal((await exchange(`Bearer ${rawToken}`)).status, 401);
+  const retired = await fetch(`${app.baseUrl}/api/app-bot/token`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${rawToken}` },
+  });
+  assert.equal(retired.status, 404);
+  assert.equal((await exchange(basic(client.clientId, "wrong-secret"))).status, 401);
+  // Another App's valid credentials cannot reach this installation.
+  const crossApp = await exchange(basic(other.clientId, otherSecret));
+  assert.equal(crossApp.status, 404);
+  assert.equal((await crossApp.json() as { code: string }).code, "installation_not_found");
+
+  // 1. First issue.
+  const firstRes = await exchange(appAuth);
+  assert.equal(firstRes.status, 200, await firstRes.clone().text());
+  const first = await firstRes.json() as { apiKey: string; agentId: string; scopes: string[]; rotated: boolean };
+  assert.ok(first.apiKey.startsWith("sk_agent_"));
+  assert.equal(first.agentId, bot.agentId);
+  assert.equal(first.rotated, false);
+  assert.deepEqual([...first.scopes].sort(), ["channels", "mentions", "read", "send"]);
+  assert.equal((await whoami(first.apiKey)).status, 200);
+
+  // 2. A second call without rotate is refused and does not log the first key out.
+  const again = await exchange(appAuth);
+  assert.equal(again.status, 409);
+  assert.equal((await again.json() as { code: string }).code, "credential_exists");
+  assert.equal((await whoami(first.apiKey)).status, 200);
+
+  // 3. Explicit rotation replaces the key.
+  const rotatedRes = await exchange(appAuth, { rotate: true });
+  assert.equal(rotatedRes.status, 200);
+  const rotated = await rotatedRes.json() as { apiKey: string; rotated: boolean };
+  assert.equal(rotated.rotated, true);
+  assert.equal((await whoami(first.apiKey)).status, 401);
+  assert.equal((await whoami(rotated.apiKey)).status, 200);
+  // Both keys record the App origin and no person.
+  const botCredentials = await getDb().select().from(agentCredentials).where(eq(agentCredentials.agentId, bot.agentId));
+  assert.equal(botCredentials.length, 2);
+  for (const row of botCredentials) {
+    assert.equal(row.issuedVia, "app");
+    assert.equal(row.createdByUserId, null);
+    assert.equal(row.issuedByMachineId, null);
+    assert.equal(row.name, `app-bot:${client.id}`);
+  }
+
+  // 4. Revoking the bot grant kills the key and refuses new ones.
+  assert.equal((await setBotGrant("revoke")).status, 200);
+  assert.equal((await whoami(rotated.apiKey)).status, 401);
+  const refused = await exchange(appAuth, { rotate: true });
+  assert.equal(refused.status, 403);
+  assert.equal((await refused.json() as { code: string }).code, "bot_not_granted");
+
+  const auditRows = await getDb().select({
+    clientId: integrationAuditEvents.clientId,
+    eventType: integrationAuditEvents.eventType,
+    outcome: integrationAuditEvents.outcome,
+    metadata: integrationAuditEvents.metadata,
+  }).from(integrationAuditEvents)
+    .where(inArray(integrationAuditEvents.eventType, ["app_bot.credential", "installation.bot_grant_updated"]))
+    .orderBy(integrationAuditEvents.createdAt);
+  const summary = auditRows.map((row) => {
+    const metadata = row.metadata as Record<string, unknown>;
+    return `${row.clientId === client.id ? "app" : "other"}:${row.eventType}:${metadata.result ?? metadata.botGrant}:${row.outcome}`;
+  });
+  assert.deepEqual(summary, [
+    "app:installation.bot_grant_updated:granted:success",
+    "other:app_bot.credential:installation_not_found:failure",
+    "app:app_bot.credential:issued:success",
+    "app:app_bot.credential:credential_exists:failure",
+    "app:app_bot.credential:rotated:success",
+    "app:installation.bot_grant_updated:revoked:success",
+    "app:app_bot.credential:bot_not_granted:failure",
+  ]);
+  const rotatedAudit = auditRows.find((row) => (row.metadata as Record<string, unknown>).result === "rotated")!;
+  assert.equal((rotatedAudit.metadata as Record<string, unknown>).revokedCount, 1);
+});
+
+test("POST /api/integrations/clients/:clientId/install/bot lazily creates the source installation for a server-local app", async ({ app }) => {
+  const suffix = randomUUID();
+  const owner = await seedUser(`bot-lazy-owner-${suffix}@slock.test`, `bot-lazy-owner-${suffix}`);
+  const server = await createServer("App Bot Lazy Server", `app-bot-lazy-${suffix.slice(0, 8)}`, owner.id);
 
   const { client } = await createOAuthClient({
     serverId: server.id,
     createdByUserId: owner.id,
-    clientId: `bot-app-${suffix.slice(0, 8)}`,
-    name: "Bot App",
+    clientId: `bot-lazy-${suffix.slice(0, 8)}`,
+    name: "Lazy Bot App",
+    enableBot: true,
+  });
+
+  // No oauthClientInstalls row exists yet — a source-owned app has never been
+  // "installed" via marketplace. The grant route must materialize it.
+  const token = await tokenForHuman(owner.email);
+  const res = await fetch(`${app.baseUrl}/api/integrations/clients/${client.id}/install/bot`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "X-Server-Id": server.id,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ action: "grant" }),
+  });
+  assert.equal(res.status, 200);
+  const body = await res.json() as { installationId: string; botGrant: string; bot: { agentId: string } | null };
+  assert.equal(body.botGrant, "granted");
+  assert.ok(body.bot?.agentId);
+
+  const [install] = await getDb().select().from(oauthClientInstalls).where(eq(oauthClientInstalls.id, body.installationId));
+  assert.ok(install, "source installation row materialized on grant");
+  assert.equal(install.serverId, server.id);
+  assert.equal(install.clientId, client.id);
+  assert.equal(install.botGrant, "granted");
+
+  // GET /clients exposes botGrant + enableBot so the editor can render state.
+  const listRes = await fetch(`${app.baseUrl}/api/integrations/clients`, {
+    headers: { Authorization: `Bearer ${token}`, "X-Server-Id": server.id },
+  });
+  const listed = await listRes.json() as Array<{ id: string; enableBot: boolean; botGrant: string | null }>;
+  const row = listed.find((entry) => entry.id === client.id);
+  assert.ok(row);
+  assert.equal(row.enableBot, true);
+  assert.equal(row.botGrant, "granted");
+
+  // Real HTTP regression (Cardy): an unrelated PATCH must return the
+  // install-joined editor row, not the bare update result — the editor
+  // replaces its row with the response and would otherwise lose botGrant.
+  const patchRes = await fetch(`${app.baseUrl}/api/integrations/clients/${client.id}`, {
+    method: "PATCH",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "X-Server-Id": server.id,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ description: "unrelated edit" }),
+  });
+  assert.equal(patchRes.status, 200);
+  const patched = await patchRes.json() as { id: string; description: string | null; installationId: string | null; botGrant: string | null };
+  assert.equal(patched.id, client.id);
+  assert.equal(patched.installationId, body.installationId);
+  assert.equal(patched.botGrant, "granted", "PATCH response carries the install-joined grant state");
+});
+
+// Regression guard: an App bot's stored avatar IS its App's logo
+// (agentService.syncAppBotAvatarsToLogo). Every surface renders
+// agent.avatarUrl, so drift here is the bot showing the generated avatar in its
+// DM header while its profile panel shows the logo.
+test("an App bot's avatar equals its App logo after bot creation, logo change, logo removal and App deletion, on every server, and each bot's server is told", async ({ app }) => {
+  const suffix = randomUUID();
+  const short = suffix.slice(0, 8);
+  const owner = await seedUser(`bot-avatar-owner-${suffix}@slock.test`, `bot-avatar-owner-${suffix}`);
+  const otherOwner = await seedUser(`bot-avatar-other-${suffix}@slock.test`, `bot-avatar-other-${suffix}`);
+  const server = await createServer("App Bot Avatar Server", `app-bot-avatar-${short}`, owner.id);
+  const otherServer = await createServer("App Bot Avatar Other", `app-bot-avatar-o-${short}`, otherOwner.id);
+  const { client } = await createOAuthClient({
+    serverId: server.id,
+    createdByUserId: owner.id,
+    clientId: `bot-avatar-${short}`,
+    name: "Avatar Bot App",
+    enableBot: true,
+  });
+  const headers = { Authorization: `Bearer ${await tokenForHuman(owner.email)}`, "X-Server-Id": server.id };
+  const logoRoute = `${app.baseUrl}/api/integrations/clients/${client.id}/logo`;
+  const uploadLogo = async (background: string) => {
+    const image = await sharp({ create: { width: 8, height: 8, channels: 3, background } }).png().toBuffer();
+    const formData = new FormData();
+    formData.set("logo", new Blob([new Uint8Array(image)], { type: "image/png" }), "logo.png");
+    const res = await fetch(logoRoute, { method: "POST", headers, body: formData });
+    assert.equal(res.status, 200, await res.clone().text());
+  };
+  const assertBotsFollowLogo = async (agentIds: string[], step: string, expectLogo: boolean) => {
+    const [stored] = await getDb().select({ logoUrl: oauthClients.logoUrl }).from(oauthClients).where(eq(oauthClients.id, client.id));
+    assert.equal(Boolean(stored?.logoUrl), expectLogo, `${step}: app logo ${expectLogo ? "set" : "cleared"}`);
+    const rows = await getDb().select({ id: agents.id, avatarUrl: agents.avatarUrl }).from(agents).where(inArray(agents.id, agentIds));
+    assert.equal(rows.length, agentIds.length);
+    for (const row of rows) {
+      assert.equal(row.avatarUrl, stored?.logoUrl ?? null, `${step}: bot ${row.id} avatar must be the app logo`);
+    }
+    // The agent directory serializer (what the DM header and message rows read).
+    const listRes = await fetch(`${app.baseUrl}/api/agents`, { headers });
+    assert.equal(listRes.status, 200);
+    const listed = (await listRes.json() as Array<{ id: string; avatarUrl: string | null }>).find((agent) => agent.id === agentIds[0]);
+    assert.equal(listed?.avatarUrl, stored?.logoUrl ?? null, `${step}: GET /api/agents emits the logo as the bot avatar`);
+    return stored?.logoUrl ?? null;
+  };
+
+  // (a) Bot creation copies the current logo: through the grant route on the
+  // App's own server, and on another server that installed the App.
+  await uploadLogo("#d33f49");
+  const grantRes = await fetch(`${app.baseUrl}/api/integrations/clients/${client.id}/install/bot`, {
+    method: "POST",
+    headers: { ...headers, "Content-Type": "application/json" },
+    body: JSON.stringify({ action: "grant" }),
+  });
+  assert.equal(grantRes.status, 200, await grantRes.clone().text());
+  const { bot } = await grantRes.json() as { bot: { agentId: string } };
+  const [otherInstall] = await getDb().insert(oauthClientInstalls).values({
+    serverId: otherServer.id,
+    clientId: client.id,
+    installedByUserId: otherOwner.id,
+    status: "active",
+    botGrant: "granted",
+  }).returning();
+  const { createManagedAppBot } = await import("../services/appBotIdentityService");
+  const otherBot = await getDb().transaction((tx) =>
+    createManagedAppBot(tx, { installId: otherInstall!.id, serverId: otherServer.id }),
+  );
+  const botIds = [bot.agentId, otherBot.agentId];
+  const firstLogo = await assertBotsFollowLogo(botIds, "bot creation", true);
+
+  // From here every write must tell each moved bot's own server to re-read it,
+  // once (agent:updated after commit; the profile-write broadcast contract).
+  const pushes: string[] = [];
+  const to = app.io.to.bind(app.io);
+  const pushSpy = vi.spyOn(app.io, "to").mockImplementation((...args) => {
+    const room = to(...args as Parameters<typeof to>);
+    return new Proxy(room, { get(target, key, receiver) {
+      if (key !== "emit") return Reflect.get(target, key, receiver);
+      return (event: string, ...payload: unknown[]) => {
+        if (event === "agent:updated") pushes.push(`${String(args[0])} ${(payload[0] as { agentId?: string } | undefined)?.agentId}`);
+        return Reflect.apply(target.emit, target, [event, ...payload]);
+      };
+    }});
+  });
+  const assertEachBotTold = (step: string) => {
+    assert.deepEqual(
+      pushes.splice(0).sort(),
+      [`server:${server.id} ${bot.agentId}`, `server:${otherServer.id} ${otherBot.agentId}`].sort(),
+      `${step}: one agent:updated per bot, to the bot's own server`,
+    );
+  };
+  try {
+    // (b) A logo change moves every bound bot, on every server.
+    await uploadLogo("#2f6fdd");
+    const secondLogo = await assertBotsFollowLogo(botIds, "logo change", true);
+    assert.notEqual(secondLogo, firstLogo, "the second upload is a different logo");
+    assertEachBotTold("logo change");
+
+    // (c) Logo removal clears the bot avatar (the generated avatar everywhere).
+    const clearRes = await fetch(logoRoute, { method: "DELETE", headers });
+    assert.equal(clearRes.status, 200);
+    await assertBotsFollowLogo(botIds, "logo removal", false);
+    assertEachBotTold("logo removal");
+
+    // (d) App deletion deletes the logo object: the bots must not keep pointing at it.
+    await uploadLogo("#1a7f37");
+    await assertBotsFollowLogo(botIds, "logo before deletion", true);
+    assertEachBotTold("logo before deletion");
+    const deleteRes = await fetch(`${app.baseUrl}/api/integrations/clients/${client.id}`, { method: "DELETE", headers });
+    assert.equal(deleteRes.status, 200, await deleteRes.clone().text());
+    const [gone] = await getDb().select({ id: oauthClients.id }).from(oauthClients).where(eq(oauthClients.id, client.id));
+    assert.equal(gone, undefined, "the App is deleted");
+    const afterDelete = await getDb().select({ avatarUrl: agents.avatarUrl }).from(agents).where(inArray(agents.id, botIds));
+    assert.deepEqual(afterDelete.map((row) => row.avatarUrl), [null, null], "App deletion: the bots fall back to the generated avatar");
+    assertEachBotTold("App deletion");
+  } finally {
+    pushSpy.mockRestore();
+  }
+});
+
+// Regression guard: an App's old logo object is deleted only after the change
+// commits. If anything after the logo write fails in the same transaction, the
+// change rolls back and the App and its bots still point at the old logo, so
+// its object must still exist.
+test("a web logo upload, logo clear or App deletion that rolls back deletes no logo object; once committed it deletes the old one", async ({ app }) => {
+  const suffix = randomUUID();
+  const short = suffix.slice(0, 8);
+  const owner = await seedUser(`logo-commit-owner-${suffix}@slock.test`, `logo-commit-owner-${suffix}`);
+  const server = await createServer("App Logo Commit Server", `app-logo-commit-${short}`, owner.id);
+  const { client } = await createOAuthClient({
+    serverId: server.id,
+    createdByUserId: owner.id,
+    clientId: `logo-commit-${short}`,
+    name: "Logo Commit App",
+    enableBot: true,
+  });
+  const [install] = await getDb().insert(oauthClientInstalls).values({
+    serverId: server.id,
+    clientId: client.id,
+    installedByUserId: owner.id,
+    status: "active",
+    botGrant: "granted",
+  }).returning();
+  const { createManagedAppBot } = await import("../services/appBotIdentityService");
+  const bot = await getDb().transaction((tx) => createManagedAppBot(tx, { installId: install!.id, serverId: server.id }));
+  const headers = { Authorization: `Bearer ${await tokenForHuman(owner.email)}`, "X-Server-Id": server.id };
+  const appRoute = `${app.baseUrl}/api/integrations/clients/${client.id}`;
+  const uploadLogo = async (background: string) => {
+    const image = await sharp({ create: { width: 8, height: 8, channels: 3, background } }).png().toBuffer();
+    const formData = new FormData();
+    formData.set("logo", new Blob([new Uint8Array(image)], { type: "image/png" }), "logo.png");
+    return fetch(`${appRoute}/logo`, { method: "POST", headers, body: formData });
+  };
+  const clearLogo = () => fetch(`${appRoute}/logo`, { method: "DELETE", headers });
+  const deleteApp = () => fetch(appRoute, { method: "DELETE", headers });
+  const stored = async () => {
+    const [row] = await getDb().select({ logoUrl: oauthClients.logoUrl, logoStorageKey: oauthClients.logoStorageKey })
+      .from(oauthClients).where(eq(oauthClients.id, client.id));
+    const [botRow] = await getDb().select({ avatarUrl: agents.avatarUrl }).from(agents).where(eq(agents.id, bot.agentId));
+    return { app: row ?? null, botAvatarUrl: botRow?.avatarUrl ?? null };
+  };
+
+  // Upload and clear: make the bot avatar sync that follows the logo write
+  // fail. App deletion has nothing after its write: fail right after it, as a
+  // failed commit would.
+  const failNextBotSync = () => vi.spyOn(agentService, "syncAppBotAvatarsToLogo")
+    .mockRejectedValueOnce(new Error("injected failure after the logo write"));
+  const failAfterNextAppDeletion = () => {
+    const deleteLocked = oauthService.deleteLockedOAuthClient;
+    return vi.spyOn(oauthService, "deleteLockedOAuthClient").mockImplementationOnce(async (...args) => {
+      await deleteLocked(...args);
+      throw new Error("injected failure after the App deletion write");
+    });
+  };
+
+  const bucket = installRecordingLogoStorage();
+  try {
+    assert.equal((await uploadLogo("#d33f49")).status, 200);
+    const before = await stored();
+    const oldKey = before.app?.logoStorageKey;
+    assert.ok(oldKey && bucket.objects.has(oldKey), "the first logo is stored");
+    assert.equal(before.botAvatarUrl, before.app?.logoUrl, "the bot shows the logo");
+
+    for (const [step, injectFailure, request] of [
+      ["logo upload", failNextBotSync, () => uploadLogo("#2f6fdd")],
+      ["logo clear", failNextBotSync, clearLogo],
+      ["App deletion", failAfterNextAppDeletion, deleteApp],
+    ] as const) {
+      const injected = injectFailure();
+      try {
+        assert.equal((await request()).status, 500, `${step}: the injected failure fails the request`);
+      } finally {
+        injected.mockRestore();
+      }
+      assert.deepEqual(await stored(), before, `${step} rolled back: the App and its bot keep the old logo`);
+      assert.deepEqual(bucket.deletes, [], `${step} rolled back: no logo object is deleted`);
+      assert.ok(bucket.objects.has(oldKey), `${step} rolled back: the old logo object still exists`);
+    }
+
+    // Committed, each change deletes the object it left unreferenced.
+    assert.equal((await uploadLogo("#2f6fdd")).status, 200);
+    const replacedBy = (await stored()).app?.logoStorageKey;
+    assert.ok(replacedBy && replacedBy !== oldKey);
+    assert.deepEqual(bucket.deletes.splice(0), [oldKey], "logo upload: the replaced object is deleted");
+    assert.equal((await clearLogo()).status, 200);
+    assert.deepEqual(bucket.deletes.splice(0), [replacedBy], "logo clear: the removed object is deleted");
+    assert.equal((await uploadLogo("#1a7f37")).status, 200);
+    const lastKey = (await stored()).app?.logoStorageKey;
+    assert.ok(lastKey);
+    assert.equal((await deleteApp()).status, 200);
+    assert.equal((await stored()).app, null, "the App is deleted");
+    assert.deepEqual(bucket.deletes.splice(0), [lastKey], "App deletion: the App's logo object is deleted");
+  } finally {
+    bucket.restore();
+  }
+});
+
+test("PATCH /api/integrations/clients/:id with enableBot=false disables the bot and puts granted installs back to pending", async ({ app }) => {
+  const suffix = randomUUID();
+  const owner = await seedUser(`bot-off-owner-${suffix}@slock.test`, `bot-off-owner-${suffix}`);
+  const server = await createServer("App Bot Off Server", `app-bot-off-${suffix.slice(0, 8)}`, owner.id);
+
+  const { client } = await createOAuthClient({
+    serverId: server.id,
+    createdByUserId: owner.id,
+    clientId: `bot-off-${suffix.slice(0, 8)}`,
+    name: "Bot Off App",
     enableBot: true,
   });
 
@@ -3502,85 +4166,67 @@ test("POST /api/app-bot/token exchanges OAuth access token for bot sk_agent_* + 
     status: "active",
     botGrant: "granted",
   }).returning();
+  const { createManagedAppBot } = await import("../services/appBotIdentityService");
+  await getDb().transaction((tx) =>
+    createManagedAppBot(tx, { installId: install.id, serverId: server.id }),
+  );
 
-  // Create the managed bot.
+  const token = await tokenForHuman(owner.email);
+  const res = await fetch(`${app.baseUrl}/api/integrations/clients/${client.id}`, {
+    method: "PATCH",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "X-Server-Id": server.id,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ enableBot: false }),
+  });
+  assert.equal(res.status, 200);
+
+  const [row] = await getDb().select().from(oauthClientInstalls).where(eq(oauthClientInstalls.id, install.id));
+  // Not "revoked": that is a Server admin's own "Don't add"; a re-enable must ask again.
+  assert.equal(row.botGrant, "pending", "a developer disable puts the grant back to pending");
+  const [binding] = await getDb().select().from(appBotBindings).where(eq(appBotBindings.installId, install.id));
+  assert.equal(binding?.state, "disabled", "managed bot disabled when enableBot is turned off");
+  assert.ok(binding?.disabledAt);
+});
+
+test("GET /api/agents/:id exposes managedByApp attribution for an app-managed bot", async ({ app }) => {
+  const suffix = randomUUID();
+  const owner = await seedUser(`bot-attr-owner-${suffix}@slock.test`, `bot-attr-owner-${suffix}`);
+  const server = await createServer("App Bot Attr Server", `app-bot-attr-${suffix.slice(0, 8)}`, owner.id);
+
+  const { client } = await createOAuthClient({
+    serverId: server.id,
+    createdByUserId: owner.id,
+    clientId: `bot-attr-${suffix.slice(0, 8)}`,
+    name: "Attributed Bot App",
+    enableBot: true,
+  });
+
+  const [install] = await getDb().insert(oauthClientInstalls).values({
+    serverId: server.id,
+    clientId: client.id,
+    installedByUserId: owner.id,
+    status: "active",
+    botGrant: "granted",
+  }).returning();
   const { createManagedAppBot } = await import("../services/appBotIdentityService");
   const bot = await getDb().transaction((tx) =>
     createManagedAppBot(tx, { installId: install.id, serverId: server.id }),
   );
 
-  // Issue a valid OAuth access token for this client+server.
-  const rawToken = `oauth-token-${suffix}`;
-  const tokenHash = createHash("sha256").update(rawToken).digest("hex");
-  await getDb().insert(oauthAccessTokens).values({
-    serverId: server.id,
-    principalType: "agent",
-    clientId: client.id,
-    tokenHash,
-    scopes: ["app"],
-    expiresAt: new Date(Date.now() + 3_600_000),
+  const token = await tokenForHuman(owner.email);
+  const res = await fetch(`${app.baseUrl}/api/agents/${bot.agentId}`, {
+    headers: { Authorization: `Bearer ${token}`, "X-Server-Id": server.id },
   });
-
-  // 1. Exchange → sk_agent_*
-  const tokenRes = await fetch(`${app.baseUrl}/api/app-bot/token`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${rawToken}` },
-  });
-  assert.equal(tokenRes.status, 200);
-  const tokenBody = await tokenRes.json() as { apiKey: string; agentId: string; scopes: string[] };
-  assert.ok(tokenBody.apiKey.startsWith("sk_agent_"));
-  assert.equal(tokenBody.agentId, bot.agentId);
-  for (const scope of ["send", "read", "mentions", "channels"]) {
-    assert.ok(tokenBody.scopes.includes(scope), `missing scope ${scope}`);
-  }
-  // Withheld capabilities must not leak.
-  for (const withheld of ["tasks", "reactions", "server", "knowledge", "mcp"]) {
-    assert.ok(!tokenBody.scopes.includes(withheld), `leaked scope ${withheld}`);
-  }
-
-  // 2. The key authenticates as the bot agent on the standard agent surface.
-  const whoamiRes = await fetch(`${app.baseUrl}/internal/agent-api/`, {
-    headers: { Authorization: `Bearer ${tokenBody.apiKey}` },
-  });
-  assert.equal(whoamiRes.status, 200);
-
-  // 3. Rotation: second exchange revokes the first credential.
-  const tokenRes2 = await fetch(`${app.baseUrl}/api/app-bot/token`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${rawToken}` },
-  });
-  assert.equal(tokenRes2.status, 200);
-  const tokenBody2 = await tokenRes2.json() as { apiKey: string };
-  assert.notEqual(tokenBody2.apiKey, tokenBody.apiKey);
-
-  // Old key → 401
-  const oldKeyRes = await fetch(`${app.baseUrl}/internal/agent-api/`, {
-    headers: { Authorization: `Bearer ${tokenBody.apiKey}` },
-  });
-  assert.equal(oldKeyRes.status, 401);
-
-  // New key still works
-  const newKeyRes = await fetch(`${app.baseUrl}/internal/agent-api/`, {
-    headers: { Authorization: `Bearer ${tokenBody2.apiKey}` },
-  });
-  assert.equal(newKeyRes.status, 200);
-
-  // 4. Revoked install → 401
-  const { disableManagedAppBot } = await import("../services/appBotIdentityService");
-  await getDb().update(oauthClientInstalls)
-    .set({ botGrant: "revoked", updatedAt: new Date() })
-    .where(eq(oauthClientInstalls.id, install.id));
-  await getDb().transaction((tx) => disableManagedAppBot(tx, { installId: install.id }));
-
-  const revokedRes = await fetch(`${app.baseUrl}/internal/agent-api/`, {
-    headers: { Authorization: `Bearer ${tokenBody2.apiKey}` },
-  });
-  assert.equal(revokedRes.status, 401);
-
-  // 5. Exchange also fails when grant is revoked.
-  const tokenRes3 = await fetch(`${app.baseUrl}/api/app-bot/token`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${rawToken}` },
-  });
-  assert.equal(tokenRes3.status, 403);
+  assert.equal(res.status, 200);
+  const body = await res.json() as {
+    managedByAppInstallId: string | null;
+    managedByApp: { clientId: string; name: string } | null;
+  };
+  assert.equal(body.managedByAppInstallId, install.id);
+  assert.ok(body.managedByApp);
+  assert.equal(body.managedByApp.clientId, client.id);
+  assert.equal(body.managedByApp.name, "Attributed Bot App");
 });

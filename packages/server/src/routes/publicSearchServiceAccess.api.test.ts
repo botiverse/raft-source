@@ -98,7 +98,6 @@ test("public search service access: per-request keys, no anonymous fallback, sha
   await withEnv({ RAFT_LANDING_SERVICE_RATE_PER_MINUTE: "12", RAFT_LANDING_SERVICE_MAX_IN_FLIGHT: "4" }, async () => {
     const app = await openTestApp("pglite://", 0, {
       humanActivityMuteFlagDefaultEnabled: true,
-      onboardingOpenerFlagDefaultEnabled: false,
       ...testHarness(createMemoryPublicSearchBucketStore()),
     });
     const logged: string[] = [];
@@ -187,7 +186,6 @@ test("public search service access: per-request keys, no anonymous fallback, sha
 test("public search service access: without an injected bucket the app refuses service traffic rather than counting it per process", async () => {
   const app = await openTestApp("pglite://", 0, {
     humanActivityMuteFlagDefaultEnabled: true,
-    onboardingOpenerFlagDefaultEnabled: false,
     publicSearchKeySource: createUncheckedTestKeySource(),
   });
   try {
@@ -359,7 +357,6 @@ test("public search service access: invalid limits make only the service path un
   await withEnv({ RAFT_LANDING_SERVICE_RATE_PER_MINUTE: "0" }, async () => {
     const app = await openTestApp("pglite://", 0, {
       humanActivityMuteFlagDefaultEnabled: true,
-      onboardingOpenerFlagDefaultEnabled: false,
       ...testHarness(createMemoryPublicSearchBucketStore()),
     });
     try {
@@ -377,7 +374,7 @@ test("public search service access: invalid limits make only the service path un
 });
 
 test("public search index: bounded pages walk every searchable entry exactly once, and a closed switch reads nothing", async () => {
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false, skipAuthRateLimit: true });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, skipAuthRateLimit: true });
   try {
     await setFlag(PUBLIC_SERVER_FEATURE_FLAG_KEY, true);
     await setFlag(PUBLIC_SERVER_SEARCH_INDEX_FEATURE_FLAG_KEY, false);
@@ -422,7 +419,7 @@ function lpadHex(n: number) {
 }
 
 test("public search index: past 500 candidates with no entries it stops with a forward cursor, and the eligible server after them appears exactly once", async () => {
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false, skipAuthRateLimit: true });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, skipAuthRateLimit: true });
   try {
     const db = getDb();
     await setFlag(PUBLIC_SERVER_FEATURE_FLAG_KEY, true);

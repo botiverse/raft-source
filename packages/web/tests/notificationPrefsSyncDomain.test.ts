@@ -22,7 +22,7 @@ import {
 
 const channelId = "channel-notification-prefs";
 const serverId = "server-notification-prefs";
-const channelScopeId = `channel:${channelId}`;
+const channelScopeId = `mute:${channelId}`;
 
 function channelEvent(version: number, muted: boolean): NotificationPrefsDomainEvent {
   return {

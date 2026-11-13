@@ -2,10 +2,10 @@ import { revokeSocketAccess } from "../socket/accessRevocation";
 import { serializeErrorForLog } from "../tracing/safeErrorLog";
 import { eq, and, asc, gt, isNull, sql } from "drizzle-orm";
 import argon2 from "argon2";
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, randomBytes, randomInt } from "node:crypto";
 import { getDb } from "../db/index";
 import type { DatabaseExecutor } from "../db/index";
-import { users, emailVerifications, passwordResets, userAuthIdentities, sessionFamilies, sessions, userRetirementReceipts } from "../db/schema";
+import { users, emailVerifications, passwordResets, userAuthIdentities, userBackupCodes, userTotp, webauthnCredentials, sessionFamilies, sessions, userRetirementReceipts } from "../db/schema";
 import { sendVerificationEmail, sendPasswordResetEmail } from "./emailService";
 import { normalizeEmail } from "./emailNormalization";
 import { syncNewsletterSignup } from "./newsletterService";
@@ -13,10 +13,18 @@ import { enqueueOnboardingEmailJourneyForUser } from "./onboardingEmailJourneySe
 import { assertRegistrationEnabled } from "./registrationPolicy";
 import type { SocialAuthProfile, SocialAuthProvider } from "./socialAuthService";
 import * as legalAcceptanceService from "./legalAcceptanceService";
-import { currentDate, isReservedAgentName, validateName } from "@botiverse/raft-shared";
-import { createSession, revokeAllUserSessionsInTransaction } from "./sessionService";
+import { DEPRECATED_GRAVATAR_HASH, currentDate, isReservedAgentName, normalizeRailTabOrder, normalizeShortcutOverrides, validateName } from "@botiverse/raft-shared";
+import type { StoredComposerSendKey, StoredShortcutOverrides } from "@botiverse/raft-shared";
+import { createSession, denyLoginCodesApprovedBy, revokeAllUserSessionsInTransaction } from "./sessionService";
+import { revokeKeysOfRevokedDeviceSessions } from "./deviceSessionKeys";
+import type { ApproverSessionRevokeTrigger } from "./approverSessionGrants";
+import { runSecurityRevokeCascade } from "./securityRevokeCascade";
 import { isStoredUserAvatarUrl, materializeUserProviderAvatar } from "./avatarService";
+import { isAutoHumanAvatarUrl, randomHumanAvatarRecipe, serializeHumanAvatarRecipe } from "@botiverse/raft-shared/src/humanAvatar";
+import { isHumanAvatarBuilderOnForServer } from "./humanAvatarBuilderFlag";
 import { forgetTraceUserId } from "../tracing/traceUserId";
+import { proofForPasswordLogin, type SessionIssueProof } from "./sessionIssueGate";
+import { passwordFingerprint } from "./secondFactor/signIn";
 
 export const PROFILE_SETUP_PLACEHOLDER_PREFIX = "pending_";
 const PROFILE_SETUP_PLACEHOLDER_RANDOM_BYTES = 10;
@@ -45,6 +53,11 @@ function toPublicUser(user: {
   preferredTranslationDisplay?: "translated" | "original" | "bilingual" | null;
   preferredTimeFormat?: "12h" | "24h" | null;
   preferredMessageBodyFontSize?: "sm" | "md" | "lg" | null;
+  railTabOrder?: string[] | null;
+  assistantOtterVisible?: boolean | null;
+  assistantOtterShortcut?: string | null;
+  composerSendKey?: StoredComposerSendKey;
+  shortcutOverrides?: StoredShortcutOverrides | null;
   shareUsageData?: boolean | null;
   referralSource?: string | null;
   referralSourceOther?: string | null;
@@ -61,7 +74,7 @@ function toPublicUser(user: {
   return {
     id: user.id,
     email: user.email,
-    gravatarHash: createHash("sha256").update(user.email.trim().toLowerCase()).digest("hex"),
+    gravatarHash: DEPRECATED_GRAVATAR_HASH,
     name: user.name,
     displayName: user.displayName,
     description: user.description,
@@ -82,6 +95,15 @@ function toPublicUser(user: {
     preferredTranslationDisplay: user.preferredTranslationDisplay ?? "translated",
     preferredTimeFormat: user.preferredTimeFormat ?? null,
     preferredMessageBodyFontSize: user.preferredMessageBodyFontSize ?? null,
+    // null = the default order; a stored order comes back complete.
+    railTabOrder: user.railTabOrder == null ? null : normalizeRailTabOrder(user.railTabOrder),
+    // #proj-assistant:#21: the otter over every page (on unless turned off) and its shortcut (null = the default, "off" = none).
+    assistantOtterVisible: user.assistantOtterVisible ?? true,
+    assistantOtterShortcut: user.assistantOtterShortcut ?? null,
+    // #triage:#210: how the message box sends (null = Enter, the default).
+    composerSendKey: user.composerSendKey ?? null,
+    // #proj-frontend:#37: the keyboard shortcuts the person changed (null = every default).
+    shortcutOverrides: user.shortcutOverrides == null ? null : normalizeShortcutOverrides(user.shortcutOverrides),
     // RFC-067 "Share usage data"; null = not chosen yet.
     shareUsageData: user.shareUsageData ?? null,
     referralSource: user.referralSource ?? null,
@@ -289,8 +311,10 @@ function isProviderHotlinkedAvatarUrl(avatarUrl: string | null): boolean {
   }
 }
 
+// A provider's photo replaces no avatar, an old hotlink, or the built avatar
+// the Server picked for a new account (`/auto`); never one the person chose.
 function shouldReplaceSocialAvatar(existingAvatarUrl: string | null): boolean {
-  return !existingAvatarUrl || isProviderHotlinkedAvatarUrl(existingAvatarUrl);
+  return !existingAvatarUrl || isProviderHotlinkedAvatarUrl(existingAvatarUrl) || isAutoHumanAvatarUrl(existingAvatarUrl);
 }
 
 function chooseSocialAvatarUrl(existingAvatarUrl: string | null, materializedAvatarUrl: string | null): string | null {
@@ -306,6 +330,28 @@ async function materializeSocialAvatar(existingAvatarUrl: string | null, profile
   });
 }
 
+/**
+ * A random built pixel avatar, marked as picked by the Server (`/auto`), so
+ * the builder opens on it, and a provider's photo (a social sign-in or link
+ * later) may still replace it.
+ */
+export function newAccountAvatarUrl(): string {
+  return serializeHumanAvatarRecipe(randomHumanAvatarRecipe(() => randomInt(0, 2 ** 32) / 2 ** 32), { auto: true });
+}
+
+/**
+ * A new account's avatar, behind human_avatar_builder_v0 for the server the
+ * account is joining: a random built one where it is on, else none (the
+ * generic person icon, as before). Sign-up that knows no server (email,
+ * social) passes none and gets none. Accounts made before keep what they had.
+ */
+export async function newAccountAvatarUrlFor(
+  joiningServerId: string | null,
+  executor: DatabaseExecutor = getDb(),
+): Promise<string | null> {
+  return (await isHumanAvatarBuilderOnForServer(joiningServerId, executor)) ? newAccountAvatarUrl() : null;
+}
+
 // ── User CRUD ──
 
 export async function createUser(
@@ -315,7 +361,14 @@ export async function createUser(
   legalAcceptance: legalAcceptanceService.LegalAcceptanceInput,
   legalMetadata: legalAcceptanceService.LegalAcceptanceMetadata = {},
   legalSource: Extract<legalAcceptanceService.LegalAcceptanceSource, "signup" | "invite"> = "signup",
-  options: { deferProfileSetup?: boolean; stagingSelfAccountCapability?: string } = {},
+  options: {
+    deferProfileSetup?: boolean;
+    stagingSelfAccountCapability?: string;
+    /** Where the verification link lands after verifying (an Artifact link signed up from); sanitized by the email. */
+    verificationReturnTo?: string;
+    /** Told whether the provider took the verification email (the product event `email_verification_sent`). */
+    onVerificationEmail?: (result: "sent" | "failed") => void;
+  } = {},
 ) {
   const db = getDb();
   const normalizedEmail = normalizeEmail(email);
@@ -343,7 +396,7 @@ export async function createUser(
   let publicUser: PublicUser;
   try {
     publicUser = await db.transaction(async (transaction) => {
-      legalAcceptanceService.requireCurrentLegalAcceptance(legalAcceptance);
+      const accepted = legalAcceptanceService.requireCurrentLegalAcceptance(legalAcceptance);
 
       const pendingHandle = options.deferProfileSetup ? createPendingHandle() : null;
       const suggestedHandle = options.deferProfileSetup
@@ -353,6 +406,7 @@ export async function createUser(
         email: normalizedEmail,
         name: pendingHandle ?? name!,
         displayName: options.deferProfileSetup ? null : name,
+        // Email sign-up joins no server yet: no avatar (newAccountAvatarUrlFor).
         passwordHash,
         passwordCredentialEstablishedAt: currentDate(),
         profileSetupCompletedAt: options.deferProfileSetup ? null : currentDate(),
@@ -360,9 +414,11 @@ export async function createUser(
         stagingSelfAccountCapabilityHash: options.stagingSelfAccountCapability
           ? hashToken(options.stagingSelfAccountCapability)
           : null,
+        // Signed up on a page without the usage-data clause: not told, not on.
+        ...(accepted.sawUsageDataNotice ? {} : { shareUsageData: false }),
       }).returning();
 
-      await legalAcceptanceService.insertUserLegalAcceptance(transaction, user.id, legalSource, legalMetadata);
+      await legalAcceptanceService.insertUserLegalAcceptance(transaction, user.id, legalSource, legalMetadata, accepted);
       await transaction.insert(emailVerifications).values({
         userId: user.id,
         tokenHash: hashToken(token),
@@ -378,7 +434,17 @@ export async function createUser(
     throw err;
   }
 
-  await sendVerificationEmail(normalizedEmail, options.deferProfileSetup ? "there" : name!, token);
+  // The account is committed above: a verification email the provider refuses
+  // must not turn a created account into "Registration failed" (the retry then
+  // says "already registered"). The user lands on the verify-email screen and
+  // can resend from there (task #55).
+  try {
+    await sendVerificationEmail(normalizedEmail, options.deferProfileSetup ? "there" : name!, token, options.verificationReturnTo);
+    options.onVerificationEmail?.("sent");
+  } catch (err) {
+    console.error("[userService] Verification email failed after account creation:", serializeErrorForLog(err));
+    options.onVerificationEmail?.("failed");
+  }
 
   if (!options.deferProfileSetup) {
     await syncNewsletterSignup(publicUser);
@@ -400,20 +466,92 @@ export async function markEmailVerifiedForTest(userId: string): Promise<void> {
   await db.update(users).set({ emailVerified: true }).where(eq(users.id, userId));
 }
 
+/**
+ * Pending social link (task #1304) for a password sign-in. `prepare` runs
+ * after the password verifies, outside the lock; the step it returns runs
+ * inside the locked transaction, after the hash is revalidated and before
+ * the session is created, and returns what to run after commit. A
+ * credential rejected at any point leaves no link behind, and a failed
+ * session rolls the link back.
+ */
+export type PasswordSignInLinkStep = (tx: DatabaseExecutor) => Promise<() => Promise<void>>;
+
+export type PasswordSignInResult =
+  | { secondFactorRequired: false; user: ReturnType<typeof toPublicUser>; session: Awaited<ReturnType<typeof createSession>> }
+  /** Two-step verification is on: no session, no link; the caller starts the second step. */
+  | { secondFactorRequired: true; userId: string; passwordFingerprint: string };
+
+type LockedPasswordUser = typeof users.$inferSelect;
+
+/**
+ * The end of a password sign-in, inside the transaction that holds the
+ * person's row (`current`, FOR UPDATE): commit the pending link if any, heal
+ * the password marker, create the session with `proof`. Shared by the
+ * password step itself and by its second step (services/secondFactor/signIn.ts).
+ */
+async function finishPasswordSignInLocked(
+  tx: DatabaseExecutor,
+  current: LockedPasswordUser,
+  proof: SessionIssueProof,
+  linkInLock: PasswordSignInLinkStep | undefined,
+) {
+  let linked: LockedPasswordUser | undefined;
+  let afterCommit: (() => Promise<void>) | undefined;
+  if (linkInLock) {
+    afterCommit = await linkInLock(tx);
+    [linked] = await tx.select().from(users).where(eq(users.id, current.id));
+  }
+  await healPasswordCredentialMarker(tx, current);
+  return { ...(await signInLocked(tx, linked ?? current, proof)), afterCommit };
+}
+
+/** The session and the public account a sign-in answers with, for the person's locked row. */
+async function signInLocked(tx: DatabaseExecutor, current: LockedPasswordUser, proof: SessionIssueProof) {
+  const session = await createSession(proof, tx);
+  return {
+    user: toPublicUser({
+      ...current,
+      profileSetupProvider: await getProfileSetupProvider(tx, current.id),
+    }),
+    session,
+  };
+}
+
+/**
+ * A passkey sign-in passed (services/secondFactor/passkeySignIn.ts): inside
+ * its transaction, after the gate, issue the session and answer with the
+ * account exactly as a password sign-in would. The gate already checked the
+ * account is active under the same row lock.
+ */
+export async function finishPasskeySignIn(tx: DatabaseExecutor, proof: SessionIssueProof) {
+  const [current] = await tx.select().from(users).where(eq(users.id, proof.userId)).for("update");
+  if (!current || current.retiredAt) throw new Error("finishPasskeySignIn: the gate admitted an inactive account");
+  return signInLocked(tx, current, proof);
+}
+
+/**
+ * Social-only users also have a non-null hash for rolling-schema
+ * compatibility, but it is an unknowable random placeholder. Verifying the
+ * supplied password is therefore the safe provenance test: a real legacy
+ * password succeeds even if the human later linked a social identity, while
+ * a placeholder remains unusable. Only a successful verification may heal
+ * the durable marker.
+ */
+async function healPasswordCredentialMarker(tx: DatabaseExecutor, current: LockedPasswordUser): Promise<void> {
+  if (current.passwordCredentialEstablishedAt) return;
+  await tx.update(users).set({
+    passwordCredentialEstablishedAt: currentDate(),
+  }).where(and(
+    eq(users.id, current.id),
+    isNull(users.passwordCredentialEstablishedAt),
+  ));
+}
+
 export async function authenticateUser(
   email: string,
   password: string,
-  options: {
-    /**
-     * Pending social link (task #1304). `prepare` runs after the password
-     * verifies, outside the lock; the step it returns runs inside the locked
-     * transaction, after the hash is revalidated and before the session is
-     * created. A credential rejected at any point leaves no link behind, and
-     * a failed session rolls the link back.
-     */
-    prepareLink?: (userId: string) => Promise<(tx: DatabaseExecutor) => Promise<() => Promise<void>>>;
-  } = {},
-) {
+  options: { prepareLink?: (userId: string) => Promise<PasswordSignInLinkStep> } = {},
+): Promise<PasswordSignInResult> {
   const db = getDb();
 
   const [user] = await db.select().from(users).where(eq(users.email, normalizeEmail(email)));
@@ -424,12 +562,8 @@ export async function authenticateUser(
     throw new EmailLoginRejectedError("user_retired");
   }
 
-  // Social-only users also have a non-null hash for rolling-schema
-  // compatibility, but it is an unknowable random placeholder. Verifying the
-  // supplied password is therefore the safe provenance test: a real legacy
-  // password succeeds even if the human later linked a social identity, while
-  // a placeholder remains unusable. Only a successful verification may heal
-  // the durable marker.
+  // See healPasswordCredentialMarker: the placeholder hash of a social-only
+  // account never verifies.
   const valid = await argon2.verify(user.passwordHash, password);
   if (!valid) {
     throw new EmailLoginRejectedError("password_mismatch");
@@ -439,34 +573,37 @@ export async function authenticateUser(
   // Argon2 is deliberately outside the lock. Revalidate its exact hash under
   // the same user lock held by password changes and session issuance.
   let afterCommit: (() => Promise<void>) | undefined;
-  const result = await db.transaction(async (tx) => {
+  const result = await db.transaction(async (tx): Promise<PasswordSignInResult> => {
     const [current] = await tx.select().from(users).where(eq(users.id, user.id)).for("update");
     if (!current || current.retiredAt) throw new EmailLoginRejectedError("user_retired");
     if (current.passwordHash !== user.passwordHash) throw new EmailLoginRejectedError("password_mismatch");
-    let linked: typeof current | undefined;
-    if (linkInLock) {
-      afterCommit = await linkInLock(tx);
-      [linked] = await tx.select().from(users).where(eq(users.id, user.id));
+    const gate = await proofForPasswordLogin(user.id, tx);
+    if (gate.secondFactorRequired) {
+      await healPasswordCredentialMarker(tx, current);
+      return { secondFactorRequired: true, userId: user.id, passwordFingerprint: passwordFingerprint(current.passwordHash) };
     }
-    if (!current.passwordCredentialEstablishedAt) {
-      await tx.update(users).set({
-        passwordCredentialEstablishedAt: currentDate(),
-      }).where(and(
-        eq(users.id, user.id),
-        isNull(users.passwordCredentialEstablishedAt),
-      ));
-    }
-    const session = await createSession(user.id, tx);
-    return {
-      user: toPublicUser({
-        ...(linked ?? current),
-        profileSetupProvider: await getProfileSetupProvider(tx, user.id),
-      }),
-      session,
-    };
+    const finished = await finishPasswordSignInLocked(tx, current, gate.proof, linkInLock);
+    afterCommit = finished.afterCommit;
+    return { secondFactorRequired: false, user: finished.user, session: finished.session };
   });
   await afterCommit?.();
   return result;
+}
+
+/**
+ * The password sign-in's second step passed (services/secondFactor/signIn.ts):
+ * finish it inside the verify transaction, exactly as the password step
+ * would have. Null when the password changed since the first step (or the
+ * account was retired): the challenge no longer stands. The caller runs
+ * `afterCommit` once the transaction commits.
+ */
+export async function finishPasswordSignInAfterSecondFactor(
+  tx: DatabaseExecutor,
+  input: { userId: string; passwordFingerprint: string; proof: SessionIssueProof; linkInLock?: PasswordSignInLinkStep },
+) {
+  const [current] = await tx.select().from(users).where(eq(users.id, input.userId)).for("update");
+  if (!current || current.retiredAt || passwordFingerprint(current.passwordHash) !== input.passwordFingerprint) return null;
+  return finishPasswordSignInLocked(tx, current, input.proof, input.linkInLock);
 }
 
 export async function retireStagingSelfAccount(userId: string, actorUserId: string, capability: string) {
@@ -517,19 +654,30 @@ export async function retireStagingSelfAccount(userId: string, actorUserId: stri
     await tx.update(sessionFamilies).set({ revokedAt: now, revokedReason: "staging_self_account" })
       .where(and(eq(sessionFamilies.userId, userId), isNull(sessionFamilies.revokedAt)));
     await tx.delete(sessions).where(eq(sessions.userId, userId));
+    await denyLoginCodesApprovedBy(tx, userId, "all", now);
     const [receipt] = await tx.insert(userRetirementReceipts).values({
       userId, actorUserId, environment: "staging", terminalState: "retired",
       sessionsRevoked: activeSessions.length,
     }).onConflictDoNothing().returning();
     return receipt ?? null;
   });
-  await revokeSocketAccess({ userId });
+  try {
+    await revokeSocketAccess({ userId });
+  } finally {
+    await revokeDeviceSessionKeysAfterSignOut(userId);
+    await revokeWhatSessionsApprovedAfterSecurityRevoke(userId, "account_retired", null);
+  }
   return result;
 }
 
-export async function getUser(userId: string) {
+export async function getUser(userId: string): Promise<ReturnType<typeof toPublicUser> | null>;
+export async function getUser(
+  userId: string,
+  options: { withDesktopAppHint: true },
+): Promise<(ReturnType<typeof toPublicUser> & { usedDesktopAppRecently: boolean }) | null>;
+export async function getUser(userId: string, options: { withDesktopAppHint?: boolean } = {}) {
   const db = getDb();
-  const [user] = await db.select({
+  const [row] = await db.select({
     id: users.id,
     email: users.email,
     name: users.name,
@@ -550,6 +698,11 @@ export async function getUser(userId: string) {
     preferredTranslationDisplay: users.preferredTranslationDisplay,
     preferredTimeFormat: users.preferredTimeFormat,
     preferredMessageBodyFontSize: users.preferredMessageBodyFontSize,
+    railTabOrder: users.railTabOrder,
+    assistantOtterVisible: users.assistantOtterVisible,
+    assistantOtterShortcut: users.assistantOtterShortcut,
+    composerSendKey: users.composerSendKey,
+    shortcutOverrides: users.shortcutOverrides,
     referralSource: users.referralSource,
     referralSourceOther: users.referralSourceOther,
     referralSourceSkippedAt: users.referralSourceSkippedAt,
@@ -557,12 +710,16 @@ export async function getUser(userId: string) {
     profileSetupSuggestedHandle: users.profileSetupSuggestedHandle,
     signupRole: users.signupRole,
     signupSurveyCompletedAt: users.signupSurveyCompletedAt,
+    lastDesktopAppSeenAt: users.lastDesktopAppSeenAt,
   }).from(users).where(eq(users.id, userId));
-  if (!user) return null;
-  return toPublicUser({
+  if (!row) return null;
+  const { lastDesktopAppSeenAt, ...user } = row;
+  const publicUser = toPublicUser({
     ...user,
     profileSetupProvider: await getProfileSetupProvider(db, user.id),
   });
+  if (!options.withDesktopAppHint) return publicUser;
+  return { ...publicUser, usedDesktopAppRecently: isRecentDesktopAppUse(lastDesktopAppSeenAt) };
 }
 
 export async function getUserByEmail(email: string) {
@@ -588,6 +745,11 @@ export async function getUserByEmail(email: string) {
     preferredTranslationDisplay: users.preferredTranslationDisplay,
     preferredTimeFormat: users.preferredTimeFormat,
     preferredMessageBodyFontSize: users.preferredMessageBodyFontSize,
+    railTabOrder: users.railTabOrder,
+    assistantOtterVisible: users.assistantOtterVisible,
+    assistantOtterShortcut: users.assistantOtterShortcut,
+    composerSendKey: users.composerSendKey,
+    shortcutOverrides: users.shortcutOverrides,
     referralSource: users.referralSource,
     referralSourceOther: users.referralSourceOther,
     referralSourceSkippedAt: users.referralSourceSkippedAt,
@@ -603,7 +765,7 @@ export async function getUserByEmail(email: string) {
   });
 }
 
-export async function updateUser(userId: string, fields: {
+export type UserUpdateFields = {
   displayName?: string;
   description?: string | null;
   avatarUrl?: string | null;
@@ -615,18 +777,29 @@ export async function updateUser(userId: string, fields: {
   preferredTranslationDisplay?: "translated" | "original" | "bilingual";
   preferredTimeFormat?: "12h" | "24h" | null;
   preferredMessageBodyFontSize?: "sm" | "md" | "lg" | null;
+  railTabOrder?: string[] | null;
+  assistantOtterVisible?: boolean;
+  assistantOtterShortcut?: string | null;
+  composerSendKey?: StoredComposerSendKey;
+  shortcutOverrides?: StoredShortcutOverrides | null;
   shareUsageData?: boolean | null;
   referralSource?: string | null;
   referralSourceOther?: string | null;
   referralSourceSkippedAt?: Date | null;
   signupRole?: string | null;
   signupSurveyCompletedAt?: Date | null;
-}) {
-  const db = getDb();
+};
+
+/** The write half of updateUser, on a caller's transaction (assistantOwnerSettingsService). */
+export async function writeUserFields(userId: string, fields: UserUpdateFields, db: DatabaseExecutor = getDb()): Promise<void> {
   await db.update(users).set({
     ...fields,
     updatedAt: new Date(),
   }).where(eq(users.id, userId));
+}
+
+export async function updateUser(userId: string, fields: UserUpdateFields) {
+  await writeUserFields(userId, fields);
   const user = await getUser(userId);
   return user;
 }
@@ -653,6 +826,31 @@ export async function recordBrowserTimezoneObservation(userId: string, timezone:
     lastObservedTimezoneAt: users.lastObservedTimezoneAt,
   });
   return recorded ?? null;
+}
+
+/** How long a Raft Desktop sign-in counts as "uses the desktop app" for the desktop-browser banner. */
+export const DESKTOP_APP_RECENT_USE_DAYS = 30;
+
+/**
+ * Deep links (task 1d): a request from Raft Desktop stamps
+ * users.last_desktop_app_seen_at, at most once a day so the profile load
+ * stays a read. getUser({ withDesktopAppHint }) reads it back as "used Raft
+ * Desktop in the last {@link DESKTOP_APP_RECENT_USE_DAYS} days". A hint only:
+ * it decides whether a desktop browser offers "Open in Raft Desktop", never
+ * anything that matters for access.
+ */
+export async function recordDesktopAppSeen(userId: string): Promise<void> {
+  await getDb().update(users).set({
+    lastDesktopAppSeenAt: sql`statement_timestamp()`,
+  }).where(and(
+    eq(users.id, userId),
+    sql`(${users.lastDesktopAppSeenAt} is null or ${users.lastDesktopAppSeenAt} < statement_timestamp() - interval '1 day')`,
+  ));
+}
+
+function isRecentDesktopAppUse(seenAt: Date | null): boolean {
+  if (!seenAt) return false;
+  return Date.now() - seenAt.getTime() < DESKTOP_APP_RECENT_USE_DAYS * 24 * 60 * 60 * 1000;
 }
 
 async function listUserAuthIdentitiesTx(database: DatabaseExecutor, userId: string) {
@@ -752,6 +950,11 @@ async function getPublicUserByIdTx(database: DatabaseExecutor, userId: string) {
     preferredTranslationDisplay: users.preferredTranslationDisplay,
     preferredTimeFormat: users.preferredTimeFormat,
     preferredMessageBodyFontSize: users.preferredMessageBodyFontSize,
+    railTabOrder: users.railTabOrder,
+    assistantOtterVisible: users.assistantOtterVisible,
+    assistantOtterShortcut: users.assistantOtterShortcut,
+    composerSendKey: users.composerSendKey,
+    shortcutOverrides: users.shortcutOverrides,
     referralSource: users.referralSource,
     referralSourceOther: users.referralSourceOther,
     referralSourceSkippedAt: users.referralSourceSkippedAt,
@@ -815,14 +1018,20 @@ export async function prepareSocialLink(userId: string, profile: SocialAuthProfi
   if (!currentUser) {
     throw new Error("User not found");
   }
-  const normalizedEmail = normalizeEmail(profile.email);
-  const [existingEmailUser] = await db.select({
-    id: users.id,
-  }).from(users).where(eq(users.email, normalizedEmail));
-  if (existingEmailUser && existingEmailUser.id !== userId) {
-    throw new Error(`This ${getProviderLabel(profile.provider)} account email belongs to another Raft account`);
-  }
   return { materializedAvatarUrl: await materializeSocialAvatar(currentUser.avatarUrl, profile) };
+}
+
+/**
+ * An account whose email is not verified may link only a provider that
+ * vouches for that same email: otherwise whoever registered someone
+ * else's address could attach their own Google/GitHub/Apple and keep signing
+ * in after the real owner takes the account over with a password reset.
+ */
+export class SocialLinkEmailUnverifiedError extends Error {
+  readonly code = "email_verification_required";
+  constructor() {
+    super("Verify your email before connecting a sign-in provider");
+  }
 }
 
 /**
@@ -845,15 +1054,15 @@ export async function linkSocialIdentityTx(
   if (!user) {
     throw new Error("User not found");
   }
-
-  const [conflictingEmailUser] = await transaction.select({
-    id: users.id,
-  }).from(users).where(eq(users.email, normalizedEmail));
-
-  if (conflictingEmailUser && conflictingEmailUser.id !== userId) {
-    throw new Error(`This ${getProviderLabel(profile.provider)} account email belongs to another Raft account`);
+  if (!user.emailVerified && normalizeEmail(user.email) !== normalizedEmail) {
+    throw new SocialLinkEmailUnverifiedError();
   }
 
+  // Another account registered with the provider's email does not block the
+  // link: sign-in resolves by provider user id first, so this identity signs
+  // in as this account, and the email is left as it is. Refusing here let
+  // anyone who registered someone else's address keep its owner from
+  // connecting their own provider account.
   try {
     await upsertSocialIdentityTx(transaction, userId, profile);
   } catch (err) {
@@ -946,7 +1155,7 @@ export async function createSocialUser(
   const db = getDb();
   assertUsableSocialProfile(profile);
   const normalizedEmail = normalizeEmail(profile.email);
-  legalAcceptanceService.requireCurrentLegalAcceptance(legalAcceptance);
+  const accepted = legalAcceptanceService.requireCurrentLegalAcceptance(legalAcceptance);
   assertRegistrationEnabled();
   const [existingEmailUser] = await db.select({ id: users.id }).from(users).where(eq(users.email, normalizedEmail));
   if (existingEmailUser) {
@@ -978,11 +1187,15 @@ export async function createSocialUser(
           // omits a name, align the editable display name with the already-generated
           // public handle suggestion instead.
           displayName: providerDisplayName ?? suggestedHandle,
+          // The provider's photo when it could be stored. Social sign-up joins
+          // no server yet, so no built one (newAccountAvatarUrlFor).
           avatarUrl: materializedAvatarUrl,
           passwordHash,
           emailVerified: true,
           profileSetupCompletedAt: options.deferProfileSetup ? null : currentDate(),
           profileSetupSuggestedHandle: options.deferProfileSetup ? suggestedHandle : null,
+          // Signed up on a page without the usage-data clause: not told, not on.
+          ...(accepted.sawUsageDataNotice ? {} : { shareUsageData: false }),
         }).returning();
 
         await transaction.insert(userAuthIdentities).values({
@@ -992,7 +1205,7 @@ export async function createSocialUser(
           providerEmail: normalizedEmail,
         });
 
-        await legalAcceptanceService.insertUserLegalAcceptance(transaction, newUser.id, legalSource, legalMetadata);
+        await legalAcceptanceService.insertUserLegalAcceptance(transaction, newUser.id, legalSource, legalMetadata, accepted);
         return toPublicUser({ ...newUser, profileSetupProvider: profile.provider });
       });
 
@@ -1011,28 +1224,73 @@ export async function createSocialUser(
   throw new Error("Social sign-in conflicted with another concurrent account change. Please try again.");
 }
 
+/**
+ * The account a first SSO sign-in creates (rfcs/083-server-sso.md §5.3), in
+ * the caller's transaction (services/sso/ssoSignIn.ts links the identity and
+ * issues the session in the same one). As for a social sign-up: the IdP
+ * proved the email (on a domain the Server verified), there is no password
+ * credential, and profile setup is deferred. A unique violation (someone took
+ * the email or handle meanwhile) propagates for the caller to retry.
+ */
+export async function createSsoUserInTransaction(
+  tx: DatabaseExecutor,
+  input: {
+    email: string;
+    displayName: string | null;
+    legalAcceptance: legalAcceptanceService.LegalAcceptanceInput;
+    legalMetadata?: legalAcceptanceService.LegalAcceptanceMetadata;
+    /** The SSO connection's server, which the account joins: decides its avatar. */
+    joiningServerId: string;
+  },
+): Promise<{ id: string; email: string }> {
+  const normalizedEmail = normalizeEmail(input.email);
+  const accepted = legalAcceptanceService.requireCurrentLegalAcceptance(input.legalAcceptance);
+  assertRegistrationEnabled();
+  const displayName = input.displayName?.trim() || null;
+  const suggestedHandle = await generateAvailableUserName(displayName || normalizedEmail.split("@")[0] || "user", tx);
+  const [created] = await tx.insert(users).values({
+    email: normalizedEmail,
+    name: createPendingHandle(),
+    displayName: displayName ?? suggestedHandle,
+    avatarUrl: await newAccountAvatarUrlFor(input.joiningServerId, tx),
+    passwordHash: await argon2.hash(randomBytes(32).toString("hex")),
+    emailVerified: true,
+    profileSetupCompletedAt: null,
+    profileSetupSuggestedHandle: suggestedHandle,
+    ...(accepted.sawUsageDataNotice ? {} : { shareUsageData: false }),
+  }).returning({ id: users.id, email: users.email });
+  await legalAcceptanceService.insertUserLegalAcceptance(tx, created!.id, "oauth", input.legalMetadata ?? {}, accepted);
+  return created!;
+}
+
 // ── Email Verification ──
 
-export async function verifyEmail(token: string): Promise<boolean> {
+/**
+ * Verifies the address the token was sent for: the user, and whether this call is what verified it
+ * (false when it already was, e.g. by a password reset or a concurrent use of the same link); null for
+ * an unknown or expired token.
+ */
+export async function verifyEmailToken(token: string): Promise<{ userId: string; newlyVerified: boolean } | null> {
   const db = getDb();
   const tokenHash = hashToken(token);
 
   const [record] = await db.select().from(emailVerifications)
     .where(eq(emailVerifications.tokenHash, tokenHash));
 
-  if (!record) return false;
+  if (!record) return null;
   // email_verifications.user_id is nullable in the schema (a column kept from the
   // reverted OTP feature). A password-flow verification row always has a user_id;
   // a row without one cannot verify a user, so treat it as invalid.
-  if (!record.userId) return false;
+  if (!record.userId) return null;
   if (new Date(record.expiresAt) < new Date()) {
     await db.delete(emailVerifications).where(eq(emailVerifications.id, record.id));
-    return false;
+    return null;
   }
 
   // Mark user verified + delete token
-  await db.update(users).set({ emailVerified: true, updatedAt: new Date() })
-    .where(eq(users.id, record.userId));
+  const newlyVerified = (await db.update(users).set({ emailVerified: true, updatedAt: new Date() })
+    .where(and(eq(users.id, record.userId), eq(users.emailVerified, false)))
+    .returning({ id: users.id })).length > 0;
   await db.delete(emailVerifications).where(eq(emailVerifications.userId, record.userId));
 
   const verifiedUser = await getPublicUserByIdTx(db, record.userId);
@@ -1040,10 +1298,11 @@ export async function verifyEmail(token: string): Promise<boolean> {
     await enqueueOnboardingEmailJourneyFailOpen(verifiedUser);
   }
 
-  return true;
+  return { userId: record.userId, newlyVerified };
 }
 
-export async function resendVerificationEmail(userId: string): Promise<void> {
+/** `returnTo`: where the new link lands after verifying, as at sign-up (sanitized by the email). */
+export async function resendVerificationEmail(userId: string, returnTo?: string): Promise<void> {
   const db = getDb();
 
   const user = await getUser(userId);
@@ -1074,8 +1333,10 @@ export async function resendVerificationEmail(userId: string): Promise<void> {
     }
   }
 
-  // Delete old tokens and create new one
-  await db.delete(emailVerifications).where(eq(emailVerifications.userId, userId));
+  // Expire the older links instead of deleting their rows: the hourly limit above counts these rows,
+  // so deleting them reset the count on every resend and only the 60-second cooldown ever applied.
+  await db.update(emailVerifications).set({ expiresAt: new Date(0) })
+    .where(eq(emailVerifications.userId, userId));
 
   const token = randomBytes(32).toString("hex");
   await db.insert(emailVerifications).values({
@@ -1088,12 +1349,15 @@ export async function resendVerificationEmail(userId: string): Promise<void> {
     user.email,
     user.profileSetupCompletedAt ? user.name : "there",
     token,
+    returnTo,
   );
 }
 
 export async function completeProfile(
   userId: string,
   input: { name: string; displayName: string },
+  /** Called once the setup committed, only by the request that completed it (not a same-payload replay). */
+  onCompleted?: () => void,
 ): Promise<PublicUser> {
   const db = getDb();
   const name = input.name.trim();
@@ -1117,6 +1381,7 @@ export async function completeProfile(
   }
 
   let completed: PublicUser;
+  let completedNow = false;
   try {
     completed = await db.transaction(async (transaction) => {
       const [updated] = await transaction
@@ -1132,6 +1397,7 @@ export async function completeProfile(
         .returning();
 
       if (updated) {
+        completedNow = true;
         return toPublicUser({
           ...updated,
           profileSetupProvider: await getProfileSetupProvider(transaction, userId),
@@ -1157,6 +1423,7 @@ export async function completeProfile(
     throw err;
   }
 
+  if (completedNow) onCompleted?.();
   // Both the newsletter upsert and onboarding-journey insert are idempotent.
   // Re-run them on same-payload replay so a post-commit transient can recover.
   await runCompletedProfileSideEffects(completed);
@@ -1185,8 +1452,9 @@ export async function requestPasswordReset(email: string): Promise<void> {
 
   if (recentTokens.length >= 5) return; // Silently fail, don't reveal rate limit
 
-  // Delete old tokens and create new one
-  await db.delete(passwordResets).where(eq(passwordResets.userId, user.id));
+  // Expire the older links instead of deleting their rows, so the hourly limit above can count them.
+  await db.update(passwordResets).set({ expiresAt: new Date(0) })
+    .where(eq(passwordResets.userId, user.id));
 
   const token = randomBytes(32).toString("hex");
   await db.insert(passwordResets).values({
@@ -1213,39 +1481,97 @@ export async function resetPassword(token: string, newPassword: string): Promise
 
   const passwordHash = await argon2.hash(newPassword);
   const result = await db.transaction(async (tx) => {
-    const [user] = await tx.select({ retiredAt: users.retiredAt }).from(users)
+    const [user] = await tx.select({ retiredAt: users.retiredAt, emailVerified: users.emailVerified }).from(users)
       .where(eq(users.id, record.userId)).for("update");
     if (!user || user.retiredAt) return { success: false };
     const [consumed] = await tx.delete(passwordResets).where(and(
       eq(passwordResets.id, record.id), gt(passwordResets.expiresAt, currentDate()),
     )).returning({ userId: passwordResets.userId });
     if (!consumed) return { success: false };
+    // The reset link proves the mailbox. Sign-in providers linked before
+    // anyone had proved it may belong to whoever registered the address,
+    // so they go, and the email counts as verified from now on.
+    if (!user.emailVerified) {
+      await tx.delete(userAuthIdentities).where(eq(userAuthIdentities.userId, record.userId));
+      // Second factors set up before the mailbox was proved go too, for the
+      // same reason: a passkey is a sign-in by itself, and someone else's
+      // authenticator app would lock the owner out (#raft-architecture:102593c2).
+      await tx.delete(userTotp).where(eq(userTotp.userId, record.userId));
+      await tx.delete(userBackupCodes).where(eq(userBackupCodes.userId, record.userId));
+      await tx.update(webauthnCredentials).set({ revokedAt: currentDate() })
+        .where(and(eq(webauthnCredentials.userId, record.userId), isNull(webauthnCredentials.revokedAt)));
+      await tx.update(users).set({ secondFactorRequiredAt: null }).where(eq(users.id, record.userId));
+    }
     await tx.update(users).set({
-      passwordHash, passwordCredentialEstablishedAt: currentDate(), updatedAt: currentDate(),
+      passwordHash, passwordCredentialEstablishedAt: currentDate(), updatedAt: currentDate(), emailVerified: true,
     }).where(eq(users.id, record.userId));
     await tx.delete(passwordResets).where(eq(passwordResets.userId, record.userId));
     await revokeAllUserSessionsInTransaction(tx, record.userId);
     return { success: true, userId: record.userId };
   });
-  if (result.success) await revokeSocketAccessAfterCredentialChange(record.userId);
+  // No session asked for a reset (an emailed link): every one is revoked, with what it issued.
+  if (result.success) await revokeAccessAfterCredentialChange(record.userId, "password_reset", null);
   return result;
 }
 
 /** The reset token is consumed and every family is revoked once the
  * transaction commits, so the caller has nothing idempotent to retry with.
  * New handshakes are rejected by the DB state; a failed fanout only leaves
- * already-open sockets on other replicas until they reconnect. */
-async function revokeSocketAccessAfterCredentialChange(userId: string): Promise<void> {
+ * already-open sockets on other replicas until they reconnect. The keys a
+ * device login's session handed out go with it (deviceSessionKeys.ts); if
+ * that fails here, hourly maintenance revokes them. Also what a finished
+ * two-step verification recovery runs after its commit
+ * (services/secondFactor/recovery.ts): the same after-commit half of a
+ * security revoke of every family. */
+export async function revokeAccessAfterCredentialChange(
+  userId: string,
+  trigger: "password_change" | "password_reset" | "second_factor_recovered",
+  /** The family of the session that changed the password: what it issued or approved is kept. */
+  exemptFamilyId: string | null,
+): Promise<void> {
   try {
     await revokeSocketAccess({ userId });
   } catch (err) {
     console.error("[userService] Socket revocation after credential change failed:", serializeErrorForLog(err));
   }
+  await revokeDeviceSessionKeysAfterSignOut(userId);
+  await revokeWhatSessionsApprovedAfterSecurityRevoke(userId, trigger, exemptFamilyId);
+}
+
+/**
+ * After a security revoke of every family of the person (a password change or
+ * reset, the account's retirement): what those sessions approved through
+ * one-time device-login grants and the keys and Computers they issued
+ * themselves, but the session that changed the password (`exemptFamilyId`),
+ * then one email (securityRevokeCascade.ts). Logged, not thrown: the revoke
+ * has committed, and hourly maintenance repairs it from state.
+ */
+async function revokeWhatSessionsApprovedAfterSecurityRevoke(userId: string, trigger: ApproverSessionRevokeTrigger, exemptFamilyId: string | null): Promise<void> {
+  try {
+    await runSecurityRevokeCascade({ userId, exemptFamilyId }, trigger);
+  } catch (err) {
+    console.error(`[userService] Revoking what the person's sessions approved or issued after ${trigger} failed:`, serializeErrorForLog(err));
+  }
+}
+
+/** After every family of the person was revoked: what their device logins' sessions handed out. Logged, not thrown: maintenance retries. */
+async function revokeDeviceSessionKeysAfterSignOut(userId: string): Promise<void> {
+  try {
+    await revokeKeysOfRevokedDeviceSessions({ userId });
+  } catch (err) {
+    console.error("[userService] Device session key revocation after sign-out failed:", serializeErrorForLog(err));
+  }
 }
 
 // ── Password Change (authenticated) ──
 
-export async function changePassword(userId: string, currentPassword: string, newPassword: string): Promise<void> {
+/**
+ * `requestingFamilyId`: the web (full) session family that asked, having given
+ * the current password. It is signed out like the others, but what it issued
+ * or approved keeps working (securityRevokeCascade.ts); null for a legacy
+ * token with no family.
+ */
+export async function changePassword(userId: string, currentPassword: string, newPassword: string, requestingFamilyId: string | null = null): Promise<void> {
   const db = getDb();
 
   const [user] = await db.select({ passwordHash: users.passwordHash })
@@ -1265,9 +1591,9 @@ export async function changePassword(userId: string, currentPassword: string, ne
       passwordHash, passwordCredentialEstablishedAt: currentDate(), updatedAt: currentDate(),
     }).where(eq(users.id, userId));
     await tx.delete(passwordResets).where(eq(passwordResets.userId, userId));
-    await revokeAllUserSessionsInTransaction(tx, userId);
+    await revokeAllUserSessionsInTransaction(tx, userId, { passwordChangedBy: requestingFamilyId });
   });
-  await revokeSocketAccessAfterCredentialChange(userId);
+  await revokeAccessAfterCredentialChange(userId, "password_change", requestingFamilyId);
 }
 
 /** users.trace_user_id, the only user identifier written to traces. */

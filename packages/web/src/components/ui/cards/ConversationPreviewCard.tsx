@@ -15,7 +15,6 @@ type ConversationAuthor =
       kind: "user";
       name: string;
       avatarUrl?: string | null;
-      gravatarHash?: string | null;
       subtitle?: string | null;
     };
 
@@ -38,18 +37,9 @@ export interface ConversationPreviewCardProps {
   action?: ReactNode;
   emphasized?: boolean;
   /**
-   * One-shot focus highlight (e.g. after opening a permalink or dblclicking
-   * the Inbox sidebar entry). Keep this visually aligned with message
-   * permalink focus so "jumped here" reads the same across list surfaces.
-   * Owners are responsible for clearing this state after the user has had
-   * time to notice it.
-   */
-  focused?: boolean;
-  /**
    * Sticky "this row is the currently-open conversation" highlight — keep it
    * set while the matching detail/thread panel is open so users can see at a
-   * glance which list entry corresponds to the panel on the right. Distinct
-   * from `focused`, which is a transient flash.
+   * glance which list entry corresponds to the panel on the right.
    */
   active?: boolean;
   onClick?: (e: MouseEvent) => void;
@@ -76,7 +66,6 @@ const ConversationPreviewCard = forwardRef<HTMLButtonElement, ConversationPrevie
   footer,
   action,
   emphasized = false,
-  focused = false,
   active = false,
   onClick,
   onContextMenu,
@@ -86,15 +75,14 @@ const ConversationPreviewCard = forwardRef<HTMLButtonElement, ConversationPrevie
   const interactive = Boolean(onClick || onContextMenu);
   // Raft Design System › Inbox / ListRow: a preview is content — the card
   // surface with a hairline and the container radius, never an ink line or a
-  // lift. Hover/press lay the pressed wash over it. The row that is open next
-  // to the list (`active`) and the row you just jumped to (`focused`) are the
-  // same cyan-soft "this one" highlight.
-  const highlighted = focused || active;
+  // lift. Hover lays the row-hover wash over it, press the pressed one. The row that is open next
+  // to the list (`active`) is the cyan-soft "this one" highlight.
+  const highlighted = active;
   const className = `relative flex w-full items-start gap-3 rounded-container border border-line-hairline p-3 text-left transition-colors ${
     highlighted ? "bg-info-soft" : "bg-layer-card"
   } ${
     interactive
-      ? `outline-none focus-visible:shadow-focus ${highlighted ? "" : "hover:press-overlay active:press-overlay"}`
+      ? `outline-none focus-visible:shadow-focus ${highlighted ? "" : "hover:overlay-subtle active:overlay-medium"}`
       : "cursor-default"
   }`;
   const content = (
@@ -107,7 +95,7 @@ const ConversationPreviewCard = forwardRef<HTMLButtonElement, ConversationPrevie
               {author.kind === "agent" ? (
                 <AvatarSlot context="preview-mini" type="agent" agentAvatarUrl={author.avatarUrl ?? null} />
               ) : (
-                <AvatarSlot context="preview-mini" type="human" humanAvatarUrl={author.avatarUrl ?? null} gravatarHash={author.gravatarHash ?? null} />
+                <AvatarSlot context="preview-mini" type="human" humanAvatarUrl={author.avatarUrl ?? null} />
               )}
               <span className="min-w-0 truncate">{author.name}</span>
               {author.subtitle ? (
@@ -139,9 +127,8 @@ const ConversationPreviewCard = forwardRef<HTMLButtonElement, ConversationPrevie
       <div
         aria-label={ariaLabel}
         data-testid={testId}
-        data-focused={focused ? "true" : undefined}
         data-active={active ? "true" : undefined}
-        aria-current={focused || active ? "true" : undefined}
+        aria-current={active ? "true" : undefined}
         className={className}
       >
         {content}
@@ -160,9 +147,8 @@ const ConversationPreviewCard = forwardRef<HTMLButtonElement, ConversationPrevie
       onDragStart={onDragStart}
       aria-label={ariaLabel}
       data-testid={testId}
-      data-focused={focused ? "true" : undefined}
       data-active={active ? "true" : undefined}
-      aria-current={focused || active ? "true" : undefined}
+      aria-current={active ? "true" : undefined}
       className={className}
     >
       {content}

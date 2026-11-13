@@ -12,6 +12,7 @@ import {
   readManagedMachineIdentities,
 } from "./machineServiceAttestation";
 import { listManagedServerIds } from "./serverState";
+import { pendingRestartRequestIdForServer, readPendingRestartMarker } from "./restartMarker";
 
 interface ReplacementSpawnOptions {
   parentMutationLockHeld?: boolean;
@@ -275,6 +276,65 @@ export async function requestServiceRestartViaIpc(
   }
 }
 
+/**
+ * The restart request lost its connection without a response. On Windows this
+ * is the normal handoff: the incumbent must close every IPC connection before
+ * its replacement can bind the named pipe (task #924). Elsewhere it means the
+ * service went away mid-request. Either way the request has not failed yet.
+ */
+export function isServiceConnectionLoss(error: unknown): boolean {
+  if (!(error instanceof ServiceClientError)) return false;
+  if (error.code === "IPC_CLIENT_CLOSED") return true;
+  const cause = error.cause as NodeJS.ErrnoException | undefined;
+  return error.code === "IPC_MALFORMED_FRAME" &&
+    (cause?.code === "ECONNRESET" || cause?.code === "EPIPE");
+}
+
+export interface RestartOutcomeWaitDeps {
+  readPendingRestartMarkerFn?: typeof readPendingRestartMarker;
+  now?: () => number;
+  sleep?: (ms: number) => Promise<void>;
+  timeoutMs?: number;
+}
+
+/**
+ * Settle a restart whose request connection was closed. A successful takeover
+ * terminates the incumbent and this runner with it, and the replacement's
+ * runner reports success from the pending-restart marker. A failed takeover
+ * keeps the incumbent running and clears the marker, so a marker that no
+ * longer carries this request while we are still alive is the failure. So is
+ * a service that died before writing it. The runner skips its own reconcile
+ * while waiting, so it cannot retire the marker itself.
+ */
+export async function awaitRestartOutcomeAfterConnectionLoss(
+  slockHome: string,
+  serverId: string,
+  requestId: string,
+  deps: RestartOutcomeWaitDeps = {},
+): Promise<void> {
+  const readMarker = deps.readPendingRestartMarkerFn ?? readPendingRestartMarker;
+  const now = deps.now ?? currentTimeMs;
+  const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => {
+    setClockTimeout(resolve, ms);
+  }));
+  const deadline = now() + (deps.timeoutMs ?? 60_000);
+  do {
+    const marker = await readMarker(slockHome);
+    if (!marker || pendingRestartRequestIdForServer(marker, serverId) !== requestId) {
+      throw new ServiceClientError(
+        "SELF_RELAUNCH_UNAVAILABLE",
+        "SELF_RELAUNCH_UNAVAILABLE: the restart did not complete; check `raft-computer status` and `raft-computer logs --service`",
+      );
+    }
+    if (now() >= deadline) break;
+    await sleep(Math.min(250, Math.max(1, deadline - now())));
+  } while (true);
+  throw new ServiceClientError(
+    "SELF_RELAUNCH_UNAVAILABLE",
+    "SELF_RELAUNCH_UNAVAILABLE: restart handoff did not finish",
+  );
+}
+
 export interface ManagedUpgradeRelayDeps {
   connectServiceFn?: typeof connectService;
 }
@@ -282,7 +342,7 @@ export interface ManagedUpgradeRelayDeps {
 /** Remote upgrade v2 (task #873): ask the supervisor to launch the installer and return. */
 export async function requestServiceUpgradeStartViaIpc(
   slockHome: string,
-  params: { requestId: string; originServerId: string; targetVersion?: string },
+  params: { requestId: string; originServerId: string; targetVersion?: string; drain?: { deadlineMs: number } },
   deps: ManagedUpgradeRelayDeps = {},
 ): Promise<void> {
   const client = await (deps.connectServiceFn ?? connectService)(slockHome);
@@ -293,6 +353,7 @@ export async function requestServiceUpgradeStartViaIpc(
       originServerId: params.originServerId,
       trigger: "web",
       ...(params.targetVersion ? { targetVersion: params.targetVersion } : {}),
+      ...(params.drain ? { drain: params.drain } : {}),
     });
     if (result.status === "already-running" && result.upgradeId !== params.requestId) {
       throw new Error(`UPGRADE_ALREADY_RUNNING: upgrade ${result.upgradeId} is already running`);

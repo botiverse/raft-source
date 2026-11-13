@@ -22,6 +22,7 @@ import {
   reduceApmStalledRecoveryTermination,
   reduceApmStartupTimeoutTermination,
 } from "./apmStateMachine";
+import { STALLED_WITH_WORK_THRESHOLDS } from "./stalledWithWork";
 import { classifyDaemonConnectionTraceEvent } from "./connection";
 import { classifyCodexResumeError, type CodexResumeErrorClassification } from "./drivers/codex";
 
@@ -119,8 +120,11 @@ test("APM contract matrix: stale direct-stdin tool output enters stalled recover
     hasDirectStdinRecoveryEvidence: false,
     runtimeProgressIsStale: true,
     staleForMs: row.fakeClock.nowMs - row.fakeClock.lastRuntimeProgressAtMs,
-    staleThresholdMs: row.fakeClock.staleThresholdMs,
-  });
+    turnInProgress: true,
+    deliveryHold: null,
+    openToolHoldsNoLiveWork: false,
+    processAlive: undefined,
+  }, { ...STALLED_WITH_WORK_THRESHOLDS, stallMs: row.fakeClock.staleThresholdMs });
 
   assert.equal(reduction.shouldTerminate, row.expectation.shouldTerminate);
   assert.equal(reduction.blockedReason, row.expectation.stalledRecoveryBlockReason);
@@ -167,8 +171,11 @@ test("APM contract matrix: stale direct-stdin tool output enters stalled recover
     hasDirectStdinRecoveryEvidence: false,
     runtimeProgressIsStale: true,
     staleForMs: row.fakeClock.nowMs - row.fakeClock.lastRuntimeProgressAtMs,
-    staleThresholdMs: row.fakeClock.staleThresholdMs,
-  });
+    turnInProgress: true,
+    deliveryHold: null,
+    openToolHoldsNoLiveWork: false,
+    processAlive: undefined,
+  }, { ...STALLED_WITH_WORK_THRESHOLDS, stallMs: row.fakeClock.staleThresholdMs });
   assert.equal(repeated.alreadyRecovering, true);
   assert.equal(repeated.shouldTerminate, false);
 });
@@ -322,8 +329,11 @@ test("APM contract matrix: recent progress blocks stalled recovery", () => {
     hasDirectStdinRecoveryEvidence: false,
     runtimeProgressIsStale: false,
     staleForMs: row.fakeClock.nowMs - row.fakeClock.lastRuntimeProgressAtMs,
-    staleThresholdMs: row.fakeClock.staleThresholdMs,
-  });
+    turnInProgress: true,
+    deliveryHold: null,
+    openToolHoldsNoLiveWork: false,
+    processAlive: undefined,
+  }, { ...STALLED_WITH_WORK_THRESHOLDS, stallMs: row.fakeClock.staleThresholdMs });
 
   assert.equal(reduction.shouldTerminate, row.expectation.shouldTerminate);
   assert.equal(reduction.blockedReason, row.expectation.stalledRecoveryBlockReason);
@@ -351,8 +361,11 @@ test("APM contract matrix: active tool without recovery evidence blocks direct-s
     hasDirectStdinRecoveryEvidence: false,
     runtimeProgressIsStale: true,
     staleForMs: row.fakeClock.nowMs - row.fakeClock.lastRuntimeProgressAtMs,
-    staleThresholdMs: row.fakeClock.staleThresholdMs,
-  });
+    turnInProgress: true,
+    deliveryHold: null,
+    openToolHoldsNoLiveWork: false,
+    processAlive: undefined,
+  }, { ...STALLED_WITH_WORK_THRESHOLDS, stallMs: row.fakeClock.staleThresholdMs });
 
   assert.equal(reduction.shouldTerminate, row.expectation.shouldTerminate);
   assert.equal(reduction.blockedReason, row.expectation.stalledRecoveryBlockReason);

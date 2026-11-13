@@ -17,17 +17,19 @@ import {
   servers,
   users,
 } from "../db/schema";
-import { signAccessToken } from "../middleware/auth";
+import { accessTokenForTest } from "../test/integration/credentials";
 import { createAgent } from "../services/agentService";
 import {
   addHuman,
   createChannel,
+  findOrCreateDM,
+  findOrCreateUserDM,
   isChannelAgent,
   isChannelHuman,
 } from "../services/channelService";
 import { addMember, createServer } from "../services/serverService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 async function seedUser(name: string) {
   const [user] = await getDb().insert(users).values({
@@ -41,10 +43,10 @@ async function seedUser(name: string) {
   return user;
 }
 
-function headers(userId: string, serverId: string) {
+async function headers(userId: string, serverId: string) {
   return {
     "Content-Type": "application/json",
-    Authorization: `Bearer ${signAccessToken(userId)}`,
+    Authorization: `Bearer ${await accessTokenForTest(userId)}`,
     "X-Server-Id": serverId,
   };
 }
@@ -64,7 +66,7 @@ test("POST /api/channels/:id/members/batch atomically adds mixed members and is 
 
   const response = await fetch(`${app.baseUrl}/api/channels/${channel.id}/members/batch`, {
     method: "POST",
-    headers: headers(owner.id, server.id),
+    headers: await headers(owner.id, server.id),
     body: JSON.stringify({
       userIds: [humanA.id, humanB.id, humanA.id],
       agentIds: [agentA.id, agentB.id, agentA.id],
@@ -100,7 +102,7 @@ test("POST /api/channels/:id/members/batch atomically adds mixed members and is 
 
   const retry = await fetch(`${app.baseUrl}/api/channels/${channel.id}/members/batch`, {
     method: "POST",
-    headers: headers(owner.id, server.id),
+    headers: await headers(owner.id, server.id),
     body: JSON.stringify({
       userIds: [humanA.id, humanB.id],
       agentIds: [agentA.id, agentB.id],
@@ -132,7 +134,7 @@ test("POST /api/channels/:id/members/batch validates the whole batch before writ
 
   const response = await fetch(`${app.baseUrl}/api/channels/${channel.id}/members/batch`, {
     method: "POST",
-    headers: headers(owner.id, server.id),
+    headers: await headers(owner.id, server.id),
     body: JSON.stringify({ userIds: [validHuman.id, missingUserId], agentIds: [] }),
   });
   assert.equal(response.status, 400);
@@ -180,7 +182,7 @@ test("POST /api/channels/:id/members/batch rolls back earlier members when a lat
 
     const response = await fetch(`${app.baseUrl}/api/channels/${channel.id}/members/batch`, {
       method: "POST",
-      headers: headers(owner.id, server.id),
+      headers: await headers(owner.id, server.id),
       body: JSON.stringify({ userIds: [humanA.id, humanB.id], agentIds: [] }),
     });
     assert.equal(response.status, 500);
@@ -195,4 +197,82 @@ test("POST /api/channels/:id/members/batch rolls back earlier members when a lat
     __resetFailpointsForTests();
     await app.close();
   }
+});
+
+test("a DM has two fixed parties: its participants cannot add anyone, others still get 404", async ({ app }) => {
+  const owner = await seedUser("dm-fixed-owner");
+  const alice = await seedUser("dm-fixed-alice");
+  const bob = await seedUser("dm-fixed-bob");
+  const carol = await seedUser("dm-fixed-carol");
+  const server = await createServer("DM Fixed Parties", "dm-fixed-parties", owner.id);
+  await getDb().update(servers).set({ plan: "founder" }).where(eq(servers.id, server.id));
+  for (const user of [alice, bob, carol]) await addMember(server.id, user.id);
+  const agent = await createAgent(server.id, "dm-fixed-agent", { runtime: "codex" });
+  const otherAgent = await createAgent(server.id, "dm-fixed-other-agent", { runtime: "codex" });
+  const humanDm = await findOrCreateUserDM(server.id, alice.id, bob.id);
+  const agentDm = await findOrCreateDM(server.id, alice.id, agent.id);
+  assert.ok(humanDm && agentDm, "DM creation still adds its two parties");
+  assert.equal(await isChannelHuman(humanDm.id, bob.id), true);
+  assert.equal(await isChannelAgent(agentDm.id, agent.id), true);
+
+  const refusal = { error: "You do not have permission to add channel members" };
+  const attempts: Array<{ channelId: string; path: string; body: object }> = [];
+  for (const dm of [humanDm, agentDm]) {
+    attempts.push(
+      { channelId: dm.id, path: "members", body: { userId: carol.id } },
+      { channelId: dm.id, path: "members", body: { agentId: otherAgent.id } },
+      { channelId: dm.id, path: "members/batch", body: { userIds: [carol.id], agentIds: [] } },
+      { channelId: dm.id, path: "members/batch", body: { userIds: [], agentIds: [otherAgent.id] } },
+    );
+  }
+  for (const attempt of attempts) {
+    const label = `${attempt.path} ${JSON.stringify(attempt.body)}`;
+    const res = await fetch(`${app.baseUrl}/api/channels/${attempt.channelId}/${attempt.path}`, {
+      method: "POST",
+      headers: await headers(alice.id, server.id),
+      body: JSON.stringify(attempt.body),
+    });
+    assert.equal(res.status, 403, label);
+    assert.deepEqual(await res.json(), refusal, label);
+    // Not a participant either: the same 404 as an id that does not exist.
+    for (const outsider of [carol, owner]) {
+      const outsiderRes = await fetch(`${app.baseUrl}/api/channels/${attempt.channelId}/${attempt.path}`, {
+        method: "POST",
+        headers: await headers(outsider.id, server.id),
+        body: JSON.stringify(attempt.body),
+      });
+      assert.equal(outsiderRes.status, 404, `${outsider.name} ${label}`);
+      assert.deepEqual(await outsiderRes.json(), { error: "Channel not found" }, `${outsider.name} ${label}`);
+    }
+  }
+
+  for (const dm of [humanDm, agentDm]) {
+    assert.equal(await isChannelHuman(dm.id, carol.id), false);
+    assert.equal(await isChannelAgent(dm.id, otherAgent.id), false);
+    const read = await fetch(`${app.baseUrl}/api/channels/${dm.id}`, { headers: await headers(carol.id, server.id) });
+    assert.equal(read.status, 404, "the refused target cannot read the DM");
+    const notices = await getDb().select({ id: messages.id })
+      .from(messages)
+      .where(and(eq(messages.channelId, dm.id), eq(messages.messageType, "system")));
+    assert.equal(notices.length, 0, "a refused add leaves no membership notice");
+  }
+
+  // An ordinary channel still takes the same adds from the same person.
+  const channel = await createChannel(server.id, "dm-fixed-control");
+  await addHuman(channel.id, alice.id);
+  const single = await fetch(`${app.baseUrl}/api/channels/${channel.id}/members`, {
+    method: "POST",
+    headers: await headers(alice.id, server.id),
+    body: JSON.stringify({ userId: carol.id }),
+  });
+  assert.equal(single.status, 200);
+  const batch = await fetch(`${app.baseUrl}/api/channels/${channel.id}/members/batch`, {
+    method: "POST",
+    headers: await headers(alice.id, server.id),
+    body: JSON.stringify({ userIds: [bob.id], agentIds: [otherAgent.id] }),
+  });
+  assert.equal(batch.status, 200);
+  assert.equal(await isChannelHuman(channel.id, carol.id), true);
+  assert.equal(await isChannelHuman(channel.id, bob.id), true);
+  assert.equal(await isChannelAgent(channel.id, otherAgent.id), true);
 });

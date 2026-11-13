@@ -1,4 +1,8 @@
-import { fixturePasswordHash, tokenForHuman } from "../test/integration/credentials";
+import { handlerTraceEvents } from "../test/handlerTraceEvents";
+import { fillJointMembersFromChannelHumans } from "../test/jointMemberFill";
+import { accessTokenForTest, fixturePasswordHash, tokenForHuman } from "../test/integration/credentials";
+import { traceIdentityHash } from "../tracing/traceIdentity";
+import { insertAttachmentsWithObjects } from "../test/attachmentObjectFixture";
 import { createApiTest } from "../test/integration/apiTest";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
@@ -15,8 +19,9 @@ import {
   type FailpointRegistry,
 } from "@botiverse/raft-shared";
 import { executeSearchSql as executeSearchSqlFromDb, getDb, SearchQueryAbortedError } from "../db/index";
-import { agentActivityEvents, attachmentObjectCharges, attachmentObjects, attachments, channelAgents, channelHumans, channels, featureFlagRules, featureFlags, inboxNotificationFacts, jointChannels, jointChannelServers, messageMentions, messageReactions, messages, serverMembers, servers as serversTable, tasks, threadFollows, users } from "../db/schema";
-import { assignMachine, createAgent } from "../services/agentService";
+import { agentActivityEvents, attachmentObjectCharges, channelConversionJobs, attachmentObjectHolds, attachmentObjects, attachments, channelAgents, channelHumans, channels, featureFlagRules, featureFlags, inboxNotificationFacts, jointChannels, jointChannelServers, messageMentions, messageReactions, messages, serverMembers, servers as serversTable, tasks, threadFollows, users } from "../db/schema";
+import { createAgent } from "../services/agentService";
+import { placeAgentOnMachine } from "../test/agentMachineFixture";
 import { mintAgentCredential } from "../services/agentCredentialService";
 import { AgentOrchestrator } from "../services/agentOrchestrator";
 import { addAgent, addHuman, archiveChannel, createChannel, findOrCreateDM, findOrCreateUserDM, getActiveJointThreadProjectionsByCanonicalThread, getActiveJointThreadProjectionsByCanonicalThreadsForServer, getOrCreateThread, getOrCreateThreadForChannel, getThreadSummaries, removeHuman } from "../services/channelService";
@@ -29,6 +34,7 @@ import {
   listMessagesWithCoverage,
   projectJointMessagesToLocalChannel,
   syncMessages,
+  getHiddenHistoryPreview,
 } from "../services/messageService";
 import {
   __resetOrdinaryMessageOutboundAuthorizationResolverForTests,
@@ -45,15 +51,13 @@ import {
   MESSAGE_SEARCH_RECENT_COLLECT_FIRST_TEXT_MATCH_LIMIT,
 } from "../services/searchService";
 import { openTestApp } from "../test/integration/app";
-import { COMPOSER_RESOURCE_REFERENCES_FEATURE_FLAG_KEY } from "../services/featureFlagService";
-import { signAccessToken } from "../middleware/auth";
 import {
   __setWebHttpClientTraceSinkForTest,
   startWebHttpClientSpan,
 } from "../../../web/src/utils/webHttpClientTrace";
 import { withChannelDelivery } from "../test/orchestratorStub";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 async function seedUser(email: string, name: string) {
   const db = getDb();
@@ -75,17 +79,6 @@ function authHeaders(token: string, serverId: string) {
     Authorization: `Bearer ${token}`,
     "X-Server-Id": serverId,
   };
-}
-
-async function enableComposerResourceReferences(serverId: string): Promise<void> {
-  await getDb().insert(featureFlagRules).values({
-    id: randomUUID(),
-    flagKey: COMPOSER_RESOURCE_REFERENCES_FEATURE_FLAG_KEY,
-    stage: "server",
-    priority: 0,
-    decision: "allow",
-    values: [serverId],
-  });
 }
 
 type EmittedEvent = { room: string; event: string; payload: any };
@@ -292,7 +285,7 @@ test("GET /messages/channel/:channelId records page-load phases and constant que
   const userMessage = await createMessage(channel.id, "user", owner.id, "user message");
   await createMessage(channel.id, "agent", agent.id, "agent message");
   await createMessage(channel.id, "user", "system", "system message", "system");
-  await db.insert(attachments).values({
+  await insertAttachmentsWithObjects(db, {
     messageId: userMessage.id,
     channelId: channel.id,
     uploaderId: owner.id,
@@ -360,11 +353,11 @@ test("GET /messages/channel/:channelId records page-load phases and constant que
   assert.equal(span.attrs?.agent_id_present, true);
   assert.equal(Object.values(span.attrs ?? {}).includes(agent.id), false);
 
-  const processEventNames = span.events
+  const processEventNames = handlerTraceEvents(span.events)
     .map((event) => event.name)
     .filter((name) => name !== "db.query.finished");
 
-  const dbEvents = span.events.filter((event) => event.name === "db.query.finished");
+  const dbEvents = handlerTraceEvents(span.events).filter((event) => event.name === "db.query.finished");
   const dbQueryNames = dbEvents.map((event) => event.attrs?.query_name).sort();
   assert.deepEqual(
     {
@@ -387,7 +380,6 @@ test("GET /messages/channel/:channelId records page-load phases and constant que
       dbQueryNames: [
         "channel_threads.list_by_channel",
         "messages.attachment_comment_counts",
-        "messages.attachment_comment_gate",
         "messages.attachment_comment_refs",
         "messages.attachments_by_messages",
         "messages.channel.loaded_page",
@@ -402,13 +394,14 @@ test("GET /messages/channel/:channelId records page-load phases and constant que
         "messages.senders.server_membership_departures",
         "messages.senders.user_profiles",
       ],
-      dbQueryCount: 16,
+      dbQueryCount: 15,
     },
   );
   // +2: page-scoped thread summary and provider-neutral external reactions — still constant.
   // -1: the coverage bounds ride the page statement.
   // +1: Slack-side mention facts (external_mention_facts, one batched lookup by message id).
-  assert.ok(dbEvents.length <= 16, "message page query count should stay constant for mixed senders/attachments/reactions");
+  // -1: the retired attachment-comment flag no longer needs its channel→server gate query.
+  assert.ok(dbEvents.length <= 15, "message page query count should stay constant for mixed senders/attachments/reactions");
 
   const dbEventByQuery = new Map(dbEvents.map((event) => [event.attrs?.query_name, event]));
   assert.equal(dbEventByQuery.get("messages.channel.loaded_page")?.attrs?.phase, "messages.paged");
@@ -445,7 +438,7 @@ test("a channel page reads its messages in a few sequential waves, at most 3 que
   const agent = await createAgent(server.id, "messages-waves-agent", { runtime: "codex" });
   const userMessage = await createMessage(channel.id, "user", owner.id, "user message");
   await createMessage(channel.id, "agent", agent.id, "agent message");
-  await db.insert(attachments).values({
+  await insertAttachmentsWithObjects(db, {
     messageId: userMessage.id,
     channelId: channel.id,
     uploaderId: owner.id,
@@ -511,6 +504,268 @@ test("a channel page reads its messages in a few sequential waves, at most 3 que
   assert.ok(summaries.maxInFlight <= 3, `at most 3 summary statements in flight, saw ${summaries.maxInFlight}`);
   assert.ok(summaries.statements >= 6, `summaries still send every read (${summaries.statements})`);
   assert.ok(summaries.sequentialDepth <= 4, `summary depth ${summaries.sequentialDepth} for ${summaries.statements} statements`);
+});
+
+test("a Free page that reaches the start of the history window says what the cutoff hides", async ({ app }) => {
+  const db = getDb();
+  const owner = await seedUser("hidden-history-owner@slock.test", "hidden-history-owner");
+  const server = await createServer("Hidden History Server", "hidden-history-server", owner.id);
+  await db.insert(serverMembers).values({ serverId: server.id, userId: owner.id, role: "owner" }).onConflictDoNothing();
+  const agent = await createAgent(server.id, "hidden-history-agent", { runtime: "codex" });
+  const channel = await createChannel(server.id, "hidden-history-channel");
+  const systemOnly = await createChannel(server.id, "hidden-history-system-only");
+  const retractedOnly = await createChannel(server.id, "hidden-history-retracted-only");
+  // Someone who is not a member of this server (as the other side of a Joint Channel would be).
+  const outsider = await seedUser("hidden-history-outsider@slock.test", "hidden-history-outsider");
+  await db.update(users).set({ avatarUrl: "https://images.example.test/owner.png" }).where(eq(users.id, owner.id));
+  const long = `${"word ".repeat(40)}\n\n  end`;
+  const oldest = await createMessage(channel.id, "user", owner.id, "the oldest hidden message");
+  const oldFromAgent = await createMessage(channel.id, "agent", agent.id, long);
+  const oldSystem = await createMessage(channel.id, "user", owner.id, "joined", "system");
+  const oldDeleted = await createMessage(channel.id, "user", owner.id, "retracted before the cutoff");
+  const oldOutsider = await createMessage(channel.id, "user", outsider.id, "from someone outside this server");
+  const newestHidden = await createMessage(channel.id, "user", owner.id, "  line one\n line two  ");
+  const oldParent = await createMessage(channel.id, "user", owner.id, "an old thread's first message");
+  const visible = await createMessage(channel.id, "user", owner.id, "visible");
+  const parent = await createMessage(channel.id, "user", owner.id, "visible parent");
+  const thread = await getOrCreateThreadForChannel(channel.id, parent.id, owner.id, "user");
+  const oldReply = await createMessage(thread.id, "agent", agent.id, "an old reply");
+  await createMessage(thread.id, "user", owner.id, "a new reply");
+  const oldThread = await getOrCreateThreadForChannel(channel.id, oldParent.id, owner.id, "user");
+  const oldThreadReply = await createMessage(oldThread.id, "user", owner.id, "an old reply in an old thread");
+  await createMessage(oldThread.id, "agent", agent.id, "a new reply in an old thread");
+  const parentOnlyOld = await createMessage(channel.id, "user", owner.id, "an old first message with only new replies");
+  const parentOnlyThread = await getOrCreateThreadForChannel(channel.id, parentOnlyOld.id, owner.id, "user");
+  await createMessage(parentOnlyThread.id, "user", owner.id, "a new reply under an old first message");
+  const onlySystem = await createMessage(systemOnly.id, "user", owner.id, "renamed the channel", "system");
+  await createMessage(systemOnly.id, "user", owner.id, "visible after a system line");
+  const onlyRetracted = await createMessage(retractedOnly.id, "user", owner.id, "retracted long ago");
+  await createMessage(retractedOnly.id, "user", owner.id, "visible after a retracted message");
+  const hiddenIds = [oldest.id, oldFromAgent.id, oldSystem.id, oldDeleted.id, oldOutsider.id, newestHidden.id, oldReply.id, oldParent.id, oldThreadReply.id, onlySystem.id, onlyRetracted.id, parentOnlyOld.id];
+  for (const [index, id] of hiddenIds.entries()) {
+    await db.update(messages).set({ createdAt: new Date(Date.UTC(2020, 0, 1 + index)) }).where(eq(messages.id, id));
+  }
+  // The old thread's first message sits before its old reply.
+  await db.update(messages).set({ createdAt: new Date(Date.UTC(2019, 11, 1)) }).where(eq(messages.id, oldParent.id));
+  // deleted_at marks a retracted message: the timeline keeps a placeholder for it.
+  await db.update(messages).set({ deletedAt: new Date() }).where(inArray(messages.id, [oldDeleted.id, onlyRetracted.id]));
+  await db.update(serversTable).set({ plan: "free" }).where(eq(serversTable.id, server.id));
+  const token = await tokenForHuman(owner.email);
+
+  type Page = {
+    messages: Array<{ id: string }>;
+    historyLimited: boolean;
+    hiddenHistory?: {
+      hiddenCount: number;
+      hiddenCountCapped: boolean;
+      parentHidden: boolean;
+      latest: Array<{ id: string; senderType: string; senderId: string; senderName: string | null; senderAvatarUrl: string | null; senderGravatarHash: string | null; createdAt: string; preview: string | null }>;
+    };
+  };
+  const page = async (channelId: string, query = "") => {
+    const res = await fetch(`${app.baseUrl}/api/messages/channel/${channelId}${query}`, { headers: authHeaders(token, server.id) });
+    assert.equal(res.status, 200);
+    return await res.json() as Page;
+  };
+
+  // What Pro would show is counted (chat, system, a retracted message's
+  // placeholder); only chat messages with text are previewed, the newest two
+  // oldest first, on one line and at most 40 characters.
+  const full = await page(channel.id);
+  assert.deepEqual(full.messages.map((message) => message.id), [visible.id, parent.id]);
+  assert.equal(full.historyLimited, true);
+  assert.equal(full.hiddenHistory?.hiddenCount, 8);
+  assert.equal(full.hiddenHistory?.hiddenCountCapped, false);
+  assert.equal(full.hiddenHistory?.parentHidden, false);
+  assert.deepEqual(full.hiddenHistory?.latest.map(({ id }) => id), [newestHidden.id, parentOnlyOld.id]);
+  const [userPreview] = full.hiddenHistory!.latest;
+  assert.equal(userPreview.preview, "line one line two");
+  assert.equal(userPreview.createdAt, new Date(Date.UTC(2020, 0, 6)).toISOString());
+  // A person's avatar only when Raft stores it; the deprecated hash is always "".
+  assert.equal(userPreview.senderAvatarUrl, null);
+  assert.equal(userPreview.senderGravatarHash, "");
+  // A built pixel avatar is shown like a stored upload; a provider URL is not.
+  for (const [avatarUrl, shown] of [
+    ["pixel-human:v1:pink.3.bun.brown.happy.none.glasses", "pixel-human:v1:pink.3.bun.brown.happy.none.glasses"],
+    ["https://lh3.googleusercontent.com/a/provider=s96-c", null],
+  ] as const) {
+    await db.update(users).set({ avatarUrl }).where(eq(users.id, owner.id));
+    assert.equal((await page(channel.id)).hiddenHistory!.latest[0]!.senderAvatarUrl, shown, avatarUrl);
+  }
+  await db.update(users).set({ avatarUrl: null }).where(eq(users.id, owner.id));
+  const older = await page(channel.id, `?before=${visible.seq}&limit=50`);
+  assert.equal(older.hiddenHistory?.hiddenCount, 8, "a short before-page carries it too");
+
+  const agentPreviewPage = await page(retractedOnly.id);
+  assert.equal(agentPreviewPage.historyLimited, true, "a retracted placeholder is hidden history");
+  assert.equal(agentPreviewPage.hiddenHistory?.hiddenCount, 1);
+  assert.deepEqual(agentPreviewPage.hiddenHistory?.latest, [], "a placeholder is not previewed");
+
+  // A full page has not reached the start yet: nothing to say there.
+  const notAtStart = await page(channel.id, "?limit=1");
+  assert.equal(notAtStart.historyLimited, true);
+  assert.equal(notAtStart.hiddenHistory, undefined);
+
+  // A thread under a visible message: its hidden replies only.
+  const replies = await page(thread.id);
+  assert.equal(replies.historyLimited, true);
+  assert.equal(replies.hiddenHistory?.hiddenCount, 1);
+  assert.equal(replies.hiddenHistory?.parentHidden, false);
+  assert.deepEqual(replies.hiddenHistory?.latest.map((message) => [message.id, message.preview]), [[oldReply.id, "an old reply"]]);
+
+  // A thread whose first message is hidden too: it leads the preview, then the newest hidden reply.
+  const oldThreadPage = await page(oldThread.id);
+  assert.equal(oldThreadPage.hiddenHistory?.hiddenCount, 1);
+  assert.equal(oldThreadPage.hiddenHistory?.parentHidden, true);
+  assert.deepEqual(oldThreadPage.hiddenHistory?.latest.map((message) => message.id), [oldParent.id, oldThreadReply.id]);
+
+  // Only a system line is hidden: counted, nothing to preview.
+  const systemPage = await page(systemOnly.id);
+  assert.equal(systemPage.historyLimited, true);
+  assert.equal(systemPage.hiddenHistory?.hiddenCount, 1);
+  assert.deepEqual(systemPage.hiddenHistory?.latest, []);
+
+  // A thread whose replies are all recent, under a first message behind the cutoff.
+  const parentOnly = await page(parentOnlyThread.id);
+  assert.equal(parentOnly.historyLimited, true);
+  assert.equal(parentOnly.hiddenHistory?.hiddenCount, 0);
+  assert.equal(parentOnly.hiddenHistory?.parentHidden, true);
+  assert.deepEqual(parentOnly.hiddenHistory?.latest.map((message) => message.id), [parentOnlyOld.id]);
+
+  // Someone outside this server: the same empty deprecated hash.
+  const outsiderPreview = await getHiddenHistoryPreview(channel.id, new Date(Date.UTC(2020, 0, 5, 12)), { viewerServerId: server.id });
+  const outsiderRow = outsiderPreview.latest.find((message) => message.id === oldOutsider.id);
+  assert.ok(outsiderRow, "the outsider's message is among the newest hidden before 2020-01-05 12:00");
+  assert.equal(outsiderRow.senderGravatarHash, "");
+
+  // A plan with all history hides nothing.
+  await db.update(serversTable).set({ plan: "pro" }).where(eq(serversTable.id, server.id));
+  const pro = await page(channel.id);
+  assert.equal(pro.historyLimited, false);
+  assert.equal(pro.hiddenHistory, undefined);
+});
+
+test("jumping to a message behind a Free server's history window says so, for a reader who may see it", async ({ app }) => {
+  const db = getDb();
+  const owner = await seedUser("hidden-target-owner@slock.test", "hidden-target-owner");
+  const member = await seedUser("hidden-target-member@slock.test", "hidden-target-member");
+  const server = await createServer("Hidden Target Server", "hidden-target-server", owner.id);
+  await db.insert(serverMembers).values([
+    { serverId: server.id, userId: owner.id, role: "owner" },
+    { serverId: server.id, userId: member.id, role: "member" },
+  ]).onConflictDoNothing();
+  const channel = await createChannel(server.id, "hidden-target-channel");
+  await addHuman(channel.id, owner.id);
+  await addHuman(channel.id, member.id);
+  const secret = await createChannel(server.id, "hidden-target-private", undefined, "private");
+  await addHuman(secret.id, owner.id);
+  const longText = `${"long words ".repeat(20)}end`;
+  const before = await createMessage(channel.id, "user", owner.id, "the message before the target");
+  const target = await createMessage(channel.id, "user", owner.id, longText);
+  const system = await createMessage(channel.id, "user", owner.id, "joined", "system");
+  const afterOne = await createMessage(channel.id, "user", owner.id, "first after the target");
+  const afterTwo = await createMessage(channel.id, "user", owner.id, "second after the target");
+  const afterThree = await createMessage(channel.id, "user", owner.id, "third after the target");
+  const recent = await createMessage(channel.id, "user", owner.id, "inside the window");
+  const thread = await getOrCreateThreadForChannel(channel.id, target.id, owner.id, "user");
+  const oldReply = await createMessage(thread.id, "user", owner.id, "an old reply");
+  const newReply = await createMessage(thread.id, "user", owner.id, "a reply inside the window");
+  const secretOld = await createMessage(secret.id, "user", owner.id, "a private old message");
+  const old = [before, target, system, afterOne, afterTwo, afterThree, oldReply, secretOld];
+  for (const [index, message] of old.entries()) {
+    await db.update(messages).set({ createdAt: new Date(Date.UTC(2020, 0, 1 + index)) }).where(eq(messages.id, message.id));
+  }
+  // Postgres keeps microseconds; a JS Date does not. Give the target and its
+  // neighbors sub-millisecond times in the same millisecond, as now() does.
+  await db.execute(sql`UPDATE messages SET created_at = '2020-01-02 00:00:00.578123+00' WHERE id = ${target.id}::uuid`);
+  await db.execute(sql`UPDATE messages SET created_at = '2020-01-02 00:00:00.578456+00' WHERE id = ${system.id}::uuid`);
+  await db.update(serversTable).set({ plan: "free" }).where(eq(serversTable.id, server.id));
+  const ownerToken = await tokenForHuman(owner.email);
+  const memberToken = await tokenForHuman(member.email);
+  type HiddenTargetBody = {
+    error: string;
+    code?: string;
+    channelId?: string;
+    targetMessageId?: string;
+    hiddenTarget?: {
+      target: { id: string; preview: string | null; seq: number };
+      before: Array<{ id: string; preview: string | null }>;
+      after: Array<{ id: string; preview: string | null }>;
+      thread: { hiddenReplyCount: number; hiddenReplyCountCapped: boolean; parentHidden: boolean } | null;
+      replies: { count: number; latest: { id: string } | null } | null;
+    };
+  };
+  const context = async (messageId: string, channelId: string, token = ownerToken) => {
+    const res = await fetch(`${app.baseUrl}/api/messages/context/${messageId}?channelId=${channelId}`, { headers: authHeaders(token, server.id) });
+    return { status: res.status, body: await res.json() as HiddenTargetBody & { historyLimited?: boolean; hiddenHistory?: { hiddenCount: number } } };
+  };
+
+  // A hidden target: still a 404 (older clients read it as not found), with
+  // its own code, the target (80 characters), one message before it, the next
+  // two chat messages after it (40 characters, system lines skipped), and its
+  // thread, whose newest reply inside the window is a way back in.
+  const hidden = await context(target.id, channel.id);
+  assert.equal(hidden.status, 404);
+  assert.equal(hidden.body.code, "history_limited");
+  assert.equal(hidden.body.channelId, channel.id);
+  assert.equal(hidden.body.targetMessageId, target.id);
+  assert.equal(hidden.body.hiddenTarget?.target.id, target.id);
+  assert.equal(hidden.body.hiddenTarget?.target.preview?.length, 80);
+  assert.deepEqual(hidden.body.hiddenTarget?.before.map((message) => message.id), [before.id]);
+  assert.deepEqual(hidden.body.hiddenTarget?.after.map((message) => message.id), [afterOne.id, afterTwo.id]);
+  assert.equal(hidden.body.hiddenTarget?.thread, null);
+  assert.equal(hidden.body.hiddenTarget?.replies?.count, 2);
+  assert.equal(hidden.body.hiddenTarget?.replies?.latest?.id, newReply.id);
+
+  // Addressed through its parent channel (a forwarded source, a link), a hidden reply names its thread: local ids only.
+  const viaParent = await context(oldReply.id, channel.id);
+  assert.equal(viaParent.status, 404);
+  assert.equal(viaParent.body.code, "history_limited");
+  const location = (viaParent.body as unknown as { canonicalTarget?: { kind?: string; threadParentMessageId?: string; threadChannelId?: string } }).canonicalTarget;
+  assert.equal(location?.kind, "thread");
+  assert.equal(location?.threadParentMessageId, target.id);
+  assert.equal(location?.threadChannelId, thread.id);
+
+  // A hidden reply: the thread's first message (hidden) leads, and the card can name the thread's hidden replies.
+  const reply = await context(oldReply.id, thread.id);
+  assert.equal(reply.status, 404);
+  assert.equal(reply.body.code, "history_limited");
+  assert.deepEqual(reply.body.hiddenTarget?.before.map((message) => message.id), [target.id]);
+  assert.deepEqual(reply.body.hiddenTarget?.thread, { hiddenReplyCount: 1, hiddenReplyCountCapped: false, parentHidden: true });
+
+  // Someone who may not read the channel learns nothing: a plain not found.
+  const denied = await context(secretOld.id, secret.id, memberToken);
+  assert.equal(denied.status, 404);
+  assert.equal(denied.body.code, undefined);
+  assert.equal(denied.body.hiddenTarget, undefined);
+
+  // So does someone on another Free server, asking from it for this server's message.
+  const stranger = await seedUser("hidden-target-stranger@slock.test", "hidden-target-stranger");
+  const otherServer = await createServer("Hidden Target Other", "hidden-target-other", stranger.id);
+  await db.update(serversTable).set({ plan: "free" }).where(eq(serversTable.id, otherServer.id));
+  const crossServer = await fetch(`${app.baseUrl}/api/messages/context/${target.id}?channelId=${channel.id}`, {
+    headers: authHeaders(await tokenForHuman(stranger.email), otherServer.id),
+  });
+  assert.equal(crossServer.status, 404);
+  const crossServerBody = await crossServer.json() as HiddenTargetBody;
+  assert.equal(crossServerBody.code, undefined);
+  assert.equal(crossServerBody.hiddenTarget, undefined);
+
+  // A message that does not exist is not found.
+  const missing = await context("00000000-0000-4000-8000-000000000000", channel.id);
+  assert.equal(missing.status, 404);
+  assert.equal(missing.body.code, undefined);
+
+  // A target inside the window whose context reaches the cutoff carries the count, as a page that reaches it does.
+  const visible = await context(recent.id, channel.id);
+  assert.equal(visible.status, 200);
+  assert.equal(visible.body.historyLimited, true);
+  assert.ok((visible.body.hiddenHistory?.hiddenCount ?? 0) > 0);
+
+  // On Pro the same message simply opens.
+  await db.update(serversTable).set({ plan: "pro" }).where(eq(serversTable.id, server.id));
+  const pro = await context(target.id, channel.id);
+  assert.equal(pro.status, 200);
 });
 
 test("message window coverage binds empty, sparse-tail, and non-latest pages fail-closed", async ({ app }) => {
@@ -750,6 +1005,12 @@ test("syncMessages returns numeric seq on both the /messages/sync route and the 
     const result = await originalExecute(...args);
     for (const row of (result as { rows?: Array<Record<string, unknown>> }).rows ?? []) {
       if (typeof row.seq === "number") row.seq = String(row.seq);
+      // ...and timestamptz as Postgres text, `2026-10-21 21:37:58.578+00`.
+      for (const field of ["createdAt", "updatedAt"]) {
+        const value = row[field];
+        const date = value instanceof Date ? value : typeof value === "string" ? new Date(value) : null;
+        if (date) row[field] = date.toISOString().replace("T", " ").replace("Z", "+00");
+      }
     }
     return result;
   }) as typeof db.execute;
@@ -762,8 +1023,10 @@ test("syncMessages returns numeric seq on both the /messages/sync route and the 
       { headers: authHeaders(token, server.id) },
     );
     assert.equal(res.status, 200);
-    const synced = await res.json() as Array<{ id: string; seq: unknown }>;
+    const synced = await res.json() as Array<{ id: string; seq: unknown; createdAt: unknown }>;
     assert.deepEqual(synced.map((message) => message.id), [first.id, second.id]);
+    // Times are ISO, as on every other message read (Safari cannot parse Postgres text).
+    assert.deepEqual(synced.map((message) => message.createdAt), [first.createdAt.toISOString(), second.createdAt.toISOString()]);
     for (const message of synced) assert.equal(typeof message.seq, "number");
     assert.deepEqual(synced.map((message) => message.seq), [first.seq, second.seq]);
 
@@ -772,6 +1035,7 @@ test("syncMessages returns numeric seq on both the /messages/sync route and the 
     const resumedOwn = resumed.filter((message) => message.channelId === channel.id);
     assert.deepEqual(resumedOwn.map((message) => message.id), [first.id, second.id]);
     for (const message of resumedOwn) assert.equal(typeof message.seq, "number");
+    for (const message of resumedOwn) assert.ok(message.createdAt instanceof Date, "createdAt is a Date, not Postgres text");
     // `seq + 1` must be arithmetic, not string concatenation.
     assert.equal((resumedOwn[0]!.seq as number) + 1, first.seq + 1);
   } finally {
@@ -1014,6 +1278,7 @@ test("human message mentions cannot enumerate a hidden human directory", async (
       joinedByUserId: peerOwner.id,
     },
   ]);
+  await fillJointMembersFromChannelHumans();
 
   const visibleRes = await fetch(`${app.baseUrl}/api/v2/messages`, {
     method: "POST",
@@ -1394,65 +1659,45 @@ test("POST /messages rejects invalid human create body fields before writes", as
   }
 });
 
-test("POST /messages rejects an App reference that is not installed in the active server", async ({ app }) => {
+test("POST /messages sends text that looks like a Computer or App reference verbatim", async ({ app }) => {
+  // composer_resource_references_v0 was dropped: `<app:…>` / `<computer:…>`
+  // is ordinary text, well-formed or not, and never stops a message.
   const db = getDb();
-  const owner = await seedUser("messages-app-ref-owner@slock.test", "messages-app-ref-owner");
-  const server = await createServer("Messages App Reference", "messages-app-reference", owner.id);
+  const owner = await seedUser("messages-resource-text-owner@slock.test", "messages-resource-text-owner");
+  const server = await createServer("Messages Resource Text", "messages-resource-text", owner.id);
   await db.insert(serverMembers).values({ serverId: server.id, userId: owner.id, role: "owner" }).onConflictDoNothing();
-  const channel = await createChannel(server.id, "messages-app-reference-channel");
-  await addHuman(channel.id, owner.id);
-  await enableComposerResourceReferences(server.id);
-  const token = await tokenForHuman(owner.email);
-  const content = "run [@Missing](<app:custom.missing>)";
-
-  const res = await fetch(`${app.baseUrl}/api/messages`, {
-    method: "POST",
-    headers: {
-      ...authHeaders(token, server.id),
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ channelId: channel.id, content }),
-  });
-
-  assert.equal(res.status, 400);
-  assert.deepEqual(await res.json(), {
-    error: "App reference is not installed in this server",
-  });
-  const persisted = await db
-    .select({ id: messages.id })
-    .from(messages)
-    .where(and(eq(messages.channelId, channel.id), eq(messages.content, content)));
-  assert.equal(persisted.length, 0, "a forged resource reference must fail before persistence");
-});
-
-test("POST /messages rejects Computer and App references while the server gate is disabled", async ({ app }) => {
-  const db = getDb();
-  const owner = await seedUser("messages-resource-gate-owner@slock.test", "messages-resource-gate-owner");
-  const server = await createServer("Messages Resource Gate", "messages-resource-gate", owner.id);
-  await db.insert(serverMembers).values({ serverId: server.id, userId: owner.id, role: "owner" }).onConflictDoNothing();
-  const channel = await createChannel(server.id, "messages-resource-gate-channel");
+  const channel = await createChannel(server.id, "messages-resource-text-channel");
   await addHuman(channel.id, owner.id);
   const token = await tokenForHuman(owner.email);
-  const content = "see [@Reminder](<app:system.reminder>)";
 
-  const res = await fetch(`${app.baseUrl}/api/messages`, {
-    method: "POST",
-    headers: {
-      ...authHeaders(token, server.id),
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ channelId: channel.id, content }),
-  });
+  for (const content of [
+    "see <app:…> here",
+    "use <app:key/ref> as a placeholder",
+    "bad [@Desk](<computer:not-a-uuid>)",
+    "[@Desk](<computer:550e8400-e29b-41d4-a716-446655440000>)",
+    "see [@Reminder](<app:system.reminder>)",
+  ]) {
+    const res = await fetch(`${app.baseUrl}/api/messages`, {
+      method: "POST",
+      headers: {
+        ...authHeaders(token, server.id),
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ channelId: channel.id, content }),
+    });
 
-  assert.equal(res.status, 400);
-  assert.deepEqual(await res.json(), {
-    error: "Computer and App references are not enabled in this server",
-  });
-  const persisted = await db
-    .select({ id: messages.id })
-    .from(messages)
-    .where(and(eq(messages.channelId, channel.id), eq(messages.content, content)));
-  assert.equal(persisted.length, 0);
+    assert.equal(res.status, 200, `${content}: ${await res.clone().text()}`);
+    const persisted = await db
+      .select({ content: messages.content })
+      .from(messages)
+      .where(and(eq(messages.channelId, channel.id), eq(messages.content, content)));
+    assert.deepEqual(persisted, [{ content }], content);
+  }
+  const mentions = await db
+    .select({ id: messageMentions.id })
+    .from(messageMentions)
+    .where(eq(messageMentions.channelId, channel.id));
+  assert.deepEqual(mentions, [], "none of it is read as a mention");
 });
 
 test("POST /messages randomId replay is scoped to the original storage channel", async ({ app }) => {
@@ -1481,7 +1726,7 @@ test("POST /messages randomId replay is scoped to the original storage channel",
   });
   assert.equal(firstRes.status, 200);
 
-  await removeHuman(privateChannel.id, owner.id);
+  await removeHuman(privateChannel.id, owner.id, { self: true });
 
   const replayRes = await fetch(`${app.baseUrl}/api/messages`, {
     method: "POST",
@@ -1516,7 +1761,7 @@ test("POST /messages preserves requested attachment order in ack, realtime, and 
   const channel = await createChannel(server.id, "messages-attachment-order-channel");
   await addHuman(channel.id, owner.id);
   const token = await tokenForHuman(owner.email);
-  const uploaded = await db.insert(attachments).values([
+  const uploaded = await insertAttachmentsWithObjects(db, [
     {
       channelId: channel.id,
       uploaderId: owner.id,
@@ -1537,7 +1782,7 @@ test("POST /messages preserves requested attachment order in ack, realtime, and 
       storageKey: "attachment-order/a.png",
       createdAt: new Date("2026-07-24T00:00:01.000Z"),
     },
-  ]).returning({ id: attachments.id, filename: attachments.filename });
+  ]);
   const attachmentB = uploaded.find((row) => row.filename === "uploaded-first-b.png")!;
   const attachmentA = uploaded.find((row) => row.filename === "uploaded-second-a.png")!;
   const requestedOrder = [attachmentA.id, attachmentB.id];
@@ -1604,7 +1849,7 @@ test("POST /messages randomId replay accepts only the identical ordered attachme
   const channel = await createChannel(server.id, "messages-attachment-replay-channel");
   await addHuman(channel.id, owner.id);
   const token = await tokenForHuman(owner.email);
-  const uploaded = await db.insert(attachments).values([
+  const uploaded = await insertAttachmentsWithObjects(db, [
     {
       channelId: channel.id,
       uploaderId: owner.id,
@@ -1623,7 +1868,7 @@ test("POST /messages randomId replay accepts only the identical ordered attachme
       sizeBytes: 2,
       storageKey: "attachment-replay/second.png",
     },
-  ]).returning({ id: attachments.id });
+  ]);
   const orderedIds = uploaded.map((row) => row.id);
   const randomId = "ordered-attachment-replay";
   const send = (attachmentIds: string[], requestRandomId = randomId) => fetch(`${app.baseUrl}/api/messages`, {
@@ -1693,7 +1938,7 @@ test("POST /messages rolls back the message for duplicate, missing, or foreign a
   const channel = await createChannel(server.id, "messages-attachment-rollback-channel");
   await addHuman(channel.id, owner.id);
   const token = await tokenForHuman(owner.email);
-  const uploaded = await db.insert(attachments).values([
+  const uploaded = await insertAttachmentsWithObjects(db, [
     {
       channelId: channel.id,
       uploaderId: owner.id,
@@ -1712,7 +1957,7 @@ test("POST /messages rolls back the message for duplicate, missing, or foreign a
       sizeBytes: 2,
       storageKey: "attachment-rollback/foreign.png",
     },
-  ]).returning({ id: attachments.id, uploaderId: attachments.uploaderId });
+  ]);
   const validId = uploaded.find((row) => row.uploaderId === owner.id)!.id;
   const foreignId = uploaded.find((row) => row.uploaderId === other.id)!.id;
   const missingId = "99999999-9999-4999-8999-999999999999";
@@ -1807,7 +2052,7 @@ for (const winner of ["first", "second"] as const) {
       await addHuman(channel.id, target.id);
       const token = await tokenForHuman(owner.email);
       const randomId = `msg-race-${winner}`;
-      const [attachment] = await db.insert(attachments).values({
+      const [attachment] = await insertAttachmentsWithObjects(db, {
         channelId: channel.id,
         uploaderId: owner.id,
         uploaderType: "user",
@@ -1815,7 +2060,7 @@ for (const winner of ["first", "second"] as const) {
         mimeType: "image/png",
         sizeBytes: 123,
         storageKey: `race/${winner}.png`,
-      }).returning({ id: attachments.id });
+      });
 
       const send = (content: string) => fetch(`${app.baseUrl}/api/messages`, {
         method: "POST",
@@ -1934,7 +2179,7 @@ test("POST /messages randomId retry recovers after insert-before-finalization fa
     await addHuman(channel.id, target.id);
     const token = await tokenForHuman(owner.email);
     const randomId = "msg-recover-001";
-    const [attachment] = await db.insert(attachments).values({
+    const [attachment] = await insertAttachmentsWithObjects(db, {
       channelId: channel.id,
       uploaderId: owner.id,
       uploaderType: "user",
@@ -1942,7 +2187,7 @@ test("POST /messages randomId retry recovers after insert-before-finalization fa
       mimeType: "image/png",
       sizeBytes: 456,
       storageKey: "recover/recover.png",
-    }).returning({ id: attachments.id });
+    });
 
     const send = () => fetch(`${app.baseUrl}/api/messages`, {
       method: "POST",
@@ -2013,8 +2258,8 @@ test("POST /messages rolls back a keyless source, attachments, mentions, and inb
     payload: "fail after all derived facts before commit",
   });
   __setFailpointsForTests(registry);
-  // A side-effect replacement must retain the real atomic persistence/fence.
-  __setMessageServiceDepsForTests({ sendPushNotifications: async () => undefined });
+  // A deps override (test fallbacks) must retain the real atomic persistence/fence.
+  __setMessageServiceDepsForTests({});
 
   try {
     const db = getDb();
@@ -2029,7 +2274,7 @@ test("POST /messages rolls back a keyless source, attachments, mentions, and inb
     await addHuman(channel.id, owner.id);
     await addHuman(channel.id, target.id);
     const token = await tokenForHuman(owner.email);
-    const [attachment] = await db.insert(attachments).values({
+    const [attachment] = await insertAttachmentsWithObjects(db, {
       channelId: channel.id,
       uploaderId: owner.id,
       uploaderType: "user",
@@ -2037,7 +2282,7 @@ test("POST /messages rolls back a keyless source, attachments, mentions, and inb
       mimeType: "image/png",
       sizeBytes: 789,
       storageKey: "keyless/atomic.png",
-    }).returning({ id: attachments.id });
+    });
     const content = `keyless atomic send @${target.name}`;
     const send = () => fetch(`${app.baseUrl}/api/messages`, {
       method: "POST",
@@ -2139,6 +2384,7 @@ test("joint channel permalink preview resolves through the caller's local projec
       joinedByUserId: guestOwner.id,
     },
   ]);
+  await fillJointMembersFromChannelHumans();
 
   const targetMessage = await createMessage(
     hostProjection.id,
@@ -2214,6 +2460,7 @@ test("joint channel thread permalink preview resolves replies through the caller
       joinedByUserId: guestOwner.id,
     },
   ]);
+  await fillJointMembersFromChannelHumans();
 
   const parentMessage = await createMessage(
     hostProjection.id,
@@ -2309,6 +2556,7 @@ test("joint thread projection for a message page is one batched lookup scoped to
     { jointChannelId: joint.id, serverId: hostServer.id, localChannelId: hostProjection.id, role: "host", joinedByUserId: hostOwner.id },
     { jointChannelId: joint.id, serverId: guestServer.id, localChannelId: guestProjection.id, role: "participant", joinedByUserId: guestOwner.id },
   ]);
+  await fillJointMembersFromChannelHumans();
 
   const canonicalIds: string[] = [];
   for (const content of ["batch parent a", "batch parent b"]) {
@@ -2539,6 +2787,7 @@ test("POST /messages keeps public-channel non-member mentions out of send-time d
     agentId: outsider.id,
     scopes: ["mentions"],
     name: "messages-mention-delivery-outsider-mentions",
+    issuedVia: "computer",
     createdByUserId: null,
   });
   const outsiderHuman = await seedUser("messages-mention-delivery-human@slock.test", "messagesMentionDeliveryHuman");
@@ -2652,6 +2901,7 @@ test("POST /messages allows inert outsider mentions in DMs without notify or inb
     agentId: outsiderAgent.id,
     scopes: ["mentions"],
     name: "messages-dm-mention-agent-mentions",
+    issuedVia: "computer",
     createdByUserId: null,
   });
   const dm = await findOrCreateUserDM(server.id, owner.id, peer.id);
@@ -2782,6 +3032,52 @@ test("POST /v2/messages surfaces stopped-agent DM delivery warnings without fail
   assert.equal(delivered[0]?.message.channel_type, "dm");
 });
 
+test("POST /v2/messages warns a DM sender that the agent is stuck on a command (task #25)", async ({ app }) => {
+  const db = getDb();
+  const owner = await seedUser("messages-stuck-agent-owner@slock.test", "messages-stuck-agent-owner");
+  const server = await createServer("Messages Stuck Agent", "messages-stuck-agent", owner.id);
+  await db.insert(serverMembers).values({ serverId: server.id, userId: owner.id, role: "owner" }).onConflictDoNothing();
+  const agent = await createAgent(server.id, "MessagesStuckAgent", { runtime: "builtin" });
+  const dm = await findOrCreateDM(server.id, owner.id, agent.id);
+  assert.ok(dm, "expected owner/agent DM");
+
+  const originalOrchestrator = app.app.get("agentOrchestrator") as AgentOrchestrator;
+  let stuck = true;
+  app.app.set("agentOrchestrator", withChannelDelivery({
+    ...originalOrchestrator,
+    deliverMessage: async () => ({ status: "queued" as const, reason: "direct_dispatch" as const }),
+    getActivity: async () => ({
+      activity: "working" as const,
+      activityDetail: "Stuck: running command, no output for 10+ min",
+      ...(stuck
+        ? { toolStuck: { toolName: "bash", toolDetailKind: "running_command" as const, startedAtMs: 0, quietSinceMs: 0, thresholdMs: 600_000, queuedMessages: 1 } }
+        : {}),
+    }),
+  }));
+  onTestFinished(() => {
+    app.app.set("agentOrchestrator", originalOrchestrator);
+  });
+
+  const ownerToken = await tokenForHuman(owner.email);
+  const send = async (content: string) => {
+    const res = await fetch(`${app.baseUrl}/api/v2/messages`, {
+      method: "POST",
+      headers: { ...authHeaders(ownerToken, server.id), "Content-Type": "application/json" },
+      body: JSON.stringify({ channelId: dm.id, content }),
+    });
+    assert.equal(res.status, 200);
+    return await res.json() as { deliveryWarnings?: Array<{ targetType: string; targetId: string; reason: string }> };
+  };
+
+  assert.deepEqual((await send("hello stuck agent")).deliveryWarnings, [{
+    targetType: "agent",
+    targetId: agent.id,
+    reason: "agent_stuck_on_tool",
+  }]);
+  stuck = false;
+  assert.equal((await send("hello again")).deliveryWarnings, undefined, "a queued delivery to an agent that is not stuck warns nothing");
+});
+
 test("POST /v2/messages keeps stopped-agent warning lookup bounded", async ({ app }) => {
   const db = getDb();
   const owner = await seedUser("messages-stopped-agent-timeout-owner@slock.test", "messages-stopped-agent-timeout-owner");
@@ -2863,6 +3159,7 @@ test("user mention-actions execute mirrors notify and add semantics", async ({ a
       agentId: outsider.id,
       scopes: ["mentions"],
       name: "messages-actions-execute-outsider-mentions",
+      issuedVia: "computer",
       createdByUserId: null,
     });
     const ownerToken = await tokenForHuman(owner.email);
@@ -3562,8 +3859,8 @@ test("message reaction update socket payload omits storage-only message columns"
   assert.equal(update.senderName, owner.displayName);
   assert.equal(update.commentRef, null);
   assert.equal(update.reactions[0]?.emoji, "👍");
-  assert.equal(update.actionMetadata.forwardedItems[0]?.sourceServerId, null);
-  assert.equal(update.actionMetadata.forwardedItems[0]?.sourceTargetId, null);
+  assert.equal(Object.hasOwn(update.actionMetadata.forwardedItems[0] ?? {}, "sourceServerId"), false, "sourceServerId is removed, not null");
+  assert.equal(Object.hasOwn(update.actionMetadata.forwardedItems[0] ?? {}, "sourceTargetId"), false, "sourceTargetId is removed, not null");
   assert.equal(update.actionMetadata.forwardedItems[0]?.sourceTargetSnapshot.label, "");
   assert.equal(update.actionMetadata.forwardedItems[0]?.sourceTargetSnapshot.labelVisibility, "restricted");
   const response = await res.json() as { actionMetadata: { forwardedItems: Array<{ sourceTargetSnapshot: { label: string } }> } };
@@ -3580,7 +3877,7 @@ test("agent reactions aggregate with human reactions without delivery side effec
 
   const agent = await createAgent(server.id, "reaction-agent", { runtime: "codex" });
   const { machine, apiKey } = await registerMachine(server.id, owner.id, "reaction-machine");
-  await assignMachine(agent.id, machine.id);
+  await placeAgentOnMachine(agent.id, machine.id);
   await db.insert(channelAgents).values({ channelId: channel.id, agentId: agent.id }).onConflictDoNothing();
 
   const message = await createMessage(channel.id, "user", owner.id, "agent reactable message");
@@ -3686,7 +3983,7 @@ test("message reactions reject system messages and archived channels", async ({ 
 
   await addHuman(channel.id, nonMember.id);
   const formerMemberMessage = await createMessage(channel.id, "user", nonMember.id, "former member's own message");
-  await removeHuman(channel.id, nonMember.id);
+  await removeHuman(channel.id, nonMember.id, { self: true });
   for (const method of ["POST", "DELETE"] as const) {
     const ownMessageReaction = await fetch(`${app.baseUrl}/api/messages/${formerMemberMessage.id}/reactions`, {
       method,
@@ -3916,7 +4213,7 @@ test("reaction actor pages bind typed cursors and stale after human, legacy-agen
   await addHuman(channel.id, member.id);
   const agent = await createAgent(server.id, "reaction-page-agent", { runtime: "codex" });
   const { machine, apiKey } = await registerMachine(server.id, owner.id, "reaction-page-machine");
-  await assignMachine(agent.id, machine.id);
+  await placeAgentOnMachine(agent.id, machine.id);
   await db.insert(channelAgents).values({ channelId: channel.id, agentId: agent.id }).onConflictDoNothing();
   const message = await createMessage(channel.id, "user", owner.id, "reaction page target");
   const otherMessage = await createMessage(channel.id, "user", owner.id, "reaction page other target");
@@ -3990,6 +4287,7 @@ test("reaction actor pages bind typed cursors and stale after human, legacy-agen
     agentId: agent.id,
     scopes: ["reactions"],
     name: "reaction-page-agent-api",
+    issuedVia: "human",
     createdByUserId: owner.id,
   });
   const agentApiRemove = await fetch(`${app.baseUrl}/internal/agent-api/messages/${message.id}/reactions`, {
@@ -4225,6 +4523,7 @@ test("joint reaction actor discussion uses the requester-local scope and rejects
       joinedByUserId: guestOwner.id,
     },
   ]);
+  await fillJointMembersFromChannelHumans();
   const message = await createMessage(hostProjection.id, "user", hostOwner.id, "joint actor page");
   const hostToken = await tokenForHuman(hostOwner.email);
   const guestToken = await tokenForHuman(guestOwner.email);
@@ -4412,6 +4711,9 @@ test("GET /messages/search supports explicit recent sort without changing releva
   const owner = await seedUser("search-sort-owner@slock.test", "search-sort-owner");
   const server = await createServer("Search Sort Server", "search-sort-server", owner.id);
   await db.insert(serverMembers).values({ serverId: server.id, userId: owner.id, role: "owner" }).onConflictDoNothing();
+  // The fixed dates below sit outside the free plan's history window, which
+  // search now honours (messages.searchHistory.api.test.ts).
+  await db.update(serversTable).set({ plan: "founder" }).where(eq(serversTable.id, server.id));
   const channel = await createChannel(server.id, "search-sort-channel");
 
   const oldHighRelevance = await createMessage(
@@ -4501,7 +4803,7 @@ test("GET /messages/search falls back to relaxed CJK token matching when strict 
 
 test("GET /messages/search records success and failure diagnostics", async ({  }) => {
   const t = {  };
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const errorLog = vi.spyOn(console, "error").mockImplementation(() => {});
     onTestFinished(() => errorLog.mockRestore());
@@ -4642,7 +4944,7 @@ test("GET /messages/search records success and failure diagnostics", async ({  }
   }
 });
 
-test("message search returns typed QUERY_TOO_BROAD above the documented boundary without forging an empty set", async ({ app }) => {
+test("relevance search above the documented boundary answers newest first, marked relevanceFallback, never an empty set", async ({ app }) => {
 
   try {
     const owner = await seedUser("search-breadth-owner@slock.test", "search-breadth-owner");
@@ -4653,6 +4955,7 @@ test("message search returns typed QUERY_TOO_BROAD above the documented boundary
       agentId: agent.id,
       scopes: ["read"],
       name: "search-breadth-agent-api",
+      issuedVia: "human",
       createdByUserId: owner.id,
     });
     await createMessage(channel.id, "user", owner.id, "breadthboundary searchable row");
@@ -4686,35 +4989,31 @@ test("message search returns typed QUERY_TOO_BROAD above the documented boundary
     const atLimitBody = await atLimit.json() as { results: unknown[]; hasMore: boolean };
     assert.equal(atLimitBody.results.length, 1);
 
+    assert.equal((atLimitBody as { relevanceFallback?: string }).relevanceFallback, undefined);
+
     // Rare in this server but common across all servers: the corpus-wide
-    // text-match set the relevance statement reads first is too large.
+    // text-match set the relevance statement reads first is too large. Not
+    // refused: answered newest first, marked relevanceFallback.
+    const expectFallback = async (response: Response) => {
+      assert.equal(response.status, 200);
+      const body = await response.json() as { results: unknown[]; relevanceFallback?: string; code?: string };
+      assert.equal(body.code, undefined);
+      assert.equal(body.relevanceFallback, "too_broad");
+      assert.equal(body.results.length, 1, "the newest-first page still finds the row");
+    };
     injectedTextMatchEstimate = MESSAGE_SEARCH_RELEVANCE_ESTIMATED_TEXT_MATCH_LIMIT + 1;
-    const corpusBroad = await fetch(`${app.baseUrl}/api/messages/search?q=breadthboundary&limit=1`, {
+    await expectFallback(await fetch(`${app.baseUrl}/api/messages/search?q=breadthboundary&limit=1`, {
       headers: userHeaders,
-    });
-    assert.equal(corpusBroad.status, 422);
-    assert.equal((await corpusBroad.json() as { code: string }).code, "QUERY_TOO_BROAD");
+    }));
     injectedTextMatchEstimate = MESSAGE_SEARCH_RELEVANCE_ESTIMATED_TEXT_MATCH_LIMIT;
 
     injectedEstimate = MESSAGE_SEARCH_RELEVANCE_ESTIMATED_CANDIDATE_LIMIT + 1;
-
-    const userBroad = await fetch(`${app.baseUrl}/api/messages/search?q=breadthboundary&limit=1`, {
+    await expectFallback(await fetch(`${app.baseUrl}/api/messages/search?q=breadthboundary&limit=1`, {
       headers: userHeaders,
-    });
-    assert.equal(userBroad.status, 422);
-    assert.deepEqual(await userBroad.json(), {
-      error: "Search query is too broad. Add a channel, sender, or time filter, or use --sort recent.",
-      code: "QUERY_TOO_BROAD",
-    });
-
-    const agentBroad = await fetch(`${app.baseUrl}/internal/agent-api/search?q=breadthboundary&limit=1`, {
+    }));
+    await expectFallback(await fetch(`${app.baseUrl}/internal/agent-api/search?q=breadthboundary&limit=1`, {
       headers: { Authorization: `Bearer ${agentCredential.apiKey}` },
-    });
-    assert.equal(agentBroad.status, 422);
-    assert.deepEqual(await agentBroad.json(), {
-      error: "Search query is too broad. Add a channel, sender, or time filter, or use --sort recent.",
-      errorCode: "QUERY_TOO_BROAD",
-    });
+    }));
 
     const recent = await fetch(`${app.baseUrl}/api/messages/search?q=breadthboundary&sort=recent&limit=1`, {
       headers: userHeaders,
@@ -4728,7 +5027,7 @@ test("message search returns typed QUERY_TOO_BROAD above the documented boundary
   }
 });
 
-test("recent search on a term above the corpus-wide cap walks the server timeline when the flag is on and no channel narrows it", async ({ app }) => {
+test("recent search on a term above the corpus-wide cap walks the server timeline when no channel narrows it", async ({ app }) => {
   try {
     const owner = await seedUser("search-timeline-owner@slock.test", "search-timeline-owner");
     const server = await createServer("Search Timeline Server", "search-timeline-server", owner.id);
@@ -4739,9 +5038,7 @@ test("recent search on a term above the corpus-wide cap walks the server timelin
     // never rejects, it walks newest first.
     const dialect = new PgDialect();
     const executed: string[] = [];
-    let timelineFlag = false;
     __setSearchServiceDepsForTests({
-      isServerTimelineWalkEnabled: async () => timelineFlag,
       executeSearchSql: (async (statement: SQL, options?: { signal?: AbortSignal }) => {
         const rendered = dialect.sqlToQuery(statement).sql.replace(/\s+/g, " ").trim();
         if (rendered.startsWith("EXPLAIN (FORMAT JSON)")) {
@@ -4754,13 +5051,6 @@ test("recent search on a term above the corpus-wide cap walks the server timelin
     });
     const headers = authHeaders(await tokenForHuman(owner.email), server.id);
 
-    // Flag off (absent in prod until the timeline verifies): the global walk.
-    const flagOff = await fetch(`${app.baseUrl}/api/messages/search?q=timelinewalk&sort=recent&limit=5`, { headers });
-    assert.equal(flagOff.status, 200);
-    assert.equal((await flagOff.json() as { results: unknown[] }).results.length, 1);
-    assert.doesNotMatch(executed.at(-1) ?? "", /\bmessage_server_timeline\b/, "the kill switch keeps the global walk");
-
-    timelineFlag = true;
     const walk = await fetch(`${app.baseUrl}/api/messages/search?q=timelinewalk&sort=recent&limit=5`, { headers });
     assert.equal(walk.status, 200);
     assert.equal((await walk.json() as { results: unknown[] }).results.length, 1);
@@ -4786,9 +5076,7 @@ test("recent search collects text matches first only up to the recent cap; above
     const dialect = new PgDialect();
     const executed: string[] = [];
     let estimate = MESSAGE_SEARCH_RECENT_COLLECT_FIRST_TEXT_MATCH_LIMIT;
-    let timelineFlag = true;
     __setSearchServiceDepsForTests({
-      isServerTimelineWalkEnabled: async () => timelineFlag,
       executeSearchSql: (async (statement: SQL, options?: { signal?: AbortSignal }) => {
         const rendered = dialect.sqlToQuery(statement).sql.replace(/\s+/g, " ").trim();
         if (rendered.startsWith("EXPLAIN (FORMAT JSON)")) {
@@ -4800,8 +5088,8 @@ test("recent search collects text matches first only up to the recent cap; above
       }) as typeof executeSearchSqlFromDb,
     });
     const headers = authHeaders(await tokenForHuman(owner.email), server.id);
-    const search = async () => {
-      const res = await fetch(`${app.baseUrl}/api/messages/search?q=recentcap&sort=recent&limit=5`, { headers });
+    const search = async (channelFilter = "") => {
+      const res = await fetch(`${app.baseUrl}/api/messages/search?q=recentcap&sort=recent&limit=5${channelFilter}`, { headers });
       assert.equal(res.status, 200);
       assert.equal((await res.json() as { results: unknown[] }).results.length, 1);
       return executed.at(-1) ?? "";
@@ -4816,12 +5104,11 @@ test("recent search collects text matches first only up to the recent cap; above
     const walked = await search();
     assert.match(walked, /\bFROM message_server_timeline t JOIN messages m ON m\.id = t\.message_id\b/);
     assert.doesNotMatch(walked, /\btext_matches AS MATERIALIZED\b/);
-    // With the timeline flag off there is no budgeted walk, so the relevance
-    // cap still decides: this estimate collects first, as before.
-    timelineFlag = false;
-    const legacy = await search();
-    assert.doesNotMatch(legacy, /\bmessage_server_timeline\b/);
-    assert.match(legacy, /\btext_matches AS MATERIALIZED\b/);
+    // A channel filter has no budgeted walk, so the relevance cap still
+    // decides: this estimate collects first.
+    const narrowed = await search(`&channelId=${channel.id}`);
+    assert.doesNotMatch(narrowed, /\bmessage_server_timeline\b/);
+    assert.match(narrowed, /\btext_matches AS MATERIALIZED\b/);
   } finally {
     __resetSearchServiceDepsForTests();
     await app.close();
@@ -4840,7 +5127,6 @@ test("the server timeline walk stops at its row budget: incomplete page, exact c
 
     const dialect = new PgDialect();
     __setSearchServiceDepsForTests({
-      isServerTimelineWalkEnabled: async () => true,
       walkTimelineRowBudget: 3,
       executeSearchSql: (async (statement: SQL, options?: { signal?: AbortSignal }) => {
         const rendered = dialect.sqlToQuery(statement).sql.replace(/\s+/g, " ").trim();
@@ -4889,8 +5175,15 @@ test("the server timeline walk stops at its row budget: incomplete page, exact c
 
     const forged = await fetch(`${app.baseUrl}/api/messages/search?q=walkbudget&sort=recent&cursor=not-a-cursor`, { headers });
     assert.equal(forged.status, 400);
-    const relevance = await fetch(`${app.baseUrl}/api/messages/search?q=walkbudget&sort=relevance&cursor=${encodeURIComponent(first.nextCursor!)}`, { headers });
-    assert.equal(relevance.status, 400, "a cursor only continues a recent search");
+    // A relevance page answered newest first (relevanceFallback) hands out the
+    // same cursor; passed back with the relevance sort it continues that walk.
+    const relevance = await fetch(`${app.baseUrl}/api/messages/search?q=walkbudget&sort=relevance&limit=1&cursor=${encodeURIComponent(first.nextCursor!)}`, { headers });
+    assert.equal(relevance.status, 200);
+    const relevancePage = await relevance.json() as Page & { relevanceFallback?: string };
+    assert.deepEqual(relevancePage.results.map((r) => r.content), ["walkbudget B"]);
+    assert.equal(relevancePage.relevanceFallback, "too_broad");
+    const noQuery = await fetch(`${app.baseUrl}/api/messages/search?sort=recent&channelId=${channel.id}&cursor=${encodeURIComponent(first.nextCursor!)}`, { headers });
+    assert.equal(noQuery.status, 400, "a cursor continues a text search only");
   } finally {
     __resetSearchServiceDepsForTests();
     await app.close();
@@ -4925,7 +5218,7 @@ test("message search maps admitted PostgreSQL statement timeout to typed SEARCH_
     });
     assert.equal(response.status, 503);
     assert.deepEqual(await response.json(), {
-      error: "Search timed out. Add a channel, sender, or time filter, use --sort recent, or retry.",
+      error: "Search timed out. Add a channel or sender filter, use --sort recent (a time range works with recent), or retry.",
       code: "SEARCH_TIMEOUT",
     });
   } finally {
@@ -4954,7 +5247,7 @@ test("message search planner timeout and malformed estimate fail closed with typ
     const timedOut = await fetch(`${app.baseUrl}/api/messages/search?q=planner&limit=1`, { headers });
     assert.equal(timedOut.status, 503);
     assert.deepEqual(await timedOut.json(), {
-      error: "Search timed out. Add a channel, sender, or time filter, use --sort recent, or retry.",
+      error: "Search timed out. Add a channel or sender filter, use --sort recent (a time range works with recent), or retry.",
       code: "SEARCH_TIMEOUT",
     });
 
@@ -4982,6 +5275,9 @@ test("GET /messages/search supports filter-only browse without keyword query", a
     { serverId: server.id, userId: owner.id, role: "owner" },
     { serverId: server.id, userId: other.id, role: "member" },
   ]).onConflictDoNothing();
+  // Fixed dates below sit outside the free plan's history window, which
+  // search honours (messages.searchHistory.api.test.ts).
+  await db.update(serversTable).set({ plan: "founder" }).where(eq(serversTable.id, server.id));
   const channel = await createChannel(server.id, "search-filter-only-channel");
   const otherChannel = await createChannel(server.id, "search-filter-only-other-channel");
 
@@ -5019,8 +5315,8 @@ test("GET /messages/search supports filter-only browse without keyword query", a
     { headers: authHeaders(ownerToken, server.id) },
   );
   assert.equal(emptyRes.status, 200);
-  const emptyBody = await emptyRes.json() as { results: unknown[]; hasMore: boolean };
-  assert.deepEqual(emptyBody, { results: [], hasMore: false });
+  const emptyBody = await emptyRes.json() as { results: unknown[]; hasMore: boolean; historyLimited: boolean };
+  assert.deepEqual(emptyBody, { results: [], hasMore: false, historyLimited: false });
 
   const filterOnlyUrl = new URL(`${app.baseUrl}/api/messages/search`);
   filterOnlyUrl.searchParams.set("senderId", owner.id);
@@ -5081,6 +5377,9 @@ test("GET /messages/search supports sender type and self-mention scopes", async 
     { serverId: server.id, userId: owner.id, role: "owner" },
     { serverId: server.id, userId: other.id, role: "member" },
   ]).onConflictDoNothing();
+  // Fixed dates below sit outside the free plan's history window, which
+  // search honours (messages.searchHistory.api.test.ts).
+  await db.update(serversTable).set({ plan: "founder" }).where(eq(serversTable.id, server.id));
   const channel = await createChannel(server.id, "search-scope-channel");
   const agent = await createAgent(server.id, "SearchScopeAgent", { runtime: "codex", model: "gpt-5" });
   await db.insert(channelAgents).values({ channelId: channel.id, agentId: agent.id }).onConflictDoNothing();
@@ -5192,7 +5491,7 @@ test("GET /messages/search and the agent search stop returning a soft-deleted ch
   ]).onConflictDoNothing();
   const agent = await createAgent(server.id, "search-deleted-agent", { runtime: "codex" });
   const { machine, apiKey } = await registerMachine(server.id, owner.id, "search-deleted-machine");
-  await assignMachine(agent.id, machine.id);
+  await placeAgentOnMachine(agent.id, machine.id);
 
   const marker = "quartzlantern";
   const doomed = await createChannel(server.id, "search-deleted-room");
@@ -5302,7 +5601,7 @@ test("POST /messages/forward records pre-router auth, account, and server admiss
   assert.equal(missingAuth.status, 401);
 
   const user = await seedUser("forward-admission@slock.test", "forward-admission");
-  const token = signAccessToken(user.id);
+  const token = await accessTokenForTest(user.id);
   await db.update(users).set({ emailVerified: false }).where(eq(users.id, user.id));
   const unverified = await post(traceIds[1]!, { Authorization: `Bearer ${token}` });
   assert.equal(unverified.status, 403);
@@ -5338,7 +5637,7 @@ test("POST /messages/forward records pre-router auth, account, and server admiss
 });
 
 test("POST /messages/forward records a pre-router rate-limit terminal", async () => {
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false, enforceMessageRateLimit: true, messageRateLimitMax: 1 });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, enforceMessageRateLimit: true, messageRateLimitMax: 1 });
   try {
     const sink = new MemoryTraceSink();
     app.app.set("serverTracer", new BasicTracer({ sink }));
@@ -5346,7 +5645,7 @@ test("POST /messages/forward records a pre-router rate-limit terminal", async ()
     const owner = await seedUser("forward-rate-owner@slock.test", "forward-rate-owner");
     const server = await createServer("Forward Rate Server", "forward-rate-server", owner.id);
     await db.insert(serverMembers).values({ serverId: server.id, userId: owner.id, role: "owner" }).onConflictDoNothing();
-    const token = signAccessToken(owner.id);
+    const token = await accessTokenForTest(owner.id);
     const headers = {
       ...authHeaders(token, server.id),
       "Content-Type": "application/json",
@@ -5390,7 +5689,7 @@ test("POST /messages/forward records validation rejection on the propagated trac
     const owner = await seedUser("forward-validation-owner@slock.test", "forward-validation-owner");
     const server = await createServer("Forward Validation Server", "forward-validation-server", owner.id);
     await db.insert(serverMembers).values({ serverId: server.id, userId: owner.id, role: "owner" }).onConflictDoNothing();
-    const token = signAccessToken(owner.id);
+    const token = await accessTokenForTest(owner.id);
     const traceId = "6".repeat(32);
 
     const res = await fetch(`${app.baseUrl}/api/messages/forward`, {
@@ -5442,8 +5741,10 @@ test("POST /messages/forward stores an ordered immutable forwarded bundle snapsh
     const second = await createMessage(source.id, "user", owner.id, "second source snapshot");
     // Visible timeline order is createdAt, not insertion/seq order. Seed/import
     // paths may backdate rows, so deliberately invert the two here.
-    await db.update(messages).set({ createdAt: new Date("2026-07-17T00:20:00.000Z") }).where(eq(messages.id, first.id));
-    await db.update(messages).set({ createdAt: new Date("2026-07-16T23:50:00.000Z") }).where(eq(messages.id, second.id));
+    // A day ago: inside the Free plan's 30-day history window.
+    const dayAgo = Date.now() - 24 * 60 * 60 * 1000;
+    await db.update(messages).set({ createdAt: new Date(dayAgo + 30 * 60 * 1000) }).where(eq(messages.id, first.id));
+    await db.update(messages).set({ createdAt: new Date(dayAgo) }).where(eq(messages.id, second.id));
     const [sourceObject] = await db.insert(attachmentObjects).values({
       originServerId: server.id,
       uploaderId: owner.id,
@@ -5465,9 +5766,6 @@ test("POST /messages/forward stores an ordered immutable forwarded bundle snapsh
       uploaderId: owner.id,
       uploaderType: "user",
       filename: "forward source.pdf",
-      mimeType: "application/pdf",
-      sizeBytes: 256,
-      storageKey: "forward/forward-source.pdf",
     }).returning();
     const token = await tokenForHuman(owner.email);
     sink.clear();
@@ -5530,6 +5828,12 @@ test("POST /messages/forward stores an ordered immutable forwarded bundle snapsh
     const [destinationSnapshot] = body.actionMetadata.forwardedItems[1]?.attachmentSnapshots ?? [];
     assert.equal(typeof destinationSnapshot?.id, "string");
     assert.notEqual(destinationSnapshot?.id, sourceAttachment.id);
+    assert.deepEqual(
+      await db.select({ holderType: attachmentObjectHolds.holderType, holderId: attachmentObjectHolds.holderId })
+        .from(attachmentObjectHolds).where(eq(attachmentObjectHolds.objectId, sourceObject.id)),
+      [{ holderType: "attachment", holderId: destinationSnapshot?.id }],
+      "the forwarded copy holds the shared bytes in the forward transaction",
+    );
     assert.deepEqual(destinationSnapshot, {
       id: destinationSnapshot?.id,
       filename: "forward source.pdf",
@@ -5631,7 +5935,7 @@ test("POST /messages/forward records an unexpected terminal phase without identi
     const token = await tokenForHuman(owner.email);
     sink.clear();
     __setWebHttpClientTraceSinkForTest(sink);
-    const clientSpan = startWebHttpClientSpan("POST");
+    const clientSpan = startWebHttpClientSpan("POST", "/messages/forward");
     const clientTraceparent = clientSpan.traceparent;
     const traceId = clientTraceparent.split("-")[1]!;
 
@@ -5667,9 +5971,11 @@ test("POST /messages/forward records an unexpected terminal phase without identi
     assert.equal(span.context.traceId, traceId);
     assert.deepEqual(webSpan.attrs, {
       method: "POST",
+      "http.route": "/api/messages/forward",
       outcome: "error",
       status_bucket: "5xx",
       status_code: 500,
+      response_bytes: Number(res.headers.get("content-length")),
       route_family: "message_forward",
       response_state: "received",
       stable_code: "server_error",
@@ -5686,6 +5992,11 @@ test("POST /messages/forward records an unexpected terminal phase without identi
       stable_code: "unexpected_type_error",
       error_class: "TypeError",
       commit_state: "pre_commit",
+      // The forward's single destination and source as keyed hashes, never raw ids.
+      destination_count: 1,
+      source_count: 1,
+      conversation_id_hash: traceIdentityHash("conversation_id_hash", destination.id),
+      message_id_hash: traceIdentityHash("message_id_hash", sourceMessage.id),
     });
     const serialized = JSON.stringify(terminal);
     assert.equal(serialized.includes(owner.id), false);
@@ -5794,6 +6105,10 @@ test("POST /messages/forward keeps a pre-persist disconnect marker separate from
       stable_code: "unexpected_type_error",
       error_class: "TypeError",
       commit_state: "pre_commit",
+      destination_count: 1,
+      source_count: 1,
+      conversation_id_hash: traceIdentityHash("conversation_id_hash", destination.id),
+      message_id_hash: traceIdentityHash("message_id_hash", sourceMessage.id),
     });
     const stored = await db.select({ id: messages.id }).from(messages).where(eq(messages.channelId, destination.id));
     assert.equal(stored.length, 0);
@@ -5865,6 +6180,10 @@ test("POST /messages/forward keeps a post-persist disconnect marker separate fro
       stable_code: "ok",
       error_class: "none",
       commit_state: "committed",
+      destination_count: 1,
+      source_count: 1,
+      conversation_id_hash: traceIdentityHash("conversation_id_hash", destination.id),
+      message_id_hash: traceIdentityHash("message_id_hash", sourceMessage.id),
     });
     const stored = await db.select({ id: messages.id }).from(messages).where(eq(messages.channelId, destination.id));
     assert.equal(stored.length, 1, "the final terminal must match the already committed destination write");
@@ -5872,6 +6191,53 @@ test("POST /messages/forward keeps a post-persist disconnect marker separate fro
     __resetFailpointsForTests();
     await app.close();
   }
+});
+
+test("POST /messages/forward records a destination mid-conversion as bounded fields with its keyed hash", async ({ app }) => {
+  const sink = new MemoryTraceSink();
+  app.app.set("serverTracer", new BasicTracer({ sink }));
+  const db = getDb();
+  const owner = await seedUser("forward-converting@slock.test", "forward-converting");
+  const server = await createServer("Forward Converting", "forward-converting", owner.id);
+  await db.insert(serverMembers).values({ serverId: server.id, userId: owner.id, role: "owner" }).onConflictDoNothing();
+  const source = await createChannel(server.id, "forward-converting-source");
+  const open = await createChannel(server.id, "forward-converting-open");
+  const converting = await createChannel(server.id, "forward-converting-target");
+  await db.insert(channelHumans).values([
+    { channelId: source.id, userId: owner.id },
+    { channelId: open.id, userId: owner.id },
+    { channelId: converting.id, userId: owner.id },
+  ]).onConflictDoNothing();
+  // A pending conversion job makes the destination refuse writes (assertChannelConversionWritable).
+  await db.insert(channelConversionJobs).values({ serverId: server.id, sourceChannelId: converting.id, sourceChannelType: "channel" });
+  const sourceMessage = await createMessage(source.id, "user", owner.id, "converting source content");
+  const token = await tokenForHuman(owner.email);
+  sink.clear();
+
+  const res = await fetch(`${app.baseUrl}/api/messages/forward`, {
+    method: "POST",
+    headers: { ...authHeaders(token, server.id), "Content-Type": "application/json" },
+    body: JSON.stringify({
+      destinationChannelIds: [open.id, converting.id],
+      sourceMessageIds: [sourceMessage.id],
+      requestId: "22222222-3333-4444-8555-666666666666",
+    }),
+  });
+  assert.equal(res.status, 200);
+  const body = await res.json() as { results: Array<{ destinationChannelId: string; status: string; code?: string }> };
+  const failed = body.results.find((result) => result.destinationChannelId === converting.id);
+  assert.equal(failed?.status, "failed");
+
+  const event = sink.getAllSpans()
+    .flatMap((span) => span.events)
+    .find((candidate) => candidate.name === "messages.forward.destination.failed" && candidate.attrs?.code === failed?.code);
+  assert.ok(event, "the mid-conversion destination is recorded");
+  assert.deepEqual(Object.keys(event.attrs ?? {}).sort(), ["code", "conversation_id_hash", "phase", "route_family"]);
+  assert.equal(event.attrs?.conversation_id_hash, traceIdentityHash("conversation_id_hash", converting.id));
+  const serialized = JSON.stringify(event);
+  assert.equal(serialized.includes(converting.id), false);
+  assert.equal(serialized.includes(sourceMessage.id), false);
+  assert.equal(serialized.includes("converting source content"), false);
 });
 
 test("POST /messages/forward batches canonical destinations with truthful partial and idempotent retry results", async ({ app }) => {
@@ -6068,9 +6434,11 @@ test("POST /messages/forward supports thread sources through parent-source-read 
     const secondReply = await createMessage(thread.id, "user", owner.id, "second thread snapshot");
     // Keep parent first by structure, but prove replies follow their visible
     // timestamps even when insertion/seq order is reversed.
-    await db.update(messages).set({ createdAt: new Date("2026-07-17T01:30:00.000Z") }).where(eq(messages.id, parentMessage.id));
-    await db.update(messages).set({ createdAt: new Date("2026-07-17T01:20:00.000Z") }).where(eq(messages.id, firstReply.id));
-    await db.update(messages).set({ createdAt: new Date("2026-07-17T01:10:00.000Z") }).where(eq(messages.id, secondReply.id));
+    // A day ago: inside the Free plan's 30-day history window.
+    const dayAgo = Date.now() - 24 * 60 * 60 * 1000;
+    await db.update(messages).set({ createdAt: new Date(dayAgo + 20 * 60 * 1000) }).where(eq(messages.id, parentMessage.id));
+    await db.update(messages).set({ createdAt: new Date(dayAgo + 10 * 60 * 1000) }).where(eq(messages.id, firstReply.id));
+    await db.update(messages).set({ createdAt: new Date(dayAgo) }).where(eq(messages.id, secondReply.id));
     const ownerToken = await tokenForHuman(owner.email);
 
     const res = await fetch(`${app.baseUrl}/api/messages/forward`, {
@@ -6363,7 +6731,7 @@ test("POST /messages/forward scrubs private thread provenance for parent-denied 
       };
     };
     const ownerItem = createdBody.actionMetadata.forwardedItems[0]!;
-    assert.equal(ownerItem.sourceTargetId, null);
+    assert.equal(ownerItem?.sourceTargetId, null);
     assert.equal(ownerItem.sourceThreadId, undefined);
     assert.equal(ownerItem.parentChannelId, undefined);
     assert.equal(ownerItem.sourceTargetSnapshot.label, "");
@@ -6390,11 +6758,11 @@ test("POST /messages/forward scrubs private thread provenance for parent-denied 
       }>;
     }).messages.find((message) => message.id === createdBody.id);
     const viewerItem = viewerForward?.actionMetadata?.forwardedItems?.[0];
-    assert.equal(viewerItem?.sourceServerId, null);
-    assert.equal(viewerItem?.sourceTargetId, null);
-    assert.equal(viewerItem?.sourceThreadId, null);
-    assert.equal(viewerItem?.parentChannelId, null);
-    assert.equal(viewerItem?.sourceMessageId, null);
+    assert.equal(Object.hasOwn(viewerItem ?? {}, "sourceServerId"), false, "sourceServerId is removed, not null");
+    assert.equal(Object.hasOwn(viewerItem ?? {}, "sourceTargetId"), false, "sourceTargetId is removed, not null");
+    assert.equal(Object.hasOwn(viewerItem ?? {}, "sourceThreadId"), false, "sourceThreadId is removed, not null");
+    assert.equal(Object.hasOwn(viewerItem ?? {}, "parentChannelId"), false, "parentChannelId is removed, not null");
+    assert.equal(Object.hasOwn(viewerItem ?? {}, "sourceMessageId"), false, "sourceMessageId is removed, not null");
     assert.equal(viewerItem?.sourceTargetSnapshot.id, null);
     assert.equal(viewerItem?.sourceTargetSnapshot.label, "");
     assert.equal(viewerItem?.sourceTargetSnapshot.labelVisibility, "restricted");
@@ -6441,9 +6809,6 @@ test("POST /messages/forward requires source read authority and degrades private
       uploaderId: owner.id,
       uploaderType: "user",
       filename: "private-source.txt",
-      mimeType: "text/plain",
-      sizeBytes: 24,
-      storageKey: privateObject.storageKey,
     }).returning();
 
     const viewerToken = await tokenForHuman(viewer.email);
@@ -6640,6 +7005,7 @@ test("POST /messages/forward supports joint destinations and restricted joint so
         joinedByUserId: guestOwner.id,
       },
     ]);
+    await fillJointMembersFromChannelHumans();
 
     const sourceMessage = await createMessage(source.id, "user", owner.id, "public source into joint");
     const privateSourceMessage = await createMessage(privateSource.id, "user", owner.id, "private source into joint");
@@ -6750,13 +7116,13 @@ test("POST /messages/forward supports joint destinations and restricted joint so
     const guestPublicItem = guestListedForward?.actionMetadata?.forwardedItems?.[0];
     const guestPrivateItem = guestListedPrivateForward?.actionMetadata?.forwardedItems?.[0];
     assert.equal(guestPublicItem?.contentSnapshot, "public source into joint");
-    assert.equal(guestPublicItem?.sourceTargetId, null);
+    assert.equal(Object.hasOwn(guestPublicItem ?? {}, "sourceTargetId"), false, "sourceTargetId is removed, not null");
     assert.equal(guestPublicItem?.sourceTargetSnapshot.id, null);
     assert.equal(guestPublicItem?.sourceTargetSnapshot.label, "");
     assert.equal(guestPublicItem?.sourceTargetSnapshot.labelVisibility, "restricted");
     assert.equal(guestPublicItem?.provenanceState, "original_unavailable");
     assert.equal(guestPrivateItem?.contentSnapshot, "private source into joint");
-    assert.equal(guestPrivateItem?.sourceTargetId, null);
+    assert.equal(Object.hasOwn(guestPrivateItem ?? {}, "sourceTargetId"), false, "sourceTargetId is removed, not null");
     assert.equal(guestPrivateItem?.sourceTargetSnapshot.label, "");
     assert.equal(guestPrivateItem?.provenanceState, "original_unavailable");
 
@@ -6778,8 +7144,8 @@ test("POST /messages/forward supports joint destinations and restricted joint so
       }>;
     }).messages.find((message) => message.id === toJointBody.id);
     const sameUserGuestItem = sameUserGuestMessage?.actionMetadata?.forwardedItems?.[0];
-    assert.equal(sameUserGuestItem?.sourceServerId, null);
-    assert.equal(sameUserGuestItem?.sourceTargetId, null);
+    assert.equal(Object.hasOwn(sameUserGuestItem ?? {}, "sourceServerId"), false, "sourceServerId is removed, not null");
+    assert.equal(Object.hasOwn(sameUserGuestItem ?? {}, "sourceTargetId"), false, "sourceTargetId is removed, not null");
     assert.equal(sameUserGuestItem?.sourceTargetSnapshot.id, null);
     assert.equal(sameUserGuestItem?.sourceTargetSnapshot.label, "");
     assert.equal(sameUserGuestItem?.sourceTargetSnapshot.labelVisibility, "restricted");
@@ -6802,7 +7168,7 @@ test("POST /messages/forward supports joint destinations and restricted joint so
         } | null;
       }>;
     }).messages.find((message) => message.id === toJointBody.id);
-    assert.equal(guestContextTarget?.actionMetadata?.forwardedItems?.[0]?.sourceTargetId, null);
+    assert.equal(Object.hasOwn(guestContextTarget?.actionMetadata?.forwardedItems?.[0] ?? {}, "sourceTargetId"), false, "sourceTargetId is removed, not null");
     assert.equal(guestContextTarget?.actionMetadata?.forwardedItems?.[0]?.sourceTargetSnapshot.label, "");
     assert.equal(guestContextTarget?.actionMetadata?.forwardedItems?.[0]?.sourceTargetSnapshot.labelVisibility, "restricted");
     assert.equal(guestContextTarget?.actionMetadata?.forwardedItems?.[0]?.provenanceState, "original_unavailable");
@@ -6823,7 +7189,7 @@ test("POST /messages/forward supports joint destinations and restricted joint so
         } | null;
       }>;
     }).messages.find((message) => message.id === toJointBody.id);
-    assert.equal(sameUserContextTarget?.actionMetadata?.forwardedItems?.[0]?.sourceServerId, null);
+    assert.equal(Object.hasOwn(sameUserContextTarget?.actionMetadata?.forwardedItems?.[0] ?? {}, "sourceServerId"), false, "sourceServerId is removed, not null");
     assert.equal(sameUserContextTarget?.actionMetadata?.forwardedItems?.[0]?.sourceTargetSnapshot.label, "");
     assert.equal(sameUserContextTarget?.actionMetadata?.forwardedItems?.[0]?.sourceTargetSnapshot.labelVisibility, "restricted");
 
@@ -6841,7 +7207,7 @@ test("POST /messages/forward supports joint destinations and restricted joint so
         }>;
       } | null;
     }>).find((message) => message.id === toJointBody.id);
-    assert.equal(sameUserSyncTarget?.actionMetadata?.forwardedItems?.[0]?.sourceServerId, null);
+    assert.equal(Object.hasOwn(sameUserSyncTarget?.actionMetadata?.forwardedItems?.[0] ?? {}, "sourceServerId"), false, "sourceServerId is removed, not null");
     assert.equal(sameUserSyncTarget?.actionMetadata?.forwardedItems?.[0]?.sourceTargetSnapshot.label, "");
     assert.equal(sameUserSyncTarget?.actionMetadata?.forwardedItems?.[0]?.sourceTargetSnapshot.labelVisibility, "restricted");
 

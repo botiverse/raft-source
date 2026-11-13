@@ -1,3 +1,4 @@
+import { fillJointMembersFromChannelHumans } from "../test/jointMemberFill";
 import { dbTest as test } from "../test/integration/dbTest";
 import { closeTestDatabase } from "../test/integration/database";
 import assert from "node:assert/strict";
@@ -237,6 +238,7 @@ test("persisted message boundary expands joint storage rows to local projection 
     { channelId: localChannelA.id, userId: ownerA.id },
     { channelId: localChannelB.id, userId: ownerB.id },
   ]);
+  await fillJointMembersFromChannelHumans();
   const [message] = await db.insert(messages).values({
     channelId: canonicalChannel.id,
     senderType: "user",
@@ -351,6 +353,7 @@ test("persisted message boundary skips local joint-face rows", async ({ db: data
     { channelId: localChannelA.id, userId: ownerA.id },
     { channelId: localChannelB.id, userId: ownerB.id },
   ]);
+  await fillJointMembersFromChannelHumans();
   const [message] = await db.insert(messages).values({
     channelId: localChannelA.id,
     senderType: "user",

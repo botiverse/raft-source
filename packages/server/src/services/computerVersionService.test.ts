@@ -5,6 +5,7 @@ import {
   resolveComputerUpgradeAvailable,
   __resetLatestComputerVersionForTest,
 } from "./computerVersionService";
+import { setPrivacyModeForTest } from "../config/privacyMode";
 
 const LATEST_BUILD_URL = "https://hands.build/public/v2/apps/raft-computer-cli/latest?channel=main";
 
@@ -28,6 +29,27 @@ function deferred<T>() {
   });
   return { promise, resolve };
 }
+
+test("RAFT_PRIVACY_MODE: getLatestComputerVersion makes no request and is unknown", async () => {
+  __resetLatestComputerVersionForTest();
+  const originalFetch = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = (async () => {
+    calls += 1;
+    return notFound();
+  }) as typeof fetch;
+  setPrivacyModeForTest(true);
+  try {
+    assert.equal(await getLatestComputerVersion(), null);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(calls, 0);
+    assert.equal(getLatestComputerReleaseNotes(), null);
+  } finally {
+    setPrivacyModeForTest(false);
+    globalThis.fetch = originalFetch;
+    __resetLatestComputerVersionForTest();
+  }
+});
 
 test("getLatestComputerVersion returns stale cache immediately and refreshes in background", async () => {
   __resetLatestComputerVersionForTest();

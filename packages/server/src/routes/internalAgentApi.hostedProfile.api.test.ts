@@ -12,7 +12,7 @@ import { createServer } from "../services/serverService";
 import { createAgent } from "../services/agentService";
 import { mintAgentCredential } from "../services/agentCredentialService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 async function seed(hosted: boolean) {
   const suffix = randomUUID();
@@ -29,7 +29,7 @@ async function seed(hosted: boolean) {
     model: "external",
     description: "Human-written instructions",
   });
-  const minted = await mintAgentCredential({ agentId: agent.id, scopes: ["send", "read"], name: "hosted", createdByUserId: owner!.id });
+  const minted = await mintAgentCredential({ agentId: agent.id, scopes: ["send", "read"], name: "hosted", issuedVia: "human", createdByUserId: owner!.id });
   if (hosted) {
     await getDb().insert(agentRuntimeProvisions).values({
       agentId: agent.id,

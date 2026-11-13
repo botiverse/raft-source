@@ -1,11 +1,10 @@
 import { execFileSync } from "node:child_process";
 import { writeFile } from "node:fs/promises";
-import { expect, test } from "@playwright/test";
+import { expect } from "@playwright/test";
 import type { APIRequestContext, Page, TestInfo } from "@playwright/test";
 import { recordHistoryRequests } from "../fixtures/historyRequestEvidence";
-import { loginViaApi } from "../fixtures/auth";
-import { waitForSeedState } from "../fixtures/seedState";
-import type { PlaywrightSeedState } from "../fixtures/seedState";
+import { seedChannelHistory, test } from "../fixtures/scenario";
+import type { ScenarioSeedState } from "../fixtures/seedState";
 
 // First-principles regression harness for message list stability.
 //
@@ -96,7 +95,7 @@ const APPEND_LEDGER_TEST_ID = "message-list-stability:append-mid-list";
 
 async function postMessage(
   request: APIRequestContext,
-  seedState: PlaywrightSeedState,
+  seedState: ScenarioSeedState,
   accessToken: string,
   channelId: string,
   content: string,
@@ -120,7 +119,9 @@ async function readMetrics(page: Page) {
     scrollHeight: el.scrollHeight,
     clientHeight: el.clientHeight,
     bottomGap: Math.max(0, el.scrollHeight - el.scrollTop - el.clientHeight),
-    itemCount: el.querySelectorAll("[data-index]").length,
+    // The virtual timeline mounts only the rows near the view and says how
+    // many messages are loaded.
+    itemCount: Number((el as HTMLElement).dataset.loadedMessageCount),
   }));
 }
 
@@ -233,7 +234,8 @@ async function installAppendLedger(page: Page, metadata: TimelineLedgerMetadata)
       maybeRecordTarget("targetResizeSeen");
     });
     resizeObserver.observe(scroller);
-    const content = scroller.firstElementChild;
+    // The rows' spacer; the scroller's first child is ScrollArea's zero-height rails layer.
+    const content = scroller.querySelector(":scope > [data-slot=virtual-list-items]");
     if (content) resizeObserver.observe(content);
 
     scroller.addEventListener("scroll", (event) => {
@@ -377,8 +379,9 @@ async function scrollAwayFromBottom(page: Page) {
   }
 }
 
-// Mirror MessageTimeline.captureAnchor's semantic: the topmost message whose
-// bottom is below the scroller's top edge. This is the anchor the primitive
+// Mirror the timeline's top visible row (topVisibleMessage in
+// VirtualMessageTimeline): the topmost message whose bottom is below the
+// scroller's top edge. This is the anchor the primitive
 // restores across resize / append / prepend.
 async function captureAnchor(page: Page): Promise<Anchor | null> {
   return page.getByTestId("message-scroller").evaluate((el) => {
@@ -414,6 +417,11 @@ async function measureAnchorDrift(page: Page, before: Anchor): Promise<number> {
   return after ?? Number.POSITIVE_INFINITY;
 }
 
+// Each test runs in a tenant of its own (fixtures/scenario: its own owner,
+// server and channel, with a seeded history): specs in other workers post to
+// the shared seeded channel, so its seeded latest message is not always the
+// newest, the virtual timeline does not mount it at the tail, and its size is
+// not known.
 test.describe("message list stability", () => {
   test.use({ viewport: { width: 390, height: 844 } });
 
@@ -424,14 +432,16 @@ test.describe("message list stability", () => {
   // tail. The anchored message should not move more than the height delta.
   test("viewport shrink while scrolled mid-list does not jump to bottom", async ({
     page,
-    request,
+    scenario,
   }) => {
-    const seedState = await waitForSeedState();
-    await loginViaApi(request, seedState);
+    const { seed } = scenario;
+    // One page (50): no older page loads while it reads, so the anchor's
+    // offset in the content moves only if the shrink moves it.
+    const history = await seedChannelHistory(seed, { count: 50 });
 
-    await page.goto(`/s/${seedState.server.slug}/channel/${seedState.channel.id}`);
+    await page.goto(`/s/${seed.server.slug}/channel/${seed.channel.id}`);
     await expect(page.getByTestId("message-scroller")).toBeVisible();
-    await expect(page.getByText(seedState.messages.latestContent)).toBeVisible();
+    await expect(page.getByText(history.latestContent)).toBeVisible();
 
     // Scroll up several screens so the user is well away from the tail.
     await scrollAwayFromBottom(page);
@@ -452,7 +462,8 @@ test.describe("message list stability", () => {
     const afterMetrics = await readMetrics(page);
     console.log(
       `[viewport-shrink] anchor=${before!.messageId} drift=${drift.toFixed(1)}px ` +
-        `bottomGap before=${beforeMetrics.bottomGap.toFixed(0)} after=${afterMetrics.bottomGap.toFixed(0)}`,
+        `bottomGap before=${beforeMetrics.bottomGap.toFixed(0)} after=${afterMetrics.bottomGap.toFixed(0)} ` +
+        `loaded before=${beforeMetrics.itemCount} after=${afterMetrics.itemCount}`,
     );
 
     expect(drift, "anchored message must not drift more than ~120px on viewport shrink").toBeLessThan(120);
@@ -469,17 +480,19 @@ test.describe("message list stability", () => {
   test("new message while reading mid-list does not yank scroll to bottom", async ({
     page,
     request,
+    scenario,
   }, testInfo) => {
-    const seedState = await waitForSeedState();
-    const login = await loginViaApi(request, seedState);
+    const { seed, login } = scenario;
+    // One page (50): no older page loads while it reads.
+    const history = await seedChannelHistory(seed, { count: 50 });
     const hostLedger = createHostAppendLedger(testInfo);
     let ledgerInstalled = false;
     let testFailed = false;
 
     try {
-      await page.goto(`/s/${seedState.server.slug}/channel/${seedState.channel.id}`);
+      await page.goto(`/s/${seed.server.slug}/channel/${seed.channel.id}`);
       await expect(page.getByTestId("message-scroller")).toBeVisible();
-      await expect(page.getByText(seedState.messages.latestContent)).toBeVisible();
+      await expect(page.getByText(history.latestContent)).toBeVisible();
 
       await scrollAwayFromBottom(page);
 
@@ -494,9 +507,9 @@ test.describe("message list stability", () => {
 
       const posted = await postMessage(
         request,
-        seedState,
+        seed,
         login.accessToken,
-        seedState.channel.id,
+        seed.channel.id,
         `[stability-harness] mid-list append ${Date.now()}`,
       );
       hostLedger.targetMessageId = posted.id;
@@ -639,48 +652,23 @@ test.describe("message list stability", () => {
   for (const pattern of ["burst", "slow"] as ScrollPattern[]) {
     test(`lazy-load history is complete and dedup'd under ${pattern} scroll`, async ({
       page,
-      request,
+      scenario,
     }, testInfo) => {
-      const seedState = await waitForSeedState();
-      const login = await loginViaApi(request, seedState);
+      const { seed } = scenario;
+      // Two older pages (of 50) past the first.
+      const history = await seedChannelHistory(seed, { count: 120 });
+      const expectedAtLeast = history.messages.length;
 
-      // Other tests in this suite post messages to the seed channel,
-      // so the seed-time `messages.total` is a lower bound. Probe the
-      // current real total via the API at test time so completeness is
-      // pinned against ground truth, not a stale snapshot.
-      const totalsResponse = await request.get(
-        `${seedState.urls.api}/api/messages/channel/${seedState.channel.id}?limit=1`,
-        {
-          headers: {
-            Authorization: `Bearer ${login.accessToken}`,
-            "X-Server-Id": seedState.server.id,
-          },
-        },
-      );
-      if (!totalsResponse.ok()) {
-        throw new Error(
-          `failed to probe channel size: ${totalsResponse.status()} ${totalsResponse.statusText()}`,
-        );
-      }
-      const probeBody = await totalsResponse.json();
-      const latestSeq: number = (probeBody.messages?.[0] ?? probeBody[0])?.seq ?? 0;
-      // Server seq is monotonic across the whole server but our seed reserves
-      // a contiguous block per channel, so the actual count is best derived
-      // from a count endpoint. Lacking one, fall back to scrolling all the
-      // way and asserting that itemCount >= seedTotal AND that the topmost
-      // visible message is older than the initial-window minSeq.
-      const expectedAtLeast = seedState.messages.total;
-
-      const evidence = recordHistoryRequests(page, seedState.channel.id);
+      const evidence = recordHistoryRequests(page, seed.channel.id);
       const olderRequests = evidence.olderRequests;
       try {
-        await page.goto(`/s/${seedState.server.slug}/channel/${seedState.channel.id}`);
+        await page.goto(`/s/${seed.server.slug}/channel/${seed.channel.id}`);
         await expect(page.getByTestId("message-scroller")).toBeVisible();
 
         const initialMetrics = await readMetrics(page);
         console.log(
           `[lazy-load:${pattern}] initial itemCount=${initialMetrics.itemCount} ` +
-            `seedTotal=${seedState.messages.total} latestSeq=${latestSeq}`,
+            `seeded=${history.messages.length}`,
         );
 
         // Pull to top in a loop. Anchor restoration on prepend means a
@@ -696,14 +684,16 @@ test.describe("message list stability", () => {
             `cursors=[${cursors.join(",")}]`,
         );
 
-        // No omission: every seeded message is in the DOM. Other tests in
-        // this suite may have appended live messages, so the floor is the
-        // seed total — itemCount can be greater than the seed if live
-        // messages arrived during the run, but never less.
-        await expect(page.getByText(seedState.messages.latestContent)).toBeVisible();
+        // No omission: every seeded message is loaded. The tail is still
+        // loaded too: back at the bottom (the virtual timeline mounts only
+        // the rows near the view), the latest message shows.
+        await page.getByTestId("message-scroller").evaluate((el) => {
+          el.scrollTop = el.scrollHeight;
+        });
+        await expect(page.getByText(history.latestContent)).toBeVisible();
         expect(
           finalMetrics.itemCount,
-          `complete history: expected at least ${expectedAtLeast} items in DOM`,
+          `complete history: expected at least ${expectedAtLeast} messages loaded`,
         ).toBeGreaterThanOrEqual(expectedAtLeast);
 
         // No duplicate: every `before=<seq>` cursor was requested at most

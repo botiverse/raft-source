@@ -370,21 +370,24 @@ test("dismiss command shares the same exact fired-item acknowledgement path", as
   ]);
 });
 
-test("repeat ack is idempotent only with an exact durable acknowledged-source tombstone", async () => {
+test("repeat ack of an acked item sends the daemon the ack (it forwards it to the Server) and reports it acknowledged", async () => {
   const { io, stdout } = memoryIo();
-  const requests: Array<{ method: string; path: string }> = [];
+  const requests: Array<{ method: string; path: string; body?: unknown }> = [];
   const ctx = createCommandContext({
     io,
     loadAgentContext: () => agentContext,
     createApiClient: () => ({
-      request: async (method: string, path: string): Promise<ApiResponse<unknown>> => {
-        requests.push({ method, path });
+      request: async (method: string, path: string, body?: unknown): Promise<ApiResponse<unknown>> => {
+        requests.push({ method, path, ...(body === undefined ? {} : { body }) });
         if (method === "GET" && path === "/internal/agent-api/inbox") {
           return ok({
             rows: [],
             items: [],
             acknowledged_app_sources: [acknowledgedSource({ revision: "7" })],
           });
+        }
+        if (method === "POST" && path === "/internal/agent-api/inbox/ack") {
+          return ok({ ok: true, itemId: `reminder:${reminderId}:7`, remaining_app_items: 0, replayed: true });
         }
         throw new Error(`unexpected request ${method} ${path}`);
       },
@@ -396,7 +399,30 @@ test("repeat ack is idempotent only with an exact durable acknowledged-source to
   assert.match(stdout.join(""), /was already acknowledged for this fired item/);
   assert.deepEqual(requests, [
     { method: "GET", path: "/internal/agent-api/inbox" },
+    { method: "POST", path: "/internal/agent-api/inbox/ack", body: { itemId: `reminder:${reminderId}:7` } },
   ]);
+});
+
+test("repeat ack against a daemon that only knows the local tombstone (item_not_found) keeps the old answer", async () => {
+  const { io, stdout } = memoryIo();
+  const ctx = createCommandContext({
+    io,
+    loadAgentContext: () => agentContext,
+    createApiClient: () => ({
+      request: async (method: string, path: string): Promise<ApiResponse<unknown>> => {
+        if (method === "GET" && path === "/internal/agent-api/inbox") {
+          return ok({ rows: [], items: [], acknowledged_app_sources: [acknowledgedSource({ revision: "7" })] });
+        }
+        if (method === "POST" && path === "/internal/agent-api/inbox/ack") {
+          return { ok: false, status: 404, error: "item not found", errorCode: "item_not_found", data: null };
+        }
+        throw new Error(`unexpected request ${method} ${path}`);
+      },
+    }) as never,
+  });
+
+  await reminderAckCommand.handler(ctx, { id: reminderId, revision: "7" });
+  assert.match(stdout.join(""), /was already acknowledged for this fired item/);
 });
 
 test("ack 404 after a stale snapshot only succeeds with a refreshed exact tombstone", async () => {
@@ -470,15 +496,20 @@ test("ack 404 after a stale snapshot fails closed without a refreshed exact tomb
   );
 });
 
-test("ack does not treat absence as idempotency without an exact tombstone", async () => {
+test("ack of a full reminder id the daemon does not hold sends the exact source; item_not_found fails closed", async () => {
   const { io } = memoryIo();
+  const bodies: unknown[] = [];
   const ctx = createCommandContext({
     io,
     loadAgentContext: () => agentContext,
     createApiClient: () => ({
-      request: async (method: string, path: string): Promise<ApiResponse<unknown>> => {
+      request: async (method: string, path: string, body?: unknown): Promise<ApiResponse<unknown>> => {
         if (method === "GET" && path === "/internal/agent-api/inbox") {
           return ok({ rows: [], items: [], acknowledged_app_sources: [] });
+        }
+        if (method === "POST" && path === "/internal/agent-api/inbox/ack") {
+          bodies.push(body);
+          return { ok: false, status: 404, error: "item not found", errorCode: "item_not_found", data: null };
         }
         throw new Error(`unexpected request ${method} ${path}`);
       },
@@ -492,6 +523,45 @@ test("ack does not treat absence as idempotency without an exact tombstone", asy
       return true;
     },
   );
+  assert.deepEqual(bodies, [{
+    itemId: `reminder:${reminderId}:7`,
+    source: { appId: "system.reminder", notificationClass: "due", sourceRef: { kind: "reminder", id: reminderId, revision: "7" } },
+  }]);
+});
+
+test("ack of a short id nothing local matches asks for the full id without posting", async () => {
+  const { io } = memoryIo();
+  const requests: string[] = [];
+  const ctx = createCommandContext({
+    io,
+    loadAgentContext: () => agentContext,
+    createApiClient: () => ({
+      request: async (method: string, path: string): Promise<ApiResponse<unknown>> => {
+        requests.push(`${method} ${path}`);
+        if (method === "GET" && path === "/internal/agent-api/inbox") {
+          return ok({ rows: [], items: [], acknowledged_app_sources: [] });
+        }
+        throw new Error(`unexpected request ${method} ${path}`);
+      },
+    }) as never,
+  });
+
+  await assert.rejects(
+    async () => { await Promise.resolve(reminderAckCommand.handler(ctx, { id: reminderId.slice(0, 8), revision: "7" })); },
+    (error: unknown) => {
+      assert.equal((error as { code?: string }).code, "ACK_FAILED");
+      assert.equal(
+        (error as { message?: string }).message,
+        "No reminder Inbox item on this Computer matches 12345678 revision 7, so the short id cannot be resolved",
+      );
+      assert.equal(
+        (error as { suggestedNextAction?: string }).suggestedNextAction,
+        "Run the ack with the full reminder id from its ack: line in raft inbox check.",
+      );
+      return true;
+    },
+  );
+  assert.deepEqual(requests, ["GET /internal/agent-api/inbox"]);
 });
 
 test("repeat ack of N stays idempotent after the same reminder advances to active N+1", async () => {
@@ -510,6 +580,9 @@ test("repeat ack of N stays idempotent after the same reminder advances to activ
             acknowledged_app_sources: [acknowledgedSource({ revision: "7" })],
           });
         }
+        if (method === "POST" && path === "/internal/agent-api/inbox/ack") {
+          return ok({ ok: true, itemId: `reminder:${reminderId}:7`, remaining_app_items: 1 });
+        }
         throw new Error(`unexpected request ${method} ${path}`);
       },
     }) as never,
@@ -520,6 +593,7 @@ test("repeat ack of N stays idempotent after the same reminder advances to activ
   assert.match(stdout.join(""), /was already acknowledged for this fired item/);
   assert.deepEqual(requests, [
     { method: "GET", path: "/internal/agent-api/inbox" },
+    { method: "POST", path: "/internal/agent-api/inbox/ack" },
   ]);
 });
 

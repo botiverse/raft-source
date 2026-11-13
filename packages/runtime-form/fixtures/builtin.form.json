@@ -49,6 +49,19 @@
         "additionalProperties": {
           "type": "string"
         }
+      },
+      "reasoningEffort": {
+        "type": "string",
+        "title": "Reasoning",
+        "x-optionSource": "reasoningEffort"
+      },
+      "contextWindow": {
+        "type": "string",
+        "title": "Context window (tokens)"
+      },
+      "maxOutputTokens": {
+        "type": "string",
+        "title": "Max output tokens"
       }
     }
   },
@@ -59,11 +72,16 @@
       "baseUrl",
       "supportsImageInput",
       "model",
+      "reasoningEffort",
+      "contextWindow",
+      "maxOutputTokens",
       "loadLocalPlugins",
       "envVars"
     ],
     "layout": {
       "advanced": [
+        "/contextWindow",
+        "/maxOutputTokens",
         "/loadLocalPlugins",
         "/envVars"
       ]
@@ -86,6 +104,28 @@
           "in": [
             "openai-compatible",
             "anthropic-compatible"
+          ]
+        }
+      },
+      {
+        "pointer": "/contextWindow",
+        "when": {
+          "pointer": "/providerId",
+          "in": [
+            "openai-compatible",
+            "anthropic-compatible",
+            "openrouter"
+          ]
+        }
+      },
+      {
+        "pointer": "/maxOutputTokens",
+        "when": {
+          "pointer": "/providerId",
+          "in": [
+            "openai-compatible",
+            "anthropic-compatible",
+            "openrouter"
           ]
         }
       }
@@ -119,6 +159,19 @@
       "envVars": {
         "label": "Environment Variables",
         "hint": "These will be injected into the runtime command environment."
+      },
+      "reasoningEffort": {
+        "label": "Reasoning"
+      },
+      "contextWindow": {
+        "label": "Context window (tokens)",
+        "placeholder": "200000",
+        "hint": "Optional. Overrides the model's context window. Leave empty to use the listed model's own value or Raft's default. A gateway can provide both limits automatically. [Learn more](https://docs.raft.build/developers/gateway-model-limits/)"
+      },
+      "maxOutputTokens": {
+        "label": "Max output tokens",
+        "placeholder": "8192",
+        "hint": "Optional. Overrides the most tokens the model may write in one reply. Leave empty to use the listed model's own value or Raft's default. A gateway can provide both limits automatically. [Learn more](https://docs.raft.build/developers/gateway-model-limits/)"
       }
     }
   },
@@ -151,9 +204,11 @@
       "kind": "dependent_select",
       "pointer": "/model",
       "dependsOn": "/providerId"
+    },
+    "reasoningEffort": {
+      "kind": "select",
+      "sourceId": "reasoningEffort",
+      "pointer": "/reasoningEffort"
     }
-  },
-  "requiredClientCapabilities": [
-    "option_source.status"
-  ]
+  }
 }

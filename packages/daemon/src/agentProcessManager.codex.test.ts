@@ -1,13 +1,15 @@
 import assert from "node:assert/strict";
+import { assertBodyOnlyInInboxPreview, assertNoMatchOutsideInboxPreview } from "./testing/inboxPreview";
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { mkdtemp, mkdir, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn as nodeSpawn, type ChildProcess } from "node:child_process";
 import { type AxSurfaceText,
+  AGENT_EVENT_TAIL_RUNTIME_INPUT_SOURCE_BASES,
   BasicTracer,
   assertSurfaceProducerFactLineage,
   createScopedTracer,
@@ -24,9 +26,10 @@ import { type AxSurfaceText,
   MODEL_SEEN_MAX_ITEMS_PER_REPORT,
 } from "@botiverse/raft-shared";
 import { AgentProcessManager, DecisionErrorWindow, resolveRuntimeSessionRef, type RuntimeProcessGate } from "./agentProcessManager";
+import { CodexDriver } from "./drivers/codex";
 import { OUTBOX_NORMAL_CAP, RuntimeOutcomeOutbox, nodeOutboxFs } from "./runtimeOutcomeOutbox";
 import { subscribeDaemonLogs } from "./logger";
-import { buildRuntimeErrorActivityDiagnostic, formatRuntimeBillingExhaustedMessage } from "./runtimeErrorDiagnostics";
+import { buildRuntimeErrorActivityDiagnostic } from "./runtimeErrorDiagnostics";
 import { CODEX_TOOL_ARGUMENT_PARSE_UPSTREAM_FIXTURE } from "./codexToolArgumentParseSignature";
 import { installDaemonFetchMockForTests } from "./daemonFetch";
 import { installManagedRunnerCredentialFetch } from "./testing/managedRunnerCredentialFetch";
@@ -43,6 +46,7 @@ import { readContextGeneration } from "./contextGeneration";
 import {
   createPiSdkEventMappingState,
   mapPiSdkEventToParsedEvents,
+  PiDriver,
 } from "./drivers/pi";
 import { buildCliSystemPrompt } from "./drivers/systemPrompt";
 import { RuntimeNotificationState } from "./runtimeNotificationState";
@@ -64,6 +68,9 @@ import { DAEMON_CORE_TRACE_ATTR_CONTRACTS } from "./core";
 import { FakeClock, waitForExactCount } from "./testing/drydock";
 import type { AgentSessionEvent } from "@earendil-works/pi-coding-agent";
 import { releaseAgentManagerForTests } from "./testing/agentManagerTeardown";
+import { afterFreshSessionStandingPrompt, afterStartupMemoryBlock } from "./testing/promptFixture";
+import { standingPromptHash } from "./standingPromptRefresh";
+import { LocalRotatingTraceSink } from "@botiverse/raft-trace-client";
 
 const testDir = path.dirname(fileURLToPath(import.meta.url));
 
@@ -149,9 +156,22 @@ test("runtime profile session refs resolve local JSONL paths", async () => {
       JSON.stringify({ sessionId: kimiSessionId, sessionDir: kimiSessionDir, workDir: "/tmp/ws" }) + "\n",
     );
 
-    assert.deepEqual(resolveRuntimeSessionRef("kimi-sdk", kimiSessionId, homeDir, undefined, { agentId: kimiAgentId }), {
+    // The legacy kimi CLI layout (~/.kimi) is the `kimi` runtime's; kimi-sdk
+    // reads its SDK home (agentProcessManager.sessionTranscript.test.ts).
+    assert.deepEqual(resolveRuntimeSessionRef("kimi", kimiSessionId, homeDir, undefined, { agentId: kimiAgentId }), {
       label: kimiSessionId,
       path: kimiSessionDir,
+      runtime: "kimi",
+      reachable: true,
+    });
+    const kimiSdkSessionId = "session_0f5a7d2c-1c2b-4d4e-8f00-0a1b2c3d4e5f";
+    const kimiSdkHome = path.join(homeDir, "kimi-code-home");
+    const kimiSdkWire = path.join(kimiSdkHome, "sessions", "wk_1", kimiSdkSessionId, "agents", "main", "wire.jsonl");
+    await mkdir(path.dirname(kimiSdkWire), { recursive: true });
+    await writeFile(kimiSdkWire, "{}\n");
+    assert.deepEqual(resolveRuntimeSessionRef("kimi-sdk", kimiSdkSessionId, homeDir, undefined, { kimiCodeHome: kimiSdkHome }), {
+      label: kimiSdkSessionId,
+      path: kimiSdkWire,
       runtime: "kimi-sdk",
       reachable: true,
     });
@@ -216,7 +236,7 @@ class FakeCodexDriver implements RuntimeDriver {
   readonly lifecycle: RuntimeDriver["lifecycle"];
   readonly communication: RuntimeDriver["communication"];
   readonly stdoutChannel: RuntimeDriver["stdoutChannel"];
-  readonly session = { recovery: "resume_or_fresh" } as const;
+  readonly session: RuntimeDriver["session"];
   readonly model = { detectedModelsVerifiedAs: "suggestion_only" } as const;
   readonly startupReadiness?: RuntimeDriver["startupReadiness"];
   readonly requiresSessionInitForDelivery?: boolean;
@@ -247,8 +267,11 @@ class FakeCodexDriver implements RuntimeDriver {
     ignoredKillSignals?: Array<NodeJS.Signals | number | undefined>;
     startupReadiness?: RuntimeDriver["startupReadiness"];
     requiresSessionInitForDelivery?: boolean;
+    /** The session contract, when a test stands in for a runtime that declares another one. */
+    session?: RuntimeDriver["session"];
   } = {}) {
     this.id = opts.id || "codex";
+    this.session = opts.session ?? { recovery: "resume_or_fresh", compaction: "reported", compactionFailure: "does_not_stick" };
     this.stdoutChannel = this.id === "codex" ? "structured_protocol" : "diagnostic";
     this.supportsStdinNotification = opts.supportsStdinNotification ?? false;
     this.busyDeliveryMode = opts.busyDeliveryMode ?? "none";
@@ -286,8 +309,12 @@ class FakeCodexDriver implements RuntimeDriver {
     return !!this.deferredWakePattern?.test(message.content);
   }
 
+  /** While set, spawn throws it (a runtime that cannot start). */
+  failSpawnWith?: Error;
+
   spawn(ctx: SpawnContext): SpawnResult {
     this.spawnCalls.push(ctx);
+    if (this.failSpawnWith) throw this.failSpawnWith;
     const proc = new FakeChildProcess();
     proc.ignoredKillSignals = new Set(this.ignoredKillSignals);
     this.processes.push(proc);
@@ -501,7 +528,7 @@ test("tracked mention delivered to an idle runtime emits receive, drain, then on
   });
 });
 
-test("tracked mention accepted while busy drains exactly once at turn end", async () => {
+test("tracked mention accepted while busy and never read drains exactly once at turn end", async () => {
   await withManager(async ({ driver, manager }) => {
     await manager.startAgent("agent-1", makeConfig({ sessionId: "session-1" }), undefined, undefined, undefined, "launch-1");
     const ap = (manager as any).agents.get("agent-1");
@@ -525,7 +552,7 @@ test("tracked mention accepted while busy drains exactly once at turn end", asyn
     assert.deepEqual(transitions, ["daemon_received", "daemon_pending"]);
     assert.equal(ackCount, 0);
     assert.equal(ap.inbox.length, 1);
-    assert.equal(ap.notifications.hasTimer, false, "tracked busy delivery must not force-wake");
+    assert.equal(ap.notifications.hasTimer, true, "a busy tracked mention gets the mid-turn notice like any message");
 
     driver.parsedLines.set("tracked-busy-turn-end", [{ kind: "turn_end", sessionId: "session-1" }]);
     driver.processes[0].stdout.emit("data", Buffer.from("tracked-busy-turn-end\n"));
@@ -534,6 +561,46 @@ test("tracked mention accepted while busy drains exactly once at turn end", asyn
     assert.deepEqual(transitions, ["daemon_received", "daemon_pending", "daemon_drained"]);
     assert.equal(ackCount, 1);
     assert.equal(driver.encodedCalls.length, 1);
+  });
+});
+
+test("tracked mention accepted while busy gets the mid-turn notice and is ACKed when the agent reads it, not again at turn end", async () => {
+  await withManager(async ({ driver, manager }) => {
+    await manager.startAgent("agent-1", makeConfig({ sessionId: "session-1" }), undefined, undefined, undefined, "launch-1");
+    const ap = (manager as any).agents.get("agent-1");
+    const transitions: string[] = [];
+    let ackCount = 0;
+    const message = makeMessage("tracked busy mention", { message_id: "mention-read-message", seq: 7003 });
+    assert.equal(manager.deliverMessage("agent-1", message, {
+      deliveryId: "mention-read-occurrence",
+      mentionDelivery: {
+        occurrenceId: "mention-read-occurrence",
+        messageId: "mention-read-message",
+        machineId: "machine-1",
+        launchId: ap.launchId,
+        sessionId: "session-1",
+      },
+      onMentionTransition: (stage) => transitions.push(stage),
+      onMentionAck: () => { ackCount += 1; },
+    }), true);
+
+    assert.equal(ap.notifications.hasTimer, true, "the mid-turn notice is scheduled");
+    (manager as any).sendStdinNotification("agent-1");
+    await waitFor(() => driver.encodedCalls.length === 1, "mid-turn notice written");
+    assert.equal(driver.encodedCalls[0]?.mode, "busy");
+    assert.match(driver.encodedCalls[0]?.text ?? "", /^\[Raft inbox notice:/);
+    assert.equal(ackCount, 0, "a notice is not a read");
+
+    // The agent reads its inbox mid-turn: the check/read path records the row model-seen.
+    (manager as any).consumeVisibleMessages("agent-1", { messages: [message], source: "agent_api_events_local" });
+    assert.deepEqual(transitions, ["daemon_received", "daemon_pending", "daemon_drained"]);
+    assert.equal(ackCount, 1, "ACKed when read");
+
+    driver.parsedLines.set("tracked-read-turn-end", [{ kind: "turn_end", sessionId: "session-1" }]);
+    driver.processes[0].stdout.emit("data", Buffer.from("tracked-read-turn-end\n"));
+    await flush();
+    assert.equal(ackCount, 1, "not ACKed again at turn end");
+    assert.equal(driver.encodedCalls.length, 1, "no new turn for a mention already read");
   });
 });
 
@@ -721,6 +788,15 @@ async function readTranscriptFixture(name: string): Promise<string> {
   return readFile(new URL(`./testdata/runtime-transcripts/${name}`, import.meta.url), "utf8");
 }
 
+/** A per_turn process ends a turn that ran, then exits 0. An exit with no event at all is D6 (planExit), which backs off. */
+function endPerTurnTurn(driver: FakeCodexDriver, processIndex: number): void {
+  driver.parsedLines.set("per-turn-output", [{ kind: "text", text: "Done." }]);
+  const child = driver.processes[processIndex];
+  child.stdout.emit("data", Buffer.from("per-turn-output\n"));
+  child.exit(0);
+  child.close(0);
+}
+
 async function waitFor(condition: () => boolean, label: string): Promise<void> {
   // Stale-runtime tests freeze Date.now; the test deadline must still advance.
   const deadline = performance.now() + 1_000;
@@ -810,9 +886,9 @@ function assertContentFreeInboxUpdatePrompt(prompt: string, forbiddenContent: st
   const forbidden = Array.isArray(forbiddenContent) ? forbiddenContent : [forbiddenContent];
   for (const value of forbidden) {
     if (typeof value === "string") {
-      assert.doesNotMatch(prompt, new RegExp(value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+      assertNoMatchOutsideInboxPreview(prompt, new RegExp(value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
     } else {
-      assert.doesNotMatch(prompt, value);
+      assertNoMatchOutsideInboxPreview(prompt, value);
     }
   }
   assert.doesNotMatch(prompt, /^New messages? received:/);
@@ -1474,7 +1550,7 @@ async function withManager(fn: (ctx: {
   driver?: FakeCodexDriver;
   defaultAgentEnvVarsProvider?: (config: Pick<AgentConfig, "runtime" | "model" | "envVars">) => Promise<Record<string, string> | null> | Record<string, string> | null;
   tracer?: Tracer;
-  cancelledStartCleanup?: { sigtermGraceMs?: number; verifyMs?: number };
+  stopKill?: { graceMs?: number; confirmMs?: number };
   daemonVersion?: string | null;
   daemonInstanceId?: string | null;
   computerVersion?: string | null;
@@ -1488,7 +1564,7 @@ async function withManager(fn: (ctx: {
     jitterRandom?: () => number;
     failPointForTesting?: (args: { agentId: string; message: string }) => {
       terminalFailure?: { detail: string; actionRequired: boolean; entries?: TrajectoryEntry[] } | null;
-      stickyTerminalFailure?: { detail: string; actionRequired: boolean; entries?: TrajectoryEntry[] } | null;
+      stickyTerminalFailure?: { detail: string; actionRequired: boolean; entries?: TrajectoryEntry[]; kind?: "input_too_large" | "compaction_failed" | "model_unsupported" } | null;
       reason?: string | null;
     } | null | undefined;
   };
@@ -1500,7 +1576,9 @@ async function withManager(fn: (ctx: {
   };
   appInboxForAgent?: (agentId: string) => AgentAppInboxStore;
   onAgentWorkingToIdle?: (agentId: string) => void;
+  onRuntimeAbsentLocalStop?: (runtime: string) => void;
   runtimeProcessGate?: RuntimeProcessGate;
+  reportThirdPartyEventsDelivered?: (agentId: string, eventIds: readonly string[]) => void;
 } = {}) {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "slock-daemon-test-"));
   const sent: MachineToServerMessage[] = [];
@@ -1520,7 +1598,7 @@ async function withManager(fn: (ctx: {
       driverResolver: () => driver,
       defaultAgentEnvVarsProvider: options.defaultAgentEnvVarsProvider,
       tracer: options.tracer,
-      cancelledStartCleanup: options.cancelledStartCleanup,
+      stopKill: options.stopKill,
       daemonVersion: options.daemonVersion,
       daemonInstanceId: options.daemonInstanceId,
       computerVersion: options.computerVersion,
@@ -1531,7 +1609,9 @@ async function withManager(fn: (ctx: {
       runtimeStartScheduler: options.runtimeStartScheduler,
       appInboxForAgent: options.appInboxForAgent,
       onAgentWorkingToIdle: options.onAgentWorkingToIdle,
+      onRuntimeAbsentLocalStop: options.onRuntimeAbsentLocalStop,
       runtimeProcessGate: options.runtimeProcessGate,
+      reportThirdPartyEventsDelivered: options.reportThirdPartyEventsDelivered,
     },
   );
   setSessionReadyDeliveryRetrySchedulerFactoryForTesting(options.sessionReadyDeliveryRetrySchedulerFactory ?? null);
@@ -2602,11 +2682,13 @@ test("persistent runtimes exiting before parsed turn boundary are not marked idl
     await flush();
 
     assert.equal((manager as any).agents.has("agent-1"), false);
-    assert.equal((manager as any).lifecycleRecords.idleRestartSnapshots.has("agent-1"), false);
+    // Reconciler step 10a (D5): a crash keeps the restart snapshot (the next
+    // wake resumes from it), but never shows as a healthy idle runtime.
+    assert.equal((manager as any).lifecycleRecords.idleRestartSnapshots.has("agent-1"), true);
     assert.equal(
       sent.some((msg) => msg.type === "agent:activity" && projectFactActivity(msg) === "online" && msg.detail === "Process idle"),
       false,
-      "exit 0 before turn_end must not cache a healthy idle runtime",
+      "exit 0 before turn_end must not show a healthy idle runtime",
     );
     assert.ok(sent.some((msg) =>
       msg.type === "agent:status"
@@ -2702,7 +2784,7 @@ test("stdin clean exit preserves pending inbox queued after turn_end", async () 
     driver.processes[0].close(0);
     await waitFor(() => driver.spawnCalls.length === 2, "restart with pending inbox after clean stdin close");
 
-    assertContentFreeInboxUpdatePrompt(driver.spawnCalls[1].prompt, "queued between turn_end and close");
+    assertContentFreeInboxUpdatePrompt(afterStartupMemoryBlock(afterFreshSessionStandingPrompt(driver.spawnCalls[1])), "queued between turn_end and close");
   }, { driver });
 });
 
@@ -2935,6 +3017,22 @@ test("machine-level default env vars are injected into spawn config", async () =
   });
 });
 
+// Env vars that can make a process run other code (agentEnvVarPolicy.ts) are
+// recorded on every launch, by name only, and no longer refused: the server
+// refuses new writes instead (#proj-raft-computer:bbea62a0).
+test("buildSpawnConfig keeps a server PATH and a machine-level default PATH, refusing neither", async () => {
+  await withManager(async ({ driver, manager }) => {
+    await manager.startAgent("agent-1", makeConfig({ runtime: "codex", envVars: null }));
+    assert.equal(driver.spawnCalls.length, 1);
+    assert.equal(driver.spawnCalls[0]?.config.envVars?.PATH, "/machine/bin:/usr/bin");
+
+    const built = await manager.buildSpawnConfig("agent-2", makeConfig({ runtime: "codex", envVars: { Path: "/server/bin" } }));
+    assert.equal(built.envVars?.Path, "/server/bin");
+  }, {
+    defaultAgentEnvVarsProvider: async () => ({ PATH: "/machine/bin:/usr/bin" }),
+  });
+});
+
 // task #359: the spawn config carries the composed passive AX gate — server
 // flag AND local kill switch (either agent env_vars or daemon process env
 // saying off wins) — which the context-generation writer publishes to the CLI.
@@ -3137,7 +3235,10 @@ test("live launch rebind keeps immutable proxy cleanup ownership", async () => {
         `${credentialHandle.proxyUrl}/internal/agent-api/server`,
         { headers: { Authorization: `Bearer ${credentialHandle.proxyToken}` } },
       );
-      assert.equal(staleCredential.status, 401);
+      // An ended launch's token is never served again. The agent is stopped, so
+      // the proxy answers 410 agent_not_running (#13975), not a bare 401.
+      assert.equal(staleCredential.status, 410);
+      assert.equal(((await staleCredential.json()) as { code?: unknown }).code, "agent_not_running");
 
       await manager.startAgent(
         "agent-rebind-resources",
@@ -3912,6 +4013,147 @@ test("task #1221: a fresh (session-less) start delivers the catch-up messages th
   });
 });
 
+// RFC 071 F9 (#proj-raft-computer:#56): a start that carries a pending
+// runtime-profile release notice AND the owed resume catch-up (no wake) must
+// render the catch-up in that launch: the server counts it as the start that
+// delivered the catch-up and stops owing it once the runtime is active.
+test("RFC 071 F9: a runtime-profile control start renders the owed resume catch-up in its first input", async () => {
+  await withManager(async ({ driver, manager }) => {
+    const owed = makeMessage("sent while starts were blocked", {
+      channel_id: "dm-channel-1",
+      channel_name: "richard",
+      channel_type: "dm",
+      message_id: "message-blocked-1",
+      seq: 7,
+    });
+    await manager.startAgent(
+      "agent-1",
+      makeConfig({
+        sessionId: null,
+        runtimeProfileControl: {
+          kind: "daemon_release_notice",
+          key: "release-notice-f9",
+          message: "Runtime Profile notice: daemon upgraded.",
+        },
+      }),
+      undefined,
+      undefined,
+      undefined,
+      "launch-f9",
+      false,
+      [owed],
+    );
+    await flush();
+    assert.equal(driver.spawnCalls.length, 1);
+    const prompt = String(driver.spawnCalls[0].prompt);
+    assert.ok(prompt.includes("sent while starts were blocked"), `F9: catch-up missing from the control start's input: ${JSON.stringify(prompt.slice(0, 200))}`);
+    assert.doesNotMatch(prompt, /Stop after reading it/, "the control-only starter must not tell the agent to stop before the catch-up");
+    await manager.stopAgent("agent-1");
+  });
+});
+
+test("RFC 071 F9: a resumed session's control start carries the release notice and then the owed catch-up", async () => {
+  const driver = new FakeCodexDriver({ id: "codex", supportsNativeStandingPrompt: true, supportsStdinNotification: true, busyDeliveryMode: "direct" });
+  await withManager(async ({ manager }) => {
+    const owed = makeMessage("sent while starts were blocked", {
+      channel_id: "dm-channel-1",
+      channel_name: "richard",
+      channel_type: "dm",
+      message_id: "message-blocked-1",
+      seq: 7,
+    });
+    const notice = { kind: "daemon_release_notice", key: "release-f9-resume", message: "Daemon v1.0.47 released: release body" } as const;
+    await manager.startAgent(
+      "agent-1",
+      makeConfig({ sessionId: "thread-9", runtimeProfileControl: notice as never }),
+      undefined,
+      undefined,
+      undefined,
+      "launch-f9-resume",
+      false,
+      [owed],
+    );
+    const prompt = String(driver.spawnCalls.at(-1)!.prompt);
+    const noticeAt = prompt.indexOf("Daemon v1.0.47 released: release body");
+    const owedAt = prompt.indexOf("sent while starts were blocked");
+    assert.ok(noticeAt >= 0, `release notice missing: ${JSON.stringify(prompt.slice(0, 200))}`);
+    assert.ok(owedAt >= 0, `F9: catch-up missing: ${JSON.stringify(prompt.slice(0, 200))}`);
+    assert.ok(noticeAt < owedAt, "the release notice goes ahead of the catch-up");
+    assert.equal(prompt.split("Daemon v1.0.47 released: release body").length - 1, 1, "the notice appears once");
+    assert.doesNotMatch(prompt, /Stop after reading it/);
+    await manager.stopAgent("agent-1", { wait: true, silent: true });
+  }, { driver });
+});
+
+test("RFC 071 F9: a resumed session whose standing prompt refreshes gets the notice there only, and the catch-up as input", async () => {
+  const driver = new FakeCodexDriver({ id: "codex", supportsNativeStandingPrompt: true, supportsStdinNotification: true, busyDeliveryMode: "direct" });
+  Object.assign(driver, { standingPromptRefreshesOnResume: true });
+  await withManager(async ({ manager }) => {
+    const owed = makeMessage("sent while starts were blocked", {
+      channel_id: "dm-channel-1",
+      channel_name: "richard",
+      channel_type: "dm",
+      message_id: "message-blocked-1",
+      seq: 7,
+    });
+    const notice = { kind: "daemon_release_notice", key: "release-f9-refresh", message: "Daemon v1.0.47 released: release body" } as const;
+    await manager.startAgent(
+      "agent-1",
+      makeConfig({ sessionId: "thread-9", runtimeProfileControl: notice as never }),
+      undefined,
+      undefined,
+      undefined,
+      "launch-f9-refresh",
+      false,
+      [owed],
+    );
+    const spawn = driver.spawnCalls.at(-1)!;
+    const prompt = String(spawn.prompt);
+    assert.match(String(spawn.standingPrompt), /Daemon v1\.0\.47 released: release body/, "the refreshed standing prompt carries the notice");
+    assert.doesNotMatch(prompt, /release body/, "no lead note: the notice reaches the session once, in the standing prompt");
+    assert.doesNotMatch(prompt, /Stop after reading it/);
+    assert.ok(prompt.includes("sent while starts were blocked"), `F9: catch-up missing: ${JSON.stringify(prompt.slice(0, 200))}`);
+    await manager.stopAgent("agent-1", { wait: true, silent: true });
+  }, { driver });
+});
+
+test("RFC 071 F9: a control start marks the owed catch-up it rendered as read", async () => {
+  await withManager(async ({ manager }) => {
+    const owed = makeMessage("sent while starts were blocked", {
+      channel_id: "dm-channel-1",
+      channel_name: "richard",
+      channel_type: "dm",
+      message_id: "message-blocked-1",
+      seq: 7,
+    });
+    const consumed: Array<{ source: string; ids: string[] }> = [];
+    const original = (manager as any).consumeVisibleMessages.bind(manager);
+    (manager as any).consumeVisibleMessages = (agentId: string, input: { source: string; messages: Array<{ message_id?: string }> }) => {
+      consumed.push({ source: input.source, ids: input.messages.map((message) => message.message_id ?? "") });
+      return original(agentId, input);
+    };
+    await manager.startAgent(
+      "agent-1",
+      makeConfig({
+        sessionId: null,
+        runtimeProfileControl: { kind: "daemon_release_notice", key: "release-notice-f9-read", message: "Runtime Profile notice: daemon upgraded." },
+      }),
+      undefined,
+      undefined,
+      undefined,
+      "launch-f9-read",
+      false,
+      [owed],
+    );
+    await flush();
+    assert.ok(
+      consumed.some((entry) => entry.source === "spawn_resume_catchup_inbox" && entry.ids.includes("message-blocked-1")),
+      `the rendered catch-up is consumed; got ${JSON.stringify(consumed)}`,
+    );
+    await manager.stopAgent("agent-1");
+  });
+});
+
 test("resume start preserves catch-up salience before buffered startup inbox", async () => {
   await withManager(async ({ driver, manager }) => {
     const freshPierce = makeMessage("fresh direct wake request", {
@@ -4091,6 +4333,27 @@ test("stopAgent records explicit stop source on process exit trace", async () =>
   }, { tracer });
 });
 
+// #triage:#169: a SIGKILL the daemon did not send (the kernel OOM killer, on
+// Linux) is its own event, so memory kills can be counted and reported; an
+// ordinary non-zero exit is not.
+test("a runtime killed by a SIGKILL the daemon did not send is recorded as process_killed", async () => {
+  const { sink, tracer } = makeDeterministicTracer();
+  await withManager(async ({ driver, manager }) => {
+    await manager.startAgent("agent-killed", makeConfig());
+    driver.processes[0].exit(null, "SIGKILL");
+    await flush();
+    const killed = traceRows(sink).filter((row) => row.name === "daemon.agent.process_killed");
+    assert.equal(killed.length, 1);
+    assert.equal(killed[0]!.attrs?.agent_id, "agent-killed");
+    assert.equal(killed[0]!.attrs?.exit_signal, "SIGKILL");
+
+    await manager.startAgent("agent-crashed", makeConfig());
+    driver.processes[1].exit(1);
+    await flush();
+    assert.equal(traceRows(sink).filter((row) => row.name === "daemon.agent.process_killed").length, 1, "a plain crash is not a kill");
+  }, { tracer });
+});
+
 test("process error and exit preserve the same dispatch and process identity", async () => {
   const { sink, tracer } = makeDeterministicTracer();
   await withManager(async ({ driver, manager }) => {
@@ -4159,7 +4422,6 @@ test("stopAgent disposes all agent process timers", async () => {
   const pendingTrajectoryTimer = setTimeout(() => {}, 60_000);
   const startupTimeoutTimer = setTimeout(() => {}, 60_000);
   const compactionWatchdog = setTimeout(() => {}, 60_000);
-  const stalledRecoverySigtermTimer = setTimeout(() => {}, 60_000);
   const backoffTimer = setTimeout(() => {}, 60_000);
   const activityHeartbeat = setInterval(() => {}, 60_000);
 
@@ -4179,7 +4441,6 @@ test("stopAgent disposes all agent process timers", async () => {
       ap.startup = { ...ap.startup, timer: startupTimeoutTimer };
       ap.compaction = { kind: "active", startedAt: Date.now(), watchdog: compactionWatchdog };
       assert.equal(ap.exit.kind, "live");
-      ap.exit = { ...ap.exit, stalledRecoverySigtermTimer };
       ap.runtimeErrorDeliveryBackoff = {
         kind: "backing_off",
         attempts: 1,
@@ -4195,7 +4456,6 @@ test("stopAgent disposes all agent process timers", async () => {
         pendingTrajectoryTimer,
         startupTimeoutTimer,
         compactionWatchdog,
-        stalledRecoverySigtermTimer,
         backoffTimer,
       ]) {
         assert.equal(clearedTimeouts.has(timer), true, "expected stopAgent to clear timeout handle");
@@ -4206,7 +4466,6 @@ test("stopAgent disposes all agent process timers", async () => {
       assert.equal(ap.startup.timer, null);
       assert.deepEqual(ap.compaction, { kind: "none" });
       assert.equal(ap.exit.kind, "live");
-      assert.equal(ap.exit.stalledRecoverySigtermTimer, null);
       assert.deepEqual(ap.runtimeErrorDeliveryBackoff, {
         kind: "idle",
         attempts: 0,
@@ -4222,7 +4481,6 @@ test("stopAgent disposes all agent process timers", async () => {
     realClearTimeout(pendingTrajectoryTimer);
     realClearTimeout(startupTimeoutTimer);
     realClearTimeout(compactionWatchdog);
-    realClearTimeout(stalledRecoverySigtermTimer);
     realClearTimeout(backoffTimer);
     realClearInterval(activityHeartbeat);
   }
@@ -4440,9 +4698,11 @@ test("activity heartbeat marks silent runtime progress as stalled", async () => 
         .filter((msg) => msg.detail !== "Starting…");
       assert.deepEqual(activities.map((msg) => msg.detail), [
         "Running command…",
+        // task #25: the 10 minute stuck-tool report comes before the 15 minute stall.
+        "Stuck: running command, no output for 10+ min",
         "Bash tool has been running for 20m; process is alive; no output/update observed for 20m.",
       ]);
-      assert.equal(projectFactActivity(activities[1]), "error");
+      assert.equal(projectFactActivity(activities[2]), "error");
 
       assert.ok(ap.runtimeProgress.isStale, "stalled marker should be latched");
       assert.deepEqual(diagnosticInputs, [{
@@ -4450,6 +4710,65 @@ test("activity heartbeat marks silent runtime progress as stalled", async () => 
         runtimeInactivityAgeMs: 16 * 60_000,
         observationIntervalMs: 15 * 60_000,
       }]);
+    });
+  } finally {
+    (Date as any).now = realDateNow;
+    globalThis.setInterval = realSetInterval;
+    globalThis.clearInterval = realClearInterval;
+  }
+});
+
+test("codex: a command left open beside a finished file change is still reported stuck and counted open", async () => {
+  // 10-28: a codex agent sat 3 h on an open command and was never reported
+  // stuck. Codex calls carried no ids, so the end of a file change it ran in
+  // parallel closed the command instead. With item ids each end closes its own call.
+  const realSetInterval = globalThis.setInterval;
+  const realClearInterval = globalThis.clearInterval;
+  const realDateNow = Date.now;
+  let now = 1_000_000;
+  let intervalCallback: (() => void) | null = null;
+  (Date as any).now = () => now;
+  (globalThis as any).setInterval = ((callback: () => void, ms?: number, ...args: any[]) => {
+    if (ms && ms > 1000) {
+      intervalCallback = callback;
+      return { fake: true };
+    }
+    return realSetInterval(callback, ms, ...args);
+  }) as typeof setInterval;
+  (globalThis as any).clearInterval = ((timer: unknown) => {
+    if ((timer as any)?.fake) return;
+    return realClearInterval(timer as ReturnType<typeof setInterval>);
+  }) as typeof clearInterval;
+
+  try {
+    await withManager(async ({ driver, sent, manager }) => {
+      await manager.startAgent("agent-1", makeConfig());
+
+      // The events the real codex driver makes of that sequence: a command
+      // starts, a file change starts with no changes listed yet, then completes.
+      const codex = new CodexDriver();
+      const codexItem = (method: string, item: Record<string, unknown>) => codex.parseLine(JSON.stringify({ method, params: { item } }));
+      driver.parsedLines.set("parallel-tools", [
+        ...codexItem("item/started", { type: "commandExecution", id: "call-cmd", command: "sleep 9999" }),
+        ...codexItem("item/started", { type: "fileChange", id: "call-patch", changes: [] }),
+        ...codexItem("item/completed", { type: "fileChange", id: "call-patch", changes: [{ path: "a.ts", kind: "modify" }, { path: "b.ts", kind: "modify" }] }),
+      ]);
+      driver.processes[0].stdout.emit("data", Buffer.from("parallel-tools\n"));
+      await flush();
+
+      const ap = (manager as any).agents.get("agent-1");
+      assert.deepEqual([...(ap.openToolCallIds ?? [])], ["call-cmd"], "the open codex command is tracked by its id");
+      assert.equal(ap.gatedSteering.outstandingToolUses, 1);
+
+      assert.ok(intervalCallback, "working activity should install heartbeat");
+      now += 11 * 60_000;
+      intervalCallback!();
+      await flush();
+
+      const details = sent
+        .filter((msg): msg is Extract<MachineToServerMessage, { type: "agent:activity" }> => msg.type === "agent:activity")
+        .map((msg) => msg.detail);
+      assert.ok(details.includes("Stuck: running command, no output for 10+ min"), `stuck report missing: ${JSON.stringify(details)}`);
     });
   } finally {
     (Date as any).now = realDateNow;
@@ -4502,7 +4821,9 @@ test("activity heartbeat keeps alive silent runtime out of stalled error", async
         .filter((msg) => msg.detail !== "Starting…");
       assert.deepEqual(activities.map((msg) => msg.detail), [
         "Running command…",
-        "Running command…",
+        // task #25: the stuck-tool report, then the cleared-busy activity carrying its detail.
+        "Stuck: running command, no output for 10+ min",
+        "Stuck: running command, no output for 10+ min",
       ]);
       assert.equal(
         activities.some((msg) => projectFactActivity(msg) === "error" && msg.detail.startsWith("Runtime stalled:")),
@@ -4566,9 +4887,10 @@ test("activity heartbeat marks dead silent runtime process as stalled", async ()
         .filter((msg) => msg.detail !== "Starting…");
       assert.deepEqual(activities.map((msg) => msg.detail), [
         "Running command…",
-        "Runtime stalled: no runtime events for 20m (after Running command…, tools=1)",
+        "Stuck: running command, no output for 10+ min",
+        "Runtime stalled: no runtime events for 20m (after Stuck: running command, no output for 10+ min, tools=1)",
       ]);
-      assert.equal(projectFactActivity(activities[1]), "error");
+      assert.equal(projectFactActivity(activities[2]), "error");
 
       const ap = (manager as any).agents.get("agent-1");
       assert.equal(ap.runtimeProgress.isStale, true, "dead runtime should still be latched stale");
@@ -4666,6 +4988,38 @@ test("activity heartbeat treats codex raw response items as internal progress", 
   }
 });
 
+test("runtime trace records category-only command heads and message roles/phases", async () => {
+  const { sink, tracer, traceId } = makeDeterministicTracer();
+  await withManager(async ({ driver, manager }) => {
+    const sessionId = "trace-categories-session";
+    await manager.startAgent("agent-1", makeConfig({ sessionId }));
+
+    driver.parsedLines.set("tool-start", [{ kind: "tool_call", name: "shell", input: { command: "API_KEY=sk-secret123 sleep 30" }, callId: "call-1" }]);
+    driver.processes[0].stdout.emit("data", Buffer.from("tool-start\n"));
+    driver.parsedLines.set("raw-message", [{
+      kind: "internal_progress",
+      source: "codex_raw_response_item",
+      itemType: "message",
+      payloadBytes: 64,
+      role: "assistant",
+      phase: "commentary",
+    }]);
+    driver.processes[0].stdout.emit("data", Buffer.from("raw-message\n"));
+    driver.parsedLines.set("turn-end", [{ kind: "turn_end", sessionId }]);
+    driver.processes[0].stdout.emit("data", Buffer.from("turn-end\n"));
+    await flush();
+
+    const events = eventsForSpan(sink, traceId, "daemon.runtime.turn");
+    const started = events.find((event) => event.name === "tool.call.started");
+    assert.equal(started?.attrs?.tool, "shell");
+    assert.equal(started?.attrs?.command_head, "sleep");
+    assert.doesNotMatch(JSON.stringify(events), /sk-secret123/);
+    const observed = events.find((event) => event.name === "runtime.progress.internal_observed");
+    assert.equal(observed?.attrs?.role, "assistant");
+    assert.equal(observed?.attrs?.phase, "commentary");
+  }, { tracer });
+});
+
 test("codex status-only system errors surface as runtime error activity", async () => {
   await withManager(async ({ driver, sent, manager }) => {
     await manager.startAgent("agent-1", makeConfig({ sessionId: "thread-1" }));
@@ -4759,8 +5113,12 @@ test("codex no-op completion error remains visible after turn_end", async () => 
     assert.equal(lastActivity?.detail, message);
     assert.equal(lastActivity?.detailKind, "runtime_error");
 
+    // Reconciler step 12 (row C10): not sticky any more. It counts like a
+    // crash (D6): the process stays, the streak grows toward the cap.
     const inactiveStatus = sent.find((msg) => msg.type === "agent:status" && msg.status === "inactive");
-    assert.ok(inactiveStatus, "no-op completion is a sticky runtime failure, not a clean idle turn");
+    assert.equal(inactiveStatus, undefined, "no-op completion is not a sticky runtime failure");
+    assert.equal((manager as any).agents.has("agent-1"), true, "the process stays");
+    assert.equal((manager as any).lifecycleRecords.getCrashCapStreak("agent-1"), 1, "counted toward the cap");
   }, { tracer });
 
   const diagnosticTrace = eventsForSpan(sink, traceId, "daemon.runtime.turn")
@@ -4892,6 +5250,307 @@ test("runtime tracing pinpoints tool output followed by silent stall", async () 
     globalThis.setInterval = realSetInterval;
     globalThis.clearInterval = realClearInterval;
   }
+});
+
+for (const withSnapshot of [true, false]) {
+  test(`task #1310: a stall carries the runtime's open provider call ${withSnapshot ? "snapshot" : "attrs only when the runtime reports them"}`, async () => {
+    const realSetInterval = globalThis.setInterval;
+    const realClearInterval = globalThis.clearInterval;
+    const realDateNow = Date.now;
+    const { sink, tracer, traceId } = makeDeterministicTracer();
+    let now = 3_200_000;
+    let intervalCallback: (() => void) | null = null;
+    (Date as any).now = () => now;
+    (globalThis as any).setInterval = ((callback: () => void, ms?: number, ...args: any[]) => {
+      if (ms && ms > 1000) {
+        intervalCallback = callback;
+        return { fake: true };
+      }
+      return realSetInterval(callback, ms, ...args);
+    }) as typeof setInterval;
+    (globalThis as any).clearInterval = ((timer: unknown) => {
+      if ((timer as any)?.fake) return;
+      return realClearInterval(timer as ReturnType<typeof setInterval>);
+    }) as typeof clearInterval;
+
+    try {
+      await withManager(async ({ driver, manager }) => {
+        await manager.startAgent("agent-1", makeConfig());
+        if (withSnapshot) {
+          (manager as any).agents.get("agent-1").runtime.providerCallSnapshot = () => ({
+            openCount: 2,
+            oldest: { phase: "headers", callContext: "outside_compaction", ageMs: 20 * 60_000, msSinceLastStreamEvent: 90_000 },
+          });
+        }
+        driver.parsedLines.set("tool-start", [{ kind: "tool_call", name: "shell", input: { command: "slockdev status" } }]);
+        driver.parsedLines.set("tool-output", [{ kind: "tool_output", name: "shell" }]);
+        driver.processes[0].stdout.emit("data", Buffer.from("tool-start\n"));
+        driver.processes[0].stdout.emit("data", Buffer.from("tool-output\n"));
+        await flush();
+
+        assert.ok(intervalCallback, "working activity should install heartbeat");
+        now += 16 * 60_000;
+        intervalCallback!();
+        await flush();
+
+        const stalled = eventsForSpan(sink, traceId, "daemon.runtime.turn")
+          .find((event) => event.name === "runtime.progress.stalled");
+        const detected = traceRows(sink).find((row) => row.name === "daemon.runtime.stall.detected");
+        assert.ok(stalled, "the stall fired");
+        assert.ok(detected, "stall.detected was recorded");
+        for (const attrs of [stalled.attrs, detected.attrs]) {
+          if (withSnapshot) {
+            assert.equal(attrs?.provider_calls_open, 2);
+            assert.equal(attrs?.provider_call_phase, "headers");
+            assert.equal(attrs?.provider_call_context, "outside_compaction");
+            assert.equal(attrs?.provider_call_age_ms_bucket, "15-60m");
+            assert.equal(attrs?.provider_call_ms_since_last_stream_event_bucket, "1-5m");
+          } else {
+            assert.equal(attrs?.provider_calls_open, undefined);
+            assert.equal(attrs?.provider_call_phase, undefined);
+          }
+        }
+      }, { tracer });
+    } finally {
+      (Date as any).now = realDateNow;
+      globalThis.setInterval = realSetInterval;
+      globalThis.clearInterval = realClearInterval;
+    }
+  });
+}
+
+// 10-23 (#proj-runtime:058da315): two Pi agents finished their turn, a manual
+// compaction ran on the idle session ~5 min later, and 15 min after that the
+// daemon reported a stall with nothing queued; a message sent then would have
+// been held. A compaction cycle that starts idle must end idle.
+for (const scenario of ["idle_after_turn_end", "during_turn", "idle_no_compaction"] as const) {
+  test(`compaction stall tripwire: ${scenario}`, async () => {
+    const realSetInterval = globalThis.setInterval;
+    const realClearInterval = globalThis.clearInterval;
+    const realDateNow = Date.now;
+    const { sink, tracer } = makeDeterministicTracer();
+    let now = 3_300_000;
+    let intervalCallback: (() => void) | null = null;
+    (Date as any).now = () => now;
+    (globalThis as any).setInterval = ((callback: () => void, ms?: number, ...args: any[]) => {
+      if (ms && ms > 1000) {
+        intervalCallback = callback;
+        return { fake: true };
+      }
+      return realSetInterval(callback, ms, ...args);
+    }) as typeof setInterval;
+    (globalThis as any).clearInterval = ((timer: unknown) => {
+      if ((timer as any)?.fake) return;
+      return realClearInterval(timer as ReturnType<typeof setInterval>);
+    }) as typeof clearInterval;
+    const driver = new FakeCodexDriver({ id: "codex", supportsStdinNotification: true, busyDeliveryMode: "direct" });
+
+    try {
+      await withManager(async ({ manager }) => {
+        await manager.startAgent("agent-1", makeConfig());
+        const emit = (line: string) => driver.processes[0].stdout.emit("data", Buffer.from(`${line}\n`));
+        driver.parsedLines.set("tool-start", [{ kind: "tool_call", name: "shell", input: { command: "echo ok" } }]);
+        driver.parsedLines.set("tool-output", [{ kind: "tool_output", name: "shell" }]);
+        driver.parsedLines.set("turn-end", [{ kind: "turn_end", sessionId: "session-1" }]);
+        driver.parsedLines.set("compact-start", [{ kind: "compaction_started", cycleId: 1 }]);
+        driver.parsedLines.set("compact-finish", [{ kind: "compaction_finished", cycleId: 1 }]);
+        emit("tool-start");
+        emit("tool-output");
+        await flush();
+        if (scenario !== "during_turn") {
+          emit("turn-end");
+          await flush();
+        }
+        now += 5 * 60_000;
+        if (scenario !== "idle_no_compaction") {
+          emit("compact-start");
+          await flush();
+          now += 60_000;
+          emit("compact-finish");
+          await flush();
+        }
+        const ap = (manager as any).agents.get("agent-1");
+        if (scenario === "during_turn") assert.equal(ap.gatedSteering.isIdle, false);
+        else assert.equal(ap.gatedSteering.isIdle, true, "the agent is idle again");
+        now += 16 * 60_000;
+        intervalCallback?.();
+        await flush();
+
+        const stalls = traceRows(sink).filter((row) => row.name === "daemon.runtime.stall.detected");
+        if (scenario === "during_turn") assert.equal(stalls.length, 1, "a silent compaction inside a turn is still a stall");
+        else assert.equal(stalls.length, 0, "an idle agent with nothing queued is not stalled");
+      }, { driver, tracer });
+    } finally {
+      (Date as any).now = realDateNow;
+      globalThis.setInterval = realSetInterval;
+      globalThis.clearInterval = realClearInterval;
+    }
+  });
+}
+
+async function idleCompactionHarness(fn: (ctx: {
+  manager: any;
+  driver: FakeCodexDriver;
+  emit: (line: string) => Promise<void>;
+  deliver: (id: string) => Promise<string[]>;
+}) => Promise<void>) {
+  const driver = new FakeCodexDriver({ id: "codex", supportsStdinNotification: true, busyDeliveryMode: "direct" });
+  await withManager(async ({ manager }) => {
+    await manager.startAgent("agent-1", makeConfig({ sessionId: "session-1" }), undefined, undefined, undefined, "launch-1");
+    driver.parsedLines.set("turn-end", [{ kind: "turn_end", sessionId: "session-1" }]);
+    driver.parsedLines.set("compact-start", [{ kind: "compaction_started", cycleId: 1 }]);
+    driver.parsedLines.set("compact-finish", [{ kind: "compaction_finished", cycleId: 1 }]);
+    driver.parsedLines.set("compact-aborted", [{ kind: "compaction_interrupted", cycleId: 1, outcome: "aborted", reason: "manual", willRetry: false }]);
+    driver.parsedLines.set("compact-start-2", [{ kind: "compaction_started", cycleId: 2 }]);
+    driver.parsedLines.set("compact-finish-2", [{ kind: "compaction_finished", cycleId: 2 }]);
+    driver.parsedLines.set("compact-start-noid", [{ kind: "compaction_started" }]);
+    driver.parsedLines.set("compact-finish-noid", [{ kind: "compaction_finished" }]);
+    driver.parsedLines.set("tool-start", [{ kind: "tool_call", name: "shell", input: { command: "echo ok" } }]);
+    driver.parsedLines.set("text", [{ kind: "text", text: "working on it" }]);
+    const emit = async (line: string) => {
+      driver.processes[0].stdout.emit("data", Buffer.from(`${line}\n`));
+      await flush();
+    };
+    const deliver = async (id: string) => {
+      const before = driver.encodedCalls.length;
+      assert.equal(manager.deliverMessage("agent-1", makeMessage(`message ${id}`, { message_id: id })), true);
+      await flush();
+      return driver.encodedCalls.slice(before).map((call) => call.mode);
+    };
+    await emit("turn-end");
+    await fn({ manager, driver, emit, deliver });
+  }, { driver });
+}
+
+for (const compacted of [true, false]) {
+  test(`a message after an idle turn end is delivered as a new prompt ${compacted ? "after an idle compaction" : "(control, no compaction)"}`, async () => {
+    await idleCompactionHarness(async ({ emit, deliver }) => {
+      if (compacted) {
+        await emit("compact-start");
+        await emit("compact-finish");
+      }
+      assert.deepEqual(await deliver("m-after"), ["idle"]);
+    });
+  });
+}
+
+test("a message arriving during an idle compaction is held, then delivered as a prompt when it finishes", async () => {
+  await idleCompactionHarness(async ({ driver, emit, deliver }) => {
+    await emit("compact-start");
+    assert.deepEqual(await deliver("m-during"), [], "held while compacting");
+    const before = driver.encodedCalls.length;
+    await emit("compact-finish");
+    assert.deepEqual(driver.encodedCalls.slice(before).map((call) => call.mode), ["idle"]);
+  });
+});
+
+test("an idle compaction that is aborted returns the agent to idle", async () => {
+  await idleCompactionHarness(async ({ manager, emit, deliver }) => {
+    await emit("compact-start");
+    await emit("compact-aborted");
+    assert.equal(manager.agents.get("agent-1").gatedSteering.isIdle, true);
+    assert.deepEqual(await deliver("m-after-abort"), ["idle"]);
+  });
+});
+
+test("a repeated compaction finish does not mark the idle agent busy again", async () => {
+  await idleCompactionHarness(async ({ manager, emit, deliver }) => {
+    await emit("compact-start");
+    await emit("compact-finish");
+    await emit("compact-finish");
+    const ap = manager.agents.get("agent-1");
+    assert.equal(ap.gatedSteering.isIdle, true);
+    assert.notEqual(ap.lastActivityKind, "working");
+    assert.deepEqual(await deliver("m-after-dup"), ["idle"]);
+  });
+});
+
+test("turn work during an idle compaction hands idleness back to that turn's own end", async () => {
+  await idleCompactionHarness(async ({ manager, emit }) => {
+    await emit("compact-start");
+    // Text does not infer the compaction's end (a tool call would), so the explicit finish still arrives in the cycle.
+    await emit("text");
+    await emit("compact-finish");
+    const ap = manager.agents.get("agent-1");
+    assert.equal(ap.gatedSteering.isIdle, false, "a turn is running; only its turn end makes the agent idle");
+  });
+});
+
+test("a late finish from an old compaction cycle does not make a newly started turn idle", async () => {
+  await idleCompactionHarness(async ({ manager, emit, deliver }) => {
+    await emit("compact-start");
+    await emit("compact-finish");
+    // A new turn starts from a message, then the old cycle's finish arrives again.
+    assert.deepEqual(await deliver("m-new-turn"), ["idle"]);
+    await emit("tool-start");
+    await emit("compact-finish");
+    const ap = manager.agents.get("agent-1");
+    assert.equal(ap.gatedSteering.isIdle, false, "the new turn is still running");
+  });
+});
+
+test("a repeated start of the open idle cycle keeps that it began idle", async () => {
+  await idleCompactionHarness(async ({ manager, emit, deliver }) => {
+    await emit("compact-start");
+    await emit("compact-start");
+    await emit("compact-finish");
+    assert.equal(manager.agents.get("agent-1").gatedSteering.isIdle, true);
+    assert.deepEqual(await deliver("m-after-repeat"), ["idle"]);
+  });
+});
+
+test("a late finish of cycle 1 does not end cycle 2 or release the message it holds", async () => {
+  await idleCompactionHarness(async ({ driver, manager, emit, deliver }) => {
+    await emit("compact-start");
+    await emit("compact-finish");
+    await emit("compact-start-2");
+    assert.deepEqual(await deliver("m-in-cycle-2"), [], "held while cycle 2 compacts");
+    const before = driver.encodedCalls.length;
+    await emit("compact-finish");
+    const ap = manager.agents.get("agent-1");
+    assert.equal(ap.compaction.kind, "active", "cycle 2 is still open");
+    assert.equal(ap.gatedSteering.compacting, true);
+    assert.deepEqual(driver.encodedCalls.slice(before), [], "nothing is delivered into a running compaction");
+    await emit("compact-finish-2");
+    assert.deepEqual(driver.encodedCalls.slice(before).map((call) => call.mode), ["idle"]);
+  });
+});
+
+test("a late interruption of cycle 1 does not end cycle 2", async () => {
+  await idleCompactionHarness(async ({ driver, manager, emit, deliver }) => {
+    await emit("compact-start");
+    await emit("compact-finish");
+    await emit("compact-start-2");
+    assert.deepEqual(await deliver("m-in-cycle-2"), [], "held while cycle 2 compacts");
+    const before = driver.encodedCalls.length;
+    await emit("compact-aborted");
+    const ap = manager.agents.get("agent-1");
+    assert.equal(ap.compaction.kind, "active", "cycle 2 is still open");
+    assert.equal(ap.gatedSteering.compacting, true);
+    assert.deepEqual(driver.encodedCalls.slice(before), [], "nothing is delivered into a running compaction");
+    await emit("compact-finish-2");
+    assert.deepEqual(driver.encodedCalls.slice(before).map((call) => call.mode), ["idle"]);
+  });
+});
+
+test("an interruption with no open compaction keeps its terminal fact visible", async () => {
+  const driver = new FakeCodexDriver({ id: "codex", supportsStdinNotification: true, busyDeliveryMode: "direct" });
+  await withManager(async ({ manager, sent }) => {
+    await manager.startAgent("agent-1", makeConfig({ sessionId: "session-1" }), undefined, undefined, undefined, "launch-1");
+    driver.parsedLines.set("exhausted", [{ kind: "compaction_interrupted", outcome: "compaction_failed_or_exhausted", reason: "overflow", failureReason: "recovery_exhausted", willRetry: false }]);
+    driver.processes[0].stdout.emit("data", Buffer.from("exhausted\n"));
+    await flush();
+    const activities = sent.filter((msg: any) => msg.type === "agent:activity");
+    assert.ok(activities.some((msg: any) => projectFactActivity(msg) === "error"), "the exhausted recovery is still reported");
+  }, { driver });
+});
+
+test("without a producer cycle id an idle compaction keeps today's behaviour (no idle restore)", async () => {
+  await idleCompactionHarness(async ({ manager, emit }) => {
+    await emit("compact-start-noid");
+    await emit("compact-finish-noid");
+    assert.equal(manager.agents.get("agent-1").gatedSteering.isIdle, false);
+  });
 });
 
 test("claude transcript queue-op appends do not suppress post-tool silent stall detection", async () => {
@@ -5888,7 +6547,8 @@ test("parsed runtime progress recovers from a silent runtime stall marker", asyn
         .filter((msg) => msg.detail !== "Starting…");
       assert.deepEqual(activities.map((msg) => msg.detail), [
         "Running command…",
-        "Runtime stalled: no runtime events for 16m (after Running command…, tools=1)",
+        "Stuck: running command, no output for 10+ min",
+        "Runtime stalled: no runtime events for 16m (after Stuck: running command, no output for 10+ min, tools=1)",
         "Running command…",
       ]);
       assert.equal(activities.at(-1) ? projectFactActivity(activities.at(-1)!) : undefined, "working");
@@ -5981,7 +6641,7 @@ test("non-stdin runtimes skip deferred wake messages before restarting after tur
     );
 
     assert.equal(driver.spawnCalls.length, 2);
-    assert.doesNotMatch(driver.spawnCalls[1].prompt, /First message task/);
+    assertBodyOnlyInInboxPreview(driver.spawnCalls[1].prompt, /First message task/);
     assertContentFreeInboxUpdatePrompt(driver.spawnCalls[1].prompt, ["actual user task", "First message task"]);
     assert.match(driver.spawnCalls[1].prompt, /Inbox update: .*2 changed targets/);
     assert.match(driver.spawnCalls[1].prompt, /#system-task\s+pending: 1 message/);
@@ -6051,8 +6711,7 @@ test("explicit agent env vars override machine defaults and idle restart re-reso
     machineKey = "sk-machine-openai-b";
     machineBaseUrl = "https://proxy-b.example.com/v1";
     manager.deliverMessage("agent-1", makeMessage("wake up again"));
-    driver.processes[0].exit(0);
-    driver.processes[0].close(0);
+    endPerTurnTurn(driver, 0);
     await waitFor(() => driver.spawnCalls.length === 2, "non-stdin restart after env override update");
 
     assert.equal(driver.spawnCalls.length, 2);
@@ -6078,8 +6737,7 @@ test("non-stdin runtimes resume immediately after normal exit when messages arri
     assert.equal(driver.spawnCalls.length, 1);
 
     manager.deliverMessage("agent-1", makeMessage("follow-up while busy"));
-    driver.processes[0].exit(0);
-    driver.processes[0].close(0);
+    endPerTurnTurn(driver, 0);
     await waitFor(() => driver.spawnCalls.length === 2, "non-stdin restart after queued messages");
 
     assert.equal(driver.spawnCalls.length, 2);
@@ -6204,10 +6862,8 @@ test.each([0, 100])("non-stdin stale recovery traces and force-kills when SIGTER
   // mint here so the restart under test does not reach the network.
   onTestFinished(installManagedRunnerCredentialFetch());
   const realDateNow = Date.now;
-  const previousTimeout = process.env.SLOCK_DAEMON_STALLED_RECOVERY_SIGTERM_TIMEOUT_MS;
   let now = 1_000_000;
   (Date as any).now = () => now;
-  process.env.SLOCK_DAEMON_STALLED_RECOVERY_SIGTERM_TIMEOUT_MS = "0";
   const { sink, tracer } = makeDeterministicTracer();
   const driver = new FakeCodexDriver({
     id: "opencode",
@@ -6260,6 +6916,9 @@ test.each([0, 100])("non-stdin stale recovery traces and force-kills when SIGTER
     }, {
       driver,
       tracer,
+      // Reconciler step 5: the stall's stop has the one stop grace (its own
+      // SLOCK_DAEMON_STALLED_RECOVERY_SIGTERM_TIMEOUT_MS is gone); shortened here.
+      stopKill: { graceMs: 0 },
       defaultAgentEnvVarsProvider: async () => {
         // Exercise asynchronous restart setup after the old child has exited.
         if (driver.spawnCalls.length === 1 && restartDelayMs > 0) {
@@ -6270,11 +6929,6 @@ test.each([0, 100])("non-stdin stale recovery traces and force-kills when SIGTER
     });
   } finally {
     (Date as any).now = realDateNow;
-    if (previousTimeout === undefined) {
-      delete process.env.SLOCK_DAEMON_STALLED_RECOVERY_SIGTERM_TIMEOUT_MS;
-    } else {
-      process.env.SLOCK_DAEMON_STALLED_RECOVERY_SIGTERM_TIMEOUT_MS = previousTimeout;
-    }
   }
 });
 
@@ -6325,6 +6979,126 @@ test("stalled direct-stdin runtimes terminate and restart for queued messages", 
     (Date as any).now = realDateNow;
   }
 });
+
+// 10-23 (#proj-raft-computer:aff1c469): a codex turn went silent with its
+// process alive and messages queued in its first minutes; no later delivery
+// came, and the alive check returned before any recovery, for 5 h.
+// Reconciler step 9: the heartbeat decides nothing; the delivery arms one
+// stall deadline (stalledWithWork: 15 min, an alive non-stdin runtime 60 min)
+// and only that timer's reconcile restarts it.
+for (const { openTool, stdin } of [
+  { openTool: false, stdin: true },
+  { openTool: true, stdin: true },
+  // A non-stdin runtime that reports tool starts (Cursor, Gemini, Copilot)
+  // with an open tool may be running a long command, however long it is quiet.
+  { openTool: true, stdin: false },
+  // 11-02: an OpenCode turn silent in `thinking` for 16 h, 8 messages queued.
+  { openTool: false, stdin: false },
+]) {
+  const restarts = !openTool;
+  test(`an alive silent ${stdin ? "stdin" : "non-stdin"} runtime with queued messages${openTool ? " and an open tool" : ""} is ${restarts ? "restarted at its stall deadline" : "not restarted"}`, async () => {
+    const realSetInterval = globalThis.setInterval;
+    const realClearInterval = globalThis.clearInterval;
+    const realSetTimeout = globalThis.setTimeout;
+    const realClearTimeout = globalThis.clearTimeout;
+    const realDateNow = Date.now;
+    const { sink, tracer } = makeDeterministicTracer();
+    let now = 3_400_000;
+    let intervalCallback: (() => void) | null = null;
+    (Date as any).now = () => now;
+    (globalThis as any).setInterval = ((callback: () => void, ms?: number, ...args: any[]) => {
+      if (ms && ms > 1000) {
+        intervalCallback = callback;
+        return { fake: true };
+      }
+      return realSetInterval(callback, ms, ...args);
+    }) as typeof setInterval;
+    (globalThis as any).clearInterval = ((timer: unknown) => {
+      if ((timer as any)?.fake) return;
+      return realClearInterval(timer as ReturnType<typeof setInterval>);
+    }) as typeof clearInterval;
+    // Long timers (the stall deadline among them) are held, to be fired by hand.
+    (globalThis as any).setTimeout = ((callback: () => void, ms?: number, ...args: any[]) => {
+      if (ms && ms > 1000) return { fake: true, callback, ms, unref: () => {} };
+      return realSetTimeout(callback, ms, ...args);
+    }) as typeof setTimeout;
+    (globalThis as any).clearTimeout = ((timer: unknown) => {
+      if ((timer as any)?.fake) return;
+      return realClearTimeout(timer as ReturnType<typeof setTimeout>);
+    }) as typeof clearTimeout;
+    const driver = stdin
+      ? new FakeCodexDriver({ id: "codex", supportsStdinNotification: true, busyDeliveryMode: "direct" })
+      : new FakeCodexDriver({ id: "opencode", supportsStdinNotification: false, busyDeliveryMode: "none" });
+
+    try {
+      await withManager(async ({ manager }) => {
+        await manager.startAgent("agent-1", makeConfig({ runtime: stdin ? "codex" : "opencode", sessionId: "session-1" }));
+        driver.parsedLines.set("tool-start", [{ kind: "tool_call", name: "shell", input: { command: "echo ok" } }]);
+        driver.parsedLines.set("tool-output", [{ kind: "tool_output", name: "shell" }]);
+        driver.processes[0].stdout.emit("data", Buffer.from("tool-start\n"));
+        if (!openTool) driver.processes[0].stdout.emit("data", Buffer.from("tool-output\n"));
+        await flush();
+        const ap = (manager as any).agents.get("agent-1");
+        ap.runtime.isAlive = () => true;
+
+        now += 60_000;
+        manager.deliverMessage("agent-1", makeMessage("queued while the turn is still fresh", { message_id: "queued-1", seq: 41 }));
+        await flush();
+        assert.equal(driver.spawnCalls.length, 1, "a fresh turn is not restarted for a delivery");
+        assert.equal(ap.inbox.length, 1);
+        const deadline = ap.stallDeadlineTimer as { callback: () => void; ms: number } | undefined;
+        if (restarts) {
+          // From the last event a minute ago: the threshold less that minute.
+          assert.equal(deadline?.ms, (stdin ? 15 : 60) * 60_000 - 60_000, "one deadline at the threshold");
+        } else {
+          assert.equal(deadline, undefined, "an open tool may still be working: nothing to wait for");
+        }
+
+        assert.ok(intervalCallback, "working activity should install heartbeat");
+        now += 16 * 60_000;
+        intervalCallback!();
+        await flush();
+        assert.equal(driver.spawnCalls.length, 1, "the heartbeat decides nothing");
+        assert.equal(driver.processes[0].killedSignals.length, 0);
+        const suppressed = traceRows(sink).find((row) => row.name === "daemon.runtime.stall.suppressed_alive");
+        assert.ok(suppressed, "the alive check ran");
+        assert.equal(suppressed.attrs?.inbox_count, 1);
+        assert.equal(suppressed.attrs?.outstanding_tool_uses, openTool ? 1 : 0);
+        assert.equal(suppressed.attrs?.background_tasks, 0);
+        assert.equal(suppressed.attrs?.inbox_untold_count, 1, "not yet told while the turn runs");
+        // Once told, the message stays in the inbox but no longer counts as untold.
+        ap.notifications.recordNoticeWritten("told", ap.sessionId, ap.inbox);
+        intervalCallback!();
+        await flush();
+        const told = traceRows(sink).filter((row) => row.name === "daemon.runtime.stall.suppressed_alive").at(-1);
+        assert.notEqual(told, suppressed, "the alive check ran again");
+        assert.equal(told?.attrs?.inbox_count, 1);
+        assert.equal(told?.attrs?.inbox_untold_count, 0);
+
+        if (!restarts) {
+          now += 60 * 60_000;
+          await (manager as any).sweepColdIdleRuntimes();
+          assert.equal(driver.processes[0].killedSignals.length, 0, "an open tool may still be working");
+          assert.equal(driver.spawnCalls.length, 1);
+          return;
+        }
+        now = Math.max(now, 3_400_000 + (stdin ? 15 : 60) * 60_000);
+        deadline!.callback();
+        await waitFor(() => driver.spawnCalls.length === 2, "alive stall recovery restart");
+        assert.deepEqual(driver.processes[0].killedSignals, ["SIGTERM"]);
+        assert.equal(driver.spawnCalls[1].config.sessionId, "session-1");
+        const action = traceRows(sink).find((row) => row.name === "daemon.runtime.stall.recovery_action");
+        assert.equal(action?.attrs?.trigger, "stall_deadline");
+      }, { driver, tracer });
+    } finally {
+      (Date as any).now = realDateNow;
+      globalThis.setInterval = realSetInterval;
+      globalThis.clearInterval = realClearInterval;
+      globalThis.setTimeout = realSetTimeout;
+      globalThis.clearTimeout = realClearTimeout;
+    }
+  });
+}
 
 test("queued recovery treats codex raw response items as internal progress", async () => {
   const realDateNow = Date.now;
@@ -6433,7 +7207,7 @@ test("stalled direct-stdin runtimes do not restart while an active tool is still
       assert.match(driver.encodedCalls[0].text, /Inbox update:/);
       assert.match(driver.encodedCalls[0].text, /Raft inbox notice/);
       assert.doesNotMatch(driver.encodedCalls[0].text, /System notification/);
-      assert.doesNotMatch(driver.encodedCalls[0].text, /follow-up during long shell command/);
+      assertBodyOnlyInInboxPreview(driver.encodedCalls[0].text, /follow-up during long shell command/);
       const deltaSpan = traceRows(sink).find((span) => span.name === "daemon.agent.inbox_projection.delta");
       assert.equal(deltaSpan?.attrs?.source, "busy_stdin_notification");
       assert.equal(deltaSpan?.attrs?.target_count, 1);
@@ -6504,6 +7278,176 @@ test("stalled direct-stdin runtimes restart active tools when stdin is already b
   } finally {
     (Date as any).now = realDateNow;
   }
+});
+
+// Task #389 (#ops-support #106): an opencode agent was woken for one message,
+// answered without reading it, and the process ended at turn_end with that
+// already-announced message still queued. The daemon respawned at once to
+// "deliver" it again, and the new process announced it again: 385 paid turns
+// in 74 minutes. A message this process already announced and the agent left
+// unread is its own deferral, not a reason to restart; a new message still is.
+test("task #389: a per-turn runtime is not respawned for an already-announced message the agent left unread", async () => {
+  const sink = new MemoryTraceSink();
+  const tracer = new BasicTracer({ sink });
+  const driver = new FakeCodexDriver({
+    id: "opencode",
+    supportsStdinNotification: false,
+    busyDeliveryMode: "none",
+    terminateProcessOnTurnEnd: true,
+  });
+
+  await withManager(async ({ manager }) => {
+    await manager.startAgent("agent-1", makeConfig({ runtime: "opencode", sessionId: "session-1" }));
+    driver.parsedLines.set("turn-end", [{ kind: "turn_end", sessionId: "session-1" }]);
+    driver.processes[0].stdout.emit("data", Buffer.from("turn-end\n"));
+    await flush();
+    await flush();
+    assert.equal(driver.spawnCalls.length, 1);
+
+    // One message wakes the agent: a new process whose prompt announces it.
+    manager.deliverMessage("agent-1", makeMessage("onboarding context the agent never reads", {
+      message_id: "onboarding-owner-facts-server-1",
+      seq: 0,
+    }));
+    await waitFor(() => driver.spawnCalls.length === 2, "wake for the new message");
+    assert.match(driver.spawnCalls[1].prompt, /Raft inbox notice/);
+
+    // The model answers without reading it; the turn ends with it still queued.
+    driver.processes[1].stdout.emit("data", Buffer.from("turn-end\n"));
+    await flush();
+    await flush();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(driver.spawnCalls.length, 2, "no respawn for a message this process already announced");
+    // Same contract as a cold-idle stop: the daemon lets go of its local copy
+    // (it stays unread on the server and surfaces at the next real wake).
+    const dropped = traceRows(sink).filter((span) => span.name === "daemon.agent.inbox.dropped_on_exit").at(-1);
+    assert.equal(dropped?.attrs?.exit_reason, "clean_exit_deferred");
+    assert.equal(dropped?.attrs?.expected, true, "an expected, server-carried exit path");
+    assert.equal(dropped?.attrs?.dropped_count, 1);
+
+    // A genuinely new message still wakes it.
+    manager.deliverMessage("agent-1", makeMessage("a real follow-up", { message_id: "message-follow-up", seq: 7 }));
+    await waitFor(() => driver.spawnCalls.length === 3, "wake for the new message");
+    assert.match(driver.spawnCalls[2].prompt, /a real follow-up/);
+  }, { driver, tracer });
+});
+
+test("task #389: a message that arrived during the announced turn is not treated as announced, so turn_end still respawns for it", async () => {
+  const driver = new FakeCodexDriver({
+    id: "opencode",
+    supportsStdinNotification: false,
+    busyDeliveryMode: "none",
+    terminateProcessOnTurnEnd: true,
+  });
+
+  await withManager(async ({ manager }) => {
+    await manager.startAgent("agent-1", makeConfig({ runtime: "opencode", sessionId: "session-1" }));
+    driver.parsedLines.set("turn-end", [{ kind: "turn_end", sessionId: "session-1" }]);
+    driver.processes[0].stdout.emit("data", Buffer.from("turn-end\n"));
+    await flush();
+    await flush();
+
+    manager.deliverMessage("agent-1", makeMessage("announced and left unread", { message_id: "message-announced", seq: 5 }));
+    await waitFor(() => driver.spawnCalls.length === 2, "wake for the first message");
+
+    // Arrives while that turn runs: queued, never in the prompt.
+    manager.deliverMessage("agent-1", makeMessage("arrived during the turn", { message_id: "message-late", seq: 6 }));
+    await flush();
+    assert.equal(driver.spawnCalls.length, 2);
+
+    driver.processes[1].stdout.emit("data", Buffer.from("turn-end\n"));
+    await waitFor(() => driver.spawnCalls.length === 3, "respawn for the message the agent was never told about");
+    assert.match(driver.spawnCalls[2].prompt, /arrived during the turn/);
+  }, { driver });
+});
+
+function opencodeDriver(): FakeCodexDriver {
+  return new FakeCodexDriver({
+    id: "opencode",
+    supportsStdinNotification: false,
+    busyDeliveryMode: "none",
+    terminateProcessOnTurnEnd: true,
+  });
+}
+
+test("task #389: a failed start records nothing as announced", async () => {
+  const driver = opencodeDriver();
+  const original = RuntimeNotificationState.prototype.recordNoticeWritten;
+  let recorded = 0;
+  RuntimeNotificationState.prototype.recordNoticeWritten = function (...args: Parameters<typeof original>) {
+    recorded += 1;
+    return original.apply(this, args);
+  };
+  try {
+    let spawnAttempts = 0;
+    let startError: unknown = null;
+    await withManager(async ({ manager }) => {
+      driver.spawn = () => { spawnAttempts += 1; throw new Error("spawn ENOENT"); };
+      try {
+        await manager.startAgent("agent-1", makeConfig({ runtime: "opencode", sessionId: "session-1" }), makeMessage("never shown"));
+      } catch (error) {
+        startError = error;
+      }
+      await flush();
+    }, { driver });
+    assert.equal(spawnAttempts, 1, "the start reached the spawn (and the prompt was built)");
+    assert.ok(startError, "the start failed");
+    assert.equal(recorded, 0, "nothing was shown to a runtime that never started");
+  } finally {
+    RuntimeNotificationState.prototype.recordNoticeWritten = original;
+  }
+});
+
+test("task #389: a message that arrives while the start is in flight is not taken as announced", async () => {
+  const driver = opencodeDriver();
+  await withManager(async ({ manager }) => {
+    await manager.startAgent("agent-1", makeConfig({ runtime: "opencode", sessionId: "session-1" }));
+    driver.parsedLines.set("turn-end", [{ kind: "turn_end", sessionId: "session-1" }]);
+    driver.processes[0].stdout.emit("data", Buffer.from("turn-end\n"));
+    await flush();
+    await flush();
+
+    // The prompt is built before spawn; this one arrives inside it.
+    const spawn = driver.spawn.bind(driver);
+    let injected = false;
+    driver.spawn = (ctx) => {
+      const result = spawn(ctx);
+      if (!injected) {
+        injected = true;
+        manager.deliverMessage("agent-1", makeMessage("arrived during the start", { message_id: "message-during-start", seq: 9 }));
+      }
+      return result;
+    };
+    manager.deliverMessage("agent-1", makeMessage("announced and left unread", { message_id: "message-announced", seq: 8 }));
+    await waitFor(() => driver.spawnCalls.length === 2, "wake for the first message");
+    assert.doesNotMatch(driver.spawnCalls[1].prompt, /arrived during the start/);
+    await flush();
+    await flush();
+
+    driver.processes[1].stdout.emit("data", Buffer.from("turn-end\n"));
+    await waitFor(() => driver.spawnCalls.length === 3, "respawn for the message that arrived during the start");
+    assert.match(driver.spawnCalls[2].prompt, /arrived during the start/);
+  }, { driver });
+});
+
+test("task #389: a fresh session that learns its id mid-turn keeps the announcement, so turn_end does not respawn", async () => {
+  const driver = opencodeDriver();
+  await withManager(async ({ manager }) => {
+    await manager.startAgent("agent-1", makeConfig({ runtime: "opencode", sessionId: null }), makeMessage("announced to a brand-new session", {
+      message_id: "message-fresh", seq: 3,
+    }));
+    await flush();
+    assert.equal(driver.spawnCalls.length, 1);
+    driver.parsedLines.set("session-init", [{ kind: "session_init", sessionId: "session-new" }]);
+    driver.processes[0].stdout.emit("data", Buffer.from("session-init\n"));
+    await flush();
+    driver.parsedLines.set("turn-end", [{ kind: "turn_end", sessionId: "session-new" }]);
+    driver.processes[0].stdout.emit("data", Buffer.from("turn-end\n"));
+    await flush();
+    await flush();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(driver.spawnCalls.length, 1, "no respawn: the session it was announced to is the one that just learned its id");
+  }, { driver });
 });
 
 test("non-stdin turn-complete runtimes are terminated after turn_end and restart on next message", async () => {
@@ -6589,11 +7533,15 @@ test("non-stdin turn-complete termination still surfaces runtime errors as failu
       "expected runtime errors to mark the agent inactive",
     );
 
-    manager.deliverMessage("agent-1", makeMessage("should not auto-restart after failed turn"));
+    // Reconciler step 10a (D5): the failed turn's crash keeps the restart
+    // snapshot; the next delivery wakes the agent on its session (the crash
+    // streak's cap ends a loop of such failures).
+    manager.deliverMessage("agent-1", makeMessage("wakes from the snapshot after a failed turn"));
     await flush();
     await flush();
 
-    assert.equal(driver.spawnCalls.length, 1);
+    assert.equal(driver.spawnCalls.length, 2);
+    assert.equal(driver.spawnCalls[1]!.config.sessionId, "session-1");
   }, { driver });
 });
 
@@ -6614,12 +7562,52 @@ test("direct busy stdin delivery does not overwrite current activity with Messag
     assert.equal(driver.encodedCalls.length, 1);
     assert.equal(driver.encodedCalls[0].mode, "busy");
     assert.match(driver.encodedCalls[0].text, /Inbox update:/);
-    assert.doesNotMatch(driver.encodedCalls[0].text, /queued while busy/);
+    assertBodyOnlyInInboxPreview(driver.encodedCalls[0].text, /queued while busy/);
     const ap = (manager as any).agents.get("agent-1");
     assert.equal(ap.inbox.length, 1);
     assert.equal(
       sent.some((msg) => msg.type === "agent:activity" && msg.detail === "Message received"),
       false,
+    );
+  }, { driver });
+});
+
+// A reply must not be held for the message it answers when the notice already
+// showed that message whole; otherwise agents "read to mark read" with the
+// output discarded, which also marks unseen replies as seen (#wg-ax:#6).
+test("busy notice: a message its preview shows whole counts as seen for a reply and stays pending; a cut one or one with attachments does not", async () => {
+  const driver = new FakeCodexDriver({ id: "claude", supportsStdinNotification: true, busyDeliveryMode: "direct" });
+  await withManager(async ({ manager }) => {
+    await manager.startAgent("agent-1", makeConfig({ runtime: "claude", sessionId: "session-1" }));
+    const whole = makeMessage("Please hold the rollout.", { seq: 8801, message_id: "whole-1" });
+    const cut = makeMessage("Hold the rollout. The second sentence is cut from the preview.", {
+      seq: 8802, message_id: "cut-1", channel_id: "channel-2", channel_name: "random",
+    });
+    const withFile = makeMessage("See the file.", {
+      seq: 8803, message_id: "file-1", channel_id: "channel-3", channel_name: "design",
+      attachments: [{ id: "attachment-1", filename: "plan.png", mimeType: "image/png" }],
+    });
+    for (const message of [whole, cut, withFile]) manager.deliverMessage("agent-1", message);
+    (manager as any).sendStdinNotification("agent-1");
+    await flush();
+
+    assert.equal(driver.encodedCalls.length, 1);
+    assert.equal(driver.encodedCalls[0].mode, "busy");
+    assertBodyOnlyInInboxPreview(driver.encodedCalls[0].text, /Please hold the rollout\./);
+    const view = (manager as any).visibleFreshnessView("agent-1");
+    assert.deepEqual(view.getExactSeenSeqs("#general"), [8801], "shown whole: a reply to #general is not held for it");
+    assert.equal(view.getBoundary("#general"), undefined, "exact id only, never a boundary");
+    assert.equal(
+      (manager as any).isVisibleMessageModelSeen("agent-1", "#general", whole),
+      false,
+      "not consumed: a redelivery is not dropped",
+    );
+    assert.deepEqual(view.getExactSeenSeqs("#random"), [], "cut preview: still unseen");
+    assert.deepEqual(view.getExactSeenSeqs("#design"), [], "attachments are not in a preview: still unseen");
+    assert.deepEqual(
+      (manager as any).allPendingVisibleMessages("agent-1").map((message: AgentMessage) => message.message_id),
+      ["whole-1", "cut-1", "file-1"],
+      "seeing a preview consumes nothing: raft message check still serves all three",
     );
   }, { driver });
 });
@@ -6705,6 +7693,25 @@ test("direct stdin runtimes do not re-contribute identified pending messages on 
   }, { driver });
 });
 
+test("idle notice: a message its preview shows whole counts as seen for a reply and stays pending", async () => {
+  const driver = new FakeCodexDriver({ id: "direct", supportsStdinNotification: true, busyDeliveryMode: "direct" });
+  await withManager(async ({ manager }) => {
+    await manager.startAgent("agent-1", makeConfig({ sessionId: "session-1" }));
+    driver.parsedLines.set("turn-end", [{ kind: "turn_end", sessionId: "session-1" }]);
+    driver.processes[0].stdout.emit("data", Buffer.from("turn-end\n"));
+    await flush();
+
+    manager.deliverMessage("agent-1", makeMessage("Please hold the rollout.", { seq: 9901, message_id: "idle-whole-1" }));
+    await flush();
+
+    assert.equal(driver.encodedCalls.length, 1);
+    assert.equal(driver.encodedCalls[0].mode, "idle");
+    assertBodyOnlyInInboxPreview(driver.encodedCalls[0].text, /Please hold the rollout\./);
+    assert.deepEqual((manager as any).visibleFreshnessView("agent-1").getExactSeenSeqs("#general"), [9901]);
+    assert.deepEqual((manager as any).agents.get("agent-1").inbox.map((message: AgentMessage) => message.message_id), ["idle-whole-1"]);
+  }, { driver });
+});
+
 test("idle stdin delivery pushes a content-free inbox update without consuming the message", async () => {
   const driver = new FakeCodexDriver({
     id: "direct",
@@ -6722,6 +7729,7 @@ test("idle stdin delivery pushes a content-free inbox update without consuming t
     await flush();
 
     const apBeforeDelivery = (manager as any).agents.get("agent-1");
+    const consumptionBeforeNotice = apBeforeDelivery.deliveryConsumption.snapshot();
     apBeforeDelivery.inbox.push(makeMessage("older unrelated pending body", {
       message_id: "message-old-1",
       channel_name: "older-target",
@@ -6740,9 +7748,18 @@ test("idle stdin delivery pushes a content-free inbox update without consuming t
     assert.match(driver.encodedCalls[0].text, /#general/);
     assert.doesNotMatch(driver.encodedCalls[0].text, /#older-target/);
     assert.doesNotMatch(driver.encodedCalls[0].text, /older unrelated pending body/);
-    assert.doesNotMatch(driver.encodedCalls[0].text, /new turn from idle/);
+    assertBodyOnlyInInboxPreview(driver.encodedCalls[0].text, /new turn from idle/);
     assert.doesNotMatch(driver.encodedCalls[0].text, /producerFactId=fact-stdin-readout/);
+    // Task #387: the latest message shows only as a labelled preview line, and
+    // seeing it reads nothing: the message stays pending and unconsumed.
+    assert.match(
+      driver.encodedCalls[0].text,
+      /\n {2}latest @richard: "new turn from idle" \(preview; still unread, full text: raft message read --target "#general" --unread\)\n/,
+    );
     const ap = (manager as any).agents.get("agent-1");
+    const consumptionAfterNotice = ap.deliveryConsumption.snapshot();
+    assert.deepEqual(consumptionAfterNotice.lastConsumption, consumptionBeforeNotice.lastConsumption, "a preview consumes nothing");
+    assert.equal(consumptionAfterNotice.unconsumedDeliveries, 1, "the previewed delivery stays unconsumed");
     assert.equal(ap.inbox.length, 2);
     assert.equal(ap.inbox[0]?.message_id, "message-old-1");
     assert.equal(ap.inbox[1]?.message_id, "message-idle-1");
@@ -6885,7 +7902,7 @@ test("idle stdin delivery writes the same pending message at most once per sessi
     assert.equal(driver.encodedCalls.length, 1);
     assert.equal(driver.encodedCalls[0].mode, "idle");
     assert.match(driver.encodedCalls[0].text, /Inbox update: 1 message pending your read across all conversations; 1 changed target/);
-    assert.doesNotMatch(driver.encodedCalls[0].text, /Lead reply body/);
+    assertBodyOnlyInInboxPreview(driver.encodedCalls[0].text, /Lead reply body/);
 
     const apAfterFirst = (manager as any).agents.get("agent-1");
     assert.equal(apAfterFirst.inbox.length, 1);
@@ -6925,7 +7942,7 @@ test("idle stdin delivery writes the same pending message at most once per sessi
     assert.equal(driver.encodedCalls.length, 2);
     assert.equal(driver.encodedCalls[1].mode, "idle");
     assert.match(driver.encodedCalls[1].text, /Inbox update: 2 messages pending your read across all conversations; 1 changed target/);
-    assert.doesNotMatch(driver.encodedCalls[1].text, /fresh message reopens idle delivery/);
+    assertBodyOnlyInInboxPreview(driver.encodedCalls[1].text, /fresh message reopens idle delivery/);
     const apAfterFresh = (manager as any).agents.get("agent-1");
     assert.equal(apAfterFresh.inbox.length, 2);
     assert.deepEqual(apAfterFresh.inbox.map((message: AgentMessage) => message.message_id), [
@@ -7032,7 +8049,7 @@ test("idle stdin duplicate memo does not hide a re-arrived message after the pen
     assert.equal(driver.encodedCalls.length, 2);
     assert.equal(driver.encodedCalls[1].mode, "idle");
     assert.match(driver.encodedCalls[1].text, /Inbox update: 1 message pending your read across all conversations; 1 changed target/);
-    assert.doesNotMatch(driver.encodedCalls[1].text, /same fingerprint re-arrives/);
+    assertBodyOnlyInInboxPreview(driver.encodedCalls[1].text, /same fingerprint re-arrives/);
     assert.equal(ap.inbox.length, 1);
     assert.equal(ap.inbox[0]?.message_id, "stale-memo-message-id");
     assert.equal(ap.inbox[0]?.seq, 6125301);
@@ -7071,7 +8088,7 @@ test("idle stdin duplicate suppression still works with multiple pending message
     assert.equal(driver.encodedCalls.length, 1);
     assert.match(driver.encodedCalls[0].text, /Inbox update: 2 messages pending your read across all conversations; 1 changed target/);
     assert.doesNotMatch(driver.encodedCalls[0].text, /older pending body/);
-    assert.doesNotMatch(driver.encodedCalls[0].text, /new idle message/);
+    assertBodyOnlyInInboxPreview(driver.encodedCalls[0].text, /new idle message/);
 
     const apAfterFirst = (manager as any).agents.get("agent-1");
     assert.equal(apAfterFirst.inbox.length, 2);
@@ -7215,8 +8232,7 @@ test("non-stdin runtimes restart with a content-free inbox update for queued cha
       }),
     );
 
-    driver.processes[0].exit(0);
-    driver.processes[0].close(0);
+    endPerTurnTurn(driver, 0);
     await waitFor(() => driver.spawnCalls.length === 2, "non-stdin restart with queued channel summary");
 
     assert.equal(driver.spawnCalls.length, 2);
@@ -7224,8 +8240,8 @@ test("non-stdin runtimes restart with a content-free inbox update for queued cha
     assert.match(driver.spawnCalls[1].prompt, /Inbox update: .*2 changed targets/);
     assert.match(driver.spawnCalls[1].prompt, /#general\s+pending: 1 message/);
     assert.match(driver.spawnCalls[1].prompt, /dm:@alice\s+pending: 1 message/);
-    assert.doesNotMatch(driver.spawnCalls[1].prompt, /first queued message/);
-    assert.doesNotMatch(driver.spawnCalls[1].prompt, /dm arrived too/);
+    assertBodyOnlyInInboxPreview(driver.spawnCalls[1].prompt, /first queued message/);
+    assertBodyOnlyInInboxPreview(driver.spawnCalls[1].prompt, /dm arrived too/);
     assert.doesNotMatch(driver.spawnCalls[1].prompt, /You also have unread messages in other channels:/);
   }, {
     driver: new FakeCodexDriver({ id: "execlike", supportsStdinNotification: false }),
@@ -7237,15 +8253,13 @@ test("messages arriving while a non-stdin auto-resume is starting are preserved"
     await manager.startAgent("agent-1", makeConfig({ sessionId: "session-1" }));
 
     manager.deliverMessage("agent-1", makeMessage("first queued message"));
-    driver.processes[0].exit(0);
-    driver.processes[0].close(0);
+    endPerTurnTurn(driver, 0);
     manager.deliverMessage("agent-1", makeMessage("second queued message during restart"));
     await waitFor(() => driver.spawnCalls.length === 2, "non-stdin auto-resume first restart");
 
     assert.equal(driver.spawnCalls.length, 2);
 
-    driver.processes[1].exit(0);
-    driver.processes[1].close(0);
+    endPerTurnTurn(driver, 1);
     await waitFor(
       () => driver.spawnCalls.length === 3,
       "non-stdin restart after message arrives during auto-resume",
@@ -7266,8 +8280,7 @@ test("queued continuation preserves restart residency after managed credential m
     assert.equal(manager.deliverMessage("agent-1", makeMessage("first queued message")), true);
 
     await withRunnerCredentialMintFailure(async () => {
-      driver.processes[0].exit(0);
-      driver.processes[0].close(0);
+      endPerTurnTurn(driver, 0);
       await waitFor(
         () => sent.some((msg) => msg.type === "agent:activity" && msg.detail.includes("runner_credential_mint_failed")),
         "queued continuation managed credential failure activity",
@@ -7398,7 +8411,7 @@ test("direct stdin runtimes pause busy delivery until compaction finishes", asyn
     assert.equal(driver.encodedCalls.length, 1);
     assert.equal(driver.encodedCalls[0].mode, "busy");
     assert.match(driver.encodedCalls[0].text, /Inbox update:/);
-    assert.doesNotMatch(driver.encodedCalls[0].text, /direct message during compaction/);
+    assertBodyOnlyInInboxPreview(driver.encodedCalls[0].text, /direct message during compaction/);
   }, { driver, tracer });
 });
 
@@ -7445,7 +8458,7 @@ test("direct stdin runtimes pause busy delivery until review mode finishes", asy
     assert.equal(driver.encodedCalls.length, 1);
     assert.equal(driver.encodedCalls[0].mode, "busy");
     assert.match(driver.encodedCalls[0].text, /Inbox update:/);
-    assert.doesNotMatch(driver.encodedCalls[0].text, /direct message during review/);
+    assertBodyOnlyInInboxPreview(driver.encodedCalls[0].text, /direct message during review/);
   }, { driver, tracer });
 });
 
@@ -7477,7 +8490,7 @@ test("direct stdin runtimes notify about compaction-boundary messages on inferre
     assert.equal(driver.encodedCalls.length, 1);
     assert.equal(driver.encodedCalls[0].mode, "busy");
     assert.match(driver.encodedCalls[0].text, /Inbox update:/);
-    assert.doesNotMatch(driver.encodedCalls[0].text, /direct question delivered during compacted turn/);
+    assertBodyOnlyInInboxPreview(driver.encodedCalls[0].text, /direct question delivered during compacted turn/);
   }, { driver });
 });
 
@@ -7518,7 +8531,8 @@ test("runtime error clears compaction state without successful finish activity o
 });
 
 test("task #10: after three terminal compaction failures of one Pi session, starts refuse to resume it until it is reset", async () => {
-  const driver = new FakeCodexDriver({ id: "pi", supportsStdinNotification: true, busyDeliveryMode: "direct" });
+  // Pi's own declaration: its compaction failures stick to the session.
+  const driver = new FakeCodexDriver({ id: "pi", session: new PiDriver().session, supportsStdinNotification: true, busyDeliveryMode: "direct" });
   await withManager(async ({ manager, sent, dataDir }) => {
     const failCompaction = async (index: number) => {
       await manager.startAgent("agent-1", makeConfig({ runtime: "pi", model: "gw/deepseek-v4-pro", sessionId: "session-1" }));
@@ -7539,7 +8553,7 @@ test("task #10: after three terminal compaction failures of one Pi session, star
     await failCompaction(1);
     await failCompaction(2);
     await failCompaction(3);
-    const stored = JSON.parse(readFileSync(path.join(dataDir, "agent-1", ".raft", "compaction-failures.json"), "utf8"));
+    const stored = JSON.parse(readFileSync(path.join(dataDir, ".agent-state", "agent-1", "compaction-failures.json"), "utf8"));
     assert.equal(stored.count, 3);
 
     const spawnedBefore = driver.processes.length;
@@ -7555,7 +8569,7 @@ test("task #10: after three terminal compaction failures of one Pi session, star
     driver.parsedLines.set("compact-ok", [{ kind: "compaction_started" }, { kind: "compaction_finished" }]);
     driver.processes.at(-1)!.stdout.emit("data", Buffer.from("compact-ok\n"));
     await flush();
-    assert.equal(existsSync(path.join(dataDir, "agent-1", ".raft", "compaction-failures.json")), false);
+    assert.equal(existsSync(path.join(dataDir, ".agent-state", "agent-1", "compaction-failures.json")), false);
     void sent;
   }, { driver });
 });
@@ -7563,7 +8577,7 @@ test("task #10: after three terminal compaction failures of one Pi session, star
 test("task #13: a resumed Codex session gets a changed standing prompt in its first input, once", async () => {
   const driver = new FakeCodexDriver({ id: "codex", supportsNativeStandingPrompt: true, supportsStdinNotification: true, busyDeliveryMode: "direct" });
   await withManager(async ({ manager, dataDir }) => {
-    const ledgerFile = path.join(dataDir, "agent-1", ".raft", "standing-prompt.json");
+    const ledgerFile = path.join(dataDir, ".agent-state", "agent-1", "standing-prompt.json");
     const run = async (config: Partial<AgentConfig>) => {
       await manager.startAgent("agent-1", makeConfig(config));
       const call = driver.spawnCalls.at(-1)!;
@@ -7622,12 +8636,112 @@ test("task #13: a resumed session with no record is recorded, not injected", asy
     driver.parsedLines.set("init", [{ kind: "session_init", sessionId: "legacy-thread" }]);
     driver.processes.at(-1)!.stdout.emit("data", Buffer.from("init\n"));
     await flush();
-    assert.equal(JSON.parse(readFileSync(path.join(dataDir, "agent-1", ".raft", "standing-prompt.json"), "utf8")).sessionId, "legacy-thread");
+    assert.equal(JSON.parse(readFileSync(path.join(dataDir, ".agent-state", "agent-1", "standing-prompt.json"), "utf8")).sessionId, "legacy-thread");
   }, { driver });
 });
 
+test("task #13: without a native standing prompt, only a session the prompt reached is recorded as current", async () => {
+  const driver = new FakeCodexDriver({ id: "cursor" });
+  await withManager(async ({ manager, dataDir }) => {
+    const ledgerFile = path.join(dataDir, ".agent-state", "agent-1", "standing-prompt.json");
+    const run = async (config: Partial<AgentConfig>, reportedSessionId: string, wake?: AgentMessage) => {
+      await manager.startAgent("agent-1", makeConfig({ runtime: "cursor", description: "reviews code", ...config }), wake);
+      const call = driver.spawnCalls.at(-1)!;
+      driver.parsedLines.set(`init-${driver.spawnCalls.length}`, [{ kind: "session_init", sessionId: reportedSessionId }]);
+      driver.processes.at(-1)!.stdout.emit("data", Buffer.from(`init-${driver.spawnCalls.length}\n`));
+      await flush();
+      await manager.stopAgent("agent-1", { wait: true, silent: true });
+      return { prompt: String(call.prompt), record: JSON.parse(readFileSync(ledgerFile, "utf8")) as { sessionId: string; promptHash: string } };
+    };
+
+    // A session-less wake: the prompt goes in the first input, so the session is current.
+    const fresh = await run({}, "chat-1", makeMessage("hello"));
+    assert.ok(fresh.prompt.startsWith(String(driver.spawnCalls.at(-1)!.standingPrompt)));
+    assert.equal(fresh.record.sessionId, "chat-1");
+    assert.doesNotMatch((await run({ sessionId: "chat-1" }, "chat-1")).prompt, /raft-standing-prompt-update/, "resumed on the prompt it got");
+
+    // A resume that comes up on another session: that session never got the prompt.
+    const switched = await run({ sessionId: "chat-1" }, "chat-2");
+    assert.doesNotMatch(switched.prompt, /raft-standing-prompt-update/);
+    assert.equal(switched.record.sessionId, "chat-2");
+    assert.notEqual(switched.record.promptHash, fresh.record.promptHash, "not recorded as current");
+
+    // So its next resume re-delivers it, and then it is current.
+    const redelivered = await run({ sessionId: "chat-2" }, "chat-2");
+    assert.match(redelivered.prompt, /^<raft-standing-prompt-update>/);
+    assert.equal(redelivered.record.promptHash, fresh.record.promptHash);
+  }, { driver });
+});
+
+test("task #13: a non-native session recorded as current before ledger version 2 gets the standing prompt once", async () => {
+  const driver = new FakeCodexDriver({ id: "cursor" });
+  await withManager(async ({ manager, dataDir }) => {
+    const ledgerFile = path.join(dataDir, ".agent-state", "agent-1", "standing-prompt.json");
+    const run = async (config: Partial<AgentConfig>, reportedSessionId: string, wake?: AgentMessage) => {
+      await manager.startAgent("agent-1", makeConfig({ runtime: "cursor", description: "reviews code", ...config }), wake);
+      const call = driver.spawnCalls.at(-1)!;
+      driver.parsedLines.set(`init-${driver.spawnCalls.length}`, [{ kind: "session_init", sessionId: reportedSessionId }]);
+      driver.processes.at(-1)!.stdout.emit("data", Buffer.from(`init-${driver.spawnCalls.length}\n`));
+      await flush();
+      await manager.stopAgent("agent-1", { wait: true, silent: true });
+      return { prompt: String(call.prompt), record: JSON.parse(readFileSync(ledgerFile, "utf8")) as { sessionId: string; promptHash: string } };
+    };
+
+    const fresh = await run({}, "chat-1", makeMessage("hello"));
+    const prompt = String(driver.spawnCalls.at(-1)!.standingPrompt);
+    assert.equal(fresh.record.promptHash, standingPromptHash(prompt, { nativeStandingPrompt: false }), "precondition: the hashed prompt is the one sent");
+
+    // What the daemon wrote before the fix for a wake-started session: the bare
+    // prompt hash, as if the prompt had reached it.
+    const legacyHash = createHash("sha256").update(prompt).digest("hex").slice(0, 32);
+    writeFileSync(ledgerFile, JSON.stringify({ version: 1, sessionId: "chat-1", promptHash: legacyHash, recordedAtMs: 0 }));
+
+    const redelivered = await run({ sessionId: "chat-1" }, "chat-1");
+    assert.match(redelivered.prompt, /^<raft-standing-prompt-update>/);
+    assert.ok(redelivered.prompt.includes(prompt), "the full standing prompt");
+    assert.equal(redelivered.record.promptHash, fresh.record.promptHash, "recorded as current");
+    assert.doesNotMatch((await run({ sessionId: "chat-1" }, "chat-1")).prompt, /raft-standing-prompt-update/, "once");
+  }, { driver });
+});
+
+test("a fresh session's standing prompt is a trace flag, not a new prompt source; both reach the real local trace sink", async () => {
+  const machineDir = await mkdtemp(path.join(os.tmpdir(), "raft-standing-prompt-trace-"));
+  const sink = new LocalRotatingTraceSink({ machineDir, maxFileBytes: 4 * 1024 * 1024, maxFiles: 4 });
+  const driver = new FakeCodexDriver({ id: "cursor" });
+  try {
+    await withManager(async ({ manager }) => {
+      await manager.startAgent("agent-1", makeConfig({ runtime: "cursor" }), makeMessage("hello"), undefined, undefined, "launch-fresh");
+      assert.ok(afterFreshSessionStandingPrompt(driver.spawnCalls[0]), "precondition: the standing prompt is in the first input");
+      driver.parsedLines.set("turn-end", [{ kind: "turn_end", sessionId: "chat-1" }]);
+      driver.processes[0].stdout.emit("data", Buffer.from("turn-end\n"));
+      await flush();
+      await manager.stopAgent("agent-1", { wait: true, silent: true });
+    }, { driver, tracer: new BasicTracer({ sink }) });
+
+    const turns: Array<Record<string, unknown>> = [];
+    const dir = path.join(machineDir, "traces");
+    for (const name of readdirSync(dir)) {
+      for (const line of (await readFile(path.join(dir, name), "utf8")).split("\n").filter(Boolean)) {
+        const record = JSON.parse(line) as { name?: string; attrs?: Record<string, unknown> };
+        if (record.name === "daemon.runtime.turn" && record.attrs?.runtime_input_source !== undefined) turns.push(record.attrs);
+      }
+    }
+    assert.equal(turns.length, 1, `one turn span on disk (${turns.length})`);
+    const source = String(turns[0].runtime_input_source);
+    // The feedback event tail keeps only known sources (an optional `_with_memory` suffix).
+    assert.ok((AGENT_EVENT_TAIL_RUNTIME_INPUT_SOURCE_BASES as readonly string[]).includes(source.replace(/_with_memory$/, "")), source);
+    assert.equal(turns[0].runtime_input_standing_prompt_present, true);
+    assert.equal(turns[0].runtime_input_native_standing_prompt_present, false);
+  } finally {
+    await rm(machineDir, { recursive: true, force: true });
+  }
+});
+
 for (const failureReason of ["compaction_failed", "input_too_large", "recovery_exhausted"] as const) {
-test(`${failureReason} stays terminal through turn_end and persists typed compaction facts`, async () => {
+// Reconciler step 12: a failed compaction (and an input still too large
+// after it) no longer leaves a terminal record: the session is replaced once,
+// with the queued delivery carried into the new one.
+test(`${failureReason} replaces the session once and persists typed compaction facts`, async () => {
   const driver = new FakeCodexDriver({
     id: "pi",
     supportsStdinNotification: true,
@@ -7690,9 +8804,17 @@ test(`${failureReason} stays terminal through turn_end and persists typed compac
 
     assert.equal(apBeforeTerminal.gatedSteering.compacting, false);
     assert.deepEqual(apBeforeTerminal.compaction, { kind: "none" });
-    assert.equal(apBeforeTerminal.inbox.length, 1);
-    assert.equal((manager as any).agents.has("agent-1"), false);
-    assert.equal(driver.encodedCalls.length, 0);
+    assert.equal(apBeforeTerminal.inbox.length, 0, "the queued delivery is carried, not kept on the old process");
+    assert.equal(driver.encodedCalls.length, 0, "nothing more reached the failed process");
+    await waitFor(() => driver.spawnCalls.length === 2, "the new session starts");
+    assert.notEqual((manager as any).agents.get("agent-1"), apBeforeTerminal);
+    assert.equal(driver.spawnCalls[1].config.sessionId ?? null, null, "on a new session");
+    assert.match(driver.spawnCalls[1].prompt, /\[Raft inbox notice:/, "the new session is told about the carried delivery");
+    assert.deepEqual(
+      sent.filter((msg) => msg.type === "agent:session:invalidate").map((msg) => msg.type === "agent:session:invalidate" ? [msg.sessionId, msg.reason] : null),
+      [["session-1", "compaction_failed"]],
+    );
+    assert.equal((manager as any).lifecycleRecords.terminalFailures.has("agent-1"), false, "no terminal record");
     assert.equal(
       sent.some((msg) =>
         msg.type === "agent:activity" &&
@@ -8193,7 +9315,7 @@ test("codex notifies about queued inbox while busy without consuming message con
     assert.equal(driver.encodedCalls.length, 1);
     assert.equal(driver.encodedCalls[0].mode, "busy");
     assert.match(driver.encodedCalls[0].text, /Inbox update:/);
-    assert.doesNotMatch(driver.encodedCalls[0].text, /interrupt current work with this/);
+    assertBodyOnlyInInboxPreview(driver.encodedCalls[0].text, /interrupt current work with this/);
     const ap = (manager as any).agents.get("agent-1");
     assert.equal(ap.inbox.length, 1);
     assert.equal(ap.notifications.pendingCount, 0);
@@ -8363,6 +9485,11 @@ function emitGrokTurnStartRejection(driver: FakeCodexDriver, text: string) {
 // exhausted"; the daemon restored and redelivered into the same session every
 // retry interval forever. Review criteria (archer/HaoHao): typed billing class,
 // bounded redelivery, billing wording, and a visible fate for the message.
+// #proj-raft-computer:#46, reconciler step 4a (C3): the balance is the
+// credential's, not a broken process. The process used to be released with
+// E1 billing_rejected; now it is kept and the message is held in its inbox
+// for the credential (no redelivery), released by a credentials change or a
+// person's stop (Retry).
 test("task #917: a billing delivery rejection stops redelivery, keeps the message, and reports billing", async () => {
   const driver = new FakeCodexDriver({ id: "grok", supportsStdinNotification: true, busyDeliveryMode: "direct" });
   const sink = new MemoryTraceSink();
@@ -8378,11 +9505,14 @@ test("task #917: a billing delivery rejection stops redelivery, keeps the messag
 
     // 2. bounded: nothing more is written into the session
     assert.equal(driver.encodedCalls.length, 1, "no redelivery after a billing rejection");
-    assert.equal((manager as any).agents.has("agent-1"), false, "runtime process is released");
+    assert.equal((manager as any).agents.has("agent-1"), true, "the process is kept (step 4a)");
+    assert.deepEqual(driver.processes[0].killedSignals, []);
+    assert.deepEqual(runtimeOutcomeFrames(sent).filter((frame) => frame.outcome.kind === "terminal_failure"), [], "no E1: the process is not broken");
 
-    // 4. the message has a visible fate: kept for the next start
-    const kept = (manager as any).startingInboxes.values("agent-1") ?? [];
+    // 4. the message has a visible fate: held in the inbox for the credential
+    const kept = (manager as any).agents.get("agent-1").inbox as AgentMessage[];
     assert.deepEqual(kept.map((m: AgentMessage) => m.message_id), [message.message_id]);
+    assert.equal((manager as any).providerLimitLedger.hasAnyInvalid(), true);
 
     // 3. the user sees billing, not input size
     const errorEvent = findLastActivity(sent, "error");
@@ -8394,6 +9524,7 @@ test("task #917: a billing delivery rejection stops redelivery, keeps the messag
     // 1. typed billing class on the trace
     const stop = traceRows(sink).find((span) => span.name === "daemon.agent.stdin_delivery.terminal_rejected");
     assert.equal(stop?.attrs?.runtime_error_class, "BillingError");
+    assert.equal(stop?.attrs?.credential_invalid_reason, "billing");
   }, { driver, tracer, stdinNotificationRetryMs: 25 });
 });
 
@@ -8416,7 +9547,9 @@ test("task #917: repeated non-billing turn/start rejections trip the same-finger
 
       assert.equal(driver.encodedCalls.length, 3, "redelivery stops at the fence threshold");
       assert.equal((manager as any).agents.has("agent-1"), false);
-      assert.equal(((manager as any).startingInboxes.values("agent-1") ?? []).length, 1, "message kept for the next start");
+      // Reconciler step 12 (row C11): handed to the server at the trip; the message stays unread there.
+      assert.equal(((manager as any).startingInboxes.values("agent-1") ?? []).length, 0, "the server holds the message for its next start");
+      assert.equal((manager as any).lastStartFailures.get("agent-1")?.spawnFailure?.reason, "runtime_spawn_failed");
       const errorEvent = findLastActivity(sent, "error");
       assert.ok(errorEvent && errorEvent.type === "agent:activity");
       assert.match(errorEvent.detail, /Runtime stopped after 3 repeated runtime errors/);
@@ -8427,9 +9560,9 @@ test("task #917: repeated non-billing turn/start rejections trip the same-finger
       const fenceLines = warnLines.filter((line) => line.includes("same-fingerprint runtime error fence tripped"));
       assert.equal(fenceLines.length, 1, `fence trip logs exactly one runner.log line, got: ${JSON.stringify(warnLines)}`);
       assert.match(fenceLines[0], /^\[Agent agent-1\] grok same-fingerprint runtime error fence tripped: fingerprint=[0-9a-f]{16} attempts=3\/3 class=[A-Za-z]+Error; /);
-      const cleanupLines = warnLines.filter((line) => line.includes("terminal runtime error cleanup"));
+      const cleanupLines = warnLines.filter((line) => line.includes("failed for good: class="));
       assert.equal(cleanupLines.length, 1, `terminal cleanup logs exactly one runner.log line, got: ${JSON.stringify(warnLines)}`);
-      assert.match(cleanupLines[0], /^\[Agent agent-1\] grok terminal runtime error cleanup: class=[A-Za-z]+Error fingerprint=[0-9a-f]{16} inbox=\d+ pending_notifications=\d+; terminating runtime process \(SIGTERM\)$/);
+      assert.match(cleanupLines[0], /^\[Agent agent-1\] grok failed for good: class=[A-Za-z]+Error fingerprint=[0-9a-f]{16} inbox=\d+ pending_notifications=\d+; terminating runtime process \(SIGTERM\)$/);
       const fenceFingerprint = /fingerprint=([0-9a-f]{16})/.exec(fenceLines[0])?.[1];
       assert.ok(fenceFingerprint && cleanupLines[0].includes(`fingerprint=${fenceFingerprint}`), "both lines name the same runtime error fingerprint");
     }, { driver, stdinNotificationRetryMs: 25 });
@@ -8618,8 +9751,72 @@ test("codex retries failed busy notification only after runtime progress can reo
     assert.equal(apAfterRetry.notifications.hasTimer, false);
     assert.equal(driver.encodedCalls[0].mode, "busy");
     assert.match(driver.encodedCalls[0].text, /Inbox update:/);
-    assert.doesNotMatch(driver.encodedCalls[0].text, /keep this visible during a long turn/);
+    assertBodyOnlyInInboxPreview(driver.encodedCalls[0].text, /keep this visible during a long turn/);
   }, { driver, stdinNotificationRetryMs: 1 });
+});
+
+test("codex retries a refused busy notification at the next tool start when the turn chains tools without text", async () => {
+  const driver = new FakeCodexDriver({
+    id: "codex",
+    supportsStdinNotification: true,
+    busyDeliveryMode: "direct",
+    failEncodeModes: ["busy"],
+  });
+
+  await withManager(async ({ manager }) => {
+    await manager.startAgent("agent-1", makeConfig({ sessionId: "session-1" }));
+    vi.useFakeTimers({ toFake: ["setTimeout"] });
+    onTestFinished(() => {
+      vi.useRealTimers();
+    });
+
+    manager.deliverMessage("agent-1", makeMessage("seen at the next tool start"));
+    (manager as any).sendStdinNotification("agent-1");
+    const ap = (manager as any).agents.get("agent-1");
+    assert.equal(ap.notifications.pendingCount, 1);
+    assert.equal(driver.encodedCalls.length, 0);
+
+    // A tool ends and the next one starts with no reasoning or text in between:
+    // the steering window reopens at the tool start.
+    driver.failEncodeModes.delete("busy");
+    driver.parsedLines.set("tool-end", [{ kind: "tool_output", name: "shell", callId: "call-1" }]);
+    driver.processes[0].stdout.emit("data", Buffer.from("tool-end\n"));
+    assert.equal(driver.encodedCalls.length, 0, "a tool end alone does not reopen steering");
+
+    driver.parsedLines.set("tool-start", [{ kind: "tool_call", name: "shell", input: { command: "ls" }, callId: "call-2" }]);
+    driver.processes[0].stdout.emit("data", Buffer.from("tool-start\n"));
+
+    assert.equal(ap.notifications.pendingCount, 0);
+    assert.equal(driver.encodedCalls.length, 1);
+    assert.equal(driver.encodedCalls[0].mode, "busy");
+    assertBodyOnlyInInboxPreview(driver.encodedCalls[0].text, /seen at the next tool start/);
+  }, { driver, stdinNotificationRetryMs: 1 });
+});
+
+test("a tool start does not write a busy notification that was never refused", async () => {
+  const driver = new FakeCodexDriver({
+    id: "codex",
+    supportsStdinNotification: true,
+    busyDeliveryMode: "direct",
+  });
+
+  await withManager(async ({ manager }) => {
+    await manager.startAgent("agent-1", makeConfig({ sessionId: "session-1" }));
+    vi.useFakeTimers({ toFake: ["setTimeout"] });
+    onTestFinished(() => {
+      vi.useRealTimers();
+    });
+
+    manager.deliverMessage("agent-1", makeMessage("batched by the usual delay"));
+    const ap = (manager as any).agents.get("agent-1");
+    assert.equal(ap.notifications.pendingCount, 1);
+    assert.equal(ap.notifications.hasTimer, true);
+
+    driver.parsedLines.set("tool-start", [{ kind: "tool_call", name: "shell", input: { command: "ls" }, callId: "call-1" }]);
+    driver.processes[0].stdout.emit("data", Buffer.from("tool-start\n"));
+    assert.equal(driver.encodedCalls.length, 0, "the initial batching delay still applies");
+    assert.equal(ap.notifications.hasTimer, true);
+  }, { driver });
 });
 
 test("codex drains re-queued inbox on the first recovery turn after a tool-timeout error", async () => {
@@ -8844,9 +10041,10 @@ test("codex fail point retires sticky terminal runtime errors without delivery c
 
     assert.equal((manager as any).agents.has("agent-1"), false);
     assert.deepEqual(driver.processes[0].killedSignals, ["SIGTERM"]);
-    const terminalFailure = (manager as any).lifecycleRecords.terminalFailures.get("agent-1");
-    assert.ok(terminalFailure);
-    assert.equal(terminalFailure.detail, "Synthetic sticky terminal runtime failure");
+    // Reconciler step 12: no terminal record; the agent is the server's, with no cooldown left.
+    assert.equal((manager as any).lifecycleRecords.terminalFailures.has("agent-1"), false);
+    assert.match((manager as any).lastStartFailures.get("agent-1")?.detail ?? "", /Synthetic sticky terminal runtime failure/);
+    assert.equal((manager as any).lifecycleRecords.activeSpawnFailBackoffs.has("agent-1"), false);
   }, {
     driver,
     runtimeErrorDeliveryBackoff: {
@@ -8864,7 +10062,68 @@ test("codex fail point retires sticky terminal runtime errors without delivery c
   });
 });
 
-test("codex auth refresh errors terminate the stale process and require explicit restart", async () => {
+// Reconciler step 12 follow-up: the fail point used to force every injected
+// sticky failure to `model_unsupported`, so the input-too-large path (C8)
+// could not be driven through it. Its own kind now wins.
+test("codex fail point injects an input-too-large sticky failure: the session is replaced once (C8), not handed to the server", async () => {
+  const stickyFailPoint = "failpoint: sticky input too large";
+  const driver = new FakeCodexDriver({
+    id: "codex",
+    supportsStdinNotification: true,
+    busyDeliveryMode: "direct",
+  });
+
+  await withManager(async ({ manager, sent }) => {
+    await manager.startAgent("agent-1", makeConfig({ sessionId: "session-1" }));
+
+    driver.parsedLines.set("initial-turn-end", [{ kind: "turn_end", sessionId: "session-1" }]);
+    driver.processes[0].stdout.emit("data", Buffer.from("initial-turn-end\n"));
+    await flush();
+
+    manager.deliverMessage("agent-1", makeMessage("message before the input outgrew the model"));
+    await flush();
+
+    driver.parsedLines.set("sticky-failpoint", [
+      { kind: "error", message: stickyFailPoint },
+    ]);
+    driver.processes[0].stdout.emit("data", Buffer.from("sticky-failpoint\n"));
+    await flush();
+
+    assert.deepEqual(driver.processes[0].killedSignals, ["SIGTERM"]);
+    assert.deepEqual(
+      sent.filter((msg) => msg.type === "agent:session:invalidate").map((msg) => msg.type === "agent:session:invalidate" ? [msg.sessionId, msg.reason] : null),
+      [["session-1", "input_too_large"]],
+      "the session is forgotten once, as too large",
+    );
+    await waitFor(() => driver.spawnCalls.length === 2, "the new session starts with the carried delivery");
+    assert.equal(driver.spawnCalls[1].config.sessionId ?? null, null, "on a new session");
+    assert.equal((manager as any).lastStartFailures.has("agent-1"), false, "not handed to the server as model_unsupported");
+    assert.equal(
+      sent.some((msg) => msg.type === "agent:activity" && (msg as { spawnFailure?: { reason?: string } }).spawnFailure?.reason === "model_unsupported"),
+      false,
+    );
+  }, {
+    driver,
+    runtimeErrorDeliveryBackoff: {
+      baseMs: 100_000,
+      maxMs: 100_000,
+      jitterRatio: 0,
+      failPointForTesting: ({ message }) => message === stickyFailPoint
+        ? {
+          terminalFailure: { detail: "Synthetic input too large", actionRequired: false },
+          stickyTerminalFailure: { detail: "Synthetic input too large", actionRequired: false, kind: "input_too_large" },
+          reason: "test_sticky_must_not_cool_down",
+        }
+        : undefined,
+    },
+  });
+});
+
+// #proj-raft-computer:#46, reconciler step 4a: the auth error used to SIGTERM
+// the process and mark the agent inactive. The credential is invalid, not the
+// process: it is kept (session and background tasks), and deliveries are held
+// until the credential changes (or a person's Retry).
+test("codex auth refresh errors keep the process and hold deliveries for the credential", async () => {
   const driver = new FakeCodexDriver({
     id: "codex",
     supportsStdinNotification: true,
@@ -8894,10 +10153,11 @@ test("codex auth refresh errors terminate the stale process and require explicit
     await flush();
     await flush();
 
-    assert.deepEqual(driver.processes[0].killedSignals, ["SIGTERM"]);
-    assert.ok(
+    assert.deepEqual(driver.processes[0].killedSignals, [], "the process is kept");
+    assert.equal(
       sent.some((msg) => msg.type === "agent:status" && msg.status === "inactive"),
-      "expected auth-required runtime errors to mark the agent inactive",
+      false,
+      "an invalid credential does not make the agent inactive",
     );
 
     const errorEvent = findLastActivity(sent, "error");
@@ -8907,12 +10167,13 @@ test("codex auth refresh errors terminate the stale process and require explicit
       "Codex CLI is not logged in on this machine. Please log in to Codex CLI locally, then retry starting this agent.",
     );
 
-    manager.deliverMessage("agent-1", makeMessage("do not route into stale auth process"));
+    manager.deliverMessage("agent-1", makeMessage("held until the credential changes"));
     await flush();
     await flush();
 
     assert.equal(driver.spawnCalls.length, 1);
-    assert.equal(driver.encodedCalls.length, 1);
+    assert.equal(driver.encodedCalls.length, 1, "held: nothing goes into the same rejection");
+    assert.ok((manager as any).agents.get("agent-1").inbox.some((m: AgentMessage) => m.content === "held until the credential changes"));
   }, { driver });
 });
 
@@ -8947,7 +10208,7 @@ test("generic provider 403 errors remain non-auth failures without terminating t
   }, { driver });
 });
 
-test("provider 403 errors with explicit auth evidence still terminate for user reauth", async () => {
+test("provider 403 errors with explicit auth evidence still ask for user reauth (the process is kept: step 4a)", async () => {
   const driver = new FakeCodexDriver({
     id: "codex",
     supportsStdinNotification: true,
@@ -8964,11 +10225,8 @@ test("provider 403 errors with explicit auth evidence still terminate for user r
     await flush();
     await flush();
 
-    assert.deepEqual(driver.processes[0].killedSignals, ["SIGTERM"]);
-    assert.ok(
-      sent.some((msg) => msg.type === "agent:status" && msg.status === "inactive"),
-      "expected an explicit 403 auth failure to mark the agent inactive",
-    );
+    assert.deepEqual(driver.processes[0].killedSignals, []);
+    assert.equal((manager as any).providerLimitLedger.hasAnyInvalid(), true, "the credential is invalid instead");
 
     const errorEvent = findLastActivity(sent, "error");
     assert.ok(errorEvent && errorEvent.type === "agent:activity");
@@ -9018,7 +10276,10 @@ test("codex terminal model errors are not masked by turn_end or clean close", as
     const apAfterTurnEnd = (manager as any).agents.get("agent-1");
     assert.equal(driver.encodedCalls.length, 1, "turn_end must not deliver queued messages into a terminally failed runtime");
     assert.equal(apAfterTurnEnd, undefined, "terminal runtime errors must retire the stale runtime entry");
-    assert.equal((manager as any).startingInboxes.values("agent-1").length, queuedBeforeFailure, "queued work must wait for explicit recovery");
+    // Reconciler step 12: no terminal record keeps the queued work here; it stays unread on the server, which owns the next start.
+    assert.equal((manager as any).startingInboxes.has("agent-1"), false, "queued work is left to the server");
+    assert.equal((manager as any).lifecycleRecords.terminalFailures.has("agent-1"), false, "no terminal record");
+    assert.equal((manager as any).lastStartFailures.get("agent-1")?.spawnFailure?.reason, "runtime_spawn_failed", "reported as a failed start (this server does not count model_unsupported)");
     assert.deepEqual(driver.processes[0].killedSignals, ["SIGTERM"], "terminal runtime errors should stop the stale process");
     const cleanupSpan = traceRows(sink).find((span) =>
       span.name === "daemon.agent.terminal_runtime_error.cleanup"
@@ -9049,12 +10310,11 @@ test("codex terminal model errors are not masked by turn_end or clean close", as
       "new messages must not be delivered into a terminally failed runtime before explicit recovery",
     );
     assert.equal(apAfterBlockedDelivery, undefined, "queued messages must not recreate a stale running entry");
-    assert.equal((manager as any).startingInboxes.values("agent-1").length, queuedBeforeFailure + 1);
+    assert.equal((manager as any).startingInboxes.has("agent-1"), false, "the delivery finds no process: the server's next start carries it");
 
     const lastAfterBlockedDelivery = [...sent].reverse().find((msg) => msg.type === "agent:activity");
     assert.ok(lastAfterBlockedDelivery && lastAfterBlockedDelivery.type === "agent:activity");
-    assert.equal(projectFactActivity(lastAfterBlockedDelivery), "error");
-    assert.match(lastAfterBlockedDelivery.detail, /model is not supported/i);
+    assert.match(lastAfterBlockedDelivery.detail, /model is not supported/i, "the start failure is shown again");
 
     const beforeExplicitRecoveryMessageCount = sent.length;
     await manager.startAgent(
@@ -9188,7 +10448,7 @@ test("codex fail point cools down busy delivery after recoverable provider error
       assert.equal(driver.encodedCalls.length, 2);
       assert.equal(driver.encodedCalls[1].mode, "busy");
       assert.match(driver.encodedCalls[1].text, /Inbox update:/);
-      assert.doesNotMatch(driver.encodedCalls[1].text, /do not reset this active turn/);
+      assertBodyOnlyInInboxPreview(driver.encodedCalls[1].text, /do not reset this active turn/);
     }, {
       driver,
       runtimeErrorDeliveryBackoff: {
@@ -9255,7 +10515,7 @@ test("codex unknown non-sticky runtime errors enter delivery cooldown", async ()
       assert.equal(driver.encodedCalls.length, 2);
       assert.equal(driver.encodedCalls[1].mode, "busy");
       assert.match(driver.encodedCalls[1].text, /Inbox update:/);
-      assert.doesNotMatch(driver.encodedCalls[1].text, /message batched by unknown-error cooldown/);
+      assertBodyOnlyInInboxPreview(driver.encodedCalls[1].text, /message batched by unknown-error cooldown/);
     }, {
       driver,
       runtimeErrorDeliveryBackoff: {
@@ -9281,12 +10541,12 @@ test("cold start wakeMessage enters the first prompt as a content-free inbox upd
     );
 
     assert.equal(driver.spawnCalls.length, 1);
-    assert.match(driver.spawnCalls[0].prompt, /^\[Raft inbox notice:/);
+    assert.match(afterStartupMemoryBlock(afterFreshSessionStandingPrompt(driver.spawnCalls[0])), /^\[Raft inbox notice:/);
     assert.match(driver.spawnCalls[0].prompt, /Inbox update: .*1 changed target/);
     assert.match(driver.spawnCalls[0].prompt, /#general/);
-    assert.doesNotMatch(driver.spawnCalls[0].prompt, /hello from cold start/);
+    assertBodyOnlyInInboxPreview(driver.spawnCalls[0].prompt, /hello from cold start/);
     assert.doesNotMatch(driver.spawnCalls[0].prompt, /producerFactId=fact-wake-readout/);
-    assert.doesNotMatch(driver.spawnCalls[0].prompt, /^New message received:/);
+    assert.doesNotMatch(afterStartupMemoryBlock(afterFreshSessionStandingPrompt(driver.spawnCalls[0])), /^New message received:/);
     const ap = (manager as any).agents.get("agent-1");
     assert.equal(ap.inbox.length, 1);
     assert.equal(ap.inbox[0]?.message_id, "wake-message-1");
@@ -9312,9 +10572,9 @@ test("transient cold start wakeMessage enters prompt once without pending inbox 
     );
 
     assert.equal(driver.spawnCalls.length, 1);
-    assert.match(driver.spawnCalls[0].prompt, /^System notice received:/);
+    assert.match(afterStartupMemoryBlock(afterFreshSessionStandingPrompt(driver.spawnCalls[0])), /^System notice received:/);
     assert.match(driver.spawnCalls[0].prompt, /Reminder: write the update/);
-    assert.doesNotMatch(driver.spawnCalls[0].prompt, /^\[Raft inbox notice:/);
+    assert.doesNotMatch(afterStartupMemoryBlock(afterFreshSessionStandingPrompt(driver.spawnCalls[0])), /^\[Raft inbox notice:/);
     const ap = (manager as any).agents.get("agent-1");
     assert.equal(ap.inbox.length, 0);
   });
@@ -9366,7 +10626,7 @@ test("model-unseen thread context is rendered and receipted ahead of the trigger
     );
 
     assert.equal(driver.spawnCalls.length, 1);
-    assert.match(driver.spawnCalls[0].prompt, /^New message received:/);
+    assert.match(afterStartupMemoryBlock(afterFreshSessionStandingPrompt(driver.spawnCalls[0])), /^New message received:/);
     assert.match(driver.spawnCalls[0].prompt, /mentioned in a thread without model-visible context/);
     assert.match(driver.spawnCalls[0].prompt, /msg=a1b2c3d4 seq=120/);
     assert.match(driver.spawnCalls[0].prompt, /msg=b1b2c3d4 seq=121/);
@@ -9416,7 +10676,7 @@ test("existing thread model-seen boundary keeps repeated context out of runtime 
     );
 
     assert.equal(driver.spawnCalls.length, 1);
-    assertContentFreeInboxUpdatePrompt(driver.spawnCalls[0].prompt, [
+    assertContentFreeInboxUpdatePrompt(afterStartupMemoryBlock(afterFreshSessionStandingPrompt(driver.spawnCalls[0])), [
       /thread context/,
       /设计一个改进方案/,
       /我建议先加 thread-enter event。/,
@@ -9727,6 +10987,9 @@ test("Codex startup request errors fail closed before routing later deliveries",
       const errorEvent = findLastActivity(sent, "error");
       assert.ok(errorEvent && errorEvent.type === "agent:activity");
       assert.equal(errorEvent.detail, specimen.detail);
+      // Typed like any runtime error; nothing here needs the owner.
+      assert.ok(errorEvent.runtimeError, "typed runtime error carrier");
+      assert.equal(errorEvent.runtimeError.requiredAction, undefined);
       if (specimen.method === "initialize") assert.equal(findLastActivity(sent, "offline"), undefined);
 
       const accepted = manager.deliverMessage("agent-1", makeMessage("must not route after failed startup"));
@@ -9747,6 +11010,26 @@ test("Codex startup request errors fail closed before routing later deliveries",
       }
     }, { tracer });
   }
+});
+
+test("a Codex startup request that fails on a login sends a typed runtime error the server can act on, with the launch", async () => {
+  await withManager(async ({ driver, sent, manager }) => {
+    await manager.startAgent("agent-1", makeConfig(), undefined, undefined, undefined, "launch-login");
+    driver.parsedLines.set("initialize-auth-error", [{
+      kind: "error",
+      message: "Not logged in. Please log in first.",
+      startupRequestMethod: "initialize",
+    }]);
+    driver.processes[0].stdout.emit("data", Buffer.from("initialize-auth-error\n"));
+    await waitFor(() => !(manager as any).agents.has("agent-1"), "initialize auth failure cleanup");
+
+    const errorEvent = findLastActivity(sent, "error");
+    assert.ok(errorEvent && errorEvent.type === "agent:activity");
+    assert.equal(errorEvent.launchId, "launch-login");
+    assert.equal(errorEvent.detailKind, "runtime_error");
+    assert.equal(errorEvent.runtimeError?.errorClass, "AuthError");
+    assert.equal(errorEvent.runtimeError?.requiredAction, "user_reauth");
+  });
 });
 
 test("startup timeout surfaces stuck starting runtimes and terminates the process", async () => {
@@ -9790,7 +11073,7 @@ test("startup timeout surfaces stuck starting runtimes and terminates the proces
       assert.ok(errorEvent && errorEvent.type === "agent:activity");
       assert.equal(
         errorEvent.detail,
-        "Gemini CLI did not finish starting on this machine. Check that Gemini CLI is installed, logged in, and can run non-interactively, then retry starting this agent.",
+        "Gemini CLI did not finish starting within 3 seconds. Its model provider may be slow or rate-limited; also check that Gemini CLI is installed, logged in, and can run non-interactively on this machine, then retry starting this agent.",
       );
       const timeoutEvent = eventsForSpan(sink, traceId, "daemon.runtime.turn")
         .find((event) => event.name === "runtime.start.timeout");
@@ -10127,6 +11410,27 @@ test("terminal quota failures are surfaced as error activity with launchId", asy
   });
 });
 
+// #proj-raft-computer:#46, C5: Codex reports a used-up quota only in words.
+// It is the same provider limit as a runtime-declared one: the rate-limit
+// delivery backoff, and a typed carrier the server keeps until model output.
+test("a Codex usage limit known only from its wording is carried as a provider limit", async () => {
+  await withManager(async ({ driver, sent, manager }) => {
+    await manager.startAgent("agent-1", makeConfig({ sessionId: "session-1" }), undefined, undefined, undefined, "launch-1");
+
+    driver.parsedLines.set("{\"type\":\"error\"}", [{ kind: "error", message: "You've hit your usage limit. Upgrade your plan or try again later." }]);
+    driver.processes[0].stdout.emit("data", Buffer.from("{\"type\":\"error\"}\n"));
+    await flush();
+
+    const ap = (manager as any).agents.get("agent-1");
+    assert.equal(ap.runtimeErrorDeliveryBackoff.kind, "backing_off");
+    assert.equal(ap.runtimeErrorDeliveryBackoff.reason, "rate_limited", "not the plain terminal-error backoff");
+    const errorEvent = findLastActivity(sent, "error");
+    assert.ok(errorEvent && errorEvent.type === "agent:activity");
+    assert.match(errorEvent.detail, /usage limit/i);
+    assert.equal(errorEvent.runtimeError?.errorClass, "RateLimitError");
+  });
+});
+
 test("codex reconnect stderr is surfaced as working activity instead of an error", async () => {
   const driver = new FakeCodexDriver({
     id: "codex",
@@ -10428,7 +11732,9 @@ test("codex repeated same-fingerprint capacity closes fence before a fourth rest
     assert.equal((manager as any).lifecycleRecords.idleRestartSnapshots.has("agent-1"), false, "fenced capacity failure must delete restart residency");
     assert.equal((manager as any).lifecycleRecords.activeSpawnFailBackoffs.has("agent-1"), false, "fenced capacity failure must not leave a close-path retry armed");
     assert.ok(sent.some((msg) => msg.type === "agent:status" && msg.agentId === "agent-1" && msg.status === "inactive"));
-    const fencedFailure = (manager as any).lifecycleRecords.terminalFailures.get("agent-1");
+    // Reconciler step 12 (row C11): no terminal record; a failed start the server pauses on.
+    assert.equal((manager as any).lifecycleRecords.terminalFailures.has("agent-1"), false);
+    const fencedFailure = (manager as any).lastStartFailures.get("agent-1");
     assert.ok(fencedFailure);
     assert.match(fencedFailure.detail, /Runtime stopped after 3 repeated runtime errors with the same fingerprint/);
     assert.match(fencedFailure.detail, /Selected model is at capacity/);
@@ -10446,7 +11752,123 @@ test("codex repeated same-fingerprint capacity closes fence before a fourth rest
   });
 });
 
-test("codex credential process close remains terminal and does not schedule retry", async () => {
+// Task #1315: a live runtime that fails with NotFoundError/404 every few
+// seconds, each error text carrying a different request id, never trips the
+// same-fingerprint fence (agent 6eec7b71, 10-21..10-23: ~44k errors).
+const notFound = (n: number) => `unexpected status 404 Not Found: model gpt-x unavailable, request req_${"abcdefghij"[n % 10]}Zq${n}x`;
+
+async function classFenceHarness(fn: (ctx: {
+  manager: any;
+  driver: FakeCodexDriver;
+  sent: MachineToServerMessage[];
+  sink: MemoryTraceSink;
+  emit: (events: ParsedEvent[]) => Promise<void>;
+  errors: (from: number, count: number) => Promise<void>;
+}) => Promise<void>) {
+  const { sink, tracer } = makeDeterministicTracer();
+  const driver = new FakeCodexDriver({ id: "codex", supportsStdinNotification: true, busyDeliveryMode: "direct" });
+  await withManager(async ({ manager, sent }) => {
+    await manager.startAgent("agent-1", makeConfig({ sessionId: "session-1" }), undefined, undefined, undefined, "launch-1");
+    let line = 0;
+    const emit = async (events: ParsedEvent[]) => {
+      const key = `class-fence-${line++}`;
+      driver.parsedLines.set(key, events);
+      driver.processes.at(-1)!.stdout.emit("data", Buffer.from(`${key}\n`));
+      await flush();
+    };
+    const errors = async (from: number, count: number) => {
+      for (let n = from; n < from + count; n++) await emit([{ kind: "error", message: notFound(n) }]);
+    };
+    await emit([{ kind: "turn_end", sessionId: "session-1" }]);
+    await fn({ manager, driver, sent, sink, emit, errors });
+  }, { driver, tracer, daemonInstanceId: "daemon-1315", runtimeErrorDeliveryBackoff: { baseMs: 5, maxMs: 5, jitterRatio: 0 } });
+}
+
+const classFenceTrips = (sink: MemoryTraceSink) => traceRows(sink).filter((row) => row.name === "daemon.agent.runtime_error_class_fence.tripped");
+
+test("task #1315: five varying-fingerprint 404s in one runtime stop it once, handed to the server", async () => {
+  await classFenceHarness(async ({ manager, driver, sent, sink, errors }) => {
+    await errors(0, 4);
+    assert.equal(manager.agents.has("agent-1"), true, "four do not stop it");
+    assert.equal(manager.lifecycleRecords.getRuntimeErrorClassFence("agent-1")?.attempts, 4);
+    assert.equal(manager.lifecycleRecords.getRuntimeErrorFingerprintFence("agent-1")?.attempts, 1, "every fingerprint differs");
+    await errors(4, 1);
+    assert.equal(manager.agents.has("agent-1"), false);
+    assert.equal(classFenceTrips(sink).length, 1);
+    assert.ok(sent.some((msg) => msg.type === "agent:status" && msg.agentId === "agent-1" && msg.status === "inactive"));
+    // Reconciler step 12 (row C11): no terminal record; a failed start the server pauses on.
+    assert.equal(manager.lifecycleRecords.terminalFailures.has("agent-1"), false);
+    const failure = manager.lastStartFailures.get("agent-1");
+    assert.match(failure.detail, /5 consecutive "not found" \(HTTP 404\) runtime errors/);
+    assert.equal(manager.lifecycleRecords.idleRestartSnapshots.has("agent-1"), false);
+    assert.equal(manager.lifecycleRecords.activeSpawnFailBackoffs.has("agent-1"), false);
+    assert.equal(manager.lifecycleRecords.getRuntimeErrorClassFence("agent-1"), undefined, "the count starts over at the trip");
+    const outcome = runtimeOutcomeFrames(sent).find((frame) => frame.outcome.kind === "terminal_failure");
+    assert.equal(outcome?.outcome.kind === "terminal_failure" ? outcome.outcome.failureKind : undefined, "fingerprint_fence", "the server-facing kind stays in the existing set");
+    await flush();
+    await flush();
+    assert.equal(driver.spawnCalls.length, 1, "no automatic respawn");
+  });
+});
+
+test("task #1315: a new message does not bring a fenced agent back; a server start does", async () => {
+  await classFenceHarness(async ({ manager, driver, errors }) => {
+    await errors(0, 5);
+    assert.equal(manager.agents.has("agent-1"), false);
+    manager.deliverMessage("agent-1", makeMessage("after the fence"));
+    await flush();
+    await flush();
+    assert.equal(driver.spawnCalls.length, 1, "a message finds no process: the server decides the next start");
+    assert.equal(manager.agents.has("agent-1"), false);
+
+    await manager.startAgent("agent-1", makeConfig({ sessionId: "session-1" }), undefined, undefined, undefined, "launch-2");
+    assert.equal(driver.spawnCalls.length, 2, "the server's start runs it again");
+    await errors(10, 1);
+    assert.equal(manager.lifecycleRecords.getRuntimeErrorClassFence("agent-1")?.attempts, 1, "counting starts over after the trip");
+  });
+});
+
+test("task #1315: progress between 404s clears the count", async () => {
+  await classFenceHarness(async ({ manager, errors, emit }) => {
+    await errors(0, 4);
+    await emit([{ kind: "text", text: "made some progress" }]);
+    assert.equal(manager.lifecycleRecords.getRuntimeErrorClassFence("agent-1"), undefined);
+    await errors(4, 4);
+    assert.equal(manager.agents.has("agent-1"), true);
+  });
+});
+
+for (const [label, message] of [
+  ["a generic RuntimeError", "something broke in the runtime"],
+  ["a not-found error without a status", "model gpt-x not found"],
+  ["a 404 classed as another error", "TypeError: 404: bad response"],
+  ["a 5xx", "unexpected status 503 Service Unavailable"],
+  ["a 429", "unexpected status 429 Too Many Requests"],
+] as const) {
+  test(`task #1315: ${label} between 404s clears the count and never counts itself`, async () => {
+    await classFenceHarness(async ({ manager, errors, emit, sink }) => {
+      await errors(0, 4);
+      await emit([{ kind: "error", message }]);
+      assert.equal(manager.lifecycleRecords.getRuntimeErrorClassFence("agent-1"), undefined);
+      for (let n = 0; n < 6; n++) await emit([{ kind: "error", message: `${message} #${"klmnopqrst"[n]}` }]);
+      assert.equal(classFenceTrips(sink).length, 0);
+    });
+  });
+}
+
+test("task #1315: identical 404s still trip the same-fingerprint fence at 3, and only it", async () => {
+  await classFenceHarness(async ({ manager, sink, emit }) => {
+    for (let n = 0; n < 3; n++) await emit([{ kind: "error", message: "unexpected status 404 Not Found: model gpt-x" }]);
+    assert.equal(manager.agents.has("agent-1"), false);
+    assert.equal(classFenceTrips(sink).length, 0);
+    assert.equal(traceRows(sink).filter((row) => row.name === "daemon.agent.runtime_error_fingerprint_fence.tripped").length, 1);
+  });
+});
+
+// Reconciler step 4a: the close used to mark the agent inactive and drop its
+// restart snapshot. It still schedules no retry, but the agent keeps its
+// snapshot and waits for the credential (a cooldown its release ends).
+test("codex credential process close does not schedule retry; the agent waits for the credential with its restart snapshot", async () => {
   const driver = new FakeCodexDriver({
     id: "codex",
     supportsStdinNotification: true,
@@ -10473,9 +11895,9 @@ test("codex credential process close remains terminal and does not schedule retr
     await flush();
 
     assert.equal(driver.spawnCalls.length, 1, "credential failure must not schedule a retry");
-    assert.equal((manager as any).lifecycleRecords.activeSpawnFailBackoffs.has("agent-1"), false);
-    assert.equal((manager as any).lifecycleRecords.idleRestartSnapshots.has("agent-1"), false);
-    assert.ok(sent.some((msg) => msg.type === "agent:status" && msg.agentId === "agent-1" && msg.status === "inactive"));
+    assert.equal((manager as any).lifecycleRecords.activeSpawnFailBackoffs.get("agent-1")?.reason, "credential_invalid");
+    assert.equal((manager as any).lifecycleRecords.idleRestartSnapshots.has("agent-1"), true, "the restart snapshot is kept");
+    assert.equal(sent.some((msg) => msg.type === "agent:status" && msg.agentId === "agent-1" && msg.status === "inactive"), false);
     const errorEvent = findLastActivity(sent, "error");
     assert.ok(errorEvent && errorEvent.type === "agent:activity");
     assert.match(errorEvent.detail, /Codex CLI is not logged in/i);
@@ -10507,7 +11929,7 @@ test("codex repeated same-fingerprint provider stream failures fence idle restar
       await waitFor(settled, label);
     };
     const restartCached = () => Boolean((manager as any).lifecycleRecords.idleRestartSnapshots.get("agent-1"));
-    const fenced = () => Boolean((manager as any).lifecycleRecords.terminalFailures.get("agent-1"));
+    const fenced = () => Boolean((manager as any).lastStartFailures.get("agent-1"));
 
     await emitStreamErrorAndClose(0, restartCached, "first failure settles with an idle restart");
     assert.ok((manager as any).lifecycleRecords.idleRestartSnapshots.get("agent-1"), "first same-fingerprint failure should stay wakeable");
@@ -10531,7 +11953,9 @@ test("codex repeated same-fingerprint provider stream failures fence idle restar
 
     assert.equal((manager as any).agents.has("agent-1"), false);
     assert.equal((manager as any).lifecycleRecords.idleRestartSnapshots.has("agent-1"), false, "fenced same-fingerprint failure must not cache another idle restart");
-    const fencedFailure = (manager as any).lifecycleRecords.terminalFailures.get("agent-1");
+    // Reconciler step 12 (row C11): no terminal record; a failed start the server pauses on.
+    assert.equal((manager as any).lifecycleRecords.terminalFailures.has("agent-1"), false);
+    const fencedFailure = (manager as any).lastStartFailures.get("agent-1");
     assert.ok(fencedFailure);
     assert.match(fencedFailure.detail, /Runtime stopped after 3 repeated runtime errors with the same fingerprint/);
     assert.match(fencedFailure.detail, /stream closed before response\.completed/);
@@ -10540,17 +11964,11 @@ test("codex repeated same-fingerprint provider stream failures fence idle restar
     assert.ok(errorEvent && errorEvent.type === "agent:activity");
     assert.match(errorEvent.detail, /Runtime stopped after 3 repeated runtime errors with the same fingerprint/);
 
-    manager.deliverMessage("agent-1", makeMessage("retry after fenced provider stream failure"));
-    await waitFor(() => (manager as any).startingInboxes.values("agent-1")?.length === 3, "fenced retry is kept pending");
-
+    const accepted = manager.deliverMessage("agent-1", makeMessage("retry after fenced provider stream failure"));
+    await flush();
+    assert.equal(await accepted, false, "the delivery finds no process: the server decides the next start");
     assert.equal(driver.spawnCalls.length, 3, "fenced same-fingerprint failure should not respawn on the next message");
-    const queued = (manager as any).startingInboxes.values("agent-1");
-    assert.equal(queued?.length, 3, "fenced retries should be kept pending for explicit recovery");
-    assert.deepEqual(queued?.map((message: AgentMessage) => message.content), [
-      "retry after first provider stream failure",
-      "retry after second provider stream failure",
-      "retry after fenced provider stream failure",
-    ]);
+    assert.equal((manager as any).startingInboxes.has("agent-1"), false, "nothing is kept here; the server holds the messages");
   }, {
     driver,
     runtimeErrorDeliveryBackoff: {
@@ -10735,8 +12153,8 @@ test("missing OpenCode resume session on stderr falls back to a cold start", asy
 
     assert.equal(driver.spawnCalls.length, 2);
     assert.equal(driver.spawnCalls[1].config.sessionId, null);
-    assert.match(driver.spawnCalls[1].prompt, /^\[Raft inbox notice:/);
-    assert.doesNotMatch(driver.spawnCalls[1].prompt, /please handle this wake/);
+    assert.match(afterStartupMemoryBlock(driver.spawnCalls[1].prompt), /^\[Raft inbox notice:/);
+    assertBodyOnlyInInboxPreview(driver.spawnCalls[1].prompt, /please handle this wake/);
     assert.ok(
       sent.some((msg) =>
         msg.type === "agent:activity" &&
@@ -10752,7 +12170,8 @@ test("missing OpenCode resume session on stderr falls back to a cold start", asy
 
     await manager.stopAgent("agent-1");
   }, {
-    driver: new FakeCodexDriver({ id: "opencode" }),
+    // Like the real OpenCode driver: the standing prompt rides natively, never in the input.
+    driver: new FakeCodexDriver({ id: "opencode", supportsNativeStandingPrompt: true }),
   });
 });
 
@@ -10781,8 +12200,8 @@ test("OpenCode provider rejection from replayed empty assistant tool call falls 
 
     assert.equal(driver.spawnCalls.length, 2);
     assert.equal(driver.spawnCalls[1].config.sessionId, null);
-    assert.match(driver.spawnCalls[1].prompt, /^\[Raft inbox notice:/);
-    assert.doesNotMatch(driver.spawnCalls[1].prompt, /retry without bad replay history/);
+    assert.match(afterStartupMemoryBlock(driver.spawnCalls[1].prompt), /^\[Raft inbox notice:/);
+    assertBodyOnlyInInboxPreview(driver.spawnCalls[1].prompt, /retry without bad replay history/);
     assert.ok(
       sent.some((msg) =>
         msg.type === "agent:activity" &&
@@ -10798,7 +12217,8 @@ test("OpenCode provider rejection from replayed empty assistant tool call falls 
 
     await manager.stopAgent("agent-1");
   }, {
-    driver: new FakeCodexDriver({ id: "opencode" }),
+    // Like the real OpenCode driver: the standing prompt rides natively, never in the input.
+    driver: new FakeCodexDriver({ id: "opencode", supportsNativeStandingPrompt: true }),
   });
 });
 
@@ -10827,8 +12247,8 @@ test("Pi replay rejection from assistant continuation falls back to a cold start
 
     assert.equal(driver.spawnCalls.length, 2);
     assert.equal(driver.spawnCalls[1].config.sessionId, null);
-    assert.match(driver.spawnCalls[1].prompt, /^\[Raft inbox notice:/);
-    assert.doesNotMatch(driver.spawnCalls[1].prompt, /recover Pi from bad replay history/);
+    assert.match(afterStartupMemoryBlock(driver.spawnCalls[1].prompt), /^\[Raft inbox notice:/);
+    assertBodyOnlyInInboxPreview(driver.spawnCalls[1].prompt, /recover Pi from bad replay history/);
     assert.ok(
       sent.some((msg) =>
         msg.type === "agent:activity" &&
@@ -10844,7 +12264,8 @@ test("Pi replay rejection from assistant continuation falls back to a cold start
 
     await manager.stopAgent("agent-1");
   }, {
-    driver: new FakeCodexDriver({ id: "pi", supportsStdinNotification: true, busyDeliveryMode: "direct" }),
+    // Like the real Pi driver: the standing prompt rides natively, never in the input.
+    driver: new FakeCodexDriver({ id: "pi", supportsNativeStandingPrompt: true, supportsStdinNotification: true, busyDeliveryMode: "direct" }),
   });
 });
 
@@ -10877,8 +12298,8 @@ test("missing Gemini resume session on stderr falls back to a cold start", async
 
     assert.equal(driver.spawnCalls.length, 2);
     assert.equal(driver.spawnCalls[1].config.sessionId, null);
-    assert.match(driver.spawnCalls[1].prompt, /^\[Raft inbox notice:/);
-    assert.doesNotMatch(driver.spawnCalls[1].prompt, /please handle this Gemini wake/);
+    assert.match(afterStartupMemoryBlock(afterFreshSessionStandingPrompt(driver.spawnCalls[1])), /^\[Raft inbox notice:/);
+    assertBodyOnlyInInboxPreview(driver.spawnCalls[1].prompt, /please handle this Gemini wake/);
     assert.ok(
       sent.some((msg) =>
         msg.type === "agent:activity" &&
@@ -11660,8 +13081,8 @@ test("task #1242: a launch whose PATH lookup timed out reaches the Server as run
   driver.spawnError = () => new RuntimeExecutableNotFoundError({ runtimeId: "codex", message: resolverMessage, reason: "lookup_timed_out" });
   await withManager(async ({ manager, sent }) => {
     seedIdleRestart(manager);
-    // runtime_not_found is retried locally like any generic spawn failure; the
-    // fifth failure in a row is what reaches the Server.
+    // An undecided lookup is retried locally like any generic spawn failure;
+    // the fifth failure in a row is what reaches the Server.
     for (let attempt = 1; attempt <= 5; attempt += 1) {
       const backoff = getSpawnFailBackoffState(manager, "agent-1");
       if (backoff) {
@@ -11680,6 +13101,54 @@ test("task #1242: a launch whose PATH lookup timed out reaches the Server as run
     assert.doesNotMatch(wire.detail, /installed/i);
   }, { driver });
 });
+
+for (const [label, makeError, wireFailure] of [
+  [
+    "a PATH lookup that found no CLI (not_on_path)",
+    () => new RuntimeExecutableNotFoundError({ runtimeId: "codex", message: "codex is not on PATH", reason: "not_on_path" }),
+    { reason: "runtime_not_found", lookupReason: "not_on_path" },
+  ],
+  [
+    "a plain ENOENT spawn (no lookup verdict)",
+    () => Object.assign(new Error("spawn codex ENOENT"), { code: "ENOENT" }),
+    { reason: "runtime_not_found" },
+  ],
+] as const) {
+  test(`reconciler step 15 (B13): local restart: ${label} stops the daemon's own restarts after the first failure, as the Server's isRuntimeAbsentStartFailure does`, async () => {
+    const driver = new ThrowingSpawnDriver({ id: "codex", supportsStdinNotification: true, busyDeliveryMode: "direct" });
+    driver.spawnError = makeError;
+    const { sink, tracer } = makeDeterministicTracer();
+    const redetects: string[] = [];
+    await withManager(async ({ manager, sent }) => {
+      seedIdleRestart(manager);
+      // Deliver until the failure reaches the Server (at most CRASH_STREAK_CAP
+      // tries, each cooldown lapsed): it must take one spawn, not five.
+      for (let attempt = 1; attempt <= 5 && startFailureActivities(sent).length === 0; attempt += 1) {
+        const backoff = getSpawnFailBackoffState(manager, "agent-1");
+        if (backoff) {
+          if (backoff.timer) clearTimeout(backoff.timer);
+          backoff.timer = null;
+          backoff.untilMs = 0;
+        }
+        assert.equal(await manager.deliverMessage("agent-1", makeMessage(`attempt ${attempt}`)), false);
+      }
+      assert.equal(driver.spawnCalls.length, 1, "spawn attempts before the failure reached the Server");
+      assert.equal((manager as any).lifecycleRecords.idleRestartSnapshots.has("agent-1"), false, "no local restart left to retry");
+      assert.equal(getSpawnFailBackoffState(manager, "agent-1"), null, "no local backoff timer either");
+      assert.deepEqual(startFailureActivities(sent).map((msg) => JSON.parse(JSON.stringify(msg.spawnFailure))), [wireFailure], "reported at the first failure, not the fifth");
+      const stopped = traceRows(sink).filter((span) => span.name === "daemon.agent.spawn.local_restart_stopped").map((span) => span.attrs);
+      assert.equal(stopped.length, 1);
+      assert.equal(stopped[0]?.stop_cause, "configuration");
+      assert.equal(stopped[0]?.failure_reason, "runtime_not_found");
+      assert.equal(stopped[0]?.attempts, 1);
+
+      assert.equal(await manager.deliverMessage("agent-1", makeMessage("second")), false);
+      assert.equal(driver.spawnCalls.length, 1, "the next message is the Server's to decide on; no local spawn");
+      // A CLI only mid-update is listed again by the re-detection the core runs.
+      assert.deepEqual(redetects, ["codex"], "the core is asked once to re-detect the runtime");
+    }, { driver, tracer, onRuntimeAbsentLocalStop: (runtime) => redetects.push(runtime) });
+  });
+}
 
 test("local restart: generic spawn failures stop after five in a row with the last failure reported", async () => {
   const driver = new ThrowingSpawnDriver({ id: "codex", supportsStdinNotification: true, busyDeliveryMode: "direct" });
@@ -12617,6 +14086,348 @@ test("task #179: a third-party event served and leased before any notice is stil
   }, { driver });
 });
 
+// A third-party event row stays `delivering` until its body reaches the
+// model. The daemon reports it delivered when a start's first prompt renders
+// its body, and keeps it pending (unseen, served by the next check) when the
+// prompt only names it in a content-free notice.
+const STARTUP_APP_EVENT_A = "eeeeeeee-0000-4000-8000-00000000a001";
+const STARTUP_APP_EVENT_B = "eeeeeeee-0000-4000-8000-00000000b002";
+const STARTUP_APP_EVENT_C = "eeeeeeee-0000-4000-8000-00000000c003";
+const STARTUP_APP_EVENT_PAYLOAD = "startup-app-event-payload-marker";
+
+function startupAppEvent(id: string): AgentMessage {
+  return makeMessage(`Third-party event: build ${id.slice(-4)} ready`, {
+    channel_id: "third-party-agent-events:agent-1",
+    channel_name: "third-party-agent-events:agent-1",
+    channel_type: "dm",
+    sender_id: "stamp",
+    sender_name: "stamp",
+    sender_type: "third_party_app",
+    message_id: id,
+    third_party_event: {
+      id,
+      kind: "event",
+      client_id: "stamp",
+      client_name: "Stamp",
+      payload_hash: "a".repeat(64),
+      payload: { marker: STARTUP_APP_EVENT_PAYLOAD },
+      expires_at: "2026-03-25T10:00:00.000Z",
+      source: {
+        client_id: "stamp",
+        client_name: "Stamp",
+        oauth_client_id: "oauth-client-row-1",
+        access_token_id_hash: "b".repeat(64),
+        resource: "urn:raft:server:server-1:agent-inbound",
+      },
+    },
+  });
+}
+
+function deliveredReportSpy() {
+  const reports: Array<{ agentId: string; eventIds: string[] }> = [];
+  return {
+    reports,
+    report: (agentId: string, eventIds: readonly string[]) => { reports.push({ agentId, eventIds: [...eventIds] }); },
+  };
+}
+
+function appEventModelSeen(manager: AgentProcessManager, message: AgentMessage): boolean {
+  return (manager as any).isVisibleMessageModelSeen("agent-1", `agent-event:${message.message_id!.slice(0, 8)}`, message);
+}
+
+/** Answers the delivered report over daemonFetch (the proxy's reporter) and records it. */
+async function withDeliveredReportFetch(fn: (serverUrl: string, reports: string[][]) => Promise<void>): Promise<void> {
+  const reports: string[][] = [];
+  const serverUrl = "https://delivered-report.invalid";
+  const previousFetch = globalThis.fetch;
+  const restore = installDaemonFetchMockForTests((async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input instanceof Request ? input.url : input);
+    if (url === `${serverUrl}/internal/agent-api/third-party-events/delivered` && init?.method === "POST") {
+      reports.push((JSON.parse(String(init.body)) as { eventIds: string[] }).eventIds);
+      return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    return previousFetch(input, init);
+  }) as typeof fetch);
+  try {
+    await fn(serverUrl, reports);
+  } finally {
+    restore();
+  }
+}
+
+test("app event delivery: a resume catch-up that renders third-party event bodies reports them delivered", async () => {
+  const spy = deliveredReportSpy();
+  await withManager(async ({ driver, manager }) => {
+    // The server folded the wake into the catch-up; a buffered event joins it.
+    (manager as any).startingInboxes.bufferMessagesDuringStart("agent-1", [startupAppEvent(STARTUP_APP_EVENT_B)]);
+    await manager.startAgent(
+      "agent-1",
+      makeConfig({ sessionId: "session-1" }),
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      false,
+      [startupAppEvent(STARTUP_APP_EVENT_A), makeMessage("owed channel message", { message_id: "owed-1", seq: 7 })],
+    );
+    const prompt = driver.spawnCalls[0].prompt;
+    assert.match(prompt, /^New messages received:/);
+    assert.match(prompt, new RegExp(STARTUP_APP_EVENT_PAYLOAD));
+    assert.deepEqual(spy.reports, [{ agentId: "agent-1", eventIds: [STARTUP_APP_EVENT_A, STARTUP_APP_EVENT_B] }]);
+    assert.equal((manager as any).agents.get("agent-1").inbox.length, 0, "rendered bodies are consumed");
+  }, { reportThirdPartyEventsDelivered: spy.report });
+});
+
+test("app event delivery: a failed start reports nothing", async () => {
+  const spy = deliveredReportSpy();
+  const driver = new FakeCodexDriver({ id: "codex", supportsStdinNotification: true, busyDeliveryMode: "direct" });
+  await withManager(async ({ manager }) => {
+    driver.spawn = () => { throw new Error("spawn ENOENT"); };
+    await assert.rejects(manager.startAgent(
+      "agent-1", makeConfig({ sessionId: "session-1" }), undefined, undefined, undefined, undefined, false,
+      [startupAppEvent(STARTUP_APP_EVENT_A)],
+    ));
+    assert.deepEqual(spy.reports, []);
+  }, { driver, reportThirdPartyEventsDelivered: spy.report });
+});
+
+test("app event delivery: content-free notices (wake inbox update, busy notice, idle stdin) report nothing", async () => {
+  const spy = deliveredReportSpy();
+  const driver = new FakeCodexDriver({ id: "claude", supportsStdinNotification: true, busyDeliveryMode: "direct" });
+  await withManager(async ({ manager }) => {
+    await manager.startAgent("agent-1", makeConfig({ runtime: "claude", sessionId: "session-1" }), startupAppEvent(STARTUP_APP_EVENT_A));
+    assertContentFreeInboxUpdatePrompt(driver.spawnCalls[0].prompt, STARTUP_APP_EVENT_PAYLOAD);
+
+    manager.deliverMessage("agent-1", startupAppEvent(STARTUP_APP_EVENT_B));
+    (manager as any).sendStdinNotification("agent-1");
+    driver.parsedLines.set("turn-end-guard", [{ kind: "turn_end", sessionId: "session-1" }]);
+    driver.processes[0].stdout.emit("data", Buffer.from("turn-end-guard\n"));
+    await flush();
+    manager.deliverMessage("agent-1", startupAppEvent(STARTUP_APP_EVENT_C));
+    await flush();
+
+    assert.ok(driver.encodedCalls.length >= 2, "the busy and idle notices were written");
+    for (const call of driver.encodedCalls) assertContentFreeInboxUpdatePrompt(call.text, STARTUP_APP_EVENT_PAYLOAD);
+    assert.deepEqual(spy.reports, [], "a content-free notice reports nothing");
+    assert.deepEqual(
+      (manager as any).agents.get("agent-1").inbox.map((message: AgentMessage) => message.message_id),
+      [STARTUP_APP_EVENT_A, STARTUP_APP_EVENT_B, STARTUP_APP_EVENT_C],
+    );
+  }, { driver, reportThirdPartyEventsDelivered: spy.report });
+});
+
+test("app event delivery: a starting-inbox event shown only as a notice stays pending and unseen; the next check serves and reports it", async () => {
+  const spy = deliveredReportSpy();
+  const event = startupAppEvent(STARTUP_APP_EVENT_A);
+  await withManager(async ({ driver, manager }) => {
+    await withDeliveredReportFetch(async (serverUrl, upstreamReports) => {
+      (manager as any).startingInboxes.bufferMessagesDuringStart("agent-1", [event]);
+      await manager.startAgent("agent-1", makeConfig({ sessionId: "session-1" }), undefined, undefined, undefined, "launch-starting-notice");
+      assertContentFreeInboxUpdatePrompt(driver.spawnCalls[0].prompt, STARTUP_APP_EVENT_PAYLOAD);
+      const ap = (manager as any).agents.get("agent-1");
+      assert.deepEqual(ap.inbox.map((message: AgentMessage) => message.message_id), [STARTUP_APP_EVENT_A], "still pending after spawn");
+      assert.equal(appEventModelSeen(manager, event), false, "a notice is not model-seen");
+      assert.deepEqual(spy.reports, [], "a notice reports nothing");
+
+      const handle = await registerAgentCredentialProxy({
+        agentId: "agent-1",
+        launchId: "launch-starting-notice",
+        serverUrl,
+        apiKey: "sk_agent_server_side",
+        activeCapabilities: "read",
+        inboxCoordinator: driver.spawnCalls[0].agentCredentialProxyInboxCoordinator,
+      });
+      try {
+        const res = await fetch(`${handle.proxyUrl}/internal/agent-api/events`, {
+          headers: { Authorization: `Bearer ${handle.proxyToken}` },
+        });
+        assert.equal(res.status, 200);
+        const body = await res.json() as { events: Array<{ message_id?: string }> };
+        assert.deepEqual(body.events.map((served) => served.message_id), [STARTUP_APP_EVENT_A]);
+        await waitFor(() => upstreamReports.length >= 1, "delivered report for the served event");
+        assert.deepEqual(upstreamReports, [[STARTUP_APP_EVENT_A]]);
+        assert.equal(ap.inbox.length, 0, "the check consumed it");
+        assert.equal(appEventModelSeen(manager, event), true);
+      } finally {
+        unregisterAgentCredentialProxyForLaunch({ agentId: "agent-1", launchId: "launch-starting-notice" });
+      }
+    });
+  }, { reportThirdPartyEventsDelivered: spy.report });
+});
+
+test("app event delivery: a re-delivered copy of a starting-inbox event shown only as a notice is kept, not dropped as consumed, and not announced again", async () => {
+  const sink = new MemoryTraceSink();
+  const tracer = new BasicTracer({ sink });
+  const driver = new FakeCodexDriver({ id: "claude", supportsStdinNotification: true, busyDeliveryMode: "direct" });
+  await withManager(async ({ manager }) => {
+    (manager as any).startingInboxes.bufferMessagesDuringStart("agent-1", [startupAppEvent(STARTUP_APP_EVENT_A)]);
+    await manager.startAgent("agent-1", makeConfig({ runtime: "claude", sessionId: "session-1" }));
+    assertContentFreeInboxUpdatePrompt(driver.spawnCalls[0].prompt, STARTUP_APP_EVENT_PAYLOAD);
+
+    // The server re-sends the still-`delivering` event (same id, new copy).
+    manager.deliverMessage("agent-1", startupAppEvent(STARTUP_APP_EVENT_A));
+    driver.parsedLines.set("turn-end-redeliver", [{ kind: "turn_end", sessionId: "session-1" }]);
+    driver.processes[0].stdout.emit("data", Buffer.from("turn-end-redeliver\n"));
+    await flush();
+    manager.deliverMessage("agent-1", startupAppEvent(STARTUP_APP_EVENT_A));
+    await flush();
+
+    const outcomes = traceRows(sink)
+      .filter((span) => span.name === "daemon.agent.delivery.routed" && span.attrs?.messageId === STARTUP_APP_EVENT_A)
+      .map((span) => span.attrs?.outcome);
+    assert.equal(outcomes.length, 2);
+    assert.ok(!outcomes.includes("dropped_already_consumed"), `outcomes: ${outcomes.join(",")}`);
+    const ap = (manager as any).agents.get("agent-1");
+    assert.deepEqual(ap.inbox.map((message: AgentMessage) => message.message_id), [STARTUP_APP_EVENT_A], "one pending copy");
+    assert.equal(driver.encodedCalls.length, 0, "the spawn prompt already announced it: no second notice");
+  }, { driver, tracer });
+});
+
+test("app event delivery: a per-turn runtime is not respawned for a starting-inbox event its first prompt announced", async () => {
+  const driver = opencodeDriver();
+  await withManager(async ({ manager }) => {
+    (manager as any).startingInboxes.bufferMessagesDuringStart("agent-1", [startupAppEvent(STARTUP_APP_EVENT_A)]);
+    await manager.startAgent("agent-1", makeConfig({ runtime: "opencode", sessionId: "session-1" }));
+    assertContentFreeInboxUpdatePrompt(driver.spawnCalls[0].prompt, STARTUP_APP_EVENT_PAYLOAD);
+    driver.parsedLines.set("turn-end", [{ kind: "turn_end", sessionId: "session-1" }]);
+    driver.processes[0].stdout.emit("data", Buffer.from("turn-end\n"));
+    await flush();
+    await flush();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(driver.spawnCalls.length, 1, "no respawn to announce it again");
+  }, { driver });
+});
+
+test("app event delivery: a wake replaced by a caller's resume prompt stays pending, unseen and unreported, and is announced after the turn", async () => {
+  const spy = deliveredReportSpy();
+  const wake = startupAppEvent(STARTUP_APP_EVENT_A);
+  const driver = new FakeCodexDriver({ id: "claude", supportsStdinNotification: true, busyDeliveryMode: "direct" });
+  await withManager(async ({ manager }) => {
+    await manager.startAgent("agent-1", makeConfig({ runtime: "claude", sessionId: "session-1" }), wake, undefined, "Resume: finish the migration.");
+    assert.match(driver.spawnCalls[0].prompt, /finish the migration/);
+    assert.doesNotMatch(driver.spawnCalls[0].prompt, new RegExp(STARTUP_APP_EVENT_PAYLOAD));
+    const ap = (manager as any).agents.get("agent-1");
+    assert.deepEqual(ap.inbox.map((message: AgentMessage) => message.message_id), [STARTUP_APP_EVENT_A]);
+    assert.equal(appEventModelSeen(manager, wake), false);
+    assert.deepEqual(spy.reports, []);
+
+    driver.parsedLines.set("turn-end-1d", [{ kind: "turn_end", sessionId: "session-1" }]);
+    driver.processes[0].stdout.emit("data", Buffer.from("turn-end-1d\n"));
+    await flush();
+    assert.equal(driver.encodedCalls.length, 1, "the untold wake gets one content-free notice");
+    assertContentFreeInboxUpdatePrompt(driver.encodedCalls[0].text, STARTUP_APP_EVENT_PAYLOAD);
+    assert.deepEqual(spy.reports, []);
+  }, { driver, reportThirdPartyEventsDelivered: spy.report });
+});
+
+// Fix 3 is not limited to app events: a channel message the starting-inbox
+// notice only names (its preview cut) stays pending and unseen too, as in a
+// wake_inbox_update start, so a send to its channel is still held until the
+// agent reads it.
+test("starting inbox: a channel message shown only as a cut preview stays pending, unseen and out of seen seqs, and is not announced again", async () => {
+  const driver = new FakeCodexDriver({ id: "claude", supportsStdinNotification: true, busyDeliveryMode: "direct" });
+  await withManager(async ({ manager }) => {
+    const channelMessage = makeMessage("notice-only-channel-body-marker. The preview cuts this second sentence.", { message_id: "starting-chan-1", seq: 4242 });
+    (manager as any).startingInboxes.bufferMessagesDuringStart("agent-1", [channelMessage]);
+    await manager.startAgent("agent-1", makeConfig({ runtime: "claude", sessionId: "session-1" }));
+    assertContentFreeInboxUpdatePrompt(driver.spawnCalls[0].prompt, "notice-only-channel-body-marker");
+    const ap = (manager as any).agents.get("agent-1");
+    assert.deepEqual(ap.inbox.map((message: AgentMessage) => message.message_id), ["starting-chan-1"], "still pending");
+    assert.equal((manager as any).isVisibleMessageModelSeen("agent-1", "#general", channelMessage), false, "not model-seen");
+    assert.deepEqual(
+      (manager as any).visibleFreshnessView("agent-1").getExactSeenSeqs("#general"),
+      [],
+      "no exact seen seq: a send to #general is still held",
+    );
+
+    driver.parsedLines.set("turn-end-chan", [{ kind: "turn_end", sessionId: "session-1" }]);
+    driver.processes[0].stdout.emit("data", Buffer.from("turn-end-chan\n"));
+    await flush();
+    assert.equal(driver.encodedCalls.length, 0, "no second notice at turn end");
+
+    manager.deliverMessage("agent-1", makeMessage("a new channel message", { message_id: "starting-chan-2", seq: 4243 }));
+    await flush();
+    assert.equal(driver.encodedCalls.length, 1, "one notice for the new message");
+    assertContentFreeInboxUpdatePrompt(driver.encodedCalls[0].text, "notice-only-channel-body-marker");
+  }, { driver });
+});
+
+test("starting inbox: a channel message the start notice shows whole counts as seen for a reply and stays pending", async () => {
+  const driver = new FakeCodexDriver({ id: "claude", supportsStdinNotification: true, busyDeliveryMode: "direct" });
+  await withManager(async ({ manager }) => {
+    const channelMessage = makeMessage("Please hold the rollout.", { message_id: "starting-chan-whole", seq: 4250 });
+    (manager as any).startingInboxes.bufferMessagesDuringStart("agent-1", [channelMessage]);
+    await manager.startAgent("agent-1", makeConfig({ runtime: "claude", sessionId: "session-1" }));
+    assertBodyOnlyInInboxPreview(driver.spawnCalls[0].prompt, /Please hold the rollout\./);
+    const ap = (manager as any).agents.get("agent-1");
+    assert.deepEqual(ap.inbox.map((message: AgentMessage) => message.message_id), ["starting-chan-whole"], "still pending");
+    assert.deepEqual((manager as any).visibleFreshnessView("agent-1").getExactSeenSeqs("#general"), [4250]);
+    assert.equal((manager as any).visibleFreshnessView("agent-1").getBoundary("#general"), undefined);
+  }, { driver });
+});
+
+test("starting inbox: a per-turn runtime is not respawned for a channel message its first prompt announced", async () => {
+  const driver = opencodeDriver();
+  await withManager(async ({ manager }) => {
+    (manager as any).startingInboxes.bufferMessagesDuringStart("agent-1", [makeMessage("announced at start", { message_id: "starting-chan-3", seq: 5000 })]);
+    await manager.startAgent("agent-1", makeConfig({ runtime: "opencode", sessionId: "session-1" }));
+    driver.parsedLines.set("turn-end", [{ kind: "turn_end", sessionId: "session-1" }]);
+    driver.processes[0].stdout.emit("data", Buffer.from("turn-end\n"));
+    await flush();
+    await flush();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(driver.spawnCalls.length, 1);
+  }, { driver });
+});
+
+test("starting inbox: with rendered thread context, only the rendered message is consumed; the notice-only rest stays pending and is not announced again", async () => {
+  const driver = new FakeCodexDriver({ id: "claude", supportsStdinNotification: true, busyDeliveryMode: "direct" });
+  await withManager(async ({ manager }) => {
+    const thread = "#general:abcd1234";
+    const threadMessage = makeMessage("reply in the thread", {
+      message_id: "starting-thread-30",
+      seq: 30,
+      channel_type: "thread",
+      channel_name: "abcd1234",
+      parent_channel_name: "general",
+      parent_channel_type: "channel",
+      thread_join_context: {
+        reason: "mentioned",
+        parent_target: "#general",
+        thread_target: thread,
+        suggested_read_history_target: thread,
+        parent_message: { message_id: "parent-10", sender_name: "alice", sender_type: "human", content: "parent", timestamp: "2026-05-13T08:00:00.000Z", seq: 10 },
+        recent_messages: [],
+        history_truncated: false,
+      },
+    });
+    // Cut preview: a notice that shows only part of a message does not make it seen.
+    const noticeOnly = makeMessage("notice-only-random-body-marker. The preview cuts this second sentence.", {
+      message_id: "starting-random-7",
+      seq: 7,
+      channel_id: "channel-random",
+      channel_name: "random",
+    });
+    (manager as any).startingInboxes.bufferMessagesDuringStart("agent-1", [threadMessage, noticeOnly]);
+    await manager.startAgent("agent-1", makeConfig({ runtime: "claude", sessionId: "session-1" }));
+    const prompt = driver.spawnCalls[0].prompt;
+    assert.match(prompt, /^New message received:/);
+    assert.match(prompt, /reply in the thread/);
+    assert.match(prompt, /\[Raft inbox notice:/);
+    assertNoMatchOutsideInboxPreview(prompt, /notice-only-random-body-marker/);
+
+    const ap = (manager as any).agents.get("agent-1");
+    assert.deepEqual(ap.inbox.map((message: AgentMessage) => message.message_id), ["starting-random-7"], "only the rendered thread message is consumed");
+    assert.equal((manager as any).isVisibleMessageModelSeen("agent-1", thread, threadMessage), true);
+    assert.equal((manager as any).isVisibleMessageModelSeen("agent-1", "#random", noticeOnly), false);
+
+    driver.parsedLines.set("turn-end-thread", [{ kind: "turn_end", sessionId: "session-1" }]);
+    driver.processes[0].stdout.emit("data", Buffer.from("turn-end-thread\n"));
+    await flush();
+    assert.equal(driver.encodedCalls.length, 0, "the notice in the first prompt already announced it");
+  }, { driver });
+});
+
 // --- RFC 071 part 2: terminal-failure breaker wire (daemon emission) ---
 
 /** The Pi SDK text reported in the field case (#5014); RFC 071 §1. */
@@ -12677,6 +14488,7 @@ test("RFC 071 W-1/W-2: Pi compaction failure sends one E1 with the RAW SDK finge
   await withManager(async ({ manager, sent }) => {
     await manager.startAgent("agent-1", makeConfig({ runtime: "pi", sessionId: "session-1" }), undefined, undefined, undefined, "launch-1");
     const registeredAtSend = recordRegistrationAtSend(manager, "agent-1", "agent:runtime:outcome");
+    const failedProcess = (manager as any).agents.get("agent-1");
 
     const events = piFieldCompactionFailureEvents("session-1");
     // The mapper's error event carries the display constant; only the
@@ -12702,11 +14514,11 @@ test("RFC 071 W-1/W-2: Pi compaction failure sends one E1 with the RAW SDK finge
     assert.equal(frame.daemonInstanceId, "daemon-rfc071");
     // W-1: sent while the process record still exists (before agents.delete).
     assert.deepEqual(registeredAtSend, [true]);
-    assert.equal((manager as any).agents.has("agent-1"), false, "cleanup still removes the record afterwards");
-    // Same per-agent sequence as agent:status: the inactive status precedes E1.
-    const inactive = sent.filter((msg) => msg.type === "agent:status" && msg.status === "inactive").at(-1);
-    assert.ok(inactive?.type === "agent:status" && typeof inactive.clientSeq === "number");
-    assert.ok(frame.clientSeq > inactive.clientSeq!, "E1 is sequenced after the inactive status");
+    assert.notEqual((manager as any).agents.get("agent-1"), failedProcess, "cleanup still removes the failed process's record afterwards");
+    // Reconciler step 12: the session is replaced (no inactive status); E1 is
+    // sequenced before the new session's frames.
+    const invalidate = sent.findIndex((msg) => msg.type === "agent:session:invalidate");
+    assert.ok(invalidate > sent.indexOf(frame), "E1 precedes the session's replacement");
 
     // W-2: never the display constant's fingerprint. Positive control: the
     // constant really hashes to the value the RFC names.
@@ -12716,8 +14528,10 @@ test("RFC 071 W-1/W-2: Pi compaction failure sends one E1 with the RAW SDK finge
   }, { driver, daemonInstanceId: "daemon-rfc071" });
 });
 
-test("RFC 071 W-3: a fingerprint-fence trip and a billing rejection each send exactly one E1 through the cleanup choke point", async () => {
-  for (const scenario of ["fence", "billing"] as const) {
+// Reconciler step 4a: a billing rejection no longer ends the process (no E1;
+// task #917's test covers it), so only the fence goes through the choke point.
+test("RFC 071 W-3: a fingerprint-fence trip sends exactly one E1 through the cleanup choke point", async () => {
+  for (const scenario of ["fence"] as const) {
     const driver = new FakeCodexDriver({ id: "grok", supportsStdinNotification: true, busyDeliveryMode: "direct" });
     await withManager(async ({ manager, sent }) => {
       await manager.startAgent("agent-1", makeConfig({ sessionId: "session-1", runtime: "grok" }), undefined, undefined, undefined, "launch-1");
@@ -12726,10 +14540,8 @@ test("RFC 071 W-3: a fingerprint-fence trip and a billing rejection each send ex
       manager.deliverMessage("agent-1", makeMessage("rejected prompt", { message_id: "msg-rfc071", seq: 71 }));
       await flush();
       const registeredAtSend = recordRegistrationAtSend(manager, "agent-1", "agent:runtime:outcome");
-      const text = scenario === "billing"
-        ? "402 Grok Build usage balance exhausted"
-        : "Grok Build ACP delivery failed: upstream rejected the prompt";
-      const attempts = scenario === "billing" ? 1 : 3;
+      const text = "Grok Build ACP delivery failed: upstream rejected the prompt";
+      const attempts = 3;
       for (let attempt = 1; attempt <= attempts; attempt += 1) {
         await waitFor(() => driver.encodedCalls.length === attempt, `delivery attempt ${attempt}`);
         emitRuntimeLines(driver, 0, `delivery-error-${attempt}`, [{
@@ -12748,19 +14560,88 @@ test("RFC 071 W-3: a fingerprint-fence trip and a billing rejection each send ex
       const raw = buildRuntimeErrorActivityDiagnostic(text);
       assert.deepEqual(frames[0].outcome, {
         kind: "terminal_failure",
-        failureKind: scenario === "billing" ? "billing_rejected" : "fingerprint_fence",
+        failureKind: "fingerprint_fence",
         fingerprint: raw.fingerprint,
         errorClass: raw.errorClass,
       });
       assert.equal(frames[0].launchId, "launch-1");
       assert.deepEqual(registeredAtSend, [true]);
-      if (scenario === "billing") {
-        assert.equal(raw.errorClass, "BillingError");
-        assert.notEqual(raw.fingerprint, buildRuntimeErrorActivityDiagnostic(formatRuntimeBillingExhaustedMessage("grok")).fingerprint,
-          "the billing E1 is the raw rejection, not the display copy");
-      }
     }, { driver, stdinNotificationRetryMs: 25, daemonInstanceId: "daemon-rfc071" });
   }
+});
+
+type TurnEndedFrame = Extract<MachineToServerMessage, { type: "agent:turn:ended" }>;
+const turnEndedFrames = (sent: MachineToServerMessage[]) => sent.filter((msg): msg is TurnEndedFrame => msg.type === "agent:turn:ended");
+
+test("agent:turn:ended: once per launch, on its first turn end, naming the unread targets the start input showed", async () => {
+  const driver = new FakeCodexDriver({ id: "pi", supportsStdinNotification: true, busyDeliveryMode: "direct" });
+  await withManager(async ({ manager, sent }) => {
+    manager.setServerTurnEndedCapable(true);
+    await manager.startAgent("agent-1", makeConfig({ runtime: "pi", sessionId: "session-1" }), undefined, { "#busy": 1294, "#quiet": 3 }, undefined, "launch-1");
+    assert.match(driver.spawnCalls[0].prompt, /#busy/, "the resume input shows the counts");
+    emitRuntimeLines(driver, 0, "clean-turn", [
+      { kind: "text", text: "nothing for me" },
+      { kind: "turn_end", sessionId: "session-1" },
+    ]);
+    await flush();
+    emitRuntimeLines(driver, 0, "second-turn", [
+      { kind: "text", text: "again" },
+      { kind: "turn_end", sessionId: "session-1" },
+    ]);
+    await flush();
+    assert.deepEqual(turnEndedFrames(sent), [{
+      type: "agent:turn:ended", agentId: "agent-1", launchId: "launch-1", outcome: "completed", shownUnreadTargets: ["#busy", "#quiet"],
+    }], "the first turn end only");
+    for (const target of turnEndedFrames(sent)[0]!.shownUnreadTargets) {
+      assert.ok(driver.spawnCalls[0].prompt.includes(`- ${target}: `), `${target} is reported only because its count is in the input`);
+    }
+  }, { driver });
+});
+
+test("agent:turn:ended: a wake start reports exactly the targets its unread suffix rendered", async () => {
+  const driver = new FakeCodexDriver({ id: "pi", supportsStdinNotification: true, busyDeliveryMode: "direct" });
+  await withManager(async ({ manager, sent }) => {
+    manager.setServerTurnEndedCapable(true);
+    const summary = { "#busy": 1294, "#wg-agent-migration": 572, "dm:@owner": 1 };
+    await manager.startAgent("agent-1", makeConfig({ runtime: "pi", sessionId: "session-1" }), makeMessage("ping", { message_id: "msg-wake", seq: 5 }), summary, undefined, "launch-1");
+    emitRuntimeLines(driver, 0, "turn", [{ kind: "text", text: "ok" }, { kind: "turn_end", sessionId: "session-1" }]);
+    await flush();
+    const [frame] = turnEndedFrames(sent);
+    assert.deepEqual(frame?.shownUnreadTargets, Object.keys(summary));
+    for (const target of frame!.shownUnreadTargets) {
+      assert.ok(driver.spawnCalls[0].prompt.includes(`- ${target}: ${summary[target as keyof typeof summary]} unread`), `${target} rendered with its count`);
+    }
+  }, { driver });
+});
+
+test("agent:turn:ended: an interrupted or output-less first turn is not completed; nothing goes to a server that does not read it", async () => {
+  for (const scenario of ["interrupted", "empty", "incapable"] as const) {
+    const driver = new FakeCodexDriver({ id: "pi", supportsStdinNotification: true, busyDeliveryMode: "direct" });
+    await withManager(async ({ manager, sent }) => {
+      if (scenario !== "incapable") manager.setServerTurnEndedCapable(true);
+      await manager.startAgent("agent-1", makeConfig({ runtime: "pi", sessionId: "session-1" }), undefined, { "#busy": 12 }, undefined, "launch-1");
+      emitRuntimeLines(driver, 0, "turn", scenario === "empty"
+        ? [{ kind: "turn_end", sessionId: "session-1" }]
+        : [{ kind: "text", text: "partial" }, scenario === "interrupted"
+          ? { kind: "turn_end", sessionId: "session-1", interrupted: true }
+          : { kind: "turn_end", sessionId: "session-1" }]);
+      await flush();
+      const frames = turnEndedFrames(sent);
+      if (scenario === "incapable") assert.deepEqual(frames, []);
+      else assert.deepEqual(frames.map((frame) => frame.outcome), [scenario === "interrupted" ? "interrupted" : "failed"]);
+    }, { driver });
+  }
+});
+
+test("agent:turn:ended: a start whose input carried no unread counts names none", async () => {
+  const driver = new FakeCodexDriver({ id: "pi", supportsStdinNotification: true, busyDeliveryMode: "direct" });
+  await withManager(async ({ manager, sent }) => {
+    manager.setServerTurnEndedCapable(true);
+    await manager.startAgent("agent-1", makeConfig({ runtime: "pi", sessionId: "session-1" }), undefined, undefined, undefined, "launch-1");
+    emitRuntimeLines(driver, 0, "turn", [{ kind: "text", text: "hi" }, { kind: "turn_end", sessionId: "session-1" }]);
+    await flush();
+    assert.deepEqual(turnEndedFrames(sent).map((frame) => frame.shownUnreadTargets), [[]]);
+  }, { driver });
 });
 
 test("RFC 071 W-4/C-10: a clean turn sends one turn_completed after agent:session; the same launch's next-turn failure still sends E1", async () => {
@@ -12829,7 +14710,7 @@ test("RFC 071 W-5: a runtime error anywhere in the turn suppresses turn_complete
   }, { driver, daemonInstanceId: "daemon-rfc071" });
 });
 
-test("RFC 071 W-6: a sticky terminal failure on a still-registered per-turn process sends no turn_completed", async () => {
+test("RFC 071 W-6: a sticky failure on a per-turn process sends no turn_completed", async () => {
   const driver = new FakeCodexDriver({ id: "codex" });
   await withManager(async ({ manager, sent }) => {
     await manager.startAgent("agent-1", makeConfig({ sessionId: "session-1" }), undefined, undefined, undefined, "launch-1");
@@ -12839,13 +14720,14 @@ test("RFC 071 W-6: a sticky terminal failure on a still-registered per-turn proc
       { kind: "turn_end", sessionId: "session-1" },
     ]);
     await flush();
-    assert.equal((manager as any).agents.has("agent-1"), true, "precondition: the per-turn process is still registered at turn_end");
+    // Reconciler step 12: acted on at the error event, on every runtime.
+    assert.equal((manager as any).agents.has("agent-1"), false, "precondition: the failed process is released at its error");
     assert.ok(sent.some((msg) => msg.type === "agent:status" && msg.status === "inactive"), "precondition: the turn ended in a sticky failure");
     assert.equal(turnCompletedFrames(sent).length, 0);
   }, { driver, daemonInstanceId: "daemon-rfc071" });
 });
 
-test("RFC 071 O-10/O-11: catchupBatchId is echoed once, only on the clean turn that rendered the batch, never under a control prompt (F9)", async () => {
+test("RFC 071 O-10/O-11: catchupBatchId is echoed once, only on the clean turn that rendered the batch, a control start's included (F9)", async () => {
   const resume = [makeMessage("owed m1", { message_id: "m1", seq: 1 }), makeMessage("owed m2", { message_id: "m2", seq: 2 })];
   for (const scenario of ["rendered", "first_turn_failed", "control_prompt"] as const) {
     const driver = new FakeCodexDriver({ id: "pi", supportsStdinNotification: true, busyDeliveryMode: "direct" });
@@ -12859,11 +14741,8 @@ test("RFC 071 O-10/O-11: catchupBatchId is echoed once, only on the clean turn t
       });
       await manager.startAgent("agent-1", config, undefined, undefined, undefined, "launch-1", false, resume, undefined, undefined, "batch-1");
       const promptSource = driver.spawnCalls[0]?.prompt ?? "";
-      if (scenario === "control_prompt") {
-        assert.doesNotMatch(String(promptSource), /owed m1/, "precondition: the control prompt replaced the catch-up");
-      } else {
-        assert.match(String(promptSource), /owed m1/, "precondition: the batch was rendered as the first turn's input");
-      }
+      // F9: a release notice goes with the catch-up, never in place of it.
+      assert.match(String(promptSource), /owed m1/, "precondition: the batch was rendered as the first turn's input");
 
       if (scenario === "first_turn_failed") {
         emitRuntimeLines(driver, 0, "batch-turn-error", [
@@ -12880,8 +14759,8 @@ test("RFC 071 O-10/O-11: catchupBatchId is echoed once, only on the clean turn t
 
       const echoes = turnCompletedFrames(sent).map((frame) =>
         frame.outcome.kind === "turn_completed" ? frame.outcome.catchupBatchId ?? null : "not-e2");
-      if (scenario === "rendered") {
-        assert.deepEqual(echoes, ["batch-1", null], "echoed on the batch turn, then never again");
+      if (scenario === "rendered" || scenario === "control_prompt") {
+        assert.deepEqual(echoes, ["batch-1", null], `${scenario}: echoed on the batch turn, then never again`);
       } else {
         assert.deepEqual(echoes, [null, null], `${scenario}: a batch that was not fed to a clean turn is never echoed`);
       }
@@ -12889,29 +14768,31 @@ test("RFC 071 O-10/O-11: catchupBatchId is echoed once, only on the clean turn t
   }
 });
 
-test("RFC 071 H-11c: the exit frame names the closure-captured process that exited, not the process the registry holds now", async () => {
-  // SIGTERM is ignored, so the terminal-failed process outlives its registry entry.
+test("RFC 071 H-11c / reconciler step 5: a start after a terminal cleanup waits for the forgotten process to exit; its exit frame names that process", async () => {
   const driver = new FakeCodexDriver({ id: "pi", supportsStdinNotification: true, busyDeliveryMode: "direct", ignoredKillSignals: ["SIGTERM"] });
   await withManager(async ({ manager, sent }) => {
     await manager.startAgent("agent-1", makeConfig({ runtime: "pi", sessionId: "session-1" }), undefined, undefined, undefined, "launch-P");
     emitRuntimeLines(driver, 0, "pi-compaction-failed", [...piFieldCompactionFailureEvents("session-1"), { kind: "turn_end", sessionId: "session-1" }]);
     await flush();
-    assert.equal((manager as any).agents.has("agent-1"), false, "precondition: terminal cleanup forgot process pi");
+    assert.equal((manager as any).agents.has("agent-1"), false, "precondition: terminal cleanup took process pi out of the live map");
     assert.equal(processExitedFrames(sent).length, 0, "precondition: pi ignored SIGTERM and has not exited");
+    assert.equal(manager.hasExitingRuntime("agent-1"), true, "pi is still tracked until its exit is confirmed");
 
-    await manager.startAgent("agent-1", makeConfig({ runtime: "pi", sessionId: "session-1" }), undefined, undefined, undefined, "launch-P2");
+    const second = manager.startAgent("agent-1", makeConfig({ runtime: "pi", sessionId: "session-1" }), undefined, undefined, undefined, "launch-P2");
+    await flush();
+    assert.equal(processSpawnedFrames(sent).length, 1, "no second process while pi is still exiting");
+
+    // The stop grace ends: pi's tree is SIGKILLed, it exits, then pi2 starts.
+    await second;
+    assert.deepEqual(driver.processes[0].killedSignals, ["SIGTERM", "SIGKILL"]);
     const spawned = processSpawnedFrames(sent);
     assert.equal(spawned.length, 2);
     const [pi, pi2] = spawned;
-    assert.equal(pi.launchId, "launch-P");
     assert.equal(pi2.launchId, "launch-P2");
     assert.notEqual(pi.processInstanceId, pi2.processInstanceId);
-    assert.equal((manager as any).agents.get("agent-1").processInstanceId, pi2.processInstanceId, "the registry now holds pi2");
-
-    driver.processes[0].exit(null, "SIGTERM");
-    await flush();
     const exited = processExitedFrames(sent);
     assert.equal(exited.length, 1);
+    assert.ok(sent.indexOf(exited[0] as MachineToServerMessage) < sent.indexOf(pi2 as MachineToServerMessage), "pi's exit is reported before pi2 is spawned");
     assert.deepEqual({
       daemonInstanceId: exited[0].daemonInstanceId,
       processInstanceId: exited[0].processInstanceId,
@@ -12925,9 +14806,9 @@ test("RFC 071 H-11c: the exit frame names the closure-captured process that exit
       spawnLaunchId: "launch-P",
       launchId: "launch-P",
       code: null,
-      signal: "SIGTERM",
+      signal: "SIGKILL",
     });
-  }, { driver, daemonInstanceId: "daemon-rfc071" });
+  }, { driver, daemonInstanceId: "daemon-rfc071", stopKill: { graceMs: 30 } });
 });
 
 test("RFC 071 X-6(f): a starting ack carries no processInstanceId; process_spawned and the exit frame carry the same id; a rebind ack names the running process", async () => {
@@ -13185,6 +15066,180 @@ test("RFC 071 deferred spawn: the accepted launch is not_spawned(deferred); the 
     assert.equal(spawned[0].respawn, true, "no accepted start was waiting: a daemon-initiated spawn");
     assert.equal(spawned[0].launchId, "launch-1");
   }, { driver, daemonInstanceId: "daemon-rfc071" });
+});
+
+// task #925 (Hands 94951463): an OpenCode agent's due reminder must start a
+// turn. The deferred empty start ("no concrete message yet") swallowed both
+// reminder wake paths, while the notice was still recorded as delivered.
+test("deferred spawn: a reminder for an idle agent with a restart snapshot spawns it with the notice", async () => {
+  const store = createAgentAppInboxStore({ registry: REMINDER_AGENT_INBOX_REGISTRY });
+  const driver = new FakeCodexDriver({ id: "opencode", supportsStdinNotification: false, busyDeliveryMode: "none", deferSpawnUntilMessage: true });
+  await withManager(async ({ manager }) => {
+    await serverStart(manager, "agent-1", makeConfig({ runtime: "opencode", sessionId: "session-1" }), "launch-1");
+    assert.equal(driver.spawnCalls.length, 0, "precondition: the empty start was deferred");
+
+    assert.equal(await manager.notifyAgentAppInbox("agent-1", mintReminderAppItem(store, "1")), true);
+    await waitFor(() => driver.spawnCalls.length === 1, "the reminder spawns the runtime");
+    assert.match(driver.spawnCalls[0]!.prompt, /App items pending: 1/, "the notice is the turn's input");
+  }, { driver, appInboxForAgent: () => store });
+});
+
+test("deferred spawn: a reminder that reached the Server as a wake spawns the agent the Server starts", async () => {
+  const store = createAgentAppInboxStore({ registry: REMINDER_AGENT_INBOX_REGISTRY });
+  const driver = new FakeCodexDriver({ id: "opencode", supportsStdinNotification: false, busyDeliveryMode: "none", deferSpawnUntilMessage: true });
+  await withManager(async ({ manager, sent }) => {
+    // No process and no restart snapshot (after a daemon restart): the due
+    // item becomes a server wake, and the Server answers with a plain start.
+    assert.equal(await manager.notifyAgentAppInbox("agent-1", mintReminderAppItem(store, "1")), true);
+    assert.equal(sent.filter((msg) => msg.type === "agent:wake:request").length, 1, "precondition: a server wake");
+    await serverStart(manager, "agent-1", makeConfig({ runtime: "opencode", sessionId: "session-1" }), "launch-1");
+
+    await waitFor(() => driver.spawnCalls.length === 1, "the server's start spawns the runtime");
+    assert.match(driver.spawnCalls[0]!.prompt, /App items pending: 1/, "the due item rides the first input");
+  }, { driver, appInboxForAgent: () => store });
+});
+
+test("deferred spawn: a reminder deferred during a turn wakes the agent once the per_turn process exits", async () => {
+  const store = createAgentAppInboxStore({ registry: REMINDER_AGENT_INBOX_REGISTRY });
+  const driver = new FakeCodexDriver({ id: "opencode", supportsStdinNotification: false, busyDeliveryMode: "none", deferSpawnUntilMessage: true });
+  await withManager(async ({ manager }) => {
+    await manager.startAgent("agent-1", makeConfig({ runtime: "opencode", sessionId: "session-1" }), makeMessage("work", { message_id: "m-1", seq: 1 }));
+    await waitFor(() => driver.spawnCalls.length === 1, "message-driven spawn");
+    assert.equal(await manager.notifyAgentAppInbox("agent-1", mintReminderAppItem(store, "1")), true);
+    assert.equal(driver.spawnCalls.length, 1, "precondition: busy, the notice waits for the turn to end");
+
+    // The turn consumed its message: only the deferred notice can respawn it.
+    (manager as any).agents.get("agent-1").inbox.splice(0);
+    emitRuntimeLines(driver, 0, "turn-1", [{ kind: "turn_end", sessionId: "session-1" }]);
+    driver.processes[0]!.exit(0);
+    driver.processes[0]!.close(0);
+    await waitFor(() => driver.spawnCalls.length === 2, "the deferred notice respawns the runtime");
+    assert.match(driver.spawnCalls[1]!.prompt, /App items pending: 1/);
+  }, { driver, appInboxForAgent: () => store });
+});
+
+test("deferred spawn: a server-woken start whose spawn fails keeps the reminder owed to the next start", async () => {
+  const store = createAgentAppInboxStore({ registry: REMINDER_AGENT_INBOX_REGISTRY });
+  const driver = new FakeCodexDriver({ id: "opencode", supportsStdinNotification: false, busyDeliveryMode: "none", deferSpawnUntilMessage: true });
+  await withManager(async ({ manager }) => {
+    assert.equal(await manager.notifyAgentAppInbox("agent-1", mintReminderAppItem(store, "1")), true);
+    driver.failSpawnWith = new Error("spawn opencode ENOENT");
+    await serverStart(manager, "agent-1", makeConfig({ runtime: "opencode", sessionId: "session-1" }), "launch-1").catch(() => {});
+    await flush();
+    driver.failSpawnWith = undefined;
+
+    await serverStart(manager, "agent-1", makeConfig({ runtime: "opencode", sessionId: "session-1" }), "launch-2");
+    await waitFor(() => driver.spawnCalls.length >= 2, "the next start spawns for the still-owed reminder");
+    assert.match(driver.spawnCalls.at(-1)!.prompt, /App items pending: 1/, "not lost to the failed spawn");
+  }, { driver, appInboxForAgent: () => store });
+});
+
+test("deferred spawn: a server wake whose own item is gone does not spawn for an advisory item", async () => {
+  const store = createAgentAppInboxStore({ registry: REMINDER_AGENT_INBOX_REGISTRY });
+  const driver = new FakeCodexDriver({ id: "opencode", supportsStdinNotification: false, busyDeliveryMode: "none", deferSpawnUntilMessage: true });
+  await withManager(async ({ manager }) => {
+    const due = mintReminderAppItem(store, "1");
+    assert.equal(await manager.notifyAgentAppInbox("agent-1", due), true);
+    assert.equal(await manager.notifyAgentAppInbox("agent-1", mintReminderAppItem(store, "2"), { startStoppedAgent: false }), true);
+    assert.equal(store.ack(due.itemId), true, "precondition: the woken item is acknowledged");
+    assert.ok(!store.list().some((item) => item.itemId === due.itemId));
+
+    await serverStart(manager, "agent-1", makeConfig({ runtime: "opencode", sessionId: "session-1" }), "launch-1");
+    await flush();
+    assert.equal(driver.spawnCalls.length, 0, "only the advisory item is left: no model call");
+  }, { driver, appInboxForAgent: () => store });
+});
+
+test("deferred spawn: after a failed spawn and the reminder's ack, an advisory item never inherits its wake", async () => {
+  const store = createAgentAppInboxStore({ registry: REMINDER_AGENT_INBOX_REGISTRY });
+  const driver = new FakeCodexDriver({ id: "opencode", supportsStdinNotification: false, busyDeliveryMode: "none", deferSpawnUntilMessage: true });
+  await withManager(async ({ manager }) => {
+    const due = mintReminderAppItem(store, "1");
+    assert.equal(await manager.notifyAgentAppInbox("agent-1", due), true);
+    driver.failSpawnWith = new Error("spawn opencode ENOENT");
+    await serverStart(manager, "agent-1", makeConfig({ runtime: "opencode", sessionId: "session-1" }), "launch-1").catch(() => {});
+    await flush();
+    driver.failSpawnWith = undefined;
+    assert.equal(driver.spawnCalls.length, 1, "precondition: the woken start's spawn failed");
+
+    assert.equal(store.ack(due.itemId), true);
+    assert.equal(await manager.notifyAgentAppInbox("agent-1", mintReminderAppItem(store, "2"), { startStoppedAgent: false }), true);
+    await serverStart(manager, "agent-1", makeConfig({ runtime: "opencode", sessionId: "session-1" }), "launch-2");
+    await flush();
+    assert.equal(driver.spawnCalls.length, 1, "only an advisory item is left: no second model call");
+  }, { driver, appInboxForAgent: () => store });
+});
+
+test("deferred spawn: a turn-exit wake whose reminder was acked leaves an advisory item for the next start", async () => {
+  const store = createAgentAppInboxStore({ registry: REMINDER_AGENT_INBOX_REGISTRY });
+  const driver = new FakeCodexDriver({ id: "opencode", supportsStdinNotification: false, busyDeliveryMode: "none", deferSpawnUntilMessage: true });
+  await withManager(async ({ manager }) => {
+    await manager.startAgent("agent-1", makeConfig({ runtime: "opencode", sessionId: "session-1" }), makeMessage("work", { message_id: "m-1", seq: 1 }));
+    await waitFor(() => driver.spawnCalls.length === 1, "message-driven spawn");
+    const due = mintReminderAppItem(store, "1");
+    assert.equal(await manager.notifyAgentAppInbox("agent-1", due), true);
+    assert.equal(await manager.notifyAgentAppInbox("agent-1", mintReminderAppItem(store, "2"), { startStoppedAgent: false }), true);
+    assert.equal(store.ack(due.itemId), true);
+
+    (manager as any).agents.get("agent-1").inbox.splice(0);
+    emitRuntimeLines(driver, 0, "turn-1", [{ kind: "turn_end", sessionId: "session-1" }]);
+    driver.processes[0]!.exit(0);
+    driver.processes[0]!.close(0);
+    await waitFor(() => (manager as any).agents.get("agent-1") === undefined, "the turn's process is gone");
+    await flush();
+    assert.equal(driver.spawnCalls.length, 1, "the acked reminder's wake is not lent to the advisory item");
+
+    await manager.deliverMessage("agent-1", makeMessage("hello", { message_id: "m-2", seq: 2 }));
+    await waitFor(() => driver.spawnCalls.length === 2, "an ordinary message restarts the agent");
+    assert.match(driver.spawnCalls[1]!.prompt, /App items pending: 1/, "the advisory item rides that start");
+  }, { driver, appInboxForAgent: () => store });
+});
+
+test("deferred spawn: an unreadable App Inbox keeps the server wake for the next start", async () => {
+  const store = createAgentAppInboxStore({ registry: REMINDER_AGENT_INBOX_REGISTRY });
+  let storeDown = false;
+  const flakyStore: AgentAppInboxStore = {
+    ...store,
+    list: () => {
+      if (storeDown) throw new Error("APP_INBOX_STORE_UNAVAILABLE");
+      return store.list();
+    },
+  };
+  const driver = new FakeCodexDriver({ id: "opencode", supportsStdinNotification: false, busyDeliveryMode: "none", deferSpawnUntilMessage: true });
+  await withManager(async ({ manager }) => {
+    assert.equal(await manager.notifyAgentAppInbox("agent-1", mintReminderAppItem(store, "1")), true);
+    storeDown = true;
+    await serverStart(manager, "agent-1", makeConfig({ runtime: "opencode", sessionId: "session-1" }), "launch-1");
+    await flush();
+    assert.equal(driver.spawnCalls.length, 0, "nothing is spawned while the App Inbox cannot be read");
+
+    storeDown = false;
+    await serverStart(manager, "agent-1", makeConfig({ runtime: "opencode", sessionId: "session-1" }), "launch-2");
+    await waitFor(() => driver.spawnCalls.length === 1, "the next start still answers the wake");
+    assert.match(driver.spawnCalls[0]!.prompt, /App items pending: 1/);
+  }, { driver, appInboxForAgent: () => flakyStore });
+});
+
+test("deferred spawn: an empty start with no due app item stays deferred", async () => {
+  const store = createAgentAppInboxStore({ registry: REMINDER_AGENT_INBOX_REGISTRY });
+  const driver = new FakeCodexDriver({ id: "opencode", supportsStdinNotification: false, busyDeliveryMode: "none", deferSpawnUntilMessage: true });
+  await withManager(async ({ manager }) => {
+    await serverStart(manager, "agent-1", makeConfig({ runtime: "opencode", sessionId: "session-1" }), "launch-1");
+    await flush();
+    assert.equal(driver.spawnCalls.length, 0, "no model call for a start with nothing to answer");
+  }, { driver, appInboxForAgent: () => store });
+});
+
+test("deferred spawn: an advisory app item never turns an empty start into a model call", async () => {
+  const store = createAgentAppInboxStore({ registry: REMINDER_AGENT_INBOX_REGISTRY });
+  const driver = new FakeCodexDriver({ id: "opencode", supportsStdinNotification: false, busyDeliveryMode: "none", deferSpawnUntilMessage: true });
+  await withManager(async ({ manager }) => {
+    await serverStart(manager, "agent-1", makeConfig({ runtime: "opencode", sessionId: "session-1" }), "launch-1");
+    assert.equal(await manager.notifyAgentAppInbox("agent-1", mintReminderAppItem(store, "1"), { startStoppedAgent: false }), true);
+    await serverStart(manager, "agent-1", makeConfig({ runtime: "opencode", sessionId: "session-1" }), "launch-2");
+    await flush();
+    assert.equal(driver.spawnCalls.length, 0, "the advisory item waits for the next concrete message");
+  }, { driver, appInboxForAgent: () => store });
 });
 
 test("RFC 071 empty batch: a start whose batch rendered no rows sends no echo; a batch with rows echoes once with its row count", async () => {
@@ -13986,6 +16041,34 @@ test("an advisory notice to a per_turn agent never restarts it and rides in the 
   });
 });
 
+// RFC 081 D9: the start input's notice reads the inbox-items launch time from
+// the config the start runs on, so a reminder fired after it is its row.
+test("inbox items with the Server's launch time: a deferred reminder rides the next start's input as its reminder: row", async () => {
+  const store = createAgentAppInboxStore({ registry: REMINDER_AGENT_INBOX_REGISTRY });
+  const config = makeConfig({ runtime: "cursor", sessionId: "session-1", inboxItems: true, inboxItemsLaunchAt: "2026-01-01T00:00:00.000Z" });
+  await withManager(async ({ driver, manager }) => {
+    await manager.startAgent("agent-1", config, undefined, undefined, undefined, "launch-1");
+    const item = mintReminderAppItem(store, "1");
+
+    assert.equal(await manager.notifyAgentAppInbox("agent-1", item, { startStoppedAgent: false }), true);
+    driver.parsedLines.set("per-turn-row-done", [{ kind: "turn_end", sessionId: "session-1" }]);
+    driver.processes[0].stdout.emit("data", Buffer.from("per-turn-row-done\n"));
+    driver.processes[0].exit(0);
+    driver.processes[0].close(0);
+    await waitFor(() => (manager as any).agents.get("agent-1") === undefined, "the first turn's process is gone");
+
+    await manager.deliverMessage("agent-1", makeMessage("hello", { message_id: "per-turn-row-next", seq: 9301 }));
+    await waitFor(() => driver.spawnCalls.length === 2, "an ordinary message restarts the agent");
+    const prompt = driver.spawnCalls[1].prompt;
+    assert.match(prompt, /\nreminder:11111111 · 1 fired, not acked/);
+    assert.match(prompt, /\n {2}ack: raft reminder ack --id 11111111-1111-4111-8111-111111111111 --revision 1\n/);
+    assert.doesNotMatch(prompt, /App items: 1/, "not in the daemon section");
+  }, {
+    driver: new FakeCodexDriver({ id: "cursor", supportsStdinNotification: false }),
+    appInboxForAgent: () => store,
+  });
+});
+
 test("an unavailable App Inbox never fails a per_turn start or its exit handling, and the deferred notice survives", async () => {
   const store = createAgentAppInboxStore({ registry: REMINDER_AGENT_INBOX_REGISTRY });
   let storeDown = false;
@@ -14456,7 +16539,7 @@ test("task #1277 (review): a cancelled start's child that ignores SIGTERM is end
     assert.deepEqual(child.killedSignals, ["SIGTERM", "SIGKILL"], "SIGTERM was ignored; the attempt escalated to SIGKILL");
     assert.equal(processExitedFrames(sent).length, 1, "the exit was observed and reported once");
     assert.ok(!statusFrames(sent).some((f) => f.status === "active"));
-  }, { driver: driver as unknown as FakeCodexDriver, daemonInstanceId: "daemon-1277", cancelledStartCleanup: { sigtermGraceMs: 50, verifyMs: 300 } });
+  }, { driver: driver as unknown as FakeCodexDriver, daemonInstanceId: "daemon-1277", stopKill: { graceMs: 50, confirmMs: 300 } });
 });
 
 test("task #1277 (review): a cancelled start's child that survives SIGKILL is reported as unconfirmed cleanup, never as exited", async () => {
@@ -14482,8 +16565,356 @@ test("task #1277 (review): a cancelled start's child that survives SIGKILL is re
       assert.ok(logs.some((l) => l.includes("Cleanup of a cancelled start's child is unconfirmed")), `unconfirmed cleanup is surfaced: ${logs.filter((l) => l.includes("cancelled")).join(" | ")}`);
       // The fixture is ended by the test, not by the daemon.
       child.exit(null, "SIGKILL");
-    }, { driver: driver as unknown as FakeCodexDriver, daemonInstanceId: "daemon-1277", cancelledStartCleanup: { sigtermGraceMs: 50, verifyMs: 300 } });
+    }, { driver: driver as unknown as FakeCodexDriver, daemonInstanceId: "daemon-1277", stopKill: { graceMs: 50, confirmMs: 300 } });
   } finally {
     unsubscribe();
   }
 });
+
+// Task #1302: a direct-stdin runtime (builtin/pi) whose open tool call never
+// returns pinned its queued messages forever, because stalled recovery refused
+// any restart while a tool was outstanding. Recovery may now cut off the tool
+// only when the runtime proves no live work can be lost.
+async function withStalledOpenTool(
+  snapshots: Array<Record<string, unknown>> | null,
+  fn: (ctx: {
+    driver: FakeCodexDriver;
+    manager: AgentProcessManager;
+    ap: any;
+    sink: MemoryTraceSink;
+    deliver: () => void;
+    tick: () => void;
+    /** The 10-minute sweep (reconcile, trigger `sweep`). */
+    sweep: () => Promise<void>;
+    setSnapshots: (next: Array<Record<string, unknown>>) => void;
+    advance: (ms: number) => void;
+  }) => Promise<void>,
+) {
+  const realDateNow = Date.now;
+  const realSetInterval = globalThis.setInterval;
+  const realClearInterval = globalThis.clearInterval;
+  let now = 2_000_000;
+  const intervals = new Map<number, () => void>();
+  (Date as any).now = () => now;
+  (globalThis as any).setInterval = ((callback: () => void, ms?: number, ...args: any[]) => {
+    if (ms && ms > 1000) {
+      intervals.set(ms, callback);
+      return { fake: true, ms };
+    }
+    return realSetInterval(callback, ms, ...args);
+  }) as typeof setInterval;
+  (globalThis as any).clearInterval = ((timer: unknown) => {
+    if ((timer as any)?.fake) {
+      intervals.delete((timer as any).ms);
+      return;
+    }
+    return realClearInterval(timer as ReturnType<typeof setInterval>);
+  }) as typeof clearInterval;
+  const driver = new FakeCodexDriver({ supportsStdinNotification: true, busyDeliveryMode: "direct" });
+  const { sink, tracer } = makeDeterministicTracer();
+  try {
+    await withManager(async ({ manager }) => {
+      await manager.startAgent("agent-1", makeConfig({ sessionId: "session-1" }));
+      driver.parsedLines.set("tool-start", [{ kind: "tool_call", name: "bash", input: { command: "psql -c 'select 1'" }, callId: "call-bash-1" }]);
+      driver.processes[0].stdout.emit("data", Buffer.from("tool-start\n"));
+      await flush();
+      const ap = (manager as any).agents.get("agent-1");
+      assert.equal(ap.gatedSteering.outstandingToolUses, 1);
+      let current = snapshots;
+      if (current) {
+        ap.runtime.emitToolDiagnosticSnapshots = () => (current ?? []).map((snapshot) => ({
+          toolExecutionInstanceId: "tool-execution-1",
+          runtimeToolCallId: "call-bash-1",
+          toolPending: true,
+          progressState: "stale",
+          negativeEvidenceBucket: "none",
+          ...snapshot,
+        }));
+      } else {
+        delete ap.runtime.emitToolDiagnosticSnapshots;
+      }
+      now += 16 * 60_000;
+      await fn({
+        driver,
+        manager,
+        ap,
+        sink,
+        deliver: () => { manager.deliverMessage("agent-1", makeMessage("queued while the tool hangs")); },
+        tick: () => {
+          const heartbeat = intervals.get(60_000);
+          assert.ok(heartbeat, "activity heartbeat armed");
+          heartbeat();
+        },
+        sweep: () => (manager as any).sweepColdIdleRuntimes(),
+        setSnapshots: (next) => { current = next; },
+        advance: (ms) => { now += ms; },
+      });
+    }, { driver, tracer });
+  } finally {
+    (Date as any).now = realDateNow;
+    globalThis.setInterval = realSetInterval;
+    globalThis.clearInterval = realClearInterval;
+  }
+}
+
+function openToolRecoveryDecisions(sink: MemoryTraceSink): unknown[] {
+  return traceRowsNamed(sink, "daemon.runtime.stall.open_tool_recovery").map((row) => row.attrs?.decision);
+}
+
+test("stalled direct-stdin runtime restarts for a queued message when the open tool's child and process group exited", async () => {
+  await withStalledOpenTool([{ classification: "completion_loss", processLiveness: "exited", processGroupLiveness: "exited" }], async ({ driver, sink, deliver }) => {
+    deliver();
+    await waitFor(() => driver.spawnCalls.length === 2, "restart after completion loss");
+    assert.deepEqual(driver.processes[0].killedSignals, ["SIGTERM"]);
+    assert.deepEqual(openToolRecoveryDecisions(sink), ["no_live_work"]);
+  });
+});
+
+test("stalled direct-stdin runtime keeps waiting when the open tool has no child process (may be in-process work)", async () => {
+  await withStalledOpenTool([{ classification: "pending_liveness_unknown", processLiveness: "not_spawned" }], async ({ driver, sink, deliver }) => {
+    deliver();
+    await flush();
+    assert.deepEqual(driver.processes[0].killedSignals, []);
+    assert.deepEqual(openToolRecoveryDecisions(sink), ["no_evidence"]);
+  });
+});
+
+test("stalled direct-stdin runtime keeps waiting when a safe bash snapshot does not cover every open tool call", async () => {
+  await withStalledOpenTool([{ classification: "completion_loss", processLiveness: "exited", processGroupLiveness: "exited" }], async ({ driver, ap, sink, deliver }) => {
+    // A second, untracked call (e.g. MCP) is open beside the finished bash.
+    driver.parsedLines.set("mcp-start", [{ kind: "tool_call", name: "mcp__server__long_call", input: {}, callId: "call-mcp-1" }]);
+    driver.processes[0].stdout.emit("data", Buffer.from("mcp-start\n"));
+    await flush();
+    assert.equal(ap.gatedSteering.outstandingToolUses, 2);
+    ap.runtimeProgress.markStale();
+    deliver();
+    await flush();
+    assert.deepEqual(driver.processes[0].killedSignals, []);
+    assert.deepEqual(openToolRecoveryDecisions(sink), ["no_evidence"]);
+  });
+});
+
+test("stalled direct-stdin runtime keeps waiting when equal counts describe a different call", async () => {
+  // One open call and one safe snapshot, but the snapshot belongs to another call.
+  await withStalledOpenTool([{ classification: "completion_loss", processLiveness: "exited", processGroupLiveness: "exited", runtimeToolCallId: "call-stale-bash" }], async ({ driver, sink, deliver }) => {
+    deliver();
+    await flush();
+    assert.deepEqual(driver.processes[0].killedSignals, []);
+    assert.deepEqual(openToolRecoveryDecisions(sink), ["no_evidence"]);
+  });
+});
+
+test("stalled direct-stdin runtime keeps waiting when the open call has no runtime id to match", async () => {
+  await withStalledOpenTool([{ classification: "completion_loss", processLiveness: "exited", processGroupLiveness: "exited" }], async ({ driver, ap, sink, deliver }) => {
+    ap.openToolCallIds.clear();
+    deliver();
+    await flush();
+    assert.deepEqual(driver.processes[0].killedSignals, []);
+    assert.deepEqual(openToolRecoveryDecisions(sink), ["no_evidence"]);
+  });
+});
+
+test("stalled direct-stdin runtime keeps waiting when an open call without a runtime id sits beside a matched one", async () => {
+  await withStalledOpenTool([{ classification: "completion_loss", processLiveness: "exited", processGroupLiveness: "exited" }], async ({ driver, ap, sink, deliver }) => {
+    // The matched bash call is safe, but a second open call carries no id.
+    driver.parsedLines.set("anon-start", [{ kind: "tool_call", name: "mcp__server__long_call", input: {} }]);
+    driver.processes[0].stdout.emit("data", Buffer.from("anon-start\n"));
+    await flush();
+    assert.equal(ap.gatedSteering.outstandingToolUses, 2);
+    assert.equal(ap.openToolCallIds.size, 1);
+    ap.runtimeProgress.markStale();
+    deliver();
+    await flush();
+    assert.deepEqual(driver.processes[0].killedSignals, []);
+    assert.deepEqual(openToolRecoveryDecisions(sink), ["no_evidence"]);
+  });
+});
+
+test("stalled direct-stdin runtime keeps waiting when the shell exited but its process group is alive", async () => {
+  await withStalledOpenTool([{ classification: "completion_loss", processLiveness: "exited", processGroupLiveness: "alive" }], async ({ driver, sink, deliver }) => {
+    deliver();
+    await flush();
+    assert.deepEqual(driver.processes[0].killedSignals, []);
+    assert.deepEqual(openToolRecoveryDecisions(sink), ["group_alive_blocked"]);
+  });
+});
+
+test("stalled direct-stdin runtime keeps waiting when the exited shell's process group cannot be probed", async () => {
+  await withStalledOpenTool([{ classification: "completion_loss", processLiveness: "exited", processGroupLiveness: "unknown" }], async ({ driver, sink, deliver }) => {
+    deliver();
+    await flush();
+    assert.deepEqual(driver.processes[0].killedSignals, []);
+    assert.deepEqual(openToolRecoveryDecisions(sink), ["no_evidence"]);
+  });
+});
+
+// Reconciler step 9: the fixed 5-minute recheck is gone; a blocked process
+// with queued work is decided again by the 10-minute sweep.
+test("blocked stalled recovery is re-checked by the sweep without a new message and restarts once the tool's work is gone", async () => {
+  await withStalledOpenTool([{ classification: "running_no_observed_progress", processLiveness: "alive" }], async ({ driver, ap, sink, tick, sweep, setSnapshots, advance }) => {
+    ap.inbox.push(makeMessage("queued before the stall"));
+    tick();
+    await flush();
+    assert.deepEqual(driver.processes[0].killedSignals, [], "the heartbeat decides nothing");
+    assert.deepEqual(openToolRecoveryDecisions(sink), [], "the heartbeat reads no tool snapshot for recovery");
+    await sweep();
+    assert.deepEqual(driver.processes[0].killedSignals, [], "alive tool: blocked");
+    assert.equal(ap.stallDeadlineTimer, undefined, "past the threshold and blocked: no deadline, the sweep decides again");
+    // The descendant finishes later; no further message arrives.
+    setSnapshots([{ classification: "completion_loss", processLiveness: "exited", processGroupLiveness: "exited" }]);
+    advance(10 * 60_000);
+    await sweep();
+    await waitFor(() => driver.spawnCalls.length === 2, "restart on the sweep");
+    assert.deepEqual(driver.processes[0].killedSignals, ["SIGTERM"]);
+    assert.deepEqual(openToolRecoveryDecisions(sink), ["alive_silent_blocked", "no_live_work"]);
+  });
+});
+
+test("stalled direct-stdin runtime never kills an alive silent tool for a queued message", async () => {
+  await withStalledOpenTool([{ classification: "running_no_observed_progress", processLiveness: "alive" }], async ({ driver, ap, sink, deliver }) => {
+    deliver();
+    await flush();
+    assert.equal(driver.spawnCalls.length, 1);
+    assert.deepEqual(driver.processes[0].killedSignals, []);
+    assert.equal(ap.inbox.length, 1, "the message waits for the tool");
+    assert.deepEqual(openToolRecoveryDecisions(sink), ["alive_silent_blocked"]);
+  });
+});
+
+test("stalled direct-stdin runtime keeps waiting on a tool with recent progress", async () => {
+  await withStalledOpenTool([{ classification: "running_with_recent_progress", processLiveness: "alive", progressState: "recent" }], async ({ driver, deliver }) => {
+    deliver();
+    await flush();
+    assert.equal(driver.spawnCalls.length, 1);
+    assert.deepEqual(driver.processes[0].killedSignals, []);
+  });
+});
+
+test("stalled direct-stdin runtime keeps waiting when tool liveness cannot be probed", async () => {
+  await withStalledOpenTool([{ classification: "pending_liveness_unknown", processLiveness: "unavailable" }], async ({ driver, sink, deliver }) => {
+    deliver();
+    await flush();
+    assert.deepEqual(driver.processes[0].killedSignals, []);
+    assert.deepEqual(openToolRecoveryDecisions(sink), ["no_evidence"]);
+  });
+});
+
+test("stalled direct-stdin runtime keeps waiting when only an untracked (non-bash) tool can be open", async () => {
+  await withStalledOpenTool([{ classification: "runtime_inactive_without_pending_tool", processLiveness: "not_spawned", toolPending: false }], async ({ driver, sink, deliver }) => {
+    deliver();
+    await flush();
+    assert.deepEqual(driver.processes[0].killedSignals, []);
+    assert.deepEqual(openToolRecoveryDecisions(sink), ["no_evidence"]);
+  });
+});
+
+test("stalled direct-stdin runtime without tool diagnostics keeps the open-tool block", async () => {
+  await withStalledOpenTool(null, async ({ driver, sink, deliver }) => {
+    deliver();
+    await flush();
+    assert.deepEqual(driver.processes[0].killedSignals, []);
+    assert.deepEqual(openToolRecoveryDecisions(sink), []);
+  });
+});
+
+test("the stall deadline recovers messages that were already queued, without waiting for another message", async () => {
+  await withStalledOpenTool([{ classification: "completion_loss", processLiveness: "exited", processGroupLiveness: "exited" }], async ({ driver, manager, ap, sink, tick }) => {
+    // Queued before the stall threshold: delivery cannot recover yet.
+    ap.inbox.push(makeMessage("queued before the stall"));
+    tick();
+    await flush();
+    assert.deepEqual(driver.processes[0].killedSignals, [], "stall detection is only a fact (row C15)");
+    // What progress or a turn start with queued work arms; already past the threshold, it fires at once.
+    (manager as any).armStallDeadlineForQueuedWork("agent-1", ap);
+    await waitFor(() => driver.spawnCalls.length === 2, "restart at the stall deadline");
+    assert.deepEqual(driver.processes[0].killedSignals, ["SIGTERM"]);
+    assert.deepEqual(openToolRecoveryDecisions(sink), ["no_live_work"]);
+  });
+});
+
+
+test("Pi empty response notice is visible while preserving stalled progress, errors, backoff and the running turn", async () => {
+  const driver = new FakeCodexDriver({ id: "builtin", supportsStdinNotification: true, busyDeliveryMode: "direct", startupReadiness: "initial_turn" });
+  await withManager(async ({ manager, sent }) => {
+    await manager.startAgent("agent-1", makeConfig({ runtime: "builtin", sessionId: "pi-session" }));
+    // Inspect the owning host state, not a reimplementation of its event reducer.
+    const ap = (manager as unknown as { agents: Map<string, {
+      runtimeProgress: import("./runtimeProgressState").RuntimeProgressState;
+      runtimeErrorDeliveryBackoff: { attempts: number; untilMs: number; reason: string | null };
+      startup: { kind: string };
+      gatedSteering: { isIdle: boolean };
+    }> }).agents.get("agent-1")!;
+    ap.runtimeProgress.markStale(123);
+    const classFence = () => (manager as any).lifecycleRecords.getRuntimeErrorClassFence("agent-1");
+    (manager as any).lifecycleRecords.setRuntimeErrorClassFence("agent-1", { attempts: 2, lastRuntimeError: "synthetic previous failure" });
+    ap.runtimeErrorDeliveryBackoff = { attempts: 2, untilMs: Date.now() + 100_000, reason: "runtime_error" };
+    const before = { at: ap.runtimeProgress.lastEventAt, kind: ap.runtimeProgress.lastEventKind,
+      stale: ap.runtimeProgress.staleSince, fence: structuredClone(classFence()),
+      backoff: structuredClone(ap.runtimeErrorDeliveryBackoff), startup: ap.startup.kind, idle: ap.gatedSteering.isIdle };
+    const state = createPiSdkEventMappingState("pi-session");
+    state.sessionAnnounced = true;
+    driver.parsedLines.set("pi-empty-notice", mapPiSdkEventToParsedEvents({ type: "message_end", message: {
+      role: "assistant", content: [], stopReason: "stop", api: "openai-completions", provider: "synthetic", model: "synthetic", timestamp: 1,
+      usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+    } } as AgentSessionEvent, state));
+    driver.processes[0].stdout.emit("data", Buffer.from("pi-empty-notice\n"));
+    await flush();
+    assert.deepEqual({ at: ap.runtimeProgress.lastEventAt, kind: ap.runtimeProgress.lastEventKind,
+      stale: ap.runtimeProgress.staleSince, fence: classFence(),
+      backoff: ap.runtimeErrorDeliveryBackoff, startup: ap.startup.kind, idle: ap.gatedSteering.isIdle }, before);
+    const notice = sent.filter((msg) => msg.type === "agent:activity").reverse().find((msg) => msg.entries?.some((e) => e.kind === "system" && e.title === "Pi response notice"));
+    assert.ok(notice, "generic system Activity must reach older Server-compatible wire");
+    assert.deepEqual(notice.entries, [{ kind: "system", title: "Pi response notice", text: "This model response contained no text or tool calls." }]);
+    assert.equal(projectFactActivity(notice), "working");
+    assert.equal(driver.encodedCalls.length, 0, "an observation cannot retry input or tools");
+  }, { driver });
+});
+
+
+test("an otherwise healthy Pi empty response remains running until settled, then returns to Idle without retry", async () => {
+  const driver = new FakeCodexDriver({ id: "builtin", supportsStdinNotification: true, busyDeliveryMode: "direct" });
+  await withManager(async ({ manager, sent }) => {
+    await manager.startAgent("agent-1", makeConfig({ runtime: "builtin", sessionId: "pi-session" }));
+    driver.parsedLines.set("empty", [{ kind: "runtime_diagnostic", severity: "info", source: "pi_empty_response", itemType: "empty_response", message: "This model response contained no text or tool calls." }]);
+    driver.processes[0].stdout.emit("data", Buffer.from("empty\n")); await flush();
+    assert.equal(projectFactActivity(sent.filter((msg) => msg.type === "agent:activity").at(-1)!), "working");
+    driver.parsedLines.set("settled", [{ kind: "turn_end", sessionId: "pi-session" }]);
+    driver.processes[0].stdout.emit("data", Buffer.from("settled\n")); await flush();
+    assert.equal(projectFactActivity(sent.filter((msg) => msg.type === "agent:activity").at(-1)!), "online");
+    assert.equal(driver.encodedCalls.length, 0);
+    assert.equal(sent.filter((msg) => msg.type === "agent:activity").some((msg) => projectFactActivity(msg) === "error"), false);
+  }, { driver });
+});
+
+// RFC 081: a per-turn runtime's start input carries the app Inbox notice as a
+// suffix. Inbox items on: the wake-up notice, the text a stdin runtime gets;
+// off: the count notice as before.
+for (const inboxItems of [true, false]) {
+  test(`deferred spawn: the start input's app Inbox suffix with inbox items ${inboxItems ? "on is the wake-up notice" : "off is the count notice"}`, async () => {
+    const store = createAgentAppInboxStore({ registry: REMINDER_AGENT_INBOX_REGISTRY });
+    const driver = new FakeCodexDriver({ id: "opencode", supportsStdinNotification: false, busyDeliveryMode: "none", deferSpawnUntilMessage: true });
+    await withManager(async ({ manager }) => {
+      assert.equal(await manager.notifyAgentAppInbox("agent-1", mintReminderAppItem(store, "1")), true);
+      await serverStart(manager, "agent-1", makeConfig({ runtime: "opencode", sessionId: "session-1", ...(inboxItems ? { inboxItems: true } : {}) }), "launch-1");
+      await waitFor(() => driver.spawnCalls.length === 1, "the server's start spawns the runtime");
+      const prompt = driver.spawnCalls[0]!.prompt;
+      if (inboxItems) {
+        // Launch time unknown (RFC 081 D9): the daemon section, never a `reminder:` row.
+        assert.ok(prompt.endsWith([
+          "",
+          "",
+          "[Raft inbox notice:",
+          "Inbox update: 1 message pending your read across all conversations; 1 changed target",
+          "",
+          "App items: 1",
+          "",
+          "app=system.reminder · class=due · item=reminder · retention=until_explicit_ack · sourceRef=reminder:11111111-1111-4111-8111-111111111111:1 · action=raft reminder ack --id 11111111 --revision 1",
+          "]",
+        ].join("\n")), prompt);
+        assert.doesNotMatch(prompt, /App items pending/);
+      } else {
+        assert.ok(prompt.endsWith("\n\n[Raft Inbox notice:\nApp items pending: 1\nRun `raft inbox check` to inspect them.]"), prompt);
+      }
+    }, { driver, appInboxForAgent: () => store });
+  });
+}

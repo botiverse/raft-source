@@ -1,3 +1,4 @@
+import type { ActiveSpan } from "@botiverse/raft-shared";
 import type { ParsedEvent } from "./drivers/index";
 import { createTurnTokenAccumulator, turnTokenTraceAttrs, type TurnTokenAccumulator } from "./runtimeTurnTokens";
 
@@ -15,6 +16,12 @@ export interface RuntimeTraceCounters {
   compactionFinishes: number;
   textEvents: number;
   thinkingEvents: number;
+  /** What the turn span carries: estimated bytes of the events kept, and the events left off it. */
+  spanEventBytes: number;
+  spanEventsDropped: number;
+  spanEventBytesDropped: number;
+  /** Set once an event did not fit: the span then takes no more, so what it keeps is the turn's first part. */
+  spanEventBudgetSpent: boolean;
 }
 
 export function createRuntimeTraceCounters(): RuntimeTraceCounters {
@@ -30,7 +37,82 @@ export function createRuntimeTraceCounters(): RuntimeTraceCounters {
     compactionFinishes: 0,
     textEvents: 0,
     thinkingEvents: 0,
+    spanEventBytes: 0,
+    spanEventsDropped: 0,
+    spanEventBytesDropped: 0,
+    spanEventBudgetSpent: false,
   };
+}
+
+/**
+ * The most event bytes one `daemon.runtime.turn` span carries. TeleScope drops
+ * a whole trace row over 8 MiB (`delivery.max_bytes`, the most it allows), and
+ * a long turn used to carry ~12 MB of events (#botiverse-raft-deployment:#208).
+ * Half the cap leaves room for the span's own attributes and the row mapping.
+ */
+export const TURN_SPAN_EVENT_BYTES_BUDGET = 4 * 1024 * 1024;
+/** One event bigger than this is left off the span on its own. */
+export const TURN_SPAN_EVENT_MAX_BYTES = 256 * 1024;
+
+/** The turn span's event cap: the budget for all its events, and the most one event may take. */
+export interface TurnSpanEventLimits {
+  budgetBytes: number;
+  maxEventBytes: number;
+}
+
+export const TURN_SPAN_EVENT_LIMITS: TurnSpanEventLimits = {
+  budgetBytes: TURN_SPAN_EVENT_BYTES_BUDGET,
+  maxEventBytes: TURN_SPAN_EVENT_MAX_BYTES,
+};
+
+function estimatedEventBytes(name: string, attrs: Record<string, unknown> | undefined): number {
+  let json: string;
+  try {
+    json = JSON.stringify(attrs ?? {}) ?? "";
+  } catch {
+    json = "";
+  }
+  return Buffer.byteLength(name) + Buffer.byteLength(json);
+}
+
+/**
+ * Whether an event still fits on the open turn span. Once the budget is spent
+ * every later event, and any one oversized event, is counted as dropped instead, and
+ * the span's end says how many and how big (`runtime_span_events_dropped_*`).
+ * The turn's counts and outcome stay on the span either way.
+ */
+export function admitTurnSpanEvent(
+  counters: RuntimeTraceCounters,
+  name: string,
+  attrs: Record<string, unknown> | undefined,
+  limits: TurnSpanEventLimits = TURN_SPAN_EVENT_LIMITS,
+): boolean {
+  const bytes = estimatedEventBytes(name, attrs);
+  if (!counters.spanEventBudgetSpent && bytes <= limits.maxEventBytes && counters.spanEventBytes + bytes > limits.budgetBytes) {
+    counters.spanEventBudgetSpent = true;
+  }
+  if (counters.spanEventBudgetSpent || bytes > limits.maxEventBytes) {
+    counters.spanEventsDropped++;
+    counters.spanEventBytesDropped += bytes;
+    return false;
+  }
+  counters.spanEventBytes += bytes;
+  return true;
+}
+
+/**
+ * Adds an event to an open `daemon.runtime.turn` span when it fits the span's
+ * cap (`admitTurnSpanEvent`). Both hosts add turn span events only through
+ * here, so a turn span carries the same bounded events whichever host ran it.
+ */
+export function addTurnSpanEvent(
+  span: Pick<ActiveSpan, "addEvent">,
+  counters: RuntimeTraceCounters,
+  name: string,
+  attrs: Record<string, unknown>,
+  limits?: TurnSpanEventLimits,
+): void {
+  if (admitTurnSpanEvent(counters, name, attrs, limits)) span.addEvent(name, attrs);
 }
 
 export function runtimeTraceCounterAttrs(
@@ -48,11 +130,20 @@ export function runtimeTraceCounterAttrs(
     runtime_compaction_finishes_count: counters.compactionFinishes,
     runtime_text_events_count: counters.textEvents,
     runtime_thinking_events_count: counters.thinkingEvents,
+    runtime_span_events_dropped_count: counters.spanEventsDropped,
+    ...(counters.spanEventsDropped > 0 ? { runtime_span_event_bytes_dropped: counters.spanEventBytesDropped } : {}),
     ...turnTokenTraceAttrs(counters.tokens),
   };
 }
 
-export function noteRuntimeTraceCounter(counters: RuntimeTraceCounters, event: ParsedEvent): void {
+/**
+ * Counts one runtime event on the open turn. Reads only its kind, named as a
+ * `ParsedEvent` kind (`tool_call`, `text`, ...): the OAR host, which never
+ * sees a `ParsedEvent`, passes the kinds its events stand for
+ * (`oarTurnTrace.ts`), and an event with no counterpart under its own kind,
+ * so it counts toward `events` only.
+ */
+export function noteRuntimeTraceCounter(counters: RuntimeTraceCounters, event: { readonly kind: ParsedEvent["kind"] | (string & {}) }): void {
   counters.events++;
   switch (event.kind) {
     case "tool_call":
@@ -100,7 +191,7 @@ export function runtimeToolingObservationAttrs(
 
 export function codexCommunicationGapAttrs(
   driverId: string,
-  counters: RuntimeTraceCounters,
+  counters: Pick<RuntimeTraceCounters, "textEvents" | "toolCalls" | "raftMessageSendAttempts" | "thinkingEvents">,
 ): Record<string, unknown> | null {
   if (
     driverId !== "codex"

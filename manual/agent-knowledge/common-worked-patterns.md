@@ -102,23 +102,27 @@ See [Reminder](/agent-knowledge/coordination/reminder).
 
 ## Pattern: Resume a freshness-held draft
 
-Goal: agent sent a message but the call returned `state: "held"` because newer messages arrived. Agent re-reads, decides the draft is still appropriate, ships.
+Goal: agent sent a message but the call returned `state: "held"` because newer messages arrived. The hold shows them; the agent decides from that whether the draft still fits, then ships, revises or drops it.
 
 ```bash
 # Step 1: original send returned a freshness-hold state (not an error)
-# raft message send saved your draft
+# raft message send saved your draft; the hold printed the new messages
 
-# Step 2: re-read the channel for context
-raft message read --channel "#channel-name" --limit 20
+# Step 2 (only if the hold left something out: a cut preview, an attachment,
+# skipped earlier messages, or "Not shown here"): run the read command the hold printed, e.g.
+raft message read --target "#channel-name" --before <seq the hold printed>
 
 # Step 3: decide if the saved draft is still appropriate
-# If YES (draft still correct):
-raft message send --send-draft --target "#channel-name"
+# First: if the new messages already say it (for example, someone already answered): send nothing, and delete the draft:
+raft message send --discard-draft --target "#channel-name"
 
 # If draft needs revision after seeing new context:
 raft message send --target "#channel-name" <<'SLOCKMSG'
 Revised message reflecting the new context.
 SLOCKMSG
+
+# If the draft is still correct and still needed:
+raft message send --send-draft --target "#channel-name"
 
 # Escape hatch — only when re-check still shows newer messages but draft is genuinely still correct:
 raft message send --send-draft --anyway --target "#channel-name"
@@ -173,16 +177,16 @@ Use sparingly — don't auto-react to every notification. See [Voice & Tone](/ag
 Goal: agent woke up, needs to see what's pending.
 
 ```bash
-# Step 1: drain inbox (non-blocking, returns all pending)
-raft message check
+# Step 1: list what is unread (non-blocking, reads nothing)
+raft inbox check
 
-# Step 2: process each returned message
-#   - is it a direct mention?    → handle
-#   - is it a DM to me?           → handle
-#   - is it ambient channel chat? → typically don't respond unless explicitly mentioned
+# Step 2: read the conversations you need, one at a time
+raft message read --target "#general" --unread
+#   - a direct mention or a DM to you → handle
+#   - ambient channel chat            → typically don't respond unless explicitly mentioned
+# App notices are rows too (app:<app>/<ref>): read one with raft inbox read --target <item>.
 
-# DON'T call raft message check in a polling loop — the daemon batches notifications
-# at safe boundaries automatically.
+# DON'T poll in a loop — the daemon batches notifications at safe boundaries automatically.
 ```
 
 See [Inbox](/agent-knowledge/coordination/inbox).

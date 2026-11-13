@@ -31,16 +31,6 @@ import { countIngest, rememberEventUuid } from "./productEventIngest";
 import type { ProductEventContext } from "./productEventContext";
 import type { ProductEventRow, ProductEventSink, PublicVisitorSink } from "./productEventScopeDbWriter";
 
-/** Default off. Turned on per visited server once the privacy policy covers it. */
-export const PUBLIC_VISIT_COUNTS_FEATURE_FLAG_KEY = "public_server_visit_counts_v0";
-
-/**
- * Default off. The cookie banner and the visitor id that follows consent
- * (cindyz, 2026-10-14). Only together with the counting flag above, and only
- * once the privacy policy and banner copy are published.
- */
-export const PUBLIC_VISITOR_ID_FEATURE_FLAG_KEY = "public_visitor_id_v0";
-
 /**
  * Shared cap per visited server per UTC day, across replicas (Redis). Past it,
  * visits are dropped: a server-day with this many rows reads as "at least".
@@ -57,16 +47,18 @@ export type PublicVisitor = (typeof PUBLIC_SERVER_VISITORS)[number];
 
 interface VisitTarget {
   serverId: ServerId;
-  /** The visited server's own product-analytics switch (gate, §9.5 strict). */
+  /**
+   * The visited server's own product-analytics switch (gate, §9.5 strict).
+   * Also gates the cookie banner and the visitor id that follows consent
+   * (cindyz, 2026-10-14): only where visits are counted.
+   */
   workspaceEnabled: boolean;
-  /** Consenting visitors' ids may be kept (PUBLIC_VISITOR_ID_FEATURE_FLAG_KEY). */
-  visitorIdEnabled: boolean;
 }
 
-/** Why a slug is not counted: no public server by that slug, or its flags are off. */
+/** Why a slug is not counted: no public server by that slug, or public_server_v0 is off for it. */
 type NoVisitTarget = "no_target" | "flag_off";
 
-// replica-local: a 30 s view of "public + flags on + switch", so a flood of
+// replica-local: a 30 s view of "public + flags + switch", so a flood of
 // visits does not become a flood of flag evaluations. Turning any of them off
 // takes effect within the TTL.
 const targetCache = new Map<string, { target: VisitTarget | NoVisitTarget; expiresAt: number }>();
@@ -79,13 +71,9 @@ async function loadVisitTarget(slug: string): Promise<VisitTarget | NoVisitTarge
     .limit(1);
   if (!row) return "no_target";
   const serverId = row.id as ServerId;
-  const [publicGate, countsGate, visitorIdGate] = await Promise.all([
-    evaluateFeatureFlag({ key: PUBLIC_SERVER_FEATURE_FLAG_KEY, serverId, platform: "web" }),
-    evaluateFeatureFlag({ key: PUBLIC_VISIT_COUNTS_FEATURE_FLAG_KEY, serverId, platform: "web" }),
-    evaluateFeatureFlag({ key: PUBLIC_VISITOR_ID_FEATURE_FLAG_KEY, serverId, platform: "web" }),
-  ]);
-  if (!publicGate.enabled || !countsGate.enabled) return "flag_off";
-  return { serverId, workspaceEnabled: row.workspaceEnabled, visitorIdEnabled: visitorIdGate.enabled };
+  const publicGate = await evaluateFeatureFlag({ key: PUBLIC_SERVER_FEATURE_FLAG_KEY, serverId, platform: "web" });
+  if (!publicGate.enabled) return "flag_off";
+  return { serverId, workspaceEnabled: row.workspaceEnabled };
 }
 
 async function resolveVisitTarget(slug: string, now: number): Promise<VisitTarget | NoVisitTarget> {
@@ -320,7 +308,7 @@ export async function recordPublicVisit(
   // Logged-out visits only: a signed-in visitor is linked to an account only
   // when they join (recordPublicServerJoin), never on a view.
   const anonymousId = visitorIdOf(input.anonymousId);
-  if (visitor === "anonymous" && anonymousId && target.visitorIdEnabled && visitorSink) {
+  if (visitor === "anonymous" && anonymousId && visitorSink) {
     visitorSink.enqueue([{
       uuid: input.uuid,
       event: input.event,
@@ -335,7 +323,7 @@ export async function recordPublicVisit(
 /** Whether a public page should offer the cookie banner (GET /api/public/servers/:slug). */
 export async function publicVisitorIdOffered(slug: string, now: number = Date.now()): Promise<boolean> {
   const target = await resolveVisitTarget(slug, now);
-  return typeof target !== "string" && target.workspaceEnabled && target.visitorIdEnabled;
+  return typeof target !== "string" && target.workspaceEnabled;
 }
 
 export type PublicServerJoinOutcome = "written" | "no_target" | "gated" | "unconfigured";
@@ -364,7 +352,7 @@ export async function recordPublicServerJoin(
   const uuid = randomUUID();
   const at = new Date(now).toISOString();
   const anonymousId = visitorIdOf(input.anonymousId);
-  const hasVisitorId = anonymousId !== null && target.visitorIdEnabled && visitorSink !== null;
+  const hasVisitorId = anonymousId !== null && visitorSink !== null;
   sink.enqueue([{
     uuid,
     event: "public_page_server_joined",

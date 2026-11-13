@@ -1,22 +1,32 @@
 export { verifyBundledPiOAuth } from "./bundledPiOAuth";
 export { verifyBundledKimiSdk } from "./drivers/index";
+export { verifyBundledOarHost } from "./oarLoader";
+import { applyDaemonConnectAttemptTimeout } from "./connectAttemptTimeout";
 import {
   observeRuntimeCliVersions,
   readRuntimeCliVersionState,
+  runtimeCliVersionDrift,
   writeRuntimeCliVersionState,
 } from "./runtimeCliVersionTracker";
 import path from "node:path";
+import { resolveWorkspaceDirectoryPath } from "./workspaces";
+import { readVolumeCapacity } from "./volumeCapacity";
 import os from "node:os";
 import { createHash, randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
 import { accessSync } from "node:fs";
-import { mkdir, readFile, rename, rm, statfs, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { Readable } from "node:stream";
 import {
+  type FeedbackTranscriptSessionLookup,
+  runtimeSessionHomeEnvVars,
   createTraceScopeTracer,
-  AGENT_MIGRATION_CAPABILITY,
+  COMPUTER_CAPABILITY_SERVICE_IPC_UNREACHABLE,
   COMPUTER_CAPABILITY_SUPERVISOR_MUTATIONS,
+  clampComputerUpgradeDrain,
+  DAEMON_CAPABILITY_COMPUTER_UPGRADE_DRAIN_V1,
+  type ComputerUpgradeDrainRequest,
   currentDate,
   currentTimeMs,
   errorClassOf,
@@ -28,6 +38,10 @@ import {
   type ActiveSpan,
   type AgentConfig,
   type ComputerLastUpgradeReceipt,
+  type ComputerInstallerRepairHint,
+  type ComputerMigratedFrom,
+  isComputerMigratedFrom,
+  type LegacyCredentialExposureReport,
   type ComputerLifecycleExecutionAck,
   type AgentMigrationTransportLeaseMessage,
   type AgentMigrationTransportReady,
@@ -44,12 +58,77 @@ import {
   type TraceStatus,
   type Tracer,
   DAEMON_CAPABILITY_SEQUENCED_STATUS,
+  DAEMON_CAPABILITY_INTERRUPT_SUBAGENT,
+  DAEMON_CAPABILITY_INTERRUPT_TURN,
+  DAEMON_CAPABILITY_RUNTIME_AUTH,
+  DAEMON_CAPABILITY_RUNTIME_AUTH_V2,
+  DAEMON_CAPABILITY_RUNTIME_AUTH_QWEN_PROVIDER,
+  DAEMON_CAPABILITY_RUNTIME_AUTH_ANTIGRAVITY,
+  DAEMON_CAPABILITY_RUNTIME_AUTH_ANTIGRAVITY_LOGOUT,
+  DAEMON_CAPABILITY_RUNTIME_AUTH_PI,
+  DAEMON_CAPABILITY_RUNTIME_AUTH_GROK,
+  DAEMON_CAPABILITY_RUNTIME_AUTH_OPENCODE,
+  DAEMON_CAPABILITY_RUNTIME_AUTH_CODEBUDDY,
+  DAEMON_CAPABILITY_RUNTIME_LIMIT_RESET,
+  DAEMON_CAPABILITY_RUNTIME_ACCOUNT_USAGE_ANTIGRAVITY,
+  DAEMON_CAPABILITY_RUNTIME_LIMIT_RESET_CLAUDE_KINDS,
+  DAEMON_CAPABILITY_STARTUP_READINESS,
+  SERVER_CAPABILITY_RUNTIME_ACCOUNT_USAGE_LIMIT_RESETS_V1,
+  SERVER_CAPABILITY_RUNTIME_ACCOUNT_USAGE_WINDOW_SCOPE_V1,
+  SERVER_CAPABILITY_RUNTIME_ACCOUNT_USAGE_WINDOW_SCOPE_V2,
+  isRuntimeAccountUsageProvider,
+  isRuntimeLimitResetIdempotencyKey,
+  isRuntimeLimitResetKind,
+  type RuntimeLimitResetIdempotencyKey,
+  type RuntimeLimitResetKind,
+  type RuntimeLimitResetsReadResult,
+  withoutLimitResets,
+  withoutModelsScopes,
+  withoutWindowScopes,
+  claudeFiveHourLimitOf,
+  type RuntimeLimitResetResult,
+  type RuntimeAuthRuntime,
+  asRuntimeAuthLoginId,
+  isRuntimeAuthPastedCode,
+  isRuntimeAuthRuntime,
+  parseRuntimeAuthProviderConnectInput,
+  runtimeAuthLoginRegionFits,
+  runtimeAuthOAuthMethodFits,
+  runtimeAuthProviderIdFits,
+  runtimeAuthSupports,
   isValidMachineDiskStatus,
   DAEMON_CAPABILITY_RUNTIME_OUTCOME_V1,
+  DAEMON_CAPABILITY_TASK_CREATE_FRESHNESS,
+  DAEMON_CAPABILITY_RUNTIME_HOST_OAR,
+  DAEMON_CAPABILITY_RUNTIME_HOST_OAR_CODEX,
+  DAEMON_CAPABILITY_RUNTIME_HOST_OAR_CURSOR,
+  DAEMON_CAPABILITY_RUNTIME_HOST_OAR_GROK,
+  DAEMON_CAPABILITY_AGENT_CONTEXT_VIEW_V0,
+  DAEMON_CAPABILITY_AGENT_CONTEXT_SEARCH_V0,
+  DAEMON_CAPABILITY_AGENT_CONTEXT_VIEW_CODEX_ROOT_V1,
+  DAEMON_CAPABILITY_RUNNER_CREDENTIAL_RECONCILE_V1,
+  DAEMON_CAPABILITY_AGENT_CONFIG_PUSH,
+  DAEMON_CAPABILITY_CONTROL_START_CATCHUP_V1,
+  DAEMON_CAPABILITY_MODEL_LIMITS_REPORT_V1,
   SERVER_CAPABILITY_RUNTIME_OUTCOME_ACK_V1,
+  SERVER_CAPABILITY_AGENT_SEND_INTENT_V1,
+  SERVER_CAPABILITY_TURN_ENDED_V1,
+  SERVER_CAPABILITY_STICKY_FAILURE_REASONS_V1,
+  SERVER_CAPABILITY_RUNTIME_CREDENTIALS_CHANGED_V1,
+  SERVER_CAPABILITY_RUNTIME_READINESS_V1,
+  runtimeAuthRuntimeFor,
+  SERVER_CAPABILITY_TASK_WRITE_LANDING_V1,
+  SERVER_CAPABILITY_IDLE_TASK_REMINDER_V1,
   SERVER_CAPABILITY_RUNTIME_DETECTION_ASYNC_V1,
   type RuntimeDetectionReport,
   SERVER_CAPABILITY_START_SPAWN_ERROR_V1,
+  SERVER_CAPABILITY_SERVER_FEATURES_V1,
+  SERVER_CAPABILITY_MIGRATION_BACKUP_IGNORE_SOURCES_V1,
+  SERVER_CAPABILITY_MIGRATION_USER_IGNORE_RECEIPT_V1,
+  SERVER_CAPABILITY_MIGRATION_SOURCE_DRAIN_PROGRESS_V1,
+  type AgentMigrationSourceDrainWaitingFor,
+  MIGRATION_USER_IGNORE_WRITE_FAILED,
+  type AgentMigrationUserIgnoreAdditionsReceipt,
   type AgentStartNotSpawnedReason,
 } from "@botiverse/raft-shared";
 import {
@@ -67,8 +146,19 @@ import {
   APP_SNAPSHOT_TRACE_IDENTITY_KEYS,
   APP_SOURCE_TRACE_IDENTITY_KEYS,
 } from "@botiverse/raft-shared/src/appRuntimeTrace";
+import { setAgentProcJobManager, setAgentProxyServerChecksTaskWriteLanding } from "./agentCredentialProxy";
+import { ProcJobManager, procStopReasonForAgentStop, type ProcStopReason } from "./procJobs";
 import { AgentProcessManager, classifySpawnFailure, StaleDispatchError, type RuntimeProcessGate } from "./agentProcessManager";
-import { getDriver } from "./drivers/index";
+import { AgentEnvVarsNotAllowedError, OarOnlyStartError } from "./spawnFailureErrors";
+import { AgentConfigRevisions } from "./agentConfigRevisions";
+import { AgentHostRouter, runtimeLabel } from "./agentHost/agentHostRouter";
+import { ComputerUpgradeDrainChannel, type ComputerUpgradeDrainPaths } from "./computerUpgradeDrain";
+import { clampAgentDrainDeadlineMs, type AgentDrainSummary } from "./agentDrain";
+import type { AgentNotIdleReason } from "./agentIdle";
+import type { AgentLifecycleHost } from "./agentHost/agentLifecycleHost";
+import { isOarHostEnabled, OAR_HOST_DISABLED_ENV, OarAgentHost, type OpenOarSession } from "./agentHost/oarAgentHost";
+import { ExitStreaks } from "./planExit";
+import { getDriver, resolveKimiHome, runtimeIdsShippedWithComputer } from "./drivers/index";
 import type { RuntimeProbeUnavailableReason } from "./drivers/types";
 import { readCommandVersion, resolveCommandOnPath } from "./drivers/probe";
 import {
@@ -78,6 +168,7 @@ import {
   type Clock,
 } from "./connection";
 import { createAgentAppInboxStore, type AgentAppInboxStore } from "./agentAppInbox";
+import { isServerContextMessage } from "./agentRuntimeInput";
 import {
   createScopedAppStorageFactory,
   type ScopedAppStorageFactory,
@@ -93,6 +184,7 @@ import {
 import { runRuntimeDetectionRound, type RuntimeDetectionRoundHandle, type RuntimeDetectionRoundOptions, type RuntimeDetectionRoundResult } from "./runtimeDetectionRound";
 import { logger } from "./logger";
 import { runFeedbackTranscriptRequest } from "./feedbackTranscriptOutcomeUpload";
+import { feedbackTranscriptCollectorErrorResult } from "./feedbackTranscriptCollector";
 import {
   acquireDaemonMachineLock,
   resolveDefaultMachineStateRoot,
@@ -109,10 +201,20 @@ import {
   type TraceJitter,
 } from "@botiverse/raft-trace-client";
 import { DaemonTraceBundleUploader } from "./traceBundleUpload";
+import { acceptServerTraceUploadUrl, resolveMachineTraceUploadUrl, resolveTraceUploadUrl, type ServerTraceUploadUrlRejection } from "./traceUploadUrl";
 import { ProbeGate } from "./probeGate";
+import { ServerFeaturesRefresh, type ServerFeaturesRefreshOptions } from "./serverFeaturesRefresh";
+import { cursorSdkAvailable, loadOarOpencodeProviderAuth, loadOarPiProviderAuth, loadOarQwenProviderAuth, loadOarRuntime } from "./oarLoader";
+import { OPENCODE_LOGIN_TIMEOUT_MS, OPENCODE_SIGN_IN_IDLE_MS, OPENCODE_SIGN_IN_TIMEOUT_MS, OpencodeSignIn } from "./runtimeAuth/opencodeProviderSignIn";
+import { piSignInDeviceId, piSignInPaths } from "./runtimeAuth/piSignInStore";
+import { RuntimeAuthHost, runtimeAuthRuntimesReadBy } from "./runtimeAuth/runtimeAuthHost";
+import { loadKimiSdkAuth, readKimiCodeSignInStatus } from "./runtimeAuth/kimiSdkAuth";
+import { readKimiSdkUsage } from "./runtimeAccountUsage/kimiSdkUsage";
 import { RuntimeModelSourceCache, type RuntimeModelCacheRead } from "./runtimeModels/modelSourceCache";
 import { RAFT_HOME_ENV, SLOCK_HOME_ENV, listLegacyRaftStatePaths, resolveRaftHome, resolveRaftHomePath } from "./raftHome";
-import { regenerateExistingOpencliWrappers } from "./drivers/cliTransport";
+import { regenerateExistingOpencliWrappers, removeStaleAgentTokenFiles } from "./drivers/cliTransport";
+import { migrateAllLegacyBridgeArtifacts } from "./legacyBridgeArtifacts";
+import { isLegacyMachineKey, legacyCredentialExposureForReady, recordLegacyCredentialExposure } from "./legacyCredentialExposure";
 import { daemonFetch } from "./daemonFetch";
 import {
   buildProviderProbeResultMessage,
@@ -126,6 +228,8 @@ import { VERSION as PI_SDK_VERSION } from "@earendil-works/pi-coding-agent";
 import { asProviderProbeId } from "@botiverse/raft-shared";
 import { assertLegacyDaemonKeyNotAdoptedByComputer } from "./computerMigrationGuard";
 import { PROCESS_MEMORY_TRACE_ATTRS, serviceMemoryAttrs, startProcessMemoryReporter } from "./processMemory";
+import { readMachineMemoryStatus } from "./machineMemory";
+import { piSessionMemoryAttrs } from "./drivers/piSessionMemory";
 import { buildRuntimeModelSourceResultMessage } from "./runtimeModelSourceProjection";
 import {
   archiveCompletedAgentMigrationSourceWorkspace,
@@ -141,6 +245,7 @@ import {
   type RaftDiskFootprint,
 } from "./raftDiskJanitor";
 import type { AgentMigrationExportProgress } from "./agentMigrationExport";
+import { AgentMigrationUserIgnoreWriteError, writeAgentMigrationUserIgnoreAdditions } from "./agentMigrationUserIgnore";
 import {
   AgentMigrationChunkDigestMismatchError,
   classifyAgentMigrationTargetResidue,
@@ -159,33 +264,51 @@ import {
 
 export * from "./legacySupervisor";
 import { hostOsVariant } from "./osVariant";
-import { hostDeviceClass, knownHostDeviceClass } from "./deviceClass";
+import { hostFacts, knownHostFacts } from "./hostFacts";
+import { daemonInstallFacts } from "./daemonInstallFacts";
 import { hostIdHash } from "./hostIdentity";
 import { readSecretFileSync } from "./secretFile";
 import { RecentDeliveryIds } from "./recentDeliveryIds";
+import { CredentialDiskWatch, type CredentialDiskWatchDeps } from "./credentialDiskWatch";
+import { RUNTIME_READINESS_FILE, RuntimeReadinessStore } from "./runtimeReadinessStore";
+import { runSecurityCommand } from "./credentialSource";
+import { ambientProcessEnv } from "./processEnvPatch";
+import { DAEMON_MIGRATION_TRANSPORT_CAPABILITIES } from "./migrationTransportCapabilities";
 import {
   createRuntimeAccountUsageCollector,
   type RuntimeAccountUsageCollector,
 } from "./runtimeAccountUsage/collector";
+import {
+  claudeLimitResetsDrivable,
+  createRuntimeLimitResetRedeemer,
+  createRuntimeLimitResetsReader,
+  type RuntimeLimitResetRedeemer,
+  type RuntimeLimitResetReport,
+  type RuntimeLimitResetsReader,
+} from "./runtimeAccountUsage/limitReset";
 
-/**
- * Default endpoint for daemon trace bundle uploads. Always baked as the
- * fallback when no explicit URL is configured — per product decision, the
- * same hosted URL applies across environments (real users connect to
- * hosted prod anyway), with two explicit escape hatches:
- *
- *   1. `SLOCK_DAEMON_TRACE_UPLOAD_DISABLED=1` — highest priority off-switch
- *   2. `SLOCK_DAEMON_TRACE_UPLOAD_URL` — explicit override for any env
- *
- * Self-host / staging / play / local deployments that want no upload must
- * set `DISABLED=1`; those that want their own worker set the URL explicitly.
- */
-const DEFAULT_TRACE_UPLOAD_URL = "https://slock-trace-upload.botiverse.dev";
 const RUNNER_CREDENTIAL_SCOPES = ["send", "read", "mentions", "tasks", "reactions", "server", "channels", "knowledge", "mcp"] as const;
 const RUNNER_CREDENTIAL_MINT_MAX_ATTEMPTS = 3;
 const RUNNER_CREDENTIAL_MINT_RETRY_DELAY_MS = 250;
+/** The feedback transcript result under RAFT_PRIVACY_MODE (feedbackTranscriptCollectorErrorResult). */
+export const FEEDBACK_TRANSCRIPT_PRIVACY_MODE_ERROR = "privacy mode is on: no feedback transcript is collected";
 const MIGRATION_OBJECT_STORE_DOWNLOAD_RETRY_INITIAL_MS = 25;
 const MIGRATION_OBJECT_STORE_DOWNLOAD_RETRY_MAX_MS = 250;
+// The target polls for the source's control while the source packs and
+// uploads, which can take many minutes. The poll starts at 25 ms and doubles,
+// so a quick migration is noticed within a few seconds; past ~25 s of waiting
+// it settles at one request per 15 s. The server cannot push "control ready",
+// so this cap is the most latency a long wait adds once the upload completes
+// (small next to the minutes already spent), and it bounds one waiting target
+// to ~4 requests a minute instead of ~30 (2 s cap). The lease TTL (hours) is
+// far longer, and the last sleep is clamped to the lease's remaining time.
+const MIGRATION_CONTROL_WAIT_RETRY_INITIAL_MS = MIGRATION_OBJECT_STORE_DOWNLOAD_RETRY_INITIAL_MS;
+const MIGRATION_CONTROL_WAIT_RETRY_MAX_MS = 15_000;
+// A chunk transfer that gets no HTTP response at all for this long means this
+// Computer cannot reach object storage (proxy, firewall, outage). Give up so
+// the migration fails with that reason instead of retrying until the lease
+// expires hours later.
+const MIGRATION_OBJECT_STORE_UNREACHABLE_MS = 5 * 60 * 1000;
 // Matches the source's upload concurrency.
 const MIGRATION_TARGET_CHUNK_DOWNLOAD_CONCURRENCY = 3;
 /** A chunk whose bytes keep failing their digest is corrupt, not a network blip. */
@@ -226,7 +349,11 @@ function isRetryableChunkBodyError(error: unknown): boolean {
   return false;
 }
 const DISK_STATUS_FIRST_REPORT_DELAY_MS = 60_000;
+/** Reconciler step 15 (B13): how long after a missing-runtime local stop the daemon re-detects runtimes. */
+export const RUNTIME_ABSENT_REDETECT_DELAY_MS = 10_000;
 const DISK_STATUS_REPORT_INTERVAL_MS = 60 * 60 * 1_000;
+// Memory moves faster than disk; the machine picker reads the latest report.
+const MEMORY_STATUS_REPORT_INTERVAL_MS = 5 * 60 * 1_000;
 const STUCK_TOOL_V0_IDENTITY_ATTRS = [
   "schema_version",
   "server_id",
@@ -248,6 +375,18 @@ const STUCK_TOOL_V0_IDENTITY_ATTRS = [
   "tool_class",
 ] as const;
 
+/** The most limit resets any account in a usage snapshot reports (Codex); absent when none reports a count. */
+function limitResetsAvailableAttr(snapshot: RuntimeAccountUsageSnapshot): { limit_resets_available?: number } {
+  const counts = snapshot.accounts.flatMap((account) => (account.limitResetsAvailable === undefined ? [] : [account.limitResetsAvailable]));
+  return counts.length === 0 ? {} : { limit_resets_available: Math.max(...counts) };
+}
+
+/**
+ * The retire runs ~20 s after the service start, and once more 10 min after a
+ * passing failure (deviceSessionRetire.ts): look at the report again after each.
+ */
+const DEVICE_SESSION_RETIRE_LATE_FLUSHES_MS = [60_000, 11 * 60_000] as const;
+
 export const DAEMON_CORE_TRACE_ATTR_CONTRACTS = {
   // task #1127. Registering this span is also how "never record argument
   // values" stops being a promise: the contract filter drops anything not
@@ -260,6 +399,73 @@ export const DAEMON_CORE_TRACE_ATTR_CONTRACTS = {
       "model",
     ],
   },
+  // The user's ignore additions on a migration source: counts and the failure
+  // reason only; the filter keeps a path or the user's name from being attached.
+  "daemon.migration_transport.user_ignore": {
+    spanAttrs: [
+      "migration_ref",
+      "role",
+      "transfer_kind",
+      "stage",
+      "outcome",
+      "written_count",
+      "already_present_count",
+      "rejected_count",
+      "reason",
+      "http_status",
+    ],
+  },
+  // task #17: web login / logout. Runtime, outcome and counts only; the
+  // contract filter keeps a link, code or account from ever being attached.
+  // Per runtime: status, then how it is signed in as OAR names it (labels and
+  // closed sets only, never the account). These four were emitted since #11069
+  // but missing here, so the filter dropped them (#oar-raft:eea998ea).
+  "daemon.runtime_auth.status.reported": {
+    spanAttrs: ["trigger", ...(["claude", "codex", "kimi", "qoder", "qwen", "antigravity", "pi", "grok", "opencode", "codebuddy"] as const).flatMap((runtime) => [
+      runtime,
+      `${runtime}_method`,
+      `${runtime}_plan`,
+      `${runtime}_sign_in_kind`,
+      `${runtime}_billing_kind`,
+    ])],
+  },
+  "daemon.runtime_auth.message_dropped": { spanAttrs: ["type"] },
+  // provider_id: Pi's provider (pi's /login id, a short checked pattern), never anything signed in.
+  "daemon.runtime_auth.login.started": { spanAttrs: ["runtime", "region", "provider_id"] },
+  "daemon.runtime_auth.login.event": { spanAttrs: ["kind"] },
+  "daemon.runtime_auth.login.event_dropped": { spanAttrs: ["kind"] },
+  "daemon.runtime_auth.login.code_dropped": { spanAttrs: ["reason"] },
+  // error_kind: OpenCode's only (OAR's closed error kinds, or the queue's), never a message.
+  "daemon.runtime_auth.login.result": { spanAttrs: ["runtime", "provider_id", "outcome", "reason", "error_kind", "code_prompts", "duration_ms"] },
+  "daemon.runtime_auth.logout.result": { spanAttrs: ["runtime", "provider_id", "outcome", "reason", "error_kind", "duration_ms"] },
+  "daemon.runtime_auth.rescan_models.failed": { spanAttrs: ["runtime"] },
+  // Qwen Code's provider list and connect: the provider id (Qwen's menu id),
+  // the outcome and OAR's error kind. Never the key, an endpoint or a model.
+  "daemon.runtime_auth.providers.result": { spanAttrs: ["runtime", "outcome", "reason", "error_kind", "provider_count", "duration_ms"] },
+  "daemon.runtime_auth.connect_provider.result": { spanAttrs: ["runtime", "provider_id", "outcome", "reason", "error_kind", "duration_ms"] },
+  // #proj-raft-computer:#46: what a successful login or provider connect
+  // released on that runtime's shared credential (invalid records, provider
+  // limit and the waits it armed). Counts and closed reasons only.
+  "daemon.runtime_auth.credentials_changed.listener_failed": { spanAttrs: ["runtime", "reason"] },
+  // Reconciler step 15: an invalid credential released because its source
+  // changed on disk. The runtime and kinds only: never a path (a home path
+  // can hold a user name), a digest or content.
+  "daemon.credential.disk_change_release": {
+    spanAttrs: ["runtime", "credential_key_kind", "source_kind", "release_cause", "credential_invalid_released", "credential_invalid_reason"],
+  },
+  // Reconciler step 15: a released credential signs in as another account,
+  // so the live process restarts. Booleans only: never an account id.
+  "daemon.agent.credential_account.restart": {
+    spanAttrs: ["agentId", "runtime", "launchId", "release_cause", "account_changed", "account_unknown", "held_count", "host"],
+  },
+  "daemon.agent.runtime_credentials_changed.cleared": {
+    spanAttrs: ["runtime", "reason", "release_cause", "credential_invalid_released", "credential_invalid_reason", "provider_limit_backoffs_cleared", "live_backoffs_ended", "cooldowns_ended"],
+  },
+  // Reconciler step 15 (B12): live processes on another runtime CLI version
+  // than the last detection. Versions and a count only, never agent ids.
+  "daemon.agent.cli_version_drift": {
+    spanAttrs: ["runtime", "from_version", "to_version", "direction", "live_agents", "from_versions"],
+  },
   "daemon.runtime_account_usage.refresh": {
     spanAttrs: [
       "outcome",
@@ -269,7 +475,22 @@ export const DAEMON_CORE_TRACE_ATTR_CONTRACTS = {
       "window_count",
       "health_classes",
       "parse_unavailable_count",
+      // #oar-raft:#3: the most limit resets any account reports (Codex), when one reports a count.
+      "limit_resets_available",
       "error_class",
+    ],
+  },
+  // A limit-reset redeem from the web: the provider, the wire outcome and its
+  // reason, OAR's own answer before the mapping (`oar_outcome`, e.g.
+  // `not_attempted:busy`), and whether the usage read after it was sent.
+  // Never the key. Claude adds the kind clicked and whether Claude's older
+  // program spent its 5-hour reset unasked; `operation: "read"` is a read of
+  // the resets held, with Claude Code's version and counts of kinds by state.
+  // Never screen text.
+  "daemon.runtime_account_usage.limit_reset": {
+    spanAttrs: [
+      "outcome", "provider", "reason", "snapshot_sent", "limit_resets_available", "duration_ms",
+      "operation", "reset_kind", "claude_version", "oar_outcome", "program", "five_hour_spent", "available_kinds", "unknown_kinds",
     ],
   },
   "daemon.app_config.receive": {
@@ -286,6 +507,11 @@ export const DAEMON_CORE_TRACE_ATTR_CONTRACTS = {
   },
   "daemon.app_inbox.ack": {
     spanAttrs: [...APP_SOURCE_TRACE_IDENTITY_KEYS, "outcome", "retention"],
+  },
+  // #wg-ax:#17: one run of the reminder-server-ack@1 backfill (acks a daemon
+  // before the token held only locally, sent to the Server). Counts only.
+  "daemon.app_inbox.server_ack_backfill": {
+    spanAttrs: ["owner_agent_id", "attempted", "accepted", "refused", "failed", "remaining", "done"],
   },
   "daemon.agent.app_inbox_notice": {
     spanAttrs: [
@@ -439,6 +665,21 @@ export const DAEMON_CORE_TRACE_ATTR_CONTRACTS = {
   "daemon.lifecycle.stop": {
     spanAttrs: ["machine_lock_present", "shutdown_reason", "stop_source", "stop_signal", "uptime_ms"],
   },
+  // This daemon took over a machine lock another owner left behind (once per
+  // process, right after acquiring it). No pid, no path: why it was stale
+  // (owner_dead, pid_reused, incomplete), the platform, and for a reused
+  // pid how it was told (the owner's recorded start identity, or its start
+  // time against the lock's startedAt).
+  "daemon.machine_lock.reclaimed": {
+    spanAttrs: ["reason", "platform", "identity_source"],
+  },
+  // A runner of this Computer exited on the machine lock (the Computer
+  // service recorded it); relayed by whichever runner connects next, once.
+  // Whether that daemon could read the owner pid's start and the lock's
+  // age bucket; never which pid, path or server.
+  "daemon.machine_lock.conflict": {
+    spanAttrs: ["platform", "owner_start_readable", "lock_age_days"],
+  },
   "daemon.process.memory": {
     spanAttrs: [...PROCESS_MEMORY_TRACE_ATTRS],
   },
@@ -451,6 +692,9 @@ export const DAEMON_CORE_TRACE_ATTR_CONTRACTS = {
   },
   "daemon.runner_credential_mint.failed": {
     spanAttrs: ["agentId", "runtime", "http_status", "code", "reason", "retryable", "max_attempts"],
+  },
+  "daemon.agent.spawn.risky_variables": {
+    spanAttrs: ["agentId", "runtime", "risky_variable_names", "invalid_variable_name_count"],
   },
   "daemon.agent.spawn.failed": {
     spanAttrs: [
@@ -465,7 +709,9 @@ export const DAEMON_CORE_TRACE_ATTR_CONTRACTS = {
     ],
   },
   "daemon.runtime.node_host_launch": {
-    spanAttrs: ["agentId", "launchId", "runtime", "candidate_source", "host_kind", "electron_run_as_node"],
+    // Which Codex install a launch picked (#14189), recorded by the legacy
+    // driver and, with `host: "oar"`, by the OAR host's Codex launch.
+    spanAttrs: ["agentId", "launchId", "runtime", "host", "candidate_source", "rejected_candidate_count", "rejection_kind", "host_kind", "electron_run_as_node"],
     endAttrs: ["error_class"],
   },
   "daemon.agent.process.error": {
@@ -473,6 +719,7 @@ export const DAEMON_CORE_TRACE_ATTR_CONTRACTS = {
   },
   "daemon.codex.request_instruction_shape": {
     spanAttrs: [
+      "host",
       "agent_id",
       "server_id",
       "machine_id",
@@ -560,10 +807,14 @@ export const DAEMON_CORE_TRACE_ATTR_CONTRACTS = {
   },
   "daemon.agent_proxy.request": {
     spanAttrs: [
+      "agentId",
       "route_family",
+      "route_path_version",
       "method",
       "trace_context_state",
       "proxy_launch_id_present",
+      // Closed set: "launch" or "stable_entry" (#proj-raft-computer:#58).
+      "via",
       "correlation_id",
     ],
     endAttrs: [
@@ -578,6 +829,16 @@ export const DAEMON_CORE_TRACE_ATTR_CONTRACTS = {
       // Closed set: scrubbedProxyCauseCode maps anything unknown to
       // UPSTREAM_TRANSPORT_FAILURE, so no raw error text reaches the span.
       "cause_code",
+      "third_party_ack_mode",
+      "third_party_served_count",
+      // Closed enums and counts from proxyFailureSpanAttrs: which layer
+      // failed, which host class, whether an HTTP proxy was used, and how
+      // many resolved addresses were tried / timed out (no addresses).
+      "upstream_layer",
+      "target_host_class",
+      "via_http_proxy",
+      "connect_attempted_addresses",
+      "connect_timed_out_addresses",
     ],
   },
   "daemon.runtime_profile.control.received": {
@@ -586,6 +847,61 @@ export const DAEMON_CORE_TRACE_ATTR_CONTRACTS = {
   },
   "daemon.computer_control.received": {
     spanAttrs: ["action", "handled", "operation_id", "request_id"],
+  },
+  // One step of a web upgrade, often sent after the restart it spans
+  // (delivered_late_ms / after_deadline); `reason` is the installer's
+  // one-line, control-free text, bounded on the Computer. On a failed
+  // receipt, `diagnostic` is the installer's own error, bounded and redacted
+  // on the Computer (traceSafeDiagnostic), and `start_failure` /
+  // `start_exit_code` classify a candidate that would not start (its stderr
+  // stays on the machine). Every receipt (success included) also yields
+  // `installer_finished` with the receipt's installer_version and
+  // receipt_outcome, the engine's own error (engine_diagnostic, redacted like
+  // `diagnostic`), K's operation phase/outcome/reason (engine_*), and the
+  // installer's last start (last_start_*: slot candidate/previous, version,
+  // succeeded, failure class and exit code; never stderr).
+  // `installer_receipt_updated` is a later rewrite of an unresolved receipt;
+  // `after_receipt` marks a service stop/start after the receipt existed.
+  "daemon.computer_upgrade.step": {
+    spanAttrs: [
+      "request_id",
+      "step",
+      "outcome",
+      "from_version",
+      "target_version",
+      "duration_ms",
+      "error_code",
+      "reason",
+      "delivered_late_ms",
+      "after_deadline",
+      "supervisor",
+      "kill_mode",
+      "bytes",
+      "version",
+      "phase",
+      "via",
+      "diagnostic",
+      "start_failure",
+      "start_exit_code",
+      "installer_version",
+      "receipt_outcome",
+      "engine_diagnostic",
+      "engine_phase",
+      "engine_outcome",
+      "engine_reason",
+      "last_start_slot",
+      "last_start_version",
+      "last_start_succeeded",
+      "last_start_failure",
+      "last_start_exit_code",
+      "after_receipt",
+    ],
+  },
+  // #proj-runtime:#47: what the Computer's start-time device session retire
+  // ended with (deviceSessionRetire.ts), once per start, sent by the first
+  // runner that claims it. Codes and counts only (never a token, key or id).
+  "daemon.computer.device_session_retire": {
+    spanAttrs: ["reason", "deleted", "keys_tried", "attempt", "http_status", "logout"],
   },
   "daemon.computer_control.replayed": {
     spanAttrs: ["action", "operation_id", "outcome"],
@@ -631,6 +947,31 @@ export const DAEMON_CORE_TRACE_ATTR_CONTRACTS = {
       ],
     },
   },
+  // pi session rotation (pi#10642, drivers/piSessionRotation.ts). Counts,
+  // sizes and closed reasons only; never a path, an id or entry content.
+  // `custom_type` is a pi/extension identifier, reduced to a short
+  // [A-Za-z0-9._-] shape or "other".
+  "pi.session.rotated": {
+    spanAttrs: ["agentId", "launchId", "runtime", "entries_before", "bytes_before", "entries_after", "bytes_after"],
+  },
+  "pi.session.rotation_skipped": {
+    spanAttrs: ["agentId", "launchId", "runtime", "reason", "session_bytes", "min_bytes", "user_extension_count"],
+  },
+  "pi.session.rotate_refused": {
+    spanAttrs: ["agentId", "launchId", "runtime", "reason", "custom_type", "session_bytes"],
+  },
+  "pi.session.rotation_failed": {
+    spanAttrs: ["agentId", "launchId", "runtime", "stage", "outcome", "error_class", "error_code"],
+  },
+  // Task #1310: one row per Pi provider call (drivers/piProviderCallTracker.ts).
+  // Closed sets and bucketed durations only; never a URL, header, body or error text.
+  "daemon.pi.provider_call.ended": {
+    spanAttrs: [
+      "agentId", "launchId", "runtime",
+      "call_context", "api", "provider", "outcome", "phase", "http_responses_seen", "last_http_status", "error_class",
+      "duration_ms_bucket", "ms_to_headers_bucket", "ms_to_first_event_bucket",
+    ],
+  },
   "daemon.runtime.tool.execution.started": {
     spanAttrs: [
       ...STUCK_TOOL_V0_IDENTITY_ATTRS,
@@ -666,6 +1007,8 @@ export const DAEMON_CORE_TRACE_ATTR_CONTRACTS = {
     spanAttrs: [
       ...STUCK_TOOL_V0_IDENTITY_ATTRS,
       "execution_state",
+      // failed | aborted only: a closed enum, never command text or output.
+      "failure_reason",
       "execution_runtime_ms",
       "process_exit_observed_before_finish",
     ],
@@ -678,6 +1021,7 @@ export const DAEMON_CORE_TRACE_ATTR_CONTRACTS = {
       "tool_pending",
       "process_liveness",
       "process_liveness_source",
+      "process_group_liveness",
       "progress_state",
       "tool_age_ms",
       "last_progress_age_ms",
@@ -701,6 +1045,11 @@ export const DAEMON_CORE_TRACE_ATTR_CONTRACTS = {
     eventAttrs: {
       "daemon.builtin.session.services_ready": ["available_models_count", "diagnostics_count", "diagnostic_info_count", "diagnostic_warning_count", "agent_dir_source", "config_source", "host_user_state", "provider_id", "model_kind", "model_id", "base_url_present", "base_url_host_class", "provider_key_present", "provider_key_source"],
       "daemon.builtin.session.model_resolved": ["available_models_count", "requested_model", "requested_model_explicit", "resolved_model", "resolved_model_present", "config_source", "host_user_state", "provider_id", "model_kind", "model_id", "base_url_present", "base_url_host_class", "provider_key_present", "provider_key_source"],
+      // gatewayModelLimits.ts: outcome (ok|not_listed|no_limits|failed:<class>), cached (no request made
+      // for this answer), provider_kind (gateway|openrouter), *_reported (booleans), format (only when ok:
+      // generic|openrouter|cliproxyapi_pi, the reader that matched), fallback_read (the client_version=pi
+      // catalog was consulted after the plain list gave no limit). Closed sets only; never a URL, key or body.
+      "daemon.builtin.session.gateway_model_limits": ["outcome", "cached", "provider_kind", "context_window_reported", "max_tokens_reported", "format", "fallback_read"],
       "daemon.builtin.session.missing_model": ["available_models_count", "requested_model", "config_source", "host_user_state", "provider_id", "model_kind", "model_id", "base_url_present", "base_url_host_class", "provider_key_present", "provider_key_source"],
       "daemon.builtin.session.started": ["requested_model", "resolved_model", "session_id_present", "config_source", "host_user_state", "provider_id", "model_kind", "model_id", "base_url_present", "base_url_host_class", "provider_key_present", "provider_key_source"],
     },
@@ -1008,16 +1357,70 @@ export async function retryMigrationTargetStep<B extends { migrationGeneration: 
   }
 }
 
+/**
+ * The target's wait for the source's control manifest: poll until it is ready,
+ * backing off from 25 ms to MIGRATION_CONTROL_WAIT_RETRY_MAX_MS, until the
+ * lease expires. `poll` returns null for "not ready yet" (409 or a retryable
+ * status) and throws to stop (410, other non-retryable statuses).
+ */
+export async function pollMigrationResumableControl<T>(input: {
+  expiresAtMs: number;
+  signal: AbortSignal;
+  poll: () => Promise<T | null>;
+  wait?: (delayMs: number, signal: AbortSignal) => Promise<void>;
+  nowMs?: () => number;
+}): Promise<T> {
+  const nowMs = input.nowMs ?? currentTimeMs;
+  const wait = input.wait ?? waitForAmbientBackoff;
+  let delayMs = MIGRATION_CONTROL_WAIT_RETRY_INITIAL_MS;
+  while (nowMs() < input.expiresAtMs) {
+    input.signal.throwIfAborted();
+    const ready = await input.poll();
+    if (ready !== null) return ready;
+    const remainingMs = input.expiresAtMs - nowMs();
+    if (remainingMs <= 0) break;
+    await wait(Math.min(delayMs, remainingMs), input.signal);
+    delayMs = Math.min(delayMs * 2, MIGRATION_CONTROL_WAIT_RETRY_MAX_MS);
+  }
+  throw new Error("MIGRATION_LEASE_EXPIRED");
+}
+
 function migrationTransferFailureMessage(err: unknown): string {
   const message = err instanceof Error ? err.message : String(err);
   return message.slice(0, 500);
 }
 
 export function migrationTransferFailureCode(err: unknown): string | undefined {
+  // A Server that does not know it yet records MIGRATION_TRANSPORT_LOST and keeps detailCode.
+  if (err instanceof AgentMigrationUserIgnoreWriteError) return MIGRATION_USER_IGNORE_WRITE_FAILED;
   const message = err instanceof Error ? err.message : String(err);
   const code = /^(MIGRATION_[A-Z0-9_]+)/.exec(message)?.[1];
   return code && RESUMABLE_MIGRATION_SPECIFIC_ERROR_CODES.has(code) ? code : undefined;
 }
+
+/**
+ * The message's agentId when it is not a usable workspace directory name, else
+ * null. Two checks that must agree: the characters that can leave a directory
+ * on any platform, and resolveWorkspaceDirectoryPath's structural rule (the
+ * resolved path is exactly one level below the root), which also catches
+ * inputs nobody thought to list.
+ */
+export function unsafeAgentIdOf(msg: unknown): string | null {
+  if (!msg || typeof msg !== "object" || !("agentId" in msg)) return null;
+  const agentId = (msg as { agentId?: unknown }).agentId;
+  if (agentId === undefined || agentId === null) return null;
+  if (typeof agentId !== "string") return String(agentId);
+  return agentId.length === 0
+    || agentId === "."
+    || agentId === ".."
+    || /[/\\:\0]/.test(agentId)
+    || resolveWorkspaceDirectoryPath(UNSAFE_AGENT_ID_PROBE_ROOT, agentId) === null
+    ? agentId
+    : null;
+}
+
+/** Any absolute root works for the structural check; it is never touched. */
+const UNSAFE_AGENT_ID_PROBE_ROOT = path.resolve("/raft-agent-workspaces");
 
 /**
  * Best-effort, non-secret classification of any transfer failure. `code` above
@@ -1026,6 +1429,7 @@ export function migrationTransferFailureCode(err: unknown): string | undefined {
  * everything else into MIGRATION_TRANSPORT_LOST.
  */
 export function migrationTransferFailureDetailCode(err: unknown): string | undefined {
+  if (err instanceof AgentMigrationUserIgnoreWriteError) return `${MIGRATION_USER_IGNORE_WRITE_FAILED}:${err.reason}`;
   const known = migrationTransferFailureCode(err);
   if (known) return known;
   if (err instanceof MigrationStepResponseError) {
@@ -1066,6 +1470,8 @@ function normalizeResumableMigrationSpecificErrorCode(value: string): string | n
 
 type MigrationTraceStage =
   | "lease"
+  | "user_ignore"
+  | "source_drain"
   | "source_quiesce"
   | "control_register"
   | "control_wait"
@@ -1168,6 +1574,18 @@ function migrationObjectStoreFailureTraceAttrs(err: unknown): Record<string, unk
   };
 }
 
+/** Why a draining migration source waits, in the Server's fixed set (AGENT_MIGRATION_SOURCE_DRAIN_WAITING_FOR). */
+function migrationSourceDrainWaitingFor(reason: AgentNotIdleReason): AgentMigrationSourceDrainWaitingFor {
+  switch (reason) {
+    case "agent_busy": return "turn";
+    case "background_tasks": return "background_tasks";
+    // Input written but not consumed yet, or a mention told but not settled by a turn end.
+    case "delivery_in_flight":
+    case "mention_in_flight": return "queued_input";
+    default: return "other";
+  }
+}
+
 function migrationTraceIdentityAttrs(
   lease: AgentMigrationTransportLeaseMessage,
   stage: MigrationTraceStage,
@@ -1242,6 +1660,27 @@ const CATALOG_CONTROL_CHARS = /[\u0000-\u001f\u007f]/g;
  * too long or has control characters is dropped (an id is an identity, not
  * display text, so it is never rewritten); an empty label falls back to the id.
  */
+/**
+ * The catalog frame one detection gives, or null when none is sent: a live
+ * list as is; nothing for an error, an unsupported runtime or no models (the
+ * server keeps its copy), except when the detection follows a sign-in change
+ * for that runtime (`authoritative`, Pi's) and says it has no models: then an
+ * empty list that replaces the server's copy, so the model picker does not
+ * keep offering the models of a provider that was signed out.
+ */
+export function runtimeModelCatalogFrame(
+  runtime: string,
+  outcome: RuntimeModelSourceOutcome,
+  authoritative: boolean,
+): Extract<MachineToServerMessage, { type: "machine:runtime_models:catalog" }> | null {
+  const models = outcome.kind === "live" ? sanitizeCatalogModels(outcome.value.models) : [];
+  if (models.length > 0) return { type: "machine:runtime_models:catalog", runtime, models };
+  if (authoritative && (outcome.kind === "no_models" || outcome.kind === "live")) {
+    return { type: "machine:runtime_models:catalog", runtime, models: [], authoritative: true };
+  }
+  return null;
+}
+
 export function sanitizeCatalogModels(
   models: ReadonlyArray<{ id: string; label: string }>,
 ): Array<{ id: string; label: string }> {
@@ -1259,8 +1698,24 @@ export function sanitizeCatalogModels(
 // Who asked this daemon to stop. The host knows (the Computer service records
 // its own kills); a signal it did not send is "external_signal". A caller that
 // names no source records "unspecified", so a missing attr only means an older
-// daemon.
-export type DaemonStopSource = "service_shutdown" | "service_unmanaged" | "external_signal" | "unspecified";
+// daemon. "machine_key_revoked": the Computer runner stops its agents after
+// the server refused its key for good (reconciler step 15).
+export type DaemonStopSource =
+  | "service_shutdown"
+  | "service_unmanaged"
+  | "external_signal"
+  | "machine_key_revoked"
+  | "unspecified";
+
+/** How a Computer runner's stop after its key was refused ended (reconciler step 15). */
+export interface MachineKeyRevokedStopTrace {
+  reason: string;
+  outcome: "stopped" | "deadline" | "error";
+  agentCount: number;
+  remainingAgentCount: number;
+  durationMs: number;
+  deadlineMs: number;
+}
 
 export interface DaemonStopOptions {
   source?: DaemonStopSource;
@@ -1272,6 +1727,8 @@ export interface DaemonCoreOptions {
   apiKey: string;
   daemonVersion?: string;
   computerVersion?: string | null;
+  /** Source commit baked into a CI-built Computer; absent on local builds. */
+  computerBuildSha?: string | null;
   slockCliPath?: string;
   dataDir?: string;
   /** Test/embedded override; production resolves the canonical Raft home. */
@@ -1294,16 +1751,44 @@ export interface DaemonCoreOptions {
   agentManagerFactory?: (
     sendToServer: (msg: MachineToServerMessage) => void,
     daemonApiKey: string,
-    options?: { dataDir?: string; serverUrl: string; defaultAgentEnvVarsProvider?: DefaultAgentEnvVarsProvider; slockCliPath?: string; slockHome?: string; tracer?: Tracer; daemonInstanceId?: string; appInboxForAgent?: (agentId: string) => AgentAppInboxStore; runtimeProcessGate?: RuntimeProcessGate },
+    options?: { dataDir?: string; serverUrl: string; defaultAgentEnvVarsProvider?: DefaultAgentEnvVarsProvider; slockCliPath?: string; slockHome?: string; tracer?: Tracer; daemonInstanceId?: string; appInboxForAgent?: (agentId: string) => AgentAppInboxStore; runtimeProcessGate?: RuntimeProcessGate; connectedServerId?: () => string | null; exitStreaks?: ExitStreaks },
   ) => AgentProcessManager;
   defaultAgentEnvVarsProvider?: DefaultAgentEnvVarsProvider;
+  /**
+   * RFC 060: run launches the server asks for (`AgentConfig.runtimeHost:
+   * "oar"`) on OAR sessions, and advertise `runtime-host:oar`. Default on
+   * unless `RAFT_DAEMON_OAR_HOST_DISABLED` is set.
+   */
+  oarHost?: boolean;
+  /** Seam for tests: how the OAR host opens a session (OAR's `scriptedRuntime`). */
+  openOarSession?: OpenOarSession;
   /** Seam for tests — injected into the ReminderCache so timers can be faked. */
   reminderClock?: Clock;
+  /** Seam for tests: the server features refresh's delay, timers and request ids. */
+  serverFeaturesRefresh?: Omit<ServerFeaturesRefreshOptions, "send">;
   /** Where the Computer reads this process's latest memory sample (doctor). */
   processMemorySamplePath?: string | null;
+  /** Where the Computer reads how many agents are mid-turn (a quiet point for stop / Raft Desktop's move). */
+  turnActivitySnapshotPath?: string | null;
+  /** Reconciler step 15: RUNTIME_ABSENT_REDETECT_DELAY_MS (tests shorten it). */
+  runtimeAbsentRedetectDelayMs?: number;
+  /**
+   * Reconciler step 13: the Computer service's drain files for this runner
+   * (computerUpgradeDrain.ts). Set only by a Computer runner; with it the
+   * daemon advertises DAEMON_CAPABILITY_COMPUTER_UPGRADE_DRAIN_V1 and relays a
+   * web upgrade's `drain` to `onComputerControl`.
+   */
+  computerUpgradeDrainPaths?: ComputerUpgradeDrainPaths | null;
   /** The Computer service's memory sample, carried on this process's memory event. */
   serviceMemorySamplePath?: string | null;
   tracer?: Tracer;
+  /**
+   * This daemon's own RAFT_PRIVACY_MODE, read once at startup by the entry
+   * point (index.ts, the Computer's runner). The daemon is in privacy mode
+   * when this is on OR its server's `machine:context` says `privacyMode`: no
+   * trace or feedback uploads.
+   */
+  privacyMode?: boolean;
   localTrace?: boolean;
   localTraceMaxFileBytes?: number;
   localTraceMaxFileAgeMs?: number;
@@ -1315,6 +1800,40 @@ export interface DaemonCoreOptions {
   };
   /** Remote upgrade v2: summary of the last installer receipt, carried on `ready`. */
   getComputerLastUpgradeReceipt?: () => Promise<ComputerLastUpgradeReceipt | null>;
+  /**
+   * #proj-raft-computer task #34: advisory hint that the installer state needs
+   * a repair run on the machine, or null. Carried on `ready`; re-read on the memory-report cadence
+   * and after a failed web upgrade, and sent as `machine:installer_repair_hint`
+   * when it changed.
+   */
+  getComputerInstallerRepairHint?: () => Promise<ComputerInstallerRepairHint | null>;
+  /**
+   * Raft Desktop moved this Computer from its embedded one (RAFT_HOME's
+   * one-shot `computer/migrated-from.json`): what this server's next ready
+   * says in `migratedFrom`, or null (none, or this server already had it).
+   */
+  getComputerMigratedFrom?: () => Promise<ComputerMigratedFrom | null>;
+  /** A ready carrying `migratedFrom` went out: never again for this server (the note goes once every server had it). */
+  onComputerMigratedFromSent?: () => Promise<void>;
+  /**
+   * The Computer's last device session retire outcome not yet sent (claimed:
+   * once returned, no other runner gets it), or null.
+   */
+  collectComputerDeviceSessionRetire?: () => Promise<ComputerDeviceSessionRetireTrace | null>;
+  /**
+   * Machine-lock conflicts this Computer's runners met and not yet sent
+   * (claimed: once returned, no other runner gets them).
+   */
+  collectComputerMachineLockConflicts?: () => Promise<ComputerMachineLockConflictTrace[]>;
+  /** Remote upgrade steps not yet sent for this server, and the ack that marks them sent. */
+  collectComputerUpgradeSteps?: (ctx: { relayedInReady: boolean }) => Promise<{ events: ComputerUpgradeStepTrace[]; ack: () => Promise<void> }>;
+  /**
+   * After a `ready` without the receipt of a web upgrade still inside its
+   * deadline: resolves with the installer's failure once its receipt appears,
+   * or null. A rolled-back installer restarts this (old) service before it
+   * writes the receipt, so that `ready` could not carry it.
+   */
+  watchComputerUpgradeOutcome?: () => Promise<{ requestId: string; outcome: string; reason: string } | null>;
   /** Durable managed-Computer operation acknowledgements waiting for receipt. */
   getComputerLifecycleAcks?: () => ComputerLifecycleExecutionAck[];
   /** Fresh, async machine attestation used only for ready-phase evidence. */
@@ -1352,6 +1871,12 @@ export interface DaemonCoreOptions {
    * single runner and must not be mistaken for this stronger contract.
    */
   computerControlViaSupervisor?: boolean;
+  /**
+   * The Computer runner could not reach its service's IPC seam at start: the
+   * ready frame says so (`COMPUTER_CAPABILITY_SERVICE_IPC_UNREACHABLE`) and the
+   * server offers manual upgrade commands instead of the Upgrade button.
+   */
+  computerServiceIpcUnreachable?: boolean;
   /** Report a persisted restart request only after this new runner generation
    * has connected and sent ready. The hook owns marker read/clear. */
   onComputerRestartReconcile?: (
@@ -1359,6 +1884,18 @@ export interface DaemonCoreOptions {
   ) => void | Promise<void>;
   /** Test seam; production collectors keep credentials and raw provider responses local. */
   runtimeAccountUsageCollector?: RuntimeAccountUsageCollector;
+  /** Test seam for spending a limit reset; production redeems through OAR. */
+  runtimeLimitResetRedeemer?: RuntimeLimitResetRedeemer;
+  /** Test seam for reading the resets an account holds; production inspects through OAR (Claude). */
+  runtimeLimitResetsReader?: RuntimeLimitResetsReader;
+  /** Test seam: the platform the capabilities are advertised for; production is the host's. */
+  platform?: NodeJS.Platform;
+  /** task #17: web login / logout through OAR (injectable for tests). */
+  runtimeAuthHost?: RuntimeAuthHost;
+  /** Test seam: one runtime's model detection; production asks the runtime's driver or its static list. */
+  runtimeModelDetector?: (runtime: string) => Promise<RuntimeModelSourceOutcome>;
+  /** Test seam: where the credential disk watch reads (a temp home, a fake timer); production uses the user's home. */
+  credentialDiskWatch?: Pick<CredentialDiskWatchDeps, "baseEnv" | "homeDir" | "platform" | "cwd" | "setInterval" | "clearInterval" | "now">;
 }
 
 export type ComputerLifecycleOriginReconcileResult =
@@ -1378,7 +1915,66 @@ const COMPUTER_LIFECYCLE_ORIGIN_RECONCILE_RETRY_MS = 50;
  * Context handed to `onComputerControl`. For `upgrade` it carries the exact
  * target; the Computer launches the installer and reports nothing (v2).
  */
+/** The Computer's start-time device session retire outcome (`deviceSessionRetire.ts`). */
+export interface ComputerDeviceSessionRetireTrace {
+  reason: string;
+  deleted: boolean;
+  keysTried: number;
+  attempt: number;
+  httpStatus?: number;
+  logout?: "ok" | "failed";
+}
+
+/**
+ * A machine-lock conflict another runner of this Computer met and exited on
+ * (`runnerLockConflict.ts`): whether that daemon could read the owner pid's
+ * start (null: its error did not say) and how old the owner's lock was, in
+ * coarse days. Never a pid, a path or that server's id.
+ */
+export interface ComputerMachineLockConflictTrace {
+  ownerStartReadable: boolean | null;
+  lockAgeDays: string;
+}
+
+/** One remote-upgrade step from the Computer's step log (`remoteUpgradeTrace.ts`). */
+export interface ComputerUpgradeStepTrace {
+  requestId: string;
+  step: string;
+  outcome: "ok" | "failed" | "skipped";
+  atMs: number;
+  deliveredLateMs: number;
+  afterDeadline: boolean;
+  fromVersion?: string;
+  targetVersion?: string;
+  durationMs?: number;
+  errorCode?: string;
+  reason?: string;
+  supervisor?: string;
+  killMode?: string;
+  bytes?: number;
+  version?: string;
+  phase?: string;
+  via?: string;
+  diagnostic?: string;
+  startFailure?: string;
+  startExitCode?: number;
+  installerVersion?: string;
+  receiptOutcome?: string;
+  engineDiagnostic?: string;
+  enginePhase?: string;
+  engineOutcome?: string;
+  engineReason?: string;
+  lastStartSlot?: string;
+  lastStartVersion?: string;
+  lastStartSucceeded?: boolean;
+  lastStartFailure?: string;
+  lastStartExitCode?: number;
+  afterReceipt?: boolean;
+}
+
 export interface ComputerControlContext {
+  /** Send the Computer's pending upgrade steps now (the launching runner, before it is stopped). */
+  flushUpgradeSteps?: () => void;
   /** Canonical lifecycle operation identifier. */
   operationId?: string;
   /** Remote upgrade v2: exact target the Server resolved; the installer runs against it. */
@@ -1386,6 +1982,12 @@ export interface ComputerControlContext {
   /** Echoes the triggering `computer:upgrade{requestId}`; undefined if the
    *  command carried none. */
   requestId?: string;
+  /**
+   * Reconciler step 13: the Server asked to wait for quiet agents first,
+   * clamped to COMPUTER_UPGRADE_DRAIN_MAX_DEADLINE_MS. Only on a runner with
+   * the drain channel (`computerUpgradeDrainPaths`).
+   */
+  drain?: ComputerUpgradeDrainRequest;
 }
 
 export interface MigrationTargetImportView {
@@ -1546,8 +2148,16 @@ export function detectRuntimes(tracer: Tracer = noopTracer, hooks: RuntimeDetect
     },
   });
 
+  // A runtime that runs only on the OAR host is offered only where that host
+  // runs: not on Windows, not with the OAR host disabled (oarAgentHost.ts).
+  const oarOnlyRunnable = process.platform !== "win32" && isOarHostEnabled();
   for (const runtime of RUNTIMES) {
     const driver = getDriver(runtime.id);
+    if (driver.oarOnly && !oarOnlyRunnable) {
+      hooks.onRuntimeChecked?.({ runtime: runtime.id, available: false });
+      span.addEvent("daemon.runtime.detect.checked", { runtime: runtime.id, outcome: "unavailable", reason: "oar_host_unavailable" });
+      continue;
+    }
     let probeErrorPresent = false;
     try {
       if (driver.probe) {
@@ -1661,14 +2271,20 @@ function formatChannelTarget(msg: ServerToMachineMessage & { type: "agent:delive
     : `#${msg.message.channel_name}`;
 }
 
+/** A runtime-auth request id as the server mints it: a short opaque string. */
+function isRuntimeAuthRequestId(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= 128;
+}
+
 function summarizeIncomingMessage(msg: ServerToMachineMessage): string {
   switch (msg.type) {
     case "machine:context":
       return `(machine=${msg.machineId}, server=${msg.serverId})`;
     case "agent:start":
       return `(agent=${msg.agentId}, runtime=${msg.config.runtime}, model=${msg.config.model}, session=${msg.config.sessionId || "new"}${msg.wakeMessage ? ", wake=true" : ""})`;
-    case "agent:start:wiki":
-      return `(agent=${msg.agentId}, runtime=${msg.config.runtime}, model=${msg.config.model}, session=${msg.config.sessionId || "new"}, wikiPack=${msg.wikiWorkspacePack.packId.slice(0, 12)}${msg.wakeMessage ? ", wake=true" : ""})`;
+    case "agent:config":
+      // Never the env or a credential: the runtime, model and revision only.
+      return `(agent=${msg.agentId}, runtime=${msg.config?.runtime}, model=${msg.config?.model}, revision=${msg.revision})`;
     case "agent:stop":
       return `(agent=${msg.agentId})`;
     case "agent:wake:outcome":
@@ -1687,8 +2303,6 @@ function summarizeIncomingMessage(msg: ServerToMachineMessage): string {
       return `(agent=${msg.agentId}, dir=${msg.dirPath || "."}, hidden=${msg.includeHidden ? "yes" : "no"})`;
     case "agent:workspace:read":
       return `(agent=${msg.agentId}, path=${msg.path})`;
-    case "agent:workspace:ensure-wiki":
-      return `(agent=${msg.agentId}, pack=${msg.pack.packId.slice(0, 12)})`;
     case "agent:skills:list":
       return `(agent=${msg.agentId}, runtime=${msg.runtime || "auto"}, req=${msg.requestId || "legacy"})`;
     case "agent:diagnostic:session_transcript":
@@ -1697,14 +2311,29 @@ function summarizeIncomingMessage(msg: ServerToMachineMessage): string {
       return `(agent=${msg.agentId}, feedbackReportId=${msg.feedbackReportId})`;
     case "agent:activity_probe":
       return `(agent=${msg.agentId}, probe=${msg.probeId.slice(0, 8)}, purpose=${msg.purpose})`;
+    case "agent:context_view_request":
+      return `(agent=${msg.agentId}, request=${String(msg.requestId).slice(0, 12)})`;
     case "machine:workspace:delete":
       return `(directory=${msg.directoryName})`;
     case "machine:runtime_models:detect":
       return `(runtime=${msg.runtime}, req=${msg.requestId})`;
     case "machine:runtime_account_usage:refresh":
       return `(provider=${msg.provider}, reason=${msg.reason}, req=${msg.requestId})`;
+    case "machine:runtime_account_usage:limit_reset:redeem":
+      // Type only: the fields are checked after this line; the key is not logged.
+      return "";
+    case "machine:runtime_account_usage:limit_resets:read":
+      return "";
     case "machine:runtimes:rescan":
       return "(rescan runtimes)";
+    case "machine:runtime_auth:login:start":
+    case "machine:runtime_auth:login:code":
+    case "machine:runtime_auth:login:cancel":
+    case "machine:runtime_auth:logout":
+    case "machine:runtime_auth:providers":
+    case "machine:runtime_auth:connect_provider":
+      // Type only: the fields are checked after this line, and a code or a key is never written anywhere.
+      return "";
     case "machine:migration:source_workspace_archive":
       return `(agent=${msg.agentId}, migration=${msg.migrationId})`;
     case "machine:migration_transport:lease":
@@ -1722,9 +2351,7 @@ function summarizeIncomingMessage(msg: ServerToMachineMessage): string {
   }
 }
 
-type AgentStartMessage =
-  | Extract<ServerToMachineMessage, { type: "agent:start" }>
-  | Extract<ServerToMachineMessage, { type: "agent:start:wiki" }>;
+type AgentStartMessage = Extract<ServerToMachineMessage, { type: "agent:start" }>;
 type AgentDeliverMessage = Extract<ServerToMachineMessage, { type: "agent:deliver" }>;
 type AgentStartAckMessage = Extract<MachineToServerMessage, { type: "agent:start:ack" }>;
 
@@ -1757,7 +2384,8 @@ class LocalStartRefusedError extends Error {
  * and a flaky test here would be worse than none.
  */
 export function selectWakeDeliveryIndex(deliveries: readonly AgentDeliverMessage[]): number {
-  return deliveries.findIndex((delivery) => delivery.transient !== true && !delivery.mentionDelivery);
+  // task #26: server context is held, never a wake; it rides the start's first prompt.
+  return deliveries.findIndex((delivery) => delivery.transient !== true && !delivery.mentionDelivery && !isServerContextMessage(delivery.message));
 }
 
 /** SLOCK_HOME values a DaemonCore set itself (it was not given one), so a later core does not take them as chosen. */
@@ -1769,6 +2397,42 @@ function raftHomeEnvIsExplicit(): boolean {
   return Boolean(slockHome) && !slockHomesSetByDaemon.has(slockHome!);
 }
 
+/**
+ * Whether a migration source may add `excludedIgnoredBySource` to its transfer
+ * summary. Both ends must accept it: the Server (capability
+ * `migration:backup-ignore-sources-v1`) and the target Computer, which parses the
+ * control manifest with the same strict schema (the source lease's
+ * `targetAcceptsIgnoreSources`; absent means an older target, so no).
+ */
+export function migrationSummaryMayReportIgnoreSources(
+  serverAccepts: boolean,
+  lease: Pick<AgentMigrationTransportLeaseMessage, "targetAcceptsIgnoreSources">,
+): boolean {
+  return serverAccepts && lease.targetAcceptsIgnoreSources === true;
+}
+
+/**
+ * A feedback request's `sessionLookup`, read as untrusted JSON: null unless
+ * it names a runtime and a model; a session id that is not a string, and any
+ * env var the runtime's session directory does not depend on, is dropped.
+ * Exported for tests.
+ */
+export function feedbackTranscriptSessionLookupFromFrame(value: unknown): FeedbackTranscriptSessionLookup | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const frame = value as Record<string, unknown>;
+  if (typeof frame.runtime !== "string" || !frame.runtime || typeof frame.model !== "string") return null;
+  // Only the keys the runtime's session directory depends on, whatever was sent.
+  const sessionHomeEnv = frame.sessionHomeEnv && typeof frame.sessionHomeEnv === "object" && !Array.isArray(frame.sessionHomeEnv)
+    ? runtimeSessionHomeEnvVars(frame.runtime, frame.sessionHomeEnv as Record<string, unknown>)
+    : null;
+  return {
+    runtime: frame.runtime,
+    model: frame.model,
+    sessionHomeEnv,
+    sessionId: typeof frame.sessionId === "string" && frame.sessionId ? frame.sessionId : null,
+  };
+}
+
 export class DaemonCore {
   private readonly options: DaemonCoreOptions;
   private readonly daemonVersion: string;
@@ -1777,6 +2441,7 @@ export class DaemonCore {
   // passes the Computer bundle version explicitly. Reported in `ready` so the
   // server can surface it distinctly from the underlying daemonVersion.
   private readonly computerVersion: string | null;
+  private readonly computerBuildSha: string | null;
   private readonly slockCliPath: string;
   private readonly slockHome: string;
   private readonly raftHomeExplicit: boolean;
@@ -1794,8 +2459,22 @@ export class DaemonCore {
   // self-healing form on the first connect of this daemon process (a SEA
   // computer switch / daemon upgrade restarts the daemon → triggers this).
   private opencliWrappersRegenerated = false;
+  private legacyBridgeArtifactsMigrated = false;
+  private staleAgentTokensRemoved = false;
   private readonly runtimeDetector: () => RuntimeDetection;
+  private readonly runtimeModelDetector: ((runtime: string) => Promise<RuntimeModelSourceOutcome>) | null;
   private readonly agentManager: AgentProcessManager;
+  /**
+   * Agent lifecycle (start, stop, deliver, probe, running/session queries):
+   * the process manager alone, or it and the OAR host behind the RFC 060
+   * router. Workspace, skills, diagnostics and profile surfaces stay on the
+   * process manager.
+   */
+  private readonly agentHosts: AgentLifecycleHost;
+  /** Reconciler step 13: a Computer runner's half of a drained web upgrade. */
+  private readonly upgradeDrain: ComputerUpgradeDrainChannel | null;
+  /** RFC 060: this daemon runs OAR launches and advertises `runtime-host:oar`. */
+  private readonly oarHostEnabled: boolean;
   private readonly connection: DaemonConnection;
   private readonly runtimeOutcomeOutbox: RuntimeOutcomeOutbox;
   /** RFC 071 outbox: whether the current connection's server acknowledges outbox frames. */
@@ -1825,6 +2504,11 @@ export class DaemonCore {
   private readyPublicationSeq = 0;
   /** task #1268: a rescan asked for while a round was running; one more round follows, never a parallel one. */
   private detectionRescanRequested = false;
+  /**
+   * Runtimes whose next catalog detection follows a sign-in change made from
+   * the web (Pi's): its result replaces the server's list even when empty.
+   */
+  private readonly authoritativeCatalogRuntimes = new Set<string>();
   /** Runtime CLI versions from the last ready frame, by runtime id (for start traces). */
   private lastReadyRuntimeVersions: Record<string, string> = {};
   /** Serializes the runtime CLI version record writes (one detection at a time). */
@@ -1849,28 +2533,112 @@ export class DaemonCore {
   private machineContextConflict = false;
   private localTraceSink: LocalRotatingTraceSink | null = null;
   private traceBundleUploader: DaemonTraceBundleUploader | null = null;
+  /**
+   * The trace upload URL the attached server named in `machine:context`, when
+   * it passed the allowlist (traceUploadUrl.ts); null otherwise. One daemon
+   * serves one server, so this is per server by construction.
+   */
+  private serverTraceUploadUrl: string | null = null;
+  /** The server's `machine:context` said `privacyMode: true` (RAFT_PRIVACY_MODE on the server). */
+  private serverPrivacyMode = false;
+  /** Last rejection warned about, so a reconnect loop logs it once. */
+  private warnedServerTraceUploadUrlRejection: ServerTraceUploadUrlRejection | null = null;
   private diskJanitor: { stop(): void } | null = null;
+  /** Reconciler step 15: releases an invalid credential that changed on disk (credentialDiskWatch.ts). */
+  private credentialDiskWatch: CredentialDiskWatch | null = null;
+  /** #proj-raft-computer:#68: persisted login facts, opened with the machine lock (runtimeReadinessStore.ts). */
+  private runtimeReadiness: RuntimeReadinessStore | null = null;
+  /** The server reads `machine:runtime_readiness` (SERVER_CAPABILITY_RUNTIME_READINESS_V1). */
+  private serverReadsRuntimeReadiness = false;
   private processMemoryReporter: { stop(): void } | null = null;
+  /** `raft proc` jobs of this runner's agents (procJobs.ts); null on Windows (v1) or before the lock. */
+  private procJobManager: ProcJobManager | null = null;
+
+  /**
+   * `raft proc` at stop: the manager's sweep ends and it writes the ledger no
+   * more (the jobs keep running); the next start opens a new one, which adopts
+   * them.
+   */
+  private async closeProcJobs(): Promise<void> {
+    const manager = this.procJobManager;
+    if (!manager) return;
+    this.procJobManager = null;
+    setAgentProcJobManager(null);
+    await manager.close();
+  }
+
+  /** Stop every running `raft proc` job of the agent; never rejects. */
+  private async stopProcJobsForAgent(agentId: string, reason: ProcStopReason): Promise<void> {
+    const manager = this.procJobManager;
+    if (!manager) return;
+    await manager.stopAllForAgent(agentId, reason).then(
+      (stopped) => {
+        if (stopped > 0) logger.info(`[Agent ${agentId}] Stopped ${stopped} raft proc job(s) (${reason})`);
+      },
+      (error: unknown) => {
+        logger.warn(`[Agent ${agentId}] Stopping raft proc jobs (${reason}) failed: ${error instanceof Error ? error.message : String(error)}`);
+      },
+    );
+  }
   private startedAtMs: number | null = null;
   private raftDiskFootprint: { atMs: number; value: Promise<RaftDiskFootprint> } | null = null;
   private diskStatusTimer: ReturnType<typeof setTimeout> | null = null;
-  private diskStatusReportsEnabled = true;
+  private machineStatusReportsEnabled = true;
+  private memoryStatusTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Reconciler step 15: one pending re-detection after a local restart found a runtime missing. */
+  private runtimeRedetectTimer: ReturnType<typeof setTimeout> | null = null;
+  private readonly runtimeAbsentRedetectDelayMs: number;
   private readonly coreStartingAgentIds = new Set<string>();
+  /** Reconciler step 11: the order of the configs the server sends each agent (shared with both hosts). */
+  private readonly configRevisions: AgentConfigRevisions;
   private readonly coreStartPendingDeliveries = new Map<string, AgentDeliverMessage[]>();
   private readonly recentlyAckedDeliveryIds = new RecentDeliveryIds();
   private readonly acceptedStartDispatches = new Map<string, AgentStartAckMessage>();
   private readonly acceptingStartDispatches = new Map<string, Promise<AgentStartAckMessage>>();
   private readonly handledComputerControlOperationIds = new Set<string>();
+  /** Serializes step-log flushes so one step is never sent twice. */
+  private computerUpgradeStepFlush: Promise<void> = Promise.resolve();
+  private computerUpgradeOutcomeWatch: Promise<void> | null = null;
+  private lastReadyCarriedUpgradeReceipt = false;
+  /** JSON of the installer repair hint this connection last told the server (`ready` or its own message). */
+  private reportedInstallerRepairHint = "null";
+  /** The late looks at the device session retire outcome (flushComputerDeviceSessionRetire), scheduled once per process. */
+  private deviceSessionRetireFlushTimers = new Set<NodeJS.Timeout>();
+  private deviceSessionRetireLateFlushesScheduled = false;
+  /** This process already sent `ready.migratedFrom` (getComputerMigratedFrom). */
+  private migratedFromSent = false;
+  /** One change report at a time, so a stale read can never be sent after a newer one. */
+  private installerRepairHintReport: Promise<void> = Promise.resolve();
   private readonly runtimeAccountUsageCollector: RuntimeAccountUsageCollector;
+  private readonly runtimeLimitResetRedeemer: RuntimeLimitResetRedeemer;
+  private readonly runtimeLimitResetsReader: RuntimeLimitResetsReader;
+  private readonly platform: NodeJS.Platform;
+  private readonly runtimeAuth: RuntimeAuthHost;
+  /**
+   * task #17: the runtimes whose auth status the server reads
+   * (SERVER_CAPABILITY_RUNTIME_AUTH_V1: Claude Code and Codex; _V2: all), or
+   * null when it reads none.
+   */
+  private serverRuntimeAuthRuntimes: readonly RuntimeAuthRuntime[] | null = null;
+  /** The server answers `server:features:request` (SERVER_CAPABILITY_SERVER_FEATURES_V1). */
+  private serverFeaturesCapable = false;
+  /** Asks the server for its current flag-derived agent config fields (serverFeaturesRefresh.ts). */
+  private readonly serverFeaturesRefresh: ServerFeaturesRefresh;
+  /** The last ready inventory's runtime ids, for a status report once the server says it reads one. */
+  private runtimeAuthInventory: string[] | null = null;
+  /** Reconciler step 15: the server reads `machine:runtime_credentials:changed` (SERVER_CAPABILITY_RUNTIME_CREDENTIALS_CHANGED_V1). */
+  private serverReadsRuntimeCredentialsChanged = false;
   /** Overlapping model / usage probes for the same key join one run instead of each spawning a CLI (probeGate.ts). Uncapped across keys so no probe waits past the server's request budget. */
   private readonly probeGate = new ProbeGate();
   private readonly runtimeModelCache = new RuntimeModelSourceCache(currentTimeMs);
   private static readonly START_DISPATCH_RECEIPT_CACHE_SIZE = 1_024;
 
   constructor(options: DaemonCoreOptions) {
+    this.runtimeAbsentRedetectDelayMs = options.runtimeAbsentRedetectDelayMs ?? RUNTIME_ABSENT_REDETECT_DELAY_MS;
     this.options = options;
     this.daemonVersion = options.daemonVersion ?? readDaemonVersion();
     this.computerVersion = options.computerVersion?.trim() || null;
+    this.computerBuildSha = options.computerBuildSha?.trim() || null;
     // Resolve eagerly but NON-FATALLY: the slock CLI path is only needed when
     // an agent actually spawns (cliTransport injects it + throws a clear error
     // if empty). A daemon must still be able to construct + connect + report
@@ -1890,20 +2658,110 @@ export class DaemonCore {
     this.injectedTracer = Boolean(options.tracer);
     this.tracer = this.withDaemonTraceScope(options.tracer ?? noopTracer);
     this.runtimeDetector = options.runtimeDetector ?? (() => detectRuntimes(this.tracer));
+    this.runtimeModelDetector = options.runtimeModelDetector ?? null;
     this.runtimeAccountUsageCollector = options.runtimeAccountUsageCollector
       ?? createRuntimeAccountUsageCollector({
         localAccountSlot: this.slockHome,
         collectorVersion: this.daemonVersion,
         now: currentTimeMs,
+        // Without the Kimi Code CLI, Kimi Code's usage is read on the SDK its agents run on (#triage:#253).
+        oar: {
+          kimiSdkUsage: () => {
+            const home = resolveKimiHome(ambientProcessEnv());
+            return readKimiSdkUsage({
+              status: () => readKimiCodeSignInStatus(home),
+              getManagedUsage: async () => (await loadKimiSdkAuth(home)).getManagedUsage(),
+            });
+          },
+        },
       });
+    // OAR runs Claude Code's /limit-reset (one session at a time per process,
+    // idempotency keys in memory) and reads usage itself right before a
+    // command that could spend Claude's older 5-hour reset. When it refuses a
+    // redeem for consent, usage read again here (a key of its own, so it never
+    // joins an earlier read) tells the 5-hour wall from a kind the account
+    // cannot use here yet.
+    this.platform = options.platform ?? process.platform;
+    let fiveHourChecks = 0;
+    this.runtimeLimitResetRedeemer = options.runtimeLimitResetRedeemer ?? createRuntimeLimitResetRedeemer({
+      fiveHourLimit: async () => {
+        fiveHourChecks += 1;
+        const snapshot = await this.probeGate.run(`runtime_account_usage_after_limit_reset_refusal:claude:${fiveHourChecks}`, () => this.runtimeAccountUsageCollector("claude"));
+        return claudeFiveHourLimitOf(snapshot);
+      },
+    });
+    this.runtimeLimitResetsReader = options.runtimeLimitResetsReader ?? createRuntimeLimitResetsReader();
+    this.serverFeaturesRefresh = new ServerFeaturesRefresh({
+      ...options.serverFeaturesRefresh,
+      send: (requestId) => {
+        logger.info(`[Daemon] Asking the server for its current features (request ${requestId.slice(0, 8)})`);
+        this.connection.send({ type: "server:features:request", requestId });
+      },
+    });
+    this.runtimeAuth = options.runtimeAuthHost ?? new RuntimeAuthHost({
+      // Pi signs in through its provider facade (loadPiAuth), never a Runtime's login.
+      loadRuntime: (id) => (id === "pi" ? Promise.reject(new Error("Pi signs in per provider")) : loadOarRuntime(id)),
+      // Kimi Code signs in on the SDK its agents run on, not OAR's kimi (no Kimi Code CLI needed), in
+      // the home they read. Its status reads the stored tokens: the SDK loads for a login or logout only.
+      kimiStatus: () => readKimiCodeSignInStatus(resolveKimiHome(ambientProcessEnv())),
+      loadKimiAuth: () => loadKimiSdkAuth(resolveKimiHome(ambientProcessEnv())),
+      // The one runtime OAR has a provider settings facade for.
+      loadProviderAuth: async (id) => (id === "qwen" ? loadOarQwenProviderAuth() : null),
+      // Pi's sign-ins in the daemon's own Pi agent dir: the auth.json the Pi runtime's agents read
+      // unless one sets its own PI_CODING_AGENT_DIR. Never Built-in Pi's (per agent).
+      loadPiAuth: () => loadOarPiProviderAuth(piSignInPaths()),
+      piDeviceId: piSignInDeviceId,
+      // OpenCode 2's sign-ins through its own server, in the daemon's environment (the store its agents
+      // read): one facade for the daemon's life, closed in stop(). `loopback: "refuse"`: the person signs
+      // in from another machine, so a sign-in only a browser on this one could finish is refused up front.
+      opencode: new OpencodeSignIn({
+        loadRuntime: () => loadOarRuntime("opencode"),
+        create: (installation) => loadOarOpencodeProviderAuth(installation, {
+          timeoutMs: OPENCODE_SIGN_IN_TIMEOUT_MS,
+          loginTimeoutMs: OPENCODE_LOGIN_TIMEOUT_MS,
+          idleMs: OPENCODE_SIGN_IN_IDLE_MS,
+          loopback: "refuse",
+        }),
+        now: currentTimeMs,
+      }),
+      // Pi's models are those of the providers it can sign in to: the picker follows a change.
+      // Authoritative for Pi: signing out its last provider clears the server's model list.
+      rescanModels: (runtime) => this.rescanRuntimes(runtime),
+      send: (message) => this.connection.send(message),
+      recordEvent: (name, attrs) => this.recordDaemonEvent(name, attrs),
+      now: currentTimeMs,
+      // A report runs only while a server that reads it is connected.
+      serverReads: () => (this.connection.connected ? this.serverRuntimeAuthRuntimes : null),
+      // #proj-raft-computer:#46 stop-gap: agents on the machine-shared login
+      // stop waiting on the old account. The legacy host releases the
+      // sign-in's provider limit in the ledger both hosts share, which ends
+      // the OAR host's waits too; the OAR host keeps no auth state.
+      onCredentialsChanged: (runtime, reason) => this.agentManager.noteRuntimeCredentialsChanged(runtime, reason),
+    });
     this.appScheduleClock = options.reminderClock ?? systemClock;
     this.lifecycleOriginClock = options.connectionOptions?.clock ?? systemClock;
 
     let connection!: DaemonConnection;
 
     this.agentsDataDir = options.dataDir ?? resolveRaftHomePath("agents", this.slockHome);
-    const traceUploadDisabled = process.env.SLOCK_DAEMON_TRACE_UPLOAD_DISABLED === "1";
+    // RFC 071 outbox: one gate for every agent host's spawns and rebinds.
+    const runtimeProcessGate: RuntimeProcessGate = {
+      openProcess: (agentId: string, processInstanceId: string, spawnLaunchId: string | null) =>
+        this.runtimeOutcomeOutbox.openProcess(agentId, processInstanceId, spawnLaunchId),
+      processExitedLocally: (agentId: string, processInstanceId: string) =>
+        this.runtimeOutcomeOutbox.processExitedLocally(agentId, processInstanceId),
+      processNotStarted: (agentId: string, processInstanceId: string) =>
+        this.runtimeOutcomeOutbox.processNotStarted(agentId, processInstanceId),
+      startRefusal: (agentId: string, launchId: string | null, recoveryGrant: RecoveryGrant | null) =>
+        this.runtimeOutcomeOutbox.startDecision(agentId, launchId, recoveryGrant),
+      waitForCapability: () => this.runtimeOutcomeOutbox.waitForCapability(),
+    };
+    // Reconciler step 10b: one record of every agent's crash streaks and
+    // resume failures, for both hosts (planExit.ts): an agent's exits on
+    // either host count into the same streaks.
+    const exitStreaks = new ExitStreaks();
     const agentManagerOptions = {
+      exitStreaks,
       dataDir: this.agentsDataDir,
       serverUrl: options.serverUrl,
       defaultAgentEnvVarsProvider: options.defaultAgentEnvVarsProvider,
@@ -1913,23 +2771,21 @@ export class DaemonCore {
       daemonVersion: this.daemonVersion,
       daemonInstanceId: this.daemonInstanceId,
       computerVersion: this.computerVersion,
-      workerUrl: traceUploadDisabled ? undefined : (process.env.SLOCK_DAEMON_TRACE_UPLOAD_URL || DEFAULT_TRACE_UPLOAD_URL),
+      // Feedback evidence uploads keep env > default (not the server's choice).
+      // Local privacy mode only; a server's arrives later and is refused per request (feedback_transcript).
+      workerUrl: resolveMachineTraceUploadUrl(process.env, options.serverUrl, options.privacyMode === true) ?? undefined,
       serverConnected: () => connection?.connected ?? false,
+      // View Context keeps each server's data apart on a Raft home several
+      // per-server daemons share; fail closed after a context conflict.
+      connectedServerId: () => (this.machineContextConflict ? null : this.authenticatedMachineContext?.serverId ?? this.observedServerId),
       appInboxForAgent: (agentId: string) => this.getAgentAppInbox(agentId),
       // Lazy: the local app runtime is created after the agent manager.
       onAgentWorkingToIdle: (agentId: string) => this.localScheduleRuntime?.onAgentWorkingToIdle(agentId),
+      onRuntimeAbsentLocalStop: (runtime: string) => this.scheduleRuntimeRedetectAfterAbsent(runtime),
+      detectedRuntimeCliVersion: (runtimeId: string) => this.lastReadyRuntimeVersions[runtimeId],
       // RFC 071 outbox: every spawn/rebind first durably records the process as open.
-      runtimeProcessGate: {
-        openProcess: (agentId: string, processInstanceId: string, spawnLaunchId: string | null) =>
-          this.runtimeOutcomeOutbox.openProcess(agentId, processInstanceId, spawnLaunchId),
-        processExitedLocally: (agentId: string, processInstanceId: string) =>
-          this.runtimeOutcomeOutbox.processExitedLocally(agentId, processInstanceId),
-        processNotStarted: (agentId: string, processInstanceId: string) =>
-          this.runtimeOutcomeOutbox.processNotStarted(agentId, processInstanceId),
-        startRefusal: (agentId: string, launchId: string | null, recoveryGrant: RecoveryGrant | null) =>
-          this.runtimeOutcomeOutbox.startDecision(agentId, launchId, recoveryGrant),
-        waitForCapability: () => this.runtimeOutcomeOutbox.waitForCapability(),
-      },
+      runtimeProcessGate,
+      activitySnapshotPath: options.turnActivitySnapshotPath ?? null,
     };
 
     this.runtimeOutcomeOutbox = new RuntimeOutcomeOutbox({
@@ -1942,17 +2798,115 @@ export class DaemonCore {
     // RFC 071: the agent manager's evidence frames go through the durable
     // outbox (write-ahead, stop-and-wait); everything else is sent directly.
     const sendAgentFrame = (msg: MachineToServerMessage) => this.routeAgentManagerFrame(msg, connection);
-    this.agentManager = options.agentManagerFactory
+    const agentManager = options.agentManagerFactory
       ? options.agentManagerFactory(sendAgentFrame, options.apiKey, agentManagerOptions)
       : new AgentProcessManager(sendAgentFrame, options.apiKey, agentManagerOptions);
+    this.agentManager = agentManager;
+    // A test stand-in for the manager may have none: then one of the core's own.
+    this.configRevisions = agentManager.configRevisions ?? new AgentConfigRevisions();
+    this.oarHostEnabled = options.oarHost ?? isOarHostEnabled();
+    if (this.oarHostEnabled) {
+      const oarHost = new OarAgentHost({
+        dataDir: this.agentsDataDir,
+        detectedRuntimeCliVersion: (runtimeId: string) => this.lastReadyRuntimeVersions[runtimeId],
+        serverUrl: options.serverUrl,
+        daemonApiKey: options.apiKey,
+        slockCliPath: this.slockCliPath,
+        slockHome: this.slockHome,
+        daemonVersion: this.daemonVersion,
+        computerVersion: this.computerVersion,
+        sendToServer: sendAgentFrame,
+        nextClientSeq: (agentId) => agentManager.nextClientSeq(agentId),
+        daemonInstanceId: () => this.daemonInstanceId,
+        buildSpawnConfig: (agentId, config) => agentManager.buildSpawnConfig(agentId, config),
+        // Reconciler step 5: an OAR launch starts after the agent's stopped legacy process has exited.
+        legacyRuntimeExited: (agentId, signal) => agentManager.runtimeExited?.(agentId, signal) ?? Promise.resolve(),
+        runtimeProcesses: {
+          opened: (agentId, launchId) => agentManager.noteOarRuntimeOpened?.(agentId, launchId),
+          closed: (agentId) => agentManager.noteOarRuntimeClosed?.(agentId),
+        },
+        isStaleClaim: (claimed) => {
+          const current = agentManager.currentConnectionEpochId;
+          return Boolean(claimed && current && claimed !== current);
+        },
+        gate: runtimeProcessGate,
+        launches: {
+          take: (agentId) => agentManager.takeAcceptedLaunches(agentId),
+          settleNotSpawned: (agentId, launchId, reason) => agentManager.settleServerStartNotSpawned(agentId, launchId, reason),
+          settleRebound: (agentId, launchId, processInstanceId) => agentManager.settleServerStartRebound(agentId, launchId, processInstanceId),
+        },
+        appInboxForAgent: (agentId) => this.getAgentAppInbox(agentId),
+        // The same idle hook as the legacy host's (built-in apps, created below).
+        onAgentWorkingToIdle: (agentId) => this.localScheduleRuntime?.onAgentWorkingToIdle(agentId),
+        contextView: {
+          sessionStarted: (agentId, session, enabled) => agentManager.noteHostedContextViewSession?.(agentId, session, enabled),
+          messageCommitted: (agentId, input) => agentManager.noteHostedMessageCommitted?.(agentId, input),
+        },
+        sendRuntimeProfileReport: (agentId, session, source) => agentManager.sendHostedRuntimeProfileReport(agentId, session, source),
+        recordEvent: (name, attrs, status, parent) => this.recordDaemonEvent(name, attrs, status, parent),
+        // #proj-raft-computer:#46: one provider-limit ledger for both hosts.
+        providerLimits: agentManager.providerLimitLedger,
+        // Reconciler step 7: one memory of the runtime each session started on, for both hosts.
+        sessionSpecs: agentManager.sessionSpecs,
+        // Reconciler step 11: one order of pushed configs (and held pushes), for both hosts.
+        configRevisions: this.configRevisions,
+        // Reconciler step 11c: an OAR spec stop's handback, read by the legacy host's refusal.
+        specHandbacks: agentManager.specHandbacks,
+        // Reconciler step 9: one stalled-replacement streak per agent, for both hosts.
+        stalledReplacements: agentManager.stalledReplacementStreaks,
+        // Reconciler step 10b: the same exit streaks (planExit.ts), for both hosts.
+        exitStreaks: agentManager.exitStreaks,
+        ...(options.openOarSession ? { openSession: options.openOarSession } : {}),
+      });
+      agentManager.setHostedSessions?.({
+        get: (agentId) => oarHost.hostedSession(agentId),
+        agentIds: () => oarHost.hostedAgentIds(),
+      });
+      this.agentHosts = new AgentHostRouter(agentManager, oarHost, {
+        recordEvent: (name, attrs, status) => this.recordDaemonEvent(name, attrs, status),
+        settleNotSpawned: (agentId, launchId, reason) => agentManager.settleServerStartNotSpawned(agentId, launchId, reason),
+        releaseUnusedCredential: (agentId, config, launchId) => agentManager.releaseUnheldRunnerCredential(agentId, config, launchId),
+      });
+    } else {
+      this.agentHosts = agentManager;
+    }
+    // Reconciler step 15: a terminal sign-in releases a held credential as a
+    // web login does (B7 / B8 / B9). Runs only while a credential is held.
+    if (agentManager.providerLimitLedger) {
+      this.credentialDiskWatch = new CredentialDiskWatch({
+        ledger: agentManager.providerLimitLedger,
+        recordEvent: (name, attrs) => this.recordDaemonEvent(name, attrs),
+        baseEnv: ambientProcessEnv,
+        runSecurity: runSecurityCommand,
+        ...options.credentialDiskWatch,
+        // PR 3: a terminal sign-in lifts the server's sign-in pauses that no
+        // held record here knows of any more (after a daemon restart).
+        onSharedCredentialsChanged: (runtime) => { void this.reportSharedCredentialsChanged(runtime); },
+      });
+    }
+    const upgradeDrainPaths = options.computerUpgradeDrainPaths ?? null;
+    this.upgradeDrain = upgradeDrainPaths
+      ? new ComputerUpgradeDrainChannel({
+          paths: upgradeDrainPaths,
+          hosts: this.agentHosts,
+          connected: () => this.connection.connected,
+          send: (frame) => this.connection.send(frame),
+          recordEvent: (name, attrs) => this.recordDaemonEvent(name, attrs),
+        })
+      : null;
 
     this.localScheduleRuntime = createBuiltInLocalScheduleRuntime({
       agentsDataDir: this.agentsDataDir,
       clock: this.appScheduleClock,
       getInbox: (agentId) => this.getAgentAppInbox(agentId),
       notifyInbox: (agentId, item, notice) =>
-        this.agentManager.notifyAgentAppInbox(agentId, item, notice),
+        this.agentHosts.notifyAgentAppInbox(agentId, item, notice),
       cleanerMeasureRaftDiskFootprint: () => this.measureRaftDiskFootprintCached(),
+      // Quota is read from Claude's rate_limit_event on the legacy host only;
+      // agents on the OAR host have no reading (undefined).
+      cleanerProviderQuota: (agentId) => this.agentManager.providerQuota?.quotaFor(agentId),
+      idleNoticeFacts: (agentId) => this.agentHosts.idleNoticeFacts(agentId),
+      deliverIdleNotice: (agentId, text) => this.agentHosts.deliverIdleNotice(agentId, text),
       send: (message) => connection.send(message),
       trace: (name, attrs, status) =>
         this.recordDaemonEvent(name, { ...attrs }, status),
@@ -1962,6 +2916,13 @@ export class DaemonCore {
         startSpan: (name, spanOptions) => this.tracer.startSpan(name, spanOptions),
         emitEvent: (name, eventOptions) => this.tracer.emitEvent(name, eventOptions),
       },
+    });
+    // The Cleaner's .raftbackupignore reminder: an agent's own credential hit
+    // a provider usage limit (a shared credential's hit is not attributed).
+    agentManager.providerLimitLedger?.subscribe((change) => {
+      if (change.kind === "recorded" && change.source.agentId) {
+        this.localScheduleRuntime.noteProviderLimitHit(change.source.agentId);
+      }
     });
 
     const connectionFactory = options.connectionFactory ?? ((connOptions: ConnectionOptions) => new DaemonConnection(connOptions));
@@ -2082,8 +3043,8 @@ export class DaemonCore {
       source: "daemon",
       sinks: [this.localTraceSink],
     }));
-    this.agentManager.setTracer(this.tracer);
-    this.agentManager.setCliTransportTraceDir(path.join(machineDir, "traces"));
+    this.agentHosts.setTracer(this.tracer);
+    this.agentHosts.setCliTransportTraceDir(path.join(machineDir, "traces"));
     this.agentManager.setMachineDir(machineDir);
   }
 
@@ -2091,18 +3052,22 @@ export class DaemonCore {
     if (!this.shouldEnableLocalTrace()) return;
     if (this.traceBundleUploader) return;
 
-    // Highest priority off-switch: SLOCK_DAEMON_TRACE_UPLOAD_DISABLED=1
+    // DISABLED=1 > SLOCK_DAEMON_TRACE_UPLOAD_URL > allowlisted server URL >
+    // the attached server's default (traceUploadUrl.ts). `workerUrl` is the machine-level URL (env >
+    // default) for the Computer's diagnostics markers; this runner's own
+    // bundles follow the server it is attached to.
     if (process.env.SLOCK_DAEMON_TRACE_UPLOAD_DISABLED === "1") return;
-
-    // Explicit URL override wins; otherwise fall back to the baked default.
-    // Self-host / local / staging etc. must use DISABLED=1 to opt out or
-    // set their own SLOCK_DAEMON_TRACE_UPLOAD_URL to redirect.
-    const workerUrl = process.env.SLOCK_DAEMON_TRACE_UPLOAD_URL || DEFAULT_TRACE_UPLOAD_URL;
+    // Null on a server that is not Raft's (traceUploadUrl.ts): the uploader is
+    // still installed, since that server may name an allowlisted receiver
+    // later (`machine:context`); until then nothing is uploaded.
+    const workerUrl = resolveMachineTraceUploadUrl(process.env, this.options.serverUrl, this.privacyModeOn());
     this.traceBundleUploader = new DaemonTraceBundleUploader({
       machineDir,
       serverUrl: this.options.serverUrl,
       apiKey: this.options.apiKey,
       workerUrl,
+      runnerWorkerUrl: () => this.runnerTraceUploadTarget() ?? { url: workerUrl, serverProvided: false },
+      privacyMode: () => this.privacyModeOn(),
       tracer: this.tracer,
       currentFileProvider: () => this.localTraceSink?.getCurrentFile() ?? null,
       sinkReportProvider: {
@@ -2112,6 +3077,53 @@ export class DaemonCore {
       jitter: this.resolveTraceJitter(),
     });
     this.traceBundleUploader.start();
+  }
+
+  /** Upload target for this runner's own trace bundles (null when disabled). */
+  private runnerTraceUploadTarget(): { url: string; serverProvided: boolean } | null {
+    const resolved = resolveTraceUploadUrl({
+      env: process.env,
+      serverTraceUploadUrl: this.serverTraceUploadUrl,
+      serverUrl: this.options.serverUrl,
+      privacyMode: this.privacyModeOn(),
+    });
+    return resolved.url === null ? null : { url: resolved.url, serverProvided: resolved.source === "server" };
+  }
+
+  /** RAFT_PRIVACY_MODE: this daemon's own (DaemonCoreOptions.privacyMode) or its server's (`machine:context`). */
+  private privacyModeOn(): boolean {
+    return this.options.privacyMode === true || this.serverPrivacyMode;
+  }
+
+  /**
+   * Take the server's `traceUploadUrl` from `machine:context`. Absent (older
+   * server, or none configured) or rejected → not used, so the upload goes to
+   * SLOCK_DAEMON_TRACE_UPLOAD_URL if set, else the default. A rejected value
+   * is warned about once, by reason only.
+   */
+  private applyServerTraceUploadUrl(raw: unknown): void {
+    if (raw === undefined || raw === null || this.machineContextConflict) {
+      this.serverTraceUploadUrl = null;
+      return;
+    }
+    const check = acceptServerTraceUploadUrl(raw, { serverUrl: this.options.serverUrl });
+    if (check.ok) {
+      if (check.url !== this.serverTraceUploadUrl) {
+        logger.info(`[Daemon] Server names trace upload receiver ${check.url}`);
+      }
+      this.serverTraceUploadUrl = check.url;
+      this.warnedServerTraceUploadUrlRejection = null;
+      return;
+    }
+    this.serverTraceUploadUrl = null;
+    if (this.warnedServerTraceUploadUrlRejection !== check.reason) {
+      this.warnedServerTraceUploadUrlRejection = check.reason;
+      const fallback = resolveTraceUploadUrl({ env: process.env, serverTraceUploadUrl: null, serverUrl: this.options.serverUrl }).source;
+      const using = fallback === "env" ? "SLOCK_DAEMON_TRACE_UPLOAD_URL"
+        : fallback === "disabled" ? "nothing (uploads disabled)"
+          : fallback === "none" ? "nothing (no receiver for this server)" : "the default receiver";
+      logger.warn(`[Daemon] Ignoring the server's trace upload URL (${check.reason}); using ${using}`);
+    }
   }
 
   /**
@@ -2174,7 +3186,8 @@ export class DaemonCore {
 
   start() {
     logger.info("[Slock Daemon] Starting...");
-    void hostDeviceClass();
+    applyDaemonConnectAttemptTimeout();
+    void hostFacts();
     // The shared contract schemas stay lazy here (built on first use). Do not
     // warm them: the daemon parses only a handful, and building all of them
     // costs every runner ~38 MB of heap. Broken schemas are caught by
@@ -2205,6 +3218,24 @@ export class DaemonCore {
         ownerProvenance: this.options.machineOwnerProvenance,
       });
       logger.info(`[Slock Daemon] Acquired machine lock: ${this.machineLock.lockDir}`);
+      // Reconciler step 5: the runtime process ledger and the orphan sweep
+      // start with the lock, never behind the local-trace switch: runtimes
+      // spawn detached either way, and nothing else reaps a crashed
+      // daemon's runtimes. Starts wait for the sweep.
+      this.agentManager.startRuntimeProcessLedger?.(this.machineLock.machineDir);
+      this.openRuntimeReadiness(this.machineLock.machineDir);
+      // `raft proc` (#proj-raft-computer:#59): the jobs' ledger sits next to
+      // the runtime ledger; jobs a previous daemon left running are adopted
+      // (the sweep above skips them). Not on Windows in v1.
+      if (process.platform !== "win32" && !this.procJobManager) {
+        this.procJobManager = ProcJobManager.start({
+          machineDir: this.machineLock.machineDir,
+          trace: (name, attrs, status) => this.recordDaemonEvent(name, attrs, status),
+          runtimeRoots: (agentId) => this.agentManager.runtimeProcessesForAgent?.(agentId) ?? [],
+        });
+        this.agentManager.setProcJobPidFilter?.((pid) => this.procJobManager?.ownsPid(pid) ?? false);
+        setAgentProcJobManager(this.procJobManager);
+      }
       this.installLocalTraceSink(this.machineLock.machineDir);
       this.installTraceBundleUploader(this.machineLock.machineDir);
       this.installDiskJanitor();
@@ -2214,7 +3245,10 @@ export class DaemonCore {
         context: () => ({
           process_instance_id: this.daemonInstanceId,
           ...this.agentManager.getRunningAgentLoad(),
+          // RFC 060: agents on the OAR host count too (their runtimes are daemon children).
+          agents_running: this.agentHosts.getRunningAgentIds().length,
           ...serviceMemoryAttrs(this.options.serviceMemorySamplePath, this.appScheduleClock.now()),
+          ...piSessionMemoryAttrs(this.appScheduleClock.now()),
         }),
         samplePath: this.options.processMemorySamplePath ?? null,
         onWriteError: (error) => logger.warn(`[Slock Daemon] Could not write the memory sample: ${String(error)}`),
@@ -2229,10 +3263,20 @@ export class DaemonCore {
         },
       });
       lifecycleSpan.addEvent("daemon.machine_lock.acquired", { machine_dir_present: true });
+      const reclaimed = this.machineLock.reclaimed;
+      if (reclaimed) {
+        this.recordDaemonEvent("daemon.machine_lock.reclaimed", {
+          reason: reclaimed.reason,
+          platform: reclaimed.platform,
+          ...(reclaimed.identitySource ? { identity_source: reclaimed.identitySource } : {}),
+        }, "ok", lifecycleSpan.context);
+      }
     }
+    this.upgradeDrain?.start();
     try {
       this.connection.connect();
     } catch (err) {
+      this.upgradeDrain?.stop();
       lifecycleSpan?.end("error", { attrs: { error_class: errorClassOf(err) } });
       this.traceBundleUploader?.stop();
       this.traceBundleUploader = null;
@@ -2246,6 +3290,9 @@ export class DaemonCore {
   }
 
   async stop(options: DaemonStopOptions = {}) {
+    // Every login stopped, and OpenCode's sign-in server with them (its own watchdog is the backstop).
+    await this.runtimeAuth.close();
+    this.serverFeaturesRefresh.reset();
     // task #1268: a detection child must not outlive the daemon.
     this.abandonDetectionRound("stop");
     logger.info("[Slock Daemon] Shutting down...");
@@ -2264,6 +3311,7 @@ export class DaemonCore {
       },
     });
     this.localScheduleRuntime.stop();
+    this.upgradeDrain?.stop();
     this.invalidateLifecycleOriginReconcile();
     this.scopedAppStorageObserver?.stop();
     this.scopedAppStorageObserver = null;
@@ -2273,12 +3321,22 @@ export class DaemonCore {
     this.processMemoryReporter = null;
     this.diskJanitor?.stop();
     this.diskJanitor = null;
-    this.diskStatusReportsEnabled = false;
+    this.credentialDiskWatch?.stop();
+    this.credentialDiskWatch = null;
+    this.runtimeReadiness?.close();
+    this.runtimeReadiness = null;
+    this.machineStatusReportsEnabled = false;
     if (this.diskStatusTimer !== null) clearTimeout(this.diskStatusTimer);
     this.diskStatusTimer = null;
+    if (this.runtimeRedetectTimer !== null) clearTimeout(this.runtimeRedetectTimer);
+    this.runtimeRedetectTimer = null;
+    if (this.memoryStatusTimer !== null) clearTimeout(this.memoryStatusTimer);
+    this.memoryStatusTimer = null;
+    for (const timer of this.deviceSessionRetireFlushTimers) clearTimeout(timer);
+    this.deviceSessionRetireFlushTimers.clear();
     try {
       // A graceful stop stores every exit (closing the open-launch records) before the outbox stops.
-      await this.agentManager.stopAll();
+      await this.agentHosts.stopAll();
       span.addEvent("daemon.agents.stopped");
     } finally {
       this.runtimeOutcomeOutbox.stop();
@@ -2303,6 +3361,10 @@ export class DaemonCore {
       }
       this.connection.disconnect();
       span.addEvent("daemon.connection.disconnect_requested");
+      // The runtime process ledger is written in the machine dir: its last
+      // updates land before the stop resolves and the lock is released.
+      await this.agentManager.settleRuntimeProcessLedger?.();
+      await this.closeProcJobs();
       this.machineLock?.release();
       if (this.machineLock) span.addEvent("daemon.machine_lock.released");
       this.machineLock = null;
@@ -2319,11 +3381,175 @@ export class DaemonCore {
   }
 
   getRunningAgentIds(): string[] {
-    return this.agentManager.getRunningAgentIds();
+    return this.agentHosts.getRunningAgentIds();
+  }
+
+  /**
+   * The Computer runner bounds its `stop({ source: "machine_key_revoked" })`
+   * and exits 77 when it ends or the bound passes; it records how here, just
+   * before the exit (the local trace sink writes synchronously).
+   */
+  recordMachineKeyRevokedStop(trace: MachineKeyRevokedStopTrace): void {
+    this.recordDaemonEvent("daemon.machine_key.revoked_stop", {
+      reason: trace.reason,
+      outcome: trace.outcome,
+      agent_count: trace.agentCount,
+      remaining_agent_count: trace.remainingAgentCount,
+      duration_ms: trace.durationMs,
+      deadline_ms: trace.deadlineMs,
+    }, trace.outcome === "stopped" ? "ok" : "error");
   }
 
   // Records a point in time fact as a trace event. The event attaches to the
   // given parent, or to the span that is active right now.
+  /**
+   * Send the Computer's device session retire outcome, if one waits. The
+   * retire runs ~20 s after the service starts (after this runner's first
+   * ready, usually) and may retry 10 min later, so this runs at every ready
+   * and, once per process, a minute and 11 minutes after the first.
+   */
+  private flushComputerDeviceSessionRetire(): void {
+    const collect = this.options.collectComputerDeviceSessionRetire;
+    if (!collect) return;
+    const flush = (): void => {
+      void collect()
+        .then((report) => {
+          if (!report) return;
+          this.recordDaemonEvent("daemon.computer.device_session_retire", {
+            reason: report.reason,
+            deleted: report.deleted,
+            keys_tried: report.keysTried,
+            attempt: report.attempt,
+            ...(report.httpStatus !== undefined ? { http_status: report.httpStatus } : {}),
+            ...(report.logout !== undefined ? { logout: report.logout } : {}),
+          }, report.deleted ? "ok" : "error");
+        })
+        .catch(() => { /* best effort: the next start reports again */ });
+    };
+    flush();
+    if (this.deviceSessionRetireLateFlushesScheduled) return;
+    this.deviceSessionRetireLateFlushesScheduled = true;
+    for (const delayMs of DEVICE_SESSION_RETIRE_LATE_FLUSHES_MS) {
+      const timer = setTimeout(() => {
+        this.deviceSessionRetireFlushTimers.delete(timer);
+        flush();
+      }, delayMs);
+      timer.unref?.();
+      this.deviceSessionRetireFlushTimers.add(timer);
+    }
+  }
+
+  /** Send the machine-lock conflicts other runners of this Computer exited on. */
+  private flushComputerMachineLockConflicts(): void {
+    const collect = this.options.collectComputerMachineLockConflicts;
+    if (!collect) return;
+    void collect()
+      .then((conflicts) => {
+        for (const conflict of conflicts) {
+          this.recordDaemonEvent("daemon.machine_lock.conflict", {
+            platform: process.platform,
+            lock_age_days: conflict.lockAgeDays,
+            ...(conflict.ownerStartReadable !== null ? { owner_start_readable: conflict.ownerStartReadable } : {}),
+          }, "error");
+        }
+      })
+      .catch(() => { /* best effort: claimed reports are gone, unclaimed ones go at the next ready */ });
+  }
+
+  /** Send the Computer's undelivered upgrade steps as trace events, then ack them. */
+  private flushComputerUpgradeSteps(relayedInReady: boolean): Promise<void> {
+    const collect = this.options.collectComputerUpgradeSteps;
+    if (!collect) return Promise.resolve();
+    this.computerUpgradeStepFlush = this.computerUpgradeStepFlush
+      .then(async () => {
+        const { events, ack } = await collect({ relayedInReady });
+        for (const event of events) this.recordComputerUpgradeStep(event);
+        await ack();
+      })
+      .catch((err) => {
+        this.recordConnectLifecycleError("computer_upgrade_steps", "step_flush_threw", err);
+      });
+    return this.computerUpgradeStepFlush;
+  }
+
+  private recordComputerUpgradeStep(event: Omit<ComputerUpgradeStepTrace, "atMs">): void {
+    this.recordDaemonEvent("daemon.computer_upgrade.step", {
+      request_id: event.requestId,
+      step: event.step,
+      outcome: event.outcome,
+      delivered_late_ms: event.deliveredLateMs,
+      after_deadline: event.afterDeadline,
+      ...(event.fromVersion !== undefined ? { from_version: event.fromVersion } : {}),
+      ...(event.targetVersion !== undefined ? { target_version: event.targetVersion } : {}),
+      ...(event.durationMs !== undefined ? { duration_ms: event.durationMs } : {}),
+      ...(event.errorCode !== undefined ? { error_code: event.errorCode } : {}),
+      ...(event.reason !== undefined ? { reason: event.reason } : {}),
+      ...(event.supervisor !== undefined ? { supervisor: event.supervisor } : {}),
+      ...(event.killMode !== undefined ? { kill_mode: event.killMode } : {}),
+      ...(event.bytes !== undefined ? { bytes: event.bytes } : {}),
+      ...(event.version !== undefined ? { version: event.version } : {}),
+      ...(event.phase !== undefined ? { phase: event.phase } : {}),
+      ...(event.via !== undefined ? { via: event.via } : {}),
+      ...(event.diagnostic !== undefined ? { diagnostic: event.diagnostic } : {}),
+      ...(event.startFailure !== undefined ? { start_failure: event.startFailure } : {}),
+      ...(event.startExitCode !== undefined ? { start_exit_code: event.startExitCode } : {}),
+      ...(event.installerVersion !== undefined ? { installer_version: event.installerVersion } : {}),
+      ...(event.receiptOutcome !== undefined ? { receipt_outcome: event.receiptOutcome } : {}),
+      ...(event.engineDiagnostic !== undefined ? { engine_diagnostic: event.engineDiagnostic } : {}),
+      ...(event.enginePhase !== undefined ? { engine_phase: event.enginePhase } : {}),
+      ...(event.engineOutcome !== undefined ? { engine_outcome: event.engineOutcome } : {}),
+      ...(event.engineReason !== undefined ? { engine_reason: event.engineReason } : {}),
+      ...(event.lastStartSlot !== undefined ? { last_start_slot: event.lastStartSlot } : {}),
+      ...(event.lastStartVersion !== undefined ? { last_start_version: event.lastStartVersion } : {}),
+      ...(event.lastStartSucceeded !== undefined ? { last_start_succeeded: event.lastStartSucceeded } : {}),
+      ...(event.lastStartFailure !== undefined ? { last_start_failure: event.lastStartFailure } : {}),
+      ...(event.lastStartExitCode !== undefined ? { last_start_exit_code: event.lastStartExitCode } : {}),
+      ...(event.afterReceipt !== undefined ? { after_receipt: event.afterReceipt } : {}),
+    }, event.outcome === "failed" ? "error" : "ok");
+  }
+
+  /** The upgrade's terminal frame reached the socket: the last step this side can see. */
+  private recordComputerUpgradeReported(requestId: string, via: string, sent: boolean): void {
+    this.recordComputerUpgradeStep({
+      requestId,
+      step: "reported",
+      outcome: sent ? "ok" : "failed",
+      deliveredLateMs: 0,
+      afterDeadline: false,
+      via,
+      ...(sent ? {} : { errorCode: "socket_not_connected" }),
+    });
+  }
+
+  /**
+   * One watch per process: a restored (rolled-back) service connects before the
+   * installer writes its receipt, so report the receipt when it appears.
+   */
+  private startComputerUpgradeOutcomeWatch(): void {
+    const watch = this.options.watchComputerUpgradeOutcome;
+    if (!watch || this.computerUpgradeOutcomeWatch) return;
+    this.computerUpgradeOutcomeWatch = Promise.resolve()
+      .then(() => watch())
+      .then((failure) => {
+        if (!failure) return;
+        const sent = this.connection.connected;
+        if (sent) {
+          this.connection.send({
+            type: "computer:upgrade:done",
+            requestId: failure.requestId,
+            ok: false,
+            code: failure.outcome === "rolled_back" ? "upgrade_rolled_back" : "upgrade_installer_failed",
+            reason: failure.reason.replace(/[\u0000-\u001f\u007f]+/gu, " ").slice(0, 2048),
+          });
+        }
+        this.recordComputerUpgradeReported(failure.requestId, "late_receipt", sent);
+        return this.flushComputerUpgradeSteps(false);
+      })
+      .catch((err) => {
+        this.recordConnectLifecycleError("computer_upgrade_outcome_watch", "watch_threw", err);
+      });
+  }
+
   private recordDaemonEvent(
     name: string,
     attrs?: Record<string, unknown>,
@@ -2371,7 +3597,7 @@ export class DaemonCore {
 
   private getMigrationTransportReadyBase(): AgentMigrationTransportReady {
     const transferLease = this.getActiveMigrationTransferLease();
-    const capabilities = [AGENT_MIGRATION_CAPABILITY];
+    const capabilities = [...DAEMON_MIGRATION_TRANSPORT_CAPABILITIES];
     if (transferLease) {
       return {
         provisioned: true,
@@ -2638,7 +3864,13 @@ export class DaemonCore {
     lease: AgentMigrationTransportLeaseMessage,
     suffix: string,
   ): URL {
-    const base = new URL(lease.controlUrl, this.options.serverUrl).toString().replace(/\/$/, "");
+    // These requests carry the machine key: an absolute controlUrl on another
+    // origin would send it there, so only this Computer's own server is used.
+    const resolved = new URL(lease.controlUrl, this.options.serverUrl);
+    if (resolved.origin !== new URL(this.options.serverUrl).origin) {
+      throw new Error("MIGRATION_CONTROL_URL_CROSS_ORIGIN");
+    }
+    const base = resolved.toString().replace(/\/$/, "");
     return new URL(`${base}${suffix}`, this.options.serverUrl);
   }
 
@@ -2655,11 +3887,19 @@ export class DaemonCore {
    * (404) disables reporting for this run. A report skipped by the throttle is
    * sent once the interval ends, so the latest counts are not lost before a
    * long quiet stretch.
+   *
+   * A user-ignore receipt rides the reports until one gets a non-5xx answer, and only to
+   * a Server that advertises SERVER_CAPABILITY_MIGRATION_USER_IGNORE_RECEIPT_V1
+   * (read per report; an older Server's strict schema rejects the field). For
+   * such a Server the first report goes out at once, so the receipt does not
+   * wait out the interval; any other Server gets exactly the old reports.
    */
   private createMigrationSourceProgressReporter(
     lease: AgentMigrationTransportLeaseMessage,
     signal: AbortSignal,
+    userIgnoreReceipt: AgentMigrationUserIgnoreAdditionsReceipt | null = null,
   ): (progress: AgentMigrationExportProgress) => void {
+    let unsentReceipt = userIgnoreReceipt;
     let lastSentAt = currentDate().getTime();
     let inFlight = false;
     let disabled = false;
@@ -2675,16 +3915,36 @@ export class DaemonCore {
       pending = null;
       clearFlush();
       inFlight = true;
+      const receipt = unsentReceipt && this.serverAcceptsMigrationUserIgnoreReceipt() ? unsentReceipt : null;
       void daemonFetch(this.migrationResumableControlUrl(lease, "/source-progress"), {
         method: "POST",
         headers: {
           ...this.migrationResumableControlHeaders(lease),
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({ migrationGeneration: lease.transportGeneration, ...progress }),
+        body: JSON.stringify({
+          migrationGeneration: lease.transportGeneration,
+          ...progress,
+          ...(receipt ? { userIgnoreAdditions: receipt } : {}),
+        }),
         signal,
       }).then((response) => {
         if (response.status === 404) disabled = true;
+        // Any answer but a 5xx settles it; a Server that refuses the body must
+        // not cost the run its progress reports. Network errors and 5xx retry.
+        if (receipt && response.status < 500) {
+          unsentReceipt = null;
+          if (!response.ok) {
+            this.recordDaemonEvent("daemon.migration_transport.user_ignore", {
+              ...migrationTraceIdentityAttrs(lease, "user_ignore"),
+              outcome: "receipt_refused",
+              http_status: response.status,
+              written_count: receipt.written,
+              already_present_count: receipt.alreadyPresent,
+              rejected_count: receipt.rejected.length,
+            }, "error");
+          }
+        }
       }, () => undefined).finally(() => {
         inFlight = false;
       });
@@ -2705,6 +3965,9 @@ export class DaemonCore {
       }
       send(progress);
     };
+    if (unsentReceipt && this.serverAcceptsMigrationUserIgnoreReceipt()) {
+      send({ phase: "scanning", files: 0, bytes: 0 });
+    }
     return report;
   }
 
@@ -2714,10 +3977,10 @@ export class DaemonCore {
   ): Promise<void> {
     if (lease.transferKind !== "upload") throw new Error("MIGRATION_RESUMABLE_SOURCE_LEASE_INVALID");
     signal.throwIfAborted();
-    const launchId = this.agentManager.getAgentLaunchId(lease.agentId) ?? "none";
-    const sessionId = this.agentManager.getAgentSessionId(lease.agentId) ?? "none";
-    await this.agentManager.stopAgent(lease.agentId, { wait: true, silent: true });
-    if (this.agentManager.getRunningAgentIds().includes(lease.agentId)) {
+    const launchId = this.agentHosts.getAgentLaunchId(lease.agentId) ?? "none";
+    const sessionId = this.agentHosts.getAgentSessionId(lease.agentId) ?? "none";
+    await this.stopMigrationSourceAgent(lease, signal);
+    if (this.agentHosts.getRunningAgentIds().includes(lease.agentId)) {
       throw new Error("MIGRATION_SOURCE_QUIESCE_FAILED");
     }
     const quiesceResponse = await daemonFetch(
@@ -2753,6 +4016,10 @@ export class DaemonCore {
       );
     }
 
+    const workspacePath = path.join(this.agentsDataDir, lease.agentId);
+    // Before the export reads the ignore files, so it applies the new lines.
+    const userIgnoreReceipt = await this.writeMigrationUserIgnoreAdditions(lease, workspacePath);
+    signal.throwIfAborted();
     const streamed = await streamAgentMigrationResumableBundle({
       agentId: lease.agentId,
       migrationId: lease.migrationId,
@@ -2760,10 +4027,11 @@ export class DaemonCore {
       leaseId: lease.leaseId,
       sourceMachineId: lease.sourceMachineId,
       targetMachineId: lease.targetMachineId,
-      workspacePath: path.join(this.agentsDataDir, lease.agentId),
+      workspacePath,
       maxBytes: lease.maxBytes,
       signal,
-      onProgress: this.createMigrationSourceProgressReporter(lease, signal),
+      onProgress: this.createMigrationSourceProgressReporter(lease, signal, userIgnoreReceipt),
+      reportIgnoredBySource: () => migrationSummaryMayReportIgnoreSources(this.serverAcceptsMigrationIgnoreSources(), lease),
       uploadChunk: (chunk, bytes) => this.uploadStreamedMigrationChunk(lease, chunk, bytes, signal),
     });
     if (streamed.resizedEntryCount > 0) {
@@ -2773,6 +4041,163 @@ export class DaemonCore {
       );
     }
     await this.registerAndCompleteResumableUpload(lease, streamed, signal);
+  }
+
+  /**
+   * Reconciler step 14 (Q-H): the source stops the agent only once it is
+   * quiet. The step 13 drain, for this agent only (AgentDrains): its new
+   * deliveries and reminders are held, it is waited for until it is idle
+   * (agentIdle.ts with `ignoreUntoldInbox`), at most until the lease's
+   * `sourceDrainUntil` and AGENT_DRAIN_MAX_DEADLINE_MS, and then stopped as
+   * before (stop·kill), with the hold still on. Its end hands nothing over
+   * here: what was held went with the process and stays unread on the server
+   * (the server queues a migrating agent's messages; the target answers them).
+   * Control is never held: an owner's Stop during the wait stops it at once,
+   * and the wait ends quiet at the next check.
+   *
+   * The migration cancelled during the wait: the hold is released (the held
+   * input is delivered), the agent keeps running here, and the run ends
+   * cancelled. An agent that cannot run (agentStopWaitReason: a credential
+   * hold, an exhausted quota, a runtime mismatch) with no turn in flight is
+   * not waited for: traced `not_runnable` with its reason; the stop, the
+   * `raft proc` jobs, the quiesce and the bundle follow as for a quiet one.
+   * A lease without `sourceDrainUntil` (an older Server, whose
+   * prep deadline has no room for the wait) or a host without the drain
+   * stops at once, as before. Traced `daemon.migration_transport.source_drain`.
+   */
+  private async stopMigrationSourceAgent(lease: AgentMigrationTransportLeaseMessage, signal: AbortSignal): Promise<void> {
+    await this.drainAndStopMigrationSourceAgent(lease, signal);
+    // `raft proc`: the agent is moving away, so its jobs here stop with it,
+    // before its workspace is packed. Not when the wait was cancelled (that
+    // throws above): the agent stays.
+    await this.stopProcJobsForAgent(lease.agentId, "migrated");
+  }
+
+  private async drainAndStopMigrationSourceAgent(lease: AgentMigrationTransportLeaseMessage, signal: AbortSignal): Promise<void> {
+    const { agentId } = lease;
+    const drainUntilMs = lease.sourceDrainUntil === undefined ? Number.NaN : Date.parse(lease.sourceDrainUntil);
+    const beginDrain = this.agentHosts.beginDrain;
+    if (!Number.isFinite(drainUntilMs) || !beginDrain) {
+      await this.agentHosts.stopAgent(agentId, { wait: true, silent: true });
+      return;
+    }
+    const drainStartMs = currentTimeMs();
+    const deadlineMs = clampAgentDrainDeadlineMs(drainUntilMs - drainStartMs);
+    const trace = (outcome: "quiet" | "not_runnable" | "deadline" | "ended" | "aborted" | "not_running", attrs: Record<string, unknown> = {}) => {
+      this.recordDaemonEvent("daemon.migration_transport.source_drain", {
+        ...migrationTraceIdentityAttrs(lease, "source_drain"),
+        outcome,
+        deadline_ms: deadlineMs,
+        ...attrs,
+      });
+    };
+    if (!this.agentHosts.getRunningAgentIds().includes(agentId)) {
+      trace("not_running", { waited_ms: 0 });
+      await this.agentHosts.stopAgent(agentId, { wait: true, silent: true });
+      return;
+    }
+    signal.throwIfAborted();
+    const release = () => this.agentHosts.endDrain?.(agentId);
+    signal.addEventListener("abort", release, { once: true });
+    let summary: AgentDrainSummary;
+    try {
+      const drained = beginDrain.call(this.agentHosts, { deadlineMs, agentId });
+      // The drain holds now (begin reads the host synchronously): why the agent is not quiet.
+      this.reportMigrationSourceDraining(lease, signal, drainStartMs + deadlineMs, deadlineMs);
+      summary = await drained;
+    } finally {
+      signal.removeEventListener("abort", release);
+    }
+    if (signal.aborted) {
+      release();
+      trace("aborted", { waited_ms: summary.durationMs });
+      signal.throwIfAborted();
+    }
+    try {
+      await this.agentHosts.stopAgent(agentId, { wait: true, silent: true });
+    } finally {
+      release();
+    }
+    // Quiet only because it cannot run (agentStopWaitReason): what a turn
+    // would have settled was not waited for, and stays unread on the server.
+    const notRunnable = summary.finished === "quiet" ? summary.notRunnable?.find((each) => each.agentId === agentId) : undefined;
+    trace(notRunnable ? "not_runnable" : summary.finished, {
+      waited_ms: summary.durationMs,
+      hit_deadline: summary.finished === "deadline",
+      live: summary.live,
+      not_quiet_reason: summary.notQuiet.map((each) => each.reason).join(",") || undefined,
+      ...(notRunnable ? { not_runnable_reason: notRunnable.reason, not_waited_for: notRunnable.settled } : {}),
+    });
+  }
+
+  /**
+   * One best-effort `draining` report to source-progress as the source drain
+   * begins, so the owner sees what the migration waits for instead of a
+   * silent stopping step. Only to a Server that advertises
+   * SERVER_CAPABILITY_MIGRATION_SOURCE_DRAIN_PROGRESS_V1 (an older one's
+   * strict schema refuses the phase), only for a wait with a deadline ahead,
+   * and not when the agent is already quiet (the drain ends at once). Never
+   * awaited: a failed or slow Server costs the drain nothing.
+   */
+  private reportMigrationSourceDraining(
+    lease: AgentMigrationTransportLeaseMessage,
+    signal: AbortSignal,
+    drainUntilMs: number,
+    deadlineMs: number,
+  ): void {
+    try {
+      if (deadlineMs <= 0 || signal.aborted || !this.serverAcceptsMigrationSourceDrainProgress()) return;
+      const progress = this.agentHosts.drainProgress?.(lease.agentId) ?? null;
+      const reason = progress?.notQuiet.find((each) => each.agentId === lease.agentId)?.reason;
+      if (progress && !reason) return;
+      void daemonFetch(this.migrationResumableControlUrl(lease, "/source-progress"), {
+        method: "POST",
+        headers: {
+          ...this.migrationResumableControlHeaders(lease),
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          migrationGeneration: lease.transportGeneration,
+          phase: "draining",
+          drainUntil: new Date(drainUntilMs).toISOString(),
+          ...(reason ? { waitingFor: migrationSourceDrainWaitingFor(reason) } : {}),
+        }),
+        signal,
+      }).catch(() => undefined);
+    } catch {
+      // Best effort: the report never fails the drain.
+    }
+  }
+
+  /**
+   * Writes the source lease's `userIgnoreAdditions` into `.raftbackupignore.user`.
+   * A failure fails the migration like any other source error (transport-lost
+   * with MIGRATION_USER_IGNORE_WRITE_FAILED). Traces counts and the failure
+   * reason only, never a path or the name.
+   */
+  private async writeMigrationUserIgnoreAdditions(
+    lease: AgentMigrationTransportLeaseMessage,
+    workspacePath: string,
+  ): Promise<AgentMigrationUserIgnoreAdditionsReceipt | null> {
+    try {
+      const outcome = await writeAgentMigrationUserIgnoreAdditions({ workspacePath, lease, now: currentDate() });
+      if (!outcome) return null;
+      this.recordDaemonEvent("daemon.migration_transport.user_ignore", {
+        ...migrationTraceIdentityAttrs(lease, "user_ignore"),
+        outcome: outcome.receipt.written > 0 ? "written" : "already_present",
+        written_count: outcome.receipt.written,
+        already_present_count: outcome.receipt.alreadyPresent,
+        rejected_count: outcome.rejectedCount,
+      });
+      return outcome.receipt;
+    } catch (err) {
+      this.recordDaemonEvent("daemon.migration_transport.user_ignore", {
+        ...migrationTraceIdentityAttrs(lease, "user_ignore"),
+        outcome: "failed",
+        reason: err instanceof AgentMigrationUserIgnoreWriteError ? err.reason : "write_failed",
+      }, "error");
+      throw err instanceof AgentMigrationUserIgnoreWriteError ? err : new AgentMigrationUserIgnoreWriteError("write_failed");
+    }
   }
 
   /** Streamed bundles: records the chunk with the server, then uploads it unless it is already there. */
@@ -2936,7 +4361,7 @@ export class DaemonCore {
       // Until the flip the server keeps authority on the source, so this
       // directory is not the agent's live workspace, unless the agent is
       // somehow running here, in which case nothing is touched.
-      if (this.agentManager.getRunningAgentIds().includes(lease.agentId)) {
+      if (this.agentHosts.getRunningAgentIds().includes(lease.agentId)) {
         throw new Error("MIGRATION_WORKSPACE_ALREADY_EXISTS");
       }
       const { quarantinePath } = await quarantinePreexistingAgentWorkspace({
@@ -3109,43 +4534,46 @@ export class DaemonCore {
     control: AgentMigrationControlManifest;
     controlSha256: string;
   }> {
-    const expiresAtMs = Date.parse(lease.expiresAt);
-    let delayMs = MIGRATION_OBJECT_STORE_DOWNLOAD_RETRY_INITIAL_MS;
-    while (currentTimeMs() < expiresAtMs) {
-      signal.throwIfAborted();
-      const url = this.migrationResumableControlUrl(lease, "/control");
-      url.searchParams.set("role", "target");
-      const response = await daemonFetch(url, {
-        method: "GET",
-        headers: this.migrationResumableControlHeaders(lease),
-        signal,
-      });
-      if (response.ok) {
-        const body = await response.json() as {
-          control?: AgentMigrationControlManifest;
-          controlSha256?: string;
-          uploadComplete?: boolean;
-        };
-        if (body.control && body.controlSha256 && body.uploadComplete) {
-          const validated = validateAgentMigrationControlManifest(body.control);
-          if (validated.sha256 !== body.controlSha256) {
-            throw new Error("MIGRATION_CONTROL_DIGEST_MISMATCH");
-          }
-          return { control: body.control, controlSha256: body.controlSha256 };
+    return await pollMigrationResumableControl({
+      expiresAtMs: Date.parse(lease.expiresAt),
+      signal,
+      poll: () => this.fetchResumableControlOnce(lease, signal),
+    });
+  }
+
+  /** One control poll: the control once the upload is complete, null to poll again; throws to stop. */
+  private async fetchResumableControlOnce(
+    lease: AgentMigrationTransportLeaseMessage,
+    signal: AbortSignal,
+  ): Promise<{ control: AgentMigrationControlManifest; controlSha256: string } | null> {
+    const url = this.migrationResumableControlUrl(lease, "/control");
+    url.searchParams.set("role", "target");
+    const response = await daemonFetch(url, {
+      method: "GET",
+      headers: this.migrationResumableControlHeaders(lease),
+      signal,
+    });
+    if (response.ok) {
+      const body = await response.json() as {
+        control?: AgentMigrationControlManifest;
+        controlSha256?: string;
+        uploadComplete?: boolean;
+      };
+      if (body.control && body.controlSha256 && body.uploadComplete) {
+        const validated = validateAgentMigrationControlManifest(body.control);
+        if (validated.sha256 !== body.controlSha256) {
+          throw new Error("MIGRATION_CONTROL_DIGEST_MISMATCH");
         }
-      } else if (response.status !== 409 && !isRetryableMigrationObjectStoreDownloadStatus(response.status)) {
-        throw await migrationStepResponseError(
-          "MIGRATION_CONTROL_DOWNLOAD_FAILED",
-          response,
-          "control_wait",
-        );
+        return { control: body.control, controlSha256: body.controlSha256 };
       }
-      const remainingMs = expiresAtMs - currentTimeMs();
-      if (remainingMs <= 0) break;
-      await waitForAmbientBackoff(Math.min(delayMs, remainingMs), signal);
-      delayMs = Math.min(delayMs * 2, MIGRATION_OBJECT_STORE_DOWNLOAD_RETRY_MAX_MS);
+    } else if (response.status !== 409 && !isRetryableMigrationObjectStoreDownloadStatus(response.status)) {
+      throw await migrationStepResponseError(
+        "MIGRATION_CONTROL_DOWNLOAD_FAILED",
+        response,
+        "control_wait",
+      );
     }
-    throw new Error("MIGRATION_LEASE_EXPIRED");
+    return null;
   }
 
   private async fetchResumableChunkPlan(
@@ -3319,12 +4747,14 @@ export class DaemonCore {
     let delayMs = MIGRATION_OBJECT_STORE_DOWNLOAD_RETRY_INITIAL_MS;
     let lastStatus: number | null = null;
     let lastErrorClass: string | null = null;
+    let noResponseSinceMs: number | null = null;
 
     while (currentTimeMs() < expiresAtMs) {
       signal.throwIfAborted();
       attempt += 1;
       try {
         const response = await request();
+        noResponseSinceMs = null;
         if (response.ok || !isRetryableResumableMigrationStatus(response.status, retryNotFound)) {
           return response;
         }
@@ -3332,8 +4762,16 @@ export class DaemonCore {
         lastErrorClass = null;
         await response.body?.cancel().catch(() => undefined);
       } catch (error) {
+        signal.throwIfAborted();
         lastStatus = null;
         lastErrorClass = errorClassOf(error);
+        noResponseSinceMs ??= currentTimeMs();
+        if (
+          (operation === "chunk_upload" || operation === "chunk_download")
+          && currentTimeMs() - noResponseSinceMs >= MIGRATION_OBJECT_STORE_UNREACHABLE_MS
+        ) {
+          throw new Error("MIGRATION_OBJECT_STORE_UNREACHABLE");
+        }
       }
 
       const remainingMs = expiresAtMs - currentTimeMs();
@@ -3549,7 +4987,7 @@ export class DaemonCore {
         migrationStatePathSegment(message.transportGeneration),
       ), { recursive: true, force: true });
       if (message.stopAgent) {
-        await this.agentManager.stopAgent(message.agentId, { wait: true });
+        await this.agentHosts.stopAgent(message.agentId, { wait: true });
       }
       if (activeLeaseMatches) {
         this.migrationTransferLease = null;
@@ -3690,7 +5128,7 @@ export class DaemonCore {
    * committed onto this computer (the agent moved back).
    */
   private async assertMigrationSourceWorkspaceArchivable(agentId: string, migrationCreatedAt?: string): Promise<void> {
-    if (this.agentManager.getRunningAgentIds().includes(agentId)) {
+    if (this.agentHosts.getRunningAgentIds().includes(agentId)) {
       throw new Error("MIGRATION_WORKSPACE_ARCHIVE_AGENT_RUNNING");
     }
     const createdAtMs = migrationCreatedAt ? Date.parse(migrationCreatedAt) : Number.NaN;
@@ -3798,6 +5236,7 @@ export class DaemonCore {
       resource: {
         daemonVersion: this.daemonVersion,
         computerVersion: this.computerVersion,
+        computerBuildSha: this.computerBuildSha,
       },
       actor: {
         serverId: this.observedServerId,
@@ -3832,6 +5271,11 @@ export class DaemonCore {
     }
     this.connection.send({ type: "machine:host_identity", hostIdHash: hash });
     this.recordDaemonEvent("daemon.host_identity.sent", {});
+  }
+
+  /** The server this connection authenticated as, or null before `machine:context` or after a conflict. */
+  private boundServerId(): string | null {
+    return this.machineContextConflict ? null : this.authenticatedMachineContext?.serverId ?? null;
   }
 
   private bindAuthenticatedMachineContext(
@@ -4187,7 +5631,9 @@ export class DaemonCore {
     this.agentManager.settleServerStartNotSpawned(
       msg.agentId,
       msg.launchId,
-      err instanceof LocalStartRefusedError ? err.reason : "start_rejected",
+      err instanceof LocalStartRefusedError || err instanceof OarOnlyStartError
+        ? (err instanceof LocalStartRefusedError ? err.reason : err.notSpawnedReason)
+        : "start_rejected",
     );
     const classification = classifySpawnFailure(err);
     logger.error(`[Agent ${msg.agentId}] Start failed (${classification.reason}): ${classification.detail}`);
@@ -4204,10 +5650,58 @@ export class DaemonCore {
       session_id_present: Boolean(msg.config.sessionId),
       // The shown refusal text (with the way out) where this daemon refused the start itself.
       ...(err instanceof LocalStartRefusedError ? { local_refusal_detail: err.message } : {}),
+      ...(err instanceof OarOnlyStartError ? { oar_only_host_reason: err.hostReason } : {}),
+      // Variable names only, never values.
+      ...(err instanceof AgentEnvVarsNotAllowedError
+        ? { refused_variable_names: err.names.join(","), refused_invalid_name_count: err.invalidNameCount }
+        : {}),
     }, "error", startSpan);
     // task #1123: the typed reason travels beside the human text so the web
     // picks copy by reason instead of parsing the detail string.
     this.agentManager.reportStartFailure(msg.agentId, msg.launchId, classification, msg.config.model);
+  }
+
+  /**
+   * Reconciler step 11 (`agent:config`): the agent's current config. Dropped
+   * when it is malformed or not newer than the last config applied for the
+   * agent (AgentConfigRevisions: frames may arrive out of order); otherwise
+   * the host that owns the agent takes it. Never a wake: a running session
+   * whose runtime spec drifted is stopped once idle, and the next start runs
+   * on the new config.
+   */
+  private handleAgentConfigMessage(msg: Extract<ServerToMachineMessage, { type: "agent:config" }>): void {
+    const { agentId, revision } = msg;
+    if (!msg.config || typeof msg.config !== "object" || typeof revision !== "number" || !Number.isFinite(revision)) {
+      logger.warn(`[Agent ${agentId}] Ignoring malformed agent:config`);
+      this.recordDaemonEvent("daemon.agent.config_push", { agentId, outcome: "malformed" }, "error");
+      return;
+    }
+    if (!this.configRevisions.acceptPush(agentId, revision)) {
+      const current = this.configRevisions.current(agentId);
+      logger.info(`[Agent ${agentId}] Ignoring config revision ${revision}: revision ${current ?? "?"} already applied`);
+      this.recordDaemonEvent("daemon.agent.config_push", { agentId, revision, current_revision: current, outcome: "stale_dropped" });
+      return;
+    }
+    this.agentHosts.applyConfig?.(agentId, withConfigRevision(msg.config, revision), revision);
+    this.localScheduleRuntime.noteMigrationReadiness(agentId, msg.config.migrationReadiness);
+  }
+
+  /**
+   * Reconciler step 11d: the config revision each running agent applied, for
+   * `ready`, so the server sends a push this daemon never got again. The
+   * highest one applied (`AgentConfigRevisions.current`): an older start that
+   * kept a newer pushed config reports the newer one, so the server never
+   * re-sends what the daemon deliberately kept. Agents whose revision is
+   * unknown (started by an older server, or before a daemon restart) are left
+   * out.
+   */
+  private runningAgentConfigRevisions(runningAgentIds: readonly string[]): Record<string, number> {
+    const revisions: Record<string, number> = {};
+    for (const agentId of runningAgentIds) {
+      const revision = this.configRevisions.current(agentId);
+      if (revision !== undefined) revisions[agentId] = revision;
+    }
+    return revisions;
   }
 
   // One consumer span covers the whole start request, including duplicate
@@ -4315,6 +5809,11 @@ export class DaemonCore {
       logger.warn(`[Agent ${msg.agentId}] Refused start ${msg.launchId ?? "(no launch)"}: claimed against an earlier connection`);
       return;
     }
+    // Before admission, so a start no host here can run takes no recovery grant.
+    if (!this.oarHostEnabled) {
+      const oarOnlyRefusal = oarOnlyStartWithoutOarHost(msg.config.runtime);
+      if (oarOnlyRefusal) throw oarOnlyRefusal;
+    }
     // RFC 071 outbox local refusal: before the agent counts as starting, so a
     // refused start leaves no starting state behind.
     const admission = this.localStartAdmission(msg);
@@ -4330,8 +5829,21 @@ export class DaemonCore {
     let replayDeliveries: AgentDeliverMessage[] = [];
     try {
       this.observeRuntimeContext(msg.config);
-      const agentCredential = await this.mintRunnerCredential(msg.agentId, msg.config, startSpan);
-      const config = { ...msg.config, agentCredentialKey: agentCredential.apiKey, agentCredentialId: agentCredential.credentialId };
+      // #wg-rbac:#27: a start the hosts will rebind onto a running (or
+      // starting, queued) launch runs on that launch's credential, so none is
+      // minted for it; a minted one nothing used would stay valid. Decided
+      // with no wait before `startAgent`, as the hosts decide. Should the host
+      // still start it afresh, the spawn mints one (`buildSpawnConfig`); a
+      // start minted here that ends up rebound is revoked by the host.
+      const agentCredential = this.agentHosts.holdsAgentStart(msg.agentId)
+        ? null
+        : await this.mintRunnerCredential(msg.agentId, msg.config, startSpan);
+      // task #1357 item 1: the config carries its revision into every copy,
+      // so a Pi session reports the revision it was built from.
+      const startConfig = withConfigRevision(msg.config, msg.type === "agent:start" ? msg.configRevision : undefined);
+      const config = agentCredential
+        ? { ...startConfig, agentCredentialKey: agentCredential.apiKey, agentCredentialId: agentCredential.credentialId }
+        : startConfig;
 
       const pendingDeliveries = this.coreStartPendingDeliveries.get(msg.agentId) || [];
       this.coreStartPendingDeliveries.delete(msg.agentId);
@@ -4350,7 +5862,13 @@ export class DaemonCore {
         }
       }
 
-      const startPromise = this.agentManager.startAgent(
+      // Reconciler step 11: this start's config is as new as its revision.
+      this.configRevisions.noteStart(msg.agentId, msg.type === "agent:start" ? msg.configRevision : undefined, config);
+      // A start older than an applied config keeps that config's readiness.
+      if (!this.configRevisions.isStaleStart(config)) {
+        this.localScheduleRuntime.noteMigrationReadiness(msg.agentId, msg.config.migrationReadiness);
+      }
+      const startPromise = this.agentHosts.startAgent(
         msg.agentId,
         config,
         wakeMessage,
@@ -4366,7 +5884,7 @@ export class DaemonCore {
         claimedEpoch ?? null,
       );
       if (msg.startDispatchId) {
-        const acceptance = this.agentManager.getAgentStartAcceptance(msg.agentId);
+        const acceptance = this.agentHosts.getAgentStartAcceptance(msg.agentId);
         // Machine-local evidence for the dispatch → ack → frame chain (#1129):
         // the runner log must show which launch this daemon acknowledged.
         logger.info(
@@ -4406,17 +5924,63 @@ export class DaemonCore {
   private handleMessage(msg: ServerToMachineMessage) {
     const summary = summarizeIncomingMessage(msg);
     logger.info(`[Daemon] Received ${msg.type}${summary ? ` ${summary}` : ""}`);
+    // Every agent message names a workspace as path.join(dataDir, agentId)
+    // (start, reset = rm -rf, workspace read/list, migration import): an id
+    // that is not one path segment would reach outside dataDir.
+    const unsafeAgentId = unsafeAgentIdOf(msg);
+    if (unsafeAgentId !== null) {
+      logger.warn(`[Daemon] Refused ${msg.type}: agentId is not a single path segment`);
+      this.recordDaemonEvent("daemon.server_message.unsafe_agent_id", {
+        message_type: msg.type,
+        agent_id_length: unsafeAgentId.length,
+      }, "error");
+      return;
+    }
     if (this.localScheduleRuntime.handleServerMessage(msg)) return;
 
     switch (msg.type) {
       case "machine:context":
         this.bindAuthenticatedMachineContext(msg);
         this.observeServerContextCapabilities(msg.capabilities ?? []);
+        // Additive: an older server omits it (off). Each context restates it.
+        this.serverPrivacyMode = msg.privacyMode === true;
+        this.applyServerTraceUploadUrl(msg.traceUploadUrl);
         // RFC 071 outbox: deliver only to a server that acknowledges; an older
         // server (or a context conflict) pauses delivery and keeps the queue.
         this.serverAcksRuntimeOutcomes = !this.machineContextConflict
           && (msg.capabilities ?? []).includes(SERVER_CAPABILITY_RUNTIME_OUTCOME_ACK_V1);
         this.runtimeOutcomeOutbox.onServerContext(this.serverAcksRuntimeOutcomes);
+        // Agent typing line: send intents only to a server that reads them.
+        this.agentManager.setServerSendIntentCapable?.(!this.machineContextConflict
+          && (msg.capabilities ?? []).includes(SERVER_CAPABILITY_AGENT_SEND_INTENT_V1));
+        // Task writes attest by landing only to a server that checks by landing.
+        setAgentProxyServerChecksTaskWriteLanding(!this.machineContextConflict
+          && (msg.capabilities ?? []).includes(SERVER_CAPABILITY_TASK_WRITE_LANDING_V1));
+        // First-turn ends (unread the agent owes nothing in): only to a server that reads them.
+        this.agentHosts.setServerTurnEndedCapable?.(!this.machineContextConflict
+          && (msg.capabilities ?? []).includes(SERVER_CAPABILITY_TURN_ENDED_V1));
+        // Reconciler step 12: the start-failure reasons of a runtime that failed after it started.
+        this.agentHosts.setServerStickyFailureReasonsCapable?.(!this.machineContextConflict
+          && (msg.capabilities ?? []).includes(SERVER_CAPABILITY_STICKY_FAILURE_REASONS_V1));
+        // Idle task reminder: asked only of a server that has the route.
+        this.localScheduleRuntime.setServerIdleTaskReminderCapable(!this.machineContextConflict
+          && (msg.capabilities ?? []).includes(SERVER_CAPABILITY_IDLE_TASK_REMINDER_V1));
+        {
+          // task #17: status queries run only for a server that reads the
+          // report, and only for the runtimes it reads (an older server
+          // refuses a report naming any other).
+          const reads = runtimeAuthRuntimesReadBy(this.machineContextConflict ? [] : (msg.capabilities ?? []));
+          const newlyReads = reads !== null && reads !== this.serverRuntimeAuthRuntimes;
+          this.serverRuntimeAuthRuntimes = reads;
+          if (newlyReads && this.runtimeAuthInventory) this.reportRuntimeAuthStatus("context", this.runtimeAuthInventory);
+          this.serverReadsRuntimeCredentialsChanged = !this.machineContextConflict
+            && (msg.capabilities ?? []).includes(SERVER_CAPABILITY_RUNTIME_CREDENTIALS_CHANGED_V1);
+          this.syncSharedCredentialWatch();
+        }
+        // #proj-raft-computer:#68: the readiness snapshot on every connect to a server that reads it.
+        this.serverReadsRuntimeReadiness = !this.machineContextConflict
+          && (msg.capabilities ?? []).includes(SERVER_CAPABILITY_RUNTIME_READINESS_V1);
+        this.sendRuntimeReadiness();
         // task #365: a proven never-created child is reported as `spawn_error`
         // only to a server that counts it AND acks outbox frames (the report
         // travels in the outbox; without acks it would sit there while the
@@ -4428,7 +5992,44 @@ export class DaemonCore {
             && (msg.capabilities ?? []).includes(SERVER_CAPABILITY_START_SPAWN_ERROR_V1),
           connectionEpochId: typeof msg.connectionEpochId === "string" && msg.connectionEpochId ? msg.connectionEpochId : null,
         });
+        // Flag changes are not replayed after a disconnect, so every
+        // (re)connect to a server that answers asks once (after a random delay).
+        this.serverFeaturesCapable = !this.machineContextConflict
+          && (msg.capabilities ?? []).includes(SERVER_CAPABILITY_SERVER_FEATURES_V1);
+        this.agentManager.setServerFeaturesCapable?.(this.serverFeaturesCapable);
+        if (this.serverFeaturesCapable) {
+          this.serverFeaturesRefresh.schedule();
+        } else {
+          // No answers from this server (or a context for another one):
+          // the last one no longer says anything about its starts.
+          this.serverFeaturesRefresh.reset();
+          this.agentManager.forgetServerFeatures?.();
+        }
         break;
+
+      // A flag affecting this server may have changed (shared featuresChanged.ts):
+      // ask for the current values. Only for the server this connection is bound to.
+      case "server:features-changed":
+        if (this.serverFeaturesCapable && msg.serverId === this.boundServerId()) this.serverFeaturesRefresh.schedule();
+        break;
+
+      case "server:features": {
+        const boundServerId = this.boundServerId();
+        const outstanding = this.serverFeaturesRefresh.outstandingRequest;
+        const features = this.serverFeaturesRefresh.acceptReply(msg, boundServerId);
+        if (!features) {
+          logger.warn(`[Daemon] Ignoring server:features (request ${String(msg.requestId).slice(0, 8)}, server ${String(msg.serverId).slice(0, 8)}): not the answer to the latest request on this connection's server`);
+          break;
+        }
+        this.recordDaemonEvent("daemon.server_features.received", {
+          enabled_apps_count: features.enabledApps?.length ?? 0,
+          ...(outstanding ? { waited_ms: currentTimeMs() - outstanding.sentAtMs } : {}),
+        });
+        // Both hosts (the router hands it to each): a session that started
+        // on other values is stopped once idle (reconciler step 6).
+        this.agentHosts.applyServerFeatures?.(features);
+        break;
+      }
 
       case "machine:host_identity:request":
         void this.replyHostIdentity();
@@ -4444,27 +6045,49 @@ export class DaemonCore {
         this.handleAgentStartMessage(msg);
         break;
 
-      case "agent:start:wiki":
-        this.agentManager.noteServerStartAccepted(msg.agentId, msg.launchId);
-        this.reportAgentStartFailure(msg, new Error("Wiki has been retired"));
+      case "agent:config":
+        this.handleAgentConfigMessage(msg);
         break;
 
-      case "agent:workspace:ensure-wiki":
-        this.connection.send({
-          type: "agent:workspace:wiki_ensured",
-          agentId: msg.agentId,
-          requestId: msg.requestId,
-          success: false,
-          packId: msg.pack.packId,
-          files: [],
-          error: "Wiki has been retired",
-        });
+      case "agent:stop": {
+        // `reason` is additive (a server that predates it sends none); read
+        // it as an optional string, so any other value reads as `lifecycle`.
+        const stopReason = procStopReasonForAgentStop((msg as { reason?: unknown }).reason);
+        logger.info(`[Agent ${msg.agentId}] Stop requested${stopReason ? ` (${stopReason})` : ""}`);
+        this.agentHosts.stopAgent(msg.agentId);
+        // `raft proc`: the owner's Stop, a delete or a migration ends the
+        // agent's jobs; a lifecycle stop (or no reason) leaves them running.
+        if (stopReason) void this.stopProcJobsForAgent(msg.agentId, stopReason);
         break;
+      }
 
-      case "agent:stop":
-        logger.info(`[Agent ${msg.agentId}] Stop requested`);
-        this.agentManager.stopAgent(msg.agentId);
+      case "agent:interrupt-turn": {
+        // task #25 step 2: a person stopped this turn; the agent keeps running.
+        logger.info(`[Agent ${msg.agentId}] Stop of the current turn requested`);
+        const { agentId, requestId } = msg;
+        void this.agentHosts.interruptTurn(agentId).then(
+          (result) => this.connection.send({ type: "agent:interrupt-turn:result", agentId, requestId, ...result }),
+          (error: unknown) => {
+            logger.warn(`[Agent ${agentId}] Stopping the current turn failed: ${error instanceof Error ? error.message : String(error)}`);
+            this.connection.send({ type: "agent:interrupt-turn:result", agentId, requestId, outcome: "not_running" });
+          },
+        );
         break;
+      }
+
+      case "agent:interrupt-subagent": {
+        // #proj-runtime:#41: a person stopped one sub-agent; the agent keeps running.
+        const { agentId, requestId, subagentTaskId } = msg;
+        logger.info(`[Agent ${agentId}] Stop of a sub-agent requested`);
+        void this.agentHosts.interruptSubagent(agentId, subagentTaskId).then(
+          (outcome) => this.connection.send({ type: "agent:interrupt-subagent:result", agentId, requestId, outcome }),
+          (error: unknown) => {
+            logger.warn(`[Agent ${agentId}] Stopping a sub-agent failed: ${error instanceof Error ? error.message : String(error)}`);
+            this.connection.send({ type: "agent:interrupt-subagent:result", agentId, requestId, outcome: "not_running" });
+          },
+        );
+        break;
+      }
 
       case "agent:wake:outcome":
         this.agentManager.handleServerWakeOutcome(msg);
@@ -4477,7 +6100,7 @@ export class DaemonCore {
 
       case "agent:inbox:purge":
         logger.info(`[Agent ${msg.agentId}] Inbox purge requested (${msg.channelIds.length} channels, reason=${msg.reason || "server_purge"})`);
-        this.agentManager.purgeInboxMessagesForChannels(msg.agentId, msg.channelIds, msg.reason || "server_purge");
+        this.agentHosts.purgeInboxMessagesForChannels(msg.agentId, msg.channelIds, msg.reason || "server_purge");
         break;
 
       case "agent:deliver":
@@ -4536,7 +6159,7 @@ export class DaemonCore {
           // (`daemon.agent.delivery.routed`, consumption, stdin retries) belong
           // under this span. Work that outlives the delivery, such as an idle
           // auto-restart spawn, leaves the scope inside the agent manager.
-          const acceptedOrPromise = runWithActiveSpan(span, () => this.agentManager.deliverMessage(msg.agentId, msg.message, {
+          const acceptedOrPromise = runWithActiveSpan(span, () => this.agentHosts.deliverMessage(msg.agentId, msg.message, {
             deliveryId: msg.deliveryId,
             transient: msg.transient ?? false,
             mentionDelivery: msg.mentionDelivery,
@@ -4594,7 +6217,7 @@ export class DaemonCore {
         });
         logger.info(`[Agent ${msg.agentId}] Runtime profile migration received (${msg.migrationKey})`);
         Promise.resolve(
-          this.agentManager.deliverRuntimeProfileNotification(msg.agentId, msg.migrationKey, "migration", msg.message, formatTraceparent(span.context), msg.launchId || null),
+          this.agentHosts.deliverRuntimeProfileNotification(msg.agentId, msg.migrationKey, "migration", msg.message, formatTraceparent(span.context), msg.launchId || null),
         ).then((accepted) => {
           span.end("ok", { attrs: { outcome: accepted ? "accepted" : "no_injection_path" } });
         }, (err: unknown) => {
@@ -4618,7 +6241,7 @@ export class DaemonCore {
         });
         logger.info(`[Agent ${msg.agentId}] Runtime profile daemon release notice received (${msg.noticeKey})`);
         Promise.resolve(
-          this.agentManager.deliverRuntimeProfileNotification(msg.agentId, msg.noticeKey, "daemon_release_notice", msg.message, formatTraceparent(span.context), msg.launchId || null),
+          this.agentHosts.deliverRuntimeProfileNotification(msg.agentId, msg.noticeKey, "daemon_release_notice", msg.message, formatTraceparent(span.context), msg.launchId || null),
         ).then((accepted) => {
           span.end("ok", { attrs: { outcome: accepted ? "accepted" : "no_injection_path" } });
         }, (err: unknown) => {
@@ -4719,13 +6342,17 @@ export class DaemonCore {
         // task #1228 ①: collect → send the result frame → only then upload the
         // transcript_outcome object (best-effort, never retried, never able to
         // delay or rewrite the result).
+        // RAFT_PRIVACY_MODE: nothing is collected or uploaded; the server gets
+        // the collector's own error result (reachable: false) and nothing else.
+        const privacyMode = this.privacyModeOn();
         const daemonVersion = readBakedDaemonVersion();
         const reportGeneratedAt = msg.feedbackReportGeneratedAt ?? currentDate().toISOString();
         void runFeedbackTranscriptRequest({
-          collect: () => this.agentManager.collectFeedbackTranscript(msg.agentId, msg.feedbackReportId, {
+          collect: privacyMode ? async () => feedbackTranscriptCollectorErrorResult(FEEDBACK_TRANSCRIPT_PRIVACY_MODE_ERROR) : () => this.agentManager.collectFeedbackTranscript(msg.agentId, msg.feedbackReportId, {
             reportGeneratedAt,
             reportTimeSource: msg.feedbackReportTimeSource ?? "server_request_received",
           }, {
+            serverLookup: feedbackTranscriptSessionLookupFromFrame(msg.sessionLookup),
             includeMachineLogTail: msg.includeMachineLogTail === true,
             machineLogPaths: this.runnerLogPathCandidates(),
             daemonVersion,
@@ -4754,11 +6381,19 @@ export class DaemonCore {
             msg.requestId,
             reportGeneratedAt,
           ),
-          workerConfigured: this.agentManager.feedbackUploadsConfigured,
+          workerConfigured: !privacyMode && this.agentManager.feedbackUploadsConfigured,
           tag: `report=${msg.feedbackReportId} agent=${msg.agentId} request=${msg.requestId}`,
         });
         break;
       }
+
+      case "agent:context_view_request":
+      case "agent:context_search_request":
+        // View Context v0, and an agent's search or read of a context:
+        // answered by at most one result POST (never a frame); the manager
+        // validates the frame and never throws.
+        void this.agentManager.handleAgentContextViewRequest?.(msg);
+        break;
 
       case "agent:activity_probe":
         // Server is asking for ground-truth current activity. Echo
@@ -4767,7 +6402,7 @@ export class DaemonCore {
         // this surface unobtrusive: probe response goes through the
         // existing ingest pipeline, with launch-guard / lifecycle
         // checks intact. See agentProcessManager.respondToActivityProbe.
-        this.agentManager.respondToActivityProbe(msg.agentId, msg.probeId);
+        this.agentHosts.respondToActivityProbe(msg.agentId, msg.probeId);
         break;
 
       case "machine:workspace:scan":
@@ -4780,6 +6415,11 @@ export class DaemonCore {
       case "machine:workspace:delete":
         logger.info(`[Daemon] Deleting workspace directory: ${msg.directoryName}`);
         this.agentManager.deleteWorkspaceDirectory(msg.directoryName).then((success) => {
+          if (success) {
+            this.localScheduleRuntime.onAgentWorkspaceDeleted(msg.directoryName);
+            // A workspace directory is named by its agent id: the agent is gone.
+            void this.stopProcJobsForAgent(msg.directoryName, "agent_deleted");
+          }
           this.connection.send({ type: "machine:workspace:delete_result", directoryName: msg.directoryName, success });
         });
         break;
@@ -4789,12 +6429,7 @@ export class DaemonCore {
       // as `machine:capabilities` — so re-emitting IS the answer, no bespoke
       // result message needed.
       case "machine:runtimes:rescan":
-        if (this.connection.connected) {
-          void this.emitReady(undefined, { publishCatalogForce: true }).then((readySent) => {
-            // task #1268: with async detection the catalog follows the round's inventory, not the pending frame.
-            if (readySent && !this.detectionRound) this.requestRuntimeModelCatalogPublish(true);
-          });
-        }
+        this.rescanRuntimes();
         break;
 
       case "machine:migration:source_workspace_archive": {
@@ -4888,13 +6523,75 @@ export class DaemonCore {
         break;
       }
 
+      // task #17: every field is checked here; anything malformed is dropped
+      // (a code is never echoed into a log or a trace, valid or not).
+      case "machine:runtime_auth:login:start": {
+        const loginId = typeof msg.loginId === "string" ? asRuntimeAuthLoginId(msg.loginId) : null;
+        // Kimi's start carries the region the person chose, and no other runtime's does;
+        // Pi's and OpenCode's the provider to sign in, and no other runtime's does;
+        // OpenCode's may name the OAuth method the person chose.
+        if (!loginId || !isRuntimeAuthRuntime(msg.runtime) || !runtimeAuthLoginRegionFits(msg.runtime, msg.region)
+          || !runtimeAuthProviderIdFits(msg.runtime, msg.providerId) || !runtimeAuthOAuthMethodFits(msg.runtime, msg.oauthMethod)) {
+          this.recordDaemonEvent("daemon.runtime_auth.message_dropped", { type: msg.type });
+          break;
+        }
+        this.runtimeAuth.startLogin(loginId, msg.runtime, msg.region, msg.providerId, msg.oauthMethod);
+        break;
+      }
+      case "machine:runtime_auth:login:code": {
+        const loginId = typeof msg.loginId === "string" ? asRuntimeAuthLoginId(msg.loginId) : null;
+        if (!loginId || !isRuntimeAuthPastedCode(msg.code)) {
+          this.recordDaemonEvent("daemon.runtime_auth.message_dropped", { type: msg.type });
+          break;
+        }
+        this.runtimeAuth.submitCode(loginId, msg.code);
+        break;
+      }
+      case "machine:runtime_auth:login:cancel": {
+        const loginId = typeof msg.loginId === "string" ? asRuntimeAuthLoginId(msg.loginId) : null;
+        if (!loginId) {
+          this.recordDaemonEvent("daemon.runtime_auth.message_dropped", { type: msg.type });
+          break;
+        }
+        this.runtimeAuth.cancelLogin(loginId);
+        break;
+      }
+      case "machine:runtime_auth:logout":
+        if (!isRuntimeAuthRequestId(msg.requestId) || !isRuntimeAuthRuntime(msg.runtime) || !runtimeAuthProviderIdFits(msg.runtime, msg.providerId)) {
+          this.recordDaemonEvent("daemon.runtime_auth.message_dropped", { type: msg.type });
+          break;
+        }
+        void this.runtimeAuth.logout(msg.requestId, msg.runtime, msg.providerId);
+        break;
+      case "machine:runtime_auth:providers":
+        if (!isRuntimeAuthRequestId(msg.requestId) || !isRuntimeAuthRuntime(msg.runtime) || !runtimeAuthSupports(msg.runtime, "connect_provider")) {
+          this.recordDaemonEvent("daemon.runtime_auth.message_dropped", { type: msg.type });
+          break;
+        }
+        void this.runtimeAuth.listProviders(msg.requestId, msg.runtime);
+        break;
+      case "machine:runtime_auth:connect_provider": {
+        // The message carries a provider's API key. It is checked field by
+        // field (no parser error can quote it), handed to the auth host, and
+        // dropped from the message, so nothing that reads `msg` later (an
+        // error report, a log) can reach it. Never logged or traced, valid or not.
+        const input = parseRuntimeAuthProviderConnectInput(msg);
+        Reflect.deleteProperty(msg, "apiKey");
+        if (!input.ok || !isRuntimeAuthRequestId(msg.requestId) || !isRuntimeAuthRuntime(msg.runtime) || !runtimeAuthSupports(msg.runtime, "connect_provider")) {
+          this.recordDaemonEvent("daemon.runtime_auth.message_dropped", { type: msg.type });
+          break;
+        }
+        void this.runtimeAuth.connectProvider(msg.requestId, msg.runtime, input.input);
+        break;
+      }
+
       case "machine:runtime_account_usage:refresh": {
         const provider: RuntimeAccountUsageProvider = msg.provider;
         void this.probeGate.run(`runtime_account_usage:${provider}`, () => this.runtimeAccountUsageCollector(provider)).then((snapshot: RuntimeAccountUsageSnapshot) => {
           this.connection.send({
             type: "machine:runtime_account_usage:snapshot",
             requestId: msg.requestId,
-            snapshot,
+            snapshot: this.snapshotForServer(snapshot),
           });
           this.recordDaemonEvent("daemon.runtime_account_usage.refresh", {
             outcome: "snapshot_sent",
@@ -4907,6 +6604,7 @@ export class DaemonCore {
               (total, account) => total + account.windows.filter((window) => window.status === "parse_unavailable").length,
               0,
             ),
+            ...limitResetsAvailableAttr(snapshot),
           });
         }).catch((err: unknown) => {
           logger.warn(`[Daemon] Runtime account usage refresh failed (${provider}): ${err instanceof Error ? err.message : String(err)}`);
@@ -4919,6 +6617,28 @@ export class DaemonCore {
         });
         break;
       }
+
+      case "machine:runtime_account_usage:limit_reset:redeem":
+        if (!isRuntimeAuthRequestId(msg.requestId) || !isRuntimeAccountUsageProvider(msg.provider) || !isRuntimeLimitResetIdempotencyKey(msg.idempotencyKey)
+          || (msg.kind !== undefined && !isRuntimeLimitResetKind(msg.kind))) {
+          this.recordDaemonEvent("daemon.runtime_account_usage.limit_reset", { outcome: "message_dropped" });
+          break;
+        }
+        void this.redeemRuntimeLimitReset(msg.requestId, msg.provider, msg.idempotencyKey, msg.kind);
+        break;
+
+      case "machine:runtime_account_usage:limit_resets:read":
+        if (!isRuntimeAuthRequestId(msg.requestId) || !isRuntimeAccountUsageProvider(msg.provider)) {
+          this.recordDaemonEvent("daemon.runtime_account_usage.limit_reset", { operation: "read", outcome: "message_dropped" });
+          break;
+        }
+        void this.readRuntimeLimitResets(msg.requestId, msg.provider, {
+          // Anything but an explicit `false` is "at the limit": the refusal is the safe side.
+          atFiveHourLimit: msg.atFiveHourLimit !== false,
+          atFiveHourLimitConsent: msg.atFiveHourLimitConsent === true,
+          includeFiveHour: msg.includeFiveHour === true,
+        });
+        break;
 
       case "machine:migration_transport:lease":
         this.handleMigrationTransportLease(msg);
@@ -4954,17 +6674,24 @@ export class DaemonCore {
           break;
         }
         if (operationId) this.handledComputerControlOperationIds.add(operationId);
+        // Reconciler step 13: only a runner with the drain channel drains
+        // (the service drains every runner through it), and never longer
+        // than the cap, whatever the Server asked for.
+        const drain = msg.type === "computer:upgrade" && this.upgradeDrain ? clampComputerUpgradeDrain(msg.drain) : null;
         this.recordDaemonEvent("daemon.computer_control.received", {
           action,
           handled: Boolean(this.options.onComputerControl),
           ...(operationId ? { operation_id: operationId } : {}),
           ...(requestId ? { request_id: requestId } : {}),
+          ...(drain ? { drain_ms: drain.deadlineMs } : {}),
         });
         if (this.options.onComputerControl) {
           const ctx: ComputerControlContext = {
+            flushUpgradeSteps: () => { void this.flushComputerUpgradeSteps(false); },
             operationId,
             requestId,
             ...(msg.type === "computer:upgrade" && typeof msg.targetVersion === "string" ? { targetVersion: msg.targetVersion } : {}),
+            ...(drain ? { drain } : {}),
           };
           // May be async while the runner relays supervisor progress; don't
           // block the message loop — surface failures via logs/trace.
@@ -5003,6 +6730,7 @@ export class DaemonCore {
               // receipt, so a lost message there waits out the request deadline.
               // An installer that gave up without stopping the service
               // (UPGRADE_INSTALLER_FAILED) is settled the same way.
+              const sent = this.connection.connected;
               this.connection.send({
                 type: "computer:upgrade:done",
                 requestId,
@@ -5010,6 +6738,12 @@ export class DaemonCore {
                 code: failure,
                 reason: message.replace(/[\u0000-\u001f\u007f]+/gu, " ").slice(0, 2048),
               });
+              if (action === "upgrade") {
+                this.recordComputerUpgradeReported(requestId, "upgrade_done", sent);
+                void this.flushComputerUpgradeSteps(false);
+                // The installer may have just left an operation it could not recover.
+                void this.reportComputerInstallerRepairHintChange();
+              }
             });
         } else {
           logger.info(`[Daemon] Ignoring computer:${action} — not launched by a Computer service.`);
@@ -5071,6 +6805,7 @@ export class DaemonCore {
   }
 
   private detectRuntimeModelOutcome(runtime: string, span: ActiveSpan): Promise<RuntimeModelSourceOutcome> {
+    if (this.runtimeModelDetector) return this.runtimeModelDetector(runtime);
     const driver = getDriver(runtime);
     const staticSource = driver ? getStaticRuntimeModelSourceSet(runtime) : undefined;
     if (typeof driver?.detectModels === "function") {
@@ -5095,6 +6830,21 @@ export class DaemonCore {
    * MODEL_CATALOG_RECONNECT_MIN_START_INTERVAL_MS. `rescan` forces a round. A trigger arriving mid-round is
    * folded into one follow-up round after the current one.
    */
+  /**
+   * Re-detects the installed runtimes and their models, and pushes both: the
+   * server's `machine:runtimes:rescan`, and a Pi sign-in change from the web
+   * (Pi lists the models of the providers it can authenticate). Only while
+   * connected: the next connect detects anyway.
+   */
+  private rescanRuntimes(authoritativeFor?: string): void {
+    if (!this.connection.connected) return;
+    if (authoritativeFor) this.authoritativeCatalogRuntimes.add(authoritativeFor);
+    void this.emitReady(undefined, { publishCatalogForce: true }).then((readySent) => {
+      // task #1268: with async detection the catalog follows the round's inventory, not the pending frame.
+      if (readySent && !this.detectionRound) this.requestRuntimeModelCatalogPublish(true);
+    });
+  }
+
   private requestRuntimeModelCatalogPublish(force: boolean): void {
     if (this.catalogPublishInFlight) {
       this.catalogPublishQueued = { force: force || (this.catalogPublishQueued?.force ?? false) };
@@ -5145,19 +6895,25 @@ export class DaemonCore {
         kind: "internal",
         attrs: { runtime },
       });
+      // Taken before the detection starts: only a detection that began after the
+      // sign-in change may clear the list. A round already detecting when it
+      // happened leaves the flag to the round queued behind it.
+      const authoritative = this.authoritativeCatalogRuntimes.delete(runtime);
       try {
         const outcome = await this.detectRuntimeModelOutcome(runtime, span);
         // The connect-time push always detects afresh; it also warms the form cache.
         this.runtimeModelCache.store(runtime, outcome);
-        const models = outcome.kind === "live" ? sanitizeCatalogModels(outcome.value.models) : [];
-        if (models.length > 0) {
+        const frame = runtimeModelCatalogFrame(runtime, outcome, authoritative);
+        const models = frame?.models ?? [];
+        if (frame) {
           if (!sameConnection()) {
             span.end("ok", { attrs: { outcome: "connection_changed", models_count: models.length } });
+            if (authoritative) this.authoritativeCatalogRuntimes.add(runtime);
             return false;
           }
-          this.connection.send({ type: "machine:runtime_models:catalog", runtime, models });
+          this.connection.send(frame);
         }
-        span.end("ok", { attrs: { outcome: models.length > 0 ? "sent" : outcome.kind, models_count: models.length } });
+        span.end("ok", { attrs: { outcome: models.length > 0 ? "sent" : frame ? "cleared" : outcome.kind, models_count: models.length } });
       } catch (err) {
         span.end("error", { attrs: { outcome: "error", error_class: errorClassOf(err) } });
       }
@@ -5173,6 +6929,130 @@ export class DaemonCore {
   private asyncDetectionAllowed(): boolean {
     const capabilities = this.serverContextCapabilities ?? new Set(this.connection.handshakeServerCapabilities);
     return capabilities.has(SERVER_CAPABILITY_RUNTIME_DETECTION_ASYNC_V1);
+  }
+
+  /** The server's migration summary accepts `excludedIgnoredBySource`. Context wins over the handshake header. */
+  private serverAcceptsMigrationIgnoreSources(): boolean {
+    if (this.machineContextConflict) return false;
+    const capabilities = this.serverContextCapabilities ?? new Set(this.connection.handshakeServerCapabilities);
+    return capabilities.has(SERVER_CAPABILITY_MIGRATION_BACKUP_IGNORE_SOURCES_V1);
+  }
+
+  /** The server's source-progress report accepts `userIgnoreAdditions`. Context wins over the handshake header. */
+  private serverAcceptsMigrationUserIgnoreReceipt(): boolean {
+    if (this.machineContextConflict) return false;
+    const capabilities = this.serverContextCapabilities ?? new Set(this.connection.handshakeServerCapabilities);
+    return capabilities.has(SERVER_CAPABILITY_MIGRATION_USER_IGNORE_RECEIPT_V1);
+  }
+
+  /** The server's source-progress report accepts `phase: "draining"`. Context wins over the handshake header. */
+  private serverAcceptsMigrationSourceDrainProgress(): boolean {
+    if (this.machineContextConflict) return false;
+    const capabilities = this.serverContextCapabilities ?? new Set(this.connection.handshakeServerCapabilities);
+    return capabilities.has(SERVER_CAPABILITY_MIGRATION_SOURCE_DRAIN_PROGRESS_V1);
+  }
+
+  /** The server's usage snapshot schema reads `limitResetsAvailable`. Context wins over the handshake header. */
+  private serverReadsLimitResets(): boolean {
+    if (this.machineContextConflict) return false;
+    const capabilities = this.serverContextCapabilities ?? new Set(this.connection.handshakeServerCapabilities);
+    return capabilities.has(SERVER_CAPABILITY_RUNTIME_ACCOUNT_USAGE_LIMIT_RESETS_V1);
+  }
+
+  /**
+   * Which window scopes the server's usage snapshot schema reads: every kind
+   * (V2, `models` included), `account` and `model` only (V1), or none.
+   * Context wins over the handshake header.
+   */
+  private serverWindowScopes(): "all" | "account_and_model" | "none" {
+    if (this.machineContextConflict) return "none";
+    const capabilities = this.serverContextCapabilities ?? new Set(this.connection.handshakeServerCapabilities);
+    if (capabilities.has(SERVER_CAPABILITY_RUNTIME_ACCOUNT_USAGE_WINDOW_SCOPE_V2)) return "all";
+    return capabilities.has(SERVER_CAPABILITY_RUNTIME_ACCOUNT_USAGE_WINDOW_SCOPE_V1) ? "account_and_model" : "none";
+  }
+
+  /**
+   * A usage snapshot in the shape this server accepts: an older server's
+   * strict schema refuses fields it does not know. A `models` scope a V1
+   * server does not know leaves its window unscoped, never the snapshot
+   * refused.
+   */
+  private snapshotForServer(snapshot: RuntimeAccountUsageSnapshot): RuntimeAccountUsageSnapshot {
+    const withResets = this.serverReadsLimitResets() ? snapshot : withoutLimitResets(snapshot);
+    switch (this.serverWindowScopes()) {
+      case "all": return withResets;
+      case "account_and_model": return withoutModelsScopes(withResets);
+      case "none": return withoutWindowScopes(withResets);
+    }
+  }
+
+  /**
+   * Spends one of the provider account's limit resets (a person's confirmed
+   * click on the web; the server checked who may), then reads that provider's
+   * usage again whatever the outcome, and answers with both. The read's gate
+   * key carries the request id, so it never joins a read that started before
+   * this redeem landed, a scheduled one or another person's redeem.
+   */
+  private async redeemRuntimeLimitReset(requestId: string, provider: RuntimeAccountUsageProvider, idempotencyKey: RuntimeLimitResetIdempotencyKey, kind?: RuntimeLimitResetKind): Promise<void> {
+    const startedAt = currentTimeMs();
+    let report: RuntimeLimitResetReport = {};
+    // The redeemer never throws (a rejection is `unknown`); this guards a test seam that does.
+    const result: RuntimeLimitResetResult = await this.runtimeLimitResetRedeemer(provider, idempotencyKey, kind, (seen) => { report = seen; })
+      .catch((): RuntimeLimitResetResult => ({ kind: "unknown" }));
+    const snapshot = await this.probeGate
+      .run(`runtime_account_usage_after_limit_reset:${provider}:${requestId}`, () => this.runtimeAccountUsageCollector(provider))
+      .catch(() => null);
+    this.connection.send({
+      type: "machine:runtime_account_usage:limit_reset:result",
+      requestId,
+      result,
+      ...(snapshot ? { snapshot: this.snapshotForServer(snapshot) } : {}),
+    });
+    this.recordDaemonEvent("daemon.runtime_account_usage.limit_reset", {
+      outcome: result.kind,
+      provider,
+      ...("reason" in result ? { reason: result.reason } : {}),
+      snapshot_sent: snapshot !== null,
+      ...(snapshot?.accounts[0]?.limitResetsAvailable !== undefined ? { limit_resets_available: snapshot.accounts[0].limitResetsAvailable } : {}),
+      ...(kind ? { reset_kind: kind } : {}),
+      ...(result.kind === "unknown" && result.fiveHourSpent ? { five_hour_spent: true } : {}),
+      ...(report.oarOutcome ? { oar_outcome: report.oarOutcome } : {}),
+      duration_ms: currentTimeMs() - startedAt,
+    });
+  }
+
+  /**
+   * Reads which limit resets the provider account holds (a person's click on
+   * the web; never a poll) and answers with them. Only a runtime with OAR's
+   * `inspectLimitResets` (Claude) has kinds to read; an account at its 5-hour
+   * limit is refused without consent.
+   */
+  private async readRuntimeLimitResets(
+    requestId: string,
+    provider: RuntimeAccountUsageProvider,
+    input: { atFiveHourLimit: boolean; atFiveHourLimitConsent: boolean; includeFiveHour: boolean },
+  ): Promise<void> {
+    const startedAt = currentTimeMs();
+    let report: RuntimeLimitResetReport = {};
+    // The reader never throws (a rejection is `unknown`); this guards a test seam that does.
+    const result: RuntimeLimitResetsReadResult = await this.runtimeLimitResetsReader(provider, input, (seen) => { report = seen; })
+      .catch((): RuntimeLimitResetsReadResult => ({ kind: "unknown" }));
+    this.connection.send({ type: "machine:runtime_account_usage:limit_resets:read:result", requestId, result });
+    this.recordDaemonEvent("daemon.runtime_account_usage.limit_reset", {
+      operation: "read",
+      outcome: result.kind,
+      provider,
+      ...("reason" in result ? { reason: result.reason } : {}),
+      ...(result.kind === "read" ? {
+        ...(result.program ? { program: result.program } : {}),
+        ...(result.fiveHourSpent ? { five_hour_spent: true } : {}),
+        available_kinds: result.resets.filter((reset) => reset.state === "available").length,
+        unknown_kinds: result.resets.filter((reset) => reset.state === "unknown").length,
+      } : {}),
+      ...(report.claudeVersion ? { claude_version: report.claudeVersion } : {}),
+      ...(report.oarOutcome ? { oar_outcome: report.oarOutcome } : {}),
+      duration_ms: currentTimeMs() - startedAt,
+    });
   }
 
   private observeServerContextCapabilities(capabilities: readonly string[]): void {
@@ -5212,13 +7092,14 @@ export class DaemonCore {
    * Compare this detection's runtime CLI versions with the last ones recorded
    * on this Raft home: every change is a trace event; a downgrade also stays
    * as a notice for `raft-computer status` (see runtimeCliVersionTracker).
+   * Runtimes that ship with the Computer are not CLIs on PATH and are left out.
    * Best-effort: a failed read or write never affects detection or ready.
    */
   private trackRuntimeCliVersions(detected: Record<string, string>): void {
     if (!this.raftHomeExplicit) return;
     this.runtimeCliVersionWrite = this.runtimeCliVersionWrite.then(async () => {
       const state = await readRuntimeCliVersionState(this.slockHome);
-      const { changes, next } = observeRuntimeCliVersions(state, detected, currentDate());
+      const { changes, next } = observeRuntimeCliVersions(state, detected, currentDate(), runtimeIdsShippedWithComputer());
       for (const change of changes) {
         this.recordDaemonEvent("daemon.runtime.cli_changed", {
           runtime: change.runtime,
@@ -5236,6 +7117,27 @@ export class DaemonCore {
     });
   }
 
+  /**
+   * Reconciler step 15 (B12, measure only, Q-4): live processes still running
+   * another CLI version than this detection found, one event per runtime with
+   * a count (never agent ids). Nothing is restarted; the data decides whether
+   * a version change should restart agents at idle. The OAR host is not
+   * counted: it keeps no per-process CLI version.
+   */
+  private traceRuntimeCliVersionDrift(detected: Record<string, string>): void {
+    const live = this.agentManager.liveRuntimeCliVersions?.() ?? [];
+    for (const drift of runtimeCliVersionDrift(live, detected)) {
+      this.recordDaemonEvent("daemon.agent.cli_version_drift", {
+        runtime: drift.runtime,
+        from_version: drift.from,
+        to_version: drift.to,
+        direction: drift.direction,
+        live_agents: drift.liveAgents,
+        from_versions: drift.fromVersions,
+      });
+    }
+  }
+
   private applyDetectionInventory(detection: RuntimeDetection): { runtimes: string[]; runtimeVersions: Record<string, string> } {
     const {
       ids: runtimes,
@@ -5247,6 +7149,7 @@ export class DaemonCore {
     this.lastReadyRuntimeSignature = JSON.stringify(runtimes.map((id) => [id, runtimeVersions[id] ?? null]));
     this.lastReadyRuntimeVersions = runtimeVersions;
     this.trackRuntimeCliVersions(runtimeVersions);
+    this.traceRuntimeCliVersionDrift(runtimeVersions);
     const runtimeInfo = runtimes.map((id) => runtimeVersions[id] ? `${id} (${runtimeVersions[id]})` : id);
     logger.info(`[Daemon] Detected runtimes: ${runtimeInfo.join(", ") || "none"}`);
     for (const [runtime, diagnostic] of Object.entries(runtimeDiagnostics)) {
@@ -5392,7 +7295,7 @@ export class DaemonCore {
     expectedLifecycleGeneration: number | undefined,
     publicationTicket: number,
   ): Promise<boolean> {
-    const runningAgentIds = this.agentManager.getRunningAgentIds();
+    const runningAgentIds = this.agentHosts.getRunningAgentIds();
     const idleAgentSessions = this.agentManager.getIdleAgentSessionIds();
     const runtimeProfileReports = this.agentManager.getAgentRuntimeProfileReports();
 
@@ -5406,6 +7309,18 @@ export class DaemonCore {
         lifecycleAcks = [];
       }
     }
+    let legacyCredentialExposure: LegacyCredentialExposureReport | null = null;
+    try {
+      legacyCredentialExposure = legacyCredentialExposureForReady(this.slockHome, this.options.apiKey);
+    } catch {
+      legacyCredentialExposure = null;
+    }
+    // Awaited only with a Computer seam: a plain daemon's ready keeps its timing.
+    const installerRepairHint = this.options.getComputerInstallerRepairHint ? await this.readComputerInstallerRepairHint() : null;
+    // Once per server after Raft Desktop's move: the first ready that goes out carries it.
+    const migratedFrom = this.options.getComputerMigratedFrom && !this.migratedFromSent
+      ? await this.options.getComputerMigratedFrom().catch(() => null)
+      : null;
     let lastUpgradeReceipt: ComputerLastUpgradeReceipt | null = null;
     if (this.options.getComputerLastUpgradeReceipt) {
       try {
@@ -5435,7 +7350,12 @@ export class DaemonCore {
     // Started in start(); a ready sent before it finishes (macOS runs
     // system_profiler, ~0.3 s) omits it, and the inventory-carrying ready that
     // follows runtime detection, the one the Server persists, has it.
-    const deviceClass = knownHostDeviceClass();
+    const { deviceClass, hostProvider, osRelease, osId, osIdLike } = knownHostFacts();
+    const { installKind, nodeOnPath } = daemonInstallFacts();
+    // #wg-rbac:#27: read here, after the last await and in the same tick as the
+    // send, so a credential minted while this frame was prepared is listed
+    // once its process or start holds it. One minted later is not listed.
+    const runnerCredentialIds = this.agentHosts.getHeldRunnerCredentialIds();
     this.connection.send({
       type: "ready",
       capabilities: [
@@ -5444,12 +7364,76 @@ export class DaemonCore {
         "agent:deliver",
         "workspace:files",
         DAEMON_CAPABILITY_SEQUENCED_STATUS,
+        DAEMON_CAPABILITY_INTERRUPT_TURN,
+        DAEMON_CAPABILITY_INTERRUPT_SUBAGENT,
+        DAEMON_CAPABILITY_RUNTIME_AUTH,
+        // Kimi and Qoder sign in and out too (RUNTIME_AUTH_RUNTIMES).
+        DAEMON_CAPABILITY_RUNTIME_AUTH_V2,
+        // Qwen Code: its providers listed and a provider's API key saved from the web.
+        DAEMON_CAPABILITY_RUNTIME_AUTH_QWEN_PROVIDER,
+        // Antigravity's status and login (OAR 0.97), and its logout (OAR 0.98).
+        DAEMON_CAPABILITY_RUNTIME_AUTH_ANTIGRAVITY,
+        DAEMON_CAPABILITY_RUNTIME_AUTH_ANTIGRAVITY_LOGOUT,
+        // Pi's sign-ins per provider: status, OAuth login, logout, API key (OAR's createPiProviderAuth).
+        DAEMON_CAPABILITY_RUNTIME_AUTH_PI,
+        // Grok Build's status, device-code login and logout (OAR 0.99).
+        DAEMON_CAPABILITY_RUNTIME_AUTH_GROK,
+        // OpenCode 2's sign-ins per provider: status, OAuth login, logout, API key (OAR 0.100 createOpencodeProviderAuth).
+        DAEMON_CAPABILITY_RUNTIME_AUTH_OPENCODE,
+        // CodeBuddy Code's status, sign-in link and logout (OAR's codebuddy runtime).
+        DAEMON_CAPABILITY_RUNTIME_AUTH_CODEBUDDY,
+        // Spends an account's limit reset from the web (OAR `redeemLimitReset`, Codex).
+        DAEMON_CAPABILITY_RUNTIME_LIMIT_RESET,
+        // Reads Antigravity's account usage: the bundled OAR (0.103+) has
+        // `antigravityRuntime.accountUsage` (collector.test.ts pins it).
+        DAEMON_CAPABILITY_RUNTIME_ACCOUNT_USAGE_ANTIGRAVITY,
+        // Claude's limit resets by kind, and reading them (OAR 0.102
+        // `inspectLimitResets` / `redeemLimitReset` with a `resetId`): only
+        // where OAR drives Claude Code (Linux). Elsewhere (macOS) the card
+        // keeps showing nothing, never a consent step for a read that could
+        // only answer `unsupported_platform`.
+        ...(claudeLimitResetsDrivable(this.platform) ? [DAEMON_CAPABILITY_RUNTIME_LIMIT_RESET_CLAUDE_KINDS] : []),
+        // `agent:runtime:ready` on a launch's first runtime output.
+        DAEMON_CAPABILITY_STARTUP_READINESS,
         // RFC 071: agent:runtime:outcome v1, process spawned/exited, rebind
         // ack processInstanceId, catchupBatchId echo.
         DAEMON_CAPABILITY_RUNTIME_OUTCOME_V1,
+        // Task v2: POST /tasks from a message attests its thread (agentCredentialProxy).
+        DAEMON_CAPABILITY_TASK_CREATE_FRESHNESS,
+        // RFC 060: reads `AgentConfig.runtimeHost` and can run a launch on an
+        // OAR session; the server asks for it only from a daemon offering this.
+        ...(this.oarHostEnabled ? [DAEMON_CAPABILITY_RUNTIME_HOST_OAR, DAEMON_CAPABILITY_RUNTIME_HOST_OAR_CODEX, DAEMON_CAPABILITY_RUNTIME_HOST_OAR_GROK] : []),
+        // #oar-raft:#10: Cursor through the SDK, only on Linux outside the SEA build with the SDK installed.
+        ...(this.oarHostEnabled && cursorSdkAvailable() ? [DAEMON_CAPABILITY_RUNTIME_HOST_OAR_CURSOR] : []),
+        // View Context v0: answers `agent:context_view_request` with one result
+        // POST and sends `agent:context_view_availability` (agentContextView/),
+        // for agents whose config has `agentContextView` on.
+        DAEMON_CAPABILITY_AGENT_CONTEXT_VIEW_V0,
+        // Agents searching a context (#wg-ax:#15): `agent:context_search_request`.
+        DAEMON_CAPABILITY_AGENT_CONTEXT_SEARCH_V0,
+        // A Codex agent's context is read only from its rollouts (#13469).
+        DAEMON_CAPABILITY_AGENT_CONTEXT_VIEW_CODEX_ROOT_V1,
+        // #wg-rbac:#27: `runnerCredentialIds` below lists every runner
+        // credential held here; the server revokes this machine's others.
+        DAEMON_CAPABILITY_RUNNER_CREDENTIAL_RECONCILE_V1,
+        // Reconciler step 11: takes `agent:config` (a new config for a
+        // running agent, applied at idle) instead of a restart.
+        DAEMON_CAPABILITY_AGENT_CONFIG_PUSH,
+        // RFC 071 F9: a runtime-profile control start also renders its
+        // resume catch-up (startupInput.ts), so the server may count it as
+        // the start that carried the owed catch-up.
+        DAEMON_CAPABILITY_CONTROL_START_CATCHUP_V1,
+        // task #1357 item 1: `agent:model_limits` for every Pi session built,
+        // each live session's last one sent again after a reconnect.
+        DAEMON_CAPABILITY_MODEL_LIMITS_REPORT_V1,
         ...BUILT_IN_READY_CAPABILITIES,
         ...(this.options.computerControlViaSupervisor
           ? [COMPUTER_CAPABILITY_SUPERVISOR_MUTATIONS]
+          : []),
+        // Reconciler step 13: a web upgrade may carry `drain` (computerUpgradeDrain.ts).
+        ...(this.upgradeDrain ? [DAEMON_CAPABILITY_COMPUTER_UPGRADE_DRAIN_V1] : []),
+        ...(this.options.computerServiceIpcUnreachable
+          ? [COMPUTER_CAPABILITY_SERVICE_IPC_UNREACHABLE]
           : []),
       ],
       daemonInstanceId: this.daemonInstanceId,
@@ -5460,10 +7444,18 @@ export class DaemonCore {
       ...(frame.inventory ? { runtimes: frame.inventory.runtimes, runtimeVersions: frame.inventory.runtimeVersions } : {}),
       ...(frame.runtimeDetection ? { runtimeDetection: frame.runtimeDetection } : {}),
       runningAgents: runningAgentIds,
+      runnerCredentialIds,
+      runningAgentConfigRevisions: this.runningAgentConfigRevisions(runningAgentIds),
       hostname: this.options.hostname ?? os.hostname(),
       os: this.options.osDescription ?? `${os.platform()} ${os.arch()}`,
       ...(osVariant ? { osVariant } : {}),
       ...(deviceClass ? { deviceClass } : {}),
+      ...(hostProvider ? { hostProvider } : {}),
+      ...(osRelease ? { osRelease } : {}),
+      ...(osId ? { osId } : {}),
+      ...(osIdLike ? { osIdLike } : {}),
+      ...(installKind ? { installKind } : {}),
+      nodeOnPath,
       daemonVersion: this.daemonVersion,
       ...(this.computerVersion ? { computerVersion: this.computerVersion } : {}),
       migrationTransport: this.getMigrationTransportReady(),
@@ -5471,17 +7463,142 @@ export class DaemonCore {
         ? { lifecycleAcks }
         : {}),
       ...(lastUpgradeReceipt ? { lastUpgradeReceipt } : {}),
+      ...(legacyCredentialExposure ? { legacyCredentialExposure } : {}),
+      ...(installerRepairHint ? { installerRepairHint } : {}),
+      ...(isComputerMigratedFrom(migratedFrom) ? { migratedFrom } : {}),
     });
-    // Fresh disk report shortly after every (re)connect, then hourly.
+    if (isComputerMigratedFrom(migratedFrom) && this.connection.connected) {
+      this.migratedFromSent = true;
+      void this.options.onComputerMigratedFromSent?.().catch((error: unknown) => {
+        logger.warn(`[Daemon] migrated-from note not cleared: ${error instanceof Error ? error.message : String(error)}`);
+      });
+    }
+    this.lastReadyCarriedUpgradeReceipt = lastUpgradeReceipt !== null;
+    this.reportedInstallerRepairHint = JSON.stringify(installerRepairHint);
+    // Fresh disk and memory reports shortly after every (re)connect, then
+    // hourly (disk) and every 5 minutes (memory).
     this.scheduleDiskStatusReport(DISK_STATUS_FIRST_REPORT_DELAY_MS);
+    this.scheduleMemoryStatusReport(DISK_STATUS_FIRST_REPORT_DELAY_MS);
     this.recordDaemonEvent("daemon.ready.sent", {
       runtimes_count: frame.inventory ? frame.inventory.runtimes.length : -1,
       runtime_detection_status: frame.runtimeDetection?.status ?? "complete",
       running_agents_count: runningAgentIds.length,
       idle_agents_count: idleAgentSessions.length,
       runtime_profile_reports_count: runtimeProfileReports.length,
+      runner_credentials_count: runnerCredentialIds.length,
+      ...(isComputerMigratedFrom(migratedFrom) ? { migrated_from: migratedFrom } : {}),
     });
+    // View Context: the Server keeps the latest availability per agent; a new
+    // connection hears it again for every running agent with the feature on.
+    this.agentManager.reportAgentContextViewAvailability?.("ready");
+    // task #17: each web-loginable runtime's auth status follows every ready
+    // that carries an inventory (startup, reconnect, rescan).
+    if (frame.inventory) {
+      this.runtimeAuthInventory = [...frame.inventory.runtimes];
+      if (this.serverRuntimeAuthRuntimes) this.reportRuntimeAuthStatus("ready", this.runtimeAuthInventory);
+      this.syncSharedCredentialWatch();
+    }
     return true;
+  }
+
+  /**
+   * #proj-raft-computer:#68: the login facts this runner persists, in its
+   * machine dir. They go back into the ledger before any agent starts, and
+   * every change is sent to a server that reads them.
+   */
+  private openRuntimeReadiness(machineDir: string): void {
+    const ledger = this.agentManager.providerLimitLedger;
+    if (this.runtimeReadiness || !ledger) return;
+    try {
+      const store = new RuntimeReadinessStore({ file: path.join(machineDir, RUNTIME_READINESS_FILE) });
+      store.load();
+      store.attach(ledger);
+      store.onChange(() => this.sendRuntimeReadiness());
+      // #proj-raft-computer:#69: the machine logins are shared with the other
+      // runners on this Computer; keep reading what they saw.
+      store.startSharedLoginSync();
+      this.runtimeReadiness = store;
+    } catch (error) {
+      logger.warn(`[Daemon] Runtime readiness store unavailable: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  /** The full readiness snapshot, to a connected server that reads it (on connect and on change; never on a timer). */
+  private sendRuntimeReadiness(): void {
+    if (!this.runtimeReadiness || !this.serverReadsRuntimeReadiness || !this.connection.connected) return;
+    this.connection.send({ type: "machine:runtime_readiness", ...this.runtimeReadiness.report() });
+  }
+
+  /**
+   * Reconciler step 15 (PR 3): the shared credential homes are watched while
+   * the connected server reads both the status report and the change frame,
+   * for the runtimes detection found that it reads. The daemon is not told
+   * which agents the server keeps paused for a sign-in, and a status query
+   * cannot say (a revoked Codex token still reads `logged_in`), so the watch
+   * does not wait for a status other than `logged_in`: a stat per source a
+   * tick, and the status query only after a change.
+   */
+  private syncSharedCredentialWatch(): void {
+    const watch = this.credentialDiskWatch;
+    if (!watch) return;
+    const reads = this.serverRuntimeAuthRuntimes;
+    const active = this.connection.connected && this.serverReadsRuntimeCredentialsChanged && reads !== null && this.runtimeAuthInventory !== null;
+    if (active) {
+      const detected = new Set(this.runtimeAuthInventory!.map((runtime) => runtimeAuthRuntimeFor(runtime)));
+      watch.setSharedHomes(reads!.filter((runtime) => detected.has(runtime)));
+    }
+    watch.setSharedHomesActive(active);
+  }
+
+  /**
+   * A runtime's shared credential changed on disk: the status report follows
+   * (the Computer card), and only when that fresh query reads it signed in
+   * does the server hear `machine:runtime_credentials:changed`, which lifts
+   * the sign-in pauses of the runtime's agents on the shared sign-in. A plain
+   * status report never lifts anything.
+   */
+  private async reportSharedCredentialsChanged(runtime: RuntimeAuthRuntime): Promise<void> {
+    let status: Awaited<ReturnType<RuntimeAuthHost["reportFreshStatus"]>> = null;
+    try {
+      status = await this.runtimeAuth.reportFreshStatus("credentials_changed_on_disk", runtime);
+    } catch (error) {
+      logger.warn(`[Daemon] Runtime auth status after a credential change failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    const sent = status?.kind === "logged_in" && this.connection.connected && this.serverReadsRuntimeCredentialsChanged;
+    if (sent) this.connection.send({ type: "machine:runtime_credentials:changed", runtime });
+    this.recordDaemonEvent("daemon.runtime_credentials.changed", {
+      runtime,
+      auth_status: status?.kind ?? "none",
+      outcome: sent ? "sent" : "not_sent",
+    });
+  }
+
+  private reportRuntimeAuthStatus(trigger: string, inventory: readonly string[]): void {
+    void this.runtimeAuth.reportStatus(trigger, inventory).catch((error: unknown) => {
+      logger.warn(`[Daemon] Runtime auth status report failed: ${error instanceof Error ? error.message : String(error)}`);
+    });
+  }
+
+  /**
+   * Reconciler step 15 (B13): a daemon-local restart stopped at its first
+   * failure because the runtime is missing here, and the server paused the
+   * agent ("runtime unavailable"). The server lifts that pause when a `ready`
+   * lists the runtime again, but nothing sends one while the connection stays
+   * up. A self-updating CLI is missing only for the moment it swaps its
+   * binary, so re-detect once, RUNTIME_ABSENT_REDETECT_DELAY_MS later: the
+   * same re-emit a web rescan does. Several stops in that window share one.
+   */
+  private scheduleRuntimeRedetectAfterAbsent(runtime: string): void {
+    this.recordDaemonEvent("daemon.runtime.absent_redetect.scheduled", { runtime, delay_ms: this.runtimeAbsentRedetectDelayMs });
+    if (this.runtimeRedetectTimer !== null) return;
+    this.runtimeRedetectTimer = setTimeout(() => {
+      this.runtimeRedetectTimer = null;
+      if (!this.connection.connected) return;
+      void this.emitReady(undefined, { publishCatalogForce: true }).then((readySent) => {
+        if (readySent && !this.detectionRound) this.requestRuntimeModelCatalogPublish(true);
+      });
+    }, this.runtimeAbsentRedetectDelayMs);
+    this.runtimeRedetectTimer.unref?.();
   }
 
   private scheduleDiskStatusReport(delayMs: number): void {
@@ -5489,16 +7606,55 @@ export class DaemonCore {
     this.diskStatusTimer = setTimeout(() => {
       this.diskStatusTimer = null;
       void this.sendDiskStatus().finally(() => {
-        if (this.diskStatusReportsEnabled) this.scheduleDiskStatusReport(DISK_STATUS_REPORT_INTERVAL_MS);
+        if (this.machineStatusReportsEnabled) this.scheduleDiskStatusReport(DISK_STATUS_REPORT_INTERVAL_MS);
       });
     }, delayMs);
     this.diskStatusTimer.unref?.();
   }
 
+  private scheduleMemoryStatusReport(delayMs: number): void {
+    if (this.memoryStatusTimer !== null) clearTimeout(this.memoryStatusTimer);
+    this.memoryStatusTimer = setTimeout(() => {
+      this.memoryStatusTimer = null;
+      void this.reportComputerInstallerRepairHintChange();
+      void this.sendMemoryStatus().finally(() => {
+        if (this.machineStatusReportsEnabled) this.scheduleMemoryStatusReport(MEMORY_STATUS_REPORT_INTERVAL_MS);
+      });
+    }, delayMs);
+    this.memoryStatusTimer.unref?.();
+  }
+
+  /** Null when there is nothing to hint, when unknown (no Computer seam) and when the read failed. */
+  private async readComputerInstallerRepairHint(): Promise<ComputerInstallerRepairHint | null> {
+    try {
+      return (await this.options.getComputerInstallerRepairHint?.()) ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Tell the server when the hint changed since this connection last said it. */
+  private reportComputerInstallerRepairHintChange(): Promise<void> {
+    if (!this.options.getComputerInstallerRepairHint) return Promise.resolve();
+    this.installerRepairHintReport = this.installerRepairHintReport.then(async () => {
+      const hint = await this.readComputerInstallerRepairHint();
+      const encoded = JSON.stringify(hint);
+      if (encoded === this.reportedInstallerRepairHint || !this.connection.connected) return;
+      this.connection.send({ type: "machine:installer_repair_hint", hint });
+      this.reportedInstallerRepairHint = encoded;
+    });
+    return this.installerRepairHintReport;
+  }
+
+  private async sendMemoryStatus(): Promise<void> {
+    const memory = await readMachineMemoryStatus().catch(() => null);
+    if (!memory || !this.connection.connected) return;
+    this.connection.send({ type: "machine:memory_status", ...memory });
+  }
+
   private async sendDiskStatus(): Promise<void> {
-    const info = await statfs(this.agentsDataDir).catch(() => null);
-    if (!info || !this.connection.connected) return;
-    const disk = { availableBytes: info.bavail * info.bsize, totalBytes: info.blocks * info.bsize };
+    const disk = await readVolumeCapacity(this.agentsDataDir);
+    if (!disk || !this.connection.connected) return;
     if (!isValidMachineDiskStatus(disk)) return;
     this.connection.send({ type: "machine:disk_status", ...disk });
   }
@@ -5577,6 +7733,9 @@ export class DaemonCore {
     // inventory. Publish that lifecycle edge before any synchronous probe can
     // delay the event loop (notably PowerShell Get-Command on fresh Windows
     // hosts). A failed hook must not suppress the daemon's fresh ready report.
+    // Reconciler step 13 (Tenny f8ae3b79 condition 2): the upgrade intent of
+    // the old connection is gone; a drain still holding lets go.
+    this.upgradeDrain?.onConnected();
     try {
       this.options.lifecycleHooks?.onConnect?.();
     } catch (err) {
@@ -5592,18 +7751,85 @@ export class DaemonCore {
     if (!this.opencliWrappersRegenerated) {
       this.opencliWrappersRegenerated = true;
       try {
-        const { scanned, rewritten } = regenerateExistingOpencliWrappers(this.agentsDataDir);
+        const { scanned, rewritten, skipped } = regenerateExistingOpencliWrappers(this.agentsDataDir);
         if (scanned > 0) {
           logger.info(`[Daemon] Refreshed ${rewritten}/${scanned} opencli wrapper(s) to current self-healing form`);
+        }
+        if (skipped > 0) {
+          // A workspace wrapper (or its `.slock`) that is not a plain file is left alone: never written through.
+          this.recordDaemonEvent("daemon.opencli_wrapper_refresh.skipped", { skipped_count: skipped, scanned_count: scanned });
         }
       } catch (err) {
         logger.warn(`[Daemon] opencli wrapper refresh skipped: ${err instanceof Error ? err.message : String(err)}`);
         this.recordConnectLifecycleError("opencli_wrapper_refresh", "wrapper_refresh_threw", err);
       }
     }
+    // #proj-raft-computer task #38: once per daemon process, remove the
+    // credential-bearing chat-bridge entries older daemons left in agent
+    // workspaces. Idempotent; launches clean their own workspace too, this
+    // covers agents that do not start again.
+    if (!this.legacyBridgeArtifactsMigrated) {
+      this.legacyBridgeArtifactsMigrated = true;
+      try {
+        const summary = migrateAllLegacyBridgeArtifacts(this.agentsDataDir, { machineKey: this.options.apiKey || null });
+        if (summary.removedEntries + summary.unlinked + summary.skipped > 0) {
+          this.recordDaemonEvent("daemon.legacy_bridge_artifacts.migrated", {
+            scanned_count: summary.scanned,
+            removed_count: summary.removedEntries,
+            unlinked_count: summary.unlinked,
+            skipped_count: summary.skipped,
+          });
+        }
+        if (summary.currentKeyExposed > 0) {
+          // The file held this machine's CURRENT key, readable by the agent before
+          // the cleanup: deleting it cannot undo that. Counts only, never the key.
+          this.recordDaemonEvent("daemon.legacy_bridge_artifacts.current_key_exposed", { artifact_count: summary.currentKeyExposed }, "error");
+          // A legacy key: kept so every `ready` tells the server (the owner is asked
+          // to move this machine to a Computer credential). A Computer key: trace only.
+          if (isLegacyMachineKey(this.options.apiKey)) {
+            try {
+              recordLegacyCredentialExposure(this.slockHome, this.options.apiKey, Date.now());
+            } catch (err) {
+              logger.warn(`[Daemon] credential exposure not recorded: ${err instanceof Error ? err.message : String(err)}`);
+            }
+          }
+        }
+      } catch (err) {
+        logger.warn(`[Daemon] legacy bridge artifact cleanup skipped: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    // Once per daemon process: older daemons wrote the Computer's own key to
+    // `agent-token` files the agents' runtimes can read, and nothing prunes
+    // old launch directories. Counts only, never paths or contents.
+    if (!this.staleAgentTokensRemoved) {
+      this.staleAgentTokensRemoved = true;
+      try {
+        const { removed, skipped } = removeStaleAgentTokenFiles(this.slockHome, this.agentsDataDir);
+        if (removed + skipped > 0) {
+          logger.info(`[Daemon] Removed ${removed} stale agent-token file(s) left by older daemons; ${skipped} not a plain file, left alone`);
+          this.recordDaemonEvent("daemon.stale_agent_tokens.removed", { removed_count: removed, skipped_count: skipped });
+        }
+      } catch (err) {
+        logger.warn(`[Daemon] stale agent-token cleanup skipped: ${err instanceof Error ? err.message : String(err)}`);
+        this.recordConnectLifecycleError("stale_agent_token_cleanup", "cleanup_threw", err);
+      }
+    }
     const initialReady = this.emitReady(lifecycleOriginConnectionGeneration);
     void initialReady.then((readySent) => {
       if (readySent) this.requestRuntimeModelCatalogPublish(false);
+      // task #1357 item 1: after the ready that declares the capability, each
+      // live Pi session's last limits report again (one sent while
+      // disconnected was lost). The same session result, never a new session.
+      if (readySent) {
+        // Optional: test doubles of the manager may not implement it.
+        for (const frame of this.agentManager.getModelLimitsReports?.() ?? []) this.connection.send(frame);
+      }
+      if (readySent) {
+        this.flushComputerDeviceSessionRetire();
+        this.flushComputerMachineLockConflicts();
+        void this.flushComputerUpgradeSteps(this.lastReadyCarriedUpgradeReceipt);
+        if (!this.lastReadyCarriedUpgradeReceipt) this.startComputerUpgradeOutcomeWatch();
+      }
     });
     if (this.options.reconcileComputerLifecycleOrigin) {
       void initialReady
@@ -5619,7 +7845,7 @@ export class DaemonCore {
     }
     // task #1103: wake requests parked while offline go out once per connect edge.
     this.agentManager.resendPendingServerWakes();
-    const runningAgentIds = this.agentManager.getRunningAgentIds();
+    const runningAgentIds = this.agentHosts.getRunningAgentIds();
     const idleAgentSessions = this.agentManager.getIdleAgentSessionIds();
     const runtimeProfileReports = this.agentManager.getAgentRuntimeProfileReports();
 
@@ -5643,8 +7869,8 @@ export class DaemonCore {
     }
 
     for (const agentId of runningAgentIds) {
-      const sessionId = this.agentManager.getAgentSessionId(agentId);
-      const launchId = this.agentManager.getAgentLaunchId(agentId);
+      const sessionId = this.agentHosts.getAgentSessionId(agentId);
+      const launchId = this.agentHosts.getAgentLaunchId(agentId);
       if (sessionId) {
         // TODO(lifecycle-v2/daemon-protocol): reconnect session replay should
         // be a canonical session_resynced/runtime_ready event with reconnect
@@ -5705,13 +7931,31 @@ export class DaemonCore {
 
   private handleDisconnect() {
     this.serverAcksRuntimeOutcomes = false;
+    this.agentManager.setServerSendIntentCapable?.(false);
+    this.agentHosts.setServerTurnEndedCapable?.(false);
+    this.agentHosts.setServerStickyFailureReasonsCapable?.(false);
+    this.localScheduleRuntime.setServerIdleTaskReminderCapable(false);
+    // A request cannot be answered across a dropped connection; the next
+    // context asks again.
+    this.serverFeaturesCapable = false;
+    this.serverFeaturesRefresh.reset();
+    this.agentManager.setServerFeaturesCapable?.(false);
+    // task #17: a login's link, code and result cannot cross a dropped
+    // connection, so stop it rather than leave it holding the runtime.
+    this.serverRuntimeAuthRuntimes = null;
+    // Each connection sends its own inventory ready; a context arriving first must not probe the old one.
+    this.runtimeAuthInventory = null;
+    this.runtimeAuth.cancelAll();
+    // The shared homes keep their last state; checks resume with the next context and ready.
+    this.serverReadsRuntimeCredentialsChanged = false;
+    this.credentialDiskWatch?.setSharedHomesActive(false);
     this.serverContextCapabilities = null;
     this.abandonDetectionRound("disconnect");
     this.runtimeOutcomeOutbox.onDisconnected();
     this.invalidateLifecycleOriginReconcile();
     logger.warn("[Daemon] Lost connection — agents continue running locally");
     this.recordDaemonEvent("daemon.connection.local_disconnect_observed", {
-      running_agents_count: this.agentManager.getRunningAgentIds().length,
+      running_agents_count: this.agentHosts.getRunningAgentIds().length,
       idle_agents_count: this.agentManager.getIdleAgentSessionIds().length,
     }, "cancelled");
     this.options.lifecycleHooks?.onDisconnect?.();
@@ -5720,4 +7964,35 @@ export class DaemonCore {
   private handleHandshakeRejected(event: { statusCode: number; reason: string | null }) {
     this.options.lifecycleHooks?.onHandshakeRejected?.(event);
   }
+}
+
+/**
+ * A start of an OAR-only runtime (drivers/oarOnly.ts) on a Computer whose OAR
+ * host is turned off (`RAFT_DAEMON_OAR_HOST_DISABLED`): there is no router and
+ * the legacy host cannot run it, so it fails before the agent counts as
+ * starting. Null for every other runtime, including unknown ones (their start
+ * fails as before).
+ */
+function oarOnlyStartWithoutOarHost(runtime: string): OarOnlyStartError | null {
+  let driver;
+  try {
+    driver = getDriver(runtime);
+  } catch {
+    return null;
+  }
+  if (!driver.oarOnly) return null;
+  return new OarOnlyStartError({
+    runtimeId: runtime,
+    hostReason: "oar_host_disabled",
+    userMessage: `${runtimeLabel(runtime)} runs only on the OAR host, which is turned off on this Computer (${OAR_HOST_DISABLED_ENV}). Turn it back on, or move the agent to another Computer.`,
+  });
+}
+
+/**
+ * task #1357 item 1: `config` stamped with the server's revision of it
+ * (`AgentConfig.configRevision`); unchanged when the server named none.
+ */
+export function withConfigRevision(config: AgentConfig, revision: number | undefined): AgentConfig {
+  if (typeof revision !== "number" || !Number.isFinite(revision)) return config;
+  return { ...config, configRevision: revision };
 }

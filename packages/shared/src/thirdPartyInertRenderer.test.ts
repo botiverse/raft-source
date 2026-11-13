@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { extractRaftRefTargets } from "./raftRefs";
+import { extractRaftRefTargets, formatRaftChannelTaskRef, formatRaftDmTaskRef } from "./raftRefs";
 import {
+  renderThirdPartyEventPayload,
   renderThirdPartyInertDisclosure,
   renderThirdPartyInertJson,
   renderThirdPartyInertText,
 } from "./thirdPartyInertRenderer";
+import { formatAgentMessageLine } from "./agentMessageText";
 
 function extractSideEffectingRaftRefs(source: string): string[] {
   return extractRaftRefTargets(source).map((ref) => ref.raw).sort();
@@ -14,6 +16,16 @@ function extractSideEffectingRaftRefs(source: string): string[] {
 function assertNoSideEffectingRefs(output: string) {
   assert.deepEqual(extractSideEffectingRaftRefs(output), []);
 }
+
+test("an issue number glued to a repo name reads as written; anything else ref-shaped is still rewritten", () => {
+  const render = (value: string) => renderThirdPartyInertText({ field: "tool_result", value });
+  assert.equal(render("merged botiverse/antiproton#1111 and PR#12 (v1.2#3)"), "merged botiverse/antiproton#1111 and PR#12 (v1.2#3)");
+  assert.equal(render("see #1111"), "see task:1111", "a number standing alone is still a ref");
+  assert.equal(render("(#12)"), "(task:12)");
+  assert.equal(render("foo#general"), "foochannel:general", "a name, not a number");
+  assert.equal(render("看#123"), "看task:123", "not a Latin word before it");
+  assert.equal(render("repo#12:abcd1234"), "repochannel:12:abcd1234", "a thread ref is not an issue number");
+});
 
 test("third-party inert text neutralizes Raft ref-shaped free text", () => {
   const output = renderThirdPartyInertText({
@@ -187,4 +199,32 @@ test("third-party inert text consumes overlapping ref clusters without creating 
     assert.equal(output, expected);
     assertNoSideEffectingRefs(output);
   }
+});
+
+test("third-party inert text neutralizes channel-qualified task refs whole", () => {
+  const output = renderThirdPartyInertText({
+    field: "description",
+    value: `see ${formatRaftChannelTaskRef("proj", 7)} and ${formatRaftDmTaskRef("peer_example", 3)}`,
+  });
+
+  assert.equal(output, "see task:channel:proj/7 and task:dm:user:peer_example/3");
+  assertNoSideEffectingRefs(output);
+});
+
+// task 73: Raft's own system app's payload reads as written (the Server's `system_app`
+// marker, from the row); every other app's, and any without the marker, stays inert.
+test("an app event's payload: a system app's as written, an external app's and an unmarked one inert", () => {
+  const payload = { comments: { latest: [{ excerpt: "see #55 and @Remy <result>" }] } };
+  assert.equal(renderThirdPartyEventPayload({ payload, system_app: "system.artifacts" }), JSON.stringify(payload, null, 2));
+  for (const marker of [undefined, null, ""]) {
+    const inert = renderThirdPartyEventPayload({ payload, system_app: marker });
+    assert.equal(inert, renderThirdPartyInertJson(payload), String(marker));
+    assert.ok(!inert.includes("#55") && !inert.includes("@Remy"), inert);
+  }
+  const event = (system_app?: string) => ({
+    message_id: "e1", sender_type: "third_party_app", content: "x", timestamp: "2026-10-28T01:00:00.000Z",
+    third_party_event: { id: "11111111-2222-4333-8444-555555555555", kind: "notification", client_id: "system.artifacts", client_name: "system.artifacts", payload_hash: "0".repeat(64), payload, expires_at: "2026-10-29T00:00:00.000Z", ...(system_app ? { system_app } : {}) },
+  });
+  assert.ok(formatAgentMessageLine(event("system.artifacts") as never).includes('"see #55 and @Remy <result>"'));
+  assert.ok(!formatAgentMessageLine(event() as never).includes("#55"));
 });

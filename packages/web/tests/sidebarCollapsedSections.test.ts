@@ -1,13 +1,10 @@
 import assert from "node:assert/strict";
 import {
   DEFAULT_SIDEBAR_COLLAPSED_SECTIONS,
-  readSidebarAgentMachineGroupCollapsed,
   readSidebarCustomSectionCollapsed,
   readSidebarCollapsedSections,
-  sidebarAgentMachineGroupCollapsedStorageKey,
   sidebarCustomSectionCollapsedStorageKey,
   sidebarCollapsedSectionStorageKey,
-  writeSidebarAgentMachineGroupCollapsed,
   writeSidebarCustomSectionCollapsed,
   writeSidebarCollapsedSection,
 } from "../src/components/layout/sidebarCollapsedSections";
@@ -118,33 +115,5 @@ test("custom sidebar section disclosure defaults closed=false when storage is un
   assert.equal(readSidebarCustomSectionCollapsed("human-one", "section-a", storage), false);
 
   writeSidebarCustomSectionCollapsed(undefined, "section-a", true, storage);
-  assert.equal(storage.length, 1);
-});
-
-test("agent machine group disclosure is persisted per user and stable machine id", () => {
-  const storage = memoryStorage();
-
-  writeSidebarAgentMachineGroupCollapsed("human-one", "machine-a", true, storage);
-  writeSidebarAgentMachineGroupCollapsed("human-one", "__no_machine__", true, storage);
-  writeSidebarAgentMachineGroupCollapsed("human-two", "machine-a", false, storage);
-
-  assert.equal(readSidebarAgentMachineGroupCollapsed("human-one", "machine-a", storage), true);
-  assert.equal(readSidebarAgentMachineGroupCollapsed("human-one", "machine-b", storage), false);
-  assert.equal(readSidebarAgentMachineGroupCollapsed("human-one", "__no_machine__", storage), true);
-  assert.equal(readSidebarAgentMachineGroupCollapsed("human-two", "machine-a", storage), false);
-  assert.match(
-    sidebarAgentMachineGroupCollapsedStorageKey("human-one", "machine-a"),
-    /human-one:agent-machine-group:machine-a$/,
-  );
-});
-
-test("agent machine group disclosure defaults closed=false when storage is unavailable or invalid", () => {
-  const storage = memoryStorage();
-  storage.setItem(sidebarAgentMachineGroupCollapsedStorageKey("human-one", "machine-a"), "collapsed");
-
-  assert.equal(readSidebarAgentMachineGroupCollapsed(undefined, "machine-a", storage), false);
-  assert.equal(readSidebarAgentMachineGroupCollapsed("human-one", "machine-a", storage), false);
-
-  writeSidebarAgentMachineGroupCollapsed(undefined, "machine-a", true, storage);
   assert.equal(storage.length, 1);
 });

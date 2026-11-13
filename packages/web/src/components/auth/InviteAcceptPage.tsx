@@ -1,4 +1,4 @@
-import { useCallback, useState, useEffect } from "react";
+import { useCallback, useState, useEffect, useRef } from "react";
 import { useIntl } from "react-intl";
 import type { IntlShape } from "react-intl";
 import type { MessageId } from "../../i18n/messages";
@@ -9,10 +9,12 @@ import api from "../../api/client";
 import { storePendingInvite } from "../../utils/socialAuth";
 import { ArrowLeft, LogIn, UserPlus } from "lucide-react";
 import Banner from "../ui/Banner";
-import { Button, Card } from "@botiverse/raft-ui";
+import { Button, Card, ScrollArea } from "@botiverse/raft-ui";
 import CenteredCardFrame from "./CenteredCardFrame";
 import { AuthPageIntro } from "./AuthPageFrame";
 import AgreementBody from "../server/AgreementBody";
+import { DeploymentUserLimitText } from "../ui/DeploymentUserLimitText";
+import { isDeploymentUserLimitRefusal } from "../../utils/deploymentUserLimit";
 
 interface InviteAcceptPageProps {
   token: string;
@@ -61,6 +63,21 @@ function clearInviteUrl() {
   window.history.replaceState({}, "", `${nextPath}${nextSearch ? `?${nextSearch}` : ""}${url.hash}`);
 }
 
+/**
+ * The page says a full link's owners were told: tell them (task #10), once per
+ * link. The server checks the seats, the flag and who made the link. Best
+ * effort: the page reads the same either way.
+ */
+function useTellOwnersSeatsFull(token: string, shown: boolean): void {
+  const toldFor = useRef<string | null>(null);
+  useEffect(() => {
+    // oxlint-disable-next-line react-doctor/no-event-handler -- Rendering is the event: the page showing the full state, which no handler observes.
+    if (!shown || toldFor.current === token) return;
+    toldFor.current = token;
+    api.post("/invites/seat-blocked", { token }).catch(() => undefined);
+  }, [shown, token]);
+}
+
 export default function InviteAcceptPage({
   token,
   onInviteConsumed,
@@ -83,6 +100,10 @@ export default function InviteAcceptPage({
     insideCountsHidden?: boolean;
     humanSeatLimitReached?: boolean;
     humanSeatLimitMessage?: string | null;
+    /** The seats are full and pro_seat_add is on for this server; the server says so, since a visitor signed out can't evaluate the flag. */
+    seatNoticeEnabled?: boolean;
+    /** The source-available deployment is at the Raft License's user limit: only someone already counted can join. */
+    deploymentUserLimitReached?: boolean;
     agreement: {
       id: string;
       title: string;
@@ -97,9 +118,18 @@ export default function InviteAcceptPage({
   const [acceptedServerId, setAcceptedServerId] = useState("");
   const [error, setError] = useState("");
   const [errorId, setErrorId] = useState<MessageId | null>(null);
+  // The accept refused at the Raft License's user limit: its sentence has a mail link, so it is not a string.
+  const [userLimitRefused, setUserLimitRefused] = useState(false);
   const errorText = error || (errorId ? formatMessage({ id: errorId }) : "");
+  const hasError = Boolean(errorText) || userLimitRefused;
   const insidePreview = inviteInfo ? renderInsidePreview(inviteInfo, formatMessage) : null;
   const humanSeatLimitReached = inviteInfo?.humanSeatLimitReached === true;
+  // Behind pro_seat_add (task #10, cindyz): someone signed out sees only Sign In
+  // and Create Account; once signed in, the page says the owners were told.
+  // Without it, the page says the seats are full to everyone, as before.
+  const seatNotice = humanSeatLimitReached && inviteInfo?.seatNoticeEnabled === true;
+  const seatsFull = humanSeatLimitReached && (!seatNotice || Boolean(user));
+  useTellOwnersSeatsFull(token, seatNotice && Boolean(user) && !errorText);
 
   // Load invite info
   useEffect(() => {
@@ -131,6 +161,7 @@ export default function InviteAcceptPage({
     setAccepting(true);
     setError("");
     setErrorId(null);
+    setUserLimitRefused(false);
     try {
       const result = await acceptInvite(token, agreementId);
       setAccepted(true);
@@ -158,6 +189,10 @@ export default function InviteAcceptPage({
         setInviteInfo((current) => current ? { ...current, agreement: response.agreement } : current);
         setError("");
     setErrorId(null);
+        return;
+      }
+      if (isDeploymentUserLimitRefusal(err)) {
+        setUserLimitRefused(true);
         return;
       }
       if (response?.error) {
@@ -239,11 +274,11 @@ export default function InviteAcceptPage({
   return (
     <CenteredCardFrame>
       <div className="w-full">
-        {errorText ? (
+        {hasError ? (
           <>
             <AuthPageIntro title={formatMessage({ id: "pages.invite.errorTitle" })} />
-            <Banner intent="warning" className="mb-6">
-              {errorText}
+            <Banner intent="warning" className="mb-6" data-testid={userLimitRefused ? "invite-user-limit-refused" : undefined}>
+              {userLimitRefused ? <DeploymentUserLimitText /> : errorText}
             </Banner>
           </>
         ) : inviteInfo ? (
@@ -284,14 +319,31 @@ export default function InviteAcceptPage({
                     )}
                   </div>
                 </div>
-                <div className="max-h-56 overflow-y-auto border-t border-line-hairline pt-3 text-callout text-foreground-muted">
+                {/* A region named after the agreement, inside the page's scroller: a scroll past its end carries on to the page. */}
+                <ScrollArea role="region" aria-label={inviteInfo.agreement.title} overscroll="auto" className="max-h-56 border-t border-line-hairline text-callout text-foreground-muted" contentClassName="pt-3">
                   <AgreementBody source={inviteInfo.agreement.bodyMarkdown} />
-                </div>
+                </ScrollArea>
               </Card>
             )}
-            {humanSeatLimitReached && (
+            {seatsFull && (seatNotice ? (
+              <Banner
+                intent="info"
+                withIcon
+                className="mb-6"
+                title={formatMessage({ id: "pages.invite.seatsFullTitle" }, { server: inviteInfo.serverName })}
+                data-testid="invite-seats-full"
+              >
+                {formatMessage({ id: "pages.invite.seatsFullBody" })}
+              </Banner>
+            ) : (
               <Banner intent="warning" className="mb-6">
                 {formatMessage({ id: "pages.invite.humanSeatLimit" })}
+              </Banner>
+            ))}
+            {/* Said before Join: someone already counted (a member elsewhere here) still gets in, so Join stays. */}
+            {!seatsFull && inviteInfo.deploymentUserLimitReached === true && (
+              <Banner intent="info" withIcon className="mb-6" data-testid="invite-user-limit-notice">
+                <DeploymentUserLimitText id="deploymentUserLimit.inviteNotice" />
               </Banner>
             )}
           </>
@@ -303,7 +355,7 @@ export default function InviteAcceptPage({
           </div>
         )}
 
-        {user && inviteInfo && !errorText && !humanSeatLimitReached && (
+        {user && inviteInfo && !hasError && !seatsFull && (
           <Button
             onClick={handleJoin}
             disabled={accepting}
@@ -317,8 +369,8 @@ export default function InviteAcceptPage({
           </Button>
         )}
 
-        {!user && inviteInfo && !errorText && !humanSeatLimitReached && (
-          <div className="space-y-3">
+        {!user && inviteInfo && !hasError && !seatsFull && (
+          <div className="stack-y-3">
             <p className="mb-4 text-center text-callout text-foreground-muted">
               {formatMessage({ id: "pages.invite.signInPrompt" })}
             </p>
@@ -342,7 +394,7 @@ export default function InviteAcceptPage({
           </div>
         )}
 
-        {(errorText || humanSeatLimitReached) && (
+        {(hasError || seatsFull) && (
           <Button size="lg"
             variant="outline"
             className="w-full"

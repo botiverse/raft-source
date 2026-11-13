@@ -12,7 +12,7 @@ import { findOrCreateAgentDM, findOrCreateDM, getOrCreateThread } from "../servi
 import { createMessage } from "../services/messageService";
 import { mintAgentCredential } from "../services/agentCredentialService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 /**
  * The agent read path for a name shared by a human and an agent (task #3):
@@ -64,6 +64,7 @@ async function seedFixture() {
     agentId: grace.id,
     scopes: ["send", "read"],
     name: "dm-peer-kind",
+    issuedVia: "computer",
     createdByUserId: null,
   });
   return { apiKey: credential.apiKey, serverId: server.id, humanMsg, agentMsg, agentThread };
@@ -80,7 +81,7 @@ async function read(baseUrl: string, apiKey: string, target: string, around?: st
 }
 
 test("reading a shared name needs the kind, and the kind selects the conversation", async ({ onTestFinished }) => {
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   onTestFinished(() => app.close());
   const fx = await seedFixture();
 
@@ -100,7 +101,7 @@ test("reading a shared name needs the kind, and the kind selects the conversatio
 });
 
 test("--around never carries a kind-pinned read into the other Twin's DM", async ({ onTestFinished }) => {
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   onTestFinished(() => app.close());
   const fx = await seedFixture();
   const agentAnchor = fx.agentMsg.id.slice(0, 8);
@@ -116,7 +117,7 @@ test("--around never carries a kind-pinned read into the other Twin's DM", async
 });
 
 test("a DM thread suffix must live under the DM the kind names", async ({ onTestFinished }) => {
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   onTestFinished(() => app.close());
   const fx = await seedFixture();
 
@@ -141,7 +142,7 @@ async function send(baseUrl: string, apiKey: string, path: "send" | "v2/send", t
 }
 
 test("sending to a shared name answers 409 with the fix, never a 500 (send and v2/send)", async ({ onTestFinished }) => {
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   onTestFinished(() => app.close());
   const fx = await seedFixture();
 
@@ -165,7 +166,7 @@ test("sending to a shared name answers 409 with the fix, never a 500 (send and v
 });
 
 test("opening a first DM to a shared name answers 409, not a 500", async ({ onTestFinished }) => {
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   onTestFinished(() => app.close());
   const fx = await seedFixture();
   // A fresh agent with no DM yet reaches the create-DM branch of target resolution.
@@ -174,6 +175,7 @@ test("opening a first DM to a shared name answers 409, not a 500", async ({ onTe
     agentId: newcomer.id,
     scopes: ["send", "read"],
     name: "dm-peer-kind-newcomer",
+    issuedVia: "computer",
     createdByUserId: null,
   });
 

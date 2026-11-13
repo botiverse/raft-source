@@ -71,6 +71,21 @@ export type AgentAppInboxAcknowledgedSource = {
   itemId: string;
   acknowledgedAtMs: number;
   ownerAgentId?: string;
+  /**
+   * The Server has settled this ack (server-authority classes): "accepted"
+   * (it recorded the ack) or "refused" (it holds nothing to ack: no such
+   * source or revision fired). Absent: acked only here, as a daemon before
+   * reminder-server-ack@1 did; the server-ack backfill sends it.
+   */
+  serverAck?: "accepted" | "refused";
+};
+
+/** An exact source identity a Server-authorized ack names, normalized by its class. */
+export type AgentAppInboxServerAckSource = {
+  appId: string;
+  notificationClass: string;
+  sourceRef: AgentInboxSourceRef;
+  itemId: string;
 };
 
 export type AgentAppInboxAckIntent = {
@@ -110,6 +125,22 @@ export type AgentAppNotificationClassDefinition = {
    * caller cannot supply it; the closed registry definition owns the builder.
    */
   materializeItemId?: (sourceRef: AgentInboxSourceRef) => string | null;
+  /**
+   * Who adjudicates an agent's explicit ack (`POST /inbox/ack` through the
+   * agent proxy). "server": only the Server's app-source ACK route, so the
+   * Server's read state is the one read state (RFC 081 D7); the local item
+   * is retired only after the Server accepts. Absent: the daemon acks
+   * locally, falling back to the Server when the local source refuses.
+   * Daemon-internal retirements (`store.ack`) are unaffected.
+   */
+  ackAuthority?: "server";
+  /**
+   * The `Next action` an agent reads when a Server-authorized ack of this
+   * source fails: "refused" (the Server answered 4xx; the same ack would be
+   * refused again) or "unavailable" (5xx or unreachable; the same ack is safe
+   * to run again). Absent: the proxy's generic wording.
+   */
+  ackFailureNextAction?: (input: { sourceRef: AgentInboxSourceRef; outcome: "refused" | "unavailable" }) => string;
 };
 
 /** appId → notificationClass → definition. Production default is empty. */
@@ -119,8 +150,8 @@ export type AgentAppInboxRegistry = Readonly<
 
 const FORBIDDEN_PRIMARY_ACTION_KEYS = new Set(["command", "shell", "argv", "executable", "cwd"]);
 
-/** Control / line terminators that would let preview forge a second CLI line. */
-const PREVIEW_FORBIDDEN_CHARS = /[\u0000-\u001f\u007f]/;
+/** Control / line terminators that would let preview forge a second CLI line (NEL and the Unicode separators included). */
+const PREVIEW_FORBIDDEN_CHARS = /[\u0000-\u001f\u007f\u0085\u2028\u2029]/;
 
 export const AGENT_APP_INBOX_PERSISTED_REJECTION_CODES = [
   "invalid_json",
@@ -210,6 +241,57 @@ export type AgentAppInboxStore = {
   }): boolean;
   mint(input: AgentAppInboxMintInput): AgentAppInboxMintResult;
   ack(itemId: string): boolean;
+  /**
+   * Drops an item whose source no longer asks for an ack (a canceled reminder,
+   * a recurring reminder's earlier fire: RFC 081 D21, D22). Nothing is
+   * acknowledged: no acknowledged source is recorded, so no ack reaches the
+   * Server, and the source isn't asked (`beforeAck`). False when the store
+   * holds no such item or a seal protects it.
+   */
+  retire(itemId: string): boolean;
+  /**
+   * The agent dismissed the item without acting on it (`raft inbox dismiss`):
+   * removed as retire() removes it, traced with outcome `dismissed`. Which
+   * items an agent may dismiss is the caller's check
+   * (agentInboxAppItemDismissTarget).
+   */
+  dismiss(itemId: string): boolean;
+  /** The item's class sets `ackAuthority: "server"`: an agent's ack goes only through the Server. */
+  requiresServerAuthorizedAck(item: Pick<AgentInboxAppItem, "appId" | "notificationClass">): boolean;
+  /**
+   * A source of a server-authority class, normalized and with its itemId, or
+   * null (unknown class, not server-authority, invalid sourceRef): what an
+   * ack of a source this store does not hold (a lost store) sends the Server.
+   */
+  normalizeServerAckSource(input: {
+    appId: string;
+    notificationClass: string;
+    sourceRef: unknown;
+  }): AgentAppInboxServerAckSource | null;
+  /** Records the Server's settlement of an acknowledged source (no-op when the store holds no such ack). */
+  markAcknowledgedSourceServerAck(
+    source: Pick<AgentAppInboxAcknowledgedSource, "appId" | "notificationClass" | "sourceRef">,
+    outcome: "accepted" | "refused",
+  ): void;
+  /** Acknowledged server-authority sources the Server has not settled, oldest first, at most `limit`. */
+  listServerAckBackfillPending(limit: number): AgentAppInboxAcknowledgedSource[];
+  /** The capability whose one-time server-ack backfill completed, or null. */
+  serverAckBackfillDone(): string | null;
+  markServerAckBackfillDone(capability: string): void;
+  /** Content-free trace of one backfill run (counts only). */
+  traceServerAckBackfill(attrs: {
+    attempted: number;
+    accepted: number;
+    refused: number;
+    failed: number;
+    remaining: number;
+    done: boolean;
+  }): void;
+  /** The class's ackFailureNextAction for this item, or null when it has none. */
+  ackFailureNextAction(
+    item: Pick<AgentInboxAppItem, "appId" | "notificationClass" | "sourceRef">,
+    outcome: "refused" | "unavailable",
+  ): string | null;
   beginServerAuthorizedAckIntent(input: { itemId: string; ackAttemptId: string }): AgentAppInboxAckIntent | null;
   completeServerAuthorizedAck(input: { itemId: string; ackAttemptId: string }): boolean;
   clearServerAuthorizedAckIntent(input: { itemId: string; ackAttemptId: string }): boolean;
@@ -269,6 +351,8 @@ export function createAgentAppInboxStore(options?: {
   const ackIntents = new Map<string, AgentAppInboxAckIntent>();
   /** Exact source identity -> local per-Agent hold, independent of source record lifetime. */
   const seals = new Map<string, AgentAppInboxSeal>();
+  /** The capability whose server-ack backfill completed (persisted), or null. */
+  let serverAckBackfillDoneFor: string | null = null;
   const assertStorageActive = () => options?.storage?.assertActive();
 
   const persist = () => {
@@ -281,6 +365,7 @@ export function createAgentAppInboxStore(options?: {
         acknowledgedSources: [...acknowledgedSources.values()],
         ackIntents: [...ackIntents.values()],
         seals: [...seals.values()],
+        ...(serverAckBackfillDoneFor ? { serverAckBackfillDone: serverAckBackfillDoneFor } : {}),
       })}\n`,
     );
   };
@@ -343,6 +428,11 @@ export function createAgentAppInboxStore(options?: {
         }
       }
 
+      const rawBackfillDone = (parsed as { serverAckBackfillDone?: unknown }).serverAckBackfillDone;
+      const restoredBackfillDone = typeof rawBackfillDone === "string" && rawBackfillDone.length > 0
+        ? rawBackfillDone
+        : null;
+
       // Install only after the complete payload has passed parse, schema, and
       // semantic binding validation. A valid prefix cannot leak through a
       // later rejection.
@@ -367,6 +457,7 @@ export function createAgentAppInboxStore(options?: {
       for (const seal of restoredSeals) {
         seals.set(makeIdentityKey(seal.appId, seal.notificationClass, seal.sourceRef), seal);
       }
+      serverAckBackfillDoneFor = restoredBackfillDone;
     } catch (error) {
       options.storage.reportDataFailure(
         error instanceof AgentAppInboxPersistedRejection
@@ -378,6 +469,26 @@ export function createAgentAppInboxStore(options?: {
   };
 
   restore();
+
+  /** retire() and dismiss(): the item leaves without an ack; `outcome` is what the trace says. */
+  const removeWithoutAck = (itemId: string, outcome: "retired" | "dismissed"): boolean => {
+    assertStorageActive();
+    const item = items.get(itemId);
+    if (!item) return false;
+    if (findSealForSourceId(seals, item)) return false;
+    items.delete(itemId);
+    identityIndex.delete(makeIdentityKey(item.appId, item.notificationClass, item.sourceRef));
+    ackIntents.delete(itemId);
+    persist();
+    if (options?.ownerAgentId) {
+      options.trace?.("daemon.app_inbox.ack", {
+        ...appInboxItemTraceAttrs(options.ownerAgentId, item),
+        outcome,
+        retention: item.retention,
+      });
+    }
+    return true;
+  };
 
   return {
     list() {
@@ -606,6 +717,78 @@ export function createAgentAppInboxStore(options?: {
       }
       return true;
     },
+    retire(itemId) {
+      return removeWithoutAck(itemId, "retired");
+    },
+    dismiss(itemId) {
+      return removeWithoutAck(itemId, "dismissed");
+    },
+    requiresServerAuthorizedAck(item) {
+      return registry[item.appId]?.[item.notificationClass]?.ackAuthority === "server";
+    },
+    normalizeServerAckSource(input) {
+      const classSpec = registry[input.appId]?.[input.notificationClass];
+      if (!classSpec || classSpec.ackAuthority !== "server") return null;
+      const normalized = classSpec.normalizeSourceRef(input.sourceRef);
+      if (!normalized.ok || !isClosedSourceRefShape(normalized.ref)) return null;
+      const itemId = classSpec.materializeItemId?.(normalized.ref)
+        ?? deriveStableItemId(input.appId, input.notificationClass, normalized.ref);
+      return {
+        appId: input.appId,
+        notificationClass: input.notificationClass,
+        sourceRef: normalized.ref,
+        itemId,
+      };
+    },
+    markAcknowledgedSourceServerAck(source, outcome) {
+      assertStorageActive();
+      const key = makeIdentityKey(source.appId, source.notificationClass, source.sourceRef);
+      const acknowledged = acknowledgedSources.get(key);
+      if (!acknowledged || acknowledged.serverAck === outcome) return;
+      acknowledgedSources.set(key, { ...acknowledged, serverAck: outcome });
+      persist();
+    },
+    listServerAckBackfillPending(limit) {
+      assertStorageActive();
+      const pending: AgentAppInboxAcknowledgedSource[] = [];
+      for (const acknowledged of acknowledgedSources.values()) {
+        if (acknowledged.serverAck !== undefined) continue;
+        if (registry[acknowledged.appId]?.[acknowledged.notificationClass]?.ackAuthority !== "server") continue;
+        pending.push(acknowledged);
+      }
+      return pending
+        .sort((a, b) => a.acknowledgedAtMs - b.acknowledgedAtMs || a.itemId.localeCompare(b.itemId))
+        .slice(0, Math.max(0, limit))
+        .map((acknowledged) => ({ ...acknowledged, sourceRef: { ...acknowledged.sourceRef } }));
+    },
+    serverAckBackfillDone() {
+      assertStorageActive();
+      return serverAckBackfillDoneFor;
+    },
+    markServerAckBackfillDone(capability) {
+      assertStorageActive();
+      if (serverAckBackfillDoneFor === capability) return;
+      serverAckBackfillDoneFor = capability;
+      persist();
+    },
+    traceServerAckBackfill(attrs) {
+      options?.trace?.(
+        "daemon.app_inbox.server_ack_backfill",
+        {
+          ...(options?.ownerAgentId ? { owner_agent_id: options.ownerAgentId } : {}),
+          attempted: attrs.attempted,
+          accepted: attrs.accepted,
+          refused: attrs.refused,
+          failed: attrs.failed,
+          remaining: attrs.remaining,
+          done: attrs.done,
+        },
+        attrs.failed > 0 ? "error" : "ok",
+      );
+    },
+    ackFailureNextAction(item, outcome) {
+      return registry[item.appId]?.[item.notificationClass]?.ackFailureNextAction?.({ sourceRef: item.sourceRef, outcome }) ?? null;
+    },
     beginServerAuthorizedAckIntent(input) {
       assertStorageActive();
       const item = items.get(input.itemId);
@@ -658,6 +841,7 @@ export function createAgentAppInboxStore(options?: {
           itemId: item.itemId,
           acknowledgedAtMs: nowMs(),
           ...(options?.ownerAgentId ? { ownerAgentId: options.ownerAgentId } : {}),
+          serverAck: "accepted",
         });
       }
       items.delete(input.itemId);
@@ -702,6 +886,7 @@ export function createAgentAppInboxStore(options?: {
       acknowledgedSources.clear();
       ackIntents.clear();
       seals.clear();
+      serverAckBackfillDoneFor = null;
       persist();
     },
   };
@@ -886,6 +1071,7 @@ function restoreAcknowledgedSource(raw: unknown, registry: AgentAppInboxRegistry
     itemId: saved.itemId,
     acknowledgedAtMs: saved.acknowledgedAtMs,
     ...(saved.ownerAgentId ? { ownerAgentId: saved.ownerAgentId } : {}),
+    ...(saved.serverAck === "accepted" || saved.serverAck === "refused" ? { serverAck: saved.serverAck } : {}),
   };
 }
 

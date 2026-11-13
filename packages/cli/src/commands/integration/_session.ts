@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { randomUUID } from "node:crypto";
 import path from "node:path";
 
 import type { AgentContext } from "../../auth/env";
@@ -11,6 +12,8 @@ import {
   type FetchTransportCauseClass,
 } from "../../proxy";
 import { buildAgentCallbackHandoffUrl, type IntegrationLoginResponse, type RegisteredIntegrationService } from "./_format";
+import type { createAgentApiSurfaceClient } from "../../agentApiPath";
+import { agentHandoffProtocol, establishAgentSession, verifyCachedAgentSession, type AgentHandoffBinding } from "./agentHandoffDirect";
 
 export interface SessionCookie {
   pair: string;
@@ -25,6 +28,7 @@ export interface IntegrationServiceSession {
   clientId: string;
   returnUrl: string;
   cookies: SessionCookie[];
+  handoff?: AgentHandoffBinding;
   createdAt: string;
   updatedAt: string;
 }
@@ -33,6 +37,7 @@ export interface IntegrationSessionResult {
   cookies: SessionCookie[];
   source: "cache" | "fresh";
   sessionPath: string | null;
+  authentication?: "verified" | "unverified";
 }
 
 function safeUrl(value: string, label: string): URL {
@@ -314,6 +319,7 @@ function storeIntegrationSession(input: {
   env: NodeJS.ProcessEnv;
   service: RegisteredIntegrationService;
   cookies: SessionCookie[];
+  handoff?: AgentHandoffBinding;
 }): string | null {
   const filePath = integrationSessionFilePath(input);
   if (!filePath) return null;
@@ -324,11 +330,24 @@ function storeIntegrationSession(input: {
     clientId: input.service.clientId,
     returnUrl: input.service.returnUrl ?? "",
     cookies: freshCookies(input.cookies),
+    ...(input.handoff ? { handoff: input.handoff } : {}),
     createdAt: previous?.createdAt ?? now,
     updatedAt: now,
   };
   fs.mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 });
-  fs.writeFileSync(filePath, `${JSON.stringify(body, null, 2)}\n`, { mode: 0o600 });
+  if (input.handoff) {
+    // A previously existing file may have broader permissions. Never write the
+    // v1 cookie through it: write a private new file and atomically replace it.
+    const temporary = path.join(path.dirname(filePath), `.raft-v1-session-${randomUUID()}.tmp`);
+    try {
+      fs.writeFileSync(temporary, `${JSON.stringify(body, null, 2)}\n`, { mode: 0o600, flag: "wx" });
+      fs.renameSync(temporary, filePath);
+    } finally {
+      try { fs.unlinkSync(temporary); } catch { /* rename removed it, or write did not create it */ }
+    }
+  } else {
+    fs.writeFileSync(filePath, `${JSON.stringify(body, null, 2)}\n`, { mode: 0o600 });
+  }
   return filePath;
 }
 
@@ -399,13 +418,48 @@ export async function consumeAgentLoginHandoff(input: {
   return callbackCookies;
 }
 
+/** Verify v1 caches against both the authenticated Raft context and the App. */
+export async function loadVerifiedIntegrationSession(input: {
+  service: RegisteredIntegrationService;
+  agentContext: AgentContext;
+  env: NodeJS.ProcessEnv;
+  api: ReturnType<typeof createAgentApiSurfaceClient>;
+}): Promise<IntegrationServiceSession | null> {
+  const stored = loadStoredIntegrationSession(input);
+  if (!stored) return null;
+  if (stored.handoff !== undefined) {
+    if (!stored.handoff || typeof stored.handoff !== "object" || stored.handoff.version !== "v1") {
+      throw cliError("INTEGRATION_AGENT_HANDOFF_FAILED", "Stored Agent session has an unsupported binding; start login again.");
+    }
+    await verifyCachedAgentSession({ api: input.api, local: input.agentContext, service: input.service,
+      binding: stored.handoff, cookies: stored.cookies, env: input.env });
+  } else if (input.service.clientId === "slock-internal-app-admin"
+    && stored.cookies.some((cookie) => cookie.pair.startsWith("__Host-raft_app_admin_agent_session="))) {
+    // This v1 cookie cannot be treated as a legacy cache if its binding is lost.
+    throw cliError("INTEGRATION_AGENT_HANDOFF_FAILED", "Stored Agent session has no identity binding; start login again.");
+  }
+  return stored;
+}
+
 export async function ensureIntegrationServiceSession(input: {
   login: IntegrationLoginResponse;
   service: RegisteredIntegrationService;
   agentContext: AgentContext;
   env: NodeJS.ProcessEnv;
+  api?: ReturnType<typeof createAgentApiSurfaceClient>;
+  verifier?: string;
   refresh?: boolean;
 }): Promise<IntegrationSessionResult> {
+  const protocol = agentHandoffProtocol(input.login.agentHandoffProtocol);
+  if (protocol === "v1") {
+    if (input.login.service.id !== input.service.id || input.login.service.clientId !== input.service.clientId || input.login.service.returnUrl !== input.service.returnUrl) {
+      throw cliError("INTEGRATION_AGENT_HANDOFF_FAILED", "The registered App changed while starting login; retry.");
+    }
+    if (!input.api || !input.login.requestId || !input.verifier) throw cliError("INTEGRATION_AGENT_HANDOFF_FAILED", "Agent Login needs an authenticated Raft context and its private verifier.");
+    const result = await establishAgentSession({ api: input.api, local: input.agentContext, service: input.service, code: input.login.requestId, verifier: input.verifier, env: input.env });
+    const sessionPath = storeIntegrationSession({ ...input, cookies: result.cookies, handoff: result.binding });
+    return { cookies: result.cookies, source: "fresh", authentication: "verified", sessionPath };
+  }
   if (!input.refresh) {
     const stored = loadStoredIntegrationSession(input);
     if (stored) {

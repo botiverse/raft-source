@@ -652,3 +652,110 @@ test(
     }
   },
 );
+
+for (const joint of [false, true]) {
+  test(
+    `real PostgreSQL root edit and concurrent reply both commit without a lock-order deadlock (joint=${joint})`,
+    { skip: !(REAL_PG_URL || REAL_PG_REQUIRED) },
+    async () => {
+      assert.ok(REAL_PG_URL, `${REAL_PG_URL_ENV} is required`);
+      const databaseName = `inbound_edit_race_${process.pid}_${randomBytes(4).toString("hex")}`;
+      const admin = new pg.Client({ connectionString: REAL_PG_URL });
+      await admin.connect();
+      const databaseUrl = databaseUrlFor(REAL_PG_URL, databaseName);
+      let pool: pg.Pool | undefined;
+      let observer: pg.Client | undefined;
+      let editor: pg.Client | undefined;
+      let replier: pg.Client | undefined;
+      let releaseEdit!: () => void;
+      const editGate = new Promise<void>((resolve) => { releaseEdit = resolve; });
+      let markLinkLocked!: () => void;
+      const linkLocked = new Promise<void>((resolve) => { markLinkLocked = resolve; });
+      let editRun: ReturnType<typeof processExternalInboundEventOnce> | undefined;
+      let replyRun: ReturnType<typeof processExternalInboundEventOnce> | undefined;
+      const sqlStates: string[] = [];
+      try {
+        await admin.query(`CREATE DATABASE ${quoteIdentifier(databaseName)}`);
+        pool = new pg.Pool({ connectionString: databaseUrl, max: 4 });
+        const db = drizzle(pool, { schema }) as Database;
+        await migrate(db, { migrationsFolder: MIGRATIONS_FOLDER });
+        await initDatabase(databaseUrl);
+        const fixture = await seedFixture(db);
+        const registrationId = randomUUID();
+        const installId = randomUUID();
+        await db.update(externalActorProjections).set({ provider: "slack", appRegistrationId: registrationId, installId })
+          .where(eq(externalActorProjections.id, fixture.actor.id));
+        Object.assign(fixture.authority, { provider: "slack", appRegistrationId: registrationId, installId });
+        if (joint) await convertFixtureToJoint(db, fixture);
+        const originalId = "1786596360.000001";
+        const dependencies: ExternalInboundWorkerDependencies = {
+          now: () => new Date(NOW.getTime() + 10_000),
+          async decryptNormalizedPayload({ ciphertext }) { return ciphertext; },
+          async resolveCurrentRuntime() { return fixture.authority; },
+        };
+        await enqueue(db, fixture.authority, "original", payload(fixture.actor.id, originalId), NOW);
+        const initial = await processExternalInboundEventOnce({ db, leaseOwner: "edit-race-original", dependencies });
+        assert.equal(initial.kind, "committed", JSON.stringify(initial));
+        const [originalLink] = await db.select().from(externalMessageLinks).where(eq(externalMessageLinks.providerMessageId, originalId));
+        const edit: ExternalInboundNormalizedMessage = {
+          ...payload(fixture.actor.id, originalId), schema: "external-inbound-normalized-edit.v1",
+          providerFileIds: [], providerAgentMentions: [], providerEditedTs: "1786596420.000002", content: "edited root",
+        };
+        const plaintext = JSON.stringify(edit);
+        await enqueueExternalInboundEvent({
+          db, authority: fixture.authority, providerEventId: "root-edit", normalizedPayloadDigest: digest(plaintext),
+          encryptedPayload: plaintext, envelopeKeyId: "test-only", payloadSchemaVersion: 4,
+          payloadExpiresAt: new Date(NOW.getTime() + 300_000), receivedAt: new Date(NOW.getTime() + 1_000),
+        });
+        await enqueue(db, fixture.authority, "reply", payload(fixture.actor.id, "1786596360.000002", originalId), new Date(NOW.getTime() + 2_000));
+        observer = new pg.Client({ connectionString: databaseUrl });
+        editor = new pg.Client({ connectionString: databaseUrl, application_name: "inbound-edit-race-editor" });
+        replier = new pg.Client({ connectionString: databaseUrl, application_name: "inbound-edit-race-replier" });
+        await Promise.all([observer.connect(), editor.connect(), replier.connect()]);
+        for (const client of [editor, replier]) {
+          // Drizzle calls pg's promise overload with a QueryConfig and values.
+          // The test wrapper records actual SQLSTATEs and pauses after the edit
+          // has its link lock; production code has no scheduling test hook.
+          const query = client.query.bind(client) as (config: pg.QueryConfig, values?: unknown[]) => Promise<pg.QueryResult>;
+          client.query = (async (config: pg.QueryConfig, values?: unknown[]) => {
+            try {
+              const result = await query(config, values);
+              if (client === editor && /select.*from "external_message_links".*for update/is.test(config.text) && result.rows.length > 0) {
+                markLinkLocked();
+                await editGate;
+              }
+              return result;
+            } catch (error) {
+              if (error instanceof Error && "code" in error && typeof error.code === "string") sqlStates.push(error.code);
+              throw error;
+            }
+          }) as typeof client.query;
+        }
+        editRun = processExternalInboundEventOnce({ db: drizzle(editor, { schema }) as Database, leaseOwner: "edit-race-editor", dependencies });
+        // A failed edit should fail the test, not leave it waiting forever.
+        await Promise.race([linkLocked, editRun.then(() => { throw new Error("edit finished before acquiring its link lock"); })]);
+        replyRun = processExternalInboundEventOnce({ db: drizzle(replier, { schema }) as Database, leaseOwner: "edit-race-replier", dependencies });
+        // Old order: reply waits on the root link while holding the channel.
+        // Fixed order: reply waits on the channel already held by the edit.
+        // Observe an actual blocking relationship before releasing the edit.
+        await waitForApplicationLock(observer, {
+          waiterApplication: "inbound-edit-race-replier", waiterQuery: "%",
+          blockerApplication: "inbound-edit-race-editor", blockerQuery: "%",
+        });
+        releaseEdit();
+        const results = await Promise.all([editRun, replyRun]);
+        assert.deepEqual(results.map((result) => result.kind), ["committed", "committed"]);
+        assert.deepEqual(sqlStates, []);
+        const [message] = await db.select().from(messages).where(eq(messages.id, originalLink.raftMessageId));
+        assert.equal(message.content, "edited root");
+      } finally {
+        releaseEdit();
+        await Promise.allSettled([editRun, replyRun].filter(Boolean));
+        await closeDatabase();
+        await Promise.all([editor?.end(), replier?.end(), observer?.end(), pool?.end()]);
+        await admin.query(`DROP DATABASE IF EXISTS ${quoteIdentifier(databaseName)}`);
+        await admin.end();
+      }
+    },
+  );
+}

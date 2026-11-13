@@ -52,3 +52,37 @@ test("events without platformScope keep the existing all-platform user-room beha
     },
   ]);
 });
+
+test("notification:desktop is declaration-filtered to desktop clientKind rooms only", () => {
+  const { io, events } = createIoRecorder();
+
+  emitPlatformScopedUserEvent(io, "user-1", "notification:desktop", { id: "message:msg-1" });
+
+  assert.deepEqual(events, [
+    {
+      room: socketClientKindRoom("user-1", "desktop"),
+      event: "notification:desktop",
+      payload: { id: "message:msg-1" },
+    },
+  ]);
+});
+
+test("notification:push stays mobile-only after the desktop event was added", () => {
+  const { io, events } = createIoRecorder();
+
+  emitPlatformScopedUserEvent(io, "user-1", "notification:push", { messageId: "msg-1" });
+
+  assert.deepEqual(events.map((event) => event.room), [socketClientKindRoom("user-1", "mobile")]);
+});
+
+test("notification:retract reaches desktop, web and mobile clientKind rooms, never cli", () => {
+  const { io, events } = createIoRecorder();
+
+  emitPlatformScopedUserEvent(io, "user-1", "notification:retract", { groupKey: "s1:c1" });
+
+  assert.deepEqual(events.map((event) => event.room), [
+    socketClientKindRoom("user-1", "desktop"),
+    socketClientKindRoom("user-1", "web"),
+    socketClientKindRoom("user-1", "mobile"),
+  ]);
+});

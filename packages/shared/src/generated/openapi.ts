@@ -90,6 +90,23 @@ export type paths = {
         patch?: never;
         trace?: never;
     };
+    "/api/channels/{channelId}/unread": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Mark a conversation unread (no request body) */
+        post: operations["markConversationUnread"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 };
 export type webhooks = Record<string, never>;
 export type components = {
@@ -103,14 +120,15 @@ export type components = {
         };
         /** Format: uuid */
         AttachmentId: string;
+        AttachmentMonthlyUpload: {
+            limitBytes: number;
+            month: string;
+            remainingBytes: number;
+            /** @constant */
+            source?: "appsumo";
+        };
         /** @enum {string} */
         AttachmentReservationState: "pending" | "consumed" | "canceled" | "expired";
-        AttachmentUploadCapabilities: {
-            directUploadEnabled: boolean;
-            directUploadThresholdBytes: number | null;
-            maxBytes: number;
-            sessionExpiresInSeconds: number | null;
-        };
         AttachmentUploadForbiddenError: {
             /** @constant */
             code: "UPLOAD_FORBIDDEN";
@@ -124,6 +142,14 @@ export type components = {
             /** @constant */
             code: "UPLOAD_IDEMPOTENCY_CONFLICT";
             message: string;
+            /** @constant */
+            retryable: false;
+        };
+        AttachmentUploadQuotaExceededError: {
+            /** @constant */
+            code: "FILE_UPLOAD_QUOTA_EXCEEDED";
+            message: string;
+            monthlyUpload: components["schemas"]["AttachmentMonthlyUpload"];
             /** @constant */
             retryable: false;
         };
@@ -232,6 +258,34 @@ export type components = {
             /** @constant */
             retryable: false;
         };
+        MarkConversationUnreadResponse: {
+            markedUnread: boolean;
+            maxReadSeq: number;
+            /** @constant */
+            ok: true;
+            outcome?: components["schemas"]["MarkUnreadOutcome"];
+            readStateVersion: number;
+            unreadCount: number;
+        };
+        /** @enum {string} */
+        MarkUnreadOutcome: "counted" | "marked" | "nothing";
+        ReadMutationPendingResponse: {
+            authoritySeq: number;
+            /** @constant */
+            code: "READ_MUTATION_PENDING";
+            frontierUrl: string;
+            /** Format: uuid */
+            mutationId: string;
+            /** @constant */
+            outcome: "unknown";
+            /** @constant */
+            status: "admitted";
+        };
+        ReadStateErrorResponse: {
+            /** @constant */
+            code?: "READ_MUTATION_FENCE_REFUSED";
+            error: string;
+        };
         UploadObjectMismatchError: {
             /** @constant */
             code: "UPLOAD_OBJECT_MISMATCH";
@@ -253,6 +307,13 @@ export type components = {
             message: string;
             /** @constant */
             retryable: false;
+        };
+        WebAttachmentUploadCapabilities: {
+            directUploadEnabled: boolean;
+            directUploadThresholdBytes: number | null;
+            maxBytes: number;
+            monthlyUpload: components["schemas"]["AttachmentMonthlyUpload"] | null;
+            sessionExpiresInSeconds: number | null;
         };
     };
     responses: never;
@@ -278,7 +339,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["AttachmentUploadCapabilities"];
+                    "application/json": components["schemas"]["WebAttachmentUploadCapabilities"];
                 };
             };
         };
@@ -314,13 +375,13 @@ export interface operations {
                     "application/json": components["schemas"]["InvalidUploadRequestError"];
                 };
             };
-            /** @description Upload is forbidden */
+            /** @description Upload is forbidden, or the monthly upload quota has no room for it */
             403: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["AttachmentUploadForbiddenError"];
+                    "application/json": components["schemas"]["AttachmentUploadForbiddenError"] | components["schemas"]["AttachmentUploadQuotaExceededError"];
                 };
             };
             /** @description Idempotency key conflicts with another request */
@@ -544,6 +605,55 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["UploadObjectMismatchError"];
+                };
+            };
+        };
+    };
+    markConversationUnread: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                channelId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The read state after the write, and what it left (`outcome`) */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MarkConversationUnreadResponse"];
+                };
+            };
+            /** @description Admitted; the result is not known yet */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ReadMutationPendingResponse"];
+                };
+            };
+            /** @description The read-state fence refused the caller */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ReadStateErrorResponse"];
+                };
+            };
+            /** @description The conversation does not exist or is not visible to the caller */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ReadStateErrorResponse"];
                 };
             };
         };

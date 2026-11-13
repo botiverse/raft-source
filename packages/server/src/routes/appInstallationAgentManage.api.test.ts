@@ -1,0 +1,63 @@
+import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
+import { and, eq } from "drizzle-orm";
+import { createApiTest } from "../test/integration/apiTest";
+import { seedBoundGuest } from "../test/guestFixture";
+import { agents, oauthAccessTokens, oauthAppPermissionRevisions, oauthClientInstalls, oauthClients, oauthUserConsents, serverMembers, users } from "../db/schema";
+import { createOAuthClient } from "../services/oauthService";
+import { mintAppInstallationCredential } from "../services/appInstallationCredentialService";
+
+const test = createApiTest({ skipAuthRateLimit: true });
+
+test("installation checks current Agent edit authority without revealing hidden Agents", async ({ app, db, seed }) => {
+  const owner = await seed.human(), creator = await seed.human(), other = await seed.human();
+  const server = await seed.server({ owner, members: [creator, other] });
+  const foreign = await seed.server({ owner });
+  const suffix = randomUUID().slice(0, 8);
+  const client = await createOAuthClient({ serverId: server.id, createdByUserId: owner.id, appType: "third_party_global", name: "Manage fixture", clientId: `manage-${suffix}` });
+  const [revision] = await db.insert(oauthAppPermissionRevisions).values({ clientId: client.client.id, revision: 1, requestedGroups: ["server", "agent"], requestedEvents: [], state: "active", createdByType: "human", createdById: owner.id }).returning();
+  await db.update(oauthClients).set({ outboundRequestRevision: 1, outboundCurrentRevisionId: revision!.id, outboundCurrentGroups: ["server", "agent"], outboundCurrentEvents: [] }).where(eq(oauthClients.id, client.client.id));
+  const [install] = await db.insert(oauthClientInstalls).values({ serverId: server.id, clientId: client.client.id, installedByUserId: owner.id, approvedRequestRevisionId: revision!.id, approvedGroups: ["server", "agent"], grantRevision: 1 }).returning();
+  const mint = async (groups: string[]) => { const result = await mintAppInstallationCredential({ clientId: client.client.id, installationId: install!.id, requestedGroups: groups }); assert.ok(result); return result.token; };
+  const token = await mint(["server", "agent"]), serverOnly = await mint(["server"]), agentOnly = await mint(["agent"]);
+  for (const human of [owner, creator, other]) {
+    await db.insert(oauthAccessTokens).values({ clientId: client.client.id, userId: human.id, principalType: "human", serverId: server.id, tokenHash: randomUUID(), scopes: ["openid"], expiresAt: new Date("2020-01-01T00:00:00Z") });
+    await db.insert(oauthUserConsents).values({ clientId: client.client.id, userId: human.id, serverId: server.id, scopes: ["openid"], source: "login" });
+  }
+  const [ordinary] = await db.insert(agents).values({ serverId: server.id, name: `ordinary-${suffix}`, creatorType: "user", creatorId: creator.id }).returning();
+  const [foreignAgent] = await db.insert(agents).values({ serverId: foreign.id, name: `foreign-${suffix}`, creatorType: "user", creatorId: owner.id }).returning();
+  const [assistant] = await db.insert(agents).values({ serverId: server.id, name: `assistant-${suffix}`, creatorType: "user", creatorId: creator.id, assistantOwnerUserId: creator.id }).returning();
+  const [hiddenBot] = await db.insert(agents).values({ serverId: server.id, name: `hidden-${suffix}`, creatorType: "user", creatorId: owner.id, managedByAppInstallId: install!.id }).returning();
+  const read = (sub: string, agentId: string, credential = token) => fetch(`${app.baseUrl}/api/app-installation/members/${sub}/agents/${agentId}/manage`, { headers: { Authorization: `Bearer ${credential}` } });
+  const result = async (sub: string, id: string) => { const res = await read(sub, id); return { status: res.status, body: await res.json(), cache: res.headers.get("cache-control") }; };
+  const no = { status: 200, body: { allowed: false }, cache: "private, no-store" };
+  const yes = { status: 200, body: { allowed: true }, cache: "private, no-store" };
+  assert.deepEqual(await result(owner.id, ordinary!.id), yes, "Server owner may edit");
+  assert.deepEqual(await result(creator.id, ordinary!.id), yes, "human creator may edit while a member");
+  assert.deepEqual(await result(creator.id.toUpperCase(), ordinary!.id), yes, "UUID casing does not change creator authority");
+  assert.deepEqual(await result(other.id, ordinary!.id), no);
+  assert.deepEqual(await result(creator.id, assistant!.id), no, "even its owner cannot reveal a personal assistant to an App");
+  assert.deepEqual(await result(owner.id, assistant!.id), no);
+  assert.deepEqual(await result(owner.id, foreignAgent!.id), no);
+  assert.deepEqual(await result(owner.id, hiddenBot!.id), no, "an inactive App Bot is not in the directory");
+  assert.deepEqual(await result(owner.id, randomUUID()), no);
+  assert.deepEqual(await result(owner.id, "not-a-uuid"), no);
+  assert.deepEqual(await result(randomUUID(), ordinary!.id), no);
+  assert.equal((await read(owner.id, ordinary!.id, serverOnly)).status, 403);
+  assert.equal((await read(owner.id, ordinary!.id, agentOnly)).status, 403);
+  assert.equal((await read(owner.id, ordinary!.id, "invalid")).status, 401);
+  await db.update(serverMembers).set({ role: "admin" }).where(and(eq(serverMembers.serverId, server.id), eq(serverMembers.userId, other.id)));
+  assert.deepEqual(await result(other.id, ordinary!.id), yes);
+  await db.update(serverMembers).set({ role: "member" }).where(and(eq(serverMembers.serverId, server.id), eq(serverMembers.userId, other.id)));
+  assert.deepEqual(await result(other.id, ordinary!.id), no);
+  await seedBoundGuest({ serverId: server.id, userId: creator.id });
+  assert.deepEqual(await result(creator.id, ordinary!.id), no, "the Agent router refuses guests even when they created it");
+  await db.update(serverMembers).set({ role: "member", guestChannelId: null }).where(and(eq(serverMembers.serverId, server.id), eq(serverMembers.userId, creator.id)));
+  await db.update(oauthUserConsents).set({ revokedAt: new Date() }).where(and(eq(oauthUserConsents.clientId, client.client.id), eq(oauthUserConsents.userId, creator.id)));
+  assert.deepEqual(await result(creator.id, ordinary!.id), no);
+  await db.update(users).set({ retiredAt: new Date() }).where(eq(users.id, owner.id));
+  assert.deepEqual(await result(owner.id, ordinary!.id), no);
+  await db.update(users).set({ retiredAt: null }).where(eq(users.id, owner.id));
+  await db.update(agents).set({ deletedAt: new Date() }).where(eq(agents.id, ordinary!.id));
+  assert.deepEqual(await result(owner.id, ordinary!.id), no);
+});

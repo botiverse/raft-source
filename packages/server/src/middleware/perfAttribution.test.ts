@@ -9,7 +9,7 @@ import {
   PERF_SCENARIO_ID_HEADER,
 } from "./perfAttribution";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 test("buildPerfAttributionEvent normalizes 5xx responses into the 5xx bucket", () => {
   const req: any = {
@@ -43,7 +43,7 @@ test("perfAttributionMiddleware logs a 429 auth limiter event when perf headers 
   const previous = process.env[PERF_ATTRIBUTION_ENV];
   process.env[PERF_ATTRIBUTION_ENV] = "1";
 
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   const originalInfo = console.info;
   const captured: string[] = [];
   console.info = (...args: unknown[]) => {

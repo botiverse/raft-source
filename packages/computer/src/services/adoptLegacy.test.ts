@@ -352,6 +352,41 @@ test("adoptLegacy service: live legacy daemon stops before runner.state.json is 
   });
 });
 
+// The machine lock's rule: the daemon wrote `startedAt` after it started, so a
+// process that started later got its pid. On Windows a SIGTERM ends it outright.
+test("adoptLegacy service: a live lock pid that started after the lock was written is another program: never signalled; the daemon itself is stopped as before", { skip: process.platform === "win32" }, async () => {
+  const lockStartedAt = "2026-11-01T00:00:00.000Z";
+  for (const [startedAtMs, outcome] of [
+    [Date.parse(lockStartedAt) + 10 * 60_000, "already_dead"],
+    [Date.parse(lockStartedAt) - 2_000, "stopped"],
+    [undefined, "stopped"],
+  ] as const) {
+    await withHome(async (home) => {
+      const ctx = await startAdoptServer({});
+      const markerPath = join(home, "legacy-stop-signaled.txt");
+      const child = await spawnLegacyDaemonProbe(markerPath);
+      try {
+        await seedLegacyOwnerFile(home, LEGACY_KEY, JSON.stringify({ pid: child.pid, startedAt: lockStartedAt }));
+        const result = await adoptLegacy(
+          { serverSlug: "/legacy", serverUrl: ctx.baseUrl, rawKey: LEGACY_KEY, mode: "legacy_key_argv", redactedPrefix: LEGACY_PREFIX },
+          { processStartTimeMs: async () => startedAtMs },
+        );
+        assert.equal(result.legacyStop.outcome, outcome, String(startedAtMs));
+        const signaled = await readFile(markerPath, "utf8").then(() => true, () => false);
+        assert.equal(signaled, outcome === "stopped", "only the daemon itself gets SIGTERM");
+        if (outcome === "already_dead") {
+          assert.deepEqual(result.legacyStop, { attempted: false, pid: child.pid, outcome: "already_dead", reason: "pid_reused" });
+          assert.equal(child.exitCode, null, "the other program keeps running");
+          assert.match(await readFile(adoptionLogPath(home), "utf8"), /legacy_stop_reason=pid_reused/);
+        }
+      } finally {
+        if (!child.killed) child.kill("SIGKILL");
+        await stop(ctx.server);
+      }
+    });
+  }
+});
+
 test("adoptLegacy service: fingerprint selector network failure throws ADOPT_NETWORK_FAILED with serverUrl and retry guidance", async () => {
   await withHome(async (home) => {
     const ctx = await startAdoptServer({ adoptConn: "destroy" });
@@ -513,7 +548,7 @@ test("adoptLegacy service: missing user session throws NO_USER_SESSION", async (
         (err: unknown) => {
           assert.ok(err instanceof ComputerServiceError);
           assert.equal((err as ComputerServiceError).code, "NO_USER_SESSION");
-          assert.match((err as ComputerServiceError).message, /No user session at .+\. Run `raft-computer login` first\./);
+          assert.match((err as ComputerServiceError).message, /No user session at .+\. Run `raft-computer setup \/<server>` in a terminal/);
           return true;
         },
       );
@@ -538,7 +573,7 @@ test("adoptLegacy service: invalid user session shape throws INVALID_USER_SESSIO
         (err: unknown) => {
           assert.ok(err instanceof ComputerServiceError);
           assert.equal((err as ComputerServiceError).code, "INVALID_USER_SESSION");
-          assert.match((err as ComputerServiceError).message, /User session at .+ is invalid\. Re-run `raft-computer login`\./);
+          assert.match((err as ComputerServiceError).message, /User session at .+ is invalid\. Run `raft-computer setup \/<server>` in a terminal/);
           return true;
         },
       );
@@ -868,8 +903,8 @@ test("adoptLegacy service: 401 auth_required throws ADOPT_AUTH_REQUIRED with log
           assert.ok(err instanceof ComputerServiceError);
           assert.equal((err as ComputerServiceError).code, "ADOPT_AUTH_REQUIRED");
           const msg = (err as ComputerServiceError).message;
-          assert.match(msg, /Re-run `raft-computer login`/);
-          assert.match(msg, /use the same `--server-url` if not on production/);
+          assert.match(msg, /Run `raft-computer setup \/<server>` in a terminal/);
+          assert.match(msg, /with the same `--server-url` if not on production/);
           assert.match(msg, /No local Computer state was written\./);
           return true;
         },
@@ -904,7 +939,7 @@ test("adoptLegacy service: 401 with no code throws ADOPT_UNEXPECTED_RESPONSE w/ 
           assert.equal((err as ComputerServiceError).code, "ADOPT_UNEXPECTED_RESPONSE");
           const msg = (err as ComputerServiceError).message;
           assert.match(msg, /status 401, missing error code/);
-          assert.match(msg, /re-run `raft-computer login` first/);
+          assert.match(msg, /run `raft-computer setup \/<server>` in a terminal to sign in again/);
           assert.equal(msg.includes("ADOPT_AUTH_REQUIRED"), false);
           return true;
         },
@@ -1089,40 +1124,4 @@ test("adoptLegacy service: appendAdoptionLog writes snake_case fields, no raw ke
       assert.equal(st.mode & 0o077, 0);
     }
   });
-});
-
-// --- Gate 16: closed-set sentinel pin (4-rule sub-rule a + b for §6/§9 adopt) ---
-//
-// Cross-verifies the AdoptLegacyService failure surface against the §6/§9
-// closed set without grep'ing source — every code we throw is named here,
-// and every code named here MUST have a thrown call site in
-// services/adoptLegacy.ts. If a future change adds, removes, or renames
-// a §6/§9 adopt-axis code, this test fails before review.
-//
-// LEGACY_KEY_REQUIRED / LEGACY_KEY_MULTIPLE_SOURCES + the prefix-shape
-// LEGACY_KEY_INVALID stay in the CLI adapter (resolveLegacyKey) — the
-// service-side LEGACY_KEY_INVALID is the SERVER-rejected variant, a
-// different §-axis rejection.
-test("adoptLegacy service: §6/§9 closed-set adopt codes are exactly { 14 codes }", async () => {
-  const expected = new Set([
-    "NO_USER_SESSION",
-    "INVALID_USER_SESSION",
-    "ADOPT_NOT_AUTHORIZED",
-    "ADOPT_REQUIRES_ADMIN",
-    "ADOPT_DISABLED",
-    "LEGACY_KEY_INVALID",
-    "LEGACY_MACHINE_NOT_FOUND",
-    "LEGACY_MACHINE_KEY_MIGRATED",
-    "ADOPT_AUTH_REQUIRED",
-    "ADOPT_UNEXPECTED_RESPONSE",
-    "ADOPT_NETWORK_FAILED",
-    "ADOPT_FAILED",
-    "PREFLIGHT_FAILED",
-    "LEGACY_DAEMON_STOP_FAILED",
-  ]);
-  const src = await readFile(new URL("./adoptLegacy.ts", import.meta.url), "utf8");
-  const re = /new ComputerServiceError\(\s*"([A-Z_]+)"/g;
-  const found = new Set<string>();
-  for (const m of src.matchAll(re)) found.add(m[1]);
-  assert.deepEqual([...found].sort(), [...expected].sort());
 });

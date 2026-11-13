@@ -8,22 +8,24 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
+import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { eq } from "drizzle-orm";
 
-import { BasicTracer, MemoryTraceSink } from "@botiverse/raft-shared";
+import { agentApiMessageEnvelopeSchema, agentApiSearchResultSchema, BasicTracer, MemoryTraceSink } from "@botiverse/raft-shared";
 import { getDb } from "../db/index";
 import { traceAgentIdHash, traceServerIdHash } from "../tracing/traceIdentity";
-import { agents, messages, serverMembers, users } from "../db/schema";
-import { createAgent, assignMachine } from "../services/agentService";
+import { agents, channelAgents, externalActorProjections, externalMessageAuthorFacts, messages, serverMembers, servers, users } from "../db/schema";
+import { createAgent } from "../services/agentService";
+import { placeAgentOnMachine } from "../test/agentMachineFixture";
 import { addHuman, createChannel, getOrCreateThread } from "../services/channelService";
-import { createMessage } from "../services/messageService";
+import { createMessage, deliverMessageToAgent } from "../services/messageService";
 import { registerMachine } from "../services/machineService";
 import { createServer } from "../services/serverService";
 import { mintAgentCredential } from "../services/agentCredentialService";
 import * as taskService from "../services/taskService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 const execFileAsync = promisify(execFile);
 const cliEntry = fileURLToPath(new URL("../../../cli/src/index.ts", import.meta.url));
@@ -48,7 +50,7 @@ async function seedSearchFixture() {
   await db.insert(serverMembers).values({ serverId: server.id, userId: speaker.id, role: "member" }).onConflictDoNothing();
   const agent = await createAgent(server.id, "search-ref-agent", { runtime: "codex" });
   const { machine, apiKey } = await registerMachine(server.id, owner.id, "search-ref-machine");
-  await assignMachine(agent.id, machine.id);
+  await placeAgentOnMachine(agent.id, machine.id);
   const channel = await createChannel(server.id, "search-ref-channel");
 
   const ownerMessage = await createMessage(channel.id, "user", owner.id, "memberref owner zebraneedle");
@@ -82,6 +84,7 @@ async function createAgentProfileEnv(baseUrl: string, serverId: string, agentId:
     agentId,
     scopes: ["read"],
     name: "search-ref-cli",
+    issuedVia: "computer",
     createdByUserId: null,
   });
   fs.writeFileSync(path.join(profileDir, "credential.json"), JSON.stringify({
@@ -142,6 +145,74 @@ test("internal agent search resolves sender handle refs and filters by sender", 
     assert.equal(JSON.stringify(span).includes(agent.id), false, `${span.name} must not carry the raw agent id`);
     assert.equal(JSON.stringify(span).includes(agent.serverId), false, `${span.name} must not carry the raw server id`);
   }
+});
+
+test("both agent search routes keep anonymous Slack readable without an addressable sender", async ({ app }) => {
+  const { owner, ownerMessage, agent, apiKey, channel } = await seedSearchFixture();
+  const db = getDb();
+  await db.insert(channelAgents).values({ channelId: channel.id, agentId: agent.id, addedAt: new Date("2020-01-01") }).onConflictDoNothing();
+  const marker = `slack-anonymous:${"a".repeat(64)}`;
+  const [actor] = await db.insert(externalActorProjections).values({ provider: "slack", appRegistrationId: "test-registration",
+    installId: "test-install", workspaceId: "T_TEST", externalActorId: "", identityKind: "anonymous", displayName: "Slack",
+    actorKind: "unknown", projectionRevision: 1, observedAt: new Date() }).returning();
+  const content = "anonymous uniqueneedle content";
+  const [message] = await db.insert(messages).values({ channelId: channel.id, senderType: "external_projection", senderId: actor.id,
+    messageType: "chat", content, searchText: content }).returning();
+  await db.insert(externalMessageAuthorFacts).values({ messageId: message.id, projectionId: actor.id, provider: "slack",
+    appRegistrationId: "test-registration", installId: "test-install", workspaceId: "T_TEST", externalActorId: "",
+    identityKind: "anonymous", anonymousDisplayId: marker, externalConversationId: "C_TEST", externalMessageId: "123.456",
+    displayName: "Slack", actorKind: "unknown", actorProjectionRevision: 1,
+    contentDigest: createHash("sha256").update(content).digest("hex") });
+  const thread = await getOrCreateThread(ownerMessage.id, owner.id, "user");
+  const [reply] = await db.insert(messages).values({ channelId: thread.id, senderType: "external_projection", senderId: actor.id,
+    messageType: "chat", content: "anonymous thread body", searchText: "anonymous thread body" }).returning();
+  await db.insert(externalMessageAuthorFacts).values({ messageId: reply.id, projectionId: actor.id, provider: "slack",
+    appRegistrationId: "test-registration", installId: "test-install", workspaceId: "T_TEST", externalActorId: "",
+    identityKind: "anonymous", anonymousDisplayId: marker, externalConversationId: "C_TEST", externalMessageId: "123.457",
+    displayName: "Slack", actorKind: "unknown", actorProjectionRevision: 1,
+    contentDigest: createHash("sha256").update(reply.content).digest("hex") });
+  const { apiKey: agentKey } = await mintAgentCredential({ agentId: agent.id, scopes: ["read"], name: "anonymous-search-test",
+    issuedVia: "computer", createdByUserId: null });
+  for (const [path, credential] of [[`/internal/agent/${agent.id}/search`, apiKey], ["/internal/agent-api/search", agentKey]] as const) {
+    const response = await fetch(`${app.baseUrl}${path}?q=uniqueneedle`, { headers: machineHeaders(credential) });
+    assert.equal(response.status, 200);
+    const body = await response.json() as { results: Array<Record<string, unknown>> };
+    const result = body.results.find(row => row.id === message.id);
+    assert.ok(result); assert.equal(result.senderId, ""); assert.equal(result.senderName, "Slack");
+    assert.equal("external_message" in result, false);
+    assert.equal(agentApiSearchResultSchema.safeParse(result).success, true);
+  }
+  const channelRef = encodeURIComponent(`#${channel.name}`);
+  for (const [path, credential] of [[`/internal/agent/${agent.id}/history`, apiKey], ["/internal/agent-api/history", agentKey]] as const) {
+    const response = await fetch(`${app.baseUrl}${path}?channel=${channelRef}&consume=false`, { headers: machineHeaders(credential) });
+    assert.equal(response.status, 200);
+    const body = await response.json() as { messages: Array<Record<string, unknown>> };
+    const result = body.messages.find(row => row.id === message.id || row.message_id === message.id);
+    assert.ok(result, `anonymous message missing from ${path}`);
+    assert.equal(result.senderId ?? result.sender_id, "");
+    assert.equal("external_message" in result, false);
+    const parsed = agentApiMessageEnvelopeSchema.safeParse(result);
+    assert.equal(parsed.success, true, parsed.success ? "" : JSON.stringify(parsed.error.issues));
+  }
+  const threadRef = encodeURIComponent(`#${channel.name}:${ownerMessage.id.slice(0, 8)}`);
+  for (const [path, credential] of [[`/internal/agent/${agent.id}/history`, apiKey], ["/internal/agent-api/history", agentKey]] as const) {
+    const response = await fetch(`${app.baseUrl}${path}?channel=${threadRef}&consume=false`, { headers: machineHeaders(credential) });
+    assert.equal(response.status, 200);
+    const body = await response.json() as { messages: Array<Record<string, unknown>> };
+    const item = body.messages.find(row => row.id === reply.id || row.message_id === reply.id);
+    assert.ok(item, `anonymous thread missing from ${path}`);
+    assert.equal(item.senderId ?? item.sender_id, "");
+    assert.equal(agentApiMessageEnvelopeSchema.safeParse(item).success, true);
+    assert.equal("external_message" in item, false);
+  }
+  const notifications: Array<Record<string, unknown>> = [];
+  await deliverMessageToAgent({ async deliverMessage(_id: string, payload: Record<string, unknown>) {
+    notifications.push(payload); return { status: "queued" };
+  } } as never, message.id, agent.id);
+  assert.equal(notifications.length, 1);
+  assert.equal(notifications[0].sender_id, "");
+  assert.equal(agentApiMessageEnvelopeSchema.safeParse(notifications[0]).success, true);
+  assert.equal("external_message" in notifications[0], false);
 });
 
 test("internal agent search preserves an amended task host hit and attaches its latest projection", async ({ app }) => {
@@ -285,16 +356,15 @@ test("internal agent search requires timezone offsets on direct date filters", a
   });
 
   assert.equal(res.status, 400);
-  const body = await res.json() as { errorCode?: string; error?: string };
+  const body = await res.json() as { code?: string; errorCode?: string; error?: string };
+  assert.equal(body.code, "INVALID_DATE_FILTER");
   assert.equal(body.errorCode, "INVALID_DATE_FILTER");
-  assert.match(body.error ?? "", /missing a timezone offset/i);
-  assert.match(body.error ?? "", /\+08:00/);
-  assert.match(body.error ?? "", /raft CLI/);
+  assert.equal(body.error, "A search date filter needs a time zone offset: give an ISO timestamp such as 2026-08-06T04:38:00+08:00.");
 });
 
 test("internal agent search applies offset-bearing boundary filters as absolute instants", async ({ app }) => {
   const db = getDb();
-  const { speaker, agent, apiKey, speakerMessage } = await seedSearchFixture();
+  const { speaker, server, agent, apiKey, speakerMessage } = await seedSearchFixture();
   await db.update(messages)
     .set({ createdAt: new Date("2026-08-05T20:38:37.000Z") })
     .where(eq(messages.id, speakerMessage.id));
@@ -313,6 +383,11 @@ test("internal agent search applies offset-bearing boundary filters as absolute 
     const body = await res.json() as { results: Array<{ id: string }> };
     return body.results.map((result) => result.id);
   }
+
+  // Agent search stays inside the free plan's history window, like every read.
+  assert.deepEqual(await searchWith({}), [], "free plan: a message older than the history window is not found");
+  assert.deepEqual(await searchWith({ before: "2026-08-06T04:38:38+08:00" }), []);
+  await db.update(servers).set({ plan: "founder" }).where(eq(servers.id, server.id));
 
   assert.deepEqual(
     await searchWith({ after: "2026-08-06T04:38:36+08:00" }),

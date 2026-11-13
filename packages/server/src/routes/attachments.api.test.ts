@@ -1,4 +1,5 @@
-import { tokenForHuman, fixturePasswordHash } from "../test/integration/credentials";
+import { fillJointMembersFromChannelHumans } from "../test/jointMemberFill";
+import { accessTokenForTest, signInForTest, tokenForHuman, fixturePasswordHash } from "../test/integration/credentials";
 import { createApiTest } from "../test/integration/apiTest";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
@@ -13,10 +14,11 @@ import { eq, inArray } from "drizzle-orm";
 import { openTestApp } from "../test/integration/app";
 import { createHangingStorageTestHarness } from "../test/hangingStorageTestHarness";
 import { getDb } from "../db/index";
-import { attachmentPreviewCache, attachments, jointChannels, jointChannelServers, machines, servers, users } from "../db/schema";
-import { signAccessToken } from "../middleware/auth";
-import { createSession, revokeAllUserSessions } from "../services/sessionService";
-import { assignMachine, createAgent } from "../services/agentService";
+import { insertAttachmentsWithObjects, insertLinkedAttachmentsWithObjects } from "../test/attachmentObjectFixture";
+import { attachmentObjects, attachmentPreviewCache, attachments, jointChannels, jointChannelServers, machines, servers, users } from "../db/schema";
+import { revokeAllUserSessions } from "../services/sessionService";
+import { createAgent } from "../services/agentService";
+import { placeAgentOnMachine } from "../test/agentMachineFixture";
 import { clearAuthCache, registerMachine } from "../services/machineService";
 import { createServer } from "../services/serverService";
 import { XLSX_PREVIEW_MAX_FILE_SIZE_BYTES, asServerId } from "@botiverse/raft-shared";
@@ -44,7 +46,7 @@ import {
   shouldStreamAttachmentThroughServerForRequest,
 } from "./attachments";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 /**
  * Regression tests for #proj-security task #10 (2026-04-19):
@@ -61,6 +63,7 @@ const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardi
  *
  * These tests assert both legs of the cross-server attack are now blocked.
  */
+
 
 
 
@@ -98,7 +101,7 @@ async function seedCrossServerFixture() {
 
   await addHuman(channelB.id, userB.id);
   const attachmentId = "00000000-0000-4000-8000-000000000001";
-  await db.insert(attachments).values({
+  await insertLinkedAttachmentsWithObjects({
     id: attachmentId,
     channelId: channelB.id,
     uploaderId: userB.id,
@@ -177,7 +180,7 @@ test("inline video/audio preview URLs get the one-hour TTL; downloads and other 
       { id: "00000000-0000-4000-8000-0000000000a3", filename: "doc.pdf", mimeType: "application/pdf" },
     ];
     for (const file of files) {
-      await getDb().insert(attachments).values({
+      await insertLinkedAttachmentsWithObjects({
         id: file.id,
         channelId: channelB.id,
         uploaderId: userB.id,
@@ -243,7 +246,7 @@ test("attachment URL routing keeps CDN_BASE_URL out of original-file downloads",
       "00000000-0000-4000-8000-000000000003",
       ".txt",
     );
-    await getDb().insert(attachments).values({
+    await insertLinkedAttachmentsWithObjects({
       id: currentAttachmentId,
       channelId: channelB.id,
       uploaderId: userB.id,
@@ -289,8 +292,7 @@ test("attachment URL routing keeps CDN_BASE_URL out of original-file downloads",
 
 test("attachment reads reject revoked sessions through both bearer and query authentication", async ({ app }) => {
   const { userB, serverB, attachmentId } = await seedCrossServerFixture();
-  const { familyId } = await createSession(userB.id);
-  const token = signAccessToken(userB.id, familyId);
+  const { token } = await signInForTest(userB.id);
   let storageReads = 0;
   __setStorageForTests({
     async put() {}, async delete() {},
@@ -320,9 +322,9 @@ test("attachment reads reject revoked sessions through both bearer and query aut
   }
 });
 
-test("attachment reads reject retired users even with legacy access tokens", async ({ app }) => {
+test("attachment reads reject retired users even with a live session's access token", async ({ app }) => {
   const { userB, serverB, attachmentId } = await seedCrossServerFixture();
-  const token = signAccessToken(userB.id);
+  const token = await accessTokenForTest(userB.id);
   await getDb().update(users).set({ retiredAt: new Date() }).where(eq(users.id, userB.id));
   for (const query of [false, true]) {
     const response = await fetch(
@@ -334,16 +336,21 @@ test("attachment reads reject retired users even with legacy access tokens", asy
   }
 });
 
-test("attachment reads reject legacy machine keys after Computer adoption", async ({ app }) => {
+test("attachment reads reject legacy machine keys, adopted or not", async ({ app }) => {
   const { userB, serverB, attachmentId } = await seedCrossServerFixture();
   const { machine, apiKey } = await registerMachine(serverB.id, userB.id, "attachment-migrated-machine");
-  await getDb().update(machines).set({ legacyKeyMigratedAt: new Date() }).where(eq(machines.id, machine.id));
-  clearAuthCache(machine.id);
-  const response = await fetch(`${app.baseUrl}/api/attachments/${attachmentId}/url`, {
+  const read = () => fetch(`${app.baseUrl}/api/attachments/${attachmentId}/url`, {
     headers: { Authorization: `Bearer ${apiKey}` },
   });
-  assert.equal(response.status, 401);
-  assert.equal((await response.json()).code, "legacy_machine_key_migrated");
+  // Machine credentials no longer read attachments at all (#proj-raft-computer:8e6a4629).
+  let response = await read();
+  assert.equal(response.status, 403);
+  assert.equal((await response.json()).code, "machine_key_route_retired");
+  await getDb().update(machines).set({ legacyKeyMigratedAt: new Date() }).where(eq(machines.id, machine.id));
+  clearAuthCache(machine.id);
+  response = await read();
+  assert.equal(response.status, 403);
+  assert.equal((await response.json()).code, "machine_key_route_retired");
 });
 
 function signPreviewLikeToken(
@@ -466,7 +473,7 @@ test("missing attachment object is a 404, not a 500", async ({ app }) => {
   const channel = await createChannel(server.id, "missing-object-channel", undefined, "channel");
   await addHuman(channel.id, owner.id);
   const attachmentId = "00000000-0000-4000-8000-0000000000f1";
-  await db.insert(attachments).values({
+  await insertLinkedAttachmentsWithObjects({
     id: attachmentId,
     channelId: channel.id,
     uploaderId: owner.id,
@@ -498,7 +505,7 @@ test("missing attachment object is a 404, not a 500", async ({ app }) => {
   }
 });
 
-test("GET /api/attachments/:id accepts sk_computer_* credential for same-server download", async ({ app }) => {
+test("GET /api/attachments/:id refuses an sk_computer_* credential even for a same-server attachment", async ({ app }) => {
   const db = getDb();
   const [owner] = await db.insert(users).values({
     email: "computer-attach-owner@slock.test",
@@ -512,7 +519,7 @@ test("GET /api/attachments/:id accepts sk_computer_* credential for same-server 
   const channel = await createChannel(server.id, "computer-attach-channel", undefined, "channel");
 
   const attachmentId = "00000000-0000-4000-8000-000000000201";
-  await db.insert(attachments).values({
+  await insertLinkedAttachmentsWithObjects({
     id: attachmentId,
     channelId: channel.id,
     uploaderId: owner.id,
@@ -538,16 +545,17 @@ test("GET /api/attachments/:id accepts sk_computer_* credential for same-server 
   const { apiKey } = (await attachRes.json()) as { apiKey: string };
   assert.ok(apiKey.startsWith("sk_computer_"), "expected sk_computer_* credential");
 
-  // The pglite harness has no storage configured, so auth+scope pass but the
-  // actual download returns 503. The key assertion is: not 401 / 403.
+  // A machine credential used to read any attachment on its server, private
+  // channels and DMs included; agents download with their own credential through
+  // /internal/agent-api/attachments instead (#proj-raft-computer:8e6a4629).
   const downloadRes = await fetch(`${app.baseUrl}/api/attachments/${attachmentId}`, {
     headers: {
       Authorization: `Bearer ${apiKey}`,
     },
     redirect: "manual",
   });
-  assert.notEqual(downloadRes.status, 401, "sk_computer_* must authenticate via requireFlexAuth");
-  assert.notEqual(downloadRes.status, 403, "sk_computer_* must be scoped to its linked machine's server");
+  assert.equal(downloadRes.status, 403);
+  assert.equal((await downloadRes.json() as { code?: string }).code, "machine_key_route_retired");
 });
 
 test("GET /api/attachments/:id/url allows linked joint attachments through sibling projections only", async ({ app }) => {
@@ -597,9 +605,10 @@ test("GET /api/attachments/:id/url allows linked joint attachments through sibli
       joinedByUserId: peerOwner.id,
     },
   ]);
+  await fillJointMembersFromChannelHumans();
 
   const message = await createMessage(canonical.id, "user", hostOwner.id, "joint attachment message");
-  await db.insert(attachments).values([
+  await insertAttachmentsWithObjects(db, [
     {
       id: "00000000-0000-4000-8000-000000000101",
       channelId: hostProjection.id,
@@ -694,7 +703,7 @@ test("GET /api/attachments/:id/preview returns bounded XLSX data and typed failu
     const validId = "00000000-0000-4000-8000-000000000201";
     const corruptId = "00000000-0000-4000-8000-000000000202";
     const tooLargeId = "00000000-0000-4000-8000-000000000203";
-    await db.insert(attachments).values([
+    await insertLinkedAttachmentsWithObjects([
       {
         id: validId,
         channelId: channel.id,
@@ -770,6 +779,12 @@ test("GET /api/attachments/:id/preview returns bounded XLSX data and typed failu
     assert.equal(cachedRes.status, 200);
     assert.equal((await cachedRes.json() as { status: string }).status, "ok");
     assert.equal(storageReads, readsAfterFirst);
+    // The card's summary view (task #164) shares the build and cache but
+    // carries only the kind, never the sheet contents.
+    const summaryRes = await fetch(`${app.baseUrl}/api/attachments/${validId}/preview?view=summary`, { headers });
+    assert.equal(summaryRes.status, 200);
+    assert.deepEqual(await summaryRes.json(), { status: "ok", data: { kind: "xlsx" }, truncated: false });
+    assert.equal(storageReads, readsAfterFirst);
     const [cacheRow] = await db.select().from(attachmentPreviewCache).where(eq(attachmentPreviewCache.attachmentId, validId));
     assert.ok(cacheRow);
     const { userB, serverB } = await seedCrossServerFixture();
@@ -790,7 +805,7 @@ test("GET /api/attachments/:id/preview returns bounded XLSX data and typed failu
     // preview (never a 5xx for an interactive caller), and the outage is not
     // pinned in the preview cache — the next request rebuilds.
     const degradedId = "00000000-0000-4000-8000-000000000204";
-    await db.insert(attachments).values({
+    await insertLinkedAttachmentsWithObjects({
       id: degradedId,
       channelId: channel.id,
       uploaderId: user.id,
@@ -853,7 +868,7 @@ test("GET /api/attachments/:id serves both image and pdf attachments from local 
   process.env.UPLOADS_LOCAL = "true";
   resetStorageForTests();
 
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const db = getDb();
     const [user] = await db
@@ -880,7 +895,7 @@ test("GET /api/attachments/:id serves both image and pdf attachments from local 
     fs.writeFileSync(path.join(uploadsDir, server.id, `${imageId}.jpg`), imageBuffer);
     fs.writeFileSync(path.join(uploadsDir, server.id, `${pdfId}.pdf`), pdfBuffer);
 
-    await db.insert(attachments).values([
+    await insertLinkedAttachmentsWithObjects([
       {
         id: imageId,
         channelId: channel.id,
@@ -917,11 +932,23 @@ test("GET /api/attachments/:id serves both image and pdf attachments from local 
     assert.equal(imageRes.status, 200);
     assert.equal(imageRes.headers.get("content-type"), "image/jpeg");
     assert.match(imageRes.headers.get("content-disposition") ?? "", /^inline;/);
+    // The web app may live on another origin (self-hosted, local dev, e2e):
+    // an inline image must be embeddable cross-origin, a download need not be.
+    assert.equal(imageRes.headers.get("cross-origin-resource-policy"), "cross-origin");
     assert.deepEqual(Buffer.from(await imageRes.arrayBuffer()), imageBuffer);
+
+    const imageDownloadRes = await fetch(`${app.baseUrl}/api/attachments/${imageId}?download=1`, {
+      headers: { Authorization: `Bearer ${token}`, "X-Server-Id": server.id },
+    });
+    assert.equal(imageDownloadRes.status, 200);
+    assert.match(imageDownloadRes.headers.get("content-disposition") ?? "", /^attachment;/);
+    assert.equal(imageDownloadRes.headers.get("cross-origin-resource-policy"), "same-origin");
+    await imageDownloadRes.arrayBuffer();
 
     assert.equal(pdfRes.status, 200);
     assert.equal(pdfRes.headers.get("content-type"), "application/pdf");
     assert.match(pdfRes.headers.get("content-disposition") ?? "", /^attachment;/);
+    assert.equal(pdfRes.headers.get("cross-origin-resource-policy"), "same-origin");
     assert.deepEqual(Buffer.from(await pdfRes.arrayBuffer()), pdfBuffer);
   } finally {
     await app.close();
@@ -941,7 +968,7 @@ test("attachment Range route releases its real upstream Agent socket when the cl
     const tokenB = await tokenForHuman(userB.email);
     const downloadId = "00000000-0000-4000-8000-000000000011";
     const sizeBytes = 1024 * 1024;
-    await getDb().insert(attachments).values({
+    await insertLinkedAttachmentsWithObjects({
       id: downloadId,
       channelId: channelB.id,
       uploaderId: userB.id,
@@ -987,7 +1014,7 @@ test("attachment HTML preview two-hop route releases its real upstream Agent soc
     const { userB, serverB, channelB } = await seedCrossServerFixture();
     const tokenB = await tokenForHuman(userB.email);
     const previewId = "00000000-0000-4000-8000-000000000012";
-    await getDb().insert(attachments).values({
+    await insertLinkedAttachmentsWithObjects({
       id: previewId,
       channelId: channelB.id,
       uploaderId: userB.id,
@@ -1033,7 +1060,7 @@ test("attachment HTML preview preserves upstream storage error logging after hea
     const { userB, serverB, channelB } = await seedCrossServerFixture();
     const tokenB = await tokenForHuman(userB.email);
     const previewId = "00000000-0000-4000-8000-000000000013";
-    await getDb().insert(attachments).values({
+    await insertLinkedAttachmentsWithObjects({
       id: previewId,
       channelId: channelB.id,
       uploaderId: userB.id,
@@ -1162,7 +1189,7 @@ test("identical uploads create distinct attachment projections instead of hash-d
   process.env.UPLOADS_LOCAL = "true";
   resetStorageForTests();
 
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const { userB, serverB, channelB } = await seedCrossServerFixture();
     const tokenB = await tokenForHuman(userB.email);
@@ -1189,8 +1216,9 @@ test("identical uploads create distinct attachment projections instead of hash-d
     assert.notEqual(secondId, firstId, "each upload owns a distinct projection identity");
 
     const rows = await getDb()
-      .select({ id: attachments.id, contentHash: attachments.contentHash })
+      .select({ id: attachments.id, contentHash: attachmentObjects.contentHash })
       .from(attachments)
+      .innerJoin(attachmentObjects, eq(attachmentObjects.id, attachments.objectId))
       .where(inArray(attachments.id, [firstId, secondId]));
     assert.equal(rows.length, 2);
     assert.equal(new Set(rows.map((row) => row.contentHash)).size, 1, "precondition: bytes really hash identically");
@@ -1236,7 +1264,7 @@ test("POST /api/attachments/upload accepts Pro files over the Free 50MB cap", as
   process.env.UPLOADS_LOCAL = "true";
   resetStorageForTests();
 
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const { userB, serverB, channelB } = await seedCrossServerFixture();
     await getDb().update(servers).set({ plan: "pro" }).where(eq(servers.id, serverB.id));
@@ -1272,7 +1300,7 @@ test("POST /api/attachments/upload accepts Pro files over the Free 50MB cap", as
 test("POST /api/attachments/upload does not let the direct-upload threshold lower the legacy limit", async () => {
   const previousThreshold = process.env.ATTACHMENT_DIRECT_UPLOAD_THRESHOLD_BYTES;
   process.env.ATTACHMENT_DIRECT_UPLOAD_THRESHOLD_BYTES = "64";
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const { userB, serverB, channelB } = await seedCrossServerFixture();
     await getDb().update(servers).set({ plan: "pro" }).where(eq(servers.id, serverB.id));
@@ -1314,12 +1342,12 @@ test("agent upload keeps the Pro plan limit when legacy multipart transport is c
   process.env.UPLOADS_LOCAL = "true";
   resetStorageForTests();
 
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const { userB, serverB, channelB } = await seedCrossServerFixture();
     const agent = await createAgent(serverB.id, "attachment-plan-agent", { runtime: "codex" });
     const { machine, apiKey } = await registerMachine(serverB.id, userB.id, "attachment-plan-machine");
-    await assignMachine(agent.id, machine.id);
+    await placeAgentOnMachine(agent.id, machine.id);
     await addAgent(channelB.id, agent.id);
     await getDb().update(servers).set({ plan: "pro" }).where(eq(servers.id, serverB.id));
 
@@ -1358,7 +1386,7 @@ test("POST /api/attachments/upload accepts the full message attachment batch cap
   process.env.UPLOADS_LOCAL = "true";
   resetStorageForTests();
 
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const { userB, serverB, channelB } = await seedCrossServerFixture();
     const tokenB = await tokenForHuman(userB.email);
@@ -1397,7 +1425,7 @@ test("POST /api/attachments/upload accepts the full message attachment batch cap
 test("ATTACHMENT_UPLOAD_ENABLED=false disables human and agent uploads", async () => {
   const previous = process.env.ATTACHMENT_UPLOAD_ENABLED;
   process.env.ATTACHMENT_UPLOAD_ENABLED = "false";
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const { userB, serverB, channelB } = await seedCrossServerFixture();
     const tokenB = await tokenForHuman(userB.email);
@@ -1421,7 +1449,7 @@ test("ATTACHMENT_UPLOAD_ENABLED=false disables human and agent uploads", async (
 
     const agent = await createAgent(serverB.id, "attachment-disabled-agent", { runtime: "codex" });
     const { machine, apiKey } = await registerMachine(serverB.id, userB.id, "attachment-disabled-machine");
-    await assignMachine(agent.id, machine.id);
+    await placeAgentOnMachine(agent.id, machine.id);
     await addAgent(channelB.id, agent.id);
 
     const agentBody = new FormData();
@@ -1488,7 +1516,7 @@ test("GET /api/attachments/:id/html-preview-url returns scoped preview URL for H
   const { userB, serverB, channelB } = await seedCrossServerFixture();
   const db = getDb();
   const htmlAttachmentId = "00000000-0000-4000-8000-0000000000ff";
-  await db.insert(attachments).values({
+  await insertLinkedAttachmentsWithObjects({
     id: htmlAttachmentId,
     channelId: channelB.id,
     uploaderId: userB.id,
@@ -1531,7 +1559,7 @@ test("GET /api/attachments/:id/html-preview-url scoped token cannot be reused fo
   const db = getDb();
   const firstAttachmentId = "00000000-0000-4000-8000-0000000000a1";
   const secondAttachmentId = "00000000-0000-4000-8000-0000000000a2";
-  await db.insert(attachments).values([
+  await insertLinkedAttachmentsWithObjects([
     {
       id: firstAttachmentId,
       channelId: channelB.id,
@@ -1581,7 +1609,7 @@ test("HTML preview token cannot authorize normal attachment download or URL endp
   const { userB, serverB, channelB } = await seedCrossServerFixture();
   const db = getDb();
   const htmlAttachmentId = "00000000-0000-4000-8000-0000000000c1";
-  await db.insert(attachments).values({
+  await insertLinkedAttachmentsWithObjects({
     id: htmlAttachmentId,
     channelId: channelB.id,
     uploaderId: userB.id,
@@ -1633,7 +1661,7 @@ test("HTML preview token rejects expired and wrong-audience tokens", async ({ ap
   const { userB, serverB, channelB } = await seedCrossServerFixture();
   const db = getDb();
   const htmlAttachmentId = "00000000-0000-4000-8000-0000000000c2";
-  await db.insert(attachments).values({
+  await insertLinkedAttachmentsWithObjects({
     id: htmlAttachmentId,
     channelId: channelB.id,
     uploaderId: userB.id,
@@ -1686,7 +1714,7 @@ test("HTML preview response rejects leaked user bearer token query after URL min
   const { userB, serverB, channelB } = await seedCrossServerFixture();
   const db = getDb();
   const htmlAttachmentId = "00000000-0000-4000-8000-0000000000b1";
-  await db.insert(attachments).values({
+  await insertLinkedAttachmentsWithObjects({
     id: htmlAttachmentId,
     channelId: channelB.id,
     uploaderId: userB.id,
@@ -1757,7 +1785,7 @@ test("GET /api/attachments/:id/html-preview allows configured web origin framing
     filePath = path.resolve(process.env.UPLOADS_DIR || path.join(process.cwd(), "uploads"), storageKey);
     fs.mkdirSync(path.dirname(filePath), { recursive: true });
     fs.writeFileSync(filePath, html);
-    await db.insert(attachments).values({
+    await insertLinkedAttachmentsWithObjects({
       id: htmlAttachmentId,
       channelId: channelB.id,
       uploaderId: userB.id,
@@ -1814,24 +1842,14 @@ test("authenticated preview forbids shared and persistent caches", async ({ app 
   } finally { resetStorageForTests(); }
 });
 
-test("legacy attachment visibility follows its message, not its original upload channel", async ({ app }) => {
-  const { userA, userB, serverB, channelB, attachmentId } = await seedCrossServerFixture();
-  await getDb().insert((await import("../db/schema")).serverMembers).values({ serverId: serverB.id, userId: userA.id, role: "member" });
-  const privateChannel = await createChannel(serverB.id, "audit-private-attachment", undefined, "private");
-  await addHuman(privateChannel.id, userB.id);
-  const message = await createMessage(privateChannel.id, "user", userB.id, "private document");
-  await getDb().update(attachments).set({ messageId: message.id, objectId: null, channelId: channelB.id }).where(eq(attachments.id, attachmentId));
-  __setStorageForTests({ async put() {}, async delete() {}, async get() { return Readable.from([Buffer.alloc(42, 65)]); } });
-  try {
-    for (const [user, status] of [[userA, 404], [userB, 200]] as const) {
-      for (const suffix of ["", "/preview", "/url"]) {
-        const response = await fetch(`${app.baseUrl}/api/attachments/${attachmentId}${suffix}`, {
-          headers: { Authorization: `Bearer ${signAccessToken(user.id)}`, "X-Server-Id": serverB.id },
-        });
-        assert.equal(response.status, status, `${suffix}: ${await response.text()}`);
-      }
-    }
-  } finally { resetStorageForTests(); }
+// Storage step 2c: every attachment projection is bound to an object; the
+// database refuses one without (attachments.object_id is NOT NULL), so the
+// objectless read path no longer exists.
+test("the database refuses an attachment projection without an object", async ({ db }) => {
+  const { attachmentId } = await seedCrossServerFixture();
+  await assert.rejects(
+    db.update(attachments).set({ objectId: null as unknown as string }).where(eq(attachments.id, attachmentId)),
+  );
 });
 
 for (const denial of ["cannot-post", "quota"] as const) test(`legacy upload rejects ${denial} before storage`, async ({ app }) => {
@@ -1845,7 +1863,7 @@ for (const denial of ["cannot-post", "quota"] as const) test(`legacy upload reje
   try {
     const body = new FormData(); body.set("channelId", channelB.id); body.append("files", new Blob(["audit upload"]), "audit.txt");
     const response = await fetch(`${app.baseUrl}/api/attachments/upload`, {
-      method: "POST", body, headers: { Authorization: `Bearer ${signAccessToken(userB.id)}`, "X-Server-Id": serverB.id },
+      method: "POST", body, headers: { Authorization: `Bearer ${await accessTokenForTest(userB.id)}`, "X-Server-Id": serverB.id },
     });
     assert.equal(response.status, 403, await response.text());
     assert.equal(writes, 0);

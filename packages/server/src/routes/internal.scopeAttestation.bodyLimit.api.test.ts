@@ -19,7 +19,7 @@ import { requestDaemonScopeAttestation } from "../../../daemon/src/directUploadC
 /** The route-scoped limit under test (1 MiB). Stated here, not imported, so the test pins the number. */
 const SCOPE_ATTESTATION_REQUEST_MAX_BYTES = 1024 * 1024;
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 async function seed() {
   const db = getDb();
@@ -60,7 +60,7 @@ async function withApp<T>(fn: (app: Awaited<ReturnType<typeof openTestApp>>) => 
     saved[key] = process.env[key];
     process.env[key] = value;
   }
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     return await fn(app);
   } finally {

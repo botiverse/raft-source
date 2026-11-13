@@ -1,4 +1,5 @@
 import { create } from "zustand";
+import { ANNOUNCEMENT_SIDEBAR_STACK_MAX } from "@botiverse/raft-shared";
 import type { Announcement } from "@botiverse/raft-shared";
 import { resetAnnouncementShown } from "../analytics/announcements";
 import api from "../api/client";
@@ -6,8 +7,16 @@ import { useServerStore } from "./serverStore";
 import { registerServerReset } from "./serverResetRegistry";
 
 interface AnnouncementState {
+  /**
+   * What this entry presents: one dialog, or up to ANNOUNCEMENT_SIDEBAR_STACK_MAX
+   * sidebar cards in queue order (never both). The first row is on screen.
+   */
   pending: Announcement[];
+  /** How many sidebar cards this entry started with, for the "2 / 5" position. */
+  stackTotal: number;
   loaded: boolean;
+  /** One announcement per document entry, across presentation types and server switches. */
+  completedThisEntry: boolean;
   /**
    * Ids already reported to the server as read-complete this session. `markRead`
    * is idempotent against this so repeated explicit confirmation cannot create
@@ -17,7 +26,8 @@ interface AnnouncementState {
   /**
    * Ids whose read-complete write FAILED this session. Two jobs, deliberately
    * separate scopes:
-   *   1. Per-context failure frontiers let `load()` advance that queue.
+   *   1. Per-context failure frontiers preserve legacy markRead/load recovery.
+   *      Explicit UI close now holds further loads until the next entry.
    *   2. The modal raises a toast when a new id lands here.
    *
    * Memory only — never persisted. The server holds no dismissal for these, so
@@ -29,6 +39,8 @@ interface AnnouncementState {
   markRead: (id: string) => Promise<void>;
   close: (id: string) => void;
   dismiss: (id: string) => Promise<void>;
+  /** Marks a sidebar card read and shows the next card of this entry, if any. */
+  advance: (id: string) => Promise<void>;
   reset: () => void;
 }
 
@@ -56,12 +68,15 @@ function syncContext() {
 
 export const useAnnouncementStore = create<AnnouncementState>((set, get) => ({
   pending: [],
+  stackTotal: 0,
   loaded: false,
+  completedThisEntry: false,
   markedReadIds: [],
   writeFailedIds: [],
 
   load: () => {
     syncContext();
+    if (get().completedThisEntry) return Promise.resolve();
     // Once this tab presents a row, it owns that presentation until the user
     // closes it. Account-level dismissal from another tab must not make a
     // focused/refocused modal disappear underneath this reader.
@@ -75,7 +90,7 @@ export const useAnnouncementStore = create<AnnouncementState>((set, get) => ({
         const skipped = failedByContext.get(requestContext) ?? [];
         const after = skipped.at(-1);
         const { data } = await api.get("/announcements/active", {
-          params: { ...(after ? { after } : {}), ...(requestContext !== "account" ? { server_id: requestContext } : {}) },
+          params: { ...(after ? { after } : {}), ...(requestContext !== "account" ? { server_id: requestContext } : {}), sidebar_limit: ANNOUNCEMENT_SIDEBAR_STACK_MAX },
         });
         if (generation !== announcementLoadGeneration) return;
         const announcements = (data.announcements as Announcement[]) ?? [];
@@ -92,10 +107,8 @@ export const useAnnouncementStore = create<AnnouncementState>((set, get) => ({
           // response from focus recovery.
           if (state.pending.length > 0) return { loaded: true };
           const hiddenIds = new Set([...(failedByContext.get(requestContext) ?? []), ...state.markedReadIds]);
-          return {
-            pending: announcements.filter((announcement) => !hiddenIds.has(announcement.id)),
-            loaded: true,
-          };
+          const pending = announcements.filter((announcement) => !hiddenIds.has(announcement.id));
+          return { pending, stackTotal: pending.length, loaded: true };
         });
       } catch (err) {
         if (generation !== announcementLoadGeneration) return;
@@ -134,13 +147,26 @@ export const useAnnouncementStore = create<AnnouncementState>((set, get) => ({
   },
 
   close: (id) => {
-    set((state) => ({ pending: state.pending.filter((a) => a.id !== id) }));
+    if (!get().pending.some((item) => item.id === id)) return;
+    announcementLoadGeneration += 1;
+    announcementLoadInFlight = null;
+    set({ pending: [], completedThisEntry: true });
   },
 
   // Account dismissal + local hide, shared by every explicit dismissal action
   // and the slockdev auto-dismiss.
   dismiss: async (id) => {
     get().close(id);
+    await get().markRead(id);
+  },
+  advance: async (id) => {
+    if (get().pending[0]?.id !== id) return;
+    const rest = get().pending.slice(1);
+    if (rest.length === 0) {
+      get().close(id);
+    } else {
+      set({ pending: rest });
+    }
     await get().markRead(id);
   },
 
@@ -151,7 +177,7 @@ export const useAnnouncementStore = create<AnnouncementState>((set, get) => ({
     announcementLoadInFlight = null;
     failedByContext.clear();
     contextKey = undefined;
-    set({ pending: [], loaded: false, markedReadIds: [], writeFailedIds: [] });
+    set({ pending: [], stackTotal: 0, loaded: false, completedThisEntry: false, markedReadIds: [], writeFailedIds: [] });
   },
 }));
 

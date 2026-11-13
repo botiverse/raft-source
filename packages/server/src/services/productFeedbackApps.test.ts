@@ -5,6 +5,7 @@ import {
   productFeedbackEnvForSource,
   productFeedbackUnavailableReason,
   ProductFeedbackSourceUnavailableError,
+  resolveProductFeedbackApp,
   resolveProductFeedbackEnv,
   selectProductFeedbackEnv,
 } from "./productFeedbackApps";
@@ -83,25 +84,27 @@ test("a missing, incomplete or unparsable entry yields no app", () => {
   assert.equal(productFeedbackEnvForSource("android", APPS, noBaseUrl), null);
 });
 
-test("flag off keeps the legacy env for every source; flag on never sends mobile to the legacy app", () => {
-  for (const source of ["web", "ios", "android", "ohos"] as const) {
-    assert.equal(selectProductFeedbackEnv({ source, multiAppEnabled: false, appsJson: APPS, env: LEGACY }), LEGACY);
-  }
+test("mobile sources use their own app and never the legacy one; web always keeps the legacy env", () => {
   assert.equal(
-    selectProductFeedbackEnv({ source: "android", multiAppEnabled: true, appsJson: APPS, env: LEGACY })
-      .HANDS_FEEDBACK_APP_SLUG,
+    selectProductFeedbackEnv({ source: "android", appsJson: APPS, env: LEGACY }).HANDS_FEEDBACK_APP_SLUG,
     "raft-feedback-android",
   );
+  assert.equal(
+    selectProductFeedbackEnv({ source: "ios", appsJson: APPS, env: LEGACY }).HANDS_FEEDBACK_APP_SLUG,
+    "raft-feedback-ios",
+  );
   assert.throws(
-    () => selectProductFeedbackEnv({ source: "ohos", multiAppEnabled: true, appsJson: APPS, env: LEGACY }),
+    () => selectProductFeedbackEnv({ source: "ohos", appsJson: APPS, env: LEGACY }),
     (error: unknown) => error instanceof ProductFeedbackSourceUnavailableError && error.source === "ohos",
   );
   assert.throws(
-    () => selectProductFeedbackEnv({ source: "android", multiAppEnabled: true, appsJson: null, env: LEGACY }),
+    () => selectProductFeedbackEnv({ source: "android", appsJson: null, env: LEGACY }),
     ProductFeedbackSourceUnavailableError,
   );
-  // Web without its own entry stays on the legacy (web) app.
-  assert.equal(selectProductFeedbackEnv({ source: "web", multiAppEnabled: true, appsJson: APPS, env: LEGACY }), LEGACY);
+  // Web stays on the legacy (web) app, even if the JSON gains a `web` entry.
+  assert.equal(selectProductFeedbackEnv({ source: "web", appsJson: APPS, env: LEGACY }), LEGACY);
+  const withWeb = JSON.stringify({ ...JSON.parse(APPS), web: app("22222222-2222-4222-8222-222222222222", "raft-feedback-web") });
+  assert.equal(selectProductFeedbackEnv({ source: "web", appsJson: withWeb, env: LEGACY }), LEGACY);
 });
 
 test("the apps parameter name comes only from the Terraform-injected staging/prod path", () => {
@@ -161,24 +164,31 @@ test("the apps JSON is read once per window; a failed read is cached as unavaila
   assert.equal(await unconfigured.get(), null);
 });
 
-test("resolveProductFeedbackEnv evaluates the flag per user and reads apps only when it is on", async () => {
+test("resolveProductFeedbackEnv reads apps only for a mobile source, with no flag", async () => {
   let reads = 0;
   const apps = new CachedProductFeedbackApps(
     async () => { reads += 1; return APPS; },
     { HANDS_FEEDBACK_APPS_SSM_PARAMETER: "/slock/staging/HANDS_FEEDBACK_APPS" },
   );
-  const off = await resolveProductFeedbackEnv({
-    userId: "u1", source: "android", env: LEGACY, apps,
-    evaluateFlag: async (input) => ({ key: input.key, enabled: false, reason: "missing_flag" }) as never,
-  });
-  assert.equal(off, LEGACY);
+  assert.equal(await resolveProductFeedbackEnv({ source: "web", env: LEGACY, apps }), LEGACY);
   assert.equal(reads, 0);
-  const on = await resolveProductFeedbackEnv({
-    userId: "u1", source: "android", env: LEGACY, apps,
-    evaluateFlag: async (input) => ({ key: input.key, enabled: true, reason: "default" }) as never,
-  });
-  assert.equal(on.HANDS_FEEDBACK_APP_ID, ANDROID_APP_ID);
+  const android = await resolveProductFeedbackEnv({ source: "android", env: LEGACY, apps });
+  assert.equal(android.HANDS_FEEDBACK_APP_ID, ANDROID_APP_ID);
   assert.equal(reads, 1);
+});
+
+test("resolveProductFeedbackApp names the app a send files into: a mobile source's own, web the legacy app", async () => {
+  const apps = new CachedProductFeedbackApps(async () => APPS, { HANDS_FEEDBACK_APPS_SSM_PARAMETER: "/slock/staging/HANDS_FEEDBACK_APPS" });
+  for (const [source, appId] of [["android", ANDROID_APP_ID], ["ios", IOS_APP_ID]] as const) {
+    const resolved = await resolveProductFeedbackApp({ source, env: LEGACY, apps });
+    assert.equal(resolved.app, source);
+    assert.equal(resolved.env.HANDS_FEEDBACK_APP_ID, appId);
+  }
+  assert.deepEqual(await resolveProductFeedbackApp({ source: "web", env: LEGACY, apps }), { env: LEGACY, app: "web" });
+  // A mobile source without an app is unavailable, never filed elsewhere.
+  await assert.rejects(resolveProductFeedbackApp({ source: "ohos", env: LEGACY, apps }), ProductFeedbackSourceUnavailableError);
+  const unconfigured = new CachedProductFeedbackApps(async () => { throw new Error("must not read"); }, {});
+  await assert.rejects(resolveProductFeedbackApp({ source: "android", env: LEGACY, apps: unconfigured }), ProductFeedbackSourceUnavailableError);
 });
 
 test("an unavailable source names why, with field names only and never a value", () => {
@@ -215,7 +225,7 @@ test("an unavailable source names why, with field names only and never a value",
 
 test("selectProductFeedbackEnv carries the unavailable reason on the error", () => {
   assert.throws(
-    () => selectProductFeedbackEnv({ source: "android", multiAppEnabled: true, appsJson: "{not json", env: LEGACY }),
+    () => selectProductFeedbackEnv({ source: "android", appsJson: "{not json", env: LEGACY }),
     (error: unknown) => error instanceof ProductFeedbackSourceUnavailableError && error.reason === "apps_json_invalid",
   );
 });

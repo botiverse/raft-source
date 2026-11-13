@@ -77,6 +77,8 @@ import {
 
 const SUPPORTED_PROTOCOL_VERSIONS = [1] as const;
 const SERVICE_VERSION = "0.0.0";
+// Upper bound on waiting for open connections to close during a win32 handoff.
+const HANDOFF_CLOSE_TIMEOUT_MS = 1_000;
 
 /**
  * Per-method handler signature. The handler receives the typed `params`
@@ -106,9 +108,12 @@ export interface IpcServer {
   /** Broadcast an event to every connected client. Drops silently if the server is closed. */
   broadcast(event: ServiceEvent): void;
   /**
-   * Stop accepting new connections without destroying already-connected
-   * request sockets. Used only for the bounded service handoff: the incumbent
-   * keeps the initiating request alive while a replacement proves ownership.
+   * Give up the endpoint for the bounded service handoff. On POSIX this stops
+   * accepting and unlinks the socket path, so already-connected request
+   * sockets (the initiating request included) stay alive while a replacement
+   * proves ownership. A Windows named pipe stays bound while any connection to
+   * it is open, so on win32 every connection is closed too and the initiating
+   * request rejects with `IPC_CLIENT_CLOSED` (task #924).
    */
   releaseListener(): Promise<void>;
   /** Stop accepting connections and destroy open sockets. Idempotent. */
@@ -325,7 +330,7 @@ export function createIpcServer(options: IpcServerOptions): IpcServer {
     }
     const handler = handlers[method as keyof RequestMethodMap];
     if (!handler) {
-      writeError(conn, id, "IPC_MALFORMED_FRAME", `unknown method \`${method}\``);
+      writeError(conn, id, "IPC_METHOD_UNSUPPORTED", `unknown method \`${method}\``);
       return;
     }
     try {
@@ -383,6 +388,23 @@ export function createIpcServer(options: IpcServerOptions): IpcServer {
     });
     socket.on("close", () => connections.delete(conn));
     socket.on("error", () => {/* swallowed; close listener cleans up */});
+  }
+
+  // Each open connection keeps its pipe instance, and so the pipe name, alive.
+  // Wait (bounded) for them and the server handle to close so the
+  // replacement's bind does not race them.
+  async function closeConnectionsForHandoff(serverClosed: Promise<void>): Promise<void> {
+    const closing = [...connections].map((conn) => new Promise<void>((resolve) => {
+      if (conn.socket.closed) return resolve();
+      conn.socket.once("close", () => resolve());
+      conn.socket.destroy();
+    }));
+    let timer: NodeJS.Timeout | undefined;
+    await Promise.race([
+      Promise.all([...closing, serverClosed]),
+      new Promise<void>((resolve) => { timer = setTimeout(resolve, HANDOFF_CLOSE_TIMEOUT_MS); }),
+    ]);
+    clearTimeout(timer);
   }
 
   return {
@@ -449,10 +471,13 @@ export function createIpcServer(options: IpcServerOptions): IpcServer {
       server = null;
       if (!s) return;
       // `Server.close()` stops accepts immediately but waits to emit `close`
-      // until existing request sockets drain. Do not await that event here:
-      // the restart request itself is intentionally one of those sockets.
-      s.close();
-      if (process.platform !== "win32") {
+      // until existing request sockets drain. On POSIX do not await it: the
+      // restart request itself is intentionally one of those sockets. On
+      // win32 those sockets are closed first, then the event is awaited.
+      const serverClosed = new Promise<void>((resolve) => s.close(() => resolve()));
+      if (process.platform === "win32") {
+        await closeConnectionsForHandoff(serverClosed);
+      } else {
         await unlink(transportPath).catch((error: unknown) => {
           if (!isErrnoException(error) || error.code !== "ENOENT") throw error;
         });

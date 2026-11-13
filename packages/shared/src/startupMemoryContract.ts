@@ -6,12 +6,13 @@
  *   injection cap (bytes) = budget tokens x approx bytes/token
  *   recommended MEMORY.md size = the injection cap ("fits fully into every
  *     fresh session" — past it the file's tail stops reaching wakes)
- *   CLI-guide target copy = the same cap, interpolated (only for agents on
- *     servers with the `constructed_wake_context` flag on)
+ *   CLI-guide target copy = the same cap, interpolated (every managed
+ *     agent; the `constructed_wake_context` flag was retired on 2026-10-23)
  *
  * The Cleaner idle-hint threshold is NOT derived from this cap yet: its
- * default is a global config shared by every server, so it keeps 64 KiB until
- * the startup memory block is on everywhere.
+ * default is a global config shared by every server and still 64 KiB. The
+ * block is now on for every managed agent, so aligning it is an open
+ * follow-up (Runtime maintainer).
  *
  * Change the root here and every surface moves together; nothing else in the
  * repo may restate these numbers.

@@ -1,4 +1,6 @@
 import { expect, test } from "@playwright/test";
+import { builtinSources, mockRuntimeFormsV2, runtimeFormFixture } from "./runtimeFormV2Mock";
+import type { RuntimeFormV2Mock } from "./runtimeFormV2Mock";
 
 /**
  * task #9, remaining non-schema migrated inputs.
@@ -18,26 +20,41 @@ import { expect, test } from "@playwright/test";
 
 type Metrics = { fontSize: string; fontWeight: string; lineHeight: string };
 
+/*
+ * The runtime form is the protocol v2 one (task #8), served from the real
+ * fixtures in packages/runtime-form/fixtures (Built-in's provider/model lists
+ * are not in the fixtures; see `builtinSources`). In v2 the key's label is the
+ * form's own "API Key" for every provider (v1 prefixed the provider name), its
+ * required mark is the form's (Built-in requires it, Pi does not), and Model is
+ * a provider-dependent searchable combobox whose INPUT is measured here too —
+ * it is the provider-dependent control that replaced v1's gateway model input.
+ * Built-in's "Supports image input" is a boolean option card, not an input.
+ */
 const STATES = [
-  { caseId: "builtin-provider-dialog", runtimeId: "builtin", provider: "DeepSeek",
-    expect: ["DeepSeek API Key*"] },
-  { caseId: "builtin-provider-dialog", runtimeId: "builtin", provider: "OpenAI Compatible",
-    expect: ["OpenAI Compatible API Key*", "Base URL*", "Model*"] },
-  { caseId: "pi-provider-dialog", runtimeId: "pi", provider: "DeepSeek",
-    expect: ["DeepSeek API Key*"] },
+  { caseId: "builtin-provider-dialog", runtimeId: "builtin", providerField: "providerId", provider: "DeepSeek",
+    expect: ["API Key*", "Model*"] },
+  { caseId: "builtin-provider-dialog", runtimeId: "builtin", providerField: "providerId", provider: "OpenAI Compatible",
+    // builtin.form.json lists Base URL in no `required` (only minLength), so no mark.
+    expect: ["API Key*", "Base URL", "Model*"] },
+  { caseId: "pi-provider-dialog", runtimeId: "pi", providerField: "provider", provider: "DeepSeek",
+    expect: ["API Key", "Model*"] },
 ] as const;
 
+const FORMS: Record<string, RuntimeFormV2Mock> = {
+  builtin: { runtimeId: "builtin", form: runtimeFormFixture("builtin.form.json"), sources: builtinSources() },
+  pi: {
+    runtimeId: "pi",
+    form: runtimeFormFixture("pi.form.json"),
+    sources: {
+      provider: runtimeFormFixture("pi.option-source.provider.json"),
+      model: runtimeFormFixture("pi.option-source.fallback.json"),
+      providerModel: runtimeFormFixture("pi.option-source.provider-model.json"),
+    },
+  },
+};
+
 async function primeCatalog(page: import("@playwright/test").Page, runtimeId: string) {
-  await page.route("**/runtime-options**", async (route) => {
-    const url = route.request().url();
-    const machineId = url.split("/machines/")[1]?.split("/")[0] ?? "";
-    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({
-      context: "new_agent", machineId,
-      options: [{ runtimeId, capabilityStatus: "available", admissionStatus: "available_for_new",
-        admissionReason: null, current: false, availableForNew: true,
-        manageableForCurrentAgent: false, canSelectInThisContext: true }],
-    })});
-  });
+  await mockRuntimeFormsV2(page, [FORMS[runtimeId]]);
 }
 
 /** DS TextField: input text is 16/24, at the body weight. */
@@ -74,12 +91,11 @@ for (const state of STATES) {
       [...document.querySelectorAll('[data-slot="select-value"]')].map((v) => (v.textContent || "").trim())[1] ?? null);
     expect(runtimeLabel, `a runtime is actually selected`).toBeTruthy();
 
-    const trigger = page.locator('[data-slot="field"]').filter({ hasText: "Provider" })
-      .locator('[data-slot="button"]').first();
-    await trigger.click();
-    await page.waitForTimeout(400);
-    await page.locator('[data-slot="select-item"]').filter({ hasText: state.provider }).first().click();
+    // Provider is a v2 option-source field: a searchable combobox.
+    await page.getByTestId(`runtime-form-v2-${state.providerField}`).click();
+    await page.getByRole("option", { name: state.provider, exact: true }).click();
     await page.waitForTimeout(900);
+    await expect(page.getByTestId(`runtime-form-v2-${state.providerField}`), `provider switched`).toHaveValue(state.provider);
 
     const labels = (await page.locator('[data-slot="field-label"]').allTextContents()).map((l) => l.trim());
     for (const want of state.expect) {

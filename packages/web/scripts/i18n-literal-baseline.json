@@ -10,14 +10,6 @@
   {
     "path": "src/App.tsx",
     "rule": "formatjs/no-literal-string-in-jsx",
-    "source": "\"Not signed in\"",
-    "count": 1,
-    "classification": "internal_dev",
-    "reason": "Dev tools panel status when no local session is signed in."
-  },
-  {
-    "path": "src/App.tsx",
-    "rule": "formatjs/no-literal-string-in-jsx",
     "source": "\"slockdev\"",
     "count": 1,
     "classification": "internal_dev",
@@ -29,7 +21,7 @@
     "source": "Clear Local Session",
     "count": 1,
     "classification": "internal_dev",
-    "reason": "Dev tools control that clears local tokens/session for debugging."
+    "reason": "Slockdev-only Dev tools control that clears local tokens/session for debugging (RFC 016 dev-only exemption)."
   },
   {
     "path": "src/App.tsx",
@@ -37,15 +29,7 @@
     "source": "Dev login",
     "count": 1,
     "classification": "internal_dev",
-    "reason": "Dev tools one-click seed-account login button."
-  },
-  {
-    "path": "src/App.tsx",
-    "rule": "formatjs/no-literal-string-in-jsx",
-    "source": "Log out",
-    "count": 1,
-    "classification": "internal_dev",
-    "reason": "Logout control that exists only on the SlockdevDebugPanel."
+    "reason": "Slockdev-only Dev tools one-click seed-account login button."
   },
   {
     "path": "src/App.tsx",
@@ -56,31 +40,23 @@
     "reason": "Summary label for expanding the preview-environment description in Dev tools."
   },
   {
-    "path": "src/App.tsx",
-    "rule": "formatjs/no-literal-string-in-jsx",
-    "source": "Reload",
-    "count": 1,
-    "classification": "internal_dev",
-    "reason": "Dev tools control that force-reloads the page."
-  },
-  {
-    "path": "src/App.tsx",
-    "rule": "formatjs/no-literal-string-in-jsx",
-    "source": "Server Picker",
-    "count": 1,
-    "classification": "internal_dev",
-    "reason": "Dev tools entry that clears last-server and returns to the picker."
-  },
-  {
-    "path": "src/components/agent/AgentDetailPanel.tsx",
+    "path": "src/features/agent/AgentDetailPanel.tsx",
     "rule": "formatjs/no-literal-string-in-jsx",
     "source": "@",
-    "count": 2,
+    "count": 1,
     "classification": "protocol",
     "reason": "Protocol @ prefix before creator and agent handles in the agent detail panel."
   },
   {
-    "path": "src/components/agent/AgentDetailPanel.tsx",
+    "path": "src/features/agent/AgentProfileInfo.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "@",
+    "count": 1,
+    "classification": "protocol",
+    "reason": "Protocol @ prefix before creator and agent handles in the agent detail panel."
+  },
+  {
+    "path": "src/features/agent/AgentDetailPanel.tsx",
     "rule": "formatjs/no-literal-string-in-jsx",
     "source": "`@${agent.name}`",
     "count": 1,
@@ -94,14 +70,6 @@
     "count": 1,
     "classification": "protocol",
     "reason": "Agent DM list subtitle shows the peer as an @handle protocol form."
-  },
-  {
-    "path": "src/components/agent/ChannelMembers.tsx",
-    "rule": "formatjs/no-literal-string-in-jsx",
-    "source": "\"99+\"",
-    "count": 1,
-    "classification": "protocol",
-    "reason": "User-visible 99+ overflow notation when totalParticipants exceeds 99 in the ChannelMembers header."
   },
   {
     "path": "src/components/auth/AccountIdentitySetupPage.tsx",
@@ -136,44 +104,28 @@
     "reason": "Preview shows the real channel name that will be created (#all); keep the channel name literal."
   },
   {
-    "path": "src/components/channel/EditChannelDialog.tsx",
-    "rule": "formatjs/no-literal-string-in-jsx",
-    "source": "#",
-    "count": 1,
-    "classification": "protocol",
-    "reason": "Protocol #channelName prefix in the edit-channel drawer description."
-  },
-  {
-    "path": "src/components/layout/Sidebar.tsx",
+    "path": "src/features/sidebar/rows/SidebarPeerRowBody.tsx",
     "rule": "formatjs/no-literal-string-in-jsx",
     "source": "\"99+\"",
-    "count": 2,
+    "count": 1,
     "classification": "protocol",
     "reason": "User-visible unread overflow protocol (unread>99 ? \"99+\"); fixed badge notation, not technical."
   },
   {
-    "path": "src/components/layout/Sidebar.tsx",
+    "path": "src/components/machine/ComputerRowVersionFact.tsx",
     "rule": "formatjs/no-literal-string-in-jsx",
     "source": "→ v",
     "count": 1,
     "classification": "protocol",
-    "reason": "User-visible Computer upgrade marker → v{version} in the production sidebar."
+    "reason": "User-visible Computer upgrade marker → v{version} on the Computer list rows (desktop sidebar and phone list share this component)."
   },
   {
-    "path": "src/components/machine/MachineDetailPanel.tsx",
+    "path": "src/features/computer/MachineInfoSection.tsx",
     "rule": "formatjs/no-literal-string-in-jsx",
     "source": "v",
     "count": 1,
     "classification": "protocol",
     "reason": "User-visible version prefix v in v{computerVersion}/v{daemonVersion} notation."
-  },
-  {
-    "path": "src/components/machine/MobileComputersPanel.tsx",
-    "rule": "formatjs/no-literal-string-in-jsx",
-    "source": "→ v",
-    "count": 1,
-    "classification": "protocol",
-    "reason": "User-visible → v{version} upgrade marker on MobileComputersPanel, same protocol as Sidebar."
   },
   {
     "path": "src/components/member/HumanDetailPanel.tsx",
@@ -200,7 +152,7 @@
     "reason": "Membership discriminant label returned for status=removed; keep as protocol membership token, not UI prose."
   },
   {
-    "path": "src/components/message/MessageInput.tsx",
+    "path": "src/components/mention/MentionSuggestionList.tsx",
     "rule": "formatjs/no-literal-string-in-jsx",
     "source": "@",
     "count": 1,
@@ -232,20 +184,12 @@
     "reason": "Protocol @ prefix before agent/human handles in the profile preview card."
   },
   {
-    "path": "src/components/search/MessageSearchPage.tsx",
+    "path": "src/features/search/SearchQueryField.tsx",
     "rule": "formatjs/no-literal-string-in-jsx",
     "source": "Esc",
     "count": 1,
     "classification": "protocol",
     "reason": "Production search-rail keyboard-cap hint for Esc; same keycap protocol as ⌘K/Ctrl+K."
-  },
-  {
-    "path": "src/components/search/MessageSearchPage.tsx",
-    "rule": "formatjs/no-literal-string-in-jsx",
-    "source": "#",
-    "count": 1,
-    "classification": "protocol",
-    "reason": "Search channel filter combobox shows channel refs with # prefix."
   },
   {
     "path": "src/components/settings/AppNotificationsControls.tsx",
@@ -254,22 +198,6 @@
     "count": 1,
     "classification": "code_example",
     "reason": "Example webhook URL placeholder in AppNotificationsControls."
-  },
-  {
-    "path": "src/components/settings/MemberGraphSection.tsx",
-    "rule": "formatjs/no-literal-string-in-jsx",
-    "source": "A",
-    "count": 1,
-    "classification": "protocol",
-    "reason": "Compact agent-count suffix A in MemberGraph channel rows ({humanCount}H/{agentCount}A); approved protocol notation."
-  },
-  {
-    "path": "src/components/settings/MemberGraphSection.tsx",
-    "rule": "formatjs/no-literal-string-in-jsx",
-    "source": "H/",
-    "count": 1,
-    "classification": "protocol",
-    "reason": "Compact human-count suffix H/ in MemberGraph channel rows ({humanCount}H/{agentCount}A); approved protocol notation."
   },
   {
     "path": "src/components/settings/ProviderConnectionsSettings.tsx",
@@ -354,14 +282,6 @@
   {
     "path": "src/components/settings/settingsNavigation.ts",
     "rule": "formatjs/no-literal-string-in-object",
-    "source": "\"MCP Servers\"",
-    "count": 2,
-    "classification": "legacy",
-    "reason": "Legacy SETTINGS_TABS English MCP Servers field; production display uses the catalog."
-  },
-  {
-    "path": "src/components/settings/settingsNavigation.ts",
-    "rule": "formatjs/no-literal-string-in-object",
     "source": "\"My Feedback\"",
     "count": 1,
     "classification": "legacy",
@@ -390,38 +310,6 @@
     "count": 2,
     "classification": "legacy",
     "reason": "Legacy SETTINGS_TABS English Server Profile field; production display uses the catalog."
-  },
-  {
-    "path": "src/components/settings/SettingsPanel.tsx",
-    "rule": "formatjs/no-literal-string-in-jsx",
-    "source": "placeholder=\"https://example.com\"",
-    "count": 1,
-    "classification": "code_example",
-    "reason": "Example HTTPS URL placeholder in SettingsPanel."
-  },
-  {
-    "path": "src/components/settings/SettingsPanel.tsx",
-    "rule": "formatjs/no-literal-string-in-jsx",
-    "source": "placeholder=\"https://example.com/.well-known/raft-agent-manifest.json\"",
-    "count": 1,
-    "classification": "code_example",
-    "reason": "Example well-known agent-manifest URL placeholder."
-  },
-  {
-    "path": "src/components/settings/SettingsPanel.tsx",
-    "rule": "formatjs/no-literal-string-in-jsx",
-    "source": "placeholder=\"https://example.com/login/callback\"",
-    "count": 1,
-    "classification": "code_example",
-    "reason": "Example OAuth login-callback URL placeholder."
-  },
-  {
-    "path": "src/components/settings/SettingsPanel.tsx",
-    "rule": "formatjs/no-literal-string-in-object",
-    "source": "`@${agent.name}${agent.displayName ? ` (${agent.displayName})` : \"\"}`",
-    "count": 1,
-    "classification": "protocol",
-    "reason": "OnboardingAgentSection select option shows agents as @name protocol handles."
   },
   {
     "path": "src/components/task/LegacyTaskPanel.tsx",
@@ -464,22 +352,6 @@
     "reason": "Channel filter option labels use #channelName protocol form."
   },
   {
-    "path": "src/components/thread/ThreadsInbox.tsx",
-    "rule": "formatjs/no-literal-string-in-jsx",
-    "source": "#",
-    "count": 1,
-    "classification": "protocol",
-    "reason": "Protocol # prefix before task numbers on thread-card task badges."
-  },
-  {
-    "path": "src/components/thread/ThreadsInbox.tsx",
-    "rule": "formatjs/no-literal-string-in-jsx",
-    "source": "` @${threadItem.taskClaimedByName}`",
-    "count": 1,
-    "classification": "protocol",
-    "reason": "Task-badge claimer fragment uses @name protocol form."
-  },
-  {
     "path": "src/components/ui/cards/QuotedMessageCard.tsx",
     "rule": "formatjs/no-literal-string-in-jsx",
     "source": "`@${channelName}`",
@@ -488,12 +360,36 @@
     "reason": "Quoted-message card shows DM peers as @channelName protocol form."
   },
   {
-    "path": "src/components/ui/ServerSwitcherMenu.tsx",
+    "path": "src/features/apps/IntegrationsSection.tsx",
     "rule": "formatjs/no-literal-string-in-jsx",
-    "source": "\"99+\"",
-    "count": 2,
+    "source": "placeholder=\"https://example.com\"",
+    "count": 1,
+    "classification": "code_example",
+    "reason": "Example HTTPS URL placeholder in IntegrationsSection."
+  },
+  {
+    "path": "src/features/apps/IntegrationsSection.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "placeholder=\"https://example.com/.well-known/raft-agent-manifest.json\"",
+    "count": 1,
+    "classification": "code_example",
+    "reason": "Example well-known agent-manifest URL placeholder."
+  },
+  {
+    "path": "src/features/apps/IntegrationsSection.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "placeholder=\"https://example.com/login/callback\"",
+    "count": 1,
+    "classification": "code_example",
+    "reason": "Example OAuth login-callback URL placeholder."
+  },
+  {
+    "path": "src/features/settings/administration/OnboardingAgentSection.tsx",
+    "rule": "formatjs/no-literal-string-in-object",
+    "source": "`@${agent.name}${agent.displayName ? ` (${agent.displayName})` : \"\"}`",
+    "count": 1,
     "classification": "protocol",
-    "reason": "User-visible unread overflow protocol (unread>99 ? \"99+\"); aligned with Sidebar/ImageLightbox."
+    "reason": "OnboardingAgentSection select option shows agents as @name protocol handles."
   },
   {
     "path": "src/generated/reactionSpriteManifest.ts",
@@ -602,7 +498,7 @@
   {
     "path": "src/pages/PaletteAuditPage.tsx",
     "rule": "formatjs/no-literal-string-in-jsx",
-    "source": "Add Machine",
+    "source": "Add machine",
     "count": 1,
     "classification": "internal_dev",
     "reason": "PaletteAudit CTA button sample mirroring product copy for visual audit only."
@@ -618,18 +514,18 @@
   {
     "path": "src/pages/PaletteAuditPage.tsx",
     "rule": "formatjs/no-literal-string-in-jsx",
-    "source": "Delete Agent",
+    "source": "Delete agent",
     "count": 1,
     "classification": "internal_dev",
-    "reason": "PaletteAudit Delete Agent button sample; audit page only."
+    "reason": "PaletteAudit Delete agent button sample; audit page only."
   },
   {
     "path": "src/pages/PaletteAuditPage.tsx",
     "rule": "formatjs/no-literal-string-in-jsx",
-    "source": "Delete Computer",
+    "source": "Delete computer",
     "count": 1,
     "classification": "internal_dev",
-    "reason": "PaletteAudit Delete Computer button sample; audit page only."
+    "reason": "PaletteAudit Delete computer button sample; audit page only."
   },
   {
     "path": "src/pages/PaletteAuditPage.tsx",
@@ -666,7 +562,7 @@
   {
     "path": "src/pages/PaletteAuditPage.tsx",
     "rule": "formatjs/no-literal-string-in-jsx",
-    "source": "Hover Me",
+    "source": "Hover me",
     "count": 1,
     "classification": "internal_dev",
     "reason": "PaletteAudit menu hover-state sample button text; audit interaction demo only."
@@ -690,7 +586,7 @@
   {
     "path": "src/pages/PaletteAuditPage.tsx",
     "rule": "formatjs/no-literal-string-in-jsx",
-    "source": "New Task",
+    "source": "New task",
     "count": 1,
     "classification": "internal_dev",
     "reason": "PaletteAudit small pink CTA button sample; audit page only."
@@ -730,7 +626,7 @@
   {
     "path": "src/pages/PaletteAuditPage.tsx",
     "rule": "formatjs/no-literal-string-in-jsx",
-    "source": "Switch or Create Server",
+    "source": "Switch or create server",
     "count": 1,
     "classification": "internal_dev",
     "reason": "PaletteAudit ServerSwitcher menu-item sample; audit page only."

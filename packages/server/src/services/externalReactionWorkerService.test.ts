@@ -156,7 +156,8 @@ async function fixture(options: { withAssociation?: boolean } = {}) {
   assert.equal(reactionFlag?.defaultEnabled, false);
   assert.equal(reactionFlag?.killSwitch, false);
   assert.equal(reactionFlag?.randomizationUnit, "server");
-  for (const key of [SLACK_BRIDGE_FEATURE_FLAG_KEYS.master, SLACK_BRIDGE_FEATURE_FLAG_KEYS.reactionSync]) {
+  // The retired reaction flag remains at its default-off value.
+  for (const key of [SLACK_BRIDGE_FEATURE_FLAG_KEYS.master]) {
     assert.ok(await updateFeatureFlag(key, { enabled: true, killSwitch: false }));
     await db.insert(featureFlagRules).values({
       flagKey: key,
@@ -227,6 +228,27 @@ test("aggregate transition creates one command and successful add closes one exa
   const [attempt] = await state.db.select().from(externalReactionCommandAttempts);
   assert.equal(command.state, "accepted");
   assert.equal(attempt.outcome, "accepted");
+});
+
+test("master pause preserves a queued reaction and resumes it after re-enable", async () => {
+  const state = await fixture();
+  const p = provider([{ kind: "response", status: 200, headers: {}, body: { ok: true },
+    observedAuthority: { providerAppId: "A_REACTION", providerAuthorityId: "T_REACTION" } }]);
+  await updateFeatureFlag(SLACK_BRIDGE_FEATURE_FLAG_KEYS.master, { enabled: false });
+  const paused = await processExternalReactionCommandOnce({
+    db: state.db, provider: p.runtime, leaseOwner: "reaction-worker", now: () => NOW,
+  });
+  assert.equal(paused.kind === "blocked" ? paused.reason : null, "bridge_disabled");
+  const [waiting] = await state.db.select().from(externalReactionCommands);
+  assert.equal(waiting.state, "queued");
+  assert.equal(waiting.attempts, 0);
+  assert.equal(p.calls.length, 0);
+  await updateFeatureFlag(SLACK_BRIDGE_FEATURE_FLAG_KEYS.master, { enabled: true });
+  const resumed = await processExternalReactionCommandOnce({
+    db: state.db, provider: p.runtime, leaseOwner: "reaction-worker", now: () => new Date(NOW.getTime() + 31_000),
+  });
+  assert.equal(resumed.kind, "attempted");
+  assert.equal(p.calls.length, 1);
 });
 
 test("missing install-server association revokes the reaction command before credential or provider I/O", async () => {
@@ -369,4 +391,37 @@ test("provider 429 honors Retry-After without converting the desired state to te
   assert.equal(command.nextAttemptAt.toISOString(), new Date(NOW.getTime() + 2_000).toISOString());
   assert.equal(attempt.outcome, "rate_limited");
   assert.equal(attempt.retryAfterMs, 2_000);
+});
+
+test("historical receipt enqueues a new reaction under current binding authority", async () => {
+  const state = await fixture();
+  await state.db.update(externalChannelBindings).set({ bindingEpoch: 2 }).where(eq(externalChannelBindings.id, state.binding.id));
+  await state.db.update(externalMessageLinks).set({ installId: "historical-install", bindingId: "historical-binding",
+    connectionEpoch: 7, authorityState: "stale" }).where(eq(externalMessageLinks.id, state.link.id));
+  await state.db.transaction((tx) => enqueueSlackReactionAggregateTransition({
+    tx, raftMessageId: state.link.raftMessageId, canonicalEmoji: "👀", localDiscussionVersion: 2,
+    localAggregateCount: 1, desiredPresent: true, now: NOW,
+  }));
+  const rows = await state.db.select().from(externalReactionCommands);
+  const current = rows.find((row) => row.bindingEpoch === 2);
+  assert.ok(current, "binding update must not hide the old message from new reaction commands");
+  assert.equal(current.messageLinkId, state.link.id);
+  const p = provider([{ kind: "response", status: 200, headers: {}, body: { ok: true } }]);
+  // Old queued work remains fenced; only the newly authorized command can send.
+  assert.equal((await processExternalReactionCommandOnce({ db: state.db, provider: p.runtime, leaseOwner: "history", now: () => NOW })).kind, "blocked");
+  await processExternalReactionCommandOnce({ db: state.db, provider: p.runtime, leaseOwner: "history", now: () => NOW });
+  assert.equal(p.calls.length, 1);
+  assert.equal(p.calls[0].authority.bindingEpoch, 2);
+});
+
+test("conflicting historical receipts cannot fan one reaction out to two provider messages", async () => {
+  const state = await fixture();
+  await state.db.update(externalChannelBindings).set({ bindingEpoch: 2 }).where(eq(externalChannelBindings.id, state.binding.id));
+  await state.db.insert(externalMessageLinks).values({ ...state.link, id: randomUUID(),
+    bindingEpoch: 2, providerMessageId: "1788574800.000999" });
+  const count = await state.db.transaction((tx) => enqueueSlackReactionAggregateTransition({
+    tx, raftMessageId: state.link.raftMessageId, canonicalEmoji: "👀", localDiscussionVersion: 2,
+    localAggregateCount: 1, desiredPresent: true, now: NOW,
+  }));
+  assert.equal(count, 0);
 });

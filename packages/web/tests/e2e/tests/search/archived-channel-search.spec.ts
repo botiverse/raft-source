@@ -76,7 +76,9 @@ test.describe("Archived channel search result navigation", () => {
     await archiveChannel(request, seedState, login.accessToken, channel.id);
 
     await page.goto(`/s/${seedState.server.slug}/search?q=${encodeURIComponent(runId)}`);
-    const messageHit = page.getByRole("button", { name: new RegExp(message.content) }).first();
+    // The snippet keeps only 24 columns before the hit (#11136), so match the
+    // part next to the run id rather than the whole message.
+    const messageHit = page.getByRole("button", { name: new RegExp(`click target ${runId}`) }).first();
     await expect(messageHit).toBeVisible();
 
     await messageHit.click();

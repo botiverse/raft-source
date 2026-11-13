@@ -1,6 +1,8 @@
 import { fixturePasswordHash } from "../test/integration/credentials";
 import { createApiTest } from "../test/integration/apiTest";
 import assert from "node:assert/strict";
+import { refusalBody } from "../lib/refusal";
+import { AGENT_CHANNEL_NOT_FOUND_REFUSAL } from "./agentRouteRefusals";
 import { randomUUID } from "node:crypto";
 
 
@@ -20,7 +22,7 @@ import {
 import { createMessage } from "../services/messageService";
 import { mintAgentCredential } from "../services/agentCredentialService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 /**
  * `raft message read` on a thread ref must name the entity that is actually
@@ -102,6 +104,7 @@ async function seedFixture() {
     agentId: agent.id,
     scopes: ["send", "read"],
     name: "dx-thread-read",
+    issuedVia: "computer",
     createdByUserId: null,
   });
 
@@ -137,7 +140,7 @@ async function readTarget(baseUrl: string, apiKey: string, target: string) {
  */
 function parseNextAction(nextAction: unknown): { target: string; around: string } {
   const text = String(nextAction);
-  const m = /raft message read --target '([^']+)' --around (\S+)/.exec(text);
+  const m = /raft message read --target ["']([^"']+)["'] --around (\S+)/.exec(text);
   assert.ok(m, `Next action is not a runnable 'raft message read' command: ${text}`);
   return { target: m[1], around: m[2] };
 }
@@ -164,7 +167,7 @@ async function runNextAction(baseUrl: string, apiKey: string, nextAction: unknow
 }
 
 test("a thread ref reports which entity is actually missing", async ({ onTestFinished }) => {
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   onTestFinished(() => app.close());
   const fx = await seedFixture();
   const read = (target: string) => readTarget(app.baseUrl, fx.apiKey, target);
@@ -211,7 +214,7 @@ test("a thread ref reports which entity is actually missing", async ({ onTestFin
   // A-missing — parent channel does not exist.
   const aMissing = await read(`#dx-nonexistent:${shortIdOf(fx.anchorNoReplies.id)}`);
   assert.equal(aMissing.status, 404);
-  assert.equal(aMissing.body.error, "Channel not found or not visible");
+  assert.deepEqual(aMissing.body, refusalBody(AGENT_CHANNEL_NOT_FOUND_REFUSAL));
 
   // A-invisible — parent channel and anchor both exist, but the caller cannot
   // see the private channel. It must be byte-identical to A-missing; otherwise
@@ -229,7 +232,7 @@ test("a thread ref reports which entity is actually missing", async ({ onTestFin
   // C — the anchor is here and really has no replies, so we may say exactly that.
   const c = await read(`#dx-parent:${shortIdOf(fx.anchorNoReplies.id)}`);
   assert.equal(c.status, 404);
-  assert.match(String(c.body.error), /no thread on message/i);
+  assert.match(String(c.body.error), /has no replies yet, so there is no thread to read/i);
   assert.doesNotMatch(String(c.body.error), /channel not found/i);
 
   // ② The Next action must be USABLE, not merely present. Run it.
@@ -274,7 +277,7 @@ test("a thread ref reports which entity is actually missing", async ({ onTestFin
  * assertion that could never match, so neither half is optional here.
  */
 test("the executed Next action discriminates on the short id it names", async ({ onTestFinished }) => {
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   onTestFinished(() => app.close());
   const fx = await seedFixture();
 
@@ -310,7 +313,6 @@ test("authorized DM history supplies consumption identity for DM and DM thread o
 }) => {
   const app = await openTestApp("pglite://", 0, {
     humanActivityMuteFlagDefaultEnabled: true,
-    onboardingOpenerFlagDefaultEnabled: false,
   });
   onTestFinished(() => app.close());
   const fx = await seedFixture();

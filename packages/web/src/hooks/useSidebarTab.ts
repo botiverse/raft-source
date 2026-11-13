@@ -1,9 +1,10 @@
 import { useCallback, useMemo } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
+import { useOwnAssistantDmId } from "../assistant/assistantClient";
 import { useServerStore } from "../store/serverStore";
 import { readTabMemory } from "./useTabRouteMemory";
 import { useLiveLocation } from "./useLiveLocation";
-import { resolveSearchOverlayBackground, searchEntryState } from "../components/search/searchOverlayLocation";
+import { resolveSearchOverlayBackground, searchEntryState } from "../features/search/searchOverlayLocation";
 
 // The left navigation rail surfaces a fixed set of modes; the entire left
 // column (rail button highlight + sidebar content + sidebar header text)
@@ -17,7 +18,7 @@ import { resolveSearchOverlayBackground, searchEntryState } from "../components/
 // visible) — same shape as `tasks`. Per stdrc #proj-uiux:c2313b1d task #311
 // 2026-05-25: Search entry promoted to the Rail's first button + opens a
 // fullscreen search page.
-export type RailMode = "search" | "activity" | "chat" | "members" | "computers" | "tasks" | "settings";
+export type RailMode = "search" | "activity" | "chat" | "members" | "computers" | "apps" | "tasks" | "settings" | "assistant" | "artifacts";
 
 // Back-compat alias for callers that only care about the chat/members
 // distinction inside the chat-or-members surface (e.g. existing tests).
@@ -33,10 +34,16 @@ function deriveRailModeFromPath(pathname: string, pathBase: string): RailMode {
   if (pathname.replace(/\/$/, "") === `${pathBase}/raftbench`) return "settings";
   if (pathname.startsWith(`${pathBase}/settings`)) return "settings";
   if (pathname.startsWith(`${pathBase}/release-notes`)) return "settings";
+  if (pathname.startsWith(`${pathBase}/keyboard-shortcuts`)) return "settings";
   if (pathname === `${pathBase}/tasks` || pathname.startsWith(`${pathBase}/tasks/`)) return "tasks";
+  if (pathname === `${pathBase}/assistant` || pathname.startsWith(`${pathBase}/assistant/`)) return "assistant";
   if (pathname.startsWith(`${pathBase}/computer/`)) return "computers";
   if (pathname.startsWith(`${pathBase}/machine/`)) return "computers"; // legacy
   if (pathname === `${pathBase}/computers` || pathname.startsWith(`${pathBase}/computers/`)) return "computers";
+  // The Apps page (#proj-apps task #22): one page, like Tasks.
+  if (pathname === `${pathBase}/apps` || pathname.startsWith(`${pathBase}/apps/`)) return "apps";
+  // The Artifacts home page (#proj-workspace:#133): one page with its own rail entry.
+  if (pathname === `${pathBase}/artifacts` || pathname.startsWith(`${pathBase}/artifacts/`)) return "artifacts";
   if (pathname.startsWith(`${pathBase}/agent/`)) return "members";
   if (pathname.startsWith(`${pathBase}/human/`)) return "members";
   if (pathname === `${pathBase}/members` || pathname.startsWith(`${pathBase}/members/`)) return "members";
@@ -47,8 +54,10 @@ export function useRailMode() {
   const location = useLocation();
   const navigate = useNavigate();
   const serverSlug = useServerStore((s) => s.current?.slug ?? null);
+  const guest = useServerStore((s) => s.current?.role === "guest");
   const pathBase = serverSlug ? `/s/${serverSlug}` : "";
   const liveLocation = useLiveLocation();
+  const assistantDmId = useOwnAssistantDmId();
 
   // While the ⌘K search overlay floats over a page, the URL is /search but the
   // page behind it (and its sidebar) is the overlay's background: settings stays
@@ -90,14 +99,39 @@ export function useRailMode() {
       navigate(`${base}/activity`);
       return;
     }
-    const remembered = readTabMemory(serverSlug, mode);
+    // The assistant is one page (its DM, or Create Your Assistant): nothing
+    // to remember inside it.
+    if (mode === "assistant") {
+      navigate(`${base}/assistant`);
+      return;
+    }
+    // Artifacts is one page too: its tabs and filters are the page's own, and an open Artifact isn't a place to come back to.
+    if (mode === "artifacts") {
+      navigate(`${base}/artifacts`);
+      return;
+    }
+    // Members is one page (raft-design members.md): a profile opens in the
+    // side panel over it, and the graph is a page under it, so the rail
+    // always lands on the page itself, never a remembered profile or graph.
+    if (mode === "members") {
+      navigate(`${base}/members`);
+      return;
+    }
+    // A Guest's Chat is its one channel, which the server's root opens: a
+    // remembered path (another channel, a DM, from when it was a member, or
+    // a channel since archived) would open a conversation it can't read.
+    if (mode === "chat" && guest) {
+      navigate(base);
+      return;
+    }
+    const remembered = readTabMemory(serverSlug, mode, { assistantDmId: assistantDmId ?? null });
     const fallback = mode === "chat" ? base
-      : mode === "members" ? `${base}/members`
       : mode === "computers" ? `${base}/computers`
+      : mode === "apps" ? `${base}/apps`
       : mode === "tasks" ? `${base}/tasks`
       : `${base}/settings/account`;
     navigate(remembered ?? fallback);
-  }, [liveLocation, serverSlug, navigate]);
+  }, [assistantDmId, guest, liveLocation, serverSlug, navigate]);
 
   return { railMode, currentMode, selectRailMode };
 }

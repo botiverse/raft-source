@@ -1,83 +1,29 @@
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { useIntl } from "react-intl";
-import { clearClockTimeout, getMachineRuntimeDisplayOptions, getSetupRuntimeOptions, setClockTimeout } from "@botiverse/raft-shared";
+import { getRuntimeInfo, setClockTimeout } from "@botiverse/raft-shared";
 import type { RuntimeInfo, RuntimeSelectionOption } from "@botiverse/raft-shared";
 import { Check, ChevronRight, Copy, KeyRound, Monitor, Terminal, X } from "lucide-react";
-import type { ServerSetupRuntimeStatus } from "./serverSetupProjection";
+import type { HostedCindyTestEntryFailureCode, ServerSetupRuntimeStatus } from "./serverSetupProjection";
+import { connectionMotionReducer, startConnectionMotion } from "./connectionMotion";
 import { formatRelativeTime } from "../../utils/relativeTime";
+import { compareRuntimeCatalogOrder } from "../../utils/runtimeCatalogOrder";
 import ComputerCommandGuide from "../machine/ComputerCommandGuide";
+import type { CopyTarget } from "../machine/ComputerCommandGuide";
 import Banner from "../ui/Banner";
 import SectionEyebrow from "../ui/SectionEyebrow";
-import { Badge, Button, Card, CardDescription, CardHeader, CardTitle, DialogSurface, Separator, Spinner, Status } from "@botiverse/raft-ui";
-import TextLink from "../ui/TextLink";
+import { Badge, Button, Card, CardDescription, CardHeader, CardTitle, DialogSurface, ScrollArea, Separator, Spinner, Status, TextLink } from "@botiverse/raft-ui";
 import Tooltip from "../ui/Tooltip";
 import SetupSessionFooter from "./SetupSessionFooter";
+import { useLocalComputerHost } from "../machine/localComputer/useLocalComputerHost";
+import UseThisComputerCard from "../machine/localComputer/UseThisComputerCard";
+import { AddThisMac } from "../machine/localComputer/AddThisMac";
+import { InstallOnAnotherComputer } from "../machine/localComputer/InstallOnAnotherComputer";
+import { localComputerOnboardingErrorMessage } from "../machine/localComputer/localComputerCopy";
+import { useServerStore } from "../../store/serverStore";
+import { RUNTIME_INSTALL_COMMANDS } from "../machine/runtimeInstallCommands";
 
 const RECOMMENDED_RUNTIME_IDS = ["claude", "codex"] as const;
-const RUNTIME_INSTALL_COMMANDS: Record<string, string> = {
-  claude: "npm install -g @anthropic-ai/claude-code",
-  codex: "npm install -g @openai/codex",
-};
-
-type ConnectionMotionPhase = "idle" | "success" | "handoff" | "settled";
-type ConnectionMotionState = {
-  computerExpanded: boolean;
-  phase: ConnectionMotionPhase;
-};
-type ConnectionMotionAction =
-  | { type: "toggle" }
-  | { type: "start" }
-  | { type: "handoff" }
-  | { type: "settle" }
-  | { type: "skip" }
-  | { type: "cancel" };
-
-function connectionMotionReducer(state: ConnectionMotionState, action: ConnectionMotionAction): ConnectionMotionState {
-  switch (action.type) {
-    case "toggle":
-      return { ...state, computerExpanded: !state.computerExpanded };
-    case "start":
-      return { computerExpanded: true, phase: "success" };
-    case "handoff":
-      return { computerExpanded: false, phase: "handoff" };
-    case "settle":
-      return { ...state, phase: "settled" };
-    case "skip":
-      return { computerExpanded: false, phase: "settled" };
-    case "cancel":
-      return { computerExpanded: true, phase: "settled" };
-  }
-}
-
-/**
- * The connection motion timers are scheduled in parallel from one start, not
- * chained: `handoff` at 1400ms and `settle` at 2040ms are independent. `settle`
- * is the moment the step stops animating and hands the screen back to the user,
- * so its arrival time is the quantity worth pinning — see the timing assertion
- * in `serverSetupComputerRuntimeMotion.behavior.test.tsx`.
- *
- * Exported for that test: the schedule is real behavior, and asserting it from
- * source text would only prove the code was written, not that it still runs.
- */
-export function startConnectionMotion(
-  dispatch: (action: ConnectionMotionAction) => void,
-  reducedMotion: boolean,
-): () => void {
-  if (reducedMotion) {
-    dispatch({ type: "skip" });
-    return () => undefined;
-  }
-
-  dispatch({ type: "start" });
-  const handoffTimer = setClockTimeout(() => dispatch({ type: "handoff" }), 1_400);
-  const settleTimer = setClockTimeout(() => dispatch({ type: "settle" }), 2_040);
-
-  return () => {
-    clearClockTimeout(handoffTimer);
-    clearClockTimeout(settleTimer);
-  };
-}
 
 export type ServerSetupComputer = {
   id: string;
@@ -139,17 +85,41 @@ export type ServerSetupComputerRuntimeStepProps = {
    */
   canReset?: boolean;
   onStartOver?: () => void;
+  /**
+   * Staging-only: the owner can skip the computer and have Cindy run in the cloud
+   * (`hostedCindyTestEntry` from the server). Absent everywhere else, so the footer link
+   * does not exist outside staging.
+   */
+  hostedCindyTestEntry?: boolean;
+  hostingCindy?: boolean;
+  hostedCindyFailure?: HostedCindyTestEntryFailureCode | null;
+  onUseCloudAgent?: () => void;
   onNext: () => void;
+  /**
+   * The setup gate's funnel (#proj-onboarding:#7): which connect command was copied and
+   * "use this computer", and which footer way out was taken. Previews leave them out.
+   */
+  onCopyCommand?: (target: CopyTarget) => void;
+  onUseThisComputer?: () => void;
+  onLeaveSetup?: (way: "switch_server" | "server_settings") => void;
 };
+
+/** The server's rows the bundled catalog can name, in the catalog's order. */
+function namedRuntimeRows(runtimeOptions: readonly RuntimeSelectionOption[]): { runtime: RuntimeInfo; option: RuntimeSelectionOption }[] {
+  return runtimeOptions
+    .flatMap((option) => {
+      const runtime = getRuntimeInfo(option.runtimeId);
+      return runtime?.supported ? [{ runtime, option }] : [];
+    })
+    .sort((left, right) => compareRuntimeCatalogOrder(left.runtime.id, right.runtime.id));
+}
 
 export function getServerSetupRuntimeCatalog(runtimeOptions: readonly RuntimeSelectionOption[]): {
   recommended: ServerSetupRuntimeCatalogEntry[];
   supported: ServerSetupRuntimeCatalogEntry[];
 } {
-  const visible = runtimeOptions.flatMap((option) => {
-    const runtime = getSetupRuntimeOptions().find((candidate) => candidate.id === option.runtimeId);
-    return runtime ? [{ runtime, option }] : [];
-  });
+  // The server's setup rows decide what is offered; the bundled catalog only names them.
+  const visible = namedRuntimeRows(runtimeOptions);
   const toEntry = ({ runtime, option }: { runtime: RuntimeInfo; option: RuntimeSelectionOption }): ServerSetupRuntimeCatalogEntry => ({
     ...runtime,
     detected: option.capabilityStatus === "available",
@@ -167,22 +137,16 @@ export function getServerSetupRuntimeCatalog(runtimeOptions: readonly RuntimeSel
 }
 
 function getPreferredReadyRuntime(runtimeOptions: readonly RuntimeSelectionOption[]) {
-  const selectable = new Set(
-    runtimeOptions.filter((option) => option.canSelectInThisContext).map((option) => option.runtimeId),
-  );
-  return getSetupRuntimeOptions().find((runtime) => selectable.has(runtime.id)) ?? null;
+  return namedRuntimeRows(runtimeOptions).find(({ option }) => option.canSelectInThisContext)?.runtime ?? null;
 }
 
 // Everything the computer actually found. The log used to name only the first one
 // ("Runtime detected: Claude Code.") on a machine that also had Codex, OpenCode and Pi —
 // it reads as though detection stopped at the first hit.
 function getDetectedRuntimeNames(runtimeOptions: readonly RuntimeSelectionOption[]): string[] {
-  const detected = new Set(
-    runtimeOptions.filter((option) => option.capabilityStatus === "available").map((option) => option.runtimeId),
-  );
-  return getMachineRuntimeDisplayOptions()
-    .filter((runtime) => detected.has(runtime.id) && runtime.id !== "builtin")
-    .map((runtime) => runtime.displayName);
+  return namedRuntimeRows(runtimeOptions)
+    .filter(({ runtime, option }) => option.capabilityStatus === "available" && runtime.id !== "builtin")
+    .map(({ runtime }) => runtime.displayName);
 }
 
 const NO_OFFLINE_COMPUTERS: NonNullable<ServerSetupComputerRuntimeStepProps["offlineComputers"]> = [];
@@ -206,9 +170,36 @@ export default function ServerSetupComputerRuntimeStep({
   onOpenApiKeySettings,
   canReset = false,
   onStartOver,
+  hostedCindyTestEntry = false,
+  hostingCindy = false,
+  hostedCindyFailure = null,
+  onUseCloudAgent,
   onNext,
+  onCopyCommand,
+  onUseThisComputer,
+  onLeaveSetup,
 }: ServerSetupComputerRuntimeStepProps) {
-  const { formatMessage } = useIntl();
+  const intl = useIntl();
+  const { formatMessage } = intl;
+  // Inside an app that is itself the Computer host (Raft Desktop), connecting
+  // is one click on this machine: no CLI install, terminal or browser approval.
+  const computerHost = useLocalComputerHost();
+  const currentServerSlug = useServerStore((s) => s.current?.slug ?? null);
+  const hostServerSlug = serverSlug ?? currentServerSlug;
+  const hostServerName = useServerStore((s) => s.servers.find((server) => server.slug === hostServerSlug)?.name ?? s.current?.name ?? null) ?? `/${hostServerSlug ?? ""}`;
+  const onboardingErrorText = useCallback((error: unknown) => localComputerOnboardingErrorMessage(error, intl), [intl]);
+  // Only for a machine Desktop may add (Raft Computer is installed, or Desktop
+  // can install it here): otherwise the CLI guide, which works for it.
+  // Until the bridge has answered, neither shows: it answers within a moment
+  // and on most desktops the answer is "Use this Mac", so showing the guide
+  // meanwhile would flash a terminal walkthrough and swap it out. Every read
+  // settles, failed or not, so this never holds the step blank.
+  const hostPending = !!computerHost && !computerHost.ready && !!hostServerSlug;
+  const useHost = !!computerHost && computerHost.ready && computerHost.canAttach && !!hostServerSlug;
+  // On Raft Desktop the person may still pick a different machine (a server,
+  // another laptop): "Install on another computer" shows the command guide here.
+  const [anotherMachine, setAnotherMachine] = useState(false);
+  const showAnotherMachine = useCallback(() => setAnotherMachine(true), []);
   // The connect step is no longer collapsible, so only the motion phase is read
   // from here; `computerExpanded` still drives the reducer's phase transitions.
   const [{ phase: connectionMotionPhase }, dispatchConnectionMotion] = useReducer(connectionMotionReducer, {
@@ -259,11 +250,20 @@ export default function ServerSetupComputerRuntimeStep({
   // The computer has ANSWERED the runtime question (whatever the answer was) — per the
   // server, not per whatever the store happens to be holding.
   const runtimesReported = runtimeAnswered || ready;
+  // Raft Desktop adding this Mac: once the server lists it, the inline card
+  // stays, finished, with these lines (no separate log under it).
+  const hostOutcome = useMemo(() => connectProgressLines(formatMessage, {
+    showApproval: false, computerName: computer?.name ?? null, computerOnline, waiting: verifyingComputer,
+    runtimeReady: ready, runtimeNames: detectedRuntimeNames, runtimesReported,
+  }), [computer?.name, computerOnline, detectedRuntimeNames, formatMessage, ready, runtimesReported, verifyingComputer]);
   const recoveryComputers = useMemo(() => (offlineComputers.length > 0
     ? offlineComputers
     : computer
       ? [{ id: computer.id, name: computer.name, lastHeartbeat: null, isComputer: computer.isComputer }]
       : []), [computer, offlineComputers]);
+  // The offline computer is this one (C4): its own buttons, not four commands.
+  const recoveringThisDevice = recovering && !!computerHost && computerHost.ready && !!hostServerSlug && recoveryComputers.some((c) =>
+    c.id === computerHost.self.machineId || computerHost.self.servers.some((row) => row.machineId === c.id));
   const toggleExpandedRuntime = useCallback((runtimeId: string) => {
     setExpandedRuntimeId(activeExpandedRuntimeId === runtimeId ? "" : runtimeId);
   }, [activeExpandedRuntimeId]);
@@ -317,8 +317,28 @@ export default function ServerSetupComputerRuntimeStep({
         </p>
       </header>
 
-      <div className="space-y-3 px-5 py-4 sm:px-9 md:min-h-0 md:flex-1 md:overflow-y-auto">
+      {/* The body scrolls between header and footer from md, in a raft-ui ScrollArea; below
+          md it keeps its content's height (no shrink) and the dialog grows with it. */}
+      <ScrollArea className="max-md:shrink-0 md:min-h-0 md:flex-1" contentClassName="stack-y-3 px-5 py-4 sm:px-9">
         {error ? <Banner intent="warning" density="sm">{error}</Banner> : null}
+        {/* The cloud attempt failed. Say which thing did NOT happen and what is still true:
+            nothing was created, and connecting a computer is untouched. A silent failure
+            would leave the owner of an empty server staring at the same screen forever. */}
+        {hostedCindyFailure ? (
+          <Banner intent="warning" density="sm" withIcon data-testid="onboarding-use-cloud-agent-failed">
+            {formatMessage({
+              id: hostedCindyFailure === "hosted_cindy_cap_reached"
+                ? "onboarding.computerRuntime.useCloudAgentCapReached"
+                : hostedCindyFailure === "hosted_cindy_name_taken"
+                  ? "onboarding.computerRuntime.useCloudAgentNameTaken"
+                  : hostedCindyFailure === "hosted_runtime_unavailable"
+                    ? "onboarding.computerRuntime.useCloudAgentRuntimeUnavailable"
+                    : hostedCindyFailure === "onboarding_agent_exists"
+                      ? "onboarding.computerRuntime.useCloudAgentAgentExists"
+                      : "onboarding.computerRuntime.useCloudAgentFailed",
+            })}
+          </Banner>
+        ) : null}
 
         {/* The connect step is one linear flow, not a collapsible section: its
             title is already the modal's heading, and wrapping it in a second
@@ -330,14 +350,21 @@ export default function ServerSetupComputerRuntimeStep({
             from under them, and leaves nothing to point at if they have to run it
             again on a second machine. The log prints underneath it, line by line. */}
         <div
-          className={`space-y-3 ${connectionMotionPhase === "success" ? "onboarding-connect-success-reveal" : ""}`}
+          className={`stack-y-3 ${connectionMotionPhase === "success" ? "onboarding-connect-success-reveal" : ""}`}
           data-motion-state={connectionMotionPhase}
           data-testid={computerOnline ? "onboarding-computer-connected" : undefined}
         >
           {/* The SAME component Add Computer uses. Platform-specific shell commands stay in
               the shared builder/guide so onboarding cannot invent a WSL or daemon-only
               Windows path that disagrees with the Computer page. */}
-          {recovering ? (
+          {recoveringThisDevice && computerHost && hostServerSlug ? (
+            <UseThisComputerCard
+              host={computerHost}
+              serverSlug={hostServerSlug}
+              serverName={hostServerName}
+            />
+          ) : null}
+          {recovering && !recoveringThisDevice ? (
             <OfflineComputerRecovery
               computers={recoveryComputers}
               serverSlug={serverSlug ?? null}
@@ -349,7 +376,14 @@ export default function ServerSetupComputerRuntimeStep({
               onStartOver={onStartOver}
             />
           ) : null}
-          {recovering ? null : (
+          {!recovering && useHost && computerHost && hostServerSlug ? (
+            // The one "Add This Mac" flow, inline: the same steps as Add Computer's dialog.
+            <AddThisMac host={computerHost} serverSlug={hostServerSlug} serverName={hostServerName} onStart={onUseThisComputer} errorText={onboardingErrorText} testId="onboarding-desktop-enable" listedOutcome={hostOutcome} />
+          ) : null}
+          {!recovering && useHost && !anotherMachine ? (
+            <InstallOnAnotherComputer onOpen={showAnotherMachine} className="mt-3" />
+          ) : null}
+          {recovering || (useHost && !anotherMachine) || hostPending ? null : (
             <>
               <ComputerCommandGuide
                 computerCommand={setupCommand}
@@ -358,14 +392,16 @@ export default function ServerSetupComputerRuntimeStep({
                 windowsComputerCommand={windowsComputerSetupCommand}
                 windowsComputerInstallCommand={windowsComputerInstallCommand}
                 onPlatformChange={setPlatform}
+                onCopy={onCopyCommand}
               />
               {/* Instructions are for someone who has not run it yet; once the computer is
                   online they are just history. The log takes over. */}
               {computerOnline ? null : <ConnectComputerInstructions platform={platform} />}
             </>
           )}
-          {recovering ? null : (
+          {recovering || (useHost && !anotherMachine) ? null : (
           <ConnectProgressLog
+            showApproval={(!useHost || anotherMachine) && !hostPending}
             computerName={computer?.name ?? null}
             computerOnline={computerOnline}
             waiting={verifyingComputer}
@@ -438,11 +474,17 @@ export default function ServerSetupComputerRuntimeStep({
           </div>
         </Card>
         ) : null}
-      </div>
+      </ScrollArea>
 
       <footer className="flex shrink-0 flex-col-reverse gap-3 border-t border-line-seam px-5 py-3 sm:flex-row sm:items-center sm:justify-between sm:px-9">
         <div className="flex min-w-0 items-center gap-3">
-          <SetupSessionFooter disabled={loading} showServerSettings />
+          <SetupSessionFooter
+            disabled={loading}
+            showServerSettings
+            onUseCloudAgent={hostedCindyTestEntry ? onUseCloudAgent : undefined}
+            useCloudAgentBusy={hostingCindy}
+            onLeave={onLeaveSetup}
+          />
         </div>
         <Button
           type="button"
@@ -507,7 +549,7 @@ function RecoveryCommandRow({
         <Button
           type="button"
           onClick={handleCopy}
-          size="icon-sm"
+          size="icon-md"
           variant="outline"
           className="shrink-0"
           aria-label={formatMessage({ id: "onboarding.computerRuntime.copyCommand" }, { command })}
@@ -558,7 +600,7 @@ function OfflineComputerRecovery({
   const anyLegacyDaemon = computers.some((c) => c.isComputer === false);
 
   return (
-    <div className="space-y-4" data-testid="onboarding-offline-recovery">
+    <div className="stack-y-4" data-testid="onboarding-offline-recovery">
       <div className="flex items-center gap-2">
         <Terminal size={18} className="shrink-0 text-foreground-muted" />
         <p className="text-subhead font-bold text-foreground">
@@ -572,7 +614,7 @@ function OfflineComputerRecovery({
       </div>
 
       {computers.length > 0 ? (
-        <ul className="space-y-2" data-testid="onboarding-offline-computer-list">
+        <ul className="stack-y-2" data-testid="onboarding-offline-computer-list">
           {computers.map((c) => {
             const lastSeen = formatRelativeTime(c.lastHeartbeat, locale);
             return (
@@ -631,7 +673,7 @@ function OfflineComputerRecovery({
                   drift the catalog ratchet just caught. */}
               {formatMessage({ id: "machine.detail.offlineDiagnosticsPrompt" })}
             </p>
-            <div className="space-y-2">
+            <div className="stack-y-2">
               <RecoveryCommandRow command="raft-computer status" testId="onboarding-recovery-status" copied={copied} onCopy={copy} />
               <RecoveryCommandRow command="raft-computer doctor" testId="onboarding-recovery-doctor" copied={copied} onCopy={copy} />
               <RecoveryCommandRow command="raft-computer restart" testId="onboarding-recovery-restart" copied={copied} onCopy={copy} />
@@ -656,7 +698,7 @@ function OfflineComputerRecovery({
                 : "onboarding.computerRuntime.startOverPromptOne",
             })}
           </span>
-          <TextLink onClick={onStartOver} data-testid="onboarding-recovery-start-over">
+          <TextLink variant="strong" onClick={onStartOver} data-testid="onboarding-recovery-start-over">
             {formatMessage({ id: "onboarding.computerRuntime.startOver" })}
           </TextLink>
         </div>
@@ -665,14 +707,10 @@ function OfflineComputerRecovery({
   );
 }
 
-function ConnectProgressLog({
-  computerName,
-  computerOnline,
-  waiting,
-  runtimeReady,
-  runtimeNames,
-  runtimesReported = false,
-}: {
+interface ConnectProgressInput {
+  // The first line narrates the CLI's browser approval; a host app connects
+  // without one, so it has nothing to report there.
+  showApproval?: boolean;
   computerName: string | null;
   computerOnline: boolean;
   waiting: boolean;
@@ -680,9 +718,17 @@ function ConnectProgressLog({
   runtimeNames: readonly string[];
   // The computer has answered the runtime question, whatever the answer was.
   runtimesReported?: boolean;
-}) {
-  const { formatMessage } = useIntl();
-  const lines: Array<{ key: string; text: string; done: boolean; pending: boolean; failed?: boolean }> = [
+}
+
+export type ConnectProgressLine = { key: string; text: string; done: boolean; pending: boolean; failed?: boolean };
+
+/** What the connect step reports, line by line (the log; on Raft Desktop, Add This Mac's finished state). */
+function connectProgressLines(
+  formatMessage: ReturnType<typeof useIntl>["formatMessage"],
+  { showApproval = true, computerName, computerOnline, waiting, runtimeReady, runtimeNames, runtimesReported = false }: ConnectProgressInput,
+): ConnectProgressLine[] {
+  const lines: ConnectProgressLine[] = [];
+  if (showApproval) lines.push(
     {
       key: "approve",
       text: formatMessage({
@@ -693,7 +739,7 @@ function ConnectProgressLog({
       done: waiting || computerOnline,
       pending: !waiting && !computerOnline,
     },
-  ];
+  );
 
   if (waiting || computerOnline) {
     lines.push({
@@ -742,10 +788,15 @@ function ConnectProgressLog({
       failed: detectionFailed,
     });
   }
+  return lines;
+}
 
+function ConnectProgressLog(props: ConnectProgressInput) {
+  const { formatMessage } = useIntl();
+  const lines = connectProgressLines(formatMessage, props);
   return (
     <ol
-      className="space-y-1.5 font-mono text-mono-meta"
+      className="stack-y-1.5 font-mono text-mono-meta"
       aria-live="polite"
       data-testid="onboarding-connect-log"
     >
@@ -804,7 +855,7 @@ function ConnectComputerInstructions({ platform }: { platform: "mac-linux" | "wi
 
   return (
     <ol
-      className="space-y-2 text-callout text-foreground-muted"
+      className="stack-y-2 text-callout text-foreground-muted"
       aria-label={formatMessage({ id: "onboarding.computerRuntime.instructionsAria" })}
       data-testid="onboarding-computer-instructions"
     >
@@ -854,17 +905,23 @@ function RuntimeRow({
   const handleToggle = useCallback(() => onToggle(runtimeId), [onToggle, runtimeId]);
   // Says so where the click happened, instead of throwing a toast across the screen.
   const [copied, setCopied] = useState(false);
+  const handleCopyInstallCommand = useCallback(() => {
+    if (!command || !onCopyInstallCommand) return;
+    onCopyInstallCommand(runtimeId, command);
+    setCopied(true);
+    setClockTimeout(() => setCopied(false), 2_000);
+  }, [command, onCopyInstallCommand, runtimeId]);
   return (
     <>
     <Separator />
     <div className={expanded ? "bg-info-soft" : ""}>
       <button
         type="button"
-        className={`flex min-h-11 w-full items-center gap-2.5 px-3.5 py-2 text-left outline-none hover:bg-fill-pressed focus-visible:shadow-[inset_0_0_0_2px_var(--foreground)] ${quiet ? "text-foreground-hint" : "text-foreground"}`}
+        className={`flex min-h-11 w-full items-center gap-2.5 px-3.5 py-2 text-left outline-none hover:bg-fill-subtle focus-visible:shadow-[inset_0_0_0_2px_var(--foreground)] ${quiet ? "text-foreground-hint" : "text-foreground"}`}
         aria-expanded={expanded}
         onClick={handleToggle}
       >
-        <span className={`flex shrink-0 items-center justify-center rounded-sticker bg-fill-muted font-mono text-mono-meta font-bold text-foreground-muted ${runtime.recommended ? "size-[27px]" : "size-6"}`}>
+        <span className={`flex shrink-0 items-center justify-center bg-fill-muted font-mono text-mono-meta font-bold text-foreground-muted ${runtime.recommended ? "size-[27px] rounded-chip" : "size-6 rounded-sticker"}`}>
           {runtime.abbreviation}
         </span>
         <span className={`min-w-0 flex-1 font-semibold ${runtime.recommended ? "text-callout" : "text-footnote"}`}>
@@ -912,14 +969,9 @@ function RuntimeRow({
                 )}
               </p>
               {command && onCopyInstallCommand ? (
-                <button
-                  type="button"
-                  onClick={() => {
-                    onCopyInstallCommand(runtime.id, command);
-                    setCopied(true);
-                    setClockTimeout(() => setCopied(false), 2_000);
-                  }}
-                  className="inline-flex items-center gap-1 rounded-control font-semibold text-foreground underline decoration-[1.5px] underline-offset-[3px] outline-none focus-visible:shadow-focus"
+                <TextLink
+                  onClick={handleCopyInstallCommand}
+                  className="inline-flex items-center gap-1"
                 >
                   {copied ? <Check size={12} strokeWidth={3} /> : <Copy size={12} />}
                   {formatMessage({
@@ -927,7 +979,7 @@ function RuntimeRow({
                       ? "onboarding.computerRuntime.copied"
                       : "onboarding.computerRuntime.copyInstallCommand",
                   })}
-                </button>
+                </TextLink>
               ) : null}
             </div>
           )}
@@ -952,7 +1004,7 @@ function OwnApiKeyRow({
     <>
     <Separator />
     <div className={expanded ? "bg-info-soft" : ""}>
-      <button type="button" className="flex min-h-11 w-full items-center gap-2.5 px-3.5 py-2 text-left text-foreground outline-none hover:bg-fill-pressed focus-visible:shadow-[inset_0_0_0_2px_var(--foreground)]" aria-expanded={expanded} onClick={onToggle}>
+      <button type="button" className="flex min-h-11 w-full items-center gap-2.5 px-3.5 py-2 text-left text-foreground outline-none hover:bg-fill-subtle focus-visible:shadow-[inset_0_0_0_2px_var(--foreground)]" aria-expanded={expanded} onClick={onToggle}>
         <span className="flex size-6 shrink-0 items-center justify-center rounded-sticker bg-fill-muted text-foreground-muted">
           <KeyRound size={14} />
         </span>
@@ -970,9 +1022,9 @@ function OwnApiKeyRow({
             {formatMessage({ id: "onboarding.computerRuntime.ownApiKeyHint" })}
           </p>
           {onOpenSettings ? (
-            <button type="button" onClick={onOpenSettings} className="rounded-control font-semibold text-foreground underline decoration-[1.5px] underline-offset-[3px] outline-none focus-visible:shadow-focus">
+            <TextLink onClick={onOpenSettings}>
               {formatMessage({ id: "onboarding.computerRuntime.addApiKey" })}
-            </button>
+            </TextLink>
           ) : null}
         </div>
       ) : null}

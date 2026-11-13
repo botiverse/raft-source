@@ -7,10 +7,10 @@ import { ANTIPROTON_HOSTED_RUNTIME_FEATURE_FLAG_KEY } from "@botiverse/raft-shar
 import { agents, agentCredentials, agentRuntimeProvisions, agentScopes, messages, channels, featureFlagRules, featureFlags, raftbenchConfigs, raftbenchFindings, raftbenchLatestRuns, raftbenchServiceAgents, serverAgentMembers, serverMembers, servers, thirdPartyAgentEvents } from "../db/schema";
 import { sourceContentVersion } from "../raftbench/service";
 import { advanceServer } from "../raftbench/controls";
-import { assignMachine, deleteAgent, updateAgent, isRaftBenchServiceAgent } from "../services/agentService";
+import { deleteAgent, updateAgent, isRaftBenchServiceAgent } from "../services/agentService";
 import { __setAgentRuntimeProviderTransportForTests } from "../services/agentRuntimeProviderService";
 import { drainAgentRuntimeProvisions } from "../services/agentRuntimeProvisionService";
-const test = createApiTest({ onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest();
 const serverId = "90623df1-20ed-4321-88a1-e4e2b411a252";
 test("admin enable creates a read-only profiled member, assigns one run, paginates results and clears on withdrawal", async ({ app, db, seed, onTestFinished }) => {
   const env = { DEPLOYMENT_ENV: "staging", SLOCK_PROVIDER_CREDENTIAL_KEY: Buffer.alloc(32, 7).toString("base64"), SERVER_URL: "https://raft.example.test", ANTIPROTON_PROVISIONING_TOKEN: "synthetic-only-provider-token" };
@@ -30,6 +30,9 @@ test("admin enable creates a read-only profiled member, assigns one run, paginat
   const path = `${app.baseUrl}/api/raftbench`;
   const put = (body: unknown) => fetch(path, { method: "PUT", headers: auth, body: JSON.stringify(body) });
   expect((await fetch(path, { headers: memberAuth })).status).toBe(403);
+  const feedbackPath = `${path}/findings/00000000-0000-4000-8000-000000000001/feedback`;
+  expect((await fetch(feedbackPath, { method: "PUT", headers: auth, body: JSON.stringify({ revision: 1, version: "bad", value: "agree" }) })).status).toBe(400);
+  expect((await fetch(feedbackPath, { method: "PUT", headers: memberAuth, body: JSON.stringify({ revision: 1, version: "a".repeat(32), value: "agree" }) })).status).toBe(403);
   expect((await fetch(path, { headers: auth })).status).toBe(200);
   expect(await isRaftBenchServiceAgent(owner.id)).toBe(false); // Warm the empty process cache before binding.
   const enable = await put({ enabled: true, channelIds: [source.id], expectedRevision: 0 });
@@ -56,8 +59,7 @@ test("admin enable creates a read-only profiled member, assigns one run, paginat
   expect(posted.some(body => body.profile === "raftbench_service")).toBe(true);
   const [provision] = await db.select().from(agentRuntimeProvisions).where(eq(agentRuntimeProvisions.agentId, agent.id));
   expect(provision.state).toBe("active"); expect(provision.provisionedProfile).toBe("raftbench_service");
-  // A Computer or runtime switch cannot turn the read-only service into a daemon actor.
-  await expect(assignMachine(agent.id, "00000000-0000-4000-8000-000000000001")).rejects.toThrow();
+  // A runtime switch cannot turn the read-only service into a daemon actor.
   await expect(updateAgent(agent.id, { runtime: "codex" })).rejects.toThrow();
   const beforeAssignment = await fetch(path, { headers: auth });
   expect((await beforeAssignment.json()).run).toBeNull();
@@ -67,7 +69,7 @@ test("admin enable creates a read-only profiled member, assigns one run, paginat
   const runs = await db.select().from(raftbenchLatestRuns).where(eq(raftbenchLatestRuns.serverId, serverId));
   const events = await db.select().from(thirdPartyAgentEvents).where(eq(thirdPartyAgentEvents.systemApp, "system.raftbench"));
   expect(runs).toHaveLength(1); expect(events).toHaveLength(1);
-  expect(runs[0].from).toEqual(new Date(now.getTime() - 7 * 24 * 60 * 60_000));
+  expect(runs[0].from).toEqual(new Date(config.updatedAt.getTime() - 7 * 24 * 60 * 60_000));
   expect(runs[0].to).toEqual(now);
   expect(events[0].payload).toMatchObject({ kind: "raftbench_run_assigned", runId: runs[0].runId });
   expect(events[0].payload).not.toHaveProperty("sourceText");
@@ -80,6 +82,14 @@ test("admin enable creates a read-only profiled member, assigns one run, paginat
   expect(result.status, JSON.stringify(page)).toBe(200); expect(page.run.report.patterns).toHaveLength(3); expect(page.pagination).toMatchObject({ page: 2, pageCount: 2, total: 8 });
   expect(page.run.report.patterns[0].evidence[0].messageId).toBe("00000000-0000-4000-8000-000000000001");
   expect(JSON.stringify(page)).not.toContain("synthetic-only-provider-token");
+  expect((await fetch(`${path}?kind=not-a-kind`, { headers: auth })).status).toBe(400);
+  expect((await fetch(`${path}?channelId=not-an-id`, { headers: auth })).status).toBe(400);
+  const scoped = await (await fetch(`${path}?kind=successful_practice&channelId=${source.id}&page=2`, { headers: auth })).json();
+  expect(scoped.pagination).toMatchObject({ page: 2, total: 8 });
+  expect(scoped.findingIndex.kindCounts.successful_practice).toBe(8);
+  const noMatch = await (await fetch(`${path}?kind=repeated_attempt`, { headers: auth })).json();
+  expect(noMatch.pagination.total).toBe(0); expect(noMatch.run.report.patterns).toEqual([]);
+
   await db.update(messages).set({ content: "Synthetic revised evidence", updatedAt: new Date(Date.now() + 1000) }).where(eq(messages.id, sourceMessage.id));
   const invalidated = await (await fetch(path, { headers: auth })).json();
   expect(invalidated.run.status).toBe("stale"); expect(invalidated.run.report).toBeNull();

@@ -3,18 +3,18 @@ import { once } from "node:events";
 import { eq } from "drizzle-orm";
 import WebSocket from "ws";
 import { createApiTest } from "../test/integration/apiTest";
-import { signAccessToken } from "../middleware/auth";
-import { createSession, revokeAllUserSessions, revokeSession } from "../services/sessionService";
+import { revokeAllUserSessions, revokeSession } from "../services/sessionService";
+import { signInForTest } from "../test/integration/credentials";
 import * as serverService from "../services/serverService";
 import { createSocialAuthCompletion } from "../services/socialAuthService";
+import { socialCompletionCookie } from "../test/integration/socialCompletionCookie";
 import { userAuthIdentities } from "../db/schema";
 
-const test = createApiTest({ onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest();
 
 test("revoked access token cannot complete social identity linking", async ({ app, seed, db }) => {
   const owner = await seed.human();
-  const revoked = await createSession(owner.id);
-  const oldToken = signAccessToken(owner.id, revoked.familyId);
+  const { token: oldToken } = await signInForTest(owner.id);
   const code = await createSocialAuthCompletion({
     provider: "google", mode: "link", intendedAction: "link", userId: owner.id,
     providerUserId: "audit-controlled-social-identity",
@@ -24,7 +24,7 @@ test("revoked access token cannot complete social identity linking", async ({ ap
   await revokeAllUserSessions(owner.id);
   const complete = (token: string) => fetch(`${app.baseUrl}/api/auth/google/complete`, {
     method: "POST",
-    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json", Cookie: socialCompletionCookie("google", code) },
     body: JSON.stringify({ code }),
   });
   const rejected = await complete(oldToken);
@@ -32,8 +32,8 @@ test("revoked access token cannot complete social identity linking", async ({ ap
   await rejected.json();
   assert.equal((await db.select().from(userAuthIdentities).where(eq(userAuthIdentities.userId, owner.id))).length, 0);
   // Rejection must not consume the completion; a fresh, live session can finish.
-  const live = await createSession(owner.id);
-  const accepted = await complete(signAccessToken(owner.id, live.familyId));
+  const live = await signInForTest(owner.id);
+  const accepted = await complete(live.token);
   assert.equal(accepted.status, 200);
   await accepted.json();
   const identities = await db.select().from(userAuthIdentities).where(eq(userAuthIdentities.userId, owner.id));
@@ -72,8 +72,7 @@ async function socketHandshake(
 test("revoked access token cannot reconnect to server socket rooms", async ({ app, seed }) => {
   const owner = await seed.human();
   const server = await seed.server({ owner });
-  const session = await createSession(owner.id);
-  const token = signAccessToken(owner.id, session.familyId);
+  const { token } = await signInForTest(owner.id);
   assert.ok((await socketHandshake(app.baseUrl, token, server.id)).startsWith("40"));
   await revokeAllUserSessions(owner.id);
   const denied = await socketHandshake(app.baseUrl, token, server.id);
@@ -84,8 +83,8 @@ for (const mode of ["all", "one"] as const) {
 test(`revoked connected socket stops receiving user-room data: ${mode}`, async ({ app, seed }) => {
   const owner = await seed.human();
   const server = await seed.server({ owner });
-  const session = await createSession(owner.id);
-  const result = await socketHandshake(app.baseUrl, signAccessToken(owner.id, session.familyId), server.id, async (ws) => {
+  const session = await signInForTest(owner.id);
+  const result = await socketHandshake(app.baseUrl, session.token, server.id, async (ws) => {
     const events: string[] = [];
     const observed = new Promise<void>((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error("Neither disconnect nor ordered broadcast barrier arrived")), 5_000);
@@ -114,7 +113,7 @@ test(`revoked connected socket stops receiving user-room data: ${mode}`, async (
 test("revocation during Socket handshake cannot resurrect stale authorization", async ({ app, seed }) => {
   const owner = await seed.human();
   const server = await seed.server({ owner });
-  const session = await createSession(owner.id);
+  const session = await signInForTest(owner.id);
   const isMember = serverService.isMember;
   const spy = vi.spyOn(serverService, "isMember").mockImplementationOnce(async (...args) => {
     const member = await isMember(...args);
@@ -122,7 +121,7 @@ test("revocation during Socket handshake cannot resurrect stale authorization", 
     return member;
   });
   try {
-    const result = await socketHandshake(app.baseUrl, signAccessToken(owner.id, session.familyId), server.id);
+    const result = await socketHandshake(app.baseUrl, session.token, server.id);
     assert.ok(result.startsWith("44"), "stale handshake must receive CONNECT_ERROR");
   } finally {
     spy.mockRestore();

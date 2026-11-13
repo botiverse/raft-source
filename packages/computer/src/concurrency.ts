@@ -33,6 +33,12 @@ const STALE_LOCK_THRESHOLD_MS = 60_000;
 export interface MutationLockOptions {
   staleMs?: number;
   updateMs?: number;
+  /**
+   * Wait this long for another holder instead of the ~5 s default (a
+   * supervised boot waits past the stale threshold, so a lock left by a
+   * crashed boot is recovered rather than failing the start).
+   */
+  waitMs?: number;
 }
 
 type LockOwnershipState =
@@ -75,9 +81,10 @@ export async function releaseHeldComputerMutationLock(slockHome: string): Promis
  */
 export async function withMutationLock<T>(
   fn: (signal: AbortSignal) => Promise<T>,
+  options: MutationLockOptions = {},
 ): Promise<T> {
   try {
-    return await withComputerMutationLock(resolveRaftHome(), fn);
+    return await withComputerMutationLock(resolveRaftHome(), fn, options);
   } catch (err) {
     if (
       err instanceof ComputerError &&
@@ -129,12 +136,15 @@ export async function withComputerMutationLock<T>(
       lockfilePath,
       stale: options.staleMs ?? STALE_LOCK_THRESHOLD_MS,
       ...(options.updateMs === undefined ? {} : { update: options.updateMs }),
-      retries: {
-        retries: 10,
-        minTimeout: 200,
-        maxTimeout: 800,
-        factor: 1.5,
-      },
+      retries: options.waitMs === undefined
+        ? {
+          retries: 10,
+          minTimeout: 200,
+          maxTimeout: 800,
+          factor: 1.5,
+        }
+        // ~1 s apart for waitMs: proper-lockfile re-checks staleness each try.
+        : { retries: Math.max(1, Math.ceil(options.waitMs / 1_000)), minTimeout: 1_000, maxTimeout: 1_000, factor: 1 },
       realpath: false,
       onCompromised: (cause) => {
         if (

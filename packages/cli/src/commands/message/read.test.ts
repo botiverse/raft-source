@@ -86,10 +86,9 @@ test("message read command uses injected ApiClient and writes canonical history"
   ]);
   assert.deepEqual(stderr, []);
   const output = stdout.join("");
-  assert.match(output, /Read window: 1 returned, seq 7, oldest to newest\./);
-  assert.match(output, /Around: abcd1234\./);
+  assert.match(output, /Around: abcd1234\. Your read position did not move\. To read new messages and mark them read, use --unread\./);
   assert.match(output, /\[1\/1 seq=7 msg=abcd1234-0000-0000-0000-000000000000/);
-  assert.match(output, /End of window: 1\/1 shown\./);
+  assert.doesNotMatch(output, /Read window|End of window|Older|Newer/, "the whole conversation is on screen");
   assert.doesNotMatch(output, /message ack|attest|model-seen/i);
   assert.match(output, /@xxchan: review this/);
   assert.equal(
@@ -645,7 +644,7 @@ test("message read --unread fails closed on a Server that ignored the flag", asy
   });
   await assert.rejects(
     async () => { await messageReadCommand.handler(ctx, { target: "#general", unread: true }); },
-    (error: unknown) => error instanceof CliError && error.code === "UNSUPPORTED_BY_SERVER" && /raft inbox check/.test(String(error.suggestedNextAction)),
+    (error: unknown) => error instanceof CliError && error.code === "UNSUPPORTED_BY_SERVER" && /without --unread/.test(String(error.suggestedNextAction)),
   );
   assert.equal(stdout.join(""), "", "the latest page must not be printed as unread");
 });
@@ -672,7 +671,7 @@ test("message read --unread says when the newest messages were too recent to mar
   await messageReadCommand.handler(ctx, { target: "#general", unread: true });
   const out = stdout.join("");
   assert.match(out, /Read position: seq 10 → 11\./);
-  assert.match(out, /1 newest message is too recent to mark read; it will come back on your next --unread, folded into one line\.\n$/);
+  assert.match(out, /1 newest message was too recent to mark read at once; it should be marked read in a few seconds\. If your next --unread shows it again, it is folded into one line: nothing new\.\n$/);
   assert.doesNotMatch(out, /No more unread/);
 });
 

@@ -4,6 +4,7 @@ import { loginViaApi } from "../../fixtures/auth";
 import { test as scenarioTest } from "../../fixtures/scenario";
 import { waitForSeedState } from "../../fixtures/seedState";
 import { dismissOwnerOnboarding } from "../../fixtures/session";
+import { expectTimelineRendered } from "../../fixtures/timeline";
 import {
   clickSelectModeMoreAction,
   clickShareMessagesMenu,
@@ -12,7 +13,7 @@ import {
 
 async function clearNativeSelection(page: Page) {
   await page.evaluate(() => window.getSelection()?.removeAllRanges());
-  await expect(page.getByRole("menu", { name: "Selected text actions" })).toBeHidden();
+  await expect(page.getByRole("toolbar", { name: "Selected text actions" })).toBeHidden();
 }
 
 test("selection shortcut covers word and browser whole-paragraph triple-click selection", async ({ page, request }) => {
@@ -43,12 +44,12 @@ test("selection shortcut covers word and browser whole-paragraph triple-click se
   await expect(messageBody).toBeVisible();
 
   await messageBody.click({ clickCount: 2, position: { x: 8, y: 10 } });
-  await expect(page.getByRole("menu", { name: "Selected text actions" })).toBeVisible();
+  await expect(page.getByRole("toolbar", { name: "Selected text actions" })).toBeVisible();
   expect((await page.evaluate(() => window.getSelection()?.toString() ?? "")).trim()).toBe("Selection");
   await clearNativeSelection(page);
 
   await messageBody.click({ clickCount: 3, position: { x: 8, y: 10 } });
-  const selectionShortcut = page.getByRole("menu", { name: "Selected text actions" });
+  const selectionShortcut = page.getByRole("toolbar", { name: "Selected text actions" });
   await expect(selectionShortcut).toBeVisible();
   expect((await page.evaluate(() => window.getSelection()?.toString() ?? "")).trim()).toBe(content);
   await page.waitForTimeout(150);
@@ -60,7 +61,7 @@ test("selection shortcut covers word and browser whole-paragraph triple-click se
     const selection = window.getSelection();
     if (selection) selection.removeAllRanges = () => {};
   });
-  await selectionShortcut.getByRole("menuitem", { name: "Copy" }).click();
+  await selectionShortcut.getByRole("button", { name: "Copy" }).click();
   await expect(selectionShortcut).toBeHidden();
   await page.waitForTimeout(500);
   await expect(selectionShortcut).toBeHidden();
@@ -72,7 +73,7 @@ test("selection shortcut covers word and browser whole-paragraph triple-click se
     const selection = window.getSelection();
     if (selection) selection.removeAllRanges = () => {};
   });
-  const keyboardCopy = selectionShortcut.getByRole("menuitem", { name: "Copy" });
+  const keyboardCopy = selectionShortcut.getByRole("button", { name: "Copy" });
   await keyboardCopy.focus();
   await keyboardCopy.press("Space");
   await expect(selectionShortcut).toBeHidden();
@@ -112,7 +113,7 @@ test("selection shortcut appears after browser triple-click selects a rich text 
 
   await messageBody.locator("code", { hasText: "origin/main" }).click({ clickCount: 3 });
 
-  await expect(page.getByRole("menu", { name: "Selected text actions" })).toBeVisible();
+  await expect(page.getByRole("toolbar", { name: "Selected text actions" })).toBeVisible();
   expect((await page.evaluate(() => window.getSelection()?.toString() ?? "")).trim()).toBe(content.replace(/`/g, ""));
 });
 
@@ -127,8 +128,9 @@ test("select mode entry + check circles + toolbar render", async ({ page, reques
   // socket.io per-channel room is joined. Otherwise messages we POST below
   // get broadcast to a room that doesn't include this client yet — see
   // "socket.io rooms have no buffer" feedback.
-  await expect(page.getByTestId("message-scroller")).toBeVisible();
-  await expect(page.getByText(seedState.messages.latestContent)).toBeVisible();
+  // Any rendered row: other tests post to this channel, so its seeded
+  // latest message may be far above the tail (and not mounted).
+  await expectTimelineRendered(page);
 
   // Send a couple messages so we have something to right-click.
   const tag = `selectsmoke-${Date.now()}`;
@@ -221,8 +223,9 @@ test("select mode → Share... → preview lightbox → Download triggers downlo
   await dismissOwnerOnboarding(request, seedState, login.accessToken);
 
   await page.goto(`/s/${seedState.server.slug}/channel/${seedState.channel.id}`);
-  await expect(page.getByTestId("message-scroller")).toBeVisible();
-  await expect(page.getByText(seedState.messages.latestContent)).toBeVisible();
+  // Any rendered row: other tests post to this channel, so its seeded
+  // latest message may be far above the tail (and not mounted).
+  await expectTimelineRendered(page);
 
   const tag = `selectsave-${Date.now()}`;
   for (let i = 0; i < 2; i++) {
@@ -247,9 +250,6 @@ test("select mode → Share... → preview lightbox → Download triggers downlo
   const lightbox = page.getByTestId("select-share-lightbox");
   await expect(lightbox).toBeVisible({ timeout: 10000 });
   await expect(lightbox.locator("img")).toHaveAttribute("src", /^data:image\/png;base64,/);
-  await expect(page.getByTestId("select-share-lightbox-copy-image")).toHaveText(/Copy image/);
-  await expect(page.getByTestId("select-share-lightbox-download")).toHaveText(/Download/);
-  await expect(page.getByTestId("select-share-lightbox-share-x")).toHaveText(/Share to X/);
 
   // Click Download → download fires + lightbox closes + select mode exits
   await page.getByTestId("select-share-lightbox-download").click();
@@ -266,8 +266,9 @@ test("select mode → Share preview → close lightbox preserves selection (v1.3
   await dismissOwnerOnboarding(request, seedState, login.accessToken);
 
   await page.goto(`/s/${seedState.server.slug}/channel/${seedState.channel.id}`);
-  await expect(page.getByTestId("message-scroller")).toBeVisible();
-  await expect(page.getByText(seedState.messages.latestContent)).toBeVisible();
+  // Any rendered row: other tests post to this channel, so its seeded
+  // latest message may be far above the tail (and not mounted).
+  await expectTimelineRendered(page);
 
   const tag = `selectclose-${Date.now()}`;
   for (let i = 0; i < 2; i++) {
@@ -296,7 +297,6 @@ test("select mode → Share preview → close lightbox preserves selection (v1.3
   // Closing still goes through the header X and preserves selection.
   await clickSelectModeMoreAction(page, "select-mode-share-open");
   await expect(lightbox).toBeVisible({ timeout: 10000 });
-  await expect(page.getByTestId("select-share-lightbox-cancel")).toHaveCount(0);
   await page.getByTestId("select-share-lightbox-close").click();
   await expect(lightbox).toHaveCount(0);
   await expect(page.getByTestId("select-mode-count")).toHaveText("2 selected");

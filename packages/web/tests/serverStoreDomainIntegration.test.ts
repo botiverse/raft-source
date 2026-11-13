@@ -57,7 +57,6 @@ function member(overrides: Partial<ServerMember> = {}): ServerMember {
     serverName: "Core",
     serverSlug: "core",
     email: null,
-    gravatarHash: "hash",
     name: "User",
     displayName: null,
     description: null,

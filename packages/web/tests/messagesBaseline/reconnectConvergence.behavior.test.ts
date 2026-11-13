@@ -132,9 +132,10 @@ test("reconnect resume delivers disconnect-period messages once and preserves vi
     handlers.roomsJoined(undefined);
     await flushAsyncWork();
 
-    assert.deepEqual(socket.emitted, [
-      { event: "sync:resume", args: [{ lastSeq: 1 }] },
-    ]);
+    // Connect asks for a starting horizon (unanswered here, like an older
+    // server), so the resume goes out without one, exactly as before.
+    assert.deepEqual(socket.emitted.map((entry) => entry.event), ["sync:horizon", "sync:resume"]);
+    assert.deepEqual(socket.emitted[1]?.args, [{ lastSeq: 1 }]);
     assert.deepEqual(harness.messages(CHANNEL_ID).map((item) => item.id), ["m-1", "m-2", "m-3"]);
 
     handlers.resumeResponse({

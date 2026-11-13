@@ -74,8 +74,25 @@ const JSON_SCHEMA_DIALECT = "https://json-schema.org/draft/2020-12/schema";
 function toJsonSchema(schema: z.ZodType, io: "input" | "output"): AgentApiJsonSchema {
   // Transforms and branded ids have no JSON Schema form; `unrepresentable:
   // "any"` keeps the document buildable and marks those spots as `{}`.
-  const result = z.toJSONSchema(schema, { io, unrepresentable: "any", target: "draft-2020-12" }) as Record<string, unknown>;
+  // `reused: "inline"` keeps every schema self-contained: the description
+  // document is a wire artifact, and a `$ref` into a route-local `$defs`
+  // has no reader that can resolve it.
+  const result = z.toJSONSchema(schema, { io, unrepresentable: "any", reused: "inline", target: "draft-2020-12" }) as Record<string, unknown>;
   delete result.$schema;
+  // zod 4.6 keeps a meta-id schema behind a `$ref` even for a single use;
+  // hoist that one level so the wire document has no dangling root ref.
+  // Only the root `$ref` is dropped: the hoisted schema can still reference
+  // sibling entries (or itself, recursively) inside `$defs`, so `$defs`
+  // must be preserved whole — deleting it would strand every nested
+  // `#/$defs/...` reference in this subschema.
+  if (typeof result.$ref === "string" && result.$ref.startsWith("#/$defs/") && result.$defs && typeof result.$defs === "object") {
+    const name = result.$ref.slice("#/$defs/".length);
+    const target = (result.$defs as Record<string, unknown>)[name];
+    if (target && typeof target === "object") {
+      const { $ref: _ref, ...rest } = result;
+      return { ...(target as Record<string, unknown>), ...rest } as AgentApiJsonSchema;
+    }
+  }
   return result;
 }
 

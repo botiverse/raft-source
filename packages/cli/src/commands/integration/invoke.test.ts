@@ -17,7 +17,7 @@ import { CliError } from "../../core/errors";
 import type { CliIo } from "../../core/io";
 import { renderError } from "../../core/renderer";
 import type { IntegrationLoginResponse, RegisteredIntegrationService } from "./_format";
-import { CleanupOutcome, integrationInvokeCommand, registerIntegrationInvokeCommand } from "./invoke";
+import { CleanupOutcome, integrationInvokeCommand, invokeAppAction, registerIntegrationInvokeCommand } from "./invoke";
 import { IntegrationV1Error } from "./invokeV1";
 import type { AgentManifestV0 } from "./manifest";
 import { validateAgentManifestV1, type AgentManifestV1 } from "./manifestV1";
@@ -835,8 +835,9 @@ test("integration invoke preserves and redacts structured errors from file-respo
   assert.deepEqual(stdout, []);
   assert.equal(
     stderr.join(""),
-    "Error: service action failed (HTTP 409); response body: "
-      + '{"error":{"code":"TRANSCRIPT_NOT_READY","message":"transcript is still processing","details":{"apiKey":"<redacted>","observed":"sk_daemon_<redacted>"}}}\n'
+    "Error: service action answered HTTP 409 TRANSCRIPT_NOT_READY:\n"
+      + "transcript is still processing\n"
+      + 'details: {"apiKey":"<redacted>","observed":"sk_daemon_<redacted>"}\n'
       + "Code: INTEGRATION_INVOKE_FAILED\n",
   );
   assert.doesNotMatch(stderr.join(""), /\[object Object\]|plain-secret-value|super-secret/);
@@ -1059,23 +1060,6 @@ test("integration invoke preserves typed v0 arrays and objects from --data-json"
     assert.equal(calls.at(-1)?.url, "https://pr-diff-viewer.botiverse.workers.dev/api/render-patch");
     assert.deepEqual(JSON.parse(String(calls.at(-1)?.init?.body)), expectedActionBody);
   }, { manifest: typedManifest, expectedActionBody });
-});
-
-test("integration invoke help identifies --param as text-only and points structured fields to typed JSON", () => {
-  const program = new Command();
-  const integration = program.command("integration");
-  registerIntegrationInvokeCommand(integration);
-  const invoke = integration.commands.find((candidate) => candidate.name() === "invoke");
-
-  assert.ok(invoke);
-  let help = "";
-  invoke.configureOutput({
-    writeOut: (chunk) => { help += chunk; },
-    writeErr: (chunk) => { help += chunk; },
-  });
-  invoke.outputHelp();
-  assert.match(help, /--param <key=value>[\s\S]*Text action parameter/);
-  assert.match(help, /Use\s+--data-json\/--data-file for array or object\s+fields/);
 });
 
 test("integration invoke file response rejects non-POSIX platform for default temp", async () => {
@@ -4231,19 +4215,12 @@ test("integration invoke renders structured non-2xx status and redacted response
     },
     authorization: "Bearer service-session-secret",
   };
-  const expectedBody = JSON.stringify({
-    error: {
-      code: "INVALID_BODY",
-      message: "body.serverId is required",
-      details: {
-        expected: { serverId: "uuid" },
-        apiKey: "<redacted>",
-        observed: "sk_agent_<redacted>",
-        trace: "JWT <redacted>",
-      },
-    },
-    authorization: "<redacted>",
-  });
+  const expectedMessage = [
+    "service action answered HTTP 422 INVALID_BODY:",
+    "body.serverId is required",
+    `details: ${JSON.stringify({ expected: { serverId: "uuid" }, apiKey: "<redacted>", observed: "sk_agent_<redacted>", trace: "JWT <redacted>" })}`,
+    `other fields: ${JSON.stringify({ authorization: "<redacted>" })}`,
+  ].join("\n");
 
   for (const json of [false, true]) {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "slock-integration-invoke-error-body-"));
@@ -4283,7 +4260,7 @@ test("integration invoke renders structured non-2xx status and redacted response
         ok: false,
         error: {
           code: "INTEGRATION_INVOKE_FAILED",
-          message: `service action failed (HTTP 422); response body: ${expectedBody}`,
+          message: expectedMessage,
           fault_domain: null,
           layer: null,
           retryable: null,
@@ -4294,12 +4271,97 @@ test("integration invoke renders structured non-2xx status and redacted response
     } else {
       assert.equal(
         stderr.join(""),
-        `Error: service action failed (HTTP 422); response body: ${expectedBody}\n`
+        `Error: ${expectedMessage}\n`
           + "Code: INTEGRATION_INVOKE_FAILED\n",
       );
     }
     assert.doesNotMatch(stderr.join(""), /\[object Object\]|plain-secret-value|super-secret|service-session-secret/);
   }
+});
+
+test("integration invoke puts an app's own typed message on its own line, and leaves other failures as they were", async () => {
+  const run = async (actionStatus: number, actionBody: unknown) => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "slock-integration-invoke-app-error-"));
+    const patchPath = path.join(tmp, "change.patch");
+    fs.writeFileSync(patchPath, "diff --git a/app.ts b/app.ts\n", "utf8");
+    const { io, stdout, stderr } = memoryIo();
+    await withMockFetch(
+      async () => {
+        await assert.rejects(
+          () => parseCommand([
+            "integration", "invoke", "--service", "pr-diff-viewer-3c05bd", "--action", "render-patch",
+            "--param", `patchText=@${patchPath}`, "--param", "author=Cardy",
+          ], { io, profileDir: path.join(tmp, "profile") }),
+          /CliExit\(1\)/,
+        );
+      },
+      { actionStatus, actionBody, actionContentType: "application/json; charset=utf-8" },
+    );
+    assert.deepEqual(stdout, []);
+    return stderr.join("");
+  };
+
+  // A hold that says what to do next (Raft Artifacts' freshness hold): the words lead, not "failed" and escaped JSON.
+  const held = await run(409, {
+    error: {
+      code: "UNSEEN_CHANGES",
+      message: "Held — not posted. Since seen=41, others added 2 new comments that you haven't seen: error.details.unseen. Read them, then: to post as is, repeat this call with seen=44; to change it, post the new text with seen=44; or don't post.",
+      details: { seen: 44, unseen: { since: 41, comments: [{ author: "xxchan", body: "keep the old title" }] } },
+      request_id: "req-1",
+    },
+  });
+  assert.equal(
+    held,
+    "Error: service action answered HTTP 409 UNSEEN_CHANGES:\n"
+      + "Held — not posted. Since seen=41, others added 2 new comments that you haven't seen: error.details.unseen. Read them, then: to post as is, repeat this call with seen=44; to change it, post the new text with seen=44; or don't post.\n"
+      + 'details: {"seen":44,"unseen":{"since":41,"comments":[{"author":"xxchan","body":"keep the old title"}]}}\n'
+      + "request_id: req-1\n"
+      + "Code: INTEGRATION_INVOKE_FAILED\n",
+  );
+  assert.doesNotMatch(held, /service action failed/);
+
+  // A body without that shape (no code, or a plain string) keeps the old one-line form.
+  const plain = await run(500, { error: "internal" });
+  assert.equal(plain, 'Error: service action failed (HTTP 500); response body: {"error":"internal"}\nCode: INTEGRATION_INVOKE_FAILED\n');
+  const noCode = await run(500, { error: { message: "upstream timed out" } });
+  assert.equal(noCode, 'Error: service action failed (HTTP 500); response body: {"error":{"message":"upstream timed out"}}\nCode: INTEGRATION_INVOKE_FAILED\n');
+});
+
+test("integration invoke tells an App's own 403 refusal apart from a refused service session", async () => {
+  const run = async (actionStatus: number, actionBody: unknown) => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "slock-integration-invoke-403-"));
+    const patchPath = path.join(tmp, "change.patch");
+    fs.writeFileSync(patchPath, "diff --git a/app.ts b/app.ts\n", "utf8");
+    const { io, stderr } = memoryIo();
+    await withMockFetch(
+      async () => {
+        await assert.rejects(
+          () => parseCommand([
+            "integration", "invoke", "--service", "pr-diff-viewer-3c05bd", "--action", "render-patch",
+            "--param", `patchText=@${patchPath}`, "--param", "author=Cardy",
+          ], { io, profileDir: path.join(tmp, "profile") }),
+          /CliExit\(1\)/,
+        );
+      },
+      { actionStatus, actionBody, actionContentType: "application/json; charset=utf-8" },
+    );
+    return stderr.join("");
+  };
+
+  // The App refuses the action itself (a permission it checks): its words, and no login step, which would change nothing.
+  const refused = await run(403, { error: { code: "PUBLIC_ADMIN_REQUIRED", message: "Only a human server owner or admin can make an artifact public" } });
+  assert.match(refused, /^Error: service action answered HTTP 403 PUBLIC_ADMIN_REQUIRED:\nOnly a human server owner or admin can make an artifact public\n/);
+  assert.doesNotMatch(refused, /session was rejected|raft integration login/);
+
+  // No typed answer: the stored service session is the likely cause, as before.
+  const untyped = await run(403, { error: "forbidden" });
+  assert.match(untyped, /service session was rejected or expired \(HTTP 403\)/);
+  assert.match(untyped, /raft integration login --service pr-diff-viewer-3c05bd/);
+
+  // 401 is always the session, typed or not.
+  const unauthenticated = await run(401, { error: { code: "UNAUTHENTICATED", message: "Sign in first" } });
+  assert.match(unauthenticated, /service session was rejected or expired \(HTTP 401\)/);
+  assert.match(unauthenticated, /raft integration login --service pr-diff-viewer-3c05bd/);
 });
 
 test("integration invoke recursively redacts structured error fields even when Content-Type is text/plain", async () => {
@@ -4379,8 +4441,9 @@ test("integration invoke preserves a controlled typed integer-validation error i
 
   assert.equal(
     stderr.join(""),
-    "Error: service action failed (HTTP 400); response body: "
-      + '{"error":{"code":"INVALID_BODY","message":"expectedConfigVersion must be an integer","details":{"field":"expectedConfigVersion","receivedType":"string"}}}\n'
+    "Error: service action answered HTTP 400 INVALID_BODY:\n"
+      + "expectedConfigVersion must be an integer\n"
+      + 'details: {"field":"expectedConfigVersion","receivedType":"string"}\n'
       + "Code: INTEGRATION_INVOKE_FAILED\n",
   );
   assert.doesNotMatch(stderr.join(""), /\[object Object\]/);
@@ -5058,4 +5121,102 @@ test("CleanupOutcome cleaned factory is private to the finalizer", () => {
   // expected to produce TS2341 because `CleanupOutcome.cleaned()` is private.
   // @ts-expect-error TS2341 cleaned is private and only callable inside CleanupOutcome
   CleanupOutcome.cleaned();
+});
+
+test("integration list-actions filters one v0 action without login or invoking a write", async () => {
+  const multi = manifest();
+  multi.actions = [...multi.actions!, { ...multi.actions![0], name: "other-action" }];
+  for (const json of [false, true]) {
+    const { io, stdout } = memoryIo();
+    const requests: Array<{ method: string; path: string; body?: unknown }> = [];
+    await withMockFetch(async (calls) => {
+      await parseCommand(["integration", "invoke", "--service", "pr-diff-viewer-3c05bd", "--list-actions", "--action", "render-patch", ...(json ? ["--json"] : [])], { io, requests });
+      assert.equal(calls.length, 1, "only the manifest is fetched, not login or the write endpoint");
+    }, { manifest: multi });
+    assert.deepEqual(requests.map(r => r.path), ["/internal/agent-api/integrations"]);
+    const output = stdout.join("");
+    if (json) assert.deepEqual(JSON.parse(output).data.actions.map((a: {name: string}) => a.name), ["render-patch"]);
+    else { assert.match(output, /render-patch/); assert.doesNotMatch(output, /other-action/); }
+  }
+});
+
+test("integration list-actions filters v1 contract and readiness in text and JSON without invocation", async () => {
+  const multi = v1Manifest();
+  multi.actions = [...multi.actions, { ...multi.actions[0], name: "other_status" }];
+  for (const json of [false, true]) {
+    const { io, stdout } = memoryIo();
+    const requests: Array<{ method: string; path: string; body?: unknown }> = [];
+    await withV1Fetch(multi, async (calls) => {
+      await parseCommand(["integration", "invoke", "pr-diff-viewer-3c05bd", "get_status", "--list-actions", ...(json ? ["--json"] : [])], { io, requests });
+      assert.equal(calls.length, 1);
+    });
+    assert.deepEqual(requests.map(r => r.path), ["/internal/agent-api/integrations"]);
+    const output = stdout.join("");
+    if (json) {
+      const payload = JSON.parse(output).data;
+      assert.deepEqual(payload.actions.map((a: {name: string}) => a.name), ["get_status"]);
+      assert.equal(payload.actionReadiness.length, 1);
+    } else { assert.match(output, /get_status/); assert.doesNotMatch(output, /other_status/); }
+  }
+});
+
+test("integration list-actions unknown action fails without login or invocation for v0 and v1", async () => {
+  for (const version of [0, 1]) {
+    const { io } = memoryIo();
+    const requests: Array<{ method: string; path: string; body?: unknown }> = [];
+    const run = async (calls: Array<{url: string}>) => {
+      await assert.rejects(async () => integrationInvokeCommand.handler(commandContext({io,requests}),undefined,undefined,{service:"pr-diff-viewer-3c05bd",listActions:true,action:"missing"}), /manifest does not define action missing/);
+      assert.equal(calls.length,1);
+    };
+    if (version===0) await withMockFetch(run); else await withV1Fetch(v1Manifest(),run);
+    assert.deepEqual(requests.map(r=>r.path),["/internal/agent-api/integrations"]);
+  }
+});
+
+test("invokeAppAction logs in and returns the v0 action's parsed answer without printing", async () => {
+  const { io, stdout } = memoryIo();
+  const requests: Array<{ method: string; path: string; body?: unknown }> = [];
+
+  const result = await withMockFetch(async () => invokeAppAction(commandContext({ io, requests }), {
+    service: "pr-diff-viewer-3c05bd",
+    action: "render-patch",
+    payload: { patchText: "diff --git a/app.ts b/app.ts\n", author: "Cardy" },
+  }));
+
+  assert.deepEqual(result.value, { viewerUrl: "https://pr-diff-viewer.botiverse.workers.dev/view/abc" });
+  assert.equal(result.service.clientId, "pr-diff-viewer-3c05bd");
+  assert.deepEqual(requests.map((r) => r.path), [
+    "/internal/agent-api/integrations",
+    "/internal/agent-api/integrations/login",
+  ]);
+  assert.equal(stdout.join(""), "");
+});
+
+test("invokeAppAction names an unknown service INTEGRATION_NOT_FOUND before any app call", async () => {
+  const { io } = memoryIo();
+  await withMockFetch(async (calls) => {
+    await assert.rejects(
+      async () => invokeAppAction(commandContext({ io }), { service: "reminder", action: "trigger", payload: {} }),
+      (error: unknown) => error instanceof CliError && error.code === "INTEGRATION_NOT_FOUND",
+    );
+    assert.equal(calls.length, 0);
+  });
+});
+
+test("invokeAppAction with requireOfficial refuses a listed service the platform hasn't marked official, before any login or app call", async () => {
+  const { io } = memoryIo();
+  const requests: Array<{ method: string; path: string; body?: unknown }> = [];
+  await withMockFetch(async (calls) => {
+    await assert.rejects(
+      async () => invokeAppAction(commandContext({ io, requests }), {
+        service: "pr-diff-viewer-3c05bd",
+        action: "render-patch",
+        payload: {},
+        requireOfficial: true,
+      }),
+      (error: unknown) => error instanceof CliError && error.code === "INTEGRATION_NOT_FOUND",
+    );
+    assert.equal(calls.length, 0);
+  });
+  assert.deepEqual(requests.map((r) => r.path), ["/internal/agent-api/integrations"], "no login for a look-alike");
 });

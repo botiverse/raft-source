@@ -34,7 +34,7 @@ afterEach(() => {
   useServerStore.setState({ current: null });
 });
 
-test("web socket handshake auth declares clientKind=web", () => {
+test("web socket handshake auth declares clientKind=web and its capabilities", () => {
   localStorage.setItem("slock_access_token", "access-token-1");
   useServerStore.setState({
     current: {
@@ -58,6 +58,7 @@ test("web socket handshake auth declares clientKind=web", () => {
     token: "access-token-1",
     serverId: "server-1",
     clientKind: "web",
+    capabilities: ["agent_activity_subscriptions_v1"],
   });
 
   localStorage.setItem("slock_access_token", "access-token-2");
@@ -67,5 +68,6 @@ test("web socket handshake auth declares clientKind=web", () => {
     token: "access-token-2",
     serverId: "server-1",
     clientKind: "web",
+    capabilities: ["agent_activity_subscriptions_v1"],
   });
 });

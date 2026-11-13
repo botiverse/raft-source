@@ -4,7 +4,7 @@ import { useIntl } from "react-intl";
 import { Badge, Button, Card, Checkbox, Input, Status } from "@botiverse/raft-ui";
 import { normalizeAppSetupUrl } from "@botiverse/raft-shared";
 import type { AppSetupState } from "@botiverse/raft-shared";
-import { ExternalLink } from "lucide-react";
+import LeavingRaftMark, { opensInNewTabAriaLabel } from "../ui/LeavingRaftMark";
 import api from "../../api/client";
 import FormField from "../ui/FormField";
 
@@ -15,10 +15,10 @@ export function AppSetupFields({ required, url, description, onRequiredChange, o
   onDescriptionChange: (event: ChangeEvent<HTMLInputElement>) => void;
 }) {
   const { formatMessage } = useIntl();
-  return <div className="space-y-3">
+  return <div className="stack-y-3">
     {/* A yes/no saved with the form is a checkbox (a switch acts at once). */}
     <label className="flex items-start gap-3">
-      <Checkbox checked={required} onCheckedChange={onRequiredChange} className="mt-0.5" />
+      <Checkbox checked={required} onCheckedChange={onRequiredChange} />
       <span className="text-subhead font-semibold text-foreground">{formatMessage({ id: "appSetup.requiresConfiguration" })}</span>
     </label>
     {required ? <>
@@ -38,7 +38,7 @@ export function AppSetupRequirement({ url, description }: { url?: string | null;
   if (!url) return null;
   let domain: string;
   try { domain = new URL(normalizeAppSetupUrl(url)!).host; } catch { return null; }
-  return <Card className="space-y-2 p-3" data-testid="app-setup-requirement">
+  return <Card className="stack-y-2 p-3" data-testid="app-setup-requirement">
     <Badge appearance="soft" variant="warning"><Status variant="warning" aria-hidden="true" />{formatMessage({ id: "appSetup.requiredAfterInstall" })}</Badge>
     <p className="text-callout text-foreground-muted">{formatMessage({ id: "appSetup.beforeInstall" }, { domain })}</p>
     {description ? <p className="break-words text-callout text-foreground">{description}</p> : null}
@@ -77,7 +77,8 @@ function AppSetupSnapshot({ clientId, serverId }: { clientId: string; serverId: 
     return () => { active = false; };
   }, [clientId, serverId, refresh]);
   if (state?.status === "not_required") return null;
-  return <Card className="space-y-3 p-4" data-testid="app-installation-setup" aria-live="polite">
+  const actionLabel = formatMessage({ id: state?.status === "complete" ? "appSetup.manage" : "appSetup.continue" });
+  return <Card className="stack-y-3 p-4" data-testid="app-installation-setup" aria-live="polite">
     <div className="text-subhead font-semibold text-foreground">{formatMessage({ id: "appSetup.title" })}</div>
     {error ? <p role="alert" className="text-footnote font-semibold text-warning-strong">{formatMessage({ id: "appSetup.loadFailed" })}</p>
       : !state ? <p className="text-callout text-foreground-muted">{formatMessage({ id: "common.loadingLabel" })}</p>
@@ -87,13 +88,14 @@ function AppSetupSnapshot({ clientId, serverId }: { clientId: string; serverId: 
           {formatMessage({ id: state.status === "complete" ? "appSetup.complete" : "appSetup.pending" })}
         </Badge>
         {state.description ? <p className="break-words text-callout text-foreground">{state.description}</p> : null}
-        {state.canConfigure && state.url ? <div className="space-y-2">
-          <Button size="sm" render={<a href={state.url} target="_blank" rel="noopener noreferrer" aria-label={formatMessage({ id: state.status === "complete" ? "appSetup.manage" : "appSetup.continue" })} />} nativeButton={false} role="link">
-            <ExternalLink size={16} />{formatMessage({ id: state.status === "complete" ? "appSetup.manage" : "appSetup.continue" })}
+        {state.canConfigure && state.url ? <div className="stack-y-2">
+          <Button size="md" render={<a href={state.url} target="_blank" rel="noopener noreferrer" aria-label={opensInNewTabAriaLabel(formatMessage, actionLabel)} />} nativeButton={false} role="link">
+            {actionLabel}
+            <LeavingRaftMark data-icon="inline-end" />
           </Button>
           <p className="break-words text-caption text-foreground-hint">{formatMessage({ id: "appSetup.opensAt" }, { domain: new URL(state.url).host })}</p>
         </div> : <p className="text-callout text-foreground-muted">{formatMessage({ id: state.status === "complete" ? "appSetup.adminManage" : "appSetup.adminRequired" })}</p>}
       </>}
-    <Button size="sm" variant="outline" onClick={reload}>{formatMessage({ id: "appSetup.refresh" })}</Button>
+    <Button size="md" variant="outline" onClick={reload}>{formatMessage({ id: "appSetup.refresh" })}</Button>
   </Card>;
 }

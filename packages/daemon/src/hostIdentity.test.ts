@@ -8,7 +8,7 @@ import {
   readHardwareId,
 } from "./hostIdentity";
 
-const MACHINE_ID = "4c4c4544004d3610804bb4c04f4e4d32";
+const MACHINE_ID = "8a7b6c5d4e3f4a1b9c2d0e1f2a3b4c5d";
 
 describe("hostIdHashForServer", () => {
   it("is stable for one machine and server, and 32 hex chars", () => {

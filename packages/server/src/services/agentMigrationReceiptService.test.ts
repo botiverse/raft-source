@@ -4,7 +4,14 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { and, eq } from "drizzle-orm";
 import type { Server as SocketServer } from "socket.io";
-import { asServerId, EXTERNAL_AGENT_RUNTIME_ID } from "@botiverse/raft-shared";
+import {
+  AGENT_MIGRATION_AGENT_RETRY_CAPABILITY,
+  AGENT_MIGRATION_CAPABILITY,
+  AGENT_MIGRATION_SOURCE_USER_IGNORE_CAPABILITY,
+  asServerId,
+  EXTERNAL_AGENT_RUNTIME_ID,
+  MAX_AGENT_MIGRATION_EXCLUDED_REGENERABLE_COUNT,
+} from "@botiverse/raft-shared";
 import { getDb } from "../db/index";
 import {
   agentMigrationReceiptChannels,
@@ -59,6 +66,7 @@ import {
   agentMigrationReceiptRetryDelayMs,
   drainAgentMigrationReceiptOutbox,
   formatAgentMigrationCompletedReceipt,
+  formatHostedMigrationCompletedReceipt,
   formatReceiptBytes,
   formatAgentMigrationTerminalReceipt,
 } from "./agentMigrationReceiptService";
@@ -373,6 +381,7 @@ test("authoritative completion atomically persists one private frozen-name recei
     serverId: fixture.server.id,
     agentId: fixture.agent.id,
     query: "Migration",
+    historyCutoff: undefined,
   });
   assert.equal(agentSearch.results.length, 1);
   assert.equal(agentSearch.results[0]!.channelId, fixture.receiptChannelId);
@@ -390,6 +399,7 @@ test("authoritative completion atomically persists one private frozen-name recei
     serverId: fixture.server.id,
     userId: fixture.owner.id,
     query: "Migration",
+    historyCutoff: undefined,
   });
   assert.equal(humanSearch.results.length, 0);
 
@@ -604,7 +614,11 @@ test("projected receipt surface resolves through joint scope without widening th
     rows.facts.map((fact) => [fact.receiverType, fact.receiverId, fact.sourceChannelId, fact.messageId]),
     [["agent", fixture.agent.id, fixture.receiptChannelId, rows.messages[0]!.id]],
   );
-  assert.equal(await canAgentAccessChannel(fixture.receiptChannelId, fixture.agent.id), true);
+  // The fixture's local surface row lives in another server than the agent's
+  // (the raw-join trap above), and canAgentAccessChannel is pinned to the
+  // channel's own server: the receipt resolves through joint scope, but no
+  // channel read widens to it either.
+  assert.equal(await canAgentAccessChannel(fixture.receiptChannelId, fixture.agent.id), false);
   assert.equal(await canUserAccessChannel(
     fixture.receiptChannelId,
     fixture.owner.id,
@@ -1068,15 +1082,115 @@ test("completed receipt lists paths left out by .raftmigrateignore and where to 
     },
   });
   assert.match(text, /Not moved, as listed in \.raftmigrateignore: 2 paths, 7 files \(1 KB\); largest: datasets \(1000 bytes\), cache\.sqlite \(50 bytes\)\./);
-  assert.match(text, /archived on Source and kept for up to 30 days/);
+  assert.match(text, /archived on Source and kept for up to 7 days, so anything missing can be recovered from there\./);
   assert.match(text, /按 \.raftmigrateignore 未迁移：2 个路径/);
+  assert.match(text, /旧工作区归档在 Source 上，最多保留 7 天，缺了可以从那里找回。/);
+  assert.doesNotMatch(text, /30 (?:days|天)/);
   const withoutIgnores = formatAgentMigrationCompletedReceipt({
     sourceMachineName: "Source",
     targetMachineName: "Target",
     supportRef: "mig_AAAAAAAAAAAAAAAAAAAAAA",
     summary,
   });
-  assert.doesNotMatch(withoutIgnores, /raftmigrateignore|30 days/);
+  assert.doesNotMatch(withoutIgnores, /raftmigrateignore|kept for up to/);
+});
+
+test("hosted completed receipt promises the 7-day archive only when files were left out", () => {
+  const base = { sourceMachineName: "Source", supportRef: "mig_AAAAAAAAAAAAAAAAAAAAAA" };
+  const skipped = formatHostedMigrationCompletedReceipt({
+    ...base,
+    summary: {
+      importedFileCount: 3,
+      importedBytes: 300,
+      skipped: [{ reason: "file_too_large", count: 1, bytes: 2_048, largestPaths: ["video.mp4"] }],
+    },
+  });
+  assert.match(skipped, /The old workspace is archived on Source and kept for up to 7 days, so anything missing can be recovered from there\./);
+  assert.doesNotMatch(skipped, /30 days/);
+  assert.doesNotMatch(formatHostedMigrationCompletedReceipt({ ...base, summary: null }), /kept for up to/);
+});
+
+test("completed receipt names each ignore file and marks a count at the bound as a lower bound", () => {
+  const base = {
+    includedFileCount: 3,
+    includedBytes: 30,
+    excludedRegenerableCount: 0,
+    excludedRegenerableByCategory: {
+      thirdPartyDependencies: 0,
+      caches: 0,
+      buildArtifacts: 0,
+      otherRegenerable: 0,
+    },
+    keyWorkspaceEntries: { memoryMdPresent: false, notesPresent: false },
+  };
+  const none = { count: 0, fileCount: 0, bytes: 0 };
+  const receipt = (summary: Parameters<typeof formatAgentMigrationCompletedReceipt>[0]["summary"]) =>
+    formatAgentMigrationCompletedReceipt({
+      sourceMachineName: "Source",
+      targetMachineName: "Target",
+      supportRef: "mig_AAAAAAAAAAAAAAAAAAAAAA",
+      summary,
+    });
+
+  const twoFiles = receipt({
+    ...base,
+    excludedIgnored: { count: 4, fileCount: 9, bytes: 2_048, largest: [] },
+    excludedIgnoredBySource: {
+      userFile: none,
+      agentFile: { count: 3, fileCount: 8, bytes: 2_000 },
+      legacyFile: { count: 1, fileCount: 1, bytes: 48 },
+      wildcard: { count: 2, fileCount: 6, bytes: 1_500 },
+    },
+  });
+  assert.match(twoFiles, /Not moved, as listed in \.raftbackupignore and \.raftmigrateignore: 4 paths \(\.raftbackupignore 3, \.raftmigrateignore 1; of which 2 through \*\*\/ patterns\), 9 files \(2 KB\)\./);
+  assert.match(twoFiles, /按 \.raftbackupignore 和 \.raftmigrateignore 未迁移：4 个路径（\.raftbackupignore 3，\.raftmigrateignore 1；其中 2 个来自 \*\*\/ 通配），9 个文件（2 KB）。/);
+  assert.doesNotMatch(twoFiles, /at least|至少/);
+
+  const oneFile = receipt({
+    ...base,
+    excludedIgnored: { count: 2, fileCount: 5, bytes: 10, largest: [] },
+    excludedIgnoredBySource: {
+      userFile: none,
+      agentFile: { count: 2, fileCount: 5, bytes: 10 },
+      legacyFile: none,
+      wildcard: none,
+    },
+  });
+  assert.match(oneFile, /Not moved, as listed in \.raftbackupignore: 2 paths, 5 files \(10 bytes\)\./);
+  assert.doesNotMatch(oneFile, /raftmigrateignore|patterns/);
+
+  const allFiles = receipt({
+    ...base,
+    excludedIgnored: { count: 3, fileCount: 1, bytes: 1, largest: [] },
+    excludedIgnoredBySource: {
+      userFile: { count: 1, fileCount: 1, bytes: 1 },
+      agentFile: { count: 1, fileCount: 0, bytes: 0 },
+      legacyFile: { count: 1, fileCount: 0, bytes: 0 },
+      wildcard: none,
+    },
+  });
+  assert.match(allFiles, /as listed in \.raftbackupignore\.user, \.raftbackupignore and \.raftmigrateignore: 3 paths \(\.raftbackupignore\.user 1, \.raftbackupignore 1, \.raftmigrateignore 1\), 1 file \(1 bytes\)\./);
+  assert.match(allFiles, /按 \.raftbackupignore\.user、\.raftbackupignore 和 \.raftmigrateignore 未迁移/);
+
+  const wildcardOnly = receipt({
+    ...base,
+    excludedIgnored: { count: 4, fileCount: 4, bytes: 4, largest: [] },
+    excludedIgnoredBySource: {
+      userFile: none,
+      agentFile: { count: 4, fileCount: 4, bytes: 4 },
+      legacyFile: none,
+      wildcard: { count: 2, fileCount: 2, bytes: 2 },
+    },
+  });
+  assert.match(wildcardOnly, /as listed in \.raftbackupignore: 4 paths \(2 through \*\*\/ patterns\), 4 files/);
+  assert.match(wildcardOnly, /4 个路径（其中 2 个来自 \*\*\/ 通配），4 个文件/);
+
+  const atBound = receipt({
+    ...base,
+    excludedIgnored: { count: 1, fileCount: MAX_AGENT_MIGRATION_EXCLUDED_REGENERABLE_COUNT, bytes: 3 * 1024 ** 3, largest: [] },
+  });
+  assert.match(atBound, new RegExp(`as listed in \\.raftmigrateignore: 1 path, at least ${MAX_AGENT_MIGRATION_EXCLUDED_REGENERABLE_COUNT} files \\(3 GB or more\\)\\.`));
+  assert.match(atBound, new RegExp(`至少 ${MAX_AGENT_MIGRATION_EXCLUDED_REGENERABLE_COUNT} 个文件（3 GB 以上）`));
 });
 
 test("receipt sizes are readable binary units", () => {
@@ -1156,4 +1270,69 @@ test("failed receipt states the measured workspace size for size-limit failures 
   for (const detail of [null, "MIGRATION_TRANSPORT_LOST", "MIGRATION_OBJECT_STORE_ENTRY_COUNT_LIMIT_EXCEEDED:entryCount=x"]) {
     assert.doesNotMatch(formatAgentMigrationTerminalReceipt({ ...base, detail }), /raftmigrateignore/);
   }
+});
+
+test("a size failure names .raftbackupignore only for a source that advertises the user-ignore capability", () => {
+  const base = {
+    kind: "failed" as const,
+    sourceMachineName: "Source",
+    targetMachineName: "Target",
+    supportRef: "mig_AAAAAAAAAAAAAAAAAAAAAA",
+    reason: "MIGRATION_OBJECT_STORE_BUNDLE_TOO_LARGE",
+    detail: "MIGRATION_OBJECT_STORE_BUNDLE_TOO_LARGE:actualBytes=12884901888:maxBytes=10737418240:topEntries=data%2F,8589934592",
+  };
+  const oldWording = "To move it, delete what you no longer need or list it in .raftmigrateignore (listed paths are not moved), then ask for the migration to be retried.";
+  const newWording = "To move it, delete what you no longer need or list it in .raftbackupignore (listed paths are not moved; a `**/<name>` line skips every folder with that name), then ask for the migration to be retried.";
+
+  const newer = formatAgentMigrationTerminalReceipt({
+    ...base,
+    sourceCapabilities: [AGENT_MIGRATION_CAPABILITY, AGENT_MIGRATION_SOURCE_USER_IGNORE_CAPABILITY],
+  });
+  assert.ok(newer.split("\n").includes(newWording), newer);
+  assert.doesNotMatch(newer, /raftmigrateignore/);
+
+  // Older sources, and callers that don't know the source's capabilities, keep today's wording exactly.
+  for (const sourceCapabilities of [undefined, null, [], [AGENT_MIGRATION_CAPABILITY]]) {
+    const text = formatAgentMigrationTerminalReceipt({ ...base, sourceCapabilities });
+    assert.ok(text.split("\n").includes(oldWording), text);
+    assert.doesNotMatch(text, /raftbackupignore/);
+  }
+
+  // Not a size failure: no ignore file named, whatever the source supports.
+  assert.doesNotMatch(
+    formatAgentMigrationTerminalReceipt({ ...base, detail: "MIGRATION_TRANSPORT_LOST", sourceCapabilities: [AGENT_MIGRATION_SOURCE_USER_IGNORE_CAPABILITY] }),
+    /raftbackupignore|raftmigrateignore/,
+  );
+});
+
+test("failed size receipt offers the agent's own retry only when the source supports it and this was not the retry", () => {
+  const base = {
+    kind: "failed" as const,
+    sourceMachineName: "Source",
+    targetMachineName: "Studio",
+    supportRef: "mig_AAAAAAAAAAAAAAAAAAAAAA",
+    reason: "MIGRATION_OBJECT_STORE_ENTRY_COUNT_LIMIT_EXCEEDED",
+    detail: "MIGRATION_OBJECT_STORE_ENTRY_COUNT_LIMIT_EXCEEDED:entryCount=1060088:maxEntries=250000:topPathCounts=worktrees%2F,565351",
+  };
+  const retryable = formatAgentMigrationTerminalReceipt({ ...base, sourceCapabilities: [AGENT_MIGRATION_CAPABILITY, AGENT_MIGRATION_AGENT_RETRY_CAPABILITY] });
+  assert.match(retryable, /list it in \.raftmigrateignore \(listed paths are not moved\), then run `raft migration retry` \(once; it moves you to Studio again\)\./);
+  assert.doesNotMatch(retryable, /ask for the migration to be retried/);
+  // A source with both capabilities names .raftbackupignore and the retry command together.
+  const both = formatAgentMigrationTerminalReceipt({ ...base, sourceCapabilities: [AGENT_MIGRATION_SOURCE_USER_IGNORE_CAPABILITY, AGENT_MIGRATION_AGENT_RETRY_CAPABILITY] });
+  assert.match(both, /list it in \.raftbackupignore \(listed paths are not moved; a `\*\*\/<name>` line skips every folder with that name\), then run `raft migration retry` \(once; it moves you to Studio again\)\./);
+
+  // A source without the capability (or unknown capabilities): the wording every version supports.
+  for (const sourceCapabilities of [[AGENT_MIGRATION_CAPABILITY], null, undefined]) {
+    const text = formatAgentMigrationTerminalReceipt({ ...base, sourceCapabilities });
+    assert.match(text, /then ask for the migration to be retried\./);
+    assert.doesNotMatch(text, /raft migration retry/);
+  }
+
+  // The failed migration was the agent's one retry: a person starts the next one.
+  const retryFailed = formatAgentMigrationTerminalReceipt({ ...base, sourceCapabilities: [AGENT_MIGRATION_AGENT_RETRY_CAPABILITY], isRetry: true });
+  assert.match(retryFailed, /list it in \.raftmigrateignore \(listed paths are not moved\)\. The automatic retry also failed; a person needs to start the next migration\./);
+  assert.doesNotMatch(retryFailed, /raft migration retry|ask for the migration to be retried/);
+  // A retry that failed for another reason says so too.
+  const retryLost = formatAgentMigrationTerminalReceipt({ ...base, reason: "MIGRATION_TRANSPORT_LOST", detail: "MIGRATION_TRANSPORT_LOST", isRetry: true });
+  assert.match(retryLost, /^The automatic retry also failed; a person needs to start the next migration\.$/m);
 });

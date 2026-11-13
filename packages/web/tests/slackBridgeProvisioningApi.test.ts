@@ -9,7 +9,7 @@ import type {
   SlackBridgeProvisioningResponse,
   SlackBridgeSetupStage,
 } from "@botiverse/raft-shared";
-import { applyManagedSlackBridgeChannelPairs } from "../src/components/settings/slackBridgeProvisioning";
+import { applyManagedSlackBridgeChannelPairs, verifyAndEnableSlackBridge } from "../src/components/settings/slackBridgeProvisioning";
 import { createSlackBridgeProvisioningProvider } from "../src/components/settings/slackBridgeProvisioningApi";
 import type { SlackBridgeProvisioningHttpClient } from "../src/components/settings/slackBridgeProvisioningApi";
 
@@ -56,14 +56,15 @@ function response(stage: SlackBridgeSetupStage): SlackBridgeProvisioningResponse
 }
 
 test("production adapter drives the typed provisioning paths and returns current OAuth authority", async () => {
-  const calls: Array<{ method: string; url: string; body?: unknown }> = [];
+  const calls: Array<{ method: string; url: string; body?: unknown; withCredentials?: boolean }> = [];
+  let enabled = false;
   const client: SlackBridgeProvisioningHttpClient = {
     async get(url) {
       calls.push({ method: "GET", url });
-      return { data: response("connect") };
+      return { data: response(enabled ? "health" : "connect") };
     },
-    async post(url, body) {
-      calls.push({ method: "POST", url, body });
+    async post(url, body, config) {
+      calls.push({ method: "POST", url, body, ...(config ? { withCredentials: config.withCredentials } : {}) });
       if (url.endsWith("/connect")) return { data: response("oauth") };
       if (url.endsWith("/oauth/start")) {
         return {
@@ -74,7 +75,10 @@ test("production adapter drives the typed provisioning paths and returns current
         };
       }
       if (url.endsWith("/preflight")) return { data: response("enable") };
-      if (url.endsWith("/enable")) return { data: response("health") };
+      if (url.endsWith("/enable")) {
+        enabled = true;
+        return { data: response("health") };
+      }
       if (url.endsWith("/disconnect")) {
         slackBridgeDisconnectRequestSchema.parse(body);
         return { data: response("connect") };
@@ -102,7 +106,7 @@ test("production adapter drives the typed provisioning paths and returns current
   assert.equal((await provider.disconnect!(7)).snapshot.stage, "connect");
 
   assert.deepEqual(calls, [
-    { method: "GET", url: "/slack-bridge/provisioning" },
+    { method: "GET", url: "/slack-bridge/provisioning?deliveryHealth=1&pairDeliveryHealth=1&workspaceAdminHint=1&confirmationHint=1&privateAuthorizerHint=1&attachmentSourceHealth=1&inboundRecovery=1&cardEditNotices=1" },
     { method: "POST", url: "/slack-bridge/provisioning/connect", body: undefined },
     {
       method: "POST",
@@ -112,6 +116,8 @@ test("production adapter drives the typed provisioning paths and returns current
         serverGrantId: "22222222-2222-4222-8222-222222222222",
         grantEpoch: 7,
       },
+      // The start response's browser-binding cookie must be stored.
+      withCredentials: true,
     },
     {
       method: "PUT",
@@ -120,6 +126,7 @@ test("production adapter drives the typed provisioning paths and returns current
     },
     { method: "POST", url: "/slack-bridge/provisioning/preflight", body: undefined },
     { method: "POST", url: "/slack-bridge/provisioning/enable", body: undefined },
+    { method: "GET", url: "/slack-bridge/provisioning?deliveryHealth=1&pairDeliveryHealth=1&workspaceAdminHint=1&confirmationHint=1&privateAuthorizerHint=1&attachmentSourceHealth=1&inboundRecovery=1&cardEditNotices=1" },
     {
       method: "POST",
       url: "/slack-bridge/provisioning/disconnect",
@@ -195,8 +202,9 @@ test("managed replacement crosses strict DELETE before PUT, preflight, and enabl
     bindingEpoch: 12,
   }];
   const calls: Array<{ method: string; body?: unknown }> = [];
+  let didEnable = false;
   const client: SlackBridgeProvisioningHttpClient = {
-    async get() { return { data: baseline }; },
+    async get() { return { data: didEnable ? enabled : baseline }; },
     async delete(_url, options) {
       calls.push({ method: "DELETE", body: options?.data });
       slackBridgeChannelPairRemovalsRequestSchema.parse(options?.data);
@@ -213,6 +221,7 @@ test("managed replacement crosses strict DELETE before PUT, preflight, and enabl
       }
       if (url.endsWith("/enable")) {
         calls.push({ method: "ENABLE" });
+        didEnable = true;
         return { data: enabled };
       }
       throw new Error(`unexpected POST ${url}`);
@@ -384,11 +393,11 @@ test("re-authorization starts OAuth from a connected snapshot and never from set
     grantEpoch: 7,
   };
   let current: SlackBridgeProvisioningResponse = { ...response("health"), oauthAuthority: authority };
-  const posts: Array<{ url: string; body?: unknown }> = [];
+  const posts: Array<{ url: string; body?: unknown; withCredentials?: boolean }> = [];
   const client: SlackBridgeProvisioningHttpClient = {
     async get() { return { data: current }; },
-    async post(url, body) {
-      posts.push({ url, body });
+    async post(url, body, config) {
+      posts.push({ url, body, ...(config ? { withCredentials: config.withCredentials } : {}) });
       return {
         data: {
           authorizationUrl: "https://slack.com/oauth/v2/authorize?state=reauth",
@@ -404,10 +413,89 @@ test("re-authorization starts OAuth from a connected snapshot and never from set
     kind: "redirect",
     url: "https://slack.com/oauth/v2/authorize?state=reauth",
   });
-  assert.deepEqual(posts, [{ url: "/slack-bridge/oauth/start", body: authority }]);
+  assert.deepEqual(posts, [{ url: "/slack-bridge/oauth/start", body: authority, withCredentials: true }]);
 
   current = response("connect");
   const view = await provider.beginReauthorization!();
   assert.equal(view.kind, "view");
   assert.equal(posts.length, 1, "a disconnected workspace must use Connect, not re-authorization");
+});
+
+
+test("delivery recovery sends the page's observed attempt version with its duplicate disclosure", async () => {
+  let sent: unknown;
+  const client: SlackBridgeProvisioningHttpClient = {
+    async get() { return { data: response("health") }; },
+    async put() { throw new Error("unexpected put"); },
+    async post(url, body) {
+      assert.equal(url, "/slack-bridge/provisioning/retry-delivery");
+      sent = body;
+      return { data: response("health") };
+    },
+  };
+  const provider = createSlackBridgeProvisioningProvider(client);
+  await provider.retryDelivery!({ bindingId: "binding-1", bindingEpoch: 3, deliveryId: "delivery-1", providerAttempts: 4 });
+  assert.deepEqual(sent, { bindingId: "binding-1", bindingEpoch: 3, deliveryId: "delivery-1",
+    expectedProviderAttempts: 4, duplicateRiskAcknowledged: true });
+});
+
+
+test("verification re-reads opted-in delivery health before returning its successful view", async () => {
+  const stalled = response("health");
+  stalled.snapshot.rawHealth.bindings = [{
+    id: "binding-1", state: "active", bindingEpoch: 7,
+    stateReason: null, recoveryAction: "none",
+  }];
+  stalled.snapshot.channelPairs[0]!.bindingEpoch = 7;
+  stalled.snapshot.rawHealth.outboundDeliveries = [{
+    bindingId: "binding-1", bindingEpoch: 7, raftChannelId: "raft-general",
+    deliveryId: "delivery-1", providerAttempts: 1, state: "dead", retryRequested: false,
+  }];
+  stalled.snapshot.rawHealth.failingSurface = "delivery";
+  const calls: string[] = [];
+  const provider = createSlackBridgeProvisioningProvider({
+    async get(url) {
+      calls.push(url);
+      return { data: stalled };
+    },
+    async post(url) {
+      calls.push(url);
+      return { data: response(url.endsWith("/preflight") ? "enable" : "health") };
+    },
+    async put() { throw new Error("unexpected put"); },
+  });
+  const view = await verifyAndEnableSlackBridge(provider);
+  assert.deepEqual(view.snapshot.rawHealth.outboundDeliveries, stalled.snapshot.rawHealth.outboundDeliveries);
+  assert.equal(view.snapshot.rawHealth.failingSurface, "delivery");
+  assert.deepEqual(calls, [
+    "/slack-bridge/provisioning/preflight",
+    "/slack-bridge/provisioning/enable",
+    "/slack-bridge/provisioning?deliveryHealth=1&pairDeliveryHealth=1&workspaceAdminHint=1&confirmationHint=1&privateAuthorizerHint=1&attachmentSourceHealth=1&inboundRecovery=1&cardEditNotices=1",
+  ]);
+});
+
+test("inbound recovery requests negotiated health and replays only the selected event", async () => {
+  let read = ""; let sent: unknown;
+  const client: SlackBridgeProvisioningHttpClient = {
+    async get(url) { read = url; return { data: response("health") }; },
+    async put() { throw new Error("unexpected put"); },
+    async post(url, body) {
+      assert.equal(url, "/slack-bridge/provisioning/replay-inbound");
+      sent = body; return { data: response("health") };
+    },
+  };
+  const provider = createSlackBridgeProvisioningProvider(client);
+  await provider.load(); assert.match(read, /(?:\?|&)inboundRecovery=1(?:&|$)/);
+  await provider.replayInbound!({ bindingId: "binding-1", bindingEpoch: 3, eventId: "event-1" });
+  assert.deepEqual(sent, { bindingId: "binding-1", bindingEpoch: 3, eventId: "event-1" });
+  await provider.replayInbound!({ bindingId: "binding-1", bindingEpoch: 3, reason: "bot_identity_pending" });
+  assert.deepEqual(sent, { bindingId: "binding-1", bindingEpoch: 3, reason: "bot_identity_pending" });
+});
+
+test("production adapter accepts a connected workflow without a health snapshot", async () => {
+  const value = response("connect");
+  value.snapshot.rawHealth = null;
+  const provider = createSlackBridgeProvisioningProvider({ async get() { return { data: value }; },
+    async post() { throw new Error("unexpected post"); }, async put() { throw new Error("unexpected put"); } });
+  assert.equal((await provider.load()).snapshot.rawHealth, null);
 });

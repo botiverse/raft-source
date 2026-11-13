@@ -1,16 +1,21 @@
 import { publishChannelUpdate } from "./channelRealtimeEvents";
+import { AGENT_KIND_RULES, agentKindOf } from "./agentMemberListPolicy";
 import { socketUserServerRoom } from "../socket/platformScope";
 import { ALL_CHANNEL_TEAM_THRESHOLD, currentDate, isExternalAgentRuntime, referralSourceLabel, signupRoleLabel } from "@botiverse/raft-shared";
 import type { Server as SocketServer } from "socket.io";
 import { createHash } from "node:crypto";
+import { and, eq } from "drizzle-orm";
 import type { AgentOrchestrator } from "./agentOrchestrator";
 import { getDb } from "../db/index";
 import * as agentService from "./agentService";
 import * as channelService from "./channelService";
-import * as featureFlagService from "./featureFlagService";
 import * as messageService from "./messageService";
 import * as serverService from "./serverService";
-import { getStorage } from "./storageService";
+import {
+  buildServerAttachmentStorageKey,
+  canWriteDedicatedAttachmentKeys,
+  getStorage,
+} from "./storageService";
 import * as userService from "./userService";
 import { createAppReminder } from "../apps/reminder/crud";
 import { getHostedOnboardingAgentState } from "./hostedCindyService";
@@ -22,10 +27,8 @@ import {
   createAttachmentTransferIntent,
 } from "./attachmentTransferIntentService";
 import { ATTACHMENT_TRANSFER_INTENT_TTL_MS } from "./attachmentUploadWriterService";
+import { attachmentTransferArtifacts } from "../db/schema";
 
-type OnboardingKind = "owner" | "member";
-
-export const ONBOARDING_OPENER_V2_FEATURE_FLAG_KEY = featureFlagService.ONBOARDING_OPENER_V2_FEATURE_FLAG_KEY;
 const OWNER_OPENER_V2_VERSION = "owner-opener-v2.0";
 const OWNER_OPENER_V2_TOPICS = [
   "language_preference",
@@ -108,7 +111,6 @@ type OnboardingServiceDeps = {
   broadcastSystemMessage: typeof messageService.broadcastSystemMessage;
   deliverSystemNoticeToAgent: typeof messageService.deliverSystemNoticeToAgent;
   broadcastAndDeliver: typeof messageService.broadcastAndDeliver;
-  evaluateFeatureFlag: typeof featureFlagService.evaluateFeatureFlag;
   createOwnerOpenerArtifactAttachment: (input: {
     serverId: string;
     channelId: string;
@@ -144,7 +146,6 @@ const defaultOnboardingServiceDeps: OnboardingServiceDeps = {
   broadcastSystemMessage: messageService.broadcastSystemMessage,
   deliverSystemNoticeToAgent: messageService.deliverSystemNoticeToAgent,
   broadcastAndDeliver: messageService.broadcastAndDeliver,
-  evaluateFeatureFlag: featureFlagService.evaluateFeatureFlag,
   createOwnerOpenerArtifactAttachment,
   getServer: serverService.getServer,
   getServerOnboardingSettings: serverService.getServerOnboardingSettings,
@@ -240,6 +241,25 @@ async function ensureOnboardingDay2Reminder(input: {
   return true;
 }
 
+/**
+ * The key the owner opener's HTML is written under. A replay keeps the key its
+ * first attempt persisted (an opener made before the move stays where it is);
+ * a fresh one takes an `attachments/v2/` key where the dedicated attachment
+ * bucket exists, so it no longer lands in the legacy bucket.
+ */
+export function ownerOpenerStorageKey(input: {
+  persisted: string | null;
+  dedicated: boolean;
+  serverId: string;
+  id: string;
+  objectId: string;
+}): string {
+  if (input.persisted) return input.persisted;
+  return input.dedicated
+    ? buildServerAttachmentStorageKey(input.serverId, input.id, input.objectId, ".html")
+    : `${input.serverId}/onboarding/${input.id}.html`;
+}
+
 async function createOwnerOpenerArtifactAttachment(input: {
   serverId: string;
   channelId: string;
@@ -257,9 +277,22 @@ async function createOwnerOpenerArtifactAttachment(input: {
   const filename = "team-mode.html";
   const mimeType = "text/html";
   const contentHash = createHash("sha256").update(buffer).digest("hex");
-  const storageKey = `${input.serverId}/onboarding/${id}.html`;
   const objectId = stableUuid(`${OWNER_OPENER_V2_VERSION}:${input.serverId}:${input.targetUserId}:team-mode:object`);
   const transferIntentId = stableUuid(`${OWNER_OPENER_V2_VERSION}:${input.serverId}:${input.targetUserId}:team-mode:transfer`);
+  const [persistedOriginal] = await getDb().select({ storageKey: attachmentTransferArtifacts.storageKey })
+    .from(attachmentTransferArtifacts)
+    .where(and(
+      eq(attachmentTransferArtifacts.intentId, transferIntentId),
+      eq(attachmentTransferArtifacts.role, "original"),
+    ))
+    .limit(1);
+  const storageKey = ownerOpenerStorageKey({
+    persisted: persistedOriginal?.storageKey ?? null,
+    dedicated: canWriteDedicatedAttachmentKeys(),
+    serverId: input.serverId,
+    id,
+    objectId,
+  });
   const now = currentDate();
 
   await createAttachmentTransferIntent({
@@ -298,57 +331,26 @@ async function createOwnerOpenerArtifactAttachment(input: {
   return { id: attachment.id, filename: attachment.filename };
 }
 
-function buildOnboardingInstruction(
-  kind: OnboardingKind,
+function buildMemberOnboardingInstruction(
   userName: string,
   locationHint: string,
   roleLabel?: string | null,
 ) {
-  const scopeLine = kind === "owner"
-    ? "This is the server owner's onboarding."
-    : "This is a new human member onboarding.";
-
-  const base = [
+  return [
     "Onboarding task (system-triggered):",
-    scopeLine,
+    "This is a new human member onboarding.",
     `Please proactively onboard @${userName} in ${locationHint}.`,
     // The signup survey asked them what they do. Hand it over, so the answer buys
     // them something instead of just landing in a table.
     ...(roleLabel ? [`They told us their role is: ${roleLabel}. Pitch Raft and pick a starting point that fits that.`] : []),
     "Default language is English; first ask what language they prefer.",
-  ];
-
-  if (kind === "member") {
-    return [
-      ...base,
-      "Goals (soft guidance, do not force):",
-      "1) Help them understand what Raft is and what this server is for.",
-      "2) Introduce relevant humans/channels/agents for their current work (not a full catalog dump).",
-      "3) Suggest where they should start collaborating right away.",
-      "Do NOT ask them to set up the server or create agents/channels.",
-      "If they are already working on a concrete task, keep onboarding lightweight and adapt to their flow.",
-    ].join("\n");
-  }
-
-  return [
-    ...base,
     "Goals (soft guidance, do not force):",
-    "1) Help them understand what is Raft and get comfortable working with Raft.",
-    "2) Help them set up this server for real work, with an initial agent team (target: at least 3 agents) and practical channels.",
-    "3) If they have no clear idea yet, proactively suggest asking Cindy for inspiration and give one simple starter path.",
-    "After the first agent exists, point them to the real onboarding wizard steps for inviting teammates and joining the Raft Community; do not invent action cards.",
-    "Keep it simple and conversational: no info dumps, no checklist-style interrogation, one actionable next step at a time.",
-    "",
-    "When the owner agrees to a new channel or agent, post a quick-commit action card with `raft action prepare` instead of just describing it or sending a copyable spec. The action-card flow is documented in your `notes/onboarding_playbook.md` (Starter Plan Output) and `notes/onboarding_knowledge_faq.md` (FAQ 15) — follow the playbook contract.",
+    "1) Help them understand what Raft is and what this server is for.",
+    "2) Introduce relevant humans/channels/agents for their current work (not a full catalog dump).",
+    "3) Suggest where they should start collaborating right away.",
+    "Do NOT ask them to set up the server or create agents/channels.",
+    "If they are already working on a concrete task, keep onboarding lightweight and adapt to their flow.",
   ].join("\n");
-}
-
-function buildAllChannelIntroMessage(agentName: string, agentDescription?: string | null) {
-  const role = agentDescription?.trim();
-  if (role) {
-    return `Hi, I'm ${agentName}. I'm here as ${role}. I can help you get oriented and turn the next setup step into something concrete. What language would you like to use?`;
-  }
-  return `Hi, I'm ${agentName}. I can help you set up this Raft server, invite teammates, and create the first useful agents. What language would you like to use?`;
 }
 
 function normalizeMemberOnboardingChannelName(userName: string): string {
@@ -448,16 +450,6 @@ async function findOwnerOnboardingChannel(serverId: string, ownerUserId: string)
   return (await deps.listChannels(serverId, ownerUserId)).find((ch) => (
     (ch.type === "channel" || ch.type === "private") && ch.name === "onboarding-owner"
   )) ?? null;
-}
-
-async function isOwnerOpenerV2Enabled(serverId: string, ownerUserId: string) {
-  const deps = resolveOnboardingServiceDeps();
-  const evaluation = await deps.evaluateFeatureFlag({
-    key: ONBOARDING_OPENER_V2_FEATURE_FLAG_KEY,
-    serverId,
-    userId: ownerUserId,
-  });
-  return evaluation.enabled;
 }
 
 export function buildOwnerOpenerV2Messages(userName: string, opts: { hosted?: boolean } = {}) {
@@ -650,45 +642,6 @@ async function sendOwnerOpenerV2(
   };
 }
 
-export async function triggerAgentIntroInAllChannel(
-  io: SocketServer,
-  agentOrchestrator: AgentOrchestrator,
-  serverId: string,
-  agentId: string,
-) {
-  const deps = resolveOnboardingServiceDeps();
-
-  const agent = await deps.getAgent(agentId);
-  if (!agent || agent.serverId !== serverId) return false;
-  if (agent.allChannelIntroSentAt) return false;
-
-  const settings = await deps.getServerOnboardingSettings(serverId);
-  if (!settings?.agentAllChannelGreetingEnabled) return false;
-
-  const allChannel = await ensureAllChannel(serverId);
-  if (!allChannel) return false;
-
-  const claimedAt = new Date();
-  const claimed = await deps.tryMarkAllChannelIntroSent(agentId, claimedAt);
-  if (!claimed) return false;
-
-  try {
-    const senderName = agent.displayName || agent.name;
-    // slack-bridge-ordinary-message-producer: onboarding.all_channel_intro
-    await deps.broadcastAndDeliver(io, agentOrchestrator, {
-      channelId: allChannel.id,
-      senderType: "agent",
-      senderId: agent.id,
-      senderName,
-      content: buildAllChannelIntroMessage(senderName, agent.description),
-    });
-    return true;
-  } catch (err) {
-    await deps.clearAllChannelIntroSentClaim(agentId, claimedAt).catch(() => {});
-    throw err;
-  }
-}
-
 function buildAllChannelAgenticGreetingInstruction(channelName: string) {
   return [
     "Onboarding task (system-triggered):",
@@ -700,15 +653,13 @@ function buildAllChannelAgenticGreetingInstruction(channelName: string) {
 }
 
 /**
- * Opener-v2 agentic #all greeting: when a newly created agent joins an already
- * unlocked #all, deliver a private instruction telling it to introduce itself,
- * and let the agent author its own greeting (no canned copy). Gated by the same
- * `agentAllChannelGreetingEnabled` server setting as the legacy canned intro.
+ * Agentic #all greeting: when a newly created agent joins an already unlocked
+ * #all, deliver a private instruction telling it to introduce itself, and let
+ * the agent author its own greeting (no canned copy). Gated by the
+ * `agentAllChannelGreetingEnabled` server setting.
  *
  * No-ops before #all is unlocked (ensureAllChannel returns null while #all is
  * still private), so the first agent (the OA) does not greet into a hidden #all.
- * The legacy non-opener-v2 flow keeps its canned intro via
- * `triggerAgentIntroInAllChannel`; this path is opener-v2 only.
  */
 export async function triggerNewAgentAllChannelGreeting(
   io: SocketServer,
@@ -717,9 +668,6 @@ export async function triggerNewAgentAllChannelGreeting(
   agentId: string,
 ) {
   const deps = resolveOnboardingServiceDeps();
-
-  const openerFlag = await deps.evaluateFeatureFlag({ key: ONBOARDING_OPENER_V2_FEATURE_FLAG_KEY, serverId });
-  if (!openerFlag.enabled) return false;
 
   const agent = await deps.getAgent(agentId);
   if (!agent || agent.serverId !== serverId) return false;
@@ -757,37 +705,16 @@ export async function triggerNewAgentAllChannelGreeting(
   }
 }
 
-async function sendOnboardingInstruction(
+async function sendMemberOnboardingInstruction(
   io: SocketServer,
   agentOrchestrator: AgentOrchestrator,
   serverId: string,
   targetUserId: string,
   onboardingAgentId: string,
-  kind: OnboardingKind,
 ) {
   const deps = resolveOnboardingServiceDeps();
   const user = await deps.getUser(targetUserId);
   if (!user) return false;
-
-  if (kind === "owner") {
-    const allChannel = await ensureAllChannel(serverId);
-    if (!allChannel) return false;
-
-    const content = buildOnboardingInstruction(kind, user.name, `#${allChannel.name} channel`, signupRoleLabel(user.signupRole));
-    // Agent-only wake, NOT a channel broadcast. This text is Cindy's briefing —
-    // it names her playbook files and CLI commands — and it was being written
-    // into #all as a system message, so every human read her whole prompt.
-    // `deliverSystemNoticeToAgent` exists for exactly this: same system sender,
-    // wakes the agent, writes no chat history.
-    await deps.deliverSystemNoticeToAgent(agentOrchestrator, onboardingAgentId, {
-      serverId,
-      channel_id: allChannel.id,
-      channel_name: allChannel.name,
-      channel_type: "channel",
-      content,
-    });
-    return true;
-  }
 
   const server = await deps.getServer(serverId);
   if (!server) return false;
@@ -805,8 +732,10 @@ async function sendOnboardingInstruction(
     .in(socketUserServerRoom(targetUserId, serverId))
     .socketsJoin(`channel:${onboardingChannel.id}`);
 
-  const content = buildOnboardingInstruction(kind, user.name, `#${onboardingChannel.name} channel`, signupRoleLabel(user.signupRole));
-  // Same reasoning as the owner branch: brief the agent, do not publish the brief.
+  const content = buildMemberOnboardingInstruction(user.name, `#${onboardingChannel.name} channel`, signupRoleLabel(user.signupRole));
+  // Agent-only wake, NOT a channel broadcast: brief the agent, do not publish
+  // the brief. `deliverSystemNoticeToAgent` uses the system sender, wakes the
+  // agent, and writes no chat history.
   await deps.deliverSystemNoticeToAgent(agentOrchestrator, onboardingAgentId, {
     serverId,
     channel_id: onboardingChannel.id,
@@ -830,22 +759,11 @@ export async function triggerOwnerOnboardingOnAgentActivation(
 
   // A hosted Cindy (antiproton_cindy) is never "started": she can receive once
   // the provider accepted her AND her workspace import landed (`ready`). Only
-  // the server's onboarding agent, only under the flag; she always takes the
-  // opener-v2 path, the only one that briefs her with the owner's facts.
+  // the server's onboarding agent.
   const activatedAgent = server.onboardingAgentId === activatedAgentId ? await deps.getAgent(activatedAgentId) : null;
   const hostedState = activatedAgent && isExternalAgentRuntime(activatedAgent.runtime)
     ? await deps.getHostedOnboardingAgentState(serverId, activatedAgentId)
     : null;
-
-  const openerV2Enabled = hostedState !== null || await isOwnerOpenerV2Enabled(serverId, server.ownerId);
-  if (!openerV2Enabled) {
-    try {
-      await triggerAgentIntroInAllChannel(io, agentOrchestrator, serverId, activatedAgentId);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.warn(`[Onboarding] Failed to trigger #all intro for agent ${activatedAgentId}: ${msg}`);
-    }
-  }
 
   // Do not brief her yet if the owner has not answered the signup survey.
   //
@@ -866,14 +784,10 @@ export async function triggerOwnerOnboardingOnAgentActivation(
   // It only suppresses setup modal reminders on the web UI, not system
   // onboarding task triggers.
   if (!ownerPrefs) return false;
-  if (openerV2Enabled) {
-    // An existing opener stops only the visible opener. The D2 reminder is a
-    // separate durable side effect and must keep retrying after a transient
-    // schedule failure.
-    if (!ownerPrefs.onboardingOwnerOpenerV2SentAt && ownerPrefs.onboardingDmSentAt) return false;
-  } else if (ownerPrefs.onboardingDmSentAt) {
-    return false;
-  }
+  // An existing opener stops only the visible opener. The D2 reminder is a
+  // separate durable side effect and must keep retrying after a transient
+  // schedule failure.
+  if (!ownerPrefs.onboardingOwnerOpenerV2SentAt && ownerPrefs.onboardingDmSentAt) return false;
 
   // Owner onboarding is only fired when server has an explicit onboarding agent
   // and that exact agent is currently activating.
@@ -896,98 +810,79 @@ export async function triggerOwnerOnboardingOnAgentActivation(
   // external agents keep this rule.
   if (onboardingAgent.status !== "active" && hostedState !== "ready") return false;
 
-  if (openerV2Enabled) {
-    if (ownerPrefs.onboardingOwnerOpenerV2SentAt) {
-      const ownerChannel = await findOwnerOnboardingChannel(serverId, server.ownerId);
-      await ensureOnboardingDay2Reminder({
-        deps,
-        orchestrator: agentOrchestrator,
-        serverId,
-        ownerId: server.ownerId,
-        onboardingAgentId: onboardingAgent.id,
-        openerSentAt: ownerPrefs.onboardingOwnerOpenerV2SentAt,
-        anchorMsgId: ownerPrefs.onboardingOwnerOpenerV2MessageIds[0],
-        targetChannelId: ownerChannel?.id,
-        owner: owner ?? {},
-      }).catch((err: unknown) => {
-        const msg = err instanceof Error ? err.message : String(err);
-        console.warn(`[Onboarding] Failed to schedule D2 recap reminder; next activation will retry: ${msg}`);
-      });
-      return false;
-    }
-
-    // One sender at a time: the import hook, the survey save, agent start and the
-    // setup backstop can all arrive together. Only the trigger that claims the
-    // opener briefs and posts it; a failed send releases the claim for a retry.
-    const claim = await deps.claimOwnerOpener(serverId, server.ownerId);
-    if (!claim) return false;
-    let opener: Awaited<ReturnType<typeof sendOwnerOpenerV2>>;
-    try {
-      // A hosted Cindy has no computer coming online to hand her the owner's facts on
-      // every wake (onboardingBriefingOnActivation); she keeps her session, so they go
-      // once, here, under the claim and ahead of the opener.
-      if (hostedState === "ready") {
-        await deliverOwnerFactsContext(agentOrchestrator, serverId, onboardingAgent.id, deps);
-      }
-      opener = await sendOwnerOpenerV2(
-        io,
-        agentOrchestrator,
-        serverId,
-        server.ownerId,
-        onboardingAgent.id,
-        { hosted: hostedState !== null },
-      );
-    } catch (error) {
-      await deps.releaseOwnerOpenerClaim(serverId, server.ownerId, claim);
-      throw error;
-    }
-    if (!opener) {
-      await deps.releaseOwnerOpenerClaim(serverId, server.ownerId, claim);
-      return false;
-    }
-
-    const sentAt = currentDate();
-    await deps.updateMemberOnboardingPreferences(serverId, server.ownerId, {
-      onboardingDmSentAt: sentAt,
-      onboardingDmSentByAgentId: onboardingAgent.id,
-      onboardingOwnerOpenerV2SentAt: sentAt,
-      onboardingOwnerOpenerV2SentByAgentId: onboardingAgent.id,
-      onboardingOwnerOpenerV2MessageIds: opener.messageIds,
-      onboardingOwnerOpenerV2Version: OWNER_OPENER_V2_VERSION,
-      onboardingOwnerOpenerV2Topics: OWNER_OPENER_V2_TOPICS,
-    });
-
+  if (ownerPrefs.onboardingOwnerOpenerV2SentAt) {
+    const ownerChannel = await findOwnerOnboardingChannel(serverId, server.ownerId);
     await ensureOnboardingDay2Reminder({
       deps,
       orchestrator: agentOrchestrator,
       serverId,
       ownerId: server.ownerId,
       onboardingAgentId: onboardingAgent.id,
-      openerSentAt: sentAt,
-      anchorMsgId: opener.messageIds[0],
-      targetChannelId: opener.channelId,
+      openerSentAt: ownerPrefs.onboardingOwnerOpenerV2SentAt,
+      anchorMsgId: ownerPrefs.onboardingOwnerOpenerV2MessageIds[0],
+      targetChannelId: ownerChannel?.id,
       owner: owner ?? {},
     }).catch((err: unknown) => {
       const msg = err instanceof Error ? err.message : String(err);
       console.warn(`[Onboarding] Failed to schedule D2 recap reminder; next activation will retry: ${msg}`);
     });
-
-    return true;
+    return false;
   }
 
-  const sent = await sendOnboardingInstruction(
-    io,
-    agentOrchestrator,
-    serverId,
-    server.ownerId,
-    onboardingAgent.id,
-    "owner",
-  );
-  if (!sent) return false;
+  // One sender at a time: the import hook, the survey save, agent start and the
+  // setup backstop can all arrive together. Only the trigger that claims the
+  // opener briefs and posts it; a failed send releases the claim for a retry.
+  const claim = await deps.claimOwnerOpener(serverId, server.ownerId);
+  if (!claim) return false;
+  let opener: Awaited<ReturnType<typeof sendOwnerOpenerV2>>;
+  try {
+    // A hosted Cindy has no computer coming online to hand her the owner's facts on
+    // every wake (onboardingBriefingOnActivation); she keeps her session, so they go
+    // once, here, under the claim and ahead of the opener.
+    if (hostedState === "ready") {
+      await deliverOwnerFactsContext(agentOrchestrator, serverId, onboardingAgent.id, deps);
+    }
+    opener = await sendOwnerOpenerV2(
+      io,
+      agentOrchestrator,
+      serverId,
+      server.ownerId,
+      onboardingAgent.id,
+      { hosted: hostedState !== null },
+    );
+  } catch (error) {
+    await deps.releaseOwnerOpenerClaim(serverId, server.ownerId, claim);
+    throw error;
+  }
+  if (!opener) {
+    await deps.releaseOwnerOpenerClaim(serverId, server.ownerId, claim);
+    return false;
+  }
 
+  const sentAt = currentDate();
   await deps.updateMemberOnboardingPreferences(serverId, server.ownerId, {
-    onboardingDmSentAt: new Date(),
+    onboardingDmSentAt: sentAt,
     onboardingDmSentByAgentId: onboardingAgent.id,
+    onboardingOwnerOpenerV2SentAt: sentAt,
+    onboardingOwnerOpenerV2SentByAgentId: onboardingAgent.id,
+    onboardingOwnerOpenerV2MessageIds: opener.messageIds,
+    onboardingOwnerOpenerV2Version: OWNER_OPENER_V2_VERSION,
+    onboardingOwnerOpenerV2Topics: OWNER_OPENER_V2_TOPICS,
+  });
+
+  await ensureOnboardingDay2Reminder({
+    deps,
+    orchestrator: agentOrchestrator,
+    serverId,
+    ownerId: server.ownerId,
+    onboardingAgentId: onboardingAgent.id,
+    openerSentAt: sentAt,
+    anchorMsgId: opener.messageIds[0],
+    targetChannelId: opener.channelId,
+    owner: owner ?? {},
+  }).catch((err: unknown) => {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.warn(`[Onboarding] Failed to schedule D2 recap reminder; next activation will retry: ${msg}`);
   });
 
   return true;
@@ -1008,13 +903,12 @@ export async function triggerNewMemberOnboarding(
   const onboardingAgent = await pickOnboardingAgent(serverId, null);
   if (!onboardingAgent) return false;
 
-  const sent = await sendOnboardingInstruction(
+  const sent = await sendMemberOnboardingInstruction(
     io,
     agentOrchestrator,
     serverId,
     userId,
     onboardingAgent.id,
-    "member",
   );
   if (!sent) return false;
 
@@ -1031,14 +925,12 @@ export async function triggerAllChannelUnlockOnboarding(
   serverId: string,
 ) {
   const deps = resolveOnboardingServiceDeps();
-  const openerFlag = await deps.evaluateFeatureFlag({ key: ONBOARDING_OPENER_V2_FEATURE_FLAG_KEY, serverId });
-  if (!openerFlag.enabled) return false;
-
   // #all unlocks once the server has grown into a team — total members
   // (humans + agents) >= 3. Baseline onboarding is owner (1 human) + the
   // Cindy OA (1 agent) = 2, so #all stays hidden until a 3rd member arrives,
   // whether that member is another agent OR another human.
-  const agentList = await deps.listAgents(serverId);
+  // The same count as the threshold that reveals #all (headcountAgent): a personal assistant is not a member.
+  const agentList = (await deps.listAgents(serverId)).filter((agent) => AGENT_KIND_RULES[agentKindOf(agent)].headcount);
   const humanMemberIds = await deps.listServerMemberIds(serverId);
   if (agentList.length + humanMemberIds.length < ALL_CHANNEL_TEAM_THRESHOLD) return false;
 
@@ -1099,9 +991,6 @@ export async function triggerCrossChannelHint(
   channelId: string,
 ) {
   const deps = resolveOnboardingServiceDeps();
-  const openerFlag = await deps.evaluateFeatureFlag({ key: ONBOARDING_OPENER_V2_FEATURE_FLAG_KEY, serverId });
-  if (!openerFlag.enabled) return false;
-
   const server = await deps.getServer(serverId);
   if (!server || server.ownerId !== senderUserId) return false;
 

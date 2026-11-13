@@ -1,16 +1,15 @@
 import { createHmac } from "node:crypto";
 import { GetParameterCommand, SSMClient } from "@aws-sdk/client-ssm";
-import { evaluateFeatureFlag } from "./featureFlagService";
+import { isPrivacyModeOn } from "../config/privacyMode";
 
 /**
  * Per-client Hands apps for product feedback (#raft-mobile-reconcile:6f867e95).
  *
- * With the `product_feedback_multi_app` flag off, every request uses today's
- * single-app configuration (`HANDS_FEEDBACK_*`), field for field. With it on,
- * each client source reads its own app from one SecureString JSON in SSM,
- * `/slock/<env>/HANDS_FEEDBACK_APPS`, whose name Terraform injects as
- * `HANDS_FEEDBACK_APPS_SSM_PARAMETER` together with the read grant. It is read at runtime
- * (like translation/ssmConfig.ts) and cached for five minutes, so a missing
+ * Web uses the single-app configuration (`HANDS_FEEDBACK_*`), field for field.
+ * Each mobile source reads its own app from one SecureString JSON in SSM,
+ * named by `HANDS_FEEDBACK_APPS_SSM_PARAMETER` (the deployment sets it together
+ * with the read grant). It is read at runtime
+ * and cached for five minutes, so a missing
  * parameter never blocks task start and a rotation needs no redeploy:
  *
  *   { "shared": { reporter_id_secret, route_subject_root, cursor_secret },
@@ -20,16 +19,13 @@ import { evaluateFeatureFlag } from "./featureFlagService";
  * The shared secrets are never the legacy ones. The result is an env view in
  * the legacy variable names, so the submit, conversation and route-binding
  * services stay unchanged. A mobile source whose entry is missing or
- * incomplete is unavailable (503) and never falls back to the legacy app; web
- * falls back to the legacy app, which is the web app.
+ * incomplete is unavailable (503) and never falls back to the legacy app.
  *
- * Do not add a `web` entry without a migration: web reporters would get a new
- * reporter id and route root, so their existing tickets would disappear from
- * the web list. The parameter uses the AWS-managed `aws/ssm` key; a customer
+ * Web never reads a `web` entry: web reporters would get a new reporter id and
+ * route root, so their existing tickets would disappear from the web list.
+ * Moving web needs a migration. The parameter uses the AWS-managed `aws/ssm` key; a customer
  * managed key also needs `kms:Decrypt` on the task role.
  */
-export const PRODUCT_FEEDBACK_MULTI_APP_FLAG = "product_feedback_multi_app";
-
 export const PRODUCT_FEEDBACK_SOURCES = ["web", "ios", "android", "ohos"] as const;
 export type ProductFeedbackSource = (typeof PRODUCT_FEEDBACK_SOURCES)[number];
 
@@ -146,15 +142,13 @@ export function productFeedbackEnvForSource(
 /** Pick the configuration a feedback request for `source` uses. */
 export function selectProductFeedbackEnv(input: {
   source: ProductFeedbackSource;
-  multiAppEnabled: boolean;
   appsJson: string | null;
   env?: NodeJS.ProcessEnv;
 }): NodeJS.ProcessEnv {
   const env = input.env ?? process.env;
-  if (!input.multiAppEnabled) return env;
+  if (input.source === "web") return env;
   const sourceEnv = productFeedbackEnvForSource(input.source, input.appsJson, env);
   if (sourceEnv) return sourceEnv;
-  if (input.source === "web") return env;
   throw new ProductFeedbackSourceUnavailableError(
     input.source,
     productFeedbackUnavailableReason(input.source, input.appsJson, env),
@@ -230,22 +224,38 @@ export function setProductFeedbackAppsForTest(apps: CachedProductFeedbackApps | 
   defaultApps = apps;
 }
 
-export async function resolveProductFeedbackEnv(input: {
-  userId: string;
+/**
+ * The apps JSON as cached now (null: unread or not configured), for a caller
+ * that selects several sources from one read (selectProductFeedbackEnv).
+ */
+export function readProductFeedbackAppsJson(apps: CachedProductFeedbackApps = productFeedbackApps()): Promise<string | null> {
+  return apps.get();
+}
+
+type ResolveProductFeedbackEnvInput = {
   source: ProductFeedbackSource;
   env?: NodeJS.ProcessEnv;
   apps?: CachedProductFeedbackApps;
-  evaluateFlag?: typeof evaluateFeatureFlag;
-}): Promise<NodeJS.ProcessEnv> {
-  const evaluation = await (input.evaluateFlag ?? evaluateFeatureFlag)({
-    key: PRODUCT_FEEDBACK_MULTI_APP_FLAG,
-    userId: input.userId,
-  });
-  if (!evaluation.enabled) return input.env ?? process.env;
-  return selectProductFeedbackEnv({
+};
+
+/**
+ * The configuration a feedback request for `source` uses, and whose Hands
+ * app that is (`app`, always `source`): web's is the legacy app, a mobile
+ * source's its own. A ticket lives in the app it was filed into and is read
+ * only through it.
+ */
+export async function resolveProductFeedbackApp(input: ResolveProductFeedbackEnvInput): Promise<{ env: NodeJS.ProcessEnv; app: ProductFeedbackSource }> {
+  if (input.source === "web") return { env: input.env ?? process.env, app: "web" };
+  // RAFT_PRIVACY_MODE: no SSM read; the caller's configuration check refuses.
+  if (isPrivacyModeOn()) return { env: input.env ?? process.env, app: input.source };
+  const env = selectProductFeedbackEnv({
     source: input.source,
-    multiAppEnabled: true,
     appsJson: await (input.apps ?? productFeedbackApps()).get(),
     env: input.env,
   });
+  return { env, app: input.source };
+}
+
+export async function resolveProductFeedbackEnv(input: ResolveProductFeedbackEnvInput): Promise<NodeJS.ProcessEnv> {
+  return (await resolveProductFeedbackApp(input)).env;
 }

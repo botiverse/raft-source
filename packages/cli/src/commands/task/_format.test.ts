@@ -3,7 +3,7 @@
 
 import assert from "node:assert/strict";
 
-import { formatMyTaskList, formatTaskList, formatTasksCreated, formatClaimResults, formatTaskUnclaimed, formatTaskStatusUpdated } from "./_format";
+import { formatMyTaskList, formatTaskList, formatTasksCreated, formatClaimResults, formatTaskUnclaimed, formatTaskStatusUpdated, formatTaskAssigned, formatTaskDeleted } from "./_format";
 
 test("formatTaskList: empty with no filter", () => {
   assert.equal(formatTaskList("#engineering", { tasks: [] }), "No tasks in #engineering.");
@@ -26,6 +26,7 @@ test("formatTaskList: single task with assignee and creator", () => {
         claimedById: "agent-1",
         claimedByName: "akko",
         createdByName: "xxchan",
+        createdByHandle: "xxchan",
         messageId: "abcd1234efgh5678",
       },
     ],
@@ -48,6 +49,7 @@ test("formatTaskList: departed creator is distinct while an active creator stays
         status: "todo",
         title: "live creator",
         createdByName: "alice",
+        createdByHandle: "alice",
         createdByMembershipStatus: "active",
         messageId: "1111111100000000",
       },
@@ -56,6 +58,7 @@ test("formatTaskList: departed creator is distinct while an active creator stays
         status: "todo",
         title: "historical creator",
         createdByName: "departed_alice",
+        createdByHandle: "departed_alice",
         createdByMembershipStatus: "removed",
         messageId: "2222222200000000",
       },
@@ -75,6 +78,7 @@ test("formatMyTaskList: departed creator state remains visible in the cross-chan
       title: "historical creator",
       channelRef: "#proj-release",
       createdByName: "departed_alice",
+      createdByHandle: "departed_alice",
       createdByMembershipStatus: "left",
       messageId: "2222222200000000",
     }],
@@ -113,8 +117,8 @@ test("formatTaskList: resource receipt state is visible", () => {
 test("formatTaskList: multiple tasks with mixed states", () => {
   const out = formatTaskList("#engineering", {
     tasks: [
-      { taskNumber: 1, status: "done", title: "set up repo", claimedById: "user-1", claimedByName: "bob", createdByName: "alice", messageId: "1111111100000000" },
-      { taskNumber: 2, status: "todo", title: "write tests", claimedByName: null, createdByName: "alice", messageId: "2222222200000000" },
+      { taskNumber: 1, status: "done", title: "set up repo", claimedById: "user-1", claimedByName: "bob", createdByName: "alice", createdByHandle: "alice", messageId: "1111111100000000" },
+      { taskNumber: 2, status: "todo", title: "write tests", claimedByName: null, createdByName: "alice", createdByHandle: "alice", messageId: "2222222200000000" },
       { taskNumber: 3, status: "in_progress", title: "fix flaky CI", claimedById: "agent-3", claimedByName: "akko", createdByName: null, messageId: "3333333300000000" },
     ],
   });
@@ -421,6 +425,7 @@ test("formatTaskList: a report-block title collapses to one physical line carryi
         claimedById: "agent-1",
         claimedByName: "HaoHao",
         createdByName: "RC",
+        createdByHandle: "RC",
         messageId: "983f3882aaaabbbb",
       },
     ],
@@ -445,6 +450,7 @@ test("formatTaskList: collapsing the title leaves the deliberate details block e
         claimedById: null,
         claimedByName: null,
         createdByName: "RC",
+        createdByHandle: "RC",
       },
     ],
   });
@@ -452,7 +458,7 @@ test("formatTaskList: collapsing the title leaves the deliberate details block e
   assert.equal(body.length, 3, `1 task line + 2 details lines expected, got:\n${body.join("\n")}`);
   assert.ok(body[0].startsWith("#5 ") && body[0].includes("line one line two"));
   assert.ok(body[1].startsWith("  Current description: first detail"));
-  assert.ok(body[2].startsWith("                       second detail"));
+  assert.ok(body[2].startsWith("  │ second detail"));
   assert.doesNotMatch(out, /\n  details:/);
 });
 
@@ -467,10 +473,168 @@ test("formatMyTaskList: the same report-block title stays on one line (task #123
         status: "in_review",
         title: REPORT_BLOCK_TITLE,
         createdByName: "RC",
+        createdByHandle: "RC",
         messageId: "983f3882aaaabbbb",
       },
     ],
   });
   const taskLines = out.split("\n").filter((l) => l.startsWith("- #wg-agent-issue task #4 "));
   assert.equal(taskLines.length, 1, `expected exactly 1 task line, got ${taskLines.length}`);
+});
+
+// Task v2 (server has task_v2_conversations_v0 on): a task is named by its
+// ref (`#channel:#7`) — it has its own conversation, or (pending) gets one on
+// its first write. No `conversation=` field; `source=` is the chat message it
+// came from. Tasks without either flag keep the exact pre-v2 bytes (pinned above).
+test("formatTaskList: task v2 tasks are named by their ref, with their source message", () => {
+  const out = formatTaskList("#proj-slock", {
+    tasks: [
+      {
+        taskNumber: 3,
+        status: "todo",
+        title: "hero section",
+        createdByName: "xxchan",
+        createdByHandle: "xxchan",
+        messageId: "33333333-0000-0000-0000-000000000000",
+        hostMessageId: null,
+        sourceMessageId: "src67890-0000-0000-0000-000000000000",
+        conversationAnchored: true,
+      },
+      {
+        taskNumber: 4,
+        status: "todo",
+        title: "pricing",
+        messageId: "44444444-0000-0000-0000-000000000000",
+        hostMessageId: null,
+        sourceMessageId: null,
+        conversationAnchored: true,
+      },
+    ],
+  });
+  assert.equal(
+    out,
+    [
+      "## Task Board for #proj-slock (2 tasks)",
+      "",
+      "#proj-slock:#3 [todo] (by @xxchan) source=src67890 Current title: hero section",
+      "#proj-slock:#4 [todo] Current title: pricing",
+    ].join("\n"),
+  );
+  assert.doesNotMatch(out, /conversation=|msg=/);
+});
+
+test("formatTaskList: a pre-v2 task with its own conversation names its earlier thread", () => {
+  const out = formatTaskList("dm:@cody", {
+    tasks: [{
+      taskNumber: 2,
+      status: "in_progress",
+      title: "old one",
+      messageId: "host1234-0000-0000-0000-000000000000",
+      hostMessageId: "host1234-0000-0000-0000-000000000000",
+      sourceMessageId: null,
+      conversationAnchored: true,
+    }],
+  });
+  assert.match(out, /^dm:@cody:#2 \[in_progress\] earlier=dm:@cody:host1234 Current title: old one$/m);
+});
+
+test("formatTasksCreated: task v2 tasks print their ref and the task reply command", () => {
+  const out = formatTasksCreated("#general", {
+    tasks: [{
+      taskNumber: 7,
+      messageId: "77777777-0000-0000-0000-000000000000",
+      title: "hero",
+      status: "todo",
+      claimedByType: null,
+      claimedById: null,
+      claimedAt: null,
+      conversationAnchored: true,
+      sourceMessageId: "src67890-0000-0000-0000-000000000000",
+    }],
+  });
+  assert.match(out, /^#general:#7 \[todo\] assignee=unassigned claimedAt=null source=src67890 "hero"$/m);
+  assert.match(out, /To discuss each task in its own conversation \(the reply body is read from stdin\):\n#general:#7 → raft task reply "#general:#7"$/);
+  assert.doesNotMatch(out, /msg=|conversation=|raft message send/);
+});
+
+test("formatClaimResults: task v2 results are named by ref and follow up with raft task reply", () => {
+  const out = formatClaimResults("#general", {
+    results: [
+      { taskNumber: 7, success: true, messageId: "77777777-0000-0000-0000-000000000000", taskRef: "#general:#7" },
+      { taskNumber: 8, success: false, reason: "already claimed", taskRef: "#general:#8" },
+    ],
+  });
+  assert.match(out, /^#general:#7: claimed$/m);
+  assert.match(out, /^#general:#8: FAILED — already claimed\./m);
+  assert.match(out, /Follow up in each task's conversation \(the reply body is read from stdin\):\n#general:#7 → raft task reply "#general:#7"\n/);
+  // Where to answer the person who asked: task view names the creator and the source.
+  assert.match(out, /Answer the person who asked where they spoke \(the source message's thread, or the task if they created it or wrote in it\); this shows who created the task and its source:\nraft task view "#general:#7"$/);
+  assert.doesNotMatch(out, /msg:|raft message send/);
+});
+
+test("formatTasksCreated: a task v2 task taken from a message points back to the message's thread", () => {
+  const out = formatTasksCreated("#general", {
+    tasks: [{
+      taskNumber: 7,
+      messageId: "77777777-0000-0000-0000-000000000000",
+      title: "hero",
+      status: "in_progress",
+      claimedByType: "agent",
+      claimedById: "agent-1",
+      claimedByName: "cody",
+      claimedAt: "2026-10-26T08:00:00.000Z",
+      conversationAnchored: true,
+      sourceMessageId: "src67890-0000-0000-0000-000000000000",
+    }],
+  });
+  assert.match(out, /To discuss each task in its own conversation \(the reply body is read from stdin\):\n#general:#7 → raft task reply "#general:#7"\n/);
+  assert.match(out, /The source message's thread now names this task\. If you have not confirmed it there yet \(what you understood and will do\), do it now:\n#general:#7 → raft message send --target "#general:src67890"/);
+});
+
+test("formatTaskStatusUpdated: a task v2 task moved to in_review is steered to done or in_progress, and where to answer", () => {
+  const out = formatTaskStatusUpdated(7, "in_review", "#general:#7");
+  assert.match(out, /^#general:#7 moved to in_review\.\n\nDon't leave it in in_review: it is no longer used\. Finished: set it done\. Waiting on someone's decision or input: set it in_progress, assign it to them/);
+  assert.match(out, /raft task view "#general:#7"$/);
+  const done = formatTaskStatusUpdated(7, "done", "#general:#7");
+  assert.match(done, /^#general:#7 moved to done\.\n\nNot sent the result yet\? Answer the person who asked where they spoke/);
+  assert.match(done, /raft task view "#general:#7"$/);
+  assert.equal(formatTaskStatusUpdated(7, "in_progress", "#general:#7"), "#general:#7 moved to in_progress.");
+});
+
+test("formatTaskList / formatMyTaskList: a pre-v2 task without its conversation on a task v2 server is named by ref", () => {
+  const task = {
+    taskNumber: 2,
+    status: "todo",
+    title: "old one",
+    messageId: "host1234-0000-0000-0000-000000000000",
+    sourceMessageId: "host1234-0000-0000-0000-000000000000",
+    conversationAnchored: false,
+    conversationPending: true,
+  };
+  const board = formatTaskList("#proj-slock", { tasks: [task] });
+  assert.match(board, /^#proj-slock:#2 \[todo\] source=host1234 Current title: old one$/m);
+  assert.doesNotMatch(board, /msg=host1234|conversation=/);
+  const mine = formatMyTaskList({ tasks: [{ ...task, channelRef: "#proj-slock" }] });
+  assert.match(mine, /^- #proj-slock:#2 \[todo\] source=host1234 /m);
+});
+
+test("task mutation receipts: the server's taskRef names the task (task v2); #N otherwise", () => {
+  assert.equal(formatTaskStatusUpdated(7, "closed", "#general:#7"), "#general:#7 moved to closed.");
+  assert.equal(formatTaskAssigned(7, "@cody", "#general:#7"), "#general:#7 assigned to @cody.");
+  assert.equal(formatTaskUnclaimed(7, "#general:#7"), "#general:#7 unclaimed — now open.");
+  assert.equal(formatTaskDeleted(7, "#general:#7"), "#general:#7 deleted.");
+  assert.equal(formatTaskStatusUpdated(7, "done"), "#7 moved to done.");
+});
+
+test("formatTaskList / formatMyTaskList: the creator is named by handle; a display name is never @-prefixed", () => {
+  const withHandle = { taskNumber: 7, status: "todo", title: "埋点", createdByName: "林晓", createdByHandle: "Developer", messageId: "abcd1234efgh5678" };
+  // A server from before `createdByHandle`: only the display name is known.
+  const displayOnly = { taskNumber: 8, status: "todo", title: "OG 图", createdByName: "周航", messageId: "bcde2345fghi6789" };
+  const board = taskBodyLines(formatTaskList("#proj-launch", { tasks: [withHandle, displayOnly] }));
+  assert.equal(board[0], "#7 [todo] (by @Developer) msg=abcd1234 Current title: 埋点");
+  assert.equal(board[1], "#8 [todo] (by 周航) msg=bcde2345 Current title: OG 图");
+  const mine = formatMyTaskList({ tasks: [{ ...withHandle, channelRef: "#proj-launch" }, { ...displayOnly, channelRef: "#proj-launch" }] });
+  assert.match(mine, /^- #proj-launch task #7 \[todo\] by=@Developer msg=abcd1234 Current title: 埋点$/m);
+  assert.match(mine, /^- #proj-launch task #8 \[todo\] by="周航" msg=bcde2345 Current title: OG 图$/m);
+  assert.doesNotMatch(`${board.join("\n")}\n${mine}`, /@(林晓|周航)/);
 });

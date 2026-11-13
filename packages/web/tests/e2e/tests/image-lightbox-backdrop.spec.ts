@@ -46,6 +46,20 @@ test("clicking outside the image closes the message image lightbox after zoom", 
   });
   expect(message.ok()).toBeTruthy();
 
+  // E2E serves the app and the API on different ports, and the API streams
+  // local-storage files with helmet's `Cross-Origin-Resource-Policy:
+  // same-origin`, so the browser blocks every <img> of an attachment
+  // (production redirects to presigned storage URLs instead). The lightbox
+  // shows its error state for an image that never loads, and this test needs
+  // one that renders: serve attachment images to the page without that header.
+  await page.route(`${seedState.urls.api}/api/attachments/**`, async (route) => {
+    if (route.request().resourceType() !== "image") return route.fallback();
+    const response = await route.fetch();
+    const headers = { ...response.headers() };
+    delete headers["cross-origin-resource-policy"];
+    await route.fulfill({ response, headers });
+  });
+
   await page.goto(`/s/${seedState.server.slug}/channel/${seedState.channel.id}`);
   await expect(page.getByText(tag)).toBeVisible();
   await page.getByLabel(`Preview ${filename}`).click();
@@ -54,14 +68,15 @@ test("clicking outside the image closes the message image lightbox after zoom", 
   await expect(lightbox).toBeVisible();
 
   const image = page.getByTestId("image-lightbox-image");
-  await image.click();
-  await expect(lightbox).toBeVisible();
-
   const imageBoxBeforeZoom = await image.boundingBox();
   expect(imageBoxBeforeZoom).toBeTruthy();
 
-  await image.dblclick();
+  // A single click on the image zooms instead of closing (#bug-triage task #12);
+  // wait for the animated zoom to commit before measuring.
+  await image.click();
+  await expect(lightbox).toBeVisible();
   await expect(image).not.toHaveCSS("transform", "none");
+  await expect.poll(() => image.evaluate((el) => (el as HTMLElement).style.transition)).toBe("");
 
   const imageBoxAfterZoom = await image.boundingBox();
   const stageBox = await page.getByTestId("image-lightbox-stage").boundingBox();
@@ -76,8 +91,17 @@ test("clicking outside the image closes the message image lightbox after zoom", 
   const zoomedVisualY = imageBoxAfterZoom.y + imageBoxAfterZoom.height / 2;
   expect(zoomedVisualX < imageBoxBeforeZoom.x || zoomedVisualX > beforeRight).toBeTruthy();
   expect(zoomedVisualX >= imageBoxAfterZoom.x && zoomedVisualX <= imageBoxAfterZoom.x + imageBoxAfterZoom.width).toBeTruthy();
+  // A click on the zoomed image's pixels outside its original box is still an
+  // image click: it zooms back to fit and does not close.
   await page.mouse.click(zoomedVisualX, zoomedVisualY);
   await expect(lightbox).toBeVisible();
+  await expect(image).toHaveCSS("transform", "none");
+  await expect.poll(() => image.evaluate((el) => (el as HTMLElement).style.transition)).toBe("");
+
+  // Zoom in again, so the blank click below proves a ZOOMED lightbox closes.
+  await image.click();
+  await expect(image).not.toHaveCSS("transform", "none");
+  await expect.poll(() => image.evaluate((el) => (el as HTMLElement).style.transition)).toBe("");
 
   const blankX = stageBox.x + 8;
   const blankY = stageBox.y + 8;
@@ -87,6 +111,7 @@ test("clicking outside the image closes the message image lightbox after zoom", 
     blankY < imageBoxAfterZoom.y ||
     blankY > imageBoxAfterZoom.y + imageBoxAfterZoom.height,
   ).toBeTruthy();
+  await expect(image).not.toHaveCSS("transform", "none");
   await page.mouse.click(blankX, blankY);
   await expect(lightbox).toHaveCount(0);
 });

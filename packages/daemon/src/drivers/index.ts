@@ -10,6 +10,7 @@ import { KimiDriver } from "./kimi";
 import { KimiSdkDriver } from "./kimi-sdk";
 import { OpenCodeDriver } from "./opencode";
 import { BuiltInDriver, PiDriver } from "./pi";
+import { OarOnlyDriver } from "./oarOnly";
 
 export type {
   RuntimeDriver,
@@ -21,15 +22,19 @@ export type {
   RuntimeExitInfo,
   RuntimeSendResult,
   RuntimeSessionDescriptor,
+  RuntimeSessionRotationHold,
+  RuntimeProviderCallSnapshot,
   RuntimeTurnAttribution,
+  RuntimeStopOptions,
 } from "./types";
-export { createChildProcessRuntimeSession, ChildProcessRuntimeSession } from "./runtimeSession";
+export { createChildProcessRuntimeSession, ChildProcessRuntimeSession, RUNTIME_OOM_SCORE_ADJ } from "./runtimeSession";
 export {
   allowedTranscriptRootsForRuntime,
   ensureRuntimeHomeDir,
   resolveRuntimeHomeDir,
   resolveRuntimeSessionRef,
   resolveRuntimeSessionRefDetailed,
+  runtimeTranscriptHomesForConfig,
   writeRuntimeLifecycleDiagnosticRecord,
   writeRuntimeTerminalCauseRecord,
   type RuntimeLifecycleDiagnosticEvent,
@@ -37,6 +42,7 @@ export {
   type RuntimeSessionRefResolution,
   type RuntimeSessionResolution,
   type RuntimeTerminalCausePhase,
+  type RuntimeTranscriptHomes,
 } from "./runtimeArtifacts";
 export {
   projectCompactionInterruptionTraceAttrs,
@@ -44,8 +50,11 @@ export {
   formatCompactionInterruption,
   projectStructuredRuntimeTerminalFailure,
 } from "../runtimeCompactionProjection";
-export { resolveClaudeCommand } from "./claude";
-export { buildCodexAppServerArgs, parseCodexJsonRpcLine, resolveCodexSpawn } from "./codex";
+export { readClaudeInstallationAsync, resolveClaudeCommand } from "./claude";
+export { buildCodexAppServerArgs, buildCodexInstructionShapeAttrs, buildCodexInstructionShapeStaticAttrs, type CodexInstructionObservationPhase, type CodexThreadRequestMethod, codexBlankFinalAnswerDiagnostic, codexCandidateTraceAttrs, codexMcpToolName, codexNotificationDiagnostics, parseCodexTelemetryEvent, CODEX_MANAGED_MCP_TOKEN_ENV, codexThreadFields, parseCodexJsonRpcLine, prepareCodexLaunch, resolveCodexSpawn, type CodexLaunchPreparation, type CodexThreadFields } from "./codex";
+export { ANTIGRAVITY_ENV_OVERRIDES, excludeFromWorkspaceGit, prepareAntigravityEnvironment, resolveAntigravitySpawn } from "./antigravity.deprecated";
+export { prepareGrokLaunch, type GrokLaunchPlan } from "./grok";
+export { isOarOnlyRuntimeId, OAR_ONLY_RUNTIMES, oarOnlyInstallation, prepareOarOnlyLaunchEnv, readOarOnlyCliVersion, type OarOnlyRuntimeId } from "./oarOnly";
 
 const driverFactories: Record<string, () => RuntimeDriver> = {
   builtin: () => new BuiltInDriver(),
@@ -69,11 +78,20 @@ const driverFactories: Record<string, () => RuntimeDriver> = {
   "kimi-sdk": () => new KimiSdkDriver(),
   opencode: () => new OpenCodeDriver(),
   pi: () => new PiDriver(),
+  // Run only on the OAR host (drivers/oarOnly.ts): no legacy driver exists.
+  qwen: () => new OarOnlyDriver("qwen"),
+  qoder: () => new OarOnlyDriver("qoder"),
+  codebuddy: () => new OarOnlyDriver("codebuddy"),
 };
 
 /** Every runtime id `getDriver` accepts. */
 export function registeredRuntimeIds(): string[] {
   return Object.keys(driverFactories);
+}
+
+/** The runtimes that are part of the Computer itself (`RuntimeDriver.shipsWithComputer`). */
+export function runtimeIdsShippedWithComputer(): Set<string> {
+  return new Set(registeredRuntimeIds().filter((id) => getDriver(id).shipsWithComputer === true));
 }
 
 /** Get the driver for a runtime ID. Throws if unknown. */
@@ -87,4 +105,6 @@ export function getDriver(runtimeId: string): RuntimeDriver {
 }
 
 // The release smoke loads the kimi SDK the way a launch does (computer native build).
-export { verifyBundledKimiSdk } from "./kimi-sdk";
+export { loadKimiSdk, verifyBundledKimiSdk } from "./kimi-sdk";
+// The web sign-in for Kimi Code runs on the same SDK, home and identity as its agents.
+export { kimiCodeHostIdentity, resolveKimiHome } from "./kimi-sdk";

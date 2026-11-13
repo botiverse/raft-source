@@ -1,6 +1,7 @@
 /**
  * Runtime form v2 batch 3a: Codex and Grok, the first forms that need client
- * capabilities (`select.custom_value`, `choice.labels`, `option_source.status`).
+ * capabilities (`select.custom_value`; `choice.labels` and `option_source.status`
+ * are always on and never listed).
  *
  * Oracles:
  * - the legacy web form: its runtimeConfig builder
@@ -63,7 +64,7 @@ test("codex and grok forms: fields by kind, capabilities, effort labels", () => 
         ["fastMode", "boolean", false, false],
         ["envVars", "string_map", false, true],
       ],
-      capabilities: ["select.custom_value", "choice.labels", "option_source.status"],
+      capabilities: ["select.custom_value"],
     },
     grok: {
       fields: [
@@ -71,7 +72,7 @@ test("codex and grok forms: fields by kind, capabilities, effort labels", () => 
         ["reasoningEffort", "derived_select", false, false],
         ["envVars", "string_map", false, true],
       ],
-      capabilities: ["choice.labels", "option_source.status"],
+      capabilities: [],
     },
   } as const;
   for (const [runtime, expected] of Object.entries(expectations)) {
@@ -252,7 +253,12 @@ test("every model option carries its efforts, resolved exactly like the legacy w
 
 // ── Forms without the capability keep their option-source behaviour ──
 
-test("status, customValueAllowed and choices appear only on forms that list the matching capability", async () => {
+// Runtimes whose model source keeps the pre-status body (no probe status);
+// every other model source says whether it is live (`option_source.status`,
+// always on, never listed).
+const UNPROBED_MODEL_RUNTIMES = new Set(["opencode", "kimi", "gemini"]);
+
+test("no form lists choice.labels or option_source.status; status follows the probe, customValueAllowed the listed capability", async () => {
   const outcomes: Array<[() => Promise<RuntimeModelSourceOutcome>, ("not_routed" | undefined)?]> = [
     [async () => ({ kind: "live", value: { models: LIVE } })],
     ...NON_LIVE_CASES.map(([, detect, , , routing]) => [detect, routing] as [() => Promise<RuntimeModelSourceOutcome>, ("not_routed" | undefined)?]),
@@ -262,11 +268,11 @@ test("status, customValueAllowed and choices appear only on forms that list the 
     const form = buildRuntimeFormV2(runtime);
     const capabilities = new Set(form.requiredClientCapabilities ?? []);
     const localization = form.uiSchema?.localization ?? {};
-    assert.equal(
-      Object.values(localization).some((copy) => copy && "choices" in copy),
-      capabilities.has("choice.labels"),
-      `${runtime}: choices iff choice.labels`,
-    );
+    assert.equal(capabilities.has("choice.labels"), false, `${runtime}: choice.labels is never required`);
+    assert.equal(capabilities.has("option_source.status"), false, `${runtime}: option_source.status is never required`);
+    for (const copy of Object.values(localization)) {
+      if (copy && "choices" in copy) assert.equal(typeof copy.choices, "object", `${runtime}: choices`);
+    }
     // A runtime that also has a v1 form must keep status off its v1 bodies:
     // v1 clients parse strictly and never asked for it.
     const hasV1 = runtimeFormV1Entry(runtime) !== null;
@@ -293,14 +299,15 @@ test("status, customValueAllowed and choices appear only on forms that list the 
         if (resolution.kind !== "source" || !resolution.source) continue;
         const source = resolution.source as unknown as Record<string, unknown>;
         for (const key of ["status", "reason", "retryable"]) {
-          if (!capabilities.has("option_source.status")) assert.equal(key in source, false, `${runtime}/${sourceId}: ${key}`);
+          if (UNPROBED_MODEL_RUNTIMES.has(runtime)) assert.equal(key in source, false, `${runtime}/${sourceId}: ${key}`);
         }
         if (!capabilities.has("select.custom_value")) assert.equal("customValueAllowed" in source, false, `${runtime}/${sourceId}: customValueAllowed`);
-        // The probed model source carries both whenever the form lists them. A
+        // A probed model source always carries status; customValueAllowed
+        // whenever the form lists select.custom_value. A
         // static source (Claude's provider select) has no probe to report on and
         // never allows a typed value (status omitted, customValueAllowed false).
         if (sourceId === "model") {
-          if (capabilities.has("option_source.status")) assert.ok(typeof source.status === "string", `${runtime}/${sourceId}: status`);
+          if (!UNPROBED_MODEL_RUNTIMES.has(runtime)) assert.ok(typeof source.status === "string", `${runtime}/${sourceId}: status`);
           assert.equal(source.customValueAllowed === true, capabilities.has("select.custom_value"), `${runtime}/${sourceId}: customValueAllowed`);
         } else {
           assert.equal("status" in source, false, `${runtime}/${sourceId}: a static source has no status`);

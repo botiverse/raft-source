@@ -20,7 +20,7 @@ export function UnarchiveChannelButton({
   const handleClick = useCallback(() => void onUnarchive(channel), [onUnarchive, channel]);
   return (
     <Button
-      size="sm"
+      size="md"
       variant="outline"
       className="w-full sm:w-auto"
       disabled={disabled}

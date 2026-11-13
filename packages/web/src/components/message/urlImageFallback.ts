@@ -1,11 +1,19 @@
 import type { MessageAttachment } from "../../store/messageStore";
+import { isHeicImageMimeType, normalizeImageMimeType } from "../../utils/imageMimeTypes";
 
 type ImageGalleryPreviewSource = Pick<MessageAttachment, "id" | "localPreviewUrl" | "thumbnailUrl" | "rasterPreviewUrl">;
 
 export function isPreviewableImageAttachment(att: MessageAttachment): boolean {
-  const mimeType = att.mimeType.split(";")[0].trim().toLowerCase();
+  const mimeType = normalizeImageMimeType(att.mimeType);
   if (mimeType === "image/svg+xml") {
     return Boolean(att.thumbnailUrl || att.rasterPreviewUrl);
+  }
+  // HEIC/HEIF previews only through a raster the browser can decode: the
+  // server thumbnail, or a local preview the composer already decoded. The raw
+  // file is never an inline source (broken image outside Safari), so without
+  // one it is a file card.
+  if (isHeicImageMimeType(mimeType)) {
+    return Boolean(att.thumbnailUrl || att.rasterPreviewUrl || att.localPreviewUrl);
   }
   return mimeType.startsWith("image/");
 }

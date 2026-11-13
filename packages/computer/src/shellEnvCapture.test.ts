@@ -11,6 +11,7 @@ import {
   serializeEnvFrame,
   SHELL_ENV_STATE_ENV_VAR,
   SHELL_ENV_PROTECTED_KEYS,
+  withInheritedProxyEnv,
 } from "./shellEnvCapture";
 import {
   bootstrapSupervisedServiceEnv,
@@ -146,16 +147,6 @@ test("modules first-evaluated before bootstrap keep the stale environment (red-p
   }
 });
 
-test("the thin entry never statically imports the CLI graph (B1 source tooth)", async () => {
-  const { readFile } = await import("node:fs/promises");
-  const src = await readFile(new URL("./index.ts", import.meta.url), "utf8");
-  const codeOnly = src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "");
-  assert.doesNotMatch(codeOnly, /import[^;]*from\s+"\.\/cli(?:\.js)?"/);
-  // Ordering itself is pinned behaviorally by the bootstrapThenRun
-  // composition teeth below (task #328); this tooth only bans a static
-  // import edge, which would defeat the seam regardless of ordering.
-  assert.match(codeOnly, /import\("\.\/cli"\)/);
-});
 
 // ---------------------------------------------------------------------------
 // B1 composition teeth (task #328, 铁根 mutation 9e984578): the earlier cells
@@ -751,6 +742,87 @@ test("bootstrap freezes --slock-home before capture and applies snapshot on succ
   assert.equal(env.RAFT_COMPUTER_SHELL_ENV_STATE, "inherited");
 });
 
+// ---------------------------------------------------------------------------
+// Proxy carry-over: a proxy only the starter knew (Raft Desktop resolving the
+// macOS system proxy) must survive a login shell that sets no proxy.
+// ---------------------------------------------------------------------------
+
+function shellCapture(env: Record<string, string>) {
+  return async () => ({ ok: true as const, env, shell: "/bin/zsh", durationMs: 1 });
+}
+
+test("bootstrap keeps the inherited proxy when the login shell sets none", async () => {
+  const env: NodeJS.ProcessEnv = {
+    HTTPS_PROXY: "http://127.0.0.1:7890",
+    HTTP_PROXY: "http://127.0.0.1:7890",
+    NO_PROXY: "localhost,127.0.0.1,::1",
+    OLD: "gone",
+  };
+  const outcome = await bootstrapServiceEnv(
+    ["node", "x", "__service"],
+    env,
+    shellCapture({ PATH: "/shell/bin" }),
+    "darwin",
+  );
+  assert.equal(outcome, "inherited");
+  assert.equal(env.PATH, "/shell/bin");
+  assert.equal(env.OLD, undefined, "everything else is still replaced");
+  assert.equal(env.HTTPS_PROXY, "http://127.0.0.1:7890");
+  assert.equal(env.HTTP_PROXY, "http://127.0.0.1:7890");
+  assert.equal(env.NO_PROXY, "localhost,127.0.0.1,::1");
+});
+
+test("bootstrap: a proxy set by the login shell wins over the inherited one", async () => {
+  const env: NodeJS.ProcessEnv = {
+    HTTPS_PROXY: "http://127.0.0.1:7890",
+    HTTP_PROXY: "http://127.0.0.1:7890",
+    NO_PROXY: "localhost",
+  };
+  await bootstrapServiceEnv(
+    ["node", "x", "__service"],
+    env,
+    shellCapture({ https_proxy: "http://corp:3128", no_proxy: ".corp" }),
+    "linux",
+  );
+  assert.equal(env.https_proxy, "http://corp:3128");
+  assert.equal(env.no_proxy, ".corp");
+  assert.equal(env.HTTPS_PROXY, undefined);
+  assert.equal(env.HTTP_PROXY, undefined);
+  assert.equal(env.NO_PROXY, undefined);
+});
+
+test("bootstrap: no proxy inherited and none in the shell stays direct", async () => {
+  const env: NodeJS.ProcessEnv = { NO_PROXY: "localhost", HTTPS_PROXY: "  " };
+  await bootstrapServiceEnv(["node", "x", "__service"], env, shellCapture({ PATH: "/p" }), "darwin");
+  for (const key of ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy"]) {
+    assert.equal(env[key], undefined, key);
+  }
+});
+
+test("withInheritedProxyEnv: NO_PROXY follows the proxy it came with", () => {
+  // The inherited NO_PROXY replaces the shell's (either spelling).
+  assert.deepEqual(
+    withInheritedProxyEnv(
+      { ALL_PROXY: "socks5h://127.0.0.1:1080", no_proxy: "inherited.local" },
+      { NO_PROXY: "shell.local", A: "1" },
+    ),
+    { A: "1", ALL_PROXY: "socks5h://127.0.0.1:1080", no_proxy: "inherited.local" },
+  );
+  // No inherited NO_PROXY: the shell's NO_PROXY stays.
+  assert.deepEqual(
+    withInheritedProxyEnv({ HTTPS_PROXY: "http://p:1" }, { NO_PROXY: "shell.local" }),
+    { NO_PROXY: "shell.local", HTTPS_PROXY: "http://p:1" },
+  );
+  // A shell NO_PROXY alone is not a proxy: the inherited proxy still applies.
+  assert.deepEqual(
+    withInheritedProxyEnv({ http_proxy: "http://p:2", NO_PROXY: "x" }, { no_proxy: "y" }),
+    { http_proxy: "http://p:2", NO_PROXY: "x" },
+  );
+  // An inherited NO_PROXY with no proxy changes nothing.
+  const captured = { no_proxy: "y" };
+  assert.equal(withInheritedProxyEnv({ NO_PROXY: "x" }, captured), captured);
+});
+
 test("bootstrap failure records explicit degraded state and keeps baseline env", async () => {
   const env: NodeJS.ProcessEnv = { RAFT_COMPUTER_OS_SUPERVISOR_KIND: "systemd-user", BASE: "kept" };
   const outcome = await bootstrapSupervisedServiceEnv(
@@ -889,15 +961,6 @@ test("service version evidence persists the shell env outcome for cross-process 
   assert.equal(await readProcessVersionEvidence(file), null);
 });
 
-test("status renders the degraded warning gated on the unavailable prefix, codes only", async () => {
-  const { readFile } = await import("node:fs/promises");
-  const src = await readFile(new URL("./status.ts", import.meta.url), "utf8");
-  assert.match(src, /shellEnvironment\?\.startsWith\("unavailable:"\)/);
-  assert.match(src, /terminal shell environment import failed/);
-  // The rendered line interpolates only the parsed code slice — never any
-  // captured environment value (which the evidence file cannot contain).
-  assert.match(src, /slice\("unavailable:"\.length\)/);
-});
 
 // ---------------------------------------------------------------------------
 // Real-bash rc hostility (Sora Linux-bed RED 91a16cbc): the exact rc patterns

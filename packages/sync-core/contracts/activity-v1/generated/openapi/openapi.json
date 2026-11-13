@@ -6,219 +6,6 @@
   },
   "tags": [],
   "paths": {
-    "/api/channels/activity/difference": {
-      "get": {
-        "operationId": "getActivityDifference",
-        "parameters": [
-          {
-            "name": "requestId",
-            "in": "query",
-            "required": true,
-            "schema": {
-              "$ref": "#/components/schemas/OpaqueId"
-            },
-            "explode": false
-          },
-          {
-            "name": "epoch",
-            "in": "query",
-            "required": true,
-            "schema": {
-              "$ref": "#/components/schemas/UInt64String"
-            },
-            "explode": false
-          },
-          {
-            "name": "afterWatermark",
-            "in": "query",
-            "required": true,
-            "schema": {
-              "$ref": "#/components/schemas/UInt64String"
-            },
-            "explode": false
-          },
-          {
-            "name": "filter",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "$ref": "#/components/schemas/ActivityFilter"
-            },
-            "explode": false
-          },
-          {
-            "name": "windowId",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "string",
-              "enum": [
-                "main"
-              ]
-            },
-            "explode": false
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "The request has succeeded.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/components/schemas/DifferenceIngress"
-                    },
-                    {
-                      "$ref": "#/components/schemas/NotModifiedIngress"
-                    }
-                  ]
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "The server could not understand the request due to invalid syntax.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/V1ErrorBody"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "Access is unauthorized.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/V1AuthErrorBody"
-                }
-              }
-            }
-          },
-          "403": {
-            "description": "Access is forbidden.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/V1ErrorBody"
-                }
-              }
-            }
-          },
-          "409": {
-            "description": "The request conflicts with the current state of the server.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/SnapshotRequiredBody"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Server error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/V1ErrorBody"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/channels/activity/snapshot": {
-      "get": {
-        "operationId": "getActivitySnapshot",
-        "parameters": [
-          {
-            "name": "requestId",
-            "in": "query",
-            "required": true,
-            "schema": {
-              "$ref": "#/components/schemas/OpaqueId"
-            },
-            "explode": false
-          },
-          {
-            "name": "filter",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "$ref": "#/components/schemas/ActivityFilter"
-            },
-            "explode": false
-          },
-          {
-            "name": "windowId",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "string",
-              "enum": [
-                "main"
-              ]
-            },
-            "explode": false
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "The request has succeeded.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/SnapshotIngress"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "The server could not understand the request due to invalid syntax.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/V1ErrorBody"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "Access is unauthorized.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/V1AuthErrorBody"
-                }
-              }
-            }
-          },
-          "403": {
-            "description": "Access is forbidden.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/V1ErrorBody"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Server error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/V1ErrorBody"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
     "/api/channels/inbox": {
       "get": {
         "operationId": "getInbox",
@@ -2390,6 +2177,20 @@
           "not": {}
         },
         "description": "Explicit repair outcome. A caller with an old epoch, a future watermark, or\na watermark older than the retained dense journal must fetch a snapshot;\nthe server never fabricates continuity."
+      },
+      "SnapshotRequiredResponse": {
+        "type": "object",
+        "required": [
+          "body"
+        ],
+        "properties": {
+          "body": {
+            "$ref": "#/components/schemas/SnapshotRequiredBody"
+          }
+        },
+        "unevaluatedProperties": {
+          "not": {}
+        }
       },
       "ThreadActivityRow": {
         "type": "object",

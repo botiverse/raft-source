@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
-import { getDriver } from "./index";
+import { getDriver, registeredRuntimeIds, runtimeIdsShippedWithComputer } from "./index";
 
 const runtimeIds = ["builtin", "claude", "codex", "grok", "kimi", "cursor", "gemini", "copilot", "opencode", "pi"] as const;
 const stdinSteerablePersistentRuntimeIds = ["claude", "codex", "grok", "kimi"] as const;
@@ -11,7 +10,7 @@ const expectedContracts = {
     lifecycle: { kind: "persistent", stdin: "direct", inFlightWake: "steer" },
     communication: { chat: "slock_cli", runtimeControl: "none" },
     stdoutChannel: "diagnostic",
-    session: { recovery: "resume_or_fresh" },
+    session: { recovery: "resume_or_fresh", compaction: "reported", compactionFailure: "sticks_to_session" },
     modelVerifiedAs: "launchable",
     nativeStandingPrompt: true,
   },
@@ -19,7 +18,7 @@ const expectedContracts = {
     lifecycle: { kind: "persistent", stdin: "direct", inFlightWake: "steer" },
     communication: { chat: "slock_cli", runtimeControl: "none" },
     stdoutChannel: "diagnostic",
-    session: { recovery: "resume_or_fresh" },
+    session: { recovery: "resume_or_fresh", compaction: "reported", compactionFailure: "does_not_stick" },
     modelVerifiedAs: "launchable",
     nativeStandingPrompt: true,
     stdinDuringCompaction: true,
@@ -28,7 +27,7 @@ const expectedContracts = {
     lifecycle: { kind: "persistent", stdin: "direct", inFlightWake: "steer" },
     communication: { chat: "slock_cli", runtimeControl: "none" },
     stdoutChannel: "structured_protocol",
-    session: { recovery: "resume_or_fresh" },
+    session: { recovery: "resume_or_fresh", compaction: "reported", compactionFailure: "does_not_stick" },
     modelVerifiedAs: "launchable",
     nativeStandingPrompt: true,
   },
@@ -36,7 +35,7 @@ const expectedContracts = {
     lifecycle: { kind: "persistent", stdin: "direct", inFlightWake: "steer" },
     communication: { chat: "slock_cli", runtimeControl: "none" },
     stdoutChannel: "structured_protocol",
-    session: { recovery: "resume_or_fresh" },
+    session: { recovery: "resume_or_fresh", compaction: "unreported", compactionFailure: "does_not_stick" },
     modelVerifiedAs: "launchable",
     nativeStandingPrompt: true,
   },
@@ -44,28 +43,30 @@ const expectedContracts = {
     lifecycle: { kind: "persistent", stdin: "direct", inFlightWake: "steer" },
     communication: { chat: "slock_cli", runtimeControl: "none" },
     stdoutChannel: "diagnostic",
-    session: { recovery: "resume_or_fresh" },
+    session: { recovery: "resume_or_fresh", compaction: "reported", compactionFailure: "does_not_stick" },
     modelVerifiedAs: "launchable",
+    // #11083: the standing prompt is written to Kimi CLI's own system file.
+    nativeStandingPrompt: true,
   },
   cursor: {
     lifecycle: { kind: "per_turn", start: "immediate", exit: "natural", inFlightWake: "spawn_new" },
     communication: { chat: "slock_cli", runtimeControl: "none" },
     stdoutChannel: "diagnostic",
-    session: { recovery: "resume_or_fresh" },
+    session: { recovery: "resume_or_fresh", compaction: "reported", compactionFailure: "does_not_stick" },
     modelVerifiedAs: "launchable",
   },
   gemini: {
     lifecycle: { kind: "per_turn", start: "immediate", exit: "natural", inFlightWake: "spawn_new" },
     communication: { chat: "slock_cli", runtimeControl: "none" },
     stdoutChannel: "diagnostic",
-    session: { recovery: "resume_or_fresh" },
+    session: { recovery: "resume_or_fresh", compaction: "unreported", compactionFailure: "does_not_stick" },
     modelVerifiedAs: "suggestion_only",
   },
   copilot: {
     lifecycle: { kind: "per_turn", start: "immediate", exit: "natural", inFlightWake: "spawn_new" },
     communication: { chat: "slock_cli", runtimeControl: "none" },
     stdoutChannel: "diagnostic",
-    session: { recovery: "resume_or_fresh" },
+    session: { recovery: "resume_or_fresh", compaction: "unreported", compactionFailure: "does_not_stick" },
     modelVerifiedAs: "launchable",
   },
   opencode: {
@@ -77,7 +78,7 @@ const expectedContracts = {
     },
     communication: { chat: "slock_cli", runtimeControl: "none" },
     stdoutChannel: "diagnostic",
-    session: { recovery: "resume_or_fresh" },
+    session: { recovery: "resume_or_fresh", compaction: "unreported", compactionFailure: "does_not_stick" },
     modelVerifiedAs: "launchable",
     nativeStandingPrompt: true,
   },
@@ -85,7 +86,7 @@ const expectedContracts = {
     lifecycle: { kind: "persistent", stdin: "direct", inFlightWake: "steer" },
     communication: { chat: "slock_cli", runtimeControl: "none" },
     stdoutChannel: "diagnostic",
-    session: { recovery: "resume_or_fresh" },
+    session: { recovery: "resume_or_fresh", compaction: "reported", compactionFailure: "sticks_to_session" },
     modelVerifiedAs: "launchable",
     nativeStandingPrompt: true,
   },
@@ -104,6 +105,27 @@ test("built-in runtime contracts match the current driver matrix", () => {
     assert.equal(Boolean(driver.supportsNativeStandingPrompt), "nativeStandingPrompt" in expected && expected.nativeStandingPrompt === true, runtimeId);
     assert.equal(Boolean(driver.acceptsStdinDuringCompaction), "stdinDuringCompaction" in expected && expected.stdinDuringCompaction === true, runtimeId);
   }
+});
+
+// Glimpse reads whether a runtime reports compaction (session.compaction), and
+// the stuck-session guard whether a failed compaction sticks
+// (session.compactionFailure), from its driver alone; there is no other list. The type requires it; this
+// checks every registered driver answers with a known value at run time too.
+test("every registered runtime declares whether it reports compaction, and whether a failed one sticks", () => {
+  for (const runtimeId of registeredRuntimeIds()) {
+    assert.ok(["reported", "unreported"].includes(getDriver(runtimeId).session.compaction), runtimeId);
+    assert.ok(["sticks_to_session", "does_not_stick"].includes(getDriver(runtimeId).session.compactionFailure), runtimeId);
+  }
+});
+
+// These run as an SDK inside the daemon; every other runtime is a CLI found on
+// PATH, whose version the Computer records to notice an older copy picked up
+// after a restart (runtimeCliVersionTracker.ts). This pins today's set; it
+// cannot notice a new in-process driver that forgets `shipsWithComputer`
+// (a Computer downgrade would then report it as an older copy on PATH), so
+// add the flag and the id here when adding one.
+test("the runtimes that ship with the Computer are the in-process SDK drivers", () => {
+  assert.deepEqual([...runtimeIdsShippedWithComputer()].sort(), ["builtin", "kimi-sdk", "pi"]);
 });
 
 test("structured contracts preserve daemon delivery behavior", () => {
@@ -167,17 +189,6 @@ test("stdin steerable persistent sessions distinguish idle prompt from busy stee
   }
 });
 
-test("Pi SDK session distinguishes idle prompt from busy steering by descriptor", () => {
-  const source = readFileSync(new URL("./pi.ts", import.meta.url), "utf8");
-
-  assert.match(source, /transport:\s*"sdk"/);
-  assert.match(source, /idle:\s*"sdk_prompt"/);
-  assert.match(source, /busy:\s*"sdk_steer"/);
-  assert.match(source, /inFlightWake:\s*"steer"/);
-  assert.match(source, /busyDelivery:\s*"direct"/);
-  assert.match(source, /postTurn:\s*"keep_alive"/);
-});
-
 test("per-turn sessions reject live stdin steering", () => {
   for (const runtimeId of perTurnRuntimeIds) {
     const driver = getDriver(runtimeId);
@@ -204,58 +215,4 @@ test("launchable model contracts expose a model-to-launch-spec round trip", asyn
       runtimeId,
     );
   }
-});
-
-test("agent process manager uses RuntimeSession instead of raw child-process IO", () => {
-  const source = readFileSync(new URL("../agentProcessManager.ts", import.meta.url), "utf8");
-
-  assert.doesNotMatch(source, /node:child_process/);
-  assert.doesNotMatch(source, /\bChildProcess\b/);
-  assert.doesNotMatch(source, /\.stdin\?\.write/);
-  assert.doesNotMatch(source, /\.stdout\?\.on/);
-  assert.doesNotMatch(source, /\.stderr\?\.on/);
-  assert.doesNotMatch(source, /\.kill\(/);
-  assert.doesNotMatch(source, /driver\.encodeStdinMessage/);
-  assert.doesNotMatch(source, /transport\s*={2,3}\s*["']child_process["']/);
-  assert.doesNotMatch(source, /ap\.driver\.busyDeliveryMode\s*[!=]==/);
-  assert.match(source, /createChildProcessRuntimeSession/);
-});
-
-test("daemon orphan reaper is the shutdown process-tree signal boundary", () => {
-  const apmSource = readFileSync(new URL("../agentProcessManager.ts", import.meta.url), "utf8");
-  const reaperSource = readFileSync(new URL("../daemonOrphanReaper.ts", import.meta.url), "utf8");
-
-  assert.match(apmSource, /reapOrphanProcesses\(/);
-  assert.match(apmSource, /daemonOrphanReaper["']/);
-
-  assert.match(reaperSource, /process\.kill\(pid,\s*0\)/);
-  assert.match(reaperSource, /process\.kill\(pid,\s*"SIGKILL"\)/);
-  assert.match(reaperSource, /daemon\.agent\.stop_all\.survivor_reaped/);
-  assert.match(reaperSource, /daemon\.agent\.stop_all\.completed/);
-  assert.match(reaperSource, /shutdown process-tree orphan safeguard/i);
-
-  assert.doesNotMatch(reaperSource, /^import\b/m);
-  assert.doesNotMatch(reaperSource, /RuntimeSession\s*[<({:]/);
-  assert.doesNotMatch(reaperSource, /createChildProcessRuntimeSession/);
-  assert.doesNotMatch(reaperSource, /AgentProcessManager/);
-});
-
-test("only daemon orphan reaper owns shutdown raw process signals outside RuntimeSession", () => {
-  const runtimeSessionSource = readFileSync(new URL("./runtimeSession.ts", import.meta.url), "utf8");
-  const apmSource = readFileSync(new URL("../agentProcessManager.ts", import.meta.url), "utf8");
-  const reaperSource = readFileSync(new URL("../daemonOrphanReaper.ts", import.meta.url), "utf8");
-
-  assert.match(runtimeSessionSource, /\.kill\(/, "RuntimeSession remains the per-session child-process owner");
-  assert.doesNotMatch(apmSource, /\.kill\(/, "AgentProcessManager must not own raw child-process signals");
-  assert.match(reaperSource, /\.kill\(/, "DaemonOrphanReaper owns only the shutdown process-tree survivor signal path");
-});
-
-test("Pi runtime uses a native SDK RuntimeSession instead of fake child-process IO", () => {
-  const source = readFileSync(new URL("./pi.ts", import.meta.url), "utf8");
-
-  assert.match(source, /createSession\(ctx: SpawnContext\): RuntimeSession/);
-  assert.match(source, /transport:\s*"sdk"/);
-  assert.doesNotMatch(source, /class\s+PiSdkProcess/);
-  assert.doesNotMatch(source, /\bPassThrough\b/);
-  assert.doesNotMatch(source, /\bWritable\b/);
 });

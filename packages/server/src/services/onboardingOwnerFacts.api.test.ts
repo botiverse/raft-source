@@ -8,7 +8,7 @@ import { createAgent } from "./agentService";
 import { AgentOrchestrator, type AgentMessageDeliveryResult } from "./agentOrchestrator";
 import { deliverOwnerFactsContext } from "./onboardingService";
 
-const test = createApiTest({ onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest();
 
 type PgliteLike = { query: (...args: unknown[]) => Promise<unknown> };
 

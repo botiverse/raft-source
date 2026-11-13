@@ -29,10 +29,12 @@ test("first click on sidebar Chat tab from machine detail switches to chat", asy
   );
   await page.waitForLoadState("networkidle");
 
-  // Confirm we're really on the machine detail surface — the
-  // mobile-back button is unique to MachineDetailPanel and lives in the
-  // header area, so it's the most stable marker.
-  await expect(page.getByTestId("machine-mobile-back")).toBeAttached();
+  // Confirm the computer is really open. A desktop /machine/<id> redirects
+  // to the computer's side panel beside the card wall,
+  // /computers?profile=computer:<id>, with the computer's head (a cold load
+  // once landed on a bare /computers, the panel lost).
+  await expect(page.getByTestId("machine-panel-header")).toBeVisible();
+  await expect(page).toHaveURL(/\/computers\?(?:.*&)?profile=computer%3A/);
 
   // Confirm the Members tab is the currently-active sidebar tab.
   // (The sidebar tab toggles live in the desktop LeftRail since #79.)
@@ -49,7 +51,9 @@ test("first click on sidebar Chat tab from machine detail switches to chat", asy
   // sidebar Chat tab actually has effect). Give the route 2s to
   // settle so we measure the steady state, not the in-flight flicker.
   await page.waitForTimeout(800);
-  await expect(page).not.toHaveURL(/\/machine\//);
+  // Left the computer, as its page or as its side panel.
+  await expect(page).not.toHaveURL(/\/(?:machine|computer)\/|[?&]profile=computer%3A/);
+  await expect(page.getByTestId("machine-panel-header")).toHaveCount(0);
   // ChatPanel renders message-scroller; it's the canonical chat
   // surface marker.
   await expect(page.getByTestId("message-scroller")).toBeVisible();
@@ -102,7 +106,21 @@ for (const width of [800, 1280]) {
         await expect(overlay).toHaveCount(0);
       }
       await expect(channels).not.toBeVisible();
-      if (["members", "computers", "settings"].includes(rail)) {
+      if (rail === "members") {
+        // Members is a full page with no sidebar beside it (#13127): the slot
+        // is gone and the page itself is what renders, not a stale Chat list.
+        await expect(page).toHaveURL(/\/members(?:[?#]|$)/);
+        await expect(page.getByTestId("members-page")).toBeVisible();
+        await expect(page.locator('[data-slot="app-shell-sidebar-slot"]')).toHaveCount(0);
+      }
+      if (rail === "computers") {
+        // Computers is a full page beside the rail too: no sidebar slot, the
+        // rack overview itself renders, not a stale Chat list.
+        await expect(page).toHaveURL(/\/computers(?:[?#]|$)/);
+        await expect(page.getByTestId("computers-rack-overview")).toBeVisible();
+        await expect(page.locator('[data-slot="app-shell-sidebar-slot"]')).toHaveCount(0);
+      }
+      if (rail === "settings") {
         await expect(page.locator('[data-slot="app-shell-sidebar-slot"]')).toBeVisible();
       }
     }

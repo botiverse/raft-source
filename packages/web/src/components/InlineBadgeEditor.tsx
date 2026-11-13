@@ -1,12 +1,11 @@
-import { Badge, DropdownMenuPopup, TaskStatusBadge } from "@botiverse/raft-ui";
-import type { BadgeProps, TaskStatusId } from "@botiverse/raft-ui";
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import type { CSSProperties, ReactNode } from "react";
-import { createPortal } from "react-dom";
+import { Badge, Popover, PopoverContent, ScrollArea, TaskStatusBadge } from "@botiverse/raft-ui";
+import type { BadgeProps, PopoverProps, TaskStatusId } from "@botiverse/raft-ui";
+import { useCallback, useMemo, useRef } from "react";
+import type { KeyboardEvent, ReactNode, RefObject } from "react";
 import { ChevronDown } from "lucide-react";
 
 import { InlineBadgeMenuItem } from "./InlineBadgeMenuItem";
-import { SelectionPopoverPanel, SELECTION_POPOVER_SURFACE } from "./ui/SelectionPopover";
+import { SelectionPopoverPanel } from "./ui/SelectionPopover";
 import Tooltip from "./ui/Tooltip";
 import { dismissLayerProps } from "./ui/dismissLayer";
 
@@ -17,6 +16,12 @@ function noop() {}
 function stopPropagation(event: { stopPropagation(): void }) {
   event.stopPropagation();
 }
+// Esc goes on to the popover, which closes on it.
+function stopPropagationUnlessEscape(event: KeyboardEvent) {
+  if (event.key !== "Escape") event.stopPropagation();
+}
+
+type PopoverRootChangeEventDetails = Parameters<NonNullable<PopoverProps["onOpenChange"]>>[1];
 
 interface InlineBadgeEditorProps {
   /** Display label shown in the badge */
@@ -51,6 +56,8 @@ interface InlineBadgeEditorProps {
   optionTestIdPrefix?: string;
   buttonClassName?: string;
   buttonChildren?: ReactNode;
+  /** The trigger, for what hangs from it besides the option list. */
+  triggerRef?: RefObject<HTMLButtonElement | null>;
   /**
    * Swap the local option list for the real `SelectionPopover` — the same
    * control the search page's filters use.
@@ -68,6 +75,12 @@ interface InlineBadgeEditorProps {
   searchPlaceholder?: string;
   popoverTitle?: string;
   emptyLabel?: string;
+  /**
+   * A step after choosing (searchable only): shown in the picker's popover in
+   * place of the list, e.g. the reason a task is handed to someone with. The
+   * caller owns its focus and Escape; null/undefined shows the list.
+   */
+  panel?: ReactNode;
 }
 
 export default function InlineBadgeEditor({
@@ -93,106 +106,28 @@ export default function InlineBadgeEditor({
   optionTestIdPrefix,
   buttonClassName,
   buttonChildren,
+  triggerRef: givenTriggerRef,
   searchable,
   search = "",
   onSearchChange,
   searchPlaceholder,
   popoverTitle,
   emptyLabel,
+  panel,
 }: InlineBadgeEditorProps) {
-  const triggerRef = useRef<HTMLButtonElement>(null);
-  const dropdownRef = useRef<HTMLDivElement>(null);
-  const [dropdownStyle, setDropdownStyle] = useState<CSSProperties>({
-    position: "fixed",
-    visibility: "hidden",
-  });
+  const hasPanel = panel != null;
+  const ownTriggerRef = useRef<HTMLButtonElement>(null);
+  const triggerRef = givenTriggerRef ?? ownTriggerRef;
 
-  useLayoutEffect(() => {
-    if (!open) {
-      setDropdownStyle({ position: "fixed", visibility: "hidden" });
-      return;
-    }
-
-    const measure = () => {
-      const trigger = triggerRef.current;
-      const dropdown = dropdownRef.current;
-      if (!trigger || !dropdown) return;
-
-      const triggerRect = trigger.getBoundingClientRect();
-      const dropdownRect = dropdown.getBoundingClientRect();
-      const viewportWidth = window.visualViewport?.width ?? window.innerWidth;
-      const viewportHeight = window.visualViewport?.height ?? window.innerHeight;
-      const gutter = 8;
-      const align = dropdownAlign ?? (window.matchMedia("(min-width: 640px)").matches ? "left" : "right");
-
-      const idealLeft = align === "left"
-        ? triggerRect.left
-        : triggerRect.right - dropdownRect.width;
-      const left = Math.min(
-        Math.max(gutter, idealLeft),
-        viewportWidth - gutter - dropdownRect.width,
-      );
-
-      const idealTop = triggerRect.bottom + 4;
-      const wouldOverflowBottom = idealTop + dropdownRect.height > viewportHeight - gutter;
-      const top = wouldOverflowBottom
-        ? Math.max(gutter, triggerRect.top - 4 - dropdownRect.height)
-        : idealTop;
-
-      setDropdownStyle({
-        position: "fixed",
-        left: Math.max(gutter, left),
-        top,
-        zIndex: 1000,
-        visibility: "visible",
-        maxHeight: viewportHeight - gutter * 2,
-        maxWidth: viewportWidth - gutter * 2,
-      });
-    };
-
-    measure();
-    const raf = requestAnimationFrame(measure);
-    window.addEventListener("resize", measure);
-    window.addEventListener("scroll", measure, { capture: true, passive: true });
-    window.visualViewport?.addEventListener("resize", measure);
-    window.visualViewport?.addEventListener("scroll", measure, { passive: true });
-
-    return () => {
-      cancelAnimationFrame(raf);
-      window.removeEventListener("resize", measure);
-      window.removeEventListener("scroll", measure, { capture: true });
-      window.visualViewport?.removeEventListener("resize", measure);
-      window.visualViewport?.removeEventListener("scroll", measure);
-    };
-  }, [dropdownAlign, open]);
-
-  useEffect(() => {
-    if (!open || !onRequestClose) return;
-
-    const handleClickOutside = (event: MouseEvent) => {
-      const target = event.target as Node | null;
-      if (!target) return;
-      const trigger = triggerRef.current;
-      const dropdown = dropdownRef.current;
-      if (trigger?.contains(target) || dropdown?.contains(target)) return;
-      onRequestClose();
-    };
-
-    document.addEventListener("mousedown", handleClickOutside);
-    return () => document.removeEventListener("mousedown", handleClickOutside);
-  }, [open, onRequestClose]);
-
-  // The popover's own `autoFocus` does not win here: the trigger has focus from
-  // the click that opened it, and the panel mounts into a portal afterwards. A
-  // search box you have to click before typing is not a search box.
-  // `dropdownStyle` is in the deps on purpose: the panel mounts `visibility:
-  // hidden` so it can be measured, and focus() is a silent no-op on a hidden
-  // element. Re-running once the measured style lands is what actually focuses.
-  useEffect(() => {
-    if (!open || !searchable || dropdownStyle.visibility === "hidden") return;
-    const input = dropdownRef.current?.querySelector("input");
-    if (input instanceof HTMLInputElement && document.activeElement !== input) input.focus();
-  }, [open, searchable, dropdownStyle]);
+  // The badge is not a PopoverTrigger: its own click toggles (`onToggle`), so a
+  // press on it is not the outside press that closes the popover. Esc and a
+  // press anywhere else are.
+  const handleOpenChange = useCallback((next: boolean, details: PopoverRootChangeEventDetails) => {
+    if (next) return;
+    const target = details.event?.target;
+    if (target instanceof Node && triggerRef.current?.contains(target)) return;
+    (onRequestClose ?? onToggle)();
+  }, [onRequestClose, onToggle, triggerRef]);
 
   const selectionOptions = useMemo(() => {
     const reserveLeadingSlot = options.some((o) => o.avatar);
@@ -206,56 +141,85 @@ export default function InlineBadgeEditor({
     }));
   }, [options, selectedId, onSelect]);
 
-  const dropdown = open && searchable ? (
-    // Same portal and same measured position as the plain list — only the panel
-    // itself is delegated. SelectionPopover brings its own popover surface, so
-    // the wrapper must not draw a second frame.
-    <div
-      ref={dropdownRef}
-      style={dropdownStyle}
-      data-testid={dropdownTestId}
-      onMouseDown={stopPropagation}
-      onClick={stopPropagation}
-    >
-      <SelectionPopoverPanel
-        searchable
-        title={popoverTitle ?? ""}
-        showHeader={!!popoverTitle}
-        search={search}
-        onSearchChange={onSearchChange ?? noop}
-        searchPlaceholder={searchPlaceholder}
-        emptyLabel={emptyLabel}
-        className={`w-[240px] ${SELECTION_POPOVER_SURFACE}`}
-        options={selectionOptions}
-      />
-    </div>
-  ) : open ? (
-    <DropdownMenuPopup
-      ref={dropdownRef}
-      style={dropdownStyle}
-      className={`overflow-y-auto ${dropdownMinWidth}`}
-      data-testid={dropdownTestId}
-      {...dismissLayerProps}
-      onMouseDown={stopPropagation}
-      onClick={stopPropagation}
-    >
-      {options.map((opt) => (
-        <InlineBadgeMenuItem
-          key={opt.id}
-          option={opt}
-          selected={opt.id === selectedId}
-          onSelect={onSelect}
-          testId={optionTestIdPrefix ? `${optionTestIdPrefix}-${opt.id}` : undefined}
-        />
-      ))}
-    </DropdownMenuPopup>
-  ) : null;
+  // Unset: under the trigger's start edge on a wide screen, its end edge on a
+  // phone (where a chip sits at the right of a row more often than not).
+  const align = dropdownAlign === "left" ? "start"
+    : dropdownAlign === "right" ? "end"
+    : open && window.matchMedia("(min-width: 640px)").matches ? "start" : "end";
+
+  // raft-ui's Popover places it (portaled, so a dragged card's lift or a
+  // panel's clip never holds it; flipped and shifted at the window's edge) on
+  // the popup layer, and owns Esc and the outside press. Presses inside stop
+  // here: the editor often sits in a clickable or draggable card, and React
+  // bubbles portal events through it.
+  // Focus on open goes to the current option (its check), as raft-ui's menus and the server popover do, so the
+  // first option is never shown as if picked. A touch opens it without moving focus (no keyboard). The search
+  // box keeps its own focus in search mode.
+  const contentRef = useRef<HTMLDivElement>(null);
+  const focusCurrent = useCallback((openType: string) => {
+    if (openType === "touch") return false;
+    return contentRef.current?.querySelector<HTMLElement>("[data-current]") ?? true;
+  }, []);
+  const popover = (
+    <Popover open={open} onOpenChange={handleOpenChange}>
+      <PopoverContent
+        ref={contentRef}
+        initialFocus={searchable ? undefined : focusCurrent}
+        anchor={triggerRef}
+        side="bottom"
+        align={align}
+        sideOffset={4}
+        collisionPadding={8}
+        aria-label={popoverTitle ?? buttonAriaLabel ?? displayValue}
+        data-testid={dropdownTestId}
+        className={searchable
+          ? `flex max-w-(--available-width) flex-col ${hasPanel ? "w-[280px]" : "w-[240px]"}`
+          : `flex flex-col p-0 ${dropdownMinWidth}`}
+        onPointerDown={stopPropagation}
+        onMouseDown={stopPropagation}
+        onTouchStart={stopPropagation}
+        onClick={stopPropagation}
+        onKeyDown={stopPropagationUnlessEscape}
+        {...dismissLayerProps}
+      >
+        {searchable && hasPanel ? panel : searchable ? (
+          // The search box takes focus as the popover opens, and again when it
+          // comes back from a `panel` step (it mounts afresh).
+          <SelectionPopoverPanel
+            searchable
+            title={popoverTitle ?? ""}
+            showHeader={!!popoverTitle}
+            search={search}
+            onSearchChange={onSearchChange ?? noop}
+            searchPlaceholder={searchPlaceholder}
+            emptyLabel={emptyLabel}
+            options={selectionOptions}
+          />
+        ) : (
+          // The options scroll in a raft-ui ScrollArea inside the popup, with
+          // a menu's 4px padding on its content. Each option takes focus: no
+          // tab stop.
+          <ScrollArea tabIndex={-1} className="min-h-0 flex-1" contentClassName="flex flex-col p-1">
+            {options.map((opt) => (
+              <InlineBadgeMenuItem
+                key={opt.id}
+                option={opt}
+                selected={opt.id === selectedId}
+                onSelect={onSelect}
+                testId={optionTestIdPrefix ? `${optionTestIdPrefix}-${opt.id}` : undefined}
+              />
+            ))}
+          </ScrollArea>
+        )}
+      </PopoverContent>
+    </Popover>
+  );
 
   // Raft Design System › StatusChip: an editable chip is a 22px soft chip
   // with a trailing chevron. raft-ui's Badge draws the chip, its hover/press
   // overlay and its disabled state; this class only lays the trigger out and
-  // carries the caller's tone class. No case transform: Title Case copy
-  // ("In Progress") renders as written.
+  // carries the caller's tone class. No case transform: the copy
+  // ("In progress") renders as written.
   const defaultButtonClassName = `mt-0.5 inline-flex items-center gap-1 ${badgeClassName} disabled:cursor-not-allowed${capitalize ? " capitalize" : ""}`;
 
   const badge = badgeStatus ? (
@@ -264,8 +228,13 @@ export default function InlineBadgeEditor({
       render={<button ref={triggerRef} type="button" disabled={disabled} />}
       onClick={onToggle}
       data-testid={buttonTestId}
+      // Set as a prop (as the Badge branch does) so a wrapping Tooltip's
+      // trigger forwards it instead of stamping `tooltip-trigger`; parents
+      // such as DescriptionList direction="inline" select on this slot.
+      data-slot="task-status-badge"
       data-task-status={buttonDataTaskStatus}
       aria-label={buttonAriaLabel}
+      aria-expanded={open}
       className={`mt-0.5 ${buttonClassName ?? ""}`.trim()}
     >
       {displayValue}
@@ -281,6 +250,7 @@ export default function InlineBadgeEditor({
       data-task-status={buttonDataTaskStatus}
       data-slot="badge"
       aria-label={buttonAriaLabel}
+      aria-expanded={open}
       className={buttonClassName ?? defaultButtonClassName}
     >
       {buttonChildren ?? (
@@ -295,7 +265,7 @@ export default function InlineBadgeEditor({
   return (
     <>
       {buttonTitle ? <Tooltip content={buttonTitle}>{badge}</Tooltip> : badge}
-      {dropdown && createPortal(dropdown, document.body)}
+      {popover}
     </>
   );
 }

@@ -16,22 +16,21 @@
 //     submit button is disabled with a hint.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Hash, Lock } from "lucide-react";
+import { ChannelIcon } from "./channelKindIcon";
 import DialogCard from "../ui/DialogCard";
 import { useIntl } from "react-intl";
 import Banner from "../ui/Banner";
-import {
-  ChannelMemberListShell,
-  ChannelMemberRow,
-  ChannelMemberSectionHeader,
-} from "./ChannelMemberList";
 import { useAgentStore } from "../../store/agentStore";
 import { useServerStore } from "../../store/serverStore";
 import { useChannelStore } from "../../store/channelStore";
 import { useChannelMembers } from "../../hooks/useChannelMembers";
 import { isLocalProjectionMember } from "../../utils/channelLocalMembership";
 import { Button, Card, IconTile } from "@botiverse/raft-ui";
-import { CandidateRemoveButton } from "./CandidateRemoveButton";
+import MemberPicker, { agentCandidate, serverMemberCandidate } from "../pickers/MemberPicker";
+import type { MemberKind } from "../pickers/MemberPicker";
+import { DialogCardFooter, DialogCommit } from "../ui/NarrowDialog";
+
+const MEMBER_KINDS: readonly MemberKind[] = ["human", "agent"];
 
 interface Props {
   channelId: string;
@@ -166,23 +165,26 @@ export default function AddMembersDialog({
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const toggleHuman = useCallback((id: string) => {
-    setSelectedHumanIds((prev) => {
-      const next = new Set(prev);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
-      return next;
-    });
+  // The picker value is every selected id (agents, then humans). This list
+  // only ever trims, so a change keeps whichever ids are still present.
+  const selectedIds = useMemo(
+    () => [...selectedAgentIds, ...selectedHumanIds],
+    [selectedAgentIds, selectedHumanIds],
+  );
+  const candidates = useMemo(
+    () => [...candidateAgents.map(agentCandidate), ...candidateHumans.map(serverMemberCandidate)],
+    [candidateAgents, candidateHumans],
+  );
+  const handleSelectionChange = useCallback((next: string[]) => {
+    const kept = new Set(next);
+    const keep = (prev: Set<string>) => new Set([...prev].filter((id) => kept.has(id)));
+    setSelectedHumanIds(keep);
+    setSelectedAgentIds(keep);
   }, []);
-
-  const toggleAgent = useCallback((id: string) => {
-    setSelectedAgentIds((prev) => {
-      const next = new Set(prev);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
-      return next;
-    });
-  }, []);
+  const removeLabel = useCallback(
+    (name: string) => formatMessage({ id: "channel.addMembers.removeFromList" }, { name }),
+    [formatMessage],
+  );
 
   const nothingToAdd = candidateHumans.length === 0 && candidateAgents.length === 0;
   const nothingSelected = selectedHumanIds.size === 0 && selectedAgentIds.size === 0;
@@ -244,12 +246,12 @@ export default function AddMembersDialog({
   }, [loadMembers]);
 
   return (
-    <DialogCard title={formatMessage({ id: "channel.addMembers.title" })} onClose={onClose}>
+    <DialogCard title={formatMessage({ id: "channel.addMembers.title" })} onClose={onClose} narrow="sheet">
         {/* The target channel is a place: the neutral channel tile (DS
             ChannelIcon, never coloured) and its name. */}
         <div className="mb-3 flex min-w-0 items-center gap-2 text-callout text-foreground">
           <IconTile size="sm">
-            {channel?.type === "private" ? <Lock /> : <Hash />}
+            <ChannelIcon channel={channel} type={channel?.type} />
           </IconTile>
           <span className="truncate font-bold">{channel?.name ?? formatMessage({ id: "channel.addMembers.unknownChannel" })}</span>
           <span className="shrink-0 text-foreground-muted">{formatMessage({ id: "channel.addMembers.targetChannelSuffix" })}</span>
@@ -272,68 +274,20 @@ export default function AddMembersDialog({
             {formatMessage({ id: "channel.addMembers.nothingToAdd" })}
           </Card>
         ) : (
-          <ChannelMemberListShell className="mb-4" data-testid="add-members-action-list">
-            {candidateAgents.length > 0 ? (
-              <section>
-                <ChannelMemberSectionHeader>{formatMessage({ id: "agent.channelMembers.agents" })}</ChannelMemberSectionHeader>
-                <ul>
-                  {candidateAgents.map((a) => {
-                    if (!selectedAgentIds.has(a.id)) return null;
-                    return (
-                      <li key={a.id}>
-                        <ChannelMemberRow
-                          type="agent"
-                          agentId={a.id}
-                          agentAvatarUrl={a.avatarUrl}
-                          name={a.displayName ?? a.name}
-                          secondary={a.description}
-                          trailing={(
-                            <CandidateRemoveButton
-                              id={a.id}
-                              label={formatMessage({ id: "channel.addMembers.removeFromList" }, { name: a.displayName ?? a.name })}
-                              onRemove={toggleAgent}
-                            />
-                          )}
-                        />
-                      </li>
-                    );
-                  })}
-                </ul>
-              </section>
-            ) : null}
-
-            {candidateHumans.length > 0 ? (
-              <section>
-                <ChannelMemberSectionHeader>{formatMessage({ id: "agent.channelMembers.humans" })}</ChannelMemberSectionHeader>
-                <ul>
-                  {candidateHumans.map((m) => {
-                    if (!selectedHumanIds.has(m.userId)) return null;
-                    return (
-                      <li key={m.userId}>
-                        <ChannelMemberRow
-                          type="human"
-                          humanAvatarUrl={m.avatarUrl}
-                          gravatarHash={m.gravatarHash}
-                          name={m.displayName ?? m.name}
-                          secondary={m.description ?? (m.displayName && m.displayName !== m.name ? `@${m.name}` : null)}
-                          trailing={(
-                            <CandidateRemoveButton
-                              id={m.userId}
-                              label={formatMessage({ id: "channel.addMembers.removeFromList" }, { name: m.displayName ?? m.name })}
-                              onRemove={toggleHuman}
-                            />
-                          )}
-                        />
-                      </li>
-                    );
-                  })}
-                </ul>
-              </section>
-            ) : null}
-          </ChannelMemberListShell>
+          <MemberPicker
+            className="mb-4"
+            data-testid="add-members-action-list"
+            presentation="removable"
+            removeLabel={removeLabel}
+            candidates={candidates}
+            kinds={MEMBER_KINDS}
+            value={selectedIds}
+            onChange={handleSelectionChange}
+            multiple
+          />
         )}
 
-        <div className="flex flex-wrap justify-end gap-2">
+        <DialogCardFooter>
           <Button size="lg"
             variant="ghost"
             type="button"
@@ -342,20 +296,24 @@ export default function AddMembersDialog({
           >
             {formatMessage({ id: "common.confirm.cancel" })}
           </Button>
-          <Button size="lg"
-            variant="accent"
-            type="button"
-            onClick={handleSubmit}
-            disabled={!canSubmit}
-          >
-            {submitting
-              ? formatMessage({ id: "channel.addMembers.adding" })
-              : formatMessage(
-                  { id: "channel.addMembers.submit" },
-                  { count: selectedHumanIds.size + selectedAgentIds.size },
-                )}
-          </Button>
-        </div>
+          <DialogCommit>
+            {(inHead) => (
+              <Button size={inHead ? "md" : "lg"}
+                variant="primary"
+                type="button"
+                onClick={handleSubmit}
+                disabled={!canSubmit}
+              >
+                {submitting
+                  ? formatMessage({ id: "channel.addMembers.adding" })
+                  : formatMessage(
+                      { id: "channel.addMembers.submit" },
+                      { count: selectedHumanIds.size + selectedAgentIds.size },
+                    )}
+              </Button>
+            )}
+          </DialogCommit>
+        </DialogCardFooter>
     </DialogCard>
   );
 }

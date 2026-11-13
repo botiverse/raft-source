@@ -1,6 +1,9 @@
 import type { AgentConfig } from "@botiverse/raft-shared";
 import type { PendingStartRebind } from "./agentStartCoordinator";
 import { AgentStatusTransitionTrace, type AgentStatusTransitionInput } from "./agentStatusTransitionTrace";
+import { ProviderLimitLedger, type ProviderLimitBackoffRecord, type ProviderLimitCredentialKey } from "./providerLimitLedger";
+import { ExitStreaks } from "./planExit";
+import { StalledReplacementStreaks } from "./stalledWithWork";
 
 export type AgentRestartSnapshot = {
   config: AgentConfig;
@@ -15,6 +18,15 @@ export type AgentRestartSnapshot = {
 export type AgentTerminalFailure = {
   detail: string;
   launchId: string | null;
+};
+
+/**
+ * Task #1315's fence (NotFoundError with HTTP 404, any text): the count in a
+ * row with no progress in between, and the last error.
+ */
+export type RuntimeErrorClassFenceState = {
+  attempts: number;
+  lastRuntimeError: string;
 };
 
 export type AgentLifecycleRecord<SpawnFailBackoff = unknown, FingerprintFence = unknown> =
@@ -77,6 +89,19 @@ export type AgentLifecycleRecordSnapshot<SpawnFailBackoff = unknown, Fingerprint
   activityClientSeqs: readonly (readonly [agentId: string, seq: number])[];
 };
 
+// The provider-limit vocabulary lives with the ledger both agent hosts share
+// (providerLimitLedger.ts); re-exported for this module's existing importers.
+export {
+  PROVIDER_LIMIT_ATTEMPT_MEMORY_MS,
+  ownProviderLimitCredentialKey,
+  providerLimitCredentialKey,
+  providerLimitCredentialKeyKind,
+  sharedProviderLimitCredentialKey,
+  type ProviderLimitBackoffRecord,
+  type ProviderLimitCredentialKey,
+  type ProviderLimitReleaseCause,
+} from "./providerLimitLedger";
+
 export class AgentLifecycleRecords<SpawnFailBackoff = unknown, FingerprintFence = unknown> {
   readonly idleRestartSnapshots = new Map<string, AgentRestartSnapshot>();
   readonly terminalFailures = new Map<string, AgentTerminalFailure>();
@@ -84,10 +109,69 @@ export class AgentLifecycleRecords<SpawnFailBackoff = unknown, FingerprintFence 
   readonly pendingStartRebinds = new Map<string, PendingStartRebind>();
   readonly pendingSpawnCauses = new Map<string, string>();
   readonly runtimeErrorFingerprintFences = new Map<string, FingerprintFence>();
+  /**
+   * Reconciler step 12 (row C11): the 404 fence's count, outside the process
+   * like the same-fingerprint fence's, so a runtime that fails once per
+   * process (a respawn per wake) still reaches the threshold. Reset on
+   * progress, any other error, a person's stop, or when the agent has nothing
+   * left here (as the fingerprint fence). Not part of the lifecycle snapshot.
+   */
+  private readonly runtimeErrorClassFences = new Map<string, RuntimeErrorClassFenceState>();
   readonly activityClientSeqs = new Map<string, number>();
+  /**
+   * Reconciler step 10a/10b (`planExit`), in the store both agent hosts share
+   * (`ExitStreaks`, planExit.ts; core.ts creates one and hands it to both):
+   * the crash streak (process crashes in a row per agent, recoverable
+   * provider closes included, with no model output, clean turn end or
+   * explicit stop in between; the close-path restart backoff grows with it),
+   * its cap streak (every crash but a recoverable provider close, D3, which
+   * neither adds to nor resets it; CRASH_STREAK_CAP ends a loop), and the
+   * early crashes in a row of launches that resumed one stored session (a
+   * different session, real output, a close that does not qualify or an
+   * explicit stop ends it). Outside the process so they grow across
+   * respawns; not part of the lifecycle snapshot; a daemon restart forgets them.
+   */
+  private readonly exitStreakStore: ExitStreaks;
+  /**
+   * Reconciler step 9: stalled-with-work replacements in a row per agent with
+   * no model output or turn end in between, and whether automatic
+   * replacement gave up on it. Lives outside the process so the count
+   * survives the replacement; an explicit stop ends it. Not part of the
+   * lifecycle snapshot; a daemon restart forgets it. The OAR host shares it
+   * (`OarAgentHostDeps.stalledReplacements`).
+   */
+  readonly stalledReplacementStreaks = new StalledReplacementStreaks();
+  /**
+   * The provider-limit delivery backoff last armed per credential
+   * (`ProviderLimitCredentialKey`), in the ledger both agent hosts share
+   * (providerLimitLedger.ts; the OAR host borrows this one). The live backoff
+   * is on each process; this copy outlives them so a replacement process (or
+   * a wake with no process), and every other agent on the same shared
+   * sign-in, still waits for the limit. Cleared on real model output on that
+   * credential, a credentials change (shared keys), or an explicit stop /
+   * manual restart of any agent on it, and dropped by the first read once its
+   * wait has been over for PROVIDER_LIMIT_ATTEMPT_MEMORY_MS
+   * (`getProviderLimit`); not part of the snapshot.
+   */
+  private readonly providerLimits: ProviderLimitLedger;
   private readonly stopEpochs = new Map<string, number>();
   private readonly startEpochs = new Map<string, number>();
   private readonly statusTransitions = new AgentStatusTransitionTrace();
+
+  constructor(providerLimits: ProviderLimitLedger = new ProviderLimitLedger(), exitStreaks: ExitStreaks = new ExitStreaks()) {
+    this.providerLimits = providerLimits;
+    this.exitStreakStore = exitStreaks;
+  }
+
+  /** Reconciler step 10b: the exit streaks these records keep their crash and early-crash records in. */
+  get exitStreaks(): ExitStreaks {
+    return this.exitStreakStore;
+  }
+
+  /** The provider-limit ledger these records keep their limits in. */
+  get providerLimitLedger(): ProviderLimitLedger {
+    return this.providerLimits;
+  }
 
   recordStop(agentId: string): number {
     const next = (this.stopEpochs.get(agentId) ?? 0) + 1;
@@ -186,6 +270,77 @@ export class AgentLifecycleRecords<SpawnFailBackoff = unknown, FingerprintFence 
     return this.terminalFailures.keys();
   }
 
+  getRuntimeErrorCloseStreak(agentId: string): number {
+    return this.exitStreakStore.crashStreak(agentId);
+  }
+
+  getCrashCapStreak(agentId: string): number {
+    return this.exitStreakStore.capStreak(agentId);
+  }
+
+  /** Reconciler step 10a: the crash streak and its cap streak after an exit (`planExit`); 0 deletes one. */
+  setRuntimeErrorCloseStreak(agentId: string, streak: number, capStreak: number): void {
+    this.exitStreakStore.setStreaks(agentId, streak, capStreak);
+  }
+
+  /** Ends the crash streak and its cap streak; true if there was one. */
+  deleteRuntimeErrorCloseStreak(agentId: string): boolean {
+    return this.exitStreakStore.deleteStreaks(agentId);
+  }
+
+  /** The early crashes in a row of launches that resumed one session (`planExit`'s `resumeFailures`). */
+  getResumedEarlyCrashStreak(agentId: string): { sessionId: string; count: number } | null {
+    return this.exitStreakStore.resumeFailureRecord(agentId);
+  }
+
+  /** Reconciler step 10a: the record an exit leaves (`planExit`); null deletes it. */
+  setResumedEarlyCrashStreak(agentId: string, record: { sessionId: string; count: number } | null): void {
+    this.exitStreakStore.setResumeFailureRecord(agentId, record);
+  }
+
+  deleteResumedEarlyCrashStreak(agentId: string): boolean {
+    return this.exitStreakStore.deleteResumeFailureRecord(agentId);
+  }
+
+  getStalledReplacementStreak(agentId: string): { count: number; gaveUp: boolean } {
+    return this.stalledReplacementStreaks.get(agentId);
+  }
+
+  /** Counts one more stalled-with-work replacement; returns the new streak. */
+  noteStalledReplacement(agentId: string): number {
+    return this.stalledReplacementStreaks.note(agentId);
+  }
+
+  /** Automatic replacement gave up on this streak (traced and shown once). */
+  noteStalledReplacementGaveUp(agentId: string): void {
+    this.stalledReplacementStreaks.noteGaveUp(agentId);
+  }
+
+  deleteStalledReplacementStreak(agentId: string): boolean {
+    return this.stalledReplacementStreaks.delete(agentId);
+  }
+
+  /**
+   * The credential's provider limit (`ProviderLimitLedger.get`): it holds
+   * deliveries only while `untilMs > nowMs`, and is kept elapsed for
+   * PROVIDER_LIMIT_ATTEMPT_MEMORY_MS for its attempts (task #379).
+   */
+  getProviderLimit(key: ProviderLimitCredentialKey, nowMs: number): ProviderLimitBackoffRecord | undefined {
+    return this.providerLimits.get(key, nowMs);
+  }
+
+  hasProviderLimits(): boolean {
+    return this.providerLimits.hasAny();
+  }
+
+  setProviderLimit(key: ProviderLimitCredentialKey, record: ProviderLimitBackoffRecord): void {
+    this.providerLimits.set(key, record);
+  }
+
+  deleteProviderLimit(key: ProviderLimitCredentialKey): boolean {
+    return this.providerLimits.delete(key);
+  }
+
   getSpawnFailBackoff(agentId: string): SpawnFailBackoff | undefined {
     return this.activeSpawnFailBackoffs.get(agentId);
   }
@@ -247,6 +402,22 @@ export class AgentLifecycleRecords<SpawnFailBackoff = unknown, FingerprintFence 
 
   runtimeErrorFingerprintFenceAgentIds(): IterableIterator<string> {
     return this.runtimeErrorFingerprintFences.keys();
+  }
+
+  getRuntimeErrorClassFence(agentId: string): RuntimeErrorClassFenceState | undefined {
+    return this.runtimeErrorClassFences.get(agentId);
+  }
+
+  setRuntimeErrorClassFence(agentId: string, fence: RuntimeErrorClassFenceState): void {
+    this.runtimeErrorClassFences.set(agentId, fence);
+  }
+
+  deleteRuntimeErrorClassFence(agentId: string): boolean {
+    return this.runtimeErrorClassFences.delete(agentId);
+  }
+
+  runtimeErrorClassFenceAgentIds(): IterableIterator<string> {
+    return this.runtimeErrorClassFences.keys();
   }
 
   snapshot(args: {

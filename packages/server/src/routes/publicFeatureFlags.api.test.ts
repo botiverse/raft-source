@@ -10,7 +10,7 @@ import { featureFlags, users } from "../db/schema";
 import { createServer } from "../services/serverService";
 import { createFeatureFlag, createFeatureFlagRule } from "../services/featureFlagService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 // Task #205: GET /api/public/feature-flags answers before login. Fixtures go through the service
 // layer plus a direct column write for pre_auth_evaluable, because flag administration lives in the
@@ -21,7 +21,7 @@ async function markPreAuth(key: string) {
 }
 
 test("public feature flags: only marked flags answer, from kill switch, enabled, platform rules and default", async () => {
-  const { baseUrl, close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const { baseUrl, close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const db = getDb();
     const [owner] = await db.insert(users).values({
@@ -99,7 +99,7 @@ test("public feature flags: only marked flags answer, from kill switch, enabled,
 });
 
 test("public feature flags: rejects bad keys and platforms", async () => {
-  const { baseUrl, close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const { baseUrl, close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     for (const query of [
       "",

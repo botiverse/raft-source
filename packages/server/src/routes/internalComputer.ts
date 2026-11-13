@@ -15,24 +15,40 @@
 // reaching here. Phase 1 accepts sk_machine_* as a Computer alias until the
 // wire prefix migration lands.
 
-import { Router, type Response, type Router as RouterType } from "express";
+import { Router, type Request, type Response, type Router as RouterType } from "express";
+import rateLimit from "express-rate-limit";
 import type { Server as SocketServer } from "socket.io";
 import {
   AGENT_MIGRATION_TERMINAL_FAILURE_CODES,
+  DAEMON_CAPABILITY_RUNNER_CREDENTIAL_RENEW_V1,
   currentDate,
   type AgentMigrationControlManifest,
   type AgentMigrationSourceQuiesceReceipt,
 } from "@botiverse/raft-shared";
-import { and, eq, inArray, isNull } from "drizzle-orm";
+import { and, eq, inArray, isNull, sql } from "drizzle-orm";
 import { getDb } from "../db/index";
-import { agents, computers, servers } from "../db/schema";
+import { agents, computers, machines, servers } from "../db/schema";
+import { handleMachineLocalRouting } from "../machineLocalReplay";
+import { createMachineLocalComputerLifecycleOperation } from "../services/computerLifecycleOperationService";
+import { revokeComputerKeyInTransaction } from "../services/computerKeyRevocation";
+import { noticeOwnersOfDetachedComputer } from "../services/computerDetachedNotices";
+import { OthersAgentsOnComputerError, unbindForcedOthersAgents, type OthersAgentOnMachine } from "../services/computerAgents";
+import { parseAgentIdList, withOwnerNotifyTimes } from "../services/accountDeletion/ownerNotices";
+import { postAgentActionRequiredNotice } from "../services/agentActionRequiredNoticeService";
+import { newAuditOperationId, recordIntegrationAuditEvent, serverAuditContextMetadata } from "../services/integrationAuditService";
+import { closeDeviceSessionKeys } from "../services/deviceSessionKeys";
+import { addTraceEvent } from "../tracing/semanticTrace";
 import {
   ALLOWED_AGENT_CAPABILITIES,
   mintAgentCredential,
   normalizeAgentCapabilities,
-  revokeAgentCredential,
+  renewRunnerCredential,
+  revokeAgentCredentialWithOutcome,
+  runnerCredentialExpiresAt,
   type AgentCapability,
+  type RunnerCredentialRenewRefusal,
 } from "../services/agentCredentialService";
+import { refuse, rateLimitRefusal, type RefusalStatus } from "../lib/refusal";
 import { broadcastAgentCredentialRevocation } from "../replicaRouter";
 import {
   ProviderConnectionError,
@@ -64,6 +80,7 @@ import {
   getAgentMigrationTargetImport,
   getAgentMigrationResumableControl,
   markAgentMigrationTransportLostForComputer,
+  agentMigrationSizeFailureNeedsConfigPush,
   markAgentMigrationTargetImportArrived,
   planAgentMigrationChunkTransfers,
   prepareAgentMigrationStreamedChunk,
@@ -83,6 +100,8 @@ import {
   emitAgentMigrationUpdatedByRef,
 } from "../services/agentMigrationRealtime";
 import { sendJsonServerError } from "./errorResponse";
+import { serializeErrorForLog } from "../tracing/safeErrorLog";
+import { setRequestTraceComputerCaller } from "../middleware/requestObservability";
 
 export const internalComputerRouter: RouterType = Router();
 
@@ -108,7 +127,10 @@ function migrationTransportToken(req: { headers: Record<string, string | string[
   return typeof token === "string" && token.trim() ? token.trim() : null;
 }
 
-async function computerMigrationContext(req: { serverId?: string; machineId?: string; computerId?: string }) {
+async function computerMigrationContext(
+  req: { serverId?: string; machineId?: string; computerId?: string; params?: Record<string, string | undefined> },
+  res: { locals?: Record<string, unknown> },
+) {
   const serverId = req.serverId ?? null;
   let machineId = req.machineId ?? null;
   if (serverId && !machineId && req.computerId) {
@@ -119,11 +141,15 @@ async function computerMigrationContext(req: { serverId?: string; machineId?: st
     machineId = computer?.machineId ?? null;
   }
   if (!serverId || !machineId) return null;
+  setRequestTraceComputerCaller(res, { machineId, migrationId: req.params?.migrationId });
   return { serverId, machineId };
 }
 
-async function targetImportContext(req: { serverId?: string; machineId?: string; computerId?: string }) {
-  const ctx = await computerMigrationContext(req);
+async function targetImportContext(
+  req: { serverId?: string; machineId?: string; computerId?: string; params?: Record<string, string | undefined> },
+  res: { locals?: Record<string, unknown> },
+) {
+  const ctx = await computerMigrationContext(req, res);
   if (!ctx) return null;
   return { serverId: ctx.serverId, targetMachineId: ctx.machineId };
 }
@@ -145,7 +171,9 @@ function sendMigrationError(res: Response, err: unknown): void {
     MIGRATION_ARRIVAL_DEADLINE_EXPIRED: { status: 409, code: "migration_arrival_deadline_expired", error: "Migration arrival deadline expired" },
     MIGRATION_CONCURRENT_UPDATE: { status: 409, code: "migration_concurrent_update", error: "Migration changed concurrently" },
     MIGRATION_SOURCE_MACHINE_MISMATCH: { status: 409, code: "migration_source_machine_mismatch", error: "Source machine no longer owns the agent" },
+    MIGRATION_TARGET_COMPUTER_DETACHED: { status: 409, code: "migration_target_computer_detached", error: "This Computer's key was revoked; the migration failed" },
     MIGRATION_NOT_ACTIVE: { status: 409, code: "migration_not_active", error: "Migration is not active" },
+    MIGRATION_TRANSFER_ENDED: { status: 410, code: "migration_transfer_ended", error: "Migration has ended; stop transferring" },
     MIGRATION_RESUMABLE_PROTOCOL_REQUIRED: { status: 409, code: "migration_resumable_protocol_required", error: "Resumable migration protocol is required" },
     MIGRATION_TRANSPORT_TOKEN_INVALID: { status: 401, code: "migration_transport_token_invalid", error: "Migration transport token is invalid" },
     MIGRATION_LEASE_EXPIRED: { status: 410, code: "migration_lease_expired", error: "Migration transfer lease expired" },
@@ -237,6 +265,331 @@ internalComputerRouter.post("/preflight", async (req, res) => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// Device-auth PR 3c: what the Computer CLI used a person's session for, done
+// with the machine's own key. Each route acts on the presenting key's own
+// Computer and machine only: the machine comes from that key's live
+// `computers` row, never from the request, so a key can never reach another
+// machine. The Phase 1 sk_machine_* alias (requireComputerAuth sets
+// req.machineId) has no `computers` row and is refused here.
+// ---------------------------------------------------------------------------
+
+type OwnComputer = { computerId: string; serverId: string; machineId: string; name: string };
+
+/** The presenting key's own live Computer, or an answer already sent. */
+async function ownComputerOrRefuse(
+  req: { computerId?: string; serverId?: string; machineId?: string },
+  res: Response,
+): Promise<OwnComputer | null> {
+  if (req.machineId) {
+    res.status(403).json({
+      error: "This route needs a Computer key (sk_computer_*); a legacy machine key cannot use it",
+      code: "computer_key_required",
+    });
+    return null;
+  }
+  if (!req.computerId || !req.serverId) {
+    res.status(500).json({ error: "Computer authentication state missing", code: "computer_binding_missing" });
+    return null;
+  }
+  const [row] = await getDb()
+    .select({ id: computers.id, serverId: computers.serverId, machineId: computers.machineId, name: computers.name })
+    .from(computers)
+    .where(and(eq(computers.id, req.computerId), eq(computers.serverId, req.serverId), isNull(computers.revokedAt)))
+    .limit(1);
+  if (!row) {
+    res.status(401).json({ error: "This Computer's key was revoked", code: "computer_revoked" });
+    return null;
+  }
+  if (!row.machineId) {
+    res.status(409).json({ error: "This Computer has no machine on the server", code: "machine_binding_missing" });
+    return null;
+  }
+  return { computerId: row.id, serverId: row.serverId, machineId: row.machineId, name: row.name };
+}
+
+const MACHINE_LOCAL_LIFECYCLE_ACTIONS: ReadonlySet<string> = new Set(["start", "stop", "restart"]);
+const LIFECYCLE_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * POST /internal/computer/lifecycle-operations
+ *
+ * The same start/stop/restart record as POST
+ * /api/servers/:id/machines/:machineId/computer-lifecycle-operations (which
+ * stays for older Computers), authenticated by this Computer's own key and
+ * recorded as "this machine, locally" (cause machine_local, no actor user).
+ * Body: { action: start|stop|restart, operationId, parentOperationId }. A
+ * `machineId` or `serverId` in the body that is not this key's own is
+ * refused; upgrade (a Hands release decision) stays on the person's route.
+ */
+internalComputerRouter.post("/lifecycle-operations", async (req, res) => {
+  try {
+    const body = jsonBody(req);
+    const action = body.action;
+    const operationId = body.operationId;
+    const parentOperationId = body.parentOperationId;
+    if (typeof action !== "string" || !MACHINE_LOCAL_LIFECYCLE_ACTIONS.has(action)) {
+      res.status(400).json({ error: "Unknown Computer lifecycle action", code: "unknown_action" });
+      return;
+    }
+    if (typeof operationId !== "string" || !LIFECYCLE_UUID_RE.test(operationId)) {
+      res.status(400).json({ error: "A valid operationId is required", code: "invalid_operation_id" });
+      return;
+    }
+    if (typeof parentOperationId !== "string" || !LIFECYCLE_UUID_RE.test(parentOperationId)) {
+      res.status(400).json({ error: "A valid parentOperationId is required", code: "invalid_parent_operation_id" });
+      return;
+    }
+    if (body.targetVersion !== undefined || body.completionMode !== undefined) {
+      res.status(400).json({ error: "Only start, stop and restart are recorded here", code: "invalid_target_version" });
+      return;
+    }
+    const own = await ownComputerOrRefuse(req, res);
+    if (!own) return;
+    if ((body.machineId !== undefined && body.machineId !== own.machineId)
+      || (body.serverId !== undefined && body.serverId !== own.serverId)) {
+      res.status(403).json({ error: "A Computer records only its own lifecycle", code: "computer_machine_mismatch" });
+      return;
+    }
+    const orchestrator = req.app.get("agentOrchestrator") as AgentOrchestrator;
+    const routing = await handleMachineLocalRouting(
+      req,
+      res,
+      own.machineId,
+      () => orchestrator.hasMachineLocally(own.machineId),
+    );
+    if (routing === "handled") return;
+    const connectionEpoch = routing === "confirmed_local"
+      ? orchestrator.getMachineConnectionEpoch?.(own.machineId) ?? null
+      : null;
+    if (action === "start" && connectionEpoch) {
+      res.status(409).json({ error: "Computer is already online", code: "computer_already_online" });
+      return;
+    }
+    if (action !== "start" && !connectionEpoch) {
+      res.status(409).json({ error: "Computer is not online", code: "computer_offline" });
+      return;
+    }
+    // Under a share lock on this key's live row: a revoke (web, link, detach)
+    // updates it first, so a record either commits before it or finds the key
+    // revoked and writes nothing.
+    const operation = await getDb().transaction(async (tx) => {
+      const [live] = await tx
+        .select({ id: computers.id })
+        .from(computers)
+        .where(and(eq(computers.id, own.computerId), isNull(computers.revokedAt)))
+        .for("share");
+      if (!live) return "revoked" as const;
+      return createMachineLocalComputerLifecycleOperation({
+        operationId,
+        parentOperationId,
+        serverId: own.serverId,
+        machineId: own.machineId,
+        action: action as "start" | "stop" | "restart",
+        connectionEpochBefore: connectionEpoch,
+      }, { executor: tx });
+    });
+    if (operation === "revoked") {
+      res.status(401).json({ error: "This Computer's key was revoked", code: "computer_revoked" });
+      return;
+    }
+    if (!operation) {
+      res.status(409).json({ error: "Operation identity does not match", code: "computer_lifecycle_operation_conflict" });
+      return;
+    }
+    addTraceEvent("operation.intent.recorded", {
+      operation_id: operation.operationId,
+      action,
+      server_id: own.serverId,
+      machine_id: own.machineId,
+      dispatch_mode: "local",
+      cause: "machine_local",
+    });
+    res.status(201).json({ operationId: operation.operationId, action });
+  } catch (err) {
+    sendJsonServerError(req, res, {
+      error: "Failed to record the Computer lifecycle operation",
+      code: "computer_lifecycle_record_failed",
+      logPrefix: "[internal.computer] lifecycle-operations failed",
+      err,
+    });
+  }
+});
+
+/**
+ * GET /internal/computer/self
+ *
+ * How the server sees this Computer, for `raft-computer doctor`: its own row
+ * and machine only, and only what doctor shows (names, ids, how many agents
+ * are assigned to the machine). Nothing about other machines or people.
+ */
+internalComputerRouter.get("/self", async (req, res) => {
+  try {
+    const own = await ownComputerOrRefuse(req, res);
+    if (!own) return;
+    const db = getDb();
+    const [machine] = await db
+      .select({ name: machines.name })
+      .from(machines)
+      .where(and(eq(machines.id, own.machineId), eq(machines.serverId, own.serverId)))
+      .limit(1);
+    if (!machine) {
+      res.status(409).json({ error: "This Computer has no machine on the server", code: "machine_binding_missing" });
+      return;
+    }
+    const [count] = await db
+      .select({ value: sql<number>`count(*)::int` })
+      .from(agents)
+      .where(and(eq(agents.serverId, own.serverId), eq(agents.machineId, own.machineId), isNull(agents.deletedAt)));
+    res.status(200).json({
+      computer: {
+        computerId: own.computerId,
+        computerName: own.name,
+        serverId: own.serverId,
+        machineId: own.machineId,
+        machineName: machine.name,
+        agentCount: Number(count?.value) || 0,
+      },
+    });
+  } catch (err) {
+    sendJsonServerError(req, res, {
+      error: "Failed to read this Computer",
+      code: "computer_self_failed",
+      logPrefix: "[internal.computer] self failed",
+      err,
+    });
+  }
+});
+
+/**
+ * POST /internal/computer/detach
+ *
+ * `raft-computer detach <server>`: this Computer revokes its own key on this
+ * server, with every runner key (`sk_agent_*`) its machine minted, and their
+ * connections are closed after commit (computerKeyRevocation.ts, via
+ * `detach`). The machine, its agents and their history stay, as with the web
+ * revoke; the machine comes back only with a new attach. It reaches nothing
+ * else: no other Computer, machine or person. The Computer deletes its local
+ * credential only after this answers 200.
+ *
+ * Gated like the web revoke by the person who attached it (routes/servers.ts
+ * revoke-computer-key; Tenny, #triage:d10ace06 msg=670f6e97), or a detach from
+ * the command line would get around that gate and the account deletion's:
+ * someone else's live agent on the machine (as the machine's person,
+ * `machines.user_id`, sees it, as on the web)
+ * refuses it, 409 `others_agents_on_computer` with the same `agents` list,
+ * until it is moved or the body's `forceAgentIds` names every one of them.
+ * Then they are unbound and stopped (not deleted) in the revoke's transaction,
+ * audited (`computer.revoke_unbound_others_agents`, via `detach`), and each
+ * owner is told after commit. The list is read under the machine row lock
+ * (FOR UPDATE) held until commit, so no bind lands in between
+ * (computerAgents.ts lockMachineTakingAgents).
+ *   { forceAgentIds?: string[] } -> { ok, computerId, machineId, unboundAgentIds }
+ */
+internalComputerRouter.post("/detach", async (req, res) => {
+  // Whose view the 409's agent list and its notice times are in: the machine's person.
+  const gate = { attacherUserId: null as string | null };
+  try {
+    const own = await ownComputerOrRefuse(req, res);
+    if (!own) return;
+    const rawForce = jsonBody(req).forceAgentIds;
+    const forceAgentIds = rawForce === undefined ? [] : parseAgentIdList(rawForce);
+    if (!forceAgentIds) {
+      res.status(400).json({ error: "forceAgentIds must be a list of at most 200 agent ids.", code: "invalid_force_agent_ids" });
+      return;
+    }
+    const now = currentDate();
+    const outcome = await getDb().transaction(async (tx) => {
+      // The machine row FOR UPDATE first, as the web revoke takes it (then the Computer row).
+      const [machine] = await tx
+        .select({ id: machines.id, userId: machines.userId, name: machines.name })
+        .from(machines)
+        .where(and(eq(machines.id, own.machineId), eq(machines.serverId, own.serverId)))
+        .for("update");
+      // Then the Computer row FOR UPDATE, held until commit: a revoke that takes no machine lock (the revoke
+      // link, the security cascades) either commits first, and this finds the key revoked and unbinds nothing,
+      // or waits for this one.
+      const [live] = await tx
+        .select({ id: computers.id })
+        .from(computers)
+        .where(and(eq(computers.id, own.computerId), isNull(computers.revokedAt)))
+        .for("update");
+      let unbound: OthersAgentOnMachine[] = [];
+      // A key revoked meanwhile is refused below whatever is on the machine.
+      if (machine && live) {
+        // "Other people's" as the machine's person sees it (`machines.user_id`), the same rule as the web revoke,
+        // even for a legacy machine an admin adopted (whose Computer's attached_by_user_id is the admin).
+        gate.attacherUserId = machine.userId;
+        unbound = await unbindForcedOthersAgents(tx, { machineId: machine.id, attacherUserId: machine.userId, forceAgentIds, now });
+      }
+      const operationId = newAuditOperationId();
+      if (unbound.length > 0) {
+        await recordIntegrationAuditEvent({
+          serverId: own.serverId,
+          eventType: "computer.revoke_unbound_others_agents",
+          outcome: "success",
+          // Asked by the Computer itself with its own key, never by a person: the actor is that Computer (a
+          // system actor whose id is the Computer's; the audit actor kinds have no machine kind), so the record
+          // does not read as the machine's person having done it.
+          source: "cli",
+          actor: { type: "system", id: own.computerId },
+          requester: null,
+          target: { type: "machine", id: own.machineId },
+          metadata: { agentIds: unbound.map((agent) => agent.id), machineId: own.machineId, computerId: own.computerId, via: "detach", ...serverAuditContextMetadata({ operationId }) },
+        }, tx);
+      }
+      const result = await revokeComputerKeyInTransaction(tx, { computerId: own.computerId, by: { via: "detach" }, now, operationId });
+      return {
+        result,
+        unbound: unbound.map((agent) => ({ agentId: agent.id, ownerUserId: agent.owner?.id ?? null })),
+        computerName: machine?.name ?? own.name,
+      };
+    });
+    const { result } = outcome;
+    if (!result?.revoked) {
+      // Revoked by something else between auth and here: the key is dead, its
+      // cascade ran with that revoke (this call repaired anything still live).
+      if (result) await closeDeviceSessionKeys(result.reach);
+      res.status(401).json({ error: "This Computer's key was revoked", code: "computer_revoked" });
+      return;
+    }
+    await closeDeviceSessionKeys(result.reach);
+    const io = req.app.get("io") as SocketServer | undefined;
+    const agentOrchestrator = req.app.get("agentOrchestrator") as AgentOrchestrator | undefined;
+    await noticeOwnersOfDetachedComputer(io, agentOrchestrator, result.detached);
+    // The agents unbound by force are no longer on the machine: their owners are told here.
+    for (const agent of outcome.unbound) {
+      agentOrchestrator?.evictCache(agent.agentId);
+      if (!agent.ownerUserId || !io || !agentOrchestrator) continue;
+      await postAgentActionRequiredNotice(io, agentOrchestrator, {
+        agentId: agent.agentId,
+        ownerUserId: agent.ownerUserId,
+        notice: { kind: "computer_detached", computerName: outcome.computerName },
+      }).catch((err) => console.warn("[internal.computer] unbound agent notice failed", { agentId: agent.agentId, err: serializeErrorForLog(err) }));
+    }
+    io?.to(`server:${own.serverId}`).emit("machine:updated", {
+      serverId: own.serverId,
+      machineId: own.machineId,
+    });
+    res.status(200).json({ ok: true, computerId: own.computerId, machineId: own.machineId, unboundAgentIds: outcome.unbound.map((agent) => agent.agentId) });
+  } catch (err) {
+    if (err instanceof OthersAgentsOnComputerError && gate.attacherUserId) {
+      res.status(409).json({
+        error: "Other people's agents run on this computer. Ask their owners to move them first, or name them to unbind them.",
+        code: "others_agents_on_computer",
+        agents: await withOwnerNotifyTimes(gate.attacherUserId, err.agents, currentDate().getTime()),
+      });
+      return;
+    }
+    sendJsonServerError(req, res, {
+      error: "Failed to detach this Computer",
+      code: "computer_detach_failed",
+      logPrefix: "[internal.computer] detach failed",
+      err,
+    });
+  }
+});
+
 /**
  * GET /internal/computer/agent-migrations/by-id/:migrationId
  *
@@ -245,7 +598,7 @@ internalComputerRouter.post("/preflight", async (req, res) => {
  */
 internalComputerRouter.get("/agent-migrations/by-id/:migrationId", async (req, res) => {
   try {
-    const ctx = await targetImportContext(req);
+    const ctx = await targetImportContext(req, res);
     if (!ctx) {
       res.status(500).json({ error: "Computer machine binding missing", code: "machine_binding_missing" });
       return;
@@ -263,7 +616,7 @@ internalComputerRouter.get("/agent-migrations/by-id/:migrationId", async (req, r
 
 internalComputerRouter.post("/agent-migrations/by-id/:migrationId/transport-lost", async (req, res) => {
   try {
-    const ctx = await computerMigrationContext(req);
+    const ctx = await computerMigrationContext(req, res);
     if (!ctx) {
       res.status(500).json({ error: "Computer machine binding missing", code: "machine_binding_missing" });
       return;
@@ -284,6 +637,10 @@ internalComputerRouter.post("/agent-migrations/by-id/:migrationId/transport-lost
     const transportGeneration = typeof body.transportGeneration === "string" && body.transportGeneration.length <= 200
       ? body.transportGeneration
       : null;
+    const orchestrator = req.app.get("agentOrchestrator") as AgentOrchestrator | undefined;
+    // The reporter is connected (it is sending this); as the source its
+    // capabilities pick the next step a size failure's receipt offers.
+    const reporterTransport = await orchestrator?.getMachineMigrationTransport(ctx.machineId);
     const migration = await markAgentMigrationTransportLostForComputer({
       migrationId: req.params.migrationId,
       serverId: ctx.serverId,
@@ -292,8 +649,22 @@ internalComputerRouter.post("/agent-migrations/by-id/:migrationId/transport-lost
       detailCode,
       transportGeneration,
       message,
+      reporterMigrationCapabilities: reporterTransport?.capabilities ?? null,
     });
     await emitAgentMigrationUpdated(req.app.get("io") as SocketServer | undefined, migration);
+    if (agentMigrationSizeFailureNeedsConfigPush(migration)) {
+      // The size failure is in the agent's migrationReadiness now (its config
+      // revision moved with the failure). Best effort: a later start carries it too.
+      try {
+        await orchestrator?.applyAgentConfig(migration.agentId);
+      } catch (err) {
+        addTraceEvent("server.agent.migration_readiness_push_failed", {
+          agent_id: migration.agentId,
+          migration_id: migration.id,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
     res.status(200).json({
       ok: true,
       migration: {
@@ -310,7 +681,7 @@ internalComputerRouter.post("/agent-migrations/by-id/:migrationId/transport-lost
 
 internalComputerRouter.post("/agent-migrations/by-id/:migrationId/cancel-ack", async (req, res) => {
   try {
-    const ctx = await computerMigrationContext(req);
+    const ctx = await computerMigrationContext(req, res);
     if (!ctx) {
       res.status(500).json({ error: "Computer machine binding missing", code: "machine_binding_missing" });
       return;
@@ -359,7 +730,7 @@ internalComputerRouter.post("/agent-migrations/by-id/:migrationId/cancel-ack", a
 
 internalComputerRouter.post("/agent-migrations/by-id/:migrationId/resumable/source-quiesced", async (req, res) => {
   try {
-    const ctx = await computerMigrationContext(req);
+    const ctx = await computerMigrationContext(req, res);
     const token = migrationTransportToken(req);
     if (!ctx || !token) {
       res.status(token ? 500 : 401).json({ error: token ? "Computer machine binding missing" : "Migration transport token missing", code: token ? "machine_binding_missing" : "migration_transport_token_missing" });
@@ -387,7 +758,7 @@ internalComputerRouter.post("/agent-migrations/by-id/:migrationId/resumable/sour
 
 internalComputerRouter.post("/agent-migrations/by-id/:migrationId/resumable/source-progress", async (req, res) => {
   try {
-    const ctx = await computerMigrationContext(req);
+    const ctx = await computerMigrationContext(req, res);
     const token = migrationTransportToken(req);
     if (!ctx || !token) {
       res.status(token ? 500 : 401).json({ error: token ? "Computer machine binding missing" : "Migration transport token missing", code: token ? "machine_binding_missing" : "migration_transport_token_missing" });
@@ -412,7 +783,7 @@ internalComputerRouter.post("/agent-migrations/by-id/:migrationId/resumable/sour
 
 internalComputerRouter.post("/agent-migrations/by-id/:migrationId/resumable/control", async (req, res) => {
   try {
-    const ctx = await computerMigrationContext(req);
+    const ctx = await computerMigrationContext(req, res);
     const token = migrationTransportToken(req);
     if (!ctx || !token) {
       res.status(token ? 500 : 401).json({ error: token ? "Computer machine binding missing" : "Migration transport token missing", code: token ? "machine_binding_missing" : "migration_transport_token_missing" });
@@ -446,7 +817,7 @@ internalComputerRouter.post("/agent-migrations/by-id/:migrationId/resumable/cont
 
 internalComputerRouter.get("/agent-migrations/by-id/:migrationId/resumable/control", async (req, res) => {
   try {
-    const ctx = await computerMigrationContext(req);
+    const ctx = await computerMigrationContext(req, res);
     const token = migrationTransportToken(req);
     const role = req.query.role === "source" || req.query.role === "target" ? req.query.role : null;
     if (!ctx || !token || !role) {
@@ -468,7 +839,7 @@ internalComputerRouter.get("/agent-migrations/by-id/:migrationId/resumable/contr
 
 internalComputerRouter.get("/agent-migrations/by-id/:migrationId/resumable/chunks", async (req, res) => {
   try {
-    const ctx = await computerMigrationContext(req);
+    const ctx = await computerMigrationContext(req, res);
     const token = migrationTransportToken(req);
     const role = req.query.role === "source" || req.query.role === "target" ? req.query.role : null;
     const cursor = req.query.cursor === undefined ? undefined : Number(req.query.cursor);
@@ -494,7 +865,7 @@ internalComputerRouter.get("/agent-migrations/by-id/:migrationId/resumable/chunk
 // as it is packed, before the control manifest exists.
 internalComputerRouter.post("/agent-migrations/by-id/:migrationId/resumable/stream-chunks/:chunkIndex", async (req, res) => {
   try {
-    const ctx = await computerMigrationContext(req);
+    const ctx = await computerMigrationContext(req, res);
     const token = migrationTransportToken(req);
     const body = jsonBody(req);
     const migrationGeneration = requiredString(body, "migrationGeneration");
@@ -523,7 +894,7 @@ internalComputerRouter.post("/agent-migrations/by-id/:migrationId/resumable/stre
 
 internalComputerRouter.post("/agent-migrations/by-id/:migrationId/resumable/chunks/:chunkIndex/receipt", async (req, res) => {
   try {
-    const ctx = await computerMigrationContext(req);
+    const ctx = await computerMigrationContext(req, res);
     const token = migrationTransportToken(req);
     const body = jsonBody(req);
     const role = body.role === "source" || body.role === "target" ? body.role : null;
@@ -557,7 +928,7 @@ internalComputerRouter.post("/agent-migrations/by-id/:migrationId/resumable/chun
 
 internalComputerRouter.post("/agent-migrations/by-id/:migrationId/resumable/upload-complete", async (req, res) => {
   try {
-    const ctx = await computerMigrationContext(req);
+    const ctx = await computerMigrationContext(req, res);
     const token = migrationTransportToken(req);
     const body = jsonBody(req);
     const migrationGeneration = requiredString(body, "migrationGeneration");
@@ -588,7 +959,7 @@ internalComputerRouter.post("/agent-migrations/by-id/:migrationId/resumable/uplo
 // migrationGeneration and receives the next one back.
 internalComputerRouter.post("/agent-migrations/by-id/:migrationId/start-transfer", async (req, res) => {
   try {
-    const ctx = await targetImportContext(req);
+    const ctx = await targetImportContext(req, res);
     if (!ctx) {
       res.status(500).json({ error: "Computer machine binding missing", code: "machine_binding_missing" });
       return;
@@ -613,7 +984,7 @@ internalComputerRouter.post("/agent-migrations/by-id/:migrationId/start-transfer
 
 internalComputerRouter.post("/agent-migrations/by-id/:migrationId/flip-machine", async (req, res) => {
   try {
-    const ctx = await targetImportContext(req);
+    const ctx = await targetImportContext(req, res);
     if (!ctx) {
       res.status(500).json({ error: "Computer machine binding missing", code: "machine_binding_missing" });
       return;
@@ -629,7 +1000,11 @@ internalComputerRouter.post("/agent-migrations/by-id/:migrationId/flip-machine",
       serverId: ctx.serverId,
       targetMachineId: ctx.targetMachineId,
     });
+    // The flip revoked the source's runner credentials: close their open streams.
+    await broadcastAgentCredentialRevocation(view.agentId);
     await emitAgentMigrationUpdatedByRef(req.app.get("io") as SocketServer | undefined, ctx.serverId, view.migrationRef);
+    // task #1357 item 1: another Computer: the Raft-defaults signal changes.
+    await (req.app.get("agentOrchestrator") as AgentOrchestrator | undefined)?.notifyModelLimitsChanged?.({ agentIds: [view.agentId] });
     sendMigrationTargetImport(res, view);
   } catch (err) {
     sendMigrationError(res, err);
@@ -638,7 +1013,7 @@ internalComputerRouter.post("/agent-migrations/by-id/:migrationId/flip-machine",
 
 internalComputerRouter.post("/agent-migrations/by-id/:migrationId/arrived", async (req, res) => {
   try {
-    const ctx = await targetImportContext(req);
+    const ctx = await targetImportContext(req, res);
     if (!ctx) {
       res.status(500).json({ error: "Computer machine binding missing", code: "machine_binding_missing" });
       return;
@@ -791,8 +1166,9 @@ internalComputerRouter.post("/agent-migrations/by-id/:migrationId/arrived", asyn
  * Adding a field here is the ONLY way to widen the surface, which makes
  * the whitelist auditable in one place.
  *
- * Default scoping is the authenticated machine. `scope=server` is the
- * explicit legacy/server-wide view used by `raft-computer runners list --all`.
+ * Always the authenticated machine's runners. `scope=server` (sent by
+ * `raft-computer runners list --all`) is still accepted but no longer widens the
+ * list to every agent on the server (#proj-raft-computer:8e6a4629).
  */
 const RUNNER_LIST_WHITELIST = ["agentId", "name", "status", "model", "runtime"] as const;
 
@@ -804,14 +1180,13 @@ internalComputerRouter.get("/runners", async (req, res) => {
       return;
     }
     const scope = typeof req.query.scope === "string" ? req.query.scope : null;
-    const serverWide = scope === "server";
     if (scope && scope !== "machine" && scope !== "server") {
       res.status(400).json({ error: "Invalid runners scope", code: "invalid_scope" });
       return;
     }
     const db = getDb();
     let machineId: string | null = req.machineId ?? null;
-    if (!serverWide && !machineId) {
+    if (!machineId) {
       if (!req.computerId) {
         res.status(500).json({ error: "Computer authentication state missing", code: "computer_binding_missing" });
         return;
@@ -822,14 +1197,14 @@ internalComputerRouter.get("/runners", async (req, res) => {
         .where(eq(computers.id, req.computerId));
       machineId = computer?.machineId ?? null;
     }
-    if (!serverWide && !machineId) {
+    if (!machineId) {
       res.status(500).json({ error: "Computer machine binding missing", code: "machine_binding_missing" });
       return;
     }
     const conditions = [
       eq(agents.serverId, serverId),
       isNull(agents.deletedAt),
-      ...(serverWide ? [] : [eq(agents.machineId, machineId as string)]),
+      eq(agents.machineId, machineId as string),
     ];
     // Projection IS the whitelist. No `select()` of the whole row, ever.
     const rows = await db
@@ -874,7 +1249,7 @@ internalComputerRouter.get("/runners", async (req, res) => {
  */
 internalComputerRouter.post("/runners/:agentId/stop", async (req, res) => {
   try {
-    const context = await computerMigrationContext(req);
+    const context = await computerMigrationContext(req, res);
     const serverId = context?.serverId;
     if (!context || !serverId) {
       res.status(500).json({ error: "Computer authentication state missing" });
@@ -921,7 +1296,9 @@ internalComputerRouter.post("/runners/:agentId/stop", async (req, res) => {
  *   - scopes: subset of ALLOWED_AGENT_CAPABILITIES. Defaults to all.
  *   - name:   human label for the credential (e.g. "computer-Maria-runner-claude").
  *
- * Response 201: { credentialId, apiKey, scopes, agentId, agentName, serverId }
+ * Response 201: { credentialId, apiKey, scopes, agentId, agentName, serverId, expiresAt }
+ *   - expiresAt: ISO time, 7 days out, when the calling Machine's daemon
+ *     declared `runner-credential-renew:v1`; null (never expires) otherwise.
  *   - apiKey is the raw `sk_agent_*` key, returned exactly once. The
  *     Computer host MUST store it in its private credential store and
  *     never log it.
@@ -933,10 +1310,31 @@ internalComputerRouter.post("/runners/:agentId/stop", async (req, res) => {
  *   400 name_invalid                — name is non-string / too long
  *   500                             — unexpected
  */
+/**
+ * What a Computer may put on an `sk_agent_*` it mints (Tenny,
+ * #proj-raft-computer:8e6a4629): exactly what the daemon asks for
+ * (RUNNER_CREDENTIAL_SCOPES): the external-agent default plus `server` and `mcp`.
+ * Role checks still run live on every call, so `server` lets an admin agent
+ * edit the server and nothing more for a member agent. Never `raftbench`.
+ * Also the default when the request names no scopes.
+ */
+export const COMPUTER_MINTABLE_AGENT_CAPABILITIES = [
+  "send",
+  "read",
+  "mentions",
+  "tasks",
+  "reactions",
+  "server",
+  "channels",
+  "knowledge",
+  "mcp",
+] as const satisfies readonly AgentCapability[];
+const COMPUTER_MINTABLE_AGENT_CAPABILITY_SET: ReadonlySet<AgentCapability> = new Set(COMPUTER_MINTABLE_AGENT_CAPABILITIES);
+
 internalComputerRouter.post("/runners/:agentId/credentials", async (req, res) => {
   try {
     const computerId = req.computerId;
-    const context = await computerMigrationContext(req);
+    const context = await computerMigrationContext(req, res);
     const serverId = context?.serverId;
     if (!computerId || !context || !serverId) {
       // Should never happen — auth middleware sets both. Belt + suspenders.
@@ -968,7 +1366,7 @@ internalComputerRouter.post("/runners/:agentId/credentials", async (req, res) =>
 
     let scopes: AgentCapability[];
     if (body.scopes === undefined) {
-      scopes = [...ALLOWED_AGENT_CAPABILITIES];
+      scopes = [...COMPUTER_MINTABLE_AGENT_CAPABILITIES];
     } else if (!Array.isArray(body.scopes)) {
       res.status(400).json({
         error: "scopes must be an array of capability literals",
@@ -992,6 +1390,14 @@ internalComputerRouter.post("/runners/:agentId/credentials", async (req, res) =>
         });
         return;
       }
+      const beyondCeiling = scopes.filter((scope) => !COMPUTER_MINTABLE_AGENT_CAPABILITY_SET.has(scope));
+      if (beyondCeiling.length > 0) {
+        res.status(403).json({
+          error: `A Computer may issue only: ${COMPUTER_MINTABLE_AGENT_CAPABILITIES.join(", ")}`,
+          code: "scope_not_allowed_for_computer",
+        });
+        return;
+      }
     }
 
     let name: string | null = null;
@@ -1006,17 +1412,49 @@ internalComputerRouter.post("/runners/:agentId/credentials", async (req, res) =>
       name = body.name;
     }
 
-    const minted = await mintAgentCredential({
-      agentId: targetAgentId,
-      scopes,
-      name,
-      // Audit lineage for sk_computer_* mints lives on the credential row
-      // via `created_by_user_id = null` + the implicit `apiKeyPrefix` →
-      // (future) Computer attachment cross-reference. Slice-1 keeps the
-      // user audit column null; Phase 1 can add `created_by_computer_id`
-      // alongside Tao's reshape.
-      createdByUserId: null,
+    // Under a share lock on this Computer's live row: revoking a device login's
+    // session revokes the key (UPDATE computers) before the credentials its
+    // holder minted, so a mint in flight either commits first and is revoked
+    // with them, or finds the key revoked here. The credential carries the
+    // family holding the key now (deviceSessionKeys.ts). The sk_machine_*
+    // alias (requireComputerAuth sets req.machineId) has no computers row,
+    // and no device session issued its key: it mints as before, unfenced.
+    // #wg-rbac:#27: a daemon that renews gets a key that expires; any other
+    // gets one that never does, as before. Read from the Machine's current
+    // connection on any replica (its `ready` capabilities).
+    const expiresAt = runnerCredentialExpiresAt(await machineDeclaresRunnerCredentialRenew(req, context.machineId));
+    const minted = await db.transaction(async (tx) => {
+      let familyId: string | null = null;
+      // Only requireComputerAuth's sk_machine_* branch sets req.machineId, so
+      // branch on that, never on "no live computers row": a sk_computer_* key
+      // revoked mid-mint must still answer computer_revoked below, or it would
+      // mint a credential with no family that the revoke cascade misses.
+      if (!req.machineId) {
+        const [key] = await tx
+          .select({ familyId: computers.keyIssuedBySessionFamilyId })
+          .from(computers)
+          .where(and(eq(computers.id, computerId), isNull(computers.revokedAt)))
+          .for("share");
+        if (!key) return null;
+        familyId = key.familyId;
+      }
+      return mintAgentCredential({
+        agentId: targetAgentId,
+        scopes,
+        name,
+        // No person issued it; the minting Machine is recorded instead (the
+        // agent's current Machine, checked above).
+        issuedVia: "computer",
+        issuedByMachineId: context.machineId,
+        issuedBySessionFamilyId: familyId,
+        createdByUserId: null,
+        expiresAt,
+      }, { executor: tx });
     });
+    if (!minted) {
+      res.status(401).json({ error: "This Computer's key was revoked", code: "computer_revoked" });
+      return;
+    }
 
     res.status(201).json({
       credentialId: minted.credentialId,
@@ -1026,6 +1464,8 @@ internalComputerRouter.post("/runners/:agentId/credentials", async (req, res) =>
       agentId: minted.agentId,
       agentName: minted.agentName,
       serverId: minted.serverId,
+      // ISO time it stops authenticating; null: never (a daemon that does not renew).
+      expiresAt: minted.expiresAt?.toISOString() ?? null,
     });
   } catch (err) {
     if (err instanceof Error && err.message === "agent_missing") {
@@ -1033,6 +1473,152 @@ internalComputerRouter.post("/runners/:agentId/credentials", async (req, res) =>
       return;
     }
     sendJsonServerError(req, res, { error: "Failed to mint runner credential", logPrefix: "internal.computer.runners.credentials.mint error:", err });
+  }
+});
+
+/** Whether the Machine's daemon declared `runner-credential-renew:v1` on its current connection (any replica). */
+async function machineDeclaresRunnerCredentialRenew(req: Request, machineId: string): Promise<boolean> {
+  const orchestrator = req.app.get("agentOrchestrator") as Partial<AgentOrchestrator> | undefined;
+  if (typeof orchestrator?.machineAdvertisesCapability !== "function") return false;
+  return orchestrator.machineAdvertisesCapability(machineId, DAEMON_CAPABILITY_RUNNER_CREDENTIAL_RENEW_V1);
+}
+
+/** Renewals one Machine may ask for per minute (per replica). A daemon renews each runner key about every 3.5 days. */
+export const RUNNER_CREDENTIAL_RENEW_RATE_LIMIT_PER_MINUTE = 60;
+let runnerCredentialRenewRateLimit = RUNNER_CREDENTIAL_RENEW_RATE_LIMIT_PER_MINUTE;
+/** Tests only: set the per-minute renewal limit (null restores the default). */
+export function __setRunnerCredentialRenewRateLimitForTests(limit: number | null): void {
+  runnerCredentialRenewRateLimit = limit ?? RUNNER_CREDENTIAL_RENEW_RATE_LIMIT_PER_MINUTE;
+}
+// replica-local: abuse guard only, per-replica budget is acceptable. Keyed by
+// the authenticated Computer (the Machine is resolved in the handler; the key
+// is the same Machine's), never by IP.
+const runnerCredentialRenewLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: () => runnerCredentialRenewRateLimit,
+  standardHeaders: true,
+  legacyHeaders: false,
+  validate: false,
+  keyGenerator: (req) => `renew:${req.machineId ?? req.computerId ?? "unknown"}`,
+  handler: rateLimitRefusal(
+    "runner_credential_renew_rate_limited",
+    "This Computer asked to renew runner credentials too often: wait, then renew again.",
+  ),
+});
+
+const RUNNER_CREDENTIAL_RENEW_REFUSALS: Record<RunnerCredentialRenewRefusal, { status: RefusalStatus; error: string }> = {
+  agent_missing: { status: 404, error: "Agent not found, or it is not on this Computer." },
+  credential_missing: { status: 404, error: "No such credential of this agent: mint a new runner credential instead." },
+  credential_not_runner: { status: 403, error: "Only a runner credential a Computer minted can be renewed: mint a new one instead." },
+  credential_not_issued_by_this_computer: { status: 403, error: "This Computer did not issue this credential: mint a new runner credential instead." },
+  credential_revoked: { status: 409, error: "This credential was revoked and is never renewed: mint a new runner credential instead." },
+  renew_window_passed: { status: 409, error: "This credential expired more than 7 days ago and can no longer be renewed: mint a new runner credential instead." },
+  already_renewed: { status: 409, error: "This credential was already renewed once: mint a new runner credential instead." },
+};
+const RUNNER_CREDENTIAL_RENEW_REFUSAL_CODES: Record<RunnerCredentialRenewRefusal, string> = {
+  agent_missing: "agent_missing",
+  credential_missing: "credential_missing",
+  credential_not_runner: "credential_not_runner",
+  credential_not_issued_by_this_computer: "credential_not_issued_by_this_computer",
+  credential_revoked: "runner_credential_revoked",
+  renew_window_passed: "runner_credential_renew_window_passed",
+  already_renewed: "runner_credential_already_renewed",
+};
+
+/**
+ * POST /internal/computer/runners/:agentId/credentials/renew
+ *
+ * #wg-rbac:#27 — a Computer renews a runner credential it minted, before it
+ * expires or after a 401 `agent_credential_expired`. Authenticated by the
+ * Computer's own key (the same as the mint), never by the old agent key.
+ *
+ * Body: { credentialId } — the credential to renew.
+ *
+ * Response 201: { credentialId, apiKey, expiresAt, scopes, agentId, replacedCredentialId, replacedExpiresAt }
+ *   - apiKey: the new raw `sk_agent_*`, returned exactly once; expiresAt: ISO,
+ *     7 days out. The old key is not revoked: it keeps working until
+ *     replacedExpiresAt (at most 5 minutes out), then answers
+ *     `agent_credential_expired`.
+ *
+ * Errors (every one: the daemon mints a new runner credential instead):
+ *   400 credential_id_invalid                    — no credentialId in the body
+ *   404 agent_missing                            — agent gone, other server, or not on this Machine
+ *   403 runner_credential_renew_not_declared     — the daemon did not declare runner-credential-renew:v1
+ *   404 credential_missing                       — no such credential of this agent
+ *   403 credential_not_runner                    — not a Computer's runner credential
+ *   403 credential_not_issued_by_this_computer   — another Machine's
+ *   409 runner_credential_revoked                — revoked: never renewed
+ *   409 runner_credential_renew_window_passed    — expired more than 7 days ago
+ *   409 runner_credential_already_renewed        — renewed before; nothing new is issued
+ *   401 computer_revoked                         — the Computer's key was revoked mid-renewal
+ *   429 runner_credential_renew_rate_limited     — more than 60 a minute from this Machine
+ */
+internalComputerRouter.post("/runners/:agentId/credentials/renew", runnerCredentialRenewLimiter);
+internalComputerRouter.post("/runners/:agentId/credentials/renew", async (req, res) => {
+  try {
+    const computerId = req.computerId;
+    const context = await computerMigrationContext(req, res);
+    if (!computerId || !context) {
+      res.status(500).json({ error: "Computer authentication state missing" });
+      return;
+    }
+    const credentialId = requiredString(jsonBody(req), "credentialId");
+    if (!credentialId) {
+      refuse(res, 400, { code: "credential_id_invalid", error: "The renewal needs the credentialId of the runner credential to renew." });
+      return;
+    }
+    if (!await machineDeclaresRunnerCredentialRenew(req, context.machineId)) {
+      refuse(res, 403, {
+        code: "runner_credential_renew_not_declared",
+        error: "This Computer's daemon did not declare runner credential renewal on its current connection: mint a new runner credential instead.",
+      });
+      return;
+    }
+
+    // As the mint: under a share lock on this Computer's live row, so a device
+    // login's revoke either sees the new key (and revokes it with the rest)
+    // or this sees the key revoked; the new key carries the family holding the
+    // Computer's key now. The sk_machine_* alias has no computers row.
+    const renewal = await getDb().transaction(async (tx) => {
+      let familyId: string | null = null;
+      if (!req.machineId) {
+        const [key] = await tx
+          .select({ familyId: computers.keyIssuedBySessionFamilyId })
+          .from(computers)
+          .where(and(eq(computers.id, computerId), isNull(computers.revokedAt)))
+          .for("share");
+        if (!key) return null;
+        familyId = key.familyId;
+      }
+      return renewRunnerCredential({
+        agentId: req.params.agentId,
+        serverId: context.serverId,
+        machineId: context.machineId,
+        credentialId,
+        issuedBySessionFamilyId: familyId,
+      }, { executor: tx });
+    });
+    if (!renewal) {
+      refuse(res, 401, { code: "computer_revoked", error: "This Computer's key was revoked, so it can no longer renew runner credentials." });
+      return;
+    }
+    if (!renewal.ok) {
+      const refusal = RUNNER_CREDENTIAL_RENEW_REFUSALS[renewal.refusal];
+      refuse(res, refusal.status, { code: RUNNER_CREDENTIAL_RENEW_REFUSAL_CODES[renewal.refusal], error: refusal.error });
+      return;
+    }
+    res.status(201).json({
+      credentialId: renewal.credentialId,
+      // Raw sk_agent_* key — returned exactly once.
+      apiKey: renewal.apiKey,
+      expiresAt: renewal.expiresAt.toISOString(),
+      scopes: renewal.scopes,
+      agentId: req.params.agentId,
+      replacedCredentialId: renewal.replacedCredentialId,
+      replacedExpiresAt: renewal.replacedExpiresAt.toISOString(),
+    });
+  } catch (err) {
+    sendJsonServerError(req, res, { error: "Failed to renew runner credential", logPrefix: "internal.computer.runners.credentials.renew error:", err });
   }
 });
 
@@ -1044,7 +1630,7 @@ internalComputerRouter.post("/runners/:agentId/credentials", async (req, res) =>
  */
 internalComputerRouter.post("/runners/:agentId/provider-connection", async (req, res) => {
   try {
-    const context = await computerMigrationContext(req);
+    const context = await computerMigrationContext(req, res);
     if (!context) {
       res.status(500).json({ error: "Computer authentication state missing" });
       return;
@@ -1109,7 +1695,7 @@ internalComputerRouter.post("/runners/:agentId/provider-connection", async (req,
  */
 internalComputerRouter.post("/probes/:probeId/materialize", async (req, res) => {
   try {
-    const context = await computerMigrationContext(req);
+    const context = await computerMigrationContext(req, res);
     if (!context) {
       res.status(500).json({ error: "Computer authentication state missing" });
       return;
@@ -1163,7 +1749,7 @@ internalComputerRouter.post("/probes/:probeId/materialize", async (req, res) => 
  */
 internalComputerRouter.delete("/runners/:agentId/credentials/:credentialId", async (req, res) => {
   try {
-    const context = await computerMigrationContext(req);
+    const context = await computerMigrationContext(req, res);
     const serverId = context?.serverId;
     if (!context || !serverId) {
       res.status(500).json({ error: "Computer authentication state missing" });
@@ -1177,14 +1763,25 @@ internalComputerRouter.delete("/runners/:agentId/credentials/:credentialId", asy
       res.status(404).json({ error: "Agent not found", code: "agent_missing" });
       return;
     }
-    const ok = await revokeAgentCredential({
+    const outcome = await revokeAgentCredentialWithOutcome({
       credentialId: req.params.credentialId,
       agentId: req.params.agentId,
       serverId,
       reason: "managed_runner_launch_ended",
+      issuedByMachineId: context.machineId,
     });
-    if (!ok) {
+    if (outcome === null) {
       res.status(404).json({ error: "Credential not found", code: "credential_missing" });
+      return;
+    }
+    if (outcome === "not_issued_by_machine") {
+      // Human, app, provision and other Machines' credentials of this agent
+      // stay valid. Daemons send this DELETE once and only trace the status,
+      // so a distinct code is enough for them not to retry.
+      res.status(403).json({
+        error: "This Computer did not issue this credential",
+        code: "credential_not_issued_by_this_computer",
+      });
       return;
     }
     await broadcastAgentCredentialRevocation(req.params.agentId);

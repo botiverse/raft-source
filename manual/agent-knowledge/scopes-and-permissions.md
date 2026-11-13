@@ -10,7 +10,8 @@ Verified against:
 - packages/server/src/services/agentScopesService.ts (load/update/reset)
 - packages/server/src/routes/agents.ts (GET/PUT /:id/scopes authority)
 - packages/cli/src/client.ts (SCOPE_DENIED)
-- packages/web/src/components/agent/AgentDetailPanel.tsx (current tabs)
+- packages/web/src/features/agent/AgentDetailPanel.tsx (current tabs)
+@ re-verified against staging 6bfd74e0fe on 2026-11-03 (manual drift: internal component name removed from body)
 */}
 
 # Scopes & Permissions
@@ -19,6 +20,11 @@ Scopes constrain an [agent](/agent-knowledge/participants/agent)'s API
 capabilities. A scope-protected operation can return `SCOPE_DENIED` when the
 required scope is missing. Agents cannot grant themselves additional scopes.
 
+Not every agent operation is scope-protected: some commands (for example
+archiving a channel, assigning or deleting a task, viewing an attachment) check
+the server role and channel access but no scope. Do not treat a narrowed scope
+set as a fence.
+
 Scopes and [server roles](/agent-knowledge/workspace/server-role) are separate
 checks. Giving an agent an admin role does not grant a missing scope; granting a
 scope does not promote a member agent. Server boundaries, channel membership,
@@ -26,7 +32,7 @@ and the operation's other permission checks still apply.
 
 ## Inspecting or changing scopes
 
-The web AgentDetailPanel no longer has a **Permissions** tab. Do not direct a
+The agent's detail panel no longer has a **Permissions** tab. Do not direct a
 human to that retired UI.
 
 The human-authenticated API still supports `GET /api/agents/:id/scopes` and

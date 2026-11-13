@@ -45,6 +45,9 @@ const {
 } = await import("../src/store/messageStore");
 const { useServerStore } = await import("../src/store/serverStore");
 const { default: api } = await import("../src/api/client");
+const { applyReadStateUpdate } = await import("../src/store/applyReadStateUpdate");
+const { isScopeMarkedUnread, useMarkedUnreadStore } = await import("../src/store/markedUnreadStore");
+const { resetReadStateSyncForTests } = await import("../src/store/readStateSync");
 
 const originalPost = api.post.bind(api);
 const originalGet = api.get.bind(api);
@@ -132,6 +135,35 @@ test("markUnread waits for the server before showing a sidebar unread badge", as
   } finally {
     restoreApi();
     resetStores();
+  }
+});
+
+test("a Mark as Unread answer (marked, version 3) that lands after a read at version 4 does not bring the dot back", async () => {
+  const unreadResponse = deferred<{ data: Record<string, unknown> }>();
+  api.post = ((url: string) => (
+    url === "/channels/channel-1/unread" ? unreadResponse.promise : Promise.resolve({ data: {} })
+  )) as typeof api.post;
+  api.get = (async () => ({ data: {} })) as typeof api.get;
+  try {
+    resetStores();
+    resetReadStateSyncForTests();
+    useMarkedUnreadStore.setState({ marked: {} });
+    const marking = useMessageStore.getState().markUnread("channel-1");
+    await Promise.resolve();
+    // The mark's own event and then a read (another device) reach the ledger first.
+    applyReadStateUpdate({ serverId: "server-1", scopeId: "channel-1", maxReadSeq: 5, readStateVersion: 3, markedUnread: true });
+    assert.equal(isScopeMarkedUnread("channel-1"), true);
+    applyReadStateUpdate({ serverId: "server-1", scopeId: "channel-1", maxReadSeq: 5, readStateVersion: 4 });
+    assert.equal(isScopeMarkedUnread("channel-1"), false);
+
+    unreadResponse.resolve({ data: { ok: true, unreadCount: 0, markedUnread: true, maxReadSeq: 5, readStateVersion: 3 } });
+    await marking;
+    assert.equal(isScopeMarkedUnread("channel-1"), false, "the late answer is older than the read: no dot");
+  } finally {
+    restoreApi();
+    resetStores();
+    resetReadStateSyncForTests();
+    useMarkedUnreadStore.setState({ marked: {} });
   }
 });
 

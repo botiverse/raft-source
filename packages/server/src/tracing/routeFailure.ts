@@ -1,5 +1,6 @@
 // Route-failure error classification for server-side observability traces.
 import { addTraceEvent, errorClassOf } from "./semanticTrace";
+import { errorDiagnosisAttrs } from "./queryTrace";
 //
 // Background: `traceRouteFailure()` historically emitted only `error_class`
 // (= `err.name`, which is almost always the generic "Error"), discarding both
@@ -207,6 +208,7 @@ export function traceRouteFailure(name: string, err: unknown, attrs: Record<stri
     error_kind: resolveRouteFailureKind(errorSubkind),
     error_subkind: errorSubkind,
     error_message: sanitizeRouteErrorMessage(err instanceof Error ? err.message : String(err ?? "")),
+    ...errorDiagnosisAttrs(err),
     ...attrs,
   });
 }

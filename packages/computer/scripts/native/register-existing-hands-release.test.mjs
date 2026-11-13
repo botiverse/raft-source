@@ -107,7 +107,7 @@ function fixtureFetch(fixture, calls) {
   return async (url, init) => {
     const parsed = new URL(url);
     calls.push({ url: parsed.href, init });
-    const prefix = `https://cdn.slock.ai/computer/candidates/${sourceCommit}/`;
+    const prefix = `https://cdn.raft.build/computer/candidates/${sourceCommit}/`;
     assert.ok(parsed.href.startsWith(prefix), `escaped candidate origin: ${parsed.href}`);
     const name = decodeURIComponent(parsed.pathname.split("/").at(-1));
     const body = fixture.files.get(name);
@@ -139,7 +139,7 @@ test("verifies the complete canonical candidate, every sidecar, and gzip-to-raw 
       ...verifierOptions(fixture, fixtureFetch(fixture, calls)),
       workDir,
     });
-    assert.equal(verified.artifactBaseUrl, `https://cdn.slock.ai/computer/candidates/${sourceCommit}`);
+    assert.equal(verified.artifactBaseUrl, `https://cdn.raft.build/computer/candidates/${sourceCommit}`);
     assert.equal(calls.length, fixture.files.size);
     assert.equal(calls.every((call) => call.init.redirect === "error"), true);
   } finally {
@@ -161,7 +161,7 @@ test("candidate transport errors identify only the canonical host and pathname",
       (error) => {
         assert.match(
           error.message,
-          /^candidate download transport failed: cdn\.slock\.ai\/computer\/candidates\/[a-f0-9]{40}\/(?:candidate-receipt|candidate-inventory|manifest)\.json$/,
+          /^candidate download transport failed: cdn\.raft\.build\/computer\/candidates\/[a-f0-9]{40}\/(?:candidate-receipt|candidate-inventory|manifest)\.json$/,
         );
         assert.doesNotMatch(error.message, /bearer|must-not-leak|https?:\/\//);
         return true;
@@ -250,6 +250,40 @@ test("alpha is an exact supported channel and reaches the publisher with channel
   assert.equal(result.channel_id, "channel-alpha");
   assert.equal(published.channel, "alpha");
   assert.equal(published.mode, "register-or-exact-reuse");
+});
+
+test("candidate is an exact RC channel: an RC receipt registers there, a feature receipt cannot", async () => {
+  const fixture = makeFixture();
+  let published;
+  const result = await registerExistingHandsRelease({
+    ...verifierOptions(fixture, fixtureFetch(fixture, [])),
+    channel: "candidate",
+    confirmation: "REGISTER-EXACT-RAFT-COMPUTER-CLI-CANDIDATE",
+    runId: "run-1",
+    runUrl: "https://github.com/botiverse/slock/actions/runs/run-1",
+    publishImpl: async (options) => {
+      published = options;
+      return { channel_id: "channel-candidate" };
+    },
+  });
+  assert.equal(result.channel_id, "channel-candidate");
+  assert.equal(published.channel, "candidate");
+  assert.equal(published.mode, "register-or-exact-reuse");
+  // A feature build stamped `-candidate.<n>` is refused: candidate takes
+  // exact stable semver from an RC receipt only.
+  const feature = makeFixture({ version: "1.0.33-candidate.1", featureChannel: "candidate" });
+  await assert.rejects(
+    registerExistingHandsRelease({
+      ...verifierOptions(feature, fixtureFetch(feature, [])),
+      version: "1.0.33-candidate.1",
+      channel: "candidate",
+      confirmation: "REGISTER-EXACT-RAFT-COMPUTER-CLI-CANDIDATE",
+      runId: "run-1",
+      runUrl: "https://github.com/botiverse/slock/actions/runs/run-1",
+      publishImpl: async () => { throw new Error("Hands must not be called"); },
+    }),
+    /exact stable semver/,
+  );
 });
 
 // task #816 — a named feature channel is an exact supported channel; its
@@ -359,7 +393,7 @@ test("unsupported or confirmation-mismatched channel fails before candidate and 
           throw new Error("Hands must not be called");
         },
       }),
-      /--channel must be exactly main, alpha, or a named feature channel|channel-bound exact phrase/,
+      /--channel must be exactly main, alpha, candidate, or a named feature channel|channel-bound exact phrase/,
     );
     assert.equal(candidateCalls, 0);
     assert.equal(publishCalls, 0);
@@ -375,7 +409,7 @@ test.skipIf(inSourceSnapshot)("register-only workflow is staging-bound and conta
   assert.match(workflow, /test "\$\(git rev-parse origin\/staging\)" = "\$GITHUB_SHA"/);
   assert.match(workflow, /HANDS_BEARER_TOKEN: \$\{\{ secrets\.HANDS_COMPUTER_DEPLOY_TOKEN \}\}/);
   assert.match(workflow, /register-existing-hands-release\.mjs/);
-  assert.match(workflow, /channel:\n        description: Exact Hands channel to anchor[\s\S]*options:\n          - main\n          - alpha/);
+  assert.match(workflow, /channel:\n        description: Exact Hands channel to anchor[\s\S]*options:\n          - main\n          - alpha\n          - candidate\n/);
   assert.match(workflow, /--channel "\$CHANNEL"/);
   const runBlocks = workflow.split("        run: |").slice(1).join("\n");
   assert.doesNotMatch(runBlocks, /\$\{\{ inputs\./, "workflow inputs must reach shell only through env bindings");

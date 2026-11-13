@@ -5,11 +5,13 @@ import { hydrateThreadRepliesScope } from "../src/store/threadRepliesReadModel";
 import api from "../src/api/client";
 import { useServerStore } from "../src/store/serverStore";
 import type { Server } from "../src/store/serverStore";
+import { __resetThreadRepliesPrefetchForTest } from "../src/store/threadRepliesPrefetch";
 
 const originalPost = api.post.bind(api);
 const originalGet = api.get.bind(api);
 
 function resetStore() {
+  __resetThreadRepliesPrefetchForTest();
   useThreadStore.setState({
     openParentMessageId: null,
     openThreadChannelId: null,
@@ -167,7 +169,11 @@ test("openThread resolves an existing thread with a read-only lookup", async () 
 
     const state = useThreadStore.getState();
     assert.deepEqual(postCalls, []);
-    assert.deepEqual(getCalls, ["/channels/channel-1/threads/parent-1"]);
+    assert.deepEqual(getCalls, [
+      "/channels/channel-1/threads/parent-1",
+      // The replies' first page goes out as the lookup answers (threadRepliesPrefetch): a read too.
+      "/messages/channel/thread-1?limit=50",
+    ]);
     assert.equal(state.openParentMessageId, "parent-1");
     assert.equal(state.openParentChannelId, "channel-1");
     assert.equal(state.openThreadChannelId, "thread-1");
@@ -189,8 +195,11 @@ test("openThread can seed threadChannelId from an activity inbox row without any
   resetStore();
   let getCalled = false;
   let postCalled = false;
-  api.get = (async () => {
-    getCalled = true;
+  const replyReads: string[] = [];
+  api.get = (async (url: string) => {
+    // The replies' first read is sent at the open (threadRepliesPrefetch); a lookup is not.
+    if (url.startsWith("/messages/")) replyReads.push(url);
+    else getCalled = true;
     return { data: {} };
   }) as typeof api.get;
   api.post = (async () => {
@@ -218,6 +227,7 @@ test("openThread can seed threadChannelId from an activity inbox row without any
     assert.equal(state.openThreadError, null);
     assert.equal(getCalled, false);
     assert.equal(postCalled, false);
+    assert.deepEqual(replyReads, ["/messages/context/reply-1"], "the focused reply's context goes out at the open");
   } finally {
     restoreApi();
     resetStore();
@@ -265,8 +275,9 @@ test("typed openThread preserves participant projection ids and drops a stale se
   const originalEpoch = useServerStore.getState().serverEpoch;
   useServerStore.setState({ current: makeServer("guest-server"), serverEpoch: originalEpoch + 1 });
   let getCalled = false;
-  api.get = (async () => {
-    getCalled = true;
+  api.get = (async (url: string) => {
+    // The replies' first read is sent at the open (threadRepliesPrefetch); a lookup is not.
+    if (!url.startsWith("/messages/")) getCalled = true;
     return { data: {} };
   }) as typeof api.get;
 

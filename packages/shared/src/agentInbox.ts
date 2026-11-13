@@ -1,4 +1,6 @@
 import type { AttentionHint } from "./attentionDependencyOracle";
+import { formatHint, RAFT_HINTS } from "./agentOps/hint";
+import { parseAgentTaskRef } from "./agentText/taskRef";
 
 const NON_MEMBER_MENTION_REPLY_GUIDANCE =
   "[Raft notice: You were notified as a non-member, so you cannot reply in that channel. If no reply is needed, no action is required. Otherwise, DM the person who mentioned you or join the channel to participate.]";
@@ -136,23 +138,55 @@ export function formatAgentInboxSnapshot(rows: readonly AgentInboxTargetRow[]): 
 
 export function formatAgentInboxDelta(
   rows: readonly AgentInboxTargetRow[],
-  options: { totalPendingMessages?: number } = {},
+  options: {
+    totalPendingMessages?: number;
+    /** Task #387: latest-message previews by target (managed runtime notice only). */
+    previews?: ReadonlyMap<string, { senderName?: string; text: string; truncated: boolean }>;
+  } = {},
 ): string {
   const totalPendingMessages = options.totalPendingMessages;
-  const header = typeof totalPendingMessages === "number"
+  const header = formatAgentInboxDeltaHeader(rows.length, totalPendingMessages);
+  if (rows.length === 0) return typeof totalPendingMessages === "number" ? header : "Inbox update: no pending targets";
+  return [
+    header,
+    ...rows.flatMap((row) => {
+      const line = `${formatAgentInboxRowTarget(row)}  ${formatAgentInboxRowDetails(row)}`;
+      const preview = isThirdPartyEventsTarget(row.target) ? undefined : options.previews?.get(row.target);
+      return preview ? [line, formatAgentInboxPreviewLine(row.target, preview)] : [line];
+    }),
+  ].join("\n");
+}
+
+/** The first line of an inbox update: the pending total and how many targets changed. */
+export function formatAgentInboxDeltaHeader(changedTargets: number, totalPendingMessages?: number): string {
+  return typeof totalPendingMessages === "number"
     // "pending your read across all conversations", not "unread ... total": this number
     // is totalPendingMessages, the SAME measure the rows below call `pending`, summed over
     // every conversation. `raft inbox check` uses the word "unread" for a DIFFERENT measure
     // (the RW-backed read cursor), so this header must not borrow that word. Two agents
     // misread this line on 2026-10-10: one mapped the total onto the single row beneath it,
     // the other mapped `inbox check`'s unread onto the rows' pending. Keep the two words apart.
-    ? `Inbox update: ${totalPendingMessages} message${totalPendingMessages === 1 ? "" : "s"} pending your read across all conversations; ${rows.length === 0 ? "no" : rows.length} changed target${rows.length === 1 ? "" : "s"}`
-    : `Inbox update: ${rows.length} changed target${rows.length === 1 ? "" : "s"}`;
-  if (rows.length === 0) return typeof totalPendingMessages === "number" ? header : "Inbox update: no pending targets";
-  return [
-    header,
-    ...rows.map((row) => `${formatAgentInboxRowTarget(row)}  ${formatAgentInboxRowDetails(row)}`),
-  ].join("\n");
+    ? `Inbox update: ${totalPendingMessages} message${totalPendingMessages === 1 ? "" : "s"} pending your read across all conversations; ${changedTargets === 0 ? "no" : changedTargets} changed target${changedTargets === 1 ? "" : "s"}`
+    : `Inbox update: ${changedTargets} changed target${changedTargets === 1 ? "" : "s"}`;
+}
+
+/**
+ * One line, quoted and escaped by JSON.stringify, and labelled as a preview of
+ * a message that is still unread, with the command that reads it in full: the
+ * cut text must not pass for the message (task #387).
+ */
+function formatAgentInboxPreviewLine(
+  target: string,
+  preview: { senderName?: string; text: string; truncated: boolean },
+): string {
+  const sender = preview.senderName ? ` @${preview.senderName}` : "";
+  const quoted = JSON.stringify(preview.truncated ? `${preview.text}…` : preview.text);
+  const cut = preview.truncated ? "truncated preview" : "preview";
+  // A task conversation (task v2, `#channel:#7`) is read with `raft task read`.
+  const fullText = parseAgentTaskRef(target)
+    ? formatHint(RAFT_HINTS.taskRead({ ref: target, unread: true }))
+    : `raft message read --target ${JSON.stringify(target)} --unread`;
+  return `  latest${sender}: ${quoted} (${cut}; still unread, full text: ${fullText})`;
 }
 
 function formatAgentInboxRowDetails(row: AgentInboxTargetRow): string {
@@ -193,7 +227,8 @@ function shortMessageId(value: string): string {
   return value.slice(0, 8);
 }
 
-function formatAttentionHintField(hint: AttentionHint): string {
+/** `attention_hint=` value as the inbox rows print it: a fixed key order, JSON. */
+export function formatAttentionHintField(hint: AttentionHint): string {
   return JSON.stringify({
     schema: hint.schema,
     trigger: hint.trigger,

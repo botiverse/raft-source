@@ -145,60 +145,6 @@
       "library": "raft-ui"
     },
     {
-      "id": "components.ui.button.states.elegant",
-      "title": "Raft UI Button (Elegant)",
-      "surface": "library",
-      "category": "library",
-      "fixture": "fixtures/components.ui.button.states.json",
-      "viewport": {
-        "width": 390,
-        "height": 844,
-        "density": 3
-      },
-      "theme": "light",
-      "locale": "zh-CN",
-      "variants": [
-        {
-          "id": "tones-and-sizes-elegant",
-          "name": "Tones And Sizes (Elegant)",
-          "props": {
-            "theme": "elegant"
-          }
-        }
-      ],
-      "capture": {
-        "selector": "[data-visual-case='components.ui.button.states']",
-        "crop": "element",
-        "contract": "component-bounds"
-      },
-      "reactPathHint": "packages/web/src/components/ui/Button.tsx",
-      "androidCaseHint": "compose_ui_button_elegant_visual",
-      "providerMatrix": {
-        "react": {
-          "status": "active",
-          "components": [
-            "components/ui/Button"
-          ],
-          "path": "packages/web/visual-testing/VisualTestingCases.tsx",
-          "fixture": "fixtures/components.ui.button.states.json"
-        },
-        "android": {
-          "status": "active",
-          "components": [
-            "build.raft.app.components.SlockBrutalActionButton"
-          ],
-          "path": "compose/shared/src/visualFixtures/kotlin/build/raft/app/UiPrimitiveVisualFixtures.kt",
-          "fixture": "compose_ui_button_elegant_visual"
-        }
-      },
-      "tolerance": {
-        "pixelRatio": 0.02,
-        "layoutDp": 1,
-        "ignoreAntialiasing": true
-      },
-      "library": "raft-ui"
-    },
-    {
       "id": "components.ui.card.states",
       "title": "Raft UI Card",
       "surface": "library",
@@ -243,62 +189,6 @@
           ],
           "path": "compose/shared/src/visualFixtures/kotlin/build/raft/app/UiPrimitiveVisualFixtures.kt",
           "fixture": "compose_ui_card_visual"
-        }
-      },
-      "tolerance": {
-        "pixelRatio": 0.02,
-        "layoutDp": 1,
-        "ignoreAntialiasing": true
-      },
-      "library": "raft-ui"
-    },
-    {
-      "id": "components.ui.card.states.elegant",
-      "title": "Raft UI Card (Elegant)",
-      "surface": "library",
-      "category": "library",
-      "fixture": "fixtures/components.ui.card.states.json",
-      "viewport": {
-        "width": 390,
-        "height": 844,
-        "density": 3
-      },
-      "theme": "light",
-      "locale": "zh-CN",
-      "variants": [
-        {
-          "id": "content-and-action-elegant",
-          "name": "Content And Action (Elegant)",
-          "props": {
-            "theme": "elegant"
-          }
-        }
-      ],
-      "capture": {
-        "selector": "[data-visual-case='components.ui.card.states']",
-        "crop": "element",
-        "contract": "component-bounds"
-      },
-      "reactPathHint": "packages/web/visual-testing/VisualTestingCases.tsx#ui-card",
-      "androidCaseHint": "compose_ui_card_elegant_visual",
-      "providerMatrix": {
-        "react": {
-          "status": "active",
-          "components": [
-            "card-brutal",
-            "components/ui/Button"
-          ],
-          "path": "packages/web/visual-testing/VisualTestingCases.tsx",
-          "fixture": "fixtures/components.ui.card.states.json"
-        },
-        "android": {
-          "status": "active",
-          "components": [
-            "build.raft.app.components.SlockBrutalCard",
-            "build.raft.app.components.SlockBrutalActionButton"
-          ],
-          "path": "compose/shared/src/visualFixtures/kotlin/build/raft/app/UiPrimitiveVisualFixtures.kt",
-          "fixture": "compose_ui_card_elegant_visual"
         }
       },
       "tolerance": {
@@ -416,61 +306,6 @@
       "library": "raft-ui"
     },
     {
-      "id": "components.ui.form-field.states.elegant",
-      "title": "Raft UI Form Field (Elegant)",
-      "surface": "library",
-      "category": "library",
-      "fixture": "fixtures/components.ui.form-field.states.json",
-      "viewport": {
-        "width": 390,
-        "height": 844,
-        "density": 3
-      },
-      "theme": "light",
-      "locale": "zh-CN",
-      "variants": [
-        {
-          "id": "label-hint-error-elegant",
-          "name": "Label Hint Error (Elegant)",
-          "props": {
-            "theme": "elegant"
-          }
-        }
-      ],
-      "capture": {
-        "selector": "[data-visual-case='components.ui.form-field.states']",
-        "crop": "element",
-        "contract": "component-bounds"
-      },
-      "reactPathHint": "packages/web/src/components/ui/FormField.tsx",
-      "androidCaseHint": "compose_ui_form_field_elegant_visual",
-      "providerMatrix": {
-        "react": {
-          "status": "active",
-          "components": [
-            "components/ui/FormField"
-          ],
-          "path": "packages/web/visual-testing/VisualTestingCases.tsx",
-          "fixture": "fixtures/components.ui.form-field.states.json"
-        },
-        "android": {
-          "status": "active",
-          "components": [
-            "build.raft.app.components.SlockFormField",
-            "build.raft.app.components.SlockBrutalInputField"
-          ],
-          "path": "compose/shared/src/visualFixtures/kotlin/build/raft/app/UiPrimitiveVisualFixtures.kt",
-          "fixture": "compose_ui_form_field_elegant_visual"
-        }
-      },
-      "tolerance": {
-        "pixelRatio": 0.02,
-        "layoutDp": 1,
-        "ignoreAntialiasing": true
-      },
-      "library": "raft-ui"
-    },
-    {
       "id": "components.ui.textarea.states",
       "title": "Raft UI Textarea",
       "surface": "library",
@@ -513,60 +348,6 @@
           ],
           "path": "compose/shared/src/visualFixtures/kotlin/build/raft/app/UiPrimitiveVisualFixtures.kt",
           "fixture": "compose_ui_textarea_visual"
-        }
-      },
-      "tolerance": {
-        "pixelRatio": 0.02,
-        "layoutDp": 1,
-        "ignoreAntialiasing": true
-      },
-      "library": "raft-ui"
-    },
-    {
-      "id": "components.ui.textarea.states.elegant",
-      "title": "Raft UI Textarea (Elegant)",
-      "surface": "library",
-      "category": "library",
-      "fixture": "fixtures/components.ui.textarea.states.json",
-      "viewport": {
-        "width": 390,
-        "height": 844,
-        "density": 3
-      },
-      "theme": "light",
-      "locale": "zh-CN",
-      "variants": [
-        {
-          "id": "helper-and-error-elegant",
-          "name": "Helper And Error (Elegant)",
-          "props": {
-            "theme": "elegant"
-          }
-        }
-      ],
-      "capture": {
-        "selector": "[data-visual-case='components.ui.textarea.states']",
-        "crop": "element",
-        "contract": "component-bounds"
-      },
-      "reactPathHint": "packages/web/src/components/ui/Textarea.tsx",
-      "androidCaseHint": "compose_ui_textarea_elegant_visual",
-      "providerMatrix": {
-        "react": {
-          "status": "active",
-          "components": [
-            "components/ui/Textarea"
-          ],
-          "path": "packages/web/visual-testing/VisualTestingCases.tsx",
-          "fixture": "fixtures/components.ui.textarea.states.json"
-        },
-        "android": {
-          "status": "active",
-          "components": [
-            "build.raft.app.components.SlockBrutalTextarea"
-          ],
-          "path": "compose/shared/src/visualFixtures/kotlin/build/raft/app/UiPrimitiveVisualFixtures.kt",
-          "fixture": "compose_ui_textarea_elegant_visual"
         }
       },
       "tolerance": {
@@ -630,61 +411,6 @@
       "library": "raft-ui"
     },
     {
-      "id": "components.ui.checkbox.states.elegant",
-      "title": "Raft UI Checkbox (Elegant)",
-      "surface": "library",
-      "category": "library",
-      "fixture": "fixtures/components.ui.checkbox.states.json",
-      "viewport": {
-        "width": 390,
-        "height": 844,
-        "density": 3
-      },
-      "theme": "light",
-      "locale": "zh-CN",
-      "variants": [
-        {
-          "id": "checked-unchecked-disabled-elegant",
-          "name": "Checked Unchecked Disabled (Elegant)",
-          "props": {
-            "theme": "elegant"
-          }
-        }
-      ],
-      "capture": {
-        "selector": "[data-visual-case='components.ui.checkbox.states']",
-        "crop": "element",
-        "contract": "component-bounds"
-      },
-      "reactPathHint": "packages/web/src/components/ui/Checkbox.tsx",
-      "androidCaseHint": "compose_ui_checkbox_elegant_visual",
-      "providerMatrix": {
-        "react": {
-          "status": "active",
-          "components": [
-            "components/ui/Checkbox",
-            "components/ui/CheckMarker"
-          ],
-          "path": "packages/web/visual-testing/VisualTestingCases.tsx",
-          "fixture": "fixtures/components.ui.checkbox.states.json"
-        },
-        "android": {
-          "status": "active",
-          "components": [
-            "build.raft.app.components.SlockCheckbox"
-          ],
-          "path": "compose/shared/src/visualFixtures/kotlin/build/raft/app/UiPrimitiveVisualFixtures.kt",
-          "fixture": "compose_ui_checkbox_elegant_visual"
-        }
-      },
-      "tolerance": {
-        "pixelRatio": 0.02,
-        "layoutDp": 1,
-        "ignoreAntialiasing": true
-      },
-      "library": "raft-ui"
-    },
-    {
       "id": "components.ui.check-marker.states",
       "title": "Raft UI Check Marker",
       "surface": "library",
@@ -737,11 +463,11 @@
       "library": "raft-ui"
     },
     {
-      "id": "components.ui.attention-dot.states",
-      "title": "Raft UI Attention Dot",
+      "id": "components.ui.typography.specimen",
+      "title": "Raft UI Typography Specimen",
       "surface": "library",
       "category": "library",
-      "fixture": "fixtures/components.ui.attention-dot.states.json",
+      "fixture": "fixtures/components.ui.typography.specimen.json",
       "viewport": {
         "width": 390,
         "height": 844,
@@ -751,138 +477,34 @@
       "locale": "zh-CN",
       "variants": [
         {
-          "id": "sizes-and-tones",
-          "name": "Sizes And Tones",
+          "id": "all-styles",
+          "name": "All Styles",
           "props": {}
         }
       ],
       "capture": {
-        "selector": "[data-visual-case='components.ui.attention-dot.states']",
+        "selector": "[data-visual-case='components.ui.typography.specimen']",
         "crop": "element",
         "contract": "component-bounds"
       },
-      "reactPathHint": "packages/web/src/components/ui/AttentionDot.tsx",
-      "androidCaseHint": "compose_ui_attention_dot_visual",
+      "reactPathHint": "packages/web/visual-testing/VisualTestingCases.tsx",
+      "androidCaseHint": "compose_ui_typography_specimen_visual",
       "providerMatrix": {
         "react": {
           "status": "active",
           "components": [
-            "components/ui/AttentionDot"
+            "raft-ui typography (text-* classes)"
           ],
           "path": "packages/web/visual-testing/VisualTestingCases.tsx",
-          "fixture": "fixtures/components.ui.attention-dot.states.json"
+          "fixture": "fixtures/components.ui.typography.specimen.json"
         },
         "android": {
           "status": "active",
           "components": [
-            "build.raft.app.components.SlockAttentionDot"
+            "build.raft.designsystem.theme.RaftTypography"
           ],
-          "path": "compose/shared/src/visualFixtures/kotlin/build/raft/app/UiPrimitiveVisualFixtures.kt",
-          "fixture": "compose_ui_attention_dot_visual"
-        }
-      },
-      "tolerance": {
-        "pixelRatio": 0.02,
-        "layoutDp": 1,
-        "ignoreAntialiasing": true
-      },
-      "library": "raft-ui"
-    },
-    {
-      "id": "components.ui.status-dot.states",
-      "title": "Raft UI Status Dot",
-      "surface": "library",
-      "category": "library",
-      "fixture": "fixtures/components.ui.status-dot.states.json",
-      "viewport": {
-        "width": 390,
-        "height": 844,
-        "density": 3
-      },
-      "theme": "light",
-      "locale": "zh-CN",
-      "variants": [
-        {
-          "id": "presence-tones",
-          "name": "Presence Tones",
-          "props": {}
-        }
-      ],
-      "capture": {
-        "selector": "[data-visual-case='components.ui.status-dot.states']",
-        "crop": "element",
-        "contract": "component-bounds"
-      },
-      "reactPathHint": "packages/web/src/components/ui/StatusDot.tsx",
-      "androidCaseHint": "compose_ui_status_dot_visual",
-      "providerMatrix": {
-        "react": {
-          "status": "active",
-          "components": [
-            "components/ui/StatusDot"
-          ],
-          "path": "packages/web/visual-testing/VisualTestingCases.tsx",
-          "fixture": "fixtures/components.ui.status-dot.states.json"
-        },
-        "android": {
-          "status": "active",
-          "components": [
-            "build.raft.app.components.SlockStatusDot"
-          ],
-          "path": "compose/shared/src/visualFixtures/kotlin/build/raft/app/UiPrimitiveVisualFixtures.kt",
-          "fixture": "compose_ui_status_dot_visual"
-        }
-      },
-      "tolerance": {
-        "pixelRatio": 0.02,
-        "layoutDp": 1,
-        "ignoreAntialiasing": true
-      },
-      "library": "raft-ui"
-    },
-    {
-      "id": "components.ui.progress-bar.states",
-      "title": "Raft UI Progress Bar",
-      "surface": "library",
-      "category": "library",
-      "fixture": "fixtures/components.ui.progress-bar.states.json",
-      "viewport": {
-        "width": 390,
-        "height": 844,
-        "density": 3
-      },
-      "theme": "light",
-      "locale": "zh-CN",
-      "variants": [
-        {
-          "id": "determinate-tones",
-          "name": "Determinate Tones",
-          "props": {}
-        }
-      ],
-      "capture": {
-        "selector": "[data-visual-case='components.ui.progress-bar.states']",
-        "crop": "element",
-        "contract": "component-bounds"
-      },
-      "reactPathHint": "packages/web/src/components/ui/ProgressBar.tsx",
-      "androidCaseHint": "compose_ui_progress_bar_visual",
-      "providerMatrix": {
-        "react": {
-          "status": "active",
-          "components": [
-            "components/ui/ProgressBar"
-          ],
-          "path": "packages/web/visual-testing/VisualTestingCases.tsx",
-          "fixture": "fixtures/components.ui.progress-bar.states.json"
-        },
-        "android": {
-          "status": "active",
-          "components": [
-            "build.raft.app.components.SlockProgressBar"
-          ],
-          "path": "compose/shared/src/visualFixtures/kotlin/build/raft/app/UiPrimitiveVisualFixtures.kt",
-          "fixture": "compose_ui_progress_bar_visual"
+          "path": "compose/shared/src/visualFixtures/kotlin/build/raft/app/UiDesignSystemVisualFixtures.kt",
+          "fixture": "compose_ui_typography_specimen_visual"
         }
       },
       "tolerance": {
@@ -947,58 +569,6 @@
       "library": "raft-ui"
     },
     {
-      "id": "components.ui.spinner.states",
-      "title": "Raft UI Spinner",
-      "surface": "library",
-      "category": "library",
-      "fixture": "fixtures/components.ui.spinner.states.json",
-      "viewport": {
-        "width": 390,
-        "height": 844,
-        "density": 3
-      },
-      "theme": "light",
-      "locale": "zh-CN",
-      "variants": [
-        {
-          "id": "sizes-and-inverse",
-          "name": "Sizes And Inverse",
-          "props": {}
-        }
-      ],
-      "capture": {
-        "selector": "[data-visual-case='components.ui.spinner.states']",
-        "crop": "element",
-        "contract": "component-bounds"
-      },
-      "reactPathHint": "packages/web/src/components/ui/Spinner.tsx",
-      "androidCaseHint": "compose_ui_spinner_visual",
-      "providerMatrix": {
-        "react": {
-          "status": "active",
-          "components": [
-            "components/ui/Spinner"
-          ],
-          "path": "packages/web/visual-testing/VisualTestingCases.tsx",
-          "fixture": "fixtures/components.ui.spinner.states.json"
-        },
-        "android": {
-          "status": "active",
-          "components": [
-            "build.raft.app.components.SlockSpinner"
-          ],
-          "path": "compose/shared/src/visualFixtures/kotlin/build/raft/app/UiPrimitiveVisualFixtures.kt",
-          "fixture": "compose_ui_spinner_visual"
-        }
-      },
-      "tolerance": {
-        "pixelRatio": 0.02,
-        "layoutDp": 1,
-        "ignoreAntialiasing": true
-      },
-      "library": "raft-ui"
-    },
-    {
       "id": "components.ui.slug-input.states",
       "title": "Raft UI Slug Input",
       "surface": "library",
@@ -1041,112 +611,6 @@
           ],
           "path": "compose/shared/src/visualFixtures/kotlin/build/raft/app/UiPrimitiveVisualFixtures.kt",
           "fixture": "compose_ui_slug_input_visual"
-        }
-      },
-      "tolerance": {
-        "pixelRatio": 0.02,
-        "layoutDp": 1,
-        "ignoreAntialiasing": true
-      },
-      "library": "raft-ui"
-    },
-    {
-      "id": "components.ui.section-eyebrow.states",
-      "title": "Raft UI Section Eyebrow",
-      "surface": "library",
-      "category": "library",
-      "fixture": "fixtures/components.ui.section-eyebrow.states.json",
-      "viewport": {
-        "width": 390,
-        "height": 844,
-        "density": 3
-      },
-      "theme": "light",
-      "locale": "zh-CN",
-      "variants": [
-        {
-          "id": "tones",
-          "name": "Tones",
-          "props": {}
-        }
-      ],
-      "capture": {
-        "selector": "[data-visual-case='components.ui.section-eyebrow.states']",
-        "crop": "element",
-        "contract": "component-bounds"
-      },
-      "reactPathHint": "packages/web/src/components/ui/SectionEyebrow.tsx",
-      "androidCaseHint": "compose_ui_section_eyebrow_visual",
-      "providerMatrix": {
-        "react": {
-          "status": "active",
-          "components": [
-            "components/ui/SectionEyebrow"
-          ],
-          "path": "packages/web/visual-testing/VisualTestingCases.tsx",
-          "fixture": "fixtures/components.ui.section-eyebrow.states.json"
-        },
-        "android": {
-          "status": "active",
-          "components": [
-            "build.raft.app.components.SlockSectionEyebrow"
-          ],
-          "path": "compose/shared/src/visualFixtures/kotlin/build/raft/app/UiPrimitiveVisualFixtures.kt",
-          "fixture": "compose_ui_section_eyebrow_visual"
-        }
-      },
-      "tolerance": {
-        "pixelRatio": 0.02,
-        "layoutDp": 1,
-        "ignoreAntialiasing": true
-      },
-      "library": "raft-ui"
-    },
-    {
-      "id": "components.ui.section-header.states",
-      "title": "Raft UI Section Header",
-      "surface": "library",
-      "category": "library",
-      "fixture": "fixtures/components.ui.section-header.states.json",
-      "viewport": {
-        "width": 390,
-        "height": 844,
-        "density": 3
-      },
-      "theme": "light",
-      "locale": "zh-CN",
-      "variants": [
-        {
-          "id": "count-and-action",
-          "name": "Count And Action",
-          "props": {}
-        }
-      ],
-      "capture": {
-        "selector": "[data-visual-case='components.ui.section-header.states']",
-        "crop": "element",
-        "contract": "component-bounds"
-      },
-      "reactPathHint": "packages/web/src/components/ui/SectionHeader.tsx",
-      "androidCaseHint": "compose_ui_section_header_visual",
-      "providerMatrix": {
-        "react": {
-          "status": "active",
-          "components": [
-            "components/ui/SectionHeader",
-            "components/ui/SectionEyebrow"
-          ],
-          "path": "packages/web/visual-testing/VisualTestingCases.tsx",
-          "fixture": "fixtures/components.ui.section-header.states.json"
-        },
-        "android": {
-          "status": "active",
-          "components": [
-            "build.raft.app.components.SlockSectionHeader",
-            "build.raft.app.components.SlockSectionEyebrow"
-          ],
-          "path": "compose/shared/src/visualFixtures/kotlin/build/raft/app/UiPrimitiveVisualFixtures.kt",
-          "fixture": "compose_ui_section_header_visual"
         }
       },
       "tolerance": {
@@ -1422,41 +886,6 @@
       "library": "raft-ui"
     },
     {
-      "id": "components.auth.register.inputs",
-      "title": "Auth Register Inputs",
-      "surface": "auth",
-      "fixture": "fixtures/components.auth.register.inputs.json",
-      "viewport": {
-        "width": 390,
-        "height": 844,
-        "density": 3
-      },
-      "theme": "light",
-      "locale": "zh-CN",
-      "variants": [
-        {
-          "id": "default",
-          "name": "Default",
-          "props": {
-            "registerEmail": "new@slock.ai",
-            "registerPassword": "correct horse battery staple"
-          }
-        }
-      ],
-      "capture": {
-        "selector": "[data-visual-case='components.auth.register.inputs']",
-        "crop": "element",
-        "contract": "component-bounds"
-      },
-      "reactPathHint": "packages/web/src/components/auth/RegisterPage.tsx",
-      "androidCaseHint": "compose_auth_register_inputs",
-      "tolerance": {
-        "pixelRatio": 0.02,
-        "layoutDp": 1,
-        "ignoreAntialiasing": true
-      }
-    },
-    {
       "id": "components.navigation.tabbar.states",
       "title": "Navigation Tabbar States",
       "surface": "navigation",
@@ -1518,7 +947,7 @@
         "crop": "element",
         "contract": "component-bounds"
       },
-      "reactPathHint": "packages/web/src/components/message/MessageInput.tsx",
+      "reactPathHint": "packages/web/src/features/composer/MessageInput.tsx",
       "androidCaseHint": "compose_thread_composer_visual_empty",
       "tolerance": {
         "pixelRatio": 0.02,
@@ -1554,7 +983,7 @@
         "crop": "element",
         "contract": "component-bounds"
       },
-      "reactPathHint": "packages/web/src/components/message/MessageInput.tsx",
+      "reactPathHint": "packages/web/src/features/composer/MessageInput.tsx",
       "androidCaseHint": "compose_thread_composer_visual",
       "tolerance": {
         "pixelRatio": 0.02,
@@ -1647,7 +1076,7 @@
           }
         ]
       },
-      "reactPathHint": "packages/web/src/components/message/MessageInput.tsx",
+      "reactPathHint": "packages/web/src/features/composer/MessageInput.tsx",
       "androidCaseHint": "compose_thread_composer_visual_as_task_selected",
       "tolerance": {
         "pixelRatio": 0.02,
@@ -1698,7 +1127,7 @@
           }
         ]
       },
-      "reactPathHint": "packages/web/src/components/message/MessageInput.tsx",
+      "reactPathHint": "packages/web/src/features/composer/MessageInput.tsx",
       "androidCaseHint": "compose_thread_composer_visual_member_suggestions",
       "tolerance": {
         "pixelRatio": 0.02,
@@ -1749,7 +1178,7 @@
           }
         ]
       },
-      "reactPathHint": "packages/web/src/components/message/MessageInput.tsx",
+      "reactPathHint": "packages/web/src/features/composer/MessageInput.tsx",
       "androidCaseHint": "compose_thread_composer_visual_channel_suggestions",
       "tolerance": {
         "pixelRatio": 0.02,
@@ -1785,7 +1214,7 @@
         "crop": "element",
         "contract": "component-bounds"
       },
-      "reactPathHint": "packages/web/src/components/message/MessageInput.tsx",
+      "reactPathHint": "packages/web/src/features/composer/MessageInput.tsx",
       "androidCaseHint": "compose_thread_composer_visual_image_preview",
       "tolerance": {
         "pixelRatio": 0.02,
@@ -1825,7 +1254,7 @@
         "crop": "element",
         "contract": "component-bounds"
       },
-      "reactPathHint": "packages/web/src/components/message/MessageInput.tsx",
+      "reactPathHint": "packages/web/src/features/composer/MessageInput.tsx",
       "androidCaseHint": "compose_thread_composer_visual_file_previews",
       "tolerance": {
         "pixelRatio": 0.02,
@@ -1895,7 +1324,7 @@
         "crop": "element",
         "contract": "component-bounds"
       },
-      "reactPathHint": "packages/web/src/components/message/ChatPanel.tsx#PanelHeader",
+      "reactPathHint": "packages/web/src/features/channel/ChatPanel.tsx#PanelHeader",
       "androidCaseHint": "compose_thread_header_visual",
       "tolerance": {
         "pixelRatio": 0.02,
@@ -2074,7 +1503,8 @@
       "capture": {
         "selector": "body",
         "crop": "element",
-        "contract": "viewport-with-portal"
+        "contract": "viewport-with-portal",
+        "fullLength": true
       },
       "reactPathHint": "packages/web/src/components/message/SelectModeToolbar.tsx",
       "androidCaseHint": "compose_thread_message_row_visual visualFixture=share_selection",
@@ -2109,7 +1539,8 @@
       "capture": {
         "selector": "[data-visual-case='components.thread.forward-modal']",
         "crop": "element",
-        "contract": "component-bounds"
+        "contract": "component-bounds",
+        "fullLength": true
       },
       "androidCaseHint": "compose_thread_forward_modal_visual",
       "tolerance": {
@@ -2162,7 +1593,8 @@
       "capture": {
         "selector": "[data-visual-case='components.thread.comment-anchor']",
         "crop": "element",
-        "contract": "component-bounds"
+        "contract": "component-bounds",
+        "fullLength": true
       },
       "androidCaseHint": "compose_thread_comment_anchor_visual",
       "tolerance": {
@@ -2287,12 +1719,36 @@
       "locale": "zh-CN",
       "variants": [
         {
-          "id": "server-unread-notification",
-          "name": "Server Unread / Notification Trigger",
+          "id": "other-server-unread",
+          "name": "Other-server unread · long name",
           "props": {
-            "serverName": "Slock Design",
-            "serverUnread": true,
-            "notifications": 2
+            "serverName": "Raft Product Design Workspace",
+            "otherServerUnread": true
+          }
+        },
+        {
+          "id": "short-name-avatar",
+          "name": "Short name · server avatar",
+          "props": {
+            "serverName": "Raft Mobile",
+            "serverAvatar": "image"
+          }
+        },
+        {
+          "id": "long-name-ellipsis",
+          "name": "Long name ellipsis · chevron visible",
+          "props": {
+            "serverName": "Raft Product Design Workspace"
+          }
+        },
+        {
+          "id": "switcher-open",
+          "name": "Expanded server switcher",
+          "props": {
+            "serverName": "Raft Product Design Workspace",
+            "serverAvatar": "image",
+            "otherServerName": "Raft Community",
+            "switcherOpen": true
           }
         }
       ],
@@ -2301,7 +1757,7 @@
         "crop": "element",
         "contract": "component-bounds"
       },
-      "reactPathHint": "packages/web/src/components/layout/Sidebar.tsx#HomeTitlebarSurface",
+      "reactPathHint": "packages/web/src/features/sidebar/Sidebar.tsx#HomeTitlebarSurface",
       "androidCaseHint": "compose_home_titlebar_visual",
       "tolerance": {
         "pixelRatio": 0.02,
@@ -2333,7 +1789,17 @@
       "capture": {
         "selector": "[data-visual-case='components.home.notification-center.states']",
         "crop": "element",
-        "contract": "component-bounds"
+        "contract": "component-bounds",
+        "interactions": [
+          {
+            "type": "click",
+            "target": "[data-testid='notification-trigger-mobile']"
+          },
+          {
+            "type": "wait",
+            "ms": 240
+          }
+        ]
       },
       "reactPathHint": "packages/web/src/components/layout/NotificationCenter.tsx",
       "androidCaseHint": "compose_home_notification_center_visual",
@@ -2382,9 +1848,10 @@
             "type": "wait",
             "ms": 850
           }
-        ]
+        ],
+        "fullLength": true
       },
-      "reactPathHint": "packages/web/src/components/search/MessageSearchPage.tsx",
+      "reactPathHint": "packages/web/src/features/search/MessageSearchPage.tsx",
       "androidCaseHint": "compose_home_search_visual",
       "tolerance": {
         "pixelRatio": 0.02,
@@ -2437,7 +1904,7 @@
           }
         ]
       },
-      "reactPathHint": "packages/web/src/components/search/MessageSearchPage.tsx",
+      "reactPathHint": "packages/web/src/features/search/MessageSearchPage.tsx",
       "androidCaseHint": "compose_home_search_channel_dropdown_visual",
       "tolerance": {
         "pixelRatio": 0.02,
@@ -2447,7 +1914,7 @@
       "providerMatrix": {
         "react": {
           "components": [
-            "components/search/MessageSearchPage",
+            "features/search/MessageSearchPage",
             "components/ui/SelectionPopover"
           ]
         }
@@ -2528,7 +1995,7 @@
           }
         ]
       },
-      "reactPathHint": "packages/web/src/components/thread/ThreadsInbox.tsx",
+      "reactPathHint": "packages/web/src/features/thread/ThreadsInbox.tsx",
       "androidCaseHint": "compose_home_activity_visual",
       "tolerance": {
         "pixelRatio": 0.02,
@@ -2571,7 +2038,8 @@
             "type": "wait",
             "ms": 160
           }
-        ]
+        ],
+        "fullLength": true
       },
       "reactPathHint": "packages/web/src/components/task/TasksPanel.tsx",
       "androidCaseHint": "compose_tasks_panel_visual",
@@ -2686,7 +2154,7 @@
         "crop": "element",
         "contract": "modal-viewport"
       },
-      "reactPathHint": "packages/web/src/components/agent/CreateAgentDialog.tsx",
+      "reactPathHint": "packages/web/src/features/agent/CreateAgentDialog.tsx",
       "androidCaseHint": "compose_create_agent_dialog_visual",
       "tolerance": {
         "pixelRatio": 0.02,
@@ -2723,50 +2191,13 @@
         "crop": "element",
         "contract": "modal-viewport"
       },
-      "reactPathHint": "packages/web/src/components/agent/CreateAgentDialog.tsx",
+      "reactPathHint": "packages/web/src/features/agent/CreateAgentDialog.tsx",
       "tolerance": {
         "pixelRatio": 0.02,
         "layoutDp": 1,
         "ignoreAntialiasing": true
       },
       "notes": "Error-state baseline: invalid name triggers inline validation so the raft-ui Input data-invalid styling is captured, not just read from the recipe."
-    },
-    {
-      "id": "components.members.create-agent.dialog-onboarding",
-      "title": "Members Create Agent Dialog - onboarding variant",
-      "surface": "members",
-      "fixture": "fixtures/components.members.create-agent.dialog.json",
-      "viewport": {
-        "width": 390,
-        "height": 844,
-        "density": 3
-      },
-      "theme": "light",
-      "locale": "zh-CN",
-      "variants": [
-        {
-          "id": "prefilled-runtime",
-          "name": "Create Agent Prefilled Runtime",
-          "props": {
-            "name": "Product-QA-Bot",
-            "description": "Watches release screenshots and reports visual regressions before merge.",
-            "machine": "Jiachengs-MacBook-Pro",
-            "runtime": "codex"
-          }
-        }
-      ],
-      "capture": {
-        "selector": "body",
-        "crop": "element",
-        "contract": "modal-viewport"
-      },
-      "reactPathHint": "packages/web/src/components/agent/CreateAgentDialog.tsx",
-      "tolerance": {
-        "pixelRatio": 0.02,
-        "layoutDp": 1,
-        "ignoreAntialiasing": true
-      },
-      "notes": "Onboarding variant baseline. NOT a locked-input baseline: onboarding renders the \"Meet Cindy\" layout without the name/description fields, so the locked styling on those controls has no reachable trigger."
     },
     {
       "id": "components.members.create-agent.claude-dialog",
@@ -2797,7 +2228,7 @@
         "crop": "element",
         "contract": "modal-viewport"
       },
-      "reactPathHint": "packages/web/src/components/agent/CreateAgentDialog.tsx",
+      "reactPathHint": "packages/web/src/features/agent/CreateAgentDialog.tsx",
       "androidCaseHint": "compose_create_agent_dialog_visual",
       "tolerance": {
         "pixelRatio": 0.02,
@@ -2836,7 +2267,7 @@
         "crop": "element",
         "contract": "modal-viewport"
       },
-      "reactPathHint": "packages/web/src/components/agent/CreateAgentDialog.tsx",
+      "reactPathHint": "packages/web/src/features/agent/CreateAgentDialog.tsx",
       "androidCaseHint": "compose_create_agent_dialog_visual",
       "tolerance": {
         "pixelRatio": 0.02,
@@ -2871,15 +2302,483 @@
       "capture": {
         "selector": "[data-visual-case='components.members.agent-detail.profile']",
         "crop": "element",
-        "contract": "page-viewport"
+        "contract": "page-viewport",
+        "fullLength": true
       },
-      "reactPathHint": "packages/web/src/components/agent/AgentDetailPanel.tsx",
+      "reactPathHint": "packages/web/src/features/agent/AgentDetailPanel.tsx",
       "androidCaseHint": "compose_members_agent_detail_visual",
       "tolerance": {
         "pixelRatio": 0.02,
         "layoutDp": 1,
         "ignoreAntialiasing": true
       }
+    },
+    {
+      "id": "components.members.agent-detail.status.credential-held-sign-in",
+      "title": "Agent Profile Status: Invalid Credential, Held for another agent's sign-in",
+      "captureType": "component-fixture",
+      "surface": "members",
+      "category": "members",
+      "viewport": {
+        "width": 390,
+        "height": 844,
+        "density": 3
+      },
+      "theme": "light",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "Default",
+          "props": {
+            "credentialStatus": "held-sign-in"
+          }
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='components.members.agent-detail.status.credential-held-sign-in']",
+        "crop": "element",
+        "contract": "page-viewport",
+        "fullLength": true
+      },
+      "reactPathHint": "packages/web/src/features/agent/AgentStatusBadge.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "features/agent/AgentDetailPanel",
+            "features/agent/AgentStatusBadge"
+          ],
+          "path": "packages/web/visual-testing/VisualTestingCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "#proj-raft-computer:#48 (reconciler step 4b). An agent held for another agent's rejected sign-in on the same machine-shared sign-in (idle status with credentialHold user_reauth): the status chip names the reason (error light) instead of Online, with the Retry TextLink beside it. Owner view. react-only: Android has no reconciler status yet."
+    },
+    {
+      "id": "components.members.agent-detail.status.credential-held-sign-in.dark",
+      "title": "Agent Profile Status: Invalid Credential, Held for another agent's sign-in (Dark)",
+      "captureType": "component-fixture",
+      "surface": "members",
+      "category": "members",
+      "viewport": {
+        "width": 390,
+        "height": 844,
+        "density": 3
+      },
+      "theme": "dark",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "Default",
+          "props": {
+            "credentialStatus": "held-sign-in",
+            "theme": "dark"
+          }
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='components.members.agent-detail.status.credential-held-sign-in.dark']",
+        "crop": "element",
+        "contract": "page-viewport",
+        "fullLength": true
+      },
+      "reactPathHint": "packages/web/src/features/agent/AgentStatusBadge.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "features/agent/AgentDetailPanel",
+            "features/agent/AgentStatusBadge"
+          ],
+          "path": "packages/web/visual-testing/VisualTestingCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "#proj-raft-computer:#48 (reconciler step 4b). An agent held for another agent's rejected sign-in on the same machine-shared sign-in (idle status with credentialHold user_reauth): the status chip names the reason (error light) instead of Online, with the Retry TextLink beside it. Owner view. react-only: Android has no reconciler status yet."
+    },
+    {
+      "id": "components.members.agent-detail.status.credential-own-billing",
+      "title": "Agent Profile Status: Invalid Credential, Own billing error",
+      "captureType": "component-fixture",
+      "surface": "members",
+      "category": "members",
+      "viewport": {
+        "width": 390,
+        "height": 844,
+        "density": 3
+      },
+      "theme": "light",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "Default",
+          "props": {
+            "credentialStatus": "own-billing"
+          }
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='components.members.agent-detail.status.credential-own-billing']",
+        "crop": "element",
+        "contract": "page-viewport",
+        "fullLength": true
+      },
+      "reactPathHint": "packages/web/src/features/agent/AgentStatusBadge.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "features/agent/AgentDetailPanel",
+            "features/agent/AgentStatusBadge"
+          ],
+          "path": "packages/web/visual-testing/VisualTestingCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "#proj-raft-computer:#48 (reconciler step 4b). An agent whose own runtime error is BillingError (stored lastRuntimeError, live error activity): the status chip says the provider balance is exhausted, with Retry; the runtime-error notice stays above. react-only: Android has no reconciler status yet."
+    },
+    {
+      "id": "components.members.agent-detail.status.credential-own-billing.dark",
+      "title": "Agent Profile Status: Invalid Credential, Own billing error (Dark)",
+      "captureType": "component-fixture",
+      "surface": "members",
+      "category": "members",
+      "viewport": {
+        "width": 390,
+        "height": 844,
+        "density": 3
+      },
+      "theme": "dark",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "Default",
+          "props": {
+            "credentialStatus": "own-billing",
+            "theme": "dark"
+          }
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='components.members.agent-detail.status.credential-own-billing.dark']",
+        "crop": "element",
+        "contract": "page-viewport",
+        "fullLength": true
+      },
+      "reactPathHint": "packages/web/src/features/agent/AgentStatusBadge.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "features/agent/AgentDetailPanel",
+            "features/agent/AgentStatusBadge"
+          ],
+          "path": "packages/web/visual-testing/VisualTestingCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "#proj-raft-computer:#48 (reconciler step 4b). An agent whose own runtime error is BillingError (stored lastRuntimeError, live error activity): the status chip says the provider balance is exhausted, with Retry; the runtime-error notice stays above. react-only: Android has no reconciler status yet."
+    },
+    {
+      "id": "components.members.agent-detail.status.runtime-error-code-member",
+      "title": "Agent Profile Status: Runtime error by code, member view",
+      "captureType": "component-fixture",
+      "surface": "members",
+      "category": "members",
+      "viewport": {
+        "width": 390,
+        "height": 844,
+        "density": 3
+      },
+      "theme": "light",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "Default",
+          "props": {
+            "runtimeErrorView": "member"
+          }
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='components.members.agent-detail.status.runtime-error-code-member']",
+        "crop": "element",
+        "contract": "page-viewport",
+        "fullLength": true
+      },
+      "reactPathHint": "packages/web/src/features/agent/AgentRuntimeErrorNotice.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "features/agent/AgentDetailPanel",
+            "features/agent/AgentRuntimeErrorNotice",
+            "features/agent/AgentStatusBadge"
+          ],
+          "path": "packages/web/visual-testing/VisualTestingCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "#wg-rbac:#57. An agent in a usage_limit runtime error, seen by a member who did not create it: the server sends no error text, so the notice reads the code's sentence and the status chip its title; no copy-info, no View logs. react-only: Android does not read the code yet."
+    },
+    {
+      "id": "components.members.agent-detail.status.runtime-error-code-member.dark",
+      "title": "Agent Profile Status: Runtime error by code, member view (Dark)",
+      "captureType": "component-fixture",
+      "surface": "members",
+      "category": "members",
+      "viewport": {
+        "width": 390,
+        "height": 844,
+        "density": 3
+      },
+      "theme": "dark",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "Default",
+          "props": {
+            "runtimeErrorView": "member"
+          }
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='components.members.agent-detail.status.runtime-error-code-member.dark']",
+        "crop": "element",
+        "contract": "page-viewport",
+        "fullLength": true
+      },
+      "reactPathHint": "packages/web/src/features/agent/AgentRuntimeErrorNotice.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "features/agent/AgentDetailPanel",
+            "features/agent/AgentRuntimeErrorNotice",
+            "features/agent/AgentStatusBadge"
+          ],
+          "path": "packages/web/visual-testing/VisualTestingCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "#wg-rbac:#57. An agent in a usage_limit runtime error, seen by a member who did not create it: the server sends no error text, so the notice reads the code's sentence and the status chip its title; no copy-info, no View logs. react-only: Android does not read the code yet."
+    },
+    {
+      "id": "components.members.agent-detail.status.runtime-error-code-manager",
+      "title": "Agent Profile Status: Runtime error by code, manager view",
+      "captureType": "component-fixture",
+      "surface": "members",
+      "category": "members",
+      "viewport": {
+        "width": 390,
+        "height": 844,
+        "density": 3
+      },
+      "theme": "light",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "Default",
+          "props": {
+            "runtimeErrorView": "manager"
+          }
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='components.members.agent-detail.status.runtime-error-code-manager']",
+        "crop": "element",
+        "contract": "page-viewport",
+        "fullLength": true
+      },
+      "reactPathHint": "packages/web/src/features/agent/AgentRuntimeErrorNotice.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "features/agent/AgentDetailPanel",
+            "features/agent/AgentRuntimeErrorNotice",
+            "features/agent/AgentStatusBadge"
+          ],
+          "path": "packages/web/visual-testing/VisualTestingCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "#wg-rbac:#57. An agent in a usage_limit runtime error, seen by its manager (owner): the notice's headline is the code's sentence with the server-scrubbed detail under it, copy-info kept; the status chip reads the code's title. react-only: Android does not read the code yet."
+    },
+    {
+      "id": "components.members.agent-detail.status.runtime-error-code-manager.dark",
+      "title": "Agent Profile Status: Runtime error by code, manager view (Dark)",
+      "captureType": "component-fixture",
+      "surface": "members",
+      "category": "members",
+      "viewport": {
+        "width": 390,
+        "height": 844,
+        "density": 3
+      },
+      "theme": "dark",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "Default",
+          "props": {
+            "runtimeErrorView": "manager"
+          }
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='components.members.agent-detail.status.runtime-error-code-manager.dark']",
+        "crop": "element",
+        "contract": "page-viewport",
+        "fullLength": true
+      },
+      "reactPathHint": "packages/web/src/features/agent/AgentRuntimeErrorNotice.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "features/agent/AgentDetailPanel",
+            "features/agent/AgentRuntimeErrorNotice",
+            "features/agent/AgentStatusBadge"
+          ],
+          "path": "packages/web/visual-testing/VisualTestingCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "#wg-rbac:#57. An agent in a usage_limit runtime error, seen by its manager (owner): the notice's headline is the code's sentence with the server-scrubbed detail under it, copy-info kept; the status chip reads the code's title. react-only: Android does not read the code yet."
+    },
+    {
+      "id": "components.members.agent-detail.status.credential-member-view",
+      "title": "Agent Profile Status: Invalid Credential, Member view",
+      "captureType": "component-fixture",
+      "surface": "members",
+      "category": "members",
+      "viewport": {
+        "width": 390,
+        "height": 844,
+        "density": 3
+      },
+      "theme": "light",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "Default",
+          "props": {
+            "credentialStatus": "member-view"
+          }
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='components.members.agent-detail.status.credential-member-view']",
+        "crop": "element",
+        "contract": "page-viewport",
+        "fullLength": true
+      },
+      "reactPathHint": "packages/web/src/features/agent/AgentStatusBadge.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "features/agent/AgentDetailPanel",
+            "features/agent/AgentStatusBadge"
+          ],
+          "path": "packages/web/visual-testing/VisualTestingCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "#proj-raft-computer:#48 (reconciler step 4b). The held agent seen by a member who did not create it: may restart it (controlAgentRuntime) but not see its details, so the chip is a plain Error with Retry beside it. react-only: Android has no reconciler status yet."
+    },
+    {
+      "id": "components.members.agent-detail.status.credential-member-view.dark",
+      "title": "Agent Profile Status: Invalid Credential, Member view (Dark)",
+      "captureType": "component-fixture",
+      "surface": "members",
+      "category": "members",
+      "viewport": {
+        "width": 390,
+        "height": 844,
+        "density": 3
+      },
+      "theme": "dark",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "Default",
+          "props": {
+            "credentialStatus": "member-view",
+            "theme": "dark"
+          }
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='components.members.agent-detail.status.credential-member-view.dark']",
+        "crop": "element",
+        "contract": "page-viewport",
+        "fullLength": true
+      },
+      "reactPathHint": "packages/web/src/features/agent/AgentStatusBadge.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "features/agent/AgentDetailPanel",
+            "features/agent/AgentStatusBadge"
+          ],
+          "path": "packages/web/visual-testing/VisualTestingCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "#proj-raft-computer:#48 (reconciler step 4b). The held agent seen by a member who did not create it: may restart it (controlAgentRuntime) but not see its details, so the chip is a plain Error with Retry beside it. react-only: Android has no reconciler status yet."
     },
     {
       "id": "components.channel.settings.panel",
@@ -2907,7 +2806,7 @@
         "crop": "element",
         "contract": "modal-viewport"
       },
-      "reactPathHint": "packages/web/src/components/channel/EditChannelDialog.tsx",
+      "reactPathHint": "packages/web/src/features/channel/EditChannelDialog.tsx",
       "androidCaseHint": "compose_channel_settings_panel_visual",
       "tolerance": {
         "pixelRatio": 0.02,
@@ -2917,7 +2816,7 @@
       "providerMatrix": {
         "react": {
           "components": [
-            "components/channel/EditChannelDialog"
+            "features/channel/EditChannelDialog"
           ]
         },
         "android": {
@@ -2951,23 +2850,20 @@
       "capture": {
         "selector": "body",
         "crop": "element",
-        "contract": "modal-viewport",
+        "contract": "page-viewport",
         "interactions": [
           {
             "type": "click",
-            "target": "[data-testid='channel-members-open']"
-          },
-          {
-            "type": "click",
-            "target": "[data-testid='add-member-open'], button:has-text('Add Member')"
+            "target": "[data-testid='member-page-add']"
           },
           {
             "type": "wait",
             "ms": 250
           }
-        ]
+        ],
+        "fullLength": true
       },
-      "reactPathHint": "packages/web/src/components/agent/ChannelMembers.tsx",
+      "reactPathHint": "packages/web/src/features/channel/ChannelMembers.tsx",
       "androidCaseHint": "compose_channel_add_member_panel_visual",
       "tolerance": {
         "pixelRatio": 0.02,
@@ -2999,9 +2895,10 @@
       "capture": {
         "selector": "[data-visual-case='components.settings.root.page']",
         "crop": "element",
-        "contract": "component-bounds"
+        "contract": "component-bounds",
+        "fullLength": true
       },
-      "reactPathHint": "packages/web/src/components/layout/Sidebar.tsx",
+      "reactPathHint": "packages/web/src/features/sidebar/Sidebar.tsx",
       "androidCaseHint": "compose_settings_route_visual:home",
       "tolerance": {
         "pixelRatio": 0.02,
@@ -3033,9 +2930,10 @@
       "capture": {
         "selector": "[data-visual-case='components.settings.account.page']",
         "crop": "element",
-        "contract": "component-bounds"
+        "contract": "component-bounds",
+        "fullLength": true
       },
-      "reactPathHint": "packages/web/src/components/settings/SettingsPanel.tsx#AccountSection",
+      "reactPathHint": "packages/web/src/features/settings/account/AccountSection.tsx#AccountSection",
       "androidCaseHint": "compose_settings_page_visual:account",
       "tolerance": {
         "pixelRatio": 0.02,
@@ -3068,9 +2966,10 @@
       "capture": {
         "selector": "[data-visual-case='components.settings.account.error-state']",
         "crop": "element",
-        "contract": "component-bounds"
+        "contract": "component-bounds",
+        "fullLength": true
       },
-      "reactPathHint": "packages/web/src/components/settings/SettingsPanel.tsx#AccountSection",
+      "reactPathHint": "packages/web/src/features/settings/account/AccountSection.tsx#AccountSection",
       "androidCaseHint": "compose_settings_page_visual:account-error",
       "tolerance": {
         "pixelRatio": 0.02,
@@ -3103,9 +3002,10 @@
       "capture": {
         "selector": "[data-visual-case='components.settings.server.profile']",
         "crop": "element",
-        "contract": "component-bounds"
+        "contract": "component-bounds",
+        "fullLength": true
       },
-      "reactPathHint": "packages/web/src/components/settings/SettingsPanel.tsx#ProfileSection + #DangerZoneSection",
+      "reactPathHint": "packages/web/src/features/settings/server/ServerTabContent.tsx#ServerTabContent",
       "androidCaseHint": "compose_settings_page_visual:server-profile",
       "tolerance": {
         "pixelRatio": 0.02,
@@ -3138,9 +3038,10 @@
       "capture": {
         "selector": "[data-visual-case='components.settings.appearance.page']",
         "crop": "element",
-        "contract": "component-bounds"
+        "contract": "component-bounds",
+        "fullLength": true
       },
-      "reactPathHint": "packages/web/src/components/settings/SettingsPanel.tsx#AppearanceSection",
+      "reactPathHint": "packages/web/src/features/settings/appearance/AppearanceSection.tsx#AppearanceSection",
       "androidCaseHint": "compose_settings_page_visual:appearance",
       "tolerance": {
         "pixelRatio": 0.02,
@@ -3172,9 +3073,10 @@
       "capture": {
         "selector": "[data-visual-case='components.settings.notifications.page']",
         "crop": "element",
-        "contract": "component-bounds"
+        "contract": "component-bounds",
+        "fullLength": true
       },
-      "reactPathHint": "packages/web/src/components/settings/SettingsPanel.tsx#NotificationsTabContent",
+      "reactPathHint": "packages/web/src/features/settings/notifications/NotificationsTabContent.tsx#NotificationsTabContent",
       "androidCaseHint": "compose_settings_page_visual:notifications",
       "tolerance": {
         "pixelRatio": 0.02,
@@ -3255,57 +3157,6 @@
       "notes": "Missing true login route parity; old auth.login inputs are not active in the canonical manifest."
     },
     {
-      "id": "screens.auth.login.signing",
-      "title": "Auth Login Signing Screen",
-      "captureType": "real-screen",
-      "surface": "auth",
-      "category": "auth",
-      "fixture": "fixtures/screens.auth.login.signing.json",
-      "viewport": {
-        "width": 390,
-        "height": 844,
-        "density": 3
-      },
-      "theme": "light",
-      "locale": "zh-CN",
-      "variants": [
-        {
-          "id": "default",
-          "name": "Default",
-          "props": {}
-        }
-      ],
-      "capture": {
-        "selector": "body",
-        "crop": "element",
-        "contract": "viewport-with-portal",
-        "interactions": [
-          {
-            "type": "fill",
-            "target": "#login-email",
-            "value": "artin@raft.build"
-          },
-          {
-            "type": "fill",
-            "target": "#login-password",
-            "value": "visual-sign-in-secret"
-          },
-          {
-            "type": "wait",
-            "ms": 120
-          }
-        ]
-      },
-      "reactPathHint": "packages/web/src/components/auth/LoginPage.tsx",
-      "androidCaseHint": "compose_auth_login_signing",
-      "tolerance": {
-        "pixelRatio": 0.02,
-        "layoutDp": 1,
-        "ignoreAntialiasing": true
-      },
-      "notes": "Pins the in-flight sign-in state: the user has filled email + password and clicked Sign In, and the auth request is still pending (authStore loading:true), so the submit button is disabled at 50% opacity reading 'Signing in…' while both inputs stay enabled with their normal white styling — React never disables the inputs during login. Paired with screens.home.loading (task #372) as the Android parity target for the sign-in transition."
-    },
-    {
       "id": "screens.auth.choose-server",
       "title": "Auth Choose Server Screen",
       "captureType": "real-screen",
@@ -3340,45 +3191,6 @@
         "ignoreAntialiasing": true
       },
       "notes": "Missing post-login choose-server gate parity; this is distinct from the Home top-bar server switcher opened inside the app shell."
-    },
-    {
-      "id": "screens.auth.profile-setup",
-      "title": "Auth Profile Setup Screen",
-      "captureType": "real-screen",
-      "surface": "auth",
-      "category": "auth",
-      "baselineStatus": "active",
-      "fixture": "fixtures/screens.auth.profile-setup.json",
-      "viewport": {
-        "width": 390,
-        "height": 844,
-        "density": 3
-      },
-      "theme": "light",
-      "locale": "zh-CN",
-      "variants": [
-        {
-          "id": "default",
-          "name": "Default",
-          "props": {
-            "profileSetupHandle": "new_designer",
-            "profileSetupDisplayName": "New Designer"
-          }
-        }
-      ],
-      "capture": {
-        "selector": "[data-visual-case='screens.auth.profile-setup']",
-        "crop": "element",
-        "contract": "screen-route"
-      },
-      "reactPathHint": "packages/web/src/components/auth/AccountIdentitySetupPage.tsx",
-      "androidCaseHint": "compose_auth_profile_setup_visual",
-      "tolerance": {
-        "pixelRatio": 0.02,
-        "layoutDp": 1,
-        "ignoreAntialiasing": true
-      },
-      "notes": "Post-verification identity gate. Both providers render the username and display-name setup surface with the same filled fixture values; completion remains a no-op in visual capture."
     },
     {
       "id": "screens.auth.forgot-password",
@@ -3586,7 +3398,8 @@
       "capture": {
         "selector": "[data-visual-case='screens.members.agent-detail.profile']",
         "crop": "element",
-        "contract": "screen-route"
+        "contract": "screen-route",
+        "fullLength": true
       },
       "reactPathHint": "packages/web/src/components/layout/MainLayout.tsx#AgentRoute",
       "androidCaseHint": "compose_member_detail:memberId=agent-product-ux,memberKind=agent,initialAgentTab=profile",
@@ -3623,7 +3436,8 @@
       "capture": {
         "selector": "[data-visual-case='screens.members.agent-detail.profile.computer-offline']",
         "crop": "element",
-        "contract": "screen-route"
+        "contract": "screen-route",
+        "fullLength": true
       },
       "reactPathHint": "packages/web/src/components/layout/MainLayout.tsx#AgentRoute",
       "androidCaseHint": "compose_member_detail:memberId=agent-computer-offline,memberKind=agent,initialAgentTab=profile",
@@ -3660,7 +3474,8 @@
       "capture": {
         "selector": "[data-visual-case='screens.members.agent-detail.profile.computer-missing']",
         "crop": "element",
-        "contract": "screen-route"
+        "contract": "screen-route",
+        "fullLength": true
       },
       "reactPathHint": "packages/web/src/components/layout/MainLayout.tsx#AgentRoute",
       "androidCaseHint": "compose_member_detail:memberId=agent-computer-missing,memberKind=agent,initialAgentTab=profile",
@@ -3697,7 +3512,8 @@
       "capture": {
         "selector": "[data-visual-case='screens.members.agent-detail.profile.no-computer']",
         "crop": "element",
-        "contract": "screen-route"
+        "contract": "screen-route",
+        "fullLength": true
       },
       "reactPathHint": "packages/web/src/components/layout/MainLayout.tsx#AgentRoute",
       "androidCaseHint": "compose_member_detail:memberId=agent-no-computer,memberKind=agent,initialAgentTab=profile",
@@ -3734,7 +3550,8 @@
       "capture": {
         "selector": "[data-visual-case='screens.members.agent-detail.profile.long-machine-name']",
         "crop": "element",
-        "contract": "screen-route"
+        "contract": "screen-route",
+        "fullLength": true
       },
       "reactPathHint": "packages/web/src/components/layout/MainLayout.tsx#AgentRoute",
       "androidCaseHint": "compose_member_detail:memberId=agent-long-machine,memberKind=agent,initialAgentTab=profile",
@@ -3771,7 +3588,8 @@
       "capture": {
         "selector": "[data-visual-case='screens.members.agent-detail.profile.daemon-only']",
         "crop": "element",
-        "contract": "screen-route"
+        "contract": "screen-route",
+        "fullLength": true
       },
       "reactPathHint": "packages/web/src/components/layout/MainLayout.tsx#AgentRoute",
       "androidCaseHint": "compose_member_detail:memberId=agent-daemon-only,memberKind=agent,initialAgentTab=profile",
@@ -3780,7 +3598,7 @@
         "layoutDp": 1,
         "ignoreAntialiasing": true
       },
-      "notes": "Profile tab for fixture agent agent-daemon-only: bound to a bare daemon (isComputer false): web status line = 'Connected' span + '·' + version segment exactly 'daemon v0.65.0' (machineRunLabel picks daemonVersion for non-computers; offline would read 'daemon offline') (task #535 batch 2)."
+      "notes": "Profile tab for fixture agent agent-daemon-only: bound to a bare daemon (isComputer false): web status line = 'Connected' span + '·' + version segment exactly 'legacy v0.65.0' (machineRunLabel picks daemonVersion for non-computers and, since #7823 retired the standalone daemon lane, names the kind 'legacy'; offline would read 'legacy offline') (task #535 batch 2)."
     },
     {
       "id": "screens.members.agent-detail.profile.no-membership",
@@ -3808,7 +3626,8 @@
       "capture": {
         "selector": "[data-visual-case='screens.members.agent-detail.profile.no-membership']",
         "crop": "element",
-        "contract": "screen-route"
+        "contract": "screen-route",
+        "fullLength": true
       },
       "reactPathHint": "packages/web/src/components/layout/MainLayout.tsx#AgentRoute",
       "androidCaseHint": "compose_member_detail:memberId=agent-no-membership,memberKind=agent,initialAgentTab=profile",
@@ -3845,7 +3664,8 @@
       "capture": {
         "selector": "[data-visual-case='screens.members.agent-detail.profile.loading-state']",
         "crop": "element",
-        "contract": "screen-route"
+        "contract": "screen-route",
+        "fullLength": true
       },
       "reactPathHint": "packages/web/src/components/layout/MainLayout.tsx#AgentRoute",
       "androidCaseHint": "compose_member_detail:memberId=agent-product-ux,memberKind=agent,initialAgentTab=profile,machinesLoading=true",
@@ -3882,7 +3702,8 @@
       "capture": {
         "selector": "[data-visual-case='screens.members.agent-detail.reminders']",
         "crop": "element",
-        "contract": "screen-route"
+        "contract": "screen-route",
+        "fullLength": true
       },
       "reactPathHint": "packages/web/src/components/layout/MainLayout.tsx#AgentRoute",
       "androidCaseHint": "compose_member_detail:memberId=agent-product-ux,memberKind=agent,initialAgentTab=reminders",
@@ -3895,7 +3716,7 @@
       "providerMatrix": {
         "react": {
           "components": [
-            "components/agent/AgentDetailPanel"
+            "features/agent/AgentDetailPanel"
           ]
         }
       }
@@ -3926,7 +3747,8 @@
       "capture": {
         "selector": "[data-visual-case='screens.members.agent-detail.workspace']",
         "crop": "element",
-        "contract": "screen-route"
+        "contract": "screen-route",
+        "fullLength": true
       },
       "reactPathHint": "packages/web/src/components/layout/MainLayout.tsx#AgentRoute",
       "androidCaseHint": "compose_member_detail:memberId=agent-product-ux,memberKind=agent,initialAgentTab=workspace",
@@ -3963,7 +3785,8 @@
       "capture": {
         "selector": "[data-visual-case='screens.members.agent-detail.apps']",
         "crop": "element",
-        "contract": "screen-route"
+        "contract": "screen-route",
+        "fullLength": true
       },
       "reactPathHint": "packages/web/src/components/layout/MainLayout.tsx#AgentRoute",
       "androidCaseHint": "compose_member_detail:memberId=agent-product-ux,memberKind=agent,initialAgentTab=apps",
@@ -4000,7 +3823,8 @@
       "capture": {
         "selector": "[data-visual-case='screens.members.agent-detail.activity']",
         "crop": "element",
-        "contract": "screen-route"
+        "contract": "screen-route",
+        "fullLength": true
       },
       "reactPathHint": "packages/web/src/components/layout/MainLayout.tsx#AgentRoute",
       "androidCaseHint": "compose_member_detail:memberId=agent-product-ux,memberKind=agent,initialAgentTab=activity",
@@ -4030,23 +3854,24 @@
           "id": "default",
           "name": "Default",
           "props": {
-            "humanUserId": "visual-human-1"
+            "humanUserId": "visual-user"
           }
         }
       ],
       "capture": {
         "selector": "[data-visual-case='screens.members.human.profile']",
         "crop": "element",
-        "contract": "screen-route"
+        "contract": "screen-route",
+        "fullLength": true
       },
       "reactPathHint": "packages/web/src/components/layout/MainLayout.tsx#HumanRoute",
-      "androidCaseHint": "compose_member_detail:memberId=visual-human-1,memberKind=human",
+      "androidCaseHint": "compose_member_detail:memberId=visual-user,memberKind=human",
       "tolerance": {
         "pixelRatio": 0.02,
         "layoutDp": 1,
         "ignoreAntialiasing": true
       },
-      "notes": "Real route capture for the human Profile tab. React uses MainLayout at /s/visual/human/visual-human-1; Android uses compose_member_detail pageData with memberId=visual-human-1 and memberKind=human.",
+      "notes": "Real route capture for the human Profile tab. React uses MainLayout at /s/visual/human/visual-user; Android uses compose_member_detail pageData with memberId=visual-user and memberKind=human.",
       "providerMatrix": {
         "react": {
           "components": [
@@ -4089,9 +3914,10 @@
             "type": "wait",
             "ms": 120
           }
-        ]
+        ],
+        "fullLength": true
       },
-      "reactPathHint": "packages/web/src/components/agent/AgentDetailPanel.tsx",
+      "reactPathHint": "packages/web/src/features/agent/AgentDetailPanel.tsx",
       "androidCaseHint": "compose_members_agent_detail_visual",
       "tolerance": {
         "pixelRatio": 0.02,
@@ -4136,7 +3962,7 @@
           }
         ]
       },
-      "reactPathHint": "packages/web/src/components/agent/AgentDetailPanel.tsx",
+      "reactPathHint": "packages/web/src/features/agent/AgentDetailPanel.tsx",
       "androidCaseHint": "compose_members_agent_detail_visual",
       "tolerance": {
         "pixelRatio": 0.02,
@@ -4208,7 +4034,7 @@
         "crop": "element",
         "contract": "screen-route"
       },
-      "reactPathHint": "packages/web/src/components/settings/SettingsPanel.tsx#AppearanceSection",
+      "reactPathHint": "packages/web/src/features/settings/appearance/AppearanceSection.tsx#AppearanceSection",
       "androidCaseHint": "pending",
       "tolerance": {
         "pixelRatio": 0.02,
@@ -4253,7 +4079,7 @@
           }
         ]
       },
-      "reactPathHint": "packages/web/src/components/settings/SettingsPanel.tsx#DangerZoneSection",
+      "reactPathHint": "packages/web/src/features/settings/server/DangerZoneSection.tsx#DangerZoneSection",
       "androidCaseHint": "compose_settings_page_visual:server-danger-modal",
       "tolerance": {
         "pixelRatio": 0.02,
@@ -4292,7 +4118,7 @@
         "crop": "element",
         "contract": "screen-route"
       },
-      "reactPathHint": "packages/web/src/components/settings/SettingsPanel.tsx#BillingTabContent",
+      "reactPathHint": "packages/web/src/features/settings/billing/BillingTabContent.tsx#BillingTabContent",
       "androidCaseHint": "pending",
       "tolerance": {
         "pixelRatio": 0.02,
@@ -4328,7 +4154,7 @@
         "crop": "element",
         "contract": "screen-route"
       },
-      "reactPathHint": "packages/web/src/components/layout/Sidebar.tsx",
+      "reactPathHint": "packages/web/src/features/sidebar/Sidebar.tsx",
       "androidCaseHint": "pending",
       "tolerance": {
         "pixelRatio": 0.02,
@@ -4471,7 +4297,7 @@
         "crop": "element",
         "contract": "viewport-with-portal"
       },
-      "reactPathHint": "packages/web/src/App.tsx packages/web/src/components/layout/Sidebar.tsx",
+      "reactPathHint": "packages/web/src/App.tsx packages/web/src/features/sidebar/Sidebar.tsx",
       "androidCaseHint": "compose_home_loading_visual",
       "tolerance": {
         "pixelRatio": 0.02,
@@ -4479,6 +4305,80 @@
         "ignoreAntialiasing": true
       },
       "notes": "Pins the post-sign-in loading transition: login has succeeded and MainLayout is mounted on the server home route, but the channels/DMs/agents/computers fetches are still in flight, so the 390px home surface shows the Sidebar skeleton rows (SidebarRowsSkeleton) instead of loaded lists. Parity target for replacing the Android app's gray home loading state."
+    },
+    {
+      "id": "screens.home.channel-list",
+      "title": "Home Channel List Screen",
+      "captureType": "real-screen",
+      "surface": "home",
+      "category": "app/home",
+      "fixture": "fixtureData.json#homeChannelList",
+      "viewport": {
+        "width": 390,
+        "height": 844,
+        "density": 3
+      },
+      "theme": "light",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "Light",
+          "props": {}
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='screens.home.channel-list']",
+        "crop": "element",
+        "contract": "component-bounds",
+        "fullLength": true
+      },
+      "reactPathHint": "packages/web/src/features/sidebar/Sidebar.tsx packages/web/src/components/layout/MainLayout.tsx#MobileTabBar",
+      "androidCaseHint": "compose_home_channel_list_visual:appearance=light",
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "The whole phone Home root in light mode: Sidebar mobileInline (top bar with the workspace pill and the notification bell, no Search button; Saved; Pinned, Joint Channels, Channels and Direct Messages) over the MobileTabBar, seeded from shared/fixtureData.json homeChannelList, which the Android compose_home_channel_list_visual fixture reads through the generated VisualFixtureData.HomeChannelList. States: loud unread (announcements, partners-sync, release, Builder, the long-named human DM), @ mention (release), followed-thread count (mobile), muted quiet count (ops-alerts), private + draft (roadmap), a truncating channel name and DM name, an agent DM with live activity (Cindy) and idle agents showing their runtime. No row is selected: a phone Home root never shows one. The Assistant entry is off (personal_assistant flag fail-closed): Android Home has no Assistant row."
+    },
+    {
+      "id": "screens.home.channel-list.dark",
+      "title": "Home Channel List Screen (Dark)",
+      "captureType": "real-screen",
+      "surface": "home",
+      "category": "app/home",
+      "fixture": "fixtureData.json#homeChannelList",
+      "viewport": {
+        "width": 390,
+        "height": 844,
+        "density": 3
+      },
+      "theme": "dark",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "Dark",
+          "props": {
+            "theme": "dark"
+          }
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='screens.home.channel-list.dark']",
+        "crop": "element",
+        "contract": "component-bounds",
+        "fullLength": true
+      },
+      "reactPathHint": "packages/web/src/features/sidebar/Sidebar.tsx packages/web/src/components/layout/MainLayout.tsx#MobileTabBar",
+      "androidCaseHint": "compose_home_channel_list_visual:appearance=dark",
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "The whole phone Home root in dark mode: Sidebar mobileInline (top bar with the workspace pill and the notification bell, no Search button; Saved; Pinned, Joint Channels, Channels and Direct Messages) over the MobileTabBar, seeded from shared/fixtureData.json homeChannelList, which the Android compose_home_channel_list_visual fixture reads through the generated VisualFixtureData.HomeChannelList. States: loud unread (announcements, partners-sync, release, Builder, the long-named human DM), @ mention (release), followed-thread count (mobile), muted quiet count (ops-alerts), private + draft (roadmap), a truncating channel name and DM name, an agent DM with live activity (Cindy) and idle agents showing their runtime. No row is selected: a phone Home root never shows one. The Assistant entry is off (personal_assistant flag fail-closed): Android Home has no Assistant row."
     },
     {
       "id": "components.thread.message-row.rich-content",
@@ -4803,6 +4703,774 @@
       "notes": "Narrow (260px) markdown message-row wrap net: forces a channel/task chip to wrap to the next line to reproduce the Android inline-box line-wrap bug. Mentions (@artin @Android-Developer-2), channel #对话流专修, and task #607 all chip. Body mirrors the Android md_wrap_task607 thread fixture byte-for-byte."
     },
     {
+      "id": "components.thread.message.agent-read-line.muted-channel",
+      "title": "Agent read line: muted channel",
+      "captureType": "component-fixture",
+      "surface": "thread",
+      "category": "app/thread",
+      "fixture": "packages/web/visual-testing/AgentReadLineCases.tsx#scenario",
+      "viewport": {
+        "width": 390,
+        "height": 844,
+        "density": 3
+      },
+      "theme": "light",
+      "locale": "zh-CN",
+      "variants": [
+        {
+          "id": "muted-channel",
+          "name": "Agent read line: muted channel",
+          "props": {
+            "lang": "zh-CN"
+          }
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='components.thread.message.agent-read-line.muted-channel']",
+        "crop": "element",
+        "contract": "component-bounds"
+      },
+      "reactPathHint": "packages/web/src/components/message/AgentReadFaces.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "components/message/MessageItem",
+            "components/message/AgentReadFaces",
+            "components/message/MessageReadStatusLine"
+          ],
+          "fixture": "packages/web/visual-testing/AgentReadLineCases.tsx#scenario",
+          "path": "packages/web/visual-testing/AgentReadLineCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "Your latest message in #design: Cindy's face (she read it) at the end of its last line, and the line under it, \"Muted: Niko · Mention them to reach them\" with the mute bell (Niko muted the channel and has not read it). React only: the agent read faces and line are web-only. The real MessageItem rows from your latest message on, with the model useAgentReadProgress builds from the pure projection (agentReadProgressDomain) over the fixture in AgentReadLineCases.tsx; the UI language comes from the variant's `lang`, so zh-CN shows the Chinese line."
+    },
+    {
+      "id": "components.thread.message.agent-read-line.muted-channel.dark",
+      "title": "Agent read line: muted channel (dark)",
+      "captureType": "component-fixture",
+      "surface": "thread",
+      "category": "app/thread",
+      "fixture": "packages/web/visual-testing/AgentReadLineCases.tsx#scenario",
+      "viewport": {
+        "width": 390,
+        "height": 844,
+        "density": 3
+      },
+      "theme": "dark",
+      "locale": "zh-CN",
+      "variants": [
+        {
+          "id": "muted-channel",
+          "name": "Agent read line: muted channel",
+          "props": {
+            "lang": "zh-CN"
+          }
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='components.thread.message.agent-read-line.muted-channel.dark']",
+        "crop": "element",
+        "contract": "component-bounds"
+      },
+      "reactPathHint": "packages/web/src/components/message/AgentReadFaces.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "components/message/MessageItem",
+            "components/message/AgentReadFaces",
+            "components/message/MessageReadStatusLine"
+          ],
+          "fixture": "packages/web/visual-testing/AgentReadLineCases.tsx#scenario",
+          "path": "packages/web/visual-testing/AgentReadLineCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "Your latest message in #design: Cindy's face (she read it) at the end of its last line, and the line under it, \"Muted: Niko · Mention them to reach them\" with the mute bell (Niko muted the channel and has not read it). React only: the agent read faces and line are web-only. The real MessageItem rows from your latest message on, with the model useAgentReadProgress builds from the pure projection (agentReadProgressDomain) over the fixture in AgentReadLineCases.tsx; the UI language comes from the variant's `lang`, so zh-CN shows the Chinese line."
+    },
+    {
+      "id": "components.thread.message.agent-read-line.muted-channel.en",
+      "title": "Agent read line: muted channel (en)",
+      "captureType": "component-fixture",
+      "surface": "thread",
+      "category": "app/thread",
+      "fixture": "packages/web/visual-testing/AgentReadLineCases.tsx#scenario",
+      "viewport": {
+        "width": 390,
+        "height": 844,
+        "density": 3
+      },
+      "theme": "light",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "muted-channel",
+          "name": "Agent read line: muted channel",
+          "props": {
+            "lang": "en"
+          }
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='components.thread.message.agent-read-line.muted-channel.en']",
+        "crop": "element",
+        "contract": "component-bounds"
+      },
+      "reactPathHint": "packages/web/src/components/message/AgentReadFaces.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "components/message/MessageItem",
+            "components/message/AgentReadFaces",
+            "components/message/MessageReadStatusLine"
+          ],
+          "fixture": "packages/web/visual-testing/AgentReadLineCases.tsx#scenario",
+          "path": "packages/web/visual-testing/AgentReadLineCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "Your latest message in #design: Cindy's face (she read it) at the end of its last line, and the line under it, \"Muted: Niko · Mention them to reach them\" with the mute bell (Niko muted the channel and has not read it). React only: the agent read faces and line are web-only. The real MessageItem rows from your latest message on, with the model useAgentReadProgress builds from the pure projection (agentReadProgressDomain) over the fixture in AgentReadLineCases.tsx; the UI language comes from the variant's `lang`, so zh-CN shows the Chinese line."
+    },
+    {
+      "id": "components.thread.message.agent-read-line.muted-channel.en.dark",
+      "title": "Agent read line: muted channel (en, dark)",
+      "captureType": "component-fixture",
+      "surface": "thread",
+      "category": "app/thread",
+      "fixture": "packages/web/visual-testing/AgentReadLineCases.tsx#scenario",
+      "viewport": {
+        "width": 390,
+        "height": 844,
+        "density": 3
+      },
+      "theme": "dark",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "muted-channel",
+          "name": "Agent read line: muted channel",
+          "props": {
+            "lang": "en"
+          }
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='components.thread.message.agent-read-line.muted-channel.en.dark']",
+        "crop": "element",
+        "contract": "component-bounds"
+      },
+      "reactPathHint": "packages/web/src/components/message/AgentReadFaces.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "components/message/MessageItem",
+            "components/message/AgentReadFaces",
+            "components/message/MessageReadStatusLine"
+          ],
+          "fixture": "packages/web/visual-testing/AgentReadLineCases.tsx#scenario",
+          "path": "packages/web/visual-testing/AgentReadLineCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "Your latest message in #design: Cindy's face (she read it) at the end of its last line, and the line under it, \"Muted: Niko · Mention them to reach them\" with the mute bell (Niko muted the channel and has not read it). React only: the agent read faces and line are web-only. The real MessageItem rows from your latest message on, with the model useAgentReadProgress builds from the pure projection (agentReadProgressDomain) over the fixture in AgentReadLineCases.tsx; the UI language comes from the variant's `lang`, so zh-CN shows the Chinese line."
+    },
+    {
+      "id": "components.thread.message.agent-read-line.stopped-following-thread",
+      "title": "Agent read line: stopped following a thread",
+      "captureType": "component-fixture",
+      "surface": "thread",
+      "category": "app/thread",
+      "fixture": "packages/web/visual-testing/AgentReadLineCases.tsx#scenario",
+      "viewport": {
+        "width": 390,
+        "height": 844,
+        "density": 3
+      },
+      "theme": "light",
+      "locale": "zh-CN",
+      "variants": [
+        {
+          "id": "stopped-following-thread",
+          "name": "Agent read line: stopped following a thread",
+          "props": {
+            "lang": "zh-CN"
+          }
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='components.thread.message.agent-read-line.stopped-following-thread']",
+        "crop": "element",
+        "contract": "component-bounds"
+      },
+      "reactPathHint": "packages/web/src/components/message/AgentReadFaces.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "components/message/MessageItem",
+            "components/message/AgentReadFaces",
+            "components/message/MessageReadStatusLine"
+          ],
+          "fixture": "packages/web/visual-testing/AgentReadLineCases.tsx#scenario",
+          "path": "packages/web/visual-testing/AgentReadLineCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "Your latest reply in a thread under #design: Cindy's face (she read it) and \"Stopped following: Niko · Mention them to reach them\" with the unfollow icon. React only: the agent read faces and line are web-only. The real MessageItem rows from your latest message on, with the model useAgentReadProgress builds from the pure projection (agentReadProgressDomain) over the fixture in AgentReadLineCases.tsx; the UI language comes from the variant's `lang`, so zh-CN shows the Chinese line."
+    },
+    {
+      "id": "components.thread.message.agent-read-line.stopped-following-thread.dark",
+      "title": "Agent read line: stopped following a thread (dark)",
+      "captureType": "component-fixture",
+      "surface": "thread",
+      "category": "app/thread",
+      "fixture": "packages/web/visual-testing/AgentReadLineCases.tsx#scenario",
+      "viewport": {
+        "width": 390,
+        "height": 844,
+        "density": 3
+      },
+      "theme": "dark",
+      "locale": "zh-CN",
+      "variants": [
+        {
+          "id": "stopped-following-thread",
+          "name": "Agent read line: stopped following a thread",
+          "props": {
+            "lang": "zh-CN"
+          }
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='components.thread.message.agent-read-line.stopped-following-thread.dark']",
+        "crop": "element",
+        "contract": "component-bounds"
+      },
+      "reactPathHint": "packages/web/src/components/message/AgentReadFaces.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "components/message/MessageItem",
+            "components/message/AgentReadFaces",
+            "components/message/MessageReadStatusLine"
+          ],
+          "fixture": "packages/web/visual-testing/AgentReadLineCases.tsx#scenario",
+          "path": "packages/web/visual-testing/AgentReadLineCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "Your latest reply in a thread under #design: Cindy's face (she read it) and \"Stopped following: Niko · Mention them to reach them\" with the unfollow icon. React only: the agent read faces and line are web-only. The real MessageItem rows from your latest message on, with the model useAgentReadProgress builds from the pure projection (agentReadProgressDomain) over the fixture in AgentReadLineCases.tsx; the UI language comes from the variant's `lang`, so zh-CN shows the Chinese line."
+    },
+    {
+      "id": "components.thread.message.agent-read-line.stopped-following-thread.en",
+      "title": "Agent read line: stopped following a thread (en)",
+      "captureType": "component-fixture",
+      "surface": "thread",
+      "category": "app/thread",
+      "fixture": "packages/web/visual-testing/AgentReadLineCases.tsx#scenario",
+      "viewport": {
+        "width": 390,
+        "height": 844,
+        "density": 3
+      },
+      "theme": "light",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "stopped-following-thread",
+          "name": "Agent read line: stopped following a thread",
+          "props": {
+            "lang": "en"
+          }
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='components.thread.message.agent-read-line.stopped-following-thread.en']",
+        "crop": "element",
+        "contract": "component-bounds"
+      },
+      "reactPathHint": "packages/web/src/components/message/AgentReadFaces.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "components/message/MessageItem",
+            "components/message/AgentReadFaces",
+            "components/message/MessageReadStatusLine"
+          ],
+          "fixture": "packages/web/visual-testing/AgentReadLineCases.tsx#scenario",
+          "path": "packages/web/visual-testing/AgentReadLineCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "Your latest reply in a thread under #design: Cindy's face (she read it) and \"Stopped following: Niko · Mention them to reach them\" with the unfollow icon. React only: the agent read faces and line are web-only. The real MessageItem rows from your latest message on, with the model useAgentReadProgress builds from the pure projection (agentReadProgressDomain) over the fixture in AgentReadLineCases.tsx; the UI language comes from the variant's `lang`, so zh-CN shows the Chinese line."
+    },
+    {
+      "id": "components.thread.message.agent-read-line.stopped-following-thread.en.dark",
+      "title": "Agent read line: stopped following a thread (en, dark)",
+      "captureType": "component-fixture",
+      "surface": "thread",
+      "category": "app/thread",
+      "fixture": "packages/web/visual-testing/AgentReadLineCases.tsx#scenario",
+      "viewport": {
+        "width": 390,
+        "height": 844,
+        "density": 3
+      },
+      "theme": "dark",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "stopped-following-thread",
+          "name": "Agent read line: stopped following a thread",
+          "props": {
+            "lang": "en"
+          }
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='components.thread.message.agent-read-line.stopped-following-thread.en.dark']",
+        "crop": "element",
+        "contract": "component-bounds"
+      },
+      "reactPathHint": "packages/web/src/components/message/AgentReadFaces.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "components/message/MessageItem",
+            "components/message/AgentReadFaces",
+            "components/message/MessageReadStatusLine"
+          ],
+          "fixture": "packages/web/visual-testing/AgentReadLineCases.tsx#scenario",
+          "path": "packages/web/visual-testing/AgentReadLineCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "Your latest reply in a thread under #design: Cindy's face (she read it) and \"Stopped following: Niko · Mention them to reach them\" with the unfollow icon. React only: the agent read faces and line are web-only. The real MessageItem rows from your latest message on, with the model useAgentReadProgress builds from the pure projection (agentReadProgressDomain) over the fixture in AgentReadLineCases.tsx; the UI language comes from the variant's `lang`, so zh-CN shows the Chinese line."
+    },
+    {
+      "id": "components.thread.message.agent-read-line.many-narrow",
+      "title": "Agent read line: four muted agents, narrow",
+      "captureType": "component-fixture",
+      "surface": "thread",
+      "category": "app/thread",
+      "fixture": "packages/web/visual-testing/AgentReadLineCases.tsx#scenario",
+      "viewport": {
+        "width": 320,
+        "height": 844,
+        "density": 3
+      },
+      "theme": "light",
+      "locale": "zh-CN",
+      "variants": [
+        {
+          "id": "many-narrow",
+          "name": "Agent read line: four muted agents, narrow",
+          "props": {
+            "lang": "zh-CN"
+          }
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='components.thread.message.agent-read-line.many-narrow']",
+        "crop": "element",
+        "contract": "component-bounds"
+      },
+      "reactPathHint": "packages/web/src/components/message/AgentReadFaces.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "components/message/MessageItem",
+            "components/message/AgentReadFaces",
+            "components/message/MessageReadStatusLine"
+          ],
+          "fixture": "packages/web/visual-testing/AgentReadLineCases.tsx#scenario",
+          "path": "packages/web/visual-testing/AgentReadLineCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "Four muted agents at 320 wide. The names take the room left over beside the verb, \"+1\", \"·\" and the whole hint (zh: \"已静音：Produ… +1 · @ 对方才会看到\"). When not even a name's first letters fit (en), the segment shows its count instead of names and +1: \"Muted: 4 agents\", and the hint, still too long for the row, loses its tail (\"Muted: 4 agents · Mention them t…\"). Cindy's face: she read it. React only: the agent read faces and line are web-only. The real MessageItem rows from your latest message on, with the model useAgentReadProgress builds from the pure projection (agentReadProgressDomain) over the fixture in AgentReadLineCases.tsx; the UI language comes from the variant's `lang`, so zh-CN shows the Chinese line."
+    },
+    {
+      "id": "components.thread.message.agent-read-line.many-narrow.dark",
+      "title": "Agent read line: four muted agents, narrow (dark)",
+      "captureType": "component-fixture",
+      "surface": "thread",
+      "category": "app/thread",
+      "fixture": "packages/web/visual-testing/AgentReadLineCases.tsx#scenario",
+      "viewport": {
+        "width": 320,
+        "height": 844,
+        "density": 3
+      },
+      "theme": "dark",
+      "locale": "zh-CN",
+      "variants": [
+        {
+          "id": "many-narrow",
+          "name": "Agent read line: four muted agents, narrow",
+          "props": {
+            "lang": "zh-CN"
+          }
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='components.thread.message.agent-read-line.many-narrow.dark']",
+        "crop": "element",
+        "contract": "component-bounds"
+      },
+      "reactPathHint": "packages/web/src/components/message/AgentReadFaces.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "components/message/MessageItem",
+            "components/message/AgentReadFaces",
+            "components/message/MessageReadStatusLine"
+          ],
+          "fixture": "packages/web/visual-testing/AgentReadLineCases.tsx#scenario",
+          "path": "packages/web/visual-testing/AgentReadLineCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "Four muted agents at 320 wide. The names take the room left over beside the verb, \"+1\", \"·\" and the whole hint (zh: \"已静音：Produ… +1 · @ 对方才会看到\"). When not even a name's first letters fit (en), the segment shows its count instead of names and +1: \"Muted: 4 agents\", and the hint, still too long for the row, loses its tail (\"Muted: 4 agents · Mention them t…\"). Cindy's face: she read it. React only: the agent read faces and line are web-only. The real MessageItem rows from your latest message on, with the model useAgentReadProgress builds from the pure projection (agentReadProgressDomain) over the fixture in AgentReadLineCases.tsx; the UI language comes from the variant's `lang`, so zh-CN shows the Chinese line."
+    },
+    {
+      "id": "components.thread.message.agent-read-line.many-narrow.en",
+      "title": "Agent read line: four muted agents, narrow (en)",
+      "captureType": "component-fixture",
+      "surface": "thread",
+      "category": "app/thread",
+      "fixture": "packages/web/visual-testing/AgentReadLineCases.tsx#scenario",
+      "viewport": {
+        "width": 320,
+        "height": 844,
+        "density": 3
+      },
+      "theme": "light",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "many-narrow",
+          "name": "Agent read line: four muted agents, narrow",
+          "props": {
+            "lang": "en"
+          }
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='components.thread.message.agent-read-line.many-narrow.en']",
+        "crop": "element",
+        "contract": "component-bounds"
+      },
+      "reactPathHint": "packages/web/src/components/message/AgentReadFaces.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "components/message/MessageItem",
+            "components/message/AgentReadFaces",
+            "components/message/MessageReadStatusLine"
+          ],
+          "fixture": "packages/web/visual-testing/AgentReadLineCases.tsx#scenario",
+          "path": "packages/web/visual-testing/AgentReadLineCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "Four muted agents at 320 wide. The names take the room left over beside the verb, \"+1\", \"·\" and the whole hint (zh: \"已静音：Produ… +1 · @ 对方才会看到\"). When not even a name's first letters fit (en), the segment shows its count instead of names and +1: \"Muted: 4 agents\", and the hint, still too long for the row, loses its tail (\"Muted: 4 agents · Mention them t…\"). Cindy's face: she read it. React only: the agent read faces and line are web-only. The real MessageItem rows from your latest message on, with the model useAgentReadProgress builds from the pure projection (agentReadProgressDomain) over the fixture in AgentReadLineCases.tsx; the UI language comes from the variant's `lang`, so zh-CN shows the Chinese line."
+    },
+    {
+      "id": "components.thread.message.agent-read-line.many-narrow.en.dark",
+      "title": "Agent read line: four muted agents, narrow (en, dark)",
+      "captureType": "component-fixture",
+      "surface": "thread",
+      "category": "app/thread",
+      "fixture": "packages/web/visual-testing/AgentReadLineCases.tsx#scenario",
+      "viewport": {
+        "width": 320,
+        "height": 844,
+        "density": 3
+      },
+      "theme": "dark",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "many-narrow",
+          "name": "Agent read line: four muted agents, narrow",
+          "props": {
+            "lang": "en"
+          }
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='components.thread.message.agent-read-line.many-narrow.en.dark']",
+        "crop": "element",
+        "contract": "component-bounds"
+      },
+      "reactPathHint": "packages/web/src/components/message/AgentReadFaces.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "components/message/MessageItem",
+            "components/message/AgentReadFaces",
+            "components/message/MessageReadStatusLine"
+          ],
+          "fixture": "packages/web/visual-testing/AgentReadLineCases.tsx#scenario",
+          "path": "packages/web/visual-testing/AgentReadLineCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "Four muted agents at 320 wide. The names take the room left over beside the verb, \"+1\", \"·\" and the whole hint (zh: \"已静音：Produ… +1 · @ 对方才会看到\"). When not even a name's first letters fit (en), the segment shows its count instead of names and +1: \"Muted: 4 agents\", and the hint, still too long for the row, loses its tail (\"Muted: 4 agents · Mention them t…\"). Cindy's face: she read it. React only: the agent read faces and line are web-only. The real MessageItem rows from your latest message on, with the model useAgentReadProgress builds from the pure projection (agentReadProgressDomain) over the fixture in AgentReadLineCases.tsx; the UI language comes from the variant's `lang`, so zh-CN shows the Chinese line."
+    },
+    {
+      "id": "components.thread.message.agent-read-line.all-reachable",
+      "title": "Agent read line: everyone reached (no line)",
+      "captureType": "component-fixture",
+      "surface": "thread",
+      "category": "app/thread",
+      "fixture": "packages/web/visual-testing/AgentReadLineCases.tsx#scenario",
+      "viewport": {
+        "width": 390,
+        "height": 844,
+        "density": 3
+      },
+      "theme": "light",
+      "locale": "zh-CN",
+      "variants": [
+        {
+          "id": "all-reachable",
+          "name": "Agent read line: everyone reached (no line)",
+          "props": {
+            "lang": "zh-CN"
+          }
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='components.thread.message.agent-read-line.all-reachable']",
+        "crop": "element",
+        "contract": "component-bounds"
+      },
+      "reactPathHint": "packages/web/src/components/message/AgentReadFaces.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "components/message/MessageItem",
+            "components/message/AgentReadFaces",
+            "components/message/MessageReadStatusLine"
+          ],
+          "fixture": "packages/web/visual-testing/AgentReadLineCases.tsx#scenario",
+          "path": "packages/web/visual-testing/AgentReadLineCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "Niko muted #design but read your message (his face on it) and Cindy replied (her face on her reply): the message reaches everyone, so there is no line. React only: the agent read faces and line are web-only. The real MessageItem rows from your latest message on, with the model useAgentReadProgress builds from the pure projection (agentReadProgressDomain) over the fixture in AgentReadLineCases.tsx; the UI language comes from the variant's `lang`, so zh-CN shows the Chinese line."
+    },
+    {
+      "id": "components.thread.message.agent-read-line.all-reachable.dark",
+      "title": "Agent read line: everyone reached (no line) (dark)",
+      "captureType": "component-fixture",
+      "surface": "thread",
+      "category": "app/thread",
+      "fixture": "packages/web/visual-testing/AgentReadLineCases.tsx#scenario",
+      "viewport": {
+        "width": 390,
+        "height": 844,
+        "density": 3
+      },
+      "theme": "dark",
+      "locale": "zh-CN",
+      "variants": [
+        {
+          "id": "all-reachable",
+          "name": "Agent read line: everyone reached (no line)",
+          "props": {
+            "lang": "zh-CN"
+          }
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='components.thread.message.agent-read-line.all-reachable.dark']",
+        "crop": "element",
+        "contract": "component-bounds"
+      },
+      "reactPathHint": "packages/web/src/components/message/AgentReadFaces.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "components/message/MessageItem",
+            "components/message/AgentReadFaces",
+            "components/message/MessageReadStatusLine"
+          ],
+          "fixture": "packages/web/visual-testing/AgentReadLineCases.tsx#scenario",
+          "path": "packages/web/visual-testing/AgentReadLineCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "Niko muted #design but read your message (his face on it) and Cindy replied (her face on her reply): the message reaches everyone, so there is no line. React only: the agent read faces and line are web-only. The real MessageItem rows from your latest message on, with the model useAgentReadProgress builds from the pure projection (agentReadProgressDomain) over the fixture in AgentReadLineCases.tsx; the UI language comes from the variant's `lang`, so zh-CN shows the Chinese line."
+    },
+    {
+      "id": "components.thread.message.agent-read-line.all-reachable.en",
+      "title": "Agent read line: everyone reached (no line) (en)",
+      "captureType": "component-fixture",
+      "surface": "thread",
+      "category": "app/thread",
+      "fixture": "packages/web/visual-testing/AgentReadLineCases.tsx#scenario",
+      "viewport": {
+        "width": 390,
+        "height": 844,
+        "density": 3
+      },
+      "theme": "light",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "all-reachable",
+          "name": "Agent read line: everyone reached (no line)",
+          "props": {
+            "lang": "en"
+          }
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='components.thread.message.agent-read-line.all-reachable.en']",
+        "crop": "element",
+        "contract": "component-bounds"
+      },
+      "reactPathHint": "packages/web/src/components/message/AgentReadFaces.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "components/message/MessageItem",
+            "components/message/AgentReadFaces",
+            "components/message/MessageReadStatusLine"
+          ],
+          "fixture": "packages/web/visual-testing/AgentReadLineCases.tsx#scenario",
+          "path": "packages/web/visual-testing/AgentReadLineCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "Niko muted #design but read your message (his face on it) and Cindy replied (her face on her reply): the message reaches everyone, so there is no line. React only: the agent read faces and line are web-only. The real MessageItem rows from your latest message on, with the model useAgentReadProgress builds from the pure projection (agentReadProgressDomain) over the fixture in AgentReadLineCases.tsx; the UI language comes from the variant's `lang`, so zh-CN shows the Chinese line."
+    },
+    {
+      "id": "components.thread.message.agent-read-line.all-reachable.en.dark",
+      "title": "Agent read line: everyone reached (no line) (en, dark)",
+      "captureType": "component-fixture",
+      "surface": "thread",
+      "category": "app/thread",
+      "fixture": "packages/web/visual-testing/AgentReadLineCases.tsx#scenario",
+      "viewport": {
+        "width": 390,
+        "height": 844,
+        "density": 3
+      },
+      "theme": "dark",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "all-reachable",
+          "name": "Agent read line: everyone reached (no line)",
+          "props": {
+            "lang": "en"
+          }
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='components.thread.message.agent-read-line.all-reachable.en.dark']",
+        "crop": "element",
+        "contract": "component-bounds"
+      },
+      "reactPathHint": "packages/web/src/components/message/AgentReadFaces.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "components/message/MessageItem",
+            "components/message/AgentReadFaces",
+            "components/message/MessageReadStatusLine"
+          ],
+          "fixture": "packages/web/visual-testing/AgentReadLineCases.tsx#scenario",
+          "path": "packages/web/visual-testing/AgentReadLineCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "Niko muted #design but read your message (his face on it) and Cindy replied (her face on her reply): the message reaches everyone, so there is no line. React only: the agent read faces and line are web-only. The real MessageItem rows from your latest message on, with the model useAgentReadProgress builds from the pure projection (agentReadProgressDomain) over the fixture in AgentReadLineCases.tsx; the UI language comes from the variant's `lang`, so zh-CN shows the Chinese line."
+    },
+    {
       "id": "components.members.create-agent.dialog-no-computer",
       "title": "Members Create Agent Dialog - no computer branch",
       "surface": "members",
@@ -4831,7 +5499,7 @@
         "crop": "element",
         "contract": "modal-viewport"
       },
-      "reactPathHint": "packages/web/src/components/agent/CreateAgentDialog.tsx",
+      "reactPathHint": "packages/web/src/features/agent/CreateAgentDialog.tsx",
       "tolerance": {
         "pixelRatio": 0.02,
         "layoutDp": 1,
@@ -4868,7 +5536,7 @@
         "crop": "element",
         "contract": "modal-viewport"
       },
-      "reactPathHint": "packages/web/src/components/agent/CreateAgentDialog.tsx",
+      "reactPathHint": "packages/web/src/features/agent/CreateAgentDialog.tsx",
       "tolerance": {
         "pixelRatio": 0.02,
         "layoutDp": 1,
@@ -5004,84 +5672,934 @@
       "capture": {
         "contract": "component-bounds"
       },
-      "reactPathHint": "packages/web/src/components/settings/SettingsPanel.tsx#IntegrationsSection"
+      "reactPathHint": "packages/web/src/features/apps/IntegrationsSection.tsx#IntegrationsSection"
+    },
+    {
+      "id": "components.message-card.header",
+      "title": "Card message header, three tags",
+      "captureType": "component-fixture",
+      "surface": "thread",
+      "category": "app/thread",
+      "viewport": {
+        "width": 640,
+        "height": 600,
+        "density": 2
+      },
+      "theme": "light",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "Default",
+          "props": {}
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='components.message-card.header']",
+        "crop": "element",
+        "contract": "component-bounds"
+      },
+      "reactPathHint": "packages/web/src/components/message/MessageCardBody.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "components/message/MessageCardBody",
+            "components/message/MessageCardElements"
+          ],
+          "path": "packages/web/visual-testing/MessageCardCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "RFC 082 v2.0 (§4.8): a card message's header: the title in the Card title style (CardTitle, 600), the subtitle muted, three tags as soft badges in their tone (danger, warning, neutral; info, success, neutral); no colour on the header itself. React-only: the mobile App draws card messages from the shared contract vectors (messageCard.v1.vector.json)."
+    },
+    {
+      "id": "components.message-card.header.dark",
+      "title": "Card message header, three tags (dark)",
+      "captureType": "component-fixture",
+      "surface": "thread",
+      "category": "app/thread",
+      "viewport": {
+        "width": 640,
+        "height": 600,
+        "density": 2
+      },
+      "theme": "dark",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "Default",
+          "props": {}
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='components.message-card.header.dark']",
+        "crop": "element",
+        "contract": "component-bounds"
+      },
+      "reactPathHint": "packages/web/src/components/message/MessageCardBody.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "components/message/MessageCardBody",
+            "components/message/MessageCardElements"
+          ],
+          "path": "packages/web/visual-testing/MessageCardCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "The header case in the dark theme: the tags keep their status tones."
+    },
+    {
+      "id": "components.message-card.fields.phone",
+      "title": "Card message Fields, phone width",
+      "captureType": "component-fixture",
+      "surface": "thread",
+      "category": "app/thread",
+      "viewport": {
+        "width": 390,
+        "height": 844,
+        "density": 3
+      },
+      "theme": "light",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "Default",
+          "props": {}
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='components.message-card.fields.phone']",
+        "crop": "element",
+        "contract": "component-bounds"
+      },
+      "reactPathHint": "packages/web/src/components/message/MessageCardBody.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "components/message/MessageCardBody",
+            "components/message/MessageCardElements"
+          ],
+          "path": "packages/web/visual-testing/MessageCardCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "RFC 082 v2.0: Fields as raft-ui DescriptionList direction=horizontal on a phone-width card: below 384px each label sits above its value; values wrap, never truncate; mono values in the code face."
+    },
+    {
+      "id": "components.message-card.markdown",
+      "title": "Card message Markdown with a list and a quote",
+      "captureType": "component-fixture",
+      "surface": "thread",
+      "category": "app/thread",
+      "viewport": {
+        "width": 640,
+        "height": 700,
+        "density": 2
+      },
+      "theme": "light",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "Default",
+          "props": {}
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='components.message-card.markdown']",
+        "crop": "element",
+        "contract": "component-bounds"
+      },
+      "reactPathHint": "packages/web/src/components/message/MessageCardBody.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "components/message/MessageCardBody",
+            "components/message/MessageCardElements"
+          ],
+          "path": "packages/web/visual-testing/MessageCardCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "RFC 082 v2.0: a Markdown element drawn by the message renderer restricted to the card subset: bold, inline code, a nested list, a quote, a link; @name stays text (no chip); then a Divider and a button."
+    },
+    {
+      "id": "components.action-card.expired-agent",
+      "title": "Action card, expired after 30 days (agent card, opened)",
+      "captureType": "component-fixture",
+      "surface": "thread",
+      "category": "app/thread",
+      "viewport": {
+        "width": 640,
+        "height": 600,
+        "density": 2
+      },
+      "theme": "light",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "Default",
+          "props": {}
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='components.action-card.expired-agent']",
+        "crop": "element",
+        "contract": "component-bounds",
+        "interactions": [
+          {
+            "type": "click",
+            "target": "[data-visual-case='components.action-card.expired-agent'] button[aria-label='Show or hide details']"
+          },
+          {
+            "type": "wait",
+            "ms": 160
+          }
+        ]
+      },
+      "reactPathHint": "packages/web/src/components/actions/ActionCardSpecCard.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "components/actions/ActionCard",
+            "components/actions/ActionCardSpecCard"
+          ],
+          "path": "packages/web/visual-testing/ActionCardCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "#proj-apps:#40 (Kirby 7579a290): an agent's channel:create card no one completed within 30 days, as the server serves it (state expired, expiresAt). Opened: Expired in Withdrawn's grey, \"Expired on {date}. Ask the agent to send a new request.\" under the title, the card's facts and reason, no buttons. React-only: the mobile App draws the card from state and expiresAt."
+    },
+    {
+      "id": "components.action-card.mcp-connect",
+      "title": "Action card, MCP connect (prepared, server manager)",
+      "captureType": "component-fixture",
+      "surface": "thread",
+      "category": "app/thread",
+      "viewport": {
+        "width": 640,
+        "height": 600,
+        "density": 2
+      },
+      "theme": "light",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "Default",
+          "props": {}
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='components.action-card.mcp-connect']",
+        "crop": "element",
+        "contract": "component-bounds",
+        "interactions": [
+          {
+            "type": "wait",
+            "ms": 320
+          }
+        ]
+      },
+      "reactPathHint": "packages/web/src/components/actions/ActionCardSpecCard.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "components/actions/ActionCard",
+            "components/actions/ActionCardSpecCard"
+          ],
+          "path": "packages/web/visual-testing/ActionCardCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "#proj-apps:#41 (Kirby 6c3920b9, 9f8835f9, 1265e067): an integration:connect_mcp card waiting for a grant. Title names the App and the agent by display name, no grey notice, the picker with Grant access in the ink border (no pink). React-only: the mobile App keeps its typed card for this type."
+    },
+    {
+      "id": "components.action-card.agent-create",
+      "title": "Action card, create agent (prepared)",
+      "captureType": "component-fixture",
+      "surface": "thread",
+      "category": "app/thread",
+      "viewport": {
+        "width": 640,
+        "height": 360,
+        "density": 2
+      },
+      "theme": "light",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "Default",
+          "props": {}
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='components.action-card.agent-create']",
+        "crop": "element",
+        "contract": "component-bounds",
+        "interactions": [
+          {
+            "type": "wait",
+            "ms": 160
+          }
+        ]
+      },
+      "reactPathHint": "packages/web/src/components/actions/ActionCardSpecCard.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "components/actions/ActionCard",
+            "components/actions/ActionCardSpecCard"
+          ],
+          "path": "packages/web/visual-testing/ActionCardCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "#proj-apps:#41 (Kirby 1265e067): an agent:create card waiting for a person. The title names the agent to be without an @: it has no record yet, and the name is what it will be called. React-only: the mobile App draws the same spec."
+    },
+    {
+      "id": "components.action-card.agent-migrate",
+      "title": "Action card, move agent to another computer (prepared)",
+      "captureType": "component-fixture",
+      "surface": "thread",
+      "category": "app/thread",
+      "viewport": {
+        "width": 640,
+        "height": 360,
+        "density": 2
+      },
+      "theme": "light",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "Default",
+          "props": {}
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='components.action-card.agent-migrate']",
+        "crop": "element",
+        "contract": "component-bounds",
+        "interactions": [
+          {
+            "type": "wait",
+            "ms": 160
+          }
+        ]
+      },
+      "reactPathHint": "packages/web/src/components/actions/ActionCardSpecCard.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "components/actions/ActionCard",
+            "components/actions/ActionCardSpecCard"
+          ],
+          "path": "packages/web/visual-testing/ActionCardCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "agent:migrate (xxchan's approved v3 design, artifact pt_216ae970): an agent asks to be moved to another computer. The title names the agent, the suggested computer is a plain field, then the Reason and one Move agent button in the ink border (no pink). React-only: the mobile App draws the same spec."
+    },
+    {
+      "id": "components.agent-context-view.messages",
+      "title": "View Context Messages (desktop side column)",
+      "captureType": "component-fixture",
+      "surface": "agent-context-view",
+      "category": "app/agent",
+      "fixture": "packages/web/visual-testing/AgentContextViewCases.tsx#CONTEXT",
+      "viewport": {
+        "width": 1280,
+        "height": 1800,
+        "density": 1
+      },
+      "theme": "light",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "View Context Messages (desktop side column)",
+          "props": {}
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='components.agent-context-view.messages']",
+        "crop": "element",
+        "contract": "component-bounds"
+      },
+      "reactPathHint": "packages/web/src/components/agentContextView/AgentContextViewMessageList.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "components/agentContextView/AgentContextViewBody"
+          ],
+          "fixture": "packages/web/visual-testing/AgentContextViewCases.tsx#CONTEXT",
+          "path": "packages/web/visual-testing/AgentContextViewCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "View Context's messages on a context like qizhi-wang's screenshot (#wg-ax, Kirby): a system update in Markdown with long paths, a user message, hidden thinking and an Agent call with a description, its result, a nested Edit call, the ringed send call. react-only: the panel is web-only. Desktop: the 440px side column."
+    },
+    {
+      "id": "components.agent-context-view.messages.dark",
+      "title": "View Context Messages (desktop side column, dark)",
+      "captureType": "component-fixture",
+      "surface": "agent-context-view",
+      "category": "app/agent",
+      "fixture": "packages/web/visual-testing/AgentContextViewCases.tsx#CONTEXT",
+      "viewport": {
+        "width": 1280,
+        "height": 1800,
+        "density": 1
+      },
+      "theme": "dark",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "View Context Messages (desktop side column, dark)",
+          "props": {
+            "theme": "dark"
+          }
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='components.agent-context-view.messages.dark']",
+        "crop": "element",
+        "contract": "component-bounds"
+      },
+      "reactPathHint": "packages/web/src/components/agentContextView/AgentContextViewMessageList.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "components/agentContextView/AgentContextViewBody"
+          ],
+          "fixture": "packages/web/visual-testing/AgentContextViewCases.tsx#CONTEXT",
+          "path": "packages/web/visual-testing/AgentContextViewCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "View Context's messages on a context like qizhi-wang's screenshot (#wg-ax, Kirby): a system update in Markdown with long paths, a user message, hidden thinking and an Agent call with a description, its result, a nested Edit call, the ringed send call. react-only: the panel is web-only. Desktop, dark: the code surface against the canvas."
+    },
+    {
+      "id": "components.agent-context-view.messages.phone",
+      "title": "View Context Messages (phone page)",
+      "captureType": "component-fixture",
+      "surface": "agent-context-view",
+      "category": "app/agent",
+      "fixture": "packages/web/visual-testing/AgentContextViewCases.tsx#CONTEXT",
+      "viewport": {
+        "width": 390,
+        "height": 1400,
+        "density": 3
+      },
+      "theme": "light",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "View Context Messages (phone page)",
+          "props": {}
+        }
+      ],
+      "capture": {
+        "selector": "body",
+        "crop": "element",
+        "contract": "modal-viewport"
+      },
+      "reactPathHint": "packages/web/src/components/agentContextView/AgentContextViewMessageList.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "components/agentContextView/AgentContextViewBody"
+          ],
+          "fixture": "packages/web/visual-testing/AgentContextViewCases.tsx#CONTEXT",
+          "path": "packages/web/visual-testing/AgentContextViewCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "View Context's messages on a context like qizhi-wang's screenshot (#wg-ax, Kirby): a system update in Markdown with long paths, a user message, hidden thinking and an Agent call with a description, its result, a nested Edit call, the ringed send call. react-only: the panel is web-only. Phone: the page over the app at 390px."
+    },
+    {
+      "id": "components.agent-context-view.verified",
+      "title": "View Context: verified (desktop side column)",
+      "captureType": "component-fixture",
+      "surface": "agent-context-view",
+      "category": "app/agent",
+      "fixture": "packages/web/visual-testing/AgentContextViewCases.tsx#viewBody",
+      "viewport": {
+        "width": 1280,
+        "height": 1000,
+        "density": 1
+      },
+      "theme": "light",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "View Context: verified (desktop side column)",
+          "props": {}
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='components.agent-context-view.verified']",
+        "crop": "element",
+        "contract": "component-bounds"
+      },
+      "reactPathHint": "packages/web/src/components/agentContextView/AgentContextViewPanel.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "components/agentContextView/AgentContextViewBody"
+          ],
+          "fixture": "packages/web/visual-testing/AgentContextViewCases.tsx#viewBody",
+          "path": "packages/web/visual-testing/AgentContextViewCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "#wg-ax:#9 (Kirby): a restore checked against what the model received. The Verified tag on the head's title (PanelStatus, as ChannelSideCard places it); its tooltip says what was checked. react-only: the panel is web-only."
+    },
+    {
+      "id": "components.agent-context-view.count-matched",
+      "title": "View Context: count matched (desktop side column)",
+      "captureType": "component-fixture",
+      "surface": "agent-context-view",
+      "category": "app/agent",
+      "fixture": "packages/web/visual-testing/AgentContextViewCases.tsx#viewBody",
+      "viewport": {
+        "width": 1280,
+        "height": 1000,
+        "density": 1
+      },
+      "theme": "light",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "View Context: count matched (desktop side column)",
+          "props": {}
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='components.agent-context-view.count-matched']",
+        "crop": "element",
+        "contract": "component-bounds"
+      },
+      "reactPathHint": "packages/web/src/components/agentContextView/AgentContextViewPanel.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "components/agentContextView/AgentContextViewBody"
+          ],
+          "fixture": "packages/web/visual-testing/AgentContextViewCases.tsx#viewBody",
+          "path": "packages/web/visual-testing/AgentContextViewCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "#wg-ax:#9 (Kirby): a Kimi restore whose message count matched but which can't be checked exactly. The neutral info note above the context names the runtime; no Verified tag. react-only: the panel is web-only."
+    },
+    {
+      "id": "components.agent-context-view.newer-session-format",
+      "title": "View Context: newer session format (desktop side column)",
+      "captureType": "component-fixture",
+      "surface": "agent-context-view",
+      "category": "app/agent",
+      "fixture": "packages/web/visual-testing/AgentContextViewCases.tsx#viewBody",
+      "viewport": {
+        "width": 1280,
+        "height": 900,
+        "density": 1
+      },
+      "theme": "light",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "View Context: newer session format (desktop side column)",
+          "props": {}
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='components.agent-context-view.newer-session-format']",
+        "crop": "element",
+        "contract": "component-bounds"
+      },
+      "reactPathHint": "packages/web/src/components/agentContextView/AgentContextViewPanel.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "components/agentContextView/AgentContextViewBody"
+          ],
+          "fixture": "packages/web/visual-testing/AgentContextViewCases.tsx#viewBody",
+          "path": "packages/web/visual-testing/AgentContextViewCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "#wg-ax:#9 (Kirby): a session saved by a newer runtime than the Computer's Raft reads. The orange banner, no Retry, and Open computer for a viewer who can open that Computer. react-only: the panel is web-only."
+    },
+    {
+      "id": "screens.shell.open-in-app.desktop-used",
+      "title": "Open in Raft Desktop: the account used the app lately",
+      "captureType": "real-screen",
+      "surface": "shell",
+      "category": "app/shell",
+      "fixture": "packages/web/visual-testing/OpenInAppOfferCases.tsx#prime",
+      "viewport": {
+        "width": 1280,
+        "height": 800,
+        "density": 1
+      },
+      "theme": "light",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "Open in Raft Desktop: the account used the app lately",
+          "props": {}
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='screens.shell.open-in-app.desktop-used']",
+        "crop": "element",
+        "contract": "viewport-with-portal"
+      },
+      "reactPathHint": "packages/web/src/components/deeplinks/OpenInAppOffers.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "components/layout/MainLayout",
+            "components/deeplinks/OpenInAppOffers"
+          ],
+          "path": "packages/web/visual-testing/OpenInAppOfferCases.tsx",
+          "fixture": "packages/web/visual-testing/OpenInAppOfferCases.tsx#prime"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "React only, no baseline or parity gate. The real MainLayout, opened fresh so the app's own boot capture records a landing from outside, with deep_links_v1 seeded on: the open-in-app offer in the strip across the window, under the top bar (ShellFrame topStrip). A computer on the Computers page; the account used Raft Desktop in the last 30 days, so the banner says so."
+    },
+    {
+      "id": "screens.shell.open-in-app.desktop-download",
+      "title": "Open in Raft Desktop: no sign of the app, so the download",
+      "captureType": "real-screen",
+      "surface": "shell",
+      "category": "app/shell",
+      "fixture": "packages/web/visual-testing/OpenInAppOfferCases.tsx#prime",
+      "viewport": {
+        "width": 1280,
+        "height": 800,
+        "density": 1
+      },
+      "theme": "light",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "Open in Raft Desktop: no sign of the app, so the download",
+          "props": {}
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='screens.shell.open-in-app.desktop-download']",
+        "crop": "element",
+        "contract": "viewport-with-portal"
+      },
+      "reactPathHint": "packages/web/src/components/deeplinks/OpenInAppOffers.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "components/layout/MainLayout",
+            "components/deeplinks/OpenInAppOffers"
+          ],
+          "path": "packages/web/visual-testing/OpenInAppOfferCases.tsx",
+          "fixture": "packages/web/visual-testing/OpenInAppOfferCases.tsx#prime"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "React only, no baseline or parity gate. The real MainLayout, opened fresh so the app's own boot capture records a landing from outside, with deep_links_v1 seeded on: the open-in-app offer in the strip across the window, under the top bar (ShellFrame topStrip). A computer on the Computers page with no sign of Raft Desktop: \"Don't have it yet?\" and this computer's download as a text link."
+    },
+    {
+      "id": "screens.computers.rack.needs-attention",
+      "title": "Computers page: needs attention (admin)",
+      "captureType": "real-screen",
+      "surface": "computers",
+      "category": "app/computers",
+      "fixture": "packages/web/visual-testing/ComputersRackCases.tsx#ATTENTION_FLEET",
+      "viewport": {
+        "width": 1280,
+        "height": 800,
+        "density": 1
+      },
+      "theme": "light",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "Computers page: needs attention (admin)",
+          "props": {
+            "lang": "en"
+          }
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='screens.computers.rack.needs-attention']",
+        "crop": "element",
+        "contract": "viewport-with-portal"
+      },
+      "reactPathHint": "packages/web/src/features/computer/ComputersAttentionSummary.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "components/layout/MainLayout",
+            "features/computer/ComputersRackOverview",
+            "features/computer/ComputersAttentionSummary",
+            "features/sidebar/computers/ComputerRowBody"
+          ],
+          "path": "packages/web/visual-testing/ComputersRackCases.tsx",
+          "fixture": "packages/web/visual-testing/ComputersRackCases.tsx#ATTENTION_FLEET"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "React only, no baseline or parity gate (#proj-raft-computer:#68). The real MainLayout at /s/visual/computers: the desktop Computers rail (sidebar Computer rows) and the Computers page, over the fixture's own fleet whose machine-list `attention` and `readiness` are composed by the shared composeReadinessAttention / composeReadiness from readiness facts and trimmed for the viewer, as the server does. Viewer is a server admin. Four Computers: oak-linux fine (Claude 60% used); elm-studio (Olive's) with its Claude account needing verification, holding 2 agents, and its Codex week used up (2 agents waiting, 6 days); pine-mini restarting into an update (Updating…); birch-mbp offline for two days. Above the list: '3 Computers need attention' and '2 agents waiting · back in 6d'."
+    },
+    {
+      "id": "screens.computers.rack.needs-attention.dark",
+      "title": "Computers page: needs attention (admin, dark)",
+      "captureType": "real-screen",
+      "surface": "computers",
+      "category": "app/computers",
+      "fixture": "packages/web/visual-testing/ComputersRackCases.tsx#ATTENTION_FLEET",
+      "viewport": {
+        "width": 1280,
+        "height": 800,
+        "density": 1
+      },
+      "theme": "dark",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "Computers page: needs attention (admin, dark)",
+          "props": {
+            "lang": "en"
+          }
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='screens.computers.rack.needs-attention.dark']",
+        "crop": "element",
+        "contract": "viewport-with-portal"
+      },
+      "reactPathHint": "packages/web/src/features/computer/ComputersAttentionSummary.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "components/layout/MainLayout",
+            "features/computer/ComputersRackOverview",
+            "features/computer/ComputersAttentionSummary",
+            "features/sidebar/computers/ComputerRowBody"
+          ],
+          "path": "packages/web/visual-testing/ComputersRackCases.tsx",
+          "fixture": "packages/web/visual-testing/ComputersRackCases.tsx#ATTENTION_FLEET"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "React only, no baseline or parity gate (#proj-raft-computer:#68). The real MainLayout at /s/visual/computers: the desktop Computers rail (sidebar Computer rows) and the Computers page, over the fixture's own fleet whose machine-list `attention` and `readiness` are composed by the shared composeReadinessAttention / composeReadiness from readiness facts and trimmed for the viewer, as the server does. screens.computers.rack.needs-attention in the dark theme."
+    },
+    {
+      "id": "screens.computers.rack.needs-attention.single",
+      "title": "Computers page: one Computer needs attention (admin)",
+      "captureType": "real-screen",
+      "surface": "computers",
+      "category": "app/computers",
+      "fixture": "packages/web/visual-testing/ComputersRackCases.tsx#SINGLE_ATTENTION_FLEET",
+      "viewport": {
+        "width": 1280,
+        "height": 800,
+        "density": 1
+      },
+      "theme": "light",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "Computers page: one Computer needs attention (admin)",
+          "props": {
+            "lang": "en"
+          }
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='screens.computers.rack.needs-attention.single']",
+        "crop": "element",
+        "contract": "viewport-with-portal"
+      },
+      "reactPathHint": "packages/web/src/features/computer/ComputersAttentionSummary.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "components/layout/MainLayout",
+            "features/computer/ComputersRackOverview",
+            "features/computer/ComputersAttentionSummary",
+            "features/sidebar/computers/ComputerRowBody"
+          ],
+          "path": "packages/web/visual-testing/ComputersRackCases.tsx",
+          "fixture": "packages/web/visual-testing/ComputersRackCases.tsx#SINGLE_ATTENTION_FLEET"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "React only, no baseline or parity gate (#proj-raft-computer:#68). The real MainLayout at /s/visual/computers: the desktop Computers rail (sidebar Computer rows) and the Computers page, over the fixture's own fleet whose machine-list `attention` and `readiness` are composed by the shared composeReadinessAttention / composeReadiness from readiness facts and trimmed for the viewer, as the server does. Viewer is a server admin. oak-linux, elm-studio (as in needs-attention) and maple-cloud: only elm-studio needs attention, so the line names it: 'Claude Code: Account needs verification on elm-studio · 2 agents · Verify account', and '2 agents waiting · back in 6d'."
+    },
+    {
+      "id": "screens.computers.rack.needs-attention.member",
+      "title": "Computers page: one Computer needs attention (member)",
+      "captureType": "real-screen",
+      "surface": "computers",
+      "category": "app/computers",
+      "fixture": "packages/web/visual-testing/ComputersRackCases.tsx#SINGLE_ATTENTION_FLEET",
+      "viewport": {
+        "width": 1280,
+        "height": 800,
+        "density": 1
+      },
+      "theme": "light",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "Computers page: one Computer needs attention (member)",
+          "props": {
+            "lang": "en"
+          }
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='screens.computers.rack.needs-attention.member']",
+        "crop": "element",
+        "contract": "viewport-with-portal"
+      },
+      "reactPathHint": "packages/web/src/features/computer/ComputersAttentionSummary.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "components/layout/MainLayout",
+            "features/computer/ComputersRackOverview",
+            "features/computer/ComputersAttentionSummary",
+            "features/sidebar/computers/ComputerRowBody"
+          ],
+          "path": "packages/web/visual-testing/ComputersRackCases.tsx",
+          "fixture": "packages/web/visual-testing/ComputersRackCases.tsx#SINGLE_ATTENTION_FLEET"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "React only, no baseline or parity gate (#proj-raft-computer:#68). The real MainLayout at /s/visual/computers: the desktop Computers rail (sidebar Computer rows) and the Computers page, over the fixture's own fleet whose machine-list `attention` and `readiness` are composed by the shared composeReadinessAttention / composeReadiness from readiness facts and trimmed for the viewer, as the server does. The fleet of needs-attention.single seen by an ordinary member, who may not see the reason on Olive's Computers: 'Needs attention on elm-studio · 2 agents · Olive can verify the account', no action link."
     }
   ],
   "componentMatrix": [
-    {
-      "id": "screens.auth.profile-setup",
-      "title": "Auth Profile Setup Screen",
-      "surface": "auth",
-      "group": "product-auth",
-      "status": "baseline",
-      "notes": "React AccountIdentitySetupPage vs the KMP profile-setup gate introduced after registration/email verification.",
-      "providers": [
-        {
-          "id": "react",
-          "status": "ready",
-          "components": [
-            "AccountIdentitySetupPage",
-            "FormField"
-          ],
-          "path": "packages/web/src/components/auth/AccountIdentitySetupPage.tsx",
-          "fixture": "fixtures/screens.auth.profile-setup.json"
-        },
-        {
-          "id": "android",
-          "status": "ready",
-          "source": "kmp-shared",
-          "components": [
-            "AuthProfileSetupContent",
-            "AuthTextField"
-          ],
-          "path": "compose/shared/src/commonMain/kotlin/build/raft/app/AuthPages.kt",
-          "fixture": "KmpVisualScreenshotCaptureTest.captureAuthProfileSetupScreen"
-        },
-        {
-          "id": "harmony",
-          "status": "pending",
-          "source": "kmp-shared",
-          "reason": "Needs OHOS real auth route capture."
-        }
-      ]
-    },
-    {
-      "id": "components.auth.register.inputs",
-      "title": "Auth Register Inputs",
-      "surface": "auth",
-      "group": "product-auth",
-      "status": "baseline",
-      "notes": "Real React RegisterPage auth input typography and placeholders vs Android rendering of the shared KMP Register page.",
-      "providers": [
-        {
-          "id": "react",
-          "status": "ready",
-          "components": [
-            "RegisterPage",
-            "FormField"
-          ],
-          "path": "packages/web/src/components/auth/RegisterPage.tsx",
-          "fixture": "fixtures/components.auth.register.inputs.json"
-        },
-        {
-          "id": "android",
-          "status": "ready",
-          "source": "kmp-shared",
-          "components": [
-            "AuthTextField",
-            "RegisterContent"
-          ],
-          "path": "compose/shared/src/commonMain/kotlin/ai/slock/compose/AuthComponents.kt",
-          "fixture": "KmpVisualScreenshotCaptureTest.captureAuthRegisterInputs"
-        },
-        {
-          "id": "harmony",
-          "status": "pending",
-          "source": "kmp-shared",
-          "reason": "Needs OHOS real auth route capture."
-        }
-      ]
-    },
     {
       "id": "components.tokens.palette",
       "title": "Shared Tokens",
@@ -5437,7 +6955,7 @@
           "components": [
             "MessageInput"
           ],
-          "path": "packages/web/src/components/message/MessageInput.tsx",
+          "path": "packages/web/src/features/composer/MessageInput.tsx",
           "fixture": "fixtures/components.thread.composer.empty.json"
         },
         {
@@ -5476,7 +6994,7 @@
           "components": [
             "MessageInput"
           ],
-          "path": "packages/web/src/components/message/MessageInput.tsx",
+          "path": "packages/web/src/features/composer/MessageInput.tsx",
           "fixture": "fixtures/components.thread.composer.states.json"
         },
         {
@@ -5556,7 +7074,7 @@
           "components": [
             "MessageInput"
           ],
-          "path": "packages/web/src/components/message/MessageInput.tsx",
+          "path": "packages/web/src/features/composer/MessageInput.tsx",
           "fixture": "components.thread.composer.states route plus As Task click interaction"
         },
         {
@@ -5597,7 +7115,7 @@
             "MentionCandidateBody",
             "MentionCandidateAvatar"
           ],
-          "path": "packages/web/src/components/message/MessageInput.tsx",
+          "path": "packages/web/src/features/composer/MessageInput.tsx",
           "fixture": "fixtures/components.thread.composer.member-suggestions.json plus @ trigger interaction"
         },
         {
@@ -5637,7 +7155,7 @@
           "components": [
             "MessageInput"
           ],
-          "path": "packages/web/src/components/message/MessageInput.tsx",
+          "path": "packages/web/src/features/composer/MessageInput.tsx",
           "fixture": "fixtures/components.thread.composer.channel-suggestions.json plus # trigger interaction"
         },
         {
@@ -5678,7 +7196,7 @@
             "MessageInput",
             "SortableAttachment"
           ],
-          "path": "packages/web/src/components/message/MessageInput.tsx",
+          "path": "packages/web/src/features/composer/MessageInput.tsx",
           "fixture": "packages/web/visual-testing/VisualTestingCases.tsx#components.thread.composer.image-preview"
         },
         {
@@ -5720,7 +7238,7 @@
             "MessageInput",
             "SortableAttachment"
           ],
-          "path": "packages/web/src/components/message/MessageInput.tsx",
+          "path": "packages/web/src/features/composer/MessageInput.tsx",
           "fixture": "packages/web/visual-testing/VisualTestingCases.tsx#components.thread.composer.file-previews"
         },
         {
@@ -5804,7 +7322,7 @@
             "ChatPanel",
             "PanelHeader"
           ],
-          "path": "packages/web/src/components/message/ChatPanel.tsx",
+          "path": "packages/web/src/features/channel/ChatPanel.tsx",
           "fixture": "packages/web/visual-testing/VisualTestingCases.tsx#ThreadHeaderVisualCaseView"
         },
         {
@@ -5909,7 +7427,7 @@
       "surface": "home",
       "group": "product-home",
       "status": "baseline",
-      "notes": "React now captures the real mobile Sidebar titlebar with the visual server and notification fixture. The previous hand-built titlebar markup was removed from the provider path. Harmony remains pending real-device/provider capture.",
+      "notes": "Four states declared as the case variants: other-server unread with a long name, short name with a server avatar, long-name ellipsis, and the expanded server switcher. React renders each with the real mobile Sidebar in its own iframe of the visual host (the bar reads global stores); Android renders the same board on its KMP page. Harmony remains pending real-device/provider capture.",
       "providers": [
         {
           "id": "react",
@@ -5918,7 +7436,7 @@
             "Sidebar",
             "NotificationTrigger"
           ],
-          "path": "packages/web/src/components/layout/Sidebar.tsx",
+          "path": "packages/web/src/features/sidebar/Sidebar.tsx",
           "fixture": "packages/web/visual-testing/VisualTestingCases.tsx#HomeTitlebarVisualCaseView"
         },
         {
@@ -5959,7 +7477,7 @@
           "components": [
             "NotificationCenter"
           ],
-          "path": "packages/web/src/components/ui/NotificationCenter.tsx",
+          "path": "packages/web/src/components/layout/NotificationCenter.tsx",
           "fixture": "packages/web/visual-testing/VisualTestingCases.tsx#VISUAL_NOTIFICATION_CENTER_ENTRIES"
         },
         {
@@ -6000,7 +7518,7 @@
             "SelectionPopover",
             "SegmentedControl"
           ],
-          "path": "packages/web/src/components/search/MessageSearchPage.tsx",
+          "path": "packages/web/src/features/search/MessageSearchPage.tsx",
           "fixture": "fixtures/components.home.search.results.json"
         },
         {
@@ -6044,7 +7562,7 @@
             "MessageSearchPage",
             "SelectionPopover"
           ],
-          "path": "packages/web/src/components/search/MessageSearchPage.tsx",
+          "path": "packages/web/src/features/search/MessageSearchPage.tsx",
           "fixture": "fixtures/components.home.search.results.json"
         },
         {
@@ -6133,7 +7651,7 @@
             "SegmentedControl",
             "ConversationPreviewCard"
           ],
-          "path": "packages/web/src/components/thread/ThreadsInbox.tsx",
+          "path": "packages/web/src/features/thread/ThreadsInbox.tsx",
           "fixture": "fixtures/components.home.activity.results.json"
         },
         {
@@ -6307,7 +7825,7 @@
             "Select",
             "RuntimeConfigFields"
           ],
-          "path": "packages/web/src/components/agent/CreateAgentDialog.tsx",
+          "path": "packages/web/src/features/agent/CreateAgentDialog.tsx",
           "fixture": "packages/web/visual-testing/VisualTestingCases.tsx"
         },
         {
@@ -6352,7 +7870,7 @@
             "AgentProfileInfo",
             "AgentSkills"
           ],
-          "path": "packages/web/src/components/agent/AgentDetailPanel.tsx",
+          "path": "packages/web/src/features/agent/AgentDetailPanel.tsx",
           "fixture": "packages/web/visual-testing/VisualTestingCases.tsx"
         },
         {
@@ -6386,7 +7904,7 @@
       "surface": "channel",
       "group": "product-channel",
       "status": "baseline",
-      "notes": "Real React EditChannelDialog for the channel settings panel. Android/KMP provider uses the shared thread settings modal route; Harmony capture remains pending.",
+      "notes": "Real React channel drawer (ChatPanel settings trigger -> ChannelOverflowMenu with EditChannelDialog as its body); query params channel=design|private|joint|dm, view=members, role=member pick the variant. Android/KMP provider uses the shared thread settings modal route; Harmony capture remains pending.",
       "providers": [
         {
           "id": "react",
@@ -6395,7 +7913,7 @@
             "EditChannelDialog",
             "FormField"
           ],
-          "path": "packages/web/src/components/channel/EditChannelDialog.tsx",
+          "path": "packages/web/src/features/channel/EditChannelDialog.tsx",
           "fixture": "fixtures/components.channel.settings.panel.json"
         },
         {
@@ -6427,17 +7945,16 @@
       "surface": "channel",
       "group": "product-channel",
       "status": "baseline",
-      "notes": "Real React ChannelMembers add-member modal opened from the channel members panel. Android/KMP provider uses the shared add-member modal route; Harmony capture remains pending.",
+      "notes": "Phone-width add-member view: real React ChannelMembers presentation=\"page\" (the channel overflow drawer's members page, 390x844) after tapping the bottom-pinned Add Member entry. Android/KMP provider is the shared ChannelAddMemberPanel.",
       "providers": [
         {
           "id": "react",
           "status": "ready",
           "components": [
             "ChannelMembers",
-            "ChannelMemberListShell",
-            "ChannelMemberRow"
+            "MemberChoiceList"
           ],
-          "path": "packages/web/src/components/agent/ChannelMembers.tsx",
+          "path": "packages/web/src/features/channel/ChannelMembers.tsx",
           "fixture": "fixtures/components.channel.members.add-panel.json"
         },
         {
@@ -6445,21 +7962,10 @@
           "status": "ready",
           "source": "kmp-shared",
           "components": [
-            "ThreadAddMemberModal",
-            "Shared add-member panel"
+            "ChannelAddMemberPanel"
           ],
-          "path": "compose/shared/src/commonMain/kotlin/ai/slock/compose/ThreadPage.kt",
+          "path": "compose/shared/src/commonMain/kotlin/build/raft/app/ChannelAddMemberPanel.kt",
           "fixture": "KmpVisualScreenshotCaptureTest.captureChannelAddMemberPanel"
-        },
-        {
-          "id": "harmony",
-          "status": "pending",
-          "source": "kmp-shared-ohos",
-          "components": [
-            "Shared add-member panel"
-          ],
-          "path": "compose/shared/src/commonMain/kotlin/ai/slock/compose/ThreadPage.kt",
-          "reason": "Needs Harmony real-device/provider capture."
         }
       ]
     },
@@ -6477,7 +7983,7 @@
           "components": [
             "Sidebar"
           ],
-          "path": "packages/web/src/components/layout/Sidebar.tsx",
+          "path": "packages/web/src/features/sidebar/Sidebar.tsx",
           "fixture": "fixtures/components.settings.root.page.json"
         },
         {
@@ -6529,7 +8035,7 @@
           "components": [
             "AccountSection"
           ],
-          "path": "packages/web/src/components/settings/SettingsPanel.tsx",
+          "path": "packages/web/src/features/settings/account/AccountSection.tsx",
           "fixture": "fixtures/components.settings.account.page.json"
         },
         {
@@ -6571,7 +8077,7 @@
           "components": [
             "AccountSection"
           ],
-          "path": "packages/web/src/components/settings/SettingsPanel.tsx",
+          "path": "packages/web/src/features/settings/account/AccountSection.tsx",
           "fixture": "fixtures/components.settings.account.error-state.json"
         },
         {
@@ -6613,7 +8119,7 @@
           "components": [
             "ProfileSection"
           ],
-          "path": "packages/web/src/components/settings/SettingsPanel.tsx",
+          "path": "packages/web/src/features/settings/server/ProfileSection.tsx",
           "fixture": "fixtures/components.settings.server.profile.json"
         },
         {
@@ -6655,7 +8161,7 @@
           "components": [
             "AdminsSection"
           ],
-          "path": "packages/web/src/components/settings/SettingsPanel.tsx",
+          "path": "packages/web/src/features/settings/administration/AdminsSection.tsx",
           "fixture": "fixtures/components.settings.administration.admins.json"
         },
         {
@@ -6697,7 +8203,7 @@
           "components": [
             "InvitesSection"
           ],
-          "path": "packages/web/src/components/settings/SettingsPanel.tsx",
+          "path": "packages/web/src/features/settings/administration/InvitesSection.tsx",
           "fixture": "fixtures/components.settings.administration.invites.json"
         },
         {
@@ -6739,7 +8245,7 @@
           "components": [
             "JoinLinksSection"
           ],
-          "path": "packages/web/src/components/settings/SettingsPanel.tsx",
+          "path": "packages/web/src/features/settings/administration/JoinLinksSection.tsx",
           "fixture": "fixtures/components.settings.administration.join-links.json"
         },
         {
@@ -6781,7 +8287,7 @@
           "components": [
             "PreJoinAgreementSection"
           ],
-          "path": "packages/web/src/components/settings/SettingsPanel.tsx",
+          "path": "packages/web/src/features/settings/administration/PreJoinAgreementSection.tsx",
           "fixture": "fixtures/components.settings.administration.pre-join-agreement.json"
         },
         {
@@ -6823,7 +8329,7 @@
           "components": [
             "OnboardingAgentSection"
           ],
-          "path": "packages/web/src/components/settings/SettingsPanel.tsx",
+          "path": "packages/web/src/features/settings/administration/OnboardingAgentSection.tsx",
           "fixture": "fixtures/components.settings.administration.onboarding.json"
         },
         {
@@ -6865,7 +8371,7 @@
           "components": [
             "MemberPermissionsSection"
           ],
-          "path": "packages/web/src/components/settings/SettingsPanel.tsx",
+          "path": "packages/web/src/features/settings/administration/MemberPermissionsSection.tsx",
           "fixture": "fixtures/components.settings.administration.member-permissions.json"
         },
         {
@@ -6907,7 +8413,7 @@
           "components": [
             "ServerTranslationSection"
           ],
-          "path": "packages/web/src/components/settings/SettingsPanel.tsx",
+          "path": "packages/web/src/features/settings/administration/ServerTranslationSection.tsx",
           "fixture": "fixtures/components.settings.administration.translation.json"
         },
         {
@@ -6950,7 +8456,7 @@
             "SettingsPanel",
             "AppearanceSection"
           ],
-          "path": "packages/web/src/components/settings/SettingsPanel.tsx#AppearanceSection",
+          "path": "packages/web/src/features/settings/appearance/AppearanceSection.tsx#AppearanceSection",
           "fixture": "fixtures/components.settings.appearance.page.json"
         },
         {
@@ -6992,7 +8498,7 @@
           "components": [
             "NotificationsTabContent"
           ],
-          "path": "packages/web/src/components/settings/SettingsPanel.tsx",
+          "path": "packages/web/src/features/settings/notifications/NotificationsTabContent.tsx",
           "fixture": "fixtures/components.settings.notifications.page.json"
         },
         {
@@ -7076,44 +8582,6 @@
           "source": "android-real-screen",
           "path": "compose/shared/src/commonMain/kotlin/ai/slock/compose/AuthPages.kt",
           "reason": "Needs real Android page/route launch capture, not a visual fixture page."
-        },
-        {
-          "id": "harmony",
-          "status": "pending",
-          "source": "ohos-real-screen",
-          "path": "compose/shared/src/commonMain/kotlin/ai/slock/compose/AuthPages.kt",
-          "reason": "Needs Harmony provider capture after React and Android contracts are defined."
-        }
-      ]
-    },
-    {
-      "id": "screens.auth.login.signing",
-      "title": "Auth Login Signing Screen",
-      "captureType": "real-screen",
-      "surface": "auth",
-      "category": "auth",
-      "group": "screens-auth",
-      "status": "baseline",
-      "notes": "In-flight sign-in state: email + password filled and Sign In clicked, auth request still pending, so the button reads 'Signing in…' at disabled:opacity-50 while the inputs stay enabled with normal white styling. Paired with screens.home.loading as the Android parity target for the sign-in transition (task #372).",
-      "providers": [
-        {
-          "id": "react",
-          "status": "ready",
-          "path": "packages/web/src/components/auth/LoginPage.tsx",
-          "fixture": "fixtures/screens.auth.login.signing.json",
-          "components": [
-            "LoginPage",
-            "AuthBrandShell",
-            "FormField"
-          ]
-        },
-        {
-          "id": "android",
-          "status": "pending",
-          "source": "android-real-screen",
-          "path": "compose/shared/src/commonMain/kotlin/ai/slock/compose/AuthPages.kt",
-          "route": "compose_auth_login_signing",
-          "reason": "Android sign-in loading state redesign (task #372) will capture compose_auth_login_signing against this React baseline."
         },
         {
           "id": "harmony",
@@ -7512,7 +8980,7 @@
       "category": "members",
       "group": "screens-members",
       "status": "baseline",
-      "notes": "Real Members route capture for human member detail profile. React uses MainLayout at /s/visual/human/visual-human-1; Android uses compose_member_detail pageData with memberId=visual-human-1 and memberKind=human. Harmony remains pending real-device/provider capture.",
+      "notes": "Real Members route capture for human member detail profile. React uses MainLayout at /s/visual/human/visual-user; Android uses compose_member_detail pageData with memberId=visual-user and memberKind=human. Harmony remains pending real-device/provider capture.",
       "providers": [
         {
           "id": "react",
@@ -7531,7 +8999,7 @@
           "source": "android-real-screen",
           "path": "compose/shared/src/commonMain/kotlin/ai/slock/compose/MembersPage.kt",
           "fixture": "KmpVisualScreenshotCaptureTest.captureMembersHumanDetailProfileScreen",
-          "route": "compose_member_detail:memberId=visual-human-1,memberKind=human",
+          "route": "compose_member_detail:memberId=visual-user,memberKind=human",
           "components": [
             "MemberDetailPageContent",
             "MembersDetailContent",
@@ -7560,7 +9028,7 @@
         {
           "id": "react",
           "status": "ready",
-          "path": "packages/web/src/components/agent/AgentDetailPanel.tsx",
+          "path": "packages/web/src/features/agent/AgentDetailPanel.tsx",
           "fixture": "fixtures/components.members.agent-lifecycle-actions.json",
           "components": [
             "AgentDetailPanel",
@@ -7602,7 +9070,7 @@
         {
           "id": "react",
           "status": "ready",
-          "path": "packages/web/src/components/agent/AgentDetailPanel.tsx",
+          "path": "packages/web/src/features/agent/AgentDetailPanel.tsx",
           "fixture": "fixtures/components.members.avatar-management.json",
           "components": [
             "AgentDetailPanel",
@@ -7677,7 +9145,7 @@
         {
           "id": "react",
           "status": "pending",
-          "path": "packages/web/src/components/settings/SettingsPanel.tsx#AppearanceSection",
+          "path": "packages/web/src/features/settings/appearance/AppearanceSection.tsx#AppearanceSection",
           "fixture": "fixtures/screens.settings.appearance.json",
           "reason": "Needs a real React Settings route capture for the Appearance screen; component-only SettingsPanel capture is tracked separately."
         },
@@ -7715,7 +9183,7 @@
             "DangerZoneSection",
             "Modal"
           ],
-          "path": "packages/web/src/components/settings/SettingsPanel.tsx#DangerZoneSection",
+          "path": "packages/web/src/features/settings/server/DangerZoneSection.tsx#DangerZoneSection",
           "fixture": "fixtures/screens.settings.server-danger-modal.json"
         },
         {
@@ -7754,7 +9222,7 @@
         {
           "id": "react",
           "status": "external",
-          "path": "packages/web/src/components/settings/SettingsPanel.tsx#BillingTabContent",
+          "path": "packages/web/src/features/settings/billing/BillingTabContent.tsx#BillingTabContent",
           "fixture": "fixtures/screens.settings.billing-portal.json",
           "reason": "Billing portal opens an external website; validate Billing tab action availability instead of a portal screen."
         },
@@ -7787,7 +9255,7 @@
         {
           "id": "react",
           "status": "pending",
-          "path": "packages/web/src/components/layout/Sidebar.tsx",
+          "path": "packages/web/src/features/sidebar/Sidebar.tsx",
           "fixture": "fixtures/screens.home.index.json",
           "reason": "Needs React visual case/fixture under the new capture taxonomy."
         },
@@ -7886,7 +9354,7 @@
         {
           "id": "react",
           "status": "ready",
-          "path": "packages/web/src/components/layout/Sidebar.tsx#SidebarRowsSkeleton",
+          "path": "packages/web/src/features/sidebar/rows/SidebarRowsSkeleton.tsx",
           "fixture": "fixtures/screens.home.loading.json",
           "components": [
             "MainLayout",
@@ -7908,6 +9376,92 @@
           "status": "pending",
           "source": "ohos-real-screen",
           "path": "compose/shared/src/commonMain/kotlin/ai/slock/compose/HomePage.kt",
+          "reason": "Needs Harmony provider capture after React and Android contracts are defined."
+        }
+      ]
+    },
+    {
+      "id": "screens.home.channel-list",
+      "title": "Home Channel List Screen",
+      "captureType": "real-screen",
+      "surface": "home",
+      "category": "app/home",
+      "group": "screens-home",
+      "status": "baseline",
+      "notes": "Whole phone Home root (top bar, Saved, Pinned / Joint Channels / Channels / Direct Messages, tab bar) from shared/fixtureData.json homeChannelList, light mode.",
+      "providers": [
+        {
+          "id": "react",
+          "status": "ready",
+          "path": "packages/web/src/features/sidebar/Sidebar.tsx",
+          "fixture": "fixtureData.json#homeChannelList",
+          "components": [
+            "Sidebar",
+            "TabRootBar",
+            "NotificationTrigger",
+            "MobileTabBar"
+          ]
+        },
+        {
+          "id": "android",
+          "status": "ready",
+          "source": "kmp-shared",
+          "path": "compose/shared/src/commonMain/kotlin/build/raft/app/RaftHomeComponents.kt",
+          "route": "compose_home_channel_list_visual",
+          "fixture": "KmpVisualScreenshotCaptureTest.captureHomeChannelList",
+          "components": [
+            "RaftStructuralHomeShell",
+            "HomeTitlebar",
+            "RaftSidebarItem"
+          ]
+        },
+        {
+          "id": "harmony",
+          "status": "pending",
+          "source": "kmp-shared",
+          "reason": "Needs Harmony provider capture after React and Android contracts are defined."
+        }
+      ]
+    },
+    {
+      "id": "screens.home.channel-list.dark",
+      "title": "Home Channel List Screen (Dark)",
+      "captureType": "real-screen",
+      "surface": "home",
+      "category": "app/home",
+      "group": "screens-home",
+      "status": "baseline",
+      "notes": "Whole phone Home root (top bar, Saved, Pinned / Joint Channels / Channels / Direct Messages, tab bar) from shared/fixtureData.json homeChannelList, dark mode.",
+      "providers": [
+        {
+          "id": "react",
+          "status": "ready",
+          "path": "packages/web/src/features/sidebar/Sidebar.tsx",
+          "fixture": "fixtureData.json#homeChannelList",
+          "components": [
+            "Sidebar",
+            "TabRootBar",
+            "NotificationTrigger",
+            "MobileTabBar"
+          ]
+        },
+        {
+          "id": "android",
+          "status": "ready",
+          "source": "kmp-shared",
+          "path": "compose/shared/src/commonMain/kotlin/build/raft/app/RaftHomeComponents.kt",
+          "route": "compose_home_channel_list_visual",
+          "fixture": "KmpVisualScreenshotCaptureTest.captureHomeChannelListDark",
+          "components": [
+            "RaftStructuralHomeShell",
+            "HomeTitlebar",
+            "RaftSidebarItem"
+          ]
+        },
+        {
+          "id": "harmony",
+          "status": "pending",
+          "source": "kmp-shared",
           "reason": "Needs Harmony provider capture after React and Android contracts are defined."
         }
       ]
@@ -8297,7 +9851,7 @@
           "components": [
             "ADMINISTRATION_VISUAL_SECTIONS"
           ],
-          "path": "packages/web/src/components/settings/SettingsPanel.tsx",
+          "path": "packages/web/src/features/settings/administration/administrationVisualSections.ts",
           "fixture": "fixtures/screens.settings.administration.full-height.json"
         },
         {

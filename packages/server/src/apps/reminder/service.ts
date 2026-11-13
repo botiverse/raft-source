@@ -8,8 +8,9 @@ import type {
   ReminderStatus,
   RaftTargetString,
 } from "@botiverse/raft-shared";
+import { formatRaftChannelTaskRef, isSubConversationType } from "@botiverse/raft-shared";
 import { getDb, type DatabaseExecutor } from "../../db/index";
-import { agents, machines, reminders, reminderEvents, servers, messages, channels } from "../../db/schema";
+import { agents, machines, reminders, reminderEvents, servers, messages, channels, tasks } from "../../db/schema";
 import { reminderSourceAcknowledgements } from "./sourceAckSchema";
 import * as channelService from "../../services/channelService";
 import * as messageService from "../../services/messageService";
@@ -395,6 +396,89 @@ export async function cancelReminder(
     canceledAt: now.toISOString(),
   }, opts);
   return canceled;
+}
+
+export interface MarkReminderMigratedInput {
+  /** The reminder's id in the Reminder App, from the import response. */
+  appReminderId: string;
+  /** Logged on the event only. */
+  batchId?: string | null;
+}
+
+/**
+ * The legacy import moved this reminder to the Reminder App: it never fires
+ * here again. Compare-and-swap on a still-scheduled row at `expectedVersion`;
+ * the version bump makes any copy already armed on a Computer stale (the
+ * server refuses its fire), and `arm_state = 'pending'` queues the explicit
+ * `reminder.cancel` that the arm watchdog sends (`listMigratedRemindersToDisarm`).
+ * Nothing is deleted, so a mistaken migration can be restored.
+ */
+export async function markReminderMigrated(
+  reminderId: string,
+  input: MarkReminderMigratedInput,
+  opts: ReminderMutationOptions,
+): Promise<ReminderRow | null> {
+  const db = getExecutor(opts);
+  const now = getClock(opts).now();
+  const [row] = await db
+    .update(reminders)
+    .set({
+      status: "migrated",
+      updatedAt: now,
+      version: sql`${reminders.version} + 1`,
+      armState: "pending",
+      armedVersion: null,
+      armUpdatedAt: now,
+    })
+    .where(and(
+      eq(reminders.id, reminderId),
+      eq(reminders.status, "scheduled"),
+      eq(reminders.version, opts.expectedVersion),
+    ))
+    .returning();
+  const migrated = row as ReminderRow | undefined;
+  if (!migrated) return null;
+  await recordReminderEvent(migrated, "migrated", opts.actor ?? { type: "system", id: null }, {
+    appReminderId: input.appReminderId,
+    batchId: input.batchId ?? null,
+  }, opts);
+  return migrated;
+}
+
+/** Migrated rows whose Computer copy has not been told to drop yet (oldest first). */
+export async function listMigratedRemindersToDisarm(
+  opts: ReminderServiceOptions & { limit: number },
+): Promise<ReminderRow[]> {
+  const db = getExecutor(opts);
+  const rows = await db.select().from(reminders)
+    .where(and(eq(reminders.status, "migrated"), eq(reminders.armState, "pending")))
+    .orderBy(asc(reminders.armUpdatedAt))
+    .limit(opts.limit);
+  return rows as ReminderRow[];
+}
+
+/**
+ * Record that `reminder.cancel` for this migrated revision was sent (or that
+ * the owner's Computer is offline, whose reconnect snapshot lists scheduled
+ * rows only). CAS on the version, so a later change is never masked.
+ */
+export async function markMigratedReminderDisarmed(
+  reminderId: string,
+  version: number,
+  opts: ReminderServiceOptions = {},
+): Promise<boolean> {
+  const db = getExecutor(opts);
+  const now = getClock(opts).now();
+  const updated = await db.update(reminders)
+    .set({ armState: "not_armed", armUpdatedAt: now })
+    .where(and(
+      eq(reminders.id, reminderId),
+      eq(reminders.status, "migrated"),
+      eq(reminders.version, version),
+      eq(reminders.armState, "pending"),
+    ))
+    .returning({ id: reminders.id });
+  return updated.length > 0;
 }
 
 export async function snoozeReminder(
@@ -1218,7 +1302,9 @@ async function buildLegacyReminderWakeMessage(
   if (!channel) return null;
 
   const { content, additionalAgentContent } = await buildLegacyReminderWakeContent(row, opts);
-  const channelType = channel.type === "thread"
+  // A task v2 conversation reaches agents as a sub-conversation ("thread");
+  // the notice delivery adds its task ref (resolveThreadParentFields).
+  const channelType = isSubConversationType(channel.type)
     ? "thread"
     : channel.type === "dm"
       ? "dm"
@@ -1365,6 +1451,7 @@ export async function resolveAnchors(
       parentChannelType: parentChannels.type,
       parentChannelName: parentChannels.name,
       parentChannelDeletedAt: parentChannels.deletedAt,
+      channelTaskId: channels.taskId,
     })
     .from(messages)
     .innerJoin(channels, eq(messages.channelId, channels.id))
@@ -1388,8 +1475,24 @@ export async function resolveAnchors(
     });
   }
 
+  const taskAnchors = await resolveTaskConversationAnchors(rows, anchors, db);
   for (const r of rows) {
     if (!r.msgId) continue;
+    const taskAnchor = taskAnchors.get(r.id);
+    if (taskAnchor) {
+      result.set(r.id, {
+        msgRef: taskAnchor.parent.type === "dm"
+          ? `task #${taskAnchor.taskNumber}`
+          : formatRaftChannelTaskRef(taskAnchor.parent.name, taskAnchor.taskNumber),
+        msgPermalink: ctx.appUrl
+          ? `${ctx.appUrl.replace(/\/$/, "")}/s/${ctx.serverSlug}/${taskAnchor.parent.type === "dm" ? "dm" : "channel"}/${taskAnchor.parent.id}?${new URLSearchParams({
+            task: `${taskAnchor.parent.id}:task:${taskAnchor.taskId}`,
+            msg: r.msgId,
+          }).toString()}`
+          : null,
+      });
+      continue;
+    }
     const anchor = byMsgId.get(r.msgId);
     if (!anchor) continue;
     result.set(r.id, {
@@ -1398,6 +1501,63 @@ export async function resolveAnchors(
     });
   }
   return result;
+}
+
+/**
+ * Task v2: reminders anchored on a message in a task conversation (a resource
+ * receipt's expiry follow-up) render as the task (`#channel:#7`, a DM task as
+ * `task #7`) and link to its dialog. The parent channel is the one the
+ * reminder's own target conversation hangs off (the owner server's face of a
+ * joint task), else the task's channel.
+ */
+async function resolveTaskConversationAnchors(
+  rows: ReminderRow[],
+  anchors: ReadonlyArray<{ messageId: string; channelType: string; channelTaskId: string | null; channelDeletedAt: Date | null }>,
+  db: DatabaseExecutor,
+): Promise<Map<string, { taskId: string; taskNumber: number; parent: { id: string; name: string; type: string } }>> {
+  const out = new Map<string, { taskId: string; taskNumber: number; parent: { id: string; name: string; type: string } }>();
+  const taskIdByMsg = new Map<string, string>();
+  for (const anchor of anchors) {
+    if (anchor.channelType === "task" && anchor.channelTaskId && !anchor.channelDeletedAt) taskIdByMsg.set(anchor.messageId, anchor.channelTaskId);
+  }
+  const taskRows = rows.filter((r) => r.msgId && taskIdByMsg.has(r.msgId));
+  if (taskRows.length === 0) return out;
+  const taskIds = [...new Set(taskRows.map((r) => taskIdByMsg.get(r.msgId!)!))];
+  const taskInfo = await db
+    .select({ id: tasks.id, taskNumber: tasks.taskNumber, channelId: tasks.channelId })
+    .from(tasks)
+    .where(inArray(tasks.id, taskIds));
+  const taskById = new Map(taskInfo.map((task) => [task.id, task]));
+  const targetIds = [...new Set(taskRows.map((r) => r.targetChannelId).filter((id): id is string => !!id))];
+  const targets = targetIds.length === 0 ? [] : await db
+    .select({ id: channels.id, type: channels.type, taskId: channels.taskId, parentChannelId: channels.parentChannelId })
+    .from(channels)
+    .where(inArray(channels.id, targetIds));
+  const targetById = new Map(targets.map((target) => [target.id, target]));
+  const parentIdByRow = new Map<string, string>();
+  for (const r of taskRows) {
+    const taskId = taskIdByMsg.get(r.msgId!)!;
+    const task = taskById.get(taskId);
+    if (!task) continue;
+    const target = r.targetChannelId ? targetById.get(r.targetChannelId) : undefined;
+    parentIdByRow.set(r.id, target?.type === "task" && target.taskId === taskId && target.parentChannelId
+      ? target.parentChannelId
+      : task.channelId);
+  }
+  const parentIds = [...new Set(parentIdByRow.values())];
+  const parents = parentIds.length === 0 ? [] : await db
+    .select({ id: channels.id, name: channels.name, type: channels.type, deletedAt: channels.deletedAt })
+    .from(channels)
+    .where(inArray(channels.id, parentIds));
+  const parentById = new Map(parents.filter((parent) => !parent.deletedAt).map((parent) => [parent.id, parent]));
+  for (const r of taskRows) {
+    const taskId = taskIdByMsg.get(r.msgId!)!;
+    const task = taskById.get(taskId);
+    const parent = parentById.get(parentIdByRow.get(r.id) ?? "");
+    if (!task || !parent) continue;
+    out.set(r.id, { taskId, taskNumber: task.taskNumber, parent: { id: parent.id, name: parent.name, type: parent.type } });
+  }
+  return out;
 }
 
 function formatMsgRef(anchor: MessageAnchor, messageId: string): RaftTargetString {

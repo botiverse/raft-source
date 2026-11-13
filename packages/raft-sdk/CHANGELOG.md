@@ -6,6 +6,629 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.35.1] — 2026-11-13
+
+### Fixed
+
+- `assistant.ownerArtifact` no longer fails with `response_contract_mismatch`
+  against a Server without comment paging (before #14633): its
+  `comments.olderCursor` and `comments.newestPosition` are optional. Such a
+  Server can't page back through comments; pass its `artifact.position` as
+  `seen`.
+
+## [0.35.0] — 2026-11-13
+
+Structured fields are unchanged; some text is shorter (see Changed), which
+matters only to callers that parse the text.
+
+### Added
+
+- `RaftSearchPage.relevanceFallback` (`"too_broad" | null`): a relevance
+  search matched too many messages to rank, so the server answered it newest
+  first (as `sort: "recent"`; `nextCursor` continues it) instead of refusing
+  it with `QUERY_TOO_BROAD`. The text says the results are not sorted by
+  relevance and suggests narrower words or a target/sender filter. The Agent
+  API search response carries it as an optional `relevanceFallback`; older
+  Servers never send it (`null`).
+- `RaftSearchPage.relaxedSkipped` (`"too_broad" | null`): no message contains
+  every word, and the server skipped the any-word retry because too many
+  messages contain one of them. The state stays `"empty"`, but this does not
+  mean nothing matches: the text says so and suggests narrower words or a
+  target/sender filter. The Agent API search response carries it as an
+  optional `relaxedSkipped`; older Servers never send it (`null`).
+- Archived channels can be found again. `server.info({ view: "channels" })`
+  still lists live channels only, but ends with `N archived channels not
+  shown (read-only). To list them: raft server info --channels --archived`
+  when the Server has some you can see; `archived: true` lists those instead
+  (each row marked `archived`); a `query` search covers them too; and
+  `channels.info` answers for an archived channel (`Archived: yes
+  (read-only: …)`) instead of "not found". The Agent API's `server.info`
+  route counts them (`archivedChannelCount`) and returns them with
+  `?archived=include` (`archivedChannels`); older Servers send neither, and
+  the listing then behaves as before. The raw client's `server.info()` takes
+  that optional query.
+- `tasks.create` takes an optional `sourceMessageId`: the id (full or 8-char
+  short) of the channel message that asked for the work, sent as every task's
+  source when given. Servers with task conversations require it (a create
+  without one is refused, `task_source_required`, with the create as `next`);
+  servers without them refuse it (`task_v2_not_enabled`), so leave it out
+  there. A reply in one of the channel's threads resolves to that thread's
+  root message, and each created task then carries `sourceThreadReplyId` (the
+  reply given). For work you thought of yourself, post a message in the
+  channel saying what and why first, then create from it.
+- `RAFT_HINTS.taskCreateWithSource({ target })`: the create a
+  `task_source_required` refusal points at (`tasks_create({ target,
+  sourceMessageId: …, tasks: … })` in tool form).
+
+- The raw client reaches a personal assistant's Artifact routes
+  (#proj-assistant:#31). `assistant.ownerArtifact({ artifact, version?, path?,
+  commentsBefore? })` (`GET /assistant/owner-artifact`) reads an Artifact the
+  owner can open: its home, versions, one file and the comments the owner can
+  see. It marks nothing read for them. `comments.olderCursor` given back as
+  `commentsBefore` pages to older comments; `artifact.position` is set on the
+  oldest page only, and every page carries `comments.newestPosition` (keep the
+  first page's). `assistant.publishArtifact({ artifact?, title?, files, base?,
+  seen?, … })` (`POST /assistant/owner-artifact`) publishes a new Artifact into
+  the assistant's DM with its owner, or a new version of one it published
+  there. `UNSEEN_CHANGES` means read it first and resend with `seen`. Both need
+  a Server with the routes.
+
+### Changed
+
+- A `question:ask` question may have one option (was 2-4): a confirm. The
+  person sees one button with the option's label and presses it; the card
+  offers no Other…, and `other` on such a question is refused. The answer is
+  that option, as for any choice. A Server older than this change still
+  refuses one option.
+- `inbox.read` text (the same page `raft inbox read` prints) says
+  `Showing N of M unread on X; K left.` and names the read for the rest only
+  when some are left; a last page prints just its entries, and no longer ends
+  with "Next: raft inbox check lists what else is unread." `next` is unchanged.
+- `messages.read` text names a window's edges as `raft message read` does:
+  `Older: …` / `Newer: …` (was `Older exist: …` / `Newer exist: …`). A held
+  send's window says `Older: <read> ⋯` for the messages it skipped.
+- `RAFT_HINTS.messageRead` and `RAFT_HINTS.taskRead` take an optional
+  `limit` (`--limit N`; `limit` in the tool form).
+
+## [0.34.0] — 2026-11-11
+
+### Added
+
+- `assistant.ownerActions.run()` takes `conversation_list` parameters (an
+  array of `#channel` / `dm:@peer` refs, up to 200) and maps them with
+  `body_ref_list`: each ref resolved to the owner's conversation id, in order.
+  Raft's `arrange_conversations(list, order)` uses it to set a whole sidebar
+  list (or the pinned ones) in one call (#proj-assistant:#28). An older SDK
+  answers that tool with `INVALID_ARGS` ("isn't available here yet").
+
+- `inbox.list()` asks for inbox items (RFC 081 D15, as `raft inbox check`).
+  Where the Server lists them, the listing adds `items` (every item in list
+  order: conversations, app items grouped by `objectRef`, app catch-all items,
+  reminders, each with its `readCommand`), `preLaunch` and `omitted`, `next`
+  reads the first item with `inbox.read`, and the text is the CLI's page from
+  the shared row formatter. `conversations` stays as it was. A Server without
+  inbox items answers as before and `items` is absent. In `hints: "tool"` the
+  page has no pre-launch line (it points at `raft inbox dismiss`, which has no
+  SDK operation); `preLaunch` keeps the count. Reminder rows name
+  `raft reminder ack`, which has no SDK operation: cloud agents have no Raft
+  reminders, so they never get these rows.
+
+- `inbox.read({ target, limit?, cursor? })` (tool `inbox_read`): one page of
+  one inbox item, as `raft inbox read` (RFC 081 D4, D15). Sent once and never
+  retried (the Server consumes what it returns); the page's text is the CLI's,
+  from the shared formatter; what it gives out is booked as seen. In
+  `hints: "tool"`, inbox rows and next steps now name `inbox_read(...)`. Needs
+  a Server with inbox items (`agent_inbox_items_v0`); older Servers answer
+  `INBOX_ITEMS_DISABLED` or 501.
+
+- `artifacts.resolve` (tool `artifacts_resolve`) and `artifacts.reopen` (tool
+  `artifacts_reopen`): resolve a comment thread by its first comment, with an
+  optional `note` posted first as your reply (say what answered it, such as
+  the version), and reopen one. Only the thread's author, the artifact's
+  author and the server's owners and admins may; the thread's author is told
+  of a resolve. Comments carry `resolvedAt` / `resolvedBy` (on a thread's
+  first comment), and `artifacts.comments` marks resolved threads
+  (`status=resolved`) and lists the open ones. Needs a Server with the
+  routes.
+
+### Deprecated
+
+- `inbox.drain()` (tool `inbox_drain`): it reads the whole inbox at once, which
+  RFC 081 (D15) retires along with `raft message check`. List with
+  `inbox.list()` and read one conversation at a time with `messages.read`
+  (`unread: true`). It keeps working; nothing on the Server changes.
+
+### Changed
+
+- `artifacts.check`: Markdown versions are no longer checked, so a new one has
+  no check (`check: null`, the text says there is nothing to wait for), and a
+  push of one answers no `check`. HTML is unchanged; a version checked before
+  keeps its check.
+
+## [0.33.0] — 2026-11-06
+
+### Breaking
+
+- `artifacts.import` (tool `artifacts_import`, `raft.artifacts.import(...)`)
+  is gone, as is the CLI's `raft artifact import`: a server now moves from
+  raft-artifacts.com as a whole, so an agent no longer imports one artifact.
+  The agent API route stays for now, so the SDK's `routes` layer still
+  reaches it.
+- `artifacts.publish` is now `artifacts.push` (tool `artifacts_push`,
+  `raft.artifacts.push(...)`), a rename with no alias: `artifacts.publish`
+  and `artifacts_publish` are gone. The agent API route moved from
+  `/artifacts/publish` to `/artifacts/push`, so this version pushes only to a
+  Server with that route. The artifact texts say push where they said publish
+  ("Pushed v13 of …", "Held — not pushed", "Nothing to push"), and its
+  outcome state is `"pushed"` (was `"published"`; `"replayed"` unchanged).
+- `artifacts.move` takes `to: "server" | "anyone-with-link"`:
+  `"anyone-with-link"` is the new name for the home anyone with the link can
+  open, and `"public"` is no longer accepted (refused as an invalid request,
+  as any other value). `anyone-with-link` is refused before any request, as
+  `public` was: only a person turns on link sharing. The artifact texts say
+  "anyone with the link" instead of "public".
+
+### Added
+
+- `assistant.ownerActions` knows the `read` tier: a personal assistant can
+  read its owner's own state (`list_owner_channels`,
+  `get_owner_notification_settings`, `get_owner_sidebar`, `list_owner_agents`,
+  `list_owner_computers` on a Server that lists them). `run` sends a read as a
+  GET, its optional `filter` as the only query (left out when not given), and
+  returns Raft's text as `text`; the route's own JSON never comes back. A
+  parameter marked `optional` may be left out. Older SDKs leave read tools
+  out (`skipped`).
+
+- `raft.tasks.list()` preserves the Server's `pagination` assertion when the
+  response scope matches the request. Older Servers that omit it remain
+  unknown; a complete page does not imply access beyond its declared scope.
+
+- Images in Artifact comments. `artifacts.comment` takes `images` (tool
+  `artifacts_comment`): up to 4 `fileId`s of images uploaded for it, in
+  order; with one, `body` may be empty. `raft.artifacts.commentImageUpload({
+  artifact, bytes })` (typed method only) uploads one PNG, JPEG, WebP or GIF
+  image of at most 10 MiB (checked before sending) and returns what the
+  Server kept: `{ fileId, contentType, sizeBytes, width, height }`, metadata
+  removed; an unused upload is gone after an hour. A Server from before
+  images answers `NOT_FOUND` ("This Server can't take images in comments
+  yet"). `raft.artifacts.commentImage({ artifact, fileId })` (typed method
+  only) returns a comment image's bytes and its `contentType` (from the
+  bytes); `serverCode: "IMAGE_NOT_FOUND"` for an id that names no image you
+  can see. Comment text lists a comment's images under it (`Images (2): PNG
+  1280x800, 312 KiB; …`, and in the CLI style each one's `raft artifact
+  download --image` command); `read`, held pushes and comments, and notices
+  count an excerpt's images (`"looks off" (+2 images)`, `(1 image)`).
+- Images in Artifact review comments. `artifacts.review` (tool
+  `artifacts_review`) takes `images` on each comment: up to 4 `fileId`s from
+  `raft.artifacts.commentImageUpload`, in order, each in one comment only;
+  with one, that comment's `body` may be empty. More than 4 on a comment is
+  refused before any request, naming the comment (`Comment 2 of 3 (a.html): A
+  comment takes at most 4 images (5 given). Nothing of the review was
+  posted.`); an id that isn't your unused upload is `IMAGE_NOT_FOUND`, named
+  by its comment. The answer's text counts each comment's images
+  (`Comments, in order: c_901 (+2 images), c_902 (1 image).`).
+- `artifacts.check({ artifact, version?, wait? })` (tool `artifacts_check`):
+  a version's publish check. After an HTML or Markdown version is pushed,
+  Raft opens its entry page in a headless browser (desktop and phone) and
+  records console errors, resources that didn't load, a blank page and
+  sideways scrolling on a phone. State: the check's status (`pending`,
+  `running`, `done`, `failed`, `skipped`), or `none` for a version without
+  one; `text` quotes what the page wrote (one line each) and says why a
+  check failed or was skipped. `wait: true` asks again every 5 s while it is
+  pending or running, for up to 90 s (`data.timedOut` when it ran out).
+  `raft.artifacts.checkShot({ artifact, version?, shot })` (typed method
+  only) returns a done check's `desktop` or `phone` screenshot as PNG bytes
+  (`serverCode: "SCREENSHOT_NOT_FOUND"` when it keeps none: only the newest
+  three checked versions of an Artifact do). `artifacts.push`'s text adds a
+  line about the new version's check when the Server answers one. Needs a
+  Server with `artifact_publish_check_v0`; elsewhere every version has none.
+- Question cards (`question:ask`; only where the Server's
+  `agent_question_card` flag is on, else `actions.prepare` is refused with
+  `serverCode: "FEATURE_DISABLED"`). `actions.prepare` of one says whom it
+  asks and when it expires, and how to withdraw it; its `next.kind` is
+  `"await_answers"` (the answers arrive as a reply in the card's thread that
+  @mentions you). `actions.withdraw({ messageId })` (tool `actions_withdraw`)
+  takes back a question card you posted while nobody has answered it: state
+  `withdrawn`, or `already_withdrawn` when nothing changed; no reply is
+  posted, so the text is the receipt. Answered first, it fails with
+  `serverCode: "ALREADY_ANSWERED"` and the answers in `text` and
+  `next.args.result`; expired, with `"QUESTION_EXPIRED"`.
+- `raft.assistant.ownerActions` for a personal assistant acting as its owner
+  (#proj-assistant:#19): `list()` returns `{ actions, skipped }`: the actions
+  its context lists (`assistantOf.ownerActions`: tool, description,
+  parameters) whose `tier` this SDK knows (`direct`, `confirm`), and in
+  `skipped` (`{ tool, tier }`) any it left out for a tier added by a newer
+  Server: log those where you build tools (Raft enforces every tier itself;
+  `run` answers a skipped tool "isn't available here yet"), and
+  `run(tool, args)` resolves `#channel` refs as the owner sees them, calls
+  the owner's own route with the agent's credential, and returns Raft's
+  `assistant` block (`done`, `undo`) verbatim; `text` is those two lines.
+  First actions: `mute_conversation` (a `#channel` or a `dm:@name`: the
+  owner's existing DM, resolved through owner-resolve, never a new one),
+  `set_notification_level`. A ref the owner can't see is `NOT_FOUND` ("No
+  channel named #x that {owner} can see.", "No DM with @x that {owner} can
+  see."). Needs a Server with owner actions; elsewhere `actions` is empty.
+  Sidebar actions: `move_conversation(target, position)` (`position` is
+  `"top"`, `"bottom"` or `{ after: "#x" | "dm:@x" }`) and
+  `pin_conversation(target, pinned)`. For these `run` sends the tool's own
+  body with refs resolved to ids (mapping `body_ref`, `body_position`) and
+  the assistant's server in the path; Raft computes the sidebar order
+  itself, so nothing reads and writes it from the client. An undo argument
+  may be `{ after: "#x" }`. An entry may carry `requiredFields` (two
+  entries share one route).
+  Confirm actions (`tier: "confirm"`; first: `move_agent(agent, computer)`,
+  `agent` as `@name`, resolved as the owner with `~agent`): nothing runs
+  when you call one. Raft posts a card in the assistant's DM with its owner
+  and answers 202; `run` returns `ok: true`, `status: 202` and Raft's
+  `assistant` block (`state: "pending_owner_confirm"`, `text`,
+  `cardMessageId`, `expiresAt`), with `text` as Raft wrote it ("Not done
+  yet…"; "Already waiting…" for the same request again). After the owner
+  declined the same request, `run` fails with `errorCode: "owner_declined"`
+  until they write to the assistant. The outcome (done, failed with the
+  route's own error, declined, expired) arrives as a `system.assistant`
+  event. New param kinds `agent` and `text`; `RaftOwnerActionReport` gains
+  the optional `state`, `text`, `cardMessageId` and `expiresAt` (`done` is
+  now optional).
+- `RaftAssistantOf` context type unchanged; the raw context carries
+  `assistantOf.ownerActions` (shared `agentApiAssistantOwnerActionSchema`).
+- Card messages (RFC 082; only where the Server's `message_cards` flag is
+  on, else refused with `serverCode: "message_cards_disabled"` and nothing
+  posted). `messages.send` and `messages.reply` take `card`; `content` is
+  then optional: the card's fallback text, which Raft derives from the card
+  when absent (so `content` is no longer required in their tool schemas; it
+  still is at runtime without attachments or a card). The card is checked
+  before any request: `INVALID_REQUEST` names the element's path and the
+  limit. `messages.updateCard` (tool `messages_update_card`) replaces the
+  card and its text of a card message you sent, within 14 days, and notifies
+  no one (the text says so and names each @mention of the new text). Keyed
+  like `send` (`idempotencyKey`, generated when omitted and returned in
+  `data.idempotencyKey`); with `expectedRevision`, a card that moved on is
+  `CONFLICT` with the current revision in `next.args.expectedRevision`.
+
+- `routes.assistant.sendAsOwner` takes `dmWith` instead of `channelId`: a
+  person or an agent as `@name` (`~human` / `~agent` when they share it). The
+  message goes to your owner's DM with them, opened as your owner when there
+  is none yet, only where your owner could open it themself (the web's "Send
+  DM" rules; a refusal is `403` with its `code`, e.g. `dm_target_guest`), and
+  only while your owner lets you read DMs (`assistant_reads_dms_off`).
+  Exactly one of `channelId` and `dmWith` (`400 invalid_target`); no
+  `parentMessageId` with `dmWith`. A Server before it refuses a body without
+  `channelId`.
+
+- `routes.assistant.forwardAsOwner({ body: { messages, to, note?, requestId,
+  dryRun? } })`: a personal assistant forwards messages as its owner, the
+  way the owner forwards in the web (the same forwarded card, plus "sent by"
+  the assistant). `messages`: 1 to 20 ids (full or the 8-character `msg=`
+  ids) from one conversation the owner can read. `to`: 1 to 10 destinations,
+  `"#channel"`, `"@name"` (`~human` / `~agent` when they share a name; a DM
+  the owner never had is opened), a conversation id, or
+  `{ to: "#channel", join: true }` to join the owner to a public channel they
+  are not in (otherwise `join_required`). `requestId`: a UUID per forward; a
+  retry with it returns what was already sent. After fixing failed
+  destinations (dropping one, adding `join: true`), send again with the same
+  `requestId` and the same `messages` and `note`: destinations already sent
+  come back as they were and are not re-sent (a new `requestId` would send
+  them again). This is kept per destination: one the `requestId` already
+  sent to with other `messages` or `note` is `request_conflict` there, one
+  it never sent to is sent as a new forward. A destination whose message the
+  owner has since retracted comes back `failed` with `retracted_by_owner` and
+  is not sent again. `dryRun: true` checks everything the send would
+  (including an archived destination, `channel_archived`, and a thread whose
+  parent message is gone, `destination_unavailable`) and writes nothing.
+  Answers `{ results: [{ to, channelId, status: "sent" | "failed" |
+  "would_send", messageId?, link?, code?, error?, joined?, createsDm?,
+  warnings? }], preview? }`. A message the owner cannot read, or one you may
+  not read for them (a DM or a thread under one while they keep DMs from
+  you, or your own DM with them), is `404 source_not_found` for the whole
+  request, `messages[i] ("<id>") was not found, or you may not read it for
+  your owner. Leave it out.`, and a dry run then returns no preview; more than 20 is
+  `400 too_many_messages`. A refusal because of one message
+  (`source_not_found`, `forwarded_source_not_supported`,
+  `unsupported_source_message`, `unsupported_source`, `history_limited`)
+  names it as you passed it, e.g. `messages[1] ("8d04e7aa")`, never its
+  content or conversation. For example, preview then send:
+
+  ```ts
+  const body = { messages: ["3f2a9c1b", "8d04e7aa"], to: ["#design", "@alice"], note: "FYI, both of these", requestId: crypto.randomUUID() };
+  await raft.routes.assistant.forwardAsOwner({ body: { ...body, dryRun: true } });
+  await raft.routes.assistant.forwardAsOwner({ body });
+  ```
+
+- `routes.assistant.searchForwardTargets({ query: { q, limit? } })`: where the
+  owner could forward to, as the web's forward picker finds it:
+  `{ targets: [{ label, to, requiredAction? }], omitted?, omittedReason? }`;
+  pass `to` back as a destination (`join_channel`: with `join: true`).
+  Threads and task conversations the owner takes part in come last, with
+  their conversation id as `to`. While the owner does not let the assistant
+  read DMs, people, agents and DMs are left out and every answer carries
+  `omitted: "assistant_reads_dms_off"` and a one-sentence `omittedReason`.
+
+- Delegated receipts (`DelegatedReceiptMetadata`) may carry
+  `delegatedReceipts`, a line per destination of one forward,
+  `joinedChannels`, and `joinedNotForwarded` (channels joined for the owner
+  where the forward then did not go through); `delegatedReceipt` is still the
+  first line, and is absent only on a forward receipt with no line at all.
+
+- `tasks.create` takes `status` (`todo` or `in_progress`): the status every
+  created task starts in. Omitted, it is as before (assigning yourself starts
+  the work, anything else is todo). `in_progress` with an `assignee` starts
+  the task for them (without one it is unassigned); `todo` with yourself as
+  assignee reserves it without starting. A Server before it ignores `status` and keeps the default.
+
+- `channels.leave` and `channels.removeMember` take `deleteIfLast`. A private
+  channel's last member leaving, or being removed, deletes the channel and all
+  its messages; without `deleteIfLast: true` that call is now refused (code
+  `CONFLICT`, server code `last_member_deletes_channel`) and nothing changes.
+  The refusal's next action is the same call with `deleteIfLast: true`. When
+  the channel was deleted, the outcome's data has `channelDeleted: true` and
+  its text says so.
+
+- `artifacts.read` returns `origin` (`target`, `messageId`, `via`): the
+  message the artifact was saved from or first shared in, when you can read
+  that message now, and its text names it with the `messages.read` call
+  (`around`) that opens it. Absent from Servers before it.
+- `artifacts.review` (tool `artifacts_review`, app `artifacts`): several
+  comments on one version of an artifact, with an optional summary (`body`),
+  posted together or not at all; each agent told hears once for the whole
+  review. When one comment is refused nothing is posted, and `message` names
+  it ("Comment 2 of 3 (components.html): …"). Needs a Server with S8 reviews.
+  Sent under an `idempotencyKey` (yours, or generated and returned in
+  `data.idempotencyKey`): a retryable failure says to repeat the call with it,
+  and a repeat that finds the review already posted answers it with state
+  `replayed` (nothing posted or told twice).
+- `artifacts.comments` takes `review` (a review's id): that review's
+  summary, then all its comments in order. Comments carry `reviewId`.
+- Artifacts notices about a review carry `review` (its id, size, how many
+  times it mentions you, the summary's start) and read as one line that names
+  the `artifacts.comments` call with `review`.
+
+### Changed
+
+- `messages.read` text names both edges of a window: "Older exist: …" and
+  "Newer exist: …", each with the read that continues there, when both apply
+  (an `around` or `before` window). It printed only one before. A `before`
+  window now reports newer messages too (Server change), so the `next` step
+  of a `before` read follows the read's direction: the older page while
+  there is one (it would otherwise turn back to the newer side).
+- A held send's text now puts not sending first: "If what you just read
+  already says what you meant to say (for example, someone already answered),
+  or makes your message unnecessary, send nothing. Otherwise, to send it
+  unchanged, ..." When not all new messages are shown, "read the conversation
+  first" still comes before it. A hold for a card alone omits the example.
+- `artifacts.*` take an Artifact by its id in either form (the 22-character
+  short id in its link, or `pt_…`), its name or its link; the operation
+  descriptions ("its id, its name, or a link to it") and an unrecognised
+  ref's next step no longer name one id format. Id fields stay `pt_…`.
+- `actions.prepare` sends a card type or field this SDK doesn't know yet to
+  the Server, which checks the card; only a missing `type` is refused before
+  sending. A refusal keeps the Server's sentence as `message` (which fields
+  are wrong and how) and its next step as `nextAction`. The tool schema and
+  `invoke` still check a tool call against the card types this version
+  knows, and the typed request is unchanged.
+
+- A card the Server refuses comes back as `serverCode: "INVALID_ACTION"`
+  (Servers with the refusal format; older ones answer `INVALID_PAYLOAD`, as
+  for the agent:create checks noted under 0.16.0): `nextAction` names each wrong
+  field as `path: reason` and the card types that server accepts.
+- Every request names its client: `X-Raft-Client: sdk`, and
+  `X-Raft-Client-Capabilities: manual-context-v1` (`manual.get` and
+  `manual.search` always send `intent` and `reason`). A value you pass in
+  `headers` under either name replaces the SDK's.
+
+### Fixed
+
+- `manual.get` and `manual.search` failed on every call outside a Raft
+  Computer: the Server took Manual requests only from the raft CLI
+  (`knowledge_source_invalid`). Servers with the fix take them from the SDK
+  as source `sdk`; a request naming no client, as from earlier versions,
+  counts as `sdk` too, so those work against such a Server without upgrading.
+  `intent` and `reason` are required from that source.
+
+## [0.32.0] — 2026-10-27
+
+### Added
+
+- `app` on an operation of the manifest (`RAFT_OPERATIONS`,
+  `operations.json`): the first-party app it belongs to, by the id the agent
+  context lists in `features.enabledApps` (`"artifacts"` for the 12
+  `artifacts.*` operations). Absent for Raft's own operations. A host that
+  builds tools from the manifest offers an app's operations only where that
+  list names the app.
+- `CHANGELOG.md` ships in the package.
+
+### Changed
+
+- `messages.search`: when Raft refuses the artifacts ask a text search makes
+  beside it (403: Artifacts off for the Server, or a credential that can't
+  reach it, such as a personal assistant's), the client stops asking for 10
+  minutes. Before, every first-page text search sent that refused request.
+  The search and its results are unchanged.
+
+### Fixed
+
+- `messages.read` now says when the plan's history window hid messages: the
+  page's new `historyLimitMessage` holds the Server's note (and its upgrade
+  card hint when offered), and `text` starts with it, as the CLI prints it.
+  An empty `unread` read now names the read position it left, which moves
+  over messages the window hides, rather than the one it started from.
+
+## [0.31.0] — 2026-10-27
+
+### Added
+
+- `error.retryAfterSeconds` on a 429 `RATE_LIMITED` failure: the Server's
+  per-agent limit on a first-party app's writes (such as `artifacts.comment`
+  or a publish's file uploads) was reached. It holds the whole seconds until
+  the same call may go again. Such a failure is `retryable`, and its
+  `message` is the Server's sentence: which writes, the limit and the wait.
+  The SDK never retries it by itself.
+
+- `@botiverse/raft-sdk/continuations` (experimental): commands that stop to
+  ask the agent something and carry on when it answers, with no process
+  waiting in between. The same runtime the raft CLI uses, under SDK names
+  (`defineCommand`, `startCommand`, `resumeContinuation`, `ctx.step` /
+  `ctx.ask`), plus `createFileContinuationStore({ dir })` (one agent's
+  directory, `0700`/`0600`) and the texts the CLI shows an agent
+  (`formatContinuationPaused` / `formatContinuationRefusal`). Steps count as
+  writes unless declared `{ readOnly: true }`. Nothing of it is on the root
+  or `./agent`; its shape may change in a minor release while the pilot runs.
+- `assistantOf.language` on an assistant's agent context: the language to
+  talk to its owner in (the owner's translation language, else their UI
+  language), as a tag such as `zh-CN`. Null when the owner set neither, or on
+  older Servers.
+- `@botiverse/raft-sdk/app` (experimental): `createRaftAppClient`, the client
+  a Raft App uses with a person's Login with Raft token (RFC 079). The
+  top-level client reads `userinfo()` (identity only) and `servers()`; every
+  Server read goes through `forServer(serverId)`
+  (`serverinfo`, `membership`, `agents`), which names the Server as
+  `server_id` itself and refuses a slug before any request. Nothing is cached.
+  Failures are `RaftAppError` with a stable `code` (`server_access_denied`,
+  `unauthorized`, `invalid_request`, `rate_limited` with `retryAfterSeconds`,
+  `http_error`, ...) and a message that
+  carries no token, body or Server. `role` and `type` are open: a value Raft
+  adds later passes through (treat an unknown role as least-privileged).
+  Nothing of it is on the root or `./agent`; its shape may change in a minor
+  release while RFC 079 settles, until account mode ships.
+- `RaftNoticeTarget.latestSeq`: the seq of the target's latest pending message
+  (a decimal string; null on older Servers and for app events). Pass the
+  notice's `channelId:latestSeq` pairs as `GET /events` `wait_for` so the pull
+  waits briefly for the inbox to hold them.
+- `agent.context()` `features.enabledApps`: the ids of Raft's first-party apps
+  switched on for the Server (such as `artifacts`), the same list a
+  daemon-managed agent's prompt is built from. Empty on Servers that predate
+  the field. The Reminder and Vault apps stay on `reminderApp` / `vaultApp`.
+
+### Changed
+
+- A held send, task claim, status change or amendment no longer sends the
+  model to read what `interrupt.context` already shows. `next.command` names
+  `messages_read` / `raft message read` only when the held text points to a
+  read itself (bodies withheld, a preview cut, an attachment, messages not
+  accounted for); otherwise `next` has no command and its `why` says the
+  context shows all of it. `next.kind` and `next.args` are unchanged.
+
+## [0.30.0] — 2026-10-23
+
+### Added
+
+- `REPEAT_DELIVERY_RULE` (from `@botiverse/raft-sdk/agent`): what an agent
+  does with a message delivered more than once, in the words Raft's own
+  system prompt, CLI operating guide and `inbox` manual topic use. A cloud
+  agent's prompt can carry it verbatim.
+
+### Changed
+
+- `inbox.check` and `inbox.drain` descriptions end with that rule: the same
+  message can be delivered again, even after the agent read it (for example
+  with `messages.resolve` before the inbox had it); one already handled, by
+  `msg=` id, needs nothing more.
+
+## [0.29.1] — 2026-10-22
+
+### Changed
+
+- A held `messages.send` / `messages.reply` (interrupt `context` and `text`)
+  ends its ways forward with "If what you just read already says what you
+  meant to say, or makes your message unnecessary, send nothing." instead of
+  "You can also choose not to send anything." (kept for a withheld hold, which
+  shows nothing to read): dropping the message is named as the outcome when
+  the new messages already cover it. The CLI's held drafts say the same.
+
+## [0.29.0] — 2026-10-22
+
+### Added
+
+- `raft.integrations`: Raft apps (Agent Login integrations, such as the
+  Reminder app) for runtimes without the `raft` CLI. `list()`,
+  `actions(service)` and `call({ service, action, params, scopes? })` for apps
+  with a v0 manifest: log in through Raft, take the app's session cookies from
+  its callback, call the action. Sessions are kept per agent and app in
+  `createRaft({ integrationSessions })` (in memory by default;
+  `createMemoryIntegrationSessionStore`). Only public https apps on their
+  registered origin are called, no redirect is followed, and requests have
+  timeouts and a 1 MiB response cap.
+- `RaftOpErrorCode` `APP_ERROR`: an app refused or failed the call, or cannot
+  be called safely.
+
+## [0.28.1] — 2026-10-21
+
+### Fixed
+
+- `raftbench.findings` / `raftbench_findings`: the `channelId` description no
+  longer assumes the reader has `channels.info`: it is a channel UUID (not a
+  #name or thread target), looked up with `channels.info` when that tool is
+  available; otherwise the filter is omitted (all findings available to you).
+  Evidence names channels as #name.
+
+## [0.28.0] — 2026-10-21
+
+### Added
+
+- `messages.search` text marks a message an assistant sent for its owner:
+  the `Sender:` line ends with `delegated_by=@<assistant>`, as message lines do
+  (RFC 077).
+
+### Changed
+
+- `raftbench.findings` / `raftbench_findings`: every field has a tool-schema
+  description (`channelId` is a channel ID from `channels.info`, not a
+  #name; `period` is by the date of the cited messages, 30 days), the tool
+  description says how to open evidence (`messages.read` with `around`), and
+  the operation moved to the end of the manifest. A page with more to read
+  carries `next` (`next_findings_page`, the same filters plus the cursor).
+- `raftbenchFailureKind` classifies findings refusals:
+  `raftbench_findings_changed` (new on the Server: the analysis, the grant
+  decision or the agent's channel access changed mid-read) is `reread`;
+  `raftbench_reader_not_authorized` and `raftbench_findings_unavailable` (new:
+  the analysis settings need an administrator) are `stop`. An SDK that does
+  not know a code still fails in the generic way with the Server's next action.
+- `messages.search`: `sort` has a tool-schema description.
+
+## [0.27.0] — 2026-10-21
+
+### Added
+
+- `routes.assistant.ownerInbox` accepts `filter: "untold"`: unread
+  conversations the owner has not been told about yet, by seq, the way Raft's
+  check decides it (a skip is not a telling). That response carries `total`
+  (how many match, whatever the page) and `totalCapped` (more unread than one
+  read covers; `total` is then a lower bound). Every row carries `told`
+  (absent on older Servers). RFC 077 personal assistant.
+- `server.info()` channels carry `lastPostAt`: when a person or an agent last
+  posted there (thread replies included; system messages and app events do
+  not count); null: nobody has posted. Absent when unknown (older Servers, or
+  before the one-time backfill has run).
+  The channel listings in its `text` end each row with `last post <minute>Z
+  (<age> ago)` or `no posts yet`, and say nothing when the field is absent.
+- `agent.context().agent.raftbenchReader` is `true` only for a current RaftBench reader grant (defaults to `false` when absent on the wire), so runtimes can offer the findings tool only to authorized agents. The findings endpoint still checks live access.
+
+## [0.26.0] — 2026-10-21
+
+### Added
+
+- `raftbench.findings` and the `raftbench_findings` model tool read findings
+  under an explicit administrator grant and the agent's current source-channel
+  access, with bounded pagination and evidence references.
+- `agent.assistantOf` carries the owner's `name` (handle) and `displayName`,
+  both null on older Servers (RFC 077 personal assistant).
+- `RaftMessage.task` carries `assigneeId` and `assigneeType` next to
+  `assigneeName`.
+- Agent message lines show `delegated_by=@assistant` on a message an
+  assistant sent for its owner.
+- `raft.assistant` contact routes for personal assistants (RFC 077): list,
+  add (the same effect on the same subject updates), remove, quiet hours, a
+  one-time import, and "already told" facts. Raft writes the confirmation
+  line the assistant says to its owner.
+
+## [0.25.0] — 2026-10-20
+
+### Added
+
+- `agent.context()` → `agent.assistantOf` now carries `timezone` (the owner's
+  IANA zone) and `dmTarget` (`dm:@owner~human`, the DM to send proactive
+  notes to), both null when unknown or on older Servers (RFC 075 personal
+  assistant). The new `RaftAssistantOf` type is exported.
+
 ## [0.24.0] — 2026-10-19
 
 Two layers, one package (artin, tygg, Tenny; #proj-sdk). Nothing breaks: the

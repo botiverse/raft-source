@@ -143,6 +143,31 @@ describe("appBotIdentityService", () => {
     );
   });
 
+  dbTest("an assistant-shaped handle is refused alike whether or not someone has that assistant", async ({ db, seed }) => {
+    const owner = await seed.human();
+    const server = await seed.server({ owner });
+    const suffix = randomUUID().slice(0, 8);
+    const taken = `taken-${suffix}-assistant`;
+    // Another member's personal assistant holds one handle; the other is unused.
+    await db.insert(agents).values({
+      serverId: server.id,
+      name: taken,
+      displayName: "Ottie",
+      status: "active",
+      creatorType: "user",
+      creatorId: owner.id,
+      assistantOwnerUserId: owner.id,
+    });
+    const refusal = async (clientId: string) => {
+      const client = await createOAuthClient({ serverId: server.id, createdByUserId: owner.id, clientId, name: "Bot App", enableBot: true });
+      const install = await installOnServer(client.client.id, server.id, owner.id);
+      const err = await db.transaction((tx) => createManagedAppBot(tx, { installId: install.id, serverId: server.id, now: NOW })).then(() => null, (e: unknown) => e);
+      assert.ok(err instanceof AppBotHandleConflictError, String(err));
+      return err.message.replace(deriveAppBotHandle(clientId), "<handle>");
+    };
+    assert.equal(await refusal(taken), await refusal(`free-${suffix}-assistant`));
+  });
+
   dbTest("disable → uninstalled lifecycle; reinstall gets new generation", async ({ db, seed }) => {
     const owner = await seed.human();
     const server = await seed.server({ owner });

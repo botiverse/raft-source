@@ -1,7 +1,7 @@
 import type { IntlShape } from "react-intl";
 
 import type { MessageId } from "../i18n/messages";
-import type { AttachmentUploadClientError } from "./directAttachmentUpload";
+import { AttachmentUploadClientError } from "./directAttachmentUpload";
 
 const UPLOAD_ERROR_MESSAGE_ID: Record<string, MessageId> = {
   UPLOAD_COMPLETE_FAILED: "message.composer.uploadError.completeFailed",
@@ -44,4 +44,15 @@ export function formatAttachmentUploadServerError(
 ): string {
   const id = SERVER_UPLOAD_ERROR_MESSAGE_ID[error];
   return id ? formatMessage({ id }) : error;
+}
+
+/** The composer's text for a failed upload; anything unrecognised (a network error) gets the generic retry hint. */
+export function formatComposerUploadError(
+  error: unknown,
+  formatMessage: IntlShape["formatMessage"],
+): string {
+  if (error instanceof AttachmentUploadClientError) return formatAttachmentUploadClientError(error, formatMessage);
+  const responseError = (error as { response?: { data?: { error?: unknown } } } | null)?.response?.data?.error;
+  if (typeof responseError === "string") return formatAttachmentUploadServerError(responseError, formatMessage);
+  return formatMessage({ id: "message.composer.uploadRetryHint" });
 }

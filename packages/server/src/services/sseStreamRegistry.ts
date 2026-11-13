@@ -13,8 +13,10 @@ import type { ServerResponse } from "node:http";
 export interface SseStreamRegistry {
   register(res: ServerResponse): void;
   unregister(res: ServerResponse): void;
-  /** End every registered stream. Returns how many were open. */
-  endAll(): number;
+  /** End one stream and drop it. Returns false if it was already ended. */
+  end(res: ServerResponse): boolean;
+  /** The streams open right now, for the paced drain going-away. */
+  snapshot(): ServerResponse[];
   readonly size: number;
 }
 
@@ -27,13 +29,14 @@ export function createSseStreamRegistry(): SseStreamRegistry {
     unregister(res) {
       streams.delete(res);
     },
-    endAll() {
-      const count = streams.size;
-      for (const res of [...streams]) {
-        streams.delete(res);
-        if (!res.writableEnded) res.end();
-      }
-      return count;
+    end(res) {
+      streams.delete(res);
+      if (res.writableEnded) return false;
+      res.end();
+      return true;
+    },
+    snapshot() {
+      return [...streams];
     },
     get size() {
       return streams.size;

@@ -14,7 +14,7 @@ import pg from "pg";
 // that attachPoolClientErrorHandler installs) must SURVIVE and log. The
 // production wiring itself (every `new pg.Pool(` paired with
 // attachPoolClientErrorHandler) is enforced statically by
-// scripts/ci/pg-pool-error-handler-ratchet.mjs.
+// scripts/ci/pg-pool-error-handler-ratchet.ts.
 
 const REAL_PG_URL_ENV = "PG_POOL_ERROR_HANDLER_REAL_PG_URL";
 const REAL_PG_URL = process.env[REAL_PG_URL_ENV];

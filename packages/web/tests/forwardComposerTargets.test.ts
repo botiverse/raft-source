@@ -102,6 +102,16 @@ test("Forward diagnostics do not change the existing user-facing failure mapping
     forwardRequestFailureMessage({ response: { data: { code: "source_not_found" } } }, formatMessage as never),
     "message.forwardComposer.sourceNotFound",
   );
+  // A source behind the Free plan's history window says so; retrying would fail the same way.
+  assert.equal(
+    forwardRequestFailureMessage({ response: { data: { code: "history_limited" } } }, formatMessage as never),
+    "message.forwardComposer.historyLimited",
+  );
+  // More than 20 messages: the Server's too_many_messages reads as the cap, not as an uncertain outcome.
+  assert.equal(
+    forwardRequestFailureMessage({ response: { status: 400, data: { code: "too_many_messages" } } }, formatMessage as never),
+    "message.forwardComposer.tooManyMessages",
+  );
   for (const error of [
     new Error("network"),
     { response: { status: 401, data: {} } },

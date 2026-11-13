@@ -1,11 +1,16 @@
 import { useMemo } from "react";
 import { useChannelStore } from "../store/channelStore";
 import { useThreadStore } from "../store/threadStore";
+import { loadThreadRefContext } from "../utils/threadRefContext";
 import { useAppNavigate } from "./useAppNavigate";
-import api from "../api/client";
 import type { RefNavContext } from "../utils/refTarget";
 import { useServerStore } from "../store/serverStore";
 import type { MessageId } from "../i18n/messages";
+import { useLegacyTaskPanelStore } from "../store/legacyTaskPanelStore";
+import { useProfileStore } from "../store/profileStore";
+import { openTaskByChannelNumber } from "../utils/openTaskRef";
+import { TASK_V2_CONVERSATIONS_FLAG_KEY, useServerFeatureFlag } from "../store/serverFeatureFlags";
+import { openTaskConversationDialog } from "../components/task/useOpenTask";
 
 /**
  * Builds the RefNavContext consumed by the shared resolve/navigate layer
@@ -24,6 +29,10 @@ export function useRefNavigation(
   const channels = useChannelStore((s) => s.channels);
   const serverSlug = useServerStore((s) => s.current?.slug ?? "");
   const openThread = useThreadStore((s) => s.openThread);
+  const closeThread = useThreadStore((s) => s.closeThread);
+  const taskV2 = useServerFeatureFlag(TASK_V2_CONVERSATIONS_FLAG_KEY).enabled;
+  const closeProfile = useProfileStore((s) => s.closeProfile);
+  const openLegacyTask = useLegacyTaskPanelStore((s) => s.openLegacyTask);
   const nav = useAppNavigate();
 
   return useMemo<RefNavContext>(() => {
@@ -43,29 +52,23 @@ export function useRefNavigation(
       get followedThreads() {
         return useThreadStore.getState().followedThreads;
       },
-      loadThreadContext: async (channelId, shortId) => {
-        const { data } = await api.get<{
-          targetMessageId?: string | null;
-          canonicalTarget?: {
-            kind?: string;
-            channelId?: string;
-            messageId?: string;
-            threadParentMessageId?: string;
-            threadChannelId?: string | null;
-          } | null;
-        }>(
-          `/messages/context/${shortId}`,
-          { params: { channelId } },
-        );
-        return data;
-      },
+      loadThreadContext: loadThreadRefContext,
       toChannel: (channelId) => nav.toChannel(channelId),
       toDm: (dmChannelId) => nav.toDm(dmChannelId),
       toMessage: (channelId, messageId) => nav.toMessage(channelId, messageId),
       toDmMessage: (dmChannelId, messageId) => nav.toDmMessage(dmChannelId, messageId),
       // Stryker disable next-line ArrowFunction: forwarding is covered by openThread payload/source contracts.
       openThread: (request) => openThread(request),
+      openTask: (channelId, taskNumber) => openTaskByChannelNumber({
+        closeProfile,
+        closeThread,
+        toChannelTasks: (taskChannelId) => nav.toChannel(taskChannelId, { chatTab: "tasks" }),
+        openLegacyTask,
+        openThread,
+        openTaskConversation: openTaskConversationDialog,
+        taskV2Enabled: taskV2,
+      }, channelId, taskNumber),
       onThreadUnavailable,
     };
-  }, [channels, nav, openThread, onThreadUnavailable, serverSlug]);
+  }, [channels, closeProfile, closeThread, nav, openLegacyTask, openThread, onThreadUnavailable, serverSlug, taskV2]);
 }

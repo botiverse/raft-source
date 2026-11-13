@@ -6,14 +6,15 @@ import { randomUUID } from "node:crypto";
 import { and, eq } from "drizzle-orm";
 
 import { getDb } from "../db/index";
-import { channelAgents, inboxNotificationFacts, messageMentions, messages, serverMembers, users } from "../db/schema";
+import { agents as agentsTable, channelAgents, inboxNotificationFacts, messageMentions, messages, serverMembers, users } from "../db/schema";
+import { seedJointChannel } from "../test/integration/jointFixture";
 import { createAgent } from "../services/agentService";
 import { addAgent, addHuman, createChannel, getOrCreateThread } from "../services/channelService";
 import { mintAgentCredential, type AgentCapability } from "../services/agentCredentialService";
 import { createMessage } from "../services/messageService";
 import { createServer } from "../services/serverService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 type MentionActionsFixture = {
   serverId: string;
@@ -41,6 +42,7 @@ async function mintAgentKey(agentId: string, scopes: readonly AgentCapability[])
     agentId,
     scopes,
     name: `mention-actions-${agentId}-${scopes.join("-")}`,
+    issuedVia: "computer",
     createdByUserId: null,
   });
   return minted.apiKey;
@@ -577,4 +579,56 @@ test("agent-api mention-actions execute returns typed fail-closed per-id statuse
   const addHumanBody = await addHuman.json() as { results: Array<{ status: string; reason?: string }> };
   assert.equal(addHumanBody.results[0]?.status, "no_permission");
   assert.equal(addHumanBody.results[0]?.reason, "add_requires_human_member_authority");
+});
+
+test("joint channel: a member agent's mention is notifiable at send; notify for a non-member agent is no_permission", async ({ app }) => {
+  // Joint channels are not a notify surface (canNotifyMentionTarget admits
+  // channel/thread rows only), so a non-member agent cannot be pulled into a
+  // joint conversation by a mention: intended. This holds with or without the
+  // agent server pin on canAgentAccessChannel; the pin adds that a target
+  // outside the joint's server can never read it either.
+  const fixture = await seedFixture();
+  const db = getDb();
+  const peer = await createServer("Mention Joint Peer", `mention-joint-peer-${randomUUID()}`, fixture.ownerId);
+  const joint = await seedJointChannel({ name: `mention-joint-${randomUUID().slice(0, 8)}`, serverIds: [fixture.serverId, peer.id], createdByUserId: fixture.ownerId });
+  const local = joint.projections[0]!;
+  await addHuman(local.id, fixture.ownerId);
+  await addAgent(local.id, fixture.actingAgentId);
+  await addAgent(local.id, fixture.otherAgentId);
+  const sendKey = await mintAgentKey(fixture.actingAgentId, ["send", "read", "mentions"]);
+  const [target] = await db.select().from(agentsTable).where(eq(agentsTable.id, fixture.targetAgentId));
+  const [member] = await db.select().from(agentsTable).where(eq(agentsTable.id, fixture.otherAgentId));
+
+  const sendRes = await fetch(`${app.baseUrl}/internal/agent-api/send`, {
+    method: "POST",
+    headers: jsonHeaders(sendKey),
+    body: JSON.stringify({ target: `#${local.name}`, content: `joint ping @${target!.name} and @${member!.name}`, seenUpToSeq: 0 }),
+  });
+  const sent = await sendRes.json() as { state?: string; error?: string; messageId?: string; pendingMentionActions?: unknown[] };
+  assert.equal(sendRes.status, 200, sent.error);
+  assert.equal(sent.state, "sent");
+  // The member's mention is recorded on the local projection and notifiable at send.
+  const rows = await db.select().from(messageMentions).where(eq(messageMentions.messageId, sent.messageId!));
+  assert.deepEqual(rows.map((row) => [row.channelId, row.targetId, row.notifiableAtSend]), [[local.id, member!.id, true]]);
+  assert.equal(sent.pendingMentionActions, undefined, "no pending notify action for the non-member");
+
+  // A pending row for the non-member on the joint projection: notify is refused.
+  const deliveries: string[] = [];
+  const agentOrchestrator = app.app.get("agentOrchestrator") as { deliverMessage: (agentId: string) => Promise<unknown> };
+  agentOrchestrator.deliverMessage = async (agentId) => {
+    deliveries.push(agentId);
+    return { status: "queued", reason: "replayable_inbox" };
+  };
+  const pending = await insertPendingMention(fixture, { channelId: local.id });
+  const res = await fetch(`${app.baseUrl}/internal/agent-api/mention-actions/execute`, {
+    method: "POST",
+    headers: jsonHeaders(fixture.actingAgentKey),
+    body: JSON.stringify({ action: "notify", resolutionIds: [pending.mention.id] }),
+  });
+  assert.equal(res.status, 200);
+  const body = await res.json() as { results: Array<{ status: string; reason?: string }> };
+  assert.equal(body.results[0]?.status, "no_permission");
+  assert.deepEqual(deliveries, []);
+  const [row] = await db.select().from(messageMentions).where(eq(messageMentions.id, pending.mention.id));
+  assert.equal(row?.notifiedAt, null);
 });

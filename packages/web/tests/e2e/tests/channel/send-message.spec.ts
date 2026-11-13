@@ -42,6 +42,8 @@ async function selectSidebarSortMode(
   mode: string,
   section = "channels",
 ) {
+  // With a mouse the section's controls show while its header is hovered.
+  await page.getByTestId(`sidebar-section-toggle-${section}`).hover();
   await page.locator(`[data-testid="sidebar-sort-menu-button"][data-sort-section="${section}"]`).click();
   await page.getByRole("button", { name: mode, exact: true }).click();
 }
@@ -131,7 +133,9 @@ test.describe("P0 channel messaging", () => {
     await composer.fill(draft);
 
     await expect.poll(async () => page.evaluate((channelId) => {
-      const raw = localStorage.getItem("slock_drafts");
+      // Drafts are kept per signed-in person: `slock_drafts:<userId>`.
+      const key = Object.keys(localStorage).find((name) => name.startsWith("slock_drafts:"));
+      const raw = key ? localStorage.getItem(key) : null;
       if (!raw) return null;
       const drafts = JSON.parse(raw) as Record<string, string>;
       return drafts[channelId] ?? null;

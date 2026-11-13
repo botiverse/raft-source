@@ -14,8 +14,6 @@ import { createMessage } from "../services/messageService";
 import { PRODUCT_EVENT_SINK_APP_KEY, PUBLIC_VISITOR_SINK_APP_KEY } from "../services/productEventIngest";
 import type { ProductEventRow, ProductEventSink, PublicVisitorRow, PublicVisitorSink } from "../services/productEventScopeDbWriter";
 import {
-  PUBLIC_VISIT_COUNTS_FEATURE_FLAG_KEY,
-  PUBLIC_VISITOR_ID_FEATURE_FLAG_KEY,
   referrerSite,
   resetPublicVisitCountsForTest,
 } from "../services/publicVisitCounts";
@@ -24,7 +22,7 @@ import { createServer, headers, seedUser } from "./channels.api.fixtures";
 
 // Public Server visit counts (design reviewed in #proj-analytics, Tenny
 // 2026-10-14): count-only, unauthenticated, always 204.
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 /** Registry properties only: the `$` request context is covered on its own. */
 function withoutContext(properties: ProductEventRow["properties"]) {
@@ -47,9 +45,6 @@ async function enableFlags() {
   await db.update(featureFlags)
     .set({ enabled: true, killSwitch: false, defaultEnabled: true })
     .where(eq(featureFlags.key, PUBLIC_SERVER_FEATURE_FLAG_KEY));
-  await db.insert(featureFlags)
-    .values({ key: PUBLIC_VISIT_COUNTS_FEATURE_FLAG_KEY, enabled: true, defaultEnabled: true, randomizationUnit: "server", salt: "test" })
-    .onConflictDoUpdate({ target: featureFlags.key, set: { enabled: true, killSwitch: false, defaultEnabled: true } });
 }
 
 function memoryVisitorSink() {
@@ -61,12 +56,6 @@ function memoryVisitorSink() {
     async flush() {},
   };
   return { rows, sink };
-}
-
-async function setVisitorIdFlag(enabled: boolean) {
-  await getDb().insert(featureFlags)
-    .values({ key: PUBLIC_VISITOR_ID_FEATURE_FLAG_KEY, enabled, defaultEnabled: true, randomizationUnit: "server", salt: "test" })
-    .onConflictDoUpdate({ target: featureFlags.key, set: { enabled, killSwitch: false, defaultEnabled: true } });
 }
 
 async function seedPublicServer(slug: string) {
@@ -105,6 +94,8 @@ test("public visits: anonymous and signed-in visits are counted per visited serv
   resetPublicVisitCountsForTest();
   await enableFlags();
   const { owner, server, open } = await seedPublicServer("visits-counted");
+  // Sharing is on unless turned off (RFC-067 default on): the owner turned it off.
+  await getDb().update(users).set({ shareUsageData: false }).where(eq(users.id, owner.id));
   const outsider = await seedUser("visits-outsider@slock.test", "visits-outsider");
   await getDb().update(users).set({ shareUsageData: true }).where(eq(users.id, outsider.id));
   const store = memorySink();
@@ -134,7 +125,7 @@ test("public visits: anonymous and signed-in visits are counted per visited serv
   // Only the sharing signed-in visitor carries a user key; nothing else does.
   assert.equal(store.rows[0].analytics_id, null);
   assert.match(String(store.rows[1].analytics_id), /^[0-9a-f-]{36}$/);
-  assert.equal(store.rows[2].analytics_id, null, "the owner has not chosen to share");
+  assert.equal(store.rows[2].analytics_id, null, "the owner turned sharing off");
   assert.equal(store.rows[3].analytics_id, null);
   assert.deepEqual(store.rows.map((row) => withoutContext(row.properties)), [
     { visitor: "anonymous" },
@@ -335,9 +326,9 @@ test("public visits: every refusal is an indistinguishable 204 that records noth
   await visit(app.baseUrl, "visits-refused", { uuid: randomUUID(), event: "public_page_channel_opened", channel_id: open.id });
   assert.equal(store.rows.length, 0);
 
-  // The counting flag off (the default): nothing.
+  // public_server_v0 off (here for every server): nothing, counted as flag_off.
   await getDb().update(servers).set({ productAnalyticsEnabled: true }).where(eq(servers.id, server.id));
-  await getDb().update(featureFlags).set({ enabled: false }).where(eq(featureFlags.key, PUBLIC_VISIT_COUNTS_FEATURE_FLAG_KEY));
+  await getDb().update(featureFlags).set({ enabled: false }).where(eq(featureFlags.key, PUBLIC_SERVER_FEATURE_FLAG_KEY));
   resetPublicVisitCountsForTest();
   await visit(app.baseUrl, "visits-refused", viewed());
   assert.equal(store.rows.length, 0);
@@ -375,7 +366,6 @@ test("public visits: a repeated uuid counts once and the daily cap stops countin
 test("public visits: a consenting logged-out visitor's id is kept only in product.public_visitors", async ({ app }) => {
   resetPublicVisitCountsForTest();
   await enableFlags();
-  await setVisitorIdFlag(true);
   const { owner, server } = await seedPublicServer("visits-visitor-id");
   const store = memorySink();
   const visitors = memoryVisitorSink();
@@ -416,66 +406,32 @@ test("public visits: a consenting logged-out visitor's id is kept only in produc
   });
   assert.equal(store.rows.length, 3);
   assert.equal(visitors.rows.length, 1);
-
-  // The visitor-id flag off (the default): no banner, no id kept, visits still counted.
-  await setVisitorIdFlag(false);
-  resetPublicVisitCountsForTest();
-  assert.equal(await offered({ "CloudFront-Viewer-Country": "US" }), undefined, "flag off: no visitor id anywhere");
-  await visit(app.baseUrl, "visits-visitor-id", { uuid: randomUUID(), event: "public_page_viewed", anonymous_id: randomUUID() });
-  assert.equal(store.rows.length, 4);
-  assert.equal(visitors.rows.length, 1);
 });
 
-test("public visits: a join links the page's visitor id to the account only when the joiner shares usage data", async ({ app }) => {
+test("public visits: the retired public join (404) records no join and links no visitor id, even for a joiner who shares usage data", async ({ app }) => {
   resetPublicVisitCountsForTest();
   await enableFlags();
-  await setVisitorIdFlag(true);
   await getDb().update(featureFlags)
     .set({ enabled: true, killSwitch: false, defaultEnabled: true })
     .where(eq(featureFlags.key, SERVER_GUEST_FEATURE_FLAG_KEY));
   const { server } = await seedPublicServer("visits-join-link");
-  await getDb().update(servers).set({ publicGuestJoinEnabled: true }).where(eq(servers.id, server.id));
   const store = memorySink();
   const visitors = memoryVisitorSink();
   app.app.set(PRODUCT_EVENT_SINK_APP_KEY, store.sink);
   app.app.set(PUBLIC_VISITOR_SINK_APP_KEY, visitors.sink);
-  const anonymousId = randomUUID();
   const join = async (email: string) => fetch(`${app.baseUrl}/api/public/servers/visits-join-link/join-as-guest`, {
     method: "POST",
     headers: headers(await tokenForHuman(email), server.id),
-    body: JSON.stringify({ anonymous_id: anonymousId }),
+    body: JSON.stringify({ anonymous_id: randomUUID() }),
   });
 
+  // A Guest is created only by accepting an external invite to its channel (#wg-rbac:#15).
   const sharing = await seedUser("visits-join-sharing@slock.test", "visits-join-sharing");
   await getDb().update(users).set({ shareUsageData: true }).where(eq(users.id, sharing.id));
-  assert.equal((await join(sharing.email)).status, 200);
-  await vi.waitFor(() => assert.equal(visitors.rows.length, 1));
-  const [joined] = store.rows.filter((row) => row.event === "public_page_server_joined");
-  assert.ok(joined?.analytics_id, "the joiner's analytics id, never their user id");
-  assert.equal(joined.server_id, server.id);
-  assert.deepEqual(joined.properties, { has_visitor_id: true }, "a flag, never the id itself");
-  assert.deepEqual(visitors.rows, [
-    { uuid: joined.uuid, event: "public_page_server_joined", server_id: server.id, received_at: joined.received_at, anonymous_id: anonymousId },
-  ]);
-
-  // Sharing but no consent on the page: the join counts, flagged without a visitor row.
-  const noConsent = await seedUser("visits-join-noconsent@slock.test", "visits-join-noconsent");
-  await getDb().update(users).set({ shareUsageData: true }).where(eq(users.id, noConsent.id));
-  assert.equal((await fetch(`${app.baseUrl}/api/public/servers/visits-join-link/join-as-guest`, {
-    method: "POST",
-    headers: headers(await tokenForHuman(noConsent.email), server.id),
-    body: "{}",
-  })).status, 200);
-  await vi.waitFor(() => assert.equal(store.rows.filter((row) => row.event === "public_page_server_joined").length, 2));
-  assert.deepEqual(store.rows.filter((row) => row.event === "public_page_server_joined")[1]?.properties, { has_visitor_id: false });
-  assert.equal(visitors.rows.length, 1);
-
-  // Not sharing (the current default): the join happens, nothing is linked.
-  const silent = await seedUser("visits-join-silent@slock.test", "visits-join-silent");
-  assert.equal((await join(silent.email)).status, 200);
+  assert.equal((await join(sharing.email)).status, 404);
   await new Promise((resolve) => setTimeout(resolve, 200));
-  assert.equal(store.rows.filter((row) => row.event === "public_page_server_joined").length, 2);
-  assert.equal(visitors.rows.length, 1);
+  assert.equal(store.rows.filter((row) => row.event === "public_page_server_joined").length, 0);
+  assert.equal(visitors.rows.length, 0);
 });
 
 // Tenny, 2026-10-14: staging showed a repeat landing on another task got

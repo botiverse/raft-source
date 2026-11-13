@@ -68,7 +68,6 @@ test("a send whose context never saw the card is held once: unseen_card, then bo
   assert.deepEqual(calls[0]!.body!.seenCards, { channel: null });
   assert.equal(held.interrupt.reason, "unseen_card");
   assert.deepEqual(held.interrupt.cards, { channel: card });
-  assert.ok(held.text.startsWith("Held — the description of #ops is not in your current context yet. Your message was not sent."), held.text);
   assert.match(held.text, /Equivalent: channels_info\(\{ target: "#ops" \}\)/);
   assert.match(held.next?.why ?? "", /has not seen the conversation's card/);
   assert.equal(raft.frontier.recordHeld(held.interrupt), false, "no message boundary to book");

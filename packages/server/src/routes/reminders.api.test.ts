@@ -8,7 +8,7 @@ import { addMember, createServer } from "../services/serverService";
 import { createAgent } from "../services/agentService";
 import { createReminder } from "../apps/reminder/service";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 
 

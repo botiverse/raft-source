@@ -11,7 +11,7 @@
 //
 // Source discussion: #proj-runtime:4dbe9aa7.
 import { legacyActivityStateProjection } from "./legacyActivityStateInference";
-import type { AgentActivityDetailKind, AgentActivityKind, AgentStatus, DaemonTrajectoryEntry, TrajectoryEntry } from "@botiverse/raft-shared";
+import type { AgentActivityDetailKind, AgentActivityKind, AgentRuntimeErrorState, AgentStatus, DaemonTrajectoryEntry, TrajectoryEntry } from "@botiverse/raft-shared";
 import type {
   AgentLifecycleEvent,
   AgentLifecycleEventType,
@@ -398,6 +398,7 @@ export const CANONICAL_DAEMON_ACTIVITY_BY_DETAIL_KIND = {
   runtime_reconnecting: "working",
   runtime_error: "error",
   runtime_crashed: "offline",
+  claude_root_privileges: "offline",
   runtime_unavailable: "offline",
   runtime_stalled: "error",
   stalled_recovery: "working",
@@ -412,9 +413,10 @@ export const CANONICAL_DAEMON_ACTIVITY_BY_DETAIL_KIND = {
   synthetic_repair: "online",
   system_message: "working",
   runtime_progress: "working",
-  // task #1116: daemon observation "deliveries written, runtime not consuming".
-  // Carried with a typed DeliveryConsumptionActivityDiagnostic; the process is
-  // alive and idle from the server's point of view, so it projects as online.
+  // task #1116: daemon observation "deliveries written, runtime not consuming",
+  // carried with a typed DeliveryConsumptionActivityDiagnostic. A diagnostic,
+  // not a state: reduceDaemonActivitySignal keeps the activity the daemon sent
+  // (#triage:eedc43fe: an agent mid-turn read as Idle); online only if it sent none.
   delivery_unconsumed: "online",
   // task #1119: the server paused automatic wakes after consecutive early exits.
   wake_crash_loop_blocked: "offline",
@@ -471,6 +473,9 @@ export function reduceDaemonActivitySignal(input: {
       source: "legacy_detail_kind_missing",
     };
   }
+  if (input.detailKind === "delivery_unconsumed") {
+    return { activity: input.legacyActivity ?? "online", detailKind: input.detailKind, source: "canonical" };
+  }
   if (input.detailKind in CANONICAL_DAEMON_ACTIVITY_BY_DETAIL_KIND) {
     const detailKind = input.detailKind as CanonicalDaemonActivityDetailKind;
     return {
@@ -492,7 +497,7 @@ export function rewriteDaemonActivityEntries(
   return entries.map((entry): TrajectoryEntry => {
     if (entry.kind !== "status") return entry;
     const { activityKind: _activityKind, activity: _activity, ...fact } = entry;
-    const entryActivity = fact.detailKind && fact.detailKind in CANONICAL_DAEMON_ACTIVITY_BY_DETAIL_KIND
+    const entryActivity = fact.detailKind && fact.detailKind !== "delivery_unconsumed" && fact.detailKind in CANONICAL_DAEMON_ACTIVITY_BY_DETAIL_KIND
       ? CANONICAL_DAEMON_ACTIVITY_BY_DETAIL_KIND[fact.detailKind as CanonicalDaemonActivityDetailKind]
       : signal.activity;
     return {
@@ -528,9 +533,72 @@ const RUNTIME_ERROR_CLEAR_DETAIL_KINDS = new Set<CanonicalDaemonActivityDetailKi
   "subagent_activity",
 ]);
 
+/**
+ * Detail kinds that prove the provider served a request again: text, thinking
+ * and the model's own tool calls, as the daemon's rate-limit delivery backoff
+ * counts them (task #379). Not `model_request_started` (the daemon reports it
+ * when it hands the model a message, including the turn that hits the same
+ * quota or empty balance again), not `runtime_progress` (turn-start
+ * bookkeeping), `tool_end` (a tool started before the error finishing late) or
+ * `subagent_activity` (a subagent may run on another model).
+ */
+const MODEL_OUTPUT_ERROR_CLEAR_DETAIL_KINDS = new Set<CanonicalDaemonActivityDetailKind>([
+  "model_response_started",
+  "thinking_started",
+  "tool_started",
+  "running_command",
+  "checking_messages",
+]);
+
+/**
+ * The stored runtime error is one only evidence that the provider served a
+ * request again may clear (MODEL_OUTPUT_ERROR_CLEAR_DETAIL_KINDS). A start, a
+ * session report or `model_request_started` never clears it: each wake into the
+ * same limit would otherwise flip the agent back to online until the provider
+ * refused again.
+ * - RateLimitError: a provider limit (a used-up quota or a rate limit); the
+ *   daemon's typed carrier names every runtime-declared provider limit so
+ *   (Grace, #proj-runtime:af29bda9).
+ * - BillingError: the provider refused for an exhausted balance (HTTP 402,
+ *   `billing_exhausted`; task #1351, the agent page's billing banner).
+ * Display state only: wake, delivery and retry decisions do not read the
+ * stored error.
+ */
+export function runtimeErrorClearsOnlyOnModelOutput(error: Pick<AgentRuntimeErrorState, "errorClass"> | null | undefined): boolean {
+  return error?.errorClass === "RateLimitError" || error?.errorClass === "BillingError";
+}
+
+/**
+ * task #1351: a frame that may prove a stored BillingError recovered: a
+ * canonical, non-heartbeat model-output frame. Text and thinking count only
+ * with a non-empty `text` / `thinking` entry of their own: the process-manager
+ * daemon also sends an empty `thinking_started` / `model_response_started` as
+ * turn-start bookkeeping, before the provider has served anything, and may
+ * prepend earlier turns' `turn_summary` entries to any frame, so "has entries"
+ * proves nothing. Tool frames are the model's own tool calls. The proof itself
+ * is the database's (agentService.clearAgentBillingErrorOnRecovery).
+ */
+export function isModelOutputRecoveryFrame(input: { signal: DaemonActivitySignalReduction; isHeartbeat?: boolean; entries: readonly unknown[] | null | undefined }): boolean {
+  if (input.signal.source !== "canonical" || input.isHeartbeat !== false) return false;
+  const detailKind = input.signal.detailKind as CanonicalDaemonActivityDetailKind;
+  if (!MODEL_OUTPUT_ERROR_CLEAR_DETAIL_KINDS.has(detailKind)) return false;
+  if (detailKind === "thinking_started" || detailKind === "model_response_started") return hasModelOutputText(input.entries);
+  return true;
+}
+
+function hasModelOutputText(entries: readonly unknown[] | null | undefined): boolean {
+  return (entries ?? []).some((entry) => {
+    if (!entry || typeof entry !== "object") return false;
+    const { kind, text } = entry as { kind?: unknown; text?: unknown };
+    return (kind === "text" || kind === "thinking") && typeof text === "string" && text.trim() !== "";
+  });
+}
+
 export function reduceRuntimeErrorActivityAction(input: {
   signal: DaemonActivitySignalReduction;
   currentErrorPresent: boolean;
+  /** Only model output clears the current error (runtimeErrorClearsOnlyOnModelOutput). */
+  currentErrorClearsOnlyOnModelOutput?: boolean;
   isHeartbeat?: boolean;
   /** #688(b): a valid typed RuntimeErrorActivityDiagnostic carrier rode this
    * signal (already normalized server-side). Only that may let `runtime_crashed`
@@ -540,7 +608,7 @@ export function reduceRuntimeErrorActivityAction(input: {
 }): RuntimeErrorActivityAction {
   if (input.signal.source === "canonical") {
     const detailKind = input.signal.detailKind as CanonicalDaemonActivityDetailKind;
-    if (detailKind === "runtime_crashed") {
+    if (detailKind === "runtime_crashed" || detailKind === "claude_root_privileges") {
       // Crash is only an authority when a valid typed carrier proves the fact;
       // otherwise it is a weak offline signal that must not establish/clear.
       return input.typedRuntimeCarrierPresent ? "set" : "preserve";
@@ -549,7 +617,7 @@ export function reduceRuntimeErrorActivityAction(input: {
     if (
       input.currentErrorPresent
       && input.isHeartbeat === false
-      && RUNTIME_ERROR_CLEAR_DETAIL_KINDS.has(detailKind)
+      && (input.currentErrorClearsOnlyOnModelOutput ? MODEL_OUTPUT_ERROR_CLEAR_DETAIL_KINDS : RUNTIME_ERROR_CLEAR_DETAIL_KINDS).has(detailKind)
     ) {
       return "clear";
     }

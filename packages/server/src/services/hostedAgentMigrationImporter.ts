@@ -20,7 +20,7 @@
  */
 import { createHash } from "node:crypto";
 import { Readable } from "node:stream";
-import { currentDate } from "@botiverse/raft-shared";
+import { currentDate, formatNotificationCopy } from "@botiverse/raft-shared";
 import { readAgentMigrationBundle, readVerifiedAgentMigrationChunks } from "@botiverse/raft-shared/src/agentMigrationBundleReader";
 import { resumableChunkStorageKey } from "./agentMigrationService";
 import { resolveProviderConfig } from "./agentRuntimeProviderService";
@@ -49,19 +49,20 @@ import {
   type HostedImportCandidate,
   type HostedImportSkip,
 } from "./hostedMigrationFileSelection";
-import { getStorage, type StorageBackend } from "./storageService";
+import { getDirectUploadStorage, getStorage, type StorageBackend } from "./storageService";
+import { hostedMigrationFileSetKey, hostedMigrationFileSetStorage } from "./hostedMigrationFileSet";
 import { hostname } from "node:os";
 import type { Server as SocketServer } from "socket.io";
 import { and, eq } from "drizzle-orm";
 import { setClockInterval } from "@botiverse/raft-shared";
-import { getAppUrl } from "../config/appUrl";
 import { getDb } from "../db/index";
-import { agentMigrationHostedTargets, agentMigrations, agents, servers } from "../db/schema";
+import { agentMigrationHostedTargets, agentMigrations, agents } from "../db/schema";
 import type { AgentMigrationRow } from "./agentMigrationService";
 import { emitAgentMigrationUpdated } from "./agentMigrationRealtime";
 import type { AgentOrchestrator } from "./agentOrchestrator";
 import { onHostedMigrationImported, sweepHostedAgentMigrations } from "./hostedAgentMigrationCompletion";
-import { sendPushNotifications } from "./pushService";
+import { enqueueNotificationRows } from "./notifications/enqueue";
+import type { NotificationNoticePayload } from "./notifications/envelope";
 
 /** Rounds of `import-check`: each drops what the provider listed; `more` means it listed only the first 200. */
 const MAX_IMPORT_CHECK_ROUNDS = 20;
@@ -72,9 +73,7 @@ export class HostedImportBuildError extends Error {
   }
 }
 
-export function hostedMigrationFileSetKey(migrationId: string): string {
-  return `agent-migrations/hosted/${migrationId}/file-set.json`;
-}
+export { hostedMigrationFileSetKey, hostedMigrationFileSetStorage };
 
 function chunkStream(storage: StorageBackend, migration: AgentMigrationRow) {
   return (chunk: { index: number }): AsyncIterable<Uint8Array> => {
@@ -186,6 +185,8 @@ export async function buildHostedImportFileSet(input: {
 
 export interface HostedImporterDeps {
   storage?: StorageBackend | null;
+  /** Where the import body is written; default the dedicated attachment bucket when there is one. */
+  fileSetStorage?: StorageBackend | null;
   /** Tell the person who started the migration that it waits for them. */
   notifyReviewReady?: (migration: AgentMigrationRow) => Promise<void>;
   onMigrationUpdated?: (migration: AgentMigrationRow) => Promise<void>;
@@ -229,9 +230,10 @@ export async function runHostedAgentMigrationImporterOnce(input: { workerId: str
     return true;
   }
   const serialized = Buffer.from(JSON.stringify(fileSet.body), "utf8");
-  const key = hostedMigrationFileSetKey(claim.migration.id);
+  const dedicated = input.fileSetStorage !== undefined ? input.fileSetStorage : getDirectUploadStorage();
+  const key = hostedMigrationFileSetKey(claim.migration.id, dedicated !== null);
   try {
-    await storage.put(key, serialized, "application/json");
+    await (dedicated ?? storage).put(key, serialized, "application/json");
   } catch (error) {
     await fail("MIGRATION_TRANSPORT_LOST", error instanceof Error ? error.message : "Failed to store the import for the cloud");
     return true;
@@ -267,7 +269,7 @@ registerProvisionImportSource(HOSTED_MIGRATION_IMPORT_SOURCE, async ({ agentId, 
     .where(and(eq(agentMigrations.supportRef, importRef), eq(agentMigrations.agentId, agentId)))
     .limit(1);
   if (!row?.key) throw new ProvisionImportSourceError("The migration's file set is missing", "file_set_missing", false);
-  const storage = getStorage();
+  const storage = hostedMigrationFileSetStorage(row.key);
   if (!storage) throw new ProvisionImportSourceError("Object storage is not configured", "storage_unavailable", true);
   let stored: Buffer;
   try {
@@ -288,28 +290,42 @@ registerProvisionImportSource(HOSTED_MIGRATION_IMPORT_SOURCE, async ({ agentId, 
 /**
  * Tell the person who started the migration that it waits for their
  * confirmation. The local agent is stopped meanwhile, and the panel alone
- * does not reach someone who closed the page (Tenny, task #16).
+ * does not reach someone who closed the page (Tenny, task #16). One
+ * `system_notice` outbox row (`migration:<id>`): every device, the person's
+ * server level, quiet hours and preview setting apply.
  */
 export async function notifyHostedMigrationReviewReady(migration: AgentMigrationRow): Promise<void> {
   if (!migration.initiatedByUserId) return;
-  const [row] = await getDb().select({ agentName: agents.name, displayName: agents.displayName, slug: servers.slug, serverName: servers.name })
+  const [row] = await getDb().select({ agentName: agents.name, displayName: agents.displayName, serverId: agents.serverId })
     .from(agents)
-    .innerJoin(servers, eq(servers.id, agents.serverId))
     .where(eq(agents.id, migration.agentId))
     .limit(1);
   if (!row) return;
-  const appUrl = getAppUrl();
   const name = row.displayName?.trim() || row.agentName;
-  await sendPushNotifications([{
-    userId: migration.initiatedByUserId,
-    payload: {
-      title: `Confirm moving ${name} to the cloud`,
-      body: `${name} is paused until you confirm. Review which files come over before the window closes.`,
-      tag: `agent-migration:${migration.supportRef}`,
-      url: `${appUrl}/s/${row.slug}`,
-      serverName: row.serverName,
-      alwaysShow: true,
-    },
+  const payload: NotificationNoticePayload = {
+    title: formatNotificationCopy("push.title.agent_migration_review", [name]),
+    titleKey: "push.title.agent_migration_review",
+    titleArgs: [name],
+    body: formatNotificationCopy("push.body.agent_migration_review", [name]),
+    bodyKey: "push.body.agent_migration_review",
+    bodyArgs: [name],
+    kind: "agent",
+    event: "system_notice",
+    route: { type: "agent", serverId: row.serverId, agentId: migration.agentId },
+    agent: { id: migration.agentId, name },
+  };
+  await enqueueNotificationRows([{
+    receiverId: migration.initiatedByUserId,
+    serverId: row.serverId,
+    kind: null,
+    sourceChannelId: null,
+    messageId: null,
+    messageSeq: null,
+    activityAt: currentDate(),
+    personalMention: true,
+    eventKey: `migration:${migration.id}`,
+    category: "system_notice",
+    payload: payload as unknown as Record<string, unknown>,
   }]);
 }
 

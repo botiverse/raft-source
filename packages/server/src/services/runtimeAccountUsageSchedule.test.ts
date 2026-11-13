@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { DAEMON_CAPABILITY_RUNTIME_ACCOUNT_USAGE_ANTIGRAVITY } from "@botiverse/raft-shared";
 
 import {
   runtimeAccountUsageIntervalMs,
@@ -7,10 +8,15 @@ import {
 
 test("scheduled usage collection selects only installed supported providers and dedupes Kimi aliases", () => {
   assert.deepEqual(
-    runtimeAccountUsageProvidersForRuntimes(["claude", "codex", "kimi", "kimi-sdk", "pi", "claude", "grok"]),
-    ["claude", "codex", "kimi", "grok"],
+    runtimeAccountUsageProvidersForRuntimes(["claude", "codex", "kimi", "kimi-sdk", "pi", "claude", "grok", "antigravity"], [DAEMON_CAPABILITY_RUNTIME_ACCOUNT_USAGE_ANTIGRAVITY]),
+    ["claude", "codex", "kimi", "grok", "antigravity"],
   );
-  assert.deepEqual(runtimeAccountUsageProvidersForRuntimes(["pi", "cursor"]), []);
+  assert.deepEqual(runtimeAccountUsageProvidersForRuntimes(["pi", "cursor"], []), []);
+});
+
+test("Antigravity's usage is read only on a Computer whose daemon advertises it reads it", () => {
+  assert.deepEqual(runtimeAccountUsageProvidersForRuntimes(["claude", "antigravity"], []), ["claude"], "an older Computer: never asked");
+  assert.deepEqual(runtimeAccountUsageProvidersForRuntimes(["antigravity"], new Set([DAEMON_CAPABILITY_RUNTIME_ACCOUNT_USAGE_ANTIGRAVITY])), ["antigravity"]);
 });
 
 test("scheduled usage collection uses stable 15-17 minute machine jitter", () => {

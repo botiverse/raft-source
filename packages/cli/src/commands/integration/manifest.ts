@@ -23,7 +23,7 @@ export {
 };
 export type { AgentManifestActionV1, AgentManifestV1 } from "./manifestV1";
 
-export const AGENT_MANIFEST_MAX_BYTES = 64 * 1024;
+export const AGENT_MANIFEST_MAX_BYTES = 1024 * 1024;
 export const AGENT_MANIFEST_SCHEMA_V0 = "slock-agent-manifest.v0";
 export const RAFT_AGENT_MANIFEST_SCHEMA_V0 = "raft-agent-manifest.v0";
 export const AGENT_MANIFEST_SCHEMA_V0_URL = "https://app.slock.ai/schemas/agent-manifest.v0.json";
@@ -438,13 +438,33 @@ export async function fetchAgentManifest(
   }
 
   const contentLength = Number(response.headers.get("content-length") ?? "");
+  const tooLarge = () => new Error(`manifest response is too large (limit: ${AGENT_MANIFEST_MAX_BYTES} bytes)`);
   if (Number.isFinite(contentLength) && contentLength > AGENT_MANIFEST_MAX_BYTES) {
-    throw new Error("manifest response is too large");
+    void response.body?.cancel().catch(() => {});
+    throw tooLarge();
   }
-  const body = Buffer.from(await response.arrayBuffer());
-  if (body.byteLength > AGENT_MANIFEST_MAX_BYTES) {
-    throw new Error("manifest response is too large");
+  // Bound the decoded body while reading, including chunked responses and
+  // responses whose Content-Length is absent or understates their size.
+  const chunks: Uint8Array[] = [];
+  let bytes = 0;
+  const reader = response.body?.getReader();
+  if (reader) {
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        bytes += value.byteLength;
+        if (bytes > AGENT_MANIFEST_MAX_BYTES) {
+          await reader.cancel().catch(() => {});
+          throw tooLarge();
+        }
+        chunks.push(value);
+      }
+    } finally {
+      reader.releaseLock();
+    }
   }
+  const body = Buffer.concat(chunks, bytes);
   const raw = body.toString("utf8");
   let parsedJson: unknown;
   try {

@@ -95,7 +95,13 @@ export async function restoreConversionResources(tx: DatabaseExecutor, fromChann
   }
 }
 
-/** One projection mapping defines local/canonical thread scope across phases. */
+/**
+ * One projection mapping defines local/canonical sub-conversation scope across
+ * phases: the host's thread projections (canonical thread under a message of
+ * the canonical channel) and, task v2, its task conversation projections
+ * (canonical task conversation of a task stored in the canonical channel). No
+ * task conversation exists with task v2 off, so the second arm is empty there.
+ */
 export function conversionThreadMapping(serverId: string, canonicalChannelId: string): SQL {
   return sql`SELECT projection.local_channel_id AS local_id, authority.canonical_channel_id AS canonical_id
     FROM ${jointChannelServers} projection
@@ -103,5 +109,13 @@ export function conversionThreadMapping(serverId: string, canonicalChannelId: st
     JOIN ${channels} thread ON thread.id = authority.canonical_channel_id AND thread.type = 'thread'
     JOIN ${messages} parent ON parent.id = thread.parent_message_id
     WHERE projection.server_id = ${serverId} AND projection.status = 'active'
-      AND projection.role = 'host' AND parent.channel_id = ${canonicalChannelId}`;
+      AND projection.role = 'host' AND parent.channel_id = ${canonicalChannelId}
+    UNION ALL
+    SELECT projection.local_channel_id AS local_id, authority.canonical_channel_id AS canonical_id
+    FROM ${jointChannelServers} projection
+    JOIN ${jointChannels} authority ON authority.id = projection.joint_channel_id
+    JOIN ${channels} conversation ON conversation.id = authority.canonical_channel_id AND conversation.type = 'task'
+    JOIN ${tasks} task ON task.id = conversation.task_id AND task.conversation_channel_id = conversation.id
+    WHERE projection.server_id = ${serverId} AND projection.status = 'active'
+      AND projection.role = 'host' AND task.channel_id = ${canonicalChannelId}`;
 }

@@ -4,14 +4,12 @@ import { dbTest } from "./dbTest";
 import { apiTest } from "./apiTest";
 import { getDb, isDatabaseInitialized } from "../../db/index";
 import { featureFlags, users } from "../../db/schema";
-import { ONBOARDING_OPENER_V2_FEATURE_FLAG_KEY } from "../../services/featureFlagService";
-import { eq } from "drizzle-orm";
 
 // Expected assertion failure deliberately exercises the real runner's teardown.
 // The next case is the witness: a green body alone cannot prove isolation.
 apiTest.fails("a failed case leaves rows, DDL, session state and flags behind", async ({ db, app, seed }) => {
   assert.equal(app.server.listening, true);
-  assert.equal((await db.select().from(featureFlags).where(eq(featureFlags.key, ONBOARDING_OPENER_V2_FEATURE_FLAG_KEY)))[0].defaultEnabled, true);
+  assert.ok((await db.select().from(featureFlags)).some(flag => flag.defaultEnabled), "migrated baseline has default-on flags");
   await seed.human();
   await db.execute(sql`CREATE TABLE integration_case_residue (id serial PRIMARY KEY)`);
   await db.execute(sql`INSERT INTO integration_case_residue DEFAULT VALUES`);
@@ -23,7 +21,7 @@ apiTest.fails("a failed case leaves rows, DDL, session state and flags behind", 
 
 dbTest("the next case restores the migrated baseline, including unknown tables and session state", async ({ db }) => {
   assert.deepEqual(await db.select().from(users), []);
-  assert.equal((await db.select().from(featureFlags).where(eq(featureFlags.key, ONBOARDING_OPENER_V2_FEATURE_FLAG_KEY)))[0].defaultEnabled, true);
+  assert.ok((await db.select().from(featureFlags)).some(flag => flag.defaultEnabled), "migrated baseline has default-on flags");
   const result = await db.execute(sql`SELECT to_regclass('integration_case_residue') AS permanent,
     to_regclass('integration_temp_residue') AS temporary, current_setting('application_name') AS application`);
   assert.deepEqual(result.rows, [{ permanent: null, temporary: null, application: "" }]);

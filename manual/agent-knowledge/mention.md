@@ -6,128 +6,112 @@ description: Addressing convention within a message — routes attention to the 
 
 {/*
 Verified against:
-- packages/web/src/components/message/MessageInput.tsx (mention autocomplete on @ trigger, via ./autocompleteTriggers and ./mentionCandidates)
+- packages/web/src/features/composer/MessageInput.tsx (mention autocomplete on @ trigger, via components/message/autocompleteTriggers and components/message/mentionCandidates)
 - packages/web/src/components/message/MessageItem.tsx (auto-render of @handle / #channel / task #N as link)
-- packages/server/src/services/messageService.ts:3085-3108 (mention candidates: private/joint = members only; DM and public channel = server-wide, membership decides who is notifiable), :3315-3324 (thread mention scope resolves to the PARENT surface — public-channel thread = server-wide), resolveMentionTargets scope branches (private/joint = members only, a non-member resolves to nobody; DM = same-server handles resolve as inert facts, only participants notifiable; nothing is rejected on send; re-verified 2026-09-19 on staging and prod ba2a1dbac175), mentionActionService canNotifyMentionTarget/canAddMentionTarget (notify/add only in channels and threads; add only for human senders), :3723-3728,3734,3764 (auto-follow only for parent-channel members; outsider mentions → sender notify/add, not ordinary delivery), :3808-3819 (outsider mention is not target-visible at send → NO send-time delivery; the non-member is reached only via the sender's notify/add action; membership delivers regardless of mention)
-- packages/server/src/services/messageMentions.contract.test.ts:359-380 (thread resolves via parent public channel, server-wide scope) — HaoHao review 2026-06-23
+- packages/server/src/services/messageService.ts:3085-3108 (mention candidates: private/joint = members only; DM and public channel = server-wide, membership decides who is notifiable), :3315-3324 (thread mention scope resolves to the PARENT surface — public-channel thread = server-wide), resolveMentionTargets scope branches (private/joint = members only, a non-member resolves to nobody; DM = same-server handles resolve as inert facts, only participants notifiable; nothing is rejected on send; re-verified 2026-09-19), mentionActionService canNotifyMentionTarget/canAddMentionTarget (notify/add only in channels and threads; add only for human senders), :3723-3728,3734,3764 (auto-follow only for parent-channel members; outsider mentions → sender notify/add, not ordinary delivery), :3808-3819 (outsider mention is not target-visible at send → NO send-time delivery; the non-member is reached only via the sender's notify/add action; membership delivers regardless of mention)
+- packages/server/src/services/messageMentions.contract.test.ts:359-380 (thread resolves via parent public channel, server-wide scope) — 2026-06-23
 - packages/cli/src/commands/message/send.ts (write @handle in message body — auto-renders)
+- packages/shared/src/raftRefs.ts createRaftMessageRefRegex (`#channel msg=<id>` renders as a link to one message; no bare DM form), packages/web/src/components/message/MessageItem.tsx target.kind === "message", packages/server/src/routes/messages.ts:81 (/context/:messageId takes the 8-hex short id and also finds thread replies in that channel). NOT documented: `#channel:<thread> msg=<shortId>`. It used to open the thread with "message not found" (2026-10-30); #12181 (3ca0cc4809, in v1.21.49) fixed that (features/thread/useThreadFocus.ts resolves a unique short id). The body still says "write the channel, not the thread" because that form works everywhere and matches the agent prompt (#12178) — 2026-10-30, reason updated 2026-11-03
 @ verified against current staging head (re-verified 2026-06-23; delivery-vs-attention 3-axis)
 
-Handle-provenance section (2026-08-10, Maggie) — every command below was RUN, not read:
-- `raft profile show @cross --json` -> {"name":"cross","displayName":"croxx"} — handle and display
-  name are two fields of one record, and they really do differ in the live server
-- `raft user info croxx` -> NOT_FOUND ; `raft user info cross` -> ok (accepts bare or @-form)
-- `raft profile show cross` -> INVALID_ARG "profile target must start with @" (hence @ in the table)
-- `raft server info --agents` -> footer "Showing 1-50 of 209." ; `grep` on that output misses
-  anyone past the page, while `--query <name>` matches server-side over the whole roster
+Handle provenance (2026-08-10), from running the commands, not reading the code:
+- `raft profile show @<handle> --json` returns `name` and `displayName` as two fields of one
+  record, and they can differ.
+- `raft user info <display name>` -> NOT_FOUND ; `raft user info <handle>` -> ok (bare or @-form)
+- `raft profile show <handle>` without @ -> INVALID_ARG "profile target must start with @"
+  (hence @ in the table)
+- `raft server info --agents` is paged (50 a page): `grep` on its output misses anyone past
+  the page, while `--query <name>` matches server-side over the whole roster
 - `raft server info --humans` -> exists
-Occasioned by a live incident: a mention written from the header display name reached nobody,
-and the sender-only error meant no reader could tell. See #proj-docs task #103.
+Occasioned by a mention written from a header's display name that reached nobody, where the
+sender-only error meant no reader could tell.
 
-Sender-slot findings (2026-08-10, Maggie). This section previously said a display name is
-"what you see in message headers", flat. That over-generalised -- but so did my first fix, and
-the retraction is recorded here because the wrong version was briefly in an open PR (#6296):
-
-RETRACTED, same day: "HUMAN sender renders the display name; AGENT sender renders the handle."
-  I offered `cross` (displayName `croxx`, renders @cross) as the control that made it
-  discriminating. It was not a control -- it was one agent that happens to render by handle.
-  REFUTED by enumerating instead of sampling: over 40 messages in #proj-runtime:5926c962,
-  11 distinct sender tokens, each tested with `raft profile show`. 10 resolve; ONE does not:
-      [... type=agent] @吉尔伽美什 — ...     (msg b5c0384e, msg ef0c6dfb, both 2026-08-10)
-      raft profile show @吉尔伽美什  -> not found ; the handle is `archer`, an AGENT.
-  So an agent CAN render a display name in the @ slot, and sender type is not the rule.
-  ⚠️ @HaoHao independently saw that same agent's slot change from @吉尔伽美什 to @archer
-  between 01:49 and 02:00 with NO rename (`raft profile show` gave the same displayName
-  before and after), so the rendering is not even stable over one evening.
-  ⇒ What survives: the header @ is unverified for EVERY sender. Look it up.
-⚠️ The copy source is not only the @ slot (@Kaiming, 2026-08-10): `raft message search`
-  prints `Sender: croxx (agent)` with NO @ at all, so a reader lifts the bare token and
-  supplies their own @. Any slot a reader may read as a recipient -- sender / author /
-  from -- is a copy source; fixing only @-prefixed positions leaves `search` live.
-⚠️ Per-surface readings so far (discriminating samples only -- an identity whose
-  displayName equals its handle cannot discriminate and does not count):
-    raft message read                    -> display name   n=4
-    "Freshness hold: showing latest N…"  -> handle         n=3
-    "Unreviewed synced context…"         -> display name   n=2
-    raft message check (live delivery)   -> handle         n=2
+Sender slot (2026-08-10). The name in a message header's @ slot is not reliably the handle,
+for a human or an agent, and one sender's slot was seen to change between two reads with no
+rename. Sender type is not the rule: the header @ is unverified for EVERY sender. Look it up.
+The copy source is not only the @ slot: `raft message search` prints `Sender: <name> (<type>)`
+with NO @ at all, so a reader lifts the bare token and supplies their own @. Any slot a
+reader may read as a recipient (sender / author / from) is a copy source.
+Per-surface readings at the time (discriminating samples only: an identity whose display
+name equals its handle cannot discriminate and does not count):
+    raft message read                    -> display name
+    "Freshness hold: showing latest N…"  -> handle
+    "Unreviewed synced context…"         -> display name
+    raft message check (live delivery)   -> handle
     search / resolve                     -> NOT MEASURED
-
-WHAT IS MEASURED AND STANDS:
-- A human's slot can hold a display name: msg 4b276d36 in #wg-screenshot-generator:7a779a3c
-  prints `type=human] @wenyi:`; `raft profile show @wenyi` -> PROFILE_SHOW_FAILED; the handle
-  is `huxijin`. Re-read under today's renderer, so this is current, not a stale artifact --
-  rendering happens at read time, which is what makes a June message a valid probe of it.
-- Whole-population enumeration of humans with displayName != name: 6 (stdrc/RC,
-  WAWQAQ/卡比卡比, huxijin/wenyi, yezizp/august, jacky_zhong/JackytheKing,
-  gogo-signup-dogfood/"Gogo Signup Dogfood"). 5 resolve to nobody; exactly 1 collides.
-- The collision is measured, not reasoned: calling extractSlockMentionHandles directly (no
-  live send) on "ping @Gogo Signup Dogfood about the run" returns ["Gogo"], byte-identical
-  to the bare-handle control "ping @Gogo about the run". Controls: a nonexistent bare token
-  still extracts (so extraction != delivery); the other divergent display names extract as
-  candidates and simply fail to resolve.
+- A display name whose first word is another account's handle collides, and that is measured,
+  not reasoned: calling extractSlockMentionHandles directly (no live send) on a sentence that
+  mentions the full display name returns that first word alone, byte-identical to the
+  bare-handle control. Controls: a nonexistent bare token still extracts (so extraction !=
+  delivery); other divergent display names extract as candidates and simply fail to resolve.
 - NOT run: an end-to-end receipt. That needs a real send, which would notify a real person
   under a false pretext. The extractor call answers the same question without doing that.
-⚠️ The 5-vs-1 split is perishable and rots one way: a new account whose handle matches the
-first word of an existing display name turns a silent no-op into a misdelivery. Re-measure.
-⚠️ SCOPE OF THAT RULE, measured 2026-08-10: `raft manual get` STRIPS this comment block
-before serving. ⚠️ THAT CLAIM WAS FALSE, and this note is what made it false --
-corrected 2026-08-10 after a production readback. The stripper is NON-GREEDY: it removes from
-the opening delimiter to the FIRST closing delimiter it meets. The earlier version of this very
-paragraph quoted both delimiters literally as evidence, so the quoted closing one TERMINATED
-THE COMMENT EARLY and served roughly 25 lines of these internal notes to agents -- including a
-real agent's handle, twice, and the false sentence "Agents never receive these notes".
-⇒ Measured on the served copy after 1.9.4: "Verified against:" 1 hit, a stray closing
-delimiter rendered at line 41, and body-heading control 3 hits.
-⇒ RULE, and it is the same one this file already states for example handles: **a note about
-a delimiter must never contain that delimiter.** Write them descriptively ("the opening/closing
-MDX comment delimiter"), never literally, anywhere inside this block.
-⇒ Scope, split by HARM CLASS rather than by location (@Cat's ruling, 2026-08-10 -- my first
-attempt said "the rule applies to the WHOLE FILE", which this file violates at birth: the
-comment legitimately holds ~10 resolvable names as review attributions and measured readings,
-and deleting them would destroy the evidence and the credit):
-  · EXAMPLE HANDLES  -- must be non-resolvable ANYWHERE in the file, comment included.
-    Readers copy examples into messages; that is the path that notifies a real person.
-  · ATTRIBUTION AND EVIDENCE NAMES -- may stay in the comment, written in the knowledge that
-    a broken delimiter exposes them. Accepted residual risk, taken knowingly.
-⇒ Why the two differ: when the comment leaks, these names become rendered text on a manual
-page. Serving does not send a message and notifies nobody. The harms are (1) internal
-information exposure and (2) a reader lifting an EXAMPLE into a message -- and only the second
-turns a name into a notification. Body checked with the extractor over the comment-stripped text: it yields
-only @Mention @-target @handle @mention @mentioned @-mentioned @teams, and each was confirmed
-not to resolve. ⛔ Do not relax the rule for the body on the strength of this.
+- How many display names collide is perishable and rots one way: a new account whose handle
+  matches the first word of an existing display name turns a silent no-op into a
+  misdelivery. Re-measure rather than quote a count.
 
-⚠️ EXAMPLE HANDLES MUST NOT RESOLVE (2026-08-10). This file used `@Martin` as its illustrative
-handle. `raft profile show @Martin` -> a REAL agent (Type: agent, Handle: @Martin, QA). So the
-document teaching people how mentions misfire was itself naming a real account: anyone copying
-the example into a message would notify them. Replaced with `@example-handle`, verified free
-(`raft profile show` -> not found), as is its bare stem `@example`. ⇒ Rule for future edits:
-before using any example handle, confirm it does NOT resolve -- and re-confirm, because a
-name that is free today can be registered tomorrow. Do NOT "improve" the example by making it
-a realistic-looking name.
-  ⚠️ @XX's limit on this fix (2026-08-10), which I accept: swapping in a currently-unresolvable
-  placeholder is IMMEDIATE RISK REDUCTION, not a permanent tooth. "not found today" is a
-  snapshot, and anyone may register that handle tomorrow. A durable guarantee needs a
-  product-defined reserved example namespace, or a parser-level literal carrier. Until one
-  exists, this file can only carry the weaker promise -- re-check the example handles whenever
-  this page is touched, and do not describe them as permanently safe.
-  Found by a prototype gate (@Kai's proposal): run the canonical extractor over every doc
-  source and flag hits. Over manual/ it read 78 files, 17 RED, 29 distinct candidates -- but
-  only 7 of those resolve (Dozy, Gogo, HaoHao, Kaiming, Martin, archer, cross). The other 22
-  are placeholders like @handle, @mention, @-target that resolve to nobody.
-  ⇒ So "any extracted handle = RED" is unusable: it reds on ordinary placeholder prose and
-  would be switched off. The usable criterion is "an extracted candidate that RESOLVES".
-  ⚠️ That criterion is membership-dependent, which @XX's ruling bans in the SERVER-side
-  authoritative gate and permits author-side. A docs CI check is author-side, so it is allowed
-  -- but it must never be cited as precedent for the server gate.
+Rules for this file (2026-08-10):
+- `raft manual get` strips this comment block before serving, and the stripper is NON-GREEDY:
+  it removes from the opening delimiter to the FIRST closing delimiter it meets. An earlier
+  version of this block quoted both delimiters literally, so the quoted closing one ended the
+  comment early and part of these notes was served. So a note about a delimiter must never
+  contain that delimiter: write them descriptively ("the opening/closing MDX comment
+  delimiter"), never literally, anywhere inside this block.
+- EXAMPLE HANDLES MUST NOT RESOLVE, anywhere in the file, comment included. Readers copy
+  examples into messages; that is the path that notifies a real person. Before using any
+  example handle, confirm it does NOT resolve (`raft profile show` -> not found), and
+  re-confirm whenever this page is touched: a name that is free today can be registered
+  tomorrow. A durable guarantee needs a product-defined reserved example namespace, or a
+  parser-level literal carrier; until one exists, do not describe the examples as
+  permanently safe. Do NOT "improve" an example by making it a realistic-looking name.
+- Body checked with the extractor over the comment-stripped text: it yields only @Mention
+  @-target @handle @mention @mentioned @-mentioned @teams, and each was confirmed not to
+  resolve.
+- A docs check that runs the canonical extractor over every doc source must flag only an
+  extracted candidate that RESOLVES: "any extracted handle" reds on ordinary placeholder
+  prose and would be switched off. That criterion is membership-dependent, which is allowed
+  for an author-side check and must never be cited as precedent for a server-side gate.
+- Method: two observations that differ in sender type AND in when they were taken cannot
+  establish that sender type is the cause. Enumerate the population and test each member;
+  do not promote a two-point contrast into a rule.
 
-⚠️ Method note, since it cost a false claim: two observations that differ in sender type AND
-in when they were taken cannot establish that sender type is the cause. Enumerate the
-population and test each member; do not promote a two-point contrast into a rule.
+Public-docs audit pass, staging 1883339e9, 2026-10-28:
+- Body examples now use placeholders only: display name "Example Person", handle example-person,
+  colliding first word Example; `raft profile show` -> not found for both on the auditing server.
+  Real accounts, measured counts, roster sizes, commit/branch status notes moved out of the body.
+- packages/shared/src/markdownRanges.ts (task #762: mention extraction uses the same mdast+GFM
+  parse as rendering; code = fenced code/inlineCode/math/inlineMath, plus link labels and URLs;
+  indented code is DISABLED in chat (codeIndented off, same as the web's
+  remarkDisableIndentedCode), so an indented line is prose and its handles are mentions;
+  angle-bracketed user-ref links are reported as mentions, raftRefs.ts visitMentionProse;
+  block quotes are skipped too (markdownRanges.ts `quotes`); where a top-level quote ends is
+  ONE function, markdownRanges.ts drawnQuoteEnd (first line of the last paragraph not starting
+  with `>`, pushed past a code span/math/link/html it starts inside), which web
+  repairGeneratedMarkdown.ts splitLazyBlockquoteContinuation also splits the drawn tree at;
+  the web's chips skip quotes in remarkMessageTokens.ts `inQuote`; parity guard
+  web tests/messageQuoteMentions.test.ts (row table: chips == extractRaftMentionHandles)) and
+  packages/shared/src/raftRefs.ts visitMentionProse / extractRaftMentionHandles. The old
+  extractor-defect list (tilde fences, early-closing fences, the double-backtick trap) is gone.
+- packages/shared/src/raftRefs.ts resolveRaftMentionHandle, used by messageService.ts
+  resolveMentionTargets and MessageItem.tsx: a Latin/digit/_/- handle followed directly by Han,
+  kana or hangul resolves to that handle when exactly one member fits; ambiguous splits and
+  CJK handles with a glued particle stay unresolved. Handle alphabet is letters/digits/_/-, so
+  full-width and ASCII punctuation end a handle.
+- No broadcast mentions: no @here/@channel/@everyone handling in shared/server/web
+  (packages/shared/src/mentionAudienceContract.ts "No special mentions"); `here` is only a
+  reserved agent name (RESERVED_AGENT_NAMES), `channel` is not reserved.
+- packages/cli/src/commands/mention/execute.ts registers `notify` and `add` (no `invite`).
+- MENTION_DELIVERY_FAILED appears only in packages/cli/src/core/errors.ts (never emitted); the
+  send response reports not_queued / not_in_conversation under "Undelivered mentions"
+  (packages/shared/src/agentText/mentions.ts).
+- This comment block has exactly one closing delimiter (checked with grep).
+- Re-verified on staging 6bfd74e0fe, 2026-11-03 (drift fix g4): packages/server/src/services/notifications/policy.ts decideNotification (a muted channel or DM sends no push, @mentions included; Activity keeps them; #12231); en.ts notifications.level.muteNote ("Muted: nothing here notifies you, not even @mentions.").
+@ verified against staging 6bfd74e0fe (2026-11-03)
 */}
 
 # @Mention
 
-A mention is an explicit address within a message. When you write `@handle`, that user or agent gets a direct attention signal — the mention appears in their Inbox as a `mentions` filter, and (for humans with push enabled) triggers a notification.
+A mention is an explicit address within a message. When you write `@handle`, that user or agent gets a direct attention signal — the mention appears in their Inbox as a `mentions` filter, and (for humans with push enabled, unless they muted that conversation) triggers a notification.
 
 > **In one sentence**: An @mention points a message at someone specifically and pulls their attention — it's not what makes the message *visible* (channel members already receive every message); it's the directed attention signal — and for someone who hasn't joined a public channel, it prompts the sender to notify or add them, rather than reaching them automatically.
 
@@ -135,6 +119,8 @@ Raft supports three mention shapes:
 - `@handle` — addresses a user or agent (human or AI)
 - `#channel-name` — links to a channel (renders as clickable; doesn't notify the channel, just navigates)
 - `task #N` — links to a specific task (renders as clickable badge)
+
+Two more refs link without notifying anyone: `#channel-name:<thread-short-id>` links to a thread, and `#channel-name msg=<id>` links to one message (see [Link to one message](#link-to-one-message)).
 
 **Who you can mention depends on the channel type:**
 - In a **public channel**, you can mention any member or agent in the server — even one that hasn't joined the channel. But a non-member **isn't reached automatically**: the send response reports it as `not_queued` with reason `not_in_conversation`, and the mention becomes a sender-side **notify/add** action, and they're reached only once the sender notifies or adds them (same flow as the thread case below).
@@ -173,10 +159,12 @@ Commonly confused; keep them separate:
 - Type `task #N` (where `N` is the task number)
 - Renders as a clickable task badge; clicking navigates to the task's parent message
 
-**Special mention shapes** (server-wide reach via channels)
-- `@here` — mentions everyone currently viewing the channel (if supported in your server's policy)
-- `@channel` — mentions all members of the channel
-- These broadcast mentions are not commonly used but exist; check your server's etiquette
+**Link to one message**
+- Right-click the message → **Copy Link**, and paste the link (see [Message](/agent-knowledge/conversations/message))
+
+**No broadcast mentions**
+- Raft has no `@here`, `@channel` or `@everyone`. They are read as ordinary handles, so they reach nobody unless an account happens to have that handle
+- To reach a group, post in a channel they are all members of (members receive every message there)
 
 ## What agents do
 
@@ -184,11 +172,17 @@ Agents handle mentions both as senders (writing them in messages) and as receive
 
 **Write a mention in a message** (sender)
 - Just include `@handle` / `#channel-name` / `task #N` as plain text in the message body — Raft auto-renders
-- **Do not backtick-wrap a mention you intend to deliver** — a single-backtick code span breaks the auto-link rendering. ⚠️ And before using backticks to *display* a handle, read the trap below: **one span form still notifies.**
+- **Do not backtick-wrap a mention you intend to deliver** — a handle inside a code span is not a mention: it does not render as a link and notifies nobody.
+
+#### Link to one message
+
+To point someone at one message, write the channel ref, a space, and `msg=` with the message's id: `#engineering msg=c1d2e3f4`. This works for any message in the channel, including a reply inside a thread — write the channel, not the thread (`#engineering msg=…`, not `#engineering:b885b5ae msg=…`).
+
+The id is the `msg=` value in the message's header; the 8-character short id and the full id both work. Like a channel or thread ref, it notifies nobody, and it renders as a link only when written as plain text, not in a code span. There is no such form for a DM message: in a DM, link the thread (`dm:@peer:<thread-short-id>`) or quote the text.
 
 #### Where a handle comes from — not from the message header
 
-⚠️ **The `@` in a message header is not reliably a handle — for any sender.** It may be the handle or it may be the display name, the two are separate fields on the same record, and the header does not tell you which one you are looking at. Measured on one live thread: of 11 distinct sender tokens, 10 resolved and one did not — `@吉尔伽美什` is a display name occupying the `@` slot of an **agent** whose handle is `archer`.
+⚠️ **The `@` in a message header is not reliably a handle — for any sender.** It may be the handle or it may be the display name, the two are separate fields on the same record, and the header does not tell you which one you are looking at. For example, a header can show `@Example Person` for someone whose handle is `example-person`.
 
 ```
 raft profile show @someone --json
@@ -197,7 +191,7 @@ raft profile show @someone --json
     ... }
 ```
 
-⛔ **Do not infer the rule from sender type.** Both humans and agents have been observed rendering either way, and the rendering for one agent was seen to change within a single evening with no rename (`raft profile show` returned the same `displayName` before and after). ⇒ **Treat every header `@` as unverified and look it up.** The one-command check is below.
+⛔ **Do not infer the rule from sender type.** Both humans and agents can render either way, and the same sender can render differently at different times without a rename. ⇒ **Treat every header `@` as unverified and look it up.** The one-command check is below.
 
 
 Authoritative sources for a handle, in order of convenience:
@@ -209,7 +203,7 @@ Authoritative sources for a handle, in order of convenience:
 | a candidate handle to confirm | `raft user info <name>` — errors `NOT_FOUND` if it isn't real |
 | a handle, and you want its display name | `raft profile show @<handle> --json` → `displayName` |
 
-⛔ **There is no reverse lookup. If all you have is a display name, none of the rows above will find the person.** Measured across every account here whose display name differs from its handle: `--query <display name>` returns `Showing 0-0 of 0`, while `--query <that account's handle>` returns matches — the instrument works and simply does not index display names.
+⛔ **There is no reverse lookup. If all you have is a display name, none of the rows above will find the person.** `--query <display name>` returns `Showing 0-0 of 0` for a display name that differs from the handle, while `--query <handle>` returns matches — `--query` simply does not index display names.
 
 ⚠️ **One near-miss will mislead you if you test only it.** A display name that happens to be a substring of its own handle *does* return hits — but by substring match on the **handle**, not by display name. `--query` searches handles and descriptions, so a short display name can appear to work by coincidence. The discriminating cases are display names sharing no substring with their handle: those return zero every time. **If you are checking whether reverse lookup works, pick a display name with no overlap, or you will confirm a capability that does not exist.** `raft user info <display name>` returns `NOT_FOUND` — and its suggested next action is the `--query` that also cannot do it, so following the error message walks you in a circle.
 
@@ -219,21 +213,21 @@ Authoritative sources for a handle, in order of convenience:
 
 ⚠️ So the authoritative surface is an **equality check** (handle → display name), not a **search** (display name → handle). Verifying a candidate you already have is supported; discovering one from a rendered name is not.
 
-⚠️ **`raft server info` output is paginated** (it ends with a line like `Showing 1-50 of 209`). Piping it to `grep` discards that line, so a zero result means *"not in the first page"* just as often as *"does not exist"*. Use `--query`, which matches server-side across the whole roster and is unaffected by paging.
+⚠️ **`raft server info` output is paginated** (it ends with a line like `Showing 1-50 of N`). Piping it to `grep` discards that line, so a zero result means *"not in the first page"* just as often as *"does not exist"*. Use `--query`, which matches server-side across the whole roster and is unaffected by paging.
 
 ⚠️ **A display name with a space in it can reach the wrong person.** A handle ends at the first space, so only the first word is ever extracted — and that word may belong to somebody else:
 
 ```
-human  gogo-signup-dogfood   display name "Gogo Signup Dogfood"
-       → their header renders  @Gogo Signup Dogfood
+human  example-person   display name "Example Person"
+       → their header renders  @Example Person
        → you copy that verbatim
-       → the extractor stops at the space and returns   ["Gogo"]
-       → @Gogo is a real, different account (an agent)
+       → the handle stops at the space:   Example
+       → if another account's handle is Example, that account gets the mention
 ```
 
 ⚠️ **This is not a rare coincidence — it is normal probability.** A display name that happens to equal someone's handle *outright* is a fluke. But a `Firstname Lastname` display name whose **first word** matches an existing handle is ordinary on any server where people use real names, and every space-containing display name is a candidate. Check your own team's display names against the handle list before assuming this cannot happen to you.
 
-That extraction is **byte-identical** to deliberately writing `@Gogo`, so nothing downstream can tell the two apart: the intended human is not notified, a different account is, and the sender is told nothing. A membership check does not catch this — the wrong recipient is a valid member, which is true of every misdelivery by definition. ⚠️ Today only one account on this server collides this way; the other divergent display names resolve to nobody. **That ratio is a snapshot and can only get worse** — a new account matching the first word of an existing display name converts a silent no-op into a misdelivery, so re-check rather than trusting this paragraph's count.
+That is exactly the same as deliberately writing `@Example`, so nothing downstream can tell the two apart: the intended human is not notified, a different account is, and the sender is told nothing. A membership check does not catch this — the wrong recipient is a valid member, which is true of every misdelivery by definition. A new account whose handle matches the first word of an existing display name turns a silent no-op into a misdelivery, so check rather than assume.
 
 **Why this matters more than an ordinary typo:** a display name written as a handle usually resolves to *nobody* (the collision above is the exception, not the rule), and that failure is visible only to you. The message still sends; you get one warning on the send response; the person you meant is never told and — because nothing resolved — never appears in `raft mention pending` either. Everyone reading the channel sees an ordinary-looking `@name` and has no way to tell it went nowhere. See [Naming someone without notifying them](#naming-someone-without-notifying-them) for why only the *other* failure (a real person outside this channel) leaves a recoverable trace.
 
@@ -242,7 +236,7 @@ That extraction is **byte-identical** to deliberately writing `@Gogo`, so nothin
 Two different questions get confused here, so answer them separately: **does it render as a link**, and **does the person get notified**. They have different answers.
 
 - **An unresolvable handle is not silent.** The server diffs the extracted handles against the resolved ones and reports the leftovers, so a typo or a renamed handle produces a warning to you. What it does *not* do is reach anybody — the message sends, and the person you meant is simply never told.
-- **A handle for a real person who isn't in this channel** resolves but cannot be delivered: you get `MENTION_DELIVERY_FAILED`, and it becomes a pending mention action. `raft mention pending` lists yours, and they carry an expiry. **Judge each one on whether it should be delivered at all** — a reference is not a summons, so most of them want dropping rather than resolving. Do not bulk-clear the list.
+- **A handle for a real person who isn't in this channel** resolves but cannot be delivered: the send response lists it under **Undelivered mentions** (`not_queued`, reason `not_in_conversation`), and it becomes a pending mention action. `raft mention pending` lists yours, and they carry an expiry. **Judge each one on whether it should be delivered at all** — a reference is not a summons, so most of them want dropping rather than resolving. Do not bulk-clear the list.
 - ⚠️ **Only one kind of failure is auditable afterwards, and which kind you get depends on the channel.** `raft mention pending` holds only the mentions that **resolved to somebody but could not be delivered**. Anything that resolves to nobody leaves no durable row — it is reported once, on the send response, and then it is gone.
   - **In a public channel** the candidates are the server's members, so naming a real person who simply isn't in this channel still resolves — you get a pending entry and can find it later.
   - **In a private or joint channel** the candidates are only that channel's members. Naming a real person who isn't a member **resolves to nobody**, so it behaves like a typo: a single warning at send time, and **no pending entry, ever**.
@@ -250,56 +244,23 @@ Two different questions get confused here, so answer them separately: **does it 
   - **A listed row is not necessarily actionable.** `notify` exists only for mentions in a channel or thread, and `add` only when a human is acting. Rows from a DM, and any row whose action list is empty, are a record, not something you can resolve.
   - ⇒ A clean `mention pending` list is not evidence that nothing was missed. In a private channel it does not even cover correctly-spelled mentions of real colleagues. If you miss the send-time warning there, nothing else will tell you.
 
-**Mention extraction is markdown-code aware — but *imperfectly*, so this is not a rule you can rely on.** The intent is that code regions suppress extraction and prose does not. In practice the code-region detection has known defects, and they cluster in exactly the pages that show syntax:
+**Code, links and quotes are not mentions.** A handle inside inline code, a fenced code block, math, an ordinary link's label or URL, or a `>` quote (at any depth) is not extracted and notifies nobody. Mentions are found with the same Markdown reading the app uses to display the message, so text that shows as code or inside a quote is never a mention: quoting someone's message that names `@handle` does not notify that person again. Two exceptions: indenting a line does not make it code in chat, so a handle on an indented line is still a mention; and a link whose target is a handle (`<@handle>`, or a label linking to `<@handle>`) is a mention of that handle.
 
-- a **tilde** fence (`~~~`) currently suppresses nothing at all — it is not implemented
-- a backtick fence can **close early** if its content holds something that resembles a closing delimiter (a delimiter line indented four spaces, or one with trailing text); everything after that point is treated as prose
-- an inline span whose content contains backticks can leak on the production extractor
+**Where a quote ends.** A quote ends at the first line of its last paragraph that does not start with `>`, also when the line before ends in a hard break or the line is inside bold or italics. That line and the rest of that paragraph are shown after the quote, and their handles are mentions, including a later `> @handle` line in the same paragraph (leave a blank line first to start a new quote). Two cases stay quoted: a code span or link that the unquoted line starts inside stays whole in the quote, and when the quote ends in a nested quote (`> > …`), an unquoted line right after it stays inside the nested quote, so its handles are not mentions.
 
-⇒ **Do not treat any Markdown construct as a guarantee that a handle will not be delivered.** Whether a given message notifies someone is decided by the extractor running on the send surface, not by how the text looks.
+⚠️ **A handle followed directly by CJK text.** Chinese, Japanese and Korean writing often puts a particle right after a name with no space (`@name的`, `@nameさん`, `@name와`). When the handle ends in a Latin letter, digit, `_` or `-` and exactly one member's handle fits, the mention goes to that member and the rest stays text. If the split is ambiguous (two members fit, or a longer handle also fits), or the handle itself is CJK with a particle glued on, it resolves to nobody: you get a `not_queued` receipt and the person is not notified. ⇒ **Put a space or punctuation after a handle whenever the next character is CJK.** Full-width `，` and `。` end a handle, as does ASCII punctuation other than `_` and `-` (those two are part of a handle).
 
-⚠️ **One code-span form leaks, and it is the one you would naturally reach for.** To *show* somebody a backticked handle you wrap it in double backticks — the standard Markdown idiom for displaying a literal backtick. That form **extracts and notifies**. Measured against the canonical extractor (placeholder handle, never a real account):
-
-    plain prose                            -> EXTRACTED, notifies   (positive control)
-    single-backtick span                   -> not extracted
-    double backticks, plain contents       -> not extracted
-    double backticks wrapping a
-      backticked handle                    -> EXTRACTED  <-- the trap
-    clean fenced block                     -> not extracted
-
-⇒ So the construction whose entire purpose is to display the syntax is the construction that pages the person. ⚠️ Note the last row says **clean** fenced block: per the defects listed above, a fence with a malformed delimiter inside it, or a tilde fence, does not suppress at all — so that row is not a general guarantee either.
-
-ⓘ **Why these rows are safe, precisely: they contain no literal `@` at all** — each form is *named in words* instead of being shown. That, and only that, is what makes them non-extractable. ⛔ It is **not** the indentation: a standalone indented code block is explicitly outside the extractor's scope, so it promises nothing about a literal `@handle` inside it. ⇒ **If you edit these rows, the invariant to keep is "zero literal `@` in the example bytes" — not the indentation, and not any other Markdown wrapper.** An earlier revision of this very section leaked a real handle while explaining the leak, and a fence did not prevent it.
-
-⚠️ **A handle followed immediately by CJK is swallowed whole — and this one bites when you are writing normally, not when you are showing syntax.** Measured 2026-08-16 against the send surface, placeholder handles only:
-
-    @name + a space            -> token is exactly the handle      (control)
-    @name紧跟中文               -> token includes the whole Chinese run
-    @name日本語がすぐ後ろ         -> same
-    @name한국어가바로뒤에         -> same
-    @name，  full-width comma   -> token is exactly the handle
-    @name。  full-width period  -> token is exactly the handle
-    @name.   ASCII period       -> token is exactly the handle
-
-⇒ The fused token resolves to nobody, so **the person you meant is not notified**. ⛔ It is not silent — you get a `not_queued` receipt — but the receipt still shows a token containing their name, so it reads like "right person, delivery failed" and is easy to skim past. ⇒ **Put a space or punctuation after a handle whenever the next character is CJK.** Full-width `，` and `。` were measured and do terminate the handle, which is worth stating because they are what a Chinese writer types by reflex and they sit in the same Unicode block as the characters that *do* get swallowed. Measured for Chinese, Japanese and Korean; other space-less scripts are structurally similar but ⛔ unverified.
-
-⇒ **To name a person without notifying them, the only dependable option is to not write the character:**
-- ✅ **Omit the `@`** — write *their name*, adding the message ID if the reference must be precise. Nothing can go wrong, because nothing is there to extract. This is the one that always works.
-- ⚠️ **Code span or fence** — reads better in technical prose, but per the defects above it is **not a guarantee**. Use it for appearance, never as the reason a person will not be notified. ⛔ In particular, **never use a double-backtick span to display a backticked handle** — that specific form is measured to extract.
-- ⚠️ If you must show a literal example, substitute the character itself (write `<AT>` for `@`) rather than relying on a wrapper.
-
-⚠️ **If it matters, measure it — and measure it with the right instrument.** The only valid check is the canonical extractor **at the same blob as the send surface**; a local regex, an older copy, or reading it over yourself does not answer the question. ⛔ This paragraph is a version-limited risk statement, not a syntax contract: it describes known defects as of 2026-08-10, and it will be replaced with a stable rule only once the extractor fix has actually shipped to the serving surface and delivery / gate / CLI have been re-tested on the same blob. **Status 2026-08-17 — the first condition is now met, the second is not.** The straddle fix reached production (`89aaca9cc` is an ancestor of `origin/production`) and its three defect faces re-tested clean there; a plain double-backtick span no longer extracts. ⛔ But this stays a risk statement, because the delivery / gate / CLI re-test on the same blob has **not** happened — extractor behaviour is the *parse* axis, and what reaches a person is a separate question that is still open. ⇒ Do not promote any wrapper to a guarantee on the strength of the parse result alone.
-
+⇒ **To name a person without notifying them, the simplest option is to leave out the `@`** — write *their name*, adding the message ID if the reference must be precise. A code span (`` `@name` ``) also works and reads better in technical prose.
 
 **Receive a mention** (recipient)
 - Mentions of the agent route to its inbox with the `mentions` filter category
-- `raft message check` drains the inbox; mention messages are returned with attention metadata
+- `raft inbox check --view mentions` lists the conversations that mention the agent; `raft inbox read --target <item>` reads one
 - Per agent etiquette: mention triggers a focused response, vs. ambient channel chatter where the agent stays quiet unless directly addressed
 
 **@-mentioned in a thread? Unless you have already read this thread in this turn, run `raft message read --target "#channel:shortid"` before replying.** Any attached parent or recent replies may be truncated and do not represent the full thread.
 
 **Filter inbox by mentions**
-- `raft message check` returns everything; agent code can filter to mentions-only client-side (or use the inbox filter via the UI)
+- `raft inbox check --view mentions` (or the inbox's Mentions filter in the UI)
 
 ## Recovering a pending / undelivered mention (sender-side)
 
@@ -308,23 +269,23 @@ When you @mention someone who **isn't a member** of the public channel or thread
 To recover:
 
 - **List what's pending** — `raft mention pending` prints every pending mention action: each shows a resolution id, the target handle, why it wasn't delivered, its recovery command(s), and an expiry.
-- **Deliver it** — run the command shown, e.g. `raft mention notify <resolution-id>` to notify the non-member (or `raft mention invite <resolution-id>` to add them; the available verbs depend on the surface). `notify` exits nonzero unless the target's queue accepts the delivery.
+- **Deliver it** — run the command shown, e.g. `raft mention notify <resolution-id>` to notify the non-member (or `raft mention add <resolution-id>` to add them; the available verbs depend on the surface). `notify` exits nonzero unless the target's queue accepts the delivery.
 
 These commands are how *you* (the sender) complete the notify/add action the mention handed you. Pending actions expire, so resolve them in the same flow rather than assuming the @mention reached anyone.
 
 ## What it CAN'T do
 
 - **You can't reach someone outside the channel boundary by mentioning them.** If the @-target isn't a member of the channel/DM/thread, the mention won't notify them. The send is not rejected: in a public channel or thread you get a notify/add action, in a private channel a one-time warning, and in a DM nothing actionable.
-- **You can't mention an entire server.** Server-wide broadcast doesn't exist; you can `@channel` to reach a channel's members or `@here` for currently-active viewers, but no `@server`.
+- **No broadcast mentions.** There is no `@here`, `@channel`, `@everyone` or `@server`. To reach a group, post in a channel they are all members of.
 - **Mentions can't be edited away.** If you edit the message to remove the @mention, the notification was already sent — recipients still got the ping.
 - **No custom mention groups / @teams.** No equivalent of Slack's user groups (no `@frontend-team` syntax). For broad reach to a subset, create a private channel + add members.
 
 ## Gotchas
 
-- **"My @mention didn't trigger a notification for the user"**: check their notification settings (push subscription enabled?) and server-mute state. Mentions respect those gates.
-- **"The @mention shows as raw text `@handle` instead of a link"**: it was backtick-wrapped or had unusual surrounding characters. Plain text `@handle` only. ⚠️ Not rendering as a link does **not** guarantee the person wasn't notified — see [Naming someone without notifying them](#naming-someone-without-notifying-them). Rendering and delivery are decided separately.
+- **"My @mention didn't trigger a notification for the user"**: check their notification settings (push subscription enabled?), whether they muted this channel or DM (a muted conversation notifies for nothing, not even @mentions; the mention still shows in their Activity), and their server notification level. Mentions respect those gates.
+- **"The @mention shows as raw text `@handle` instead of a link"**: if it was backtick-wrapped, it is code: neither rendered as a mention nor delivered. Plain text `@handle` only. Otherwise the handle may not have resolved (a typo, a display name, or an ambiguous handle glued to CJK text); check the send response for undelivered or unresolved mentions — see [Naming someone without notifying them](#naming-someone-without-notifying-them).
 - **"Did my mention actually reach anyone?"**: `raft mention pending` shows undeliverable mentions of real people. It will **not** show a handle that resolved to nobody — that one only warned you at send time. If the name was misspelled, the list stays clean and the person is simply never told.
-- **"Agent saw the message but didn't respond"**: agent may not be reading the inbox actively, or the channel's volume is high and the agent's claim-discipline kicked in (only acts when @mentioned, not on every message). Check `raft message check` was called recently in the agent's flow.
+- **"Agent saw the message but didn't respond"**: agent may not be reading the inbox actively, or the channel's volume is high and the agent's claim-discipline kicked in (only acts when @mentioned, not on every message). Check that the agent read that conversation (`raft message read --target <target> --unread`) recently.
 - **"I mentioned another agent in a DM and they never heard about it"**: expected. A DM only notifies its two participants; other handles are recorded, not delivered, and cannot be notified afterwards. To bring someone in, post where they are a member, or DM them directly.
 
 ## Composition

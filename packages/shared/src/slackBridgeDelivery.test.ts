@@ -9,6 +9,7 @@ import {
   applySlackBridgeProviderAttemptResult,
   canAdvanceSlackBridgePartitionCursor,
   planSlackBridgePartitionWork,
+  needsSlackBridgeManualRetry,
   type SlackBridgeOutboundDeliverySnapshot,
 } from "./slackBridgeDelivery";
 
@@ -154,7 +155,7 @@ test("unknown and dead heads cannot be overtaken automatically", () => {
     currentRuntimeRevision: "runtime-r4.1",
     runtimeActive: true,
     now: NOW,
-  }), { kind: "reconcile_or_redispatch", automaticRedispatchAllowed: false });
+  }), { kind: "reconcile_or_redispatch", automaticRedispatchAllowed: true });
 
   assert.deepEqual(planSlackBridgePartitionWork({
     delivery: delivery({
@@ -258,7 +259,7 @@ test("definite transient failure uses capped full jitter and the 24th failure is
   assert.equal(dead.reason, "failure_budget_exhausted");
 });
 
-test("24h age terminalizes retryable and ambiguous outcomes while acceptance remains authoritative", () => {
+test("queue age never terminalizes delivery while acceptance and provider Retry-After remain authoritative", () => {
   const firstDispatchedAt = new Date(NOW.getTime() - SLACK_BRIDGE_MAX_DELIVERY_AGE_MS).toISOString();
   const aged = delivery({
     state: "dispatching",
@@ -267,16 +268,22 @@ test("24h age terminalizes retryable and ambiguous outcomes while acceptance rem
     firstDispatchedAt,
   });
 
-  assert.equal(applySlackBridgeProviderAttemptResult(
+  const rateLimited = applySlackBridgeProviderAttemptResult(
     aged,
     { kind: "rate_limited", retryAfterMs: 30_000 },
     NOW,
-  ).reason, "age_budget_exhausted");
+  );
+  assert.equal(rateLimited.state, "retry_wait");
+  assert.equal(rateLimited.nextAttemptAt, new Date(NOW.getTime() + 30_000).toISOString());
+  assert.equal(rateLimited.reason, "provider_rate_limited");
+  assert.equal(applySlackBridgeProviderAttemptResult(
+    aged, { kind: "transient_failure", baseDelayMs: 1000, jitterUnit: 0.5 }, NOW,
+  ).reason, "provider_transient_failure");
   assert.equal(applySlackBridgeProviderAttemptResult(
     aged,
     { kind: "outcome_ambiguous" },
     NOW,
-  ).state, "dead");
+  ).state, "outcome_unknown");
   assert.equal(applySlackBridgeProviderAttemptResult(
     aged,
     { kind: "accepted" },
@@ -503,4 +510,29 @@ test("invalid snapshots and invalid retry inputs fail closed", () => {
     ),
     /Retry-After/,
   );
+});
+
+
+test("an audited retry of an exhausted delivery can fail without exceeding the stored failure budget", () => {
+  for (const result of [
+    { kind: "deterministic_failure" as const },
+    { kind: "transient_failure" as const, baseDelayMs: 1000, jitterUnit: 0.5 },
+  ]) {
+    const transition = applySlackBridgeProviderAttemptResult(delivery({
+      state: "dispatching", providerAttempts: 24, ambiguityBudgetProviderAttempts: 24,
+      dispatchedFailureAttempts: 24, firstDispatchedAt: NOW.toISOString(),
+    }), result, NOW);
+    assert.equal(transition.state, "dead");
+    assert.equal(transition.dispatchedFailureAttempts, 24);
+  }
+});
+
+
+test("ordinary provider waits need no manual recovery, but exhausted waits stay visible", () => {
+  const ordinary = delivery({ state: "retry_wait", providerAttempts: 1, ambiguityBudgetProviderAttempts: 1,
+    firstDispatchedAt: NOW.toISOString(), nextAttemptAt: new Date(NOW.getTime() + 1000).toISOString() });
+  assert.equal(needsSlackBridgeManualRetry(ordinary, NOW), false);
+  assert.equal(needsSlackBridgeManualRetry({ ...ordinary, ambiguityBudgetProviderAttempts: 3 }, NOW), true);
+  assert.equal(needsSlackBridgeManualRetry({ ...ordinary, dispatchedFailureAttempts: 24 }, NOW), true);
+  assert.equal(needsSlackBridgeManualRetry({ ...ordinary, firstDispatchedAt: new Date(NOW.getTime() - 86400000).toISOString() }, NOW), false);
 });

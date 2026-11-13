@@ -1,7 +1,7 @@
 {
   "jsPlugins": [
     { "name": "formatjs", "specifier": "eslint-plugin-formatjs" },
-    "./oxlint-plugins/raft-i18n/index.mjs"
+    "./oxlint-plugins/raft-i18n/index.ts"
   ],
   "categories": {
     "correctness": "off"

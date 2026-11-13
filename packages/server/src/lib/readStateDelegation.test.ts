@@ -3,8 +3,8 @@ import assert from "node:assert/strict";
 import { decideReadStateDelegation } from "./actorPermissions";
 
 const USER = "human-caller";
-const creatorAgent = { creatorType: "user" as const, creatorId: USER };
-const strangerAgent = { creatorType: "user" as const, creatorId: "someone-else" };
+const creatorAgent = { creatorType: "user" as const, creatorId: USER, assistantOwnerUserId: null };
+const strangerAgent = { creatorType: "user" as const, creatorId: "someone-else", assistantOwnerUserId: null };
 
 test("server manageAgents capability (owner) authorizes with server_manage_agents basis", () => {
   const decision = decideReadStateDelegation({
@@ -55,7 +55,7 @@ test("agent-kind creator does NOT authorize a human (creator must be creatorType
   const decision = decideReadStateDelegation({
     callerServerRole: "member",
     userId: USER,
-    agent: { creatorType: "agent", creatorId: USER },
+    agent: { creatorType: "agent", creatorId: USER, assistantOwnerUserId: null },
   });
   assert.deepEqual(decision, { allowed: false, basis: null });
 });
@@ -88,7 +88,14 @@ test("null creatorType/creatorId never matches (fail-closed)", () => {
   const decision = decideReadStateDelegation({
     callerServerRole: "member",
     userId: USER,
-    agent: { creatorType: null, creatorId: null },
+    agent: { creatorType: null, creatorId: null, assistantOwnerUserId: null },
   });
   assert.deepEqual(decision, { allowed: false, basis: null });
+});
+
+test("a personal assistant's read position is its owner's alone: no admin or creator override", () => {
+  const assistant = { creatorType: "user" as const, creatorId: "someone-else", assistantOwnerUserId: "the-owner" };
+  assert.deepEqual(decideReadStateDelegation({ callerServerRole: "admin", userId: USER, agent: assistant }), { allowed: false, basis: null });
+  assert.deepEqual(decideReadStateDelegation({ callerServerRole: "owner", userId: USER, agent: assistant }), { allowed: false, basis: null });
+  assert.deepEqual(decideReadStateDelegation({ callerServerRole: "member", userId: "the-owner", agent: assistant }), { allowed: true, basis: "assistant_owner" });
 });

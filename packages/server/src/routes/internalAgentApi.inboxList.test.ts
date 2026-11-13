@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
+import { EXTERNAL_AGENT_RUNTIME_ID, EXTERNAL_AGENT_RUNTIME_MODEL } from "@botiverse/raft-shared";
 
 import { apiTest as test } from "../test/integration/apiTest";
 import { fixturePasswordHash } from "../test/integration/credentials";
 import { getDb } from "../db/index";
-import { channelAgents, channels, jointChannels, jointChannelServers, messages, servers, threadFollows, users } from "../db/schema";
+import { agentChannelReadCursors, channelAgents, channels, messageMentions, jointChannels, jointChannelServers, messages, servers, threadFollows, users } from "../db/schema";
 import { createServer } from "../services/serverService";
 import { createAgent } from "../services/agentService";
 import {
@@ -15,13 +16,15 @@ import {
   createChannel,
   findOrCreateDM,
   getOrCreateThread,
+  markAgentLegacyRead,
   type AgentInboxChainRow,
 } from "../services/channelService";
 import { createMessage } from "../services/messageService";
 import { mintAgentCredential } from "../services/agentCredentialService";
+import { __resetExternalTurnEndSnapshotsForTests } from "../services/externalTurnEndSnapshot";
 
 // `raft inbox check` reads the agent's offered conversations from the agent
-// inbox view of the unified chain (RisingWave rw_agent_inbox_v6, which holds only
+// inbox view of the unified chain (RisingWave rw_agent_inbox_v7, which holds only
 // offered rows). The view read is stubbed through the RW test seam, answering
 // the page / totals / DM queries over the given rows as the view would;
 // everything else (targets, latest sender) is real Postgres.
@@ -34,7 +37,7 @@ function stubChain(rows: AgentInboxChainRow[]): void {
   __testRisingWaveInbox.set({
     getPool: () => ({} as never),
     query: (async (_pool: unknown, text: string, values: unknown[] = []) => {
-      assert.match(text, /FROM rw_agent_inbox_v6\s+WHERE agent_id = \$1/);
+      assert.match(text, /FROM rw_agent_inbox_v7\s+WHERE agent_id = \$1/);
       const param = (pattern: RegExp) => {
         const match = text.match(pattern);
         return match ? values[Number(match[1]) - 1] : undefined;
@@ -119,7 +122,7 @@ async function followAsAgent(agentId: string, threadChannelId: string, parentMes
 }
 
 async function credentialFor(agentId: string) {
-  const credential = await mintAgentCredential({ agentId, scopes: ["read"], name: "inbox-list", createdByUserId: null });
+  const credential = await mintAgentCredential({ agentId, scopes: ["read"], name: "inbox-list", issuedVia: "computer", createdByUserId: null });
   return credential.apiKey;
 }
 
@@ -315,4 +318,133 @@ test("inbox answers 503 INBOX_UNAVAILABLE when the chain is unconfigured or its 
   assert.equal(failed.status, 503);
   assert.equal(failed.body.code, "INBOX_UNAVAILABLE");
   assert.doesNotMatch(JSON.stringify(failed.body), /ECONNREFUSED/);
+});
+
+test("an external agent's inbox listing returns a turn snapshot; its completed end-of-turn report settles what it owes nothing in", async ({ app }) => {
+  __resetExternalTurnEndSnapshotsForTests();
+  const owner = await seedHuman("ext-owner");
+  const server = await createServer("Inbox Snapshot", `inbox-snap-${randomUUID().slice(0, 8)}`, owner.id);
+  const agent = await createAgent(server.id, "CloudBot", { runtime: EXTERNAL_AGENT_RUNTIME_ID, model: EXTERNAL_AGENT_RUNTIME_MODEL });
+  const busy = await createChannel(server.id, "busy");
+  const pinged = await createChannel(server.id, "pinged");
+  for (const channel of [busy, pinged]) {
+    await addHuman(channel.id, owner.id);
+    await addAgent(channel.id, agent.id);
+  }
+  await createMessage(busy.id, "user", owner.id, "old 1");
+  const busyLatest = await createMessage(busy.id, "user", owner.id, "old 2");
+  const ping = await createMessage(pinged.id, "user", owner.id, "@CloudBot please look");
+  await getDb().insert(messageMentions).values({
+    messageId: ping.id, serverId: server.id, channelId: pinged.id, messageSeq: ping.seq,
+    targetType: "agent", targetId: agent.id, handleAtSendTime: "CloudBot",
+  });
+  stubChain([
+    chainRow({ targetId: busy.id, kind: "channel", serverId: server.id, channelName: "busy", channelType: "channel", latestSeq: busyLatest.seq, unreadCount: 2 }),
+    chainRow({ targetId: pinged.id, kind: "channel", serverId: server.id, channelName: "pinged", channelType: "channel", latestSeq: ping.seq, unreadCount: 1, mentionUnread: 1, maxMentionSeq: ping.seq }),
+  ]);
+  const apiKey = await credentialFor(agent.id);
+  const first = await getInbox(app.baseUrl, apiKey);
+  assert.equal(first.status, 200);
+  assert.equal(typeof first.body.snapshotId, "string");
+  assert.equal((await getInbox(app.baseUrl, apiKey)).body.snapshotId, first.body.snapshotId, "listings in one turn share the snapshot");
+  // A message after the listing is not covered by it.
+  const afterListing = await createMessage(busy.id, "user", owner.id, "new during the turn");
+
+  const report = async (turnEnded: unknown) => {
+    const res = await fetch(`${app.baseUrl}/internal/agent-api/activity`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ schema: "raft-agent-activity-ingest.v1", events: [], turnEnded }),
+    });
+    return { status: res.status, body: await res.json() as any };
+  };
+  const cursorOf = async (channelId: string) =>
+    (await getDb().select({ seq: agentChannelReadCursors.lastReadSeq }).from(agentChannelReadCursors)
+      .where(and(eq(agentChannelReadCursors.agentId, agent.id), eq(agentChannelReadCursors.channelId, channelId))))[0]?.seq ?? null;
+
+  const stale = await report({ snapshotId: "another-turn", outcome: "completed", shownUnreadTargets: ["#busy"] });
+  assert.deepEqual(stale.body.turnEnded, { outcome: "skipped", reason: "stale_snapshot" });
+  assert.equal(await cursorOf(busy.id), null, "another snapshot's report changes nothing");
+
+  const settled = await report({ snapshotId: first.body.snapshotId, outcome: "completed", shownUnreadTargets: ["#busy", "#pinged", "#never-listed"] });
+  assert.equal(settled.status, 200);
+  assert.deepEqual(settled.body.turnEnded, { outcome: "settled", conversationCount: 1 });
+  assert.equal(await cursorOf(busy.id), busyLatest.seq, "read through what the listing showed, not the later message");
+  assert.ok(afterListing.seq > busyLatest.seq);
+  assert.equal(await cursorOf(pinged.id), null, "an unread @mention stays unread");
+
+  const again = await report({ snapshotId: first.body.snapshotId, outcome: "completed", shownUnreadTargets: ["#busy"] });
+  assert.deepEqual(again.body.turnEnded, { outcome: "skipped", reason: "no_snapshot" }, "the first report consumed it");
+
+  const next = await getInbox(app.baseUrl, apiKey);
+  assert.notEqual(next.body.snapshotId, first.body.snapshotId, "the next turn gets a new snapshot");
+  const interrupted = await report({ snapshotId: next.body.snapshotId, outcome: "interrupted", shownUnreadTargets: ["#busy"] });
+  assert.deepEqual(interrupted.body.turnEnded, { outcome: "skipped", reason: "not_completed" });
+  const malformed = await report({ snapshotId: next.body.snapshotId, outcome: "done" });
+  assert.equal(malformed.status, 200, "a malformed turnEnded never fails the activity batch");
+  assert.deepEqual(malformed.body.ignoredFields, ["turnEnded"]);
+});
+
+test("a managed agent's inbox listing carries no turn snapshot", async ({ app }) => {
+  const owner = await seedHuman("managed-owner");
+  const server = await createServer("Inbox Managed", `inbox-man-${randomUUID().slice(0, 8)}`, owner.id);
+  const agent = await createAgent(server.id, "ComputerBot", { runtime: "claude", model: "sonnet" });
+  const general = await createChannel(server.id, "general");
+  const msg = await createMessage(general.id, "user", owner.id, "hi");
+  stubChain([chainRow({ targetId: general.id, kind: "channel", serverId: server.id, channelName: "general", channelType: "channel", latestSeq: msg.seq })]);
+  const listed = await getInbox(app.baseUrl, await credentialFor(agent.id));
+  assert.equal(listed.status, 200);
+  assert.equal("snapshotId" in listed.body, false);
+});
+
+test("a conversation the agent just read through is not listed while the chain trails; a partly read one opens at the durable position", async ({ app }) => {
+  const owner = await seedHuman("durable-owner");
+  const server = await createServer("Inbox Durable", `inbox-durable-${randomUUID().slice(0, 8)}`, owner.id);
+  const agent = await createAgent(server.id, "DurableBot", { runtime: "claude", model: "sonnet" });
+  const readThrough = await createChannel(server.id, "read-through");
+  const partly = await createChannel(server.id, "partly");
+  for (const channel of [readThrough, partly]) {
+    await addHuman(channel.id, owner.id);
+    await addAgent(channel.id, agent.id);
+  }
+  const done = await createMessage(readThrough.id, "user", owner.id, "already read with --after");
+  const partlyFirst = await createMessage(partly.id, "user", owner.id, "read");
+  const partlyLatest = await createMessage(partly.id, "user", owner.id, "not yet");
+  // The chain still shows both as unread from an older position; the reads already landed in Postgres.
+  stubChain([
+    chainRow({ targetId: readThrough.id, kind: "channel", serverId: server.id, channelName: "read-through", channelType: "channel", latestSeq: done.seq, unreadCount: 1, lastReadSeq: done.seq - 1 }),
+    chainRow({ targetId: partly.id, kind: "channel", serverId: server.id, channelName: "partly", channelType: "channel", latestSeq: partlyLatest.seq, unreadCount: 2, lastReadSeq: partlyFirst.seq - 1 }),
+  ]);
+  await markAgentLegacyRead(agent.id, readThrough.id, done.seq);
+  await markAgentLegacyRead(agent.id, partly.id, partlyFirst.seq);
+
+  const listed = await getInbox(app.baseUrl, await credentialFor(agent.id));
+  assert.equal(listed.status, 200);
+  assert.deepEqual(listed.body.items.map((item: { target: string }) => item.target), ["#partly"], "the read-through conversation is not a phantom");
+  assert.equal(listed.body.items[0].lastReadSeq, partlyFirst.seq, "open: starts where the agent actually read to");
+  assert.equal(listed.body.totals.conversations, 1);
+});
+
+test("a read-through row dropped at a page boundary does not end the paging", async ({ app }) => {
+  const owner = await seedHuman("paging-owner");
+  const server = await createServer("Inbox Paging", `inbox-paging-${randomUUID().slice(0, 8)}`, owner.id);
+  const agent = await createAgent(server.id, "PagingBot", { runtime: "claude", model: "sonnet" });
+  const rows: AgentInboxChainRow[] = [];
+  for (const name of ["c1", "c2", "c3"]) {
+    const channel = await createChannel(server.id, name);
+    await addAgent(channel.id, agent.id);
+    const message = await createMessage(channel.id, "user", owner.id, `in ${name}`);
+    rows.push(chainRow({ targetId: channel.id, kind: "channel", serverId: server.id, channelName: name, channelType: "channel", latestSeq: message.seq, lastReadSeq: message.seq - 1 }));
+    if (name === "c3") await markAgentLegacyRead(agent.id, channel.id, message.seq);
+  }
+  stubChain(rows);
+  const apiKey = await credentialFor(agent.id);
+  // Newest first: c3 (read through), c2, c1. A page of 1 reads two rows (c3, c2), drops c3 and
+  // keeps c2; there is still c1 after it.
+  const first = await getInbox(app.baseUrl, apiKey, "?limit=1");
+  assert.deepEqual(first.body.items.map((item: { target: string }) => item.target), ["#c2"]);
+  assert.equal(first.body.hasMore, true, "c1 is still after it");
+  const second = await getInbox(app.baseUrl, apiKey, `?limit=1&before_seq=${first.body.nextBeforeSeq}`);
+  assert.deepEqual(second.body.items.map((item: { target: string }) => item.target), ["#c1"]);
+
 });

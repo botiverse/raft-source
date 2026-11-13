@@ -8,7 +8,7 @@ import { advanceServer } from "../raftbench/controls";
 import { mintAgentCredential } from "../services/agentCredentialService";
 import { __setAppWebhookEncryptionKeyForTests } from "../services/appWebhookConfigService";
 
-const test = createApiTest({ onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest();
 const serverId = "90623df1-20ed-4321-88a1-e4e2b411a252";
 
 test("RaftBench credential is staging-bound, read-only, run-bound and idempotent", async ({ app, db, seed, onTestFinished }) => {
@@ -28,17 +28,17 @@ test("RaftBench credential is staging-bound, read-only, run-bound and idempotent
   await db.insert(messages).values(Array.from({ length: 101 }, (_, index) => ({ channelId: channel.id, senderId: owner.id, senderType: "user" as const, content: `Synthetic normal progress ${index}`, createdAt: new Date("2026-10-17T12:01:00Z") })));
   await db.insert(raftbenchConfigs).values({ serverId, configuredByUserId: administrator.id, enabled: true, agentId: agent.id, channelIds: [channel.id], revision: 1 });
   const [run] = await db.insert(raftbenchLatestRuns).values({ serverId, agentId: agent.id, revision: 1, status: "queued", from: new Date("2026-10-17T00:00:00Z"), to: new Date("2026-10-18T00:00:00Z") }).returning();
-  const credential = await mintAgentCredential({ agentId: agent.id, scopes: ["read", "raftbench"], name: "Synthetic analysis", createdByUserId: owner.id });
+  const credential = await mintAgentCredential({ agentId: agent.id, scopes: ["read", "raftbench"], name: "Synthetic analysis", issuedVia: "human", createdByUserId: owner.id });
   const unlistedId = randomUUID();
   await db.insert(servers).values({ id: unlistedId, ownerId: owner.id, name: "Unlisted synthetic", slug: `unlisted-${unlistedId.slice(0, 8)}` });
   const [unlistedAgent] = await db.insert(agents).values({ serverId: unlistedId, name: "UnlistedService", runtime: "external" }).returning();
-  const unlistedKey = await mintAgentCredential({ agentId: unlistedAgent.id, scopes: ["raftbench"], name: "Unlisted synthetic", createdByUserId: owner.id });
+  const unlistedKey = await mintAgentCredential({ agentId: unlistedAgent.id, scopes: ["raftbench"], name: "Unlisted synthetic", issuedVia: "human", createdByUserId: owner.id });
   const notEnrolled = await fetch(`${app.baseUrl}/internal/agent-api/raftbench/context`, { headers: { Authorization: `Bearer ${unlistedKey.apiKey}` } });
   expect(notEnrolled.status).toBe(403);
   expect((await notEnrolled.json()).code).toBe("raftbench_server_not_allowed");
   const headers = { Authorization: `Bearer ${credential.apiKey}`, "Content-Type": "application/json" };
   const call = (path: string, body?: unknown) => fetch(`${app.baseUrl}/internal/agent-api/${path}`, { headers, method: body === undefined ? "GET" : "POST", ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
-  const ordinary = await mintAgentCredential({ agentId: agent.id, scopes: ["read", "send", "server", "tasks"], name: "Alternate credential", createdByUserId: owner.id });
+  const ordinary = await mintAgentCredential({ agentId: agent.id, scopes: ["read", "send", "server", "tasks"], name: "Alternate credential", issuedVia: "human", createdByUserId: owner.id });
   const missingCapability = await fetch(`${app.baseUrl}/internal/agent-api/raftbench/context`, { headers: { Authorization: `Bearer ${ordinary.apiKey}` } });
   expect(missingCapability.status).toBe(403);
   expect((await missingCapability.json()).code).toBe("capability_not_authorized");
@@ -46,7 +46,7 @@ test("RaftBench credential is staging-bound, read-only, run-bound and idempotent
   expect(notHosted.status).toBe(403);
   expect((await notHosted.json()).code).toBe("raftbench_service_credential_required");
   await db.insert(raftbenchServiceAgents).values({ serverId, agentId: agent.id });
-  await expect(mintAgentCredential({ agentId: agent.id, scopes: ["read", "send"], createdByUserId: owner.id })).rejects.toThrow("raftbench_service_credential_scope_invalid");
+  await expect(mintAgentCredential({ agentId: agent.id, scopes: ["read", "send"], issuedVia: "human", createdByUserId: owner.id })).rejects.toThrow("raftbench_service_credential_scope_invalid");
   await db.insert(agentRuntimeProvisions).values({ agentId: agent.id, serverId, provider: "antiproton", state: "active", provisionedProfile: "raftbench_service", credentialId: credential.credentialId, provisionedName: "Synthetic analysis", provisionedInstructions: "Synthetic test only" });
   const alternateSend = await fetch(`${app.baseUrl}/internal/agent-api/send`, { method: "POST", headers: { Authorization: `Bearer ${ordinary.apiKey}`, "Content-Type": "application/json" }, body: JSON.stringify({ target: "#synthetic-qa", content: "Synthetic must not send" }) });
   expect(alternateSend.status).toBe(403);

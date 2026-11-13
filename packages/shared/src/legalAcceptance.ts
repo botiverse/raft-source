@@ -1,5 +1,5 @@
 export const CURRENT_TERMS_VERSION = "2026-05-12";
-export const CURRENT_PRIVACY_VERSION = "2026-05-12";
+export const CURRENT_PRIVACY_VERSION = "2026-10-14";
 export const TERMS_URL = "https://raft.build/terms";
 export const PRIVACY_URL = "https://raft.build/privacy";
 

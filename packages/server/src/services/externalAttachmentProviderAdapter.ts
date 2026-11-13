@@ -38,11 +38,13 @@ export type ExternalAttachmentUploadRequest = Readonly<{
 
 export type ExternalOutboundFrozenAttachment = Readonly<{
   sourceAttachmentId: string;
+  objectId: string;
+  originServerId: string;
   storageKey: string;
   filename: string;
   mimeType: string;
   sizeBytes: number;
-  contentDigest: string;
+  contentDigest: string | null;
   messagePosition: number;
 }>;
 
@@ -56,9 +58,16 @@ export type ExternalOutboundAttachmentSnapshot = Readonly<{
   authorPresentation: Readonly<{
     displayName: string;
     fallbackKind: "human" | "agent";
+    avatar: Readonly<{ publicUrl: string }> | null;
   }>;
   attachments: readonly ExternalOutboundFrozenAttachment[];
   bindingAuthority: ExternalAttachmentAuthority;
+}>;
+
+/** An immutable provider-owned decision; the transfer kernel never infers omissions. */
+export type ExternalOutboundAttachmentSelection = Readonly<{
+  includedAttachmentIds: readonly string[];
+  omittedAttachmentIds: readonly string[];
 }>;
 
 export type ExternalAttachmentCompletionRequest = Readonly<{

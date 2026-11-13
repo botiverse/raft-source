@@ -8,8 +8,8 @@ import {
   RISINGWAVE_ARTIFACT_CDC_TABLES,
   RISINGWAVE_BOOTSTRAP_ARTIFACTS,
   RISINGWAVE_CDC_TABLES,
+  splitSqlStatements,
   RISINGWAVE_LOCAL_SOURCE,
-  RISINGWAVE_PUBLICATION_TABLES,
   RISINGWAVE_REQUIRED_RELATIONS,
   RISINGWAVE_SERVER_READ_RELATIONS,
   buildRisingWaveBootstrapStatements,
@@ -60,14 +60,32 @@ export function renderReleaseQaRisingWaveBootstrap(sourceRoot: string) {
     ]),
   );
   const allStatements = buildRisingWaveBootstrapStatements(artifacts);
-  const cdcRelations = new Set(RISINGWAVE_CDC_TABLES.map((table) => table.name));
-  const cdcStatements = allStatements.filter((statement) => {
-    const relation = createdRelationName(statement);
-    return relation !== null && cdcRelations.has(relation);
+  // Use the production catalog snapshot on both QA paths, rather than
+  // raftdev's deliberately smaller projections. No schema inference from (*).
+  const catalogSql = readFileSync(path.join(sourceRoot,
+    "infra/aws-server/envs/release-qa/sql/risingwave-cdc-bootstrap.sql"), "utf8");
+  const cdcStatements = splitSqlStatements(catalogSql).filter((statement) => {
+    const name = createdRelationName(statement);
+    return name !== null && name !== "rw_message_mentions" &&
+      /\bCREATE TABLE\b/i.test(statement);
   });
+  const cdcNames = cdcStatements.map((statement) => createdRelationName(statement)!);
+  if (cdcNames.length !== 18 || new Set(cdcNames).size !== cdcNames.length) {
+    throw new Error("release-QA needs the 18 distinct production CDC projections");
+  }
+  const publicationTables = [...new Set(cdcStatements.map((statement) => {
+    if (/\(\s*\*\s*\)/.test(statement)) throw new Error("inferred QA CDC projection");
+    const upstream = /FROM\s+:"rw_source_name"\s+TABLE\s+'public\.([a-z_]+)'/i.exec(statement)?.[1];
+    if (!upstream) throw new Error("QA CDC projection has no bound upstream table");
+    return upstream;
+  }))];
+  const replacedCdc = new Set([
+    ...RISINGWAVE_CDC_TABLES.map((table) => table.name),
+    ...RISINGWAVE_ARTIFACT_CDC_TABLES.map((table) => table.name),
+  ]);
   const manifestStatements = allStatements.filter((statement) => {
     const relation = createdRelationName(statement);
-    return relation === null || !cdcRelations.has(relation);
+    return relation === null || !replacedCdc.has(relation);
   });
   const sourceStatement = [
     'CREATE SOURCE :"rw_source_name"',
@@ -81,15 +99,16 @@ export function renderReleaseQaRisingWaveBootstrap(sourceRoot: string) {
     "  schema.name = 'public',",
     "  ssl.mode = :'pg_ssl_mode',",
     "  slot.name = :'pg_slot_name',",
-    "  publication.name = :'pg_publication_name'",
+    "  publication.name = :'pg_publication_name',",
+    "  auto.schema.change = 'false'",
     ")",
   ].join("\n");
   const contract = {
     schema_version: 1,
-    publication_tables: [...RISINGWAVE_PUBLICATION_TABLES],
-    cdc_relations: RISINGWAVE_CDC_TABLES.map((table) => table.name),
-    artifact_cdc_relations: RISINGWAVE_ARTIFACT_CDC_TABLES.map((table) => table.name),
-    required_relations: [...RISINGWAVE_REQUIRED_RELATIONS],
+    publication_tables: publicationTables,
+    cdc_relations: cdcNames,
+    artifact_cdc_relations: [],
+    required_relations: [...new Set([...RISINGWAVE_REQUIRED_RELATIONS, ...cdcNames])],
     server_read_relations: [...RISINGWAVE_SERVER_READ_RELATIONS],
   };
   return {

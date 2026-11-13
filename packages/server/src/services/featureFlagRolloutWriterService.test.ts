@@ -228,6 +228,7 @@ function rejectConfigVersionUpdates(db: Database) {
 }
 
 test("authoritative feature flag rollout writer", async ({ db }) => {
+  await db.delete(featureFlagConfigVersions);
   await runNamedCase("blocked widening and no-op return with zero state/audit/version writes", async () => {
     const noOpKey = "writer_no_op_v0";
     const wideningKey = "writer_missing_receipt_v0";

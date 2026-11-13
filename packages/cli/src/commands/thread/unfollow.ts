@@ -78,8 +78,8 @@ export const threadUnfollowCommand = defineCommand(
     const agentContext = ctx.loadAgentContext();
     const client = ctx.createApiClient(agentContext);
     const agentApi = createAgentApiSurfaceClient(client);
-    const reason = opts.reason?.trim() || "no longer following";
-    const res = await agentApi.threads.unfollow({ thread, reason });
+    const reason = opts.reason?.trim();
+    const res = await agentApi.threads.unfollow(reason ? { thread, reason } : { thread });
     if (!res.ok) {
       throw new CliError({
         code: res.status >= 500 ? "SERVER_5XX" : "UNFOLLOW_FAILED",

@@ -3,6 +3,7 @@ import { createHmac } from "node:crypto";
 import { afterEach, test } from "vitest";
 import {
   agentIdHashAttrs,
+  apiKeyPrefixHashAttrs,
   exportTraceIdentityKeyHex,
   serverIdHashAttrs,
   traceAgentIdHash,
@@ -73,4 +74,13 @@ test("exported keys are absent without JWT_SECRET", () => {
   delete process.env.JWT_SECRET;
   assert.equal(exportTraceIdentityKeyHex("agent_id_hash"), null);
   assert.equal(exportTraceIdentityKeyHex("server_id_hash"), null);
+});
+
+test("apiKeyPrefixHashAttrs hashes the prefix and is stable", () => {
+  process.env.JWT_SECRET ??= "test-jwt-secret-for-key-prefix-hash";
+  const { key_prefix_hash: hash } = apiKeyPrefixHashAttrs("sk_agent_abcdefg");
+  assert.ok(hash);
+  assert.equal(hash.includes("sk_agent"), false);
+  assert.equal(apiKeyPrefixHashAttrs("sk_agent_abcdefg").key_prefix_hash, hash);
+  assert.notEqual(apiKeyPrefixHashAttrs("sk_agent_zzzzzzz").key_prefix_hash, hash);
 });

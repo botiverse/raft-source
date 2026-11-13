@@ -4,7 +4,7 @@ import { afterEach, beforeEach } from "vitest";
 import { and, eq } from "drizzle-orm";
 import { EXTERNAL_AGENT_RUNTIME_ID } from "@botiverse/raft-shared";
 import { getDb } from "../db/index";
-import { agentCredentials, agentMigrationHostedTargets, agentMigrationReceiptOutbox, agentMigrations, agentRuntimeProvisions, agents, machines, messages, serverMembers, servers, users } from "../db/schema";
+import { agentChannelReadCursors, agentConfigChangeEvents, agentCredentials, agentMigrationHostedTargets, channels, messageMentions, agentMigrationReceiptOutbox, agentMigrations, agentRuntimeProvisions, agents, machines, messages, serverMembers, servers, users } from "../db/schema";
 import {
   HOSTED_MIGRATION_TARGET_CONTROL_IDENTITY,
   beginHostedAgentMigrationProvisioning,
@@ -19,10 +19,12 @@ import {
   getHostedMigrationReview,
   hostedRuntimeSnapshotScope,
   recordHostedAgentMigrationFileSet,
+  settleMigratedAgentReadBacklog,
 } from "./hostedAgentMigrationService";
 import { markTestAgentMigrationReady } from "../test/agentMigrationFixture";
 import { ANTIPROTON_PROVISIONING_TOKEN_ENV, __setAgentRuntimeProviderTransportForTests, decryptProviderSecret } from "./agentRuntimeProviderService";
 import { probeProviderAgent } from "./agentRuntimeProvisionService";
+import { mintAgentCredential, RUNNER_MACHINE_CHANGED_REVOKE_REASON } from "./agentCredentialService";
 import {
   HOSTED_MIGRATION_IMPORT_FAILED_REASON,
   HOSTED_MIGRATION_IMPORT_STALLED_REASON,
@@ -128,6 +130,17 @@ test("claim, review, confirm: the switch makes the agent hosted in one step", as
   assert.equal(switched.runtime, EXTERNAL_AGENT_RUNTIME_ID);
   assert.equal(switched.machineId, null);
   assert.equal(switched.sessionId, null);
+  // The switch records the configured model it replaced, in the same commit.
+  const configEvents = await db.select().from(agentConfigChangeEvents).where(eq(agentConfigChangeEvents.agentId, agent.id));
+  assert.equal(configEvents.length, 1);
+  assert.equal(configEvents[0].source, "hosted_migration");
+  assert.equal(configEvents[0].actorKind, "user");
+  assert.equal(configEvents[0].actorId, user.id);
+  assert.equal(configEvents[0].beforeRuntime, "codex");
+  assert.equal(configEvents[0].beforeModel, "gpt-5.3-codex");
+  assert.equal(configEvents[0].afterRuntime, EXTERNAL_AGENT_RUNTIME_ID);
+  assert.equal(configEvents[0].afterModel, switched.model);
+  assert.equal(configEvents[0].changedAt.toISOString(), claimAt.toISOString());
   const [provision] = await db.select().from(agentRuntimeProvisions).where(eq(agentRuntimeProvisions.agentId, agent.id));
   assert.equal(provision.importSource, "computer_migration");
   assert.equal(provision.importRef, reviewed.supportRef);
@@ -143,6 +156,32 @@ test("claim, review, confirm: the switch makes the agent hosted in one step", as
     }),
     /MIGRATION_NOT_CANCELABLE/,
   );
+});
+
+test("the switch to the cloud revokes the source Computer's runner credentials and keeps the cloud runtime's", async ({ db }) => {
+  const now = new Date("2026-10-18T06:00:00.000Z");
+  const { agent, user, server, source } = await readyHostedMigration(now);
+  const runner = await mintAgentCredential({ agentId: agent.id, scopes: ["read"], name: "runner:source", issuedVia: "computer", issuedByMachineId: source.id, createdByUserId: null });
+  const human = await mintAgentCredential({ agentId: agent.id, scopes: ["read"], name: "human", issuedVia: "human", createdByUserId: user.id });
+  const claimAt = new Date(now.getTime() + 2_000);
+  const claim = await claimHostedAgentMigrationImport({ workerId: "w1", now: claimAt });
+  assert.ok(claim);
+  const reviewed = await recordHostedAgentMigrationFileSet({
+    claim, fileSetObjectKey: "k", fileSetSha256: "s".repeat(64), importSummary: summary, now: claimAt,
+  });
+  assert.ok(reviewed);
+  await confirmHostedAgentMigration({
+    serverId: server.id, agentId: agent.id, migrationRef: reviewed.supportRef,
+    expectedRevision: reviewed.revision, userId: user.id, now: claimAt,
+  });
+
+  const [provision] = await db.select({ credentialId: agentRuntimeProvisions.credentialId }).from(agentRuntimeProvisions).where(eq(agentRuntimeProvisions.agentId, agent.id));
+  assert.ok(provision?.credentialId);
+  const rows = await db.select({ id: agentCredentials.id, revokedReason: agentCredentials.revokedReason }).from(agentCredentials).where(eq(agentCredentials.agentId, agent.id));
+  const reasonOf = (id: string) => rows.find((row) => row.id === id)?.revokedReason ?? null;
+  assert.equal(reasonOf(runner.credentialId), RUNNER_MACHINE_CHANGED_REVOKE_REASON);
+  assert.equal(reasonOf(human.credentialId), null);
+  assert.equal(reasonOf(provision.credentialId), null, "the cloud runtime's own credential stays");
 });
 
 test("confirming before the review is built, or after a cancel, changes nothing", async ({ db }) => {
@@ -329,11 +368,39 @@ test("a create the provider refused and never had puts the agent back on its Com
   assert.equal(restored.runtime, "codex");
   assert.equal(restored.model, "gpt-5.3-codex");
   assert.deepEqual(restored.envVars, { OPENAI_API_KEY: "sk-very-secret-value" });
+  // The switch and the revert each recorded one change; the revert is the system's.
+  const configEvents = await db.select().from(agentConfigChangeEvents).where(eq(agentConfigChangeEvents.agentId, agent.id));
+  assert.deepEqual(configEvents.map((event) => event.source).sort(), ["hosted_migration", "hosted_migration_revert"]);
+  const revert = configEvents.find((event) => event.source === "hosted_migration_revert")!;
+  assert.equal(revert.actorKind, "system");
+  assert.equal(revert.actorId, null);
+  assert.equal(revert.beforeRuntime, EXTERNAL_AGENT_RUNTIME_ID);
+  assert.equal(revert.afterRuntime, "codex");
+  assert.equal(revert.afterModel, "gpt-5.3-codex");
+  assert.ok(!JSON.stringify(configEvents).includes("sk-very-secret-value"), "no env value is copied into the history");
   assert.equal((await db.select().from(agentRuntimeProvisions).where(eq(agentRuntimeProvisions.agentId, agent.id))).length, 0);
   const credentials = await db.select().from(agentCredentials).where(eq(agentCredentials.agentId, agent.id));
   assert.ok(credentials.length > 0);
   assert.ok(credentials.every((credential) => credential.revokedAt !== null));
   assert.match(await receiptText(arriving.id, "failed"), /You are still on source-mac; your workspace there was not changed\./);
+});
+
+test("a refused create whose source Computer was detached meanwhile leaves the agent unbound and stopped, not on the revoked machine", async ({ db }) => {
+  const now = new Date("2026-10-18T06:00:00.000Z");
+  const { agent, arriving, source, at } = await arrivingHostedMigration(now, undefined, "-detached-source");
+  await db.update(agentRuntimeProvisions).set({ state: "failed", lastErrorCode: "plan_required" }).where(eq(agentRuntimeProvisions.agentId, agent.id));
+  // The source's key is revoked while the agent is hosted (a legacy machine: its own key).
+  await db.update(machines).set({ apiKeyHash: "revoked:account_deletion_requested" }).where(eq(machines.id, source.id));
+  const { deps } = fakeDeps();
+
+  await sweepHostedAgentMigrations({ ...deps, now: at, probeProvider: async () => "never_existed" });
+  const [row] = await db.select().from(agentMigrations).where(eq(agentMigrations.id, arriving.id));
+  assert.equal(row.state, "failed");
+  assert.equal(row.failureReason, HOSTED_MIGRATION_NOT_CREATED_REASON);
+  const [restored] = await db.select().from(agents).where(eq(agents.id, agent.id));
+  assert.equal(restored.machineId, null, "not back on the revoked machine");
+  assert.equal(restored.status, "stopped");
+  assert.equal(restored.runtime, "codex", "its runtime is restored all the same");
 });
 
 test("an import that failed or never came needs attention, and a later import still completes", async ({ db }) => {
@@ -456,4 +523,71 @@ test("only a 2xx that says never_existed counts as never created; anything else 
     if (savedToken === undefined) delete process.env[ANTIPROTON_PROVISIONING_TOKEN_ENV];
     else process.env[ANTIPROTON_PROVISIONING_TOKEN_ENV] = savedToken;
   }
+});
+
+test("the switch marks an old read backlog read and keeps DMs and unread @mentions", async ({ db }) => {
+  const now = new Date("2026-10-20T19:00:00.000Z");
+  const { provisioning, agent, user, server } = await readyHostedMigration(now, undefined, "-backlog");
+  const [backlog, mentioned, dm, current] = await db.insert(channels).values([
+    { serverId: server.id, name: "backlog", type: "channel" },
+    { serverId: server.id, name: "mentioned", type: "channel" },
+    { serverId: server.id, name: "dm-owner", type: "dm" },
+    { serverId: server.id, name: "current", type: "channel" },
+  ]).returning();
+  const post = async (channelId: string, content: string) =>
+    (await db.insert(messages).values({ channelId, senderType: "user", senderId: user.id, content }).returning())[0]!;
+  const readThrough = async (channelId: string, seq: number) =>
+    db.insert(agentChannelReadCursors).values({ agentId: agent.id, channelId, lastReadSeq: seq });
+  const cursorOf = async (channelId: string) =>
+    (await db.select({ seq: agentChannelReadCursors.lastReadSeq, version: agentChannelReadCursors.readStateVersion })
+      .from(agentChannelReadCursors)
+      .where(and(eq(agentChannelReadCursors.agentId, agent.id), eq(agentChannelReadCursors.channelId, channelId))))[0]!;
+
+  const backlogRead = await post(backlog.id, "read in July");
+  await post(backlog.id, "never delivered 1");
+  const backlogLatest = await post(backlog.id, "never delivered 2");
+  await readThrough(backlog.id, backlogRead.seq);
+
+  const mentionedRead = await post(mentioned.id, "read");
+  const mention = await post(mentioned.id, "@mover please look");
+  await db.insert(messageMentions).values({
+    messageId: mention.id, serverId: server.id, channelId: mentioned.id, messageSeq: mention.seq,
+    targetType: "agent", targetId: agent.id, handleAtSendTime: "mover",
+  });
+  await readThrough(mentioned.id, mentionedRead.seq);
+
+  const dmRead = await post(dm.id, "hi");
+  await post(dm.id, "still waiting on you");
+  await readThrough(dm.id, dmRead.seq);
+  // A thread in the DM is owed too.
+  const [dmThread] = await db.insert(channels).values({ serverId: server.id, name: "dm-thread", type: "thread", parentMessageId: dmRead.id }).returning();
+  const dmThreadRead = await post(dmThread.id, "thread start");
+  await post(dmThread.id, "thread follow-up");
+  await readThrough(dmThread.id, dmThreadRead.seq);
+
+  const currentLatest = await post(current.id, "seen");
+  await readThrough(current.id, currentLatest.seq);
+  const currentBefore = await cursorOf(current.id);
+
+  const claimAt = new Date(now.getTime() + 2_000);
+  const claim = await claimHostedAgentMigrationImport({ workerId: "w1", now: claimAt });
+  assert.ok(claim);
+  const reviewed = await recordHostedAgentMigrationFileSet({
+    claim, fileSetObjectKey: "k", fileSetSha256: "s".repeat(64), importSummary: summary, now: claimAt,
+  });
+  assert.ok(reviewed);
+  await confirmHostedAgentMigration({
+    serverId: server.id, agentId: agent.id, migrationRef: reviewed.supportRef,
+    expectedRevision: reviewed.revision, userId: user.id, now: claimAt,
+  });
+  assert.equal(provisioning.migration.agentId, agent.id);
+
+  assert.equal((await cursorOf(backlog.id)).seq, backlogLatest.seq, "the old backlog is read through its latest message");
+  assert.equal((await cursorOf(mentioned.id)).seq, mentionedRead.seq, "an unread @mention of the agent stays unread");
+  assert.equal((await cursorOf(dm.id)).seq, dmRead.seq, "a DM stays unread");
+  assert.equal((await cursorOf(dmThread.id)).seq, dmThreadRead.seq, "a thread in a DM stays unread");
+  assert.deepEqual(await cursorOf(current.id), currentBefore, "a conversation already read is not touched");
+
+  // Raise-only and idempotent: a second pass finds nothing left to settle.
+  assert.deepEqual(await settleMigratedAgentReadBacklog(db, agent.id), { conversations: 0, messages: 0, keptConversations: 3 });
 });

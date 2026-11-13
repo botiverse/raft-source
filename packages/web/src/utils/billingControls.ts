@@ -1,5 +1,7 @@
 import type { MessageId } from "../i18n/messages";
 export interface BillingControlsStateInput {
+  source?: "server" | "subscription" | "appsumo" | "prepaid";
+  appsumoBillingReserved?: boolean;
   plan?: string | null;
   subscriptionStatus?: "active" | "past_due" | "canceled" | "incomplete" | null;
 }
@@ -174,12 +176,14 @@ export function getSettingsBillingPlanPresentation(
 }
 
 export function getBillingControlsState(input: BillingControlsStateInput): BillingControlsState {
-  const hasInternalEntitlement = isInternalBillingPlan(input.plan);
-  const hasEntitlingSubscription = !hasInternalEntitlement && (input.subscriptionStatus === "active" || input.subscriptionStatus === "past_due");
+  // Prepaid Pro (task #19) is renewed, never changed in Stripe or put under a subscription.
+  const isPrepaid = input.source === "prepaid";
+  const hasInternalEntitlement = isInternalBillingPlan(input.plan) || input.source === "appsumo" || input.appsumoBillingReserved === true;
+  const hasEntitlingSubscription = !hasInternalEntitlement && !isPrepaid && (input.subscriptionStatus === "active" || input.subscriptionStatus === "past_due");
   const hasProProjection = input.plan === "pro";
   return {
     hasEntitlingSubscription,
-    canCheckout: !hasEntitlingSubscription && !hasInternalEntitlement,
+    canCheckout: !hasEntitlingSubscription && !hasInternalEntitlement && !isPrepaid,
     canUpdatePacks: hasEntitlingSubscription && hasProProjection,
     canOpenPortal: hasEntitlingSubscription,
   };

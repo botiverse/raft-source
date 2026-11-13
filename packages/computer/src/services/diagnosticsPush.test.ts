@@ -43,7 +43,7 @@ async function seedUserSession(home: string): Promise<void> {
   );
 }
 
-async function seedAttachment(home: string, serverId: string, apiKey: string): Promise<void> {
+async function seedAttachment(home: string, serverId: string, apiKey: string, serverUrl = "http://localhost:9999"): Promise<void> {
   const serverDir = path.join(home, "computer", "servers", serverId);
   await mkdir(serverDir, { recursive: true, mode: 0o700 });
   await writeFile(
@@ -52,7 +52,7 @@ async function seedAttachment(home: string, serverId: string, apiKey: string): P
       kind: "computer-attachment",
       serverId,
       apiKey,
-      serverUrl: "http://localhost:9999",
+      serverUrl,
       serverMachineId: "smid-" + serverId,
     }),
     { mode: 0o600 },
@@ -61,8 +61,8 @@ async function seedAttachment(home: string, serverId: string, apiKey: string): P
 
 /** Attachment + a live runner pidfile (our own pid) so the running-runner gate
  *  treats it as a runner whose uploader is alive. */
-async function seedRunningRunner(home: string, serverId: string, apiKey: string): Promise<void> {
-  await seedAttachment(home, serverId, apiKey);
+async function seedRunningRunner(home: string, serverId: string, apiKey: string, serverUrl?: string): Promise<void> {
+  await seedAttachment(home, serverId, apiKey, serverUrl);
   await writeFile(
     path.join(home, "computer", "servers", serverId, "runner.pid"),
     String(process.pid),
@@ -285,6 +285,93 @@ test("diagnosticsPush: UPLOAD_DISABLED when RAFT_COMPUTER_LOCAL_TRACE=0", async 
       else process.env.RAFT_COMPUTER_LOCAL_TRACE = prev;
     }
   });
+});
+
+test("diagnosticsPush: UPLOAD_DISABLED under RAFT_PRIVACY_MODE, no marker and no forced upload", async () => {
+  await withHome(async (home) => {
+    await seedUserSession(home);
+    await seedRunningRunner(home, randomUUID(), "sk_computer_abc");
+    const prev = process.env.RAFT_PRIVACY_MODE;
+    process.env.RAFT_PRIVACY_MODE = "on";
+    let calls = 0;
+    try {
+      const r = await diagnosticsPush({ slockHome: home }, {
+        forceUploadNow: true,
+        fetchImpl: async () => { calls += 1; return new Response("{}"); },
+      });
+      assert.equal(r.status, "failed");
+      if (r.status !== "failed") return;
+      assert.equal(r.reason, "UPLOAD_DISABLED");
+      assert.equal(calls, 0);
+    } finally {
+      if (prev === undefined) delete process.env.RAFT_PRIVACY_MODE;
+      else process.env.RAFT_PRIVACY_MODE = prev;
+    }
+  });
+});
+
+test("diagnosticsPush: an invalid RAFT_PRIVACY_MODE is a result (UPLOAD_DISABLED), never a throw", async () => {
+  await withHome(async (home) => {
+    await seedUserSession(home);
+    await seedRunningRunner(home, randomUUID(), "sk_computer_abc");
+    const prev = process.env.RAFT_PRIVACY_MODE;
+    process.env.RAFT_PRIVACY_MODE = "sometimes";
+    try {
+      const r = await diagnosticsPush({ slockHome: home });
+      assert.equal(r.status, "failed");
+      if (r.status !== "failed") return;
+      assert.equal(r.reason, "UPLOAD_DISABLED");
+    } finally {
+      if (prev === undefined) delete process.env.RAFT_PRIVACY_MODE;
+      else process.env.RAFT_PRIVACY_MODE = prev;
+    }
+  });
+});
+
+/** A forced upload with the receiver chosen by the daemon's rule (no workerUrl override, no env URL). */
+async function forcedUploadUrls(serverUrl: string): Promise<{ result: Awaited<ReturnType<typeof diagnosticsPush>>; urls: string[] }> {
+  const saved = { url: process.env.SLOCK_DAEMON_TRACE_UPLOAD_URL, disabled: process.env.SLOCK_DAEMON_TRACE_UPLOAD_DISABLED };
+  delete process.env.SLOCK_DAEMON_TRACE_UPLOAD_URL;
+  delete process.env.SLOCK_DAEMON_TRACE_UPLOAD_DISABLED;
+  try {
+    return await withHome(async (home) => {
+      await seedUserSession(home);
+      await seedRunningRunner(home, randomUUID(), "sk_computer_receiver", serverUrl);
+      const urls: string[] = [];
+      const result = await diagnosticsPush({ slockHome: home }, {
+        forceUploadNow: true,
+        privacyMode: false,
+        fetchImpl: async (input) => {
+          urls.push(String(input));
+          if (String(input).endsWith("/scope-attestation")) return Response.json({ attestation: "att" });
+          return new Response("unavailable", { status: 503 });
+        },
+      });
+      return { result, urls };
+    });
+  } finally {
+    if (saved.url === undefined) delete process.env.SLOCK_DAEMON_TRACE_UPLOAD_URL;
+    else process.env.SLOCK_DAEMON_TRACE_UPLOAD_URL = saved.url;
+    if (saved.disabled === undefined) delete process.env.SLOCK_DAEMON_TRACE_UPLOAD_DISABLED;
+    else process.env.SLOCK_DAEMON_TRACE_UPLOAD_DISABLED = saved.disabled;
+  }
+}
+
+test("diagnosticsPush: a forced upload for a self-hosted server's attachment uploads nowhere by default", async () => {
+  const { result, urls } = await forcedUploadUrls("https://raft.example.org");
+  assert.equal(result.status, "failed");
+  if (result.status !== "failed") return;
+  assert.equal(result.reason, "UPLOAD_DISABLED");
+  assert.deepEqual(urls, []);
+});
+
+test("diagnosticsPush: a forced upload for a Raft server's attachment still goes to Raft's receiver", async () => {
+  const { urls } = await forcedUploadUrls("https://api.raft.build");
+  // Attestation from the attachment's own server, then Raft's receiver (its 503 ends it).
+  assert.deepEqual(urls, [
+    "https://api.raft.build/internal/machine/scope-attestation",
+    "https://slock-trace-upload.botiverse.dev/api/trace-bundles",
+  ]);
 });
 
 test("diagnosticsPush: OFFLINE when no user session AND no attachments", async () => {

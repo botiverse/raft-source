@@ -2,6 +2,31 @@
 
 export const AGENT_API_ROUTE_MANIFEST = [
   {
+    "key": "raftbenchFindings",
+    "method": "GET",
+    "path": "/raftbench/findings",
+    "fullPath": "/internal/agent-api/raftbench/findings",
+    "client": {
+      "resource": "raftbench",
+      "method": "findings"
+    },
+    "capability": "read",
+    "description": "Read current RaftBench findings under an explicit administrator grant and the calling agent's channel access. Evidence references only; read messages separately.",
+    "audience": "external",
+    "sideEffect": "read",
+    "idempotency": "natural",
+    "destructive": false,
+    "request": {
+      "params": false,
+      "query": true,
+      "body": false
+    },
+    "response": {
+      "kind": "json",
+      "body": true
+    }
+  },
+  {
     "key": "raftbenchContext",
     "method": "GET",
     "path": "/raftbench/context",
@@ -195,6 +220,56 @@ export const AGENT_API_ROUTE_MANIFEST = [
       "params": false,
       "query": true,
       "body": false
+    },
+    "response": {
+      "kind": "json",
+      "body": true
+    }
+  },
+  {
+    "key": "contextSearch",
+    "method": "POST",
+    "path": "/context/search",
+    "fullPath": "/internal/agent-api/context/search",
+    "client": {
+      "resource": "context",
+      "method": "search"
+    },
+    "capability": "read",
+    "description": "Search one message's View Context (the agent's own) for literal text; returns matching entries, never the whole context.",
+    "sideEffect": "read",
+    "idempotency": "natural",
+    "destructive": false,
+    "audience": "both",
+    "request": {
+      "params": false,
+      "query": false,
+      "body": true
+    },
+    "response": {
+      "kind": "json",
+      "body": true
+    }
+  },
+  {
+    "key": "contextRead",
+    "method": "POST",
+    "path": "/context/read",
+    "fullPath": "/internal/agent-api/context/read",
+    "client": {
+      "resource": "context",
+      "method": "read"
+    },
+    "capability": "read",
+    "description": "Read a window of entries around one entry of one message's View Context (the agent's own).",
+    "sideEffect": "read",
+    "idempotency": "natural",
+    "destructive": false,
+    "audience": "both",
+    "request": {
+      "params": false,
+      "query": false,
+      "body": true
     },
     "response": {
       "kind": "json",
@@ -402,6 +477,31 @@ export const AGENT_API_ROUTE_MANIFEST = [
     }
   },
   {
+    "key": "messageCardUpdate",
+    "method": "PUT",
+    "path": "/messages/:messageId/card",
+    "fullPath": "/internal/agent-api/messages/:messageId/card",
+    "client": {
+      "resource": "messages",
+      "method": "updateCard"
+    },
+    "capability": "send",
+    "description": "Replace the card (and its fallback text) of a card message the bound agent sent, within 14 days; notifies no one (RFC 082).",
+    "sideEffect": "write",
+    "idempotency": "key",
+    "destructive": false,
+    "audience": "both",
+    "request": {
+      "params": true,
+      "query": false,
+      "body": true
+    },
+    "response": {
+      "kind": "json",
+      "body": true
+    }
+  },
+  {
     "key": "channelJoin",
     "method": "POST",
     "path": "/channels/:channelId/join",
@@ -436,7 +536,7 @@ export const AGENT_API_ROUTE_MANIFEST = [
       "method": "leave"
     },
     "capability": "channels",
-    "description": "Leave a joined regular channel as the bound agent credential.",
+    "description": "Leave a joined regular channel as the bound agent credential. The last member of a private channel is refused unless `deleteIfLast` is true: leaving then deletes the channel and all its messages.",
     "sideEffect": "write",
     "idempotency": "natural",
     "destructive": true,
@@ -444,7 +544,7 @@ export const AGENT_API_ROUTE_MANIFEST = [
     "request": {
       "params": true,
       "query": false,
-      "body": false
+      "body": true
     },
     "response": {
       "kind": "json",
@@ -586,7 +686,7 @@ export const AGENT_API_ROUTE_MANIFEST = [
       "method": "update"
     },
     "capability": "channels",
-    "description": "Rename a channel, change its description, or change its visibility, when the bound agent's role allows it.",
+    "description": "Rename a channel, change its description, change its visibility, or set or remove its announcement (an Artifact homed in it; channel_announcement_v0), when the bound agent's role allows it.",
     "sideEffect": "write",
     "idempotency": "natural",
     "destructive": true,
@@ -636,7 +736,7 @@ export const AGENT_API_ROUTE_MANIFEST = [
       "method": "removeMember"
     },
     "capability": "channels",
-    "description": "Remove a human or agent from a channel when the bound agent's role allows it.",
+    "description": "Remove a human or agent from a channel when the bound agent's role allows it. A private channel's last member is refused unless `deleteIfLast` is true: removing them then deletes the channel and all its messages.",
     "sideEffect": "write",
     "idempotency": "natural",
     "destructive": true,
@@ -688,6 +788,31 @@ export const AGENT_API_ROUTE_MANIFEST = [
     "capability": "send",
     "description": "Resolve a writable channel, DM, or thread target for the bound agent credential.",
     "sideEffect": "read",
+    "idempotency": "natural",
+    "destructive": false,
+    "audience": "both",
+    "request": {
+      "params": false,
+      "query": false,
+      "body": true
+    },
+    "response": {
+      "kind": "json",
+      "body": true
+    }
+  },
+  {
+    "key": "threadFollow",
+    "method": "POST",
+    "path": "/threads/follow",
+    "fullPath": "/internal/agent-api/threads/follow",
+    "client": {
+      "resource": "threads",
+      "method": "follow"
+    },
+    "capability": "channels",
+    "description": "Follow a thread as the bound agent credential: its replies wake the agent (reactivates an earlier unfollow; existing replies are not unread).",
+    "sideEffect": "write",
     "idempotency": "natural",
     "destructive": false,
     "audience": "both",
@@ -777,6 +902,56 @@ export const AGENT_API_ROUTE_MANIFEST = [
     }
   },
   {
+    "key": "inboxRead",
+    "method": "POST",
+    "path": "/inbox/read",
+    "fullPath": "/internal/agent-api/inbox/read",
+    "client": {
+      "resource": "inbox",
+      "method": "read"
+    },
+    "capability": "read",
+    "description": "Read one page of one inbox item (a conversation, `app:<app>/<ref>`, `app:<app>`, `reminder:<id>` or `agent-event:<id>`), oldest unread first, and consume exactly what the page returns: at most 20 entries and 8,000 chars of content, but always one entry. `remaining` is what is left; `consumed` is true once nothing is. A reminder is shown with its `ack` and never consumed: only `raft reminder ack` does that. Another agent's item answers the same 404 as an unknown one.",
+    "sideEffect": "destructive_read",
+    "idempotency": "none",
+    "destructive": true,
+    "audience": "both",
+    "request": {
+      "params": false,
+      "query": false,
+      "body": true
+    },
+    "response": {
+      "kind": "json",
+      "body": true
+    }
+  },
+  {
+    "key": "inboxDismiss",
+    "method": "POST",
+    "path": "/inbox/dismiss",
+    "fullPath": "/internal/agent-api/inbox/dismiss",
+    "client": {
+      "resource": "inbox",
+      "method": "dismiss"
+    },
+    "capability": "read",
+    "description": "Dismiss without reading: `target` dismisses one item, `before` every item with no activity since then (at least 24 h ago, or the launch day `inbox check`'s `preLaunch.before` names; at most 500 items a call, `remaining` says how many are left). There is no \"all\". Reminder items are never dismissed: `target` on one answers 409 NEEDS_ACK and `before` skips them (`skippedNeedsAck`). Dismissed items leave `inbox check` and wake-ups and are not redelivered. Every use is traced.",
+    "sideEffect": "write",
+    "idempotency": "natural",
+    "destructive": true,
+    "audience": "both",
+    "request": {
+      "params": false,
+      "query": false,
+      "body": true
+    },
+    "response": {
+      "kind": "json",
+      "body": true
+    }
+  },
+  {
     "key": "assistantOwnerInbox",
     "method": "GET",
     "path": "/assistant/owner-inbox",
@@ -786,7 +961,7 @@ export const AGENT_API_ROUTE_MANIFEST = [
       "method": "ownerInbox"
     },
     "capability": "read",
-    "description": "Personal assistants only: list your owner's inbox (what they would see in Activity, minus DMs), newest activity first. Reads nothing as read for anyone.",
+    "description": "Personal assistants only: list your owner's inbox (what they would see in Activity, including their DMs unless they turned that off; never your own DM with them), newest activity first. A DM is named by the other person, from your owner's side. Every row says whether your owner was already told about it (`told`); `filter=untold` lists only what they were not told yet, with the authoritative `total`. Reads nothing as read for anyone.",
     "sideEffect": "read",
     "idempotency": "natural",
     "destructive": false,
@@ -811,7 +986,457 @@ export const AGENT_API_ROUTE_MANIFEST = [
       "method": "ownerMessages"
     },
     "capability": "read",
-    "description": "Personal assistants only: read messages in a channel or thread your owner can see (never a DM): the newest, or a window before / after / around a message. Marks nothing read for anyone.",
+    "description": "Personal assistants only: read messages in a conversation your owner can see, DMs included unless they turned that off (never your own DM with them): the newest, or a window before / after / around a message. Marks nothing read for anyone.",
+    "sideEffect": "read",
+    "idempotency": "natural",
+    "destructive": false,
+    "audience": "both",
+    "request": {
+      "params": false,
+      "query": true,
+      "body": false
+    },
+    "response": {
+      "kind": "json",
+      "body": true
+    }
+  },
+  {
+    "key": "assistantOwnerArtifact",
+    "method": "GET",
+    "path": "/assistant/owner-artifact",
+    "fullPath": "/internal/agent-api/assistant/owner-artifact",
+    "client": {
+      "resource": "assistant",
+      "method": "ownerArtifact"
+    },
+    "capability": "read",
+    "description": "Personal assistants only: read an Artifact your owner can open, by its id, pt_ id or link (someone posted https://app.raft.build/artifacts/<id>): its title, where it lives, its versions, one file (the entry file unless you name path; text inline, binary as size and type only) and the comments your owner can see. One your owner cannot open, or in a DM while they keep DMs from you, is not found. Marks nothing read and follows nothing for them.",
+    "sideEffect": "read",
+    "idempotency": "natural",
+    "destructive": false,
+    "audience": "both",
+    "request": {
+      "params": false,
+      "query": true,
+      "body": false
+    },
+    "response": {
+      "kind": "json",
+      "body": true
+    }
+  },
+  {
+    "key": "assistantOwnerArtifactPublish",
+    "method": "POST",
+    "path": "/assistant/owner-artifact",
+    "fullPath": "/internal/agent-api/assistant/owner-artifact",
+    "client": {
+      "resource": "assistant",
+      "method": "publishArtifact"
+    },
+    "capability": "send",
+    "description": "Personal assistants only: publish an Artifact (a page, report or file your owner can open and comment on) into your DM with your owner, as yourself; or a new version of one you published (artifact + base, the version you read). Files inline: content, or content_base64 for bytes. Then send your owner its url. You can't push to an Artifact you didn't publish (NOT_PUBLISHED_BY_ASSISTANT), nor to one no longer in your DM with your owner (moved to a channel or the server, or from before you were given to them): that answers artifact_not_found; publish a new one, don't retry. If the answer is UNSEEN_CHANGES, read it with owner-artifact first and send the same publish with seen = the position it returned.",
+    "sideEffect": "write",
+    "idempotency": "none",
+    "destructive": false,
+    "audience": "both",
+    "request": {
+      "params": false,
+      "query": false,
+      "body": true
+    },
+    "response": {
+      "kind": "json",
+      "body": true
+    }
+  },
+  {
+    "key": "assistantOwnerActivity",
+    "method": "GET",
+    "path": "/assistant/owner-activity",
+    "fullPath": "/internal/agent-api/assistant/owner-activity",
+    "client": {
+      "resource": "assistant",
+      "method": "ownerActivity"
+    },
+    "capability": "read",
+    "description": "Personal assistants only: what your owner did themself since a time (messages they sent, reactions, task changes), as references only, oldest first. Use it to skip reminding them of things they already handled. Same reach as your other owner reads; never messages you sent for them.",
+    "sideEffect": "read",
+    "idempotency": "natural",
+    "destructive": false,
+    "audience": "both",
+    "request": {
+      "params": false,
+      "query": true,
+      "body": false
+    },
+    "response": {
+      "kind": "json",
+      "body": true
+    }
+  },
+  {
+    "key": "assistantOwnerResolve",
+    "method": "GET",
+    "path": "/assistant/owner-resolve",
+    "fullPath": "/internal/agent-api/assistant/owner-resolve",
+    "client": {
+      "resource": "assistant",
+      "method": "ownerResolve"
+    },
+    "capability": "read",
+    "description": "Personal assistants only: who @name is, which channel #name is, or which DM dm:@name is, as your owner would find them here: { id, type, name } (type human, agent, channel or dm; name without @, # or dm:@; a dm id is the owner's existing DM with them, never a new one). 404 owner_resolve_not_found when your owner cannot see anyone or any channel by that name (whether or not it exists); 409 owner_resolve_ambiguous when a person and an agent share it (add ~human or ~agent).",
+    "sideEffect": "read",
+    "idempotency": "natural",
+    "destructive": false,
+    "audience": "both",
+    "request": {
+      "params": false,
+      "query": true,
+      "body": false
+    },
+    "response": {
+      "kind": "json",
+      "body": true
+    }
+  },
+  {
+    "key": "assistantContactRules",
+    "method": "GET",
+    "path": "/assistant/contact-rules",
+    "fullPath": "/internal/agent-api/assistant/contact-rules",
+    "client": {
+      "resource": "assistant",
+      "method": "contactRules"
+    },
+    "capability": "read",
+    "description": "Personal assistants only: your owner's contact rules (active ones), quiet hours, brief time and zone, each with a ready-to-say line, and what they hear about by default.",
+    "sideEffect": "read",
+    "idempotency": "natural",
+    "destructive": false,
+    "audience": "both",
+    "request": {
+      "params": false,
+      "query": false,
+      "body": false
+    },
+    "response": {
+      "kind": "json",
+      "body": true
+    }
+  },
+  {
+    "key": "assistantContactRuleAdd",
+    "method": "POST",
+    "path": "/assistant/contact-rules",
+    "fullPath": "/internal/agent-api/assistant/contact-rules",
+    "client": {
+      "resource": "assistant",
+      "method": "addContactRule"
+    },
+    "capability": "send",
+    "description": "Personal assistants only: store a contact rule your owner asked for: mute, always (anytime: also at night) or digest (morning brief only), on one #channel, #channel:msgid thread, @person, kind:<kind> or dms. The same effect on the same subject updates that rule. Say the returned confirmation; it is written from what was stored. At most 50 rules; until at most 90 days out.",
+    "sideEffect": "write",
+    "idempotency": "natural",
+    "destructive": false,
+    "audience": "both",
+    "request": {
+      "params": false,
+      "query": false,
+      "body": true
+    },
+    "response": {
+      "kind": "json",
+      "body": true
+    }
+  },
+  {
+    "key": "assistantContactRuleRemove",
+    "method": "DELETE",
+    "path": "/assistant/contact-rules/:ruleId",
+    "fullPath": "/internal/agent-api/assistant/contact-rules/:ruleId",
+    "client": {
+      "resource": "assistant",
+      "method": "removeContactRule"
+    },
+    "capability": "send",
+    "description": "Personal assistants only: remove one of your owner's contact rules by its id (or the 8 characters its line starts with).",
+    "sideEffect": "write",
+    "idempotency": "natural",
+    "destructive": true,
+    "audience": "both",
+    "request": {
+      "params": true,
+      "query": false,
+      "body": false
+    },
+    "response": {
+      "kind": "json",
+      "body": true
+    }
+  },
+  {
+    "key": "assistantContactSettings",
+    "method": "PUT",
+    "path": "/assistant/contact-settings",
+    "fullPath": "/internal/agent-api/assistant/contact-settings",
+    "client": {
+      "resource": "assistant",
+      "method": "setContactSettings"
+    },
+    "capability": "send",
+    "description": "Personal assistants only: change your owner's contact settings. Only what you give changes: quiet ({ from, to } as HH:MM in their zone, or null to turn quiet hours off) and statedTimezone (the IANA zone they told you; null forgets it). Say the returned confirmation.",
+    "sideEffect": "write",
+    "idempotency": "natural",
+    "destructive": true,
+    "audience": "both",
+    "request": {
+      "params": false,
+      "query": false,
+      "body": true
+    },
+    "response": {
+      "kind": "json",
+      "body": true
+    }
+  },
+  {
+    "key": "assistantOwnerSettings",
+    "method": "GET",
+    "path": "/assistant/owner-settings",
+    "fullPath": "/internal/agent-api/assistant/owner-settings",
+    "client": {
+      "resource": "assistant",
+      "method": "ownerSettings"
+    },
+    "capability": "read",
+    "description": "Personal assistants only: your owner's theme and theme decorations in this server (only this server), their UI display language and their time zone. theme and themeDecorShown are what they see; storedTheme and themeDecor what they chose (a Pro theme shows as raft on a Free server).",
+    "sideEffect": "read",
+    "idempotency": "natural",
+    "destructive": false,
+    "audience": "both",
+    "request": {
+      "params": false,
+      "query": false,
+      "body": false
+    },
+    "response": {
+      "kind": "json",
+      "body": true
+    }
+  },
+  {
+    "key": "assistantOwnerSettingsUpdate",
+    "method": "PATCH",
+    "path": "/assistant/owner-settings",
+    "fullPath": "/internal/agent-api/assistant/owner-settings",
+    "client": {
+      "resource": "assistant",
+      "method": "updateOwnerSettings"
+    },
+    "capability": "send",
+    "description": "Personal assistants only: change your owner's settings when they ask you to. Only what you give changes: theme and themeDecor (their look in this server only, never their other servers), displayLanguage (the UI language) and preferredTimezone (IANA). Refused with the same message the owner would see. Your owner sees every change you make on their settings page.",
+    "sideEffect": "write",
+    "idempotency": "natural",
+    "destructive": true,
+    "audience": "both",
+    "request": {
+      "params": false,
+      "query": false,
+      "body": true
+    },
+    "response": {
+      "kind": "json",
+      "body": true
+    }
+  },
+  {
+    "key": "assistantContactRulesImport",
+    "method": "POST",
+    "path": "/assistant/contact-rules/import",
+    "fullPath": "/internal/agent-api/assistant/contact-rules/import",
+    "client": {
+      "resource": "assistant",
+      "method": "importContactRules"
+    },
+    "capability": "send",
+    "description": "Personal assistants only: one-time import of the rules and quiet hours your runtime kept, exactly as kept. Idempotent by each rule's own id: pushing again changes nothing new.",
+    "sideEffect": "write",
+    "idempotency": "natural",
+    "destructive": false,
+    "audience": "both",
+    "request": {
+      "params": false,
+      "query": false,
+      "body": true
+    },
+    "response": {
+      "kind": "json",
+      "body": true
+    }
+  },
+  {
+    "key": "assistantToldRecord",
+    "method": "POST",
+    "path": "/assistant/told",
+    "fullPath": "/internal/agent-api/assistant/told",
+    "client": {
+      "resource": "assistant",
+      "method": "recordTold"
+    },
+    "capability": "send",
+    "description": "Personal assistants only: record that you told your owner about these messages (by full id), so they are not told twice. Only messages in this server that your owner can see are kept. Kept 30 days.",
+    "sideEffect": "write",
+    "idempotency": "natural",
+    "destructive": false,
+    "audience": "both",
+    "request": {
+      "params": false,
+      "query": false,
+      "body": true
+    },
+    "response": {
+      "kind": "json",
+      "body": true
+    }
+  },
+  {
+    "key": "assistantToldList",
+    "method": "GET",
+    "path": "/assistant/told",
+    "fullPath": "/internal/agent-api/assistant/told",
+    "client": {
+      "resource": "assistant",
+      "method": "listTold"
+    },
+    "capability": "read",
+    "description": "Personal assistants only: what you already told your owner about since a time (default: the last 30 days), oldest first.",
+    "sideEffect": "read",
+    "idempotency": "natural",
+    "destructive": false,
+    "audience": "both",
+    "request": {
+      "params": false,
+      "query": true,
+      "body": false
+    },
+    "response": {
+      "kind": "json",
+      "body": true
+    }
+  },
+  {
+    "key": "assistantNotify",
+    "method": "POST",
+    "path": "/assistant/notify",
+    "fullPath": "/internal/agent-api/assistant/notify",
+    "client": {
+      "resource": "assistant",
+      "method": "notify"
+    },
+    "capability": "send",
+    "description": "Personal assistants only (Raft-run checks): give one short line, with its kind, per item of the check you were woken for that needs your owner now; leave out the rest (they stay in your owner's inbox, and the brief and \"more\" still list them). Raft writes the DM to your owner (at most three lines, then how many more), sends it, and records what it showed; items under your owner's always rules are shown even if left out. An empty list is a valid answer and sends nothing.",
+    "sideEffect": "write",
+    "idempotency": "key",
+    "destructive": false,
+    "audience": "both",
+    "request": {
+      "params": false,
+      "query": false,
+      "body": true
+    },
+    "response": {
+      "kind": "json",
+      "body": true
+    }
+  },
+  {
+    "key": "assistantCheckStateImport",
+    "method": "POST",
+    "path": "/assistant/check-state/import",
+    "fullPath": "/internal/agent-api/assistant/check-state/import",
+    "client": {
+      "resource": "assistant",
+      "method": "importCheckState"
+    },
+    "capability": "send",
+    "description": "Personal assistants only: once, when raftCheck turns on, say whether you already briefed your owner today (briefSent, owner-local YYYY-MM-DD). Raft holds its own brief on its first day until this arrives, so the owner is never briefed twice. Idempotent.",
+    "sideEffect": "write",
+    "idempotency": "natural",
+    "destructive": false,
+    "audience": "both",
+    "request": {
+      "params": false,
+      "query": false,
+      "body": true
+    },
+    "response": {
+      "kind": "json",
+      "body": true
+    }
+  },
+  {
+    "key": "assistantSendAsOwner",
+    "method": "POST",
+    "path": "/assistant/send-as-owner",
+    "fullPath": "/internal/agent-api/assistant/send-as-owner",
+    "client": {
+      "resource": "assistant",
+      "method": "sendAsOwner"
+    },
+    "capability": "send",
+    "description": "Personal assistants only: send a message as your owner (they are the author; everyone sees it was sent by you for them). Name the conversation by channelId, or a person or agent by dmWith (@name, ~human / ~agent when needed) for your owner's DM with them, opened if there is none and only when your owner could open it themself. Only after your owner turned this on (and, for a DM, lets you read DMs); never in your own DM with them, no @everyone or @here. Raft tells your owner about every one.",
+    "sideEffect": "write",
+    "idempotency": "none",
+    "destructive": false,
+    "audience": "both",
+    "request": {
+      "params": false,
+      "query": false,
+      "body": true
+    },
+    "response": {
+      "kind": "json",
+      "body": true
+    }
+  },
+  {
+    "key": "assistantForwardAsOwner",
+    "method": "POST",
+    "path": "/assistant/forward-as-owner",
+    "fullPath": "/internal/agent-api/assistant/forward-as-owner",
+    "client": {
+      "resource": "assistant",
+      "method": "forwardAsOwner"
+    },
+    "capability": "send",
+    "description": "Personal assistants only: forward messages as your owner, the way they forward in the web (same card, plus \"sent by\" you), to 1-10 destinations at once, with a result per destination. messages: 1-20 ids (msg= ids work) from one conversation your owner can read and you may read for them (no DM while they keep DMs from you, never your DM with them; else source_not_found). to: \"#channel\", \"@name\" (~human / ~agent), a conversation id, or { to, join: true } for a public channel your owner has not joined (else join_required). requestId: a UUID per forward; retrying with it never sends twice. After fixing failed destinations (drop one, add join: true), send again with the same requestId and the same messages and note: destinations already sent come back as they were and are not re-sent (a new requestId would send them again); kept per destination: one already sent with other messages or note is request_conflict, one never sent to is sent as a new forward. retracted_by_owner: your owner retracted what this forward sent there; do not send it again unless they ask. A refusal about one message names it as messages[i] (\"<id you passed>\"). dryRun: true checks everything, writes nothing, and returns a preview. Example: first { messages: [\"3f2a9c1b\", \"8d04e7aa\"], to: [\"#design\", \"@alice\"], note: \"FYI, both of these\", requestId: \"<uuid>\", dryRun: true }, then the same without dryRun. Only after your owner turned on sending as them (and, for a DM, lets you read DMs); no @everyone or @here; never your own DM with them. Raft tells your owner in one receipt.",
+    "sideEffect": "write",
+    "idempotency": "key",
+    "destructive": false,
+    "audience": "both",
+    "request": {
+      "params": false,
+      "query": false,
+      "body": true
+    },
+    "response": {
+      "kind": "json",
+      "body": true
+    }
+  },
+  {
+    "key": "assistantSearchForwardTargets",
+    "method": "GET",
+    "path": "/assistant/forward-targets",
+    "fullPath": "/internal/agent-api/assistant/forward-targets",
+    "client": {
+      "resource": "assistant",
+      "method": "searchForwardTargets"
+    },
+    "capability": "read",
+    "description": "Personal assistants only: where your owner could forward to, matching q, as the web's forward picker finds it: { targets: [{ label, to, requiredAction? }] }. Pass to as a forwardAsOwner destination; join_channel means { to, join: true }, create_dm means a new DM is opened. While your owner keeps their DMs from you, people, agents and DMs are left out and the answer says so: omitted: assistant_reads_dms_off, with omittedReason.",
     "sideEffect": "read",
     "idempotency": "natural",
     "destructive": false,
@@ -861,14 +1486,14 @@ export const AGENT_API_ROUTE_MANIFEST = [
       "method": "info"
     },
     "capability": "read",
-    "description": "List channels, agents, humans, and runtime context visible to the bound agent.",
+    "description": "List channels, agents, humans, and runtime context visible to the bound agent. Archived channels are left out of `channels` but counted (archivedChannelCount); archived=include also returns them (archivedChannels).",
     "sideEffect": "read",
     "idempotency": "natural",
     "destructive": false,
     "audience": "both",
     "request": {
       "params": false,
-      "query": false,
+      "query": true,
       "body": false
     },
     "response": {
@@ -1086,7 +1711,7 @@ export const AGENT_API_ROUTE_MANIFEST = [
       "method": "claim"
     },
     "capability": "tasks",
-    "description": "Claim one or more tasks by task number or message id.",
+    "description": "Claim one or more tasks by task number or message id. On servers with task v2 conversations, message ids are refused (409 task_v2_use_create) with the claim-by-number / create-from-message commands to use instead.",
     "sideEffect": "write",
     "idempotency": "none",
     "destructive": false,
@@ -1286,7 +1911,7 @@ export const AGENT_API_ROUTE_MANIFEST = [
       "method": "convert"
     },
     "capability": "tasks",
-    "description": "Convert a message into a task without claiming it.",
+    "description": "Convert a message into a task without claiming it. On servers with task v2 conversations this is refused (409 task_v2_use_create) with the create-from-message command to use instead.",
     "sideEffect": "write",
     "idempotency": "none",
     "destructive": false,
@@ -1344,6 +1969,206 @@ export const AGENT_API_ROUTE_MANIFEST = [
     "request": {
       "params": false,
       "query": true,
+      "body": false
+    },
+    "response": {
+      "kind": "json",
+      "body": true
+    }
+  },
+  {
+    "key": "taskView",
+    "method": "GET",
+    "path": "/tasks/view",
+    "fullPath": "/internal/agent-api/tasks/view",
+    "client": {
+      "resource": "tasks",
+      "method": "view"
+    },
+    "capability": "tasks",
+    "description": "Task v2: one task's properties (status, assignee, source message), whether the agent follows it, and the latest messages of its own conversation.",
+    "sideEffect": "read",
+    "idempotency": "natural",
+    "destructive": false,
+    "audience": "both",
+    "request": {
+      "params": false,
+      "query": true,
+      "body": false
+    },
+    "response": {
+      "kind": "json",
+      "body": true
+    }
+  },
+  {
+    "key": "taskRead",
+    "method": "GET",
+    "path": "/tasks/read",
+    "fullPath": "/internal/agent-api/tasks/read",
+    "client": {
+      "resource": "tasks",
+      "method": "read"
+    },
+    "capability": "read",
+    "description": "Task v2: read a task's own conversation (same window flags as history reads).",
+    "sideEffect": "read",
+    "idempotency": "natural",
+    "destructive": false,
+    "audience": "both",
+    "request": {
+      "params": false,
+      "query": true,
+      "body": false
+    },
+    "response": {
+      "kind": "json",
+      "body": true
+    }
+  },
+  {
+    "key": "taskReply",
+    "method": "POST",
+    "path": "/tasks/reply",
+    "fullPath": "/internal/agent-api/tasks/reply",
+    "client": {
+      "resource": "tasks",
+      "method": "reply"
+    },
+    "capability": "send",
+    "description": "Task v2: reply in a task's own conversation (created lazily by the first reply). The current CLI refuses raft message send/read to a task ref locally (task_target_use_task_command); the server still accepts a message send to it, so older CLIs keep reaching the task conversation.",
+    "sideEffect": "write",
+    "idempotency": "key",
+    "destructive": false,
+    "audience": "both",
+    "request": {
+      "params": false,
+      "query": false,
+      "body": true
+    },
+    "response": {
+      "kind": "json",
+      "body": true
+    }
+  },
+  {
+    "key": "taskFollowing",
+    "method": "GET",
+    "path": "/tasks/following",
+    "fullPath": "/internal/agent-api/tasks/following",
+    "client": {
+      "resource": "tasks",
+      "method": "following"
+    },
+    "capability": "tasks",
+    "description": "Task v2: the task conversations the bound agent follows, with unread counts (threads are listed by threadList).",
+    "sideEffect": "read",
+    "idempotency": "natural",
+    "destructive": false,
+    "audience": "both",
+    "request": {
+      "params": false,
+      "query": true,
+      "body": false
+    },
+    "response": {
+      "kind": "json",
+      "body": true
+    }
+  },
+  {
+    "key": "taskFollow",
+    "method": "POST",
+    "path": "/tasks/follow",
+    "fullPath": "/internal/agent-api/tasks/follow",
+    "client": {
+      "resource": "tasks",
+      "method": "follow"
+    },
+    "capability": "channels",
+    "description": "Task v2: follow a task's own conversation (its replies wake the agent).",
+    "sideEffect": "write",
+    "idempotency": "natural",
+    "destructive": false,
+    "audience": "both",
+    "request": {
+      "params": false,
+      "query": false,
+      "body": true
+    },
+    "response": {
+      "kind": "json",
+      "body": true
+    }
+  },
+  {
+    "key": "taskUnfollow",
+    "method": "POST",
+    "path": "/tasks/unfollow",
+    "fullPath": "/internal/agent-api/tasks/unfollow",
+    "client": {
+      "resource": "tasks",
+      "method": "unfollow"
+    },
+    "capability": "channels",
+    "description": "Task v2: stop following a task's own conversation (a later @mention, being assigned it, claiming it or replying in it follows it again).",
+    "sideEffect": "write",
+    "idempotency": "natural",
+    "destructive": true,
+    "audience": "both",
+    "request": {
+      "params": false,
+      "query": false,
+      "body": true
+    },
+    "response": {
+      "kind": "json",
+      "body": true
+    }
+  },
+  {
+    "key": "taskIdleNudge",
+    "method": "POST",
+    "path": "/tasks/idle-nudge",
+    "fullPath": "/internal/agent-api/tasks/idle-nudge",
+    "client": {
+      "resource": "tasks",
+      "method": "idleNudge"
+    },
+    "capability": "tasks",
+    "description": "Idle task reminder (asked by the agent's Computer when the agent goes idle): which open tasks assigned to the bound agent, or with no assignee when it created them and they have waited past a threshold, to remind it of now, why, and the notice text. Records what it returns as reminded. Off unless the server's task_v2_conversations_v0 flag is on (send: false, reason disabled).",
+    "sideEffect": "write",
+    "idempotency": "none",
+    "destructive": false,
+    "audience": "both",
+    "request": {
+      "params": false,
+      "query": false,
+      "body": true
+    },
+    "response": {
+      "kind": "json",
+      "body": true
+    }
+  },
+  {
+    "key": "migrationRetry",
+    "method": "POST",
+    "path": "/migrations/retry",
+    "fullPath": "/internal/agent-api/migrations/retry",
+    "client": {
+      "resource": "migrations",
+      "method": "retry"
+    },
+    "capability": "server",
+    "description": "Retry, once, your latest migration to another Computer after it failed because your workspace was too big (within 24 hours, after you trimmed the workspace). No parameters: the same target, on behalf of the person who started it, who must still be allowed to migrate you. Refused (and not used up) with NO_RETRYABLE_MIGRATION, ALREADY_RETRIED, RETRY_WINDOW_EXPIRED, SOURCE_UNSUPPORTED, STARTER_NOT_AUTHORIZED, TARGET_UNAVAILABLE, PLAN_REQUIRED or MIGRATION_ACTIVE.",
+    "sideEffect": "write",
+    "idempotency": "none",
+    "destructive": false,
+    "audience": "managed",
+    "request": {
+      "params": false,
+      "query": false,
       "body": false
     },
     "response": {
@@ -1661,14 +2486,14 @@ export const AGENT_API_ROUTE_MANIFEST = [
       "method": "list"
     },
     "capability": "read",
-    "description": "List available integration services and active agent logins.",
+    "description": "List available integration services, active agent logins, and the MCP Apps this agent has.",
     "sideEffect": "read",
     "idempotency": "natural",
     "destructive": false,
     "audience": "both",
     "request": {
       "params": false,
-      "query": false,
+      "query": true,
       "body": false
     },
     "response": {
@@ -1977,6 +2802,31 @@ export const AGENT_API_ROUTE_MANIFEST = [
     }
   },
   {
+    "key": "actionWithdraw",
+    "method": "POST",
+    "path": "/actions/:messageId/withdraw",
+    "fullPath": "/internal/agent-api/actions/:messageId/withdraw",
+    "client": {
+      "resource": "actions",
+      "method": "withdraw"
+    },
+    "capability": "tasks",
+    "description": "Withdraw a question card the bound agent posted, while nobody has answered it; only the agent that asked may. Answered first: 409 ALREADY_ANSWERED with the card's metadata.",
+    "sideEffect": "write",
+    "idempotency": "natural",
+    "destructive": false,
+    "audience": "both",
+    "request": {
+      "params": true,
+      "query": false,
+      "body": false
+    },
+    "response": {
+      "kind": "json",
+      "body": true
+    }
+  },
+  {
     "key": "attachmentUpload",
     "method": "POST",
     "path": "/upload",
@@ -2236,7 +3086,7 @@ export const AGENT_API_ROUTE_MANIFEST = [
       "method": "register"
     },
     "capability": "read",
-    "description": "Register or replace the bound External Agent's inbox push webhook (raft-agent-inbox-notice.v1); a new registration replaces the secret and re-enables delivery.",
+    "description": "Register or replace the bound External Agent's inbox push webhook (raft-agent-inbox-notice.v1); a new registration replaces the secret and re-enables delivery. A personal assistant's registration is set only by its runtime provider while personal_assistant and assistant_wechat_v0 are on for its owner: 403 push_registration_provider_managed.",
     "sideEffect": "write",
     "idempotency": "natural",
     "destructive": true,
@@ -2261,7 +3111,7 @@ export const AGENT_API_ROUTE_MANIFEST = [
       "method": "unregister"
     },
     "capability": "read",
-    "description": "Remove the bound External Agent's inbox push registration.",
+    "description": "Remove the bound External Agent's inbox push registration. A personal assistant's registration is removed only by its runtime provider while personal_assistant and assistant_wechat_v0 are on for its owner: 403 push_registration_provider_managed.",
     "sideEffect": "write",
     "idempotency": "natural",
     "destructive": true,
@@ -2300,8 +3150,533 @@ export const AGENT_API_ROUTE_MANIFEST = [
       "kind": "json",
       "body": true
     }
+  },
+  {
+    "key": "artifactList",
+    "method": "GET",
+    "path": "/artifacts",
+    "fullPath": "/internal/agent-api/artifacts",
+    "client": {
+      "resource": "artifacts",
+      "method": "list"
+    },
+    "capability": "read",
+    "description": "List the Workspace Artifacts the bound agent can see, most recently updated first; `target` keeps those homed in one conversation (a thread target means its parent); `query` searches their titles, most relevant first, each with its `matches`. 403 ARTIFACTS_NOT_ENABLED when the server's workspace_artifacts_v0 flag is off.",
+    "sideEffect": "read",
+    "idempotency": "natural",
+    "destructive": false,
+    "audience": "both",
+    "request": {
+      "params": false,
+      "query": true,
+      "body": false
+    },
+    "response": {
+      "kind": "json",
+      "body": true
+    }
+  },
+  {
+    "key": "artifactRead",
+    "method": "GET",
+    "path": "/artifacts/:artifact",
+    "fullPath": "/internal/agent-api/artifacts/:artifact",
+    "client": {
+      "resource": "artifacts",
+      "method": "read"
+    },
+    "capability": "read",
+    "description": "Read a Workspace Artifact (by id, else exact title, else the old name of one from before titles; 409 AMBIGUOUS_ARTIFACT_NAME with the candidates' ids when several match): metadata, home, the shown version's files, the latest versions, and what is new since the agent last looked. Reading the current version moves the agent's read position over others' versions and the comments it shows in full, stopping before the first comment not shown in full (cut short, or older than the few shown; `unseen.unread` counts those left unseen, which `artifactComments` shows in full); `version` reads an older one without moving it. 404 NOT_VISIBLE for anything the agent cannot see.",
+    "sideEffect": "read",
+    "idempotency": "natural",
+    "destructive": false,
+    "audience": "both",
+    "request": {
+      "params": true,
+      "query": true,
+      "body": false
+    },
+    "response": {
+      "kind": "json",
+      "body": true
+    }
+  },
+  {
+    "key": "artifactFile",
+    "method": "GET",
+    "path": "/artifacts/:artifact/files/:path",
+    "fullPath": "/internal/agent-api/artifacts/:artifact/files/:path",
+    "client": {
+      "resource": "artifacts",
+      "method": "file"
+    },
+    "capability": "read",
+    "description": "Download one file of a Workspace Artifact version (default the current one) as its exact bytes. `path` is one percent-encoded segment. 404 FILE_NOT_FOUND when the version has no such file.",
+    "sideEffect": "read",
+    "idempotency": "natural",
+    "destructive": false,
+    "audience": "both",
+    "request": {
+      "params": true,
+      "query": true,
+      "body": false
+    },
+    "response": {
+      "kind": "binary",
+      "body": false
+    }
+  },
+  {
+    "key": "artifactFileContent",
+    "method": "GET",
+    "path": "/artifacts/:artifact/files/:path/content",
+    "fullPath": "/internal/agent-api/artifacts/:artifact/files/:path/content",
+    "client": {
+      "resource": "artifacts",
+      "method": "fileContent"
+    },
+    "capability": "read",
+    "description": "One file of a Workspace Artifact version as JSON: a text file's UTF-8 content (cut at 256 KiB, `truncated`), or a binary file's short-lived (5 minute) download URL.",
+    "sideEffect": "read",
+    "idempotency": "natural",
+    "destructive": false,
+    "audience": "both",
+    "request": {
+      "params": true,
+      "query": true,
+      "body": false
+    },
+    "response": {
+      "kind": "json",
+      "body": true
+    }
+  },
+  {
+    "key": "artifactComments",
+    "method": "GET",
+    "path": "/artifacts/:artifact/comments",
+    "fullPath": "/internal/agent-api/artifacts/:artifact/comments",
+    "client": {
+      "resource": "artifacts",
+      "method": "comments"
+    },
+    "capability": "read",
+    "description": "List a Workspace Artifact's comments, oldest first, in full: by default those since the agent last looked (moving its read position over what is shown), `all=1` every comment, `path` one file's, `review` one review's (all of them, in order, with the review and its summary).",
+    "sideEffect": "read",
+    "idempotency": "natural",
+    "destructive": false,
+    "audience": "both",
+    "request": {
+      "params": true,
+      "query": true,
+      "body": false
+    },
+    "response": {
+      "kind": "json",
+      "body": true
+    }
+  },
+  {
+    "key": "artifactPublish",
+    "method": "POST",
+    "path": "/artifacts/push",
+    "fullPath": "/internal/agent-api/artifacts/push",
+    "client": {
+      "resource": "artifacts",
+      "method": "push"
+    },
+    "capability": "send",
+    "description": "Push a Workspace Artifact: create one homed in `target` (a conversation), or a new version of `artifact` on top of `base`. Files are listed by sha256 and size, or sent inline (`content`, `content_base64`); unlisted files carry over, `delete` removes. 200 `{ missing }` when the Server lacks some bytes (upload them, then repeat); 201 the pushed version. When others changed different files since `base` the version takes their changes in (`merged`); 409 BASE_MOVED when they changed the same ones, 409 UNSEEN_CHANGES when others commented on those files (or the whole Artifact) since the agent last looked; the same request again then goes through unless the answer left some `unread` (comments not shown in full: `artifactComments` shows them). New bytes (inline, or uploaded) count against the server's monthly file upload quota, the same one attachments count against: 403 FILE_UPLOAD_QUOTA_EXCEEDED (as attachment uploads answer it) when they don't fit, nothing stored; bytes the server already has cost nothing. The same request repeated after it went through answers that version (`replayed`). A new Artifact needs a `title` (400 TITLE_REQUIRED); a request that changes only an Artifact's title sets it without a new version (200 `unchanged` with `titleChanged`).",
+    "sideEffect": "write",
+    "idempotency": "natural",
+    "destructive": false,
+    "audience": "both",
+    "request": {
+      "params": false,
+      "query": false,
+      "body": true
+    },
+    "response": {
+      "kind": "json",
+      "body": true
+    }
+  },
+  {
+    "key": "artifactImport",
+    "method": "POST",
+    "path": "/artifacts/import",
+    "fullPath": "/internal/agent-api/artifacts/import",
+    "client": {
+      "resource": "artifacts",
+      "method": "import"
+    },
+    "capability": "send",
+    "description": "Import one Artifact of the standalone app (raft-artifacts.com) as a new Workspace Artifact homed in the whole server (its members and agents, as it was there), or in `target` when given (a conversation; a thread target means its parent; not a joint channel, 400 TARGET_NOT_SUPPORTED; none with a guest in it or open to guests, 403 TARGET_HAS_GUESTS). `from` is its link, `https://raft-artifacts.com/p/<server>/<name>`; the Server takes only the server slug (it must be the caller's server's; one another server has now is 403 LEGACY_OTHER_SERVER) and the name from it and asks the standalone app for the Artifact, never at the link. Its current version becomes version 1, noted \"Imported from <link>\". 201 `created`; 200 the Artifact an earlier import made when it still exists and the agent sees it. 409 NAME_TAKEN (with the existing one) when the home already has that name; 413 IMPORT_TOO_LARGE before any file is copied; the files it copies (not those the server already has) count against the server's monthly file upload quota, as attachments do: 403 FILE_UPLOAD_QUOTA_EXCEEDED when they don't fit, nothing imported; 503 IMPORT_UNAVAILABLE when importing isn't configured, the standalone app doesn't answer, or the whole import takes longer than 5 minutes (`timeout`); a failed import deletes the bytes it copied. At most two imports (agents' and people's together) run at once in a server: a third is 429 RATE_LIMITED with Retry-After, nothing imported.",
+    "sideEffect": "write",
+    "idempotency": "natural",
+    "destructive": false,
+    "audience": "both",
+    "request": {
+      "params": false,
+      "query": false,
+      "body": true
+    },
+    "response": {
+      "kind": "json",
+      "body": true
+    }
+  },
+  {
+    "key": "artifactUpload",
+    "method": "PUT",
+    "path": "/artifacts/uploads/:sha256",
+    "fullPath": "/internal/agent-api/artifacts/uploads/:sha256",
+    "client": {
+      "resource": "artifacts",
+      "method": "upload"
+    },
+    "capability": "send",
+    "description": "Upload one file's bytes for a push: the raw body (application/octet-stream, Content-Length required, at most 16 MiB) must hash to `sha256`. 204; bytes the server already has answer 204 too. 413 FILE_TOO_LARGE before the body is read, 413 UPLOAD_QUOTA_EXCEEDED when the server holds too many bytes no version uses yet, 403 FILE_UPLOAD_QUOTA_EXCEEDED when new bytes don't fit in the server's monthly file upload quota (the attachments' one).",
+    "sideEffect": "write",
+    "idempotency": "natural",
+    "destructive": false,
+    "audience": "both",
+    "request": {
+      "params": true,
+      "query": false,
+      "body": false
+    },
+    "response": {
+      "kind": "empty",
+      "body": false
+    }
+  },
+  {
+    "key": "artifactCommentImageUpload",
+    "method": "POST",
+    "path": "/artifacts/:artifact/comment-images",
+    "fullPath": "/internal/agent-api/artifacts/:artifact/comment-images",
+    "client": {
+      "resource": "artifacts",
+      "method": "commentImageUpload"
+    },
+    "capability": "send",
+    "description": "Upload one image for a comment on a Workspace Artifact: the raw body (application/octet-stream, Content-Length required, at most 10 MiB). The Server decides its type from the bytes (PNG, JPEG, WebP or GIF; never SVG), reads its pixel size from the header (at most 40 megapixels) and removes its metadata (JPEG and WebP are encoded again, PNG keeps only what drawing needs) before keeping it. 201 the image (`fileId`, type, size, width, height): put its `fileId` in a comment's `images` (artifactComment, artifactReview) within the hour, after which an unused image is gone; only this agent can read it until then. Only an agent of the Artifact's server or its joint channel (403 FORBIDDEN). 411 CONTENT_LENGTH_REQUIRED, 413 FILE_TOO_LARGE before the body is read, 422 or 413 IMAGE_REFUSED (`reason`), 403 FILE_UPLOAD_QUOTA_EXCEEDED when it doesn't fit in the server's monthly file upload quota (the attachments' one). One of the agent's writes (60 a minute per agent, 600 per server, with its comments and other Artifact writes; 429 RATE_LIMITED).",
+    "sideEffect": "write",
+    "idempotency": "natural",
+    "destructive": false,
+    "audience": "both",
+    "request": {
+      "params": true,
+      "query": false,
+      "body": false
+    },
+    "response": {
+      "kind": "json",
+      "body": true
+    }
+  },
+  {
+    "key": "artifactCommentImage",
+    "method": "GET",
+    "path": "/artifacts/:artifact/comment-images/:fileId",
+    "fullPath": "/internal/agent-api/artifacts/:artifact/comment-images/:fileId",
+    "client": {
+      "resource": "artifacts",
+      "method": "commentImage"
+    },
+    "capability": "read",
+    "description": "Download one image of a Workspace Artifact's comments (its `fileId` from artifactComments' `images`) as its bytes, with the type the Server found in them. 404 IMAGE_NOT_FOUND for an id that names no image of a comment the agent can read here.",
+    "sideEffect": "read",
+    "idempotency": "natural",
+    "destructive": false,
+    "audience": "both",
+    "request": {
+      "params": true,
+      "query": false,
+      "body": false
+    },
+    "response": {
+      "kind": "binary",
+      "body": false
+    }
+  },
+  {
+    "key": "artifactCheck",
+    "method": "GET",
+    "path": "/artifacts/:artifact/check",
+    "fullPath": "/internal/agent-api/artifacts/:artifact/check",
+    "client": {
+      "resource": "artifacts",
+      "method": "check"
+    },
+    "capability": "read",
+    "description": "Read the publish check of a Workspace Artifact version (default the current one): after a push of an HTML version Raft opens it in a headless browser, takes a desktop and a phone screenshot and notes what the page got wrong. `check` is null when the version has none (another kind, such as Markdown or a PDF, pushed before checks or while they were off): that is no failure, and none is coming. Its `status` is pending, running, done, failed (`errorClass`) or skipped (`skipReason`, e.g. `unchanged` when the files are the previous version's); a done check has its `findings` (console errors, blocked resources, a blank page, sideways scrolling at phone width) and the `screenshots` it kept, each downloaded with artifactCheckShot. Read-only; it moves no read position. 404 NOT_VISIBLE also for another server's agent reading a public Artifact (its current version only).",
+    "sideEffect": "read",
+    "idempotency": "natural",
+    "destructive": false,
+    "audience": "both",
+    "request": {
+      "params": true,
+      "query": true,
+      "body": false
+    },
+    "response": {
+      "kind": "json",
+      "body": true
+    }
+  },
+  {
+    "key": "artifactCheckShot",
+    "method": "GET",
+    "path": "/artifacts/:artifact/check/:shot",
+    "fullPath": "/internal/agent-api/artifacts/:artifact/check/:shot",
+    "client": {
+      "resource": "artifacts",
+      "method": "checkShot"
+    },
+    "capability": "read",
+    "description": "Download one screenshot of a Workspace Artifact version's publish check (default the current version's) as PNG bytes: `shot` is `desktop` (1280x800) or `phone` (390x844 at 2x), as listed in artifactCheck's `screenshots`. Only the newest three checked versions of an Artifact keep theirs. 404 SCREENSHOT_NOT_FOUND when the check has no such screenshot.",
+    "sideEffect": "read",
+    "idempotency": "natural",
+    "destructive": false,
+    "audience": "both",
+    "request": {
+      "params": true,
+      "query": true,
+      "body": false
+    },
+    "response": {
+      "kind": "binary",
+      "body": false
+    }
+  },
+  {
+    "key": "artifactComment",
+    "method": "POST",
+    "path": "/artifacts/:artifact/comments",
+    "fullPath": "/internal/agent-api/artifacts/:artifact/comments",
+    "client": {
+      "resource": "artifacts",
+      "method": "comment"
+    },
+    "capability": "send",
+    "description": "Comment on a Workspace Artifact: on one file (`path`, optionally `anchor`, a place in it) or the whole Artifact, on a version (default the current one), optionally answering a comment (`replyTo`), with text (`body`), images (`images`: up to 4 `fileId`s of this agent's uploads, artifactCommentImageUpload; 400 IMAGE_NOT_FOUND for one that isn't, nothing written) or both. `@name`s in the body are looked up among the Artifact's server; mentioned agents that can see it and its other followers are told at once. 201 the comment, who is told (`notified`) and the names that reached no one (`notNotified`). 409 UNSEEN_CHANGES when others commented on that file or the whole Artifact, or pushed a version changing that file, since the agent last looked (any of it for a comment on the whole Artifact); the same request again then goes through unless the answer left some `unread` (comments not shown in full: `artifactComments` shows them). Commenting follows the Artifact.",
+    "sideEffect": "write",
+    "idempotency": "none",
+    "destructive": false,
+    "audience": "both",
+    "request": {
+      "params": true,
+      "query": false,
+      "body": true
+    },
+    "response": {
+      "kind": "json",
+      "body": true
+    }
+  },
+  {
+    "key": "artifactReview",
+    "method": "POST",
+    "path": "/artifacts/:artifact/reviews",
+    "fullPath": "/internal/agent-api/artifacts/:artifact/reviews",
+    "client": {
+      "resource": "artifacts",
+      "method": "review"
+    },
+    "capability": "send",
+    "description": "Submit a review of a Workspace Artifact: 1 to 50 comments (each as artifactComment takes one: `path`, `anchor`, `replyTo`, `body`) on one version (default the current one), with an optional summary (`body`), posted together or not at all. Each comment is one of the agent's writes (60 a minute per agent, 600 per server; 429 RATE_LIMITED). When one comment is refused, nothing is posted and the answer is that comment's own error code with `index` (0-based) and `path` in its details; 400 TOO_MANY_COMMENTS over 50. 409 UNSEEN_CHANGES is checked once for the whole review; the same request again then goes through unless the answer left some `unread` (comments not shown in full: `artifactComments` shows them). Each agent told gets one notice for the review: as mentioned when the summary or a comment mentions it, else as a follower. 201 the review (its id), its comments in order, who is told (`notified`) and the names that reached no one (`notNotified`). With an `idempotencyKey`, the same request again answers the review it posted (200, `notified` empty: nothing posted or told twice), and a different request under that key gets 409 IDEMPOTENCY_KEY_REUSED. Submitting follows the Artifact.",
+    "sideEffect": "write",
+    "idempotency": "key",
+    "destructive": false,
+    "audience": "both",
+    "request": {
+      "params": true,
+      "query": false,
+      "body": true
+    },
+    "response": {
+      "kind": "json",
+      "body": true
+    }
+  },
+  {
+    "key": "artifactCommentResolve",
+    "method": "POST",
+    "path": "/artifacts/:artifact/comments/:comment/resolve",
+    "fullPath": "/internal/agent-api/artifacts/:artifact/comments/:comment/resolve",
+    "client": {
+      "resource": "artifacts",
+      "method": "resolveComment"
+    },
+    "capability": "send",
+    "description": "Resolve a comment thread on a Workspace Artifact, by its root comment's id (409 COMMENT_IS_REPLY for a reply, naming its thread's root). Only the thread's author, the Artifact's author (or whoever manages it, when it's an agent), and the server's owners and admins may (403 FORBIDDEN), and only an agent that may comment on it. With `note`, the note is posted first as the agent's reply in the thread (checked and told as a reply is): say what answered it, such as the version. 409 UNSEEN_CHANGES as a reply in that thread would be: read the comments first, then the same request goes through. 200 the thread's root (`resolvedAt`, `resolvedBy`), the note, `changed` (false: it was already resolved, nothing written, no note posted, so a retry never posts it twice) and who is told: the thread's author when someone else. A reply in a resolved thread reopens it. One of the agent's writes (60 a minute per agent, 600 per server; 429 RATE_LIMITED).",
+    "sideEffect": "write",
+    "idempotency": "natural",
+    "destructive": false,
+    "audience": "both",
+    "request": {
+      "params": true,
+      "query": false,
+      "body": true
+    },
+    "response": {
+      "kind": "json",
+      "body": true
+    }
+  },
+  {
+    "key": "artifactCommentReopen",
+    "method": "POST",
+    "path": "/artifacts/:artifact/comments/:comment/reopen",
+    "fullPath": "/internal/agent-api/artifacts/:artifact/comments/:comment/reopen",
+    "client": {
+      "resource": "artifacts",
+      "method": "reopenComment"
+    },
+    "capability": "send",
+    "description": "Reopen a resolved comment thread on a Workspace Artifact, by its root comment's id (409 COMMENT_IS_REPLY for a reply). Who may, as resolving (403 FORBIDDEN). Tells no one. 200 the thread's root and `changed` (false: it was open, nothing written). Replying in a resolved thread reopens it too. One of the agent's writes (60 a minute per agent, 600 per server; 429 RATE_LIMITED).",
+    "sideEffect": "write",
+    "idempotency": "natural",
+    "destructive": false,
+    "audience": "both",
+    "request": {
+      "params": true,
+      "query": false,
+      "body": false
+    },
+    "response": {
+      "kind": "json",
+      "body": true
+    }
+  },
+  {
+    "key": "artifactSubscribe",
+    "method": "PUT",
+    "path": "/artifacts/:artifact/subscription",
+    "fullPath": "/internal/agent-api/artifacts/:artifact/subscription",
+    "client": {
+      "resource": "artifacts",
+      "method": "subscribe"
+    },
+    "capability": "send",
+    "description": "Follow a Workspace Artifact: others' comments on it, and others' versions changing a file the agent was the last to push, reach the agent. Pushing and commenting follow it too, unless the agent stopped following it.",
+    "sideEffect": "write",
+    "idempotency": "natural",
+    "destructive": false,
+    "audience": "both",
+    "request": {
+      "params": true,
+      "query": false,
+      "body": false
+    },
+    "response": {
+      "kind": "json",
+      "body": true
+    }
+  },
+  {
+    "key": "artifactUnsubscribe",
+    "method": "DELETE",
+    "path": "/artifacts/:artifact/subscription",
+    "fullPath": "/internal/agent-api/artifacts/:artifact/subscription",
+    "client": {
+      "resource": "artifacts",
+      "method": "unsubscribe"
+    },
+    "capability": "send",
+    "description": "Stop following a Workspace Artifact: no more comment or changed-file notices from it, and pushing or commenting there won't follow it again until the agent follows it (artifactSubscribe). Mentions still reach the agent.",
+    "sideEffect": "write",
+    "idempotency": "natural",
+    "destructive": false,
+    "audience": "both",
+    "request": {
+      "params": true,
+      "query": false,
+      "body": false
+    },
+    "response": {
+      "kind": "json",
+      "body": true
+    }
+  },
+  {
+    "key": "artifactMove",
+    "method": "POST",
+    "path": "/artifacts/:artifact/home",
+    "fullPath": "/internal/agent-api/artifacts/:artifact/home",
+    "client": {
+      "resource": "artifacts",
+      "method": "move"
+    },
+    "capability": "send",
+    "description": "Move a Workspace Artifact to the whole server (`to: \"server\"`): its server's members (not guests) and agents can then see it, its comments and all its versions. Only its author among agents may, and only what the person who manages it could move too: sees it and may widen it (403 FORBIDDEN otherwise, `reason` manager_cannot_see, manager_cannot_move or no_manager; and for `to: \"public\"`: only a person makes one public). An agent can't move it back (only a person can, to the conversation it came from): 409 HOME_NOT_WIDER when it is already that wide, 409 NAME_TAKEN when it and a server-wide Artifact have the same old name (only Artifacts from before titles have one). 200 the Artifact and the home it left.",
+    "sideEffect": "write",
+    "idempotency": "none",
+    "destructive": true,
+    "audience": "both",
+    "request": {
+      "params": true,
+      "query": false,
+      "body": true
+    },
+    "response": {
+      "kind": "json",
+      "body": true
+    }
+  },
+  {
+    "key": "artifactDelete",
+    "method": "DELETE",
+    "path": "/artifacts/:artifact",
+    "fullPath": "/internal/agent-api/artifacts/:artifact",
+    "client": {
+      "resource": "artifacts",
+      "method": "delete"
+    },
+    "capability": "send",
+    "description": "Delete a Workspace Artifact: no one can open it or any of its versions any more, and it can't be undone. Only its author among agents may (403 FORBIDDEN otherwise). 200 the deleted Artifact's id and title.",
+    "sideEffect": "write",
+    "idempotency": "none",
+    "destructive": true,
+    "audience": "both",
+    "request": {
+      "params": true,
+      "query": false,
+      "body": false
+    },
+    "response": {
+      "kind": "json",
+      "body": true
+    }
+  },
+  {
+    "key": "artifactSaveAttachment",
+    "method": "POST",
+    "path": "/artifacts/save-attachment",
+    "fullPath": "/internal/agent-api/artifacts/save-attachment",
+    "client": {
+      "resource": "artifacts",
+      "method": "saveAttachment"
+    },
+    "capability": "send",
+    "description": "Save an attachment as a Workspace Artifact, as the web's \"Save as Artifact\": `attachmentId` is the id shown after the file name in a message. The agent must see the attachment's message, within the plan's history window (404 ATTACHMENT_NOT_FOUND otherwise). The bytes are copied into a new Artifact the agent owns and follows, homed in the attachment's top-level conversation (a thread's: its channel), named after the file, version 1 the one file; the attachment then links to it on the web. 201 `created`; 200 the Artifact an earlier save made when it is live and the agent sees it, 409 ALREADY_SAVED when the agent can't. 422 ATTACHMENT_NOT_SAVABLE over an Artifact file's limit (16 MiB text, 15 MiB binary); the copied bytes count against the server's monthly file upload quota, as attachments do: 403 FILE_UPLOAD_QUOTA_EXCEEDED when they don't fit, nothing saved; 503 CONTENT_UNAVAILABLE when storage can't take them.",
+    "sideEffect": "write",
+    "idempotency": "natural",
+    "destructive": false,
+    "audience": "both",
+    "request": {
+      "params": false,
+      "query": false,
+      "body": true
+    },
+    "response": {
+      "kind": "json",
+      "body": true
+    }
   }
 ] as const;
 
 /** Content hash of AGENT_API_ROUTE_MANIFEST; see computeAgentApiManifestVersion. */
-export const AGENT_API_MANIFEST_VERSION = "6cddd50f870f2c51";
+export const AGENT_API_MANIFEST_VERSION = "a3e643c6f6e06751";

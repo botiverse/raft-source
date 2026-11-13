@@ -29,5 +29,9 @@ export const reminderSourceAcknowledgements = pgTable("reminder_source_acknowled
 }, (t) => [
   uniqueIndex("idx_reminder_source_acks_exact_unique").on(t.serverId, t.ownerAgentId, t.reminderId, t.sourceVersion),
   index("idx_reminder_source_acks_attempt").on(t.ackAttemptId),
+  // The closed-server purge deletes the reminders and events these keys name
+  // (migration closed_server_purge_fk_indexes; CONCURRENTLY on a large table).
+  index("idx_reminder_source_acks_reminder").on(t.reminderId),
+  index("idx_reminder_source_acks_source_event").on(t.sourceEventId),
   check("reminder_source_acks_source_version_positive", sql`${t.sourceVersion} > 0`),
 ]);

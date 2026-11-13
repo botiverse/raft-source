@@ -1,8 +1,14 @@
 import { Button, Card, CardDescription, CardHeader, CardLeading, CardTitle, Checkbox, Input } from "@botiverse/raft-ui";
 import { Pencil, RefreshCw } from "lucide-react";
-import { useCallback, useMemo } from "react";
+import { useCallback, useId, useMemo } from "react";
 import type { ChangeEvent, RefObject } from "react";
-import { runtimeFormV2Choices, runtimeFormV2SelectedConnection, runtimeFormV2SourceStatus } from "@botiverse/raft-runtime-form";
+import {
+  isRuntimeFormV2FieldRequired,
+  runtimeFormV2Choices,
+  runtimeFormV2SelectedConnection,
+  runtimeFormV2SourceStatus,
+  runtimeFormV2UnavailableSelection,
+} from "@botiverse/raft-runtime-form";
 import type { RuntimeFormV2ChoiceOption, RuntimeFormV2Field, RuntimeFormV2Sources, RuntimeFormV2Value, RuntimeFormV2Values } from "@botiverse/raft-runtime-form";
 import { useIntl } from "react-intl";
 import { Field, FieldAction, RuntimeFormV2StringMapField, RuntimeSelectControl } from "./RuntimeConfigFields";
@@ -10,6 +16,7 @@ import Tooltip from "../ui/Tooltip";
 import { RuntimeFormV2ChoiceCombobox } from "./RuntimeChoiceCombobox";
 import type { RuntimeOption } from "./RuntimeConfigFields";
 import { RuntimeFormV2SourceStatusLine } from "./RuntimeFormV2SourceStatusLine";
+import { RuntimeFormV2HintText } from "./RuntimeFormV2HintText";
 
 const RUNTIME_FORM_V2_EMPTY_CHOICE = "__runtime_form_v2_default__";
 
@@ -58,7 +65,10 @@ export function RuntimeFormV2FieldControl({
   // connection's, not the user's — disabled, safe placeholder, never required
   // (and never submitted; the shared runtimeFormV2Submission rules drop it).
   const connectionOwnedNow = connectionActive && field.connectionOwned === true;
-  const fieldConnection = runtimeFormV2SelectedConnection(field, sources, values);
+  // v3 keeps a bound connection that is not selectable in unavailableOptions:
+  // its pencil still opens it (to enable it or add the credential).
+  const fieldConnection = runtimeFormV2SelectedConnection(field, sources, values)
+    ?? runtimeFormV2UnavailableSelection(field, sources, values);
   const connectionId = typeof fieldConnection?.connectionId === "string" && fieldConnection.connectionId
     ? fieldConnection.connectionId
     : undefined;
@@ -95,10 +105,12 @@ export function RuntimeFormV2FieldControl({
   }, [onRetrySource, sourceId]);
   const refreshTitle = formatMessage({ id: "agent.runtimeFormV2.refreshSourceTitle" });
   const refreshLabel = formatMessage({ id: "agent.runtimeFormV2.refreshSourceAria" });
+  // Server hint copy may carry inline Markdown links (https only).
+  const fieldHint = useMemo(() => (field.hint ? <RuntimeFormV2HintText hint={field.hint} /> : undefined), [field.hint]);
   const hint = connectionOwnedNow
     ? managedPlaceholder
-    : secretKept ? formatMessage({ id: "agent.runtimeFormV2.secretKept" }) : field.hint;
-  const required = field.required && !secretKept && !connectionOwnedNow;
+    : secretKept ? formatMessage({ id: "agent.runtimeFormV2.secretKept" }) : fieldHint;
+  const required = isRuntimeFormV2FieldRequired(field, values) && !secretKept && !connectionOwnedNow;
   const common = useMemo(
     () => ({
       label: field.label,
@@ -130,7 +142,7 @@ export function RuntimeFormV2FieldControl({
                   <Button
                     type="button"
                     variant="ghost"
-                    size="icon-sm"
+                    size="icon-md"
                     onClick={handleEditConnection}
                     aria-label={pencilLabel}
                     title={pencilLabel}
@@ -146,6 +158,24 @@ export function RuntimeFormV2FieldControl({
     }),
     [connectionId, savedConnections, handleEditConnection, pencilLabel, showRefresh, refreshTitle, handleRefreshSource, refreshing, refreshLabel, fieldKey, field.label, hint, required, error],
   );
+  // `OptionSource.unavailableOptions`: models this Computer's runtime listed as
+  // disabled (and, on v3, saved connections that are not selectable), a
+  // disabled group after the list: by `group` when the server sends one, else
+  // "Not available on this computer". The reason is plain text.
+  const unavailableSource = field.kind !== "derived_select" && field.optionSourceId ? sources[field.optionSourceId]?.unavailableOptions : undefined;
+  const unavailableOptions = useMemo((): RuntimeOption[] => {
+    if (!Array.isArray(unavailableSource)) return NO_RUNTIME_OPTIONS;
+    const group = formatMessage({ id: "agent.runtimeModels.unavailableGroup" });
+    return unavailableSource
+      .filter((option) => typeof option?.value === "string" && option.value !== "")
+      .map((option) => ({
+        value: option.value,
+        label: typeof option.label === "string" && option.label ? option.label : option.value,
+        disabled: true,
+        group: option.group === "saved" ? savedGroupLabel : option.group === "direct" ? directGroupLabel : group,
+        ...(typeof option.reason === "string" && option.reason ? { description: option.reason } : {}),
+      }));
+  }, [unavailableSource, formatMessage, savedGroupLabel, directGroupLabel]);
   const listedOptions = useMemo(
     () => (choices?.kind === "select" ? choices.options.map(toRuntimeOptionV2) : NO_RUNTIME_OPTIONS),
     [choices, toRuntimeOptionV2],
@@ -178,9 +208,13 @@ export function RuntimeFormV2FieldControl({
     [onChange, fieldKey],
   );
   const testId = `runtime-form-v2-${fieldKey}`;
+  // A boolean's field has no label of its own: point the checkbox at the
+  // option card's title so it is announced by the option's name
+  // (runtimeChoiceCards.behavior.test.tsx (removed in the 2026-11 web DOM test prune)).
+  const optionTitleId = useId();
   switch (field.kind) {
     case "unsupported":
-      return field.required ? (
+      return required ? (
         <Field {...common} adopt={false}>
           <p className="text-callout text-foreground-muted" data-testid={testId}>
             {formatMessage({ id: "agent.runtimeFormV2.updateToEdit" })}
@@ -193,10 +227,10 @@ export function RuntimeFormV2FieldControl({
           <Card variant="option" render={<label />}>
             <CardHeader>
               <CardLeading>
-                <Checkbox checked={value === true} disabled={connectionOwnedNow} onCheckedChange={handleCheckedChange} data-testid={testId} />
+                <Checkbox checked={value === true} disabled={connectionOwnedNow} onCheckedChange={handleCheckedChange} aria-labelledby={optionTitleId} data-testid={testId} />
               </CardLeading>
-              <CardTitle>{field.label}</CardTitle>
-              {field.hint && <CardDescription>{field.hint}</CardDescription>}
+              <CardTitle id={optionTitleId}>{field.label}</CardTitle>
+              {fieldHint && <CardDescription>{fieldHint}</CardDescription>}
             </CardHeader>
           </Card>
         </Field>
@@ -205,7 +239,7 @@ export function RuntimeFormV2FieldControl({
       return (
         <RuntimeFormV2StringMapField
           value={value && typeof value === "object" ? value : EMPTY_STRING_MAP}
-          hint={field.hint}
+          hint={fieldHint}
           onChange={handleValueChange}
         />
       );
@@ -233,6 +267,7 @@ export function RuntimeFormV2FieldControl({
               value={text}
               onValueChange={handleValueChange}
               emptyOption={choices.allowEmpty ? emptyOption : undefined}
+              unavailableOptions={unavailableOptions}
               allowCustom={choices.allowCustom}
               placeholder={field.placeholder ?? field.label}
               portalContainer={portalContainer}

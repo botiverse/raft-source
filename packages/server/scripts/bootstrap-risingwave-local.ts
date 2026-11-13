@@ -23,10 +23,18 @@ import {
   buildRisingWaveBootstrapStatements,
   createdRelationName,
 } from "../../../scripts/dev/raftdev-risingwave-bootstrap";
+import { barrierIntervalToRestore, BOOTSTRAP_BARRIER_INTERVAL_MS } from "./risingwave-bootstrap-barrier";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "../../..");
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function readBarrierIntervalMs(risingwave: pg.Client): Promise<number | null> {
+  const result = await risingwave.query<Record<string, string>>("SHOW PARAMETERS");
+  const row = result.rows.find((r) => (r.Name ?? r.name) === "barrier_interval_ms");
+  const value = row ? (row.Value ?? row.value) : undefined;
+  return value && /^\d+$/.test(value) ? Number(value) : null;
+}
 
 function requiredEnv(name: string): string {
   const value = process.env[name]?.trim();
@@ -189,7 +197,7 @@ async function assertRequiredRelations(risingwave: pg.Client): Promise<void> {
 
   // Serving invariants on the view the server reads (UNIFIED_CHAIN_VIEWS.serving).
   for (const [predicate, message] of [
-    ["kind = 'thread' AND reply_count IS NULL", "serving thread rows have NULL reply_count"],
+    ["kind IN ('thread', 'task') AND reply_count IS NULL", "serving thread / task conversation rows have NULL reply_count"],
     ["mention_only AND activity_at IS NULL", "mention-only serving rows must carry the mention timestamp as activity_at"],
     [
       "mention_only AND latest_activity_message_id IS NULL",
@@ -197,7 +205,7 @@ async function assertRequiredRelations(risingwave: pg.Client): Promise<void> {
     ],
   ] as const) {
     const invalid = await risingwave.query<{ count: string }>(
-      `SELECT count(*)::text AS count FROM rw_inbox_serving_v8 WHERE ${predicate}`,
+      `SELECT count(*)::text AS count FROM rw_inbox_serving_v9 WHERE ${predicate}`,
     );
     if (Number(invalid.rows[0]?.count ?? -1) !== 0) {
       throw new Error(`serving invariant failed: ${message}`);
@@ -249,7 +257,13 @@ async function main(): Promise<void> {
   });
   await postgres.connect();
   await risingwave.connect();
+  let restoreBarrierIntervalMs: number | null = null;
   try {
+    // Loopback-only (checked above): this never touches a staging or
+    // production RisingWave. Set the restore target before shortening, so a
+    // failure in between still restores.
+    restoreBarrierIntervalMs = barrierIntervalToRestore(await readBarrierIntervalMs(risingwave));
+    await risingwave.query(`ALTER SYSTEM SET barrier_interval_ms = ${BOOTSTRAP_BARRIER_INTERVAL_MS}`);
     const wal = await postgres.query<{ wal_level: string }>("SHOW wal_level");
     if (wal.rows[0]?.wal_level !== "logical") {
       throw new Error(`Postgres wal_level must be logical, got ${wal.rows[0]?.wal_level ?? "unknown"}`);
@@ -313,11 +327,50 @@ async function main(): Promise<void> {
       sourceCounts: { ...sourceCounts, ...artifactCdcCounts },
     }, null, 2));
   } finally {
-    await Promise.allSettled([postgres.end(), risingwave.end()]);
+    // The 11-06 CI timeout came after the summary above was printed: the work
+    // was done and only this cleanup was left. Each step is bounded and
+    // logged, so a hang here shows where it is and cannot hold the run.
+    if (restoreBarrierIntervalMs !== null) {
+      const restore = restoreBarrierIntervalMs;
+      await withinMs(
+        "restore barrier_interval_ms",
+        CLEANUP_STEP_TIMEOUT_MS,
+        risingwave.query(`ALTER SYSTEM SET barrier_interval_ms = ${restore}`),
+      ).catch((error: unknown) => {
+        console.error(`[rw-bootstrap] could not restore barrier_interval_ms=${restore}: ${error instanceof Error ? error.message : String(error)}`);
+      });
+    }
+    await withinMs(
+      "close connections",
+      CLEANUP_STEP_TIMEOUT_MS,
+      Promise.allSettled([postgres.end(), risingwave.end()]),
+    ).catch((error: unknown) => {
+      console.error(`[rw-bootstrap] ${error instanceof Error ? error.message : String(error)}`);
+    });
   }
 }
 
-main().catch((error) => {
+const CLEANUP_STEP_TIMEOUT_MS = 30_000;
+
+async function withinMs<T>(label: string, ms: number, work: Promise<T>): Promise<T> {
+  const started = Date.now();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      work,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label} did not finish within ${ms}ms`)), ms);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+    console.error(`[rw-bootstrap] ${label} (${Date.now() - started}ms)`);
+  }
+}
+
+// Exit explicitly: a handle left open by a driver must not keep a finished
+// bootstrap alive until the CI step's timeout.
+main().then(() => process.stdout.write("", () => process.exit(0)), (error) => {
   let message = error instanceof Error ? error.message : String(error);
   for (const secret of [
     process.env.DATABASE_URL,

@@ -10,6 +10,7 @@ import { buildGeminiTokenUsageEvent } from "./geminiEventNormalizer";
 import { buildCliTransportSystemPrompt, prepareCliTransport } from "./cliTransport";
 import { resolveNodeHostLaunch } from "./nodeHostLaunch";
 import { resolveCommandOnPath, resolveCommandOnPathAsync, type ProbeDeps } from "./probe";
+import { OpenToolCalls } from "./openToolCalls";
 import { ProbeChildError, runProbeChild } from "./probeChild";
 import {
   prepareManagedMcpRuntimeProxy,
@@ -199,7 +200,7 @@ export async function resolveGeminiSpawnAsync(
   });
   return {
     command: nodeHost.command,
-    args: [geminiEntry, ...commandArgs],
+    args: [...nodeHost.execArgv, geminiEntry, ...commandArgs],
     env: nodeHost.env,
   };
 }
@@ -262,7 +263,7 @@ export function resolveGeminiSpawn(
   });
   return {
     command: nodeHost.command,
-    args: [geminiEntry, ...commandArgs],
+    args: [...nodeHost.execArgv, geminiEntry, ...commandArgs],
     env: nodeHost.env,
   };
 }
@@ -289,6 +290,9 @@ export class GeminiDriver implements RuntimeDriver {
   } as const;
   readonly session = {
     recovery: "resume_or_fresh",
+    // Never emits a compaction event.
+    compaction: "unreported",
+    compactionFailure: "does_not_stick",
   } as const;
   readonly model = {
     detectedModelsVerifiedAs: "suggestion_only",
@@ -299,14 +303,18 @@ export class GeminiDriver implements RuntimeDriver {
 
   private sessionId: string | null = null;
   private sessionAnnounced = false;
+  private readonly openTools = new OpenToolCalls();
 
   async spawn(ctx: SpawnContext): Promise<SpawnResult> {
     this.sessionId = ctx.config.sessionId || null;
     this.sessionAnnounced = false;
+    this.openTools.clear();
 
     const managedMcp = await prepareManagedMcpRuntimeProxy({
       agentId: ctx.agentId,
       launchId: ctx.launchId,
+      processInstanceId: ctx.processInstanceId,
+      readTurnOrigin: ctx.readTurnOrigin,
       serverUrl: ctx.config.serverUrl,
       agentCredentialKey: ctx.config.agentCredentialKey,
     });
@@ -372,19 +380,30 @@ export class GeminiDriver implements RuntimeDriver {
         }
         break;
 
-      case "tool_use":
-        events.push({
-          kind: "tool_call",
-          name: event.tool_name || "unknown_tool",
-          input: event.parameters,
-        });
+      case "tool_use": {
+        const name = event.tool_name || "unknown_tool";
+        const callId = typeof event.tool_id === "string" && event.tool_id ? event.tool_id : undefined;
+        if (callId && !this.openTools.start(callId, name)) break;
+        events.push({ kind: "tool_call", name, input: event.parameters, ...(callId ? { callId } : {}) });
         break;
+      }
+
+      case "tool_result": {
+        // Gemini sends no exit code or duration, and reports a cancelled call
+        // as "success"; the daemon times the call itself.
+        const callId = typeof event.tool_id === "string" ? event.tool_id : "";
+        const name = callId ? this.openTools.end(callId) : undefined;
+        if (name !== undefined) events.push({ kind: "tool_output", name, callId, ok: event.status === "success" });
+        break;
+      }
 
       case "error":
         events.push({ kind: "error", message: event.message || "Unknown Gemini error" });
         break;
 
       case "result":
+        // The turn's end closes whatever is still open (the daemon resets its count too).
+        this.openTools.clear();
         if (event.status !== "success") {
           const raw = event.error_message || event.message || event.error || "";
           const detail = typeof raw === "string" ? raw : (raw?.message || JSON.stringify(raw));

@@ -5,6 +5,7 @@ import { useIntl } from "react-intl";
 import DialogCard from "../ui/DialogCard";
 import Banner from "../ui/Banner";
 import api from "../../api/client";
+import { DialogActions, DialogCommit } from "../ui/NarrowDialog";
 
 type Phase = "confirm" | "stopped" | "resuming";
 
@@ -152,7 +153,7 @@ export default function SOSDialog({
               rows={4}
               disabled={resuming}
             />
-            <div className="flex justify-end gap-3">
+            <DialogActions className="flex justify-end gap-2">
               <Button
                 onClick={onClose}
                 size="lg"
@@ -161,17 +162,21 @@ export default function SOSDialog({
               >
                 {formatMessage({ id: "message.sos.keepStopped" })}
               </Button>
-              <Button
-                onClick={handleResume}
-                disabled={!guidance.trim() || resuming}
-                size="lg"
-                variant="primary"
-              >
-                {resuming
-                  ? formatMessage({ id: "message.sos.resuming" })
-                  : formatMessage({ id: "message.sos.resumeAll" })}
-              </Button>
-            </div>
+              <DialogCommit>
+                {(inHead) => (
+                  <Button
+                    onClick={handleResume}
+                    disabled={!guidance.trim() || resuming}
+                    size={inHead ? "md" : "lg"}
+                    variant="primary"
+                  >
+                    {resuming
+                      ? formatMessage({ id: "message.sos.resuming" })
+                      : formatMessage({ id: "message.sos.resumeAll" })}
+                  </Button>
+                )}
+              </DialogCommit>
+            </DialogActions>
           </>
         )}
     </DialogCard>

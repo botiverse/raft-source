@@ -188,7 +188,12 @@ function parseProviderConfig(
       && typeof value.apiKey === "string"
       && value.apiKey.trim()
     ) {
-      return { kind: "custom", apiUrl: value.apiUrl.trim(), apiKey: value.apiKey.trim() };
+      return {
+        kind: "custom",
+        apiUrl: value.apiUrl.trim(),
+        apiKey: value.apiKey.trim(),
+        ...(value.authType === "auth_token" ? { authType: "auth_token" as const } : {}),
+      };
     }
     if (value.kind === "custom" && legacyApiUrl?.trim() && legacyApiKey?.trim()) {
       return { kind: "custom", apiUrl: legacyApiUrl.trim(), apiKey: legacyApiKey.trim() };
@@ -226,7 +231,7 @@ function parseModelConfig(
 ): RuntimeModelConfig {
   if (!isPlainRecord(value)) return modelConfigFromLegacy(runtimeModels, runtime, fallback);
   if (value.kind === "custom" && typeof value.name === "string" && value.name.trim()) {
-    return { kind: "custom", name: value.name.trim() };
+    return { kind: "custom", name: value.name.trim(), ...(runtime === "builtin" ? storedCustomModelLimits(value) : {}) };
   }
   if (usesLegacyClaudeCustomProvider && runtime === "claude" && legacyCustomModel?.trim()) {
     return { kind: "custom", name: legacyCustomModel.trim() };
@@ -239,6 +244,19 @@ function parseModelConfig(
     return { kind: "preset", id: value.id.trim() };
   }
   return modelConfigFromLegacy(runtimeModels, runtime, fallback);
+}
+
+/**
+ * A stored custom model's declared limits (#proj-runtime:#50), kept when they
+ * are positive integers (strict writes already bounded them); anything else is
+ * dropped, so the model falls back to the catalog or Raft's default.
+ */
+function storedCustomModelLimits(value: Record<string, unknown>): { contextWindow?: number; maxOutputTokens?: number } {
+  const positive = (field: unknown): field is number => Number.isSafeInteger(field) && (field as number) > 0;
+  return {
+    ...(positive(value.contextWindow) ? { contextWindow: value.contextWindow } : {}),
+    ...(positive(value.maxOutputTokens) ? { maxOutputTokens: value.maxOutputTokens } : {}),
+  };
 }
 
 function parseModeConfig(value: unknown): RuntimeModeConfig {

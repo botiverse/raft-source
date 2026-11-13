@@ -4,12 +4,12 @@ import assert from "node:assert/strict";
 import { AGENT_BOOTSTRAP_SURFACE_ENABLED_ENV } from "../services/agentCredentialService";
 import { openTestApp } from "../test/integration/app";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 test("self-hosted runner bootstrap exchange route is not mounted by default", async () => {
   const oldValue = process.env[AGENT_BOOTSTRAP_SURFACE_ENABLED_ENV];
   delete process.env[AGENT_BOOTSTRAP_SURFACE_ENABLED_ENV];
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const res = await fetch(`${app.baseUrl}/api/agent/login`, {
       method: "POST",
@@ -30,7 +30,7 @@ test("self-hosted runner bootstrap exchange route is not mounted by default", as
 test("self-hosted runner bootstrap exchange route can be explicitly enabled", async () => {
   const oldValue = process.env[AGENT_BOOTSTRAP_SURFACE_ENABLED_ENV];
   process.env[AGENT_BOOTSTRAP_SURFACE_ENABLED_ENV] = "true";
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const res = await fetch(`${app.baseUrl}/api/agent/login`, {
       method: "POST",

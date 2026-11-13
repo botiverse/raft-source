@@ -1,0 +1,4 @@
+#!/bin/sh
+# Stub of the Raft CLI wrapper: swallow stdin, report a fixed message id.
+cat >/dev/null
+echo "Message sent to #general. Message ID: 11111111-2222-4333-8444-555555555555"

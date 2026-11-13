@@ -1,0 +1,31 @@
+diff --git a/out/targets/LinuxTargetHelper.js b/out/targets/LinuxTargetHelper.js
+index ffbe95938be1b78f17a0da0fbfcfcb9a5b2a4247..ff9c537ffa456594c74c80cdfc940cf0b1e78989 100644
+--- a/out/targets/LinuxTargetHelper.js
++++ b/out/targets/LinuxTargetHelper.js
+@@ -213,7 +213,11 @@ class LinuxTargetHelper {
+         if (exec == null) {
+             exec = `${exports.installPrefix}/${appInfo.sanitizedProductName}/${packager.executableName}`;
+             if (!/^[/0-9A-Za-z._-]+$/.test(exec)) {
+-                exec = `"${exec}"`;
++                // Raft patch: a quoted path with a space ("/opt/Raft Desktop/...")
++                // is cut at the space by xdg-open's generic fallback, so raft://
++                // links went to the browser. Packages (deb/rpm/pacman) link
++                // /usr/bin/<executableName> in after-install: use that.
++                exec = /^[0-9A-Za-z._-]+$/.test(packager.executableName) ? `/usr/bin/${packager.executableName}` : `"${exec}"`;
+             }
+             if (executableArgs && executableArgs.length > 0) {
+                 exec += " " + buildExecArgs(executableArgs);
+diff --git a/scheme.json b/scheme.json
+index 81fc8c5cc33dee120e5dd13356b910edfc3bb8af..ea88b7cd021cd7f516a0740fa6bd71a723591f4a 100644
+--- a/scheme.json
++++ b/scheme.json
+@@ -979,7 +979,8 @@
+             "UDRO",
+             "UDRW",
+             "UDZO",
+-            "ULFO"
++            "ULFO",
++            "ULMO"
+           ],
+           "type": "string"
+         },

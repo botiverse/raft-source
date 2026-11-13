@@ -12,6 +12,7 @@ import {
   type UsableUserSession,
 } from "./lib/userSession";
 import { computerFetch } from "./proxy";
+import { isMachineKeyRouteUnavailable } from "./apiClient";
 
 export type ComputerLifecycleIntentResult =
   | { status: "accepted"; operationId: string }
@@ -91,6 +92,56 @@ export class ComputerLifecycleClient {
   }
 }
 
+/** The machine-key record answered "no such route": an older server. */
+export type MachineKeyLifecycleIntentResult =
+  | ComputerLifecycleIntentResult
+  | { status: "route_unavailable" };
+
+/**
+ * Device-auth PR 3c: the same start/stop/restart record, made with this
+ * server's own sk_computer_* (POST /internal/computer/lifecycle-operations).
+ * The server takes the machine from the key, so none is sent; it records the
+ * operation as "this machine, locally", not as a person.
+ */
+export class MachineKeyLifecycleClient {
+  constructor(
+    private readonly baseUrl: string,
+    private readonly computerApiKey: string,
+  ) {}
+
+  async create(input: {
+    operationId: string;
+    parentOperationId: string;
+    action: Exclude<ComputerLifecycleAction, "upgrade">;
+  }): Promise<MachineKeyLifecycleIntentResult> {
+    try {
+      const res = await computerFetch(new URL("/internal/computer/lifecycle-operations", this.baseUrl).toString(), {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${this.computerApiKey}`,
+        },
+        body: JSON.stringify({
+          operationId: input.operationId,
+          parentOperationId: input.parentOperationId,
+          action: input.action,
+        }),
+      });
+      const body = (await res.json().catch(() => null)) as Record<string, unknown> | null;
+      if (isMachineKeyRouteUnavailable(res.status, body)) return { status: "route_unavailable" };
+      if (res.status === 201 && body && typeof body.operationId === "string") {
+        return { status: "accepted", operationId: body.operationId };
+      }
+      return {
+        status: "rejected",
+        code: body && typeof body.code === "string" ? body.code : `http_${res.status}`,
+      };
+    } catch {
+      return { status: "rejected", code: "request_failed" };
+    }
+  }
+}
+
 export interface PreparedLocalLifecycleOperation {
   serverId: string;
   operationId: string;
@@ -128,6 +179,12 @@ export interface LocalLifecycleIntentDependencies {
     accessToken: string,
     input: LifecycleIntentInput,
   ) => Promise<ComputerLifecycleIntentResult>;
+  /** Record by this server's own Computer key; `route_unavailable` falls back to the session route. */
+  createMachineIntent: (
+    serverUrl: string,
+    computerApiKey: string,
+    input: Parameters<MachineKeyLifecycleClient["create"]>[0],
+  ) => Promise<MachineKeyLifecycleIntentResult>;
   enqueue: typeof enqueueLifecycleOperation;
   enqueueExact: typeof enqueueExactLifecycleOperationIfNoActionConflict;
   hasPending: typeof hasPendingLifecycleAction;
@@ -140,6 +197,8 @@ const defaultDependencies: LocalLifecycleIntentDependencies = {
     ensureUsableUserSession(slockHome, serverUrl, { requireServerOrigin: true }),
   createIntent: (serverUrl, accessToken, input) =>
     new ComputerLifecycleClient(serverUrl, accessToken).create(input),
+  createMachineIntent: (serverUrl, computerApiKey, input) =>
+    new MachineKeyLifecycleClient(serverUrl, computerApiKey).create(input),
   enqueue: enqueueLifecycleOperation,
   enqueueExact: enqueueExactLifecycleOperationIfNoActionConflict,
   hasPending: hasPendingLifecycleAction,
@@ -301,6 +360,12 @@ export async function prepareExactLocalUpgradeLifecycleOperationResult(
 /**
  * Fail-open for local process control, fail-closed for action attribution.
  * Only server-accepted intents are persisted as acknowledgements.
+ *
+ * Each server's record is made with that server's own Computer key
+ * (device-auth PR 3c). Only a server that answers that it has no such route
+ * (an older server) is asked again on the person's session route, as before;
+ * a refusal of the key itself is never retried with the session. A legacy
+ * sk_machine_* attachment has no Computer key and keeps the session route.
  */
 export async function prepareLocalLifecycleOperations(
   slockHome: string,
@@ -327,19 +392,34 @@ export async function prepareLocalLifecycleOperations(
   };
   const parentOperationId = dependencies.createId();
   const prepared: PreparedLocalLifecycleOperation[] = [];
-  for (const attachment of attachments) {
-    if (dependencies.hasPending(slockHome, attachment.serverId, action)) continue;
+  const recordWithSession = async (attachment: LifecycleAttachment, operationId: string) => {
     const session = await getSession(attachment.serverUrl);
-    if (!session || session.status !== "usable") continue;
-    const operationId = dependencies.createId();
-    const result = await dependencies.createIntent(attachment.serverUrl, session.accessToken, {
+    if (!session || session.status !== "usable") return null;
+    return dependencies.createIntent(attachment.serverUrl, session.accessToken, {
       serverId: attachment.serverId,
       machineId: attachment.machineId,
       operationId,
       parentOperationId,
       action,
     });
-    if (result.status !== "accepted") continue;
+  };
+  for (const attachment of attachments) {
+    if (dependencies.hasPending(slockHome, attachment.serverId, action)) continue;
+    const operationId = dependencies.createId();
+    let result: ComputerLifecycleIntentResult | null;
+    if (attachment.apiKey.startsWith("sk_computer_")) {
+      const byKey = await dependencies.createMachineIntent(attachment.serverUrl, attachment.apiKey, {
+        operationId,
+        parentOperationId,
+        action,
+      });
+      result = byKey.status === "route_unavailable"
+        ? await recordWithSession(attachment, operationId)
+        : byKey;
+    } else {
+      result = await recordWithSession(attachment, operationId);
+    }
+    if (!result || result.status !== "accepted") continue;
     try {
       await dependencies.enqueue(slockHome, attachment.serverId, {
         operationId: result.operationId,

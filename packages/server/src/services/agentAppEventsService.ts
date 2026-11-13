@@ -1,5 +1,12 @@
-import { currentDate, type AgentAppEventDetail, type AgentAppEventListResponse, type AgentAppEventSummary } from "@botiverse/raft-shared";
-import { and, desc, eq, lt, or, sql, type SQL } from "drizzle-orm";
+import {
+  currentDate,
+  type ActivityTurnAppEventView,
+  type ActivityTurnTriggerAppEvent,
+  type AgentAppEventDetail,
+  type AgentAppEventListResponse,
+  type AgentAppEventSummary,
+} from "@botiverse/raft-shared";
+import { and, desc, eq, gte, lte, lt, or, sql, type SQL } from "drizzle-orm";
 import { getDb, type DatabaseExecutor } from "../db/index";
 import { oauthClients, thirdPartyAgentEvents } from "../db/schema";
 import { THIRD_PARTY_EVENT_APP_COLUMNS } from "./oauthService";
@@ -126,6 +133,109 @@ export async function getAgentAppEvent(input: {
     .limit(1);
   if (!row) return null;
   return { ...toSummary(row, currentDate()), payload: row.event.payload };
+}
+
+/**
+ * The app events delivered to this agent in [fromMs, toMs] (server clock),
+ * newest first, for the Activity overview to place in turns. Only what the
+ * overview shows: never the payload, its hash, the resource or token ids.
+ * Never-delivered events have no deliveredAt and are not returned.
+ */
+export async function listAgentAppEventsDeliveredBetween(input: {
+  agentId: string;
+  fromMs: number;
+  toMs: number;
+  limit: number;
+  executor?: DatabaseExecutor;
+}): Promise<ActivityTurnAppEventView[]> {
+  const rows = await (input.executor ?? getDb()).select({
+    id: thirdPartyAgentEvents.id,
+    kind: thirdPartyAgentEvents.kind,
+    summary: thirdPartyAgentEvents.summary,
+    deliveredAt: thirdPartyAgentEvents.deliveredAt,
+    ...THIRD_PARTY_EVENT_APP_COLUMNS,
+    logoUrl: oauthClients.logoUrl,
+  })
+    .from(thirdPartyAgentEvents)
+    // Left join: a Raft system app's events (client_id NULL) count too.
+    .leftJoin(oauthClients, eq(oauthClients.id, thirdPartyAgentEvents.clientId))
+    .where(and(
+      eq(thirdPartyAgentEvents.agentId, input.agentId),
+      // delivered_at has no index; (agent_id, status) does. The two agree: the
+      // only writer of delivered_at sets status 'delivered' with it
+      // (markThirdPartyAgentEventsDelivered, oauthService.ts), and no writer
+      // moves a delivered row to another status (the claim and release
+      // updates match only queued / delivering rows). There is no created_at
+      // bound: delivery does not refuse expired rows (that same update checks
+      // no expires_at), so delivered_at - created_at has no upper limit.
+      eq(thirdPartyAgentEvents.status, "delivered"),
+      // RFC 081: a dismissed event was never shown (`raft inbox dismiss`), so it
+      // is not delivered in a turn; the dismiss trace counts it instead.
+      sql`${thirdPartyAgentEvents.consumedVia} is distinct from 'dismissed'`,
+      gte(thirdPartyAgentEvents.deliveredAt, new Date(input.fromMs)),
+      lte(thirdPartyAgentEvents.deliveredAt, new Date(input.toMs)),
+    ))
+    .orderBy(desc(thirdPartyAgentEvents.deliveredAt), desc(thirdPartyAgentEvents.id))
+    .limit(input.limit);
+  return rows.flatMap((row) => (row.deliveredAt ? [{
+    id: row.id,
+    appName: row.clientName,
+    clientKey: row.clientKey,
+    logoUrl: row.logoUrl,
+    summary: row.summary,
+    deliveredAt: row.deliveredAt.getTime(),
+    kind: row.kind,
+  }] : []));
+}
+
+/** Short ids collide rarely (32 bits), so a page's references match only a few rows. */
+const EVENT_REF_QUERY_LIMIT = 500;
+const EVENT_REF_RE = /^([0-9a-f]{8})(?:-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})?$/;
+
+/**
+ * The app events behind `agent-event:<id8>` (or full id) references, scoped
+ * to this agent in SQL, one query for all of them. A reference no event of
+ * this agent matches (pruned, another agent's) or that two of its events
+ * share (a short-id collision) is left out.
+ */
+export async function resolveAgentAppEventRefs(input: {
+  agentId: string;
+  refs: readonly string[];
+  executor?: DatabaseExecutor;
+}): Promise<Map<string, ActivityTurnTriggerAppEvent>> {
+  const wanted = new Map<string, string>();
+  for (const ref of input.refs) {
+    const normalized = ref.trim().toLowerCase();
+    const match = EVENT_REF_RE.exec(normalized);
+    if (match) wanted.set(ref, normalized);
+  }
+  const resolved = new Map<string, ActivityTurnTriggerAppEvent>();
+  if (wanted.size === 0) return resolved;
+  const prefixes = [...new Set([...wanted.values()].map((ref) => ref.slice(0, 8)))];
+  const rows = await (input.executor ?? getDb()).select({
+    id: thirdPartyAgentEvents.id,
+    summary: thirdPartyAgentEvents.summary,
+    ...THIRD_PARTY_EVENT_APP_COLUMNS,
+  })
+    .from(thirdPartyAgentEvents)
+    .leftJoin(oauthClients, eq(oauthClients.id, thirdPartyAgentEvents.clientId))
+    .where(and(
+      eq(thirdPartyAgentEvents.agentId, input.agentId),
+      // A short id is a range of the primary key (uuids order by their bytes,
+      // as their hex reads), so the lookup is an index range scan.
+      or(...prefixes.map((prefix) => and(
+        gte(thirdPartyAgentEvents.id, `${prefix}-0000-0000-0000-000000000000`),
+        lte(thirdPartyAgentEvents.id, `${prefix}-ffff-ffff-ffff-ffffffffffff`),
+      )))!,
+    ))
+    .limit(EVENT_REF_QUERY_LIMIT);
+  // A cut-off result could hide a second event behind a prefix: resolve none.
+  if (rows.length >= EVENT_REF_QUERY_LIMIT) return resolved;
+  for (const [ref, normalized] of wanted) {
+    const matches = rows.filter((row) => (normalized.length === 8 ? row.id.startsWith(normalized) : row.id === normalized));
+    if (matches.length === 1) resolved.set(ref, { appName: matches[0]!.clientName, summary: matches[0]!.summary });
+  }
+  return resolved;
 }
 
 /**

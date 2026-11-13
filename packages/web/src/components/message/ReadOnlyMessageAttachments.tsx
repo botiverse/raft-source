@@ -1,7 +1,7 @@
 import { createContext, useCallback, useContext, useMemo, useState } from "react";
 import { useIntl } from "react-intl";
 import { Download } from "lucide-react";
-import { MARKDOWN_PREVIEW_PAYLOAD_BYTE_LIMIT, TEXT_PREVIEW_BYTE_LIMIT } from "@botiverse/raft-shared";
+import { MARKDOWN_PREVIEW_BYTE_LIMIT, previewPrefixAtLineBoundary, TEXT_PREVIEW_BYTE_LIMIT } from "@botiverse/raft-shared";
 import {
   buildMessageImageGalleryRows,
   MessageAttachmentGroup,
@@ -24,7 +24,7 @@ import {
   isTextAttachment,
 } from "./attachmentPreview";
 import type { DocumentAttachmentPreview } from "./attachmentPreview";
-import { DocumentAttachmentPreviewModal } from "./attachmentPreviewSurfaces";
+import { DocumentAttachmentPreviewModal } from "./attachmentPreviewChunk";
 import { showToast } from "../toastBridge";
 
 /**
@@ -61,8 +61,10 @@ type ReadOnlyPreviewKind = "markdown" | "text" | "pdf";
 /**
  * Which read-only preview a file chip opens, or null for download-only.
  * Active content (HTML, SVG) is never previewed, even when its MIME claims to
- * be text. Text and markdown use the member preview caps; a larger file is a
- * download rather than a silently truncated preview.
+ * be text. Text uses the member preview cap; a larger text file is a download
+ * rather than a silently truncated preview. Markdown of any size previews: like
+ * the member preview (task #164), a file over the cap shows its first
+ * MARKDOWN_PREVIEW_BYTE_LIMIT bytes, cut at a whole line, under a notice.
  */
 export function readOnlyPreviewKind(attachment: Pick<MessageAttachment, "filename" | "mimeType" | "sizeBytes">): ReadOnlyPreviewKind | null {
   const filename = attachment.filename.toLowerCase();
@@ -70,46 +72,61 @@ export function readOnlyPreviewKind(attachment: Pick<MessageAttachment, "filenam
   if (isHtmlPreviewAttachment(attachment) || filename.endsWith(".xhtml") || mimeType.includes("html")) return null;
   if (filename.endsWith(".svg") || filename.endsWith(".svgz") || mimeType === "image/svg+xml") return null;
   if (isPdfAttachment(attachment)) return "pdf";
-  if (isMarkdownAttachment(attachment)) return attachment.sizeBytes <= MARKDOWN_PREVIEW_PAYLOAD_BYTE_LIMIT ? "markdown" : null;
+  if (isMarkdownAttachment(attachment)) return "markdown";
   if (isTextAttachment(attachment) || isCsvAttachment(attachment)) return attachment.sizeBytes <= TEXT_PREVIEW_BYTE_LIMIT ? "text" : null;
   return null;
 }
 
-/** Fetches a public attachment as UTF-8 text, refusing anything over `maxBytes`
- *  or not valid UTF-8 (null). Anonymous: no cookies or credentials are sent. */
-async function fetchReadOnlyText(url: string, maxBytes: number): Promise<string | null> {
+/** Fetches a public attachment as UTF-8 text, refusing anything not valid
+ *  UTF-8 (null). Over `maxBytes` it refuses too ("too_large"), unless `truncate` is
+ *  set: then it stops reading and keeps the whole lines within `maxBytes`.
+ *  Anonymous: no cookies or credentials are sent. */
+async function fetchReadOnlyText(
+  url: string,
+  maxBytes: number,
+  { truncate = false }: { truncate?: boolean } = {},
+): Promise<{ text: string; truncated: boolean; byteLength: number } | "too_large" | null> {
   const response = await fetch(url, { credentials: "omit" });
   if (!response.ok) return null;
   const declaredLength = Number(response.headers.get("content-length"));
-  if (Number.isFinite(declaredLength) && declaredLength > maxBytes) return null;
+  if (!truncate && Number.isFinite(declaredLength) && declaredLength > maxBytes) return "too_large";
   const reader = response.body?.getReader();
   const chunks: Uint8Array[] = [];
   let total = 0;
+  let truncated = false;
   if (reader) {
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
-      total += value.byteLength;
-      if (total > maxBytes) {
+      if (total + value.byteLength > maxBytes) {
         void reader.cancel();
-        return null;
+        if (!truncate) return "too_large";
+        chunks.push(value.subarray(0, maxBytes - total));
+        total = maxBytes;
+        truncated = true;
+        break;
       }
+      total += value.byteLength;
       chunks.push(value);
     }
   } else {
     const buffer = new Uint8Array(await response.arrayBuffer());
-    total = buffer.byteLength;
-    if (total > maxBytes) return null;
-    chunks.push(buffer);
+    if (buffer.byteLength > maxBytes) {
+      if (!truncate) return "too_large";
+      truncated = true;
+    }
+    total = Math.min(buffer.byteLength, maxBytes);
+    chunks.push(buffer.subarray(0, total));
   }
-  const bytes = new Uint8Array(total);
+  let bytes = new Uint8Array(total);
   let offset = 0;
   for (const chunk of chunks) {
     bytes.set(chunk, offset);
     offset += chunk.byteLength;
   }
+  if (truncated) bytes = previewPrefixAtLineBoundary(bytes);
   try {
-    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    return { text: new TextDecoder("utf-8", { fatal: true }).decode(bytes), truncated, byteLength: bytes.byteLength };
   } catch {
     return null;
   }
@@ -129,6 +146,7 @@ function startDownload(url: string, filename: string) {
 interface ReadOnlyPreviewEntry {
   attachment: MessageAttachment;
   preview: DocumentAttachmentPreview;
+  truncated: boolean;
   url: string | null;
 }
 
@@ -145,6 +163,19 @@ function ReadOnlyFileChip({
   const [loading, setLoading] = useState(false);
   const previewKind = readOnlyPreviewKind(attachment);
   const download = useCallback(() => startDownload(urls.download(attachment.id), attachment.filename), [attachment.filename, attachment.id, urls]);
+  // A chip that promised a preview never downloads silently (task #164):
+  // say why first, as the member opener does.
+  const explainAndDownload = useCallback((reason: "too_large" | "unsupported") => {
+    showToast({
+      title: formatMessage(
+        { id: reason === "too_large" ? "message.messageItem.previewUnavailableTooLarge" : "message.messageItem.previewUnavailable" },
+        { filename: attachment.filename },
+      ),
+      description: formatMessage({ id: "message.messageItem.previewUnavailableDownloading" }),
+      type: "warning",
+    });
+    download();
+  }, [attachment.filename, download, formatMessage]);
   // Same shape as the member opener: the chip shows "Opening preview…" while
   // the bytes load, and anything that turns out not to be previewable falls
   // back to the download it would have been before.
@@ -154,28 +185,37 @@ function ReadOnlyFileChip({
       return;
     }
     if (previewKind === "pdf") {
-      onOpenPreview({ attachment, preview: { kind: "pdf" }, url: urls.pdfPreview(attachment.id) });
+      onOpenPreview({ attachment, preview: { kind: "pdf" }, truncated: false, url: urls.pdfPreview(attachment.id) });
       return;
     }
     setLoading(true);
     try {
-      const maxBytes = previewKind === "markdown" ? MARKDOWN_PREVIEW_PAYLOAD_BYTE_LIMIT : TEXT_PREVIEW_BYTE_LIMIT;
-      const text = await fetchReadOnlyText(urls.inline(attachment.id), maxBytes);
-      if (text === null || text.trim().length === 0) {
-        download();
+      const read = previewKind === "markdown"
+        ? await fetchReadOnlyText(urls.inline(attachment.id), MARKDOWN_PREVIEW_BYTE_LIMIT, { truncate: true })
+        : await fetchReadOnlyText(urls.inline(attachment.id), TEXT_PREVIEW_BYTE_LIMIT);
+      if (read === null || read === "too_large" || read.text.trim().length === 0) {
+        explainAndDownload(read === "too_large" ? "too_large" : "unsupported");
         return;
       }
+      const { text, truncated, byteLength } = read;
       onOpenPreview({
         attachment,
-        preview: previewKind === "markdown" ? { kind: "markdown", markdown: text.trim() } : { kind: "text", text },
+        preview: previewKind === "markdown"
+          ? {
+            kind: "markdown",
+            markdown: text.trim(),
+            ...(truncated ? { previewByteLength: byteLength, sourceByteLength: Math.max(attachment.sizeBytes, byteLength) } : {}),
+          }
+          : { kind: "text", text },
+        truncated,
         url: null,
       });
     } catch {
-      download();
+      explainAndDownload("unsupported");
     } finally {
       setLoading(false);
     }
-  }, [attachment, download, onOpenPreview, previewKind, urls]);
+  }, [attachment, download, explainAndDownload, onOpenPreview, previewKind, urls]);
   const onClick = useCallback(() => void handleClick(), [handleClick]);
   return (
     <AttachmentChip
@@ -231,7 +271,7 @@ export default function ReadOnlyMessageAttachments({ attachments }: { attachment
   if (!urls) return null;
 
   return (
-    <div className="mt-1 space-y-2" data-testid="read-only-message-attachments">
+    <div className="mt-1 stack-y-2" data-testid="read-only-message-attachments">
       {imageRows.length > 0 ? (
         <MessageImageGallery className="group-data-[followed-by]/message:mb-px">
           {imageRows.map((row) => (
@@ -283,7 +323,7 @@ export default function ReadOnlyMessageAttachments({ attachments }: { attachment
         <DocumentAttachmentPreviewModal
           filename={previewEntry.attachment.filename}
           preview={previewEntry.preview}
-          truncated={false}
+          truncated={previewEntry.truncated}
           url={previewEntry.url}
           onClose={closePreview}
           onDownload={downloadPreview}

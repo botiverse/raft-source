@@ -1,12 +1,21 @@
+import type { ManagedMcpOAuthClientInput } from "@botiverse/raft-shared";
 import { UnauthorizedError, type OAuthClientProvider, type OAuthDiscoveryState } from "@modelcontextprotocol/sdk/client/auth.js";
 import type {
   OAuthClientInformationMixed,
   OAuthClientMetadata,
   OAuthTokens,
 } from "@modelcontextprotocol/sdk/shared/auth.js";
+import { raftManagedMcpOAuthClient, type ManagedMcpRaftOAuthClientKind } from "./managedMcpRaftOAuthClient";
 
 export interface ManagedMcpOAuthStorage {
   redirectUrl: string;
+  configuredClient?: ManagedMcpOAuthClientInput;
+  /** Signs in with Raft's own client for this provider, resolved from the deployment at each use. */
+  raftClient?: ManagedMcpRaftOAuthClientKind;
+  /** The provider policy's scopes for Raft's client, recorded when it is chosen; without them it is not used. */
+  raftClientScope?: string;
+  /** The active sign-in, checked again after acquiring the credential lease. */
+  authorizationState?: string;
   clientMetadataUrl?: string;
   codeVerifier?: string;
   clientInformation?: OAuthClientInformationMixed;
@@ -27,18 +36,33 @@ export class ManagedMcpOAuthProvider implements OAuthClientProvider {
     return this.storage.redirectUrl;
   }
 
+  /** The user's registered client, else Raft's own client when this Connection uses it. */
+  private get registeredClient(): ManagedMcpOAuthClientInput | undefined {
+    if (this.storage.configuredClient) return this.storage.configuredClient;
+    if (!this.storage.raftClient || !this.storage.raftClientScope) return undefined;
+    const raft = raftManagedMcpOAuthClient(this.storage.raftClient);
+    return raft ? { ...raft, scope: this.storage.raftClientScope } : undefined;
+  }
+
+  /** On a registered or Raft client, never fall back to stored registration data or CIMD. */
+  private get usesRegisteredClient(): boolean {
+    return Boolean(this.storage.configuredClient || this.storage.raftClient);
+  }
+
   get clientMetadata(): OAuthClientMetadata {
+    const client = this.registeredClient;
     return {
       client_name: "Raft Managed MCP",
       redirect_uris: [this.storage.redirectUrl],
       grant_types: ["authorization_code", "refresh_token"],
       response_types: ["code"],
-      token_endpoint_auth_method: "none",
+      token_endpoint_auth_method: client?.tokenEndpointAuthMethod ?? "none",
+      ...(client?.scope ? { scope: client.scope } : {}),
     };
   }
 
   get clientMetadataUrl(): string | undefined {
-    return this.storage.clientMetadataUrl;
+    return this.usesRegisteredClient ? undefined : this.storage.clientMetadataUrl;
   }
 
   state(): string {
@@ -52,11 +76,19 @@ export class ManagedMcpOAuthProvider implements OAuthClientProvider {
   }
 
   clientInformation(): OAuthClientInformationMixed | undefined {
-    return this.storage.clientInformation;
+    const client = this.registeredClient;
+    return client ? {
+      client_id: client.clientId,
+      ...(client.clientSecret ? { client_secret: client.clientSecret } : {}),
+      token_endpoint_auth_method: client.tokenEndpointAuthMethod,
+    } : this.usesRegisteredClient ? undefined : this.storage.clientInformation;
   }
 
   async saveClientInformation(clientInformation: OAuthClientInformationMixed): Promise<void> {
-    this.storage.clientInformation = clientInformation;
+    // The SDK writes back the client it used after a token exchange. A registered or Raft client
+    // is already known; storing it would copy its secret (Raft's comes from the deployment) here.
+    if (this.usesRegisteredClient) delete this.storage.clientInformation;
+    else this.storage.clientInformation = clientInformation;
     await this.persist();
   }
 
@@ -72,6 +104,19 @@ export class ManagedMcpOAuthProvider implements OAuthClientProvider {
 
   redirectToAuthorization(authorizationUrl: URL): void {
     if (!this.fixedState) throw new UnauthorizedError("Managed MCP OAuth must be reconnected from Raft");
+    // A client with fixed scopes (a provider policy) never asks for more: the SDK would otherwise
+    // take a server's `insufficient_scope` challenge, or its full scopes_supported, as the request.
+    const allowed = this.registeredClient?.scope?.split(" ").filter(Boolean);
+    if (allowed?.length) {
+      const requested = authorizationUrl.searchParams.get("scope")?.split(" ").filter(Boolean) ?? [];
+      if (requested.length === 0 || requested.some((scope) => !allowed.includes(scope))) {
+        throw new UnauthorizedError("The MCP server asked for scopes beyond this Connection's client");
+      }
+    }
+    if (this.registeredClient?.requestOfflineAccess) {
+      authorizationUrl.searchParams.set("access_type", "offline");
+      authorizationUrl.searchParams.set("prompt", "consent");
+    }
     this.authorizationUrl = authorizationUrl.toString();
   }
 

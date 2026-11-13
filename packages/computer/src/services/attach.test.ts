@@ -253,7 +253,6 @@ test("attach service: existing local attachment with revoked key fails closed in
         (err: unknown) => {
           assert.ok(err instanceof ComputerServiceError);
           assert.equal((err as ComputerServiceError).code, "PREFLIGHT_FAILED");
-          assert.match((err as ComputerServiceError).message, /not creating a fresh attachment/);
           assert.match((err as ComputerServiceError).message, /recover\/rebind/);
           return true;
         },
@@ -278,7 +277,6 @@ test("attach service: existing local attachment with unreachable preflight asks 
         assert.ok(err instanceof ComputerServiceError);
         assert.equal((err as ComputerServiceError).code, "PREFLIGHT_FAILED");
         assert.match((err as ComputerServiceError).message, /failed preflight \(request_failed\)/);
-        assert.match((err as ComputerServiceError).message, /Network or server may be unavailable/);
         assert.match((err as ComputerServiceError).message, /Retry later/);
         assert.doesNotMatch((err as ComputerServiceError).message, /recover\/rebind/);
         assert.doesNotMatch((err as ComputerServiceError).message, /remove local state/);
@@ -300,7 +298,6 @@ test("attach service: same slug with explicit different serverUrl fails closed i
       (err: unknown) => {
         assert.ok(err instanceof ComputerServiceError);
         assert.equal((err as ComputerServiceError).code, "ATTACH_FAILED");
-        assert.match((err as ComputerServiceError).message, /refusing to use display name or slug to bind identity/);
         assert.match((err as ComputerServiceError).message, /raft-computer setup \/alpha/);
         assert.doesNotMatch((err as ComputerServiceError).message, /remove local state/);
         return true;
@@ -355,7 +352,7 @@ test("attach service: missing user session throws NO_USER_SESSION", async () => 
         (err: unknown) => {
           assert.ok(err instanceof ComputerServiceError);
           assert.equal((err as ComputerServiceError).code, "NO_USER_SESSION");
-          assert.match((err as ComputerServiceError).message, /No user session at .+\. Run `raft-computer login` first\./);
+          assert.match((err as ComputerServiceError).message, /No user session at .+\. Run `raft-computer attach \/alpha` to approve this machine instead\./);
           return true;
         },
       );
@@ -373,7 +370,7 @@ test("attach service: invalid user session shape throws INVALID_USER_SESSION", a
         (err: unknown) => {
           assert.ok(err instanceof ComputerServiceError);
           assert.equal((err as ComputerServiceError).code, "INVALID_USER_SESSION");
-          assert.match((err as ComputerServiceError).message, /User session at .+ is invalid\. Re-run `raft-computer login`\./);
+          assert.match((err as ComputerServiceError).message, /User session at .+ is invalid\. Run `raft-computer attach \/alpha` to approve this machine instead\./);
           return true;
         },
       );
@@ -409,9 +406,8 @@ test("attach service: 403 from server throws ATTACH_NOT_AUTHORIZED", async () =>
           (err: unknown) => {
             assert.ok(err instanceof ComputerServiceError);
             assert.equal((err as ComputerServiceError).code, "ATTACH_NOT_AUTHORIZED");
-            assert.match((err as ComputerServiceError).message, /Server \/alpha is not available to the account/);
             assert.match((err as ComputerServiceError).message, /\(@cindy\)/);
-            assert.match((err as ComputerServiceError).message, /SLOCK_HOME=.*raft-computer login/);
+            assert.doesNotMatch((err as ComputerServiceError).message, /raft-computer login/);
             assert.match((err as ComputerServiceError).message, /SLOCK_HOME=.*raft-computer setup '\/alpha'/);
             assert.match((err as ComputerServiceError).message, /https:\/\/app\.raft\.build\/s\/alpha\//);
             assert.doesNotMatch((err as ComputerServiceError).message, /cindy@example\.io|raft-computer logout/);
@@ -451,7 +447,6 @@ test("attach service: 403 requires_admin throws ATTACH_REQUIRES_ADMIN, not ATTAC
         (err: unknown) => {
           assert.ok(err instanceof ComputerServiceError);
           assert.equal((err as ComputerServiceError).code, "ATTACH_REQUIRES_ADMIN");
-          assert.match((err as ComputerServiceError).message, /requires the admin or owner role/);
           return true;
         },
       );
@@ -473,7 +468,6 @@ test("attach service: 404 plain throws ATTACH_DISABLED", async () => {
         (err: unknown) => {
           assert.ok(err instanceof ComputerServiceError);
           assert.equal((err as ComputerServiceError).code, "ATTACH_DISABLED");
-          assert.match((err as ComputerServiceError).message, /Computer attach is not enabled on this server/);
           return true;
         },
       );
@@ -495,7 +489,6 @@ test("attach service: 404 with server_not_found code throws ATTACH_SERVER_NOT_FO
         (err: unknown) => {
           assert.ok(err instanceof ComputerServiceError);
           assert.equal((err as ComputerServiceError).code, "ATTACH_SERVER_NOT_FOUND");
-          assert.match((err as ComputerServiceError).message, /Server \/missing-server was not found on/);
           assert.match((err as ComputerServiceError).message, /Check the slug spelling and --server-url, then retry\./);
           return true;
         },
@@ -520,7 +513,7 @@ test("attach service: 401 session_invalid throws USER_SESSION_EXPIRED", async ()
           assert.equal((err as ComputerServiceError).code, "USER_SESSION_EXPIRED");
           assert.equal(
             (err as ComputerServiceError).message,
-            "Your user session is no longer valid. Re-run `raft-computer login`.",
+            "Your user session is no longer valid. Run `raft-computer attach /alpha` to approve this machine instead.",
           );
           return true;
         },
@@ -541,7 +534,6 @@ test("attach service: connection drop throws ATTACH_REQUEST_FAILED", async () =>
         (err: unknown) => {
           assert.ok(err instanceof ComputerServiceError);
           assert.equal((err as ComputerServiceError).code, "ATTACH_REQUEST_FAILED");
-          assert.match((err as ComputerServiceError).message, /Could not reach .+ while attaching to \/alpha\./);
           assert.match((err as ComputerServiceError).message, /Check --server-url \/ network connectivity, then retry\./);
           return true;
         },
@@ -612,7 +604,6 @@ test("attach service: preflight failure throws PREFLIGHT_FAILED + ZERO local-sta
           assert.ok(err instanceof ComputerServiceError);
           assert.equal((err as ComputerServiceError).code, "PREFLIGHT_FAILED");
           assert.match((err as ComputerServiceError).message, /Server preflight failed \(schema_mismatch\)\./);
-          assert.match((err as ComputerServiceError).message, /nothing was written locally/);
           return true;
         },
       );

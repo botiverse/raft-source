@@ -1,3 +1,4 @@
+import type { TurnEndCompactionDriverOutcome, TurnEndContextFacts } from "../turnEndCompaction";
 import { randomUUID } from "node:crypto";
 import { ambientProcessEnv } from "../processEnvPatch";
 import { EventEmitter } from "node:events";
@@ -8,10 +9,10 @@ import { homedir } from "node:os";
 import type {
   Session as KimiSession,
   createKimiHarness,
-  LocalKaos,
   Event as KimiSdkEvent,
   GoalToolResult,
   KimiHarness,
+  KimiHostIdentity,
 } from "@botiverse/kimi-code-sdk";
 
 import {
@@ -19,6 +20,8 @@ import {
   RuntimeLoginRequiredError,
   RuntimeModelNotConfiguredError,
 } from "../spawnFailureErrors";
+import { kimiToolResultOutcome } from "./kimiToolResult";
+import { SendIntentArgumentScanner } from "./sendIntentScanner";
 
 const requireFromHere = createRequire(import.meta.url);
 
@@ -43,8 +46,8 @@ export function loadKimiSdk(): Promise<KimiSdk> {
  */
 export async function verifyBundledKimiSdk(): Promise<void> {
   const sdk = await loadKimiSdk();
-  if (typeof sdk.createKimiHarness !== "function" || typeof sdk.LocalKaos !== "function") {
-    throw new Error("bundled kimi SDK is missing createKimiHarness/LocalKaos");
+  if (typeof sdk.createKimiHarness !== "function") {
+    throw new Error("bundled kimi SDK is missing createKimiHarness");
   }
 }
 
@@ -54,13 +57,18 @@ function isKimiError(error: unknown): error is import("@botiverse/kimi-code-sdk"
 }
 
 /**
- * The SDK's `resolveKimiHome`, without loading the SDK: an explicit home, else
- * `KIMI_CODE_HOME`, else `~/.kimi-code`. Model detection and session launch
- * both use this one resolver so they cannot read different homes;
- * kimi-sdk.test.ts pins it to the SDK's.
+ * The Kimi Code SDK home for an env (the spawn env at session launch, which
+ * already merges the agent's env vars over the daemon's; the daemon's own env
+ * for model detection), without loading the SDK. The transcript resolver
+ * (runtimeArtifacts `resolveKimiSdkHomeFromConfig`) applies the same rule,
+ * `kimiSdkHomeFromEnv` (kimiCodeHome.ts), to the same merge, so the two
+ * cannot read different homes. It matches the SDK's own resolver for an unset
+ * or absolute `KIMI_CODE_HOME` (pinned by kimi-sdk.test.ts); an empty value
+ * counts as unset and a relative one is resolved against the daemon's cwd,
+ * where the in-process SDK resolves it too.
  */
-export function resolveKimiHome(homeDir?: string): string {
-  return homeDir ?? process.env.KIMI_CODE_HOME ?? path.join(homedir(), ".kimi-code");
+export function resolveKimiHome(env: Record<string, string | undefined> = process.env): string {
+  return kimiSdkHomeFromEnv(env, homedir());
 }
 
 /**
@@ -92,7 +100,7 @@ export const KIMI_CODE_PLATFORM = "kimi_code_cli";
  * exact dependency pin so a package-only bump cannot leave the wire identity
  * stale again.
  */
-export const KIMI_CODE_HOST_VERSION = "0.34.0-botiverse.0";
+export const KIMI_CODE_HOST_VERSION = "2.3.1-botiverse.1";
 
 function getDaemonVersion(): string {
   try {
@@ -103,6 +111,21 @@ function getDaemonVersion(): string {
   }
 }
 
+/**
+ * How this daemon identifies itself to Kimi's OAuth host and managed
+ * endpoints: an agent's harness and the web sign-in (runtimeAuth/kimiSdkAuth.ts)
+ * present the same identity, so the device a sign-in registers is the one
+ * agents then run as.
+ */
+export function kimiCodeHostIdentity(): KimiHostIdentity {
+  return {
+    productName: KIMI_CODE_USER_AGENT_PRODUCT,
+    version: KIMI_CODE_HOST_VERSION,
+    platform: KIMI_CODE_PLATFORM,
+    userAgentSuffix: `slock-daemon/${getDaemonVersion()}`,
+  };
+}
+
 import {
   hydrateRuntimeConfig,
   runtimeConfigToLaunchFields,
@@ -111,8 +134,10 @@ import {
   type RuntimeModelSourceOutcome,
   type AxSurfaceText,
 } from "@botiverse/raft-shared";
-import { buildCliTransportSystemPrompt, prepareCliTransport, SLOCK_AGENT_LAUNCH_DIR_ENV, SLOCK_CLI_TRANSPORT_DIR_ENV, toolEnvFromSpawnEnv } from "./cliTransport";
+import { buildCliTransportSystemPrompt, prepareCliTransport, SLOCK_AGENT_LAUNCH_DIR_ENV, SLOCK_CLI_TRANSPORT_DIR_ENV } from "./cliTransport";
+import { kimiSdkHomeFromEnv } from "./kimiCodeHome";
 import { prepareManagedMcpRuntimeProxy } from "../managedMcpRuntimeProxy";
+import { RuntimeTurnOriginHolder, type RuntimeTurnOrigin } from "../runtimeTurnOrigin";
 import {
   createKimiRequestDiagnosticSession,
   type KimiRequestDiagnosticRecord,
@@ -144,11 +169,8 @@ type RuntimeSessionEvents = {
 
 type RuntimeSessionEventName = keyof RuntimeSessionEvents;
 
-type PendingKimiTurnStartAttempt = {
-  id: number;
-  text: string;
-  delivery: boolean;
-};
+/** How long a turn-end compaction may run before it counts as failed (the wait ends; Kimi's compaction may still finish). */
+const KIMI_TURN_END_COMPACTION_WAIT_MS = 10 * 60_000;
 
 export type KimiSessionFactory = (ctx: SpawnContext, sessionId: string) => Promise<{
   harness: KimiHarness;
@@ -156,9 +178,9 @@ export type KimiSessionFactory = (ctx: SpawnContext, sessionId: string) => Promi
   /**
    * Absolute path to the per-agent `raft` CLI wrapper that prepareCliTransport
    * wrote for this session. Kept for diagnostics/observability; the LLM no
-   * longer receives this path in the standing prompt. Instead, the per-session
-   * tool Kaos prepends the wrapper directory to PATH so the model can use the
-   * bare `raft` command.
+   * longer receives this path in the standing prompt. Instead, the harness's
+   * tool base environment prepends the wrapper directory to PATH so the model
+   * can use the bare `raft` command.
    */
   wrapperPath: string;
 }>;
@@ -168,6 +190,121 @@ export interface KimiSdkEventMappingState {
   sessionAnnounced: boolean;
   seenUsageSteps: Set<string>;
   usageIdentityOmissionObserved: boolean;
+  /** Agent typing line: `raft message send` targets in streaming Bash arguments (created on first use). */
+  sendIntentScanner?: SendIntentArgumentScanner;
+  /** The daemon cancelled the running turn: its `cancelled` end is a stop, not a failure. */
+  interruptRequested?: boolean;
+  /**
+   * #proj-runtime:#41 — subagents spawned in this session, by their agent id
+   * (`subagent.spawned.subagentId`, the id their own events carry).
+   */
+  subagents?: Map<string, KimiSubagent>;
+  /** Ends of subagents whose spawn has not arrived yet (bounded, oldest first). */
+  unspawnedSubagentEnds?: Set<string>;
+}
+
+interface KimiSubagent {
+  /** The call that started its current run; a spawn by a subagent is qualified by that subagent's agent id. */
+  parentToolCallId: string;
+  name?: string;
+  /**
+   * Its current run's task id when the main agent started it: the session
+   * stops it by that id (`Session.stopBackgroundTask`, which looks only in the
+   * main agent's tasks), foreground or background.
+   */
+  stopTaskId?: string;
+  /** Its current run has started and not ended. A resume spawns it again with a new call. */
+  running: boolean;
+  /** Its text or reasoning not yet passed on, so interleaved deltas stay whole rows. */
+  pendingText?: { kind: "thinking" | "text"; text: string };
+}
+
+/** At most this many ends of subagents not yet spawned are remembered (an end can beat its spawn). */
+const KIMI_UNSPAWNED_ENDS_LIMIT = 64;
+
+/** Its buffered text or reasoning, as one row, before anything else of its own is passed on. */
+function flushKimiSubagentText(subagentId: string, subagent: KimiSubagent): ParsedEvent[] {
+  const pending = subagent.pendingText;
+  if (!pending || pending.text.length === 0) return [];
+  subagent.pendingText = undefined;
+  return [{ kind: pending.kind, text: pending.text, subagent: kimiSubagentLineage(subagentId, subagent) }];
+}
+
+function kimiSubagentLineage(subagentId: string, subagent: KimiSubagent): { parentToolUseId: string; taskId: string; subagentType?: string } {
+  return { parentToolUseId: subagent.parentToolCallId, taskId: subagentId, ...(subagent.name ? { subagentType: subagent.name } : {}) };
+}
+
+function kimiSubagentEnded(state: KimiSdkEventMappingState, subagentId: string, taskStatus: "completed" | "failed" | "stopped"): ParsedEvent[] {
+  const subagent = state.subagents?.get(subagentId);
+  if (!subagent?.running) {
+    // Its end beat its spawn (a cancel before a spawn or a resume was
+    // announced): that spawn must not start it. The SDK sends one end per run.
+    const ends = state.unspawnedSubagentEnds ??= new Set();
+    ends.add(subagentId);
+    const oldest = ends.values().next().value;
+    if (ends.size > KIMI_UNSPAWNED_ENDS_LIMIT && oldest !== undefined) ends.delete(oldest);
+    return [];
+  }
+  subagent.running = false;
+  return [
+    ...flushKimiSubagentText(subagentId, subagent),
+    { kind: "subagent_progress", source: "kimi_subagent", phase: "notification", taskStatus, ...kimiSubagentLineage(subagentId, subagent) },
+  ];
+}
+
+/**
+ * #proj-runtime:#41 — a subagent's own event (its `agentId` is a subagent
+ * this session spawned), or null for the main agent's and unknown agents'.
+ * Kept: its text, reasoning and tool calls, with its lineage; its call ids
+ * qualified by its agent id (ids are only unique per agent). Its usage is
+ * counted as before. Its turn ends, errors and compaction stay out: they are
+ * not the agent's.
+ */
+export function mapKimiSubagentEvent(event: KimiSdkEvent, state: KimiSdkEventMappingState): ParsedEvent[] | null {
+  const agentId = (event as { agentId?: unknown }).agentId;
+  if (typeof agentId !== "string" || agentId === KIMI_MAIN_AGENT_ID) return null;
+  const subagent = state.subagents?.get(agentId);
+  if (!subagent) return null;
+  const subagentLineage = { subagent: kimiSubagentLineage(agentId, subagent) };
+  switch (event.type) {
+    case "thinking.delta":
+    case "assistant.delta": {
+      if (typeof event.delta !== "string" || event.delta.length === 0) return [];
+      const kind = event.type === "thinking.delta" ? "thinking" : "text";
+      // Buffered per subagent: the daemon's text buffer is per agent, so the
+      // main agent's and other subagents' deltas would split each other's rows.
+      const flushed = subagent.pendingText && subagent.pendingText.kind !== kind ? flushKimiSubagentText(agentId, subagent) : [];
+      subagent.pendingText = { kind, text: (subagent.pendingText?.text ?? "") + event.delta };
+      return flushed;
+    }
+    case "turn.step.completed":
+    case "turn.ended":
+      return flushKimiSubagentText(agentId, subagent);
+    case "tool.call.started":
+      return [...flushKimiSubagentText(agentId, subagent), {
+        kind: "tool_call",
+        name: event.name || "unknown_tool",
+        input: event.args ?? {},
+        ...(event.toolCallId ? { callId: `${agentId}:${event.toolCallId}` } : {}),
+        ...subagentLineage,
+      }];
+    case "tool.result":
+      return [{
+        kind: "tool_output",
+        name: "",
+        ...(event.toolCallId ? { callId: `${agentId}:${event.toolCallId}` } : {}),
+        ...kimiToolResultOutcome(event),
+        ...subagentLineage,
+      }];
+    // Its own subagents' lifecycle (nested): recorded as any spawn's.
+    case "subagent.spawned":
+    case "subagent.completed":
+    case "subagent.failed":
+    case "subagent.cancelled":
+      return mapKimiSdkEventToParsedEvents(event, state);
+    default:
+      return [];
+  }
 }
 
 export function createKimiSdkEventMappingState(sessionId: string | null = null): KimiSdkEventMappingState {
@@ -188,6 +325,7 @@ export function setKimiSdkEventMappingSession(
   state.sessionAnnounced = false;
   state.seenUsageSteps.clear();
   state.usageIdentityOmissionObserved = false;
+  state.sendIntentScanner?.reset();
 }
 
 function finiteNumber(value: unknown): number | undefined {
@@ -282,12 +420,6 @@ function kimiErrorMessage(error: unknown): string {
   return "Unknown Kimi error";
 }
 
-function kimiDeliveryErrorCode(message: string): "turn.agent_busy" | "runtime.delivery_error" {
-  return /Cannot launch a new turn while another turn\b/i.test(message)
-    ? "turn.agent_busy"
-    : "runtime.delivery_error";
-}
-
 function kimiGoalIsActive(result: GoalToolResult | null | undefined): boolean {
   return result?.goal?.status === "active";
 }
@@ -311,19 +443,6 @@ function pushSessionInitIfNeeded(state: KimiSdkEventMappingState, events: Parsed
  * The single turn-triggering source class is `turn.ended` → daemon idle ONLY
  * derives from this. Other events MUST NOT produce `kind: "turn_end"`.
  */
-/**
- * Kimi's Bash tool reports a command that exited non-zero as an error result
- * ("Command failed with exit code: N."): the command ran, so the tool call is
- * ok and the exit code is recorded. `isError` is optional in the SDK; when it
- * is absent the outcome is unknown and left out.
- */
-export function kimiToolResultOutcome(event: { isError?: boolean; output?: unknown }): { ok?: boolean; exitCode?: number } {
-  if (event.isError !== true) return event.isError === false ? { ok: true } : {};
-  const text = typeof event.output === "string" ? event.output : JSON.stringify(event.output ?? "").slice(0, 4096);
-  const exit = /Command failed with exit code: (\d+)/.exec(text);
-  return exit ? { ok: true, exitCode: Number(exit[1]) } : { ok: false };
-}
-
 export function mapKimiSdkEventToParsedEvents(
   event: KimiSdkEvent,
   state: KimiSdkEventMappingState,
@@ -370,13 +489,25 @@ export function mapKimiSdkEventToParsedEvents(
       return events;
 
     // ── THE single turn-triggering source class ──
-    case "turn.ended":
-      events.push({ kind: "turn_end", sessionId: state.sessionId || undefined });
+    case "turn.ended": {
+      const interrupted = state.interruptRequested === true && event.reason === "cancelled";
+      state.interruptRequested = false;
+      events.push({ kind: "turn_end", sessionId: state.sessionId || undefined, ...(interrupted ? { interrupted: true as const } : {}) });
       return events;
+    }
 
     case "turn.step.completed": {
       const usage = buildKimiStepUsageEvent(event, state);
       if (usage) events.push(usage);
+      return events;
+    }
+
+    case "tool.call.delta": {
+      // Agent typing line: Kimi streams the arguments JSON in `argumentsPart`
+      // fragments keyed by the call id that `tool.call.started` later reuses.
+      const sendIntent = (state.sendIntentScanner ??= new SendIntentArgumentScanner())
+        .append(event.toolCallId, event.name, event.argumentsPart);
+      if (sendIntent) events.push(sendIntent);
       return events;
     }
 
@@ -393,7 +524,6 @@ export function mapKimiSdkEventToParsedEvents(
     case "turn.step.retrying":
     case "turn.step.interrupted":
     // tool-call progress / hooks (could elevate to internal_progress in future)
-    case "tool.call.delta":
     case "tool.progress":
     case "shell.output":
     case "shell.started":
@@ -416,15 +546,49 @@ export function mapKimiSdkEventToParsedEvents(
     // MCP infra
     case "tool.list.updated":
     case "mcp.server.status":
-    // subagent lifecycle (v0: drop; could surface later)
-    case "subagent.spawned":
+      return events;
+    // #proj-runtime:#41: subagent lifecycle. A spawn names it (its agent id,
+    // the call that started it, its profile) and starts it; its end says how.
+    case "subagent.spawned": {
+      if (!event.subagentId) return events;
+      const subagents = state.subagents ??= new Map();
+      const known = subagents.get(event.subagentId);
+      // A spawn while its run is going is a repeat; one after it ended is a resume: a new run, under its new call.
+      if (known?.running) return events;
+      // The spawning agent's call ids are only unique per agent: a subagent's are qualified, as its tool rows are.
+      const spawner = (event as { agentId?: unknown }).agentId;
+      const parentToolCallId = typeof spawner === "string" && spawner !== KIMI_MAIN_AGENT_ID ? `${spawner}:${event.parentToolCallId}` : event.parentToolCallId;
+      const endedAlready = state.unspawnedSubagentEnds?.delete(event.subagentId) === true;
+      const subagent: KimiSubagent = {
+        parentToolCallId,
+        ...(event.subagentName ? { name: event.subagentName } : {}),
+        ...(event.taskId && !(typeof spawner === "string" && spawner !== KIMI_MAIN_AGENT_ID) ? { stopTaskId: event.taskId } : {}),
+        running: !endedAlready,
+      };
+      subagents.set(event.subagentId, subagent);
+      if (subagent.running) events.push({ kind: "subagent_progress", source: "kimi_subagent", phase: "started", ...kimiSubagentLineage(event.subagentId, subagent) });
+      return events;
+    }
+    case "subagent.completed":
+      events.push(...kimiSubagentEnded(state, event.subagentId, "completed"));
+      return events;
+    case "subagent.failed":
+      events.push(...kimiSubagentEnded(state, event.subagentId, "failed"));
+      return events;
+    case "subagent.cancelled":
+      events.push(...kimiSubagentEnded(state, event.subagentId, "stopped"));
+      return events;
+    // Started (after its spawn) and suspended change nothing shown.
     case "subagent.started":
     case "subagent.suspended":
-    case "subagent.completed":
-    case "subagent.failed":
     // compaction sub-cases
     case "compaction.blocked":
     case "compaction.cancelled":
+    // kimi-code 2.x engine notices: config load warnings, plugin and model
+    // capability changes (state-only)
+    case "event.config.warning":
+    case "event.plugin.changed":
+    case "event.capability.changed":
     // out-of-band
     case "task.started":
     case "task.terminated":
@@ -446,6 +610,23 @@ export function mapKimiSdkEventToParsedEvents(
       return events;
     }
   }
+}
+
+const KIMI_MAIN_AGENT_ID = "main";
+/**
+ * What of a subagent's events the daemon passes on. The engine delivers every
+ * agent's events on the session, each with its own `agentId`: a subagent's
+ * `turn.ended` must not end the main agent's turn, and its text, errors and
+ * compaction are not the main agent's. Only its usage is counted here; a
+ * subagent the session spawned has its text and tool calls shown with its
+ * lineage (mapKimiSubagentEvent), which keeps them out of the agent's own turn.
+ */
+const KIMI_SUBAGENT_EVENTS_SHOWN: ReadonlySet<string> = new Set(["turn.step.completed"]);
+
+export function kimiEventIsShownForMainAgent(event: KimiSdkEvent): boolean {
+  const agentId = (event as { agentId?: unknown }).agentId;
+  if (typeof agentId !== "string" || agentId === KIMI_MAIN_AGENT_ID) return true;
+  return KIMI_SUBAGENT_EVENTS_SHOWN.has(event.type);
 }
 
 const KIMI_SDK_RUNTIME_SESSION_DESCRIPTOR = {
@@ -475,9 +656,9 @@ const KIMI_SDK_RUNTIME_SESSION_DESCRIPTOR = {
  * it survives Kimi's context compaction and never has to be re-asserted.
  *
  * Returns the standing prompt verbatim (or "" when absent). The per-agent
- * `raft` wrapper is no longer surfaced here; instead, the Kimi SDK bash tool
- * receives a per-session tool Kaos whose PATH is prepended with the current
- * launch's wrapper directory, so the model can use the bare `raft` command.
+ * `raft` wrapper is no longer surfaced here; instead, the harness's tool base
+ * environment has PATH prepended with the current launch's wrapper directory,
+ * so the model can use the bare `raft` command.
  *
  * The `wrapperPath` parameter is kept for signature compatibility but ignored.
  */
@@ -485,7 +666,7 @@ export function composeStandingRoleAdditional(
   standingPrompt: string | undefined,
   wrapperPath: string | null,
 ): string {
-  void wrapperPath; // per-session PATH is supplied via tool Kaos; no absolute-path note needed
+  void wrapperPath; // PATH is supplied via the harness's tool base env; no absolute-path note needed
   return standingPrompt ?? "";
 }
 
@@ -497,7 +678,35 @@ export function composeStandingRoleAdditional(
 export interface KimiSessionFactoryDeps {
   createHarness?: typeof createKimiHarness;
   prepareTransport?: typeof prepareCliTransport;
-  createLocalKaos?: () => Promise<LocalKaos>;
+}
+
+/**
+ * The environment every tool process the Kimi engine spawns starts from: the
+ * spawn env the transport computed for this agent (the daemon's ambient env,
+ * the agent's own variables, identity and runtime context, keys it removed
+ * left out) plus the wrapper PATH and launch selectors. It replaces the
+ * daemon's process.env as the base, so what Kimi's tools see is what a
+ * child-process runtime gets, and nothing the daemon itself carries leaks in.
+ */
+export function kimiToolBaseEnv(input: {
+  spawnEnv: NodeJS.ProcessEnv;
+  slockDir: string;
+  slockHome: string;
+}): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const [key, value] of Object.entries(input.spawnEnv)) {
+    if (typeof value === "string") env[key] = value;
+  }
+  return {
+    ...env,
+    // Same PATH as the spawned-runtime env (wrapper dir + agent-configured or
+    // daemon PATH).
+    PATH: input.spawnEnv.PATH ?? `${input.slockDir}${path.delimiter}${ambientProcessEnv().PATH ?? ""}`,
+    NO_COLOR: "1",
+    SLOCK_HOME: input.slockHome,
+    [SLOCK_AGENT_LAUNCH_DIR_ENV]: path.basename(input.slockDir),
+    [SLOCK_CLI_TRANSPORT_DIR_ENV]: input.slockDir,
+  };
 }
 
 export async function createKimiAgentSessionForContext(
@@ -505,7 +714,7 @@ export async function createKimiAgentSessionForContext(
   sessionId: string,
   deps: KimiSessionFactoryDeps = {},
 ): Promise<{ harness: KimiHarness; session: KimiSession; wrapperPath: string }> {
-  const sdk = deps.createHarness && deps.createLocalKaos ? null : await loadKimiSdk();
+  const sdk = deps.createHarness ? null : await loadKimiSdk();
   const createHarnessImpl = deps.createHarness ?? sdk!.createKimiHarness;
   const prepareTransportImpl = deps.prepareTransport ?? prepareCliTransport;
   const sessionDir = buildKimiSessionDir(ctx.workingDirectory);
@@ -513,46 +722,27 @@ export async function createKimiAgentSessionForContext(
 
   // prepareCliTransport writes the per-agent `raft` wrapper into daemon-owned
   // transport storage outside the model workspace. For the in-process Kimi SDK
-  // runtime we supply the wrapper directory via a per-session tool Kaos (PATH
-  // prepend + launch selector) instead of surfacing an absolute wrapper path in
-  // the standing prompt.
+  // runtime the wrapper directory reaches the engine's tool processes through
+  // the harness's base env (PATH prepend + launch selector) instead of an
+  // absolute wrapper path in the standing prompt.
   const cliTransport = await prepareTransportImpl(ctx, { NO_COLOR: "1" });
   const spawnEnv = cliTransport.spawnEnv;
   const wrapperPath = cliTransport.wrapperPath;
-  const slockDir = cliTransport.slockDir;
-  const slockHome = cliTransport.slockHome;
-
-  // The SDK's bash tool must resolve `raft` to the current launch's wrapper and
-  // forward any stale absolute wrapper invocation to the current launch before
-  // stale credential/proxy env is read. Build a tool Kaos that overlays the
-  // per-session env; keep persistence on a plain LocalKaos so session files and
-  // credentials stay local to the daemon host.
-  // The Kaos env layers over the daemon's own process.env, so overlay the
-  // whole spawn env the transport computed for this agent (identity, runtime
-  // context, agent-configured env) and unset what it removed — what a
-  // child-process runtime gets. Without it, tools that read SLOCK_AGENT_ID /
-  // SLOCK_SERVER_URL / RAFT_CURRENT_* directly (not through the `raft`
-  // wrapper) see no agent. Kaos types layers as strings; undefined values
-  // pass through to Node's spawn, which omits them.
-  const localKaos = await (deps.createLocalKaos ?? (() => sdk!.LocalKaos.create()))();
-  const toolKaos = localKaos.withEnv({
-    ...(toolEnvFromSpawnEnv(spawnEnv) as Record<string, string>),
-    // Same PATH as the spawned-runtime env (wrapper dir + agent-configured or
-    // daemon PATH), not a fresh process.env.PATH that drops the agent's own.
-    PATH: spawnEnv.PATH ?? `${slockDir}${path.delimiter}${process.env.PATH ?? ""}`,
-    NO_COLOR: "1",
-    SLOCK_HOME: slockHome,
-    [SLOCK_AGENT_LAUNCH_DIR_ENV]: path.basename(slockDir),
-    [SLOCK_CLI_TRANSPORT_DIR_ENV]: slockDir,
-  });
+  const baseEnv = kimiToolBaseEnv({ spawnEnv, slockDir: cliTransport.slockDir, slockHome: cliTransport.slockHome });
 
   // Kimi Code keeps config, OAuth credentials, and sessions under
   // KIMI_CODE_HOME (default: ~/.kimi-code). Use the same resolver as model
   // detection so the two cannot silently read different homes. Pass the
   // prepared per-agent override into it; per-agent env is not installed into
   // the daemon process-wide environment.
-  const homeDir = resolveKimiHome(spawnEnv.KIMI_CODE_HOME);
+  const homeDir = resolveKimiHome(spawnEnv);
   mkdirSync(homeDir, { recursive: true });
+
+  // The standing prompt rides the harness's `roleAdditional` (botiverse
+  // mirror): rendered into the main agent's `${role_additional}` slot of the
+  // base system prompt, sent on EVERY request, so it survives context
+  // compaction. A resumed session is re-rendered with the current value.
+  const roleAdditional = composeStandingRoleAdditional(ctx.standingPrompt, wrapperPath);
 
   // The harness resolves auth from <homeDir>/credentials/kimi-code.json by
   // default (KimiAuthFacade with the homeDir we just passed). We do NOT call
@@ -561,12 +751,9 @@ export async function createKimiAgentSessionForContext(
   // pipeline based on what's already in <homeDir>.
   const harness = createHarnessImpl({
     homeDir,
-    identity: {
-      productName: KIMI_CODE_USER_AGENT_PRODUCT,
-      version: KIMI_CODE_HOST_VERSION,
-      platform: KIMI_CODE_PLATFORM,
-      userAgentSuffix: `slock-daemon/${getDaemonVersion()}`,
-    },
+    identity: kimiCodeHostIdentity(),
+    ...(roleAdditional ? { roleAdditional } : {}),
+    baseEnv,
   });
 
   const launchRuntimeFields = runtimeConfigToLaunchFields(hydrateRuntimeConfig(ctx.config));
@@ -574,46 +761,28 @@ export async function createKimiAgentSessionForContext(
   // back to fresh creation. Resume gives us memory continuity across daemon
   // restarts; createSession with a pre-existing id throws ("Session ... already
   // exists"), so we MUST go through resume on the second launch.
-  // Deliver the standing prompt via the SDK's native `roleAdditional` session
-  // option (renders into `{{ ROLE_ADDITIONAL }}` in the base system prompt,
-  // resent every request → survives context compaction). Passed identically on
-  // both the resume and fresh-create paths so a resumed agent keeps the same
-  // native standing instructions. The wrapper path note is gone; the per-session
-  // tool Kaos supplies the correct PATH.
-  const roleAdditional = composeStandingRoleAdditional(ctx.standingPrompt, wrapperPath);
   const managedMcp = await prepareManagedMcpRuntimeProxy({
     agentId: ctx.agentId,
     launchId: ctx.launchId,
+    processInstanceId: ctx.processInstanceId,
+    readTurnOrigin: ctx.readTurnOrigin,
     serverUrl: ctx.config.serverUrl,
     agentCredentialKey: ctx.config.agentCredentialKey,
   });
   const selectedModel = launchRuntimeFields.model && launchRuntimeFields.model !== "default"
     ? launchRuntimeFields.model
     : null;
-  const sessionFields = {
-    workDir: ctx.workingDirectory,
-    kaos: toolKaos,
-    persistenceKaos: localKaos,
-    ...(roleAdditional ? { roleAdditional } : {}),
-    ...(managedMcp ? {
-      mcpServers: {
-        [managedMcp.name]: {
-          transport: "http" as const,
-          url: managedMcp.url,
-        },
-      },
-    } : {}),
-  };
+  const sessionFields = { workDir: ctx.workingDirectory };
   // task #365: right before the SDK session is resumed or created. What ran
-  // before it is local preparation only (CLI transport files, LocalKaos, the
-  // harness object, the managed MCP proxy): no provider request and no tool
+  // before it is local preparation only (CLI transport files, the harness
+  // object, the managed MCP proxy): no provider request and no tool
   // execution. A stale launch throws here; the launch's proxies are released
   // by the process manager's failed-start cleanup.
   ctx.assertLaunchCurrent?.();
   let session: KimiSession;
   try {
+    let resumed = false;
     if (ctx.config.sessionId) {
-      let resumed = false;
       try {
         session = await harness.resumeSession({ ...sessionFields, id: ctx.config.sessionId });
         resumed = true;
@@ -634,39 +803,80 @@ export async function createKimiAgentSessionForContext(
           ...(launchRuntimeFields.reasoningEffort ? { thinking: launchRuntimeFields.reasoningEffort } : {}),
         });
       }
-      // Resume restores the persisted model/thinking profile. Re-apply the
-      // current Runtime Profile before the first resumed turn: `model` and
-      // `thinking` are not resume options, while the Session methods are the
-      // SDK's supported live reconfiguration surface. A failure here is not a
-      // missing session and must remain visible rather than falling back to a
-      // fresh create.
-      if (resumed) {
-        if (selectedModel) {
-          await session.setModel(selectedModel);
-        }
-        if (launchRuntimeFields.reasoningEffort) {
-          await session.setThinking(launchRuntimeFields.reasoningEffort);
-        }
-      } else if (selectedModel) {
-        // Fresh fallback: resolve the model now, as on the fresh path below.
-        await session.setModel(selectedModel);
-      }
     } else {
       session = await harness.createSession({
         ...sessionFields,
         ...(selectedModel ? { model: selectedModel } : {}),
         ...(launchRuntimeFields.reasoningEffort ? { thinking: launchRuntimeFields.reasoningEffort } : {}),
       });
+    }
+    // The engine takes no MCP servers on create or resume; the managed server
+    // is attached to the live session, every launch (not persisted). The
+    // engine only gives an agent the tools of servers known when its session
+    // was opened (agent-core-v2 freezes that set), so the session is reloaded
+    // once to open it again with the managed server in it. This runs before
+    // the Runtime Profile below is applied, so the reload cannot undo it.
+    // Remove the reload once the SDK forwards `mcpServers` through the
+    // harness's createSession/resumeSession (botiverse/kimi-code-sdk fork).
+    if (managedMcp) await attachManagedMcpServer(ctx, session, managedMcp);
+    if (resumed) {
+      // Resume restores the persisted model/thinking profile. Re-apply the
+      // current Runtime Profile before the first resumed turn: `model` and
+      // `thinking` are not resume options, while the Session methods are the
+      // SDK's supported live reconfiguration surface. A failure here is not a
+      // missing session and must remain visible rather than falling back to a
+      // fresh create.
+      if (selectedModel) await session.setModel(selectedModel);
+      if (launchRuntimeFields.reasoningEffort) await session.setThinking(launchRuntimeFields.reasoningEffort);
+    } else if (selectedModel) {
       // createSession only records the model alias; the SDK resolves it against
       // the local config on the first request. Resolve it now so a model that is
       // not configured on this computer fails the start (typed, stops automatic
       // relaunches) instead of failing every first turn (task #1221).
-      if (selectedModel) await session.setModel(selectedModel);
+      await session.setModel(selectedModel);
     }
   } catch (error) {
+    // Nothing else holds this harness: close it, or a failed start keeps its
+    // session, session lock and MCP connection open.
+    await Promise.resolve().then(() => harness.close()).catch(() => undefined);
     throw typedKimiStartError(error, selectedModel);
   }
   return { harness, session, wrapperPath };
+}
+
+/**
+ * Attach the launch's managed MCP server (Raft apps) to the live session and
+ * reload the session so its tools reach the agent. Neither step is allowed to
+ * fail the start: without them the agent only lacks the apps' tools, and the
+ * session itself is fine (0.34 passed the server as a session option, so an
+ * unreachable server never stopped the session from opening either). A
+ * failure is recorded and the start goes on.
+ */
+async function attachManagedMcpServer(
+  ctx: SpawnContext,
+  session: KimiSession,
+  managedMcp: { name: string; url: string },
+): Promise<void> {
+  let step: "add" | "reload" = "add";
+  try {
+    await session.addMcpServer({ name: managedMcp.name, transport: "http", url: managedMcp.url });
+    step = "reload";
+    await session.reloadSession();
+  } catch (error) {
+    const failureCode = isKimiError(error) ? error.code : error instanceof Error ? error.name : "unknown";
+    console.warn(`[kimi-sdk] managed MCP ${managedMcp.name} unavailable for this session (${step} failed: ${failureCode}); starting without it`);
+    ctx.tracer?.emitEvent("daemon.runtime.managed_mcp.attach_failed", {
+      surface: "daemon",
+      attrs: {
+        runtime: "kimi-sdk",
+        agent_id: ctx.agentId,
+        launch_id: ctx.launchId ?? undefined,
+        mcp_server_name: managedMcp.name,
+        step_kind: step,
+        failure_code: failureCode,
+      },
+    });
+  }
 }
 
 /**
@@ -716,11 +926,15 @@ export class KimiSdkRuntimeSession implements RuntimeSession {
   private requestedStopReason: string | undefined;
   private exitInfo: RuntimeExitInfo | null = null;
   private sdkTurnActive = false;
+  /** #proj-runtime:#54 phase 3: the turn-end compaction this driver asked for, settled by its compaction event. */
+  private turnEndCompactionWaiter: ((outcome: TurnEndCompactionDriverOutcome) => void) | null = null;
+  /** Each prompt's number; interruptTurn marks the one it cancelled, whose late rejection is not an error. */
+  private promptSeq = 0;
+  private cancelledPromptSeq: number | null = null;
   private goalRunActive = false;
   private pendingTurnEndSessionId: string | undefined;
   private requestDiagnostics: KimiRequestDiagnosticSession | null = null;
-  private nextTurnStartAttemptId = 1;
-  private pendingTurnStartAttempt: PendingKimiTurnStartAttempt | undefined;
+  private readonly turnOrigin: RuntimeTurnOriginHolder;
 
   constructor(
     private readonly ctx: SpawnContext,
@@ -728,6 +942,13 @@ export class KimiSdkRuntimeSession implements RuntimeSession {
     private readonly sessionFactory: KimiSessionFactory = createKimiAgentSessionForContext,
   ) {
     this.mappingState = createKimiSdkEventMappingState(ctx.config.sessionId || null);
+    this.turnOrigin = new RuntimeTurnOriginHolder(ctx.processInstanceId);
+    // Registered in the constructor so these run BEFORE any manager listener: on turn_end the
+    // manager may immediately send the next idle prompt, which must see the previous turn closed.
+    this.events.on("runtime_event", (event: ParsedEvent) => {
+      if (event.kind === "turn_end") this.turnOrigin.endTurn();
+    });
+    this.events.on("exit", () => this.turnOrigin.close());
   }
 
   get pid(): undefined {
@@ -764,7 +985,7 @@ export class KimiSdkRuntimeSession implements RuntimeSession {
     this.events.on(event, cb as (...args: unknown[]) => void);
   }
 
-  async start(input: { text: string; sessionId?: string | null }): Promise<RuntimeSendResult> {
+  async start(input: { text: string; sessionId?: string | null; origin?: RuntimeTurnOrigin | null }): Promise<RuntimeSendResult> {
     if (this.started) {
       return { ok: false, reason: "runtime_error", error: "runtime session already started" };
     }
@@ -779,6 +1000,7 @@ export class KimiSdkRuntimeSession implements RuntimeSession {
     const { harness, session, wrapperPath } = await this.sessionFactory(
       {
         ...this.ctx,
+        readTurnOrigin: this.turnOrigin.read,
         config: {
           ...this.ctx.config,
           sessionId,
@@ -830,6 +1052,7 @@ export class KimiSdkRuntimeSession implements RuntimeSession {
       });
       return { ok: true, acceptedAs: "steer" };
     }
+    this.turnOrigin.beginTurn(input.origin);
     this.launchPrompt(firstTurnText, "initial");
     return { ok: true, acceptedAs: "prompt" };
   }
@@ -845,6 +1068,7 @@ export class KimiSdkRuntimeSession implements RuntimeSession {
     mode: "idle" | "busy";
     text: string;
     sessionId?: string | null;
+    origin?: RuntimeTurnOrigin | null;
   }): RuntimeSendResult {
     if (this.didClose) return { ok: false, reason: "closed" };
     const session = this.session;
@@ -870,8 +1094,103 @@ export class KimiSdkRuntimeSession implements RuntimeSession {
       return { ok: true, acceptedAs: "steer" };
     }
 
+    this.turnOrigin.beginTurn(input.origin);
     this.launchPrompt(input.text, "delivery");
     return { ok: true, acceptedAs: "prompt" };
+  }
+
+  /**
+   * Kimi's own cancel: the turn ends with `turn.ended` reason `cancelled` and
+   * the session stays open. A goal run keeps its turn end pending, so it
+   * takes the daemon's restart path instead, as does a turn that does not end
+   * within the daemon's interrupt timeout.
+   */
+  /** #proj-runtime:#54 phase 3: the session's own context count and its model's window. */
+  async turnEndContextFacts(): Promise<TurnEndContextFacts> {
+    const session = this.session;
+    if (this.didClose || !session) return { contextTokens: null, windowTokens: null };
+    try {
+      const status = await session.getStatus();
+      return {
+        contextTokens: status.contextTokens > 0 ? status.contextTokens : null,
+        windowTokens: status.maxContextTokens > 0 ? status.maxContextTokens : null,
+      };
+    } catch {
+      return { contextTokens: null, windowTokens: null };
+    }
+  }
+
+  /**
+   * #proj-runtime:#54 phase 3: Kimi's manual compaction on an idle session,
+   * settled by its compaction.completed / blocked / cancelled event. The SDK
+   * throws with a turn active or nothing to compact: a refusal.
+   */
+  async compactAtTurnEnd(): Promise<TurnEndCompactionDriverOutcome> {
+    const session = this.session;
+    if (this.didClose || !session) return { kind: "refused", reason: "no_session" };
+    if (this.sdkTurnActive || this.goalRunActive) return { kind: "refused", reason: "busy" };
+    if (this.turnEndCompactionWaiter) return { kind: "refused", reason: "compacting" };
+    const settled = new Promise<TurnEndCompactionDriverOutcome>((resolve) => { this.turnEndCompactionWaiter = resolve; });
+    try {
+      await session.compact();
+    } catch (error) {
+      this.turnEndCompactionWaiter = null;
+      return { kind: "refused", reason: /turn/i.test(kimiErrorMessage(error)) ? "busy" : "nothing_to_compact" };
+    }
+    let timer: NodeJS.Timeout | undefined;
+    const timeout = new Promise<TurnEndCompactionDriverOutcome>((resolve) => {
+      timer = setTimeout(() => resolve({ kind: "failed", reason: "timeout" }), KIMI_TURN_END_COMPACTION_WAIT_MS);
+      timer.unref?.();
+    });
+    try {
+      const outcome = await Promise.race([settled, timeout]);
+      if (outcome.kind === "failed" && outcome.reason === "timeout") await this.cancelTurnEndCompaction();
+      return outcome;
+    } finally {
+      if (timer) clearTimeout(timer);
+      this.turnEndCompactionWaiter = null;
+    }
+  }
+
+  /** Abort a compaction left running (its own wait or the manager's cap passed), so the next prompt isn't racing it. */
+  async cancelTurnEndCompaction(): Promise<void> {
+    const session = this.session;
+    if (this.didClose || !session) return;
+    try {
+      await session.cancelCompaction();
+    } catch (error) {
+      this.events.emit("stderr", kimiErrorMessage(error));
+    }
+  }
+
+  interruptTurn(): "sent" | "unsupported" {
+    const session = this.session;
+    if (this.didClose || !session || !this.sdkTurnActive || this.goalRunActive) return "unsupported";
+    this.mappingState.interruptRequested = true;
+    this.cancelledPromptSeq = this.promptSeq;
+    void session.cancel().catch((error) => {
+      this.events.emit("stderr", kimiErrorMessage(error));
+    });
+    return "sent";
+  }
+
+  /**
+   * #proj-runtime:#41: stop one subagent through its task
+   * (`Session.stopBackgroundTask` aborts the run: `subagent.cancelled`). It
+   * covers foreground runs too (registered as tasks; the agent's Agent call
+   * returns a stopped result and its turn carries on). The session looks only
+   * in the main agent's tasks, so a subagent another subagent started cannot
+   * be stopped from here.
+   */
+  interruptSubagent(subagentTaskId: string): "sent" | "not_running" | "unsupported" {
+    const session = this.session;
+    const subagent = this.mappingState.subagents?.get(subagentTaskId);
+    if (this.didClose || !session || !subagent?.running) return "not_running";
+    if (!subagent.stopTaskId) return "unsupported";
+    void session.stopBackgroundTask(subagent.stopTaskId, { reason: "Stopped from Raft" }).catch((error: unknown) => {
+      this.events.emit("stderr", kimiErrorMessage(error));
+    });
+    return "sent";
   }
 
   async stop(opts?: {
@@ -880,6 +1199,7 @@ export class KimiSdkRuntimeSession implements RuntimeSession {
     reason?: string;
   }): Promise<void> {
     if (this.didClose) return;
+    this.turnOrigin.close();
     this.requestedStopReason = opts?.reason;
     const signal = opts?.signal ?? "SIGTERM";
     const session = this.session;
@@ -909,17 +1229,26 @@ export class KimiSdkRuntimeSession implements RuntimeSession {
 
   private handleSdkEvent(event: KimiSdkEvent): void {
     this.requestDiagnostics?.observeSdkEvent(event);
+    const subagentEvents = mapKimiSubagentEvent(event, this.mappingState);
+    if (subagentEvents) {
+      for (const parsed of subagentEvents) this.events.emit("runtime_event", parsed);
+      // Its usage is still counted, as before.
+      if (event.type !== "turn.step.completed") return;
+    }
+    if (!kimiEventIsShownForMainAgent(event)) return;
+    if (this.turnEndCompactionWaiter && (event.type === "compaction.completed" || event.type === "compaction.blocked" || event.type === "compaction.cancelled")) {
+      const settle = this.turnEndCompactionWaiter;
+      this.turnEndCompactionWaiter = null;
+      settle(event.type === "compaction.completed" ? { kind: "completed" } : { kind: "failed", reason: event.type === "compaction.blocked" ? "blocked" : "cancelled" });
+    }
     if (event.type === "goal.updated") {
       this.updateGoalState({ goal: event.snapshot });
       return;
     }
 
     if (event.type === "turn.started") {
-      this.pendingTurnStartAttempt = undefined;
       this.sdkTurnActive = true;
     }
-
-    if (this.emitDeliveryErrorForSdkBusyEvent(event)) return;
 
     if (event.type === "turn.ended" && this.goalRunActive) {
       this.sdkTurnActive = false;
@@ -983,52 +1312,22 @@ export class KimiSdkRuntimeSession implements RuntimeSession {
       return;
     }
     this.sdkTurnActive = true;
-    const attemptId = this.trackTurnStartAttempt(text, delivery === "delivery");
+    const seq = ++this.promptSeq;
     this.deferSdkCall({
       requestMethod: "turn/start",
       text,
       delivery: delivery === "delivery",
       invoke: () => session.prompt(text),
+      // The prompt the daemon cancelled may reject; that is the stop, not a delivery failure.
+      isCancelled: () => this.cancelledPromptSeq === seq,
       onSettled: (fulfilled) => {
-        if (!fulfilled) {
-          this.clearTurnStartAttempt(attemptId);
+        // A cancelled prompt settling late must not end the turn that followed it.
+        if (!fulfilled && seq === this.promptSeq) {
           this.sdkTurnActive = false;
           this.pendingTurnEndSessionId = undefined;
         }
       },
     });
-  }
-
-  private trackTurnStartAttempt(text: string, delivery: boolean): number {
-    const id = this.nextTurnStartAttemptId++;
-    this.pendingTurnStartAttempt = { id, text, delivery };
-    return id;
-  }
-
-  private clearTurnStartAttempt(attemptId: number): void {
-    if (this.pendingTurnStartAttempt?.id === attemptId) {
-      this.pendingTurnStartAttempt = undefined;
-    }
-  }
-
-  private emitDeliveryErrorForSdkBusyEvent(event: KimiSdkEvent): boolean {
-    if (event.type !== "error") return false;
-    if (event.code !== "turn.agent_busy") return false;
-    const attempt = this.pendingTurnStartAttempt;
-    if (!attempt?.delivery) return false;
-
-    this.pendingTurnStartAttempt = undefined;
-    this.sdkTurnActive = false;
-    this.pendingTurnEndSessionId = undefined;
-    this.events.emit("runtime_event", {
-      kind: "delivery_error",
-      message: kimiErrorMessage(event),
-      requestMethod: "turn/start",
-      source: "kimi_sdk_response",
-      code: "turn.agent_busy",
-      payloadBytes: Buffer.byteLength(attempt.text, "utf8"),
-    } satisfies ParsedEvent);
-    return true;
   }
 
   private emitSdkCallError(input: {
@@ -1044,7 +1343,7 @@ export class KimiSdkRuntimeSession implements RuntimeSession {
         message,
         requestMethod: input.requestMethod,
         source: "kimi_sdk_response",
-        code: kimiDeliveryErrorCode(message),
+        code: "runtime.delivery_error",
         payloadBytes: Buffer.byteLength(input.text, "utf8"),
       } satisfies ParsedEvent);
       return;
@@ -1060,6 +1359,7 @@ export class KimiSdkRuntimeSession implements RuntimeSession {
     text: string;
     delivery: boolean;
     invoke: () => Promise<unknown>;
+    isCancelled?: () => boolean;
     onSettled?: (fulfilled: boolean) => void;
   }): void {
     setImmediate(() => {
@@ -1075,7 +1375,7 @@ export class KimiSdkRuntimeSession implements RuntimeSession {
               input.onSettled?.(true);
             },
             (error) => {
-              if (!this.didClose) {
+              if (!this.didClose && !input.isCancelled?.()) {
                 this.emitSdkCallError({
                   error,
                   requestMethod: input.requestMethod,
@@ -1182,7 +1482,7 @@ export class KimiSdkRuntimeSession implements RuntimeSession {
  * heavier (instantiates `KimiCore`, sets up RPC, allocates logs) for what is
  * a one-shot read; the TOML shape under `[models.<id>]` is stable across
  * upstream versions and all we need is `id` + optional `display_name`. Same
- * shape as `detectKimiModels(home)` in `kimi.ts`. `resolveKimiHome()` mirrors
+ * shape as `detectKimiModels(home)` in `kimi.ts`. `resolveKimiHome()` matches
  * the SDK's helper (pinned by a test) so we honor `KIMI_CODE_HOME` env
  * overrides (default fallback `~/.kimi-code`; see
  * `packages/agent-core/src/config/path.ts` upstream) without loading the SDK.
@@ -1315,6 +1615,8 @@ export function detectKimiSdkModels(
  */
 export class KimiSdkDriver implements RuntimeDriver {
   readonly id = "kimi-sdk";
+  // Its subagents stop through the SDK session (KimiSdkRuntimeSession.interruptSubagent).
+  readonly stopsSubagentsInSession = true;
   /**
    * Genuine native support: the standing prompt (and wrapper CLI note) are
    * mounted via the Kimi SDK's `roleAdditional` session option, which renders
@@ -1336,6 +1638,9 @@ export class KimiSdkDriver implements RuntimeDriver {
   } as const;
   readonly session = {
     recovery: "resume_or_fresh",
+    // Emits the compaction events.
+    compaction: "reported",
+    compactionFailure: "does_not_stick",
   } as const;
   readonly model = {
     detectedModelsVerifiedAs: "suggestion_only" as const,
@@ -1343,6 +1648,8 @@ export class KimiSdkDriver implements RuntimeDriver {
   };
   readonly supportsStdinNotification = true;
   readonly busyDeliveryMode = "direct" as const;
+  // The Kimi SDK runs in the daemon process; its version is a constant of this build.
+  readonly shipsWithComputer = true;
 
   private sessionId: string | null = null;
 

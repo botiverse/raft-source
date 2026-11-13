@@ -24,6 +24,7 @@ import {
   unregisterManagedMcpRuntimeProxyForLaunch,
   writeManagedMcpRuntimeConfigFile,
 } from "./managedMcpRuntimeProxy";
+import { RuntimeTurnOriginHolder } from "./runtimeTurnOrigin";
 
 const mcpServerId = "22222222-2222-4222-8222-222222222222";
 
@@ -343,6 +344,55 @@ test("managed MCP runtime proxy exposes currently available tools and forwards c
   }
 });
 
+test("managed MCP endpoint takes the token as a bearer header, so it need not be in a process's arguments", async () => {
+  const snapshot: ManagedMcpRuntimeSnapshot = { catalogVersion: 1, tools: [] };
+  const handle = await registerManagedMcpRuntimeProxy({
+    agentId: "agent-bearer",
+    launchId: "launch-bearer",
+    snapshot,
+    async loadSnapshot() {
+      return snapshot;
+    },
+    async callTool() {
+      return { isError: false, content: [] };
+    },
+  });
+  try {
+    assert.equal(handle.url, `${handle.endpointUrl}/${handle.token}`);
+    assert.doesNotMatch(handle.endpointUrl, new RegExp(handle.token));
+
+    const client = new Client({ name: "runtime-proxy-bearer-test", version: "1.0.0" });
+    const transport = new StreamableHTTPClientTransport(new URL(handle.endpointUrl), {
+      requestInit: { headers: { Authorization: `Bearer ${handle.token}` } },
+    });
+    await client.connect(transport);
+    assert.deepEqual((await client.listTools()).tools, []);
+    await client.close();
+
+    for (const authorization of [undefined, "Bearer", "Bearer ", "Bearer wrong-token", `Basic ${handle.token}`]) {
+      const response = await fetch(handle.endpointUrl, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          accept: "application/json, text/event-stream",
+          ...(authorization ? { authorization } : {}),
+        },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
+      });
+      assert.equal(response.status, 404, String(authorization));
+    }
+    // The header only stands in for the path token on the bare endpoint.
+    const pathMiss = await fetch(`${handle.endpointUrl}/not-a-token`, {
+      method: "POST",
+      headers: { "content-type": "application/json", accept: "application/json, text/event-stream", authorization: `Bearer ${handle.token}` },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
+    });
+    assert.equal(pathMiss.status, 404);
+  } finally {
+    unregisterManagedMcpRuntimeProxyForLaunch({ agentId: "agent-bearer", launchId: "launch-bearer" });
+  }
+});
+
 test("managed MCP runtime config files are private and removed with the launch", () => {
   withTempDir((directory) => {
     const filePath = writeManagedMcpRuntimeConfigFile({
@@ -385,6 +435,8 @@ test("managed MCP JSON overlay preserves user config and restores its exact byte
       }),
     });
 
+    // #proj-runtime:#40: while it holds the token the file is the owner's only.
+    assert.equal(statSync(filePath).mode & 0o777, 0o600);
     const overlaid = JSON.parse(readFileSync(filePath, "utf8")) as {
       mcpServers: Record<string, unknown>;
     };
@@ -421,4 +473,137 @@ test("managed MCP JSON overlay never overwrites a concurrent user edit during cl
     });
     assert.equal(readFileSync(filePath, "utf8"), concurrent);
   });
+});
+
+test("⭐ native proxy forwards the origin of the turn a call was issued in -- never a later turn's (task #21)", async () => {
+  const calls: ManagedMcpCallRequest[] = [];
+  const snapshot: ManagedMcpRuntimeSnapshot = {
+    catalogVersion: 1,
+    tools: [{
+      mcpServerId,
+      serverName: "Docs",
+      toolName: "search",
+      runtimeName: "mcp_docs_search",
+      inputSchema: { type: "object" },
+      configVersion: 1,
+      assignmentVersion: 1,
+    }],
+  };
+  let duringLoad: (() => void) | null = null;
+  const holder = new RuntimeTurnOriginHolder("process-1");
+  const register = (processInstanceId: string) => registerManagedMcpRuntimeProxy({
+    agentId: "agent-origin",
+    launchId: "launch-origin",
+    processInstanceId,
+    readTurnOrigin: holder.read,
+    snapshot,
+    async loadSnapshot() {
+      const hook = duringLoad;
+      duringLoad = null;
+      // Yield first so the handler has already captured its origin, then move the turn on.
+      await new Promise((resolve) => setImmediate(resolve));
+      hook?.();
+      return snapshot;
+    },
+    async callTool(input) {
+      calls.push(input);
+      return { isError: false, content: [{ type: "text", text: "ok" }] };
+    },
+  });
+  const own = await register("process-1");
+  const foreign = await register("process-2");
+  const clientFor = async (url: string) => {
+    const client = new Client({ name: "origin-test", version: "1.0.0" });
+    await client.connect(new StreamableHTTPClientTransport(new URL(url)));
+    const [tool] = (await client.listTools()).tools;
+    return { client, call: () => client.callTool({ name: tool!.name, arguments: {} }) };
+  };
+  const a = await clientFor(own.url);
+  const b = await clientFor(foreign.url);
+  try {
+    const M1 = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const M2 = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+
+    await a.call();
+    assert.equal(calls.at(-1)!.origin, undefined, "no open turn");
+
+    holder.beginTurn({ sourceMessageId: M1 });
+    await a.call();
+    assert.deepEqual(calls.at(-1)!.origin, { sourceMessageId: M1 });
+
+    // The turn ends and the next begins while this call is still reloading the tool snapshot.
+    duringLoad = () => {
+      holder.endTurn();
+      holder.beginTurn({ sourceMessageId: M2 });
+    };
+    await a.call();
+    assert.equal(calls.at(-1)!.origin, undefined, "⭐ must not be re-homed onto the turn that started mid-call");
+
+    await a.call();
+    assert.deepEqual(calls.at(-1)!.origin, { sourceMessageId: M2 }, "control: the new turn's own calls do carry it");
+
+    await b.call();
+    assert.equal(calls.at(-1)!.origin, undefined, "a registration for another process instance never borrows this getter");
+  } finally {
+    await a.client.close();
+    await b.client.close();
+    await __resetManagedMcpRuntimeProxyForTest();
+  }
+});
+
+test("⭐ the native proxy passes the Server's refusal and its guidance to the model, not a bare HTTP status", async () => {
+  const snapshot: ManagedMcpRuntimeSnapshot = {
+    catalogVersion: 1,
+    tools: [{
+      mcpServerId,
+      serverName: "Docs",
+      toolName: "search",
+      runtimeName: "mcp_docs_search",
+      inputSchema: { type: "object" },
+      configVersion: 1,
+      assignmentVersion: 1,
+    }],
+  };
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: unknown, init?: unknown) => {
+    const url = String(input instanceof Request ? input.url : input);
+    // Only the agent-api leg is stubbed; the MCP client's own transport talks to the local proxy
+    // over this same global and must be left alone.
+    if (!url.startsWith("https://raft.test")) return originalFetch(input as never, init as never);
+    if (url.endsWith("/mcp/tools")) {
+      return new Response(JSON.stringify(snapshot), { status: 200, headers: { "Content-Type": "application/json" } });
+    }
+    return new Response(
+      JSON.stringify({
+        error: "MCP connection is not authorized for this agent",
+        code: "managed_mcp_login_required",
+        connectionRequested: true,
+      }),
+      { status: 409, headers: { "Content-Type": "application/json" } },
+    );
+  }) as typeof fetch;
+
+  const handle = await prepareManagedMcpRuntimeProxy({
+    agentId: "agent-guidance",
+    launchId: "launch-guidance",
+    serverUrl: "https://raft.test",
+    agentCredentialKey: "sk_agent_test",
+  });
+  assert.ok(handle);
+  const client = new Client({ name: "guidance-test", version: "1.0.0" });
+  try {
+    await client.connect(new StreamableHTTPClientTransport(new URL(handle!.url)));
+    const [tool] = (await client.listTools()).tools;
+    const result = await client.callTool({ name: tool!.name, arguments: {} });
+    const text = JSON.stringify(result.content);
+    assert.equal(result.isError, true);
+    assert.match(text, /not authorized for this agent/, "the Server's own sentence reaches the model");
+    assert.match(text, /human to authorize/, "⭐ and what happens next");
+    assert.doesNotMatch(text, /^"\[\{"type":"text","text":"Raft MCP gateway request failed: HTTP 409/u,
+      "not a bare status line");
+  } finally {
+    await client.close().catch(() => undefined);
+    globalThis.fetch = originalFetch;
+    await __resetManagedMcpRuntimeProxyForTest();
+  }
 });

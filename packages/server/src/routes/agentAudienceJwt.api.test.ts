@@ -11,19 +11,19 @@ import { createApiTest } from "../test/integration/apiTest";
 import { openTestApp } from "../test/integration/app";
 import { fixturePasswordHash } from "../test/integration/credentials";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 test("Agent JWT issuance is built in, binds the authenticated actor, requires live local authorization, and never creates a raw code", async () => {
   const previousUrl = process.env.SERVER_URL;
   process.env.SERVER_URL = "https://raft.example.test";
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const suffix = randomUUID();
     const [owner] = await getDb().insert(users).values({ name: `jwt-${suffix}`, email: `jwt-${suffix}@raft.test`, passwordHash: await fixturePasswordHash("password123"), emailVerified: true }).returning();
     const server = await createServer("JWT Server", `jwt-${suffix}`, owner.id);
     const foreign = await createServer("Foreign Server", `foreign-${suffix}`, owner.id);
     const agent = await createAgent(server.id, "JwtAgent", { runtime: "external", model: "external" });
-    const credential = await mintAgentCredential({ agentId: agent.id, scopes: ["read"], name: "jwt-test", createdByUserId: null });
+    const credential = await mintAgentCredential({ agentId: agent.id, scopes: ["read"], name: "jwt-test", issuedVia: "computer", createdByUserId: null });
     const { client } = await createOAuthClient({ serverId: server.id, createdByUserId: owner.id, clientId: `jwt-${suffix.slice(0, 8)}`, name: "JWT RP", allowedScopes: ["openid", "profile"], returnUrl: "https://rp.example.test/callback" });
     const { client: foreignClient } = await createOAuthClient({ serverId: foreign.id, createdByUserId: owner.id, clientId: `other-${suffix.slice(0, 8)}`, name: "Foreign RP", allowedScopes: ["openid", "profile"] });
     const post = (body: Record<string, unknown> = { service: client.clientId }, token = credential.apiKey) => fetch(`${app.baseUrl}/internal/agent-api/integrations/token`, {

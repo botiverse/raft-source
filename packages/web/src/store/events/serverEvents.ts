@@ -24,12 +24,23 @@ export const DEFAULT_SIDEBAR_ORDER: SidebarOrderPreferences = {
   hiddenDmIds: [],
   channelPanelTabOrder: [],
   agentPanelTabOrder: [],
+  channelSideLayout: null,
   customSections: [],
   sectionOrder: ["system:pinned", "system:joint", "system:channels", "system:dms"],
   sectionPlacements: [],
   sectionsVersion: 0,
   pinnedVersion: 0,
 };
+
+/**
+ * Whether the current server's sidebar order has been read. Every server
+ * switch resets `sidebarOrder` to DEFAULT_SIDEBAR_ORDER itself, and every read
+ * (a failed one included) or local edit sets a new object, so until then the
+ * Pinned section cannot tell "no pins" from "pins not read yet".
+ */
+export function isSidebarOrderLoaded(sidebarOrder: SidebarOrderPreferences): boolean {
+  return sidebarOrder !== DEFAULT_SIDEBAR_ORDER;
+}
 
 export interface ServerDomainState {
   servers: Server[];

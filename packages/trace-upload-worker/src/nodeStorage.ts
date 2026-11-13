@@ -12,7 +12,14 @@ export interface S3TraceStorageConfig {
   secretAccessKey: string;
   region?: string;
   fetch?: typeof fetch;
+  /** Wait before each retry of a failed PUT; its length is the number of retries. */
+  putRetryDelaysMs?: readonly number[];
 }
+
+// R2 answers a small share of PUTs with 429 or 5xx (about 1 in 100,000). One
+// cause is its limit of one write per second to the same key, so the first
+// retry waits a full second.
+const DEFAULT_PUT_RETRY_DELAYS_MS: readonly number[] = [1_000, 2_000];
 
 export interface S3PutOptions {
   httpMetadata?: {
@@ -35,15 +42,46 @@ export class S3TraceStorage {
   private readonly endpoint: string;
   private readonly region: string;
   private readonly fetchImpl: typeof fetch;
+  private readonly putRetryDelaysMs: readonly number[];
 
   constructor(private readonly config: S3TraceStorageConfig) {
     this.endpoint = config.endpoint.replace(/\/+$/, "");
     this.region = config.region || "auto";
     this.fetchImpl = config.fetch ?? fetch;
+    this.putRetryDelaysMs = config.putRetryDelaysMs ?? DEFAULT_PUT_RETRY_DELAYS_MS;
   }
 
+  // A PUT of the same key and bytes is idempotent, so 429, 5xx and network
+  // errors are retried. Every failed attempt is logged on one countable line
+  // (`[TraceStorage] put_failed`): a write that fails inside a request
+  // otherwise surfaces only as that request's 500. An error raised before the
+  // request is sent (an invalid key or header) is not a storage failure: it
+  // is thrown at once, neither retried nor counted.
   async put(key: string, value: ArrayBuffer | ArrayBufferView | string, options?: S3PutOptions): Promise<{ etag?: string }> {
     const body = toBody(value);
+    for (let attempt = 1; ; attempt += 1) {
+      const retryDelayMs = this.putRetryDelaysMs[attempt - 1];
+      try {
+        return await this.putOnce(key, body, options);
+      } catch (error) {
+        if (!(error instanceof S3PutError)) throw error;
+        const { status } = error;
+        const willRetry = retryDelayMs !== undefined && (status === undefined || status === 429 || status >= 500);
+        console.warn("[TraceStorage] put_failed", {
+          key,
+          attempt,
+          will_retry: willRetry,
+          ...(status !== undefined ? { status } : {}),
+          error_message: error.message,
+        });
+        if (!willRetry) throw error;
+        await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
+      }
+    }
+  }
+
+  // Headers are built and signed per attempt: the signature covers the date.
+  private async putOnce(key: string, body: Buffer, options?: S3PutOptions): Promise<{ etag?: string }> {
     const headers = new Headers({
       "content-length": String(body.length),
       "content-type": options?.httpMetadata?.contentType ?? "application/octet-stream",
@@ -56,13 +94,20 @@ export class S3TraceStorage {
 
     const url = this.objectUrl(key);
     await this.sign(headers, "PUT", url.pathname + url.search);
-    const response = await this.fetchImpl(url, {
-      method: "PUT",
-      headers,
-      body: body as BodyInit,
-    });
+    let response: Response;
+    try {
+      response = await this.fetchImpl(url, {
+        method: "PUT",
+        headers,
+        body: body as BodyInit,
+      });
+    } catch (cause) {
+      throw new S3PutError(undefined, cause);
+    }
     if (!response.ok) {
-      throw new Error(`R2 PUT failed with status ${response.status}`);
+      // Release the connection: the error body is not read.
+      await response.body?.cancel().catch(() => undefined);
+      throw new S3PutError(response.status);
     }
     return { etag: response.headers.get("etag") ?? undefined };
   }
@@ -111,6 +156,18 @@ export class S3TraceStorage {
     headers.set(
       "authorization",
       `AWS4-HMAC-SHA256 Credential=${this.config.accessKeyId}/${scope}, SignedHeaders=${signedHeaders}, Signature=${signature}`,
+    );
+  }
+}
+
+// R2 refused the PUT (`status`), or the request failed before R2 answered.
+class S3PutError extends Error {
+  constructor(readonly status: number | undefined, cause?: unknown) {
+    super(
+      status !== undefined
+        ? `R2 PUT failed with status ${status}`
+        : `R2 PUT failed before a response: ${cause instanceof Error ? cause.message : String(cause)}`,
+      { cause },
     );
   }
 }

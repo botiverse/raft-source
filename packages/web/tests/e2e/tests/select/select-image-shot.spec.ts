@@ -50,8 +50,8 @@ test("select screenshot renders protected attachment image and reaction chip", a
         <div class="min-w-0 flex-1">
           <div class="text-sm font-bold text-black">Developer</div>
           <div class="text-sm text-black">download-as-image image + reaction fixture</div>
-          <div class="mt-1 space-y-2">
-            <div class="max-w-[28rem] space-y-2">
+          <div class="mt-1 stack-y-2">
+            <div class="max-w-[28rem] stack-y-2">
               <div class="grid gap-2 grid-cols-1">
                 <button type="button" class="group/img relative overflow-hidden border-2 border-black bg-transparent text-left inline-block w-fit max-w-[26rem] justify-self-start" title="fixture.png">
                   <img src="https://cdn.invalid/thumbnail-that-should-not-be-used.png" alt="fixture.png" data-select-screenshot-attachment-id="attachment-for-export" data-select-screenshot-attachment-width="96" data-select-screenshot-attachment-height="54" class="block max-h-72 w-auto max-w-full object-contain bg-white" loading="lazy" />

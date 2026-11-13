@@ -1,3 +1,4 @@
+import { fillJointMembersFromChannelHumans } from "../test/jointMemberFill";
 import { tokenForHuman } from "../test/integration/credentials";
 import { createApiTest } from "../test/integration/apiTest";
 import assert from "node:assert/strict";
@@ -9,12 +10,12 @@ import { addMember } from "../services/serverService";
 import { addHuman, createChannel } from "../services/channelService";
 import { createServer, headers, seedUser } from "./channels.api.fixtures";
 
-// Joint channel parity t5 (#proj-joint-channel:2541153f): a joint channel has
-// channel admins, stored on each server's own projection. A joint channel
-// admin may edit the shared name/description and set roles of this server's
-// members; anything whose effect reaches other servers stays with server admins.
+// Joint channel parity t5 (#proj-joint-channel:2541153f), under computed
+// membership (the only mode): a channel admin appointed on the host's copy is
+// a host manager. It edits the shared name/description, archives and removes
+// members from the host; roles stay with the host's owners/admins.
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 async function seedJoint(prefix: string) {
   const db = getDb();
@@ -44,6 +45,7 @@ async function seedJoint(prefix: string) {
     { jointChannelId: joint!.id, serverId: hostServer.id, localChannelId: hostProjection.id, role: "host", joinedByUserId: hostOwner.id },
     { jointChannelId: joint!.id, serverId: peerServer.id, localChannelId: peerProjection.id, role: "participant", joinedByUserId: peerOwner.id },
   ]);
+  await fillJointMembersFromChannelHumans();
   return {
     hostServer, peerServer, hostProjection, peerProjection,
     hostOwner, hostMember, hostOther, peerMember,
@@ -105,39 +107,6 @@ test("a joint channel admin renames the joint channel for every server; a plain 
   assert.equal(other.status, 403, await other.text());
 });
 
-test("a joint channel admin cannot archive, remove members, or set another server's member role", async ({ app }) => {
-  const f = await seedJoint("jca-limits");
-  const promote = await setRole(app.baseUrl, f.token.hostOwner, f.hostServer.id, f.hostProjection.id, f.hostMember.id, "admin");
-  assert.equal(promote.status, 200, await promote.text());
-
-  // Archive reaches every server: server admins only.
-  const archive = await fetch(`${app.baseUrl}/api/channels/${f.hostProjection.id}/archive`, {
-    method: "POST",
-    headers: headers(f.token.hostMember, f.hostServer.id),
-  });
-  assert.equal(archive.status, 403, await archive.text());
-  const [stillLive] = await getDb().select({ archivedAt: channels.archivedAt }).from(channels).where(eq(channels.id, f.hostProjection.id));
-  assert.equal(stillLive?.archivedAt, null);
-
-  // The joint admin allowlist does not include removing members.
-  const remove = await fetch(`${app.baseUrl}/api/channels/${f.hostProjection.id}/members/user/${f.hostOther.id}`, {
-    method: "DELETE",
-    headers: headers(f.token.hostMember, f.hostServer.id),
-  });
-  assert.equal(remove.status, 403, await remove.text());
-
-  // A joint channel admin can set roles of this server's members ...
-  const promoteLocal = await setRole(app.baseUrl, f.token.hostMember, f.hostServer.id, f.hostProjection.id, f.hostOther.id, "admin");
-  assert.equal(promoteLocal.status, 200, await promoteLocal.text());
-
-  // ... but never of another server's member: they have no row on this projection.
-  const promotePeer = await setRole(app.baseUrl, f.token.hostOwner, f.hostServer.id, f.hostProjection.id, f.peerMember.id, "admin");
-  assert.notEqual(promotePeer.status, 200, await promotePeer.text());
-  const [peerRow] = await getDb().select({ role: channelHumans.role }).from(channelHumans)
-    .where(and(eq(channelHumans.channelId, f.peerProjection.id), eq(channelHumans.userId, f.peerMember.id)));
-  assert.equal(peerRow?.role, "member");
-});
-
 test("the joint roster offers a role change only for this server's own members", async ({ app }) => {
   const f = await seedJoint("jca-roster");
   const response = await fetch(`${app.baseUrl}/api/channels/${f.hostProjection.id}/members`, {
@@ -152,7 +121,7 @@ test("the joint roster offers a role change only for this server's own members",
   assert.equal(byId.get(f.peerMember.id)?.canChangeChannelRole, false, "another server's member");
 });
 
-test("the channel list grants a joint channel admin only the joint admin capabilities", async ({ app }) => {
+test("the channel list grants a host-appointed manager the host's management capabilities, never member roles or visitor access", async ({ app }) => {
   const f = await seedJoint("jca-caps");
   const promote = await setRole(app.baseUrl, f.token.hostOwner, f.hostServer.id, f.hostProjection.id, f.hostMember.id, "admin");
   assert.equal(promote.status, 200, await promote.text());
@@ -162,8 +131,9 @@ test("the channel list grants a joint channel admin only the joint admin capabil
   const row = (JSON.parse(raw) as Array<Record<string, any>>).find((channel) => channel.id === f.hostProjection.id);
   assert.equal(row?.type, "joint");
   assert.equal(row?.channelCapabilities?.editChannelMetadata, true);
-  assert.equal(row?.channelCapabilities?.changeChannelMemberRoles, true);
-  assert.equal(row?.channelCapabilities?.archiveChannels, false);
-  assert.equal(row?.channelCapabilities?.removeChannelMembers, false);
-  assert.equal(row?.channelCapabilities?.manageGuestAccess, false);
+  // Roles and inviting servers stay with the host's owners/admins.
+  assert.equal(row?.channelCapabilities?.changeChannelMemberRoles, false);
+  assert.equal(row?.channelCapabilities?.archiveChannels, true);
+  assert.equal(row?.channelCapabilities?.removeChannelMembers, true);
+  assert.equal(row?.channelCapabilities?.manageVisitorAccess, false);
 });

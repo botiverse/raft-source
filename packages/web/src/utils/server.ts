@@ -1,11 +1,9 @@
-import { assertValidDesktopRuntimeEnvironment, RUNTIME_API_ORIGIN } from "../desktopRuntimeEnvironment";
+import { RUNTIME_API_ORIGIN } from "../runtimeEndpoints";
 
 /**
  * Derive the server URL for machine connections.
  */
 export function getServerUrl(): string {
-  assertValidDesktopRuntimeEnvironment();
-
   if (RUNTIME_API_ORIGIN.includes(":5173")) {
     return RUNTIME_API_ORIGIN.replace(":5173", ":3001");
   }

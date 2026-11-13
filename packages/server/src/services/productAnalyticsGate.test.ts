@@ -26,9 +26,9 @@ const ANALYTICS_ID = "44444444-4444-4444-8444-444444444444";
 
 const GATE_CASES: Array<[string, ProductAnalyticsFacts, ReturnType<typeof decideProductAnalyticsGate>]> = [
   [
-    "usage data not chosen: the (strict) default applies, nothing is linked",
+    "usage data not chosen: the default (on) applies",
     { analyticsId: ANALYTICS_ID, shareUsageData: null, workspaceEnabled: true },
-    { recordAllowed: true, analyticsId: null, clientEventsAllowed: false },
+    { recordAllowed: true, analyticsId: ANALYTICS_ID as never, clientEventsAllowed: true },
   ],
   [
     "usage data turned off: workspace counts only, nothing linked to the user",
@@ -96,10 +96,10 @@ test("every new user gets a random analytics id that is not their user id", asyn
     assert.notEqual(userMapping, ownerMapping);
 
     const notChosen = await resolveProductAnalyticsGate(db, { userId: USER_ID, serverId: SERVER_ID });
-    assert.deepEqual(notChosen, { recordAllowed: true, analyticsId: null, clientEventsAllowed: false });
-    await db.update(users).set({ shareUsageData: true }).where(eq(users.id, USER_ID));
-    const sharing = await resolveProductAnalyticsGate(db, { userId: USER_ID, serverId: SERVER_ID });
-    assert.deepEqual(sharing, { recordAllowed: true, analyticsId: userMapping, clientEventsAllowed: true });
+    assert.deepEqual(notChosen, { recordAllowed: true, analyticsId: userMapping, clientEventsAllowed: true });
+    await db.update(users).set({ shareUsageData: false }).where(eq(users.id, USER_ID));
+    const notSharing = await resolveProductAnalyticsGate(db, { userId: USER_ID, serverId: SERVER_ID });
+    assert.deepEqual(notSharing, { recordAllowed: true, analyticsId: null, clientEventsAllowed: false });
   } finally {
     await client.close();
   }

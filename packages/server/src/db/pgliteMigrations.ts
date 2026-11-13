@@ -12,7 +12,7 @@ type MigrationJournal = {
   }>;
 };
 
-const DRIZZLE_DIR = path.resolve(
+export const DRIZZLE_DIR = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
   "../../drizzle",
 );
@@ -23,6 +23,9 @@ const PGLITE_COMPATIBILITY_STATEMENTS = [
     WHERE sender_type = 'user' and random_id is not null`,
   `CREATE INDEX IF NOT EXISTS "idx_messages_sender_created_at"
     ON "messages" USING btree ("sender_id", "created_at", "id")`,
+  `CREATE INDEX IF NOT EXISTS "idx_messages_insert_xid"
+    ON "messages" USING btree ("insert_xid")
+    WHERE insert_xid IS NOT NULL`,
 ];
 
 async function ensureMigrationTable(client: PGlite) {
@@ -47,6 +50,27 @@ async function readMigrationJournal(drizzleDir: string): Promise<MigrationJourna
   const journalPath = path.join(drizzleDir, "meta", "_journal.json");
   const raw = await readFile(journalPath, "utf8");
   return JSON.parse(raw) as MigrationJournal;
+}
+
+/**
+ * Every input migratePglite applies from a drizzle folder: the raw journal,
+ * each journal entry's SQL in apply order, and (for the real folder) the
+ * PGlite compatibility statements. The test template cache keys on these
+ * (src/test/setup/pgliteTemplate.ts).
+ */
+export async function readMigrationSources(drizzleDir: string = DRIZZLE_DIR): Promise<{
+  journal: string;
+  migrations: Array<{ tag: string; sql: string }>;
+  compatibilityStatements: string[];
+}> {
+  const journal = await readFile(path.join(drizzleDir, "meta", "_journal.json"), "utf8");
+  const entries = (JSON.parse(journal) as MigrationJournal).entries.slice().sort((a, b) => a.idx - b.idx);
+  const migrations: Array<{ tag: string; sql: string }> = [];
+  for (const entry of entries) {
+    migrations.push({ tag: entry.tag, sql: await readFile(path.join(drizzleDir, `${entry.tag}.sql`), "utf8") });
+  }
+  const compatibilityStatements = drizzleDir === DRIZZLE_DIR ? PGLITE_COMPATIBILITY_STATEMENTS : [];
+  return { journal, migrations, compatibilityStatements };
 }
 
 function splitStatements(sqlText: string): string[] {

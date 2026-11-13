@@ -9,14 +9,19 @@ import type { Command } from "commander";
 import {
   AGENT_API_MESSAGE_SEARCH_DEFAULT_LIMIT,
   AGENT_API_MESSAGE_SEARCH_MAX_LIMIT,
+  artifactsMatchQuery,
+  appEnabledPerEnv,
+  messageSearchProbesArtifacts,
+  probeWithin,
 } from "@botiverse/raft-shared/src/agentCliSurface";
 
 import { defineCommand, registerCliCommand } from "../../core/command";
 import type { CommandRuntimeOptions } from "../../core/context";
 import { CliError, type CliErrorCode } from "../../core/errors";
 import { writeText, NL } from "../../core/renderer";
-import { createAgentApiSurfaceClient } from "../../agentApiPath";
+import { createAgentApiContractSurfaceClient, createAgentApiSurfaceClient } from "../../agentApiPath";
 import { PEER_KIND_OPTION, resolveTargetAlias, type TargetAliasOpts } from "../_target";
+import { formatArtifactsAlsoMatch } from "../artifact/_format";
 import { formatSearchResults, type SearchData } from "./_format";
 
 interface SearchOpts extends TargetAliasOpts {
@@ -289,7 +294,7 @@ export const messageSearchCommand = defineCommand(
     const agentContext = ctx.loadAgentContext();
     const client = ctx.createApiClient(agentContext);
     const agentApi = createAgentApiSurfaceClient(client);
-    const res = await agentApi.messages.search({
+    const searched = agentApi.messages.search({
       ...(searchOpts.query ? { q: searchOpts.query } : {}),
       ...(searchOpts.channel ? { channel: searchOpts.channel } : {}),
       ...(searchOpts.sender ? { sender: searchOpts.sender } : {}),
@@ -300,6 +305,22 @@ export const messageSearchCommand = defineCommand(
       ...(searchOpts.offset !== undefined ? { offset: String(searchOpts.offset) } : {}),
       ...(searchOpts.cursor ? { cursor: searchOpts.cursor } : {}),
     });
+    // Asked alongside the search (after it), never instead of it: any failure
+    // is "no", and once the search has answered it waits only a short grace.
+    const probe = new AbortController();
+    // Not asked when the daemon says Artifacts are off for this Server (it would answer 403).
+    const artifactsMatch = searchOpts.query && messageSearchProbesArtifacts(searchOpts) && appEnabledPerEnv(ctx.env, "artifacts") !== false
+      ? artifactsMatchQuery(createAgentApiContractSurfaceClient(client, { signal: probe.signal }), { query: searchOpts.query, ...(searchOpts.channel ? { target: searchOpts.channel } : {}) })
+      : Promise.resolve(false);
+    let res: Awaited<typeof searched>;
+    let artifactsAlsoMatch = false;
+    try {
+      res = await searched;
+      if (res.ok) artifactsAlsoMatch = await probeWithin(artifactsMatch);
+    } finally {
+      // Whatever happened to the search (refused, thrown, or answered and the grace over), the probe ends here.
+      probe.abort();
+    }
     if (!res.ok) {
       const code = toSearchErrorCode(res.errorCode, res.status);
       throw new CliError({
@@ -313,7 +334,7 @@ export const messageSearchCommand = defineCommand(
       ...(searchOpts.sender ? { sender: searchOpts.sender } : {}),
       ...(searchOpts.after ? { after: searchOpts.after } : {}),
       ...(searchOpts.before ? { before: searchOpts.before } : {}),
-    }), NL);
+    }), NL, ...(artifactsAlsoMatch ? [formatArtifactsAlsoMatch(searchOpts.displayQuery, searchOpts.channel), NL] : []));
   },
 );
 

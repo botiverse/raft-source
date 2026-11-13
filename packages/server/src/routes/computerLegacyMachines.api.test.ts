@@ -1,4 +1,4 @@
-import { fixturePasswordHash } from "../test/integration/credentials";
+import { accessTokenForTest, fixturePasswordHash } from "../test/integration/credentials";
 import { createApiTest } from "../test/integration/apiTest";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
@@ -8,14 +8,13 @@ import { eq } from "drizzle-orm";
 import { getDb } from "../db/index";
 import { users, machines } from "../db/schema";
 import { openTestApp } from "../test/integration/app";
-import { signAccessToken } from "../middleware/auth";
 import { createServer, addMember } from "../services/serverService";
 import {
   extractApiKeyFingerprint,
   registerMachine,
 } from "../services/machineService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 // RFC v9.9 §X.2 + Jianwei msg=a87a44a9 + Cody msg=ec68c27f / msg=ce91881f
 // regression guard for `GET /api/computer/legacy-machines`.
@@ -48,7 +47,7 @@ async function withEnv<T>(
   const oldGate = process.env.SLOCK_DEVICE_LOGIN_ENABLED;
   if (enabled) delete process.env.SLOCK_DEVICE_LOGIN_ENABLED;
   else process.env.SLOCK_DEVICE_LOGIN_ENABLED = "false";
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     return await fn(app);
   } finally {
@@ -71,7 +70,7 @@ async function seedUser(label = "roster"): Promise<{ id: string; bearer: string 
       emailVerified: true,
     })
     .returning();
-  return { id: u.id, bearer: signAccessToken(u.id) };
+  return { id: u.id, bearer: await accessTokenForTest(u.id) };
 }
 
 test("legacy-machines: gate off → 404 (router not mounted)", async () => {

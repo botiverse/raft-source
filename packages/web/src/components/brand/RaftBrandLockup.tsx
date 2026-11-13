@@ -22,7 +22,11 @@ export default function RaftBrandLockup({
   );
 
   return (
+    // role="img": the lockup is one image named "Raft" (a plain div's
+    // aria-label is not exposed). Where it stands for a word in a sentence
+    // ("Login with [Raft]"), that name is the word screen readers read.
     <div
+      role="img"
       className={`inline-flex select-none items-center ${className}`}
       aria-label={formatMessage({ id: "brand.productName" })}
     >

@@ -26,6 +26,17 @@ export function conversionReadChannelIdsQuery(channelId: string | SQLWrapper): S
       CROSS JOIN LATERAL (VALUES (projection.local_channel_id), (joint_thread.canonical_channel_id)) paired(id)
       WHERE projection.role = 'host' AND projection.status = 'active'
         AND ${channelId}::uuid IN (projection.local_channel_id, joint_thread.canonical_channel_id)
+        -- Index prefilter only: implied by, never a replacement for, the line
+        -- above (which keeps peer projections out). Lets each side of that OR
+        -- use its own index instead of fanning out from every host projection
+        -- on the job's server (~5 ms on prod, growing with joints).
+        AND joint_thread.id IN (
+          SELECT local_projection.joint_channel_id FROM ${jointChannelServers} local_projection
+            WHERE local_projection.local_channel_id = ${channelId}::uuid
+          UNION ALL
+          SELECT canonical_joint.id FROM ${jointChannels} canonical_joint
+            WHERE canonical_joint.canonical_channel_id = ${channelId}::uuid
+        )
   `;
 }
 

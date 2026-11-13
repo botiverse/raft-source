@@ -1,0 +1,4 @@
+ALTER TABLE "external_outbound_deliveries" DROP CONSTRAINT "external_outbound_delivery_contract_valid";--> statement-breakpoint
+ALTER TABLE "external_outbound_deliveries" ALTER COLUMN "render_snapshot_schema" SET DEFAULT 'slack-bridge-render-snapshot.v5';--> statement-breakpoint
+ALTER TABLE "external_outbound_deliveries" ADD CONSTRAINT "external_outbound_delivery_contract_valid" CHECK ("external_outbound_deliveries"."delivery_contract_version" = 'slack-bridge-delivery.v1'
+      AND "external_outbound_deliveries"."render_snapshot_schema" IN ('slack-bridge-render-snapshot.v3', 'slack-bridge-render-snapshot.v4', 'slack-bridge-render-snapshot.v5'));

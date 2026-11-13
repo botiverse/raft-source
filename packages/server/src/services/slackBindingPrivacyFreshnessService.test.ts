@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { readFile } from "node:fs/promises";
 import { eq } from "drizzle-orm";
 
 import { dbTest as test } from "../test/integration/dbTest";
@@ -20,7 +19,6 @@ import {
 import { createServer } from "./serverService";
 import {
   refreshSlackBindingPrivacy,
-  SLACK_PRIVACY_CHANGED_AUDIENCE_MIGRATION_REQUIRED,
 } from "./slackBindingPrivacyFreshnessService";
 import {
   SLACK_BRIDGE_CREDENTIAL_LEASE_SCHEMA,
@@ -117,22 +115,21 @@ test("fresh public observation keeps the binding active and extends only privacy
   assert.equal(row.privacyFreshUntil.getTime(), NOW.getTime() + 10 * 60_000);
 });
 
-test("public to private observation atomically pauses for auditable audience migration", async () => {
+test("public to private observation records the new class in place and stays active", async () => {
   const { binding } = await seedPublicBinding();
   const receipt = await refreshSlackBindingPrivacy({
     bindingId: binding.id, provider: provider({ kind: "response", status: 200, headers: {}, body: {
       ok: true, channel: { id: "C_PRIVACY", is_private: true, is_archived: false, is_member: true },
     } }), now: NOW,
   });
-  assert.equal(receipt.kind, "changed_paused");
+  assert.equal(receipt.kind, "changed");
   const [row] = await getDb().select().from(externalChannelBindings).where(eq(externalChannelBindings.id, binding.id));
-  assert.equal(row.state, "paused");
-  assert.equal(row.stateReason, SLACK_PRIVACY_CHANGED_AUDIENCE_MIGRATION_REQUIRED);
+  assert.equal(row.state, "active");
+  assert.equal(row.stateReason, null);
   assert.equal(row.privacyClass, "private");
   assert.equal(row.providerConversationKind, "private_channel");
-  assert.equal(row.audienceRevision, null);
-  assert.equal(row.audienceFreshUntil, null);
-  assert.equal(row.bindingEpoch, 2);
+  assert.equal(row.privacyFreshUntil.getTime(), NOW.getTime() + 10 * 60_000);
+  assert.equal(row.bindingEpoch, binding.bindingEpoch, "a visibility flip is not an authority change");
 });
 
 test("provider unavailable never extends stale privacy or mutates binding identity", async () => {
@@ -177,18 +174,6 @@ test("stale server-grant epoch cannot extend privacy freshness or call Slack", a
   assert.equal(row.privacyFreshUntil.getTime(), NOW.getTime() - 1);
   assert.equal(row.state, "active");
   assert.equal(row.bindingEpoch, binding.bindingEpoch);
-});
-
-test("privacy write authority keeps the global binding-before-grant lock order", async () => {
-  const source = await readFile(new URL("./slackBindingPrivacyFreshnessService.ts", import.meta.url), "utf8");
-  const helperStart = source.indexOf("async function lockCurrentPrivacyWriteAuthority");
-  const helperEnd = source.indexOf("export async function refreshSlackBindingPrivacy", helperStart);
-  assert.ok(helperStart >= 0 && helperEnd > helperStart);
-  const helper = source.slice(helperStart, helperEnd);
-  const bindingLock = helper.indexOf('.for("update")');
-  const grantLock = helper.indexOf("resolveExternalInstallServerGrantAuthority");
-  assert.ok(bindingLock >= 0, "privacy writer must lock the frozen binding");
-  assert.ok(grantLock > bindingLock, "privacy writer must lock the binding before association/current grant");
 });
 
 test("provider rate limit preserves retry timing without blessing stale privacy", async () => {

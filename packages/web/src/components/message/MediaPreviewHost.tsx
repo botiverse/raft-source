@@ -4,7 +4,7 @@ import {
   AudioAttachmentPreviewModal,
   HtmlAttachmentPreviewModal,
   VideoAttachmentPreviewModal,
-} from "./attachmentPreviewSurfaces";
+} from "./attachmentPreviewChunk";
 import { downloadAttachmentById } from "./downloadAttachment";
 
 /**

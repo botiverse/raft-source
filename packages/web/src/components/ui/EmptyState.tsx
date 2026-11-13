@@ -1,3 +1,4 @@
+import { createElement } from "react";
 import type { HTMLAttributes, ReactNode } from "react";
 import {
   EmptyState,
@@ -38,11 +39,20 @@ import {
  * source for the banned classes so the soft-frame look can't be
  * resurrected accidentally.
  */
+type TitleRenderProps = HTMLAttributes<HTMLElement>;
+const TITLE_HEADING_RENDER = {
+  h2: (props: TitleRenderProps) => createElement("h2", props),
+  h3: (props: TitleRenderProps) => createElement("h3", props),
+} as const;
+
 export interface EmptyStateProps extends Omit<HTMLAttributes<HTMLDivElement>, "title"> {
   icon: ReactNode;
   title: ReactNode;
   description?: ReactNode;
   action?: ReactNode;
+  /** The title's heading level when the empty state is the area's only
+   *  content (Raft DS › EmptyState: then its title is a heading). */
+  titleHeading?: "h2" | "h3";
 }
 
 export default function AppEmptyState({
@@ -50,6 +60,7 @@ export default function AppEmptyState({
   title,
   description,
   action,
+  titleHeading,
   className = "",
   ...props
 }: EmptyStateProps) {
@@ -62,7 +73,7 @@ export default function AppEmptyState({
         {icon}
       </EmptyStateIcon>
       <EmptyStateContent>
-        <EmptyStateTitle>{title}</EmptyStateTitle>
+        <EmptyStateTitle render={titleHeading ? TITLE_HEADING_RENDER[titleHeading] : undefined}>{title}</EmptyStateTitle>
         {description ? <EmptyStateDescription>{description}</EmptyStateDescription> : null}
       </EmptyStateContent>
       {action ? <EmptyStateActions>{action}</EmptyStateActions> : null}

@@ -6,6 +6,7 @@ import {
   type Router as RouterType,
 } from "express";
 import { z } from "zod";
+import { PRO_SINGLE_FILE_UPLOAD_LIMIT_BYTES } from "@botiverse/raft-shared";
 import type { ServerId } from "@botiverse/raft-shared";
 import {
   attachmentUploadContract,
@@ -19,8 +20,15 @@ import {
   getAttachmentFileSizeLimitBytes,
   getLegacyAttachmentFileSizeLimitBytes,
 } from "../services/attachmentUploadPolicy";
-import { getFileUploadQuotaSummary } from "../services/fileUploadQuotaService";
-import { isChannelReadOnlyByBillingFeature, isChannelReadOnlyByQuota } from "../services/planService";
+import {
+  FILE_UPLOAD_QUOTA_EXCEEDED_MESSAGE,
+  FILE_UPLOAD_APPSUMO_QUOTA_EXCEEDED_MESSAGE,
+  getFileUploadQuotaSummary,
+  type FileUploadQuotaSummary,
+} from "../services/fileUploadQuotaService";
+import { getChannelBillingReadOnly, isChannelReadOnlyByQuota } from "../services/planService";
+import { notePaywallHit } from "./paywallHit";
+import type { PaywallHitUsage } from "../services/serverProductEvents";
 
 export type AttachmentUploadSessionContext = Readonly<
   | { serverId: ServerId; userId: string; agentId?: never }
@@ -81,6 +89,27 @@ const rateLimitedBody = {
   retryable: true,
   retryAfterMs: 60_000,
 } as const;
+
+/** The monthly quota as the web is told it: null where none is enforced (ordinary Pro). */
+function monthlyUpload(quota: FileUploadQuotaSummary) {
+  return quota.enforced
+    ? { month: quota.month, limitBytes: quota.limitBytes, remainingBytes: quota.remainingBytes, ...(quota.appsumo ? { source: "appsumo" as const } : {}) }
+    : null;
+}
+
+/**
+ * The web's capabilities: the service's (shared with the agent API, whose
+ * schema never grows) plus what is left of the monthly quota.
+ */
+async function webCapabilities(
+  service: AttachmentUploadSessionService | null,
+  context: AttachmentUploadSessionContext,
+): Promise<AttachmentUploadSessionResult> {
+  const result = service ? await service.capabilities(context) : await disabledCapabilities(context);
+  if (result.status !== 200) return result;
+  const quota = await getFileUploadQuotaSummary(context.serverId);
+  return { status: 200, body: { ...(result.body as object), monthlyUpload: monthlyUpload(quota) } };
+}
 
 async function disabledCapabilities(context: AttachmentUploadSessionContext): Promise<AttachmentUploadSessionResult> {
   const quota = await getFileUploadQuotaSummary(context.serverId);
@@ -144,26 +173,44 @@ function requestContext(req: Request): Extract<AttachmentUploadSessionContext, {
 async function canCreateUploadSession(
   context: Extract<AttachmentUploadSessionContext, { userId: string }>,
   input: CreateAttachmentUploadSessionInput,
+  /** A refusal that is a plan paywall (paywall_hit); `usage` with the monthly quota's. */
+  onPaywall: (gate: "upload_file_size" | "upload_monthly_quota" | "joint_channel_read_only", usage?: PaywallHitUsage) => void,
 ): Promise<AttachmentUploadSessionResult | null> {
   const { channelId, sizeBytes } = input;
   const canAccess = await channelService.canUserAccessChannel(channelId, context.userId, context.serverId);
   if (!canAccess || !await channelService.canUserPostToChannel(channelId, context.userId)) {
     return { status: 403, body: forbiddenBody };
   }
-  if (
-    await channelService.isChannelArchived(channelId)
-    || await isChannelReadOnlyByBillingFeature(channelId, context.serverId)
-    || await isChannelReadOnlyByQuota(channelId, context.serverId)
-  ) {
+  if (await channelService.isChannelArchived(channelId)) {
+    return { status: 403, body: forbiddenBody };
+  }
+  const billingReadOnly = await getChannelBillingReadOnly(channelId, context.serverId);
+  if (billingReadOnly) {
+    if (billingReadOnly.reason === "joint_over_limit") onPaywall("joint_channel_read_only");
+    return { status: 403, body: forbiddenBody };
+  }
+  if (await isChannelReadOnlyByQuota(channelId, context.serverId)) {
     return { status: 403, body: forbiddenBody };
   }
 
   const quota = await getFileUploadQuotaSummary(context.serverId);
   if (sizeBytes > getAttachmentFileSizeLimitBytes(quota.plan)) {
+    // A Free paywall only when Pro would take the file.
+    if (quota.plan === "free" && sizeBytes <= PRO_SINGLE_FILE_UPLOAD_LIMIT_BYTES) onPaywall("upload_file_size");
     return { status: 413, body: tooLargeBody };
   }
   if (quota.enforced && sizeBytes > quota.remainingBytes) {
-    return { status: 403, body: forbiddenBody };
+    if (quota.plan === "free") onPaywall("upload_monthly_quota", { requestedBytes: sizeBytes, monthUsedBytes: quota.usedBytes });
+    return {
+      status: 403,
+      body: {
+        code: "FILE_UPLOAD_QUOTA_EXCEEDED",
+        // The legacy route's sentence, which older web builds already recognise.
+        message: quota.appsumo ? FILE_UPLOAD_APPSUMO_QUOTA_EXCEEDED_MESSAGE : FILE_UPLOAD_QUOTA_EXCEEDED_MESSAGE,
+        retryable: false,
+        monthlyUpload: monthlyUpload(quota)!,
+      },
+    };
   }
   return null;
 }
@@ -215,13 +262,7 @@ export function createAttachmentUploadSessionRouter(
   const securityMiddleware = [...options.securityMiddleware];
 
   router.get(attachmentUploadCapabilitiesPath, ...securityMiddleware, async (req, res) => {
-    sendContractResponse(
-      res,
-      "capabilities",
-      service
-        ? await service.capabilities(requestContext(req))
-        : await disabledCapabilities(requestContext(req)),
-    );
+    sendContractResponse(res, "capabilities", await webCapabilities(service, requestContext(req)));
   });
 
   router.get(listPath, ...securityMiddleware, async (req, res) => {
@@ -248,7 +289,7 @@ export function createAttachmentUploadSessionRouter(
       return;
     }
     const context = requestContext(req);
-    const denied = await canCreateUploadSession(context, parsed.data);
+    const denied = await canCreateUploadSession(context, parsed.data, (gate, usage) => notePaywallHit(req, gate, usage));
     if (denied) {
       sendContractResponse(res, "create", denied);
       return;

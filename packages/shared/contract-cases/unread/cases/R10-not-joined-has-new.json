@@ -1,0 +1,45 @@
+{
+  "formatVersion": 1,
+  "id": "R10-not-joined-has-new",
+  "rule": "R10",
+  "title": "A channel the person has not joined, with new messages, shows the quiet new dot",
+  "why": "A not-joined channel has no exact count (`unread` 0); the summary's `hasNew` lights a quiet dot.",
+  "status": "agreed",
+  "sources": {
+    "web": [
+      "packages/web/src/utils/channelUnreadIndicator.ts (getChannelUnreadIndicatorState)",
+      "packages/web/src/features/sidebar/rows/ChannelRow.tsx"
+    ],
+    "app": [
+      "compose/shared/src/commonMain/kotlin/build/raft/app/RaftHomeComponents.kt (homeChannelRowMarks)"
+    ]
+  },
+  "knownGaps": [
+    {
+      "client": "app",
+      "reason": "The app parses hasNew but does not show it (inventory S2).",
+      "followUp": "#proj-mobile:#70 PR 8 (shared display reducer)"
+    }
+  ],
+  "given": {
+    "conversation": {
+      "id": "channel-1",
+      "kind": "channel"
+    },
+    "row": {
+      "joined": false,
+      "muted": false,
+      "unread": 0,
+      "hasNew": true
+    }
+  },
+  "steps": [],
+  "expect": {
+    "state": {
+      "rowDisplay": {
+        "kind": "newDot",
+        "unreadTone": false
+      }
+    }
+  }
+}

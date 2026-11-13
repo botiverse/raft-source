@@ -9,7 +9,7 @@ import { getDb } from "../db/index";
 import { agents, serverMembers, servers, users } from "./schema";
 import { createServer } from "../services/serverService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 // The defer-retirement backfill (task #172, Phase N).
 //

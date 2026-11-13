@@ -35,3 +35,21 @@ test("sign-notarize version guard rejects other pre-release forms and malformed 
   assert.equal(versionGuard("1.0.33-a_b.1"), "rejected");
   assert.equal(versionGuard("1.0.33-constructed-wake-context.1;touch x"), "rejected");
 });
+
+// task #166 / notes/computer-tcc-probe.md: a Desktop-supervised Computer is
+// its own TCC identity, keyed on identifier + Team. Grants survive upgrades
+// only if the identifier never changes, so it is pinned and checked.
+test("sign-notarize pins the stable TCC signing identifier and fails the release on any other", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const source = await readFile(script, "utf8");
+  // Pinned per architecture, as read from the 1.0.56 stable binaries (codesign -dv).
+  assert.match(source, /darwin-arm64\) signing_identifier=raft-computer-darwin-arm64 ;;/u);
+  assert.match(source, /darwin-x64\) signing_identifier=raft-computer-darwin-x64 ;;/u);
+  assert.match(source, /--identifier "\$signing_identifier"/u);
+  assert.match(source, /grep -Fx "Identifier=\$\{signing_identifier\}"/u);
+  // publish-computer-sea.yml checks the same pinned values on the final binary.
+  const workflow = await readFile(new URL("../../../../.github/workflows/publish-computer-sea.yml", import.meta.url), "utf8");
+  assert.match(workflow, /darwin-arm64\) EXPECTED_IDENTIFIER=raft-computer-darwin-arm64 ;;/u);
+  assert.match(workflow, /darwin-x64\) EXPECTED_IDENTIFIER=raft-computer-darwin-x64 ;;/u);
+  assert.match(workflow, /grep -Fx "Identifier=\$\{EXPECTED_IDENTIFIER\}"/u);
+});

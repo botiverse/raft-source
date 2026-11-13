@@ -31,6 +31,88 @@ function responseWithUrl(body: BodyInit | null, init: ResponseInit, url: string)
   return response;
 }
 
+const manifestUrl = "https://manifest.example/.well-known/raft-agent-manifest.json";
+const manifestLimit = 1024 * 1024;
+const sizeError = /manifest response is too large \(limit: 1048576 bytes\)/;
+const smallManifest = {
+  schema: "slock-agent-manifest.v0",
+  execution: { mode: "http_api" },
+};
+
+async function fetchSyntheticManifest(body: BodyInit, headers: Record<string, string> = {}) {
+  const previousFetch = setCanonicalFetchImplForTests(async () => responseWithUrl(body, {
+    status: 200,
+    headers: { "content-type": "application/json", ...headers },
+  }, manifestUrl));
+  try {
+    return await fetchAgentManifest(manifestUrl, {});
+  } finally {
+    setCanonicalFetchImplForTests(previousFetch);
+  }
+}
+
+test("manifest fetch accepts v0 and v1 bodies above 64 KiB through the inclusive 1 MiB limit", async () => {
+  for (const value of [smallManifest, {
+    schema: "raft-agent-manifest.v1",
+    service: "synthetic",
+    execution: { mode: "local_cli" },
+    actions: [],
+  }]) {
+    const json = JSON.stringify(value);
+    for (const bytes of [64 * 1024 + 1, manifestLimit]) {
+      const body = json.padEnd(bytes, " ");
+      for (const headers of [undefined, { "content-length": String(bytes) }]) {
+        const result = await fetchSyntheticManifest(body, headers);
+        assert.equal(result.execution.mode, value.execution.mode);
+      }
+    }
+  }
+});
+
+test("manifest fetch rejects an oversized declared length before reading and cancels the body", async () => {
+  let pulled = false, cancelled = false;
+  const body = new ReadableStream<Uint8Array>({
+    pull() { pulled = true; throw new Error("must not read an oversized declared response"); },
+    cancel() { cancelled = true; },
+  }, { highWaterMark: 0 });
+  await assert.rejects(
+    fetchSyntheticManifest(body, { "content-length": String(manifestLimit + 1) }),
+    sizeError,
+  );
+  assert.equal(pulled, false);
+  assert.equal(cancelled, true);
+});
+
+test("manifest fetch stops oversized chunked bodies even with an understated Content-Length", async () => {
+  for (const headers of [undefined, { "content-length": "1" }]) {
+    let reads = 0, cancelled = false;
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        reads++;
+        if (reads === 1) controller.enqueue(new Uint8Array(manifestLimit).fill(32));
+        else if (reads === 2) controller.enqueue(new Uint8Array([32]));
+        else throw new Error("must stop reading after the byte limit");
+      },
+      cancel() { cancelled = true; },
+    }, { highWaterMark: 0 });
+    await assert.rejects(fetchSyntheticManifest(body, headers), sizeError);
+    assert.equal(reads, 2);
+    assert.equal(cancelled, true);
+  }
+});
+
+test("manifest fetch applies the size limit to UTF-8 bytes rather than characters", async () => {
+  const body = JSON.stringify({ ...smallManifest, description: "私".repeat(350_000) });
+  assert.ok(body.length < manifestLimit);
+  assert.ok(Buffer.byteLength(body, "utf8") > manifestLimit);
+  await assert.rejects(fetchSyntheticManifest(body), sizeError);
+});
+
+test("large manifests below the byte limit still pass through schema validation", async () => {
+  const body = JSON.stringify({ schema: "unknown" }).padEnd(128 * 1024, " ");
+  await assert.rejects(fetchSyntheticManifest(body), /manifest schema/);
+});
+
 test("validateAgentManifestV0 accepts minimal local CLI per-agent HOME manifest", () => {
   const manifest = validateAgentManifestV0({
     schema: "slock-agent-manifest.v0",

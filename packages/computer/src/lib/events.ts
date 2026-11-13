@@ -52,6 +52,10 @@ export type ComputerApiEvent =
   // --- attach (AttachService) ---
   | { kind: "attach.attaching"; serverSlug: string }
   | { kind: "attach.preflight"; resumed: boolean }
+  // The server is older than one-time attach approvals: it answered the
+  // approval with a user session (written like `login` used to), and attach
+  // carries on with that session.
+  | { kind: "attach.session-fallback"; sessionPath: string }
   | {
       kind: "attach.attached";
       serverId: string;
@@ -66,8 +70,13 @@ export type ComputerApiEvent =
   | { kind: "start.starting"; managedTargets: string[]; attachedCount: number; foreground: boolean }
   | { kind: "start.already_running"; servicePid: number; managedTargets: string[]; attachedCount: number }
   | { kind: "start.running"; managedTargets: string[]; attachedCount: number }
-  | { kind: "start.spawned"; servicePid: number; managedTargets: string[]; attachedCount: number }
+  // `supervisorUnit`: started through the systemd unit that owns the service (task #917), not spawned detached.
+  | { kind: "start.spawned"; servicePid: number; managedTargets: string[]; attachedCount: number; supervisorUnit?: string }
+  // Linux: the detached service will be stopped with the caller's login session (task #37).
+  | { kind: "start.logind_session_risk"; risk: { sessionScope: string; user: string; linger: boolean | null } }
   | { kind: "start.ready"; ready: Map<string, number>; managedTargets: string[] }
+  // Under the external installer: some runners were ready, the rest never came (acceptPartialReady).
+  | { kind: "start.partial_ready"; ready: Map<string, number>; managedTargets: string[]; notReady: string[] }
   // Unscoped start left out attachments the server has unlinked.
   | { kind: "start.skipped_unlinked"; serverIds: string[] }
   | { kind: "start.aborted"; servicePid: number; managedTargets: string[]; ready: Map<string, number> }
@@ -79,7 +88,8 @@ export type ComputerApiEvent =
   // --- stop (StopService) ---
   | { kind: "stop.stopping"; pid: number | null }
   | { kind: "stop.not_running" }
-  | { kind: "stop.stale_pidfile_cleared"; pid: number }
+  // `otherProgram`: the pid is alive but belongs to another program (reused); it was not signalled.
+  | { kind: "stop.stale_pidfile_cleared"; pid: number; otherProgram?: true }
   | { kind: "stop.signaled"; pid: number }
   | { kind: "stop.stopped"; pid: number }
 

@@ -11,6 +11,7 @@ import {
   useCallback,
   useContext,
   useMemo,
+  useRef,
   useState,
 } from "react";
 import type {
@@ -26,6 +27,8 @@ import {
 import type {
   Locale,
 } from "./locale";
+import { isLocaleReadyToShow, loadLocaleToShow } from "./messages";
+import { tellServiceWorkerLocale } from "./serviceWorkerLocale";
 
 type LocaleContextValue = {
   locale: Locale;
@@ -59,23 +62,42 @@ function readInitialLocale(): Locale {
 
 export function LocaleProvider({ children }: { children: ReactNode }) {
   const [locale, setLocaleState] = useState<Locale>(readInitialLocale);
+  // The latest requested locale: a slower catalog load must not switch the app
+  // back after a newer choice has already applied.
+  const requestedLocale = useRef<Locale | null>(null);
 
-  const setLocale = useCallback((next: Locale) => {
-    syncDocumentLocale(next);
-    setLocaleState(next);
-    if (typeof window !== "undefined") {
-      rememberLocale(next, window.localStorage);
+  // Switch once the locale's catalogs are in memory (en too under a partial
+  // locale; both parts once anything past the first screen has loaded, as an
+  // open panel may show any id: messages/index.ts), so the UI goes straight from the old language to the new one
+  // instead of flashing English or raw ids while the chunks load. A failed load
+  // keeps the current language, with no app-wide refresh prompt (catalog loads
+  // are importHandledLocally, i18n/messages/index.ts); choosing it again retries.
+  const applyLocale = useCallback((next: Locale) => {
+    requestedLocale.current = next;
+    const commit = () => {
+      if (requestedLocale.current !== next) return;
+      syncDocumentLocale(next);
+      setLocaleState(next);
+      tellServiceWorkerLocale(next);
+      if (typeof window !== "undefined") {
+        rememberLocale(next, window.localStorage);
+      }
+    };
+    if (isLocaleReadyToShow(next)) commit();
+    else {
+      loadLocaleToShow(next).then(commit, (error: unknown) => {
+        if (requestedLocale.current === next) requestedLocale.current = null;
+        console.warn("[i18n] could not load the catalog for", next, error);
+      });
     }
   }, []);
+
+  const setLocale = useCallback((next: Locale) => applyLocale(next), [applyLocale]);
 
   const setLocaleFromUser = useCallback((next: string | null | undefined) => {
     if (!isSupportedLocale(next)) return;
-    syncDocumentLocale(next);
-    setLocaleState(next);
-    if (typeof window !== "undefined") {
-      rememberLocale(next, window.localStorage);
-    }
-  }, []);
+    applyLocale(next);
+  }, [applyLocale]);
   // The auth → locale reconcile (calling setLocaleFromUser with the user's
   // server-persisted displayLanguage) lives in App.tsx, NOT here — so importing
   // useCopy from the i18n barrel doesn't drag the auth store into every

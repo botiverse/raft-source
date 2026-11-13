@@ -3,7 +3,7 @@ import { resolveAgentKnowledgeDoc } from "./agentKnowledgeService";
 
 // A natural Manual query ("can a custom Connected App send agent-event to wake
 // an agent", meichen digest 9/19) ranks the integration topic first, but the
-// answer lived only on what-slock-doesnt-have. The integration page must carry
+// answer lived only on what-raft-doesnt-have. The integration page must carry
 // the answer itself: no public inbound webhook, the App + Agent Events path,
 // and the scope gate.
 test("integration topic answers how an outside system can wake an agent", async () => {

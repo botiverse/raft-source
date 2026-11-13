@@ -17,6 +17,11 @@
 // (missing, unreadable or unwritable table, a runtime that reports another
 // session than the one resumed) resolves to a new id.
 //
+// Whether the runtime reports compaction is its driver's own declaration
+// (`RuntimeDriver.session.compaction`), passed in by whoever holds the driver:
+// the daemon and the OAR host plan each spawn with it. The transport never
+// guesses it: without a plan it publishes nothing (signal unknown).
+//
 // Failure direction: the old file is removed before the new one is written.
 // If the write fails, no file is left behind, so the CLI reads "signal
 // unknown" and falls back to attaching the guidance. Leaving the previous
@@ -33,32 +38,8 @@ import {
   type ContextGenerationRecord,
 } from "@botiverse/raft-shared";
 
+import type { RuntimeCompactionReporting } from "./drivers/types";
 import { logger } from "./logger";
-
-/**
- * Whether each registered runtime reports context compaction
- * (`compaction_started` / `compaction_finished`). Checked against every
- * registered driver by a test, so adding a driver forces an answer here.
- */
-export const RUNTIME_REPORTS_COMPACTION: Readonly<Record<string, boolean>> = {
-  // claudeEventNormalizer, codexEventNormalizer, cursor.ts, kimi.ts,
-  // kimi-sdk.ts and pi.ts emit the normalized compaction events; builtin
-  // extends the pi driver.
-  claude: true,
-  codex: true,
-  cursor: true,
-  kimi: true,
-  "kimi-sdk": true,
-  pi: true,
-  builtin: true,
-  // These runtimes never emit a compaction event, so an unchanged id says
-  // nothing about whether their context was compacted.
-  grok: false,
-  copilot: false,
-  gemini: false,
-  opencode: false,
-  antigravity: false,
-};
 
 /**
  * The composed passive AX gate on a spawn config (task #359). Only an explicit
@@ -67,10 +48,6 @@ export const RUNTIME_REPORTS_COMPACTION: Readonly<Record<string, boolean>> = {
  */
 export function configPassiveAx(config: object): boolean {
   return (config as { passiveAx?: unknown }).passiveAx === true;
-}
-
-export function runtimeReportsCompaction(runtime: string): boolean {
-  return RUNTIME_REPORTS_COMPACTION[runtime] === true;
 }
 
 export interface ContextGenerationFs {
@@ -108,7 +85,7 @@ function unlinkIfPresent(fs: ContextGenerationFs, file: string): void {
  */
 export function writeContextGeneration(
   transportDir: string,
-  input: { reason: ContextGenerationReason; runtime: string; passiveAx: boolean; contextId?: string },
+  input: { reason: ContextGenerationReason; runtime: string; compaction: RuntimeCompactionReporting; passiveAx: boolean; contextId?: string },
   deps: ContextGenerationDeps = {},
 ): string | null {
   const fs = deps.fs ?? DEFAULT_FS;
@@ -116,7 +93,7 @@ export function writeContextGeneration(
   const record: ContextGenerationRecord = {
     contextId: input.contextId ?? (deps.newId ?? randomUUID)(),
     reason: input.reason,
-    compactionReported: runtimeReportsCompaction(input.runtime),
+    compactionReported: input.compaction === "reported",
     runtime: input.runtime,
     writtenAt: (deps.now?.() ?? new Date()).toISOString(),
     passiveAx: input.passiveAx,
@@ -155,7 +132,7 @@ export function readContextGeneration(transportDir: string, deps: ContextGenerat
 }
 
 /** The context id a spawn publishes, decided before the process exists. */
-export type SpawnContextGeneration = { contextId: string; reason: "spawn" | "resume" };
+export type SpawnContextGeneration = { contextId: string; reason: "spawn" | "resume"; compaction: RuntimeCompactionReporting };
 
 /**
  * Resuming `resumeSessionId` reuses the id that session last had; otherwise
@@ -166,23 +143,40 @@ export type SpawnContextGeneration = { contextId: string; reason: "spawn" | "res
  */
 export function planSpawnContextGeneration(
   transportDir: string,
-  input: { runtime: string; resumeSessionId?: string | null },
+  input: { compaction: RuntimeCompactionReporting; resumeSessionId?: string | null },
   deps: ContextGenerationDeps = {},
 ): SpawnContextGeneration {
-  const reused = input.resumeSessionId && runtimeReportsCompaction(input.runtime)
+  const reused = input.resumeSessionId && input.compaction === "reported"
     ? readSessions(transportDir, deps)?.sessions[input.resumeSessionId]?.contextId
     : undefined;
-  return reused ? { contextId: reused, reason: "resume" } : { contextId: (deps.newId ?? randomUUID)(), reason: "spawn" };
+  return reused
+    ? { contextId: reused, reason: "resume", compaction: input.compaction }
+    : { contextId: (deps.newId ?? randomUUID)(), reason: "spawn", compaction: input.compaction };
 }
 
-/** Spawn-time write of `plan` (planned here when the caller has none). */
+/**
+ * Spawn-time write of `plan`, made by whoever holds the runtime's driver (the
+ * daemon, the OAR host). Without a plan nothing says whether the runtime
+ * reports compaction, so any earlier id is removed and none is published:
+ * the CLI reads "signal unknown", never a guess. Returns the id published.
+ */
 export function publishSpawnContextGeneration(
   transportDir: string,
-  input: { runtime: string; resumeSessionId?: string | null; passiveAx: boolean; plan?: SpawnContextGeneration },
+  input: { runtime: string; passiveAx: boolean; plan: SpawnContextGeneration | undefined },
   deps: ContextGenerationDeps = {},
 ): string | null {
-  const plan = input.plan ?? planSpawnContextGeneration(transportDir, input, deps);
-  return writeContextGeneration(transportDir, { reason: plan.reason, runtime: input.runtime, passiveAx: input.passiveAx, contextId: plan.contextId }, deps);
+  const plan = input.plan;
+  if (!plan) {
+    // Every host that spawns plans first (the APM, the OAR host); one that doesn't leaves its agent without glimpse.
+    logger.warn(`[ContextGeneration] spawn of ${input.runtime} without a plan: no context id published (signal unknown)`);
+    try {
+      unlinkIfPresent(deps.fs ?? DEFAULT_FS, path.join(transportDir, CONTEXT_GENERATION_FILENAME));
+    } catch (error) {
+      logger.warn(`[ContextGeneration] could not clear an earlier generation in ${transportDir}: ${String(error)}`);
+    }
+    return null;
+  }
+  return writeContextGeneration(transportDir, { reason: plan.reason, runtime: input.runtime, compaction: plan.compaction, passiveAx: input.passiveAx, contextId: plan.contextId }, deps);
 }
 
 /**
@@ -194,14 +188,14 @@ export function publishSpawnContextGeneration(
  */
 export function bindContextGenerationToSession(
   transportDir: string,
-  input: { runtime: string; sessionId: string; expectedSessionId: string | null },
+  input: { runtime: string; compaction: RuntimeCompactionReporting; sessionId: string; expectedSessionId: string | null },
   deps: ContextGenerationDeps = {},
 ): string | null {
   const current = readContextGeneration(transportDir, deps);
   let contextId = current?.contextId ?? null;
   if (current && contextId && input.expectedSessionId && input.expectedSessionId !== input.sessionId) {
     // Same process, same gate: carry the published value over to the new id.
-    contextId = writeContextGeneration(transportDir, { reason: "spawn", runtime: input.runtime, passiveAx: current.passiveAx === true }, deps);
+    contextId = writeContextGeneration(transportDir, { reason: "spawn", runtime: input.runtime, compaction: input.compaction, passiveAx: current.passiveAx === true }, deps);
   }
   rememberSessionContext(transportDir, input.sessionId, contextId, deps);
   return contextId;

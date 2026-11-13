@@ -125,3 +125,9 @@ test("runtimeErrorRequiredAction: the daemon's decision wins; older daemons' Aut
   assert.equal(runtimeErrorRequiredAction(carrier("RateLimitError")), null);
   assert.equal(runtimeErrorRequiredAction(null), null);
 });
+
+test("Claude root refusal carrier survives server normalization", () => {
+  const diagnostic = { errorClass: "RootPrivilegesError", errorReason: "root_privileges", fingerprint, reasonProvenance: "daemon_fallback", nativeReasonPresent: false };
+  assert.deepEqual(normalizeRuntimeErrorActivityDiagnostic(diagnostic), diagnostic);
+  assert.equal(normalizeRuntimeErrorActivityDiagnostic({ ...diagnostic, errorReason: "auth_failed" }), null);
+});

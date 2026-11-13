@@ -1,5 +1,5 @@
-import type { CSSProperties } from "react";
 import { useIntl } from "react-intl";
+import { Banner, BannerAction, BannerDescription, Button } from "@botiverse/raft-ui";
 import RootFallbackScroller from "./RootFallbackScroller";
 import { FALLBACK_STYLE } from "./RootErrorFallback";
 
@@ -48,63 +48,32 @@ export function AppRefreshRequiredScreen({
   );
 }
 
-// Raft Design System › Banner (warning): the orange-soft wash, ink text, a
-// hairline, no ink frame; it floats over the app, so it takes the float shadow.
-const WARNING_BANNER_STYLE: CSSProperties = {
-  display: "flex",
-  alignItems: "center",
-  gap: 12,
-  padding: "12px 14px",
-  borderRadius: 10,
-  background: "var(--warning-soft, #fde6de)",
-  color: "var(--foreground, #141111)",
-  boxShadow: "inset 0 0 0 1px var(--line-hairline, #14111126), var(--elevation-float, 0 1px 0 #1411110a, 0 12px 32px -12px #14111152)",
-  fontFamily: 'var(--font-sans, "Space Grotesk", system-ui, sans-serif)',
-  fontSize: 14,
-  lineHeight: "20px",
-};
-
-// Raft Design System › Button (small, ink-lined paper button): 32 tall, 13/18 700.
-const SMALL_BUTTON_STYLE: CSSProperties = {
-  display: "inline-flex",
-  alignItems: "center",
-  justifyContent: "center",
-  flex: "none",
-  height: 32,
-  padding: "0 12px",
-  borderRadius: 8,
-  border: "1.5px solid var(--line-strong, #141111)",
-  background: "var(--layer-card, #ffffff)",
-  color: "var(--foreground, #141111)",
-  font: "inherit",
-  fontSize: 13,
-  lineHeight: "18px",
-  fontWeight: 700,
-  whiteSpace: "nowrap",
-  cursor: "pointer",
-};
-
-export function AppRefreshWarningBanner({ onRefresh }: { onRefresh: () => void }) {
+// Raft Design System › Banner (warning) over the running app: the app stays
+// mounted under it (unsent text survives) until the person chooses Refresh;
+// Dismiss puts it away. Only shown while the app renders, so its stylesheet
+// (and raft-ui's) is there, unlike the screen above.
+export function AppRefreshWarningBanner({ onRefresh, onDismiss }: { onRefresh: () => void; onDismiss?: () => void }) {
   const { formatMessage } = useIntl();
 
   return (
     <div
       role="status"
       aria-live="polite"
-      className="fixed top-3 left-1/2 z-40 w-[min(calc(100%-24px),560px)] -translate-x-1/2"
+      className="fixed top-3 left-1/2 z-app w-[min(calc(100%-24px),560px)] -translate-x-1/2"
     >
-      <div role="alert" style={WARNING_BANNER_STYLE}>
-        <p style={{ margin: 0, flex: 1, minWidth: 0 }}>
-          {formatMessage({ id: "app.update.newerVersionAvailable" })}
-        </p>
-        <button
-          type="button"
-          onClick={onRefresh}
-          style={SMALL_BUTTON_STYLE}
-        >
-          {formatMessage({ id: "app.update.refresh" })}
-        </button>
-      </div>
+      <Banner status="warning" className="shadow-float" data-testid="app-update-banner">
+        <BannerDescription>{formatMessage({ id: "app.update.newerVersionAvailable" })}</BannerDescription>
+        <BannerAction>
+          {onDismiss ? (
+            <Button variant="ghost" size="md" onClick={onDismiss}>
+              {formatMessage({ id: "app.update.dismiss" })}
+            </Button>
+          ) : null}
+          <Button variant="default" size="md" onClick={onRefresh}>
+            {formatMessage({ id: "app.update.refresh" })}
+          </Button>
+        </BannerAction>
+      </Banner>
     </div>
   );
 }

@@ -1,8 +1,6 @@
 import type { ComponentProps, ReactElement, ReactNode } from "react";
-import { useMemo } from "react";
 import { TooltipProvider } from "@botiverse/raft-ui";
 import Tooltip from "../ui/Tooltip";
-import { useLightboxPortalContainer } from "../ui/Lightbox";
 
 /**
  * Tooltip preset for attachment surfaces: white surface, 600ms hover delay.
@@ -11,9 +9,8 @@ import { useLightboxPortalContainer } from "../ui/Lightbox";
  * it here keeps every attachment tooltip on one feel instead of each call site
  * re-deciding. Chat body and forward preview share this by construction.
  *
- * When rendered inside a Lightbox (the preview modal, z-70), the tooltip
- * portal moves into the Lightbox stacking context — a body-level portal (z-50)
- * would sit behind the overlay (same pattern as MermaidToolbar).
+ * Inside a lightbox (the file viewer, raft-ui's Lightbox at z-70), Base UI
+ * portals the tooltip into the lightbox's own portal, above its content.
  */
 export const ATTACHMENT_TOOLTIP_DELAY_MS = 600;
 
@@ -28,16 +25,11 @@ export default function AttachmentTooltip({
   children: ReactElement;
   contentProps?: Omit<AttachmentTooltipContentProps, "className">;
 }) {
-  const container = useLightboxPortalContainer();
-  const mergedContentProps = useMemo(
-    () => ({ container: container ?? undefined, ...contentProps }),
-    [container, contentProps],
-  );
   return (
     <TooltipProvider delay={ATTACHMENT_TOOLTIP_DELAY_MS}>
       <Tooltip
         content={content}
-        contentProps={mergedContentProps}
+        contentProps={contentProps}
       >
         {children}
       </Tooltip>

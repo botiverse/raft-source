@@ -288,8 +288,29 @@ export function createAgentApiClient(
   const pathPrefix = options.pathPrefix ?? AGENT_API_BASE_PATH;
   const rawClient = createAgentApiRawClient(transport, { pathPrefix });
   const generated = wrapRawClient(rawClient);
+  const sendV1 = generated.messages.send;
   return {
     ...generated,
+    messages: {
+      ...generated.messages,
+      // RFC 082: v1 send has no card, and its schema would drop one silently,
+      // posting plain text the caller takes for a card (Sage, #12683).
+      send: async (...args) => {
+        const body = (args[0] as { body?: unknown } | undefined)?.body ?? args[0];
+        if (typeof body === "object" && body !== null && "card" in body) {
+          return {
+            ok: false,
+            routeKey: "messageSend",
+            error: {
+              kind: "validation",
+              reason: "request_contract_mismatch",
+              message: "A card message needs the v2 send: use client.messages.sendV2({ target, card, content? }) or raft.messages.send({ target, card }); the v1 send has no card",
+            },
+          };
+        }
+        return sendV1(...args);
+      },
+    },
     request: async (routeKey, requestOptions = {}) => agentApiClientResultFromRaw(await requestAgentApiRawRoute(transport, routeKey, {
       pathPrefix,
       ...requestOptions,

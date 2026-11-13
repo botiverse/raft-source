@@ -30,17 +30,23 @@ import {
   type RaftInterruptCancel,
   type RaftInterrupted,
   type RaftInterruptResume,
+  heldNextStep,
 } from "./interrupt";
-import { formatAgentHold } from "../agentText/hold";
+import { heldSendNothing, renderAgentHold } from "../agentText/hold";
 import { formatAgentThreadTargetCheck } from "../agentText/threadTarget";
+import { AGENT_MESSAGE_CARD_NOT_STORED_NOTICE } from "../agentText/messageCards";
 import { detectThreadTargetMismatch, type ThreadTargetMismatch } from "./seenPolicy/threadTarget";
 import { agentChannelRef } from "../agentText/server";
+import { formatAgentDeliveredToAgentsLine, normalizeAgentDeliveredToAgents } from "../agentText/mentions";
 import { parseDmPeerRef } from "../dmPeerRef";
+import type { MessageCardInput } from "../messageCard";
+import { messageCardFailure, messageCardRequestFailure, RAFT_MESSAGE_CARD_FIELD_DESCRIPTION, raftMessageCardInputSchema } from "./messageCards";
 import { parseRaftRefTarget } from "../raftRefs";
 import {
   channelCardRev,
   elideSeenSenderDescriptions,
   renderSendAttachment,
+  windowAttachmentCount,
   senderObservationId,
   peerCardHasContent,
   peerCardId,
@@ -108,7 +114,9 @@ export interface RaftHistoryPage {
   /**
    * For an `unread` read: the read position after it. Below the newest seq
    * when the newest messages are too recent to mark read (seq order is not
-   * commit order); those come again on the next unread read.
+   * commit order). The Server marks them read a few seconds later; they come
+   * again on the next unread read only if it comes sooner or a lower seq
+   * committed late.
    */
   readThroughSeq?: number;
   /**
@@ -117,9 +125,21 @@ export interface RaftHistoryPage {
    * `text` folds them into one line so a repeat is not read as new.
    */
   alreadyShownSeqs?: number[];
+  /**
+   * Why messages are missing: the plan's history window hides older messages
+   * this read reached back to (or, for an `unread` read, skipped). The
+   * Server's note, with the upgrade card hint when it offers one; `text`
+   * starts with it (after the conversation cards, when they show).
+   */
+  historyLimitMessage?: string;
 }
 
-function historyNext(page: RaftHistoryPage, style: RaftHintStyle): RaftNextStep | null {
+/**
+ * The read that continues this one. A `before` read pages backward, so it
+ * continues to the older page while there is one; it would otherwise turn
+ * back to the newer side it came from (a `before` window has newer messages).
+ */
+function historyNext(page: RaftHistoryPage, style: RaftHintStyle, backward = false): RaftNextStep | null {
   const seqs = page.messages.map((m) => m.seq).filter((s): s is number => s !== null);
   // An unread read moved the read position, so the same call continues it.
   if (page.unreadAfterSeq !== undefined) {
@@ -133,6 +153,7 @@ function historyNext(page: RaftHistoryPage, style: RaftHintStyle): RaftNextStep 
       )
       : null;
   }
+  if (backward && page.hasOlder && seqs.length > 0) return olderStep(page, seqs, style);
   if (page.hasNewer && seqs.length > 0) {
     const max = Math.max(...seqs);
     return hintStep(
@@ -143,23 +164,30 @@ function historyNext(page: RaftHistoryPage, style: RaftHintStyle): RaftNextStep 
       { target: page.target, after: max },
     );
   }
-  if (page.hasOlder && seqs.length > 0) {
-    const min = Math.min(...seqs);
-    return hintStep(
-      "read_older",
-      RAFT_HINTS.messageRead({ target: page.target, before: min }),
-      "Older messages exist before this window; read them only if the task needs them.",
-      style,
-      { target: page.target, before: min },
-    );
-  }
+  if (page.hasOlder && seqs.length > 0) return olderStep(page, seqs, style);
   return null;
 }
 
+function olderStep(page: RaftHistoryPage, seqs: number[], style: RaftHintStyle): RaftNextStep {
+  const min = Math.min(...seqs);
+  return hintStep(
+    "read_older",
+    RAFT_HINTS.messageRead({ target: page.target, before: min }),
+    "Older messages exist before this window; read them only if the task needs them.",
+    style,
+    { target: page.target, before: min },
+  );
+}
+
 function historyText(page: RaftHistoryPage, style: RaftHintStyle): string {
+  const body = historyBodyText(page, style);
+  return page.historyLimitMessage ? `${page.historyLimitMessage}\n${body}` : body;
+}
+
+function historyBodyText(page: RaftHistoryPage, style: RaftHintStyle): string {
   if (page.messages.length === 0) {
     return page.unreadAfterSeq !== undefined
-      ? `No unread messages in ${page.target}. You have read through seq ${page.unreadAfterSeq}.`
+      ? `No unread messages in ${page.target}. You have read through seq ${page.readThroughSeq ?? page.unreadAfterSeq}.`
       : `No messages in ${page.target}.`;
   }
   const folded = new Set(page.alreadyShownSeqs ?? []);
@@ -172,9 +200,26 @@ function historyText(page: RaftHistoryPage, style: RaftHintStyle): string {
     lines.push(`${shown.length === 0 ? `No new unread messages in ${page.target}. ` : ""}${seqs.length} message${seqs.length === 1 ? "" : "s"} you were already shown (seq ${range}) ${seqs.length === 1 ? "is" : "are"} not repeated. To see ${seqs.length === 1 ? "it" : "them"} again: ${again}`);
   }
   if (shown.length > 0) lines.push(formatAgentMessages(shown.map((m) => toAgentMessageLike(m.raw)), style));
-  const next = historyNext(page, style);
-  if (next?.command) lines.push(`${next.kind === "read_newer" ? "Newer" : "Older"} exist: ${next.command}`);
+  lines.push(...historyCursorLines(page, style));
   return lines.join("\n");
+}
+
+/**
+ * The window's edges, as the CLI names them: "Older:" and "Newer:" each
+ * with the read that continues there, both when both
+ * apply (an `around` or `before` window). An unread read only continues
+ * forward, so it names only the next unread page.
+ */
+function historyCursorLines(page: RaftHistoryPage, style: RaftHintStyle): string[] {
+  const seqs = page.messages.map((m) => m.seq).filter((s): s is number => s !== null);
+  if (page.unreadAfterSeq !== undefined || seqs.length === 0) {
+    const next = historyNext(page, style);
+    return next?.command ? [`Newer: ${next.command}`] : [];
+  }
+  const lines: string[] = [];
+  if (page.hasOlder) lines.push(`Older: ${formatHint(RAFT_HINTS.messageRead({ target: page.target, before: Math.min(...seqs) }), style)}`);
+  if (page.hasNewer) lines.push(`Newer: ${formatHint(RAFT_HINTS.messageRead({ target: page.target, after: Math.max(...seqs) }), style)}`);
+  return lines;
 }
 
 /**
@@ -273,6 +318,13 @@ export async function readHistory(
     modelSeenUpToSeq: typeof data.model_seen_up_to_seq === "number" ? data.model_seen_up_to_seq : null,
     ...(typeof data.unread_after_seq === "number" ? { unreadAfterSeq: data.unread_after_seq } : {}),
     ...(typeof data.read_through_seq === "number" ? { readThroughSeq: data.read_through_seq } : {}),
+    ...(data.historyLimited === true
+      ? {
+        historyLimitMessage: typeof data.historyLimitMessage === "string" && data.historyLimitMessage
+          ? data.historyLimitMessage
+          : "Message history is limited on this plan.",
+      }
+      : {}),
   };
   if (request.unread && frontier) {
     const alreadyShown = [...alreadyShownIn(frontier, page.target, page.messages)];
@@ -284,7 +336,7 @@ export async function readHistory(
     ok: true,
     state: page.messages.length > 0 ? "page" : "empty",
     data: page,
-    next: historyNext(page, style),
+    next: historyNext(page, style, request.before !== undefined),
     text: cardLines.length > 0 ? `${cardLines.join("\n")}\n\n${text}` : text,
   };
 }
@@ -341,7 +393,8 @@ const SEND_TRANSPORT_ATTEMPTS = 3;
 
 export interface SendMessageRequest {
   target: string;
-  content: string;
+  /** Message text (Markdown). Optional only with `attachmentIds` or a `card`; with a card it is the card's fallback text. */
+  content?: string;
   attachmentIds?: string[];
   /**
    * One key per logical message. Generated with `crypto.randomUUID()` when
@@ -362,10 +415,19 @@ export interface SendMessageRequest {
    * one of its threads (resuming a `thread_target` interrupt).
    */
   targetConfirmed?: boolean;
+  /**
+   * RFC 082: post the message as a card. `content` is then optional:
+   * the card's fallback text, which Raft derives from the card when absent;
+   * only `content` the caller wrote mentions anyone. The card is checked
+   * before any request. Its sender may replace it later: `messages.updateCard`.
+   */
+  card?: MessageCardInput;
 }
 
-const sendMessageFields = {
-  content: z.string().describe("Message text (Markdown). May be empty only when attachmentIds are given."),
+// A function, called inside the lazy schemas below: the card field's schema is
+// lazy too, and touching it at import time would build it (lazySchema.ts).
+const sendMessageFields = () => ({
+  content: z.string().optional().describe("Message text (Markdown). Required unless attachmentIds or a card are given; with a card it is the text agents, search and notifications read (derived from the card when omitted)."),
   attachmentIds: z.array(z.string()).optional().describe("Attachment ids from an upload, posted with this message."),
   idempotencyKey: z.string().optional().describe("One key per logical message; generated when omitted. Reuse it to retry, and to resume an interrupted send (interrupt.resume.idempotencyKey)."),
   mentions: z.array(agentApiStructuredMentionSchema).optional().describe("Structured @mentions (user or agent id and name), in addition to @handles in the text."),
@@ -374,11 +436,12 @@ const sendMessageFields = {
     exactSeqs: z.array(z.number().int().positive()).optional(),
   }).optional().describe("Override the seen attestation for this send (runtimes that track what their model saw themselves)."),
   targetConfirmed: z.boolean().optional().describe("The top-level target is intentional even though you last read one of its threads (answering a thread_target interrupt)."),
-};
+  card: raftMessageCardInputSchema.optional().describe(`${RAFT_MESSAGE_CARD_FIELD_DESCRIPTION} Replace it later with messages.updateCard (notifies no one).`),
+});
 
 export const sendMessageRequestSchema = lazySchema("sendMessageRequestSchema", () => requestSchema<SendMessageRequest>()(z.object({
   target: raftTargetSchema,
-  ...sendMessageFields,
+  ...sendMessageFields(),
 })));
 
 /** `reply(message, request)` as one argument object: the received message (its `target`) and the send fields. */
@@ -388,7 +451,7 @@ export interface ReplyToRequest extends Omit<SendMessageRequest, "target"> {
 
 export const replyToRequestSchema = lazySchema("replyToRequestSchema", () => requestSchema<ReplyToRequest>()(z.object({
   message: z.object({ target: raftTargetSchema }).describe("The received message to reply to; only its `target` is used."),
-  ...sendMessageFields,
+  ...sendMessageFields(),
 })));
 
 export interface RaftSent {
@@ -396,8 +459,17 @@ export interface RaftSent {
   messageSeq: number | null;
   /** Handles in the content that resolved to nobody (Server warning, sender-only). */
   unresolvedMentionHandles: string[];
+  /** Agents this message was delivered to ([] when none); null when the Server did not count (Joint channel, older Server). */
+  deliveredToAgents: string[] | null;
   /** Newer messages the Server returned alongside the acceptance, if any. */
   recentUnread: RaftMessage[];
+  /**
+   * RFC 082: the card stored with the message (a send with `card`; on a
+   * replay, its revision now). Absent: no card was stored. A send with
+   * `card` without it went out as text only (a Server older than card
+   * messages ignores `card`), and `text` says so.
+   */
+  messageCard?: { revision: number };
 }
 
 export type SendMessageOutcome = RaftOutcome<RaftSent, "sent"> | RaftInterrupted;
@@ -410,10 +482,13 @@ export type SendMessageOutcome = RaftOutcome<RaftSent, "sent"> | RaftInterrupted
 function heldSendPaths(interrupt: RaftInterrupt, style: RaftHintStyle): string {
   const key = interrupt.resume.idempotencyKey;
   const resend = key ? `send it again with idempotencyKey "${key}"` : "send it again";
-  const first = interrupt.contextComplete || interrupt.withheld
-    ? `To send it unchanged, ${resend}.`
-    : `Not all of them are shown here: read the conversation first (${formatHint(RAFT_HINTS.messageRead({ target: interrupt.target }), style)}), then ${resend}.`;
-  return `${first} To change it, send the revised content instead. You can also choose not to send anything.\n`;
+  // A withheld hold shows only a count: there is nothing just read to judge by.
+  if (interrupt.withheld) return `To send it unchanged, ${resend}. To change it, send the revised content instead. You can also choose not to send anything.\n`;
+  const readFirst = interrupt.contextComplete
+    ? ""
+    : `Not all of them are shown here: read the conversation first (${formatHint(RAFT_HINTS.messageRead({ target: interrupt.target }), style)}). Then: `;
+  // Not sending comes first: someone may have said it already.
+  return `${readFirst}${heldSendNothing(interrupt.newMessageCount > 0)} Otherwise, to send it unchanged, ${resend}. To change it, send the revised content instead.\n`;
 }
 
 /**
@@ -428,10 +503,11 @@ export function heldInterrupt(
   resume: RaftInterruptResume,
   cancel?: RaftInterruptCancel,
   style: RaftHintStyle = "cli",
-): RaftInterrupt {
+): { interrupt: RaftInterrupt; pointsToRead: boolean } {
   const interrupt = unreadMessagesInterrupt({ target, hold: data, context: "", resume, ...(cancel ? { cancel } : {}), hints: style });
   const paths = heldSendPaths(interrupt, style);
-  return { ...interrupt, context: formatAgentHold(target, data, { heldAction: action, draftInstructions: paths, isolationInstructions: `${action} ${paths}` }, style).trimEnd() };
+  const held = renderAgentHold(target, data, { heldAction: action, draftInstructions: paths, isolationInstructions: `${action} ${paths}` }, style);
+  return { interrupt: { ...interrupt, context: held.text.trimEnd() }, pointsToRead: held.pointsToRead };
 }
 
 /**
@@ -485,36 +561,43 @@ function threadTargetInterrupted(
   };
 }
 
-function heldSendNext(interrupt: RaftInterrupt, style: RaftHintStyle): RaftNextStep {
-  return hintStep(
-    "resend",
-    RAFT_HINTS.messageRead({ target: interrupt.target }),
-    interrupt.reason === "unseen_card"
-      ? "This context has not seen the conversation's card. Show interrupt.context to the model, call frontier.recordHeld(interrupt) (it books under interrupt.contextId), then resume the send (interrupt.resume, same idempotencyKey) or cancel it."
-      : interrupt.withheld
-      ? "Newer messages exist in this conversation but were withheld; read them, then resume the send (interrupt.resume, same idempotencyKey) or cancel it."
-      : !interrupt.contextComplete
-      ? "Newer messages arrived in this conversation and not all of them are shown here; read the conversation, then resume the send (interrupt.resume, same idempotencyKey) or cancel it."
-      : "Newer messages arrived in this conversation. Show interrupt.context to the model, call frontier.recordHeld(interrupt) to attest that, then resume the send (interrupt.resume, same idempotencyKey) or cancel it.",
-    style,
-    { target: interrupt.target },
-  );
+function heldSendNext(interrupt: RaftInterrupt, pointsToRead: boolean, style: RaftHintStyle): RaftNextStep {
+  const resume = "resume the send (interrupt.resume, same idempotencyKey) or cancel it.";
+  return heldNextStep("resend", interrupt, pointsToRead, {
+    read: interrupt.withheld
+      ? `Newer messages exist in this conversation but were withheld; read them, then ${resume}`
+      : `Newer messages arrived in this conversation and interrupt.context does not show all of them in full; read the conversation, then ${resume}`,
+    shown: interrupt.reason === "unseen_card"
+      ? `This context has not seen the conversation's card. Show interrupt.context to the model, call frontier.recordHeld(interrupt) (it books under interrupt.contextId), then ${resume}`
+      : `Newer messages arrived in this conversation; interrupt.context shows all of them. Show it to the model, call frontier.recordHeld(interrupt) to attest that, then ${resume}`,
+  }, style);
 }
 
 export function isHeldResponse(data: unknown): data is AgentApiHeldFreshnessResponse {
   return Boolean(data) && typeof data === "object" && (data as { state?: unknown }).state === "held";
 }
 
-function sentOutcome(target: string, data: Extract<AgentApiSendResponse, { state: "sent" }>, style: RaftHintStyle): SendMessageOutcome {
+function sentOutcome(
+  target: string,
+  data: Extract<AgentApiSendResponse, { state: "sent" }>,
+  style: RaftHintStyle,
+  /** RFC 082: the request carried a card; without `messageCard` in the answer, `text` says none was stored. */
+  cardRequested = false,
+): SendMessageOutcome {
+  const revision = data.messageCard?.revision;
   const sent: RaftSent = {
     messageId: data.messageId,
     messageSeq: typeof data.messageSeq === "number" ? data.messageSeq : null,
     unresolvedMentionHandles: data.unresolvedMentionHandles ?? [],
+    deliveredToAgents: normalizeAgentDeliveredToAgents(data),
     recentUnread: projectRaftMessages(data.recentUnread ?? [], style),
+    ...(typeof revision === "number" ? { messageCard: { revision } } : {}),
   };
   const warn = sent.unresolvedMentionHandles.length > 0
     ? ` Unresolved @handles: ${sent.unresolvedMentionHandles.map((h) => `@${h}`).join(", ")}.`
     : "";
+  const delivered = formatAgentDeliveredToAgentsLine(sent.deliveredToAgents);
+  const textOnly = cardRequested && !sent.messageCard ? `\n${AGENT_MESSAGE_CARD_NOT_STORED_NOTICE}` : "";
   return {
     ok: true,
     state: "sent",
@@ -522,7 +605,7 @@ function sentOutcome(target: string, data: Extract<AgentApiSendResponse, { state
     next: sent.recentUnread.length > 0
       ? hintStep("read_target", RAFT_HINTS.messageRead({ target }), "Newer messages arrived while you were sending.", style, { target })
       : null,
-    text: `Message sent to ${target}. Message ID: ${sent.messageId}${warn}`,
+    text: `Message sent to ${target}. Message ID: ${sent.messageId}${warn}${delivered ? `\n${delivered}` : ""}${textOnly}`,
   };
 }
 
@@ -577,6 +660,7 @@ async function sendAttachmentText(
         sender: m.sender_name ?? null,
         timestamp: m.timestamp ?? null,
         content: m.content ?? "",
+        attachmentCount: windowAttachmentCount(m),
       })),
     }, undefined, style);
     return lines.length > 0 ? lines.join("\n") : null;
@@ -594,7 +678,12 @@ export async function sendMessage(
   const style = options.hints ?? "cli";
   const invalid = validateOpRequest(sendMessageRequestSchema, request); if (invalid) return invalid;
   if (!request.target?.trim()) return failureOutcome(opError("INVALID_REQUEST", { message: "A target is required to send a message." }));
-  if (typeof request.content !== "string" || (!request.content.trim() && !(request.attachmentIds?.length))) {
+  const content = typeof request.content === "string" ? request.content : "";
+  if (request.card !== undefined) {
+    // RFC 082: checked as the Server will, so the caller gets the element's path and the limit before any request.
+    const refused = messageCardRequestFailure(request.card, content.length > 0 ? content : undefined, request.mentions);
+    if (refused) return refused;
+  } else if (!content.trim() && !(request.attachmentIds?.length)) {
     return failureOutcome(opError("INVALID_REQUEST", { message: "Message content (or an attachment) is required." }));
   }
   const idempotencyKey = request.idempotencyKey?.trim() || crypto.randomUUID();
@@ -609,7 +698,9 @@ export async function sendMessage(
     : frontier?.attestation(request.target) ?? { seenExactSeqs: [] };
   const body: AgentApiSendV2Body = {
     target: request.target,
-    content: request.content,
+    // A card without content: none is sent, so the Server derives the card's fallback.
+    ...(request.card !== undefined && content.length === 0 ? {} : { content }),
+    ...(request.card !== undefined ? { card: request.card } : {}),
     ...(request.attachmentIds?.length ? { attachmentIds: request.attachmentIds } : {}),
     idempotencyKey,
     ...(request.mentions?.length ? { mentions: request.mentions } : {}),
@@ -622,13 +713,13 @@ export async function sendMessage(
   for (let attempt = 1; !result.ok && result.error.kind === "transport" && attempt < SEND_TRANSPORT_ATTEMPTS; attempt += 1) {
     result = await client.messages.sendV2(body);
   }
-  if (!result.ok) return failureFromClientResult(result);
+  if (!result.ok) return request.card !== undefined ? messageCardFailure(result) : failureFromClientResult(result);
   const data = result.data;
   if (isHeldResponse(data)) {
     // The SDK keeps no draft, so there is no argv to offer: resuming is
     // sending the same request again with `resume.idempotencyKey`, and
     // cancelling is not sending it (nothing to clean up, so no `cancel`).
-    const held = heldInterrupt(
+    const { interrupt: held, pointsToRead } = heldInterrupt(
       request.target,
       data,
       "Your message was not sent.",
@@ -648,10 +739,10 @@ export async function sendMessage(
       ...(Object.keys(shownCards).length > 0 ? { cards: shownCards } : {}),
       ...(frontier?.contextId ? { contextId: frontier.contextId } : {}),
     };
-    return { ok: true, state: "interrupted", interrupt, next: heldSendNext(interrupt, style), text: interrupt.context };
+    return { ok: true, state: "interrupted", interrupt, next: heldSendNext(interrupt, pointsToRead, style), text: interrupt.context };
   }
   if (data.state === "sent") {
-    const outcome = sentOutcome(request.target, data, style);
+    const outcome = sentOutcome(request.target, data, style, request.card !== undefined);
     if (!cards) return outcome;
     const extra: string[] = [];
     // A card the reply carries (changed since this context saw it, or sent with an unseen one) is shown and booked.

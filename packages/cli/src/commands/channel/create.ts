@@ -6,6 +6,7 @@ import type { Command } from "commander";
 import { createAgentApiSurfaceClient } from "../../agentApiPath";
 import { defineCommand, registerCliCommand } from "../../core/command";
 import type { CommandRuntimeOptions } from "../../core/context";
+import { rateLimitedResponseError } from "../../core/apiFailure";
 import { CliError } from "../../core/errors";
 import { writeText, adoptCliReplyText } from "../../core/renderer";
 
@@ -66,6 +67,8 @@ export const channelCreateCommand = defineCommand(
       ...(opts.description !== undefined ? { description: opts.description } : {}),
       visibility: opts.private ? "private" : "public",
     });
+    const rateLimited = res.ok ? null : rateLimitedResponseError(res);
+    if (rateLimited) throw rateLimited;
     if (!res.ok || !res.data) {
       throw new CliError({
         code: res.status >= 500 ? "SERVER_5XX" : "CREATE_FAILED",

@@ -3,9 +3,7 @@
   "runtimeId": "claude",
   "schemaVersion": "claude.create.v1",
   "requiredClientCapabilities": [
-    "select.custom_value",
-    "choice.labels",
-    "option_source.status"
+    "select.custom_value"
   ],
   "dataSchema": {
     "type": "object",
@@ -25,6 +23,11 @@
         "type": "string",
         "title": "API URL",
         "format": "uri"
+      },
+      "authType": {
+        "type": "string",
+        "title": "Authentication",
+        "x-optionSource": "authType"
       },
       "apiKey": {
         "type": "string",
@@ -67,6 +70,7 @@
     "order": [
       "provider",
       "apiUrl",
+      "authType",
       "apiKey",
       "model",
       "reasoningEffort",
@@ -91,6 +95,15 @@
         }
       },
       {
+        "pointer": "/authType",
+        "when": {
+          "pointer": "/provider",
+          "in": [
+            "custom"
+          ]
+        }
+      },
+      {
         "pointer": "/apiKey",
         "when": {
           "pointer": "/provider",
@@ -103,11 +116,15 @@
     "localization": {
       "provider": {
         "label": "Provider",
-        "hint": "Default leaves Claude Code provider settings untouched. Custom sets ANTHROPIC_BASE_URL and ANTHROPIC_API_KEY for this agent."
+        "hint": "Default leaves Claude Code provider settings untouched. Custom sets ANTHROPIC_BASE_URL and, from the key, ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN for this agent."
       },
       "apiUrl": {
         "label": "API URL",
         "placeholder": "https://gateway.example.com"
+      },
+      "authType": {
+        "label": "Authentication",
+        "hint": "Use Bearer token for a gateway that expects an Authorization header."
       },
       "apiKey": {
         "label": "API Key",
@@ -121,6 +138,14 @@
         "label": "Reasoning",
         "hint": "Available values depend on the selected model.",
         "choices": {
+          "off": {
+            "label": "No reasoning",
+            "description": "Answers directly, without a thinking phase"
+          },
+          "minimal": {
+            "label": "Minimal",
+            "description": "Very light reasoning for the fastest responses"
+          },
           "low": {
             "label": "Low",
             "description": "Fast responses with lighter reasoning"
@@ -134,7 +159,7 @@
             "description": "Greater reasoning depth for complex problems"
           },
           "xhigh": {
-            "label": "Extra High",
+            "label": "Extra high",
             "description": "Extra high reasoning depth for complex problems"
           },
           "max": {
@@ -180,6 +205,14 @@
       "kind": "select",
       "pointer": "/provider"
     },
+    "authType": {
+      "protocolVersion": 1,
+      "runtimeId": "claude",
+      "schemaVersion": "claude.create.v1",
+      "sourceId": "authType",
+      "kind": "select",
+      "pointer": "/authType"
+    },
     "model": {
       "protocolVersion": 1,
       "runtimeId": "claude",
@@ -198,6 +231,7 @@
   "values": {
     "provider": "custom",
     "apiUrl": "https://gateway.example.test",
+    "authType": "api_key",
     "model": "sonnet",
     "reasoningEffort": "high",
     "fastMode": true,

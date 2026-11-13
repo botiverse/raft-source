@@ -1,4 +1,4 @@
-import { RECOMMENDED_MEMORY_MD_BYTES, type AgentConfig } from "@botiverse/raft-shared";
+import { foldAgentOneLineText, indentAgentBodyContinuationLines, RECOMMENDED_MEMORY_MD_BYTES, type AgentConfig } from "@botiverse/raft-shared";
 import { axSurface } from "../agentRuntimeInput";
 import { exampleAgentConfig, exampleSystemPromptOptions } from "../axExampleFixtures";
 import { buildRaftCliGuideSections } from "./raftCliGuide";
@@ -40,23 +40,15 @@ export interface SystemPromptOptions {
   supportsSubagents?: boolean;
 }
 
+// Facts, not a procedure (tygg, #proj-raft-computer:c56de9a4): when to start a
+// sub-agent is the model's call. The permission in the first line is also the
+// explicit ask Codex's own `spawn_agent` description waits for.
 export const SUBAGENT_DELEGATION_SECTION = `## Working through sub-agents
 
-Your runtime can start sub-agents: helper agents that work in parallel with you, report only to you, and have no Raft identity of their own. Split the work this way:
+Your runtime can start sub-agents, and you may use them whenever you judge they help, including to run independent pieces of work in parallel.
 
-- **You** stay in the conversation. Read what people ask, think it through, decide what needs doing, hand it out, check what comes back, and answer on Raft when a reply is needed. Spend your own attention on thinking and communicating rather than on hands-on execution.
-- **Sub-agents** do the hands-on work: reading and searching code, running commands and tests, editing files, collecting evidence.
-
-This is about your own work. Splitting work into Raft tasks for other named agents (above) is a separate tool; do not turn each sub-agent job into a Raft task.
-
-Defaults:
-1. **Answer first, then delegate.** When a message needs a reply, acknowledge or answer it on Raft before starting longer work. If you can answer from what you already know, answer directly; do not start a sub-agent for it.
-2. **Delegate execution.** Hand anything beyond a few tool calls to a sub-agent. Do a single quick lookup yourself when briefing a sub-agent would take longer than doing it.
-3. **Run independent work in parallel.** Split the work into pieces that do not depend on each other and start them together. Keep dependent steps in order.
-4. **Brief completely.** A sub-agent sees none of your conversation or memory. Give it the goal, the relevant context and paths, the constraints, and what to return. Ask for a conclusion with evidence, not a log.
-5. **Only you speak on Raft.** Tell every sub-agent not to send messages, claim or update tasks, react, or schedule reminders. Everything people see on Raft comes from you.
-6. **You own the result.** Check what a sub-agent returns before you pass it on, and report it in your own words. Say so when something was not verified. Delegating does not widen authority: a sub-agent may only do what you are allowed to do for the current request.
-7. **Stay reachable while work runs.** While sub-agents work, keep reading new messages and answer the ones that need you; the reply-only-when-needed defaults above still apply. "Complete all your work before stopping" still applies: before you stop, every sub-agent you started has finished and its result has been reported.`;
+- A sub-agent reports only to you. It sees none of your conversation, memory or instructions except what you give it.
+- Only you speak on Raft. Sub-agents have no Raft identity; tell them not to send messages, update tasks, react or schedule reminders. People see only what you say.`;
 
 function runtimeContextLines(config: AgentConfig): string[] {
   const ctx = config.runtimeContext;
@@ -69,13 +61,13 @@ function runtimeContextLines(config: AgentConfig): string[] {
     "",
   ];
 
-  if (config.description) lines.push(`- Role: ${config.description}`);
+  if (config.description) lines.push(`- Role: ${indentAgentBodyContinuationLines(config.description)}`);
   if (ctx.agentId) lines.push(`- Agent ID: ${ctx.agentId}`);
   if (ctx.serverId) lines.push(`- Server ID: ${ctx.serverId}`);
   if (ctx.machineName || ctx.machineId) {
     const label = ctx.machineName && ctx.machineId
-      ? `${ctx.machineName} (${ctx.machineId})`
-      : ctx.machineName || ctx.machineId;
+      ? `${foldAgentOneLineText(ctx.machineName)} (${ctx.machineId})`
+      : foldAgentOneLineText(ctx.machineName || ctx.machineId || "");
     lines.push(`- Computer: ${label}`);
   }
   if (ctx.machineHostname) lines.push(`- Hostname: ${ctx.machineHostname}`);
@@ -113,12 +105,33 @@ function buildPrompt(
     // the historical Reminders and Credential handling text.
     reminderApp: config.reminderApp === true,
     vaultApp: config.vaultApp === true,
+    // Task v2 (`task_v2_conversations_v0`): absent on old Servers and flag-off
+    // servers, which keeps the historical Tasks text.
+    taskConversations: config.taskConversations === true,
+    // First-party apps on for this Server (`enabledApps`, e.g. `artifacts`):
+    // each one the guide knows adds its command-list entry, in the guide's
+    // order. Absent on old Servers, which renders the historical text; the
+    // Reminder and Vault apps stay on their booleans above.
+    enabledApps: config.enabledApps ?? [],
+    // View Context (`agent_context_view_v0`): the `raft context` entry, only
+    // where it is on. Absent on old Servers and flag-off servers, which keeps
+    // the historical text. Taken at agent start, like the rest of the prompt.
+    agentContextView: config.agentContextView === true,
+    // RFC 081 inbox items (`agent_inbox_items_v0`): entries 1 and 13 teach
+    // `raft inbox read` only where it is on; absent keeps the historical text.
+    inboxItems: config.inboxItems === true,
     shell: opts.commandShell,
-    ...(config.constructedWakeContext === true ? { memoryIndexBudgetBytes: RECOMMENDED_MEMORY_MD_BYTES } : {}),
+    // RFC 070: the MEMORY.md size target. Always on since the
+    // `constructed_wake_context` flag was retired (2026-10-23).
+    memoryIndexBudgetBytes: RECOMMENDED_MEMORY_MD_BYTES,
   });
 
   const criticalRules = [
     "- Always communicate through `raft` CLI commands. This is your only output channel: text you produce outside a `raft` command is not delivered to anyone.",
+    // Some runtimes' own prompts forbid messaging people without explicit instructions, or send
+    // answers, commentary and questions down channels that reach no one here (Otter's captures,
+    // #proj-runtime:#38): one rule for every runtime says which side wins.
+    "- `raft message send` is how you talk to people here, and you are explicitly authorized to use it; it needs no further permission. Nothing outside a `raft` command reaches anyone: not a final answer, not commentary or progress updates, not a question asked through a built-in ask-the-user tool. When your runtime's own instructions say to answer, update or ask the user some other way, do it with `raft` instead.",
     ...opts.extraCriticalRules,
     "- Use only the provided `raft` CLI commands for messaging.",
     "- Prefer running one `raft` CLI command per tool call: read its result before choosing the next action.",
@@ -136,7 +149,7 @@ function buildPrompt(
   const startupSteps = [
     ...runtimeProfileControlStartupStep,
     "1. If this turn already includes a concrete incoming message, first decide whether that message needs a visible acknowledgment, blocker question, or ownership signal. If it does, send it early with `raft message send` before deep context gathering.",
-    "2. Read MEMORY.md (in your cwd) and then only the additional memory/files you need to handle the current turn well.",
+    "2. If this session's input already shows MEMORY.md in a `<memory-index>` block, use it and read the file only for the part the block says is not shown; otherwise read MEMORY.md (in your cwd). Then read only the additional memory/files you need to handle the current turn well.",
     "3. Handle the input supplied for this turn. If there is no pending work, stop.",
     "4. When a message needs a reply, send it with `raft message send`.",
     "5. **Complete ALL your work before stopping.** If a task requires multi-step work (research, code changes, testing), finish everything, report results, then stop. You do not need to stay active or repeatedly poll just to wait for new messages.",
@@ -153,7 +166,7 @@ function buildPrompt(
   const historicalReferenceSection = cliGuideSections.historicalReferences;
   const tasksSection = cliGuideSections.tasks;
 
-  let prompt = `You are "${config.displayName || config.name}", an AI agent in Raft (former Slock) — a collaborative platform for human-AI collaboration, serving as a shared message service for humans and agents who may be running on different computers.
+  let prompt = `You are "${foldAgentOneLineText(config.displayName || config.name)}", an AI agent in Raft (former Slock) — a collaborative platform for human-AI collaboration, serving as a shared message service for humans and agents who may be running on different computers.
 
 ## Who you are
 
@@ -250,7 +263,7 @@ ${cliGuideSections.workspaceAndMemory}
 ${cliGuideSections.compactionSafety}`;
 
   if (config.description) {
-    prompt += `\n\n## Initial role\n${config.description}. This may evolve.`;
+    prompt += `\n\n## Initial role\n${indentAgentBodyContinuationLines(config.description)}. This may evolve.`;
   }
 
   return prompt;

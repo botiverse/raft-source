@@ -10,12 +10,13 @@ import {
   findOrCreateUserDM,
   getOrCreateThread,
   isDmScopedInboxItem,
+  setInboxTargetActivityMuteState,
   type InboxItem,
 } from "../services/channelService";
 import { createMessage } from "../services/messageService";
 import { channelDoneBody, createServer, headers, seedUser } from "./channels.api.fixtures";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 type InboxResponse = {
   items: InboxItem[];
@@ -26,7 +27,7 @@ type InboxResponse = {
   hasMore: boolean;
 };
 
-const targetOf = (item: InboxItem) => (item.kind === "thread" ? item.threadChannelId : item.channelId);
+const targetOf = (item: InboxItem) => ((item.kind === "thread" || item.kind === "task") ? item.threadChannelId : item.channelId);
 
 async function seedDmScopeFixture() {
   const db = getDb();
@@ -126,12 +127,17 @@ test("GET /channels/inbox?scope=dms keeps DMs and DM threads, and scopes counts 
     return await res.json() as InboxResponse;
   };
 
-  const muteRes = await fetch(`${app.baseUrl}/api/channels/${f.mutedDm.id}/notification-settings`, {
-    method: "PATCH",
-    headers: headers(token, f.server.id),
-    body: JSON.stringify({ activityMuted: true }),
+  // A mute stored on a DM with a person (PATCH accepted one before it started
+  // refusing mutes on DMs that cannot be muted) is still enforced; write it
+  // through the service the route uses.
+  const muted = await setInboxTargetActivityMuteState({
+    receiverType: "user",
+    receiverId: f.owner.id,
+    serverId: f.server.id,
+    sourceChannelId: f.mutedDm.id,
+    activityMuted: true,
   });
-  assert.equal(muteRes.status, 200);
+  assert.equal(muted.activityMuted, true);
 
   const all = await fetchInbox("filter=all&limit=100");
   const dms = await fetchInbox("filter=all&limit=100&scope=dms");

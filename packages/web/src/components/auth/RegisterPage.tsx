@@ -1,26 +1,26 @@
-import { useCallback, useState } from "react";
+import { useCallback, useId, useState } from "react";
 import type { ChangeEvent, FormEvent, ReactNode } from "react";
 import { useIntl } from "react-intl";
-import { Button, Input, Separator, TextSans } from "@botiverse/raft-ui";
+import { Button, Input, TextSans, TextLink } from "@botiverse/raft-ui";
 import { CURRENT_LEGAL_ACCEPTANCE } from "@botiverse/raft-shared";
 import { useAuthStore } from "../../store/authStore";
 import type { AuthProvider, SocialAuthProviderId } from "../../hooks/useAuthProviders";
 import { useAuthProviders } from "../../hooks/useAuthProviders";
 import {
-  buildSocialAuthStartUrl,
   getCurrentReturnTo,
   getExternalBrowserLoginUrl,
   isEmbeddedBrowser,
   PENDING_INVITE_STORAGE_KEY,
 } from "../../utils/socialAuth";
+import { startSocialSignIn } from "../../utils/socialSignIn";
 import AuthPageFrame, { AuthPageIntro } from "./AuthPageFrame";
-import TextLink from "../ui/TextLink";
 import Banner from "../ui/Banner";
 import FormField from "../ui/FormField";
-import LegalAcceptanceCheckbox from "./LegalAcceptanceCheckbox";
+import LegalAcceptanceCheckbox, { LegalAcceptanceUsageDataNotice } from "./LegalAcceptanceCheckbox";
 import OpenInBrowserSignInGuide from "./OpenInBrowserSignInGuide";
-import SocialProviderButton from "./SocialProviderButton";
+import { DesktopSignInWaiting, SocialProviderSection } from "./SocialProviderButton";
 import { AUTH_MESSAGE_IDS, authServerErrorMessage, isValidEmailFormat } from "./authErrors";
+import { DeploymentUserLimitText } from "../ui/DeploymentUserLimitText";
 
 interface RegisterPageProps {
   onSwitchToLogin: () => void;
@@ -31,7 +31,12 @@ export default function RegisterPage({ onSwitchToLogin, previewProviders }: Regi
   const { formatMessage } = useIntl();
   const register = useAuthStore((state) => state.register);
   const loading = useAuthStore((state) => state.loading);
-  const { enabledProviders: configuredProviders } = useAuthProviders();
+  const {
+    enabledProviders: configuredProviders,
+    loading: providersLoading,
+    expectedCount: expectedProviderCount,
+    deploymentUserLimitReached,
+  } = useAuthProviders();
   const enabledProviders = previewProviders ?? configuredProviders;
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -39,6 +44,7 @@ export default function RegisterPage({ onSwitchToLogin, previewProviders }: Regi
   const [error, setError] = useState("");
   const [fieldErrors, setFieldErrors] = useState<{ email?: string; password?: string }>({});
   const [showOpenInBrowserGuide, setShowOpenInBrowserGuide] = useState(false);
+  const usageDataNoticeId = useId();
 
   const handleSocialLogin = useCallback((providerId: SocialAuthProviderId) => {
     if (previewProviders) return;
@@ -46,8 +52,8 @@ export default function RegisterPage({ onSwitchToLogin, previewProviders }: Regi
       setShowOpenInBrowserGuide(true);
       return;
     }
-    window.location.href = buildSocialAuthStartUrl(providerId, getCurrentReturnTo());
-  }, [previewProviders]);
+    startSocialSignIn(providerId, getCurrentReturnTo(), formatMessage);
+  }, [formatMessage, previewProviders]);
 
   const handleCloseOpenInBrowserGuide = useCallback(() => {
     setShowOpenInBrowserGuide(false);
@@ -87,7 +93,8 @@ export default function RegisterPage({ onSwitchToLogin, previewProviders }: Regi
         termsVersion: CURRENT_LEGAL_ACCEPTANCE.termsVersion,
         privacyVersion: CURRENT_LEGAL_ACCEPTANCE.privacyVersion,
         legalAcceptanceSource: window.localStorage.getItem(PENDING_INVITE_STORAGE_KEY) ? "invite" : "signup",
-      });
+        // The page signed up from (an Artifact link): the verification email's link lands back on it, as third-party sign-up does.
+      }, getCurrentReturnTo());
     } catch (err: any) {
       setError(authServerErrorMessage(err, formatMessage({ id: "pages.register.failed" }), formatMessage));
     }
@@ -108,8 +115,14 @@ export default function RegisterPage({ onSwitchToLogin, previewProviders }: Regi
         <AuthPageIntro title={formatMessage({ id: "pages.register.title" })} />
 
         {error ? <Banner intent="warning" className="mb-4">{error}</Banner> : null}
+        {/* Signing up still works at the limit: only joining a server as one more person is refused. */}
+        {deploymentUserLimitReached && !previewProviders ? (
+          <Banner intent="info" withIcon className="mb-4" data-testid="register-user-limit-notice">
+            <DeploymentUserLimitText id="deploymentUserLimit.registerNotice" />
+          </Banner>
+        ) : null}
 
-        <form onSubmit={handleSubmit} className="space-y-4" autoComplete="on" noValidate>
+        <form onSubmit={handleSubmit} className="stack-y-4 md:pointer-fine:stack-y-3" autoComplete="on" noValidate>
           <FormField label={formatMessage({ id: "pages.register.emailLabel" })} error={fieldErrors.email} htmlFor="register-email">
             <Input
               id="register-email"
@@ -146,6 +159,7 @@ export default function RegisterPage({ onSwitchToLogin, previewProviders }: Regi
           <Button
             type="submit"
             disabled={loading || !acceptedLegal}
+            aria-describedby={usageDataNoticeId}
             size="xl"
             variant="accent"
             className="w-full"
@@ -155,43 +169,25 @@ export default function RegisterPage({ onSwitchToLogin, previewProviders }: Regi
               : formatMessage({ id: "pages.register.submit" })}
           </Button>
 
-          {/* task #724: a disabled Continue must say why. The reason is the
-              unchecked legal box, which is otherwise easy to miss; show a
-              persistent reason line (never hover-only — touch has no hover),
-              and only while the box is unchecked so it does not read as an
-              error next to the validation text. */}
-          {!acceptedLegal && !loading ? (
-            <p
-              className="text-center text-caption text-foreground-hint"
-              data-testid="register-legal-hint"
-            >
-              {formatMessage({ id: "auth.legalAcceptance.requiredHint" })}
-            </p>
-          ) : null}
+          <LegalAcceptanceUsageDataNotice id={usageDataNoticeId} />
         </form>
 
-        {enabledProviders.length > 0 ? (
-          <>
-            <Separator className="my-1">{formatMessage({ id: "pages.register.or" })}</Separator>
-            <div className="space-y-2">
-              {enabledProviders.map((provider) => (
-                <SocialProviderButton
-                  key={provider.id}
-                  providerId={provider.id}
-                  label={provider.label}
-                  onClick={handleSocialLogin}
-                />
-              ))}
-            </div>
-          </>
-        ) : null}
+        <SocialProviderSection
+          loading={!previewProviders && providersLoading}
+          expectedCount={expectedProviderCount}
+          providers={enabledProviders}
+          separator={formatMessage({ id: "pages.register.or" })}
+          onSelect={handleSocialLogin}
+        />
+        {/* Raft Desktop: a second step from these buttons can hand over to a passkey in the browser. */}
+        <DesktopSignInWaiting passkey />
 
         <TextSans size="small" className="mt-4 text-center">
           {formatMessage(
             { id: "pages.register.haveAccountPrompt" },
             {
               signin: (c: ReactNode) => (
-                <TextLink key="signin" variant="primary" onClick={onSwitchToLogin}>
+                <TextLink key="signin" variant="strong" onClick={onSwitchToLogin}>
                   {c}
                 </TextLink>
               ),

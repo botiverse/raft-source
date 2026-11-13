@@ -14,5 +14,6 @@
     "declaration": true,
     "noEmit": true
   },
-  "include": ["src/**/*.ts", "contracts/**/*.ts"]
+  "include": ["src/**/*.ts", "contracts/**/*.ts"],
+  "exclude": ["contracts/*/tools/**"]
 }

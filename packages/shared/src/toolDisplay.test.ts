@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { classifyToolCall } from "./activityTurnSummary";
 import {
   getToolActivityLabel,
   getToolLogLabel,
@@ -21,6 +22,11 @@ test("tool labels come from the shared metadata table", () => {
   assert.equal(getToolActivityLabel("mcp_chat_list_tasks"), "Listing tasks…");
   assert.equal(getToolLogLabel("Read"), "Reading file");
   assert.equal(getToolActivityLabel("SearchWeb"), "Searching web…");
+  // `raft server info` reads as what it shows, not "Listing server" (#proj-runtime:#45).
+  assert.equal(getToolLogLabel("mcp__chat__list_server"), "Viewing server info");
+  assert.equal(getToolActivityLabel("mcp__chat__list_server"), "Viewing server info…");
+  const serverInfo = normalizeToolDisplayInvocation("Bash", { command: "raft server info --channels" });
+  assert.equal(getToolLogLabel(serverInfo.toolName), "Viewing server info");
   assert.equal(getToolLogLabel("unknown_tool_name"), "unknown_tool_name");
   assert.equal(getToolActivityLabel("unknown_tool_with_long_name_here"), "Using unknown_tool_with_lo……");
 });
@@ -198,4 +204,17 @@ test("slock channel membership CLI maps back to channel tool semantics", () => {
   });
   assert.equal(leave.toolName, "leave_channel");
   assert.deepEqual(leave.input, { target: "#engineering" });
+});
+
+test("#proj-runtime:#41: a sub-agent's task is summarized for the Sub-agents view, bounded", () => {
+  // Claude's Agent (formerly Task) call: its short description, never the prompt.
+  assert.equal(summarizeToolInput("Agent", { description: "Find stale call sites", prompt: "Long private prompt", subagent_type: "Explore" }), "Find stale call sites");
+  assert.equal(summarizeToolInput("Task", { description: "Review the diff" }), "Review the diff");
+  assert.equal(summarizeToolInput("Agent", { prompt: "Long private prompt" }), "", "without a description, nothing: never the prompt");
+  assert.equal(getToolLogLabel("Agent"), "Starting sub-agent");
+  assert.equal(classifyToolCall("Agent", "Find stale call sites"), "subagent");
+  // Codex collab calls: the operation and the first line of the prompt, cut at 100 characters.
+  assert.equal(summarizeToolInput("collab_tool_call", { tool: "spawnAgent", prompt: "Run the daemon tests\nthen report" }), "spawnAgent: Run the daemon tests");
+  assert.equal(summarizeToolInput("collab_tool_call", { tool: "wait", prompt: null }), "wait");
+  assert.equal(summarizeToolInput("collab_tool_call", { tool: "spawnAgent", prompt: "x".repeat(150) }), `spawnAgent: ${"x".repeat(100)}…`);
 });

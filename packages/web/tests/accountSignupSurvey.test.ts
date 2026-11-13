@@ -87,7 +87,7 @@ test("the survey is asked after Cindy is created and before the handoff", async 
   fireEvent.click(role);
   // Selected answer = yellow sticker (DS: yellow is what you selected), never
   // the pink of the one primary action below it.
-  assert.match(role.className, /(?:^|\s)bg-brand(?:\s|$)/);
+  assert.match(role.className, /(?:^|\s)bg-selected(?:\s|$)/);
   assert.doesNotMatch(role.className, /bg-attention|bg-palette-pink/);
   assert.equal(submit.disabled, true, "one answer cannot submit the survey");
 
@@ -125,7 +125,7 @@ test("the handoff screen is answered by the server alone, with no session-local 
     }),
   ));
   assert.match(screen.getByTestId("server-setup-handoff").textContent ?? "", /Cindy/);
-  fireEvent.click(screen.getByRole("button", { name: "Let's Go" }));
+  fireEvent.click(screen.getByRole("button", { name: "Let's go" }));
 
   await waitFor(() => assert.equal(done, 1));
   assert.deepEqual(requests, ["/servers/server-1/setup-handoff"]);
@@ -150,6 +150,6 @@ test("the handoff just says Let's Go, and is what briefs Cindy", async () => {
   ));
 
   assert.match(screen.getByTestId("server-setup-handoff").textContent ?? "", /Cindy/);
-  fireEvent.click(screen.getByRole("button", { name: "Let's Go" }));
+  fireEvent.click(screen.getByRole("button", { name: "Let's go" }));
   await waitFor(() => assert.deepEqual(requests, ["/servers/server-1/setup-handoff"]));
 });

@@ -3,13 +3,15 @@
 import { withProcessEnvPatch } from "../processEnvPatch";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { readFileSync, existsSync, mkdirSync, mkdtempSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { readFileSync, readdirSync, existsSync, mkdirSync, mkdtempSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { buildCliTransportDir, deriveCliFallbackCandidates, deriveOpencliFallbackCandidates, prepareCliTransport, setProcSelfExeReaderForTests, regenerateExistingOpencliWrappers, SLOCK_AGENT_LAUNCH_DIR_ENV, upgradeExistingAgentWrappers, writeOpencliWrapper } from "./cliTransport";
+import { buildCliTransportDir, spawnCliTransportDir, POWERSHELL_WRAPPER_ENV_NAMES, deriveCliFallbackCandidates, deriveOpencliFallbackCandidates, prepareCliTransport, RAFT_CURRENT_RUNTIME_ENV, setProcSelfExeReaderForTests, regenerateExistingOpencliWrappers, removeStaleAgentTokenFiles, SLOCK_AGENT_LAUNCH_DIR_ENV, upgradeExistingAgentWrappers, resolveOpencliBinPath, writeOpencliWrapper } from "./cliTransport";
 import { CONTEXT_GENERATION_FILENAME } from "@botiverse/raft-shared";
 import { applyLoopbackNoProxyEnv } from "../loopbackNoProxy";
 import type { SpawnContext } from "./types";
+import { getDriver } from "./index";
+import { setDaemonFetchImplForTests } from "../daemonFetch";
 
 const originalSlockHome = process.env.SLOCK_HOME;
 const testSlockHome = mkdtempSync(path.join(os.tmpdir(), "slock-cli-home-"));
@@ -81,34 +83,40 @@ test("prepareCliTransport: unix writes bash wrapper only", { skip: process.platf
 
 // D1 (RFC 072 §7.7): the context id exists before the runtime process does, in
 // the directory the process is told about, and every spawn gets a new one.
-test("prepareCliTransport publishes a fresh spawn context generation in the transport dir", async () => {
+// It is planned by whoever holds the driver (its compaction declaration); the
+// transport publishes that plan and never guesses one.
+test("prepareCliTransport publishes the spawn context generation it was planned with", async () => {
   const tmp = mkdtempSync(path.join(os.tmpdir(), "slock-cli-test-"));
   try {
-    const ctx = { ...makeCtx(tmp, { runtime: "gemini" }), slockHome: testSlockHome };
+    const base = { ...makeCtx(tmp, { runtime: "gemini" }), slockHome: testSlockHome };
+    const plan = (contextId: string) => ({ contextId, reason: "spawn" as const, compaction: getDriver("gemini").session.compaction });
+    const ctx = { ...base, contextGeneration: plan("ctx-1") };
     const first = await prepareCliTransport(ctx, {}, "linux");
     assert.equal(first.spawnEnv.SLOCK_CLI_TRANSPORT_DIR, first.slockDir);
     // The APM derives the same directory for compaction writes from these inputs.
     assert.equal(first.slockDir, buildCliTransportDir(testSlockHome, ctx.agentId, ctx.launchId));
+    assert.equal(first.slockDir, spawnCliTransportDir(ctx), "the OAR host plans in this directory");
     const file = path.join(first.slockDir, CONTEXT_GENERATION_FILENAME);
     const firstRecord = JSON.parse(readFileSync(file, "utf8"));
     assert.equal(firstRecord.reason, "spawn");
     assert.equal(firstRecord.runtime, "gemini");
-    assert.equal(firstRecord.compactionReported, false);
+    assert.equal(firstRecord.compactionReported, false, "gemini's driver declares it does not report compaction");
     assert.equal(firstRecord.passiveAx, false, "no gate on the config ⇒ published off");
-    assert.match(firstRecord.contextId, /^[0-9a-f-]{36}$/);
+    assert.equal(firstRecord.contextId, "ctx-1");
 
     // Same launchId means the same directory: a respawn must still replace the id.
-    const second = await prepareCliTransport(ctx, {}, "linux");
+    const second = await prepareCliTransport({ ...ctx, contextGeneration: plan("ctx-2") }, {}, "linux");
     assert.equal(second.slockDir, first.slockDir);
-    assert.notEqual(JSON.parse(readFileSync(file, "utf8")).contextId, firstRecord.contextId);
+    assert.equal(JSON.parse(readFileSync(file, "utf8")).contextId, "ctx-2");
 
     // task #359: the composed gate on the spawn config is published as-is.
     await prepareCliTransport({ ...ctx, config: { ...ctx.config, passiveAx: true } as typeof ctx.config }, {}, "linux");
     assert.equal(JSON.parse(readFileSync(file, "utf8")).passiveAx, true);
 
-    // glimpse G0: an id the daemon planned for this spawn is published unchanged.
-    await prepareCliTransport({ ...ctx, contextGeneration: { contextId: "planned-context-id", reason: "spawn" } }, {}, "linux");
-    assert.equal(JSON.parse(readFileSync(file, "utf8")).contextId, "planned-context-id");
+    // Without a plan nothing says whether the runtime reports compaction: no id is
+    // published, and the respawn's earlier one is removed (signal unknown).
+    await prepareCliTransport(base, {}, "linux");
+    assert.equal(existsSync(file), false);
   } finally {
     rmSync(tmp, { recursive: true, force: true });
   }
@@ -258,6 +266,7 @@ test("prepareCliTransport: win32 writes both bash and .cmd wrappers", async () =
     assert.match(cmdBody, /set PYTHONIOENCODING=utf-8/);
     assert.match(cmdBody, /set "SLOCK_LOOPBACK_NO_PROXY=127\.0\.0\.1,localhost"/);
     assert.match(cmdBody, /set "SLOCK_EXISTING_NO_PROXY=%NO_PROXY%"/);
+    assert.doesNotMatch(cmdBody, /%no_proxy%/, "Windows aliases NO_PROXY and no_proxy, so the wrapper must not read the same value twice");
     assert.match(cmdBody, /if defined SLOCK_EXISTING_NO_PROXY \(set "NO_PROXY=%SLOCK_LOOPBACK_NO_PROXY%,%SLOCK_EXISTING_NO_PROXY%"\) else set "NO_PROXY=%SLOCK_LOOPBACK_NO_PROXY%"/);
     assert.match(cmdBody, /set "no_proxy=%NO_PROXY%"/);
     assert.match(cmdBody, /\/fake\/cli\/index\.js/);
@@ -268,13 +277,86 @@ test("prepareCliTransport: win32 writes both bash and .cmd wrappers", async () =
     assert.match(psBody, /\$OutputEncoding = \$utf8NoBom/);
     assert.match(psBody, /\[Console\]::OutputEncoding = \$utf8NoBom/);
     assert.match(psBody, /\$loopbackNoProxy = '127\.0\.0\.1,localhost'/);
-    assert.match(psBody, /\$existingNoProxy = @\(\$env:NO_PROXY, \$env:no_proxy\) \| Where-Object \{ \$_ \}/);
-    assert.match(psBody, /\$env:NO_PROXY = \$mergedNoProxy/);
-    assert.match(psBody, /\$env:no_proxy = \$mergedNoProxy/);
+    assert.match(psBody, /\$existingNoProxy = if \(\$env:NO_PROXY\) \{ \$env:NO_PROXY -split ',' \} else \{ @\(\) \}/);
+    assert.match(psBody, /\$seenNoProxy = \[System\.Collections\.Generic\.HashSet\[string\]\]::new\(\[System\.StringComparer\]::OrdinalIgnoreCase\)/);
+    assert.match(psBody, /foreach \(\$entry in \(@\(\$loopbackNoProxy -split ','\) \+ @\(\$existingNoProxy\)\)\)/);
+    assert.match(psBody, /\$env:NO_PROXY = \$mergedNoProxy -join ','/);
+    assert.doesNotMatch(psBody, /\$env:no_proxy/, "PowerShell must not read or write a second spelling of the same Windows environment variable");
+    assert.match(psBody, /\$raftSavedEnv\[\$raftEnvName\] = \[Environment\]::GetEnvironmentVariable\(\$raftEnvName, 'Process'\)/);
+    assert.match(psBody, /\} finally \{\r\n  foreach \(\$raftEnvName in \$raftSavedEnv\.Keys\) \{ \[Environment\]::SetEnvironmentVariable\(\$raftEnvName, \$raftSavedEnv\[\$raftEnvName\], 'Process'\) \}/);
+    assert.match(psBody, /\[Console\]::OutputEncoding = \$raftSavedConsoleEncoding/);
+    assert.match(psBody, /\$raftExitCode = \$LASTEXITCODE/);
+    assert.match(psBody, /exit \$raftExitCode/);
     assert.match(psBody, /\$input \| & \$node \$cli @args/);
     assert.match(psBody, /\/fake\/cli\/index\.js/);
 
     assert.equal(result.wrapperPath, cmdPath);
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("prepareCliTransport: a cont wrapper beside raft answers a paused command through raft __continue", { skip: process.platform === "win32" }, async () => {
+  const tmp = mkdtempSync(path.join(os.tmpdir(), "slock-cli-test-"));
+  try {
+    // A stale workspace copy goes with the other legacy transport files.
+    mkdirSync(path.join(tmp, ".slock"), { recursive: true });
+    writeFileSync(path.join(tmp, ".slock", "cont"), "stale transport");
+    const cliPath = path.join(tmp, "fake-cli.cjs");
+    const outPath = path.join(tmp, "call.json");
+    writeFileSync(cliPath, `
+const { readFileSync, writeFileSync } = require("node:fs");
+writeFileSync(process.env.SLOCK_TEST_OUT, JSON.stringify({ argv: process.argv.slice(2), stdin: readFileSync(0, "utf8"), agent: process.env.SLOCK_AGENT_ID }), "utf8");
+process.exit(10);
+`, "utf8");
+    const ctx = makeCtx(tmp);
+    ctx.slockCliPath = cliPath;
+    const result = await prepareCliTransport(ctx, {}, "linux");
+
+    const contPath = path.join(result.slockDir, "cont");
+    assert.ok(statSync(contPath).mode & 0o111, "cont should be executable");
+    assert.ok(!existsSync(path.join(result.slockDir, "cont.cmd")), "cont.cmd only on win32");
+    assert.ok(!existsSync(path.join(tmp, ".slock", "cont")), "stale workspace cont should be removed");
+    const body = readFileSync(contPath, "utf8");
+    assert.match(body, /^#!\/usr\/bin\/env bash\n/);
+    assert.match(body, /exec "\$\(dirname "\$0"\)\/raft" __continue "\$@"\n$/);
+    assert.doesNotMatch(body, /SLOCK_AGENT_ID=|TOKEN/, "cont carries no identity or credential of its own");
+
+    const run = spawnSync(contPath, ["k7q2m3x9ab", "b"], {
+      env: { ...process.env, SLOCK_TEST_OUT: outPath },
+      input: "my new reply\n",
+      encoding: "utf8",
+    });
+    assert.equal(run.status, 10, `exit status passes through: ${run.stderr}`);
+    assert.deepEqual(JSON.parse(readFileSync(outPath, "utf8")), {
+      argv: ["__continue", "k7q2m3x9ab", "b"],
+      stdin: "my new reply\n",
+      agent: "test-agent-id",
+    });
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("prepareCliTransport: win32 writes cont, cont.cmd and cont.ps1 that run raft __continue beside them", async () => {
+  const tmp = mkdtempSync(path.join(os.tmpdir(), "slock-cli-test-"));
+  try {
+    const result = await prepareCliTransport(makeCtx(tmp), {}, "win32");
+    assert.match(readFileSync(path.join(result.slockDir, "cont"), "utf8"), /exec "\$\(dirname "\$0"\)\/raft" __continue "\$@"/);
+
+    const cmdBody = readFileSync(path.join(result.slockDir, "cont.cmd"), "utf8");
+    assert.equal(cmdBody.split("\r\n")[0], "@echo off");
+    assert.match(cmdBody, /^"%~dp0raft\.cmd" __continue %\*\r$/m);
+    assert.doesNotMatch(cmdBody, /(?<!\r)\n/, "CRLF only");
+
+    const psBody = readFileSync(path.join(result.slockDir, "cont.ps1"), "utf8");
+    assert.match(psBody, /\$raft = Join-Path \$PSScriptRoot 'raft\.ps1'/);
+    assert.match(psBody, /\$input \| & \$raft __continue @args/);
+    assert.match(psBody, /& \$raft __continue @args/);
+    assert.match(psBody, /exit \$LASTEXITCODE/);
+    for (const wrapper of [cmdBody, psBody]) {
+      assert.doesNotMatch(wrapper, /SLOCK_AGENT_ID|TOKEN/, "cont carries no identity or credential of its own");
+    }
   } finally {
     rmSync(tmp, { recursive: true, force: true });
   }
@@ -385,6 +467,132 @@ process.stdin.on("end", () => {
   }
 });
 
+test("prepareCliTransport: win32 PowerShell wrapper restores NO_PROXY and preserves child exit codes", { skip: process.platform !== "win32" }, async () => {
+  const tmp = mkdtempSync(path.join(os.tmpdir(), "slock-cli-test-"));
+  try {
+    const cliPath = path.join(tmp, "fake-cli.cjs");
+    const childOutPath = path.join(tmp, "child-no-proxy.txt");
+    const sessionOutPath = path.join(tmp, "session-no-proxy.txt");
+    writeFileSync(cliPath, `
+const { appendFileSync } = require("node:fs");
+appendFileSync(process.env.SLOCK_TEST_OUT, process.env.NO_PROXY + "\\n", "utf8");
+process.exitCode = process.argv.includes("fail") ? 7 : 0;
+`, "utf8");
+
+    const ctx = makeCtx(tmp);
+    ctx.slockCliPath = cliPath;
+    const transport = await prepareCliTransport(ctx, {}, "win32");
+    const psWrapper = path.join(transport.slockDir, "raft.ps1");
+    const quote = (value: string) => `'${value.replaceAll("'", "''")}'`;
+    const command = [
+      "$env:NO_PROXY = 'corp.internal,LOCALHOST,corp.internal'",
+      `& ${quote(psWrapper)} server info`,
+      "$firstNoProxy = $env:NO_PROXY",
+      "$firstExitCode = $LASTEXITCODE",
+      `& ${quote(psWrapper)} server fail`,
+      "$secondNoProxy = $env:NO_PROXY",
+      "$secondExitCode = $LASTEXITCODE",
+      "$utf8NoBom = [System.Text.UTF8Encoding]::new($false)",
+      `[System.IO.File]::WriteAllText(${quote(sessionOutPath)}, ($firstNoProxy + [Environment]::NewLine + $firstExitCode + [Environment]::NewLine + $secondNoProxy + [Environment]::NewLine + $secondExitCode), $utf8NoBom)`,
+    ].join("\r\n");
+
+    const result = spawnSync("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command], {
+      env: { ...process.env, SLOCK_TEST_OUT: childOutPath },
+      encoding: "utf8",
+      timeout: 10_000,
+    });
+
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    assert.deepEqual(readFileSync(childOutPath, "utf8").trim().split(/\r?\n/), [
+      "127.0.0.1,localhost,corp.internal",
+      "127.0.0.1,localhost,corp.internal",
+    ]);
+    assert.deepEqual(readFileSync(sessionOutPath, "utf8").split(/\r?\n/), [
+      "corp.internal,LOCALHOST,corp.internal",
+      "0",
+      "corp.internal,LOCALHOST,corp.internal",
+      "7",
+    ]);
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("task #384: the PowerShell wrapper only touches env names it snapshots and restores", async () => {
+  const tmp = mkdtempSync(path.join(os.tmpdir(), "slock-cli-test-"));
+  try {
+    const ctx = makeCtx(tmp);
+    const transport = await prepareCliTransport(ctx, {}, "win32");
+    const psBody = readFileSync(path.join(transport.slockDir, "raft.ps1"), "utf8");
+    const touched = new Set<string>();
+    for (const match of psBody.matchAll(/\$env:([A-Za-z_][A-Za-z0-9_]*)\s*=/g)) touched.add(match[1]!.toUpperCase());
+    for (const match of psBody.matchAll(/Remove-Item ([^\r\n-]+)/g)) {
+      for (const item of match[1]!.split(",")) {
+        const name = /Env:([A-Za-z_][A-Za-z0-9_]*)/.exec(item.trim())?.[1];
+        if (name) touched.add(name.toUpperCase());
+      }
+    }
+    const saved = new Set(POWERSHELL_WRAPPER_ENV_NAMES.map((name) => name.toUpperCase()));
+    const unsaved = [...touched].filter((name) => !saved.has(name));
+    assert.deepEqual(unsaved, [], `env names written or removed by raft.ps1 but never restored: ${unsaved.join(", ")}`);
+    assert.ok(touched.size > 0, "the scan found the wrapper's env writes");
+    // Every change happens inside the try, so the finally covers it.
+    const tryIndex = psBody.indexOf("\r\ntry {\r\n");
+    assert.ok(tryIndex > 0);
+    assert.doesNotMatch(psBody.slice(0, tryIndex), /\$env:[A-Za-z_]+\s*=|Remove-Item Env:|\[Console\]::OutputEncoding =/);
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("task #384: win32 raft.ps1 leaves the caller's session env exactly as it found it", { skip: process.platform !== "win32" }, async () => {
+  const tmp = mkdtempSync(path.join(os.tmpdir(), "slock-cli-test-"));
+  try {
+    const cliPath = path.join(tmp, "fake-cli.cjs");
+    const childOutPath = path.join(tmp, "child-env.txt");
+    const sessionOutPath = path.join(tmp, "session-env.txt");
+    writeFileSync(cliPath, `
+const { appendFileSync } = require("node:fs");
+appendFileSync(process.env.SLOCK_TEST_OUT, [process.env.LANG, process.env.RAFT_PROFILE ?? "<unset>", process.env.SLOCK_AGENT_ID ?? "<unset>"].join("|") + "\\n", "utf8");
+process.exitCode = 3;
+`, "utf8");
+    const ctx = makeCtx(tmp);
+    ctx.slockCliPath = cliPath;
+    const transport = await prepareCliTransport(ctx, {}, "win32");
+    const psWrapper = path.join(transport.slockDir, "raft.ps1");
+    const quote = (value: string) => `'${value.replaceAll("'", "''")}'`;
+    const snapshot = "(@($env:LANG, $env:RAFT_PROFILE, $(if (Test-Path Env:SLOCK_AGENT_ID) { 'set' } else { '<unset>' }), [Console]::OutputEncoding.WebName) -join '|')";
+    const command = [
+      "$env:LANG = 'en_US.UTF-8'",
+      "$env:RAFT_PROFILE = 'mine'",
+      "Remove-Item Env:SLOCK_AGENT_ID -ErrorAction SilentlyContinue",
+      `$before = ${snapshot}`,
+      `& ${quote(psWrapper)} server info`,
+      "$exitCode = $LASTEXITCODE",
+      `$after = ${snapshot}`,
+      "$utf8NoBom = [System.Text.UTF8Encoding]::new($false)",
+      `[System.IO.File]::WriteAllText(${quote(sessionOutPath)}, ($before + [Environment]::NewLine + $after + [Environment]::NewLine + $exitCode), $utf8NoBom)`,
+    ].join("\r\n");
+    const result = spawnSync("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command], {
+      env: { ...process.env, SLOCK_TEST_OUT: childOutPath },
+      encoding: "utf8",
+      timeout: 10_000,
+    });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    const [before, after, exitCode] = readFileSync(sessionOutPath, "utf8").split(/\r?\n/);
+    assert.equal(after, before, "LANG, RAFT_PROFILE, the unset SLOCK_AGENT_ID and the console encoding all come back unchanged");
+    assert.equal(exitCode, "3");
+    // The child still ran with the wrapper's own values.
+    const [childLine] = readFileSync(childOutPath, "utf8").trim().split(/\r?\n/);
+    const [childLang, childProfile, childAgentId] = childLine!.split("|");
+    assert.equal(childLang, "C.UTF-8");
+    assert.equal(childProfile, "<unset>");
+    assert.notEqual(childAgentId, "<unset>");
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
 test("prepareCliTransport: non-win32 does not force locale env", async () => {
   const tmp = mkdtempSync(path.join(os.tmpdir(), "slock-cli-test-"));
   try {
@@ -403,7 +611,7 @@ test("prepareCliTransport: non-win32 does not force locale env", async () => {
   }
 });
 
-test("prepareCliTransport: token file and env are platform-independent", async () => {
+test("prepareCliTransport: env is platform-independent", async () => {
   const tmp = mkdtempSync(path.join(os.tmpdir(), "slock-cli-test-"));
   const slockHome = path.join(tmp, "home");
   const oldSlockHome = process.env.SLOCK_HOME;
@@ -411,10 +619,6 @@ test("prepareCliTransport: token file and env are platform-independent", async (
     process.env.SLOCK_HOME = slockHome;
     const ctx = makeCtx(tmp);
     const result = await prepareCliTransport(ctx, {}, "win32");
-
-    // Token file written
-    const token = readFileSync(result.tokenFile, "utf8");
-    assert.equal(token, "test-token-123");
 
     // Env vars set correctly
     assert.equal(result.spawnEnv.SLOCK_AGENT_ID, "test-agent-id");
@@ -505,7 +709,7 @@ test("prepareCliTransport: transport files live outside workspace and stale work
     assert.ok(!result.slockDir.startsWith(workspaceSlockDir));
     assert.ok(existsSync(path.join(result.slockDir, "slock")), "daemon-owned wrapper should exist");
     assert.ok(existsSync(path.join(result.slockDir, "raft")), "daemon-owned raft wrapper should exist");
-    assert.ok(existsSync(result.tokenFile), "daemon-owned legacy token file should exist");
+    assert.ok(!existsSync(path.join(result.slockDir, "agent-token")), "no daemon-owned legacy token file");
     assert.equal(result.spawnEnv.SLOCK_AGENT_TOKEN_FILE, undefined);
 
     for (const filename of ["agent-token", "slock", "raft", "opencli"]) {
@@ -631,6 +835,8 @@ test("prepareCliTransport: agentCredentialKey uses scoped proxy without legacy t
         SLOCK_AGENT_CREDENTIAL_KEY: "sk_agent_leaked",
       },
     });
+    mkdirSync(spawnCliTransportDir(ctx), { recursive: true });
+    writeFileSync(path.join(spawnCliTransportDir(ctx), "agent-token"), "stale-machine-token", { mode: 0o600 });
     ctx.daemonVersion = "1.0.15";
     ctx.computerVersion = "1.0.16";
     const result = await prepareCliTransport(
@@ -650,7 +856,7 @@ test("prepareCliTransport: agentCredentialKey uses scoped proxy without legacy t
     assert.equal(result.spawnEnv.SLOCK_AGENT_PROXY_TOKEN, undefined);
     assert.equal(result.spawnEnv.SLOCK_AGENT_PROXY_TOKEN_FILE, undefined);
     assert.equal(result.spawnEnv.SLOCK_AGENT_TOKEN_FILE, undefined);
-    assert.ok(!existsSync(result.tokenFile), "stale legacy machine token file should be removed on proxy path");
+    assert.ok(!existsSync(path.join(result.slockDir, "agent-token")), "stale legacy machine token file should be removed on proxy path");
     assert.ok(!existsSync(path.join(staleSlockDir, "agent-token")), "stale workspace token file should be removed on proxy path");
 
     const wrapper = readFileSync(result.wrapperPath, "utf8");
@@ -679,6 +885,25 @@ test("prepareCliTransport: agentCredentialKey uses scoped proxy without legacy t
       computerVersion: "1.0.16",
       observation: "live_daemon_process",
     });
+
+    // The proxy names the agent's runtime and versions to the server (task #15 in #proj-analytics).
+    let upstreamHeaders: Headers | null = null;
+    setDaemonFetchImplForTests((async (_input: unknown, init?: RequestInit) => {
+      upstreamHeaders = new Headers(init?.headers);
+      return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "content-type": "application/json" } });
+    }) as never);
+    try {
+      const serverResponse = await fetch(`${result.agentCredentialProxyUrl}/internal/agent-api/server`, {
+        headers: { Authorization: `Bearer ${proxyToken}` },
+      });
+      assert.equal(serverResponse.status, 200);
+    } finally {
+      setDaemonFetchImplForTests(undefined);
+    }
+    const forwarded = upstreamHeaders as Headers | null;
+    assert.equal(forwarded?.get("x-raft-runtime"), "claude");
+    assert.equal(forwarded?.get("x-raft-computer-version"), "1.0.16");
+    assert.equal(forwarded?.get("x-raft-daemon-version"), "1.0.15");
   } finally {
     if (oldSlockHome === undefined) {
       delete process.env.SLOCK_HOME;
@@ -730,23 +955,79 @@ test("prepareCliTransport: POSIX wrapper inline-exports SLOCK_AGENT_ID + SLOCK_S
   }
 });
 
-test("prepareCliTransport: POSIX wrapper inline-exports SLOCK_AGENT_ID + SLOCK_SERVER_URL + SLOCK_AGENT_TOKEN_FILE (non-proxy / legacy path)", async () => {
+test("prepareCliTransport: a launch without a runner credential gets no Raft credential, never the Computer key", async () => {
   const tmp = mkdtempSync(path.join(os.tmpdir(), "slock-cli-test-"));
+  const slockHome = path.join(tmp, "home");
+  const workspace = path.join(tmp, "workspace");
+  const computerKey = "sk_computer_must_not_reach_runtime";
   try {
-    const ctx = makeCtx(tmp);
-    const result = await prepareCliTransport(ctx, {}, "linux");
+    // The production config shape (`authToken: ""`) with no runner credential.
+    const ctx: SpawnContext = {
+      ...makeCtx(workspace, { authToken: "" }),
+      daemonApiKey: computerKey,
+      slockHome,
+    };
+    // Older daemons left the Computer key in the launch directory and the workspace.
+    const slockDir = spawnCliTransportDir(ctx);
+    mkdirSync(slockDir, { recursive: true });
+    writeFileSync(path.join(slockDir, "agent-token"), computerKey, { mode: 0o600 });
+    mkdirSync(path.join(workspace, ".slock"), { recursive: true });
+    writeFileSync(path.join(workspace, ".slock", "agent-token"), computerKey, { mode: 0o600 });
 
-    assert.equal(result.agentCredentialProxyUrl, null, "no proxy in this scenario");
-    const wrapper = readFileSync(result.wrapperPath, "utf8");
-    assert.match(wrapper, /SLOCK_AGENT_ID='test-agent-id'/);
-    assert.match(wrapper, /SLOCK_SERVER_URL='https:\/\/test\.slock\.dev'/);
-    // Non-proxy path must include the legacy token file PATH (not contents)
-    // so a CLI process started via the wrapper can authenticate without
-    // relying on the parent process's env.
-    assert.match(wrapper, /SLOCK_AGENT_TOKEN_FILE='[^']+'/);
-    // Token CONTENTS must never be inlined; only the file path.
-    assert.doesNotMatch(wrapper, /test-token-123/);
-    assert.doesNotMatch(wrapper, /SLOCK_AGENT_PROXY_/, "no proxy vars on legacy path");
+    // win32 writes every wrapper flavor (POSIX, .cmd, .ps1).
+    const result = await prepareCliTransport(ctx, {}, "win32");
+
+    assert.equal(result.agentCredentialProxyUrl, null);
+    assert.ok(!existsSync(path.join(slockDir, "agent-token")), "stale launch token must be removed");
+    for (const name of ["SLOCK_AGENT_TOKEN_FILE", "SLOCK_AGENT_TOKEN", "SLOCK_AGENT_PROXY_URL", "SLOCK_AGENT_PROXY_TOKEN_FILE"]) {
+      assert.equal(result.spawnEnv[name], undefined, `${name} must not be in the runtime env`);
+    }
+    assert.ok(!Object.values(result.spawnEnv).some((value) => value?.includes(computerKey)), "runtime env must not carry the Computer key");
+    for (const wrapper of ["slock", "raft", "slock.cmd", "raft.cmd", "slock.ps1", "raft.ps1"]) {
+      const body = readFileSync(path.join(slockDir, wrapper), "utf8");
+      assert.match(body, /SLOCK_AGENT_ID/, `${wrapper} keeps the agent identity`);
+      assert.doesNotMatch(body, /(SLOCK_AGENT_TOKEN_FILE|SLOCK_AGENT_PROXY_URL|SLOCK_AGENT_PROXY_TOKEN_FILE)=/, `${wrapper} must set no credential`);
+    }
+    const filesHoldingKey: string[] = [];
+    const visit = (dir: string): void => {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        const entryPath = path.join(dir, entry.name);
+        if (entry.isDirectory()) visit(entryPath);
+        else if (readFileSync(entryPath, "utf8").includes(computerKey)) filesHoldingKey.push(entryPath);
+      }
+    };
+    visit(tmp);
+    assert.deepEqual(filesHoldingKey, [], "the Computer key must not be on disk under the transport home or workspace");
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("removeStaleAgentTokenFiles never follows a symlinked directory and leaves non-files alone", { skip: process.platform === "win32" }, async () => {
+  const tmp = mkdtempSync(path.join(os.tmpdir(), "slock-stale-token-"));
+  try {
+    const slockHome = path.join(tmp, "home");
+    const agentsRoot = path.join(tmp, "agents");
+    const outside = path.join(tmp, "outside");
+    mkdirSync(outside, { recursive: true });
+    writeFileSync(path.join(outside, "agent-token"), "outside", { mode: 0o600 });
+    // A launch directory, an agent directory and a workspace `.slock` that are links to `outside`.
+    mkdirSync(path.join(slockHome, "cli-transport", "agent-a"), { recursive: true });
+    symlinkSync(outside, path.join(slockHome, "cli-transport", "agent-a", "launch-link"));
+    symlinkSync(outside, path.join(slockHome, "cli-transport", "agent-link"));
+    mkdirSync(path.join(agentsRoot, "agent-a"), { recursive: true });
+    symlinkSync(outside, path.join(agentsRoot, "agent-a", ".slock"));
+    // A directory named agent-token, and one plain stale file.
+    mkdirSync(path.join(slockHome, "cli-transport", "agent-a", "launch-dir", "agent-token"), { recursive: true });
+    mkdirSync(path.join(slockHome, "cli-transport", "agent-a", "launch-file"), { recursive: true });
+    writeFileSync(path.join(slockHome, "cli-transport", "agent-a", "launch-file", "agent-token"), "stale", { mode: 0o600 });
+
+    assert.deepEqual(removeStaleAgentTokenFiles(slockHome, agentsRoot), { removed: 1, skipped: 1 });
+    assert.equal(readFileSync(path.join(outside, "agent-token"), "utf8"), "outside");
+    assert.ok(statSync(path.join(slockHome, "cli-transport", "agent-a", "launch-dir", "agent-token")).isDirectory());
+    assert.ok(!existsSync(path.join(slockHome, "cli-transport", "agent-a", "launch-file", "agent-token")));
+    // Missing roots are not an error.
+    assert.deepEqual(removeStaleAgentTokenFiles(path.join(tmp, "absent"), path.join(tmp, "absent-agents")), { removed: 0, skipped: 0 });
   } finally {
     rmSync(tmp, { recursive: true, force: true });
   }
@@ -886,6 +1167,49 @@ test("prepareCliTransport: exposes current runtime context as read-only env", as
     assert.equal(result.spawnEnv.RAFT_CURRENT_COMPUTER_OS, "darwin arm64");
     assert.equal(result.spawnEnv.SLOCK_CURRENT_DAEMON_VERSION, "0.41.1");
     assert.equal(result.spawnEnv.SLOCK_CURRENT_WORKSPACE_PATH, tmp);
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("prepareCliTransport: tells the CLI the Server's first-party apps as RAFT_ENABLED_APPS, unset when the Server didn't send them", async () => {
+  const tmp = mkdtempSync(path.join(os.tmpdir(), "slock-cli-test-"));
+  try {
+    const on = await prepareCliTransport(makeCtx(tmp, { enabledApps: ["artifacts"] }), {}, "linux");
+    assert.equal(on.spawnEnv.RAFT_ENABLED_APPS, "artifacts");
+    const none = await prepareCliTransport(makeCtx(tmp, { enabledApps: [] }), {}, "linux");
+    assert.equal(none.spawnEnv.RAFT_ENABLED_APPS, "", "none on: empty, not unset");
+    const older = await prepareCliTransport(makeCtx(tmp, {}), {}, "linux");
+    assert.equal("RAFT_ENABLED_APPS" in older.spawnEnv, false, "an older Server: unknown");
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("prepareCliTransport: exposes the agent's runtime id as RAFT_CURRENT_RUNTIME, defaulting to claude", async () => {
+  const tmp = mkdtempSync(path.join(os.tmpdir(), "slock-cli-test-"));
+  try {
+    const codex = await prepareCliTransport(makeCtx(tmp, { runtime: "codex" }), {}, "linux");
+    assert.equal(codex.spawnEnv[RAFT_CURRENT_RUNTIME_ENV], "codex");
+    assert.equal(RAFT_CURRENT_RUNTIME_ENV, "RAFT_CURRENT_RUNTIME");
+
+    const unset = await prepareCliTransport(makeCtx(tmp, { runtime: "" }), {}, "linux");
+    assert.equal(unset.spawnEnv.RAFT_CURRENT_RUNTIME, "claude");
+
+    // An agent-configured env var of the same name does not replace it.
+    const configured = await prepareCliTransport(makeCtx(tmp, {
+      runtime: "claude",
+      runtimeConfig: {
+        version: 1,
+        runtime: "claude",
+        provider: { kind: "default" },
+        model: { kind: "default" },
+        mode: { kind: "default" },
+        envVars: { RAFT_CURRENT_RUNTIME: "spoofed", TEAM_FLAG: "enabled" },
+      },
+    }), {}, "linux");
+    assert.equal(configured.spawnEnv.TEAM_FLAG, "enabled");
+    assert.equal(configured.spawnEnv.RAFT_CURRENT_RUNTIME, "claude");
   } finally {
     rmSync(tmp, { recursive: true, force: true });
   }
@@ -1073,7 +1397,7 @@ test("regenerateExistingOpencliWrappers: rewrites existing wrappers only, never 
     writeFileSync(path.join(noOpencli, "slock"), "#!/usr/bin/env bash\nexit 0\n", { mode: 0o755 });
 
     const result = regenerateExistingOpencliWrappers(root, "linux", bin);
-    assert.deepEqual(result, { scanned: 2, rewritten: 2 });
+    assert.deepEqual(result, { scanned: 2, rewritten: 2, skipped: 0 });
 
     // existing wrappers were rewritten to the current variable-exec form
     for (const id of ["agent-a", "agent-b"]) {
@@ -1089,6 +1413,54 @@ test("regenerateExistingOpencliWrappers: rewrites existing wrappers only, never 
   }
 });
 
+test("regenerateExistingOpencliWrappers: a wrapper or .slock the agent turned into a link is never written through", () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "slock-opencli-link-"));
+  try {
+    const bin = "/opt/opencli/dist/src/main.js";
+    const outside = path.join(root, "outside");
+    mkdirSync(outside, { recursive: true });
+    const victim = path.join(outside, "victim.sh");
+    writeFileSync(victim, "untouched");
+    // agent-a: its wrapper is a link to a file outside the workspace.
+    mkdirSync(path.join(root, "agent-a", ".slock"), { recursive: true });
+    symlinkSync(victim, path.join(root, "agent-a", ".slock", "opencli"));
+    // agent-b: its .slock is a link to a directory outside, holding a plain wrapper.
+    writeFileSync(path.join(outside, "opencli"), "#!/usr/bin/env bash\nexit 0\n");
+    mkdirSync(path.join(root, "agent-b"), { recursive: true });
+    symlinkSync(outside, path.join(root, "agent-b", ".slock"));
+    // agent-c: a plain wrapper, but on Windows its .cmd sibling is a link.
+    mkdirSync(path.join(root, "agent-c", ".slock"), { recursive: true });
+    writeFileSync(path.join(root, "agent-c", ".slock", "opencli"), "#!/usr/bin/env bash\nexit 0\n");
+    symlinkSync(victim, path.join(root, "agent-c", ".slock", "opencli.cmd"));
+
+    assert.deepEqual(regenerateExistingOpencliWrappers(root, "linux", bin), { scanned: 3, rewritten: 1, skipped: 2 });
+    assert.equal(readFileSync(victim, "utf8"), "untouched");
+    assert.equal(readFileSync(path.join(outside, "opencli"), "utf8"), "#!/usr/bin/env bash\nexit 0\n");
+    assert.match(readFileSync(path.join(root, "agent-c", ".slock", "opencli"), "utf8"), /OPENCLI_BIN=/);
+
+    assert.deepEqual(regenerateExistingOpencliWrappers(root, "win32", bin), { scanned: 3, rewritten: 0, skipped: 3 });
+    assert.equal(readFileSync(victim, "utf8"), "untouched");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("writeOpencliWrapper replaces a link at the wrapper path instead of writing through it", () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "slock-opencli-replace-"));
+  try {
+    const victim = path.join(root, "victim.sh");
+    writeFileSync(victim, "untouched");
+    const sd = path.join(root, "transport");
+    mkdirSync(sd, { recursive: true });
+    symlinkSync(victim, path.join(sd, "opencli"));
+    writeOpencliWrapper(sd, "/opt/opencli/dist/src/main.js", "linux");
+    assert.equal(readFileSync(victim, "utf8"), "untouched");
+    assert.match(readFileSync(path.join(sd, "opencli"), "utf8"), /OPENCLI_BIN=/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("regenerateExistingOpencliWrappers: no opencli resolvable → no-op {0,0}", () => {
   const root = mkdtempSync(path.join(os.tmpdir(), "slock-opencli-noop-"));
   try {
@@ -1096,7 +1468,7 @@ test("regenerateExistingOpencliWrappers: no opencli resolvable → no-op {0,0}",
     mkdirSync(sd, { recursive: true });
     writeFileSync(path.join(sd, "opencli"), "#!/usr/bin/env bash\nexit 0\n", { mode: 0o755 });
     const result = regenerateExistingOpencliWrappers(root, "linux", null);
-    assert.deepEqual(result, { scanned: 0, rewritten: 0 });
+    assert.deepEqual(result, { scanned: 0, rewritten: 0, skipped: 0 });
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -1182,7 +1554,52 @@ test("writeOpencliWrapper: Electron host injects ELECTRON_RUN_AS_NODE (posix + c
     const sdWin = path.join(tmp, "win");
     mkdirSync(sdWin, { recursive: true });
     writeOpencliWrapper(sdWin, bin, "win32", /* execIsElectron */ true);
-    assert.match(readFileSync(path.join(sdWin, "opencli.cmd"), "utf8"), /set "ELECTRON_RUN_AS_NODE=1"/);
+    const cmdBody = readFileSync(path.join(sdWin, "opencli.cmd"), "utf8");
+    assert.match(cmdBody, /set "ELECTRON_RUN_AS_NODE=1"/);
+    assert.match(cmdBody, /" "--import" "data:text\/javascript,process\.defaultApp=true" "%OPENCLI_BIN%" %\*/);
+    assert.doesNotMatch(readFileSync(path.join(sdPlain, "opencli"), "utf8"), /--import/);
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+// task #159: under Electron's Node mode `process.versions.electron` is set and
+// `process.defaultApp` is not, so opencli's commander parse() took the bin path
+// as the command: `opencli list` -> "unknown command '<bin>'". This runs the
+// real opencli through the wrapper the daemon writes, in a Node child made to
+// look like Electron's Node mode (the packaged-app run is in the desktop smoke).
+test("writeOpencliWrapper: Electron wrapper runs a real opencli subcommand (task #159)", { skip: process.platform === "win32" }, () => {
+  const bin = resolveOpencliBinPath();
+  assert.ok(bin, "@jackwener/opencli must resolve from the daemon");
+  const tmp = mkdtempSync(path.join(os.tmpdir(), "slock-opencli-electron-"));
+  try {
+    const fakeElectron = path.join(tmp, "fake-electron-node-mode.mjs");
+    writeFileSync(fakeElectron, "Object.defineProperty(process.versions, 'electron', { value: '44.0.0' });\n");
+    const run = (execIsElectron: boolean) => {
+      const slockDir = path.join(tmp, execIsElectron ? "electron" : "plain");
+      mkdirSync(slockDir, { recursive: true });
+      writeOpencliWrapper(slockDir, bin, "linux", execIsElectron);
+      return spawnSync("bash", [path.join(slockDir, "opencli"), "list", "-f", "json"], {
+        encoding: "utf8",
+        timeout: 60_000,
+        maxBuffer: 64 * 1024 * 1024,
+        env: { ...process.env, HOME: tmp, CI: "1", NODE_OPTIONS: `--import="${fakeElectron}"` },
+      });
+    };
+    // Control: a wrapper without the launch options hits the bug in this child.
+    // opencli 2.x reports the failure as structured JSON on stdout (older 1.x
+    // printed it to stderr), so match the combined output.
+    const broken = run(false);
+    assert.notEqual(broken.status, 0);
+    assert.match(broken.stdout + broken.stderr, /[Uu]nknown command/);
+    const fixed = run(true);
+    assert.equal(fixed.status, 0, fixed.stderr);
+    // opencli 2.x wraps results in an { ok, data } envelope (1.x printed the
+    // bare command array).
+    const listing = JSON.parse(fixed.stdout) as { ok?: boolean; data?: { commands?: unknown[] } };
+    const commands = listing.data?.commands;
+    assert.ok(listing.ok === true && Array.isArray(commands) && commands.length > 0, "opencli list returns its command table");
+    assert.match(readFileSync(path.join(tmp, "electron", "opencli"), "utf8"), /'--import' 'data:text\/javascript,process\.defaultApp=true'/);
   } finally {
     rmSync(tmp, { recursive: true, force: true });
   }
@@ -1198,7 +1615,7 @@ test("writeOpencliWrapper: Electron host injects ELECTRON_RUN_AS_NODE (posix + c
 test("prepareCliTransport: POSIX wrapper embeds launch forwarding guard before credentials", async () => {
   const tmp = mkdtempSync(path.join(os.tmpdir(), "slock-cli-guard-"));
   try {
-    const ctx = makeCtx(tmp);
+    const ctx = makeCtx(tmp, { agentCredentialKey: "sk_agent_guard_order" });
     const result = await prepareCliTransport(ctx, {}, "linux");
     const body = readFileSync(path.join(result.slockDir, "slock"), "utf8");
     assert.match(body, /# slock-daemon-generated/);
@@ -1207,7 +1624,7 @@ test("prepareCliTransport: POSIX wrapper embeds launch forwarding guard before c
     // Guard must appear before the credential line so stale wrappers forward
     // before any stale credential env is set.
     const guardIdx = body.indexOf("SLOCK_OWN_LAUNCH_DIR=");
-    const credentialIdx = body.indexOf("SLOCK_AGENT_TOKEN_FILE=");
+    const credentialIdx = body.indexOf("SLOCK_AGENT_PROXY_TOKEN_FILE=");
     assert.ok(guardIdx > 0);
     assert.ok(credentialIdx > 0);
     assert.ok(guardIdx < credentialIdx, "launch guard must precede credential line");
@@ -1380,6 +1797,13 @@ function makeTokenPrintingCli(tmp: string): string {
   return cli;
 }
 
+/** Make a generated wrapper's credential file read `marker`, so the fake CLI names the launch it ran under. */
+function markLaunchCredential(wrapperPath: string, marker: string): void {
+  const tokenFile = readFileSync(wrapperPath, "utf8").match(/SLOCK_AGENT_PROXY_TOKEN_FILE='([^']+)'/)?.[1];
+  assert.ok(tokenFile, "generated wrapper must name its proxy token file");
+  writeFileSync(tokenFile, marker, { mode: 0o600 });
+}
+
 function runWrapper(wrapperPath: string, env: Record<string, string | undefined>): { status: number | null; stdout: string; stderr: string } {
   const result = spawnSync(wrapperPath, ["message", "check"], {
     env: { ...process.env, ...env },
@@ -1414,12 +1838,12 @@ async function setupForwardedLaunchFixture(tmp: string): Promise<{
 
   // W2: generated by prepareCliTransport. This also upgrades the W1 wrapper
   // with the launch forwarding guard.
-  const ctx = makeCtx(tmp);
+  const ctx = makeCtx(tmp, { agentCredentialKey: "sk_agent_w2" });
   ctx.agentId = agentId;
   ctx.launchId = "w2";
   ctx.slockCliPath = fakeCli;
-  (ctx.config as { authToken: string }).authToken = "W2";
   const transport = await prepareCliTransport(ctx, {}, "linux");
+  markLaunchCredential(path.join(transport.slockDir, "raft"), "W2");
 
   return {
     agentRoot,
@@ -1630,12 +2054,12 @@ test("launch forwarding guard: mutation test — no forward without guard/upgrad
     const agentRoot = path.join(process.env.SLOCK_HOME, "cli-transport", agentId);
 
     // W2 wrapper first, so prepareCliTransport does not upgrade W1 yet.
-    const ctxW2 = makeCtx(tmp);
+    const ctxW2 = makeCtx(tmp, { agentCredentialKey: "sk_agent_w2" });
     ctxW2.agentId = agentId;
     ctxW2.launchId = "w2";
     ctxW2.slockCliPath = fakeCli;
-    (ctxW2.config as { authToken: string }).authToken = "W2";
     const w2Transport = await prepareCliTransport(ctxW2, {}, "linux");
+    markLaunchCredential(path.join(w2Transport.slockDir, "raft"), "W2");
 
     // W1 old wrapper written after W2 generation (no guard).
     const w1Dir = path.join(agentRoot, "w1");
@@ -2023,6 +2447,35 @@ test("task #28: an agent spawned while a Pi session is being created does not in
   } finally {
     if (oldSlockHome === undefined) delete process.env.SLOCK_HOME;
     else process.env.SLOCK_HOME = oldSlockHome;
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("prepareCliTransport strips the legacy chat-bridge entry bound to this agent and keeps user MCP servers (task #261)", { skip: process.platform === "win32" }, async () => {
+  const tmp = mkdtempSync(path.join(os.tmpdir(), "slock-cli-test-"));
+  try {
+    const ctx = makeCtx(tmp); // agentId "test-agent-id"
+    const bridge = {
+      command: "node",
+      args: ["/opt/old/chat-bridge.js", "--agent-id", ctx.agentId, "--server-url", "u", "--auth-token", "sk_machine_FIXTURE", "--runtime", "claude", "--runtime-actions-only"],
+    };
+    const rootFile = path.join(tmp, ".slock-claude-mcp.json");
+    writeFileSync(rootFile, JSON.stringify({ mcpServers: { chat: bridge } }));
+    mkdirSync(path.join(tmp, ".slock"), { recursive: true });
+    const mixedFile = path.join(tmp, ".slock", "claude-mcp-config.json");
+    writeFileSync(mixedFile, JSON.stringify({ mcpServers: { fetch: { command: "uvx" }, chat: bridge } }));
+    const foreign = path.join(tmp, ".gemini");
+    mkdirSync(foreign, { recursive: true });
+    const foreignFile = path.join(foreign, "settings.json");
+    writeFileSync(foreignFile, JSON.stringify({ mcpServers: { chat: { ...bridge, args: bridge.args.map((a) => (a === ctx.agentId ? "someone-else" : a)) } } }));
+
+    await prepareCliTransport(ctx, {}, "linux");
+
+    assert.equal(existsSync(rootFile), false, "file that was entirely the bridge is unlinked");
+    assert.deepEqual(JSON.parse(readFileSync(mixedFile, "utf8")), { mcpServers: { fetch: { command: "uvx" } } });
+    assert.equal(readFileSync(mixedFile, "utf8").includes("sk_machine_FIXTURE"), false);
+    assert.equal(readFileSync(foreignFile, "utf8").includes("sk_machine_FIXTURE"), true, "entry bound to another agent is untouched");
+  } finally {
     rmSync(tmp, { recursive: true, force: true });
   }
 });

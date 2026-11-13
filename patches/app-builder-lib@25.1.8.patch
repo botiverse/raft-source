@@ -1,0 +1,14 @@
+diff --git a/scheme.json b/scheme.json
+index ea3069a11e0ee218b4da71fc29983f75f97db8fa..82c9298c9a9a5e1111b69d7a7fcdc6b00be9ac86 100644
+--- a/scheme.json
++++ b/scheme.json
+@@ -794,7 +794,8 @@
+             "UDRO",
+             "UDRW",
+             "UDZO",
+-            "ULFO"
++            "ULFO",
++            "ULMO"
+           ],
+           "type": "string"
+         },

@@ -178,7 +178,7 @@ async function main() {
     }
 
     // Sidebar unread (getUnreadCounts / getUnreadSummary / getSidebarUnreadSummaryCounts)
-    // has no Postgres path to compare against: it reads rw_conversation_unread_v3 only.
+    // has no Postgres path to compare against: it reads rw_conversation_unread_v4 only.
 
     console.log(JSON.stringify({
       ok: true,

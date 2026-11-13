@@ -14,16 +14,51 @@ function memoryStorage() {
   };
 }
 
-test("hide-empty-sections defaults to OFF outside the desktop shell", () => {
+type DesktopGlobal = { window?: { raftDesktop?: { isDesktop?: boolean } } };
+
+function withDesktopShell(run: () => void) {
+  const target = globalThis as DesktopGlobal;
+  const hadWindow = "window" in globalThis;
+  const originalWindow = target.window;
+  target.window = { raftDesktop: { isDesktop: true } };
+  try {
+    run();
+  } finally {
+    if (hadWindow) target.window = originalWindow;
+    else delete target.window;
+  }
+}
+
+test("hide-empty-sections defaults to OFF on the web", () => {
   // No `window.raftDesktop` in the node test env → web default is OFF.
   assert.equal(defaultHideEmptySidebarSections(), false);
   assert.equal(readHideEmptySidebarSections(memoryStorage()), false);
 });
 
-test("an explicit stored choice wins over the platform default", () => {
+test("hide-empty-sections defaults to OFF in the desktop shell too", () => {
+  withDesktopShell(() => {
+    assert.equal(defaultHideEmptySidebarSections(), false);
+    assert.equal(readHideEmptySidebarSections(memoryStorage()), false);
+  });
+});
+
+test("an explicit prior choice is preserved under the OFF default", () => {
+  withDesktopShell(() => {
+    // A desktop user who explicitly turned it on keeps it on…
+    const chosenOn = memoryStorage();
+    writeHideEmptySidebarSections(true, chosenOn);
+    assert.equal(readHideEmptySidebarSections(chosenOn), true);
+
+    // …and an explicit "off" stays off.
+    const chosenOff = memoryStorage();
+    writeHideEmptySidebarSections(false, chosenOff);
+    assert.equal(readHideEmptySidebarSections(chosenOff), false);
+  });
+});
+
+test("an explicit stored choice wins over the provided fallback", () => {
   const storage = memoryStorage();
 
-  // Even with the desktop default forced ON, a stored "false" is honored.
   writeHideEmptySidebarSections(false, storage);
   assert.equal(readHideEmptySidebarSections(storage, true), false);
 

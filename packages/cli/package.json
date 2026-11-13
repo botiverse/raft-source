@@ -1,7 +1,7 @@
 {
   "name": "@botiverse/raft",
-  "version": "0.0.38",
-  "license": "FSL-1.1-ALv2",
+  "version": "1.25.0",
+  "license": "LicenseRef-Raft-License",
   "description": "Canonical Raft agent-facing CLI. Provides raft plus the legacy slock alias over the same CLI core. Invoked by daemon-spawned agent processes via injected env vars.",
   "type": "module",
   "engines": {
@@ -9,7 +9,8 @@
   },
   "bin": {
     "raft": "dist/raft.js",
-    "slock": "dist/slock.js"
+    "slock": "dist/slock.js",
+    "cont": "dist/cont.js"
   },
   "files": [
     "dist"
@@ -25,17 +26,18 @@
   "scripts": {
     "dev": "node --watch --import @oxc-node/core/register src/index.ts",
     "start": "node --import @oxc-node/core/register src/index.ts",
-    "build": "tsdown && node scripts/write-dist-package.mjs",
-    "test": "node scripts/run-tests-with-manifest.mjs",
-    "test:update-manifest": "node scripts/run-tests-with-manifest.mjs --update-manifest",
-    "typecheck": "tsc --noEmit",
-    "lint:publish-package": "node scripts/check-publish-package.mjs"
+    "build": "tsdown && node --import @oxc-node/core/register scripts/write-dist-package.ts",
+    "test": "node --import @oxc-node/core/register scripts/run-tests-with-manifest.ts",
+    "test:update-manifest": "node --import @oxc-node/core/register scripts/run-tests-with-manifest.ts --update-manifest",
+    "typecheck": "tsrs --noEmit",
+    "typecheck:tsc": "tsc --noEmit",
+    "lint:publish-package": "node --import @oxc-node/core/register scripts/check-publish-package.ts"
   },
   "dependencies": {
     "ajv": "^8.20.0",
     "commander": "^12.1.0",
     "safe-regex2": "5.1.1",
-    "undici": "8.10.2"
+    "undici": "8.12.3"
   },
   "devDependencies": {
     "@botiverse/raft-shared": "workspace:*",

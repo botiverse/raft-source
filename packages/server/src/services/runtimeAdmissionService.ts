@@ -1,18 +1,17 @@
 import {
-  getCreatableRuntimeOptions,
+  OAR_ONLY_RUNTIME_IDS,
   getExistingAgentRuntimeOptions,
   getSetupRuntimeOptions,
+  isRuntimeDeprecated,
+  isRuntimeSelectableForNewAgent,
+  RUNTIMES,
   type RuntimeAdmissionReason,
   type RuntimeInfo,
   type RuntimeSelectionOption,
 } from "@botiverse/raft-shared";
-import { evaluateFeatureFlag, GROK_RUNTIME_FEATURE_FLAG_KEY } from "./featureFlagService";
+import { agentRuntimeOarFeatureFlagKey, evaluateFeatureFlags } from "./featureFlagService";
 import { runtimeFormV1Entry } from "./runtimeFormDefinitionService";
 import { RUNTIME_FORM_V2_MARKER, runtimeFormV2Entry } from "./runtimeFormV2Registry";
-
-export interface RuntimeAdmissionPolicy {
-  grokRuntimeEnabled: boolean;
-}
 
 /**
  * Released mobile apps (1.12, 1.13) decode runtime options STRICTLY: any key
@@ -26,6 +25,77 @@ export interface RuntimeOptionProjection {
 }
 
 const NO_RUNTIME_FORM_V2_MARKER: RuntimeOptionProjection = { includeRuntimeFormV2Marker: false };
+
+/**
+ * Which runtimes this server admits for new agents and switches beyond what a
+ * Computer reports. A runtime that runs only on the Computer's OAR host
+ * (shared OAR_ONLY_RUNTIME_IDS) is gated only if it has a server flag
+ * (`agent_runtime_oar_<id>`, default off); none has one today, so the
+ * Computer's report decides. An agent already on a gated runtime keeps it.
+ */
+export interface RuntimeAdmissionPolicy {
+  disabledRuntimeIds: ReadonlySet<string>;
+  /**
+   * Deprecated runtimes this server offers again for new agents and switches
+   * because their OAR host flag is on: Antigravity with
+   * `agent_runtime_oar_antigravity` (tygg, #oar-raft:e9798673). Missing = none.
+   */
+  revivedRuntimeIds?: ReadonlySet<string>;
+}
+
+const FLAG_GATED_RUNTIME_IDS = OAR_ONLY_RUNTIME_IDS.filter((runtime) => agentRuntimeOarFeatureFlagKey(runtime) !== null);
+/** Deprecated runtimes that run on the OAR host behind a server flag. */
+const FLAG_REVIVED_RUNTIME_IDS = RUNTIMES
+  .filter((runtime) => runtime.supported && runtime.deprecated && agentRuntimeOarFeatureFlagKey(runtime.id) !== null)
+  .map((runtime) => runtime.id);
+
+/** Fail closed: every flag-gated runtime off (a caller that did not resolve the policy). */
+export const DEFAULT_RUNTIME_ADMISSION_POLICY: RuntimeAdmissionPolicy = { disabledRuntimeIds: new Set(FLAG_GATED_RUNTIME_IDS) };
+
+/** A flag evaluation that fails leaves every gated runtime off, never a 500. */
+export async function resolveRuntimeAdmissionPolicy(
+  input: { serverId: string; userId: string },
+  evaluate: typeof evaluateFeatureFlags = evaluateFeatureFlags,
+): Promise<RuntimeAdmissionPolicy> {
+  const runtimes = [...FLAG_GATED_RUNTIME_IDS, ...FLAG_REVIVED_RUNTIME_IDS];
+  if (runtimes.length === 0) return { disabledRuntimeIds: new Set() };
+  let evaluations: Awaited<ReturnType<typeof evaluateFeatureFlags>>;
+  try {
+    evaluations = await evaluate(runtimes.map((runtime) => ({
+      key: agentRuntimeOarFeatureFlagKey(runtime)!,
+      serverId: input.serverId,
+      userId: input.userId,
+    })));
+  } catch {
+    return DEFAULT_RUNTIME_ADMISSION_POLICY;
+  }
+  const disabled = new Set<string>(FLAG_GATED_RUNTIME_IDS);
+  const revived = new Set<string>();
+  runtimes.forEach((runtime, index) => {
+    if (!evaluations[index]?.enabled) return;
+    if (FLAG_REVIVED_RUNTIME_IDS.includes(runtime)) revived.add(runtime);
+    else disabled.delete(runtime);
+  });
+  return { disabledRuntimeIds: disabled, revivedRuntimeIds: revived };
+}
+
+export function isRuntimeAdmittedForNewUse(runtime: string, policy: RuntimeAdmissionPolicy): boolean {
+  return !policy.disabledRuntimeIds.has(runtime);
+}
+
+/** A deprecated runtime this server offers again (its OAR flag is on). */
+export function isRuntimeRevived(runtime: string, policy: RuntimeAdmissionPolicy): boolean {
+  return policy.revivedRuntimeIds?.has(runtime) ?? false;
+}
+
+/** Deprecated for new agents and switches on this server: deprecated and not revived. */
+export function isRuntimeDeprecatedForServer(runtime: string, policy: RuntimeAdmissionPolicy): boolean {
+  return isRuntimeDeprecated(runtime) && !isRuntimeRevived(runtime, policy);
+}
+
+function revivedRuntimes(policy: RuntimeAdmissionPolicy): RuntimeInfo[] {
+  return RUNTIMES.filter((runtime) => runtime.supported && isRuntimeRevived(runtime.id, policy));
+}
 
 /** Request header a client sends to declare that it understands the `runtimeFormV2` marker. */
 export const RUNTIME_FORM_V2_MARKER_HEADER = "x-raft-runtime-form-v2";
@@ -82,19 +152,15 @@ function projectRuntimeOption(input: {
   };
 }
 
-function isRuntimeAdmittedForNewUse(runtime: RuntimeInfo, policy: RuntimeAdmissionPolicy): boolean {
-  return runtime.id !== "grok" || policy.grokRuntimeEnabled;
-}
-
 function projectNewUseOptions(
   candidates: RuntimeInfo[],
   installedRuntimeIds: readonly string[],
-  policy: RuntimeAdmissionPolicy,
   projection: RuntimeOptionProjection,
+  policy: RuntimeAdmissionPolicy,
 ): RuntimeSelectionOption[] {
   const installed = new Set(installedRuntimeIds);
   return candidates
-    .filter((runtime) => isRuntimeAdmittedForNewUse(runtime, policy))
+    .filter((runtime) => isRuntimeAdmittedForNewUse(runtime.id, policy))
     .map((runtime) => projectRuntimeOption({
       runtime,
       installedRuntimeIds: installed,
@@ -106,34 +172,38 @@ function projectNewUseOptions(
 
 export function projectNewAgentRuntimeOptions(
   installedRuntimeIds: readonly string[],
-  policy: RuntimeAdmissionPolicy,
   projection: RuntimeOptionProjection = NO_RUNTIME_FORM_V2_MARKER,
+  policy: RuntimeAdmissionPolicy = DEFAULT_RUNTIME_ADMISSION_POLICY,
 ): RuntimeSelectionOption[] {
-  return projectNewUseOptions(getCreatableRuntimeOptions(), installedRuntimeIds, policy, projection);
+  const candidates = RUNTIMES.filter((runtime) =>
+    isRuntimeSelectableForNewAgent(runtime) || (runtime.supported && isRuntimeRevived(runtime.id, policy)));
+  return projectNewUseOptions(candidates, installedRuntimeIds, projection, policy);
 }
 
 /** Server setup state never carries the marker: no client opens a v2 form from it. */
 export function projectSetupRuntimeOptions(
   installedRuntimeIds: readonly string[],
-  policy: RuntimeAdmissionPolicy,
+  policy: RuntimeAdmissionPolicy = DEFAULT_RUNTIME_ADMISSION_POLICY,
 ): RuntimeSelectionOption[] {
-  return projectNewUseOptions(getSetupRuntimeOptions(), installedRuntimeIds, policy, NO_RUNTIME_FORM_V2_MARKER);
+  return projectNewUseOptions(getSetupRuntimeOptions(), installedRuntimeIds, NO_RUNTIME_FORM_V2_MARKER, policy);
 }
 
 export function projectExistingAgentRuntimeOptions(
   installedRuntimeIds: readonly string[],
   currentRuntime: string,
-  policy: RuntimeAdmissionPolicy,
   projection: RuntimeOptionProjection = NO_RUNTIME_FORM_V2_MARKER,
+  policy: RuntimeAdmissionPolicy = DEFAULT_RUNTIME_ADMISSION_POLICY,
 ): RuntimeSelectionOption[] {
   const installed = new Set(installedRuntimeIds);
-  return getExistingAgentRuntimeOptions(currentRuntime)
-    .filter((runtime) => runtime.id === currentRuntime || isRuntimeAdmittedForNewUse(runtime, policy))
+  const listed = getExistingAgentRuntimeOptions(currentRuntime);
+  return [...listed, ...revivedRuntimes(policy).filter((runtime) => !listed.includes(runtime))]
+    .sort((a, b) => RUNTIMES.indexOf(a) - RUNTIMES.indexOf(b))
+    .filter((runtime) => runtime.id === currentRuntime || isRuntimeAdmittedForNewUse(runtime.id, policy))
     .map((runtime) => {
       const admissionReason: RuntimeAdmissionReason = runtime.id === currentRuntime
-        ? runtime.deprecated
+        ? isRuntimeDeprecatedForServer(runtime.id, policy)
           ? "deprecated"
-          : runtime.id === "grok" && !policy.grokRuntimeEnabled
+          : !isRuntimeAdmittedForNewUse(runtime.id, policy)
             ? "feature_flag_off"
             : null
         : null;
@@ -145,16 +215,4 @@ export function projectExistingAgentRuntimeOptions(
         projection,
       });
     });
-}
-
-export async function resolveRuntimeAdmissionPolicy(input: {
-  serverId: string;
-  userId: string;
-}): Promise<RuntimeAdmissionPolicy> {
-  const evaluation = await evaluateFeatureFlag({
-    key: GROK_RUNTIME_FEATURE_FLAG_KEY,
-    serverId: input.serverId,
-    userId: input.userId,
-  });
-  return { grokRuntimeEnabled: evaluation.enabled };
 }

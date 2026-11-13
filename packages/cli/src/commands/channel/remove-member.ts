@@ -3,6 +3,8 @@
 
 import type { Command } from "commander";
 
+import { formatChannelDeletedWithLastMember, formatLastMemberRefusal, LAST_MEMBER_DELETES_CHANNEL } from "@botiverse/raft-shared/src/agentCliSurface";
+
 import { createAgentApiSurfaceClient } from "../../agentApiPath";
 import { defineCommand, registerCliCommand } from "../../core/command";
 import type { CommandRuntimeOptions } from "../../core/context";
@@ -14,10 +16,12 @@ interface RemoveMemberOpts {
   target?: string;
   user?: string;
   agent?: string;
+  deleteIfLast?: boolean;
 }
 
 interface RemoveMemberResponse {
   wasMember?: boolean;
+  channelDeleted?: boolean;
   member?: {
     type?: string;
     name?: string;
@@ -38,6 +42,7 @@ function normalizeHandle(raw: string | undefined): string {
 export function formatRemoveMemberResult(target: string, memberName: string, wasMember: boolean, result?: RemoveMemberResponse): string {
   const member = `@${memberName}`;
   if (!wasMember) return `${member} was not in ${target}.`;
+  if (result?.channelDeleted) return formatChannelDeletedWithLastMember(target, member);
 
   const lines = [`Removed ${member} from ${target}.`];
   if (result?.attention?.ordinaryActivity) lines.push(result.attention.ordinaryActivity);
@@ -67,6 +72,10 @@ export const channelRemoveMemberCommand = defineCommand(
       {
         flags: "--agent <handle>",
         description: "Agent handle to remove, e.g. '@assistant'",
+      },
+      {
+        flags: "--delete-if-last",
+        description: "If they are a private channel's last member, remove them anyway: that deletes the channel and all its messages, which can't be undone (without it, that removal is refused)",
       },
     ],
   },
@@ -108,8 +117,12 @@ export const channelRemoveMemberCommand = defineCommand(
     }
 
     const body = user ? { user } : { agent };
-    const removeRes = await createAgentApiSurfaceClient(client).channels.removeMember({ channelId: channel.id as never }, body);
+    const removeRes = await createAgentApiSurfaceClient(client).channels.removeMember({ channelId: channel.id as never }, opts.deleteIfLast ? { ...body, deleteIfLast: true } : body);
     if (!removeRes.ok) {
+      if (removeRes.errorCode === LAST_MEMBER_DELETES_CHANNEL) {
+        const { message, nextAction } = formatLastMemberRefusal({ target, member: user ? { user: `@${user}` } : { agent: `@${agent}` } });
+        throw new CliError({ code: "LAST_MEMBER", message, suggestedNextAction: nextAction });
+      }
       throw new CliError({
         code: removeRes.status >= 500 ? "SERVER_5XX" : "MEMBERS_FAILED",
         message: removeRes.error ?? `HTTP ${removeRes.status}`,

@@ -5,7 +5,7 @@ import { useIntl } from "react-intl";
 import AvatarListRow from "../ui/AvatarListRow";
 import { canRemoveAdminPrincipal, getAdminPrincipalKey, getAdminPrincipalLabel, getMemberLabel } from "../../utils/serverAdminSettings";
 import type { ServerAdminSettingsPrincipal } from "../../utils/serverAdminSettings";
-import { renderPrincipalAvatar } from "./SettingsPanel";
+import { renderPrincipalAvatar } from "../../features/settings/administration/renderPrincipalAvatar";
 
 export function AdminPrincipalRow({
   admin,
@@ -52,7 +52,7 @@ export function AdminPrincipalRow({
       rightContent={
         canRemove ? (
           <Button
-            variant="outline" size="sm"
+            variant="outline" size="md"
             type="button"
             onClick={handleDemote}
             disabled={savingPrincipalKey != null}

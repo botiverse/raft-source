@@ -16,13 +16,15 @@
 // This module returns the raw key exactly once at attach time; subsequent
 // reads return the row WITHOUT it.
 
-import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { randomBytes, timingSafeEqual } from "node:crypto";
 import argon2 from "argon2";
 import { timedArgon2Verify, type Argon2VerifyStats } from "./argon2VerifyStats";
-import { and, eq, isNull, isNotNull } from "drizzle-orm";
-import { asMachineId } from "@botiverse/raft-shared";
+import { DeviceSessionRevokedError, lockLiveSessionFamily } from "./sessionService";
+import { and, eq, isNull, isNotNull, lt, or, sql } from "drizzle-orm";
+import { DEPRECATED_GRAVATAR_HASH, asMachineId } from "@botiverse/raft-shared";
 import { getDb } from "../db/index";
-import { computers, machines, serverMembers, servers, users } from "../db/schema";
+import { computers, deviceLoginGrants, machines, serverMembers, servers, users } from "../db/schema";
+import type { DatabaseTransaction } from "../db/index";
 import { registerMachine, getMachine, generateMachineKeyMaterial, acquireMachineCreateLock } from "./machineService";
 import { lockActorMembershipRow, ServerMembershipRevokedError } from "../lib/actorMembershipFence";
 import { actorHasServerCapabilityInServer, getActorServerRoleInServer, actorRoleHasServerCapability } from "../lib/actorPermissions";
@@ -79,6 +81,7 @@ export interface ComputerCreatorSummary {
   name: string;
   displayName: string | null;
   avatarUrl: string | null;
+  /** @deprecated Always ""; kept for older clients (DEPRECATED_GRAVATAR_HASH). */
   gravatarHash: string;
 }
 
@@ -98,7 +101,6 @@ export async function getComputerLinkedMachineCreators(
       name: users.name,
       displayName: users.displayName,
       avatarUrl: users.avatarUrl,
-      email: users.email,
     })
     .from(computers)
     .innerJoin(serverMembers, and(
@@ -122,7 +124,7 @@ export async function getComputerLinkedMachineCreators(
       name: row.name,
       displayName: row.displayName,
       avatarUrl: row.avatarUrl,
-      gravatarHash: createHash("sha256").update(row.email.trim().toLowerCase()).digest("hex"),
+      gravatarHash: DEPRECATED_GRAVATAR_HASH,
     });
   }
   return creators;
@@ -251,24 +253,54 @@ export async function findComputerByApiKeyWithReason(
 }
 
 /**
- * Best-effort observability triple write. Failure does not affect the
- * request path; always called via `void recordComputerUse(...)`.
+ * How often one computer's `last_used_*` triple is written at most. Every
+ * authenticated computer request calls `recordComputerUse`; a computer whose
+ * agents all reconnect at once (30+ runner-credential requests in a few
+ * seconds) made every server instance update the same row, queueing on its
+ * row lock for seconds while holding a pool connection. Nothing reads these
+ * columns in real time, so a minute of staleness costs nothing.
+ */
+export const COMPUTER_USE_WRITE_INTERVAL_MS = 60_000;
+const COMPUTER_USE_RECENT_LIMIT = 10_000;
+const recentComputerUseWrites = new Map<string, number>();
+
+/** Test seam: forget which computers this process has written recently. */
+export function resetComputerUseWriteCacheForTests(): void {
+  recentComputerUseWrites.clear();
+}
+
+/**
+ * Best-effort observability triple write, at most once per
+ * COMPUTER_USE_WRITE_INTERVAL_MS per computer. Within the interval this
+ * process skips the database entirely; across instances the WHERE clause
+ * makes every write but the first a no-op that changes no row. Failure does
+ * not affect the request path; always called via `void recordComputerUse(...)`.
  */
 export async function recordComputerUse(input: {
   computerId: string;
   ip: string | null;
   userAgent: string | null;
-}): Promise<void> {
+}, now: number = Date.now()): Promise<void> {
+  const lastWrite = recentComputerUseWrites.get(input.computerId);
+  if (lastWrite !== undefined && now - lastWrite < COMPUTER_USE_WRITE_INTERVAL_MS) return;
+  if (recentComputerUseWrites.size >= COMPUTER_USE_RECENT_LIMIT) recentComputerUseWrites.clear();
+  recentComputerUseWrites.set(input.computerId, now);
   try {
     const db = getDb();
     await db
       .update(computers)
       .set({
-        lastUsedAt: new Date(),
+        lastUsedAt: new Date(now),
         lastUsedIp: input.ip,
         lastUsedUserAgent: input.userAgent,
       })
-      .where(eq(computers.id, input.computerId));
+      .where(and(
+        eq(computers.id, input.computerId),
+        or(
+          isNull(computers.lastUsedAt),
+          lt(computers.lastUsedAt, sql`now() - make_interval(secs => ${COMPUTER_USE_WRITE_INTERVAL_MS / 1000})`),
+        ),
+      ));
   } catch {
     // Swallow — observability writes must not impact auth latency / success.
   }
@@ -353,7 +385,18 @@ async function storeComputerApiKeyHmac(computerId: string, apiKeyHash: string, a
  */
 export type AttachComputerResult =
   | { ok: true; apiKey: string; serverMachineId: string; machineId: string; serverId: string; serverSlug: string; resumed: boolean }
-  | { ok: false; error: "not_authorized" | "requires_admin" | "computer_name_collision" };
+  | {
+      ok: false;
+      error:
+        | "not_authorized"
+        | "requires_admin"
+        | "computer_name_collision"
+        | "session_revoked"
+        // Attaching with a device-login grant's attach token (`grant` below).
+        | "attach_token_invalid"
+        | "attach_token_expired"
+        | "attach_token_consumed";
+    };
 
 /**
  * task #30 PR-F — ensure the Computer is backed by a `machines` (daemons)
@@ -366,10 +409,55 @@ export type AttachComputerResult =
  * via the normal `agents.machineId = <this machine id>`.
  */
 
+/**
+ * Locks a device-login grant for redeeming its attach token in this attach's
+ * transaction (the row lock orders two attaches with the same token: the
+ * second sees it consumed). Null when it may be redeemed; otherwise why not.
+ */
+async function lockRedeemableAttachGrant(
+  tx: DatabaseTransaction,
+  grant: { id: string; tokenLookupHash: Buffer },
+  expected: { serverId: string; userId: string },
+): Promise<"attach_token_invalid" | "attach_token_expired" | "attach_token_consumed" | null> {
+  const [row] = await tx
+    .select({
+      kind: deviceLoginGrants.kind,
+      status: deviceLoginGrants.status,
+      serverId: deviceLoginGrants.serverId,
+      approverUserId: deviceLoginGrants.approverUserId,
+      expiresAt: deviceLoginGrants.expiresAt,
+    })
+    .from(deviceLoginGrants)
+    .where(and(eq(deviceLoginGrants.id, grant.id), eq(deviceLoginGrants.attachTokenLookupHash, grant.tokenLookupHash)))
+    .for("update");
+  if (!row || row.kind !== "computer_attach") {
+    return "attach_token_invalid";
+  }
+  if (row.status === "consumed") return "attach_token_consumed";
+  if (row.status !== "approved" || !row.expiresAt || row.expiresAt.getTime() <= Date.now()) return "attach_token_expired";
+  if (row.serverId !== expected.serverId || row.approverUserId !== expected.userId) return "attach_token_invalid";
+  return null;
+}
+
 export async function attachComputer(input: {
   userId: string;
   serverSlug: string;
   name: string;
+  /** A device login's session family, when that session attaches: recorded on the key and fenced live. */
+  deviceSessionFamilyId?: string | null;
+  /**
+   * The person's own web (full) session family, when that session attaches:
+   * recorded on the key in its own column (a security revoke of the session
+   * revokes it, webSessionIssuedKeys.ts) and fenced live.
+   */
+  webSessionFamilyId?: string | null;
+  /**
+   * A device-login grant's attach token, redeemed by this attach (the caller
+   * passes the approver as `userId`). Checked and consumed in the attach's
+   * transaction: approved, unexpired, for this server and approver, not used.
+   * The key records the grant, never a session family.
+   */
+  grant?: { id: string; tokenLookupHash: Buffer };
 }): Promise<AttachComputerResult> {
   const db = getDb();
 
@@ -404,6 +492,12 @@ export async function attachComputer(input: {
       if (!actorRoleHasServerCapability(lockedRole, "registerMachines")) {
         return { ok: false, error: "requires_admin" };
       }
+      const fencedFamilyId = input.deviceSessionFamilyId ?? (input.grant ? null : input.webSessionFamilyId ?? null);
+      if (fencedFamilyId) await lockLiveSessionFamily(tx, fencedFamilyId, input.userId);
+      if (input.grant) {
+        const refused = await lockRedeemableAttachGrant(tx, input.grant, { serverId: server.id, userId: input.userId });
+        if (refused) return { ok: false, error: refused };
+      }
 
       // Name is display-only. A duplicate live display name from the same
       // attaching user is ambiguous, so fail closed instead of treating the name
@@ -431,6 +525,9 @@ export async function attachComputer(input: {
           apiKeyHmac: material.apiKeyHmac,
           apiKeyPrefix: material.apiKeyPrefix,
           attachedByUserId: input.userId,
+          keyIssuedBySessionFamilyId: input.grant ? null : input.deviceSessionFamilyId ?? null,
+          keyIssuedByWebSessionFamilyId: input.grant ? null : input.webSessionFamilyId ?? null,
+          keyIssuedByGrantId: input.grant?.id ?? null,
         })
         .returning({ id: computers.id });
 
@@ -439,6 +536,12 @@ export async function attachComputer(input: {
         material: machineMaterial,
       });
       await tx.update(computers).set({ machineId: machine.id }).where(eq(computers.id, row.id));
+      if (input.grant) {
+        await tx
+          .update(deviceLoginGrants)
+          .set({ status: "consumed", consumedAt: new Date(), consumedComputerId: row.id })
+          .where(and(eq(deviceLoginGrants.id, input.grant.id), eq(deviceLoginGrants.status, "approved")));
+      }
 
       return {
         ok: true,
@@ -453,6 +556,7 @@ export async function attachComputer(input: {
   } catch (error) {
     // Removal committed first: identical to "not a member" before the transaction existed.
     if (error instanceof ServerMembershipRevokedError) return { ok: false, error: "not_authorized" };
+    if (error instanceof DeviceSessionRevokedError) return { ok: false, error: "session_revoked" };
     throw error;
   }
 }

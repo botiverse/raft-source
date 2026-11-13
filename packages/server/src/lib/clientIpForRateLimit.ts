@@ -14,8 +14,11 @@ import type { Request } from "express";
 // inferred: if the ALB is ever reopened, the flag does not flip back by itself,
 // so turn it off together with any such change.
 //
-// For rate-limit keys only: the result is not persisted or traced. Stored IP
-// fields keep using `req.ip` (collecting real visitor IPs is a separate decision).
+// clientIpForRateLimit is for rate-limit keys only: never persisted, and traced
+// only as a salted HMAC of the limiter key (tracing/clientIpHash.ts).
+// trustedViewerIp (the visitor's address, or null — never the edge's) is what
+// a stored visitor address uses: the device-login records keep it for 30 days,
+// for security only (lib/visitorOrigin.ts). Other stored IP fields keep `req.ip`.
 export const TRUST_CLOUDFRONT_VIEWER_HEADERS_ENV = "TRUST_CLOUDFRONT_VIEWER_HEADERS";
 
 type ClientIpRequest = Pick<Request, "ip"> & { headers?: Request["headers"] };
@@ -52,7 +55,16 @@ function forwardedForViewerIp(header: string | string[] | undefined): string | n
 export function clientIpForRateLimit(req: ClientIpRequest, env: NodeJS.ProcessEnv = process.env): string {
   const proxyIp = req.ip ?? "unknown";
   if (!isTrustingCloudFrontViewerHeaders(env)) return proxyIp;
+  return trustedViewerIp(req, env) ?? proxyIp;
+}
+
+/**
+ * The visitor's address when the viewer headers are trusted, else null (never
+ * the edge's `req.ip`, which names CloudFront, not a person). For callers that
+ * show or keep the visitor's address: lib/visitorOrigin.ts.
+ */
+export function trustedViewerIp(req: ClientIpRequest, env: NodeJS.ProcessEnv = process.env): string | null {
+  if (!isTrustingCloudFrontViewerHeaders(env)) return null;
   return viewerAddressIp(req.headers?.["cloudfront-viewer-address"])
-    ?? forwardedForViewerIp(req.headers?.["x-forwarded-for"])
-    ?? proxyIp;
+    ?? forwardedForViewerIp(req.headers?.["x-forwarded-for"]);
 }

@@ -1,3 +1,5 @@
+import { readRaftAppHosts } from "../../store/raftAppHosts";
+
 export const ATTACHMENT_PREVIEW_EXTERNAL_LINK_COOLDOWN_MS = 500;
 export const ATTACHMENT_PREVIEW_EXTERNAL_LINK_MAX_LENGTH = 4096;
 
@@ -73,6 +75,10 @@ function isInternalAppHostname(hostname: string, appOrigin: string): boolean {
     // remains the conservative boundary.
   }
   if (INTERNAL_APP_HOSTS.has(hostname)) return true;
+  // Raft's own app hosts as this deployment's server lists them
+  // (store/raftAppHosts, from its client config), read now: only ever more
+  // hosts refused, never fewer.
+  if (readRaftAppHosts()?.includes(hostname)) return true;
   return hostname === "botiverse.dev" || hostname.endsWith(".botiverse.dev");
 }
 

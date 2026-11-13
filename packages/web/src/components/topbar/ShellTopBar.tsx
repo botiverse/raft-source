@@ -1,7 +1,7 @@
-import { useLayoutEffect, useMemo } from "react";
+import { useContext, useLayoutEffect, useMemo } from "react";
 import { AppTopBar } from "./AppTopBar";
 import { TopBarGlobalActions } from "./TopBarGlobalActions";
-import { useTopBarHost } from "./topBarHostContext";
+import { TopBarMountedContext, useTopBarHost } from "./topBarHostContext";
 
 // One element for the web's own actions, so a re-render of the shell does not
 // re-render them.
@@ -13,9 +13,9 @@ const GLOBAL_ACTIONS = <TopBarGlobalActions />;
  */
 export function ShellTopBar() {
   const host = useTopBarHost();
-  const onBarMounted = host?.onBarMounted;
-  // Layout effect: the shell swaps its stand-in strip for this bar before the
-  // first paint, so the two never show together for a frame.
+  const onBarMounted = useContext(TopBarMountedContext);
+  // Layout effect: TitleBarHost swaps its stand-in strip for this bar before
+  // the first paint, so the two never show together for a frame.
   useLayoutEffect(() => {
     onBarMounted?.(true);
     return () => onBarMounted?.(false);
@@ -27,7 +27,7 @@ export function ShellTopBar() {
   );
   return (
     <AppTopBar
-      leadingEnd={host?.leadingEnd}
+      historyControls={host?.historyControls === true}
       trailing={trailing}
       titleBar={host?.titleBar === true}
       workspaceShortcutModifier={host?.workspaceShortcutModifier ?? null}

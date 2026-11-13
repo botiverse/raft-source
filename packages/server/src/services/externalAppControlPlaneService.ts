@@ -1,7 +1,9 @@
 import { createHash, randomBytes } from "node:crypto";
-import { and, desc, eq, gt, isNull, ne, or } from "drizzle-orm";
-import { currentDate } from "@botiverse/raft-shared";
+import { and, desc, eq, gt, isNull, ne } from "drizzle-orm";
+import { currentDate, type SlackBridgeProvisioningFailureReason } from "@botiverse/raft-shared";
 import { getDb } from "../db/index";
+import { lockSlackInstallConversations, SlackInstallLockSetChanged } from "./slackBridgeRowLocks";
+import { newSlackMentionAuthorizationId } from "./slackMentionReconcileState";
 import {
   channels,
   externalAppCredentials,
@@ -11,9 +13,7 @@ import {
   externalAppRegistrationSecrets,
   externalAppRegistrations,
   externalAppServerGrants,
-  externalBindingAudienceSnapshots,
   externalChannelBindings,
-  externalHumanIdentityLinks,
   externalOAuthAttempts,
   oauthClientInstalls,
   serverMembers,
@@ -33,6 +33,7 @@ export type ExternalAppControlPlaneErrorCode =
   | "external_app_not_authorized"
   | "external_app_invalid_state"
   | "external_app_install_conflict"
+  | "external_app_workspace_mismatch"
   | "external_app_scope_mismatch"
   | "external_app_persist_failed";
 
@@ -40,6 +41,7 @@ export class ExternalAppControlPlaneError extends Error {
   constructor(
     message: string,
     readonly code: ExternalAppControlPlaneErrorCode,
+    readonly reason?: SlackBridgeProvisioningFailureReason,
   ) {
     super(message);
     this.name = "ExternalAppControlPlaneError";
@@ -66,6 +68,27 @@ function scopesCover(actual: string[], required: string[]): boolean {
   return required.every((s) => have.has(s));
 }
 
+async function requireOAuthManager(tx: DbLike, serverId: string, requestingUserId: string, lock: boolean): Promise<void> {
+  const query = tx.select({ role: serverMembers.role }).from(serverMembers).where(and(
+    eq(serverMembers.serverId, serverId), eq(serverMembers.userId, requestingUserId),
+  )).limit(1);
+  const [membership] = lock ? await query.for("update") : await query;
+  if (membership?.role !== "owner" && membership?.role !== "admin") {
+    throw new ExternalAppControlPlaneError("External app operation is not authorized", "external_app_not_authorized");
+  }
+}
+
+/** Retry only discovery races after their transaction rolls back; never mask a deadlock. */
+export async function retryExternalAppInstallLockSet<T>(run: () => Promise<T>): Promise<T> {
+  for (let attempt = 0; ; attempt++) {
+    try { return await run(); } catch (error) {
+      if (!(error instanceof SlackInstallLockSetChanged)) throw error;
+      if (attempt >= 2) throw new ExternalAppControlPlaneError(
+        "External workspace changed during the operation; retry", "external_app_install_conflict");
+    }
+  }
+}
+
 async function loadCurrentGrant(
   tx: DbLike,
   input: {
@@ -77,6 +100,10 @@ async function loadCurrentGrant(
     lock?: boolean;
   },
 ): Promise<{ registration: RegistrationRow; grant: GrantRow }> {
+  // Keep the manager fence before install/shared authority locks, as in the
+  // provisioning control plane. Begin/claim must not hold registration while
+  // waiting for an OAuth completion's manager row.
+  if (input.requestingUserId) await requireOAuthManager(tx, input.serverId, input.requestingUserId, input.lock ?? false);
   const registrationQuery = tx
     .select()
     .from(externalAppRegistrations)
@@ -137,26 +164,6 @@ async function loadCurrentGrant(
     );
   }
 
-  if (input.requestingUserId) {
-    const membershipQuery = tx
-      .select({ role: serverMembers.role })
-      .from(serverMembers)
-      .where(and(
-        eq(serverMembers.serverId, input.serverId),
-        eq(serverMembers.userId, input.requestingUserId),
-      ))
-      .limit(1);
-    const [membership] = input.lock
-      ? await membershipQuery.for("update")
-      : await membershipQuery;
-    if (membership?.role !== "owner" && membership?.role !== "admin") {
-      throw new ExternalAppControlPlaneError(
-        "External app operation is not authorized",
-        "external_app_not_authorized",
-      );
-    }
-  }
-
   return { registration, grant };
 }
 
@@ -176,6 +183,8 @@ export async function beginExternalOAuthAttempt(input: {
   environment: "test" | "production";
   providerAppId: string;
   providerOAuthClientId: string;
+  /** Current workspace hint only; completion rechecks the provider response. */
+  providerTeamId: string | null;
 }> {
   const state = randomBytes(32).toString("base64url");
   const stateHash = sha256(state);
@@ -194,6 +203,17 @@ export async function beginExternalOAuthAttempt(input: {
         "external_app_invalid_state",
       );
     }
+
+    const workspaces = await tx.select({ teamId: externalAppInstalls.providerTeamId })
+      .from(externalAppInstallServerGrants)
+      .innerJoin(externalAppInstalls, eq(externalAppInstalls.id, externalAppInstallServerGrants.installId))
+      .where(and(
+        eq(externalAppInstallServerGrants.serverId, input.serverId),
+        eq(externalAppInstallServerGrants.registrationId, registration.id),
+        eq(externalAppInstallServerGrants.state, "active"),
+      )).limit(2);
+    if (workspaces.length > 1) throw new ExternalAppControlPlaneError(
+      "Slack Bridge server has multiple current workspace authorities", "external_app_install_conflict");
 
     const [created] = await tx
       .insert(externalOAuthAttempts)
@@ -226,6 +246,7 @@ export async function beginExternalOAuthAttempt(input: {
       environment: registration.environment,
       providerAppId: registration.providerAppId,
       providerOAuthClientId: registration.providerOAuthClientId,
+      providerTeamId: workspaces[0]?.teamId ?? null,
     };
   });
 
@@ -329,121 +350,7 @@ export interface SealedExternalCredential {
   expiresAt?: Date | null;
 }
 
-async function persistExternalHumanIdentityLink(
-  tx: DbLike,
-  input: {
-    serverId: string;
-    installId: string;
-    userId: string;
-    providerAuthorityId: string;
-    providerUserId: string;
-    observedConnectionEpoch: number;
-    now: Date;
-  },
-): Promise<{ id: string; linkEpoch: number }> {
-  const active = await tx
-    .select()
-    .from(externalHumanIdentityLinks)
-    .where(and(
-      eq(externalHumanIdentityLinks.installId, input.installId),
-      eq(externalHumanIdentityLinks.state, "active"),
-      or(
-        eq(externalHumanIdentityLinks.userId, input.userId),
-        eq(externalHumanIdentityLinks.providerUserId, input.providerUserId),
-      ),
-    ))
-    .for("update");
-  const providerConflict = active.find((link) =>
-    link.providerUserId === input.providerUserId
-      && link.userId !== input.userId);
-  if (providerConflict) {
-    throw new ExternalAppControlPlaneError(
-      "Slack human identity is already linked to another Raft user",
-      "external_app_install_conflict",
-    );
-  }
 
-  const same = active.find((link) =>
-    link.userId === input.userId
-      && link.providerUserId === input.providerUserId);
-  const replaced = active.filter((link) =>
-    link.userId === input.userId
-      && link.providerUserId !== input.providerUserId);
-  for (const link of replaced) {
-    await tx
-      .update(externalHumanIdentityLinks)
-      .set({
-        state: "revoked",
-        revokedAt: input.now,
-        revokeReason: "provider_identity_replaced",
-        updatedAt: input.now,
-      })
-      .where(and(
-        eq(externalHumanIdentityLinks.id, link.id),
-        eq(externalHumanIdentityLinks.state, "active"),
-        eq(externalHumanIdentityLinks.linkEpoch, link.linkEpoch),
-      ));
-  }
-
-  const [latest] = await tx
-    .select({ linkEpoch: externalHumanIdentityLinks.linkEpoch })
-    .from(externalHumanIdentityLinks)
-    .where(and(
-      eq(externalHumanIdentityLinks.installId, input.installId),
-      eq(externalHumanIdentityLinks.userId, input.userId),
-    ))
-    .orderBy(desc(externalHumanIdentityLinks.linkEpoch))
-    .limit(1);
-  const linkEpoch = (latest?.linkEpoch ?? 0) + 1;
-  if (same) {
-    const [updated] = await tx
-      .update(externalHumanIdentityLinks)
-      .set({
-        serverId: input.serverId,
-        providerAuthorityId: input.providerAuthorityId,
-        linkEpoch,
-        observedConnectionEpoch: input.observedConnectionEpoch,
-        updatedAt: input.now,
-      })
-      .where(and(
-        eq(externalHumanIdentityLinks.id, same.id),
-        eq(externalHumanIdentityLinks.state, "active"),
-        eq(externalHumanIdentityLinks.linkEpoch, same.linkEpoch),
-      ))
-      .returning({ id: externalHumanIdentityLinks.id });
-    if (!updated) {
-      throw new ExternalAppControlPlaneError(
-        "External human identity link lost its state fence",
-        "external_app_persist_failed",
-      );
-    }
-    return { id: updated.id, linkEpoch };
-  }
-
-  const [created] = await tx
-    .insert(externalHumanIdentityLinks)
-    .values({
-      serverId: input.serverId,
-      installId: input.installId,
-      userId: input.userId,
-      provider: "slack",
-      providerAuthorityId: input.providerAuthorityId,
-      providerUserId: input.providerUserId,
-      state: "active",
-      linkEpoch,
-      observedConnectionEpoch: input.observedConnectionEpoch,
-      createdAt: input.now,
-      updatedAt: input.now,
-    })
-    .returning({ id: externalHumanIdentityLinks.id });
-  if (!created) {
-    throw new ExternalAppControlPlaneError(
-      "External human identity link could not be persisted",
-      "external_app_persist_failed",
-    );
-  }
-  return { id: created.id, linkEpoch };
-}
 
 export async function completeExternalOAuthAttempt(input: {
   attemptId: string;
@@ -451,6 +358,7 @@ export async function completeExternalOAuthAttempt(input: {
   providerTeamId: string;
   providerEnterpriseId?: string | null;
   providerUserId: string;
+  workspaceAdminVerified?: boolean;
   botUserId: string;
   providerBotId?: string | null;
   workspaceName?: string | null;
@@ -460,13 +368,12 @@ export async function completeExternalOAuthAttempt(input: {
   installId: string;
   connectionEpoch: number;
   credentialRevision: number;
-  identityLinkEpoch: number;
 }> {
   const now = currentDate();
   const providerTeamId = input.providerTeamId.trim();
   const providerUserId = input.providerUserId.trim();
   const botUserId = input.botUserId.trim();
-  return getDb().transaction(async (tx) => {
+  return retryExternalAppInstallLockSet(() => getDb().transaction(async (tx) => {
     const [attempt] = await tx
       .select()
       .from(externalOAuthAttempts)
@@ -493,7 +400,8 @@ export async function completeExternalOAuthAttempt(input: {
         isNull(servers.deletedAt),
       ))
       .limit(1)
-      .for("update");
+      // Block deletion/tombstoning, but allow other control-plane FK inserts.
+      .for("share");
     if (!server) {
       throw new ExternalAppControlPlaneError(
         "External app server is unavailable",
@@ -501,18 +409,24 @@ export async function completeExternalOAuthAttempt(input: {
       );
     }
 
+    await requireOAuthManager(tx as DbLike, attempt.serverId, attempt.requestingUserId, true);
+    const [candidateInstall] = await tx.select().from(externalAppInstalls).where(and(
+      eq(externalAppInstalls.registrationId, attempt.registrationId),
+      eq(externalAppInstalls.authorityType, "team"), eq(externalAppInstalls.providerAuthorityId, providerTeamId),
+    )).limit(1);
+    const scope = candidateInstall ? await lockSlackInstallConversations(tx, candidateInstall.id) : null;
     const { registration } = await loadCurrentGrant(tx as DbLike, {
       serverId: attempt.serverId,
       registrationId: attempt.registrationId,
       serverGrantId: attempt.serverGrantId,
       grantEpoch: attempt.grantEpoch,
-      requestingUserId: attempt.requestingUserId,
       lock: true,
     });
     if (
       input.providerAppId !== registration.providerAppId
       || !providerTeamId
       || !providerUserId
+      || providerUserId.length > 160 || /[\r\n\0]/u.test(providerUserId)
       || !botUserId
       || providerUserId === botUserId
       || (
@@ -543,16 +457,48 @@ export async function completeExternalOAuthAttempt(input: {
       );
     }
 
-    const [existing] = await tx
-      .select()
-      .from(externalAppInstalls)
-      .where(and(
-        eq(externalAppInstalls.registrationId, registration.id),
-        eq(externalAppInstalls.authorityType, "team"),
-        eq(externalAppInstalls.providerAuthorityId, providerTeamId),
-      ))
-      .limit(1)
-      .for("update");
+    // An absent install is serialized by the registration lock. If another
+    // completion created it while we waited, restart before locking that row.
+    const [currentInstall] = await tx.select().from(externalAppInstalls).where(and(
+      eq(externalAppInstalls.registrationId, registration.id), eq(externalAppInstalls.authorityType, "team"),
+      eq(externalAppInstalls.providerAuthorityId, providerTeamId),
+    )).limit(1);
+    if (currentInstall?.id !== scope?.install.id) throw new SlackInstallLockSetChanged();
+    const existing = scope?.install;
+    // One server selects one workspace per registration. The registration lock
+    // above serializes completions, including attempts started before another
+    // workspace was connected. Reject a different workspace before changing any
+    // install, credential or association; switching requires an explicit disconnect.
+    const currentWorkspaceGrants = await tx.select({ installId: externalAppInstallServerGrants.installId })
+      .from(externalAppInstallServerGrants).where(and(
+        eq(externalAppInstallServerGrants.serverId, attempt.serverId),
+        eq(externalAppInstallServerGrants.registrationId, registration.id),
+        eq(externalAppInstallServerGrants.state, "active"),
+      ));
+    if (currentWorkspaceGrants.some((grant) => grant.installId !== existing?.id)) {
+      throw new ExternalAppControlPlaneError(
+        "You selected another Slack workspace. Reauthorize the connected workspace, or disconnect it before switching.",
+        "external_app_workspace_mismatch",
+      );
+    }
+    // A provider token belongs to the workspace rather than a Raft server.
+    // Reuse (including reauthorization of a shared install) therefore needs
+    // a fresh positive role observation of the human who completed this OAuth.
+    const [otherServerGrant] = existing
+      ? await tx.select({ id: externalAppInstallServerGrants.id })
+        .from(externalAppInstallServerGrants).where(and(
+          eq(externalAppInstallServerGrants.installId, existing.id),
+          ne(externalAppInstallServerGrants.serverId, attempt.serverId),
+          eq(externalAppInstallServerGrants.state, "active"),
+        )).limit(1)
+      : [];
+    if (existing && (existing.serverId !== attempt.serverId || otherServerGrant)
+      && input.workspaceAdminVerified !== true) {
+      throw new ExternalAppControlPlaneError(
+        "A Slack workspace administrator must authorize a shared installation",
+        "external_app_not_authorized",
+      );
+    }
     const [existingCredential] = existing
       ? await tx.select().from(externalAppCredentials).where(and(
           eq(externalAppCredentials.installId, existing.id),
@@ -600,8 +546,12 @@ export async function completeExternalOAuthAttempt(input: {
     const credentialRevision = existing
       ? sharedGrantOnly ? existing.credentialRevision : existing.credentialRevision + 1
       : 1;
+    const slackMentionCapability = {
+      authorizationId: newSlackMentionAuthorizationId(), result: "unverified" as const, connectionEpoch, credentialRevision,
+    };
     const [install] = sharedGrantOnly
-      ? [existing!]
+      ? await tx.update(externalAppInstalls).set({ slackMentionCapability })
+        .where(eq(externalAppInstalls.id, existing!.id)).returning()
       : existing
       ? await tx
         .update(externalAppInstalls)
@@ -618,6 +568,7 @@ export async function completeExternalOAuthAttempt(input: {
           connectionEpoch,
           scopeRevision: existing.scopeRevision + 1,
           credentialRevision,
+          slackMentionCapability,
           installedScopes,
           providerAppId: input.providerAppId,
           providerTeamId,
@@ -643,6 +594,7 @@ export async function completeExternalOAuthAttempt(input: {
           connectionEpoch,
           scopeRevision: 1,
           credentialRevision,
+          slackMentionCapability,
           installedScopes,
           providerAppId: input.providerAppId,
           providerTeamId,
@@ -665,15 +617,7 @@ export async function completeExternalOAuthAttempt(input: {
     }
 
     if (existing && !sharedGrantOnly) {
-      const currentBindings = await tx.select().from(externalChannelBindings).where(and(
-        eq(externalChannelBindings.installId, existing.id),
-        eq(externalChannelBindings.connectionEpoch, existing.connectionEpoch),
-        or(
-          eq(externalChannelBindings.state, "active"),
-          eq(externalChannelBindings.state, "paused"),
-          eq(externalChannelBindings.state, "quarantined"),
-        ),
-      )).for("update");
+      const currentBindings = scope!.bindings.filter(binding => binding.connectionEpoch === existing.connectionEpoch);
       for (const binding of currentBindings) {
         const [frozen] = await tx.update(externalChannelBindings).set({
           state: "paused",
@@ -707,6 +651,7 @@ export async function completeExternalOAuthAttempt(input: {
         state: "active",
         authorizedByType: "human",
         authorizedById: attempt.requestingUserId,
+        providerAuthorizingUserId: providerUserId,
         revokedAt: null,
         revokeReason: null,
         createdAt: now,
@@ -724,6 +669,7 @@ export async function completeExternalOAuthAttempt(input: {
           state: "active",
           authorizedByType: "human",
           authorizedById: attempt.requestingUserId,
+          providerAuthorizingUserId: providerUserId,
           revokedAt: null,
           revokeReason: null,
           updatedAt: now,
@@ -761,16 +707,6 @@ export async function completeExternalOAuthAttempt(input: {
         });
     }
 
-    const identity = await persistExternalHumanIdentityLink(tx as DbLike, {
-      serverId: attempt.serverId,
-      installId: install.id,
-      userId: attempt.requestingUserId,
-      providerAuthorityId: providerTeamId,
-      providerUserId,
-      observedConnectionEpoch: connectionEpoch,
-      now,
-    });
-
     const [consumed] = await tx
       .update(externalOAuthAttempts)
       .set({ status: "consumed", consumedAt: now, updatedAt: now })
@@ -790,82 +726,15 @@ export async function completeExternalOAuthAttempt(input: {
       installId: install.id,
       connectionEpoch,
       credentialRevision,
-      identityLinkEpoch: identity.linkEpoch,
     };
-  });
+  }));
 }
 
-export async function revokeExternalHumanIdentityLink(input: {
-  serverId: string;
-  installId: string;
-  userId: string;
-  expectedLinkEpoch: number;
-  reason: string;
-}): Promise<{ revoked: boolean; linkEpoch: number | null }> {
-  const reason = input.reason.trim();
-  if (
-    !input.serverId
-    || !input.installId
-    || !input.userId
-    || !Number.isInteger(input.expectedLinkEpoch)
-    || input.expectedLinkEpoch < 1
-    || !reason
-  ) {
-    throw new ExternalAppControlPlaneError(
-      "External human identity revocation is invalid",
-      "external_app_invalid_state",
-    );
-  }
-  const now = currentDate();
-  return getDb().transaction(async (tx) => {
-    const [link] = await tx
-      .select({
-        id: externalHumanIdentityLinks.id,
-        linkEpoch: externalHumanIdentityLinks.linkEpoch,
-      })
-      .from(externalHumanIdentityLinks)
-      .innerJoin(
-        externalAppInstalls,
-        eq(externalAppInstalls.id, externalHumanIdentityLinks.installId),
-      )
-      .innerJoin(
-        externalAppInstallServerGrants,
-        and(
-          eq(externalAppInstallServerGrants.installId, externalHumanIdentityLinks.installId),
-          eq(externalAppInstallServerGrants.serverId, externalHumanIdentityLinks.serverId),
-        ),
-      )
-      .where(and(
-        eq(externalHumanIdentityLinks.serverId, input.serverId),
-        eq(externalHumanIdentityLinks.installId, input.installId),
-        eq(externalHumanIdentityLinks.userId, input.userId),
-        eq(externalHumanIdentityLinks.state, "active"),
-        eq(externalHumanIdentityLinks.linkEpoch, input.expectedLinkEpoch),
-        eq(externalAppInstallServerGrants.serverId, input.serverId),
-        eq(externalAppInstallServerGrants.state, "active"),
-      ))
-      .limit(1)
-      .for("update");
-    if (!link) return { revoked: false, linkEpoch: null };
-    const [revoked] = await tx
-      .update(externalHumanIdentityLinks)
-      .set({
-        state: "revoked",
-        revokedAt: now,
-        revokeReason: reason,
-        updatedAt: now,
-      })
-      .where(and(
-        eq(externalHumanIdentityLinks.id, link.id),
-        eq(externalHumanIdentityLinks.state, "active"),
-        eq(externalHumanIdentityLinks.linkEpoch, link.linkEpoch),
-      ))
-      .returning({ linkEpoch: externalHumanIdentityLinks.linkEpoch });
-    return revoked
-      ? { revoked: true, linkEpoch: revoked.linkEpoch }
-      : { revoked: false, linkEpoch: null };
-  });
-}
+// Per-member OAuth identity links are removed: private channels resolve audience
+// members from external actor projections like public channels do, and outbound
+// Slack mentions use the projections' Slack user IDs. Kept for existing rows
+// until the schema migration drops the table.
+
 
 export async function markExternalOAuthExchangeUnknown(
   attemptId: string,
@@ -895,6 +764,11 @@ export type ExternalBindingAuthorityReason =
   | "privacy_stale"
   | "epoch_mismatch"
   | "channel_unavailable"
+  /** The Raft channel is still a live top-level ordinary channel, but its
+   *  visibility no longer matches the binding's privacy class. Distinct from
+   *  `channel_unavailable` so the outbound path can pause the binding with a
+   *  reason instead of blocking every send silently. */
+  | "raft_privacy_mismatch"
   | "install_grant_unavailable"
   | "secret_reference_unavailable"
   | "install_grant_stale"
@@ -939,6 +813,7 @@ export async function resolveExternalBindingAuthority(input: {
   expectedConnectionEpoch: number;
   expectedBindingEpoch: number;
   now?: Date;
+  allowArchivedForQueuedDelivery?: boolean;
 }, db?: DbLike): Promise<ExternalBindingAuthorityDecision> {
   const now = input.now ?? currentDate();
   const resolve = async (tx: DbLike): Promise<ExternalBindingAuthorityDecision> => {
@@ -952,9 +827,9 @@ export async function resolveExternalBindingAuthority(input: {
       .limit(1);
     if (!binding) return { active: false, reason: "binding_missing" };
     if (binding.state !== "active") return { active: false, reason: "binding_inactive" };
-    if (!binding.privacyFreshUntil || binding.privacyFreshUntil <= now) {
-      return { active: false, reason: "privacy_stale" };
-    }
+    // privacyFreshUntil is directory-cache metadata: visibility no longer
+    // decides whether sync is allowed, so a stale privacy cache degrades
+    // to the recorded class instead of stopping messages (task #241).
 
     const [registration] = await tx
       .select()
@@ -1051,24 +926,29 @@ export async function resolveExternalBindingAuthority(input: {
       ? await resolveExternalConversationTarget({
         executor: tx,
         authorityChannelId: binding.channelId,
+        allowArchivedForQueuedDelivery: input.allowArchivedForQueuedDelivery,
       })
       : null;
     if (
       !channel
       || channel.serverId !== input.serverId
       || channel.deletedAt
-      || channel.archivedAt
+      || (channel.archivedAt && !input.allowArchivedForQueuedDelivery)
       || !conversationTarget
       || conversationTarget.serverId !== input.serverId
       || conversationTarget.bindingChannelId !== binding.channelId
       || conversationTarget.level !== "top_level"
-      || (binding.privacyClass === "public" && !(
-        conversationTarget.kind === "ordinary" && channel.type === "channel"
-        || conversationTarget.kind === "joint" && conversationTarget.role === "host"
-      ))
-      || (binding.privacyClass === "private" && !(
-        conversationTarget.kind === "ordinary" && channel.type === "private"
-      ))
+    ) {
+      return { active: false, reason: "channel_unavailable" };
+    }
+    // Visibility is per-platform: a binding pair stays live when either
+    // side's channel flips public/private — only inaccessibility, unbind or
+    // revoke stops sync (yezizp, task #241). Shape still has to be a real
+    // binding channel: ordinary (either type) or a Joint host.
+    if (
+      !(conversationTarget.kind === "ordinary"
+        && (channel.type === "channel" || channel.type === "private"))
+      && !(conversationTarget.kind === "joint" && conversationTarget.role === "host")
     ) {
       return { active: false, reason: "channel_unavailable" };
     }
@@ -1120,33 +1000,12 @@ export async function resolveExternalBindingAuthority(input: {
       return { active: false, reason: "install_grant_mismatch" };
     }
 
-    let audienceRevision: number | null = null;
-    if (binding.privacyClass === "private") {
-      if (!binding.audienceRevision || !binding.audienceFreshUntil) {
-        return { active: false, reason: "audience_unavailable" };
-      }
-      if (binding.audienceFreshUntil <= now) {
-        return { active: false, reason: "audience_stale" };
-      }
-      const [audience] = await tx
-        .select()
-        .from(externalBindingAudienceSnapshots)
-        .where(and(
-          eq(externalBindingAudienceSnapshots.bindingId, binding.id),
-          eq(externalBindingAudienceSnapshots.bindingEpoch, binding.bindingEpoch),
-          eq(externalBindingAudienceSnapshots.audienceRevision, binding.audienceRevision),
-        ))
-        .limit(1);
-      if (!audience) return { active: false, reason: "audience_unavailable" };
-      if (audience.status === "unavailable") {
-        return { active: false, reason: "audience_unavailable" };
-      }
-      if (audience.status === "mismatch") {
-        return { active: false, reason: "audience_mismatch" };
-      }
-      if (audience.expiresAt <= now) return { active: false, reason: "audience_stale" };
-      audienceRevision = audience.audienceRevision;
-    }
+    // Private channels reuse the public authority path: a per-member OAuth
+    // link and a bounded freshness window are no longer prerequisites. A live
+    // install + active binding is sufficient to bridge. audienceRevision is
+    // carried verbatim for legacy v1 runtime-revision replay only — it is not
+    // an authority coordinate in v2.
+    const audienceRevision: number | null = binding.audienceRevision;
 
     return {
       active: true,

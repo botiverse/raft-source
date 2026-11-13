@@ -1,7 +1,7 @@
 {
   "name": "@botiverse/raft-runtime-form",
   "version": "0.1.0",
-  "license": "FSL-1.1-ALv2",
+  "license": "LicenseRef-Raft-License",
   "private": true,
   "type": "module",
   "main": "src/index.ts",
@@ -16,10 +16,11 @@
     "./generated/*": "./generated/*"
   },
   "scripts": {
-    "contract:generate": "node contract/generate.mjs",
-    "contract:check": "node contract/generate.mjs --check",
+    "contract:generate": "node --import @oxc-node/core/register contract/generate.ts",
+    "contract:check": "node --import @oxc-node/core/register contract/generate.ts --check",
     "test": "vitest run",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsrs --noEmit",
+    "typecheck:tsc": "tsc --noEmit"
   },
   "dependencies": {
     "@botiverse/raft-shared": "workspace:*"

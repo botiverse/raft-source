@@ -1,10 +1,11 @@
 import { createApiTest } from "../test/integration/apiTest";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { and, eq } from "drizzle-orm";
-import { SERVER_GUEST_FEATURE_FLAG_KEY, type ServerId } from "@botiverse/raft-shared";
+import { eq, sql } from "drizzle-orm";
+import { type ServerId } from "@botiverse/raft-shared";
 import { getDb } from "../db/index";
-import { channelHumans, channels, featureFlagRules, serverMembers } from "../db/schema";
+import { channelHumans, channels } from "../db/schema";
+import { seedBoundGuest } from "../test/guestFixture";
 import { createAgent } from "./agentService";
 import {
   addHuman,
@@ -15,7 +16,7 @@ import {
   getOrCreateThreadForChannel,
 } from "./channelService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 type PgliteLike = { query: (...args: unknown[]) => Promise<unknown> };
 
@@ -26,8 +27,6 @@ test("filterUserAccessibleChannelIds answers every channel type exactly as canUs
   const server = await seed.server({ owner, members: [member, guest] });
   const other = await seed.server({ owner });
   const db = getDb();
-  await db.update(serverMembers).set({ role: "guest" }).where(and(eq(serverMembers.serverId, server.id), eq(serverMembers.userId, guest.id)));
-  await db.insert(featureFlagRules).values({ flagKey: SERVER_GUEST_FEATURE_FLAG_KEY, stage: "server", priority: 0, decision: "allow", values: [server.id] });
 
   const label = () => randomUUID().slice(0, 8);
   const open = await createChannel(server.id, `parity-open-${label()}`);
@@ -35,7 +34,10 @@ test("filterUserAccessibleChannelIds answers every channel type exactly as canUs
   await db.update(channels).set({ guestVisible: true }).where(eq(channels.id, guestOpen.id));
   const joined = await createChannel(server.id, `parity-joined-${label()}`, undefined, "private");
   await addHuman(joined.id, member.id);
-  await addHuman(joined.id, guest.id);
+  // The guest's one channel (#wg-rbac:#15); another it is a member of grants it nothing.
+  await seedBoundGuest({ serverId: server.id, userId: guest.id, channelId: joined.id });
+  const guestOther = await createChannel(server.id, `parity-guest-other-${label()}`, undefined, "private");
+  await addHuman(guestOther.id, guest.id);
   const closed = await createChannel(server.id, `parity-closed-${label()}`, undefined, "private");
   const archived = await createChannel(server.id, `parity-archived-${label()}`);
   await db.update(channels).set({ archivedAt: new Date() }).where(eq(channels.id, archived.id));
@@ -55,15 +57,18 @@ test("filterUserAccessibleChannelIds answers every channel type exactly as canUs
     open: await threadOf(open),
     guestOpen: await threadOf(guestOpen),
     joined: await threadOf(joined),
+    guestOther: await threadOf(guestOther),
     closed: await threadOf(closed),
   };
   const [orphanThread] = await db.insert(channels).values({ serverId: server.id, name: `parity-orphan-${label()}`, type: "thread" }).returning();
   // A legacy membership row on a parentless thread (addHuman refuses threads).
   await db.insert(channelHumans).values({ channelId: orphanThread.id, userId: member.id });
+  // Emulate pre-CHECK orphan history; current writes must satisfy the cache invariant.
+  await db.execute(sql`ALTER TABLE channels DROP CONSTRAINT channels_parent_message_requires_channel`);
   const [missingParentThread] = await db.insert(channels).values({ serverId: server.id, name: `parity-missing-${label()}`, type: "thread", parentMessageId: randomUUID() }).returning();
 
   const ids = [
-    open.id, guestOpen.id, joined.id, closed.id, archived.id, deleted.id, elsewhere.id,
+    open.id, guestOpen.id, joined.id, guestOther.id, closed.id, archived.id, deleted.id, elsewhere.id,
     memberDm.id, guestDm.id, ownerDm.id,
     ...Object.values(threads), orphanThread.id, missingParentThread.id, randomUUID(),
   ];
@@ -77,7 +82,7 @@ test("filterUserAccessibleChannelIds answers every channel type exactly as canUs
   const memberBatch = await filterUserAccessibleChannelIds(ids, member.id, server.id as ServerId);
   assert.ok(memberBatch.has(memberDm.id) && !memberBatch.has(ownerDm.id) && memberBatch.has(threads.joined) && !memberBatch.has(threads.closed) && memberBatch.has(orphanThread.id));
   const guestBatch = await filterUserAccessibleChannelIds(ids, guest.id, server.id as ServerId);
-  assert.ok(guestBatch.has(threads.guestOpen) && !guestBatch.has(threads.open) && !guestBatch.has(open.id));
+  assert.deepEqual([...guestBatch].sort(), [joined.id, threads.joined].sort(), "a guest: its one channel and its threads, nothing else");
 });
 
 test("filterUserAccessibleChannelIds checks threads and DMs in a fixed number of queries", async ({ seed }) => {

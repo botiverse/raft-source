@@ -2,7 +2,6 @@ export interface SidebarCollapsedSections {
   pinned: boolean;
   jointChannels: boolean;
   channels: boolean;
-  humans: boolean;
   agents: boolean;
   machinesAgents: boolean;
 }
@@ -16,7 +15,6 @@ const STORAGE_SECTION_IDS: Record<SidebarCollapsedSection, string> = {
   pinned: "pinned",
   jointChannels: "joint-channels",
   channels: "channels",
-  humans: "humans",
   agents: "direct-messages",
   machinesAgents: "members-agents",
 };
@@ -25,7 +23,6 @@ export const DEFAULT_SIDEBAR_COLLAPSED_SECTIONS: SidebarCollapsedSections = {
   pinned: false,
   jointChannels: false,
   channels: false,
-  humans: false,
   agents: false,
   machinesAgents: false,
 };
@@ -120,48 +117,6 @@ export function writeSidebarCustomSectionCollapsed(
 
   try {
     target.setItem(sidebarCustomSectionCollapsedStorageKey(userId, sectionId), String(collapsed));
-  } catch {
-    // Storage can be unavailable in private/embedded browser contexts.
-  }
-}
-
-/**
- * Members-rail agent machine groups are keyed by the server-side machine id
- * (stable across renames), so disclosure preference survives the machine being
- * renamed. Agents without a machine share the "__no_machine__" group key.
- */
-const AGENT_MACHINE_GROUP_STORAGE_SUFFIX = "agent-machine-group";
-
-export function sidebarAgentMachineGroupCollapsedStorageKey(userId: string, machineKey: string): string {
-  return `${STORAGE_PREFIX}:${encodeURIComponent(userId)}:${AGENT_MACHINE_GROUP_STORAGE_SUFFIX}:${encodeURIComponent(machineKey)}`;
-}
-
-export function readSidebarAgentMachineGroupCollapsed(
-  userId: string | undefined,
-  machineKey: string,
-  storage?: SidebarCollapsedStorage,
-): boolean {
-  const target = storage ?? getDefaultStorage();
-  if (!userId || !machineKey || !target) return false;
-
-  try {
-    return target.getItem(sidebarAgentMachineGroupCollapsedStorageKey(userId, machineKey)) === "true";
-  } catch {
-    return false;
-  }
-}
-
-export function writeSidebarAgentMachineGroupCollapsed(
-  userId: string | undefined,
-  machineKey: string,
-  collapsed: boolean,
-  storage?: SidebarCollapsedStorage,
-): void {
-  const target = storage ?? getDefaultStorage();
-  if (!userId || !machineKey || !target) return;
-
-  try {
-    target.setItem(sidebarAgentMachineGroupCollapsedStorageKey(userId, machineKey), String(collapsed));
   } catch {
     // Storage can be unavailable in private/embedded browser contexts.
   }

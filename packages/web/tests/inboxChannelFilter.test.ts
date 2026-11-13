@@ -1,8 +1,6 @@
 import assert from "node:assert/strict";
 import {
   channelFilterOptionLabel,
-  inboxChannelFilterOptions,
-  itemFilterChannelId,
   itemFilterChannelLabel,
 } from "../src/components/thread/inboxChannelFilter";
 import type {
@@ -57,29 +55,6 @@ function threadItem(threadChannelId: string, parentChannelId: string, parentChan
   };
 }
 
-function mentionItem(channelId: string, channelName: string): InboxItem {
-  return {
-    kind: "mention_action",
-    id: "ma",
-    channelId,
-    channelName,
-    channelType: "channel",
-    messageId: "mid",
-    messagePreview: "@you",
-    createdAt: "2026-07-11T00:00:00Z",
-    pendingMentionActions: [],
-    unreadCount: 0,
-    hasMention: false,
-  };
-}
-
-test("itemFilterChannelId groups a thread under its parent channel, not its thread channel", () => {
-  assert.equal(itemFilterChannelId(threadItem("thread-xyz", "eng", "engineering")), "eng");
-  assert.equal(itemFilterChannelId(channelItem("eng", "engineering")), "eng");
-  assert.equal(itemFilterChannelId(channelItem("dm-1", "Alice", "dm")), "dm-1");
-  assert.equal(itemFilterChannelId(mentionItem("eng", "engineering")), "eng");
-});
-
 test("itemFilterChannelLabel resolves DM peer name and parent-channel prefixes", () => {
   const dmChannels: ChannelLike[] = [{ id: "dm-1", name: "fallback", type: "dm", peerDisplayName: "Alice", peerName: "alice" }];
   assert.equal(itemFilterChannelLabel(channelItem("dm-1", "fallback", "dm"), [], dmChannels), "@Alice");
@@ -90,22 +65,4 @@ test("itemFilterChannelLabel resolves DM peer name and parent-channel prefixes",
 test("channelFilterOptionLabel uses peer labels for DMs", () => {
   assert.equal(channelFilterOptionLabel({ id: "dm-1", name: "fallback", type: "dm", peerDisplayName: "Alice" }), "@Alice");
   assert.equal(channelFilterOptionLabel({ id: "eng", name: "engineering", type: "channel" }), "#engineering");
-});
-
-test("inboxChannelFilterOptions dedups, excludes threads and archived channels, and sorts by label", () => {
-  const channels: ChannelLike[] = [
-    { id: "random", name: "random", type: "channel" },
-    { id: "eng", name: "engineering", type: "channel" },
-    { id: "thread-1", name: "thread", type: "thread" },
-    { id: "archived", name: "archived", type: "channel", archivedAt: "2026-07-11T00:00:00Z" },
-  ];
-  const dmChannels: ChannelLike[] = [
-    { id: "dm-1", name: "fallback", type: "dm", peerDisplayName: "Alice" },
-    { id: "eng", name: "duplicate", type: "channel" },
-  ];
-  assert.deepEqual(inboxChannelFilterOptions(channels, dmChannels), [
-    { id: "dm-1", label: "@Alice" },
-    { id: "eng", label: "#engineering" },
-    { id: "random", label: "#random" },
-  ]);
 });

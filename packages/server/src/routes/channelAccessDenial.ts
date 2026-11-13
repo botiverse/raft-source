@@ -24,31 +24,6 @@ import * as channelService from "../services/channelService";
 export const CHANNEL_NOT_FOUND_BODY = { error: "Channel not found or not visible" } as const;
 
 /**
- * The single body used BOTH for "no message with that short id in this channel"
- * and for "that short id belongs to some other channel".
- *
- * Same construction, same reason as CHANNEL_NOT_FOUND_BODY above: one function,
- * so the two cases are byte-identical BY CONSTRUCTION rather than by someone
- * remembering to keep two literals in step. Saying "it lives in #elsewhere"
- * would tell a caller who cannot see that channel both that it exists and where
- * the message is; saying "it has no replies yet" would assert something we have
- * not checked and, for these two cases, is simply false.
- *
- * `parentRef` is safe to echo: the caller supplied it and we only reach here
- * after it resolved as visible to them.
- *
- * Task #145, @Tenny's ruling in #proj-dx:4cd28c12.
- */
-export function threadAnchorNotFoundBody(parentRef: string) {
-  return {
-    error: `Message or thread not found in ${parentRef}`,
-    errorCode: "NOT_FOUND" as const,
-    suggestedNextAction: `Check the message id, or list recent messages with: raft message read --target '${parentRef}'`,
-  };
-}
-
-
-/**
  * Answer a denied channel access without disclosing existence to a stranger.
  *
  * ```

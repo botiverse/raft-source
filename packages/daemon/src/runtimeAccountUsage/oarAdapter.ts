@@ -1,13 +1,15 @@
 import { createHash } from "node:crypto";
 
-import type { AccountUsageSnapshot } from "@botiverse/oar";
+import type { AccountUsageSnapshot, AccountUsageWindow } from "@botiverse/oar";
 
 import {
   RUNTIME_ACCOUNT_USAGE_PROTOCOL_VERSION,
+  RUNTIME_LIMIT_RESETS_AVAILABLE_MAX,
   maskRuntimeAccountEmail,
   type RuntimeAccountUsageHealth,
   type RuntimeAccountUsageProvider,
   type RuntimeAccountUsageSnapshot,
+  type RuntimeAccountUsageWindowScope,
 } from "@botiverse/raft-shared";
 
 export type OarAccountUsageSnapshot = AccountUsageSnapshot;
@@ -36,6 +38,35 @@ function accountKeyFor(provider: RuntimeAccountUsageProvider, localAccountSlot: 
 function windowId(label: string, index: number): string {
   const suffix = createHash("sha256").update(label).digest("hex").slice(0, 12);
   return `w${index}_${suffix}`;
+}
+
+/** OAR's count of limit resets, when it is one the wire schema can carry. */
+function limitResetsAvailableOf(snapshot: Extract<OarAccountUsageSnapshot, { kind: "available" }>): number | undefined {
+  const available = snapshot.limitResets?.available;
+  return typeof available === "number" && Number.isInteger(available) && available >= 0 && available <= RUNTIME_LIMIT_RESETS_AVAILABLE_MAX
+    ? available
+    : undefined;
+}
+
+/**
+ * OAR's window scope, forwarded unchanged (a model's or a group of models'
+ * name only when it is a label the wire carries). Absent stays absent:
+ * unknown, not the account. Sent to a server that reads it only (the daemon
+ * strips it otherwise, SERVER_CAPABILITY_RUNTIME_ACCOUNT_USAGE_WINDOW_SCOPE_V1;
+ * a `models` one needs ..._V2).
+ */
+function scopeOf(window: AccountUsageWindow): RuntimeAccountUsageWindowScope | undefined {
+  const scope = window.scope;
+  if (!scope) return undefined;
+  switch (scope.kind) {
+    case "account":
+      return { kind: "account" };
+    case "model":
+    case "models": {
+      const name = safeLabel(scope.name);
+      return name ? { kind: scope.kind, name } : undefined;
+    }
+  }
 }
 
 function isoOrUndefined(value: unknown): string | undefined {
@@ -76,16 +107,20 @@ export function projectOarAccountUsageSnapshot(input: {
   // server that predates the field rejects the whole snapshot (strict parse), so
   // email-identified accounts must never carry it.
   const displayName = maskedLabel ? undefined : safeLabel(snapshot.displayName);
+  // Sent to a server that reads it only (the daemon strips it otherwise,
+  // SERVER_CAPABILITY_RUNTIME_ACCOUNT_USAGE_LIMIT_RESETS_V1).
+  const limitResetsAvailable = limitResetsAvailableOf(snapshot);
   let sawUnreadableRatio = false;
 
   const windows = snapshot.windows.map((window, index) => {
     const label = safeLabel(window.label) ?? "Usage limit";
     const id = windowId(label, index);
+    const scope = scopeOf(window);
     const ratio = window.usedRatio;
     const usable = typeof ratio === "number" && Number.isFinite(ratio) && ratio >= 0 && ratio <= 1;
     if (!usable) {
       sawUnreadableRatio = true;
-      return { id, label, status: "parse_unavailable" as const };
+      return { id, label, status: "parse_unavailable" as const, ...(scope ? { scope } : {}) };
     }
     const resetsAt = isoOrUndefined(window.resetsAt);
     return {
@@ -94,6 +129,7 @@ export function projectOarAccountUsageSnapshot(input: {
       status: ratio >= 1 ? ("limit_reached" as const) : ("ok" as const),
       usedRatio: Number(ratio.toFixed(6)),
       ...(resetsAt ? { resetsAt } : {}),
+      ...(scope ? { scope } : {}),
     };
   });
 
@@ -122,6 +158,7 @@ export function projectOarAccountUsageSnapshot(input: {
       ...(planLabel ? { planLabel } : {}),
       ...(displayName ? { displayName } : {}),
       health,
+      ...(limitResetsAvailable !== undefined ? { limitResetsAvailable } : {}),
       ...(sawUnreadableRatio ? { parseErrorCode: "oar_window_ratio_unreadable" } : {}),
       windows,
     }],

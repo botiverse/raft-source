@@ -9,6 +9,12 @@ import {
   type MachineReplicaReplayTarget,
 } from "./replicaRouter";
 import { addTraceEvent, errorClassOf, getCurrentTraceContext } from "./tracing/semanticTrace";
+import { traceMachineIdHash } from "./tracing/traceIdentity";
+import {
+  COMPUTER_PROBE_STATE_HEADER,
+  computerProbeTraceStateOf,
+  setRequestTraceComputerProbeState,
+} from "./middleware/requestObservability";
 
 const REPLAY_MARKER_HEADER = "x-raft-replica-replay";
 const REPLAY_MACHINE_HEADER = "x-raft-replica-replay-machine";
@@ -42,20 +48,25 @@ const MACHINE_LOCAL_ROUTE_ALLOWLIST: Array<{ method: string; path: RegExp }> = [
   { method: "POST", path: /^\/api\/agents$/ },
   { method: "PATCH", path: /^\/api\/agents\/[^/]+$/ },
   { method: "POST", path: /^\/api\/agents\/[^/]+\/start$/ },
-  {
-    method: "POST",
-    path: /^\/api\/agents\/[^/]+\/(?:assign-machine|migrate)$/,
-  },
+  { method: "POST", path: /^\/api\/agents\/[^/]+\/migrate$/ },
   { method: "GET", path: /^\/api\/agents\/[^/]+\/workspace-files$/ },
   { method: "GET", path: /^\/api\/agents\/[^/]+\/workspace-files\/read$/ },
   { method: "GET", path: /^\/api\/agents\/[^/]+\/skills$/ },
   { method: "DELETE", path: /^\/api\/servers\/[^/]+\/machines\/[^/]+$/ },
   { method: "POST", path: /^\/api\/servers\/[^/]+\/machines\/[^/]+\/computer\/(?:restart|upgrade)$/ },
   { method: "POST", path: /^\/api\/servers\/[^/]+\/machines\/[^/]+\/computer-lifecycle-operations$/ },
+  // The same record by the Computer's own key: it needs the connection epoch
+  // of the replica holding the machine's socket. The owner re-authenticates it.
+  { method: "POST", path: /^\/internal\/computer\/lifecycle-operations$/ },
   { method: "GET", path: /^\/api\/servers\/[^/]+\/machines\/[^/]+\/workspaces$/ },
   { method: "GET", path: /^\/api\/servers\/[^/]+\/machines\/[^/]+\/runtime-models\/[^/]+$/ },
   { method: "GET", path: /^\/api\/servers\/[^/]+\/machines\/[^/]+\/runtime-form-definitions\/[^/]+\/option-sources\/[^/]+$/ },
   { method: "GET", path: /^\/api\/servers\/[^/]+\/machines\/[^/]+\/runtime-forms\/v2\/[^/]+\/option-sources\/[^/]+$/ },
+  // task #10: the Built-in v2 definition reads the Computer's model source to
+  // decide which preset providers show the limit fields.
+  { method: "GET", path: /^\/api\/servers\/[^/]+\/machines\/[^/]+\/runtime-forms\/v2\/[^/]+$/ },
+  // task #10: the agent's v2 edit form, for the same reason (the agent's Computer).
+  { method: "GET", path: /^\/api\/agents\/[^/]+\/runtime-form$/ },
   { method: "GET", path: /^\/api\/servers\/[^/]+\/machines\/[^/]+\/agents\/[^/]+\/diagnostic\/session-transcript$/ },
   { method: "POST", path: /^\/api\/servers\/[^/]+\/machines\/[^/]+\/agents\/[^/]+\/feedback\/[^/]+\/transcript$/ },
   { method: "DELETE", path: /^\/api\/servers\/[^/]+\/machines\/[^/]+\/workspaces\/[^/]+$/ },
@@ -99,6 +110,16 @@ export interface MachineLocalRoutingDeps {
  */
 export type MachineLocalRoutingResult = "handled" | "confirmed_local" | "not_routed" | "owner_missing";
 
+/**
+ * A replay to the owner replica that produced no usable answer: it timed out
+ * (`replay_timeout`) or the transport failed (`replay_failed`). Returned only
+ * by handleMachineLocalProbeRouting.
+ */
+export type MachineLocalReplayFailure = "replay_timeout" | "replay_failed";
+
+/** What a route answers when its replay failed; the default sends 504/503/the owner's 409. */
+type ReplayFailureHandler<F> = (attempt: ReplayAttempt, res: Response) => F;
+
 const defaultRoutingDeps: MachineLocalRoutingDeps = {
   getReplayTarget: getMachineReplicaReplayTarget,
   clearOwner: clearMachineReplicaOwnerIfMatches,
@@ -114,20 +135,67 @@ export function isMachineLocalReplayAllowed(method: string, originalUrl: string)
   return MACHINE_LOCAL_ROUTE_ALLOWLIST.some((entry) => entry.method === normalizedMethod && entry.path.test(pathname));
 }
 
-export async function handleMachineLocalRouting(
+export function handleMachineLocalRouting(
   req: Request,
   res: Response,
   machineId: string,
   machineLocal: boolean | (() => boolean),
   deps: MachineLocalRoutingDeps = defaultRoutingDeps,
 ): Promise<MachineLocalRoutingResult> {
+  return routeMachineLocal(req, res, machineId, machineLocal, deps, sendReplayFailureHandled);
+}
+
+/**
+ * handleMachineLocalRouting for the read-only Computer probes (runtime models,
+ * runtime-form option sources, agent skills): a failed replay is returned
+ * instead of answered 504/503, so the route can answer 200 from the shared
+ * probe cache (computerProbeCacheService). An owner response is still
+ * forwarded as is. The owner's typed `machine_owner_not_local` with no
+ * replacement owner proves no replica holds the socket: that is
+ * `owner_missing`, the offline answer every route already gives. Every other
+ * route keeps handleMachineLocalRouting.
+ */
+export function handleMachineLocalProbeRouting(
+  req: Request,
+  res: Response,
+  machineId: string,
+  machineLocal: boolean | (() => boolean),
+  deps: MachineLocalRoutingDeps = defaultRoutingDeps,
+): Promise<MachineLocalRoutingResult | MachineLocalReplayFailure> {
+  return routeMachineLocal(req, res, machineId, machineLocal, deps, (attempt) => {
+    // A failure handed over as a response is only ever the owner's typed
+    // machine_owner_not_local (any other answer is forwarded above).
+    if (attempt.kind === "response") return "owner_missing";
+    return attempt.kind === "timeout" ? "replay_timeout" : "replay_failed";
+  });
+}
+
+/** The stable trace error code for a failed replay that the route answered itself. */
+export function machineLocalReplayFailureCode(failure: MachineLocalReplayFailure): string {
+  return failure === "replay_timeout" ? "machine_affinity_replay_timeout" : "machine_affinity_replay_failed";
+}
+
+export function isMachineLocalReplayFailure(
+  routing: MachineLocalRoutingResult | MachineLocalReplayFailure,
+): routing is MachineLocalReplayFailure {
+  return routing === "replay_timeout" || routing === "replay_failed";
+}
+
+async function routeMachineLocal<F>(
+  req: Request,
+  res: Response,
+  machineId: string,
+  machineLocal: boolean | (() => boolean),
+  deps: MachineLocalRoutingDeps,
+  onReplayFailure: ReplayFailureHandler<F>,
+): Promise<MachineLocalRoutingResult | F> {
   const isMachineLocal = typeof machineLocal === "function" ? machineLocal : () => machineLocal;
   if (!isMachineLocalReplayAllowed(req.method, req.originalUrl || req.url)) {
     addMachineAffinityTrace("not_allowed", machineId);
     return "not_routed";
   }
 
-  const incomingReplay = verifyIncomingReplay(req, machineId);
+  const incomingReplay = verifyReplicaRequestSignature(req, machineId);
   if (isMachineLocal()) {
     if (incomingReplay === "invalid") {
       addMachineAffinityTrace("owner_not_local", machineId, { replay_signature_valid: false });
@@ -203,7 +271,7 @@ export async function handleMachineLocalRouting(
     return routeToReplica(req, res, machineId, {
       ...replayTarget,
       endpoint: replayTarget.endpoint,
-    }, isMachineLocal, allowReplacementReread, deps);
+    }, isMachineLocal, allowReplacementReread, deps, onReplayFailure);
   }
 
   const flyInstance = await deps.getFlyInstance(machineId);
@@ -239,10 +307,14 @@ export function sendMachineAffinityUnavailable(
   });
 }
 
+// The hashed Computer id (as on request spans), so a stalled or failed route
+// can be matched to the machine it waited on (#proj-o11y:#29).
 function addMachineAffinityTrace(route: MachineAffinityRoute, machineId: string, attrs: Record<string, unknown> = {}) {
+  const machineIdHash = traceMachineIdHash(machineId);
   addTraceEvent("machine.affinity.routed", {
     machine_affinity_route: route,
     machine_id_present: Boolean(machineId),
+    ...(machineIdHash ? { machine_id_hash: machineIdHash } : {}),
     ...attrs,
   });
 }
@@ -308,7 +380,7 @@ async function replayToReplica(
   }
 }
 
-async function routeToReplica(
+async function routeToReplica<F>(
   req: Request,
   res: Response,
   machineId: string,
@@ -316,7 +388,8 @@ async function routeToReplica(
   isMachineLocal: () => boolean,
   allowReplacementReread: boolean,
   deps: MachineLocalRoutingDeps,
-): Promise<MachineLocalRoutingResult> {
+  onReplayFailure: ReplayFailureHandler<F>,
+): Promise<MachineLocalRoutingResult | F> {
   const first = await replayToReplica(req, machineId, target, deps);
   if (first.kind === "response" && !isOwnerNotLocalResponse(first)) {
     sendReplayResponse(first, res);
@@ -338,8 +411,7 @@ async function routeToReplica(
   });
 
   if (!isIdempotentRead(req.method) || !allowReplacementReread) {
-    sendReplayFailure(first, res);
-    return "handled";
+    return onReplayFailure(first, res);
   }
 
   const replacement = await deps.getReplayTarget(machineId);
@@ -384,12 +456,10 @@ async function routeToReplica(
       stale_owner_clear_result: secondClearResult,
       ...(second.kind === "replay_failed" ? { error_class: second.errorClass } : {}),
     });
-    sendReplayFailure(second, res);
-    return "handled";
+    return onReplayFailure(second, res);
   }
 
-  sendReplayFailure(first, res);
-  return "handled";
+  return onReplayFailure(first, res);
 }
 
 /**
@@ -440,6 +510,8 @@ function sendReplayResponse(
   res: Response,
 ): void {
   copyReplayResponseHeaders(attempt.response, res);
+  const probeState = computerProbeTraceStateOf(attempt.response.headers.get(COMPUTER_PROBE_STATE_HEADER));
+  if (probeState) setRequestTraceComputerProbeState({ locals: res.locals }, probeState);
   res.status(attempt.response.status);
   if (attempt.response.status === 204 || attempt.response.status === 304) {
     res.end();
@@ -448,10 +520,10 @@ function sendReplayResponse(
   res.send(attempt.body);
 }
 
-function sendReplayFailure(attempt: ReplayAttempt, res: Response): void {
+function sendReplayFailureHandled(attempt: ReplayAttempt, res: Response): "handled" {
   if (attempt.kind === "response") {
     sendReplayResponse(attempt, res);
-    return;
+    return "handled";
   }
   if (attempt.kind === "timeout") {
     res.status(504).json({
@@ -459,13 +531,14 @@ function sendReplayFailure(attempt: ReplayAttempt, res: Response): void {
       code: "machine_affinity_replay_timeout",
       machineAffinityRoute: "timeout",
     });
-    return;
+    return "handled";
   }
   res.status(503).json({
     error: "Failed to route request to machine owner replica",
     code: "machine_affinity_replay_failed",
     machineAffinityRoute: "replay_failed",
   });
+  return "handled";
 }
 
 export function buildReplayHeaders(req: Request, machineId: string, body: BodyInit | undefined): Headers {
@@ -489,12 +562,27 @@ export function buildReplayHeaders(req: Request, machineId: string, body: BodyIn
     // normal browser request has no traceparent at all.
     headers.set("traceparent", formatTraceparent(activeTraceContext));
   }
-  const timestamp = String(Date.now());
-  headers.set(REPLAY_MARKER_HEADER, "1");
-  headers.set(REPLAY_MACHINE_HEADER, machineId);
-  headers.set(REPLAY_TIMESTAMP_HEADER, timestamp);
-  headers.set(REPLAY_SIGNATURE_HEADER, signReplay(req.method, getPathnameWithSearch(req.originalUrl || req.url), machineId, timestamp));
+  for (const [name, value] of Object.entries(signReplicaRequestHeaders(req.method, req.originalUrl || req.url, machineId))) {
+    headers.set(name, value);
+  }
   return headers;
+}
+
+/**
+ * The replay signature headers for one request from this replica to another:
+ * an HMAC over method, path and query, a subject and a timestamp, under the
+ * replicas' shared secret. Replay signs with the machine id as the subject;
+ * another internal replica route may bind its own id (e.g. a View Context
+ * request id). The body is not covered: these hops stay on the private network.
+ */
+export function signReplicaRequestHeaders(method: string, url: string, subject: string): Record<string, string> {
+  const timestamp = String(Date.now());
+  return {
+    [REPLAY_MARKER_HEADER]: "1",
+    [REPLAY_MACHINE_HEADER]: subject,
+    [REPLAY_TIMESTAMP_HEADER]: timestamp,
+    [REPLAY_SIGNATURE_HEADER]: signReplay(method, getPathnameWithSearch(url), subject, timestamp),
+  };
 }
 
 function copyReplayResponseHeaders(response: globalThis.Response, res: Response): void {
@@ -515,15 +603,16 @@ function serializeReplayBody(req: Request): BodyInit | undefined {
   return JSON.stringify(body);
 }
 
-function verifyIncomingReplay(req: Request, machineId: string): "absent" | "valid" | "invalid" {
+/** Check signReplicaRequestHeaders' headers on an incoming request for `subject` (5-minute window). */
+export function verifyReplicaRequestSignature(req: Request, subject: string): "absent" | "valid" | "invalid" {
   if (getHeader(req, REPLAY_MARKER_HEADER) !== "1") return "absent";
   const replayMachineId = getHeader(req, REPLAY_MACHINE_HEADER);
   const timestamp = getHeader(req, REPLAY_TIMESTAMP_HEADER);
   const signature = getHeader(req, REPLAY_SIGNATURE_HEADER);
-  if (!replayMachineId || !timestamp || !signature || replayMachineId !== machineId) return "invalid";
+  if (!replayMachineId || !timestamp || !signature || replayMachineId !== subject) return "invalid";
   const ts = Number(timestamp);
   if (!Number.isFinite(ts) || Math.abs(Date.now() - ts) > REPLAY_SIGNATURE_MAX_AGE_MS) return "invalid";
-  const expected = signReplay(req.method, getPathnameWithSearch(req.originalUrl || req.url), machineId, timestamp);
+  const expected = signReplay(req.method, getPathnameWithSearch(req.originalUrl || req.url), subject, timestamp);
   return timingSafeEqualString(signature, expected) ? "valid" : "invalid";
 }
 

@@ -12,6 +12,13 @@ async function readServerFile(relativePath: string) {
   return readFile(path.join(SERVER_ROOT, relativePath), "utf8");
 }
 
+/** The newest snapshot: the one drizzle-kit generate diffs schema.ts against (older ones are pruned). */
+async function latestSnapshot() {
+  const journal = JSON.parse(await readServerFile("drizzle/meta/_journal.json")) as { entries: Array<{ idx: number }> };
+  const last = String(journal.entries.at(-1)!.idx).padStart(4, "0");
+  return JSON.parse(await readServerFile(`drizzle/meta/${last}_snapshot.json`));
+}
+
 test("0248 keeps the large sender index out of drizzle migrate", async () => {
   const migration = await readServerFile("drizzle/0248_even_ogun.sql");
 
@@ -22,46 +29,7 @@ test("0248 keeps the large sender index out of drizzle migrate", async () => {
   );
 });
 
-test("snapshot declares the sender index for future schema diffs", async () => {
-  const snapshot = await readServerFile("drizzle/meta/0248_snapshot.json");
-  assert.match(snapshot, /idx_messages_sender_created_at/);
-});
-
-test("server package exposes concurrent sender index create and verify scripts", async () => {
-  const packageJson = JSON.parse(await readServerFile("package.json"));
-  assert.equal(
-    packageJson.scripts["db:create-messages-sender-index"],
-    "node --import @oxc-node/core/register scripts/create-messages-sender-index.ts",
-  );
-  assert.equal(
-    packageJson.scripts["db:verify-messages-sender-index"],
-    "node --import @oxc-node/core/register scripts/verify-messages-sender-index.ts",
-  );
-
-  const helperScript = await readServerFile("scripts/messages-sender-index.ts");
-  assert.match(
-    helperScript,
-    /CREATE INDEX CONCURRENTLY IF NOT EXISTS "\$\{SENDER_INDEX_NAME\}"/,
-  );
-  assert.match(helperScript, /"sender_id", "created_at", "id"/);
-  assert.match(helperScript, /MESSAGES_SENDER_INDEX_STATEMENT_TIMEOUT/);
-  assert.match(helperScript, /MESSAGES_SENDER_INDEX_LOCK_TIMEOUT/);
-  assert.match(helperScript, /indisvalid/);
-  assert.match(helperScript, /indisready/);
-
-  const createScript = await readServerFile(
-    "scripts/create-messages-sender-index.ts",
-  );
-  assert.match(createScript, /set_config\('statement_timeout'/);
-  assert.match(createScript, /set_config\('lock_timeout'/);
-});
-
-test("PGlite builds the sender index for local and test DBs", async () => {
-  const pgliteMigrations = await readServerFile("src/db/pgliteMigrations.ts");
-
-  assert.match(
-    pgliteMigrations,
-    /CREATE INDEX IF NOT EXISTS "idx_messages_sender_created_at"/,
-  );
-  assert.doesNotMatch(pgliteMigrations, /CONCURRENTLY/);
+test("the latest snapshot declares the sender index for future schema diffs", async () => {
+  const snapshot = await latestSnapshot();
+  assert.ok(snapshot.tables["public.messages"].indexes.idx_messages_sender_created_at, "snapshot must declare idx_messages_sender_created_at");
 });

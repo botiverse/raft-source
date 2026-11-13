@@ -105,6 +105,7 @@ const CLI_COMMAND_PREFIX = /\braft $/;
  */
 const ALLOWED: Array<{ file: string; literal: string; why: string }> = [
   { file: "agentOps/passiveResources.ts", literal: "raft ", why: "CLI-only: `raft <command> --help` for the command-guidance resource; never on the SDK path." },
+  { file: "agentText/raftDeliveryParse.ts", literal: "raft inbox read --target <item>", why: "Read, not rendered: View Context's parser recognizes RFC 081's inbox footer by this text." },
 ];
 
 function scannedFiles(): string[] {

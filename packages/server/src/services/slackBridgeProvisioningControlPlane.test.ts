@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 
 import {
   projectSlackProviderChannelsForServer,
+  slackBridgeMentionSyncState,
+  slackBridgeChannelPairFailureReason,
   slackActorProjectionRevisionAfterRefresh,
 } from "./slackBridgeProvisioningControlPlane";
 
@@ -59,4 +61,35 @@ test("another server's reserved Slack channel is omitted without exposing its bi
   });
   assert.deepEqual(projected.map((channel) => channel.id), ["C_OWN", "C_FREE"]);
   assert.equal(JSON.stringify(projected).includes("secret-other-server-name"), false);
+});
+
+test("pair failures distinguish missing channels and bot membership; visibility never fails a pair", () => {
+  for (const visibility of ["public", "private"] as const) {
+    const raft = { type: visibility === "public" ? "channel" : "private" };
+    const slack = { privacyClass: visibility, isMember: true };
+    assert.equal(slackBridgeChannelPairFailureReason(raft, slack), null);
+    assert.equal(slackBridgeChannelPairFailureReason(undefined, slack), "channel_unavailable");
+    assert.equal(slackBridgeChannelPairFailureReason(raft, undefined), "channel_unavailable");
+    assert.equal(slackBridgeChannelPairFailureReason(raft, { ...slack, isMember: false }), "not_member");
+    assert.equal(slackBridgeChannelPairFailureReason(raft, { privacyClass: visibility }), "not_member");
+    // Cross-class pairing is admissible: visibility is per-platform.
+    assert.equal(slackBridgeChannelPairFailureReason(raft, { ...slack, privacyClass: visibility === "public" ? "private" : "public" }), null);
+  }
+});
+
+
+test("retiring an obsolete group cannot mark current members unavailable", () => {
+  const human = { serverId: "server-a", userId: "human-a", name: "alice", displayName: "Alice", serverName: "Raft", serverSlug: "raft" };
+  const health = slackBridgeMentionSyncState({
+    candidates: [], humanCandidates: [human], observedAt: new Date("2032-01-02T03:04:05Z"),
+    reconciled: { kind: "fact", fact: {
+      handles: [], humanHandles: [{ userId: human.userId, providerUsergroupId: "S_ALICE", handle: "alice" }],
+      failures: [{ userId: "other-server-user", slackError: "name_taken", transient: false }],
+      cleanupFailures: [{ slackError: "permission_denied" }],
+    } },
+  });
+  assert.equal(health?.state, "synced");
+  assert.equal(health?.actual, 1);
+  assert.equal(health?.expected, 1);
+  assert.equal(health?.slackError, "cleanup_pending");
 });

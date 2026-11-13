@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { OXC_NODE_ARGS } from "./helpers/oxcNode";
 
 /**
  * @MingQi review r5 #1: the layout-owner detector must have an EXECUTABLE counterfactual
@@ -15,7 +16,7 @@ import { resolve } from "node:path";
  */
 
 const REPO = resolve(import.meta.dirname, "..");
-const SCRIPT = resolve(REPO, "scripts/check-host-bridge-callers.mjs");
+const SCRIPT = resolve(REPO, "scripts/check-host-bridge-callers.ts");
 
 const OWNERS: Array<{ label: string; path: string; importSpec: string }> = [
   { label: "MainLayout.tsx", path: "src/components/layout/MainLayout.tsx",
@@ -39,7 +40,7 @@ function corruptOwner(rel: string, importSpec: string): void {
 }
 
 function runDetector(): { code: number; err: string } {
-  const r = spawnSync("node", [SCRIPT], { encoding: "utf8" });
+  const r = spawnSync("node", [...OXC_NODE_ARGS, SCRIPT], { encoding: "utf8" });
   return { code: r.status ?? -1, err: r.stderr + r.stdout };
 }
 

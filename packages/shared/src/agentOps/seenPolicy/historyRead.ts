@@ -15,7 +15,7 @@
 //    follow-up: a single high seq cannot safely become a max boundary
 //    without contiguity or seen-set semantics.
 
-import type { MaybePromise } from "./store";
+import type { MaybePromise } from "../../maybePromise";
 import { canonicalizeConsumedTarget, type ConsumedSeqLedger } from "./consumedSeqs";
 import { andThen } from "./maybe";
 

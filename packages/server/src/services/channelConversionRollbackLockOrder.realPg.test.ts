@@ -96,7 +96,7 @@ test.skipIf(!REAL_PG_URL && !REAL_PG_REQUIRED)(
       await admin.query(`ALTER DATABASE ${quoteIdentifier(databaseName)} SET enable_mergejoin = off`);
       await setupPool.end();
       setupPool = undefined;
-      app = await startTestApp(testUrl, 0, { channelToJointConversionFlagDefaultEnabled: true, humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+      app = await startTestApp(testUrl, 0, { humanActivityMuteFlagDefaultEnabled: true });
       observer = new pg.Pool({ connectionString: testUrl, application_name: "conversion-rollback-observer", max: 1 });
 
       const db = getDb();

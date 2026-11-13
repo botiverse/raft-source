@@ -85,10 +85,10 @@ test("transport maps authoritative list and detail unread fields", async () => {
 test("attachment preview reads the authenticated ticket attachment as a blob", async () => {
   const attachmentId = "55555555-5555-4555-8555-555555555555";
   const blob = new Blob(["image"], { type: "image/png" });
-  let request: { url: string; responseType?: string; signal?: AbortSignal } | null = null;
+  let request: { url: string; responseType?: string; params?: unknown; signal?: AbortSignal } | null = null;
   api.get = (async (
     url: string,
-    config?: { responseType?: string; signal?: AbortSignal },
+    config?: { responseType?: string; params?: unknown; signal?: AbortSignal },
   ) => {
     request = { url, ...config };
     return { data: blob };
@@ -105,6 +105,8 @@ test("attachment preview reads the authenticated ticket attachment as a blob", a
   assert.deepEqual(request, {
     url: `/product-feedback/tickets/${TICKET}/attachments/${attachmentId}`,
     responseType: "blob",
+    // A web ticket names no platform.
+    params: {},
     signal,
   });
 });

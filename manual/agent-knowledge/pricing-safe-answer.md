@@ -7,7 +7,7 @@ description: How an agent should handle pricing, billing, quota, and refund ques
 {/*
 Policy doc, not a code-derived reference or customer-facing price sheet. Intentionally contains NO specific prices, tiers, percentages, or quota numbers — those live on the canonical pricing surface and go stale. Cross-checked against:
 - manual/agent-knowledge/scopes-and-permissions.md (agent cannot see or mutate user account/billing state)
-- manual/agent-knowledge/what-slock-doesnt-have.md (don't assert features/limits that may not exist)
+- manual/agent-knowledge/what-raft-doesnt-have.md (don't assert features/limits that may not exist)
 Review trigger: if Raft exposes user-side spend controls, agent-side billing actions, refunds, invoice reads, usage-based automatic billing, or the agent gains a billing-read surface, revisit this policy.
 */}
 
@@ -32,8 +32,8 @@ What counts as the canonical surface:
 
 Current implementation shape to describe, without turning it into a binding quote:
 - Free and Pro are the ordinary self-serve plan names shown to users. Enterprise is a contact-us plan.
-- Free includes limited server capacity, including a small agent cap, a monthly file-upload quota, and 30 days of message history.
-- Pro is prepaid by Pack. Each Pack bundles human-seat and agent-seat capacity, with monthly and annual billing intervals shown on the pricing surface.
+- Free does not cap the number of agents, but it still has limits such as a monthly file-upload quota and 30 days of message history.
+- Pro is prepaid by seat. One person uses 1 seat and one agent uses 0.1 seat; billable capacity rounds up to a whole seat, with a minimum of 1. Monthly and annual billing intervals are shown on the pricing surface.
 - Billing is based on prepaid provisioned capacity, not recent-participation, active-member, per-message, or usage-metered billing.
 - Only owners can change billing. Admins may see non-sensitive billing summary; members cannot.
 
@@ -48,14 +48,14 @@ What the agent **must not** do:
 
 ### If a human asks: "Is this free?" or "How much does this feature cost?"
 
-- **Use this answer:** "The Pricing section on the Raft site and your Billing tab are the source of truth for current numbers. I can explain the shape: Free has fixed limits including message history and file uploads; Pro uses prepaid Packs that bundle human-seat and agent-seat capacity; Enterprise is contact-us. For the exact current price or your account's current plan, please check Billing or the pricing section."
+- **Use this answer:** "The Pricing section on the Raft site and your Billing tab are the source of truth for current numbers. I can explain the shape: Free does not cap the number of agents, but it has fixed limits including message history and file uploads. Pro uses prepaid seats: one person uses 1 seat and one agent uses 0.1 seat, with billable capacity rounded up to a whole seat (at least 1). Enterprise is contact-us. For the exact current price or your account's current plan, please check Billing or the pricing section."
 - **Check first:** whether the question is about a feature (answerable from the canonical pricing surface) or about the user's specific bill (must route).
 - **Do not claim:** that the feature is free, paid, included, or excluded without sending the human to the canonical pricing surface.
 - **Escalate when:** the question is about the user's specific account state — current charges, included quota remaining, plan-tier eligibility. Route to billing settings or support.
 
 ### If a human asks: "How does pricing work in Raft?" / "What model do you use?"
 
-- **Use this answer:** describe the *shape* — Free has fixed limits including message history and file uploads; Pro uses prepaid Packs that bundle human-seat and agent-seat capacity; Enterprise is contact-us. Raft does not bill from recent participation or active-member metering. The Billing tab and public pricing section show current rates and account state.
+- **Use this answer:** describe the *shape* — Free does not cap the number of agents, but it has fixed limits including message history and file uploads. Pro uses prepaid seats: one person uses 1 seat and one agent uses 0.1 seat, with billable capacity rounded up to a whole seat (at least 1). Enterprise is contact-us. Raft does not bill from recent participation or active-member metering. The Billing tab and public pricing section show current rates and account state.
 - **Check first:** that the human wants the shape, not a specific number. If they want a number, treat as "Is this free?" above.
 - **Do not claim:** specific dollar prices, taxes, discounts, refund rules, or account-specific quotas without the canonical source. Plan names and broad shape are okay when they match the current Billing tab/pricing surface.
 - **Escalate when:** the human is comparing plans for a purchase decision — they should look at the pricing section and, if helpful, talk to sales/support.
@@ -83,7 +83,7 @@ What the agent **must not** do:
 
 ### If a human asks: "Is the agent itself costing me money? Are you billing per message?"
 
-- **Use this answer:** "Agents count against the same server billing model described on the pricing section and Billing tab. Free has a small fixed agent cap, and Pro seats include agent capacity. I can't tell you your exact account state or invoice from here, but Billing is where that answer lives."
+- **Use this answer:** "Agents count against the same server billing model described on the pricing section and Billing tab. Free does not cap how many agents you can create. On Pro, one agent uses 0.1 seat, and billable capacity is rounded up to a whole seat (at least 1). I can't tell you your exact account state or invoice from here, but Billing is where that answer lives."
 - **Check first:** the human isn't actually asking for a refund or a "stop the meter" action — those route directly.
 - **Do not claim:** per-message rates, free tiers, or specific included amounts unless you have a live pricing source open and quoted.
 - **Escalate when:** the human wants to dispute or stop a charge.

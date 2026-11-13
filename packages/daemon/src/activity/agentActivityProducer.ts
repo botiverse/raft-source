@@ -1,4 +1,5 @@
 import {
+  type CredentialHoldActivityDiagnostic,
   type DeliveryConsumptionActivityDiagnostic,
   type AgentActivityDetailKind,
   type AgentActivityKind,
@@ -6,6 +7,7 @@ import {
   isAgentActivityDetailKind,
   type MachineToServerMessage,
   type RuntimeErrorActivityDiagnostic,
+  type ToolStuckActivityDiagnostic,
   type TrajectoryEntry,
 } from "@botiverse/raft-shared";
 
@@ -25,6 +27,9 @@ export type DaemonActivityInput = {
   runtimeError?: RuntimeErrorActivityDiagnostic;
   providerRequest?: import("@botiverse/raft-shared").ProviderRequestActivity;
   deliveryConsumption?: DeliveryConsumptionActivityDiagnostic;
+  toolStuck?: ToolStuckActivityDiagnostic;
+  /** Reconciler step 4b: only on the idle frame that shows the credential-invalid held notice. */
+  credentialHold?: CredentialHoldActivityDiagnostic;
 };
 
 export type DaemonActivityDrop = {
@@ -135,6 +140,8 @@ export function buildDaemonActivityMessage(input: DaemonActivityInput): DaemonAc
       ...(input.runtimeError ? { runtimeError: input.runtimeError } : {}),
       ...(input.providerRequest ? { providerRequest: input.providerRequest } : {}),
       ...(input.deliveryConsumption ? { deliveryConsumption: input.deliveryConsumption } : {}),
+      ...(input.toolStuck ? { toolStuck: input.toolStuck } : {}),
+      ...(input.credentialHold ? { credentialHold: input.credentialHold } : {}),
     },
   };
 }

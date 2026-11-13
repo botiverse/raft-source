@@ -4,6 +4,32 @@ import { createRaft } from "./index";
 const credential = "sk_agent_raft_test";
 const sample = { channel_type: "channel", channel_name: "general", message_id: "00000000-1111-2222-3333-444444444444", timestamp: "2026-08-31T08:00:00.000Z", sender_type: "human", sender_name: "richard", content: "hello everyone", seq: 1200 };
 
+test("anonymous Slack search results cannot create a reply mention", async () => {
+  const calls: Array<{ path: string; body: unknown }> = [];
+  const row = { id: sample.message_id, seq: 1200, channelId: "c", threadId: null, parentMessageId: null,
+    parentMessageContent: null, parentChannelId: "c", parentChannelName: "general", parentChannelType: "channel",
+    parentChannelArchivedAt: null, senderId: "", senderType: "third_party_app", senderName: "Slack", channelName: "general",
+    channelType: "channel", channelArchivedAt: null, content: "anonymous body", snippet: "anonymous body",
+    createdAt: sample.timestamp };
+  const raft = createRaft({ serverUrl: "https://raft.example", credential, fetch: async (input, init) => {
+    const path = new URL(String(input)).pathname;
+    calls.push({ path, body: init?.body ? JSON.parse(String(init.body)) : undefined });
+    if (path.endsWith("/search")) return Response.json({ results: [row], hasMore: false });
+    if (path.endsWith("/artifacts")) return Response.json({ error: "not allowed" }, { status: 403 });
+    if (path.endsWith("/v2/send")) return Response.json({ ok: true, state: "sent", messageId: "m-1", messageSeq: 1201 });
+    return Response.json({ error: "unexpected" }, { status: 500 });
+  } });
+  const searched = await raft.messages.search({ query: "anonymous" });
+  assert.equal(searched.ok, true);
+  if (!searched.ok) return;
+  assert.equal(searched.data.results[0].senderId, "");
+  await raft.messages.reply({ target: "#general:00000000" }, { content: "Thanks", idempotencyKey: "anon-reply" });
+  const sent = calls.find(call => call.path.endsWith("/v2/send"));
+  assert.ok(sent);
+  assert.equal((sent.body as { content: string }).content, "Thanks");
+  assert.equal("mentions" in (sent.body as object), false);
+});
+
 test("createRaft wires identity, inbox, read, send, and tasks over one credential with the contract's retry split", async () => {
   const calls: Array<{ method: string; path: string; init: RequestInit; body: unknown }> = [];
   const raft = createRaft({
@@ -61,4 +87,92 @@ test("createRaft restores an exported frontier and rejects bad configuration bef
   assert.match(raft.routes.manifestVersion, /^[0-9a-f]{16}$/);
   assert.throws(() => createRaft({ serverUrl: "ftp://raft.example", credential }), /HTTP or HTTPS/);
   assert.throws(() => createRaft({ serverUrl: "https://raft.example", credential: "nope" }), /External Agent credential/);
+});
+
+test("createRaft names itself on every request, the Manual included; a caller's header of the same name wins", async () => {
+  const seen: Array<{ path: string; client: string | null; capabilities: string | null }> = [];
+  const fetchStub = async (input: string | URL | Request, init?: RequestInit) => {
+    const url = new URL(String(input));
+    const headers = new Headers(init?.headers);
+    seen.push({ path: url.pathname, client: headers.get("x-raft-client"), capabilities: headers.get("x-raft-client-capabilities") });
+    if (url.pathname === "/internal/agent-api/knowledge") {
+      return Response.json({ ok: true, docId: "message", topicOrPath: "message", docVersion: "sha256:0", docState: "published", contentType: "text/markdown", content: "# Messages\n" });
+    }
+    if (url.pathname === "/internal/agent-api/knowledge/search") {
+      return Response.json({ ok: true, query: "message link", scope: null, results: [{ slug: "message", title: "Messages", firstScreen: "Send and read" }] });
+    }
+    if (url.pathname.startsWith("/internal/agent-api/events")) {
+      return Response.json({ events: [], last_seen_msgId: null, last_seen_seq: 0, reply_target: null, has_more: false, ack_mode: "cursor" });
+    }
+    return new Response("unexpected", { status: 500 });
+  };
+  const context = { intent: "Point a human at one message", reason: "Need the message link format" };
+
+  const raft = createRaft({ serverUrl: "https://raft.example", credential, fetch: fetchStub });
+  assert.equal((await raft.manual.get({ topic: "message", ...context })).ok, true);
+  assert.equal((await raft.manual.search({ query: "message link", ...context })).ok, true);
+  assert.equal((await raft.inbox.check()).ok, true);
+  assert.deepEqual(seen.map((call) => call.path), [
+    "/internal/agent-api/knowledge",
+    "/internal/agent-api/knowledge/search",
+    "/internal/agent-api/events",
+  ]);
+  for (const call of seen) {
+    assert.equal(call.client, "sdk", call.path);
+    assert.equal(call.capabilities, "manual-context-v1", call.path);
+  }
+
+  seen.length = 0;
+  const named = createRaft({ serverUrl: "https://raft.example", credential, fetch: fetchStub, headers: { "X-Raft-Client": "my-runtime" } });
+  assert.equal((await named.manual.get({ topic: "message", ...context })).ok, true);
+  assert.deepEqual(seen, [{ path: "/internal/agent-api/knowledge", client: "my-runtime", capabilities: "manual-context-v1" }]);
+});
+
+test("actions.withdraw takes back a question card: one POST with the id as given, the CLI's receipt, the answers when answered first, and tool calls in tool style", async () => {
+  const id = "1a2b3c4d-1111-4222-8333-444455556666";
+  const action = { type: "question:ask", ref: "deploy-1", addressee: { kind: "user", userId: "00000000-0000-4000-8000-000000000001", handle: "tenny" }, questions: [{ id: "window", kind: "text", text: "Which window?" }] };
+  const result = { kind: "question-answers", ref: "deploy-1", answeredBy: { userId: "00000000-0000-4000-8000-000000000001", handle: "tenny" }, answeredAt: "2026-10-30T09:12:00.000Z", answers: { window: { kind: "text", text: "Tuesday" } } };
+  let answer: Response = Response.json({});
+  const calls: Array<{ method: string; path: string }> = [];
+  const make = (hints?: "tool") => createRaft({
+    serverUrl: "https://raft.example",
+    credential,
+    ...(hints ? { hints } : {}),
+    fetch: async (input, init) => {
+      calls.push({ method: init?.method ?? "GET", path: new URL(String(input)).pathname });
+      return answer.clone();
+    },
+  });
+
+  answer = Response.json({ messageId: id, metadata: { kind: "action-card", state: "withdrawn", action } });
+  const withdrawn = await make().actions.withdraw({ messageId: "1a2b3c4d" });
+  assert.deepEqual(calls, [{ method: "POST", path: "/internal/agent-api/actions/1a2b3c4d/withdraw" }]);
+  assert.equal(withdrawn.ok && withdrawn.state, "withdrawn");
+  assert.equal(withdrawn.ok && withdrawn.data.messageId, id);
+  assert.equal(withdrawn.ok && withdrawn.text, `Question card withdrawn: message ${id} (short 1a2b3c4d, ref: deploy-1). @tenny can no longer answer it. No reply is posted for a withdrawal; this is your receipt.\n`);
+
+  // The same through invoke (the model's tool call), and again: already withdrawn.
+  answer = Response.json({ messageId: id, metadata: { kind: "action-card", state: "withdrawn", action }, alreadyWithdrawn: true });
+  const again = await make().invoke("actions.withdraw", { messageId: "1a2b3c4d" });
+  assert.equal("ok" in again && again.ok && again.state, "already_withdrawn");
+
+  // Answered first: a failure carrying the answers; a tool-mode next step names no CLI command.
+  answer = Response.json({ error: "This question was answered before it could be withdrawn", errorCode: "ALREADY_ANSWERED", metadata: { kind: "action-card", state: "executed", action, result } }, { status: 409 });
+  const answered = await make("tool").actions.withdraw({ messageId: "1a2b3c4d" });
+  assert.ok(!answered.ok);
+  if (answered.ok) return;
+  assert.equal(answered.error.serverCode, "ALREADY_ANSWERED");
+  assert.deepEqual(answered.next?.args, { messageId: "1a2b3c4d", result });
+  assert.ok(answered.text.includes("1. window — Which window?\n   → Tuesday\n"), answered.text);
+  assert.doesNotMatch(answered.error.nextAction, /\braft [a-z]/);
+  // The Server's CLI step for a miss becomes the tool-mode step for the same thing, not a generic one.
+  answer = Response.json({ error: "No question card with that message id", errorCode: "NOT_FOUND", suggestedNextAction: "Pass the card's message id, or its first 8 characters, as raft action prepare printed them." }, { status: 404 });
+  const missing = await make("tool").actions.withdraw({ messageId: "ffffffff" });
+  assert.equal(!missing.ok && missing.error.nextAction, "Pass the card's message id, or its first 8 characters, as actions_prepare returned them.");
+
+  // An empty id is refused before any request.
+  calls.length = 0;
+  const empty = await make().invoke("actions.withdraw", { messageId: "" });
+  assert.equal("ok" in empty && !empty.ok && empty.error.code, "INVALID_REQUEST");
+  assert.deepEqual(calls, []);
 });

@@ -94,6 +94,17 @@ export function hasActivityReadHold(identity: ActivityReadStateIdentity, scopeId
   return key !== null && activeReadHolds.has(key);
 }
 
+/**
+ * The person marked the scope unread (Mark as Unread): the read they made
+ * before, which the hold kept, is no longer theirs to show.
+ */
+export function releaseActivityReadHold(identity: ActivityReadStateIdentity, scopeId: string): boolean {
+  const key = holdKey(identity, scopeId);
+  if (!key || !activeReadHolds.delete(key)) return false;
+  activityReadStateRevision += 1;
+  return true;
+}
+
 export function releaseActivityReadHoldForMessage(
   identity: ActivityReadStateIdentity,
   scopeId: string,

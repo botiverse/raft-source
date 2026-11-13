@@ -1,7 +1,5 @@
-import { PRO_PACK_ANNUAL_DISCOUNT_PERCENT } from "@botiverse/raft-shared";
-import type { BillingInterval } from "@botiverse/raft-shared";
 import { useIntl } from "react-intl";
-import { SegmentedControl, SegmentedControlCount, SegmentedControlItem, SegmentedControlLabel } from "@botiverse/raft-ui";
+import { SegmentedControl, SegmentedControlItem, SegmentedControlLabel } from "@botiverse/raft-ui";
 import { MESSAGE_BODY_FONT_SIZE_OPTIONS } from "../../store/appearanceStore";
 import type { MessageBodyFontSize } from "../../store/appearanceStore";
 import type { MessageId } from "../../i18n/messages/en";
@@ -14,93 +12,6 @@ export const MESSAGE_FONT_SIZE_LABEL_ID: Record<MessageBodyFontSize, MessageId> 
 };
 
 export type ConnectedAppsTab = "marketplace" | "installed" | "myapps";
-
-export type ConnectedAppsTabOption = {
-  value: ConnectedAppsTab;
-  label: string;
-  count: number;
-  testId: string;
-};
-
-export function BillingIntervalSegmentedControl({
-  value,
-  disabled,
-  onValueChange,
-}: {
-  value: BillingInterval;
-  disabled?: boolean;
-  onValueChange: (value: BillingInterval) => void;
-}) {
-  const { formatMessage } = useIntl();
-  const billingIntervalOptions = [
-    { value: "monthly" as const, label: formatMessage({ id: "billing.monthly" }), testId: "billing-interval-monthly" },
-    {
-      value: "annual" as const,
-      label: formatMessage({ id: "billing.yearly" }),
-      // Secondary text slot: rUI themes its type and colour (Space Mono
-      // meta, light/dark, checked/unchecked). Only wrapping is set here.
-      badge: formatMessage({ id: "billing.saveAnnualPercent" }, { percent: PRO_PACK_ANNUAL_DISCOUNT_PERCENT }),
-      testId: "billing-interval-annual",
-    },
-  ];
-
-  return (
-    <SegmentedControl<BillingInterval>
-      value={value}
-      aria-label={formatMessage({ id: "billing.billingInterval" })}
-      onValueChange={onValueChange}
-      disabled={disabled}
-    >
-      {billingIntervalOptions.map((option) => (
-        <SegmentedControlItem
-          key={option.value}
-          value={option.value}
-          data-testid={option.testId}
-        >
-          <SegmentedControlLabel>{option.label}</SegmentedControlLabel>
-          {"badge" in option ? (
-            <SegmentedControlCount className="whitespace-nowrap">{option.badge}</SegmentedControlCount>
-          ) : null}
-        </SegmentedControlItem>
-      ))}
-    </SegmentedControl>
-  );
-}
-
-export function ConnectedAppsTabSegmentedControl({
-  value,
-  options,
-  onValueChange,
-  className,
-}: {
-  value: ConnectedAppsTab;
-  options: ConnectedAppsTabOption[];
-  onValueChange: (value: ConnectedAppsTab) => void;
-  className?: string;
-}) {
-  const { formatMessage } = useIntl();
-  return (
-    <SegmentedControl<ConnectedAppsTab>
-      value={value}
-      aria-label={formatMessage({ id: "settings.connectedApps.viewAria" })}
-      onValueChange={onValueChange}
-      className={className}
-    >
-      {options.map((option) => (
-        <SegmentedControlItem
-          key={option.value}
-          value={option.value}
-          data-testid={option.testId}
-        >
-          <SegmentedControlLabel>{option.label}</SegmentedControlLabel>
-          {option.count > 0 ? (
-            <SegmentedControlCount>{option.count}</SegmentedControlCount>
-          ) : null}
-        </SegmentedControlItem>
-      ))}
-    </SegmentedControl>
-  );
-}
 
 export function MessageBodyFontSizeSegmentedControl({
   value,

@@ -69,6 +69,47 @@ export function isSidebarJointChannel(
   return channel.type === "joint" && !hasActiveChannelConversion(channel);
 }
 
+/**
+ * A channel with people from outside the Server that no other server has
+ * joined (a Guest or an open external invite; `hasExternalRelation`). Not
+ * gated by external_channels_v1: a channel that is already external keeps
+ * its group and icon when the flag is off (plan §2a).
+ */
+export function isSidebarExternalOnlyChannel(
+  channel: Pick<Channel, "type" | "hasExternalRelation">,
+): boolean {
+  return channel.hasExternalRelation === true && (channel.type === "channel" || channel.type === "private");
+}
+
+/** The External section (formerly Joint Channels): joint channels and external-only ones. */
+export function isSidebarExternalSectionChannel(
+  channel: Pick<Channel, "type" | "conversionJob" | "hasExternalRelation">,
+): boolean {
+  return isSidebarJointChannel(channel) || isSidebarExternalOnlyChannel(channel);
+}
+
 export function shouldShowSidebarChannelEmptyState(channels: Channel[]): boolean {
   return channels.length === 0;
+}
+
+/**
+ * The External section's title: "External" once external channels are on or
+ * any of its (active) channels is external-only, else "Joint Channels".
+ * Pass the section's channels or all of them: only active external-only ones count.
+ */
+export function sidebarExternalSectionLabelId(
+  externalChannelsEnabled: boolean,
+  channels: ReadonlyArray<Pick<Channel, "type" | "hasExternalRelation" | "archivedAt">>,
+): "layout.sidebar.external" | "layout.sidebar.jointChannels" {
+  return externalChannelsEnabled
+    || channels.some((channel) => !channel.archivedAt && isSidebarExternalOnlyChannel(channel))
+    ? "layout.sidebar.external"
+    : "layout.sidebar.jointChannels";
+}
+
+/** A channel's home section (where it sits unpinned and unplaced), as a sectionOrder key. */
+export function sidebarChannelHomeSectionKey(
+  channel: Pick<Channel, "type" | "conversionJob" | "hasExternalRelation">,
+): "system:joint" | "system:channels" {
+  return isSidebarExternalSectionChannel(channel) ? "system:joint" : "system:channels";
 }

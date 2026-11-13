@@ -201,7 +201,7 @@ test("missing required options fail as INVALID_ARG before auth bootstrap", async
   );
   await assertInvalidBeforeBootstrap(
     "task amend",
-    (ctx) => taskAmendCommand.handler(ctx, { number: "8", title: "Current" }),
+    (ctx) => taskAmendCommand.handler(ctx, undefined, { number: "8", title: "Current" }),
     "--target is required (legacy --channel is accepted during the transition)",
   );
   await assertInvalidBeforeBootstrap(
@@ -265,7 +265,7 @@ test("newly migrated commands use injected client and write canonical success ou
     },
     {
       name: "task claim",
-      run: async () => runCommand(ok({ results: [{ taskNumber: 7, messageId: "abcdef123456", success: true }] }), (ctx) => taskClaimCommand.handler(ctx, { target: "#engineering", number: ["7"] })),
+      run: async () => runCommand(ok({ results: [{ taskNumber: 7, messageId: "abcdef123456", success: true }] }), (ctx) => taskClaimCommand.handler(ctx, undefined, { target: "#engineering", number: ["7"] })),
       stdout: /Claim results/,
     },
     {
@@ -297,7 +297,7 @@ test("newly migrated commands use injected client and write canonical success ou
           payload: { revision: 2, changes: { title: { from: "Ship", to: "Current" } } },
           createdAt: "2026-08-05T00:00:00.000Z",
         },
-      }), (ctx) => taskAmendCommand.handler(ctx, { target: "#engineering", number: "8", title: "Current" })),
+      }), (ctx) => taskAmendCommand.handler(ctx, undefined, { target: "#engineering", number: "8", title: "Current" })),
       stdout: /#8 amended — revision 2, event seq 12/,
     },
     {
@@ -327,9 +327,9 @@ test("newly migrated commands map server failures to CliError", async () => {
     { name: "reminder log", code: "LOG_FAILED", run: (ctx) => reminderLogCommand.handler(ctx, { id: reminderId }) },
     { name: "reminder snooze", code: "SNOOZE_FAILED", run: (ctx) => reminderSnoozeCommand.handler(ctx, { id: reminderId, by: "30m" }) },
     { name: "reminder update", code: "UPDATE_FAILED", run: (ctx) => reminderUpdateCommand.handler(ctx, { id: reminderId, title: "Updated" }) },
-    { name: "task claim", code: "CLAIM_FAILED", run: (ctx) => taskClaimCommand.handler(ctx, { target: "#engineering", number: ["7"] }) },
+    { name: "task claim", code: "CLAIM_FAILED", run: (ctx) => taskClaimCommand.handler(ctx, undefined, { target: "#engineering", number: ["7"] }) },
     { name: "task create", code: "CREATE_FAILED", run: (ctx) => taskCreateCommand.handler(ctx, { target: "#engineering", title: ["Ship"] }) },
-    { name: "task amend", code: "AMEND_FAILED", run: (ctx) => taskAmendCommand.handler(ctx, { target: "#engineering", number: "8", title: "Current" }) },
+    { name: "task amend", code: "AMEND_FAILED", run: (ctx) => taskAmendCommand.handler(ctx, undefined, { target: "#engineering", number: "8", title: "Current" }) },
     { name: "task history", code: "HISTORY_FAILED", run: (ctx) => taskHistoryCommand.handler(ctx, { target: "#engineering", number: "8" }) },
   ];
 
@@ -361,7 +361,7 @@ test("task claim maps daemon proxy 5xx envelopes to proxy-scoped CliError", asyn
   });
 
   await assert.rejects(
-    async () => { await Promise.resolve(taskClaimCommand.handler(ctx, { target: "#engineering", number: ["7"] })); },
+    async () => { await Promise.resolve(taskClaimCommand.handler(ctx, undefined, { target: "#engineering", number: ["7"] })); },
     (err: unknown) => {
       assert.ok(err instanceof CliError);
       assert.equal(err.code, "PROXY_5XX");
@@ -382,7 +382,7 @@ test("task claim maps daemon proxy 5xx envelopes to proxy-scoped CliError", asyn
 test("task claim accepts legacy --channel alias during target transition", async () => {
   const result = await runCommand(
     ok({ results: [{ taskNumber: 7, messageId: "abcdef123456", success: true }] }),
-    (ctx) => taskClaimCommand.handler(ctx, { channel: "#engineering", number: ["7"] }),
+    (ctx) => taskClaimCommand.handler(ctx, undefined, { channel: "#engineering", number: ["7"] }),
   );
 
   assert.deepEqual(result.requests, [
@@ -397,7 +397,7 @@ test("task claim accepts legacy --channel alias during target transition", async
 test("task claim rejects conflicting --target and legacy --channel before auth bootstrap", async () => {
   await assertInvalidBeforeBootstrap(
     "task claim",
-    (ctx) => taskClaimCommand.handler(ctx, { target: "#engineering", channel: "#ops", number: ["7"] }),
+    (ctx) => taskClaimCommand.handler(ctx, undefined, { target: "#engineering", channel: "#ops", number: ["7"] }),
     "--target and legacy --channel must refer to the same target when both are provided",
   );
 });

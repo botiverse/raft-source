@@ -10,8 +10,7 @@ import { useAuthStore } from "../src/store/authStore";
 import type { Message } from "../src/store/messageStore";
 import { useServerStore } from "../src/store/serverStore";
 import {
-  TRANSLATION_LANGUAGE_OPTIONS,
-  detectBrowserLanguage,
+  FOLLOW_DISPLAY_LANGUAGE_TARGET,
   formatTimezoneLabel,
   getTimezoneOptions,
   getTranslationLanguageOptions,
@@ -89,49 +88,59 @@ test("translation language and timezone options execute the normalized API contr
   assert.equal(normalizeTranslationLanguageCode("it-IT"), "it");
   assert.equal(normalizeTranslationLanguageCode("en-US"), "en");
 
-  const optionValues = new Set(TRANSLATION_LANGUAGE_OPTIONS.map((option) => option.value));
-  assert.deepEqual(
-    ["browser", "en", "zh-cn", "zh-tw", "pt-br", "it"].map((value) => optionValues.has(value)),
-    [true, true, true, true, true, true],
-  );
-
   const identityFormat = ((desc: { id: string }) => {
-    if (desc.id === "settings.language.browserLanguage") return "Browser language";
+    if (desc.id === "settings.language.followDisplayLanguage") return "Same as display language";
     if (desc.id === "settings.language.selectTimezone") return "Select timezone";
     return desc.id;
   }) as never;
 
-  assert.deepEqual(getTranslationLanguageOptions("en", identityFormat).map((option) => option.label), [
-    "Browser language",
+  // "Same as display language" first, then every language named in the UI
+  // language and sorted the way that language sorts.
+  const english = getTranslationLanguageOptions("en", identityFormat);
+  assert.equal(english[0].value, FOLLOW_DISPLAY_LANGUAGE_TARGET);
+  assert.deepEqual(english.map((option) => option.label), [
+    "Same as display language",
+    "Brazilian Portuguese",
     "English",
-    "Simplified Chinese",
-    "Traditional Chinese",
-    "Japanese",
-    "Korean",
-    "Spanish",
     "French",
     "German",
-    "Portuguese (Brazil)",
     "Italian",
+    "Japanese",
+    "Korean",
+    "Russian",
+    "Simplified Chinese",
+    "Spanish",
+    "Traditional Chinese",
   ]);
-  assert.match(formatTimezoneLabel("Asia/Shanghai"), /^UTC\+08:00 Asia\/Shanghai$/);
-  assert.equal(getTimezoneOptions("Asia/Shanghai", identityFormat)[0].label, "UTC+08:00 Asia/Shanghai");
+  const japanese = getTranslationLanguageOptions("ja", identityFormat);
+  assert.equal(japanese.find((option) => option.value === "ko")?.label, "韓国語");
+  assert.equal(japanese.find((option) => option.value === "zh-tw")?.label, "繁体中国語");
+  assert.deepEqual(
+    new Set(english.map((option) => option.value)),
+    new Set(japanese.map((option) => option.value)),
+    "the same languages in every UI language",
+  );
+  assert.match(formatTimezoneLabel("Asia/Shanghai"), /^UTC\+08:00 Shanghai$/);
+  assert.match(formatTimezoneLabel("America/Argentina/Buenos_Aires"), /^UTC-03:00 Buenos Aires$/);
+  assert.equal(getTimezoneOptions("Asia/Shanghai", identityFormat)[0].label, "UTC+08:00 Shanghai");
   assert.equal(getTimezoneOptions("America/Indiana/Indianapolis", identityFormat).some((option) => option.value === "America/Indiana/Indianapolis"), true);
   assert.equal(getTimezoneOptions("Asia/Shanghai", identityFormat).length < 50, true);
 });
 
-test("browser language resolves the first supported translation target", () => {
-  Object.defineProperty(globalThis, "navigator", {
-    value: { languages: ["zh-CN"], language: "zh-CN" },
-    configurable: true,
-  });
-  assert.equal(detectBrowserLanguage(), "zh-cn");
+test("with no preference the translation target follows the display language", () => {
+  useTranslationStore.setState((state) => ({
+    settings: { ...state.settings, preferredLanguage: null, effectiveLanguage: "en" },
+  }));
+  useTranslationStore.getState().followDisplayLanguage("ja");
+  assert.equal(useTranslationStore.getState().settings.effectiveLanguage, "ja");
 
-  Object.defineProperty(globalThis, "navigator", {
-    value: { languages: ["en-US"], language: "en-US" },
-    configurable: true,
-  });
-  assert.equal(detectBrowserLanguage(), "en");
+  // An explicit choice is not overridden by a display-language change.
+  useTranslationStore.setState((state) => ({
+    settings: { ...state.settings, preferredLanguage: "ko", effectiveLanguage: "ko" },
+  }));
+  useTranslationStore.getState().followDisplayLanguage("zh-cn");
+  assert.equal(useTranslationStore.getState().settings.effectiveLanguage, "ko");
+  useTranslationStore.getState().followDisplayLanguage("en");
 });
 
 function TranslationBatchProbe({ messages }: { messages: Message[] }) {

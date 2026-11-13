@@ -1,6 +1,7 @@
 import { isProcessAlive, readPidfileAt } from "./internal/process-primitives";
 import {
   serverConnectedMarkerPath,
+  serverRunnerLockConflictPath,
   serverRunnerPidReadFallback,
   serverRunnerVersionPath,
 } from "./paths";
@@ -9,6 +10,7 @@ import {
   readProcessVersionEvidence,
   type ProcessVersionEvidence,
 } from "./versionEvidence";
+import { readRunnerLockConflictMarker, type RunnerLockConflictMarker } from "./runnerLockConflict";
 import {
   readResidentConnectedMarker,
   type ResidentConnectionEvidence,
@@ -21,6 +23,8 @@ export interface RunnerMachineFacts {
   readonly alive: boolean;
   readonly versionEvidence: ProcessVersionEvidence | null;
   readonly connectionEvidence: ResidentConnectionEvidence | null;
+  /** The machine-lock conflict the service last resolved for this runner, if any. */
+  readonly lockConflict?: RunnerLockConflictMarker | null;
 }
 
 /**
@@ -42,6 +46,7 @@ export interface CollectMachineFactsOptions {
   isAlive?: typeof isProcessAlive;
   readVersionEvidence?: typeof readProcessVersionEvidence;
   readConnectionEvidence?: typeof readResidentConnectedMarker;
+  readLockConflict?: typeof readRunnerLockConflictMarker;
 }
 
 async function readRunnerProcess(
@@ -70,6 +75,7 @@ export async function collectMachineFacts(
   const isAlive = options.isAlive ?? isProcessAlive;
   const readVersionEvidence = options.readVersionEvidence ?? readProcessVersionEvidence;
   const readConnectionEvidence = options.readConnectionEvidence ?? readResidentConnectedMarker;
+  const readLockConflict = options.readLockConflict ?? readRunnerLockConflictMarker;
 
   const runners = await Promise.all(runnerServerIds.map(async (serverId): Promise<RunnerMachineFacts> => {
     const [processFacts, versionEvidence] = await Promise.all([
@@ -81,6 +87,7 @@ export async function collectMachineFacts(
       ...processFacts,
       versionEvidence,
       connectionEvidence: readConnectionEvidence(serverConnectedMarkerPath(slockHome, serverId)),
+      lockConflict: readLockConflict(serverRunnerLockConflictPath(slockHome, serverId)),
     };
   }));
 

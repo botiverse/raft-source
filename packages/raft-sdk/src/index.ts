@@ -54,12 +54,20 @@ export type {
   RaftEventsReceiveResult,
 } from "./events";
 export type {
+  RaftAssistantOf,
   RaftContextAgent,
   RaftContextData,
   RaftContextError,
   RaftContextResult,
   RaftContextServer,
 } from "./context";
+export type {
+  RaftAssistantOwnerActions,
+  RaftOwnerAction,
+  RaftOwnerActionList,
+  RaftOwnerActionReport,
+  RaftOwnerActionRunResult,
+} from "./assistantOwnerActions";
 export type {
   RaftActionPrepared,
   RaftActionPrepareRequest,

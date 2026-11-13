@@ -5,6 +5,10 @@ describe("announcement presentation", () => {
     const input = { label: "New", cta: { label: "Create", href: "/?dialog=create-joint-channel" }, image: { assetId: "00000000-0000-0000-0000-000000000001", alt: "Channel diagram" } };
     expect(validateAnnouncementPresentation(input)).toEqual(input);
   });
+  it("preserves the sidebar style and rejects unrecognized modes", () => {
+    expect(validateAnnouncementPresentation({ displayMode: "sidebar" })).toEqual({ displayMode: "sidebar" });
+    expect(() => validateAnnouncementPresentation({ displayMode: "toast" })).toThrow();
+  });
   it("accepts old content with no extra presentation", () => {
     expect(validateAnnouncementPresentation({ title: "Old", pages: [{ body: "Old" }] })).toEqual({});
   });

@@ -1,0 +1,51 @@
+{
+  "formatVersion": 1,
+  "id": "R1-inferred-counted",
+  "rule": "R1",
+  "title": "Without `outcome` (older server): a count above 0 is counted",
+  "why": "Older servers do not send `outcome`; clients keep the inference they used before it (a count wins over the mark, as on the server).",
+  "status": "agreed",
+  "sources": {
+    "web": [
+      "packages/shared/src/readStateContract.ts (resolveMarkUnreadOutcome)",
+      "packages/web/src/store/inboxStore.ts (markScopeUnread)",
+      "packages/web/src/store/messageStore.ts (markUnread)"
+    ],
+    "app": [
+      "compose/shared/src/commonMain/kotlin/build/raft/app/data/MarkUnreadOutcome.kt"
+    ],
+    "server": [
+      "packages/shared/src/readStateContract.ts (markConversationUnreadResponseSchema)",
+      "packages/server/src/routes/channels.ts (POST /channels/:id/unread)"
+    ]
+  },
+  "given": {
+    "conversation": {
+      "id": "thread-1",
+      "kind": "thread"
+    }
+  },
+  "steps": [
+    {
+      "act": "markUnread",
+      "surface": "activityRow"
+    },
+    {
+      "act": "serverResponds",
+      "status": 200,
+      "from": "olderServer",
+      "body": {
+        "ok": true,
+        "unreadCount": 3,
+        "maxReadSeq": 40,
+        "readStateVersion": 7,
+        "markedUnread": false
+      }
+    }
+  ],
+  "expect": {
+    "state": {
+      "outcome": "counted"
+    }
+  }
+}

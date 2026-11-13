@@ -470,6 +470,43 @@ export async function recordMentionDeliveryIdentityDriftForIdentity(input: {
 }
 
 /**
+ * A daemon's terminal receipt for an occurrence the server already ended at a
+ * stage receipt (IDENTITY_DRIFT: the server's launch or session moved between
+ * its decision and the daemon's `daemon_received`). That stage terminal sent
+ * nothing, so when the daemon then refuses the message (daemons before #13027:
+ * UNSUPPORTED_DELIVERY_PATH), this receipt is the only evidence it was not
+ * delivered (Bencher, v1.21.54 bench: 1 of 3 lost). Claims the row once, moving
+ * its decision to `terminal_receipt` with the daemon's code, so the caller
+ * redelivers it once; a repeated receipt finds it claimed and gets null.
+ */
+export async function claimStageDriftForDaemonTerminal(input: {
+  occurrenceId: string;
+  agentId: string;
+  messageId: string;
+  identity: MentionDeliveryIdentity;
+  code: MentionDeliveryTerminalErrorCode;
+}): Promise<MentionDeliveryOccurrenceRow | null> {
+  const now = currentDate();
+  const [updated] = await getDb().update(mentionDeliveryOccurrences).set({
+    terminalDecision: { layer: "server", stage: "terminal_receipt", originalDaemonCode: input.code },
+    version: sql`${mentionDeliveryOccurrences.version} + 1`,
+    updatedAt: now,
+  }).where(and(
+    eq(mentionDeliveryOccurrences.occurrenceId, input.occurrenceId),
+    eq(mentionDeliveryOccurrences.agentId, input.agentId),
+    eq(mentionDeliveryOccurrences.messageId, input.messageId),
+    eq(mentionDeliveryOccurrences.machineIdSnapshot, input.identity.machineId),
+    eq(mentionDeliveryOccurrences.launchIdSnapshot, input.identity.launchId),
+    eq(mentionDeliveryOccurrences.sessionIdSnapshot, input.identity.sessionId),
+    isNull(mentionDeliveryOccurrences.ackedAt),
+    eq(mentionDeliveryOccurrences.state, "terminal_error"),
+    eq(mentionDeliveryOccurrences.terminalErrorCode, "IDENTITY_DRIFT"),
+    sql`${mentionDeliveryOccurrences.terminalDecision}->>'stage' = 'stage_receipt'`,
+  )).returning();
+  return updated ?? null;
+}
+
+/**
  * ONE-SHOT CLAIM, DESPITE THE NAME. The where-clause below pins `redriveCount = 0`, so the column
  * can only ever hold 0 or 1 — it is a latch, not a counter (@Hipp, review of #6700). Anyone who
  * sums it, averages it, or plots its distribution will get a bounded number and no warning.

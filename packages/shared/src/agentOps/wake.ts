@@ -29,6 +29,11 @@ export interface RaftNoticeTarget {
   pendingCount: number;
   firstPendingMsgId: string | null;
   latestMsgId: string | null;
+  /**
+   * Seq of the latest pending message, a decimal string; null on older Servers
+   * and for app events. Pass `channelId:latestSeq` as `/events` `wait_for`.
+   */
+  latestSeq: string | null;
   latestSenderName: string | null;
   latestSenderType: "human" | "agent" | "system" | "third_party_app" | null;
   flags: RaftNoticeFlag[];
@@ -118,6 +123,7 @@ function parseNotice(value: unknown, deliveryId: string | null): RaftInboxNotice
       pendingCount: typeof t.pendingCount === "number" ? t.pendingCount : 0,
       firstPendingMsgId: typeof t.firstPendingMsgId === "string" ? t.firstPendingMsgId : null,
       latestMsgId: typeof t.latestMsgId === "string" ? t.latestMsgId : null,
+      latestSeq: typeof t.latestSeq === "string" && /^[0-9]+$/.test(t.latestSeq) ? t.latestSeq : null,
       latestSenderName: typeof t.latestSenderName === "string" ? t.latestSenderName : null,
       latestSenderType: typeof t.latestSenderType === "string" && SENDER_TYPES.has(t.latestSenderType)
         ? t.latestSenderType as RaftNoticeTarget["latestSenderType"]

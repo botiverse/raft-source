@@ -1,16 +1,19 @@
 import type { AttachmentPreviewResponse } from "@botiverse/raft-shared";
 import { and, eq, lt } from "drizzle-orm";
 import { getDb } from "../../db";
-import { attachmentPreviewCache, type attachments } from "../../db/schema";
+import { attachmentPreviewCache } from "../../db/schema";
 import { buildAttachmentPreviewResponse, getAttachmentPreviewProvider, type AttachmentPreviewBuildTimings } from "./registry";
+import type { ResolvedAttachment } from "../attachmentRecord";
 
-type Attachment = typeof attachments.$inferSelect;
+type Attachment = ResolvedAttachment;
 
 /**
  * Bump when any provider's output shape or limits change, so cached rows built
  * by an older server are recomputed instead of served.
  */
-export const ATTACHMENT_PREVIEW_CACHE_VERSION = 1;
+// 2: markdown limit 64 KB payload -> 512 KB line-cut prefix (task #164), so
+// rows that pinned "too_large" for a mid-size markdown file are rebuilt.
+export const ATTACHMENT_PREVIEW_CACHE_VERSION = 2;
 /** Previews whose parse (not download) took at least this long are cached whatever their kind. */
 export const ATTACHMENT_PREVIEW_CACHE_MIN_COMPUTE_MS = 200;
 /** Parsing these is CPU-heavy (zip inflate + SheetJS), so they are always cached. */

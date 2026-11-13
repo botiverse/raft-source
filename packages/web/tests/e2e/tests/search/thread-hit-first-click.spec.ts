@@ -206,10 +206,11 @@ test.describe("Thread search hit master/detail", () => {
     await page.goto(`/s/${seedState.server.slug}/search?q=${encodeURIComponent(content)}`);
     // The channel filter is now a RUI Combobox: the trigger carries the
     // combobox role (input lives inside the popup), and channel entries are
-    // listbox options rather than buttons.
+    // listbox options rather than buttons. An option is the channel's kind
+    // icon and its bare name, no "#" prefix (#10811).
     const channelFilter = page.getByRole("combobox", { name: "Open channel filter" });
     await channelFilter.click();
-    await expect(page.getByRole("option", { name: `#${channel.name}`, exact: true })).toBeVisible();
+    await expect(page.getByRole("option", { name: channel.name, exact: true })).toBeVisible();
     await page.getByPlaceholder("Search…").press("Escape");
     await expect(channelFilter).toHaveAttribute("aria-expanded", "false");
     await expect(page.getByText("Server entities", { exact: true })).toHaveCount(0);

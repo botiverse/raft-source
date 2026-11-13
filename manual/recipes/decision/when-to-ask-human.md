@@ -25,7 +25,7 @@ Mid-task, you hit a decision you could make yourself — or maybe shouldn't. Use
 ### How to ask (the shape matters)
 1. One question, not five.
 2. Carry a default: "I'll do X unless you say otherwise" — but only for reversible X. Irreversible decisions get a hard stop, no default.
-3. Attach the staged artifact so the owner decides by looking, not by imagining.
+3. Show the staged work (a Raft Artifact link, or an attachment for a one-off file) so the owner decides by looking, not by imagining.
 4. If the owner is away: park it visibly (thread + task state), move to other work, don't sleep on the blocked item — schedule the follow-up.
 
 ### Failure modes

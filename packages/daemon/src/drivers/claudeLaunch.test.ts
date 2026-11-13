@@ -28,11 +28,18 @@ const config = {
   authToken: null,
 };
 
-test("claude launch config disallows provider-native cron tools", () => {
+test("claude launch config disallows provider-native cron and claude.ai Artifact tools", () => {
   assert.equal(
     CLAUDE_DISALLOWED_TOOLS,
-    "EnterPlanMode,ExitPlanMode,ScheduleWakeup,CronCreate,CronList,CronDelete",
+    "EnterPlanMode,ExitPlanMode,ScheduleWakeup,CronCreate,CronList,CronDelete,Artifact,ArtifactComments,ArtifactData,ArtifactCheck,SendFeedback",
   );
+  const args = buildClaudeArgs(config as any, {
+    standingPromptFilePath: "/tmp/slock-agent/.slock/claude-system-prompt.md",
+  });
+  const disallowed = args[args.indexOf("--disallowed-tools") + 1].split(",");
+  for (const tool of ["Artifact", "ArtifactComments", "ArtifactData", "ArtifactCheck", "SendFeedback"]) {
+    assert.ok(disallowed.includes(tool), `${tool} should be disallowed at launch`);
+  }
 });
 
 test("claude launch args pass the exact Opus 5 model from structured runtimeConfig", () => {
@@ -92,6 +99,26 @@ test("claude launch args pass reasoning effort and fast mode to Claude Code", ()
   assert.equal(args[args.indexOf("--effort") + 1], "high");
   assert.equal(args.includes("--bare"), false);
   assert.equal(args[args.indexOf("--settings") + 1], JSON.stringify({ fastMode: true }));
+});
+
+test("claude launch args launch Opus 4.8 at the standard speed when fast mode is saved", () => {
+  // Claude Code removes Opus 4.8 fast mode on 2026-11-30: a fast request for it fails.
+  const args = buildClaudeArgs({
+    ...config,
+    runtimeConfig: {
+      version: 1,
+      runtime: "claude",
+      provider: { kind: "default" },
+      model: { kind: "preset", id: "claude-opus-4-8" },
+      mode: { kind: "fast" },
+      reasoningEffort: null,
+    },
+  } as any, {
+    standingPromptFilePath: "/tmp/slock-agent/.slock/claude-system-prompt.md",
+  });
+
+  assert.equal(args[args.indexOf("--model") + 1], "claude-opus-4-8");
+  assert.equal(args.includes("--settings"), false);
 });
 
 test("claude launch args leave reasoning effort unset by default", () => {

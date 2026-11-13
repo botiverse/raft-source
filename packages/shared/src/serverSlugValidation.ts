@@ -5,6 +5,9 @@
  */
 export const SERVER_SLUG_MIN_LENGTH = 5;
 
+/** Most characters a server name may have (trimmed), on create and on rename. */
+export const SERVER_NAME_MAX_LENGTH = 100;
+
 const SERVER_SLUG_PATTERN = /^[a-z][a-z0-9-]*$/;
 
 export type ServerSlugReferenceValidationReason =

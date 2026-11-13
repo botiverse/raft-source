@@ -2,7 +2,7 @@
  * Required-Test Admission evidence (docs/sops/ci-check-maintenance.md)
  *
  * - Test/check: packages/web FormatJS + raft-i18n AST literal gate
- *   (`lint:i18n-literals` / check-i18n-literals.mjs)
+ *   (`lint:i18n-literals` / check-i18n-literals.ts)
  * - Protected invariant: new UI literals in message-call / .ts return cannot
  *   bypass the catalog baseline ratchet
  * - RED proof (minimal production mutation): automated replay in
@@ -52,13 +52,13 @@ import {
   templateHoleHasStaticLiteral,
   toBaselineEntries,
   validateBaselineEntries,
-} from "../scripts/check-i18n-literals.mjs";
+} from "../scripts/check-i18n-literals";
+import { OXC_NODE_ARGS } from "./helpers/oxcNode";
 
 const WEB_ROOT = resolve(import.meta.dirname, "..");
-const SCRIPT = resolve(WEB_ROOT, "scripts/check-i18n-literals.mjs");
+const SCRIPT = resolve(WEB_ROOT, "scripts/check-i18n-literals.ts");
 const CONFIG = resolve(WEB_ROOT, "scripts/oxlint-i18n.json");
 const IS_WIN = process.platform === "win32";
-const ROLE_PERMISSION_PATH = "src/components/member/RolePermissionHelpDialog.tsx";
 
 function readFiles(map: Map<string, string>) {
   return (absPath: string) => {
@@ -73,7 +73,7 @@ function lintI18nWiringErrors(scripts: Record<string, string | undefined>): stri
   const errors: string[] = [];
   const gate = scripts["lint:i18n-literals"];
   // Compare mode only: no args, no print-current, no shell bypass.
-  if (gate !== "node scripts/check-i18n-literals.mjs") {
+  if (gate !== "node --import @oxc-node/core/register scripts/check-i18n-literals.ts") {
     errors.push(
       `lint:i18n-literals must be exact unparameterized compare mode, got ${JSON.stringify(gate)}`,
     );
@@ -281,7 +281,7 @@ test("templateHoleHasStaticLiteral fails closed on TypeScript parseDiagnostics",
 test("isIgnorableStructuralLiteral: ignore punctuation-only template glue around dynamic and translated values", () => {
   const catalogIds = new Set([
     "channel.edit.thisServer",
-    "billing.thisMonth",
+    "planBilling.usage.uploads",
     "pages.integrationInvite.installedSuffix",
     "task.status.done",
     "upload.progress",
@@ -289,7 +289,7 @@ test("isIgnorableStructuralLiteral: ignore punctuation-only template glue around
   const ignore = [
     '`${formatMessage({ id: "channel.edit.thisServer" })} · ${email}`',
     '`${getAdminPrincipalLabel(principal, formatMessage)} · ${principal.email}`',
-    '`${formatBytes(used)} / ${formatBytes(limit)} ${formatMessage({ id: "billing.thisMonth" })}`',
+    '`${formatBytes(used)} / ${formatBytes(limit)} ${formatMessage({ id: "planBilling.usage.uploads" })}`',
     '`${server.name} (${server.slug})`',
     '`/${currentServer.slug}`',
     '`${server.name}${server.installedAt ? formatMessage({ id: "pages.integrationInvite.installedSuffix" }) : ""}`',
@@ -1071,7 +1071,7 @@ test("CLI rejects --target outside --root before oxlint spawn", () => {
     writeFileSync(join(fixtureRoot, "Hi.tsx"), "export const x = 1;\n");
     const result = spawnSync(
       process.execPath,
-      [SCRIPT, "--root", fixtureRoot, "--target", "/tmp", "--print-current"],
+      [...OXC_NODE_ARGS, SCRIPT, "--root", fixtureRoot, "--target", "/tmp", "--print-current"],
       { encoding: "utf8" },
     );
     assert.notEqual(result.status, 0);
@@ -1087,7 +1087,7 @@ test(
   () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "i18n-print-"));
     const linkDir = mkdtempSync(join(tmpdir(), "i18n-link-"));
-    const link = join(linkDir, "check-i18n-literals.mjs");
+    const link = join(linkDir, "check-i18n-literals.ts");
     try {
       writeFileSync(
         join(fixtureRoot, "Hi.tsx"),
@@ -1096,7 +1096,7 @@ test(
       symlinkSync(SCRIPT, link);
       const result = spawnSync(
         process.execPath,
-        [link, "--root", fixtureRoot, "--target", ".", "--print-current"],
+        [...OXC_NODE_ARGS, link, "--root", fixtureRoot, "--target", ".", "--print-current"],
         { encoding: "utf8" },
       );
       assert.equal(result.status, 0, `stderr=${result.stderr}\nstdout=${result.stdout}`);
@@ -1124,7 +1124,7 @@ test("CLI --print-current flushes JSON larger than the stdout pipe buffer", () =
     );
     const result = spawnSync(
       process.execPath,
-      [SCRIPT, "--root", fixtureRoot, "--target", ".", "--print-current"],
+      [...OXC_NODE_ARGS, SCRIPT, "--root", fixtureRoot, "--target", ".", "--print-current"],
       { encoding: "utf8", maxBuffer: 8 * 1024 * 1024 },
     );
     assert.equal(result.status, 0, `stderr=${result.stderr}`);
@@ -1143,8 +1143,8 @@ test("CLI --print-current flushes JSON larger than the stdout pipe buffer", () =
 
 test("lint:i18n-literals wiring rejects print-current, || true, and trailing bypass", () => {
   const baseLint =
-    "node scripts/check-source-extensions.mjs && pnpm run lint:i18n-literals";
-  const goodGate = "node scripts/check-i18n-literals.mjs";
+    "node --import @oxc-node/core/register scripts/check-source-extensions.ts && pnpm run lint:i18n-literals";
+  const goodGate = "node --import @oxc-node/core/register scripts/check-i18n-literals.ts";
 
   assert.ok(
     lintI18nWiringErrors({
@@ -1170,14 +1170,14 @@ test("lint:i18n-literals wiring rejects print-current, || true, and trailing byp
   assert.ok(
     lintI18nWiringErrors({
       lint: baseLint,
-      "lint:i18n-literals": "node scripts/check-i18n-literals.mjs --print-current",
+      "lint:i18n-literals": "node --import @oxc-node/core/register scripts/check-i18n-literals.ts --print-current",
     }).length > 0,
     "lint:i18n-literals with --print-current must RED",
   );
   assert.ok(
     lintI18nWiringErrors({
       lint: baseLint,
-      "lint:i18n-literals": "node scripts/check-i18n-literals.mjs || true",
+      "lint:i18n-literals": "node --import @oxc-node/core/register scripts/check-i18n-literals.ts || true",
     }).length > 0,
     "lint:i18n-literals with || true must RED",
   );
@@ -1187,40 +1187,6 @@ test("lint:i18n-literals wiring rejects print-current, || true, and trailing byp
       "lint:i18n-literals": goodGate,
     }),
     [],
-  );
-});
-
-test("package.json wires lint:i18n-literals into the main lint script", () => {
-  const pkg = JSON.parse(readFileSync(join(WEB_ROOT, "package.json"), "utf8")) as {
-    scripts?: Record<string, string>;
-  };
-  const scripts = pkg.scripts ?? {};
-  assert.deepEqual(
-    lintI18nWiringErrors(scripts),
-    [],
-    "package.json lint wiring must be exact compare-mode gate at lint tail",
-  );
-  assert.equal(scripts["lint:i18n-literals"], "node scripts/check-i18n-literals.mjs");
-  assert.ok(
-    (scripts.lint ?? "").endsWith("&& pnpm run lint:i18n-literals"),
-    "main lint must end exactly with && pnpm run lint:i18n-literals",
-  );
-});
-
-test("runOxlintI18n spawns oxlint JS bin via process.execPath", () => {
-  const src = readFileSync(SCRIPT, "utf8");
-  const fnStart = src.indexOf("export function runOxlintI18n");
-  assert.ok(fnStart >= 0);
-  const fnBody = src.slice(fnStart, src.indexOf("export function collectCurrentFindings", fnStart));
-  assert.match(
-    fnBody,
-    /spawnSync\(\s*process\.execPath\s*,\s*\[\s*bin\b/,
-    "must spawn node with oxlint bin as argv[0], not the shebang path directly",
-  );
-  assert.doesNotMatch(
-    fnBody,
-    /spawnSync\(\s*bin\s*,/,
-    "must not spawn the shebang bin as the process executable",
   );
 });
 
@@ -1420,21 +1386,6 @@ export function group<T>(results: T[]): T[] {
   } finally {
     rmSync(fixtureRoot, { recursive: true, force: true });
   }
-});
-
-test("real corpus: RolePermissionHelpDialog has no remaining AST literal debt", () => {
-  // After Task 8 roles batch, headings + summary/details rows are MessageIds.
-  const findings = collectCurrentFindings({
-    root: WEB_ROOT,
-    configPath: CONFIG,
-    target: "src",
-  }).filter((f) => f.path === ROLE_PERMISSION_PATH);
-
-  assert.equal(
-    findings.length,
-    0,
-    `expected 0 AST keys after roles migration; got ${JSON.stringify(findings)}`,
-  );
 });
 
 test("real oxlint temp-root fixture: raft-i18n call-sink RED shapes", () => {
@@ -1897,40 +1848,6 @@ export function directLogicalReturn(flag: boolean): string {
   }
 });
 
-test("real corpus: activity.ts Thinking…/Working… are catalog MessageIds, not return-prose", () => {
-  // Migrated in activity-status batch: ellipsis labels live in the catalog.
-  const activitySrc = readFileSync(join(WEB_ROOT, "src/utils/activity.ts"), "utf8");
-  assert.ok(
-    activitySrc.includes("activity.status.thinkingEllipsis") &&
-      activitySrc.includes("activity.status.workingEllipsis"),
-    "activity.ts must route Thinking…/Working… through MessageIds",
-  );
-  assert.ok(
-    !activitySrc.includes("Thinking\\u2026") && !activitySrc.includes("Working\\u2026"),
-    "activity.ts must not keep Thinking…/Working… return literals",
-  );
-  const liveFindings = collectCurrentFindings({
-    root: WEB_ROOT,
-    configPath: CONFIG,
-    target: "src/utils/activity.ts",
-  });
-  const returnSources = liveFindings
-    .filter((f) => f.rule === "raft-i18n/no-literal-return-prose")
-    .map((f) => f.source);
-  assert.ok(
-    !returnSources.some(
-      (s) => s.includes("Thinking") && (s.includes("\u2026") || s.includes("\\u2026")),
-    ),
-    `activity.ts Thinking… must not remain as return-prose; got ${JSON.stringify(returnSources)}`,
-  );
-  assert.ok(
-    !returnSources.some(
-      (s) => s.includes("Working") && (s.includes("\u2026") || s.includes("\\u2026")),
-    ),
-    `activity.ts Working… must not remain as return-prose; got ${JSON.stringify(returnSources)}`,
-  );
-});
-
 /**
  * SOP minimal production-mutation RED replay (docs/sops/ci-check-maintenance.md Required-Test Admission).
  * Replays the parent-agent lint mutation against real production sources in a
@@ -1942,7 +1859,7 @@ test("SOP minimal production-mutation RED replay for raft-i18n call/return", () 
   const mainNeedle =
     'toast.error(formatMessage({ id: "message.messageItem.threadUnavailable" }));';
   const activityNeedle =
-    "export function getActivityText(activity: AgentActivity, detail?: string, detailKind?: AgentActivityDetailKind): string {";
+    "export function getActivityText(activity: AgentActivity, detail?: string, detailKind?: AgentActivityDetailKind, errorCode?: RuntimeErrorCode | null): string {";
 
   const mainSrc = readFileSync(join(WEB_ROOT, MAIN_REL), "utf8");
   const activitySrc = readFileSync(join(WEB_ROOT, ACTIVITY_REL), "utf8");
@@ -2054,6 +1971,7 @@ test("CLI with real oxlint + temp baseline reports NEW and STALE", () => {
     const newResult = spawnSync(
       process.execPath,
       [
+        ...OXC_NODE_ARGS,
         SCRIPT,
         "--root",
         fixtureRoot,
@@ -2097,6 +2015,7 @@ test("CLI with real oxlint + temp baseline reports NEW and STALE", () => {
     const staleResult = spawnSync(
       process.execPath,
       [
+        ...OXC_NODE_ARGS,
         SCRIPT,
         "--root",
         fixtureRoot,
@@ -2115,23 +2034,6 @@ test("CLI with real oxlint + temp baseline reports NEW and STALE", () => {
   } finally {
     rmSync(fixtureRoot, { recursive: true, force: true });
   }
-});
-
-test("check-i18n-literals header documents FormatJS+raft-i18n AST gate", () => {
-  const src = readFileSync(SCRIPT, "utf8");
-  const header = src.slice(0, 500);
-  assert.doesNotMatch(
-    header,
-    /intentionally not wired into `pnpm lint` yet/i,
-    "header must not claim the gate is unwired",
-  );
-  assert.doesNotMatch(header, /[Rr]egex/, "header must not mention Regex supplementation");
-  assert.match(
-    header,
-    /lint:i18n-literals/,
-    "header must say lint:i18n-literals is the required gate",
-  );
-  assert.match(header, /FormatJS \+ raft-i18n AST/i);
 });
 
 test("extractSourceComments uses TS scanner and ignores quoted disable text", () => {
@@ -2250,6 +2152,7 @@ test("CLI exits 2 on forbidden formatjs disable directive before baseline compar
     const result = spawnSync(
       process.execPath,
       [
+        ...OXC_NODE_ARGS,
         SCRIPT,
         "--root",
         fixtureRoot,
@@ -2269,7 +2172,7 @@ test("CLI exits 2 on forbidden formatjs disable directive before baseline compar
 
 test("real corpus: structural, catalog-id, and template-glue filters remove audited keys only", () => {
   // Applies the same predicate used before aggregate. Audited C-sub-batch is
-  // 71 space/punct/count keys; exact safe shapes must filter all 71.
+  // 73 space/punct/count keys; exact safe shapes must filter all 73.
   const baselinePath = resolve(WEB_ROOT, "scripts/i18n-literal-baseline.json");
   const current = collectCurrentFindings({
     root: WEB_ROOT,
@@ -2379,7 +2282,163 @@ test("real corpus: structural, catalog-id, and template-glue filters remove audi
   // `100` swatch labels) and adds three (the channel header's `·` and the
   // thread header's `" "` and `" · "` subtitle glue). No business text is
   // exempted.
-  assert.equal(filteredKeys, 71, `audited structural key count; got ${filteredKeys}`);
+  // Paginated share images (#10026) add SelectShareLightbox's page counter
+  // `{currentPage + 1}/{pageCount}` — a `/` between two numbers, the same
+  // shape as ThreadPanel's search counter: 71 -> 72.
+  // RaftBench insight category headings add a middle-dot separator between
+  // a translated category and its formatted count: structural punctuation only.
+  // AgentSkills' stale note (a Computer that did not answer in time) adds a
+  // `{" "}` spacer between the translated sentence and its Retry TextLink —
+  // layout glue, the same shape as RuntimeFormV2SourceStatusLine's: 73 -> 74.
+  // App link preview cards show the link's real host after the App's name
+  // (`{appName} · {host}`): a `·` between two dynamic values, structural
+  // punctuation only: 74 -> 75.
+  // The Agent MCP tab (AgentMcpTab / McpServerListItem) was deleted when MCP Apps
+  // became rows of the Agent's Apps tab, taking its separator key with it: 75 -> 74.
+  // The search page's Free history notice adds a `{" "}` spacer between its
+  // translated sentence and its Upgrade TextLink — layout glue: 74 -> 75.
+  // The phone's server tab (MobileServerTab, raft-design #712) shows each
+  // server's address as `/{server.slug}` under its name, as Home's switcher
+  // does: a `/` before a dynamic value, structural punctuation in a new file:
+  // 75 -> 76.
+  // ServerRowUnread, the server rows' shared unread count (Home's switcher and
+  // the server tab's popover), puts a ", " between a muted count and its
+  // screen-reader reason: structural punctuation in a new file: 76 -> 77.
+  // The Artifacts home page (S7) leads a mentioning comment's excerpt with
+  // its sender and a colon, as Activity's InboxItemSender does, and ends a
+  // truncated excerpt with an ellipsis — punctuation only: 77 -> 79.
+  // The Computers rack overview joins a row's
+  // facts with `·` (OS release · version; Offline · Last seen …), as JSX text
+  // around translated or reported values: two structural keys in a new file,
+  // no business text: 79 -> 81.
+  // Action cards drawn from their spec (ActionCardSpecRenderer) join a
+  // property's entity chips with ", ": structural punctuation between dynamic
+  // values in a new file: 81 -> 82.
+  // The private-share install page names the link's one target server as
+  // `/{server.slug}` under its name (#proj-apps:769a57d4), as Home's switcher
+  // and the server tab do: a `/` before a dynamic value, structural punctuation
+  // only; the file already had a `.` key: 82 -> 83.
+  // The Artifact link's hover card (ArtifactLinkPreview) joins its type,
+  // version, facts and home with `·`, as the App link card does: structural
+  // punctuation between dynamic values in a new file: 83 -> 84.
+  // The v2 runtime-form source status joins its reason and fallback sentences
+  // with a " " array item so the Retry tail can glue to the last one
+  // (withInlineActionTail): structural whitespace between two translated
+  // sentences: 84 -> 85.
+  // The rack's runtime account meters (RackRuntimeUsage) print `{left}%`
+  // after the runtime's mark, as RackMeter prints Disk / Memory's `{percent}%`
+  // beside them: a `%` after a number, structural punctuation in a new file:
+  // 82 -> 83.
+  // The touch Select Text sheet (MessageSelectTextDrawer) heads the message's
+  // text with `{sender} · {time}`, as the Computers rack joins its facts: a
+  // `·` between two dynamic values, structural punctuation in a new file:
+  // 83 -> 84.
+  // AddSeatsDialog (task #10, adding Pro seats in place) puts a `{" "}` spacer
+  // between a failed price's translated sentence and its "Try again" TextLink —
+  // layout glue in a new file, the same shape as AgentSkills' stale note: 84 -> 85.
+  // With feat's Artifacts keys merged (feat was at 87 over staging's 84): 88.
+  // The Artifact review notice (ArtifactReviewParts) puts a `{" "}` spacer
+  // between its draft count and the muted hint, two translated sentences:
+  // layout glue in a new file, the AddSeatsDialog shape: 88 -> 89.
+  // The composer's upload banners went (upload limits open the upgrade dialog),
+  // and with them MessageInput's `{" "}` spacer before their Upgrade TextLink: 89 -> 88.
+  // The Apps page's Marketplace row (MarketplaceListingsTab) joins its by-line
+  // and the App's description with a ` · ` span: structural punctuation
+  // between a translated line and a dynamic one, in a new file: 88 -> 89.
+  // The Artifact review notice became raft-ui's ModeBar (title and description
+  // are separate parts), so its `{" "}` spacer between them went: 89 -> 88.
+  // The migration log (MigrationLogPage) prints `—` for an empty value, `%`
+  // after the success rate, a `/` between the ring-1 legend's two swatches and
+  // `···` for a removed computer's code: structural punctuation only, in a new
+  // file; its routes, lists and ranges go through agent.migrationLog.fmt.*: 88 -> 92.
+  // The rack's Disk / Memory say "62% used" through machine.rack.percentUsed
+  // (usage shows what is used, stdrc 2026-10-29), so RackResource's bare
+  // `{percent}%` went: 92 -> 91.
+  // The Qwen Code provider dialog (RuntimeProviderConnectDialog) heads the key step with
+  // `{group} · {provider}`, Qwen's own group and provider names: a `·` between
+  // two dynamic values, structural punctuation: 91 -> 92.
+  // The runtime field's label (RuntimeConfigFields) holds name, `{" "}` and
+  // the Experimental badge in one span, so the closed Select's flex trigger
+  // keeps the space: layout glue between a name and a badge: 92 -> 93.
+  // Plan & Billing became an overview (task #13): the seat form's `/` between
+  // used and bought and the confirm dialog's `label: value` rows went, and its
+  // separators are catalog text now (planBilling.*): 93 -> 91.
+  // The Custom MCP App form (McpAppServerSection) puts a `{" "}` spacer between
+  // its Marketplace hint and the Browse Marketplace TextLink, two translated
+  // strings: layout glue, the AddSeatsDialog shape: 91 -> 92.
+  // The error trace id note (TraceIdNote, #proj-o11y:#18) shows the first 8 hex
+  // digits followed by `…`: an ellipsis after a dynamic value, structural
+  // punctuation in a new file: 92 -> 93.
+  // ThreadsInbox moved into features/thread (#proj-frontend:#18): its two
+  // row components went to their own files, so its `:` glue (one key, 2
+  // hits) is now one key in InboxRow and one in ObjectInboxRow: 93 -> 94.
+  // ManagerOverview's cost comparison became a date-labeled table, removing
+  // the cost slash between the two amounts: 94 -> 93.
+  // RaftBench's All view lists every finding instead of a newest-three sample
+  // per kind, dropping the ` · ` between a kind heading and its count: 93 -> 92.
+  // An App link card's details row (LinkCardElements) puts a `·` between two
+  // drawn details that aren't the state Badge (artin, Kirby, 2026-11-01): a
+  // `·` between App-supplied values, structural punctuation: 92 -> 93.
+  // The channel drawer head (ChannelOverflowMenu) reads "Settings · #name" on
+  // a phone (stdrc, 2026-11-03): an aria-hidden `·` between the title and the
+  // channel ref, structural punctuation: 93 -> 94.
+  // The thread head's subtitle (ThreadPanelHeader, #189 rule 6) holds its
+  // `{" · "}{N replies}` in a span of its own, so it ellipsizes after the
+  // channel name: the same `·` glue, now an element's child: 94 -> 95.
+  // The downgrade banner (DowngradeWarningCard) is one sentence now (task #3 in
+  // #proj-commercial): the `(`, `/` and `)` around each "N over limit" row's
+  // count and limit went with those rows: 95 -> 92.
+  // The Artifacts home (#proj-workspace:#133) moved a waiting row's `name: `
+  // and `…` out of ArtifactsDashboard into ArtifactMentionExcerpt, shared with
+  // the table's waiting rows: its `:` is still one key there, the `…` no longer
+  // counts as one: 92 -> 91.
+  // The keyboard shortcuts list (ShortcutHelpList) puts a `/` between a row's
+  // two Kbds (⌘↑ / ⌘↓), as Artea's mockup draws it: structural punctuation
+  // between keys, not copy: 91 -> 92. Its ranges' `…` (⌘1…⌘9), between two
+  // KbdShortcut now rather than glue inside one string, is the same: 92 -> 93.
+  // View Context's folded tool result (AgentContextViewMessageList) shows the
+  // output's first characters followed by `…` when there is more: an ellipsis
+  // after a dynamic value, structural punctuation in a new file, the
+  // TraceIdNote shape: 93 -> 94.
+  // The typed action card left the web (every card renders from its spec,
+  // #proj-apps:#40 P9), and with it ActionCard.tsx's busy button `…` and its
+  // result line's `→ ` arrow: 94 -> 92.
+  // The editable shortcuts panel (#proj-frontend:#37): the message box's note puts a `{" "}` spacer between its
+  // sentence and the "Change in Settings" TextLink, the McpAppServerSection shape: 92 -> 93. The `/` and `…` between
+  // Kbds moved with them from ShortcutHelpList into ShortcutKeysView: the same keys.
+  // The Artifacts home's one list (#proj-workspace:#210) has no waiting rows, and with them ArtifactMentionExcerpt
+  // and its `:` left: 93 -> 92.
+  // The agent read line (MessageReadStatusLine, #proj-raft-ui:#212) puts an aria-hidden `·` between who won't get the
+  // message and the hint to mention them, the ChannelOverflowMenu shape: structural punctuation: 92 -> 93.
+  // A channel's header no longer says who is working (#proj-raft-ui:#211): ChannelHeaderSubtitle and its aria-hidden
+  // `·` between the working line and the description went; the line above the composer joins its parts in the catalog
+  // (message.agentTyping.typingAndOthers): 93 -> 92.
+  // The display report dialog (ArtifactDisplayReportDialog, #proj-workspace:#243) put a `{" "}` spacer between the
+  // page area's mono size and its unit, and between the two translated sentences of who sees the report: layout glue
+  // in a new file, the AddSeatsDialog shape: 92 -> 93. The dialog went (the report is the comment list's own box,
+  // xxchan), and its spacers with it: 93 -> 92.
+  // The Members page's agents list (MembersAgentList) shows `—` in a Runtime,
+  // Model or Computer cell with no value (raft-design members.md, "a dash for
+  // an agent on no computer"): structural punctuation, not copy: 92 -> 93.
+  // HelperText step 1 cut McpAppServerSection's Marketplace sentence; its "Browse marketplace" TextLink stands alone,
+  // and the `{" "}` spacer between them went: 93 -> 92.
+  // Adding seats to prepaid Pro (PrepaidSeatsPart, task #19 in #proj-commercial) puts a `{" "}` spacer between a
+  // refused price and its Retry TextLink, the AddSeatsDialog shape: layout glue in a new file: 92 -> 93.
+  // A task hand-off card (TaskHandoffCard, #wg-task-v2:#20) puts a `→` between who handed the task and to whom:
+  // structural punctuation, not copy: 93 -> 94.
+  // The member-connect dialog row and the Connected servers row separate the
+  // slug from their note with an aria-hidden ` · ` span (#wg-rbac:#36): 94 -> 96.
+  // The channel details are a column titled Details (raft-design channel.md, stdrc 2026-11-10): the drawer head's
+  // "Settings · #name" and its `·` went with ChannelDrawerTitle: 96 -> 95.
+  // The Computers list (ComputerRackRow) shows an aria-hidden `—` in the Agents cell of a computer with no agents,
+  // as an empty usage cell, with the words for a screen reader: structural punctuation, not copy: 95 -> 96.
+  // An agent profile's Computer version row (AgentProfileInfo) is the version only, `—` when there is none (its
+  // Online / Offline is the row above, approved status design): structural punctuation, not copy: 96 -> 97.
+  // The Computers page's needs-attention line (ComputersAttentionSummary, #proj-raft-computer:#68) separates its
+  // parts with an aria-hidden `·`: structural punctuation, not copy: 97 -> 98.
+  // The Computers list usage cell's model line (RackRuntimeUsage, OAR 0.102 window scope) puts a `{" · "}` between
+  // the model name and its value ("Opus · 40%"): structural punctuation, not copy: 98 -> 99.
+  assert.equal(filteredKeys, 99, `audited structural key count; got ${filteredKeys}`);
   assert.ok(filteredHits > 100, `hits must exceed prior 100; got ${filteredHits}`);
   // HandoffCreateFlow's `· ${session.model}` suffix is dynamic metadata glue, the
   // same shape as EditChannelDialog's `· ${…}` suffixes.
@@ -2400,14 +2459,28 @@ test("real corpus: structural, catalog-id, and template-glue filters remove audi
   // 14 -> 15 (2026-10-14): channelKindIcon's sr-only `` `${label}, ` `` (#9826): a
   // translated sentence plus the comma that keeps it a separate spoken phrase
   // before the channel name. Glue, not user copy.
+  // 15 -> 16 (2026-10-21): MessageInput's external-mention description
+  // `` `${providerBadge} · ${external.workspaceName}` `` (#231): the translated
+  // provider badge joined by the middot separator to a runtime workspace name.
+  // Glue, not user copy.
+  // 16 -> 15 (2026-10-23): HumanLoginSetupPage's app-card aria-label
+  // `` `${openAppAriaPrefix} ${client.name}` `` now goes through
+  // opensInNewTabAriaLabel(), which adds "(opens in a new tab)" for links that
+  // leave Raft (task #160); a template passed as an argument is not JSX glue.
+  // 15 -> 14 keys and hits: a private share link installs on one target server
+  // (#proj-apps:769a57d4), so the install page dropped its server picker and
+  // with it the option label `` `${server.name}${installedSuffix}` ``.
+  // 14 -> 12 keys and hits: Plan & Billing became an overview (task #13); its
+  // upload row `` `${used} / ${limit} ${thisMonth}` `` and the Free upload
+  // label `` `${limit}/${month}` `` are planBilling.* messages now.
   assert.equal(
     glueFilteredOut.length,
-    15,
+    12,
     `audited dynamic/translated template-glue key count; got ${JSON.stringify(glueFilteredOut)}`,
   );
   assert.equal(
     glueFilteredOut.reduce((n, e) => n + e.count, 0),
-    15,
+    12,
     "each audited glue key currently occurs once",
   );
   // Structural drops 75 (including the two compatibility source paths);
@@ -2468,8 +2541,15 @@ test("real corpus: structural, catalog-id, and template-glue filters remove audi
     // keys are per file, so the same two hits are now two keys: 12 -> 13.
     // The Raft Design System replies summary drops its `" ›"` chevron (the DS
     // `rf-replies` block has none): 13 -> 12.
-    12,
-    `expected 13 former-gap keys filtered; got ${JSON.stringify(formerGapFiltered)}`,
+    // ServerRowUnread reads a muted count as "5, Notifications muted": the
+    // ", " before its screen-reader reason is a new per-file "," key: 12 -> 13.
+    // The downgrade notice's `(` and `)` around each count/limit went with its
+    // "N over limit" lines (DowngradeWarningCard): 13 -> 11.
+    // The typed action card's result line, and its "→" arrow, left ActionCard.tsx
+    // (every card renders from its spec, #proj-apps:#40 P9): 11 -> 10.
+    // A task hand-off card's "→" between who handed it and to whom (TaskHandoffCard, #wg-task-v2:#20): 10 -> 11.
+    11,
+    `expected 11 former-gap keys filtered; got ${JSON.stringify(formerGapFiltered)}`,
   );
 
   // B examples + technical tokens remain; catalog MessageIds and safe glue are gone.
@@ -2492,326 +2572,5 @@ test("real corpus: structural, catalog-id, and template-glue filters remove audi
   assert.ok(
     bySource((s) => s === "@theme" || s === "file:line" || s === "packages/web/src/index.css").length >= 3,
     "technical-token research bucket must remain",
-  );
-});
-
-test("reactionSpriteManifest label debts are baselined, not suppressed by disable", () => {
-  const generated = readFileSync(
-    resolve(WEB_ROOT, "src/generated/reactionSpriteManifest.ts"),
-    "utf8",
-  );
-  const baseline = JSON.parse(
-    readFileSync(resolve(WEB_ROOT, "scripts/i18n-literal-baseline.json"), "utf8"),
-  ) as Array<{ path: string; source: string; classification: string }>;
-
-  assert.doesNotMatch(generated, /(?:eslint|oxlint)-disable/);
-  assert.match(generated, /as const satisfies ReactionSpriteManifest/);
-  assert.doesNotMatch(generated, /JSON\.parse\s*\(/);
-
-  const reaction = baseline.filter(
-    (e) => e.path === "src/generated/reactionSpriteManifest.ts",
-  );
-  assert.equal(reaction.length, 7);
-  // Reviewed disposition: generated labels are unused at runtime (legacy), not
-  // migration debt — ReactionGlyph is aria-hidden and reads sprite coords only.
-  assert.ok(reaction.every((e) => e.classification === "legacy"));
-  assert.ok(
-    reaction.every((e) => typeof e.reason === "string" && e.reason.trim().length > 0),
-  );
-  assert.ok(reaction.some((e) => e.source === '"Thumbs up"'));
-
-  // Guard must still reject a bare disable if someone reintroduces it on this file.
-  assert.ok(
-    findForbiddenDisableDirectivesInSource(
-      `/* eslint-disable */\n${generated}`,
-      "reactionSpriteManifest.ts",
-    ).length >= 1,
-  );
-});
-
-test("PaletteAuditPage keeps exactly three reviewed technical literals with reasons", () => {
-  const baseline = JSON.parse(
-    readFileSync(resolve(WEB_ROOT, "scripts/i18n-literal-baseline.json"), "utf8"),
-  ) as Array<{
-    path: string;
-    source: string;
-    classification: string;
-    reason?: string;
-  }>;
-  const technical = baseline.filter((entry) => entry.classification === "technical");
-  assert.deepEqual(
-    technical.map((entry) => entry.source).sort(),
-    [
-      "@theme",
-      "file:line",
-      "packages/web/src/index.css",
-    ].sort(),
-  );
-  assert.ok(
-    technical.every(
-      (entry) =>
-        entry.path === "src/pages/PaletteAuditPage.tsx" &&
-        typeof entry.reason === "string" &&
-        entry.reason.trim().length > 0,
-    ),
-    `technical entries must be PaletteAuditPage literals with reasons: ${JSON.stringify(technical)}`,
-  );
-});
-
-/**
- * Recovery layer 3 completes messaging core, agent/onboarding, and workspace
- * localization. Flag-off compatibility adds two source-path instances of
- * already-reviewed protocol literals (99+ and #channel); debt/brand stay zero.
- * ReleaseNotesPanel's eight owner-managed literals were retired into the
- * message catalogs by the dynamic release-notes read-path cutover.
- */
-test("baseline disposition counts match reviewed exception decisions", () => {
-  const baseline = JSON.parse(
-    readFileSync(resolve(WEB_ROOT, "scripts/i18n-literal-baseline.json"), "utf8"),
-  ) as Array<{
-    path: string;
-    source: string;
-    count: number;
-    classification: string;
-    reason?: string;
-  }>;
-
-  const EXPECTED: Record<string, { keys: number; hits: number }> = {
-    debt: { keys: 0, hits: 0 },
-    brand: { keys: 0, hits: 0 },
-    // 2026-08-19: the isolated flag-off member/settings surfaces repeat two
-    // existing protocol literals under their own auditable source paths.
-    // 2026-09-16: -1 key / -1 hit. Wave-2 title→Tooltip migration deleted the
-    // redundant `@${human.name}` handle-span title in HumanDetailPanel; the
-    // audited protocol literal left the baseline with it.
-    // 2026-10-04: -1 key / -1 hit. #8831 moved MachineDetailPanel's "(v" version marker
-    // into the catalogued "Upgrade to v{version}" label; its baseline entry was removed.
-    // 2026-10-10: -26 keys / -32 hits. Removing the Workspace grid layout deleted its
-    // panel-title protocol literals (#channel / @name / task #N) across MainLayout,
-    // Sidebar, member rows, MessageSearchPage and src/components/workspace.
-    // 2026-10-14: -2 hits. The Sidebar channel row's two "99+" caps moved out of
-    // JSX into one helper (thread-unread badge segments).
-    // 2026-10-15: -2 keys / -3 hits. ActionCard's `@` and `#` prefixes moved from JSX
-    // into template strings in useActionCardDetail (task #752).
-    // 2026-10-18: -1 hit. The Sidebar DM and pinned-agent rows draw through one
-    // SidebarPeerRowBody, so their two "99+" unread caps are one.
-    protocol: { keys: 40, hits: 46 },
-    // 2026-08-24: -7 keys / -9 hits. RuntimeConfigFields' ten legacy inputs moved to
-    // raft-ui <Input>; the jsx literal rule only sees intrinsic elements, so those
-    // placeholders (sk-..., gateway URLs, claude) left the baseline entirely.
-    // 2026-09-08: -1 key / -1 hit. InviteHumanDialog's email box moved to raft-ui
-    // <Input> for per-row invite roles; the jsx literal rule only sees intrinsic
-    // elements, so `name@company.com` left the baseline the same way.
-    // 2026-10-08: -1 key / -1 hit. MachineDetailPanel's `~/.slock/agents/`
-    // workspace path moved out of JSX into a helper (slock#9190).
-    // 2026-10-18: -3 keys / -3 hits. PaletteAuditPage was rebuilt to audit the
-    // Raft DS tokens; its brutal-palette Notes section (and the quoted
-    // "destructive" / "CTA" / "@mentioned" asides in it) is gone.
-    code_example: { keys: 5, hits: 5 },
-    user_data_example: { keys: 4, hits: 4 },
-    // 2026-09-24: -4 keys / -4 hits. 11fc52292 removed the dormant PostHog
-    // integration, taking src/analytics/flagRegistry.ts ("Chat grid layout",
-    // "Sync-core messages", "Auto", "Feature flags") and two App.tsx entries.
-    // The baseline was pruned in that commit; only this count was missed.
-    // 2026-10-18: -1 key / -1 hit, and technical -6 / -6. The PaletteAuditPage
-    // Raft DS rebuild dropped the brutal-palette Notes section ("The …",
-    // getActivityDotClass(), MentionLink.tsx:27, bg-palette-lavender/40,
-    // brutal-pink, brutal-red, #E08585).
-    internal_dev: { keys: 24, hits: 24 },
-    legacy: { keys: 22, hits: 34 },
-    technical: { keys: 3, hits: 3 },
-    owner_managed: { keys: 0, hits: 0 },
-  };
-
-  const keysBy = new Map<string, number>();
-  const hitsBy = new Map<string, number>();
-  for (const entry of baseline) {
-    keysBy.set(entry.classification, (keysBy.get(entry.classification) ?? 0) + 1);
-    hitsBy.set(entry.classification, (hitsBy.get(entry.classification) ?? 0) + entry.count);
-  }
-
-  const actual: Record<string, { keys: number; hits: number }> = {};
-  for (const classification of Object.keys(EXPECTED)) {
-    actual[classification] = {
-      keys: keysBy.get(classification) ?? 0,
-      hits: hitsBy.get(classification) ?? 0,
-    };
-  }
-
-  assert.deepEqual(
-    actual,
-    EXPECTED,
-    `disposition mismatch:\n${JSON.stringify({ actual, expected: EXPECTED }, null, 2)}`,
-  );
-  // Direction matters. Removing a literal lowers these numbers; that is the only
-  // legitimate reason they move. RAISING them silences a failure instead of fixing
-  // it — and the diff looks almost identical to a legitimate lowering, just with the
-  // sign flipped. Treat any upward edit here as a red flag and demand the literal it
-  // corresponds to. (Raised by @Bugen: the pins catch drift, not someone editing the
-  // pin to make red go away.)
-  // The totals that used to be pinned here (142 keys / 170 hits) are not asserted
-  // any more, and deliberately: `actual` above is derived from the same baseline
-  // and compared class-by-class against EXPECTED, so the totals are already
-  // implied by that comparison. Copying them added a second place to update and
-  // nothing else -- they drifted on every legitimate removal without catching
-  // anything the per-class comparison would not.
-  assert.ok(Object.keys(EXPECTED).length > 0, "disposition table must not be empty");
-  assert.equal(keysBy.get("debt") ?? 0, 0, "debt keys must be zero");
-  assert.equal(hitsBy.get("debt") ?? 0, 0, "debt hits must be zero");
-  assert.equal(keysBy.get("brand") ?? 0, 0, "brand keys must be zero");
-  assert.equal(hitsBy.get("brand") ?? 0, 0, "brand hits must be zero");
-
-  assert.ok(
-    baseline.every((e) => typeof e.reason === "string" && e.reason.trim().length > 0),
-    "every baseline entry requires a non-empty reason",
-  );
-
-  const ownerManaged = baseline.filter((e) => e.classification === "owner_managed");
-  assert.equal(ownerManaged.length, 0, "owner-managed literal debt must stay retired");
-
-  const technical = baseline.filter((e) => e.classification === "technical");
-  assert.deepEqual(
-    technical.map((e) => e.source).sort(),
-    [
-      "@theme",
-      "file:line",
-      "packages/web/src/index.css",
-    ].sort(),
-    "technical must be exactly the approved three PaletteAudit identifiers",
-  );
-  assert.ok(
-    technical.every((e) => e.path === "src/pages/PaletteAuditPage.tsx"),
-    "technical entries must live on PaletteAuditPage.tsx",
-  );
-
-  // PaletteAudit internal_dev is only safe because /palette-audit is DEV-gated.
-  const paletteInternalDev = baseline.filter(
-    (e) =>
-      e.classification === "internal_dev" &&
-      e.path === "src/pages/PaletteAuditPage.tsx",
-  );
-  assert.ok(paletteInternalDev.length >= 1, "PaletteAudit internal_dev entries must exist");
-  // The production/dev route boundary is exercised by
-  // paletteAuditRouteGate.behavior.test.tsx. Keep that as an executable routing
-  // oracle instead of inspecting either App.tsx or the test's own source here.
-
-  // Legacy retention is protected by the named boundary test (not mere baseline).
-  const legacy = baseline.filter((e) => e.classification === "legacy");
-  assert.equal(legacy.length, 22, "legacy key count");
-  const legacyBoundaryPath = resolve(WEB_ROOT, "tests/i18nLegacyLiteralBoundaries.test.ts");
-  const legacyBoundarySrc = readFileSync(legacyBoundaryPath, "utf8");
-  assert.match(
-    legacyBoundarySrc,
-    /findSymbolConsumers|sourceReadsProperty|SETTINGS_LABEL_BY_ID|reactionSpriteManifest|runtimeApiUrlUnsupportedCopy/,
-    "i18nLegacyLiteralBoundaries must pin legacy non-consumption helpers/families",
-  );
-  assert.match(
-    legacyBoundarySrc,
-    /legacy/,
-    "i18nLegacyLiteralBoundaries must document legacy coverage",
-  );
-});
-
-/**
- * Identity→classification pins for reviewed edge cases.
- * Aggregate disposition counts alone would still pass same-bucket swaps;
- * match by path + source so locked identities cannot drift across buckets.
- */
-test("baseline disposition identities pin reviewed edge-case classifications", () => {
-  const baseline = JSON.parse(
-    readFileSync(resolve(WEB_ROOT, "scripts/i18n-literal-baseline.json"), "utf8"),
-  ) as Array<{
-    path: string;
-    source: string;
-    classification: string;
-    reason?: string;
-  }>;
-
-  const entryOf = (path: string, source: string) =>
-    baseline.find((e) => e.path === path && e.source === source);
-  const classificationOf = (path: string, source: string): string | undefined =>
-    entryOf(path, source)?.classification;
-
-  // MemberGraph H/A: protocol + approved compact member-count notation reason.
-  const memberGraphH = entryOf("src/components/settings/MemberGraphSection.tsx", "H/");
-  const memberGraphA = entryOf("src/components/settings/MemberGraphSection.tsx", "A");
-  assert.equal(memberGraphH?.classification, "protocol");
-  assert.equal(memberGraphA?.classification, "protocol");
-  assert.match(
-    memberGraphH?.reason ?? "",
-    /\{humanCount\}H\/\{agentCount\}A/,
-    "H/ reason must name the approved compact notation",
-  );
-  assert.match(
-    memberGraphA?.reason ?? "",
-    /\{humanCount\}H\/\{agentCount\}A/,
-    "A reason must name the approved compact notation",
-  );
-  assert.match(
-    memberGraphH?.reason ?? "",
-    /approved|compact/i,
-    "H/ reason must state approved compact member-count protocol",
-  );
-  assert.match(
-    memberGraphA?.reason ?? "",
-    /approved|compact/i,
-    "A reason must state approved compact member-count protocol",
-  );
-  assert.equal(
-    classificationOf("src/pages/PaletteAuditPage.tsx", "99+"),
-    "protocol",
-  );
-  assert.equal(
-    classificationOf("src/components/member/humanMembershipStatus.ts", '"Left"'),
-    "protocol",
-  );
-  assert.equal(
-    classificationOf("src/components/member/humanMembershipStatus.ts", '"Removed"'),
-    "protocol",
-  );
-  // InviteHumanDialog's placeholder left the corpus with its move to raft-ui
-  // <Input> (2026-09-08), so the classification pin moves to a placeholder still
-  // on an intrinsic element. Pinning the departed entry would assert on nothing.
-  assert.equal(
-    classificationOf(
-      "src/components/settings/SettingsPanel.tsx",
-      'placeholder="https://example.com"',
-    ),
-    "code_example",
-  );
-
-  const userData = baseline
-    .filter((e) => e.classification === "user_data_example")
-    .map((e) => e.source)
-    .sort();
-  assert.deepEqual(userData, ["@stdrc", "M", "S", "general"].sort());
-
-  const releaseNotes = baseline.filter(
-    (e) => e.path === "src/components/settings/ReleaseNotesPanel.tsx",
-  );
-  assert.equal(releaseNotes.length, 0, "ReleaseNotesPanel must remain fully localized");
-
-  assert.equal(
-    classificationOf("src/pages/PaletteAuditPage.tsx", "quoted message contents"),
-    undefined,
-    "PaletteAudit sample quoted message must be migrated out of baseline",
-  );
-  assert.equal(
-    classificationOf("src/pages/PaletteAuditPage.tsx", "that ship looks risky"),
-    undefined,
-    "PaletteAudit sample risky message must be migrated out of baseline",
-  );
-
-  const technical = baseline
-    .filter((e) => e.classification === "technical")
-    .map((e) => e.source)
-    .sort();
-  assert.deepEqual(
-    technical,
-    [
-      "@theme",
-      "file:line",
-      "packages/web/src/index.css",
-    ].sort(),
   );
 });

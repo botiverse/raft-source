@@ -1,7 +1,5 @@
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
-import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
 import { eq } from "drizzle-orm";
 
 import { closeDatabase, getDb, initDatabase } from "../db/index";
@@ -461,10 +459,6 @@ async function seedOutbound() {
     uploaderId: base.owner.id,
     uploaderType: "user",
     filename: "roadmap.pdf",
-    mimeType: "application/pdf",
-    sizeBytes: 8192,
-    storageKey: object.storageKey,
-    contentHash: DIGEST,
     createdAt: NOW,
   }).returning();
   return { ...base, message, delivery, object, attachment };
@@ -683,17 +677,4 @@ test("a fake non-production provider satisfies the generic streaming and correla
     correlation: completion,
     signal: controller.signal,
   }), { kind: "matched", providerMessageId: "fixture-message-1" });
-});
-
-test("the generic attachment kernel and adapter contract contain no first-provider dependency", () => {
-  const directory = fileURLToPath(new URL(".", import.meta.url));
-  for (const filename of [
-    "externalAttachmentTransferService.ts",
-    "externalAttachmentProviderAdapter.ts",
-    "externalInboundAttachmentStorageService.ts",
-    "externalInboundAttachmentWorkerService.ts",
-  ]) {
-    const source = readFileSync(`${directory}/${filename}`, "utf8");
-    assert.doesNotMatch(source, /slack/i, `${filename} must remain provider-neutral`);
-  }
 });

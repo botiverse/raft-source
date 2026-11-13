@@ -1,10 +1,11 @@
 const AGENT_LOGIN_INVENTORY_LABELS = {
   inventory: {
-    registered_agent_login_integrations: "Raft Agent Login integration inventory",
+    registered_agent_login_integrations: "Raft App integration inventory (Agent Login services and MCP Apps)",
   },
   includes: {
     registered_services: "installed registered Agent Login services",
     active_agent_logins: "this Agent's active logins",
+    mcp_apps: "the MCP Apps this Agent has (used through their MCP tools)",
   },
   excludes: {
     runtime_tools: "runtime tools",
@@ -34,10 +35,11 @@ export const AGENT_LOGIN_INTEGRATION_INVENTORY_MANUAL_DOC_ID = "integration" as 
 
 export const AGENT_LOGIN_INTEGRATION_INVENTORY_SCOPE = {
   inventory: "registered_agent_login_integrations",
-  includes: ["registered_services", "active_agent_logins"],
+  // MCP Apps are Raft Apps too and are listed (`mcp_apps`); `server_managed_mcp_tools` stays a
+  // valid exclusion for older scopes but is no longer excluded by default.
+  includes: ["registered_services", "active_agent_logins", "mcp_apps"],
   excludes: [
     "runtime_tools",
-    "server_managed_mcp_tools",
     "computer_local_tools",
     "browser_sessions",
     "arbitrary_clis",

@@ -20,7 +20,7 @@ import { createServer as createServerService } from "../services/serverService";
 import { createChannel as createChannelService, addHuman } from "../services/channelService";
 import { createMessage } from "../services/messageService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 // Any match on the client-visible body is a leak of DB/driver internals.
 const LEAK_MARKERS = [
@@ -119,7 +119,7 @@ test("malformed path and query ids on id-keyed GET routes are clean 4xx (black-b
     { path: (bad) => `/api/mcp/agents/${bad}`, status: 404 },
     { path: (bad) => `/api/integrations/agents/${bad}`, status: 404 },
     { path: (bad) => `/api/integrations/clients/${bad}/app-notifications`, status: 404 },
-    { path: (bad) => `/api/integrations/clients/${bad}/share-link`, status: 404 },
+    { path: (bad) => `/api/integrations/clients/${bad}/share-links`, status: 404 },
     { path: (bad) => `/api/integrations/marketplace/${bad}/install/app-notifications`, status: 404 },
   ];
   const malformed = ["not-a-uuid", encodeURIComponent(`${messageId}这条你是不是没收到`)];

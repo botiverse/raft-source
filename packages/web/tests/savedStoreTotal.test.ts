@@ -46,6 +46,21 @@ function hangNextWrite() {
   api.delete = (() => pending) as typeof api.delete;
 }
 
+test("loadSaved resolves false when the request fails and keeps the list (pull to refresh's toast)", async () => {
+  mockSavedResponse({ saved: [{ messageId: "a" }], hasMore: false, total: 1 });
+  assert.equal(await useSavedStore.getState().loadSaved(), true);
+  api.get = (async () => { throw new Error("offline"); }) as typeof api.get;
+  const originalError = console.error;
+  console.error = () => {};
+  try {
+    assert.equal(await useSavedStore.getState().loadSaved(), false);
+  } finally {
+    console.error = originalError;
+  }
+  assert.equal(useSavedStore.getState().saved.length, 1);
+  assert.equal(useSavedStore.getState().loading, false);
+});
+
 test("loadSaved sets total from the server response, not the loaded-page length", async () => {
   // Only 2 rows loaded this page, but the server reports 247 saved overall —
   // the badge must reflect 247, not 2 (and not the old 20 cap).

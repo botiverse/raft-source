@@ -1,3 +1,5 @@
+import { dataUrlToBlob } from "./dataUrlBlob";
+
 // Task #1302: a selected-message screenshot is one canvas. Past an engine's
 // canvas budget the browser does not throw; `toDataURL` returns an empty
 // `data:,`, which used to reach preview, download, X upload and native share
@@ -96,7 +98,8 @@ async function decodeImageSize(blob: Blob): Promise<{ width: number; height: num
 }
 
 const realDeps: ScreenshotValidationDeps = {
-  toBlob: async (dataUrl) => (await fetch(dataUrl)).blob(),
+  // Decoded in place, not fetched: Raft Desktop's page policy refuses `fetch` of a data URL (#triage:#352).
+  toBlob: async (dataUrl) => dataUrlToBlob(dataUrl),
   decode: decodeImageSize,
 };
 

@@ -1,13 +1,16 @@
+import { useCallback } from "react";
 import { useIntl } from "react-intl";
 import { PLAN_CONFIG, getEffectiveLimits } from "@botiverse/raft-shared";
 import type { ServerPlan } from "@botiverse/raft-shared";
-import { useAppNavigate } from "../../hooks/useAppNavigate";
+import { usePaywallUpgrade } from "../../hooks/usePaywallUpgrade";
+import { usePaywallShown } from "../../analytics/paywall";
 import { useServerStore } from "../../store/serverStore";
 import Banner from "../ui/Banner";
+import { TextLink } from "@botiverse/raft-ui";
 
 /**
  * Plan message-history cutoff notice ("Message history is limited to N days on
- * the Free plan") with a billing link. Shared by the channel list and the
+ * the Free plan") with an Upgrade link to the upgrade dialog. Shared by the channel list and the
  * thread panel: a thread whose replies all sit behind the cutoff must show this
  * notice, never "No replies yet" (task #14).
  */
@@ -18,7 +21,9 @@ export default function HistoryLimitBanner({ target = false }: {
   const { formatMessage } = useIntl();
   const server = useServerStore((s) => s.current);
   const billing = useServerStore((s) => s.billing);
-  const nav = useAppNavigate();
+  const upgrade = usePaywallUpgrade();
+  const openUpgrade = useCallback(() => upgrade("history_30d", "conversation"), [upgrade]);
+  usePaywallShown("history_30d", "conversation");
   const plan = (billing?.plan || server?.plan || "free") as ServerPlan;
   const days = getEffectiveLimits(plan).messageHistoryDays;
 
@@ -28,12 +33,14 @@ export default function HistoryLimitBanner({ target = false }: {
         { id: target ? "message.chatPanel.messageBeyondHistory" : "message.chatPanel.historyLimit" },
         { days, plan: PLAN_CONFIG[plan].displayName },
       )}
-      <button
-        onClick={() => nav.toSettings("billing")}
-        className="ml-1 rounded-[2px] font-semibold underline decoration-[1.5px] underline-offset-[3px] outline-none focus-visible:shadow-focus"
+      <TextLink
+        onClick={openUpgrade}
+        variant="strong"
+        className="ml-1"
+        data-testid="history-limit-upgrade"
       >
-        {formatMessage({ id: "message.chatPanel.viewBilling" })}
-      </button>
+        {formatMessage({ id: "billing.upgradeToPro" })}
+      </TextLink>
     </Banner>
   );
 }

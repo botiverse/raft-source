@@ -2,15 +2,17 @@ import { createHmac, randomUUID } from "node:crypto";
 import { lookup } from "node:dns/promises";
 import { request as httpsRequest } from "node:https";
 import {
+  appNotificationEventSpec,
   clearClockInterval,
   clearClockTimeout,
   currentDate,
   noopTracer,
   setClockInterval,
   setClockTimeout,
+  type AppNotificationSubjectType,
   type Tracer,
 } from "@botiverse/raft-shared";
-import { and, asc, eq, isNull, lt, lte, or, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, isNull, lt, lte, or, sql } from "drizzle-orm";
 import { getDb, type DatabaseExecutor } from "../db/index";
 import { afterAmbientTransaction } from "../db/ambientTransaction";
 import { addTraceEvent, withTraceRoot } from "../tracing/semanticTrace";
@@ -32,6 +34,7 @@ import {
   APP_OUTBOUND_EVENT_GROUPS,
   appOutboundEventRequiredGroups,
   computeEffectiveAppOutboundAuthority,
+  type AppInstallationEventType,
   type AppOutboundEventType,
   type AppOutboundGroup,
 } from "./appOutboundPermissionService";
@@ -42,6 +45,7 @@ import {
 } from "./appWebhookConfigService";
 import { oauthClientIsUserManagedPredicate } from "./oauthClientManagementPolicy";
 import { deriveAppMemberRef } from "./appOutboundProjectionService";
+import { agentFindableBy } from "./agentMemberListPolicy";
 import { responseRequestId } from "./externalRequestCorrelation";
 
 const DELIVERY_LOCK_TIMEOUT_MS = 2 * 60 * 1000;
@@ -177,6 +181,19 @@ export function createAppWebhookPinnedLookup(pinned: PinnedLookupAddress) {
   };
 }
 
+/**
+ * Which of these agent ids are personal assistants. An assistant is found only
+ * by its owner (agentFindableBy), so no App is told it exists: no member event
+ * and no agent event names one. The row keeps its owner after deletion, so
+ * this holds for a removal too.
+ */
+async function personalAssistantIdsAmong(agentIds: readonly string[], executor: DatabaseExecutor): Promise<Set<string>> {
+  if (agentIds.length === 0) return new Set();
+  const rows = await executor.select({ id: agents.id }).from(agents)
+    .where(and(inArray(agents.id, [...agentIds]), sql`not ${agentFindableBy({})}`));
+  return new Set(rows.map((row) => row.id));
+}
+
 async function eventSubjectIsVisible(input: {
   serverId: string;
   subjectType: string;
@@ -195,7 +212,12 @@ async function eventSubjectIsVisible(input: {
         ? eq(servers.id, input.serverId)
         : and(eq(servers.id, input.serverId), isNull(servers.deletedAt)))
       .limit(1);
-    return !!row;
+    if (!row) return false;
+    // At delivery: an event about an agent member is never about a personal assistant.
+    if (input.provenance?.principal_type === "agent") {
+      return (await personalAssistantIdsAmong([input.subjectId], executor)).size === 0;
+    }
+    return true;
   }
   if (input.subjectType === "server") {
     if (!input.groups.includes("server") || input.subjectId !== input.serverId) return false;
@@ -205,8 +227,14 @@ async function eventSubjectIsVisible(input: {
   }
   if (input.subjectType === "agent") {
     if (!input.groups.includes("agent")) return false;
+    // A personal assistant is found only by its owner (agentFindableBy): never by an App.
     const [row] = await executor.select({ id: agents.id }).from(agents)
-      .where(and(eq(agents.id, input.subjectId), eq(agents.serverId, input.serverId), isNull(agents.deletedAt))).limit(1);
+      .where(and(
+        eq(agents.id, input.subjectId),
+        eq(agents.serverId, input.serverId),
+        isNull(agents.deletedAt),
+        agentFindableBy({}),
+      )).limit(1);
     return !!row;
   }
   if (input.subjectType === "channel") {
@@ -233,17 +261,26 @@ async function eventSubjectIsVisible(input: {
   return false;
 }
 
+/**
+ * Emit a group-gated event to every eligible installation on the Server. An
+ * installation's own event never goes through here: its type is not in
+ * APP_OUTBOUND_EVENT_GROUPS, and its subject is not one of these
+ * (emitAppInstallationNotificationEvent is its only emitter).
+ */
 export async function emitAppFacingNotificationEvent(input: {
   id?: string;
   serverId: string;
   eventType: AppOutboundEventType;
-  subjectType: "server" | "agent" | "channel" | "computer";
+  subjectType: Exclude<AppNotificationSubjectType, "member" | "installation">;
   subjectId: string;
   occurredAt?: Date;
   provenance?: Record<string, unknown>;
 }, executor: DatabaseExecutor = getDb()): Promise<{ eventId: string; recipientCount: number }> {
-  if (!(input.eventType in APP_OUTBOUND_EVENT_GROUPS)) {
+  if (!Object.prototype.hasOwnProperty.call(APP_OUTBOUND_EVENT_GROUPS, input.eventType)) {
     throw new AppNotificationDeliveryError("Unknown app-facing event type");
+  }
+  if (appNotificationEventSpec(input.eventType)?.subject !== input.subjectType) {
+    throw new AppNotificationDeliveryError("Event subject does not match its event type");
   }
   const requiredGroups = appOutboundEventRequiredGroups(input.eventType);
   const provenance = sanitizeProvenance(input.provenance);
@@ -293,6 +330,71 @@ export async function emitAppFacingNotificationEvent(input: {
   // uncommitted deliveries through it and could post webhooks before commit.
   if (recipientCount > 0) afterAmbientTransaction(() => scheduledDrain?.());
   return { eventId, recipientCount };
+}
+
+/**
+ * Emit an event about one App installation, to that installation only (the
+ * App that owns it), in the caller's transaction. There is no recipient
+ * parameter: the subject and the only possible recipient are the same row, so
+ * an installation event can never reach another App. It needs no
+ * installer-approved group; the installation receives it while it is active,
+ * subscribed to the event and has an enabled webhook. The event row is written
+ * either way, so a committed change always has its event and a rolled-back
+ * one never does.
+ */
+export async function emitAppInstallationNotificationEvent(input: {
+  eventType: AppInstallationEventType;
+  installation: { id: string; serverId: string };
+  occurredAt?: Date;
+  provenance?: Record<string, unknown>;
+}, executor: DatabaseExecutor = getDb()): Promise<{ eventId: string; recipientCount: number }> {
+  if (appNotificationEventSpec(input.eventType)?.subject !== "installation") {
+    throw new AppNotificationDeliveryError("Not an installation event type");
+  }
+  const [created] = await executor.insert(notificationEvents).values({
+    serverId: input.installation.serverId,
+    eventType: input.eventType,
+    requiredGroups: [],
+    subjectType: "installation",
+    subjectId: input.installation.id,
+    provenance: sanitizeProvenance(input.provenance),
+    occurredAt: input.occurredAt ?? currentDate(),
+  }).returning({ id: notificationEvents.id });
+  if (!created) throw new AppNotificationDeliveryError("Event insert returned no row");
+
+  const [candidate] = await executor.select({
+    installation: oauthClientInstalls,
+    configRevision: oauthAppWebhookConfigs.revision,
+  }).from(oauthClientInstalls)
+    .innerJoin(oauthClients, eq(oauthClients.id, oauthClientInstalls.clientId))
+    .innerJoin(oauthAppWebhookConfigs, eq(oauthAppWebhookConfigs.clientId, oauthClients.id))
+    .where(and(
+      eq(oauthClientInstalls.id, input.installation.id),
+      eq(oauthClientInstalls.serverId, input.installation.serverId),
+      eq(oauthClientInstalls.status, "active"),
+      eq(oauthClients.enabled, true),
+      oauthClientIsUserManagedPredicate(),
+      eq(oauthAppWebhookConfigs.enabled, true),
+    ))
+    .limit(1);
+  if (!candidate || !candidate.installation.subscribedEvents.includes(input.eventType)) {
+    return { eventId: created.id, recipientCount: 0 };
+  }
+  const [recipient] = await executor.insert(notificationRecipients).values({
+    eventId: created.id,
+    serverId: input.installation.serverId,
+    recipientType: "app_installation",
+    recipientId: candidate.installation.id,
+  }).returning({ id: notificationRecipients.id });
+  await executor.insert(notificationDeliveries).values({
+    notificationId: recipient!.id,
+    adapter: "webhook",
+    configRevision: candidate.configRevision,
+    grantRevision: candidate.installation.grantRevision,
+    subscriptionRevision: candidate.installation.subscriptionRevision,
+  });
+  afterAmbientTransaction(() => scheduledDrain?.());
+  return { eventId: created.id, recipientCount: 1 };
 }
 
 async function eligibleRecipientInstallations(
@@ -345,12 +447,19 @@ export async function emitAppFacingMemberEvents(input: {
   occurredAt?: Date;
   provenance: Record<string, unknown>;
 }, executor: DatabaseExecutor = getDb()): Promise<{ eventCount: number; recipientCount: number }> {
-  if (input.members.length === 0) return { eventCount: 0, recipientCount: 0 };
+  const assistants = await personalAssistantIdsAmong(
+    input.members.filter((member) => member.principalType === "agent").map((member) => member.principalId),
+    executor,
+  );
+  const members = input.members.filter((member) => !(member.principalType === "agent" && assistants.has(member.principalId)));
+  if (members.length === 0) return { eventCount: 0, recipientCount: 0 };
   const requiredGroups = appOutboundEventRequiredGroups(input.eventType);
+  const subjectType = appNotificationEventSpec(input.eventType)?.subject;
+  if (subjectType !== "member") throw new AppNotificationDeliveryError("Not a member event type");
   const baseProvenance = sanitizeProvenance(input.provenance);
   if (!await eventSubjectIsVisible({
     serverId: input.serverId,
-    subjectType: "member",
+    subjectType,
     subjectId: input.serverId,
     groups: requiredGroups,
     provenance: baseProvenance,
@@ -360,14 +469,14 @@ export async function emitAppFacingMemberEvents(input: {
 
   const occurredAt = input.occurredAt ?? currentDate();
   let recipientCount = 0;
-  for (let offset = 0; offset < input.members.length; offset += MEMBER_EVENT_INSERT_CHUNK) {
-    const chunk = input.members.slice(offset, offset + MEMBER_EVENT_INSERT_CHUNK);
+  for (let offset = 0; offset < members.length; offset += MEMBER_EVENT_INSERT_CHUNK) {
+    const chunk = members.slice(offset, offset + MEMBER_EVENT_INSERT_CHUNK);
     const events = chunk.map((member) => ({
       id: randomUUID(),
       serverId: input.serverId,
       eventType: input.eventType,
       requiredGroups,
-      subjectType: "member",
+      subjectType,
       subjectId: member.principalId,
       provenance: sanitizeProvenance({
         ...baseProvenance,
@@ -395,7 +504,7 @@ export async function emitAppFacingMemberEvents(input: {
     })));
     recipientCount += recipientRows.length;
   }
-  return { eventCount: input.members.length, recipientCount };
+  return { eventCount: members.length, recipientCount };
 }
 
 /**
@@ -447,6 +556,23 @@ async function renderEventSubject(
     }),
     ...(signedIn ? { sub: event.subjectId } : {}),
   };
+}
+
+/**
+ * An event's `data`, rendered for the installation at send time. Only
+ * `installation.bot_changed` has any: the bot's state when the delivery is
+ * sent (the lookup's mapping), so a retry or a late delivery never reports a
+ * state the installation has since left.
+ */
+async function renderEventData(
+  event: typeof notificationEvents.$inferSelect,
+  installation: typeof oauthClientInstalls.$inferSelect,
+  executor: DatabaseExecutor,
+): Promise<Record<string, unknown> | null> {
+  if (event.eventType !== "installation.bot_changed") return null;
+  // Dynamic: appBotIdentityService emits through this module.
+  const { readInstallationBotChangedData } = await import("./appBotIdentityService");
+  return readInstallationBotChangedData(executor, installation.id);
 }
 
 /**
@@ -640,17 +766,25 @@ export async function drainAppNotificationDeliveries(input: {
       approvedGroups: authority.installation.approvedGroups,
       subscribedEvents: authority.installation.subscribedEvents,
     });
-    const eventType = base.event.eventType as AppOutboundEventType;
-    const eligible = eventType in APP_OUTBOUND_EVENT_GROUPS
-      && effective.events.includes(eventType)
-      && includesAll(effective.groups, base.event.requiredGroups)
-      && await eventSubjectIsVisible({
-        serverId: base.event.serverId,
-        subjectType: base.event.subjectType,
-        subjectId: base.event.subjectId,
-        groups: effective.groups,
-        provenance: base.event.provenance,
-      }, executor);
+    // The row's subject must be the one its event type is registered with, so
+    // a row can't borrow the installation subject to skip groups. An
+    // installation event goes only to the installation it is about.
+    const spec = appNotificationEventSpec(base.event.eventType);
+    const eligible = !!spec && spec.subject === base.event.subjectType && (
+      spec.subject === "installation"
+        ? base.event.subjectId === authority.installation.id
+          && base.notification.recipientId === authority.installation.id
+          && authority.installation.subscribedEvents.includes(base.event.eventType)
+        : effective.events.includes(base.event.eventType as AppOutboundEventType)
+          && includesAll(effective.groups, base.event.requiredGroups)
+          && await eventSubjectIsVisible({
+            serverId: base.event.serverId,
+            subjectType: base.event.subjectType,
+            subjectId: base.event.subjectId,
+            groups: effective.groups,
+            provenance: base.event.provenance,
+          }, executor)
+    );
     if (!eligible) {
       await finishDeliveryAttempt({
         deliveryId: claimed.id,
@@ -670,6 +804,7 @@ export async function drainAppNotificationDeliveries(input: {
     let timing: WebhookPostTiming | undefined;
     let timeoutPhase: WebhookPostError["timeoutPhase"] = null;
     try {
+      const data = await renderEventData(base.event, authority.installation, executor);
       const body = JSON.stringify({
         installation_id: authority.installation.id,
         delivery_id: claimed.id,
@@ -681,6 +816,7 @@ export async function drainAppNotificationDeliveries(input: {
           occurred_at: base.event.occurredAt.toISOString(),
           subject: await renderEventSubject(base.event, authority.installation, executor),
           provenance: base.event.provenance,
+          ...(data ? { data } : {}),
         },
       });
       const secret = decryptAppWebhookSigningSecret(authority.config, claimed.configRevision, now);

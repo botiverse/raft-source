@@ -44,6 +44,19 @@ async function toWebRequest(incoming: import("node:http").IncomingMessage): Prom
     }
   }
 
+  // Aborts when the client goes away before its whole request arrived, so
+  // handleRequest can tell a failed body read from a failure of our own.
+  // Registered before Readable.toWeb, so the signal is set before the body
+  // read rejects.
+  const clientGone = new AbortController();
+  // Only while the request is incomplete: once it has fully arrived, a
+  // disconnect must not relabel a failure of our own.
+  const abortIfIncomplete = () => {
+    if (!incoming.complete) clientGone.abort();
+  };
+  incoming.once("error", abortIfIncomplete);
+  incoming.once("close", abortIfIncomplete);
+
   const body = incoming.method === "GET" || incoming.method === "HEAD"
     ? undefined
     : Readable.toWeb(incoming) as ReadableStream<Uint8Array>;
@@ -52,6 +65,7 @@ async function toWebRequest(incoming: import("node:http").IncomingMessage): Prom
     headers,
     body,
     duplex: body ? "half" : undefined,
+    signal: clientGone.signal,
   } as RequestInit);
 }
 

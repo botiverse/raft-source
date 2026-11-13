@@ -179,8 +179,7 @@ export function projectAgentCommentScope(
 
 /**
  * One canonical Agent-visible scope block shared by live delivery, thread
- * context, history reads, and search results. Callers outside the attachment-
- * comment feature gate receive no projection and must not call this renderer.
+ * context, history reads, and search results.
  */
 export function renderAgentCommentScopeBlock(scope: AgentCommentScopeProjection): string {
   const scopeLine = renderScopeLine(scope);

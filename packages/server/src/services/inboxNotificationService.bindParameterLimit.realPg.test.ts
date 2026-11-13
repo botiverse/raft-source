@@ -11,7 +11,7 @@
 import assert from "node:assert/strict";
 import { randomBytes, randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
-import { sql } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/node-postgres";
 import { migrate } from "drizzle-orm/node-postgres/migrator";
 import pg from "pg";
@@ -19,10 +19,15 @@ import pg from "pg";
 import { chunkForBindParameters, insertParametersPerRow, PG_MAX_BIND_PARAMETERS } from "../db/bindParameterBudget";
 import { closeDatabase, getDb, initDatabase } from "../db/index";
 import * as schema from "../db/schema";
-import { channels, inboxNotificationFacts, messages, servers, users } from "../db/schema";
+import { channels, inboxNotificationFacts, messages, notificationOutbox, servers, users } from "../db/schema";
 import { BasicTracer, MemoryTraceSink } from "@botiverse/raft-shared";
 import { runWithTraceSpan } from "../tracing/semanticTrace";
 import { recordInboxNotificationFacts, type InboxNotificationFactInput } from "./inboxNotificationService";
+import {
+  __resetNotificationDispatchRuntimeForTests,
+  __setAfterNotificationClaimForTests,
+  __setNotificationDispatchRuntimeForTests,
+} from "./notifications/dispatcher";
 
 const REAL_PG_URL_ENV = "BIND_PARAMETER_LIMIT_REAL_PG_URL";
 const REAL_PG_URL = process.env[REAL_PG_URL_ENV];
@@ -95,12 +100,35 @@ test(
       // Precondition: an unchunked facts statement would be past the limit.
       assert.ok(RECEIVERS * 11 > PG_MAX_BIND_PARAMETERS);
 
+      // The post-commit drain is captured, not run in the background.
+      const scheduled: Array<() => Promise<void>> = [];
+      __setNotificationDispatchRuntimeForTests({ schedule: (work) => { scheduled.push(work); } });
+
       const recorded = await db.transaction((tx) => recordInboxNotificationFacts(facts, tx));
 
       assert.equal(recorded, RECEIVERS);
       const [factCount] = await db.select({ n: sql<number>`count(*)::int` }).from(inboxNotificationFacts);
       assert.equal(factCount.n, RECEIVERS);
+
+      // The same transaction wrote one notification row per receiver (chunked
+      // like the facts), and one post-commit drain covers all of them.
+      const outboxRows = await db
+        .select({ id: notificationOutbox.id, eventKey: notificationOutbox.eventKey, status: notificationOutbox.status })
+        .from(notificationOutbox)
+        .where(eq(notificationOutbox.messageId, message.id));
+      assert.equal(outboxRows.length, RECEIVERS);
+      assert.ok(outboxRows.every((row) => row.eventKey === `message:${message.id}` && row.status === "pending"));
+      assert.equal(scheduled.length, 1, "one post-commit drain for the whole send");
+      const claimedIds: string[] = [];
+      __setAfterNotificationClaimForTests((rows) => { claimedIds.push(...rows.map((row) => row.id)); });
+      await scheduled[0]!();
+      assert.deepEqual(claimedIds.sort(), outboxRows.map((row) => row.id).sort(), "the drain claimed exactly the inserted rows");
+      const [stillPending] = await db.select({ n: sql<number>`count(*)::int` }).from(notificationOutbox)
+        .where(sql`${notificationOutbox.status} IN ('pending', 'processing')`);
+      assert.equal(stillPending.n, 0, "every claimed row was settled");
     } finally {
+      __setAfterNotificationClaimForTests(null);
+      __resetNotificationDispatchRuntimeForTests();
       await closeDatabase().catch(() => undefined);
       await admin.query(`DROP DATABASE IF EXISTS ${quoteIdentifier(databaseName)} WITH (FORCE)`).catch(() => undefined);
       await admin.end();

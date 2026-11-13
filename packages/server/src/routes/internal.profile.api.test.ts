@@ -13,11 +13,12 @@ import { fileURLToPath } from "node:url";
 import { getDb } from "../db/index";
 import { users } from "../db/schema";
 import { createServer } from "../services/serverService";
-import { createAgent, assignMachine } from "../services/agentService";
+import { createAgent } from "../services/agentService";
+import { placeAgentOnMachine } from "../test/agentMachineFixture";
 import { registerMachine } from "../services/machineService";
 import { mintAgentCredential } from "../services/agentCredentialService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 const execFileAsync = promisify(execFile);
 const cliEntry = fileURLToPath(new URL("../../../cli/src/index.ts", import.meta.url));
@@ -42,11 +43,12 @@ async function seed() {
   const server = await createServer("Profile Server", "profile-server", owner.id);
   const agent = await createAgent(server.id, "profile-agent", { runtime: "codex", model: "gpt-5.5" });
   const { machine, apiKey } = await registerMachine(server.id, owner.id, "dev-machine");
-  await assignMachine(agent.id, machine.id);
+  await placeAgentOnMachine(agent.id, machine.id);
   const { apiKey: agentApiKey } = await mintAgentCredential({
     agentId: agent.id,
     scopes: ["read", "send", "server"],
     name: "profile-cli-e2e",
+    issuedVia: "human",
     createdByUserId: owner.id,
   });
 

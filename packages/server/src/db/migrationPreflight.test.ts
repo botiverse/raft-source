@@ -31,6 +31,19 @@ test("resolvePreflightConfig: missing DATABASE_URL / timeout / invalid fail clos
   }
 });
 
+test("resolvePreflightConfig: the pre-rename timeout name is refused, never read as a fallback", () => {
+  // A stale deploy config still setting the old name would look effective while
+  // delivering nothing; it aborts even when the new name is set beside it.
+  for (const env of [
+    { DATABASE_URL: "postgres://u:p@h/d", SERVER_MIGRATION_STATEMENT_TIMEOUT_MS: "60000" },
+    { DATABASE_URL: "postgres://u:p@h/d", SERVER_MIGRATION_STATEMENT_TIMEOUT_MS: "60000", SERVER_MIGRATION_EXPECTED_STATEMENT_TIMEOUT_MS: "60000" },
+  ]) {
+    const r = resolvePreflightConfig(env);
+    assert.equal(r.kind, "abort");
+    assert.equal((r as { code: string }).code, "DEPRECATED_TIMEOUT_ENV");
+  }
+});
+
 test("resolvePreflightConfig: valid keeps RAW url + numeric requiredMs (no injection)", () => {
   const raw = "postgres://u:p@h/d?sslmode=require";
   const r = resolvePreflightConfig({ DATABASE_URL: raw, SERVER_MIGRATION_EXPECTED_STATEMENT_TIMEOUT_MS: "60000" }) as { connectionString: string; requiredMs: number };
@@ -157,6 +170,7 @@ function runScript(overrides: Record<string, string | undefined>) {
   const env: Record<string, string | undefined> = { ...process.env };
   delete env.DATABASE_URL;
   delete env.SERVER_MIGRATION_EXPECTED_STATEMENT_TIMEOUT_MS;
+  delete env.SERVER_MIGRATION_STATEMENT_TIMEOUT_MS;
   for (const [k, v] of Object.entries(overrides)) {
     if (v === undefined) delete env[k];
     else env[k] = v;
@@ -178,6 +192,17 @@ test("subprocess: missing/invalid timeout -> exit 2, no DSN leak", () => {
   r = runScript({ DATABASE_URL: "postgres://u:secret@h/d", SERVER_MIGRATION_EXPECTED_STATEMENT_TIMEOUT_MS: "nope" });
   assert.equal(r.status, 2);
   assert.match(r.stderr, /INVALID_TIMEOUT/);
+  assert.doesNotMatch(r.stderr, /secret/);
+});
+
+test("subprocess: the pre-rename timeout name -> exit 2, DEPRECATED_TIMEOUT_ENV, no DSN leak", () => {
+  const r = runScript({
+    DATABASE_URL: "postgres://u:secret@h/d",
+    SERVER_MIGRATION_STATEMENT_TIMEOUT_MS: "60000",
+    SERVER_MIGRATION_EXPECTED_STATEMENT_TIMEOUT_MS: "60000",
+  });
+  assert.equal(r.status, 2);
+  assert.match(r.stderr, /\[MIGRATION_PREFLIGHT_ABORT\] DEPRECATED_TIMEOUT_ENV/);
   assert.doesNotMatch(r.stderr, /secret/);
 });
 

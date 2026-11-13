@@ -1,7 +1,8 @@
 // E2E test hooks — exposed on `window.__SLOCK_E2E__` ONLY when the bundle is
-// built with `VITE_E2E=true` (the Playwright e2e build). Production / CF Pages
-// builds omit the flag, so this object is never attached and the imports below
-// add no runtime behavior beyond what the app already bundles.
+// built with `VITE_E2E=true` (the Playwright e2e build). main.tsx imports this
+// module only in that build (and renders after it is in); production / CF
+// Pages builds omit the flag, so neither this module nor its imports (the
+// screenshot export, the E2E probes) are in their bundle.
 //
 // Why this exists: the e2e suite previously reached into app internals via
 // `page.evaluate(() => import("/src/store/messageStore.ts"))`, which only works
@@ -13,7 +14,7 @@
 // module paths.
 import { useMessageStore } from "./store/messageStore";
 import { useProfileStore } from "./store/profileStore";
-import { captureSelectedMessages } from "./utils/selectScreenshot";
+import { captureSelectedMessages, readLastCaptureMessageIds } from "./utils/selectScreenshot";
 import {
   isProfileOpenE2eTimelineActive,
   readProfileOpenE2eTimeline,
@@ -39,7 +40,8 @@ declare global {
     __SLOCK_E2E__?: {
       loadMessages: (channelId: string) => Promise<void>;
       captureSelectedMessages: typeof captureSelectedMessages;
-      triggerRenderError?: (message?: string) => void;
+      // The message ids of the rows the last image capture rendered.
+      readLastCaptureMessageIds: typeof readLastCaptureMessageIds;
       startProfileOpenTimeline: (receiptStartedAtEpochMs: number) => void;
       readProfileOpenTimeline: () => ProfileOpenDiagnosticTimeline;
       stopProfileOpenTimeline: () => void;
@@ -125,6 +127,7 @@ if (import.meta.env.VITE_E2E === "true") {
   window.__SLOCK_E2E__ = {
     loadMessages: (channelId) => useMessageStore.getState().loadMessages(channelId),
     captureSelectedMessages,
+    readLastCaptureMessageIds,
     startProfileOpenTimeline: (receiptStartedAtEpochMs) => {
       domCounts = readDomCounts();
       startProfileOpenE2eTimeline(receiptStartedAtEpochMs);

@@ -11,7 +11,7 @@ import { getDb } from "../db/index";
 import { servers, users } from "../db/schema";
 import { createServer } from "../services/serverService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 const DATABASE_URL = process.env.INBOX_PRESSURE_REAL_PG_URL;
 const REQUIRED = process.env.INBOX_PRESSURE_REAL_PG_REQUIRED === "1";
@@ -175,7 +175,7 @@ test(
   async () => {
     assert.ok(DATABASE_URL, "INBOX_PRESSURE_REAL_PG_URL is required");
     assert.ok(EXPECTATION === "red" || EXPECTATION === "green", "INBOX_PRESSURE_EXPECT must be red or green");
-    const app = await openTestApp(DATABASE_URL, 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false, skipAuthRateLimit: true });
+    const app = await openTestApp(DATABASE_URL, 0, { humanActivityMuteFlagDefaultEnabled: true, skipAuthRateLimit: true });
     const monitor = new pg.Client({ connectionString: DATABASE_URL });
     await monitor.connect();
     let poll = true;

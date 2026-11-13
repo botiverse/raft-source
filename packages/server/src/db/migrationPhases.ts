@@ -210,3 +210,87 @@ export function readPhaseJournalTags(migrationsFolder: string): string[] {
   ) as MigrationJournal;
   return journal.entries.map((entry) => entry.tag);
 }
+
+// ---------------------------------------------------------------------------
+// Per-migration transaction timeout (auto-release step 1, #botiverse-raft-deployment:3e5ec8cc).
+//
+// PostgreSQL 17 fixes a transaction's `transaction_timeout` when the
+// transaction BEGINs: a `SET LOCAL transaction_timeout` inside the migration
+// neither raises nor lowers it (measured on 17.11), and hitting it terminates
+// the whole connection (FATAL 25P04), not just the transaction. Drizzle opens
+// each migration's transaction itself, so the runner sets the session value
+// before each phase. A migration that legitimately needs longer declares it in
+// its leading comment block:
+//
+//   -- migration: transaction_timeout=15min
+//
+// Migrations numbered below the cutoff were written before this existed (0601
+// scans for ~10 minutes); they run with no transaction timeout so a fresh
+// database still replays the whole history.
+
+/** First migration number that runs under a transaction timeout. Fixed in
+ * source, never derived at run time; see migrationPhases.test.ts. */
+export const MIGRATION_TRANSACTION_TIMEOUT_FROM = 611;
+export const DEFAULT_MIGRATION_TRANSACTION_TIMEOUT_MS = 30_000;
+const MAX_MIGRATION_TRANSACTION_TIMEOUT_MS = 6 * 60 * 60 * 1000;
+
+export type MigrationTransactionTimeout = {
+  /** null = no transaction timeout (a migration from before the cutoff). */
+  ms: number | null;
+  source: "before-cutoff" | "default" | "declared" | "malformed-declaration";
+};
+
+const DIRECTIVE = /^--\s*migration:\s*transaction_timeout\s*=\s*(.*?)\s*$/i;
+const DURATION = /^([1-9][0-9]*)(ms|s|min|h)$/;
+const UNIT_MS: Record<string, number> = { ms: 1, s: 1000, min: 60_000, h: 3_600_000 };
+
+/** The number a drizzle tag starts with (`0611_x` -> 611), or null. */
+export function migrationNumber(tag: string): number | null {
+  const match = /^([0-9]{4,})_/.exec(tag);
+  return match ? Number(match[1]) : null;
+}
+
+/** Read `-- migration: transaction_timeout=…` from the leading comment block
+ * only (comment and blank lines before the first statement). Anything that is
+ * not exactly one well-formed declaration is malformed: the runner then uses
+ * the default, and the release classifier refuses to auto-ship the file. */
+export function parseTransactionTimeoutDeclaration(
+  sql: string,
+): { kind: "none" } | { kind: "declared"; ms: number } | { kind: "malformed"; raw: string } {
+  const found: string[] = [];
+  for (const line of sql.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (trimmed === "") continue;
+    if (!trimmed.startsWith("--")) break;
+    const match = DIRECTIVE.exec(trimmed);
+    if (match) found.push(match[1]);
+    else if (/^--\s*migration:/i.test(trimmed)) found.push(trimmed);
+  }
+  if (found.length === 0) return { kind: "none" };
+  if (found.length > 1) return { kind: "malformed", raw: found.join(" | ") };
+  const duration = DURATION.exec(found[0]);
+  if (!duration) return { kind: "malformed", raw: found[0] };
+  const ms = Number(duration[1]) * UNIT_MS[duration[2]];
+  if (!Number.isSafeInteger(ms) || ms > MAX_MIGRATION_TRANSACTION_TIMEOUT_MS) {
+    return { kind: "malformed", raw: found[0] };
+  }
+  return { kind: "declared", ms };
+}
+
+export function resolveMigrationTransactionTimeout(tag: string, sql: string): MigrationTransactionTimeout {
+  const number = migrationNumber(tag);
+  // A tag without the NNNN_ prefix cannot be placed before the cutoff, so it
+  // gets the limit: a misnamed new migration must not skip the protection.
+  if (number !== null && number < MIGRATION_TRANSACTION_TIMEOUT_FROM) {
+    return { ms: null, source: "before-cutoff" };
+  }
+  const declaration = parseTransactionTimeoutDeclaration(sql);
+  if (declaration.kind === "declared") return { ms: declaration.ms, source: "declared" };
+  if (declaration.kind === "malformed") {
+    return { ms: DEFAULT_MIGRATION_TRANSACTION_TIMEOUT_MS, source: "malformed-declaration" };
+  }
+  return { ms: DEFAULT_MIGRATION_TRANSACTION_TIMEOUT_MS, source: "default" };
+}
+
+/** SQLSTATE 25P04: the session was terminated by transaction_timeout. */
+export const TRANSACTION_TIMEOUT_SQLSTATE = "25P04";

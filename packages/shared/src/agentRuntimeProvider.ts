@@ -178,9 +178,18 @@ export function isAgentConnectionProvider(value: unknown): value is AgentConnect
 export const AGENT_CONNECTION_CALLBACK_STATUSES = ["pending", "denied", "failed"] as const;
 export type AgentConnectionCallbackStatus = typeof AGENT_CONNECTION_CALLBACK_STATUSES[number];
 
-/** `POST /api/agents/:id/connections/:provider` body. `private` requests private-repo access. */
+/**
+ * `POST /api/agents/:id/connections/:provider` body. `private` requests
+ * private-repo access. `connectorId` (one of the status's `connectors`, shaped
+ * like AGENT_CONNECTION_CONNECTOR_ID_RE) reconnects that connector in place:
+ * confirm replaces its tokens, keeping its id, for every agent on it. It needs
+ * the connector's creator or a server owner/admin (its `canManage`); the
+ * authorization must be the connector's own GitHub account. No other field is
+ * accepted.
+ */
 export interface AgentConnectionStartRequest {
   access?: "private";
+  connectorId?: string;
 }
 
 /** `POST /api/agents/:id/connections/:provider/confirm` body: the provider's pending id from the return URL. */
@@ -203,6 +212,18 @@ export interface AgentConnectionAssignRequest {
   connectorId: string;
 }
 
+/**
+ * A removal that took: `DELETE /api/agents/:id/connections/:provider` (this
+ * agent) or `…/connectors/:connectorId` (every agent). With nothing more to
+ * say it answers 204 and no body. When the provider could not reach a copy of
+ * the credential it had handed to an agent (that agent's storage is gone), it
+ * answers 200 with `revokeOnGithub: true`: the person should also revoke the
+ * authorization on GitHub. The 502 partial disconnect carries the same field.
+ */
+export interface AgentConnectionRemovedView {
+  revokeOnGithub?: true;
+}
+
 /** Shape of a connector id the provider hands back (opaque, URL-safe). */
 export const AGENT_CONNECTION_CONNECTOR_ID_RE = /^[A-Za-z0-9_.~-]{1,200}$/;
 
@@ -210,10 +231,53 @@ export const AGENT_CONNECTION_CONNECTOR_ID_RE = /^[A-Za-z0-9_.~-]{1,200}$/;
 export type AgentConnectorActingRole = "creator" | "admin";
 
 /**
+ * A connection's health as the provider reports it, in the words of Raft's
+ * managed-MCP OAuth connectors: `connected` (working), `disconnected` (this
+ * agent has no connection) or `error` (GitHub refused to renew it: only
+ * reconnecting mends it). A connector in `connectors` is `connected` or
+ * `error`. "Needs reconnecting" is this field, never a refusal code.
+ */
+export type AgentConnectionOAuthStatus = "connected" | "disconnected" | "error";
+
+export const AGENT_CONNECTION_OAUTH_STATUSES: readonly AgentConnectionOAuthStatus[] = ["connected", "disconnected", "error"];
+
+/**
+ * A connection's OAuth scopes as the provider recorded them (antiproton
+ * #1166): `scopes`, what GitHub's token answer granted; `requestedScopes`,
+ * what the connect flow asked for. `[]`: none named (for `scopes`, GitHub's
+ * answer named no scope). `null`: not
+ * recorded (a connector made before the provider kept them; one reconnect
+ * records them). Absent: the provider does not report them (an older one).
+ *
+ * If the connection turns out to hold a GitHub App user token, `scopes` is
+ * `[]`: such a token's access is the App's permissions plus the repositories
+ * the person chose, not OAuth scopes. Then `requestedScopes` must not be shown
+ * as granted (Tenny and Kirby decide the display after the first real
+ * connection).
+ */
+export interface AgentConnectionScopesView {
+  scopes?: string[] | null;
+  requestedScopes?: string[] | null;
+}
+
+/**
+ * The provider's health fields, passed through as it sent them. Each is
+ * absent when the provider did not send it (a provider from before
+ * antiproton reported health): Raft never fills one in.
+ */
+export interface AgentConnectionHealthView {
+  oauthStatus?: AgentConnectionOAuthStatus;
+  /** Why it needs reconnecting (antiproton: "OAuth authorization expired; reconnect required"), or null. */
+  lastCheckError?: string | null;
+  /** When the provider last checked the connection (connect, switch, renewal, the refusal that broke it), or null. */
+  lastCheckedAt?: string | null;
+}
+
+/**
  * A tenant-level (per Raft server) account connection. Several agents may use
  * the same connector; no token is ever part of this view.
  */
-export interface AgentConnectionConnectorView {
+export interface AgentConnectionConnectorView extends AgentConnectionHealthView, AgentConnectionScopesView {
   id: string;
   account: string | null;
   createdAt: string | null;
@@ -221,17 +285,27 @@ export interface AgentConnectionConnectorView {
   creator: { id: string; name: string | null; displayName: string | null } | null;
   /** The agent currently uses this connector. */
   current: boolean;
-  /** The caller may assign this connector to an agent and disconnect it (its creator or a server owner/admin). */
+  /** The caller may reconnect and disconnect this connector (its creator or a server owner/admin). */
   canManage: boolean;
+  /**
+   * This agent may be switched to this connector: its creator is the agent's owner. False only for
+   * the connector the agent is on from before the rule, which is listed so it can be cleared.
+   * Absent from an older server: treat as true.
+   */
+  assignable?: boolean;
 }
 
 /**
  * `GET /api/agents/:id/connections/:provider`. `supported: false` when the
- * provider does not serve connections (it answered 404).
+ * provider does not serve connections (it answered 404). The health fields
+ * are this agent's connection's (`oauthStatus: "error"` while `connected` is
+ * false: it needs reconnecting); each connector carries its own.
  */
 export type AgentConnectionStatusView =
   | { provider: AgentConnectionProvider; supported: false }
-  | {
+  | (AgentConnectionHealthView & {
+      /** The caller is this agent's owner, the only person who may connect a new account to it. Absent from an older server: treat as true. */
+      canConnectNew?: boolean;
     provider: AgentConnectionProvider;
     supported: true;
     connected: boolean;
@@ -239,12 +313,21 @@ export type AgentConnectionStatusView =
     connectedAt: string | null;
     /** The Raft user who completed the connection, resolved when still known. */
     connectedBy: { id: string; name: string | null } | null;
+    /**
+     * What GitHub granted this agent's connection (`AgentConnectionScopesView`),
+     * kept as it always was: `[]` when not connected, and also when GitHub named
+     * none, when the provider has not recorded them (`null`) or does not report
+     * them. The current connector's entry in `connectors` tells those apart
+     * (`[]` vs `null` vs absent).
+     */
     scopes: string[];
+    /** What the connect flow asked for, as the provider sent it (`null`: not recorded); absent when it did not send it. Not what was granted. */
+    requestedScopes?: string[] | null;
     /** The tenant connector this agent uses, if any. */
     connectorId: string | null;
     /** Every tenant connector of this provider on the agent's server. */
     connectors: AgentConnectionConnectorView[];
-  };
+  });
 
 /**
  * `GET /api/agents/:id/external-diagnostics` — the debugging snapshot of an
@@ -297,6 +380,10 @@ export interface ExternalAgentDiagnosticsView {
     lastDeliveryAt: string | null;
     lastError: string | null;
     nextAttemptAt: string | null;
+    /** When Raft stopped probing a stopped endpoint (30 days); a new PUT clears it. */
+    probeStoppedAt?: string | null;
+    /** While disabled: how delivery resumes (probing, or a new PUT). Absent from older servers. */
+    recovery?: string | null;
   };
   events: {
     /** Last cursor-mode `GET /internal/agent-api/events?ack=cursor` (or its ack), if any. */

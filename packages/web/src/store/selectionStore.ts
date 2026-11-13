@@ -22,6 +22,19 @@ interface SelectionState {
   /** True iff we are in select mode for some channel/thread. */
   isActive: boolean;
   /**
+   * The message the selection started on (the row Select Message was opened
+   * on; a thread's parent when entered without one). Focus can return to it
+   * when the selection ends where there is no composer. Null when inactive.
+   */
+  originId: string | null;
+  /**
+   * The anchor of a range selection: the message last added (or the one the
+   * selection started on), while it stays selected. Shift+click / Select to here takes every message
+   * from it to the target (messageRangeSelection.ts). Null when inactive or
+   * after the selection is cleared.
+   */
+  anchorId: string | null;
+  /**
    * Enter channel-mode select. `initialIds` are the messages to start the
    * selection with — typically the message the user opened the menu on.
    */
@@ -30,8 +43,8 @@ interface SelectionState {
    * Enter thread-mode select. `threadChannelId` is the channel id on which
    * thread replies live; `threadRootId`/`threadRootChannelId` describe the
    * parent message that anchors the thread. `initialIds` is the clicked row
-   * by default; ThreadPanel exposes an explicit Select all action for users
-   * who want parent + every reply.
+   * by default; the thread's toolbar (SelectModeToolbar) leads with a
+   * select-all checkbox for the parent + every loaded reply.
    */
   enterThread: (
     threadChannelId: string,
@@ -45,6 +58,11 @@ interface SelectionState {
   toggle: (messageId: string) => void;
   /** Replace the active selection with the supplied ids. No-op if not active. */
   selectAll: (messageIds: ReadonlyArray<string>) => void;
+  /**
+   * Add a range (ids computed by the caller, in any order) to the selection;
+   * never removes. `targetId` becomes the anchor. No-op if not active.
+   */
+  selectRange: (messageIds: ReadonlyArray<string>, targetId: string) => void;
   /**
    * Toggle a parent message together with all its already-loaded replies as
    * a group: if the parent was selected, the parent and every reply id are
@@ -64,6 +82,8 @@ export const useSelectionStore = create<SelectionState>((set, get) => ({
   threadRootChannelId: null,
   selectedIds: new Set(),
   isActive: false,
+  originId: null,
+  anchorId: null,
 
   enter: (channelId, initialIds) =>
     set({
@@ -71,6 +91,8 @@ export const useSelectionStore = create<SelectionState>((set, get) => ({
       threadRootId: null,
       threadRootChannelId: null,
       isActive: true,
+      originId: initialIds?.[0] ?? null,
+      anchorId: initialIds?.[0] ?? null,
       selectedIds: initialIds && initialIds.length > 0 ? new Set(initialIds) : new Set(),
     }),
 
@@ -80,6 +102,8 @@ export const useSelectionStore = create<SelectionState>((set, get) => ({
       threadRootId,
       threadRootChannelId,
       isActive: true,
+      originId: initialIds?.[0] ?? threadRootId,
+      anchorId: initialIds?.[0] ?? threadRootId,
       selectedIds: initialIds && initialIds.length > 0 ? new Set(initialIds) : new Set([threadRootId]),
     }),
 
@@ -89,6 +113,8 @@ export const useSelectionStore = create<SelectionState>((set, get) => ({
       threadRootId: null,
       threadRootChannelId: null,
       isActive: false,
+      originId: null,
+      anchorId: null,
       selectedIds: new Set(),
     }),
 
@@ -98,16 +124,27 @@ export const useSelectionStore = create<SelectionState>((set, get) => ({
     const next = new Set(state.selectedIds);
     if (next.has(messageId)) {
       next.delete(messageId);
-    } else {
-      next.add(messageId);
+      // The anchor is the last message added that is still selected:
+      // deselecting it leaves no anchor (a range from it would re-add it).
+      set({ selectedIds: next, anchorId: state.anchorId === messageId ? null : state.anchorId });
+      return;
     }
-    set({ selectedIds: next });
+    next.add(messageId);
+    set({ selectedIds: next, anchorId: messageId });
   },
 
   selectAll: (messageIds) => {
     const state = get();
     if (!state.isActive) return;
-    set({ selectedIds: new Set(messageIds) });
+    set(messageIds.length > 0 ? { selectedIds: new Set(messageIds) } : { selectedIds: new Set(), anchorId: null });
+  },
+
+  selectRange: (messageIds, targetId) => {
+    const state = get();
+    if (!state.isActive) return;
+    const next = new Set(state.selectedIds);
+    for (const id of messageIds) next.add(id);
+    set({ selectedIds: next, anchorId: targetId });
   },
 
   toggleWithThread: (parentId, threadReplyIds) => {

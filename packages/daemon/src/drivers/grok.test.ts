@@ -11,6 +11,7 @@ import {
   GrokDriver,
   grokLaunchAllowsPermissionAutoApproval,
   grokModelSetFromInitializeResult,
+  prepareGrokLaunch,
   probeGrok,
   resolveGrokCommand,
   resolveGrokHomeFromEnv,
@@ -532,6 +533,53 @@ test("grok ACP handshake starts a session, selects the model, and deduplicates c
     });
     assert.deepEqual(messages[3].params.prompt, [{ type: "text", text: "initial prompt" }]);
   });
+});
+
+test("grok on its default model with an effort selects that default model so the effort reaches Grok", async () => {
+  // The effort only travels with session/set_model. Before, an agent on Grok's
+  // default model never sent set_model, so its chosen effort was dropped.
+  await withScriptedGrok("fresh", async ({ waitForEvent, logPath }) => {
+    await waitForEvent((event) => event.kind === "turn_end", "grok default-model turn_end");
+    const messages = readMessages(logPath);
+    assert.deepEqual(messages.map((message) => message.method), [
+      "initialize",
+      "session/new",
+      "session/set_model",
+      "session/prompt",
+    ]);
+    assert.equal(messages[1].params._meta.modelId, undefined, "the session still starts on Grok's default");
+    assert.deepEqual(messages[2].params, {
+      sessionId: "fresh-session-1",
+      modelId: "grok-4.5",
+      _meta: { reasoningEffort: "medium" },
+    });
+  }, { model: "default", reasoningEffort: "medium" });
+});
+
+test("the launch plan carries the effort on Grok's default model too (the OAR host applies it on its own)", async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "slock-grok-plan-"));
+  try {
+    const { binDir } = installScriptedGrok(root);
+    const env = { ...process.env, PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ""}` };
+    const onDefault = await prepareGrokLaunch(makeSpawnContext(root, { model: "default", reasoningEffort: "high" }), { env });
+    assert.equal(onDefault.model, undefined, "still Grok's default model");
+    assert.equal(onDefault.reasoningEffort, "high");
+    const none = await prepareGrokLaunch(makeSpawnContext(root, { model: "default", reasoningEffort: null }), { env });
+    assert.equal(none.reasoningEffort, undefined);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("grok on its default model without an effort sends no model selection", async () => {
+  await withScriptedGrok("fresh", async ({ waitForEvent, logPath }) => {
+    await waitForEvent((event) => event.kind === "turn_end", "grok default-model turn_end");
+    assert.deepEqual(readMessages(logPath).map((message) => message.method), [
+      "initialize",
+      "session/new",
+      "session/prompt",
+    ]);
+  }, { model: "default", reasoningEffort: null });
 });
 
 test("grok missing resume falls back to a fresh session with a visible recovery notice", async () => {

@@ -1,26 +1,25 @@
-import type { TaskStatusId } from "@botiverse/raft-ui";
+import { TASK_STATUSES } from "@botiverse/raft-shared";
 import {
   Button,
-  Card,
-  PickerTriggerButton,
-  PanelHeaderContent,
-  PanelMeta,
-  PanelSectionHeader,
-  PanelTitle,
   Popover,
   PopoverTrigger,
-  SegmentedControl,
-  SegmentedControlItem,
-  SegmentedControlLabel,
   TaskBoardColumn,
   TaskBoardColumnBadge,
   TaskBoardColumnChevron,
   TaskBoardColumnCount,
   TaskBoardColumnEmpty,
+  TaskBoardColumnEmptyAllowed,
+  TaskBoardColumnEmptyBlocked,
+  TaskBoardColumnEmptyIdle,
   TaskBoardColumnHeading,
   TaskBoardColumnItems,
   TaskBoardColumnPanel,
   TaskBoardColumnTrigger,
+  TaskBoardRoot,
+  TaskDndProvider,
+  TaskDragOverlay,
+  TaskDraggable,
+  TaskDropZone,
   TaskSection as RuiTaskSection,
   TaskSectionBadge,
   TaskSectionChevron,
@@ -31,44 +30,50 @@ import {
   TaskSectionPanel,
   TaskSectionTrigger,
   TasksPanelRoot,
+  ScrollArea,
   TasksPanelToolbar,
-  TasksPanelViewport,
 } from "@botiverse/raft-ui";
+import { FitToolbar, FitToolbarButton, FitToolbarGroup, FitToolbarPicker } from "@botiverse/raft-ui/wip";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { touchDragRegion } from "../../utils/touchDragRegion";
 import { useIntl } from "react-intl";
-import { CheckSquare, ChevronDown, Columns3, Hash, LayoutList, Plus, User as UserIcon, UserCircle2 } from "lucide-react";
-import {
-  DndContext,
-  PointerSensor,
-  TouchSensor,
-  useDraggable,
-  useDroppable,
-  useSensor,
-  useSensors,
-} from "@dnd-kit/core";
-import type {
-  DragEndEvent,
-} from "@dnd-kit/core";
-import { CSS } from "@dnd-kit/utilities";
+import { ChevronDown, Columns3, Hash, LayoutList, ListTodo, Plus, User as UserIcon, UserCircle2, X } from "lucide-react";
 import { useTaskStore } from "../../store/taskStore";
 import type { Task, TaskStatus } from "../../store/taskStore";
 import { useThreadStore } from "../../store/threadStore";
+import { TASK_V2_CONVERSATIONS_FLAG_KEY, useServerFeatureFlag } from "../../store/serverFeatureFlags";
+import { openTaskConversationDialog } from "./useOpenTask";
+import { opensAsTaskConversation } from "../../utils/taskConversation";
 import { useLegacyTaskPanelStore } from "../../store/legacyTaskPanelStore";
 import { useProfileStore } from "../../store/profileStore";
 import { useChannelStore } from "../../store/channelStore";
-import { useServerStore } from "../../store/serverStore";
-import { useAgentStore } from "../../store/agentStore";
 import { useAuthStore } from "../../store/authStore";
-import TaskCard from "./TaskCard";
-import CreateTaskDialog from "./CreateTaskDialog";
-import { TASK_STATUS_UI } from "./taskStatusUi";
+import TaskCard, { TaskCardSkeleton } from "./TaskCard";
+import { taskLanePlaceholders, useRememberedTaskLaneCounts } from "./taskLaneCounts";
+import { CreateTaskDialog } from "./DeferredCreateTaskDialog";
+import { TaskBacklogReasonPopover } from "./TaskBacklogReasonPopover";
+import { TASK_STATUS_UI, toRuiTaskStatus } from "./taskStatusUi";
+import { backlogColumnHeading, useTaskBoardDrag } from "./useTaskBoardDrag";
+import type { BoardDropData } from "./useTaskBoardDrag";
 import EmptyState from "../ui/EmptyState";
-import { SkeletonRow } from "../ui/Skeleton";
 import AvatarSlot from "../ui/AvatarSlot";
 import SelectionPopover from "../ui/SelectionPopover";
 import VirtualizedTaskStack, { TaskVirtualLayout } from "./VirtualizedTaskStack";
 import { useLiveSearchParams } from "../../hooks/useLiveSearchParams";
 import { useServerPermissions } from "../../hooks/useServerPermissions";
+import { useServerStore } from "../../store/serverStore";
+import { useMediaQuery } from "../../hooks/effectPrimitives";
+import { LIST_TOOLBAR_MORE_GROUP_CLASS, LIST_TOOLBAR_STEP } from "../ui/listToolbar";
+import { ListToolbarMore, ListViewSwitch, MoreMenuChoices } from "../ui/ListToolbarParts";
+import { useTabRootScroll } from "../../hooks/useTabRootScroll";
+import { TabRootBar } from "../layout/TabRootBar";
+import { usePinnedHeadRailInset } from "../../hooks/usePinnedHeadRailInset";
+import { PHONE_ROOT_TOOLBAR_CLASS, PHONE_ROOT_VIEWPORT_CLASS, TOOLBAR_CLASS, VIEWPORT_CLASS, VIEWPORT_CONTENT_CLASS } from "./tasksPanelViewport";
+import { LoadMoreSentinel } from "./tasksPage/LoadMoreSentinel";
+import { parseTaskViewMode, readStoredTaskViewMode, writeStoredTaskViewMode } from "./tasksViewMode";
+import type { ViewMode } from "./tasksViewMode";
+import { useTaskIdentityOptions } from "./useTaskIdentityOptions";
+import type { IdentityOption } from "./useTaskIdentityOptions";
 
 /**
  * Identity reference shape used by Creator + Assignee filters. Encoded in
@@ -84,31 +89,9 @@ import { useServerPermissions } from "../../hooks/useServerPermissions";
  */
 type IdentityFilterValue = string;
 
-interface IdentityOption {
-  key: IdentityFilterValue;
-  type: "user" | "agent";
-  id: string;
-  label: string;
-  /** Stable @handle / mention name for searchability + tie-break */
-  handle: string;
-  /** Avatar identity — passed to AvatarSlot. Agents use `avatarUrl`; humans
-   *  use `avatarUrl` / `gravatarHash` / `email`. Absent on the synthetic
-   *  "Unassigned" sentinel, which renders as `humanPlaceholder`. */
-  avatarUrl?: string | null;
-  gravatarHash?: string | null;
-  email?: string | null;
-  /** True for the synthetic "Unassigned" row. Suppresses avatar lookup and
-   *  italicizes the label so the sentinel stays visually distinct from a
-   *  real member while still flowing through the same sorted+searchable
-   *  list (no longer pinned). */
-  isSentinel?: boolean;
-}
 
-type ViewMode = "board" | "list";
-
-const TASK_VIEW_MODE_STORAGE_KEY = "slock.tasks.viewMode";
-
-const STATUS_ORDER: TaskStatus[] = ["todo", "in_progress", "in_review", "done", "closed"];
+/** The way work flows, left to right (raft-design patterns/tasks.md): Backlog to Closed. */
+const STATUS_ORDER: readonly TaskStatus[] = TASK_STATUSES;
 
 function sortTasks(tasks: Task[]): Task[] {
   return [...tasks].sort((a, b) => {
@@ -118,55 +101,39 @@ function sortTasks(tasks: Task[]): Task[] {
   });
 }
 
-function parseTaskViewMode(value: string | null): ViewMode | null {
-  return value === "board" || value === "list" ? value : null;
-}
+export { TaskCardSkeleton };
 
-function readStoredTaskViewMode(): ViewMode | null {
-  try {
-    return parseTaskViewMode(window.localStorage.getItem(TASK_VIEW_MODE_STORAGE_KEY));
-  } catch {
-    return null;
-  }
-}
-
-function writeStoredTaskViewMode(nextView: ViewMode): void {
-  try {
-    window.localStorage.setItem(TASK_VIEW_MODE_STORAGE_KEY, nextView);
-  } catch {
-    // Ignore storage failures; the URL param and platform default still work.
-  }
-}
-
-const SKELETON_LINE_WIDTHS = ["w-1/2", "w-3/4"];
-
-/** A loading placeholder shaped like the task card it stands in for
- *  (Raft DS TaskCard: raft-ui Card's surface, hairline and container radius). */
-function TaskCardSkeleton() {
-  return (
-    <Card
-      render={<SkeletonRow lineWidths={SKELETON_LINE_WIDTHS} />}
-      className="flex-row items-center gap-2 p-3"
-    />
+/**
+ * A lane's cards while it loads (`count` TaskCardSkeletons, `gap` apart as
+ * the loaded cards are), or, for a lane that had none last time, its empty
+ * box held invisible: whether it is empty is not known yet.
+ */
+function LanePlaceholders({ count, gapClassName, empty, render = (cards) => cards }: {
+  count: number;
+  gapClassName: string;
+  empty: React.ReactNode;
+  /** Where the cards go in the lane (the list's TaskSectionItems). */
+  render?: (cards: React.ReactNode) => React.ReactNode;
+}) {
+  if (count === 0) return empty;
+  return render(
+    <div className={`flex flex-col ${gapClassName}`} aria-hidden="true" data-testid="task-lane-placeholders">
+      {Array.from({ length: count }, (_, index) => <TaskCardSkeleton key={index} />)}
+    </div>,
   );
 }
 
-/** The applied-filter count (Raft DS `rf-filter__count`): Space Mono 12, bold. */
-const FILTER_COUNT_CLASS_NAME = "font-mono text-mono-meta font-bold";
+const inListItems = (cards: React.ReactNode) => <TaskSectionItems>{cards}</TaskSectionItems>;
+
+/** List cards sit 10px apart (the list's VirtualizedTaskStack gap); placeholders too. */
+const LIST_CARD_GAP = 10;
+const LIST_CARD_GAP_CLASS = "gap-2.5";
 
 function getTaskKey(task: Task): string {
   return task.id;
 }
 
-const STATUS_TO_RUI_STATUS: Record<TaskStatus, TaskStatusId> = {
-  todo: "todo",
-  in_progress: "in-progress",
-  in_review: "in-review",
-  done: "done",
-  closed: "closed",
-};
-
-function TaskSection({
+export function TaskSection({
   status,
   tasks,
   onOpenTask,
@@ -177,6 +144,8 @@ function TaskSection({
   hasMore = false,
   loadingPage = false,
   onLoadMore,
+  renderFooterEnd,
+  placeholders,
 }: {
   status: TaskStatus;
   tasks: Task[];
@@ -189,22 +158,32 @@ function TaskSection({
   hasMore?: boolean;
   loadingPage?: boolean;
   onLoadMore?: () => void;
+  /** Extra read-only facts per card (the channel Tasks panel shows the assignee). */
+  renderFooterEnd?: (task: Task) => React.ReactNode;
+  /** The list is still loading: this many card placeholders (0: the empty
+   *  box, held invisible), and no count until it is known. */
+  placeholders?: number;
 }) {
   const { formatMessage } = useIntl();
-  const ruiStatus = STATUS_TO_RUI_STATUS[status];
+  const ruiStatus = toRuiTaskStatus(status);
   const handleOpenChange = useCallback(() => onToggleCollapsed?.(status), [onToggleCollapsed, status]);
+  const emptyLabel = formatMessage(
+    { id: "task.status.emptyGroup" },
+    { status: formatMessage({ id: TASK_STATUS_UI[status].labelId }) },
+  );
   const renderTask = useCallback((task: Task) => (
     <TaskCard
       task={task}
       onOpen={onOpenTask}
       showChannelName={showChannelName}
+      footerEnd={renderFooterEnd?.(task)}
     />
-  ), [onOpenTask, showChannelName]);
+  ), [onOpenTask, showChannelName, renderFooterEnd]);
   return (
     <RuiTaskSection
       open={!collapsed}
       onOpenChange={handleOpenChange}
-      className="space-y-2.5"
+      className="stack-y-2.5"
     >
       <TaskSectionTrigger
         disabled={!onToggleCollapsed}
@@ -218,7 +197,7 @@ function TaskSection({
           <TaskSectionBadge status={ruiStatus}>
             {formatMessage({ id: TASK_STATUS_UI[status].labelId })}
           </TaskSectionBadge>
-          <TaskSectionCount>{tasks.length}</TaskSectionCount>
+          {placeholders === undefined ? <TaskSectionCount>{tasks.length}</TaskSectionCount> : null}
         </TaskSectionHeading>
         {onToggleCollapsed ? (
           <TaskSectionChevron />
@@ -227,16 +206,18 @@ function TaskSection({
         )}
       </TaskSectionTrigger>
       <TaskSectionPanel>
-        {tasks.length === 0 ? (
+        {placeholders !== undefined ? (
+          <LanePlaceholders
+            count={placeholders}
+            gapClassName={LIST_CARD_GAP_CLASS}
+            empty={<TaskSectionEmpty className="invisible" aria-hidden="true">{emptyLabel}</TaskSectionEmpty>}
+            render={inListItems}
+          />
+        ) : tasks.length === 0 ? (
           loadingPage ? (
             <TaskCardSkeleton />
           ) : (
-            <TaskSectionEmpty>
-              {formatMessage(
-                { id: "task.status.emptyGroup" },
-                { status: formatMessage({ id: TASK_STATUS_UI[status].labelId }) },
-              )}
-            </TaskSectionEmpty>
+            <TaskSectionEmpty>{emptyLabel}</TaskSectionEmpty>
           )
         ) : (
           <TaskSectionItems>
@@ -244,7 +225,7 @@ function TaskSection({
               items={tasks}
               scrollElementRef={scrollElementRef}
               estimateSize={116}
-              gap={10}
+              gap={LIST_CARD_GAP}
               getItemKey={getTaskKey}
               renderItem={renderTask}
             />
@@ -253,7 +234,7 @@ function TaskSection({
         {hasMore && (
           <Button
             type="button"
-            size="sm"
+            size="md"
             variant="outline"
             disabled={loadingPage}
             onClick={onLoadMore}
@@ -268,140 +249,202 @@ function TaskSection({
   );
 }
 
+/** Board cards sit `gap-2` apart (TaskBoardColumnItems); the virtualizer must match. */
+const BOARD_CARD_GAP = 8;
+
 /**
- * Drag-handle wrapper around TaskCard for board-view drag-drop.
- *
- * Uses @dnd-kit/core `useDraggable` instead of the HTML5 Drag API so that
- * pointer events (mouse, stylus) and touch events work identically. The
- * PointerSensor + TouchSensor combination in DndContext handles both surfaces;
- * the TouchSensor's delay constraint distinguishes a hold-to-drag from a
- * horizontal scroll gesture.
- *
- * Click / tap → TaskCard.onOpen still fires normally when the drag activation
- * constraint is not met (PointerSensor: distance 5px, TouchSensor: 200ms hold).
+ * One draggable board card (raft-ui TaskDnd). It is not a drop target: a
+ * column's order is the sort's, not the person's, so a card lands on a column
+ * and never "between two cards", where it would only jump back to its sorted
+ * place (stdrc 11-10; Raft DS › Drag and drop: where the order isn't the
+ * person's, the target is the column). Pointer (6px), touch (hold 500ms, then
+ * move) and keyboard activation come from TaskDndProvider, so a click or tap
+ * still opens the card.
  */
-function DraggableTaskWrapper({
+function BoardTaskItem({
   task,
   children,
-  disabled = false,
 }: {
   task: Task;
+  status: TaskStatus;
   children: React.ReactNode;
-  disabled?: boolean;
 }) {
-  const { attributes, listeners, setNodeRef, transform, isDragging } = useDraggable({ id: task.id, disabled });
-  const dragStyle = {
-    transform: CSS.Translate.toString(transform),
-    zIndex: isDragging ? 20 : undefined,
-  };
-
   return (
-    <div
-      ref={setNodeRef}
-      {...listeners}
-      {...attributes}
+    <TaskDraggable
+      id={task.id}
       data-testid="task-board-draggable-card"
-      style={dragStyle}
-      className={`relative ${disabled ? "" : "cursor-grab touch-none will-change-transform active:cursor-grabbing"} ${isDragging ? "opacity-90" : ""}`}
+      data-task-id={task.id}
     >
       {children}
-      </div>
+    </TaskDraggable>
   );
 }
 
 /**
- * One status column in the board view. Uses `useDroppable` so that tasks can
- * be dragged into it from any other column; `isOver` drives the highlight state.
+ * One status column in the board view: a TaskDropZone rendered as the
+ * TaskBoardColumn, so the column's `data-drop-state` (idle / allowed /
+ * blocked) drives the recipe's empty text and collapsed outline. The column
+ * itself never changes fill. The dragged card leaves its column while the
+ * overlay carries it.
  */
-function DroppableColumn({
+export function BoardColumn({
   status,
   collapsed,
   onToggleCollapsed,
   statusTasks,
+  activeTaskId,
+  blockedReason,
   openTask,
   isChannelMode,
   scrollElementRef,
-  canModifyTasks,
   hasMore = false,
   loadingPage = false,
   onLoadMore,
+  renderFooterEnd,
+  count,
+  renderTitleEnd,
+  loadMoreOnScroll = false,
+  loadMoreFailed = false,
+  pendingFirstPage = false,
+  currentTaskId = null,
+  selectedTaskIds,
+  placeholders,
 }: {
   status: TaskStatus;
   collapsed: boolean;
   onToggleCollapsed: (status: TaskStatus) => void;
   statusTasks: Task[];
-  openTask: (task: Task) => void;
+  /** The card being dragged, if any; it is drawn in the drag overlay instead. */
+  activeTaskId: string | null;
+  /** Why the dragged card can't be dropped here, when the board knows. */
+  blockedReason: string | undefined;
+  openTask: (task: Task, event?: React.MouseEvent) => void;
   isChannelMode: boolean;
   scrollElementRef: React.RefObject<HTMLDivElement | null>;
-  canModifyTasks: boolean;
   /** Server-mode lazy paging: more pages exist for this status lane. */
   hasMore?: boolean;
   loadingPage?: boolean;
   onLoadMore?: () => void;
+  /** Extra read-only facts per card (the channel Tasks panel shows the assignee). */
+  renderFooterEnd?: (task: Task) => React.ReactNode;
+  /** The column's total from the server (the Tasks page); else the cards shown. */
+  count?: number | null;
+  /** Inline after each card's title (the Tasks page: its number of messages). */
+  renderTitleEnd?: (task: Task) => React.ReactNode;
+  /** The next page is read when the end of the column scrolls into view, not on a button. */
+  loadMoreOnScroll?: boolean;
+  loadMoreFailed?: boolean;
+  /** Its first page is still to be read: a placeholder, not "No … tasks". */
+  pendingFirstPage?: boolean;
+  /** The task open beside the board. */
+  currentTaskId?: string | null;
+  /** Cards selected on the Tasks page. */
+  selectedTaskIds?: ReadonlySet<string>;
+  /** The board is still loading: this many card placeholders (0: the empty
+   *  box, held invisible), and no count until it is known. */
+  placeholders?: number;
 }) {
   const { formatMessage } = useIntl();
-  const { setNodeRef, isOver } = useDroppable({ id: status, disabled: !canModifyTasks });
-  const ruiStatus = STATUS_TO_RUI_STATUS[status];
+  const ruiStatus = toRuiTaskStatus(status);
+  const statusLabel = formatMessage({ id: TASK_STATUS_UI[status].labelId });
+  const columnDropId = `task-status:${status}`;
+  const columnDropData = useMemo<BoardDropData>(() => ({ status }), [status]);
+  const visibleTasks = useMemo(
+    () => (activeTaskId == null ? statusTasks : statusTasks.filter((task) => task.id !== activeTaskId)),
+    [activeTaskId, statusTasks],
+  );
   const handleOpenChange = useCallback(() => onToggleCollapsed(status), [onToggleCollapsed, status]);
   const renderTask = useCallback((task: Task) => (
-    <DraggableTaskWrapper task={task} disabled={!canModifyTasks}>
+    <BoardTaskItem task={task} status={status}>
       <TaskCard
         task={task}
         onOpen={openTask}
         showChannelName={!isChannelMode}
+        footerEnd={renderFooterEnd?.(task)}
+        titleEnd={renderTitleEnd?.(task)}
+        current={currentTaskId === task.id}
+        selected={selectedTaskIds?.has(task.id) ?? false}
       />
-    </DraggableTaskWrapper>
-  ), [canModifyTasks, isChannelMode, openTask]);
+    </BoardTaskItem>
+  ), [currentTaskId, isChannelMode, openTask, renderFooterEnd, renderTitleEnd, selectedTaskIds, status]);
   return (
     <TaskBoardColumn
-      ref={setNodeRef}
+      render={
+        <TaskDropZone
+          id={columnDropId}
+          data={columnDropData}
+          data-drop-collapsed={collapsed ? "true" : undefined}
+        />
+      }
       open={!collapsed}
       onOpenChange={handleOpenChange}
-      // The drop target is a hover-like hint: the pressed overlay, no colour
-      // (Raft DS: hints have no colour). The column's own chrome is the recipe's.
-      className={`rounded-container transition-colors ${isOver ? "bg-fill-pressed" : ""}`}
+      data-testid={`task-board-column-${status}`}
     >
       <TaskBoardColumnTrigger
         aria-label={formatMessage(
           { id: collapsed ? "task.status.showGroup" : "task.status.hideGroup" },
-          { status: formatMessage({ id: TASK_STATUS_UI[status].labelId }) },
+          { status: statusLabel },
         )}
       >
         <TaskBoardColumnHeading>
           <TaskBoardColumnBadge status={ruiStatus}>
-            {formatMessage({ id: TASK_STATUS_UI[status].labelId })}
+            {statusLabel}
           </TaskBoardColumnBadge>
-          <TaskBoardColumnCount>{statusTasks.length}</TaskBoardColumnCount>
+          {placeholders === undefined ? <TaskBoardColumnCount>{count ?? statusTasks.length}</TaskBoardColumnCount> : null}
         </TaskBoardColumnHeading>
-        <TaskBoardColumnChevron />
+        <TaskBoardColumnChevron><ChevronDown aria-hidden /></TaskBoardColumnChevron>
       </TaskBoardColumnTrigger>
       <TaskBoardColumnPanel>
         <TaskBoardColumnItems>
-          {statusTasks.length === 0 ? (
-            loadingPage ? (
+          {placeholders !== undefined ? (
+            <LanePlaceholders
+              count={placeholders}
+              gapClassName="gap-2"
+              empty={(
+                <TaskBoardColumnEmpty className="invisible" aria-hidden="true">
+                  <TaskBoardColumnEmptyIdle>
+                    {formatMessage({ id: "task.status.emptyGroup" }, { status: statusLabel })}
+                  </TaskBoardColumnEmptyIdle>
+                </TaskBoardColumnEmpty>
+              )}
+            />
+          ) : visibleTasks.length === 0 ? (
+            loadingPage || pendingFirstPage ? (
               <TaskCardSkeleton />
             ) : (
-              <TaskBoardColumnEmpty>
-                {formatMessage(
-                  { id: isOver ? "task.status.dropToSet" : "task.status.emptyGroup" },
-                  { status: formatMessage({ id: TASK_STATUS_UI[status].labelId }) },
-                )}
-              </TaskBoardColumnEmpty>
+              <>
+                <TaskBoardColumnEmpty>
+                  <TaskBoardColumnEmptyIdle>
+                    {formatMessage({ id: "task.status.emptyGroup" }, { status: statusLabel })}
+                  </TaskBoardColumnEmptyIdle>
+                  <TaskBoardColumnEmptyAllowed>
+                    {formatMessage({ id: "task.status.dropToSet" }, { status: statusLabel })}
+                  </TaskBoardColumnEmptyAllowed>
+                  <TaskBoardColumnEmptyBlocked>
+                    {blockedReason ?? formatMessage({ id: "task.status.cannotMoveTo" }, { status: statusLabel })}
+                  </TaskBoardColumnEmptyBlocked>
+                </TaskBoardColumnEmpty>
+              </>
             )
           ) : (
             <VirtualizedTaskStack
-              items={statusTasks}
+              items={visibleTasks}
               scrollElementRef={scrollElementRef}
               estimateSize={116}
-              gap={10}
+              gap={BOARD_CARD_GAP}
               getItemKey={getTaskKey}
               renderItem={renderTask}
             />
           )}
-          {hasMore && (
+          {hasMore && loadMoreOnScroll && onLoadMore ? (
+            <>
+              {loadingPage && visibleTasks.length > 0 ? <TaskCardSkeleton /> : null}
+              <LoadMoreSentinel onLoadMore={onLoadMore} loading={loadingPage} failed={loadMoreFailed} testId={`task-load-more-${status}`} />
+            </>
+          ) : hasMore && (
             <Button
               type="button"
-              size="sm"
+              size="md"
               variant="outline"
               disabled={loadingPage}
               onClick={onLoadMore}
@@ -434,7 +477,7 @@ function DroppableColumn({
  * Single-popover-at-a-time is enforced by the parent: each chip is given
  * an `isOpen` prop and the parent tracks which chip key (if any) is open.
  */
-function IdentityFilterChip({
+export function IdentityFilterChip({
   icon,
   label,
   options,
@@ -444,11 +487,13 @@ function IdentityFilterChip({
   selfOption = null,
   isOpen,
   onOpenChange,
+  labelOrder,
+  testId,
 }: {
   icon: React.ReactNode;
   label: string;
   options: IdentityOption[];
-  selected: IdentityFilterValue[];
+  selected: readonly IdentityFilterValue[];
   onChange: (next: IdentityFilterValue[]) => void;
   includeUnassigned?: boolean;
   /**
@@ -462,6 +507,9 @@ function IdentityFilterChip({
   isOpen: boolean;
   /** The popover's trigger, outside presses and Escape all report here. */
   onOpenChange: (open: boolean) => void;
+  /** When its label gives way in its FitToolbar (FitToolbarPicker). */
+  labelOrder: number;
+  testId?: string;
 }) {
   const { formatMessage } = useIntl();
   const [search, setSearch] = useState("");
@@ -546,15 +594,13 @@ function IdentityFilterChip({
     // per stdrc 2026-05-18 msg=806c19c0. The shared popover row still
     // reserves the size-5 slot for identity filters so its height and label
     // baseline stay identical to real compact-list AvatarSlot rows (size-5,
-    // 1px border, 18px pixel/gravatar).
+    // 1px border, 18px pixel/photo).
     avatar: opt.isSentinel ? null : (
       <AvatarSlot
         context="compact-list"
         type={opt.type === "agent" ? "agent" : "human"}
         agentAvatarUrl={opt.type === "agent" ? opt.avatarUrl ?? null : null}
         humanAvatarUrl={opt.type === "user" ? opt.avatarUrl ?? null : null}
-        gravatarHash={opt.type === "user" ? opt.gravatarHash ?? null : null}
-        email={opt.type === "user" ? opt.email ?? null : null}
       />
     ),
   })), [filteredOptions, selected, toggleValue]);
@@ -563,18 +609,16 @@ function IdentityFilterChip({
   // on screen; the popover owns the toggle, outside presses and Escape.
   return (
     <Popover open={isOpen} onOpenChange={handleOpenChange}>
-      <PopoverTrigger
-        render={<PickerTriggerButton type="button" data-has-value={selected.length > 0 ? "" : undefined} />}
+      <FitToolbarPicker
+        trigger={<PopoverTrigger />}
+        icon={icon}
+        value={selected.length > 0 ? selected.length : undefined}
+        labelOrder={labelOrder}
+        data-active={selected.length > 0 ? "" : undefined}
+        data-testid={testId}
       >
-        {icon}
         {label}
-        {selected.length > 0 && (
-          <span className={FILTER_COUNT_CLASS_NAME}>{selected.length}</span>
-        )}
-        <span data-picker-trigger-indicator="" aria-hidden="true">
-          <ChevronDown />
-        </span>
-      </PopoverTrigger>
+      </FitToolbarPicker>
       <SelectionPopover
         title={label}
         searchable
@@ -583,6 +627,82 @@ function IdentityFilterChip({
         options={popoverOptions}
         showClear={selected.length > 0}
         onClear={clearSelection}
+      />
+    </Popover>
+  );
+}
+
+/**
+ * The Channel filter chip + popover (server-wide Tasks views): a searchable
+ * multi-select of the server's channels, as the Creator/Assignee chips.
+ * Single-popover-at-a-time is the parent's, as for those.
+ */
+export function ChannelFilterChip({
+  selected,
+  onChange,
+  isOpen,
+  onOpenChange,
+  labelOrder,
+  testId,
+}: {
+  selected: readonly string[];
+  onChange: (next: string[]) => void;
+  isOpen: boolean;
+  onOpenChange: (open: boolean) => void;
+  /** When its label gives way in its FitToolbar (FitToolbarPicker). */
+  labelOrder: number;
+  testId?: string;
+}) {
+  const { formatMessage } = useIntl();
+  const channels = useChannelStore((s) => s.channels);
+  // Search box state for the channel filter popover, reset on (re)open so the
+  // popover doesn't reopen with stale text. stdrc 2026-05-18
+  // #proj-task:572c5ba6 msg=d6a82cc9: "channel filter 也应该加上搜索".
+  const [search, setSearch] = useState("");
+  const handleOpenChange = useCallback((open: boolean) => {
+    if (open) setSearch("");
+    onOpenChange(open);
+  }, [onOpenChange]);
+  const options = useMemo(() => {
+    return [...channels]
+      .filter((channel) => channel.type === "channel" || channel.type === "private")
+      .sort((a, b) => a.name.localeCompare(b.name));
+  }, [channels]);
+  const filtered = useMemo(() => {
+    if (!search.trim()) return options;
+    const needle = search.trim().toLowerCase();
+    return options.filter((channel) => channel.name.toLowerCase().includes(needle));
+  }, [options, search]);
+  const popoverOptions = useMemo(() => filtered.map((channel) => ({
+    key: channel.id,
+    checked: selected.includes(channel.id),
+    onClick: () => onChange(selected.includes(channel.id)
+      ? selected.filter((id) => id !== channel.id)
+      : [...selected, channel.id]),
+    label: `#${channel.name}`,
+  })), [filtered, onChange, selected]);
+  const clear = useCallback(() => onChange([]), [onChange]);
+  const channelLabel = formatMessage({ id: "task.panel.channelColumn" });
+  return (
+    <Popover open={isOpen} onOpenChange={handleOpenChange}>
+      <FitToolbarPicker
+        trigger={<PopoverTrigger />}
+        icon={<Hash />}
+        value={selected.length > 0 ? selected.length : undefined}
+        labelOrder={labelOrder}
+        data-active={selected.length > 0 ? "" : undefined}
+        data-testid={testId}
+      >
+        {channelLabel}
+      </FitToolbarPicker>
+      <SelectionPopover
+        title={formatMessage({ id: "task.filter.channels" })}
+        searchable
+        search={search}
+        onSearchChange={setSearch}
+        options={popoverOptions}
+        showClear={selected.length > 0}
+        onClear={clear}
       />
     </Popover>
   );
@@ -630,15 +750,11 @@ export default function TasksPanel({ channelId }: TasksPanelProps = {}) {
   const loadTasks = useTaskStore((s) => s.loadTasks);
   const registerServerTasksConsumer = useTaskStore((s) => s.registerServerTasksConsumer);
   const unregisterServerTasksConsumer = useTaskStore((s) => s.unregisterServerTasksConsumer);
-  const updateTaskStatus = useTaskStore((s) => s.updateTaskStatus);
   const tasks = isChannelMode ? channelTasks : serverTasks;
   const loading = isChannelMode ? channelLoading : serverLoading;
-  const channels = useChannelStore((s) => s.channels);
-  const members = useServerStore((s) => s.members);
-  const agents = useAgentStore((s) => s.agents);
   const currentUserId = useAuthStore((s) => s.user?.id);
-  const { role } = useServerPermissions();
-  const canModifyTasks = role !== "guest";
+  const { capabilities } = useServerPermissions();
+  const canManageServer = capabilities.deleteAnyTask;
   const openThread = useThreadStore((s) => s.openThread);
   const closeThread = useThreadStore((s) => s.closeThread);
   const threadPanelOpen = useThreadStore((s) => !!s.openParentMessageId);
@@ -651,15 +767,11 @@ export default function TasksPanel({ channelId }: TasksPanelProps = {}) {
   // chip swaps. The previous channel-only state was a boolean — now that we
   // have three chips we need a discriminator.
   const [openFilter, setOpenFilter] = useState<"channel" | "creator" | "assignee" | null>(null);
-  // Search box state for the channel filter popover. Mirrors how
-  // IdentityFilterChip handles its own `search` — reset on (re)open so the
-  // popover doesn't reopen with stale text. stdrc 2026-05-18
-  // #proj-task:572c5ba6 msg=d6a82cc9: "channel filter 也应该加上搜索".
-  const [channelSearch, setChannelSearch] = useState("");
   const [showCreateDialog, setShowCreateDialog] = useState(false);
-  // Both terminal states (done, closed) start collapsed to keep visual focus
-  // on active work. Users can expand explicitly.
+  // Backlog (work not planned now) and both terminal states (done, closed) start
+  // collapsed to keep visual focus on active work. Users can expand explicitly.
   const [collapsedStatuses, setCollapsedStatuses] = useState<Record<TaskStatus, boolean>>({
+    backlog: true,
     todo: false,
     in_progress: false,
     in_review: false,
@@ -680,13 +792,32 @@ export default function TasksPanel({ channelId }: TasksPanelProps = {}) {
     return isMobile ? "list" : "board";
   }, [searchParams, storedViewMode, isMobile]);
 
-  // dnd-kit sensors — PointerSensor for mouse/stylus, TouchSensor for touch.
-  // TouchSensor delay:200 / tolerance:5 distinguishes hold-to-drag from
-  // quick tap (opens card) and from horizontal scroll swipe (moves viewport).
-  const sensors = useSensors(
-    useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
-    useSensor(TouchSensor, { activationConstraint: { delay: 200, tolerance: 5 } }),
-  );
+  // The board is the touch-drag surface (see utils/touchDragRegion): only it,
+  // and only in board mode, keeps touches cancelable for TaskDndProvider's
+  // touch sensor (hold 500ms, then move; a swipe still scrolls the board).
+  const isBoardView = viewMode === "board";
+  const viewportRef = useCallback((node: HTMLDivElement | null) => {
+    scrollContainerRef.current = node;
+    const releaseDragRegion = isBoardView ? touchDragRegion(node) : undefined;
+    return () => {
+      releaseDragRegion?.();
+      scrollContainerRef.current = null;
+    };
+  }, [isBoardView]);
+
+  // On the phone the server-wide Tasks page is a tab root like Home, Activity
+  // and More: the 56px frame bar names it (the page's one h1) with its count,
+  // no large title (design lead + artin 2026-10-21). Its filter row moves into
+  // the scroller as the first child and pins under the bar, like Activity's.
+  const isPhone = useMediaQuery("(max-width: 767px)");
+  const isPhoneTabRoot = !isChannelMode && isPhone;
+  // The Tasks tab root: a re-tap scrolls it to the top, and its scroll
+  // position survives a switch to another tab (its filters are in the URL,
+  // which the tab bar brings back).
+  useTabRootScroll(isPhoneTabRoot ? "tasks" : null, scrollContainerRef);
+  // The pinned filter row's height, kept clear above the vertical scrollbar.
+  const toolbarRef = useRef<HTMLDivElement>(null);
+  const toolbarRailInset = usePinnedHeadRailInset(toolbarRef, isPhoneTabRoot);
 
   useEffect(() => {
     if (isChannelMode) {
@@ -738,54 +869,7 @@ export default function TasksPanel({ channelId }: TasksPanelProps = {}) {
     return () => observer.disconnect();
   }, []);
 
-  const channelOptions = useMemo(() => {
-    return [...channels]
-      .filter((channel) => channel.type === "channel" || channel.type === "private")
-      .sort((a, b) => a.name.localeCompare(b.name));
-  }, [channels]);
-
-  const filteredChannelOptions = useMemo(() => {
-    if (!channelSearch.trim()) return channelOptions;
-    const needle = channelSearch.trim().toLowerCase();
-    return channelOptions.filter((channel) =>
-      channel.name.toLowerCase().includes(needle),
-    );
-  }, [channelOptions, channelSearch]);
-
-  /**
-   * Combined identity options for Creator + Assignee popovers.
-   * Humans and agents share the same shape because both can author or claim
-   * a task. We flag the kind so the popover renders a distinguishing badge
-   * (H / A) and so the selection encoding stays unambiguous.
-   *
-   * Stable sort by display label keeps the list's visual order independent
-   * from the order events arrive in the underlying Zustand stores.
-   */
-  const identityOptions = useMemo<IdentityOption[]>(() => {
-    const humans = members.map<IdentityOption>((m) => ({
-      key: `user:${m.userId}`,
-      type: "user",
-      id: m.userId,
-      label: m.displayName || m.name,
-      handle: m.name,
-      avatarUrl: m.avatarUrl,
-      gravatarHash: m.gravatarHash,
-      email: m.email,
-    }));
-    const agentOpts = agents
-      .filter((a) => !a.deletedAt)
-      .map<IdentityOption>((a) => ({
-        key: `agent:${a.id}`,
-        type: "agent",
-        id: a.id,
-        label: a.displayName || a.name,
-        handle: a.name,
-        avatarUrl: a.avatarUrl,
-      }));
-    return [...humans, ...agentOpts].sort((a, b) =>
-      a.label.localeCompare(b.label, undefined, { sensitivity: "base" }),
-    );
-  }, [members, agents]);
+  const identityOptions = useTaskIdentityOptions();
 
   const selectedChannelIds = useMemo(
     () => searchParams.getAll("channel").filter(Boolean),
@@ -846,18 +930,54 @@ export default function TasksPanel({ channelId }: TasksPanelProps = {}) {
   const hasIdentityFilter = selectedCreators.length > 0 || selectedAssignees.length > 0;
   const hasAnyFilter = selectedChannelIds.length > 0 || hasIdentityFilter;
 
+  // Task v2: a task opens on its own conversation, keyed by the task.
+  const taskV2 = useServerFeatureFlag(TASK_V2_CONVERSATIONS_FLAG_KEY).enabled;
+
   const sortedTasks = useMemo(() => sortTasks(filteredTasks), [filteredTasks]);
+  // in_review is retired for task v2 (#wg-task-v2:f7043517): no empty lane for
+  // it; a pre-v2 task still in it keeps its lane so it stays reachable. Backlog
+  // is task v2 only, the other way round: no empty lane for it with the flag off.
   const groupedTasks = useMemo(() => {
     return STATUS_ORDER.map((status) => ({
       status,
       tasks: sortedTasks.filter((task) => task.status === status),
-    }));
-  }, [sortedTasks]);
+    })).filter(({ status, tasks }) => tasks.length > 0 || status !== (taskV2 ? "in_review" : "backlog"));
+  }, [sortedTasks, taskV2]);
 
-  // A server with zero ACTIVE tasks still has its done/closed lanes unfetched
-  // on first screen; only show the blanket empty state once every lane has
-  // loaded, otherwise the collapsed sections must stay reachable.
-  const allServerLanesLoaded = STATUS_ORDER.every((status) => serverTaskPages[status].loaded);
+  // While the tasks load, the board or list is drawn with its lanes (the
+  // lanes groupedTasks shows, plus a hidden one that had cards last time),
+  // each open lane with as many card placeholders as it had the last time it
+  // loaded here, for this person on this server (taskLaneCounts), so the
+  // cards land where their placeholders were (#proj-raft-ui:#231). A filter
+  // changes what a lane holds, so filtered views neither read nor write it.
+  const laneCountServerId = useServerStore((s) => s.current?.id);
+  const laneCounts = useMemo(() => {
+    if (loading || hasAnyFilter) return null;
+    const counts: Partial<Record<TaskStatus, number>> = {};
+    for (const { status, tasks: laneTasks } of groupedTasks) {
+      // A server lane that has not been read (a folded one) says nothing.
+      if (isChannelMode || serverTaskPages[status].loaded) counts[status] = laneTasks.length;
+    }
+    return counts;
+  }, [loading, hasAnyFilter, groupedTasks, isChannelMode, serverTaskPages]);
+  const rememberedLaneCounts = useRememberedTaskLaneCounts({
+    userId: currentUserId,
+    serverId: laneCountServerId,
+    scope: isChannelMode ? `channel:${channelId}` : "server",
+    enabled: !hasAnyFilter,
+    loading,
+    loaded: laneCounts,
+  });
+  const loadingLanes = useMemo(() => STATUS_ORDER
+    .filter((status) => status !== (taskV2 ? "in_review" : "backlog") || (rememberedLaneCounts[status] ?? 0) > 0)
+    .map((status) => ({ status, tasks: [] as Task[], placeholders: taskLanePlaceholders(rememberedLaneCounts[status]) })),
+  [rememberedLaneCounts, taskV2]);
+  const lanes: { status: TaskStatus; tasks: Task[]; placeholders?: number }[] = loading ? loadingLanes : groupedTasks;
+
+  // A server with zero ACTIVE tasks still has its backlog/done/closed lanes
+  // unfetched on first screen; only show the blanket empty state once every
+  // shown lane has loaded, otherwise the collapsed sections must stay reachable.
+  const allServerLanesLoaded = groupedTasks.every(({ status }) => serverTaskPages[status].loaded);
 
   // Per-lane lazy paging props (server mode only): a "Load more" affordance
   // while the lane's walk has a next cursor.
@@ -927,29 +1047,9 @@ export default function TasksPanel({ channelId }: TasksPanelProps = {}) {
     }, { replace: true });
   }, [setSearchParams, isMobile]);
 
-  const toggleChannelFilter = useCallback((channelId: string) => {
-    const nextIds = selectedChannelIds.includes(channelId)
-      ? selectedChannelIds.filter((id) => id !== channelId)
-      : [...selectedChannelIds, channelId];
-    setSelectedChannels(nextIds);
-  }, [selectedChannelIds, setSelectedChannels]);
-
-  const clearChannelFilters = useCallback(() => {
-    setSelectedChannels([]);
-  }, [setSelectedChannels]);
-
-  const channelPopoverOptions = useMemo(() => filteredChannelOptions.map((channel) => ({
-    key: channel.id,
-    checked: selectedChannelIds.includes(channel.id),
-    onClick: () => toggleChannelFilter(channel.id),
-    label: `#${channel.name}`,
-  })), [filteredChannelOptions, selectedChannelIds, toggleChannelFilter]);
-
   // One filter popover at a time: opening one replaces the other; a close
   // only clears the one that closed.
   const handleChannelPopoverOpenChange = useCallback((open: boolean) => {
-    // Each opening starts from an empty search.
-    if (open) setChannelSearch("");
     setOpenFilter((prev) => (open ? "channel" : prev === "channel" ? null : prev));
   }, []);
   const handleCreatorPopoverOpenChange = useCallback((open: boolean) => {
@@ -972,7 +1072,7 @@ export default function TasksPanel({ channelId }: TasksPanelProps = {}) {
   const closeCreateDialog = useCallback(() => setShowCreateDialog(false), []);
 
   const toggleStatusCollapsed = useCallback((status: TaskStatus) => {
-    // Expanding a never-loaded lane (done/closed start collapsed + unloaded in
+    // Expanding a never-loaded lane (backlog/done/closed start collapsed + unloaded in
     // server mode) lazily pulls its first summary page.
     if (!isChannelMode && collapsedStatuses[status]) {
       const lane = useTaskStore.getState().serverTaskPages[status];
@@ -997,31 +1097,101 @@ export default function TasksPanel({ channelId }: TasksPanelProps = {}) {
     // plain side thread with no title, status or assignee — the task disappears into its
     // own discussion. It used to be carried implicitly by the `/tasks` route test, which
     // never matched the in-channel Tasks tab.
+    if (opensAsTaskConversation(task, taskV2)) {
+      // Task v2: the task dialog on the task's own conversation — for a task
+      // made the v2 way whatever the flag says (its messageId is no message).
+      openTaskConversationDialog(task);
+      return;
+    }
     void openThread({ parentChannelId: task.channelId, parentMessageId: task.messageId, intent: "task" });
     // Stryker restore all
-  }, [closeProfile, closeThread, closeLegacyTask, openLegacyTask, openThread]);
+  }, [closeProfile, closeThread, closeLegacyTask, openLegacyTask, openThread, taskV2]);
 
-  /**
-   * Resolves a dnd-kit drag-end event into a task status update.
-   *
-   * `over.id` is the TaskStatus string we set as the droppable id in
-   * DroppableColumn. `active.id` is the task UUID from DraggableTaskWrapper.
-   * Bail-out cases: dropped outside any column, same-status drop.
-   */
-  const handleDragEnd = useCallback(
-    async ({ active, over }: DragEndEvent) => {
-      if (!canModifyTasks) return;
-      if (!over) return;
-      const targetStatus = over.id as TaskStatus;
-      const task = tasks.find((t) => t.id === active.id);
-      if (!task || task.status === targetStatus) return;
-      try {
-        await updateTaskStatus(task.channelId, task.id, targetStatus);
-      } catch (err) {
-        console.error("Drag-drop status update failed:", err);
-      }
-    },
-    [canModifyTasks, tasks, updateTaskStatus],
+  const boardDrag = useTaskBoardDrag({ tasks, taskV2, currentUserId, canManageServer });
+  const { activeTaskId, activeTask, blockedReasons } = boardDrag;
+
+  const clearAllLabel = formatMessage({ id: "task.panel.clearAll" });
+  const newTaskLabel = formatMessage({ id: "task.board.newTask" });
+  const viewSwitchOptions = useMemo(() => [
+    { value: "board" as const, label: formatMessage({ id: "task.view.board" }), icon: <Columns3 size={16} aria-hidden="true" />, testId: "channel-task-view-board" },
+    { value: "list" as const, label: formatMessage({ id: "task.view.list" }), icon: <LayoutList size={16} aria-hidden="true" />, testId: "channel-task-view-list" },
+  ], [formatMessage]);
+  const viewMenuOptions = useMemo(() => viewSwitchOptions.map(({ value, label }) => ({ value, label })), [viewSwitchOptions]);
+  // The toolbar over the list (Raft DS › The toolbar over a list), on raft-ui's FitToolbar: no search, so
+  // the filters fill the one line and scroll in it (Clear all pinned at their end), then Board / List and,
+  // in channel mode, New task, the primary action, last. As it narrows: Board / List shows its icons, the
+  // filters theirs, New task becomes +, and Board / List folds into ⋯.
+  const toolbar = (
+    <TasksPanelToolbar ref={isPhoneTabRoot ? toolbarRef : undefined} className={isPhoneTabRoot ? `${TOOLBAR_CLASS} ${PHONE_ROOT_TOOLBAR_CLASS}` : TOOLBAR_CLASS}>
+      <FitToolbar aria-label={formatMessage({ id: "task.panel.heading" })} className="w-full gap-2">
+        <FitToolbarGroup
+          overflow="scroll"
+          className="gap-2"
+          data-testid="tasks-toolbar-filters"
+          end={hasAnyFilter ? (
+            <FitToolbarButton variant="ghost" collapsedIcon={<X />} labelOrder={LIST_TOOLBAR_STEP.filterLabels} onClick={clearAllFilters}>
+              {clearAllLabel}
+            </FitToolbarButton>
+          ) : null}
+        >
+          {/* Channel filter only makes sense in server mode — channel mode
+              is already scoped to one channel. */}
+          {!isChannelMode && (
+            <ChannelFilterChip
+              selected={selectedChannelIds}
+              onChange={setSelectedChannels}
+              isOpen={openFilter === "channel"}
+              onOpenChange={handleChannelPopoverOpenChange}
+              labelOrder={LIST_TOOLBAR_STEP.filterLabels}
+            />
+          )}
+          {/* Creator + Assignee: the same identity pool (humans + agents of
+              the server) feeds both popovers. "Created by me" / "Assigned to
+              me" are rows inside them (stdrc 2026-05-19 #proj-task:572c5ba6). */}
+          <IdentityFilterChip
+            icon={<UserCircle2 />}
+            label={formatMessage({ id: "task.filter.creator" })}
+            options={identityOptions}
+            selected={selectedCreators}
+            onChange={setSelectedCreators}
+            selfOption={creatorSelfOption}
+            isOpen={openFilter === "creator"}
+            onOpenChange={handleCreatorPopoverOpenChange}
+            labelOrder={LIST_TOOLBAR_STEP.filterLabels}
+          />
+          <IdentityFilterChip
+            icon={<UserIcon />}
+            label={formatMessage({ id: "task.filter.assignee" })}
+            options={identityOptions}
+            selected={selectedAssignees}
+            onChange={setSelectedAssignees}
+            includeUnassigned
+            selfOption={assigneeSelfOption}
+            isOpen={openFilter === "assignee"}
+            onOpenChange={handleAssigneePopoverOpenChange}
+            labelOrder={LIST_TOOLBAR_STEP.filterLabels}
+          />
+        </FitToolbarGroup>
+        <FitToolbarGroup
+          firstLine
+          className="gap-2"
+          moreOrder={LIST_TOOLBAR_STEP.displayMore}
+          moreItem={<MoreMenuChoices heading={formatMessage({ id: "ui.listToolbar.view" })} value={viewMode} options={viewMenuOptions} onValueChange={setView} testId="tasks-toolbar-more-view" />}
+        >
+          <ListViewSwitch value={viewMode} options={viewSwitchOptions} onValueChange={setView} label={formatMessage({ id: "task.viewAria" })} />
+        </FitToolbarGroup>
+        <FitToolbarGroup firstLine className={isChannelMode ? "gap-2" : LIST_TOOLBAR_MORE_GROUP_CLASS}>
+          <ListToolbarMore testId="tasks-toolbar-more" />
+          {/* New task: channel mode only. The server-wide board has no channel
+              to post a task in, so it offers none. */}
+          {isChannelMode && (
+            <FitToolbarButton variant="primary" icon={<Plus />} plusOrder={LIST_TOOLBAR_STEP.primaryPlus} onClick={openCreateDialog}>
+              {newTaskLabel}
+            </FitToolbarButton>
+          )}
+        </FitToolbarGroup>
+      </FitToolbar>
+    </TasksPanelToolbar>
   );
 
   return (
@@ -1035,148 +1205,47 @@ export default function TasksPanel({ channelId }: TasksPanelProps = {}) {
           Raft DS › Panel / NavBar: the head names the page and carries no icon
           tile (the yellow location block belongs to a channel). On the phone
           this is the Tasks tab root, so it sits in the frame like the other
-          tab roots: raft-ui's section head, white on desktop and the frame on
-          a phone. The Board/List toggle lives in the filter row, not here. */}
+          tab roots (TabRootBar): raft-ui's section head, white on desktop and
+          the frame on a phone, the page name its one h1 there. The Board/List
+          toggle lives in the filter row, not here. */}
       {!isChannelMode && (
-        <PanelSectionHeader>
-          <PanelHeaderContent>
-            <PanelTitle render={<h2>{formatMessage({ id: "task.panel.heading" })}</h2>} />
-            <PanelMeta render={<p />}>
+        <TabRootBar
+          name={formatMessage({ id: "task.panel.heading" })}
+          headingLevel={isPhoneTabRoot ? 1 : 2}
+          // No count before the tasks are read ("0 channel tasks" while they
+          // load): the line's box stays, empty.
+          subtitle={loading ? "\u00a0" : (
+            <span>
               <span className="font-mono">{sortedTasks.length}</span>
               {hasAnyFilter ? formatMessage({ id: "task.panel.ofTotal" }, { total: tasks.length }) : ""}
               {" "}{formatMessage({ id: "task.panel.channelTasks" })}
-            </PanelMeta>
-          </PanelHeaderContent>
-        </PanelSectionHeader>
+            </span>
+          )}
+        />
       )}
 
-      <TasksPanelToolbar>
-        <div className="flex flex-wrap items-center gap-2">
-          {/* Channel filter only makes sense in server mode — channel mode
-              is already scoped to one channel. */}
-          {!isChannelMode && (
-            <Popover open={openFilter === "channel"} onOpenChange={handleChannelPopoverOpenChange}>
-              <PopoverTrigger
-                render={<PickerTriggerButton type="button" data-has-value={selectedChannelIds.length > 0 ? "" : undefined} />}
-              >
-                <Hash size={14} />
-                {formatMessage({ id: "task.panel.channelColumn" })}
-                {selectedChannelIds.length > 0 && (
-                  <span className={FILTER_COUNT_CLASS_NAME}>{selectedChannelIds.length}</span>
-                )}
-                <span data-picker-trigger-indicator="" aria-hidden="true">
-                  <ChevronDown />
-                </span>
-              </PopoverTrigger>
-              <SelectionPopover
-                title={formatMessage({ id: "task.filter.channels" })}
-                searchable
-                search={channelSearch}
-                onSearchChange={setChannelSearch}
-                options={channelPopoverOptions}
-                showClear={selectedChannelIds.length > 0}
-                onClear={clearChannelFilters}
-              />
-            </Popover>
-          )}
+      {isPhoneTabRoot ? null : toolbar}
 
-          {/* Creator + Assignee chips: available in both server- and
-              channel-mode. The same identity pool (humans + agents from the
-              current server) feeds both popovers. */}
-          <IdentityFilterChip
-            icon={<UserCircle2 size={14} />}
-            label={formatMessage({ id: "task.filter.creator" })}
-            options={identityOptions}
-            selected={selectedCreators}
-            onChange={setSelectedCreators}
-            selfOption={creatorSelfOption}
-            isOpen={openFilter === "creator"}
-            onOpenChange={handleCreatorPopoverOpenChange}
-          />
-          <IdentityFilterChip
-            icon={<UserIcon size={14} />}
-            label={formatMessage({ id: "task.filter.assignee" })}
-            options={identityOptions}
-            selected={selectedAssignees}
-            onChange={setSelectedAssignees}
-            includeUnassigned
-            selfOption={assigneeSelfOption}
-            isOpen={openFilter === "assignee"}
-            onOpenChange={handleAssigneePopoverOpenChange}
-          />
-
-          {/* "Created by me" / "Assigned to me" are no longer standalone
-              buttons — they live inside the Creator / Assignee popovers as
-              special sentinel rows (like Unassigned). stdrc 2026-05-19
-              #proj-task:572c5ba6 msg=58495043. */}
-
-          {hasAnyFilter && (
-            <Button size="sm" variant="ghost"
-              type="button"
-              onClick={clearAllFilters}
-            >
-              {formatMessage({ id: "task.panel.clearAll" })}
-            </Button>
-          )}
-
-          {/* New Task button: channel mode only. Server-wide page has no
-              implicit channel context to anchor task creation, so we don't
-              expose a +New CTA there — users still create from the channel
-              they want the task in. */}
-          {isChannelMode && canModifyTasks && (
-            <Button
-              type="button"
-              size="sm"
-              variant="outline"
-              onClick={openCreateDialog}
-            >
-              <Plus size={16} />
-              {formatMessage({ id: "task.board.newTask" })}
-            </Button>
-          )}
-
-          <SegmentedControl
-            value={viewMode}
-            onValueChange={setView}
-            aria-label={formatMessage({ id: "task.viewAria" })}
-            className="sm:ml-auto"
-          >
-            {/* Phone: icons only; the label stays as the accessible name. */}
-            <SegmentedControlItem
-              value="board"
-              data-testid="channel-task-view-board"
-            >
-              <Columns3 size={16} aria-hidden="true" />
-              <SegmentedControlLabel className="max-sm:sr-only">{formatMessage({ id: "task.view.board" })}</SegmentedControlLabel>
-            </SegmentedControlItem>
-            <SegmentedControlItem
-              value="list"
-              data-testid="channel-task-view-list"
-            >
-              <LayoutList size={16} aria-hidden="true" />
-              <SegmentedControlLabel className="max-sm:sr-only">{formatMessage({ id: "task.view.list" })}</SegmentedControlLabel>
-            </SegmentedControlItem>
-          </SegmentedControl>
-        </div>
-      </TasksPanelToolbar>
-
-      <TasksPanelViewport
-        ref={scrollContainerRef}
+      {/* raft-ui ScrollArea, both ways (the board scrolls sideways); the
+          scrollbars show while it is pointed at or scrolls, as on every page
+          scroller. On the phone the pinned filter row is inside it, so the
+          vertical scrollbar starts below it (railInset). */}
+      <ScrollArea
+        ref={viewportRef}
+        orientation="both"
         data-task-virtual-scroll
+        railInset={isPhoneTabRoot ? toolbarRailInset : undefined}
+        className={VIEWPORT_CLASS}
         // The floating-tab-bar clearance belongs to the Tasks tab root only —
         // channel-detail panes have no capsule above them (task #678).
-        className={`flex-1 overflow-auto py-4 safe-bottom${isChannelMode ? "" : " mobile-nav-clearance"}`}
+        contentClassName={`${VIEWPORT_CONTENT_CLASS}${isChannelMode ? "" : " mobile-nav-clearance"}${isPhoneTabRoot ? PHONE_ROOT_VIEWPORT_CLASS : ""}`}
       >
-        {loading ? (
-          <div className="flex flex-col gap-2" aria-hidden="true">
-            {Array.from({ length: 5 }, (_, i) => (
-              <TaskCardSkeleton key={i} />
-            ))}
-          </div>
-        ) : sortedTasks.length === 0 && (isChannelMode || allServerLanesLoaded) ? (
+        {isPhoneTabRoot && toolbar}
+        {/* Loading, the board or list itself with placeholders in its lanes. */}
+        {!loading && sortedTasks.length === 0 && (isChannelMode || allServerLanesLoaded) ? (
           <EmptyState
-            className="flex h-full flex-col items-center justify-center"
-            icon={<CheckSquare size={36} />}
+            className="flex flex-1 flex-col items-center justify-center"
+            icon={<ListTodo size={36} />}
             title={hasAnyFilter ? formatMessage({ id: "emptyState.noTasksFiltered" }) : formatMessage({ id: "emptyState.noTasksTitle" })}
             description={hasAnyFilter
               ? formatMessage({ id: "task.filter.noMatchHint" })
@@ -1185,34 +1254,56 @@ export default function TasksPanel({ channelId }: TasksPanelProps = {}) {
                 : formatMessage({ id: "task.panel.serverWideExcluded" })}
           />
         ) : viewMode === "board" ? (
-          <DndContext sensors={sensors} onDragEnd={handleDragEnd}>
+          <TaskDndProvider
+            isDropAllowed={boardDrag.isDropAllowed}
+            onDragStart={boardDrag.handleDragStart}
+            onDragCancel={boardDrag.handleDragFinish}
+            onDragEnd={boardDrag.handleDragFinish}
+            onMove={boardDrag.handleMove}
+          >
             <TaskVirtualLayout
               scrollElementRef={scrollContainerRef}
               data-testid="channel-task-board-view"
-              className="flex min-w-max items-start gap-4 pr-4"
+              aria-busy={loading || undefined}
             >
-              {groupedTasks.map(({ status, tasks: statusTasks }) => (
-                <DroppableColumn
-                  key={status}
-                  status={status}
-                  collapsed={collapsedStatuses[status]}
-                  onToggleCollapsed={toggleStatusCollapsed}
-                  statusTasks={statusTasks}
-                  openTask={openTask}
-                  isChannelMode={isChannelMode}
-                  scrollElementRef={scrollContainerRef}
-                  canModifyTasks={canModifyTasks}
-                  {...lanePagingProps(status)}
-                />
-              ))}
+              <TaskBoardRoot>
+                {lanes.map(({ status, tasks: statusTasks, placeholders }) => (
+                  <BoardColumn
+                    key={status}
+                    status={status}
+                    collapsed={collapsedStatuses[status]}
+                    onToggleCollapsed={toggleStatusCollapsed}
+                    statusTasks={statusTasks}
+                    activeTaskId={activeTaskId}
+                    blockedReason={blockedReasons[status]}
+                    openTask={openTask}
+                    isChannelMode={isChannelMode}
+                    scrollElementRef={scrollContainerRef}
+                    placeholders={placeholders}
+                    {...(loading ? {} : lanePagingProps(status))}
+                  />
+                ))}
+              </TaskBoardRoot>
             </TaskVirtualLayout>
-          </DndContext>
+            {/* The board is a raft-ui ScrollArea, its own stacking context (and its scrollbar the top layer in it):
+                a copy left in place would be covered by the rail and the top bar. On the body, as sideSectionDrag does. */}
+            <TaskDragOverlay container={document.body}>
+              {activeTask == null ? null : (
+                <TaskCard
+                  task={activeTask}
+                  onOpen={openTask}
+                  showChannelName={!isChannelMode}
+                />
+              )}
+            </TaskDragOverlay>
+          </TaskDndProvider>
         ) : (
           <TaskVirtualLayout
             scrollElementRef={scrollContainerRef}
-            className="space-y-6"
+            className="stack-y-6"
+            aria-busy={loading || undefined}
           >
-            {groupedTasks.map(({ status, tasks: statusTasks }) => (
+            {lanes.map(({ status, tasks: statusTasks, placeholders }) => (
               <TaskSection
                 key={status}
                 status={status}
@@ -1222,12 +1313,28 @@ export default function TasksPanel({ channelId }: TasksPanelProps = {}) {
                 onToggleCollapsed={toggleStatusCollapsed}
                 showChannelName={!isChannelMode}
                 scrollElementRef={scrollContainerRef}
-                {...lanePagingProps(status)}
+                placeholders={placeholders}
+                {...(loading ? {} : lanePagingProps(status))}
               />
             ))}
           </TaskVirtualLayout>
         )}
-      </TasksPanelViewport>
+      </ScrollArea>
+
+      {/* Board moves, in words (dnd-kit's own announcements name cards by id). */}
+      <span className="sr-only" aria-live="polite" aria-atomic="true" data-testid="task-board-announcement">
+        {boardDrag.moveAnnouncement}
+      </span>
+
+      {boardDrag.backlogPrompt && (
+        <TaskBacklogReasonPopover
+          open={boardDrag.backlogPrompt.open}
+          task={boardDrag.backlogPrompt.task}
+          anchor={backlogColumnHeading}
+          finalFocus={backlogColumnHeading}
+          onClose={boardDrag.closeBacklogPrompt}
+        />
+      )}
 
       {showCreateDialog && channelId && (
         <CreateTaskDialog

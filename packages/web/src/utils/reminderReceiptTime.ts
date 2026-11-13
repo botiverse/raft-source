@@ -80,7 +80,7 @@ export function formatReminderReceiptTime(
   }
 
   const sameYear = yearKey(date, options) === yearKey(now, options);
-  const datePart = date.toLocaleDateString(options.locale, sameYear
+  const datePart = date.toLocaleDateString(options.locale ?? "en", sameYear
     ? { month: "short", day: "numeric", timeZone: timeZoneOption(options) }
     : { year: "numeric", month: "short", day: "numeric", timeZone: timeZoneOption(options) });
 

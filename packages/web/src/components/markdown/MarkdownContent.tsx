@@ -15,8 +15,9 @@ import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
 import type { Components, Options } from "react-markdown";
 import remarkBreaks from "remark-breaks";
 import remarkGfm from "remark-gfm";
+import remarkCjkFriendly from "remark-cjk-friendly";
 import rehypeSanitize from "rehype-sanitize";
-import { InlineCode, Separator } from "@botiverse/raft-ui";
+import { InlineCode, Separator, MarkdownLink as RaftMarkdownLink } from "@botiverse/raft-ui";
 import { remarkAutolinkBareUrls } from "../../utils/markdownAutolink";
 import {
   EXTERNAL_TRANSLATION_GUARD_TRANSLATE,
@@ -31,6 +32,10 @@ import { CustomProtocolLink, isCustomProtocolHref } from "./CustomProtocolLink";
 import { MermaidDiagram } from "../mermaid/MermaidDiagram";
 import { readMermaidSource } from "../mermaid/mermaidSource";
 import { remarkDisableIndentedCode } from "./remarkDisableIndentedCode";
+import { remarkRaftMath } from "./remarkRaftMath";
+import { InlineMath } from "./InlineMath";
+import { DisplayMath } from "./DisplayMath";
+import { isMathClassName, readMathSource } from "./mathFormula";
 
 interface MarkdownContentErrorBoundaryProps {
   source: string;
@@ -95,13 +100,17 @@ class MarkdownContentErrorBoundary extends Component<
 /** Shared code-block wrapper (DS code block: the `code` layer, a hairline,
  *  container radius, Space Mono) — the canonical look for every fenced block
  *  across chat body + attachment preview. Extracted so the mermaid-aware
- *  `pre` can reuse it verbatim for the non-mermaid path. */
-function BaseCodePre({ children }: { children?: ReactNode }) {
+ *  `pre` can reuse it verbatim for the non-mermaid path, and a card's
+ *  Markdown (which draws every fence as code, never a formula) can too. */
+export function BaseCodePre({ children }: { children?: ReactNode }) {
   const codeText = extractCodeBlockText(children);
   const language = extractCodeBlockLanguage(children);
   return (
     <CodeBlock
-      className="overflow-x-auto rounded-container border border-line-hairline bg-layer-code px-3 py-2 pr-12 text-code-foreground [font-size:inherit] font-mono [&>code]:border-0 [&>code]:bg-transparent [&>code]:p-0"
+      // The body follows the message's font-size preference and line height,
+      // like the rest of the rich text, instead of raft-ui's fixed code size.
+      bodyClassName="[font-size:inherit]! [line-height:inherit]!"
+      className="text-code-foreground [font-size:inherit] font-mono [&>code]:border-0 [&>code]:bg-transparent [&>code]:p-0"
       code={codeText}
       language={language}
     >
@@ -187,6 +196,9 @@ export function MarkdownCode({
   children?: ReactNode;
   className?: string;
 }) {
+  // A formula (task #775). Block formulas are taken in the `pre` slot, so
+  // math reaching here is inline.
+  if (isMathClassName(className)) return <InlineMath>{children}</InlineMath>;
   // Inline code (no language class)
   if (!className) {
     return (
@@ -221,21 +233,23 @@ export function MarkdownLink({
     return <CustomProtocolLink href={href}>{children}</CustomProtocolLink>;
   }
   return (
-    <a
+    <RaftMarkdownLink
       href={href}
       target="_blank"
       rel="noopener noreferrer"
-      {...externalTranslationGuardProps(
-        "text-foreground-link underline decoration-2 underline-offset-2 hover:decoration-attention select-text",
-      )}
+      {...externalTranslationGuardProps("")}
     >
       {children}
-    </a>
+    </RaftMarkdownLink>
   );
 }
 
 export const BASE_MARKDOWN_COMPONENTS: Components = {
-  pre: ({ children }) => <BaseCodePre>{children}</BaseCodePre>,
+  pre: ({ children }) => {
+    const mathSource = readMathSource(children);
+    if (mathSource !== null) return <DisplayMath source={mathSource} />;
+    return <BaseCodePre>{children}</BaseCodePre>;
+  },
   code: (props) => <MarkdownCode {...props} />,
   p: ({ children }) => (
     <p {...externalTranslationGuardProps("mb-1 last:mb-0")}>
@@ -265,7 +279,7 @@ export const BASE_MARKDOWN_COMPONENTS: Components = {
     </blockquote>
   ),
   table: ({ children }) => (
-    <div {...externalTranslationGuardProps("my-2 overflow-x-auto")}>
+    <div data-md-table="" {...externalTranslationGuardProps("my-2 overflow-x-auto")}>
     <table className="border-collapse border border-line-hairline [font-size:inherit]">{children}</table>
     </div>
   ),
@@ -379,6 +393,8 @@ const MERMAID_MARKDOWN_COMPONENTS: Components = {
     if (mermaidSource !== null) {
       return <MermaidDiagram code={mermaidSource} />;
     }
+    const mathSource = readMathSource(children);
+    if (mathSource !== null) return <DisplayMath source={mathSource} />;
     return <BaseCodePre>{children}</BaseCodePre>;
   },
 };
@@ -415,6 +431,8 @@ export function getMarkdownComponents(
 // render, forcing a full re-parse even when the source was unchanged.
 const DOCUMENT_REMARK_PLUGINS: PluggableList = [
   remarkGfm,
+  remarkCjkFriendly,
+  remarkRaftMath,
   remarkAutolinkBareUrls,
   remarkBreaks,
 ];
@@ -447,9 +465,9 @@ export interface MarkdownContentProps {
    */
   remarkPlugins?: PluggableList;
   /**
-   * Defaults to `[rehypeSanitize]`. Surfaces that allow `dangerouslySetInnerHTML`
-   * markup (e.g. chat body's `data-mention*` placeholders) pass
-   * `[rehypeRaw, [rehypeSanitize, customSchema]]`.
+   * Defaults to `[rehypeSanitize]` with the shared schema. Raw HTML in the
+   * source is never parsed into elements (no rehype-raw): chat marks its
+   * mentions and refs on the syntax tree instead (remarkMessageTokens).
    */
   rehypePlugins?: PluggableList;
   /**

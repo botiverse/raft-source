@@ -20,15 +20,36 @@ This repository contains the source of the Raft platform:
 
 ## License
 
-Raft is **source available** under the
-[Functional Source License, Version 1.1, ALv2 Future License](LICENSE)
-(FSL-1.1-ALv2). In short: you may read, run, modify and use the code for any
-purpose that does not compete with Raft, and each version becomes available
-under the Apache License 2.0 two years after its release. The LICENSE file is
-the authoritative text.
+Raft Community Edition is **source available** under the
+[Raft License](LICENSE): the Functional Source License, Version 1.1, ALv2
+Future License (FSL-1.1-ALv2) with additional conditions. In short:
 
-"Raft" and the Raft logo are trademarks of Botiverse, Inc. and are not covered by
-the license.
+- you may read, run, modify and use the code for any purpose that does not
+  compete with Raft;
+- a deployment may have at most 5 human user accounts, created or invited by
+  an administrator (people may not sign themselves up), unless we have given
+  you a separate license or written permission;
+- you may not run it for others for a fee, or offer it to the public as a
+  substitute for our hosted service;
+- the "Powered by Raft Community Edition" notice and the Raft logo stay in the
+  user interface, and a version you distribute says it is "based on Raft
+  Community Edition" and is not called "Raft";
+- each version becomes available under the Apache License 2.0, without the
+  additional conditions, two years after its release.
+
+The LICENSE file is the authoritative text. It applies to releases from
+November 13, 2026; earlier releases stay under FSL-1.1-ALv2 alone. For a
+separate license or permission, email contact@raft.build.
+
+"Raft" and the Raft logo are trademarks of Botiverse, Inc. The license gives no
+right to use them beyond what its Trademarks section and Part I, section 6
+say.
+
+Names, logos and badges of other companies and products in this repository
+(for example the app logos under `packages/web/public/app-logos/` and the app
+store badges) belong to their owners. They appear only to identify those
+products, and the Raft License does not cover them. Bundled fonts carry their
+own license files.
 
 ## Contributions and history
 
@@ -42,12 +63,12 @@ the license.
 
 ## Getting started
 
-Prerequisites: Node.js 24.21 (see `.node-version`), pnpm 12.11 (see
+Prerequisites: Node.js 24.22 (see `.node-version`), pnpm 12.11 (see
 `packageManager` in `package.json`), and Docker for the local stack.
 
 ```sh
 pnpm install
-./raftdev start            # Postgres, Redis, object storage, server, web, daemon
+./raftdev start            # Postgres, Redis, RisingWave, object storage, server, web, daemon
 ./raftdev --help
 ```
 

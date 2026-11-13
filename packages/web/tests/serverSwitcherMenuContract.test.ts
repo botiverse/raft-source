@@ -1,7 +1,4 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
 import "./helpers/domSetup";
 import { createElement } from "react";
 import { Popover } from "@botiverse/raft-ui";
@@ -12,20 +9,6 @@ import ServerSwitcherMenu from "../src/components/ui/ServerSwitcherMenu";
 import { useServerStore } from "../src/store/serverStore";
 import type { Server } from "../src/store/serverStore";
 import { getChannelUnreadIndicatorState, hasUnmutedUnread, shouldShowActivityMutedIcon } from "../src/utils/channelUnreadIndicator";
-import {
-  hasOtherServerLoudUnread,
-  parseServerUnreadSummaryRows,
-} from "../src/utils/serverUnreadSummary";
-
-const repoRoot = resolve(import.meta.dirname, "..");
-const read = (path: string) => {
-  const text = readFileSync(resolve(repoRoot, path), "utf8");
-  if (!text.startsWith("// @ts-nocheck\n") && !text.includes("function stryNS_")) return text;
-  return execFileSync("git", ["show", `HEAD:packages/web/${path}`], {
-    cwd: repoRoot,
-    encoding: "utf8",
-  });
-};
 
 const currentServer: Server = {
   id: "server-alpha",
@@ -139,9 +122,9 @@ test("ServerSwitcherMenu primitive exists and exports the expected shape", async
   assert.equal(menu.getAttribute("data-dismiss-layer"), "");
   assert.match(menu.className, /max-h-\(--available-height\)/);
   assert.doesNotMatch(menu.className, /\babsolute\b|top-full|left-full/, "no hand placement");
-  const list = within(menu).getByRole("link", { name: /Alpha/ }).closest(".overflow-y-auto");
+  const list = within(menu).getByRole("link", { name: /Alpha/ }).closest("[data-slot=scroll-area]");
   assert.ok(list, "the workspace list is the scroller");
-  assert.equal(list.contains(within(menu).getByRole("button", { name: "Switch or Create Server" })), false);
+  assert.equal(list.contains(within(menu).getByRole("button", { name: "Switch or create server" })), false);
 
   fireEvent.keyDown(document, { key: "Escape" });
   await waitFor(() => assert.equal(closes, 1, "Escape closes the menu"));
@@ -161,7 +144,7 @@ test("current server row hides its own unread badge (stdrc decision C)", () => {
 
   const alpha = screen.getByRole("link", { name: /Alpha/ });
   const beta = screen.getByRole("link", { name: /Beta/ });
-  assert.equal(within(alpha).queryByText("7"), null, "current server's own unread badge stays hidden");
+  assert.ok(within(alpha).queryByText("7") === null, "current server's own unread badge stays hidden");
   assert.ok(within(beta).getByText("3"), "other servers still show their unread count");
 });
 
@@ -193,75 +176,50 @@ test("server switcher unread count is loud unless the server is muted", () => {
   assert.doesNotMatch(quiet.className, /text-white/);
 });
 
-test("muted servers keep numeric counts but do not light cross-server attention dots", () => {
-  const summaries = parseServerUnreadSummaryRows([
-    { serverId: "server-alpha", unreadCount: 10, serverPushMuted: false, activityUnreadCount: 10 },
-    { serverId: "server-beta", unreadCount: 6, serverPushMuted: true, activityUnreadCount: 6 },
-    { serverId: "server-gamma", unreadCount: 4, serverPushMuted: false, activityUnreadCount: 4 },
-  ]);
-
-  assert.equal(summaries["server-beta"].serverPushMuted, true);
-  assert.equal(
-    hasOtherServerLoudUnread(
-      [{ id: "server-alpha" }, { id: "server-beta" }],
-      { id: "server-alpha" },
-      summaries,
-    ),
-    false,
-    "muted unread on another server stays numeric-only, not a cross-server attention dot",
-  );
-  assert.equal(
-    hasOtherServerLoudUnread(
-      [{ id: "server-alpha" }, { id: "server-gamma" }],
-      { id: "server-alpha" },
-      summaries,
-    ),
-    true,
-    "unmuted unread on another server still lights cross-server attention",
-  );
-});
-
-test("Activity counts are independent of server notification mute state", () => {
-  const leftRail = read("src/components/layout/LeftRail.tsx");
-  const sidebar = read("src/components/layout/Sidebar.tsx");
-  const parser = read("src/utils/serverUnreadSummary.ts");
-
-  assert.match(parser, /serverPushMuted: entry\.serverPushMuted === true/);
-  assert.match(parser, /activityUnreadCount/);
-  assert.match(leftRail, /hasOtherServerActivityUnread\(servers, server, serverUnreadCounts\)/);
-  assert.match(sidebar, /hasOtherServerActivityUnread\(servers, server, serverUnreadCounts\)/);
-});
-
 test("muted joined channels still show quiet numeric unread counts", () => {
   assert.deepEqual(
     getChannelUnreadIndicatorState({ unread: 3, joined: true, showMutedIcon: false }),
-    { showLoudUnreadBadge: true, showQuietUnreadCount: false, showQuietNewDot: false },
+    { showLoudUnreadBadge: true, showQuietUnreadCount: false, showQuietNewDot: false, showMarkedUnreadDot: false, unreadTone: true },
   );
   assert.deepEqual(
     getChannelUnreadIndicatorState({ unread: 3, joined: true, showMutedIcon: true }),
-    { showLoudUnreadBadge: false, showQuietUnreadCount: true, showQuietNewDot: false },
+    { showLoudUnreadBadge: false, showQuietUnreadCount: true, showQuietNewDot: false, showMarkedUnreadDot: false, unreadTone: false },
   );
   assert.deepEqual(
     getChannelUnreadIndicatorState({ unread: 3, joined: false, showMutedIcon: false }),
-    { showLoudUnreadBadge: false, showQuietUnreadCount: true, showQuietNewDot: false },
+    { showLoudUnreadBadge: false, showQuietUnreadCount: true, showQuietNewDot: false, showMarkedUnreadDot: false, unreadTone: false },
   );
   assert.deepEqual(
     getChannelUnreadIndicatorState({ unread: 0, joined: true, showMutedIcon: true }),
-    { showLoudUnreadBadge: false, showQuietUnreadCount: false, showQuietNewDot: false },
+    { showLoudUnreadBadge: false, showQuietUnreadCount: false, showQuietNewDot: false, showMarkedUnreadDot: false, unreadTone: false },
   );
   // hasNew (non-joined public channel with messages past the cursor, no count):
   // a quiet dot on a non-joined row only; a count, when present, wins.
   assert.deepEqual(
     getChannelUnreadIndicatorState({ unread: 0, joined: false, showMutedIcon: false, hasNew: true }),
-    { showLoudUnreadBadge: false, showQuietUnreadCount: false, showQuietNewDot: true },
+    { showLoudUnreadBadge: false, showQuietUnreadCount: false, showQuietNewDot: true, showMarkedUnreadDot: false, unreadTone: false },
   );
   assert.deepEqual(
     getChannelUnreadIndicatorState({ unread: 0, joined: true, showMutedIcon: false, hasNew: true }),
-    { showLoudUnreadBadge: false, showQuietUnreadCount: false, showQuietNewDot: false },
+    { showLoudUnreadBadge: false, showQuietUnreadCount: false, showQuietNewDot: false, showMarkedUnreadDot: false, unreadTone: false },
   );
   assert.deepEqual(
     getChannelUnreadIndicatorState({ unread: 2, joined: false, showMutedIcon: false, hasNew: true }),
-    { showLoudUnreadBadge: false, showQuietUnreadCount: true, showQuietNewDot: false },
+    { showLoudUnreadBadge: false, showQuietUnreadCount: true, showQuietNewDot: false, showMarkedUnreadDot: false, unreadTone: false },
+  );
+  // Marked unread with nothing countable (#triage:#101): the quiet pixel and
+  // the unread name; a muted row keeps its quiet name; a count wins.
+  assert.deepEqual(
+    getChannelUnreadIndicatorState({ unread: 0, joined: true, showMutedIcon: false, markedUnread: true }),
+    { showLoudUnreadBadge: false, showQuietUnreadCount: false, showQuietNewDot: false, showMarkedUnreadDot: true, unreadTone: true },
+  );
+  assert.deepEqual(
+    getChannelUnreadIndicatorState({ unread: 0, joined: true, showMutedIcon: true, markedUnread: true }),
+    { showLoudUnreadBadge: false, showQuietUnreadCount: false, showQuietNewDot: false, showMarkedUnreadDot: true, unreadTone: false },
+  );
+  assert.deepEqual(
+    getChannelUnreadIndicatorState({ unread: 2, joined: true, showMutedIcon: false, markedUnread: true }),
+    { showLoudUnreadBadge: true, showQuietUnreadCount: false, showQuietNewDot: false, showMarkedUnreadDot: false, unreadTone: true },
   );
   assert.equal(shouldShowActivityMutedIcon({ activityMuted: true, joined: true }), true);
   assert.equal(shouldShowActivityMutedIcon({ activityMuted: true, joined: false }), false);
@@ -302,7 +260,6 @@ test("server switcher primitive honors desktop and mobile navigation modes", () 
   const { rerender } = renderMenu({ testId: "desktop-server-switcher-menu" });
   assert.ok(screen.getByTestId("desktop-server-switcher-menu"));
   assert.equal(screen.getByRole("link", { name: /Beta/ }).getAttribute("href"), "/s/beta/tasks");
-  assert.ok(screen.getByText("Switch or Create Server"));
 
   rerender(
     createElement(
@@ -331,9 +288,9 @@ test("server switcher primitive honors desktop and mobile navigation modes", () 
 test("server switcher primitive renders the shared footer actions", () => {
   renderMenu();
 
-  assert.ok(screen.getByRole("button", { name: "Join Community" }));
-  assert.equal(screen.queryByRole("button", { name: "Join Chinese Community" }), null);
-  assert.ok(screen.getByRole("button", { name: "Switch or Create Server" }));
+  assert.ok(screen.getByRole("button", { name: "Join community" }));
+  assert.ok(screen.queryByRole("button", { name: "Join Chinese community" }) === null);
+  assert.ok(screen.getByRole("button", { name: "Switch or create server" }));
 });
 
 test("Chinese browser language does not add the QR-page action to the server switcher", async () => {
@@ -348,23 +305,12 @@ test("Chinese browser language does not add the QR-page action to the server swi
     },
   });
 
-  assert.equal(screen.queryByRole("button", { name: "Join Chinese Community" }), null);
-  fireEvent.click(screen.getByRole("button", { name: "Join Community" }));
+  assert.ok(screen.queryByRole("button", { name: "Join Chinese community" }) === null);
+  fireEvent.click(screen.getByRole("button", { name: "Join community" }));
 
   await waitFor(() => {
     assert.equal(joinCalls.length, 1);
   });
   assert.equal(closes, 1);
   assert.equal(joinCalls[0]?.slug, "community");
-});
-
-test("a switcher row lights only on hover or keyboard focus, not on the focus a mouse open moves in", () => {
-  // The popover focuses its first row when it opens. With `focus-within`, a
-  // mouse-opened switcher showed that row yellow as if hovered, while the
-  // current workspace (checked) sat elsewhere; blurring the window cleared it.
-  const source = readFileSync(resolve(import.meta.dirname, "../src/components/ui/ServerSwitcherMenu.tsx"), "utf8");
-  const row = source.match(/className="group\/server-row [^"]*"/)?.[0] ?? "";
-  assert.ok(row, "the server row class is found");
-  assert.match(row, /has-\[:focus-visible\]:bg-brand-soft/);
-  assert.doesNotMatch(row, /focus-within:bg-/);
 });

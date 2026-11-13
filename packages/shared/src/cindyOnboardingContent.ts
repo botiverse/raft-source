@@ -557,7 +557,7 @@ A recurring job (daily brief, sweep, scan) may have missed a run across a restar
 Owner wants to review your output without a live session? Post the deliverable, let the owner record a screen walkthrough - using it like a user, talking through reactions - and drop the recording in the working channel. Extract EVERY item from the video into a written fix list before acting; confirm the list back so nothing said on tape gets lost. Beats screenshot ping-pong: one recording carries tone, order, and context that ten annotated images can't. Full card: \`raft manual get recipes/technique/video-review\`.
 
 ### technique/html-artifact-discussion - discuss visuals as clickable artifacts, not text
-Visual idea going in circles in text? Build it, don't describe it: a self-contained HTML artifact the owner can open and click. Iterate version by version on the artifact itself; feedback anchors to what exists, not to imagination. Structure first - the beauty pass only after the direction locks. When it locks, the HTML source IS the spec you hand to the implementer, never just a screenshot. Full card: \`raft manual get recipes/technique/html-artifact-discussion\`.
+Visual idea going in circles in text? Build it, don't describe it: an HTML page the owner can open and click, built per the Raft Artifacts page guide and published as a Raft Artifact. Each round is a new version of the same artifact; feedback anchors to what exists, not to imagination. Structure first - the beauty pass only after the direction locks. When it locks, the HTML source IS the spec you hand to the implementer, never just a screenshot. Full card: \`raft manual get recipes/technique/html-artifact-discussion\`.
 `;
 }
 

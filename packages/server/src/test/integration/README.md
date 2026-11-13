@@ -1,8 +1,8 @@
 # Server integration tests
 
 Use Vitest fixtures to remove per-case migrations, login setup, and cleanup
-boilerplate. Every case gets a fresh PGlite restored from a file-local migrated
-template. Commits and inner transaction rollbacks remain real.
+boilerplate. Every case gets a fresh PGlite restored from a migrated template
+file built once per run. Commits and inner transaction rollbacks remain real.
 
 ```ts
 import assert from "node:assert/strict";
@@ -22,7 +22,7 @@ apiTest("lists the channel the reader can access", async ({ seed, http }) => {
 - `dbTest` supplies `db`, `seed`, and `lifecycle`; `apiTest` also supplies `app`
   and `http`. Unused fixtures do not start a DB or import the app.
 - Keep production defaults. For an intentional flag/configuration variant use
-  `createApiTest({ onboardingOpenerFlagDefaultEnabled: false })`. Vitest 2 binds
+  `createApiTest({ humanActivityMuteFlagDefaultEnabled: true })`. Vitest 2 binds
   fixture dependencies at extension time, so do not override `appOptions` later.
 - `http.as` and `tokenForHuman` issue real access tokens and run production auth.
   Tests of login, session families, refresh, or revocation must use real login.
@@ -62,4 +62,16 @@ boundary tests must run against real PostgreSQL:
 Run existing shard commands. `RAFT_TEST_PROFILE=1` adds per-case elapsed time,
 DB/app/seed/cleanup timings and process memory. `cleanup` contains the close
 subphases; do not add overlapping phases. Use `lifecycle.measure("operation", fn)`
-for an explicit operation measurement. File-local templates rebuild each run.
+for an explicit operation measurement.
+
+## PGlite template file
+
+- The Vitest globalSetup (`src/test/setup/pgliteTemplate.global.ts`) builds the
+  migrated datadir in a child process and caches it at
+  `node_modules/.cache/raft-pglite-template/pglite-template-<key>.tar` (newest 3 kept).
+- The key hashes the drizzle journal, every migration's SQL, the PGlite
+  compatibility statements, the installed `@electric-sql/pglite` version and
+  `TEMPLATE_FORMAT_VERSION`; `migratePglite` still runs after each restore.
+- `RAFT_TEST_PGLITE_TEMPLATE=rebuild` forces a fresh build; `=off` disables it.
+- A Vitest worker without the template warns and migrates per file; under CI it
+  fails. Playwright servers and scripts keep a process-local snapshot.

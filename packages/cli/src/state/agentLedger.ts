@@ -42,6 +42,10 @@ import {
   CLI_READ_STATE_FILENAME,
   CLI_READ_STATE_NAMESPACE,
   configuredCliReadStateBase,
+  PASSIVE_RENDER_COUNTS_DDL,
+  PASSIVE_RENDER_COUNTS_TABLE,
+  PASSIVE_RENDER_COUNTS_UPSERT,
+  type PassiveRenderKind,
 } from "@botiverse/raft-shared/src/agentCliSurface";
 import {
   isTrustedCanonicalTarget,
@@ -64,10 +68,13 @@ export interface LedgerDraftEntry {
   attachmentIds: string[];
   idempotencyKey?: string;
   mentions?: unknown[];
+  /** RFC 082: a card message's card (`raft message send --card`); in the JSON payload, so no schema change. */
+  card?: unknown;
   savedAt: number;
   reholdCount: number;
   seenUpToSeq?: number;
   seenExactSeqs?: number[];
+  cause?: string;
 }
 
 const LEDGER_VERSION = 1;
@@ -107,8 +114,9 @@ export function resolveStateDbPath(agentId: string, env: NodeJS.ProcessEnv = pro
 
 const STATE_DIR_README = `Machine-managed Raft CLI state. Do not edit or delete files here.
 This directory holds the agent's local context ledger (read cursors, held
-drafts). It is written by the raft CLI only; hand edits forge or destroy the
-freshness attestation and degrade sends to conservative holds.
+drafts, commands paused for an answer). It is written by the raft CLI only;
+hand edits forge or destroy the freshness attestation and degrade sends to
+conservative holds.
 `;
 
 function ensureStateDirReadme(dbPath: string): void {
@@ -362,7 +370,24 @@ function prepareDb(db: DatabaseSync, agentId: string, env: NodeJS.ProcessEnv): v
     `);
   }
   ensureThreadContextColumns(db);
+  ensurePassiveRenderCountsTable(db);
   importLegacyStateOnce(db, agentId, env);
+}
+
+/**
+ * Glimpse layer 2: the counts table exists from this CLI's first ledger open,
+ * so the daemon can tell a CLI that counts (and printed nothing) from one that
+ * predates the counts (no table). Additive (still version 1). Best-effort: a
+ * ledger that cannot take the DDL right now still serves reads, and the first
+ * count tries again.
+ */
+function ensurePassiveRenderCountsTable(db: DatabaseSync): void {
+  try {
+    if (db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(PASSIVE_RENDER_COUNTS_TABLE)) return;
+    db.exec(PASSIVE_RENDER_COUNTS_DDL);
+  } catch {
+    // See above.
+  }
 }
 
 /**
@@ -927,6 +952,28 @@ export function probeLedgerWritable(agentId: string, env: NodeJS.ProcessEnv = pr
   }
 }
 
+// ---- passive render counts (glimpse layer 2) ----
+
+// Additive (still version 1): what this CLI printed of passive AX, per model
+// context and kind, until the daemon takes and clears the rows when a turn
+// ends (packages/shared/src/agentOps/passiveRenderCounts.ts). The table is
+// created on the ledger's first open (ensurePassiveRenderCountsTable).
+
+/** Add one printed block to its context's count; best-effort, a lost count only under-reports. */
+export function countPassiveRender(
+  agentId: string,
+  contextId: string,
+  kind: PassiveRenderKind,
+  chars: number,
+  bytes: number,
+  env: NodeJS.ProcessEnv = process.env,
+): void {
+  withDbBestEffort(agentId, env, (db) => {
+    db.exec(PASSIVE_RENDER_COUNTS_DDL);
+    db.prepare(PASSIVE_RENDER_COUNTS_UPSERT).run(contextId, kind, chars, bytes);
+  });
+}
+
 // ---- drafts ----
 
 export function readDraftEntry(agentId: string, target: string, env: NodeJS.ProcessEnv = process.env): LedgerDraftEntry | undefined {
@@ -994,6 +1041,123 @@ export function deleteDraftEntryIfIdempotencyKeyMatches(agentId: string, target:
       "DELETE FROM drafts WHERE target = ? AND json_extract(payload, '$.idempotencyKey') = ?",
     ).run(target, idempotencyKey);
     return Number(result.changes) > 0;
+  });
+}
+
+// ---- continuations (shared/src/continuations) ----
+
+// Additive (still version 1): records of commands that paused to ask the
+// agent something, and the content-free tombstones left of answered ones.
+// The payload is the record or tombstone as JSON; `revision` and
+// `delete_after` are copies the conditional update and the sweep match on.
+// Created on first use: older CLIs never see these tables, and a ledger that
+// never paused a command never has them.
+const CONTINUATION_TABLES_DDL = `
+  CREATE TABLE IF NOT EXISTS continuations (
+    id TEXT PRIMARY KEY,
+    revision INTEGER NOT NULL,
+    delete_after INTEGER NOT NULL,
+    payload TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS continuation_tombstones (
+    id TEXT PRIMARY KEY,
+    delete_after INTEGER NOT NULL,
+    payload TEXT NOT NULL
+  );`;
+
+function ensureContinuationTables(db: DatabaseSync): void {
+  const present = db.prepare(
+    "SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name IN ('continuations', 'continuation_tombstones')",
+  ).get() as { n: number | bigint };
+  if (Number(present.n) < 2) db.exec(CONTINUATION_TABLES_DDL);
+}
+
+/**
+ * Continuation rows are NOT best-effort: the runtime builds every answer it
+ * gives the agent (paused, answered once, expired) on what was stored, so a
+ * failed read or write throws, and the command says it could not keep the
+ * continuation instead of losing it silently.
+ */
+function withContinuationTables<T>(agentId: string, env: NodeJS.ProcessEnv, fn: (db: DatabaseSync) => T): T {
+  return withDb(agentId, env, (db) => {
+    ensureContinuationTables(db);
+    return fn(db);
+  });
+}
+
+/** Insert a continuation; false, writing nothing, when the id is taken. */
+export function insertContinuationRow(
+  agentId: string,
+  row: { id: string; revision: number; deleteAfter: number; payload: string },
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  return withContinuationTables(agentId, env, (db) => {
+    const result = db.prepare(
+      "INSERT INTO continuations (id, revision, delete_after, payload) VALUES (?, ?, ?, ?) ON CONFLICT(id) DO NOTHING",
+    ).run(row.id, row.revision, row.deleteAfter, row.payload);
+    return Number(result.changes) === 1;
+  });
+}
+
+export function readContinuationRow(agentId: string, id: string, env: NodeJS.ProcessEnv = process.env): string | undefined {
+  return withContinuationTables(agentId, env, (db) => {
+    const row = db.prepare("SELECT payload FROM continuations WHERE id = ?").get(id) as { payload: string } | undefined;
+    return row?.payload;
+  });
+}
+
+/** Replace the continuation only while its stored revision is `expectedRevision`; false when it moved on or is gone. */
+export function updateContinuationRow(
+  agentId: string,
+  row: { id: string; revision: number; deleteAfter: number; payload: string },
+  expectedRevision: number,
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  return withContinuationTables(agentId, env, (db) => {
+    const result = db.prepare(
+      "UPDATE continuations SET revision = ?, delete_after = ?, payload = ? WHERE id = ? AND revision = ?",
+    ).run(row.revision, row.deleteAfter, row.payload, row.id, expectedRevision);
+    return Number(result.changes) === 1;
+  });
+}
+
+export function deleteContinuationRow(agentId: string, id: string, env: NodeJS.ProcessEnv = process.env): void {
+  withContinuationTables(agentId, env, (db) => {
+    db.prepare("DELETE FROM continuations WHERE id = ?").run(id);
+  });
+}
+
+export function writeContinuationTombstoneRow(
+  agentId: string,
+  row: { id: string; deleteAfter: number; payload: string },
+  env: NodeJS.ProcessEnv = process.env,
+): void {
+  withContinuationTables(agentId, env, (db) => {
+    db.prepare("INSERT OR REPLACE INTO continuation_tombstones (id, delete_after, payload) VALUES (?, ?, ?)")
+      .run(row.id, row.deleteAfter, row.payload);
+  });
+}
+
+export function readContinuationTombstoneRow(agentId: string, id: string, env: NodeJS.ProcessEnv = process.env): string | undefined {
+  return withContinuationTables(agentId, env, (db) => {
+    const row = db.prepare("SELECT payload FROM continuation_tombstones WHERE id = ?").get(id) as { payload: string } | undefined;
+    return row?.payload;
+  });
+}
+
+/** Delete every continuation and tombstone whose `delete_after` is before `now`, in one transaction; answers how many. */
+export function deleteExpiredContinuationRows(agentId: string, now: number, env: NodeJS.ProcessEnv = process.env): number {
+  return withContinuationTables(agentId, env, (db) => {
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      const records = db.prepare("DELETE FROM continuations WHERE delete_after < ?").run(now);
+      const tombstones = db.prepare("DELETE FROM continuation_tombstones WHERE delete_after < ?").run(now);
+      db.exec("COMMIT");
+      return Number(records.changes) + Number(tombstones.changes);
+    } catch (error) {
+      db.exec("ROLLBACK");
+      throw error;
+    }
   });
 }
 

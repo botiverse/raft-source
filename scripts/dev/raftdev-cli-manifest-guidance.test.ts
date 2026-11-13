@@ -17,7 +17,7 @@ function fixture(before: Cases, after: Cases) {
     mkdirSync(join(root, "scripts"));
     symlinkSync(join(projectDir, "node_modules"), join(root, "node_modules"), "junction");
     writeFileSync(join(root, "package.json"), JSON.stringify({ type: "module" }));
-    for (const file of ["run-tests-with-manifest.mjs", "test-execution-reporter.mjs"]) {
+    for (const file of ["run-tests-with-manifest.ts", "test-execution-reporter.ts"]) {
       copyFileSync(join(projectDir, "packages/cli/scripts", file), join(root, "scripts", file));
     }
     const writeCases = (files: Cases) => {
@@ -31,7 +31,7 @@ function fixture(before: Cases, after: Cases) {
     const env = { ...process.env };
     delete env.NODE_TEST_CONTEXT;
     const run = (...args: string[]) => spawnSync(process.execPath,
-      [join(root, "scripts/run-tests-with-manifest.mjs"), ...args],
+      ["--import", "@oxc-node/core/register", join(root, "scripts/run-tests-with-manifest.ts"), ...args],
       { cwd: root, encoding: "utf8", env });
     writeCases(before);
     const seed = run("--update-manifest");

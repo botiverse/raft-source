@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "vitest";
 import type { ParsedEvent } from "./drivers/index";
-import { createTurnTokenAccumulator, noteTurnTokenUsage, turnTokenTraceAttrs } from "./runtimeTurnTokens";
+import { activityTurnTokensFrom, createTurnTokenAccumulator, noteTurnTokenUsage, turnTokenTraceAttrs } from "./runtimeTurnTokens";
 
 type TelemetryEvent = Extract<ParsedEvent, { kind: "telemetry" }>;
 const usage = (source: string, attrs: TelemetryEvent["attrs"]): TelemetryEvent => ({ kind: "telemetry", name: "token_usage", source, attrs });
@@ -36,7 +36,19 @@ test("Codex session totals become this turn's usage, with cached input split out
     inputTokens: 17_000, cachedInputTokens: 13_500, outputTokens: 800,
     lastInputTokens: 4_000, lastCachedInputTokens: 3_000, lastOutputTokens: 200,
   }));
-  assert.deepEqual(turnTokenTraceAttrs(acc), { input_tokens: 1_500, output_tokens: 300, cache_read_tokens: 5_500 });
+  assert.deepEqual(turnTokenTraceAttrs(acc), { input_tokens: 1_500, output_tokens: 300, cache_read_tokens: 5_500, last_request_context_tokens: 4_000 });
+});
+
+test("#54: the turn's last request context: Claude's from the normalizer, Codex's last input (cached included); the summed fields can't size it", () => {
+  const claude = createTurnTokenAccumulator();
+  noteTurnTokenUsage(claude, usage("claude_result_usage", { inputTokens: 30, outputTokens: 900, cachedInputTokens: 900_000, cacheCreationInputTokens: 5_000, lastRequestContextTokens: 310_000 }));
+  assert.equal(turnTokenTraceAttrs(claude).last_request_context_tokens, 310_000, "not the 905k summed over the turn's calls");
+  const codex = createTurnTokenAccumulator();
+  noteTurnTokenUsage(codex, usage("codex_thread_token_usage_updated", { inputTokens: 900_000, cachedInputTokens: 800_000, outputTokens: 600, lastInputTokens: 250_000, lastCachedInputTokens: 240_000, lastOutputTokens: 100 }));
+  assert.equal(turnTokenTraceAttrs(codex).last_request_context_tokens, 250_000);
+  const pi = createTurnTokenAccumulator();
+  noteTurnTokenUsage(pi, usage("pi_message_end_usage", { input_tokens: 100, output_tokens: 10 }));
+  assert.equal(turnTokenTraceAttrs(pi).last_request_context_tokens, undefined, "not reported: left off");
 });
 
 test("unusable reports leave the fields off", () => {
@@ -51,10 +63,31 @@ test("unusable reports leave the fields off", () => {
   noteTurnTokenUsage(reset, usage("codex_thread_token_usage_updated", {
     inputTokens: 900, cachedInputTokens: 0, outputTokens: 20, lastInputTokens: 900, lastCachedInputTokens: 0, lastOutputTokens: 20,
   }));
-  assert.deepEqual(turnTokenTraceAttrs(reset), {}, "totals that went backwards give no number");
+  assert.deepEqual(turnTokenTraceAttrs(reset), { last_request_context_tokens: 900 }, "totals that went backwards give no number; the last call's own size still holds");
 
   const gemini = createTurnTokenAccumulator();
   noteTurnTokenUsage(gemini, usage("gemini_result_stats", { total_tokens: 5_000 }));
   noteTurnTokenUsage(gemini, { kind: "telemetry", name: "rate_limits", source: "claude_result_usage", attrs: { inputTokens: 1 } });
   assert.deepEqual(turnTokenTraceAttrs(gemini), {});
+});
+
+test("Pi Anthropic provider_request sizes add up over the turn, and its tokens are not counted twice", () => {
+  const acc = createTurnTokenAccumulator();
+  const request = (attrs: TelemetryEvent["attrs"]): TelemetryEvent => ({ kind: "telemetry", name: "provider_request", source: "pi_anthropic_request", attrs });
+  noteTurnTokenUsage(acc, usage("pi_message_end_usage", { input_tokens: 100, output_tokens: 10 }));
+  noteTurnTokenUsage(acc, request({ request_bytes: 9_000, input_tokens: 100 }));
+  noteTurnTokenUsage(acc, request({ request_bytes: 400, input_tokens: 5 }));
+  assert.deepEqual(turnTokenTraceAttrs(acc), {
+    input_tokens: 100,
+    output_tokens: 10,
+    provider_request_bytes: 9_400,
+    provider_requests_count: 2,
+  });
+});
+
+test("activityTurnTokensFrom: the turn's counts, its last request's context and the model; unreported counts stay absent", () => {
+  const acc = createTurnTokenAccumulator();
+  noteTurnTokenUsage(acc, usage("claude_result_usage", { inputTokens: 12, outputTokens: 900, cachedInputTokens: 80_000, lastRequestContextTokens: 81_000 }));
+  assert.deepEqual(activityTurnTokensFrom(acc, "claude-opus"), { input: 12, cacheRead: 80_000, output: 900, contextUsed: 81_000, model: "claude-opus" });
+  assert.deepEqual(activityTurnTokensFrom(createTurnTokenAccumulator(), undefined), {});
 });

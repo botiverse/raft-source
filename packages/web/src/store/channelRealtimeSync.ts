@@ -3,6 +3,11 @@ import type { ApiChannel } from "./channelStore";
 import { useServerStore } from "./serverStore";
 import { useMessageStore } from "./messageStore";
 import type { Message } from "./messageStore";
+import { clearChannelAccessLost } from "./channelAccessLoss";
+import type { InboxRefreshTrigger } from "@botiverse/raft-shared";
+
+/** Asks for a throttled Activity re-read, naming the event that asked (#triage:#229). */
+export type ScheduleInboxRefresh = (trigger: InboxRefreshTrigger) => void;
 
 export interface ChannelRealtimeSocket {
   emit(event: string, ...args: unknown[]): unknown;
@@ -15,7 +20,8 @@ type ChannelRealtimeBinding = {
 
 export function applyMessageChannelActivity(
   msg: Message,
-  scheduleInboxRefresh: () => void,
+  scheduleInboxRefresh: ScheduleInboxRefresh,
+  trigger: Extract<InboxRefreshTrigger, "message_new" | "message_echo">,
 ) {
   if (!msg?.channelId) return;
   if (isMessageActivitySuppressedByMute(msg)) return;
@@ -26,12 +32,24 @@ export function applyMessageChannelActivity(
   if (useChannelStore.getState().dmChannels.some((c) => c.id === msg.channelId)) {
     void useChannelStore.getState().addOrRefreshDM(msg.channelId);
   }
-  scheduleInboxRefresh();
+  scheduleInboxRefresh(trigger);
 }
 
 export function isMessageActivitySuppressedByMute(msg: Message): boolean {
   if (mentionsCurrentUser(msg)) return false;
+  return isMessageInMutedActivityRange(msg);
+}
+
+/**
+ * Is this message at or past its channel's Activity mute, mention or not? The
+ * served channel row stops at the mute (a mention reaches Activity, but not
+ * that row's preview).
+ */
+export function isMessageInMutedActivityRange(msg: Message): boolean {
   if (msg.conversationContext?.channelType === "thread") return false;
+  // A task conversation (task v2) follows the thread rule: following it, not
+  // the channel's mute, decides whether it reaches Activity.
+  if (msg.conversationContext?.channelType === "task") return false;
   const activityChannelId = msg.channelId;
   const channelState = useChannelStore.getState();
   const muteSource = channelState.channels.find((channel) => channel.id === activityChannelId)
@@ -65,14 +83,14 @@ function normalizeSeq(value: string | number | null | undefined): number | null 
 
 export function createChannelRealtimeBindings(
   socket: ChannelRealtimeSocket,
-  scheduleInboxRefresh: () => void,
+  scheduleInboxRefresh: ScheduleInboxRefresh,
 ): ChannelRealtimeBinding[] {
   const dmNew = (payload: unknown) => {
     const channelId = readChannelId(payload);
     if (!channelId) return;
     socket.emit("join:channel", channelId);
     void useChannelStore.getState().addOrRefreshDM(channelId);
-    scheduleInboxRefresh();
+    scheduleInboxRefresh("dm_new");
   };
 
   const channelUpdated = (payload: unknown) => {
@@ -83,6 +101,8 @@ export function createChannelRealtimeBindings(
       // from another server must not land in this server's list.
       const currentServerId = useServerStore.getState().current?.id;
       if (channel.serverId && currentServerId && channel.serverId !== currentServerId) return;
+      // Added back (the route sends the added person their row, joined).
+      if (channel.joined === true) clearChannelAccessLost(channel.id);
       useChannelStore.getState().applyChannelPatch(channel);
       return;
     }
@@ -105,6 +125,9 @@ export function createChannelRealtimeBindings(
     // useChannelMembers re-fetches its own member page on the same event.
     const channelId = readChannelId(payload);
     if (channelId) {
+      // Our own join's event (sent before its reply): the join re-reads the
+      // row itself when it settles, accepted or not (store/channelJoin.ts).
+      if (useChannelStore.getState().joiningChannelIds[channelId]) return;
       void useChannelStore.getState().ensureChannel(channelId, { refresh: true });
       return;
     }

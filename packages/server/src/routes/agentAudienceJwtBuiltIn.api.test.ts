@@ -5,6 +5,7 @@ import { agentJwtIssuanceCounter } from "../metrics";
 import { getDb } from "../db/index";
 import { users, oauthClients, oauthClientInstalls, integrationAuditEvents } from "../db/schema";
 import { createOAuthClient, createOAuthClientShareLink, installOAuthClientShareInvite } from "../services/oauthService";
+import { currentAppPermissions } from "../test/integration/appPermissions";
 import { createServer, addMember } from "../services/serverService";
 import { createAgent } from "../services/agentService";
 import { mintAgentCredential } from "../services/agentCredentialService";
@@ -12,10 +13,10 @@ import { createApiTest } from "../test/integration/apiTest";
 import { openTestApp } from "../test/integration/app";
 import { fixturePasswordHash, tokenForHuman } from "../test/integration/credentials";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 test("Agent JWT is built in: no App or installation setting, same availability boundary as Agent Login", async () => {
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const seedUser = async (label: string) => {
       const suffix = randomUUID();
@@ -31,8 +32,8 @@ test("Agent JWT is built in: no App or installation setting, same availability b
     const { client } = await createOAuthClient({ serverId: source.id, createdByUserId: owner.id, clientId: `jwt-${randomUUID().slice(0, 8)}`, name: "Audience app", allowedScopes: ["openid", "profile"] });
     const sourceAgent = await createAgent(source.id, "SourceAgent", { runtime: "external", model: "external" });
     const targetAgent = await createAgent(target.id, "TargetAgent", { runtime: "external", model: "external" });
-    const sourceKey = await mintAgentCredential({ agentId: sourceAgent.id, scopes: ["read"], name: "source", createdByUserId: null });
-    const targetKey = await mintAgentCredential({ agentId: targetAgent.id, scopes: ["read"], name: "target", createdByUserId: null });
+    const sourceKey = await mintAgentCredential({ agentId: sourceAgent.id, scopes: ["read"], name: "source", issuedVia: "computer", createdByUserId: null });
+    const targetKey = await mintAgentCredential({ agentId: targetAgent.id, scopes: ["read"], name: "target", issuedVia: "computer", createdByUserId: null });
     const issue = (token: string, service = client.clientId) => fetch(`${app.baseUrl}/internal/agent-api/integrations/token`, { method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ service }) });
     const settings = (serverId: string, token: string, body?: object) => fetch(`${app.baseUrl}/api/integrations/clients/${client.id}/agent-jwt`, {
       method: body ? "PUT" : "GET", headers: { Authorization: `Bearer ${token}`, "X-Server-Id": serverId, "Content-Type": "application/json" }, ...(body ? { body: JSON.stringify(body) } : {}),
@@ -66,11 +67,11 @@ test("Agent JWT is built in: no App or installation setting, same availability b
     assert.equal(JSON.stringify(metric).includes(issued.access_token), false);
 
     // Private share: the source keeps an active installation and the target installs by invite.
-    const share = await createOAuthClientShareLink({ serverId: source.id, clientId: client.id, createdByUserId: owner.id });
+    const share = await createOAuthClientShareLink({ serverId: source.id, clientId: client.id, targetServerSlug: target.slug, createdByUserId: owner.id });
     assert.ok(share);
     assert.equal((await issue(sourceKey.apiKey)).status, 200, "source keeps issuing after conversion to a private share");
     assert.equal((await issue(targetKey.apiKey)).status, 403, "a share link alone does not install the App");
-    assert.ok(await installOAuthClientShareInvite({ token: share.token, userId: installer.id, serverId: target.id }));
+    assert.equal((await installOAuthClientShareInvite({ token: share.token, userId: installer.id, serverId: target.id, expected: await currentAppPermissions(client.id) }))?.status, "ok");
     const [installation] = await getDb().select().from(oauthClientInstalls).where(and(eq(oauthClientInstalls.clientId, client.id), eq(oauthClientInstalls.serverId, target.id)));
     assert.equal(installation.agentJwtEnabled, false, "fixture: the old installation column default is still false");
     const targetIssued = await issue(targetKey.apiKey);

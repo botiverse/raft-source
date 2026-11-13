@@ -1,23 +1,45 @@
-import { EXAMPLE_T, exampleMessage, exampleRestartDriver, exampleStdinDriver, exampleUnreadSummary } from "./axExampleFixtures";
+import { EXAMPLE_T, exampleMessage, exampleRestartDriver, exampleStdinDriver, exampleThirdPartyEvent, exampleUnreadSummary } from "./axExampleFixtures";
 import {
+  agentInboxItemRowFromPendingTarget,
+  ATTENTION_HINT_COPY_VERSION,
+  ATTENTION_HINT_SCHEMA,
+  formatAgentInboxDeltaHeader,
+  formatAgentInboxItemRow,
+  formatAgentSourceTasksSuffix,
+  formatAgentTaskReplySuffix,
+  formatHint,
+  parseAgentTaskRef,
+  RAFT_HINTS,
+  formatAgentMessageCardBlock,
+  formatAgentMessageCardHeaderFields,
   formatUtcTimestamp,
   formatProducerFactLineageBracket,
   formatSenderHandleText,
   indentAgentBodyContinuationLines,
-  renderThirdPartyInertJson,
+  formatAgentInboxPreviewText,
+  renderThirdPartyEventPayload,
+  thirdPartyEventPayloadForAgent,
+  thirdPartyEventInboxItemTarget,
+  thirdPartyEventShortId,
   asAxSurfaceText,
+  AGENT_INBOX_REMINDER_TARGET_PREFIX,
+  formatAgentInboxAppItems,
   type AgentConfig,
+  type AgentInboxAppItem,
+  type AgentInboxItemRow,
   type AgentMessage,
   type AxSurfaceText,
 } from "@botiverse/raft-shared";
 import {
   formatAgentInboxDelta,
   formatAgentReplyAffordanceSuffix,
+  projectAgentInboxLatestPreviews,
   projectAgentInboxSnapshot,
   type AgentInboxTargetRow,
 } from "./agentInboxProjection";
 import { formatAttachmentSuffix, type AttachmentDownloadHintStyle } from "./attachmentFormatting";
 import type { AgentProxyVisibleMessage } from "./agentCredentialProxy";
+import { isReminderDueInboxItem } from "./apps/reminder/inboxDefinition";
 import { formatAgentMessageVisibleTarget } from "./agentVisibleDeliveryLedger";
 import type { RuntimeDriver } from "./drivers/types";
 
@@ -95,6 +117,9 @@ export const adoptAxSurfaceText = (text: string): AxSurfaceText => asAxSurfaceTe
 
 type IncomingMessageFormatOptions = {
   attachmentHint?: AttachmentDownloadHintStyle;
+  /** Task v2: the task reply hints already shown in this delivery. The hint
+   *  is given once per task conversation per delivery, not on every message. */
+  shownTaskReplyHints?: Set<string>;
 };
 
 function getMessageShortId(messageId: string): string {
@@ -102,15 +127,9 @@ function getMessageShortId(messageId: string): string {
 }
 
 function formatSenderHandle(message: { sender_name: string; sender_description?: string | null; sender_timezone?: string | null }): string {
-  // sender_name / sender_description are free text (a human or agent profile
-  // description) and land on the same line as the header. Prefix their
-  // continuation lines so a newline in either cannot start a forged header.
-  // The zone is a server-validated IANA id.
-  return formatSenderHandleText(
-    indentAgentBodyContinuationLines(message.sender_name),
-    message.sender_description ? indentAgentBodyContinuationLines(message.sender_description) : null,
-    message.sender_timezone ?? null,
-  );
+  // sender_name / sender_description are free text on the header line;
+  // formatSenderHandleText prefixes their continuation lines.
+  return formatSenderHandleText(message.sender_name, message.sender_description ?? null, message.sender_timezone ?? null);
 }
 
 function formatVisibleActorType(type: AgentMessage["sender_type"]): string {
@@ -125,6 +144,13 @@ function formatThreadContextMessage(
   const senderType = formatVisibleActorType(message.sender_type);
   const seq = typeof message.seq === "number" ? ` seq=${message.seq}` : "";
   return `- [msg=${msgId}${seq} time=${time}${senderType}] ${formatSenderHandle(message)}: ${indentAgentBodyContinuationLines(message.content)}`;
+}
+
+/** A Raft system app's non-empty payload; never an external app's (shared thirdPartyEventPayloadForAgent). */
+function formatThirdPartyEventPayloadSuffix(message: AgentMessage): string {
+  const event = message.third_party_event;
+  const payload = event ? thirdPartyEventPayloadForAgent(event) : null;
+  return payload ? `\npayload:\n${renderThirdPartyEventPayload({ payload, system_app: event?.system_app })}` : "";
 }
 
 function formatIncomingMessage(message: AgentMessage, options: IncomingMessageFormatOptions): string {
@@ -145,23 +171,45 @@ function formatIncomingMessage(message: AgentMessage, options: IncomingMessageFo
         "",
       ].join("\n")
     : "";
+  // Task v2: a task's conversation is unfollowed with `raft task unfollow <ref>`.
+  const reactivatedTaskRef = message.thread_follow_reactivation
+    ? parseAgentTaskRef(message.thread_follow_reactivation.thread_target)
+    : null;
   const threadFollowReactivationPrefix = message.thread_follow_reactivation
     ? [
-        `[Raft thread follow restored: this @mention re-subscribed you to ordinary replies in ${message.thread_follow_reactivation.thread_target}.]`,
-        `To stop those replies again: raft thread unfollow --target ${JSON.stringify(message.thread_follow_reactivation.thread_target)}`,
+        `[Raft ${reactivatedTaskRef ? "task" : "thread"} follow restored: this @mention re-subscribed you to ordinary replies in ${message.thread_follow_reactivation.thread_target}.]`,
+        reactivatedTaskRef
+          ? `To stop those replies again: ${formatHint(RAFT_HINTS.taskUnfollow(reactivatedTaskRef.ref))}`
+          : `To stop those replies again: raft thread unfollow --target ${JSON.stringify(message.thread_follow_reactivation.thread_target)}`,
         "",
       ].join("\n")
     : "";
   const target = formatAgentMessageVisibleTarget(message);
-  const msgId = message.message_id ? getMessageShortId(message.message_id) : "-";
+  // A third-party event: the same id `message read` shows (its own id, shortened), whatever message_id carries.
+  const msgId = message.third_party_event
+    ? thirdPartyEventShortId(message.third_party_event)
+    : message.message_id ? getMessageShortId(message.message_id) : "-";
   const time = message.timestamp ? formatUtcTimestamp(message.timestamp) : "-";
-  const senderType = formatVisibleActorType(message.sender_type);
+  // RFC 082: a card message says `card=r<revision>` (and `updated=` once replaced) in the header, never in the body;
+  // what the card itself says follows the body (formatAgentMessageCardBlock).
+  const senderType = `${formatVisibleActorType(message.sender_type)}${formatAgentMessageCardHeaderFields(message.message_card)}`;
   const attachSuffix = formatAttachmentSuffix(message.attachments, options.attachmentHint);
-  const taskSuffix = message.task_status
-    ? ` [task #${message.task_number} status=${message.task_status}${message.task_assignee_id ? ` assignee=${message.task_assignee_type ?? null}:${message.task_assignee_id}` : ""}]`
-    : "";
+  // Task v2 (server sets source_tasks only where task v2 conversations are on):
+  // every task hanging under the message; otherwise the pre-v2 bracket as is.
+  const taskSuffix = message.source_tasks?.length
+    ? formatAgentSourceTasksSuffix(message.source_tasks, target)
+    : message.task_status
+      ? ` [task #${message.task_number} status=${message.task_status}${message.task_assignee_id ? ` assignee=${message.task_assignee_type ?? null}:${message.task_assignee_id}` : ""}]`
+      : "";
   const lineageSuffix = formatProducerFactLineageBracket(message.producerFactId);
-  const body = `[target=${target} msg=${msgId} time=${time}${senderType}] ${formatSenderHandle(message)}: ${indentAgentBodyContinuationLines(message.content)}${message.third_party_event ? `\npayload:\n${renderThirdPartyInertJson(message.third_party_event.payload)}` : ""}${attachSuffix}${taskSuffix}${lineageSuffix}${formatAgentReplyAffordanceSuffix(message)}`;
+  // Task v2: `raft task reply` is named on the first message of each task
+  // conversation in a delivery; later ones carry only their target.
+  let taskReplySuffix = formatAgentTaskReplySuffix(message);
+  if (taskReplySuffix && options.shownTaskReplyHints) {
+    if (options.shownTaskReplyHints.has(taskReplySuffix)) taskReplySuffix = "";
+    else options.shownTaskReplyHints.add(taskReplySuffix);
+  }
+  const body = `[target=${target} msg=${msgId} time=${time}${senderType}] ${formatSenderHandle(message)}: ${indentAgentBodyContinuationLines(message.content)}${formatThirdPartyEventPayloadSuffix(message)}${attachSuffix}${taskSuffix}${taskReplySuffix}${lineageSuffix}${formatAgentReplyAffordanceSuffix(message)}${formatAgentMessageCardBlock(message.message_card, message.content)}`;
   const prefixes = [threadJoinPrefix, threadFollowReactivationPrefix].filter(Boolean);
   return prefixes.length > 0 ? `${prefixes.join("\n")}\n${body}` : body;
 }
@@ -191,39 +239,274 @@ export const formatConcreteMessagesRuntimeInput = axSurface(
   pendingInboxNotice?: string,
 ): string => {
   const header = messages.length === 1 ? "New message received:" : "New messages received:";
+  const shownTaskReplyHints = new Set<string>();
   const concreteMessages = messages
-    .map((message) => formatIncomingMessage(message, incomingMessageFormatOptionsForDriver(driver)))
+    .map((message) => formatIncomingMessage(message, { ...incomingMessageFormatOptionsForDriver(driver), shownTaskReplyHints }))
     .join("\n");
   return (`${header}\n\n${concreteMessages}${pendingInboxNotice ? `\n\n${pendingInboxNotice}` : ""}\n\nRespond as appropriate. Complete all your work before stopping.\n${RESPONSE_TARGET_HINT}`);
 },
   {
     // Delivery examples cover all four target shapes (@xxchan 8/31):
     // channel, channel thread, dm, dm thread.
-    examples: [{ title: "plain channel message", args: [[exampleMessage], exampleStdinDriver] }, { title: "channel thread (thread-join context prefix)", args: [[{ ...exampleMessage, channel_type: "thread", channel_name: "thread-aaaabbbb-0000-0000-0000-000000000000", parent_channel_name: "general", parent_channel_type: "channel", content: "@alice-agent what do you think?", mentioned: true, thread_join_context: { reason: "mentioned", parent_target: "#general", thread_target: "#general:aaaabbbb", suggested_read_history_target: "#general:aaaabbbb", parent_message: { message_id: "aaaabbbb-0000-0000-0000-000000000000", sender_name: "richard", sender_type: "human", content: "let's discuss the rollout plan", timestamp: EXAMPLE_T, seq: 90 }, recent_messages: [], history_truncated: true } }], exampleStdinDriver] }, { title: "dm", args: [[{ ...exampleMessage, channel_type: "dm", channel_name: "richard", content: "hey, can you help?" }], exampleStdinDriver] }, { title: "dm thread reply", args: [[{ ...exampleMessage, channel_type: "thread", channel_name: "thread-00000000-1111-2222-3333-444444444444", parent_channel_name: "richard", parent_channel_type: "dm", content: "following up in our DM thread" }], exampleStdinDriver] }, { title: "attachments + task bracket + non-member mention", args: [[{ ...exampleMessage, mentioned: true, non_member_mention: true, attachments: [{ id: "aaaa1111-0000-0000-0000-000000000000", filename: "spec.md", mimeType: "text/markdown", sizeBytes: 12345 }], task_status: "in_progress", task_number: 42, task_assignee_type: "agent", task_assignee_id: "agent-1" }], exampleStdinDriver] }],
+    examples: [{ title: "plain channel message", args: [[exampleMessage], exampleStdinDriver] }, { title: "channel thread (thread-join context prefix)", args: [[{ ...exampleMessage, channel_type: "thread", channel_name: "thread-aaaabbbb-0000-0000-0000-000000000000", parent_channel_name: "general", parent_channel_type: "channel", content: "@alice-agent what do you think?", mentioned: true, thread_join_context: { reason: "mentioned", parent_target: "#general", thread_target: "#general:aaaabbbb", suggested_read_history_target: "#general:aaaabbbb", parent_message: { message_id: "aaaabbbb-0000-0000-0000-000000000000", sender_name: "richard", sender_type: "human", content: "let's discuss the rollout plan", timestamp: EXAMPLE_T, seq: 90 }, recent_messages: [], history_truncated: true } }], exampleStdinDriver] }, { title: "dm", args: [[{ ...exampleMessage, channel_type: "dm", channel_name: "richard", content: "hey, can you help?" }], exampleStdinDriver] }, { title: "dm thread reply", args: [[{ ...exampleMessage, channel_type: "thread", channel_name: "thread-00000000-1111-2222-3333-444444444444", parent_channel_name: "richard", parent_channel_type: "dm", content: "following up in our DM thread" }], exampleStdinDriver] }, { title: "attachments + task bracket + non-member mention", args: [[{ ...exampleMessage, mentioned: true, non_member_mention: true, attachments: [{ id: "aaaa1111-0000-0000-0000-000000000000", filename: "spec.md", mimeType: "text/markdown", sizeBytes: 12345 }], task_status: "in_progress", task_number: 42, task_assignee_type: "agent", task_assignee_id: "agent-1" }], exampleStdinDriver] }, { title: "a card message (RFC 082): card=r1 in the header, the card's own text under the body", args: [[{ ...exampleMessage, sender_type: "agent", sender_name: "hands", content: "Build 1.19.0 failed", message_card: { revision: 1, updated_at: EXAMPLE_T, text: "Build 1.19.0 · [Failed]\n\n⚠️ Font file missing: NotoSans_CJK.ttf\n\n[Open build log](https://ci.example.com/builds/42)" } }], exampleStdinDriver] }],
   },
 );
 
 export const formatInboxUpdateRuntimeInput = axSurface(
-  "Content-free [Raft inbox notice: ...] batched into a busy turn or delivered as a wake.",
+  "[Raft inbox notice: ...] batched into a busy turn or delivered as a wake: per-target counts plus a bounded preview of each target's latest message (task #387); it reads nothing and advances no cursor.",
   (
   messages: readonly AgentMessage[],
   _driver: RuntimeDriver,
   totalPendingMessages: number = messages.length,
+  options: InboxUpdateRenderOptions = {},
 ): string => {
+  if (options.inboxItems === true) return formatInboxItemsWakeNotice(messages, totalPendingMessages, options);
   const rows = projectAgentInboxSnapshot(messages);
+  const previews = projectAgentInboxLatestPreviews(messages);
+  // Task v2: only when a task conversation is listed, so other notices keep their bytes.
+  const taskReadNote = rows.some((row) => parseAgentTaskRef(row.target))
+    ? " A task conversation (a `#channel:#7` target) is read with `raft task read <ref> --unread` and replied to with `raft task reply <ref>`."
+    : "";
   return ([
     "[Raft inbox notice:",
-    formatAgentInboxDelta(rows, { totalPendingMessages }),
+    formatAgentInboxDelta(rows, { totalPendingMessages, previews }),
     "]",
-    "These messages have not been read. Choose when to read them: `raft message read --target <target> --unread` reads one conversation's unread messages; `raft message check` reads all of them.",
+    `These messages have not been read. Choose when to read them: \`raft message read --target <target> --unread\` reads one conversation's unread messages; \`raft inbox check\` lists every conversation with unread messages.${taskReadNote}`,
   ].join("\n"));
 },
   {
     // Rows cover all four target shapes (@xxchan 8/31): channel, channel
     // thread, dm, dm thread.
-    examples: [{ args: [[{ ...exampleMessage, mentioned: true }, { ...exampleMessage, message_id: "55555555-6666-7777-8888-999999999999", seq: 101, channel_type: "dm", channel_name: "richard" }, { ...exampleMessage, message_id: "aaaabbbb-0000-0000-0000-000000000000", seq: 102, channel_type: "thread", channel_name: "thread-aaaabbbb", parent_channel_name: "general", parent_channel_type: "channel" }, { ...exampleMessage, message_id: "ccccdddd-0000-0000-0000-000000000000", seq: 103, channel_type: "thread", channel_name: "thread-55555555", parent_channel_name: "richard", parent_channel_type: "dm" }], exampleStdinDriver, 7] }],
+    examples: [{ args: [[{ ...exampleMessage, mentioned: true }, { ...exampleMessage, message_id: "55555555-6666-7777-8888-999999999999", seq: 101, channel_type: "dm", channel_name: "richard" }, { ...exampleMessage, message_id: "aaaabbbb-0000-0000-0000-000000000000", seq: 102, channel_type: "thread", channel_name: "thread-aaaabbbb", parent_channel_name: "general", parent_channel_type: "channel" }, { ...exampleMessage, message_id: "ccccdddd-0000-0000-0000-000000000000", seq: 103, channel_type: "thread", channel_name: "thread-55555555", parent_channel_name: "richard", parent_channel_type: "dm" }], exampleStdinDriver, 7] }, { title: "inbox items on (RFC 081 D16): rows through the shared item-row formatter, each with its inbox read command", args: [[{ ...exampleMessage, mentioned: true }, { ...exampleMessage, message_id: "55555555-6666-7777-8888-999999999999", seq: 101, channel_type: "dm", channel_name: "richard" }], exampleStdinDriver, 7, { inboxItems: true }] }, { title: "inbox items on, with the wake-up's own details: first msg, attention hint and the non-member line", args: [[{ ...exampleMessage, mentioned: true, non_member_mention: true, attention_hint: { schema: ATTENTION_HINT_SCHEMA, trigger: "M2", scope: "#general", suggested_command: "raft channel mute \"#general\"", copy: "You've received 12 updates from #general with no action taken.", copy_version: ATTENTION_HINT_COPY_VERSION, epoch_ms: 123, thresholds: { K: 12, window_ms: 604800000 } } }], exampleStdinDriver, 1, { inboxItems: true }] }, { title: "inbox items on, with grouped third-party app events (the ones not in this list)", args: [[{ ...exampleMessage, mentioned: true }, { ...exampleMessage, message_id: "eeeeeeee-0000-4000-8000-000000000000", seq: 104, channel_id: "third-party-agent-events:agent-1", channel_type: "dm", channel_name: "third-party-agent-events:agent-1", sender_type: "third_party_app", sender_name: "stamp", content: "", third_party_event: { id: "eeeeeeee-0000-4000-8000-000000000000", kind: "notification", client_id: "stamp", client_name: "stamp", payload_hash: "0".repeat(64), payload: {}, expires_at: EXAMPLE_T, source: { client_id: "stamp", client_name: "stamp", oauth_client_id: "oauth-client-1", resource: "urn:raft:example" } } }], exampleStdinDriver, 2, { inboxItems: true }] }, { title: "inbox items on, third-party events: one the Server lists as an app item (its own row) and one it does not (the grouped row)", args: [[exampleThirdPartyEvent(201, "app:stamp/pr-13754"), exampleThirdPartyEvent(202), { ...exampleMessage, mentioned: true }], exampleStdinDriver, 3, { inboxItems: true }] }],
   },
 );
+
+/**
+ * What the agent's config says about the wake-up notice. `inboxItems` is the
+ * Server's `agent_inbox_items_v0` flag (AgentConfig, on `agent:start` and
+ * `server:features`); absent or false keeps today's notice byte for byte.
+ */
+export type InboxUpdateRenderOptions = {
+  inboxItems?: boolean;
+  /**
+   * Inbox items on: the Computer-local app items the notice is about.
+   * `changed` (the items not noticed yet) picks the reminders that get a row;
+   * `pending` (every item in the agent's app Inbox) fills each row with all of
+   * that reminder's fired revisions not yet acked, as `inbox check` lists it.
+   */
+  appItems?: { changed: readonly AgentInboxAppItem[]; pending: readonly AgentInboxAppItem[] };
+  /**
+   * With `appItems`: when inbox items launched (the Server's
+   * `AgentConfig.inboxItemsLaunchAt`, read by inboxItemsLaunchAtMs), or null
+   * when the daemon does not know it.
+   * RFC 081 D9: only a reminder fired since then is a Server item (its
+   * `reminder:` row and `read:` resolve); every other reminder stays on the
+   * old path, in the daemon section. Unknown: every reminder does.
+   */
+  inboxItemsLaunchAtMs?: number | null;
+  /** For a row's `latest … ago`; without it no row shows an age. */
+  nowMs?: number;
+};
+
+/** The flag a host reads from the config it renders a wake-up for. */
+export function inboxUpdateRenderOptions(config: Pick<AgentConfig, "inboxItems"> | null | undefined): InboxUpdateRenderOptions {
+  return config?.inboxItems === true ? { inboxItems: true } : {};
+}
+
+/**
+ * RFC 081 D16, with inbox items on: the wake-up rows render through the
+ * shared item-row formatter, fed the same row data `raft inbox check` builds
+ * for a daemon-pending target (agentInboxItemRowFromPendingTarget), so each
+ * row carries its `raft inbox read --target <item>` command. The header and
+ * the bracket stay as they are.
+ */
+/**
+ * The shared pending-target row plus what today's wake-up notice already
+ * shows of the target and `inbox check` does not: the first pending message,
+ * the suppressed count, the attention hint and the non-member guidance.
+ */
+function wakeUpItemRow(row: AgentInboxTargetRow, preview: { text: string; truncated: boolean } | undefined): AgentInboxItemRow {
+  return {
+    ...agentInboxItemRowFromPendingTarget(row, preview, { as: "unread" }),
+    ...(row.firstPendingMsgId ? { firstUnreadMsgId: row.firstPendingMsgId } : {}),
+    ...(row.suppressedCount ? { suppressed: row.suppressedCount } : {}),
+    ...(row.attentionHint ? { attentionHint: row.attentionHint } : {}),
+    ...(row.flags.includes("non_member_mention") ? { nonMemberMention: true as const } : {}),
+  };
+}
+
+type AppItem = Pick<AgentInboxItemRow, "kind" | "app" | "objectRef"> & { latest: AgentMessage };
+
+/**
+ * RFC 081, inbox items on: third-party events the Server lists as an inbox
+ * item (`third_party_event.inbox_item_target`) form their own app row, by
+ * that target, rather than counting in the grouped third-party events row.
+ * The app it names is the event's own (`client_id`, `client_name`).
+ */
+function appItemRows(messages: readonly AgentMessage[]): Map<string, AppItem> {
+  const apps = new Map<string, AppItem>();
+  for (const message of messages) {
+    const event = message.third_party_event;
+    const item = event ? thirdPartyEventInboxItemTarget(message) : null;
+    if (!event || !item) continue;
+    const known = apps.get(item.target);
+    if (known) {
+      if (isLaterMessage(message, known.latest)) known.latest = message;
+      continue;
+    }
+    apps.set(item.target, {
+      kind: item.objectRef ? "app" : "app_fallback",
+      ...(event.client_id && event.client_name ? { app: { key: event.client_id, name: event.client_name } } : {}),
+      ...(item.objectRef ? { objectRef: item.objectRef } : {}),
+      latest: message,
+    });
+  }
+  return apps;
+}
+
+/** By seq, then id: the projection's own order for a target's latest message. */
+function isLaterMessage(a: AgentMessage, b: AgentMessage): boolean {
+  const seqA = typeof a.seq === "number" ? a.seq : 0;
+  const seqB = typeof b.seq === "number" ? b.seq : 0;
+  return seqA !== seqB ? seqA > seqB : (a.message_id ?? "").localeCompare(b.message_id ?? "") > 0;
+}
+
+// What the Server writes before an event's summary (buildThirdPartyAgentMessage):
+// `Third-party <kind>: ` for an external app, `System <kind>: ` for a system app.
+const APP_EVENT_CONTENT_PREFIX = /^(?:Third-party|System) [a-z_]+: /u;
+
+/**
+ * The preview of an app item's latest event: its summary, the first line of
+ * what the Server pushed without the line's `Third-party <kind>: ` prefix. A
+ * preview only: nothing is marked seen for it (third-party events never are,
+ * projectAgentInboxWholePreviewMessages).
+ */
+function appEventPreview(message: AgentMessage): { text: string; truncated: boolean } | null {
+  if (typeof message.content !== "string") return null;
+  const firstLine = message.content.split("\n", 1)[0] ?? "";
+  return formatAgentInboxPreviewText(firstLine.replace(APP_EVENT_CONTENT_PREFIX, ""));
+}
+
+/** An app item's wake-up row: the app it is from, its event count and its latest event's summary; never the sender (D6). */
+function wakeUpAppItemRow(row: AgentInboxTargetRow, app: AppItem): AgentInboxItemRow {
+  const { latest, ...fields } = app;
+  return {
+    ...agentInboxItemRowFromPendingTarget(row, appEventPreview(latest), { as: "unread" }),
+    ...fields,
+    mentions: 0,
+    latestSender: fields.app ? { name: fields.app.name, type: "app" } : null,
+  };
+}
+
+/** A reminder revision the Server lists (D9): fired at or after the launch. Unknown launch or fire time: not listed. */
+function firedSinceLaunch(item: AgentInboxAppItem, launchAtMs: number | null | undefined): boolean {
+  return typeof launchAtMs === "number" && typeof item.createdAtMs === "number" && item.createdAtMs >= launchAtMs;
+}
+
+/** The reminders the Server lists: those with a pending revision fired since launch (`inbox check` hides every daemon copy of them). */
+function listedReminderIds(options: InboxUpdateRenderOptions): Set<string> {
+  return new Set((options.appItems?.pending ?? [])
+    .filter((item) => isReminderDueInboxItem(item) && firedSinceLaunch(item, options.inboxItemsLaunchAtMs))
+    .map((item) => item.sourceRef.id));
+}
+
+/**
+ * RFC 081, inbox items on: a Computer-local reminder (the daemon's app Inbox)
+ * as the item row the Server lists for it in `inbox check`
+ * (listAgentReminderItems): `reminder:<id8>`, one `ack` per fired revision not
+ * yet acked (oldest first), its title as the preview. Newest reminder first. Only
+ * the reminders, and revisions, fired since launch (D9).
+ */
+function reminderItemRows(options: InboxUpdateRenderOptions): AgentInboxItemRow[] {
+  const appItems = options.appItems;
+  if (!appItems) return [];
+  const listed = listedReminderIds(options);
+  const changed = new Set(appItems.changed.filter((item) => isReminderDueInboxItem(item) && listed.has(item.sourceRef.id)).map((item) => item.sourceRef.id));
+  const byReminder = new Map<string, AgentInboxAppItem[]>();
+  for (const item of appItems.pending) {
+    // The Server's row holds the revisions fired since launch only.
+    if (!isReminderDueInboxItem(item) || !changed.has(item.sourceRef.id) || !firedSinceLaunch(item, options.inboxItemsLaunchAtMs)) continue;
+    const group = byReminder.get(item.sourceRef.id);
+    if (group) group.push(item);
+    else byReminder.set(item.sourceRef.id, [item]);
+  }
+  const revision = (item: AgentInboxAppItem) => Number(item.sourceRef.revision);
+  const firedAt = (item: AgentInboxAppItem) => item.createdAtMs ?? 0;
+  const iso = (ms: number | undefined) => (typeof ms === "number" && Number.isFinite(ms) ? new Date(ms).toISOString() : null);
+  return [...byReminder.values()]
+    .map((group) => group.sort((a, b) => revision(a) - revision(b)))
+    .sort((a, b) => firedAt(b.at(-1)!) - firedAt(a.at(-1)!))
+    .map((group): AgentInboxItemRow => {
+      const latest = group.at(-1)!;
+      return {
+        target: `${AGENT_INBOX_REMINDER_TARGET_PREFIX}${latest.sourceRef.id.slice(0, 8)}`,
+        kind: "reminder",
+        related: null,
+        ack: group.map((item) => ({ app: "system.reminder" as const, id: item.sourceRef.id, revision: item.sourceRef.revision! })),
+        unread: group.length,
+        latestSender: null,
+        preview: latest.title ?? null,
+        previewTruncated: false,
+        firstUnreadAt: iso(group[0]!.createdAtMs),
+        latestAt: iso(latest.createdAtMs),
+        preLaunch: false,
+      };
+    });
+}
+
+function formatInboxItemsWakeNotice(
+  messages: readonly AgentMessage[],
+  totalPendingMessages: number,
+  options: InboxUpdateRenderOptions,
+): string {
+  const rows = projectAgentInboxSnapshot(messages, undefined, { appInboxItemTargets: true });
+  const previews = projectAgentInboxLatestPreviews(messages);
+  const apps = appItemRows(messages);
+  const items: AgentInboxItemRow[] = [
+    ...reminderItemRows(options),
+    ...rows.map((row) => {
+      const app = apps.get(row.target);
+      return app ? wakeUpAppItemRow(row, app) : wakeUpItemRow(row, previews.get(row.target));
+    }),
+  ];
+  const localItems = localOnlyAppItems(options);
+  const rowOptions = { inboxRead: true, ...(options.nowMs === undefined ? {} : { nowMs: options.nowMs }) };
+  const changedTargets = items.length + localItems.changed;
+  const listed = changedTargets === 0
+    ? formatAgentInboxDelta(rows, { totalPendingMessages })
+    : [
+      formatAgentInboxDeltaHeader(changedTargets, totalPendingMessages),
+      ...items.flatMap((item) => formatAgentInboxItemRow(item, rowOptions)),
+    ].join("\n");
+  // The section `raft inbox check` prints for them, byte for byte (shared formatAgentInboxAppItems).
+  const body = localItems.text ? `${listed}\n\n${localItems.text}` : listed;
+  const notice = ["[Raft inbox notice:", body, "]"];
+  // Each item row prints its own `read:` (and a reminder its `ack:`) command,
+  // so the notice ends at its bracket (#wg-ax:#32: the sentence that used to
+  // follow cost every agent ~60 tokens a notice). Only the bare count, with no
+  // row to read from, still says where to look.
+  if (changedTargets === 0) {
+    notice.push("These messages have not been read. `raft inbox check` lists every item with unread messages.");
+  }
+  return notice.join("\n");
+}
+
+/**
+ * Computer-local app items the Server does not list (every app's but the
+ * reminder's, e.g. the cleaner's, and a reminder not fired since launch, D9):
+ * `raft inbox check` shows them in its daemon section, `App items: N` and one
+ * line each (formatAgentInboxAppItems), all of them; the notice shows the
+ * same section when one of them is new.
+ */
+function localOnlyAppItems(options: InboxUpdateRenderOptions): { changed: number; text: string } {
+  const appItems = options.appItems;
+  if (!appItems) return { changed: 0, text: "" };
+  const listed = listedReminderIds(options);
+  const isLocal = (item: AgentInboxAppItem) => !isReminderDueInboxItem(item) || !listed.has(item.sourceRef.id);
+  const changed = appItems.changed.filter(isLocal).length;
+  if (changed === 0) return { changed: 0, text: "" };
+  return { changed, text: formatAgentInboxAppItems(appItems.pending.filter(isLocal)) };
+}
 
 export function formatUnreadSummaryRows(unreadSummary: Record<string, number> | undefined): string {
   return Object.entries(unreadSummary ?? {})
@@ -306,15 +589,26 @@ export function projectThreadJoinContextsForRuntimeInput(
 // Claude Code 2.1.114 treats "follow your system prompt" style user turns as
 // prompt-injection bait even when the prompt is supplied via --system-prompt-file.
 // A neutral starter lets the native standing prompt drive startup/migration.
+// A driver without a native standing prompt gets the prompt ahead of it in the
+// same first input (applyFreshSessionStandingPrompt).
 export const NATIVE_STANDING_PROMPT_STARTUP_INPUT: AxSurfaceText = axSurfaceLiteral(
-  "Neutral starter turn for native-standing-prompt drivers.",
+  "Neutral starter turn for a fresh session whose standing prompt is already delivered (natively, or ahead of it in the first input).",
   "Start."
 );
 
+/**
+ * The unread-summary targets the startup suffixes and the resume prompt render,
+ * in order. `agent:turn:ended` reports exactly these as shown, so a target is
+ * never reported unless its count went into the input.
+ */
+export function renderedUnreadSummaryTargets(unreadSummary: Record<string, number> | undefined): string[] {
+  return Object.keys(unreadSummary ?? {});
+}
+
 function formatUnreadChannelLines(unreadSummary: Record<string, number>): string {
   let lines = "";
-  for (const [ch, count] of Object.entries(unreadSummary)) {
-    lines += `\n- ${ch}: ${count} unread`;
+  for (const ch of renderedUnreadSummaryTargets(unreadSummary)) {
+    lines += `\n- ${ch}: ${unreadSummary[ch]} unread`;
   }
   return lines;
 }
@@ -323,7 +617,7 @@ export const formatOtherUnreadChannelsSuffix = axSurface(
   "Wake-delivery suffix listing other channels with unread counts.",
   (unreadSummary: Record<string, number> | undefined): string => {
   if (!unreadSummary || Object.keys(unreadSummary).length === 0) return ("");
-  return (`\n\nYou also have unread messages in other channels:${formatUnreadChannelLines(unreadSummary)}\n\nRun \`raft inbox check\` at a natural breakpoint if you choose to inspect those targets; it lists every unread conversation with the command that opens it.`);
+  return (`\n\nYou also have unread messages in other channels:${formatUnreadChannelLines(unreadSummary)}\n\nList them: \`raft inbox check\``);
 },
   {
     examples: [{ args: [exampleUnreadSummary] }],
@@ -331,11 +625,10 @@ export const formatOtherUnreadChannelsSuffix = axSurface(
 );
 
 export const formatAppInboxNoticeSuffix = axSurface(
-  "Start-input suffix telling a per-turn runtime that App items (reminders, cleaner hints) are pending in its Inbox.",
-  (pendingAppItems: number): string =>
-    `\n\n[Raft Inbox notice:\nApp items pending: ${pendingAppItems}\nRun \`raft inbox check\` to inspect them.]`,
+  "Start-input suffix telling a per-turn runtime that App items (reminders, cleaner hints) are pending in its Inbox: the app Inbox notice (appInboxNoticeText) after a blank line.",
+  (notice: string): string => `\n\n${notice}`,
   {
-    examples: [{ args: [1] }],
+    examples: [{ args: ["[Raft Inbox notice:\nApp items pending: 1\nRun `raft inbox check` to inspect them.]"] }],
   },
 );
 
@@ -343,7 +636,7 @@ export const formatBoundedStartupUnreadSuffix = axSurface(
   "Resume catch-up suffix warning that the startup batch is bounded.",
   (unreadSummary: Record<string, number> | undefined): string => {
   if (!unreadSummary || Object.keys(unreadSummary).length === 0) return ("");
-  return (`\n\nSome unread channels may not be included in this bounded startup batch:${formatUnreadChannelLines(unreadSummary)}\n\nRun \`raft inbox check\` at a natural breakpoint if you choose to inspect those targets; it lists every unread conversation with the command that opens it.`);
+  return (`\n\nSome unread channels may not be included in this bounded startup batch:${formatUnreadChannelLines(unreadSummary)}\n\nList them: \`raft inbox check\``);
 },
   {
     examples: [{ args: [exampleUnreadSummary] }],
@@ -389,6 +682,35 @@ export function runtimeProfileNotificationFromMessage(message: AgentMessage): { 
   }
   return null;
 }
+
+/**
+ * task #26: context the server writes for the agent about its own setup, not
+ * a channel's content. Its `channel_id` is a label ("onboarding-context"),
+ * not a channel: an inbox row for it would offer a `raft message read` that
+ * cannot resolve, and the row would never clear. The daemon holds it instead
+ * (serverContextLedger) and writes it ahead of the agent's next input.
+ */
+const SERVER_CONTEXT_CHANNEL_IDS: ReadonlySet<string> = new Set(["onboarding-context"]);
+
+export function isServerContextMessage(message: AgentMessage): boolean {
+  return message.sender_type === "system" && SERVER_CONTEXT_CHANNEL_IDS.has(message.channel_id ?? "");
+}
+
+export const formatSubagentsFinishedRuntimeInput = axSurface(
+  "Wake written by the daemon when the last of the agent's subagents finished after its turn had ended, for a runtime that only queues their results for the next turn (Codex); the results themselves are the runtime's own notification items in the same turn.",
+  (): string => "Your sub-agents have finished. Their results are above. Continue your work with them. Complete all your work before stopping.",
+  { examples: [{ args: [] }] },
+);
+
+export const formatServerContextPrefix = axSurface(
+  "Server-authored context for the agent about its own setup (e.g. the onboarding owner facts), written as its body ahead of the next runtime input.",
+  (body: string): string => `${body}\n\n`,
+  {
+    examples: [{
+      args: ["Onboarding context for this server (re-sent on every start; not a message to reply to):\nowner_name=Ada"],
+    }],
+  },
+);
 
 /**
  * Wrap a batch of inbox-pipeline runtime-profile notifications into a
@@ -484,6 +806,36 @@ export const formatRuntimeProfileControlStartupInput = axSurface(
   },
 );
 
+/**
+ * RFC 071 F9: the spawn-time release notice when the same start also carries
+ * the owed resume catch-up, and the standing prompt that holds the notice does
+ * not reach the session. It goes ahead of the catch-up messages (the standing
+ * prompt's startup step 0 orders the notice first); unlike
+ * `formatRuntimeProfileControlStartupInput` it does not say "stop": the
+ * messages follow in this same input.
+ */
+export const formatRuntimeProfileControlCatchupLead = axSurface(
+  "Runtime Profile daemon release notice put ahead of the resume catch-up messages in the same start input (spawn-time path, RFC 071 F9).",
+  (
+  control: NonNullable<AgentConfig["runtimeProfileControl"]>,
+  driver: RuntimeDriver,
+): string => {
+  void driver;
+  return ([
+    "Runtime Profile notice: read the daemon release notice below first. No chat reply or runtime control action is required for this notice; then handle the messages that follow.",
+    "",
+    control.message,
+    "",
+    "---",
+    "",
+    "",
+  ].join("\n"));
+},
+  {
+    examples: [{ args: [{ kind: "daemon_release_notice", message: "Daemon v1.0.24 released: <release notice body>" } as never, exampleStdinDriver] }],
+  },
+);
+
 export function groupThreadJoinContextReceiptMessages(
   messages: readonly AgentMessage[],
 ): Map<string, AgentProxyVisibleMessage[]> {
@@ -503,4 +855,28 @@ export function groupThreadJoinContextReceiptMessages(
     }
   }
   return messagesByTarget;
+}
+
+/**
+ * The ledger receipts for the thread-join packages rendered in one delivery.
+ * A thread target's package advances that thread's model-seen boundary only
+ * when it was shown whole. A truncated package (`history_truncated`) shows the
+ * latest replies but not the older ones below them, so it records exact ids
+ * only: the older replies stay unseen, and a send in that thread is still held
+ * until the agent reads them. The parent target never advances either way
+ * (`canAdvanceBoundaryForTarget`).
+ */
+export function threadJoinContextReceipts(
+  messages: readonly AgentMessage[],
+): Array<{ target: string; messages: AgentProxyVisibleMessage[]; source: "thread_join_context_rendered" | "thread_join_context_rendered_truncated" }> {
+  const truncatedTargets = new Set<string>();
+  for (const message of messages) {
+    const context = message.thread_join_context;
+    if (context?.history_truncated) truncatedTargets.add(context.thread_target);
+  }
+  return [...groupThreadJoinContextReceiptMessages(messages)].map(([target, contextMessages]) => ({
+    target,
+    messages: contextMessages,
+    source: truncatedTargets.has(target) ? "thread_join_context_rendered_truncated" : "thread_join_context_rendered",
+  }));
 }

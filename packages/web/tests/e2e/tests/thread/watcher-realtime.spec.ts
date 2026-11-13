@@ -221,7 +221,7 @@ test("parent activity mute suppresses channel root while followed thread still p
   await expect(page.getByRole("heading", { name: "Activity" })).toBeVisible();
   const threadRow = page.getByTestId("inbox-row")
     .filter({
-      has: page.locator('[data-testid="conversation-card-title-icon"][data-kind="thread"]'),
+      has: page.locator('[data-testid="conversation-card-avatar"][data-kind="thread"]'),
     })
     .filter({ hasText: parentContent });
   await expect(threadRow).toBeVisible();

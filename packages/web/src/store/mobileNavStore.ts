@@ -1,184 +1,143 @@
 import { create } from "zustand";
 import type { RailMode } from "../hooks/useSidebarTab";
 
-// Mobile-only per-tab navigation stack. Each MOBILE TAB (chat / tasks /
-// members / settings — 4 tabs, per @stdrc 2026-04-30 #proj-uiux:c8711d2a)
-// keeps its own list of paths the user has visited within that tab.
-// iOS NavigationView semantics:
+// The phone's tabs (chat / activity / tasks / search — the bar reads
+// Home / Activity / Tasks / Search, then the server tab; Search became a tab
+// on 2026-10-21, design lead) and which URLs belong to which.
 //
-// - Cold tap a tab from elsewhere → land on the stack's current top
-//   (the place the user left when they last switched away). If empty,
-//   land on the tab's canonical home.
-// - Tap a tab while already on it → pop everything down to root (just
-//   the tab home). This is the "scroll-to-top / reset" gesture.
-// - Drilling into a detail (e.g. agent/<id> from members list) pushes
-//   the new path onto the active tab's stack. The detail covers the
-//   tab bar — there is no concept of "switch tabs from inside a detail",
-//   user must hit the back button first.
-// - In-app or browser back pops one entry off the active tab's stack.
+// A tab tap always lands on that tab's root (stdrc 2026-05-09: pushed pages
+// hide the bar, so reopening one would leave no way back to the root), as the
+// user left it: its filters come back (`roots` below) and so does its scroll
+// position (hooks/useTabRootScroll). Tapping the selected tab scrolls its
+// root to the top (Activity: its next unread item) and changes nothing else.
+// Back follows the browser history (useMobileBack), not anything kept here.
 //
-// Computers is NOT a top-level mobile tab — it lives inside Settings.
-// On mobile, /computers and /computer/<id> are part of the Settings stack.
-// Search is NOT a top-level mobile tab — it is a Home drill-in.
-// On mobile, /search is part of the Chat/Home stack.
+// The last slot is the server tab (Raft DS › Navigation › "The server tab on a
+// phone", stdrc 2026-10-22): the current server, which opens a popover, not a
+// page, and is never selected. It took the place of More. The server's own
+// pages, Members, Computers and Settings (and everything under them), open
+// from that popover as pushed pages with Back, so they belong to no tab
+// (`mobileTabForPath` returns null). The old /more link redirects to Home.
+// Search is a tab (design lead 2026-10-21, "like Slack"): /search is its
+// root, with no Back and the bar showing Search selected. A result opened from
+// it is a pushed page with a Back that returns to the results.
 //
-// URL paths are still shared with desktop — only navigation BEHAVIOR
-// is mobile-specific. The stack only matters for tab tap / back.
-//
-// Stacks are not persisted across reloads: a fresh page load
-// reconstructs the active tab's stack from [tabHome, currentPath]
-// (see hydrateFromLocation).
+// URL paths are shared with desktop — only navigation BEHAVIOR is
+// phone-specific. Nothing here survives a reload.
 
-export type MobileTabId = "chat" | "tasks" | "members" | "settings";
+export type MobileTabId = "chat" | "activity" | "tasks" | "search";
 
-export const MOBILE_TAB_IDS: readonly MobileTabId[] = ["chat", "tasks", "members", "settings"];
+export const MOBILE_TAB_IDS: readonly MobileTabId[] = ["chat", "activity", "tasks", "search"];
 
 /** Which mobile tab does this desktop rail mode belong to?
- *  - desktop "computers" rail mode → mobile "settings" tab
- *  - desktop "search" rail mode    → mobile "chat" tab (Search lives under
- *    Home on mobile)
- *  - desktop "activity" rail mode  → mobile "chat" tab (Activity lives under
- *    Home on mobile too — same shape as Search; mobile Activity surface is
- *    a follow-up if/when stdrc spec'd it)
- *  - everything else maps 1:1
+ *  - artifacts / members / computers / apps / settings → none: the server's own
+ *    pages, opened from the server tab's popover as pushed pages
+ *  - search    → mobile "search" tab
+ *  - assistant → mobile "chat" tab (a Home row on a phone)
  */
-export function railModeToMobileTab(mode: RailMode): MobileTabId {
-  if (mode === "search") return "chat";
-  if (mode === "activity") return "chat";
-  if (mode === "computers") return "settings";
+export function railModeToMobileTab(mode: RailMode): MobileTabId | null {
+  // The assistant is a Home row on a phone, not a tab.
+  if (mode === "assistant") return "chat";
+  if (mode === "artifacts" || mode === "members" || mode === "computers" || mode === "apps" || mode === "settings") return null;
   return mode;
 }
 
+function isUnder(pathname: string, base: string): boolean {
+  return pathname === base || pathname.startsWith(`${base}/`);
+}
+
+/** The phone tab a pathname belongs to; null for the server's own pages,
+ *  which the server tab's popover opens and no tab holds. */
+export function mobileTabForPath(pathname: string, pathBase: string): MobileTabId | null {
+  const path = pathname.replace(/\/+$/, "");
+  if (isUnder(path, `${pathBase}/search`)) return "search";
+  if (isUnder(path, `${pathBase}/activity`) || isUnder(path, `${pathBase}/inbox`)) return "activity";
+  if (isUnder(path, `${pathBase}/tasks`)) return "tasks";
+  if (
+    isUnder(path, `${pathBase}/artifacts`)
+    || isUnder(path, `${pathBase}/members`)
+    || path.startsWith(`${pathBase}/agent/`)
+    || path.startsWith(`${pathBase}/human/`)
+    || isUnder(path, `${pathBase}/computers`)
+    || path.startsWith(`${pathBase}/computer/`)
+    || path.startsWith(`${pathBase}/machine/`)
+    || isUnder(path, `${pathBase}/apps`)
+    || isUnder(path, `${pathBase}/settings`)
+    || path.startsWith(`${pathBase}/release-notes`)
+    || path.startsWith(`${pathBase}/keyboard-shortcuts`)
+    || path === `${pathBase}/raftbench`
+  ) return null;
+  return "chat";
+}
+
+
 const TAB_HOME_BY_MOBILE_TAB: Record<MobileTabId, (pathBase: string) => string> = {
   chat: (base) => base,
+  activity: (base) => `${base}/activity`,
   tasks: (base) => `${base}/tasks`,
-  members: (base) => `${base}/members`,
-  // /settings (no sub-tab) is the master view that renders the settings
-  // sub-nav (Account / Browser / Server / Computers / Release Notes) inline.
-  settings: (base) => `${base}/settings`,
+  // Bare /search: MessageSearchPage restores the last query and filters
+  // (raft:search-state) and the cached results, so coming back to the tab
+  // resumes the search the user left.
+  search: (base) => `${base}/search`,
 };
 
 export function tabHomeFor(mode: MobileTabId, pathBase: string): string {
   return TAB_HOME_BY_MOBILE_TAB[mode](pathBase);
 }
 
-// Query params that encode right-panel overlays (thread / profile). On a
-// cold-start URL these overlays sit ON TOP of the base route — so the natural
-// back-stop is the same pathname with the overlay param stripped, not the
-// tab home. Without this intermediate layer, hitting back once on a thread
-// permalink (#proj-uiux:c8711d2a bug reported by @stdrc msg=768680bf) would
-// jump past the parent channel straight to Home. Keep this list in sync
-// with `useRightPanelUrlSync` in MainLayout.tsx (L442-498).
-const OVERLAY_QUERY_PARAMS = ["thread", "profile"] as const;
+// Query params that open something over a page (a thread, a profile, a task
+// sheet, a picked search result) rather than describe the page itself. A tab
+// root remembered without them is the root as the user left it, with its
+// filters, and never a pushed page.
+const OVERLAY_QUERY_PARAMS = ["thread", "profile", "task", "legacyTask", "agentTab", "open"] as const;
 
-/** Strip overlay params (?thread, ?profile) from a "pathname?search" string. */
+/** Strip overlay params from a "pathname?search" string. */
 function stripOverlayParams(pathAndSearch: string): string {
   const qIndex = pathAndSearch.indexOf("?");
   if (qIndex < 0) return pathAndSearch;
   const pathname = pathAndSearch.slice(0, qIndex);
   const params = new URLSearchParams(pathAndSearch.slice(qIndex + 1));
-  let removedAny = false;
-  for (const key of OVERLAY_QUERY_PARAMS) {
-    if (params.has(key)) {
-      params.delete(key);
-      removedAny = true;
-    }
-  }
-  if (!removedAny) return pathAndSearch;
+  for (const key of OVERLAY_QUERY_PARAMS) params.delete(key);
   const remaining = params.toString();
   return remaining ? `${pathname}?${remaining}` : pathname;
 }
 
 interface MobileNavState {
-  // Per-tab stacks of path+search strings. Top of stack = bottom of array
-  // is the home; last element is the current view.
-  stacks: Record<MobileTabId, string[]>;
-  // True when the next location change came from in-app navigation
-  // (push/pop/replace). False on browser back/forward.
-  // We only use this to skip duplicate hydration; default false is safe.
-  expectingNav: boolean;
-
-  hydrate: (mode: MobileTabId, pathBase: string, currentPathAndSearch: string) => void;
-  push: (mode: MobileTabId, pathAndSearch: string) => void;
-  pop: (mode: MobileTabId) => string | null;
-  popToRoot: (mode: MobileTabId) => string;
-  replaceTop: (mode: MobileTabId, pathAndSearch: string) => void;
+  // Each tab root as the user last left it ("pathname?search"), so a tab tap
+  // brings back its filters (e.g. Tasks' channel / creator / assignee
+  // filters, which live in the URL). Only roots are recorded: a tab never
+  // reopens on a pushed page.
+  roots: Partial<Record<MobileTabId, string>>;
+  rememberRoot: (mode: MobileTabId, pathAndSearch: string) => void;
+  // Set when the server tab's popover opens one of the server's pages
+  // (Members, Computers, Settings): the tab bar is gone while that pushed page
+  // is up, and the server tab takes focus back when it returns (Raft DS ›
+  // Navigation), so a keyboard or a screen reader picks up where it left off.
+  // The request is tied to the history entry the popover was opened on
+  // (react-router's location key): only Back to that entry brings focus back.
+  // Reaching a tab bar any other way (a DM, then a channel link, then Home)
+  // drops it, so the server tab never grabs focus out of nowhere.
+  serverTabFocusFor: string | null;
+  requestServerTabFocus: (locationKey: string) => void;
+  /** Whether the tab bar now showing is the entry focus should return to; clears the request either way. */
+  consumeServerTabFocus: (locationKey: string) => boolean;
   reset: () => void;
 }
 
-const emptyStacks = (): Record<MobileTabId, string[]> => ({
-  chat: [],
-  tasks: [],
-  members: [],
-  settings: [],
-});
-
 export const useMobileNavStore = create<MobileNavState>((set, get) => ({
-  stacks: emptyStacks(),
-  expectingNav: false,
-
-  // Initialize a tab's stack on cold load. Shapes (by current URL):
-  //   - current IS the tab home             → [home]
-  //   - current has an overlay param        → [home, currentWithoutOverlay, current]
-  //   - otherwise                           → [home, current]
-  //
-  // The three-layer shape matters for cold-starting on a thread permalink
-  // (`/channel/<id>?thread=<..>`): the first back should close the thread
-  // (land at `/channel/<id>`), the second back should land at Home. Without
-  // the intermediate layer we'd jump past the parent channel in one click.
-  //
-  // Subsequent calls within the same session won't re-hydrate (we keep
-  // whatever the user has built up).
-  hydrate: (mode, pathBase, current) => {
-    const existing = get().stacks[mode];
-    if (existing.length > 0) return;
-    const home = tabHomeFor(mode, pathBase);
-    if (current === home) {
-      set((state) => ({ stacks: { ...state.stacks, [mode]: [home] } }));
-      return;
-    }
-    const intermediate = stripOverlayParams(current);
-    const layers: string[] = [home];
-    if (intermediate !== current && intermediate !== home) {
-      layers.push(intermediate);
-    }
-    layers.push(current);
-    set((state) => ({ stacks: { ...state.stacks, [mode]: layers } }));
+  roots: {},
+  rememberRoot: (mode, pathAndSearch) => {
+    const root = stripOverlayParams(pathAndSearch);
+    set((state) => (state.roots[mode] === root ? {} : { roots: { ...state.roots, [mode]: root } }));
   },
-
-  push: (mode, pathAndSearch) => {
-    set((state) => {
-      const top = state.stacks[mode].at(-1);
-      if (top === pathAndSearch) return {};
-      return { stacks: { ...state.stacks, [mode]: [...state.stacks[mode], pathAndSearch] } };
-    });
+  serverTabFocusFor: null,
+  requestServerTabFocus: (locationKey) => set({ serverTabFocusFor: locationKey }),
+  consumeServerTabFocus: (locationKey) => {
+    const pending = get().serverTabFocusFor;
+    if (pending === null) return false;
+    set({ serverTabFocusFor: null });
+    return pending === locationKey;
   },
-
-  pop: (mode) => {
-    const cur = get().stacks[mode];
-    if (cur.length <= 1) return null;
-    const next = cur.slice(0, -1);
-    set((state) => ({ stacks: { ...state.stacks, [mode]: next } }));
-    return next.at(-1) ?? null;
-  },
-
-  popToRoot: (mode) => {
-    const cur = get().stacks[mode];
-    const home = cur[0] ?? "";
-    set((state) => ({ stacks: { ...state.stacks, [mode]: home ? [home] : [] } }));
-    return home;
-  },
-
-  replaceTop: (mode, pathAndSearch) => {
-    set((state) => {
-      const cur = state.stacks[mode];
-      if (cur.length === 0) {
-        return { stacks: { ...state.stacks, [mode]: [pathAndSearch] } };
-      }
-      const next = [...cur.slice(0, -1), pathAndSearch];
-      return { stacks: { ...state.stacks, [mode]: next } };
-    });
-  },
-
-  reset: () => set({ stacks: emptyStacks(), expectingNav: false }),
+  // Another server has other roots, and its bar has no page to come back from.
+  reset: () => set({ roots: {}, serverTabFocusFor: null }),
 }));

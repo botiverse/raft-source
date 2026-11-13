@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { and, eq, isNotNull, isNull } from "drizzle-orm";
 import { getDb } from "../db/index";
-import { agents, computers, machines, serverMembers, servers, users } from "../db/schema";
+import { agents, computers, integrationAuditEvents, machines, serverMembers, servers, users } from "../db/schema";
 import { createServer, removeMember } from "./serverService";
 import { createAgent } from "./agentService";
 import { __setAgentCreateLockObserverForTests } from "./planService";
@@ -17,7 +17,7 @@ import {
   ServerSetupStateError,
 } from "./serverSetupStateService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 /**
  * "Start over" — the rollback that replaces "Set up later".
@@ -39,10 +39,11 @@ async function seedUser(label: string) {
   return user;
 }
 
-async function attachComputer(serverId: string, name: string) {
+async function attachComputer(serverId: string, name: string, attachedByUserId: string | null = null) {
   const [computer] = await getDb().insert(computers).values({
     serverId,
     name,
+    attachedByUserId,
     apiKeyHash: "argon2-placeholder",
     apiKeyPrefix: `sk_computer_${randomUUID().slice(0, 6)}`,
   }).returning();
@@ -53,8 +54,8 @@ test("reset revokes the stranded computers and rewinds setup to the start", asyn
   const db = getDb();
   const owner = await seedUser("reset-owner");
   const server = await createServer("Reset", `reset-${randomUUID()}`, owner.id);
-  await attachComputer(server.id, "sold-laptop");
-  await attachComputer(server.id, "dead-desktop");
+  const sold = await attachComputer(server.id, "sold-laptop", owner.id);
+  const dead = await attachComputer(server.id, "dead-desktop", owner.id);
   await db.update(serverMembers)
     .set({ setupStatus: "in_progress" })
     .where(eq(serverMembers.serverId, server.id));
@@ -70,6 +71,23 @@ test("reset revokes the stranded computers and rewinds setup to the start", asyn
     .where(and(eq(serverMembers.serverId, server.id), eq(serverMembers.userId, owner.id)));
   assert.equal(row.setupStatus, "not_started", "the owner starts the flow again from the top");
   assert.equal(row.setupCompletionReason, null);
+
+  const audit = await db.select().from(integrationAuditEvents)
+    .where(and(eq(integrationAuditEvents.serverId, server.id), eq(integrationAuditEvents.eventType, "computer.key_revoked")));
+  assert.deepEqual(audit.map((event) => event.targetId).sort(), [sold.id, dead.id].sort(), "one event per revoked computer");
+  for (const event of audit) {
+    assert.equal(event.eventCategory, "computer");
+    assert.equal(event.actorType, "human");
+    assert.equal(event.actorId, owner.id);
+    assert.equal(event.requesterType, "human");
+    assert.equal(event.requesterId, owner.id, "whoever attached the computer is the requester");
+    assert.equal(event.targetType, "computer");
+    assert.equal((event.metadata as Record<string, unknown>).reason, "setup_reset");
+    assert.equal((event.metadata as Record<string, unknown>).actorRole, "owner");
+  }
+  const operationIds = new Set(audit.map((event) => (event.metadata as Record<string, unknown>).operationId));
+  assert.equal(operationIds.size, 1, "one reset, one operationId");
+  assert.equal(typeof [...operationIds][0], "string");
 });
 
 test("reset is atomic when rewinding setup fails after computers were revoked", async ({ app }) => {
@@ -330,6 +348,7 @@ test("a new server is born under v2: it may complete or roll back, but it may no
       officialOnboardingAgent: "missing",
       ownerSurveyPending: false,
       ownerHandoffPending: false,
+      ownerUpgradePromptPending: false,
       actorIsOwner: true,
     },
   );

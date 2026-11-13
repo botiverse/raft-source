@@ -1,28 +1,29 @@
-import { Card, Button, DialogHeader } from "@botiverse/raft-ui";
-import CloseButton from "../ui/CloseButton";
-import { useCallback, useEffect, useState } from "react";
+import { Button, Card, DialogHeader, Lightbox, LightboxContent, ScrollArea } from "@botiverse/raft-ui";
+import { useCallback, useMemo, useRef, useState } from "react";
 import type { SyntheticEvent } from "react";
 import { useIntl } from "react-intl";
-import { Check, Copy, Download, Share2, X } from "lucide-react";
-import { downloadDataUrl } from "../../utils/selectScreenshot";
+import { Check, ChevronLeft, ChevronRight, Copy, Download, Share2, X } from "lucide-react";
+import { downloadDataUrl } from "../../utils/selectScreenshotShared";
 import type { ValidatedScreenshot } from "../../utils/screenshotBudget";
-import {
-  copyPngDataUrlToClipboard,
-  resolvePngClipboardCapability,
-} from "../../utils/selectMarkdown";
-import Lightbox from "../ui/Lightbox";
+import { createScreenshotZip, downloadBlob, screenshotPageFilename } from "../../utils/selectScreenshotArchive";
+import { copyPngDataUrlToClipboard } from "../../utils/selectMarkdown";
+import CloseButton from "../ui/CloseButton";
+import { dismissLayerProps } from "../ui/dismissLayer";
+import { ICON_SM_END_PULL } from "../ui/headEdges";
+import { useOpenerFocus, useOverlayLayer } from "../ui/useOverlayLayer";
+import { useShortcut } from "../../features/shortcuts/useShortcut";
+import { OVERLAY_TITLEBAR_ATTR, useOverlayTitleBar } from "../topbar/overlayTitleBar";
 
 export interface SelectShareLightboxProps {
-  /** The captured PNG; only a validated capture can be previewed or sent on. */
-  image: ValidatedScreenshot;
+  /** Validated captured pages. `image` remains for single-page callers. */
+  images?: readonly ValidatedScreenshot[];
+  image?: ValidatedScreenshot;
   /** Suggested filename when the user clicks Download. */
   filename?: string;
   /** Called when the user dismisses the preview (Cancel, X, ESC, backdrop). Selection should be preserved. */
   onClose: () => void;
   /** Called after a successful Download. Selection mode should exit here. Defaults to onClose if omitted. */
   onSaved?: () => void;
-  /** Optional platform share target. Runs only after the preview PNG already exists. */
-  onShareToX?: (image: ValidatedScreenshot) => Promise<void>;
 }
 
 type FileShareNavigator = Navigator & {
@@ -39,251 +40,352 @@ function pngFile(image: ValidatedScreenshot, filename: string): File {
   return new File([image.blob], filename, { type: "image/png" });
 }
 
-async function canSavePngViaNativeShare(image: ValidatedScreenshot, filename: string): Promise<boolean> {
+function pngFiles(images: readonly ValidatedScreenshot[], filename: string): File[] {
+  return images.map((image, index) => pngFile(
+    image,
+    screenshotPageFilename(filename, index + 1, images.length),
+  ));
+}
+
+function canSavePngViaNativeShare(images: readonly ValidatedScreenshot[], filename: string): boolean {
   if (!isMobileBrowser()) return false;
   const nav = navigator as FileShareNavigator;
   if (typeof nav.share !== "function" || typeof nav.canShare !== "function") return false;
   try {
-    return nav.canShare({ files: [pngFile(image, filename)] });
+    return nav.canShare({ files: pngFiles(images, filename) });
   } catch {
     return false;
   }
 }
 
-/**
- * Confirmation lightbox shown after the user clicks "Share..." on the
- * select-mode toolbar. The user reviews the rendered screenshot, then chooses
- * an artifact action. Platform-specific share targets intentionally live here,
- * not in the toolbar, so the image is ready before the user sends it anywhere.
- */
-const stopClickPropagation = (event: React.MouseEvent) => {
-  event.stopPropagation();
-};
+function missingScreenshot(): never {
+  throw new Error("SelectShareLightbox requires at least one validated screenshot");
+}
 
+/**
+ * Confirmation lightbox shown after the user clicks Share in select mode.
+ * Captures are already validated; this surface previews and delivers every
+ * page without silently reducing a multi-page artifact to page one.
+ *
+ * raft-ui's Lightbox (z-lightbox, above the conversation, the select-mode toolbar
+ * and dialogs): Esc, a press on the scrim and ⌘W close it. It is opened from
+ * state, so focus is explicit: in on the lightbox when it opens, back to what
+ * opened it (the toolbar's Share) when it closes.
+ */
 export default function SelectShareLightbox({
+  images,
   image,
   filename = "slock-export.png",
   onClose,
   onSaved,
-  onShareToX,
 }: SelectShareLightboxProps) {
   const { formatMessage } = useIntl();
-  const { dataUrl } = image;
-  const [sharingToX, setSharingToX] = useState(false);
+  const screenshots = useMemo(
+    () => images ? Array.from(images) : image ? [image] : [],
+    [image, images],
+  );
+  const [currentPage, setCurrentPage] = useState(0);
+  const currentImage = screenshots[currentPage] ?? screenshots[0] ?? missingScreenshot();
+  const { dataUrl } = currentImage;
+  const pageCount = screenshots.length;
+  const mobile = isMobileBrowser();
+  const popupRef = useRef<HTMLDivElement | null>(null);
+  const finalFocus = useOpenerFocus();
+  // Desktop: the lightbox covers the window, title bar included, and its card
+  // floats in the middle, so it has no header at the window's top. An empty
+  // strip there is the window's title bar while it is open (drag region), and
+  // the card starts below it, so the strip never lies over its controls. A
+  // press on the strip drags the window rather than closing the preview.
+  const titleBar = useOverlayTitleBar();
+  const titleBarStrip = OVERLAY_TITLEBAR_ATTR in titleBar;
+  // A modal layer of the shortcut registry: ⌘K and the selection's own keys stop under it; its Esc is Base UI's. The
+  // lightbox's scope, so ⌘W (registry "close-preview", the desktop app's) closes it, as FileViewerShell.
+  useOverlayLayer(true, "lightbox");
+  useShortcut("close-preview", () => { onClose(); });
+  const handleOpenChange = useCallback((open: boolean) => {
+    if (!open) onClose();
+  }, [onClose]);
   const [savingImage, setSavingImage] = useState(false);
   const [copyingImage, setCopyingImage] = useState(false);
   const [imageCopied, setImageCopied] = useState(false);
-  const [copyError, setCopyError] = useState<string | null>(null);
-  const [canCopyImage, setCanCopyImage] = useState(false);
-  const [canNativeSaveImage, setCanNativeSaveImage] = useState(false);
+  const busy = savingImage || copyingImage;
+  const [actionError, setActionError] = useState<string | null>(null);
   const [previewSourceWidth, setPreviewSourceWidth] = useState<number | null>(null);
+  const canNativeShareImages = useMemo(
+    () => canSavePngViaNativeShare(screenshots, filename),
+    [filename, screenshots],
+  );
+  const showNativeShareActions = mobile && canNativeShareImages;
 
   const handlePreviewImageLoad = (event: SyntheticEvent<HTMLImageElement>) => {
     const { naturalWidth } = event.currentTarget;
     if (naturalWidth <= 0) return;
 
-    // The capture records the ratio it rasterized at (lower than the screen's
-    // when the selection is long; task #1302). Keep the
-    // lightbox from enlarging a narrow message-column export above the CSS
-    // width it was captured at; that interpolation is what makes text look
-    // soft while the downloaded PNG remains the correct aspect ratio.
-    setPreviewSourceWidth(naturalWidth / image.pixelRatio);
+    // The capture records its actual raster ratio. Avoid enlarging a 1x or 2x
+    // fallback above its source CSS width in the preview.
+    setPreviewSourceWidth(naturalWidth / currentImage.pixelRatio);
   };
 
-  // Async-loader probing native share capability. Reset-on-input + arrival.
-  // Adjust-rule fires on the reset-to-false setState line too.
-  // oxlint-disable-next-line react-doctor/no-cascading-set-state
-  useEffect(() => {
-    let cancelled = false;
-    // oxlint-disable-next-line react-doctor/no-adjust-state-on-prop-change
-    setCanNativeSaveImage(false);
-    void canSavePngViaNativeShare(image, filename).then((canSave) => {
-      if (!cancelled) setCanNativeSaveImage(canSave);
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, [image, filename]);
-
-  useEffect(() => {
-    let cancelled = false;
-    let permissionStatus: PermissionStatus | null = null;
-    const syncPermission = () => {
-      if (!cancelled && permissionStatus) {
-        setCanCopyImage(permissionStatus.state !== "denied");
-      }
-    };
-
-    void resolvePngClipboardCapability().then((capability) => {
-      if (cancelled) return;
-      permissionStatus = capability.permissionStatus;
-      setCanCopyImage(capability.available);
-      permissionStatus?.addEventListener("change", syncPermission);
-    });
-
-    return () => {
-      cancelled = true;
-      permissionStatus?.removeEventListener("change", syncPermission);
-    };
-  }, []);
-
-  const handleDownload = useCallback(async () => {
-    if (sharingToX || savingImage || copyingImage) return;
-    if (!canNativeSaveImage) {
-      downloadDataUrl(dataUrl, filename);
-      (onSaved ?? onClose)();
-      return;
-    }
-
+  const handleDownloadAll = useCallback(async () => {
+    if (busy) return;
+    setActionError(null);
     setSavingImage(true);
     try {
-      const file = pngFile(image, filename);
+      if (screenshots.length === 1) {
+        downloadDataUrl(dataUrl, filename);
+      } else {
+        const archive = await createScreenshotZip(screenshots, filename);
+        downloadBlob(archive, `${filename.replace(/\.png$/i, "") || "raft-export"}.zip`);
+      }
+      (onSaved ?? onClose)();
+    } finally {
+      setSavingImage(false);
+    }
+  }, [busy, screenshots, dataUrl, filename, onSaved, onClose]);
+
+  const handleShareAll = useCallback(async () => {
+    if (busy) return;
+    setActionError(null);
+    if (!canNativeShareImages) {
+      setActionError(formatMessage({ id: "message.selectShare.nativeShareUnavailable" }));
+      return;
+    }
+    setSavingImage(true);
+    try {
       const nav = navigator as FileShareNavigator;
       await nav.share?.({
-        files: [file],
+        files: pngFiles(screenshots, filename),
         title: formatMessage({ id: "message.selectShare.nativeShareTitle" }),
       });
       (onSaved ?? onClose)();
     } catch (err) {
       if (err instanceof DOMException && err.name === "AbortError") return;
-      downloadDataUrl(dataUrl, filename);
-      (onSaved ?? onClose)();
+      setActionError(formatMessage({ id: "message.share.failed" }));
     } finally {
       setSavingImage(false);
     }
-  }, [sharingToX, savingImage, copyingImage, canNativeSaveImage, image, dataUrl, filename, onSaved, onClose, formatMessage]);
+  }, [busy, canNativeShareImages, screenshots, filename, onSaved, onClose, formatMessage]);
+
+  const handleDownloadCurrent = useCallback(() => {
+    if (busy) return;
+    setActionError(null);
+    downloadDataUrl(
+      dataUrl,
+      screenshotPageFilename(filename, currentPage + 1, pageCount),
+    );
+  }, [busy, currentPage, dataUrl, filename, pageCount]);
 
   const handleCopyImage = useCallback(async () => {
-    if (sharingToX || savingImage || copyingImage) return;
+    if (busy) return;
     setCopyingImage(true);
     setImageCopied(false);
-    setCopyError(null);
+    setActionError(null);
     try {
       await copyPngDataUrlToClipboard(dataUrl);
       setImageCopied(true);
     } catch (err) {
       console.error("copyPngDataUrlToClipboard failed:", err);
-      const errorName = typeof err === "object" && err !== null && "name" in err
-        ? String(err.name)
-        : "";
-      if (errorName === "NotAllowedError") {
-        setCanCopyImage(false);
-      } else {
-        setCopyError(formatMessage({ id: "message.share.copyImageFailed" }));
-      }
+      setActionError(formatMessage({ id: "message.share.copyImageFailed" }));
     } finally {
       setCopyingImage(false);
     }
-  }, [sharingToX, savingImage, copyingImage, dataUrl, formatMessage]);
+  }, [busy, dataUrl, formatMessage]);
 
-  const handleShareToX = useCallback(async () => {
-    if (!onShareToX || sharingToX || savingImage || copyingImage) return;
-    setSharingToX(true);
-    try {
-      await onShareToX(image);
-    } finally {
-      setSharingToX(false);
-    }
-  }, [onShareToX, sharingToX, savingImage, copyingImage, image]);
+  const selectPage = useCallback((page: number) => {
+    setCurrentPage(Math.max(0, Math.min(pageCount - 1, page)));
+    setPreviewSourceWidth(null);
+    setImageCopied(false);
+    setActionError(null);
+  }, [pageCount]);
+
+  const selectPreviousPage = useCallback(() => {
+    selectPage(currentPage - 1);
+  }, [currentPage, selectPage]);
+
+  const selectNextPage = useCallback(() => {
+    selectPage(currentPage + 1);
+  }, [currentPage, selectPage]);
 
   return (
-    <Lightbox
-      onClose={onClose}
-      zIndex={100}
-      backdropClass="bg-layer-backdrop"
-      className="flex items-center justify-center p-4"
-      data-testid="select-share-lightbox"
-    >
-      <Card
-        className="flex max-h-[90vh] w-full max-w-3xl flex-col"
-        onClick={stopClickPropagation}
+    <Lightbox open onOpenChange={handleOpenChange} closeOnModW={false}>
+      <LightboxContent
+        ref={popupRef}
+        initialFocus={popupRef}
+        finalFocus={finalFocus}
+        aria-label={formatMessage({ id: "message.selectShare.title" })}
+        className={titleBarStrip ? "items-center justify-center p-4 pt-12" : "items-center justify-center p-4"}
+        data-testid="select-share-lightbox"
+        {...dismissLayerProps}
       >
-        {/* The preview is a dialog with pinned bars: raft-ui's dialog bar head
-            (56, a seam under it, on the card's own surface). Its close is the
-            dialog close — the small ghost icon button whose glyph ends on the
-            head's 20 edge — drawn here because the card is not a raft Dialog. */}
+      {titleBarStrip ? (
+        <div
+          {...titleBar}
+          aria-hidden="true"
+          className="pointer-events-auto absolute inset-x-0 top-0 h-12"
+          data-testid="select-share-lightbox-titlebar"
+        />
+      ) : null}
+      {/* pointer-events-auto: the lightbox lets the pointer through to its scrim, which closes it. */}
+      <Card className="pointer-events-auto flex max-h-[min(90vh,100%)] w-full max-w-3xl flex-col">
         <DialogHeader bar>
-          <h2 className="min-w-0 flex-1 truncate text-headline text-foreground">{formatMessage({ id: "message.selectShare.title" })}</h2>
+          <div className="min-w-0 flex-1">
+            <h2 className="truncate text-headline text-foreground">
+              {formatMessage({ id: "message.selectShare.title" })}
+            </h2>
+            {pageCount > 1 ? (
+              <p className="truncate text-caption text-foreground-muted">
+                {formatMessage({ id: "message.selectShare.imageCount" }, { count: pageCount })}
+              </p>
+            ) : null}
+          </div>
+          {pageCount > 1 ? (
+            <span
+              className="shrink-0 rounded-chip bg-info-soft px-2 py-1 font-mono text-mono-meta text-foreground"
+              data-testid="select-share-page-count"
+            >
+              {currentPage + 1}/{pageCount}
+            </span>
+          ) : null}
           <CloseButton
             type="button"
             onClick={onClose}
             aria-label={formatMessage({ id: "common.close" })}
             data-testid="select-share-lightbox-close"
-            className="-mr-1.5"
+            className={ICON_SM_END_PULL}
           >
             <X className="size-4.5" />
           </CloseButton>
         </DialogHeader>
-        <div className="flex-1 overflow-auto p-4">
-          <img
-            src={dataUrl}
-            alt={formatMessage({ id: "message.selectShare.alt" })}
-            className="mx-auto block max-w-full rounded-container border border-line-hairline"
-            onLoad={handlePreviewImageLoad}
-            style={previewSourceWidth ? { width: `${previewSourceWidth}px` } : undefined}
-          />
-        </div>
-        <div className="flex shrink-0 flex-wrap items-center justify-end gap-2 border-t border-line-hairline px-4 py-3 sm:px-5">
-          {copyError && (
+
+        {/* The preview scrolls both ways in a raft-ui ScrollArea; its padding
+            stays on the area so the page still centres in the full box
+            (min-h-full / min-w-full) and the page buttons keep their place.
+            The buttons sit 24px in at every width (in the 64px side padding),
+            clear of the area's 16px scrollbar gutter on the right edge, which
+            takes the pointer while the area is hovered. */}
+        <ScrollArea
+          orientation="both"
+          role="region"
+          aria-label={formatMessage({ id: "message.selectShare.title" })}
+          className="relative min-h-0 flex-1 bg-fill-muted px-16 py-4 sm:px-20 sm:py-6"
+        >
+          {pageCount > 1 ? (
+            <Button
+              type="button"
+              size="icon-md"
+              variant="outline"
+              onClick={selectPreviousPage}
+              disabled={currentPage === 0}
+              aria-label={formatMessage({ id: "message.selectShare.previousPage" })}
+              className="absolute left-6 top-1/2 z-raised -translate-y-1/2"
+              data-testid="select-share-previous-page"
+            >
+              <ChevronLeft />
+            </Button>
+          ) : null}
+          <div className="flex min-h-full min-w-full items-center justify-center">
+            <img
+              key={currentPage}
+              src={dataUrl}
+              alt={formatMessage({ id: "message.selectShare.alt" })}
+              className="mx-auto block max-w-full rounded-container border border-line-hairline shadow-float"
+              onLoad={handlePreviewImageLoad}
+              style={previewSourceWidth ? { width: `${previewSourceWidth}px` } : undefined}
+            />
+          </div>
+          {pageCount > 1 ? (
+            <Button
+              type="button"
+              size="icon-md"
+              variant="outline"
+              onClick={selectNextPage}
+              disabled={currentPage === pageCount - 1}
+              aria-label={formatMessage({ id: "message.selectShare.nextPage" })}
+              className="absolute right-6 top-1/2 z-raised -translate-y-1/2"
+              data-testid="select-share-next-page"
+            >
+              <ChevronRight />
+            </Button>
+          ) : null}
+        </ScrollArea>
+
+        <div className="flex shrink-0 flex-col gap-2 border-t border-line-hairline px-3 py-3 sm:px-5">
+          {actionError && (
             <p
               role="alert"
-              className="mr-auto text-callout font-medium text-danger-strong"
+              className="text-callout font-medium text-danger-strong"
               data-testid="select-share-lightbox-copy-error"
             >
-              {copyError}
+              {actionError}
             </p>
           )}
-          <div className="flex flex-wrap items-center justify-end gap-2">
-            {canCopyImage && (
+          <div className="grid w-full grid-cols-2 gap-2 sm:ml-auto sm:w-auto">
+            {showNativeShareActions ? (
               <Button
                 type="button"
-                size="lg"
+                size="md"
                 variant="outline"
+                className="w-full min-w-0 px-2"
+                onClick={handleDownloadCurrent}
+                disabled={busy}
+                data-testid="select-share-lightbox-save-current"
+              >
+                <Download className="hidden min-[360px]:block" />
+                {formatMessage({ id: "message.selectShare.saveCurrent" })}
+              </Button>
+            ) : (
+              <Button
+                type="button"
+                size="md"
+                variant="outline"
+                className="w-full min-w-0 px-2"
                 onClick={handleCopyImage}
-                disabled={sharingToX || savingImage || copyingImage}
+                disabled={busy}
                 loading={copyingImage}
                 loadingLabel={formatMessage({ id: "message.selectShare.copying" })}
                 data-testid="select-share-lightbox-copy-image"
               >
-                {imageCopied ? <Check /> : <Copy />}
+                {imageCopied ? <Check className="hidden min-[360px]:block" /> : <Copy className="hidden min-[360px]:block" />}
                 {imageCopied
                   ? formatMessage({ id: "message.selectShare.copied" })
-                  : formatMessage({ id: "message.selectShare.copyImage" })}
+                  : formatMessage({ id: "message.selectShare.copyCurrent" })}
               </Button>
             )}
-            <Button
-              type="button"
-              size="lg"
-              variant="outline"
-              onClick={handleDownload}
-              disabled={sharingToX || savingImage || copyingImage}
-              loading={savingImage}
-              loadingLabel={formatMessage({ id: "message.selectShare.saving" })}
-              data-testid="select-share-lightbox-download"
-            >
-              <Download />
-              {canNativeSaveImage
-                ? formatMessage({ id: "message.selectShare.saveImage" })
-                : formatMessage({ id: "common.lightbox.download" })}
-            </Button>
-            {onShareToX && (
+            {showNativeShareActions ? (
               <Button
                 type="button"
-                size="lg"
+                size="md"
                 variant="accent"
-                onClick={handleShareToX}
-                disabled={sharingToX || savingImage || copyingImage}
-                loading={sharingToX}
+                className="w-full min-w-0 px-2"
+                onClick={handleShareAll}
+                disabled={busy}
+                loading={savingImage}
                 loadingLabel={formatMessage({ id: "message.selectShare.sharing" })}
-                data-testid="select-share-lightbox-share-x"
+                data-testid="select-share-lightbox-share"
               >
-                <Share2 />
-                {formatMessage({ id: "message.selectShare.shareToX" })}
+                <Share2 className="hidden min-[360px]:block" />
+                {formatMessage({ id: "message.selectShare.shareAll" })}
+              </Button>
+            ) : (
+              <Button
+                type="button"
+                size="md"
+                variant="accent"
+                className="w-full min-w-0 px-2"
+                onClick={handleDownloadAll}
+                disabled={busy}
+                loading={savingImage}
+                loadingLabel={formatMessage({ id: "message.selectShare.saving" })}
+                data-testid="select-share-lightbox-download"
+              >
+                <Download className="hidden min-[360px]:block" />
+                {formatMessage({ id: "message.selectShare.downloadAll" })}
               </Button>
             )}
           </div>
         </div>
       </Card>
+      </LightboxContent>
     </Lightbox>
   );
 }

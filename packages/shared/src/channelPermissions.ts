@@ -18,7 +18,6 @@ export const CHANNEL_ADMIN_CAPABILITIES = [
   "archiveChannels",
   "removeChannelMembers",
   "changeChannelMemberRoles",
-  "manageGuestAccess",
 ] as const satisfies readonly ServerCapability[];
 
 /**
@@ -31,31 +30,17 @@ export const CHANNEL_MANAGEMENT_CAPABILITIES = [
   "archiveChannels",
   "deleteChannels",
   "changeChannelVisibility",
-  "manageGuestAccess",
+  "manageVisitorAccess",
   "federateChannels",
   "addChannelMembers",
   "removeChannelMembers",
   "changeChannelMemberRoles",
 ] as const satisfies readonly ServerCapability[];
 
-/**
- * A joint channel's admin role is stored per server (on that server's
- * projection) but some of its effects reach every connected server. A joint
- * channel admin therefore gets only the capabilities whose effect is either
- * the shared name/description (decided by artin, #proj-joint-channel:2541153f)
- * or this server's own memberships. Archive, guest access and anything that
- * connects servers stay with server admins.
- */
-export const JOINT_CHANNEL_ADMIN_CAPABILITIES = [
-  "editChannelMetadata",
-  "changeChannelMemberRoles",
-] as const satisfies readonly (typeof CHANNEL_ADMIN_CAPABILITIES)[number][];
-
 export type ChannelAdminCapability = typeof CHANNEL_ADMIN_CAPABILITIES[number];
 export type ChannelAdminBasis = "server_role" | "channel_role" | "both" | null;
 
 const CHANNEL_ADMIN_CAPABILITY_SET = new Set<ServerCapability>(CHANNEL_ADMIN_CAPABILITIES);
-const JOINT_CHANNEL_ADMIN_CAPABILITY_SET = new Set<ServerCapability>(JOINT_CHANNEL_ADMIN_CAPABILITIES);
 
 /** Public, private and joint channels carry channel roles; DMs, threads and #all do not. */
 export function channelSupportsRoles(channelType: string, channelName: string | null | undefined): boolean {
@@ -67,68 +52,67 @@ export function isChannelRole(value: unknown): value is ChannelRole {
   return typeof value === "string" && (CHANNEL_ROLES as readonly string[]).includes(value);
 }
 
-export type GuestChannelKind = "channel" | "private" | "joint" | "dm" | "thread";
+export type GuestChannelKind = "channel" | "private" | "joint" | "dm" | "thread" | "task";
 
 export interface GuestChannelPolicyInput {
-  gateEnabled: boolean;
   serverRole: ServerRole | null | undefined;
+  /** The channel being checked (a sub-conversation's caller passes its parent). */
+  channelId: string;
   channelType: GuestChannelKind;
-  channelName?: string | null;
-  allChannelHidden?: boolean;
-  guestVisible: boolean;
-  guestJoinable: boolean;
+  /** The one channel this Guest belongs to (server_members.guest_channel_id). */
+  guestChannelId: string | null | undefined;
   isChannelMember: boolean;
   archived: boolean;
   deleted: boolean;
-}
-
-function isEnabledAllForGuest(input: GuestChannelPolicyInput): boolean {
-  return input.channelName === "all" && input.allChannelHidden !== true;
+  /**
+   * Joint channels only (P3): the server resolved that this Guest enters the
+   * joint through the host projection it is bound to (host external_channels_v1
+   * on, current joint membership). Absent or false keeps the joint closed.
+   */
+  jointEntry?: boolean;
 }
 
 /**
- * Guest access is a separate axis from ordinary server membership. Missing or
- * disabled rollout state fails closed, and joint channels remain out of v1.
- * Thread callers must resolve against the parent before invoking this helper.
+ * A Guest belongs to exactly one channel of its server (guest + external
+ * channels, #wg-rbac:#15) and reads only that channel and its threads and
+ * tasks: it must be the bound channel, the Guest must still be its member, and
+ * it must be live (an archived channel cuts its Guest off). Nothing else is
+ * readable: no other channel, #all or DM. A joint channel is readable only when
+ * it is the bound channel (the host's projection) and the server resolved the
+ * joint entry (`jointEntry`, P3: host external_channels_v1 and current joint
+ * membership). A Guest with no binding (legacy) reads nothing. Sub-conversation
+ * (thread / task conversation) callers must resolve against the parent first.
  */
 export function canGuestReadChannel(input: GuestChannelPolicyInput): boolean {
-  if (!input.gateEnabled || input.serverRole !== "guest" || input.deleted) return false;
-  if (input.channelType === "joint" || input.channelType === "thread") return false;
-  if (input.channelType === "dm" || input.channelType === "private") return input.isChannelMember;
-  // #all is a special read-only Guest surface, never a Guest membership.
-  // Its one Guest control is discoverability/read access; explicit/stale
-  // membership rows must not widen that policy.
-  if (input.channelName === "all") return isEnabledAllForGuest(input) && input.guestVisible;
-  return input.isChannelMember || input.guestVisible;
+  if (input.serverRole !== "guest" || input.deleted || input.archived) return false;
+  if (!input.guestChannelId || input.channelId !== input.guestChannelId) return false;
+  if (input.channelType === "joint") return input.jointEntry === true && input.isChannelMember;
+  if (input.channelType !== "channel" && input.channelType !== "private") return false;
+  return input.isChannelMember;
 }
 
-export function canGuestJoinChannel(input: GuestChannelPolicyInput): boolean {
-  if (!canGuestReadChannel(input) || input.archived || input.isChannelMember) return false;
-  if (input.channelName === "all") return false;
-  if (input.channelType !== "channel") return false;
-  return input.guestVisible && input.guestJoinable;
+/**
+ * A Guest's bound channel on a member payload (GET /servers/:id/members, sync
+ * rows, the member profile): set only for a Guest, and only for a viewer who
+ * may read that channel, so a private channel's name never leaks.
+ */
+export interface GuestChannelField {
+  guestChannel?: { id: string; name: string } | null;
 }
 
+/** A Guest posts, replies and assigns tasks wherever it can read. */
 export function canGuestPostToChannel(input: GuestChannelPolicyInput): boolean {
-  // Guest membership is a visibility/subscription relationship only. It must
-  // never widen into shared-content mutation authority, including for joined
-  // channels, private channels, or existing DMs. Keep the full input shape so
-  // read/join/post policy callers continue to share one projection contract.
-  void input;
-  return false;
-}
-
-export function isValidGuestChannelPolicy(input: { guestVisible: boolean; guestJoinable: boolean }): boolean {
-  return !input.guestJoinable || input.guestVisible;
+  return canGuestReadChannel(input);
 }
 
 export function isChannelAdminCapability(
   capability: ServerCapability,
   channelType: string,
 ): capability is ChannelAdminCapability {
-  return channelType === "joint"
-    ? JOINT_CHANNEL_ADMIN_CAPABILITY_SET.has(capability)
-    : CHANNEL_ADMIN_CAPABILITY_SET.has(capability);
+  // A joint channel's management follows its host (the server's
+  // channelActorHasCapability jointAuthority: host owner/admin and host-
+  // appointed managers), never a stored role read on its own.
+  return channelType !== "joint" && CHANNEL_ADMIN_CAPABILITY_SET.has(capability);
 }
 
 /**
@@ -138,9 +122,10 @@ export function isChannelAdminCapability(
  * though its stored channel role may also be `member`.
  *
  * Server owner/admin authority is server-scoped and therefore does not
- * require a stored channel membership. Every other caller must be a joined
- * current member. Public, private and joint channels are addable; DMs,
- * threads and the system #all channel are not.
+ * require a stored channel membership on public and private channels; on a
+ * joint channel it does. Every other caller must be a joined current member.
+ * Public, private and joint channels are addable; DMs, threads and the system
+ * #all channel are not.
  */
 export function canAddChannelMembers(input: {
   serverRole: ServerRole | null | undefined;
@@ -163,7 +148,11 @@ export function canAddChannelMembers(input: {
     || input.channelType === "joint"
   ) && input.channelName !== "all";
   if (!addableChannel || input.archived || input.deleted) return false;
-  if (input.serverRole === "owner" || input.serverRole === "admin") return true;
+  // A joint channel is shared with other servers, so even a server owner/admin
+  // must be in it to add someone (decided by cindyz, #wg-rbac B6).
+  if (input.serverRole === "owner" || input.serverRole === "admin") {
+    return input.channelType !== "joint" || input.isChannelMember;
+  }
   return input.serverRole === "member"
     && input.admissionClass === "current_member"
     && input.isChannelMember;
@@ -177,7 +166,7 @@ export function hasEffectiveChannelCapability(input: {
   capability: ServerCapability;
   /**
    * Required so no caller can forget it: a stored admin role on a joint
-   * channel grants only JOINT_CHANNEL_ADMIN_CAPABILITIES.
+   * channel grants nothing here (its authority is the host's).
    */
   channelType: string;
 }): boolean {

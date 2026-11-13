@@ -1,10 +1,22 @@
 import { useCallback, useLayoutEffect, useMemo, useRef, useSyncExternalStore } from "react";
 import { useLocation, useNavigate, useNavigationType } from "react-router-dom";
-import { searchEntryState } from "../components/search/searchOverlayLocation";
+import type { NavigateOptions } from "react-router-dom";
+import { searchEntryState } from "../features/search/searchOverlayLocation";
+import { useMessageStore } from "../store/messageStore";
 import { useServerStore } from "../store/serverStore";
 import { useLiveLocation } from "./useLiveLocation";
 import { buildSidebarChannelFocusState } from "../components/layout/sidebarChannelFocus";
+import { requestChannelNavigation } from "../navigation/channelSwitchGuard";
+import { prefetchConversationForPath } from "../navigation/conversationPrefetch";
+import { beginViewSwitchToPath } from "../observability/viewSwitchSpan";
 import { shareableWebOrigin } from "../utils/desktopShell";
+import { formatTaskConversationParam } from "../utils/taskConversation";
+import { currentComputerPath } from "../utils/computerPanel";
+import { buildMessagePath } from "../utils/messagePath";
+import type { MessagePermalinkOptions, MessagePermalinkRouteKind } from "../utils/messagePath";
+
+export { buildMessagePath };
+export type { MessagePermalinkOptions, MessagePermalinkRouteKind };
 
 export type NavigationKindForDepth = "PUSH" | "POP" | "REPLACE";
 
@@ -136,10 +148,12 @@ function syncMobileBackNavigationState(
   if (browserHistoryIndex === null) {
     // No entry index (MemoryRouter / non-browser): compressed stack.
     inAppNavigationStack = nextNavigationStack(inAppNavigationStack, navigationType, path);
+    navigationStackChanged();
     return;
   }
   inAppNavigationEntries = nextNavigationEntries(inAppNavigationEntries, navigationType, browserHistoryIndex, path);
   inAppNavigationStack = navigationStackFromEntries(inAppNavigationEntries, browserHistoryIndex);
+  navigationStackChanged();
 }
 
 function initializeMobileBackNavigationState(path: string) {
@@ -148,6 +162,7 @@ function initializeMobileBackNavigationState(path: string) {
   trackedBrowserHistoryIndex = readBrowserHistoryIndex();
   inAppNavigationEntries = trackedBrowserHistoryIndex === null ? {} : { [trackedBrowserHistoryIndex]: path };
   pendingSynchronousNavigation = null;
+  navigationStackChanged();
 }
 
 function readBrowserHistoryIndex(): number | null {
@@ -161,6 +176,17 @@ let inAppNavigationStack: string[] = [];
 let inAppNavigationEntries: Record<number, string> = {};
 let inAppPushDepth = 0;
 let trackedBrowserHistoryIndex: number | null = null;
+/** Who reads the stack while rendering (useHasInAppPageBehind): told each time it changes. */
+const navigationStackListeners = new Set<() => void>();
+function navigationStackChanged(): void {
+  for (const listener of navigationStackListeners) listener();
+}
+function subscribeNavigationStack(listener: () => void): () => void {
+  navigationStackListeners.add(listener);
+  return () => {
+    navigationStackListeners.delete(listener);
+  };
+}
 export interface SynchronousNavigationRecord {
   navigationType: Exclude<NavigationKindForDepth, "POP">;
   historyIndex: number | null;
@@ -357,10 +383,35 @@ export function NavigationDepthTracker() {
  * msg=768680bf. CI log trace: msg=68fc6426. Since every caller already
  * passes a semantic `fallback` (ThreadPanel → parent channel, ChatPanel
  * → `/s/<slug>`, AgentDetail → `/members` or closeProfile, etc.), the
- * view-stack adds no correctness and only adds race conditions. The
- * view-stack still drives tab-switch memory and popToRoot in
- * `useMobileNav.selectTab`.
+ * view-stack added no correctness and only race conditions; it is gone
+ * (the phone tab bar keeps only each tab root's filters, `useMobileNav`).
  */
+/**
+ * Whether the history entry before this one is a page of the app this
+ * document has shown, so `navigate(-1)` stays in the app: false for a link
+ * opened from outside (a new tab, another app) or after a reload, whose
+ * earlier entries are unknown.
+ */
+export function hasInAppPageBehind(stack: readonly string[] = inAppNavigationStack): boolean {
+  const previous = stack.at(-2);
+  return previous !== undefined && previous !== UNKNOWN_NAVIGATION_ENTRY;
+}
+
+/**
+ * The pages this document has shown up to the current entry, oldest first
+ * (UNKNOWN_NAVIGATION_ENTRY where an entry was never seen), read while
+ * rendering: the page renders again once NavigationDepthTracker records an
+ * entry. The assistant page looks for the conversation behind it.
+ */
+export function useInAppNavigationStack(): readonly string[] {
+  return useSyncExternalStore(subscribeNavigationStack, () => inAppNavigationStack, () => inAppNavigationStack);
+}
+
+/** hasInAppPageBehind, read while rendering: the page renders again once NavigationDepthTracker records its entry. */
+export function useHasInAppPageBehind(): boolean {
+  return useSyncExternalStore(subscribeNavigationStack, () => hasInAppPageBehind(), () => false);
+}
+
 export function useMobileBack(
   fallback: string | (() => void),
   beforeNavigate?: () => void,
@@ -417,6 +468,19 @@ interface NavOptions {
   sidebarFocus?: "center";
 }
 
+/** A message link's options (toMessage, toDmMessage, toThreadMessage). */
+interface MessageNavOptions {
+  /** One-shot visual intent for Search → Chat channel navigation. */
+  sidebarFocus?: "center";
+  /** In place of the current history entry (a phone page that the message takes the place of). */
+  replace?: boolean;
+  /**
+   * Runs once the navigation has happened: at once, or after the unsaved
+   * channel-settings prompt lets it go (never, if that prompt keeps the page).
+   */
+  onNavigated?: () => void;
+}
+
 interface ComputersNavOptions {
   /** Focus the Computers list on devices needing user attention. */
   filter?: "attention";
@@ -444,24 +508,13 @@ export function buildSearchPath(
   return paramsText ? `${base}/search?${paramsText}` : `${base}/search`;
 }
 
-export type MessagePermalinkRouteKind = "channel" | "dm";
-
-interface MessagePermalinkOptions {
-  routeKind?: MessagePermalinkRouteKind;
-  threadParentMessageId?: string | null;
-}
-
-function buildMessagePath(
-  base: string,
-  channelId: string,
-  messageId: string,
-  { routeKind = "channel", threadParentMessageId = null }: MessagePermalinkOptions = {}
-): string {
-  const params = new URLSearchParams({ msg: messageId });
-  if (threadParentMessageId) {
-    params.set("thread", `${channelId}:${threadParentMessageId}`);
-  }
-  return `${base}/${routeKind}/${channelId}?${params.toString()}`;
+/** A message link's navigate options: the sidebar focus intent, and replacing the current entry. */
+function messageNavigateOptions(channelId: string, opts: MessageNavOptions | undefined): NavigateOptions | undefined {
+  if (!opts?.sidebarFocus && !opts?.replace) return undefined;
+  return {
+    ...(opts.sidebarFocus ? { state: buildSidebarChannelFocusState(channelId) } : {}),
+    ...(opts.replace ? { replace: true } : {}),
+  };
 }
 
 export function useAppNavigate() {
@@ -488,63 +541,118 @@ export function useAppNavigate() {
       const query = params.toString();
       return query ? `${path}?${query}` : path;
     };
+    // task #156: every nav.* call funnels through here. A dirty channel-
+    // settings draft cannot survive a navigation (the sheet's form remounts
+    // on the new channel id), so string destinations go through the sheet's
+    // unsaved-changes prompt first — same deferred-action mechanism the
+    // search overlay guard uses. Non-string calls (delta navigations) bypass.
+    const guardedNavigate = (
+      path: string,
+      options?: NavigateOptions & { flushSync?: boolean },
+      onNavigated?: () => void,
+    ) => requestChannelNavigation(path, () => {
+      // A conversation, message or thread path starts `web.view.switch` at the click.
+      beginViewSwitchToPath(path);
+      // Its first messages' read goes out now, while the view renders (counted for the switch).
+      prefetchConversationForPath(path, liveLocationRef.current().pathname);
+      navigateRef.current(path, options);
+      onNavigated?.();
+    });
+    // A message link to the page already showing it (its `msg=` is the page's):
+    // the URL won't change, so nothing would re-run; jump to it again in
+    // place, as the first click did (#triage:#157).
+    const toMessagePath = (path: string, channelId: string, messageId: string, opts?: MessageNavOptions) => {
+      const here = liveLocationRef.current();
+      if (`${here.pathname}${here.search}` !== path) return guardedNavigate(path, messageNavigateOptions(channelId, opts), opts?.onNavigated);
+      beginViewSwitchToPath(path);
+      void useMessageStore.getState().loadMessageContext(channelId, messageId);
+      opts?.onNavigated?.();
+    };
     return {
-    toChannel: (channelId: string, opts?: NavOptions) => navigateRef.current(
+    toChannel: (channelId: string, opts?: NavOptions) => guardedNavigate(
       withQuery(`${base}/channel/${channelId}`, opts),
       opts?.sidebarFocus
         ? { state: buildSidebarChannelFocusState(channelId) }
         : undefined,
     ),
-    toDm: (dmChannelId: string, opts?: NavOptions) => navigateRef.current(
+    toDm: (dmChannelId: string, opts?: NavOptions) => guardedNavigate(
       withQuery(`${base}/dm/${dmChannelId}`, opts),
       opts?.sidebarFocus
         ? { state: buildSidebarChannelFocusState(dmChannelId, "dm") }
         : undefined,
     ),
-    toMessage: (channelId: string, messageId: string, opts?: NavOptions) => navigateRef.current(
-      buildMessagePath(base, channelId, messageId),
-      opts?.sidebarFocus
-        ? { state: buildSidebarChannelFocusState(channelId) }
-        : undefined,
+    toMessage: (channelId: string, messageId: string, opts?: MessageNavOptions) => toMessagePath(
+      buildMessagePath(base, channelId, messageId), channelId, messageId, opts,
     ),
-    toDmMessage: (dmChannelId: string, messageId: string) => navigateRef.current(buildMessagePath(base, dmChannelId, messageId, { routeKind: "dm" })),
+    toDmMessage: (dmChannelId: string, messageId: string, opts?: Omit<MessageNavOptions, "sidebarFocus">) => toMessagePath(
+      buildMessagePath(base, dmChannelId, messageId, { routeKind: "dm" }), dmChannelId, messageId, opts,
+    ),
     toThreadMessage: (
       channelId: string,
       parentMessageId: string,
       messageId: string,
       routeKind: MessagePermalinkRouteKind = "channel",
-      opts?: NavOptions,
-    ) => navigateRef.current(
+      opts?: MessageNavOptions,
+    ) => guardedNavigate(
       buildMessagePath(base, channelId, messageId, { routeKind, threadParentMessageId: parentMessageId }),
-      opts?.sidebarFocus
-        ? { state: buildSidebarChannelFocusState(channelId) }
-        : undefined,
+      messageNavigateOptions(channelId, opts),
+      opts?.onNavigated,
     ),
-    toAgent: (agentId: string) => navigateRef.current(`${base}/agent/${agentId}`),
-    toAgentWorkspace: (agentId: string) => navigateRef.current(`${base}/agent/${agentId}?agentTab=workspace`),
-    toComputer: (machineId: string) => navigateRef.current(`${base}/computer/${machineId}`),
+    /**
+     * A task's own conversation (task v2), opened over the channel the task
+     * lives in: the `task=<channel>:task:<taskId>` slot rightPanelUrlSync
+     * projects into the task dialog. `onNavigated` runs once the route has
+     * moved, so a caller can focus a message in the conversation it opened.
+     */
+    toTaskConversation: (
+      parentChannelId: string,
+      taskId: string,
+      routeKind: MessagePermalinkRouteKind = "channel",
+      onNavigated?: () => void,
+    ) => guardedNavigate(
+      `${base}/${routeKind}/${parentChannelId}?${new URLSearchParams({ task: formatTaskConversationParam(parentChannelId, taskId) }).toString()}`,
+      undefined,
+      onNavigated,
+    ),
+    toAgent: (agentId: string) => guardedNavigate(`${base}/agent/${agentId}`),
+    toAgentWorkspace: (agentId: string) => guardedNavigate(`${base}/agent/${agentId}?agentTab=workspace`),
+    /** A computer: its side panel beside the card wall, or its own page (computerPanel.ts). */
+    toComputer: (machineId: string) => guardedNavigate(currentComputerPath(base, machineId)),
     /** @deprecated use toComputer */
-    toMachine: (machineId: string) => navigateRef.current(`${base}/computer/${machineId}`),
-    toHuman: (userId: string) => navigateRef.current(`${base}/human/${userId}`),
-    toMembers: () => navigateRef.current(`${base}/members`),
+    toMachine: (machineId: string) => guardedNavigate(currentComputerPath(base, machineId)),
+    toHuman: (userId: string) => guardedNavigate(`${base}/human/${userId}`),
+    /** The server's migration log, optionally opened on one agent or computer. */
+    toMigrationLog: (filter?: { agent?: string; computer?: string }) => guardedNavigate(
+      `${base}/migrations${filter?.agent ? `?agent=${encodeURIComponent(filter.agent)}` : filter?.computer ? `?computer=${encodeURIComponent(filter.computer)}` : ""}`,
+    ),
+    toMembers: () => guardedNavigate(`${base}/members`),
     toComputers: (opts?: ComputersNavOptions) =>
-      navigateRef.current(
+      guardedNavigate(
         opts?.filter ? `${base}/computers?filter=${opts.filter}` : `${base}/computers`,
       ),
+    /** The Apps page; `search` (with its `?`) carries a deep link such as `?permission_updates=1`. */
+    toApps: (search = "") => guardedNavigate(`${base}/apps${search}`),
     // Desktop: every search entry floats as the ⌘K overlay over the current
     // view (task #96) — carry it as backgroundLocation. Web: full-page /search.
-    toSearch: (query?: string, opts?: SearchNavOptions) => navigateRef.current(
+    toSearch: (query?: string, opts?: SearchNavOptions) => guardedNavigate(
       buildSearchPath(base, query, opts),
       {
         state: searchEntryState(liveLocationRef.current()),
         ...(opts?.flushSync ? { flushSync: true } : {}),
       },
     ),
-    toSettings: (tab?: string) => navigateRef.current(tab ? `${base}/settings/${tab}` : `${base}/settings`),
-    toReleaseNotes: () => navigateRef.current(`${base}/release-notes`),
-    toThreadsInbox: () => navigateRef.current(`${base}/activity`),
-    toTasks: () => navigateRef.current(`${base}/tasks`),
-    toSaved: () => navigateRef.current(`${base}/saved`),
+    // A conversation's own search, a pushed page over it (phone; Raft DS ›
+    // Navigation › Search on a phone).
+    toConversationSearch: (kind: "channel" | "dm", conversationId: string) => guardedNavigate(`${base}/${kind}/${conversationId}/search`),
+    toSettings: (tab?: string) => guardedNavigate(tab ? `${base}/settings/${tab}` : `${base}/settings`),
+    toReleaseNotes: () => guardedNavigate(`${base}/release-notes`),
+    toThreadsInbox: () => guardedNavigate(`${base}/activity`),
+    toTasks: () => guardedNavigate(`${base}/tasks`),
+    toSaved: () => guardedNavigate(`${base}/saved`),
+    toDrafts: () => guardedNavigate(`${base}/drafts`),
+    toArtifacts: () => guardedNavigate(`${base}/artifacts`),
+    /** A page of the current server by its path under `/s/<slug>` ("/artifacts?artifact=…"): where an app's search hit opens. */
+    toServerPath: (path: `/${string}`) => guardedNavigate(`${base}${path}`),
     };
   }, [base]);
 }

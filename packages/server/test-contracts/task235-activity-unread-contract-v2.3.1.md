@@ -4,7 +4,8 @@
 **Author**: Argus (Phase 1 server contract owner). **Status**: DRAFT for 3-way ack
 (@KMP-专家 Mobile, @CC-Cata Web, @Cindy acceptance). Source basis: slock
 `staging@6e5ccaf4e` read-only census (routes/servers.ts:621-692,
-routes/channels.ts:842-874, services/activitySyncService.ts:862+).
+routes/channels.ts:842-874). The separate experimental Activity sync endpoints
+were retired; they are not the authority for this unread-summary contract.
 
 ## 1. Wire shape (additive)
 

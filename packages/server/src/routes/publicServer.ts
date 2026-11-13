@@ -1,6 +1,7 @@
 import { Router, type Router as ExpressRouter } from "express";
 import { createRaftStructuredUserRefRegex, extractRaftMentionHandles, normalizeTranslationLanguageCode } from "@botiverse/raft-shared";
 import { kickAppNotificationDelivery } from "../services/appNotificationDeliveryService";
+import { agentFindableBy } from "../services/agentMemberListPolicy";
 import { and, desc, eq, inArray, isNotNull, isNull, lt, or, sql } from "drizzle-orm";
 import type { Server as SocketServer } from "socket.io";
 import { getDb } from "../db/index";
@@ -21,22 +22,21 @@ import {
 } from "../db/schema";
 import { UUID_RE } from "../lib/messageId";
 import { guardUuidPathParams } from "../lib/uuidPathParams";
-import { requireAuth, requireVerified } from "../middleware/auth";
 import * as channelService from "../services/channelService";
 import * as onboardingService from "../services/onboardingService";
 import * as serverAgreementService from "../services/serverAgreementService";
 import * as serverService from "../services/serverService";
 import { getProductEventSink, getPublicVisitorSink } from "../services/productEventIngest";
-import { publicVisitorIdOffered, recordPublicServerJoin } from "../services/publicVisitCounts";
+import { publicVisitorIdOffered } from "../services/publicVisitCounts";
 import { publicVisitorIdMode } from "../services/publicVisitorRegion";
 import type { DbQueryTracer } from "../tracing/dbQueryTrace";
-import { isStoredServerScopedAvatarUrl, isStoredUserAvatarUrl } from "../services/avatarService";
+import { isShownUserAvatarUrl, isStoredServerScopedAvatarUrl } from "../services/avatarService";
+import { isPublicPixelAvatarUrl } from "../services/pixelAvatarService";
 import { projectServerPublicProfile } from "../services/serverProfileProjection";
 import type { AgentOrchestrator } from "../services/agentOrchestrator";
 import {
   evaluateFeatureFlag,
   PUBLIC_SERVER_FEATURE_FLAG_KEY,
-  SERVER_GUEST_FEATURE_FLAG_KEY,
 } from "../services/featureFlagService";
 import { sendJsonServerError } from "./errorResponse";
 import {
@@ -58,7 +58,6 @@ import { streamStorageResponse } from "../services/storageResponseStream";
 import {
   isTranslationProviderConfigured,
   translatePublicMessagesBatch,
-  TranslationFeatureUnavailableError,
   type TranslationMode,
 } from "../services/messageTranslationService";
 
@@ -104,7 +103,6 @@ async function findPubliclyVisibleServer(slug: string) {
       name: servers.name,
       slug: servers.slug,
       avatarUrl: servers.avatarUrl,
-      publicGuestJoinEnabled: servers.publicGuestJoinEnabled,
       translationEnabled: servers.translationEnabled,
     })
     .from(servers)
@@ -117,7 +115,6 @@ async function findPubliclyVisibleServer(slug: string) {
   if (!row) return null;
   return {
     ...projectServerPublicProfile(row),
-    publicGuestJoinEnabled: row.publicGuestJoinEnabled,
     translationEnabled: row.translationEnabled,
   };
 }
@@ -181,6 +178,7 @@ async function findAnonymousReadableChannel(slug: string, channelId: string) {
  */
 export async function loadPublicThreadPreviews(
   channelId: string,
+  serverId: string,
   parentMessageIds: string[],
   traceQuery?: DbQueryTracer,
 ) {
@@ -189,6 +187,9 @@ export async function loadPublicThreadPreviews(
     parentMessageIds,
     parentMessageScopeSource: "messages_page",
     includeParticipants: false,
+    // Reply agents resolve like the parent rows in listPublicMessages: only
+    // this server's agents, else "Unknown agent" (wg-rbac #56).
+    agentServerId: serverId,
     ...(traceQuery ? { traceQuery } : {}),
   });
 }
@@ -305,7 +306,8 @@ async function loadPublicMentions(messages: Array<{ id: string; content: string;
     db
       .select({ name: agents.name, displayName: agents.displayName })
       .from(agents)
-      .where(and(eq(agents.serverId, serverId), isNull(agents.deletedAt), inArray(agents.name, names))),
+      // No personal assistant: nobody but its owner finds one (agentFindableBy).
+      .where(and(eq(agents.serverId, serverId), isNull(agents.deletedAt), inArray(agents.name, names), agentFindableBy({}))),
   ]);
   // Agents first, then humans, so a human wins a name collision exactly as in
   // the member view's `buildMentionMap`.
@@ -380,6 +382,17 @@ async function loadPublicReactions(messageIds: string[]) {
  * (emoji + count) are projected by the loaders above; widening this response
  * requires an intentional change at this boundary.
  */
+// The plan's history window does not apply here: public server pages are the
+// one marked exception to it (cindyz, #proj-commercial task #8: "公开服务器页
+// 暂时不是问题，不考虑"; services/historyWindow.ts).
+/** An agent's avatar on the anonymous projection: its own server-scoped
+ *  upload, or a valid client-rendered `pixel:*` key (no URL, no personal
+ *  data). Anything else — another server's upload, third-party or signed
+ *  URLs, unknown pixel keys — is null. */
+function publicAgentAvatarUrl(avatarUrl: string | null, serverId: string): string | null {
+  return isStoredServerScopedAvatarUrl(avatarUrl, serverId) || isPublicPixelAvatarUrl(avatarUrl) ? avatarUrl : null;
+}
+
 async function listPublicMessages(channelId: string, serverId: string, limit: number, beforeMessageId?: string) {
   const conditions = [eq(messages.channelId, channelId)];
   if (beforeMessageId !== undefined) {
@@ -429,7 +442,7 @@ async function listPublicMessages(channelId: string, serverId: string, limit: nu
     .limit(limit);
   const messageIds = rows.map((row) => row.id);
   const [summaries, attachmentsByMessage, mentionsByMessage, reactionsByMessage] = await Promise.all([
-    loadPublicThreadPreviews(channelId, messageIds),
+    loadPublicThreadPreviews(channelId, serverId, messageIds),
     loadPublicAttachments(messageIds),
     loadPublicMentions(rows, serverId),
     loadPublicReactions(messageIds),
@@ -440,12 +453,13 @@ async function listPublicMessages(channelId: string, serverId: string, limit: nu
     sender: {
       displayName: row.senderName,
       handle: row.senderHandle,
-      // Human uploads are capability URLs served by the public avatar route.
-      // Historical third-party profile URLs are deliberately not projected.
+      // Human uploads are capability URLs served by the public avatar route;
+      // a built pixel avatar is only option ids. Historical third-party
+      // profile URLs are deliberately not projected.
       avatarUrl: row.senderType === "user"
-        ? (isStoredUserAvatarUrl(row.userAvatarUrl) ? row.userAvatarUrl : null)
+        ? (isShownUserAvatarUrl(row.userAvatarUrl) ? row.userAvatarUrl : null)
         : row.senderType === "agent"
-          ? (isStoredServerScopedAvatarUrl(row.agentAvatarUrl, serverId) ? row.agentAvatarUrl : null)
+          ? publicAgentAvatarUrl(row.agentAvatarUrl, serverId)
           : null,
       description: row.senderType === "user"
         ? row.userDescription
@@ -466,7 +480,8 @@ async function listPublicMessages(channelId: string, serverId: string, limit: nu
     // a member sees instead of a bare count. Nothing new becomes readable: the
     // same replies are served by the public thread endpoint below. Projected
     // like the parent rows: display name only (no sender id, no handle) and
-    // avatars through the same stored-upload rule.
+    // avatars through the same rule (stored upload or built pixel avatar;
+    // agents also pixel keys).
     latestReplies: (summaries[row.id]?.latestReplies ?? []).map((reply) => ({
       messageId: reply.messageId,
       seq: reply.seq,
@@ -474,9 +489,9 @@ async function listPublicMessages(channelId: string, serverId: string, limit: nu
       senderType: reply.senderType,
       senderName: reply.senderDisplayName,
       senderAvatarUrl: reply.senderType === "user"
-        ? (isStoredUserAvatarUrl(reply.senderAvatarUrl) ? reply.senderAvatarUrl : null)
+        ? (isShownUserAvatarUrl(reply.senderAvatarUrl) ? reply.senderAvatarUrl : null)
         : reply.senderType === "agent"
-          ? (isStoredServerScopedAvatarUrl(reply.senderAvatarUrl, serverId) ? reply.senderAvatarUrl : null)
+          ? publicAgentAvatarUrl(reply.senderAvatarUrl, serverId)
           : null,
       createdAt: reply.createdAt,
     })),
@@ -555,10 +570,6 @@ publicServerRouter.post("/servers/:slug/message-translations:batch", async (req,
     });
     res.json({ results });
   } catch (err) {
-    if (err instanceof TranslationFeatureUnavailableError) {
-      res.status(403).json({ error: err.message });
-      return;
-    }
     sendJsonServerError(req, res, { error: "Failed to translate public messages", logPrefix: "Public translation batch error:", err });
   }
 });
@@ -573,10 +584,7 @@ publicServerRouter.get("/servers/:slug", async (req, res) => {
       res.status(404).json({ error: "Not found" });
       return;
     }
-    const [publicGate, guestGate] = await Promise.all([
-      evaluateFeatureFlag({ key: PUBLIC_SERVER_FEATURE_FLAG_KEY, serverId: server.id, platform: "web" }),
-      evaluateFeatureFlag({ key: SERVER_GUEST_FEATURE_FLAG_KEY, serverId: server.id, platform: "web" }),
-    ]);
+    const publicGate = await evaluateFeatureFlag({ key: PUBLIC_SERVER_FEATURE_FLAG_KEY, serverId: server.id, platform: "web" });
     if (!publicGate.enabled) {
       res.status(404).json({ error: "Not found" });
       return;
@@ -600,11 +608,9 @@ publicServerRouter.get("/servers/:slug", async (req, res) => {
         gpc: req.get("sec-gpc"),
       })
       : undefined;
-    const { publicGuestJoinEnabled, ...publicServer } = server;
     res.json({
-      server: publicServer,
+      server,
       channels: visible,
-      canJoinAsGuest: publicGuestJoinEnabled && guestGate.enabled,
       translationAvailable: isTranslationProviderConfigured(),
       visitorIdMode,
     });
@@ -660,8 +666,9 @@ export const PUBLIC_ATTACHMENT_PRESIGNED_URL_TTL_SECONDS = 60;
 /**
  * Authorize one anonymous attachment read. Authority is the message, never
  * the attachment row: the projection must be bound to a message (draft
- * uploads have none), not revoked, and — once bound to an RFC 049 object —
- * backed by an active object. That message's channel must then pass the same
+ * uploads have none), not revoked, and backed by an active object (size, type
+ * and key come only from that object; a projection without one is a data
+ * error answered as a missing file). That message's channel must then pass the same
  * predicate as the history routes: an anonymously readable ordinary channel,
  * or a thread whose parent message lives in one, on this slug's public server.
  *
@@ -674,7 +681,7 @@ async function findPublicAttachment(slug: string, attachmentId: string) {
     .select({ projection: attachments, object: attachmentObjects, channelId: messages.channelId })
     .from(attachments)
     .innerJoin(messages, eq(messages.id, attachments.messageId))
-    .leftJoin(attachmentObjects, eq(attachmentObjects.id, attachments.objectId))
+    .innerJoin(attachmentObjects, eq(attachmentObjects.id, attachments.objectId))
     .where(and(
       eq(attachments.id, attachmentId),
       isNull(attachments.revokedAt),
@@ -682,18 +689,18 @@ async function findPublicAttachment(slug: string, attachmentId: string) {
     ))
     .limit(1);
   if (!row) return null;
-  if (row.projection.objectId && row.object?.lifecycleState !== "active") return null;
+  const { object } = row;
+  if (object.lifecycleState !== "active") return null;
   const readable = await findAnonymousReadableChannel(slug, row.channelId)
     ?? await findPublicThread(slug, row.channelId);
   if (!readable) return null;
-  const physical = row.projection.objectId ? row.object! : row.projection;
   const filename = normalizeAttachmentFilename(row.projection.filename);
   return {
     serverId: readable.serverId,
     filename,
-    mimeType: resolveAttachmentMimeType(filename, physical.mimeType),
-    sizeBytes: physical.sizeBytes,
-    storageKey: physical.storageKey,
+    mimeType: resolveAttachmentMimeType(filename, object.mimeType),
+    sizeBytes: object.sizeBytes,
+    storageKey: object.storageKey,
   };
 }
 
@@ -774,121 +781,6 @@ publicServerRouter.get("/servers/:slug/attachments/:attachmentId", async (req, r
       return;
     }
     sendJsonServerError(req, res, { error: "Failed to serve public attachment", logPrefix: "Public attachment error:", err });
-  }
-});
-
-// POST /api/public/servers/:slug/join-as-guest
-//
-// Authentication is deliberately attached to this one route rather than the
-// router: all GETs above remain the same narrow anonymous projection. The
-// caller cannot assert an admission source or role; this endpoint always means
-// "public-page self admission" and can only create a Guest membership.
-publicServerRouter.post("/servers/:slug/join-as-guest", requireAuth, requireVerified, async (req, res) => {
-  try {
-    const slug = Array.isArray(req.params.slug) ? req.params.slug[0] : req.params.slug;
-    if (!slug) {
-      res.status(404).json({ error: "Not found" });
-      return;
-    }
-    const agreementId = typeof req.body?.agreementId === "string" ? req.body.agreementId : null;
-    // The page's visitor id, sent only after cookie consent; checked in
-    // recordPublicServerJoin, which is the only place it meets an account.
-    const anonymousId = typeof req.body?.anonymous_id === "string" ? req.body.anonymous_id : null;
-    const result = await getDb().transaction(async (tx) => {
-      const [server] = await tx
-        .select({
-          id: servers.id,
-          name: servers.name,
-          slug: servers.slug,
-          publiclyVisible: servers.publiclyVisible,
-          publicGuestJoinEnabled: servers.publicGuestJoinEnabled,
-        })
-        .from(servers)
-        .where(and(eq(servers.slug, slug), isNull(servers.deletedAt)))
-        .limit(1)
-        .for("update");
-      if (!server) return null;
-
-      const publicGate = await evaluateFeatureFlag(
-        { key: PUBLIC_SERVER_FEATURE_FLAG_KEY, serverId: server.id, userId: req.userId!, platform: "web" },
-        tx,
-      );
-      const guestGate = await evaluateFeatureFlag(
-        { key: SERVER_GUEST_FEATURE_FLAG_KEY, serverId: server.id, userId: req.userId!, platform: "web" },
-        tx,
-      );
-      if (!publicGate.enabled || !guestGate.enabled || !server.publiclyVisible || !server.publicGuestJoinEnabled) {
-        return null;
-      }
-
-      const [existing] = await tx
-        .select({ role: serverMembers.role })
-        .from(serverMembers)
-        .where(and(eq(serverMembers.serverId, server.id), eq(serverMembers.userId, req.userId!)))
-        .limit(1);
-      if (existing) return { ...server, role: existing.role, joined: false };
-
-      await serverAgreementService.requireSelfServeAgreement(tx, server.id, { agreementId });
-      const joined = await serverService.addMember(server.id, req.userId!, "guest", {
-        executor: tx,
-        agreementAudit: {
-          actorUserId: req.userId!,
-          source: "join",
-          agreementId,
-          ipAddress: req.ip ?? null,
-          userAgent: req.get("user-agent") ?? null,
-        },
-      });
-      if (!joined) {
-        const [raced] = await tx.select({ role: serverMembers.role }).from(serverMembers)
-          .where(and(eq(serverMembers.serverId, server.id), eq(serverMembers.userId, req.userId!))).limit(1);
-        return raced ? { ...server, role: raced.role, joined: false } : null;
-      }
-      return { ...server, role: "guest" as const, joined: true };
-    });
-
-    if (!result) {
-      res.status(404).json({ error: "Not found" });
-      return;
-    }
-    if (result.joined) {
-      // Committed: deliver the server.member_added App Notification now.
-      kickAppNotificationDelivery();
-      // Best effort and after commit: analytics never fails a join.
-      void recordPublicServerJoin(
-        { slug, userId: req.userId!, anonymousId },
-        getProductEventSink(req.app),
-        getPublicVisitorSink(req.app),
-      ).catch((err: unknown) => {
-        console.warn("[public-visits] join not recorded:", err instanceof Error ? err.name : "unknown");
-      });
-      const io = req.app.get("io") as SocketServer | undefined;
-      const agentOrchestrator = req.app.get("agentOrchestrator") as AgentOrchestrator | undefined;
-      if (io) {
-        io.to(`server:${result.id}`).emit("server:member-added", { serverId: result.id, userId: req.userId! });
-        if (agentOrchestrator) {
-          void onboardingService.triggerNewMemberOnboarding(io, agentOrchestrator, result.id, req.userId!).catch((err: unknown) => {
-            console.warn(`[Onboarding] Failed after public Guest join for ${req.userId}: ${err instanceof Error ? err.message : String(err)}`);
-          });
-          void onboardingService.triggerAllChannelUnlockOnboarding(io, agentOrchestrator, result.id).catch((err: unknown) => {
-            console.warn(`[Onboarding] Failed #all unlock after public Guest join for ${req.userId}: ${err instanceof Error ? err.message : String(err)}`);
-          });
-        }
-      }
-    }
-    res.json({ serverId: result.id, serverName: result.name, serverSlug: result.slug, role: result.role, joined: result.joined });
-  } catch (err: unknown) {
-    const agreementResponse = serverAgreementService.agreementErrorResponse(err);
-    if (agreementResponse) {
-      res.status(agreementResponse.status).json(agreementResponse.body);
-      return;
-    }
-    const message = err instanceof Error ? err.message : "";
-    if (message.includes("seat limit") || message.includes("limit reached")) {
-      res.status(403).json({ error: message });
-      return;
-    }
-    sendJsonServerError(req, res, { error: "Failed to join public server", logPrefix: "Public Guest join error:", err });
   }
 });
 

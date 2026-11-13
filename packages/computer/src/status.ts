@@ -9,6 +9,7 @@ import { readRuntimeCliNotices } from "./runtimeCliNotices";
 // from filesystem state, but NEVER the user access token or any
 // sk_computer_* key — none of those values ever enter the report object.
 import { readFile, access } from "node:fs/promises";
+import { startedAfterRecord } from "@botiverse/raft-shared";
 import {
   resolveRaftHome,
   userSessionPath,
@@ -22,13 +23,15 @@ import {
 } from "./paths";
 import { formatServerSlugDisplay, listServerAttachments } from "./serverState";
 import { canonicalizeServerUrl } from "./serverUrl";
-import { readPidfileAt, isProcessAlive } from "./internal/process-primitives";
-import { findLiveServicePidReadOnly } from "./internal/service-pid-fallback";
+import { readPidfileAt, isProcessAlive, readProcessStartTimeMs } from "./internal/process-primitives";
+import { findLiveServicePidReadOnly, type ServicePidIdentityDeps } from "./internal/service-pid-fallback";
 import { isDegraded, readTerminalUnlinked } from "./health";
 import { info } from "./output";
 import { COMPUTER_VERSION } from "./version";
 import { SHELL_ENV_CAPTURE_TIMEOUT_MS } from "./shellEnvCapture";
 import { readProcessVersionEvidence } from "./versionEvidence";
+import { deferredLockOwner, type DeferredOwnerIdentity } from "./runnerLockConflict";
+import { formatProcJobsStatus, listRunningProcJobs, type ProcJobsDeps } from "./procJobs";
 
 type UserSessionReadResult =
   | { state: "missing"; session: null; error: null }
@@ -84,12 +87,101 @@ async function pidStatus(pidfile: string): Promise<DaemonState> {
   return pid !== null && isProcessAlive(pid) ? { running: true, pid } : { running: false };
 }
 
-async function runnerPidStatus(slockHome: string, serverId: string): Promise<DaemonState> {
+/**
+ * How a live recorded pid is told from the process that wrote it; tests
+ * replace these instead of using real processes. A start is read (once per
+ * pid per report):
+ *  - for the service pid, when service-version.json names it and nothing
+ *    answers on the service's IPC endpoint (`endpointAnswers`);
+ *  - for a runner pid with version evidence of its own, while the service is
+ *    stopped;
+ *  - for a lock owner the service deferred to, when runner-version.json names
+ *    its pid: every report, also under a running service (the deferral is
+ *    rare, and nothing about that owner is cached).
+ * A healthy running service and its own runners cost no read. On Linux no
+ * start is read at all, and every case is shown as before starts were read.
+ */
+export type StatusReportDeps = ServicePidIdentityDeps;
+
+/** What a server's files say about its runner process. */
+interface RunnerProcess {
+  daemon: DaemonState;
+  connected: boolean;
+  lockHeldByPid?: number;
+  deferredOwner?: DeferredOwnerIdentity;
+}
+
+/**
+ * A live pid in runner.pid is not yet this server's runner. Two things put
+ * another process there:
+ *
+ *  - A runner that died without its service (sign-out, a kill) leaves its
+ *    pidfile behind, and Windows hands the pid to an unrelated program. The
+ *    runner wrote its version evidence after it started, so a process that
+ *    started later than that reused the pid (the machine lock's start-time
+ *    rule). A start that cannot be read is not reuse.
+ *  - The service, deferring to whoever holds the daemon machine lock, writes
+ *    that holder's pid (runnerLockConflict.ts). It started no runner, and a
+ *    live pid in a lock says nothing about what the process is. Who it is
+ *    comes from `deferredLockOwner`, the one answer status, doctor, stop and
+ *    detach share. "own-runner" is shown as the runner, connected or not by
+ *    its own marker, and so is "unread" (its start could not be read: shown
+ *    as before starts were read). "another-program" and "unknown" are the
+ *    lock's holder, nothing more.
+ *
+ * A live pid with neither record stays running, as before. When a start is
+ * read: StatusReportDeps.
+ */
+async function runnerProcess(
+  slockHome: string,
+  serverId: string,
+  serviceRunning: boolean,
+  processStartTimeMs: NonNullable<StatusReportDeps["processStartTimeMs"]>,
+): Promise<RunnerProcess> {
+  const evidence = await readProcessVersionEvidence(serverRunnerVersionPath(slockHome, serverId));
+  const lockOwner = await deferredLockOwner(slockHome, serverId, { processStartTimeMs });
+  let lockHeldByPid: number | undefined;
+  let deferredOwner: DeferredOwnerIdentity | undefined;
   for (const pidfile of serverRunnerPidReadFallback(slockHome, serverId)) {
     const state = await pidStatus(pidfile);
-    if (state.running) return state;
+    if (!state.running) continue;
+    if (lockOwner?.pid === state.pid) {
+      switch (lockOwner.identity) {
+        case "own-runner":
+        case "unread":
+          return { daemon: state, connected: lockOwner.connected, deferredOwner: lockOwner.identity };
+        case "another-program":
+        case "unknown":
+          // Still the holder with the service stopped: its pid stays in runner.pid until a later start.
+          lockHeldByPid = state.pid;
+          deferredOwner = lockOwner.identity;
+          continue;
+      }
+    }
+    let isRunner = true;
+    if (evidence?.pid === state.pid) {
+      const recordedAtMs = Date.parse(evidence.writtenAt);
+      // Not for a running service's own runner. Reading a start is a
+      // PowerShell start per server on Windows, and Raft Desktop asks for
+      // status every 5 s. Under a running service runner.pid is that
+      // service's own: `start` forgets what an earlier service left before it
+      // spawns one, and the service clears it when its runner exits.
+      const readStart = !serviceRunning && Number.isFinite(recordedAtMs);
+      isRunner = !(readStart && startedAfterRecord(recordedAtMs, await processStartTimeMs(state.pid)));
+    }
+    if (isRunner) {
+      return {
+        daemon: state,
+        connected: await access(serverConnectedMarkerPath(slockHome, serverId)).then(() => true, () => false),
+      };
+    }
   }
-  return { running: false };
+  return {
+    daemon: { running: false },
+    connected: false,
+    ...(lockHeldByPid !== undefined ? { lockHeldByPid } : {}),
+    ...(deferredOwner !== undefined ? { deferredOwner } : {}),
+  };
 }
 
 async function visibleRunnerLogPath(slockHome: string, serverId: string): Promise<string> {
@@ -107,8 +199,11 @@ async function visibleRunnerLogPath(slockHome: string, serverId: string): Promis
  * surfaced as running — never clearing or otherwise mutating the chain
  * (§3.3.1 read-only + secret-free invariant).
  */
-async function serviceState(slockHome: string): Promise<DaemonState> {
-  const { pid } = await findLiveServicePidReadOnly(slockHome);
+async function serviceState(slockHome: string, identity: ServicePidIdentityDeps): Promise<DaemonState> {
+  // A live pid that is another program's (after a sign-out or reboot:
+  // service-pid-fallback.ts) is not found: the service is stopped, and the
+  // runner pids it left behind are checked the same way.
+  const { pid } = await findLiveServicePidReadOnly(slockHome, identity);
   return pid !== null ? { running: true, pid } : { running: false };
 }
 
@@ -186,6 +281,20 @@ export interface ServerStatusRow {
    *  callbacks — not a server-side query. Required for Desktop v1:
    *  `Online` = health ok + serverConnected true. */
   serverConnected: boolean;
+  /**
+   * Set when runner.pid names the process the service deferred to because it
+   * holds this machine's daemon lock, and that process has not shown itself
+   * to be this server's runner (`daemon.running` is false). It may be another
+   * Raft daemon or, its pid reused, an unrelated program.
+   */
+  lockHeldByPid?: number;
+  /**
+   * Set when the pid in this row (`daemon.pid`, or `lockHeldByPid`) is the
+   * daemon lock's owner the service deferred to, not a runner it started:
+   * who that owner is (runnerLockConflict.ts). The service never stops,
+   * restarts or signals such a process.
+   */
+  deferredOwner?: DeferredOwnerIdentity;
 }
 
 export interface ComputerStatusReport {
@@ -218,12 +327,19 @@ export interface ComputerStatusReport {
  * handler (PR-impl-2, D-stage) both pass an `installRoot` resolved by
  * their respective entry points.
  */
-export async function buildStatusReport(installRoot: string): Promise<ComputerStatusReport> {
+export async function buildStatusReport(installRoot: string, deps: StatusReportDeps = {}): Promise<ComputerStatusReport> {
   const sessionRead = await readUserSession(userSessionPath(installRoot));
   const session = sessionRead.session;
   const attachments = await listServerAttachments(installRoot);
+  // One start read per pid within a report: it spawns a command on Windows and macOS.
+  const starts = new Map<number, Promise<number | undefined>>();
+  const processStartTimeMs = (pid: number): Promise<number | undefined> => {
+    let start = starts.get(pid);
+    if (!start) starts.set(pid, (start = (deps.processStartTimeMs ?? readProcessStartTimeMs)(pid)));
+    return start;
+  };
   const service = {
-    ...(await serviceState(installRoot)),
+    ...(await serviceState(installRoot, { endpointAnswers: deps.endpointAnswers, processStartTimeMs })),
     logPath: serviceLogPath(installRoot),
   };
   const serviceWithVersion = {
@@ -231,11 +347,11 @@ export async function buildStatusReport(installRoot: string): Promise<ComputerSt
     version: await processVersionStatus(serviceVersionPath(installRoot), service),
   };
 
+  // Together: each server's runner pid may need its start read.
+  const runners = await Promise.all(attachments.map((a) => runnerProcess(installRoot, a.serverId, service.running, processStartTimeMs)));
   const servers: ServerStatusRow[] = [];
-  for (const a of attachments) {
-    const daemon = await runnerPidStatus(installRoot, a.serverId);
-    const markerExists = await access(serverConnectedMarkerPath(installRoot, a.serverId)).then(() => true, () => false);
-    const serverConnected = markerExists && daemon.running;
+  for (const [index, a] of attachments.entries()) {
+    const { daemon, connected: serverConnected, lockHeldByPid, deferredOwner } = runners[index]!;
     servers.push({
       serverId: a.serverId,
       serverSlug: a.serverSlug ?? null,
@@ -251,6 +367,8 @@ export async function buildStatusReport(installRoot: string): Promise<ComputerSt
       daemon,
       health: await deriveHealth(installRoot, a.serverId, a.serverMachineId, daemon),
       serverConnected,
+      ...(lockHeldByPid !== undefined ? { lockHeldByPid } : {}),
+      ...(deferredOwner !== undefined ? { deferredOwner } : {}),
     });
   }
 
@@ -290,11 +408,14 @@ function formatVersionStatus(version: ProcessVersionStatus): string {
 export function formatStatusReport(report: ComputerStatusReport): void {
   info("");
   info(`SLOCK_HOME:   ${report.slockHome}`);
+  // A user session is no longer needed: each server is added with a
+  // one-time approval (`raft-computer attach`). Only older servers and the
+  // legacy-daemon migration in setup still sign in.
   const loginDetail = report.userSessionError
-    ? "no — user session file is invalid; re-run `raft-computer login`"
+    ? "no — user session file is invalid (not needed: add a server with `raft-computer attach /<server>`)"
     : report.loggedIn
       ? `yes (user ${report.userId ?? "?"})`
-      : "no — run `raft-computer login`";
+      : "no (not needed: add a server with `raft-computer attach /<server>`)";
   info(
     `Logged in:    ${loginDetail}`,
   );
@@ -329,7 +450,9 @@ export function formatStatusReport(report: ComputerStatusReport): void {
     info("Attachments:");
     info(`  ${pad("SERVER", 24)}${pad("HEALTH", 12)}${pad("CONNECTED", 12)}${pad("DAEMON", 24)}${pad("MACHINE", 38)}URL`);
     for (const s of report.servers) {
-      const dcol = s.daemon.running ? `running (pid ${s.daemon.pid})` : "stopped";
+      const dcol = s.daemon.running
+        ? `running (pid ${s.daemon.pid})`
+        : s.lockHeldByPid !== undefined ? `lock held (pid ${s.lockHeldByPid})` : "stopped";
       info(
         `  ${pad(formatServerSlugDisplay(s.serverSlug), 24)}${pad(s.health, 12)}${pad(s.serverConnected ? "yes" : "no", 12)}${pad(dcol, 24)}${pad(s.serverMachineId, 38)}${s.serverUrl}`,
       );
@@ -343,6 +466,15 @@ export function formatStatusReport(report: ComputerStatusReport): void {
       );
       info(
         "  After fixing the underlying issue, run `raft-computer restart /<serverSlug>` (e.g. `/myserver`) to try again.",
+      );
+    }
+    if (report.servers.some((s) => s.lockHeldByPid !== undefined)) {
+      info("");
+      info(
+        "  Note: one or more servers show `lock held`: a process the Computer service did not start holds this machine's daemon lock and could not be confirmed as that server's runner, so the service started no runner for them.",
+      );
+      info(
+        "  Run `raft-computer doctor` for how to check that process and start the runner again.",
       );
     }
     if (report.servers.some((s) => s.health === "unlinked")) {
@@ -365,5 +497,19 @@ export function formatStatusReport(report: ComputerStatusReport): void {
  * end-to-end stdout path directly.
  */
 export async function runStatus(): Promise<void> {
-  formatStatusReport(await buildStatusReport(resolveRaftHome()));
+  const home = resolveRaftHome();
+  formatStatusReport(await buildStatusReport(home));
+  await printProcJobsStatus(home);
+}
+
+/**
+ * `raft proc` (#proj-raft-computer:#59): the agents' running jobs, after the
+ * report (agent short id, name, pid, running time) and how to stop them.
+ * Read from the daemons' ledgers (procJobs.ts); none on Windows.
+ */
+export async function printProcJobsStatus(home: string, deps: ProcJobsDeps & { now?: () => number } = {}): Promise<void> {
+  if ((deps.platform ?? process.platform) === "win32") return;
+  const jobs = await listRunningProcJobs(home, deps).catch(() => []);
+  for (const line of formatProcJobsStatus(jobs, (deps.now ?? Date.now)())) info(line);
+  info("");
 }

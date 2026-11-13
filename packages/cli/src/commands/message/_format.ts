@@ -6,7 +6,11 @@
 import { T, UUID_A, UUID_B, UUID_C, sampleMessage, sampleMessageChannelThread, sampleMessageDm, sampleMessageDmThread } from "../_axExampleFixtures";
 import { axSurface } from "../../core/renderer";
 import type {
+  AgentApiMessageReaction,
+  AgentMessageCardMarker,
+  AgentMessageCardUpdatedText,
   AgentMessageLike,
+  AgentMessageSourceTaskLike,
   AgentMessageTaskCurrentProjectionLike,
   AgentSearchContinueFilters,
   AgentSearchData,
@@ -19,16 +23,26 @@ import type {
 import {
   AGENT_API_MESSAGE_SEARCH_DEFAULT_LIMIT,
   AGENT_API_MESSAGE_SEARCH_MAX_LIMIT,
+  AGENT_MESSAGE_CARD_NOT_STORED_NOTICE,
   formatAgentAttachmentSuffix,
   formatAgentInboxHint,
+  formatAgentMessageCardBlock,
+  formatAgentMessageCardHeaderFields,
+  formatAgentMessageCardUpdated,
   formatAgentMessageLine,
+  formatAgentMessageReactionsLine,
   formatAgentMessages,
   formatAgentMessageTarget,
   formatAgentSenderHandle,
   formatAgentTaskAssigneeSuffix,
   formatAgentTaskCurrentProjection,
   formatAgentSearchResults,
+  formatAgentSourceTasksSuffix,
+  formatHint,
   formatUtcTimestamp,
+  MESSAGE_CARD_LIMITS,
+  parseAgentTaskRef,
+  RAFT_HINTS,
   formatSenderHandleText,
   indentAgentBodyContinuationLines,
   neutralizeAgentRaftRefLiterals,
@@ -66,6 +80,15 @@ function formatTaskCurrentProjection(
   return formatAgentTaskCurrentProjection(projection, taskNumber, neutralizeRefs ? renderAgentSearchPreviewText : undefined);
 }
 
+/** Reactions as the envelope carries them: one emoji by one reactor, one by more than are named, and more emoji than are shown. */
+const EXAMPLE_REACTIONS = [
+  { emoji: "✅", count: 1, reactors: [{ name: "tygg", kind: "human" }] },
+  { emoji: "👍", count: 3, reactors: [{ name: "alice", kind: "human" }, { name: "Remy", kind: "agent" }, { name: "bob", kind: "human" }] },
+  { emoji: "🎉", count: 2, reactors: [{ name: "carol", kind: "human" }, { name: "dave", kind: "external" }] },
+  { emoji: "👀", count: 1, reactors: [{ name: "erin", kind: "human" }] },
+  { emoji: "🚀", count: 4 },
+];
+
 export const formatMessageLine = axSurface(
   "One received-message line: header bracket + sender + content + suffixes.",
   (m: MessageLike): string => formatAgentMessageLine(m),
@@ -76,6 +99,7 @@ export const formatMessageLine = axSurface(
       { title: "channel thread", args: [sampleMessageChannelThread] },
       { title: "dm", args: [sampleMessageDm] },
       { title: "dm thread", args: [sampleMessageDmThread] },
+      { title: "with reactions (more than three emoji, more reactors than named)", args: [{ ...sampleMessage, reactions: EXAMPLE_REACTIONS }] },
     ],
   },
 );
@@ -137,13 +161,17 @@ export interface HistoryMessage {
   taskCurrentProjection?: TaskCurrentProjectionLike | null;
   threadId?: string | null;
   replyCount?: number | null;
+  /** RFC 082: a card message (`card=r<revision>` in the header; `content` is its fallback; the card's own text under it). */
+  message_card?: AgentMessageCardMarker | null;
+  /** The message's reactions, one entry per emoji; printed under it (formatAgentMessageReactionsLine). */
+  reactions?: AgentApiMessageReaction[] | null;
   [key: string]: unknown;
 }
 
 // Match the server's `parseChannelRef`: only the LAST colon can introduce a
 // thread suffix, and that suffix must be exactly 8 hex characters. Parent
 // channel/DM names may themselves contain colons, so `[^:]+` is incorrect.
-function isThreadTargetRef(channel: string): boolean {
+export function isThreadTargetRef(channel: string): boolean {
   const prefixLength = channel.startsWith("#")
     ? 1
     : /^dm:@/i.test(channel) ? 4 : -1;
@@ -153,9 +181,17 @@ function isThreadTargetRef(channel: string): boolean {
   return lastColon > 0 && /^[0-9a-f]{8}$/i.test(targetRest.slice(lastColon + 1));
 }
 
+function isAgentEventTarget(channel: string): boolean {
+  return channel.startsWith("agent-event:");
+}
+
 function buildReplyTarget(channel: string, messageId: string | undefined): string | null {
   if (!messageId) return null;
   if (isThreadTargetRef(channel)) return null;
+  // Task v2: a task's conversation has no threads; its messages are replied to with `raft task reply`.
+  if (parseAgentTaskRef(channel)) return null;
+  // One app event has no thread to reply in.
+  if (isAgentEventTarget(channel)) return null;
   return `${channel}:${messageId.slice(0, 8)}`;
 }
 
@@ -172,6 +208,9 @@ function formatHistoryMessageLine(channel: string, m: HistoryMessage, index: num
     `time=${createdAt ? formatUtcTimestamp(createdAt) : "-"}`,
   ];
   if (senderType) headerParts.push(`type=${senderType}`);
+  // RFC 082: a card message is marked here, never in the body (`card=r3 updated=…` once replaced).
+  const cardFields = formatAgentMessageCardHeaderFields(m.message_card).trim();
+  if (cardFields) headerParts.push(cardFields);
   // No `threadId=`: the thread channel's own id is a second address for the
   // same thread, and agents replied to it instead of `replyTarget` (the root
   // message's short id), which the daemon then recorded as a different target
@@ -182,12 +221,18 @@ function formatHistoryMessageLine(channel: string, m: HistoryMessage, index: num
 
   const attachSuffix = formatAttachmentSuffix(m.attachments);
   const assigneeName = m.taskAssigneeName ?? m.task_assignee_name ?? null;
-  const taskSuffix = m.taskStatus
-    ? ` [task #${m.taskNumber} status=${m.taskStatus}${formatTaskAssigneeSuffix(m.taskAssigneeId, assigneeName)}]`
-    : "";
+  // Task v2 (source_tasks present): every task hanging under the message, by ref.
+  const sourceTasks = Array.isArray(m.source_tasks) ? m.source_tasks as AgentMessageSourceTaskLike[] : null;
+  const taskSuffix = sourceTasks?.length
+    ? formatAgentSourceTasksSuffix(sourceTasks, channel)
+    : m.taskStatus
+      ? ` [task #${m.taskNumber} status=${m.taskStatus}${formatTaskAssigneeSuffix(m.taskAssigneeId, assigneeName)}]`
+      : "";
   const senderTimezone = typeof m.senderTimezone === "string" ? m.senderTimezone : typeof m.sender_timezone === "string" ? m.sender_timezone : null;
   const handle = formatSenderHandleText(senderName, senderDescription, senderTimezone);
-  return `[${headerParts.join(" ")}] ${handle}: ${indentAgentBodyContinuationLines(m.content ?? "")}${attachSuffix}${taskSuffix}${formatTaskCurrentProjection(m.taskCurrentProjection)}`;
+  // RFC 082 §4.3: what the card says, under the body (`card:`, then its markdown).
+  const cardBlock = formatAgentMessageCardBlock(m.message_card, m.content);
+  return `[${headerParts.join(" ")}] ${handle}: ${indentAgentBodyContinuationLines(m.content ?? "")}${attachSuffix}${taskSuffix}${cardBlock}${formatTaskCurrentProjection(m.taskCurrentProjection)}${formatAgentMessageReactionsLine(m.reactions)}`;
 }
 
 export interface HistoryData {
@@ -214,25 +259,30 @@ function seqRange(messages: HistoryMessage[]): string {
   return first === last ? String(first) : `${first}-${last}`;
 }
 
-// Exported for the freshness-hold digest: the hold's never-shown line reuses
-// this exact cursor phrasing so agents meet one recovery-command format
-// everywhere. If this string shape changes, the hold line follows for free.
-// `commandTarget` completes the fragment into a runnable command — required
-// outside read output, where no surrounding context supplies the verb
-// (instruction-surface universality: every printed command must execute
-// as-is, without internal knowledge).
-export function historyCursorText(
+// `Older: raft message read --target "#ops" --before 41`: the read that
+// continues the window in one direction (task targets: `raft task read`),
+// with the window size the read asked for.
+function historyCursorLine(
+  channel: string,
   label: "Older" | "Newer",
-  exists: boolean,
   flag: "before" | "after",
   anchor: number | string,
-  commandTarget?: string,
+  limit: number | undefined,
 ): string {
-  if (!exists) return `No ${label.toLowerCase()}.`;
-  const command = commandTarget !== undefined
-    ? `raft message read --target "${commandTarget}" --${flag} ${anchor}`
-    : `--${flag} ${anchor}`;
-  return `${label} exist: ${command}.`;
+  if (typeof anchor !== "number") return `${label} messages exist.`;
+  return `${label}: ${formatHint(RAFT_HINTS.messageRead({ target: channel, [flag]: anchor, limit }))}`;
+}
+
+const TOP_LEVEL_COVERAGE = "Coverage: top-level messages in this target only; thread replies are excluded and must be read from their thread targets.";
+
+/**
+ * What a read of `channel` says it leaves out: the sentence for a top-level
+ * channel or DM, null for a thread, task or app event target (their rows say
+ * what they are). The read prints it once per context (`ax/readCoverage.ts`).
+ */
+export function topLevelCoverageSentence(channel: string): string | null {
+  const isTopLevel = !parseAgentTaskRef(channel) && !isThreadTargetRef(channel) && !isAgentEventTarget(channel);
+  return isTopLevel ? TOP_LEVEL_COVERAGE : null;
 }
 
 export const formatChannelCard = axSurface(
@@ -248,7 +298,7 @@ export const formatChannelCard = axSurface(
 );
 
 export const formatSentChannelCard = axSurface(
-  "Channel card after a sent message: the send named a card version other than the channel's current one (changed since this context saw it, or sent with --anyway before seeing it).",
+  "Channel card after a sent message: the send named a card version other than the channel's current one (changed since this context saw it, or not yet seen: a first send with nothing unread, or one sent with --anyway).",
   (card: ChannelCard, changed: boolean): string => `\n${renderChannelCard(card, { changed }).join("\n")}\n`,
   {
     examples: [
@@ -296,19 +346,35 @@ export const formatSendAttachment = axSurface(
   },
 );
 
+/** When the Server flags a history-limited read without saying why. */
+const HISTORY_LIMITED_FALLBACK = "Message history is limited on this plan.";
+
 export const formatHistory = axSurface(
-  "Read window: header with seq range/cursors, numbered lines, end-of-window footer.",
+  "Read window: numbered lines; an Older:/Newer: line for each direction that has more (and, on a default read, the read for unread messages before the window), nothing when the whole conversation is on screen.",
   (
   channel: string,
   data: HistoryData,
-  opts?: { around?: string; after?: string | number; before?: string | number; unread?: boolean; alreadyShownSeqs?: ReadonlySet<number> },
+  opts?: {
+    around?: string;
+    after?: string | number;
+    before?: string | number;
+    unread?: boolean;
+    alreadyShownSeqs?: ReadonlySet<number>;
+    /** The read's `--limit`, carried into the commands it prints. */
+    limit?: number;
+    /** Leave out the top-level Coverage line: this context was already shown it (`ax/readCoverage.ts`). */
+    omitTopLevelCoverage?: boolean;
+  },
 ): string => {
-  const isThreadTarget = isThreadTargetRef(channel);
-  const coverage = isThreadTarget
-    ? "Coverage: this thread target only."
-    : "Coverage: top-level messages in this target only; thread replies are excluded and must be read from their thread targets.";
+  const coverage = opts?.omitTopLevelCoverage ? null : topLevelCoverageSentence(channel);
   if (opts?.unread) return formatUnreadWindow(channel, data, coverage, opts.alreadyShownSeqs);
-  if (!data.messages || data.messages.length === 0) return (`${coverage}\n\nNo messages in this target.`);
+  if (!data.messages || data.messages.length === 0) {
+    // An empty window on a plan that hides older history says why.
+    const empty = data.historyLimited
+      ? `No messages in this target's history window. ${data.historyLimitMessage || HISTORY_LIMITED_FALLBACK}`
+      : "No messages in this target.";
+    return coverage ? `${coverage}\n\n${empty}` : empty;
+  }
 
   const messages = data.messages;
   const count = messages.length;
@@ -325,26 +391,32 @@ export const formatHistory = axSurface(
     }, index, count))
     .join("\n");
 
-  const headerLines = [
-    `Read window: ${count} returned, seq ${seqRange(messages)}, oldest to newest. ${historyCursorText("Older", hasOlder, "before", minSeq)} ${historyCursorText("Newer", hasNewer, "after", maxSeq)}`,
-    coverage,
-  ];
+  // One line per direction that has more; none when it is all on screen.
+  const limit = opts?.limit;
+  const headerLines: string[] = [];
+  if (hasOlder) headerLines.push(historyCursorLine(channel, "Older", "before", minSeq, limit));
+  // A default read (the latest page) moves the read position past unread
+  // messages older than the window; name the read that shows them.
+  const lastRead = data.last_read_seq ?? 0;
+  if (opts?.after === undefined && opts?.before === undefined && opts?.around === undefined
+    && lastRead > 0 && typeof minSeq === "number" && lastRead < minSeq - 1) {
+    headerLines.push(`Unread before this window: ${formatHint(RAFT_HINTS.messageRead({ target: channel, after: lastRead, limit }))}`);
+  }
+  if (hasNewer) headerLines.push(historyCursorLine(channel, "Newer", "after", maxSeq, limit));
+  if (coverage) headerLines.push(coverage);
   if (opts?.around) {
-    headerLines.push(`Around: ${opts.around}.`);
+    headerLines.push(`Around: ${opts.around}. Your read position did not move. To read new messages and mark them read, use --unread.`);
   }
   if (data.historyLimited) {
-    headerLines.push(data.historyLimitMessage || "Message history is limited on this plan.");
-  }
-  if ((data.last_read_seq ?? 0) > 0 && !opts?.after && !opts?.before && !opts?.around) {
-    headerLines.push(`Server unread cursor before this read: seq ${data.last_read_seq}. Use raft message read --target "${channel}" --after ${data.last_read_seq} to browse newer messages.`);
+    headerLines.push(data.historyLimitMessage || HISTORY_LIMITED_FALLBACK);
   }
 
-  return (`${headerLines.join("\n")}\n\n${formatted}\n\nEnd of window: ${count}/${count} shown.`);
+  return headerLines.length > 0 ? `${headerLines.join("\n")}\n\n${formatted}` : formatted;
 },
   {
     // Window examples cover all four target shapes (@xxchan 8/31); the dm
     // window also shows the replyTarget affordance, which thread windows omit.
-    examples: [{ title: "unread window (--unread), more unread remain", args: ["#general:00000000", { messages: [sampleMessage, { ...sampleMessage, message_id: UUID_B, seq: 1201, content: "second message" }], has_older: true, has_newer: true, last_read_seq: 1199, unread_after_seq: 1199, model_seen_up_to_seq: 1201 }, { unread: true }] }, { title: "unread window (--unread), newest message too recent to mark read", args: ["#general", { messages: [sampleMessage, { ...sampleMessage, message_id: UUID_B, seq: 1201, content: "second message" }], has_older: true, has_newer: false, last_read_seq: 1199, unread_after_seq: 1199, read_through_seq: 1200, model_seen_up_to_seq: 1201 }, { unread: true }] }, { title: "unread window (--unread), a message already shown last time is folded", args: ["#general", { messages: [sampleMessage, { ...sampleMessage, message_id: UUID_B, seq: 1201, content: "second message" }], has_older: true, has_newer: false, last_read_seq: 1199, unread_after_seq: 1199, read_through_seq: 1201, model_seen_up_to_seq: 1201 }, { unread: true, alreadyShownSeqs: new Set([1200]) }] }, { title: "unread window (--unread), nothing unread", args: ["#general", { messages: [], has_older: true, has_newer: false, last_read_seq: 1201, unread_after_seq: 1201 }, { unread: true }] }, { title: "channel window with unread cursor", args: ["#general", { messages: [sampleMessage, { ...sampleMessage, message_id: UUID_B, seq: 1201, content: "second message" }], has_older: true, has_newer: false, last_read_seq: 1200 }] }, { title: "channel thread window (--around anchor)", args: ["#general:00000000", { messages: [sampleMessage], has_older: true, has_newer: true }, { around: "00000000" }] }, { title: "dm window with a threaded reply", args: ["dm:@richard", { messages: [{ ...sampleMessage, content: "hey, can you help?", replyCount: 2 }], has_older: false, has_newer: false }] }, { title: "dm thread window", args: ["dm:@richard:00000000", { messages: [sampleMessage, { ...sampleMessage, message_id: UUID_B, seq: 1201, content: "DM thread reply" }], has_older: false, has_newer: false }] }],
+    examples: [{ title: "unread window (--unread), more unread remain", args: ["#general:00000000", { messages: [sampleMessage, { ...sampleMessage, message_id: UUID_B, seq: 1201, content: "second message" }], has_older: true, has_newer: true, last_read_seq: 1199, unread_after_seq: 1199, model_seen_up_to_seq: 1201 }, { unread: true }] }, { title: "unread window (--unread), newest message too recent to mark read", args: ["#general", { messages: [sampleMessage, { ...sampleMessage, message_id: UUID_B, seq: 1201, content: "second message" }], has_older: true, has_newer: false, last_read_seq: 1199, unread_after_seq: 1199, read_through_seq: 1200, model_seen_up_to_seq: 1201 }, { unread: true }] }, { title: "unread window (--unread), a message already shown last time is folded", args: ["#general", { messages: [sampleMessage, { ...sampleMessage, message_id: UUID_B, seq: 1201, content: "second message" }], has_older: true, has_newer: false, last_read_seq: 1199, unread_after_seq: 1199, read_through_seq: 1201, model_seen_up_to_seq: 1201 }, { unread: true, alreadyShownSeqs: new Set([1200]) }] }, { title: "unread window (--unread), nothing unread", args: ["#general", { messages: [], has_older: true, has_newer: false, last_read_seq: 1201, unread_after_seq: 1201 }, { unread: true }] }, { title: "unread window (--unread), started behind the plan's history window", args: ["#general", { messages: [sampleMessage], has_older: false, has_newer: false, last_read_seq: 900, unread_after_seq: 900, read_through_seq: 1200, model_seen_up_to_seq: 1200, historyLimited: true, historyLimitMessage: "Older messages are hidden: this server is on the Free plan, which keeps the last 30 days. Upgrading to Pro restores the full history." }, { unread: true }] }, { title: "channel window, older messages exist", args: ["#general", { messages: [sampleMessage, { ...sampleMessage, message_id: UUID_B, seq: 1201, content: "second message" }], has_older: true, has_newer: false, last_read_seq: 1200 }] }, { title: "channel window (default read), unread messages before it", args: ["#general", { messages: [sampleMessage, { ...sampleMessage, message_id: UUID_B, seq: 1201, content: "second message" }], has_older: true, has_newer: false, last_read_seq: 1100 }] }, { title: "channel thread window (--around anchor)", args: ["#general:00000000", { messages: [sampleMessage], has_older: true, has_newer: true }, { around: "00000000" }] }, { title: "dm window with a threaded reply", args: ["dm:@richard", { messages: [{ ...sampleMessage, content: "hey, can you help?", replyCount: 2 }], has_older: false, has_newer: false }] }, { title: "a message with reactions (one line under it)", args: ["#general", { messages: [{ ...sampleMessage, reactions: EXAMPLE_REACTIONS.slice(0, 2) }], has_older: false, has_newer: false }] }, { title: "dm thread window", args: ["dm:@richard:00000000", { messages: [sampleMessage, { ...sampleMessage, message_id: UUID_B, seq: 1201, content: "DM thread reply" }], has_older: false, has_newer: false }] }, { title: "a card message (RFC 082): card=r2 in the header, the card's own text under the body", args: ["#builds", { messages: [{ ...sampleMessage, sender_type: "agent", sender_name: "hands", content: "Build 1.19.0 failed", message_card: { revision: 2, updated_at: T, text: "Build 1.19.0 · [Failed]\n\n⚠️ Font file missing: NotoSans_CJK.ttf\n\n`v1.19.0+11900001` · 2026-11-05 09:10:00Z – 2026-11-05 09:12:00Z\n\n[Open build log](https://ci.example.com/builds/42) · Retry (disabled: Builds are paused)" } }], has_older: false, has_newer: false }] }],
   },
 );
 
@@ -356,13 +428,23 @@ export const formatHistory = axSurface(
 function formatUnreadWindow(
   channel: string,
   data: HistoryData,
-  coverage: string,
+  coverage: string | null,
   alreadyShownSeqs: ReadonlySet<number> = new Set(),
 ): string {
   const readThrough = data.unread_after_seq ?? data.last_read_seq ?? 0;
   const messages = data.messages ?? [];
+  // A read that started behind the plan's history window skipped what the
+  // window hides; the server says so (and may offer the upgrade card), and
+  // the note follows the Coverage line as in an ordinary window.
+  const scope = [coverage, data.historyLimited ? data.historyLimitMessage || HISTORY_LIMITED_FALLBACK : null]
+    .filter(Boolean)
+    .join("\n");
+  const scoped = (body: string): string => (scope ? `${scope}\n\n${body}` : body);
   if (messages.length === 0) {
-    return `${coverage}\n\nNo unread messages in ${channel}. You have read through seq ${readThrough}.`;
+    // Not the start: an empty read can still move the position (over what the
+    // history window hides).
+    const readNow = data.read_through_seq ?? readThrough;
+    return scoped(`No unread messages in ${channel}. You have read through seq ${readNow}.`);
   }
   // Messages this agent was already shown (they came back because they were
   // too recent to mark read last time) are folded into one line, so a repeat
@@ -372,18 +454,18 @@ function formatUnreadWindow(
   const newPosition = typeof data.read_through_seq === "number" ? data.read_through_seq : data.model_seen_up_to_seq;
   const shownCount = messages.length - folded.length;
   const movedTo = shownCount > 0 && typeof newPosition === "number" && newPosition > readThrough
-    ? `Read position: seq ${readThrough} → ${newPosition}. To re-read these: raft message read --target "${channel}" --after ${readThrough}`
+    ? `Read position: seq ${readThrough} → ${newPosition}. To re-read these: ${formatHint(RAFT_HINTS.messageRead({ target: channel, after: readThrough }))}`
     : null;
   // The re-read command is printed once: on the read-position line when there
   // is one, otherwise here.
   const foldNote = folded.length > 0
-    ? `${folded.length} message${folded.length === 1 ? "" : "s"} you were already shown (seq ${seqRange(folded)}) ${folded.length === 1 ? "is" : "are"} not repeated.${movedTo ? "" : ` To see ${folded.length === 1 ? "it" : "them"} again: raft message read --target "${channel}" --after ${readThrough}`}`
+    ? `${folded.length} message${folded.length === 1 ? "" : "s"} you were already shown (seq ${seqRange(folded)}) ${folded.length === 1 ? "is" : "are"} not repeated.${movedTo ? "" : ` To see ${folded.length === 1 ? "it" : "them"} again: ${formatHint(RAFT_HINTS.messageRead({ target: channel, after: readThrough }))}`}`
     : null;
   const footer = data.has_newer
-    ? `More unread remain. Next: raft message read --target "${channel}" --unread`
+    ? `More unread remain. Next: ${formatHint(RAFT_HINTS.messageRead({ target: channel, unread: true }))}`
     : null;
   if (shown.length === 0) {
-    return `${coverage}\n\nNo new unread messages in ${channel}. ${foldNote}${footer ? `\n${footer}` : ""}`;
+    return scoped(`No new unread messages in ${channel}. ${foldNote}${footer ? `\n${footer}` : ""}`);
   }
   const count = shown.length;
   const formatted = shown
@@ -394,16 +476,19 @@ function formatUnreadWindow(
     }, index, count))
     .join("\n");
   const header = `Unread window: ${count} returned, seq ${seqRange(shown)}, oldest to newest, starting after your read position (seq ${readThrough}).`;
-  // Rows newer than the read position were too recent to mark read (seq order
-  // is not commit order); say so, or the agent reads them as new next time.
+  // Rows newer than the read position were too recent to mark read now (seq
+  // order is not commit order). The Server marks them read a few seconds
+  // later, unless an older message committed late (readPositionSettle.ts);
+  // only then, or when the next read comes within those seconds, do they come
+  // back, folded into one line. Say that, not that they always come back.
   const unsettled = typeof newPosition === "number"
     ? shown.filter((m) => typeof m.seq === "number" && m.seq > newPosition).length
     : 0;
   const settleNote = unsettled > 0
-    ? `${unsettled} newest message${unsettled === 1 ? " is" : "s are"} too recent to mark read; ${unsettled === 1 ? "it" : "they"} will come back on your next --unread, folded into one line.`
+    ? `${unsettled} newest message${unsettled === 1 ? " was" : "s were"} too recent to mark read at once; ${unsettled === 1 ? "it" : "they"} should be marked read in a few seconds. If your next --unread shows ${unsettled === 1 ? "it" : "them"} again, ${unsettled === 1 ? "it is" : "they are"} folded into one line: nothing new.`
     : null;
   const end = footer ?? (unsettled > 0 ? null : "No more unread in this target.");
-  return `${header}\n${coverage}\n\n${[foldNote, formatted].filter(Boolean).join("\n")}\n\n${[movedTo, settleNote, end].filter(Boolean).join("\n")}`;
+  return `${[header, scope].filter(Boolean).join("\n")}\n\n${[foldNote, formatted].filter(Boolean).join("\n")}\n\n${[movedTo, settleNote, end].filter(Boolean).join("\n")}`;
 }
 
 // --- Search result rendering (agent-facing AX readout) ---
@@ -490,5 +575,77 @@ export const formatDraftReplacedSuccess = axSurface(
     `Replaced an unsent draft. ${replacedDraftRecoveryLine(recoveryFilePath)}`,
   {
     examples: [{ args: ["/home/agent/replaced-drafts/draft.txt"] }],
+  },
+);
+
+/** What a held `message send` continuation ended with, as `cont` reports it (message/_sendContinuation.ts). */
+export type SendContinuationOutcome =
+  | { status: "sent" | "committed"; target: string; messageId: string | null }
+  | { status: "not_sent" };
+
+export const formatSendContinuationOutcome = axSurface(
+  "How a held `message send` continuation (the pilot) ended: not sent, or sent with its message id when its full receipt was printed in an earlier call (a retry of the same answer); nothing more when this call printed the receipt.",
+  (outcome: SendContinuationOutcome, shown: { printedAbove: boolean }): string => {
+    if (outcome.status === "not_sent") return "Not sent.\n";
+    if (shown.printedAbove) return "";
+    const id = outcome.messageId ? ` Message ID: ${outcome.messageId}` : "";
+    return outcome.status === "committed"
+      ? `Message commit confirmed for ${outcome.target}.${id}\n`
+      : `Message sent to ${outcome.target}.${id}\n`;
+  },
+  {
+    examples: [
+      { title: "the agent chose not to send", args: [{ status: "not_sent" }, { printedAbove: false }] },
+      { title: "a retry of the answer that sent it", args: [{ status: "sent", target: "#ops", messageId: UUID_A }, { printedAbove: false }] },
+    ],
+  },
+);
+
+// --- Card messages (RFC 082): `message send --card` and `message update-card` ---
+
+export const formatMessageCardSentHint = axSurface(
+  "After `message send --card` is sent and the receipt says its card was stored (`messageCard`): how to replace the card later (from the revision stored now), and that doing so notifies no one.",
+  (messageId: string, revision: number = 1): string =>
+    `To update this card later (up to ${MESSAGE_CARD_LIMITS.updateWindowDays} days; notifies no one): raft message update-card --message-id ${messageId.slice(0, 8)} --card <file> --expected-revision ${revision}`,
+  {
+    examples: [
+      { title: "a new card message", args: [UUID_A] },
+      { title: "a replay (same key) after the card was updated", args: [UUID_A, 3] },
+    ],
+  },
+);
+
+export const formatMessageCardNotStored = axSurface(
+  "After `message send --card` is sent but the receipt has no `messageCard`: the text was sent and no card was stored (a Server older than card messages ignores the card). Part of the success output, not an error.",
+  (): string => AGENT_MESSAGE_CARD_NOT_STORED_NOTICE,
+  {
+    examples: [{ args: [] }],
+  },
+);
+
+export const formatCardStdinDeadlineDiagnostic = axSurface(
+  "`message send --card` / `message update-card` stderr diagnostic: no text arrived on stdin in time, so Raft derives the card's text.",
+  (action: "sent" | "updated", observationWindowMs: number = SEND_DRAFT_STDIN_OBSERVATION_MS): string =>
+    `No text arrived on stdin within ${observationWindowMs}ms; the card is ${action} with the text Raft derives from it.`,
+  {
+    examples: [{ title: "a card send", args: ["sent"] }, { title: "a card update", args: ["updated"] }],
+  },
+);
+
+export const formatMessageCardUpdated = axSurface(
+  "`message update-card` succeeded: the card's new revision, and that nobody was notified (naming each @mention of the new text). Also the retry rule's answer when an earlier run already made the same change.",
+  (input: AgentMessageCardUpdatedText): string => formatAgentMessageCardUpdated(input),
+  {
+    examples: [
+      { title: "updated", args: [{ messageId: UUID_A, revision: 3, notice: "Updating notifies no one. To tell someone, send a new message." }] },
+      {
+        title: "an @mention in the new text",
+        args: [{ messageId: UUID_A, revision: 2, notice: "Updating notifies no one. @alice in the new text was not notified; to tell them, send a new message." }],
+      },
+      {
+        title: "an earlier run already made this change (retry after a lost answer)",
+        args: [{ messageId: UUID_A, revision: 4, notice: "Updating notifies no one. To tell someone, send a new message.", alreadyApplied: true }],
+      },
+    ],
   },
 );

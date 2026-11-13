@@ -35,7 +35,7 @@ class FakeDriver implements RuntimeDriver {
   readonly id = "claude";
   readonly lifecycle = { kind: "persistent", stdin: "direct", inFlightWake: "steer" } as const;
   readonly communication = { chat: "slock_cli", runtimeControl: "none" } as const;
-  readonly session = { recovery: "resume_or_fresh" } as const;
+  readonly session = { recovery: "resume_or_fresh", compaction: "reported", compactionFailure: "does_not_stick" } as const;
   readonly model = { detectedModelsVerifiedAs: "launchable" } as const;
   readonly supportsStdinNotification = true;
   readonly busyDeliveryMode = "direct" as const;
@@ -183,17 +183,32 @@ describe("A: getSessionTranscript returns a typed content kind", () => {
     });
   });
 
-  test("A4 kimi-sdk session directory → native_state_file (the runtime's state file, not called a conversation transcript)", async () => {
+  test("A4 legacy kimi CLI session directory → native_state_file (the runtime's state file, not called a conversation transcript)", async () => {
     await withManager(async ({ manager, homeDir }) => {
       const agentId = "d2bf1e2c-3648-4590-a0e2-46c6998b2c38";
       const sessionId = "kimi-s1";
       const sessionDir = path.join(homeDir, ".kimi", "sessions", `wd_${agentId}_abc`, `session_${sessionId}`);
       await mkdir(sessionDir, { recursive: true });
       await writeFile(path.join(sessionDir, "state.json"), '{"state":1}');
-      await manager.startAgent(agentId, makeConfig({ runtime: "kimi-sdk", sessionId }));
+      await manager.startAgent(agentId, makeConfig({ runtime: "kimi", sessionId }));
       const result = await manager.getSessionTranscript(agentId) as any;
       assert.equal(result.transcriptContent, "native_state_file");
       assert.equal(result.sourceBytes, Buffer.byteLength('{"state":1}'));
+    });
+  });
+
+  test("A4b kimi-sdk session → its main agent's wire.jsonl, a conversation (native_session_file), never state.json", async () => {
+    await withManager(async ({ manager, homeDir }) => {
+      const kimiHome = path.join(homeDir, "kimi-code-home");
+      const sessionId = "session_kimi-s1";
+      const sessionDir = path.join(kimiHome, "sessions", "wk_1", sessionId);
+      await mkdir(path.join(sessionDir, "agents", "main"), { recursive: true });
+      await writeFile(path.join(sessionDir, "state.json"), '{"state":1}');
+      await writeFile(path.join(sessionDir, "agents", "main", "wire.jsonl"), '{"type":"context.append_message"}\n');
+      await manager.startAgent("agent-1", makeConfig({ runtime: "kimi-sdk", sessionId, envVars: { KIMI_CODE_HOME: kimiHome } }));
+      const result = await manager.getSessionTranscript("agent-1") as any;
+      assert.equal(result.transcriptContent, "native_session_file");
+      assert.equal(result.transcript, '{"type":"context.append_message"}\n');
     });
   });
 
@@ -296,7 +311,7 @@ describe("B: reason codes are observations, not conclusions", () => {
     });
   });
 
-  test("B5b a resolved native path outside the allowed roots (kimi index pointing elsewhere) → path_rejected", async () => {
+  test("B5b a resolved native path outside the allowed roots (legacy kimi index pointing elsewhere) → path_rejected", async () => {
     await withManager(async ({ manager, homeDir }) => {
       const agentId = "d2bf1e2c-3648-4590-a0e2-46c6998b2c38";
       const sessionDir = path.join(homeDir, "elsewhere", "session_k");
@@ -304,7 +319,7 @@ describe("B: reason codes are observations, not conclusions", () => {
       await writeFile(path.join(sessionDir, "state.json"), '{"escaped":true}');
       await mkdir(path.join(homeDir, ".kimi"), { recursive: true });
       await writeFile(path.join(homeDir, ".kimi", "session_index.jsonl"), `${JSON.stringify({ sessionId: "k", sessionDir })}\n`);
-      await manager.startAgent(agentId, makeConfig({ runtime: "kimi-sdk", sessionId: "k" }));
+      await manager.startAgent(agentId, makeConfig({ runtime: "kimi", sessionId: "k" }));
       const result = await manager.getSessionTranscript(agentId) as any;
       assert.equal(result.reasonCode, "path_rejected");
       assert.equal(result.transcript, null);
@@ -373,6 +388,31 @@ describe("A/B via collectFeedbackTranscript", () => {
       await writeClaudeSession(homeDir, "hit", content);
       await manager.startAgent("agent-1", makeConfig({ sessionId: "hit" }));
       const result = await manager.collectFeedbackTranscript("agent-1", "report-1", WINDOW, { requestId: "req-1" } as any) as any;
+      const transcript = log.attestations.find((m) => m.feedbackAttachmentKind === undefined);
+      assert.ok(transcript, "transcript attestation requested");
+      assert.equal(transcript.feedbackTranscriptContent, "native_session_file");
+      assert.equal(transcript.feedbackTranscriptSourceBytes, Buffer.byteLength(content));
+      assert.equal(transcript.feedbackTranscriptBytes, Buffer.byteLength(content));
+      assert.equal(transcript.feedbackTranscriptRequestId, "req-1");
+      assert.equal(result.upload.status, "stored");
+      assert.equal(result.upload.uploadId, "upload-1");
+      assert.equal(result.upload.contentLabel, "signed");
+      assert.equal(result.lookup.content, "native_session_file");
+    }, { workerUrl: "https://worker.test", fetchImpl });
+  });
+
+  test("a report about an agent this daemon holds nothing for is stored with the request's session lookup (after a restart, or the agent's failure)", async () => {
+    const { fetchImpl, log } = recordingFetch();
+    await withManager(async ({ manager, homeDir }) => {
+      const content = '{"type":"user","timestamp":"2026-10-04T07:59:00.000Z"}\n';
+      await writeClaudeSession(homeDir, "hit", content);
+      // Never started here: without the lookup this is no_config_in_memory.
+      const without = await manager.collectFeedbackTranscript("agent-1", "report-0", WINDOW, { requestId: "req-0" } as any) as any;
+      assert.equal(without.lookup.reasonCode, "no_config_in_memory");
+      const result = await manager.collectFeedbackTranscript("agent-1", "report-1", WINDOW, {
+        requestId: "req-1",
+        serverLookup: { runtime: "claude", model: "sonnet", sessionHomeEnv: null, sessionId: "hit" },
+      } as any) as any;
       const transcript = log.attestations.find((m) => m.feedbackAttachmentKind === undefined);
       assert.ok(transcript, "transcript attestation requested");
       assert.equal(transcript.feedbackTranscriptContent, "native_session_file");

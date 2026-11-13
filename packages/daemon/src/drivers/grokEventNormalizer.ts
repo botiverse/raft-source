@@ -1,3 +1,4 @@
+import { SendIntentArgumentScanner } from "./sendIntentScanner";
 import type { ParsedEvent, RuntimeTurnAttribution } from "./types";
 
 export type GrokJsonRpcId = number | string;
@@ -122,6 +123,8 @@ export class GrokEventNormalizer {
   private completedAutonomousSuccessorPromptIds = new Set<string>();
   private toolCalls = new Map<string, ToolState>();
   private toolCallIdsByIndex = new Map<number, string>();
+  /** Agent typing line: `raft message send` targets in streaming shell arguments. */
+  private readonly sendIntentScanner = new SendIntentArgumentScanner();
 
   reset(): void {
     this.sessionIdValue = null;
@@ -134,6 +137,7 @@ export class GrokEventNormalizer {
     this.completedAutonomousSuccessorPromptIds.clear();
     this.toolCalls.clear();
     this.toolCallIdsByIndex.clear();
+    this.sendIntentScanner.reset();
   }
 
   get sessionId(): string | null {
@@ -153,6 +157,7 @@ export class GrokEventNormalizer {
     this.activeTurnGeneration = this.nextTurnGeneration;
     this.toolCalls.clear();
     this.toolCallIdsByIndex.clear();
+    this.sendIntentScanner.reset();
     return this.nextTurnGeneration;
   }
 
@@ -220,6 +225,12 @@ export class GrokEventNormalizer {
             existing.arguments += update.arguments_delta;
           }
           this.toolCalls.set(toolCallId, existing);
+          const sendIntent = this.sendIntentScanner.append(
+            toolCallId,
+            toolName(update, "") || undefined,
+            typeof update.arguments_delta === "string" ? update.arguments_delta : undefined,
+          );
+          if (sendIntent) return [internalProgress(updateKind, update), sendIntent];
         }
         return [internalProgress(updateKind, update)];
       }

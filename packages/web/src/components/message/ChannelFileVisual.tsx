@@ -15,13 +15,20 @@ export function ChannelFileVisual({
   file,
   canPreview,
   icon: Icon,
+  compact = false,
 }: {
   file: ChannelFileEntry;
   canPreview: boolean;
   icon: ReturnType<typeof fileTypeIcon>;
+  /** The 20px leading block of a compact row: the type icon, or a 20px
+   *  thumbnail for an image; the name already carries the extension. */
+  compact?: boolean;
 }) {
   const [fallbackUrl, setFallbackUrl] = useState<string | null>(null);
-  const src = file.thumbnailUrl || fallbackUrl;
+  // An inline source that failed to load shows the type icon, not a broken image.
+  const [failedSrc, setFailedSrc] = useState<string | null>(null);
+  const candidateSrc = file.thumbnailUrl || fallbackUrl;
+  const src = candidateSrc && candidateSrc !== failedSrc ? candidateSrc : null;
 
   // Async-loader pattern: when `file.id` or `canPreview` changes, reset the
   // fallback URL and (if the file lacks a `thumbnailUrl`) async-fetch a
@@ -51,6 +58,24 @@ export function ChannelFileVisual({
     };
   }, [canPreview, file.id, file.thumbnailUrl]);
 
+  if (compact) {
+    return (
+      <span data-row-mark className="flex size-5 shrink-0 items-center justify-center overflow-hidden rounded-[4px] text-foreground-hint" data-testid="channel-file-compact-visual">
+        {canPreview && src ? (
+          <img
+            src={src}
+            alt=""
+            className={`block size-full border border-line-hairline object-cover ${imageGalleryBackgroundClass} rounded-[4px]`}
+            loading="lazy"
+            onError={() => setFailedSrc(src)}
+          />
+        ) : (
+          <Icon size={16} aria-hidden="true" />
+        )}
+      </span>
+    );
+  }
+
   return (
     <span className="relative flex size-14 shrink-0 items-center justify-center overflow-hidden rounded-control border border-line-hairline bg-fill-muted text-foreground-muted">
       {canPreview && src ? (
@@ -59,6 +84,7 @@ export function ChannelFileVisual({
           alt=""
           className={`block h-full w-full ${imageFitClass(file)} ${imageGalleryBackgroundClass}`}
           loading="lazy"
+          onError={() => setFailedSrc(src)}
         />
       ) : (
         <Icon size={18} />

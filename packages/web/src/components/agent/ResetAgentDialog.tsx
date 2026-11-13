@@ -71,7 +71,7 @@ export default function ResetAgentDialog({
       maxWidthClass="max-w-md"
       plainMessage
       message={(
-        <div className="space-y-3">
+        <div className="stack-y-3">
           {/* Standard rui RadioGroup. These were three hand-rolled <button>s
               carrying their own border/tint/hover rules, which is why they read
               as heavy panels (@Artea, task #660). The group

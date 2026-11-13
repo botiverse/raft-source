@@ -7,6 +7,7 @@ SELECT 'rw_inbox_normal_v4 vs rw_inbox_normal_v5' AS pair,
   (SELECT COUNT(*) FROM (SELECT * FROM rw_inbox_normal_v4 EXCEPT SELECT * FROM rw_inbox_normal_v5) AS d) AS only_old,
   (SELECT COUNT(*) FROM (SELECT * FROM rw_inbox_normal_v5 EXCEPT SELECT * FROM rw_inbox_normal_v4) AS d) AS only_new;
 
+-- Skip where rw_inbox_muted_full_v2 does not exist.
 SELECT 'rw_inbox_muted_full_v1 vs rw_inbox_muted_full_v2' AS pair,
   (SELECT COUNT(*) FROM (SELECT * FROM rw_inbox_muted_full_v1 EXCEPT SELECT * FROM rw_inbox_muted_full_v2) AS d) AS only_old,
   (SELECT COUNT(*) FROM (SELECT * FROM rw_inbox_muted_full_v2 EXCEPT SELECT * FROM rw_inbox_muted_full_v1) AS d) AS only_new;
@@ -31,6 +32,7 @@ SELECT 'rw_agent_inbox_v5 vs rw_agent_inbox_v6' AS pair,
   (SELECT COUNT(*) FROM (SELECT * FROM rw_agent_inbox_v5 EXCEPT SELECT * FROM rw_agent_inbox_v6) AS d) AS only_old,
   (SELECT COUNT(*) FROM (SELECT * FROM rw_agent_inbox_v6 EXCEPT SELECT * FROM rw_agent_inbox_v5) AS d) AS only_new;
 
+-- Skip where rw_conversation_unread_v3 is not built.
 SELECT 'rw_conversation_unread_v2 vs rw_conversation_unread_v3' AS pair,
   (SELECT COUNT(*) FROM (SELECT * FROM rw_conversation_unread_v2 EXCEPT SELECT * FROM rw_conversation_unread_v3) AS d) AS only_old,
   (SELECT COUNT(*) FROM (SELECT * FROM rw_conversation_unread_v3 EXCEPT SELECT * FROM rw_conversation_unread_v2) AS d) AS only_new;

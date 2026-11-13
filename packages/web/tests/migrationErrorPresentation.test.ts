@@ -27,7 +27,7 @@ test("bundle-too-large wire payload becomes human copy with an action", () => {
 
   assert.equal(
     presentation.message,
-    "The workspace is too large to move: compressed, it is over the 3 GiB limit. Largest items (before compression): .git/ (2 GiB), archive.tar (1 GiB), media/ (0.5 GiB). Ask the agent to delete large files it no longer needs, or to list them in .raftmigrateignore, then try again.",
+    "The workspace is too large to move: it is over the 3 GiB migration limit. Largest items (before compression): .git/ (2 GiB), archive.tar (1 GiB), media/ (0.5 GiB). Ask the agent to delete large files it no longer needs, or to list them in .raftmigrateignore, then try again.",
   );
   assert.equal(presentation.technicalCode, "MIGRATION_OBJECT_STORE_BUNDLE_TOO_LARGE");
   assert.doesNotMatch(presentation.message, /[A-Z][A-Z0-9_]+:.*=/);
@@ -42,7 +42,7 @@ test("legacy bundle-too-large payload without accounting keeps an honest fallbac
 
   assert.equal(
     presentation.message,
-    "The workspace is too large to move: compressed, it is over the 3 GiB limit. Ask the agent to delete large files it no longer needs, or to list them in .raftmigrateignore, then try again.",
+    "The workspace is too large to move: it is over the 3 GiB migration limit. Ask the agent to delete large files it no longer needs, or to list them in .raftmigrateignore, then try again.",
   );
   assert.doesNotMatch(presentation.message, /Largest items/);
 });

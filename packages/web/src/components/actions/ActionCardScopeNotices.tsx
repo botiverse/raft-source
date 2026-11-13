@@ -1,5 +1,5 @@
-// Raft's notes on where an agent-inbound app may send. They are notices, so the
-// card renders them first, above the properties (cindyz 2026-10-15).
+// Raft's notes on where an agent-inbound app may send, as notices. A spec's
+// ScopeList draws them just before its scope list (ActionCardSpecRenderer).
 
 import { useIntl } from "react-intl";
 import { MessageActionCardNotice } from "@botiverse/raft-ui";

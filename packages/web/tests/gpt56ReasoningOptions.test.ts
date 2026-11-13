@@ -75,3 +75,24 @@ test("non-gating models fall back to the BASE set — max/ultra must NOT leak (t
   assert.equal(reconcileReasoningEffort("claude", "sonnet", "high"), "high");
   assert.equal(reconcileReasoningEffort("claude", "sonnet", null), null);
 });
+
+test("a live Codex model that declares minimal does not get Pi's Minimal (#9775)", () => {
+  const live = [{ id: "gpt-live", label: "GPT Live", supportedReasoningEfforts: ["minimal", "low", "medium", "high"] }];
+  assert.deepEqual(reasoningEffortOptionsForModel("codex", "gpt-live", live as never).map((o) => o.value), ["low", "medium", "high"]);
+  assert.ok(reasoningEffortOptionsForModel("pi", "default").some((o) => o.value === "minimal"), "Pi still offers it");
+});
+
+test("Antigravity offers an effort only for a model whose levels the Computer listed", () => {
+  const live = [
+    { id: "gemini-3.8-flash", label: "Gemini 3.8 Flash", supportedReasoningEfforts: ["low", "medium", "high"], defaultReasoningEffort: "medium" },
+    { id: "gemini-4-carbon-medium", label: "Gemini 4 Carbon (Medium)" },
+  ];
+  assert.deepEqual(reasoningEffortOptionsForModel("antigravity", "gemini-3.8-flash", live).map((option) => option.value), ["low", "medium", "high"]);
+  assert.deepEqual(reasoningEffortOptionsForModel("antigravity", "gemini-4-carbon-medium", live), []);
+  assert.deepEqual(reasoningEffortOptionsForModel("antigravity", "default", live), []);
+  // Moving to a model with no listed levels drops a chosen effort to Default.
+  assert.equal(reconcileReasoningEffort("antigravity", "gemini-4-carbon-medium", "high", live), null);
+  assert.equal(reconcileReasoningEffort("antigravity", "gemini-3.8-flash", null, live), "medium");
+  // Other runtimes keep the base set for an undeclared model.
+  assert.equal(reconcileReasoningEffort("claude", "claude-unlisted", "high", []), "high");
+});

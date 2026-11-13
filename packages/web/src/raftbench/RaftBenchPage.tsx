@@ -6,12 +6,12 @@ import {
   useRef,
   useState,
 } from "react";
-import { Activity, BarChart3, Sparkles } from "lucide-react";
+import { BenchIcon } from "./BenchIcon";
 import PanelHeader from "../components/ui/PanelHeader";
 import type { ChangeEvent, MouseEvent } from "react";
 import { useIntl } from "react-intl";
 import { useNavigate } from "react-router-dom";
-import { useAppNavigate } from "../hooks/useAppNavigate";
+import { useAppNavigate, useMobileBack } from "../hooks/useAppNavigate";
 import {
   Badge,
   Panel,
@@ -27,6 +27,7 @@ import {
   SelectList,
   SelectTrigger,
   SelectValue,
+  ScrollArea,
   Separator,
   Status,
   Textarea,
@@ -133,31 +134,9 @@ export default function RaftBenchPage() {
     };
   }, [server]);
   if (!canUseRaftBench(server?.role))
-    return (
-      <main className="min-h-0 flex-1 overflow-auto bg-layer-canvas p-6 text-foreground">
-        <Card className={PANEL}>
-          <h1 className="text-title">
-            {t({ id: "raftbench.adminOnly" })}
-          </h1>
-          <p className="mt-2 text-callout text-foreground-muted">
-            {t({ id: "raftbench.adminOnlyHelp" })}
-          </p>
-        </Card>
-      </main>
-    );
+    return <RaftBenchGate title={t({ id: "raftbench.adminOnly" })} help={t({ id: "raftbench.adminOnlyHelp" })} />;
   if (!enabled)
-    return (
-      <main className="min-h-0 flex-1 overflow-auto bg-layer-canvas p-6 text-foreground">
-        <Card className={PANEL}>
-          <h1 className="text-title">
-            {t({ id: "raftbench.notEnabled" })}
-          </h1>
-          <p className="mt-2 text-callout text-foreground-muted">
-            {t({ id: "raftbench.notEnabledHelp" })}
-          </p>
-        </Card>
-      </main>
-    );
+    return <RaftBenchGate title={t({ id: "raftbench.notEnabled" })} help={t({ id: "raftbench.notEnabledHelp" })} />;
   return (
     <RaftBenchAdminPage
       key={flagScope}
@@ -165,6 +144,37 @@ export default function RaftBenchPage() {
     />
   );
 }
+
+/** The page in front of RaftBench when it is not open to this person or not
+ *  enabled. On a phone it is a pushed page like any other, so it has Back
+ *  (Raft DS › Navigation: a gate page is no dead end). Wider screens keep the
+ *  bare card. */
+function RaftBenchGate({ title, help }: { title: string; help: string }) {
+  const { formatMessage: t } = useIntl();
+  const slug = useServerStore((s) => s.current?.slug);
+  const back = useMobileBack(slug ? `/s/${slug}/settings` : "/");
+  const backProps = useMemo(
+    () => ({ "aria-label": t({ id: "raftbench.back" }), "data-testid": "raftbench-gate-back" }),
+    [t],
+  );
+  return (
+    <main className="flex min-h-0 flex-1 flex-col bg-layer-canvas text-foreground">
+      <PanelHeader
+        title={t({ id: "raftbench.nav" })}
+        onMobileBack={back}
+        mobileBackProps={backProps}
+        containerProps={GATE_HEADER_PROPS}
+      />
+      <ScrollArea role="region" aria-label={t({ id: "raftbench.nav" })} className="min-h-0 flex-1" contentClassName="p-6">
+        <Card className={PANEL}>
+          <h1 className="text-title">{title}</h1>
+          <p className="mt-2 text-callout text-foreground-muted">{help}</p>
+        </Card>
+      </ScrollArea>
+    </main>
+  );
+}
+const GATE_HEADER_PROPS = { className: "md:hidden" };
 
 function RaftBenchAdminPage({ analysisAllowed }: { analysisAllowed: boolean }) {
   const { formatMessage: t, formatDate, formatTime } = useIntl();
@@ -439,12 +449,13 @@ function RaftBenchAdminPage({ analysisAllowed }: { analysisAllowed: boolean }) {
     <Panel edge="inset" className="flex min-h-0 min-w-0 flex-1 flex-col bg-layer-canvas text-foreground" data-testid="raftbench-page">
       <PanelHeader
         title={t({ id: "raftbench.nav" })}
-        icon={<Activity size={18} />}
+        icon={<BenchIcon width={18} height={18} />}
         onMobileBack={backToWorkspace}
         mobileBackProps={mobileBackProps}
       />
-      <div className="min-h-0 flex-1 overflow-y-auto bg-layer-canvas px-5 py-4 mobile-nav-clearance">
-      <div className="mx-auto max-w-7xl space-y-4 md:space-y-5">
+      {/* The page and its two inner lists scroll in raft-ui ScrollAreas; the lists hand a scroll past their end on to the page. */}
+      <ScrollArea role="region" aria-label={t({ id: "raftbench.nav" })} className="min-h-0 flex-1 bg-layer-canvas" contentClassName="px-5 py-4 mobile-nav-clearance">
+      <div className="mx-auto max-w-7xl stack-y-4 md:stack-y-5">
         {!analysisAllowed && <Card role="status" className={`${WARNING_PANEL} text-callout`}>
           {t({ id: "raftbench.flagUncertain" })}
         </Card>}
@@ -452,16 +463,6 @@ function RaftBenchAdminPage({ analysisAllowed }: { analysisAllowed: boolean }) {
           <h1 className="text-title md:text-display">{t({ id: "raftbench.title" })}</h1>
           <p className="mt-2 text-callout text-foreground-muted">{t({ id: "raftbench.subtitle" })}</p>
         </header>
-        <nav className="grid gap-3 sm:grid-cols-2" aria-label={t({ id: "raftbench.sections" })}>
-          <a href="#raftbench-metrics" className="flex items-center gap-3 rounded-container bg-info-soft p-3 text-foreground hover:underline">
-            <BarChart3 aria-hidden="true" size={22} className="shrink-0" />
-            <span><strong className="block text-callout">{t({ id: "raftbench.managerTitle" })}</strong><span className="text-caption">{t({ id: "raftbench.metricsCue" })}</span></span>
-          </a>
-          <a href="#raftbench-ai" className="flex items-center gap-3 rounded-container bg-success-soft p-3 text-foreground hover:underline">
-            <Sparkles aria-hidden="true" size={22} className="shrink-0" />
-            <span><strong className="block text-callout">{t({ id: "raftbench.aiTitle" })}</strong><span className="text-caption">{t({ id: "raftbench.aiCue" })}</span></span>
-          </a>
-        </nav>
         <Card className={PANEL}>
           <div className="flex flex-wrap items-end gap-4">
             <div className="w-full min-w-0 sm:w-auto sm:min-w-60 sm:flex-1">
@@ -498,19 +499,20 @@ function RaftBenchAdminPage({ analysisAllowed }: { analysisAllowed: boolean }) {
 
           </div>
         </Card>
-        <section id="raftbench-metrics" aria-label={t({ id: "raftbench.managerTitle" })}>
-          <ManagerOverview key={managerScopeKey} channelId={channelId === WORKSPACE_SCOPE ? null : channelId} />
-        </section>
         <section id="raftbench-ai" aria-label={t({ id: "raftbench.aiTitle" })}>
-          <HostedAnalysis allowed={analysisAllowed} options={options} onEnabled={setConsented} />
+          <HostedAnalysis key={managerScopeKey} channelId={channelId === WORKSPACE_SCOPE ? null : channelId} allowed={analysisAllowed} options={options} onEnabled={setConsented} />
         </section>
-        <details className="space-y-4" data-testid="raftbench-legacy-rules">
+        <details id="raftbench-metrics" className="stack-y-3" aria-label={t({ id: "raftbench.managerTitle" })}>
+          <summary className="cursor-pointer rounded-container border border-line-hairline p-3 text-callout font-semibold">{t({ id: "raftbench.managerTitle" })}</summary>
+          <ManagerOverview key={managerScopeKey} channelId={channelId === WORKSPACE_SCOPE ? null : channelId} />
+        </details>
+        <details className="stack-y-4" data-testid="raftbench-legacy-rules">
           <summary className="cursor-pointer rounded-container border border-line-hairline p-3 text-callout font-semibold">{t({ id: "raftbench.ruleCuesTitle" })}</summary>
-          <div className="space-y-4">
+          <div className="stack-y-4">
         <Card className={PANEL}>
           <p className="mb-3 text-caption text-foreground-hint">{t({ id: "raftbench.ruleCuesHelp" })}</p>
           <div className="flex flex-wrap items-center gap-3">
-            <Button size="sm"
+            <Button size="md"
               className="flex-1 sm:flex-none"
               onClick={startAnalysis}
               disabled={!consented || !analysisAllowed || !channelId || !options.length || loading}
@@ -573,7 +575,7 @@ function RaftBenchAdminPage({ analysisAllowed }: { analysisAllowed: boolean }) {
                 <summary className="cursor-pointer py-1 text-footnote font-semibold text-foreground">
                   {t({ id: "raftbench.coverageDetails" })}
                 </summary>
-                <div className="mt-3 space-y-2">
+                <div className="mt-3 stack-y-2">
               <p className="font-semibold text-foreground">
                 {channelName} ·{" "}
                 {t(
@@ -637,12 +639,12 @@ function RaftBenchAdminPage({ analysisAllowed }: { analysisAllowed: boolean }) {
                 </div>
               </details>
             </Card>
-            <Card className={`${PANEL} space-y-3`}>
+            <Card className={`${PANEL} stack-y-3`}>
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <h2 className="text-headline">
                   {t({ id: "raftbench.channels" })}
                 </h2>
-                <Button size="sm" variant="ghost" onClick={clearDrill}>
+                <Button size="md" variant="ghost" onClick={clearDrill}>
                   {t({ id: "raftbench.allChannels" })}
                 </Button>
               </div>
@@ -651,7 +653,7 @@ function RaftBenchAdminPage({ analysisAllowed }: { analysisAllowed: boolean }) {
                   <Button
                     key={channel.channelId}
                     variant="outline"
-                    size="sm"
+                    size="md"
                     className={drillChannelId === channel.channelId ? SELECTED_CLASS : undefined}
                     aria-pressed={drillChannelId === channel.channelId}
                     data-channel={channel.channelId}
@@ -673,7 +675,7 @@ function RaftBenchAdminPage({ analysisAllowed }: { analysisAllowed: boolean }) {
               </div>
             </Card>
             <div className="grid items-start gap-4 lg:grid-cols-2">
-              <Card className={`${PANEL} space-y-4`}>
+              <Card className={`${PANEL} stack-y-4`}>
                 <h2 className="text-headline">
                   {t({ id: "raftbench.queue" })}
                 </h2>
@@ -683,7 +685,7 @@ function RaftBenchAdminPage({ analysisAllowed }: { analysisAllowed: boolean }) {
                   ).map((kind) => (
                     <Button
                       key={kind}
-                      size="sm"
+                      size="md"
                       variant="outline"
                       className={filter === kind ? SELECTED_CLASS : undefined}
                       aria-pressed={filter === kind}
@@ -717,7 +719,7 @@ function RaftBenchAdminPage({ analysisAllowed }: { analysisAllowed: boolean }) {
                     { count: findings.length },
                   )}
                 </p>
-                <div className="max-h-64 space-y-2 overflow-auto lg:max-h-[32rem]">
+                <ScrollArea tabIndex={-1} overscroll="auto" className="max-h-64 lg:max-h-[32rem]" contentClassName="stack-y-2">
                   {findings.map((f) => (
                     <Button
                       key={f.id}
@@ -747,14 +749,14 @@ function RaftBenchAdminPage({ analysisAllowed }: { analysisAllowed: boolean }) {
                       </span>
                     </Button>
                   ))}
-                </div>
+                </ScrollArea>
                 {!findings.length && (
                   <p className="text-callout text-foreground-muted">
                     {t({ id: "raftbench.noCues" })}
                   </p>
                 )}
               </Card>
-              <Card className={`${PANEL} space-y-4`}>
+              <Card className={`${PANEL} stack-y-4`}>
                 <h2 className="text-headline">
                   {t({ id: "raftbench.evidence" })}
                 </h2>
@@ -767,7 +769,7 @@ function RaftBenchAdminPage({ analysisAllowed }: { analysisAllowed: boolean }) {
                       {t({ id: rules[finding.kind] })}
                     </p>
                     <Separator />
-                    <div className="max-h-[30rem] space-y-4 overflow-auto">
+                    <ScrollArea role="region" aria-label={t({ id: "raftbench.evidence" })} overscroll="auto" className="max-h-[30rem]" contentClassName="stack-y-4">
                       {evidence.map((m) => (
                         <article
                           key={m.id}
@@ -792,7 +794,7 @@ function RaftBenchAdminPage({ analysisAllowed }: { analysisAllowed: boolean }) {
                           </p>
                           <Button
                             variant="ghost"
-                            size="sm"
+                            size="md"
                             data-message={m.id}
                             onClick={openSource}
                           >
@@ -800,7 +802,7 @@ function RaftBenchAdminPage({ analysisAllowed }: { analysisAllowed: boolean }) {
                           </Button>
                         </article>
                       ))}
-                    </div>
+                    </ScrollArea>
                     <Separator />
                     <label
                       className="block text-footnote font-semibold text-foreground-muted"
@@ -814,17 +816,17 @@ function RaftBenchAdminPage({ analysisAllowed }: { analysisAllowed: boolean }) {
                       onChange={changeNote}
                     />
                     <div className="flex flex-wrap gap-2">
-                      <Button size="sm" onClick={confirmSignal}>
+                      <Button size="md" onClick={confirmSignal}>
                         {t({ id: "raftbench.confirm" })}
                       </Button>
                       <Button
-                        size="sm"
+                        size="md"
                         variant="outline"
                         onClick={dismissSignal}
                       >
                         {t({ id: "raftbench.dismiss" })}
                       </Button>
-                      <Button size="sm" variant="ghost" onClick={reopenSignal}>
+                      <Button size="md" variant="ghost" onClick={reopenSignal}>
                         {t({ id: "raftbench.reopen" })}
                       </Button>
                     </div>
@@ -847,7 +849,7 @@ function RaftBenchAdminPage({ analysisAllowed }: { analysisAllowed: boolean }) {
           </div>
         </details>
       </div>
-      </div>
+      </ScrollArea>
     </Panel>
   );
 }

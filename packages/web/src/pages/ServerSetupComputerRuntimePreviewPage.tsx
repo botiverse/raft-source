@@ -1,6 +1,7 @@
 import { useCallback, useState } from "react";
-import CreateAgentDialog from "../components/agent/CreateAgentDialog";
+import { CreateAgentDialog } from "../components/agent/DeferredCreateAgentDialog";
 import ServerCreatePreview from "../components/auth/ServerCreatePreview";
+import { SCRIM_CLASS } from "../components/ui/scrim";
 import ServerSetupComputerRuntimeStep from "../components/onboarding/ServerSetupComputerRuntimeStep";
 import { useMachineStore } from "../store/machineStore";
 import { readServerSetupPreviewView, serverSetupPreviewFixture } from "../dev/serverSetupPreviewFixtures";
@@ -55,7 +56,7 @@ export default function ServerSetupComputerRuntimePreviewPage() {
       <div className="absolute inset-0">
         <ServerCreatePreview serverName="Cindy's pricing team" serverSlug="cindys-pricing-team" />
       </div>
-      <div className="absolute inset-0 bg-layer-backdrop" aria-hidden="true" />
+      <div className={`absolute inset-0 ${SCRIM_CLASS}`} aria-hidden="true" />
       <div className="absolute inset-0 flex items-center justify-center p-4 sm:px-8 sm:py-7 lg:px-[120px] lg:py-14">
         {showCreateAgent ? (
           <CreateAgentDialog

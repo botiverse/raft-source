@@ -17,8 +17,8 @@ test("three consecutive failures of one session refuse resuming it; the count su
   assert.equal(ledger.recordFailure("agent-1", "session-a", "deepseek/v4"), 3);
   const restarted = new SessionCompactionFailureLedger(dir);
   assert.equal(restarted.needsReset("agent-1", "session-a", "deepseek/v4"), 3, "kept on disk across a daemon restart");
-  // Stored in the workspace's hidden .raft/ directory, ids and counts only.
-  const stored = JSON.parse(readFileSync(path.join(dir, "agent-1", ".raft", "compaction-failures.json"), "utf8"));
+  // Stored in the daemon's agent state beside the workspaces, ids and counts only.
+  const stored = JSON.parse(readFileSync(path.join(dir, ".agent-state", "agent-1", "compaction-failures.json"), "utf8"));
   assert.deepEqual(Object.keys(stored).sort(), ["count", "model", "sessionId", "updatedAtMs", "version"]);
 });
 

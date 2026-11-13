@@ -18,10 +18,13 @@ export type AttachmentUploadedLike = AgentAttachmentUploadedLike;
 export type CommentRow = AgentAttachmentCommentRow;
 
 export const formatAttachmentUploaded = axSurface(
-  "Upload receipt with attachment id and send-usage hint.",
-  (attachment: AttachmentUploadedLike): string => formatAgentAttachmentUploaded(attachment),
+  "Upload receipt with attachment id and send-usage hint (the task reply for a task ref).",
+  (attachment: AttachmentUploadedLike, target?: string): string => formatAgentAttachmentUploaded(attachment, "cli", target),
   {
-    examples: [{ args: [{ id: "aaaa1111-0000-0000-0000-000000000000", filename: "spec.md", sizeBytes: 12595 }] }],
+    examples: [
+      { args: [{ id: "aaaa1111-0000-0000-0000-000000000000", filename: "spec.md", sizeBytes: 12595 }] },
+      { title: "uploaded to a task ref", args: [{ id: "aaaa1111-0000-0000-0000-000000000000", filename: "spec.md", sizeBytes: 12595 }, "#proj-launch:#2"] },
+    ],
   },
 );
 

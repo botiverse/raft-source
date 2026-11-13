@@ -13,6 +13,7 @@
 // - Q2: the caller's built-in app conversations are inspected and list no one:
 //   no longer skipped when `#<appId>` resolves nothing, and no longer decided
 //   by a same-named regular channel's roster when it resolves one.
+import { fillJointMembersFromChannelHumans } from "../test/jointMemberFill";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 
@@ -56,6 +57,7 @@ import { createAgent } from "../services/agentService";
 import { addAgent, addHuman, createChannel } from "../services/channelService";
 import { resolveConversation } from "../services/rapRegistryStore";
 import { createServer } from "../services/serverService";
+import { seedBoundGuest } from "../test/guestFixture";
 import { fixturePasswordHash } from "../test/integration/credentials";
 
 /**
@@ -190,7 +192,7 @@ async function insertUser(name: string): Promise<string> {
   return row.id;
 }
 
-async function insertMember(serverId: string, userId: string, role: "member" | "guest"): Promise<void> {
+async function insertMember(serverId: string, userId: string, role: "member"): Promise<void> {
   await getDb().insert(serverMembers).values({ serverId, userId, role });
 }
 
@@ -224,7 +226,6 @@ export async function seedUserChannelsScenario(): Promise<UserChannelsScenario> 
   const serverA = await createServer("User Channels A", `uc-a-${suffix}`, ownerId);
   const serverB = await createServer("User Channels B", `uc-b-${suffix}`, bobId);
   await insertMember(serverA.id, aliceId, "member");
-  await insertMember(serverA.id, gwenId, "guest");
   await insertMember(serverA.id, aliceUpperId, "member");
   await insertMember(serverA.id, boltHumanId, "member");
   await insertMember(serverB.id, aliceId, "member");
@@ -245,7 +246,8 @@ export async function seedUserChannelsScenario(): Promise<UserChannelsScenario> 
   const pubTwo = await createChannel(serverA.id, "pub-two");
   await addAgent(pubTwo.id, boltAgent.id);
   await addAgent(pubTwo.id, mem.id);
-  await addHuman(pubTwo.id, gwenId);
+  // gwen is server A's Guest, bound to (and a member of) pub-two.
+  await seedBoundGuest({ serverId: serverA.id, userId: gwenId, channelId: pubTwo.id });
   await addHuman(pubTwo.id, aliceUpperId);
 
   const privAda = await createChannel(serverA.id, "priv-ada", undefined, "private");
@@ -306,10 +308,15 @@ export async function seedUserChannelsScenario(): Promise<UserChannelsScenario> 
   await db.insert(channelHumans).values({ channelId: jointLocal.localProjection, userId: aliceUpperId });
   // Server B's Scout is in it too; A's Scout is listed for its own row.
   await db.insert(channelAgents).values({ channelId: jointLocal.hostProjection, agentId: scoutElsewhere.id });
-  const jointGone = await joint(`joint-gone-${suffix}`, "disconnected");
+  const jointGone = await joint(`joint-gone-${suffix}`, "active");
   await addAgent(jointGone.localProjection, ada.id);
   await addAgent(jointGone.localProjection, mem.id);
   await addAgent(jointGone.localProjection, scout.id);
+  // The CH rows above, as joint members (computed joint membership).
+  await fillJointMembersFromChannelHumans();
+  // Keep historical membership rows, then revoke this projection.
+  await db.update(jointChannelServers).set({ status: "disconnected" })
+    .where(eq(jointChannelServers.localChannelId, jointGone.localProjection));
 
   // Built-in app conversations (type dm, named by app id) and a regular
   // channel that `#system.canary` resolves to instead.
@@ -334,6 +341,7 @@ export async function seedUserChannelsScenario(): Promise<UserChannelsScenario> 
     agentId,
     scopes,
     name,
+    issuedVia: "computer",
     createdByUserId: null,
   })).apiKey;
   const adminApiKey = await mint(ada.id, ["read", "channels"], "user-channels-admin");

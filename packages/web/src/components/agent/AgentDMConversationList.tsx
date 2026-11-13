@@ -17,7 +17,7 @@ export function AgentDMConversationList({
   items: AgentDMConversation[];
 }) {
   return (
-    <div className="p-4 space-y-3">
+    <div className="p-4 stack-y-3">
       {items.map((item) => (
         <AgentDMConversationCard key={item.id} item={item} />
       ))}

@@ -568,6 +568,7 @@ test("local runtime drives current worker through one exact credential lease and
     },
     sanitizedText: "outbound exact",
     externalMentions: [],
+    raftMentionSubstitutions: [],
     attachments: [],
     bindingAuthority: authority,
     enqueueRuntimeRevision: decision.fact.runtimePredicateRevision,

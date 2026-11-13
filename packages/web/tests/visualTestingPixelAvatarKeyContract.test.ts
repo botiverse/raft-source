@@ -7,7 +7,7 @@ import { readdirSync, readFileSync } from "node:fs";
 // This pins every `pixel:` value in visual-testing/shared/*.json to the registry.
 
 const registry = JSON.parse(
-  readFileSync(new URL("../assets/avatars/pixelAvatars.json", import.meta.url), "utf8"),
+  readFileSync(new URL("../../shared/assets/pixelAvatars.json", import.meta.url), "utf8"),
 ) as { avatars: Record<string, unknown>; reservedKeys?: string[]; defaultKey?: string };
 
 const sharedDir = new URL("../../visual-testing/shared/", import.meta.url);

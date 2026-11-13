@@ -21,7 +21,7 @@ export default function PublicServerChannelRow({
     <SidebarItem
       active={selected}
       onClick={handleClick}
-      className="mx-0 w-full items-center"
+      className="w-full items-center"
       data-public-channel-id={channelId}
     >
       {/* The workspace sidebar's channel row parts: the bare # in the 19px

@@ -1,4 +1,6 @@
 import type { Request, Response } from "express";
+import { isPrivacyModeOn } from "../config/privacyMode";
+import { refuse } from "../lib/refusal";
 
 const DEFAULT_MAX_BYTES = 10 * 1024 * 1024;
 
@@ -8,9 +10,15 @@ export interface OtlpRelayConfig {
   fallbackTargetUrl?: string;
   maxBytes?: string;
   fetch?: typeof fetch;
+  /** RAFT_PRIVACY_MODE (default: the server's startup read): the relay forwards nothing. */
+  privacyMode?: boolean;
 }
 
 export async function otlpRelayHandler(req: Request, res: Response, config: OtlpRelayConfig = {}): Promise<void> {
+  if (config.privacyMode ?? isPrivacyModeOn()) {
+    refuse(res, 404, { code: "otlp_relay_disabled", error: "This server runs in privacy mode (RAFT_PRIVACY_MODE), so it relays no traces; unset it to relay." });
+    return;
+  }
   const expectedAuthorization = config.authorization ?? process.env.OTLP_RELAY_AUTHORIZATION;
   if (!expectedAuthorization) {
     res.status(500).json({ error: "OTLP relay authorization is not configured" });

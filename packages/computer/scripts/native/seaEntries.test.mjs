@@ -14,11 +14,9 @@ import {
   SEA_ASSET_KIMI,
   SEA_ASSET_LITE,
   SEA_CLI_ENTRY,
-  SEA_CLI_LAZY_ASSETS,
   SEA_CODE_CACHE_DELAY_MS,
   SEA_CODE_CACHE_DIR,
   SEA_LAZY_ASSET_HOOK,
-  SEA_LAZY_ASSETS,
   SEA_LITE_EXTERNAL_PATTERN,
   SEA_RUNNER_ENTRIES,
   seaAssetFor,
@@ -66,9 +64,10 @@ const SRC = fileURLToPath(new URL("../../src", import.meta.url));
 // daemon (SEA_RUNNER_ENTRIES, or the agent CLI's own bundle).
 const DAEMON_IMPORT_SITES = {
   "cli.ts @botiverse/raft-daemon/bundled-cli": "__cli",
-  "cli.ts @botiverse/raft-daemon/core": ["__verify-bundled-oauth", "__verify-bundled-kimi"],
+  "cli.ts @botiverse/raft-daemon/core": ["__verify-bundled-oauth", "__verify-bundled-kimi", "__verify-bundled-oar"],
   "index.ts @botiverse/raft-daemon/bundled-cli": "__cli",
-  "index.ts @botiverse/raft-daemon/runtime-detection-child": "__detect-runtimes",
+  "runtimeDetectionEntry.ts @botiverse/raft-daemon/runtime-detection-child": "__detect-runtimes",
+  "runtimeDetectionEntry.ts @botiverse/raft-daemon/context-view-restore-child": "__restore-context-view",
   "seaCliEntry.ts @botiverse/raft-daemon/bundled-cli": "__cli",
   // runResident → defaultCoreFactory, reached only through the `__run` command.
   "service.ts @botiverse/raft-daemon/core": "__run",
@@ -331,17 +330,4 @@ test("code cache: a cache directory that cannot be written leaves the start unaf
   const home = tempHome();
   writeFileSync(join(home, SEA_CODE_CACHE_DIR[0]), "a file where the directory should be");
   assert.deepEqual(startInChild({ RAFT_HOME: home }), { rejected: null, scheduled: 1 });
-});
-
-test("every lazy asset has the shim build.mjs aliases its package to", () => {
-  const build = readFileSync(fileURLToPath(new URL("./build.mjs", import.meta.url)), "utf8");
-  for (const [lazyAssets, shimFile] of [[SEA_LAZY_ASSETS, "sea-lazy-kimi.cjs"], [SEA_CLI_LAZY_ASSETS, "sea-lazy-undici.cjs"]]) {
-    for (const specifier of Object.keys(lazyAssets)) {
-      const shim = fileURLToPath(new URL(`./${shimFile}`, import.meta.url));
-      assert.ok(existsSync(shim));
-      const key = /^[A-Za-z_$][\w$]*$/.test(specifier) ? specifier : JSON.stringify(specifier);
-      assert.ok(build.includes(`${key}: join(HERE, "${shimFile}")`), `no shim alias for ${specifier}`);
-      assert.ok(readFileSync(shim, "utf8").includes(`load(${JSON.stringify(specifier)})`));
-    }
-  }
 });

@@ -1,10 +1,8 @@
 import assert from "node:assert/strict";
 import type { Agent } from "../src/store/agentStore";
-import type { Channel } from "../src/store/channelStore";
 import {
   applyStatusActivityEvent,
   appendLiveAgentActivityItem,
-  buildMessageActivityItem,
   buildStatusActivityItem,
   LIVE_AGENT_ACTIVITY_VISIBLE_MS,
   LIVE_AGENT_IDLE_GRACE_MS,
@@ -36,61 +34,6 @@ function agent(overrides: Partial<Agent> & Pick<Agent, "id" | "name">): Agent {
     ...overrides,
   };
 }
-
-function channel(overrides: Partial<Channel> & Pick<Channel, "id" | "name">): Channel {
-  return {
-    description: null,
-    type: "channel",
-    createdAt: "2026-01-01T00:00:00.000Z",
-    ...overrides,
-  };
-}
-
-test("buildMessageActivityItem ignores human messages", () => {
-  const item = buildMessageActivityItem({
-    id: "message-1",
-    senderType: "user",
-    senderId: "user-1",
-    senderName: "Alice",
-    content: "hello",
-    channelId: "channel-1",
-    createdAt: "2026-05-12T00:00:00.000Z",
-  }, { agents: [], channels: [], dmChannels: [] });
-
-  assert.equal(item, null);
-});
-
-test("buildMessageActivityItem does not convert agent messages into ticker rows", () => {
-  const agents = [agent({ id: "agent-1", name: "writer", displayName: "Writer" })];
-  const channels = [channel({ id: "channel-1", name: "proj-chat" })];
-  const threadItem = buildMessageActivityItem({
-    id: "message-1",
-    senderType: "agent",
-    senderId: "agent-1",
-    senderName: "writer",
-    content: "I pushed the PR",
-    channelId: "thread-1",
-    createdAt: "2026-05-12T00:00:00.000Z",
-  }, {
-    agents,
-    channels,
-    dmChannels: [],
-    threads: [{ threadChannelId: "thread-1", parentChannelName: "proj-chat" }],
-  });
-
-  const channelItem = buildMessageActivityItem({
-    id: "message-2",
-    senderType: "agent",
-    senderId: "agent-1",
-    senderName: "writer",
-    content: "Done",
-    channelId: "channel-1",
-    createdAt: "2026-05-12T00:00:01.000Z",
-  }, { agents, channels, dmChannels: [] });
-
-  assert.equal(threadItem, null);
-  assert.equal(channelItem, null);
-});
 
 test("buildStatusActivityItem only keeps active work status events", () => {
   const agents = [agent({ id: "agent-1", name: "runner" })];

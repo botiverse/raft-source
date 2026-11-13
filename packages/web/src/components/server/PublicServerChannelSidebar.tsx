@@ -37,20 +37,22 @@ export default function PublicServerChannelSidebar({
     >
       {/* Below sm the column is 144px wide, too narrow for the label on one
           line at the signed-in metrics, so it wraps there as it did before. */}
-      <div className="mb-1 flex h-6 items-center justify-between px-2 max-sm:h-auto max-sm:min-h-6">
+      <div className="flex h-6 items-center justify-between mt-2 px-5 max-sm:h-auto max-sm:min-h-6">
         <SectionEyebrow as="div" className="min-w-0 flex-1 truncate max-sm:whitespace-normal" data-public-channel-label>
           {channelsLabel}
         </SectionEyebrow>
       </div>
-      {channels.map((channel) => (
-        <PublicServerChannelRow
-          key={channel.id}
-          channelId={channel.id}
-          name={channel.name}
-          selected={selectedChannelId === channel.id}
-          onSelectChannel={onSelectChannel}
-        />
-      ))}
+      <div className="flex flex-col gap-0.5 py-2">
+        {channels.map((channel) => (
+          <PublicServerChannelRow
+            key={channel.id}
+            channelId={channel.id}
+            name={channel.name}
+            selected={selectedChannelId === channel.id}
+            onSelectChannel={onSelectChannel}
+          />
+        ))}
+      </div>
     </PublicServerSidebarFrame>
   );
 }

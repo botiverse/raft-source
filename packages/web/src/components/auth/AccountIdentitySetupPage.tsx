@@ -1,21 +1,23 @@
-import { useCallback, useEffect, useId, useRef, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { Input, InputGroup, InputGroupAddon, InputGroupInput, Button } from "@botiverse/raft-ui";
 import type { ChangeEvent, FormEvent, ReactNode } from "react";
 import { useIntl } from "react-intl";
 import { validateNameReason } from "@botiverse/raft-shared";
 import type { NameValidationReason } from "@botiverse/raft-shared";
-import { Camera, Hash } from "lucide-react";
+import { Hash } from "lucide-react";
 import { useAuthStore } from "../../store/authStore";
 import type { User } from "../../store/authStore";
 import type { MessageId } from "../../i18n/messages";
 import api from "../../api/client";
 import AvatarSlot from "../ui/AvatarSlot";
+import { HumanAvatarEditMenu } from "../member/HumanAvatarEditMenu";
+import { isHumanPixelAvatarUrl } from "../../utils/humanAvatar";
 import Banner from "../ui/Banner";
 import FormField from "../ui/FormField";
 import { AuthPageIntro } from "./AuthPageFrame";
 import OnboardingCreateShell from "./OnboardingCreateShell";
 import { authServerErrorMessage } from "./authErrors";
-import { avatarUploadApiErrorMessage, isAvatarFileTooLarge, isAvatarTooLargeError, PROFILE_AVATAR_ACCEPT } from "../../utils/avatarUpload";
+import { avatarUploadApiErrorMessage, isAvatarFileTooLarge, isAvatarTooLargeError } from "../../utils/avatarUpload";
 import { formatNameValidationError } from "../../i18n/nameValidation";
 import { useOptionalAppTheme } from "../../hooks/useAppTheme";
 import { hasDeviceThemePreference } from "../../theme/appThemeCache";
@@ -52,28 +54,25 @@ function identitySetupError(error: unknown): IdentitySetupError {
 function PreviewAvatar({
   avatarPreviewUrl,
   persistedAvatarUrl,
-  gravatarHash,
-  email,
   safeOnly,
   size,
 }: {
   avatarPreviewUrl: string | null;
   persistedAvatarUrl: string | null;
-  gravatarHash: string | null;
-  email: string | null;
   safeOnly: boolean;
   size: number;
 }) {
   const src = !safeOnly && avatarPreviewUrl ? avatarPreviewUrl : persistedAvatarUrl;
+  // A built pixel avatar (a new account's) is drawn by AvatarSlot itself; a
+  // photo (a chosen file's local preview, the provider's) as an image.
+  const image = src && !isHumanPixelAvatarUrl(src) ? src : null;
   return (
     <AvatarSlot
       context={size === 28 ? "compact-row" : "account-tile"}
       type="human"
       humanAvatarUrl={src}
-      gravatarHash={gravatarHash}
-      email={email}
     >
-      {src ? <img src={src} alt="" className="h-full w-full object-cover" /> : undefined}
+      {image ? <img src={image} alt="" className="h-full w-full object-cover" /> : undefined}
     </AvatarSlot>
   );
 }
@@ -83,16 +82,12 @@ function IdentityImpactPreview({
   persistedAvatarUrl,
   displayName,
   handle,
-  gravatarHash,
-  email,
   safeOnly,
 }: {
   avatarPreviewUrl: string | null;
   persistedAvatarUrl: string | null;
   displayName: string;
   handle: string;
-  gravatarHash: string | null;
-  email: string | null;
   safeOnly: boolean;
 }) {
   const { formatMessage } = useIntl();
@@ -106,25 +101,25 @@ function IdentityImpactPreview({
 
   return (
     <div
-      className="relative z-10 min-h-[520px] w-full max-w-[640px] p-4 sm:p-6"
+      className="relative z-raised min-h-[520px] w-full max-w-[640px] p-4 sm:p-6"
       data-testid="identity-impact-preview"
     >
       <div className="relative flex h-full min-h-[460px] items-center justify-center">
         <div className="w-[min(100%,520px)]">
           <div className="relative pb-24" data-testid="identity-preview-cardzone">
             <section
-              className="onboarding-identity-card-enter relative z-10 w-[min(92%,480px)] rotate-[-1deg] overflow-hidden rounded-container border-[1.5px] border-line-strong bg-layer-canvas shadow-sticker [--identity-card-rotate:-1deg]"
+              className="onboarding-identity-card-enter relative z-raised w-[min(92%,480px)] rotate-[-1deg] overflow-hidden rounded-container border-[1.5px] border-line-strong bg-layer-canvas shadow-sticker [--identity-card-rotate:-1deg]"
               data-testid="identity-channel-preview"
             >
-              <header className="flex h-12 items-center gap-2 border-b border-line-seam bg-layer-canvas px-4">
-                <span className="flex size-[27px] items-center justify-center rounded-sticker border-[1.5px] border-sticker-ink bg-brand text-sticker-ink">
+              <header className="flex h-12 md:pointer-fine:h-(--header-height) items-center gap-2 border-b border-line-seam bg-layer-canvas px-4">
+                <span className="flex size-[27px] items-center justify-center rounded-chip border-[1.5px] border-sticker-ink bg-brand text-sticker-ink">
                   <Hash size={14} />
                 </span>
                 <span className="truncate text-headline text-foreground">
                   {formatMessage({ id: "pages.identitySetup.previewChannel" })}
                 </span>
               </header>
-              <div className="space-y-4 p-4">
+              <div className="stack-y-4 p-4">
                 <div className="flex items-start gap-2.5">
                   <div className="mt-px flex size-[27px] shrink-0 items-center justify-center rounded-sticker border-[1.5px] border-sticker-ink bg-palette-lavender text-footnote font-bold text-sticker-ink shadow-[0_0_0_1.5px_var(--sticker-edge)]">
                     M
@@ -174,8 +169,6 @@ function IdentityImpactPreview({
                     <PreviewAvatar
                       avatarPreviewUrl={avatarPreviewUrl}
                       persistedAvatarUrl={persistedAvatarUrl}
-                      gravatarHash={gravatarHash}
-                      email={email}
                       safeOnly={safeOnly}
                       size={28}
 
@@ -203,7 +196,7 @@ function IdentityImpactPreview({
             </section>
 
             <section
-              className="onboarding-identity-card-enter absolute bottom-2 right-0 z-20 w-[min(78%,360px)] rotate-[2deg] rounded-container border-[1.5px] border-line-strong bg-layer-popover p-4 shadow-sticker [--identity-card-delay:80ms] [--identity-card-rotate:2deg]"
+              className="onboarding-identity-card-enter absolute bottom-2 right-0 z-raised w-[min(78%,360px)] rotate-[2deg] rounded-container border-[1.5px] border-line-strong bg-layer-popover p-4 shadow-sticker [--identity-card-delay:80ms] [--identity-card-rotate:2deg]"
               data-testid="identity-profile-preview"
             >
               <div className="flex items-start gap-3">
@@ -215,8 +208,6 @@ function IdentityImpactPreview({
                   <PreviewAvatar
                     avatarPreviewUrl={avatarPreviewUrl}
                     persistedAvatarUrl={persistedAvatarUrl}
-                    gravatarHash={gravatarHash}
-                    email={email}
                     safeOnly={safeOnly}
                     size={56}
 
@@ -276,8 +267,6 @@ export default function AccountIdentitySetupPage({
     setThemeMode("light");
     markOnboardingDisplayStylePending();
   }, [previewMode, setThemeMode]);
-  const avatarInputId = useId();
-  const avatarInputRef = useRef<HTMLInputElement | null>(null);
   const [displayName, setDisplayName] = useState(user?.displayName ?? "");
   // The display name mirrors the username as you type it — until the user edits
   // the display name themselves, at which point it detaches and keeps its own
@@ -321,8 +310,7 @@ export default function AccountIdentitySetupPage({
     };
   }, [avatarPreviewUrl]);
 
-  const handleAvatarChange = (event: ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0] ?? null;
+  const stageAvatarFile = useCallback((file: File | null) => {
     setAvatarError("");
     setAvatarUploadFailed(false);
     // The util's *Error form returns an English sentence; using it as a
@@ -335,7 +323,6 @@ export default function AccountIdentitySetupPage({
         if (current) URL.revokeObjectURL(current);
         return null;
       });
-      event.currentTarget.value = "";
       return;
     }
     setAvatarFile(file);
@@ -343,7 +330,7 @@ export default function AccountIdentitySetupPage({
       if (current) URL.revokeObjectURL(current);
       return file ? URL.createObjectURL(file) : null;
     });
-  };
+  }, [formatMessage]);
 
   // Validate the display name on blur (not just on Continue) so format errors
   // surface as soon as the user leaves the field.
@@ -376,9 +363,9 @@ export default function AccountIdentitySetupPage({
     setFieldErrors((current) => ({ ...current, displayName: undefined }));
   }, []);
 
-  const handleAvatarButtonClick = useCallback(() => {
-    avatarInputRef.current?.click();
-  }, []);
+  // A built avatar is saved by the builder itself, replacing the avatar: a
+  // photo chosen before it is dropped, so Continue doesn't upload over it.
+  const handleAvatarBuilt = useCallback(() => stageAvatarFile(null), [stageAvatarFile]);
 
   const handleUsernameBlur = useCallback(async () => {
     const candidate = handle.trim();
@@ -454,8 +441,6 @@ export default function AccountIdentitySetupPage({
           persistedAvatarUrl={user.avatarUrl}
           displayName={displayName}
           handle={handle}
-          gravatarHash={user.gravatarHash}
-          email={user.email}
           safeOnly={avatarUploadFailed}
         />
       }
@@ -472,7 +457,7 @@ export default function AccountIdentitySetupPage({
 
         {error ? <Banner intent="warning">{error}</Banner> : null}
 
-        <form onSubmit={handleSubmit} className="space-y-4" noValidate>
+        <form onSubmit={handleSubmit} className="stack-y-4 md:pointer-fine:stack-y-3" noValidate>
               <FormField label={formatMessage({ id: "pages.identitySetup.usernameLabel" })} error={fieldErrors.handle} htmlFor="identity-handle">
                 {/* The `@` is a fixed prefix of the same control (DS rf-inputgroup),
                     not a coloured block of its own. */}
@@ -520,40 +505,27 @@ export default function AccountIdentitySetupPage({
                 </div>
                 <div>
                   <div className="flex items-center gap-3">
-                    <div className="size-[51px] shrink-0">
-                      <PreviewAvatar
-                        avatarPreviewUrl={avatarPreviewUrl}
-                        persistedAvatarUrl={user.avatarUrl}
-                        gravatarHash={user.gravatarHash}
-                        email={user.email}
-                        safeOnly={avatarUploadFailed}
-                        size={56}
-
-                      />
-                    </div>
+                    {/* The avatar is the way to change it (pencil veil → Upload a
+                        photo / Build an avatar). A chosen photo uploads with
+                        Continue; a built one is saved by the builder. */}
+                    <HumanAvatarEditMenu
+                      testId="identity-avatar-edit"
+                      context="account-tile"
+                      avatarUrl={user.avatarUrl}
+                      busy={loading && avatarFile !== null}
+                      onUpload={stageAvatarFile}
+                      onBuilt={handleAvatarBuilt}
+                      avatar={(
+                        <PreviewAvatar
+                          avatarPreviewUrl={avatarPreviewUrl}
+                          persistedAvatarUrl={user.avatarUrl}
+                          safeOnly={avatarUploadFailed}
+                          size={56}
+                        />
+                      )}
+                    />
                     <div className="min-w-0 flex-1">
-                      <Button size="sm"
-                        variant="outline"
-                        disabled={loading}
-                        // Stryker disable next-line OptionalChaining: the visible button and hidden file input mount together; this stays defensive for ref timing.
-                        onClick={handleAvatarButtonClick}
-                      >
-                        <Camera size={15} />
-                        {formatMessage({
-                          id: loading && avatarFile
-                            ? "pages.identitySetup.avatarUploading"
-                            : "pages.identitySetup.avatarCta",
-                        })}
-                      </Button>
-                      <input
-                        ref={avatarInputRef}
-                        id={avatarInputId}
-                        type="file"
-                        accept={PROFILE_AVATAR_ACCEPT}
-                        className="sr-only"
-                        onChange={handleAvatarChange}
-                      />
-                      <p className="mt-1.5 text-caption text-foreground-hint">
+                      <p className="text-caption text-foreground-hint">
                         {formatMessage({
                           id: provider
                             ? "pages.identitySetup.avatarOauthHelper"
@@ -562,7 +534,7 @@ export default function AccountIdentitySetupPage({
                       </p>
                     </div>
                   </div>
-                  {avatarError ? <p className="mt-2 text-caption font-semibold text-danger-strong" role="alert">{avatarError}</p> : null}
+                  {avatarError ? <p className="mt-2 text-caption font-semibold text-warning-strong" role="alert">{avatarError}</p> : null}
                 </div>
               </div>
 

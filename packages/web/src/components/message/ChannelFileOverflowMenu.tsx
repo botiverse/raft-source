@@ -31,7 +31,7 @@ export function ChannelFileOverflowMenu({
         <DropdownMenuTrigger
           render={(
             <Button
-              size="icon-sm"
+              size="icon-md"
               variant="ghost"
               aria-label={menuLabel}
               data-testid="channel-file-overflow-trigger"

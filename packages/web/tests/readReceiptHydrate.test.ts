@@ -16,8 +16,8 @@ test("read receipt hydrate is limited to server-supported conversation scopes", 
   assert.equal(isReadReceiptScopeEligible(channel("channel")), true);
   assert.equal(isReadReceiptScopeEligible(channel("private")), true);
   assert.equal(isReadReceiptScopeEligible(channel("dm")), true);
-  assert.equal(isReadReceiptScopeEligible(channel("joint")), false);
-  assert.equal(isReadReceiptScopeEligible(channel("thread")), false);
+  assert.equal(isReadReceiptScopeEligible(channel("joint")), true);
+  assert.equal(isReadReceiptScopeEligible(channel("thread")), true);
   assert.equal(isReadReceiptScopeEligible(channel("channel", "all")), false);
   assert.equal(isReadReceiptScopeEligible(null), false);
 });

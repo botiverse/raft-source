@@ -32,6 +32,25 @@
  *     the URL is the only thing that lives through that, and a latch does not.
  * Drop either half and you get a bug that never errors: one day the header appears.
  *
+ * ── Who honours it ─────────────────────────────────────────────────────────
+ * The settings surfaces above, and the signed-in Artifact page (`/artifacts/<id>`,
+ * `/v/<n>`; ArtifactStandalonePage, mobile #3866): the App opens an Artifact with
+ * this same value, draws Back, the title and the version natively, and the page
+ * keeps only its toolbar (where it lives, its original message, Comments, ⋯). Not a
+ * new version: the meaning ("the native shell owns the title bar") is the same.
+ * `back=host` with the host shell (#proj-workspace:#264): the App draws no title bar
+ * over the Artifact page after all, so the page's toolbar starts with Back, which asks
+ * the App to close it by setting the hash to `#host=close` (artifactPageOpening). Latched
+ * and kept in the URL with the rest.
+ *
+ * `hostMenu=desktop-mode,open-in-browser` with the host shell (Lagoon, artin: one top bar in the App's Artifact
+ * viewer, mobile #4635): the App offers these items of its own, and lets the page draw the only bar once it says it
+ * does. The page's toolbar then carries the title and version too, its ⋯ starts with the items named (each asks the
+ * App through `#host=<item>`), and once drawn the page writes `hostToolbar=1`; the App drops its own bar after that.
+ * `hostDesktop=on|off` is the App's Desktop mode, which the App keeps current in the query and announces with a
+ * `raft:host-state` event on the window. All three are kept in the URL by the keeper: a navigation that dropped
+ * `hostToolbar` would bring the App's bar back over the page's.
+ *
  * Legacy `embed=1` is deliberately NOT supported (@artin: 不用兼容). An old client
  * therefore falls back to a normal page — one extra web header, not a double header.
  */
@@ -47,6 +66,34 @@ export interface EmbedMode {
    *  - "web":  no native title bar ⇒ web keeps its PanelHeader.
    */
   shell: EmbedShell;
+  /**
+   * `chrome=none` with the host shell: the native shell draws the page's
+   * toolbar too (an Artifact's place, presence and actions, #proj-workspace:#127),
+   * so the page draws only its content. Latched with the rest.
+   */
+  chromeless?: true;
+  /**
+   * `back=host` with the host shell: the App draws no Back of its own, so the page's
+   * toolbar does, and its tap asks the App to close the page (`#host=close`,
+   * #proj-workspace:#264). Latched with the rest, and kept in the URL by the keeper.
+   */
+  hostBack?: true;
+  /**
+   * `hostMenu=<items>` with the host shell: the App's own menu items, for the page's ⋯ (known names only, in the
+   * App's order). Present only when at least one is known. Latched with the rest, and kept in the URL by the keeper.
+   */
+  hostMenu?: readonly HostMenuItem[];
+}
+
+/** An item of the App's own that the page's ⋯ offers, asked for through `#host=<item>` (artifactPageOpening). */
+export type HostMenuItem = "desktop-mode" | "open-in-browser";
+
+const HOST_MENU_ITEMS: readonly HostMenuItem[] = ["desktop-mode", "open-in-browser"];
+
+function parseHostMenu(value: string | null): HostMenuItem[] {
+  if (!value) return [];
+  const named = value.split(",").map((item) => item.trim());
+  return named.filter((item, index): item is HostMenuItem => (HOST_MENU_ITEMS as readonly string[]).includes(item) && named.indexOf(item) === index);
 }
 
 /** The only value we recognise. An unknown version falls back to a normal page. */
@@ -61,7 +108,19 @@ export function parseEmbedMode(search: string): EmbedMode {
   // v2 value against an older web build and get a plain page, never a broken one.
   if (embed !== SUPPORTED_EMBED) return NOT_EMBEDDED;
   const shell = params.get("shell") === "web" ? "web" : "host";
-  return { embedded: true, shell };
+  if (shell === "web") return { embedded: true, shell };
+  return {
+    embedded: true,
+    shell,
+    ...(params.get("chrome") === "none" ? { chromeless: true as const } : {}),
+    ...(params.get("back") === "host" ? { hostBack: true as const } : {}),
+    ...hostMenuOf(params),
+  };
+}
+
+function hostMenuOf(params: URLSearchParams): { hostMenu?: readonly HostMenuItem[] } {
+  const items = parseHostMenu(params.get("hostMenu"));
+  return items.length > 0 ? { hostMenu: items } : {};
 }
 
 /**
@@ -102,6 +161,61 @@ export function isHostShell(): boolean {
   return mode.embedded && mode.shell === "host";
 }
 
+/** True when the native shell also draws the page's toolbar (`chrome=none`) ⇒ web renders only the content. */
+export function isChromeless(): boolean {
+  const mode = getEmbedMode();
+  return mode.embedded && mode.shell === "host" && mode.chromeless === true;
+}
+
+/** True when the page draws Back for the App (`back=host` with the host shell) ⇒ its tap sets `#host=close`. */
+export function hasHostBack(): boolean {
+  const mode = getEmbedMode();
+  return mode.embedded && mode.shell === "host" && mode.hostBack === true;
+}
+
+const NO_HOST_MENU: readonly HostMenuItem[] = [];
+
+/** The App's own items for the page's ⋯ (`hostMenu=`, with the host shell): none when it declared none. */
+export function hostMenuItems(): readonly HostMenuItem[] {
+  const mode = getEmbedMode();
+  return mode.embedded && mode.shell === "host" ? mode.hostMenu ?? NO_HOST_MENU : NO_HOST_MENU;
+}
+
+/**
+ * Whether the page has drawn the only bar (title, version and the App's items), so the App may drop its own:
+ * `hostToolbar=1`, written once the toolbar is up and kept by the keeper from then on. Only for an App that
+ * declared `hostMenu`; an older one draws its own bar whatever the page writes.
+ */
+let toolbarDrawn = false;
+
+export function hostToolbarDrawn(): boolean {
+  return toolbarDrawn;
+}
+
+/** Marks the page's bar drawn: the keeper then writes `hostToolbar=1` (and keeps it). A no-op without `hostMenu`. */
+export function markHostToolbarDrawn(): boolean {
+  if (toolbarDrawn || hostMenuItems().length === 0) return false;
+  toolbarDrawn = true;
+  return true;
+}
+
+/**
+ * The App's Desktop mode as last seen (`hostDesktop=on|off`): read from the address as it is now, which the App
+ * keeps current, and remembered so the keeper can put it back where a navigation dropped the query. null: the App
+ * never said (or declared no `desktop-mode` item).
+ */
+let lastHostDesktop: boolean | null = null;
+
+export function readHostDesktop(search: string): boolean | null {
+  if (!hostMenuItems().includes("desktop-mode")) return null;
+  const value = new URLSearchParams(search).get("hostDesktop");
+  if (value === "on" || value === "off") lastHostDesktop = value === "on";
+  return lastHostDesktop;
+}
+
+/** The window event the App fires after changing `hostDesktop` in the address. */
+export const HOST_STATE_EVENT = "raft:host-state";
+
 /**
  * MERGE the embed params into an existing query string — never overwrite it.
  *
@@ -117,12 +231,18 @@ export function isHostShell(): boolean {
 export function withEmbedParams(current: URLSearchParams): URLSearchParams {
   const mode = getEmbedMode();
   if (!mode.embedded) return current;
-  if (current.get("embed") === SUPPORTED_EMBED && current.get("shell") === mode.shell) {
-    return current;
-  }
+  if (!needsEmbedRepair(`?${current.toString()}`)) return current;
   const next = new URLSearchParams(current); // copy — every other param survives
   next.set("embed", SUPPORTED_EMBED);
   next.set("shell", mode.shell);
+  // `back=host` too: a reload after a navigation that dropped the query must still draw the page's Back
+  // (the App draws none, so without it there would be no way out).
+  if (mode.hostBack) next.set("back", "host");
+  // The App's items and the bar's flag, so a reload keeps one bar; Desktop mode only where the query lost it (the App
+  // writes it, and a value it wrote is never overwritten with an older one).
+  if (mode.hostMenu && !next.has("hostMenu")) next.set("hostMenu", mode.hostMenu.join(","));
+  if (toolbarDrawn) next.set("hostToolbar", "1");
+  if (lastHostDesktop !== null && !next.has("hostDesktop")) next.set("hostDesktop", lastHostDesktop ? "on" : "off");
   return next;
 }
 
@@ -148,14 +268,17 @@ export function needsEmbedRepair(search: string): boolean {
   const mode = getEmbedMode();
   if (!mode.embedded) return false; // not embedded ⇒ never touch the URL, ever
   const params = new URLSearchParams(search);
-  return params.get("embed") !== SUPPORTED_EMBED || params.get("shell") !== mode.shell;
+  return params.get("embed") !== SUPPORTED_EMBED || params.get("shell") !== mode.shell || (mode.hostBack === true && params.get("back") !== "host")
+    || (mode.hostMenu !== undefined && !params.has("hostMenu"))
+    || (toolbarDrawn && params.get("hostToolbar") !== "1")
+    || (lastHostDesktop !== null && !params.has("hostDesktop"));
 }
 
 /** Test seam. Production never resets: the mode is decided once, at entry. */
 export const __embedTestInternals = {
   parseEmbedMode,
   SUPPORTED_EMBED,
-  reset: () => { latched = null; },
+  reset: () => { latched = null; toolbarDrawn = false; lastHostDesktop = null; },
 };
 
 /**

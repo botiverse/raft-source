@@ -1,10 +1,7 @@
 import assert from "node:assert/strict";
 import { createIntl } from "react-intl";
 
-import {
-  getBillingCurrentTotalLabel,
-  getBillingSelectedTotalLabels,
-} from "../src/utils/billingSeatInput";
+import { getBillingSelectedTotalLabels } from "../src/utils/billingPricedTotals";
 import { en as enMessages } from "../src/i18n/messages/en";
 import { zhCn as zhMessages } from "../src/i18n/messages/zh-cn";
 
@@ -40,21 +37,6 @@ const formatUsd = (v: number) => (Number.isInteger(v) ? String(v) : v.toFixed(2)
 const legacyZh = (oldEnglish: string) =>
   oldEnglish.replace(" / year", " / 年").replace(" / month", " / 月");
 
-test("current-total label matches the old string in both locales", () => {
-  const annual = getBillingCurrentTotalLabel("annual", 20, 200, formatUsd);
-  assert.equal(render("en", annual), "$200 / year");
-  assert.equal(render("zh-cn", annual), legacyZh("$200 / year"));
-
-  const monthly = getBillingCurrentTotalLabel("monthly", 20, 200, formatUsd);
-  assert.equal(render("en", monthly), "$20 / month");
-  assert.equal(render("zh-cn", monthly), legacyZh("$20 / month"));
-
-  // annualUsd null fell back to monthly*12 before the migration; the amount is
-  // computed by the getter, so this must not have moved into the catalog.
-  const fallback = getBillingCurrentTotalLabel("annual", 20, null, formatUsd);
-  assert.equal(render("en", fallback), "$240 / year");
-});
-
 test("selected-total labels match the old strings in both locales", () => {
   const annual = getBillingSelectedTotalLabels("annual", 3, 20, 15, formatUsd);
   assert.equal(render("en", annual.totalLabel), "$45 / year");
@@ -69,10 +51,25 @@ test("selected-total labels match the old strings in both locales", () => {
   assert.equal(monthly.originalLabel, null, "monthly shows no struck-through original");
 });
 
+test("billing selected totals show yearly discount against undiscounted annual price", () => {
+  // Priced totals are {id, amount} now — the "/ month" period is a translated
+  // part of the message instead of English text patched by replace() downstream.
+  // The AMOUNTS are what this test is about, and they are unchanged; the rendered
+  // strings are pinned by the test above.
+  assert.deepEqual(getBillingSelectedTotalLabels("monthly", 3, 10, 105.6, formatUsd), {
+    totalLabel: { id: "billing.perMonth", amount: "30" },
+    originalLabel: null,
+  });
+  assert.deepEqual(getBillingSelectedTotalLabels("annual", 3, 10, 105.6, formatUsd), {
+    totalLabel: { id: "billing.perYear", amount: "316.80" },
+    originalLabel: { id: "billing.perYear", amount: "360" },
+  });
+});
+
 test("non-integer amounts keep the caller's formatting", () => {
   // formatUsd is injected; the catalog must NOT reformat the number, or a
   // price like $12.50 would render as "12.5" through ICU's number formatter.
-  const total = getBillingCurrentTotalLabel("monthly", 12.5, null, formatUsd);
+  const total = getBillingSelectedTotalLabels("monthly", 1, 12.5, 10, formatUsd).totalLabel;
   assert.equal(render("en", total), "$12.50 / month");
   assert.equal(render("zh-cn", total), "$12.50 / 月");
 });
@@ -107,7 +104,7 @@ test("the annual savings badge matches the old inline ternary", () => {
 
 test("DELIBERATE DELTA: the settings tab title now follows the display locale", () => {
   // Not an equivalence case. Before this slice the billing tab title came from
-  // billingText("Plan & Billing"), which read the `?lang=` WebView param instead
+  // billingText("Plan & billing"), which read the `?lang=` WebView param instead
   // of the react-intl locale — so it could disagree with every other tab title
   // on the same screen. @artin approved removing that mechanism outright
   // ("以前的那个可以去掉了"), so billing now resolves like every other tab.
@@ -123,6 +120,6 @@ test("DELIBERATE DELTA: the settings tab title now follows the display locale", 
         `intended, give the tab its own id rather than reintroducing a special case`,
     );
   }
-  assert.equal(en["settings.tabs.billingHeader"], "Plan & Billing");
+  assert.equal(en["settings.tabs.billingHeader"], "Plan & billing");
   assert.equal(zh["settings.tabs.billingHeader"], "套餐与账单");
 });

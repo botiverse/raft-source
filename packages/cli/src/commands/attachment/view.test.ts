@@ -342,3 +342,35 @@ test("attachment view command does not write a file or signed URL on an expired 
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("attachment view says a file is behind the plan's history window instead of unavailable", async () => {
+  const error = "This file is in a message older than the 30-day history on the Free plan. Upgrading to Pro restores the full history.";
+  const { io } = memoryIo();
+  const ctx = createCommandContext({
+    io,
+    loadAgentContext: () => agentContext,
+    createApiClient: () => ({
+      request: async <T>(): Promise<ApiResponse<T>> => {
+        throw new Error("attachment view should use the binary surface method");
+      },
+      requestBinary: async (): Promise<BinaryResponse> => ({
+        ok: false,
+        status: 404,
+        body: new Uint8Array(),
+        error,
+        errorCode: "HISTORY_LIMITED",
+      }),
+    }) as any,
+  });
+
+  await assert.rejects(
+    async () => { await attachmentViewCommand.handler(ctx, { id: "old-file-id", output: "unused" }); },
+    (err: unknown) => {
+      assert.ok(err instanceof CliError);
+      assert.equal(err.code, "HISTORY_LIMITED");
+      assert.equal(err.message, error);
+      assert.equal(err.suggestedNextAction, undefined, "not the feedback-report hint");
+      return true;
+    },
+  );
+});

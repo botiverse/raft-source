@@ -11,22 +11,26 @@ import {
   servers,
   users,
 } from "../db/schema";
+import { asServerId } from "@botiverse/raft-shared";
 import {
-  buildAgentVisibleChannelsRowCheckSql,
-  buildAgentVisibleChannelsSql,
   buildMessageSearchStatement,
-  buildUserVisibleChannelsSql,
+  buildVisibleConversationChannelsSql,
+  buildVisibleConversationRowCheckSql,
   searchMessagesForAgent,
   searchMessagesForUser,
 } from "./searchService";
+import { intersectVisibleRoots, visibleRootChannelIds, type VisibleRoots } from "./visibilityService";
 
 // Search resolves a thread's parent channel from channels.parent_channel_id
-// (0297, trigger-derived) instead of looking up every thread's parent message.
+// (0297, trigger-derived) instead of looking up every thread's parent message,
+// and takes its visible roots from the visibility entry (visibilityService).
 // These tests run the frozen pre-0297 visibility SQL (parent-message join,
 // below) and the current builders over the same data for every visibility
-// shape, and require identical results except for the one intended change: a
+// shape, and require identical results except for the intended changes: a
 // thread whose parent message lives in another server's channel is no longer
-// visible (0 such threads on prod when this shipped).
+// visible (0 such threads on prod when this shipped), and an explicit root
+// list (the guest prefilter) now narrows the visible set instead of replacing
+// it, so it cannot reveal a private channel the viewer is not in.
 //
 // Note for reviewers of search changes: the breadth probe only runs EXPLAIN,
 // so it cannot see the cost of building visible_channels; only EXPLAIN ANALYZE
@@ -36,10 +40,13 @@ type Principal =
   | { kind: "agent"; serverId: string; agentId: string }
   | { kind: "user"; serverId: string; userId: string; allowedRootChannelIds?: readonly string[] };
 
-function visibleSql(principal: Principal): SQL {
-  return principal.kind === "agent"
-    ? buildAgentVisibleChannelsSql({ serverId: principal.serverId, agentId: principal.agentId })
-    : buildUserVisibleChannelsSql({ serverId: principal.serverId, userId: principal.userId, allowedRootChannelIds: principal.allowedRootChannelIds });
+async function rootsOf(principal: Principal): Promise<VisibleRoots> {
+  const roots = await visibleRootChannelIds(principal.kind === "agent"
+    ? { type: "agent", id: principal.agentId, serverId: asServerId(principal.serverId) }
+    : { type: "user", id: principal.userId, serverId: asServerId(principal.serverId) });
+  return principal.kind === "user" && principal.allowedRootChannelIds
+    ? intersectVisibleRoots(roots, principal.allowedRootChannelIds)
+    : roots;
 }
 
 function legacyVisibleSql(principal: Principal): SQL {
@@ -225,6 +232,8 @@ test("parent_channel_id visibility equals the parent-message join, minus cross-s
     other: await thread("svc-t-other", otherPub.id, { serverId: otherServer.id }),
     noMatch: await thread("svc-t-no-match", pub.id),
   };
+  // Emulate pre-CHECK orphan history; current writes must satisfy the cache invariant.
+  await db.execute(sql`ALTER TABLE channels DROP CONSTRAINT channels_parent_message_requires_channel`);
   const [orphan] = await db.insert(channels).values({
     serverId: server.id, name: "svc-t-orphan", type: "thread", parentMessageId: "00000000-0000-4000-8000-00000000dead",
   }).returning();
@@ -271,7 +280,11 @@ test("parent_channel_id visibility equals the parent-message join, minus cross-s
   const channelFilters = [undefined, pub.id, privMember.id, dmMember.id, otherPub.id, threads.pub.id, threads.privOther.id, moved.id];
   const filterSets: Array<{ senderId?: string; after?: Date; before?: Date }> = [{}, { senderId: agent.id }, { senderId: owner.id, after: midpoint }, { before: midpoint }];
   const otherTenantChannelIds = new Set([otherPub.id, threads.other.id]);
-  const intendedDrop = new Set([threads.crossParent.id]);
+  const intendedDrop = (label: string) => new Set([
+    threads.crossParent.id,
+    // The root list narrows: the owner is not in privOther, so listing it does not reveal it.
+    ...(label === "user-roots" ? [privOther.id, threads.privOther.id] : []),
+  ]);
 
   let comparisons = 0;
   let droppedRows = 0;
@@ -279,6 +292,10 @@ test("parent_channel_id visibility equals the parent-message join, minus cross-s
   let recentTextRows = 0;
   let timelineWalkRows = 0;
   for (const { label, principal } of principals) {
+    const roots = await rootsOf(principal);
+    const visibleSql = () => buildVisibleConversationChannelsSql(roots);
+    const rowCheckSql = () => buildVisibleConversationRowCheckSql(roots);
+    const drop = intendedDrop(label);
     for (const text of queries) {
       const tsQuery = text ? sql`plainto_tsquery('simple', ${text})` : null;
       for (const sort of (text ? ["relevance", "recent"] : ["recent"]) as Array<"relevance" | "recent">) {
@@ -288,8 +305,8 @@ test("parent_channel_id visibility equals the parent-message join, minus cross-s
             const run = async (vis: SQL) =>
               (await db.execute(buildMessageSearchStatement(vis, params, tsQuery))).rows as Array<{ id: string; channelId: string; parentChannelId: string }>;
             const legacy = await run(legacyVisibleSql(principal));
-            const current = await run(visibleSql(principal));
-            const expected = legacy.filter((row) => !intendedDrop.has(row.channelId));
+            const current = await run(visibleSql());
+            const expected = legacy.filter((row) => !drop.has(row.channelId));
             droppedRows += legacy.length - expected.length;
             assert.deepEqual(
               current.map((row) => row.id),
@@ -303,7 +320,7 @@ test("parent_channel_id visibility equals the parent-message join, minus cross-s
               // The channel filter narrows messages to the channel and its
               // threads before visibility; it must keep exactly the unfiltered
               // rows in that channel or under it.
-              const unfiltered = (await db.execute(buildMessageSearchStatement(visibleSql(principal), { ...params, channelId: undefined }, tsQuery))).rows as Array<{ id: string; channelId: string; parentChannelId: string }>;
+              const unfiltered = (await db.execute(buildMessageSearchStatement(visibleSql(), { ...params, channelId: undefined }, tsQuery))).rows as Array<{ id: string; channelId: string; parentChannelId: string }>;
               assert.ok(unfiltered.length < params.limit, "fixture: the unfiltered result fits in one page");
               assert.deepEqual(
                 current.map((row) => row.id).sort(),
@@ -315,25 +332,22 @@ test("parent_channel_id visibility equals the parent-message join, minus cross-s
               // Recent sort takes text matches first for a bounded term and
               // walks newest first otherwise (the agent walk through the
               // row-check visible set): the same page either way.
-              const textFirst = (await db.execute(buildMessageSearchStatement(visibleSql(principal), { ...params, recentPlan: "text_matches_first" }, tsQuery))).rows as Array<{ id: string }>;
+              const textFirst = (await db.execute(buildMessageSearchStatement(visibleSql(), { ...params, recentPlan: "text_matches_first" }, tsQuery))).rows as Array<{ id: string }>;
               assert.deepEqual(
                 textFirst.map((row) => row.id),
                 current.map((row) => row.id),
                 `${label} / "${text}" / channel=${channelId ?? "none"} / ${JSON.stringify(filters)}: text-first recent must equal the walk, in order`,
               );
-              if (principal.kind === "agent") {
-                const rowCheckWalk = (await db.execute(buildMessageSearchStatement(buildAgentVisibleChannelsRowCheckSql(principal), { ...params, recentPlan: "walk" }, tsQuery))).rows as Array<{ id: string }>;
-                assert.deepEqual(
-                  rowCheckWalk.map((row) => row.id),
-                  current.map((row) => row.id),
-                  `agent / "${text}" / channel=${channelId ?? "none"} / ${JSON.stringify(filters)}: the row-check walk must equal the walk, in order`,
-                );
-              }
+              const rowCheckWalk = (await db.execute(buildMessageSearchStatement(rowCheckSql(), { ...params, recentPlan: "walk" }, tsQuery))).rows as Array<{ id: string }>;
+              assert.deepEqual(
+                rowCheckWalk.map((row) => row.id),
+                current.map((row) => row.id),
+                `${label} / "${text}" / channel=${channelId ?? "none"} / ${JSON.stringify(filters)}: the row-check walk must equal the walk, in order`,
+              );
               if (!channelId) {
                 // A dense term without a channel filter walks this server's
                 // timeline (0310, trigger-maintained in this fixture): same page, in order.
-                const walkVisible = principal.kind === "agent" ? buildAgentVisibleChannelsRowCheckSql(principal) : visibleSql(principal);
-                const timelineWalk = (await db.execute(buildMessageSearchStatement(walkVisible, { ...params, recentPlan: "server_timeline_walk" }, tsQuery))).rows as Array<{ id: string }>;
+                const timelineWalk = (await db.execute(buildMessageSearchStatement(rowCheckSql(), { ...params, recentPlan: "server_timeline_walk" }, tsQuery))).rows as Array<{ id: string }>;
                 assert.deepEqual(
                   timelineWalk.map((row) => row.id),
                   current.map((row) => row.id),
@@ -347,7 +361,7 @@ test("parent_channel_id visibility equals the parent-message join, minus cross-s
               // Relevance collects text matches across servers before joining
               // visibility (and narrows them by the channel filter on its own);
               // it must keep exactly the rows the visibility-first shape finds.
-              const visibilityFirst = (await db.execute(buildMessageSearchStatement(visibleSql(principal), { ...params, sort: "recent" }, tsQuery))).rows as Array<{ id: string }>;
+              const visibilityFirst = (await db.execute(buildMessageSearchStatement(visibleSql(), { ...params, sort: "recent" }, tsQuery))).rows as Array<{ id: string }>;
               assert.deepEqual(
                 current.map((row) => row.id).sort(),
                 visibilityFirst.map((row) => row.id).sort(),
@@ -367,35 +381,31 @@ test("parent_channel_id visibility equals the parent-message join, minus cross-s
   assert.ok(recentTextRows > 0, "fixture: recent text search found rows to compare");
   assert.ok(timelineWalkRows > 0, "fixture: the server timeline walk found rows to compare");
 
-  // The visible set itself, row for row: identical except the cross-server thread.
+  // The visible set itself, row for row: identical except the intended drops,
+  // and the row-check form (recent walks) is the same set as the UNION form.
+  const visibleRows = async (vis: SQL) =>
+    ((await db.execute(sql`SELECT id::text AS id, parent_channel_id::text AS parent FROM (${vis}) v`)).rows as Array<{ id: string; parent: string }>)
+      .map((row) => `${row.id}:${row.parent}`).sort();
   for (const { label, principal } of principals) {
-    const rows = async (vis: SQL) =>
-      ((await db.execute(sql`SELECT id::text AS id, parent_channel_id::text AS parent FROM (${vis}) v`)).rows as Array<{ id: string; parent: string }>)
-        .map((row) => `${row.id}:${row.parent}`).sort();
-    const legacy = await rows(legacyVisibleSql(principal));
-    const current = await rows(visibleSql(principal));
-    assert.deepEqual(current, legacy.filter((row) => !row.startsWith(`${threads.crossParent.id}:`)), `${label}: visible set`);
+    const roots = await rootsOf(principal);
+    const legacy = await visibleRows(legacyVisibleSql(principal));
+    const current = await visibleRows(buildVisibleConversationChannelsSql(roots));
+    const drop = intendedDrop(label);
+    assert.deepEqual(current, legacy.filter((row) => !drop.has(row.slice(0, row.indexOf(":")))), `${label}: visible set`);
+    assert.deepEqual(await visibleRows(buildVisibleConversationRowCheckSql(roots)), current, `${label}: row-check visible set`);
   }
   {
-    // The agent's row-check form (recent walk) is the same visible set as its UNION form.
-    const agentPrincipal = principals[0]!.principal as Extract<Principal, { kind: "agent" }>;
-    const rows = async (vis: SQL) =>
-      ((await db.execute(sql`SELECT id::text AS id, parent_channel_id::text AS parent FROM (${vis}) v`)).rows as Array<{ id: string; parent: string }>)
-        .map((row) => `${row.id}:${row.parent}`).sort();
-    assert.deepEqual(await rows(buildAgentVisibleChannelsRowCheckSql(agentPrincipal)), await rows(visibleSql(agentPrincipal)), "agent: row-check visible set");
-  }
-  {
-    const agentVisible = ((await db.execute(sql`SELECT id::text AS id, parent_channel_id::text AS parent FROM (${visibleSql(principals[0]!.principal)}) v`)).rows as Array<{ id: string; parent: string }>);
+    const agentVisible = ((await db.execute(sql`SELECT id::text AS id, parent_channel_id::text AS parent FROM (${buildVisibleConversationChannelsSql(await rootsOf(principals[0]!.principal))}) v`)).rows as Array<{ id: string; parent: string }>);
     assert.ok(agentVisible.some((row) => row.id === moved.id && row.parent === privMember.id), "a moved parent's thread is visible under its new channel");
   }
 
   // The public entry points still find the expected threads and nothing from the other tenant.
-  const agentResult = await searchMessagesForAgent({ serverId: server.id, agentId: agent.id, query: "needle haystack reply", sort: "recent", limit: 50 });
+  const agentResult = await searchMessagesForAgent({ serverId: server.id, agentId: agent.id, query: "needle haystack reply", historyCutoff: undefined, sort: "recent", limit: 50 });
   const agentChannels = new Set(agentResult.results.map((row) => row.channelId));
   assert.ok(agentChannels.has(threads.pub.id) && agentChannels.has(threads.privMember.id) && agentChannels.has(threads.dm.id));
   assert.ok(!agentChannels.has(threads.privOther.id) && !agentChannels.has(threads.other.id) && !agentChannels.has(threads.pubDeletedThread.id));
   assert.ok(!agentChannels.has(threads.crossParent.id), "a thread under another server's channel is not visible");
-  const userResult = await searchMessagesForUser({ serverId: server.id, userId: owner.id, query: "needle haystack reply", sort: "recent", limit: 50 });
+  const userResult = await searchMessagesForUser({ serverId: server.id, userId: owner.id, query: "needle haystack reply", historyCutoff: undefined, sort: "recent", limit: 50 });
   const userChannels = new Set(userResult.results.map((row) => row.channelId));
   assert.ok(userChannels.has(threads.pub.id) && userChannels.has(threads.privMember.id));
   assert.ok(!userChannels.has(threads.other.id) && !userChannels.has(threads.underDeletedParent.id) && !userChannels.has(threads.crossParent.id));

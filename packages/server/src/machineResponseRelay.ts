@@ -7,7 +7,14 @@ export type RelayedMachineResponse = Extract<MachineToServerMessage, {
     | "machine:runtime_models:result"
     | "machine:migration:source_workspace_archive_result"
     | "machine:provider_probe:result"
-    | "machine:runtime_account_usage:snapshot";
+    | "machine:runtime_account_usage:snapshot"
+    | "machine:runtime_account_usage:limit_reset:result"
+    | "machine:runtime_account_usage:limit_resets:read:result"
+    | "agent:interrupt-turn:result"
+    | "agent:interrupt-subagent:result"
+    | "machine:runtime_auth:logout:result"
+    | "machine:runtime_auth:providers:result"
+    | "machine:runtime_auth:connect_provider:result";
 }>;
 export type MachineReplyRequestId = string & { readonly __machineReplyRequestId: unique symbol };
 export type MachineReplyReplicaId = string & { readonly __machineReplyReplicaId: unique symbol };
@@ -31,6 +38,13 @@ export interface MachineReplyRequest {
 }
 interface ReplyRecord extends MachineReplyRequest {
   response?: RelayedMachineResponse;
+  /**
+   * The response exactly as written. cjson (Redis Lua) re-encodes an empty
+   * array as `{}`, so `response` round-tripped through the Lua script loses
+   * them (a usage account's `windows: []` came back as `{}`, #triage:#151).
+   * Readers prefer this; `response` stays for replicas on older code.
+   */
+  responseJson?: string;
   sourceReplicaId?: MachineReplyReplicaId;
 }
 export interface MachineReplyStore {
@@ -52,6 +66,7 @@ if record.migrationId and record.migrationId ~= response.migrationId then return
 if record.probeId and record.probeId ~= response.probeId then return false end
 if not record.response then
   record.response = response
+  record.responseJson = ARGV[2]
   record.sourceReplicaId = ARGV[3]
   redis.call('SET', KEYS[1], cjson.encode(record), 'KEEPTTL')
 end
@@ -72,7 +87,11 @@ export function redisMachineReplyStore(redis: () => Redis): MachineReplyStore {
     },
     async read(requestId) {
       const raw = await redis().get(key(requestId));
-      return raw ? JSON.parse(raw) as ReplyRecord : null;
+      if (!raw) return null;
+      const record = JSON.parse(raw) as ReplyRecord;
+      if (typeof record.responseJson === "string") record.response = JSON.parse(record.responseJson) as RelayedMachineResponse;
+      delete record.responseJson;
+      return record;
     },
     async remove(requestId) { await redis().del(key(requestId)); },
   };

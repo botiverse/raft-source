@@ -1,4 +1,4 @@
-ARG NODE_VERSION=24.21.0
+ARG NODE_VERSION=24.22.1
 FROM node:${NODE_VERSION}-bookworm-slim AS builder
 
 RUN corepack enable
@@ -9,7 +9,6 @@ WORKDIR /app
 COPY package.json pnpm-workspace.yaml pnpm-lock.yaml ./
 
 # Copy package manifests
-COPY packages/desktop-contract/package.json packages/desktop-contract/
 COPY packages/sync-core/package.json packages/sync-core/
 COPY packages/runtime-form/package.json packages/runtime-form/
 COPY packages/shared/package.json packages/shared/
@@ -17,10 +16,10 @@ COPY packages/web/package.json packages/web/
 
 # Install dependencies (skip Electron binary download — not needed for web)
 ENV ELECTRON_SKIP_BINARY_DOWNLOAD=1
+COPY patches/ patches/
 RUN pnpm install --frozen-lockfile
 
 # Copy source
-COPY packages/desktop-contract/ packages/desktop-contract/
 COPY packages/sync-core/ packages/sync-core/
 COPY packages/runtime-form/ packages/runtime-form/
 COPY packages/shared/ packages/shared/

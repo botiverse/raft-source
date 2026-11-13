@@ -4,25 +4,29 @@ import {
   resolveProviderFromEnv,
 } from "./messageTranslationService";
 
-const OPENAI_COMPATIBLE_ENV_KEYS = [
+const TRANSLATION_ENV_KEYS = [
   "TRANSLATION_PROVIDER",
-  "TRANSLATION_OPENAI_COMPATIBLE_API_KEY",
-  "TRANSLATION_OPENAI_COMPATIBLE_MODEL",
-  "TRANSLATION_OPENAI_COMPATIBLE_ENDPOINT",
   "TRANSLATION_SSM_ENVIRONMENT",
+  "TRANSLATION_AZURE_ENDPOINT",
+  "TRANSLATION_AZURE_API_KEY",
+  "TRANSLATION_GOOGLE_PROJECT_ID",
+  "TRANSLATION_GOOGLE_ACCESS_TOKEN",
+  "TRANSLATION_GOOGLE_SERVICE_ACCOUNT_JSON",
+  "TRANSLATION_GOOGLE_CLIENT_EMAIL",
+  "TRANSLATION_GOOGLE_PRIVATE_KEY",
 ] as const;
 
-async function withOpenAICompatibleEnv(
-  overrides: Partial<Record<(typeof OPENAI_COMPATIBLE_ENV_KEYS)[number], string>>,
+async function withTranslationEnv(
+  overrides: Partial<Record<(typeof TRANSLATION_ENV_KEYS)[number], string>>,
   fn: () => Promise<void>,
 ): Promise<void> {
-  const previous = new Map(OPENAI_COMPATIBLE_ENV_KEYS.map((key) => [key, process.env[key]]));
-  for (const key of OPENAI_COMPATIBLE_ENV_KEYS) delete process.env[key];
+  const previous = new Map(TRANSLATION_ENV_KEYS.map((key) => [key, process.env[key]]));
+  for (const key of TRANSLATION_ENV_KEYS) delete process.env[key];
   Object.assign(process.env, overrides);
   try {
     await fn();
   } finally {
-    for (const key of OPENAI_COMPATIBLE_ENV_KEYS) {
+    for (const key of TRANSLATION_ENV_KEYS) {
       const value = previous.get(key);
       if (value === undefined) delete process.env[key];
       else process.env[key] = value;
@@ -30,34 +34,52 @@ async function withOpenAICompatibleEnv(
   }
 }
 
-test("resolveProviderFromEnv binds OpenAICompatible key and model to the server-side provider identity", async () => {
-  await withOpenAICompatibleEnv({
-    TRANSLATION_PROVIDER: "openai-compatible",
-    TRANSLATION_OPENAI_COMPATIBLE_API_KEY: "test-openai-compatible-server-only-key",
-    TRANSLATION_OPENAI_COMPATIBLE_MODEL: "openai/gpt-5-mini",
+test("Google translation remains configured and resolves to the Google provider", async () => {
+  await withTranslationEnv({
+    TRANSLATION_PROVIDER: "google",
+    TRANSLATION_GOOGLE_PROJECT_ID: "test-project",
+    TRANSLATION_GOOGLE_ACCESS_TOKEN: "synthetic-token",
   }, async () => {
     assert.equal(isTranslationProviderConfigured(), true);
     const resolved = resolveProviderFromEnv();
     assert.deepEqual(resolved.provider.providerVersion, {
-      provider: "openai-compatible",
-      apiVersion: "v1",
-      policyVersion: "openai-compatible-translation-v1:openai/gpt-5-mini",
+      provider: "google-cloud-translate",
+      apiVersion: "v3",
+      policyVersion: "google-cloud-translate-v1",
     });
     assert.equal(resolved.placeholderPolicyVersion, "brace-placeholder-v1");
   });
 });
 
-test("OpenAICompatible configuration fails closed when either secret-injected value is absent", async () => {
-  await withOpenAICompatibleEnv({
-    TRANSLATION_PROVIDER: "openai-compatible",
-    TRANSLATION_OPENAI_COMPATIBLE_API_KEY: "test-openai-compatible-server-only-key",
+test("removed and unknown providers cannot silently fall back to configured Azure", async () => {
+  for (const provider of ["openai-compatible", "unknown"]) await withTranslationEnv({
+    TRANSLATION_PROVIDER: provider,
+    TRANSLATION_AZURE_ENDPOINT: "https://example.invalid",
+    TRANSLATION_AZURE_API_KEY: "synthetic-key",
   }, async () => {
     assert.equal(isTranslationProviderConfigured(), false);
-    assert.throws(
-      () => resolveProviderFromEnv(),
-      (error: unknown) => error instanceof Error
-        && error.message.includes("TRANSLATION_OPENAI_COMPATIBLE_MODEL")
-        && !error.message.includes("test-openai-compatible-server-only-key"),
-    );
+    assert.throws(() => resolveProviderFromEnv(), /Unsupported translation provider/);
+  });
+});
+
+test("legacy SSM configuration cannot silently switch to Google", async () => {
+  await withTranslationEnv({
+    TRANSLATION_PROVIDER: "google",
+    TRANSLATION_GOOGLE_PROJECT_ID: "test-project",
+    TRANSLATION_GOOGLE_ACCESS_TOKEN: "synthetic-token",
+    TRANSLATION_SSM_ENVIRONMENT: "staging",
+  }, async () => {
+    assert.equal(isTranslationProviderConfigured(), false);
+    assert.throws(() => resolveProviderFromEnv(), /Translation SSM configuration is no longer supported/);
+  });
+});
+
+test("Azure remains the default when no provider is explicitly selected", async () => {
+  await withTranslationEnv({
+    TRANSLATION_AZURE_ENDPOINT: "https://example.invalid",
+    TRANSLATION_AZURE_API_KEY: "synthetic-key",
+  }, async () => {
+    assert.equal(isTranslationProviderConfigured(), true);
+    assert.equal(resolveProviderFromEnv().provider.providerVersion.provider, "azure-translator");
   });
 });

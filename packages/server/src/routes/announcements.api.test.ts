@@ -13,7 +13,7 @@ import * as announcementService from "../services/announcementService";
 import { createOAuthClient } from "../services/oauthService";
 import { createServer } from "../services/serverService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 function hashSecret(value: string): string {
   return createHash("sha256").update(value).digest("hex");
@@ -130,6 +130,17 @@ test("GET /active rejects malformed failed-write frontiers", async ({ app }) => 
 
   const malformed = await fetch(`${app.baseUrl}/api/announcements/active?after=not-a-uuid`, { headers });
   assert.equal(malformed.status, 400);
+});
+
+test("GET /active accepts sidebar_limit 1-5 and rejects anything else", async ({ app }) => {
+  const user = await createVerifiedUser("ann-sidebar-limit@slock.test");
+  const headers = { Authorization: `Bearer ${await tokenForHuman(user.email)}` };
+  for (const value of ["0", "6", "2.5", "x"]) {
+    const res = await fetch(`${app.baseUrl}/api/announcements/active?sidebar_limit=${value}`, { headers });
+    assert.equal(res.status, 400, `sidebar_limit=${value}`);
+  }
+  const ok = await fetch(`${app.baseUrl}/api/announcements/active?sidebar_limit=5`, { headers });
+  assert.equal(ok.status, 200);
 });
 
 test("dismissed latest announcement disappears for that user; re-publishing surfaces a new row", async ({ app }) => {
@@ -408,7 +419,7 @@ test("scheduled content is fixed, timing remains editable and overlapping window
 test("authorized operator identity still gets 404 for every removed announcement admin route", async () => {
   const authorityEnv = "RAFT_ANNOUNCEMENT_OPERATOR_PRINCIPAL_IDS";
   const previousAuthority = process.env[authorityEnv];
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const operator = await createVerifiedUser(`removed-announcement-${randomUUID()}@slock.test`);
     process.env[authorityEnv] = operator.id;
@@ -490,4 +501,26 @@ test("targeted API validates context, rejects spoofed membership and keeps recip
   assert.equal("audience" in data.announcements[0], false);
   const denied = await fetch(`${app.baseUrl}/api/announcements/${row.id}/dismiss?server_id=${server.id}`, { method: "POST", headers: { Authorization: `Bearer ${outsiderToken}` } });
   assert.equal(denied.status, 404);
+});
+
+test("client-targeted announcements follow the request User-Agent and never block unfiltered ones", async ({ app }) => {
+  const user = await createVerifiedUser("ann-client@slock.test");
+  const [stuck, global] = await getDb().insert(announcements).values([
+    { title: "Update manually", pages: [{ body: "Stuck Play build" }], status: "published", startsAt: new Date("2026-01-01"), audience: validateAnnouncementAudience({ type: "all", clients: [{ platform: "android", buildTypes: ["play"], maxBuild: 11400009 }] }) },
+    { title: "Everyone", pages: [{ body: "All" }], status: "published", startsAt: new Date("2026-02-01") },
+  ]).returning();
+  const token = await tokenForHuman(user.email);
+  const active = async (userAgent: string) => {
+    const res = await fetch(`${app.baseUrl}/api/announcements/active`, { headers: { Authorization: `Bearer ${token}`, "User-Agent": userAgent } });
+    assert.equal(res.status, 200);
+    return ((await res.json()) as { announcements: Array<{ id: string }> }).announcements.map((item) => item.id);
+  };
+  const stuckUa = "Raft/1.14.0+11400009 (Android 36; play)";
+  assert.deepEqual(await active(stuckUa), [stuck.id]);
+  assert.deepEqual(await active("Raft/1.16.1+11601001 (Android 36; release)"), [global.id], "an older filtered row does not block a newer one");
+  assert.deepEqual(await active("Mozilla/5.0 (Linux; Android 14; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Mobile Safari/537.36"), [global.id]);
+  const dismiss = (userAgent: string) => fetch(`${app.baseUrl}/api/announcements/${stuck.id}/dismiss`, { method: "POST", headers: { Authorization: `Bearer ${token}`, "User-Agent": userAgent } });
+  assert.equal((await dismiss("Raft/1.16.1+11601001 (Android 36; release)")).status, 404);
+  assert.equal((await dismiss(stuckUa)).status, 200);
+  assert.deepEqual(await active(stuckUa), [global.id]);
 });

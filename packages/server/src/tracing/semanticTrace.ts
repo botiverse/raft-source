@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from "node:async_hooks";
+import type { NextFunction, RequestHandler } from "express";
 import {
   createScopedTracer,
   currentTimeMs,
@@ -20,6 +21,72 @@ import { queryFailureDiagnostics, timeoutBucket } from "./queryTrace";
 // tracer of the current request beside it, so deep service code can open an
 // exact child span without threading a tracer through every signature.
 const activeTracerStore = new AsyncLocalStorage<Tracer>();
+
+// Process-wide tracer for work that runs outside any request (pollers,
+// workers, timers). Set once at startup from the server tracer. Before this,
+// `recordTraceEvent` outside a request fell back to the noop tracer, so events
+// from background paths were dropped without a trace (10-20: assistant doorbell
+// sends from the 5 s poll never logged `server.assistant.doorbell.sent`).
+let processDefaultTracer: Tracer | null = null;
+
+export function setDefaultTraceTracer(tracer: Tracer | null): void {
+  processDefaultTracer = tracer;
+}
+
+// Events and root spans that still found no tracer at all. Expected to stay
+// zero in a running server; reported once a minute so a gap shows up as a row
+// instead of as silence. Bounded by name so it cannot grow without limit.
+const DROPPED_TRACE_EVENT_NAME_LIMIT = 200;
+const DROPPED_TRACE_EVENT_OVERFLOW = "_other";
+const droppedTraceEvents = new Map<string, number>();
+
+function countDroppedTraceEvent(name: string): void {
+  const key = droppedTraceEvents.has(name) || droppedTraceEvents.size < DROPPED_TRACE_EVENT_NAME_LIMIT
+    ? name
+    : DROPPED_TRACE_EVENT_OVERFLOW;
+  droppedTraceEvents.set(key, (droppedTraceEvents.get(key) ?? 0) + 1);
+}
+
+/** Return and reset the per-name counts of trace records that had no tracer. */
+export function takeDroppedTraceEventCounts(): Map<string, number> {
+  const counts = new Map(droppedTraceEvents);
+  droppedTraceEvents.clear();
+  return counts;
+}
+
+export const DROPPED_TRACE_EVENT_REPORT_INTERVAL_MS = 60_000;
+
+/**
+ * Every interval, one `server.trace_event.dropped` event per name that was
+ * dropped since the last report (`event_name`, `count`). Nothing is emitted
+ * while the counts are zero.
+ */
+export function startDroppedTraceEventReporter(
+  tracer: Tracer,
+  intervalMs: number = DROPPED_TRACE_EVENT_REPORT_INTERVAL_MS,
+): () => void {
+  const timer = setInterval(() => {
+    try {
+      for (const [eventName, count] of takeDroppedTraceEventCounts()) {
+        tracer.emitEvent("server.trace_event.dropped", {
+          surface: "server",
+          attrs: { event_name: eventName, count, interval_ms: intervalMs },
+        });
+      }
+    } catch {
+      // Reporting must never affect the process.
+    }
+  }, intervalMs);
+  timer.unref?.();
+  return () => clearInterval(timer);
+}
+
+function tracerForRecord(name: string, explicit?: Tracer | null): Tracer {
+  const tracer = explicit ?? processDefaultTracer;
+  if (tracer) return tracer;
+  countDroppedTraceEvent(name);
+  return noopTracer;
+}
 
 export function runWithTraceSpan<T>(span: ActiveSpan, work: () => T, tracer?: Tracer): T {
   const activeTracer = tracer ?? activeTracerStore.getStore();
@@ -53,10 +120,11 @@ export function getCurrentTraceContext(): TraceContext | null {
  * Record a point in time fact as a standalone trace event. It is attached to
  * the active span when there is one, and uses the tracer of the current
  * request. Outside an instrumented request it uses the fallback tracer when
- * one is given, and does nothing otherwise.
+ * one is given, then the process default tracer; with neither it is dropped
+ * and counted (see `startDroppedTraceEventReporter`).
  */
 export function recordTraceEvent(name: string, attrs?: TraceAttributes, fallbackTracer?: Tracer): void {
-  const tracer = activeTracerStore.getStore() ?? fallbackTracer ?? noopTracer;
+  const tracer = tracerForRecord(name, activeTracerStore.getStore() ?? fallbackTracer);
   tracer.emitEvent(name, {
     surface: "server",
     attrs,
@@ -77,7 +145,7 @@ export async function withTraceRoot<T>(
   work: () => Promise<T>,
   errorEventName?: string,
 ): Promise<T> {
-  const activeTracer = tracer ?? noopTracer;
+  const activeTracer = tracerForRecord(name, tracer);
   const span = activeTracer.startSpan(name, options);
   try {
     const result = await runWithTraceSpan(span, work, activeTracer);
@@ -100,6 +168,8 @@ export async function withTraceRoot<T>(
 export interface TraceChildSpanOutcome<T> {
   onSuccess?: (result: T) => TraceAttributes;
   onError?: (error: unknown) => TraceAttributes;
+  /** The span's status for work that answers a failure instead of throwing it (default "ok"). */
+  statusOf?: (result: T) => "ok" | "error";
 }
 
 /**
@@ -124,7 +194,7 @@ export async function withTraceChildSpan<T>(
   });
   try {
     const result = await runWithTraceSpan(span, work, tracer);
-    span.end("ok", {
+    span.end(outcome.statusOf?.(result) ?? "ok", {
       attrs: {
         duration_ms: currentTimeMs() - startedAt,
         ...outcome.onSuccess?.(result),
@@ -160,6 +230,34 @@ export async function tracePhase<T>(
     ...event.attrs,
   });
   return result;
+}
+
+export const MIDDLEWARE_PHASE_FINISHED_EVENT = "middleware.phase.finished";
+
+/**
+ * The `next` of a pre-handler middleware phase: when the middleware hands the
+ * request on (with or without an error), the request span gets one
+ * `middleware.phase.finished` event with only `phase` (a stable short name)
+ * and `duration_ms` since this call. Call it first thing in the middleware.
+ * A middleware that answers the request itself records nothing here; the
+ * response's status says why. Outside an instrumented request it is a no-op.
+ */
+export function traceMiddlewarePhase(phase: string, next: NextFunction): NextFunction {
+  const startedAt = Date.now();
+  let recorded = false;
+  const traced = (...args: unknown[]): void => {
+    if (!recorded) {
+      recorded = true;
+      safeAddTraceEvent(MIDDLEWARE_PHASE_FINISHED_EVENT, () => ({ phase, duration_ms: Date.now() - startedAt }));
+    }
+    (next as (...nextArgs: unknown[]) => void)(...args);
+  };
+  return traced as NextFunction;
+}
+
+/** `traceMiddlewarePhase` around a middleware that is not ours to edit (e.g. a rate limiter). */
+export function withMiddlewarePhaseTrace(phase: string, handler: RequestHandler): RequestHandler {
+  return (req, res, next) => handler(req, res, traceMiddlewarePhase(phase, next));
 }
 
 /**

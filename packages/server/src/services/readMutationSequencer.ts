@@ -2,13 +2,21 @@ import { createHash, randomUUID } from "node:crypto";
 import { hostname } from "node:os";
 import { and, asc, eq, gt, inArray, isNotNull, lt, lte, or, sql } from "drizzle-orm";
 import type { SQL } from "drizzle-orm";
-import { currentDate, currentTimeMs, SERVER_GUEST_FEATURE_FLAG_KEY, noopTracer, setClockInterval, setClockTimeout, type Tracer } from "@botiverse/raft-shared";
+import { currentDate, currentTimeMs, noopTracer, setClockInterval, setClockTimeout, type MarkUnreadOutcome, type Tracer } from "@botiverse/raft-shared";
 
-import { evaluateFeatureFlag } from "./featureFlagService";
-import { getDb, type DatabaseExecutor, type DatabaseTransaction } from "../db/index";
+import { getBoundedAuthDb, getDb, type DatabaseExecutor, type DatabaseTransaction } from "../db/index";
 import { FencedAuthorizationDeniedError, lockActorMembershipRow, ServerMembershipRevokedError } from "../lib/actorMembershipFence";
 import { decideReadStateDelegation } from "../lib/actorPermissions";
 import { errorClassOf, getCurrentTraceContext, runWithTraceSpan, safeAddTraceEvent } from "../tracing/semanticTrace";
+import { withStatementStats } from "../db/statementStats";
+import { asServerId } from "@botiverse/raft-shared";
+import { prepareJointReadFanout, planJointReadFanout, applyJointReadFanout } from "./jointHumanReadFanout";
+import { announceJointHumanReadUpdates } from "./jointHumanReadRealtime";
+import {
+  filterJointHumanMemberEntries,
+  resolveJointHumanEntrySql,
+  resolveJointHumanMembershipScopes,
+} from "./jointHumanMembershipAccess";
 import {
   readMutationWorkerDrainDuration,
   readMutationWorkerDrainsTotal,
@@ -34,8 +42,19 @@ export const READ_MUTATION_RECOVERY_HORIZON_MS = 90 * 24 * 60 * 60 * 1_000;
 const DEFAULT_LEASE_MS = 30_000;
 const DEFAULT_WORKER_INTERVAL_MS = 1_000;
 const DEFAULT_WORKER_BATCH_SIZE = 50;
-const DEFAULT_COMPACTION_INTERVAL_MS = 60 * 60 * 1_000;
-const DEFAULT_COMPACTION_BATCH_SIZE = 100;
+// Each task compacts every 10 minutes, for up to the time budget below. Each
+// row is its own short transaction: production (v1.21.45) measured 24-57 rows
+// a second, so one 30 s cycle moves ~700-1,700 rows. Hourly cycles across 12
+// tasks gave ~340k rows a day, barely above the ~270k rows a day that become
+// terminal, which left a 1.85M-row expired backlog for weeks; every 10 minutes
+// is about 2M rows a day. On average less than one task is compacting at once.
+const DEFAULT_COMPACTION_INTERVAL_MS = 10 * 60 * 1_000;
+// Candidates read per batch. Grouped by principal (see compactTerminalReadMutations),
+// a larger batch puts more of one principal's rows into one transaction.
+const DEFAULT_COMPACTION_BATCH_SIZE = 500;
+// One compaction cycle keeps taking batches while they come back full, for up
+// to this long.
+const DEFAULT_COMPACTION_TIME_BUDGET_MS = 30_000;
 export const READ_MUTATION_COMPATIBILITY_WAIT_MS_ENV = "READ_MUTATION_COMPATIBILITY_WAIT_MS";
 const UUID_V4_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -139,8 +158,25 @@ export type ReadMutationAck = {
      * past maxReadSeq), so clients can update a count they cannot project
      * locally. 0 for the read-all kinds; set for row_read on a live scope;
      * absent otherwise and on acks minted before the field existed.
+     * For a human's row_unread on a live scope it is the Mark as Unread
+     * answer's count, decided with `unreadOutcome` from the same written
+     * state: the latest countable message's seq minus maxReadSeq (0 when none),
+     * the measure that answer has always used.
      */
     unreadCount?: number;
+    /**
+     * The scope is marked unread with nothing countable past the cursor
+     * (user_channel_read_cursors.marked_unread): set by a row_unread that found
+     * no message of others to rewind over, cleared by every read write. Present
+     * only when true; absent on acks minted before the field existed.
+     */
+    markedUnread?: true;
+    /**
+     * What a human's row_unread on a live scope left (counted / marked /
+     * nothing), decided in this transaction from the state it wrote. Set only
+     * there; absent on other kinds and on acks minted before the field existed.
+     */
+    unreadOutcome?: MarkUnreadOutcome;
   }>;
   terminalDigest: string;
 };
@@ -306,15 +342,134 @@ async function lockReadMutationAdmissionFence(
   if (agentMembership.rows.length !== 1) throw new FencedAuthorizationDeniedError("not_found");
   if (!input.actor) return;
   const agentRows = await tx.execute(sql`
-    SELECT a.creator_type AS "creatorType", a.creator_id AS "creatorId"
+    SELECT a.creator_type AS "creatorType", a.creator_id AS "creatorId", a.assistant_owner_user_id AS "assistantOwnerUserId"
     FROM agents a
     WHERE a.id = ${input.principalId}::uuid
       AND a.server_id = ${input.serverId}::uuid
   `);
-  const agent = agentRows.rows[0] as { creatorType: string | null; creatorId: string | null } | undefined;
+  const agent = agentRows.rows[0] as { creatorType: string | null; creatorId: string | null; assistantOwnerUserId: string | null } | undefined;
   if (!agent) throw new FencedAuthorizationDeniedError("not_found");
   const decision = decideReadStateDelegation({ callerServerRole: actorRole, userId: input.actor.userId, agent });
   if (!decision.allowed) throw new FencedAuthorizationDeniedError("forbidden");
+}
+
+/**
+ * Every sequencer transaction waits at most this long for a row lock (the
+ * authority row, read_mutations, cursors), then fails with 55P03 instead of
+ * holding a pool connection until the 15 s statement timeout. A stray holder
+ * (10-27 09:20Z: an idle-in-transaction session on read_mutation_authorities)
+ * then costs one fast failure: a worker claim stays leased and is retried after
+ * the lease, an admission or inline wait fails the request as the timeout did,
+ * only sooner. SET LOCAL ends with the transaction.
+ */
+export const SEQUENCER_LOCK_TIMEOUT = "3s";
+
+function sequencerTransaction<T>(fn: (tx: DatabaseTransaction) => Promise<T>): Promise<T> {
+  return getDb().transaction(async (tx) => {
+    await tx.execute(sql.raw(`SET LOCAL lock_timeout = '${SEQUENCER_LOCK_TIMEOUT}'`));
+    return fn(tx);
+  }).catch(async (error: unknown) => {
+    if (isLockNotAvailable(error)) await logSequencerLockHolders();
+    throw error;
+  });
+}
+
+function isLockNotAvailable(error: unknown): boolean {
+  for (let current = error, depth = 0; current && depth < 5; depth += 1) {
+    if ((current as { code?: unknown }).code === "55P03") return true;
+    current = (current as { cause?: unknown }).cause;
+  }
+  return false;
+}
+
+/**
+ * After a sequencer lock_timeout, trace the lock chain back to its front: for
+ * every session waiting on a lock right now, who blocks it (pg_blocking_pids).
+ * The blockers that are not themselves waiting on a lock are the front of the
+ * chain (e.g. a membership change holding a channel row or advisory lock while
+ * idle in transaction), which locks on the read tables alone would miss.
+ * Runs only on that failure, at most once per 30 s per process, on the bounded
+ * side pool (never the content pool, which is full during a burst) with a 1 s
+ * statement timeout. Logs pid, state, user, wait event, transaction age and a
+ * hash of the query; never the query text or its parameters. Never throws.
+ */
+const LOCK_HOLDER_SAMPLE_INTERVAL_MS = 30_000;
+let lastLockHolderSampleAtMs = 0;
+
+async function logSequencerLockHolders(): Promise<void> {
+  const nowMs = Date.now();
+  if (nowMs - lastLockHolderSampleAtMs < LOCK_HOLDER_SAMPLE_INTERVAL_MS) return;
+  lastLockHolderSampleAtMs = nowMs;
+  try {
+    const side = getBoundedAuthDb(1_000);
+    if (!side) return;
+    const result = await side.execute(sql`
+      SELECT w.pid AS "waiterPid", b.pid AS "blockerPid", b.state, b.usename AS "user",
+             b.wait_event_type AS "waitEventType", b.wait_event AS "waitEvent",
+             round(extract(epoch FROM now() - b.xact_start))::int AS "transactionAgeSeconds",
+             left(md5(coalesce(b.query, '')), 16) AS "queryHash"
+      FROM pg_stat_activity w
+      CROSS JOIN LATERAL unnest(pg_blocking_pids(w.pid)) AS bp(pid)
+      JOIN pg_stat_activity b ON b.pid = bp.pid
+      WHERE w.wait_event_type = 'Lock' AND w.pid <> pg_backend_pid()
+      ORDER BY "transactionAgeSeconds" DESC NULLS LAST
+      LIMIT 10
+    `);
+    const edges = result.rows as Array<Record<string, unknown>>;
+    // The front of the chain: blockers not themselves waiting on a lock.
+    const roots = [...new Map(edges
+      .filter((edge) => edge.waitEventType !== "Lock")
+      .map((edge) => [edge.blockerPid, edge])).values()];
+    console.warn("[ReadMutationSequencer] lock_timeout; lock chain", { roots, waits: edges.length });
+    const root = roots[0];
+    safeAddTraceEvent("server.read_mutation_sequencer.lock_timeout", () => ({
+      waiting_edge_count: edges.length,
+      root_count: roots.length,
+      ...(root ? {
+        root_pid: Number(root.blockerPid ?? 0),
+        root_state: String(root.state ?? ""),
+        root_user: String(root.user ?? ""),
+        root_wait_event: String(root.waitEvent ?? ""),
+        root_transaction_age_s: Number(root.transactionAgeSeconds ?? 0),
+        root_query_hash: String(root.queryHash ?? ""),
+      } : {}),
+    }));
+  } catch (error) {
+    console.warn("[ReadMutationSequencer] lock_timeout; lock chain lookup failed", { error: (error as Error)?.message });
+  }
+}
+
+let beforeCompactionDeleteForTests: ((tx: DatabaseTransaction) => Promise<void>) | null = null;
+
+/** Test hook: run inside a compaction chunk after its identity check, before its delete. */
+export function setBeforeCompactionDeleteForTests(hook: ((tx: DatabaseTransaction) => Promise<void>) | null): void {
+  beforeCompactionDeleteForTests = hook;
+}
+
+/** Test hook: let the next lock_timeout sample regardless of the 30 s limit. */
+export function resetLockHolderSampleLimitForTests(): void {
+  lastLockHolderSampleAtMs = 0;
+}
+
+/**
+ * Compaction's lock: the authority row if it is free, else null. Compaction
+ * never waits on a principal another worker (or the drain) holds; it skips it
+ * and a later cycle compacts it.
+ */
+async function tryLockAuthority(
+  tx: DatabaseTransaction,
+  serverId: string,
+  principalKind: ReadMutationPrincipalKind,
+  principalId: string,
+): Promise<boolean> {
+  const locked = await tx.execute(sql`
+    SELECT 1 FROM read_mutation_authorities
+    WHERE server_id = ${serverId}::uuid
+      AND principal_type = ${principalKind}
+      AND principal_id = ${principalId}::uuid
+    FOR UPDATE SKIP LOCKED
+  `);
+  return locked.rows.length > 0;
 }
 
 async function lockAuthority(
@@ -380,8 +535,12 @@ type ReadScopeAuthority =
 
 type AuthorizedReadMutationScope = {
   scopeId: string;
-  channelType: "channel" | "private" | "joint" | "dm" | "thread";
+  // `task`: a task conversation (task v2) — authorized like a thread, through
+  // its parent channel (parent_channel_id on every face).
+  channelType: "channel" | "private" | "joint" | "dm" | "thread" | "task";
   authority: ReadScopeAuthority;
+  /** Proven and locked by the computed root membership check, never by CH. */
+  computedJointMember?: true;
 };
 
 function liveReadScopeOf(resolved: AuthorizedReadMutationScope | null): LiveReadScope | null {
@@ -454,6 +613,30 @@ async function lockActiveReadMutationPrincipal(
         FOR KEY SHARE
       `);
   return membership.rows.length === 1;
+}
+
+/** Joint roots replace local CH authority, including a sub-conversation's
+ * parent. Absence from the map means not a joint projection (local CH
+ * authority applies), not denial. Keep the current J member locked through the
+ * cursor write, just as the CH path locks CH; admissions/source labels never
+ * grant read authority. */
+async function lockComputedJointReadMembership(
+  tx: DatabaseTransaction,
+  localChannelIds: string[],
+  userId: string,
+): Promise<Map<string, boolean>> {
+  if (localChannelIds.length === 0) return new Map();
+  const scopes = [...(await resolveJointHumanMembershipScopes({ localChannelIds }, tx)).values()];
+  if (scopes.length === 0) return new Map();
+  await tx.execute(sql`
+    SELECT joint_channel_id FROM joint_channel_members
+    WHERE user_id = ${userId}::uuid
+      AND joint_channel_id = ANY(${sql.param([...new Set(scopes.map((scope) => scope.jointId))])}::uuid[])
+    ORDER BY joint_channel_id
+    FOR KEY SHARE
+  `);
+  const allowed = await filterJointHumanMemberEntries(scopes, userId, tx);
+  return new Map(scopes.map((scope) => [scope.localChannelId, allowed.has(scope.localChannelId)]));
 }
 
 /**
@@ -540,7 +723,7 @@ async function resolveAuthorizedReadMutationScope(
   }
 
   let storageScopeId = local.scopeId;
-  if (local.channelType === "joint" || local.channelType === "thread") {
+  if (local.channelType === "joint" || local.channelType === "thread" || local.channelType === "task") {
     const projectionResult = await tx.execute(sql`
       SELECT projection.local_channel_id::text AS "localScopeId",
              joint_storage.canonical_channel_id::text AS "canonicalScopeId"
@@ -564,7 +747,41 @@ async function resolveAuthorizedReadMutationScope(
 
   let accessChannelId = local.scopeId;
   let accessChannelType = local.channelType;
-  if (local.channelType === "thread") {
+  if (local.channelType === "task") {
+    // Task conversation (task v2): every face carries its local parent channel.
+    const parentAccess = await tx.execute(sql`
+      SELECT parent.id::text AS "scopeId", parent.type::text AS "channelType"
+      FROM channels conversation
+      INNER JOIN channels parent ON parent.id = conversation.parent_channel_id
+      WHERE conversation.id = ${local.scopeId}::uuid
+        AND conversation.type = 'task'
+        AND parent.server_id = ${input.serverId}::uuid
+        AND parent.deleted_at IS NULL
+      FOR KEY SHARE OF conversation, parent
+    `);
+    const [parentChannel] = parentAccess.rows as Array<{
+      scopeId: string;
+      channelType: AuthorizedReadMutationScope["channelType"];
+    }>;
+    if (!parentChannel || parentChannel.channelType === "thread" || parentChannel.channelType === "task") {
+      if (input.allowLostAccessResidue === true) {
+        const residue = await tx.execute(sql`
+          SELECT 1
+          WHERE ${lostAccessResidueEvidence(input, local.scopeId)}
+        `);
+        if (residue.rows.length === 1) {
+          return {
+            scopeId: local.scopeId,
+            channelType: local.channelType,
+            authority: { kind: "residue", reason: "unavailable_thread_parent" },
+          };
+        }
+      }
+      return null;
+    }
+    accessChannelId = parentChannel.scopeId;
+    accessChannelType = parentChannel.channelType;
+  } else if (local.channelType === "thread") {
     const parentResult = await tx.execute(sql`
       SELECT parent_message.channel_id::text AS "canonicalParentScopeId"
       FROM channels storage_thread
@@ -622,8 +839,15 @@ async function resolveAuthorizedReadMutationScope(
     accessChannelType = parentChannel.channelType;
   }
 
+  let computedJointMember = false;
   if (accessChannelType !== "channel") {
-    const participant = input.principalKind === "human"
+    const computed = input.principalKind === "human" && accessChannelType === "joint"
+      ? await lockComputedJointReadMembership(tx, [accessChannelId], input.principalId)
+      : new Map<string, boolean>();
+    computedJointMember = computed.get(accessChannelId) === true;
+    const participates = computed.has(accessChannelId)
+      ? computed.get(accessChannelId) === true
+      : (input.principalKind === "human"
       ? await tx.execute(sql`
           SELECT ch.user_id
           FROM channel_humans ch
@@ -637,8 +861,8 @@ async function resolveAuthorizedReadMutationScope(
           WHERE ca.channel_id = ${accessChannelId}::uuid
             AND ca.agent_id = ${input.principalId}::uuid
           FOR KEY SHARE
-        `);
-    if (participant.rows.length !== 1) {
+        `)).rows.length === 1;
+    if (!participates) {
       // Task #48, usability half. Losing access must not strand the Activity
       // entry a receiver already owns: a removed member, or a participant of a
       // soft-deleted DM, still has rows of their own and no way to retire them.
@@ -663,7 +887,7 @@ async function resolveAuthorizedReadMutationScope(
       // The name is kept for both, and the distinction is not needed: neither
       // population is a probe -- both are residue authority bounded by
       // receiver-owned rows.
-      const residueScopeIds = local.channelType === "thread" && local.scopeId !== accessChannelId
+      const residueScopeIds = (local.channelType === "thread" || local.channelType === "task") && local.scopeId !== accessChannelId
         ? [accessChannelId, local.scopeId]
         : [accessChannelId];
       const residue = await tx.execute(sql`
@@ -683,6 +907,7 @@ async function resolveAuthorizedReadMutationScope(
     scopeId: local.scopeId,
     channelType: local.channelType,
     authority: { kind: "live", scope: mintLiveReadScope(storageScopeId) },
+    ...(computedJointMember ? { computedJointMember: true as const } : {}),
   };
 }
 
@@ -698,7 +923,7 @@ export async function inspectChannelReadAllScopeAuthorityForTests(input: {
   principalId: string;
   scopeId: string;
 }): Promise<"live" | ReadScopeResidueReason | null> {
-  return getDb().transaction(async (tx) => {
+  return sequencerTransaction(async (tx) => {
     const resolved = await resolveAuthorizedReadMutationScope(tx, {
       ...input,
       allowDeletedInboxResidue: true,
@@ -739,11 +964,13 @@ async function resolveAuthorizedReadMutationScopes(
  *
  * The per-scope resolver (resolveAuthorizedReadMutationScope) runs 2–6
  * statements per scope; this version resolves every candidate in TWO
- * statements regardless of count: one for non-thread scopes (local row +
+ * statements for the structural lookup regardless of count: one for non-thread scopes (local row +
  * joint projection + participant check) and one for thread scopes (parent
  * chain + parent projection + parent access + participant check). Output is
  * re-sorted into candidate order afterward because the boundary and ack feed
  * the terminal digest.
+ * Joint human roots additionally lock/recheck J membership in a batch,
+ * instead of depending on local CH.
  *
  * Lock order (uniform hierarchy — the refinement of Task #101's
  * "servers → member rows → resource rows" for this resolution; every
@@ -796,9 +1023,11 @@ async function resolveGlobalLiveReadScopes(
     seen.add(candidate.scopeId);
     positions.set(candidate.scopeId, index);
   });
-  const nonThreadIds = candidates.filter((c) => c.channelType !== "thread").map((c) => c.scopeId);
+  const nonThreadIds = candidates.filter((c) => c.channelType !== "thread" && c.channelType !== "task").map((c) => c.scopeId);
   const threadIds = candidates.filter((c) => c.channelType === "thread").map((c) => c.scopeId);
-  if (nonThreadIds.length === 0 && threadIds.length === 0) return [];
+  // Task conversations (task v2): authorized through their parent channel.
+  const taskConversationIds = candidates.filter((c) => c.channelType === "task").map((c) => c.scopeId);
+  if (nonThreadIds.length === 0 && threadIds.length === 0 && taskConversationIds.length === 0) return [];
   const membershipTable = principalKind === "human" ? "channel_humans" : "channel_agents";
   const membershipPrincipalColumn = principalKind === "human" ? "user_id" : "agent_id";
 
@@ -810,6 +1039,7 @@ async function resolveGlobalLiveReadScopes(
   // Maps record which membership rows each surviving scope depends on.
   const localMembershipScopeIds: string[] = [];
   const threadParentMembership = new Map<string, string>();
+  const jointRootIds = new Set<string>();
 
   // Statement 1 — non-thread locals: local channel row and joint projection.
   if (nonThreadIds.length > 0) {
@@ -830,7 +1060,7 @@ async function resolveGlobalLiveReadScopes(
       LEFT JOIN joint_channels j
         ON j.id = jps.joint_channel_id
        AND j.status = 'active'
-      WHERE c.type <> 'thread'
+      WHERE c.type NOT IN ('thread', 'task')
       ORDER BY s.scope_id
       FOR KEY SHARE OF c
     `);
@@ -841,6 +1071,7 @@ async function resolveGlobalLiveReadScopes(
     }>) {
       const channelType = row.channelType as AuthorizedReadMutationScope["channelType"];
       if (channelType === "joint" && !row.canonicalScopeId) continue;
+      if (channelType === "joint") jointRootIds.add(row.scopeId);
       // All non-thread scopes lock membership: for private/joint/dm it is the
       // authorization check; for plain channels the row exists by construction
       // of the candidate listing, so the lock is a fixed-cost no-op that keeps
@@ -911,9 +1142,58 @@ async function resolveGlobalLiveReadScopes(
       if (row.parentAccessChannelType !== "channel") {
         threadParentMembership.set(row.scopeId, row.parentAccessScopeId);
       }
+      if (row.parentAccessChannelType === "joint") jointRootIds.add(row.parentAccessScopeId);
       resolvedByScopeId.set(row.scopeId, {
         scopeId: row.scopeId,
         channelType: "thread",
+        authority: { kind: "live", scope: mintLiveReadScope(row.canonicalScopeId ?? row.scopeId) },
+      });
+    }
+  }
+
+  // Statement 2b — task conversations (task v2): local face, its canonical
+  // projection, and its parent access channel (parent_channel_id). Skipped
+  // when there are none, so thread-only resolutions keep their statement count.
+  if (taskConversationIds.length > 0) {
+    const conversations = await tx.execute(sql`
+      SELECT s.scope_id::text AS "scopeId",
+             j.canonical_channel_id::text AS "canonicalScopeId",
+             pc.id::text AS "parentAccessScopeId",
+             pc.type::text AS "parentAccessChannelType"
+      FROM unnest(${sql.param(taskConversationIds)}::uuid[]) WITH ORDINALITY AS s(scope_id, ord)
+      JOIN channels c
+        ON c.id = s.scope_id
+       AND c.server_id = ${serverId}::uuid
+       AND c.deleted_at IS NULL
+       AND c.type = 'task'
+      LEFT JOIN joint_channel_servers jps
+        ON jps.local_channel_id = c.id
+       AND jps.server_id = ${serverId}::uuid
+       AND jps.status = 'active'
+      LEFT JOIN joint_channels j
+        ON j.id = jps.joint_channel_id
+       AND j.status = 'active'
+      JOIN channels pc
+        ON pc.id = c.parent_channel_id
+       AND pc.server_id = ${serverId}::uuid
+       AND pc.deleted_at IS NULL
+      ORDER BY s.scope_id
+      FOR KEY SHARE OF c, pc
+    `);
+    for (const row of conversations.rows as Array<{
+      scopeId: string;
+      canonicalScopeId: string | null;
+      parentAccessScopeId: string;
+      parentAccessChannelType: string;
+    }>) {
+      if (row.parentAccessChannelType === "thread" || row.parentAccessChannelType === "task") continue;
+      if (row.parentAccessChannelType !== "channel") {
+        threadParentMembership.set(row.scopeId, row.parentAccessScopeId);
+      }
+      if (row.parentAccessChannelType === "joint") jointRootIds.add(row.parentAccessScopeId);
+      resolvedByScopeId.set(row.scopeId, {
+        scopeId: row.scopeId,
+        channelType: "task",
         authority: { kind: "live", scope: mintLiveReadScope(row.canonicalScopeId ?? row.scopeId) },
       });
     }
@@ -926,10 +1206,17 @@ async function resolveGlobalLiveReadScopes(
   // scopes are dropped below — exactly the per-scope resolver returning null.
   // Plain-channel access never required membership (the per-scope path skipped
   // the participant check for it) so those ids are not locked.
+  const computed = principalKind === "human"
+    ? await lockComputedJointReadMembership(tx, [...jointRootIds], principalId)
+    : new Map<string, boolean>();
   const lockIdSet = new Set<string>([
     ...localMembershipScopeIds,
     ...threadParentMembership.values(),
   ]);
+  // Only legacy roots depend on CH. A computed member can have no CH at this
+  // entry; a stale CH must not override a revoked J membership either.
+  for (const scopeId of computed.keys()) lockIdSet.delete(scopeId);
+  const locked = new Set([...computed].filter(([, allowed]) => allowed).map(([scopeId]) => scopeId));
   if (lockIdSet.size > 0) {
     const lockIds = [...lockIdSet].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
     const membership = await tx.execute(sql`
@@ -940,13 +1227,13 @@ async function resolveGlobalLiveReadScopes(
       ORDER BY channel_id
       FOR KEY SHARE
     `);
-    const locked = new Set<string>((membership.rows as Array<{ channelId: string }>).map((row) => row.channelId));
-    for (const scopeId of localMembershipScopeIds) {
-      if (!locked.has(scopeId)) resolvedByScopeId.delete(scopeId);
-    }
-    for (const [scopeId, parentAccessScopeId] of threadParentMembership) {
-      if (!locked.has(parentAccessScopeId)) resolvedByScopeId.delete(scopeId);
-    }
+    for (const row of membership.rows as Array<{ channelId: string }>) locked.add(row.channelId);
+  }
+  for (const scopeId of localMembershipScopeIds) {
+    if (!locked.has(scopeId)) resolvedByScopeId.delete(scopeId);
+  }
+  for (const [scopeId, parentAccessScopeId] of threadParentMembership) {
+    if (!locked.has(parentAccessScopeId)) resolvedByScopeId.delete(scopeId);
   }
   // Re-assemble in candidate order: the boundary and ack feed the terminal
   // digest, so ordering is load-bearing (asserted in tests).
@@ -1045,7 +1332,7 @@ export async function admitReadMutation(input: ReadMutationAdmissionInput): Prom
   if (mutation.kind === "done" && principalKind !== "human") {
     throw new ReadMutationError("INVALID_MUTATION_PAYLOAD", "Done mutations are human-only");
   }
-  return getDb().transaction(async (tx) => {
+  return sequencerTransaction(async (tx) => {
     await lockReadMutationAdmissionFence(tx, {
       serverId: input.serverId,
       principalKind,
@@ -1127,11 +1414,12 @@ export async function admitReadMutation(input: ReadMutationAdmissionInput): Prom
       throw new ReadMutationError("SCOPE_NOT_FOUND", "read mutation scope was not found");
     }
     if (mutation.kind === "conversation_read_all"
-      && (principalKind !== "human" || resolvedScope?.channelType === "thread")) {
+      && (principalKind !== "human" || resolvedScope?.channelType === "thread" || resolvedScope?.channelType === "task")) {
       throw new ReadMutationError("SCOPE_NOT_FOUND", "conversation read scope was not found");
     }
     if (mutation.kind === "done") {
-      const actualTargetKind: DoneTargetKind = resolvedScope!.channelType === "thread" ? "thread" : "channel";
+      // Done on a task conversation (task v2) is sub-conversation Done (`thread`).
+      const actualTargetKind: DoneTargetKind = resolvedScope!.channelType === "thread" || resolvedScope!.channelType === "task" ? "thread" : "channel";
       if (actualTargetKind !== mutation.targetKind) {
         throw new ReadMutationError("SCOPE_NOT_FOUND", "Done target kind does not match the authorized scope");
       }
@@ -1191,7 +1479,7 @@ export async function claimNextReadMutation(input: {
   const principalKind = input.principalKind ?? "human";
   const leaseMs = input.leaseMs ?? DEFAULT_LEASE_MS;
   if (!Number.isFinite(leaseMs) || leaseMs <= 0) throw new Error("leaseMs must be positive");
-  return getDb().transaction(async (tx) => {
+  return sequencerTransaction(async (tx) => {
     await lockAuthority(tx, input.serverId, principalKind, input.principalId);
     const [minimum] = await tx.select().from(readMutations).where(and(
       eq(readMutations.serverId, input.serverId),
@@ -1252,7 +1540,7 @@ export async function claimNextFairReadMutation(input: {
   const now = input.now ?? currentDate();
   const leaseMs = input.leaseMs ?? DEFAULT_LEASE_MS;
   if (!Number.isFinite(leaseMs) || leaseMs <= 0) throw new Error("leaseMs must be positive");
-  return getDb().transaction(async (tx) => {
+  return sequencerTransaction(async (tx) => {
     const candidateResult = await tx.execute(sql`
       -- The materialized pending set is the load-bearing stop condition for
       -- idle polls: an empty read_mutations partial index must prevent any
@@ -1405,6 +1693,8 @@ type CapturedChannelBoundary = {
   residueScopeIds: string[];
   /** row_read on a live scope: where its messages are stored, to count what stays unread. */
   unreadStorageScopeId?: string;
+  /** row_unread on a live scope: where its messages are stored and what it is, to find what it can mark unread. */
+  markUnreadScope?: { storageScopeId: string; conversationType: AuthorizedReadMutationScope["channelType"]; computedJointMember?: true };
 };
 
 async function captureChannelBoundary(
@@ -1461,7 +1751,7 @@ async function captureDoneBoundary(
   const live = liveReadScopeOf(resolved);
   if (!resolved || !live) return { boundary: null, applyBroadDoneMarker: false };
 
-  const actualTargetKind: DoneTargetKind = resolved.channelType === "thread" ? "thread" : "channel";
+  const actualTargetKind: DoneTargetKind = resolved.channelType === "thread" || resolved.channelType === "task" ? "thread" : "channel";
   if (actualTargetKind !== mutation.doneTargetKind) {
     return { boundary: null, applyBroadDoneMarker: false };
   }
@@ -1566,6 +1856,7 @@ async function captureGlobalBoundary(
   principalId: string,
 ): Promise<ReadMutationBoundary[] | null> {
   if (!await lockActiveReadMutationPrincipal(tx, serverId, principalKind, principalId)) return null;
+  const jointEntry = principalKind === "human" ? await resolveJointHumanEntrySql({ serverId }, tx) : null;
   const candidates = principalKind === "human"
     ? await tx.execute(sql`
         SELECT c.id::text AS "scopeId", c.type::text AS "channelType"
@@ -1577,19 +1868,21 @@ async function captureGlobalBoundary(
           AND c.deleted_at IS NULL
           AND c.archived_at IS NULL
           AND inbox.done_at IS NULL
-          AND EXISTS (
+          AND (EXISTS (
             SELECT 1
             FROM channel_humans ch
             WHERE ch.channel_id = c.id
               AND ch.user_id = ${principalId}::uuid
-          )
+          ) OR (c.type = 'joint' AND ${jointEntry ? jointEntry(sql`c.id`, sql`${principalId}::uuid`) : sql`false`}))
         UNION
         SELECT c.id::text AS "scopeId", c.type::text AS "channelType"
         FROM thread_follows tf
         INNER JOIN channels c
           ON c.id = tf.thread_channel_id
          AND c.server_id = ${serverId}::uuid
-         AND c.type = 'thread'
+         -- Task conversations (task v2) are followed like threads; their
+         -- reads (and a marked-unread flag) are part of Mark all read.
+         AND c.type IN ('thread', 'task')
          AND c.deleted_at IS NULL
         WHERE tf.follower_type = 'user'
           AND tf.follower_id = ${principalId}::uuid
@@ -1645,7 +1938,7 @@ async function captureLiveScopeBoundaries(
     principalId,
     candidates: candidateRows,
   });
-  if (requiredParentId && !resolved.some((scope) => scope.scopeId === requiredParentId && scope.channelType !== "thread")) {
+  if (requiredParentId && !resolved.some((scope) => scope.scopeId === requiredParentId && scope.channelType !== "thread" && scope.channelType !== "task")) {
     return null;
   }
   // Batch the per-channel frontier probe into one round trip: unnest + a scalar
@@ -1714,9 +2007,6 @@ async function captureConversationBoundary(
   parentId: string,
 ): Promise<ReadMutationBoundary[] | null> {
   if (!await lockActiveReadMutationPrincipal(tx, serverId, "human", principalId)) return null;
-  const guestGate = await evaluateFeatureFlag({
-    key: SERVER_GUEST_FEATURE_FLAG_KEY, serverId, userId: principalId,
-  }, tx);
   const candidates = await tx.execute(sql`
     WITH parent AS (
       SELECT p.id, p.type, sm.role, COALESCE(pj.canonical_channel_id, p.id) AS storage_id
@@ -1731,10 +2021,12 @@ async function captureConversationBoundary(
         AND (p.type <> 'joint' OR pj.id IS NOT NULL)
         AND NOT (p.name = 'all' AND p.type = 'private')
         -- Joined roots already require channel membership in the live resolver.
-        -- Guests may read those regular/private/DM roots, but never joint or
-        -- hidden #all roots, and only while the Guest gate is enabled.
+        -- A Guest reads only its one bound channel, as its member
+        -- (canGuestReadChannel, #wg-rbac:#15). A bound joint channel (P3) is
+        -- a candidate only; the live resolver applies the joint guest rule.
         AND (sm.role <> 'guest' OR (
-          ${guestGate.enabled} AND p.type <> 'joint' AND (p.type <> 'channel' OR p.name <> 'all' OR p.guest_visible)
+          p.id = sm.guest_channel_id AND (p.type = 'joint' OR (p.type IN ('channel', 'private')
+          AND EXISTS (SELECT 1 FROM channel_humans gch WHERE gch.channel_id = p.id AND gch.user_id = ${principalId}::uuid)))
         ))
     )
     SELECT p.id::text AS "scopeId", p.type::text AS "channelType" FROM parent p
@@ -1752,7 +2044,7 @@ async function captureConversationBoundary(
     JOIN parent p ON p.storage_id = pm.channel_id
     WHERE tf.follower_type = 'user' AND tf.follower_id = ${principalId}::uuid
       AND tf.done_at IS NULL AND tf.unfollowed_at IS NULL
-      AND (p.role <> 'guest' OR j.id IS NULL)
+      AND (p.role <> 'guest' OR j.id IS NULL OR p.type = 'joint')
     ORDER BY "scopeId"
   `);
   return captureLiveScopeBoundaries(
@@ -1798,6 +2090,10 @@ async function captureBoundary(
     boundary: [{ scopeId: mutation.scopeId!, throughSeq: mutation.requestedThroughSeq! }],
     residueScopeIds: [],
     ...(mutation.kind === "row_read" && live ? { unreadStorageScopeId: live.storageScopeId } : {}),
+    ...(mutation.kind === "row_unread" && live
+      ? { markUnreadScope: { storageScopeId: live.storageScopeId, conversationType: resolved.channelType,
+          ...(resolved.computedJointMember ? { computedJointMember: true as const } : {}) } }
+      : {}),
   };
 }
 
@@ -1811,6 +2107,8 @@ async function captureBoundary(
  * write's own transaction, takes no authority seq and leaves last_applied_authority_seq
  * as it was. The conflict predicate re-checks the value at write time, like
  * applyScopeBoundary, so a concurrent sequencer write can never be lowered.
+ * A human's (re-)join also clears a marked-unread flag left from before, so an
+ * old mark does not come back with the conversation.
  */
 export async function raiseReadPositionForJoin(
   executor: DatabaseExecutor,
@@ -1825,10 +2123,12 @@ export async function raiseReadPositionForJoin(
         INSERT INTO user_channel_read_cursors (user_id, channel_id, last_read_seq, read_state_version, updated_at)
         VALUES (${principalId}::uuid, ${scopeId}::uuid, ${throughSeq}, 1, now())
         ON CONFLICT (user_id, channel_id) DO UPDATE SET
-          last_read_seq = EXCLUDED.last_read_seq,
+          last_read_seq = GREATEST(EXCLUDED.last_read_seq, user_channel_read_cursors.last_read_seq),
           read_state_version = user_channel_read_cursors.read_state_version + 1,
+          marked_unread = false,
           updated_at = now()
         WHERE EXCLUDED.last_read_seq > user_channel_read_cursors.last_read_seq
+           OR user_channel_read_cursors.marked_unread
       `
     : sql`
         INSERT INTO agent_channel_read_cursors (agent_id, channel_id, last_read_seq, read_state_version, updated_at)
@@ -1901,6 +2201,9 @@ async function applyScopeBoundary(input: {
   // absent-row race with legacy compatibility writers that do not share the
   // sequencer authority lock, while ensuring unchanged scopes perform no
   // UPDATE and therefore cannot advance version/authority metadata.
+  // A read of a scope marked unread clears the mark even when the position
+  // does not move (the mark exists because nothing countable lies past it);
+  // the position itself stays raise-only.
   const humanUpsert = input.principalKind === "human" && input.direction === "forward"
     ? sql`
         INSERT INTO user_channel_read_cursors (
@@ -1909,11 +2212,13 @@ async function applyScopeBoundary(input: {
           ${input.principalId}::uuid, ${input.scopeId}::uuid, ${input.throughSeq}, 1, ${input.authoritySeq}, now()
         )
         ON CONFLICT (user_id, channel_id) DO UPDATE SET
-          last_read_seq = EXCLUDED.last_read_seq,
+          last_read_seq = GREATEST(EXCLUDED.last_read_seq, user_channel_read_cursors.last_read_seq),
           read_state_version = user_channel_read_cursors.read_state_version + 1,
           last_applied_authority_seq = EXCLUDED.last_applied_authority_seq,
+          marked_unread = false,
           updated_at = now()
         WHERE EXCLUDED.last_read_seq > user_channel_read_cursors.last_read_seq
+           OR user_channel_read_cursors.marked_unread
         RETURNING last_read_seq AS "lastReadSeq",
                   read_state_version AS "readStateVersion",
                   last_applied_authority_seq AS "lastAppliedAuthoritySeq",
@@ -1927,11 +2232,14 @@ async function applyScopeBoundary(input: {
           ${input.principalId}::uuid, ${input.scopeId}::uuid, ${input.throughSeq}, 1, ${input.authoritySeq}, now()
         )
         ON CONFLICT (user_id, channel_id) DO UPDATE SET
-          last_read_seq = EXCLUDED.last_read_seq,
+          last_read_seq = LEAST(EXCLUDED.last_read_seq, user_channel_read_cursors.last_read_seq),
           read_state_version = user_channel_read_cursors.read_state_version + 1,
           last_applied_authority_seq = EXCLUDED.last_applied_authority_seq,
+          -- A rewind counts what it marks unread: an older mark gives way.
+          marked_unread = false,
           updated_at = now()
         WHERE EXCLUDED.last_read_seq < user_channel_read_cursors.last_read_seq
+           OR user_channel_read_cursors.marked_unread
         RETURNING last_read_seq AS "lastReadSeq",
                   read_state_version AS "readStateVersion",
                   last_applied_authority_seq AS "lastAppliedAuthoritySeq"
@@ -2028,6 +2336,184 @@ async function applyScopeBoundary(input: {
 }
 
 /**
+ * A message of `m` that Mark as Unread can count for the principal: not their
+ * own, not a system line they caused, not a noise subtype; in a task
+ * conversation, a chat message only (its lifecycle lines are not "new": the
+ * unread count, rw_task_conversation_unread_v1, counts chat messages). The one
+ * predicate of resolveReadMutationUnreadBoundary (where the rewind lands) and
+ * of row_unread's mark decision below, so neither disagrees with the count.
+ */
+function unreadEligibleMessageSql(
+  principalKind: ReadMutationPrincipalKind,
+  principalId: string,
+  conversationType: AuthorizedReadMutationScope["channelType"],
+): SQL {
+  const senderType = principalKind === "human" ? "user" : "agent";
+  const chatOnly = conversationType === "task" ? sql`AND m.message_type = 'chat'` : sql``;
+  return sql`NOT (
+      m.sender_type = ${senderType}
+      AND m.sender_id = ${principalId}
+    )
+    AND NOT COALESCE(
+      m.message_type = 'system'
+      AND m.causal_actor_type = ${senderType}
+      AND m.causal_actor_id = ${principalId}, FALSE
+    )
+    AND (m.system_subtype IS NULL OR m.system_subtype NOT IN ('channel.self_unfollow_thread', 'task.deleted_summary'))
+    ${chatOnly}`;
+}
+
+/**
+ * A human's row_unread on a live scope. When a message the person can count
+ * lies past the requested position (or past the cursor, if that is lower), the
+ * cursor is rewound as before (and an older mark gives way). Otherwise nothing
+ * past the cursor is countable (a thread whose only message from someone else
+ * is its parent, stored in the parent channel), and rewinding would leave the
+ * scope read: the cursor stays and the scope is marked unread instead
+ * (marked_unread, one read-state version). Mark as Unread therefore takes
+ * effect on every conversation the person is in, and counts never include the
+ * mark. Refused (unchanged, not marked): a conversation with no messages at all
+ * (nothing to come back to), and one the person is not in (a channel they are
+ * not a member of, a thread or task conversation they do not follow), where
+ * neither the sidebar nor Activity would show the mark.
+ */
+async function applyRowUnread(input: {
+  tx: DatabaseTransaction;
+  principalId: string;
+  authoritySeq: number;
+  scopeId: string;
+  storageScopeId: string;
+  conversationType: AuthorizedReadMutationScope["channelType"];
+  computedJointMember?: true;
+  throughSeq: number;
+  afterCursorLocked?: () => Promise<void>;
+}): Promise<ReadMutationAck["scopes"][number]> {
+  const locked = await input.tx.execute(sql`
+    SELECT last_read_seq AS "lastReadSeq"
+    FROM user_channel_read_cursors
+    WHERE user_id = ${input.principalId}::uuid AND channel_id = ${input.scopeId}::uuid
+    FOR UPDATE
+  `);
+  const [cursor] = locked.rows as Array<{ lastReadSeq: unknown }>;
+  const rewindTo = Math.min(input.throughSeq, cursor ? asNumber(cursor.lastReadSeq) : 0);
+  const subConversation = input.conversationType === "thread" || input.conversationType === "task";
+  const decided = await input.tx.execute(sql`
+    SELECT EXISTS (
+             SELECT 1 FROM messages m
+             WHERE m.channel_id = ${input.storageScopeId}::uuid
+               AND m.seq > ${rewindTo}
+               AND ${unreadEligibleMessageSql("human", input.principalId, input.conversationType)}
+           ) AS "rewinds",
+           EXISTS (SELECT 1 FROM messages m WHERE m.channel_id = ${input.storageScopeId}::uuid) AS "hasMessages",
+           ${subConversation
+             ? sql`EXISTS (
+                 SELECT 1 FROM thread_follows tf
+                 WHERE tf.thread_channel_id = ${input.scopeId}::uuid
+                   AND tf.follower_type = 'user'
+                   AND tf.follower_id = ${input.principalId}::uuid
+                   AND tf.unfollowed_at IS NULL
+               )`
+             : input.computedJointMember ? sql`true` : sql`EXISTS (
+                 SELECT 1 FROM channel_humans ch
+                 WHERE ch.channel_id = ${input.scopeId}::uuid AND ch.user_id = ${input.principalId}::uuid
+               )`} AS "inConversation"
+  `);
+  const [decision] = decided.rows as Array<{ rewinds: unknown; hasMessages: unknown; inConversation: unknown }>;
+  if (decision?.rewinds === true) {
+    const rewound = await applyScopeBoundary({
+      tx: input.tx,
+      principalKind: "human",
+      principalId: input.principalId,
+      authoritySeq: input.authoritySeq,
+      scopeId: input.scopeId,
+      throughSeq: input.throughSeq,
+      direction: "backward",
+      afterCursorLocked: input.afterCursorLocked,
+    });
+    // Count and outcome come from one read of the written state: the latest
+    // countable message past the cursor as written (still under its row lock),
+    // not past rewindTo; a cursorless scope is written at throughSeq, which can
+    // be above rewindTo. The count is the seq distance to it, the measure the
+    // /unread answer has always used. Read by the (channel_id, seq) index.
+    const latest = await input.tx.execute(sql`
+      SELECT m.seq AS "seq"
+      FROM messages m
+      WHERE m.channel_id = ${input.storageScopeId}::uuid
+        AND m.seq > ${rewound.maxReadSeq}
+        AND ${unreadEligibleMessageSql("human", input.principalId, input.conversationType)}
+      ORDER BY m.seq DESC
+      LIMIT 1
+    `);
+    const [latestRow] = latest.rows as Array<{ seq: unknown }>;
+    const unreadCount = latestRow ? Math.max(asNumber(latestRow.seq) - rewound.maxReadSeq, 0) : 0;
+    // A rewind clears any older mark, so this scope is never left marked.
+    return { ...rewound, unreadCount, unreadOutcome: unreadCount > 0 ? "counted" : "nothing" };
+  }
+  await input.afterCursorLocked?.();
+  type CursorRow = { lastReadSeq: unknown; readStateVersion: unknown; lastAppliedAuthoritySeq: unknown };
+  const currentRow = async () => {
+    const current = await input.tx.execute(sql`
+      SELECT last_read_seq AS "lastReadSeq",
+             read_state_version AS "readStateVersion",
+             last_applied_authority_seq AS "lastAppliedAuthoritySeq",
+             marked_unread AS "markedUnread"
+      FROM user_channel_read_cursors
+      WHERE user_id = ${input.principalId}::uuid AND channel_id = ${input.scopeId}::uuid
+    `);
+    return (current.rows as Array<CursorRow & { markedUnread: unknown }>)[0];
+  };
+  if (decision?.hasMessages !== true || decision?.inConversation !== true) {
+    const row = await currentRow();
+    return {
+      scopeId: input.scopeId,
+      maxReadSeq: row ? asNumber(row.lastReadSeq) : 0,
+      readStateVersion: row ? asNumber(row.readStateVersion) : 0,
+      lastAppliedAuthoritySeq: row ? asNumber(row.lastAppliedAuthoritySeq) : 0,
+      changed: false,
+      // Refused: nothing countable lies past the cursor (else it would have
+      // rewound). A mark left from before (normally cleared by the unfollow's
+      // read or the re-join) is still the written state, reported as such.
+      // Nothing countable past the cursor: no count.
+      unreadCount: 0,
+      ...(row?.markedUnread === true
+        ? { markedUnread: true as const, unreadOutcome: "marked" as const }
+        : { unreadOutcome: "nothing" as const }),
+    };
+  }
+  const marked = await input.tx.execute(sql`
+    INSERT INTO user_channel_read_cursors (
+      user_id, channel_id, last_read_seq, read_state_version, last_applied_authority_seq, marked_unread, updated_at
+    ) VALUES (
+      ${input.principalId}::uuid, ${input.scopeId}::uuid, 0, 1, ${input.authoritySeq}, true, now()
+    )
+    ON CONFLICT (user_id, channel_id) DO UPDATE SET
+      marked_unread = true,
+      read_state_version = user_channel_read_cursors.read_state_version + 1,
+      last_applied_authority_seq = EXCLUDED.last_applied_authority_seq,
+      updated_at = now()
+    WHERE NOT user_channel_read_cursors.marked_unread
+    RETURNING last_read_seq AS "lastReadSeq",
+              read_state_version AS "readStateVersion",
+              last_applied_authority_seq AS "lastAppliedAuthoritySeq"
+  `);
+  let [row] = marked.rows as CursorRow[];
+  const changed = Boolean(row);
+  // Already marked: an unchanged scope, like a repeated rewind.
+  if (!row) row = await currentRow();
+  if (!row) throw new Error("read mutation cursor resolution returned no row");
+  return {
+    scopeId: input.scopeId,
+    maxReadSeq: asNumber(row.lastReadSeq),
+    readStateVersion: asNumber(row.readStateVersion),
+    lastAppliedAuthoritySeq: asNumber(row.lastAppliedAuthoritySeq),
+    changed,
+    unreadCount: 0,
+    markedUnread: true,
+    unreadOutcome: "marked",
+  };
+}
+
+/**
  * Batched apply for global_read_all. The per-scope loop (one FOR UPDATE + one
  * upsert per channel) becomes three statements total: a sorted batch lock, one
  * unnest-driven upsert, and a supplementary read for channels the upsert did
@@ -2078,6 +2564,9 @@ async function applyGlobalScopeBoundaries(input: {
   }
 
   const throughSeqOf = new Map(boundary.map((entry) => [entry.scopeId, entry.throughSeq]));
+  // A human's read also clears a scope's marked-unread flag where the position
+  // does not move (applyScopeBoundary's forward branch); agents have no flag.
+  const clearsMark = input.principalKind === "human";
   // (b) One upsert for every boundary channel. Forward semantics only:
   // global_read_all always moves the cursor forward, matching the per-scope
   // forward branch of applyScopeBoundary.
@@ -2092,11 +2581,13 @@ async function applyGlobalScopeBoundaries(input: {
     ) AS b(channel_id, through_seq)
     ORDER BY b.channel_id
     ON CONFLICT (${sql.raw(principalColumn)}, channel_id) DO UPDATE SET
-      last_read_seq = EXCLUDED.last_read_seq,
+      last_read_seq = GREATEST(EXCLUDED.last_read_seq, ${sql.raw(cursorTable)}.last_read_seq),
       read_state_version = ${sql.raw(cursorTable)}.read_state_version + 1,
       last_applied_authority_seq = EXCLUDED.last_applied_authority_seq,
+      ${clearsMark ? sql`marked_unread = false,` : sql``}
       updated_at = now()
     WHERE EXCLUDED.last_read_seq > ${sql.raw(cursorTable)}.last_read_seq
+      ${clearsMark ? sql`OR ${sql.raw(cursorTable)}.marked_unread` : sql``}
     RETURNING channel_id,
               last_read_seq AS "lastReadSeq",
               read_state_version AS "readStateVersion",
@@ -2258,7 +2749,8 @@ export async function executeReadMutationClaim(input: {
   const now = input.now ?? currentDate();
   if (input.failpoint === "before_effect") throw new ReadMutationFailpointError(input.failpoint);
 
-  const ack = await getDb().transaction(async (tx) => {
+  const ack = await sequencerTransaction(async (tx) => {
+    const jointPreparation = await prepareJointReadFanout(tx, input.claim);
     // Task #93 line B: servers first, so holding the member row and then inserting a servers-FK row (read_mutations/authority)
     // cannot deadlock with transitionMemberRole. The authority decision below is unchanged.
     await lockReadMutationServerRow(tx, input.claim.serverId);
@@ -2275,6 +2767,7 @@ export async function executeReadMutationClaim(input: {
     let captured: ReadMutationBoundary[] | null;
     let residueScopeIds: ReadonlySet<string> = new Set();
     let unreadStorageScopeId: string | undefined;
+    let markUnreadScope: CapturedChannelBoundary["markUnreadScope"];
     let applyBroadDoneMarker = false;
     let doneFrontierBeyondLatest = false;
     try {
@@ -2287,6 +2780,7 @@ export async function executeReadMutationClaim(input: {
         captured = capturedScopes?.boundary ?? null;
         residueScopeIds = new Set(capturedScopes?.residueScopeIds ?? []);
         unreadStorageScopeId = capturedScopes?.unreadStorageScopeId;
+        markUnreadScope = capturedScopes?.markUnreadScope;
       }
     } catch (error) {
       if (
@@ -2305,6 +2799,8 @@ export async function executeReadMutationClaim(input: {
     const authorizationRevoked = captured === null;
     const boundary = captured ?? [];
     await input.afterBoundaryCaptured?.({ tx, boundary });
+    const jointPlan = await planJointReadFanout(tx, input.claim, jointPreparation, boundary, residueScopeIds);
+    const effectiveThrough = new Map(jointPlan.effectiveBoundary.map((row) => [row.scopeId, row.throughSeq]));
     const scopes: ReadMutationAck["scopes"] = [];
     if ((minimum.kind === "global_read_all" || minimum.kind === "conversation_read_all") && boundary.length > 0) {
       // Batched apply: one lock, one upsert, one supplementary read for the
@@ -2317,7 +2813,7 @@ export async function executeReadMutationClaim(input: {
         principalKind: minimum.principalType,
         principalId: minimum.principalId,
         authoritySeq: minimum.authoritySeq,
-        boundary,
+        boundary: jointPlan.effectiveBoundary,
         afterScopeCursorLocked: input.afterScopeCursorLocked
           ? ({ scopeId, index }) => input.afterScopeCursorLocked!({ scopeId, index })
           : undefined,
@@ -2345,19 +2841,32 @@ export async function executeReadMutationClaim(input: {
           });
         }
       }
-      const appliedScope = await applyScopeBoundary({
-        tx,
-        principalKind: minimum.principalType,
-        principalId: minimum.principalId,
-        authoritySeq: minimum.authoritySeq,
-        scopeId: capturedScope.scopeId,
-        throughSeq: capturedScope.throughSeq,
-        direction: minimum.kind === "row_unread" ? "backward" : "forward",
-        afterCursorLocked: input.afterScopeCursorLocked
-          ? () => input.afterScopeCursorLocked!({ scopeId: capturedScope.scopeId, index })
-          : undefined,
-        unreadStorageScopeId,
-      });
+      const afterCursorLocked = input.afterScopeCursorLocked
+        ? () => input.afterScopeCursorLocked!({ scopeId: capturedScope.scopeId, index })
+        : undefined;
+      const appliedScope = minimum.kind === "row_unread" && minimum.principalType === "human" && markUnreadScope
+        ? await applyRowUnread({
+          tx,
+          principalId: minimum.principalId,
+          authoritySeq: minimum.authoritySeq,
+          scopeId: capturedScope.scopeId,
+          storageScopeId: markUnreadScope.storageScopeId,
+          conversationType: markUnreadScope.conversationType,
+          computedJointMember: markUnreadScope.computedJointMember,
+          throughSeq: asNumber(effectiveThrough.get(capturedScope.scopeId) ?? capturedScope.throughSeq),
+          afterCursorLocked,
+        })
+        : await applyScopeBoundary({
+          tx,
+          principalKind: minimum.principalType,
+          principalId: minimum.principalId,
+          authoritySeq: minimum.authoritySeq,
+          scopeId: capturedScope.scopeId,
+          throughSeq: effectiveThrough.get(capturedScope.scopeId) ?? capturedScope.throughSeq,
+          direction: minimum.kind === "row_unread" ? "backward" : "forward",
+          afterCursorLocked,
+          unreadStorageScopeId: unreadStorageScopeId ?? jointPlan.groups.get(capturedScope.scopeId)?.[0]?.storageScopeId,
+        });
       const ackScope = minimum.kind === "channel_read_all" ? { ...appliedScope, unreadCount: 0 } : appliedScope;
       scopes.push(residueScopeIds.has(capturedScope.scopeId)
         ? residueScopeAck(ackScope, capturedScope.throughSeq)
@@ -2377,6 +2886,18 @@ export async function executeReadMutationClaim(input: {
     }
     }
 
+    const jointUpdates = await applyJointReadFanout(tx, input.claim, jointPlan, scopes);
+    // Include the source deliberately: a durable worker can finish after the
+    // request went away, or without an HTTP route at all. HTTP may repeat the
+    // source push, which clients deduplicate by read-state version; notification
+    // retraction already coalesces the same user/server/scope to its max frontier.
+    announceJointHumanReadUpdates({
+      userId: minimum.principalId, mutationId: minimum.mutationId, forward: minimum.kind !== "row_unread",
+      updates: [...scopes.filter((row) => jointPlan.groups.has(row.scopeId)).map((row) => ({
+        ...row, serverId: asServerId(minimum.serverId),
+      })), ...jointUpdates],
+    });
+
     // serving_rows maintenance retired (2026-09-21 teardown): read-state is
     // authoritative in cursors; Activity surfaces derive from them in RW.
 
@@ -2384,7 +2905,7 @@ export async function executeReadMutationClaim(input: {
       throw new ReadMutationFailpointError(input.failpoint);
     }
 
-    const anyCursorChanged = scopes.some((scope) => scope.changed);
+    const anyCursorChanged = scopes.some((scope) => scope.changed) || jointUpdates.length > 0;
     const doneEffectApplied = minimum.kind === "done"
       && !doneFrontierBeyondLatest
       && !authorizationRevoked
@@ -2479,7 +3000,7 @@ export async function resolveReadMutationUnreadBoundary(input: {
   scopeId: string;
 }): Promise<{ latestUnreadEligibleSeq: number; throughSeq: number }> {
   const principalKind = input.principalKind ?? "human";
-  return getDb().transaction(async (tx) => {
+  return sequencerTransaction(async (tx) => {
     // Task #93 line B: this boundary read is a read-state entry point reached straight from the unread route, ahead of
     // any admission. Fence Server membership first, in the global order, so a principal removed or demoted after the
     // request-level checks is refused with the typed error the routes map to 403 — instead of falling through to the
@@ -2496,16 +3017,7 @@ export async function resolveReadMutationUnreadBoundary(input: {
       SELECT COALESCE(MAX(m.seq), 0)::int AS "latestUnreadEligibleSeq"
       FROM messages m
       WHERE m.channel_id = ${live.storageScopeId}::uuid
-        AND NOT (
-          m.sender_type = ${principalKind === "human" ? "user" : "agent"}
-          AND m.sender_id = ${input.principalId}
-        )
-        AND NOT COALESCE(
-          m.message_type = 'system'
-          AND m.causal_actor_type = ${principalKind === "human" ? "user" : "agent"}
-          AND m.causal_actor_id = ${input.principalId}, FALSE
-        )
-        AND (m.system_subtype IS NULL OR m.system_subtype NOT IN ('channel.self_unfollow_thread', 'task.deleted_summary'))
+        AND ${unreadEligibleMessageSql(principalKind, input.principalId, resolved!.channelType)}
     `);
     const [row] = result.rows as Array<{ latestUnreadEligibleSeq: unknown }>;
     const latestUnreadEligibleSeq = asNumber(row?.latestUnreadEligibleSeq ?? 0);
@@ -2561,7 +3073,7 @@ export async function executeCompatibilityReadMutation(input: {
       )).limit(1);
       if (row && (row.state === "applied" || row.state === "retired_no_effect") && row.ack) {
         const storedAck = row.ack;
-        const bounded = await getDb().transaction((tx) => boundStoredChannelReadAllAck(tx, {
+        const bounded = await sequencerTransaction((tx) => boundStoredChannelReadAllAck(tx, {
           serverId: input.serverId,
           principalKind,
           principalId: input.principalId,
@@ -2615,92 +3127,162 @@ export async function executeCompatibilityReadMutation(input: {
   );
 }
 
+/** One `uuid[]` parameter (a JS array would expand into one parameter per id). */
+function uuidArrayParam(ids: readonly string[]) {
+  return sql`${`{${ids.join(",")}}`}::uuid[]`;
+}
+
+/** At most this many of one principal's candidates move in one transaction. */
+const COMPACTION_PRINCIPAL_CHUNK = 100;
+
+/** A chunk row changed between the read and the delete: the chunk rolls back. */
+class CompactionChunkChangedError extends Error {
+  constructor() {
+    super("read mutation compaction chunk changed while it was being moved");
+  }
+}
+
 export async function compactTerminalReadMutations(input: {
   before?: Date;
   limit?: number;
-} = {}): Promise<{ compacted: number }> {
+} = {}): Promise<{ compacted: number; candidates: number }> {
   const limit = Math.max(1, Math.min(input.limit ?? 100, 1_000));
   const retentionPredicate = input.before
     ? lt(readMutations.terminalAt, input.before)
     : sql`${readMutations.terminalAt} < now() - interval '90 days'`;
-  const candidates = await getDb().select({
+  // One ordered read per terminal state, merged here. With both states in one
+  // `state IN (...) ORDER BY terminal_at`, the (state, terminal_at) index
+  // cannot return rows in terminal_at order, so the planner bitmap-scanned and
+  // sorted every expired row (about 1.8M in production) and the query hit the
+  // statement timeout on every run. Each per-state read is an ordered index
+  // range scan that stops after `limit` rows.
+  const candidatesForState = (state: "applied" | "retired_no_effect") => getDb().select({
     serverId: readMutations.serverId,
     principalKind: readMutations.principalType,
     principalId: readMutations.principalId,
     mutationId: readMutations.mutationId,
+    terminalAt: readMutations.terminalAt,
   }).from(readMutations).where(and(
-    inArray(readMutations.state, ["applied", "retired_no_effect"]),
+    eq(readMutations.state, state),
     isNotNull(readMutations.terminalAt),
     retentionPredicate,
   )).orderBy(asc(readMutations.terminalAt)).limit(limit);
+  const candidates = [
+    ...await candidatesForState("applied"),
+    ...await candidatesForState("retired_no_effect"),
+  ]
+    .sort((left, right) => left.terminalAt!.getTime() - right.terminalAt!.getTime())
+    .slice(0, limit);
+
+  // One transaction per principal (per chunk of up to COMPACTION_PRINCIPAL_CHUNK
+  // of its candidates), not per row. Each row was its own transaction and
+  // touched cold heap and index pages: production measured 18-40 ms a row.
+  // Under the principal's authority lock (skipped, never waited for) the chunk
+  // is written as tombstones and deleted together: either every live row of
+  // the chunk moves, or none does.
+  const groups = new Map<string, typeof candidates>();
+  for (const candidate of candidates) {
+    const key = `${candidate.serverId}\u0000${candidate.principalKind}\u0000${candidate.principalId}`;
+    const group = groups.get(key);
+    if (group) group.push(candidate); else groups.set(key, [candidate]);
+  }
+  const chunks: Array<typeof candidates> = [];
+  for (const group of groups.values()) {
+    for (let start = 0; start < group.length; start += COMPACTION_PRINCIPAL_CHUNK) {
+      chunks.push(group.slice(start, start + COMPACTION_PRINCIPAL_CHUNK));
+    }
+  }
 
   let compacted = 0;
-  for (const candidate of candidates) {
-    const moved = await getDb().transaction(async (tx) => {
-      await lockAuthority(tx, candidate.serverId, candidate.principalKind, candidate.principalId);
-      const [live] = await tx.select().from(readMutations).where(and(
-        eq(readMutations.serverId, candidate.serverId),
-        eq(readMutations.principalType, candidate.principalKind),
-        eq(readMutations.principalId, candidate.principalId),
-        eq(readMutations.mutationId, candidate.mutationId),
-        inArray(readMutations.state, ["applied", "retired_no_effect"]),
-        isNotNull(readMutations.terminalDigest),
-      )).limit(1);
-      if (!live || !live.terminalDigest || !live.terminalReason || !live.terminalAt) return false;
-      if (input.before && live.terminalAt >= input.before) return false;
-      if (!input.before) {
-        const eligible = await tx.execute(sql`SELECT ${live.terminalAt}::timestamptz < now() - interval '90 days' AS eligible`);
-        if (!(eligible.rows[0] as { eligible?: boolean } | undefined)?.eligible) return false;
-      }
-
-      await tx.insert(readMutationTombstones).values({
-        serverId: live.serverId,
-        principalType: live.principalType,
-        principalId: live.principalId,
-        mutationId: live.mutationId,
-        payloadHash: live.payloadHash,
-        originalAuthoritySeq: live.authoritySeq,
-        terminalState: live.state as ReadMutationTerminalState,
-        terminalReason: live.terminalReason as ReadMutationTerminalReason,
-        terminalDigest: live.terminalDigest,
-      }).onConflictDoNothing({
-        target: [
-          readMutationTombstones.serverId,
-          readMutationTombstones.principalType,
-          readMutationTombstones.principalId,
-          readMutationTombstones.mutationId,
-        ],
-      });
-      const [tombstone] = await tx.select().from(readMutationTombstones).where(and(
-        eq(readMutationTombstones.serverId, live.serverId),
-        eq(readMutationTombstones.principalType, live.principalType),
-        eq(readMutationTombstones.principalId, live.principalId),
-        eq(readMutationTombstones.mutationId, live.mutationId),
-      )).limit(1);
-      if (
-        !tombstone
-        || tombstone.payloadHash !== live.payloadHash
-        || tombstone.originalAuthoritySeq !== live.authoritySeq
-        || tombstone.terminalState !== live.state
-        || tombstone.terminalReason !== live.terminalReason
-        || tombstone.terminalDigest !== live.terminalDigest
-      ) {
+  for (const chunk of chunks) {
+    const { serverId, principalKind, principalId } = chunk[0]!;
+    const mutationIds = chunk.map((candidate) => candidate.mutationId);
+    const eligible = input.before
+      ? sql`m.terminal_at < ${input.before.toISOString()}::timestamptz`
+      : sql`m.terminal_at < now() - interval '90 days'`;
+    const moved = await sequencerTransaction(async (tx) => {
+      if (!await tryLockAuthority(tx, serverId, principalKind, principalId)) return 0;
+      const live = await tx.execute<{ mutation_id: string }>(sql`
+        SELECT m.mutation_id::text AS mutation_id FROM read_mutations m
+        WHERE m.server_id = ${serverId}::uuid
+          AND m.principal_type = ${principalKind}
+          AND m.principal_id = ${principalId}::uuid
+          AND m.mutation_id = ANY(${uuidArrayParam(mutationIds)})
+          AND m.state IN ('applied', 'retired_no_effect')
+          AND m.terminal_digest IS NOT NULL
+          AND m.terminal_reason IS NOT NULL
+          AND m.terminal_at IS NOT NULL
+          AND ${eligible}
+      `);
+      const liveIds = live.rows.map((row) => row.mutation_id);
+      if (liveIds.length === 0) return 0;
+      await tx.execute(sql`
+        INSERT INTO read_mutation_tombstones (
+          server_id, principal_type, principal_id, mutation_id, payload_hash,
+          original_authority_seq, terminal_state, terminal_reason, terminal_digest
+        )
+        SELECT m.server_id, m.principal_type, m.principal_id, m.mutation_id, m.payload_hash,
+          m.authority_seq, m.state, m.terminal_reason, m.terminal_digest
+        FROM read_mutations m
+        WHERE m.server_id = ${serverId}::uuid
+          AND m.principal_type = ${principalKind}
+          AND m.principal_id = ${principalId}::uuid
+          AND m.mutation_id = ANY(${uuidArrayParam(liveIds)})
+        ON CONFLICT (server_id, principal_type, principal_id, mutation_id) DO NOTHING
+      `);
+      // A tombstone that already existed must match the live terminal identity.
+      const mismatched = await tx.execute<{ n: number }>(sql`
+        SELECT count(*)::int AS n FROM read_mutations m
+        LEFT JOIN read_mutation_tombstones t
+          ON t.server_id = m.server_id AND t.principal_type = m.principal_type
+         AND t.principal_id = m.principal_id AND t.mutation_id = m.mutation_id
+        WHERE m.server_id = ${serverId}::uuid
+          AND m.principal_type = ${principalKind}
+          AND m.principal_id = ${principalId}::uuid
+          AND m.mutation_id = ANY(${uuidArrayParam(liveIds)})
+          AND (t.mutation_id IS NULL
+            OR t.payload_hash IS DISTINCT FROM m.payload_hash
+            OR t.original_authority_seq IS DISTINCT FROM m.authority_seq
+            OR t.terminal_state IS DISTINCT FROM m.state
+            OR t.terminal_reason IS DISTINCT FROM m.terminal_reason
+            OR t.terminal_digest IS DISTINCT FROM m.terminal_digest)
+      `);
+      if ((mismatched.rows[0]?.n ?? 0) > 0) {
         throw new Error("read mutation tombstone conflict does not match the live terminal identity");
       }
-      const deleted = await tx.delete(readMutations).where(and(
-        eq(readMutations.serverId, live.serverId),
-        eq(readMutations.principalType, live.principalType),
-        eq(readMutations.principalId, live.principalId),
-        eq(readMutations.mutationId, live.mutationId),
-        eq(readMutations.authoritySeq, live.authoritySeq),
-        eq(readMutations.state, live.state),
-        eq(readMutations.terminalDigest, live.terminalDigest),
-      )).returning({ mutationId: readMutations.mutationId });
-      return deleted.length === 1;
+      if (beforeCompactionDeleteForTests) await beforeCompactionDeleteForTests(tx);
+      // Delete exactly the identity each tombstone recorded: a row whose
+      // authority seq, state, reason or digest no longer matches its tombstone stays,
+      // and the count check below rolls the chunk back.
+      const deleted = await tx.execute<{ mutation_id: string }>(sql`
+        DELETE FROM read_mutations m
+        USING read_mutation_tombstones t
+        WHERE m.server_id = ${serverId}::uuid
+          AND m.principal_type = ${principalKind}
+          AND m.principal_id = ${principalId}::uuid
+          AND m.mutation_id = ANY(${uuidArrayParam(liveIds)})
+          AND t.server_id = m.server_id AND t.principal_type = m.principal_type
+          AND t.principal_id = m.principal_id AND t.mutation_id = m.mutation_id
+          AND t.payload_hash = m.payload_hash
+          AND t.original_authority_seq = m.authority_seq
+          AND t.terminal_state = m.state
+          AND t.terminal_reason IS NOT DISTINCT FROM m.terminal_reason
+          AND t.terminal_digest = m.terminal_digest
+        RETURNING m.mutation_id
+      `);
+      // All or nothing: a row that changed between the read and the delete
+      // rolls back the whole chunk, tombstones included.
+      if (deleted.rows.length !== liveIds.length) {
+        throw new CompactionChunkChangedError();
+      }
+      return deleted.rows.length;
+    }).catch((error: unknown) => {
+      if (error instanceof CompactionChunkChangedError) return 0;
+      throw error;
     });
-    if (moved) compacted += 1;
+    compacted += moved;
   }
-  return { compacted };
+  return { compacted, candidates: candidates.length };
 }
 
 export async function getReadMutationFrontier(input: {
@@ -2753,7 +3335,7 @@ export async function getReadMutationFrontier(input: {
     throw new ReadMutationError("INVALID_MUTATION_PAYLOAD", "scopeIds must contain at most 100 UUIDs");
   }
   const principalKind = input.principalKind ?? "human";
-  return getDb().transaction(async (tx) => {
+  return sequencerTransaction(async (tx) => {
     // Task #93 line B: servers first; lockAuthority below may insert the authority row (FK servers) after the member row.
     await lockReadMutationServerRow(tx, input.serverId);
     if (!await lockActiveReadMutationPrincipal(tx, input.serverId, principalKind, input.principalId)) {
@@ -2973,7 +3555,11 @@ export async function drainReadMutationOutbox(input: {
       },
     });
     try {
-      await runWithTraceSpan(claimSpan, () => executeReadMutationClaim({ claim }), tracer);
+      await runWithTraceSpan(
+        claimSpan,
+        () => withStatementStats(`read_mutation.claim.${claim.kind}`, () => executeReadMutationClaim({ claim })),
+        tracer,
+      );
       claimSpan.end("ok");
       processed += 1;
     } catch (error) {
@@ -3021,6 +3607,7 @@ export function startReadMutationWorker(input: {
   batchSize?: number;
   compactionIntervalMs?: number;
   compactionBatchSize?: number;
+  compactionTimeBudgetMs?: number;
   leaseOwner?: string;
   clock?: ReadMutationWorkerClock;
   /** Used for the drain root span and forwarded to drainReadMutationOutbox. */
@@ -3073,7 +3660,26 @@ export function startReadMutationWorker(input: {
     if (compacting) return;
     compacting = true;
     const startedAtMs = currentTimeMs();
-    compactTerminalReadMutations({ limit: input.compactionBatchSize ?? DEFAULT_COMPACTION_BATCH_SIZE })
+    const batchSize = input.compactionBatchSize ?? DEFAULT_COMPACTION_BATCH_SIZE;
+    const budgetMs = input.compactionTimeBudgetMs ?? DEFAULT_COMPACTION_TIME_BUDGET_MS;
+    const compactUntilShortOrBudget = async (): Promise<{ compacted: number }> => {
+      let compacted = 0;
+      for (;;) {
+        const batch = await withStatementStats(
+          "read_mutation.compaction_batch",
+          () => compactTerminalReadMutations({ limit: batchSize }),
+          ({ compacted: batchCompacted, candidates }) => ({ compacted: batchCompacted, candidates }),
+        );
+        compacted += batch.compacted;
+        // Stop when the expired rows are used up (fewer candidates than a
+        // batch) or nothing in the batch could move (all locked by the drain or
+        // already taken by another task). A batch that moved some rows but not
+        // all (a few principals locked, rows another task compacted first) is
+        // no reason to stop: production cycles stopped after 10 s that way.
+        if (batch.candidates < batchSize || batch.compacted === 0 || currentTimeMs() - startedAtMs >= budgetMs || stopped) return { compacted };
+      }
+    };
+    compactUntilShortOrBudget()
       .then((result) => {
         if (result.compacted > 0) {
           console.info("[ReadMutationSequencer] compaction cycle", {
@@ -3092,17 +3698,32 @@ export function startReadMutationWorker(input: {
         compacting = false;
       });
   };
-  runDrain();
-  runCompaction();
-  const drainTimer = clock.scheduleEvery(runDrain, intervalMs);
-  const compactionTimer = clock.scheduleEvery(runCompaction, compactionIntervalMs);
-  for (const timer of [drainTimer, compactionTimer]) {
+  const unrefTimer = (timer: unknown) => {
     if (typeof timer === "object" && timer && "unref" in timer && typeof timer.unref === "function") timer.unref();
-  }
+  };
+  runDrain();
+  const drainTimer = clock.scheduleEvery(runDrain, intervalMs);
+  unrefTimer(drainTimer);
+  let compactionTimer: unknown = null;
+  let stopped = false;
+  const startCompaction = () => {
+    if (stopped) return;
+    runCompaction();
+    compactionTimer = clock.scheduleEvery(runCompaction, compactionIntervalMs);
+    unrefTimer(compactionTimer);
+  };
+  // Every task starts at deploy time, so without jitter all of them compact in
+  // the same minute and queue on the same authority rows as the drain (10-27
+  // 18:22 / 23:22). In production each task starts at a random point within the
+  // interval; an injected clock (tests) starts at once, as before.
+  const compactionJitter = input.clock ? null : setTimeout(startCompaction, Math.floor(Math.random() * compactionIntervalMs));
+  if (compactionJitter) unrefTimer(compactionJitter); else startCompaction();
   return {
     stop: () => {
+      stopped = true;
+      if (compactionJitter) clearTimeout(compactionJitter);
       clock.clearInterval(drainTimer);
-      clock.clearInterval(compactionTimer);
+      if (compactionTimer !== null) clock.clearInterval(compactionTimer);
     },
   };
 }

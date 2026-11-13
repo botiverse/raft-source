@@ -3,11 +3,11 @@
 exports[`channel hold: skipped line anchors on the lowest held seq when firstShownSeq is absent 1`] = `
 "Held — 3 unread messages in #general. Your task claim was not applied.
 
-  ├ ⋯ 1 earlier message skipped in this notice. Older exist: raft message read --target "#general" --before 51. ⋯
+  ├ ⋯ 1 earlier message skipped in this notice. Older: raft message read --target "#general" --before 51 ⋯
   ├ Latest 2 ────────────────────────────
   │ @scout 09:01  second
   │ @richard 09:00  first
-  └ Previews are truncated. Full text: raft message read --target "#general"
+  └ ────────────────────────────────────────
 
 After reviewing the current state of this conversation, choose one path.
 "
@@ -22,7 +22,7 @@ Equivalent: raft user info @richard
 After reading it, choose one path.
 To send the current draft unchanged:
   raft message send --send-draft --target "dm:@richard"
-You can also choose not to send anything.
+If what you just read already says what you meant to say, or makes your message unnecessary, send nothing.
 "
 `;
 
@@ -43,7 +43,7 @@ To update the draft, send revised content normally:
 exports[`hold with no previews: pointer line only, singular noun 1`] = `
 "Held — 1 unread message in #general. Your message has been saved as a draft.
 
-  └ Previews are truncated. Full text: raft message read --target "#general"
+  └ Not shown here. Read them: raft message read --target "#general"
 
 After reviewing the current state of this conversation, choose one path.
 "
@@ -52,11 +52,11 @@ After reviewing the current state of this conversation, choose one path.
 exports[`server window counts and anchors are passed through: shown count, first shown seq, string seqs 1`] = `
 "Held — 9 unread messages in #general. Your message has been saved as a draft.
 
-  ├ ⋯ 6 earlier messages skipped in this notice. Older exist: raft message read --target "#general" --before 40. ⋯
+  ├ ⋯ 6 earlier messages skipped in this notice. Older: raft message read --target "#general" --before 40 ⋯
   ├ Latest 3 ────────────────────────────
   │ @scout 09:01  string seq
   │ @richard  no seq
-  └ Previews are truncated. Full text: raft message read --target "#general"
+  └ Not all of it is shown here. Read it: raft message read --target "#general"
 
 After reviewing the current state of this conversation, choose one path.
 "
@@ -67,7 +67,7 @@ exports[`thread hold: no start anchor when the thread start is inside the shown 
 
   ├ Latest 1 ────────────────────────────
   │ @richard  root
-  └ Previews are truncated. Full text: raft message read --target "dm:@richard:1a2b3c4d"
+  └ ────────────────────────────────────────
 
 After reviewing the current state of this conversation, choose one path.
 "
@@ -79,7 +79,7 @@ Note: 2 of these messages formally @mention you.
 
   ┌ Thread start ────────────────────────────
   │ @richard 08:00  Deploy plan for the API tier
-  ├ ⋯ 4 earlier messages skipped in this notice. Older exist: raft message read --target "#ops:1a2b3c4d" --before 1205. ⋯
+  ├ ⋯ 4 earlier messages skipped in this notice. Older: raft message read --target "#ops:1a2b3c4d" --before 1205 ⋯
   ├ Latest 3 ────────────────────────────
   │ @scout 09:01  The rollout is paused because the canary error rate doubled after the config push; please hold any deploys to the API tier until we confirm the fix, then re-run…⟨38 more chars⟩
   │ @李雷 09:02  这次发布先暂停：配置推送之后金丝雀的错误率翻了一倍。这次发布先暂停：配置推送之后金丝雀的错误率翻了一倍。这次发布先暂停：配置推送之后金丝雀的错误率翻了一倍。这次发布先暂停：配置推送之后金丝雀的错误率翻了一倍。这次发布先暂停：配置推送之后金丝雀的错误率翻了一倍。这次发布先暂停：配置推送之后金丝雀的错误率翻了一倍。这次发布…⟨100 more chars⟩
@@ -103,7 +103,7 @@ Equivalent: raft channel info "#ops"
 
   ├ Latest 1 ────────────────────────────
   │ @richard 09:00  deploy at 5?
-  └ Previews are truncated. Full text: raft message read --target "#ops"
+  └ ────────────────────────────────────────
 
 After reviewing the current state of this conversation, choose one path.
 "

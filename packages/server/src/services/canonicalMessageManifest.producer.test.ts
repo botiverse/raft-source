@@ -80,6 +80,7 @@ const EXTERNAL_AUTHOR_FORWARD: { [K in ManifestNestedNames<"externalAuthor">]: K
   appRegistrationId: "appRegistrationId", avatarDigest: "avatarDigest", avatarUrl: "avatarUrl",
   displayName: "displayName", externalActorId: "externalActorId",
   externalConversationId: "externalConversationId", externalMessageId: "externalMessageId",
+  identityKind: "identityKind", profileFallback: "profileFallback",
   installId: "installId", projectionId: "projectionId", provider: "provider", workspaceId: "workspaceId",
   workspaceName: "workspaceName",
 };
@@ -88,6 +89,7 @@ const EXTERNAL_AUTHOR_REVERSE: { [K in keyof EnrichedExternalAuthor]: K & Manife
   appRegistrationId: "appRegistrationId", avatarDigest: "avatarDigest", avatarUrl: "avatarUrl",
   displayName: "displayName", externalActorId: "externalActorId",
   externalConversationId: "externalConversationId", externalMessageId: "externalMessageId",
+  identityKind: "identityKind", profileFallback: "profileFallback",
   installId: "installId", projectionId: "projectionId", provider: "provider", workspaceId: "workspaceId",
   workspaceName: "workspaceName",
 };

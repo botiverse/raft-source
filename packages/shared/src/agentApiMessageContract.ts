@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { lazySchema } from "./lazySchema";
 import { isSlackBridgedExternalProvider } from "./externalProjection";
+import type { AgentMessageCardMarker, MessageCardInput } from "./messageCard";
 
 const optionalStringSchema = lazySchema("optionalStringSchema", () => z.string().trim().optional());
 const optionalStringArraySchema = lazySchema("optionalStringArraySchema", () => z.array(z.string().trim().min(1)).optional());
@@ -97,9 +98,47 @@ const agentApiSendBodyKnownSchema = lazySchema("agentApiSendBodyKnownSchema", ()
 
 export const agentApiSendBodySchema = lazySchema("agentApiSendBodySchema", () => agentApiSendBodyKnownSchema.passthrough());
 
+/**
+ * RFC 082: a card on a v2 send, read loosely here. The Server checks it with
+ * the shared `parseMessageCard` and refuses one that breaks a rule with 400
+ * `card_invalid` naming the element's path and the limit, not a contract
+ * mismatch; a Server whose `message_cards` flag is off refuses any card
+ * (`message_cards_disabled`). Older Servers ignore the field (passthrough).
+ */
+const agentApiSendCardSchema = lazySchema("agentApiSendCardSchema", () => z.object({}).passthrough()
+  .describe("A message card (RFC 082): { version: 1, header?, root, elements }, validated by the Server"));
+
 export const agentApiSendV2BodySchema = lazySchema("agentApiSendV2BodySchema", () => agentApiSendBodyKnownSchema.extend({
   mentions: z.array(agentApiStructuredMentionSchema).optional(),
+  card: agentApiSendCardSchema.optional(),
 }).passthrough());
+
+/**
+ * RFC 082 §4.2: `PUT /messages/:messageId/card`, the sender replacing its
+ * card message's card and fallback. `card` is read loosely here and checked
+ * by the Server as at send (400 `card_invalid`); `content` absent: the
+ * fallback is derived from the new card. Mentions are never resolved again,
+ * so the body has no `mentions`.
+ */
+export const agentApiMessageCardUpdateBodySchema = lazySchema("agentApiMessageCardUpdateBodySchema", () => z.object({
+  card: agentApiSendCardSchema,
+  content: z.string().optional(),
+  /** The revision the caller last read; another current revision refuses with 409 `card_revision_conflict`. */
+  expectedRevision: z.number().int().positive().optional(),
+  idempotencyKey: optionalStringSchema,
+}).passthrough());
+
+/** A card update's answer (also the replay of a repeated `idempotencyKey`). */
+export const agentApiMessageCardUpdateResponseSchema = lazySchema("agentApiMessageCardUpdateResponseSchema", () => passthroughObject({
+  ok: z.literal(true),
+  messageId: z.string(),
+  revision: z.number().int().positive(),
+  updatedAt: z.string(),
+  /** Each @mention in the new fallback: none of them was notified. */
+  unnotifiedMentionHandles: z.array(z.string()),
+  /** "Updating notifies no one. …" for the agent, naming those mentions. */
+  notice: z.string(),
+}));
 
 export const legacyAgentSendBodySchema = lazySchema("legacyAgentSendBodySchema", () => agentApiSendBodySchema.extend({
   channel: z.string().optional(),
@@ -109,6 +148,15 @@ export const legacyAgentSendBodySchema = lazySchema("legacyAgentSendBodySchema",
 export const agentApiAttachmentEnvelopeSchema = lazySchema("agentApiAttachmentEnvelopeSchema", () => passthroughObject({
   id: z.string(),
   filename: z.string(),
+}));
+
+/** Task v2: one task hanging under a chat message (servers with task v2 conversations only). */
+export const agentApiMessageSourceTaskSchema = lazySchema("agentApiMessageSourceTaskSchema", () => passthroughObject({
+  number: z.number().int().positive(),
+  status: z.string(),
+  assignee_type: z.string().nullable().optional(),
+  assignee_id: z.string().nullable().optional(),
+  assignee_name: z.string().nullable().optional(),
 }));
 
 export const agentApiTaskCurrentProjectionSchema = lazySchema("agentApiTaskCurrentProjectionSchema", () => passthroughObject({
@@ -163,6 +211,27 @@ export function isAgentApiExternalMessageForbiddenAuthorityField(field: string):
     || AGENT_API_EXTERNAL_MESSAGE_TASK_LIFECYCLE_FIELD.test(field);
 }
 
+/** At most this many reactors are named per emoji in a message envelope's `reactions`; `count` is the true total. */
+export const AGENT_API_MESSAGE_REACTION_REACTORS_MAX = 5;
+
+/**
+ * One emoji's reactions on a message, as an agent reads them
+ * (`AgentApiMessageEnvelope.reactions`): how many reacted with it, and the
+ * first AGENT_API_MESSAGE_REACTION_REACTORS_MAX of them, in the order they
+ * reacted. `reactors` is absent from a Server older than the field (then only
+ * `count` is known). Not gated by any flag.
+ */
+export const agentApiMessageReactionSchema = lazySchema("agentApiMessageReactionSchema", () => passthroughObject({
+  emoji: z.string(),
+  count: z.number().int().nonnegative(),
+  reactors: z.array(passthroughObject({
+    /** The reactor's handle, written without `@`; a display name where there is no handle. */
+    name: z.string(),
+    /** `human`, `agent`, or `external` (someone mirrored from another service, such as Slack). */
+    kind: z.string(),
+  })).optional(),
+}));
+
 export const agentApiMessageEnvelopeSchema = lazySchema("agentApiMessageEnvelopeSchema", () => passthroughObject({
   seq: optionalNumberSchema,
   id: optionalStringSchema,
@@ -177,12 +246,15 @@ export const agentApiMessageEnvelopeSchema = lazySchema("agentApiMessageEnvelope
   sender_description: z.string().nullable().optional(),
   senderTimezone: z.string().nullable().optional(),
   sender_timezone: z.string().nullable().optional(),
+  delegated_by: z.object({ name: z.string() }).passthrough().nullable().optional(),
   external_message: agentApiExternalMessageProvenanceSchema.optional(),
   channel_type: optionalStringSchema,
   channel_name: optionalStringSchema,
   parent_channel_type: optionalStringSchema,
   parent_channel_name: optionalStringSchema,
-  content: optionalStringSchema,
+  // The body keeps its leading blanks (a first line of indented code reads as
+  // written); only trailing blanks go (most sends end with a line break).
+  content: z.string().overwrite((text) => text.trimEnd()).optional(),
   attachments: z.array(agentApiAttachmentEnvelopeSchema).optional(),
   taskStatus: z.string().nullable().optional(),
   task_status: z.string().nullable().optional(),
@@ -196,8 +268,18 @@ export const agentApiMessageEnvelopeSchema = lazySchema("agentApiMessageEnvelope
   task_assignee_name: z.string().nullable().optional(),
   taskCurrentProjection: agentApiTaskCurrentProjectionSchema.optional(),
   task_current_projection: agentApiTaskCurrentProjectionSchema.optional(),
+  source_tasks: z.array(agentApiMessageSourceTaskSchema).optional(),
+  task_conversation_number: z.number().int().positive().optional(),
   threadId: z.string().nullable().optional(),
   replyCount: z.number().int().nonnegative().nullable().optional(),
+  /**
+   * RFC 082: a card message's revision and when it last changed (`card=r1` in
+   * the header), and `text`, the card as markdown Raft generates from it
+   * (§4.3; absent from an older Server).
+   */
+  message_card: z.object({ revision: z.number().int().positive(), updated_at: z.string(), text: z.string().optional() }).nullable().optional(),
+  /** The message's reactions, one entry per emoji in the order each was first used; empty or absent when it has none. */
+  reactions: z.array(agentApiMessageReactionSchema).optional(),
 }).superRefine((value, ctx) => {
   if (!value.external_message) return;
   const senderTypes = [value.senderType, value.sender_type].filter((v): v is string => v !== undefined);
@@ -255,9 +337,13 @@ export const agentApiSendSentResponseSchema = lazySchema("agentApiSendSentRespon
   state: z.literal("sent"),
   messageId: z.string(),
   messageSeq: optionalNumberSchema,
+  /** Task v2: the target named a task conversation; newer CLIs reply with `raft task reply <ref>`. */
+  taskCommandHint: optionalStringSchema,
   recentUnread: z.array(agentApiMessageEnvelopeSchema).optional(),
   pendingMentionActions: z.array(agentApiMessageEnvelopeSchema).optional(),
   unresolvedMentionHandles: z.array(z.string()).optional(),
+  /** Handles of the agents this message was delivered to, sorted; [] when none. Absent when not counted (Joint channel, older Server). */
+  deliveredToAgents: z.array(z.string()).optional(),
   attention: passthroughObject({
     driveByJoinedToPost: passthroughObject({
       reason: optionalStringSchema,
@@ -271,6 +357,8 @@ export const agentApiSendSentResponseSchema = lazySchema("agentApiSendSentRespon
   channelCardChanged: optionalBooleanSchema,
   /** A DM target's peer card, when this context has not seen the peer. */
   peerCard: agentApiPeerCardSchema.optional(),
+  /** RFC 082: the card stored with the message (a send with `card`; a replay: its revision now). Absent: no card was stored (an older Server ignores `card` and posts the text). */
+  messageCard: passthroughObject({ revision: z.number().int().positive() }).optional(),
 }));
 
 export const agentApiSendNotFoundResponseSchema = lazySchema("agentApiSendNotFoundResponseSchema", () => passthroughObject({
@@ -286,6 +374,8 @@ export const agentApiSendCommittedResponseSchema = lazySchema("agentApiSendCommi
   messageSeq: optionalNumberSchema,
   reconciliation: z.literal(true),
   receiptComplete: z.literal(false),
+  /** RFC 082: the committed message carries a card (its revision now). Absent: no card (a text message, or an older Server). */
+  messageCard: passthroughObject({ revision: z.number().int().positive() }).optional(),
 }));
 
 export const agentApiSendResponseSchema = lazySchema("agentApiSendResponseSchema", () => z.discriminatedUnion("state", [
@@ -322,6 +412,37 @@ export interface AgentApiSendBody extends AgentApiSendBodyKnownFields {
 
 export interface AgentApiSendV2Body extends AgentApiSendBodyKnownFields {
   mentions?: AgentApiStructuredMention[];
+  /**
+   * RFC 082: post the message as a card. `content` is then optional: it is the
+   * card's fallback (what agents, search and push read), derived from the card
+   * when absent; only a `content` the sender wrote mentions anyone.
+   */
+  card?: MessageCardInput;
+  [key: string]: unknown;
+}
+
+/**
+ * RFC 082 §4.2: the sender replaces the card (and its fallback `content`,
+ * derived from the new card when absent). Notifies no one: a mention in the
+ * new `content` is not resolved.
+ */
+export interface AgentApiMessageCardUpdateBody {
+  card: MessageCardInput;
+  content?: string;
+  /** The revision last read; the update is refused (409 `card_revision_conflict`) when the card moved on. */
+  expectedRevision?: number;
+  /** The same key with the same body answers the first result again; with another body, 409 `idempotency_key_reused`. */
+  idempotencyKey?: string;
+  [key: string]: unknown;
+}
+
+export interface AgentApiMessageCardUpdateResponse {
+  ok: true;
+  messageId: string;
+  revision: number;
+  updatedAt: string;
+  unnotifiedMentionHandles: string[];
+  notice: string;
   [key: string]: unknown;
 }
 
@@ -364,6 +485,8 @@ export interface AgentApiMessageEnvelope {
   sender_description?: string | null;
   senderTimezone?: string | null;
   sender_timezone?: string | null;
+  /** RFC 077: the personal assistant that sent this as its owner (the sender). */
+  delegated_by?: { name: string } | null;
   external_message?: AgentApiExternalMessageProvenance;
   channel_type?: string;
   channel_name?: string;
@@ -381,8 +504,45 @@ export interface AgentApiMessageEnvelope {
   task_assignee_type?: string | null;
   taskAssigneeName?: string | null;
   task_assignee_name?: string | null;
+  /** Task v2: every task hanging under this chat message (servers with task v2 conversations only). */
+  source_tasks?: AgentApiMessageSourceTask[];
+  /** Task v2: the message is in this task's own conversation (its target is the task ref `#channel:#7`). */
+  task_conversation_number?: number;
   threadId?: string | null;
   replyCount?: number | null;
+  /** RFC 082: set on a card message; `content` is its fallback text, `message_card.text` the card as markdown. */
+  message_card?: AgentMessageCardMarker | null;
+  /** The message's reactions, one entry per emoji; empty or absent when it has none. */
+  reactions?: AgentApiMessageReaction[];
+  [key: string]: unknown;
+}
+
+/** Who reacted, as an agent reads it: `external` is someone mirrored from another service (Slack). */
+export type AgentApiMessageReactorKind = "human" | "agent" | "external";
+
+export interface AgentApiMessageReactor {
+  /** The handle, written without `@`; a display name where there is no handle. */
+  name: string;
+  kind: AgentApiMessageReactorKind | (string & {});
+  [key: string]: unknown;
+}
+
+/** One emoji's reactions on a message (agentApiMessageReactionSchema). */
+export interface AgentApiMessageReaction {
+  emoji: string;
+  /** Everyone who reacted with it, however many `reactors` names. */
+  count: number;
+  /** The first AGENT_API_MESSAGE_REACTION_REACTORS_MAX, in the order they reacted; absent from an older Server. */
+  reactors?: AgentApiMessageReactor[];
+  [key: string]: unknown;
+}
+
+export interface AgentApiMessageSourceTask {
+  number: number;
+  status: string;
+  assignee_type?: string | null;
+  assignee_id?: string | null;
+  assignee_name?: string | null;
   [key: string]: unknown;
 }
 
@@ -432,9 +592,12 @@ export interface AgentApiSendSentResponse {
   state: "sent";
   messageId: string;
   messageSeq?: number;
+  taskCommandHint?: string;
   recentUnread?: AgentApiMessageEnvelope[];
   pendingMentionActions?: AgentApiMessageEnvelope[];
   unresolvedMentionHandles?: string[];
+  /** Handles of the agents this message was delivered to, sorted; [] when none. Absent when not counted (Joint channel, older Server). */
+  deliveredToAgents?: string[];
   attention?: {
     driveByJoinedToPost?: {
       reason?: string;
@@ -450,6 +613,8 @@ export interface AgentApiSendSentResponse {
   channelCardChanged?: boolean;
   /** A DM target's peer card, when this context has not seen the peer. */
   peerCard?: AgentApiPeerCard;
+  /** RFC 082: the card stored with the message (a send with `card`; a replay: its revision now). Absent: no card was stored (an older Server ignores `card` and posts the text). */
+  messageCard?: { revision: number; [key: string]: unknown };
   [key: string]: unknown;
 }
 
@@ -467,6 +632,8 @@ export interface AgentApiSendCommittedResponse {
   messageSeq?: number;
   reconciliation: true;
   receiptComplete: false;
+  /** RFC 082: the committed message carries a card (its revision now). Absent: no card (a text message, or an older Server). */
+  messageCard?: { revision: number; [key: string]: unknown };
   [key: string]: unknown;
 }
 

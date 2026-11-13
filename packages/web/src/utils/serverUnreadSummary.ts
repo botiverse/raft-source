@@ -1,9 +1,17 @@
 export interface ServerUnreadSummary {
   unreadCount: number;
   serverPushMuted: boolean;
-  /** Present only when the server proved the Activity count is known. */
+  /**
+   * Present only when the server proved the Activity count is known. With
+   * an object app on for the server, its unread object rows are added in
+   * (`activityObjectUnreadCount`): the server keeps them apart for older
+   * clients that show no object rows (shared activityObjectsContract).
+   */
   activityUnreadCount?: number;
 }
+
+const isCount = (value: unknown): value is number =>
+  typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 
 export function parseServerUnreadSummaryRows(data: unknown): Record<string, ServerUnreadSummary> {
   const next: Record<string, ServerUnreadSummary> = {};
@@ -16,19 +24,18 @@ export function parseServerUnreadSummaryRows(data: unknown): Record<string, Serv
       unreadCount?: unknown;
       serverPushMuted?: unknown;
       activityUnreadCount?: unknown;
+      activityObjectUnreadCount?: unknown;
     };
     const serverId = typeof entry.serverId === "string" ? entry.serverId : null;
     const unreadCount = Number(entry.unreadCount);
     if (!serverId || !Number.isFinite(unreadCount)) continue;
 
-    const activityUnreadCount = entry.activityUnreadCount;
+    const { activityUnreadCount, activityObjectUnreadCount } = entry;
     next[serverId] = {
       unreadCount: Math.max(0, Math.floor(unreadCount)),
       serverPushMuted: entry.serverPushMuted === true,
-      ...(typeof activityUnreadCount === "number"
-        && Number.isSafeInteger(activityUnreadCount)
-        && activityUnreadCount >= 0
-        ? { activityUnreadCount }
+      ...(isCount(activityUnreadCount)
+        ? { activityUnreadCount: activityUnreadCount + (isCount(activityObjectUnreadCount) ? activityObjectUnreadCount : 0) }
         : {}),
     };
   }

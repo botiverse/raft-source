@@ -88,8 +88,12 @@ export class RuntimeNotificationState {
   private lastNoticeSessionId: string | null = null;
   private lastEncodeFailedFingerprint: string | null = null;
   private lastEncodeFailedSessionId: string | null = null;
+  /** Session of a busy notice the encoder refused and nothing written since; kept even when the fingerprint is empty. */
+  private encodeRefusedSessionId: string | null = null;
   private contributedSessionId: string | null = null;
-  private contributedIdentities = new Set<string>();
+  /** Identity -> when it was first told (contributionSeq at that write). */
+  private contributedIdentities = new Map<string, number>();
+  private contributionSeq = 0;
 
   constructor(private readonly scheduler: RuntimeNotificationScheduler = systemNotificationScheduler) {}
 
@@ -153,25 +157,42 @@ export class RuntimeNotificationState {
     this.lastNoticeSessionId = sessionId;
     this.lastEncodeFailedFingerprint = null;
     this.lastEncodeFailedSessionId = null;
+    this.encodeRefusedSessionId = null;
     this.ensureContributionSession(sessionId);
+    this.contributionSeq += 1;
     for (const message of messages) {
       const identity = inboxNoticeMessageIdentity(message);
-      if (identity.length > 0) {
-        this.contributedIdentities.add(identity);
+      if (identity.length > 0 && !this.contributedIdentities.has(identity)) {
+        this.contributedIdentities.set(identity, this.contributionSeq);
       }
     }
   }
 
-  hasContributedMessage(message: InboxNoticeIdentityMessage, sessionId: string | null): boolean {
+  /**
+   * A point in the told history: a message told after it has a later mark.
+   * Taken when the daemon decides to stop an idle runtime, so what is told to
+   * the dying process after that is not mistaken for something the agent saw
+   * and chose to leave (see `hasContributedMessage`'s `toldBy`).
+   */
+  contributionMark(): number {
+    return this.contributionSeq;
+  }
+
+  /** `toldBy`: count it only if it was told at or before that mark (`contributionMark`). */
+  hasContributedMessage(message: InboxNoticeIdentityMessage, sessionId: string | null, toldBy?: number): boolean {
+    this.adoptLearnedSessionId(sessionId);
     if (this.contributedSessionId !== sessionId) return false;
     const identity = inboxNoticeMessageIdentity(message);
-    return identity.length > 0 && this.contributedIdentities.has(identity);
+    if (identity.length === 0) return false;
+    const toldAt = this.contributedIdentities.get(identity);
+    return toldAt !== undefined && (toldBy === undefined || toldAt <= toldBy);
   }
 
   filterUncontributedMessages<T extends InboxNoticeIdentityMessage>(
     messages: readonly T[],
     sessionId: string | null,
   ): T[] {
+    this.adoptLearnedSessionId(sessionId);
     if (this.contributedSessionId !== sessionId || this.contributedIdentities.size === 0) {
       return [...messages];
     }
@@ -189,7 +210,7 @@ export class RuntimeNotificationState {
       const identity = inboxNoticeMessageIdentity(message);
       if (identity.length > 0) pending.add(identity);
     }
-    for (const identity of this.contributedIdentities) {
+    for (const identity of [...this.contributedIdentities.keys()]) {
       if (!pending.has(identity)) {
         this.contributedIdentities.delete(identity);
       }
@@ -201,7 +222,13 @@ export class RuntimeNotificationState {
     return this.lastEncodeFailedFingerprint === fingerprint && this.lastEncodeFailedSessionId === sessionId;
   }
 
+  /** A busy notice for this session was refused by the runtime's encoder (e.g. Codex's closed steering window) and not written since. */
+  hasEncodeFailedNotice(sessionId: string | null): boolean {
+    return this.encodeRefusedSessionId !== null && this.encodeRefusedSessionId === sessionId;
+  }
+
   recordNoticeEncodeFailed(fingerprint: string, sessionId: string | null) {
+    this.encodeRefusedSessionId = sessionId;
     if (fingerprint.length === 0) return;
     this.lastEncodeFailedFingerprint = fingerprint;
     this.lastEncodeFailedSessionId = sessionId;
@@ -212,6 +239,7 @@ export class RuntimeNotificationState {
     this.lastNoticeSessionId = null;
     this.lastEncodeFailedFingerprint = null;
     this.lastEncodeFailedSessionId = null;
+    this.encodeRefusedSessionId = null;
     this.contributedSessionId = null;
     this.contributedIdentities.clear();
   }
@@ -231,7 +259,20 @@ export class RuntimeNotificationState {
 
   private ensureContributionSession(sessionId: string | null) {
     if (this.contributedSessionId === sessionId) return;
+    if (this.adoptLearnedSessionId(sessionId)) return;
     this.contributedSessionId = sessionId;
     this.contributedIdentities.clear();
+  }
+
+  /**
+   * Task #389: a fresh session's id is unknown when its first prompt is
+   * written and arrives later with session_init. It is the same session, so
+   * what was told to it stays told; reads and writes both adopt the learned
+   * id. Any other change is a different session and starts empty.
+   */
+  private adoptLearnedSessionId(sessionId: string | null): boolean {
+    if (this.contributedSessionId !== null || sessionId === null) return false;
+    this.contributedSessionId = sessionId;
+    return true;
   }
 }

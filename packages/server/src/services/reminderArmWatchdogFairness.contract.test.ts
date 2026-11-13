@@ -115,6 +115,7 @@ test("a persistently failing head must not starve rows behind it", async ({ db }
     horizonMs: 15_000,
     batchSize: BATCH,
     orchestrator: {
+      pushReminderCancel: async () => true,
       pushReminderUpsert: async (_agentId: string, row: ReminderRow) => {
         pushedIds.add(row.id);
         // The push "succeeds" but the Computer never returns armed(revision) --

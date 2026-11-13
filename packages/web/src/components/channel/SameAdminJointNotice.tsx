@@ -22,7 +22,7 @@ export function SameAdminJointNotice({
 }) {
   const { formatMessage } = useIntl();
   return (
-    <Banner intent="info" className="space-y-2" data-testid="joint-same-admin-notice">
+    <Banner intent="info" className="stack-y-2" data-testid="joint-same-admin-notice">
       <p>
         {formatMessage(
           { id: "channel.jointInvite.sameAdmin.notice" },
@@ -34,7 +34,6 @@ export function SameAdminJointNotice({
           checked={confirmed}
           disabled={disabled}
           onCheckedChange={onConfirmedChange}
-          className="mt-0.5"
         />
         <span>{formatMessage({ id: "channel.jointInvite.sameAdmin.confirm" })}</span>
       </label>

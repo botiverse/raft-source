@@ -1,4 +1,4 @@
-import { fixturePasswordHash } from "../test/integration/credentials";
+import { accessTokenForTest, fixturePasswordHash } from "../test/integration/credentials";
 import { createApiTest } from "../test/integration/apiTest";
 import assert from "node:assert/strict";
 import { createServer as createHttpServer, type IncomingMessage } from "node:http";
@@ -7,16 +7,17 @@ import type { AddressInfo } from "node:net";
 import { eq } from "drizzle-orm";
 import { getDb } from "../db/index";
 import { serverMembers, servers, users } from "../db/schema";
-import { signAccessToken } from "../middleware/auth";
 import { resetProductFeedbackRouteBindingCacheForTest } from "../services/productFeedbackRouteBindingService";
 import {
   resetProductFeedbackBreakersForTest,
   resetProductFeedbackReporterSessionCacheForTest,
 } from "../services/productFeedbackConversationService";
+import { setProductFeedbackAppsForTest } from "../services/productFeedbackApps";
+import { setMobileFeedbackAppsForTest } from "../test/handsFeedbackStub";
 import { openTestApp } from "../test/integration/app";
 import { buildProductFeedbackContact } from "./productFeedback";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 async function seedUser(suffix = "") {
   const [user] = await getDb().insert(users).values({
@@ -138,10 +139,10 @@ async function withHandsFeedbackUpstream<T>(
 test("product feedback returns bounded Hands diagnostics beside the stable integration code", async () => {
   await withHandsFeedbackUpstream(async (baseUrl) => (
     withFeedbackEnv(baseUrl, async () => {
-      const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+      const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
       try {
         const user = await seedUser("-noserver");
-        const token = signAccessToken(user.id);
+        const token = await accessTokenForTest(user.id);
         const form = new FormData();
         form.set("type", "idea");
         form.set("message", "Expose a safe upstream diagnostic.");
@@ -175,10 +176,10 @@ test("product feedback returns bounded Hands diagnostics beside the stable integ
 test("product feedback exposes only fixed duration-only upstream timing metrics", async () => {
   await withHandsFeedbackUpstream(async (baseUrl) => (
     withFeedbackEnv(baseUrl, async () => {
-      const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+      const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
       try {
         const user = await seedUser();
-        const token = signAccessToken(user.id);
+        const token = await accessTokenForTest(user.id);
         const form = new FormData();
         form.set("type", "idea");
         form.set("message", "Measure the trusted feedback path.");
@@ -220,10 +221,10 @@ test("real product-feedback list entry mints once and reuses a server-only repor
       process.env.HANDS_FEEDBACK_CONVERSATION_SESSION_ENABLED = "true";
       process.env.HANDS_FEEDBACK_REPORTER_INTEGRATION_ID = TEST_REPORTER_INTEGRATION_ID;
       resetProductFeedbackReporterSessionCacheForTest();
-      const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+      const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
       try {
         const user = await seedUser();
-        const token = signAccessToken(user.id);
+        const token = await accessTokenForTest(user.id);
         for (let index = 0; index < 2; index += 1) {
           const response = await fetch(`${app.baseUrl}/api/product-feedback/tickets`, {
             headers: { Authorization: `Bearer ${token}` },
@@ -277,6 +278,7 @@ async function withFeedbackEnv<T>(baseUrl: string, run: () => Promise<T>): Promi
   process.env.HANDS_FEEDBACK_REPORTER_INTEGRATION_ID = "legacy-feedback:11111111-1111-4111-8111-111111111111";
   process.env.HANDS_FEEDBACK_ROUTE_SUBJECT_KEY_ID = "v1";
   process.env.HANDS_FEEDBACK_ROUTE_SUBJECT_ROOT = Buffer.alloc(32, 1).toString("base64url");
+  setMobileFeedbackAppsForTest();
   resetProductFeedbackRouteBindingCacheForTest();
   resetProductFeedbackReporterSessionCacheForTest();
   try {
@@ -287,6 +289,7 @@ async function withFeedbackEnv<T>(baseUrl: string, run: () => Promise<T>): Promi
       if (value === undefined) delete process.env[key];
       else process.env[key] = value;
     }
+    setProductFeedbackAppsForTest(null);
     resetProductFeedbackRouteBindingCacheForTest();
     resetProductFeedbackReporterSessionCacheForTest();
   }
@@ -312,10 +315,10 @@ test("Raft no longer exposes a feedback webhook that persists a local projection
 test("product feedback validates a fixed draft UUID and fails closed without Hands config", async () => {
   const previousKey = process.env.HANDS_FEEDBACK_CLIENT_KEY;
   delete process.env.HANDS_FEEDBACK_CLIENT_KEY;
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const user = await seedUser();
-    const token = signAccessToken(user.id);
+    const token = await accessTokenForTest(user.id);
     const invalid = new FormData();
     invalid.set("type", "idea");
     invalid.set("message", "Please add a compact command palette.");
@@ -350,10 +353,10 @@ test("product feedback validates a fixed draft UUID and fails closed without Han
 test("product feedback rejects spoofed native attribution before Hands config or traffic", async () => {
   const previousBaseUrl = process.env.HANDS_FEEDBACK_BASE_URL;
   delete process.env.HANDS_FEEDBACK_BASE_URL;
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const user = await seedUser();
-    const token = signAccessToken(user.id);
+    const token = await accessTokenForTest(user.id);
     const form = new FormData();
     form.set("type", "problem");
     form.set("message", "Native attribution should fail closed when spoofed.");
@@ -382,10 +385,10 @@ test("product feedback rejects spoofed native attribution before Hands config or
 test("product feedback accepts native attribution only from a matching trusted client kind", async () => {
   const previousBaseUrl = process.env.HANDS_FEEDBACK_BASE_URL;
   delete process.env.HANDS_FEEDBACK_BASE_URL;
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const user = await seedUser();
-    const token = signAccessToken(user.id);
+    const token = await accessTokenForTest(user.id);
     const form = new FormData();
     form.set("type", "problem");
     form.set("message", "Native attribution should reach the config gate when trusted.");
@@ -404,8 +407,9 @@ test("product feedback accepts native attribution only from a matching trusted c
       },
       body: form,
     });
+    // Trusted, it reaches the iOS app's config, which without a base URL is unavailable.
     assert.equal(response.status, 503);
-    assert.equal((await response.json() as { code: string }).code, "feedback_not_configured");
+    assert.equal((await response.json() as { code: string }).code, "feedback_integration_unavailable");
   } finally {
     if (previousBaseUrl === undefined) delete process.env.HANDS_FEEDBACK_BASE_URL;
     else process.env.HANDS_FEEDBACK_BASE_URL = previousBaseUrl;
@@ -417,10 +421,10 @@ for (const clientKind of ["ios", "android"] as const) {
   test(`product feedback forwards configured ${clientKind} attribution to Hands metadata`, async () => {
     await withHandsFeedbackUpstream(async (baseUrl, requests) => (
       withFeedbackEnv(baseUrl, async () => {
-        const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+        const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
         try {
           const user = await seedUser();
-          const token = signAccessToken(user.id);
+          const token = await accessTokenForTest(user.id);
           const form = new FormData();
           form.set("type", "problem");
           form.set("message", `Native ${clientKind} feedback should reach Hands.`);
@@ -488,7 +492,7 @@ test("contact formatting is server-derived and explicit", () => {
 
 test("reporter reply rejects non-image multipart attachments before Hands traffic", async ({ app }) => {
   const user = await seedUser();
-  const token = signAccessToken(user.id);
+  const token = await accessTokenForTest(user.id);
   const form = new FormData();
   form.set("body", "Here is the requested reproduction.");
   form.set("submission_id", "55555555-5555-4555-8555-555555555555");
@@ -508,10 +512,10 @@ test("reporter reply rejects non-image multipart attachments before Hands traffi
 test("reporter can close only a canonical ticket through the authenticated API", async () => {
   await withHandsFeedbackUpstream(async (baseUrl, requests) => (
     withFeedbackEnv(baseUrl, async () => {
-      const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+      const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
       try {
         const user = await seedUser();
-        const token = signAccessToken(user.id);
+        const token = await accessTokenForTest(user.id);
         const ticketId = "33333333-3333-4333-8333-333333333333";
         const response = await fetch(
           `${app.baseUrl}/api/product-feedback/tickets/${ticketId}/close`,
@@ -567,13 +571,13 @@ test("close entry logs only the sanitized upstream failure stage", async () => {
   await withHandsFeedbackUpstream(async (baseUrl) => (
     withFeedbackEnv(baseUrl, async () => {
       resetProductFeedbackBreakersForTest();
-      const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+      const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
       const originalConsoleError = console.error;
       const errors: unknown[][] = [];
       console.error = (...args: unknown[]) => { errors.push(args); };
       try {
         const user = await seedUser();
-        const token = signAccessToken(user.id);
+        const token = await accessTokenForTest(user.id);
         const ticketId = "33333333-3333-4333-8333-333333333333";
         const response = await fetch(
           `${app.baseUrl}/api/product-feedback/tickets/${ticketId}/close`,
@@ -601,6 +605,7 @@ test("close entry logs only the sanitized upstream failure stage", async () => {
             code: "feedback_service_unavailable",
             failure_stage: "upstream_response",
             upstream_status: 502,
+            upstream_code: null,
             breaker_failures: 1,
             breaker_open: false,
           },
@@ -624,11 +629,11 @@ test("close entry logs only the sanitized upstream failure stage", async () => {
 test("reporter attribution forwards the validated server slug and handle to Hands", async () => {
   await withHandsFeedbackUpstream(async (baseUrl, requests) => (
     withFeedbackEnv(baseUrl, async () => {
-      const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+      const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
       try {
         const db = getDb();
         const user = await seedUser("-member");
-        const token = signAccessToken(user.id);
+        const token = await accessTokenForTest(user.id);
         const [server] = await db.insert(servers).values({
           name: "Attribution Server",
           slug: "attribution-server",
@@ -676,11 +681,11 @@ test("reporter attribution forwards the validated server slug and handle to Hand
 test("reporter attribution is omitted when the caller is not a member of the claimed server", async () => {
   await withHandsFeedbackUpstream(async (baseUrl, requests) => (
     withFeedbackEnv(baseUrl, async () => {
-      const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+      const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
       try {
         const db = getDb();
         const user = await seedUser("-member");
-        const token = signAccessToken(user.id);
+        const token = await accessTokenForTest(user.id);
         const outsider = await seedUser("-outsider");
         // The server exists, but the submitting user is NOT a member.
         const [foreignServer] = await db.insert(servers).values({
@@ -724,10 +729,10 @@ test("reporter attribution is omitted when the caller is not a member of the cla
 test("reporter attribution is omitted for clients that send no server context", async () => {
   await withHandsFeedbackUpstream(async (baseUrl, requests) => (
     withFeedbackEnv(baseUrl, async () => {
-      const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+      const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
       try {
         const user = await seedUser();
-        const token = signAccessToken(user.id);
+        const token = await accessTokenForTest(user.id);
         const form = new FormData();
         form.set("type", "idea");
         form.set("message", "Older clients send no X-Server-Id.");
@@ -762,11 +767,11 @@ test("reporter attribution is omitted for clients that send no server context", 
 test("reporter attribution refuses a joint-storage pseudo-server", async () => {
   await withHandsFeedbackUpstream(async (baseUrl, requests) => (
     withFeedbackEnv(baseUrl, async () => {
-      const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+      const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
       try {
         const db = getDb();
         const user = await seedUser("-joint");
-        const token = signAccessToken(user.id);
+        const token = await accessTokenForTest(user.id);
         // A joint-storage pseudo-server the user genuinely belongs to. The
         // server-scoped middleware excludes these; attribution must too.
         const [jointServer] = await db.insert(servers).values({
@@ -815,11 +820,11 @@ test("reporter attribution refuses a joint-storage pseudo-server", async () => {
 test("reporter attribution never records a server the submitter is not in, even when they belong to several", async () => {
   await withHandsFeedbackUpstream(async (baseUrl, requests) => (
     withFeedbackEnv(baseUrl, async () => {
-      const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+      const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
       try {
         const db = getDb();
         const user = await seedUser("-multi");
-        const token = signAccessToken(user.id);
+        const token = await accessTokenForTest(user.id);
         const other = await seedUser("-multiforeign");
 
         // The submitter belongs to two servers; a third belongs to someone else.
@@ -878,10 +883,10 @@ test("reporter attribution never records a server the submitter is not in, even 
 test("attribution never blocks submission when X-Server-Id is malformed", async () => {
   await withHandsFeedbackUpstream(async (baseUrl, requests) => (
     withFeedbackEnv(baseUrl, async () => {
-      const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+      const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
       try {
         const user = await seedUser("-malformed");
-        const token = signAccessToken(user.id);
+        const token = await accessTokenForTest(user.id);
         const form = new FormData();
         form.set("type", "problem");
         form.set("message", "A malformed server header must not block feedback.");
@@ -918,11 +923,11 @@ test("attribution never blocks submission when X-Server-Id is malformed", async 
 test("attribution is skipped, not fatal, when the server row disappears mid-flight", async () => {
   await withHandsFeedbackUpstream(async (baseUrl, requests) => (
     withFeedbackEnv(baseUrl, async () => {
-      const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+      const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
       try {
         const db = getDb();
         const user = await seedUser("-vanished");
-        const token = signAccessToken(user.id);
+        const token = await accessTokenForTest(user.id);
         // Soft-delete the server after the user joins it: the membership row
         // remains but the server is gone, so resolution must degrade quietly
         // rather than fail the submission.
@@ -965,10 +970,10 @@ test("attribution is skipped, not fatal, when the server row disappears mid-flig
 test("an agent Report Issue ticket forwards a canonical feedback_report_id and rejects any other value before Hands traffic", async () => {
   await withHandsFeedbackUpstream(async (baseUrl, requests) => (
     withFeedbackEnv(baseUrl, async () => {
-      const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+      const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
       try {
         const user = await seedUser();
-        const token = signAccessToken(user.id);
+        const token = await accessTokenForTest(user.id);
         const submit = (submissionId: string, feedbackReportId: string) => {
           const form = new FormData();
           form.set("type", "problem");
@@ -1006,4 +1011,172 @@ test("an agent Report Issue ticket forwards a canonical feedback_report_id and r
       }
     })
   ));
+});
+
+// A client that opts in (degraded_ok=1) gets an empty, degraded first page while
+// Hands is slow or failing (v1.21.49 switch: 95 list 503s); an older client and an
+// authorization or configuration failure keeps the error.
+test("the list answers a transient Hands failure with a degraded page only for a client that opts in", async () => {
+  const listStatuses: number[] = [];
+  const putStatuses: number[] = [];
+  const hands = createHttpServer(async (req, res) => {
+    await readRequestBody(req);
+    const json = (status: number, value: unknown) => {
+      res.writeHead(status, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(value));
+    };
+    if (req.method === "PUT" && req.url?.includes("/reporter-feedback/route-subject")) {
+      const status = putStatuses.shift() ?? 200;
+      json(status, status === 200 ? { changed: false, subject_version: "v1" } : { error: "no" });
+      return;
+    }
+    if (req.method === "GET" && req.url?.includes("/reporter-feedback?")) {
+      const status = listStatuses.shift() ?? 200;
+      json(status, status === 200 ? { tickets: [], next_cursor: null, unread_total: 2 } : { error: "no" });
+      return;
+    }
+    json(404, { error: "unexpected request" });
+  });
+  await new Promise<void>((resolve) => hands.listen(0, "127.0.0.1", resolve));
+  const { port } = hands.address() as AddressInfo;
+  try {
+    await withFeedbackEnv(`http://127.0.0.1:${port}`, async () => {
+      resetProductFeedbackBreakersForTest();
+      const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
+      try {
+        const { BasicTracer, MemoryTraceSink } = await import("@botiverse/raft-shared");
+        const sink = new MemoryTraceSink();
+        app.app.set("serverTracer", new BasicTracer({ sink }));
+        const degradedEvents = () => sink.getAllSpans()
+          .flatMap((span) => span.events)
+          .filter((event) => event.name === "server.product_feedback.list_degraded")
+          .map((event) => event.attrs);
+        const user = await seedUser("-degraded");
+        const token = await accessTokenForTest(user.id);
+        const list = (query: string) => fetch(`${app.baseUrl}/api/product-feedback/tickets${query}`, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+
+        putStatuses.push(503);
+        const unbound = await list("?degraded_ok=1");
+        assert.equal(unbound.status, 200, "a failed binding degrades");
+        assert.deepEqual(await unbound.json(), { tickets: [], next_cursor: null, unread_total: null, degraded: true, retry_after_seconds: 5 });
+        assert.equal(unbound.headers.get("retry-after"), "5");
+
+        const healthy = await list("?degraded_ok=1");
+        assert.equal(healthy.status, 200);
+        assert.equal((await healthy.json()).unread_total, 2, "a healthy answer is the real list");
+
+        listStatuses.push(500);
+        assert.equal((await list("?degraded_ok=1")).status, 200, "a Hands 5xx on the read degrades");
+        listStatuses.push(500);
+        assert.equal((await list("")).status, 503, "an older client keeps the 503");
+        listStatuses.push(401);
+        assert.equal((await list("?degraded_ok=1")).status, 503, "an authorization failure is not degraded");
+        assert.deepEqual(degradedEvents(), [
+          { step: "binding", reason: "hands_status_503" },
+          { step: "read", reason: "upstream_response" },
+        ], "each degraded answer is counted by step and reason, and only those");
+      } finally {
+        await app.close();
+      }
+    });
+  } finally {
+    await new Promise<void>((resolve) => hands.close(() => resolve()));
+  }
+});
+
+// GET /api/product-feedback/tickets (the unread poll) and the send reuse one
+// cached route binding; a Hands 401 or 403 drops it, so the next request PUTs
+// the route subject again, while a Hands 5xx keeps it.
+test("a Hands 401 or 403 after the route binding makes the next request bind again; a 5xx does not", async () => {
+  const listStatuses: number[] = [];
+  const submitStatuses: number[] = [];
+  const requests: CapturedHandsRequest[] = [];
+  const hands = createHttpServer(async (req, res) => {
+    const body = await readRequestBody(req);
+    requests.push({ method: req.method ?? "", url: req.url ?? "", headers: req.headers, body });
+    const json = (status: number, value: unknown) => {
+      res.writeHead(status, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(value));
+    };
+    if (req.method === "PUT" && req.url?.includes("/reporter-feedback/route-subject")) {
+      json(200, { changed: false, subject_version: "v1" });
+      return;
+    }
+    if (req.method === "GET" && req.url?.includes("/reporter-feedback?")) {
+      const status = listStatuses.shift() ?? 200;
+      json(status, status === 200 ? { tickets: [], next_cursor: null, unread_total: 0 } : { error: "no" });
+      return;
+    }
+    if (req.method === "POST" && req.url === "/public/v2/apps/raft-web/feedback") {
+      const status = submitStatuses.shift() ?? 201;
+      json(status, status === 201 ? { id: "ticket-rebind", status: "open", attachments: 0 } : { error: "no" });
+      return;
+    }
+    json(404, { error: "unexpected request" });
+  });
+  await new Promise<void>((resolve) => hands.listen(0, "127.0.0.1", resolve));
+  const { port } = hands.address() as AddressInfo;
+  try {
+    await withFeedbackEnv(`http://127.0.0.1:${port}`, async () => {
+      resetProductFeedbackBreakersForTest();
+      const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
+      try {
+        const user = await seedUser("-rebind");
+        const token = await accessTokenForTest(user.id);
+        const puts = () => requests.filter((request) => request.method === "PUT").length;
+        const list = async () => (await fetch(`${app.baseUrl}/api/product-feedback/tickets`, {
+          headers: { Authorization: `Bearer ${token}` },
+        })).status;
+        const send = async (submissionId: string) => {
+          const form = new FormData();
+          form.set("type", "idea");
+          form.set("message", "Bind again after Hands refuses.");
+          form.set("submission_id", submissionId);
+          form.set("may_contact", "false");
+          return (await fetch(`${app.baseUrl}/api/product-feedback`, {
+            method: "POST",
+            headers: { Authorization: `Bearer ${token}` },
+            body: form,
+          })).status;
+        };
+
+        assert.equal(await list(), 200);
+        assert.equal(await list(), 200);
+        assert.equal(puts(), 1, "the unread poll reuses the cached binding");
+
+        listStatuses.push(500);
+        assert.equal(await list(), 503);
+        assert.equal(await list(), 200);
+        assert.equal(puts(), 1, "a Hands 5xx keeps the binding");
+
+        listStatuses.push(401);
+        assert.equal(await list(), 503);
+        assert.equal(await list(), 200);
+        assert.equal(puts(), 2, "a Hands 401 drops the binding");
+
+        listStatuses.push(403);
+        assert.equal(await list(), 503);
+        assert.equal(await list(), 200);
+        assert.equal(puts(), 3, "a Hands 403 drops the binding");
+
+        submitStatuses.push(403);
+        assert.equal(await send("cccccccc-cccc-4ccc-8ccc-cccccccccccc"), 503);
+        assert.equal(puts(), 3, "the send reused the cached binding");
+        assert.equal(await list(), 200);
+        assert.equal(puts(), 4, "a Hands 403 on the send drops the binding");
+
+        submitStatuses.push(500);
+        assert.equal(await send("dddddddd-dddd-4ddd-8ddd-dddddddddddd"), 503);
+        assert.equal(await list(), 200);
+        assert.equal(puts(), 4, "a Hands 5xx on the send keeps the binding");
+      } finally {
+        await app.close();
+      }
+    });
+  } finally {
+    resetProductFeedbackBreakersForTest();
+    await new Promise<void>((resolve, reject) => hands.close((error) => error ? reject(error) : resolve()));
+  }
 });

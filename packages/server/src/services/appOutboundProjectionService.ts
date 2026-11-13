@@ -1,19 +1,24 @@
 import { createHmac } from "node:crypto";
 import { projectCoarseServerPlan } from "./serverPlanProjection";
 import { currentTimeMs } from "@botiverse/raft-shared";
-import { and, eq, inArray, isNull } from "drizzle-orm";
+import { and, eq, exists, inArray, isNull, ne, or, sql } from "drizzle-orm";
 import { getDb } from "../db/index";
 import {
   agents,
   channels,
   computers,
   machines,
+  oauthAccessTokens,
+  oauthUserConsents,
   serverAgentMembers,
   serverMembers,
   servers,
+  users,
 } from "../db/schema";
 import type { VerifiedAppInstallationCredential } from "./appInstallationCredentialService";
 import type { AppOutboundGroup } from "./appOutboundPermissionService";
+import { agentFindableBy, listedServerAgent } from "./agentMemberListPolicy";
+import { userCanActOnAgentResource } from "../lib/actorPermissions";
 
 const MEMBER_REF_KEY_ENV = "RAFT_APP_MEMBER_REF_KEY";
 const MEMBER_REF_KEY_VERSION_ENV = "RAFT_APP_MEMBER_REF_KEY_VERSION";
@@ -95,10 +100,18 @@ export async function getAppServerProjection(
   if (!server) return null;
 
   const [humanMembers, agentMembers] = await Promise.all([
+    // A retired (deleted) account keeps its membership row for history; to an
+    // app it is gone, as the server.member_removed it was sent says.
     dbOrTx.select({ principalId: serverMembers.userId, role: serverMembers.role })
-      .from(serverMembers).where(eq(serverMembers.serverId, credential.serverId)),
+      .from(serverMembers)
+      .innerJoin(users, eq(users.id, serverMembers.userId))
+      .where(and(eq(serverMembers.serverId, credential.serverId), isNull(users.retiredAt))),
+    // Not a personal assistant: an App never finds one (agentFindableBy with no
+    // finder), as the server.member_* events never name one.
     dbOrTx.select({ principalId: serverAgentMembers.agentId, role: serverAgentMembers.role })
-      .from(serverAgentMembers).where(eq(serverAgentMembers.serverId, credential.serverId)),
+      .from(serverAgentMembers)
+      .innerJoin(agents, eq(agents.id, serverAgentMembers.agentId))
+      .where(and(eq(serverAgentMembers.serverId, credential.serverId), agentFindableBy({}))),
   ]);
   const members = [
     ...humanMembers.map((member) => ({ principal_type: "human" as const, ...member })),
@@ -128,6 +141,74 @@ export async function getAppServerProjection(
   };
 }
 
+// A human's role for an installation, only after a real Login with Raft to
+// this App. A preview-only consent is not a login. Expired login tokens still
+// witness that login; explicit revocation marks every token revoked and also
+// revokes consent. Account-mode login has no Server, but only reaches a live
+// non-guest member on this installation's Server. The transaction passed by the
+// route also checked the installation and its effective server group.
+export async function getAppHumanMemberRole(
+  credential: VerifiedAppInstallationCredential,
+  sub: string,
+  dbOrTx: ReturnType<typeof getDb> = getDb(),
+): Promise<{ role: "owner" | "admin" | "member" | "guest" } | null> {
+  requireGroup(credential, "server");
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(sub)) return null;
+  const login = dbOrTx.select({ one: sql`1` }).from(oauthAccessTokens).where(and(
+    eq(oauthAccessTokens.clientId, credential.clientId),
+    eq(oauthAccessTokens.userId, serverMembers.userId),
+    eq(oauthAccessTokens.principalType, "human"),
+    isNull(oauthAccessTokens.revokedAt),
+    or(
+      and(eq(oauthUserConsents.serverId, credential.serverId), eq(oauthAccessTokens.serverId, credential.serverId)),
+      and(isNull(oauthUserConsents.serverId), isNull(oauthAccessTokens.serverId), ne(serverMembers.role, "guest")),
+    ),
+  ));
+  const [member] = await dbOrTx.select({ role: serverMembers.role }).from(serverMembers)
+    .innerJoin(users, eq(users.id, serverMembers.userId))
+    .innerJoin(servers, eq(servers.id, serverMembers.serverId))
+    .innerJoin(oauthUserConsents, and(
+      eq(oauthUserConsents.userId, serverMembers.userId),
+      eq(oauthUserConsents.clientId, credential.clientId),
+      isNull(oauthUserConsents.revokedAt),
+    ))
+    .where(and(
+      eq(serverMembers.serverId, credential.serverId),
+      eq(serverMembers.userId, sub),
+      isNull(users.retiredAt),
+      isNull(servers.deletedAt),
+      ne(servers.kind, "joint_storage"),
+      exists(login),
+    )).limit(1);
+  return member ?? null;
+}
+
+// This exposes only a yes/no decision for directory-visible Agents, not their
+// creator or assistant owner. Use the same editAgents decision as Raft's agent
+// settings routes, and the same snapshot as the human's role/consent lookup.
+export async function canAppHumanManageAgent(
+  credential: VerifiedAppInstallationCredential,
+  sub: string,
+  agentId: string,
+  dbOrTx: ReturnType<typeof getDb> = getDb(),
+): Promise<boolean> {
+  requireGroup(credential, "agent");
+  const member = await getAppHumanMemberRole(credential, sub, dbOrTx);
+  if (!member || member.role === "guest") return false;
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(agentId)) return false;
+  const [agent] = await dbOrTx.select({
+    creatorType: agents.creatorType,
+    creatorId: agents.creatorId,
+    assistantOwnerUserId: agents.assistantOwnerUserId,
+  }).from(agents).where(and(
+    eq(agents.id, agentId),
+    eq(agents.serverId, credential.serverId),
+    isNull(agents.deletedAt),
+    listedServerAgent(),
+  )).limit(1);
+  return !!agent && userCanActOnAgentResource(member.role, sub.toLowerCase(), agent, "editAgents");
+}
+
 export async function listAppAgentProjections(
   credential: VerifiedAppInstallationCredential,
   dbOrTx: ReturnType<typeof getDb> = getDb(),
@@ -143,11 +224,15 @@ export async function listAppAgentProjections(
     runtime: agents.runtime,
     model: agents.model,
     execution_mode: agents.executionMode,
+    // Coarse classification only: never expose the managing installation id.
+    is_app_bot: sql<boolean>`${agents.managedByAppInstallId} IS NOT NULL`,
     created_at: agents.createdAt,
     updated_at: agents.updatedAt,
   }).from(agents).where(and(
     eq(agents.serverId, credential.serverId),
     isNull(agents.deletedAt),
+    // The agents a member list shows: an App never finds a personal assistant.
+    listedServerAgent(),
   ));
 }
 
@@ -196,6 +281,9 @@ export async function listAppComputerProjections(
         eq(agents.serverId, credential.serverId),
         inArray(agents.machineId, machineIds),
         isNull(agents.deletedAt),
+        // Not a personal assistant, in the ids or the count: an App never finds
+        // one (agentFindableBy with no finder, as countActiveAgentsByMachine).
+        agentFindableBy({}),
       ));
   const includeAgentIdentities = credential.groups.includes("agent");
   const onlineAfter = currentTimeMs() - 90_000;

@@ -8,11 +8,18 @@ function fail(message) {
   process.exit(1);
 }
 
-if (process.argv.length !== 10) {
-  fail("Usage: sharp-image-diff.mjs <baseline.png> <current.png> <side-by-side.png> <metrics.json> <case-id> <case-title> <baseline-label> <current-label>");
+if (process.argv.length !== 10 && process.argv.length !== 11) {
+  fail("Usage: sharp-image-diff.mjs <baseline.png> <current.png> <side-by-side.png> <metrics.json> <case-id> <case-title> <baseline-label> <current-label> [full-length]");
 }
 
-const [, , baselinePath, currentPath, outputPath, metricsPath, caseId, caseTitle, baselineLabel, currentLabel] = process.argv;
+const [, , baselinePath, currentPath, outputPath, metricsPath, caseId, caseTitle, baselineLabel, currentLabel, compareMode = ""] = process.argv;
+// full-length (sharedCases.json capture.fullLength): long screenshots whose
+// heights may differ. Never rescale (a stretched tail would look "similar");
+// pad both to the taller canvas with a marker colour and count every padded
+// pixel as a full mismatch in BOTH metrics, so a missing/extra tail lowers the
+// score in proportion to its area.
+const fullLengthMode = compareMode === "full-length";
+const PAD_MARKER = { r: 255, g: 0, b: 255, alpha: 1 };
 
 function escapeXml(value) {
   return String(value)
@@ -49,6 +56,51 @@ async function rgbaBuffer(image, width, height, mode) {
     });
   }
   return pipeline.raw().toBuffer();
+}
+
+async function markerPaddedBuffer(image, width, height) {
+  return sharp(image.file, { limitInputPixels: false })
+    .flatten({ background: "#ffffff" })
+    .ensureAlpha()
+    .extend({
+      top: 0,
+      left: 0,
+      bottom: Math.max(0, height - image.height),
+      right: Math.max(0, width - image.width),
+      background: PAD_MARKER,
+    })
+    .raw()
+    .toBuffer();
+}
+
+async function fullLengthMetrics(baseline, current, width, height) {
+  const left = await markerPaddedBuffer(baseline, width, height);
+  const right = await markerPaddedBuffer(current, width, height);
+  let diff = 0;
+  let matching = 0;
+  let padded = 0;
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const inBoth = x < baseline.width && y < baseline.height && x < current.width && y < current.height;
+      if (!inBoth) {
+        padded += 1;
+        diff += 255;
+        continue;
+      }
+      const i = (y * width + x) * 4;
+      diff += (Math.abs(left[i] - right[i]) + Math.abs(left[i + 1] - right[i + 1]) + Math.abs(left[i + 2] - right[i + 2])) / 3;
+      if (left[i] === right[i] && left[i + 1] === right[i + 1] && left[i + 2] === right[i + 2] && left[i + 3] === right[i + 3]) {
+        matching += 1;
+      }
+    }
+  }
+  const total = width * height;
+  return {
+    rgb: Math.max(0, 1 - diff / (total * 255)),
+    pixel: matching / total,
+    paddedPixels: padded,
+    paddedRatio: padded / total,
+  };
 }
 
 async function rgbSimilarity(baseline, current, width, height) {
@@ -127,7 +179,7 @@ async function renderSideBySide(baseline, current, metrics) {
     ${panelSvg({ x: baselineX, y: panelY, width: baselinePanel.width, height: baselinePanel.height, shadow, framePadding, provider: baselineLabel, rawSize: `${baseline.width}×${baseline.height}`, title: caseTitle, id: caseId })}
     ${panelSvg({ x: currentX, y: panelY, width: currentPanel.width, height: currentPanel.height, shadow, framePadding, provider: currentLabel, rawSize: `${current.width}×${current.height}`, title: caseTitle, id: caseId })}
     <text x="${width / 2}" y="${height - 40}" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="14" font-weight="700" fill="#141111">RGB similarity ${rgb}%   Pixel perfect ${pixel}%   Mismatch ${mismatch}%</text>
-    <text x="${width / 2}" y="${height - 20}" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11" font-weight="500" fill="#514946">Compare canvas ${metrics.comparisonWidth}×${metrics.comparisonHeight}</text>
+    <text x="${width / 2}" y="${height - 20}" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11" font-weight="500" fill="#514946">Compare canvas ${metrics.comparisonWidth}×${metrics.comparisonHeight}${metrics.fullLength ? `   Full length: height Δ ${metrics.fullLength.heightDelta}px, padding ${(metrics.fullLength.paddedRatio * 100).toFixed(2)}% counted as mismatch` : ""}</text>
   </svg>`;
   await fs.promises.mkdir(path.dirname(outputPath), { recursive: true });
   await sharp(Buffer.from(svg))
@@ -143,8 +195,9 @@ const baseline = await loadImage(baselinePath);
 const current = await loadImage(currentPath);
 const comparisonWidth = Math.max(baseline.width, current.width);
 const comparisonHeight = Math.max(baseline.height, current.height);
-const rgb = await rgbSimilarity(baseline, current, comparisonWidth, comparisonHeight);
-const pixel = await pixelPerfectSimilarity(baseline, current, comparisonWidth, comparisonHeight);
+const fullLength = fullLengthMode ? await fullLengthMetrics(baseline, current, comparisonWidth, comparisonHeight) : null;
+const rgb = fullLength ? fullLength.rgb : await rgbSimilarity(baseline, current, comparisonWidth, comparisonHeight);
+const pixel = fullLength ? fullLength.pixel : await pixelPerfectSimilarity(baseline, current, comparisonWidth, comparisonHeight);
 const metrics = {
   baselineWidth: baseline.width,
   baselineHeight: baseline.height,
@@ -157,7 +210,17 @@ const metrics = {
   pixelMismatchRatio: 1 - pixel,
   compositor: "sharp",
   displayMode: "preserve-provider-raw-size",
-  metricMode: "rgb-resize-pixel-pad-no-crop",
+  metricMode: fullLength ? "full-length-marker-pad-no-rescale" : "rgb-resize-pixel-pad-no-crop",
+  ...(fullLength
+    ? {
+        fullLength: {
+          heightDelta: current.height - baseline.height,
+          paddedPixels: fullLength.paddedPixels,
+          paddedRatio: fullLength.paddedRatio,
+          padMarker: "#ff00ff",
+        },
+      }
+    : {}),
 };
 await renderSideBySide(baseline, current, metrics);
 await fs.promises.mkdir(path.dirname(metricsPath), { recursive: true });

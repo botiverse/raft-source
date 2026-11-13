@@ -36,12 +36,16 @@ import {
  * - PIN_THREAD_DELTA (sweep B): the fixed extra cost of the
  *   thread-resolution statement (Y − X). Per-thread growth is a regression;
  *   an intentional fixed extra statement gets a documented pin change.
- * - Y <= 12 is a ceiling kept as documentation on top of the exact pins.
+ * - The thread ceiling is X + PIN_THREAD_DELTA, so it agrees with both pins.
  */
 
-// Filled from the first verified run; see the assertion messages above.
-const PIN_SWEEP_A_COUNT = 17; // verified 2026-09-24 (PGlite): X=17 after the authorization-lock statement (Ray review)
-const PIN_THREAD_DELTA = 1; // verified 2026-09-24: Y=18, X=17 — the thread-resolution statement
+// 2026-11-05: ordinary-channel CI sweeps remain flat at X=21. The prior 19
+// includes the authorization lock and two SET LOCAL lock_timeout statements.
+// #13114 adds one computed-entry discovery query to the global candidate
+// resolver; #13132 adds one frozen-recipient discovery query before locks.
+// With no joint projections both queries return empty without per-scope work.
+const PIN_SWEEP_A_COUNT = 21;
+const PIN_THREAD_DELTA = 1; // The one batched thread-resolution statement: Y=22.
 
 type PgliteLike = {
   query: (...args: unknown[]) => Promise<unknown>;
@@ -214,7 +218,8 @@ test("global_read_all statement count is O(1): thread sweep N=[4,52,200] equal, 
   const [y4, y52, y200] = counts;
   assert.equal(y52, y4, `statement count must not grow with N on the thread sweep (N=52 gave ${y52}, N=4 gave ${y4}); per-thread growth is an N+1 regression — fix the code, do not raise the pins`);
   assert.equal(y200, y4, `statement count must not grow with N on the thread sweep (N=200 gave ${y200}, N=4 gave ${y4}); per-thread growth is an N+1 regression — fix the code, do not raise the pins`);
-  assert.ok(y4 <= 18, `Y=${y4} exceeds the pinned ceiling of 18 statements per batched claim (X=17 + 1 fixed thread-resolution statement); X includes the authorization lock restored per Ray's review; the remaining 18-vs->=20 choice (three structural locks) is tygg's per the PR — if the batch shape intentionally grew, update the pin and explain`);
+  const threadCeiling = PIN_SWEEP_A_COUNT + PIN_THREAD_DELTA;
+  assert.ok(y4 <= threadCeiling, `Y=${y4} exceeds the pinned ceiling of ${threadCeiling} statements per batched claim (X=${PIN_SWEEP_A_COUNT} + ${PIN_THREAD_DELTA} fixed thread-resolution statement); per-scope growth is a regression, and an intentional fixed addition needs a documented pin change`);
   if (PIN_THREAD_DELTA > 0) {
     assert.equal(y4 - baseline, PIN_THREAD_DELTA, "Y − X is the fixed statement cost of the thread-resolution branch; per-thread growth is a regression — fix the code; an intentional fixed extra statement gets a documented pin change");
   }

@@ -47,7 +47,12 @@ function isSafeOwnerId(value: string): boolean {
 }
 
 /** Normalize untrusted raw into the closed source-ref shape (fail closed). */
-function normalizeCleanerSourceRef(raw: unknown, kind: "memory_hint" | "disk_hint"): { ok: true; ref: AgentInboxSourceRef } | { ok: false; message: string } {
+type CleanerSourceRefKind = "memory_hint" | "disk_hint" | "backup_ignore_hint";
+
+function normalizeCleanerSourceRef(
+  raw: unknown,
+  kinds: readonly CleanerSourceRefKind[],
+): { ok: true; ref: AgentInboxSourceRef } | { ok: false; message: string } {
   if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
     return { ok: false, message: "cleaner sourceRef must be an object" };
   }
@@ -57,8 +62,9 @@ function normalizeCleanerSourceRef(raw: unknown, kind: "memory_hint" | "disk_hin
       return { ok: false, message: `cleaner sourceRef rejects field: ${key}` };
     }
   }
-  if (cand.kind !== kind) {
-    return { ok: false, message: `cleaner sourceRef kind must be ${kind}: ${String(cand.kind)}` };
+  const kind = kinds.find((candidate) => candidate === cand.kind);
+  if (kind === undefined) {
+    return { ok: false, message: `cleaner sourceRef kind must be ${kinds.join(" or ")}: ${String(cand.kind)}` };
   }
   if (typeof cand.agentId !== "string" || !isSafeOwnerId(cand.agentId)) {
     return { ok: false, message: "cleaner sourceRef.agentId must be a safe owner id" };
@@ -127,7 +133,7 @@ export function createSystemCleanerNotificationClassDefinition(
   return {
     retention: "transient",
     primaryAction: { kind: "run_command", commandId: "cleaner.configure" },
-    normalizeSourceRef: (raw) => normalizeCleanerSourceRef(raw, "memory_hint"),
+    normalizeSourceRef: (raw) => normalizeCleanerSourceRef(raw, ["memory_hint"]),
     materializeActionCli: ({ sourceRef }) => materializeCleanerActionCli(sourceRef, resolveAppliedConfig),
   };
 }
@@ -145,11 +151,16 @@ export function createSystemCleanerAppRegistry(
       [CLEANER_DISK_NOTIFICATION_CLASS]: {
         retention: "transient",
         primaryAction: { kind: "run_command", commandId: "cleaner.disk_guidance" },
-        normalizeSourceRef: (raw: unknown) => normalizeCleanerSourceRef(raw, "disk_hint"),
+        // The workspace tip (disk_hint) and the .raftbackupignore reminder
+        // (backup_ignore_hint) share this class, which the Server manifest
+        // declares; the kind keeps them two items.
+        normalizeSourceRef: (raw: unknown) => normalizeCleanerSourceRef(raw, ["disk_hint", "backup_ignore_hint"]),
         materializeActionCli: ({ sourceRef }: { sourceRef: AgentInboxSourceRef }) =>
-          resolveAppliedConfig(sourceRef.id)
-            ? 'raft manual get app --intent "Free disk space safely" --reason "Cleaner reported low disk space"'
-            : null,
+          !resolveAppliedConfig(sourceRef.id)
+            ? null
+            : sourceRef.kind === "backup_ignore_hint"
+              ? 'raft manual get agent --intent "Keep your workspace migratable" --reason "Cleaner reminder about .raftbackupignore"'
+              : 'raft manual get app --intent "Free disk space safely" --reason "Cleaner reported low disk space"',
       },
     },
   } as const;

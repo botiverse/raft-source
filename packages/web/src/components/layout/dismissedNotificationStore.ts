@@ -7,7 +7,7 @@ const MAX_PERSISTED_KEYS = 100;
 // action on a single row in the notification center. Keys are state-
 // fingerprints, not notification ids:
 // `useSystemNotifications` rebuilds the key from the current world (which machines
-// are offline, what the excess-agent count is) so the dismissal is auto-
+// are offline, when the server went back to Free) so the dismissal is auto-
 // invalidated whenever that fingerprint changes ("直到状态又发生变化", per
 // stdrc 2026-05-02 #proj-uiux:f87f6eb9 msg=308efc48).
 //

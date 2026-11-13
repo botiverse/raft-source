@@ -40,6 +40,8 @@ import {
 import { formatServerSlugDisplay, normalizeServerSlug } from "../serverState";
 import { resolveServerUrl, resolveServerUrlEnv } from "../serverUrl";
 import { ComputerServiceError } from "./errors";
+import { startedAfterRecord } from "@botiverse/raft-shared";
+import { readProcessStartTimeMsBeforeActing } from "../internal/process-primitives";
 
 interface UserSession {
   kind?: string;
@@ -75,24 +77,40 @@ export interface AdoptLegacyInput {
   redactedPrefix: string;
 }
 
+/**
+ * The credential for a roster-selected adoption when it is not the saved user
+ * session: setup's `computer_migrate` migrate token (services/migrateGrant.ts),
+ * held in memory. `renew` asks for a new one when the server no longer takes
+ * it (expired or revoked): one retry, as a session gets one refresh.
+ */
+export interface AdoptCredential {
+  baseUrl: string;
+  bearer: string;
+  renew?: () => Promise<{ baseUrl: string; bearer: string } | null>;
+}
+
 export interface AdoptLegacyByFingerprintInput {
   serverSlug: string;
   serverUrl?: string;
   name?: string;
-  /** Server roster identity selected after user login. */
+  /** Server roster identity the person selected. */
   legacyMachineId: string;
   /** sha256(legacy api key).slice(0,16), intersected with local owner.json. */
   apiKeyFingerprint: string;
   /** Absolute local owner.json path from detection/validation. */
   legacyOwnerPath: string;
+  /** Instead of the saved user session (setup's migrate token). */
+  credential?: AdoptCredential;
 }
 
 export interface AdoptLegacyByDaemonIdInput {
   serverSlug: string;
   serverUrl?: string;
   name?: string;
-  /** Server roster identity selected after user login. */
+  /** Server roster identity the person selected. */
   legacyMachineId: string;
+  /** Instead of the saved user session (setup's migrate token). */
+  credential?: AdoptCredential;
 }
 
 export interface LegacyStopResult {
@@ -137,6 +155,8 @@ export type AdoptLegacyEvent =
 export interface AdoptLegacyOptions {
   signal?: AbortSignal;
   onEvent?: (event: AdoptLegacyEvent) => void;
+  /** Test seam: when the process holding the legacy lock's pid started (epoch ms); undefined when unknown. */
+  processStartTimeMs?: (pid: number) => Promise<number | undefined>;
 }
 
 function emit(opts: AdoptLegacyOptions | undefined, event: AdoptLegacyEvent): void {
@@ -193,6 +213,7 @@ function isProcessAlive(pid: number): boolean {
 
 async function stopLegacyDaemonByOwnerFile(
   ownerFile: string,
+  processStartTimeMs: (pid: number) => Promise<number | undefined> = readProcessStartTimeMsBeforeActing,
 ): Promise<LegacyStopResult> {
   let raw: string;
   try {
@@ -201,17 +222,27 @@ async function stopLegacyDaemonByOwnerFile(
     return { attempted: false, outcome: "absent" };
   }
   let pid: number;
+  let lockStartedAtMs: number;
   try {
-    const owner = JSON.parse(raw) as { pid?: unknown };
+    const owner = JSON.parse(raw) as { pid?: unknown; startedAt?: unknown };
     if (typeof owner.pid !== "number") {
       return { attempted: false, outcome: "error", reason: "owner_json_missing_pid" };
     }
     pid = owner.pid;
+    lockStartedAtMs = typeof owner.startedAt === "string" ? Date.parse(owner.startedAt) : Number.NaN;
   } catch {
     return { attempted: false, outcome: "error", reason: "owner_json_unparseable" };
   }
   if (!isProcessAlive(pid)) {
     return { attempted: false, pid, outcome: "already_dead" };
+  }
+  // The machine lock's rule (daemon/machineLock.ts): the daemon wrote
+  // `startedAt` after it started, so a process that started later reused its
+  // pid. It is another program and is never signalled; the daemon is gone.
+  // An unreadable start (Linux, where only the lock's recorded `processStart`
+  // identity can tell) keeps the stop as before.
+  if (Number.isFinite(lockStartedAtMs) && startedAfterRecord(lockStartedAtMs, await processStartTimeMs(pid))) {
+    return { attempted: false, pid, outcome: "already_dead", reason: "pid_reused" };
   }
   try {
     process.kill(pid, "SIGTERM");
@@ -273,6 +304,17 @@ interface UserSessionContext {
   baseUrl: string;
 }
 
+async function adoptContext(
+  slockHome: string,
+  input: { serverUrl?: string; credential?: AdoptCredential },
+): Promise<UserSessionContext> {
+  if (input.credential) return { accessToken: input.credential.bearer, baseUrl: input.credential.baseUrl };
+  return readUserSessionContext(slockHome, input.serverUrl);
+}
+
+const APPROVAL_REJECTED_MESSAGE =
+  "The server no longer accepts this machine's approval to move the old daemon over (it expired, or the sign-in that approved it was revoked). Run `raft-computer setup /<server>` in a terminal to approve it again. No local Computer state was written.";
+
 async function readUserSessionContext(
   slockHome: string,
   serverUrl?: string,
@@ -285,14 +327,14 @@ async function readUserSessionContext(
   } catch (err) {
     throw new ComputerServiceError(
       "NO_USER_SESSION",
-      `No user session at ${sessionFile}. Run \`raft-computer login\` first.`,
+      `No user session at ${sessionFile}. Run \`raft-computer setup /<server>\` in a terminal: it signs in to move the old daemon over.`,
       err,
     );
   }
   if (session.kind !== "user-session" || typeof session.accessToken !== "string" || !session.accessToken) {
     throw new ComputerServiceError(
       "INVALID_USER_SESSION",
-      `User session at ${sessionFile} is invalid. Re-run \`raft-computer login\`.`,
+      `User session at ${sessionFile} is invalid. Run \`raft-computer setup /<server>\` in a terminal: it signs in to move the old daemon over.`,
     );
   }
 
@@ -452,7 +494,7 @@ async function completeAdoptionExchange(
   // start` cannot mint a second supervisor while the legacy daemon is still
   // alive locally.
   options.signal?.throwIfAborted?.();
-  const stop = await stopLegacyDaemonByOwnerFile(legacyOwnerFile);
+  const stop = await stopLegacyDaemonByOwnerFile(legacyOwnerFile, options.processStartTimeMs);
   if (stop.outcome === "timed_out" || stop.outcome === "denied" || stop.outcome === "error") {
     await appendAdoptionFailureLog(slockHome, log, startedAt, `legacy_stop_${stop.outcome}`, {
       computerId: result.computerId,
@@ -549,10 +591,18 @@ async function retryOnceOnAuthRequired<T extends { status: string }>(
   serverUrl: string | undefined,
   firstClient: ComputerAttachClient,
   call: (client: ComputerAttachClient) => Promise<T>,
+  credential?: AdoptCredential,
 ): Promise<{ client: ComputerAttachClient; result: T }> {
   let client = firstClient;
   let result = await call(client);
-  if (result.status === "auth_required") {
+  if (result.status === "auth_required" && credential) {
+    // Not a session: never refresh or read user-session.json; ask for a new approval once.
+    const renewed = credential.renew ? await credential.renew() : null;
+    if (renewed) {
+      client = new ComputerAttachClient(renewed.baseUrl, renewed.bearer);
+      result = await call(client);
+    }
+  } else if (result.status === "auth_required") {
     const refreshed = await refreshUserSession(slockHome, serverUrl).catch(() => false);
     if (refreshed) {
       const ctx = await readUserSessionContext(slockHome, serverUrl);
@@ -612,13 +662,13 @@ export async function adoptLegacy(
         invalidFailureReason: "legacy_key_invalid",
         invalidMessage: `Server rejected the legacy api key (unknown / wrong server / malformed). Local legacy owner evidence for this key: ${formatLegacyOwnerEvidence(slockHome, ownerEvidence)}. Verify the key came from this SLOCK_HOME and server, or use a fresh isolated SLOCK_HOME for a clean Computer setup.`,
         migratedMessage: `This machine has already been adopted; the legacy key is no longer accepted. Local legacy owner evidence for this key: ${formatLegacyOwnerEvidence(slockHome, ownerEvidence)}. Use \`raft-computer attach\` to add another Computer attachment, or use a fresh isolated SLOCK_HOME for a clean setup.`,
-        authRequiredMessage: `Your Computer user session was rejected by the server before legacy adoption. Local legacy owner evidence for this key: ${formatLegacyOwnerEvidence(slockHome, ownerEvidence)}. Re-run \`raft-computer login\` for this server (use the same \`--server-url\` if not on production), then retry the adopt command. No local Computer state was written.`,
+        authRequiredMessage: `Your Computer user session was rejected by the server before legacy adoption. Local legacy owner evidence for this key: ${formatLegacyOwnerEvidence(slockHome, ownerEvidence)}. Run \`raft-computer setup /<server>\` in a terminal (with the same \`--server-url\` if not on production) to sign in again. No local Computer state was written.`,
         failedMessage: (code) =>
           `Adoption failed at server exchange (${code}). Local legacy owner evidence for this key: ${formatLegacyOwnerEvidence(slockHome, ownerEvidence)}. Confirm the user session is valid, the legacy key belongs to this server/SLOCK_HOME, and the server URL is correct. No local Computer state was written.`,
         stopFailureRetryCommand: `\`raft-computer setup ${formatServerSlugDisplay(slugForServer)}\``,
         unexpectedAuthHint: (httpStatus) =>
           httpStatus === 401
-            ? " If your server may be on an older release that does not emit `code: auth_required`, re-run `raft-computer login` first to refresh your user session, then retry. If the issue persists, report it as server contract drift."
+            ? " If your server may be on an older release that does not emit `code: auth_required`, run `raft-computer setup /<server>` in a terminal to sign in again. If the issue persists, report it as server contract drift."
             : "",
       },
     },
@@ -632,7 +682,7 @@ export async function adoptLegacyByFingerprint(
 ): Promise<AdoptLegacyResult> {
   options.signal?.throwIfAborted?.();
   const slockHome = resolveRaftHome();
-  const { accessToken, baseUrl } = await readUserSessionContext(slockHome, input.serverUrl);
+  const { accessToken, baseUrl } = await adoptContext(slockHome, input);
   const slugForServer = normalizeServerSlug(input.serverSlug);
   if (!slugForServer) {
     throw new ComputerServiceError("ADOPT_NOT_AUTHORIZED", "Server slug must not be empty.");
@@ -654,6 +704,7 @@ export async function adoptLegacyByFingerprint(
         apiKeyFingerprint: input.apiKeyFingerprint,
         ...(input.name ? { name: input.name } : {}),
       }),
+    input.credential,
   );
 
   return completeAdoptionExchange(
@@ -672,7 +723,9 @@ export async function adoptLegacyByFingerprint(
         invalidFailureReason: "legacy_fingerprint_invalid",
         invalidMessage: `Server rejected the selected legacy machine (unknown / wrong server / malformed fingerprint). Local legacy owner evidence for this candidate: ${formatLegacyOwnerEvidence(slockHome, ownerEvidence)}. Re-run setup and pick a currently listed legacy daemon, or choose fresh attach.`,
         migratedMessage: `This machine has already been adopted. Local legacy owner evidence for this candidate: ${formatLegacyOwnerEvidence(slockHome, ownerEvidence)}. Use \`raft-computer attach\` to add another Computer attachment, or choose fresh attach in setup.`,
-        authRequiredMessage: `Your Computer user session was rejected by the server before legacy adoption. Local legacy owner evidence for this candidate: ${formatLegacyOwnerEvidence(slockHome, ownerEvidence)}. Re-run \`raft-computer login\` for this server, then retry setup. No local Computer state was written.`,
+        authRequiredMessage: input.credential
+          ? APPROVAL_REJECTED_MESSAGE
+          : `Your Computer user session was rejected by the server before legacy adoption. Local legacy owner evidence for this candidate: ${formatLegacyOwnerEvidence(slockHome, ownerEvidence)}. Run \`raft-computer setup /<server>\` in a terminal to sign in again. No local Computer state was written.`,
         failedMessage: (code) =>
           `Adoption failed at server exchange (${code}). Local legacy owner evidence for this candidate: ${formatLegacyOwnerEvidence(slockHome, ownerEvidence)}. Confirm the user session is valid and the server URL is correct. No local Computer state was written.`,
         stopFailureRetryCommand: `\`raft-computer setup ${formatServerSlugDisplay(slugForServer)}\``,
@@ -688,7 +741,7 @@ export async function adoptLegacyByDaemonId(
 ): Promise<AdoptLegacyResult> {
   options.signal?.throwIfAborted?.();
   const slockHome = resolveRaftHome();
-  const { accessToken, baseUrl } = await readUserSessionContext(slockHome, input.serverUrl);
+  const { accessToken, baseUrl } = await adoptContext(slockHome, input);
   const slugForServer = normalizeServerSlug(input.serverSlug);
   if (!slugForServer) {
     throw new ComputerServiceError("ADOPT_NOT_AUTHORIZED", "Server slug must not be empty.");
@@ -710,6 +763,7 @@ export async function adoptLegacyByDaemonId(
         daemonId: input.legacyMachineId,
         ...(input.name ? { name: input.name } : {}),
       }),
+    input.credential,
   );
 
   return completeAdoptionExchange(
@@ -727,7 +781,9 @@ export async function adoptLegacyByDaemonId(
         invalidFailureReason: "legacy_daemon_id_invalid",
         invalidMessage: "Server rejected the selected legacy machine row. Re-run setup and pick a currently listed legacy daemon, or choose fresh attach.",
         migratedMessage: "This machine has already been adopted. Use `raft-computer attach` to add another Computer attachment, or choose fresh attach in setup.",
-        authRequiredMessage: "Your Computer user session was rejected by the server before legacy adoption. Re-run `raft-computer login` for this server, then retry setup. No local Computer state was written.",
+        authRequiredMessage: input.credential
+          ? APPROVAL_REJECTED_MESSAGE
+          : "Your Computer user session was rejected by the server before legacy adoption. Run `raft-computer setup /<server>` in a terminal to sign in again. No local Computer state was written.",
         failedMessage: (code) =>
           `Adoption failed at server exchange (${code}). Confirm the user session is valid and the server URL is correct. No local Computer state was written.`,
         stopFailureRetryCommand: `\`raft-computer setup ${formatServerSlugDisplay(slugForServer)}\``,

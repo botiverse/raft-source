@@ -19,7 +19,6 @@ export interface MessageSelectionShortcutTarget {
   quoteChannelId: string;
   text: string;
   anchorRect: RectLike;
-  selectionRect: RectLike;
 }
 
 export interface MessageSelectionShortcutPosition {
@@ -75,22 +74,40 @@ function toRectLike(rect: DOMRect): RectLike {
   };
 }
 
-export function getRangeShortcutRects(range: Range): { anchorRect: RectLike; selectionRect: RectLike } | null {
-  const rects = Array.from(range.getClientRects()).filter(rectHasArea);
-  const anchorRect = rects.at(-1) ?? range.getBoundingClientRect();
-  if (!anchorRect || !rectHasArea(anchorRect)) return null;
-  let selectionRect = toRectLike(rects[0] ?? anchorRect);
-  for (const rect of rects.slice(1)) {
-    const left = Math.min(selectionRect.left, rect.left);
-    const top = Math.min(selectionRect.top, rect.top);
-    const right = Math.max(selectionRect.right, rect.right);
-    const bottom = Math.max(selectionRect.bottom, rect.bottom);
-    selectionRect = { left, top, right, bottom, width: right - left, height: bottom - top };
+function containsRect(outer: RectLike, inner: RectLike): boolean {
+  return outer !== inner
+    && outer.left <= inner.left
+    && outer.top <= inner.top
+    && outer.right >= inner.right
+    && outer.bottom >= inner.bottom
+    && (outer.width > inner.width || outer.height > inner.height);
+}
+
+function isBackwardSelection(selection: Selection): boolean {
+  const direction = (selection as Selection & { direction?: string }).direction;
+  if (direction) return direction === "backward";
+  const { anchorNode, anchorOffset, focusNode, focusOffset } = selection;
+  if (!anchorNode || !focusNode || anchorOffset === undefined || focusOffset === undefined) return false;
+  if (anchorNode === focusNode) return focusOffset < anchorOffset;
+  try {
+    return Boolean(anchorNode.compareDocumentPosition(focusNode) & Node.DOCUMENT_POSITION_PRECEDING);
+  } catch {
+    return false;
   }
-  return {
-    anchorRect: toRectLike(anchorRect),
-    selectionRect,
-  };
+}
+
+/**
+ * The rect of the line the selection's focus end is on: the last client rect
+ * for a forward selection, the first for a backward one. A whole-line
+ * selection also returns the box of the block holding those lines, which
+ * spans the row; a rect that contains another one is such a box, not a line.
+ */
+export function getRangeFocusLineRect(range: Range, backward = false): RectLike | null {
+  const rects = Array.from(range.getClientRects()).filter(rectHasArea);
+  const lines = rects.filter((rect) => !rects.some((other) => containsRect(rect, other)));
+  const focusRect = (backward ? lines[0] : lines.at(-1)) ?? range.getBoundingClientRect();
+  if (!focusRect || !rectHasArea(focusRect)) return null;
+  return toRectLike(focusRect);
 }
 
 export function getMessageSelectionShortcutTarget(selection: Selection | null): MessageSelectionShortcutTarget | null {
@@ -107,15 +124,14 @@ export function getMessageSelectionShortcutTarget(selection: Selection | null): 
   const text = getTextSelectionWithinElement(selection, messageBody);
   if (!text) return null;
 
-  const shortcutRects = getRangeShortcutRects(range);
-  if (!shortcutRects) return null;
+  const anchorRect = getRangeFocusLineRect(range, isBackwardSelection(selection));
+  if (!anchorRect) return null;
 
   return {
     messageId: messageBody.dataset.messageId ?? null,
     quoteChannelId,
     text,
-    anchorRect: shortcutRects.anchorRect,
-    selectionRect: shortcutRects.selectionRect,
+    anchorRect,
   };
 }
 
@@ -123,16 +139,18 @@ function clamp(value: number, min: number, max: number): number {
   return Math.min(Math.max(value, min), Math.max(min, max));
 }
 
+/**
+ * Centers the toolbar over the focus line, above it when there is room and
+ * below it otherwise, then clamps it inside the viewport.
+ */
 export function placeMessageSelectionShortcut({
   anchorRect,
-  avoidRect = anchorRect,
   floatingSize,
   viewport,
   gap = MESSAGE_SELECTION_SHORTCUT_GAP,
   padding = MESSAGE_SELECTION_SHORTCUT_PADDING,
 }: {
   anchorRect: RectLike;
-  avoidRect?: RectLike;
   floatingSize: { width: number; height: number };
   viewport: { width: number; height: number; offsetLeft?: number; offsetTop?: number };
   gap?: number;
@@ -144,9 +162,9 @@ export function placeMessageSelectionShortcut({
   const maxX = offsetLeft + viewport.width - floatingSize.width - padding;
   const minY = offsetTop + padding;
   const maxY = offsetTop + viewport.height - floatingSize.height - padding;
-  const desiredX = avoidRect.left + avoidRect.width / 2 - floatingSize.width / 2;
-  const aboveY = avoidRect.top - floatingSize.height - gap;
-  const belowY = avoidRect.bottom + gap;
+  const desiredX = anchorRect.left + anchorRect.width / 2 - floatingSize.width / 2;
+  const aboveY = anchorRect.top - floatingSize.height - gap;
+  const belowY = anchorRect.bottom + gap;
   const belowFits = belowY <= maxY;
   const aboveFits = aboveY >= minY;
   const desiredY = aboveFits || !belowFits ? aboveY : belowY;

@@ -14,6 +14,7 @@ import { useContext } from "react";
 import type { LabelHTMLAttributes, ReactNode } from "react";
 import { IntlContext } from "react-intl";
 import {
+  cn,
   Field,
   FieldDescription,
   FieldError,
@@ -21,7 +22,7 @@ import {
   LabelAsterisk,
   LabelOptional,
 } from "@botiverse/raft-ui";
-import { en } from "../../i18n/messages/en";
+import { enFallback } from "../../i18n/messages/enFallback";
 
 
 export type FormFieldProps = {
@@ -47,6 +48,8 @@ export type FormFieldProps = {
   size?: "default" | "compact";
   /** Additional classes appended to the outer `<div>`. */
   className?: string;
+  /** The outer `<div>`'s id: a setting's anchor (/settings/<page>#<id>). */
+  id?: string;
   /** The actual control — `<input>`, `<textarea>`, `<SegmentedControl>`,
    *  `<select>`, custom group, etc. */
   children: ReactNode;
@@ -63,17 +66,17 @@ export default function FormField({
   htmlFor,
   size = "default",
   className,
+  id,
   children,
 }: FormFieldProps) {
   // Some legacy test and static-render seams mount this shared primitive
   // without an IntlProvider; keep that path human-readable instead of throwing.
   const intl = useContext(IntlContext);
-  const optionalLabel = intl?.formatMessage({ id: "ui.formField.optional" }) ?? en["ui.formField.optional"];
+  const optionalLabel = intl?.formatMessage({ id: "ui.formField.optional" }) ?? enFallback["ui.formField.optional"];
   // raft-ui's label step: md = 13/18 600 (the DS field label), sm = 12/16 600
   // for the denser settings form treatment.
   const labelSize = size === "compact" ? "sm" : "md";
   const wrapperCls = className ? className : undefined;
-  const hasLabelRow = Boolean(labelAccessory || labelAction);
   const labelElement = (
     <FieldLabel
       size={labelSize}
@@ -86,23 +89,39 @@ export default function FormField({
       ) : null}
     </FieldLabel>
   );
+  const messageCls = labelAction ? "col-span-full" : undefined;
+  const message = error ? (
+    <FieldError role="alert" match={Boolean(error)} className={messageCls}>
+      {error}
+    </FieldError>
+  ) : hint ? (
+    <FieldDescription className={messageCls}>{hint}</FieldDescription>
+  ) : null;
+  if (labelAction) {
+    // Drawn at the end of the label row, but after the control in the markup:
+    // Tab and screen readers reach the field before its action.
+    return (
+      <Field id={id} className={cn("grid grid-cols-[minmax(0,1fr)_auto] gap-x-2", wrapperCls)} invalid={Boolean(error)}>
+        <div className="col-start-1 row-start-1 flex min-w-0 items-center gap-1">
+          {labelElement}
+          {labelAccessory}
+        </div>
+        <div className="col-span-full row-start-2 flex min-w-0 flex-col gap-1.5">{children}</div>
+        <span className="col-start-2 row-start-1 flex items-center">{labelAction}</span>
+        {message}
+      </Field>
+    );
+  }
   return (
-    <Field className={wrapperCls} invalid={Boolean(error)}>
-      {hasLabelRow ? (
+    <Field id={id} className={wrapperCls} invalid={Boolean(error)}>
+      {labelAccessory ? (
         <div className="flex items-center gap-1">
           {labelElement}
           {labelAccessory}
-          {labelAction ? <span className="ml-auto flex">{labelAction}</span> : null}
         </div>
       ) : labelElement}
       {children}
-      {error ? (
-        <FieldError role="alert" match={Boolean(error)}>
-          {error}
-        </FieldError>
-      ) : hint ? (
-        <FieldDescription>{hint}</FieldDescription>
-      ) : null}
+      {message}
     </Field>
   );
 }

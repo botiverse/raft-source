@@ -2,6 +2,7 @@ import type { MachineToServerMessage } from "@botiverse/raft-shared";
 import { appSourceTraceAttrs } from "@botiverse/raft-shared/src/appRuntimeTrace";
 import type { BuiltInMachineMessageContext } from "../../registry.manifest";
 import * as reminderService from "./service";
+import { notifyReminderFired } from "./firedNotification";
 import { isReminderCatchup } from "./fireTiming";
 import { selectReminderDueProtocol } from "./protocolTransition";
 import { errorClassOf } from "../../tracing/semanticTrace";
@@ -170,6 +171,8 @@ export async function handleReminderFireRequest(
         catchup: result.catchup,
         nextFireAt: result.nextFireAt?.toISOString() ?? null,
       });
+      // Notify the human who scheduled it (every device, through the outbox). Never blocks the receipt.
+      void notifyReminderFired({ reminderId: result.row.id, firedAt: result.row.firedAt?.toISOString() ?? message.firedAtClient });
     }
     const transported = result.nextFireAt
       ? await context.host.pushReminderUpsert(result.row.ownerAgentId, result.row)

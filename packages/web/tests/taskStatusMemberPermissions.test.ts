@@ -42,9 +42,10 @@ test("a non-assignee member can edit status", () => {
   assert.equal(canEditTaskStatus(taskWith(), OTHER, false), true);
 });
 
-test("a Guest never receives a status editor", () => {
-  assert.equal(canEditTaskStatus(taskWith(), OTHER, false, "guest"), false);
-  assert.equal(canEditTaskStatus(taskWith(), ASSIGNEE, true, "guest"), false);
+test("a Guest moves its own channel's tasks like a member (guest matrix §1); the board only holds those", () => {
+  assert.equal(canEditTaskStatus(taskWith(), OTHER, false), true);
+  assert.equal(canEditTaskStatus(taskWith(), ASSIGNEE, true), true);
+  assert.equal(canEditTaskStatus(taskWith({ readOnlyReason: "historical_joint_task" }), OTHER, false), false);
 });
 
 test("a member can edit status on an unclaimed task", () => {
@@ -54,29 +55,28 @@ test("a member can edit status on an unclaimed task", () => {
   );
 });
 
-test("a non-assignee gets the real transitions, not a menu of one", () => {
+test("a non-assignee gets every status, not a menu of one", () => {
   // Previously a non-assignee outside `in_review` got `[current]` -- a dropdown
   // whose only entry was the status the task already had.
-  const options = getTaskStatusOptions(taskWith({ status: "in_progress" }), OTHER, false).map((o) => o.id);
-  assert.deepEqual(options, ["in_progress", "in_review", "done", "closed"]);
+  const options = getTaskStatusOptions(taskWith({ status: "in_progress" }), OTHER, false, false).map((o) => o.id);
+  assert.deepEqual(options, ["todo", "in_progress", "in_review", "done", "closed"]);
 });
 
-test("a non-assignee is not silently handed admin force-transitions", () => {
-  const options = getTaskStatusOptions(taskWith({ status: "todo" }), OTHER, false).map((o) => o.id);
-  assert.deepEqual(options, ["todo", "in_progress", "closed"]);
-  assert.equal(options.includes("done"), false, "todo -> done is not a legal member transition");
+test("there are no transition limits: todo can go straight to done (stdrc 2026-10-31)", () => {
+  const options = getTaskStatusOptions(taskWith({ status: "todo" }), OTHER, false, false).map((o) => o.id);
+  assert.deepEqual(options, ["todo", "in_progress", "in_review", "done", "closed"]);
 });
 
 test("assignee and non-assignee now see identical menus", () => {
   for (const status of ["todo", "in_progress", "in_review", "done", "closed"] as const) {
-    const mine = getTaskStatusOptions(taskWith({ status }), ASSIGNEE, false).map((o) => o.id);
-    const theirs = getTaskStatusOptions(taskWith({ status }), OTHER, false).map((o) => o.id);
+    const mine = getTaskStatusOptions(taskWith({ status }), ASSIGNEE, false, false).map((o) => o.id);
+    const theirs = getTaskStatusOptions(taskWith({ status }), OTHER, false, false).map((o) => o.id);
     assert.deepEqual(theirs, mine, `menus diverge at status=${status}`);
   }
 });
 
 test("the in_review carve-out is gone: a reviewer can send work back, not only approve", () => {
-  const options = getTaskStatusOptions(taskWith({ status: "in_review" }), OTHER, false).map((o) => o.id);
+  const options = getTaskStatusOptions(taskWith({ status: "in_review" }), OTHER, false, false).map((o) => o.id);
   // The old rule granted a non-assignee exactly [in_review, done] here.
   assert.equal(options.includes("in_progress"), true, "sending it back must be offered too");
   assert.equal(options.includes("closed"), true);
@@ -86,7 +86,14 @@ test("closed work can be reopened by someone other than the original assignee", 
   const closed = taskWith({ status: "closed" });
   assert.equal(canEditTaskStatus(closed, OTHER, false), true);
   assert.deepEqual(
-    getTaskStatusOptions(closed, OTHER, false).map((o) => o.id),
-    ["closed", "todo", "in_progress"],
+    getTaskStatusOptions(closed, OTHER, false, false).map((o) => o.id),
+    ["todo", "in_progress", "in_review", "done", "closed"],
   );
+});
+
+test("backlog is offered on task v2 only, and a task already in it keeps it as its current option", () => {
+  const options = (status: Task["status"], taskV2: boolean) => getTaskStatusOptions(taskWith({ status }), OTHER, false, taskV2).map((option) => option.id);
+  assert.equal(options("todo", false).includes("backlog"), false);
+  assert.equal(options("todo", true).includes("backlog"), true);
+  assert.equal(options("backlog", false).includes("backlog"), true);
 });

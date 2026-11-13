@@ -56,7 +56,7 @@ function authHeaders(seedState: PlaywrightSeedState, accessToken: string) {
 //
 // Post-rail refactor (#1176): sidebar surfaces moved from `?sidebarTab=...`
 // query params to path-based routes. Agent/Human detail now falls back to
-// `/members`, Machine detail falls back to `/settings`, and the chat root
+// `/members`, Machine detail falls back to `/computers`, and the chat root
 // stays at `/s/<slug>`.
 test.describe("mobile back from cold-start deep URL", () => {
   test("Activity thread transitions preserve Activity as the one-step Back origin", async ({
@@ -114,13 +114,16 @@ test.describe("mobile back from cold-start deep URL", () => {
       await expect(row).toBeVisible();
       await row.click();
       await expect(page.getByTestId("thread-mobile-back")).toBeVisible();
+      // The thread opens inside Activity (a page pushed over its list), not
+      // on the parent channel's chat route.
       await expect(page).toHaveURL(new RegExp(
-        `/channel/${seedState.channel.id}\\?.*thread=${seedState.channel.id}(?:%3A|:)${parentMessage.id}`,
+        `${activityPath}\\?.*thread=${seedState.channel.id}(?:%3A|:)${parentMessage.id}`,
       ));
+      await expect.poll(() => new URL(page.url()).searchParams.get("open")).toMatch(/^thread:/);
     };
 
     // Activity → Thread → Back is one transition, so one Back restores the
-    // Activity surface instead of merely stripping the thread query in-place.
+    // Activity list instead of merely stripping the thread query in-place.
     await openActivityThread();
     await page.getByTestId("thread-mobile-back").click();
     await expect(page).toHaveURL(new RegExp(`${activityPath}$`));
@@ -253,6 +256,8 @@ test.describe("mobile back from cold-start deep URL", () => {
     page,
     request,
   }) => {
+    // 25 seeded messages and a cold boot before the scroll checks.
+    test.slow();
     const seedState = await waitForSeedState();
     const login = await loginViaApi(request, seedState);
     await dismissOwnerOnboarding(request, seedState, login.accessToken);
@@ -291,15 +296,42 @@ test.describe("mobile back from cold-start deep URL", () => {
     const threadScroller = page.getByTestId("thread-message-scroller");
     const backButton = page.getByTestId("thread-mobile-back");
     const threadComposer = page.getByPlaceholder("Message thread");
-    await expect(threadScroller.getByText(`${replyPrefix} 0`)).toBeVisible();
+    // Exact: on touch every row also holds its swipe-to-reveal time (aria-hidden,
+    // right after the body), so a row's text runs on into the clock. A substring
+    // match for "reply 23" also hits reply 2's row whenever the time starts with
+    // 3 ("…reply 2" + "3:18"): two elements, a strict-mode failure in 3 o'clock.
+    const reply = (index: number) =>
+      threadScroller.getByText(`${replyPrefix} ${index}`, { exact: true });
+    // With no reply to focus, a thread opens at its latest reply (the
+    // timeline's initial position: focus, then the remembered row, then the
+    // tail). The list is virtualized, so whether the oldest replies are still
+    // mounted above the view depends on its overscan, not on the position:
+    // assert the tail, then scroll the history explicitly.
+    // Cold boot plus the replies' first page: slow when other workers share
+    // the API.
+    await expect(reply(23)).toBeInViewport({ timeout: 15_000 });
     await expect(threadComposer).toBeVisible();
 
+    const distanceFromBottom = () =>
+      threadScroller.evaluate((el) => el.scrollHeight - el.clientHeight - el.scrollTop);
+
+    // Scroll the history back to the thread's start.
+    await threadScroller.evaluate((el) => {
+      el.scrollTop = 0;
+    });
+    await expect(reply(0)).toBeInViewport();
+    await expect.poll(distanceFromBottom, { timeout: 5000 }).toBeGreaterThan(0);
+    await page.evaluate(() => new Promise(requestAnimationFrame));
+
+    expect(await centerHitBelongsTo(backButton)).toBeTruthy();
+    expect(await centerHitBelongsTo(threadComposer)).toBeTruthy();
+
+    // And forward again to the latest reply.
     await threadScroller.evaluate((el) => {
       el.scrollTop = el.scrollHeight;
     });
-    await expect
-      .poll(() => threadScroller.evaluate((el) => el.scrollTop), { timeout: 5000 })
-      .toBeGreaterThan(0);
+    await expect(reply(23)).toBeInViewport();
+    await expect.poll(distanceFromBottom, { timeout: 5000 }).toBeLessThanOrEqual(1);
     await page.evaluate(() => new Promise(requestAnimationFrame));
 
     expect(await centerHitBelongsTo(backButton)).toBeTruthy();
@@ -367,9 +399,9 @@ test.describe("mobile back from cold-start deep URL", () => {
     await expect(page).toHaveURL(new RegExp(`/s/${seedState.server.slug}/members$`));
   });
 
-  // Machine detail falls back to the Settings rail — the Computers list
-  // now lives inside server settings.
-  test("machine detail deep link → back → settings rail", async ({ page, request }) => {
+  // Machine detail falls back to the Computers list it belongs to (on a phone
+  // a page the server tab's popover pushes; Settings no longer lists it).
+  test("machine detail deep link → back → computers list", async ({ page, request }) => {
     const seedState = await waitForSeedState();
     const login = await loginViaApi(request, seedState);
     await dismissOwnerOnboarding(request, seedState, login.accessToken);
@@ -379,7 +411,7 @@ test.describe("mobile back from cold-start deep URL", () => {
     await expect(page.getByTestId("machine-mobile-back")).toBeVisible();
 
     await page.getByTestId("machine-mobile-back").click();
-    await expect(page).toHaveURL(new RegExp(`/s/${seedState.server.slug}/settings$`));
+    await expect(page).toHaveURL(new RegExp(`/s/${seedState.server.slug}/computers$`));
   });
 
   // Profile-as-overlay (`?profile=...`) cold-start: previously the back

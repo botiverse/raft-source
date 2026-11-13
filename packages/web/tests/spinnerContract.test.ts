@@ -2,18 +2,19 @@ import assert from "node:assert/strict";
 import { execSync } from "node:child_process";
 import { readFileSync, readdirSync } from "node:fs";
 import { relative, resolve } from "node:path";
+import { isTestPath } from "../scripts/testLocations";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import ts from "typescript";
 import { Spinner } from "@botiverse/raft-ui";
 
 const repoRoot = resolve(import.meta.dirname, "..");
-const read = (path: string) => readFileSync(resolve(repoRoot, path), "utf8");
 const sourceFiles = (directory: string): string[] => readdirSync(directory, { withFileTypes: true })
   .flatMap((entry) => {
     const path = resolve(directory, entry.name);
     if (entry.isDirectory()) return sourceFiles(path);
-    return /\.(?:ts|tsx)$/.test(entry.name) ? [path] : [];
+    // Feature tests (src/features/<feature>/tests/) are not app code.
+    return /\.(?:ts|tsx)$/.test(entry.name) && !isTestPath(relative(repoRoot, path)) ? [path] : [];
   });
 
 test("Spinner exposes xs/sm/md/lg + default/inverse + pixel visual", () => {
@@ -92,6 +93,7 @@ test("no inline ring-style `rounded-full ... animate-spin` div outside Spinner.t
   const allowed = hits
     .split("\n")
     .filter((line) => line && !line.includes("/components/ui/Spinner.tsx"))
+    .filter((line) => !isTestPath(relative(repoRoot, line.split(":")[0])))
     .join("\n");
   assert.equal(
     allowed.trim(),
@@ -158,32 +160,4 @@ test("no generic lucide `animate-spin` loader outside Spinner.tsx", () => {
     "",
     `generic spinning lucide icons are banned — use <Spinner> instead:\n${violations.join("\n")}`,
   );
-});
-
-test("migrated callsites import and use Spinner", () => {
-  const imageLightbox = read("src/components/ImageLightbox.tsx");
-  const attachmentChip = read("src/components/message/AttachmentChip.tsx");
-  const messageItem = read("src/components/message/MessageItem.tsx");
-  const messageInput = read("src/components/message/MessageInput.tsx");
-  const selectModeToolbar = read("src/components/message/SelectModeToolbar.tsx");
-  const agentWorkspace = read("src/components/agent/AgentWorkspace.tsx");
-
-  assert.match(imageLightbox, /import\s*\{[^}]*\bSpinner\b[^}]*\}\s*from\s*"@botiverse\/raft-ui"/);
-  assert.match(imageLightbox, /<Spinner size="lg" variant="inverse"/);
-
-  assert.match(attachmentChip, /import\s*\{[^}]*\bSpinner\b[^}]*\}\s*from\s*"@botiverse\/raft-ui"/);
-  assert.match(attachmentChip, /<Spinner size="sm"/);
-
-  assert.match(messageItem, /import\s*\{[^}]*\bSpinner\b[^}]*\}\s*from\s*"@botiverse\/raft-ui"/);
-  assert.match(messageItem, /<Spinner size="xs"/);
-  assert.match(messageItem, /<Spinner size="md" variant="inverse"/);
-
-  assert.match(messageInput, /import\s*\{[^}]*\bSpinner\b[^}]*\}\s*from\s*"@botiverse\/raft-ui"/);
-  assert.match(messageInput, /<Spinner size="sm"/);
-
-  assert.match(selectModeToolbar, /import\s*\{[^}]*\bSpinner\b[^}]*\}\s*from\s*"@botiverse\/raft-ui"/);
-  assert.match(selectModeToolbar, /<Spinner size="sm"/);
-
-  assert.match(agentWorkspace, /import\s*\{[^}]*\bSpinner\b[^}]*\}\s*from\s*"@botiverse\/raft-ui"/);
-  assert.match(agentWorkspace, /<Spinner size="xs"/);
 });

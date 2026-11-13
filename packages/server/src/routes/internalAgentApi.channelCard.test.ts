@@ -12,7 +12,7 @@ import { addAgent, addHuman, archiveChannel, createChannel, findOrCreateDM, getO
 import { createMessage } from "../services/messageService";
 import { mintAgentCredential } from "../services/agentCredentialService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 /**
  * A history read carries the card of the channel it is in (for a thread, its
@@ -47,7 +47,7 @@ async function seedFixture() {
   assert.ok(dm);
   await createMessage(dm.id, "user", owner.id, "hello", "chat");
 
-  const credential = await mintAgentCredential({ agentId: agent.id, scopes: ["send", "read"], name: "glimpse-card", createdByUserId: null });
+  const credential = await mintAgentCredential({ agentId: agent.id, scopes: ["send", "read"], name: "glimpse-card", issuedVia: "computer", createdByUserId: null });
   return { owner, ops, secret, anchor, apiKey: credential.apiKey };
 }
 
@@ -59,7 +59,7 @@ async function read(baseUrl: string, apiKey: string, target: string) {
 }
 
 test("history reads carry the channel card; a thread carries its parent's; a DM none", async ({ onTestFinished }) => {
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   onTestFinished(() => app.close());
   const fx = await seedFixture();
 

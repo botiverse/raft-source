@@ -1,0 +1,1285 @@
+{
+  "$comment": "Runtime form v3 condition conformance table (contract `Condition`). Every client evaluator must give `expected` for each case (condition.schema evaluated at condition.scope over `data`; absent value = \"\"), and must report every `unsupported` schema as unsupported (the form is then unavailable). const/enum compare structurally (object key order does not count); pattern is the portable subset in the package README (ECMAScript semantics: `$` only at the very end, `.` excludes only \\n, \\r, U+2028, U+2029). Consumed by packages/runtime-form/src/v3Rules.test.ts and the mobile tests.",
+  "cases": [
+    {
+      "name": "const matches",
+      "condition": {
+        "scope": "#/properties/providerId",
+        "schema": {
+          "const": "deepseek"
+        }
+      },
+      "data": {
+        "providerId": "deepseek"
+      },
+      "expected": true
+    },
+    {
+      "name": "const differs",
+      "condition": {
+        "scope": "#/properties/providerId",
+        "schema": {
+          "const": "deepseek"
+        }
+      },
+      "data": {
+        "providerId": "openai"
+      },
+      "expected": false
+    },
+    {
+      "name": "const on absent value compares with empty string",
+      "condition": {
+        "scope": "#/properties/providerId",
+        "schema": {
+          "const": ""
+        }
+      },
+      "data": {},
+      "expected": true
+    },
+    {
+      "name": "const boolean",
+      "condition": {
+        "scope": "#/properties/flag",
+        "schema": {
+          "const": true
+        }
+      },
+      "data": {
+        "flag": true
+      },
+      "expected": true
+    },
+    {
+      "name": "const boolean differs from string",
+      "condition": {
+        "scope": "#/properties/flag",
+        "schema": {
+          "const": true
+        }
+      },
+      "data": {
+        "flag": "true"
+      },
+      "expected": false
+    },
+    {
+      "name": "enum matches",
+      "condition": {
+        "scope": "#/properties/providerId",
+        "schema": {
+          "enum": [
+            "a",
+            "openai-compatible"
+          ]
+        }
+      },
+      "data": {
+        "providerId": "openai-compatible"
+      },
+      "expected": true
+    },
+    {
+      "name": "enum misses",
+      "condition": {
+        "scope": "#/properties/providerId",
+        "schema": {
+          "enum": [
+            "a",
+            "b"
+          ]
+        }
+      },
+      "data": {
+        "providerId": "c"
+      },
+      "expected": false
+    },
+    {
+      "name": "enum on absent value",
+      "condition": {
+        "scope": "#/properties/providerId",
+        "schema": {
+          "enum": [
+            "a"
+          ]
+        }
+      },
+      "data": {},
+      "expected": false
+    },
+    {
+      "name": "enum with empty string matches absent",
+      "condition": {
+        "scope": "#/properties/providerId",
+        "schema": {
+          "enum": [
+            "",
+            "a"
+          ]
+        }
+      },
+      "data": {},
+      "expected": true
+    },
+    {
+      "name": "enum with null value treated as empty",
+      "condition": {
+        "scope": "#/properties/providerId",
+        "schema": {
+          "enum": [
+            ""
+          ]
+        }
+      },
+      "data": {
+        "providerId": null
+      },
+      "expected": true
+    },
+    {
+      "name": "empty enum never matches",
+      "condition": {
+        "scope": "#/properties/providerId",
+        "schema": {
+          "enum": []
+        }
+      },
+      "data": {
+        "providerId": "a"
+      },
+      "expected": false
+    },
+    {
+      "name": "pattern prefix matches",
+      "condition": {
+        "scope": "#/properties/providerId",
+        "schema": {
+          "pattern": "^connection:"
+        }
+      },
+      "data": {
+        "providerId": "connection:abc"
+      },
+      "expected": true
+    },
+    {
+      "name": "pattern prefix misses",
+      "condition": {
+        "scope": "#/properties/providerId",
+        "schema": {
+          "pattern": "^connection:"
+        }
+      },
+      "data": {
+        "providerId": "deepseek"
+      },
+      "expected": false
+    },
+    {
+      "name": "pattern is unanchored",
+      "condition": {
+        "scope": "#/properties/providerId",
+        "schema": {
+          "pattern": "seek"
+        }
+      },
+      "data": {
+        "providerId": "deepseek"
+      },
+      "expected": true
+    },
+    {
+      "name": "pattern on absent value",
+      "condition": {
+        "scope": "#/properties/providerId",
+        "schema": {
+          "pattern": "^connection:"
+        }
+      },
+      "data": {},
+      "expected": false
+    },
+    {
+      "name": "pattern matching empty on absent",
+      "condition": {
+        "scope": "#/properties/providerId",
+        "schema": {
+          "pattern": "^$"
+        }
+      },
+      "data": {},
+      "expected": true
+    },
+    {
+      "name": "pattern on a boolean value is false",
+      "condition": {
+        "scope": "#/properties/flag",
+        "schema": {
+          "pattern": ".*"
+        }
+      },
+      "data": {
+        "flag": true
+      },
+      "expected": false
+    },
+    {
+      "name": "not inverts",
+      "condition": {
+        "scope": "#/properties/providerId",
+        "schema": {
+          "not": {
+            "pattern": "^connection:"
+          }
+        }
+      },
+      "data": {
+        "providerId": "deepseek"
+      },
+      "expected": true
+    },
+    {
+      "name": "not inverts a match",
+      "condition": {
+        "scope": "#/properties/providerId",
+        "schema": {
+          "not": {
+            "pattern": "^connection:"
+          }
+        }
+      },
+      "data": {
+        "providerId": "connection:x"
+      },
+      "expected": false
+    },
+    {
+      "name": "anyOf one matches",
+      "condition": {
+        "scope": "#/properties/providerId",
+        "schema": {
+          "anyOf": [
+            {
+              "const": "a"
+            },
+            {
+              "const": "b"
+            }
+          ]
+        }
+      },
+      "data": {
+        "providerId": "b"
+      },
+      "expected": true
+    },
+    {
+      "name": "anyOf none matches",
+      "condition": {
+        "scope": "#/properties/providerId",
+        "schema": {
+          "anyOf": [
+            {
+              "const": "a"
+            },
+            {
+              "const": "b"
+            }
+          ]
+        }
+      },
+      "data": {
+        "providerId": "c"
+      },
+      "expected": false
+    },
+    {
+      "name": "allOf all match",
+      "condition": {
+        "scope": "#/properties/providerId",
+        "schema": {
+          "allOf": [
+            {
+              "pattern": "^dee"
+            },
+            {
+              "pattern": "seek$"
+            }
+          ]
+        }
+      },
+      "data": {
+        "providerId": "deepseek"
+      },
+      "expected": true
+    },
+    {
+      "name": "allOf one fails",
+      "condition": {
+        "scope": "#/properties/providerId",
+        "schema": {
+          "allOf": [
+            {
+              "pattern": "^dee"
+            },
+            {
+              "const": "x"
+            }
+          ]
+        }
+      },
+      "data": {
+        "providerId": "deepseek"
+      },
+      "expected": false
+    },
+    {
+      "name": "empty schema is always true",
+      "condition": {
+        "scope": "#/properties/providerId",
+        "schema": {}
+      },
+      "data": {
+        "providerId": "anything"
+      },
+      "expected": true
+    },
+    {
+      "name": "several keywords combine with and",
+      "condition": {
+        "scope": "#/properties/providerId",
+        "schema": {
+          "enum": [
+            "a",
+            "b"
+          ],
+          "not": {
+            "const": "b"
+          }
+        }
+      },
+      "data": {
+        "providerId": "b"
+      },
+      "expected": false
+    },
+    {
+      "name": "whole-object scope with properties",
+      "condition": {
+        "scope": "#",
+        "schema": {
+          "properties": {
+            "providerId": {
+              "const": "a"
+            },
+            "model": {
+              "const": "m"
+            }
+          }
+        }
+      },
+      "data": {
+        "providerId": "a",
+        "model": "m"
+      },
+      "expected": true
+    },
+    {
+      "name": "whole-object properties one differs",
+      "condition": {
+        "scope": "#",
+        "schema": {
+          "properties": {
+            "providerId": {
+              "const": "a"
+            },
+            "model": {
+              "const": "m"
+            }
+          }
+        }
+      },
+      "data": {
+        "providerId": "a",
+        "model": "n"
+      },
+      "expected": false
+    },
+    {
+      "name": "whole-object properties absent key is empty string",
+      "condition": {
+        "scope": "#",
+        "schema": {
+          "properties": {
+            "apiKey": {
+              "const": ""
+            }
+          }
+        }
+      },
+      "data": {
+        "providerId": "a"
+      },
+      "expected": true
+    },
+    {
+      "name": "whole-object anyOf across fields",
+      "condition": {
+        "scope": "#",
+        "schema": {
+          "anyOf": [
+            {
+              "properties": {
+                "a": {
+                  "const": "1"
+                }
+              }
+            },
+            {
+              "properties": {
+                "b": {
+                  "const": "2"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "data": {
+        "a": "0",
+        "b": "2"
+      },
+      "expected": true
+    },
+    {
+      "name": "properties on a non-object value sees absent keys",
+      "condition": {
+        "scope": "#/properties/providerId",
+        "schema": {
+          "properties": {
+            "x": {
+              "const": ""
+            }
+          }
+        }
+      },
+      "data": {
+        "providerId": "deepseek"
+      },
+      "expected": true
+    },
+    {
+      "name": "unknown field scope evaluates absent value",
+      "condition": {
+        "scope": "#/properties/missing",
+        "schema": {
+          "const": ""
+        }
+      },
+      "data": {
+        "providerId": "a"
+      },
+      "expected": true
+    },
+    {
+      "name": "const object ignores key order",
+      "condition": {
+        "scope": "#",
+        "schema": {
+          "const": {
+            "providerId": "a",
+            "model": "m"
+          }
+        }
+      },
+      "data": {
+        "model": "m",
+        "providerId": "a"
+      },
+      "expected": true
+    },
+    {
+      "name": "enum object ignores nested key order",
+      "condition": {
+        "scope": "#",
+        "schema": {
+          "enum": [
+            "x",
+            {
+              "a": {
+                "x": 1,
+                "y": [
+                  1,
+                  {
+                    "p": "q",
+                    "r": "s"
+                  }
+                ]
+              },
+              "b": "2"
+            }
+          ]
+        }
+      },
+      "data": {
+        "b": "2",
+        "a": {
+          "y": [
+            1,
+            {
+              "r": "s",
+              "p": "q"
+            }
+          ],
+          "x": 1
+        }
+      },
+      "expected": true
+    },
+    {
+      "name": "const object with an extra key differs",
+      "condition": {
+        "scope": "#",
+        "schema": {
+          "const": {
+            "providerId": "a"
+          }
+        }
+      },
+      "data": {
+        "model": "m",
+        "providerId": "a"
+      },
+      "expected": false
+    },
+    {
+      "name": "const object with a missing key differs",
+      "condition": {
+        "scope": "#",
+        "schema": {
+          "const": {
+            "providerId": "a",
+            "model": "m"
+          }
+        }
+      },
+      "data": {
+        "providerId": "a"
+      },
+      "expected": false
+    },
+    {
+      "name": "const object with a different nested value differs",
+      "condition": {
+        "scope": "#",
+        "schema": {
+          "const": {
+            "b": {
+              "y": "1",
+              "x": "2"
+            }
+          }
+        }
+      },
+      "data": {
+        "b": {
+          "x": "2",
+          "y": "2"
+        }
+      },
+      "expected": false
+    },
+    {
+      "name": "const array order counts",
+      "condition": {
+        "scope": "#/properties/providerId",
+        "schema": {
+          "const": [
+            "a",
+            "b"
+          ]
+        }
+      },
+      "data": {
+        "providerId": [
+          "b",
+          "a"
+        ]
+      },
+      "expected": false
+    },
+    {
+      "name": "const array matches in order",
+      "condition": {
+        "scope": "#/properties/providerId",
+        "schema": {
+          "const": [
+            "a",
+            {
+              "k": "v",
+              "j": "w"
+            }
+          ]
+        }
+      },
+      "data": {
+        "providerId": [
+          "a",
+          {
+            "j": "w",
+            "k": "v"
+          }
+        ]
+      },
+      "expected": true
+    },
+    {
+      "name": "const empty object differs from empty array",
+      "condition": {
+        "scope": "#/properties/providerId",
+        "schema": {
+          "const": {}
+        }
+      },
+      "data": {
+        "providerId": []
+      },
+      "expected": false
+    },
+    {
+      "name": "const object differs from a string",
+      "condition": {
+        "scope": "#/properties/providerId",
+        "schema": {
+          "const": {
+            "a": "1"
+          }
+        }
+      },
+      "data": {
+        "providerId": "a"
+      },
+      "expected": false
+    },
+    {
+      "name": "pattern alternation in an anchored group matches",
+      "condition": {
+        "scope": "#/properties/providerId",
+        "schema": {
+          "pattern": "^(openai|deepseek)$"
+        }
+      },
+      "data": {
+        "providerId": "deepseek"
+      },
+      "expected": true
+    },
+    {
+      "name": "pattern alternation in an anchored group misses",
+      "condition": {
+        "scope": "#/properties/providerId",
+        "schema": {
+          "pattern": "^(openai|deepseek)$"
+        }
+      },
+      "data": {
+        "providerId": "deepseek2"
+      },
+      "expected": false
+    },
+    {
+      "name": "pattern unanchored alternation",
+      "condition": {
+        "scope": "#/properties/providerId",
+        "schema": {
+          "pattern": "foo|bar"
+        }
+      },
+      "data": {
+        "providerId": "xbar"
+      },
+      "expected": true
+    },
+    {
+      "name": "pattern class with ranges and a trailing dash matches",
+      "condition": {
+        "scope": "#/properties/providerId",
+        "schema": {
+          "pattern": "^[a-z0-9-]+$"
+        }
+      },
+      "data": {
+        "providerId": "conn-1"
+      },
+      "expected": true
+    },
+    {
+      "name": "pattern class with ranges is case-sensitive",
+      "condition": {
+        "scope": "#/properties/providerId",
+        "schema": {
+          "pattern": "^[a-z0-9-]+$"
+        }
+      },
+      "data": {
+        "providerId": "Conn"
+      },
+      "expected": false
+    },
+    {
+      "name": "pattern class with a leading dash",
+      "condition": {
+        "scope": "#/properties/providerId",
+        "schema": {
+          "pattern": "^[-a]+$"
+        }
+      },
+      "data": {
+        "providerId": "-a-"
+      },
+      "expected": true
+    },
+    {
+      "name": "pattern negated class matches",
+      "condition": {
+        "scope": "#/properties/providerId",
+        "schema": {
+          "pattern": "^[^:]+$"
+        }
+      },
+      "data": {
+        "providerId": "abc"
+      },
+      "expected": true
+    },
+    {
+      "name": "pattern negated class misses",
+      "condition": {
+        "scope": "#/properties/providerId",
+        "schema": {
+          "pattern": "^[^:]+$"
+        }
+      },
+      "data": {
+        "providerId": "a:b"
+      },
+      "expected": false
+    },
+    {
+      "name": "pattern optional group and escaped dot matches",
+      "condition": {
+        "scope": "#/properties/providerId",
+        "schema": {
+          "pattern": "^gpt-5(\\.[0-9]+)?$"
+        }
+      },
+      "data": {
+        "providerId": "gpt-5.1"
+      },
+      "expected": true
+    },
+    {
+      "name": "pattern optional group and escaped dot misses",
+      "condition": {
+        "scope": "#/properties/providerId",
+        "schema": {
+          "pattern": "^gpt-5(\\.[0-9]+)?$"
+        }
+      },
+      "data": {
+        "providerId": "gpt-5x"
+      },
+      "expected": false
+    },
+    {
+      "name": "pattern brace range matches",
+      "condition": {
+        "scope": "#/properties/providerId",
+        "schema": {
+          "pattern": "^[0-9]{2,4}$"
+        }
+      },
+      "data": {
+        "providerId": "123"
+      },
+      "expected": true
+    },
+    {
+      "name": "pattern brace range misses",
+      "condition": {
+        "scope": "#/properties/providerId",
+        "schema": {
+          "pattern": "^[0-9]{2,4}$"
+        }
+      },
+      "data": {
+        "providerId": "12345"
+      },
+      "expected": false
+    },
+    {
+      "name": "pattern exact brace count",
+      "condition": {
+        "scope": "#/properties/providerId",
+        "schema": {
+          "pattern": "^a{2}$"
+        }
+      },
+      "data": {
+        "providerId": "aa"
+      },
+      "expected": true
+    },
+    {
+      "name": "pattern open brace range",
+      "condition": {
+        "scope": "#/properties/providerId",
+        "schema": {
+          "pattern": "^a{2,}$"
+        }
+      },
+      "data": {
+        "providerId": "a"
+      },
+      "expected": false
+    },
+    {
+      "name": "pattern escaped syntax characters",
+      "condition": {
+        "scope": "#/properties/providerId",
+        "schema": {
+          "pattern": "^a\\+b\\$\\/\\[x\\]\\{1\\}$"
+        }
+      },
+      "data": {
+        "providerId": "a+b$/[x]{1}"
+      },
+      "expected": true
+    },
+    {
+      "name": "pattern escaped characters in a class",
+      "condition": {
+        "scope": "#/properties/providerId",
+        "schema": {
+          "pattern": "^[\\]\\-\\\\]+$"
+        }
+      },
+      "data": {
+        "providerId": "]-\\"
+      },
+      "expected": true
+    },
+    {
+      "name": "pattern dot and star",
+      "condition": {
+        "scope": "#/properties/providerId",
+        "schema": {
+          "pattern": "^c.*n$"
+        }
+      },
+      "data": {
+        "providerId": "connection"
+      },
+      "expected": true
+    },
+    {
+      "name": "pattern plus needs one",
+      "condition": {
+        "scope": "#/properties/providerId",
+        "schema": {
+          "pattern": "^ab+$"
+        }
+      },
+      "data": {
+        "providerId": "a"
+      },
+      "expected": false
+    },
+    {
+      "name": "pattern literal non-ASCII",
+      "condition": {
+        "scope": "#/properties/providerId",
+        "schema": {
+          "pattern": "^café$"
+        }
+      },
+      "data": {
+        "providerId": "café"
+      },
+      "expected": true
+    },
+    {
+      "name": "pattern dollar matches only at the very end (not before a trailing newline)",
+      "condition": {
+        "scope": "#/properties/providerId",
+        "schema": {
+          "pattern": "^a$"
+        }
+      },
+      "data": {
+        "providerId": "a\n"
+      },
+      "expected": false
+    },
+    {
+      "name": "pattern dot does not match a line feed",
+      "condition": {
+        "scope": "#/properties/providerId",
+        "schema": {
+          "pattern": "^a.b$"
+        }
+      },
+      "data": {
+        "providerId": "a\nb"
+      },
+      "expected": false
+    },
+    {
+      "name": "pattern dot matches U+0085 (only \\n, \\r, U+2028, U+2029 are line terminators)",
+      "condition": {
+        "scope": "#/properties/providerId",
+        "schema": {
+          "pattern": "^a.b$"
+        }
+      },
+      "data": {
+        "providerId": "ab"
+      },
+      "expected": true
+    }
+  ],
+  "unsupported": [
+    {
+      "name": "unknown keyword",
+      "schema": {
+        "minLength": 1
+      }
+    },
+    {
+      "name": "unknown keyword nested in not",
+      "schema": {
+        "not": {
+          "type": "string"
+        }
+      }
+    },
+    {
+      "name": "unknown keyword nested in properties",
+      "schema": {
+        "properties": {
+          "a": {
+            "format": "uri"
+          }
+        }
+      }
+    },
+    {
+      "name": "enum operand not an array",
+      "schema": {
+        "enum": "a"
+      }
+    },
+    {
+      "name": "pattern operand not a string",
+      "schema": {
+        "pattern": 1
+      }
+    },
+    {
+      "name": "invalid pattern",
+      "schema": {
+        "pattern": "("
+      }
+    },
+    {
+      "name": "empty anyOf",
+      "schema": {
+        "anyOf": []
+      }
+    },
+    {
+      "name": "schema not an object",
+      "schema": [
+        "a"
+      ]
+    },
+    {
+      "name": "pattern outside the portable subset: lookahead",
+      "schema": {
+        "pattern": "^(?=a)"
+      }
+    },
+    {
+      "name": "pattern outside the portable subset: negative lookahead",
+      "schema": {
+        "pattern": "(?!a)b"
+      }
+    },
+    {
+      "name": "pattern outside the portable subset: lookbehind",
+      "schema": {
+        "pattern": "(?<=a)b"
+      }
+    },
+    {
+      "name": "pattern outside the portable subset: negative lookbehind",
+      "schema": {
+        "pattern": "(?<!a)b"
+      }
+    },
+    {
+      "name": "pattern outside the portable subset: named group",
+      "schema": {
+        "pattern": "(?<name>a)"
+      }
+    },
+    {
+      "name": "pattern outside the portable subset: non-capturing group",
+      "schema": {
+        "pattern": "(?:a)"
+      }
+    },
+    {
+      "name": "pattern outside the portable subset: inline flag",
+      "schema": {
+        "pattern": "(?i)a"
+      }
+    },
+    {
+      "name": "pattern outside the portable subset: backreference",
+      "schema": {
+        "pattern": "(a)\\1"
+      }
+    },
+    {
+      "name": "pattern outside the portable subset: named backreference",
+      "schema": {
+        "pattern": "(a)\\k<n>"
+      }
+    },
+    {
+      "name": "pattern outside the portable subset: unicode property escape",
+      "schema": {
+        "pattern": "^\\p{L}+$"
+      }
+    },
+    {
+      "name": "pattern outside the portable subset: negated unicode property escape",
+      "schema": {
+        "pattern": "\\P{L}"
+      }
+    },
+    {
+      "name": "pattern outside the portable subset: class escape \\d",
+      "schema": {
+        "pattern": "^\\d+$"
+      }
+    },
+    {
+      "name": "pattern outside the portable subset: class escape \\w",
+      "schema": {
+        "pattern": "\\w"
+      }
+    },
+    {
+      "name": "pattern outside the portable subset: class escape \\s",
+      "schema": {
+        "pattern": "\\s"
+      }
+    },
+    {
+      "name": "pattern outside the portable subset: word boundary",
+      "schema": {
+        "pattern": "\\bconnection"
+      }
+    },
+    {
+      "name": "pattern outside the portable subset: control escape \\n",
+      "schema": {
+        "pattern": "a\\n"
+      }
+    },
+    {
+      "name": "pattern outside the portable subset: unicode escape",
+      "schema": {
+        "pattern": "\\u0041"
+      }
+    },
+    {
+      "name": "pattern outside the portable subset: hex escape",
+      "schema": {
+        "pattern": "\\x41"
+      }
+    },
+    {
+      "name": "pattern outside the portable subset: escaped dash outside a class",
+      "schema": {
+        "pattern": "a\\-b"
+      }
+    },
+    {
+      "name": "pattern outside the portable subset: trailing backslash",
+      "schema": {
+        "pattern": "a\\"
+      }
+    },
+    {
+      "name": "pattern outside the portable subset: lazy quantifier",
+      "schema": {
+        "pattern": "a*?"
+      }
+    },
+    {
+      "name": "pattern outside the portable subset: possessive quantifier",
+      "schema": {
+        "pattern": "a++"
+      }
+    },
+    {
+      "name": "pattern outside the portable subset: stacked quantifiers",
+      "schema": {
+        "pattern": "a{2}{3}"
+      }
+    },
+    {
+      "name": "pattern outside the portable subset: quantifier at the start",
+      "schema": {
+        "pattern": "*a"
+      }
+    },
+    {
+      "name": "pattern outside the portable subset: quantifier on an anchor",
+      "schema": {
+        "pattern": "^*a"
+      }
+    },
+    {
+      "name": "pattern outside the portable subset: quantifier after alternation",
+      "schema": {
+        "pattern": "a|+b"
+      }
+    },
+    {
+      "name": "pattern outside the portable subset: quantifier after an open group",
+      "schema": {
+        "pattern": "(+a)"
+      }
+    },
+    {
+      "name": "pattern outside the portable subset: bare open brace",
+      "schema": {
+        "pattern": "a{"
+      }
+    },
+    {
+      "name": "pattern outside the portable subset: brace without a minimum",
+      "schema": {
+        "pattern": "a{,3}"
+      }
+    },
+    {
+      "name": "pattern outside the portable subset: brace range reversed",
+      "schema": {
+        "pattern": "a{3,2}"
+      }
+    },
+    {
+      "name": "pattern outside the portable subset: bare close brace",
+      "schema": {
+        "pattern": "a}"
+      }
+    },
+    {
+      "name": "pattern outside the portable subset: bare close bracket",
+      "schema": {
+        "pattern": "a]"
+      }
+    },
+    {
+      "name": "pattern outside the portable subset: empty class",
+      "schema": {
+        "pattern": "[]"
+      }
+    },
+    {
+      "name": "pattern outside the portable subset: negated empty class",
+      "schema": {
+        "pattern": "[^]"
+      }
+    },
+    {
+      "name": "pattern outside the portable subset: nested class",
+      "schema": {
+        "pattern": "[[a]]"
+      }
+    },
+    {
+      "name": "pattern outside the portable subset: class intersection",
+      "schema": {
+        "pattern": "[a&&b]"
+      }
+    },
+    {
+      "name": "pattern outside the portable subset: reversed class range",
+      "schema": {
+        "pattern": "[z-a]"
+      }
+    },
+    {
+      "name": "pattern outside the portable subset: dash after a range",
+      "schema": {
+        "pattern": "[a-c-e]"
+      }
+    },
+    {
+      "name": "pattern outside the portable subset: dash as a range end",
+      "schema": {
+        "pattern": "[!--]"
+      }
+    },
+    {
+      "name": "pattern outside the portable subset: class escape inside a class",
+      "schema": {
+        "pattern": "[\\d]"
+      }
+    },
+    {
+      "name": "pattern outside the portable subset: unterminated class",
+      "schema": {
+        "pattern": "[a"
+      }
+    },
+    {
+      "name": "pattern outside the portable subset: unbalanced close group",
+      "schema": {
+        "pattern": "a)"
+      }
+    },
+    {
+      "name": "pattern outside the portable subset: unbalanced open group",
+      "schema": {
+        "pattern": "(a"
+      }
+    },
+    {
+      "name": "pattern outside the portable subset nested in not",
+      "schema": {
+        "not": {
+          "pattern": "(?<=a)b"
+        }
+      }
+    },
+    {
+      "name": "pattern outside the portable subset nested in properties",
+      "schema": {
+        "properties": {
+          "providerId": {
+            "pattern": "^\\d"
+          }
+        }
+      }
+    }
+  ]
+}

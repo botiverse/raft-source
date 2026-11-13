@@ -159,7 +159,7 @@ test("staging version codes are deterministic per exact prerelease and distinct 
   assert.equal(versionCodeFromVersion("1.2.3"), 1_002_003);
 });
 
-function promoteApi(manifest) {
+function promoteApi(manifest, { buildChannel = "alpha" } = {}) {
   const calls = [];
   let releaseStatus = "draft";
   const listedTargets = Object.entries(manifest.targets).map(([target, entry]) => ({
@@ -184,7 +184,7 @@ function promoteApi(manifest) {
     if (method === "GET" && path.startsWith("/api/apps/app-1/builds?version_name=")) {
       return { builds: [{
         id: "build-1",
-        channel: "alpha",
+        channel: buildChannel,
         product_type: "cli-binary",
         release_type: "stable",
         version_name: manifest.version,
@@ -398,6 +398,28 @@ test("stable promotion reuses the immutable RC target URLs and activates main on
   }
 });
 
+test("stable promotion accepts an RC build from the candidate channel and refuses any other source channel", async () => {
+  const fx = await fixture();
+  try {
+    const promote = (remote) => publishHandsRelease({
+      ...options(fx, remote.api),
+      artifactBaseUrl: `https://cdn.raft.build/computer/candidates/${"a".repeat(40)}`,
+      channel: "main",
+      mode: "promote-existing",
+      versionCode: undefined,
+    });
+    const promoted = await promote(promoteApi(fx.manifest, { buildChannel: "candidate" }));
+    assert.equal(promoted.release_id, "release-main");
+    for (const buildChannel of ["main", "constructed-wake-context"]) {
+      const remote = promoteApi(fx.manifest, { buildChannel });
+      await assert.rejects(promote(remote), /external build identity mismatch/);
+      assert.equal(remote.calls.some((call) => call.path.endsWith("/releases/draft")), false);
+    }
+  } finally {
+    await rm(fx.dir, { recursive: true, force: true });
+  }
+});
+
 test("register-or-exact-reuse leaves an exact active build and release byte-for-byte idempotent", async () => {
   const fx = await fixture();
   try {
@@ -537,11 +559,11 @@ test("direct upload transport failures name the asset and host/path, never the s
     };
     await assert.rejects(
       uploadAsset({
-        api, appId: "a1", buildId: "b1", fetchImpl,
+        api, appId: "a1", buildId: "b1", fetchImpl, recovery: { sleep: async () => {} }, log: () => {},
         asset: { artifact_kind: "binary", platform: "linux", arch: "x64", filetype: "bin", sha256: "0".repeat(64), size_bytes: 5, file: "raft-computer-linux-x64", path },
       }),
       (error) => {
-        assert.equal(error.message, "Hands direct upload transport failed: raft-computer-linux-x64 -> r2.example.com/bucket/key (TypeError <- ECONNRESET)");
+        assert.match(error.message, /^Hands direct upload transport failed: raft-computer-linux-x64 \(5 bytes\) -> r2\.example\.com\/bucket\/key after \d+ ms \(TypeError <- ECONNRESET\)$/);
         assert.doesNotMatch(error.message, /must-not-leak|Signature/);
         return true;
       },
@@ -552,6 +574,111 @@ test("direct upload transport failures name the asset and host/path, never the s
   } finally {
     await rm(workDir, { recursive: true, force: true });
   }
+});
+
+test("a failed direct upload names the host, size, edge request ids and the error body, never signature material", async () => {
+  const workDir = await mkdtemp(join(tmpdir(), "hands-upload-test-"));
+  try {
+    const path = join(workDir, "raft-computer-linux-x64");
+    await writeFile(path, "bytes");
+    const api = async () => ({
+      state: "pending",
+      asset_id: "as1",
+      upload: { method: "PUT", url: "https://acct.r2.cloudflarestorage.com/bucket/key?X-Amz-Signature=must-not-leak", headers: {} },
+      complete_url: "/api/apps/a1/builds/b1/assets/as1/upload/complete",
+    });
+    const errorBody = "<Error><Code>InternalError</Code><Message>We encountered an internal error.</Message>"
+      + "<StringToSign>AWS4-HMAC-SHA256 must-not-leak</StringToSign><Resource>/bucket/key?X-Amz-Credential=AKIA-must-not-leak</Resource></Error>";
+    const fetchImpl = async () => new Response(errorBody, {
+      status: 504,
+      headers: { "cf-ray": "8d1f2e3a4b5c6d7e-SJC", "x-amz-request-id": "req-123", "server": "cloudflare" },
+    });
+    await assert.rejects(
+      uploadAsset({
+        api, appId: "a1", buildId: "b1", fetchImpl, recovery: { sleep: async () => {} }, log: () => {},
+        asset: { artifact_kind: "binary", platform: "linux", arch: "x64", filetype: "bin", sha256: "0".repeat(64), size_bytes: 5, file: "raft-computer-linux-x64", path },
+      }),
+      (error) => {
+        assert.match(error.message, /^Hands direct upload failed: HTTP 504: raft-computer-linux-x64 \(5 bytes\) -> acct\.r2\.cloudflarestorage\.com\/bucket\/key; after \d+ ms; /);
+        assert.match(error.message, /cf-ray=8d1f2e3a4b5c6d7e-SJC x-amz-request-id=req-123 server=cloudflare/);
+        assert.match(error.message, /<Code>InternalError<\/Code>/);
+        assert.doesNotMatch(error.message, /must-not-leak/);
+        return true;
+      },
+    );
+  } finally {
+    await rm(workDir, { recursive: true, force: true });
+  }
+});
+
+async function retryFixture(statuses, run) {
+  const workDir = await mkdtemp(join(tmpdir(), "hands-upload-retry-"));
+  try {
+    const path = join(workDir, "raft-computer-darwin-arm64");
+    await writeFile(path, "bytes");
+    let links = 0;
+    const calls = [];
+    const api = async (method, apiPath) => {
+      calls.push(`${method} ${apiPath}`);
+      if (apiPath.endsWith("/assets/uploads")) {
+        links += 1;
+        return {
+          state: "pending",
+          asset_id: "as1",
+          upload: { method: "PUT", url: `https://acct.r2.cloudflarestorage.com/bucket/key?link=${links}&X-Amz-Signature=must-not-leak`, headers: {} },
+          complete_url: "/api/apps/a1/builds/b1/assets/as1/upload/complete",
+        };
+      }
+      if (apiPath.endsWith("/upload/complete")) return { state: "ready" };
+      throw new Error(`unexpected ${method} ${apiPath}`);
+    };
+    const putLinks = [];
+    const fetchImpl = async (url) => {
+      putLinks.push(new URL(url).searchParams.get("link"));
+      const status = statuses.shift();
+      if (status === "reset") throw new TypeError("fetch failed", { cause: Object.assign(new Error("socket"), { code: "UND_ERR_SOCKET" }) });
+      return new Response(status === 200 ? null : "<Error><Code>X</Code></Error>", { status });
+    };
+    const slept = [];
+    const logged = [];
+    const asset = { artifact_kind: "binary", platform: "darwin", arch: "arm64", filetype: "bin", sha256: "0".repeat(64), size_bytes: 5, file: "raft-computer-darwin-arm64", path };
+    const upload = () => uploadAsset({ api, appId: "a1", buildId: "b1", fetchImpl, asset, recovery: { sleep: async (ms) => { slept.push(ms); } }, log: (line) => logged.push(line) });
+    await run({ upload, calls, putLinks, slept, logged });
+  } finally {
+    await rm(workDir, { recursive: true, force: true });
+  }
+}
+
+test("a direct upload that fails with 504 or a reset is retried for that asset only, with a fresh link each time", async () => {
+  await retryFixture([504, "reset", 200], async ({ upload, calls, putLinks, slept, logged }) => {
+    await upload();
+    assert.deepEqual(putLinks, ["1", "2", "3"], "every attempt asks Hands for a new link");
+    assert.deepEqual(slept, [10_000, 30_000]);
+    assert.equal(calls.filter((call) => call.endsWith("/upload/complete")).length, 1, "completed once, after the PUT that passed");
+    assert.match(logged[0], /attempt 1\/3 failed \(http_504\)/);
+    assert.match(logged[1], /attempt 2\/3 failed \(transport\)/);
+    assert.doesNotMatch(logged.join("\n"), /must-not-leak/);
+  });
+});
+
+test("a 403 on the direct upload is reported as a rejected link and retried with a fresh one", async () => {
+  await retryFixture([403, 200], async ({ upload, logged, putLinks }) => {
+    await upload();
+    assert.deepEqual(putLinks, ["1", "2"]);
+    assert.match(logged[0], /\(link_rejected\).*upload link rejected \(expired or invalid\): HTTP 403/);
+  });
+});
+
+test("a direct upload gives up after three attempts, and never retries a 4xx other than 403/408/429", async () => {
+  await retryFixture([500, 502, 504], async ({ upload, putLinks }) => {
+    await assert.rejects(upload(), /Hands direct upload failed: HTTP 504/);
+    assert.equal(putLinks.length, 3);
+  });
+  await retryFixture([400], async ({ upload, putLinks, slept }) => {
+    await assert.rejects(upload(), /Hands direct upload failed: HTTP 400/);
+    assert.deepEqual(putLinks, ["1"]);
+    assert.deepEqual(slept, []);
+  });
 });
 
 test("a timed-out Hands API request names TimeoutError, not the numeric DOMException code", async () => {

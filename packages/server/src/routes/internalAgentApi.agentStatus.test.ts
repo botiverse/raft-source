@@ -18,7 +18,7 @@ import { createAgent } from "../services/agentService";
 import { mintAgentCredential } from "../services/agentCredentialService";
 import { AgentOrchestrator } from "../services/agentOrchestrator";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 type TestApp = { baseUrl: string; app: { set: (key: string, value: unknown) => void } };
 
@@ -38,6 +38,7 @@ async function seedExternalAgent(name = "StatusExt") {
     agentId: agent.id,
     scopes: ["read"],
     name: "agent-status-test",
+    issuedVia: "computer",
     createdByUserId: null,
   });
   return { agentId: agent.id, serverId: server.id, apiKey: minted.apiKey };

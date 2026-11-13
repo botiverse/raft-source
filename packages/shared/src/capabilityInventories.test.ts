@@ -7,11 +7,14 @@ import {
   type AgentLoginIntegrationInventoryScope,
 } from "./capabilityInventories";
 
-test("default projected exclusion preserves the exact negative-list boundary", () => {
+test("default scope lists MCP Apps (Raft Apps of another type) and no longer excludes Server-managed MCP", () => {
+  assert.deepEqual(AGENT_LOGIN_INTEGRATION_INVENTORY_SCOPE.includes, ["registered_services", "active_agent_logins", "mcp_apps"]);
+  assert.equal((AGENT_LOGIN_INTEGRATION_INVENTORY_SCOPE.excludes as readonly string[]).includes("server_managed_mcp_tools"), false);
   assert.equal(
-    AGENT_LOGIN_INTEGRATION_INVENTORY_PROJECTION.copy.exclusion,
-    "Not your runtime capability inventory: it does not list runtime tools (including Server-managed MCP), Computer-local tools, browser sessions, or arbitrary CLIs.",
+    AGENT_LOGIN_INTEGRATION_INVENTORY_PROJECTION.copy.scope,
+    "Scope: this command lists only installed registered Agent Login services, this Agent's active logins, and the MCP Apps this Agent has (used through their MCP tools).",
   );
+  assert.doesNotMatch(AGENT_LOGIN_INTEGRATION_INVENTORY_PROJECTION.copy.exclusion, /MCP/);
 });
 
 test("structured inventory fields project into both machine scope and human boundary copy", () => {

@@ -8,7 +8,6 @@ import { and, eq } from "drizzle-orm";
 import { getDb } from "../db/index";
 import {
   channelHumans,
-  featureFlags,
   channels,
   inboxSuppressionStates,
   messages,
@@ -28,8 +27,9 @@ import {
   READ_MUTATION_COMPATIBILITY_WAIT_MS_ENV,
 } from "../services/readMutationSequencer";
 import { openTestApp } from "../test/integration/app";
+import { revealAllChannelForTest } from "../test/allChannelFixture";
 
-const test = createApiTest({ sidebarMarkAllReadFlagDefaultEnabled: true, humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 async function login(baseUrl: string, email: string): Promise<string> {
   const response = await fetch(`${baseUrl}/api/auth/login`, {
@@ -235,7 +235,7 @@ test("frontier failure returns an explicit HOLD-worthy 503 rather than an empty 
 test("all five compatibility routes return recoverable 202 without fallback writes when a predecessor owns the authority", async () => {
   const previousWait = process.env[READ_MUTATION_COMPATIBILITY_WAIT_MS_ENV];
   process.env[READ_MUTATION_COMPATIBILITY_WAIT_MS_ENV] = "1";
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const [owner, sender, outsider] = await getDb().insert(users).values([
       {
@@ -283,6 +283,7 @@ test("all five compatibility routes return recoverable 202 without fallback writ
         `read-compat-${index}-${randomUUID()}`,
         owner.id,
       );
+      await revealAllChannelForTest(server.id);
       const [scope] = await getDb().select().from(channels).where(eq(channels.serverId, server.id)).limit(1);
       assert.ok(scope);
       await getDb().insert(messages).values({
@@ -471,6 +472,7 @@ test("all five compatibility routes return recoverable 202 without fallback writ
       `read-compat-validation-${randomUUID()}`,
       owner.id,
     );
+    await revealAllChannelForTest(validationServer.id);
     const [validationScope] = await getDb().select().from(channels)
       .where(eq(channels.serverId, validationServer.id)).limit(1);
     assert.ok(validationScope);
@@ -494,7 +496,7 @@ test("all five compatibility routes return recoverable 202 without fallback writ
 test("thread routes preserve legacy primary commits while composite Done stays wholly pending", async () => {
   const previousWait = process.env[READ_MUTATION_COMPATIBILITY_WAIT_MS_ENV];
   process.env[READ_MUTATION_COMPATIBILITY_WAIT_MS_ENV] = "1";
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const [owner, sender] = await getDb().insert(users).values([
       {
@@ -520,6 +522,7 @@ test("thread routes preserve legacy primary commits while composite Done stays w
         `read-composite-${spec}-${randomUUID()}`,
         owner.id,
       );
+      await revealAllChannelForTest(server.id);
       const [parentChannel] = await getDb().select().from(channels).where(eq(channels.serverId, server.id)).limit(1);
       assert.ok(parentChannel);
       const [parent] = await getDb().insert(messages).values({
@@ -666,7 +669,7 @@ test("thread routes preserve legacy primary commits while composite Done stays w
 test("post-persist thread reply stays successful and exact when its read receipt is pending", async () => {
   const previousWait = process.env[READ_MUTATION_COMPATIBILITY_WAIT_MS_ENV];
   process.env[READ_MUTATION_COMPATIBILITY_WAIT_MS_ENV] = "1";
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const [owner] = await getDb().insert(users).values({
       email: `read-message-owner-${randomUUID()}@test.invalid`,
@@ -676,6 +679,7 @@ test("post-persist thread reply stays successful and exact when its read receipt
       profileSetupCompletedAt: new Date(),
     }).returning();
     const server = await createServer("Read Message Pending", `read-message-pending-${randomUUID()}`, owner.id);
+    await revealAllChannelForTest(server.id);
     const [parentChannel] = await getDb().select().from(channels).where(eq(channels.serverId, server.id)).limit(1);
     assert.ok(parentChannel);
     const [parent] = await getDb().insert(messages).values({
@@ -772,6 +776,7 @@ test("sidebar conversation read-all derives the receiver and server from auth an
     { email: `conversation-other-${randomUUID()}@test.invalid`, name: `conversation-other-${randomUUID()}`, passwordHash: "x", emailVerified: true },
   ]).returning();
   const server = await createServer("Conversation reads", `conversation-${randomUUID()}`, owner.id);
+  await revealAllChannelForTest(server.id);
   const foreignServer = await createServer("Other conversation server", `conversation-other-${randomUUID()}`, owner.id);
   const [parent] = await db.select().from(channels).where(eq(channels.serverId, server.id)).limit(1);
   await db.insert(channelHumans).values({ channelId: parent.id, userId: owner.id }).onConflictDoNothing();
@@ -781,16 +786,12 @@ test("sidebar conversation read-all derives the receiver and server from auth an
   await db.insert(threadFollows).values({ followerType: "user", followerId: owner.id, threadChannelId: thread.id, parentMessageId: message.id, reason: "manual" });
   const token = await login(app.baseUrl, owner.email);
   const endpoint = `${app.baseUrl}/api/channels/${parent.id}/conversation-read-all`;
-  await db.update(featureFlags).set({ defaultEnabled: false }).where(eq(featureFlags.key, "sidebar_mark_all_read_v0"));
-  const disabled = await fetch(endpoint, { method: "POST", headers: authHeaders(token, server.id) });
-  assert.equal(disabled.status, 404);
   const generic = await fetch(`${app.baseUrl}/api/read-mutations`, {
     method: "POST", headers: authHeaders(token, server.id),
     body: JSON.stringify({ mutationId: randomUUID(), kind: "conversation_read_all", scopeId: parent.id }),
   });
-  assert.equal(generic.status, 400, "generic admission must not bypass the conversation rollout gate");
-  assert.equal((await db.select().from(readMutations)).length, 0, "disabled gate must not admit a new kind");
-  await db.update(featureFlags).set({ defaultEnabled: true }).where(eq(featureFlags.key, "sidebar_mark_all_read_v0"));
+  assert.equal(generic.status, 400, "generic admission does not take conversation_read_all; only its own route does");
+  assert.equal((await db.select().from(readMutations)).length, 0, "a refused generic admission writes nothing");
   const crossServer = await fetch(endpoint, { method: "POST", headers: authHeaders(token, foreignServer.id) });
   assert.equal(crossServer.status, 404, await crossServer.clone().text());
   const response = await fetch(endpoint, {

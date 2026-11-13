@@ -1,5 +1,9 @@
 import assert from "node:assert/strict";
-import { detectNodeHostKind, NodeHostUnavailableError, resolveNodeHostLaunch, seaDetected } from "./nodeHostLaunch";
+import { spawnSync } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { detectNodeHostKind, ELECTRON_NODE_SCRIPT_EXEC_ARGV, NodeHostUnavailableError, resolveNodeHostLaunch, seaDetected } from "./nodeHostLaunch";
 
 /**
  * The defect this pins: `exec_path_is_node: !versions.electron` inferred "is
@@ -89,6 +93,7 @@ test("NODE NEGATIVE CONTROL: a plain Node host is untouched", () => {
   assert.equal(launch.command, "/usr/local/bin/node");
   assert.deepEqual(launch.env, env);
   assert.equal(launch.env.ELECTRON_RUN_AS_NODE, undefined, "plain Node must not gain the Electron flag");
+  assert.deepEqual(launch.execArgv, [], "plain Node runs the entry with no extra options");
 });
 
 test("Electron still gets Node mode and keeps the rest of the environment", () => {
@@ -99,6 +104,36 @@ test("Electron still gets Node mode and keeps the rest of the environment", () =
   });
   assert.equal(launch.env.ELECTRON_RUN_AS_NODE, "1");
   assert.equal(launch.env.EXISTING, "kept");
+  assert.deepEqual(launch.execArgv, [...ELECTRON_NODE_SCRIPT_EXEC_ARGV]);
+});
+
+// task #159: commander's argument-less parse() and yargs' hideBin read
+// `process.versions.electron` without `process.defaultApp` as "argv[1] is a
+// user argument", so `<electron> <script> list` saw the script path as the
+// command. Run that exact decision in a child that looks like Electron's Node
+// mode, without and with the launch options.
+test("Electron Node mode: the exec options make argv[1] the script for commander/yargs-style parsers", () => {
+  const fakeElectron = "Object.defineProperty(process.versions, 'electron', { value: '44.0.0' });";
+  // Same rule as commander's _prepareUserArgs (from: "electron") and yargs' hideBin.
+  const probe = "const skip = process.versions.electron && !process.defaultApp ? 1 : 2;"
+    + "process.stdout.write(JSON.stringify(process.argv.slice(skip)));";
+  const dir = mkdtempSync(path.join(tmpdir(), "electron-node-argv-"));
+  try {
+    const script = path.join(dir, "cli.mjs");
+    writeFileSync(script, probe);
+    const runScript = (execArgv: readonly string[]) => {
+      const result = spawnSync(process.execPath, [
+        "--import", `data:text/javascript,${encodeURIComponent(fakeElectron)}`,
+        ...execArgv, script, "list",
+      ], { encoding: "utf8" });
+      assert.equal(result.status, 0, result.stderr);
+      return JSON.parse(result.stdout) as string[];
+    };
+    assert.deepEqual(runScript([]), [script, "list"], "control: without the options the script path leaks in as the first argument");
+    assert.deepEqual(runScript(ELECTRON_NODE_SCRIPT_EXEC_ARGV), ["list"]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("REAL PROBE: the SEA check actually runs on this ESM host and returns a usable answer", () => {

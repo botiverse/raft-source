@@ -12,7 +12,7 @@ import {
   seedUserChannelsScenario,
 } from "./internalAgentApi.userChannels.testkit";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 /**
  * GET /internal/agent-api/users/:name/channels — `raft user info` in one
@@ -80,7 +80,7 @@ test("users/:name/channels: the gate of both routes it replaces (channels + chan
   });
 
   const { mintAgentCredential } = await import("../services/agentCredentialService");
-  const channelsOnly = (await mintAgentCredential({ agentId: admin.agentId, scopes: ["channels"], name: "channels-only", createdByUserId: null })).apiKey;
+  const channelsOnly = (await mintAgentCredential({ agentId: admin.agentId, scopes: ["channels"], name: "channels-only", issuedVia: "computer", createdByUserId: null })).apiKey;
   const noRead = await get(app.baseUrl, channelsOnly, "/users/Scout/channels");
   assert.equal(noRead.status, 403);
   assert.equal(((await noRead.json()) as { requiredCapability?: string }).requiredCapability, "read");
@@ -100,7 +100,8 @@ test("users/:name/channels: unknown and directory-hidden users are 404 user_not_
 
   const unknown = await get(app.baseUrl, scenario.memberApiKey, "/users/nobody/channels");
   assert.equal(unknown.status, 404);
-  assert.deepEqual(await unknown.json(), { error: "User not found or not visible", code: "user_not_found" });
+  const unknownBody = await unknown.json() as { code?: string };
+  assert.equal(unknownBody.code, "user_not_found");
 
   // Exact, case-sensitive names: "scout" is not "Scout".
   assert.equal((await get(app.baseUrl, scenario.memberApiKey, "/users/scout/channels")).status, 404);
@@ -112,7 +113,8 @@ test("users/:name/channels: unknown and directory-hidden users are 404 user_not_
   await scenario.setHumanDirectoryHidden(true);
   const hidden = await get(app.baseUrl, scenario.memberApiKey, `/users/${scenario.hiddenHumanName}/channels`);
   assert.equal(hidden.status, 404);
-  assert.deepEqual(await hidden.json(), { error: "User not found or not visible", code: "user_not_found" });
+  // A hidden human answers exactly as a name nobody has.
+  assert.deepEqual(await hidden.json(), unknownBody);
   // A server-admin agent still sees the directory.
   assert.equal((await get(app.baseUrl, scenario.adminApiKey, `/users/${scenario.hiddenHumanName}/channels`)).status, 200);
 
@@ -123,9 +125,9 @@ test("users/:name/channels: unknown and directory-hidden users are 404 user_not_
   }
   const max = await get(app.baseUrl, scenario.memberApiKey, "/users/Scout/channels?limit=200");
   assert.equal(max.status, 200);
-  assert.deepEqual(((await max.json()) as { page: unknown }).page, { total: 9, offset: 0, limit: 200 });
+  assert.deepEqual(((await max.json()) as { page: unknown }).page, { total: 8, offset: 0, limit: 200 });
   const byDefault = await get(app.baseUrl, scenario.memberApiKey, "/users/@Scout/channels");
-  assert.deepEqual(((await byDefault.json()) as { page: unknown }).page, { total: 9, offset: 0, limit: 50 });
+  assert.deepEqual(((await byDefault.json()) as { page: unknown }).page, { total: 8, offset: 0, limit: 50 });
 });
 
 type UserChannelsBody = { memberships: Array<{ name: string; type: string }>; uncheckedCount: number };
@@ -170,7 +172,7 @@ test("users/:name/channels: a joint channel lists the subject itself, never its 
   assert.ok(roster.data.agents?.some((agent) => agent.name === "Scout"));
 });
 
-test("users/:name/channels: disconnected joint projections (the subject's server's: unchecked; a peer's: not in the roster)", async ({ app }) => {
+test("users/:name/channels: disconnected joint projections are absent from the local directory or peer roster", async ({ app }) => {
   const scenario = await seedUserChannelsScenario();
   const before = await jointMemberships(app.baseUrl, scenario.memberApiKey, "Scout");
   const peerGone = await scenario.addPeerDisconnectedJoint();
@@ -185,7 +187,7 @@ test("users/:name/channels: disconnected joint projections (the subject's server
   for (const name of ["Mem", "Ada"]) {
     assert.ok((await jointMemberships(app.baseUrl, scenario.memberApiKey, name)).joint.includes(peerGone), name);
   }
-  // A's projection of joint-gone is disconnected: unchecked, before and after.
+  // A's disconnected joint-gone projection stays absent from the directory.
   const after = await jointMemberships(app.baseUrl, scenario.memberApiKey, "Scout");
   assert.equal(after.uncheckedCount, before.uncheckedCount);
   assert.ok(before.uncheckedCount >= 1);
@@ -225,7 +227,7 @@ test("users/:name/channels: an admin caller's rows describe the subject, not the
 
   const outcome = await userInfo(agentApiClientFor(app.baseUrl, admin.apiKey).client, { name: "Mem" });
   assert.ok(outcome.ok);
-  assert.match(outcome.text, /^#priv-both \[private, joined, channel role=member\]$/m);
+  assert.match(outcome.text, /^#priv-both \[private, joined, channel role=member, no posts yet\]$/m);
   assert.doesNotMatch(outcome.text, /admin/);
 
   // Scout is a channel admin of pub-one, where the admin caller is a plain member.
@@ -252,17 +254,17 @@ test("users/:name/channels: built-in app conversations are inspected and list no
 
   // Without the twin `#system.canary` resolves nothing (the roster route 404s),
   // yet the built-in conversation stays in the window and is not unchecked:
-  // only joint-gone (A's projection disconnected) and `#weird:abcdef12` (a
-  // thread reference) are.
+  // the disconnected joint-gone entry is absent from the directory. Only
+  // `#weird:abcdef12` (a thread reference) is unchecked.
   await scenario.removeAppTwin();
   assert.equal((await roster()).ok, false);
   for (const name of ["Scout", "Mem", "alice"]) {
     const body = await read(name);
     assert.equal(body.page.total, withTwin.page.total - 1, name);
-    assert.equal(body.uncheckedCount, 2, name);
+    assert.equal(body.uncheckedCount, 1, name);
     assert.ok(!body.memberships.some((row) => row.type === "dm"), name);
   }
   const outcome = await userInfo(agentApiClientFor(app.baseUrl, scenario.memberApiKey).client, { name: "Mem" });
   assert.ok(outcome.ok);
-  assert.match(outcome.text, /^Skipped 2 visible channel roster checks because the server rejected them\.$/m);
+  assert.match(outcome.text, /^Skipped 1 visible channel roster checks because the server rejected them\.$/m);
 });

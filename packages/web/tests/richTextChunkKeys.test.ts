@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
+import { isTestPath } from "../scripts/testLocations";
 
 // react-intl renders rich-text chunks as an ARRAY, so a chunk function that
 // returns an element without a `key` triggers React's
@@ -51,6 +52,8 @@ test("every react-intl rich-text chunk returns a keyed element", () => {
   for (const file of walk(SRC)) {
     const rel = relative(SRC, file);
     if (NOT_INTL_CHUNKS.some((p) => rel.startsWith(p))) continue;
+    // Feature tests (src/features/<feature>/tests/) are not app code.
+    if (isTestPath(`src/${rel}`)) continue;
 
     const src = readFileSync(file, "utf8");
     // Only files that actually format messages can have intl chunks.

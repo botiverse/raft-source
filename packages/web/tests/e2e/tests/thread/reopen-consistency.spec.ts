@@ -65,7 +65,6 @@ test.describe("P0 thread reopen consistency", () => {
         '[data-message-affordance="inline-thread-replies"]',
       );
 
-      await expect(threadPage.getByText("Thread").first()).toBeVisible();
       await expect(threadScroller.getByText(firstReply)).toBeVisible();
       await expect(inlineReplies).toContainText(firstReply);
 

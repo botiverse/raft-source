@@ -21,6 +21,7 @@ import type {
   ExternalIngressSecretResolver,
 } from "./externalAppIngressService";
 import type { ExternalInboundWorkerDependencies } from "./externalInboundWorkerService";
+import { SlackNormalizedEnvelopeInvalid } from "./slackNormalizedPayloadError";
 
 const SIGNING_SECRET_SCHEMA = "slack-signing-secret.v1" as const;
 const PAYLOAD_ENVELOPE_SCHEMA = "slack-inbound-payload-envelope.v1" as const;
@@ -319,7 +320,7 @@ export function createSlackKmsInboundPayloadCrypto(input: {
         || request.signal?.aborted
       ) throw new Error("Slack inbound payload cannot be decrypted");
       const envelope = parseEnvelope(request.ciphertext);
-      if (!envelope) throw new Error("Slack inbound payload envelope is invalid");
+      if (!envelope) throw new SlackNormalizedEnvelopeInvalid();
       const decrypted = await input.kms.send(new DecryptCommand({
         KeyId: request.envelopeKeyId,
         CiphertextBlob: envelope.wrappedDataKey,

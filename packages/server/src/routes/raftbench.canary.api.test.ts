@@ -19,7 +19,7 @@ unitTest("canary has its own secret and production cannot select it", () => {
   expect(resolveProviderConfig("antiproton", { ...secrets, DEPLOYMENT_ENV: "development" }, "canary")).toBeNull();
   expect(resolveProviderConfig("antiproton", { DEPLOYMENT_ENV: "staging", ANTIPROTON_PROVISIONING_TOKEN: secrets.ANTIPROTON_PROVISIONING_TOKEN }, "canary")).toBeNull();
 });
-const test = createApiTest({ onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest();
 test("admin enrolls a frozen synthetic canary; lifecycle and hooks cannot cross provider origins", async ({ app, db, seed, onTestFinished }) => {
   const serverId = randomUUID();
   const env = { DEPLOYMENT_ENV: "staging", RAFTBENCH_CANARY_SERVER_ID: serverId, ANTIPROTON_CANARY_PROVISIONING_TOKEN: "synthetic-canary", ANTIPROTON_PROVISIONING_TOKEN: "synthetic-official", SLOCK_PROVIDER_CREDENTIAL_KEY: Buffer.alloc(32, 7).toString("base64"), SERVER_URL: "https://raft.example.test" };
@@ -60,7 +60,7 @@ test("admin enrolls a frozen synthetic canary; lifecycle and hooks cannot cross 
   expect(requests.every(row => row.origin === "https://canary.antiproton.ai" && row.token === "Bearer synthetic-canary")).toBe(true);
   expect((await put({ ...settings, expectedRevision: 1, providerTarget: "default" })).status).toBe(409);
   await expect(db.update(agentRuntimeProvisions).set({ providerTarget: "default" }).where(eq(agentRuntimeProvisions.agentId, config.agentId!))).rejects.toThrow();
-  const credential = await mintAgentCredential({ agentId: config.agentId!, scopes: ["read", "raftbench"], name: "Synthetic hook", createdByUserId: owner.id });
+  const credential = await mintAgentCredential({ agentId: config.agentId!, scopes: ["read", "raftbench"], name: "Synthetic hook", issuedVia: "human", createdByUserId: owner.id });
   __setAppWebhookEncryptionKeyForTests(Buffer.alloc(32, 9));
   const hook = (url: string) => fetch(`${app.baseUrl}/internal/agent-api/push-webhook`, { method: "PUT", headers: { Authorization: `Bearer ${credential.apiKey}`, "Content-Type": "application/json" }, body: JSON.stringify({ url, secret: "Q2hvb3NlLWEtcmFuZG9tLXNlY3JldC1vZi0zMi1ieXRlcw_x" }) });
   expect((await hook("https://preview.antiproton.ai/hooks/synthetic")).status).toBe(403);

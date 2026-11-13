@@ -30,6 +30,11 @@ export const CLEANER_APP_ID = "system.cleaner" as const;
 /** Closed notification-class identity for the Computer-local hint. */
 export const CLEANER_NOTIFICATION_CLASS = "memory_size_hint" as const;
 export const CLEANER_DISK_NOTIFICATION_CLASS = "disk_space_hint" as const;
+/**
+ * Computer-local hint suggesting `.raftbackupignore` entries for large,
+ * regenerable workspace paths. Declared ahead of the Computer that mints it.
+ */
+export const CLEANER_BACKUP_IGNORE_NOTIFICATION_CLASS = "backup_ignore_hint" as const;
 
 /** Local disk policy; kept off the closed config wire understood by older Computers. */
 export const CLEANER_DISK_FREE_PERCENT_THRESHOLD = 10;

@@ -4,7 +4,7 @@ import { getAppUrl } from "../config/appUrl";
 /**
  * Public redirect to the current mobile build.
  *
- * `GET /api/mobile-download?platform=android|ios`
+ * `GET /api/mobile-download?platform=android|ios|ios-beta`
  *
  * **Deliberately unauthenticated.** The desktop Settings surface renders a QR
  * code, and the phone that scans it has no Raft session — an authenticated
@@ -57,17 +57,32 @@ import { getAppUrl } from "../config/appUrl";
  * iOS does not go through Hands.
  *
  * Hands does hold a `raft-ios` release, but its asset is an `.ipa`, and stock
- * iOS cannot install one — sideloading is not available to ordinary users. The
- * real distribution channel is TestFlight, which is an Apple-side surface with
- * its own public join link. Redirecting an iPhone to the `.ipa` would produce a
- * download that silently does nothing useful, which is the failure mode this
- * whole route exists to avoid.
+ * iOS cannot install one — sideloading is not available to ordinary users.
+ * Redirecting an iPhone to the `.ipa` would produce a download that silently
+ * does nothing useful, which is the failure mode this whole route exists to
+ * avoid. iOS is distributed through Apple-side surfaces instead.
+ *
+ * The App Store listing is the primary channel (`platform=ios`, and what an
+ * iPhone UA resolves to) since the app went live on the App Store (artin; ID
+ * from @Lagoon). Overridable so it can change without a code edit.
+ */
+const IOS_APP_STORE_URL = process.env.RAFT_IOS_APP_STORE_URL
+  ?? "https://apps.apple.com/app/id6789091965";
+
+/**
+ * The TestFlight beta (`platform=ios-beta`) is no longer linked from the web
+ * (the App Store app is live, #triage:a230ad1c) but stays served for old QR
+ * codes and links. It is not a `MobilePlatform`: no UA resolves to it, only an
+ * explicit request.
  *
  * Link supplied by @huxijin (#wg-download-mobile). Overridable so it can change
  * without a code edit if the beta is re-created.
  */
 const IOS_TESTFLIGHT_URL = process.env.RAFT_IOS_TESTFLIGHT_URL
   ?? "https://testflight.apple.com/join/JvM5wXuc";
+
+/** `platform` value for the iOS TestFlight beta; see IOS_TESTFLIGHT_URL. */
+export const IOS_BETA_PLATFORM = "ios-beta";
 
 /**
  * Web surface that lets a person pick their own platform.
@@ -243,6 +258,12 @@ export const mobileDownloadRouter: Router = Router();
 
 mobileDownloadRouter.get("/", async (req, res) => {
   const requested = req.query.platform;
+  if (requested === IOS_BETA_PLATFORM) {
+    // Apple-side surface, not a Hands artifact — see IOS_TESTFLIGHT_URL.
+    res.setHeader("Cache-Control", "private, max-age=300");
+    res.redirect(302, IOS_TESTFLIGHT_URL);
+    return;
+  }
   const platform = isMobilePlatform(requested)
     ? requested
     : platformFromUserAgent(req.get("user-agent"));
@@ -269,9 +290,9 @@ mobileDownloadRouter.get("/", async (req, res) => {
   }
 
   if (platform === "ios") {
-    // Apple-side surface, not a Hands artifact — see IOS_TESTFLIGHT_URL.
+    // Apple-side surface, not a Hands artifact — see IOS_APP_STORE_URL.
     res.setHeader("Cache-Control", "private, max-age=300");
-    res.redirect(302, IOS_TESTFLIGHT_URL);
+    res.redirect(302, IOS_APP_STORE_URL);
     return;
   }
 

@@ -1,7 +1,5 @@
 import * as serverService from "./serverService";
-import { isProductFeedbackConfigured } from "./productFeedbackService";
-import { isProductFeedbackConversationConfigured } from "./productFeedbackConversationService";
-import { isProductFeedbackRouteConfigured } from "./productFeedbackRouteBindingService";
+import { isProductFeedbackEnabled } from "./productFeedbackSendService";
 
 type ServerSettingsDependencies = {
   getOnboardSettings: typeof serverService.getServerOnboardingSettings;
@@ -12,9 +10,7 @@ type ServerSettingsDependencies = {
 const defaultDependencies: ServerSettingsDependencies = {
   getOnboardSettings: serverService.getServerOnboardingSettings,
   getMemberOnboardPreferences: serverService.getMemberOnboardingPreferences,
-  isFeedbackEnabled: () => isProductFeedbackConfigured()
-    && isProductFeedbackConversationConfigured()
-    && isProductFeedbackRouteConfigured(),
+  isFeedbackEnabled: isProductFeedbackEnabled,
 };
 
 export async function getServerSettings(

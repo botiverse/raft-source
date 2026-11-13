@@ -1,4 +1,4 @@
-import { isDeviceClass, type MachineDiskStatus } from "@botiverse/raft-shared";
+import { isDeviceClass, isHostProvider, normalizeOsId, normalizeOsIdLike, normalizeOsRelease, type MachineDiskStatus, type MachineMemoryStatus } from "@botiverse/raft-shared";
 import type { AgentOrchestrator } from "./agentOrchestrator";
 import type {
   ComputerSourceFactProvenance,
@@ -16,15 +16,31 @@ type MachineReadModelInput = {
   os: string | null;
   // Coarse machine kind for the icon; null = unknown (older daemon or undetected).
   deviceClass?: string | null;
+  // Cloud / VM platform id and OS release ("Ubuntu 26.04"); null = unknown.
+  hostProvider?: string | null;
+  osRelease?: string | null;
+  // os-release ID / ID_LIKE for the distribution icon; null = unknown.
+  osId?: string | null;
+  osIdLike?: string[] | null;
+  // How the daemon runs (shared DAEMON_INSTALL_KINDS), from its latest
+  // `ready`; null = unknown. Upgrade-policy input, not projected by the list.
+  installKind?: string | null;
   daemonVersion: string | null;
   lastHeartbeat: Date | null;
   createdAt: Date;
   // Last Computer version this machine reported, persisted on `ready`.
   computerVersion?: string | null;
   computerVersionReportedAt?: Date | null;
+  // #proj-raft-computer task #38: owner-only, see `credentialExposureFoundAt` below.
+  credentialExposureFoundAt?: Date | null;
+  legacyKeyMigratedAt?: Date | null;
+  // Computer owner v1 (#wg-rbac:#32): who Raft records as the owner; null = Public.
+  ownerUserId?: string | null;
 };
 
-export type MachineReadModel = MachineReadModelInput & {
+export type MachineReadModel = Omit<MachineReadModelInput, "credentialExposureFoundAt" | "legacyKeyMigratedAt"> & {
+  /** #proj-raft-computer task #38: when an agent may have read this machine's current key (ISO); the owner only, else null. */
+  credentialExposureFoundAt: string | null;
   status: "online" | "offline";
   statusVersion: number;
   runtimes: string[];
@@ -52,6 +68,12 @@ export type MachineReadModel = MachineReadModelInput & {
   // Computer/Daemon label, computer-only setup command, and (later)
   // remote restart/upgrade controls.
   isComputer: boolean;
+  /**
+   * Computer owner v1 (#wg-rbac:#32): who Raft records as this Computer's
+   * owner, null = a Public Computer. Not the connector (`userId`, the
+   * attacher): display and transfer only, no rights. Additive.
+   */
+  ownerUserId: string | null;
   // True when the current requester is the user who attached the backing
   // Computer row. Raw daemons expose false. Web Add Computer uses this to
   // avoid pivoting one user's setup wizard onto another user's Computer.
@@ -64,15 +86,33 @@ export type MachineReadModel = MachineReadModelInput & {
   // Latest disk report while connected (null when offline or never
   // reported). Clients derive the low-disk warning with isMachineDiskLow.
   diskStatus: MachineDiskStatus | null;
+  // Latest memory report while connected (null when offline, never reported,
+  // or from a Computer older than the report).
+  memoryStatus: MachineMemoryStatus | null;
 };
+
+/**
+ * A machine row as it may leave the server: the stored key hash, the key
+ * fingerprint (sha256 prefix, SECRET REDLINE in machineService.ts) and the web
+ * session that issued the key never do.
+ * Responses that start from a raw `daemons` row (register, PATCH, the read
+ * model) pass through this.
+ */
+export function withoutMachineKeySecrets<T extends object>(row: T): Omit<T, "apiKeyHash" | "apiKeyFingerprint" | "keyIssuedByWebSessionFamilyId" | "credentialExposureFoundAt"> {
+  // Which web session issued the key is the cascade's (webSessionIssuedKeys.ts), never a client's.
+  // A credential exposure is the owner's to see (buildMachineReadModel adds it back for them).
+  const { apiKeyHash: _hash, apiKeyFingerprint: _fingerprint, keyIssuedByWebSessionFamilyId: _issuedBy, credentialExposureFoundAt: _exposure, ...rest } =
+    row as T & { apiKeyHash?: unknown; apiKeyFingerprint?: unknown; keyIssuedByWebSessionFamilyId?: unknown; credentialExposureFoundAt?: unknown };
+  return rest;
+}
 
 export async function buildMachineReadModel(
   machine: MachineReadModelInput,
   agentOrchestrator: Pick<
     AgentOrchestrator,
     "getMachineStatus" | "getMachineStatusVersion" | "getMachineDaemonVersion"
-  > & Partial<Pick<AgentOrchestrator, "getMachineComputerVersion" | "getMachineComputerVersionFact" | "getMachineRuntimeVersions" | "getMachineDiskStatus" | "getMachineRuntimeDetection">>,
-  opts?: { isComputer?: boolean; computerAttachedByCurrentUser?: boolean; agentCount?: number },
+  > & Partial<Pick<AgentOrchestrator, "getMachineComputerVersion" | "getMachineComputerVersionFact" | "getMachineRuntimeVersions" | "getMachineDiskStatus" | "getMachineMemoryStatus" | "getMachineRuntimeDetection">>,
+  opts?: { isComputer?: boolean; computerAttachedByCurrentUser?: boolean; agentCount?: number; viewerUserId?: string | null },
 ): Promise<MachineReadModel> {
   const liveDaemonVersion = agentOrchestrator.getMachineDaemonVersion(machine.id);
   // Optional-chained so a caller whose orchestrator predates this method
@@ -98,16 +138,20 @@ export async function buildMachineReadModel(
   const diskStatusPromise = agentOrchestrator.getMachineDiskStatus
     ? agentOrchestrator.getMachineDiskStatus(machine.id)
     : Promise.resolve(null);
-  const [status, statusVersion, liveComputerFact, runtimeVersions, diskStatus, runtimeDetection] = await Promise.all([
+  const memoryStatusPromise = agentOrchestrator.getMachineMemoryStatus
+    ? agentOrchestrator.getMachineMemoryStatus(machine.id)
+    : Promise.resolve(null);
+  const [status, statusVersion, liveComputerFact, runtimeVersions, diskStatus, memoryStatus, runtimeDetection] = await Promise.all([
     agentOrchestrator.getMachineStatus(machine.id),
     agentOrchestrator.getMachineStatusVersion(machine.id),
     liveComputerFactPromise,
     runtimeVersionsPromise,
     diskStatusPromise,
+    memoryStatusPromise,
     runtimeDetectionPromise,
   ]);
   return {
-    ...machine,
+    ...withoutMachineKeySecrets(machine),
     status,
     statusVersion,
     runtimes: machine.runtimes || [],
@@ -116,13 +160,24 @@ export async function buildMachineReadModel(
     hostname: machine.hostname ?? null,
     os: machine.os ?? null,
     deviceClass: isDeviceClass(machine.deviceClass) ? machine.deviceClass : null,
+    hostProvider: isHostProvider(machine.hostProvider) ? machine.hostProvider : null,
+    osRelease: normalizeOsRelease(machine.osRelease),
+    osId: normalizeOsId(machine.osId),
+    osIdLike: normalizeOsIdLike(machine.osIdLike),
     lastHeartbeat: machine.lastHeartbeat ?? null,
     daemonVersion: liveDaemonVersion ?? machine.daemonVersion ?? null,
     ...computerVersionFields(status, liveComputerFact, machine),
     isComputer: opts?.isComputer ?? false,
+    ownerUserId: machine.ownerUserId ?? null,
     computerAttachedByCurrentUser: opts?.computerAttachedByCurrentUser ?? false,
     agentCount: opts?.agentCount ?? 0,
+    // #proj-raft-computer task #38: only the machine's owner, and only while the
+    // exposed key has not been retired by the move to a Computer credential.
+    credentialExposureFoundAt: opts?.viewerUserId && opts.viewerUserId === machine.userId && !machine.legacyKeyMigratedAt && machine.credentialExposureFoundAt
+      ? machine.credentialExposureFoundAt.toISOString()
+      : null,
     diskStatus: status === "online" ? diskStatus : null,
+    memoryStatus: status === "online" ? memoryStatus : null,
   };
 }
 

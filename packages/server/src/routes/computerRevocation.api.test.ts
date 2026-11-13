@@ -2,18 +2,18 @@ import assert from "node:assert/strict";
 import { eq } from "drizzle-orm";
 import argon2 from "argon2";
 import { createApiTest } from "../test/integration/apiTest";
-import { signAccessToken } from "../middleware/auth";
+import { accessTokenForTest } from "../test/integration/credentials";
 import { computers, machines } from "../db/schema";
 import { createAgent } from "../services/agentService";
 import { registerMachine } from "../services/machineService";
 import { findComputerByApiKey, findComputerByApiKeyWithReason } from "../services/computerCredentialService";
 
-const test = createApiTest({ onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest();
 
 test("deleting a Computer's machine revokes its key before it can mint another agent credential", async ({ app, seed, db }) => {
   const owner = await seed.human();
   const server = await seed.server({ owner });
-  const headers = { Authorization: `Bearer ${signAccessToken(owner.id)}`, "Content-Type": "application/json", "X-Server-Id": server.id };
+  const headers = { Authorization: `Bearer ${await accessTokenForTest(owner.id)}`, "Content-Type": "application/json", "X-Server-Id": server.id };
   const attached = await fetch(`${app.baseUrl}/api/computer/attach`, {
     method: "POST", headers, body: JSON.stringify({ serverSlug: server.slug, name: "audit-computer" }),
   });
@@ -43,7 +43,7 @@ for (const change of ["old-orphan", "delete-during-verify"] as const) {
     const owner = await seed.human();
     const server = await seed.server({ owner });
     const attached = await fetch(`${app.baseUrl}/api/computer/attach`, {
-      method: "POST", headers: { Authorization: `Bearer ${signAccessToken(owner.id)}`, "Content-Type": "application/json" },
+      method: "POST", headers: { Authorization: `Bearer ${await accessTokenForTest(owner.id)}`, "Content-Type": "application/json" },
       body: JSON.stringify({ serverSlug: server.slug, name: "audit-orphan" }),
     });
     assert.equal(attached.status, 201);

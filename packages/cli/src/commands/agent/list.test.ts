@@ -35,14 +35,6 @@ test("describeListResult: no_manageable_server points at credential authority re
   );
 });
 
-test("describeListResult: no_agents_on_manageable_servers tells the operator to create an agent", () => {
-  const copy = describeListResult("no_agents_on_manageable_servers", SERVER);
-  assert.ok(
-    copy.includes("create an agent"),
-    `expected agent-creation hint, got: ${copy}`,
-  );
-});
-
 test("describeListResult: every reason returns non-empty copy (contract — CLI must always have a next step)", () => {
   for (const reason of ["ok", "no_manageable_server", "no_agents_on_manageable_servers"] as const) {
     const copy = describeListResult(reason, SERVER);

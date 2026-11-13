@@ -47,6 +47,11 @@ function mapResolveError(res: ApiResponse<unknown>): {
       suggestedNextAction: "Use the full message UUID instead of the 8-character short id.",
     };
   }
+  if (res.errorCode === "HISTORY_LIMITED") {
+    // The message exists and this agent may read its channel, but it is older
+    // than the server plan's history window: the server's error says so.
+    return { code: "HISTORY_LIMITED", message };
+  }
   if (res.errorCode === "NOT_FOUND" || res.status === 404) {
     return {
       code: "NOT_FOUND",
@@ -68,6 +73,8 @@ export const messageResolveCommand = defineCommand(
     name: "resolve",
     description: "Resolve a message id exactly and print the canonical message",
     arguments: ["<id>"],
+    helpAfter:
+      "\nTo see the messages around it, use: raft message read --target <target> --around <id>\n",
   },
   async (ctx, rawId: string) => {
     const id = rawId?.trim();

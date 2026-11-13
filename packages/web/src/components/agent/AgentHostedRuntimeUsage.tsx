@@ -69,7 +69,7 @@ export function AgentHostedRuntimeUsage({ agentId }: { agentId: string }) {
   return (
     <>
     <Separator />
-    <div className="px-5 py-4" data-testid="agent-hosted-runtime-usage">
+    <div className="px-(--surface-inset) py-4" data-testid="agent-hosted-runtime-usage">
       <SectionEyebrow as="div" className="mb-2">
         {formatMessage({ id: "agent.detail.usage.title" })}
       </SectionEyebrow>
@@ -84,6 +84,9 @@ export function AgentHostedRuntimeUsage({ agentId }: { agentId: string }) {
           {formatMessage({ id: "agent.detail.usage.empty" })}
         </p>
       ) : summary ? (
+        // Labels stack over values by the list's own width (raft-ui 0.23's
+        // horizontal list is its own container), so a 320px profile panel on
+        // a wide window stacks long labels (es: "Tokens de razonamiento").
         <DescriptionList direction="horizontal">
           {summary.cost && (
             <UsageRow label={formatMessage({ id: "agent.detail.usage.cost" })}>
@@ -142,7 +145,7 @@ export function AgentHostedRuntimeUsage({ agentId }: { agentId: string }) {
           </UsageRow>
           {summary.topModels.length > 0 && (
             <UsageRow label={formatMessage({ id: "agent.detail.usage.topModels" })}>
-              <ul className="m-0 list-none space-y-0.5 p-0">
+              <ul className="m-0 list-none stack-y-0.5 p-0">
                 {summary.topModels.map((entry) => (
                   <li key={entry.model} className="flex min-w-0 items-baseline gap-2">
                     <span className="truncate font-mono text-mono-meta text-foreground">{entry.model}</span>

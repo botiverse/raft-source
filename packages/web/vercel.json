@@ -4,7 +4,7 @@
     {
       "src": "/(.*)",
       "headers": {
-        "Content-Security-Policy": "base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self' 'wasm-unsafe-eval' 'unsafe-eval' https://challenges.cloudflare.com https://static.cloudflareinsights.com; worker-src 'self' blob:",
+        "Content-Security-Policy": "base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self' 'sha256-9/rA/fGEYHRZyCw7+bvhgE1lOzeGdFvDtZBQrvBmyVU=' 'wasm-unsafe-eval' https://challenges.cloudflare.com https://static.cloudflareinsights.com; worker-src 'self' blob:",
         "X-Frame-Options": "DENY",
         "Referrer-Policy": "no-referrer",
         "X-Content-Type-Options": "nosniff"

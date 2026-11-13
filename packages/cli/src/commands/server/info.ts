@@ -26,6 +26,7 @@ interface ServerInfoOpts {
   agents?: boolean;
   humans?: boolean;
   joined?: boolean;
+  archived?: boolean;
   query?: string;
   limit?: string;
   offset?: string;
@@ -64,13 +65,16 @@ function selectedSections(opts: ServerInfoOpts): ServerInfoSection[] {
 }
 
 function hasListModifier(opts: ServerInfoOpts): boolean {
-  return Boolean(opts.joined || opts.query !== undefined || opts.limit !== undefined || opts.offset !== undefined);
+  return Boolean(opts.joined || opts.archived || opts.query !== undefined || opts.limit !== undefined || opts.offset !== undefined);
 }
 
 function includesQuery(row: unknown, query: string | undefined): boolean {
   const needle = query?.trim().toLowerCase();
   if (!needle) return true;
-  const values = Object.values(row as Record<string, unknown>)
+  // A channel's last-post time is a timestamp, not text to match ("10" would match every date).
+  const values = Object.entries(row as Record<string, unknown>)
+    .filter(([key]) => key !== "lastPostAt")
+    .map(([, value]) => value)
     .filter((value): value is string => typeof value === "string")
     .map((value) => value.toLowerCase());
   return values.some((value) => value.includes(needle));
@@ -86,6 +90,7 @@ function nextCommand(section: ServerInfoSection, opts: ServerInfoOpts, offset: n
   const parts = ["raft server info", `--${section}`, `--offset ${nextOffset}`, `--limit ${limit}`];
   if (opts.query?.trim()) parts.push(`--query ${JSON.stringify(opts.query.trim())}`);
   if (opts.joined) parts.push("--joined");
+  if (opts.archived) parts.push("--archived");
   return parts.join(" ");
 }
 
@@ -99,6 +104,7 @@ export const serverInfoCommand = defineCommand(
       { flags: "--agents", description: "List agents only" },
       { flags: "--humans", description: "List humans only" },
       { flags: "--joined", description: "With --channels, show only joined channels" },
+      { flags: "--archived", description: "With --channels, list archived channels instead (read-only: you can read their history, nothing new can be posted)" },
       { flags: "--query <text>", description: "Filter the selected list by visible text" },
       { flags: "--limit <n>", description: "Maximum rows for list output (default: 50)" },
       { flags: "--offset <n>", description: "Rows to skip for list output (default: 0)" },
@@ -115,7 +121,7 @@ export const serverInfoCommand = defineCommand(
     if (sections.length === 0 && hasListModifier(opts)) {
       throw new CliError({
         code: "INVALID_ARG",
-        message: "--query, --limit, --offset, and --joined require --channels, --agents, or --humans",
+        message: "--query, --limit, --offset, --joined, and --archived require --channels, --agents, or --humans",
       });
     }
     if (opts.joined && sections.some((section) => section !== "channels")) {
@@ -124,12 +130,22 @@ export const serverInfoCommand = defineCommand(
         message: "--joined can only be used with --channels",
       });
     }
+    if (opts.archived && sections.some((section) => section !== "channels")) {
+      throw new CliError({
+        code: "INVALID_ARG",
+        message: "--archived can only be used with --channels",
+      });
+    }
 
     const limit = parsePositiveInt(opts.limit, "--limit", 50);
     const offset = parseNonNegativeInt(opts.offset, "--offset", 0);
     const agentContext = ctx.loadAgentContext();
     const client = ctx.createApiClient(agentContext);
-    const res = await createAgentApiSurfaceClient(client).server.info();
+    // Archived channels (read-only) come back only when asked for: --archived
+    // lists them, and a --query search covers them too, so a name is never
+    // "not found" just because the channel was archived.
+    const wantsArchived = sections.includes("channels") && (opts.archived === true || Boolean(opts.query?.trim()));
+    const res = await createAgentApiSurfaceClient(client).server.info(wantsArchived ? { archived: "include" } : undefined);
     if (!res.ok) {
       throw apiFailureError(res, "INFO_FAILED");
     }
@@ -158,15 +174,30 @@ export const serverInfoCommand = defineCommand(
     const chunks: string[] = [];
     for (const section of sections) {
       if (section === "channels") {
-        const rows = (data.channels ?? [])
+        const query = opts.query?.trim() || undefined;
+        if (opts.archived && data.archivedChannelCount === undefined) {
+          throw new CliError({
+            code: "UNSUPPORTED_BY_SERVER",
+            message: "This Server does not list archived channels yet; read one by name (its history is still readable).",
+          });
+        }
+        const archivedCount = data.archivedChannelCount ?? 0;
+        const archivedRows = (data.archivedChannels ?? []).map((channel) => ({ ...channel, archived: true }));
+        const source = opts.archived ? archivedRows : query !== undefined ? [...(data.channels ?? []), ...archivedRows] : (data.channels ?? []);
+        const rows = source
           .filter((channel) => !opts.joined || channel.joined)
           .filter((channel) => includesQuery(channel, opts.query));
+        // The default listing says how many archived channels it leaves out (last page only).
+        // Not with --joined: the count covers every visible archived channel, joined or not.
+        const archivedNotShown = !opts.archived && query === undefined && !opts.joined && archivedCount > 0
+          ? { count: archivedCount, listCommand: "raft server info --channels --archived" }
+          : undefined;
         chunks.push(formatServerChannels(pageRows(rows, offset, limit), {
           total: rows.length,
           offset,
           limit,
           nextCommand: nextCommand(section, opts, offset, limit, rows.length),
-        }));
+        }, undefined, archivedNotShown));
       } else if (section === "agents") {
         const rows = (data.agents ?? []).filter((agent) => includesQuery(agent, opts.query));
         chunks.push(formatServerAgents(pageRows(rows, offset, limit), {

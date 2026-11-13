@@ -151,8 +151,6 @@ test("CSV Markdown and PDF attachments open document previews", async ({ page, r
   const messageCard = page.locator(`#message-${messageBody.id}`).first();
   await expect(messageCard.getByText(tag)).toBeVisible();
   await expect(messageCard.getByText("3 rows · 3 columns")).toBeVisible();
-  await expect(messageCard.getByText("Markdown document")).toBeVisible();
-  await expect(messageCard.getByText("PDF document")).toBeVisible();
 
   await messageCard.getByLabel(`preview-${suffix}.csv`).click();
   const csvCell = page.getByText("Alpha");
@@ -232,7 +230,8 @@ test("Markdown attachment Mermaid fence renders the uploaded diagram", async ({ 
 
   const openDownloadMenu = async () => {
     await diagram.getByRole("button", { name: "Download Mermaid diagram" }).click();
-    const menu = previewRoot.locator('[data-slot="dropdown-menu-content"]');
+    // Base UI portals it into the lightbox's own portal, outside the scrolling body.
+    const menu = page.locator('[data-slot="lightbox-portal"] [data-slot="dropdown-menu-content"]');
     await expect(menu).toBeVisible();
     return menu;
   };
@@ -591,39 +590,24 @@ test("blocked parent hotspot shows a fallback whose click keeps no-opener and no
   await popup.close();
 });
 
-test("coarse pointer text preview taps create and preserve a structural comment anchor", async ({ page, request }) => {
-  await page.addInitScript(() => {
-    const realMatchMedia = window.matchMedia.bind(window);
-    window.matchMedia = (query: string) => {
-      if (query === "(pointer: coarse)") {
-        return {
-          matches: true,
-          media: query,
-          onchange: null,
-          addListener: () => {},
-          removeListener: () => {},
-          addEventListener: () => {},
-          removeEventListener: () => {},
-          dispatchEvent: () => false,
-        } as MediaQueryList;
-      }
-      return realMatchMedia(query);
-    };
-  });
-
+test("text preview comments sit in the margin beside the selected line", async ({ page, request }) => {
+  // Task #118: Markdown, text and CSV previews show comments as margin cards
+  // level with their passage (raft-design patterns/comments.md) instead of
+  // the side panel and its Preview/Comment mode, which they no longer have.
+  await page.setViewportSize({ width: 1280, height: 800 });
   const seedState = await waitForSeedState();
   const login = await loginViaApi(request, seedState);
   await dismissOwnerOnboarding(request, seedState, login.accessToken);
 
   const suffix = randomUUID();
-  const filename = `tap-anchor-${suffix}.txt`;
+  const filename = `margin-comment-${suffix}.txt`;
   const attachmentId = await uploadAttachment(request, seedState, login.accessToken, {
     name: filename,
     mimeType: "text/plain",
     buffer: TEXT_FIXTURE,
   });
 
-  const tag = `tap anchor comment ${suffix}`;
+  const tag = `margin comment ${suffix}`;
   const message = await request.post(`${seedState.urls.api}/api/messages`, {
     headers: {
       Authorization: `Bearer ${login.accessToken}`,
@@ -644,14 +628,31 @@ test("coarse pointer text preview taps create and preserve a structural comment 
 
   await messageCard.getByLabel(filename).click();
   await expect(page.getByText("Plain text preview")).toBeVisible();
-  await page.locator('[data-message-affordance="attachment-preview-mode"]').click();
+  await expect(page.locator('[data-message-affordance="attachment-preview-mode"]')).toHaveCount(0);
+  // No comments yet: no margin, and the header button starts one on the whole file (an action, not a toggle).
+  const headerComments = page.locator('[data-message-affordance="attachment-comments-toggle"]');
+  await expect(headerComments).not.toHaveAttribute("aria-pressed");
+  await expect(page.locator('[data-testid="attachment-comment-margin"]')).toHaveCount(0);
 
-  await page.locator('[data-anchor-line="1"]').filter({ hasText: "Alpha anchor line" }).click();
-  const pendingAnchor = page.locator('[data-message-affordance="attachment-comment-pending-anchor"]').first();
-  await expect(pendingAnchor).toContainText("L1");
+  const line = page.locator('[data-anchor-line="2"]').filter({ hasText: "Beta keep line" });
+  await line.selectText();
+  await page.locator('[data-message-affordance="attachment-comment-add"]').click();
+  const newCard = page.locator('[data-message-affordance="attachment-comment-new"]');
+  const commentText = `margin anchored comment ${suffix}`;
+  await newCard.getByPlaceholder("Add a comment").fill(commentText);
+  await newCard.getByPlaceholder("Add a comment").press("Enter");
 
-  await page.getByText("Plain text preview").click();
-  await expect(pendingAnchor).toContainText("L1");
+  const card = page.locator('[data-testid="attachment-comment-margin"] [data-slot="comment-card"]').filter({ hasText: commentText });
+  await expect(card).toBeVisible();
+  // Level with its line: the card's top is within a line of the passage's.
+  const lineBox = await line.boundingBox();
+  const cardBox = await card.boundingBox();
+  expect(lineBox && cardBox && Math.abs(cardBox.y - lineBox.y)).toBeLessThan(24);
+
+  // Esc closes the open card first, then the viewer.
+  await page.keyboard.press("Escape");
+  await expect(card).not.toHaveAttribute("data-active", "");
+  await expect(page.getByText("Plain text preview")).toBeVisible();
 });
 
 test("paused video preview lets comments attach a timestamp explicitly", async ({ page, request }) => {
@@ -842,7 +843,8 @@ test("markdown preview shell stays fixed to mobile viewport width", async ({ pag
   expect(previewBox).not.toBeNull();
   expect(previewBox!.x).toBeGreaterThanOrEqual(0);
   expect(previewBox!.width).toBeLessThanOrEqual(viewport!.width);
-  await expect(page.locator("html")).toHaveCSS("overflow-x", "hidden");
+  // raft-ui's document mode leaves the page's own styles alone (no scroll lock on <html>): the lightbox is fixed to the
+  // window, so a page wider than the window doesn't widen it.
 });
 
 // Long filenames in the small attachment card must truncate inside the

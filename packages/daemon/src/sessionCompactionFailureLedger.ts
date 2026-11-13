@@ -1,5 +1,5 @@
-import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import path from "node:path";
+import { readFileSync, rmSync } from "node:fs";
+import { agentStateFile, writeAgentStateText } from "./agentStateFiles";
 
 /**
  * task #10 — consecutive terminal context-compaction failures of one runtime
@@ -14,8 +14,8 @@ import path from "node:path";
  * compaction clears the count; so does a different session id (Reset Session)
  * or a different model, which can change what fits.
  *
- * Stored in the agent workspace's hidden `.raft/` directory, which workspace
- * listings never show. The record holds ids, a model name and counts; never
+ * Stored in the daemon's agent state (`agentStateFiles.ts`), never the
+ * workspace. The record holds ids, a model name and counts; never
  * conversation content.
  */
 export const SESSION_NEEDS_RESET_THRESHOLD = 3;
@@ -35,7 +35,7 @@ export class SessionCompactionFailureLedger {
   constructor(private readonly agentsDir: string, private readonly now: () => number = Date.now) {}
 
   private file(agentId: string): string {
-    return path.join(this.agentsDir, agentId, ".raft", FILE_NAME);
+    return agentStateFile(this.agentsDir, agentId, FILE_NAME);
   }
 
   private read(agentId: string): LedgerRecord | null {
@@ -65,11 +65,7 @@ export class SessionCompactionFailureLedger {
       count: same ? current.count + 1 : 1,
       updatedAtMs: this.now(),
     };
-    const file = this.file(agentId);
-    mkdirSync(path.dirname(file), { recursive: true });
-    const tmp = `${file}.${process.pid}.tmp`;
-    writeFileSync(tmp, JSON.stringify(record));
-    renameSync(tmp, file);
+    writeAgentStateText(this.file(agentId), JSON.stringify(record));
     return record.count;
   }
 

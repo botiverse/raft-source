@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
 
 import {
   getEnvironmentLabelMessageId,
   getPreviewEnvironmentDetails,
   getSlockdevSeedCommand,
+  initialAuthView,
   shouldAutoDismissSlockdevAnnouncement,
   shouldAutoLoginSlockdev,
   clearSlockdevManualLogout,
@@ -66,55 +66,6 @@ test("shouldAutoDismissSlockdevAnnouncement is gated to slockdev", () => {
   assert.equal(shouldAutoDismissSlockdevAnnouncement(undefined), false);
 });
 
-test("slockdev start passes preview descriptions into the web dev tools", () => {
-  // The repo-root ./raftdev launches scripts/dev/raftdev.ts, where
-  // preview-description handling lives.
-  const slockdevSource = readFileSync(new URL("../../../scripts/dev/raftdev.ts", import.meta.url), "utf8");
-  const appSource = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
-  const viteEnvSource = readFileSync(new URL("../src/vite-env.d.ts", import.meta.url), "utf8");
-
-  assert.match(slockdevSource, /--description <text>/);
-  assert.match(slockdevSource, /VITE_SLOCKDEV_PREVIEW_DESCRIPTION/);
-  assert.match(slockdevSource, /VITE_SLOCKDEV_EMAIL/);
-  assert.match(appSource, /VITE_SLOCKDEV_PREVIEW_DESCRIPTION/);
-  assert.match(appSource, /Preview description/);
-  assert.match(appSource, /<Tooltip content=\{previewDescription\}>/);
-  assert.match(viteEnvSource, /VITE_SLOCKDEV_PREVIEW_DESCRIPTION\?: string/);
-  assert.match(viteEnvSource, /VITE_SLOCKDEV_EMAIL\?: string/);
-});
-
-test("slockdev wires Report Issue to the local trace worker", () => {
-  const slockdevSource = readFileSync(new URL("../../../scripts/dev/raftdev.ts", import.meta.url), "utf8");
-  const traceWorkerPackage = readFileSync(new URL("../../../packages/trace-upload-worker/package.json", import.meta.url), "utf8");
-  const agentDetailSource = readFileSync(new URL("../src/components/agent/AgentDetailPanel.tsx", import.meta.url), "utf8");
-  const reportDialogSource = readFileSync(new URL("../src/components/agent/ReportIssueDialog.tsx", import.meta.url), "utf8");
-
-  assert.match(slockdevSource, /VITE_FEEDBACK_EXPORT_URL/);
-  assert.match(slockdevSource, /TRACE_WEB_CORS_ORIGIN/);
-  assert.match(slockdevSource, /smoke-feedback-report\.ts/);
-  assert.match(slockdevSource, /script feedback-report/);
-  // Local dev runs the production Node entry against the local RustFS bucket.
-  assert.match(traceWorkerPackage, /"dev": "node [^"]*src\/node\.ts"/);
-  assert.match(slockdevSource, /envAssign\("TRACE_WEB_CORS_ORIGIN"/);
-  assert.match(slockdevSource, /envAssign\("DEPLOYMENT_ENV"/);
-  assert.match(slockdevSource, /envAssign\("R2_ENDPOINT", e\.S3_ENDPOINT\)/);
-  assert.match(agentDetailSource, /VITE_FEEDBACK_EXPORT_URL/);
-  assert.match(agentDetailSource, /id: "agent\.reportIssue\.title"/);
-  assert.match(reportDialogSource, /id: "agent\.reportIssue\.uploaded"/);
-  assert.match(reportDialogSource, /id: "agent\.reportIssue\.reportReference"/);
-  assert.match(reportDialogSource, /\/feedback\/\$\{report\.id\}\/transcript/);
-  assert.doesNotMatch(reportDialogSource, /sessionId/);
-  const submittedReportType = /type SubmittedReport = \{[\s\S]*?\};/.exec(reportDialogSource)?.[0] ?? "";
-  const copyReportReference = /const handleCopyReportReference[\s\S]*?setReportRefCopied\(true\);\n  \}/.exec(reportDialogSource)?.[0] ?? "";
-  assert.match(submittedReportType, /reportId/);
-  assert.match(submittedReportType, /issueDescription/);
-  assert.match(submittedReportType, /ticketId/);
-  assert.match(copyReportReference, /serverId/);
-  assert.match(copyReportReference, /issueDescription/);
-  assert.doesNotMatch(submittedReportType, /expiresAt/);
-  assert.doesNotMatch(copyReportReference, /expiresAt/);
-});
-
 test("an explicit logout beats the dev auto-login, and signing in again retires it", () => {
   // stdrc, 2026-07-13: "log out 得真的 log out". Clicking Log out mid-onboarding handed
   // you straight back to the seeded dev account — the one thing logging out must prevent.
@@ -139,11 +90,18 @@ test("an explicit logout beats the dev auto-login, and signing in again retires 
   };
   markSlockdevManualLogout(broken);
   assert.equal(hasSlockdevManualLogout(broken), false);
+});
 
-  // And the gate itself reads it: logout is checked before every other condition.
-  const source = readFileSync(new URL("../src/utils/devMode.ts", import.meta.url), "utf8");
-  assert.match(source, /if \(hasSlockdevManualLogout\(\)\) return false;/);
-  const authStore = readFileSync(new URL("../src/store/authStore.ts", import.meta.url), "utf8");
-  assert.match(authStore, /markSlockdevManualLogout\(\)/);
-  assert.match(authStore, /clearSlockdevManualLogout\(\)/);
+test("initialAuthView opens Create Account on /signup and Sign In everywhere else", () => {
+  assert.equal(initialAuthView("/signup"), "register");
+  assert.equal(initialAuthView("/signup/"), "register");
+  assert.equal(initialAuthView("/"), "login");
+  assert.equal(initialAuthView("/signup-later"), "login");
+  assert.equal(initialAuthView("/s/acme/signup"), "login");
+});
+
+test("initialAuthView opens Forgot password on /forgot-password (the two-step lock email's reset link)", () => {
+  assert.equal(initialAuthView("/forgot-password"), "forgot-password");
+  assert.equal(initialAuthView("/forgot-password/"), "forgot-password");
+  assert.equal(initialAuthView("/forgot-password-later"), "login");
 });

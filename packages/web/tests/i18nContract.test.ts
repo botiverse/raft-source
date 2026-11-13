@@ -133,6 +133,24 @@ test("unknown persisted display language is ignored in favor of the browser", ()
 test("display locale maps to canonical HTML lang metadata", () => {
   assert.equal(htmlLangForLocale("en"), "en");
   assert.equal(htmlLangForLocale("zh-cn"), "zh-CN");
+  assert.equal(htmlLangForLocale("ja"), "ja");
+  assert.equal(htmlLangForLocale("ko"), "ko");
+});
+
+test("a Japanese or Korean browser selects ja / ko; the first supported language wins", () => {
+  assert.equal(resolveInitialLocale({ storage: storageWithDisplayLanguage(null), languages: ["ja-JP", "en"] }), "ja");
+  assert.equal(resolveInitialLocale({ storage: storageWithDisplayLanguage(null), languages: ["ko-KR"] }), "ko");
+  assert.equal(resolveInitialLocale({ storage: storageWithDisplayLanguage(null), languages: ["fr-FR", "ko", "ja"] }), "ko");
+  assert.equal(resolveInitialLocale({ storage: storageWithDisplayLanguage(null), languages: ["en-US", "ja-JP"] }), "en");
+  assert.equal(resolveInitialLocale({ storage: storageWithDisplayLanguage("ja"), languages: ["zh-CN"] }), "ja");
+});
+
+test("ja / ko catalogs render through the same intl rails", () => {
+  assert.equal(intlFor("ja").formatMessage({ id: "common.confirm.cancel" }), "キャンセル");
+  assert.equal(intlFor("ko").formatMessage({ id: "common.confirm.cancel" }), "취소");
+  // No count-plural distinction: one `other` arm renders every count.
+  assert.equal(intlFor("ja").formatMessage({ id: "fixtures.plural" }, { count: 1 }), "1 件");
+  assert.equal(intlFor("ko").formatMessage({ id: "fixtures.plural" }, { count: 5 }), "항목 5개");
 });
 
 test("account reconciliation waits for a settled authenticated user", () => {

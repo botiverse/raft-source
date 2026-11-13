@@ -6,6 +6,7 @@ import type { Command } from "commander";
 import { createAgentApiSurfaceClient } from "../../agentApiPath";
 import { defineCommand, registerCliCommand } from "../../core/command";
 import type { CommandRuntimeOptions } from "../../core/context";
+import { rateLimitedResponseError } from "../../core/apiFailure";
 import { cliError } from "../../core/errors";
 import { writeJson, writeText } from "../../core/renderer";
 import {
@@ -61,6 +62,8 @@ export function buildMentionExecuteCommand(action: MentionActionKind) {
         action,
         resolutionIds: ids,
       });
+      const rateLimited = res.ok ? null : rateLimitedResponseError(res);
+      if (rateLimited) throw rateLimited;
       if (!res.ok || !res.data) {
         throw cliError(res.status >= 500 ? "SERVER_5XX" : "MENTION_ACTION_FAILED", res.error ?? `HTTP ${res.status}`);
       }

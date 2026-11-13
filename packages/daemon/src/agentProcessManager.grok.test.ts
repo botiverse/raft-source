@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { assertBodyOnlyInInboxPreview } from "./testing/inboxPreview";
 import { EventEmitter } from "node:events";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
@@ -747,7 +748,7 @@ test("grok pending inbox debt survives a clean Grok subprocess restart in origin
     assert.equal(driver.encodedCalls.length, 2);
     assert.equal(driver.encodedCalls[1]?.mode, "idle");
     assert.match(driver.encodedCalls[1]?.text ?? "", /2 messages pending your read/);
-    assert.doesNotMatch(driver.encodedCalls[1]?.text ?? "", /first restart debt|second restart debt/);
+    assertBodyOnlyInInboxPreview(driver.encodedCalls[1]?.text ?? "", /first restart debt|second restart debt/);
   } finally {
     await releaseAgentManagerForTests(manager);
     restoreFetch();

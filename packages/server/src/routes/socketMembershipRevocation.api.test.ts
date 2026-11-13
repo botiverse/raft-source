@@ -3,13 +3,13 @@ import assert from "node:assert/strict";
 import { once } from "node:events";
 import WebSocket from "ws";
 import { and, eq } from "drizzle-orm";
-import { SERVER_GUEST_FEATURE_FLAG_KEY } from "@botiverse/raft-shared";
-import { channels, featureFlagRules, serverMembers, threadFollows } from "../db/schema";
+import { channels, threadFollows } from "../db/schema";
+import { seedBoundGuest } from "../test/guestFixture";
 import { createApiTest } from "../test/integration/apiTest";
-import { signAccessToken } from "../middleware/auth";
+import { accessTokenForTest } from "../test/integration/credentials";
 import { getOrCreateThread } from "../services/channelService";
 
-const test = createApiTest({ onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest();
 
 function waitForPacket(ws: WebSocket, packets: string[], predicate: (packet: string) => boolean) {
   if (packets.some(predicate) || ws.readyState === WebSocket.CLOSED) return Promise.resolve();
@@ -31,16 +31,12 @@ test("guest socket join and resume enforce hidden-channel and parent visibility"
   const owner = await seed.human();
   const guest = await seed.human();
   const server = await seed.server({ owner, members: [guest] });
-  await db.update(serverMembers).set({ role: "guest" }).where(and(
-    eq(serverMembers.serverId, server.id), eq(serverMembers.userId, guest.id),
-  ));
-  await db.insert(featureFlagRules).values({
-    flagKey: SERVER_GUEST_FEATURE_FLAG_KEY, stage: "server", priority: 0,
-    decision: "allow", values: [server.id],
-  });
-  const hidden = await seed.channel({ server, members: [owner], visibility: "channel" });
+  // "Hidden": a public channel open to guests by the old flag, with the guest
+  // a member of it, yet not its one channel (#wg-rbac:#15); "visible": the guest's channel.
+  const hidden = await seed.channel({ server, members: [owner, guest], visibility: "channel" });
+  await db.update(channels).set({ guestVisible: true }).where(eq(channels.id, hidden.id));
   const visible = await seed.channel({ server, members: [owner], visibility: "channel" });
-  await db.update(channels).set({ guestVisible: true }).where(eq(channels.id, visible.id));
+  await seedBoundGuest({ serverId: server.id, userId: guest.id, channelId: visible.id }, db);
   const sentinel = await seed.message({ channel: hidden, author: owner, content: "before-sync-cursor" });
   const hiddenMessage = await seed.message({ channel: hidden, author: owner, content: "audit-guest-hidden" });
   const visibleMessage = await seed.message({ channel: visible, author: owner, content: "audit-guest-visible" });
@@ -54,11 +50,12 @@ test("guest socket join and resume enforce hidden-channel and parent visibility"
     threadMessages.push({ id: message.id, allowed });
   }
   const packets: string[] = [];
+  const guestToken = await accessTokenForTest(guest.id);
   const ws = new WebSocket(`${app.baseUrl.replace("http:", "ws:")}/socket.io/?EIO=4&transport=websocket`);
   ws.on("message", (data) => {
     const packet = data.toString();
     packets.push(packet);
-    if (packet.startsWith("0")) ws.send(`40${JSON.stringify({ token: signAccessToken(guest.id), serverId: server.id })}`);
+    if (packet.startsWith("0")) ws.send(`40${JSON.stringify({ token: guestToken, serverId: server.id })}`);
   });
   try {
     await waitForPacket(ws, packets, (packet) => packet.includes('"rooms:joined"'));
@@ -116,17 +113,18 @@ for (const transition of ["remove-private-member", "leave-private-channel", "rem
     const channel = await seed.channel({ server, members: [owner, member], visibility: "private" });
     const parent = await seed.message({ channel, author: owner, content: "audit-private-thread-parent" });
     const thread = await getOrCreateThread(parent.id, member.id, "user");
-    const headers = (id: string) => ({
-      Authorization: `Bearer ${signAccessToken(id)}`,
+    const headers = async (id: string) => ({
+      Authorization: `Bearer ${await accessTokenForTest(id)}`,
       "X-Server-Id": server.id,
       "Content-Type": "application/json",
     });
     const packets: string[] = [];
+    const memberToken = await accessTokenForTest(member.id);
     const ws = new WebSocket(`${app.baseUrl.replace("http:", "ws:")}/socket.io/?EIO=4&transport=websocket`);
     ws.on("message", (data) => {
       const packet = data.toString();
       packets.push(packet);
-      if (packet.startsWith("0")) ws.send(`40${JSON.stringify({ token: signAccessToken(member.id), serverId: server.id })}`);
+      if (packet.startsWith("0")) ws.send(`40${JSON.stringify({ token: memberToken, serverId: server.id })}`);
     });
     try {
       await waitForPacket(ws, packets, (packet) => packet.startsWith("42") && packet.includes('"rooms:joined"'));
@@ -137,7 +135,7 @@ for (const transition of ["remove-private-member", "leave-private-channel", "rem
       assert.ok(packets.some((packet) => packet.includes("audit-thread-before-removal")));
       const send = async (content: string) => {
         const response = await fetch(`${app.baseUrl}/api/messages`, {
-          method: "POST", headers: headers(owner.id), body: JSON.stringify({ channelId: channel.id, content }),
+          method: "POST", headers: await headers(owner.id), body: JSON.stringify({ channelId: channel.id, content }),
         });
         assert.equal(response.status, 200, await response.text());
       };
@@ -152,10 +150,10 @@ for (const transition of ["remove-private-member", "leave-private-channel", "rem
           : `/api/channels/${channel.id}/members/user/${member.id}`;
       const removed = await fetch(`${app.baseUrl}${path}`, {
         method: transition === "leave-private-channel" ? "POST" : "DELETE",
-        headers: headers(transition === "leave-private-channel" ? member.id : owner.id),
+        headers: await headers(transition === "leave-private-channel" ? member.id : owner.id),
       });
       assert.equal(removed.status, 200, await removed.text());
-      const denied = await fetch(`${app.baseUrl}/api/messages/channel/${channel.id}`, { headers: headers(member.id) });
+      const denied = await fetch(`${app.baseUrl}/api/messages/channel/${channel.id}`, { headers: await headers(member.id) });
       assert.ok([403, 404].includes(denied.status), `HTTP must deny the removed member, got ${denied.status}`);
       await denied.text();
 

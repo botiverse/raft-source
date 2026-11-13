@@ -1,0 +1,38 @@
+{
+  "formatVersion": 1,
+  "id": "R11-marked-unread-joined",
+  "rule": "R11",
+  "title": "A joined, unmuted channel marked unread with nothing countable shows the marked dot and the unread name",
+  "why": "Marked unread has no number, so the quiet dot instead of a count; the name is unread as for a loud count.",
+  "status": "agreed",
+  "sources": {
+    "web": [
+      "packages/web/src/utils/channelUnreadIndicator.ts (getChannelUnreadIndicatorState)",
+      "packages/web/src/features/sidebar/rows/ChannelRow.tsx"
+    ],
+    "app": [
+      "compose/shared/src/commonMain/kotlin/build/raft/app/RaftHomeComponents.kt (homeChannelRowMarks)"
+    ]
+  },
+  "given": {
+    "conversation": {
+      "id": "channel-1",
+      "kind": "channel"
+    },
+    "row": {
+      "joined": true,
+      "muted": false,
+      "unread": 0,
+      "markedUnread": true
+    }
+  },
+  "steps": [],
+  "expect": {
+    "state": {
+      "rowDisplay": {
+        "kind": "markedDot",
+        "unreadTone": true
+      }
+    }
+  }
+}

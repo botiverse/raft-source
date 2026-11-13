@@ -68,6 +68,38 @@ function sqlState(error: unknown): string | undefined {
   return code && isSqlStateShaped(code) ? code : undefined;
 }
 
+/** The violated constraint's name from the driver error chain (an identifier, never a value). */
+function dbConstraintName(error: unknown): string | undefined {
+  const seen = new Set<unknown>();
+  let current: unknown = error;
+  for (let depth = 0; depth <= MAX_CAUSE_DEPTH; depth += 1) {
+    if (current === null || typeof current !== "object" || seen.has(current)) return undefined;
+    seen.add(current);
+    const constraint = (current as { constraint?: unknown }).constraint;
+    if (typeof constraint === "string" && /^[A-Za-z_][A-Za-z0-9_]{0,62}$/.test(constraint)) return constraint;
+    current = (current as { cause?: unknown }).cause;
+  }
+  return undefined;
+}
+
+/**
+ * What a route failure can say about its cause without its text
+ * (#proj-o11y:#29): the SQLSTATE and constraint name of a database error and
+ * the error's type name. Postgres error text often carries the offending
+ * value (`Key (email)=(...) already exists`), so it stays out; these are codes
+ * and identifiers only.
+ */
+export function errorDiagnosisAttrs(error: unknown): TraceAttributes {
+  const code = sqlState(error);
+  const constraint = code ? dbConstraintName(error) : undefined;
+  const typeName = boundedErrorTypeName(error);
+  return {
+    ...(code ? { sqlstate: code } : {}),
+    ...(constraint ? { db_constraint: constraint } : {}),
+    ...(typeName ? { error_type: typeName } : {}),
+  };
+}
+
 export function queryFailureReason(error: unknown): QueryFailureReason {
   const code = errorCode(error);
   if (code === "57014") return "statement_timeout";

@@ -1,0 +1,33 @@
+-- Retire Guest joining (#wg-rbac:#47, #wg-rbac:#49), the last step: drop
+-- channels.guest_joinable.
+--
+-- schema-snapshot: unchanged (0653's snapshot already lacks the column)
+--
+-- Safe for the serving and rollback images: v1.21.62 (#13829) stopped
+-- declaring, reading and writing the column and cleared it (0653-0654), and it
+-- is the release production serves, so the next release rolls back to it
+-- (docs/operations/server-release.md). guest_join_public_column_drop took the
+-- column out of change_log_channels_upd's WHEN, so no trigger names it; no
+-- index or constraint uses it (its CHECK went in 0653). Its default goes with
+-- the column.
+--
+-- RisingWave: on staging and production rw_channels was created with a fixed
+-- column list (id, server_id, name, description, type, parent_message_id,
+-- created_at, archived_at, archived_by_user_id, deleted_at, parent_channel_id,
+-- task_id) that never had guest_joinable, both CDC sources have
+-- auto.schema.change = false, and no materialized view references the column
+-- (Ray, #proj-risingwave:bda45d48, 2026-11-10). So the mirror reads nothing
+-- this drops, as with servers.public_guest_join_enabled. Release QA is
+-- different: its bootstrap (infra/aws-server/envs/release-qa/sql/
+-- risingwave-cdc-bootstrap.sql) defines rw_channels (*), so that mirror does
+-- have the column; whoever runs release QA checks rw_channels' CDC after this
+-- migration there, and rebuilds the table from the bootstrap if it stalls.
+--
+-- Locks: ACCESS EXCLUSIVE on channels for a catalog change only (dropping a
+-- column rewrites and scans nothing). channels is hot: give up after 2 s
+-- rather than queue reads behind a long transaction (the deploy runner
+-- retries a lock timeout). IF EXISTS: a database made from another history
+-- may not have the column.
+SET LOCAL lock_timeout = '2s';--> statement-breakpoint
+SET LOCAL statement_timeout = '30s';--> statement-breakpoint
+ALTER TABLE "channels" DROP COLUMN IF EXISTS "guest_joinable";

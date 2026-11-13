@@ -6,7 +6,8 @@ import { useAgentStore } from "../../store/agentStore";
 import { useServerStore } from "../../store/serverStore";
 import Banner from "../ui/Banner";
 import { Button } from "@botiverse/raft-ui";
-import CreateAgentDialog from "./CreateAgentDialog";
+import { CreateAgentDialog } from "./DeferredCreateAgentDialog";
+import { startVisiblePoll } from "../../utils/visiblePoll";
 
 /** Re-read the setup state now and then: the server flips it to `failed` after its timeout and retry. */
 const RECHECK_MS = 60_000;
@@ -40,9 +41,10 @@ export default function HostedCindyFailedBanner({ agent }: { agent: Agent }) {
 
   useEffect(() => {
     void recheck();
-    const timer = setInterval(() => void recheck(), RECHECK_MS);
-    return () => clearInterval(timer);
-  }, [recheck]);
+    if (!eligible) return;
+    // Paused while the page is hidden; one recheck when it shows again.
+    return startVisiblePoll(() => void recheck(), { intervalMs: RECHECK_MS });
+  }, [eligible, recheck]);
 
   const openDialog = useCallback(() => setDialogOpen(true), []);
   const closeDialog = useCallback(() => {
@@ -60,7 +62,7 @@ export default function HostedCindyFailedBanner({ agent }: { agent: Agent }) {
           withIcon
           data-testid="hosted-cindy-failed-banner"
           actions={(
-            <Button size="sm" onClick={openDialog}>
+            <Button size="md" onClick={openDialog}>
               {formatMessage({ id: "agent.hostedCindy.failed.connectComputer" })}
             </Button>
           )}

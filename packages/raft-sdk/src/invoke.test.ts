@@ -194,3 +194,19 @@ test("contextId scopes attestation: a send attests only reads from the same mode
   assert.deepEqual(restored.frontier.attestation("#general"), { seenUpToSeq: 1201, seenExactSeqs: [] });
   assert.deepEqual(restored.frontier.inContext("ctx-A").attestation("#general"), { seenExactSeqs: [] });
 });
+
+test("artifacts.move with to: anyone-with-link, as a model calls it, is refused before any request: only a person can, and the move it can make; public is no value of to", async () => {
+  const server = fakeServer();
+  const outcome = await raftOn(server, { hints: "tool" }).invoke("artifacts.move", { artifact: "pt_abc", to: "anyone-with-link" });
+  assert.ok(!outcome.ok);
+  assert.deepEqual([outcome.error.code, outcome.error.serverCode, outcome.error.message, outcome.error.nextAction], [
+    "INVALID_REQUEST",
+    "FORBIDDEN",
+    "Only a person can turn on link sharing (anyone with the link can then open it).",
+    `Ask a person who manages it to choose "Anyone with the link" under "Who can see" in its ⋯ menu on the web. To let the whole server see it: artifacts_move({ artifact: "pt_abc", to: "server" })`,
+  ]);
+  // `public`, that home's name on the wire, is refused as any value `to` doesn't take.
+  const wire = await raftOn(server, { hints: "tool" }).invoke("artifacts.move", { artifact: "pt_abc", to: "public" });
+  assert.ok(!wire.ok && wire.error.code === "INVALID_REQUEST" && !wire.error.serverCode && /\bto\b/.test(wire.error.message), JSON.stringify(wire));
+  assert.deepEqual(server.calls, []);
+});

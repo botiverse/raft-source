@@ -11,6 +11,7 @@ import {
   createPiToolExecutionObserver,
   PI_TOOL_PROGRESS_COALESCE_MS,
 } from "./piToolExecutionObservability";
+import { createPiCommandTool } from "./piCommandTool";
 import { traceRows } from "../testing/traceRows";
 
 class FakeChildProcess extends EventEmitter {
@@ -37,6 +38,7 @@ function deferred(): {
 function testObserver(input: {
   now: () => number;
   probeChildLiveness?: () => boolean | undefined;
+  probeProcessGroupLiveness?: () => boolean | undefined;
   runtimeSessionId?: string | null;
 }) {
   const sink = new MemoryTraceSink();
@@ -56,6 +58,7 @@ function testObserver(input: {
     probeChildLiveness: input.probeChildLiveness
       ? () => input.probeChildLiveness!()
       : () => true,
+    ...(input.probeProcessGroupLiveness ? { probeProcessGroupLiveness: () => input.probeProcessGroupLiveness!() } : {}),
   });
   observer.beginRuntimeTurn();
   return { observer, sink };
@@ -500,4 +503,160 @@ test("Pi diagnostic turn identity gaps remain explicit negative evidence", async
   assert.equal(lastSnapshotAttrs(sink).negative_evidence_bucket, "turn_identity_missing");
   hold.resolve();
   await running;
+});
+
+// Task #1302: a shell that exited can leave a backgrounded descendant working
+// in its process group, and abort kills the whole group. completion_loss must
+// say whether the group is gone before stalled recovery may cut the tool off.
+test("Pi tool completion_loss reports process-group liveness only for process-group tracked tools", async () => {
+  const cases: Array<{
+    tracking: "process_group" | "unknown";
+    groupAlive: boolean | undefined;
+    expected: "alive" | "exited" | "unknown";
+  }> = [
+    { tracking: "process_group", groupAlive: true, expected: "alive" },
+    { tracking: "process_group", groupAlive: false, expected: "exited" },
+    { tracking: "process_group", groupAlive: undefined, expected: "unknown" },
+    { tracking: "unknown", groupAlive: false, expected: "unknown" },
+  ];
+  for (const testCase of cases) {
+    const now = 1_000;
+    const { observer, sink } = testObserver({
+      now: () => now,
+      probeProcessGroupLiveness: () => testCase.groupAlive,
+    });
+    const hold = deferred();
+    const child = new FakeChildProcess();
+    const running = observer.runToolExecution("call-group", undefined, async () => {
+      observer.observeProcessSpawned(child as never, { processTreeTracking: testCase.tracking, stdioMode: "pipe" });
+      child.exitCode = 0;
+      observer.observeProcessExit({ code: 0, signal: null });
+      await hold.promise;
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    const [snapshot] = observer.emitDiagnosticSnapshots({ trigger: "queued_message_recovery", runtimeInactivityAgeMs: 16 * 60_000 });
+    assert.equal(snapshot?.classification, "completion_loss", JSON.stringify(testCase));
+    assert.equal(snapshot?.processGroupLiveness, testCase.expected, JSON.stringify(testCase));
+    assert.equal(snapshot?.runtimeToolCallId, "call-group", "in-memory id lets the daemon match the open call");
+    assert.doesNotMatch(JSON.stringify(traceRows(sink)), /call-group/, "the raw call id never reaches a trace");
+    assert.equal(lastSnapshotAttrs(sink).process_group_liveness, testCase.expected, "the fact survives the attr contract");
+    hold.resolve();
+    await running;
+  }
+});
+
+// failure_reason on daemon.runtime.tool.execution.finished, through the real
+// command tool (Raft's POSIX operations, Pi's bash tool, the observer wrapper)
+// and the span attr contract, so a reason the contract drops would read as
+// missing here.
+function finishedAttrs(sink: MemoryTraceSink): Record<string, unknown> {
+  const finished = traceRows(sink).filter((row) => row.name === "daemon.runtime.tool.execution.finished");
+  assert.equal(finished.length, 1, "expected one finished fact");
+  return { ...(finished[0]?.attrs ?? {}) };
+}
+
+function exitedAttrs(sink: MemoryTraceSink): Record<string, unknown> | undefined {
+  return traceRows(sink).find((row) => row.name === "daemon.runtime.tool.process.exited")?.attrs;
+}
+
+function realCommandTool(deps: Omit<Parameters<typeof createPiCommandTool>[2], "observer"> = {}) {
+  const { observer, sink } = testObserver({ now: Date.now });
+  const tool = createPiCommandTool(process.cwd(), process.env, { platform: process.platform, ...deps, observer });
+  return { observer, sink, tool };
+}
+
+const posixOnly = { skip: process.platform === "win32" };
+
+test("failure_reason: a command that succeeds carries none", posixOnly, async () => {
+  const { sink, tool } = realCommandTool();
+  await tool.execute("call-ok", { command: "true" });
+  const attrs = finishedAttrs(sink);
+  assert.equal(attrs.execution_state, "succeeded");
+  assert.equal("failure_reason" in attrs, false);
+});
+
+test("failure_reason: a non-zero exit is a result, not a failure; the exit kind carries it", posixOnly, async () => {
+  const { sink, tool } = realCommandTool();
+  const result = await tool.execute("call-exit", { command: "exit 3" });
+  assert.equal((result as { isError?: boolean }).isError, true, "Pi resolves a non-zero exit with isError");
+  const attrs = finishedAttrs(sink);
+  assert.equal(attrs.execution_state, "succeeded");
+  assert.equal("failure_reason" in attrs, false);
+  assert.equal(exitedAttrs(sink)?.exit_kind, "code_nonzero");
+});
+
+test("failure_reason: a command killed by a signal it was not sent is killed_by_signal", posixOnly, async () => {
+  const { sink, tool } = realCommandTool();
+  await assert.rejects(tool.execute("call-signal", { command: "kill -KILL $$" }));
+  const attrs = finishedAttrs(sink);
+  assert.equal(attrs.execution_state, "failed");
+  assert.equal(attrs.failure_reason, "killed_by_signal");
+  assert.equal(exitedAttrs(sink)?.exit_kind, "signal");
+});
+
+test("failure_reason: the tool's own timeout, explicit or default, is timeout", posixOnly, async () => {
+  for (const params of [{ command: "sleep 30", timeout: 0.3 }, { command: "sleep 30" }]) {
+    const { sink, tool } = realCommandTool({ defaultTimeoutSeconds: 0.3 });
+    await assert.rejects(tool.execute("call-timeout", params), /timed out/);
+    const attrs = finishedAttrs(sink);
+    assert.equal(attrs.execution_state, "failed", JSON.stringify(params));
+    assert.equal(attrs.failure_reason, "timeout", JSON.stringify(params));
+    // The timeout kills the group, so the exit alone would read as a signal.
+    assert.equal(exitedAttrs(sink)?.exit_kind, "signal");
+  }
+});
+
+test("failure_reason: a shell that cannot be spawned is spawn_failed", async () => {
+  const spawnFails = (() => {
+    const child = new FakeChildProcess() as FakeChildProcess & { stdout: EventEmitter; stderr: EventEmitter };
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    queueMicrotask(() => child.emit("error", Object.assign(new Error("spawn ENOENT"), { code: "ENOENT" })));
+    return child;
+  }) as never;
+  const { sink, tool } = realCommandTool({ platform: "linux", spawn: spawnFails });
+  await assert.rejects(tool.execute("call-spawn", { command: "true" }));
+  const attrs = finishedAttrs(sink);
+  assert.equal(attrs.execution_state, "failed");
+  assert.equal(attrs.failure_reason, "spawn_failed");
+});
+
+test("failure_reason: any other failure is other", posixOnly, async () => {
+  const { sink, observer } = testObserver({ now: Date.now });
+  const tool = createPiCommandTool("/nonexistent-raft-cwd", process.env, { platform: process.platform, observer });
+  await assert.rejects(tool.execute("call-cwd", { command: "true" }), /Working directory does not exist/);
+  const attrs = finishedAttrs(sink);
+  assert.equal(attrs.execution_state, "failed");
+  assert.equal(attrs.failure_reason, "other");
+});
+
+test("failure_reason: an abort is attributed to the cause recorded before it", posixOnly, async () => {
+  const cases = [
+    { cause: "stop", expected: "aborted_by_stop" },
+    { cause: "interrupt", expected: "aborted_by_interrupt" },
+    { cause: undefined, expected: "other" },
+  ] as const;
+  for (const testCase of cases) {
+    const { observer, sink, tool } = realCommandTool();
+    const abort = new AbortController();
+    const run = tool.execute("call-abort", { command: "sleep 30", timeout: 60 }, abort.signal);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    if (testCase.cause) observer.observeAbortRequested(testCase.cause);
+    abort.abort();
+    await assert.rejects(run, /Command aborted/);
+    const attrs = finishedAttrs(sink);
+    assert.equal(attrs.execution_state, "aborted", JSON.stringify(testCase));
+    assert.equal(attrs.failure_reason, testCase.expected, JSON.stringify(testCase));
+  }
+});
+
+test("failure_reason: an abort cause only marks executions pending when it was recorded", async () => {
+  const { observer, sink } = testObserver({ now: Date.now });
+  observer.observeAbortRequested("stop");
+  const abort = new AbortController();
+  abort.abort();
+  await assert.rejects(observer.runToolExecution("late", abort.signal, async () => {
+    throw new Error("aborted");
+  }));
+  assert.equal(finishedAttrs(sink).failure_reason, "other");
 });

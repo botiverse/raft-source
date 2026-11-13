@@ -8,7 +8,8 @@ import { risingWaveUnavailableResponsesTotal } from "../metrics";
 import { installRisingWaveReadReferences, uninstallRisingWaveReadReferences } from "../test/risingWaveReadReference";
 import { __testRisingWaveInbox, addHuman, createChannel } from "../services/channelService";
 import { createServer, headers, seedUser } from "./channels.api.fixtures";
-import { __setStaleReadStoreForTests } from "./rwStaleRead";
+import { __setStaleReadStoreForTests, STALE_RESPONSE_HEADER } from "./rwStaleRead";
+import { getWebCorsOrigins } from "../config/appUrl";
 
 const test = createApiTest();
 
@@ -176,3 +177,28 @@ for (const summary of [false, true]) {
     }
   });
 }
+
+// task #164: the web app is cross-origin, so its script reads X-Raft-Stale and
+// Retry-After only if CORS exposes them; without that it can never say the
+// counts may be out of date, nor pace its retries by the server's hint.
+test("GET /api/channels/unread: a stale answer exposes X-Raft-Stale and Retry-After to the web origin", async ({ app }) => {
+  const reader = await seedReader("stale-cors");
+  const memory = memoryStaleStore();
+  __setStaleReadStoreForTests(memory.store);
+  const origin = getWebCorsOrigins()[0];
+  assert.ok(origin);
+  try {
+    const fresh = await fetch(`${app.baseUrl}/api/channels/unread`, { headers: { ...headers(reader.token, reader.serverId), Origin: origin } });
+    assert.equal(fresh.status, 200);
+    await new Promise((resolve) => setImmediate(resolve));
+    const res = await withRisingWave({ getPool: configuredPool, query: overloadedQuery }, () =>
+      fetch(`${app.baseUrl}/api/channels/unread`, { headers: { ...headers(reader.token, reader.serverId), Origin: origin } }));
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get("x-raft-stale"), "rw_overloaded");
+    const exposed = (res.headers.get("access-control-expose-headers") ?? "").toLowerCase().split(/\s*,\s*/);
+    assert.ok(exposed.includes(STALE_RESPONSE_HEADER.toLowerCase()), `exposed: ${exposed.join(",")}`);
+    assert.ok(exposed.includes("retry-after"), `exposed: ${exposed.join(",")}`);
+  } finally {
+    __setStaleReadStoreForTests(undefined);
+  }
+});

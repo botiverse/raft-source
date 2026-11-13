@@ -42,21 +42,21 @@ import {
 import { logger } from "./logger";
 
 /** Ledger versions whose `observations` shape this writer knows. */
-const KNOWN_LEDGER_VERSIONS = new Set(["1"]);
+export const KNOWN_LEDGER_VERSIONS: ReadonlySet<string> = new Set(["1"]);
 
-interface SqliteStatement {
+export interface SqliteStatement {
   run(...params: unknown[]): { changes: number | bigint };
   get(...params: unknown[]): unknown;
   all(...params: unknown[]): unknown[];
 }
-interface SqliteDatabase {
+export interface SqliteDatabase {
   exec(sql: string): void;
   prepare(sql: string): SqliteStatement;
   close(): void;
 }
-type SqliteModule = { DatabaseSync: new (file: string) => SqliteDatabase };
+export type SqliteModule = { DatabaseSync: new (file: string) => SqliteDatabase };
 
-function loadSqlite(): SqliteModule | undefined {
+export function loadSqlite(): SqliteModule | undefined {
   try {
     // Not a static import: a host without node:sqlite must still load the
     // daemon, and simply shows every description in full.

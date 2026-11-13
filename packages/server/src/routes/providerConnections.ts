@@ -1,4 +1,5 @@
 import { Router, type NextFunction, type Request, type Response, type Router as RouterType } from "express";
+import { hideUnfindableAgentsByParam } from "./unfindableAgentGate";
 import {
   isProviderConnectionProviderId,
   isProviderProbeId,
@@ -36,6 +37,8 @@ import {
 } from "../services/providerConnectionService";
 
 export const providerConnectionRouter: RouterType = Router();
+// Another person's personal assistant reads as an unknown agent (agentFindableBy).
+hideUnfindableAgentsByParam(providerConnectionRouter, "agentId");
 
 function body(req: Request): Record<string, unknown> {
   if (!req.body || typeof req.body !== "object" || Array.isArray(req.body)) {
@@ -181,7 +184,7 @@ providerConnectionRouter.patch("/:connectionId", requireCapability("manageExtern
       ...input,
     });
     if (input.apiKey !== undefined || input.endpointUrl !== undefined || input.enabled !== undefined) {
-      await liftWakeBlocksForConnection(req);
+      await liftWakeBlocksForConnection(req, { pushConfig: input.apiKey !== undefined || input.endpointUrl !== undefined });
     }
     res.json(updated);
   } catch (error) {
@@ -200,7 +203,7 @@ providerConnectionRouter.post("/:connectionId/credentials/rotate", requireCapabi
       endpointUrl: input.endpointUrl,
       supportsImageInput: input.supportsImageInput,
     });
-    await liftWakeBlocksForConnection(req);
+    await liftWakeBlocksForConnection(req, { pushConfig: true });
     res.json(rotated);
   } catch (error) {
     sendError(error, res, next);
@@ -255,16 +258,24 @@ function sendProbeError(error: unknown, res: Response, next: NextFunction) {
 /**
  * A new key or endpoint may fix what paused automatic restarts of the agents
  * on this connection (task #1221 start-failure block); lift it for each, as an
- * agent's own model/key edit does. Best effort: the edit itself has landed.
+ * agent's own model/key edit does. With `pushConfig` (a key or endpoint edit,
+ * reconciler step 11b) each running agent's daemon also gets its new config
+ * and restarts it once idle; a daemon that cannot take it keeps the old
+ * launch until its next start, as before. Best effort: the edit itself has
+ * landed.
  */
-async function liftWakeBlocksForConnection(req: Request): Promise<void> {
+async function liftWakeBlocksForConnection(req: Request, options: { pushConfig: boolean }): Promise<void> {
   const orchestrator = (req.app.get("agentOrchestrator") ?? null) as AgentOrchestrator | null;
   if (!orchestrator) return;
   try {
     const { agents } = await listProviderConnectionAssignedAgents({ serverId: req.serverId!, connectionId: connectionId(req) });
     for (const agent of agents) {
-      if (!agent.deleted) await orchestrator.liftWakeBlockForConfigChange(agent.id, { runtimeValuesChanged: true });
+      if (agent.deleted) continue;
+      await orchestrator.liftWakeBlockForConfigChange(agent.id, { runtimeValuesChanged: true });
+      if (options.pushConfig) await orchestrator.applyAgentConfig(agent.id);
     }
+    // task #1357 item 1: a key or endpoint edit moved each agent's revision.
+    if (options.pushConfig) await orchestrator.notifyModelLimitsChanged?.({ agentIds: agents.filter((agent) => !agent.deleted).map((agent) => agent.id) });
   } catch (error) {
     console.warn(`[ProviderConnections] lifting paused restarts after a connection edit failed: ${error instanceof Error ? error.message : String(error)}`);
   }

@@ -1,10 +1,15 @@
+import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync } from "node:fs";
+import { logger } from "../logger";
+import { ambientProcessEnv } from "../processEnvPatch";
 import { spawnRuntimeChild } from "./runtimeChild";
 import path from "node:path";
 import { hydrateRuntimeConfig, runtimeConfigToLaunchFields, type AgentConfig, type RuntimeModelSourceOutcome , type AxSurfaceText } from "@botiverse/raft-shared";
 import { buildCliTransportSystemPrompt, prepareCliTransport } from "./cliTransport";
 import { lookupCommandOnPath, resolveCommandOnPath, readCommandVersion, type ProbeDeps } from "./probe";
 import { resolveWindowsDirectLaunch, type DirectLaunch } from "./windowsLaunch";
+import { detectAntigravityModelSource } from "./antigravityModels";
 import type { ParsedEvent, RuntimeDriver, RuntimeProbeResult, SpawnContext, SpawnResult } from "./types";
 import {
   installManagedMcpRuntimeJsonOverlay,
@@ -63,6 +68,73 @@ export function buildAntigravityManagedMcpConfig(
   };
 }
 
+/**
+ * Keep a file holding a launch's MCP token out of `git add -A`, in the
+ * repository's own exclude file, never its `.gitignore`. `relativePath` is from
+ * the workspace, and the line names that one path. A workspace that isn't a
+ * repository has nothing to do; nothing here stops the launch.
+ */
+export function excludeFromWorkspaceGit(workingDirectory: string, relativePath: string): void {
+  let cwd: string;
+  let lines: string[];
+  try {
+    // git's relative answers are from the physical directory.
+    cwd = realpathSync(workingDirectory);
+    lines = execFileSync("git", ["rev-parse", "--show-prefix", "--git-path", "info/exclude"], {
+      cwd,
+      encoding: "utf8",
+      env: ambientProcessEnv(),
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 5_000,
+      windowsHide: true,
+    }).split("\n");
+  } catch {
+    return; // Not a repository, or no git.
+  }
+  const pattern = `/${lines[0]}${relativePath}`;
+  const excludeFile = path.resolve(cwd, lines[1]!);
+  try {
+    const current = existsSync(excludeFile) ? readFileSync(excludeFile, "utf8") : "";
+    if (current.split("\n").includes(pattern)) return;
+    mkdirSync(path.dirname(excludeFile), { recursive: true });
+    appendFileSync(excludeFile, `${current && !current.endsWith("\n") ? "\n" : ""}${pattern}\n`);
+  } catch (error) {
+    logger.warn(`[Antigravity] Could not exclude ${relativePath} from git: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+/**
+ * What a launch needs around the `agy` command, on either host: Raft's CLI
+ * transport in its environment, and the managed MCP server in the workspace's
+ * own `.agents/mcp_config.json` (never through ACP, where `agy` would store it).
+ */
+export async function prepareAntigravityEnvironment(ctx: SpawnContext): Promise<NodeJS.ProcessEnv> {
+  const managedMcp = await prepareManagedMcpRuntimeProxy({
+    agentId: ctx.agentId,
+    launchId: ctx.launchId,
+    processInstanceId: ctx.processInstanceId,
+    readTurnOrigin: ctx.readTurnOrigin,
+    serverUrl: ctx.config.serverUrl,
+    agentCredentialKey: ctx.config.agentCredentialKey,
+  });
+  if (managedMcp) {
+    const filePath = path.join(ctx.workingDirectory, ".agents", "mcp_config.json");
+    // A file the user already has is theirs to commit or not.
+    if (!existsSync(filePath)) excludeFromWorkspaceGit(ctx.workingDirectory, ".agents/mcp_config.json");
+    installManagedMcpRuntimeJsonOverlay({
+      agentId: ctx.agentId,
+      launchId: ctx.launchId,
+      filePath,
+      apply: (config) => buildAntigravityManagedMcpConfig(config, managedMcp),
+    });
+  }
+  const { spawnEnv } = await prepareCliTransport(ctx, {
+    NO_COLOR: "1",
+    ...ANTIGRAVITY_ENV_OVERRIDES,
+  });
+  return spawnEnv;
+}
+
 const ERROR_LINE_PREFIX_RE = /^(?:(?:error|fatal|exception|failure):\s*|failed(?:\b|:))/i;
 const ERROR_LINE_PATTERNS = [
   /authentication timed out/i,
@@ -108,9 +180,13 @@ export class AntigravityDriver implements RuntimeDriver {
   } as const;
   readonly session = {
     recovery: "resume_or_fresh",
+    // Never emits a compaction event.
+    compaction: "unreported",
+    compactionFailure: "does_not_stick",
   } as const;
   readonly model = {
-    detectedModelsVerifiedAs: "suggestion_only" as const,
+    // OAR lists what the signed-in `agy` offers now; the OAR launch passes the choice.
+    detectedModelsVerifiedAs: "launchable" as const,
     toLaunchSpec: (_modelId: string) => ({ args: [] }),
   };
   readonly supportsStdinNotification = false;
@@ -132,26 +208,8 @@ export class AntigravityDriver implements RuntimeDriver {
     this.sessionId = ctx.config.sessionId || randomUUID();
     this.sessionAnnounced = false;
 
-    const managedMcp = await prepareManagedMcpRuntimeProxy({
-      agentId: ctx.agentId,
-      launchId: ctx.launchId,
-      serverUrl: ctx.config.serverUrl,
-      agentCredentialKey: ctx.config.agentCredentialKey,
-    });
-    if (managedMcp) {
-      installManagedMcpRuntimeJsonOverlay({
-        agentId: ctx.agentId,
-        launchId: ctx.launchId,
-        filePath: path.join(ctx.workingDirectory, ".agents", "mcp_config.json"),
-        apply: (config) => buildAntigravityManagedMcpConfig(config, managedMcp),
-      });
-    }
-
     const launch = resolveAntigravitySpawn(buildAntigravityArgs(ctx));
-    const { spawnEnv } = await prepareCliTransport(ctx, {
-      NO_COLOR: "1",
-      ...ANTIGRAVITY_ENV_OVERRIDES,
-    });
+    const spawnEnv = await prepareAntigravityEnvironment(ctx);
 
     // task #365: after the last await, right before the child exists.
     ctx.assertLaunchCurrent?.();
@@ -202,7 +260,8 @@ export class AntigravityDriver implements RuntimeDriver {
     });
   }
 
+  /** The `agy` login's models through OAR's `listModels` (antigravityModels.ts). */
   async detectModels(): Promise<RuntimeModelSourceOutcome> {
-    return { kind: "unsupported" };
+    return detectAntigravityModelSource();
   }
 }

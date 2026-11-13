@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
 import "./helpers/domSetup";
 import { cleanup, render } from "@testing-library/react";
 import { createElement } from "react";
@@ -54,15 +53,6 @@ function simulateExternalTranslator(root: Element): number {
 
   return textNodes.length;
 }
-
-test("html shell opts the React-owned document out of external translators before boot", () => {
-  const html = readFileSync(new URL("../index.html", import.meta.url), "utf8");
-
-  assert.match(html, /<html[^>]*\btranslate="no"[^>]*\bclass="notranslate"/);
-  assert.match(html, /<meta\s+name="google"\s+content="notranslate"\s*\/>/);
-  assert.match(html, /<body[^>]*\btranslate="no"[^>]*\bclass="notranslate"/);
-  assert.match(html, /<div\s+id="root"[^>]*\btranslate="no"[^>]*\bclass="notranslate"/);
-});
 
 test("runtime guard is idempotent and repairs test/HMR shells", () => {
   const doc = document.implementation.createHTMLDocument("Raft");

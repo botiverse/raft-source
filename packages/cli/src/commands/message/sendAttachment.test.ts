@@ -10,6 +10,7 @@ import { Readable } from "node:stream";
 import { afterEach, beforeEach, test } from "vitest";
 
 import { createCommandContext } from "../../core/context";
+import { readPassiveRenderCountsForTest } from "../../state/passiveRenderCountsTestReader";
 import { messageSendCommand } from "./send";
 
 const AGENT = "agent-send-attachment";
@@ -92,7 +93,12 @@ test("a runtime that does not report compaction gets the cards and latest messag
   assert.match(read.path, /consume=false/);
   assert.match(read.path, /before=m-9/);
   assert.match(read.path, /limit=3/);
-  assert.match(run.out(), /Message sent to #ops\. Message ID: m-9.*\n\nNot part of your message: the latest in #ops before it \(shown after every send because this runtime does not report context compaction\):\nChannel #ops \(public\): Release coordination\.\nEquivalent: raft channel info "#ops"\n  ├ Latest 2 ─+\n  │ @richard 09:00  deploy at 5\?\n  │ @scout 09:02  canary is green\n  └ Previews are truncated\. Full text: raft message read --target "#ops"\n$/s);
+  assert.match(run.out(), /Message sent to #ops\. Message ID: m-9.*\n\nNot part of your message: the latest in #ops before it \(shown after every send because this runtime does not report context compaction\):\nChannel #ops \(public\): Release coordination\.\nEquivalent: raft channel info "#ops"\n  ├ Latest 2 ─+\n  │ @richard 09:00  deploy at 5\?\n  │ @scout 09:02  canary is green\n  └ ─{40}\n$/s);
+  // Counted for the daemon's turn report: the attachment as printed, from its leading blank line.
+  const attached = run.out().slice(run.out().indexOf("\nNot part of your message"));
+  assert.deepEqual(readPassiveRenderCountsForTest(AGENT), [
+    { contextId: "ctx-A", kind: "send_attachment", renders: 1, chars: Array.from(attached).length, bytes: Buffer.byteLength(attached, "utf8") },
+  ]);
 });
 
 test("no attachment for a runtime that reports compaction, with passive AX off, or when the read fails", async () => {

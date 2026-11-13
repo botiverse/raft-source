@@ -1,8 +1,11 @@
-import { and, desc, eq, gt, gte, inArray, isNull, lt, or } from "drizzle-orm";
+import { resolveAgentLounge } from "./agentLoungeService";
+import { JointActorUnavailableError, lockJointHumanAdmissionSource, lockJointUsersFirst, prepareJointHumanMembershipMirror } from "./jointHumanMembershipMirror";
+import { and, desc, eq, gt, gte, inArray, isNull, lt, or, sql } from "drizzle-orm";
 import { asServerId } from "@botiverse/raft-shared";
 
 import { getDb, type DatabaseExecutor } from "../db/index";
 import {
+  agentLounges,
   agents as agentsTable,
   channelAgents,
   channelHumans,
@@ -16,6 +19,7 @@ import {
   actorHasChannelCapability,
   channelActorHasCapability,
   resolveChannelActorContext,
+  lockComputedJointActor,
 } from "../lib/channelActorPermissions";
 import { uuidShortIdRange } from "../lib/messageId";
 import * as channelService from "./channelService";
@@ -24,6 +28,12 @@ import { recordInboxNotificationFacts, type InboxNotificationFactInput } from ".
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const SHORT_ID_RE = /^[0-9a-f]{8}$/i;
 const PENDING_MENTION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+/**
+ * Thread level after the mention re-follows the thread (contract §1.1): a
+ * stored 'mentions' (= unfollowed) goes back to NULL (default); an explicit
+ * 'none' and 'all' / 'default' stay.
+ */
+const refollowNotificationLevelSql = sql<"default" | "all" | "mentions" | "none" | null>`CASE WHEN ${threadFollows.notificationLevel} = 'mentions' THEN NULL ELSE ${threadFollows.notificationLevel} END`;
 
 export type MentionActionActorType = "user" | "agent";
 export type MentionActionKind = "notify" | "add";
@@ -56,6 +66,9 @@ export type MentionActionRow = {
   serverId: string;
   channelId: string;
   parentMessageId: string | null;
+  /** Task v2: a task conversation names its parent channel and task on the row. */
+  parentChannelId: string | null;
+  taskId: string | null;
   targetType: "user" | "agent";
   targetId: string;
   handleAtSendTime: string;
@@ -91,8 +104,17 @@ function isExpiredMentionAction(row: MentionActionRow): boolean {
   return Date.now() - row.createdAt.getTime() > PENDING_MENTION_TTL_MS;
 }
 
+/**
+ * A thread or a task v2 conversation: membership is the parent channel's, and
+ * "already in it" means following it. A task conversation's parent channel is
+ * on its row (`parent_channel_id`); a thread's is its parent message's channel.
+ */
+function isSubConversationRow(row: MentionActionRow): boolean {
+  return row.channelType === "thread" || row.channelType === "task";
+}
+
 function canNotifyMentionTarget(row: MentionActionRow): boolean {
-  return (row.channelType === "channel" || row.channelType === "thread") && !row.channelArchivedAt && !row.channelDeletedAt;
+  return (row.channelType === "channel" || isSubConversationRow(row)) && !row.channelArchivedAt && !row.channelDeletedAt;
 }
 
 async function mentionTargetCanReadMessage(row: MentionActionRow): Promise<boolean> {
@@ -107,14 +129,14 @@ function canAddMentionTarget(row: MentionActionRow, actorType: MentionActionActo
   // Target type is intentionally symmetric; the write below maps user/agent to
   // the corresponding membership table.
   return actorType === "user"
-    && (row.channelType === "channel" || row.channelType === "thread")
+    && (row.channelType === "channel" || isSubConversationRow(row))
     && !row.channelArchivedAt
     && !row.channelDeletedAt;
 }
 
 async function canActorUseMemberManagementAdd(row: MentionActionRow, actorType: MentionActionActorType, actorId: string): Promise<boolean> {
   if (actorType !== "user") return false;
-  if (row.channelType !== "channel" && row.channelType !== "thread") return false;
+  if (row.channelType !== "channel" && !isSubConversationRow(row)) return false;
   const authorityChannelId = await channelService.getChannelMembershipAuthorityChannelId(row.channelId);
   if (!authorityChannelId) return false;
   return actorHasChannelCapability(row.serverId, authorityChannelId, actorType, actorId, "addChannelMembers");
@@ -146,6 +168,8 @@ function mentionActionSelectShape() {
     serverId: messageMentions.serverId,
     channelId: messageMentions.channelId,
     parentMessageId: channels.parentMessageId,
+    parentChannelId: channels.parentChannelId,
+    taskId: channels.taskId,
     targetType: messageMentions.targetType,
     targetId: messageMentions.targetId,
     handleAtSendTime: messageMentions.handleAtSendTime,
@@ -170,6 +194,8 @@ function toMentionActionRow(row: Record<string, unknown>): MentionActionRow {
     serverId: row.serverId as string,
     channelId: row.channelId as string,
     parentMessageId: (row.parentMessageId as string | null) ?? null,
+    parentChannelId: (row.parentChannelId as string | null) ?? null,
+    taskId: (row.taskId as string | null) ?? null,
     targetType: row.targetType as "user" | "agent",
     targetId: row.targetId as string,
     handleAtSendTime: row.handleAtSendTime as string,
@@ -231,6 +257,13 @@ export async function listPendingMentionActionsForSender(
       eq(messages.senderType, actorType),
       eq(messages.senderId, actorId),
       isNull(channels.deletedAt),
+      // Agent Lounge: nobody unreached there is reminded later (a person who
+      // has not joined, tygg #proj-chat:30a58e4d; another agent, never), so
+      // no mention there is a pending action.
+      sql`not exists (
+        select 1 from ${agentLounges}
+        where ${agentLounges.channelId} in (${channels.id}, ${channels.parentChannelId})
+      )`,
     ))
     .orderBy(desc(messageMentions.createdAt))
     .limit(limit);
@@ -284,7 +317,7 @@ async function mentionTargetStillExists(row: MentionActionRow, executor: ReturnT
 }
 
 async function mentionTargetIsChannelMember(row: MentionActionRow, executor: ReturnType<typeof getDb> = getDb()): Promise<boolean> {
-  if (row.channelType === "thread") {
+  if (isSubConversationRow(row)) {
     const [follow] = await executor
       .select({ threadChannelId: threadFollows.threadChannelId })
       .from(threadFollows)
@@ -319,7 +352,10 @@ async function mentionSenderCanAct(
 ): Promise<boolean> {
   if (row.senderType !== actorType || row.senderId !== actorId) return false;
   let membershipChannelId = row.channelId;
-  if (row.channelType === "thread") {
+  if (row.channelType === "task") {
+    if (!row.parentChannelId) return false;
+    membershipChannelId = row.parentChannelId;
+  } else if (row.channelType === "thread") {
     if (!row.parentMessageId) return false;
     const [parentMessage] = await executor
       .select({ channelId: messages.channelId })
@@ -370,6 +406,11 @@ async function executeMentionActionForRow(
   }
   if (row.notifiableAtSend || row.channelArchivedAt || row.channelDeletedAt) {
     return { ...base, status: "stale", reason: "no_longer_pending" };
+  }
+  // Agent Lounge: neither notify nor add reaches anyone there afterwards
+  // (another agent never; a person who has not joined, tygg #proj-chat:30a58e4d).
+  if (await resolveAgentLounge(row.channelId)) {
+    return { ...base, status: "no_permission", reason: row.targetType === "agent" ? "agent_lounge_outsider" : "agent_lounge_no_reminders" };
   }
   if (isExpiredMentionAction(row)) {
     return { ...base, status: "expired" };
@@ -430,7 +471,12 @@ async function executeMentionActionForRow(
   const db = getDb();
   let threadAddParentChannelId: string | null = null;
   let threadAddParentMessageId: string | null = null;
-  if (action === "add" && row.channelType === "thread") {
+  if (action === "add" && row.channelType === "task") {
+    if (!row.parentChannelId || !row.taskId) {
+      return { ...base, status: "stale", reason: "thread_parent_unavailable" };
+    }
+    threadAddParentChannelId = row.parentChannelId;
+  } else if (action === "add" && row.channelType === "thread") {
     if (!row.parentMessageId) {
       return { ...base, status: "stale", reason: "thread_parent_unavailable" };
     }
@@ -450,13 +496,31 @@ async function executeMentionActionForRow(
   const cutoff = new Date(Date.now() - PENDING_MENTION_TTL_MS);
   const dedupedResolutionIds = await db.transaction(async (tx) => {
     if (action === "add") {
-      const membershipChannelId = row.channelType === "thread" ? threadAddParentChannelId! : row.channelId;
+      // The users rows first (lockJointUsersFirst): the person added (their
+      // channel row, a joint's membership and admission name them) and the
+      // person adding (admitted_by), before the channel row: taken only by
+      // those rows' FK checks, after the channel, server and member rows, one
+      // closes a cycle with that person's account deletion (users row FOR
+      // UPDATE, then the servers they own). The adder retired or being
+      // deleted: as one without the authority to add.
+      const usersFirst = await lockJointUsersFirst(tx, {
+        actorUserId: actorType === "user" ? actorId : null,
+        userIds: row.targetType === "agent" ? [] : [row.targetId],
+      }).then(() => true, (err: unknown) => {
+        if (err instanceof JointActorUnavailableError) return false;
+        throw err;
+      });
+      if (!usersFirst) return null;
+      const membershipChannelId = isSubConversationRow(row) ? threadAddParentChannelId! : row.channelId;
       const [lockedChannel] = await tx
-        .select({ id: channels.id, archivedAt: channels.archivedAt, deletedAt: channels.deletedAt })
+        .select({ id: channels.id, type: channels.type, archivedAt: channels.archivedAt, deletedAt: channels.deletedAt })
         .from(channels)
         .where(and(eq(channels.id, membershipChannelId), eq(channels.serverId, serverId)))
         .for("update")
         .limit(1);
+      if (lockedChannel?.type === "joint") await lockComputedJointActor({ serverId, channelId: membershipChannelId,
+        actorType, actorId, humanSubjectIds: row.targetType === "agent" ? [] : [row.targetId],
+      },tx);
       const context = lockedChannel
         ? await resolveChannelActorContext(serverId, membershipChannelId, actorType, actorId, tx)
         : null;
@@ -469,7 +533,26 @@ async function executeMentionActionForRow(
       ) {
         return null;
       }
-      const joinedChannel = row.targetType === "agent"
+      // Match the member-management routes: the existing channel lock must
+      // precede source member and J locks. Ordinary/agent adds keep their old
+      // behavior and take no new joint-source admission locks.
+      let mirrorHumans: Awaited<ReturnType<typeof prepareJointHumanMembershipMirror>> | null = null;
+      if (row.targetType !== "agent" && lockedChannel.type === "joint") {
+        await lockJointHumanAdmissionSource(tx, serverId, [row.targetId]);
+        mirrorHumans = await prepareJointHumanMembershipMirror(tx, { channelIds: [membershipChannelId] }, "join");
+      }
+      // As addHuman: a current joint member is in the channel already
+      // (through any server), so nothing is written for the channel: no CH
+      // row, read position or source. A thread/task
+      // mention still follows that conversation below.
+      const jointMember = mirrorHumans?.coversChannel(membershipChannelId)
+        ? (await tx.execute<{ member: boolean }>(sql`SELECT EXISTS (
+            SELECT 1 FROM joint_channel_members m JOIN joint_channel_servers p ON p.joint_channel_id=m.joint_channel_id
+            WHERE p.local_channel_id=${membershipChannelId}::uuid AND m.user_id=${row.targetId}::uuid
+          ) AS member`)).rows[0]?.member === true
+        : false;
+      if (jointMember) mirrorHumans = null;
+      const joinedChannel = jointMember ? [] : row.targetType === "agent"
         ? await tx
           .insert(channelAgents)
           .values({ channelId: membershipChannelId, agentId: row.targetId })
@@ -489,10 +572,37 @@ async function executeMentionActionForRow(
           principalKind,
           row.targetId,
           membershipChannelId,
-          row.channelType === "thread" ? undefined : row.messageSeq - 1,
+          isSubConversationRow(row) ? undefined : row.messageSeq - 1,
         );
       }
-      if (row.channelType === "thread") {
+      // The person who acted admitted them; an agent is no person (admitted_by stays empty).
+      if (mirrorHumans) await mirrorHumans.apply([row.targetId], actorType === "user" ? { actorUserId: actorId } : {});
+      if (row.channelType === "task") {
+        // Task v2: joins the parent channel (above) and follows the task
+        // conversation just before the mention, like a thread.
+        await channelService.startReadPositionAtJoin(tx, principalKind, row.targetId, row.channelId, row.messageSeq - 1);
+        await tx
+          .insert(threadFollows)
+          .values({
+            threadChannelId: row.channelId,
+            followerType: row.targetType,
+            followerId: row.targetId,
+            parentMessageId: null,
+            parentTaskId: row.taskId!,
+            reason: "mentioned",
+          })
+          .onConflictDoUpdate({
+            target: [threadFollows.threadChannelId, threadFollows.followerType, threadFollows.followerId],
+            set: {
+              parentTaskId: row.taskId!,
+              reason: "mentioned",
+              doneAt: null,
+              unfollowedAt: null,
+              notificationLevel: refollowNotificationLevelSql,
+              createdAt: deliveredAt,
+            },
+          });
+      } else if (row.channelType === "thread") {
         await channelService.startReadPositionAtJoin(tx, principalKind, row.targetId, row.channelId, row.messageSeq - 1);
         await tx
           .insert(threadFollows)
@@ -510,6 +620,7 @@ async function executeMentionActionForRow(
               reason: "mentioned",
               doneAt: null,
               unfollowedAt: null,
+              notificationLevel: refollowNotificationLevelSql,
               createdAt: deliveredAt,
             },
           });
@@ -593,7 +704,7 @@ async function recordQueuedMentionActionFacts(
       receiverType: row.targetType,
       receiverId: row.targetId,
       serverId: row.serverId,
-      kind: row.channelType === "thread" ? "thread" : "channel",
+      kind: row.channelType === "thread" ? "thread" : row.channelType === "task" ? "task" : "channel",
       sourceChannelId: row.channelId,
       messageId: row.messageId,
       messageSeq: Number(row.messageSeq),

@@ -37,7 +37,7 @@ test("diagnostic activity kind uses structured detail kind instead of display te
     formatMessage,
   });
 
-  assert.match(info, /^Raft Diagnostic Info$/m);
+  assert.match(info, /^Raft diagnostic info$/m);
   assert.match(info, /^activityKind: running_command$/m);
   assert.doesNotMatch(info, /^activityKind: Localized or edited running-copy$/m);
 });
@@ -53,7 +53,7 @@ test("managed agent diagnostic text keeps its exact managed shape", () => {
     formatMessage,
   });
   assert.equal(info, [
-    "Raft Diagnostic Info",
+    "Raft diagnostic info",
     "reportedAtUtc: 1970-01-01T00:01:07.890Z",
     "serverId: server-1",
     "agentId: agent-1",

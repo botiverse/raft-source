@@ -5,6 +5,7 @@
 // the JSON transport. The Server still requires a `channelId`, so the target
 // is resolved first through `POST /resolve-channel`, exactly as the CLI does.
 
+import { foldAgentOneLineText } from "../agentMessageText";
 import { z } from "zod";
 import { lazySchema } from "../lazySchema";
 
@@ -294,7 +295,7 @@ export async function downloadAttachmentUrl(
     state: "url",
     data: { url, expiresAt, filename, mimeType },
     next: null,
-    text: `Download URL for ${filename} (${mimeType}), valid until ${expiresAt}:\n${url}`,
+    text: `Download URL for ${foldAgentOneLineText(filename)} (${mimeType}), valid until ${expiresAt}:\n${url}`,
   };
 }
 

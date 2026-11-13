@@ -1,3 +1,4 @@
+import { TASK_STATUSES } from "@botiverse/raft-shared";
 import { Timeline, TimelineContent, TimelineItem, TimelineTime, TimelineTitle } from "@botiverse/raft-ui";
 import type { TaskStatusId } from "@botiverse/raft-ui";
 import { useIntl } from "react-intl";
@@ -7,7 +8,7 @@ import type { TaskHistoryEvent, TaskStatus } from "../../store/taskStore";
 import { toRuiTaskStatus } from "./taskStatusUi";
 import { TimelineDetail, TimelineText } from "./TaskProperties";
 
-const TIMELINE_STATUSES: readonly string[] = ["todo", "in_progress", "in_review", "done", "closed"];
+const TIMELINE_STATUSES: readonly string[] = TASK_STATUSES;
 
 // Resolve the task status a history event is about, so the Timeline marker can
 // be painted from that status's own token. The rui Timeline reads the status's

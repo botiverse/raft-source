@@ -1,6 +1,7 @@
 import { eq, and, isNotNull, isNull, ne, lt, asc } from "drizzle-orm";
 import { getDb } from "../db/index";
 import { servers, agents } from "../db/schema";
+import { seatAgent } from "./agentMemberListPolicy";
 import { PLAN_CONFIG, DOWNGRADE_GRACE_PERIOD_DAYS, getEffectiveLimits, noopTracer, type Tracer } from "@botiverse/raft-shared";
 import { errorClassOf, getCurrentTraceContext, recordTraceEvent, runWithTraceSpan } from "../tracing/semanticTrace";
 import type { AgentOrchestrator } from "./agentOrchestrator";
@@ -94,9 +95,10 @@ async function enforceServerLimit(
         eq(agents.serverId, serverId),
         ne(agents.status, "inactive"),
         isNull(agents.deletedAt),
-        // App-owned bots do not count against the free agent limit (they are
-        // not a billable seat) and are not subject to downgrade stop.
-        isNull(agents.managedByAppInstallId),
+        // App-owned bots and personal assistants do not count against the
+        // free agent limit (they are not a billable seat) and are not subject
+        // to downgrade stop.
+        seatAgent(),
       ),
     )
     .orderBy(asc(agents.createdAt));

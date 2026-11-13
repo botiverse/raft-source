@@ -3,7 +3,7 @@ import { closeTestDatabase } from "../test/integration/database";
 import assert from "node:assert/strict";
 import { eq } from "drizzle-orm";
 import { getDb } from "../db/index";
-import { channels, messages, servers, users } from "../db/schema";
+import { agents, channels, messages, servers, users } from "../db/schema";
 import { getMessageContext, getMessageContextByShortId, listMessages, resolveMessageIdInServer, resolveMessageSeqAnchor } from "../services/messageService";
 import { resolveMessageInChannel } from "../services/taskService";
 import { classifyHistoryAroundCursor, paginateHistoryProbe } from "./historyCursor";
@@ -71,7 +71,13 @@ async function seedReminderMsgIdFixtures() {
     },
   ]);
 
-  return { server, agentId: "44444444-4444-4444-8444-444444444444" };
+  // A real agent of this server: channel reads are pinned to a live agent of the channel's server.
+  const [agent] = await db.insert(agents).values({
+    id: "44444444-4444-4444-8444-444444444444",
+    serverId: server.id,
+    name: "reminder-anchor-agent",
+  }).returning();
+  return { server, agentId: agent.id };
 }
 
 test("classifyHistoryAroundCursor distinguishes seq, short message ids, and full ids", () => {
@@ -199,6 +205,18 @@ test("resolveMessageSeqAnchor disambiguates 8-digit pagination seqs from around 
   assert.deepEqual(await resolveMessageSeqAnchor(channel.id, "123456789", "pagination"), {
     ok: true,
     seq: 123456789,
+  });
+
+  // An 8-digit `around` that is no message's short id is a seq: seqs passed
+  // 10M, and the "Older:"/"Newer:" lines print seqs that agents anchor on.
+  assert.deepEqual(await resolveMessageSeqAnchor(channel.id, "19852431", "around"), {
+    ok: true,
+    seq: 19852431,
+  });
+  // Other non-matching locators stay not found.
+  assert.deepEqual(await resolveMessageSeqAnchor(channel.id, "deadbeef", "around"), {
+    ok: false,
+    reason: "not_found",
   });
 
   // Suppress unused-var on `server` (matches the surrounding test pattern).

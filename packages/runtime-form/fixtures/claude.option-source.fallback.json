@@ -105,6 +105,17 @@
       ]
     },
     {
+      "value": "claude-fable-5-2",
+      "label": "Claude Fable 5.2",
+      "supportedReasoningEfforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ]
+    },
+    {
       "value": "claude-fable-5-1",
       "label": "Claude Fable 5.1",
       "supportedReasoningEfforts": [

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { vi } from "vitest";
 import {
   integrationAuditEvents,
   oauthAccessRequests,
@@ -6,6 +7,7 @@ import {
   oauthClients,
   oauthAgentAutoGrantBlocks,
   oauthGrants,
+  oauthUserConsents,
 } from "../db/schema";
 import {
   __resetOAuthServiceDbForTests,
@@ -15,10 +17,11 @@ import {
   HUMAN_AUTHORIZATION_CODE_TTL_MS,
   approveAccessRequest,
   createOAuthClient,
-  deleteOAuthClient,
+  deleteLockedOAuthClient,
   denyAccessRequest,
   exchangeAccessRequest,
   getIdentityByAccessToken,
+  lockDeletableOAuthClient,
   projectMarketplaceInstallBadge,
   requestOAuthClientPublish,
   requestOAuthClientUnpublish,
@@ -26,6 +29,25 @@ import {
   revokeGrant,
   updateOAuthClient,
 } from "./oauthService";
+import { __setCdnStorageForTests, resetStorageForTests, type StorageBackend } from "./storageService";
+
+// These tests pin each service's own queries against a scripted transaction.
+// "Require SSO" on App tokens (RFC 083 §6.2) reads its own tables and is
+// covered against a real database in routes/ssoEnforcement.api.test.ts.
+vi.mock("./sso/ssoEnforcement", () => ({
+  appTokenPassesSso: async () => true,
+}));
+// Prompt-text revisions (task #4) add queries of their own and are covered
+// against a real database in routes/appPromptText.api.test.ts.
+vi.mock("./appPromptTextService", () => ({
+  recordPromptTextEdit: async () => ({ kind: "unchanged" }),
+  ensureCurrentTextRevision: async () => ({ revisionId: "text-revision-1", text: { name: "", description: null, whenToUse: null } }),
+  currentTextConfirmation: async () => ({}),
+  promptTextConsentEnabled: async () => false,
+  promptTextConsentForWrite: async () => false,
+  resolveAgentFacingPromptText: async (_serverId: string, clients: Array<Record<string, unknown>>) =>
+    clients.map((client) => ({ ...client, promptText: { name: client.name, description: client.description ?? null, whenToUse: client.whenToUse ?? null } })),
+}));
 
 test("marketplace install badge projection pins count and publication-age boundaries", () => {
   const now = new Date("2026-08-19T12:00:00.000Z");
@@ -111,6 +133,9 @@ function makeInsertBuilder<T>(result: T, capture?: InsertCapture) {
     onConflictDoNothing() {
       return afterValues;
     },
+    onConflictDoUpdate() {
+      return afterValues;
+    },
     then(resolve: (value: T) => unknown, reject?: (reason: unknown) => unknown) {
       return Promise.resolve(result).then(resolve, reject);
     },
@@ -153,6 +178,10 @@ function makeTx(options: {
   const deletes = [...(options.deletes ?? [])];
 
   return {
+    // The advisory locks of oauthClientKeys.ts; nothing reads their result.
+    async execute() {
+      return { rows: [] };
+    },
     select() {
       const next = selects.shift();
       if (!next) throw new Error("Unexpected select");
@@ -178,6 +207,23 @@ function makeTx(options: {
     },
   };
 }
+
+/** exchangeAccessRequest's first read, the request's owner: an agent request names no person. */
+const AGENT_REQUEST_OWNER = { result: [{ userId: null }] };
+
+/** A person's code: their id, then their `users` row lock, taken before the request's. */
+function personRequestOwner(lock?: SelectCapture) {
+  return [{ result: [{ userId: "user-1" }] }, { result: [{ id: "user-1" }], capture: lock }];
+}
+
+/** The sign-in that asked for a person's code is still live (sessionService.isApprovingSessionLive). */
+const LIVE_APPROVING_SESSION = { result: [{ id: "family-1" }] };
+
+/** exchangeAccessRequest's live install re-check, for an app with no installation gate. */
+const SERVER_LOCAL_INSTALL_AVAILABILITY = { result: [{ appType: "server_local", installStatus: null }] };
+
+/** exchangeAccessRequest's login-mode read for a person's code (RFC 079 Q3): a server-mode App. */
+const SERVER_MODE_LOGIN = { result: [{ loginMode: "server" }] };
 
 function humanOpenIdIdentityRow() {
   return [{
@@ -223,6 +269,8 @@ test("createOAuthClient writes the client and success audit inside one transacti
   const clientInsertCapture: InsertCapture = {};
   const auditInsertCapture: InsertCapture = {};
   const tx = makeTx({
+    // claimOAuthClientKey: no App holds the key, and it has no alias row.
+    selects: [{ result: [] }, { result: [] }],
     inserts: [
       {
         result: [{
@@ -505,6 +553,7 @@ test("exchangeAccessRequest consumes remembered requests on first exchange", asy
   const auditInsertCapture: InsertCapture = {};
   const tx = makeTx({
     selects: [
+      AGENT_REQUEST_OWNER,
       {
         result: [{
           id: "request-1",
@@ -514,9 +563,12 @@ test("exchangeAccessRequest consumes remembered requests on first exchange", asy
           scopes: ["identity"],
           status: "approved",
           remember: true,
+          resolvedAt: new Date(),
           consumedAt: null,
         }],
       },
+      // The live installation re-check: a server-local app has none.
+      SERVER_LOCAL_INSTALL_AVAILABILITY,
       {
         result: [{
           id: "grant-1",
@@ -555,15 +607,18 @@ test("exchangeAccessRequest consumes remembered requests on first exchange", asy
 
 test("exchangeAccessRequest rejects remembered requests once already consumed", async () => {
   const tx = makeTx({
-    selects: [{
-      result: [{
-        id: "request-1",
-        clientId: "client-1",
-        status: "approved",
-        remember: true,
-        consumedAt: new Date(),
-      }],
-    }],
+    selects: [
+      AGENT_REQUEST_OWNER,
+      {
+        result: [{
+          id: "request-1",
+          clientId: "client-1",
+          status: "approved",
+          remember: true,
+          consumedAt: new Date(),
+        }],
+      },
+    ],
   });
 
   __setOAuthServiceDbForTests(() => ({
@@ -579,6 +634,7 @@ test("exchangeAccessRequest rejects remembered requests once already consumed", 
 test("exchangeAccessRequest rejects remembered requests when active grant is gone", async () => {
   const tx = makeTx({
     selects: [
+      AGENT_REQUEST_OWNER,
       {
         result: [{
           id: "request-1",
@@ -588,9 +644,12 @@ test("exchangeAccessRequest rejects remembered requests when active grant is gon
           scopes: ["identity"],
           status: "approved",
           remember: true,
+          resolvedAt: new Date(),
           consumedAt: null,
         }],
       },
+      // The live installation re-check: a server-local app has none.
+      SERVER_LOCAL_INSTALL_AVAILABILITY,
       { result: [] },
     ],
   });
@@ -605,11 +664,13 @@ test("exchangeAccessRequest rejects remembered requests when active grant is gon
   );
 });
 
-test("exchangeAccessRequest mints human tokens without requiring an agent grant", async () => {
+test("exchangeAccessRequest mints human tokens without requiring an agent grant and records the person's consent", async () => {
   const tokenInsertCapture: InsertCapture = {};
+  const consentInsertCapture: InsertCapture = {};
   const auditInsertCapture: InsertCapture = {};
   const tx = makeTx({
     selects: [
+      ...personRequestOwner(),
       {
         result: [{
           id: "request-1",
@@ -618,6 +679,7 @@ test("exchangeAccessRequest mints human tokens without requiring an agent grant"
           principalType: "human",
           agentId: null,
           userId: "user-1",
+          approverSessionFamilyId: "family-1",
           scopes: ["openid", "profile"],
           status: "approved",
           remember: false,
@@ -625,10 +687,15 @@ test("exchangeAccessRequest mints human tokens without requiring an agent grant"
           createdAt: new Date("2026-07-21T00:00:00.000Z"),
         }],
       },
+      LIVE_APPROVING_SESSION,
+      // The live installation re-check: a server-local app has none.
+      SERVER_MODE_LOGIN,
+      SERVER_LOCAL_INSTALL_AVAILABILITY,
       { result: humanOpenIdIdentityRow() },
     ],
     inserts: [
       { result: [{ id: "token-1" }], capture: tokenInsertCapture },
+      { result: [{ id: "consent-1" }], capture: consentInsertCapture },
       { result: [{ id: "audit-1" }], capture: auditInsertCapture },
     ],
     updates: [{ result: undefined }],
@@ -648,6 +715,11 @@ test("exchangeAccessRequest mints human tokens without requiring an agent grant"
   assert.equal(tokenInsertCapture.values?.principalType, "human");
   assert.equal(tokenInsertCapture.values?.agentId, null);
   assert.equal(tokenInsertCapture.values?.userId, "user-1");
+  assert.equal(consentInsertCapture.table, oauthUserConsents);
+  assert.deepEqual(
+    { userId: consentInsertCapture.values?.userId, serverId: consentInsertCapture.values?.serverId, clientId: consentInsertCapture.values?.clientId, scopes: consentInsertCapture.values?.scopes, source: consentInsertCapture.values?.source },
+    { userId: "user-1", serverId: "server-1", clientId: "client-1", scopes: ["openid", "profile"], source: "login" },
+  );
   assert.equal(result.identity?.humanId, "user-1");
   assert.equal(auditInsertCapture.table, integrationAuditEvents);
   assert.deepEqual(auditInsertCapture.values?.metadata, {
@@ -664,6 +736,7 @@ test("exchangeAccessRequest accepts human authorization codes at the TTL boundar
   const consumeCapture: UpdateCapture = {};
   const tx = makeTx({
     selects: [
+      ...personRequestOwner(),
       {
         result: [{
           id: "request-1",
@@ -672,6 +745,7 @@ test("exchangeAccessRequest accepts human authorization codes at the TTL boundar
           principalType: "human",
           agentId: null,
           userId: "user-1",
+          approverSessionFamilyId: "family-1",
           scopes: ["openid", "profile"],
           status: "approved",
           remember: false,
@@ -679,10 +753,15 @@ test("exchangeAccessRequest accepts human authorization codes at the TTL boundar
           createdAt: new Date(boundary.getTime() - HUMAN_AUTHORIZATION_CODE_TTL_MS),
         }],
       },
+      LIVE_APPROVING_SESSION,
+      // The live installation re-check: a server-local app has none.
+      SERVER_MODE_LOGIN,
+      SERVER_LOCAL_INSTALL_AVAILABILITY,
       { result: humanOpenIdIdentityRow() },
     ],
     inserts: [
       { result: [{ id: "token-1" }], capture: tokenInsertCapture },
+      { result: [{ id: "consent-1" }] },
       { result: [{ id: "audit-1" }], capture: auditInsertCapture },
     ],
     updates: [{ result: undefined, capture: consumeCapture }],
@@ -711,21 +790,25 @@ test("exchangeAccessRequest accepts human authorization codes at the TTL boundar
 test("exchangeAccessRequest rejects expired unused human authorization codes", async () => {
   const now = new Date("2026-07-21T00:10:00.001Z");
   const tx = makeTx({
-    selects: [{
-      result: [{
-        id: "request-1",
-        clientId: "client-1",
-        serverId: "server-1",
-        principalType: "human",
-        agentId: null,
-        userId: "user-1",
-        scopes: ["openid", "profile"],
-        status: "approved",
-        remember: false,
-        consumedAt: null,
-        createdAt: new Date(now.getTime() - HUMAN_AUTHORIZATION_CODE_TTL_MS - 1),
-      }],
-    }],
+    selects: [
+      ...personRequestOwner(),
+      {
+        result: [{
+          id: "request-1",
+          clientId: "client-1",
+          serverId: "server-1",
+          principalType: "human",
+          agentId: null,
+          userId: "user-1",
+          approverSessionFamilyId: "family-1",
+          scopes: ["openid", "profile"],
+          status: "approved",
+          remember: false,
+          consumedAt: null,
+          createdAt: new Date(now.getTime() - HUMAN_AUTHORIZATION_CODE_TTL_MS - 1),
+        }],
+      },
+    ],
   });
 
   __setOAuthServiceDbForTests(() => ({
@@ -741,21 +824,25 @@ test("exchangeAccessRequest rejects expired unused human authorization codes", a
 test("exchangeAccessRequest keeps consumed replay ordering before human authorization expiry", async () => {
   const now = new Date("2026-07-21T00:10:00.001Z");
   const tx = makeTx({
-    selects: [{
-      result: [{
-        id: "request-1",
-        clientId: "client-1",
-        serverId: "server-1",
-        principalType: "human",
-        agentId: null,
-        userId: "user-1",
-        scopes: ["openid", "profile"],
-        status: "approved",
-        remember: false,
-        consumedAt: new Date("2026-07-21T00:00:30.000Z"),
-        createdAt: new Date(now.getTime() - HUMAN_AUTHORIZATION_CODE_TTL_MS - 1),
-      }],
-    }],
+    selects: [
+      ...personRequestOwner(),
+      {
+        result: [{
+          id: "request-1",
+          clientId: "client-1",
+          serverId: "server-1",
+          principalType: "human",
+          agentId: null,
+          userId: "user-1",
+          approverSessionFamilyId: "family-1",
+          scopes: ["openid", "profile"],
+          status: "approved",
+          remember: false,
+          consumedAt: new Date("2026-07-21T00:00:30.000Z"),
+          createdAt: new Date(now.getTime() - HUMAN_AUTHORIZATION_CODE_TTL_MS - 1),
+        }],
+      },
+    ],
   });
 
   __setOAuthServiceDbForTests(() => ({
@@ -774,6 +861,7 @@ test("exchangeAccessRequest tolerates modest future clock skew for human authori
   const auditInsertCapture: InsertCapture = {};
   const tx = makeTx({
     selects: [
+      ...personRequestOwner(),
       {
         result: [{
           id: "request-1",
@@ -782,6 +870,7 @@ test("exchangeAccessRequest tolerates modest future clock skew for human authori
           principalType: "human",
           agentId: null,
           userId: "user-1",
+          approverSessionFamilyId: "family-1",
           scopes: ["openid", "profile"],
           status: "approved",
           remember: false,
@@ -789,10 +878,15 @@ test("exchangeAccessRequest tolerates modest future clock skew for human authori
           createdAt: new Date(now.getTime() + 30_000),
         }],
       },
+      LIVE_APPROVING_SESSION,
+      // The live installation re-check: a server-local app has none.
+      SERVER_MODE_LOGIN,
+      SERVER_LOCAL_INSTALL_AVAILABILITY,
       { result: humanOpenIdIdentityRow() },
     ],
     inserts: [
       { result: [{ id: "token-1" }], capture: tokenInsertCapture },
+      { result: [{ id: "consent-1" }] },
       { result: [{ id: "audit-1" }], capture: auditInsertCapture },
     ],
     updates: [{ result: undefined }],
@@ -806,6 +900,45 @@ test("exchangeAccessRequest tolerates modest future clock skew for human authori
 
   assert.equal(tokenInsertCapture.table, oauthAccessTokens);
   assert.equal(auditInsertCapture.table, integrationAuditEvents);
+});
+
+test("exchangeAccessRequest takes the person's row before the request's and refuses a code whose sign-in is gone before anything is written", async () => {
+  const now = new Date("2026-07-21T00:05:00.000Z");
+  const userLock: SelectCapture = {};
+  const requestLock: SelectCapture = {};
+  const tx = makeTx({
+    selects: [
+      ...personRequestOwner(userLock),
+      {
+        result: [{
+          id: "request-1",
+          clientId: "client-1",
+          serverId: "server-1",
+          principalType: "human",
+          agentId: null,
+          userId: "user-1",
+          approverSessionFamilyId: "family-1",
+          scopes: ["openid", "profile"],
+          status: "approved",
+          remember: false,
+          consumedAt: null,
+          createdAt: new Date(now.getTime() - 60_000),
+        }],
+        capture: requestLock,
+      },
+      // The sign-in that asked for it is no longer live.
+      { result: [] },
+    ],
+  });
+
+  __setOAuthServiceDbForTests(() => ({
+    transaction: async (fn: (arg: typeof tx) => Promise<unknown>) => fn(tx),
+  }) as any);
+
+  // No insert or update is scripted: any write would fail differently.
+  await assert.rejects(() => exchangeAccessRequest({ clientId: "client-1", requestId: "request-1", now }), /^Error: access_denied$/);
+  assert.equal(userLock.lockMode, "key share");
+  assert.equal(requestLock.lockMode, "update");
 });
 
 test("revokeGrant also revokes outstanding access tokens and blocks automatic re-grants", async () => {
@@ -866,7 +999,7 @@ test("revokeGrant ignores grants outside the caller server", async () => {
   assert.equal(result, null);
 });
 
-test("deleteOAuthClient locks the client row, revokes active grants and tokens, then deletes the client", async () => {
+test("App deletion locks the client row, then revokes active grants and tokens and deletes the client in the same transaction, leaving the logo object for after commit", async () => {
   const selectCapture: SelectCapture = {};
   const grantUpdateCapture: UpdateCapture = {};
   const tokenUpdateCapture: UpdateCapture = {};
@@ -880,8 +1013,16 @@ test("deleteOAuthClient locks the client row, revokes active grants and tokens, 
         clientId: "demo-client",
         appType: "server_local",
         publishStatus: "private",
+        logoStorageKey: "integration-logos/client-1/old.webp",
       }],
       capture: selectCapture,
+    }, {
+      // deleteLockedOAuthClient reads the App's installations to uninstall
+      // their Bots first (#11998); this App has none.
+      result: [],
+    }, {
+      // lockDeletedOAuthClientKey: never used, so its key isn't reserved.
+      result: [{ firstUsedAt: null }],
     }],
     updates: [
       { result: undefined, capture: grantUpdateCapture },
@@ -900,20 +1041,25 @@ test("deleteOAuthClient locks the client row, revokes active grants and tokens, 
     }],
   });
 
-  __setOAuthServiceDbForTests(() => ({
-    transaction: async (fn: (arg: typeof tx) => Promise<unknown>) => fn(tx),
-  }) as any);
-
-  const result = await deleteOAuthClient({ serverId: "server-1", clientId: "client-1" });
-
+  const storageDeletes: string[] = [];
+  __setCdnStorageForTests({ delete: async (key: string) => { storageDeletes.push(key); } } as unknown as StorageBackend);
+  // The route clears the App's bot avatars (agentService.syncAppBotAvatarsToLogo)
+  // between the two steps, in the same transaction.
+  const locked = await lockDeletableOAuthClient(tx as any, { serverId: "server-1", clientId: "client-1" });
   assert.equal(selectCapture.lockMode, "update");
+  assert.ok(locked);
+  const result = await deleteLockedOAuthClient(tx as any, locked, { serverId: "server-1" }).finally(resetStorageForTests);
+
   assert.equal(grantUpdateCapture.table, oauthGrants);
   assert.ok(grantUpdateCapture.values?.revokedAt instanceof Date);
   assert.equal(tokenUpdateCapture.table, oauthAccessTokens);
   assert.ok(tokenUpdateCapture.values?.revokedAt instanceof Date);
   assert.equal(auditInsertCapture.table, integrationAuditEvents);
   assert.equal(clientDeleteCapture.table, oauthClients);
-  assert.equal(result?.id, "client-1");
+  assert.equal(result.client.id, "client-1");
+  // Inside the (uncommitted) transaction the logo object stays: the route deletes it after commit.
+  assert.equal(result.staleLogoStorageKey, "integration-logos/client-1/old.webp");
+  assert.deepEqual(storageDeletes, []);
 });
 
 test("getIdentityByAccessToken rejects tokens whose parent grant was revoked", async () => {

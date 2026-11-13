@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import {
   HOST_ACCESS_TOKEN_UPDATED_EVENT,
   accessTokenSubject,
+  isAccessTokenExpired,
   createHostAccessTokenSync,
   hostAccessTokenSurfaceForPathname,
   parseHostAccessTokenBinding,
@@ -83,7 +84,10 @@ test("every native host surface shares the same path classifier", () => {
   assert.equal(hostAccessTokenSurfaceForPathname("/s/dev/agent/agent-1/"), "agent");
   assert.equal(hostAccessTokenSurfaceForPathname("/agent/agent-1"), "agent");
   assert.equal(hostAccessTokenSurfaceForPathname("/s/dev/agent"), null);
+  assert.equal(hostAccessTokenSurfaceForPathname("/s/dev/agent/agent-1/activity"), "agent");
+  assert.equal(hostAccessTokenSurfaceForPathname("/agent/agent-1/activity"), "agent");
   assert.equal(hostAccessTokenSurfaceForPathname("/s/dev/agent/agent-1/extra"), null);
+  assert.equal(hostAccessTokenSurfaceForPathname("/s/dev/agent/agent-1/activity/extra"), null);
   assert.equal(hostAccessTokenSurfaceForPathname("/s/dev/agents/agent-1"), null);
 });
 
@@ -271,4 +275,27 @@ test("JWT subject fallback accepts only access-token claims", () => {
   assert.equal(accessTokenSubject(`x.${encode({ sub: "account-1", type: "access" })}.x`), "account-1");
   assert.equal(accessTokenSubject(`x.${encode({ sub: "account-1", type: "refresh" })}.x`), null);
   assert.equal(accessTokenSubject("not-a-jwt"), null);
+});
+
+function jwtWith(claims: Record<string, unknown>): string {
+  const b64 = (value: unknown) => btoa(JSON.stringify(value)).replace(/=+$/, "").replace(/\+/g, "-").replace(/\//g, "_");
+  return `${b64({ alg: "HS256", typ: "JWT" })}.${b64(claims)}.signature`;
+}
+
+test("isAccessTokenExpired reads exp, with a skew before the real expiry", () => {
+  const now = 1_800_000_000_000;
+  const token = (expSecondsFromNow: number) => jwtWith({ sub: "u", type: "access", exp: now / 1000 + expSecondsFromNow });
+  assert.equal(isAccessTokenExpired(token(-1), now), true);
+  assert.equal(isAccessTokenExpired(token(10), now), true, "inside the 30s skew counts as expired");
+  assert.equal(isAccessTokenExpired(token(600), now), false);
+  assert.equal(isAccessTokenExpired(token(10), now, 0), false);
+});
+
+test("isAccessTokenExpired treats an unreadable or exp-less token as not expired", () => {
+  const now = 1_800_000_000_000;
+  assert.equal(isAccessTokenExpired(null, now), false);
+  assert.equal(isAccessTokenExpired("not-a-jwt", now), false);
+  assert.equal(isAccessTokenExpired("a.%%%.c", now), false);
+  assert.equal(isAccessTokenExpired(jwtWith({ sub: "u", type: "access" }), now), false);
+  assert.equal(isAccessTokenExpired(jwtWith({ sub: "u", exp: "soon" }), now), false);
 });

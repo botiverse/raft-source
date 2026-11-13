@@ -64,9 +64,8 @@ export function useComposerAutosize(
     resizeRafRef.current = 0;
   }, []);
 
-  useEffect(() => () => {
-    if (resizeRafRef.current !== 0) cancelAnimationFrame(resizeRafRef.current);
-  }, []);
+  // Reset the id as well as cancelling: StrictMode replays mount effects.
+  useEffect(() => cancelScheduledAutoResize, [cancelScheduledAutoResize]);
 
   // Width changes (panel resize, breakpoint) change both wrap points and the
   // effective min-height style — re-measure with the cache invalidated. Height

@@ -29,7 +29,9 @@ import {
   drainAppNotificationDeliveries,
   emitAppFacingMemberEvents,
   emitAppFacingNotificationEvent,
+  emitAppInstallationNotificationEvent,
 } from "./appNotificationDeliveryService";
+import { deriveAppBotHandle } from "./appBotIdentityService";
 import { __setAppMemberRefKeyForTests, deriveAppMemberRef } from "./appOutboundProjectionService";
 import {
   __resetOAuthServiceDbForTests,
@@ -585,6 +587,55 @@ test("a Server deletion's member removals still deliver after the tombstone; oth
   }
 });
 
+test("a member event queued about an agent is not delivered once that agent is a personal assistant", async () => {
+  const { client, db } = await createTestDb();
+  __setAppWebhookEncryptionKeyForTests(Buffer.alloc(32, 9));
+  __setAppMemberRefKeyForTests(Buffer.alloc(32, 7));
+  __setOAuthServiceDbForTests(() => db);
+  try {
+    await configureAppWebhook({ clientId: CLIENT_ID, actorUserId: USER_ID, endpointUrl: "https://hooks.example.com/raft" }, db);
+    await subscribeToMemberRemoved(db);
+    const ordinaryId = "66666666-6666-4666-8666-666666666601";
+    const assistantId = "66666666-6666-4666-8666-666666666602";
+    await db.insert(agents).values([
+      { id: ordinaryId, serverId: SERVER_ID, name: "queued-ordinary" },
+      { id: assistantId, serverId: SERVER_ID, name: "queued-assistant" },
+    ]);
+    const emitted = await emitAppFacingMemberEvents({
+      serverId: SERVER_ID,
+      eventType: "server.member_removed",
+      members: [ordinaryId, assistantId].map((principalId) => ({ principalType: "agent" as const, principalId, role: "member" })),
+      provenance: { source: "agent_service", actor_type: "human", reason: "removed" },
+    }, db);
+    assert.equal(emitted.eventCount, 2);
+    // Marked after queueing (createMyAssistant marks its row after the insert).
+    await db.update(agents).set({ assistantOwnerUserId: USER_ID }).where(eq(agents.id, assistantId));
+
+    const refs: string[] = [];
+    assert.deepEqual(await drainAppNotificationDeliveries({
+      executor: db,
+      post: async ({ body }) => {
+        refs.push((JSON.parse(body) as { event: { subject: { member_ref: string } } }).event.subject.member_ref);
+        return { status: 204 };
+      },
+    }), { claimed: 2, delivered: 1, retried: 0, suppressed: 1, deadLettered: 0 });
+    assert.deepEqual(refs, [deriveAppMemberRef({ clientId: CLIENT_ID, installationId: INSTALLATION_ID, principalId: ordinaryId }).member_ref]);
+
+    // And a new event about it is not written at all.
+    assert.deepEqual(await emitAppFacingMemberEvents({
+      serverId: SERVER_ID,
+      eventType: "server.member_removed",
+      members: [{ principalType: "agent", principalId: assistantId, role: "member" }],
+      provenance: { source: "agent_service", actor_type: "human", reason: "removed" },
+    }, db), { eventCount: 0, recipientCount: 0 });
+  } finally {
+    __resetOAuthServiceDbForTests();
+    __setAppWebhookEncryptionKeyForTests(null);
+    __setAppMemberRefKeyForTests(null);
+    await client.close();
+  }
+});
+
 test("announcing a large Server's deletion stays a few bulk writes", async () => {
   const { client, db } = await createTestDb();
   __setAppWebhookEncryptionKeyForTests(Buffer.alloc(32, 9));
@@ -610,6 +661,133 @@ test("announcing a large Server's deletion stays a few bulk writes", async () =>
     assert.ok(elapsedMs < 20_000, `5000 member events took ${Math.round(elapsedMs)}ms`);
   } finally {
     __resetOAuthServiceDbForTests();
+    __setAppWebhookEncryptionKeyForTests(null);
+    await client.close();
+  }
+});
+
+// Tenny's conditions for installation.bot_changed (#proj-apps #35): it goes
+// only to the installation it is about, needs no group, is never delivered to
+// a suspended installation, and no other event can use its subject to skip
+// groups. The registry half is pinned in packages/shared appNotifications.test.ts.
+test("an installation event reaches only its own installation, needs no group, and never a suspended one", async () => {
+  const { client, db } = await createTestDb();
+  __setAppWebhookEncryptionKeyForTests(Buffer.alloc(32, 9));
+  const OTHER_CLIENT_ID = "cdcdcdcd-cdcd-4dcd-8dcd-cdcdcdcdcdcd";
+  const OTHER_INSTALLATION_ID = "dededede-dede-4ede-8ede-dededededede";
+  try {
+    // Another App on the same Server, with no groups declared or approved.
+    await db.insert(oauthClients).values({
+      id: OTHER_CLIENT_ID,
+      serverId: SERVER_ID,
+      clientId: "outbound-other-app",
+      clientSecretHash: "test",
+      appType: "third_party_global",
+      name: "Outbound Other App",
+      publishStatus: "published",
+      createdByUserId: USER_ID,
+    });
+    await db.insert(oauthClientInstalls).values({
+      id: OTHER_INSTALLATION_ID,
+      serverId: SERVER_ID,
+      clientId: OTHER_CLIENT_ID,
+      installedByUserId: USER_ID,
+      subscribedEvents: ["installation.bot_changed"],
+    });
+    await db.update(oauthClientInstalls).set({
+      subscribedEvents: ["installation.bot_changed", "server.config_updated", "server.public_channel_created"],
+    }).where(eq(oauthClientInstalls.id, INSTALLATION_ID));
+    for (const clientId of [CLIENT_ID, OTHER_CLIENT_ID]) {
+      await configureAppWebhook({ clientId, actorUserId: USER_ID, endpointUrl: "https://hooks.example.com/raft" }, db);
+    }
+    const posts: Array<{ installation_id: string; event: { type: string; subject: unknown; data?: unknown } }> = [];
+    const drain = () => drainAppNotificationDeliveries({
+      executor: db,
+      post: async ({ body }) => {
+        posts.push(JSON.parse(body));
+        return { status: 204 };
+      },
+    });
+    const recipientsOf = async (eventId: string) => (await db.select({ id: notificationRecipients.recipientId })
+      .from(notificationRecipients).where(eq(notificationRecipients.eventId, eventId))).map((row) => row.id);
+
+    // Both installations subscribe; the event about one reaches that one only.
+    const own = await emitAppInstallationNotificationEvent({
+      eventType: "installation.bot_changed",
+      installation: { id: INSTALLATION_ID, serverId: SERVER_ID },
+    }, db);
+    assert.equal(own.recipientCount, 1);
+    assert.deepEqual(await recipientsOf(own.eventId), [INSTALLATION_ID]);
+    // No group: the other App's installation, approved none, gets its own.
+    const groupless = await emitAppInstallationNotificationEvent({
+      eventType: "installation.bot_changed",
+      installation: { id: OTHER_INSTALLATION_ID, serverId: SERVER_ID },
+    }, db);
+    assert.deepEqual(await recipientsOf(groupless.eventId), [OTHER_INSTALLATION_ID]);
+    assert.deepEqual(await drain(), { claimed: 2, delivered: 2, retried: 0, suppressed: 0, deadLettered: 0 });
+    assert.deepEqual(posts.map((post) => [post.installation_id, post.event.subject]).sort(), [
+      [INSTALLATION_ID, { type: "installation", id: INSTALLATION_ID }],
+      [OTHER_INSTALLATION_ID, { type: "installation", id: OTHER_INSTALLATION_ID }],
+    ].sort());
+    const ownPost = posts.find((post) => post.installation_id === INSTALLATION_ID)!;
+    assert.deepEqual(ownPost.event.data, { state: "not_added", handle: deriveAppBotHandle("outbound-test-app") });
+
+    // A row addressed to another App's installation, and a group-gated event
+    // type wearing the installation subject, are both suppressed at send.
+    const forgedEvent = await emitAppInstallationNotificationEvent({
+      eventType: "installation.bot_changed",
+      installation: { id: INSTALLATION_ID, serverId: SERVER_ID },
+    }, db);
+    const [crossRecipient] = await db.insert(notificationRecipients).values({
+      eventId: forgedEvent.eventId, serverId: SERVER_ID, recipientType: "app_installation", recipientId: OTHER_INSTALLATION_ID,
+    }).returning();
+    await db.insert(notificationDeliveries).values({
+      notificationId: crossRecipient!.id, adapter: "webhook", configRevision: 1, grantRevision: 0, subscriptionRevision: 0,
+    });
+    const [borrowed] = await db.insert(notificationEvents).values({
+      serverId: SERVER_ID, eventType: "server.config_updated", requiredGroups: [], subjectType: "installation",
+      subjectId: INSTALLATION_ID, occurredAt: new Date(),
+    }).returning();
+    const [borrowedRecipient] = await db.insert(notificationRecipients).values({
+      eventId: borrowed!.id, serverId: SERVER_ID, recipientType: "app_installation", recipientId: INSTALLATION_ID,
+    }).returning();
+    await db.insert(notificationDeliveries).values({
+      notificationId: borrowedRecipient!.id, adapter: "webhook", configRevision: 1, grantRevision: 1, subscriptionRevision: 1,
+    });
+    posts.length = 0;
+    assert.deepEqual(await drain(), { claimed: 3, delivered: 1, retried: 0, suppressed: 2, deadLettered: 0 });
+    assert.deepEqual(posts.map((post) => [post.installation_id, post.event.type]), [[INSTALLATION_ID, "installation.bot_changed"]]);
+
+    // The emitters refuse to mix the two kinds.
+    await assert.rejects(emitAppInstallationNotificationEvent({
+      eventType: "server.config_updated" as never,
+      installation: { id: INSTALLATION_ID, serverId: SERVER_ID },
+    }, db), AppNotificationDeliveryError);
+    await assert.rejects(emitAppFacingNotificationEvent({
+      serverId: SERVER_ID, eventType: "installation.bot_changed" as never, subjectType: "installation" as never, subjectId: INSTALLATION_ID,
+    }, db), AppNotificationDeliveryError);
+    await assert.rejects(emitAppFacingNotificationEvent({
+      serverId: SERVER_ID, eventType: "server.config_updated", subjectType: "channel", subjectId: SERVER_ID,
+    }, db), /subject does not match/);
+
+    // Suspended: queued before, suppressed at send; emitted during, no recipient.
+    await emitAppInstallationNotificationEvent({
+      eventType: "installation.bot_changed",
+      installation: { id: INSTALLATION_ID, serverId: SERVER_ID },
+    }, db);
+    await db.update(oauthClientInstalls).set({ status: "suspended" }).where(eq(oauthClientInstalls.id, INSTALLATION_ID));
+    posts.length = 0;
+    assert.deepEqual(await drain(), { claimed: 1, delivered: 0, retried: 0, suppressed: 1, deadLettered: 0 });
+    const duringSuspension = await emitAppInstallationNotificationEvent({
+      eventType: "installation.bot_changed",
+      installation: { id: INSTALLATION_ID, serverId: SERVER_ID },
+    }, db);
+    assert.equal(duringSuspension.recipientCount, 0);
+    assert.equal((await db.select().from(notificationEvents).where(eq(notificationEvents.id, duringSuspension.eventId))).length, 1,
+      "the event row is still written with the change");
+    assert.deepEqual(await drain(), { claimed: 0, delivered: 0, retried: 0, suppressed: 0, deadLettered: 0 });
+    assert.equal(posts.length, 0);
+  } finally {
     __setAppWebhookEncryptionKeyForTests(null);
     await client.close();
   }

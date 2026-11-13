@@ -4,6 +4,7 @@ import { sql } from "drizzle-orm";
 import { getDb } from "./index";
 import {
   evaluatePostMigrationIndexes,
+  indexKeysFromDefinition,
   POST_MIGRATION_INDEXES,
   postMigrationIndexRemedy,
   readObservedIndexes,
@@ -78,6 +79,41 @@ test("an index matches on table, ordered columns, uniqueness and predicate, neve
   assert.ok(both?.state === "ok" && both.matchedName === sender.name);
 });
 
+const activity = POST_MIGRATION_INDEXES.find((spec) => spec.name === "idx_tasks_channel_activity")!;
+const created = POST_MIGRATION_INDEXES.find((spec) => spec.name === "idx_tasks_channel_created")!;
+
+test("a spec with keys matches the whole key list, expressions and order included, ignoring whitespace", () => {
+  assert.equal(
+    indexKeysFromDefinition("CREATE INDEX idx_tasks_channel_activity ON public.tasks USING btree (channel_id, COALESCE(last_activity_at, updated_at) DESC, id DESC)"),
+    "channel_id, COALESCE(last_activity_at, updated_at) DESC, id DESC",
+  );
+  assert.equal(
+    indexKeysFromDefinition("CREATE UNIQUE INDEX x ON public.t USING btree (a, lower(b)) WHERE (c IS NOT NULL)"),
+    "a, lower(b)",
+  );
+  assert.equal(indexKeysFromDefinition("not an index definition"), null);
+
+  const withKeys = (spec: PostMigrationIndexSpec, keys: string | null) => observed(spec, { keys });
+  assert.equal(evaluatePostMigrationIndexes([withKeys(activity, activity.keys!)], [activity])[0]?.state, "ok");
+  assert.equal(
+    evaluatePostMigrationIndexes([withKeys(activity, "channel_id,COALESCE(last_activity_at,  updated_at) DESC,id DESC")], [activity])[0]?.state,
+    "ok",
+    "whitespace does not matter",
+  );
+  // Plain columns alone ([channel_id, id]) would accept any expression between them.
+  for (const keys of [
+    "channel_id, COALESCE(updated_at, last_activity_at) DESC, id DESC",
+    "channel_id, updated_at DESC, id DESC",
+    "channel_id, COALESCE(last_activity_at, updated_at), id",
+    null,
+  ]) {
+    assert.equal(evaluatePostMigrationIndexes([withKeys(activity, keys)], [activity])[0]?.state, "missing", String(keys));
+  }
+  // An ascending created_at has the same columns, not the same index.
+  assert.equal(evaluatePostMigrationIndexes([withKeys(created, "channel_id, created_at, id")], [created])[0]?.state, "missing");
+  assert.equal(evaluatePostMigrationIndexes([withKeys(created, created.keys!)], [created])[0]?.state, "ok");
+});
+
 test("the catalog is read from pg_index on a migrated database", async ({ db: _db }) => {
   // The test database speaks drizzle, not pg.Pool: inline the one array parameter.
   const query = async (text: string, values?: unknown[]) => {
@@ -112,4 +148,15 @@ test("the catalog is read from pg_index on a migrated database", async ({ db: _d
   // The real catalog reads without error; every entry resolves to a state.
   const states = evaluatePostMigrationIndexes(await readObservedIndexes(query));
   assert.equal(states.length, POST_MIGRATION_INDEXES.length);
+
+  // The tasks sort indexes the migration built: their definitions as
+  // PostgreSQL prints them, which is what the keys specs compare against.
+  const observedTasks = await readObservedIndexes(query, [activity, created]);
+  assert.deepEqual(
+    ["idx_tasks_channel_activity", "idx_tasks_channel_created"].map((name) => observedTasks.find((index) => index.name === name)?.keys),
+    ["channel_id, COALESCE(last_activity_at, updated_at) DESC, id DESC", "channel_id, created_at DESC, id DESC"],
+  );
+  for (const state of evaluatePostMigrationIndexes(observedTasks, [activity, created])) {
+    assert.equal(state.state, "ok", state.spec.name);
+  }
 });

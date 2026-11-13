@@ -8,7 +8,7 @@ import { getDb } from "../db/index";
 import { users } from "../db/schema";
 import { machineDuplicateConnectionActionsTotal, machineDuplicateConnectionsTotal, machineOwnerRefreshTotal } from "../metrics";
 import type { MachineReplicaRefreshResult } from "../replicaRouter";
-import { AgentOrchestrator, reportedHostnameHash } from "./agentOrchestrator";
+import { AgentOrchestrator, daemonLacksDuplicateReconnectDelay, reportedHostnameHash } from "./agentOrchestrator";
 import { registerMachine } from "./machineService";
 import type { ReplicaStateStore } from "./replicaStateStore";
 import { createServer } from "./serverService";
@@ -40,6 +40,9 @@ function makeStore(refresh: () => Promise<MachineReplicaRefreshResult>): Replica
     compareAndSetWakeCrashLoopState: async () => true,
     setAgentRuntimeError: async () => {},
     getAgentRuntimeError: async () => null,
+    setAgentContextViewAvailability: async () => {},
+    getAgentContextViewAvailability: async () => null,
+    clearAgentContextViewAvailability: async () => {},
     setMachineMeta: async () => {},
     getMachineMeta: async () => null,
     clearMachineMeta: async () => {},
@@ -623,5 +626,85 @@ test("task #374: `ready` records the daemon identity and a hash of its reported 
   assert.equal(conn.daemonInstanceId, "inst-ready");
   assert.equal(conn.reportedHostnameHash, reportedHostnameHash("tenant-laptop"));
   assert.match(conn.reportedHostnameHash ?? "", /^[0-9a-f]{12}$/);
+  await orchestrator.shutdown();
+});
+
+test("task #374: the handshake check refuses a held duplicate (counted, hold extended) only while enforcement is on", async ({ db: _db }) => {
+  const { machineId } = await seedMachine("handshake");
+  const { state, clock } = controlledClock();
+  const touched: number[] = [];
+  // The winner last renewed 10 s ago; the lease does not move unless it renews.
+  const winnerRenewedAt = state.now - 10_000;
+  const store = holdStore({
+    lease: () => ({ replicaId: "replica-other", generation: "gen-winner", updatedAtMs: winnerRenewedAt }),
+    hold: { replicaId: "replica-other", generation: "gen-winner", closedDaemonVersion: "1.0.19" },
+    registered: [],
+    touched,
+  });
+  const orchestrator = new AgentOrchestrator(store, clock as never, new BasicTracer({ sink: new MemoryTraceSink() }));
+  const enforcement = orchestrator as unknown as { duplicateConnectionEnforcement: boolean };
+
+  enforcement.duplicateConnectionEnforcement = false;
+  assert.equal(await orchestrator.refuseHeldDuplicateAtHandshake(machineId), false, "observe-only never refuses");
+  assert.equal(touched.length, 0);
+
+  enforcement.duplicateConnectionEnforcement = true;
+  const before = await actionCount("refused_held_handshake");
+  assert.equal(await orchestrator.refuseHeldDuplicateAtHandshake(machineId), true);
+  assert.equal((await actionCount("refused_held_handshake")) - before, 1);
+  assert.equal(touched.length, 1, "a refusal extends the hold while the loser keeps trying");
+
+  // The winner stopped renewing: its hold no longer protects it.
+  state.now += 10 * 60_000;
+  assert.equal(await orchestrator.refuseHeldDuplicateAtHandshake(machineId), false);
+  await orchestrator.shutdown();
+});
+
+test("task #374: only daemons without the 5-minute duplicate delay (before 1.0.47, or unknown) are refused at the handshake", () => {
+  assert.equal(daemonLacksDuplicateReconnectDelay("1.0.19"), true);
+  assert.equal(daemonLacksDuplicateReconnectDelay("1.0.46"), true);
+  assert.equal(daemonLacksDuplicateReconnectDelay(null), true, "a version that never reported is treated as old");
+  assert.equal(daemonLacksDuplicateReconnectDelay("not-a-version"), true);
+  assert.equal(daemonLacksDuplicateReconnectDelay("1.0.47"), false);
+  assert.equal(daemonLacksDuplicateReconnectDelay("1.0.51"), false);
+});
+
+test("task #374: a held loser on 1.0.47+ stays on the after-open 4003 path, which keeps its 5-minute delay", async ({ db: _db }) => {
+  const { machineId } = await seedMachine("handshake-new");
+  const { state, clock } = controlledClock();
+  const touched: number[] = [];
+  const store = holdStore({
+    lease: () => ({ replicaId: "replica-other", generation: "gen-winner", updatedAtMs: state.now - 10_000 }),
+    hold: { replicaId: "replica-other", generation: "gen-winner", closedDaemonVersion: "1.0.51" },
+    registered: [],
+    touched,
+  });
+  const orchestrator = new AgentOrchestrator(store, clock as never, new BasicTracer({ sink: new MemoryTraceSink() }));
+  (orchestrator as unknown as { duplicateConnectionEnforcement: boolean }).duplicateConnectionEnforcement = true;
+  assert.equal(await orchestrator.refuseHeldDuplicateAtHandshake(machineId), false);
+  assert.equal(touched.length, 0, "not refused here, so the hold is not extended here");
+  await orchestrator.shutdown();
+});
+
+test("a committed replica registration names the machine and server, so a rollout readout can join it with the daemon's disconnect", async ({ db: _db }) => {
+  const [user] = await getDb()
+    .insert(users)
+    .values({ email: "register-committed@slock.test", name: "register-committed", passwordHash: "hash", emailVerified: true })
+    .returning();
+  const server = await createServer("Register committed", "register-committed", user!.id);
+  const { machine } = await registerMachine(server.id, user!.id, "register-committed-machine");
+  const sink = new MemoryTraceSink();
+  const orchestrator = new AgentOrchestrator(makeStore(async () => "refreshed" as MachineReplicaRefreshResult), undefined, new BasicTracer({ sink }));
+  const ws = { readyState: 1, OPEN: 1, send: () => {}, close() { this.readyState = 3; }, terminate() { this.readyState = 3; } };
+  await orchestrator.registerMachine(machine.id, server.id, ws as never);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const events = [
+    ...sink.getAllLogEvents(),
+    ...sink.getAllSpans().flatMap((span) => span.events),
+  ].filter((event) => event.name === "machine.replica.register_committed");
+  assert.equal(events.length, 1);
+  assert.equal(events[0]!.attrs?.machine_id, machine.id);
+  assert.equal(events[0]!.attrs?.server_id, server.id);
   await orchestrator.shutdown();
 });

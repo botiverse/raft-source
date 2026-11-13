@@ -8,6 +8,7 @@ import {
   channelConversionJobs,
 } from "../db/schema";
 import { withChannelConversionResourceLock } from "./channelConversionFenceService";
+import { RESERVATION_IN_FLIGHT, SESSION_IN_FLIGHT, TRANSFER_INTENT_IN_FLIGHT } from "./channelConversionUploadActivity";
 
 type ConversionProgress = Record<string, unknown>;
 
@@ -59,17 +60,17 @@ export async function reconcileConversionUploadBlocker(channelId: string): Promi
           SELECT 'session'::text AS kind, upload.id::text AS id, upload.attachment_id::text AS logical_id
             FROM ${attachmentUploadSessions} upload
            WHERE upload.channel_id = ${current.sourceChannelId}
-             AND upload.state IN ('pending', 'verifying')
+             AND ${SESSION_IN_FLIGHT}
           UNION ALL
           SELECT 'transfer_intent'::text AS kind, intent.id::text AS id, intent.reservation_id::text AS logical_id
             FROM ${attachmentTransferIntents} intent
            WHERE intent.channel_id = ${current.sourceChannelId}
-             AND intent.state = 'planned'
+             AND ${TRANSFER_INTENT_IN_FLIGHT}
           UNION ALL
           SELECT 'reservation'::text AS kind, reservation.id::text AS id, reservation.id::text AS logical_id
             FROM ${attachmentUploadReservations} reservation
            WHERE reservation.channel_id = ${current.sourceChannelId}
-             AND reservation.state = 'pending'
+             AND ${RESERVATION_IN_FLIGHT}
         )
         SELECT kind, id, logical_id FROM active_rows ORDER BY kind, id
       `);
@@ -92,17 +93,17 @@ export async function reconcileConversionUploadBlocker(channelId: string): Promi
               SELECT 'session'::text AS kind, upload.id::text AS id, upload.attachment_id::text AS logical_id
                 FROM ${attachmentUploadSessions} upload
                WHERE ${scopedSessionIds.length > 0 ? sql`upload.id IN (${sql.join(scopedSessionIds.map((id) => sql`${id}::uuid`), sql`, `)})` : sql`false`}
-                 AND upload.state IN ('pending', 'verifying')
+                 AND ${SESSION_IN_FLIGHT}
               UNION ALL
               SELECT 'transfer_intent'::text AS kind, intent.id::text AS id, intent.reservation_id::text AS logical_id
                 FROM ${attachmentTransferIntents} intent
                WHERE ${scopedIntentIds.length > 0 ? sql`intent.id IN (${sql.join(scopedIntentIds.map((id) => sql`${id}::uuid`), sql`, `)})` : sql`false`}
-                 AND intent.state = 'planned'
+                 AND ${TRANSFER_INTENT_IN_FLIGHT}
               UNION ALL
               SELECT 'reservation'::text AS kind, reservation.id::text AS id, reservation.id::text AS logical_id
                 FROM ${attachmentUploadReservations} reservation
                WHERE ${scopedReservationIds.length > 0 ? sql`reservation.id IN (${sql.join(scopedReservationIds.map((id) => sql`${id}::uuid`), sql`, `)})` : sql`false`}
-                 AND reservation.state = 'pending'
+                 AND ${RESERVATION_IN_FLIGHT}
             )
             SELECT kind, id, logical_id FROM active_rows ORDER BY kind, id
           `)

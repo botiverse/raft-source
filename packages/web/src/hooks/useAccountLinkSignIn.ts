@@ -4,8 +4,10 @@ import { useState } from "react";
 import { useIntl } from "react-intl";
 import { useAuthStore } from "../store/authStore";
 import { accountLinkErrorCode, accountLinkHttpStatus, clearPendingAccountLink, failPendingAccountLink, usePendingAccountLink } from "../utils/pendingAccountLink";
-import { buildSocialAuthStartUrl, takePendingInviteRedirectPath } from "../utils/socialAuth";
+import { takePendingInviteRedirectPath } from "../utils/socialAuth";
+import { startSocialSignIn } from "../utils/socialSignIn";
 import type { AccountLinkSignIn } from "../components/auth/LoginPage";
+import { afterSecondFactorSignIn } from "../components/auth/secondFactorSignIn";
 
 export function useAccountLinkSignIn(): AccountLinkSignIn | undefined {
   const pending = usePendingAccountLink((state) => state.pending);
@@ -24,7 +26,7 @@ export function useAccountLinkSignIn(): AccountLinkSignIn | undefined {
     terminal,
     restart() {
       clearPendingAccountLink(pending.token);
-      window.location.href = buildSocialAuthStartUrl(pending.provider, pending.returnTo);
+      startSocialSignIn(pending.provider, pending.returnTo, formatMessage);
     },
     attemptId: pending.token, provider: pending.provider, providerLabel, email: pending.email, signInMethods: pending.signInMethods, busy, error: failure ? formatMessage({ id: failureId }, { provider: providerLabel, email: pending.email }) : error,
     async signIn(email, password) {
@@ -33,9 +35,15 @@ export function useAccountLinkSignIn(): AccountLinkSignIn | undefined {
       setError("");
       usePendingAccountLink.setState({ failure: null });
       try {
-        await useAuthStore.getState().login(email, password, pending);
-        clearPendingAccountLink(pending.token);
-        window.location.replace(takePendingInviteRedirectPath() ?? pending.returnTo);
+        const outcome = await useAuthStore.getState().login(email, password, pending);
+        const land = () => {
+          clearPendingAccountLink(pending.token);
+          window.location.replace(takePendingInviteRedirectPath() ?? pending.returnTo);
+        };
+        // Two-step verification is on: the link is made, and the page left,
+        // once the second step signs in.
+        if (outcome === "secondFactor") afterSecondFactorSignIn(land);
+        else land();
       } catch (err) {
         const code = accountLinkErrorCode(err);
         if (code?.startsWith("pending_link_") || code === "provider_conflict" || code === "account_link_unconfirmed") failPendingAccountLink(pending.token, err);
@@ -49,7 +57,7 @@ export function useAccountLinkSignIn(): AccountLinkSignIn | undefined {
     },
     socialSignIn(provider) {
       if (busy) return;
-      window.location.href = buildSocialAuthStartUrl(provider, pending.returnTo);
+      startSocialSignIn(provider, pending.returnTo, formatMessage);
     },
     cancel() {
       setBusy(true);

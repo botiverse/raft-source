@@ -1,0 +1,58 @@
+{
+  "formatVersion": 1,
+  "id": "R3-only-my-replies-in-thread",
+  "rule": "R3",
+  "title": "Mark as Unread inside an open thread that has only the person's own replies marks it, keeps the hold, and shows no toast",
+  "why": "A thread with only the person's own replies has nothing countable, so the server (v1.21.38+) marks it (`markedUnread`, outcome `marked`); the hold stays while the person is there and no toast is shown. Decided by artin (#proj-mobile:966d7abd, 2026-10-29).",
+  "status": "agreed",
+  "sources": {
+    "server": [
+      "packages/server/src/routes/channels.ts (POST /channels/:id/unread: only own replies sets markedUnread, v1.21.38+)"
+    ],
+    "web": [
+      "packages/web/src/components/thread/inboxRowActions.ts (markThreadUnreadFromThread)",
+      "packages/web/src/components/message/threadUnreadHold.ts"
+    ],
+    "app": [
+      "compose/shared/src/commonMain/kotlin/build/raft/app/SharedThreadStore.kt"
+    ]
+  },
+  "given": {
+    "conversation": {
+      "id": "thread-1",
+      "kind": "thread"
+    },
+    "openThread": "thread-1"
+  },
+  "steps": [
+    {
+      "act": "markUnread",
+      "surface": "threadMenu"
+    },
+    {
+      "act": "serverResponds",
+      "status": 200,
+      "body": {
+        "ok": true,
+        "unreadCount": 0,
+        "maxReadSeq": 40,
+        "readStateVersion": 7,
+        "markedUnread": true,
+        "outcome": "marked"
+      }
+    }
+  ],
+  "expect": {
+    "requests": [
+      {
+        "method": "POST",
+        "path": "/api/channels/thread-1/unread"
+      }
+    ],
+    "state": {
+      "outcome": "marked",
+      "holdActive": true,
+      "toast": null
+    }
+  }
+}

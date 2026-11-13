@@ -7,7 +7,11 @@
  */
 
 import { getToolActivityLabel, isAgentActivity, normalizeActivityDetailKind } from "@botiverse/raft-shared";
-import type { AgentActivity, AgentActivityDetailKind, DeliveryConsumptionActivityDiagnostic, SpawnFailureActivityDiagnostic, TrajectoryEntry, WakeCrashLoopActivityDiagnostic } from "@botiverse/raft-shared";
+import type { AgentActivity, AgentActivityDetailKind, CredentialHoldActivityDiagnostic, DeliveryConsumptionActivityDiagnostic, RuntimeErrorCode, SpawnFailureActivityDiagnostic, ToolStuckActivityDiagnostic, TrajectoryEntry, WakeCrashLoopActivityDiagnostic } from "@botiverse/raft-shared";
+
+import { ACTIVITY_DETAIL_BUCKET_BY_KIND } from "./agentActivityDetailBuckets";
+import { attachSocketTypedCarriers } from "./activityTypedCarriers";
+import type { AgentActivityDetailBucket } from "./agentActivityDetailBuckets";
 
 export const MAX_ACTIVITY_LOG_ENTRIES = 200;
 export const MAX_TRAJECTORY_ENTRIES = 500;
@@ -33,67 +37,23 @@ export interface AgentActivityState {
    * only — picks copy, never drives actions.
    */
   spawnFailure?: SpawnFailureActivityDiagnostic;
+  /**
+   * task #25 (#triage #36): the agent is stuck on one tool call with no output.
+   * Not tied to a detail kind: the daemon attaches it to every frame while it
+   * is true, so the latest frame is the current state. Display only.
+   */
+  toolStuck?: ToolStuckActivityDiagnostic;
+  /**
+   * Reconciler step 4b: the daemon holds this agent's deliveries for an
+   * invalid credential another agent saw rejected, and its idle status is
+   * the held notice. Present only while detailKind === "idle"; a later
+   * activity drops it. An older daemon never sends it: the plain status.
+   */
+  credentialHold?: CredentialHoldActivityDiagnostic;
+  /** #wg-rbac:#57: the error's code (push `errorCode`, REST `activityErrorCode`), only while activity === "error"; a member gets no error text. */
+  errorCode?: RuntimeErrorCode;
 }
 
-type AgentActivityDetailBucket =
-  | "none"
-  | "command"
-  | "compaction"
-  | "runtime"
-  | "lifecycle"
-  | "message"
-  | "review"
-  | "external"
-  | "generic";
-
-const ACTIVITY_DETAIL_BUCKET_BY_KIND = {
-  none: "none",
-  message_received: "message",
-  freshness_hold: "lifecycle",
-  starting: "lifecycle",
-  runtime_starting: "runtime",
-  idle: "none",
-  running_command: "command",
-  checking_messages: "command",
-  compacting_context: "compaction",
-  compaction_finished: "compaction",
-  compaction_stale: "compaction",
-  reviewing_changes: "review",
-  review_finished: "review",
-  review_stale: "review",
-  runtime_reconnecting: "runtime",
-  runtime_error: "runtime",
-  runtime_crashed: "runtime",
-  runtime_unavailable: "runtime",
-  runtime_stalled: "runtime",
-  stalled_recovery: "lifecycle",
-  stopped: "lifecycle",
-  computer_started: "lifecycle",
-  computer_restarted: "lifecycle",
-  computer_upgraded: "lifecycle",
-  computer_operation_failed: "lifecycle",
-  ready: "lifecycle",
-  runtime_interrupted: "runtime",
-  machine_disconnected: "generic",
-  daemon_activity: "external",
-  external_activity: "external",
-  synthetic_repair: "lifecycle",
-  slock_action: "message",
-  system_message: "message",
-  runtime_progress: "runtime",
-  delivery_unconsumed: "runtime",
-  wake_crash_loop_blocked: "lifecycle",
-  terminal_failure_paused: "lifecycle",
-  model_request_started: "runtime",
-  provider_request_status: "runtime",
-  model_response_started: "runtime",
-  tool_started: "command",
-  tool_end: "command",
-  thinking_started: "runtime",
-  thinking_end: "runtime",
-  subagent_activity: "external",
-  other: "generic",
-} as const satisfies Record<AgentActivityDetailKind, AgentActivityDetailBucket>;
 
 export interface AgentActivityViolationBasis {
   same_activity: boolean;
@@ -182,6 +142,9 @@ export type AgentActivityEvent =
       deliveryConsumption?: DeliveryConsumptionActivityDiagnostic;
       wakeCrashLoop?: WakeCrashLoopActivityDiagnostic;
       spawnFailure?: SpawnFailureActivityDiagnostic;
+      toolStuck?: ToolStuckActivityDiagnostic;
+      credentialHold?: CredentialHoldActivityDiagnostic;
+      activityErrorCode?: RuntimeErrorCode;
     }
   | {
       kind: "patch:trajectory-append";
@@ -300,20 +263,7 @@ function applySocketActivity(
   }
   const detailKind = normalizeActivityDetailKind(event.detailKind);
   const nextActivity = makeActivityState(normalized, event.activityDetail, detailKind);
-  // task #1116: keep the typed carrier next to the state it describes. It is
-  // attached only for the delivery_unconsumed frame, so a later plain
-  // activity (a fresh makeActivityState) naturally drops it.
-  if (detailKind === "delivery_unconsumed" && event.deliveryConsumption) {
-    nextActivity.deliveryConsumption = event.deliveryConsumption;
-  }
-  // task #1119: same rule for the server's wake crash-loop carrier.
-  if (detailKind === "wake_crash_loop_blocked" && event.wakeCrashLoop) {
-    nextActivity.wakeCrashLoop = event.wakeCrashLoop;
-  }
-  // task #1123: same rule for the typed spawn-failure reason.
-  if (detailKind === "runtime_unavailable" && event.spawnFailure) {
-    nextActivity.spawnFailure = event.spawnFailure;
-  }
+  attachSocketTypedCarriers(nextActivity, detailKind, event);
   if (typeof event.serverSeq === "number") {
     const lastSeq = state.agentActivitySeq[event.agentId] ?? Number.NEGATIVE_INFINITY;
     const shouldUpgradeFallbackCurrent = event.serverSeq === lastSeq
@@ -623,7 +573,13 @@ function nextActivityVersion(state: AgentActivityDomainState, agentId: string): 
 }
 
 function activityStateEqual(a: AgentActivityState | undefined, b: AgentActivityState): boolean {
-  return a?.activity === b.activity && a.activityDetail === b.activityDetail && a.detailKind === b.detailKind;
+  return a?.activity === b.activity && a.activityDetail === b.activityDetail && a.detailKind === b.detailKind
+    // A stuck frame usually repeats the same "Running command" activity, so the
+    // stuck episode (and its queue count) must count as a change of its own.
+    && a.toolStuck?.quietSinceMs === b.toolStuck?.quietSinceMs
+    && a.toolStuck?.queuedMessages === b.toolStuck?.queuedMessages
+    && a.credentialHold?.reason === b.credentialHold?.reason
+    && a.errorCode === b.errorCode;
 }
 
 function producerSeqConflictBasis(
@@ -721,21 +677,35 @@ function mergeTrajectoryLogs(existing: TrajectoryLogEntry[], incoming: Trajector
   if (incoming.length === 0) return existing;
   let changed = false;
   const merged = [...existing];
+  // Keys once per entry (a sorted JSON each): a reload brings a full window (#proj-runtime:#43).
+  const exactKeys = new Map<string, number>();
+  const byVisibleKey = new Map<string, number[]>();
+  const countKey = (key: string, by: number) => {
+    const count = (exactKeys.get(key) ?? 0) + by;
+    return count > 0 ? exactKeys.set(key, count) : exactKeys.delete(key);
+  };
+  const addKeys = (item: TrajectoryLogEntry, index: number) => {
+    countKey(trajectoryLogKey(item), 1);
+    const visible = trajectoryLogVisibleKey(item);
+    if (!byVisibleKey.get(visible)?.push(index)) byVisibleKey.set(visible, [index]);
+  };
+  merged.forEach(addKeys);
   for (const item of incoming) {
-    const key = trajectoryLogKey(item);
-    if (merged.some((existingItem) => trajectoryLogKey(existingItem) === key)) continue;
+    if (exactKeys.has(trajectoryLogKey(item))) continue;
     // Hydrated durable rows do not carry the live socket source identity, so
     // the exact key can differ even when both rows render the same fact.
-    const visibleDuplicateIndex = merged.findIndex((existingItem) => shouldDedupeTrajectoryLogEntries(existingItem, item));
-    if (visibleDuplicateIndex >= 0) {
-      const preferred = preferTrajectoryLogEntry(merged[visibleDuplicateIndex]!, item);
-      if (preferred !== merged[visibleDuplicateIndex]) {
-        merged[visibleDuplicateIndex] = preferred;
+    const duplicateIndex = byVisibleKey.get(trajectoryLogVisibleKey(item))?.find((index) => shouldDedupeTrajectoryLogEntries(merged[index]!, item));
+    if (duplicateIndex !== undefined) {
+      const preferred = preferTrajectoryLogEntry(merged[duplicateIndex]!, item);
+      if (preferred !== merged[duplicateIndex]) {
+        countKey(trajectoryLogKey(merged[duplicateIndex]!), -1);
+        countKey(trajectoryLogKey(preferred), 1);
+        merged[duplicateIndex] = preferred;
         changed = true;
       }
       continue;
     }
-    merged.push(item);
+    addKeys(item, merged.push(item) - 1);
     changed = true;
   }
   if (!changed) return existing;

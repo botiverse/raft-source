@@ -1,5 +1,6 @@
 // `raft integration env --service <service>` — print local CLI isolation env for a manifest-backed service.
 
+import { findIntegrationService, findListedIntegrationService, foldAgentOneLineText } from "@botiverse/raft-shared/src/agentCliSurface";
 import type { Command } from "commander";
 
 import type { AgentContext } from "../../auth/env";
@@ -8,7 +9,8 @@ import type { CommandRuntimeOptions } from "../../core/context";
 import { cliError } from "../../core/errors";
 import { writeJson, writeText, NL, adoptCliReplyText } from "../../core/renderer";
 import { createAgentApiSurfaceClient } from "../../agentApiPath";
-import type { IntegrationListResponse, RegisteredIntegrationService } from "./_format";
+import type { RegisteredIntegrationService } from "./_format";
+import { findMcpAppForService, mcpAppIsNotAgentLoginMessage } from "./_format";
 import {
   AgentManifestFetchError,
   AgentManifestResponseFormatError,
@@ -23,20 +25,6 @@ import {
 interface EnvOptions {
   service: string;
   json?: boolean;
-}
-
-function normalizeService(value: string): string {
-  return value.trim().toLowerCase();
-}
-
-function findService(data: IntegrationListResponse, service: string): RegisteredIntegrationService | null {
-  const normalized = normalizeService(service);
-  if (!normalized) return null;
-  return data.services.find((candidate) =>
-    candidate.id === service
-    || normalizeService(candidate.clientId) === normalized
-    || normalizeService(candidate.name) === normalized
-  ) ?? null;
 }
 
 function describeNoLocalEnv(manifest: AgentManifest): string {
@@ -62,7 +50,7 @@ function describeMissingManifest(input: { service: RegisteredIntegrationService;
   if (input.manifestUrl) {
     return "agent behavior manifest was not found; no local CLI env is required";
   }
-  return `${input.service.name} does not expose an agent behavior manifest; no local CLI env is required`;
+  return `${foldAgentOneLineText(input.service.name)} does not expose an agent behavior manifest; no local CLI env is required`;
 }
 
 function isInferredWellKnownManifest(service: RegisteredIntegrationService): boolean {
@@ -210,15 +198,23 @@ export const integrationEnvCommand = defineCommand(
 
     const ctx = cmdCtx.loadAgentContext();
     const client = cmdCtx.createApiClient(ctx);
-    const res = await createAgentApiSurfaceClient(client).integrations.list();
+    const api = createAgentApiSurfaceClient(client);
+    const res = await api.integrations.list();
     if (!res.ok || !res.data) {
       const code = res.status >= 500 ? "SERVER_5XX" : "INTEGRATION_LIST_FAILED";
       throw cliError(code, res.error ?? `HTTP ${res.status}`);
     }
 
     const integrations = res.data;
-    const service = findService(integrations, serviceQuery);
+    // A listed id or client id needs no second call; for an old id or a name the server decides.
+    let service = findListedIntegrationService(integrations.services, serviceQuery);
     if (!service) {
+      const asked = await api.integrations.list({ service: serviceQuery });
+      service = findIntegrationService(asked.ok && asked.data ? asked.data : integrations, serviceQuery);
+    }
+    if (!service) {
+      const mcpApp = findMcpAppForService(integrations, serviceQuery);
+      if (mcpApp) throw cliError("INTEGRATION_SERVICE_IS_MCP_APP", mcpAppIsNotAgentLoginMessage(mcpApp, "env"));
       throw cliError("INTEGRATION_NOT_FOUND", `No registered integration matched ${serviceQuery}`);
     }
     let resolution;

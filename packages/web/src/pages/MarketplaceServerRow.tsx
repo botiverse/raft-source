@@ -4,7 +4,7 @@ import { Badge, Spinner } from "@botiverse/raft-ui";
 import type { Server } from "../store/serverStore";
 import { useCallback, useMemo } from "react";
 import { useIntl } from "react-intl";
-import type { AvailableServerClient } from "./HumanLoginSetupPage";
+import type { AvailableServerClient } from "../features/login-with-raft/loginClientSummary";
 
 export function MarketplaceServerRow({
   server,
@@ -24,15 +24,19 @@ export function MarketplaceServerRow({
   onSelect: (serverId: string) => void;
 }) {
   const { formatMessage } = useIntl();
-  const installed = entry?.client.availability !== "install_required" && entry != null;
+  // Installed but suspended there: unavailable, with the reason.
+  const suspended = entry?.client.availability === "suspended";
+  const installed = entry != null && !suspended && entry.client.availability !== "install_required";
   const canInstall = entry?.client.installation?.canInstall === true;
   const rowTitle = formatMessage({ id: installed
     ? "pages.humanLogin.serverInstalledReady"
-    : canInstall
-      ? "pages.humanLogin.serverNotInstalledCanInstall"
-      : entry
-        ? "pages.humanLogin.serverNotInstalledAskAdmin"
-        : "pages.humanLogin.serverStatusUnavailable" });
+    : suspended
+      ? "pages.humanLogin.installationSuspended"
+      : canInstall
+        ? "pages.humanLogin.serverNotInstalledCanInstall"
+        : entry
+          ? "pages.humanLogin.serverNotInstalledAskAdmin"
+          : "pages.humanLogin.serverStatusUnavailable" });
   const serverId = server.id;
   const handleClick = useCallback(() => onSelect(serverId), [onSelect, serverId]);
   const ariaLabel = `${formatMessage({ id: "pages.humanLogin.useThisServer" })}: ${server.name}`;
@@ -70,9 +74,11 @@ export function MarketplaceServerRow({
         <Badge variant="muted" appearance="soft">
           {formatMessage({ id: !entry
             ? "pages.humanLogin.serverUnavailableCompact"
-            : canInstall
-              ? "pages.humanLogin.notInstalledCompact"
-              : "pages.humanLogin.adminNeededCompact" })}
+            : suspended
+              ? "pages.humanLogin.suspendedCompact"
+              : canInstall
+                ? "pages.humanLogin.notInstalledCompact"
+                : "pages.humanLogin.adminNeededCompact" })}
         </Badge>
       ) : null}
       selected={selected}

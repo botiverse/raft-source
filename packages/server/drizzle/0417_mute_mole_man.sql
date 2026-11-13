@@ -1,0 +1,22 @@
+-- MCP Apps: one Connection per App again, for rollback compatibility (Tenny, 2026-10-21).
+--
+-- 0409 dropped idx_managed_mcp_credentials_server (one credential per MCP server) so an App could
+-- hold several Connections. Binaries released before MCP Apps (#9782) save credentials with
+-- INSERT ... ON CONFLICT (mcp_server_id), which needs this unique index as its arbiter: without it
+-- every such save fails with 42P10, so rolling back to them would break saving MCP credentials.
+-- This release restores the index and keeps one Connection per App
+-- (MCP_MULTIPLE_CONNECTIONS_ENABLED = false; a second Connection is refused with 409
+-- managed_mcp_single_connection before any write). A later release drops the index again and
+-- enables several Connections per App. idx_managed_mcp_credentials_default stays.
+--
+-- Precondition: no MCP server has more than one managed_mcp_credentials row. Production meets it
+-- (240 MCP servers, 0 with a second row, 10-21; new code that could add a second has not shipped
+-- without this index). If any App does have several, the CREATE fails with a unique violation and
+-- the deploy stops; this migration deliberately deletes nothing, so resolve such rows by hand.
+-- The operator helper from #10796 (`scripts/rollback-0409-managed-mcp-credential-index.ts`) reads
+-- the same index: once this migration has run, its --restore step has nothing to do and its --drop
+-- step is what the release that allows several Connections will use.
+--
+-- Not CONCURRENTLY: the table is tiny (one row per connected MCP server), so the build is
+-- milliseconds; the migration session's lock_timeout bounds the wait for its lock.
+CREATE UNIQUE INDEX IF NOT EXISTS "idx_managed_mcp_credentials_server" ON "managed_mcp_credentials" USING btree ("mcp_server_id");

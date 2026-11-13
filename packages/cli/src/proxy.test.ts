@@ -4,9 +4,11 @@ import net, { type Socket } from "node:net";
 import { gzipSync } from "node:zlib";
 
 import {
+  buildFetchDispatcher,
   CanonicalFetchTransportError,
   credentialFreeDiagnosticUrl,
   fetchWithCanonicalProxy,
+  fetchWithDispatcher,
 } from "./proxy";
 
 async function listen(server: http.Server): Promise<number> {
@@ -223,4 +225,61 @@ test("canonical fetch diagnostics keep bounded cause classes and redact URL cred
     proxyUsed: false,
   });
   assert.equal(cyclicError.diagnostics.causeClass, "unknown");
+});
+
+test("fetchWithDispatcher sends a FormData body through a real proxy with the package dispatcher", async () => {
+  const origin = http.createServer(async (request, response) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of request) chunks.push(Buffer.from(chunk));
+    const body = Buffer.concat(chunks).toString();
+    response.writeHead(200, { "content-type": "application/json", connection: "close" });
+    response.end(JSON.stringify({
+      method: request.method,
+      contentType: request.headers["content-type"] ?? "",
+      hasField: body.includes("field-value"),
+    }));
+  });
+  const originSockets = trackSockets(origin);
+  const originPort = await listen(origin);
+
+  let proxyConnects = 0;
+  const proxy = http.createServer((_request, response) => {
+    response.writeHead(501);
+    response.end();
+  });
+  const proxySockets = trackSockets(proxy);
+  proxy.on("connect", (_request, downstream, head) => {
+    proxyConnects += 1;
+    const upstream = net.connect(originPort, "127.0.0.1", () => {
+      downstream.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+      if (head.length > 0) upstream.write(head);
+      downstream.pipe(upstream);
+      upstream.pipe(downstream);
+    });
+    upstream.once("error", () => downstream.destroy());
+    downstream.once("error", () => upstream.destroy());
+  });
+  const proxyPort = await listen(proxy);
+
+  const url = `http://proxy-only.invalid:${originPort}/upload`;
+  try {
+    const dispatcher = await buildFetchDispatcher(url, { HTTP_PROXY: `http://127.0.0.1:${proxyPort}` });
+    assert.ok(dispatcher);
+    const form = new FormData();
+    form.append("field", "field-value");
+    const response = await fetchWithDispatcher(url, { method: "POST", body: form, dispatcher });
+    assert.equal(response.status, 200);
+    const echoed = await response.json() as { method: string; contentType: string; hasField: boolean };
+    assert.equal(echoed.method, "POST");
+    assert.match(echoed.contentType, /^multipart\/form-data; boundary=/);
+    assert.equal(echoed.hasField, true);
+    assert.equal(proxyConnects, 1);
+  } finally {
+    for (const socket of proxySockets) socket.destroy();
+    for (const socket of originSockets) socket.destroy();
+    await Promise.all([
+      new Promise<void>((resolve) => proxy.close(() => resolve())),
+      new Promise<void>((resolve) => origin.close(() => resolve())),
+    ]);
+  }
 });

@@ -12,24 +12,60 @@ import {
   expectSync,
   LOCAL_DRAFT_TTL_MINUTES,
   lookupSavedDraft as lookupSharedSavedDraft,
+  savedDraftCauseOf,
   setSavedDraft as setSharedSavedDraft,
+  type CommandStateDraftEntry,
   type SavedDraft,
+  type SavedDraftCause,
   type SavedDraftLookup,
 } from "@botiverse/raft-shared/src/agentOps/seenPolicy/index";
 
 import { createCliCommandStateStore } from "../../state/commandStateStore";
 
-export { LOCAL_DRAFT_TTL_MINUTES, type SavedDraft, type SavedDraftLookup };
+export { LOCAL_DRAFT_TTL_MINUTES, type SavedDraft, type SavedDraftCause, type SavedDraftLookup };
 
 const store = (agentId: string) => createCliCommandStateStore(agentId, process.env);
 
-export function getSavedDraft(agentId: string, target: string): SavedDraft | null {
-  const lookup = lookupSavedDraft(agentId, target);
+/** Who a draft found expired was, without its body (`cli.draft.resolved`). */
+export interface ExpiredDraftIdentity {
+  idempotencyKey?: string;
+  savedAt: number;
+  reholdCount: number;
+  cause?: SavedDraftCause;
+}
+
+export type OnDraftExpired = (draft: ExpiredDraftIdentity) => void;
+
+export function getSavedDraft(agentId: string, target: string, onExpired?: OnDraftExpired): SavedDraft | null {
+  const lookup = lookupSavedDraft(agentId, target, onExpired);
   return lookup.status === "found" ? lookup.draft : null;
 }
 
-export function lookupSavedDraft(agentId: string, target: string): SavedDraftLookup {
-  return expectSync(lookupSharedSavedDraft(store(agentId), target, () => Date.now()));
+/**
+ * `onExpired` hears about a draft this lookup found past its TTL (and
+ * discarded). The shared lookup reports only the body of an expired draft, so
+ * the entry it read is kept here for the draft's key and rehold count.
+ */
+export function lookupSavedDraft(agentId: string, target: string, onExpired?: OnDraftExpired): SavedDraftLookup {
+  const ledger = store(agentId);
+  const read: { draft?: CommandStateDraftEntry } = {};
+  const lookup = expectSync(lookupSharedSavedDraft(
+    onExpired ? { ...ledger, readDraft: (key) => (read.draft = ledger.readDraft(key)) } : ledger,
+    target,
+    () => Date.now(),
+  ));
+  if (onExpired && lookup.status === "expired") {
+    const stored = read.draft;
+    const idempotencyKey = typeof stored?.idempotencyKey === "string" ? stored.idempotencyKey.trim() : "";
+    const cause = savedDraftCauseOf(stored?.cause);
+    onExpired({
+      ...(idempotencyKey ? { idempotencyKey } : {}),
+      savedAt: lookup.savedAt,
+      reholdCount: stored && Number.isFinite(stored.reholdCount) ? stored.reholdCount : 0,
+      ...(cause ? { cause } : {}),
+    });
+  }
+  return lookup;
 }
 
 export function setSavedDraft(agentId: string, target: string, draft: SavedDraft): void {

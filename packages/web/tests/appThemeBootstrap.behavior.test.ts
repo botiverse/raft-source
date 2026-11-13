@@ -58,15 +58,8 @@ function executeBootstrap({
       return { matches: systemDark };
     },
   });
-  return { classes, root, script, storageEntries, themeColor };
+  return { classes, root, storageEntries, themeColor };
 }
-
-test("the bootstrap is the served public script with no deployment or account input", () => {
-  const { script } = executeBootstrap({ storageEntries: {} });
-
-  assert.doesNotMatch(script, /VITE_RAFT_MULTITHEME_POLICY|allowLocalOverride|slock_access_token|multitheme_v0|__name/);
-  assert.match(script, new RegExp(APP_THEME_PREFERENCES_STORAGE_KEY.replaceAll("-", "\\-")));
-});
 
 test("every first paint sets only the mode; no theme family is named", () => {
   // raft-ui has no family axis and AppThemeProvider writes only the mode

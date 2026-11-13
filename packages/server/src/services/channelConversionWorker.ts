@@ -4,17 +4,26 @@ import { getDb } from "../db/index";
 import { channelConversionJobs } from "../db/schema";
 import { runConversionCommandWorkerPass } from "./channelConversionCommandService";
 import { runChannelConversionJob } from "./channelConversionService";
-import type { ChannelConversionPrivacyRevalidator } from "./channelConversionService";
-import { withTraceRoot } from "../tracing/semanticTrace";
+import { runExternalConnectWorkerPass, type ExternalConnection } from "./externalInviteConnectService";
+import type { ChannelConversionPhaseAttempt, ChannelConversionPrivacyRevalidator } from "./channelConversionService";
+import { addTraceEvent, withTraceRoot } from "../tracing/semanticTrace";
+import { traceIdentityHash } from "../tracing/traceIdentity";
 
 type ConversionReceipt = Awaited<ReturnType<typeof runChannelConversionJob>>;
 
 /** A fresh process reconstructs work from receipts. Per-source DB locks make
- * multiple workers safe; failed jobs stay visible until an explicit Retry. */
+ * multiple workers safe: every replica runs this pass on the same jobs, and a
+ * phase takes the conversion lock with a try, so a job another replica is
+ * running is skipped (busy) instead of waited on. Failed jobs stay visible
+ * until an explicit Retry.
+ * After the jobs, external invites connecting a server move on (P2a-3): one
+ * whose conversion committed is connected, one whose conversion rolled back
+ * returns to pending. */
 export async function runChannelConversionWorkerPass(
   onProgress?: (job: ConversionReceipt) => Promise<void>,
   onCommandSettled?: (sourceChannelId: string) => Promise<void>,
   revalidateExternalPrivacy?: ChannelConversionPrivacyRevalidator,
+  onExternalConnected?: (connection: ExternalConnection) => Promise<void>,
 ): Promise<number> {
   await runConversionCommandWorkerPass(onCommandSettled, revalidateExternalPrivacy);
   const db = getDb();
@@ -25,7 +34,19 @@ export async function runChannelConversionWorkerPass(
     ))
     .orderBy(asc(channelConversionJobs.updatedAt)).limit(8);
   for (const row of jobs) {
-    const job = await runChannelConversionJob(row.id, { maxPhases: 1 });
+    let attempt: ChannelConversionPhaseAttempt | null = null;
+    const job = await runChannelConversionJob(row.id, { maxPhases: 1, onPhaseAttempt: (value) => { attempt = value; } });
+    const attempted = attempt as ChannelConversionPhaseAttempt | null;
+    if (attempted) {
+      const jobIdHash = traceIdentityHash("job_id_hash", job.id);
+      addTraceEvent("server.channel_conversion_worker.job", {
+        phase: attempted.phase,
+        ...(jobIdHash ? { job_id_hash: jobIdHash } : {}),
+        lock_acquired: attempted.lockAcquired ? true : "busy",
+      });
+      // Another replica (or a request) is running it: nothing changed here.
+      if (!attempted.lockAcquired) continue;
+    }
     await onProgress?.(job);
     if ((job.status === "done" || job.status === "canceled" || job.status === "failed") && onProgress) {
       await db.update(channelConversionJobs).set({
@@ -33,6 +54,7 @@ export async function runChannelConversionWorkerPass(
       }).where(and(eq(channelConversionJobs.id, job.id), eq(channelConversionJobs.conversionEpoch, job.conversionEpoch), eq(channelConversionJobs.status, job.status), eq(channelConversionJobs.updatedAt, job.updatedAt)));
     }
   }
+  await runExternalConnectWorkerPass(onExternalConnected);
   return jobs.length;
 }
 
@@ -41,6 +63,7 @@ export function startChannelConversionWorker(
   onCommandSettled?: (sourceChannelId: string) => Promise<void>,
   revalidateExternalPrivacy?: ChannelConversionPrivacyRevalidator,
   tracer: Tracer = noopTracer,
+  onExternalConnected?: (connection: ExternalConnection) => Promise<void>,
 ) {
   let stopped = false;
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -52,7 +75,7 @@ export function startChannelConversionWorker(
         tracer,
         "server.channel_conversion_worker.pass",
         { surface: "server", kind: "internal" },
-        () => runChannelConversionWorkerPass(onProgress, onCommandSettled, revalidateExternalPrivacy),
+        () => runChannelConversionWorkerPass(onProgress, onCommandSettled, revalidateExternalPrivacy, onExternalConnected),
         "server.channel_conversion_worker.error",
       );
     } catch (error) {

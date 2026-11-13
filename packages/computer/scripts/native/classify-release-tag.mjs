@@ -14,8 +14,11 @@ const featureChannelSlugPattern = "[a-z0-9][a-z0-9-]{1,62}[a-z0-9]";
 const featureTagPattern = new RegExp(
   `^computer-v((${baseVersionPattern})-(${featureChannelSlugPattern})\\.([1-9][0-9]*))$`,
 );
+// `candidate` is the Hands channel RC tags publish to: the CLI accepts it as a
+// named channel, so it must be refused here or a feature tag could publish
+// into the release-candidate cohort.
 export const RESERVED_CHANNEL_WORDS = new Set([
-  "main", "alpha", "latest", "stable", "rc", "release", "staging", "production", "prod", "nightly", "preview", "pinned", "default",
+  "main", "alpha", "candidate", "latest", "stable", "rc", "release", "staging", "production", "prod", "nightly", "preview", "pinned", "default",
 ]);
 
 export function classifyComputerReleaseTag(tag, packageVersion) {

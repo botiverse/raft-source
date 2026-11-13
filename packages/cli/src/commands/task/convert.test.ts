@@ -124,3 +124,24 @@ test("task convert maps a 5xx to SERVER_5XX rather than CONVERT_FAILED", async (
     (err: unknown) => err instanceof CliError && err.code === "SERVER_5XX",
   );
 });
+
+test("task v2 server: convert surfaces task_v2_use_create with the create command verbatim", async () => {
+  const { io, stdout } = memoryIo();
+  const requests: Array<{ method: string; path: string; body: unknown }> = [];
+  const hint = [
+    "`task convert` is not available on this server: tasks here have their own conversations, and a message is never turned into a task. Nothing was converted.",
+    "Create a task from the message instead (the task stays linked to it; edit the title as needed):",
+    "  raft task create --target \"#proj-runtime\" --message-id abcdef12 --title \"look at the retry storm\"",
+    "To take it yourself in the same step, add --assignee @cody.",
+  ].join("\n");
+  const ctx = contextReturning(
+    { ok: false, status: 409, error: hint, errorCode: "task_v2_use_create", data: null },
+    requests,
+    io,
+  );
+  await assert.rejects(
+    async () => { await taskConvertCommand.handler(ctx, { target: "#proj-runtime", messageId: "abcdef12" }); },
+    (err: unknown) => err instanceof CliError && err.code === "task_v2_use_create" && err.message === hint,
+  );
+  assert.deepEqual(stdout, []);
+});

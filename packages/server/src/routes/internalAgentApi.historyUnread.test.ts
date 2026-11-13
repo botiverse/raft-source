@@ -21,7 +21,7 @@ import {
   type DeferredReadAdvanceOutcome,
 } from "../services/readPositionSettle";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 /**
  * `raft message read --target X --unread` (#wg-ax:b365e91f): one conversation's
@@ -50,6 +50,7 @@ async function seedFixture() {
     agentId: agent.id,
     scopes: ["send", "read"],
     name: "ax-unread",
+    issuedVia: "computer",
     createdByUserId: null,
   });
   // Messages are posted already settled (older than the settle window) unless
@@ -82,7 +83,7 @@ async function read(baseUrl: string, apiKey: string, query: string) {
 }
 
 test("--unread reads from the read position and moves it, without a seq from the caller", async ({ onTestFinished }) => {
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   onTestFinished(() => app.close());
   const fx = await seedFixture();
   const unread = () => read(app.baseUrl, fx.apiKey, "unread=true");
@@ -116,7 +117,7 @@ test("--unread reads from the read position and moves it, without a seq from the
 });
 
 test("--unread pages: the same command continues where the last page stopped", async ({ onTestFinished }) => {
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   onTestFinished(() => app.close());
   const fx = await seedFixture();
   for (const content of ["a", "b", "c"]) await fx.post(content);
@@ -129,8 +130,29 @@ test("--unread pages: the same command continues where the last page stopped", a
   assert.equal(page2.body.has_newer, false);
 });
 
+// Cindy 10-30: a `--before` window always said "No newer", although the
+// anchor is a message the agent stepped back from.
+test("a --before window says whether messages exist at or after its anchor", async ({ onTestFinished }) => {
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
+  onTestFinished(() => app.close());
+  const fx = await seedFixture();
+  await fx.post("a");
+  await fx.post("b");
+  const c = await fx.post("c");
+  const d = await fx.post("d");
+
+  const back = await read(app.baseUrl, fx.apiKey, `before=${Number(c.seq)}&limit=1`);
+  assert.deepEqual(back.contents, ["b"]);
+  assert.equal(back.body.has_older, true);
+  assert.equal(back.body.has_newer, true, "c and d are at or after the anchor");
+
+  const pastTheEnd = await read(app.baseUrl, fx.apiKey, `before=${Number(d.seq) + 1000}&limit=10`);
+  assert.deepEqual(pastTheEnd.contents, ["a", "b", "c", "d"]);
+  assert.equal(pastTheEnd.body.has_newer, false, "nothing at or after an anchor past the last message");
+});
+
 test("--unread refuses an anchor, and plain reads do not echo unread_after_seq", async ({ onTestFinished }) => {
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   onTestFinished(() => app.close());
   const fx = await seedFixture();
   await fx.post("hello");
@@ -138,7 +160,7 @@ test("--unread refuses an anchor, and plain reads do not echo unread_after_seq",
   const combined = await read(app.baseUrl, fx.apiKey, "unread=true&after=1");
   assert.equal(combined.status, 400);
   assert.equal(combined.body.errorCode, "INVALID_ARG");
-  assert.equal(combined.body.suggestedNextAction, "raft message read --target '#ax-unread' --unread");
+  assert.equal(combined.body.suggestedNextAction, 'raft message read --target "#ax-unread" --unread');
 
   const plain = await read(app.baseUrl, fx.apiKey, "limit=5");
   assert.equal(plain.status, 200);
@@ -146,7 +168,7 @@ test("--unread refuses an anchor, and plain reads do not echo unread_after_seq",
 });
 
 test("--unread leaves out the agent's own messages, as the inbox count does, and reads past them", async ({ onTestFinished }) => {
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   onTestFinished(() => app.close());
   const fx = await seedFixture();
   await fx.post("question");
@@ -173,7 +195,7 @@ test("--unread leaves out the agent's own messages, as the inbox count does, and
 });
 
 test("--unread: a full page followed only by own messages has no more unread", async ({ onTestFinished }) => {
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   onTestFinished(() => app.close());
   const fx = await seedFixture();
   await fx.post("a");
@@ -190,7 +212,7 @@ test("--unread: a full page followed only by own messages has no more unread", a
 });
 
 test("the deferred check moves over an own message the read did not print", async ({ onTestFinished }) => {
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   onTestFinished(() => app.close());
   onTestFinished(setReadPositionSettleMsForTests(300));
   const fx = await seedFixture();
@@ -208,7 +230,7 @@ test("the deferred check moves over an own message the read did not print", asyn
 });
 
 test("a message too recent to settle is returned but does not move the read position (seq order is not commit order)", async ({ onTestFinished }) => {
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   onTestFinished(() => app.close());
   // A long window: the deferred check does not fire during this test.
   onTestFinished(setReadPositionSettleMsForTests(60_000));
@@ -234,7 +256,7 @@ test("settledReadThroughSeq stops at the first row that is too new, in seq order
 });
 
 test("once the window passes, a deferred check moves the read position over what the read returned", async ({ onTestFinished }) => {
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   onTestFinished(() => app.close());
   onTestFinished(setReadPositionSettleMsForTests(300));
   const fx = await seedFixture();

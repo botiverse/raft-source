@@ -150,3 +150,40 @@ test("task #1258: a session made by another runtime major line is session_runtim
   assert.equal(unreadable.reason, "session_runtime_mismatch");
   assert.match(unreadable.userMessage, /session record is unreadable/);
 });
+
+// task #1307: the real header check, classified end to end. The user message
+// is Cat's copy and carries neither the key nor where or what the bad
+// character is; those stay in the error message for the local log.
+test("a provider API key that cannot go in an HTTP header is classified as provider_api_key_invalid with safe copy", async () => {
+  const { assertProviderApiKeyIsHeaderSafe } = await import("./drivers/pi");
+  const { PROVIDER_API_KEY_INVALID_USER_MESSAGE } = await import("./spawnFailureClassification");
+  const secretKey = "sk-live-SECRET\nPASTED-NOTE";
+  let thrown: unknown;
+  try { assertProviderApiKeyIsHeaderSafe(secretKey, "ANTHROPIC_API_KEY"); } catch (error) { thrown = error; }
+  assert.ok(thrown instanceof Error, "the header check must refuse the key");
+  const classification = classifySpawnFailure(thrown);
+  assert.equal(classification.reason, "provider_api_key_invalid");
+  assert.equal(
+    classification.userMessage,
+    "Couldn't start: there's a problem with the API key. Copy the full key again from your provider's dashboard, save, and retry.",
+  );
+  assert.equal(classification.userMessage, PROVIDER_API_KEY_INVALID_USER_MESSAGE);
+  for (const leak of ["SECRET", "PASTED", "ANTHROPIC_API_KEY", "position", "code 10"]) {
+    assert.ok(!classification.userMessage.includes(leak), `user message must not carry ${leak}`);
+  }
+  assert.match(classification.detail, /position 15, code 10/, "the local log keeps the diagnostic");
+  // The local log names the variable, position and character code, never the key.
+  for (const part of ["sk-live", "SECRET", "PASTED-NOTE"]) {
+    assert.ok(!classification.detail.includes(part), `local detail must not carry ${part}`);
+    assert.ok(!String((thrown as Error).message).includes(part), `error message must not carry ${part}`);
+  }
+  // The activity the server and web get: the typed reason and the safe text only.
+  const activity = startFailureActivity(classification, "claude-opus-5");
+  assert.deepEqual(activity.spawnFailure, { reason: "provider_api_key_invalid" });
+  assert.equal(activity.detail, PROVIDER_API_KEY_INVALID_USER_MESSAGE);
+  assert.doesNotMatch(JSON.stringify(activity), /SECRET|PASTED|position|ANTHROPIC/);
+});
+
+test("other untyped start errors keep the generic runtime_spawn_failed", () => {
+  assert.equal(classifySpawnFailure(new Error("API key contains a bad character")).reason, "runtime_spawn_failed");
+});

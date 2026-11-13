@@ -14,7 +14,11 @@
 // plumbing that handles raw request bytes and the webhook secret, which must
 // not pass through a model), `attachments.upload` / `attachments.download`
 // (binary payloads have no JSON tool form; use the typed methods, or
-// `attachments.downloadUrl`, which is in the manifest), `frontier`,
+// `attachments.downloadUrl`, which is in the manifest), `artifacts.file`,
+// `artifacts.upload`, `artifacts.checkShot`, `artifacts.commentImageUpload`
+// and `artifacts.commentImage` (same: use `artifacts.fileContent`, inline
+// files in `artifacts.push`, `artifacts.check` for what a check found, and
+// `artifacts.comments` for a comment's images), `frontier`,
 // `state.*` (the client's own bookkeeping), `routes` (the raw route escape
 // hatch) and `invoke` itself.
 //
@@ -24,14 +28,19 @@
 // pins every (name, toolName) pair.
 
 import type { z } from "zod";
+import { artifactsOperationDefs } from "./apps/artifacts";
+import { NO_CONSUMPTION, SMALL_OUTPUT, type OperationDef } from "./operationDef";
 import { agentApiContract, type AgentApiCapability, type AgentApiRouteKey } from "@botiverse/raft-shared/src/agentApiContract";
 import { AGENT_API_ROUTE_META } from "@botiverse/raft-shared/src/agentApiRouteMeta";
+import { REPEAT_DELIVERY_RULE } from "@botiverse/raft-shared/src/agentText/index";
 import {
   amendTaskRequestSchema,
   assignTaskRequestSchema,
   unassignTaskRequestSchema,
   attachmentCommentsRequestSchema,
   channelInfoRequestSchema,
+  channelLeaveRequestSchema,
+  channelMemberRemoveRequestSchema,
   channelMemberRequestSchema,
   createChannelRequestSchema,
   updateChannelRequestSchema,
@@ -49,6 +58,7 @@ import {
   drainInboxRequestSchema,
   getManualTopicRequestSchema,
   listInboxRequestSchema,
+  readInboxItemRequestSchema,
   listTasksRequestSchema,
   listThreadsRequestSchema,
   mentionResolutionIdsRequestSchema,
@@ -62,6 +72,8 @@ import {
   searchMessagesRequestSchema,
   sendMessageRequestSchema,
   senderMentionDeliveriesRequestSchema,
+  updateMessageCardRequestSchema,
+  withdrawQuestionCardRequestSchema,
   serverInfoRequestSchema,
   showProfileRequestSchema,
   taskRefSchema,
@@ -72,6 +84,7 @@ import {
   raftToolNameFor,
 } from "@botiverse/raft-shared/src/agentOps/index";
 
+import { raftbenchFindingsQuerySchema } from "@botiverse/raft-shared";
 import { commitInboxRequestSchema, whoamiRequestSchema } from "./operationSchemas";
 import { toRaftToolInputSchema, type RaftJsonSchema } from "./toolSchema";
 
@@ -120,34 +133,17 @@ export interface RaftOperationSpec {
   output: { mayBeLarge: boolean; boundBy: string[] };
   /** Still dispatchable, scheduled for removal; use the replacement named in `description`. */
   deprecated?: boolean;
+  /**
+   * The Raft first-party app the operation belongs to, by the id the agent
+   * context lists in `features.enabledApps` while the app is on for this
+   * caller (e.g. `"artifacts"`). Absent for Raft's own operations. Offer the
+   * operation only where that list names the app: elsewhere Raft refuses it.
+   */
+  app?: string;
 }
 
-interface OperationDef {
-  name: string;
-  /** Override only to keep a name stable across a rename; otherwise derived from `name`. */
-  toolName?: string;
-  description: string;
-  schema: z.ZodType;
-  /** Fields the runtime accepts but the tool schema does not advertise (code-only knobs). */
-  hiddenFields?: readonly string[];
-  /** Union-typed top-level fields → the one type the tool schema advertises (the runtime accepts that spelling the same). */
-  unionAs?: Readonly<Record<string, "string" | "integer" | "number" | "boolean">>;
-  /** Tool-schema descriptions for top-level fields whose zod schema (shared with the Server) carries none. */
-  fieldDescriptions?: Readonly<Record<string, string>>;
-  /** The Agent API routes the operation calls. */
-  routes: readonly AgentApiRouteKey[];
-  /** Semantics of an operation that calls no route. */
-  local?: { sideEffect: "read" | "write"; idempotency: "natural" | "none" };
-  /** The argument carrying the idempotency key, when the routes are keyed. */
-  idempotencyArg?: string;
-  mayInterrupt?: boolean;
-  consumes: { model: RaftConsumption[]; code: RaftConsumption[] | "refused" };
-  output: { mayBeLarge: boolean; boundBy: string[] };
-  deprecated?: boolean;
-}
-
-const nothing = { model: [], code: [] } satisfies OperationDef["consumes"];
-const small = { mayBeLarge: false, boundBy: [] } satisfies OperationDef["output"];
+const nothing = NO_CONSUMPTION;
+const small = SMALL_OUTPUT;
 
 const OPERATION_DEFS = [
   {
@@ -160,7 +156,7 @@ const OPERATION_DEFS = [
   },
   {
     name: "inbox.check",
-    description: "Pull one batch of new messages addressed to you (DMs, @mentions, followed threads, joined channels). Handle them, then call inbox.commit; the next check acknowledges the committed batch.",
+    description: `Pull one batch of new messages addressed to you (DMs, @mentions, followed threads, joined channels). Handle them, then call inbox.commit; the next check acknowledges the committed batch. ${REPEAT_DELIVERY_RULE}`,
     schema: checkInboxRequestSchema,
     routes: ["events"],
     consumes: { model: ["inbox", "seen"], code: "refused" },
@@ -168,7 +164,7 @@ const OPERATION_DEFS = [
   },
   {
     name: "inbox.drain",
-    description: "Pull new messages until the server reports nothing more, returned together. Each batch is acknowledged by the pull after it; call inbox.commit after handling the result.",
+    description: `Pull new messages until the server reports nothing more, returned together; deprecated, since that hands over the whole inbox at once: instead list with inbox.list, then read one conversation at a time with messages.read (unread: true). Each batch is acknowledged by the pull after it; call inbox.commit after handling the result. ${REPEAT_DELIVERY_RULE}`,
     schema: drainInboxRequestSchema,
     routes: ["events"],
     consumes: { model: ["inbox", "seen"], code: "refused" },
@@ -185,11 +181,19 @@ const OPERATION_DEFS = [
   },
   {
     name: "inbox.list",
-    description: "List conversations with unread messages, newest activity first, each with where to start reading. Consumes nothing.",
+    description: "List what is waiting for you, newest activity first: unread conversations and, where the server lists them, app items and reminders, each with the call that reads it. Consumes nothing.",
     schema: listInboxRequestSchema,
     routes: ["inboxList"],
     consumes: nothing,
     output: { mayBeLarge: true, boundBy: ["before", "limit"] },
+  },
+  {
+    name: "inbox.read",
+    description: "Read one page of one item from inbox.list, oldest unread first; what it gives out is read and is not given again. When more is left, the first line says how many, so read the same item again for the rest; a reminder stays listed until you ack it. To re-read something already read, use messages.read.",
+    schema: readInboxItemRequestSchema,
+    routes: ["inboxRead"],
+    consumes: { model: ["inbox", "seen"], code: "refused" },
+    output: { mayBeLarge: true, boundBy: ["limit"] },
   },
   {
     name: "messages.read",
@@ -224,9 +228,9 @@ const OPERATION_DEFS = [
   },
   {
     name: "messages.search",
-    description: "Search messages by text, conversation, sender, or time; results are previews. Use it to find a specific message, not to check what is new.",
+    description: "Search messages by text, conversation, sender, or time; results are previews. Use it to find a specific message, not to check what is new. A text search also says when artifacts match it.",
     schema: searchMessagesRequestSchema,
-    routes: ["messageSearch"],
+    routes: ["messageSearch", "artifactList"],
     consumes: nothing,
     output: { mayBeLarge: true, boundBy: ["limit", "offset"] },
   },
@@ -255,6 +259,15 @@ const OPERATION_DEFS = [
     output: small,
   },
   {
+    name: "messages.updateCard",
+    description: "Replace the card (and its text) of a card message you sent in the last 14 days; it notifies no one. Pass expectedRevision (the card=rN you last read) so a newer state is never overwritten.",
+    schema: updateMessageCardRequestSchema,
+    routes: ["messageCardUpdate"],
+    idempotencyArg: "idempotencyKey",
+    consumes: nothing,
+    output: small,
+  },
+  {
     name: "attachments.downloadUrl",
     description: "Get a short-lived (5 minute) URL for an attachment's bytes, with its filename and MIME type, for runtimes that fetch files themselves. The URL grants access to the file: do not post it in messages.",
     schema: downloadAttachmentUrlRequestSchema,
@@ -270,6 +283,7 @@ const OPERATION_DEFS = [
     consumes: nothing,
     output: { mayBeLarge: true, boundBy: ["limit"] },
   },
+  ...artifactsOperationDefs,
   {
     name: "mentions.pending",
     description: "List @mentions you sent that reached nobody, each with the actions that would deliver it.",
@@ -304,7 +318,7 @@ const OPERATION_DEFS = [
   },
   {
     name: "actions.prepare",
-    description: "Post an action card (create a channel, add members, create an agent, or an integration step) for a human to confirm; the human who clicks it carries it out as themselves. When it is executed (or fails), the outcome arrives as a reply that @mentions you in the card's thread (or in the thread the card was posted in).",
+    description: "Post an action card (create a channel, add members, create an agent, or an integration step) for a human to confirm; the human who clicks it carries it out as themselves. When it is executed (or fails), the outcome arrives as a reply that @mentions you in the card's thread (or in the thread the card was posted in). A plan:upgrade card executes nothing: its button only opens the upgrade dialog, and no reply follows.",
     schema: prepareActionCardRequestSchema,
     fieldDescriptions: {
       target: "Conversation to post the card in: `#channel`, `dm:@peer`, or a thread.",
@@ -313,6 +327,14 @@ const OPERATION_DEFS = [
     },
     routes: ["actionPrepare"],
     idempotencyArg: "idempotencyKey",
+    consumes: nothing,
+    output: small,
+  },
+  {
+    name: "actions.withdraw",
+    description: "Withdraw a question card (question:ask) you posted, while nobody has answered it: the person can no longer answer, and no reply is posted, so the outcome is your receipt. Answered first, nothing is withdrawn and the failure carries the answers; expired, it says so.",
+    schema: withdrawQuestionCardRequestSchema,
+    routes: ["actionWithdraw"],
     consumes: nothing,
     output: small,
   },
@@ -351,7 +373,7 @@ const OPERATION_DEFS = [
   },
   {
     name: "tasks.create",
-    description: "Create one or more tasks on a channel's board; each gets its own thread.",
+    description: "Create one or more tasks on a channel's board, from their source message where task conversations are on; each gets its own thread.",
     schema: createTasksRequestSchema,
     routes: ["taskCreate"],
     idempotencyArg: "idempotencyKey",
@@ -384,7 +406,7 @@ const OPERATION_DEFS = [
   },
   {
     name: "tasks.updateStatus",
-    description: "Move a task: todo → in_progress → in_review → done, or closed from anywhere. Held like a send when the channel has messages you have not seen.",
+    description: "Set a task's status; any status can be set from any other (usual path todo → in_progress → done; backlog = not now, with an optional reason; closed = won't do). Held like a send when the channel has messages you have not seen.",
     schema: updateTaskStatusRequestSchema,
     routes: ["taskUpdateStatus"],
     mayInterrupt: true,
@@ -442,8 +464,8 @@ const OPERATION_DEFS = [
   },
   {
     name: "channels.leave",
-    description: "Leave a channel; ordinary channel messages stop arriving.",
-    schema: channelTargetRequestSchema,
+    description: "Leave a channel; ordinary channel messages stop arriving. As a private channel's last member, leaving deletes it and all its messages, so that is refused unless `deleteIfLast` is true.",
+    schema: channelLeaveRequestSchema,
     routes: ["serverInfo", "channelLeave"],
     consumes: nothing,
     output: small,
@@ -522,8 +544,8 @@ const OPERATION_DEFS = [
   },
   {
     name: "channels.removeMember",
-    description: "Remove a human (`user`) or an agent (`agent`) from a channel. Works when your server role, or your channel-admin role in that channel, allows it.",
-    schema: channelMemberRequestSchema,
+    description: "Remove a human (`user`) or an agent (`agent`) from a channel. Works when your server role, or your channel-admin role in that channel, allows it. Removing a private channel's last member deletes it and all its messages, so that is refused unless `deleteIfLast` is true.",
+    schema: channelMemberRemoveRequestSchema,
     routes: ["serverInfo", "channelMemberRemove"],
     consumes: nothing,
     output: small,
@@ -614,6 +636,14 @@ const OPERATION_DEFS = [
     consumes: nothing,
     output: small,
   },
+  {
+    name: "raftbench.findings",
+    description: "Read RaftBench findings (patterns found in this server's conversations) one page at a time, once a server owner or administrator has allowed this agent in RaftBench settings; only findings whose every cited channel you can read are returned. Each evidence item is a `target` and `messageId` to open with messages.read (`around`). A finding is a hypothesis, not proof of a current problem: read its evidence and search for counterevidence before answering, and no findings does not mean no problems.",
+    schema: raftbenchFindingsQuerySchema,
+    routes: ["raftbenchFindings"],
+    consumes: nothing,
+    output: { mayBeLarge: true, boundBy: ["limit", "cursor"] },
+  },
 ] as const satisfies readonly OperationDef[];
 
 /** The dotted name of every operation in the manifest (the `invoke` key). */
@@ -621,6 +651,9 @@ export type RaftOperationName = (typeof OPERATION_DEFS)[number]["name"];
 
 /** `tasks.updateStatus` → `tasks_update_status` (shared with the hint renderer, which names tools the same way). */
 export { raftToolNameFor };
+
+/** Each first-party app's operations, by the app's id (`features.enabledApps`). */
+const APP_OF_OPERATION: ReadonlyMap<string, string> = new Map(artifactsOperationDefs.map((def) => [def.name, "artifacts"]));
 
 const IDEMPOTENCY_STRENGTH = { natural: 0, key: 1, none: 2 } as const;
 
@@ -647,6 +680,7 @@ function deriveSpec(def: OperationDef): RaftOperationSpec {
     consumes: { model: [...def.consumes.model], code: def.consumes.code === "refused" ? "refused" : [...def.consumes.code] },
     output: { mayBeLarge: def.output.mayBeLarge, boundBy: [...def.output.boundBy] },
     ...(def.deprecated ? { deprecated: true } : {}),
+    ...(APP_OF_OPERATION.has(def.name) ? { app: APP_OF_OPERATION.get(def.name)! } : {}),
   };
 }
 

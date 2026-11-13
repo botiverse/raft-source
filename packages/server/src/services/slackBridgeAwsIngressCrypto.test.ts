@@ -191,6 +191,11 @@ test("KMS envelope refuses AAD substitution, wrong returned key authority, and i
   }), /cannot be sealed/);
   assert.equal(calls, 0);
   const sealed = await crypto.payloadSealer.sealNormalizedPayload({ plaintext: "payload", aad: aad() });
+  const { SlackNormalizedEnvelopeInvalid } = await import("./slackNormalizedPayloadError");
+  await assert.rejects(() => crypto.decryptNormalizedPayload({
+    eventId: "55555555-5555-4555-8555-555555555555", ciphertext: "malformed",
+    envelopeKeyId: sealed.envelopeKeyId, aad: aad(),
+  }), SlackNormalizedEnvelopeInvalid);
   await assert.rejects(() => crypto.decryptNormalizedPayload({
     eventId: "55555555-5555-4555-8555-555555555555",
     ciphertext: sealed.encryptedPayload,

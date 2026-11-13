@@ -65,7 +65,8 @@ test.describe("detail panel layout contract", () => {
       expect(panelBox!.x).toBe(0);
 
       // Header height is part of the cross-panel contract: every Raft head
-      // (phone nav row, panel / sidebar / drawer header) is 56 tall.
+      // (panel / sidebar / drawer header) is raft-ui's header height: 56 on a
+      // phone-width viewport (or a touch screen), 44 with a mouse at md+.
       const headerBox = await page.getByTestId("legacy-task-panel-header").boundingBox();
       expect(headerBox?.height).toBe(56);
     });
@@ -74,7 +75,7 @@ test.describe("detail panel layout contract", () => {
   test.describe("rail-visible viewport (md+): centered modal", () => {
     test.use({ viewport: { width: 1280, height: 800 } });
 
-    test("legacy task panel opens as a centered modal from Tasks and uses the 56px header", async ({
+    test("legacy task panel opens as a centered modal from Tasks and uses the 44px header", async ({
       page,
       request,
     }) => {
@@ -92,7 +93,7 @@ test.describe("detail panel layout contract", () => {
       await expect(panel).toBeVisible();
 
       // Legacy tasks opened from /tasks at md+ share the task-thread modal
-      // pattern — bounded centered card inside <Modal>, position defaults
+      // pattern — bounded centered card inside the task dialog (raft-ui Dialog), position defaults
       // to static.
       const position = await panel.evaluate((el) => getComputedStyle(el).position);
       expect(position).toBe("static");
@@ -102,10 +103,10 @@ test.describe("detail panel layout contract", () => {
       expect(panelBox!.width).toBeLessThan(page.viewportSize()!.width);
       expect(panelBox!.x).toBeGreaterThan(0);
 
-      // Header height is part of the cross-panel contract: every Raft head
-      // (phone nav row, panel / sidebar / drawer header) is 56 tall.
+      // Header height is part of the cross-panel contract: with a mouse at md+
+      // every Raft head is raft-ui's desktop header height, 44 tall.
       const headerBox = await page.getByTestId("legacy-task-panel-header").boundingBox();
-      expect(headerBox?.height).toBe(56);
+      expect(headerBox?.height).toBe(44);
     });
   });
 });

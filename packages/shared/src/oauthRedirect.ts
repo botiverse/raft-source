@@ -18,3 +18,22 @@ export function appendOAuthAuthorizationParams(returnTo: string, code: string, s
   if (state) url.searchParams.set("state", state);
   return url.toString();
 }
+
+/**
+ * An authorization error sent back to the app's registered callback (RFC 6749
+ * §4.1.2.1): `error`, optional `error_description`, and the app's `state`.
+ * Only for a callback the server already matched to the registered one.
+ */
+export function appendOAuthErrorParams(
+  returnTo: string,
+  error: string,
+  options: { description?: string | null; state?: string | null } = {},
+): string {
+  if (!isSafeOAuthReturnUrl(returnTo)) throw new Error("Invalid OAuth returnUrl");
+  const url = new URL(returnTo);
+  url.searchParams.delete("code");
+  url.searchParams.set("error", error);
+  if (options.description) url.searchParams.set("error_description", options.description);
+  if (options.state) url.searchParams.set("state", options.state);
+  return url.toString();
+}

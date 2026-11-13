@@ -105,6 +105,19 @@ export const CANONICAL_MESSAGE_V2_MANIFEST = Object.freeze({
     legacyCompatibilityPreviewPolicy: "empty-without-room-common-provenance",
     deterministicOrder: "emoji-code-unit/actor-id-code-unit",
   }),
+  /** RFC 077 retraction. Additive and optional at schema 5: a reader that does
+   * not know the key may ignore it. Present only when the V1 row is retracted;
+   * retraction is one-way, so absent means "not retracted or unknown" and
+   * preserves an earlier retraction instead of clearing it. */
+  retraction: Object.freeze({
+    field: "deletedAt",
+    wireType: "iso-8601-string",
+    optionalKey: true,
+    presentWhen: "legacy-row-deletedAt-non-empty-string",
+    mergePolicy: "present-overwrite",
+    absentPolicy: "preserve",
+  }),
+  factFields: Object.freeze(["deletedAt", "reactions"] as const),
   viewerOverlayFields: Object.freeze(["reactions.reactedByMe"] as const),
   readCacheRelations: Object.freeze(["Message.ReactionActors"] as const),
   forbiddenCanonicalPaths: Object.freeze([
@@ -274,12 +287,39 @@ export function reactionViewerOverlaySnapshotJson(
   return `${JSON.stringify(projected)}\n`;
 }
 
+/** RFC 077 retraction slice of the shared fact: `deletedAt` is present only
+ * for a retracted message (ISO-8601), never `null`. */
+export interface CanonicalRetractionFact {
+  deletedAt?: string;
+}
+
 export interface CanonicalMessageV2Envelope {
   schemaVersion: typeof CANONICAL_MESSAGE_V2_SCHEMA_VERSION;
   kind: typeof CANONICAL_MESSAGE_V2_ENVELOPE_KIND;
   fact: {
     reactions?: readonly CanonicalReactionFact[];
-  };
+  } & CanonicalRetractionFact;
+}
+
+function isRetractionTimestamp(value: unknown): value is string {
+  return typeof value === "string"
+    && value.length > 0
+    && value === value.trim()
+    && Number.isFinite(Date.parse(value));
+}
+
+/**
+ * Normalize the V1 row's `deletedAt` (ISO string, `null` = live, absent on the
+ * task-status projector) into the V2 retraction fact: a retracted row carries
+ * the key, a live or unknown row omits it.
+ */
+export function normalizeLegacyRetraction(deletedAt: unknown): CanonicalRetractionFact {
+  return isRetractionTimestamp(deletedAt) ? { deletedAt } : {};
+}
+
+/** Deterministic bytes of the retraction fact for cross-platform vectors. */
+export function canonicalRetractionFactJson(fact: CanonicalRetractionFact): string {
+  return `${JSON.stringify(fact.deletedAt === undefined ? {} : { deletedAt: fact.deletedAt })}\n`;
 }
 
 function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
@@ -333,7 +373,8 @@ export function isCanonicalMessageV2SoleApplyEligible(
   if (envelope.kind !== CANONICAL_MESSAGE_V2_ENVELOPE_KIND) return false;
   if (!envelope.fact || typeof envelope.fact !== "object") return false;
   const fact = envelope.fact as Record<string, unknown>;
-  if (!hasExactKeys(fact, ["reactions"])) return false;
+  if (!hasExactKeys(fact, ["reactions"]) && !hasExactKeys(fact, ["deletedAt", "reactions"])) return false;
+  if ("deletedAt" in fact && !isRetractionTimestamp(fact.deletedAt)) return false;
   const reactions = fact.reactions;
   if (!Array.isArray(reactions) || reactions.length > CANONICAL_REACTION_LIMIT) return false;
   if (!reactions.every(isCanonicalReactionFact)) return false;

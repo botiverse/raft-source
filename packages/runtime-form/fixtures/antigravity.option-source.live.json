@@ -1,0 +1,33 @@
+{
+  "protocolVersion": 1,
+  "runtimeId": "antigravity",
+  "schemaVersion": "antigravity.edit.v1",
+  "sourceId": "model",
+  "kind": "select",
+  "pointer": "/model",
+  "options": [
+    {
+      "value": "default",
+      "label": "AGY configured default",
+      "supportedReasoningEfforts": []
+    },
+    {
+      "value": "gemini-3.8-flash",
+      "label": "Gemini 3.8 Flash",
+      "supportedReasoningEfforts": [
+        "low",
+        "medium",
+        "high"
+      ],
+      "defaultReasoningEffort": "medium"
+    },
+    {
+      "value": "gemini-4-carbon-medium",
+      "label": "Gemini 4 Carbon (Medium)",
+      "supportedReasoningEfforts": []
+    }
+  ],
+  "defaultValue": "default",
+  "customValueAllowed": true,
+  "status": "live"
+}

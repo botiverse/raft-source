@@ -163,3 +163,25 @@ test("channel info takes the target as --target too, as the card's agents tried 
   await channelInfoCommand.handler(ctx, undefined, { target: "#qa-a" });
   assert.match(stdout.join(""), /Channel: #qa-a/);
 });
+
+test("channel info answers for an archived channel (read-only) that server info counts but does not list", async () => {
+  const { io, stdout, stderr } = memoryIo();
+  const ctx = createCommandContext({
+    io,
+    loadAgentContext: () => agentContext,
+    createApiClient: () => ({
+      request: async (_method: string, path: string): Promise<ApiResponse<unknown>> => {
+        if (path.startsWith("/internal/agent-api/channel-members")) {
+          return { ok: true, status: 200, error: null, data: { channel: { ref: "#proj-task", type: "channel" }, agents: [], humans: [{ name: "xxchan" }] } };
+        }
+        if (path.endsWith("/server?archived=include")) {
+          return { ok: true, status: 200, error: null, data: { runtimeContext: { agentId: "agent-1", serverId: "server-1" }, channels: [], archivedChannelCount: 1, archivedChannels: [{ id: "c9", name: "proj-task", joined: true, type: "channel", archived: true }], agents: [], humans: [] } };
+        }
+        return { ok: true, status: 200, error: null, data: { runtimeContext: { agentId: "agent-1", serverId: "server-1" }, channels: [], archivedChannelCount: 1, agents: [], humans: [] } };
+      },
+    }) as any,
+  });
+  await channelInfoCommand.handler(ctx, "#proj-task");
+  assert.deepEqual(stderr, []);
+  assert.match(stdout.join(""), /Archived: yes \(read-only: you can read its history, nothing new can be posted\)/);
+});

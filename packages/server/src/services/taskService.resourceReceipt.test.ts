@@ -13,7 +13,7 @@ import { addAgent, addHuman, createChannel } from "./channelService";
 import { createServer } from "./serverService";
 import * as taskService from "./taskService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 async function seed() {
   const db = getDb();

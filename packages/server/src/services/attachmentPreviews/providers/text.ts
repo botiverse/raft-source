@@ -1,5 +1,5 @@
 import { TextDecoder } from "node:util";
-import { isTextPreviewCandidate, TEXT_PREVIEW_BYTE_LIMIT, type TextAttachmentPreviewData } from "@botiverse/raft-shared";
+import { isTextPreviewCandidate, previewPrefixAtLineBoundary, TEXT_PREVIEW_BYTE_LIMIT, type TextAttachmentPreviewData } from "@botiverse/raft-shared";
 import type { AttachmentPreviewProvider } from "../types";
 
 export { TEXT_PREVIEW_BYTE_LIMIT };
@@ -28,8 +28,11 @@ export const textPreviewProvider: AttachmentPreviewProvider<TextAttachmentPrevie
   streamByteCap: TEXT_PREVIEW_BYTE_LIMIT,
   payloadByteCap: TEXT_PREVIEW_PAYLOAD_BYTE_LIMIT,
   canPreview: (attachment) => isTextAttachment(attachment.filename, attachment.mimeType),
-  async buildPreview({ buffer }) {
-    const text = decodeUtf8Text(buffer);
+  async buildPreview({ buffer, truncated }) {
+    // A truncated read is cut at its last whole line, so the strict decode
+    // below never sees a character split by the byte cap.
+    const shown = truncated ? previewPrefixAtLineBoundary(buffer) : buffer;
+    const text = decodeUtf8Text(Buffer.from(shown.buffer, shown.byteOffset, shown.byteLength));
     if (text == null) return null;
     return buildTextPreview(text);
   },

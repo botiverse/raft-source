@@ -56,10 +56,11 @@ const {
 } = await import("../src/store/serverFeatureFlags");
 const { reactionReadModelStore } = await import("../src/store/reactionReadModels");
 const { useChannelStore } = await import("../src/store/channelStore");
-const { useMessageStore } = await import("../src/store/messageStore");
+const { __resetMessageHistoryRequestsForTests, useMessageStore } = await import("../src/store/messageStore");
 const { useServerStore } = await import("../src/store/serverStore");
 const { triggerServerReset } = await import("../src/store/serverResetRegistry");
 const { buildMainLayoutSocketBindings } = await import("../src/store/socketBridge");
+const { BOOT_FETCHES_GLOBAL, __resetBootFetchesForTest } = await import("../src/boot/bootPrefetch");
 const { useInboxStore } = await import("../src/store/inboxStore");
 const { useThreadStore } = await import("../src/store/threadStore");
 const {
@@ -159,7 +160,6 @@ function resetThreadStore() {
     replyScopes: {},
     followedThreads: [],
     taskUpdatesByMessageId: {},
-    focusedThreadChannelId: null,
   });
 }
 
@@ -223,7 +223,7 @@ afterEach(() => {
   storage.clear();
 });
 
-function socketHandler(event: string, scheduleInboxRefresh = () => {}) {
+function socketHandler(event: string, scheduleInboxRefresh: (trigger: string) => void = () => {}) {
   const bindings = buildMainLayoutSocketBindings(
     {
       connected: true,
@@ -250,7 +250,7 @@ function messageNewHandler(scheduleInboxRefresh = () => {}) {
 }
 
 
-function threadUpdatedHandler(scheduleInboxRefresh = () => {}) {
+function threadUpdatedHandler(scheduleInboxRefresh: (trigger: string) => void = () => {}) {
   return socketHandler("thread:updated", scheduleInboxRefresh);
 }
 
@@ -941,7 +941,8 @@ test("thread replies bridge: duplicate same-epoch mismatch coalesces to one requ
     }
   });
   try {
-    const handler = threadUpdatedHandler();
+    const triggers: string[] = [];
+    const handler = threadUpdatedHandler((trigger) => { triggers.push(trigger); });
     handler(canonicalThreadUpdate(10, "epoch-1"));
     publications = 0;
     handler(canonicalThreadUpdate(11, "epoch-2", {
@@ -973,8 +974,11 @@ test("thread replies bridge: duplicate same-epoch mismatch coalesces to one requ
     resolveSummary({
       data: { threadChannelId: "thread-channel-1", replyCount: 10 },
     });
+    assert.ok(!triggers.includes("thread_reply_rebaseline"), "no rebaseline refresh before the snapshot lands");
     await new Promise((resolve) => setTimeout(resolve, 0));
     assert.equal(publications, 1);
+    assert.equal(triggers.at(-1), "thread_reply_rebaseline", "#triage:#229: the post-rebaseline refresh names itself");
+    assert.equal(triggers.filter((trigger) => trigger === "thread_reply_rebaseline").length, 1);
     assert.deepEqual(
       useThreadStore.getState().replyScopes["parent-thread-1"]?.replies.map((item) => item.seq),
       [11, 12, 13],
@@ -1134,13 +1138,18 @@ test("receiver-private HTTP response for A cannot mutate or reactivate after aut
   stubMessageFlagEvaluation(true);
 
   let resolveRequest!: (value: unknown) => void;
-  api.get = (async () => new Promise<unknown>((resolve) => {
-    resolveRequest = resolve;
-  })) as typeof api.get;
+  const readFor: (string | null)[] = [];
+  api.get = (async () => {
+    readFor.push(useMessageStore.getState().currentUserId);
+    // B's own read of the window, once A's is dropped: nothing for B.
+    if (readFor.length > 1) return { data: { messages: [] } };
+    return new Promise<unknown>((resolve) => {
+      resolveRequest = resolve;
+    });
+  }) as typeof api.get;
   const pending = useMessageStore.getState().loadMessages(channelId);
 
   useMessageStore.getState().setCurrentUserId("user-b");
-  const storeBefore = useMessageStore.getState().channelMessages;
   const readModelBefore = reactionReadModelStore.getState();
   resolveRequest({
     data: {
@@ -1157,7 +1166,8 @@ test("receiver-private HTTP response for A cannot mutate or reactivate after aut
   });
   await pending;
 
-  assert.equal(useMessageStore.getState().channelMessages, storeBefore);
+  assert.deepEqual(readFor, ["user-a", "user-b"], "the window is read again for B");
+  assert.deepEqual(useMessageStore.getState().channelMessages[channelId], [], "A's rows are not B's window");
   const readModelAfter = reactionReadModelStore.getState();
   assert.equal(readModelAfter.activePrincipalId, "user-b");
   assert.equal(readModelAfter.viewerOverlay, readModelBefore.viewerOverlay);
@@ -1178,6 +1188,7 @@ test("sync resume keeps an invalid batch on V1 and skips normalized side effects
   };
   const malformed = {
     ...message(2, "malformed"),
+    id: "message-sync-bridge-2",
     reactions: [{ emoji: " 👍 ", count: 1, previewK: [] }],
   };
   socketHandler("sync:resume:response")({
@@ -1211,4 +1222,156 @@ test("sync resume keeps an invalid batch on V1 and skips normalized side effects
   await new Promise((resolve) => setTimeout(resolve, 0));
   assert.equal(viewerGetCalls, 0, "resume must not request the retired normalized viewer state");
   assert.equal(reactionReadModelStore.getState().viewerVersions.size, 0);
+});
+
+function recordingBindings(syncVisibleScopes: () => Promise<void> = async () => {}) {
+  const emitted: Array<{ event: string; args: unknown[] }> = [];
+  const bindings = buildMainLayoutSocketBindings(
+    {
+      connected: true,
+      emit(event: string, ...args: unknown[]) { emitted.push({ event, args }); },
+      on() {},
+      off() {},
+      onAny() {},
+      offAny() {},
+      disconnect() {},
+      connect() {},
+    },
+    () => {},
+    syncVisibleScopes,
+    () => {},
+    () => {},
+  );
+  const handler = (event: string) => {
+    const binding = bindings.find((item) => item.event === event);
+    assert.ok(binding);
+    return binding.handler;
+  };
+  return { emitted, handler };
+}
+
+test("connect asks for a starting sync horizon once and keeps the answer", () => {
+  useMessageStore.setState({ syncHorizon: null });
+  __resetMessageHistoryRequestsForTests();
+  api.get = (async () => ({ data: [] })) as typeof api.get;
+  const { emitted, handler } = recordingBindings();
+
+  handler("connect")();
+  const request = emitted.find((entry) => entry.event === "sync:horizon");
+  assert.ok(request, "connect requests sync:horizon");
+  (request.args[0] as (response: { horizon: string }) => void)({ horizon: "1200" });
+  assert.equal(useMessageStore.getState().syncHorizon, "1200");
+
+  handler("connect")();
+  assert.equal(emitted.filter((entry) => entry.event === "sync:horizon").length, 1, "a known horizon is not re-requested");
+});
+
+test("sync:resume carries the horizon and takes the next one from the response", async () => {
+  api.get = (async () => ({ data: [] })) as typeof api.get;
+  stubMessageFlagEvaluation(false);
+  useMessageStore.setState({ lastSeq: 40, syncHorizon: "1200" });
+  const { emitted, handler } = recordingBindings();
+
+  handler("rooms:joined")();
+  const resume = emitted.find((entry) => entry.event === "sync:resume");
+  assert.deepEqual(resume?.args[0], { lastSeq: 40, sinceHorizon: "1200" });
+
+  handler("sync:resume:response")({ messages: [], currentSeq: 40, hasMore: false, horizon: "1350" });
+  assert.equal(useMessageStore.getState().syncHorizon, "1350");
+
+  handler("sync:resume:response")({ messages: [], currentSeq: 40, hasMore: false });
+  assert.equal(useMessageStore.getState().syncHorizon, "1350", "an old server's response keeps the horizon");
+  await new Promise((resolve) => setTimeout(resolve, 0));
+});
+
+test("sync:resume without a horizon yet is sent exactly as before", async () => {
+  api.get = (async () => ({ data: [] })) as typeof api.get;
+  stubMessageFlagEvaluation(false);
+  useMessageStore.setState({ lastSeq: 40, syncHorizon: null });
+  const { emitted, handler } = recordingBindings();
+
+  handler("rooms:joined")();
+  assert.deepEqual(emitted.find((entry) => entry.event === "sync:resume")?.args[0], { lastSeq: 40 });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+});
+
+test("a horizon reset re-reads the visible scopes", async () => {
+  api.get = (async () => ({ data: [] })) as typeof api.get;
+  useMessageStore.setState({ lastSeq: 40, syncHorizon: "1200" });
+  let visibleScopeSyncs = 0;
+  const { handler } = recordingBindings(async () => { visibleScopeSyncs += 1; });
+
+  handler("sync:resume:response")({ messages: [], currentSeq: 41, hasMore: false, horizon: "1400", horizonReset: true });
+
+  assert.equal(visibleScopeSyncs, 1);
+  assert.equal(useMessageStore.getState().syncHorizon, "1400");
+  await new Promise((resolve) => setTimeout(resolve, 0));
+});
+
+test("a starting horizon whose reply arrives after a history request is not used", async () => {
+  // Socket and HTTP are separate connections: once history has gone out, the
+  // server may have taken the horizon after the history query, so a message in
+  // flight during that query could fall below it.
+  useMessageStore.setState({ syncHorizon: null });
+  __resetMessageHistoryRequestsForTests();
+  api.get = (async () => ({ data: [] })) as typeof api.get;
+  const { emitted, handler } = recordingBindings();
+
+  handler("connect")();
+  const request = emitted.find((entry) => entry.event === "sync:horizon");
+  assert.ok(request);
+  await useMessageStore.getState().syncGap("channel-horizon-race", { sinceSeq: 5 });
+  (request.args[0] as (response: { horizon: string }) => void)({ horizon: "1200" });
+
+  assert.equal(useMessageStore.getState().syncHorizon, null, "the late starting horizon is dropped");
+});
+
+async function startingHorizonAfter(sendFirst: () => Promise<unknown>) {
+  useMessageStore.setState({ syncHorizon: null });
+  __resetMessageHistoryRequestsForTests();
+  const { emitted, handler } = recordingBindings();
+  handler("connect")();
+  const request = emitted.find((entry) => entry.event === "sync:horizon");
+  assert.ok(request);
+  await sendFirst();
+  (request.args[0] as (response: { horizon: string }) => void)({ horizon: "1300" });
+  return useMessageStore.getState().syncHorizon;
+}
+
+test("loading newer messages before the starting horizon's reply drops that horizon", async () => {
+  api.get = (async () => ({ data: [] })) as typeof api.get;
+  useMessageStore.setState({
+    currentChannelId: channelId,
+    loading: false,
+    loadingNewer: false,
+    hasNewer: true,
+    channelWindowMeta: {},
+    channelMessages: { [channelId]: [message(7, "loaded") as never] },
+  });
+
+  assert.equal(await startingHorizonAfter(() => useMessageStore.getState().loadNewerMessages(channelId)), null);
+});
+
+test("sending a message before the starting horizon's reply drops that horizon", async () => {
+  api.post = (async () => ({ data: { ...message(8, "sent"), id: "message-sync-bridge-sent" } })) as typeof api.post;
+
+  assert.equal(await startingHorizonAfter(
+    () => useMessageStore.getState().sendMessage(channelId, "sent").catch(() => undefined),
+  ), null);
+});
+
+test("a page of history the boot script read before the socket existed drops the socket's starting horizon", async () => {
+  // Its read may predate the socket's horizon: the page's own horizon starts the rounds instead.
+  (globalThis as Record<string, unknown>)[BOOT_FETCHES_GLOBAL] = [{
+    u: "https://app.raft.build/api/messages/channel/c1?limit=50",
+    h: {},
+    t: Date.now(),
+    p: new Promise(() => {}),
+  }];
+  try {
+    assert.equal(await startingHorizonAfter(async () => {}), null);
+  } finally {
+    __resetBootFetchesForTest();
+  }
+  assert.equal(await startingHorizonAfter(async () => {}), "1300", "without one the socket's horizon is taken");
 });

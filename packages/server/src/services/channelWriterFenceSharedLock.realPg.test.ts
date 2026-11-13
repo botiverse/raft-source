@@ -157,9 +157,7 @@ test.skipIf(!REAL_PG_URL && !REAL_PG_REQUIRED)(
       await setupPool.end();
       setupPool = undefined;
       app = await startTestApp(testUrl, 0, {
-        channelToJointConversionFlagDefaultEnabled: true,
         humanActivityMuteFlagDefaultEnabled: true,
-        onboardingOpenerFlagDefaultEnabled: false,
       });
       observer = new pg.Pool({ connectionString: testUrl, application_name: "writer-fence-observer", max: 1 });
 
@@ -246,7 +244,7 @@ test.skipIf(!REAL_PG_URL && !REAL_PG_REQUIRED)(
           bothFenced.count += 1;
           if (bothFenced.count === 2) bothFenced.open.open();
           await bothFenced.open.opened;
-          await assertActionCardWritableInTransaction(tx, card.messageId);
+          await assertActionCardWritableInTransaction(tx, server.id, card.messageId);
         });
         const results = await settleWithin(
           Promise.allSettled([gatedWriter(), gatedWriter()]),
@@ -272,7 +270,7 @@ test.skipIf(!REAL_PG_URL && !REAL_PG_REQUIRED)(
             await releaseFirst.opened;
           }
         });
-        const execute = () => executeActionCard({
+        const execute = () => executeActionCard({ webSessionFamilyId: null,
           messageId: card.messageId,
           serverId: server.id as ServerId,
           userId: owner.id,

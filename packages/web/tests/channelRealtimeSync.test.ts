@@ -102,6 +102,9 @@ test("global layout applies server plan payloads and refreshes request-shaped bi
   vi.spyOn(store, "loadServers").mockImplementation(async () => { serverLoads += 1; });
   vi.spyOn(store, "loadBilling").mockImplementation(async () => { billingLoads += 1; });
   vi.spyOn(store, "loadUsage").mockImplementation(async () => { usageLoads += 1; });
+  const { useSavedStore } = await import("../src/store/savedStore");
+  let savedLoads = 0;
+  vi.spyOn(useSavedStore.getState(), "loadSaved").mockImplementation(async () => { savedLoads += 1; });
 
   const binding = buildMainLayoutSocketBindings(
     socket,
@@ -117,11 +120,39 @@ test("global layout applies server plan payloads and refreshes request-shaped bi
   assert.equal(serverLoads, 0);
   assert.equal(billingLoads, 1);
   assert.equal(usageLoads, 1);
+  assert.equal(savedLoads, 1, "saved messages behind the 30-day window come back on Pro");
 
   binding.handler({});
   assert.equal(serverLoads, 1, "missing plan facts trigger an authoritative server reload");
   assert.equal(billingLoads, 2);
   assert.equal(usageLoads, 2);
+});
+
+test("appearance:updated patches that server's theme and decorations; a bad payload is ignored", async () => {
+  const { buildMainLayoutSocketBindings } = await import("../src/store/socketBridge");
+  const { useServerStore } = await import("../src/store/serverStore");
+  const { socket } = makeMainLayoutSocket();
+  const store = useServerStore.getState();
+  const patches: unknown[] = [];
+  vi.spyOn(store, "applyServerPatch").mockImplementation((patch) => void patches.push(patch));
+
+  const binding = buildMainLayoutSocketBindings(
+    socket,
+    () => undefined,
+    async () => undefined,
+    () => undefined,
+    () => undefined,
+  ).find((candidate) => candidate.event === "appearance:updated");
+  assert.ok(binding);
+
+  binding.handler({ serverId: "server-1", theme: "space", themeDecor: false });
+  binding.handler({ serverId: "server-2", theme: null, themeDecor: true });
+  binding.handler({ serverId: "server-3", theme: "neon", themeDecor: true });
+  binding.handler({ theme: "space" });
+  assert.deepEqual(patches, [
+    { id: "server-1", theme: "space", themeDecor: false },
+    { id: "server-2", theme: null, themeDecor: true },
+  ]);
 });
 
 test("installed recovery persists lastSeq on pagehide but not beforeunload", async () => {
@@ -334,6 +365,34 @@ test("an id-only channel:updated refetches the cached channel, so a lifted joint
   }
 });
 
+test("our own join's channel:members-updated does not re-read the row while the join is in flight; anyone else's does", async () => {
+  const { createChannelRealtimeBindings } = await import("../src/store/channelRealtimeSync");
+  const { useChannelStore } = await import("../src/store/channelStore");
+  const original = useChannelStore.getState().ensureChannel;
+  const reads: string[] = [];
+  useChannelStore.setState({
+    joiningChannelIds: { "joining-1": true },
+    ensureChannel: async (channelId: string) => {
+      reads.push(channelId);
+      return null;
+    },
+  } as never);
+  try {
+    const binding = createChannelRealtimeBindings({ emit: () => undefined }, () => undefined)
+      .find((candidate) => candidate.event === "channel:members-updated");
+    assert.ok(binding);
+    binding.handler({ channelId: "joining-1" });
+    assert.deepEqual(reads, [], "the join re-reads it when it settles (store/channelJoin.ts)");
+    binding.handler({ channelId: "other-1" });
+    assert.deepEqual(reads, ["other-1"]);
+    useChannelStore.setState({ joiningChannelIds: {} });
+    binding.handler({ channelId: "joining-1" });
+    assert.deepEqual(reads, ["other-1", "joining-1"], "once the join is done, an event re-reads it again");
+  } finally {
+    useChannelStore.setState({ ensureChannel: original, joiningChannelIds: {} } as never);
+  }
+});
+
 test("message channel activity suppresses muted channel traffic but promotes followed-thread traffic independently", async () => {
   const { applyMessageChannelActivity } = await import("../src/store/channelRealtimeSync");
   const { useChannelStore } = await import("../src/store/channelStore");
@@ -373,7 +432,7 @@ test("message channel activity suppresses muted channel traffic but promotes fol
     senderId: "user-other",
     content: "ordinary",
     createdAt: "2026-07-07T00:01:00.000Z",
-  }, () => { inboxRefreshes += 1; });
+  }, () => { inboxRefreshes += 1; }, "message_new");
   applyMessageChannelActivity({
     id: "m-muted-thread",
     seq: 11,
@@ -388,7 +447,7 @@ test("message channel activity suppresses muted channel traffic but promotes fol
     senderId: "user-other",
     content: "ordinary thread reply",
     createdAt: "2026-07-07T00:02:00.000Z",
-  }, () => { inboxRefreshes += 1; });
+  }, () => { inboxRefreshes += 1; }, "message_new");
 
   assert.deepEqual(useChannelStore.getState().channelActivity, {
     "thread-muted": "2026-07-07T00:02:00.000Z",
@@ -401,6 +460,7 @@ test("message channel activity lets direct mentions pierce activity mute", async
   const { useChannelStore } = await import("../src/store/channelStore");
   const { useMessageStore } = await import("../src/store/messageStore");
   let inboxRefreshes = 0;
+  const triggers: string[] = [];
   useMessageStore.getState().setCurrentUserId("user-current");
   useChannelStore.setState({
     channels: [{
@@ -431,10 +491,11 @@ test("message channel activity lets direct mentions pierce activity mute", async
       name: "current",
     }],
     createdAt: "2026-07-07T00:03:00.000Z",
-  }, () => { inboxRefreshes += 1; });
+  }, (trigger) => { inboxRefreshes += 1; triggers.push(trigger); }, "message_echo");
 
   assert.equal(useChannelStore.getState().channelActivity["c-muted"], "2026-07-07T00:03:00.000Z");
   assert.equal(inboxRefreshes, 1);
+  assert.deepEqual(triggers, ["message_echo"], "the caller's trigger is passed through");
 });
 
 test("thread updated socket event promotes followed-thread activity independently from parent mute", async () => {
@@ -444,6 +505,7 @@ test("thread updated socket event promotes followed-thread activity independentl
   const { useMessageStore } = await import("../src/store/messageStore");
   const { useThreadStore } = await import("../src/store/threadStore");
   let inboxRefreshes = 0;
+  const triggers: string[] = [];
   useMessageStore.getState().setCurrentUserId("user-current");
   useChannelStore.setState({
     channels: [{
@@ -519,7 +581,7 @@ test("thread updated socket event promotes followed-thread activity independentl
       disconnect: () => undefined,
       connect: () => undefined,
     },
-    () => { inboxRefreshes += 1; },
+    (trigger) => { inboxRefreshes += 1; triggers.push(trigger); },
     async () => undefined,
     () => undefined,
     () => undefined,
@@ -553,6 +615,7 @@ test("thread updated socket event promotes followed-thread activity independentl
   assert.equal(inboxThread?.latestActivityMessageId, "reply-muted");
   assert.equal(inboxThread?.replyCount, 2);
   assert.equal(inboxRefreshes, 1);
+  assert.deepEqual(triggers, ["thread_reply"], "the refresh names its event");
 });
 
 test("message:new socket event promotes followed-thread activity independently from parent mute", async () => {
@@ -561,6 +624,7 @@ test("message:new socket event promotes followed-thread activity independently f
   const { useInboxStore } = await import("../src/store/inboxStore");
   const { useMessageStore } = await import("../src/store/messageStore");
   let inboxRefreshes = 0;
+  const triggers: string[] = [];
   useMessageStore.getState().setCurrentUserId("user-current");
   useChannelStore.setState({
     channels: [{
@@ -616,7 +680,7 @@ test("message:new socket event promotes followed-thread activity independently f
       disconnect: () => undefined,
       connect: () => undefined,
     },
-    () => { inboxRefreshes += 1; },
+    (trigger) => { inboxRefreshes += 1; triggers.push(trigger); },
     async () => undefined,
     () => undefined,
     () => undefined,
@@ -646,6 +710,7 @@ test("message:new socket event promotes followed-thread activity independently f
     "thread-muted": "2026-07-07T00:05:00.000Z",
   });
   assert.equal(inboxRefreshes, 1);
+  assert.deepEqual(triggers, ["message_new"], "the refresh names its event");
   assert.equal(useMessageStore.getState().channelMessages["thread-muted"]?.[0]?.id, "reply-boundary");
 });
 
@@ -654,6 +719,7 @@ test("channel realtime binding refreshes existing DMs without socketBridge store
   const { useChannelStore } = await import("../src/store/channelStore");
   const emitted: Array<{ event: string; channelId: string }> = [];
   let inboxRefreshes = 0;
+  const triggers: string[] = [];
   useChannelStore.setState({
     channels: [],
     dmChannels: [
@@ -682,7 +748,7 @@ test("channel realtime binding refreshes existing DMs without socketBridge store
         emitted.push({ event, channelId: String(channelId) });
       },
     },
-    () => { inboxRefreshes += 1; },
+    (trigger) => { inboxRefreshes += 1; triggers.push(trigger); },
   ).find((candidate) => candidate.event === "dm:new");
   assert.ok(binding);
 
@@ -692,6 +758,7 @@ test("channel realtime binding refreshes existing DMs without socketBridge store
   assert.deepEqual(useChannelStore.getState().dmChannels.map((channel) => channel.id), ["dm-new", "dm-old"]);
   assert.equal(typeof useChannelStore.getState().channelActivity["dm-new"], "string");
   assert.equal(inboxRefreshes, 1);
+  assert.deepEqual(triggers, ["dm_new"], "the refresh names its event");
 });
 
 test("main socket bridge applies channel notification_prefs:updated to activity mute state", async () => {
@@ -846,25 +913,13 @@ test("main socket bridge applies message_display_prefs:updated and drops stale p
   assert.equal(afterStalePatch?.displayPrefsVersion, 2);
 });
 
-test("main socket bridge gates channel notification_prefs:updated through sync-core when enabled", async () => {
+test("main socket bridge gates channel notification_prefs:updated through sync-core", async () => {
   const { buildMainLayoutSocketBindings } = await import("../src/store/socketBridge");
   const { useChannelStore } = await import("../src/store/channelStore");
   const { useServerStore } = await import("../src/store/serverStore");
-  const api = (await import("../src/api/client")).default;
-  const {
-    REGISTERED_SERVER_FEATURE_FLAG_KEYS,
-  } = await import("../src/store/serverFeatureFlags");
-  const {
-    SYNC_CORE_NOTIFICATION_PREFS_FLAG_KEY,
-  } = await import("../src/store/serverFeatureFlags");
-  const {
-    refreshSyncCoreNotificationPrefsFlagForCurrentServer,
-    resetSyncCoreNotificationPrefsFlagForTests,
-  } = await import("../src/store/notificationPrefsSyncFeatureFlag");
   const { resetNotificationPrefsSyncCoreForTests } = await import("../src/store/notificationPrefsSyncDomain");
 
   onTestFinished(() => {
-    resetSyncCoreNotificationPrefsFlagForTests();
     resetNotificationPrefsSyncCoreForTests();
   });
 
@@ -883,23 +938,6 @@ test("main socket bridge gates channel notification_prefs:updated through sync-c
       createdAt: "2026-07-10T00:00:00.000Z",
     },
   });
-  vi.spyOn(api, "post").mockImplementation(async (url: string, body?: unknown) => {
-    assert.equal(url, "/feature-flags/evaluate");
-    assert.deepEqual(body, {
-      serverId: "server-prefs",
-      platform: "web",
-      keys: REGISTERED_SERVER_FEATURE_FLAG_KEYS,
-    });
-    return {
-      data: {
-        evaluations: REGISTERED_SERVER_FEATURE_FLAG_KEYS.map((key) => ({
-          key,
-          enabled: key === SYNC_CORE_NOTIFICATION_PREFS_FLAG_KEY,
-        })),
-      },
-    };
-  });
-  assert.equal(await refreshSyncCoreNotificationPrefsFlagForCurrentServer(), true);
 
   useChannelStore.setState({
     channels: [{
@@ -1088,4 +1126,81 @@ test("lazy socket room join failures are logged with context", async () => {
       },
     ]);
   });
+});
+
+function triggerRecordingBindings(
+  buildMainLayoutSocketBindings: typeof import("../src/store/socketBridge").buildMainLayoutSocketBindings,
+  triggers: string[],
+) {
+  return buildMainLayoutSocketBindings(
+    {
+      connected: true,
+      emit: () => undefined,
+      on: () => undefined,
+      off: () => undefined,
+      onAny: () => undefined,
+      offAny: () => undefined,
+      disconnect: () => undefined,
+      connect: () => undefined,
+    },
+    (trigger) => { triggers.push(trigger); },
+    async () => undefined,
+    () => undefined,
+    () => undefined,
+  );
+}
+
+test("activity:changed for this server asks for an Activity re-read named activity_changed (#triage:#229)", async () => {
+  const { buildMainLayoutSocketBindings } = await import("../src/store/socketBridge");
+  const { useServerStore } = await import("../src/store/serverStore");
+  const savedServer = useServerStore.getState().current;
+  useServerStore.setState({ current: { id: "srv-229" } } as never);
+  try {
+    const triggers: string[] = [];
+    const binding = triggerRecordingBindings(buildMainLayoutSocketBindings, triggers)
+      .find((candidate) => candidate.event === "activity:changed");
+    assert.ok(binding);
+    binding.handler({ serverId: "srv-other", source: "object" });
+    assert.deepEqual(triggers, [], "another server's change asks for nothing");
+    binding.handler({ serverId: "srv-229", source: "object" });
+    assert.deepEqual(triggers, ["activity_changed"]);
+  } finally {
+    useServerStore.setState({ current: savedServer } as never);
+  }
+});
+
+test("message:new for a message already held names message_echo, a new one message_new (#triage:#229)", async () => {
+  const { buildMainLayoutSocketBindings } = await import("../src/store/socketBridge");
+  const { useChannelStore } = await import("../src/store/channelStore");
+  const { useMessageStore } = await import("../src/store/messageStore");
+  useMessageStore.getState().setCurrentUserId("user-current");
+  useChannelStore.setState({
+    channels: [{
+      id: "c-echo",
+      name: "echo",
+      description: null,
+      type: "channel",
+      createdAt: "2026-07-07T00:00:00.000Z",
+    }],
+    dmChannels: [],
+    channelActivity: {},
+    channelLocalMembership: {},
+    loading: false,
+  });
+  const triggers: string[] = [];
+  const binding = triggerRecordingBindings(buildMainLayoutSocketBindings, triggers)
+    .find((candidate) => candidate.event === "message:new");
+  assert.ok(binding);
+  const message = {
+    id: "m-echo",
+    seq: 1,
+    channelId: "c-echo",
+    senderType: "user",
+    senderId: "user-other",
+    content: "hello",
+    createdAt: "2026-07-07T00:06:00.000Z",
+  };
+  binding.handler(message);
+  binding.handler(message);
+  assert.deepEqual(triggers, ["message_new", "message_echo"]);
 });

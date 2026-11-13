@@ -3,14 +3,14 @@
 The Kotlin leg of the Activity contract.
 
 **Digests are NOT transcribed here.** `manifest.json` holds them authoritatively
-and `tools/verify-contract.mjs` pins the manifest against the real files. An
+and `tools/verify-contract.ts` pins the manifest against the real files. An
 earlier version of this README listed source/generator/binding SHAs by hand;
 they silently expired as the contract evolved and ended up pointing at a voided
 binding, which is worse than no README because it sends a reader to compare
 against dead values and then doubt the artifacts.
 
 
-`tools/generate-kotlin.mjs` reads the TypeSpec compiler semantic graph
+`tools/generate-kotlin.ts` reads the TypeSpec compiler semantic graph
 directly. JSON Schema and OpenAPI are not generator inputs. It emits:
 
 - sealed `kotlinx.serialization` unions with `type` discriminators;

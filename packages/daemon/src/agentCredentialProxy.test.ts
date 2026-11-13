@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import os from "node:os";
 import { join } from "node:path";
 import http from "node:http";
 import net from "node:net";
@@ -14,9 +15,11 @@ import {
 } from "@botiverse/raft-shared";
 import { ApiClient } from "../../cli/src/client";
 import type { AgentContext } from "../../cli/src/auth/env";
+import { normalizeVersion, readCliVersion } from "../../cli/src/version";
 
 import { setDaemonFetchImplForTests } from "./daemonFetch";
 import {
+  __agentApiBooksHistoryWindowForTest,
   __agentApiSideEffectActionForTest,
   __agentCredentialProxyFetchOptionsForTest,
   __transportNormalizedErrorForErrorForTest,
@@ -25,16 +28,32 @@ import {
   __setThirdPartyEventDeliveryReportRetryBaseMsForTest,
   __setThirdPartyEventLeaseMsForTest,
   bodySizeBucket,
+  INBOX_READ_PATH,
   registerAgentCredentialProxy,
+  reportThirdPartyEventsDelivered,
+  setAgentProxyServerChecksTaskWriteLanding,
   unregisterAgentCredentialProxyForLaunch,
   type AgentProxyVisibleMessage,
 } from "./agentCredentialProxy";
 import { AgentVisibleDeliveryLedger, type AgentVisibleFreshnessView } from "./agentVisibleDeliveryLedger";
-import { groupThreadJoinContextReceiptMessages } from "./agentRuntimeInput";
+import { formatInboxUpdateRuntimeInput, threadJoinContextReceipts } from "./agentRuntimeInput";
+import { formatInboxCheck } from "../../cli/src/commands/inbox/_format";
 import { AGENT_API_ROUTE_MANIFEST } from "../../shared/src/generated/agentApiRoutes";
+import { agentApiContract, agentApiHistoryResponseSchema } from "../../shared/src/agentApiContract";
 import { createAgentAppInboxStore } from "./agentAppInbox";
+import { REMINDER_SERVER_ACK_CAPABILITY } from "./reminderServerAck";
+import { createCommandContext } from "../../cli/src/core/context";
+import { CliError } from "../../cli/src/core/errors";
+import { formatErrorEnvelope } from "../../cli/src/core/renderer";
+import { reminderAckCommand } from "../../cli/src/apps/reminder/ack";
 import { REMINDER_AGENT_INBOX_REGISTRY } from "./apps/reminder/inboxDefinition";
+import { createScopedAppStorageFactory } from "./scopedAppStorage";
 import { buildApmFreshnessDecisionProducerFactId } from "./apmStateMachine";
+
+// The connected Server checks task writes by landing unless a test says it is older.
+beforeEach(() => {
+  setAgentProxyServerChecksTaskWriteLanding(true);
+});
 
 const TEST_TRACE_ID = "1".repeat(32);
 const TEST_PARENT_SPAN_ID = "2".repeat(16);
@@ -335,6 +354,68 @@ test("agent credential proxy continues caller trace with a daemon child carrier"
   });
 });
 
+for (const phase of ["waiting for the response", "reading a streamed response"] as const) {
+  test(`agent credential proxy cancels the upstream request once the CLI stops ${phase}`, async () => {
+    const streamed = phase === "reading a streamed response";
+    const sink = new MemoryTraceSink();
+    const failuresRecorded: string[] = [];
+    let upstreamSeen!: () => void;
+    const upstreamReached = new Promise<void>((resolve) => { upstreamSeen = resolve; });
+    let upstreamClosed!: () => void;
+    const upstreamGone = new Promise<void>((resolve) => { upstreamClosed = resolve; });
+    await withUpstream((req, res) => {
+      // Never finishes: the CLI gives up first.
+      req.socket.once("close", () => upstreamClosed());
+      if (streamed) {
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.write("data: first\n\n");
+      }
+      upstreamSeen();
+    }, async (serverUrl) => {
+      const handle = await registerAgentCredentialProxy({
+        agentId: "agent-gives-up",
+        launchId: "launch-gives-up",
+        serverUrl,
+        apiKey: "sk_agent_server_side",
+        activeCapabilities: "read",
+        tracer: deterministicProxyTracer(sink),
+        inboxCoordinator: {
+          getBoundary: () => undefined,
+          getPendingMessages: () => [],
+          consumeVisibleMessages: () => {},
+          recordProxyFailure: () => { failuresRecorded.push("proxy_failure"); },
+          recordTransportNormalizedError: () => { failuresRecorded.push("transport_error"); },
+        },
+      });
+      try {
+        const cli = new AbortController();
+        const response = fetch(`${handle.proxyUrl}/internal/agent-api/integrations`, {
+          headers: { Authorization: `Bearer ${handle.proxyToken}` },
+          signal: cli.signal,
+        });
+        await upstreamReached;
+        if (streamed) {
+          const reader = (await response).body!.getReader();
+          await reader.read();
+        }
+        cli.abort();
+        if (!streamed) await assert.rejects(response);
+        await withinMs(upstreamGone, 5_000, "the upstream request was not cancelled");
+        await waitForSpan(sink, "daemon.agent_proxy.request");
+      } finally {
+        unregisterAgentCredentialProxyForLaunch({ agentId: "agent-gives-up", launchId: "launch-gives-up" });
+      }
+    });
+    const [span] = sink.getAllSpans().filter((entry) => entry.name === "daemon.agent_proxy.request");
+    assert.equal(span?.attrs?.agentId, "agent-gives-up");
+    assert.equal(span?.attrs?.route_family, "integrations");
+    assert.equal(span?.attrs?.outcome, "client_closed");
+    assert.equal(span?.attrs?.response_started, streamed);
+    assert.equal(span?.status, streamed ? "ok" : "error");
+    assert.deepEqual(failuresRecorded, [], "a CLI that left is not a transport failure");
+  });
+}
+
 test("agent credential proxy tags uploads with a coarse body size bucket only", async () => {
   const sink = new MemoryTraceSink();
   await withUpstream((req, res) => {
@@ -458,7 +539,7 @@ test("agent credential proxy uses one child carrier for freshness preflight and 
       return;
     }
     res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ ok: true, results: [{ taskNumber: 243, success: true }] }));
+    res.end(JSON.stringify({ ok: true, state: "sent", messageId: "sent-1" }));
   }, async (serverUrl) => {
     const handle = await registerAgentCredentialProxy({
       agentId: "agent-traced",
@@ -474,26 +555,28 @@ test("agent credential proxy uses one child carrier for freshness preflight and 
       },
     });
 
-    const response = await fetch(`${handle.proxyUrl}/internal/agent-api/tasks/claim`, {
+    // A send preflights a target the model has not read (task writes leave
+    // that to the Server), so it makes the history read the carrier spans.
+    const response = await fetch(`${handle.proxyUrl}/internal/agent-api/send`, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${handle.proxyToken}`,
         "content-type": "application/json",
       },
-      body: JSON.stringify({ channel: "#proj-o11y", task_numbers: [243] }),
+      body: JSON.stringify({ target: "#proj-o11y", content: "traced" }),
     });
 
     assert.equal(response.status, 200);
     assert.equal(observed.length, 2);
     assert.match(observed[0]!.path, /^\/internal\/agent-api\/history\?/);
-    assert.equal(observed[1]!.path, "/internal/agent-api/tasks/claim");
+    assert.equal(observed[1]!.path, "/internal/agent-api/send");
     assert.equal(observed[0]!.traceparent, observed[1]!.traceparent);
     assert.equal(observed[0]!.traceparent, `00-${TEST_TRACE_ID}-${TEST_PROXY_SPAN_ID}-00`);
     const [span] = sink.getAllSpans();
     assert.equal(span.context.parentSpanId, null);
     assert.equal(span.attrs?.trace_context_state, "new_root");
     assert.equal(span.attrs?.proxy_launch_id_present, false);
-    assert.equal(span.attrs?.route_family, "tasks/claim");
+    assert.equal(span.attrs?.route_family, "agent-api/send");
     assert.equal(span.attrs?.outcome, "upstream_response");
   });
 });
@@ -609,7 +692,23 @@ test("agent credential proxy overrides caller active capabilities and unregister
     assert.equal(first.status, 200);
     assert.equal(observedAuth, "Bearer sk_agent_server_side");
     assert.equal(observedActiveCaps, "read");
-    assert.equal(observedClientCaps, "manual-context-v1");
+    // The daemon adds its own token to the CLI's, whatever the inbox items flag (here off).
+    assert.equal(observedClientCaps, `manual-context-v1,${REMINDER_SERVER_ACK_CAPABILITY}`);
+
+    const withoutCallerCaps = await fetch(`${handle.proxyUrl}/internal/agent-api/server`, {
+      headers: { Authorization: `Bearer ${handle.proxyToken}` },
+    });
+    assert.equal(withoutCallerCaps.status, 200);
+    assert.equal(observedClientCaps, REMINDER_SERVER_ACK_CAPABILITY);
+
+    const alreadyDeclared = await fetch(`${handle.proxyUrl}/internal/agent-api/server`, {
+      headers: {
+        Authorization: `Bearer ${handle.proxyToken}`,
+        "X-Raft-Client-Capabilities": `${REMINDER_SERVER_ACK_CAPABILITY}, inbox-items@1`,
+      },
+    });
+    assert.equal(alreadyDeclared.status, 200);
+    assert.equal(observedClientCaps, `${REMINDER_SERVER_ACK_CAPABILITY},inbox-items@1`);
 
     assert.equal(unregisterAgentCredentialProxyForLaunch({
       agentId: "agent-1",
@@ -619,9 +718,75 @@ test("agent credential proxy overrides caller active capabilities and unregister
     const afterUnregister = await fetch(`${handle.proxyUrl}/internal/agent-api/server`, {
       headers: { Authorization: `Bearer ${handle.proxyToken}` },
     });
-    assert.equal(afterUnregister.status, 401);
-    assert.equal((await afterUnregister.json() as { code?: string }).code, "invalid_agent_proxy_token");
+    // The token is dead; the proxy says the agent has no running session (#proj-raft-computer:#58).
+    assert.equal(afterUnregister.status, 410);
+    assert.equal((await afterUnregister.json() as { code?: string }).code, "agent_not_running");
   });
+});
+
+test("agent credential proxy names the agent's Computer, daemon and runtime, and passes the CLI's own version through", async () => {
+  const seen: Array<Record<string, string | undefined>> = [];
+  await withUpstream((req, res) => {
+    const header = (name: string) => req.headers[name] as string | undefined;
+    seen.push({
+      client: header("x-raft-client"),
+      clientVersion: header("x-raft-client-version"),
+      computerVersion: header("x-raft-computer-version"),
+      daemonVersion: header("x-raft-daemon-version"),
+      runtime: header("x-raft-runtime"),
+    });
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ ok: true }));
+  }, async (serverUrl) => {
+    const handle = await registerAgentCredentialProxy({
+      agentId: "agent-origin",
+      launchId: "launch-origin",
+      serverUrl,
+      apiKey: "sk_agent_server_side",
+      activeCapabilities: "read",
+      daemonVersion: "1.0.53",
+      computerVersion: "1.0.54",
+      runtime: "codex",
+    });
+    const unversioned = await registerAgentCredentialProxy({
+      agentId: "agent-origin",
+      launchId: "launch-origin-unversioned",
+      serverUrl,
+      apiKey: "sk_agent_server_side",
+      activeCapabilities: "read",
+    });
+    try {
+      const cli = new ApiClient({
+        agentId: "agent-origin",
+        serverId: "server-1",
+        serverUrl: handle.proxyUrl,
+        token: handle.proxyToken,
+        clientMode: "managed-runner",
+        secretSource: "agent-proxy-token-env",
+        activeCapabilities: null,
+      });
+      assert.equal((await cli.request("GET", "/internal/agent-api/server")).ok, true);
+      // The daemon is the authority on what the agent runs on: a caller's
+      // own values are replaced, or removed when the daemon knows none.
+      const forged = { "X-Raft-Computer-Version": "9.9.9", "X-Raft-Daemon-Version": "9.9.9", "X-Raft-Runtime": "forged" };
+      for (const proxy of [handle, unversioned]) {
+        const response = await fetch(`${proxy.proxyUrl}/internal/agent-api/server`, {
+          headers: { Authorization: `Bearer ${proxy.proxyToken}`, ...forged },
+        });
+        assert.equal(response.status, 200);
+      }
+    } finally {
+      unregisterAgentCredentialProxyForLaunch({ agentId: "agent-origin", launchId: "launch-origin" });
+      unregisterAgentCredentialProxyForLaunch({ agentId: "agent-origin", launchId: "launch-origin-unversioned" });
+    }
+  });
+  const cliVersion = normalizeVersion(readCliVersion());
+  assert.ok(cliVersion, "the source-run CLI reads its package version");
+  assert.deepEqual(seen, [
+    { client: "cli", clientVersion: cliVersion, computerVersion: "1.0.54", daemonVersion: "1.0.53", runtime: "codex" },
+    { client: "cli", clientVersion: undefined, computerVersion: "1.0.54", daemonVersion: "1.0.53", runtime: "codex" },
+    { client: "cli", clientVersion: undefined, computerVersion: undefined, daemonVersion: undefined, runtime: undefined },
+  ]);
 });
 
 test("agent credential proxy strips upstream compression headers after decoded forwarding", async () => {
@@ -1239,6 +1404,7 @@ test("agent credential proxy records failure details when upstream forwarding th
       originalMessage: body.detail,
       launchId: "launch-proxy-failure",
       targetHostClass: "custom_server",
+      viaHttpProxy: false,
       downstreamCaller: "cli",
       upstream: "server",
     }]);
@@ -1625,6 +1791,7 @@ test("agent credential proxy does not write a JSON failure after streaming respo
       originalMessage: "terminated",
       launchId: "launch-stream-failure",
       targetHostClass: "custom_server",
+      viaHttpProxy: false,
       downstreamCaller: "cli",
       upstream: "server",
     }]);
@@ -1714,6 +1881,7 @@ test("agent credential proxy classifies localhost upstream server failures as cu
     originalMessage: "fetch failed",
     launchId: "launch-local-server-failure",
     targetHostClass: "custom_server",
+    viaHttpProxy: false,
     downstreamCaller: "cli",
     upstream: "server",
   }]);
@@ -1766,6 +1934,64 @@ test("agent credential proxy records transport-normalized errors for upstream HT
   });
 });
 
+test("agent credential proxy relays a 5xx the Server answered on purpose, and still records it", async () => {
+  const transportEvents: Array<{ causeCode?: string }> = [];
+  const answer = { error: "artifact storage (r2) is not configured", code: "ARTIFACTS_STORAGE_UNAVAILABLE" };
+  await withUpstream((_req, res) => {
+    res.writeHead(503, { "content-type": "application/json" });
+    res.end(JSON.stringify(answer));
+  }, async (serverUrl) => {
+    const handle = await registerAgentCredentialProxy({
+      agentId: "agent-1",
+      launchId: "launch-deliberate-5xx",
+      serverUrl,
+      apiKey: "sk_agent_server_side",
+      activeCapabilities: "read",
+      inboxCoordinator: {
+        getBoundary: () => undefined,
+        getPendingMessages: () => [],
+        consumeVisibleMessages: () => {},
+        recordTransportNormalizedError: (input) => transportEvents.push(input),
+      },
+    });
+
+    const res = await fetch(`${handle.proxyUrl}/internal/agent-api/artifacts/uploads/${"a".repeat(64)}`, {
+      method: "PUT",
+      headers: { Authorization: `Bearer ${handle.proxyToken}`, "content-type": "application/octet-stream" },
+      body: "x",
+    });
+
+    assert.equal(res.status, 503);
+    assert.match(res.headers.get("x-raft-correlation-id") ?? "", /^[0-9a-f]{16}$/);
+    assert.deepEqual(await res.json(), answer);
+    assert.deepEqual(transportEvents.map((event) => event.causeCode), ["HTTP_503"]);
+  });
+});
+
+test("agent credential proxy keeps its envelope for the Server's unexpected-error answer", async () => {
+  await withUpstream((_req, res) => {
+    res.writeHead(500, { "content-type": "application/json", "x-slock-error-id": "trace-1" });
+    res.end(JSON.stringify({ error: "Internal server error", code: "internal_server_error", correlationId: "trace-1" }));
+  }, async (serverUrl) => {
+    const handle = await registerAgentCredentialProxy({
+      agentId: "agent-1",
+      launchId: "launch-unexpected-5xx",
+      serverUrl,
+      apiKey: "sk_agent_server_side",
+      activeCapabilities: "read",
+    });
+
+    const res = await fetch(`${handle.proxyUrl}/internal/agent-api/messages/deadbeef/resolve`, {
+      headers: { Authorization: `Bearer ${handle.proxyToken}` },
+    });
+
+    assert.equal(res.status, 500);
+    const body = await res.json() as { code?: string; proxy?: { failure_class?: string } };
+    assert.equal(body.code, "agent_proxy_failed");
+    assert.equal(body.proxy?.failure_class, "upstream_http_response");
+  });
+});
+
 test("agent credential proxy classifies api.slock.ai proxy connect transport failures", () => {
   const event = __transportNormalizedErrorForErrorForTest(
     new URL("https://api.slock.ai/internal/agent-api/send"),
@@ -1784,6 +2010,7 @@ test("agent credential proxy classifies api.slock.ai proxy connect transport fai
     originalMessage: "proxy CONNECT failed before upstream response",
     launchId: "launch-proxy-connect",
     targetHostClass: "api.slock.ai",
+    viaHttpProxy: false,
     downstreamCaller: "cli",
     upstream: "server",
   });
@@ -2036,103 +2263,127 @@ test("agent credential proxy reviewer isolation returns a body-free local hold w
   });
 });
 
-test("agent credential proxy locally holds task side effects on same-target pending even with stray continueAnyway", async () => {
-  let upstreamClaimCount = 0;
-  let upstreamUpdateCount = 0;
-  const consumed: Array<{ target?: string; source: string; boundarySeq?: number; seqs: number[] }> = [];
-  const decisions: unknown[] = [];
+// A new Computer on an older Server (no SERVER_CAPABILITY_TASK_WRITE_LANDING_V1):
+// that Server would compare a task-conversation boundary with the board and hold
+// nearly every write, so a task write attests nothing and is not checked there.
+test("agent credential proxy attests no task write to a Server that does not check by landing", async () => {
+  setAgentProxyServerChecksTaskWriteLanding(false);
+  const forwarded: Array<Record<string, unknown>> = [];
   await withUpstream(async (req, res) => {
-    if (req.url === "/internal/agent-api/tasks/claim") upstreamClaimCount += 1;
-    if (req.url === "/internal/agent-api/tasks/update-status") upstreamUpdateCount += 1;
-    res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ ok: true, results: [{ taskNumber: 1, success: true }] }));
+    let raw = "";
+    req.on("data", (chunk) => { raw += chunk; });
+    req.on("end", () => {
+      forwarded.push(JSON.parse(raw) as Record<string, unknown>);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true, results: [{ taskNumber: 201, success: true }] }));
+    });
   }, async (serverUrl) => {
     const handle = await registerAgentCredentialProxy({
       agentId: "agent-1",
-      launchId: "launch-task-hold",
+      launchId: "launch-old-server",
       serverUrl,
       apiKey: "sk_agent_server_side",
       activeCapabilities: "send,read,tasks",
       inboxCoordinator: {
         getBoundary: () => 7,
-        getPendingMessages: (target) => target === "#proj-runtime"
-          ? [{ seq: 8, id: "pending-8", channel_type: "channel", channel_name: "proj-runtime", content: "new task context" }]
-          : [],
-        consumeVisibleMessages: (input) => {
-          consumed.push({
-            target: input.target,
-            source: input.source,
-            boundarySeq: input.boundarySeq,
-            seqs: input.messages.map((message) => Number(message.seq ?? 0)),
-          });
-        },
-        recordFreshnessDecision: (input) => decisions.push(input),
+        getPendingMessages: () => [],
+        consumeVisibleMessages: () => {},
       },
     });
-
-    const claim = await fetch(`${handle.proxyUrl}/internal/agent-api/tasks/claim`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${handle.proxyToken}`,
-        "content-type": "application/json",
-      },
-      body: JSON.stringify({ channel: "#proj-runtime", task_numbers: [201], continueAnyway: true }),
-    });
-    const update = await fetch(`${handle.proxyUrl}/internal/agent-api/tasks/update-status`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${handle.proxyToken}`,
-        "content-type": "application/json",
-      },
-      body: JSON.stringify({ channel: "#proj-runtime", task_number: 201, status: "in_review", continueAnyway: true }),
-    });
-
-    assert.equal(upstreamClaimCount, 0);
-    assert.equal(upstreamUpdateCount, 0);
-    const claimBody = await claim.json() as { state?: string; seenUpToSeq?: number; available_actions?: string[] };
-    const updateBody = await update.json() as { state?: string; seenUpToSeq?: number; available_actions?: string[] };
-    assert.equal(claimBody.state, "held");
-    assert.deepEqual(claimBody.available_actions, ["check_messages", "retry_action"]);
-    assert.equal(updateBody.seenUpToSeq, 8);
-    assert.deepEqual(updateBody.available_actions, ["check_messages", "retry_action"]);
-    assert.deepEqual(consumed, [
-      { target: "#proj-runtime", source: "side_effect_preflight_context", boundarySeq: 8, seqs: [8] },
-      { target: "#proj-runtime", source: "side_effect_preflight_context", boundarySeq: 8, seqs: [8] },
-    ]);
-    assert.deepEqual(decisions.map((decision) => (decision as { action?: string; decision?: string; reason?: string }).action), ["task_claim", "task_update"]);
-    assert.ok(decisions.every((decision) => (decision as { decision?: string; reason?: string }).decision === "local_hold"));
-    assert.ok(decisions.every((decision) => (decision as { decision?: string; reason?: string }).reason === "exact_target_pending"));
+    // A client that attests by landing itself (the SDK does) sends these too.
+    const attested = { seenFor: "task_conversation", seenUpToSeq: 12, seenExactSeqs: [14] };
+    for (const [path, body] of [
+      ["/internal/agent-api/tasks/claim", { channel: "#proj-runtime", task_numbers: [201] }],
+      ["/internal/agent-api/tasks/update-status", { channel: "#proj-runtime", task_number: 201, status: "in_review", ...attested }],
+      ["/internal/agent-api/tasks", { channel: "#proj-runtime", tasks: [{ title: "t", source_message_id: "abcdef12" }], ...attested }],
+      ["/internal/agent-api/tasks", { channel: "#proj-runtime", tasks: [{ title: "no source" }], ...attested }],
+    ] as const) {
+      const res = await fetch(`${handle.proxyUrl}${path}`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${handle.proxyToken}`, "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      assert.equal(res.status, 200, path);
+    }
   });
+  for (const body of forwarded) {
+    for (const field of ["seenUpToSeq", "seenExactSeqs", "seenFor"]) {
+      assert.equal(Object.hasOwn(body, field), false, `${field} reached an older Server: ${JSON.stringify(body)}`);
+    }
+  }
+  assert.equal(forwarded.length, 4);
 });
 
-test("agent credential proxy fail-closes task side effects on first-touch target", async () => {
-  let upstreamClaimCount = 0;
-  let upstreamUpdateCount = 0;
+// A task write is never held here, even with messages delivered to the
+// daemon that the model has not taken in yet: it carries the model-seen
+// boundary of its landing and the Server decides (agentWriteLanding.ts).
+test("agent credential proxy never holds a task write locally, even with pending messages in its conversation", async () => {
+  const forwarded: Array<{ url?: string; body: Record<string, unknown> }> = [];
+  const consumed: unknown[] = [];
+  await withUpstream(async (req, res) => {
+    let raw = "";
+    req.on("data", (chunk) => { raw += chunk; });
+    req.on("end", () => {
+      forwarded.push({ url: req.url, body: JSON.parse(raw) as Record<string, unknown> });
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true, results: [{ taskNumber: 201, success: true }] }));
+    });
+  }, async (serverUrl) => {
+    const handle = await registerAgentCredentialProxy({
+      agentId: "agent-1",
+      launchId: "launch-task-pending",
+      serverUrl,
+      apiKey: "sk_agent_server_side",
+      activeCapabilities: "send,read,tasks",
+      inboxCoordinator: {
+        getBoundary: () => 7,
+        getPendingMessages: (target) => target === "#proj-runtime:#201"
+          ? [{ seq: 8, id: "pending-8", channel_type: "channel", channel_name: "proj-runtime", content: "new task context" }]
+          : [],
+        consumeVisibleMessages: (input) => consumed.push(input),
+      },
+    });
+    for (const [path, body] of [
+      ["/internal/agent-api/tasks/claim", { channel: "#proj-runtime", task_numbers: [201] }],
+      ["/internal/agent-api/tasks/update-status", { channel: "#proj-runtime", task_number: 201, status: "in_review" }],
+    ] as const) {
+      const res = await fetch(`${handle.proxyUrl}${path}`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${handle.proxyToken}`, "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      assert.notEqual((await res.json() as { state?: string }).state, "held", path);
+    }
+  });
+  assert.deepEqual(forwarded.map((entry) => [entry.url, entry.body.seenUpToSeq, entry.body.seenFor]), [
+    ["/internal/agent-api/tasks/claim", 7, "task_conversation"],
+    ["/internal/agent-api/tasks/update-status", 7, "task_conversation"],
+  ]);
+  assert.deepEqual(consumed, [], "the pending message stays pending: the model has not seen it");
+});
+
+// A task write never preflights a conversation the model has not read: the
+// Computer cannot tell the agent's own lifecycle lines from others' (history
+// rows carry no causal actor), so it attests 0 for the landing and the Server
+// decides with its self-caused exemptions.
+test("agent credential proxy leaves a task write's first touch of its conversation to the Server", async () => {
   let upstreamHistoryCount = 0;
-  const consumed: Array<{ target?: string; source: string; boundarySeq?: number; seqs: number[] }> = [];
-  const decisions: unknown[] = [];
+  const forwarded: Array<{ url?: string; body: Record<string, unknown> }> = [];
+  const consumed: unknown[] = [];
   await withUpstream(async (req, res) => {
     if (req.url?.startsWith("/internal/agent-api/history")) {
       upstreamHistoryCount += 1;
       res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({
-        messages: [
-          {
-            seq: 99,
-            id: "recent-task-99",
-            senderType: "human",
-            senderName: "tygg",
-            content: "new task context before claim",
-            createdAt: "2026-05-20T00:00:00.000Z",
-          },
-        ],
-      }));
+      res.end(JSON.stringify({ messages: [{ seq: 99, id: "own-took-99", senderType: "system", content: "📌 agent-1 took #201" }] }));
       return;
     }
-    if (req.url === "/internal/agent-api/tasks/claim") upstreamClaimCount += 1;
-    if (req.url === "/internal/agent-api/tasks/update-status") upstreamUpdateCount += 1;
-    res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ ok: true, results: [{ taskNumber: 201, success: true }] }));
+    let raw = "";
+    req.on("data", (chunk) => { raw += chunk; });
+    req.on("end", () => {
+      forwarded.push({ url: req.url, body: JSON.parse(raw) as Record<string, unknown> });
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true, results: [{ taskNumber: 201, success: true }] }));
+    });
   }, async (serverUrl) => {
     const handle = await registerAgentCredentialProxy({
       agentId: "agent-1",
@@ -2143,155 +2394,29 @@ test("agent credential proxy fail-closes task side effects on first-touch target
       inboxCoordinator: {
         getBoundary: () => undefined,
         getPendingMessages: () => [],
-        consumeVisibleMessages: (input) => {
-          consumed.push({
-            target: input.target,
-            source: input.source,
-            boundarySeq: input.boundarySeq,
-            seqs: input.messages.map((message) => Number(message.seq ?? 0)),
-          });
-        },
-        recordFreshnessDecision: (input) => decisions.push(input),
+        consumeVisibleMessages: (input) => consumed.push(input),
       },
     });
 
-    const requests: Array<{ path: string; body: Record<string, unknown> }> = [
-      { path: "/internal/agent-api/tasks/claim", body: { channel: "#proj-runtime", task_numbers: [201] } },
-      { path: "/internal/agent-api/tasks/update-status", body: { channel: "#proj-runtime", task_number: 201, status: "in_review" } },
-    ];
-
-    const responses = [];
-    for (const request of requests) {
-      const res = await fetch(`${handle.proxyUrl}${request.path}`, {
+    for (const [path, body] of [
+      ["/internal/agent-api/tasks/claim", { channel: "#proj-runtime", task_numbers: [201] }],
+      ["/internal/agent-api/tasks/update-status", { channel: "#proj-runtime", task_number: 201, status: "in_review" }],
+    ] as const) {
+      const res = await fetch(`${handle.proxyUrl}${path}`, {
         method: "POST",
-        headers: {
-          Authorization: `Bearer ${handle.proxyToken}`,
-          "content-type": "application/json",
-        },
-        body: JSON.stringify(request.body),
+        headers: { Authorization: `Bearer ${handle.proxyToken}`, "content-type": "application/json" },
+        body: JSON.stringify(body),
       });
       assert.equal(res.status, 200);
-      responses.push(await res.json() as { state?: string; seenUpToSeq?: number; producerFactId?: string; available_actions?: string[]; heldMessages?: Array<{ seq?: number }> });
+      assert.notEqual((await res.json() as { state?: string }).state, "held", `${path} is not held locally`);
     }
 
-    assert.equal(upstreamClaimCount, 0);
-    assert.equal(upstreamUpdateCount, 0);
-    assert.equal(upstreamHistoryCount, 2);
-    assert.deepEqual(responses.map((body) => body.state), ["held", "held"]);
-    assert.deepEqual(responses.map((body) => body.seenUpToSeq), [99, 99]);
-    assert.ok(responses.every((body) => body.available_actions?.join(",") === "check_messages,retry_action"));
-    assert.ok(responses.every((body) => body.heldMessages?.[0]?.seq === 99));
-    assert.deepEqual(consumed, [
-      { target: "#proj-runtime", source: "side_effect_preflight_context", boundarySeq: 99, seqs: [99] },
-      { target: "#proj-runtime", source: "side_effect_preflight_context", boundarySeq: 99, seqs: [99] },
+    assert.equal(upstreamHistoryCount, 0, "no first-touch history read for a task write");
+    assert.deepEqual(forwarded.map((entry) => [entry.url, entry.body.seenUpToSeq, entry.body.seenFor]), [
+      ["/internal/agent-api/tasks/claim", 0, "task_conversation"],
+      ["/internal/agent-api/tasks/update-status", 0, "task_conversation"],
     ]);
-    const expectedClaimDecision = {
-      action: "task_claim",
-      decision: "syncing_hold",
-      target: "#proj-runtime",
-      inboxTrustState: "untrusted",
-      reason: "target_first_touch_recent_context",
-      pendingCount: 0,
-      pendingMaxSeq: 99,
-      modelSeenSeq: 0,
-      heldMessageCount: 1,
-      omittedMessageCount: 0,
-    } as const;
-    const expectedUpdateDecision = {
-      action: "task_update",
-      decision: "syncing_hold",
-      target: "#proj-runtime",
-      inboxTrustState: "untrusted",
-      reason: "target_first_touch_recent_context",
-      pendingCount: 0,
-      pendingMaxSeq: 99,
-      modelSeenSeq: 0,
-      heldMessageCount: 1,
-      omittedMessageCount: 0,
-    } as const;
-    assert.deepEqual(decisions, [
-      {
-        ...expectedClaimDecision,
-        producerFactId: buildApmFreshnessDecisionProducerFactId("agent-1", expectedClaimDecision),
-      },
-      {
-        ...expectedUpdateDecision,
-        producerFactId: buildApmFreshnessDecisionProducerFactId("agent-1", expectedUpdateDecision),
-      },
-    ]);
-    assert.deepEqual(
-      responses.map((body) => body.producerFactId),
-      [
-        buildApmFreshnessDecisionProducerFactId("agent-1", expectedClaimDecision),
-        buildApmFreshnessDecisionProducerFactId("agent-1", expectedUpdateDecision),
-      ],
-    );
-  });
-});
-
-test("agent credential proxy forwards first-touch target when recent context has no seq boundary", async () => {
-  let upstreamClaimCount = 0;
-  let upstreamHistoryCount = 0;
-  const consumed: unknown[] = [];
-  const decisions: unknown[] = [];
-  await withUpstream(async (req, res) => {
-    if (req.url?.startsWith("/internal/agent-api/history")) {
-      upstreamHistoryCount += 1;
-      res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({
-        messages: [
-          {
-            id: "recent-task-no-seq",
-            senderType: "human",
-            senderName: "tygg",
-            content: "context without seq boundary",
-            createdAt: "2026-05-20T00:00:00.000Z",
-          },
-        ],
-      }));
-      return;
-    }
-    if (req.url === "/internal/agent-api/tasks/claim") upstreamClaimCount += 1;
-    res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ ok: true, results: [{ taskNumber: 201, success: true }] }));
-  }, async (serverUrl) => {
-    const handle = await registerAgentCredentialProxy({
-      agentId: "agent-1",
-      launchId: "launch-task-first-touch-no-seq",
-      serverUrl,
-      apiKey: "sk_agent_server_side",
-      activeCapabilities: "read,tasks",
-      inboxCoordinator: {
-        getBoundary: () => undefined,
-        getPendingMessages: () => [],
-        consumeVisibleMessages: (input) => consumed.push(input),
-        recordFreshnessDecision: (input) => decisions.push(input),
-      },
-    });
-
-    const res = await fetch(`${handle.proxyUrl}/internal/agent-api/tasks/claim`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${handle.proxyToken}`,
-        "content-type": "application/json",
-      },
-      body: JSON.stringify({ channel: "#proj-runtime", task_numbers: [201] }),
-    });
-
-    assert.equal(res.status, 200);
-    assert.equal((await res.json() as { ok?: boolean }).ok, true);
-    assert.equal(upstreamHistoryCount, 1);
-    assert.equal(upstreamClaimCount, 1);
     assert.deepEqual(consumed, []);
-    assert.deepEqual(decisions, [{
-      action: "task_claim",
-      decision: "forward",
-      target: "#proj-runtime",
-      inboxTrustState: "untrusted",
-      reason: "target_first_touch_recent_context_without_seq_boundary",
-      pendingCount: 0,
-      modelSeenSeq: 0,
-    }]);
   });
 });
 
@@ -2770,6 +2895,108 @@ test("agent credential proxy records successful self send by exact id without ad
   });
 });
 
+test("agent credential proxy reports each message the Server accepted on a send or task reply (View Context index)", async () => {
+  const committed: unknown[] = [];
+  const answers = [
+    { path: "/internal/agent-api/send", status: 200, body: { ok: true, state: "sent", messageId: "m-sent" } },
+    { path: "/internal/agent-api/v2/send", status: 200, body: { ok: true, state: "committed", messageId: "m-reconciled" } },
+    { path: "/internal/agent-api/send", status: 200, body: { ok: true, state: "held", heldMessages: [] } },
+    { path: "/internal/agent-api/tasks/reply", status: 200, body: { ok: true, state: "sent", messageId: "m-reply" } },
+    { path: "/internal/agent-api/tasks/reply", status: 409, body: { state: "sent", messageId: "m-refused" } },
+  ];
+  let next = 0;
+  await withUpstream(async (req, res) => {
+    for await (const chunk of req) void chunk;
+    if (req.url?.startsWith("/internal/agent-api/history")) {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ messages: [] }));
+      return;
+    }
+    const answer = answers[next++]!;
+    assert.equal(req.url, answer.path);
+    res.writeHead(answer.status, { "content-type": "application/json" });
+    res.end(JSON.stringify(answer.body));
+  }, async (serverUrl) => {
+    const handle = await registerAgentCredentialProxy({
+      agentId: "agent-1",
+      launchId: "launch-context-view-commit",
+      serverUrl,
+      apiKey: "sk_agent_server_side",
+      activeCapabilities: "send,read",
+      inboxCoordinator: {
+        getBoundary: () => undefined,
+        getPendingMessages: () => [],
+        consumeVisibleMessages: () => {},
+        recordMessageCommitted: (input) => {
+          committed.push(input);
+          // A failing recorder never changes the agent's answer.
+          if (input.messageId === "m-reply") throw new Error("index write failed");
+        },
+      },
+    });
+    for (const answer of answers) {
+      const res = await fetch(`${handle.proxyUrl}${answer.path}`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${handle.proxyToken}`, "content-type": "application/json" },
+        body: JSON.stringify({ target: "#general", content: "hi", channel: "#general", task_number: 1 }),
+      });
+      assert.equal(res.status, answer.status);
+      assert.deepEqual(await res.json(), answer.body);
+    }
+  });
+  assert.deepEqual(committed, [
+    { messageId: "m-sent", route: "send" },
+    { messageId: "m-reconciled", route: "send" },
+    { messageId: "m-reply", route: "task_reply" },
+  ]);
+});
+
+test("agent credential proxy reports a committed send of a launch with no inbox coordinator (the OAR host)", async () => {
+  const committed: unknown[] = [];
+  const sendOutcomes: unknown[] = [];
+  await withUpstream(async (req, res) => {
+    for await (const _chunk of req) { /* drained */ }
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify(req.url === "/internal/agent-api/tasks/reply"
+      ? { state: "sent", messageId: "m-reply" }
+      : req.url === "/internal/agent-api/v2/send"
+        ? { state: "sent", messageId: "m-sent" }
+        : req.url === "/internal/agent-api/send"
+          ? { state: "held", messageId: "m-held" }
+          : { state: "sent", messageId: "m-not-a-send" }));
+  }, async (serverUrl) => {
+    const handle = await registerAgentCredentialProxy({
+      agentId: "agent-1",
+      launchId: "launch-oar-commit",
+      serverUrl,
+      apiKey: "sk_agent_server_side",
+      activeCapabilities: "send,read",
+      recordMessageCommitted: (input) => committed.push(input),
+      recordSendOutcome: (input) => sendOutcomes.push(input),
+    });
+    for (const [route, messageId] of [
+      ["/internal/agent-api/v2/send", "m-sent"],
+      ["/internal/agent-api/send", "m-held"],
+      ["/internal/agent-api/tasks/reply", "m-reply"],
+      ["/internal/agent-api/tasks/claim", "m-not-a-send"],
+    ] as const) {
+      const res = await fetch(`${handle.proxyUrl}${route}`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${handle.proxyToken}`, "content-type": "application/json" },
+        body: JSON.stringify({ target: "#general", content: "hi", channel: "#general", task_number: 1 }),
+      });
+      assert.equal(res.status, 200);
+      assert.equal(((await res.json()) as { messageId?: string }).messageId, messageId);
+    }
+  });
+  assert.deepEqual(committed, [
+    { messageId: "m-sent", route: "send" },
+    { messageId: "m-reply", route: "task_reply" },
+  ]);
+  // The send outcomes the OAR host's turn span counts, as a coordinator hears them: sends only.
+  assert.deepEqual(sendOutcomes, [{ state: "sent", messageId: "m-sent" }, { state: "held" }]);
+});
+
 test("agent credential proxy lets explicit send bypass forward despite pending inbox", async () => {
   let observedBody: any = null;
   const decisions: unknown[] = [];
@@ -2917,15 +3144,20 @@ test("agent credential proxy consumes server held context after it is returned",
   });
 });
 
-// Glimpse G2-3: task writes carry the daemon's model-seen boundary to the
-// Server's task gate, and the Server's held context is booked like a send's,
-// so the identical rerun attests it and passes.
-test("agent credential proxy forwards the boundary on task writes and consumes a server-held task response", async () => {
-  for (const [path, body] of [
-    ["/internal/agent-api/tasks/claim", { channel: "#board", task_numbers: [7] }],
-    ["/internal/agent-api/tasks/update-status", { channel: "#board", task_number: 7, status: "in_review" }],
-    ["/internal/agent-api/tasks/amend", { channel: "#board", task_number: 7, title: "renamed" }],
+// A task write carries the daemon's model-seen boundary for the conversation
+// its result lands in (shared agentWriteLanding.ts), named in `seenFor`, and
+// the Server's held context is booked under that landing like a send's, so
+// the identical rerun attests it and passes.
+test("agent credential proxy forwards the landing's boundary on task writes and consumes a server-held task response", async () => {
+  for (const [path, body, landing, seenFor] of [
+    ["/internal/agent-api/tasks/claim", { channel: "#board", task_numbers: [7] }, "#board:#7", "task_conversation"],
+    ["/internal/agent-api/tasks/unclaim", { channel: "#board", task_number: 7 }, "#board:#7", "task_conversation"],
+    ["/internal/agent-api/tasks/assign", { channel: "#board", task_number: 7, assignee: "@richard" }, "#board:#7", "task_conversation"],
+    ["/internal/agent-api/tasks/update-status", { channel: "#board", task_number: 7, status: "in_review" }, "#board:#7", "task_conversation"],
+    ["/internal/agent-api/tasks/amend", { channel: "#board", task_number: 7, title: "renamed" }, "#board:#7", "task_conversation"],
+    ["/internal/agent-api/tasks", { channel: "#board", tasks: [{ title: "t", source_message_id: "abcdef12-3456" }] }, "#board:abcdef12", "source_thread"],
   ] as const) {
+    const boundaries: Array<string | undefined> = [];
     const forwarded: Array<Record<string, unknown>> = [];
     const consumed: Array<{ target?: string; source: string; boundarySeq?: number; seqs: number[] }> = [];
     await withUpstream((req, res) => {
@@ -2948,7 +3180,10 @@ test("agent credential proxy forwards the boundary on task writes and consumes a
         apiKey: "sk_agent_server_side",
         activeCapabilities: "send,read,tasks",
         inboxCoordinator: {
-          getBoundary: () => 7,
+          getBoundary: (target) => {
+            boundaries.push(target);
+            return 7;
+          },
           getPendingMessages: () => [],
           consumeVisibleMessages: (input) => {
             consumed.push({
@@ -2970,74 +3205,66 @@ test("agent credential proxy forwards the boundary on task writes and consumes a
     });
     assert.equal(forwarded.length, 1, `${path} reached the Server`);
     assert.equal(forwarded[0]!.seenUpToSeq, 7, `${path} carries the daemon's boundary`);
+    assert.equal(forwarded[0]!.seenFor, seenFor, `${path} names the landing its boundary is for`);
+    assert.ok(boundaries.every((target) => target === landing), `${path} reads the boundary of ${landing}: ${boundaries.join(",")}`);
     assert.deepEqual(
       consumed.filter((entry) => entry.source === "server_held_context"),
-      [{ target: "#board", source: "server_held_context", boundarySeq: 9, seqs: [9] }],
+      [{ target: landing, source: "server_held_context", boundarySeq: 9, seqs: [9] }],
       path,
     );
   }
 });
 
-// Glimpse G2-3: a task write has no --anyway, so the daemon's local hold is at
-// most one per catch-up: after a hold the model took in, newer messages that
-// reached the daemon meanwhile do not hold the same write's rerun again; it is
-// forwarded with the model-seen boundary and nothing newer is consumed.
-test("a local task-write hold is one per catch-up; another write is held as usual", async () => {
-  const forwarded: Array<{ url?: string; body: Record<string, unknown> }> = [];
-  let boundary = 7;
-  let pending: AgentProxyVisibleMessage[] = [{ seq: 8, id: "pending-8", channel_type: "channel", channel_name: "board", content: "scope changed" }];
-  const consumedSeqs: number[] = [];
-  await withUpstream((req, res) => {
-    let raw = "";
-    req.on("data", (chunk) => { raw += chunk; });
-    req.on("end", () => {
-      forwarded.push({ url: req.url, body: JSON.parse(raw) as Record<string, unknown> });
-      res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ ok: true, results: [{ taskNumber: 7, success: true }] }));
-    });
-  }, async (serverUrl) => {
-    const handle = await registerAgentCredentialProxy({
-      agentId: "agent-1",
-      launchId: "launch-rehold",
-      serverUrl,
-      apiKey: "sk_agent_server_side",
-      activeCapabilities: "send,read,tasks",
-      inboxCoordinator: {
-        getBoundary: () => boundary,
-        getPendingMessages: (target) => (target === "#board" ? pending : []),
-        consumeVisibleMessages: (input) => {
-          const seqs = input.messages.map((message) => Number(message.seq ?? 0));
-          consumedSeqs.push(...seqs);
-          if (typeof input.boundarySeq === "number") boundary = Math.max(boundary, input.boundarySeq);
-          pending = pending.filter((message) => !seqs.includes(Number(message.seq)));
+// An applied task write's attached context (agentWriteLanding.ts `attach`)
+// reaches the model with the response: it is booked under the write's landing,
+// and the boundary moves only when every counted message was attached.
+test("agent credential proxy books the unseen messages attached to an applied task write", async () => {
+  for (const [omitted, boundary] of [[0, 12], [3, undefined]] as const) {
+    const consumed: Array<{ target?: string; source: string; boundarySeq?: number; seqs: number[] }> = [];
+    await withUpstream((req, res) => {
+      req.resume();
+      req.on("end", () => {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({
+          ok: true,
+          unseen: {
+            target: "#board:#7",
+            messages: [{ seq: 12, id: "unseen-12", content: "one more thing" }],
+            newMessageCount: 1 + omitted,
+            omittedMessageCount: omitted,
+            seenUpToSeq: 12,
+          },
+        }));
+      });
+    }, async (serverUrl) => {
+      const handle = await registerAgentCredentialProxy({
+        agentId: "agent-1",
+        launchId: "launch-attach",
+        serverUrl,
+        apiKey: "sk_agent_server_side",
+        activeCapabilities: "read,tasks",
+        inboxCoordinator: {
+          getBoundary: () => 10,
+          getPendingMessages: () => [],
+          consumeVisibleMessages: (input) => {
+            consumed.push({
+              target: input.target,
+              source: input.source,
+              boundarySeq: input.boundarySeq,
+              seqs: input.messages.map((message) => Number(message.seq ?? 0)),
+            });
+          },
         },
-      },
-    });
-    const post = async (path: string, body: Record<string, unknown>) => {
-      const res = await fetch(`${handle.proxyUrl}${path}`, {
+      });
+      const res = await fetch(`${handle.proxyUrl}/internal/agent-api/tasks/update-status`, {
         method: "POST",
         headers: { Authorization: `Bearer ${handle.proxyToken}`, "content-type": "application/json" },
-        body: JSON.stringify(body),
+        body: JSON.stringify({ channel: "#board", task_number: 7, status: "in_review" }),
       });
-      return await res.json() as { state?: string };
-    };
-    const claim = { channel: "#board", task_numbers: [7] };
-
-    assert.equal((await post("/internal/agent-api/tasks/claim", claim)).state, "held", "the first claim is held locally");
-    assert.equal(forwarded.length, 0);
-    assert.equal(boundary, 8, "the hold's context reached the model");
-
-    // While the agent read, the board moved on.
-    pending = [{ seq: 9, id: "pending-9", channel_type: "channel", channel_name: "board", content: "arrived during the read" }];
-    assert.notEqual((await post("/internal/agent-api/tasks/claim", claim)).state, "held", "the rerun is not held again");
-    assert.equal(forwarded.length, 1);
-    assert.equal(forwarded[0]!.body.seenUpToSeq, 8, "forwarded with the model-seen boundary; the Server decides by the same rule");
-    assert.equal(consumedSeqs.includes(9), false, "nothing newer is consumed by the pass-through");
-
-    // A different write on the board is not covered by that hold.
-    assert.equal((await post("/internal/agent-api/tasks/update-status", { channel: "#board", task_number: 7, status: "in_review" })).state, "held");
-    assert.equal(forwarded.length, 1);
-  });
+      assert.equal(res.status, 200);
+    });
+    assert.deepEqual(consumed, [{ target: "#board:#7", source: "server_held_context", boundarySeq: boundary, seqs: [12] }], `omitted=${omitted}`);
+  }
 });
 
 // Glimpse input duplication: the server groups the bodies it returns by launch and model context.
@@ -3349,7 +3576,7 @@ test("reviewer-isolation replaces legacy upstream error detail with a static fai
 
 test("agent credential proxy consumes returned events and history as visible inbox materialization", async () => {
   const effectOrder: string[] = [];
-  const consumed: Array<{ target?: string; source: string; boundarySeq?: number; seqs: number[] }> = [];
+  const consumed: Array<{ target?: string; source: string; boundarySeq?: number; seqs: number[]; responseBytes?: number }> = [];
   const drainOutcomes: unknown[] = [];
   await withUpstream((req, res) => {
     res.writeHead(200, { "content-type": "application/json" });
@@ -3399,6 +3626,7 @@ test("agent credential proxy consumes returned events and history as visible inb
             source: input.source,
             boundarySeq: input.boundarySeq,
             seqs: input.messages.map((message) => Number(message.seq ?? 0)),
+            ...(input.responseBytes !== undefined && { responseBytes: input.responseBytes }),
           });
         },
         recordDrainOutcome: (input) => drainOutcomes.push(input),
@@ -3421,7 +3649,14 @@ test("agent credential proxy consumes returned events and history as visible inb
 
     assert.deepEqual(consumed, [
       { target: undefined, source: "agent_api_events_server", boundarySeq: undefined, seqs: [10] },
-      { target: "#general", source: "agent_api_history", boundarySeq: 12, seqs: [12] },
+      {
+        target: "#general",
+        source: "agent_api_history",
+        boundarySeq: 12,
+        seqs: [12],
+        // History reads report the upstream body size for re-read telemetry.
+        responseBytes: Buffer.byteLength(JSON.stringify({ messages: [{ seq: 12, id: "history-12", channel_type: "channel", channel_name: "general", content: "history" }] }), "utf8"),
+      },
     ]);
     assert.deepEqual(drainOutcomes, [{
       source: "server_events",
@@ -3437,6 +3672,514 @@ test("agent credential proxy consumes returned events and history as visible inb
       "exposed:12",
     ]);
   });
+});
+
+// `raft task read` is a history window on a task's own conversation. Task v2
+// added its route without booking it, so a task read never counted as seen: a
+// task assign was held on messages the agent had read, and the inbox kept them
+// pending. Message envelopes carry no channel fields, so the key comes from
+// the task ref the request asked for and the Server's answer names.
+test("agent credential proxy books a task read under the task ref it asked for, and nowhere else", async () => {
+  const taskMessages = [
+    { seq: 21, id: "task-21", senderType: "human", senderName: "tygg", content: "first", createdAt: "2026-11-04T00:00:00.000Z" },
+    { seq: 23, id: "task-23", senderType: "agent", senderName: "Kirby", content: "second", createdAt: "2026-11-04T00:00:01.000Z" },
+  ];
+  for (const [query, answerTarget, expected] of [
+    ["channel=%23board&task_number=7", "#board:#7", "#board:#7"],
+    ["channel=dm%3A%40tygg&task_number=3", "dm:@tygg:#3", "dm:@tygg:#3"],
+    ["channel=%23board&task_number=7&before=30&limit=2", "#board:#7", "#board:#7"],
+    ["channel=%23board&task_number=7", "#board", undefined],
+    ["channel=%23board&task_number=7", undefined, undefined],
+    ["channel=%23board&task_number=7", "#board:#8", undefined],
+    ["channel=%23board&task_number=7&consume=false", "#board:#7", undefined],
+  ] as const) {
+    const consumed: Array<{ target?: string; source: string; boundarySeq?: number; seqs: number[] }> = [];
+    await withUpstream((_req, res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ...(answerTarget && { target: answerTarget }), messages: taskMessages }));
+    }, async (serverUrl) => {
+      const handle = await registerAgentCredentialProxy({
+        agentId: "agent-1",
+        launchId: "launch-task-read",
+        serverUrl,
+        apiKey: "sk_agent_server_side",
+        activeCapabilities: "read",
+        inboxCoordinator: {
+          getBoundary: () => undefined,
+          getPendingMessages: () => [],
+          consumeVisibleMessages: (input) => {
+            consumed.push({
+              target: input.target,
+              source: input.source,
+              boundarySeq: input.boundarySeq,
+              seqs: input.messages.map((message) => Number(message.seq ?? 0)),
+            });
+          },
+        },
+      });
+      const res = await fetch(`${handle.proxyUrl}/internal/agent-api/tasks/read?${query}`, {
+        headers: { Authorization: `Bearer ${handle.proxyToken}` },
+      });
+      assert.equal(res.status, 200);
+      assert.equal((await res.json() as { messages?: unknown[] }).messages?.length, 2, "the read itself reaches the agent unchanged");
+    });
+    // `agent_api_history` books exact seqs only and never moves a boundary, so
+    // a --before/--after page marks nothing it didn't return.
+    assert.deepEqual(
+      consumed,
+      expected ? [{ target: expected, source: "agent_api_history", boundarySeq: 23, seqs: [21, 23] }] : [],
+      `${query} answered for ${answerTarget ?? "no target"}`,
+    );
+  }
+});
+
+test("a task read counts as seen: the next task assign carries the read seqs for the task conversation, not the board", async () => {
+  const ledger = new AgentVisibleDeliveryLedger();
+  const forwarded: Array<Record<string, unknown>> = [];
+  await withUpstream((req, res) => {
+    if (req.url?.startsWith("/internal/agent-api/tasks/read")) {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        target: "#proj-assistant:#19",
+        messages: [
+          { seq: 41, id: "task-41", senderType: "agent", senderName: "Kirby", content: "approved", createdAt: "2026-11-04T19:20:08.000Z" },
+          { seq: 44, id: "task-44", senderType: "agent", senderName: "Grace", content: "thanks", createdAt: "2026-11-04T19:20:21.000Z" },
+        ],
+      }));
+      return;
+    }
+    let raw = "";
+    req.on("data", (chunk) => { raw += chunk; });
+    req.on("end", () => {
+      forwarded.push(JSON.parse(raw) as Record<string, unknown>);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true }));
+    });
+  }, async (serverUrl) => {
+    const handle = await registerAgentCredentialProxy({
+      agentId: "agent-1",
+      launchId: "launch-task-read-assign",
+      serverUrl,
+      apiKey: "sk_agent_server_side",
+      activeCapabilities: "read,tasks",
+      inboxCoordinator: {
+        getBoundary: (target) => ledger.getBoundary("agent-1", target),
+        getExactSeenSeqs: (target) => ledger.getExactSeenSeqs("agent-1", target),
+        getPendingMessages: () => [],
+        consumeVisibleMessages: (input) => { ledger.recordConsumed("agent-1", input); },
+      },
+    });
+    const read = await fetch(`${handle.proxyUrl}/internal/agent-api/tasks/read?channel=%23proj-assistant&task_number=19&unread=true`, {
+      headers: { Authorization: `Bearer ${handle.proxyToken}` },
+    });
+    assert.equal(read.status, 200);
+    await read.json();
+    const assign = await fetch(`${handle.proxyUrl}/internal/agent-api/tasks/assign`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${handle.proxyToken}`, "content-type": "application/json" },
+      body: JSON.stringify({ channel: "#proj-assistant", task_number: 19, assignee: "@Grace" }),
+    });
+    assert.equal(assign.status, 200);
+  });
+  assert.equal(forwarded.length, 1);
+  assert.deepEqual(forwarded[0]!.seenExactSeqs, [41, 44], "the messages the read returned are attested as seen");
+  assert.equal(forwarded[0]!.seenFor, "task_conversation");
+  assert.equal(ledger.isModelSeen("agent-1", "#proj-assistant:#19", { seq: 44, message_id: "task-44" }), true);
+  assert.deepEqual(ledger.getExactSeenSeqs("agent-1", "#proj-assistant"), [], "nothing is booked for the board");
+});
+
+/**
+ * A coordinator on the real ledger, scoped to one model context as under
+ * passive AX: what a task write's rerun attests is what the ledger kept.
+ */
+function ledgerCoordinator(
+  ledger: AgentVisibleDeliveryLedger,
+  agentId: string,
+  context: { contextId: string },
+  options: { pending?: AgentProxyVisibleMessage[]; consumed?: Array<{ source: string; seqs: number[] }> } = {},
+) {
+  const view = () => ledger.freshnessView(agentId, context);
+  return {
+    getBoundary: (target: string) => view().getBoundary(target),
+    getExactSeenSeqs: (target: string) => view().getExactSeenSeqs(target),
+    isMessageModelSeen: ({ target, message }: { target: string; message: AgentProxyVisibleMessage }) => view().isModelSeen(target, message),
+    getPendingMessages: () => options.pending ?? [],
+    consumeVisibleMessages: (input: Parameters<AgentVisibleDeliveryLedger["recordConsumed"]>[1]) => {
+      options.consumed?.push({ source: input.source, seqs: input.messages.map((message) => Number(message.seq ?? 0)) });
+      ledger.recordConsumed(agentId, { ...input, contextId: context.contextId });
+    },
+    recordHeldWriteSpan: (input: { target: string; writeKey: string; seenUpToSeq: number }) => {
+      ledger.recordHeldWriteSpan(agentId, { ...input, contextId: context.contextId });
+    },
+    getHeldWriteSpan: ({ target, writeKey }: { target: string; writeKey: string }) =>
+      ledger.getHeldWriteSpan(agentId, context, target, writeKey),
+    getThreadTargetOfMessage: ({ parentTarget, messageId }: { parentTarget: string; messageId: string }) =>
+      ledger.threadTargetOfMessage(agentId, parentTarget, messageId),
+  };
+}
+
+/**
+ * A Server that holds a gated task write until it attests `latestSeq`, as
+ * gateTaskWriteFreshness does when the rerun's boundary covers its last hold;
+ * the hold shows only the newest few messages (the rest are omitted).
+ */
+function holdingTaskWriteServer(latestSeq: number, heldMessages: AgentProxyVisibleMessage[], forwarded: Array<Record<string, unknown>>): http.RequestListener {
+  return (req, res) => {
+    let raw = "";
+    req.on("data", (chunk) => { raw += chunk; });
+    req.on("end", () => {
+      const body = JSON.parse(raw) as Record<string, unknown>;
+      forwarded.push(body);
+      res.writeHead(200, { "content-type": "application/json" });
+      const seen = typeof body.seenUpToSeq === "number" ? body.seenUpToSeq : 0;
+      res.end(JSON.stringify(seen >= latestSeq
+        ? { ok: true }
+        : {
+          ok: true,
+          state: "held",
+          decision: "syncing_hold",
+          newMessageCount: latestSeq - seen,
+          omittedMessageCount: latestSeq - seen - heldMessages.length,
+          seenUpToSeq: latestSeq,
+          heldMessages,
+        }));
+    });
+  };
+}
+
+async function postTaskWrite(handle: { proxyUrl: string; proxyToken: string }, path: string, body: Record<string, unknown>): Promise<{ state?: string }> {
+  const res = await fetch(`${handle.proxyUrl}${path}`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${handle.proxyToken}`, "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  assert.equal(res.status, 200);
+  return await res.json() as { state?: string };
+}
+
+// #proj-o11y:#35: a task conversation the agent had handled in an earlier
+// context held its assignment on 134 messages; the hold showed 3, and each
+// identical rerun attested only those 3, so it was held 42 times. The hold's
+// whole span is booked for freshness (not delivery): the rerun goes through.
+test("a held task write's rerun attests the hold's whole span, not only the messages it showed", async () => {
+  const ledger = new AgentVisibleDeliveryLedger();
+  const context = { contextId: "context-after-compaction" };
+  const forwarded: Array<Record<string, unknown>> = [];
+  const taskMessage = (seq: number): AgentProxyVisibleMessage => ({
+    seq,
+    id: `task-${seq}`,
+    channel_type: "thread",
+    channel_name: "#35",
+    parent_channel_name: "proj-o11y",
+    parent_channel_type: "channel",
+    task_conversation_number: 35,
+    sender_name: "richard",
+    sender_type: "human",
+    content: `update ${seq}`,
+  });
+  const assignBody = { channel: "#proj-o11y", task_number: 35, assignee: "@Grace" };
+  await withUpstream(holdingTaskWriteServer(140, [taskMessage(138), taskMessage(139), taskMessage(140)], forwarded), async (serverUrl) => {
+    const handle = await registerAgentCredentialProxy({
+      agentId: "agent-1",
+      launchId: "launch-task-hold-span",
+      serverUrl,
+      apiKey: "sk_agent_server_side",
+      activeCapabilities: "read,tasks",
+      inboxCoordinator: ledgerCoordinator(ledger, "agent-1", context),
+    });
+    assert.equal((await postTaskWrite(handle, "/internal/agent-api/tasks/assign", assignBody)).state, "held");
+    // The hold vouches only for its own rerun (the Server's write key):
+    // another write to the same task saw 3 of 134 and is checked as such.
+    assert.equal((await postTaskWrite(handle, "/internal/agent-api/tasks/claim", { channel: "#proj-o11y", task_numbers: [35] })).state, "held");
+    assert.equal((await postTaskWrite(handle, "/internal/agent-api/tasks/assign", { ...assignBody, assignee: "@Kirby" })).state, "held");
+    assert.notEqual((await postTaskWrite(handle, "/internal/agent-api/tasks/assign", assignBody)).state, "held", "the identical rerun goes through");
+    // A new model context has seen none of it: evidence stays context-scoped.
+    context.contextId = "context-next";
+    assert.equal((await postTaskWrite(handle, "/internal/agent-api/tasks/assign", assignBody)).state, "held");
+  });
+  assert.equal(forwarded.length, 5);
+  assert.equal(forwarded[0]!.seenUpToSeq, 0);
+  assert.notEqual(forwarded[1]!.seenUpToSeq, 140, "a claim does not attest the assignment's hold");
+  assert.notEqual(forwarded[2]!.seenUpToSeq, 140, "an assignment to someone else does not attest it");
+  assert.equal(forwarded[3]!.seenUpToSeq, 140, "the rerun attests the hold's seenUpToSeq");
+  assert.equal(forwarded[3]!.seenFor, "task_conversation");
+  assert.equal(forwarded[4]!.seenUpToSeq, 0, "a new context attests nothing it has not seen");
+  assert.equal(ledger.getBoundary("agent-1", "#proj-o11y:#35"), undefined, "never a delivery boundary: omitted rows stay deliverable");
+});
+
+// The held span must not reach the send planner: a message send to the same
+// conversation would call the rows the hold left out seen, consume them as
+// preflight context and drop them from the pending inbox undelivered.
+test("a held task write's span leaves the rows its hold omitted pending for a message send to that conversation", async () => {
+  const ledger = new AgentVisibleDeliveryLedger();
+  const context = { contextId: "context-1" };
+  const taskMessage = (seq: number): AgentProxyVisibleMessage => ({
+    seq,
+    id: `task-${seq}`,
+    message_id: `task-${seq}`,
+    channel_id: "task-35-conversation",
+    channel_type: "thread",
+    channel_name: "#35",
+    parent_channel_name: "proj-o11y",
+    parent_channel_type: "channel",
+    task_conversation_number: 35,
+    sender_name: "richard",
+    sender_type: "human",
+    content: `update ${seq}`,
+  });
+  // Delivered to the daemon but never shown: the hold showed only 138-140.
+  const pending = [10, 11, 12, 136, 137].map(taskMessage);
+  const consumed: Array<{ source: string; seqs: number[] }> = [];
+  const forwarded: Array<Record<string, unknown>> = [];
+  await withUpstream(holdingTaskWriteServer(140, [taskMessage(138), taskMessage(139), taskMessage(140)], forwarded), async (serverUrl) => {
+    const handle = await registerAgentCredentialProxy({
+      agentId: "agent-1",
+      launchId: "launch-task-hold-then-send",
+      serverUrl,
+      apiKey: "sk_agent_server_side",
+      activeCapabilities: "send,read,tasks",
+      inboxCoordinator: ledgerCoordinator(ledger, "agent-1", context, { pending, consumed }),
+    });
+    assert.equal((await postTaskWrite(handle, "/internal/agent-api/tasks/assign", { channel: "#proj-o11y", task_number: 35, assignee: "@Grace" })).state, "held");
+    const sent = await postTaskWrite(handle, "/internal/agent-api/send", { target: "#proj-o11y:#35", content: "on it" });
+    assert.equal(sent.state, "held", "the send is held on the pending rows the model has not seen");
+  });
+  assert.equal(forwarded.length, 1, "the send was not forwarded past the pending rows");
+  const preflightSeqs = consumed.filter((entry) => entry.source === "side_effect_preflight_context").flatMap((entry) => entry.seqs);
+  assert.ok(!preflightSeqs.includes(10) && !preflightSeqs.includes(11), `rows the send's hold did not show stay pending: ${preflightSeqs.join(",")}`);
+  for (const seq of [10, 11]) {
+    assert.equal(ledger.isModelSeen("agent-1", "#proj-o11y:#35", { seq, message_id: `task-${seq}` }), false, `seq ${seq} is not suppressed`);
+  }
+});
+
+// A task create from a reply inside a thread lands in that thread (the Server
+// hangs the task under its root), but was attested for `#ch:<reply short>`, a
+// thread that does not exist: the model's view of the real thread was never
+// sent, and the hold's context was booked under the real thread, so the
+// rerun attested nothing again and was held on reruns forever.
+test("a task create from a reply in a thread attests that thread, and its rerun passes", async () => {
+  const root = "aaaaaaaa-1111-4111-8111-111111111111";
+  const reply = "bbbbbbbb-2222-4222-8222-222222222222";
+  const threadMessage = (seq: number): AgentProxyVisibleMessage => ({
+    seq,
+    id: `thread-${seq}`,
+    channel_type: "thread",
+    channel_name: `thread-${root.slice(0, 8)}`,
+    parent_channel_name: "proj",
+    parent_channel_type: "channel",
+    sender_name: "richard",
+    sender_type: "human",
+    content: `reply ${seq}`,
+  });
+  const createBody = { channel: "#proj", tasks: [{ title: "write the note", source_message_id: reply.slice(0, 8) }] };
+  // Saw the thread before; never saw it; never saw it, and the hold shows the
+  // reply itself (the rerun then attests the real thread, where the span
+  // must be booked too).
+  for (const [sawThread, holdShowsReply] of [[true, false], [false, false], [false, true]] as const) {
+    const ledger = new AgentVisibleDeliveryLedger();
+    const context = { contextId: "context-1" };
+    if (sawThread) {
+      // The model read the thread up to seq 94, the reply among it.
+      ledger.recordConsumed("agent-1", {
+        target: "#proj:aaaaaaaa",
+        messages: [{ seq: 50, id: reply }, { seq: 94, id: "thread-94" }],
+        boundarySeq: 94,
+        source: "verified_contiguous_content_consumption",
+        contextId: context.contextId,
+      });
+    }
+    const forwarded: Array<Record<string, unknown>> = [];
+    const held = [threadMessage(95), threadMessage(96), holdShowsReply ? { ...threadMessage(97), id: reply } : threadMessage(97)];
+    await withUpstream(holdingTaskWriteServer(97, held, forwarded), async (serverUrl) => {
+      const handle = await registerAgentCredentialProxy({
+        agentId: "agent-1",
+        launchId: `launch-task-create-reply-${sawThread}-${holdShowsReply}`,
+        serverUrl,
+        apiKey: "sk_agent_server_side",
+        activeCapabilities: "read,tasks",
+        inboxCoordinator: ledgerCoordinator(ledger, "agent-1", context),
+      });
+      assert.equal((await postTaskWrite(handle, "/internal/agent-api/tasks", createBody)).state, "held");
+      assert.notEqual((await postTaskWrite(handle, "/internal/agent-api/tasks", createBody)).state, "held", `rerun goes through (saw thread: ${sawThread}, hold shows reply: ${holdShowsReply})`);
+    });
+    assert.equal(forwarded.length, 2, "exactly one hold, then applied");
+    assert.equal(forwarded[0]!.seenFor, "source_thread");
+    assert.equal(forwarded[0]!.seenUpToSeq, sawThread ? 94 : 0, "attests what the model saw of the reply's thread");
+    assert.equal(forwarded[1]!.seenUpToSeq, 97);
+  }
+});
+
+// Guard: task v2 added `/tasks/read` and the proxy never booked it, while
+// both sides' unit tests stayed green. Every route that answers with a history
+// window is one the proxy books as seen.
+test("every route that answers with a history window is booked as seen by the proxy", () => {
+  const windowRoutes = Object.values(agentApiContract)
+    .filter((route) => (route as { response?: { body?: unknown } }).response?.body === agentApiHistoryResponseSchema);
+  assert.ok(windowRoutes.some((route) => route.key === "taskRead"), "fixture: task read answers with a history window");
+  for (const route of windowRoutes) {
+    assert.equal(__agentApiBooksHistoryWindowForTest(route.fullPath), true, `${route.key} (${route.fullPath}) is read by agents but never booked as seen`);
+  }
+});
+
+// RFC 081 D1 / §7: `raft inbox read` drops what its page printed from the
+// daemon-local queue, by id and seq, as a `message read` page does.
+function inboxReadQueued(id: string, seq: number, overrides: Partial<AgentProxyVisibleMessage> = {}): AgentProxyVisibleMessage {
+  return { id, message_id: id, seq, channel_id: "ch-general", channel_type: "channel", channel_name: "general", sender_name: "richard", sender_type: "human", content: id, ...overrides };
+}
+
+test("[D1] an inbox read page drops the messages it printed from the local queue; one it did not print stays", async () => {
+  assert.equal(INBOX_READ_PATH, agentApiContract.inboxRead.fullPath, "the proxy watches the contract's route");
+  const ledger = new AgentVisibleDeliveryLedger();
+  // The daemon-local queue, as APM keeps it; consumeVisibleMessages filters it as APM does.
+  let queue = [
+    inboxReadQueued("m-41", 41),
+    inboxReadQueued("m-42", 42),
+    inboxReadQueued("m-43", 43),
+    inboxReadQueued("t-50", 50, { channel_type: "thread", channel_name: "thread-3ae9bd99", parent_channel_name: "general", parent_channel_type: "channel" }),
+  ];
+  const sources: string[] = [];
+  const requests: Array<{ method?: string; url?: string; body: string }> = [];
+  await withUpstream((req, res) => {
+    let raw = "";
+    req.on("data", (chunk) => { raw += chunk; });
+    req.on("end", () => {
+      requests.push({ method: req.method, url: req.url, body: raw });
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        target: "#general",
+        kind: "conversation",
+        // The page printed 41 and 42 (oldest first); 43 is left for the next read.
+        entries: [
+          { seq: 41, id: "m-41", channel_type: "channel", channel_name: "general", senderType: "human", senderName: "richard", content: "m-41", createdAt: "2026-11-09T10:00:00.000Z" },
+          { seq: 42, id: "m-42", channel_type: "channel", channel_name: "general", senderType: "human", senderName: "richard", content: "m-42", createdAt: "2026-11-09T10:01:00.000Z" },
+        ],
+        unreadBefore: 3,
+        remaining: 1,
+        remainingCapped: false,
+        consumed: false,
+        nextCursor: null,
+      }));
+    });
+  }, async (serverUrl) => {
+    const handle = await registerAgentCredentialProxy({
+      agentId: "agent-1",
+      launchId: "launch-inbox-read-drop",
+      serverUrl,
+      apiKey: "sk_agent_server_side",
+      activeCapabilities: "read",
+      inboxCoordinator: {
+        getBoundary: (target) => ledger.getBoundary("agent-1", target),
+        getPendingMessages: () => [],
+        consumeVisibleMessages: (input) => {
+          sources.push(input.source);
+          const consumed = ledger.recordConsumed("agent-1", input);
+          if (consumed) queue = queue.filter((message) => !consumed.shouldSuppress(message as never));
+        },
+      },
+    });
+    // Typed under another spelling than the Server's canonical target: the
+    // entries' own metadata decides where they are booked.
+    const res = await fetch(`${handle.proxyUrl}${INBOX_READ_PATH}`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${handle.proxyToken}`, "content-type": "application/json" },
+      body: JSON.stringify({ target: "#GENERAL" }),
+    });
+    assert.equal(res.status, 200);
+    assert.equal((await res.json() as { entries: unknown[] }).entries.length, 2, "the page reaches the agent unchanged");
+  });
+  assert.equal(requests.length, 1, "a destructive read is forwarded once, never retried");
+  assert.equal(requests[0]!.method, "POST");
+  assert.equal(requests[0]!.url, INBOX_READ_PATH);
+  assert.deepEqual(sources, ["agent_api_inbox_read"]);
+  assert.deepEqual(queue.map((message) => message.id), ["m-43", "t-50"], "printed messages leave the queue; the rest stay");
+  // Not pushed again: a re-delivery of a printed message is already model-seen.
+  assert.equal(ledger.isModelSeen("agent-1", "#general", { seq: 42, message_id: "m-42" }), true);
+  assert.equal(ledger.isModelSeen("agent-1", "#general", { seq: 43, message_id: "m-43" }), false);
+  // Exact ids and seqs only: a page never moves the boundary past what it did not print.
+  assert.equal(ledger.getBoundary("agent-1", "#general"), undefined);
+});
+
+// RFC 081 D13 (Tenny #wg-ax:#19): reading a reminder consumes nothing (only
+// its ack does), and its entries carry the firing event's id, so a reminder
+// read must not drop the queued notice with that id.
+test("[D13] an inbox read of a reminder leaves the local queue as it was", async () => {
+  const ledger = new AgentVisibleDeliveryLedger();
+  let queue = [inboxReadQueued("evt-7", 70)];
+  const sources: string[] = [];
+  await withUpstream((req, res) => {
+    req.resume();
+    req.on("end", () => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        target: "app:system.reminder/rem-1",
+        kind: "reminder",
+        entries: [{ seq: 70, id: "evt-7", message_id: "evt-7", channel_type: "channel", channel_name: "general", content: "reminder fired", createdAt: "2026-11-09T10:00:00.000Z" }],
+        unreadBefore: 1,
+        remaining: 1,
+        remainingCapped: false,
+        consumed: false,
+        nextCursor: null,
+      }));
+    });
+  }, async (serverUrl) => {
+    const handle = await registerAgentCredentialProxy({
+      agentId: "agent-1",
+      launchId: "launch-inbox-read-reminder",
+      serverUrl,
+      apiKey: "sk_agent_server_side",
+      activeCapabilities: "read",
+      inboxCoordinator: {
+        getBoundary: (target) => ledger.getBoundary("agent-1", target),
+        getPendingMessages: () => [],
+        consumeVisibleMessages: (input) => {
+          sources.push(input.source);
+          const consumed = ledger.recordConsumed("agent-1", input);
+          if (consumed) queue = queue.filter((message) => !consumed.shouldSuppress(message as never));
+        },
+      },
+    });
+    const res = await fetch(`${handle.proxyUrl}${INBOX_READ_PATH}`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${handle.proxyToken}`, "content-type": "application/json" },
+      body: JSON.stringify({ target: "app:system.reminder/rem-1" }),
+    });
+    assert.equal(res.status, 200);
+  });
+  assert.deepEqual(sources, [], "a reminder read books nothing");
+  assert.deepEqual(queue.map((message) => message.id), ["evt-7"], "the queued notice stays until the reminder is acked");
+});
+
+test("[D1] an inbox read whose local bookkeeping fails still answers the agent once, without a retry", async () => {
+  let upstreamCalls = 0;
+  await withUpstream((req, res) => {
+    upstreamCalls += 1;
+    req.resume();
+    req.on("end", () => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ target: "#general", kind: "conversation", entries: [{ seq: 41, id: "m-41", channel_type: "channel", channel_name: "general", content: "m-41" }], unreadBefore: 1, remaining: 0, remainingCapped: false, consumed: true, nextCursor: null }));
+    });
+  }, async (serverUrl) => {
+    const handle = await registerAgentCredentialProxy({
+      agentId: "agent-1",
+      launchId: "launch-inbox-read-ledger-fail",
+      serverUrl,
+      apiKey: "sk_agent_server_side",
+      activeCapabilities: "read",
+      inboxCoordinator: {
+        getBoundary: () => undefined,
+        getPendingMessages: () => [],
+        consumeVisibleMessages: () => { throw new Error("ledger down"); },
+      },
+    });
+    const res = await fetch(`${handle.proxyUrl}${INBOX_READ_PATH}`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${handle.proxyToken}`, "content-type": "application/json" },
+      body: JSON.stringify({ target: "#general" }),
+    });
+    assert.equal(res.status, 200, "the consumed page is not lost to a local failure");
+    assert.equal((await res.json() as { consumed: boolean }).consumed, true);
+  });
+  assert.equal(upstreamCalls, 1);
 });
 
 test("agent credential proxy serves local pending inbox before forwarding agent-api events", async () => {
@@ -4316,6 +5059,291 @@ test("agent credential proxy serves typed app inbox items without msg fields; ch
   });
 });
 
+for (const inboxItemsFlag of [true, false]) test(`inbox items ${inboxItemsFlag ? "on" : "off"}: a locally fired reminder is acked only through the Server, listed once, and the daemon declares reminder-server-ack@1; other app items still ack locally`, async () => {
+  const reminderId = "cccccccc-0000-4000-8000-000000000003";
+  const reminderItemId = `reminder:${reminderId}:1`;
+  const fixtureRegistry = {
+    "test.fixture": {
+      over_threshold: {
+        retention: "transient" as const,
+        primaryAction: { kind: "run_command" as const, commandId: "fixture.review" },
+        normalizeSourceRef: (raw: unknown) => {
+          const o = raw as { kind?: unknown; id?: unknown };
+          return o?.kind === "fixture-measure" && typeof o.id === "string"
+            ? { ok: true as const, ref: { kind: "fixture-measure", id: o.id } }
+            : { ok: false as const, message: "invalid measure ref" };
+        },
+        materializeActionCli: () => "raft fixture review",
+      },
+    },
+  };
+  let ackMode: "refuse" | "unavailable" | "accept" = "refuse";
+  let serverAcked = false;
+  const upstreamAckCaps: string[] = [];
+  const listCaps: string[] = [];
+  let beforeAckCalls = 0;
+  let beforeServerAckCalls = 0;
+  await withUpstream((req, res) => {
+    const caps = String(req.headers["x-raft-client-capabilities"] ?? "");
+    if (req.method === "GET" && req.url?.startsWith("/internal/agent-api/inbox/conversations")) {
+      listCaps.push(caps);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        view: "unread",
+        items: [],
+        hasMore: false,
+        nextBeforeSeq: null,
+        totals: { conversations: 0, dms: 0, mentions: 0 },
+        preLaunch: null,
+        omitted: null,
+        rows: serverAcked ? [] : [{
+          target: `reminder:${reminderId}`,
+          kind: "reminder",
+          app: { key: "system.reminder", name: "Reminder" },
+          ack: [{ app: "system.reminder", id: reminderId, revision: "1" }],
+          unread: 1,
+          latestSender: null,
+          preview: "check the deploy",
+          previewTruncated: false,
+          firstUnreadAt: null,
+          latestAt: null,
+          preLaunch: false,
+        }],
+      }));
+      return;
+    }
+    assert.equal(req.method, "POST");
+    assert.equal(req.url, "/internal/agent-api/app-sources/ack");
+    upstreamAckCaps.push(caps);
+    let raw = "";
+    req.setEncoding("utf8");
+    req.on("data", (chunk) => { raw += chunk; });
+    req.on("end", () => {
+      const body = JSON.parse(raw) as Record<string, unknown>;
+      if (ackMode === "refuse") {
+        res.writeHead(404, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "Source revision was not fired", code: "target_not_fired" }));
+        return;
+      }
+      if (ackMode === "unavailable") {
+        res.writeHead(503, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "Service unavailable" }));
+        return;
+      }
+      serverAcked = true;
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        ok: true,
+        itemId: body.itemId,
+        appId: body.appId,
+        notificationClass: body.notificationClass,
+        sourceRef: body.sourceRef,
+        sourceEventId: "dddddddd-0000-4000-8000-000000000004",
+        ackAttemptId: body.ackAttemptId,
+        replayed: false,
+      }));
+    });
+  }, async (serverUrl) => {
+    const appInbox = createAgentAppInboxStore({
+      idFactory: () => "fixture-item-1",
+      registry: { ...REMINDER_AGENT_INBOX_REGISTRY, ...fixtureRegistry },
+      // The reminder fired on this machine: the local cache would ack it.
+      beforeAck: () => {
+        beforeAckCalls += 1;
+        return true;
+      },
+      beforeServerAuthorizedAck: () => {
+        beforeServerAckCalls += 1;
+        return true;
+      },
+    });
+    assert.equal(appInbox.mint({
+      appId: "system.reminder",
+      notificationClass: "due",
+      sourceRef: { kind: "reminder", id: reminderId, revision: "1" },
+    }).ok, true);
+    assert.equal(appInbox.mint({
+      appId: "test.fixture",
+      notificationClass: "over_threshold",
+      sourceRef: { kind: "fixture-measure", id: "owner" },
+    }).ok, true);
+    const handle = await registerAgentCredentialProxy({
+      agentId: "agent-reminder-server-ack",
+      launchId: "launch-reminder-server-ack",
+      serverUrl,
+      apiKey: "sk_agent_server_side",
+      activeCapabilities: "read",
+      appInbox,
+      inboxItems: () => inboxItemsFlag,
+    });
+    const authorization = { Authorization: `Bearer ${handle.proxyToken}` };
+    const ack = (itemId: string) => fetch(`${handle.proxyUrl}/internal/agent-api/inbox/ack`, {
+      method: "POST",
+      headers: { ...authorization, "content-type": "application/json", "X-Raft-Client-Capabilities": "inbox-items@1" },
+      body: JSON.stringify({ itemId }),
+    });
+    // `raft inbox check`: the Server's list and the daemon snapshot, merged by the CLI.
+    const inboxCheck = async () => {
+      const [list, daemon] = await Promise.all([
+        fetch(`${handle.proxyUrl}/internal/agent-api/inbox/conversations?items=true`, {
+          headers: { ...authorization, "X-Raft-Client-Capabilities": "manual-context-v1,inbox-items@1" },
+        }),
+        fetch(`${handle.proxyUrl}/internal/agent-api/inbox`, { headers: authorization }),
+      ]);
+      assert.equal(list.status, 200);
+      assert.equal(daemon.status, 200);
+      const daemonBody = await daemon.json() as { items: Array<Record<string, unknown>> };
+      const appItems = daemonBody.items.filter((item) => item.source === "app");
+      return {
+        appItems,
+        text: formatInboxCheck({ view: "unread", nowMs: 0, list: await list.json() as never, appItems: appItems as never }),
+      };
+    };
+    try {
+      const before = await inboxCheck();
+      assert.equal(listCaps.at(-1), `manual-context-v1,inbox-items@1,${REMINDER_SERVER_ACK_CAPABILITY}`);
+      // The daemon still holds the item (`raft reminder ack` resolves it there); the merge shows it once.
+      assert.equal(before.appItems.filter((item) => item.appId === "system.reminder").length, 1);
+      assert.equal(before.text.match(/raft reminder ack/g)?.length, 1, before.text);
+      assert.equal(before.text.match(new RegExp(`^reminder:${reminderId} · 1 fired, not acked`, "gm"))?.length, 1, before.text);
+      assert.doesNotMatch(before.text, /action=raft reminder ack/, "the daemon copy is not listed beside the Server row");
+
+      // A Server refusal is the caller's error; the local item stays and nothing acked locally.
+      const refused = await ack(reminderItemId);
+      assert.equal(refused.status, 404);
+      assert.equal((await refused.json() as { code: string }).code, "target_not_fired");
+      assert.equal(beforeAckCalls, 0, "the local cache never acks a reminder on its own");
+      assert.equal(beforeServerAckCalls, 0);
+      assert.ok(appInbox.list().some((item) => item.itemId === reminderItemId));
+
+      // An unavailable Server is not faked into success either.
+      ackMode = "unavailable";
+      const unavailable = await ack(reminderItemId);
+      assert.equal(unavailable.status, 503);
+      assert.equal(beforeAckCalls, 0);
+      assert.ok(appInbox.list().some((item) => item.itemId === reminderItemId));
+
+      ackMode = "accept";
+      const accepted = await ack(reminderItemId);
+      assert.equal(accepted.status, 200);
+      assert.equal(beforeAckCalls, 0);
+      assert.equal(beforeServerAckCalls, 1, "the local cache converges only after the Server accepts");
+      assert.equal(appInbox.list().some((item) => item.itemId === reminderItemId), false);
+      assert.equal(upstreamAckCaps.length, 3);
+      for (const caps of upstreamAckCaps) assert.equal(caps, `inbox-items@1,${REMINDER_SERVER_ACK_CAPABILITY}`);
+
+      const after = await inboxCheck();
+      assert.equal(after.appItems.filter((item) => item.appId === "system.reminder").length, 0);
+      assert.doesNotMatch(after.text, /reminder:|raft reminder ack/);
+
+      // A non-reminder app item keeps its local ack: no Server call.
+      const fixture = await ack("fixture-item-1");
+      assert.equal(fixture.status, 200);
+      assert.equal(beforeAckCalls, 1);
+      assert.equal(upstreamAckCaps.length, 3);
+      assert.equal(appInbox.list().length, 0);
+    } finally {
+      unregisterAgentCredentialProxyForLaunch({ agentId: "agent-reminder-server-ack", launchId: "launch-reminder-server-ack" });
+    }
+  });
+});
+
+test("raft reminder ack says the reminder is still not acked: refused, where its current ack lines are; 5xx or unreachable, retry the same ack", async () => {
+  const reminderId = "cccccccc-0000-4000-8000-000000000003";
+  const json = (status: number, body: unknown): http.RequestListener => (_req, res) => {
+    res.writeHead(status, { "content-type": "application/json" });
+    res.end(JSON.stringify(body));
+  };
+  const stillNotAcked = `reminder ${reminderId} revision 1 is still not acknowledged.`;
+  const sameAck = `it is safe to run the same ack again: raft reminder ack --id ${reminderId} --revision 1`;
+  const cases: Array<{ upstream: http.RequestListener | "unreachable"; text: string }> = [
+    {
+      upstream: json(403, { error: "Permission denied", code: "FORBIDDEN" }),
+      text: [
+        `Error: The Server refused the ack (Permission denied); ${stillNotAcked}`,
+        "Code: ACK_FAILED",
+        "Next action: Nothing was acknowledged. raft inbox check lists this reminder's current ack: lines; ack those.",
+      ].join("\n") + "\n",
+    },
+    {
+      upstream: json(404, { error: "Source revision was not fired", code: "target_not_fired" }),
+      text: [
+        `Error: The Server refused the ack (Source revision was not fired); ${stillNotAcked}`,
+        "Code: ACK_FAILED",
+        "Next action: Nothing was acknowledged. raft inbox check lists this reminder's current ack: lines; ack those.",
+      ].join("\n") + "\n",
+    },
+    {
+      upstream: json(503, { error: "Service unavailable" }),
+      text: [
+        `Error: The Server could not take the ack (Service unavailable); ${stillNotAcked}`,
+        "Code: SERVER_5XX",
+        `Next action: Retry in a few seconds; ${sameAck}`,
+      ].join("\n") + "\n",
+    },
+    {
+      upstream: "unreachable",
+      text: [
+        `Error: The Server could not be reached; ${stillNotAcked}`,
+        "Code: ACK_UNREACHABLE",
+        `Next action: Retry in a few seconds; ${sameAck}`,
+      ].join("\n") + "\n",
+    },
+  ];
+  for (const [index, { upstream, text }] of cases.entries()) {
+    const server = http.createServer(upstream === "unreachable" ? () => {} : upstream);
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    assert.ok(address && typeof address === "object");
+    if (upstream === "unreachable") await new Promise<void>((resolve) => server.close(() => resolve()));
+    const appInbox = createAgentAppInboxStore({
+      registry: REMINDER_AGENT_INBOX_REGISTRY,
+      beforeAck: () => true,
+      beforeServerAuthorizedAck: () => true,
+    });
+    assert.equal(appInbox.mint({
+      appId: "system.reminder",
+      notificationClass: "due",
+      sourceRef: { kind: "reminder", id: reminderId, revision: "1" },
+    }).ok, true);
+    const launchId = `launch-reminder-ack-text-${index}`;
+    const handle = await registerAgentCredentialProxy({
+      agentId: "agent-reminder-ack-text",
+      launchId,
+      serverUrl: `http://127.0.0.1:${address.port}`,
+      apiKey: "sk_agent_server_side",
+      activeCapabilities: "read",
+      appInbox,
+    });
+    const agentContext: AgentContext = {
+      agentId: "agent-reminder-ack-text",
+      serverId: "server-1",
+      serverUrl: handle.proxyUrl,
+      token: handle.proxyToken,
+      clientMode: "managed-runner",
+      secretSource: "agent-proxy-token-env",
+      activeCapabilities: null,
+    };
+    const ctx = createCommandContext({
+      io: { stdout: { write: () => true }, stderr: { write: () => true } },
+      loadAgentContext: () => agentContext,
+      createApiClient: () => new ApiClient(agentContext),
+    });
+    try {
+      const error = await Promise.resolve(reminderAckCommand.handler(ctx, { id: "cccccccc", revision: "1" })).then(
+        () => assert.fail("the ack must fail"),
+        (err: unknown) => err,
+      );
+      assert.ok(error instanceof CliError, String(error));
+      assert.equal(formatErrorEnvelope(error), text);
+      assert.equal(appInbox.list().length, 1, "the local item stays");
+    } finally {
+      unregisterAgentCredentialProxyForLaunch({ agentId: "agent-reminder-ack-text", launchId });
+      if (upstream !== "unreachable") await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  }
+});
+
 test("sealed reminder items block receipt and server ACK paths before side effects; unsealed controls remain normal", async () => {
   const reminderId = "aaaaaaaa-0000-4000-8000-000000000001";
   const controlReminderId = "bbbbbbbb-0000-4000-8000-000000000002";
@@ -4386,15 +5414,17 @@ test("sealed reminder items block receipt and server ACK paths before side effec
         [["1", "@Stone"], ["2", "@Stone"], ["3", null], ["4", null]],
       );
 
-      const localControl = await post("/internal/agent-api/inbox/ack", { itemId: `reminder:${controlReminderId}:3` });
-      assert.equal(localControl.status, 200);
-      assert.equal(beforeAckCalls, 1);
-      assert.equal(upstreamAckCount, 0, "receipt-present unsealed control stays local");
+      // reminder-server-ack@1: an unsealed reminder is acked through the Server
+      // whether or not the local cache holds its receipt.
+      const receiptPresentControl = await post("/internal/agent-api/inbox/ack", { itemId: `reminder:${controlReminderId}:3` });
+      assert.equal(receiptPresentControl.status, 200);
+      assert.equal(beforeAckCalls, 0);
+      assert.equal(upstreamAckCount, 1, "receipt-present unsealed control uses the Server path");
 
-      const serverControl = await post("/internal/agent-api/inbox/ack", { itemId: `reminder:${controlReminderId}:4` });
-      assert.equal(serverControl.status, 200);
-      assert.equal(beforeAckCalls, 2);
-      assert.equal(upstreamAckCount, 1, "receipt-missing unsealed control uses the Server path");
+      const receiptMissingControl = await post("/internal/agent-api/inbox/ack", { itemId: `reminder:${controlReminderId}:4` });
+      assert.equal(receiptMissingControl.status, 200);
+      assert.equal(beforeAckCalls, 0);
+      assert.equal(upstreamAckCount, 2, "receipt-missing unsealed control uses the Server path");
     } finally {
       unregisterAgentCredentialProxyForLaunch({ agentId: "agent-sealed-reminders", launchId: "launch-sealed-reminders" });
     }
@@ -5051,6 +6081,121 @@ for (const eventRef of ["abcdef12", "abcdef12-0000-4000-8000-000000000000", "ABC
     });
   });
 }
+
+// `raft message read --target agent-event:<id8>` hands the event body to the
+// runtime like a Local Inbox `/events` serve does, so it reports the event
+// delivered once the response has been written. A read that fails (absent,
+// ambiguous, expired) or does not consume carries no body to the model.
+function withAgentEventHistoryUpstream(
+  historyResponse: { status: number; body: unknown },
+  fn: (serverUrl: string, reports: string[][]) => Promise<void>,
+): Promise<void> {
+  const reports: string[][] = [];
+  return withUpstream((req, res) => {
+    if (req.method === "POST" && req.url === "/internal/agent-api/third-party-events/delivered") {
+      const chunks: Buffer[] = [];
+      req.on("data", (chunk: Buffer) => chunks.push(chunk));
+      req.on("end", () => {
+        reports.push((JSON.parse(Buffer.concat(chunks).toString("utf8")) as { eventIds: string[] }).eventIds);
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true, delivered: 1 }));
+      });
+      return;
+    }
+    res.writeHead(historyResponse.status, { "content-type": "application/json" });
+    res.end(JSON.stringify(historyResponse.body));
+  }, (serverUrl) => fn(serverUrl, reports));
+}
+
+test("agent credential proxy reports a third-party event delivered after an agent-event re-read returns its body", async () => {
+  const eventId = "abcdef12-0000-4000-8000-000000000257";
+  const message = {
+    id: eventId, message_id: eventId,
+    channel_type: "dm", channel_name: "third-party-agent-events:agent-reread",
+    third_party_event: { id: eventId },
+  };
+  const ledger = new AgentVisibleDeliveryLedger();
+  await withAgentEventHistoryUpstream({ status: 200, body: { messages: [message] } }, async (serverUrl, reports) => {
+    const handle = await registerAgentCredentialProxy({
+      agentId: "agent-reread", launchId: "launch-reread", serverUrl,
+      apiKey: "sk_agent_server_side", activeCapabilities: "read",
+      inboxCoordinator: {
+        getBoundary: (target) => ledger.getBoundary("agent-reread", target),
+        getPendingMessages: () => [],
+        consumeVisibleMessages: (input) => { ledger.recordConsumed("agent-reread", input); },
+      },
+    });
+    try {
+      const response = await fetch(`${handle.proxyUrl}/internal/agent-api/history?channel=agent-event:abcdef12`, {
+        headers: { Authorization: `Bearer ${handle.proxyToken}` },
+      });
+      assert.equal(response.status, 200);
+      assert.deepEqual(await response.json(), { messages: [message] });
+      await waitForCondition(() => reports.length >= 1, "re-read delivery report");
+      assert.deepEqual(reports, [[eventId]]);
+      assert.equal(ledger.isModelSeen("agent-reread", "agent-event:abcdef12", message), true);
+    } finally {
+      unregisterAgentCredentialProxyForLaunch({ agentId: "agent-reread", launchId: "launch-reread" });
+    }
+  });
+});
+
+test("a start-prompt delivered report is attempted only for an agent with a proxy registration", async () => {
+  const eventId = "abcdef14-0000-4000-8000-000000000257";
+  await withAgentEventHistoryUpstream({ status: 200, body: { events: [] } }, async (serverUrl, reports) => {
+    assert.equal(reportThirdPartyEventsDelivered("agent-start-report", [eventId]), false, "no registration: nothing attempted");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.deepEqual(reports, []);
+
+    await registerAgentCredentialProxy({
+      agentId: "agent-start-report", launchId: "launch-start-report", serverUrl,
+      apiKey: "sk_agent_server_side", activeCapabilities: "read",
+    });
+    try {
+      assert.equal(reportThirdPartyEventsDelivered("agent-start-report", [eventId]), true);
+      await waitForCondition(() => reports.length >= 1, "start-prompt delivery report");
+      assert.deepEqual(reports, [[eventId]]);
+    } finally {
+      unregisterAgentCredentialProxyForLaunch({ agentId: "agent-start-report", launchId: "launch-start-report" });
+    }
+  });
+});
+
+for (const [label, historyResponse, query] of [
+  ["absent (404)", { status: 404, body: { error: "Channel not found" } }, "channel=agent-event:abcdef13"],
+  ["ambiguous (409)", { status: 409, body: { error: "ambiguous", errorCode: "AMBIGUOUS_ID" } }, "channel=agent-event:abcdef13"],
+  ["expired (410)", { status: 410, body: { error: "expired", errorCode: "EXPIRED" } }, "channel=agent-event:abcdef13"],
+  ["a 2xx response with no messages", { status: 200, body: { messages: [] } }, "channel=agent-event:abcdef13"],
+  ["an error status whose body still carries a message", {
+    status: 404,
+    body: { messages: [{ id: "abcdef13-0000-4000-8000-000000000257", third_party_event: { id: "abcdef13-0000-4000-8000-000000000257" } }] },
+  }, "channel=agent-event:abcdef13"],
+  ["consume=false", {
+    status: 200,
+    body: { messages: [{ id: "abcdef13-0000-4000-8000-000000000257", third_party_event: { id: "abcdef13-0000-4000-8000-000000000257" } }] },
+  }, "channel=agent-event:abcdef13&consume=false"],
+] as const) {
+  test(`agent credential proxy does not report an agent-event re-read that is ${label}`, async () => {
+    await withAgentEventHistoryUpstream(historyResponse, async (serverUrl, reports) => {
+      const handle = await registerAgentCredentialProxy({
+        agentId: "agent-reread-none", launchId: "launch-reread-none", serverUrl,
+        apiKey: "sk_agent_server_side", activeCapabilities: "read",
+        inboxCoordinator: { getBoundary: () => undefined, getPendingMessages: () => [], consumeVisibleMessages: () => undefined },
+      });
+      try {
+        const response = await fetch(`${handle.proxyUrl}/internal/agent-api/history?${query}`, {
+          headers: { Authorization: `Bearer ${handle.proxyToken}` },
+        });
+        assert.equal(response.status, historyResponse.status);
+        await response.arrayBuffer();
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        assert.deepEqual(reports, []);
+      } finally {
+        unregisterAgentCredentialProxyForLaunch({ agentId: "agent-reread-none", launchId: "launch-reread-none" });
+      }
+    });
+  });
+}
 test("history consumption scope survives HTTP and normalizes returned channel identity", async () => {
   const agentId = "11111111-1111-4111-8111-111111111111";
   const channelId = "22222222-2222-4222-8222-222222222222";
@@ -5448,7 +6593,7 @@ test("task #179: the delivered report contains exactly the served ids the shared
 // records the package tail as the thread boundary and the reply itself by
 // exact id. The send preflight must hand the Server those exact seqs above the
 // boundary, or it counts the already-delivered reply as unread and holds.
-function threadReplyWithJoinContext(input: { triggerSeq: number; recentSeqs: number[] }): AgentMessage {
+function threadReplyWithJoinContext(input: { triggerSeq: number; recentSeqs: number[]; historyTruncated?: boolean }): AgentMessage {
   const threadTarget = "#proj-raft-computer:459ad9a0";
   return {
     channel_id: "thread-channel",
@@ -5470,7 +6615,7 @@ function threadReplyWithJoinContext(input: { triggerSeq: number; recentSeqs: num
       suggested_read_history_target: threadTarget,
       parent_message: { message_id: "parent-1000", sender_name: "tygg", sender_description: null, sender_type: "human", content: "parent", timestamp: "2026-10-01T02:51:00.000Z", seq: 1000 },
       recent_messages: input.recentSeqs.map((seq) => ({ message_id: `recent-${seq}`, sender_name: "archer", sender_description: null, sender_type: "agent", content: `reply ${seq}`, timestamp: "2026-10-01T03:00:00.000Z", seq })),
-      history_truncated: false,
+      history_truncated: input.historyTruncated ?? false,
     },
   } as AgentMessage;
 }
@@ -5521,8 +6666,8 @@ async function sendThroughLedgerBackedProxy(
 
 function deliverIdleWithJoinContext(ledger: AgentVisibleDeliveryLedger, message: AgentMessage, contextId?: string): void {
   // Mirrors the idle stdin delivery: the rendered package, then the reply itself.
-  for (const [target, contextMessages] of groupThreadJoinContextReceiptMessages([message])) {
-    ledger.recordConsumed("agent-1", { target, messages: contextMessages, source: "thread_join_context_rendered", contextId });
+  for (const receipt of threadJoinContextReceipts([message])) {
+    ledger.recordConsumed("agent-1", { ...receipt, contextId });
   }
   ledger.recordConsumed("agent-1", { messages: [message], source: "stdin_idle_delivery", contextId });
 }
@@ -5535,6 +6680,17 @@ test("task #360 sample 1: a thread reply delivered in full is forwarded as an ex
   const forwarded = await sendThroughLedgerBackedProxy(ledger, { target: "#proj-raft-computer:459ad9a0", content: "reply" });
   assert.equal(forwarded.seenUpToSeq, 1020);
   assert.deepEqual(forwarded.seenExactSeqs, [1030], "the delivered reply must not be counted as unread");
+});
+
+test("a truncated thread-join package records its replies as exact seqs and leaves older replies below them unseen", async () => {
+  const ledger = new AgentVisibleDeliveryLedger();
+  deliverIdleWithJoinContext(ledger, threadReplyWithJoinContext({ triggerSeq: 1030, recentSeqs: [1010, 1020], historyTruncated: true }));
+  assert.equal(ledger.getBoundary("agent-1", "#proj-raft-computer:459ad9a0"), undefined, "the replies cut from the package (below 1010) must not count as seen");
+  assert.equal(ledger.getBoundary("agent-1", "#proj-raft-computer"), undefined, "the parent channel never advances");
+
+  const forwarded = await sendThroughLedgerBackedProxy(ledger, { target: "#proj-raft-computer:459ad9a0", content: "reply" });
+  assert.equal(forwarded.seenUpToSeq, undefined);
+  assert.deepEqual(forwarded.seenExactSeqs, [1010, 1020, 1030], "the rendered replies and the trigger are still seen, exactly");
 });
 
 test("task #360 sample 2: daemon exact seqs are unioned with the CLI's own, never replacing them", async () => {
@@ -5620,26 +6776,34 @@ test("glimpse G0: a v2 send carries daemon facts from the current context only",
 // glimpse G0: the claim preflight reads the same context-scoped view. A target
 // read in this context forwards; after a compaction the same claim is held
 // until the model sees the target's latest messages again.
-test("glimpse G0: a task claim after a compaction is held for context the model no longer has", async () => {
+test("glimpse G0: a task claim after a compaction attests only what the model still has", async () => {
   const ledger = new AgentVisibleDeliveryLedger();
   let contextId = "ctx-1";
   ledger.recordConsumed("agent-1", {
-    target: "#proj-runtime",
-    messages: [{ seq: 99, id: "recent-task-99", channel_type: "channel", channel_name: "proj-runtime" }],
+    target: "#proj-runtime:#201",
+    messages: [{ seq: 99, id: "recent-task-99" }],
     boundarySeq: 99,
     source: "verified_contiguous_content_consumption",
     contextId,
   });
   let upstreamClaimCount = 0;
+  const forwardedSeen: Array<number | undefined> = [];
   await withUpstream(async (req, res) => {
     if (req.url?.startsWith("/internal/agent-api/history")) {
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ messages: [{ seq: 99, id: "recent-task-99", senderType: "human", senderName: "tygg", content: "task context", createdAt: "2026-05-20T00:00:00.000Z" }] }));
       return;
     }
-    if (req.url === "/internal/agent-api/tasks/claim") upstreamClaimCount += 1;
-    res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ ok: true, results: [{ taskNumber: 201, success: true }] }));
+    let raw = "";
+    req.on("data", (chunk) => { raw += chunk; });
+    req.on("end", () => {
+      if (req.url === "/internal/agent-api/tasks/claim") {
+        upstreamClaimCount += 1;
+        forwardedSeen.push((JSON.parse(raw) as { seenUpToSeq?: number }).seenUpToSeq);
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true, results: [{ taskNumber: 201, success: true }] }));
+    });
   }, async (serverUrl) => {
     const view = () => ledger.freshnessView("agent-1", { contextId });
     const handle = await registerAgentCredentialProxy({
@@ -5665,16 +6829,10 @@ test("glimpse G0: a task claim after a compaction is held for context the model 
     };
 
     assert.notEqual((await claim()).state, "held", "read in this context: forwarded");
-    assert.equal(upstreamClaimCount, 1);
-
     contextId = "ctx-2";
-    const held = await claim();
-    assert.equal(held.state, "held", "after the compaction the same claim is held");
-    assert.equal(held.heldMessages?.[0]?.seq, 99);
-    assert.equal(upstreamClaimCount, 1, "the held claim did not reach the Server");
-
-    assert.notEqual((await claim()).state, "held", "shown again in this context: the retry forwards");
+    assert.notEqual((await claim()).state, "held", "the Server decides a first touch");
     assert.equal(upstreamClaimCount, 2);
+    assert.deepEqual(forwardedSeen, [99, 0], "after the compaction the claim no longer attests what the model lost");
   });
 });
 
@@ -5682,7 +6840,7 @@ test("glimpse G0: a task claim after a compaction is held for context the model 
 // while both sides' unit tests stayed green. Every side-effect route the CLI
 // can call must be classified by the proxy, including any future send version.
 test("every CLI side-effect route, including every message send version, is classified by the proxy", () => {
-  const sideEffectKeys = new Set(["taskClaim", "taskUpdateStatus", "taskAmend"]);
+  const sideEffectKeys = new Set(["taskCreate", "taskClaim", "taskUnclaim", "taskAssign", "taskUpdateStatus", "taskAmend"]);
   const routes = AGENT_API_ROUTE_MANIFEST.filter((route) => route.key.startsWith("messageSend") || sideEffectKeys.has(route.key));
   assert.ok(routes.some((route) => route.key === "messageSendV2"), "fixture: the v2 send route is in the manifest");
   for (const route of routes) {
@@ -5797,4 +6955,500 @@ test("held context from another channel's thread still refuses to enter the ledg
   });
   assert.equal(ledger.isModelSeen("agent-1", "#general:3ae9bd99", { seq: 4200, message_id: "held-4200" }), false, "parent/thread isolation holds");
   assert.equal(ledger.isModelSeen("agent-1", "#proj-raft-computer:46a146e8", { seq: 4200, message_id: "held-4200" }), false);
+});
+
+async function waitForSpan(sink: MemoryTraceSink, name: string): Promise<void> {
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    if (sink.getAllSpans().some((span) => span.name === name)) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`timed out waiting for span ${name}`);
+}
+
+async function withinMs<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(message)), ms); }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+test("#47: a connect timeout records how many addresses Node tried and timed out, and whether an HTTP proxy was in the way, never the addresses", () => {
+  const timedOut = (address: string) => Object.assign(new Error(`connect ETIMEDOUT ${address}:443`), { code: "ETIMEDOUT" });
+  const unreachable = (address: string) => Object.assign(new Error(`connect ENETUNREACH ${address}:443`), { code: "ENETUNREACH" });
+  // The shape undici 8 builds from Node's autoSelectFamily failure on api.raft.build
+  // (4 A timing out, 8 AAAA failing at once): fetch failed → ConnectTimeoutError → AggregateError.
+  const attempts = [
+    timedOut("3.164.92.71"), unreachable("2600:9000:2843:1600:18:3109:5b40:93a1"),
+    timedOut("3.164.92.102"), unreachable("2600:9000:2843:a600:18:3109:5b40:93a1"),
+    timedOut("3.164.92.80"), unreachable("2600:9000:2843:dc00:18:3109:5b40:93a1"),
+    timedOut("3.164.92.64"), unreachable("2600:9000:2843:1c00:18:3109:5b40:93a1"),
+  ];
+  const aggregate = Object.assign(new AggregateError(attempts), { code: "ETIMEDOUT" });
+  const connectTimeout = Object.assign(
+    new Error("Connect Timeout Error (attempted addresses: 3.164.92.71:443, 2600:9000:2843:1600:18:3109:5b40:93a1:443, timeout: 30000ms)", { cause: aggregate }),
+    { code: "UND_ERR_CONNECT_TIMEOUT" },
+  );
+  const fetchFailed = new TypeError("fetch failed", { cause: connectTimeout });
+  const target = new URL("https://api.raft.build/internal/agent-api/events");
+
+  const proxyKeys = ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy"] as const;
+  const saved = Object.fromEntries(proxyKeys.map((key) => [key, process.env[key]]));
+  for (const key of proxyKeys) delete process.env[key];
+  try {
+    const direct = __transportNormalizedErrorForErrorForTest(target, fetchFailed, "launch-1");
+    assert.equal(direct.causeCode, "UND_ERR_CONNECT_TIMEOUT");
+    assert.equal(direct.connectAttemptedAddresses, 8);
+    assert.equal(direct.connectTimedOutAddresses, 4);
+    assert.equal(direct.viaHttpProxy, false);
+    assert.doesNotMatch(JSON.stringify({ ...direct, originalMessage: undefined }), /3\.164|2600:/, "only counts, never addresses");
+
+    process.env.HTTPS_PROXY = "http://127.0.0.1:7890";
+    assert.equal(__transportNormalizedErrorForErrorForTest(target, fetchFailed, "launch-1").viaHttpProxy, true);
+  } finally {
+    for (const key of proxyKeys) {
+      if (saved[key] === undefined) delete process.env[key];
+      else process.env[key] = saved[key];
+    }
+  }
+
+  // A transport error that is not a per-address connect failure carries no counts.
+  const reset = new TypeError("fetch failed", { cause: Object.assign(new Error("other side closed"), { code: "UND_ERR_SOCKET" }) });
+  const plain = __transportNormalizedErrorForErrorForTest(target, reset, "launch-1");
+  assert.equal(plain.connectAttemptedAddresses, undefined);
+  assert.equal(plain.connectTimedOutAddresses, undefined);
+});
+
+// RFC 081, inbox items on: the Server lists the third-party events it marks
+// with `inbox_item_target` as `app:` items, so the daemon's `inbox check`
+// snapshot (whose grouped row the CLI prints as "N not in this list") leaves
+// them out, as the wake-up notice does.
+function inboxItemEvent(seq: number, inboxItemTarget?: unknown): AgentProxyVisibleMessage {
+  return {
+    seq,
+    message_id: `eeeeeeee-0000-4000-8000-${String(seq).padStart(12, "0")}`,
+    channel_id: "third-party-agent-events:agent-items",
+    channel_type: "dm",
+    channel_name: "third-party-agent-events:agent-items",
+    sender_type: "third_party_app",
+    sender_name: "stamp",
+    content: "Third-party notification: checks failed",
+    third_party_event: {
+      id: `ffffffff-0000-4000-8000-${String(seq).padStart(12, "0")}`,
+      kind: "notification",
+      client_id: "stamp",
+      client_name: "Stamp",
+      ...(inboxItemTarget === undefined ? {} : { inbox_item_target: inboxItemTarget }),
+    },
+  } as unknown as AgentProxyVisibleMessage;
+}
+
+/** 5 events the Server lists (3 items), 1 it does not, 1 conversation message. */
+const inboxItemsPending: AgentProxyVisibleMessage[] = [
+  inboxItemEvent(201, "app:stamp/pr-1"),
+  inboxItemEvent(202, "app:stamp/pr-1"),
+  inboxItemEvent(203, "app:stamp/pr-1"),
+  inboxItemEvent(204, "app:stamp/pr-2"),
+  inboxItemEvent(205, "app:stamp"),
+  inboxItemEvent(206),
+  { seq: 100, id: "conv-100", channel_type: "channel", channel_name: "general", sender_type: "human", sender_name: "richard", content: "hi" },
+];
+
+async function localInboxCheck(inboxItems: (() => boolean) | undefined, pending: AgentProxyVisibleMessage[], between?: () => void) {
+  const snapshots: Array<{ pendingMessageCount: number; rows: unknown[] }> = [];
+  let text = "";
+  const texts: string[] = [];
+  await withUpstream((_req, res) => {
+    res.writeHead(500);
+    res.end();
+  }, async (serverUrl) => {
+    const launchId = `launch-inbox-items-${Math.random().toString(16).slice(2)}`;
+    const handle = await registerAgentCredentialProxy({
+      agentId: "agent-items",
+      launchId,
+      serverUrl,
+      apiKey: "sk_agent_server_side",
+      activeCapabilities: "read",
+      ...(inboxItems ? { inboxItems } : {}),
+      inboxCoordinator: {
+        getBoundary: () => undefined,
+        getPendingMessages: () => [],
+        getAllPendingMessages: () => pending,
+        recordInboxSnapshot: (input) => snapshots.push(input as never),
+        consumeVisibleMessages: () => assert.fail("inbox check consumes nothing"),
+      },
+    });
+    try {
+      for (const step of between ? [0, 1] : [0]) {
+        if (step === 1) between!();
+        const response = await fetch(`${handle.proxyUrl}/internal/agent-api/inbox`, { headers: { Authorization: `Bearer ${handle.proxyToken}` } });
+        assert.equal(response.status, 200);
+        texts.push(await response.text());
+      }
+      text = texts[0]!;
+    } finally {
+      unregisterAgentCredentialProxyForLaunch({ agentId: "agent-items", launchId });
+    }
+  });
+  return { text, texts, body: JSON.parse(text) as { rows: Array<{ target: string; pendingCount: number }>; items: Array<{ source: string; row?: { target: string } }>; pending_targets: number; pending_messages: number }, snapshots };
+}
+
+const GROUPED = "dm:@third-party-agent-events:agent-items";
+
+test("RFC 081: with inbox items on, the inbox check snapshot leaves out the events the Server lists as app items", async () => {
+  const off = await localInboxCheck(undefined, inboxItemsPending);
+  assert.deepEqual(off.body.rows.map((row) => [row.target, row.pendingCount]), [[GROUPED, 6], ["#general", 1]]);
+  assert.equal(off.body.pending_messages, 7);
+  // Off (getter false, or none): byte for byte the response without the getter.
+  assert.equal((await localInboxCheck(() => false, inboxItemsPending)).text, off.text);
+
+  const on = await localInboxCheck(() => true, inboxItemsPending);
+  assert.deepEqual(on.body.rows.map((row) => [row.target, row.pendingCount]), [[GROUPED, 1], ["#general", 1]], "no app: rows; the grouped row counts the one unlisted event");
+  assert.deepEqual(on.body.items.map((item) => [item.source, item.row?.target]), [["message_target", GROUPED], ["message_target", "#general"]]);
+  assert.deepEqual([on.body.pending_targets, on.body.pending_messages], [2, 2]);
+  assert.deepEqual(on.snapshots.map((snapshot) => snapshot.pendingMessageCount), [2]);
+  // The conversation row is the same row either way.
+  assert.deepEqual(on.body.rows[1], off.body.rows[1]);
+  // The same batch's grouped count in the wake-up notice (same shared split).
+  const wake = formatInboxUpdateRuntimeInput(inboxItemsPending as unknown as AgentMessage[], {} as never, inboxItemsPending.length, { inboxItems: true });
+  const wakeGrouped = /^Third-party app events · (\d+) /m.exec(wake)?.[1];
+  assert.equal(Number(wakeGrouped), on.body.rows.find((row) => row.target === GROUPED)?.pendingCount);
+
+  // What `raft inbox check` prints with the Server listing the 3 app items.
+  const appRow = (target: string, unread: number, objectRef?: string) => ({
+    target, kind: objectRef ? "app" as const : "app_fallback" as const, ...(objectRef ? { objectRef } : {}), app: { key: "stamp", name: "Stamp" }, related: null,
+    unread, latestSender: null, preview: null, previewTruncated: false, firstUnreadAt: null, latestAt: null, preLaunch: false,
+  });
+  const list = {
+    view: "unread" as const, items: [], hasMore: false, nextBeforeSeq: null, totals: { conversations: 0, dms: 0, mentions: 0 },
+    rows: [appRow("app:stamp/pr-1", 3, "pr-1"), appRow("app:stamp/pr-2", 1, "pr-2"), appRow("app:stamp", 1)],
+  };
+  const cli = (rows: unknown[]) => formatInboxCheck({ view: "unread", nowMs: 0, list: list as never, pendingRows: rows as never });
+  assert.match(cli(off.body.rows), /^Third-party app events · 6 not in this list · /m, "before: the 5 listed events counted again");
+  const after = cli(on.body.rows);
+  assert.match(after, /^Third-party app events · 1 not in this list · /m);
+  assert.match(after, /^app:stamp\/pr-1 · 3 unread · from Stamp$/m);
+});
+
+test("RFC 081: a flag turned off after launch gives the inbox check snapshot from before", async () => {
+  let flag = true;
+  const checks = await localInboxCheck(() => flag, inboxItemsPending, () => { flag = false; });
+  assert.equal((JSON.parse(checks.texts[0]!) as { pending_messages: number }).pending_messages, 2);
+  assert.equal(checks.texts[1], (await localInboxCheck(undefined, inboxItemsPending)).text, "the same launch, the flag read again");
+});
+
+test("RFC 081: with inbox items on, an invalid inbox_item_target stays in the grouped row", async () => {
+  const invalid = ["", "app:", "app:stamp/", "#general", "app:stamp/pr 1", "app:stamp/pr\"x", 42, null].map((value, index) => inboxItemEvent(300 + index, value));
+  const on = await localInboxCheck(() => true, invalid);
+  assert.equal(on.text, (await localInboxCheck(undefined, invalid)).text);
+  assert.deepEqual(on.body.rows.map((row) => [row.target, row.pendingCount]), [[GROUPED, invalid.length]]);
+});
+
+// #wg-ax:#17: reminders a daemon before reminder-server-ack@1 acked only locally.
+
+type AppSourceAckRequest = { caps: string; client: string; body: Record<string, unknown> };
+
+/** Answers `/app-sources/ack` with `answer(body)` (an exact acceptance by default) and records each request. */
+function appSourceAckServer(
+  requests: AppSourceAckRequest[],
+  answer: (body: Record<string, unknown>) => { status: number; body: unknown } | null = () => null,
+): http.RequestListener {
+  return (req, res) => {
+    assert.equal(req.method, "POST");
+    assert.equal(req.url, "/internal/agent-api/app-sources/ack");
+    let raw = "";
+    req.setEncoding("utf8");
+    req.on("data", (chunk) => { raw += chunk; });
+    req.on("end", () => {
+      const body = JSON.parse(raw) as Record<string, unknown>;
+      requests.push({
+        caps: String(req.headers["x-raft-client-capabilities"] ?? ""),
+        client: String(req.headers["x-raft-client"] ?? ""),
+        body,
+      });
+      const answered = answer(body) ?? {
+        status: 200,
+        body: {
+          ok: true,
+          itemId: body.itemId,
+          appId: body.appId,
+          notificationClass: body.notificationClass,
+          sourceRef: body.sourceRef,
+          sourceEventId: "dddddddd-0000-4000-8000-000000000004",
+          ackAttemptId: body.ackAttemptId,
+          replayed: false,
+        },
+      };
+      res.writeHead(answered.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(answered.body));
+    });
+  };
+}
+
+/** A reminder fired and acked only in the store, as a daemon before the token did. */
+function ackLocallyOnly(store: ReturnType<typeof createAgentAppInboxStore>, id: string, revision: string): void {
+  const minted = store.mint({ appId: "system.reminder", notificationClass: "due", sourceRef: { kind: "reminder", id, revision } });
+  assert.equal(minted.ok, true);
+  assert.equal(store.ack(`reminder:${id}:${revision}`), true);
+}
+
+test("the server-ack backfill sends each locally-only acked reminder once, retries failures on the next start, and is done only when none is left", async () => {
+  const dir = mkdtempSync(join(os.tmpdir(), "reminder-ack-backfill-"));
+  const storage = createScopedAppStorageFactory({
+    slockHome: dir,
+    owner: { machineId: "machine-test", serverId: "server-test" },
+  }).open({ appId: "system.agent-inbox", agentId: "agent-backfill" });
+  const traces: Array<{ name: string; attrs: Record<string, unknown>; status?: string }> = [];
+  const openStore = () => createAgentAppInboxStore({
+    registry: REMINDER_AGENT_INBOX_REGISTRY,
+    storage,
+    ownerAgentId: "agent-backfill",
+    beforeAck: () => true,
+    beforeServerAuthorizedAck: () => true,
+    trace: (name, attrs, status) => { traces.push({ name, attrs, ...(status ? { status } : {}) }); },
+  });
+  const transient = "aaaaaaaa-0000-4000-8000-00000000000a";
+  const accepted = "bbbbbbbb-0000-4000-8000-00000000000b";
+  const notFired = "cccccccc-0000-4000-8000-00000000000c";
+  const alreadyOnServer = "eeeeeeee-0000-4000-8000-00000000000e";
+  const requests: AppSourceAckRequest[] = [];
+  let transientUp = false;
+  const backfillTraces = () => traces.filter((trace) => trace.name === "daemon.app_inbox.server_ack_backfill");
+  const sentIds = () => requests.map((request) => (request.body.sourceRef as { id: string }).id).sort();
+  try {
+    await withUpstream(appSourceAckServer(requests, (body) => {
+      const id = (body.sourceRef as { id: string }).id;
+      if (id === transient && !transientUp) return { status: 503, body: { error: "Service unavailable" } };
+      if (id === notFired) return { status: 404, body: { error: "Source revision was not fired", code: "target_not_fired" } };
+      return null;
+    }), async (serverUrl) => {
+      const first = openStore();
+      ackLocallyOnly(first, transient, "1");
+      ackLocallyOnly(first, accepted, "2");
+      ackLocallyOnly(first, notFired, "3");
+      // A reminder still live is the normal ack path's, not the backfill's.
+      assert.equal(first.mint({ appId: "system.reminder", notificationClass: "due", sourceRef: { kind: "reminder", id: alreadyOnServer, revision: "1" } }).ok, true);
+      assert.equal(first.serverAckBackfillDone(), null);
+
+      const register = async (store: ReturnType<typeof createAgentAppInboxStore>, launchId: string) => {
+        const handle = await registerAgentCredentialProxy({
+          agentId: "agent-backfill",
+          launchId,
+          serverUrl,
+          apiKey: "sk_agent_server_side",
+          activeCapabilities: "read",
+          appInbox: store,
+        });
+        await handle.serverAckBackfill;
+        unregisterAgentCredentialProxyForLaunch({ agentId: "agent-backfill", launchId });
+      };
+
+      await register(first, "launch-backfill-1");
+      assert.deepEqual(sentIds(), [transient, accepted, notFired].sort());
+      for (const request of requests) {
+        assert.equal(request.caps, REMINDER_SERVER_ACK_CAPABILITY);
+        assert.equal(request.client, "daemon");
+        assert.equal(request.body.appId, "system.reminder");
+        assert.equal(request.body.notificationClass, "due");
+      }
+      assert.deepEqual(backfillTraces().map((trace) => [trace.attrs, trace.status]), [[{
+        owner_agent_id: "agent-backfill", attempted: 3, accepted: 1, refused: 1, failed: 1, remaining: 1, done: false,
+      }, "error"]]);
+      assert.equal(first.serverAckBackfillDone(), null, "not done while one is left");
+
+      // Next start: a fresh store from the same durable state sends only the one that failed.
+      requests.length = 0;
+      transientUp = true;
+      const second = openStore();
+      await register(second, "launch-backfill-2");
+      assert.deepEqual(sentIds(), [transient]);
+      assert.deepEqual(backfillTraces().at(-1)?.attrs, {
+        owner_agent_id: "agent-backfill", attempted: 1, accepted: 1, refused: 0, failed: 0, remaining: 0, done: true,
+      });
+
+      // Done is durable: a later start sends nothing and traces nothing.
+      requests.length = 0;
+      const third = openStore();
+      assert.equal(third.serverAckBackfillDone(), REMINDER_SERVER_ACK_CAPABILITY);
+      await register(third, "launch-backfill-3");
+      assert.deepEqual(requests, []);
+      assert.equal(backfillTraces().length, 2);
+      assert.deepEqual(
+        third.listAcknowledgedSources().map((source) => [source.sourceRef.id, source.serverAck]).sort(),
+        [[accepted, "accepted"], [notFired, "refused"], [transient, "accepted"]].sort(),
+      );
+      assert.equal(third.list().length, 1, "the live reminder is untouched");
+    });
+  } finally {
+    await __resetAgentCredentialProxyForTest();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// #proj-raft-computer:27e207f5 (Remy): an hourly reminder at revision 349
+// left more local-only acks than one batch (100), and the rest stayed listed
+// for several starts after the upgrade. One run now sends batch after batch
+// until none is left. RED proof: stop after the first batch and 105 remain.
+test("the server-ack backfill drains a backlog larger than one batch in a single start", async () => {
+  const dir = mkdtempSync(join(os.tmpdir(), "reminder-ack-backfill-many-"));
+  const storage = createScopedAppStorageFactory({
+    slockHome: dir,
+    owner: { machineId: "machine-test", serverId: "server-test" },
+  }).open({ appId: "system.agent-inbox", agentId: "agent-backfill-many" });
+  const traces: Array<{ name: string; attrs: Record<string, unknown>; status?: string }> = [];
+  const store = createAgentAppInboxStore({
+    registry: REMINDER_AGENT_INBOX_REGISTRY,
+    storage,
+    ownerAgentId: "agent-backfill-many",
+    beforeAck: () => true,
+    beforeServerAuthorizedAck: () => true,
+    trace: (name, attrs, status) => { traces.push({ name, attrs, ...(status ? { status } : {}) }); },
+  });
+  const requests: AppSourceAckRequest[] = [];
+  const reminderId = "ffffffff-0000-4000-8000-00000000000f";
+  try {
+    await withUpstream(appSourceAckServer(requests, () => null), async (serverUrl) => {
+      for (let revision = 1; revision <= 205; revision += 1) ackLocallyOnly(store, reminderId, String(revision));
+      const launchId = "launch-backfill-many";
+      const handle = await registerAgentCredentialProxy({
+        agentId: "agent-backfill-many",
+        launchId,
+        serverUrl,
+        apiKey: "sk_agent_server_side",
+        activeCapabilities: "read",
+        appInbox: store,
+      });
+      await handle.serverAckBackfill;
+      unregisterAgentCredentialProxyForLaunch({ agentId: "agent-backfill-many", launchId });
+      assert.equal(requests.length, 205, "every local-only ack is sent in this one start");
+      assert.equal(store.serverAckBackfillDone(), REMINDER_SERVER_ACK_CAPABILITY);
+      assert.deepEqual(traces.filter((trace) => trace.name === "daemon.app_inbox.server_ack_backfill").map((trace) => trace.attrs), [{
+        owner_agent_id: "agent-backfill-many", attempted: 205, accepted: 205, refused: 0, failed: 0, remaining: 0, done: true,
+      }]);
+    });
+  } finally {
+    await __resetAgentCredentialProxyForTest();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+/** Runs `raft reminder ack` (the CLI command, through the proxy) against `store` and the upstream. */
+async function runReminderAckThroughProxy(
+  serverUrl: string,
+  store: ReturnType<typeof createAgentAppInboxStore>,
+  options: { id: string; revision: string },
+): Promise<{ stdout: string; error: unknown }> {
+  // The backfill has its own test: here the store is past it.
+  store.markServerAckBackfillDone(REMINDER_SERVER_ACK_CAPABILITY);
+  const launchId = `launch-reminder-ack-${randomLaunchSuffix()}`;
+  const handle = await registerAgentCredentialProxy({
+    agentId: "agent-reminder-ack",
+    launchId,
+    serverUrl,
+    apiKey: "sk_agent_server_side",
+    activeCapabilities: "read",
+    appInbox: store,
+  });
+  await handle.serverAckBackfill;
+  const agentContext: AgentContext = {
+    agentId: "agent-reminder-ack",
+    serverId: "server-1",
+    serverUrl: handle.proxyUrl,
+    token: handle.proxyToken,
+    clientMode: "managed-runner",
+    secretSource: "agent-proxy-token-env",
+    activeCapabilities: null,
+  };
+  const stdout: string[] = [];
+  const ctx = createCommandContext({
+    io: { stdout: { write: (chunk: string | Uint8Array) => { stdout.push(String(chunk)); return true; } }, stderr: { write: () => true } },
+    loadAgentContext: () => agentContext,
+    createApiClient: () => new ApiClient(agentContext),
+  });
+  try {
+    let error: unknown = null;
+    await Promise.resolve(reminderAckCommand.handler(ctx, options)).catch((err: unknown) => { error = err; });
+    return { stdout: stdout.join(""), error };
+  } finally {
+    unregisterAgentCredentialProxyForLaunch({ agentId: "agent-reminder-ack", launchId });
+  }
+}
+
+let launchSuffix = 0;
+function randomLaunchSuffix(): number {
+  launchSuffix += 1;
+  return launchSuffix;
+}
+
+test("raft reminder ack of a reminder acked only locally sends the Server the ack; its \"already acknowledged\" is a success", async () => {
+  const reminderId = "aaaaaaaa-1111-4222-8333-444455556666";
+  const requests: AppSourceAckRequest[] = [];
+  await withUpstream(appSourceAckServer(requests, (body) => ({
+    status: 200,
+    body: {
+      ok: true,
+      itemId: body.itemId,
+      appId: body.appId,
+      notificationClass: body.notificationClass,
+      sourceRef: body.sourceRef,
+      sourceEventId: "dddddddd-0000-4000-8000-000000000004",
+      ackAttemptId: body.ackAttemptId,
+      replayed: true,
+    },
+  })), async (serverUrl) => {
+    const store = createAgentAppInboxStore({ registry: REMINDER_AGENT_INBOX_REGISTRY, beforeAck: () => true, beforeServerAuthorizedAck: () => true });
+    ackLocallyOnly(store, reminderId, "4");
+    const { stdout, error } = await runReminderAckThroughProxy(serverUrl, store, { id: reminderId.slice(0, 8), revision: "4" });
+    assert.equal(error, null);
+    assert.equal(stdout, `Reminder ${reminderId} revision 4 was already acknowledged for this fired item.\n`);
+    assert.equal(requests.length, 1);
+    assert.deepEqual(requests[0]!.body.sourceRef, { kind: "reminder", id: reminderId, revision: "4" });
+    assert.equal(requests[0]!.body.itemId, `reminder:${reminderId}:4`);
+    assert.ok(requests[0]!.caps.split(",").includes(REMINDER_SERVER_ACK_CAPABILITY), requests[0]!.caps);
+    assert.deepEqual(store.listAcknowledgedSources().map((source) => source.serverAck), ["accepted"]);
+  });
+  await __resetAgentCredentialProxyForTest();
+});
+
+test("raft reminder ack with an empty local store acks the full reminder id on the Server; a refusal keeps the refusal text", async () => {
+  const reminderId = "bbbbbbbb-1111-4222-8333-444455556666";
+  const requests: AppSourceAckRequest[] = [];
+  let refuse = false;
+  await withUpstream(appSourceAckServer(requests, () => refuse
+    ? { status: 404, body: { error: "Source revision was not fired", code: "target_not_fired" } }
+    : null), async (serverUrl) => {
+    const emptyStore = () => createAgentAppInboxStore({ registry: REMINDER_AGENT_INBOX_REGISTRY, beforeAck: () => true, beforeServerAuthorizedAck: () => true });
+
+    const acked = await runReminderAckThroughProxy(serverUrl, emptyStore(), { id: reminderId, revision: "2" });
+    assert.equal(acked.error, null);
+    assert.equal(acked.stdout, `Reminder ${reminderId} revision 2 fired item acknowledged.\n`);
+    assert.deepEqual(requests.map((request) => [request.body.itemId, request.body.sourceRef]), [
+      [`reminder:${reminderId}:2`, { kind: "reminder", id: reminderId, revision: "2" }],
+    ]);
+
+    refuse = true;
+    const refused = await runReminderAckThroughProxy(serverUrl, emptyStore(), { id: reminderId, revision: "3" });
+    assert.ok(refused.error instanceof CliError, String(refused.error));
+    assert.equal(formatErrorEnvelope(refused.error), [
+      `Error: The Server refused the ack (Source revision was not fired); reminder ${reminderId} revision 3 is still not acknowledged.`,
+      "Code: ACK_FAILED",
+      "Next action: Nothing was acknowledged. raft inbox check lists this reminder's current ack: lines; ack those.",
+    ].join("\n") + "\n");
+
+    // A short id nothing local matches is not guessed: the CLI asks for the full id and posts nothing.
+    const before = requests.length;
+    const short = await runReminderAckThroughProxy(serverUrl, emptyStore(), { id: reminderId.slice(0, 8), revision: "2" });
+    assert.ok(short.error instanceof CliError, String(short.error));
+    assert.equal(formatErrorEnvelope(short.error), [
+      "Error: No reminder Inbox item on this Computer matches bbbbbbbb revision 2, so the short id cannot be resolved",
+      "Code: ACK_FAILED",
+      "Next action: Run the ack with the full reminder id from its ack: line in raft inbox check.",
+    ].join("\n") + "\n");
+    assert.equal(requests.length, before);
+  });
+  await __resetAgentCredentialProxyForTest();
 });

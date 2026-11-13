@@ -74,7 +74,7 @@ export async function verifyFeatureFlagAdminPrivileges(
 
 export const FEATURE_FLAG_ADMIN_PRIVILEGE_CONTRACT_KEY = "operator-surfaces-v2";
 export const FEATURE_FLAG_ADMIN_PRIVILEGE_MIGRATION_TAG =
-  "0355_announcement_targeting";
+  "0617_announcement_rules_reach";
 
 export async function verifyFeatureFlagAdminPrivilegeReceipt(
   query: FeatureFlagAdminPrivilegeQuery,

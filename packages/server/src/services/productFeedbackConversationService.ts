@@ -1,5 +1,10 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { clearClockTimeout, currentTimeMs, setClockTimeout } from "@botiverse/raft-shared";
+import { addTraceEvent, withTraceChildSpan } from "../tracing/semanticTrace";
+import { isPrivacyModeOn } from "../config/privacyMode";
+import { handsReporterRouteTemplate, handsTraceHeaders } from "./handsTraceHeaders";
+import type { TraceAttributes } from "@botiverse/raft-shared";
+import { forgetProductFeedbackRouteBinding, isHandsAuthRejectionStatus, readHandsErrorCode } from "./productFeedbackRouteBindingService";
 
 const FULL_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const TICKET_KINDS = new Set(["feedback", "bug", "crash"]);
@@ -23,8 +28,21 @@ const REPORTER_SESSION_MAX_LIFETIME_MS = 60_000;
 const REPORTER_SESSION_EXPIRY_MARGIN_MS = 5_000;
 const REPORTER_SESSION_CACHE_MAX_ENTRIES = 10_000;
 export const PRODUCT_FEEDBACK_ATTACHMENT_MAX_BYTES = 10 * 1024 * 1024;
+// Bound on a reporter-session mint and on a read (ticket list, ticket detail)
+// when the caller passes no signal. Unbounded, a stalled connect on a fresh task
+// waited for undici's 10s connect timeout and a stalled response far longer:
+// list requests after the v1.21.32 deploy took 11-16s before failing (AndyLok).
+// The route-subject PUT before them uses 4s; a read pages more rows, so 5s.
+const HANDS_READ_TIMEOUT_MS = 5_000;
+const BREAKER_WINDOW_MS = 60_000;
+const BREAKER_THRESHOLD = 3;
+const BREAKER_MAX_SAMPLES = 1_000;
 
-type OperationClass = "read" | "comment" | "attachment";
+// `background_read`: the server's own reads (productFeedbackUnreadReconcile).
+// They take no part in the breakers: their failures never refuse a person's
+// read, and a person's failures never stop them. The job bounds its own calls
+// (deadline, retries, a stop after consecutive failed tickets).
+type OperationClass = "read" | "background_read" | "comment" | "attachment";
 type BreakerFailure = "integration" | "service";
 
 export type ProductFeedbackTicket = {
@@ -42,6 +60,12 @@ export type ProductFeedbackTicket = {
   attachment_count: number;
   comment_count: number;
   latest_comment_at: number | null;
+  /** Hands sends it on list pages only. */
+  latest_comment?: {
+    author_type: ProductFeedbackComment["author_type"];
+    body_preview: string;
+    created_at: number;
+  } | null;
   unread: boolean;
   unread_count: number;
 };
@@ -90,6 +114,8 @@ export type ProductFeedbackConversationFailureStage =
 export type ProductFeedbackConversationDiagnostic = {
   stage: ProductFeedbackConversationFailureStage;
   upstreamStatus: number | null;
+  /** Hands' identifier-shaped error code from the response body (readHandsErrorCode), when sent. */
+  upstreamCode: string | null;
   breakerFailures: number | null;
   breakerOpen: boolean | null;
 };
@@ -101,6 +127,7 @@ function conversationDiagnostic(
   return {
     stage,
     upstreamStatus: options.upstreamStatus ?? null,
+    upstreamCode: options.upstreamCode ?? null,
     breakerFailures: options.breakerFailures ?? null,
     breakerOpen: options.breakerOpen ?? null,
   };
@@ -129,6 +156,7 @@ export function productFeedbackConversationFailureLog(
     code: error.code,
     failure_stage: error.diagnostic.stage,
     upstream_status: error.diagnostic.upstreamStatus,
+    upstream_code: error.diagnostic.upstreamCode,
     breaker_failures: error.diagnostic.breakerFailures,
     breaker_open: error.diagnostic.breakerOpen,
   };
@@ -153,6 +181,7 @@ function readConfig(env: NodeJS.ProcessEnv): Config {
   const reporterSessionEnabled = env.HANDS_FEEDBACK_CONVERSATION_SESSION_ENABLED === "true";
   const cursorKey = env.HANDS_FEEDBACK_CURSOR_SECRET?.trim();
   if (
+    isPrivacyModeOn() ||
     !baseUrl || !appId || !appToken || !credentialRevision || !cursorKey || !isCanonicalUuid(appId)
     || (reporterSessionEnabled && (!reporterIntegrationId || !isCanonicalUuid(reporterIntegrationId)))
   ) {
@@ -201,8 +230,31 @@ function isCount(value: unknown): value is number {
   return Number.isSafeInteger(value) && Number(value) >= 0;
 }
 
+/**
+ * The newest visible comment Hands adds to a list row. It is a preview, not
+ * part of the ticket: a malformed one is dropped (null) rather than failing
+ * the whole list.
+ */
+function parseLatestComment(
+  value: unknown,
+): ProductFeedbackTicket["latest_comment"] {
+  if (value === undefined || value === null) return value;
+  if (
+    !isRecord(value)
+    || typeof value.author_type !== "string" || !AUTHOR_TYPES.has(value.author_type)
+    || typeof value.body_preview !== "string"
+    || !isEpochMs(value.created_at)
+  ) return null;
+  return {
+    author_type: value.author_type as ProductFeedbackComment["author_type"],
+    body_preview: value.body_preview,
+    created_at: value.created_at,
+  };
+}
+
 function parseTicket(value: unknown): ProductFeedbackTicket | null {
   if (!isRecord(value)) return null;
+  const latestComment = parseLatestComment(value.latest_comment);
   if (
     typeof value.id !== "string" || !isCanonicalUuid(value.id)
     || typeof value.kind !== "string" || !TICKET_KINDS.has(value.kind)
@@ -238,6 +290,7 @@ function parseTicket(value: unknown): ProductFeedbackTicket | null {
     attachment_count: value.attachment_count,
     comment_count: value.comment_count,
     latest_comment_at: value.latest_comment_at,
+    ...(latestComment === undefined ? {} : { latest_comment: latestComment }),
     unread: value.unread,
     unread_count: value.unread_count,
   };
@@ -370,8 +423,13 @@ export function decodeProductFeedbackCursor(
   }
 }
 
+// Same rule as the route-binding breaker (productFeedbackRouteBindingService):
+// at least 3 failures in a minute, and no fewer failures than successes, open
+// it for 30s; then one trial decides. Counting successes keeps a fresh task's
+// burst of first requests, where a few of many fail, from refusing everyone.
 type BreakerState = {
   failures: number[];
+  successes: number[];
   openUntil: number;
   halfOpenInFlight: boolean;
   openCode: "feedback_integration_unavailable" | "feedback_service_unavailable";
@@ -391,6 +449,7 @@ function breakerKey(config: Config, operation: OperationClass): string {
 }
 
 function beforeBreaker(config: Config, operation: OperationClass, now: number): void {
+  if (operation === "background_read") return;
   const key = breakerKey(config, operation);
   const state = breakers.get(key);
   if (!state) return;
@@ -421,8 +480,30 @@ function beforeBreaker(config: Config, operation: OperationClass, now: number): 
   }
 }
 
-function breakerSuccess(config: Config, operation: OperationClass): void {
-  breakers.delete(breakerKey(config, operation));
+/** Times within the breaker window, newest last, at most BREAKER_MAX_SAMPLES of them. */
+function recentSamples(samples: number[], now: number): number[] {
+  const recent = samples.filter((time) => now - time <= BREAKER_WINDOW_MS);
+  return recent.length > BREAKER_MAX_SAMPLES ? recent.slice(-BREAKER_MAX_SAMPLES) : recent;
+}
+
+function breakerSuccess(config: Config, operation: OperationClass, now: number = currentTimeMs()): void {
+  if (operation === "background_read") return;
+  const key = breakerKey(config, operation);
+  const state = breakers.get(key);
+  if (!state) {
+    breakers.set(key, {
+      failures: [], successes: [now], openUntil: 0, halfOpenInFlight: false,
+      openCode: "feedback_service_unavailable",
+    });
+    return;
+  }
+  // A successful half-open trial closes the breaker.
+  if (state.openUntil > 0) {
+    breakers.delete(key);
+    return;
+  }
+  state.failures = recentSamples(state.failures, now);
+  state.successes = recentSamples([...state.successes, now], now);
 }
 
 function breakerFailure(
@@ -431,14 +512,18 @@ function breakerFailure(
   now: number,
   code: "feedback_integration_unavailable" | "feedback_service_unavailable" = "feedback_service_unavailable",
 ): BreakerSnapshot {
+  if (operation === "background_read") return { failures: 0, open: false };
   const key = breakerKey(config, operation);
   const state = breakers.get(key) ?? {
-    failures: [], openUntil: 0, halfOpenInFlight: false, openCode: code,
+    failures: [], successes: [], openUntil: 0, halfOpenInFlight: false, openCode: code,
   };
-  state.failures = state.failures.filter((time) => now - time <= 60_000);
-  state.failures.push(now);
+  state.failures = recentSamples([...state.failures, now], now);
+  state.successes = recentSamples(state.successes, now);
   state.halfOpenInFlight = false;
-  if (state.openUntil > 0 || state.failures.length >= 3) {
+  if (
+    state.openUntil > 0
+    || (state.failures.length >= BREAKER_THRESHOLD && state.failures.length >= state.successes.length)
+  ) {
     state.openUntil = now + 30_000;
     state.openCode = code;
   }
@@ -532,9 +617,10 @@ function pruneReporterSessionCache(now: number): void {
   }
 }
 
-function reporterSessionMintError(response: Response, now: number): ProductFeedbackConversationError {
+async function reporterSessionMintError(response: Response, now: number): Promise<ProductFeedbackConversationError> {
   const diagnostic = conversationDiagnostic("reporter_session_response", {
     upstreamStatus: response.status,
+    upstreamCode: await readHandsErrorCode(response),
   });
   if (response.status === 429) {
     return new ProductFeedbackConversationError(
@@ -616,21 +702,59 @@ async function readBoundedReporterSessionResponse(response: Response): Promise<u
   }
 }
 
-async function mintReporterSession(input: {
+/** A fixed reason code for a failed Hands fetch: timeout or the low-level error code. */
+function handsTransportReason(error: unknown): string {
+  const name = error instanceof Error ? error.name : "";
+  if (name === "TimeoutError" || name === "AbortError") return "timeout";
+  const cause = error instanceof Error ? (error as Error & { cause?: { code?: unknown } }).cause : undefined;
+  const code = typeof cause?.code === "string" && /^[A-Z0-9_]{1,40}$/.test(cause.code) ? cause.code : null;
+  return code ? `network_${code}` : "request_failed";
+}
+
+function conversationFailureAttrs(error: unknown): TraceAttributes {
+  if (!(error instanceof ProductFeedbackConversationError)) return { stage: "unclassified" };
+  return {
+    stage: error.diagnostic.stage,
+    ...(error.diagnostic.upstreamStatus === null ? {} : { upstream_status: error.diagnostic.upstreamStatus }),
+    ...(error.diagnostic.upstreamCode === null ? {} : { upstream_code: error.diagnostic.upstreamCode }),
+  };
+}
+
+function mintReporterSession(input: {
   config: Config;
   reporterId: string;
   fetchImpl: typeof fetch;
   now: () => number;
   signal?: AbortSignal;
-  cacheKey: string;
+  /** Null: a session for this call only, never cached. */
+  cacheKey: string | null;
 }): Promise<ReporterAuthorization> {
+  // Child span per mint: stage and upstream status of a failed mint, which the
+  // deploy-time 503s lacked (AndyLok).
+  return withTraceChildSpan(
+    "server.product_feedback.reporter_session",
+    { surface: "server", kind: "client" },
+    () => mintReporterSessionRequest(input),
+    { onError: conversationFailureAttrs },
+  );
+}
+
+async function mintReporterSessionRequest(input: {
+  config: Config;
+  reporterId: string;
+  fetchImpl: typeof fetch;
+  now: () => number;
+  signal?: AbortSignal;
+  cacheKey: string | null;
+}): Promise<ReporterAuthorization> {
+  const timeout = AbortSignal.timeout(HANDS_READ_TIMEOUT_MS);
   let response: Response;
   try {
     response = await input.fetchImpl(
       `${input.config.baseUrl}/api/apps/${encodeURIComponent(input.config.appId)}/reporter-feedback/session`,
       {
         method: "POST",
-        signal: input.signal,
+        signal: input.signal ? AbortSignal.any([input.signal, timeout]) : timeout,
         headers: {
           Authorization: `Bearer ${input.config.appToken}`,
           "Content-Type": "application/json",
@@ -639,7 +763,10 @@ async function mintReporterSession(input: {
         body: JSON.stringify({ scopes: REPORTER_SESSION_SCOPES }),
       },
     );
-  } catch {
+  } catch (error) {
+    addTraceEvent("server.product_feedback.reporter_session.transport_failed", {
+      reason: handsTransportReason(error),
+    });
     throw new ProductFeedbackConversationError(
       503,
       "feedback_service_unavailable",
@@ -648,7 +775,7 @@ async function mintReporterSession(input: {
     );
   }
   const now = input.now();
-  if (!response.ok) throw reporterSessionMintError(response, now);
+  if (!response.ok) throw await reporterSessionMintError(response, now);
   if (response.status !== 201) {
     throw new ProductFeedbackConversationError(
       503,
@@ -692,11 +819,13 @@ async function mintReporterSession(input: {
       conversationDiagnostic("reporter_session_receipt", { upstreamStatus: response.status }),
     );
   }
-  reporterSessionCache.set(input.cacheKey, {
-    token: value.session_token,
-    expiresAtMs,
-    lastAccess: ++reporterSessionAccessSequence,
-  });
+  if (input.cacheKey !== null) {
+    reporterSessionCache.set(input.cacheKey, {
+      token: value.session_token,
+      expiresAtMs,
+      lastAccess: ++reporterSessionAccessSequence,
+    });
+  }
   return {
     bearer: value.session_token,
     cacheKey: input.cacheKey,
@@ -710,10 +839,16 @@ async function reporterAuthorization(input: {
   fetchImpl: typeof fetch;
   now: () => number;
   signal?: AbortSignal;
+  /**
+   * False: mint a session for this call only, outside the shared cache, so
+   * background reads never evict (or fill the cap of) people's sessions.
+   */
+  cacheSession?: boolean;
 }): Promise<ReporterAuthorization> {
   if (!input.config.reporterSessionEnabled) {
     return { bearer: input.config.appToken, cacheKey: null, mintServerTiming: null };
   }
+  if (input.cacheSession === false) return mintReporterSession({ ...input, cacheKey: null });
   const now = input.now();
   pruneReporterSessionCache(now);
   const cacheKey = reporterSessionCacheKey(input.config, input.reporterId);
@@ -747,22 +882,43 @@ function combineHandsServerTiming(...values: Array<string | null>): string | nul
   return present.length > 0 ? present.join(", ") : null;
 }
 
+type HandsRequestInput = {
+  config: Config;
+  reporterId: string;
+  operation: OperationClass;
+  init?: RequestInit;
+  fetchImpl?: typeof fetch;
+  now?: () => number;
+  signal?: AbortSignal;
+  onUpstreamServerTiming?: (value: string | null) => void;
+};
+
+/**
+ * Every Hands call after the route binding (list, get, comment, close,
+ * attachment) goes through here. A 401 or 403 from Hands, on the reporter
+ * session mint or the call itself, drops this reporter's cached route binding,
+ * so the next request binds again instead of reusing one Hands no longer
+ * honours. A 5xx, a timeout or a transport failure keeps it.
+ */
 async function handsRequest(
   path: string,
-  input: {
-    config: Config;
-    reporterId: string;
-    operation: OperationClass;
-    init?: RequestInit;
-    fetchImpl?: typeof fetch;
-    now?: () => number;
-    signal?: AbortSignal;
-    onUpstreamServerTiming?: (value: string | null) => void;
-  },
+  input: HandsRequestInput & { env: NodeJS.ProcessEnv },
 ): Promise<Response> {
+  try {
+    return await sendHandsRequest(path, input);
+  } catch (error) {
+    if (error instanceof ProductFeedbackConversationError && isHandsAuthRejectionStatus(error.diagnostic.upstreamStatus)) {
+      forgetProductFeedbackRouteBinding({ reporterId: input.reporterId, env: input.env });
+    }
+    throw error;
+  }
+}
+
+async function sendHandsRequest(path: string, input: HandsRequestInput): Promise<Response> {
   const nowValue = input.now?.() ?? currentTimeMs();
   const now = input.now ?? (() => currentTimeMs());
   beforeBreaker(input.config, input.operation, nowValue);
+  const callerSignal = input.signal ?? input.init?.signal ?? undefined;
   let authorization: ReporterAuthorization;
   try {
     authorization = await reporterAuthorization({
@@ -770,7 +926,8 @@ async function handsRequest(
       reporterId: input.reporterId,
       fetchImpl: input.fetchImpl ?? globalThis.fetch,
       now,
-      signal: input.signal ?? input.init?.signal ?? undefined,
+      signal: callerSignal,
+      cacheSession: input.operation !== "background_read",
     });
   } catch (error) {
     if (error instanceof ProductFeedbackConversationError) {
@@ -800,17 +957,33 @@ async function handsRequest(
       }),
     );
   }
+  // A read without a caller signal is bounded from the request on (the mint has
+  // its own bound), so a slow mint does not eat the read's time.
+  const signal = callerSignal ?? (
+    input.operation === "read" || input.operation === "background_read" ? AbortSignal.timeout(HANDS_READ_TIMEOUT_MS) : undefined
+  );
   let response: Response;
   try {
-    response = await (input.fetchImpl ?? globalThis.fetch)(`${input.config.baseUrl}${path}`, {
-      ...input.init,
-      signal: input.signal ?? input.init?.signal,
-      headers: {
-        Authorization: `Bearer ${authorization.bearer}`,
-        "X-Hands-Reporter-Id": input.reporterId,
-        ...input.init?.headers,
+    // Child span per Hands call: the transport reason (timeout, network_<code>)
+    // or the upstream status, so a failed read is not inferred from its duration.
+    response = await withTraceChildSpan(
+      "server.product_feedback.hands_request",
+      { surface: "server", kind: "client", attrs: { operation: input.operation, hands_route: handsReporterRouteTemplate(path) } },
+      () => (input.fetchImpl ?? globalThis.fetch)(`${input.config.baseUrl}${path}`, {
+        ...input.init,
+        signal,
+        headers: {
+          Authorization: `Bearer ${authorization.bearer}`,
+          "X-Hands-Reporter-Id": input.reporterId,
+          ...handsTraceHeaders(),
+          ...input.init?.headers,
+        },
+      }),
+      {
+        onSuccess: (result) => ({ upstream_status: result.status }),
+        onError: (error) => ({ reason: handsTransportReason(error) }),
       },
-    });
+    );
   } catch {
     const snapshot = breakerFailure(input.config, input.operation, input.now?.() ?? currentTimeMs());
     throw new ProductFeedbackConversationError(
@@ -867,6 +1040,7 @@ async function handsRequest(
     null,
     conversationDiagnostic("upstream_response", {
       upstreamStatus: response.status,
+      upstreamCode: await readHandsErrorCode(response),
       breakerFailures: snapshot.failures,
       breakerOpen: snapshot.open,
     }),
@@ -898,6 +1072,7 @@ export async function listProductFeedbackTickets(input: {
   if (handsCursor) params.set("cursor", handsCursor);
   const response = await handsRequest(queryPath(config, `?${params}`), {
     config,
+    env: input.env ?? process.env,
     reporterId: input.reporterId,
     operation: "read",
     fetchImpl: input.fetchImpl,
@@ -921,7 +1096,7 @@ export async function listProductFeedbackTickets(input: {
   const nextCursor = value.next_cursor
     ? encodeProductFeedbackCursor({ route: "ticket_list", userId: input.userId, ticketId: null, handsCursor: value.next_cursor, issuedAtMs: input.now?.() }, config.cursorKey)
     : null;
-  breakerSuccess(config, "read");
+  breakerSuccess(config, "read", input.now?.() ?? currentTimeMs());
   return {
     tickets: tickets as ProductFeedbackTicket[],
     next_cursor: nextCursor,
@@ -935,6 +1110,14 @@ export async function getProductFeedbackTicket(input: {
   ticketId: string;
   commentLimit: number;
   commentCursor?: string;
+  /**
+   * The server's own read (productFeedbackUnreadReconcile), not a person's:
+   * it never moves the reporter's read receipt (Hands `mark_read=false`),
+   * takes no part in the breakers, mints no cached reporter session, and stops at
+   * `signal` (which then also bounds it; nothing else does). Absent: a
+   * person's read, which marks the ticket read as before.
+   */
+  background?: { signal: AbortSignal };
   env?: NodeJS.ProcessEnv;
   fetchImpl?: typeof fetch;
   now?: () => number;
@@ -952,8 +1135,11 @@ export async function getProductFeedbackTicket(input: {
     : null;
   const params = new URLSearchParams({ comment_limit: String(input.commentLimit) });
   if (handsCursor) params.set("comment_cursor", handsCursor);
+  if (input.background) params.set("mark_read", "false");
+  const operation: OperationClass = input.background ? "background_read" : "read";
   const response = await handsRequest(queryPath(config, `/${input.ticketId}?${params}`), {
-    config, reporterId: input.reporterId, operation: "read", fetchImpl: input.fetchImpl, now: input.now,
+    config, env: input.env ?? process.env, reporterId: input.reporterId, operation, fetchImpl: input.fetchImpl, now: input.now,
+    signal: input.background?.signal,
     onUpstreamServerTiming: input.onUpstreamServerTiming,
   });
   const value = await response.json().catch(() => null);
@@ -962,14 +1148,14 @@ export async function getProductFeedbackTicket(input: {
     || !(typeof value.next_comment_cursor === "string" || value.next_comment_cursor === null)
     || !isCount(value.unread_total)
   ) {
-    breakerFailure(config, "read", input.now?.() ?? currentTimeMs());
+    breakerFailure(config, operation, input.now?.() ?? currentTimeMs());
     throw new ProductFeedbackConversationError(503, "feedback_service_unavailable");
   }
   const ticket = parseTicket(value.ticket);
   const comments = value.comments.map(parseComment);
   const attachments = value.attachments.map(parseAttachment);
   if (!ticket || comments.some((comment) => !comment) || attachments.some((attachment) => !attachment)) {
-    breakerFailure(config, "read", input.now?.() ?? currentTimeMs());
+    breakerFailure(config, operation, input.now?.() ?? currentTimeMs());
     throw new ProductFeedbackConversationError(503, "feedback_service_unavailable");
   }
   const nextCursor = value.next_comment_cursor
@@ -978,7 +1164,7 @@ export async function getProductFeedbackTicket(input: {
       handsCursor: value.next_comment_cursor, issuedAtMs: input.now?.(),
     }, config.cursorKey)
     : null;
-  breakerSuccess(config, "read");
+  breakerSuccess(config, operation, input.now?.() ?? currentTimeMs());
   return {
     ticket,
     comments: comments as ProductFeedbackComment[],
@@ -1030,6 +1216,7 @@ export async function commentOnProductFeedbackTicket(input: {
   }
   const response = await handsRequest(queryPath(config, `/${input.ticketId}/comments`), {
     config,
+    env: input.env ?? process.env,
     reporterId: input.reporterId,
     operation: "comment",
     fetchImpl: input.fetchImpl,
@@ -1053,7 +1240,7 @@ export async function commentOnProductFeedbackTicket(input: {
     breakerFailure(config, "comment", input.now?.() ?? currentTimeMs());
     throw new ProductFeedbackConversationError(503, "feedback_service_unavailable");
   }
-  breakerSuccess(config, "comment");
+  breakerSuccess(config, "comment", input.now?.() ?? currentTimeMs());
   return {
     status: response.status,
     comment: {
@@ -1085,6 +1272,7 @@ export async function closeProductFeedbackTicket(input: {
   const config = readConfig(input.env ?? process.env);
   const response = await handsRequest(queryPath(config, `/${input.ticketId}/close`), {
     config,
+    env: input.env ?? process.env,
     reporterId: input.reporterId,
     operation: "comment",
     fetchImpl: input.fetchImpl,
@@ -1126,7 +1314,7 @@ export async function closeProductFeedbackTicket(input: {
       }),
     );
   }
-  breakerSuccess(config, "comment");
+  breakerSuccess(config, "comment", input.now?.() ?? currentTimeMs());
   return {
     status: "closed",
     closure_reason: input.reason,
@@ -1184,7 +1372,7 @@ export async function getProductFeedbackAttachment(input: {
   let response: Response;
   try {
     response = await handsRequest(queryPath(config, `/${input.ticketId}/attachments/${input.attachmentId}`), {
-      config, reporterId: input.reporterId, operation: "attachment", fetchImpl: input.fetchImpl,
+      config, env: input.env ?? process.env, reporterId: input.reporterId, operation: "attachment", fetchImpl: input.fetchImpl,
       now: input.now, signal: controller.signal,
     });
   } finally {
@@ -1226,7 +1414,7 @@ export async function getProductFeedbackAttachment(input: {
     created_at: 0,
   };
   const bodyTimer = setClockTimeout(() => controller.abort(), 60_000);
-  breakerSuccess(config, "attachment");
+  breakerSuccess(config, "attachment", input.now?.() ?? currentTimeMs());
   return {
     response,
     metadata,

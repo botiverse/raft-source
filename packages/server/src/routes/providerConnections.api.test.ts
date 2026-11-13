@@ -11,11 +11,11 @@ import {
 } from "@botiverse/raft-shared";
 import { getDb } from "../db/index";
 import { agentProviderConnections, agents, featureFlagRules, integrationAuditEvents, machines, providerConnections, serverMembers, users } from "../db/schema";
-import { assignMachine as assignAgentMachine } from "../services/agentService";
+import { placeAgentOnMachine } from "../test/agentMachineFixture";
 import { createServer } from "../services/serverService";
 import { openTestApp } from "../test/integration/app";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 async function seedUser(email: string, name: string) {
   const [user] = await getDb().insert(users).values({
@@ -69,7 +69,7 @@ test("provider connection migration defaults off and names only the two launch s
 test("provider connection API gates management, rejects aliases, and never returns credentials", async () => {
   const originalKey = process.env.SLOCK_PROVIDER_CREDENTIAL_KEY;
   process.env.SLOCK_PROVIDER_CREDENTIAL_KEY = Buffer.alloc(32, 8).toString("base64");
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const owner = await seedUser("provider-api-owner@raft.test", "provider-api-owner");
     const member = await seedUser("provider-api-member@raft.test", "provider-api-member");
@@ -260,7 +260,7 @@ test("provider connection API gates management, rejects aliases, and never retur
       apiKeyHash: "unused-provider-api-machine-hash",
       runtimes: ["builtin"],
     }).returning();
-    await assignAgentMachine(agent.id, machine.id);
+    await placeAgentOnMachine(agent.id, machine.id);
     let catalogValidationCalls = 0;
     Object.assign(app.app.get("agentOrchestrator"), {
       hasMachineLocally: () => true,
@@ -372,7 +372,7 @@ async function readAssignedAgents(baseUrl: string, token: string, serverId: stri
 test("a new key or endpoint on a connection lifts paused restarts of the agents using it", async () => {
   const originalKey = process.env.SLOCK_PROVIDER_CREDENTIAL_KEY;
   process.env.SLOCK_PROVIDER_CREDENTIAL_KEY = Buffer.alloc(32, 9).toString("base64");
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const owner = await seedUser("provider-lift-owner@raft.test", "provider-lift-owner");
     const server = await createServer("Provider Lift", "provider-lift", owner.id);
@@ -428,7 +428,7 @@ test("a new key or endpoint on a connection lifts paused restarts of the agents 
 test("provider connection names the Agents that block deletion without leaking credentials", async () => {
   const originalKey = process.env.SLOCK_PROVIDER_CREDENTIAL_KEY;
   process.env.SLOCK_PROVIDER_CREDENTIAL_KEY = Buffer.alloc(32, 9).toString("base64");
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const owner = await seedUser("provider-agents-owner@raft.test", "provider-agents-owner");
     const member = await seedUser("provider-agents-member@raft.test", "provider-agents-member");
@@ -460,7 +460,7 @@ test("provider connection names the Agents that block deletion without leaking c
       apiKeyHash: "unused-assigned-agent-machine-hash",
       runtimes: ["builtin"],
     }).returning();
-    await assignAgentMachine(agent.id, machine.id);
+    await placeAgentOnMachine(agent.id, machine.id);
 
     const listed = await readAssignedAgents(app.baseUrl, ownerToken, server.id, created.id);
     assert.equal(listed.status, 200);
@@ -531,7 +531,7 @@ test("provider connection names the Agents that block deletion without leaking c
 test("deleted Agents stop blocking provider connection deletion", async () => {
   const originalKey = process.env.SLOCK_PROVIDER_CREDENTIAL_KEY;
   process.env.SLOCK_PROVIDER_CREDENTIAL_KEY = Buffer.alloc(32, 10).toString("base64");
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const owner = await seedUser("provider-detach-owner@raft.test", "provider-detach-owner");
     const server = await createServer("Provider Detach", "provider-detach", owner.id);

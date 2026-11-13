@@ -1,32 +1,13 @@
-import { expect, test } from "@playwright/test";
-import type { APIRequestContext, Page } from "@playwright/test";
-import { loginViaApi } from "../../fixtures/auth";
-import { waitForSeedState } from "../../fixtures/seedState";
-import type { PlaywrightSeedState } from "../../fixtures/seedState";
+import { expect } from "@playwright/test";
+import type { Page } from "@playwright/test";
+import { seedChannelHistory, test } from "../../fixtures/scenario";
+import { loadedMessageCount } from "../../fixtures/timeline";
 
-// The seeded owner has no machines/agents, so the onboarding setup gate would
-// otherwise intercept clicks. Opt the user out of it before navigating.
-async function dismissOwnerOnboarding(
-  request: APIRequestContext,
-  seedState: PlaywrightSeedState,
-  accessToken: string,
-) {
-  const response = await request.patch(
-    `${seedState.urls.api}/api/servers/${seedState.server.id}/onboarding-settings`,
-    {
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        "X-Server-Id": seedState.server.id,
-      },
-      data: { setupModalReminderOptOut: true },
-    },
-  );
-  if (!response.ok()) {
-    throw new Error(
-      `Failed to opt out of onboarding modal: ${response.status()} ${response.statusText()}`,
-    );
-  }
-}
+// Each test runs in a tenant of its own (fixtures/scenario: its own owner,
+// server and channel, with a seeded history): specs in other workers post to
+// the shared seeded channel, so its seeded latest message is not always the
+// newest, and the virtual timeline does not mount it at the tail. The
+// scenario owner has the onboarding setup gate dismissed already.
 
 // Distance from the real bottom of the message scroller, in CSS pixels.
 async function measureBottomGap(page: Page) {
@@ -63,14 +44,14 @@ test.describe("Back to bottom", () => {
   test("smooth scroll lands at the actual bottom even when new messages arrive mid-flight", async ({
     page,
     request,
+    scenario,
   }) => {
-    const seedState = await waitForSeedState();
-    const login = await loginViaApi(request, seedState);
-    await dismissOwnerOnboarding(request, seedState, login.accessToken);
+    const { seed, login } = scenario;
+    const history = await seedChannelHistory(seed);
 
-    await page.goto(`/s/${seedState.server.slug}`);
+    await page.goto(`/s/${seed.server.slug}/channel/${seed.channel.id}`);
     await expect(page.getByTestId("message-scroller")).toBeVisible();
-    await expect(page.getByText(seedState.messages.latestContent)).toBeVisible();
+    await expect(page.getByText(history.latestContent)).toBeVisible();
 
     // Leave the live tail with real user input. Directly assigning scrollTop
     // would move the viewport without changing the user's follow-bottom intent.
@@ -92,18 +73,20 @@ test.describe("Back to bottom", () => {
     // behavior, this keeps the setup honest: a script-only scroll preserves
     // follow-bottom intent and would jump back to the tail here.
     const preClickContent = `[back-to-bottom] before click ${Date.now()}`;
-    const preClickResponse = await request.post(`${seedState.urls.api}/api/messages`, {
+    const loadedBeforePost = await loadedMessageCount(page.getByTestId("message-scroller"));
+    const preClickResponse = await request.post(`${seed.urls.api}/api/messages`, {
       headers: {
         Authorization: `Bearer ${login.accessToken}`,
-        "X-Server-Id": seedState.server.id,
+        "X-Server-Id": seed.server.id,
       },
       data: {
-        channelId: seedState.channel.id,
+        channelId: seed.channel.id,
         content: preClickContent,
       },
     });
     expect(preClickResponse.ok()).toBe(true);
-    await expect(page.getByText(preClickContent)).toBeAttached();
+    // Arrived below the view (not mounted by the virtual timeline).
+    await expect.poll(() => loadedMessageCount(page.getByTestId("message-scroller"))).toBeGreaterThan(loadedBeforePost);
     await expect.poll(() => measureBottomGap(page)).toBeGreaterThan(250);
     await expect(bottomButton).toBeVisible();
 
@@ -118,13 +101,13 @@ test.describe("Back to bottom", () => {
     const burst = burstContents.map((content, i) =>
       (async () => {
         await page.waitForTimeout(i * 60);
-        await request.post(`${seedState.urls.api}/api/messages`, {
+        await request.post(`${seed.urls.api}/api/messages`, {
           headers: {
             Authorization: `Bearer ${login.accessToken}`,
-            "X-Server-Id": seedState.server.id,
+            "X-Server-Id": seed.server.id,
           },
           data: {
-            channelId: seedState.channel.id,
+            channelId: seed.channel.id,
             content,
           },
         });
@@ -133,7 +116,7 @@ test.describe("Back to bottom", () => {
     await Promise.all(burst);
     await page.evaluate(async (channelId) => {
       await window.__SLOCK_E2E__!.loadMessages(channelId);
-    }, seedState.channel.id);
+    }, seed.channel.id);
     await expect(page.getByText(burstContents[burstContents.length - 1])).toBeAttached();
 
     const finalGap = await waitForStableGap(page, { timeoutMs: 8000 });
@@ -143,16 +126,15 @@ test.describe("Back to bottom", () => {
 
   test("clicking back to bottom from a context window lands on the latest message", async ({
     page,
-    request,
+    scenario,
   }) => {
-    const seedState = await waitForSeedState();
-    const login = await loginViaApi(request, seedState);
-    await dismissOwnerOnboarding(request, seedState, login.accessToken);
+    const { seed } = scenario;
+    const history = await seedChannelHistory(seed);
 
     // Permalink load: opens a context window centered on focusMessageId with
     // hasNewer=true, so the user is sitting in a window detached from the tail.
     await page.goto(
-      `/s/${seedState.server.slug}/channel/${seedState.channel.id}?msg=${seedState.messages.focusMessageId}`,
+      `/s/${seed.server.slug}/channel/${seed.channel.id}?msg=${history.focusMessageId}`,
     );
     await expect(page.getByTestId("message-scroller")).toBeVisible();
 
@@ -161,7 +143,7 @@ test.describe("Back to bottom", () => {
     // Back to bottom exit the context window rather than just scroll. (The
     // native primitive keeps off-screen items in DOM, so check viewport
     // intersection rather than DOM presence.)
-    await expect(page.getByText(seedState.messages.latestContent)).not.toBeInViewport();
+    await expect(page.getByText(history.latestContent)).not.toBeInViewport();
 
     const bottomButton = page
       .locator('button:has-text("Back to bottom"), button:has-text("new message")')
@@ -171,7 +153,7 @@ test.describe("Back to bottom", () => {
 
     // After loadMessages completes the latest message must be visible and the
     // scroller should be parked at the real bottom.
-    await expect(page.getByText(seedState.messages.latestContent)).toBeVisible();
+    await expect(page.getByText(history.latestContent)).toBeVisible();
     const finalGap = await waitForStableGap(page, { timeoutMs: 8000 });
     expect(finalGap).toBeLessThan(40);
   });
@@ -185,18 +167,22 @@ test.describe("Back to bottom", () => {
 // releases in the same instant, before any transition, so this test holds the
 // button down the way a hand does.
 test.describe("Back to bottom (held press)", () => {
-  test("a held press keeps the button under the pointer, and releasing it returns to the bottom", async ({ page, request }) => {
-    const seedState = await waitForSeedState();
-    const login = await loginViaApi(request, seedState);
-    await dismissOwnerOnboarding(request, seedState, login.accessToken);
+  test("a held press keeps the button under the pointer, and releasing it returns to the bottom", async ({ page, scenario }) => {
+    const { seed } = scenario;
+    const history = await seedChannelHistory(seed);
 
-    await page.goto(`/s/${seedState.server.slug}`);
+    await page.goto(`/s/${seed.server.slug}/channel/${seed.channel.id}`);
     await expect(page.getByTestId("message-scroller")).toBeVisible();
-    await expect(page.getByText(seedState.messages.latestContent)).toBeVisible();
+    await expect(page.getByText(history.latestContent)).toBeVisible();
     const scroller = page.getByTestId("message-scroller");
     await scroller.hover();
     await page.mouse.wheel(0, -700);
-    const bottomButton = page.locator('button:has-text("Back to bottom")').first();
+    // Locate by testid, not by label: the label flips between "Back to bottom"
+    // and "N new messages" as the badge counter updates, so an append can flip
+    // it between toBeVisible and boundingBox and the locator dies waiting for
+    // a text that is no longer there (staging e2e (1), 2026-10-20, when this
+    // test still ran on the shared seeded channel).
+    const bottomButton = page.getByTestId("back-to-bottom").first();
     await expect(bottomButton).toBeVisible();
     await page.mouse.wheel(0, -700);
     await expect.poll(() => measureBottomGap(page)).toBeGreaterThan(500);
@@ -210,9 +196,11 @@ test.describe("Back to bottom (held press)", () => {
     await page.mouse.down();
     await page.waitForTimeout(250);
     const pressed = (await bottomButton.boundingBox())!;
-    const underPointer = await page.evaluate(([px, py]) => document.elementFromPoint(px, py)?.closest("button")?.textContent ?? null, [x, y]);
+    const underPointer = await page.evaluate(([px, py]) => document.elementFromPoint(px, py)?.closest("button")?.getAttribute("data-testid") ?? null, [x, y]);
     expect(Math.abs(pressed.x - rest.x), "a press adds a wash and does not move the button").toBeLessThanOrEqual(0.5);
-    expect(underPointer, "the pointer is still on the button while it is held").toContain("Back to bottom");
+    // Same reason as the locator above: assert the element under the pointer is
+    // the back-to-bottom button itself, not its (transient) label text.
+    expect(underPointer, "the pointer is still on the button while it is held").toBe("back-to-bottom");
     await page.mouse.up();
 
     expect(await waitForStableGap(page, { timeoutMs: 8000 })).toBeLessThan(40);

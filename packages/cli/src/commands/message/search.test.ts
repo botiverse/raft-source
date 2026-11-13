@@ -7,6 +7,7 @@ import { CliError } from "../../core/errors";
 import type { CliIo } from "../../core/io";
 import { formatSearchResults } from "./_format";
 import { messageSearchCommand } from "./search";
+import { buildRaftProgram } from "../../program";
 
 function memoryIo(): { io: CliIo; stdout: string[]; stderr: string[] } {
   const stdout: string[] = [];
@@ -417,7 +418,7 @@ test("message search command preserves QUERY_TOO_BROAD as a machine-readable rej
         ok: false,
         status: 422,
         data: null,
-        error: "Search query is too broad. Add a channel, sender, or time filter, or use --sort recent.",
+        error: "Search query is too broad. Add a channel or sender filter, or use --sort recent (a time range works with recent).",
         errorCode: "QUERY_TOO_BROAD",
       }),
     }) as any,
@@ -450,7 +451,7 @@ test("message search command preserves SEARCH_TIMEOUT after an admitted query re
         ok: false,
         status: 503,
         data: null,
-        error: "Search timed out. Add a channel, sender, or time filter, use --sort recent, or retry.",
+        error: "Search timed out. Add a channel or sender filter, use --sort recent (a time range works with recent), or retry.",
         errorCode: "SEARCH_TIMEOUT",
       }),
     }) as any,
@@ -514,5 +515,96 @@ test("message search command rejects --cursor outside a recent text search and w
       async () => { await messageSearchCommand.handler(ctx, opts); },
       (err: unknown) => err instanceof CliError && err.code === "INVALID_ARG",
     );
+  }
+});
+
+async function runSearchArgv(argv: string[], artifacts: { status: number; data?: unknown; errorCode?: string; hangUntilAborted?: boolean }, search: "ok" | "refused" | "throws" = "ok", env: NodeJS.ProcessEnv = {}) {
+  const { io, stdout, stderr } = memoryIo();
+  const requests: string[] = [];
+  const signals: AbortSignal[] = [];
+  const program = buildRaftProgram({
+    io,
+    env,
+    loadAgentContext: () => agentContext,
+    createApiClient: () => ({
+      request: async (method: string, path: string, _body?: unknown, options?: { signal?: AbortSignal }): Promise<ApiResponse<unknown>> => {
+        requests.push(`${method} ${path}`);
+        if (path.startsWith("/internal/agent-api/artifacts")) {
+          if (options?.signal) signals.push(options.signal);
+          if (artifacts.hangUntilAborted) {
+            await new Promise<void>((resolve) => options?.signal?.addEventListener("abort", () => resolve()));
+            return { ok: false, status: 0, data: null, error: "aborted", errorCode: null };
+          }
+          const ok = artifacts.status < 400;
+          return { ok, status: artifacts.status, data: ok ? artifacts.data : null, error: ok ? null : "refused", errorCode: artifacts.errorCode ?? null };
+        }
+        if (search === "throws") throw new Error("socket hang up");
+        if (search === "refused") return { ok: false, status: 503, data: null, error: "search unavailable", errorCode: "SEARCH_UNAVAILABLE" };
+        return { ok: true, status: 200, error: null, data: { results: [], hasMore: false } };
+      },
+    }) as any,
+  });
+  let error: unknown = null;
+  try {
+    await program.parseAsync(argv, { from: "user" });
+  } catch (caught) {
+    error = caught;
+  }
+  return { stdout: stdout.join(""), stderr: stderr.join(""), requests, signals, error };
+}
+
+const artifactHit = {
+  artifacts: [{ id: "pt_abc", url: "https://app.raft.build/artifacts/pt_abc", name: "plan", title: "Plan", description: null, kind: "html", home: { kind: "server" }, currentVersion: 1, author: { type: "agent", name: "Remy" }, createdAt: "2026-10-22T14:02:00.000Z", updatedAt: "2026-10-22T14:02:00.000Z", matches: [] }],
+  nextCursor: null,
+  target: null,
+};
+
+test("argv: a text search ends with the Artifacts line when artifacts match; not when they don't, are off, or a filter can't apply", async () => {
+  const hit = await runSearchArgv(["message", "search", "--query", "rollout plan", "--target", "#ops"], { status: 200, data: artifactHit });
+  assert.deepEqual(hit.requests, [
+    "GET /internal/agent-api/search?q=rollout+plan&channel=%23ops",
+    "GET /internal/agent-api/artifacts?target=%23ops&query=rollout+plan&limit=1",
+  ]);
+  assert.equal(hit.stdout, `No search results. (truncated=false)\nArtifacts also match "rollout plan": raft artifact list --query 'rollout plan' --target "#ops"\n`);
+
+  const none = await runSearchArgv(["message", "search", "--query", "rollout plan"], { status: 200, data: { ...artifactHit, artifacts: [] } });
+  assert.equal(none.stdout, "No search results. (truncated=false)\n");
+  const off = await runSearchArgv(["message", "search", "--query", "rollout plan"], { status: 403, errorCode: "ARTIFACTS_NOT_ENABLED" });
+  assert.equal(off.stdout, "No search results. (truncated=false)\n");
+  assert.equal(off.stderr, "");
+
+  const bySender = await runSearchArgv(["message", "search", "--query", "rollout plan", "--sender", "@alice"], { status: 200, data: artifactHit });
+  assert.deepEqual(bySender.requests, ["GET /internal/agent-api/search?q=rollout+plan&sender=alice"]);
+  const byTime = await runSearchArgv(["message", "search", "--query", "rollout plan", "--before", "2026-10-01T00:00:00Z"], { status: 200, data: artifactHit });
+  assert.ok(byTime.requests.every((r) => !r.includes("/artifacts")), byTime.requests.join(", "));
+});
+
+test("argv: when the daemon says Artifacts are off for this Server, no artifacts request is made; on, or not said, it asks", async () => {
+  const offPerDaemon = await runSearchArgv(["message", "search", "--query", "rollout plan"], { status: 200, data: artifactHit }, "ok", { RAFT_ENABLED_APPS: "" });
+  assert.deepEqual(offPerDaemon.requests, ["GET /internal/agent-api/search?q=rollout+plan"]);
+  assert.equal(offPerDaemon.stdout, "No search results. (truncated=false)\n");
+  const onPerDaemon = await runSearchArgv(["message", "search", "--query", "rollout plan"], { status: 200, data: artifactHit }, "ok", { RAFT_ENABLED_APPS: "artifacts" });
+  assert.ok(onPerDaemon.requests.some((r) => r.startsWith("GET /internal/agent-api/artifacts")), onPerDaemon.requests.join(", "));
+  const unsaid = await runSearchArgv(["message", "search", "--query", "rollout plan"], { status: 200, data: artifactHit });
+  assert.ok(unsaid.requests.some((r) => r.startsWith("GET /internal/agent-api/artifacts")), "an older daemon or a self-hosted runner still asks");
+});
+
+test("argv: a probe still running after the search's grace is aborted, and the search prints without the line", async () => {
+  const started = Date.now();
+  const slow = await runSearchArgv(["message", "search", "--query", "rollout plan"], { status: 200, hangUntilAborted: true });
+  assert.ok(Date.now() - started < 2_000);
+  assert.equal(slow.stdout, "No search results. (truncated=false)\n");
+  assert.equal(slow.signals.length, 1);
+  assert.equal(slow.signals[0]!.aborted, true);
+});
+
+test("argv: a search that is refused or throws ends the probe at once", async () => {
+  for (const search of ["refused", "throws"] as const) {
+    const started = Date.now();
+    const run = await runSearchArgv(["message", "search", "--query", "rollout plan"], { status: 200, hangUntilAborted: true }, search);
+    assert.ok(Date.now() - started < 2_000, search);
+    assert.equal(run.signals.length, 1, search);
+    assert.equal(run.signals[0]!.aborted, true, search);
+    assert.equal(run.stdout, "", search);
   }
 });

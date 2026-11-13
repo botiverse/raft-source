@@ -4,12 +4,21 @@ export const LEGACY_DEFAULT_COMPUTER_SERVER_URL = "https://api.slock.ai";
 
 // The Computer ships as a self-contained SEA binary installed by the native
 // shell script (`install.sh` on macOS/Linux, `install.ps1` on Windows), not
-// npm — no Node/npm required. The installer resolves the latest version from
-// the release base `manifest.json`. Prod uses the formal
-// computer-v* channel; staging uses a branch snapshot channel isolated under
-// /computer/staging. The installed binary is `raft-computer`.
-export const COMPUTER_CDN_BASE_STAGING = "https://slock-cdn-staging.botiverse.dev/computer/staging";
+// npm — no Node/npm required. Every environment uses the same production entry
+// scripts; the installer resolves the Computer release through Hands. Prod
+// installs the default `main` channel; staging passes `--channel alpha` (the
+// channel staging builds publish to). A version pin (RAFT_COMPUTER_VERSION) is
+// forwarded as `--version`, which the installer rejects together with
+// `--channel`, so a pinned command carries no channel. The installed binary is
+// `raft-computer`.
 export const COMPUTER_CDN_BASE_PROD = "https://cdn.raft.build/computer";
+
+/** Hands channel staging deployments install from. */
+export const STAGING_COMPUTER_CHANNEL = "alpha";
+
+/** The public guide to installing and connecting Raft Computer (the same
+ *  commands the Add Computer dialog shows). */
+export const COMPUTER_INSTALL_DOCS_URL = "https://docs.raft.build/features/server/computers/#connecting-a-computer";
 
 export type ComputerCommandPlatform = "mac-linux" | "windows";
 
@@ -20,52 +29,44 @@ function normalizeComputerVersionPin(version?: string | null): string | null {
     : null;
 }
 
+// Installer arguments implied by the environment; none once a version is
+// pinned (the pin wins, and the installer rejects --version with --channel).
+function computerInstallChannelArgs(deploymentEnv: string | undefined, versionPin: string | null): string[] {
+  return deploymentEnv === "staging" && !versionPin ? ["--channel", STAGING_COMPUTER_CHANNEL] : [];
+}
+
+function computerInstallShellCommand(
+  deploymentEnv: string | undefined,
+  version: string | null | undefined,
+  extraArgs: string[] = [],
+): string {
+  const versionPin = normalizeComputerVersionPin(version);
+  const installEnv = versionPin ? `RAFT_COMPUTER_VERSION=${versionPin} ` : "";
+  const args = [...computerInstallChannelArgs(deploymentEnv, versionPin), ...extraArgs];
+  return `curl -fsSL ${COMPUTER_CDN_BASE_PROD}/install.sh | ${installEnv}sh${args.length > 0 ? ` -s -- ${args.join(" ")}` : ""}`;
+}
+
 export function computerInstallCommand(
   deploymentEnv?: string,
   version?: string | null,
 ): string {
-  const base = deploymentEnv === "staging" ? COMPUTER_CDN_BASE_STAGING : COMPUTER_CDN_BASE_PROD;
-  const versionPin = normalizeComputerVersionPin(version);
-  const installEnv = [
-    ...(deploymentEnv === "staging"
-      ? [
-          `RAFT_COMPUTER_RELEASE_BASE=${base}`,
-          "RAFT_COMPUTER_INSTALL_CHANNEL=alpha",
-        ]
-      : []),
-    ...(versionPin ? [`RAFT_COMPUTER_VERSION=${versionPin}`] : []),
-  ];
-  return `curl -fsSL ${base}/install.sh | ${installEnv.length > 0 ? `${installEnv.join(" ")} ` : ""}sh`;
+  return computerInstallShellCommand(deploymentEnv, version);
 }
 
 export function windowsComputerInstallCommand(
   deploymentEnv?: string,
   version?: string | null,
 ): string {
-  const base = deploymentEnv === "staging" ? COMPUTER_CDN_BASE_STAGING : COMPUTER_CDN_BASE_PROD;
   const versionPin = normalizeComputerVersionPin(version);
-  const installEnv = [
-    ...(deploymentEnv === "staging"
-      ? [
-          `$env:RAFT_COMPUTER_RELEASE_BASE = "${base}"`,
-          '$env:RAFT_COMPUTER_INSTALL_CHANNEL = "alpha"',
-        ]
-      : []),
-    ...(versionPin ? [`$env:RAFT_COMPUTER_VERSION = "${versionPin}"`] : []),
-  ];
-  const installUrl = deploymentEnv === "staging"
-    ? '"$env:RAFT_COMPUTER_RELEASE_BASE/install.ps1"'
-    : `${base}/install.ps1`;
-  return `${installEnv.length > 0 ? `${installEnv.join("; ")}; ` : ""}irm ${installUrl} | iex`;
+  const installEnv = versionPin ? `$env:RAFT_COMPUTER_VERSION = "${versionPin}"; ` : "";
+  const args = computerInstallChannelArgs(deploymentEnv, versionPin);
+  // `irm … | iex` cannot pass arguments; the scriptblock form can.
+  return args.length > 0
+    ? `${installEnv}& ([scriptblock]::Create((irm ${COMPUTER_CDN_BASE_PROD}/install.ps1))) ${args.join(" ")}`
+    : `${installEnv}irm ${COMPUTER_CDN_BASE_PROD}/install.ps1 | iex`;
 }
 
 export interface ComputerSetupCommandOptions {
-  // Retained as a no-op input so existing callsites (AddMachineDialog,
-  // MachineDetailPanel) keep passing the daemon-side legacy key without
-  // churn. The CLI removed `--adopt-legacy` / `--legacy-api-key` in
-  // RFC v9 PR-impl-3 commit 3 — legacy-daemon adoption is now driven by
-  // an interactive TTY prompt inside `raft-computer setup`, not flags.
-  legacyApiKey?: string | null;
   // Identity-carried adoption (task #239 PR-D/PR-E): when the calling
   // surface knows WHICH machine row this computer is (machine detail
   // page), the command carries `--machine <id>` and `raft-computer setup`
@@ -90,6 +91,8 @@ export interface ComputerCommands {
   installAndSetup: string | null;
   status: string;
   doctor: string;
+  // Upgrade in the terminal; the installer prints its result there.
+  upgrade: string;
   // Restart the whole Computer service and every attached server runner.
   restartService: string;
   // Restart while scoping lifecycle readback to one server.
@@ -147,6 +150,7 @@ export function getComputerCommands(
         installAndSetup: null,
         status: `${environment} ${binary} status`,
         doctor: `${environment} ${binary} doctor`,
+        upgrade: `${environment} ${binary} upgrade`,
         restartService: `${environment} ${binary} restart`,
         restart: `${environment} ${binary} restart /${slug}`,
         stop: `${environment} ${binary} stop`,
@@ -163,6 +167,7 @@ export function getComputerCommands(
       installAndSetup: null,
       status: `${environment} ${binary} status`,
       doctor: `${environment} ${binary} doctor`,
+      upgrade: `${environment} ${binary} upgrade`,
       restartService: `${environment} ${binary} restart`,
       restart: `${environment} ${binary} restart /${slug}`,
       stop: `${environment} ${binary} stop`,
@@ -177,9 +182,10 @@ export function getComputerCommands(
     setup: `raft-computer setup /${slug}${setupArgs}`,
     installAndSetup: platform === "windows"
       ? null
-      : `${computerInstallCommand(deploymentEnv, options.version)} -s -- --setup /${slug}${setupArgs}`,
+      : computerInstallShellCommand(deploymentEnv, options.version, [`--setup /${slug}${setupArgs}`]),
     status: "raft-computer status",
     doctor: "raft-computer doctor",
+    upgrade: "raft-computer upgrade",
     restartService: "raft-computer restart",
     restart: `raft-computer restart /${slug}`,
     stop: "raft-computer stop",

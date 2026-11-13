@@ -5,8 +5,8 @@ import type { StateStorage } from "zustand/middleware";
 import {
   normalizeSearchEntityUsage,
   recordSearchEntityOpen,
-} from "../components/search/searchHome";
-import type { SearchEntityUsage } from "../components/search/searchHome";
+} from "../features/search/searchHome";
+import type { SearchEntityUsage } from "../features/search/searchHome";
 
 const SEARCH_ENTITY_USAGE_STORE_KEY = "raft:search-entity-usage-store:v1";
 const SEARCH_ENTITY_USAGE_SCOPE_LIMIT = 32;

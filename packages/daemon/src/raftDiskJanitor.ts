@@ -179,7 +179,7 @@ export interface RaftDiskJanitorResult {
 /**
  * One bounded janitor pass:
  * - idle (>7d) migration transport generations lose their bulk data;
- * - workspace backups get the existing keep-3 / 30-day rule, which until now
+ * - workspace backups get the existing keep-3 / 7-day rule, which until now
  *   only ran when the same agent migrated again.
  */
 export async function runRaftDiskJanitor(input: {
@@ -213,14 +213,15 @@ export async function runRaftDiskJanitor(input: {
   }
 
   const backupRoot = path.join(input.slockHome, AGENT_MIGRATION_WORKSPACE_BACKUP_DIRECTORY);
-  for (const ownerAgentId of await listDirectories(backupRoot)) {
-    if (budgetExhausted(budget)) break;
+  const ownerAgentIds = await listDirectories(backupRoot);
+  const pruneOwner = async (ownerAgentId: string, measureSizes: boolean): Promise<void> => {
     const agentBackupRoot = path.join(backupRoot, ownerAgentId);
     await pruneAgentMigrationWorkspaceBackups({
       agentBackupRoot,
       now,
-      beforeRemove: async (entry) => {
-        const freedBytes = await measureDirectoryBytes(path.join(agentBackupRoot, entry.name), budget);
+      measureBytes: measureSizes ? (backupPath) => measureDirectoryBytes(backupPath, budget) : undefined,
+      beforeRemove: async (entry, measuredBytes) => {
+        const freedBytes = measuredBytes ?? await measureDirectoryBytes(path.join(agentBackupRoot, entry.name), budget);
         result.backupsFreedBytes += freedBytes;
         result.backupsRemoved.push({
           ownerAgentId,
@@ -230,6 +231,16 @@ export async function runRaftDiskJanitor(input: {
         });
       },
     });
+  };
+  // Count and age first for every agent; sizing kept backups can take the
+  // whole walk budget, so the size cap only spends what is left.
+  for (const ownerAgentId of ownerAgentIds) {
+    if (budgetExhausted(budget)) break;
+    await pruneOwner(ownerAgentId, false);
+  }
+  for (const ownerAgentId of ownerAgentIds) {
+    if (budgetExhausted(budget)) break;
+    await pruneOwner(ownerAgentId, true);
   }
   result.sweepOutcome = budget.outcome;
   return result;

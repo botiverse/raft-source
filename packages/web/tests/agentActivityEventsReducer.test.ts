@@ -1119,3 +1119,39 @@ function shuffledEvents(events: AgentActivityEvent[]): fc.Arbitrary<AgentActivit
   return fc.shuffledSubarray(indexes, { minLength: indexes.length, maxLength: indexes.length })
     .map((order) => order.map((index) => events[index]!));
 }
+
+test("#proj-runtime:#43: a full-window reload over a full live log keeps the newest window, each fact once", () => {
+  const live: AgentActivityEvent[] = [];
+  for (let i = 0; i < MAX_TRAJECTORY_ENTRIES; i += 1) {
+    live.push({
+      kind: "patch:trajectory-append",
+      agentId: "agent-1",
+      entries: [{ kind: "status", activity: "working", detail: `step ${i}` }],
+      timestamp: 10_000 + i,
+      serverSeq: i + 1,
+      joinKeys: { launchId: "launch-1", clientSeq: i + 1 },
+    });
+  }
+  // The reload brings more than the window, overlapping the live half: the
+  // durable twins of live entries carry no socket identity.
+  const reloaded = [];
+  for (let i = -200; i < MAX_TRAJECTORY_ENTRIES + 100; i += 1) {
+    reloaded.push({ timestamp: 10_000 + i, entry: { kind: "status", activity: "working", detail: `step ${i}` } as TrajectoryEntry });
+  }
+  const before = fold(live);
+  // Every entry key is one JSON.stringify: count them over the reload's merge only.
+  const stringify = vi.spyOn(JSON, "stringify");
+  const state = fold([{ kind: "hydrate:trajectory-log", agentId: "agent-1", entries: reloaded }], before);
+  const keyed = stringify.mock.calls.length;
+  stringify.mockRestore();
+  const log = state.trajectoryLogs["agent-1"]!;
+  assert.equal(log.length, MAX_TRAJECTORY_ENTRIES);
+  const details = log.map((item) => (item.entry as { detail: string }).detail);
+  assert.equal(new Set(details).size, details.length, "a live entry and its durable twin are one");
+  assert.equal(details.at(-1), `step ${MAX_TRAJECTORY_ENTRIES + 99}`);
+  assert.equal(details[0], `step 100`);
+  // Linear merge: a few keys per entry, whatever the runner's speed. The
+  // quadratic merge keyed every incoming entry against every live one
+  // (about 800 x 500 x 2 here); a wall-clock bound failed on busy runners.
+  assert.ok(keyed < 10 * (live.length + reloaded.length), `merge keyed ${keyed} entries for ${live.length + reloaded.length}`);
+});

@@ -6,8 +6,11 @@ import { registerServerReset } from "../../store/serverResetRegistry";
 const agentProfileCache = new Map<string, Agent>();
 const humanProfileCache = new Map<string, HumanProfile>();
 
-function humanCacheKey(serverId: string, userId: string) {
-  return `${serverId}:${userId}`;
+// A person's profile names their servers in the channel it was opened from
+// (`?channelId=`, #wg-rbac:#58), so the same person opened from two channels
+// is two entries; "" is the profile opened from no channel.
+function humanCacheKey(serverId: string, userId: string, channelId: string | null | undefined) {
+  return `${serverId}:${channelId ?? ""}:${userId}`;
 }
 
 function agentCacheKey(viewerServerId: string, agentId: string) {
@@ -24,15 +27,16 @@ export function setCachedAgentProfile(viewerServerId: string | null | undefined,
   agentProfileCache.set(agentCacheKey(viewerServerId, agent.id), agent);
 }
 
-export function getCachedHumanProfile(serverId: string, userId: string): HumanProfile | null {
-  return humanProfileCache.get(humanCacheKey(serverId, userId)) ?? null;
+export function getCachedHumanProfile(serverId: string, userId: string, channelId?: string | null): HumanProfile | null {
+  return humanProfileCache.get(humanCacheKey(serverId, userId, channelId)) ?? null;
 }
 
-export function setCachedHumanProfile(serverId: string, human: HumanProfile) {
-  humanProfileCache.set(humanCacheKey(serverId, human.userId), human);
+export function setCachedHumanProfile(serverId: string, human: HumanProfile, channelId?: string | null) {
+  humanProfileCache.set(humanCacheKey(serverId, human.userId, channelId), human);
 }
 
-export function primeHumanProfileFromChannelMember(serverId: string, human: ChannelHuman) {
+/** The roster row of `channelId`, shown at once while that channel's profile loads. */
+export function primeHumanProfileFromChannelMember(serverId: string, channelId: string, human: ChannelHuman) {
   setCachedHumanProfile(serverId, {
     userId: human.id,
     serverId: human.serverId,
@@ -40,7 +44,6 @@ export function primeHumanProfileFromChannelMember(serverId: string, human: Chan
     serverSlug: human.serverSlug,
     ...(human.servers ? { servers: human.servers } : {}),
     email: null,
-    gravatarHash: "",
     name: human.name,
     displayName: human.displayName,
     description: human.description,
@@ -49,7 +52,7 @@ export function primeHumanProfileFromChannelMember(serverId: string, human: Chan
     joinedAt: null,
     membershipStatus: "active",
     createdAgents: [],
-  });
+  }, channelId);
 }
 
 registerServerReset(() => {

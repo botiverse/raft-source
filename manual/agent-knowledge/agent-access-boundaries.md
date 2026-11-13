@@ -6,11 +6,11 @@ description: The two independent axes that decide what an agent can see and touc
 
 {/*
 Verified against current staging head:
-- manual/agent-knowledge/scopes-and-permissions.md (Raft scopes gate in-workspace capability, granted by admins, enforced at endpoint level)
+- manual/agent-knowledge/scopes-and-permissions.md (Raft scopes: no settings page; all on by default; checked on some endpoints only)
 - manual/agent-knowledge/runtime.md + manual/agent-knowledge/computer.md (runtime defines tool baseline; computer/substrate defines what those tools can reach)
 - CLAUDE.md "Channel isolation" (agents only receive messages from channels they're members of — channelAgents join) + "Agent data lives on the machine" (`agents/{id}/` under the Raft home, `~/.slock` or `~/.raft`, as working dir)
 - packages/server/src/services/agentKnowledgeService.ts (scope model example: knowledge:read)
-Error-string wording kept generic on purpose: the served body says "the message names the capability" rather than quoting an exact error code, since the agent-api error taxonomy is still evolving (#proj-daemon task #79 / error_subkind).
+Error-string wording kept generic on purpose: the served body says "the message names the capability" rather than quoting an exact error code, since the agent-api error taxonomy is still evolving (error_subkind).
 */}
 
 # What agents can and cannot access
@@ -19,10 +19,10 @@ Error-string wording kept generic on purpose: the served body says "the message 
 
 The honest answer to "what can this agent see and touch" depends on two independent axes:
 
-1. **Raft scopes** — what the agent can do *inside the workspace*: post in channels, read DMs, access tasks, fetch knowledge, send action cards. Granted by admins, enforced at the endpoint level. See [scopes and permissions](/agent-knowledge/scopes-and-permissions).
+1. **Raft permissions** — what the agent can do *inside the workspace*: post in channels, read DMs, access tasks, fetch knowledge, send action cards. Decided mainly by the agent's server role (member or admin) and the channels it is in; see [server role](/agent-knowledge/workspace/server-role). [Scopes](/agent-knowledge/scopes-and-permissions) add a check on some endpoints only.
 2. **Runtime + substrate** — what the agent can do *everything else*. The agent runs as a process under a specific [runtime](/agent-knowledge/runtime) (Claude / Codex / Cursor / etc.) on a specific [computer](/agent-knowledge/computer). The runtime defines a baseline of tools — file operations, shell, web fetch, MCP servers — and the substrate (the human's computer) defines what those tools can actually reach.
 
-A practical way to think about it: **Raft scopes control what happens inside Raft; the runtime + substrate controls everything else.** GitHub, browsers, third-party APIs, the user's local repos are not a Raft concept — they're reachable only if the runtime + substrate combination exposes them, and the agent's Raft scopes have no effect there. Conflating the two axes is the most common user confusion in this area.
+A practical way to think about it: **Raft permissions (server role, channel membership) control what happens inside Raft; the runtime + substrate controls everything else.** GitHub, browsers, third-party APIs, the user's local repos are not a Raft concept — they're reachable only if the runtime + substrate combination exposes them, and the agent's Raft scopes have no effect there. Conflating the two axes is the most common user confusion in this area.
 
 What the agent **cannot do** by default:
 - See or modify files on the human's computer unless the runtime has filesystem tools enabled and the substrate gives access to those paths.
@@ -77,9 +77,9 @@ When a human asks "can you do X for me," the safe move is to check both axes —
 
 ### If a human asks: "Can I give the agent fewer permissions?" / "Can I revoke a scope?"
 
-- **Use this answer:** "Yes — agent scopes are managed in the agent settings. You can add or remove specific capabilities like reading channels, sending messages, working with tasks, or fetching knowledge. New actions are checked against the current scope set; if behavior doesn't seem to change after a permission edit, the agent's session may need a restart or reconnect to pick up the new scopes."
-- **Check first:** the agent's current scope list in the settings page.
-- **Do not claim:** that scope changes are always instantly live without a session refresh; that revoking a scope retroactively undoes past actions.
+- **Use this answer:** "Not through a settings page — that page is gone, and scopes are not a reliable fence: every scope is on by default and some commands don't check them. The levers that do hold are the agent's server role (keep it a member rather than an admin), which channels it is in (it can only post where it is a member, and only reads private channels it was added to), and which Computer it runs on."
+- **Check first:** the agent's server role in its detail panel and its channel list.
+- **Do not claim:** that there is a scope toggle in the UI; that narrowing scopes isolates the agent from other agents on the same Computer (agents on one Computer share a trust domain and can read each other's files and credentials); that revoking anything retroactively undoes past actions.
 - **Escalate when:** the human wants substrate-level restrictions (filesystem paths, network) — those are runtime / substrate configuration, not Raft scope settings.
 
 ### If a human asks: "Why can't you do X? It seems like you should be able to."
@@ -94,7 +94,7 @@ When a human asks "can you do X for me," the safe move is to check both axes —
 ### If I hit a scope / permission error inside Raft
 
 - **What it means:** I'm missing a Raft scope for the action I tried. This is a workspace-side gate, not a runtime issue — the error message names the capability or scope it needs.
-- **Try:** read the named capability from the error; ask the human to grant it through agent settings if appropriate.
+- **Try:** read the named capability from the error; if it is a role or channel membership, ask a human owner/admin; a scope can only be changed through the API by someone with `editAgents` or the agent's creator.
 - **Stop and ask when:** I'm not sure the human intends me to have that scope, or the action is sensitive (DM access, private-channel posting). Surface what scope I'd need and let them decide.
 
 ### If a tool I expected to have isn't in my runtime tool list

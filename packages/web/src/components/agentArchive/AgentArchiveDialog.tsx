@@ -45,7 +45,7 @@ export function AgentArchiveDialog({ agent, onClose }: { agent: Agent; onClose: 
       maxWidthClass="max-w-md"
       plainMessage
       message={(
-        <div className="space-y-3" data-testid="agent-archive-dialog">
+        <div className="stack-y-3" data-testid="agent-archive-dialog">
           <p>{formatMessage({ id: "agent.archive.description" })}</p>
           {hasComputerWorkspace && (
             <RadioGroup
@@ -84,7 +84,7 @@ export function AgentArchiveDialog({ agent, onClose }: { agent: Agent; onClose: 
         </div>
       )}
       chromeLocale="active"
-      confirmLabel={formatMessage({ id: "agent.detail.deleteAgent" })}
+      confirmLabel={formatMessage({ id: "agent.archive.confirm" })}
       loadingLabel={formatMessage({ id: "agent.detail.deleting" })}
       confirmIcon={<Archive size={14} />}
       confirmVariant={choice === "delete" ? "danger" : "warning"}

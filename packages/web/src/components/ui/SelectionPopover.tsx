@@ -2,15 +2,8 @@ import { useCallback, useRef } from "react";
 import type { ChangeEvent, KeyboardEvent, ReactNode, RefObject } from "react";
 import { Check, Search } from "lucide-react";
 import { useIntl } from "react-intl";
-import { PopoverContent } from "@botiverse/raft-ui";
+import { PopoverContent, ScrollArea, TextLink } from "@botiverse/raft-ui";
 import { dismissLayerProps } from "./dismissLayer";
-
-/** Raft Design System › Menu / Select popup (`rf-menu`): the popover layer,
- *  the container radius, a seam edge plus the float shadow — raft-ui's
- *  PopoverContent draws it for the positioned popover; a caller that places
- *  the bare panel itself (SelectionPopoverPanel) adds it. */
-export const SELECTION_POPOVER_SURFACE =
-  "rounded-container bg-layer-popover text-foreground shadow-float ring-1 ring-line-seam";
 
 export interface SelectionPopoverOption {
   key: string;
@@ -59,6 +52,8 @@ type SelectionPopoverProps = SelectionPopoverPanelProps & {
   /** Which edge of the trigger it lines up with (it still shifts to stay on
    *  screen). */
   align?: "start" | "end";
+  /** Which side of the trigger it opens on (above a bar at the bottom of the screen: `top`). */
+  side?: "top" | "bottom";
   /** "trigger": exactly as wide as the trigger (a field-style picker). */
   width?: "content" | "trigger";
 };
@@ -66,7 +61,8 @@ type SelectionPopoverProps = SelectionPopoverPanelProps & {
 /**
  * Shared option row for selection popovers.
  *
- * Every row is the same height whatever it holds: a fixed `h-9`, and a
+ * Every row is the same height whatever it holds: raft-ui's option height
+ * (36 by touch, 34 with a mouse, the control height), and a
  * `size-5` leading slot the caller can reserve so label-only rows line up with
  * avatar rows. Search channel rows pass a real leading icon instead; Tasks
  * channel rows stay label-only to match the Tasks list.
@@ -103,7 +99,7 @@ function SelectionPopoverOptionRow({
       type="button"
       disabled={disabled}
       onClick={onClick}
-      className={`flex h-9 w-full items-center justify-between gap-2 overflow-hidden rounded-control px-2.5 text-left text-callout outline-none ${rowTone}`}
+      className={`flex h-(--option-height) w-full items-center justify-between gap-2 overflow-hidden rounded-chip px-2.5 text-left text-callout outline-none ${rowTone}`}
     >
       <span className="flex min-w-0 items-center gap-2">
         {(reserveLeadingSlot || leadingContent) && (
@@ -133,6 +129,7 @@ function SelectionPopoverOptionRow({
  */
 export default function SelectionPopover({
   align = "start",
+  side = "bottom",
   width = "content",
   className = "",
   ...panelProps
@@ -140,6 +137,7 @@ export default function SelectionPopover({
   const searchRef = useRef<HTMLInputElement | null>(null);
   return (
     <PopoverContent
+      side={side}
       align={align}
       sideOffset={8}
       collisionPadding={8}
@@ -153,8 +151,9 @@ export default function SelectionPopover({
 }
 
 /**
- * The bare panel, for a caller that already places it (its own portal and
- * measured position). It brings no surface: pass SELECTION_POPOVER_SURFACE.
+ * The bare panel, for a caller that renders its own raft-ui `PopoverContent`
+ * (InlineBadgeEditor, which swaps it for a later step in the same popover).
+ * The PopoverContent draws the surface; this brings none.
  */
 export function SelectionPopoverPanel({ className = "", ...panelProps }: SelectionPopoverPanelProps) {
   return (
@@ -184,7 +183,9 @@ function SelectionPopoverSections(props: SelectionPopoverPanelProps & {
     onSearchChange?.(event.target.value);
   }, [onSearchChange]);
   const handleInputKeyDown = useCallback((event: KeyboardEvent<HTMLInputElement>) => {
-    event.stopPropagation();
+    // Typing stays in the box (no page shortcuts); Esc goes on to the
+    // popover, which closes on it.
+    if (event.key !== "Escape") event.stopPropagation();
     onInputKeyDown?.(event, options);
   }, [onInputKeyDown, options]);
 
@@ -196,20 +197,19 @@ function SelectionPopoverSections(props: SelectionPopoverPanelProps & {
             {title}
           </span>
           {showClear && onClear && (
-            <button
-              type="button"
+            <TextLink
               onClick={onClear}
-              className="rounded-[2px] text-caption font-semibold text-foreground underline decoration-[1.5px] underline-offset-[3px] outline-none focus-visible:shadow-focus"
+              className="text-caption"
             >
               {formatMessage({ id: "ui.selectionPopover.clear" })}
-            </button>
+            </TextLink>
           )}
         </div>
       )}
       {props.searchable && (
         // DS menu search row: flush with the menu's edge, a hairline under it,
         // and the focus ring drawn inside the edge.
-        <label className="flex h-10 shrink-0 items-center gap-2 border-b border-line-hairline px-3 text-foreground-hint focus-within:shadow-[inset_0_0_0_2px_var(--foreground)]">
+        <label className="flex h-10 md:pointer-fine:h-control shrink-0 items-center gap-2 border-b border-line-hairline px-3 text-foreground-hint keyboard:has-focus-visible:shadow-[inset_0_0_0_2px_var(--foreground)]">
           <Search size={16} className="shrink-0" aria-hidden="true" />
           <input
             ref={searchRef}
@@ -224,7 +224,7 @@ function SelectionPopoverSections(props: SelectionPopoverPanelProps & {
           />
         </label>
       )}
-      <div className="max-h-64 min-h-0 overflow-y-auto p-1.5">
+      <ScrollArea tabIndex={-1} className="max-h-64 min-h-0" contentClassName="p-1">
         {options.length === 0 ? (
           <div className="px-2.5 py-2 text-callout text-foreground-hint">
             {emptyLabelText}
@@ -234,7 +234,7 @@ function SelectionPopoverSections(props: SelectionPopoverPanelProps & {
             <SelectionPopoverOptionRow key={key} {...option} />
           ))
         )}
-      </div>
+      </ScrollArea>
     </>
   );
 }

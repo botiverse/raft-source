@@ -3,6 +3,7 @@ import type { ServerId } from "@botiverse/raft-shared";
 import { getDb } from "../db/index";
 import { attachmentObjects, attachments, channels, messages } from "../db/schema";
 import * as channelService from "./channelService";
+import { canView } from "./visibilityService";
 
 export type AttachmentAuthorityPrincipal =
   | { type: "user"; id: string }
@@ -62,9 +63,9 @@ async function resolveLocalHostChannel(
 
 /**
  * Resolve one public projection ID to the complete message-owned authority
- * context from RFC 049. This is deliberately not wired into production reads
- * during the additive phase: legacy readers stay authoritative until the
- * dual-write/backfill parity gates close.
+ * context from RFC 049. The attachment routes (members and agents) and the
+ * comment service read through it; a projection without an object never
+ * resolves (attachmentObjectlessProjection.ts).
  */
 export async function resolveBoundAttachmentAuthorityContext(input: {
   projectionId: string;
@@ -120,24 +121,15 @@ export async function canReadAttachmentAuthorityContext(
 ): Promise<boolean> {
   if (context.localHostChannel.serverId !== context.requestServerId) return false;
 
-  switch (context.principal.type) {
-    case "user":
-      return channelService.canUserAccessChannel(
-        context.localHostChannel.id,
-        context.principal.id,
-        context.requestServerId,
-      );
-    case "agent":
-      return channelService.canAgentAccessChannel(
-        context.localHostChannel.id,
-        context.principal.id,
-      );
-    case "machine":
-      // Machine authentication is already server-scoped by middleware. A
-      // machine never acquires human/agent channel membership; it may consume
-      // only a host-message face resolved into its authenticated server.
-      return true;
-  }
+  // Machine credentials no longer read attachments (requireFlexAuth rejects
+  // them). Deny here too, so no path can bring back server-wide reads.
+  if (context.principal.type === "machine") return false;
+  // An attachment is seen exactly when its local host conversation is.
+  const [visible] = await canView(
+    { type: context.principal.type, id: context.principal.id, serverId: context.requestServerId },
+    [{ kind: "conversation", channelId: context.localHostChannel.id }],
+  );
+  return visible === true;
 }
 
 export async function resolveReadableAttachmentAuthorityContext(input: {

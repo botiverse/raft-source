@@ -153,6 +153,18 @@ export function createAgentApiMessageClient(options: AgentApiMessageClientOption
     input: AgentApiSendBody | AgentApiSendV2Body,
     version: "v1" | "v2",
   ): Promise<AgentApiMessageClientResult> => {
+    // RFC 082: v1 send has no card, and its schema would drop one silently,
+    // posting plain text the caller takes for a card (Sage, #12683).
+    if (version === "v1" && typeof input === "object" && input !== null && "card" in input) {
+      return {
+        ok: false,
+        error: {
+          kind: "validation",
+          reason: "request_contract_mismatch",
+          message: "A card message needs the v2 send: use client.messages.sendV2({ target, card, content? }) or raft.messages.send({ target, card }); the v1 send has no card",
+        },
+      };
+    }
     const parsedBody = version === "v2"
       ? agentApiSendV2BodySchema.safeParse(input)
       : agentApiSendBodySchema.safeParse(input);

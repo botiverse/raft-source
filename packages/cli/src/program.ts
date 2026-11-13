@@ -24,7 +24,7 @@
 //   raft thread unfollow --target "#name:shortid"
 //   raft manual get <topic>
 //   raft manual search <keywords>
-//   raft inbox check
+//   raft inbox check/read/dismiss
 //   raft message send/check/read/search/resolve/react
 //   raft attachment upload/view
 //   raft task list/create/claim/unclaim/assign/unassign/update/amend/history/convert/delete
@@ -32,7 +32,8 @@
 //   raft profile show/update
 //   raft integration list/marketplace/login/env/invoke/app prepare|rotate-secret|update|transfer-owner
 //   raft reminder schedule/list/cancel/snooze/update/log
-//   raft action prepare
+//   raft action prepare/withdraw
+//   raft migration retry
 
 import { Command, CommanderError } from "commander";
 
@@ -45,8 +46,10 @@ import { registerWhoamiCommand } from "./commands/auth/whoami";
 import { registerVersionCommand } from "./commands/version";
 import { registerAgentListCommand } from "./commands/agent/list";
 import { registerAgentLoginCommand } from "./commands/agent/login";
+import { registerAgentLogoutCommand } from "./commands/agent/logout";
 import { registerAgentBridgeCommand } from "./commands/agent/bridge";
 import { registerActionPrepareCommand } from "./commands/action/prepare";
+import { registerActionWithdrawCommand } from "./commands/action/withdraw";
 import { registerChannelMembersCommand } from "./commands/channel/members";
 import { registerChannelInfoCommand } from "./commands/channel/info";
 import { registerChannelCreateCommand } from "./commands/channel/create";
@@ -62,18 +65,30 @@ import { registerUserInfoCommand } from "./commands/user/info";
 import { registerKnowledgeGetCommand } from "./commands/knowledge/get";
 import { registerKnowledgeSearchCommand } from "./commands/knowledge/search";
 import { registerInboxCheckCommand } from "./commands/inbox/check";
+import { registerInboxDismissCommand } from "./commands/inbox/dismiss";
+import { registerInboxReadCommand } from "./commands/inbox/read";
 import { registerChannelLeaveCommand } from "./commands/channel/leave";
 import { registerThreadListCommand } from "./commands/thread/list";
+import { registerProcStartCommand } from "./commands/proc/start";
+import { registerProcListCommand } from "./commands/proc/list";
+import { registerProcLogsCommand } from "./commands/proc/logs";
+import { registerProcStopCommand } from "./commands/proc/stop";
+import { registerThreadFollowCommand } from "./commands/thread/follow";
 import { registerThreadUnfollowCommand } from "./commands/thread/unfollow";
+import { registerContextSearchCommand } from "./commands/context/search";
+import { registerContextReadCommand } from "./commands/context/read";
 import { registerSendCommand } from "./commands/message/send";
 import { registerCheckCommand } from "./commands/message/check";
 import { registerReadCommand } from "./commands/message/read";
 import { registerSearchCommand } from "./commands/message/search";
 import { registerResolveCommand } from "./commands/message/resolve";
 import { registerReactCommand } from "./commands/message/react";
+import { registerUpdateCardCommand } from "./commands/message/updateCard";
 import { registerAttachmentUploadCommand } from "./commands/attachment/upload";
 import { registerAttachmentViewCommand } from "./commands/attachment/view";
 import { registerAttachmentCommentsCommand } from "./commands/attachment/comments";
+import { registerMigrationRetryCommand } from "./commands/migration/retry";
+import { registerArtifactsCommands } from "./apps/artifacts";
 import { registerTaskListCommand } from "./commands/task/list";
 import { registerTaskCreateCommand } from "./commands/task/create";
 import { registerTaskClaimCommand } from "./commands/task/claim";
@@ -87,6 +102,10 @@ import { registerTaskConvertCommand } from "./commands/task/convert";
 import { registerTaskAmendCommand } from "./commands/task/amend";
 import { registerTaskHistoryCommand } from "./commands/task/history";
 import { registerTaskShowCommand } from "./commands/task/show";
+import { registerTaskViewCommand } from "./commands/task/view";
+import { registerTaskReplyCommand } from "./commands/task/reply";
+import { registerTaskReadCommand } from "./commands/task/read";
+import { registerTaskFollowCommands } from "./commands/task/follow";
 import { registerMentionCommands } from "./commands/mention/index";
 import { registerProfileShowCommand } from "./commands/profile/show";
 import { registerProfileUpdateCommand } from "./commands/profile/update";
@@ -103,7 +122,9 @@ import { registerReminderCancelCommand } from "./commands/reminder/cancel";
 import { registerReminderSnoozeCommand } from "./commands/reminder/snooze";
 import { registerReminderUpdateCommand } from "./commands/reminder/update";
 import { registerReminderLogCommand } from "./commands/reminder/log";
+import { registerReminderTriggerCommand } from "./commands/reminder/trigger";
 import { registerAppConfigCommand } from "./commands/app/config";
+import { registerContinueCommand } from "./commands/continuation/continue";
 
 export interface RaftProgramOptions extends CommandRuntimeOptions {
   /** Fixed help wrap width (tests); default: Commander's terminal detection. */
@@ -138,7 +159,7 @@ function commandHelpTarget(program: Command, userArgs: string[]): string {
   let cursor: Command = program;
   for (const arg of userArgs) {
     if (arg.startsWith("-")) break;
-    const child = cursor.commands.find((candidate) => candidate.name() === arg || candidate.alias() === arg);
+    const child = cursor.commands.find((candidate) => candidate.name() === arg || candidate.aliases().includes(arg));
     if (!child) break;
     path.push(child.name());
     cursor = child;
@@ -150,7 +171,7 @@ function visibleSubcommandList(program: Command, userArgs: string[]): string {
   let cursor: Command = program;
   for (const arg of userArgs) {
     if (arg.startsWith("-")) break;
-    const child = cursor.commands.find((candidate) => candidate.name() === arg || candidate.alias() === arg);
+    const child = cursor.commands.find((candidate) => candidate.name() === arg || candidate.aliases().includes(arg));
     if (!child) break;
     cursor = child;
   }
@@ -273,6 +294,7 @@ export function buildRaftProgram(runtime: RaftProgramOptions = {}): Command {
     .command("agent")
     .description("External agent onboarding (device-code login → sk_agent_* mint → local profile credential)");
   registerAgentLoginCommand(agentCmd, runtimeOptions);
+  registerAgentLogoutCommand(agentCmd, runtimeOptions);
   registerAgentListCommand(agentCmd, runtimeOptions);
   registerAgentBridgeCommand(agentCmd, runtimeOptions);
 
@@ -292,6 +314,7 @@ export function buildRaftProgram(runtime: RaftProgramOptions = {}): Command {
 
   const threadCmd = program.command("thread").description("Thread attention operations");
   registerThreadListCommand(threadCmd, runtimeOptions);
+  registerThreadFollowCommand(threadCmd, runtimeOptions);
   registerThreadUnfollowCommand(threadCmd, runtimeOptions);
 
   const serverCmd = program.command("server").description("Server / workspace introspection");
@@ -319,8 +342,14 @@ export function buildRaftProgram(runtime: RaftProgramOptions = {}): Command {
   registerKnowledgeGetCommand(knowledgeCmd, runtimeOptions);
   registerKnowledgeSearchCommand(knowledgeCmd, runtimeOptions);
 
+  const contextCmd = program.command("context").description("Search and read the context behind a message: what the model was given when it wrote it");
+  registerContextSearchCommand(contextCmd, runtimeOptions);
+  registerContextReadCommand(contextCmd, runtimeOptions);
+
   const inboxCmd = program.command("inbox").description("Inbox target summary operations");
   registerInboxCheckCommand(inboxCmd, runtimeOptions);
+  registerInboxReadCommand(inboxCmd, runtimeOptions);
+  registerInboxDismissCommand(inboxCmd, runtimeOptions);
 
   const messageCmd = program.command("message").description("Message operations");
   registerSendCommand(messageCmd, runtimeOptions);
@@ -329,11 +358,14 @@ export function buildRaftProgram(runtime: RaftProgramOptions = {}): Command {
   registerSearchCommand(messageCmd, runtimeOptions);
   registerResolveCommand(messageCmd, runtimeOptions);
   registerReactCommand(messageCmd, runtimeOptions);
+  registerUpdateCardCommand(messageCmd, runtimeOptions);
 
   const attachmentCmd = program.command("attachment").description("Attachment operations");
   registerAttachmentUploadCommand(attachmentCmd, runtimeOptions);
   registerAttachmentViewCommand(attachmentCmd, runtimeOptions);
   registerAttachmentCommentsCommand(attachmentCmd, runtimeOptions);
+
+  registerArtifactsCommands(program, runtimeOptions);
 
   const taskCmd = program.command("task").description("Task board operations");
   registerTaskListCommand(taskCmd, runtimeOptions);
@@ -349,6 +381,10 @@ export function buildRaftProgram(runtime: RaftProgramOptions = {}): Command {
   registerTaskAmendCommand(taskCmd, runtimeOptions);
   registerTaskHistoryCommand(taskCmd, runtimeOptions);
   registerTaskShowCommand(taskCmd, runtimeOptions);
+  registerTaskViewCommand(taskCmd, runtimeOptions);
+  registerTaskReplyCommand(taskCmd, runtimeOptions);
+  registerTaskReadCommand(taskCmd, runtimeOptions);
+  registerTaskFollowCommands(taskCmd, runtimeOptions);
 
   const mentionCmd = program.command("mention").description("Sender-side mention action operations");
   registerMentionCommands(mentionCmd, runtimeOptions);
@@ -373,12 +409,26 @@ export function buildRaftProgram(runtime: RaftProgramOptions = {}): Command {
   registerReminderSnoozeCommand(reminderCmd, runtimeOptions);
   registerReminderUpdateCommand(reminderCmd, runtimeOptions);
   registerReminderLogCommand(reminderCmd, runtimeOptions);
+  registerReminderTriggerCommand(reminderCmd, runtimeOptions);
+
+  const migrationCmd = program.command("migration").description("Your own moves to another Computer");
+  registerMigrationRetryCommand(migrationCmd, runtimeOptions);
+
+  const procCmd = program.command("proc").description("Background jobs the Computer runs for this agent");
+  registerProcStartCommand(procCmd, runtimeOptions);
+  registerProcListCommand(procCmd, runtimeOptions);
+  registerProcLogsCommand(procCmd, runtimeOptions);
+  registerProcStopCommand(procCmd, runtimeOptions);
 
   const appCmd = program.command("app").description("Built-in RAP App operations");
   registerAppConfigCommand(appCmd, runtimeOptions);
 
   const actionCmd = program.command("action").description("Action card operations (B-mode quick-commit shortcuts)");
   registerActionPrepareCommand(actionCmd, runtimeOptions);
+  registerActionWithdrawCommand(actionCmd, runtimeOptions);
+
+  // Hidden: `cont <id> [choice]` (the daemon's wrapper) answers a command that paused.
+  registerContinueCommand(program, runtimeOptions);
 
   return program;
 }

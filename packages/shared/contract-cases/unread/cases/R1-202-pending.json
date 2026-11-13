@@ -1,0 +1,100 @@
+{
+  "formatVersion": 1,
+  "id": "R1-202-pending",
+  "rule": "R1",
+  "title": "A 202 answer is pending: no toast, the hold stays, the realtime read-state event decides",
+  "why": "202 means the write was admitted but its result is not known yet. Saying 'nothing to mark' or dropping the hold would be a guess; the read-state event that follows carries the result. Decided by Tenny (#proj-mobile:#70).",
+  "status": "agreed",
+  "sources": {
+    "server": [
+      "packages/shared/src/readStateContract.ts (readMutationPendingResponseSchema)",
+      "packages/server/src/routes/channels.ts"
+    ],
+    "web": [
+      "packages/web/src/store/inboxStore.ts (markScopeUnread)"
+    ],
+    "app": [
+      "compose/shared/src/commonMain/kotlin/build/raft/app/SharedThreadStore.kt"
+    ]
+  },
+  "knownGaps": [
+    {
+      "client": "web",
+      "reason": "Web reads a 202 body as an answer with no count and no mark, so it resolves `nothing` instead of `pending`: on the Activity row that shows the nothing toast. On this thread-menu path the toast and hold happen to match, but the outcome does not.",
+      "followUp": "#proj-mobile:#70: web consumes the outcome with 202 as pending"
+    }
+  ],
+  "given": {
+    "conversation": {
+      "id": "thread-1",
+      "kind": "thread"
+    },
+    "openThread": "thread-1"
+  },
+  "steps": [
+    {
+      "act": "markUnread",
+      "surface": "threadMenu"
+    },
+    {
+      "act": "serverResponds",
+      "status": 202,
+      "body": {
+        "code": "READ_MUTATION_PENDING",
+        "status": "admitted",
+        "outcome": "unknown",
+        "mutationId": "00000000-0000-4000-8000-000000000001",
+        "authoritySeq": 12,
+        "frontierUrl": "/api/read-mutations/frontier?mutationId=00000000-0000-4000-8000-000000000001"
+      }
+    },
+    {
+      "act": "realtimeEvent",
+      "type": "read_state:updated",
+      "payload": {
+        "serverId": "server-1",
+        "scopeId": "thread-1",
+        "maxReadSeq": 40,
+        "readStateVersion": 8,
+        "markedUnread": true
+      }
+    }
+  ],
+  "checkpoints": [
+    {
+      "afterStep": 1,
+      "requests": [
+        {
+          "method": "POST",
+          "path": "/api/channels/thread-1/unread"
+        }
+      ],
+      "state": {
+        "holdActive": true
+      }
+    },
+    {
+      "afterStep": 2,
+      "state": {
+        "outcome": "pending",
+        "toast": null,
+        "holdActive": true
+      }
+    }
+  ],
+  "expect": {
+    "requests": [
+      {
+        "method": "POST",
+        "path": "/api/channels/thread-1/unread"
+      }
+    ],
+    "state": {
+      "unreadState": {
+        "kind": "dot"
+      },
+      "toast": null,
+      "holdActive": true
+    }
+  }
+}

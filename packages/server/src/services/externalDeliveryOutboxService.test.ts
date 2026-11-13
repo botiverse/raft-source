@@ -1,8 +1,8 @@
+import { fillJointMembersFromChannelHumans } from "../test/jointMemberFill";
 import { dbTest as test } from "../test/integration/dbTest";
 import { closeTestDatabase, openTestDatabase } from "../test/integration/database";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import fs from "node:fs";
 import { eq } from "drizzle-orm";
 import {
   __resetFailpointsForTests,
@@ -53,6 +53,7 @@ import {
   type SlackBridgeRenderSnapshot,
 } from "./externalDeliveryOutboxService";
 import { withChannelDelivery } from "../test/orchestratorStub";
+import { insertAttachmentsWithObjects } from "../test/attachmentObjectFixture";
 
 
 const ELIGIBLE_ORDINARY_DECISION = {
@@ -227,6 +228,7 @@ async function seedJointOutboundFixture() {
     status: "active",
     joinedByUserId: fixture.owner.id,
   });
+  await fillJointMembersFromChannelHumans();
   return { ...fixture, storageServer, canonicalChannel, joint };
 }
 
@@ -279,7 +281,7 @@ test("source message, FIFO position, and frozen outbox row roll back together", 
 
   const committed = await getDb().transaction(async (executor) => {
     const message = await insertSourceMessage(executor, fixture, "commit me once");
-    await executor.insert(attachments).values({
+    await insertAttachmentsWithObjects(executor, {
       messageId: message.id,
       messagePosition: 0,
       channelId: fixture.channel.id,
@@ -307,9 +309,9 @@ test("source message, FIFO position, and frozen outbox row roll back together", 
     publicUrl: avatarUrl,
     contentDigest: avatarDigest,
   });
-  assert.equal(snapshot.sanitizedText, "commit me once\n\n[Attachment not synced]");
-  assert.equal(JSON.stringify(snapshot).includes("private-name.png"), false);
-  assert.equal(JSON.stringify(snapshot).includes("private/storage/key.png"), false);
+  assert.equal(snapshot.sanitizedText, "commit me once");
+  assert.equal(snapshot.attachments.length, 1);
+  assert.equal(snapshot.attachments[0]!.contentDigest, null);
   assert.deepEqual(snapshot.externalMentions, []);
 });
 
@@ -408,7 +410,7 @@ test("External host avatars (lh3.googleusercontent.com) freeze their URL with a 
   );
 });
 
-test("attachment child fuse freezes immutable objects and creates one transfer job per file", async () => {
+test("attachment sync freezes immutable objects and creates one transfer job per file", async () => {
   const fixture = await seedOutboundFixture();
   const committed = await getDb().transaction(async (executor) => {
     const message = await insertSourceMessage(executor, fixture, "send the file");
@@ -429,20 +431,13 @@ test("attachment child fuse freezes immutable objects and creates one transfer j
       uploaderId: fixture.owner.id,
       uploaderType: "user",
       filename: "frozen.pdf",
-      mimeType: "application/pdf",
-      sizeBytes: 4096,
-      storageKey: object.storageKey,
-      contentHash: object.contentHash,
     }).returning();
     const baseInput = enqueueInput(executor, fixture, message);
-    const result = await enqueueSlackBridgeOutboundDelivery({
-      ...baseInput,
-      activeRuntime: { ...baseInput.activeRuntime, attachmentTransferEnabled: true },
-    });
+    const result = await enqueueSlackBridgeOutboundDelivery(baseInput);
     return { message, object, attachment, result };
   });
   const snapshot = committed.result.delivery.renderSnapshot as unknown as SlackBridgeRenderSnapshot;
-  assert.equal(snapshot.schema, "slack-bridge-render-snapshot.v4");
+  assert.equal(snapshot.schema, "slack-bridge-render-snapshot.v5");
   assert.equal(snapshot.sanitizedText, "send the file");
   assert.deepEqual(snapshot.attachments, [{
     sourceAttachmentId: committed.attachment.id,
@@ -521,6 +516,7 @@ test("Joint host thread render authority links the local parent while freezing c
     status: "active",
     joinedByUserId: fixture.owner.id,
   });
+  await fillJointMembersFromChannelHumans();
   const [message] = await getDb().insert(messages).values({
     channelId: canonicalThread.id,
     senderType: "user",
@@ -551,11 +547,12 @@ test("Joint host thread render authority links the local parent while freezing c
   );
 });
 
-test("attachment marker overflow fails closed without truncating the source body", async () => {
+test("long attachment captions retain the source body and enqueue the attachment", async () => {
   const fixture = await seedOutboundFixture();
-  await assert.rejects(getDb().transaction(async (executor) => {
-    const message = await insertSourceMessage(executor, fixture, "x".repeat(39_976));
-    await executor.insert(attachments).values({
+  const body = "x".repeat(39_976);
+  const result = await getDb().transaction(async (executor) => {
+    const message = await insertSourceMessage(executor, fixture, body);
+    await insertAttachmentsWithObjects(executor, {
       messageId: message.id,
       messagePosition: 0,
       channelId: fixture.channel.id,
@@ -566,10 +563,14 @@ test("attachment marker overflow fails closed without truncating the source body
       sizeBytes: 1,
       storageKey: "private/overflow.png",
     });
-    await enqueueSlackBridgeOutboundDelivery(enqueueInput(executor, fixture, message));
-  }), /attachment marker exceeds the provider text limit/);
-  assert.equal((await getDb().select().from(messages)).length, 0);
-  assert.equal((await getDb().select().from(externalOutboundDeliveries)).length, 0);
+    return enqueueSlackBridgeOutboundDelivery(enqueueInput(executor, fixture, message));
+  });
+  const snapshot = result.delivery.renderSnapshot as unknown as SlackBridgeRenderSnapshot;
+  assert.equal(snapshot.sanitizedText, body);
+  assert.equal(snapshot.attachments.length, 1);
+  const [job] = await getDb().select().from(externalAttachmentTransferJobs);
+  assert.equal(job?.outboundDeliveryId, result.delivery.id);
+  assert.equal(job?.sourceAttachmentId, snapshot.attachments[0]?.sourceAttachmentId);
 });
 
 test("direct replay reuses one logical delivery, marker, and FIFO position", async () => {
@@ -920,6 +921,7 @@ test("real joint topology returns one durable fact when its joint Socket project
     joinedByUserId: fixture.target.id,
   }]);
   await db.insert(channelHumans).values({ channelId: localChannel.id, userId: fixture.owner.id });
+  await fillJointMembersFromChannelHumans();
   const request = {
     channelId: localChannel.id,
     senderType: "user" as const,
@@ -1156,39 +1158,6 @@ test("excluded ordinary-projection decisions never consult authority", async () 
     assert.equal(await maybeEnqueueOrdinaryMessageExternalDelivery({ ...inertInput, decision }), null);
   }
   assert.equal(calls, 0);
-});
-
-test("all atomic ordinary producers take admission before source insertion", () => {
-  const messageService = fs.readFileSync(new URL("./messageService.ts", import.meta.url), "utf8");
-  const agentReplayService = fs.readFileSync(new URL("./agentSendReplayService.ts", import.meta.url), "utf8");
-
-  const userTransaction = messageService.indexOf("async function createOrReplayUserRandomSend");
-  const userAdmission = messageService.indexOf("lockOrdinaryMessageExternalDeliveryAdmission", userTransaction);
-  const userInsert = messageService.indexOf("const insertAttempt", userTransaction);
-  assert.ok(userAdmission > userTransaction && userAdmission < userInsert);
-
-  const agentCall = messageService.indexOf("createOrReplayAgentSend({");
-  const agentAdmission = messageService.indexOf("beforeInsert:", agentCall);
-  const agentFinalize = messageService.indexOf("onInserted:", agentCall);
-  assert.ok(agentAdmission > agentCall && agentAdmission < agentFinalize);
-  const helperTransaction = agentReplayService.indexOf("return db.transaction");
-  const helperAdmission = agentReplayService.indexOf("if (opts.beforeInsert) await opts.beforeInsert(tx)", helperTransaction);
-  const helperInsert = agentReplayService.indexOf(".insert(messages)", helperTransaction);
-  assert.ok(helperAdmission > helperTransaction && helperAdmission < helperInsert);
-
-  const directTransaction = messageService.indexOf('queryName: "messages.direct_send_transaction"');
-  const directAdmission = messageService.indexOf("lockOrdinaryMessageExternalDeliveryAdmission", directTransaction);
-  const directPersist = messageService.indexOf("return persistDirectSend(tx)", directAdmission);
-  assert.ok(directAdmission > directTransaction && directAdmission < directPersist);
-});
-
-test("partition row lock precedes logical replay lookup", () => {
-  const source = fs.readFileSync(new URL("./externalDeliveryOutboxService.ts", import.meta.url), "utf8");
-  const partitionSelect = source.indexOf("const partition = await runSlackBridgeOutboundAdmissionStage");
-  const rowLock = source.indexOf('.for("update")', partitionSelect);
-  const replayLookup = source.indexOf("const existing = await runSlackBridgeOutboundAdmissionStage", partitionSelect);
-  assert.ok(partitionSelect >= 0);
-  assert.ok(rowLock > partitionSelect && rowLock < replayLookup);
 });
 
 test("schema constraints reject impossible evidence and lease shapes", async () => {

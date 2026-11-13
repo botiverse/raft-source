@@ -24,6 +24,8 @@
  *     get patched back into the preview and duplicate.
  */
 
+import { isOlderCardRevision } from "./messageCardRevision";
+
 export interface ThreadReplyPreview {
   messageId: string;
   seq: number;
@@ -35,6 +37,10 @@ export interface ThreadReplyPreview {
   senderDisplayName?: string;
   senderAvatarUrl: string | null;
   createdAt: string;
+  /** Content revision; optional for snapshots from older servers. */
+  updatedAt?: string;
+  /** RFC 082: the card revision this preview was taken from, once a card update reached it. */
+  cardRevision?: number;
 }
 
 export interface ThreadRepliesSnapshotOptions {
@@ -171,18 +177,9 @@ export function applyThreadReplyFrame(
   // now on the count field: the seq gate orders the WINDOW, and nothing was ordering
   // the COUNT. Take the max — add-only, so a stale frame cannot regress it.
   //
-  // Add-only is SOUND here, not a compromise: v1 is create-only because message
-  // deletion does not exist server-side (no deletedAt/isDeleted/revision column on
-  // `messages`, no delete route, no `message:deleted` event, no delete affordance —
-  // verified on origin/staging). Deletion and edit are a FORWARD contract in RFC 043
-  // §B.10, not code here: a reducer branch for an event nobody can emit is
-  // unexercisable, and its tests would pin a guessed server contract rather than a
-  // real one. Two things §B.10 records for whoever builds deletion:
-  //   - it must match by messageId BEFORE the seam above — a delete frame carries its
-  //     own reply's seq, which is <= the seam, so the seam (an INSERT-dedupe gate)
-  //     would silently swallow every deletion of a reply that is actually on screen;
-  //   - delete is monotone (an absorbing state, so ordering is free and it costs no
-  //     server field); an edit is true last-writer-wins and needs `messages.revision`.
+  // Arrival frames remain add-only. Body edits take the separate identity-
+  // matched path below, ordered by the server's monotonic updatedAt, without
+  // advancing this arrival seam or changing reply counts.
   const windowUnchanged = replies.length === scope.replies.length
     && replies.every((next, i) => next.messageId === scope.replies[i].messageId);
   if (windowUnchanged && nextReplyCount === scope.replyCount) return scope;
@@ -207,4 +204,42 @@ function sortBySeqAscending(replies: ThreadReplyPreview[]): ThreadReplyPreview[]
 
 function isConversationReply(reply: ThreadReplyPreview): boolean {
   return reply.senderType !== "system";
+}
+
+
+export function threadReplyContentVersion(reply: Pick<ThreadReplyPreview, "updatedAt" | "createdAt">): number {
+  const version = Date.parse(reply.updatedAt ?? reply.createdAt);
+  return Number.isFinite(version) ? version : 0;
+}
+
+/** Edit an already retained reply; never insert, reorder or change counts. */
+export function applyThreadReplyUpdate(
+  scope: ThreadRepliesScope,
+  update: { messageId: string; seq: number; preview: string; updatedAt: string; cardRevision?: number },
+): ThreadRepliesScope {
+  const version = Date.parse(update.updatedAt);
+  if (!Number.isFinite(version)) return scope;
+  const index = scope.replies.findIndex((reply) => reply.messageId === update.messageId && reply.seq === update.seq);
+  const existing = scope.replies[index];
+  // RFC 082: an older card revision never replaces a newer one, whatever its updatedAt (the conversation's rows' rule).
+  if (!existing || isOlderCardRevision(existing.cardRevision, update.cardRevision)) return scope;
+  if (version <= threadReplyContentVersion(existing)) return scope;
+  const replies = [...scope.replies];
+  replies[index] = { ...existing, preview: update.preview, updatedAt: update.updatedAt,
+    ...(update.cardRevision === undefined ? {} : { cardRevision: update.cardRevision }) };
+  return { ...scope, replies };
+}
+
+/** A delayed HTTP snapshot must not roll back an accepted socket edit. */
+export function retainNewerThreadReplyContent(next: ThreadRepliesScope, current: ThreadRepliesScope | null): ThreadRepliesScope {
+  if (!current) return next;
+  let changed = false;
+  const replies = next.replies.map((reply) => {
+    const existing = current.replies.find((old) => old.messageId === reply.messageId && old.seq === reply.seq);
+    if (!existing || threadReplyContentVersion(existing) <= threadReplyContentVersion(reply)) return reply;
+    changed = true;
+    return { ...reply, preview: existing.preview, updatedAt: existing.updatedAt,
+      ...(existing.cardRevision === undefined ? {} : { cardRevision: existing.cardRevision }) };
+  });
+  return changed ? { ...next, replies } : next;
 }

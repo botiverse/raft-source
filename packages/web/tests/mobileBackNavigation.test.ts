@@ -4,7 +4,6 @@ import {
   navigationStackFromEntries,
   nextNavigationDepth,
   nextNavigationEntries,
-  nextNavigationStack,
   resolveMobileBackAction,
   UNKNOWN_NAVIGATION_ENTRY,
 } from "../src/hooks/useAppNavigate";
@@ -91,20 +90,6 @@ test("fallback destination can differ from the current-server safety scope", () 
     ),
     { kind: "fallback", path: "/" },
   );
-});
-
-test("navigation stack tracks push, replace, and pop paths", () => {
-  let stack = nextNavigationStack([], "REPLACE", "/s/dev");
-  assert.deepEqual(stack, ["/s/dev"]);
-
-  stack = nextNavigationStack(stack, "PUSH", "/s/dev/search");
-  assert.deepEqual(stack, ["/s/dev", "/s/dev/search"]);
-
-  stack = nextNavigationStack(stack, "REPLACE", "/s/dev/search?q=hello");
-  assert.deepEqual(stack, ["/s/dev", "/s/dev/search?q=hello"]);
-
-  stack = nextNavigationStack(stack, "POP", "/s/dev");
-  assert.deepEqual(stack, ["/s/dev"]);
 });
 
 test("notification → thread → back → channel → back → chat tab root", () => {

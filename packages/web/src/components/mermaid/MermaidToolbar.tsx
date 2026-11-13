@@ -8,7 +8,7 @@ import {
   ZoomIn,
   ZoomOut,
 } from "lucide-react";
-import { useCallback, useMemo } from "react";
+import { useCallback } from "react";
 import type { MouseEvent } from "react";
 import { useIntl } from "react-intl";
 import {
@@ -25,7 +25,6 @@ import {
 import type { ImageZoomController } from "../ImageZoom";
 import { useBlobDownload } from "../../hooks/useBlobDownload";
 import { useCopyText } from "../../hooks/useCopyText";
-import { useLightboxPortalContainer } from "../ui/Lightbox";
 import Tooltip from "../ui/Tooltip";
 import {
   diagramFilename,
@@ -38,6 +37,7 @@ export type MermaidView = "diagram" | "code";
 const ZOOM_FACTOR = 1.2;
 const MERMAID_TOOLTIP_DELAY_MS = 600;
 const MERMAID_TOOLTIP_CONTENT_CLASS = "r-mermaid-tooltip";
+const TOOLTIP_CONTENT_PROPS = { className: MERMAID_TOOLTIP_CONTENT_CLASS };
 const MERMAID_MOBILE_TOUCH_TARGET_CLASS = "r-mermaid-toolbar__touch-target";
 
 // Toolbar buttons must not steal focus from the diagram on mouse press.
@@ -64,14 +64,7 @@ export function MermaidToolbar({
 }) {
   const { formatMessage } = useIntl();
   const downloadBlob = useBlobDownload();
-  const lightboxPortalContainer = useLightboxPortalContainer();
-  const tooltipContentProps = useMemo(() => ({
-    className: MERMAID_TOOLTIP_CONTENT_CLASS,
-    container: lightboxPortalContainer ?? undefined,
-  }), [lightboxPortalContainer]);
-  const floatingPortalProps = useMemo(() => (lightboxPortalContainer
-    ? { container: lightboxPortalContainer }
-    : undefined), [lightboxPortalContainer]);
+  // Inside a lightbox (an attachment preview), Base UI portals the tooltips and the menu into the lightbox's own.
 
   // The copy control is the same Button as the rest of the toolbar, so it
   // keeps the toolbar's register; the controller owns the clipboard write and
@@ -136,11 +129,11 @@ export function MermaidToolbar({
   const fullscreenControl = showDiagramActions ? (
     <Tooltip
       content={formatMessage({ id: "message.mermaid.fullscreen" })}
-      contentProps={tooltipContentProps}
+      contentProps={TOOLTIP_CONTENT_PROPS}
     >
       <Button
         variant="ghost"
-        size="icon-sm"
+        size="icon-md"
         className={MERMAID_MOBILE_TOUCH_TARGET_CLASS}
         disabled={!result}
         onClick={onFullscreen}
@@ -154,12 +147,12 @@ export function MermaidToolbar({
     <DropdownMenu>
       <Tooltip
         content={formatMessage({ id: "message.mermaid.downloadMenu" })}
-        contentProps={tooltipContentProps}
+        contentProps={TOOLTIP_CONTENT_PROPS}
       >
         <DropdownMenuTrigger render={(
           <Button
             variant="ghost"
-            size="icon-sm"
+            size="icon-md"
             className={MERMAID_MOBILE_TOUCH_TARGET_CLASS}
             aria-label={formatMessage({ id: "message.mermaid.downloadMenu" })}
           >
@@ -171,7 +164,6 @@ export function MermaidToolbar({
         side="bottom"
         align="end"
         sideOffset={4}
-        portalProps={floatingPortalProps}
         className="r-mermaid-download-menu"
       >
         <DropdownMenuItem className="r-mermaid-download-menu__item" onClick={saveSource}>
@@ -229,11 +221,11 @@ export function MermaidToolbar({
           >
             <Tooltip
               content={formatMessage({ id: "message.mermaid.zoomOut" })}
-              contentProps={tooltipContentProps}
+              contentProps={TOOLTIP_CONTENT_PROPS}
             >
               <Button
                 variant="ghost"
-                size="icon-sm"
+                size="icon-md"
                 disabled={!result}
                 onMouseDown={preventFocusSteal}
                 onClick={zoomOut}
@@ -244,11 +236,11 @@ export function MermaidToolbar({
             </Tooltip>
             <Tooltip
               content={formatMessage({ id: "message.mermaid.zoomIn" })}
-              contentProps={tooltipContentProps}
+              contentProps={TOOLTIP_CONTENT_PROPS}
             >
               <Button
                 variant="ghost"
-                size="icon-sm"
+                size="icon-md"
                 disabled={!result}
                 onMouseDown={preventFocusSteal}
                 onClick={zoomIn}
@@ -260,10 +252,10 @@ export function MermaidToolbar({
           </div>
         ) : null}
 
-        <Tooltip content={copyFeedbackLabel} contentProps={tooltipContentProps}>
+        <Tooltip content={copyFeedbackLabel} contentProps={TOOLTIP_CONTENT_PROPS}>
           <Button
             variant="ghost"
-            size="icon-sm"
+            size="icon-md"
             onMouseDown={preventFocusSteal}
             onClick={copySource}
             aria-label={copyFeedbackLabel}

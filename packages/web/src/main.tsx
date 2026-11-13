@@ -1,50 +1,40 @@
-import { Component, StrictMode, useEffect, useState } from "react";
-import type { ErrorInfo, ReactNode } from "react";
+import { StrictMode } from "react";
 import ReactDOM from "react-dom/client";
-import { currentTimeMs } from "@botiverse/raft-shared";
-import { installGlobalClientErrorReporters, reportClientError } from "./utils/clientErrorTrace";
-import { ThemeProvider } from "@botiverse/raft-ui";
-import { LocaleProvider } from "./i18n/LocaleProvider";
-import { IntlProviderWrapper } from "./i18n/IntlProviderWrapper";
+import { installGlobalClientErrorReporters } from "./utils/clientErrorTrace";
+import { preloadInitialLocaleMessages } from "./i18n/preloadLocaleMessages";
 import { AppProviders } from "./AppProviders";
+import { WindowControlsOverlayShell } from "./components/topbar/windowControlsOverlay";
 import App from "./App";
 import ServiceWorkerNavigationBridge from "./components/pwa/ServiceWorkerNavigationBridge";
 import "./index.css";
-import { isDynamicImportFailure } from "./utils/dynamicImportRecovery";
-import {
-  reportUpdateGateDecision,
-  reportUpdateGateDecisionBeforeUnload,
-} from "./utils/updateGateTrace";
-import type {
-  UpdateGateTriggerSource,
-} from "./utils/updateGateTrace";
 import { registerPushServiceWorker, supportsPushNotifications } from "./utils/pushNotifications";
 import { assertOfflineBundleStart } from "./utils/offlineBundleHost";
-import { cleanBrowserStateForRecovery } from "./utils/serviceWorkerRecovery";
 import { installExternalTranslationGuard } from "./utils/externalTranslationGuard";
-import RootErrorFallback from "./components/errors/RootErrorFallback";
-import {
-  AppRefreshRequiredScreen,
-  AppRefreshWarningBanner,
-} from "./components/errors/AppUpdateGate";
+import { RootErrorBoundary } from "./components/errors/RootErrorBoundary";
+import { installAppUpdateGate } from "./utils/appUpdateGate";
+import { installWebVersionCheck } from "./utils/webVersionCheck";
+import { NewWebVersionBanner } from "./components/errors/NewWebVersionBanner";
 import "./buildIdentity";
-import {
-  bootstrapDesktopHandshake,
-  renderDesktopHandshakeRecovery,
-} from "./desktopHandshake";
-import { installDesktopServerWindowBinding } from "./desktopServerWindow";
-import { installDesktopServerTitleBinding } from "./desktopServerTitle";
-import "./testHooks"; // attaches window.__SLOCK_E2E__ only when built with VITE_E2E=true
 import { trackVisualViewport } from "./utils/visualViewport";
+import { installViewSwitchTracking } from "./observability/viewSwitchSpan";
 import { captureLandingPage } from "./analytics/publicVisits";
-
-const desktopHandshake = bootstrapDesktopHandshake();
-installDesktopServerWindowBinding(desktopHandshake);
-installDesktopServerTitleBinding(desktopHandshake);
-void desktopHandshake.catch((error) => {
-  console.error("[Raft Desktop] handshake failed", error);
-  renderDesktopHandshakeRecovery();
-});
+import { captureMessageLinkLanding } from "./utils/messageLinkLanding";
+import { applyBootServerTheme } from "./theme/serverTheme";
+import { isBootTimingReported, markBootMilestone, startBootTiming } from "./boot/bootTiming";
+import { armFirstScreenGate, openFirstScreenGate } from "./boot/deferredUi";
+import { fetchDeferredUiAfterFirstScreen } from "./boot/deferredUiStart";
+import { openServerFromDevice } from "./boot/openServerFromDevice";
+import { preloadComputersRackForRoute } from "./features/computer/computersRackChunk";
+import { preloadLandingPageForLocation } from "./pages/landingPages";
+import { preloadThreadPanelForLocation } from "./features/thread/threadPanelChunk";
+import { openArtifactFromDevice, shortenArtifactAddress, startArtifactPermalink } from "./boot/openArtifactFromDevice";
+import { flushLocalTables, hydrateLocalTables } from "./store/localTables/persistence";
+import { localTableSession, startMeWriter } from "./store/localTables/storeWriters";
+import { startOfflineSession } from "./store/offlineSession";
+import { refreshExpiredTokenAtBoot, useAuthStore } from "./store/authStore";
+import { requestServerListEarly } from "./store/serverStore";
+import { bootRequestsServerListEarly, isAuthHandoffPage } from "./boot/serverFrame";
+import { followSignedInUser } from "./store/signedInUser";
 
 // Local dev tools must be installed before React's first render. Gate the render
 // on them rather than using top-level await: any TLA in the module graph makes
@@ -53,230 +43,97 @@ const localDevToolsReady = import.meta.env.DEV
   ? import("./devtools/localReactDevTools").then(({ installLocalReactDevTools }) => installLocalReactDevTools())
   : null;
 
+// The E2E hooks (window.__SLOCK_E2E__) exist only in the Playwright build
+// (VITE_E2E=true). Any other build drops this import, so neither the hooks nor
+// what they import (the screenshot export...) are in its first download; the
+// E2E build attaches them before the first render, as a static import did.
+// A failed load still renders (with the cause in the console), so an E2E
+// failure shows why rather than a blank page.
+const e2eHooksReady = import.meta.env.VITE_E2E === "true"
+  ? import("./testHooks").then(() => {}, (error: unknown) => {
+    console.error("[e2e] window.__SLOCK_E2E__ hooks failed to load; rendering without them", error);
+  })
+  : null;
+
+// The Artifacts fake dev build (VITE_ARTIFACTS_SOURCE=fake) installs the fake
+// before the first render, so boot reads (an Artifact opened from the device)
+// answer from it, not the API. Every other build drops this import.
+const fakeArtifactsReady = import.meta.env.DEV === true && import.meta.env.VITE_ARTIFACTS_SOURCE === "fake"
+  ? import("./apps/artifacts").then(({ installFakeArtifactSourceForDev }) => installFakeArtifactSourceForDev())
+    .catch((error: unknown) => { console.error("[artifacts] the fake data source failed to load", error); })
+  : null;
+
 if (supportsPushNotifications()) {
   void registerPushServiceWorker();
 }
 
+// The service worker's release messages and what a failed chunk does (utils/appUpdateGate).
+installAppUpdateGate();
+// A newer Web version published since this tab loaded: reload or offer Reload (utils/webVersionCheck).
+installWebVersionCheck();
+
 // Keyboard-only visualViewport pinning (#5888 / #725): trackVisualViewport
-// writes --vv-height only while a text field is focused and the visual
+// pins #root's height only while a text field is focused and the visual
 // viewport is substantially shorter than the layout viewport. Task #15
 // still owns the no-keyboard path (CSS 100dvh / fixed #root) — we do not
 // reintroduce always-on JS height pinning that left the PWA bottom gap.
 trackVisualViewport();
 installExternalTranslationGuard();
+// An older Artifact link (`/artifacts/pt_<uuid>`) shows as links are written now, before anything reads the address.
+shortenArtifactAddress(window.location, window.history);
 // Before the first render moves the URL: where a Public Server visit came from.
 captureLandingPage();
-
-const APP_REFRESH_REQUIRED_EVENT = "raft:app-refresh-required";
-let appRefreshRequired = false;
-let appRefreshTriggerSource: UpdateGateTriggerSource = "error_boundary";
-
-async function clearAssetCacheAndReload() {
-  reportUpdateGateDecision({
-    action: "recovery_started",
-    reason: "user_recover",
-    triggerSource: appRefreshTriggerSource,
-  });
-  let cleanupFailureCount = 0;
-  let serviceWorkerCount = 0;
-  let assetCacheCount = 0;
-  try {
-    // Does nothing when the page was loaded from an offline bundle; see cleanBrowserStateForRecovery.
-    const result = await cleanBrowserStateForRecovery();
-    serviceWorkerCount = result.serviceWorkerCount;
-    assetCacheCount = result.assetCacheCount;
-    cleanupFailureCount += result.failureCount;
-  } catch (error) {
-    cleanupFailureCount += 1;
-    console.warn("[RootErrorBoundary] app refresh cache cleanup failed", error);
-  } finally {
-    await reportUpdateGateDecisionBeforeUnload({
-      action: "recovery_finished",
-      reason: cleanupFailureCount === 0 ? "cleanup_completed" : "cleanup_partial_failure",
-      triggerSource: appRefreshTriggerSource,
-      cleanupFailureCount,
-      serviceWorkerCount,
-      assetCacheCount,
-    });
-    const url = new URL(window.location.href);
-    url.searchParams.set("raft_recover", String(currentTimeMs()));
-    window.location.replace(url.toString());
-  }
-}
-
-function requestAppRefreshPrompt(error: unknown, triggerSource: UpdateGateTriggerSource): boolean {
-  try {
-    if (typeof window !== "undefined" && isDynamicImportFailure(error)) {
-      reportUpdateGateDecision({
-        action: "detected",
-        reason: "dynamic_import_failure",
-        triggerSource,
-      });
-      appRefreshTriggerSource = triggerSource;
-      appRefreshRequired = true;
-      window.dispatchEvent(new CustomEvent(APP_REFRESH_REQUIRED_EVENT));
-      return true;
-    }
-  } catch (promptError) {
-    console.warn("[RootErrorBoundary] app refresh prompt guard failed", promptError);
-  }
-  return false;
-}
-
-if (typeof window !== "undefined") {
-  window.addEventListener("vite:preloadError", (event) => {
-    const payload = (event as Event & { payload?: unknown }).payload ?? event;
-    requestAppRefreshPrompt(payload, "vite_preload_error");
-    // Do not cancel this event. Vite treats a canceled preload error as
-    // handled and resolves the failed import to undefined. React.lazy then
-    // masks the useful chunk error with "reading 'default'" instead of
-    // letting the root boundary show the refresh recovery screen.
-  });
-}
-
-type RootErrorBoundaryState = {
-  error: Error | null;
-  info: ErrorInfo | null;
-  refreshRequired: boolean;
-  refreshWarningVisible: boolean;
-  refreshPromptDismissed: boolean;
-};
-
-class RootErrorBoundary extends Component<{ children: ReactNode }, RootErrorBoundaryState> {
-  state: RootErrorBoundaryState = {
-    error: null,
-    info: null,
-    refreshRequired: appRefreshRequired,
-    refreshWarningVisible: false,
-    refreshPromptDismissed: false,
-  };
-  componentDidMount() {
-    if (typeof window === "undefined") return;
-    window.addEventListener(APP_REFRESH_REQUIRED_EVENT, this.handleRefreshRequired);
-    if (this.state.refreshRequired) {
-      reportUpdateGateDecision({
-        action: "prompt_shown",
-        reason: "dynamic_import_failure",
-        triggerSource: appRefreshTriggerSource,
-      });
-    }
-  }
-  componentWillUnmount() {
-    if (typeof window === "undefined") return;
-    window.removeEventListener(APP_REFRESH_REQUIRED_EVENT, this.handleRefreshRequired);
-  }
-  handleRefreshRequired = () => {
-    if (this.state.refreshPromptDismissed) {
-      reportUpdateGateDecision({
-        action: "prompt_suppressed",
-        reason: "dismissed_prompt",
-        triggerSource: appRefreshTriggerSource,
-      });
-      this.setState({ error: null, info: null, refreshRequired: false, refreshWarningVisible: true });
-      return;
-    }
-    reportUpdateGateDecision({
-      action: "prompt_shown",
-      reason: "dynamic_import_failure",
-      triggerSource: appRefreshTriggerSource,
-    });
-    this.setState({ error: null, info: null, refreshRequired: true });
-  };
-  handleContinueAnyway = () => {
-    reportUpdateGateDecision({
-      action: "continued",
-      reason: "user_continue",
-      triggerSource: appRefreshTriggerSource,
-    });
-    this.setState({
-      error: null,
-      info: null,
-      refreshRequired: false,
-      refreshWarningVisible: true,
-      refreshPromptDismissed: true,
-    });
-  };
-  handleRecoverAndRefresh = () => {
-    void clearAssetCacheAndReload();
-  };
-  componentDidCatch(error: Error, info: ErrorInfo) {
-    if (isDynamicImportFailure(error) && this.state.refreshPromptDismissed) {
-      reportUpdateGateDecision({
-        action: "detected",
-        reason: "dynamic_import_failure",
-        triggerSource: "later_action",
-      });
-      reportUpdateGateDecision({
-        action: "prompt_shown",
-        reason: "dynamic_import_failure",
-        triggerSource: "later_action",
-      });
-      appRefreshTriggerSource = "later_action";
-      this.setState({ error: null, info: null, refreshRequired: true, refreshWarningVisible: false });
-      console.warn("[RootErrorBoundary] stale app build detected after later action");
-      return;
-    }
-    if (requestAppRefreshPrompt(error, "error_boundary")) {
-      this.setState({ error: null, info: null, refreshRequired: true, refreshWarningVisible: false });
-      console.warn("[RootErrorBoundary] stale app build detected; showing refresh prompt");
-      return;
-    }
-    this.setState({ error, info, refreshRequired: false, refreshWarningVisible: false });
-    console.error("[RootErrorBoundary]", error, info.componentStack);
-    reportClientError({ source: "error_boundary", error, componentStack: info.componentStack });
-  }
-  render() {
-    const root = typeof document !== "undefined" ? document.documentElement : null;
-    const mode = root?.classList.contains("dark") ? "dark" : "light";
-
-    // RootErrorBoundary sits above AppThemeProvider and LocaleProvider; wrap intl-backed
-    // and RUI fallbacks so formatMessage resolves the user's persisted display locale
-    // and RUI components resolve the active mode from DOM without touching app stores.
-    if (this.state.refreshRequired) {
-      return (
-        <ThemeProvider mode={mode} syncDom={false}>
-          <LocaleProvider>
-            <IntlProviderWrapper>
-              <AppRefreshRequiredScreen
-                onContinueAnyway={this.handleContinueAnyway}
-                onRecoverAndRefresh={this.handleRecoverAndRefresh}
-              />
-            </IntlProviderWrapper>
-          </LocaleProvider>
-        </ThemeProvider>
-      );
-    }
-
-    if (this.state.error) {
-      return (
-        <ThemeProvider mode={mode} syncDom={false}>
-          <LocaleProvider>
-            <IntlProviderWrapper>
-              <RootErrorFallback
-                error={this.state.error}
-                componentStack={this.state.info?.componentStack}
-              />
-            </IntlProviderWrapper>
-          </LocaleProvider>
-        </ThemeProvider>
-      );
-    }
-    return (
-      <>
-        {this.state.refreshWarningVisible ? (
-          <ThemeProvider mode={mode} syncDom={false}>
-            <LocaleProvider>
-              <IntlProviderWrapper>
-                <AppRefreshWarningBanner onRefresh={this.handleRecoverAndRefresh} />
-              </IntlProviderWrapper>
-            </LocaleProvider>
-          </ThemeProvider>
-        ) : null}
-        {this.props.children}
-      </>
-    );
-  }
-}
+captureMessageLinkLanding();
+// The server this page opens shows its own theme from the first frame.
+applyBootServerTheme(window.location.pathname);
+// slock.web.boot_timing: what this load opens; milestones report as they come.
+startBootTiming();
+// The messages store reads replies for whoever the auth store has signed in,
+// from before the first request (store/signedInUser.ts).
+followSignedInUser();
+// The local tables (store/localTables): the stored session's are put back from
+// the device, and the person's own row follows the auth store from now on.
+const localTablesHydrated = hydrateLocalTables(localTableSession());
+// A server link opens its server from them, before GET /servers answers.
+void openServerFromDevice(window.location, localTablesHydrated);
+// A page that opens on Computers (the native WebView's) starts the rack's code
+// now, alongside the first requests, not once the page has rendered.
+preloadComputersRackForRoute(window.location.pathname);
+// A link to a landing page (sign-in setup, an invite, a reset email...) starts that page's code now too.
+preloadLandingPageForLocation(window.location);
+// So does an address with a thread open: the thread panel is deferred (features/thread/threadPanelChunk.ts).
+preloadThreadPanelForLocation(window.location);
+// An expired access token held every early request until refresh, /auth/me
+// and the server list had run one after another (+1.7 s median for a third of
+// boots). Refresh now, then send them alongside /auth/me: a canonical Artifact
+// link's `open` too, and the list its page enters the server from.
+if (!isAuthHandoffPage(window.location)) void refreshExpiredTokenAtBoot().then((refreshed) => {
+  if (!refreshed) return;
+  void openServerFromDevice(window.location, localTablesHydrated);
+  const openedArtifact = openArtifactFromDevice(window.location);
+  if (bootRequestsServerListEarly(window.location) || openedArtifact) requestServerListEarly();
+});
+// A canonical Artifact link starts its page, and its one call (`open`) with the stored token, alongside /auth/me.
+startArtifactPermalink(window.location);
+startMeWriter(useAuthStore.subscribe);
+// Opened offline: once /auth/me fails unreachable and the tables are back, the
+// last session's workspace from them, marked Offline (store/offlineSession).
+startOfflineSession(useAuthStore.subscribe, useAuthStore.getState, localTablesHydrated);
+window.addEventListener("pagehide", flushLocalTables);
+// First-screen-optional requests wait for the content milestone; a load that
+// shows no conversation lets them go after this.
+const FIRST_SCREEN_GATE_FALLBACK_MS = 4_000;
+armFirstScreenGate();
+// Its content milestone: the first conversation's first page is in. Then the
+// UI kept out of the first download is fetched (boot/deferredUi); a load that
+// shows no conversation fetches it after a while anyway.
+// A load reported earlier (a landing that isn't a conversation reports at
+// its frame, a hidden tab when hidden) still opens the first-screen gate when
+// a conversation's first page comes in.
+fetchDeferredUiAfterFirstScreen(() => {
+  if (!isBootTimingReported()) markBootMilestone("content");
+});
+setTimeout(openFirstScreenGate, FIRST_SCREEN_GATE_FALLBACK_MS);
 
 // A host injection that is present but invalid is a failed offline start: show the
 // root error screen instead of running as an ordinary page. The host's own
@@ -286,39 +143,56 @@ function OfflineBundleStartGate() {
   return null;
 }
 
-// E2E-only probe for calibrating the root error boundary in prod-like preview.
-function E2ERenderErrorProbe() {
-  const [message, setMessage] = useState<string | null>(null);
-
-  useEffect(() => {
-    if (import.meta.env.VITE_E2E !== "true") return undefined;
-    const e2e = window.__SLOCK_E2E__;
-    if (!e2e) return undefined;
-    e2e.triggerRenderError = (nextMessage = "e2e-render-error") => setMessage(nextMessage);
-    return () => {
-      if (e2e.triggerRenderError) delete e2e.triggerRenderError;
-    };
-  }, []);
-
-  if (message) throw new Error(message);
-  return null;
-}
-
 installGlobalClientErrorReporters();
+// Back and Forward start a `web.view.switch` span (observability/viewSwitchSpan.ts).
+installViewSwitchTracking();
 
 const renderRoot = () => ReactDOM.createRoot(document.getElementById("root")!).render(
   <StrictMode>
     <RootErrorBoundary>
       <OfflineBundleStartGate />
-      {import.meta.env.VITE_E2E === "true" ? <E2ERenderErrorProbe /> : null}
       {/* Root composition lives in AppProviders — shared with the desktop
           shell, never re-listed here (see that file). */}
       <AppProviders insideRouter={<ServiceWorkerNavigationBridge />}>
-        <App />
+        {/* Installed as an app with the browser's window controls laid over
+            the page: the top bar is the window's title bar (no-op otherwise). */}
+        <WindowControlsOverlayShell>
+          <App />
+        </WindowControlsOverlayShell>
+        <NewWebVersionBanner />
       </AppProviders>
     </RootErrorBoundary>
   </StrictMode>
 );
 
-if (localDevToolsReady) void localDevToolsReady.then(renderRoot);
-else renderRoot();
+// index.html puts the app stylesheet after the boot frame so it does not hold
+// the first paint; wait for it here instead, so the first render is styled.
+const STYLESHEET_WAIT_MAX_MS = 3000;
+
+function stylesheetsReady(): Promise<void> | null {
+  const loading = Array.from(document.querySelectorAll<HTMLLinkElement>('link[rel="stylesheet"]'))
+    .filter((link) => !link.sheet);
+  if (loading.length === 0) return null;
+  // A sheet that already failed has no sheet and fires no more events: never wait
+  // longer than a few seconds, so a broken stylesheet costs styling, not the app.
+  return Promise.race([
+    Promise.all(loading.map((link) => new Promise<void>((resolve) => {
+      link.addEventListener("load", () => resolve(), { once: true });
+      link.addEventListener("error", () => resolve(), { once: true });
+    }))).then(() => undefined),
+    new Promise<void>((resolve) => {
+      setTimeout(resolve, STYLESHEET_WAIT_MAX_MS);
+    }),
+  ]);
+}
+
+const initialLocaleReady = preloadInitialLocaleMessages();
+const initialStylesReady = stylesheetsReady();
+const startRoot = () => (initialLocaleReady || initialStylesReady
+  ? void Promise.all([initialLocaleReady, initialStylesReady]).then(renderRoot)
+  : renderRoot());
+
+if (localDevToolsReady || e2eHooksReady || fakeArtifactsReady) {
+  void Promise.all([localDevToolsReady, e2eHooksReady, fakeArtifactsReady]).then(startRoot);
+}
+else startRoot();

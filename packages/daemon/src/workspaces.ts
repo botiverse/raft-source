@@ -1,9 +1,13 @@
 import { access, mkdir, readdir, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
+import { AGENT_STATE_DIR_NAME } from "./agentStateFiles";
 import { RUNTIME_OUTCOME_OUTBOX_DIR_NAME } from "./runtimeOutcomeOutbox";
 import path from "node:path";
 import type { WorkspaceDirectoryInfo } from "@botiverse/raft-shared";
 import { logger } from "./logger";
+
+/** The daemon's own directories beside the workspaces: never listed, read or deleted as one. */
+const DAEMON_STATE_DIR_NAMES: ReadonlySet<string> = new Set([RUNTIME_OUTCOME_OUTBOX_DIR_NAME, AGENT_STATE_DIR_NAME]);
 
 export interface AgentWorkspaceSeedFile {
   relativePath: string;
@@ -51,7 +55,9 @@ export function resolveWorkspaceDirectoryPath(dataDir: string, directoryName: st
   // ("." and ""), anything above it ("..", "../x"), and any nested path
   // ("nested/agent-1") in a single comparison -- workspace names are agent ids and
   // are always a single segment.
-  if (path.dirname(target) !== root) {
+  // Case-insensitive and without trailing dots or spaces: on macOS and Windows those name the same directory.
+  const name = path.basename(target).toLowerCase().replace(/[. ]+$/, "");
+  if (path.dirname(target) !== root || DAEMON_STATE_DIR_NAMES.has(name)) {
     return null;
   }
   return target;
@@ -149,8 +155,8 @@ export async function scanWorkspaceDirectories(dataDir: string): Promise<Workspa
 
   const results = await Promise.all(
     entries.map(async (entry): Promise<WorkspaceDirectoryInfo | null> => {
-      // RFC 071: the runtime-outcome outbox lives beside the workspaces; it is not one.
-      if (!entry.isDirectory() || entry.name === RUNTIME_OUTCOME_OUTBOX_DIR_NAME) {
+      // RFC 071's outbox and the agents' daemon state live beside the workspaces; they are not ones.
+      if (!entry.isDirectory() || DAEMON_STATE_DIR_NAMES.has(entry.name)) {
         return null;
       }
 

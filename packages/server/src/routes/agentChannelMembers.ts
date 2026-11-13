@@ -1,3 +1,6 @@
+import type { RefusalInput } from "../lib/refusal";
+import { AGENT_LOUNGE_OUTSIDER_ADD_REFUSAL, isLoungeOutsiderAgent } from "../services/agentLoungeService";
+import { formatLastMemberRefusal, isSubConversationType, LAST_MEMBER_DELETES_CHANNEL } from "@botiverse/raft-shared";
 import { revokeSocketAccess } from "../socket/accessRevocation";
 import type { Server as SocketServer } from "socket.io";
 import * as agentService from "../services/agentService";
@@ -5,7 +8,7 @@ import * as channelService from "../services/channelService";
 import * as messageService from "../services/messageService";
 import * as serverService from "../services/serverService";
 import { getActorServerRoleInServer } from "../lib/actorPermissions";
-import { actorHasChannelCapability, withLockedChannelActorCapability } from "../lib/channelActorPermissions";
+import { actorHasChannelCapability, resolveChannelActorContext, channelActorHasCapability, withLockedChannelActorCapability } from "../lib/channelActorPermissions";
 import { addTraceEvent, errorClassOf } from "../tracing/semanticTrace";
 import type { AgentOrchestrator } from "../services/agentOrchestrator";
 import { agentRefusalBody, agentServerRoleRequiredBody, asSentence } from "../lib/agentServerRoleRequired";
@@ -45,6 +48,32 @@ function buildChannelMemberRemovalAttention(channel: { name: string }, target: T
   };
 }
 
+/**
+ * A removal an agent asked for, or null when it was refused because it would
+ * have deleted a private channel with its last member and the agent didn't
+ * pass `deleteIfLast` (nothing changed: the transaction rolled back).
+ */
+export async function removeUnlessLastMember(remove: () => Promise<channelService.ChannelMemberRemoval>): Promise<channelService.ChannelMemberRemoval | null> {
+  try {
+    return await remove();
+  } catch (err) {
+    if (err instanceof channelService.LastPrivateMemberError) return null;
+    throw err;
+  }
+}
+
+/** 409 `last_member_deletes_channel`: what it would have deleted, and the call that does it (CLI form; the SDK writes its own). */
+export function lastMemberRefusalBody(input: { target: string; member?: { user: string } | { agent: string } }) {
+  const { message, nextAction } = formatLastMemberRefusal(input);
+  return agentRefusalBody(message, LAST_MEMBER_DELETES_CHANNEL, nextAction);
+}
+
+/** The same refusal for refuse(). */
+export function lastMemberRefusal(input: { target: string; member?: { user: string } | { agent: string } }): RefusalInput {
+  const { message, nextAction } = formatLastMemberRefusal(input);
+  return { code: LAST_MEMBER_DELETES_CHANNEL, error: message, suggestedNextAction: nextAction };
+}
+
 function normalizeHandle(raw: unknown): string | null {
   if (typeof raw !== "string") return null;
   const value = raw.trim().replace(/^@/, "");
@@ -81,7 +110,15 @@ type TargetRequest =
   | { type: "human"; name: string; id?: never }
   | { type: "agent"; name: string; id?: never };
 
-async function resolveTarget(serverId: string, request: TargetRequest): Promise<{ target?: Target; error?: string }> {
+async function resolveTarget(serverId: string, request: TargetRequest, jointRemovalChannelId?: string): Promise<{ target?: Target; error?: string }> {
+  if (jointRemovalChannelId) {
+    // Resolve only visible current J members, never a global agent directory.
+    const members = await channelService.getChannelMembers(jointRemovalChannelId);
+    const candidates = request.type === "human" ? members.humans : members.agents;
+    const matches = candidates.filter(candidate => request.id ? candidate.id === request.id : candidate.name === request.name);
+    if (matches.length !== 1) return { error: matches.length ? "Member handle is ambiguous; use its ID" : "Member not found in this channel" };
+    return { target: { type: request.type, id: matches[0]!.id, name: matches[0]!.name } };
+  }
   if (request.type === "human") {
     if (request.id) {
       const role = await getActorServerRoleInServer(serverId, "user", request.id);
@@ -94,12 +131,15 @@ async function resolveTarget(serverId: string, request: TargetRequest): Promise<
     return { target: { type: "human", id: human.userId, name: human.name } };
   }
 
+  // A personal assistant is no channel's member but its owner DM's, and
+  // nobody else may find it (agentFindableBy): it reads as not found, by id or
+  // by handle, rather than refused later by addAgent.
   if (request.id) {
     const agent = await agentService.getAgent(request.id);
-    if (!agent || agent.serverId !== serverId) return { error: "Agent not found in this server" };
+    if (!agent || agent.serverId !== serverId || agent.assistantOwnerUserId) return { error: "Agent not found in this server" };
     return { target: { type: "agent", id: agent.id, name: agent.name } };
   }
-  const agent = (await agentService.listAgents(serverId)).find((candidate) => candidate.name === request.name);
+  const agent = (await agentService.listAgents(serverId)).find((candidate) => candidate.name === request.name && !candidate.assistantOwnerUserId);
   if (!agent) return { error: "Agent not found in this server" };
   return { target: { type: "agent", id: agent.id, name: agent.name } };
 }
@@ -191,7 +231,22 @@ export async function addChannelMemberForAgent(input: {
     });
     return { status: 404, body: { error: "Channel not found" } };
   }
-  if (channel.type === "thread") {
+  const canAccessChannel = await channelService.canAgentAccessChannel(channel.id, actor.id);
+  const actorRole = await getActorServerRoleInServer(serverId, "agent", actor.id);
+  // Same rule as the human route: owner/admin may add to a public or private
+  // channel they are not in, never to a joint channel (#wg-rbac B6). Checked
+  // before the channel-type refusals so an id the agent cannot see answers
+  // 404 whatever its type, exactly like an id that does not exist (B14).
+  const canManageUnjoined = (actorRole === "owner" || actorRole === "admin")
+    && (channel.type === "channel" || channel.type === "private");
+  if (!canAccessChannel && !canManageUnjoined) {
+    addTraceEvent("agent_channel_member_add.request.failed", {
+      reason: "channel_not_visible",
+      status_code: 404,
+    });
+    return { status: 404, body: { error: "Channel not found" } };
+  }
+  if (isSubConversationType(channel.type)) {
     addTraceEvent("agent_channel_member_add.validation.failed", { reason: "thread_channel" });
     addTraceEvent("agent_channel_member_add.request.failed", {
       reason: "thread_channel",
@@ -209,16 +264,6 @@ export async function addChannelMemberForAgent(input: {
       status_code: 400,
     });
     return { status: 400, body: { error: "Only public, private, or joint channels are supported" } };
-  }
-  const canAccessChannel = await channelService.canAgentAccessChannel(channel.id, actor.id);
-  const actorRole = await getActorServerRoleInServer(serverId, "agent", actor.id);
-  const canManageUnjoined = actorRole === "owner" || actorRole === "admin";
-  if (!canAccessChannel && !canManageUnjoined) {
-    addTraceEvent("agent_channel_member_add.request.failed", {
-      reason: "channel_not_visible",
-      status_code: 404,
-    });
-    return { status: 404, body: { error: "Channel not found" } };
   }
   if (channel.archivedAt) {
     addTraceEvent("agent_channel_member_add.request.failed", {
@@ -288,6 +333,10 @@ export async function addChannelMemberForAgent(input: {
   }
 
   const target = resolved.target;
+  if (target.type === "agent" && await isLoungeOutsiderAgent(channel.id, target.id)) {
+    addTraceEvent("agent_channel_member_add.request.failed", { reason: "agent_lounge_outsider", status_code: 403 });
+    return { status: 403, body: { error: AGENT_LOUNGE_OUTSIDER_ADD_REFUSAL, code: "agent_lounge_outsider" } };
+  }
   let alreadyMember = false;
 
   try {
@@ -310,6 +359,7 @@ export async function addChannelMemberForAgent(input: {
         actorType: "agent",
         actorId: actor.id,
         capability: "addChannelMembers",
+        humanSubjectIds: [target.id],
       }, (tx) => messageService.addHumanWithMembershipSystemMessage({
         channel,
         userId: target.id,
@@ -376,6 +426,15 @@ export async function addChannelMemberForAgent(input: {
   }
 }
 
+function lastMemberRefused(channel: { name: string }, target: Target): AgentChannelMemberRemoveResult {
+  addTraceEvent("agent_channel_member_remove.request.failed", {
+    reason: "last_member_deletes_channel",
+    status_code: 409,
+  });
+  const member = target.type === "agent" ? { agent: `@${target.name}` } : { user: `@${target.name}` };
+  return { status: 409, body: lastMemberRefusalBody({ target: `#${channel.name}`, member }) };
+}
+
 export async function removeChannelMemberForAgent(input: {
   actor: AgentChannelMemberActor;
   serverId: string;
@@ -405,7 +464,18 @@ export async function removeChannelMemberForAgent(input: {
     });
     return { status: 404, body: { error: "Channel not found" } };
   }
-  if (channel.type === "thread") {
+  // Visibility before the channel-type refusals: an id the agent cannot see
+  // answers 404 whatever its type, exactly like an id that does not exist
+  // (#wg-rbac B14). Removing still requires seeing the channel, whatever the
+  // agent's server role.
+  if (!await channelService.canAgentAccessChannel(channel.id, actor.id)) {
+    addTraceEvent("agent_channel_member_remove.request.failed", {
+      reason: "channel_not_visible",
+      status_code: 404,
+    });
+    return { status: 404, body: { error: "Channel not found" } };
+  }
+  if (isSubConversationType(channel.type)) {
     addTraceEvent("agent_channel_member_remove.validation.failed", { reason: "thread_channel" });
     addTraceEvent("agent_channel_member_remove.request.failed", {
       reason: "thread_channel",
@@ -439,14 +509,20 @@ export async function removeChannelMemberForAgent(input: {
       ),
     };
   }
-  if (!await channelService.canAgentAccessChannel(channel.id, actor.id)) {
+  const payload = typeof body === "object" && body !== null ? body as Record<string, unknown> : {};
+  const requested = pickTarget(payload);
+  if (!requested.target) {
+    addTraceEvent("agent_channel_member_remove.validation.failed", { reason: "invalid_target" });
     addTraceEvent("agent_channel_member_remove.request.failed", {
-      reason: "channel_not_visible",
-      status_code: 404,
+      reason: "invalid_target",
+      status_code: 400,
     });
-    return { status: 404, body: { error: "Channel not found" } };
+    return { status: 400, body: { error: requested.error ?? "Invalid member target" } };
   }
-  const hasAuthority = await actorHasChannelCapability(serverId, channel.id, "agent", actor.id, "removeChannelMembers");
+
+  const actorContext = await resolveChannelActorContext(serverId, channel.id, "agent", actor.id);
+  const memberTargetType = requested.target.type === "agent" ? "agent" : "user";
+  const hasAuthority = actorContext ? channelActorHasCapability(actorContext, "removeChannelMembers", memberTargetType) : false;
   addTraceEvent("agent_channel_member_remove.authorization.checked", {
     outcome: hasAuthority ? "allowed" : "denied",
     required_capability: "removeChannelMembers",
@@ -466,18 +542,7 @@ export async function removeChannelMemberForAgent(input: {
     return { status: 409, body: { error: "This channel is archived", code: "channel_archived" } };
   }
 
-  const payload = typeof body === "object" && body !== null ? body as Record<string, unknown> : {};
-  const requested = pickTarget(payload);
-  if (!requested.target) {
-    addTraceEvent("agent_channel_member_remove.validation.failed", { reason: "invalid_target" });
-    addTraceEvent("agent_channel_member_remove.request.failed", {
-      reason: "invalid_target",
-      status_code: 400,
-    });
-    return { status: 400, body: { error: requested.error ?? "Invalid member target" } };
-  }
-
-  const resolved = await resolveTarget(serverId, requested.target);
+  const resolved = await resolveTarget(serverId, requested.target, actorContext?.jointAuthority ? channel.id : undefined);
   if (!resolved.target) {
     addTraceEvent("agent_channel_member_remove.validation.failed", {
       reason: requested.target.type === "agent" ? "agent_not_found" : "user_not_server_member",
@@ -490,40 +555,52 @@ export async function removeChannelMemberForAgent(input: {
   }
 
   const target = resolved.target;
+  const targetChannel = target.type === "agent" ? await channelService.getJointAgentRemovalChannel(channel.id, target.id) : channel;
+  const lastMember = payload.deleteIfLast === true ? "delete" : "refuse";
   const wasMember = target.type === "agent"
-    ? await channelService.isChannelAgent(channel.id, target.id)
+    ? Boolean(targetChannel && await channelService.isChannelAgent(targetChannel.id, target.id))
     : await channelService.isChannelHuman(channel.id, target.id);
 
   try {
+    let removal: channelService.ChannelMemberRemoval | null;
     if (target.type === "agent") {
-      await withLockedChannelActorCapability({
+      removal = await removeUnlessLastMember(() => withLockedChannelActorCapability({
         serverId,
         channelId: channel.id,
         actorType: "agent",
         actorId: actor.id,
         capability: "removeChannelMembers",
-      }, (tx) => channelService.removeAgent(channel.id, target.id, tx));
-      if (wasMember) {
-        await broadcastMembershipSystemMessage(io, agentOrchestrator, channel, target, "removed", actor);
+        memberTargetType: "agent",
+      }, (tx, context) => channelService.removeAgent(channel.id, target.id, tx, context, lastMember)));
+      if (!removal) return lastMemberRefused(channel, target);
+      if (wasMember && targetChannel && !removal.channelDeleted) {
+        await broadcastMembershipSystemMessage(io, agentOrchestrator, targetChannel, target, "removed", actor);
       }
-      if (wasMember && channel.type !== "channel") {
+      if (wasMember && targetChannel && channel.type !== "channel") {
         await agentOrchestrator?.purgeAgentInboxForChannelTree(
           target.id,
-          channel.id,
+          targetChannel.id,
           "channel_membership_removed",
         );
       }
     } else {
-      await withLockedChannelActorCapability({
+      removal = await removeUnlessLastMember(() => withLockedChannelActorCapability({
         serverId,
         channelId: channel.id,
         actorType: "agent",
         actorId: actor.id,
         capability: "removeChannelMembers",
-      }, (tx) => channelService.removeHuman(channel.id, target.id, tx));
-      await revokeSocketAccess({ userId: target.id });
+        humanSubjectIds: [target.id],
+      }, (tx, context) => channelService.removeHuman(channel.id, target.id, context, tx, lastMember)));
+      if (!removal) return lastMemberRefused(channel, target);
+      await channelService.finishChannelMemberRemoval(removal, target.id);
     }
     emitChannelMembersUpdated(io, serverId, channel);
+    if (target.type === "agent" && channel.type === "joint") {
+      for (const projection of await channelService.getActiveJointChannelProjectionsByLocalChannel(channel.id)) {
+        if (projection.localChannelId !== channel.id) io?.to(`channel:${projection.localChannelId}`).emit("channel:members-updated", { channelId: projection.localChannelId });
+      }
+    }
     addTraceEvent("agent_channel_member_remove.removed", {
       target_type: target.type,
       was_member: wasMember,
@@ -537,6 +614,7 @@ export async function removeChannelMemberForAgent(input: {
         channelId: channel.id,
         member: { type: target.type, id: target.id, name: target.name },
         ...(wasMember ? { attention: buildChannelMemberRemovalAttention(channel, target) } : {}),
+        ...(removal.channelDeleted ? { channelDeleted: true } : {}),
       },
     };
   } catch (err) {

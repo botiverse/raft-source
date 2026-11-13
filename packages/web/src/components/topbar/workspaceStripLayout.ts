@@ -1,12 +1,19 @@
 // Pure layout rules for the title-bar workspace strip (task #140); see
 // WorkspaceStrip.tsx. Kept framework-free so they are unit-testable.
 
-/** One slot = 32px button (Raft DS IconButton sm) + 4px gap. */
-export const STRIP_SLOT_PX = 36;
+/**
+ * The avatar button's width where it can't be measured (no layout, e.g.
+ * jsdom): raft-ui Button `icon-md` by touch, 32px. With a mouse on a desktop
+ * raft-ui makes it the control height (34px, desktop density), so the bar
+ * measures the rendered button instead (useStripLayout, the strip's slot probe).
+ */
+export const STRIP_BUTTON_PX = 32;
+/** The gap between avatars (gap-1): n avatars need n slots minus one gap. */
+export const STRIP_GAP_PX = 4;
+/** One slot = the avatar button + the gap after it. */
+export const STRIP_SLOT_PX = STRIP_BUTTON_PX + STRIP_GAP_PX;
 /** The strip's lead before its first avatar (WorkspaceStrip's pl-2). */
 const STRIP_LEAD_PX = 8;
-/** The gap between avatars (gap-1): n avatars need n slots minus one gap. */
-const STRIP_GAP_PX = 4;
 /**
  * What the hairline before an out-of-range current workspace adds over a plain
  * gap: one more gap-1 plus the 1px line, so the line sits in the middle of
@@ -20,8 +27,9 @@ export const STRIP_DIVIDER_PX = 5;
  * history controls' box. The strip uses all of it: the air before the
  * controls is their own 8px lead (pl-2), the same 8px the strip keeps after
  * the name, so the avatars sit between two equal gaps, with no spare slot
- * before ‹ ›. What is left over is under one slot: avatars keep a fixed
- * rhythm rather than spreading out with the window.
+ * before ‹ ›. What is left over is under one slot and goes to the search
+ * field (useElasticSearch): avatars keep a fixed rhythm rather than spreading
+ * out with the window.
  */
 export function stripFreePx(spanPx: number): number {
   return Math.max(0, spanPx - STRIP_LEAD_PX + STRIP_GAP_PX - STRIP_DIVIDER_PX);
@@ -48,11 +56,13 @@ export const STRIP_MIN = 2;
 
 /**
  * How many avatars fit in `freePx` (no fixed cap: the space decides), or 0
- * below STRIP_MIN.
+ * below STRIP_MIN. `slotPx` is one avatar button plus its gap, as rendered
+ * (useStripLayout's avatarSlotPx); callers always pass it, so a fixed 32px
+ * avatar can't be counted where raft-ui renders 34.
  */
-export function stripCapacity(freePx: number, total: number): number {
+export function stripCapacity(freePx: number, total: number, slotPx: number): number {
   if (total < 2) return 0;
-  const fit = Math.min(total, Math.floor(freePx / STRIP_SLOT_PX));
+  const fit = Math.min(total, Math.floor(freePx / slotPx));
   return fit >= STRIP_MIN ? fit : 0;
 }
 

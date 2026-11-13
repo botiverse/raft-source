@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
-import { sql } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { PgDialect } from "drizzle-orm/pg-core";
 import { dbTest } from "../test/integration/dbTest";
-import { messages } from "../db/schema";
+import { channelConversionJobs, channels, jointChannels, jointChannelServers, messages } from "../db/schema";
 import {
   conversionReadChannelIdsQuery,
   conversionReadChannelPredicate,
@@ -148,4 +148,82 @@ dbTest("message context previous/next consume resolved ids as an indexable predi
 
   const aroundWindow = await getMessageContext(target.id, 1, 1);
   assert.deepEqual(aroundWindow?.messages.map((row) => row.id), [older.id, target.id, newer.id]);
+});
+
+dbTest("joint thread projections of a converted channel resolve to their canonical thread", async ({ db, seed }) => {
+  const owner = await seed.human();
+  const server = await seed.server({ owner });
+  const source = await seed.channel({ server, members: [owner] });
+  const canonical = await seed.channel({ server, members: [owner] });
+  const plain = await seed.channel({ server, members: [owner] });
+  await db.insert(channelConversionJobs).values({
+    serverId: server.id,
+    sourceChannelId: source.id,
+    sourceChannelType: "channel",
+    status: "done",
+    phase: "done",
+    state: "succeeded",
+    canonicalChannelId: canonical.id,
+    createdByUserId: owner.id,
+  });
+
+  async function jointThread(role: "host" | "participant", status: "active" | "disconnected") {
+    const canonicalParent = await seed.message({ channel: canonical, author: owner, content: `canonical ${role}` });
+    const localParent = await seed.message({ channel: source, author: owner, content: `local ${role}` });
+    const [canonicalThread, localThread] = await db.insert(channels).values([
+      { serverId: server.id, name: `thread-${canonicalParent.id}`, type: "thread", parentMessageId: canonicalParent.id },
+      { serverId: server.id, name: `thread-${localParent.id}`, type: "thread", parentMessageId: localParent.id },
+    ]).returning();
+    const [joint] = await db.insert(jointChannels).values({
+      canonicalChannelId: canonicalThread!.id,
+      createdByServerId: server.id,
+      createdByUserId: owner.id,
+    }).returning();
+    await db.insert(jointChannelServers).values({
+      jointChannelId: joint!.id,
+      serverId: server.id,
+      localChannelId: localThread!.id,
+      role,
+      status,
+      joinedByUserId: owner.id,
+    });
+    return { canonicalThread: canonicalThread!, localThread: localThread! };
+  }
+
+  const resolveSorted = async (channelId: string) => (await resolveConversionReadChannelIds(db, channelId)).sort();
+
+  const hosted = await jointThread("host", "active");
+  const pair = [hosted.localThread.id, hosted.canonicalThread.id].sort();
+  assert.deepEqual(await resolveSorted(hosted.localThread.id), pair);
+  assert.deepEqual(await resolveSorted(hosted.canonicalThread.id), pair);
+
+  // A peer's projection of the same joint must not inherit the host pair.
+  const peerServer = await seed.server({ owner });
+  const peerChannel = await seed.channel({ server: peerServer, members: [owner] });
+  const peerParent = await seed.message({ channel: peerChannel, author: owner, content: "peer parent" });
+  const [peerThread] = await db.insert(channels).values({
+    serverId: peerServer.id, name: `thread-${peerParent.id}`, type: "thread", parentMessageId: peerParent.id,
+  }).returning();
+  const [hostedJoint] = await db.select({ id: jointChannels.id }).from(jointChannels)
+    .where(eq(jointChannels.canonicalChannelId, hosted.canonicalThread.id));
+  await db.insert(jointChannelServers).values({
+    jointChannelId: hostedJoint!.id,
+    serverId: peerServer.id,
+    localChannelId: peerThread!.id,
+    role: "participant",
+    status: "active",
+    joinedByUserId: owner.id,
+  });
+  assert.deepEqual(await resolveSorted(peerThread!.id), [peerThread!.id]);
+  assert.deepEqual(await resolveSorted(hosted.canonicalThread.id), pair);
+
+  const participant = await jointThread("participant", "active");
+  assert.deepEqual(await resolveSorted(participant.localThread.id), [participant.localThread.id]);
+  assert.deepEqual(await resolveSorted(participant.canonicalThread.id), [participant.canonicalThread.id]);
+
+  const disconnected = await jointThread("host", "disconnected");
+  assert.deepEqual(await resolveSorted(disconnected.localThread.id), [disconnected.localThread.id]);
+  assert.deepEqual(await resolveSorted(disconnected.canonicalThread.id), [disconnected.canonicalThread.id]);
+
+  assert.deepEqual(await resolveSorted(plain.id), [plain.id]);
 });

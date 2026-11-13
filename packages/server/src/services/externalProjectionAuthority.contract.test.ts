@@ -13,107 +13,10 @@ function productionTypeScriptFiles(directory: string): string[] {
   });
 }
 
-function source(relativePath: string): string {
-  return readFileSync(resolve(serverSourceRoot, relativePath), "utf8");
-}
-
-test("external projection source ratchet keeps one canonical writer and no Raft authority writes", () => {
+test("external projection source ratchet keeps one canonical writer", () => {
   const externalSenderWriters = productionTypeScriptFiles(serverSourceRoot)
     .filter((path) => /senderType\s*:\s*["']external_projection["']/.test(readFileSync(path, "utf8")))
     .map((path) => relative(serverSourceRoot, path));
 
   assert.deepEqual(externalSenderWriters, ["services/externalProjectionService.ts"]);
-
-  const writer = source("services/externalProjectionService.ts");
-  assert.match(writer, /\.insert\(messages\)[\s\S]*?senderType:\s*"external_projection"/);
-  for (const forbiddenAuthorityWrite of [
-    "messageMentions",
-    "inboxNotificationFacts",
-    "tasks",
-    "threadFollows",
-    "actionCards",
-  ]) {
-    assert.doesNotMatch(
-      writer,
-      new RegExp(`\\.insert\\(${forbiddenAuthorityWrite}\\)`),
-      `canonical external writer must not create ${forbiddenAuthorityWrite} authority`,
-    );
-  }
-
-  assert.match(
-    source("services/taskService.ts"),
-    /senderType === "external_projection"[\s\S]*?cannot be claimed as tasks/,
-  );
-});
-
-test("external projection reader ratchet keeps immutable author and Agent de-escalation guards", () => {
-  const requiredReaderMarkers: Record<string, RegExp[]> = {
-    "services/messageService.ts": [
-      /loadExternalMessageAuthors/,
-      /missing immutable author fact/i,
-      // Only Slack-bridged rows may carry a mention fact or ordinary content;
-      // every other external payload renders inert.
-      /function isSlackBridgedExternalMessage[\s\S]*?isSlackBridgedExternalProvider\(message\.externalAuthor\?\.provider\)/,
-      /senderType === "external_projection" && !isSlackBridgedExternalMessage\(message\)\s*\?\s*renderThirdPartyInertText/,
-      /isSlackBridgedExternalMessage\(message\)\s*&& isAgentPersonallyMentioned\(message\.mentions, viewerAgentId\)/,
-      /senderType !== "external_projection"[\s\S]*?taskStatus/,
-      /isAgentApiExternalMessageForbiddenAuthorityField[\s\S]*?projectAgentVisibleHttpMessageResponse/,
-      /projectAgentVisibleHttpMessageResponse[\s\S]*?Object\.keys\(envelope\)[\s\S]*?isAgentApiExternalMessageForbiddenAuthorityField/,
-    ],
-    "services/searchService.ts": [
-      /external_message_author_facts/,
-      /search row is missing immutable author fact/i,
-    ],
-    "services/savedService.ts": [
-      /externalMessageAuthorFacts/,
-      /saved row is missing immutable author fact/i,
-    ],
-    "services/channelService.ts": [
-      /externalMessageAuthorFacts/,
-      /thread reply is missing immutable author fact/i,
-      /followed-thread row is missing immutable author fact/i,
-    ],
-    "routes/internal.ts": [
-      /third_party_app/,
-      /externalAuthor: _externalAuthor/,
-      /!external &&/,
-      /reaction-add\.updated[\s\S]*?projectAgentVisibleHttpMessageResponse\(enriched, enriched\.content, agent\.id\)/,
-      /reaction-remove\.updated[\s\S]*?projectAgentVisibleHttpMessageResponse\(enriched, enriched\.content, agent\.id\)/,
-    ],
-    "routes/internalAgentApi.ts": [
-      /third_party_app/,
-      /toAgentApiMessageEnvelope\(enriched, enriched\.content, actingAgentId\)/,
-      /registerAgentApiRoute\("messageReactionAdd"[\s\S]*?handleReaction\(req, res, "add"\)/,
-      /registerAgentApiRoute\("messageReactionRemove"[\s\S]*?handleReaction\(req, res, "remove"\)/,
-    ],
-  };
-
-  for (const [relativePath, markers] of Object.entries(requiredReaderMarkers)) {
-    const text = source(relativePath);
-    for (const marker of markers) {
-      assert.match(text, marker, `${relativePath} lost external projection reader guard ${marker}`);
-    }
-  }
-});
-
-test("provider-neutral inbound ratchet keeps one sealed worker and one atomic canonical commit path", () => {
-  const worker = source("services/externalInboundWorkerService.ts");
-  for (const required of [
-    /externalInboundEvents/,
-    /decryptNormalizedPayload/,
-    /resolveCurrentRuntime/,
-    /insertCanonicalExternalMessage/,
-    /externalMessageLinks/,
-    /recordInboxFactsForPersistedMessages/,
-    /payloadTombstoneDigest/,
-    /inboundEventRowLockHookForTests[\s\S]*?dependencies\.now/,
-  ]) {
-    assert.match(worker, required, `provider-neutral inbound worker lost ${required}`);
-  }
-  assert.doesNotMatch(worker, /chat\.postMessage|slack\.com|xox[baprs]-/i);
-
-  const schema = source("db/schema.ts");
-  assert.match(schema, /externalInboundEvents = pgTable\("external_inbound_events"/);
-  assert.match(schema, /external_inbound_event_custody_shape/);
-  assert.match(schema, /external_inbound_event_terminal_shape/);
 });

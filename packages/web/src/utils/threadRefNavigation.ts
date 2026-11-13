@@ -49,7 +49,8 @@ interface ExecuteThreadRefHandoffOptions {
   resolve: (parentChannel: ThreadRefChannel) => Promise<ThreadRouteTarget | null>;
   getAuthority: () => ThreadRefAuthoritySnapshot;
   onOpen: (target: ThreadRouteTarget, parentChannel: ThreadRefChannel) => void;
-  onFailure: () => void;
+  /** `channel_not_listed`: no channel of that name is in the local list, so no request was made (no trace id to show). */
+  onFailure: (reason: ThreadRefHandoffFailure) => void;
 }
 
 interface ResolveThreadRefOptions {
@@ -142,6 +143,8 @@ export function captureThreadRouteAuthorityGuard(
   };
 }
 
+export type ThreadRefHandoffFailure = "channel_not_listed" | "unresolved";
+
 export async function executeThreadRefHandoffOnce({
   consumedHandoffs,
   maxConsumedHandoffs = DEFAULT_MAX_CONSUMED_THREAD_REF_HANDOFFS,
@@ -177,24 +180,26 @@ export async function executeThreadRefHandoffOnce({
       authority.serverEpoch,
     );
   };
-  const failClosed = (): ThreadRefHandoffResult => {
+  const failClosed = (reason: ThreadRefHandoffFailure): ThreadRefHandoffResult => {
     if (!authorityIsCurrent()) return "stale";
-    onFailure();
+    onFailure(reason);
     return "failed";
   };
 
   const parentChannel = findThreadRefParentChannel(intent, serverSlug, channels);
-  if (!parentChannel) return failClosed();
+  if (!parentChannel) {
+    return failClosed(isThreadRefParentChannelUnlisted(intent, serverSlug, channels) ? "channel_not_listed" : "unresolved");
+  }
 
   let target: ThreadRouteTarget | null;
   try {
     target = await resolve(parentChannel);
   } catch {
-    return failClosed();
+    return failClosed("unresolved");
   }
 
   if (!authorityIsCurrent()) return "stale";
-  if (!target || target.serverSlug !== serverSlug) return failClosed();
+  if (!target || target.serverSlug !== serverSlug) return failClosed("unresolved");
   onOpen({
     ...target,
     focusedMessageId: intent.focusedMessageId ?? target.focusedMessageId,
@@ -228,6 +233,42 @@ export function findThreadRefParentChannel(
     && (!intent.parentChannelId || channel.id === intent.parentChannelId)
   );
   return candidates.length === 1 ? candidates[0] : null;
+}
+
+/**
+ * Why `findThreadRefParentChannel` found nothing, when it is the plain case: no
+ * channel of that name is in the list at all (left, or removed). A DM, a name
+ * shared by several, or a name whose id differs keep the generic notice.
+ */
+export function isThreadRefParentChannelUnlisted(
+  intent: ThreadRefIntent,
+  currentServerSlug: string,
+  channels: ThreadRefChannel[],
+): boolean {
+  if (intent.serverSlug !== currentServerSlug || intent.parentChannelType === "dm") return false;
+  const name = intent.parentChannelName.toLowerCase();
+  return !channels.some((channel) =>
+    (channel.type === "channel" || channel.type === "private" || channel.type === "joint")
+    && channel.name.toLowerCase() === name
+  );
+}
+
+export type ThreadRefMissingParentNotice =
+  | "message.messageItem.threadChannelUnavailable"
+  | "message.messageItem.threadUnavailable";
+
+/**
+ * The notice when the thread's channel can't be found locally. Decided with no
+ * request, so there is no trace id to send: say why when it is plain.
+ */
+export function threadRefMissingParentNotice(
+  intent: ThreadRefIntent,
+  currentServerSlug: string,
+  channels: ThreadRefChannel[],
+): ThreadRefMissingParentNotice {
+  return isThreadRefParentChannelUnlisted(intent, currentServerSlug, channels)
+    ? "message.messageItem.threadChannelUnavailable"
+    : "message.messageItem.threadUnavailable";
 }
 
 export function findThreadParentMessageIdByShortId({

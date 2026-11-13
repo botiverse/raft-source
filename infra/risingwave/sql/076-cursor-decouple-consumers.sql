@@ -21,6 +21,7 @@ CREATE MATERIALIZED VIEW rw_agent_inbox_v6 AS WITH proj AS (SELECT s.local_chann
 CREATE INDEX idx_rw_agent_inbox_v6_agent_activity ON rw_agent_inbox_v6(agent_id, activity_seq DESC);
 
 -- Sidebar unread on the v6 mention arm (rw_inbox_muted_full_v2 unchanged).
+-- Build it only where rw_inbox_muted_full_v2 exists.
 CREATE MATERIALIZED VIEW rw_conversation_unread_v3 AS
 WITH subs AS (
   SELECT kind, receiver_type, receiver_id, target_id, server_id, done_at, latest_seq, unread_count

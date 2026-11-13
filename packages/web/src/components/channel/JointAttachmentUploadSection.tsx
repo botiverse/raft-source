@@ -7,7 +7,6 @@ import {
 } from "../../utils/directAttachmentUpload";
 import type { RecoveryView } from "../../utils/directAttachmentUpload";
 import { FormSection } from "@botiverse/raft-ui";
-import Banner from "../ui/Banner";
 import { ActiveUploadRow } from "./ActiveUploadRow";
 import {
   notifyAttachmentUploadChanged,
@@ -138,28 +137,20 @@ export default function JointAttachmentUploadSection({
       title={formatMessage({ id: "channel.edit.activeUploadsTitle" })}
       description={formatMessage({ id: "channel.edit.activeUploadsDescription" })}
     >
-      <Banner
-        intent="warning"
-        density="sm"
-        withIcon
-        className="min-w-0"
-        data-testid="channel-settings-joint-uploads-banner"
-      >
-        <div className="space-y-2">
-          <ul className="space-y-2" data-testid="channel-settings-joint-uploads-list">
-            {uploads.map((upload, index) => (
-              <ActiveUploadRow
-                key={upload.uploadId}
-                upload={upload}
-                separated={index > 0}
-                cancelBusy={cancelBusyId === upload.uploadId}
-                onOpenChannel={onOpenChannel}
-                onCancel={onCancel}
-              />
-            ))}
-          </ul>
-        </div>
-      </Banner>
+      {/* The uploads are data (file names and their actions), not a banner's message: a list of their own under
+          the section's line, which says what to do (HelperText step 1). */}
+      <ul className="m-0 stack-y-2 p-0" data-testid="channel-settings-joint-uploads-list">
+        {uploads.map((upload, index) => (
+          <ActiveUploadRow
+            key={upload.uploadId}
+            upload={upload}
+            separated={index > 0}
+            cancelBusy={cancelBusyId === upload.uploadId}
+            onOpenChannel={onOpenChannel}
+            onCancel={onCancel}
+          />
+        ))}
+      </ul>
     </FormSection>
   );
 }

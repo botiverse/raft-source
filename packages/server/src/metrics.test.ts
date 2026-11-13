@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { configureMetricsDeploymentIdentity, register, releaseShaLabel } from "./metrics";
-import { readBuildIdentityStatus } from "./version";
+import { readBuildIdentityStatus, SERVER_VERSION } from "./version";
 
 test("application metrics include privacy-safe deployment identity labels", async () => {
   configureMetricsDeploymentIdentity({
@@ -18,6 +18,8 @@ test("application metrics include privacy-safe deployment identity labels", asyn
   assert.match(metrics, /slock_app_metrics_info\{[^}]*deployment_identity_state="resolved"[^}]*\} 1/);
   assert.match(metrics, /slock_app_metrics_info\{[^}]*ecs_task_id="0123456789abcdef0123456789abcdef"[^}]*\} 1/);
   assert.match(metrics, /slock_app_metrics_info\{[^}]*git_sha="[^"]+"[^}]*\} 1/);
+  assert.match(metrics, new RegExp(`slock_app_metrics_info\\{[^}]*service_version="${SERVER_VERSION.replaceAll(".", "\\.")}"[^}]*\\} 1`));
+  assert.match(SERVER_VERSION, /^\d+\.\d+\.\d+/);
   assert.match(metrics, /# HELP slock_attachment_lifecycle_sweeps_total/);
   assert.match(metrics, /# HELP slock_attachment_lifecycle_gc_outcomes_total/);
   assert.match(metrics, /# HELP slock_attachment_lifecycle_gc_jobs/);

@@ -11,6 +11,15 @@
 // that is older than LIVEZ_DB_STALE_MS. Short pauses never reach it; a task
 // whose pool is truly dead (the case the DB-backed health check was guarding)
 // still gets replaced.
+//
+// A task that has never had an answer is different from one that lost it: it
+// reports "starting" (503) until its first successful ping. Otherwise a new
+// task that cannot reach the database at all (bad secret, pool or driver
+// regression) would pass the ALB check for its first minute, be counted
+// healthy by ECS, take traffic, and let the rollout stop good tasks. With 503
+// it never enters service and the rollout stalls with the old fleet intact,
+// as it did when the ALB checked /health. The stale window applies only after
+// the first success.
 
 /**
  * How long the database may go unanswered before this task reports itself
@@ -24,8 +33,11 @@ export const LIVEZ_DB_PING_INTERVAL_MS = 5_000;
 
 export interface LivenessVerdict {
   ok: boolean;
-  /** "unmonitored" when no probe was started (tests, tools), never a failure. */
-  db: "ok" | "stale" | "unmonitored";
+  /**
+   * "unmonitored" when no probe was started (tests, tools), never a failure.
+   * "starting" while monitored but before the first successful ping: not ok.
+   */
+  db: "ok" | "starting" | "stale" | "unmonitored";
   msSinceDbSuccess: number | null;
 }
 
@@ -47,17 +59,14 @@ export function createDbLivenessTracker(options: {
   const intervalMs = options.intervalMs ?? LIVEZ_DB_PING_INTERVAL_MS;
   const staleMs = options.staleMs ?? LIVEZ_DB_STALE_MS;
   let monitored = false;
-  // Counting from the first probe gives a fresh task the full window before
-  // it can be judged, even if the database is slow to answer at startup.
-  let lastSuccessAt = 0;
+  // null until the database has answered once. A fresh task is not alive
+  // before that; ECS's health check grace period covers a slow start.
+  let lastSuccessAt: number | null = null;
   let timer: ReturnType<typeof setInterval> | null = null;
   let inFlight = false;
 
   const probeOnce = async () => {
-    if (!monitored) {
-      monitored = true;
-      lastSuccessAt = now();
-    }
+    monitored = true;
     if (inFlight) return; // a hung ping must not stack up behind itself
     inFlight = true;
     try {
@@ -74,6 +83,7 @@ export function createDbLivenessTracker(options: {
     probeOnce,
     verdict(at = now()) {
       if (!monitored) return { ok: true, db: "unmonitored", msSinceDbSuccess: null };
+      if (lastSuccessAt === null) return { ok: false, db: "starting", msSinceDbSuccess: null };
       const age = at - lastSuccessAt;
       return age > staleMs
         ? { ok: false, db: "stale", msSinceDbSuccess: age }

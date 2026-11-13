@@ -8,7 +8,7 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { getDb } from "../db/index";
-import { channels, jointChannels, users } from "../db/schema";
+import { channels, jointChannels, servers, users } from "../db/schema";
 import { createServer } from "./serverService";
 import { attachJointChannelMetadata, createJointChannel, getOrCreateThreadForChannel } from "./channelService";
 import { createMessage } from "./messageService";
@@ -53,6 +53,8 @@ async function seedHost() {
 async function createJoints(host: Awaited<ReturnType<typeof seedHost>>, n: number) {
   // A joint needs at least one invite; a pending one is enough here.
   const peer = await seedHost();
+  // A free server hosts only one joint; these cases need several.
+  await getDb().update(servers).set({ plan: "founder" }).where(eq(servers.id, host.server.id));
   const created = [];
   for (let i = 0; i < n; i += 1) {
     created.push(await createJointChannel({

@@ -7,6 +7,8 @@
 // agent gets the neutral 404; a reply is a clear 409 MIGRATION_RECEIPT_READ_ONLY
 // that names the next step, and nothing lands in the receipt DM.
 import assert from "node:assert/strict";
+import { refusalBody } from "../lib/refusal";
+import { AGENT_CHANNEL_NOT_FOUND_REFUSAL } from "./agentRouteRefusals";
 import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { getDb } from "../db/index";
@@ -31,7 +33,7 @@ import { MIGRATION_RECEIPT_CHANNEL_PREFIX, resolveAgentFacingChannelRef, resolve
 import { registerMachine } from "../services/machineService";
 import { createServer } from "../services/serverService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 /** A completed Computer migration: its receipt sits in the agent-only receipt DM. */
 async function seedCompletedMigration() {
@@ -63,8 +65,8 @@ async function seedCompletedMigration() {
   await completeAgentMigrationAutoStart({ migrationId: migration.id, agentId: agent.id, targetMachineId: target.id });
   const [completed] = await db.select().from(agentMigrations).where(eq(agentMigrations.id, migration.id));
   assert.equal(completed.state, "completed");
-  const agentKey = (await mintAgentCredential({ agentId: agent.id, scopes: ["send", "read"], name: "receipt-dm", createdByUserId: null })).apiKey;
-  const otherKey = (await mintAgentCredential({ agentId: other.id, scopes: ["send", "read"], name: "receipt-dm", createdByUserId: null })).apiKey;
+  const agentKey = (await mintAgentCredential({ agentId: agent.id, scopes: ["send", "read"], name: "receipt-dm", issuedVia: "computer", createdByUserId: null })).apiKey;
+  const otherKey = (await mintAgentCredential({ agentId: other.id, scopes: ["send", "read"], name: "receipt-dm", issuedVia: "computer", createdByUserId: null })).apiKey;
   return { server, agent, other, agentKey, otherKey, migration: completed, receiptChannelId: completed.receiptChannelId! };
 }
 
@@ -85,7 +87,7 @@ test("the migrated agent reads its receipt under the name its inbox prints; anot
   // Same neutral answer as any channel the caller cannot see.
   const other = await agentApi(app.baseUrl, world.otherKey, "GET", `/history?${new URLSearchParams({ channel: target! })}`);
   assert.equal(other.status, 404, other.raw);
-  assert.equal(other.body.error, "Channel not found or not visible");
+  assert.deepEqual(other.body, refusalBody(AGENT_CHANNEL_NOT_FOUND_REFUSAL));
   assert.ok(!other.raw.includes("Migration completed"));
 });
 

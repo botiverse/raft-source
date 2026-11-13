@@ -130,6 +130,7 @@ function BufferedMermaidFrame({
         nextFrame.style.height = "100%";
         nextFrame.style.transform = "none";
         nextFrame.style.opacity = "1";
+        // raft-ui: z-index crossfade buffer, three frames (prepared 0 < active 1 < retiring 2) inside the viewer's own stack
         nextFrame.style.zIndex = "1";
         nextFrame.removeAttribute("aria-hidden");
         nextFrame.removeAttribute("tabindex");
@@ -148,6 +149,7 @@ function BufferedMermaidFrame({
         previousFrame.style.transform = `translate(-50%, -50%) scale(${latest.ratio})`;
         previousFrame.style.transformOrigin = "center center";
         previousFrame.style.opacity = "1";
+        // raft-ui: z-index crossfade buffer, three frames (prepared 0 < active 1 < retiring 2) inside the viewer's own stack
         previousFrame.style.zIndex = "2";
         previousFrame.setAttribute("aria-hidden", "true");
         previousFrame.tabIndex = -1;

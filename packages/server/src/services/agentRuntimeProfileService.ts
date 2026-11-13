@@ -105,6 +105,8 @@ export interface RecordAgentRuntimeProfileInput {
 export interface RecordAgentRuntimeProfileResult {
   profile: RuntimeProfileRow;
   pending: RuntimeProfileRow | null;
+  /** Reconciler step 11b: the report moved the stored running runtime or model (not on the first report). */
+  runtimeIdentityChanged?: boolean;
 }
 
 function stableJson(value: unknown): string {
@@ -484,6 +486,16 @@ function backoff(attempt: number): number {
   return PROFILE_RETRY_BASE_MS * Math.pow(2, attempt) + Math.random() * 50;
 }
 
+/** Reconciler step 11b: whether a report's runtime or model differs from the stored profile's. */
+async function reportMovesRuntimeIdentity(input: RecordAgentRuntimeProfileInput): Promise<boolean> {
+  const [stored] = await getDb().select({ runtime: agentRuntimeProfiles.runtime, model: agentRuntimeProfiles.model })
+    .from(agentRuntimeProfiles)
+    .where(eq(agentRuntimeProfiles.agentId, input.agentId))
+    .limit(1);
+  const values = currentValues(input);
+  return Boolean(stored) && (stored!.runtime !== values.runtime || stored!.model !== values.model);
+}
+
 /**
  * Records agent runtime profile with optimistic concurrency control.
  * On revision conflict (concurrent write from another machine), retries with
@@ -491,8 +503,10 @@ function backoff(attempt: number): number {
  * startup (e.g. bluegreen deploys).
  */
 export async function recordAgentRuntimeProfile(input: RecordAgentRuntimeProfileInput): Promise<RecordAgentRuntimeProfileResult> {
-  // Skip if we recently wrote this agent's profile (prevent lock storms)
-  if (shouldSkipProfileWrite(input.agentId)) {
+  // Skip if we recently wrote this agent's profile (prevent lock storms),
+  // unless the report moves the running runtime or model (reconciler step
+  // 11b: a config applied when idle shows up only through this report).
+  if (shouldSkipProfileWrite(input.agentId) && !await reportMovesRuntimeIdentity(input)) {
     return { profile: null as unknown as RuntimeProfileRow, pending: null };
   }
 
@@ -616,6 +630,7 @@ async function tryRecordAgentRuntimeProfile(
     return {
       profile: updated,
       pending: updated.pendingKind ? updated : null,
+      runtimeIdentityChanged: existing.runtime !== values.runtime || existing.model !== values.model,
     };
   });
   if (result !== "retry") {

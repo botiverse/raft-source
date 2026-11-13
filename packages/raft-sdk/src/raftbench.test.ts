@@ -160,10 +160,10 @@ test("the run-assignment event is recognised by kind, run id and revision; anyth
   assert.equal(isRaftbenchRunAssigned(null), false);
 });
 
-test("raftbenchIncompleteReport is a valid incomplete result; RaftBench is not a model-facing operation", () => {
+test("raftbenchIncompleteReport is a valid incomplete result; background context and submission are not model-facing operations", () => {
   const incomplete = raftbenchIncompleteReport({ runId, revision: 2 }, "  Validation failed twice: status.  ", ["partial_scan"]);
   assert.deepEqual(incomplete, { runId, revision: 2, status: "incomplete", reason: "Validation failed twice: status.", patterns: [], gaps: ["partial_scan"] });
-  assert.equal(RAFT_OPERATIONS.some((op) => op.name.startsWith("raftbench")), false);
+  assert.deepEqual(RAFT_OPERATIONS.filter((op) => op.name.startsWith("raftbench")).map(op => op.name), ["raftbench.findings"]);
 });
 
 test("only the harness's failure report may carry failure; a model result with it is refused locally in plain words", async () => {
@@ -275,4 +275,60 @@ test("a window with no messages is empty, not complete; its result is an ordinar
   const report = raftbenchEmptyWindowReport(material.data);
   assert.deepEqual(report, { runId, revision: 2, status: "incomplete", reason: "No messages were read in this window; nothing was analyzed.", patterns: [], gaps: ["missing_tool_outcomes"] });
   assert.equal(report.failure, undefined, "not a failure: it must not count towards the 3-failure limit");
+});
+
+test("a findings page with more to read names the next call with the same filters; the last page names none", async () => {
+  const finding = {
+    id: "44444444-4444-4444-8444-444444444444",
+    evidenceAt: "2026-10-17T12:00:01.000Z",
+    pattern: { kind: "repeated_attempt", explanation: "x", evidence: [{ target: "#general", messageId: "55555555-5555-4555-8555-555555555555" }], counterevidence: [], evidenceLevel: "conversation_only", intent: "unknown", suggestion: "" },
+  };
+  const body = (nextCursor: string | null) => ({ revision: 2, findings: [finding], total: 2, nextCursor, coverage: { historyFrom: null, scannedThroughAt: null, note: "n" } });
+  const { calls, fetch } = server((_call, i) => Response.json(body(i === 0 ? "c1" : null)));
+  const raft = createRaft({ serverUrl: "https://raft.example", credential, fetch });
+
+  const first = await raft.raftbench.findings({ kind: "repeated_attempt", period: "recent" });
+  assert.equal(first.ok && first.state, "page");
+  const nextArgs = { kind: "repeated_attempt", period: "recent", limit: 5, cursor: "c1" };
+  assert.deepEqual(first.next, {
+    kind: "next_findings_page",
+    args: nextArgs,
+    operation: { name: "raftbench.findings", args: nextArgs },
+    why: "More findings match these filters; read the next page only if more examples would change the answer.",
+  });
+  const last = await raft.invoke("raftbench.findings", first.next!.operation!.args);
+  assert.equal(last.ok && last.state, "last_page");
+  assert.equal(last.next, null);
+  assert.match(calls[1]!.url, /cursor=c1/);
+  assert.match(calls[1]!.url, /kind=repeated_attempt/);
+});
+
+test("a findings refusal says whether to read the first page again or to tell the person who asked", async () => {
+  const cases: Array<[string, number, string]> = [
+    ["raftbench_findings_changed", 409, "reread"],
+    ["raftbench_cursor_stale", 409, "reread"],
+    ["raftbench_reader_not_authorized", 403, "stop"],
+    ["raftbench_findings_unavailable", 409, "stop"],
+    ["raftbench_disabled", 403, "stop"],
+    ["raftbench_server_not_allowed", 403, "stop"],
+    ["raftbench_unavailable", 503, "retry_identical"],
+  ];
+  for (const [code, status, kind] of cases) {
+    const { fetch } = server(() => Response.json({ error: "x", code, suggestedNextAction: "y" }, { status }));
+    const outcome = await createRaft({ serverUrl: "https://raft.example", credential, fetch, retry: { attempts: 1 } }).raftbench.findings();
+    assert.equal(outcome.ok, false, code);
+    if (!outcome.ok) {
+      assert.equal(raftbenchFailureKind(outcome), kind, code);
+      assert.equal(outcome.error.nextAction, "y", "the Server's words reach the model");
+    }
+  }
+  // A code this SDK does not know still fails in the generic way, with the Server's next action.
+  const { fetch } = server(() => Response.json({ error: "x", code: "raftbench_some_future_code", suggestedNextAction: "z" }, { status: 409 }));
+  const unknown = await createRaft({ serverUrl: "https://raft.example", credential, fetch, retry: { attempts: 1 } }).raftbench.findings();
+  assert.equal(unknown.ok, false);
+  if (!unknown.ok) {
+    assert.equal(unknown.error.code, "CONFLICT");
+    assert.equal(unknown.error.nextAction, "z");
+    assert.equal(raftbenchFailureKind(unknown), null);
+  }
 });

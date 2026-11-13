@@ -68,7 +68,6 @@ test("AddMembersDialog uses the member-list surface and submits only candidates 
     members: [{
       userId: "user-mei",
       email: "mei@example.test",
-      gravatarHash: "hash-mei",
       name: "mei",
       displayName: "Mei",
       description: "Design",
@@ -113,7 +112,10 @@ test("AddMembersDialog uses the member-list surface and submits only candidates 
 
   const shell = await screen.findByTestId("add-members-action-list");
   assert.match(shell.className, /max-h-72/);
-  assert.match(shell.className, /overflow-y-auto/);
+  assert.doesNotMatch(shell.className, /overflow-y-auto/, "the card is the frame, not the scroller");
+  const area = shell.firstElementChild as HTMLElement;
+  assert.ok(area.classList.contains("r-scroll-area"), "the rows scroll in a raft-ui ScrollArea that fills the card");
+  assert.equal(area.tabIndex, -1, "each row is a control: the area is no tab stop");
   // DS inset list: raft-ui's Card, a card surface with a hairline edge, no shadow.
   assert.equal(shell.getAttribute("data-slot"), "card");
   assert.match(shell.className, /rounded-container/);
@@ -127,16 +129,20 @@ test("AddMembersDialog uses the member-list surface and submits only candidates 
   assert.equal(screen.getByText("Wug").textContent, "Wug");
   assert.equal(screen.getByText("Mei").textContent, "Mei");
   assert.ok(shell.querySelector('[data-channel-member-avatar-badge-shell="true"]'));
-  assert.match(screen.getByText("Wug").closest(".group")?.className ?? "", /hover:bg-fill-pressed/);
+  // Raft DS Row hover: a member row hovers with the subtle tier (fill-subtle), not the medium tier.
+  assert.match(screen.getByText("Wug").closest(".group")?.className ?? "", /hover:bg-fill-subtle/);
+  assert.doesNotMatch(screen.getByText("Wug").closest(".group")?.className ?? "", /hover:bg-fill-medium/);
 
   const removeMei = screen.getByRole("button", { name: "Remove Mei from add list" });
   // Taking someone off the add list is reversible: a quiet icon button, not red.
-  assert.match(removeMei.className, /hover:bg-fill-pressed/);
+  assert.match(removeMei.className, /hover:bg-fill-medium/);
   assert.doesNotMatch(removeMei.className, /danger/);
-  assert.equal(removeMei.querySelector("svg")?.getAttribute("width"), "16");
+  // raft-ui ghost icon-md: a 32px box whose recipe sizes the glyph (18px).
+  assert.match(removeMei.className, /(?:^|\s)size-8(?:\s|$)/);
+  assert.ok(removeMei.querySelector("svg"), "remove control renders its glyph");
   fireEvent.click(removeMei);
 
-  await waitFor(() => assert.equal(screen.queryByText("Mei"), null));
+  await waitFor(() => assert.ok(screen.queryByText("Mei") === null));
   fireEvent.click(screen.getByRole("button", { name: "Add 1 member" }));
 
   await waitFor(() => assert.ok(submitted));
@@ -179,7 +185,7 @@ test("channel member role UI hides Member and swaps Channel Admin for hover acti
   });
   renderIntl(createElement(ChannelMemberRoleAndActions, { role: "admin", actions }));
 
-  assert.equal(screen.getByTestId("member-page-role-channel-admin").textContent, "Channel Admin");
+  assert.equal(screen.getByTestId("member-page-role-channel-admin").textContent, "Channel admin");
   const trailing = screen.getByTestId("member-page-trailing");
   assert.match(trailing.className, /self-center/);
   assert.match(trailing.className, /items-center/);
@@ -189,6 +195,12 @@ test("channel member role UI hides Member and swaps Channel Admin for hover acti
   );
   assert.match((trailing.children[0] as HTMLElement).className, /group-hover:invisible/);
   assert.match((trailing.children[1] as HTMLElement).className, /group-hover:visible/);
+  // Hover-reveal needs a mouse, not just a wide window: touch tablets
+  // (>=768px, no hover) must still see the actions.
+  for (const cell of [trailing, ...trailing.children] as HTMLElement[]) {
+    assert.doesNotMatch(cell.className, /(?:^|\s)md:(?!pointer-fine:)/);
+  }
+  assert.match((trailing.children[1] as HTMLElement).className, /(?:^|\s)md:pointer-fine:invisible(?:\s|$)/);
   const hoverActions = screen.getByTestId("channel-member-hover-actions");
   assert.equal(hoverActions.textContent, "Demote");
   assert.match(hoverActions.className, /items-center/);
@@ -198,7 +210,7 @@ test("channel member role UI hides Member and swaps Channel Admin for hover acti
   assert.equal(removeAction.textContent, "");
   assert.ok(removeAction.querySelector("svg"), "remove action renders its icon");
   // Both hover actions are the DS small control (32): the role action is
-  // raft-ui's `size="sm"` (h-8), the remove control is a hand-sized 32 square.
+  // raft-ui's `size="md"` (h-8), the remove control is a hand-sized 32 square.
   assert.match(roleAction.className, /(^| )h-8( |$)/);
   assert.match(removeAction.className, /size-8|h-8/);
   assert.doesNotMatch(removeAction.className, /(?:^|\s)mt-1(?:\s|$)/);
@@ -210,5 +222,5 @@ test("channel member role UI hides Member and swaps Channel Admin for hover acti
 
   cleanup();
   renderIntl(createElement(MemberRoleTag, { role: "member" }));
-  assert.equal(screen.queryByTestId("member-page-role-channel-admin"), null);
+  assert.ok(screen.queryByTestId("member-page-role-channel-admin") === null);
 });

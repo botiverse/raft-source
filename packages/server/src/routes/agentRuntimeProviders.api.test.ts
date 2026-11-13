@@ -5,14 +5,15 @@
 // credentials before the provider DELETE, and cross-server isolation.
 import { tokenForHuman, fixturePasswordHash } from "../test/integration/credentials";
 import { createApiTest } from "../test/integration/apiTest";
+import { seedBoundGuest } from "../test/guestFixture";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { ANTIPROTON_HOSTED_RUNTIME_FEATURE_FLAG_KEY } from "@botiverse/raft-shared";
+import { ANTIPROTON_HOSTED_RUNTIME_FEATURE_FLAG_KEY, isRefusalCode, refusalSentenceProblem } from "@botiverse/raft-shared";
 import { createServer as createHttpServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { and, eq, isNull } from "drizzle-orm";
 import { getDb } from "../db/index";
-import { agentCredentials, agentRuntimeProvisions, agents, featureFlagRules, featureFlags, integrationAuditEvents, serverAgentMembers, serverMembers, servers, users } from "../db/schema";
+import { agentConfigChangeEvents, agentCredentials, agentRuntimeProvisions, agents, featureFlagRules, featureFlags, integrationAuditEvents, serverAgentMembers, serverMembers, servers, users } from "../db/schema";
 import { createServer } from "../services/serverService";
 import { createAgent } from "../services/agentService";
 import { addAgent as addAgentToChannel, getOrCreateThread, listChannels } from "../services/channelService";
@@ -48,7 +49,7 @@ import { buildCindyMemoryMd, buildCindySeedFiles, EXTERNAL_AGENT_RUNTIME_ID, EXT
 import { createHash } from "node:crypto";
 import { createAgent as createAgentRow } from "../services/agentService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 const PROVIDER_TOKEN = "pt-fake-provider-token-0123456789abcdef";
 const RAFT_ORIGIN = "https://raft.example.test";
@@ -134,7 +135,7 @@ async function seedUser(email: string, name: string) {
   return user;
 }
 
-const ENV_KEYS = ["SLOCK_PROVIDER_CREDENTIAL_KEY", "SERVER_URL", "DEPLOYMENT_ENV", "ANTIPROTON_PROVISIONING_TOKEN"] as const;
+const ENV_KEYS = ["SLOCK_PROVIDER_CREDENTIAL_KEY", "SERVER_URL", "DEPLOYMENT_ENV", "ANTIPROTON_PROVISIONING_TOKEN", "HOSTED_RUNTIME_SEND_BUDGETS"] as const;
 
 function withEnv<T>(run: () => Promise<T>): Promise<T> {
   const saved = Object.fromEntries(ENV_KEYS.map((key) => [key, process.env[key]]));
@@ -142,6 +143,7 @@ function withEnv<T>(run: () => Promise<T>): Promise<T> {
   process.env.SERVER_URL = `${RAFT_ORIGIN}/`;
   delete process.env.DEPLOYMENT_ENV;
   delete process.env.ANTIPROTON_PROVISIONING_TOKEN;
+  delete process.env.HOSTED_RUNTIME_SEND_BUDGETS;
   return run().finally(() => {
     for (const key of ENV_KEYS) {
       if (saved[key] === undefined) delete process.env[key]; else process.env[key] = saved[key];
@@ -324,6 +326,20 @@ test("create provisions with an identical-body retry after a lost answer, and th
       const pending = await provisionRow(created.id);
       assert.ok(pending.encryptedCredential && !pending.encryptedCredential.startsWith("sk_agent_"));
       assert.ok(pending.credentialId);
+      const [issued] = await getDb().select().from(integrationAuditEvents).where(and(
+        eq(integrationAuditEvents.serverId, a.server.id),
+        eq(integrationAuditEvents.eventType, "agent_credential.issued"),
+      ));
+      assert.ok(issued, "the hosted-runtime mint is audited");
+      assert.equal(issued.actorType, "human");
+      assert.equal(issued.actorId, a.server.ownerId, "the creator's authority minted it");
+      assert.equal(issued.targetId, pending.credentialId);
+      assert.equal((issued.metadata as Record<string, unknown>).issuedVia, "provision");
+      // The provider holds the key and no person saw it: the row names no issuer.
+      const [credentialRow] = await getDb().select().from(agentCredentials).where(eq(agentCredentials.id, pending.credentialId));
+      assert.equal(credentialRow?.issuedVia, "provision");
+      assert.equal(credentialRow?.createdByUserId, null);
+      assert.equal(credentialRow?.issuedByMachineId, null);
 
       fake.next(() => "lose-response");
       const first = await drainAgentRuntimeProvisions();
@@ -654,6 +670,15 @@ test("delete revokes the credential before the provider DELETE and retries until
       assert.equal(del.status, 200);
       assert.equal(await findAgentCredentialByApiKey(credential), null, "credential unusable right after delete");
       assert.equal((await provisionRow(created.id)).state, "deleting");
+      const revokedEvents = await getDb().select().from(integrationAuditEvents).where(and(
+        eq(integrationAuditEvents.serverId, a.server.id),
+        eq(integrationAuditEvents.eventType, "agent_credential.revoked"),
+      ));
+      assert.equal(revokedEvents.length, 1, "one event for the agent's bulk revoke");
+      assert.equal(revokedEvents[0]!.actorId, a.server.ownerId);
+      const { operationId, ...revokedMetadata } = revokedEvents[0]!.metadata as Record<string, unknown>;
+      assert.deepEqual(revokedMetadata, { agentId: created.id, revokedCount: 1, reason: "agent_archived", actorRole: "owner" });
+      assert.equal(typeof operationId, "string", "the archive's revocations carry its operation id");
 
       await drainAgentRuntimeProvisions();
       assert.equal((await provisionRow(created.id)).state, "deleting", "5xx keeps the tombstone");
@@ -1093,8 +1118,8 @@ async function setupConnectionServer(baseUrl: string, slug: string) {
   await getDb().insert(serverMembers).values([
     { serverId: base.server.id, userId: admin.id, role: "admin" },
     { serverId: base.server.id, userId: creator.id, role: "member" },
-    { serverId: base.server.id, userId: guest.id, role: "guest" },
   ]);
+  await seedBoundGuest({ serverId: base.server.id, userId: guest.id });
   return {
     ...base,
     creatorUser: creator,
@@ -1141,7 +1166,17 @@ test("connect GitHub: owner/admin/creator only, returnUrl from the Raft origin, 
       await getDb().update(agents).set({ creatorId: a.creatorUser.id }).where(eq(agents.id, created.id));
       assert.equal(connectionRequests(fake).length, 0, "forbidden callers never reach the provider");
 
+      // A new connection acts as whoever signs it in, so only the agent's owner may start one (#proj-assistant:#23).
+      for (const [who, client] of [["owner", a.owner], ["admin", a.admin]] as const) {
+        const refused = await client.send("POST", path, {});
+        const body = await refused.json() as { code: string };
+        assert.deepEqual([refused.status, body.code], [403, "agent_connection_owner_required"], who);
+      }
+      assert.equal(connectionRequests(fake).length, 0, "an admin's new connection never reaches the provider");
+      const idOf = async (email: string) => (await getDb().select({ id: users.id }).from(users).where(eq(users.email, email)))[0]!.id;
+      const ownerIds = { owner: await idOf("conn-perm-owner@raft.test"), admin: await idOf("conn-perm-admin@raft.test"), creator: a.creatorUser.id };
       for (const [who, client] of [["owner", a.owner], ["admin", a.admin], ["creator", a.creator]] as const) {
+        await getDb().update(agents).set({ creatorId: ownerIds[who] }).where(eq(agents.id, created.id));
         const res = await client.send("POST", path, who === "admin" ? { access: "private" } : {});
         const text = await res.text();
         assert.equal(res.status, 200, `${who}: ${text}`);
@@ -1153,7 +1188,6 @@ test("connect GitHub: owner/admin/creator only, returnUrl from the Raft origin, 
       for (const body of bodies) {
         assert.equal(body.returnUrl, `${RAFT_ORIGIN}/api/connections/callback/${a.server.id}/${created.id}`);
       }
-      const idOf = async (email: string) => (await getDb().select({ id: users.id }).from(users).where(eq(users.email, email)))[0]!.id;
       assert.deepEqual(bodies.map((b) => b.initiatedBy.raftUserId), [
         await idOf("conn-perm-owner@raft.test"),
         await idOf("conn-perm-admin@raft.test"),
@@ -1199,6 +1233,7 @@ test("connection status resolves connectedBy, disconnect deletes, provider 404 m
         connectedAt: "2026-09-29T00:00:00.000Z",
         connectedBy: { id: a.creatorUser.id, name: a.creatorUser.displayName },
         scopes: ["public_repo"],
+        canConnectNew: false,
         connectorId: null,
         connectors: [],
       });
@@ -1240,7 +1275,8 @@ test("connection status resolves connectedBy, disconnect deletes, provider 404 m
         assert.deepEqual(await res.json(), {
           error: "This agent no longer exists at its provider; connections are unavailable. Recreate the agent.",
           code: "agent_connection_agent_missing_at_provider",
-          providerMessage: missingMessage,
+          errorCode: "agent_connection_agent_missing_at_provider",
+          details: { providerMessage: missingMessage },
         }, method);
         assert.equal(fake.requests.slice(before).filter(isAgentLookup).length, 1, `${method}: one agent lookup`);
       }
@@ -1369,11 +1405,12 @@ test("a provider refusal (4xx) surfaces its sanitized reason on connect and conf
         const res = await a.owner.send("POST", path, body);
         const text = await res.text();
         assert.equal(res.status, 409, text);
-        const json = JSON.parse(text) as { code: string; providerCode: string; providerMessage: string; error: string };
+        const json = JSON.parse(text) as { code: string; error: string; details: { providerCode: string; providerMessage: string; providerStatus: number } };
         assert.equal(json.code, "agent_connection_provider_refused");
-        assert.equal(json.providerCode, "github_mount_missing");
-        assert.match(json.providerMessage, /^Agent has no github plugin mount; add exactly one\./);
-        assert.equal(json.error, json.providerMessage);
+        assert.equal(json.details.providerCode, "github_mount_missing");
+        assert.equal(json.details.providerStatus, 409);
+        assert.match(json.details.providerMessage, /^Agent has no github plugin mount; add exactly one\./);
+        assert.equal(json.error, json.details.providerMessage, "the provider's sentence is the refusal's");
         assert.ok(!text.includes("ghp_abcdef0123456789") && !text.includes("secret-value"), "token-shaped text is redacted");
         assert.ok(!text.includes(PROVIDER_TOKEN));
       }
@@ -1382,10 +1419,19 @@ test("a provider refusal (4xx) surfaces its sanitized reason on connect and conf
       fake.setFallback(() => ({ status: 404, body: { error: { code: "pending_expired", message: "The pending connection expired." } } }));
       const expired = await a.owner.send("POST", `/agents/${created.id}/connections/github/confirm`, { pending: "pnd_old" });
       assert.equal(expired.status, 404);
-      assert.deepEqual(
-        await expired.json(),
-        { error: "The connection link expired or is invalid; start again", code: "agent_connection_pending_invalid", providerCode: "pending_expired", providerMessage: "The pending connection expired." },
-      );
+      assert.deepEqual(await expired.json(), {
+        error: "The connection link expired, was already used, or was started by someone else; start again",
+        code: "agent_connection_pending_invalid",
+        errorCode: "agent_connection_pending_invalid",
+        details: { providerCode: "pending_expired", providerStatus: 404, providerMessage: "The pending connection expired." },
+      });
+
+      // A reconnect whose connector was deleted meanwhile is connector_gone (antiproton #1167): the client drops that
+      // connection instead of starting the link again.
+      fake.setFallback(() => ({ status: 404, body: { error: { code: "connector_gone", message: "no github connector con_x in this tenant; it was disconnected meanwhile" } } }));
+      const gone = await a.owner.send("POST", `/agents/${created.id}/connections/github/confirm`, { pending: "pnd_gone" });
+      assert.equal(gone.status, 404);
+      assert.equal((await gone.json() as { code: string }).code, "agent_connection_connector_not_found");
     } finally {
       await fake.close();
     }
@@ -1444,15 +1490,27 @@ test("connection status lists the server's connectors with resolved creators, pe
       assert.ok(!text.includes("ghp_"), "no provider token field is passed through");
       const body = JSON.parse(text) as { connectorId: string; connectors: unknown[] };
       assert.equal(body.connectorId, "ctr_mine");
-      assert.deepEqual(body.connectors, [
-        { id: "ctr_mine", account: "octocat", createdAt: "2026-09-29T00:00:00.000Z", creator: { id: a.creatorUser.id, name: "conn-list-creator", displayName: "conn-list-creator" }, current: true, canManage: true },
-        { id: "ctr_admin", account: "hubot", createdAt: "2026-09-28T00:00:00.000Z", creator: { id: a.adminId, name: "conn-list-admin", displayName: "conn-list-admin" }, current: false, canManage: false },
-        // Not a member of this server: no name is resolved.
-        { id: "ctr_gone", account: "ex", createdAt: null, creator: { id: outsider.id, name: null, displayName: null }, current: false, canManage: false },
-      ]);
+      const mine = { id: "ctr_mine", account: "octocat", createdAt: "2026-09-29T00:00:00.000Z", creator: { id: a.creatorUser.id, name: "conn-list-creator", displayName: "conn-list-creator" }, current: true, canManage: true, assignable: true };
+      assert.deepEqual(body.connectors, [mine], "only what this agent may use: nobody else's account is offered");
 
       const asAdmin = await (await a.admin.get(path)).json() as { connectors: { id: string; canManage: boolean }[] };
-      assert.deepEqual(asAdmin.connectors.map((c) => c.canManage), [true, true, true], "owner/admin may manage every connector");
+      assert.deepEqual(asAdmin.connectors.map((c) => [c.id, c.canManage]), [["ctr_mine", true]], "an admin is offered no more than the owner");
+
+      // On someone else's connector from before the rule: still listed, so it can be cleared.
+      fake.setFallback(() => ({ status: 200, body: {
+        connected: true, connectorId: "ctr_gone", account: "ex", connectedAt: "2026-09-29T00:00:00.000Z", connectedBy: outsider.id,
+        connectors: [
+          { id: "ctr_mine", account: "octocat", creatorRaftUserId: a.creatorUser.id, createdAt: "2026-09-29T00:00:00.000Z", current: false },
+          { id: "ctr_gone", account: "ex", creatorRaftUserId: outsider.id, createdAt: null, current: true },
+          { id: "ctr_admin", account: "hubot", creatorRaftUserId: a.adminId, createdAt: "2026-09-28T00:00:00.000Z", current: false },
+        ],
+      } }));
+      const onForeign = await (await a.creator.get(path)).json() as { connectors: unknown[] };
+      assert.deepEqual(onForeign.connectors, [
+        { ...mine, current: false },
+        // Not a member of this server: no name is resolved.
+        { id: "ctr_gone", account: "ex", createdAt: null, creator: { id: outsider.id, name: null, displayName: null }, current: true, canManage: false, assignable: false },
+      ]);
     } finally {
       await fake.close();
     }
@@ -1513,20 +1571,38 @@ test("switching an agent's connector and disconnecting a connector need the conn
       await getDb().update(agents).set({ creatorId: a.creatorUser.id }).where(eq(agents.id, created.id));
       assert.equal(mutations().length, 0, "refused callers never reach the provider");
 
+      // Binding: only a connection the agent's owner created, whoever asks; an admin's role doesn't widen that.
+      for (const [label, client, connectorId] of [
+        ["admin, own connector", a.admin, "ctr_admin"],
+        ["admin, the member's connector", a.owner, "ctr_member"],
+      ] as const) {
+        const refused = await assign(client, connectorId);
+        const body = await refused.json() as { code: string; error: string };
+        assert.deepEqual([refused.status, body.code], [403, "agent_connection_owner_required"], label);
+        assert.match(body.error, /owner created/, label);
+      }
+      assert.equal(mutations().length, 0, "a refused binding never reaches the provider");
+
       // Allowed: the acting role Raft vouches for goes to the provider.
-      const allowed: [string, ReturnType<typeof api>, string, string, string][] = [
+      for (const [label, client, actingRaftUserId, actingRole] of [
+        ["the owner, their own connector", a.creator, a.creatorUser.id, "creator"],
+        ["an admin, the owner's connector", a.admin, a.adminId, "admin"],
+      ] as const) {
+        const put = await assign(client, "ctr_creator");
+        const putBody = await put.json() as { supported: boolean; connectors: { id: string }[] };
+        assert.equal(put.status, 200, `${label}: ${JSON.stringify(putBody)}`);
+        assert.deepEqual(putBody.connectors.map((connector) => connector.id), ["ctr_creator"], `${label}: returns the refreshed status`);
+        assert.deepEqual(JSON.parse(mutations().at(-1)!.body), { connectorId: "ctr_creator", actingRaftUserId, actingRole }, label);
+      }
+
+      // Disconnecting stays open to the connection's creator and to admins, for cleanup.
+      const cleanups: [string, ReturnType<typeof api>, string, string, string][] = [
         ["connector creator", a.creator, "ctr_creator", a.creatorUser.id, "creator"],
         ["admin, own connector", a.admin, "ctr_admin", a.adminId, "creator"],
         ["admin, other's connector", a.admin, "ctr_creator", a.adminId, "admin"],
         ["owner", a.owner, "ctr_member", a.ownerId, "admin"],
       ];
-      for (const [label, client, connectorId, actingRaftUserId, actingRole] of allowed) {
-        const put = await assign(client, connectorId);
-        const putBody = await put.json() as { supported: boolean; connectors: unknown[] };
-        assert.equal(put.status, 200, `${label}: ${JSON.stringify(putBody)}`);
-        assert.equal(putBody.connectors.length, connectors.length, `${label}: returns the refreshed status`);
-        assert.deepEqual(JSON.parse(mutations().at(-1)!.body), { connectorId, actingRaftUserId, actingRole }, label);
-
+      for (const [label, client, connectorId, actingRaftUserId, actingRole] of cleanups) {
         const del = await disconnect(client, connectorId);
         assert.equal(del.status, 204, label);
         const sent = mutations().at(-1)!;
@@ -1534,32 +1610,61 @@ test("switching an agent's connector and disconnecting a connector need the conn
         assert.deepEqual(JSON.parse(sent.body), { actingRaftUserId, actingRole }, label);
       }
 
-      // Partial failure: the provider could not detach some agents (502 + `failed`). Not a success; retrying the same call completes it.
-      let partialOnce = true;
-      fake.setFallback((request) => {
-        if (request.method === "GET" && request.path === statusPath) return { status: 200, body: { connected: false, connectors } };
-        if (request.method === "DELETE" && request.path.startsWith("/provision/connectors/")) {
-          if (partialOnce) {
-            partialOnce = false;
-            return { status: 502, body: { error: { code: "partial", message: "some agents were not detached" }, failed: [randomUUID(), randomUUID()] } };
+      // Partial failure: some agents still hold the connector's credential. Not a success; retrying the same call
+      // completes it. Recognized by the body's `outcome`, not the status (antiproton#1131 answers 409).
+      const stillHeld = [randomUUID(), randomUUID()];
+      // The body antiproton builds (cf/src/provision/handlers.ts `disconnect`), copied from its code on 2026-11-01,
+      // not invented here: the 409 from 2a3c272c (#1131 merged). Check: `git show
+      // 2a3c272c:cf/src/provision/handlers.ts`. `failedCount` counts this origin's agents only (`agents`).
+      const partialShapes: [string, { status: number; body: unknown }][] = [
+        ["409 not_cleared (antiproton#1131)", { status: 409, body: {
+          error: { code: "partially_disconnected", message: "some agents still hold this connector's credential; their bindings and the connector were kept, and the same call finishes the job" },
+          outcome: "not_cleared", retry: true, agents: stillHeld,
+          detached: [], failed: stillHeld.map((raftAgentId) => ({ raftAgentId, error: "the agent's object did not answer: timeout", action: "retry_delete" })),
+        } }],
+      ];
+      for (const [label, answer] of partialShapes) {
+        let partialOnce = true;
+        fake.setFallback((request) => {
+          if (request.method === "GET" && request.path === statusPath) return { status: 200, body: { connected: false, connectors } };
+          if (request.method === "DELETE" && request.path.startsWith("/provision/connectors/")) {
+            if (partialOnce) {
+              partialOnce = false;
+              return answer;
+            }
+            return { status: 204 };
           }
-          return { status: 204 };
-        }
-        return { status: 500 };
-      });
-      const partial = await disconnect(a.owner, "ctr_admin");
-      assert.equal(partial.status, 502);
-      assert.deepEqual(await partial.json(), {
-        error: "Disconnect partially completed; retry to finish",
-        code: "agent_connection_connector_disconnect_partial",
-        failedCount: 2,
-      });
-      assert.equal((await disconnect(a.owner, "ctr_admin")).status, 204, "retry completes the cleanup");
+          return { status: 500 };
+        });
+        const partial = await disconnect(a.owner, "ctr_admin");
+        assert.equal(partial.status, 502, label);
+        assert.deepEqual(await partial.json(), {
+          error: "Disconnect partially completed; retry to finish",
+          code: "agent_connection_connector_disconnect_partial",
+          failedCount: 2,
+        }, label);
+        assert.equal((await disconnect(a.owner, "ctr_admin")).status, 204, `${label}: retry completes the cleanup`);
+      }
       const partialAudits = await getDb().select().from(integrationAuditEvents).where(eq(integrationAuditEvents.eventType, "agent_connection.connector_disconnected"));
-      assert.equal(partialAudits.filter((row) => row.targetId === created.id && row.outcome === "failure").length, 1);
+      assert.equal(partialAudits.filter((row) => row.targetId === created.id && row.outcome === "failure").length, partialShapes.length);
       fake.setFallback((request) => {
         if (request.method === "GET" && request.path === statusPath) return { status: 200, body: { connected: false, connectorId: null, account: null, connectors } };
         return { status: 204 };
+      });
+
+      // Agent-level DELETE whose mount clear did not take (antiproton#1131): 409 `outcome: "not_cleared"`, the
+      // connection kept. Raft says so and asks for a retry; never a "fix your setup" refusal (the code names a mount).
+      // Body copied on 2026-11-01 from the agent-level removal in cf/src/provision/handlers.ts at 2a3c272c.
+      fake.next(() => ({ status: 409, body: {
+        error: { code: "mount_not_cleared", message: "the agent's mount still holds the connection's credential (timeout); the connection was kept, DELETE it again" },
+        outcome: "not_cleared", retry: true, agents: [created.id], binding: "kept", mount: "not_cleared", action: "retry_delete",
+      } }));
+      const notCleared = await a.creator.send("DELETE", agentPath);
+      assert.equal(notCleared.status, 409);
+      assert.deepEqual(await notCleared.json(), {
+        error: "The agent still holds the connection's credential; the connection was kept. Try again",
+        code: "agent_connection_disconnect_not_cleared",
+        errorCode: "agent_connection_disconnect_not_cleared",
       });
 
       // Agent-level DELETE only detaches this agent (the existing rule, no connector check).
@@ -1580,9 +1685,484 @@ test("switching an agent's connector and disconnecting a connector need the conn
       const audits = await getDb().select().from(integrationAuditEvents).where(eq(integrationAuditEvents.targetId, created.id));
       const assigned = audits.filter((row) => row.eventType === "agent_connection.connector_assigned" && row.outcome === "success");
       const disconnected = audits.filter((row) => row.eventType === "agent_connection.connector_disconnected" && row.outcome === "success");
-      assert.equal(assigned.length, 4);
-      assert.equal(disconnected.length, 5, "four in the matrix plus the completed retry");
-      assert.deepEqual(assigned.map((row) => (row.metadata as { actingRole: string }).actingRole).sort(), ["admin", "admin", "creator", "creator"]);
+      assert.equal(assigned.length, 2);
+      assert.equal(disconnected.length, 4 + partialShapes.length, "four in the matrix plus each completed retry");
+      assert.deepEqual(assigned.map((row) => (row.metadata as { actingRole: string }).actingRole).sort(), ["admin", "creator"]);
+    } finally {
+      await fake.close();
+    }
+  });
+});
+
+// antiproton's connector refusals, `{error: {code, message}}` as cf/src/provision/handlers.ts writes them (copied
+// from antiproton 4140460 on 2026-11-05; docs/agent-surface.md "Reconnecting a connector in place"), each mapped to
+// a code in REFUSAL_CODES with its status; any other code is the generic refusal, its sentence passed through.
+test("antiproton's connector refusals become listed refusal codes in the envelope; any other passes its sentence through", async ({ app }) => {
+  await withEnv(async () => {
+    const fake = await startFakeProvider();
+    try {
+      const a = await setupConnectorServer(app.baseUrl, "conn-refusal-map");
+      await configure(fake, a);
+      const created = await createHosted(a.owner, "conn-refusal-map-agent");
+      await drainAgentRuntimeProvisions();
+      // The member "creator" made the agent and the connector: Raft vouches for it as `creator`.
+      await getDb().update(agents).set({ creatorType: "user", creatorId: a.creatorUser.id }).where(eq(agents.id, created.id));
+      const statusPath = `/provision/agents/by-raft-agent/${created.id}/connections/github?raftServerId=${a.server.id}`;
+      const agentLookupPath = `/provision/agents/by-raft-agent/${created.id}?raftServerId=${a.server.id}`;
+      const connectors = [{ id: "con_mine", account: "octocat", creatorRaftUserId: a.creatorUser.id, createdAt: "2026-10-17T13:26:02.504Z", current: true }];
+      const providerAnswers = (reply: { status: number; body?: unknown }) => fake.setFallback((request) => {
+        if (request.method === "GET" && request.path === statusPath) return { status: 200, body: { connected: true, connectorId: "con_mine", account: "octocat", connectors } };
+        if (request.method === "GET" && request.path === agentLookupPath) return { status: 200, body: { providerAgentId: `raft_${created.id}`, status: "active" } };
+        return reply;
+      });
+      const agentPath = `/agents/${created.id}/connections/github`;
+      const confirm = () => a.creator.send("POST", `${agentPath}/confirm`, { pending: "pnd_reconnect" });
+      const assign = () => a.creator.send("PUT", agentPath, { connectorId: "con_mine" });
+      const disconnect = () => a.creator.send("DELETE", `${agentPath}/connectors/con_mine`);
+      const mismatch = "this connector is GitHub account octocat, and the authorization was for mallory; nothing was changed. Sign in to GitHub as octocat and reconnect, or connect without connectorId to make a new connector";
+      const notCreator = "actingRole is creator, but this connector was created by someone else";
+      const broken = "OAuth authorization expired; reconnect required: this connector has to be connected again before an agent is pointed at it";
+      const forbidden = "Only the connection's creator or a server admin can reconnect, switch or disconnect it";
+
+      const cases: [string, () => Promise<Response>, { status: number; body?: unknown }, number, Record<string, unknown>][] = [
+        ["confirm of a reconnect, another GitHub account (409 account_mismatch)", confirm,
+          { status: 409, body: { error: { code: "account_mismatch", message: mismatch } } }, 409, {
+            code: "agent_connection_account_mismatch",
+            error: "The GitHub account you authorized is not the one this connection belongs to, so nothing was changed. Sign in to GitHub as the connection's account, then reconnect.",
+            details: { providerCode: "account_mismatch", providerStatus: 409, providerMessage: mismatch },
+          }],
+        ["confirm of a reconnect, not the connector's creator (403 not_creator)", confirm,
+          { status: 403, body: { error: { code: "not_creator", message: notCreator } } }, 403, {
+            code: "agent_connection_connector_forbidden", error: forbidden,
+            details: { providerCode: "not_creator", providerStatus: 403, providerMessage: notCreator },
+          }],
+        ["switch, the provider's creator check refuses (403 not_creator)", assign,
+          { status: 403, body: { error: { code: "not_creator", message: notCreator } } }, 403, {
+            code: "agent_connection_connector_forbidden", error: forbidden,
+            details: { providerCode: "not_creator", providerStatus: 403, providerMessage: notCreator },
+          }],
+        ["disconnect, the provider's creator check refuses (403 not_creator)", disconnect,
+          { status: 403, body: { error: { code: "not_creator", message: notCreator } } }, 403, {
+            code: "agent_connection_connector_forbidden", error: forbidden,
+            details: { providerCode: "not_creator", providerStatus: 403, providerMessage: notCreator },
+          }],
+        ["switch, the connector is gone (404 not_found, the agent still there)", assign,
+          { status: 404, body: { error: { code: "not_found", message: "no github connector con_mine in this tenant" } } }, 404, {
+            code: "agent_connection_connector_not_found", error: "That connection does not exist on this server any more; reload the connections",
+          }],
+        ["confirm, the link expired or was used (404 not_found)", confirm,
+          { status: 404, body: { error: { code: "not_found", message: "no pending connection with that id for this agent and user; it may have expired or been used" } } }, 404, {
+            code: "agent_connection_pending_invalid",
+            error: "The connection link expired, was already used, or was started by someone else; start again",
+            details: { providerCode: "not_found", providerStatus: 404, providerMessage: "no pending connection with that id for this agent and user; it may have expired or been used" },
+          }],
+        ["switch to a connector that needs reconnecting (422 connect_failed, not listed)", assign,
+          { status: 422, body: { error: { code: "connect_failed", message: broken } } }, 409, {
+            code: "agent_connection_provider_refused", error: broken,
+            details: { providerCode: "connect_failed", providerStatus: 422, providerMessage: broken },
+          }],
+        ["an unknown code whose message is no sentence: Raft's own", confirm,
+          { status: 400, body: { error: { code: "unknown_field", message: "connectorId" } } }, 409, {
+            code: "agent_connection_provider_refused", error: "The agent's provider refused the request",
+            details: { providerCode: "unknown_field", providerStatus: 400, providerMessage: "connectorId" },
+          }],
+        ["an unknown code with no message: Raft's own", assign,
+          { status: 409, body: { error: { code: "conflict" } } }, 409, {
+            code: "agent_connection_provider_refused", error: "The agent's provider refused the request",
+            details: { providerCode: "conflict", providerStatus: 409 },
+          }],
+      ];
+      for (const [label, call, answer, status, expected] of cases) {
+        providerAnswers(answer);
+        const res = await call();
+        const text = await res.text();
+        assert.equal(res.status, status, `${label}: ${text}`);
+        const body = JSON.parse(text) as Record<string, unknown> & { code: string; error: string };
+        assert.deepEqual(body, { ...expected, errorCode: expected.code }, label);
+        assert.ok(isRefusalCode(body.code), `${label}: ${body.code} is in REFUSAL_CODES`);
+        assert.equal(refusalSentenceProblem(body.error), null, `${label}: the error is a refusal sentence`);
+      }
+    } finally {
+      await fake.close();
+    }
+  });
+});
+
+// A reconnect in place (antiproton docs/agent-surface.md "Reconnecting a connector in place", cf/src/provision/handlers.ts
+// connection POST and `reconnectInPlace`, at a22004a on 2026-11-05): the link-start POST names the connector
+// (`connectorId`) and the capacity Raft checked the initiator in (`actingRole`); the initiator is `initiatedBy.raftUserId`.
+test("reconnecting a connector in place needs the connector's creator or an owner/admin, and names it to the provider", async ({ app }) => {
+  await withEnv(async () => {
+    const fake = await startFakeProvider();
+    try {
+      const a = await setupConnectorServer(app.baseUrl, "conn-reconnect");
+      await configure(fake, a);
+      const created = await createHosted(a.owner, "conn-reconnect-agent");
+      await drainAgentRuntimeProvisions();
+      // The member "creator" owns the agent, so it may manage it but reconnect only its own connectors.
+      await getDb().update(agents).set({ creatorType: "user", creatorId: a.creatorUser.id }).where(eq(agents.id, created.id));
+      const statusPath = `/provision/agents/by-raft-agent/${created.id}/connections/github?raftServerId=${a.server.id}`;
+      const confirmPath = `/provision/agents/by-raft-agent/${created.id}/connections/github/confirm?raftServerId=${a.server.id}`;
+      const agentLookupPath = `/provision/agents/by-raft-agent/${created.id}?raftServerId=${a.server.id}`;
+      const connectors = [
+        { id: "con_creator", account: "octocat", creatorRaftUserId: a.creatorUser.id, createdAt: "2026-10-17T13:26:02.504Z", current: true,
+          oauthStatus: "error", lastCheckError: "OAuth authorization expired; reconnect required", lastCheckedAt: "2026-10-17T23:28:42.744Z" },
+        { id: "con_admin", account: "hubot", creatorRaftUserId: a.adminId, createdAt: "2026-10-17T13:26:02.504Z", current: false },
+        { id: "con_member", account: "monalisa", creatorRaftUserId: a.memberId, createdAt: "2026-10-17T13:26:02.504Z", current: false },
+      ];
+      const link = { url: "https://antiproton.test/connect/start?t=signed", expiresAt: "2026-11-05T00:10:00.000Z", scopes: ["public_repo"] };
+      const answers = (start: (request: Recorded) => Reply, lookup: Reply = { status: 200, body: { providerAgentId: `raft_${created.id}`, status: "active" } }) => fake.setFallback((request) => {
+        if (request.method === "GET" && request.path === statusPath) {
+          return { status: 200, body: { connected: false, connectorId: "con_creator", account: "octocat", oauthStatus: "error", connectors } };
+        }
+        if (request.method === "GET" && request.path === agentLookupPath) return lookup;
+        if (request.method === "POST" && request.path === statusPath) return start(request);
+        return { status: 500, body: { error: { code: "unexpected", message: `${request.method} ${request.path}` } } };
+      });
+      // antiproton's answer: the link, and `reconnect` naming the connector it was signed for.
+      answers((request) => {
+        const sent = JSON.parse(request.body) as { connectorId?: string };
+        return { status: 200, body: { ...link, ...(sent.connectorId ? { reconnect: sent.connectorId } : {}) } };
+      });
+      const agentPath = `/agents/${created.id}/connections/github`;
+      const linkStarts = () => fake.requests.filter((r) => r.method === "POST" && r.path === statusPath);
+      const reconnect = (client: ReturnType<typeof api>, body: Record<string, unknown>) => client.send("POST", agentPath, body);
+      const returnUrl = `${RAFT_ORIGIN}/api/connections/callback/${a.server.id}/${created.id}`;
+
+      // Refused: the provider is never asked for a link. A malformed connectorId or an unknown field is refused before
+      // anything reaches the provider; an unknown connector, or one the caller may not mend, after the connector lookup.
+      const before = fake.requests.length;
+      const refusals: [string, () => Promise<Response>, number, string, Record<string, unknown>?][] = [
+        ["agent creator, someone else's connector", () => reconnect(a.creator, { connectorId: "con_admin" }), 403, "agent_connection_connector_forbidden"],
+        ["agent creator, someone else's connector, private access", () => reconnect(a.creator, { connectorId: "con_member", access: "private" }), 403, "agent_connection_connector_forbidden"],
+        ["connector creator who cannot manage the agent", () => reconnect(a.member, { connectorId: "con_member" }), 403, "agent_connection_forbidden"],
+        ["unknown connector", () => reconnect(a.owner, { connectorId: "con_nope" }), 404, "agent_connection_connector_not_found"],
+        ["malformed connectorId (a path)", () => reconnect(a.owner, { connectorId: "bad id/.." }), 400, "agent_connection_invalid"],
+        ["malformed connectorId (empty)", () => reconnect(a.owner, { connectorId: "" }), 400, "agent_connection_invalid"],
+        ["malformed connectorId (not a string)", () => reconnect(a.owner, { connectorId: ["con_creator"] }), 400, "agent_connection_invalid"],
+        ["an unknown field", () => reconnect(a.owner, { reconnect: "con_creator" }), 400, "agent_connection_invalid", { field: "reconnect" }],
+        ["the acting role is Raft's to decide", () => reconnect(a.creator, { connectorId: "con_admin", actingRole: "admin" }), 400, "agent_connection_invalid", { field: "actingRole" }],
+      ];
+      for (const [label, call, status, code, details] of refusals) {
+        const res = await call();
+        const json = await res.json() as { code: string; error: string; details?: unknown };
+        assert.equal(res.status, status, `${label}: ${JSON.stringify(json)}`);
+        assert.equal(json.code, code, label);
+        if (details) assert.deepEqual(json.details, details, label);
+        if (code === "agent_connection_connector_forbidden") assert.match(json.error, /creator or a server admin/, label);
+      }
+      assert.equal(linkStarts().length, 0, "refused callers never get a link");
+      assert.deepEqual(
+        fake.requests.slice(before).map((r) => `${r.method} ${r.path}`),
+        [`GET ${statusPath}`, `GET ${statusPath}`, `GET ${statusPath}`],
+        "only the connector lookups of the two forbidden reconnects and the unknown connector reach the provider",
+      );
+
+      // Allowed: the connector and the role Raft vouches for go to the provider with the session user as initiator.
+      const allowed: [string, ReturnType<typeof api>, Record<string, unknown>, string, string][] = [
+        ["connector creator", a.creator, { connectorId: "con_creator" }, a.creatorUser.id, "creator"],
+        ["connector creator, private access", a.creator, { connectorId: "con_creator", access: "private" }, a.creatorUser.id, "creator"],
+        ["admin, own connector", a.admin, { connectorId: "con_admin" }, a.adminId, "creator"],
+        ["admin, another's connector", a.admin, { connectorId: "con_creator" }, a.adminId, "admin"],
+        ["owner, a member's connector", a.owner, { connectorId: "con_member" }, a.ownerId, "admin"],
+      ];
+      for (const [label, client, body, initiator, actingRole] of allowed) {
+        const res = await reconnect(client, body);
+        const text = await res.text();
+        assert.equal(res.status, 200, `${label}: ${text}`);
+        assert.deepEqual(JSON.parse(text), link, label);
+        assert.deepEqual(JSON.parse(linkStarts().at(-1)!.body), {
+          returnUrl,
+          initiatedBy: { raftUserId: initiator },
+          ...(body.access ? { access: body.access } : {}),
+          connectorId: body.connectorId,
+          actingRole,
+        }, label);
+      }
+      // Without a connector (or with null) it is a connect as before: no connector, no acting role.
+      for (const body of [{}, { connectorId: null }]) {
+        assert.equal((await reconnect(a.creator, body)).status, 200, JSON.stringify(body));
+        assert.deepEqual(JSON.parse(linkStarts().at(-1)!.body), { returnUrl, initiatedBy: { raftUserId: a.creatorUser.id } }, JSON.stringify(body));
+      }
+      const initiated = (await getDb().select().from(integrationAuditEvents).where(eq(integrationAuditEvents.eventType, "agent_connection.connect_initiated")))
+        .filter((row) => row.targetId === created.id && row.outcome === "success")
+        .map((row) => row.metadata as { connectorId?: string; actingRole?: string });
+      assert.deepEqual(initiated.map((m) => `${m.connectorId ?? "-"} ${m.actingRole ?? "-"}`).sort(), [
+        "- -", "- -", "con_admin creator", "con_creator admin", "con_creator creator", "con_creator creator", "con_member admin",
+      ], "the audit names the connector and the role of each reconnect");
+
+      // antiproton answers 404 to the link-start POST: with a connector named, that is the connector (unknown or
+      // another tenant's), or the agent when it is gone too; never "unsupported" (which a plain connect still says).
+      const notFound: Reply = { status: 404, body: { error: { code: "not_found", message: "no github connector con_creator in this tenant" } } };
+      answers(() => notFound);
+      const gone = await reconnect(a.creator, { connectorId: "con_creator" });
+      assert.equal(gone.status, 404);
+      assert.equal((await gone.json() as { code: string }).code, "agent_connection_connector_not_found");
+      const plain = await reconnect(a.creator, {});
+      assert.equal(plain.status, 409);
+      assert.equal((await plain.json() as { code: string }).code, "agent_connection_unsupported", "a plain connect's 404 is still classified as before");
+      answers(() => notFound, { status: 404, body: { error: { code: "not_found", message: `no provisioned agent made from Raft agent ${created.id}` } } });
+      const agentGone = await reconnect(a.creator, { connectorId: "con_creator" });
+      assert.equal(agentGone.status, 409);
+      assert.equal((await agentGone.json() as { code: string }).code, "agent_connection_agent_missing_at_provider");
+
+      // antiproton re-checks a creator claim at the POST (`403 not_creator`): Raft's own refusal.
+      answers(() => ({ status: 403, body: { error: { code: "not_creator", message: "actingRole is creator, but this connector was created by someone else" } } }));
+      const notCreator = await reconnect(a.creator, { connectorId: "con_creator" });
+      assert.equal(notCreator.status, 403);
+      assert.equal((await notCreator.json() as { code: string }).code, "agent_connection_connector_forbidden");
+
+      // Confirm takes no connector of its own (the provider sealed it into the link). A mended connector keeps its id;
+      // another GitHub account changes nothing and is refused as account_mismatch.
+      const mismatch = "this connector is GitHub account octocat, and the authorization was for mallory; nothing was changed. Sign in to GitHub as octocat and reconnect, or connect without connectorId to make a new connector";
+      let confirmAnswer: Reply = { status: 409, body: { error: { code: "account_mismatch", message: mismatch } } };
+      fake.setFallback((request) => request.method === "POST" && request.path === confirmPath ? confirmAnswer : { status: 500 });
+      const refusedConfirm = await a.creator.send("POST", `${agentPath}/confirm`, { pending: "pnd_reconnect" });
+      assert.equal(refusedConfirm.status, 409);
+      assert.equal((await refusedConfirm.json() as { code: string }).code, "agent_connection_account_mismatch");
+      assert.deepEqual(JSON.parse(fake.requests.at(-1)!.body), { pending: "pnd_reconnect", raftUserId: a.creatorUser.id });
+      confirmAnswer = { status: 200, body: {
+        connected: true, reconnected: true, connectorId: "con_creator", account: "octocat",
+        connectedAt: "2026-11-05T00:01:00.000Z", connectedBy: a.creatorUser.id, updated: [created.id], failed: [],
+      } };
+      const mended = await a.creator.send("POST", `${agentPath}/confirm`, { pending: "pnd_reconnect" });
+      const mendedBody = await mended.json() as { connected: boolean; connectorId: string; account: string };
+      assert.equal(mended.status, 200, JSON.stringify(mendedBody));
+      assert.deepEqual([mendedBody.connected, mendedBody.connectorId, mendedBody.account], [true, "con_creator", "octocat"], "the same connector, mended");
+    } finally {
+      await fake.close();
+    }
+  });
+});
+
+test("#proj-assistant:#23: a personal assistant binds only its owner's connection, an agent-made agent none, and what is bound can still be cleared", async ({ app }) => {
+  await withEnv(async () => {
+    const fake = await startFakeProvider();
+    try {
+      const a = await setupConnectorServer(app.baseUrl, "conn-owner");
+      await configure(fake, a);
+      const created = await createHosted(a.owner, "conn-owner-agent");
+      await drainAgentRuntimeProvisions();
+      // Artea's case: a person who is an admin, with a personal assistant. Being its owner and an admin must not
+      // let it use another person's account. The assistant owner wins over who created the row.
+      await getDb().update(agents).set({ assistantOwnerUserId: a.adminId }).where(eq(agents.id, created.id));
+      const statusPath = `/provision/agents/by-raft-agent/${created.id}/connections/github?raftServerId=${a.server.id}`;
+      const connectors = [
+        { id: "ctr_own", account: "mine", creatorRaftUserId: a.adminId, createdAt: "2026-09-29T00:00:00.000Z", current: false },
+        { id: "ctr_other", account: "TennyZhuang", creatorRaftUserId: a.ownerId, createdAt: "2026-09-29T00:00:00.000Z", current: true },
+        { id: "ctr_spare", account: "TennyZhuang", creatorRaftUserId: a.ownerId, createdAt: "2026-09-29T00:00:00.000Z", current: false },
+      ];
+      fake.setFallback((request) => {
+        if (request.method === "GET" && request.path === statusPath) return { status: 200, body: { connected: true, connectorId: "ctr_other", account: "TennyZhuang", connectors } };
+        if (request.method === "PUT" && request.path === statusPath) return { status: 200, body: {} };
+        if (request.method === "DELETE" && request.path === statusPath) return { status: 204 };
+        return { status: 500, body: { error: { code: "unexpected", message: `${request.method} ${request.path}` } } };
+      });
+      const path = `/agents/${created.id}/connections/github`;
+      const puts = () => fake.requests.filter((request) => request.method === "PUT");
+
+      const refused = await a.admin.send("PUT", path, { connectorId: "ctr_spare" });
+      const refusedBody = await refused.json() as { code: string };
+      assert.deepEqual([refused.status, refusedBody.code], [403, "agent_connection_owner_required"], "an admin can't bind someone else's account to their own assistant");
+      assert.equal(puts().length, 0);
+
+      const listed = await (await a.admin.get(path)).json() as { canConnectNew: boolean; connectors: { id: string; assignable: boolean; canManage: boolean }[] };
+      assert.deepEqual(listed.connectors.map((c) => [c.id, c.assignable]), [["ctr_own", true], ["ctr_other", false]], "the spare is not offered; the current one can be cleared");
+      assert.equal(listed.canConnectNew, true, "its owner can connect a new account");
+      assert.equal(listed.connectors.find((c) => c.id === "ctr_other")?.canManage, true);
+
+      assert.equal((await a.admin.send("PUT", path, { connectorId: "ctr_own" })).status, 200, "its own connection binds");
+      assert.deepEqual(JSON.parse(puts().at(-1)!.body), { connectorId: "ctr_own", actingRaftUserId: a.adminId, actingRole: "creator" });
+      assert.equal((await a.admin.send("DELETE", path)).status, 204, "what is bound can still be cleared");
+
+      // An agent made by an agent has no owner: nobody can bind one or start a new one.
+      await getDb().update(agents).set({ assistantOwnerUserId: null, creatorType: "agent", creatorId: randomUUID() }).where(eq(agents.id, created.id));
+      const noOwner = await a.owner.send("PUT", path, { connectorId: "ctr_spare" });
+      assert.equal(((await noOwner.json()) as { code: string }).code, "agent_connection_owner_required");
+      const noOwnerStart = await a.owner.send("POST", path, {});
+      assert.equal(((await noOwnerStart.json()) as { code: string }).code, "agent_connection_owner_required");
+    } finally {
+      await fake.close();
+    }
+  });
+});
+
+test("connection status passes the provider's health and scopes through as sent, and never invents them", async ({ app }) => {
+  await withEnv(async () => {
+    const fake = await startFakeProvider();
+    try {
+      const a = await setupConnectorServer(app.baseUrl, "conn-health");
+      await configure(fake, a);
+      const created = await createHosted(a.owner, "conn-health-agent");
+      await drainAgentRuntimeProvisions();
+      await getDb().update(agents).set({ creatorType: "user", creatorId: a.adminId }).where(eq(agents.id, created.id));
+      const path = `/agents/${created.id}/connections/github`;
+      const reason = "OAuth authorization expired; reconnect required";
+      const creatorRaftUserId = a.adminId;
+      // A connection GitHub refused to renew, as antiproton's GET answers it (docs/agent-surface.md, "A connection that
+      // needs reconnecting"), next to connectors that are healthy, and that come from before health. Scopes as antiproton
+      // #1166 (eba128f4, `connectorScope`) sends them: `scopes` granted, `requestedScopes` asked for; [] none named, null
+      // not recorded (a connector from before it kept them), keys absent from an older antiproton.
+      fake.next(() => ({ status: 200, body: {
+        connected: false, connectorId: "con_broken", account: "octocat", connectedAt: "2026-10-17T13:26:02.504Z", connectedBy: a.adminId,
+        oauthStatus: "error", lastCheckError: reason, lastCheckedAt: "2026-10-17T23:28:42.744Z", scopes: null, requestedScopes: null,
+        connectors: [
+          { id: "con_broken", account: "octocat", creatorRaftUserId, createdAt: "2026-10-17T13:26:02.504Z", current: true,
+            oauthStatus: "error", lastCheckError: reason, lastCheckedAt: "2026-10-17T23:28:42.744Z", scopes: null, requestedScopes: null },
+          { id: "con_ok", account: "hubot", creatorRaftUserId, createdAt: "2026-10-16T00:00:00.000Z", current: false,
+            oauthStatus: "connected", lastCheckError: null, lastCheckedAt: "2026-10-18T00:00:00.000Z", scopes: ["repo", 7, "gist"], requestedScopes: ["repo"] },
+          { id: "con_none", account: "monalisa", creatorRaftUserId, createdAt: "2026-10-16T00:00:00.000Z", current: false,
+            oauthStatus: "connected", lastCheckError: null, lastCheckedAt: null, scopes: [], requestedScopes: ["public_repo"] },
+          { id: "con_old", account: "ex", creatorRaftUserId, createdAt: null, current: false, scope: "public_repo read:org" },
+          { id: "con_odd", account: "odd", creatorRaftUserId, createdAt: null, current: false,
+            oauthStatus: "pending", lastCheckError: 42, lastCheckedAt: 7, scopes: "repo", requestedScopes: { repo: true } },
+        ],
+      } }));
+      const res = await a.admin.get(path);
+      const text = await res.text();
+      assert.equal(res.status, 200, text);
+      const status = JSON.parse(text) as Record<string, unknown> & { connectors: Record<string, unknown>[] };
+      // "Needs reconnecting" is this field on the query, not a refusal.
+      assert.equal(status.connected, false);
+      assert.equal(status.oauthStatus, "error");
+      assert.equal(status.lastCheckError, reason);
+      assert.equal(status.lastCheckedAt, "2026-10-17T23:28:42.744Z");
+      // The status's `scopes` stays the string[] it always was; `requestedScopes` is passed through, null kept.
+      assert.deepEqual(status.scopes, []);
+      assert.ok("requestedScopes" in status && status.requestedScopes === null, "requestedScopes: null is kept on the status");
+      const creator = { id: a.adminId, name: "conn-health-admin", displayName: "conn-health-admin" };
+      assert.deepEqual(status.connectors, [
+        // Not recorded: null on both, never [].
+        { id: "con_broken", account: "octocat", createdAt: "2026-10-17T13:26:02.504Z", creator, current: true, canManage: true, assignable: true,
+          oauthStatus: "error", lastCheckError: reason, lastCheckedAt: "2026-10-17T23:28:42.744Z", scopes: null, requestedScopes: null },
+        // Arrays as string lists (a non-string entry dropped).
+        { id: "con_ok", account: "hubot", createdAt: "2026-10-16T00:00:00.000Z", creator, current: false, canManage: true, assignable: true,
+          oauthStatus: "connected", lastCheckError: null, lastCheckedAt: "2026-10-18T00:00:00.000Z", scopes: ["repo", "gist"], requestedScopes: ["repo"] },
+        // GitHub named none: [] stays [], and what was asked for is not taken for granted.
+        { id: "con_none", account: "monalisa", createdAt: "2026-10-16T00:00:00.000Z", creator, current: false, canManage: true, assignable: true,
+          oauthStatus: "connected", lastCheckError: null, lastCheckedAt: null, scopes: [], requestedScopes: ["public_repo"] },
+        // Nothing sent, nothing said: no health and no scope keys, and an OAuth `scope` string is not read.
+        { id: "con_old", account: "ex", createdAt: null, creator, current: false, canManage: true, assignable: true },
+        // Malformed is left out, never coerced: an unknown status word, a non-string error or time, scopes neither array nor null.
+        { id: "con_odd", account: "odd", createdAt: null, creator, current: false, canManage: true, assignable: true },
+      ]);
+
+      // Connected: both lists from antiproton.
+      fake.next(() => ({ status: 200, body: {
+        connected: true, connectorId: "con_ok", account: "hubot", connectedAt: "2026-10-18T00:00:00.000Z", connectedBy: a.adminId,
+        scopes: ["repo", "gist"], requestedScopes: ["repo"], oauthStatus: "connected", lastCheckError: null, lastCheckedAt: "2026-10-18T00:00:00.000Z", connectors: [],
+      } }));
+      const healthy = await (await a.admin.get(path)).json() as Record<string, unknown>;
+      assert.deepEqual(
+        { scopes: healthy.scopes, requestedScopes: healthy.requestedScopes, oauthStatus: healthy.oauthStatus, lastCheckError: healthy.lastCheckError, lastCheckedAt: healthy.lastCheckedAt },
+        { scopes: ["repo", "gist"], requestedScopes: ["repo"], oauthStatus: "connected", lastCheckError: null, lastCheckedAt: "2026-10-18T00:00:00.000Z" },
+      );
+
+      // Connected through a connection made before connectors: not recorded. The status's `scopes` is [] as it always
+      // was for "nothing to show"; `requestedScopes` keeps the null.
+      fake.next(() => ({ status: 200, body: {
+        connected: true, connectorId: null, account: "hubot", connectedAt: "2026-10-18T00:00:00.000Z", connectedBy: a.adminId,
+        scopes: null, requestedScopes: null, connectors: [],
+      } }));
+      const unrecorded = await (await a.admin.get(path)).json() as Record<string, unknown>;
+      assert.deepEqual({ scopes: unrecorded.scopes, requestedScopes: unrecorded.requestedScopes }, { scopes: [], requestedScopes: null });
+
+      // A provider from before health and scopes: none of those keys, and no scopes beyond the empty list the view
+      // always had (an OAuth `scope` string is not read).
+      fake.next(() => ({ status: 200, body: { connected: true, connectorId: null, account: "hubot", connectedAt: null, connectedBy: null, scope: "repo,gist" } }));
+      const older = await (await a.admin.get(path)).json() as Record<string, unknown>;
+      for (const key of ["oauthStatus", "lastCheckError", "lastCheckedAt", "requestedScopes"]) assert.ok(!(key in older), `${key} is absent when not sent`);
+      assert.deepEqual(older.scopes, []);
+    } finally {
+      await fake.close();
+    }
+  });
+});
+
+test("a removal whose copy the provider could not reach says so (revokeOnGithub), and only then", async ({ app }) => {
+  await withEnv(async () => {
+    const fake = await startFakeProvider();
+    try {
+      const a = await setupConnectorServer(app.baseUrl, "conn-revoke");
+      await configure(fake, a);
+      const created = await createHosted(a.owner, "conn-revoke-agent");
+      await drainAgentRuntimeProvisions();
+      const statusPath = `/provision/agents/by-raft-agent/${created.id}/connections/github?raftServerId=${a.server.id}`;
+      const connectors = [{ id: "ctr_admin", account: "hubot", creatorRaftUserId: a.adminId, createdAt: "2026-09-29T00:00:00.000Z", current: true }];
+      // The provider's DELETE answers, one per call, from `answers`; everything else is the connector list.
+      let answers: { status: number; body?: unknown }[] = [];
+      fake.setFallback((request) => {
+        if (request.method === "GET" && request.path === statusPath) return { status: 200, body: { connected: true, connectorId: "ctr_admin", account: "hubot", connectors } };
+        if (request.method === "DELETE") return answers.shift() ?? { status: 500 };
+        return { status: 500 };
+      });
+      const agentPath = `/agents/${created.id}/connections/github`;
+      const remove = async (path: string, answer: { status: number; body?: unknown }) => {
+        answers = [answer];
+        const res = await a.admin.send("DELETE", path);
+        const text = await res.text();
+        assert.equal(answers.length, 0, `${path}: the provider was asked`);
+        return { status: res.status, body: text ? JSON.parse(text) as Record<string, unknown> : null };
+      };
+      // The words antiproton sends with it (cf/src/provision/handlers.ts `REVOKE_ON_GITHUB`), shortened.
+      const REVOKE = "a copy of this connection's credential was handed to an agent whose object holds nothing to clear, so it cannot be removed here";
+
+      // Agent-level DELETE, bodies copied from cf/src/provision/handlers.ts at 2a3c272c (same at antiproton 8915968):
+      // the agent's object holds nothing (wiped), so the binding goes and the answer says to revoke on GitHub.
+      assert.deepEqual(await remove(agentPath, { status: 200, body: { binding: "removed", mount: "not_cleared", action: "revoke_on_github", message: REVOKE } }), {
+        status: 200, body: { revokeOnGithub: true },
+      }, "agent: revoke_on_github");
+      for (const [label, answer] of [
+        ["204", { status: 204 }],
+        ["2xx with another body", { status: 200, body: { binding: "removed", mount: "cleared" } }],
+      ] as const) {
+        assert.deepEqual(await remove(agentPath, answer), { status: 204, body: null }, `agent: ${label} says nothing more`);
+      }
+      // A removal that did not take is unchanged, even though its body names an `action` too.
+      assert.deepEqual(await remove(agentPath, { status: 409, body: {
+        error: { code: "mount_not_cleared", message: "the agent's mount still holds the connection's credential (timeout); the connection was kept, DELETE it again" },
+        outcome: "not_cleared", retry: true, agents: [created.id], binding: "kept", mount: "not_cleared", action: "retry_delete",
+      } }), {
+        status: 409, body: { error: "The agent still holds the connection's credential; the connection was kept. Try again", code: "agent_connection_disconnect_not_cleared", errorCode: "agent_connection_disconnect_not_cleared" },
+      }, "agent: not_cleared");
+
+      // Connector DELETE (`disconnect` in the same file): this origin's wiped agents under `revokeOnGithub`, another
+      // origin's counted under `otherOrigins.revoke`.
+      const connectorPath = `${agentPath}/connectors/ctr_admin`;
+      const wiped = randomUUID();
+      const done = { disconnected: true, connectorId: "ctr_admin", detached: [created.id] };
+      const revokeHere = { revokeOnGithub: { agents: [wiped], action: "revoke_on_github", message: REVOKE } };
+      const elsewhere = (revoke: number) => ({ otherOrigins: {
+        cleared: 1, failed: 0, ...(revoke ? { revoke } : {}),
+        message: "agents of another Raft origin held this connector's credential: their copies are removed here, but that origin has had a working token",
+      } });
+      const said: [string, { status: number; body?: unknown }][] = [
+        ["this origin's agent", { status: 200, body: { ...done, ...revokeHere } }],
+        ["another origin's agent", { status: 200, body: { ...done, ...elsewhere(1) } }],
+      ];
+      for (const [label, answer] of said) {
+        assert.deepEqual(await remove(connectorPath, answer), { status: 200, body: { revokeOnGithub: true } }, `connector: ${label}`);
+      }
+      const silent: [string, { status: number; body?: unknown }][] = [
+        ["204", { status: 204 }],
+        ["plain success", { status: 200, body: done }],
+        ["another origin's copies removed", { status: 200, body: { ...done, ...elsewhere(0) } }],
+      ];
+      for (const [label, answer] of silent) {
+        assert.deepEqual(await remove(connectorPath, answer), { status: 204, body: null }, `connector: ${label} says nothing more`);
+      }
+      // A partial disconnect says it too: the retry that completes it no longer meets the wiped agent.
+      const stillHeld = [randomUUID()];
+      const partial = {
+        error: { code: "partially_disconnected", message: "some agents still hold this connector's credential; their bindings and the connector were kept, and the same call finishes the job" },
+        outcome: "not_cleared", retry: true, agents: stillHeld, detached: [],
+        failed: stillHeld.map((raftAgentId) => ({ raftAgentId, error: "the agent's object did not answer: timeout", action: "retry_delete" })),
+      };
+      const partialAnswer = { error: "Disconnect partially completed; retry to finish", code: "agent_connection_connector_disconnect_partial", failedCount: 1 };
+      assert.deepEqual(await remove(connectorPath, { status: 409, body: { ...partial, ...revokeHere } }), {
+        status: 502, body: { ...partialAnswer, revokeOnGithub: true },
+      }, "connector: partial with an unreachable copy");
+      assert.deepEqual(await remove(connectorPath, { status: 409, body: partial }), { status: 502, body: partialAnswer }, "connector: partial alone");
     } finally {
       await fake.close();
     }
@@ -1850,8 +2430,9 @@ test("the server fires a ready hosted Cindy's Day-2 recap once and posts her wak
         creatorId: owner.id,
         afterInsert: (tx, agent) => recordAgentProvisioning(tx, { agent, provider: "antiproton", createdByUserId: owner.id, importSource: "cindy_seed" }),
       });
-      const [channel] = await listChannels(server.id);
-      // Her opener channel always has her as a member (sendOwnerOpenerV2 adds her).
+      // Her opener channel is the owner's private onboarding-owner channel, and it
+      // always has her as a member (sendOwnerOpenerV2 adds her).
+      const channel = (await listChannels(server.id, owner.id)).find((ch) => ch.name === "onboarding-owner");
       await addAgentToChannel(channel!.id, cindy.id);
       // The D2 anchor is her own opener message (ensureOnboardingDay2Reminder).
       const anchor = await createMessage(channel!.id, "agent", cindy.id, "welcome");
@@ -1966,13 +2547,14 @@ test("a hosted Cindy is created once per server under antiproton_cindy; the setu
       assert.deepEqual([row!.importSource, row!.state, row!.provisionedModel], ["cindy_seed", "provisioning", null]);
 
       // The owner goes through the real flow: stamped `normal` (not `grandfathered` by the
-      // checkpoint her link crosses), so the survey and the handoff are still owed.
+      // checkpoint her link crosses), so the survey, the Pro step (a Free server) and the
+      // handoff are still owed.
       const [ownerSetup] = await getDb().select({ status: serverMembers.setupStatus, reason: serverMembers.setupCompletionReason })
         .from(serverMembers).where(and(eq(serverMembers.serverId, server.id), eq(serverMembers.userId, owner.id)));
       assert.deepEqual(ownerSetup, { status: "complete", reason: "normal" });
       const ownerProjection = await api(app.baseUrl, await tokenForHuman(owner.email), server.id).get(`/servers/${server.id}/setup-projection`);
       const projected = await ownerProjection.json() as { postSetup?: { surveyPending: boolean; handoffPending: boolean } };
-      assert.deepEqual(projected.postSetup, { surveyPending: true, handoffPending: true });
+      assert.deepEqual(projected.postSetup, { surveyPending: true, upgradePending: true, handoffPending: true });
       assert.deepEqual(await provisionHostedCindy({ serverId: server.id, ownerUserId: owner.id }), { outcome: "exists" });
 
       // A Cindy whose server link was lost (a crash before links committed together): the backstop relinks her.
@@ -2003,6 +2585,62 @@ test("a hosted Cindy is created once per server under antiproton_cindy; the setu
       assert.deepEqual(await provisionHostedCindy({ serverId: third.id, ownerUserId: owner.id }), { outcome: "cap_reached" });
     } finally {
       if (savedCap === undefined) delete process.env.HOSTED_CINDY_DAILY_CAP; else process.env.HOSTED_CINDY_DAILY_CAP = savedCap;
+      await fake.close();
+    }
+  });
+});
+
+test("staging test entry: the owner creates a hosted Cindy without antiproton_cindy; never off staging, never twice, never for a non-owner", async ({ app }) => {
+  await withEnv(async () => {
+    const fake = await startFakeProvider();
+    try {
+      const owner = await seedUser("cindy-entry-owner@raft.test", "cindy-entry-owner");
+      const member = await seedUser("cindy-entry-member@raft.test", "cindy-entry-member");
+      const server = await createServer("Hosted Cindy test entry", "hosted-cindy-test-entry", owner.id);
+      await getDb().insert(serverMembers).values({ serverId: server.id, userId: member.id, role: "member" });
+      configureDeployment(fake);
+      await enableFlagFor(server.id);
+      const ownerApi = api(app.baseUrl, await tokenForHuman(owner.email), server.id);
+      const memberApi = api(app.baseUrl, await tokenForHuman(member.email), server.id);
+      const entryShown = async (client: typeof ownerApi) =>
+        ((await (await client.get(`/servers/${server.id}/setup-projection`)).json()) as { hostedCindyTestEntry?: boolean }).hostedCindyTestEntry;
+
+      // Not staging: hidden and refused, whatever the runtime flag says.
+      assert.equal(await entryShown(ownerApi), false);
+      assert.equal((await ownerApi.send("POST", `/servers/${server.id}/hosted-cindy`)).status, 404);
+
+      process.env.DEPLOYMENT_ENV = "staging";
+      assert.equal(await entryShown(ownerApi), true, "staging, owner, no onboarding agent, runtime on");
+      assert.equal(await entryShown(memberApi), false, "never for a non-owner");
+      assert.equal((await memberApi.send("POST", `/servers/${server.id}/hosted-cindy`)).status, 404);
+
+      const created = await ownerApi.send("POST", `/servers/${server.id}/hosted-cindy`);
+      assert.equal(created.status, 201);
+      const { agentId } = await created.json() as { agentId: string };
+      const [linked] = await getDb().select({ onboardingAgentId: servers.onboardingAgentId }).from(servers).where(eq(servers.id, server.id));
+      assert.equal(linked!.onboardingAgentId, agentId, "she is the server's onboarding agent");
+      assert.equal((await provisionRow(agentId))!.importSource, "cindy_seed");
+      // The owner continues in Cindy's flow (survey, then handoff), as on a flag-on server.
+      const projected = await (await ownerApi.get(`/servers/${server.id}/setup-projection`)).json() as { postSetup?: { surveyPending: boolean }; hostedCindyTestEntry?: boolean };
+      assert.equal(projected.postSetup?.surveyPending, true);
+      assert.equal(projected.hostedCindyTestEntry, false, "hidden once she exists");
+
+      const again = await ownerApi.send("POST", `/servers/${server.id}/hosted-cindy`);
+      assert.equal(again.status, 409);
+      assert.deepEqual(await again.json(), { error: "This server already has its onboarding agent.", code: "onboarding_agent_exists", onboardingAgentId: agentId });
+
+      // Off staging, even the owner of a server that has her gets the neutral 404.
+      delete process.env.DEPLOYMENT_ENV;
+      const offStaging = await ownerApi.send("POST", `/servers/${server.id}/hosted-cindy`);
+      assert.equal(offStaging.status, 404);
+      assert.deepEqual(await offStaging.json(), { error: "Not found", code: "hosted_cindy_test_entry_unavailable" });
+      process.env.DEPLOYMENT_ENV = "staging";
+
+      // The hosted runtime is still required.
+      const bare = await createServer("Hosted Cindy no runtime", "hosted-cindy-no-runtime", owner.id);
+      const bareApi = api(app.baseUrl, await tokenForHuman(owner.email), bare.id);
+      assert.equal((await bareApi.send("POST", `/servers/${bare.id}/hosted-cindy`)).status, 404);
+    } finally {
       await fake.close();
     }
   });
@@ -2060,6 +2698,16 @@ test("hosted Cindy setup (flag rolled back after she was created): usable while 
       assert.equal((await converted.json() as { id: string }).id, cindyId, "converted in place, same id");
       const [now] = await getDb().select().from(agents).where(eq(agents.id, cindyId));
       assert.equal(now!.runtime, "codex");
+      // Her history: the hosted create, then one conversion by the owner (the
+      // unconfirmed attempt changed nothing and recorded nothing).
+      const configEvents = await getDb().select().from(agentConfigChangeEvents).where(eq(agentConfigChangeEvents.agentId, cindyId));
+      assert.deepEqual(configEvents.map((event) => event.source).sort(), ["hosted_cindy_convert_to_computer", "hosted_cindy_create"]);
+      const conversion = configEvents.find((event) => event.source === "hosted_cindy_convert_to_computer")!;
+      assert.equal(conversion.actorKind, "user");
+      assert.equal(conversion.actorId, owner.id);
+      assert.equal(conversion.beforeRuntime, "external");
+      assert.equal(conversion.afterRuntime, "codex");
+      assert.equal(conversion.afterModel, now!.model);
       assert.equal((now!.envVars as Record<string, string> | null)?.SLOCK_ONBOARDING_MEMORY_SEED ?? (now!.runtimeConfig as { envVars?: Record<string, string> } | null)?.envVars?.SLOCK_ONBOARDING_MEMORY_SEED, "first-cindy");
       assert.equal((await provisionRow(cindyId))!.state, "deleted");
       assert.ok(fake.requests.some((r) => r.method === "DELETE" && r.path.startsWith(`/provision/agents/by-raft-agent/${cindyId}`)));
@@ -2151,8 +2799,24 @@ test("the provider learns each hosted server's plan once, again when it changes,
       assert.deepEqual(await syncHostedRuntimeServerPlans(), { checked: 1, synced: 1, failed: 0 });
       assert.equal(puts().length, 1);
       assert.equal(puts()[0]!.path, `/provision/servers/${hosted.server.id}/plan`);
+      // HOSTED_RUNTIME_SEND_BUDGETS off (the default): today's body, and no amounts recorded.
       assert.deepEqual(JSON.parse(puts()[0]!.body), { plan: "pro" });
-      assert.deepEqual(await syncHostedRuntimeServerPlans(), { checked: 0, synced: 0, failed: 0 }, "confirmed: nothing to send");
+      const [offRow] = await getDb().select().from(hostedRuntimeServerPlans).where(eq(hostedRuntimeServerPlans.serverId, hosted.server.id));
+      assert.deepEqual([offRow!.syncedDailyBudgetCents, offRow!.syncedOnboardingDailyBudgetCents], [null, null]);
+      assert.deepEqual(await syncHostedRuntimeServerPlans(), { checked: 0, synced: 0, failed: 0 }, "confirmed: nothing to send, and the null amounts are not stale while off");
+
+      // On: every server re-sends once with both budgets in integer cents (today's plan mapping).
+      process.env.HOSTED_RUNTIME_SEND_BUDGETS = "true";
+      assert.deepEqual(await syncHostedRuntimeServerPlans(), { checked: 1, synced: 1, failed: 0 });
+      assert.deepEqual(JSON.parse(puts().at(-1)!.body), { plan: "pro", dailyBudgetCents: 1000, onboardingDailyBudgetCents: 100 });
+      assert.deepEqual(await syncHostedRuntimeServerPlans(), { checked: 0, synced: 0, failed: 0 }, "once");
+      // A deploy that changes an amount (here: a row confirmed with another amount) re-sends.
+      await getDb().update(hostedRuntimeServerPlans).set({ syncedDailyBudgetCents: 500 }).where(eq(hostedRuntimeServerPlans.serverId, hosted.server.id));
+      assert.deepEqual(await syncHostedRuntimeServerPlans(), { checked: 1, synced: 1, failed: 0 });
+      const [resent] = await getDb().select().from(hostedRuntimeServerPlans).where(eq(hostedRuntimeServerPlans.serverId, hosted.server.id));
+      assert.deepEqual([resent!.syncedDailyBudgetCents, resent!.syncedOnboardingDailyBudgetCents], [1000, 100]);
+      assert.deepEqual(await syncHostedRuntimeServerPlans(), { checked: 0, synced: 0, failed: 0 });
+      delete process.env.HOSTED_RUNTIME_SEND_BUDGETS;
       assert.ok(!puts().some((r) => r.path.includes(plain.server.id)), "a server without hosted agents is left alone");
 
       // A downgrade that fails at the provider: recorded, backed off, then sent.

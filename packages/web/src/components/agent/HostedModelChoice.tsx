@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useIntl } from "react-intl";
-import { Button, Spinner } from "@botiverse/raft-ui";
+import { Spinner, TextLink } from "@botiverse/raft-ui";
 import type { AgentRuntimeProviderKind, HostedRuntimeModelsView } from "@botiverse/raft-shared";
 import api from "../../api/client";
 import { RuntimeChoiceCombobox } from "./RuntimeChoiceCombobox";
@@ -82,15 +82,15 @@ export function HostedModelChoice({
     return (
       <div className="flex flex-wrap items-baseline gap-x-1 text-footnote font-semibold text-warning-strong" data-testid={`${testId}-error`}>
         <span>{formatMessage({ id: "agent.create.hostedModel.loadFailed" })}</span>
-        <Button type="button" variant="link" size="inline" onClick={onReload}>
+        <TextLink variant="strong" onClick={onReload}>
           {formatMessage({ id: "agent.create.hostedModel.reload" })}
-        </Button>
+        </TextLink>
       </div>
     );
   }
   if (view!.locked) {
     return (
-      <div className="space-y-1" data-testid={`${testId}-locked`}>
+      <div className="stack-y-1" data-testid={`${testId}-locked`}>
         <p className="font-mono text-mono-meta text-foreground">{view!.defaultLabel ?? view!.default}</p>
         <p className="text-caption text-foreground-hint">
           {formatMessage({ id: "agent.detail.hostedModel.locked" })}

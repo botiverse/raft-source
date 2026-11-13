@@ -17,15 +17,15 @@ interface ListOpts {
   all?: boolean;
 }
 
-const VALID_STATUSES = new Set<ReminderStatus>(["scheduled", "fired", "canceled"]);
+const VALID_STATUSES = new Set<ReminderStatus>(["scheduled", "fired", "canceled", "migrated"]);
 
 export const reminderListCommand = defineCommand(
   {
     name: "list",
-    description: "List your own reminders (defaults to scheduled and fired)",
+    description: "List your own reminders (defaults to scheduled ones)",
     options: [
-      { flags: "--all", description: "Include canceled reminders" },
-      { flags: "--status <s>", description: "Comma-separated statuses (scheduled,fired,canceled). Default: scheduled,fired" },
+      { flags: "--all", description: "Also list fired and canceled reminders" },
+      { flags: "--status <s>", description: "Comma-separated statuses (scheduled,fired,canceled,migrated). Default: scheduled, plus reminders moved to the Reminder app; fired ones are counted, not listed" },
     ],
   },
   async (ctx, opts: ListOpts) => {
@@ -42,6 +42,9 @@ export const reminderListCommand = defineCommand(
       } else {
         params.set("status", statusRaw);
       }
+      // The default and --all views also show reminders moved to the Reminder
+      // app, so the agent knows where they went. An explicit --status is exact.
+      if (!opts.status) params.set("includeMigrated", "true");
 
       const agentContext = ctx.loadAgentContext();
       const client = ctx.createApiClient(agentContext);
@@ -50,7 +53,15 @@ export const reminderListCommand = defineCommand(
         const code = res.status >= 500 ? "SERVER_5XX" : "LIST_FAILED";
         throw cliError(code, res.error ?? `HTTP ${res.status}`);
       }
-      writeText(ctx.io, adoptCliReplyText(formatReminderList(res.data?.reminders ?? [], currentDate()) + "\n"));
+      const reminders = res.data?.reminders ?? [];
+      // A one-time reminder stays `fired` for good once it has fired, so the
+      // default view would grow without bound and read as a backlog. Ask for
+      // the same statuses as before (any server answers), list only the live
+      // ones, and count the fired ones. `--status` and `--all` stay exact.
+      const defaultView = !opts.status && !opts.all;
+      const shown = defaultView ? reminders.filter((r) => r.status !== "fired") : reminders;
+      const hiddenFired = reminders.length - shown.length;
+      writeText(ctx.io, adoptCliReplyText(formatReminderList(shown, currentDate(), { hiddenFired }) + "\n"));
   },
 );
 

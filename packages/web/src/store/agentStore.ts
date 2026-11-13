@@ -2,22 +2,26 @@ import { useSyncExternalStore } from "react";
 import { create } from "zustand";
 import api from "../api/client";
 import { currentTimeMs, EXTERNAL_AGENT_ONLINE_WINDOW_MS, isExternalAgentRuntime, normalizeActivity, normalizeActivityDetailKind } from "@botiverse/raft-shared";
-import type { AgentActivity, AgentArchiveWorkspaceChoice, AgentActivityDetailKind, AgentHostedRuntimeSummary, ExternalAgentDiagnosticsView, AgentRuntimeErrorState, AgentRuntimeProviderKind, AgentStatus, DeliveryConsumptionActivityDiagnostic, ReasoningEffort, RuntimeConfig, RuntimeFormDefinitionRef, ServerRole, SpawnFailureActivityDiagnostic, TrajectoryEntry, WakeCrashLoopActivityDiagnostic } from "@botiverse/raft-shared";
+import type { AgentActivity, AgentArchiveWorkspaceChoice, Readiness, AgentActivityDetailKind, AgentHostedRuntimeSummary, AgentBlockedReason, ExternalAgentDiagnosticsView, AgentRuntimeErrorState, RuntimeErrorCode, AgentRuntimeProviderKind, AgentStatus, CredentialHoldActivityDiagnostic, DeliveryConsumptionActivityDiagnostic, ReasoningEffort, RuntimeConfig, RuntimeFormDefinitionRef, ServerRole, SpawnFailureActivityDiagnostic, ToolStuckActivityDiagnostic, TrajectoryEntry, WakeCrashLoopActivityDiagnostic } from "@botiverse/raft-shared";
 import type { RuntimeFormV2SubmitRef } from "@botiverse/raft-runtime-form";
 import { useServerStore } from "./serverStore";
+import { runtimeFormV2SubmitRequestConfig } from "../utils/runtimeFormV2ClientCapabilities";
 import { registerServerReset } from "./serverResetRegistry";
-import { en } from "../i18n/messages/en";
+import { agentActorRow, currentActorScope, registerLocalActorLookup, upsertActorsIfCurrent } from "./localTables/actorResolve";
+import { enFallback } from "../i18n/messages/enFallback";
 import { getActivityText } from "../utils/activity";
+import { agentBlockedState, agentHeldByOfflineComputer } from "../utils/agentBlockedState";
+import { isMachineOffline, useMachineStore } from "./machineStore";
+import { noteMachineOfflineRefusal } from "../utils/machineOfflineError";
+import type { AgentBlockedState } from "../utils/agentBlockedState";
 import { formatRelativeTime } from "../utils/relativeTime";
 import { getPresenceClockNowMs, subscribePresenceClock } from "./presenceClock";
 import { traceAgentActivityStoreDecision } from "../utils/webAgentActivityTrace";
 import type { AgentActivityTraceJoin } from "../utils/webAgentActivityTrace";
 import { emitStateViolationTrace } from "../utils/stateViolationTrace";
 import { emitStateTransitionTrace } from "../utils/stateTransitionTrace";
-import {
-  applyAgentActivityEvent,
-  makeActivityState,
-} from "./events/agentActivityEvents";
+import { applyAgentActivityEvent, makeActivityState, MAX_TRAJECTORY_ENTRIES } from "./events/agentActivityEvents";
+import { withTypedCarriers } from "./events/activityTypedCarriers";
 import type {
   ActivityLogEntry,
   AgentActivityDomainState,
@@ -27,6 +31,11 @@ import type {
   TrajectoryLogEntry,
 } from "./events/agentActivityEvents";
 import { notifyAllChannelMembersChanged } from "./channelMemberEvents";
+
+/** What `POST /agents/:id/interrupt-turn` reports for a stop that went through. */
+export type AgentTurnStopOutcome = "interrupted" | "restarted" | "not_running";
+/** `PATCH /agents/:id`: `when_idle` at the running agent's next idle point, `restarted` now (restartMode), `saved` at its next start. */
+export type AgentConfigApply = "when_idle" | "restarted" | "saved";
 
 // Re-export for consumers that previously imported from this file
 export type { AgentActivity } from "@botiverse/raft-shared";
@@ -60,18 +69,52 @@ export interface Agent {
   executionMode: "byoc" | "cloud";
   envVars: Record<string, string> | null;
   machineId: string | null;
+  /** Agent list only: its Computer is below an enforced version floor, or its access was revoked (`computer_access_revoked`): not run. */
+  blockedReason?: AgentBlockedReason | null;
+  /** #proj-raft-computer:#68, agent list only: the first broken link of its readiness, trimmed for this viewer (no `primary`: not theirs to see). */
+  readiness?: Readiness;
   sessionId?: string | null;
   runtimeProfile?: AgentRuntimeProfileSummary | null;
+  /** task #1357 item 1: whether the current session reported a Raft default limit (server-derived); only on Built-in custom gateway agents. */
+  modelLimits?: { defaultsReported: boolean } | null;
   /** External agents on a hosted runtime provider (antiproton): provisioning state, for managers only. */
   hostedRuntime?: AgentHostedRuntimeSummary | null;
   creatorType: "user" | "agent" | null;
   creatorId: string | null;
   creator: CreatorSummary | null;
   createdAgents: AgentCreatedSummary[];
+  /** Non-null when this agent is an app-managed bot (design-v3 app-bot). */
+  managedByAppInstallId?: string | null;
+  /** Detail payloads only: the app that owns this bot. */
+  managedByApp?: { clientId: string; name: string; logoUrl: string | null; description: string | null; botStatusText: string | null } | null;
+  /**
+   * App Bots and personal assistants only: false while the Bot is removed
+   * from its App, and always for an assistant (the server's member-list
+   * condition). The directory keeps it so its old messages still resolve;
+   * read it through isAgentInMemberLists.
+   */
+  inMemberLists?: boolean;
   deletedAt: string | null;
   createdAt: string;
   /** Bounded public profile carried by a readable channel relation. */
   profileProjection?: "channel_summary";
+  /**
+   * A personal assistant (RFC 075): the person it belongs to. Null or absent
+   * for every other agent. The list and detail payloads spread the agent row,
+   * so it is present without being a named part of the contract.
+   */
+  assistantOwnerUserId?: string | null;
+  /**
+   * A personal assistant a server owner/admin paused (#10654), as an ISO time;
+   * null otherwise. While set nothing wakes it; only its owner's Start
+   * (`POST /agents/:id/start`) lifts it. Pause and resume emit `agent:updated`.
+   */
+  assistantPausedAt?: string | null;
+  /**
+   * Who paused it. Sent only to the owner and to server owners/admins; absent
+   * for everyone else, who see the pause without a name.
+   */
+  assistantPausedBy?: { id: string; name: string } | null;
 }
 
 export type OnboardingIdentityField = "name" | "displayName" | "role" | "serverRole" | "avatarUrl";
@@ -152,7 +195,6 @@ export interface CreatorSummary {
   name: string;
   displayName: string | null;
   avatarUrl: string | null;
-  gravatarHash?: string;
   deletedAt?: string | null;
 }
 
@@ -166,17 +208,12 @@ export interface AgentCreatedSummary {
   status: AgentStatus;
 }
 
-export type ExternalAgentSetupState = "waiting_for_login" | "credential_minted" | "connected";
-
-export interface ExternalAgentStatus {
-  setupState: ExternalAgentSetupState;
-  credentialLastUsedAt: string | null;
-  lastActivityAt: string | null;
-  hostedRuntime?: AgentHostedRuntimeSummary;
-}
+export type { ExternalAgentSetupState, ExternalAgentStatus } from "./externalAgentStatus";
+export { externalSetupNeedsSignIn } from "./externalAgentStatus";
+import type { ExternalAgentStatus } from "./externalAgentStatus";
 
 /** Shape returned by the API — may include activity fields used to seed agentActivities. */
-type ApiAgent = Agent & {
+type ApiAgent = Agent & Pick<AgentDisplayState, "activityErrorCode"> & { // activityErrorCode (#wg-rbac:#57): served with activity "error", to every viewer
   activity?: AgentActivity;
   activityKind?: AgentActivity;
   activityDetail?: string;
@@ -187,8 +224,11 @@ type ApiAgent = Agent & {
   wakeCrashLoop?: WakeCrashLoopActivityDiagnostic;
   /** task #1123: served with activityDetailKind "runtime_unavailable" after a failed start. */
   spawnFailure?: SpawnFailureActivityDiagnostic;
+  /** task #25: served with any activity while the agent is stuck on a tool call. */
+  toolStuck?: ToolStuckActivityDiagnostic;
+  /** Reconciler step 4b: served with activityDetailKind "idle" while the held notice shows. */
+  credentialHold?: CredentialHoldActivityDiagnostic;
 };
-
 
 export type { ActivityLogEntry, AgentActivityState, TrajectoryLogEntry } from "./events/agentActivityEvents";
 
@@ -202,9 +242,21 @@ export interface AgentDisplayState {
   isExternal?: boolean;
   /** External agents only: last time the agent was seen (ISO), if ever. */
   lastSeenAt?: string | null;
+  /** The agent is held from running; this replaces its activity in the status UI. */
+  blocked?: AgentBlockedState;
+  /** A personal assistant a server owner/admin paused (#10654): offline, worded "Paused". */
+  paused?: true;
+  /**
+   * No state for this agent yet, only `status: "active"` (#triage:#97): shown
+   * green as "Likely online" (artin), kept apart from a state the server sent.
+   * The server sends every agent's state with `/agents` and channel rosters;
+   * this is the moment before that arrives, or an agent the web hasn't loaded.
+   */
+  likelyOnline?: true;
+  activityErrorCode?: RuntimeErrorCode; // #wg-rbac:#57: the error's code, while the activity is an error
 }
 
-type AgentDisplayFallback = Pick<Agent, "status"> & Partial<Pick<Agent, "runtime" | "external" | "lastSeenAt">>;
+type AgentDisplayFallback = Pick<Agent, "status"> & Partial<Pick<Agent, "runtime" | "external" | "lastSeenAt" | "blockedReason" | "assistantPausedAt" | "machineId">>;
 
 /** Pure presence rule for external agents: seen within the online window. */
 export function isExternalAgentSeenOnline(lastSeenAt: string | null | undefined, nowMs: number): boolean {
@@ -214,12 +266,34 @@ export function isExternalAgentSeenOnline(lastSeenAt: string | null | undefined,
   return nowMs - seenMs < EXTERNAL_AGENT_ONLINE_WINDOW_MS;
 }
 
+/** The status words of each held state (`AgentDisplayState.blocked`). */
+const BLOCKED_STATUS_TEXT_IDS = {
+  computer_too_old: "agent.status.computerTooOld",
+  computer_access_revoked: "agent.status.computerAccessRevoked",
+  computer_offline: "agent.status.computerOffline",
+} as const satisfies Record<AgentBlockedState, keyof typeof enFallback>;
+
 export function resolveAgentDisplayState(
-  agent: (Pick<Agent, "status"> & Partial<Pick<Agent, "lastSeenAt">>) | null | undefined,
+  agent: (Pick<Agent, "status"> & Partial<Pick<Agent, "lastSeenAt" | "blockedReason" | "assistantPausedAt">>) | null | undefined,
   activityState: AgentActivityState | null | undefined,
   isExternal?: boolean,
   nowMs: number = currentTimeMs(),
+  machineOffline = false,
 ): AgentDisplayState {
+  // A paused personal assistant (#10654) runs nothing until its owner starts
+  // it: whatever its credential's recent presence or last activity says, it
+  // is offline and every status surface (dot, chip, sidebar) reads "Paused".
+  // The offline light, not the external one, matches the Paused chip.
+  if (agent?.assistantPausedAt) {
+    return {
+      activity: "offline",
+      activityDetail: "",
+      activityDetailKind: "none",
+      activityText: enFallback["assistant.paused.chip"],
+      isOnline: false,
+      paused: true,
+    };
+  }
   // External agents have no daemon: presence (credential seen within the
   // online window) is only the floor for agents that go silent. While seen,
   // the dot shows the same activity-derived state as a managed agent —
@@ -234,8 +308,8 @@ export function resolveAgentDisplayState(
         activity: activityState.activity,
         activityDetail: activityState.activityDetail,
         activityDetailKind: activityState.detailKind,
-        activityText: getActivityText(activityState.activity, activityState.activityDetail, activityState.detailKind),
-        isOnline: activityState.activity !== "offline",
+        activityText: getActivityText(activityState.activity, activityState.activityDetail, activityState.detailKind, activityState.errorCode),
+        isOnline: activityState.activity !== "offline", ...(activityState.errorCode ? { activityErrorCode: activityState.errorCode } : {}),
         isExternal: true,
         lastSeenAt,
       };
@@ -246,30 +320,62 @@ export function resolveAgentDisplayState(
       activityDetail: "",
       activityDetailKind: "none",
       activityText: relative
-        ? en["activity.status.lastActive"].replace("{time}", relative)
+        ? enFallback["activity.status.lastActive"].replace("{time}", relative)
         : getActivityText(isOnline ? "online" : "offline"),
       isOnline,
       isExternal: true,
       lastSeenAt,
     };
   }
-  const activity = activityState?.activity
-    ?? (agent?.status === "active" ? "online" : "offline");
+  // Its Computer is too old to be sent agent work, or its access was revoked
+  // (reconciler step 15): say that, whatever the last activity was, instead of
+  // a generic "Offline". Error orange (a warning wash on chips): someone has to
+  // act on the Computer or move the agent. An offline Computer (#triage:#206) is offline stone.
+  const blocked = agentBlockedState(agent?.blockedReason)
+    ?? (agentHeldByOfflineComputer(agent, activityState, machineOffline) ? "computer_offline" : null);
+  if (blocked) {
+    return {
+      activity: blocked === "computer_offline" ? "offline" : "error",
+      activityDetail: "",
+      activityDetailKind: "none",
+      activityText: enFallback[BLOCKED_STATUS_TEXT_IDS[blocked]],
+      isOnline: false,
+      blocked,
+    };
+  }
+  if (!activityState && agent?.status === "active") {
+    return {
+      activity: "online",
+      activityDetail: "",
+      activityDetailKind: "none",
+      activityText: enFallback["activity.status.likelyOnline"],
+      isOnline: true,
+      likelyOnline: true,
+    };
+  }
+  const activity = activityState?.activity ?? "offline";
   const activityDetail = activityState?.activityDetail
-    ?? (agent?.status === "stopped" ? en["activity.log.status.stopped"] : "");
+    ?? (agent?.status === "stopped" ? enFallback["activity.log.status.stopped"] : "");
   const detailKind = activityState?.detailKind
     ?? (agent?.status === "stopped" ? "stopped" : "none");
   return {
     activity,
     activityDetail,
     activityDetailKind: detailKind,
-    activityText: getActivityText(activity, activityDetail, detailKind),
-    isOnline: activity !== "offline",
+    activityText: getActivityText(activity, activityDetail, detailKind, activityState?.errorCode),
+    isOnline: activity !== "offline", ...(activityState?.errorCode ? { activityErrorCode: activityState.errorCode } : {}),
   };
 }
 
 interface AgentState {
   agents: Agent[];
+  /**
+   * External agents this server's agent list does not have (a joint
+   * channel's other-server agents): last seen (ISO; null = never), from the
+   * joint roster and `agent:seen` pushes. Moves forward only; in memory only.
+   * A key marks the agent as external.
+   */
+  externalSeenAt: Record<string, string | null>;
   /**
    * Internal materialized current-activity cache.
    * Components should consume selector/hook projections below instead of
@@ -348,21 +454,39 @@ interface AgentState {
   retryHostedRuntimeProvisioning: (agentId: string, options?: { model?: string | null }) => Promise<AgentHostedRuntimeSummary | null>;
   fetchOnboardingIdentityAdoption: (agentId: string) => Promise<OnboardingIdentityAdoptionPreview>;
   adoptOnboardingIdentity: (agentId: string) => Promise<OnboardingIdentityAdoptionResult>;
+  /** The agent as saved, and `configApply`: how the server applies a runtime change (reconciler step 11b; absent from an older server). */
   updateAgent: (
     agentId: string,
     fields: { displayName?: string | null; description?: string | null; avatarUrl?: string | null; serverRole?: Extract<ServerRole, "admin" | "member">; model?: string; runtime?: string; runtimeConfig?: RuntimeConfig | null; formDefinitionRef?: RuntimeFormDefinitionRef | RuntimeFormV2SubmitRef; formValues?: Record<string, unknown>; reasoningEffort?: ReasoningEffort | null; envVars?: Record<string, string> | null },
     opts?: { restartMode?: "restart" | "session" },
-  ) => Promise<Agent>;
+  ) => Promise<Agent & { configApply?: AgentConfigApply }>;
   startAgent: (agentId: string) => Promise<void>;
   stopAgent: (agentId: string) => Promise<void>;
-  /** A hosted agent: interrupt its running turn (the agent stays). Throws when the stop failed. */
-  stopHostedAgentTurn: (agentId: string) => Promise<"interrupted" | "not_running">;
+  /** Interrupt the agent's running turn (the agent stays). Throws when the stop failed. */
+  stopAgentTurn: (agentId: string) => Promise<AgentTurnStopOutcome>;
+  /**
+   * A server owner/admin's Stop on someone else's personal assistant: the same
+   * `interrupt-turn` route, which the server turns into a lasting pause and
+   * answers `{ outcome, paused }`. When `paused` the record shows the pause at
+   * once (`by` is the person pausing); a refetch confirms it. Throws when the
+   * request failed.
+   */
+  pauseAssistant: (agentId: string, by: { id: string; name: string }) => Promise<{ outcome: AgentTurnStopOutcome; paused: boolean }>;
+  /**
+   * The owner's Start on a paused assistant (`POST /agents/:id/start`, which
+   * lifts the pause). Clears the pause as soon as the route answers, ahead of
+   * the agent:updated push and the refetch that confirm it. Throws (and keeps
+   * the pause) when the request failed.
+   */
+  resumeAssistant: (agentId: string) => Promise<void>;
   /** Archive the agent (the former delete); `workspace` decides what happens to its workspace. */
   deleteAgent: (agentId: string, workspace?: AgentArchiveWorkspaceChoice) => Promise<void>;
   resetAgent: (agentId: string, mode: "restart" | "session" | "full") => Promise<void>;
   updateAgentSession: (agentId: string, sessionId: string | null) => void;
   /** `agent:seen` push: advance an external agent's `lastSeenAt` (never backwards). */
   applyAgentSeen: (agentId: string, lastSeenAt: string) => void;
+  /** Seed `externalSeenAt` from channel roster rows (external agents only; never backwards). */
+  seedExternalSeenFromRoster: (rows: ReadonlyArray<Pick<Agent, "id"> & Partial<Pick<Agent, "external" | "lastSeenAt">>>) => void;
   updateActivity: (
     agentId: string,
     activity: string,
@@ -378,6 +502,9 @@ interface AgentState {
     deliveryConsumption?: DeliveryConsumptionActivityDiagnostic,
     wakeCrashLoop?: WakeCrashLoopActivityDiagnostic,
     spawnFailure?: SpawnFailureActivityDiagnostic,
+    toolStuck?: ToolStuckActivityDiagnostic,
+    credentialHold?: CredentialHoldActivityDiagnostic,
+    errorCode?: RuntimeErrorCode, // #wg-rbac:#57: the push's errorCode
   ) => void;
   appendTrajectory: (
     agentId: string,
@@ -401,16 +528,13 @@ export function selectAgentActivityTraceJoin(state: AgentState, agentId: string)
 }
 
 /**
- * Pure per-agent display-state compute over narrow slices. Components that
- * need MANY agents' display states must subscribe to the raw slices
- * (`s.agents`, `s.agentActivities` — stable references) and call this in
- * render. NEVER build a map of these inside a store selector: the result is
- * a fresh object per call, so even useShallow sees a changed snapshot every
- * time -> infinite re-render (React #185, prod incident 2026-07-07).
+ * Pure per-agent display-state compute over narrow slices. Components that need MANY agents' display states must
+ * subscribe to the raw slices (`s.agents`, `s.agentActivities` — stable references) and call this in render. NEVER
+ * build a map of these inside a store selector: the result is a fresh object per call, so even useShallow sees a
+ * changed snapshot every time -> infinite re-render (React #185, prod incident 2026-07-07).
  */
-/** Named stable slice export — components subscribe via this instead of
- *  naming the raw field (agentActivityStoreBoundary ratchet). Returns the
- *  store-held reference, so it is snapshot-stable by construction. */
+/** Named stable slice export — components subscribe via this instead of naming the raw field
+ *  (agentActivityStoreBoundary ratchet). Returns the store-held reference, so it is snapshot-stable by construction. */
 export const selectAgentActivitiesSlice = (state: AgentState): Record<string, AgentActivityState> => state.agentActivities;
 
 export function computeAgentDisplayState(
@@ -419,10 +543,11 @@ export function computeAgentDisplayState(
   agentId: string,
   fallbackAgent?: AgentDisplayFallback | null,
   nowMs: number = currentTimeMs(),
+  machines: ReturnType<typeof useMachineStore.getState>["machines"] = useMachineStore.getState().machines, // pass the subscribed list (#triage:#206)
 ): AgentDisplayState {
   const agent = agents.find((candidate) => candidate.id === agentId) ?? fallbackAgent;
   const isExternal = agent?.external === true || isExternalAgentRuntime(agent?.runtime);
-  return resolveAgentDisplayState(agent, agentActivities[agentId], isExternal, nowMs);
+  return resolveAgentDisplayState(agent, agentActivities[agentId], isExternal, nowMs, isMachineOffline(machines, agent?.machineId));
 }
 
 export function selectAgentDisplayState(
@@ -431,18 +556,20 @@ export function selectAgentDisplayState(
   fallbackAgent?: AgentDisplayFallback | null,
   nowMs: number = currentTimeMs(),
 ): AgentDisplayState {
-  return computeAgentDisplayState(state.agents, state.agentActivities, agentId, fallbackAgent, nowMs);
+  return computeAgentDisplayState(state.agents, state.agentActivities, agentId, fallbackAgent, nowMs, useMachineStore.getState().machines);
 }
 
 /**
- * Module-level in-flight guard for `loadAgents()`. Multiple
- * concurrent calls (e.g. socket-reconnect storm firing several
- * `connect` events in quick succession) coalesce onto the same
- * Promise, preventing the REST response from racing with newer
- * socket pushes. Cleared after each settled fetch.
- * (#engineering:72283cf7 task #340 PR B)
+ * Module-level in-flight guard for `loadAgents()`. Multiple concurrent calls (e.g. socket-reconnect storm firing
+ * several `connect` events in quick succession) coalesce onto the same Promise, preventing the REST response from
+ * racing with newer socket pushes. Cleared after each settled fetch. (#engineering:72283cf7 task #340 PR B)
  */
 let loadAgentsInFlight: Promise<void> | null = null;
+
+/** Let an in-flight agents load land (see settleInFlightLoader in serverStore). */
+export async function settleAgentsLoadInFlight(): Promise<void> {
+  await loadAgentsInFlight?.catch(() => undefined);
+}
 
 /**
  * Re-read the agent list after the server says a stored agent changed.
@@ -457,38 +584,17 @@ export function reloadAgentsAfterServerChange(): Promise<void> {
   return stale.then(reload, reload);
 }
 const agentProfileInFlight = new Map<string, Promise<void>>();
+
 let agentActivityReconcileScheduled = false;
 
 function nextActivityVersion(state: Pick<AgentState, "agentActivityVersions">, agentId: string): number {
   return (state.agentActivityVersions[agentId] ?? 0) + 1;
 }
 
-function stripActivityFields(agent: ApiAgent): Agent {
-  const { activity: _a, activityKind: _ak, activityDetail: _d, activityDetailKind: _dk, deliveryConsumption: _dc, wakeCrashLoop: _wcl, spawnFailure: _sf, ...rest } = agent;
+export function stripActivityFields(agent: ApiAgent): Agent {
+  const { activity: _a, activityKind: _ak, activityDetail: _d, activityDetailKind: _dk, deliveryConsumption: _dc, wakeCrashLoop: _wcl, spawnFailure: _sf, toolStuck: _ts, credentialHold: _ch, activityErrorCode: _aec, ...rest } = agent;
   return rest;
 }
-
-/**
- * task #1116 / #1119: REST snapshots carry a typed carrier only with its own
- * activityDetailKind; attach each there and nowhere else.
- */
-function withTypedCarriers(
-  state: AgentActivityState,
-  carriers: { deliveryConsumption?: DeliveryConsumptionActivityDiagnostic; wakeCrashLoop?: WakeCrashLoopActivityDiagnostic; spawnFailure?: SpawnFailureActivityDiagnostic },
-): AgentActivityState {
-  if (state.detailKind === "delivery_unconsumed" && carriers.deliveryConsumption) {
-    return { ...state, deliveryConsumption: carriers.deliveryConsumption };
-  }
-  if (state.detailKind === "wake_crash_loop_blocked" && carriers.wakeCrashLoop) {
-    return { ...state, wakeCrashLoop: carriers.wakeCrashLoop };
-  }
-  // task #1123: the daemon's typed spawn-failure reason rides runtime_unavailable.
-  if (state.detailKind === "runtime_unavailable" && carriers.spawnFailure) {
-    return { ...state, spawnFailure: carriers.spawnFailure };
-  }
-  return state;
-}
-
 
 function clearAgentActivityTraceJoin(
   traceJoins: Record<string, AgentActivityTraceJoin>,
@@ -567,19 +673,51 @@ const AGENT_COMPARED_KEYS: Record<AgentComparedKey, true> = {
   executionMode: true,
   envVars: true,
   machineId: true,
+  blockedReason: true,
+  readiness: true,
   sessionId: true,
   runtimeProfile: true,
+  modelLimits: true,
   hostedRuntime: true,
   creatorType: true,
   creatorId: true,
   creator: true,
   createdAgents: true,
+  managedByAppInstallId: true,
+  managedByApp: true,
+  inMemberLists: true,
   deletedAt: true,
   createdAt: true,
   profileProjection: true,
+  assistantOwnerUserId: true,
+  assistantPausedAt: true,
+  assistantPausedBy: true,
 };
 
 const AGENT_COMPARED_KEY_LIST = Object.keys(AGENT_COMPARED_KEYS) as (keyof Agent)[];
+
+/**
+ * Whether member lists, mention candidates and member pickers show this
+ * directory agent. The directory (`GET /agents`) also keeps agents for history
+ * only: deleted ones, App Bots removed from their App, and personal
+ * assistants (their owner's, not the server's members), which the server marks
+ * `inMemberLists: false`. An assistant is also known by its owner, for a
+ * record (`agent:created`) that carries no marking. Message rows, open DMs and
+ * profiles still resolve all of them.
+ */
+export function isAgentInMemberLists(agent: Pick<Agent, "deletedAt" | "inMemberLists" | "assistantOwnerUserId">): boolean {
+  return !agent.deletedAt && agent.inMemberLists !== false && !agent.assistantOwnerUserId;
+}
+
+/**
+ * An App Bot removed from its App (#11295). Its DM and that DM's threads keep
+ * their history, but it can't answer there, so they show the read-only
+ * composer under RemovedAppBotDmNotice. An ordinary agent, deleted or not,
+ * never counts.
+ */
+export function isRemovedAppBot(agent: Pick<Agent, "managedByAppInstallId" | "deletedAt" | "inMemberLists" | "assistantOwnerUserId"> | undefined): boolean {
+  return agent?.managedByAppInstallId ? !isAgentInMemberLists(agent) : false;
+}
 
 function agentRecordEqual(a: Agent, b: Agent): boolean {
   if (a === b) return true;
@@ -742,6 +880,7 @@ export const useAgentStore = create<AgentState>((set, get) => ({
       createAgentOnboarding: show ? onboarding : false,
     }),
   agents: [],
+  externalSeenAt: {},
   agentActivities: {},
   agentActivityTraceJoins: {},
   agentActivityObservedAt: {},
@@ -764,6 +903,7 @@ export const useAgentStore = create<AgentState>((set, get) => ({
     const epoch = useServerStore.getState().serverEpoch;
     const serverId = useServerStore.getState().current?.id;
     if (!serverId) return;
+    const actorScope = currentActorScope();
     const agentIdsAtRequest = new Set(get().agents.map((agent) => agent.id));
     const activityVersionsAtRequest = { ...get().agentActivityVersions };
     // Never set loading here — it starts as true (store init / server reset)
@@ -812,6 +952,26 @@ export const useAgentStore = create<AgentState>((set, get) => ({
               agentActivityVersions[a.id] = currentVersion;
             }
           }
+          // Another server's agents (a joint channel's peers) are never in this
+          // server's `/agents`: their state comes from the channel roster and
+          // `agent:activity` pushes, so this reload keeps it instead of dropping
+          // it to the roster's plain status until their next push (#triage:#95).
+          // A peer agent can also be in `state.agents` (its profile was opened,
+          // ensureAgentProfile): its serverId says it is not this server's.
+          const ownAgentIds = new Set(state.agents
+            .filter((agent) => !agent.serverId || agent.serverId === serverId)
+            .map((agent) => agent.id));
+          const peerInList = new Set(state.agents
+            .filter((agent) => agent.serverId && agent.serverId !== serverId)
+            .map((agent) => agent.id));
+          for (const id of Object.keys(state.agentActivities)) {
+            if (snapshotAgentIds.has(id) || ownAgentIds.has(id)) continue;
+            if (agentIdsAtRequest.has(id) && !peerInList.has(id)) continue;
+            agentActivities[id] = state.agentActivities[id]!;
+            if (state.agentActivityTraceJoins[id]) agentActivityTraceJoins[id] = state.agentActivityTraceJoins[id];
+            agentActivityObservedAt[id] = state.agentActivityObservedAt[id] ?? snapshotObservedAt;
+            agentActivityVersions[id] = state.agentActivityVersions[id] ?? 0;
+          }
           for (const a of locallyAddedAgents) {
             if (state.agentActivities[a.id]) {
               agentActivities[a.id] = state.agentActivities[a.id];
@@ -834,6 +994,8 @@ export const useAgentStore = create<AgentState>((set, get) => ({
             loading: false,
           };
         });
+        // `/agents` is this server's directory: an agent without a serverId is its own.
+        upsertActorsIfCurrent(actorScope, agents.map((agent) => agentActorRow(agent, serverId)));
       } catch (err) {
         console.error("Failed to load agents:", err);
         if (useServerStore.getState().serverEpoch !== epoch) return;
@@ -851,11 +1013,14 @@ export const useAgentStore = create<AgentState>((set, get) => ({
     if (!agentId || get().agents.some((agent) => agent.id === agentId)) return;
     const existing = agentProfileInFlight.get(agentId);
     if (existing) return existing;
+    const actorScope = currentActorScope();
     const promise = (async () => {
       try {
         const { data } = await api.get(`/agents/${agentId}`);
         const apiAgent = data as ApiAgent;
         const agent = stripActivityFields(apiAgent);
+        // May be another server's agent: without a serverId it is skipped, not guessed.
+        if (agent?.id) upsertActorsIfCurrent(actorScope, [agentActorRow(agent)]);
         const observedAt = Date.now();
         const snapshotActivity = withTypedCarriers(makeActivityState(
           normalizeActivity(apiAgent.activityKind ?? apiAgent.activity, apiAgent.status),
@@ -914,8 +1079,8 @@ export const useAgentStore = create<AgentState>((set, get) => ({
       ...(opts.provider && opts.hostedModel ? { hostedModel: opts.hostedModel } : {}),
       ...(opts.actionCardMessageId ? { actionCardMessageId: opts.actionCardMessageId } : {}),
       ...(opts.actionCardConfirmationVersion !== undefined ? { actionCardConfirmationVersion: opts.actionCardConfirmationVersion } : {}),
-    });
-    const { activity: rawActivity, activityKind: rawActivityKind, activityDetail: rawDetail, activityDetailKind: rawDetailKind, deliveryConsumption: rawDeliveryConsumption, wakeCrashLoop: rawWakeCrashLoop, spawnFailure: rawSpawnFailure, ...rest } = data as ApiAgent;
+    }, runtimeFormV2SubmitRequestConfig(opts.formDefinitionRef));
+    const { activity: rawActivity, activityKind: rawActivityKind, activityDetail: rawDetail, activityDetailKind: rawDetailKind, deliveryConsumption: rawDeliveryConsumption, wakeCrashLoop: rawWakeCrashLoop, spawnFailure: rawSpawnFailure, credentialHold: rawCredentialHold, activityErrorCode: rawActivityErrorCode, ...rest } = data as ApiAgent;
     const agent: Agent = rest;
     set((state) => ({
       // Upsert: a failed hosted Cindy converted to a computer Cindy comes back with her existing id.
@@ -928,7 +1093,7 @@ export const useAgentStore = create<AgentState>((set, get) => ({
           activity: normalizeActivity(rawActivityKind ?? rawActivity, agent.status),
           activityDetail: rawDetail || "",
           detailKind: normalizeActivityDetailKind(rawDetailKind),
-        }, { deliveryConsumption: rawDeliveryConsumption, wakeCrashLoop: rawWakeCrashLoop, spawnFailure: rawSpawnFailure }),
+        }, { deliveryConsumption: rawDeliveryConsumption, wakeCrashLoop: rawWakeCrashLoop, spawnFailure: rawSpawnFailure, credentialHold: rawCredentialHold, activityErrorCode: rawActivityErrorCode }),
       },
       agentActivityTraceJoins: clearAgentActivityTraceJoin(state.agentActivityTraceJoins, agent.id),
       agentActivityObservedAt: {
@@ -983,10 +1148,11 @@ export const useAgentStore = create<AgentState>((set, get) => ({
   },
 
   updateAgent: async (agentId, fields, opts) => {
-    const { data } = await api.patch(`/agents/${agentId}`, {
+    const { data } = await api.patch<Agent & { configApply?: AgentConfigApply }>(`/agents/${agentId}`, {
       ...fields,
       ...(opts?.restartMode ? { restartMode: opts.restartMode } : {}),
-    });
+    }, runtimeFormV2SubmitRequestConfig((fields as { formDefinitionRef?: unknown }).formDefinitionRef));
+    const { configApply: _configApply, ...saved } = data;
     set((state) => ({
       ...(() => {
         if (opts?.restartMode !== "session") {
@@ -1000,21 +1166,23 @@ export const useAgentStore = create<AgentState>((set, get) => ({
         };
       })(),
       agents: state.agents.map((a) =>
-        a.id === agentId ? { ...a, ...data } : a
+        a.id === agentId ? { ...a, ...saved } : a
       ),
     }));
     return data;
   },
 
   startAgent: async (agentId) => {
-    await api.post(`/agents/${agentId}/start`);
-    // Only optimistically update if agent was offline — avoid overriding real state
+    await api.post(`/agents/${agentId}/start`).catch((error: unknown) => {
+      throw noteMachineOfflineRefusal(error, get().agents.find((agent) => agent.id === agentId)?.machineId);
+    });
+    // Only optimistically update if agent was offline (or had no state yet, #triage:#97) — avoid overriding real state
     set((state) => {
       const current = state.agentActivities[agentId];
       const agents = state.agents.map((a) =>
         a.id === agentId ? { ...a, status: "active" as const } : a
       );
-      if (current?.activity !== "offline") {
+      if (current && current.activity !== "offline") {
         return { agents };
       }
       return {
@@ -1037,9 +1205,43 @@ export const useAgentStore = create<AgentState>((set, get) => ({
     notifyAllChannelMembersChanged();
   },
 
-  stopHostedAgentTurn: async (agentId) => {
-    const { data } = await api.post(`/agents/${agentId}/stop`);
-    return (data as { result?: string }).result === "interrupted" ? "interrupted" : "not_running";
+  stopAgentTurn: async (agentId) => {
+    // One route for hosted and Computer agents; a Computer that can't stop just
+    // the turn in place restarts the agent and reports "restarted".
+    const { data } = await api.post(`/agents/${agentId}/interrupt-turn`);
+    const outcome = (data as { outcome?: string }).outcome;
+    return outcome === "interrupted" || outcome === "restarted" ? outcome : "not_running";
+  },
+
+  pauseAssistant: async (agentId, by) => {
+    const { data } = await api.post(`/agents/${agentId}/interrupt-turn`);
+    const body = data as { outcome?: string; paused?: unknown };
+    const outcome: AgentTurnStopOutcome = body.outcome === "interrupted" || body.outcome === "restarted" ? body.outcome : "not_running";
+    const paused = body.paused === true;
+    if (paused) {
+      set((state) => ({
+        agents: state.agents.map((a) =>
+          a.id === agentId && !a.assistantPausedAt
+            ? { ...a, assistantPausedAt: new Date().toISOString(), assistantPausedBy: by }
+            : a
+        ),
+      }));
+      // agent:updated confirms it too; this covers a socket that missed it.
+      void reloadAgentsAfterServerChange();
+    }
+    return { outcome, paused };
+  },
+
+  resumeAssistant: async (agentId) => {
+    await api.post(`/agents/${agentId}/start`);
+    // Clear on the server's yes, without waiting for agent:updated or the
+    // refetch below to confirm it.
+    set((state) => ({
+      agents: state.agents.map((a) =>
+        a.id === agentId && a.assistantPausedAt ? { ...a, assistantPausedAt: null, assistantPausedBy: null } : a
+      ),
+    }));
+    void reloadAgentsAfterServerChange();
   },
 
   stopAgent: async (agentId) => {
@@ -1050,7 +1252,7 @@ export const useAgentStore = create<AgentState>((set, get) => ({
       ),
       agentActivities: {
         ...state.agentActivities,
-        [agentId]: makeActivityState("offline", en["activity.log.status.stopped"], "stopped"),
+        [agentId]: makeActivityState("offline", enFallback["activity.log.status.stopped"], "stopped"),
       },
       agentActivityTraceJoins: clearAgentActivityTraceJoin(state.agentActivityTraceJoins, agentId),
       agentActivityObservedAt: {
@@ -1128,7 +1330,13 @@ export const useAgentStore = create<AgentState>((set, get) => ({
 
   applyAgentSeen: (agentId, lastSeenAt) => set((state) => {
     const current = state.agents.find((agent) => agent.id === agentId);
-    if (!current || !isNewerTimestamp(lastSeenAt, current.lastSeenAt)) return {};
+    if (!current) {
+      // Another server's agent (a joint channel's projection room push).
+      const known = state.externalSeenAt[agentId];
+      if (known !== undefined && !isNewerTimestamp(lastSeenAt, known)) return {};
+      return { externalSeenAt: { ...state.externalSeenAt, [agentId]: lastSeenAt } };
+    }
+    if (!isNewerTimestamp(lastSeenAt, current.lastSeenAt)) return {};
     return {
       agents: state.agents.map((agent) =>
         agent.id === agentId ? { ...agent, lastSeenAt } : agent
@@ -1136,7 +1344,20 @@ export const useAgentStore = create<AgentState>((set, get) => ({
     };
   }),
 
-  updateActivity: (agentId, activity, activityDetail = "", serverSeq, timestamp = Date.now(), joinKeys, activityKind, detailKind, traceJoin, isHeartbeat, isRefreshOnly, deliveryConsumption, wakeCrashLoop, spawnFailure) =>
+  seedExternalSeenFromRoster: (rows) => set((state) => {
+    let next: Record<string, string | null> | null = null;
+    for (const row of rows) {
+      if (row.external !== true) continue;
+      const known = (next ?? state.externalSeenAt)[row.id];
+      const incoming = row.lastSeenAt ?? null;
+      if (known !== undefined && !isNewerTimestamp(incoming, known)) continue;
+      next ??= { ...state.externalSeenAt };
+      next[row.id] = incoming;
+    }
+    return next ? { externalSeenAt: next } : {};
+  }),
+
+  updateActivity: (agentId, activity, activityDetail = "", serverSeq, timestamp = Date.now(), joinKeys, activityKind, detailKind, traceJoin, isHeartbeat, isRefreshOnly, deliveryConsumption, wakeCrashLoop, spawnFailure, toolStuck, credentialHold, errorCode) =>
     set((state) => {
       const { state: next, transition } = applyAgentActivityEvent(pickAgentActivityDomainState(state), {
         kind: "patch:socket-activity",
@@ -1154,6 +1375,9 @@ export const useAgentStore = create<AgentState>((set, get) => ({
         ...(deliveryConsumption ? { deliveryConsumption } : {}),
         ...(wakeCrashLoop ? { wakeCrashLoop } : {}),
         ...(spawnFailure ? { spawnFailure } : {}),
+        ...(toolStuck ? { toolStuck } : {}),
+        ...(credentialHold ? { credentialHold } : {}),
+        ...(errorCode ? { activityErrorCode: errorCode } : {}),
       });
       traceAgentActivityTransition(state, transition, { activity, activityKind, detail: activityDetail, detailKind, joinKeys, traceJoin, isHeartbeat, isRefreshOnly });
       if (transition.reconcileSuggested) scheduleAgentActivityReconcile();
@@ -1176,7 +1400,9 @@ export const useAgentStore = create<AgentState>((set, get) => ({
       return transition.touched === 0 ? {} : applyAgentActivityDomainPatch(state, next);
     }),
 
-  loadTrajectoryLog: async (agentId, limit = 50) => {
+  // As many as the live log keeps: the Sub-agents list is built from it, so a
+  // reload must not show fewer than the page had (#proj-runtime:#43).
+  loadTrajectoryLog: async (agentId, limit = MAX_TRAJECTORY_ENTRIES) => {
     const hydrateGeneration = get().trajectoryHydrateGeneration;
     let incoming: TrajectoryLogEntry[];
     try {
@@ -1211,6 +1437,20 @@ export const useAgentStore = create<AgentState>((set, get) => ({
   getTrajectoryLog: (agentId) => get().trajectoryLogs[agentId] || [],
 }));
 
+function withExternalSeenAt(
+  fallbackAgent: AgentDisplayFallback | null | undefined,
+  externalSeenAt: string | null | undefined,
+): AgentDisplayFallback | null | undefined {
+  if (externalSeenAt === undefined) return fallbackAgent;
+  const fallbackSeenAt = fallbackAgent?.lastSeenAt ?? null;
+  return {
+    ...fallbackAgent,
+    status: fallbackAgent?.status ?? "inactive",
+    external: true,
+    lastSeenAt: isNewerTimestamp(fallbackSeenAt, externalSeenAt) ? fallbackSeenAt : externalSeenAt,
+  };
+}
+
 const getConstantPresenceSnapshot = () => 0;
 const subscribeNoPresenceClock = () => () => {};
 
@@ -1219,8 +1459,13 @@ export function useAgentDisplayState(
   fallbackAgent?: AgentDisplayFallback | null,
 ): AgentDisplayState {
   const agentFromStore = useAgentStore((state) => state.agents.find((agent) => agent.id === agentId));
+  const machineOffline = useMachineStore((state) => isMachineOffline(state.machines, agentFromStore?.machineId));
+  const externalSeenAt = useAgentStore((state) => state.externalSeenAt[agentId]);
   const activityState = useAgentCurrentActivityState(agentId);
-  const agent = agentFromStore ?? fallbackAgent;
+  // This server's agents read only their own record; another server's
+  // external agent (joint channel) takes the newer of its fallback row's
+  // lastSeenAt and what the roster/pushes recorded.
+  const agent = agentFromStore ?? withExternalSeenAt(fallbackAgent, externalSeenAt);
   const isExternal = agent?.external === true || isExternalAgentRuntime(agent?.runtime);
   // External presence is time-derived: follow the shared presence clock.
   // Managed agents read a constant snapshot, so they never re-render from it.
@@ -1229,7 +1474,7 @@ export function useAgentDisplayState(
     isExternal ? getPresenceClockNowMs : getConstantPresenceSnapshot,
     getConstantPresenceSnapshot,
   );
-  return resolveAgentDisplayState(agent, activityState, isExternal, isExternal ? nowMs : undefined);
+  return resolveAgentDisplayState(agent, activityState, isExternal, isExternal ? nowMs : undefined, machineOffline);
 }
 
 export function useAgentCurrentActivityState(agentId: string): AgentActivityState | undefined {
@@ -1240,10 +1485,30 @@ export function useAgentActivityTraceJoin(agentId: string): AgentActivityTraceJo
   return useAgentStore((state) => selectAgentActivityTraceJoin(state, agentId));
 }
 
+/**
+ * The agent with this id when it is an App bot (`managedByAppInstallId`, the
+ * one predicate every App-bot surface uses), read from the agent list; null
+ * for any other agent, an id the list doesn't hold, or no id. For list rows
+ * that carry only an id: they show AppBadge beside the name with
+ * `appName={appBot.managedByApp?.name}`, and no presence or runtime. Returns
+ * the store's own record, so the row re-renders only when that agent changes.
+ */
+export function useAppBotAgent(agentId: string | null | undefined): Agent | null {
+  return useAgentStore((state) => {
+    if (!agentId) return null;
+    const agent = state.agents.find((candidate) => candidate.id === agentId);
+    return agent?.managedByAppInstallId ? agent : null;
+  });
+}
+
+// The resolver drops refs this directory already knows.
+registerLocalActorLookup((ref) => ref.kind === "agent" && useAgentStore.getState().agents.some((agent) => agent.id === ref.id));
+
 // Reset all server-scoped state when the user switches servers.
 registerServerReset(() =>
   useAgentStore.setState({
     agents: [],
+    externalSeenAt: {},
     agentActivities: {},
     agentActivityTraceJoins: {},
     agentActivityObservedAt: {},

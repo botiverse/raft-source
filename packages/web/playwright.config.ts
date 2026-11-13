@@ -1,5 +1,12 @@
 import path from "node:path";
 import { defineConfig } from "@playwright/test";
+import { useDevRunEnv } from "../../scripts/dev/raftdev-cache";
+
+// Local runs: TMPDIR (browser profiles, playwright-artifacts-*) and
+// NODE_COMPILE_CACHE on disk under ~/.cache/raft-dev, removed when the run
+// ends; workers loading this config reuse the main process's run dir.
+// test-results/ and playwright-report/ stay where they were. Nothing in CI.
+useDevRunEnv();
 
 const webPort = Number(process.env.PLAYWRIGHT_WEB_PORT || "4173");
 const apiPort = Number(process.env.PLAYWRIGHT_API_PORT || "4174");
@@ -7,8 +14,18 @@ const stateDir = path.resolve(process.cwd(), ".playwright", "state");
 const seedStatePath = path.join(stateDir, "playwright-server.json");
 const authStatePath = path.join(stateDir, "auth.json");
 
+// The nightly tier: a test titled with `@nightly` is excluded from every
+// per-change run (PRs, staging pushes, release candidates) and runs only in
+// the scheduled full Test run (GITHUB_EVENT_NAME=schedule, 18:07Z daily).
+// Use it for a test that is correct but cannot fit a per-merge budget; say
+// why on the test and what would bring it back. Run them locally with
+// E2E_INCLUDE_NIGHTLY=1.
+const includeNightly =
+  process.env.GITHUB_EVENT_NAME === "schedule" || process.env.E2E_INCLUDE_NIGHTLY === "1";
+
 export default defineConfig({
   testDir: "./tests/e2e/tests",
+  ...(includeNightly ? {} : { grepInvert: /@nightly/ }),
   fullyParallel: false,
   // 1 retry on CI to absorb known infra flakiness (vite ws ECONNRESET noise +
   // occasional `socket hang up` from the pglite-backed test API server during

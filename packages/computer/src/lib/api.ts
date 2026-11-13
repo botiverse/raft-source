@@ -46,6 +46,12 @@ import {
 import { resolveServerUrl, resolveServerUrlEnv } from "../serverUrl";
 import { login as loginService, type LoginResult } from "../services/login";
 import { attach as attachService, type AttachResult } from "../services/attach";
+import {
+  approveMachine as approveMachineService,
+  attachWithApproval as attachWithApprovalService,
+  attachWithToken as attachWithTokenService,
+  type ApproveMachineResult,
+} from "../services/attachGrant";
 import { start as startService, type StartResult, type StartDeps } from "../services/start";
 import { stop as stopService, type StopResult, type StopDeps, type StopStatus } from "../services/stop";
 import {
@@ -191,6 +197,35 @@ export interface ComputerApi {
     opts: { serverSlug: string; serverUrl?: string; name?: string },
     onEvent?: (event: ComputerApiEvent) => void,
   ): Promise<AttachResult>;
+  /**
+   * Attach this Computer to one server through a one-time approval (no user
+   * session; device-auth design v2 §3.2). The presenter prints the approval
+   * code from the `login.device-code` event. On a server older than one-time
+   * grants this falls back to the user-session attach.
+   */
+  attachWithApproval(
+    opts: { serverSlug: string; serverUrl?: string; name?: string },
+    onEvent?: (event: ComputerApiEvent) => void,
+  ): Promise<AttachResult>;
+  /**
+   * Attach this Computer to one server with a single-use `dvat_*` attach
+   * token the caller already obtained (Raft Desktop runs the device flow and
+   * approves it with its own web session). No user session is read or
+   * written; the token is never logged, put on an event or in an error.
+   */
+  attachWithToken(
+    opts: { serverSlug: string; serverId: string; serverUrl: string; attachToken: string; name?: string },
+    onEvent?: (event: ComputerApiEvent) => void,
+  ): Promise<AttachResult>;
+  /**
+   * The approval flow without a server slug (the old `login` command): the
+   * server picked on the approval page is attached. An older server signs in
+   * with a user session instead.
+   */
+  approveMachine(
+    opts: { serverUrl?: string; name?: string },
+    onEvent?: (event: ComputerApiEvent) => void,
+  ): Promise<ApproveMachineResult>;
   /** Start/ensure the Computer service. `onEvent` formats the start lines. */
   start(
     opts: {
@@ -421,6 +456,40 @@ export function createComputerApi(slockHome: string, opts?: CreateComputerApiOpt
       return viaService(() =>
         attachService(
           { serverSlug: opts.serverSlug, serverUrl: opts.serverUrl, name: opts.name, slockHome },
+          onEvent ? { onEvent } : {},
+        ),
+      );
+    },
+
+    attachWithApproval(opts, onEvent): Promise<AttachResult> {
+      return viaService(() =>
+        attachWithApprovalService(
+          { serverSlug: opts.serverSlug, serverUrl: opts.serverUrl, name: opts.name, slockHome },
+          onEvent ? { onEvent } : {},
+        ),
+      );
+    },
+
+    attachWithToken(opts, onEvent): Promise<AttachResult> {
+      return viaService(() =>
+        attachWithTokenService(
+          {
+            serverSlug: opts.serverSlug,
+            serverId: opts.serverId,
+            serverUrl: opts.serverUrl,
+            attachToken: opts.attachToken,
+            ...(opts.name ? { name: opts.name } : {}),
+            slockHome,
+          },
+          onEvent ? { onEvent } : {},
+        ),
+      );
+    },
+
+    approveMachine(opts, onEvent): Promise<ApproveMachineResult> {
+      return viaService(() =>
+        approveMachineService(
+          { serverUrl: opts.serverUrl, name: opts.name, slockHome },
           onEvent ? { onEvent } : {},
         ),
       );

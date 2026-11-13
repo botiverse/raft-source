@@ -1,5 +1,5 @@
 import type { RequestHandler, Response } from "express";
-import { addTraceEvent } from "../tracing/semanticTrace";
+import { addTraceEvent, traceMiddlewarePhase } from "../tracing/semanticTrace";
 import {
   InboxBackpressureRejectedError,
   type InboxRouteBackpressure,
@@ -23,11 +23,13 @@ export function getInboxRouteBackpressureAdmission(
   return (res as ResponseWithAdmission)[INBOX_BACKPRESSURE_ADMISSION];
 }
 
-export const inboxRouteBackpressureMiddleware: RequestHandler = async (req, res, next) => {
+export const inboxRouteBackpressureMiddleware: RequestHandler = async (req, res, untracedNext) => {
   if (req.method !== "GET" || req.path !== "/inbox") {
-    next();
+    untracedNext();
     return;
   }
+  // Only the inbox read waits here, so only it records the phase.
+  const next = traceMiddlewarePhase("inbox_backpressure", untracedNext);
 
   // This middleware can terminate before Express reaches the concrete Router
   // layer. Preserve the already-known constant route for bounded telemetry

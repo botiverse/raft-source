@@ -10,14 +10,22 @@ export function canForwardFromSource(channel: Pick<Channel, "type"> | null | und
   return Boolean(channel);
 }
 
-export function getForwardDisabledReason(
+/**
+ * How the selection toolbar shows Forward (#proj-raft-ui:#245):
+ * - `hidden`: forwarding is impossible here (a Guest may not forward);
+ * - `pending`: the source channel hasn't loaded yet, so Forward shows disabled,
+ *   with no sentence explaining it (it becomes `ready` once the channel loads);
+ * - `ready`: Forward works.
+ * Every channel type can be forwarded from, so a loaded channel is always `ready`.
+ */
+export type ForwardAvailability = "hidden" | "pending" | "ready";
+
+export function forwardAvailability(
   channel: Pick<Channel, "type"> | null | undefined,
-  formatMessage: FormatMessage,
-): string | null {
-  if (!canForwardFromSource(channel)) {
-    return formatMessage({ id: "message.forward.unsupportedSource" });
-  }
-  return null;
+  { isGuest }: { isGuest: boolean },
+): ForwardAvailability {
+  if (isGuest) return "hidden";
+  return canForwardFromSource(channel) ? "ready" : "pending";
 }
 export function getForwardableMessages<T extends Message>(messages: readonly T[]) {
   let nestedForwardCount = 0;

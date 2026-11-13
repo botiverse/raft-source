@@ -1,5 +1,5 @@
-import { validateAnnouncementPresentation, validateAnnouncementAudience, type AnnouncementAudience } from "@botiverse/raft-shared";
-import { and, asc, desc, eq, gt, inArray, isNull, lte, or, sql } from "drizzle-orm";
+import { validateAnnouncementPresentation, validateAnnouncementAudience, matchesAnnouncementRules, matchesAnnouncementDevices, announcementRuleFlagKeys, type AnnouncementAudience, type AnnouncementClient, type AnnouncementRuleContext, type AnnouncementRulePlatform } from "@botiverse/raft-shared";
+import { and, asc, desc, eq, gt, inArray, isNull, lt, lte, or, sql, type SQL } from "drizzle-orm";
 import {
   currentDate,
   DISPLAY_LOCALES,
@@ -12,6 +12,7 @@ import {
   type ServerId,
 } from "@botiverse/raft-shared";
 import { getDb } from "../db/index";
+import { evaluateFeatureFlags } from "./featureFlagService";
 import {
   announcementAuditEvents,
   announcements,
@@ -32,8 +33,10 @@ export type {
 export type AnnouncementStatus = "draft" | "published" | "expired";
 export type AnnouncementEffectiveStatus = AnnouncementStatus | "scheduled";
 export type AnnouncementAuditAction =
+  | "deleted"
   | "created"
   | "updated"
+  | "priority_updated"
   | "published"
   | "scheduled"
   | "schedule_updated"
@@ -111,7 +114,7 @@ export function validateLocalizedContent(
   rawContent: AnnouncementContentByLocale,
 ): AnnouncementContentByLocale {
   if (!DISPLAY_LOCALES.includes(defaultLocale)) {
-    throw new Error("defaultLocale must be en or zh-cn");
+    throw new Error(`defaultLocale must be one of ${DISPLAY_LOCALES.join(", ")}`);
   }
   if (!rawContent || typeof rawContent !== "object" || Array.isArray(rawContent)) {
     throw new Error("content must be an object keyed by locale");
@@ -135,6 +138,9 @@ export function validateLocalizedContent(
   const pageCount = fallback.pages.length;
   for (const locale of DISPLAY_LOCALES) {
     const entry = content[locale];
+    if (entry && (entry.displayMode ?? "modal") !== (fallback.displayMode ?? "modal")) {
+      throw new Error("all localized content must use the same display mode");
+    }
     if (entry && entry.pages.length !== pageCount) {
       throw new Error("all localized content must use the same page count and order");
     }
@@ -257,6 +263,7 @@ async function recordActivationIfNeeded(
       .where(and(
         eq(announcements.id, announcementId),
         eq(announcements.status, "published"),
+        isNull(announcements.deletedAt),
         lte(announcements.startsAt, now),
         isNull(announcements.activatedAt),
       ))
@@ -317,14 +324,33 @@ async function recordActivationIfNeeded(
  * @cindyz decided on 2026-08-07 that a user should instead work through every
  * live announcement they have not read, oldest first, so an older unread row now
  * DOES surface after a newer one. That is the intended product behaviour, not a
- * regression. (A `priority` column may later join the ordering; not implemented.)
+ * regression. Admin-managed priority now sorts first, descending; equal priorities
+ * retain this oldest-first order. Existing rows default to priority 0.
  *
  * Dismissal participates in SELECTION rather than being checked afterwards: a
  * post-check would make "the oldest row is already read" collapse to "no
  * announcement", which is the old defect facing the other way.
  */
+/**
+ * `audience.clients` narrows any audience to native App builds named by the
+ * request's User-Agent (parseRaftAppClient). It is part of selection for the
+ * same reason as membership: a client-filtered older row must not hide a newer
+ * row this client may see. A constraint the request does not state (no build
+ * number, no build type, no App at all) excludes it.
+ */
+function clientEligibility(client: AnnouncementClient | null | undefined) {
+  if (!client) return sql`not (${announcements.audience} ? 'clients')`;
+  return sql`(not (${announcements.audience} ? 'clients') or exists (
+    select 1 from jsonb_array_elements(case when jsonb_typeof(${announcements.audience}->'clients') = 'array' then ${announcements.audience}->'clients' else '[]'::jsonb end) c
+    where c->>'platform' = ${client.platform}
+      and (not (c ? 'buildTypes') or (${client.buildType ?? null}::text is not null and c->'buildTypes' @> to_jsonb(${client.buildType ?? null}::text)))
+      and (not (c ? 'minBuild') or (${client.buildNumber ?? null}::bigint is not null and (c->>'minBuild')::bigint <= ${client.buildNumber ?? null}::bigint))
+      and (not (c ? 'maxBuild') or (${client.buildNumber ?? null}::bigint is not null and (c->>'maxBuild')::bigint >= ${client.buildNumber ?? null}::bigint))
+  ))`;
+}
+
 /** Apply targeting before oldest-first selection; context alone never grants membership. */
-function audienceEligibility(userId: string, serverId?: ServerId) {
+function audienceEligibility(userId: string, serverId?: ServerId, client?: AnnouncementClient | null) {
   const currentMember = serverId ? sql`exists (
     select 1 from ${serverMembers} join ${servers} on ${servers.id} = ${serverMembers.serverId}
     where ${serverMembers.userId} = ${userId} and ${serverMembers.serverId} = ${serverId}
@@ -349,7 +375,7 @@ function audienceEligibility(userId: string, serverId?: ServerId) {
     where ${serverMembers.userId} = ${userId} and ${serverMembers.role} <> 'guest'
       and ${servers.deletedAt} is null and ${servers.kind} <> 'joint_storage'
   ))`;
-  return sql`(not ${guestInServer} and not ${guestOnly}) and (
+  return sql`(not ${guestInServer} and not ${guestOnly}) and ${clientEligibility(client)} and (
     ${announcements.audience}->>'type' = 'all'
     or (${announcements.audience}->>'type' = 'users' and ${announcements.audience}->'userIds' @> ${JSON.stringify([userId])}::jsonb)
     or (${currentMember} and (
@@ -362,12 +388,91 @@ function audienceEligibility(userId: string, serverId?: ServerId) {
   )`;
 }
 
+/** The client platform as audience rules name it; `unknown` (older clients, no header) is null. */
+export function announcementRulePlatform(platform: string | null | undefined): AnnouncementRulePlatform | null {
+  switch (platform) {
+    case "web": case "pwa": return "web";
+    case "mobile_web": return "mobile_web";
+    case "desktop_app": return "desktop";
+    case "ios": case "android": case "harmonyos": return platform;
+    default: return null;
+  }
+}
+
+/**
+ * `audience.rules` (task #31) need facts SQL alone cannot cheaply give (feature
+ * flags, the request's platform), so they are checked here, after the SQL
+ * eligibility above and in the same priority/oldest-first order. The facts are
+ * read once per request, and only when a candidate row carries rules.
+ */
+async function loadRuleContext(
+  userId: string,
+  serverId: ServerId | undefined,
+  platform: AnnouncementRulePlatform | null,
+  now: Date,
+  flagKeys: string[],
+): Promise<AnnouncementRuleContext | null> {
+  const db = getDb();
+  const [user] = await db
+    .select({ createdAt: users.createdAt, displayLanguage: users.displayLanguage })
+    .from(users)
+    .where(eq(users.id, userId))
+    .limit(1);
+  if (!user) return null;
+  const [server] = serverId
+    ? await db
+        .select({ createdAt: servers.createdAt, plan: servers.plan, role: serverMembers.role })
+        .from(serverMembers)
+        .innerJoin(servers, eq(servers.id, serverMembers.serverId))
+        .where(and(
+          eq(serverMembers.userId, userId),
+          eq(serverMembers.serverId, serverId),
+          isNull(servers.deletedAt),
+          sql`${serverMembers.role} <> 'guest'`,
+        ))
+        .limit(1)
+    : [];
+  const evaluations = flagKeys.length === 0
+    ? []
+    : await evaluateFeatureFlags(flagKeys.map((key) => ({ key, userId, serverId: serverId ?? null })));
+  const locale = DISPLAY_LOCALES.includes(user.displayLanguage as DisplayLocale) ? user.displayLanguage as DisplayLocale : null;
+  return {
+    now,
+    accountCreatedAt: user.createdAt,
+    locale,
+    platform,
+    server: server ? { createdAt: server.createdAt, plan: server.plan, role: server.role } : null,
+    flags: new Map(evaluations.map((evaluation) => [evaluation.key, evaluation.enabled])),
+  };
+}
+
+/** How many SQL-eligible rows one request inspects for rules. Live announcements are few. */
+const RULE_SCAN_LIMIT = 100;
+
+async function filterByRules<T extends { audience: AnnouncementAudience }>(
+  rows: T[],
+  userId: string,
+  serverId: ServerId | undefined,
+  platform: AnnouncementRulePlatform | null,
+  now: Date,
+): Promise<T[]> {
+  const onDevice = rows.filter((row) => matchesAnnouncementDevices(row.audience.devices, platform));
+  if (!onDevice.some((row) => row.audience.rules)) return onDevice;
+  const flagKeys = [...new Set(onDevice.flatMap((row) => announcementRuleFlagKeys(row.audience.rules)))];
+  const ctx = await loadRuleContext(userId, serverId, platform, now, flagKeys);
+  if (!ctx) return [];
+  return onDevice.filter((row) => matchesAnnouncementRules(row.audience.rules, ctx));
+}
+
 export async function listUndismissedForUser(
   userId: string,
   sessionFamilyId?: string,
   now = currentDate(),
   afterAnnouncementId?: string,
   serverId?: ServerId,
+  client?: AnnouncementClient | null,
+  sidebarLimit = 1,
+  platform: AnnouncementRulePlatform | null = null,
 ): Promise<Announcement[]> {
   const db = getDb();
   const [user] = await db
@@ -387,12 +492,13 @@ export async function listUndismissedForUser(
     ? await db
         .select({
           id: announcements.id,
+          priority: announcements.priority,
           startsAt: announcements.startsAt,
           publishedAt: announcements.publishedAt,
           createdAt: announcements.createdAt,
         })
         .from(announcements)
-        .where(eq(announcements.id, afterAnnouncementId))
+        .where(and(eq(announcements.id, afterAnnouncementId), isNull(announcements.deletedAt)))
         .limit(1)
     : [];
   if (afterAnnouncementId && (!afterRow || !afterRow.startsAt)) return [];
@@ -400,7 +506,7 @@ export async function listUndismissedForUser(
     ? afterRow.publishedAt ?? afterRow.startsAt ?? afterRow.createdAt
     : undefined;
   const publishedOrder = sql<Date>`coalesce(${announcements.publishedAt}, ${announcements.startsAt}, ${announcements.createdAt})`;
-  const afterCondition = afterRow && afterPublishedAt
+  const afterTimeCondition = afterRow && afterPublishedAt
     ? or(
         gt(announcements.startsAt, afterRow.startsAt!),
         and(
@@ -421,7 +527,25 @@ export async function listUndismissedForUser(
       )
     : undefined;
 
-  const [oldestUnread] = await db
+  const afterCondition = afterRow
+    ? or(lt(announcements.priority, afterRow.priority), and(eq(announcements.priority, afterRow.priority), afterTimeCondition))
+    : undefined;
+
+  // Sidebar cards and the dialog are exclusive per entry (@cindyz, 2026-10-29,
+  // task #26). The head of the queue decides: a dialog head is returned alone,
+  // exactly as before; a sidebar head brings up to `sidebarLimit` sidebar rows
+  // that follow it in the same order, skipping dialog rows. The client shows
+  // them one at a time and records each as read only when the reader moves on.
+  const eligible = and(
+    eq(announcements.status, "published"),
+    isNull(announcements.deletedAt),
+    lte(announcements.startsAt, now),
+    or(isNull(announcements.endsAt), gt(announcements.endsAt, now)),
+    isNull(userAnnouncementDismissals.userId),
+    audienceEligibility(userId, serverId, client),
+    afterCondition,
+  );
+  const selectUnread = (where: SQL | undefined, limit: number) => db
     .select({ announcement: announcements })
     .from(announcements)
     // The user-id predicate belongs in the JOIN condition, never in WHERE: in
@@ -434,26 +558,44 @@ export async function listUndismissedForUser(
         eq(userAnnouncementDismissals.userId, userId),
       ),
     )
-    .where(and(
-      eq(announcements.status, "published"),
-      lte(announcements.startsAt, now),
-      or(isNull(announcements.endsAt), gt(announcements.endsAt, now)),
-      isNull(userAnnouncementDismissals.userId),
-      audienceEligibility(userId, serverId),
-      afterCondition,
-    ))
+    .where(where)
     .orderBy(
+      desc(announcements.priority),
       asc(announcements.startsAt),
       asc(publishedOrder),
       asc(announcements.createdAt),
       asc(announcements.id),
     )
-    .limit(1);
+    .limit(limit);
 
-  const row = oldestUnread?.announcement;
+  // Rows carrying audience rules or devices are judged after SQL, so the scan reads a
+  // bounded run of eligible rows and the first rule-matching one is the head.
+  // The common case reads one row: a head without rules that is a dialog (or
+  // asked alone) needs nothing more.
+  const [first] = (await selectUnread(eligible, 1)).map((item) => item.announcement);
+  if (!first) return [];
+  const firstIsAlone = !first.audience.rules && matchesAnnouncementDevices(first.audience.devices, platform) && (sidebarLimit <= 1 || toAnnouncement(first, user.displayLanguage, serverId).displayMode !== "sidebar");
+  const candidates = firstIsAlone ? [first] : await filterByRules(
+    (await selectUnread(eligible, RULE_SCAN_LIMIT)).map((item) => item.announcement),
+    userId,
+    serverId,
+    platform,
+    now,
+  );
+  const row = candidates[0];
   if (!row) return [];
-  await recordActivationIfNeeded(row.id, now);
-  return [toAnnouncement(row, user.displayLanguage, serverId)];
+  const head = toAnnouncement(row, user.displayLanguage, serverId);
+  if (sidebarLimit <= 1 || head.displayMode !== "sidebar") {
+    await recordActivationIfNeeded(row.id, now);
+    return [head];
+  }
+  // A sidebar head brings the sidebar rows that follow it in the same order,
+  // skipping dialog rows. displayMode is the same in every locale
+  // (validateLocalizedContent), so the default locale's value decides.
+  const isSidebar = (item: typeof row) => (item.localizedContent as Record<string, { displayMode?: string } | undefined> | null)?.[item.defaultLocale]?.displayMode === "sidebar";
+  const stack = [row, ...candidates.slice(1).filter(isSidebar)].slice(0, sidebarLimit);
+  for (const item of stack) await recordActivationIfNeeded(item.id, now);
+  return stack.map((item) => item.id === row.id ? head : toAnnouncement(item, user.displayLanguage, serverId));
 }
 
 export async function dismiss(
@@ -461,19 +603,23 @@ export async function dismiss(
   announcementId: string,
   now = currentDate(),
   serverId?: ServerId,
+  client?: AnnouncementClient | null,
+  platform: AnnouncementRulePlatform | null = null,
 ): Promise<boolean> {
   const db = getDb();
-  const [exists] = await db
-    .select({ id: announcements.id })
+  const [found] = await db
+    .select({ id: announcements.id, audience: announcements.audience })
     .from(announcements)
     .where(and(
       eq(announcements.id, announcementId),
-      audienceEligibility(userId, serverId),
+      audienceEligibility(userId, serverId, client),
       eq(announcements.status, "published"),
+      isNull(announcements.deletedAt),
       lte(announcements.startsAt, now),
       or(isNull(announcements.endsAt), gt(announcements.endsAt, now)),
     ))
     .limit(1);
+  const [exists] = found ? await filterByRules([found], userId, serverId, platform, now) : [];
   if (!exists) return false;
   await db
     .insert(userAnnouncementDismissals)
@@ -554,7 +700,7 @@ export async function updateDraft(
     const [existing] = await tx
       .select()
       .from(announcements)
-      .where(eq(announcements.id, announcementId))
+      .where(and(eq(announcements.id, announcementId), isNull(announcements.deletedAt)))
       .limit(1);
     if (!existing) return null;
 
@@ -577,6 +723,7 @@ export async function updateDraft(
         .where(and(
           eq(announcements.id, announcementId),
           eq(announcements.status, "published"),
+          isNull(announcements.deletedAt),
         ))
         .returning();
       if (!row) return null;
@@ -597,7 +744,7 @@ export async function updateDraft(
         updatedByUserId: actorUserId,
         updatedAt: now,
       })
-      .where(and(eq(announcements.id, announcementId), eq(announcements.status, "draft")))
+      .where(and(eq(announcements.id, announcementId), isNull(announcements.deletedAt), eq(announcements.status, "draft")))
       .returning();
     if (!row) return null;
     await tx.insert(announcementAuditEvents).values({
@@ -619,7 +766,7 @@ export async function publishDraft(
     const [draft] = await tx
       .select()
       .from(announcements)
-      .where(and(eq(announcements.id, announcementId), eq(announcements.status, "draft")))
+      .where(and(eq(announcements.id, announcementId), isNull(announcements.deletedAt), eq(announcements.status, "draft")))
       .limit(1);
     if (!draft) return null;
 
@@ -640,7 +787,7 @@ export async function publishDraft(
         updatedByUserId: actorUserId,
         updatedAt: now,
       })
-      .where(and(eq(announcements.id, announcementId), eq(announcements.status, "draft")))
+      .where(and(eq(announcements.id, announcementId), isNull(announcements.deletedAt), eq(announcements.status, "draft")))
       .returning();
     if (!row) return null;
     if (startsAt.getTime() > now.getTime()) {
@@ -677,6 +824,7 @@ export async function cancelScheduledAnnouncement(
       .where(and(
         eq(announcements.id, announcementId),
         eq(announcements.status, "published"),
+        isNull(announcements.deletedAt),
       ))
       .limit(1);
     if (!existing?.startsAt || existing.startsAt.getTime() <= now.getTime()) return null;
@@ -694,6 +842,7 @@ export async function cancelScheduledAnnouncement(
       .where(and(
         eq(announcements.id, announcementId),
         eq(announcements.status, "published"),
+        isNull(announcements.deletedAt),
       ))
       .returning();
     if (!row) return null;
@@ -724,6 +873,7 @@ export async function expireAnnouncement(
       .where(and(
         eq(announcements.id, announcementId),
         eq(announcements.status, "published"),
+        isNull(announcements.deletedAt),
         lte(announcements.startsAt, now),
       ))
       .returning();
@@ -744,6 +894,7 @@ export async function listAdminAnnouncements(now = currentDate()): Promise<Admin
     .from(announcements)
     .where(and(
       eq(announcements.status, "published"),
+      isNull(announcements.deletedAt),
       lte(announcements.startsAt, now),
       isNull(announcements.activatedAt),
     ));
@@ -751,6 +902,7 @@ export async function listAdminAnnouncements(now = currentDate()): Promise<Admin
   const rows = await db
     .select()
     .from(announcements)
+    .where(isNull(announcements.deletedAt))
     .orderBy(desc(announcements.createdAt));
   return rows.map((row) => toAdminAnnouncement(row, now));
 }
@@ -760,6 +912,8 @@ export async function listAuditEvents(announcementId: string): Promise<Array<{
   announcementId: string;
   actorUserId: string | null;
   action: AnnouncementAuditAction;
+  oldPriority: number | null;
+  newPriority: number | null;
   createdAt: string;
 }>> {
   await recordActivationIfNeeded(announcementId);
@@ -774,6 +928,8 @@ export async function listAuditEvents(announcementId: string): Promise<Array<{
     announcementId: row.announcementId,
     actorUserId: row.actorUserId,
     action: row.action,
+    oldPriority: row.oldPriority,
+    newPriority: row.newPriority,
     createdAt: row.createdAt.toISOString(),
   }));
 }
@@ -790,6 +946,7 @@ export async function getById(
     .where(and(
       eq(announcements.id, id),
       eq(announcements.status, "published"),
+      isNull(announcements.deletedAt),
       lte(announcements.startsAt, now),
     ))
     .limit(1);
@@ -807,6 +964,7 @@ export async function getLatest(
     .from(announcements)
     .where(and(
       eq(announcements.status, "published"),
+      isNull(announcements.deletedAt),
       lte(announcements.startsAt, now),
     ))
     .orderBy(desc(announcements.startsAt), desc(announcements.publishedAt))

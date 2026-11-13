@@ -927,7 +927,7 @@ test("durable trajectory reload repairs stale idle badge state", async () => {
   });
 });
 
-test("agent display state falls back to database status when activity is not seeded", () => {
+test("agent display state falls back to database status when activity is not seeded: active reads Likely online (#triage:#97)", () => {
   resetStores();
   useAgentStore.setState({
     agents: [
@@ -940,8 +940,9 @@ test("agent display state falls back to database status when activity is not see
     activity: "online",
     activityDetail: "",
     activityDetailKind: "none",
-    activityText: "Online",
+    activityText: "Likely online",
     isOnline: true,
+    likelyOnline: true,
   });
   assert.deepEqual(selectAgentDisplayState(useAgentStore.getState(), "stopped-agent"), {
     activity: "offline",
@@ -950,4 +951,44 @@ test("agent display state falls back to database status when activity is not see
     activityText: "Stopped — won't receive messages until restarted",
     isOnline: false,
   });
+});
+
+test("loadAgents keeps another server's agent activity (joint channel) and drops this server's removed agent (#triage:#95)", async () => {
+  resetStores();
+  useAgentStore.setState({ agents: [makeAgent(), makeAgent({ id: "agent-gone", name: "gone" })] });
+  api.get = (async (url: string) => {
+    assert.equal(url, "/agents");
+    return { data: [{ ...makeAgent(), activity: "online" }] };
+  }) as typeof api.get;
+
+  // A peer server's Computer agent, known only from the joint roster / pushes.
+  useAgentStore.getState().updateActivity("peer-agent", "working", "Running command", 7, 400);
+  useAgentStore.getState().updateActivity("agent-gone", "working", "Thinking", 3, 400);
+
+  await useAgentStore.getState().loadAgents();
+
+  const state = useAgentStore.getState();
+  assert.equal(state.agentActivities["peer-agent"]?.activity, "working", "the peer agent stays working");
+  assert.equal(state.agentActivities["peer-agent"]?.activityDetail, "Running command");
+  assert.equal(state.agentActivities["agent-gone"], undefined, "an agent this server no longer lists is dropped");
+  assert.equal(state.agentActivities["agent-1"]?.activity, "online", "this server's agents follow /agents");
+
+  // It finished while the tab was offline: the roster read after the reconnect
+  // (useChannelMembers hydrates without a seq) replaces the kept "working".
+  useAgentStore.getState().updateActivity("peer-agent", "online", "");
+  assert.equal(useAgentStore.getState().agentActivities["peer-agent"]?.activity, "online", "the roster's state wins over the kept one");
+});
+
+test("loadAgents keeps the activity of another server's agent whose profile put it in the list (#triage:#95)", async () => {
+  resetStores();
+  useAgentStore.setState({ agents: [makeAgent(), makeAgent({ id: "peer-profile", name: "peer", serverId: "server-2" })] });
+  api.get = (async (url: string) => {
+    assert.equal(url, "/agents");
+    return { data: [{ ...makeAgent(), activity: "online" }] };
+  }) as typeof api.get;
+  useAgentStore.getState().updateActivity("peer-profile", "working", "Running command", 4, 400);
+
+  await useAgentStore.getState().loadAgents();
+
+  assert.equal(useAgentStore.getState().agentActivities["peer-profile"]?.activity, "working");
 });

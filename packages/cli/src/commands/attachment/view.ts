@@ -67,6 +67,11 @@ export const attachmentViewCommand = defineCommand(
     const client = ctx.createApiClient(agentContext);
     const res = await createAgentApiSurfaceClient(client).attachments.view({ attachmentId: id });
     if (!res.ok) {
+      // A file in a message older than the server plan's history window: the
+      // server's error says so, not "unavailable".
+      if (res.errorCode === "HISTORY_LIMITED") {
+        throw new CliError({ code: "HISTORY_LIMITED", message: res.error ?? `HTTP ${res.status}` });
+      }
       const unavailable = res.status === 404;
       throw new CliError({
         code: res.status >= 500 ? "SERVER_5XX" : "VIEW_FAILED",

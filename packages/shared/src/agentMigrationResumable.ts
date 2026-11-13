@@ -1,4 +1,5 @@
 import type { AgentMigrationTransferSummary } from "./agentMigration";
+import { COMPUTER_UPGRADE_DRAIN_MAX_DEADLINE_MS } from "./computerUpgradeDrain";
 
 // transferSummary is required on the v2 wire contract. Keep both the protocol
 // and control schema versioned so a rolling deployment fails closed at start:
@@ -16,6 +17,42 @@ export const AGENT_MIGRATION_CONTROL_SCHEMA_VERSION = "agent-migration-control/v
  * the capability a target needs to import the bundle.
  */
 export const AGENT_MIGRATION_CAPABILITY = "migration/v3" as const;
+/**
+ * Advertised in `ready.migrationTransport.capabilities` by a Computer whose
+ * control-manifest schema accepts `excludedIgnoredBySource` in the transfer
+ * summary when it is a migration target. The Server sets the source lease's
+ * `targetAcceptsIgnoreSources` only when the target advertises it.
+ */
+export const AGENT_MIGRATION_TARGET_IGNORE_SOURCES_CAPABILITY = "migration:target-ignore-sources-v1" as const;
+/**
+ * Advertised in `ready.migrationTransport.capabilities` by a Computer that, as a
+ * migration source, writes the source lease's `userIgnoreAdditions` into the
+ * agent's `.raftbackupignore.user` before it packs (./agentMigrationUserIgnore).
+ */
+export const AGENT_MIGRATION_SOURCE_USER_IGNORE_CAPABILITY = "migration:source-user-ignore-v1" as const;
+/**
+ * Advertised in `ready.migrationTransport.capabilities` by a Computer whose
+ * daemon and CLI let the agent retry, once, a migration that failed because
+ * its workspace was too big (`raft migration retry`, ./agentMigrationRetry).
+ * The Server accepts the retry only when the failed migration's SOURCE
+ * advertises it (the agent runs and trims its workspace there), and only then
+ * does the failed receipt tell the agent it can.
+ */
+export const AGENT_MIGRATION_AGENT_RETRY_CAPABILITY = "migration:agent-retry-v1" as const;
+/**
+ * Reconciler step 14 (Q-H). Advertised in `ready.migrationTransport.capabilities`
+ * by a Computer that, as a migration source, stops the agent only once it is
+ * quiet: it holds new deliveries and reminders for that agent and waits for
+ * it to be idle (the step 13 drain, for one agent), at most
+ * AGENT_MIGRATION_SOURCE_DRAIN_MAX_MS, then stops it. It waits only when the
+ * source lease carries `sourceDrainUntil`: the Server sends that only for a
+ * migration it gave the longer prep window (so an old Server's migration is
+ * stopped at once, as before, and never aborted at its prep deadline while
+ * the source still waits).
+ */
+export const AGENT_MIGRATION_SOURCE_DRAIN_CAPABILITY = "migration:source-drain-v1" as const;
+/** The longest a migration source waits for its agent to be quiet: the step 13 drain cap (the daemon clamps to it too). */
+export const AGENT_MIGRATION_SOURCE_DRAIN_MAX_MS = COMPUTER_UPGRADE_DRAIN_MAX_DEADLINE_MS;
 export const AGENT_MIGRATION_DEFAULT_CHUNK_BYTES = 8 * 1024 * 1024;
 export const AGENT_MIGRATION_MIN_CHUNK_BYTES = 1024 * 1024;
 export const AGENT_MIGRATION_MAX_CHUNKS = 2_048;

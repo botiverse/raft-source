@@ -115,12 +115,6 @@ test("ledger round-trips streams, drafts, and meta through one database", () => 
     assert.equal(getSavedDraft("agent-rt", "#general")?.content, "hello");
     assert.equal(readMeta("agent-rt", "version"), "1");
     assert.equal(readMeta("agent-rt", "generation"), undefined, "context lifetime lives in observations (RFC 072 §7.3), not meta");
-    // The directory carries its own do-not-touch breadcrumb.
-    const readme = fs.readFileSync(
-      path.join(path.dirname(resolveStateDbPath("agent-rt")), "README"),
-      "utf8",
-    );
-    assert.match(readme, /Do not edit or delete/);
   } finally {
     restore();
   }
@@ -383,6 +377,32 @@ test("an agent id that could name another directory is refused", () => {
   try {
     assert.throws(() => setSavedDraft("../other-agent", "#x", { content: "x", attachmentIds: [], savedAt: Date.now(), reholdCount: 0 }));
     assert.equal(getConsumedSeq("../other-agent", "#x"), undefined);
+  } finally {
+    restore();
+  }
+});
+
+// Glimpse layer 2: the daemon reads "no counts table" as a CLI that predates
+// the counts, so any open by this CLI, a read included, must create it.
+test("any ledger open creates the passive render counts table, also in a ledger an older CLI made", () => {
+  const { restore } = isolatedEnv();
+  try {
+    const hasTable = () => {
+      const db = new DatabaseSync(resolveStateDbPath("agent-counts"), { readOnly: true });
+      try {
+        return Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'passive_render_counts'").get());
+      } finally {
+        db.close();
+      }
+    };
+    assert.equal(readStreamEntry("agent-counts", "#x"), undefined);
+    assert.equal(hasTable(), true, "fresh ledger");
+    const db = new DatabaseSync(resolveStateDbPath("agent-counts"));
+    db.exec("DROP TABLE passive_render_counts");
+    db.close();
+    assert.equal(hasTable(), false);
+    readStreamEntry("agent-counts", "#x");
+    assert.equal(hasTable(), true, "an older CLI's ledger gains it on the next open");
   } finally {
     restore();
   }

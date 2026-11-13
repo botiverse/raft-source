@@ -86,8 +86,11 @@ function project(node: unknown, where: string, options: ProjectOptions): RaftJso
   }
   const out: RaftJsonSchema = {};
   if (node.type !== undefined) {
-    if (Array.isArray(node.type)) throw new Error(`${where}: type arrays are outside the tool-schema subset`);
-    const type = String(node.type);
+    const typeValue = Array.isArray(node.type)
+      ? node.type.filter((t) => t !== "null")
+      : [node.type];
+    if (typeValue.length !== 1) throw new Error(`${where}: type arrays are outside the tool-schema subset`);
+    const type = String(typeValue[0]);
     if (type !== "object" && type !== "array" && !PRIMITIVES.has(type)) throw new Error(`${where}: unknown type ${type}`);
     out.type = type as RaftJsonSchemaType;
   }
@@ -129,7 +132,8 @@ function project(node: unknown, where: string, options: ProjectOptions): RaftJso
 function isNullable(node: unknown): boolean {
   if (!isRaw(node)) return false;
   const branches = (node.anyOf ?? node.oneOf) as unknown;
-  return node.type === "null" || (Array.isArray(branches) && branches.some((b) => isRaw(b) && b.type === "null"));
+  const typeArray = Array.isArray(node.type) && (node.type as unknown[]).includes("null");
+  return node.type === "null" || typeArray || (Array.isArray(branches) && branches.some((b) => isRaw(b) && b.type === "null"));
 }
 
 /**

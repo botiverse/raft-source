@@ -8,7 +8,8 @@ import { copyTextToClipboard } from "../../utils/selectMarkdown";
 import { migrationSupportRef } from "./presentation";
 import type { AgentMigrationNotice } from "./realtime";
 
-export function MigrationReference({ notice }: { notice: AgentMigrationNotice }) {
+/** The reference and its copy button, for a row whose label sits elsewhere. */
+export function MigrationReferenceValue({ notice }: { notice: AgentMigrationNotice }) {
   const { formatMessage } = useIntl();
   const [copied, setCopied] = useState(false);
   const ref = migrationSupportRef(notice);
@@ -25,26 +26,33 @@ export function MigrationReference({ notice }: { notice: AgentMigrationNotice })
     void copy();
   }, [copy]);
   return (
+    <span className="flex min-w-0 items-center gap-1">
+      {/* Plain Space Mono text: a support reference, not a highlighted chip. */}
+      <code className="min-w-0 break-all font-mono text-mono-meta text-foreground">{ref}</code>
+      <Tooltip content={copied
+          ? formatMessage({ id: "agent.migration.referenceCopied" })
+          : formatMessage({ id: "agent.migration.referenceCopy" })}>
+      <Button variant="ghost" size="icon-md"
+        type="button"
+        onClick={handleCopyClick}
+        className="shrink-0"
+        aria-label={copied
+          ? formatMessage({ id: "agent.migration.referenceCopied" })
+          : formatMessage({ id: "agent.migration.referenceCopyAria" }, { ref })}
+      >
+        {copied ? <Check size={14} aria-hidden="true" /> : <Copy size={14} aria-hidden="true" />}
+      </Button>
+      </Tooltip>
+    </span>
+  );
+}
+
+export function MigrationReference({ notice }: { notice: AgentMigrationNotice }) {
+  const { formatMessage } = useIntl();
+  return (
     <div className="flex min-w-0 flex-wrap items-center gap-1.5 text-caption text-foreground-muted">
       <span className="font-semibold">{formatMessage({ id: "agent.migration.referenceLabel" })}</span>
-      <span className="flex min-w-0 items-center gap-1">
-        {/* Plain Space Mono text: a support reference, not a highlighted chip. */}
-        <code className="min-w-0 break-all font-mono text-mono-meta text-foreground">{ref}</code>
-        <Tooltip content={copied
-            ? formatMessage({ id: "agent.migration.referenceCopied" })
-            : formatMessage({ id: "agent.migration.referenceCopy" })}>
-        <Button variant="ghost" size="icon-sm"
-          type="button"
-          onClick={handleCopyClick}
-          className="shrink-0"
-          aria-label={copied
-            ? formatMessage({ id: "agent.migration.referenceCopied" })
-            : formatMessage({ id: "agent.migration.referenceCopyAria" }, { ref })}
-        >
-          {copied ? <Check size={14} aria-hidden="true" /> : <Copy size={14} aria-hidden="true" />}
-        </Button>
-        </Tooltip>
-      </span>
+      <MigrationReferenceValue notice={notice} />
     </div>
   );
 }

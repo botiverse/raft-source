@@ -1,7 +1,8 @@
 import { publishChannelUpdate } from "../services/channelRealtimeEvents";
-import { validateName } from "@botiverse/raft-shared";
+import { validateName, type ServerId } from "@botiverse/raft-shared";
 import type { Server as SocketServer } from "socket.io";
 import * as channelService from "../services/channelService";
+import { archivedNameCollisionBody } from "./archivedNameCollision";
 import { actorHasServerCapabilityInServer } from "../lib/actorPermissions";
 import { addTraceEvent, errorClassOf } from "../tracing/semanticTrace";
 import { agentRefusalBody, agentServerRoleRequiredBody } from "../lib/agentServerRoleRequired";
@@ -134,13 +135,7 @@ export async function createChannelForAgent(input: {
       });
       return {
         status: 409,
-        body: {
-          error: `Channel name "${err.channelName}" is held by an archived channel`,
-          code: "archived_name_collision",
-          archivedChannelId: err.archivedChannelId,
-          archivedChannelName: err.channelName,
-          archivedChannelType: err.archivedChannelType,
-        },
+        body: await archivedNameCollisionBody(err, { type: "agent", id: actor.id, serverId: serverId as ServerId }),
       };
     }
     const msg = err instanceof Error ? err.message : "";

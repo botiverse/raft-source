@@ -69,14 +69,40 @@ test("a database unanswered for longer than the stale window turns 503, and reco
   assert.deepEqual(h.tracker.verdict(), { ok: true, db: "ok", msSinceDbSuccess: 0 });
 });
 
-test("a fresh task gets the full window even if its first pings fail", async () => {
+test("a fresh task is not alive until the database has answered once", async () => {
+  let failing = true;
   const h = harness(async () => {
-    throw new Error("database still starting");
+    if (failing) throw new Error("password authentication failed");
   });
+
+  // No success yet: not ok from the first probe on, not only after the stale
+  // window. A task that cannot reach the database must never pass the ALB
+  // check, or ECS would count it healthy and stop good tasks.
   await h.tracker.probeOnce();
+  const starting = { ok: false, db: "starting" as const, msSinceDbSuccess: null };
+  assert.deepEqual(h.tracker.verdict(), starting);
+  assert.equal(livezStatus(h.tracker.verdict(), "production"), 503);
+
   h.advance(LIVEZ_DB_STALE_MS - 1);
   await h.tracker.probeOnce();
-  assert.equal(h.tracker.verdict().ok, true);
+  assert.deepEqual(h.tracker.verdict(), starting, "still starting inside what used to be the free window");
+
+  h.advance(LIVEZ_DB_STALE_MS);
+  await h.tracker.probeOnce();
+  assert.deepEqual(h.tracker.verdict(), starting, "never stale without a first success");
+
+  // The first answer makes it alive, and the stale window counts from there.
+  failing = false;
+  await h.tracker.probeOnce();
+  assert.deepEqual(h.tracker.verdict(), { ok: true, db: "ok", msSinceDbSuccess: 0 });
+  assert.equal(livezStatus(h.tracker.verdict(), "production"), 200);
+
+  failing = true;
+  h.advance(LIVEZ_DB_STALE_MS);
+  await h.tracker.probeOnce();
+  assert.equal(h.tracker.verdict().ok, true, "after a success the full window applies");
+  h.advance(1);
+  assert.equal(h.tracker.verdict().db, "stale");
 });
 
 test("a hung ping does not stack further pings behind it", async () => {
@@ -96,11 +122,13 @@ test("production refuses an unmonitored tracker instead of a silent 200", () => 
   assert.equal(livezStatus(unmonitored, "test"), 200);
   assert.equal(livezStatus({ ok: true, db: "ok", msSinceDbSuccess: 10 }, "production"), 200);
   assert.equal(livezStatus({ ok: false, db: "stale", msSinceDbSuccess: 60_001 }, "production"), 503);
+  assert.equal(livezStatus({ ok: false, db: "starting", msSinceDbSuccess: null }, "production"), 503);
+  assert.equal(livezStatus({ ok: false, db: "starting", msSinceDbSuccess: null }, "test"), 503);
 });
 
-test("start() marks the tracker monitored before the first ping resolves", () => {
+test("start() marks the tracker monitored before the first ping resolves, and a hung first ping is not alive", () => {
   const tracker = createDbLivenessTracker({ ping: () => new Promise(() => {}), intervalMs: 60_000 });
   tracker.start();
-  assert.equal(tracker.verdict().db, "ok");
+  assert.deepEqual(tracker.verdict(), { ok: false, db: "starting", msSinceDbSuccess: null });
   tracker.stop();
 });

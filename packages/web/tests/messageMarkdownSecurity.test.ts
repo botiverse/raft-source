@@ -93,7 +93,7 @@ test("message markdown renders user raw HTML as text instead of DOM", () => {
 test("message markdown keeps normal markdown links", () => {
   const html = renderEscapedUserMarkdown("[Slock](https://slock.ai)");
 
-  assert.match(html, /<a href="https:\/\/slock\.ai"/);
+  assert.match(html, /<a [^>]*href="https:\/\/slock\.ai"/);
   assert.match(html, />Slock<\/a>/);
 });
 
@@ -105,18 +105,18 @@ test("message markdown allows obsidian:// links while stripping unlisted custom 
       rehypePlugins: MESSAGE_MARKDOWN_REHYPE_PLUGINS,
     })));
   const allowed = renderWithIntl("[Open note](obsidian://open?vault=Main)");
-  assert.match(allowed, /<a href="obsidian:\/\/open\?vault=Main"/);
+  assert.match(allowed, /<a [^>]*href="obsidian:\/\/open\?vault=Main"/);
   assert.match(allowed, />Open note<\/a>/);
 
   // Angle-bracket autolinks are CommonMark autolinks (any scheme), so they
   // reach the same allowlist; bare obsidian:// text is intentionally NOT
   // linkified (remark-gfm + remarkAutolinkBareUrls cover http(s) only).
   const autolink = renderWithIntl("see <obsidian://open?vault=Main>");
-  assert.match(autolink, /<a href="obsidian:\/\/open\?vault=Main"/);
+  assert.match(autolink, /<a [^>]*href="obsidian:\/\/open\?vault=Main"/);
 
   const stripped = renderWithIntl("[bad link](foo://bar)");
   assert.doesNotMatch(stripped, /foo:\/\/bar/);
-  assert.doesNotMatch(stripped, /<a href=/);
+  assert.doesNotMatch(stripped, /<a [^>]*href=/);
 });
 
 test("shared markdown allows obsidian:// links while stripping unlisted custom schemes", () => {
@@ -127,7 +127,7 @@ test("shared markdown allows obsidian:// links while stripping unlisted custom s
 
   const stripped = renderWithIntl("[bad link](foo://bar)");
   assert.doesNotMatch(stripped, /foo:\/\/bar/);
-  assert.doesNotMatch(stripped, /<a href=/);
+  assert.doesNotMatch(stripped, /<a [^>]*href=/);
 });
 
 test("message markdown parses explicit markdown links before bare-url linkification", () => {
@@ -135,7 +135,7 @@ test("message markdown parses explicit markdown links before bare-url linkificat
     "来源：[Meta 官方建广告账户](https://www.facebook.com/business/help/407323696966570)、2026 Business Manager 教程",
   );
 
-  assert.match(html, /<a href="https:\/\/www\.facebook\.com\/business\/help\/407323696966570"/);
+  assert.match(html, /<a [^>]*href="https:\/\/www\.facebook\.com\/business\/help\/407323696966570"/);
   assert.match(html, />Meta 官方建广告账户<\/a>、2026 Business Manager 教程/);
   assert.doesNotMatch(html, /\[Meta 官方建广告账户\]/);
   assert.doesNotMatch(html, /href="https:\/\/www\.facebook\.com\/business\/help\/407323696966570\)/);
@@ -146,7 +146,7 @@ test("message markdown keeps unmatched ASCII closing parens outside bare URL aut
     "来源：（https://www.facebook.com/business/help/407323696966570）、2026 Business Manager 教程",
   );
 
-  assert.match(html, /（<a href="https:\/\/www\.facebook\.com\/business\/help\/407323696966570"/);
+  assert.match(html, /（<a [^>]*href="https:\/\/www\.facebook\.com\/business\/help\/407323696966570"/);
   assert.match(html, />https:\/\/www\.facebook\.com\/business\/help\/407323696966570<\/a>）、2026 Business Manager 教程/);
   assert.doesNotMatch(html, /href="https:\/\/www\.facebook\.com\/business\/help\/407323696966570\)/);
   assert.doesNotMatch(html, /href="https:\/\/www\.facebook\.com\/business\/help\/407323696966570）/);
@@ -155,14 +155,14 @@ test("message markdown keeps unmatched ASCII closing parens outside bare URL aut
 test("message markdown preserves balanced ASCII parens inside bare URL autolinks", () => {
   const html = renderEscapedUserMarkdown("read https://example.com/foo_(bar)、then continue");
 
-  assert.match(html, /<a href="https:\/\/example\.com\/foo_\(bar\)"/);
+  assert.match(html, /<a [^>]*href="https:\/\/example\.com\/foo_\(bar\)"/);
   assert.match(html, />https:\/\/example\.com\/foo_\(bar\)<\/a>、then continue/);
 });
 
 test("message markdown preserves CommonMark autolinks while escaping raw HTML", () => {
   const html = renderEscapedUserMarkdown("see <https://slock.ai> now");
 
-  assert.match(html, /<a href="https:\/\/slock\.ai"/);
+  assert.match(html, /<a [^>]*href="https:\/\/slock\.ai"/);
   assert.match(html, />https:\/\/slock\.ai<\/a>/);
   assert.doesNotMatch(html, />&lt;https:\/\/slock\.ai/);
   assert.doesNotMatch(html, /https:\/\/slock\.ai&gt;/);
@@ -171,7 +171,7 @@ test("message markdown preserves CommonMark autolinks while escaping raw HTML", 
 test("message markdown autolink boundary excludes trailing CJK punctuation", () => {
   const html = renderEscapedUserMarkdown("测试，<https://slock.ai>，再见");
 
-  assert.match(html, /<a href="https:\/\/slock\.ai"/);
+  assert.match(html, /<a [^>]*href="https:\/\/slock\.ai"/);
   assert.match(html, />https:\/\/slock\.ai<\/a>，再见/);
   assert.doesNotMatch(html, /href="https:\/\/slock\.ai&gt;/);
   assert.doesNotMatch(html, /href="https:\/\/slock\.ai，/);
@@ -180,7 +180,7 @@ test("message markdown autolink boundary excludes trailing CJK punctuation", () 
 test("message markdown supports email autolinks", () => {
   const html = renderEscapedUserMarkdown("contact <user@example.com>");
 
-  assert.match(html, /<a href="mailto:user@example\.com"/);
+  assert.match(html, /<a [^>]*href="mailto:user@example\.com"/);
   assert.match(html, />user@example\.com<\/a>/);
 });
 
@@ -227,7 +227,7 @@ test("message markdown keeps invalid angle-bracket text visible", () => {
   const html = renderEscapedUserMarkdown("<not-a-url>");
 
   assert.match(html, /&lt;not-a-url&gt;/);
-  assert.doesNotMatch(html, /<a href=/);
+  assert.doesNotMatch(html, /<a [^>]*href=/);
 });
 
 test("message markdown keeps the data attributes of message token anchors", () => {

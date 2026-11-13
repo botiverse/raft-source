@@ -1,43 +1,47 @@
 import { getEditableHumanServerRoles } from "../src/components/member/humanRoleTransitions";
 
-test("Guest role options fail closed with server_guest_v0 off", () => {
+// #wg-rbac:#15 P1 c: Guest is never a target role (the server refuses a change
+// to guest with 403); a Guest can still be promoted.
+
+test("Guest is never offered as a target role", () => {
   expect(getEditableHumanServerRoles({
     actorRole: "owner",
     targetRole: "member",
     isSelf: false,
     ownerCount: 1,
-    serverGuestEnabled: false,
   })).toEqual(["owner", "admin"]);
   expect(getEditableHumanServerRoles({
-    actorRole: "owner",
-    targetRole: "guest",
-    isSelf: false,
-    ownerCount: 1,
-    serverGuestEnabled: false,
-  })).toEqual([]);
-});
-
-test("Owner and Admin receive only contract-valid Guest transition options", () => {
-  expect(getEditableHumanServerRoles({
-    actorRole: "owner",
+    actorRole: "admin",
     targetRole: "member",
     isSelf: false,
     ownerCount: 1,
-    serverGuestEnabled: true,
-  })).toEqual(["owner", "admin", "guest"]);
+  })).not.toContain("guest");
+  expect(getEditableHumanServerRoles({
+    actorRole: "owner",
+    targetRole: "admin",
+    isSelf: false,
+    ownerCount: 1,
+  })).not.toContain("guest");
+});
+
+test("an existing Guest can be promoted to member or admin", () => {
   expect(getEditableHumanServerRoles({
     actorRole: "admin",
     targetRole: "guest",
     isSelf: false,
     ownerCount: 1,
-    serverGuestEnabled: true,
   })).toEqual(["admin", "member"]);
+  expect(getEditableHumanServerRoles({
+    actorRole: "owner",
+    targetRole: "guest",
+    isSelf: false,
+    ownerCount: 1,
+  })).toEqual(["owner", "admin", "member"]);
   expect(getEditableHumanServerRoles({
     actorRole: "admin",
     targetRole: "admin",
     isSelf: false,
     ownerCount: 1,
-    serverGuestEnabled: true,
   })).toEqual([]);
 });
 
@@ -47,20 +51,17 @@ test("Owner self-demotion requires another owner while Admin self-change stays c
     targetRole: "owner",
     isSelf: true,
     ownerCount: 1,
-    serverGuestEnabled: true,
   })).toEqual([]);
   expect(getEditableHumanServerRoles({
     actorRole: "owner",
     targetRole: "owner",
     isSelf: true,
     ownerCount: 2,
-    serverGuestEnabled: true,
-  })).toEqual(["admin", "member", "guest"]);
+  })).toEqual(["admin", "member"]);
   expect(getEditableHumanServerRoles({
     actorRole: "admin",
     targetRole: "admin",
     isSelf: true,
     ownerCount: 2,
-    serverGuestEnabled: true,
   })).toEqual([]);
 });

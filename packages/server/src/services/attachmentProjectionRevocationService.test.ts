@@ -6,6 +6,7 @@ import { asServerId } from "@botiverse/raft-shared";
 import { eq } from "drizzle-orm";
 import { getDb } from "../db/index";
 import {
+  attachmentObjectHolds,
   attachmentObjects,
   attachmentProjectionRevocations,
   attachments,
@@ -19,7 +20,7 @@ import {
   revokeAttachmentProjection,
 } from "./attachmentProjectionRevocationService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 test("projection revoke is atomic, idempotent, audited, and sibling-local", async ({ app }) => {
   const db = getDb();
@@ -57,9 +58,6 @@ test("projection revoke is atomic, idempotent, audited, and sibling-local", asyn
       uploaderId: owner.id,
       uploaderType: "user",
       filename: "host.txt",
-      mimeType: "text/plain",
-      sizeBytes: 12,
-      storageKey: object.storageKey,
     },
     {
       objectId: object.id,
@@ -70,11 +68,18 @@ test("projection revoke is atomic, idempotent, audited, and sibling-local", asyn
       uploaderId: owner.id,
       uploaderType: "user",
       filename: "sibling.txt",
-      mimeType: "text/plain",
-      sizeBytes: 12,
-      storageKey: object.storageKey,
     },
   ]).returning();
+
+  // Both linked projections hold the shared bytes (as the holds backfill writes them).
+  await db.insert(attachmentObjectHolds).values([projection, sibling].map((row) => ({
+    holderType: "attachment" as const,
+    holderId: row.id,
+    objectId: object.id,
+  })));
+  const holders = async () => (await db.select({ holderId: attachmentObjectHolds.holderId })
+    .from(attachmentObjectHolds)
+    .where(eq(attachmentObjectHolds.objectId, object.id))).map((row) => row.holderId).sort();
 
   const authorize = async ({ message }: { message: typeof messages.$inferSelect }) =>
     message.senderType === "user" && message.senderId === owner.id;
@@ -100,6 +105,8 @@ test("projection revoke is atomic, idempotent, audited, and sibling-local", asyn
   assert.equal(audit?.objectId, object.id);
   assert.equal(audit?.hostMessageId, hostMessage.id);
   assert.equal(audit?.reason, "remove destination grant");
+  assert.deepEqual(await holders(), [sibling.id], "the revoked projection released its hold; the sibling keeps the bytes");
+  assert.equal(liveObject?.unheldSince, null);
 
   const replay = await revokeAttachmentProjection({
     projectionId: projection.id,
@@ -110,6 +117,7 @@ test("projection revoke is atomic, idempotent, audited, and sibling-local", asyn
   });
   assert.equal(replay.replayed, true);
   assert.equal(replay.revokedAt.toISOString(), first.revokedAt.toISOString());
+  assert.deepEqual(await holders(), [sibling.id], "a replay changes no hold");
 
   await assert.rejects(
     revokeAttachmentProjection({
@@ -121,4 +129,15 @@ test("projection revoke is atomic, idempotent, audited, and sibling-local", asyn
     }),
     (error: unknown) => error instanceof AttachmentProjectionRevocationError && error.code === "conflict",
   );
+
+  const siblingRevoke = await revokeAttachmentProjection({
+    projectionId: sibling.id,
+    requestServerId: asServerId(server.id),
+    actor: { type: "user", id: owner.id },
+    authorize,
+  });
+  assert.deepEqual(await holders(), []);
+  const [unheld] = await db.select().from(attachmentObjects).where(eq(attachmentObjects.id, object.id));
+  assert.equal(unheld?.lifecycleState, "active", "nothing deletes unheld bytes in this release");
+  assert.equal(unheld?.unheldSince?.toISOString(), siblingRevoke.revokedAt.toISOString());
 });

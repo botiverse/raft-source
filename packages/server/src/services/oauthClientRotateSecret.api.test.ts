@@ -13,7 +13,9 @@ import { createApiTest } from "../test/integration/apiTest";
 import assert from "node:assert/strict";
 
 import argon2 from "argon2";
-import { and, eq, isNotNull, isNull } from "drizzle-orm";
+import { and, eq, inArray, isNotNull, isNull } from "drizzle-orm";
+import sharp from "sharp";
+import { vi } from "vitest";
 
 import { getDb } from "../db/index";
 import {
@@ -32,10 +34,12 @@ import {
   users,
 } from "../db/schema";
 import { asServerId, INTEGRATION_INVITE_PATH_PREFIX } from "@botiverse/raft-shared";
+import * as agentService from "../services/agentService";
 import { createAgent } from "../services/agentService";
 import { mintAgentCredential } from "../services/agentCredentialService";
 import { addAgent, addHuman, createChannel } from "../services/channelService";
 import { bindMarketplaceAppName, executeActionCard, prepareActionCard } from "../services/actionCardsService";
+import * as oauthService from "../services/oauthService";
 import {
   authenticateOAuthClient,
   createOAuthClient,
@@ -44,8 +48,9 @@ import {
   updateOAuthClientForAgent,
 } from "../services/oauthService";
 import { createServer } from "../services/serverService";
+import { installRecordingLogoStorage } from "../test/recordingLogoStorage";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 const ONE_BY_ONE_GIF = Buffer.from(
   "R0lGODdhAQABAIABAP///wAAACwAAAAAAQABAAACAkQBADs=",
@@ -119,7 +124,7 @@ async function registerAppViaCard(opts: {
     },
   });
 
-  await executeActionCard({
+  await executeActionCard({ webSessionFamilyId: null,
     messageId: card.messageId,
     serverId: asServerId(opts.serverId),
     userId: opts.ownerId,
@@ -255,7 +260,7 @@ test("registration stays committed and owner rotation recovers when initial secr
       },
     });
 
-    const executed = await executeActionCard({
+    const executed = await executeActionCard({ webSessionFamilyId: null,
       messageId: card.messageId,
       serverId: asServerId(server.id),
       userId: owner.id,
@@ -401,7 +406,7 @@ test("owner can update and self-transfer; old owner loses lifecycle capability",
     payload: legacyAction,
   }).where(eq(actionCards.messageId, historical.messageId));
   await assert.rejects(
-    executeActionCard({
+    executeActionCard({ webSessionFamilyId: null,
       messageId: historical.messageId,
       serverId: asServerId(server.id),
       userId: human.id,
@@ -467,12 +472,14 @@ test("app list/status exposes owned apps to owners and every source app to curre
     agentId: requester.id,
     scopes: ["read"],
     name: "query-requester-cred",
+    issuedVia: "computer",
     createdByUserId: null,
   })).apiKey;
   const nextOwnerKey = (await mintAgentCredential({
     agentId: nextOwner.id,
     scopes: ["read"],
     name: "query-next-owner-cred",
+    issuedVia: "computer",
     createdByUserId: null,
   })).apiKey;
   const auth = (key: string) => ({ Authorization: `Bearer ${key}` });
@@ -494,7 +501,7 @@ test("app list/status exposes owned apps to owners and every source app to curre
   assert.equal(hiddenPending.status, 404);
   assert.equal(hiddenMissing.status, 404, "missing and requester-hidden cards use the same status");
 
-  await executeActionCard({
+  await executeActionCard({ webSessionFamilyId: null,
     messageId: card.messageId,
     serverId: asServerId(server.id),
     userId: human.id,
@@ -596,6 +603,7 @@ test("agent app management matches human fields and distribution lifecycle with 
     agentId,
     scopes: ["read"],
     name,
+    issuedVia: "computer",
     createdByUserId: null,
   })).apiKey;
   const ownerKey = await credentialFor(ownerAgent.id, "manage-owner-credential");
@@ -696,9 +704,25 @@ test("agent app management matches human fields and distribution lifecycle with 
   assert.equal(clearLogo.status, 200, "owner can clear its app logo");
   assert.equal(((await clearLogo.json()) as { logoUrl: string | null }).logoUrl, null);
 
-  const createShare = await manage(adminKey, { action: "share_link_create", expiresInDays: 7 });
+  // An Agent names the one target Server too (#proj-apps:769a57d4).
+  const untargetedShare = await manage(adminKey, { action: "share_link_create", expiresInDays: 7 });
+  assert.equal(untargetedShare.status, 400, "a share link needs its target Server");
+  assert.equal((await untargetedShare.json() as { errorCode: string }).errorCode, "SHARE_LINK_TARGET_REQUIRED");
+  const malformedShare = await manage(adminKey, { action: "share_link_create", targetServerSlug: "Not A Slug!" });
+  assert.equal(malformedShare.status, 400);
+  assert.equal((await malformedShare.json() as { errorCode: string }).errorCode, "SHARE_LINK_TARGET_INVALID");
+  assert.equal((await getDb().select({ id: oauthClientShareLinks.id }).from(oauthClientShareLinks)
+    .where(eq(oauthClientShareLinks.clientId, registered.id))).length, 0, "a refused create stores nothing");
+
+  const createShare = await manage(adminKey, { action: "share_link_create", expiresInDays: 7, targetServerSlug: otherServer.slug });
   assert.equal(createShare.status, 200, "current server admin can create a private share link");
-  const createShareBody = await createShare.json() as { shareUrl: string; link: { id: string } };
+  const createShareText = await createShare.clone().text();
+  const createShareBody = await createShare.json() as { shareUrl: string; link: { id: string; targetServerSlug: string | null } };
+  assert.equal(createShareBody.link.targetServerSlug, otherServer.slug);
+  assert.equal(createShareText.includes(otherServer.id), false, "the resolved target is never echoed");
+  assert.equal(createShareText.includes(otherServer.name), false, "the resolved target is never echoed");
+  const unknownShare = await manage(adminKey, { action: "share_link_create", targetServerSlug: "manage-app-nowhere" });
+  assert.equal(unknownShare.status, 200, "an unknown slug answers like a known one");
   assert.match(createShareBody.shareUrl, /\/integration-invites\/raft_share_[0-9a-f]{64}$/);
   assert.match(
     new URL(createShareBody.shareUrl).pathname,
@@ -718,17 +742,38 @@ test("agent app management matches human fields and distribution lifecycle with 
     .where(eq(oauthClientShareLinks.id, createShareBody.link.id));
   assert.equal(shareLink?.createdByUserId, null);
   assert.equal(shareLink?.createdByAgentId, adminAgent.id, "share link records the acting Agent");
+  assert.equal(shareLink?.targetServerId, otherServer.id);
   assert.doesNotMatch(shareLink?.tokenHash ?? "", /raft_share_/, "only the token hash is stored");
 
   const getShare = await manage(ownerKey, { action: "share_link_get" });
   assert.equal(getShare.status, 200);
   const getShareText = await getShare.text();
   assert.doesNotMatch(getShareText, /raft_share_/, "share-link status never replays the one-time token");
-  assert.equal((JSON.parse(getShareText) as { shareUrl?: string | null }).shareUrl ?? null, null);
+  assert.equal(getShareText.includes(otherServer.id), false);
+  const getShareBody = JSON.parse(getShareText) as { shareUrl?: string | null; links: Array<{ targetServerSlug: string | null }> };
+  assert.equal(getShareBody.shareUrl ?? null, null);
+  assert.deepEqual(getShareBody.links.map((link) => link.targetServerSlug).sort(), ["manage-app-nowhere", otherServer.slug].sort(), "one active link per target");
 
-  const revokeShare = await manage(ownerKey, { action: "share_link_revoke" });
+  const revokeShare = await manage(ownerKey, { action: "share_link_revoke", targetServerSlug: otherServer.slug });
   assert.equal(revokeShare.status, 200);
-  assert.ok((await revokeShare.json() as { link: { revokedAt: string | null } }).link.revokedAt);
+  const revokeShareBody = await revokeShare.json() as { link: { revokedAt: string | null }; links: Array<{ targetServerSlug: string | null }> };
+  assert.ok(revokeShareBody.link.revokedAt);
+  assert.deepEqual(revokeShareBody.links.map((link) => link.targetServerSlug), [otherServer.slug], "only that target's link");
+  const revokeRest = await manage(ownerKey, { action: "share_link_revoke" });
+  assert.equal(revokeRest.status, 200);
+  assert.deepEqual((await revokeRest.json() as { links: Array<{ targetServerSlug: string | null }> }).links.map((link) => link.targetServerSlug), ["manage-app-nowhere"]);
+  assert.equal((await manage(ownerKey, { action: "share_link_revoke" })).status, 404, "nothing active left");
+
+  // A target means something only to share_link_create and share_link_revoke:
+  // every other action refuses it instead of ignoring it, and does nothing.
+  for (const action of ["share_link_get", "request_publish", "request_unpublish", "clear_logo", "delete"]) {
+    const misplaced = await manage(adminKey, { action, targetServerSlug: otherServer.slug });
+    assert.equal(misplaced.status, 400, `${action} with a target`);
+    assert.equal((await misplaced.json() as { errorCode: string }).errorCode, "SHARE_LINK_TARGET_NOT_APPLICABLE", action);
+  }
+  const [stillPrivate] = await getDb().select({ publishStatus: oauthClients.publishStatus })
+    .from(oauthClients).where(eq(oauthClients.id, registered.id));
+  assert.equal(stillPrivate?.publishStatus, "private", "the refused request_publish changed nothing");
 
   const requestPublish = await manage(adminKey, { action: "request_publish" });
   assert.equal(requestPublish.status, 200, "current server admin can request Marketplace review");
@@ -787,6 +832,221 @@ test("agent app management matches human fields and distribution lifecycle with 
   );
 });
 
+// Regression guard for the agent-API logo paths: an App bot's avatar IS its
+// App's logo (agentService.syncAppBotAvatarsToLogo, written in the logo's own
+// transaction), and each moved bot's server is told to re-read it.
+test("agent-API logo upload, logo clear and App deletion keep every bound bot's avatar on the logo and tell each bot's server", async ({ app }) => {
+  const owner = await seedUser("bot-avatar-agent-owner@slock.test", "bot-avatar-agent-owner");
+  const otherOwner = await seedUser("bot-avatar-agent-other@slock.test", "bot-avatar-agent-other");
+  const server = await createServer("Bot Avatar Agent Server", "bot-avatar-agent-server", owner.id);
+  const otherServer = await createServer("Bot Avatar Agent Other", "bot-avatar-agent-other", otherOwner.id);
+  const adminAgent = await createAgent(server.id, "bot-avatar-admin-agent", { runtime: "codex" });
+  await getDb().update(serverAgentMembers)
+    .set({ role: "admin" })
+    .where(and(eq(serverAgentMembers.serverId, server.id), eq(serverAgentMembers.agentId, adminAgent.id)));
+  const adminKey = (await mintAgentCredential({
+    agentId: adminAgent.id,
+    scopes: ["read"],
+    name: "bot-avatar-admin-credential",
+    issuedVia: "computer",
+    createdByUserId: null,
+  })).apiKey;
+  const { client } = await createOAuthClient({
+    serverId: server.id,
+    createdByUserId: owner.id,
+    clientId: "bot-avatar-agent-app",
+    name: "Bot Avatar Agent App",
+    enableBot: true,
+  });
+  const { createManagedAppBot } = await import("../services/appBotIdentityService");
+  const bots: Array<{ serverId: string; agentId: string }> = [];
+  for (const [serverId, installedByUserId] of [[server.id, owner.id], [otherServer.id, otherOwner.id]] as const) {
+    const [install] = await getDb().insert(oauthClientInstalls).values({
+      serverId,
+      clientId: client.id,
+      installedByUserId,
+      status: "active",
+      botGrant: "granted",
+    }).returning();
+    const bot = await getDb().transaction((tx) => createManagedAppBot(tx, { installId: install!.id, serverId }));
+    bots.push({ serverId, agentId: bot.agentId });
+  }
+  const botIds = bots.map((bot) => bot.agentId);
+  const avatars = async () => (await getDb().select({ avatarUrl: agents.avatarUrl }).from(agents)
+    .where(inArray(agents.id, botIds))).map((row) => row.avatarUrl);
+  const uploadLogo = async () => {
+    const form = new FormData();
+    form.set("clientKey", "bot-avatar-agent-app");
+    form.set("avatar", new Blob([ONE_BY_ONE_GIF], { type: "image/gif" }), "logo.gif");
+    const res = await fetch(`${app.baseUrl}/internal/agent-api/integrations/app/logo`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${adminKey}` },
+      body: form,
+    });
+    assert.equal(res.status, 200, await res.clone().text());
+    return (await res.json() as { logoUrl: string }).logoUrl;
+  };
+  const manage = (action: string) => fetch(`${app.baseUrl}/internal/agent-api/integrations/app/manage`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${adminKey}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ clientKey: "bot-avatar-agent-app", action }),
+  });
+
+  const pushes: string[] = [];
+  const originalTo = app.io.to.bind(app.io);
+  (app.io as any).to = (room: string | string[]) => {
+    const operator = originalTo(room as any) as any;
+    const originalEmit = operator.emit.bind(operator);
+    operator.emit = (event: string, ...args: unknown[]) => {
+      if (event === "agent:updated") pushes.push(`${String(room)} ${(args[0] as { agentId?: string } | undefined)?.agentId}`);
+      return originalEmit(event, ...args);
+    };
+    return operator;
+  };
+  const assertEachBotTold = (step: string) => {
+    assert.deepEqual(
+      pushes.splice(0).sort(),
+      bots.map((bot) => `server:${bot.serverId} ${bot.agentId}`).sort(),
+      `${step}: one agent:updated per bot, to the bot's own server`,
+    );
+  };
+  try {
+    const logoUrl = await uploadLogo();
+    assert.deepEqual(await avatars(), [logoUrl, logoUrl], "logo upload: every bot on every server shows the logo");
+    assertEachBotTold("logo upload");
+
+    const cleared = await manage("clear_logo");
+    assert.equal(cleared.status, 200, await cleared.clone().text());
+    assert.deepEqual(await avatars(), [null, null], "logo clear: the bots fall back to the generated avatar");
+    assertEachBotTold("logo clear");
+
+    const nextLogoUrl = await uploadLogo();
+    assert.deepEqual(await avatars(), [nextLogoUrl, nextLogoUrl]);
+    assertEachBotTold("second logo upload");
+    const deleted = await manage("delete");
+    assert.equal(deleted.status, 200, await deleted.clone().text());
+    const [gone] = await getDb().select({ id: oauthClients.id }).from(oauthClients).where(eq(oauthClients.id, client.id));
+    assert.equal(gone, undefined, "the App is deleted");
+    assert.deepEqual(await avatars(), [null, null], "App deletion: the bots no longer point at the deleted logo");
+    assertEachBotTold("App deletion");
+  } finally {
+    (app.io as any).to = originalTo;
+  }
+});
+
+// Regression guard for the agent-API logo paths: an App's old logo object is
+// deleted only after the change commits. If anything after the logo write fails
+// in the same transaction, the change rolls back and the App and its bot still
+// point at the old logo, so its object must still exist.
+test("agent-API logo upload, clear_logo or delete that rolls back deletes no logo object; once committed it deletes the old one", async ({ app }) => {
+  const owner = await seedUser("logo-commit-agent-owner@slock.test", "logo-commit-agent-owner");
+  const server = await createServer("Logo Commit Agent Server", "logo-commit-agent-server", owner.id);
+  const adminAgent = await createAgent(server.id, "logo-commit-admin-agent", { runtime: "codex" });
+  await getDb().update(serverAgentMembers)
+    .set({ role: "admin" })
+    .where(and(eq(serverAgentMembers.serverId, server.id), eq(serverAgentMembers.agentId, adminAgent.id)));
+  const adminKey = (await mintAgentCredential({
+    agentId: adminAgent.id,
+    scopes: ["read"],
+    name: "logo-commit-admin-credential",
+    issuedVia: "computer",
+    createdByUserId: null,
+  })).apiKey;
+  const clientKey = "logo-commit-agent-app";
+  const { client } = await createOAuthClient({
+    serverId: server.id,
+    createdByUserId: owner.id,
+    clientId: clientKey,
+    name: "Logo Commit Agent App",
+    enableBot: true,
+  });
+  const [install] = await getDb().insert(oauthClientInstalls).values({
+    serverId: server.id,
+    clientId: client.id,
+    installedByUserId: owner.id,
+    status: "active",
+    botGrant: "granted",
+  }).returning();
+  const { createManagedAppBot } = await import("../services/appBotIdentityService");
+  const bot = await getDb().transaction((tx) => createManagedAppBot(tx, { installId: install!.id, serverId: server.id }));
+  const uploadLogo = async (background: string) => {
+    const image = await sharp({ create: { width: 8, height: 8, channels: 3, background } }).png().toBuffer();
+    const form = new FormData();
+    form.set("clientKey", clientKey);
+    form.set("avatar", new Blob([new Uint8Array(image)], { type: "image/png" }), "logo.png");
+    return fetch(`${app.baseUrl}/internal/agent-api/integrations/app/logo`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${adminKey}` },
+      body: form,
+    });
+  };
+  const manage = (action: "clear_logo" | "delete") => fetch(`${app.baseUrl}/internal/agent-api/integrations/app/manage`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${adminKey}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ clientKey, action }),
+  });
+  const stored = async () => {
+    const [row] = await getDb().select({ logoUrl: oauthClients.logoUrl, logoStorageKey: oauthClients.logoStorageKey })
+      .from(oauthClients).where(eq(oauthClients.id, client.id));
+    const [botRow] = await getDb().select({ avatarUrl: agents.avatarUrl }).from(agents).where(eq(agents.id, bot.agentId));
+    return { app: row ?? null, botAvatarUrl: botRow?.avatarUrl ?? null };
+  };
+
+  // Upload and clear: make the bot avatar sync that follows the logo write
+  // fail. App deletion has nothing after its write: fail right after it, as a
+  // failed commit would.
+  const failNextBotSync = () => vi.spyOn(agentService, "syncAppBotAvatarsToLogo")
+    .mockRejectedValueOnce(new Error("injected failure after the logo write"));
+  const failAfterNextAppDeletion = () => {
+    const deleteLocked = oauthService.deleteLockedOAuthClient;
+    return vi.spyOn(oauthService, "deleteLockedOAuthClient").mockImplementationOnce(async (...args) => {
+      await deleteLocked(...args);
+      throw new Error("injected failure after the App deletion write");
+    });
+  };
+
+  const bucket = installRecordingLogoStorage();
+  try {
+    assert.equal((await uploadLogo("#d33f49")).status, 200);
+    const before = await stored();
+    const oldKey = before.app?.logoStorageKey;
+    assert.ok(oldKey && bucket.objects.has(oldKey), "the first logo is stored");
+    assert.equal(before.botAvatarUrl, before.app?.logoUrl, "the bot shows the logo");
+
+    for (const [step, injectFailure, request] of [
+      ["logo upload", failNextBotSync, () => uploadLogo("#2f6fdd")],
+      ["clear_logo", failNextBotSync, () => manage("clear_logo")],
+      ["delete", failAfterNextAppDeletion, () => manage("delete")],
+    ] as const) {
+      const injected = injectFailure();
+      try {
+        assert.equal((await request()).status, 500, `${step}: the injected failure fails the request`);
+      } finally {
+        injected.mockRestore();
+      }
+      assert.deepEqual(await stored(), before, `${step} rolled back: the App and its bot keep the old logo`);
+      assert.deepEqual(bucket.deletes, [], `${step} rolled back: no logo object is deleted`);
+      assert.ok(bucket.objects.has(oldKey), `${step} rolled back: the old logo object still exists`);
+    }
+
+    // Committed, each change deletes the object it left unreferenced.
+    assert.equal((await uploadLogo("#2f6fdd")).status, 200);
+    const replacedBy = (await stored()).app?.logoStorageKey;
+    assert.ok(replacedBy && replacedBy !== oldKey);
+    assert.deepEqual(bucket.deletes.splice(0), [oldKey], "logo upload: the replaced object is deleted");
+    assert.equal((await manage("clear_logo")).status, 200);
+    assert.deepEqual(bucket.deletes.splice(0), [replacedBy], "clear_logo: the removed object is deleted");
+    assert.equal((await uploadLogo("#1a7f37")).status, 200);
+    const lastKey = (await stored()).app?.logoStorageKey;
+    assert.ok(lastKey);
+    assert.equal((await manage("delete")).status, 200);
+    assert.equal((await stored()).app, null, "the App is deleted");
+    assert.deepEqual(bucket.deletes.splice(0), [lastKey], "delete: the App's logo object is deleted");
+  } finally {
+    bucket.restore();
+  }
+});
+
 test("admin recovery rejects an active owner and succeeds after that owner is retired", async ({ app }) => {
   const human = await seedUser("recovery-admin@slock.test", "recovery-admin");
   const server = await createServer("Recovery Server", "recovery-server", human.id);
@@ -818,12 +1078,12 @@ test("admin recovery rejects an active owner and succeeds after that owner is re
     },
   });
   await assert.rejects(
-    executeActionCard({ messageId: card.messageId, serverId: asServerId(server.id), userId: human.id }),
+    executeActionCard({ webSessionFamilyId: null, messageId: card.messageId, serverId: asServerId(server.id), userId: human.id }),
     (err: unknown) => err instanceof Error && err.message.includes("active owner"),
   );
 
   await getDb().update(agents).set({ deletedAt: new Date() }).where(eq(agents.id, ownerAgent.id));
-  const recovered = await executeActionCard({
+  const recovered = await executeActionCard({ webSessionFamilyId: null,
     messageId: card.messageId,
     serverId: asServerId(server.id),
     userId: human.id,
@@ -874,30 +1134,35 @@ test("rotate-secret route: owner gets 200, same-server non-owner gets 403, and u
     agentId: agent.id,
     scopes: ["read"],
     name: "rotate-route-owner-cred",
+    issuedVia: "computer",
     createdByUserId: null,
   })).apiKey;
   const nonOwnerKey = (await mintAgentCredential({
     agentId: otherAgent.id,
     scopes: ["read"],
     name: "rotate-route-nonowner-cred",
+    issuedVia: "computer",
     createdByUserId: null,
   })).apiKey;
   const thirdAgentKey = (await mintAgentCredential({
     agentId: thirdAgent.id,
     scopes: ["read"],
     name: "rotate-route-third-cred",
+    issuedVia: "computer",
     createdByUserId: null,
   })).apiKey;
   const adminAgentKey = (await mintAgentCredential({
     agentId: adminAgent.id,
     scopes: ["read"],
     name: "rotate-route-admin-cred",
+    issuedVia: "computer",
     createdByUserId: null,
   })).apiKey;
   const fourthAgentKey = (await mintAgentCredential({
     agentId: fourthAgent.id,
     scopes: ["read"],
     name: "rotate-route-fourth-cred",
+    issuedVia: "computer",
     createdByUserId: null,
   })).apiKey;
 
@@ -1496,7 +1761,7 @@ test("prepared login and Marketplace cards fail closed if the App becomes platfo
   });
   await bindPlatformRegistration(loginClient.id, "LOGIN");
   await assert.rejects(
-    executeActionCard({
+    executeActionCard({ webSessionFamilyId: null,
       messageId: loginCard.messageId,
       serverId: asServerId(target.id),
       userId: owner.id,
@@ -1544,7 +1809,7 @@ test("prepared login and Marketplace cards fail closed if the App becomes platfo
   });
   await bindPlatformRegistration(marketplaceClient.id, "MARKETPLACE");
   await assert.rejects(
-    executeActionCard({
+    executeActionCard({ webSessionFamilyId: null,
       messageId: installCard.messageId,
       serverId: asServerId(target.id),
       userId: owner.id,

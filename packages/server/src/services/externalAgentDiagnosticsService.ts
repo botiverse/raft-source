@@ -138,6 +138,8 @@ export async function getExternalAgentDiagnostics(input: {
       lastDeliveryAt: push.lastDeliveryAt,
       lastError: push.lastError,
       nextAttemptAt: push.nextAttemptAt,
+      probeStoppedAt: push.probeStoppedAt,
+      recovery: push.recovery,
     },
     events: {
       lastCursorPullAt: iso(pendingAck?.updatedAt ?? null),

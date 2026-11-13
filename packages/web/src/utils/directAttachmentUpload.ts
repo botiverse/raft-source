@@ -7,9 +7,11 @@ import type {
   UploadFallbackErrorIdentity,
   UploadFallbackReason,
 } from "./attachmentUploadFallbackTrace";
+import { reportDirectPutFailure } from "./directPutFailureTrace";
+import type { DirectPutFailure } from "./directPutFailureTrace";
 
 type Attachment = components["schemas"]["AttachmentUploadResponse"];
-type Capabilities = components["schemas"]["AttachmentUploadCapabilities"];
+type Capabilities = components["schemas"]["WebAttachmentUploadCapabilities"];
 type CreateRequest = components["schemas"]["CreateAttachmentUploadSessionRequest"];
 type CreateResponse = components["schemas"]["CreateAttachmentUploadSessionResponse"];
 type CompleteResponse = components["schemas"]["CompleteAttachmentUploadSessionResponse"];
@@ -57,6 +59,8 @@ export class AttachmentUploadClientError extends Error {
     message: string,
     public readonly retryable = false,
     public readonly retryAfterMs?: number,
+    /** A quota refusal's `monthlyUpload` (FILE_UPLOAD_QUOTA_EXCEEDED), unparsed; see monthlyUploadQuota.ts. */
+    public readonly monthlyUpload?: unknown,
   ) {
     super(message);
     this.name = "AttachmentUploadClientError";
@@ -132,7 +136,8 @@ function contractError(error: unknown, fallbackCode: string, fallbackMessage: st
   const retryAfterMs = typeof retryAfterCandidate === "number"
     ? retryAfterCandidate
     : undefined;
-  return new AttachmentUploadClientError(code, message, retryable, retryAfterMs);
+  const monthlyUpload = (data as { monthlyUpload?: unknown } | undefined)?.monthlyUpload;
+  return new AttachmentUploadClientError(code, message, retryable, retryAfterMs, monthlyUpload);
 }
 
 function sessionEndpoint(uploadId: string): string {
@@ -215,7 +220,13 @@ async function recoverExistingSession(
   }
 }
 
-type RawPutOutcome = "uploaded" | "already_exists" | "object_may_exist";
+/**
+ * What the PUT did. A failed PUT carries what the trace needs; the caller
+ * reports it once it knows what recovery found (directPutFailureTrace.ts).
+ */
+type PutResult =
+  | Readonly<{ outcome: "uploaded" | "already_exists" }>
+  | Readonly<{ outcome: "object_may_exist" | "rejected"; failure: DirectPutFailure }>;
 type UploadRequestResponse = Readonly<{ status: number }>;
 type UploadRequest = (config: AxiosRequestConfig<File>) => Promise<UploadRequestResponse>;
 
@@ -240,14 +251,29 @@ async function putFile(
   signal: AbortSignal | undefined,
   requestImpl: UploadRequest,
   onProgress?: (progress: number) => void,
-): Promise<RawPutOutcome> {
+): Promise<PutResult> {
   let reportedProgress = 0;
+  let bytesSent: number | null = null;
   const reportProgress = (event: AxiosProgressEvent) => {
+    if (event.loaded > (bytesSent ?? -1)) bytesSent = event.loaded;
     if (!onProgress || file.size <= 0 || event.loaded <= 0) return;
     const progress = Math.max(1, Math.min(99, Math.round((event.loaded / file.size) * 100)));
     if (progress <= reportedProgress) return;
     reportedProgress = progress;
     onProgress(progress);
+  };
+  const startedAt = Date.now();
+  const failure = (status: number | null, error?: unknown): DirectPutFailure => {
+    const identity = error === undefined ? { name: null, code: null } : errorIdentity(error);
+    return {
+      reason: status === null ? "network_error" : "http_status",
+      httpStatus: status,
+      errorName: identity.name,
+      errorCode: identity.code,
+      sizeBytes: file.size,
+      elapsedMs: Date.now() - startedAt,
+      bytesSent,
+    };
   };
   let response: UploadRequestResponse;
   try {
@@ -267,17 +293,14 @@ async function putFile(
     });
   } catch (error) {
     if (isAbort(error, signal)) throw error;
-    return "object_may_exist";
+    return { outcome: "object_may_exist", failure: failure(httpStatus(error) ?? null, error) };
   }
-  if (response.status >= 200 && response.status < 300) return "uploaded";
-  if (response.status === 412) return "already_exists";
+  if (response.status >= 200 && response.status < 300) return { outcome: "uploaded" };
+  if (response.status === 412) return { outcome: "already_exists" };
   if (response.status === 408 || response.status === 429 || response.status >= 500) {
-    return "object_may_exist";
+    return { outcome: "object_may_exist", failure: failure(response.status) };
   }
-  throw new AttachmentUploadClientError(
-    "UPLOAD_OBJECT_PUT_FAILED",
-    `Direct object upload failed with HTTP ${response.status}.`,
-  );
+  return { outcome: "rejected", failure: failure(response.status) };
 }
 
 async function createSession(
@@ -382,16 +405,33 @@ export async function uploadAttachmentFile(options: Readonly<{
   }, signal);
   onSession?.({ uploadId: session.uploadId });
 
-  let putOutcome: RawPutOutcome;
+  let put: PutResult;
   try {
-    putOutcome = await putFile(file, session.upload, signal, requestImpl, onProgress);
+    put = await putFile(file, session.upload, signal, requestImpl, onProgress);
   } catch (error) {
     if (signal?.aborted) throw error;
     await cancelAttachmentUploadSession(api, session.uploadId).catch(() => undefined);
     throw error;
   }
-  if (putOutcome === "object_may_exist") {
-    const recovered = await recoverExistingSession(api, session.uploadId, sleep, signal);
+  if (put.outcome === "rejected") {
+    if (!signal?.aborted) reportDirectPutFailure(put.failure, "not_attempted");
+    if (!signal?.aborted) {
+      await cancelAttachmentUploadSession(api, session.uploadId).catch(() => undefined);
+    }
+    throw new AttachmentUploadClientError(
+      "UPLOAD_OBJECT_PUT_FAILED",
+      `Direct object upload failed with HTTP ${put.failure.httpStatus}.`,
+    );
+  }
+  if (put.outcome === "object_may_exist") {
+    let recovered: Attachment | null;
+    try {
+      recovered = await recoverExistingSession(api, session.uploadId, sleep, signal);
+    } catch (error) {
+      if (!signal?.aborted) reportDirectPutFailure(put.failure, "failed");
+      throw error;
+    }
+    reportDirectPutFailure(put.failure, recovered ? "found" : "not_found");
     if (recovered) return recovered.id;
     throw new AttachmentUploadClientError(
       "UPLOAD_OBJECT_PUT_UNCERTAIN",

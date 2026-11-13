@@ -5,7 +5,7 @@ import { getDb } from "../db/index";
 import { serverMembers, users } from "../db/schema";
 import { claimOwnerOpener, createServer, OWNER_OPENER_CLAIM_LEASE_MS, releaseOwnerOpenerClaim } from "./serverService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 // The owner opener has several concurrent entry points (import hook, survey save,
 // agent start, setup backstop): exactly one may brief and post it.

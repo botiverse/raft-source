@@ -23,3 +23,13 @@ test("inline markdown preview flattens block markdown for line-clamped cards", (
   assert.match(html, /quoted block/);
   assert.doesNotMatch(html, /<(ol|ul|li|blockquote|p|h[1-6]|pre|table|thead|tbody|tr|th|td)\b/);
 });
+
+test("links in an inline preview are not clickable, so they are not underlined", () => {
+  const html = renderToStaticMarkup(
+    createElement(InlineMarkdownPreview, { markdown: "see [the doc](https://example.com/doc)" }),
+  );
+
+  assert.match(html, /<span class="text-foreground-link">the doc<\/span>/);
+  assert.doesNotMatch(html, /<a\b/);
+  assert.doesNotMatch(html, /\bunderline\b/);
+});

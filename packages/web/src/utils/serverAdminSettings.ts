@@ -1,4 +1,4 @@
-import { canChangeMemberRole } from "@botiverse/raft-shared";
+import { canChangeAgentMemberRole, canChangeMemberRole } from "@botiverse/raft-shared";
 import type { ServerRole } from "@botiverse/raft-shared";
 import type { MessageId } from "../i18n/messages/en";
 
@@ -22,7 +22,6 @@ export interface ServerAdminSettingsMember {
   displayName: string | null;
   email: string | null;
   avatarUrl?: string | null;
-  gravatarHash?: string;
   role: ServerRole;
 }
 
@@ -151,7 +150,7 @@ export function canRemoveAdminPrincipal(
   ownerCount = Number.POSITIVE_INFINITY,
 ) {
   if (principal.kind === "human") return canRemoveAdminMember(actorRole, principal, ownerCount);
-  return principal.role === "admin" && canChangeMemberRole(actorRole, principal.role, "member");
+  return principal.role === "admin" && canChangeAgentMemberRole(actorRole, principal.role, "member");
 }
 
 export function unknownMemberLabel(formatMessage: FormatMessage): string {

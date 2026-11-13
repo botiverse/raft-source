@@ -8,7 +8,7 @@ import { agents, serverMembers, servers, users } from "../db/schema";
 import { createAgent } from "./agentService";
 import { addMember, createServer, transitionMemberRole, updateServerOnboardingAgent, updateServerOnboardingSettings } from "./serverService";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 /**
  * #4883 — a member promoted to owner on an already-configured server must NOT be dropped back
@@ -68,7 +68,6 @@ async function promoteToOwner(serverId: string, actorUserId: string, targetUserI
     actorUserId,
     targetUserId,
     nextRole: "owner",
-    guestTransitionsEnabled: true,
   });
 }
 
@@ -169,7 +168,6 @@ test("server completion stays monotonic after the owner who completed setup is d
     actorUserId: remainingOwner.id,
     targetUserId: completingOwner.id,
     nextRole: "member",
-    guestTransitionsEnabled: true,
   });
 
   await addMember(server.id, newOwner.id, "owner");

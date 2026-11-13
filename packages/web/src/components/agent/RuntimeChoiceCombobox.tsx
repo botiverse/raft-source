@@ -41,6 +41,12 @@ type RuntimeChoiceComboboxProps = {
   onValueChange: (next: string, custom: boolean) => void;
   /** The "runtime default" choice of an optional field; stored as "". */
   emptyOption?: RuntimeOption;
+  /**
+   * Shown after the listed options, never selectable (disabled rows, their own
+   * group): models this Computer cannot use now. Not part of the list, so a
+   * stored value among them still reads as not listed.
+   */
+  unavailableOptions?: readonly RuntimeOption[];
   allowCustom: boolean;
   /** The value is one the person typed on purpose (not a listed choice that went away). */
   customValue?: boolean;
@@ -60,7 +66,7 @@ export function RuntimeFormV2ChoiceCombobox({
   belowControl,
   ...props
 }: RuntimeChoiceComboboxProps & {
-  common: { label: string; hint?: string; required: boolean; error?: string; labelAccessory?: ReactNode };
+  common: { label: string; hint?: ReactNode; required: boolean; error?: string; labelAccessory?: ReactNode };
   belowControl?: ReactNode;
 }) {
   return (
@@ -81,6 +87,7 @@ export function RuntimeChoiceCombobox({
   value,
   onValueChange,
   emptyOption,
+  unavailableOptions,
   allowCustom,
   customValue = false,
   placeholder,
@@ -102,25 +109,38 @@ export function RuntimeChoiceCombobox({
     return map;
   }, [options, emptyOption]);
   const notListedLabel = formatMessage({ id: customValue ? "agent.runtimeConfig.custom" : "agent.runtimeFormV2.notInList" });
+  // The current value is an unavailable entry (a disabled model, or on v3 a
+  // bound saved connection): shown selected, by its own label and reason.
+  const unavailableSelected = useMemo(
+    () => (unlisted ? (unavailableOptions ?? []).find((option) => option.value === value) : undefined),
+    [unlisted, unavailableOptions, value],
+  );
   const filtered = useMemo(() => {
     const matches = options.filter((option) => runtimeChoiceMatches(option, query));
+    const unavailable = (unavailableOptions ?? []).filter((option) =>
+      option.value !== value && !byValue.has(option.value) && runtimeChoiceMatches(option, query));
     return [
       ...(emptyOption && runtimeChoiceMatches(emptyOption, query) ? [emptyOption] : []),
-      ...(unlisted && runtimeChoiceMatches({ value, label: value }, query) ? [{ value, label: value, description: notListedLabel }] : []),
+      ...(unlisted && runtimeChoiceMatches({ value, label: unavailableSelected?.label ?? value }, query)
+        ? [{ value, label: unavailableSelected?.label ?? value, description: unavailableSelected?.description ?? notListedLabel }]
+        : []),
       ...matches,
+      ...unavailable.map((option) => ({ ...option, disabled: true })),
     ];
-  }, [options, query, emptyOption, unlisted, value, notListedLabel]);
+  }, [options, query, emptyOption, unlisted, value, notListedLabel, unavailableOptions, byValue, unavailableSelected]);
   const typed = query.trim();
   const offerCustom = allowCustom && typed !== "" && !byValue.has(typed) && typed !== value;
   const items = useMemo(
     () => [...filtered.map((option) => option.value), ...(offerCustom ? [`${CUSTOM_ITEM_PREFIX}${typed}`] : [])],
     [filtered, offerCustom, typed],
   );
-  const selectedValue = value === "" ? (emptyOption?.value ?? null) : value;
-  const selectedLabel = selectedValue === null ? "" : (byValue.get(selectedValue)?.label ?? selectedValue);
+  // "" is the runtime default: the client's own Default row (v2 derived), else a
+  // listed "" option (v3: the server-sent Default), else nothing chosen yet.
+  const selectedValue = value === "" ? (emptyOption?.value ?? (listed ? "" : null)) : value;
+  const selectedLabel = selectedValue === null ? "" : (byValue.get(selectedValue)?.label ?? unavailableSelected?.label ?? selectedValue);
   const itemLabel = useCallback(
-    (item: string) => (item.startsWith(CUSTOM_ITEM_PREFIX) ? item.slice(CUSTOM_ITEM_PREFIX.length) : byValue.get(item)?.label ?? item),
-    [byValue],
+    (item: string) => (item.startsWith(CUSTOM_ITEM_PREFIX) ? item.slice(CUSTOM_ITEM_PREFIX.length) : byValue.get(item)?.label ?? (item === unavailableSelected?.value ? unavailableSelected.label : item)),
+    [byValue, unavailableSelected],
   );
   const handleInputChange: NonNullable<ComboboxProps<string>["onInputValueChange"]> = useCallback((next, details) => {
     // Only typing filters; the combobox also rewrites the input itself (to the
@@ -207,9 +227,11 @@ function renderOption(option: RuntimeOption) {
       <span className="flex min-w-0 flex-col">
         <span className="truncate">{option.label}</span>
         {/* A description (e.g. "Not in the current list") is part of the
-            option's name; the id line is visual help only. */}
+            option's name; the id line is visual help only. A disabled
+            option's description is why it can't be picked (the runtime's
+            reason), so it wraps instead of truncating. */}
         {option.description
-          ? <span className="truncate text-caption font-normal text-foreground-hint">{option.description}</span>
+          ? <span className={`${option.disabled ? "" : "truncate "}text-caption font-normal text-foreground-hint`}>{option.description}</span>
           : id && <span aria-hidden className="truncate font-mono text-mono-meta font-normal text-foreground-hint">{id}</span>}
       </span>
       <ComboboxItemIndicator />

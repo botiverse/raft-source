@@ -16,7 +16,7 @@ import type {
 
 export interface SlackBridgeProvisioningHttpClient {
   get(url: string): Promise<{ data: unknown }>;
-  post(url: string, body?: unknown): Promise<{ data: unknown }>;
+  post(url: string, body?: unknown, config?: { withCredentials?: boolean }): Promise<{ data: unknown }>;
   put(url: string, body?: unknown): Promise<{ data: unknown }>;
   delete?(url: string, options?: { data?: unknown }): Promise<{ data: unknown }>;
 }
@@ -44,7 +44,7 @@ export function createSlackBridgeProvisioningProvider(
   };
 
   const load = async (): Promise<SlackBridgeProvisioningView> => {
-    const response = await client.get(PROVISIONING_PATH);
+    const response = await client.get(`${PROVISIONING_PATH}?deliveryHealth=1&pairDeliveryHealth=1&workspaceAdminHint=1&confirmationHint=1&privateAuthorizerHint=1&attachmentSourceHealth=1&inboundRecovery=1&cardEditNotices=1`);
     return accept(response.data);
   };
 
@@ -56,7 +56,9 @@ export function createSlackBridgeProvisioningProvider(
       return { kind: "view", view: ready(current) };
     }
 
-    const response = await client.post("/slack-bridge/oauth/start", authority);
+    // withCredentials: the response sets the HttpOnly cookie that binds this install to this
+    // browser; Slack's redirect back to the API callback must carry it.
+    const response = await client.post("/slack-bridge/oauth/start", authority, { withCredentials: true });
     const result = slackBridgeOAuthStartResponseSchema.parse(response.data);
     return { kind: "redirect", url: result.authorizationUrl };
   };
@@ -70,13 +72,29 @@ export function createSlackBridgeProvisioningProvider(
       return { kind: "view", view: ready(current) };
     }
 
-    const response = await client.post("/slack-bridge/oauth/start", authority);
+    // withCredentials: the response sets the HttpOnly cookie that binds this install to this
+    // browser; Slack's redirect back to the API callback must carry it.
+    const response = await client.post("/slack-bridge/oauth/start", authority, { withCredentials: true });
     const result = slackBridgeOAuthStartResponseSchema.parse(response.data);
     return { kind: "redirect", url: result.authorizationUrl };
   };
 
   return {
     load,
+    replayInbound: async (event) => {
+      const response = await client.post(`${PROVISIONING_PATH}/replay-inbound`, event);
+      return accept(response.data);
+    },
+    retryDelivery: async (delivery) => {
+      const response = await client.post(`${PROVISIONING_PATH}/retry-delivery`, {
+        bindingId: delivery.bindingId,
+        bindingEpoch: delivery.bindingEpoch,
+        deliveryId: delivery.deliveryId,
+        expectedProviderAttempts: delivery.providerAttempts,
+        duplicateRiskAcknowledged: true,
+      });
+      return accept(response.data);
+    },
     connect: async () => {
       const response = await client.post(`${PROVISIONING_PATH}/connect`);
       return accept(response.data);
@@ -106,7 +124,10 @@ export function createSlackBridgeProvisioningProvider(
     },
     enable: async () => {
       const response = await client.post(`${PROVISIONING_PATH}/enable`);
-      return accept(response.data);
+      accept(response.data);
+      // Enable responses preserve the older browser contract. Re-read with the
+      // explicit delivery-health opt-in before showing a successful recovery.
+      return load();
     },
   };
 }

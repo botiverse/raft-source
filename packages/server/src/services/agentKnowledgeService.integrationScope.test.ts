@@ -86,9 +86,12 @@ test("[wording-coupled] the integration topic states the scope limit of `integra
     /each with its own inventory/,
     "must not assert that every other surface has an enumerable inventory",
   );
+  // Re-anchored when MCP Apps joined the list (owner: "MCP Apps and ordinary Apps are all Raft
+  // Apps, just different types"): Server-managed MCP is now listed; the runtime's own MCP servers
+  // are the runtime-side surface it still does not cover.
   assert.match(
     doc.content,
-    /Server-managed MCP/,
+    /your runtime's own MCP servers/,
     "must name the runtime-side surface the list does not cover",
   );
 });
@@ -111,7 +114,11 @@ test("the scope limit sits ON the list surface, not in a later section", async (
     /not an inventory of everything you can do/,
     "the scope limit must be inside the list row; a correct sentence in a later section is what already failed in the system prompt",
   );
-  assert.match(step, /Server-managed MCP/, "the excluded surface must be named in that same step");
+  assert.match(step, /your runtime's own MCP servers/, "the excluded surface must be named in that same step");
+  assert.match(step, /`type: MCP`/, "the MCP Apps the list now covers are named in that same step");
+  assert.match(step, /not `invoke`/, "and how they are used, so an agent does not try to invoke one");
+  assert.match(step, /`raft integration login --service <id> --target <channel-or-thread>` request whenever access or a connection is missing/,
+    "and how an agent asks for one it lacks, so it does not stop at a missing grant or connection");
 });
 
 test("[wording-coupled] the triage answer carries the same boundary", async () => {

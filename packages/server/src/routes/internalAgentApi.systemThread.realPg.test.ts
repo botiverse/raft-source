@@ -72,7 +72,6 @@ test(
 
       app = await openTestApp(testUrl, 0, {
         humanActivityMuteFlagDefaultEnabled: true,
-        onboardingOpenerFlagDefaultEnabled: false,
         skipAuthRateLimit: true,
       });
       __setOrdinaryMessageOutboundAuthorizationResolverForTests(async () => null);
@@ -103,6 +102,7 @@ test(
         agentId: agent.id,
         scopes: ["send", "read"],
         name: "system-thread-real-pg",
+        issuedVia: "computer",
         createdByUserId: null,
       });
       const parent = await createMessage(

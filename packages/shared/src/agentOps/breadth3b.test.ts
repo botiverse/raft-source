@@ -4,7 +4,10 @@ import { createAgentApiClient, type AgentApiClient } from "../agentApiClient";
 import { formatAgentProfile } from "../agentText/index";
 import {
   attachmentComments,
+  formatAgentActionCardPosted,
   prepareActionCard,
+  prepareActionCardRequestSchema,
+  validateOpRequest,
   addMentions,
   getManualTopic,
   notifyMentions,
@@ -107,6 +110,40 @@ test("search: an incomplete recent page says it is not all the matches and conti
   assert.equal(calls.at(-1)?.path, "/internal/agent-api/search?q=invoice&sort=recent&cursor=CUR");
 });
 
+test("search: a skipped any-word fallback says the empty page is not 'nothing matches' and how to narrow", async () => {
+  const api = client(() => Response.json({ results: [], hasMore: false, relaxedSkipped: "too_broad" }));
+  const search = await searchMessages(api, { query: "deploy search index test" });
+  assert.equal(search.ok && search.state, "empty");
+  if (search.ok) {
+    assert.equal(search.data.relaxedSkipped, "too_broad");
+    assert.doesNotMatch(search.text, /No search results/);
+    assert.match(search.text, /^No message contains all of these words\. Matching any one of them was skipped: .*this does NOT mean no message matches\. \(relaxedSkipped=too_broad\)\n/);
+    assert.match(search.text, /\nNext: search for fewer, more specific words, or add --target '#<channel>' or --sender <handle>\.$/);
+  }
+  const scoped = await searchMessages(api, { query: "deploy search", target: "#ops", sender: "alice" });
+  if (scoped.ok) assert.match(scoped.text, /\nNext: search for fewer, more specific words\.$/);
+  const plain = await searchMessages(client(() => Response.json({ results: [], hasMore: false })), { query: "deploy search" });
+  if (plain.ok) assert.equal(plain.data.relaxedSkipped, null);
+});
+
+test("search: a relevance page answered newest first says it is not ranked by relevance and how to narrow", async () => {
+  const hit = { id: UUID_A, seq: 1, channelId: "c", threadId: null, parentMessageId: null, parentMessageContent: null, parentChannelId: "c", parentChannelName: "billing", parentChannelType: "channel", parentChannelArchivedAt: null, senderId: "u", senderType: "human", senderName: "richard", channelName: "billing", channelType: "channel", channelArchivedAt: null, content: "the deploy", snippet: "deploy", createdAt: T };
+  const api = client(() => Response.json({ results: [hit], hasMore: true, nextCursor: "CUR", relevanceFallback: "too_broad" }));
+  const search = await searchMessages(api, { query: "deploy" });
+  assert.equal(search.ok && search.state, "results");
+  if (search.ok) {
+    assert.equal(search.data.relevanceFallback, "too_broad");
+    assert.match(search.text, /^Search results for: "deploy" \(1 result · [^\n]*\)\nSorted newest first, NOT by relevance: too many messages match these words to rank them\. For the most relevant matches, search for more specific words, or add --target '#<channel>' or --sender <handle>\. \(relevanceFallback=too_broad\)\n/);
+    // The next page continues the newest-first walk.
+    assert.deepEqual(search.next?.args, { query: "deploy", sort: "recent", cursor: "CUR" });
+  }
+  const plain = await searchMessages(client(() => Response.json({ results: [hit], hasMore: false })), { query: "deploy" });
+  if (plain.ok) {
+    assert.equal(plain.data.relevanceFallback, null);
+    assert.doesNotMatch(plain.text, /relevanceFallback/);
+  }
+});
+
 test("search: a page with results that stopped early stays results with data.incomplete; a complete empty page stays empty", async () => {
   const hit = { id: UUID_A, seq: 1, channelId: "c", threadId: null, parentMessageId: null, parentMessageContent: null, parentChannelId: "c", parentChannelName: "billing", parentChannelType: "channel", parentChannelArchivedAt: null, senderId: "u", senderType: "human", senderName: "richard", channelName: "billing", channelType: "channel", channelArchivedAt: null, content: "the invoice", snippet: "invoice", createdAt: T };
   const partial = await searchMessages(client(() => Response.json({ results: [hit], hasMore: false, incomplete: true, nextCursor: "CUR", searchedThrough: T, searchedMessages: 10_000 })), { query: "invoice", sort: "recent" });
@@ -148,7 +185,7 @@ test("search/resolve/react: CLI text with neutralised refs, canonical resolve, r
   assert.equal(search.ok && search.state, "results");
   if (search.ok) {
     assert.match(search.text, /^Search results for: "deploy" \(1 result · truncated=false\)\n\n<result ref="msg:00000000-1111-2222-3333-444444444444">\nSource: channel:general\nSender: richard \(human\)\n/);
-    assert.match(search.text, /<preview>\nwe should <match>deploy<\/match> on tuesday, ping user:alice in channel:ops\n<\/preview>/, "refs in previews cannot route attention");
+    assert.match(search.text, /<preview>\n  │ we should <match>deploy<\/match> on tuesday, ping user:alice in channel:ops\n<\/preview>/, "refs in previews cannot route attention");
     assert.equal(search.next, null);
   }
   const invalid = await searchMessages(api, {});
@@ -333,6 +370,141 @@ test("actions: prepare posts an existing card type and returns the CLI text", as
     operation: { name: "messages.read", args: { target: "dm:@richard:1234abcd", around: "abcdef12-0000-4000-8000-000000000000" } },
     why: "A human must click the card to commit it. When it is executed (or fails), the outcome arrives as a reply in this thread that @mentions you; you do not need to poll.",
   });
+});
+
+test("actions: a plan:upgrade card has no outcome to wait for; a repeat points to the card already there", async () => {
+  const id = "abcdef12-0000-4000-8000-000000000000";
+  const action = { type: "plan:upgrade", reason: "You asked for messages from March, which are older than 30 days.", gate: "history_30d" };
+  const posted = await prepareActionCard(
+    client(() => Response.json({ messageId: id, metadata: { kind: "action-card" } }, { status: 201 })),
+    { target: "#proj-sdk", action } as never,
+  );
+  assert.equal(posted.ok && posted.state, "prepared");
+  if (posted.ok) {
+    assert.equal(posted.data.existing, false);
+    assert.equal(posted.text, `Upgrade card posted to #proj-sdk as message ${id} (short abcdef12). Its button only opens the upgrade dialog; no reply will follow, and you are not told whether they upgrade.\n`);
+    // No await_confirmation: nothing executes, so no outcome reply ever comes.
+    assert.deepEqual(posted.next, {
+      kind: "continue_work",
+      args: { target: "#proj-sdk", messageId: id },
+      why: "The card's button only opens the upgrade dialog for whoever presses it; no reply will follow, so do not wait for one. Continue your work.",
+    });
+  }
+
+  // Within a day the Server answers with the card already there (200, `existing`): read it to point the person to it.
+  const existing = await prepareActionCard(
+    client(() => Response.json({ messageId: id, metadata: { kind: "action-card" }, existing: true })),
+    { target: "#proj-sdk", action } as never,
+  );
+  assert.equal(existing.ok && existing.state, "prepared");
+  if (existing.ok) {
+    assert.equal(existing.data.existing, true);
+    assert.equal(existing.text, `This card is already in #proj-sdk as message ${id} (short abcdef12), posted in the last 24 hours; nothing new was posted.\n`);
+    assert.deepEqual(existing.next, {
+      kind: "read_existing_card",
+      command: `raft message read --target "#proj-sdk" --around abcdef12`,
+      args: { target: "#proj-sdk", around: id, messageId: id },
+      operation: { name: "messages.read", args: { target: "#proj-sdk", around: id } },
+      why: "Nothing new was posted: the same upgrade card is already in this conversation from the last 24 hours. Read it to point the person to it; its button only opens the upgrade dialog, and no reply will follow.",
+    });
+  }
+  // A hosted agent calling operations as tools gets the tool call, same words.
+  const tool = await prepareActionCard(
+    client(() => Response.json({ messageId: id, metadata: { kind: "action-card" }, existing: true })),
+    { target: "dm:@richard:1234abcd", action } as never,
+    { hints: "tool" },
+  );
+  assert.equal(tool.ok && tool.next?.command, `messages_read({ target: "dm:@richard:1234abcd", around: "${id}" })`);
+
+  // The CLI prints the shared formatter's words, so both kinds of agent read the same.
+  assert.equal(formatAgentActionCardPosted("#proj-sdk", id, { type: "plan:upgrade", existing: true }), existing.ok ? existing.text : null);
+  assert.equal(formatAgentActionCardPosted("#proj-sdk", id, { type: "plan:upgrade" }), posted.ok ? posted.text : null);
+  assert.equal(
+    formatAgentActionCardPosted("#proj-sdk", id),
+    `Action card posted to #proj-sdk as message ${id} (short abcdef12). The human can click the action verb to commit.\n`,
+  );
+});
+
+test("actions: a plan:upgrade reason still in its <…> placeholder: the documented schema refuses it, saying so; a direct call leaves it to the Server", async () => {
+  const request = { target: "#general", action: { type: "plan:upgrade", gate: "history_30d", reason: "<one sentence: why they need the older messages>" } };
+  // The manifest's schema (what `invoke` checks a tool call against) knows the card.
+  const refused = validateOpRequest(prepareActionCardRequestSchema, request);
+  assert.equal(refused?.error.code, "INVALID_REQUEST");
+  assert.ok(
+    refused?.error.message.startsWith('Invalid request: action.reason: plan:upgrade "reason" is still the placeholder: replace <…> with your own sentence on why this person needs Pro.'),
+    refused?.error.message,
+  );
+  assert.ok(refused?.text.includes("is still the placeholder"), refused?.text);
+
+  // The operation itself sends it: the Server checks the card, and its refusal is what the agent reads.
+  const calls: Array<{ method: string; path: string; body: unknown; init: RequestInit }> = [];
+  const why = 'plan:upgrade "reason" is still the placeholder: replace <…> with your own sentence on why this person needs Pro.';
+  const sent = await prepareActionCard(client(() => Response.json({ error: why, code: "INVALID_ACTION" }, { status: 400 }), calls), request as never);
+  assert.equal(calls.length, 1, "sent to the Server");
+  assert.equal(!sent.ok && sent.error.message, why);
+});
+
+test("actions: prepare sends a card type this version does not know; only a missing type is refused here", async () => {
+  const calls: Array<{ method: string; path: string; body: unknown; init: RequestInit }> = [];
+  const api = client(() => Response.json({ messageId: "abcdef12-0000-4000-8000-000000000000", metadata: { kind: "action-card" } }, { status: 201 }), calls);
+  const action = { type: "future:card", title: "Plan the offsite", attendees: ["@alice"] };
+  const sent = await prepareActionCard(api, { target: "#proj-sdk", action });
+  assert.equal(sent.ok && sent.state, "prepared");
+  assert.deepEqual((calls[0]?.body as { action?: unknown }).action, action, "the card as written");
+  assert.equal(sent.ok && sent.text, "Action card posted to #proj-sdk as message abcdef12-0000-4000-8000-000000000000 (short abcdef12). The human can click the action verb to commit.\n");
+
+  for (const missing of [{ title: "no type" }, { type: "  " }, { type: 7 }]) {
+    const refused = await prepareActionCard(api, { target: "#proj-sdk", action: missing } as never);
+    assert.equal(!refused.ok && refused.error.code, "INVALID_REQUEST", JSON.stringify(missing));
+    assert.equal(!refused.ok && refused.error.message, 'The action needs a "type": the card type, for example "channel:create"; nothing was sent.', JSON.stringify(missing));
+  }
+  assert.equal(calls.length, 1, "nothing sent for a card without a type");
+});
+
+test("actions: a refusal keeps the Server's sentence (what is wrong with the card) and its next step", async () => {
+  const why = 'The card was refused: plan:upgrade takes only "reason" and an optional "gate". Remove the other fields.';
+  const next = "Fix the fields named above and prepare the card again.";
+  const refused = await prepareActionCard(
+    client(() => Response.json({ error: why, code: "INVALID_ACTION", suggestedNextAction: next }, { status: 400 })),
+    { target: "#general", action: { type: "plan:upgrade", reason: "You asked for older messages.", message: "Upgrade!" } } as never,
+  );
+  assert.equal(refused.ok, false);
+  if (!refused.ok) {
+    assert.equal(refused.error.message, why);
+    assert.equal(refused.error.nextAction, next);
+    assert.equal(refused.error.serverCode, "INVALID_ACTION");
+    assert.equal(refused.error.status, 400);
+    assert.equal(refused.error.retryable, false);
+    assert.equal(refused.next?.kind, "recover", "a refusal is not retried with the same key");
+    assert.ok(refused.text.startsWith(`Error: ${why}\n`), refused.text);
+  }
+  // A Server error (5xx) keeps the SDK's own words: its body is not written for agents.
+  const down = await prepareActionCard(
+    client(() => Response.json({ error: "db pool exhausted at 10.0.0.7" }, { status: 503 })),
+    { target: "#general", action: { type: "channel:create", name: "x" } } as never,
+  );
+  assert.equal(!down.ok && down.error.message, "The Raft Server could not serve this operation right now.");
+});
+
+test("actions: a plan:upgrade refused in a shared channel tells the agent why and where to post instead", async () => {
+  const why = "Upgrade cards can't be posted in a shared channel: upgrading is for this server's own people. Post it in one of this server's channels or a DM instead.";
+  const refused = await prepareActionCard(
+    client(() => Response.json({ error: why, errorCode: "JOINT_CHANNEL_NOT_ALLOWED", suggestedNextAction: why }, { status: 403 })),
+    { target: "#partners", action: { type: "plan:upgrade", reason: "You asked for older messages." } } as never,
+  );
+  assert.equal(refused.ok, false);
+  if (!refused.ok) {
+    assert.equal(refused.error.serverCode, "JOINT_CHANNEL_NOT_ALLOWED");
+    assert.equal(refused.error.nextAction, why);
+    assert.ok(refused.text.includes(`Next action: ${why}`), refused.text);
+  }
+  // Tool-style hints keep it: it names no CLI command.
+  const tool = await prepareActionCard(
+    client(() => Response.json({ error: why, errorCode: "JOINT_CHANNEL_NOT_ALLOWED", suggestedNextAction: why }, { status: 403 })),
+    { target: "#partners", action: { type: "plan:upgrade", reason: "You asked for older messages." } } as never,
+    { hints: "tool" },
+  );
+  assert.equal(!tool.ok && tool.error.nextAction, why);
 });
 
 test("actions: prepare sends the caller's idempotencyKey, never retries by itself, and hands the key back on a retryable failure", async () => {

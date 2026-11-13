@@ -5,7 +5,8 @@ import type { AgentContext } from "../../auth/env";
 import { createCommandContext } from "../../core/context";
 import type { CliIo } from "../../core/io";
 import { TASK_CLAIM_REASON_ALREADY_CLAIMED_BY_YOU } from "@botiverse/raft-shared";
-import { CliExit } from "../../core/errors";
+import { CliError, CliExit } from "../../core/errors";
+import { readPassiveRenderCountsForTest, withPassiveAxContextForTest } from "../../state/passiveRenderCountsTestReader";
 import { taskClaimCommand } from "./claim";
 
 function memoryIo(): { io: CliIo; stdout: string[] } {
@@ -54,7 +55,7 @@ test("task claim command keeps repeated task numbers as one batched claim reques
     }) as any,
   });
 
-  await taskClaimCommand.handler(ctx, { target: "#engineering", number: ["87", "93", "100"] });
+  await taskClaimCommand.handler(ctx, undefined, { target: "#engineering", number: ["87", "93", "100"] });
 
   assert.deepEqual(requests, [{
     channel: "#engineering",
@@ -107,7 +108,7 @@ test("reviewer-isolation task claim uses withheld mode and reprojects poisoned l
     }) as any,
   });
 
-  await taskClaimCommand.handler(ctx, { target: "#engineering", number: ["7"] });
+  await taskClaimCommand.handler(ctx, undefined, { target: "#engineering", number: ["7"] });
 
   assert.deepEqual(requests, [{
     channel: "#engineering",
@@ -140,7 +141,7 @@ test("task claim exit status: zero successes is non-zero, any success is zero", 
         }),
       }) as any,
     });
-    return taskClaimCommand.handler(ctx, {
+    return taskClaimCommand.handler(ctx, undefined, {
       target: "#engineering",
       number: results.map((r) => String(r.taskNumber)),
     });
@@ -215,7 +216,7 @@ test("zero-success claim with a structured conflict throws typed CLAIM_CONFLICT 
     },
   }]);
   await assert.rejects(
-    async () => taskClaimCommand.handler(ctx, { target: "#proj-task", number: ["57"] }),
+    async () => taskClaimCommand.handler(ctx, undefined, { target: "#proj-task", number: ["57"] }),
     (error: any) => error?.code === "CLAIM_CONFLICT"
       && /#57 held by @Cody/.test(error.message)
       && !/INTERNAL_BUG|CliExit/.test(String(error.message)),
@@ -227,7 +228,7 @@ test("zero-success claim with a structured conflict throws typed CLAIM_CONFLICT 
 test("zero-success claim without a conflict throws typed CLAIM_FAILED carrying the reason", async () => {
   const { ctx } = refusalCtx([{ taskNumber: 99, success: false, reason: "task not found" }]);
   await assert.rejects(
-    async () => taskClaimCommand.handler(ctx, { target: "#proj-task", number: ["99"] }),
+    async () => taskClaimCommand.handler(ctx, undefined, { target: "#proj-task", number: ["99"] }),
     (error: any) => error?.code === "CLAIM_FAILED" && /#99 task not found/.test(error.message),
   );
 });
@@ -237,7 +238,7 @@ test("already-claimed-by-you still authorises work: no throw, exit stays clean",
     taskNumber: 60, messageId: "msg-60", success: false,
     reason: TASK_CLAIM_REASON_ALREADY_CLAIMED_BY_YOU,
   }]);
-  await taskClaimCommand.handler(ctx, { target: "#proj-task", number: ["60"] });
+  await taskClaimCommand.handler(ctx, undefined, { target: "#proj-task", number: ["60"] });
   assert.match(stdout.join(""), /#60: already claimed by you/);
 });
 
@@ -254,7 +255,7 @@ test("a partial claim (one success, one conflict) does not throw", async () => {
       },
     },
   ]);
-  await taskClaimCommand.handler(ctx, { target: "#proj-task", number: ["1", "2"] });
+  await taskClaimCommand.handler(ctx, undefined, { target: "#proj-task", number: ["1", "2"] });
   assert.match(stdout.join(""), /1 claimed, 1 failed/);
 });
 
@@ -288,9 +289,110 @@ test("proxy 5xx with upstream_http_response yields PROXY_5XX with the server-sid
     }) as any,
   });
   await assert.rejects(
-    async () => taskClaimCommand.handler(ctx, { target: "#proj-task", number: ["57"] }),
+    async () => taskClaimCommand.handler(ctx, undefined, { target: "#proj-task", number: ["57"] }),
     (error: any) => error?.code === "PROXY_5XX"
       && /discarded the upstream response body/.test(String(error.suggestedNextAction))
       && !/inspect daemon proxy transport logs/.test(String(error.suggestedNextAction)),
   );
+});
+
+test("a held claim is counted for the daemon's turn report while passive AX is on", async () => {
+  await withPassiveAxContextForTest("ctx-A", async () => {
+    const { io, stdout } = memoryIo();
+    const ctx = createCommandContext({
+      io,
+      loadAgentContext: () => agentContext,
+      createApiClient: () => ({
+        request: async (): Promise<ApiResponse<unknown>> => ({
+          ok: true,
+          status: 200,
+          error: null,
+          data: { state: "held", newMessageCount: 1, seenUpToSeq: 17, heldMessages: [{ seq: 17, id: "m-17", senderName: "ana", content: "taking #7 myself" }] },
+        }),
+      }) as any,
+    });
+    await taskClaimCommand.handler(ctx, undefined, { target: "#engineering", number: ["7"] });
+    const held = stdout.join("");
+    assert.match(held, /Your task claim was not applied/);
+    assert.deepEqual(readPassiveRenderCountsForTest("agent-1"), [
+      { contextId: "ctx-A", kind: "freshness_hold", renders: 1, chars: Array.from(held).length, bytes: Buffer.byteLength(held, "utf8") },
+    ]);
+  });
+});
+
+test("task v2 server: claim --message-id surfaces task_v2_use_create with the server's commands verbatim", async () => {
+  const { io, stdout } = memoryIo();
+  const hint = [
+    "`task claim --message-id` is not available on this server: tasks here have their own conversations and are claimed by number. Nothing was claimed.",
+    "Message abcdef12 has 2 tasks — claim by number:",
+    "  raft task claim --target \"#proj-task\" --number 4",
+    "  raft task claim --target \"#proj-task\" --number 5",
+  ].join("\n");
+  const ctx = createCommandContext({
+    io,
+    loadAgentContext: () => agentContext,
+    createApiClient: () => ({
+      request: async (): Promise<ApiResponse<unknown>> => ({
+        ok: false, status: 409, error: hint, errorCode: "task_v2_use_create", data: null,
+      }),
+    }) as any,
+  });
+  await assert.rejects(
+    async () => taskClaimCommand.handler(ctx, undefined, { target: "#proj-task", messageId: ["abcdef12"] }),
+    (error: any) => error?.code === "task_v2_use_create" && error.message === hint,
+  );
+  assert.deepEqual(stdout, []);
+});
+
+test("task claim over the task-write budget: RATE_LIMITED, retryable, the wait; under reviewer isolation too (the sentence holds only counts)", async () => {
+  const body = {
+    error: "This agent made too many task changes: the limit is 120 a minute. Retry in 5 seconds.",
+    code: "RATE_LIMITED",
+    details: { operation: "taskClaim", limit: 120, windowSeconds: 60, retryAfterSeconds: 5 },
+  };
+  for (const reviewerIsolation of [false, true]) {
+    const { io } = memoryIo();
+    const ctx = createCommandContext({
+      io,
+      loadAgentContext: () => agentContext,
+      createApiClient: () => ({
+        request: async (): Promise<ApiResponse<unknown>> => ({ ok: false, status: 429, error: body.error, errorCode: "RATE_LIMITED", data: null, errorBody: body }),
+      }) as any,
+    });
+    await assert.rejects(
+      async () => taskClaimCommand.handler(ctx, undefined, { target: "#engineering", number: ["7"], ...(reviewerIsolation ? { reviewerIsolation: true } : {}) }),
+      (err: unknown) => {
+        const e = err as { code?: string; message?: string; retryable?: boolean; suggestedNextAction?: string };
+        assert.equal(e.code, "RATE_LIMITED");
+        assert.equal(e.message, body.error);
+        assert.equal(e.retryable, true);
+        assert.equal(e.suggestedNextAction, "Wait 5 seconds, then run the same command again (the refused request changed nothing).");
+        return true;
+      },
+    );
+  }
+});
+
+test("task claim takes one task by its ref", async () => {
+  const { io } = memoryIo();
+  const requests: unknown[] = [];
+  const ctx = createCommandContext({
+    io,
+    loadAgentContext: () => agentContext,
+    createApiClient: () => ({
+      request: async (_method: string, _path: string, body?: unknown): Promise<ApiResponse<unknown>> => {
+        requests.push(body);
+        return { ok: true, status: 200, error: null, data: { results: [{ taskNumber: 7, messageId: "msg-7", success: true }] } };
+      },
+    }) as any,
+  });
+
+  await taskClaimCommand.handler(ctx, "#engineering:#7", {});
+
+  assert.deepEqual(requests, [{ channel: "#engineering", task_numbers: [7] }]);
+  await assert.rejects(
+    async () => { await taskClaimCommand.handler(ctx, "#engineering:#7", { messageId: ["abcd1234"] }); },
+    (err: unknown) => err instanceof CliError && err.code === "INVALID_ARG",
+  );
+  assert.equal(requests.length, 1);
 });

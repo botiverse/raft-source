@@ -8,6 +8,7 @@ import type { KimiFreshness } from "./kimiTokenRefresh";
 import type { AvailableInstallation, InstallationSnapshot, Runtime } from "@botiverse/oar";
 
 import { readOarAccountUsage } from "./collector";
+import { loadOarRuntime } from "../oarLoader";
 
 const BASE = {
   provider: "codex",
@@ -38,6 +39,42 @@ function recordingRuntime(installation: InstallationSnapshot) {
   });
   return { runtime, seen };
 }
+
+test("a usage read asks for the count of limit resets only, with no env", async () => {
+  const given: unknown[] = [];
+  const runtime = defineRuntime({
+    id: "recording",
+    session: (() => {
+      throw new Error("session must not be started by an account-usage read");
+    }) as unknown as Runtime["session"],
+    installation: async () => ({ kind: "available", via: "executable", command: "/usr/local/bin/codex", version: "0.130.0" }),
+    accountUsage: async (_installation: AvailableInstallation, options) => {
+      given.push(options);
+      return { kind: "available", rateLimited: false, windows: [], limitResets: { available: 3 } } as const;
+    },
+  });
+  const snapshot = await readOarAccountUsage({ ...BASE, deps: { runtime, timeoutMs: 1234 } });
+  assert.deepEqual(given, [{ timeoutMs: 1234, limitResetDetails: false }]);
+  assert.equal(snapshot.accounts[0]?.limitResetsAvailable, 3);
+});
+
+test("Antigravity's usage is read without the SSH variables, so agy reads the sign-in its agents run on", async () => {
+  const given: unknown[] = [];
+  const runtime = defineRuntime({
+    id: "recording",
+    session: (() => {
+      throw new Error("session must not be started by an account-usage read");
+    }) as unknown as Runtime["session"],
+    installation: async () => ({ kind: "available", via: "executable", command: "/usr/local/bin/agy", version: "1.5.7" }),
+    accountUsage: async (_installation: AvailableInstallation, options) => {
+      given.push(options);
+      return { kind: "reauth_required", reason: "not_authenticated" } as const;
+    },
+  });
+  const snapshot = await readOarAccountUsage({ ...BASE, provider: "antigravity", deps: { runtime, timeoutMs: 1234 } });
+  assert.deepEqual(given, [{ env: { SSH_CLIENT: null, SSH_CONNECTION: null, SSH_TTY: null }, timeoutMs: 1234, limitResetDetails: false }]);
+  assert.equal(snapshot.accounts[0]?.health, "reauth_required", "not signed in to agy");
+});
 
 test("installation is probed exactly once per read", async () => {
   const available: InstallationSnapshot = { kind: "available", via: "bundled" };
@@ -232,4 +269,9 @@ test("task #1282 (gate on): every other freshness hands the read to OAR and the 
 test("task #1282 (gate off, the default): the pre-step never runs and OAR's result is projected as before", async () => {
   assert.deepEqual(await readWithFreshness({ kind: "revoked" }, OK_READING, false), { health: "ok", readerCalls: 1, ensureFreshCalls: 0 });
   assert.deepEqual(await readWithFreshness({ kind: "fresh", expiresAt: 1 }, OAR_CREDENTIALS_REJECTED, false), { health: "reauth_required", readerCalls: 1, ensureFreshCalls: 0 });
+});
+
+test("the bundled OAR reads Antigravity's usage, which the daemon advertises (DAEMON_CAPABILITY_RUNTIME_ACCOUNT_USAGE_ANTIGRAVITY)", async () => {
+  const runtime = await loadOarRuntime("antigravity");
+  assert.equal(typeof runtime.accountUsage, "function", "an OAR without it: stop advertising the capability in core.ts");
 });

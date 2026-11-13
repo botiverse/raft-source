@@ -3,7 +3,9 @@ import api from "../api/client";
 import { registerServerReset } from "./serverResetRegistry";
 import type { ActivitySortDirection } from "./inboxStore";
 
-const PAGE_SIZE = 20;
+// The server's cap. At 20 a long list took a request per 20 rows, about 0.55s
+// each (task #5).
+const PAGE_SIZE = 50;
 let activeSavedListRequestId = 0;
 
 export interface SavedEntry {
@@ -38,16 +40,29 @@ interface SavedState {
    *  independent of how many pages are currently loaded into `saved`. */
   total: number;
   resultTotal: number;
+  /** Saved messages older than the plan's history window: not listed, only
+   * counted (Free, 30 days; `historyHidden` on the list's first page). */
+  historyHiddenCount: number;
+  /** Counts the saves and unsaves the server accepted: each also follows or
+   *  unfollows a thread, so Activity's Saved filter reloads on it. */
+  writeRevision: number;
   query: string;
   channelId: string | null;
   sortDirection: ActivitySortDirection;
-  loadSaved: (filters?: { query?: string; sortDirection?: ActivitySortDirection; channelId?: string | null }) => Promise<void>;
+  /** Resolves false when the request failed (the list on screen stays), so
+   *  a pull to refresh can say so. */
+  loadSaved: (filters?: { query?: string; sortDirection?: ActivitySortDirection; channelId?: string | null }) => Promise<boolean>;
   loadMore: () => Promise<void>;
   saveMessage: (messageId: string) => Promise<void>;
   unsaveMessage: (messageId: string) => Promise<void>;
   isSaved: (messageId: string) => boolean;
   /** Check saved status for a batch of message IDs (used when loading messages) */
   checkSaved: (messageIds: string[]) => Promise<void>;
+}
+
+function readHistoryHiddenCount(value: unknown): number {
+  const count = value && typeof value === "object" ? (value as { count?: unknown }).count : undefined;
+  return typeof count === "number" && Number.isFinite(count) && count > 0 ? count : 0;
 }
 
 export const useSavedStore = create<SavedState>((set, get) => ({
@@ -57,6 +72,8 @@ export const useSavedStore = create<SavedState>((set, get) => ({
   hasMore: false,
   total: 0,
   resultTotal: 0,
+  historyHiddenCount: 0,
+  writeRevision: 0,
   query: "",
   channelId: null,
   sortDirection: "desc",
@@ -95,6 +112,7 @@ export const useSavedStore = create<SavedState>((set, get) => ({
           savedIds,
           hasMore: !!data.hasMore,
           resultTotal: typeof data.total === "number" ? data.total : saved.length,
+          historyHiddenCount: readHistoryHiddenCount(data.historyHidden),
           // Fall back to the loaded length if an older server omits `total`.
           total: typeof data.globalTotal === "number"
             ? data.globalTotal
@@ -104,9 +122,11 @@ export const useSavedStore = create<SavedState>((set, get) => ({
           loading: false,
         };
       });
+      return true;
     } catch (err) {
       console.error("Failed to load saved messages:", err);
       if (requestId === activeSavedListRequestId) set({ loading: false });
+      return false;
     }
   },
 
@@ -155,6 +175,7 @@ export const useSavedStore = create<SavedState>((set, get) => ({
     }));
     try {
       await api.post("/channels/saved", { messageId });
+      set((state) => ({ writeRevision: state.writeRevision + 1 }));
       // Reload full list to get metadata + reconcile the authoritative total.
       get().loadSaved();
     } catch (err) {
@@ -185,6 +206,7 @@ export const useSavedStore = create<SavedState>((set, get) => ({
     });
     try {
       await api.delete(`/channels/saved/${messageId}`);
+      set((state) => ({ writeRevision: state.writeRevision + 1 }));
     } catch (err) {
       console.error("Failed to unsave message:", err);
       // Revert by reloading
@@ -223,6 +245,7 @@ registerServerReset(() => {
     hasMore: false,
     total: 0,
     resultTotal: 0,
+    historyHiddenCount: 0,
     query: "",
     channelId: null,
     sortDirection: "desc",

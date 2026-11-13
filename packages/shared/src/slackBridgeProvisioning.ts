@@ -1,6 +1,11 @@
 import { z } from "zod";
 import { lazySchema } from "./lazySchema";
 
+
+/** Why a held Slack delivery cannot be confirmed yet: Raft rechecks Slack every 15 minutes. */
+export const SLACK_PAIR_CONFIRMATION_DETAILS = ["history_limited", "metadata_missing", "marker_unconfirmed"] as const;
+export type SlackPairConfirmationDetail = (typeof SLACK_PAIR_CONFIRMATION_DETAILS)[number];
+
 export const SLACK_BRIDGE_PROVISIONING_PROTOCOL_VERSION = 1 as const;
 
 export const SLACK_BRIDGE_SETUP_STAGES = [
@@ -27,8 +32,21 @@ export const slackBridgeChannelPairSchema = lazySchema("slackBridgeChannelPairSc
   slackChannelId: opaqueIdSchema,
 }));
 
+// Declared before the snapshot pair schema below, which is built while this
+// module loads and refers to it.
+/** Safe, additive setup diagnostics; never carries provider response bodies. */
+export const slackBridgeProvisioningFailureReasonSchema = lazySchema("slackBridgeProvisioningFailureReasonSchema", () => z.enum([
+  "privacy_mismatch",
+  "not_member",
+  "channel_unavailable",
+  "provider_unavailable",
+]));
+export type SlackBridgeProvisioningFailureReason = z.infer<typeof slackBridgeProvisioningFailureReasonSchema>;
+
 const slackBridgeSnapshotChannelPairSchema = lazySchema("slackBridgeSnapshotChannelPairSchema", () => slackBridgeChannelPairSchema.extend({
   bindingEpoch: positiveSafeIntegerSchema.optional(),
+  /** Set when a saved pair no longer matches current channel authority. */
+  invalidReason: slackBridgeProvisioningFailureReasonSchema.optional(),
 }));
 
 export const slackBridgeChannelPairRemovalSchema = lazySchema("slackBridgeChannelPairRemovalSchema", () => slackBridgeChannelPairSchema.extend({
@@ -79,6 +97,9 @@ function oneToOnePairsSchema(minimum: number) {
   });
 }
 
+/** RFC 082 §4.6: the kinds of a card message's Slack notice to its pair's admins. */
+export const SLACK_CARD_EDIT_NOTICE_KINDS = ["not_confirmed", "latest_update_not_shown", "updates_cannot_be_shown", "edit_waiting"] as const;
+
 export const slackBridgeRawHealthSchema = lazySchema("slackBridgeRawHealthSchema", () => z.strictObject({
   install: z.strictObject({
     state: z.enum([
@@ -126,6 +147,75 @@ export const slackBridgeRawHealthSchema = lazySchema("slackBridgeRawHealthSchema
     actual: z.number().int().min(0),
     observedAt: z.string().datetime({ offset: true }),
   }).nullable(),
+  attachmentSourceIssues: z.array(z.strictObject({
+    raftChannelId: opaqueIdSchema,
+    reason: z.enum(["unavailable", "size_mismatch"]),
+  })).max(500).optional(),
+  outboundDeliveries: z.array(z.strictObject({
+    raftChannelId: opaqueIdSchema,
+    bindingId: opaqueIdSchema,
+    bindingEpoch: positiveSafeIntegerSchema,
+    deliveryId: opaqueIdSchema,
+    providerAttempts: positiveSafeIntegerSchema,
+    state: z.enum(["dead", "outcome_unknown", "retry_wait"]),
+    retryRequested: z.boolean(),
+  })).max(500).optional(),
+  outboundPairBlocks: z.array(z.strictObject({
+    raftChannelId: opaqueIdSchema,
+    bindingId: opaqueIdSchema,
+    since: z.string().datetime({ offset: true }),
+    nextRetryAt: z.string().datetime({ offset: true }).nullable(),
+    reason: z.enum(["connection", "credentials", "configuration", "invite_app", "reauthorize", "unarchive", "check_channel"]),
+    /** Negotiated separately because older setup clients parse strict objects. */
+    action: z.literal("workspace_admin").optional(),
+    /**
+     * Why Raft cannot yet confirm whether the held message reached Slack (`reason` stays
+     * "configuration" for older clients). Negotiated separately (`?confirmationHint=1`), as `action`.
+     */
+    detail: z.enum(SLACK_PAIR_CONFIRMATION_DETAILS).optional(),
+  })).max(500).optional(),
+  /**
+   * RFC 082 §4.6: what a card message's Slack copy needs its pair's admins to
+   * know, one entry per pair and kind (deduplicated across the pair's
+   * messages): `not_confirmed` ("not confirmed in Slack", never "failed" or
+   * "synced"; a card's unknown outcome at least T old), `latest_update_not_shown`
+   * (Slack refused a card's current latest update), `updates_cannot_be_shown`
+   * (the safe fallback for a stored card message that has files anyway: a send
+   * with both is refused, so only a row stored before that, or by a path that
+   * skipped it, has them), `edit_waiting` (a card's edit is held; `reason` is
+   * its hint, as a pair block's). Each is present only while one of the pair's
+   * cards qualifies. Only pairs the viewer can see. Negotiated separately
+   * (`?cardEditNotices=1`).
+   */
+  cardEditNotices: z.array(z.strictObject({
+    raftChannelId: opaqueIdSchema,
+    bindingId: opaqueIdSchema,
+    kind: z.enum(SLACK_CARD_EDIT_NOTICE_KINDS),
+    reason: z.enum(["connection", "credentials", "configuration", "invite_app", "reauthorize", "unarchive", "check_channel"]).optional(),
+    since: z.string().datetime({ offset: true }),
+  })).max(2000).optional(),
+  /** Negotiated separately for strict clients predating verified ingress. */
+  inboundIsolated: z.array(z.strictObject({
+    raftChannelId: opaqueIdSchema,
+    bindingId: opaqueIdSchema,
+    bindingEpoch: positiveSafeIntegerSchema,
+    eventId: opaqueIdSchema,
+    reason: z.string().regex(/^[a-z][a-z0-9_]{0,159}$/u),
+    firstFailureAt: z.string().datetime({ offset: true }).nullable(),
+    heldAt: z.string().datetime({ offset: true }).nullable(),
+  })).max(500).optional(),
+  inboundIsolatedSummary: z.strictObject({
+    count: z.number().int().nonnegative().safe(),
+    oldestFirstFailureAt: z.string().datetime({ offset: true }).nullable(),
+    undisplayed: z.number().int().nonnegative().safe(),
+  }).optional(),
+  inboundIsolatedGroups: z.array(z.strictObject({
+    raftChannelId: opaqueIdSchema,
+    bindingId: opaqueIdSchema,
+    bindingEpoch: positiveSafeIntegerSchema,
+    reason: z.string().regex(/^[a-z][a-z0-9_]{0,159}$/u),
+    count: z.number().int().positive().safe(),
+  })).max(5000).optional(),
   failingSurface: z.enum([
     "install",
     "credential",
@@ -133,6 +223,7 @@ export const slackBridgeRawHealthSchema = lazySchema("slackBridgeRawHealthSchema
     "audience",
     "connection",
     "scope",
+    "delivery",
   ]).nullable(),
 }).superRefine((health, ctx) => {
   const bindingIds = new Set<string>();
@@ -155,10 +246,27 @@ export const slackBridgeRawHealthSchema = lazySchema("slackBridgeRawHealthSchema
     }
     audienceBindingIds.add(bindingId);
   }
+  const isolatedIds = new Set<string>();
+  for (const [index, group] of (health.inboundIsolatedGroups ?? []).entries()) {
+    if (!health.bindings.some(row => row.id === group.bindingId && row.bindingEpoch === group.bindingEpoch)) {
+      ctx.addIssue({ code: "custom", path: ["inboundIsolatedGroups", index, "bindingId"], message: "Held group must reference a returned binding epoch" });
+    }
+  }
+  for (const [index, event] of (health.inboundIsolated ?? []).entries()) {
+    const binding = health.bindings.find((row) => row.id === event.bindingId);
+    if (!binding || binding.bindingEpoch !== event.bindingEpoch) {
+      ctx.addIssue({ code: "custom", path: ["inboundIsolated", index, "bindingId"], message: "Held event must reference a returned binding epoch" });
+    }
+    if (isolatedIds.has(event.eventId)) {
+      ctx.addIssue({ code: "custom", path: ["inboundIsolated", index, "eventId"], message: "Held event ids must be unique" });
+    }
+    isolatedIds.add(event.eventId);
+  }
 }));
 
 export const slackBridgeSetupSnapshotSchema = lazySchema("slackBridgeSetupSnapshotSchema", () => z.strictObject({
   stage: z.enum(SLACK_BRIDGE_SETUP_STAGES),
+  needsSlackReauthorization: z.boolean().optional(),
   workspaceName: z.string().trim().min(1).max(200).nullable(),
   raftChannels: z.array(z.strictObject({
     id: opaqueIdSchema,
@@ -186,7 +294,7 @@ export const slackBridgeSetupSnapshotSchema = lazySchema("slackBridgeSetupSnapsh
     }
   }),
   preflight: slackBridgePreflightSchema.nullable(),
-  rawHealth: slackBridgeRawHealthSchema,
+  rawHealth: slackBridgeRawHealthSchema.nullable(),
 }).superRefine((snapshot, ctx) => {
   const raftChannelIds = new Set<string>();
   for (let index = 0; index < snapshot.raftChannels.length; index += 1) {
@@ -281,3 +389,4 @@ export type SlackBridgeProvisioningResponse = z.infer<typeof slackBridgeProvisio
 export type SlackBridgeChannelPairsRequest = z.infer<typeof slackBridgeChannelPairsRequestSchema>;
 export type SlackBridgeChannelPairRemovalsRequest = z.infer<typeof slackBridgeChannelPairRemovalsRequestSchema>;
 export type SlackBridgeOAuthStartResponse = z.infer<typeof slackBridgeOAuthStartResponseSchema>;
+

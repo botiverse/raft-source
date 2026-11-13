@@ -3,15 +3,15 @@ import { useIntl } from "react-intl";
 import type { IntlShape } from "react-intl";
 import {
   AlertTriangle,
-  CheckSquare,
+  ListTodo,
   Hash,
   Link as LinkIcon,
-  MessageSquare,
   OctagonAlert,
   Plus,
   Trash2,
 } from "lucide-react";
-import { Button, Card, InlineCode, Status, TaskStatusBadge } from "@botiverse/raft-ui";
+import { Button, Card, InlineCode, ScrollArea, Status, TaskStatusBadge } from "@botiverse/raft-ui";
+import { MessageIcon } from "@botiverse/ricons";
 import AvatarSlot from "../components/ui/AvatarSlot";
 import SectionEyebrow from "../components/ui/SectionEyebrow";
 
@@ -42,7 +42,9 @@ type TokenSwatch = {
 };
 
 const COLOR_FAMILY: readonly TokenSwatch[] = [
-  { name: "yellow", token: "--brand-400", utility: "bg-brand", note: "You: the frame, where you are, what you selected, @you, a search hit, your workspace tile. Never a button or a wash.", soft: { token: "--brand-soft", utility: "bg-brand-soft" } },
+  { name: "yellow", token: "--brand-400", utility: "bg-brand", note: "Brand: the frame, the channel you are in, your workspace tile. A theme may gray it (Boring Gray); where you are and what you selected use selected, @you and a search hit use you. Never a button or a wash.", soft: { token: "--brand-soft", utility: "bg-brand-soft" } },
+  { name: "selected", token: "--selected", utility: "bg-selected", note: "Where you are and what is on: the selected sidebar row, a segment, a tab, a switch, the current step, the picked option. Yellow in every theme." },
+  { name: "you", token: "--you", utility: "bg-you", note: "Addressed to you: a mention of you, the @ marker, a search hit, the comment you opened. Yellow in every theme." },
   { name: "pink", token: "--attention-400", utility: "bg-attention", note: "Do it: the one primary button per screen, unread counts, attention dots.", soft: { token: "--attention-soft", utility: "bg-attention-soft" } },
   { name: "cyan", token: "--info", utility: "bg-info", note: "Info: In Progress, runtime tags, external agents; cyan-soft is the selected item in a content list.", soft: { token: "--info-soft", utility: "bg-info-soft" } },
   { name: "lime", token: "--success", utility: "bg-success", note: "Success: online, Done, saved.", soft: { token: "--success-soft", utility: "bg-success-soft" } },
@@ -87,7 +89,7 @@ function Section({ title, eyebrow, children }: { title: string; eyebrow?: string
         )}
         <h2 className="text-title">{title}</h2>
       </header>
-      <div className="space-y-6">{children}</div>
+      <div className="stack-y-6">{children}</div>
     </section>
   );
 }
@@ -149,7 +151,7 @@ function TokenRow({ swatch }: { swatch: TokenSwatch }) {
       {samples ? (
         <div>
           <SectionEyebrow as="div" className="mb-2">{formatMessage({ id: "pages.paletteAudit.realComponentsPrefix" })} {swatch.name}</SectionEyebrow>
-          <div className="space-y-1">{samples}</div>
+          <div className="stack-y-1">{samples}</div>
         </div>
       ) : null}
     </Card>
@@ -170,10 +172,10 @@ function realComponentsFor(
                 S
               </span>
               <span className="inline-flex size-10 items-center justify-center rounded-control border-[1.5px] border-line-frame-active bg-layer-frame-active text-foreground-on-frame-active">
-                <MessageSquare size={20} />
+                <MessageIcon width={20} height={20} />
               </span>
               <span className="inline-flex size-10 items-center justify-center rounded-control text-foreground-on-frame">
-                <CheckSquare size={20} />
+                <ListTodo size={20} />
               </span>
             </div>
           </Sample>
@@ -185,7 +187,7 @@ function realComponentsFor(
           </Sample>
 
           <Sample source="Sidebar — selected row">
-            <span className={`inline-flex h-9 items-center gap-2 rounded-control border-[1.5px] border-sticker-ink bg-brand pl-2 pr-2.5 text-subhead font-bold text-sticker-ink`}>
+            <span className={`inline-flex h-9 items-center gap-2 rounded-control border-[1.5px] border-sticker-ink bg-selected pl-2 pr-2.5 text-subhead font-bold text-sticker-ink`}>
               <Hash size={16} />
               <span>general</span>
             </span>
@@ -193,7 +195,7 @@ function realComponentsFor(
 
           <Sample source="Message — @you">
             <span className="text-body">
-              <span className="rounded-sticker bg-brand px-[3px] font-semibold text-sticker-ink shadow-[inset_0_0_0_1.5px_var(--sticker-ink)]">@stdrc</span>{" "}
+              <span className="rounded-sticker bg-you px-[3px] font-semibold text-sticker-ink shadow-[inset_0_0_0_1.5px_var(--sticker-ink)]">@stdrc</span>{" "}
               <span className="text-foreground-muted">{formatMessage({ id: "pages.paletteAudit.sampleRiskyMessage" })}</span>
             </span>
           </Sample>
@@ -201,11 +203,11 @@ function realComponentsFor(
           <Sample source="Menu — hover / keyboard highlight (yellow-soft)">
             <div className="w-60 rounded-container bg-layer-popover p-1 shadow-float ring-1 ring-line-seam">
               <div className="flex h-9 items-center gap-2 rounded-control bg-brand-soft px-2.5 text-callout font-medium text-foreground">
-                <span>Hover Me</span>
+                <span>Hover me</span>
               </div>
               <div className="flex h-9 items-center gap-2 rounded-control px-2.5 text-callout font-medium text-foreground">
                 <Plus size={16} className="text-foreground-muted" />
-                <span>Switch or Create Server</span>
+                <span>Switch or create server</span>
               </div>
             </div>
           </Sample>
@@ -229,11 +231,11 @@ function realComponentsFor(
           <Sample source="Button — the screen's one primary action">
             <Button variant="accent" size="lg">
               <Plus size={18} />
-              <span>Add Machine</span>
+              <span>Add machine</span>
             </Button>
-            <Button variant="accent" size="sm">
+            <Button variant="accent" size="md">
               <Plus size={16} />
-              <span>New Task</span>
+              <span>New task</span>
             </Button>
           </Sample>
 
@@ -346,16 +348,16 @@ function realComponentsFor(
           <Sample source="Button — irreversible (red sticker, ink type)">
             <Button variant="danger" size="lg">
               <Trash2 size={18} />
-              <span>Delete Agent</span>
+              <span>Delete agent</span>
             </Button>
-            <Button variant="danger" size="sm">
+            <Button variant="danger" size="md">
               <Trash2 size={16} />
-              <span>Delete Computer</span>
+              <span>Delete computer</span>
             </Button>
           </Sample>
 
           <Sample source="Dialog — the consequence, then the confirm">
-            <div className="w-80 space-y-3 rounded-dialog bg-layer-popover p-5 shadow-float ring-1 ring-line-seam">
+            <div className="w-80 stack-y-3 rounded-dialog bg-layer-popover p-5 shadow-float ring-1 ring-line-seam">
               <div className="flex items-start gap-2 rounded-container border border-line-hairline bg-danger-soft p-3 text-callout text-foreground">
                 <OctagonAlert size={18} className="mt-px shrink-0" />
                 <span>This will remove all associated data and cannot be undone.</span>
@@ -370,7 +372,7 @@ function realComponentsFor(
 
           <Sample source="TextField — invalid (danger-strong ink)">
             <div className="flex w-80 flex-col gap-1.5">
-              <span className="flex h-11 items-center rounded-control border-[1.5px] border-danger-strong bg-layer-card px-3" aria-hidden="true" />
+              <span className="flex h-control items-center rounded-control border border-danger-strong bg-layer-card px-3" aria-hidden="true" />
               <span className="text-caption font-semibold text-danger-strong">Title cannot be empty.</span>
             </div>
           </Sample>
@@ -406,7 +408,7 @@ function realComponentsFor(
 export default function PaletteAuditPage() {
   const { formatMessage } = useIntl();
   return (
-    <div className="min-h-screen w-full overflow-y-auto bg-layer-canvas font-display text-foreground">
+    <ScrollArea className="min-h-screen w-full bg-layer-canvas font-display text-foreground">
       <div className="mx-auto max-w-5xl px-4 py-10 sm:px-6">
         <header className="mb-10 border-b border-line-seam pb-6">
           <div className="mb-1 font-mono text-mono-meta text-foreground-hint">
@@ -434,6 +436,6 @@ export default function PaletteAuditPage() {
           ))}
         </Section>
       </div>
-    </div>
+    </ScrollArea>
   );
 }

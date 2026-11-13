@@ -5,7 +5,7 @@ import {
   declaredAnimationClasses,
   findOrphans,
   isConsumerFile,
-} from "../scripts/check-orphan-animations.mjs";
+} from "../scripts/check-orphan-animations";
 
 const tsx = (text: string) => ({ path: "/repo/packages/web/src/components/Thing.tsx", text });
 

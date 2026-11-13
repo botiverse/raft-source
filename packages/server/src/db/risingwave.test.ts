@@ -128,12 +128,12 @@ function rwNotFound(relation: string) {
   );
 }
 
-test("unified chain transition: a missing 077 view is read from its 076 counterpart, and remembered for a minute", async () => {
+test("unified chain transition: a missing 078 view is read from its 077 counterpart, and remembered for a minute", async () => {
   __testUnifiedChainTransition.reset();
   try {
     let clock = 1_000_000;
     const now = () => clock;
-    const built = new Set(["rw_inbox_serving_v7", "rw_activity_totals_v5", "rw_agent_inbox_v5", "rw_conversation_unread_v2"]);
+    const built = new Set(["rw_inbox_serving_v8", "rw_activity_totals_v6", "rw_agent_inbox_v6", "rw_conversation_unread_v3"]);
     const ran: string[] = [];
     const run = async (text: string) => {
       ran.push(text);
@@ -147,34 +147,42 @@ test("unified chain transition: a missing 077 view is read from its 076 counterp
 
     assert.equal(
       await withUnifiedChainTransition(query, run, onFallback, now),
-      "SELECT 1 FROM rw_inbox_serving_v7 i WHERE i.receiver_id = $1",
+      "SELECT 1 FROM rw_inbox_serving_v8 i WHERE i.receiver_id = $1",
     );
-    assert.equal(ran.length, 2, "the 077 view is tried first, then 076");
-    assert.deepEqual(fallbacks, [["rw_inbox_serving_v8"]]);
+    assert.equal(ran.length, 2, "the 078 view is tried first, then 077");
+    assert.deepEqual(fallbacks, [["rw_inbox_serving_v9"]]);
 
-    // Within the minute: straight to 076, no failed round-trip.
+    // Within the minute: straight to 077, no failed round-trip and no new report.
     ran.length = 0;
     await withUnifiedChainTransition(query, run, onFallback, now);
-    assert.deepEqual(ran, ["SELECT 1 FROM rw_inbox_serving_v7 i WHERE i.receiver_id = $1"]);
+    assert.deepEqual(ran, ["SELECT 1 FROM rw_inbox_serving_v8 i WHERE i.receiver_id = $1"]);
+    assert.equal(fallbacks.length, 1, "a remembered fallback is not reported again");
 
-    // After the minute, with 077 built: back on 077.
-    built.add("rw_inbox_serving_v8");
+    // After the minute, still unbuilt: one failed round-trip and one report.
+    clock += 60_001;
+    ran.length = 0;
+    await withUnifiedChainTransition(query, run, onFallback, now);
+    assert.equal(ran.length, 2);
+    assert.equal(fallbacks.length, 2);
+
+    // After the minute, with 078 built: back on 078.
+    built.add("rw_inbox_serving_v9");
     clock += 60_001;
     ran.length = 0;
     await withUnifiedChainTransition(query, run, onFallback, now);
     assert.deepEqual(ran, [query]);
-    assert.equal(fallbacks.length, 2);
+    assert.equal(fallbacks.length, 2, "reading the current view is not a fallback");
   } finally {
     __testUnifiedChainTransition.reset();
   }
 });
 
-test("unified chain transition: with neither 077 nor 076 built, serving and totals fall back two generations to 068", async () => {
+test("unified chain transition: with neither 078 nor 077 built, serving and totals fall back two generations to 076", async () => {
   __testUnifiedChainTransition.reset();
   try {
     let clock = 2_000_000;
     const now = () => clock;
-    const built = new Set(["rw_inbox_serving_v6", "rw_activity_totals_v4"]);
+    const built = new Set(["rw_inbox_serving_v7", "rw_activity_totals_v5"]);
     const ran: string[] = [];
     const run = async (text: string) => {
       ran.push(text);
@@ -188,17 +196,17 @@ test("unified chain transition: with neither 077 nor 076 built, serving and tota
 
     assert.equal(
       await withUnifiedChainTransition(query, run, onFallback, now),
-      "SELECT 1 FROM rw_inbox_serving_v6 i JOIN rw_activity_totals_v4 t ON true",
+      "SELECT 1 FROM rw_inbox_serving_v7 i JOIN rw_activity_totals_v5 t ON true",
     );
-    assert.deepEqual(reported.at(-1), [
-      ["rw_inbox_serving_v8", "rw_activity_totals_v6"],
-      ["rw_inbox_serving_v6", "rw_activity_totals_v4"],
-    ]);
+    assert.deepEqual(reported, [[
+      ["rw_inbox_serving_v9", "rw_activity_totals_v7"],
+      ["rw_inbox_serving_v7", "rw_activity_totals_v5"],
+    ]], "one report, for the generation that answered");
 
-    // Within the minute: straight to 068, one round-trip.
+    // Within the minute: straight to 076, one round-trip.
     ran.length = 0;
     await withUnifiedChainTransition(query, run, onFallback, now);
-    assert.deepEqual(ran, ["SELECT 1 FROM rw_inbox_serving_v6 i JOIN rw_activity_totals_v4 t ON true"]);
+    assert.deepEqual(ran, ["SELECT 1 FROM rw_inbox_serving_v7 i JOIN rw_activity_totals_v5 t ON true"]);
 
     // No generation left: the missing-relation error surfaces instead of looping.
     __testUnifiedChainTransition.reset();
@@ -213,9 +221,60 @@ test("unified chain transition: with neither 077 nor 076 built, serving and tota
       withUnifiedChainTransition(query, run, onFallback, now),
       (error: unknown) => error instanceof UnifiedChainViewUnavailableError
         && error.view === UNIFIED_CHAIN_VIEWS.serving
-        && /rw_inbox_serving_v8, rw_inbox_serving_v7, rw_inbox_serving_v6/.test(error.message),
+        && /rw_inbox_serving_v9, rw_inbox_serving_v8, rw_inbox_serving_v7$/.test(error.message),
     );
     assert.deepEqual(ran, [], "no query is sent once every generation is known missing");
+  } finally {
+    __testUnifiedChainTransition.reset();
+  }
+});
+
+test("unified chain transition: a query builder reads a current-generation-only column only when the view resolved to it", async () => {
+  __testUnifiedChainTransition.reset();
+  try {
+    let clock = 3_000_000;
+    const now = () => clock;
+    const built = new Set(["rw_inbox_serving_v8"]);
+    const ran: string[] = [];
+    const run = async (text: string) => {
+      ran.push(text);
+      const missing = [...text.matchAll(/\b(rw_[a-z0-9_]+)\b/g)].map((m) => m[1]!).find((name) => !built.has(name));
+      if (missing) throw rwNotFound(missing);
+      return text;
+    };
+    const resolvedTo: string[] = [];
+    const query = (resolved: (view: string) => string) => {
+      const servingView = resolved(UNIFIED_CHAIN_VIEWS.serving);
+      resolvedTo.push(servingView);
+      const anchor = servingView === UNIFIED_CHAIN_VIEWS.serving ? "i.first_mention_message_id" : "NULL";
+      // Named by its current name: rewritten like a plain text.
+      return `SELECT ${anchor} AS a FROM ${UNIFIED_CHAIN_VIEWS.serving} i`;
+    };
+
+    // 078 unbuilt: the builder is asked again with 077's name and projects NULL.
+    assert.equal(await withUnifiedChainTransition(query, run, () => {}, now), "SELECT NULL AS a FROM rw_inbox_serving_v8 i");
+    assert.deepEqual(ran, [
+      "SELECT i.first_mention_message_id AS a FROM rw_inbox_serving_v9 i",
+      "SELECT NULL AS a FROM rw_inbox_serving_v8 i",
+    ]);
+    assert.equal(resolvedTo.at(-1), "rw_inbox_serving_v8", "the last build is the text that ran");
+
+    // 078 built (after the memo): the column is read from v9.
+    built.add("rw_inbox_serving_v9");
+    clock += 60_001;
+    ran.length = 0;
+    assert.equal(
+      await withUnifiedChainTransition(query, run, () => {}, now),
+      "SELECT i.first_mention_message_id AS a FROM rw_inbox_serving_v9 i",
+    );
+    assert.equal(ran.length, 1);
+    assert.equal(resolvedTo.at(-1), UNIFIED_CHAIN_VIEWS.serving);
+
+    // A builder naming no chain view runs once, with views resolved to themselves.
+    assert.equal(
+      await withUnifiedChainTransition((resolved) => `SELECT 1 FROM ${resolved("rw_messages")}`, async (text) => text),
+      "SELECT 1 FROM rw_messages",
+    );
   } finally {
     __testUnifiedChainTransition.reset();
   }

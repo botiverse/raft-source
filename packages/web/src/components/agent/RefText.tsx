@@ -8,6 +8,8 @@ import {
   CHANNEL_REF_NAME_PATTERN,
   THREAD_SHORT_ID_PATTERN,
   DM_REF_PEER_PATTERN,
+  createChannelTaskRefRegex,
+  createDmTaskRefRegex,
 } from "../../utils/messageReferencePatterns";
 import type { MessageId } from "../../i18n/messages";
 
@@ -24,8 +26,9 @@ import type { MessageId } from "../../i18n/messages";
 // ref regexes (longest form first so `#c:shortid` isn't shadowed by `#c`).
 // ---------------------------------------------------------------------------
 
-// channel-thread | dm-thread | channel | dm  (alternation order = priority,
-// longest form first so `#c:shortid` isn't shadowed by `#c`).
+// channel-task | dm-task | channel-thread | dm-thread | channel | dm
+// (alternation order = priority, longest form first so `#c/7` and
+// `#c:shortid` aren't shadowed by `#c`).
 //
 // Built from the SAME exported grammar constants the messageReferencePatterns
 // factories use — one grammar source feeding both the message-body renderer
@@ -33,7 +36,9 @@ import type { MessageId } from "../../i18n/messages";
 // reintroduces the chat/activity drift this shared seam exists to kill
 // (@Bugen review 2026-05-18 #proj-uiux:2921feaf).
 const SCAN = new RegExp(
-  `#(${CHANNEL_REF_NAME_PATTERN}):(${THREAD_SHORT_ID_PATTERN})` +
+  `${createChannelTaskRefRegex().source}` +
+    `|${createDmTaskRefRegex().source}` +
+    `|#(${CHANNEL_REF_NAME_PATTERN}):(${THREAD_SHORT_ID_PATTERN})` +
     `|dm:@(${DM_REF_PEER_PATTERN}):(${THREAD_SHORT_ID_PATTERN})` +
     `|#(${CHANNEL_REF_NAME_PATTERN})` +
     `|dm:@(${DM_REF_PEER_PATTERN})`,
@@ -41,10 +46,12 @@ const SCAN = new RegExp(
 );
 
 function partsFromMatch(m: RegExpExecArray): RefParts {
-  if (m[1] !== undefined) return { channelName: m[1], threadShortId: m[2] };
-  if (m[3] !== undefined) return { dmPeer: m[3], threadShortId: m[4] };
-  if (m[5] !== undefined) return { channelName: m[5] };
-  return { dmPeer: m[6] };
+  if (m[1] !== undefined) return { channelName: m[1], taskNumber: Number(m[2]) };
+  if (m[3] !== undefined) return { dmPeer: m[3], taskNumber: Number(m[4]) };
+  if (m[5] !== undefined) return { channelName: m[5], threadShortId: m[6] };
+  if (m[7] !== undefined) return { dmPeer: m[7], threadShortId: m[8] };
+  if (m[9] !== undefined) return { channelName: m[9] };
+  return { dmPeer: m[10] };
 }
 
 /** Surface a thread-unavailable notice up to AgentActivityLog. Default no-op
@@ -65,7 +72,8 @@ export function ThreadRefNoticeProvider({
 
 function RefToken({ resolved }: { resolved: ResolvedRef }) {
   const [busy, setBusy] = useState(false);
-  const isThread = resolved.kind === "channel-thread" || resolved.kind === "dm-thread";
+  // Thread and task refs open a conversation in place (link); channel/DM refs navigate (accent).
+  const variant = resolved.kind === "channel" || resolved.kind === "dm" ? "accent" : "link";
 
   // Reuse the exact chat ref affordance recipe — no new link visual language.
   // Thread refs = cyan (matches MessageItem thread refs), channel/DM = pink
@@ -87,7 +95,7 @@ function RefToken({ resolved }: { resolved: ResolvedRef }) {
 
   return (
     <MessageReferenceChip
-      variant={isThread ? "link" : "accent"}
+      variant={variant}
       render={
         <a href="#" >
           {resolved.label}
@@ -95,11 +103,10 @@ function RefToken({ resolved }: { resolved: ResolvedRef }) {
       role="link"
       aria-busy={busy}
       onClick={onClick}
-      // In-message refs are the explicit arrow-cursor exception to the app's
-      // link-hand control contract. Busy state = dim + non-interactive, no
-      // spinner in the mono row (locked with @Bugen).
-      className={`cursor-default ${busy ? "pointer-events-none opacity-60" : ""
-        }`}
+      // Clickable refs keep the recipe's pointer (clickable-affordance
+      // contract). Busy state = dim + non-interactive, no spinner in the mono
+      // row (locked with @Bugen).
+      className={busy ? "pointer-events-none opacity-60" : undefined}
     />
   );
 }
@@ -135,7 +142,7 @@ export function linkifyRefs(text: string, ctx: RefNavContext): ReactNode[] {
 
 /**
  * Drop-in replacement for a plain `{text}` slot in the Activity Diagnostics
- * renderers. Linkifies channel / thread / DM target refs.
+ * renderers. Linkifies channel / thread / DM / task target refs.
  */
 export function RefText({ text }: { text: string }) {
   const onNotice = useContext(ThreadRefNoticeContext);

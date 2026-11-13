@@ -1,3 +1,4 @@
+import { handlerTraceEvents } from "../test/handlerTraceEvents";
 import { tokenForHuman } from "../test/integration/credentials";
 import { fixturePasswordHash } from "../test/integration/credentials";
 import { createApiTest } from "../test/integration/apiTest";
@@ -31,15 +32,17 @@ import {
   recordInboxNotificationFacts
 } from "../services/inboxNotificationService";
 import { registerMachine } from "../services/machineService";
-import { assignMachine } from "../services/agentService";
+import { placeAgentOnMachine } from "../test/agentMachineFixture";
 import {
   __resetOnboardingServiceDepsForTests,
   __setOnboardingServiceDepsForTests,
   triggerAllChannelUnlockOnboarding,
 } from "../services/onboardingService";
 import { createServer, installFakeIo, headers, seedUser } from "./channels.api.fixtures";
+import { revealAllChannelForTest } from "../test/allChannelFixture";
+import { insertAttachmentsWithObjects } from "../test/attachmentObjectFixture";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 
 test("member channel creator gains local admin edit but not server-only delete authority", async ({ app }) => {
@@ -137,7 +140,7 @@ test("GET /api/channels/dm records DM list phases and constant query shape", asy
   );
   assert.ok(span, "expected GET /api/channels/dm root span");
 
-  const processEventNames = span.events
+  const processEventNames = handlerTraceEvents(span.events)
     .map((event) => event.name)
     .filter((name) => name !== "db.query.finished");
   assert.deepEqual(processEventNames, [
@@ -147,7 +150,7 @@ test("GET /api/channels/dm records DM list phases and constant query shape", asy
     "http.response.finished",
   ]);
 
-  const dbEvents = span.events.filter((event) => event.name === "db.query.finished");
+  const dbEvents = handlerTraceEvents(span.events).filter((event) => event.name === "db.query.finished");
   assert.deepEqual(
     dbEvents.map((event) => event.attrs?.query_name).sort(),
     [
@@ -222,7 +225,7 @@ test("agent-to-agent DMs are not readable through human channel and attachment r
 
   const secretMessage = await createMessage(dm.id, "agent", agentA.id, "agent private transcript");
   const attachmentId = "00000000-0000-4000-8000-00000000a2ad";
-  await db.insert(attachments).values({
+  await insertAttachmentsWithObjects(db, {
     id: attachmentId,
     messageId: secretMessage.id,
     channelId: dm.id,
@@ -327,7 +330,7 @@ test("saved message list re-checks private channel membership", async ({ app, se
   });
   assert.equal(ownerSave.status, 200);
 
-  await removeHuman(privateChannel.id, member.id);
+  await removeHuman(privateChannel.id, member.id, { self: true });
 
   const hiddenMessages = await fetch(`${app.baseUrl}/api/messages/channel/${privateChannel.id}`, {
     headers: memberHeaders,
@@ -420,6 +423,44 @@ test("POST /api/channels/dm hides newly-created user DM for passive peer only", 
   assert.deepEqual(peerAfterReopen?.hiddenDmIds ?? [], [], "opening an existing DM must not re-hide it for the peer");
 });
 
+// Task #59 (Artea): the passive peer's DM stayed hidden after they replied, so
+// it only showed in Home once the other person wrote again. A reply reopens it,
+// through the composer's own send (randomId).
+test("replying in a DM that was hidden for you reopens it; the other person's message does not", async ({ app }) => {
+  const db = getDb();
+  const owner = await seedUser("dm-reply-owner@slock.test", "dm-reply-owner");
+  const peer = await seedUser("dm-reply-peer@slock.test", "dm-reply-peer");
+  const server = await createServer("DM Reply Server", "dm-reply-server", owner.id);
+  await addMember(server.id, peer.id);
+  const ownerToken = await tokenForHuman(owner.email);
+  const peerToken = await tokenForHuman(peer.email);
+  const createRes = await fetch(`${app.baseUrl}/api/channels/dm`, {
+    method: "POST",
+    headers: headers(ownerToken, server.id),
+    body: JSON.stringify({ userId: peer.id }),
+  });
+  const dm = await createRes.json() as { id: string };
+  const send = async (token: string, content: string) => {
+    const res = await fetch(`${app.baseUrl}/api/messages`, {
+      method: "POST",
+      headers: headers(token, server.id),
+      body: JSON.stringify({ channelId: dm.id, content, randomId: `rnd-${content}` }),
+    });
+    assert.equal(res.status, 200, await res.clone().text());
+  };
+  const hiddenFor = async (userId: string) => (await db
+    .select({ hiddenDmIds: serverMembers.hiddenDmIds })
+    .from(serverMembers)
+    .where(and(eq(serverMembers.serverId, server.id), eq(serverMembers.userId, userId))))[0]?.hiddenDmIds ?? [];
+
+  await send(ownerToken, "hi-there");
+  assert.deepEqual(await hiddenFor(peer.id), [dm.id], "the other person's message leaves it to unread");
+
+  await send(peerToken, "hello-back");
+  assert.deepEqual(await hiddenFor(peer.id), [], "the reply reopens it for the replier");
+  assert.deepEqual(await hiddenFor(owner.id), []);
+});
+
 
 test("POST /api/channels/dm cannot bypass a hidden human directory with a known user id", async ({ app }) => {
   const db = getDb();
@@ -442,7 +483,7 @@ test("POST /api/channels/dm cannot bypass a hidden human directory with a known 
 
   const blocked = await openDm(hiddenPeer.id);
   assert.equal(blocked.status, 404);
-  assert.deepEqual(await blocked.json(), { error: "DM target not found" });
+  assert.deepEqual(await blocked.json(), { error: "DM target not found", code: "dm_target_not_found" });
 
   const selfDm = await openDm(requester.id);
   assert.equal(selfDm.status, 200, "hidden-directory policy must not block self-DM");
@@ -475,6 +516,7 @@ test("message payload carries authoritative sender membership status", async ({ 
   }).returning();
 
   const server = await createServer("Membership Status Server", "membership-status", owner.id);
+  await revealAllChannelForTest(server.id);
   await addMember(server.id, newcomer.id);
 
   const [allChannel] = await db
@@ -858,6 +900,7 @@ test("channel visibility conversion requires manageChannels and hides/restores s
   const activeNewcomer = await seedUser("visibility-guard-active-newcomer@slock.test", "visibility-guard-active-newcomer");
   const hiddenNewcomer = await seedUser("visibility-guard-hidden-newcomer@slock.test", "visibility-guard-hidden-newcomer");
   const server = await createServer("Visibility Guard Server", "visibility-guard-server", owner.id);
+  await revealAllChannelForTest(server.id);
   await addMember(server.id, member.id);
   const channel = await createChannel(server.id, "guard-room");
   await addHuman(channel.id, member.id);
@@ -892,13 +935,13 @@ test("channel visibility conversion requires manageChannels and hides/restores s
   assert.equal(channelsRes.status, 200);
   const allChannel = (await channelsRes.json() as Array<{ id: string; name: string; joined: boolean }>).find((item) => item.name === "all");
   assert.ok(allChannel);
-  assert.equal(allChannel.joined, true, "virtual #all should render joined without channel membership rows");
+  assert.equal(allChannel.joined, true, "#all renders joined");
 
   let allHumanRows = await getDb()
     .select({ userId: channelHumans.userId })
     .from(channelHumans)
     .where(eq(channelHumans.channelId, allChannel.id));
-  assert.equal(allHumanRows.length, 0, "active #all must not persist human membership rows");
+  assert.deepEqual(allHumanRows.map((row) => row.userId).sort(), [owner.id, member.id].sort(), "an enabled #all keeps a row per non-guest member (#triage:64b44a12)");
 
   await addMember(server.id, activeNewcomer.id);
   const activeAgent = await createAgent(server.id, "active-all-agent", { runtime: "codex" });
@@ -911,7 +954,7 @@ test("channel visibility conversion requires manageChannels and hides/restores s
     .select({ userId: channelHumans.userId })
     .from(channelHumans)
     .where(eq(channelHumans.channelId, allChannel.id));
-  assert.equal(allHumanRows.length, 0, "server join must not persist #all human membership rows");
+  assert.deepEqual(allHumanRows.map((row) => row.userId).sort(), [owner.id, member.id, activeNewcomer.id].sort(), "joining the server adds the newcomer's #all row");
   assert.equal(await canUserPostToChannel(allChannel.id, activeNewcomer.id), true, "server humans should be able to post to virtual #all");
   assert.equal(await canAgentPostToChannel(allChannel.id, activeAgent.id), true, "server agents should be able to post to virtual #all");
 
@@ -1018,13 +1061,13 @@ test("channel visibility conversion requires manageChannels and hides/restores s
     .select({ agentId: channelAgents.agentId })
     .from(channelAgents)
     .where(eq(channelAgents.channelId, allChannel.id));
-  assert.equal(allHumanRows.length, 0, "restored #all must remain virtual for humans");
+  assert.deepEqual(allHumanRows.map((row) => row.userId).sort(), [owner.id, member.id, activeNewcomer.id, hiddenNewcomer.id].sort(), "restoring #all gives every non-guest member a row again");
   assert.equal(allAgentRows.length, 0, "restored #all must remain virtual for agents");
 });
 
 
 test("manually hidden #all does not auto-reveal from onboarding unlock after member growth", async () => {
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: true });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const owner = await seedUser("manual-hidden-all-owner@slock.test", "manual-hidden-all-owner");
     const teammate = await seedUser("manual-hidden-all-teammate@slock.test", "manual-hidden-all-teammate");
@@ -1084,7 +1127,7 @@ test("manually hidden #all does not auto-reveal from onboarding unlock after mem
 // grew via humans (1 agent + N humans stayed hidden). The pinned rule is total
 // members (humans + agents) >= 3, so a 2nd human is also a valid unlock trigger.
 test("opener-world hidden #all auto-reveals when a 3rd member is a human", async () => {
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: true });
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   __setOnboardingServiceDepsForTests({ broadcastSystemMessage: async () => undefined as never });
   try {
     const owner = await seedUser("opener-human-unlock-owner@slock.test", "opener-human-unlock-owner");
@@ -1278,7 +1321,7 @@ test("private channel remains active with an agent member and soft-deletes after
   await addHuman(privateChannel.id, owner.id);
   await addAgent(privateChannel.id, agent.id);
 
-  await removeHuman(privateChannel.id, owner.id);
+  await removeHuman(privateChannel.id, owner.id, { self: true });
 
   const [stillActive] = await db
     .select({ deletedAt: channels.deletedAt })
@@ -1527,6 +1570,7 @@ test("attempting to remove an agent from #all writes no membership system messag
   const db = getDb();
   const owner = await seedUser("all-remove-notice-owner@slock.test", "all-remove-notice-owner");
   const server = await createServer("All Remove Notice Server", "all-remove-notice-server", owner.id);
+  await revealAllChannelForTest(server.id);
   const [allChannel] = await db
     .select()
     .from(channels)
@@ -1699,6 +1743,7 @@ test("GET /channels/:id/members shows community admins in #all when human direct
     const member = await seedUser(`hidden-${slug}-member@slock.test`, `hidden-${slug}-member`);
     const other = await seedUser(`hidden-${slug}-other@slock.test`, `hidden-${slug}-other`);
     const server = await createServer(`Hidden ${slug}`, slug, owner.id);
+    await revealAllChannelForTest(server.id);
     await db.update(serversTable).set({ hideHumansFromMembers: true }).where(eq(serversTable.id, server.id));
     await db.insert(serverMembers).values([
       { serverId: server.id, userId: admin.id, role: "admin" },
@@ -1751,7 +1796,7 @@ test("legacy agent channel-members and server info respect hidden human director
 
   const agent = await createAgent(server.id, "legacy-hidden-agent", { runtime: "codex" });
   const { machine, apiKey } = await registerMachine(server.id, owner.id, "legacy-hidden-directory-machine");
-  await assignMachine(agent.id, machine.id);
+  await placeAgentOnMachine(agent.id, machine.id);
 
   const memberList = await fetch(
     `${app.baseUrl}/internal/agent/${agent.id}/channel-members?channel=${encodeURIComponent("#all")}`,

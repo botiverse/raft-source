@@ -9,6 +9,23 @@ test("inbox variant aliases resolve to the inbox doc", async () => {
   }
 });
 
+test("the renamed what-raft-doesnt-have topic still answers to its old Slock id and paths", async () => {
+  for (const topic of [
+    "what-raft-doesnt-have",
+    "agent-knowledge/what-raft-doesnt-have",
+    "/agent-knowledge/cross-cutting/what-raft-doesnt-have",
+    "what-slock-doesnt-have",
+    "agent-knowledge/what-slock-doesnt-have",
+    "manual/agent-knowledge/what-slock-doesnt-have",
+    "/agent-knowledge/cross-cutting/what-slock-doesnt-have",
+    "docs/agent-knowledge/cross-cutting/what-slock-doesnt-have",
+  ]) {
+    const doc = await resolveAgentKnowledgeDoc(topic);
+    assert.ok(doc, `${topic} must resolve`);
+    assert.equal(doc.docId, "what-raft-doesnt-have");
+  }
+});
+
 test("recipe stripped-prefix general fallback resolves whitelisted-class recipes", async () => {
   // Agents drop the `recipes/` prefix across multiple classes (decision/*, technique/*, ...).
   // The class-whitelist resolves the bare `<class>/<slug>` form for every real recipe whose

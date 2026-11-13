@@ -2,9 +2,19 @@
 
 This directory contains the committed OpenAPI 3.1 artifact generated from the
 organization-wide contract registry in `src/openApiContract.ts`. Feature wire
-schemas stay in feature modules; the first registered module is the additive,
-unmounted direct-attachment-upload P1 contract in
-`src/attachmentUploadContract.ts`.
+schemas stay in feature modules. Registered modules:
+
+- `attachmentUploads`: the additive, unmounted direct-attachment-upload P1
+  contract in `src/attachmentUploadContract.ts` (below).
+- `readState`: Mark as Unread, `POST /api/channels/{channelId}/unread`, in
+  `src/readStateContract.ts`. The server route checks its 200 answer against
+  `MarkConversationUnreadResponse` at compile time (`satisfies`; no runtime
+  parse after the committed write), and `channels.markedUnread.api.test.ts`
+  parses real answers with the schema. `outcome` (`counted` / `marked` /
+  `nothing`; optional, as older servers omit it) and `unreadCount` are decided
+  together in the read-state transaction from the state it wrote
+  (`applyRowUnread` in the server's `readMutationSequencer.ts`). Its consumer assertions are
+  `src/readStateApi.consumer.ts`; its test `src/readStateContract.test.ts`.
 
 `scripts/generate-openapi.ts` is the only generator entry point. It renders
 both `openapi/openapi.json` and `src/generated/openapi.ts`. Adding another API
@@ -39,7 +49,8 @@ pnpm --filter @botiverse/raft-shared check:openapi
 The gate regenerates committed artifacts and rejects drift, runs a second
 byte-identical generation, validates the document with the independent Redocly
 validator, compiles generated Web consumer assertions with
-`tsconfig.openapi.json`, and runs the registered feature contract tests. The
+`tsconfig.openapi.json`, and runs the registered feature contract tests
+(`test:attachment-upload-contract`, `test:read-state-contract`). The
 generated files are reviewable outputs, not manually maintained inputs; any
 direct edit is overwritten by regeneration and rejected by CI freshness.
 

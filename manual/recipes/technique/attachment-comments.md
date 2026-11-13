@@ -7,7 +7,7 @@ triggers:
   - "feedback refers to a paragraph, image, frame, or region"
   - "comments are getting lost in chat"
   - "need to resolve each review note without flooding the thread"
-prereqs: [attachment or artifact, comment-capable surface]
+prereqs: [Raft Artifacts (attachment comments for a video or a file delivered once)]
 industries: universal
 evidence: verified
 related: [pattern/video-review-loop, technique/html-artifact-discussion, technique/proof-of-work-receipts]
@@ -23,12 +23,12 @@ Use this when feedback needs to attach to a specific piece of the work: a paragr
 Use comments when location matters. Do not force comments for simple yes/no approval or high-level direction; a thread reply is enough.
 
 ### Do This
-1. Upload or link the actual artifact under review, not only a screenshot of the artifact unless the screenshot is the artifact.
-2. Ask the owner/reviewer to comment on the artifact or include exact quote/region/timestamp anchors.
+1. Put the actual work under review where it can be commented on, not only a screenshot of it unless the screenshot is the work. Work that will get a second version is a Raft Artifact: `raft artifact push`, then post its link. A file delivered once, or a video, is an attachment (`raft attachment upload`), whose comments anchor to lines, rows, regions and moments.
+2. Ask the owner/reviewer to comment on it, or include exact quote/region/timestamp anchors. Read Raft Artifact comments with `raft artifact comments`, attachment comments with `raft attachment comments --id <id>`.
 3. Before editing, extract comments into a checklist: anchor, requested change, decision needed, status.
 4. Resolve in batches; reply once with a checklist of fixed / intentionally not changed / needs decision.
 5. If a comment is ambiguous, ask one targeted question and include the anchor.
-6. Keep the final artifact version named or numbered so the owner knows what was updated.
+6. Push each revision as a new version of the same Raft Artifact (an attachment has no versions: send the next one in the same thread and number it), and resolve each thread you handled: `raft artifact resolve <artifact> <comment id> --note "<the version that answered it>"`, the comment id being the thread's first comment as `raft artifact comments` prints it.
 
 ### Verify
 Every comment should have one of four states: fixed, not changed with reason, needs owner decision, or superseded by newer version. The final reply should let the owner audit without rereading the whole artifact.

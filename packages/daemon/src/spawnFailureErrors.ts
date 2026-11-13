@@ -9,7 +9,7 @@
 
 // task #1123: the reason enum is the wire contract now, so it lives in shared;
 // re-exported here so daemon call sites keep their import path.
-import { SPAWN_FAILURE_REASONS as SHARED_SPAWN_FAILURE_REASONS, type SpawnFailureReason } from "@botiverse/raft-shared";
+import { SPAWN_FAILURE_REASONS as SHARED_SPAWN_FAILURE_REASONS, type AgentStartNotSpawnedReason, type SpawnFailureReason } from "@botiverse/raft-shared";
 export type { SpawnFailureReason } from "@botiverse/raft-shared";
 
 const SPAWN_FAILURE_REASONS: ReadonlySet<string> = new Set<string>(SHARED_SPAWN_FAILURE_REASONS);
@@ -121,6 +121,26 @@ export class RuntimeModelNotConfiguredError extends Error {
   }
 }
 
+/**
+ * task #1307 — the provider API key holds a character that cannot be sent in
+ * an HTTP header (usually pasted along with the key). The message names the
+ * key variable, position and character code for the local log only; the user
+ * sees reason-chosen copy that never carries any of them.
+ */
+export class ProviderApiKeyInvalidError extends Error {
+  readonly code = "provider_api_key_invalid" as const;
+  readonly keyName: string;
+
+  constructor(input: { keyName: string; position: number; charCode: number }) {
+    super(
+      `${input.keyName} contains a character that cannot be sent in an HTTP header (position ${input.position}, `
+      + `code ${input.charCode}). Remove any pasted text, line breaks or other characters that are not part of the key.`,
+    );
+    this.name = "ProviderApiKeyInvalidError";
+    this.keyName = input.keyName;
+  }
+}
+
 /** The runtime needs a human login on this computer before it can start. */
 export class RuntimeLoginRequiredError extends Error {
   readonly code = "runtime_login_required" as const;
@@ -142,6 +162,31 @@ export class RuntimeConfigInvalidError extends Error {
     super(input.message);
     this.name = "RuntimeConfigInvalidError";
     this.runtimeId = input.runtimeId;
+  }
+}
+
+/**
+ * The agent's env vars set names this Computer does not take from the server
+ * (agentEnvVarPolicy.ts). `names` are valid variable names only, never
+ * values; keys that are not valid names are only counted.
+ */
+export class AgentEnvVarsNotAllowedError extends Error {
+  readonly code = "env_var_not_allowed" as const;
+  readonly runtimeId: string;
+  readonly names: readonly string[];
+  readonly invalidNameCount: number;
+
+  constructor(input: { runtimeId: string; names: readonly string[]; invalidNameCount?: number }) {
+    const invalidNameCount = input.invalidNameCount ?? 0;
+    const parts = [
+      ...(input.names.length > 0 ? [input.names.join(", ")] : []),
+      ...(invalidNameCount > 0 ? [`${invalidNameCount} invalid name(s)`] : []),
+    ];
+    super(`Agent environment variables not allowed on this Computer: ${parts.join("; ")}`);
+    this.name = "AgentEnvVarsNotAllowedError";
+    this.runtimeId = input.runtimeId;
+    this.names = input.names;
+    this.invalidNameCount = invalidNameCount;
   }
 }
 
@@ -193,4 +238,35 @@ export function isRuntimeModelNotFoundError(error: unknown): error is RuntimeMod
 export function isProviderConnectionMaterializationError(error: unknown): error is ProviderConnectionMaterializationError {
   return error instanceof ProviderConnectionMaterializationError
     || (error instanceof Error && (error as { code?: unknown }).code === "provider_connection_materialization_failed");
+}
+
+/**
+ * A start of a runtime that runs only on the OAR host (`RuntimeDriver.oarOnly`)
+ * that the OAR host could not run. There is no legacy host to hand it to, so
+ * the start fails with this error instead (agentHostRouter.ts). `notSpawnedReason`
+ * settles the launch; `userMessage` is the sentence the owner sees.
+ */
+export class OarOnlyStartError extends Error {
+  readonly spawnFailureCode: SpawnFailureReason;
+  readonly runtimeId: string;
+  /** Why the OAR host did not run the start (its trace reason). */
+  readonly hostReason: string;
+  readonly notSpawnedReason: AgentStartNotSpawnedReason;
+  readonly userMessage: string;
+
+  constructor(input: {
+    runtimeId: string;
+    hostReason: string;
+    userMessage: string;
+    spawnFailureCode?: SpawnFailureReason;
+    notSpawnedReason?: AgentStartNotSpawnedReason;
+  }) {
+    super(`${input.runtimeId} runs only on the OAR host, which could not run this start (${input.hostReason})`);
+    this.name = "OarOnlyStartError";
+    this.runtimeId = input.runtimeId;
+    this.hostReason = input.hostReason;
+    this.userMessage = input.userMessage;
+    this.spawnFailureCode = input.spawnFailureCode ?? "runtime_spawn_failed";
+    this.notSpawnedReason = input.notSpawnedReason ?? "start_rejected";
+  }
 }

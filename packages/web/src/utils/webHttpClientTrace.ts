@@ -1,31 +1,33 @@
 import {
   BasicTracer,
   formatTraceparent,
+  parseTraceparent,
 } from "@botiverse/raft-shared";
 import type {
   ActiveSpan,
-  CompletedTraceSpan,
+  TraceContext,
   TraceSink,
   TraceStatus,
 } from "@botiverse/raft-shared";
-import {
-  buildWebTraceRecord,
-  emitWebTraceRecord,
-} from "./webAuthTrace";
-import type {
-  WebSpanName,
-} from "./webAuthTrace";
+import { webTraceSink } from "../observability/webSpanSink";
+import { apiRouteTemplate } from "../observability/apiRouteTemplate";
+import { absoluteRequestUrl, contentLengthOf, performanceNow, requestTiming, watchResourceTiming } from "../observability/resourceTiming";
+import { finishViewSwitchRequest, noteViewSwitchRequest } from "../observability/viewSwitchSpan";
+import type { ViewSwitchRequest } from "../observability/viewSwitchSpan";
 
 export type WebHttpStatusBucket = "2xx" | "3xx" | "4xx" | "5xx" | "network_error" | "other";
 
 export interface WebHttpClientSpan {
   readonly traceparent: string;
+  /** The request as counted by the view switch in flight (observability/viewSwitchSpan.ts), if it is one of its requests. */
+  viewSwitch?: ViewSwitchRequest | null;
   end(input: WebHttpClientTerminalInput): void;
 }
 
 export interface WebHttpTraceRequestConfig {
   method?: string;
   url?: string;
+  baseURL?: string;
   headers: Record<string, unknown>;
 }
 
@@ -113,20 +115,7 @@ function statusBucket(statusCode: number | undefined): WebHttpStatusBucket {
   return "other";
 }
 
-function recordCompletedHttpSpan(span: CompletedTraceSpan): void {
-  emitWebTraceRecord(buildWebTraceRecord(span.name as WebSpanName, span.attrs ?? {}, {
-    traceId: span.context.traceId,
-    spanId: span.context.spanId,
-    parentSpanId: span.context.parentSpanId,
-    kind: span.kind,
-    status: span.status,
-    startTime: new Date(span.startTimeMs).toISOString(),
-    endTime: new Date(span.endTimeMs).toISOString(),
-    surface: span.surface as "web",
-  }));
-}
-
-const defaultTraceSink: TraceSink = { record: recordCompletedHttpSpan };
+const defaultTraceSink: TraceSink = webTraceSink;
 let tracer = new BasicTracer({ sink: defaultTraceSink });
 
 /** Test-only sink seam for proving Web + Server trace correlation in one sink. */
@@ -136,21 +125,51 @@ export function __setWebHttpClientTraceSinkForTest(sink: TraceSink | null): void
 
 const httpClientSpans = new WeakMap<object, WebHttpClientSpan>();
 
+// The polled reads whose background-tab share is measured (#12928): their
+// span says whether the tab was visible when the request was sent. Joined to
+// the server span by trace id, and to the tab by the default tabId attr.
+const TAB_VISIBILITY_ROUTES = [
+  /^\/integrations\/permission-updates$/,
+  /^\/messages\/sync(?:\?|$)/,
+  /^\/channels\/joint-invites$/,
+  /^\/servers\/[^/?]+\/seat-join-blocks$/,
+];
+
+/** `tab.visibility` (document.visibilityState now) for those routes; nothing for any other. */
+export function tabVisibilityAttrs(url: string | undefined): Record<string, string> {
+  if (!url || !TAB_VISIBILITY_ROUTES.some((route) => route.test(url))) return {};
+  const hidden = typeof document !== "undefined" && document.visibilityState === "hidden";
+  return { "tab.visibility": hidden ? "hidden" : "visible" };
+}
+
 /**
  * Start one real browser HTTP-client span. The span exists even without a
  * previously-active web span: the outgoing request itself is the operation,
  * so its context is safe to propagate and is never a detached/fabricated id.
+ * It carries the route template (`http.route`, never the URL's ids or query),
+ * and at its end the response size and the Resource Timing segments.
  */
-export function startWebHttpClientSpan(method: string | undefined): WebHttpClientSpan {
+export function startWebHttpClientSpan(
+  method: string | undefined,
+  url?: string,
+  continued?: { parent: TraceContext; startTimeMs: number },
+  baseURL?: string,
+): WebHttpClientSpan {
   const span: ActiveSpan = tracer.startSpan("web.http.client", {
     surface: "web",
     kind: "client",
+    ...(continued ? { parent: continued.parent, startTimeMs: continued.startTimeMs } : {}),
     attrs: {
       method: (method || "GET").toUpperCase(),
+      "http.route": apiRouteTemplate(url),
+      ...tabVisibilityAttrs(url),
     },
   });
+  watchResourceTiming();
+  const absoluteUrl = absoluteRequestUrl(baseURL, url);
+  const sentAt = performanceNow();
 
-  return {
+  const handle: WebHttpClientSpan = {
     traceparent: formatTraceparent(span.context),
     end(input) {
       const bucket = statusBucket(input.statusCode);
@@ -159,27 +178,53 @@ export function startWebHttpClientSpan(method: string | undefined): WebHttpClien
         : Number(input.statusCode) < 400
           ? "ok"
           : "error";
+      const timing = input.statusCode === undefined ? null : requestTiming(absoluteUrl, sentAt);
+      const bytes = timing?.bytes ?? contentLengthOf(input.responseHeaders);
+      finishViewSwitchRequest(handle.viewSwitch, { bytes, timing });
       span.end(traceStatus, {
         attrs: {
           outcome: input.cancelled ? "cancelled" : traceStatus === "ok" ? "success" : "error",
           status_bucket: bucket,
           status_code: input.statusCode,
+          ...(bytes !== undefined ? { response_bytes: bytes } : {}),
+          ...timing?.segments,
           ...forwardHttpDiagnosticAttrs(input),
         },
       });
     },
   };
+  return handle;
 }
 
 /** Attach exactly one live span to one Axios request attempt. */
 export function attachWebHttpClientTrace(config: WebHttpTraceRequestConfig): void {
   try {
     if (httpClientSpans.has(config)) return;
-    const httpSpan = startWebHttpClientSpan(config.method);
+    const httpSpan = startWebHttpClientSpan(config.method, config.url, undefined, config.baseURL);
+    httpSpan.viewSwitch = noteViewSwitchRequest(config.url);
     config.headers.traceparent = httpSpan.traceparent;
     httpClientSpans.set(config, httpSpan);
   } catch {
     // HTTP tracing is diagnostic-only and must never block the real request.
+  }
+}
+
+/**
+ * The attempt is answered by a request the boot script sent earlier
+ * (boot/bootPrefetch.ts): its span is replaced by one in that request's trace
+ * (the server's span of it is in the same trace), started when it went out.
+ * The span replaced was never ended, so it is never recorded.
+ */
+export function continueWebHttpClientTrace(config: WebHttpTraceRequestConfig, traceparent: string | undefined, sentAtMs: number): void {
+  try {
+    const parent = parseTraceparent(traceparent);
+    if (!parent) return;
+    const httpSpan = startWebHttpClientSpan(config.method, config.url, { parent, startTimeMs: sentAtMs }, config.baseURL);
+    httpSpan.viewSwitch = httpClientSpans.get(config)?.viewSwitch;
+    config.headers.traceparent = traceparent;
+    httpClientSpans.set(config, httpSpan);
+  } catch {
+    // Diagnostic only, as above.
   }
 }
 

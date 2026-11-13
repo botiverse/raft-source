@@ -12,8 +12,9 @@ import { closeTestDatabase } from "../test/integration/database";
  */
 import assert from "node:assert/strict";
 import { getDb } from "../db/index";
-import { users } from "../db/schema";
-import { dismiss, listUndismissedForUser, publish } from "./announcementService";
+import { eq } from "drizzle-orm";
+import { announcements, users } from "../db/schema";
+import { createDraft, updateDraft, publishDraft, listAdminAnnouncements, dismiss, listUndismissedForUser, publish } from "./announcementService";
 
 
 afterEach(async () => {
@@ -123,4 +124,35 @@ test("⑤ a request-scoped frontier advances to the next unread row without dism
     [older.id],
     "the frontier is request-scoped and must not create a durable dismissal",
   );
+});
+
+test("priority wins before age, with equal-priority oldest-first and a matching recovery frontier", async ({ db }) => {
+  const user = await seedEligibleUser("priority-order@example.com");
+  const older = await publish({ title: "normal older", pages: page, startsAt: new Date("2026-01-01") });
+  const first = await publish({ title: "high older", pages: page, startsAt: new Date("2026-02-01") });
+  const second = await publish({ title: "high newer", pages: page, startsAt: new Date("2026-03-01") });
+  await db.update(announcements).set({ priority: 50 }).where(eq(announcements.id, first.id));
+  await db.update(announcements).set({ priority: 50 }).where(eq(announcements.id, second.id));
+  assert.equal((await listUndismissedForUser(user.id, FAMILY))[0]?.id, first.id);
+  assert.equal((await listUndismissedForUser(user.id, FAMILY, undefined, first.id))[0]?.id, second.id);
+  assert.equal((await listUndismissedForUser(user.id, FAMILY, undefined, second.id))[0]?.id, older.id);
+  await dismiss(user.id, first.id);
+  assert.equal((await listUndismissedForUser(user.id, FAMILY))[0]?.id, second.id);
+  await dismiss(user.id, second.id);
+  assert.equal((await listUndismissedForUser(user.id, FAMILY))[0]?.id, older.id);
+  // Raising an already-read announcement does not resend it.
+  await db.update(announcements).set({ priority: 100 }).where(eq(announcements.id, first.id));
+  assert.equal((await listUndismissedForUser(user.id, FAMILY))[0]?.id, older.id);
+});
+
+
+test("deleted drafts stay out of legacy admin lists and cannot be edited or published", async ({db}) => {
+  const user = await seedEligibleUser("deleted-draft@example.com");
+  const input = {defaultLocale: "en" as const, content: {en: {title: "Deleted draft", pages: [{body: "Never delivered"}]}}};
+  const draft = await createDraft(user.id, input);
+  await db.update(announcements).set({deletedAt: new Date()}).where(eq(announcements.id, draft.id));
+  assert.ok(!(await listAdminAnnouncements()).some(row => row.id === draft.id));
+  assert.equal(await updateDraft(user.id, draft.id, input), null);
+  assert.equal(await publishDraft(user.id, draft.id), null);
+  assert.deepEqual(await listUndismissedForUser(user.id, FAMILY), []);
 });

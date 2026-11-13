@@ -1,6 +1,6 @@
 /**
  * Product copy calls the provider-run agent a "cloud agent" / "runs in the cloud"
- * (云端 agent). The provider's name never reaches a person, and the old
+ * (云端 Agent). The provider's name never reaches a person, and the old
  * "Hosted by Raft" / "no computer needed" wording does not come back next to it.
  *
  * Identifiers keep the provider name (`antiproton_hosted_runtime`, provider kind

@@ -47,7 +47,6 @@ async function openApp() {
   }
   return openTestApp(REAL_PG_URL ?? "pglite://", 0, {
     humanActivityMuteFlagDefaultEnabled: true,
-    onboardingOpenerFlagDefaultEnabled: false,
   });
 }
 
@@ -451,7 +450,7 @@ test("public ids leave the server only through the search API: agent server info
     const agent = await createAgent(seed.server.id, "SeoNoLeakBot", { runtime: "claude", model: "sonnet" });
     await addAgent(seed.open.id, agent.id);
     await addAgent(seed.hidden.id, agent.id);
-    const { apiKey } = await mintAgentCredential({ agentId: agent.id, scopes: ["read", "channels"], name: "seo-noleak", createdByUserId: null });
+    const { apiKey } = await mintAgentCredential({ agentId: agent.id, scopes: ["read", "channels"], name: "seo-noleak", issuedVia: "computer", createdByUserId: null });
     const routeIds = (await getDb().select({ publicId: channelPublicRoutes.publicId }).from(channelPublicRoutes))
       .map((row) => row.publicId)
       .concat(seed.serverPid);

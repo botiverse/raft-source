@@ -12,6 +12,8 @@ import { agents, attachments, channels, messages, servers, users } from "../db/s
 import { __setChannelWriterFenceTransactionTestAdapterForTests } from "./channelConversionFenceService";
 
 
+const FAKE_OBJECT_ID = "b0000000-0000-4000-8000-000000000001";
+
 type InsertCapture = {
   table?: unknown;
   values?: Record<string, unknown>;
@@ -72,12 +74,31 @@ function makeSelectBuilder(result: unknown[]) {
     },
   });
   const afterWhere = makeAfterWhere(result);
-  const joinedAfterWhere = makeAfterWhere(result.map((projection) => ({ projection, object: null })));
+  // Projection + object join: message loading reads physical metadata only
+  // from an active object, so each fake projection gets one built from it.
+  const joinedAfterWhere = makeAfterWhere(result.map((row) => {
+    const projection = row as Record<string, unknown>;
+    const objectId = projection.objectId ?? `object-${String(projection.id)}`;
+    return {
+      projection: { ...projection, objectId },
+      object: {
+        id: objectId,
+        lifecycleState: "active",
+        mimeType: projection.mimeType,
+        sizeBytes: projection.sizeBytes,
+        storageKey: projection.storageKey,
+        thumbnailKey: projection.thumbnailKey,
+        contentHash: projection.contentHash,
+        width: projection.width,
+        height: projection.height,
+      },
+    };
+  }));
 
   return {
     from() {
       return {
-        leftJoin() {
+        innerJoin() {
           return {
             where() {
               return joinedAfterWhere;
@@ -127,6 +148,10 @@ function makeDb(options: {
           if (!result) throw new Error("Unexpected select");
           return makeSelectBuilder(result);
         },
+        // Raw SQL of the hold writer (attachmentObjectHoldService): the
+        // linked attachment's object is locked as active, then its hold is
+        // inserted. Every projection names an object (object_id NOT NULL).
+        execute: async () => ({ rows: [{ id: FAKE_OBJECT_ID, lifecycle_state: "active", unheld: false }] }),
       };
 
       return fn(tx);
@@ -188,6 +213,7 @@ test("createOrReplayAgentSend persists a new agent message on first send", async
         id: "a0000000-0000-4000-8000-000000000001",
         uploaderId: "agent-1",
         messageId: null,
+        objectId: FAKE_OBJECT_ID,
       }],
       [{
         id: "a0000000-0000-4000-8000-000000000001",

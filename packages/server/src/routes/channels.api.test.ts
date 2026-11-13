@@ -1,8 +1,8 @@
+import { handlerTraceEvents } from "../test/handlerTraceEvents";
 import { tokenForHuman } from "../test/integration/credentials";
 import { fixturePasswordHash } from "../test/integration/credentials";
 import { createApiTest } from "../test/integration/apiTest";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 
 import { and, desc, eq, inArray } from "drizzle-orm";
@@ -10,7 +10,6 @@ import {
   BasicTracer,
   MemoryTraceSink
 } from "@botiverse/raft-shared";
-import { openTestApp } from "../test/integration/app";
 import { getDb } from "../db/index";
 import { closeRisingWavePool } from "../db/risingwave";
 import {
@@ -24,7 +23,7 @@ import {
   inboxSuppressionStates,
   userChannelInboxStates,
   userChannelDisplayPrefs, featureFlags,
-  channelHumans, serverAgentMembers
+  channelHumans, serverAgentMembers, notificationOutbox
 } from "../db/schema";
 import { addMember, updateServerOnboardingAgent } from "../services/serverService";
 import { createAgent } from "../services/agentService";
@@ -35,7 +34,6 @@ import {
 } from "../services/messageService";
 import {
 } from "../services/inboxNotificationService";
-import { ONBOARDING_OPENER_V2_FEATURE_FLAG_KEY } from "../services/featureFlagService";
 import {
   __resetOnboardingServiceDepsForTests,
   __setOnboardingServiceDepsForTests,
@@ -45,9 +43,12 @@ import {
   resolveChannelSuppressionTarget,
   resolveThreadSuppressionTarget,
 } from "../services/inboxSuppressionWriters";
-import { createServer, installFakeIo, enableReadReceiptsForServer, recordTestInboxFact, seedThreadFixture, headers, channelDoneBody, threadDoneBody, legacyDoneFallbackCount, seedUser, type InboxMentionItem, fetchInboxAll } from "./channels.api.fixtures";
+import { listHumanChannelItems } from "../services/channelListItems";
+import { createServer, installFakeIo, recordTestInboxFact, seedThreadFixture, headers, channelDoneBody, threadDoneBody, legacyDoneFallbackCount, seedUser, type InboxMentionItem, fetchInboxAll } from "./channels.api.fixtures";
+import { shapeEstablishedServerForTest, revealAllChannelForTest } from "../test/allChannelFixture";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
+const testMuteFlagOff = createApiTest({ humanActivityMuteFlagDefaultEnabled: false });
 
 
 test("GET /api/channels records restore-list phases and constant query shape", async ({ app }) => {
@@ -67,6 +68,7 @@ test("GET /api/channels records restore-list phases and constant query shape", a
   const owner = await seedUser("channels-trace-owner@slock.test", "channels-trace-owner");
   const member = await seedUser("channels-trace-member@slock.test", "channels-trace-member");
   const server = await createServer("Channels Trace Server", "channels-trace-server", owner.id);
+  await shapeEstablishedServerForTest(server.id);
   await addMember(server.id, member.id);
   const joinedChannel = await createChannel(server.id, "joined-channel");
   await addHuman(joinedChannel.id, owner.id);
@@ -95,7 +97,7 @@ test("GET /api/channels records restore-list phases and constant query shape", a
   );
   assert.ok(span, "expected GET /api/channels root span");
 
-  const processEventNames = span.events
+  const processEventNames = handlerTraceEvents(span.events)
     .map((event) => event.name)
     .filter((name) => name !== "db.query.finished");
   assert.deepEqual(processEventNames, [
@@ -105,7 +107,7 @@ test("GET /api/channels records restore-list phases and constant query shape", a
     "http.response.finished",
   ]);
 
-  const dbEvents = span.events.filter((event) => event.name === "db.query.finished");
+  const dbEvents = handlerTraceEvents(span.events).filter((event) => event.name === "db.query.finished");
   assert.deepEqual(
     dbEvents.map((event) => event.attrs?.query_name).sort(),
     [
@@ -123,7 +125,8 @@ test("GET /api/channels records restore-list phases and constant query shape", a
   assert.equal(dbEventByQuery.get("channels.list_by_server")?.attrs?.archived_filter, "exclude");
   assert.equal(dbEventByQuery.get("channels.list_by_server")?.attrs?.row_count, 3);
   assert.equal(dbEventByQuery.get("channels.memberships_by_user")?.attrs?.phase, "channels.loaded");
-  assert.equal(dbEventByQuery.get("channels.memberships_by_user")?.attrs?.memberships_count, 1);
+  // The joined channel plus the enabled #all row every member now holds (#triage:64b44a12).
+  assert.equal(dbEventByQuery.get("channels.memberships_by_user")?.attrs?.memberships_count, 2);
   assert.equal(dbEventByQuery.get("channels.last_messages_by_channels")?.attrs?.phase, "channels.loaded");
   assert.equal(dbEventByQuery.get("channels.last_messages_by_channels")?.attrs?.channels_count, 3);
   assert.equal(dbEventByQuery.get("channels.last_messages_by_channels")?.attrs?.channels_with_messages_count, 2);
@@ -261,6 +264,34 @@ test("GET /api/channels default restore list excludes archived channels", async 
 });
 
 
+test("GET /api/channels?archived=include skips latest-message reads for archived channels; a lookup by id keeps them", async ({ seed, http }) => {
+  const owner = await seed.human();
+  const server = await seed.server({ owner });
+  const activeChannel = await seed.channel({ server, members: [owner] });
+  const archivedChannel = await seed.channel({ server, members: [owner] });
+  const activeMessage = await createMessage(activeChannel.id, "user", owner.id, "active latest");
+  const archivedMessage = await createMessage(archivedChannel.id, "user", owner.id, "archived latest");
+  await archiveChannel(archivedChannel.id, owner.id);
+  const client = http.as(owner, server);
+
+  const res = await client.get("/api/channels?archived=include");
+  assert.equal(res.status, 200);
+  type Row = { id: string; archivedAt: string | null; lastMessageAt: string | null; maxReadSeq: number; readState?: { kind: string } };
+  const body = await res.json() as Row[];
+  const active = body.find((channel) => channel.id === activeChannel.id);
+  const archived = body.find((channel) => channel.id === archivedChannel.id);
+  assert.equal(active?.lastMessageAt, activeMessage.createdAt.toISOString());
+  assert.ok(active?.readState, "a live channel keeps its read state");
+  assert.ok(archived?.archivedAt, "the archived channel is still listed");
+  assert.equal(archived?.lastMessageAt, null, "no latest-message read for an archived channel in the whole list");
+  assert.equal(archived?.readState, undefined, "no read state, so the web leaves its ledger entry alone");
+  assert.equal(archived?.maxReadSeq, 0);
+
+  const [byId] = await listHumanChannelItems(server.id, owner.id, { archived: "include", channelIds: [archivedChannel.id] });
+  assert.equal(byId?.lastMessageAt?.toISOString(), archivedMessage.createdAt.toISOString(), "a lookup by id still reads the archived channel's latest message");
+  assert.ok((byId as { readState?: unknown } | undefined)?.readState, "a lookup by id still reads its read state");
+});
+
 test("POST /api/channels returns creator notification capability state for the new channel", async ({ app }) => {
   const owner = await seedUser("create-channel-mute-owner@slock.test", "create-channel-mute-owner");
   const server = await createServer("Create Channel Mute Server", "create-channel-mute-server", owner.id);
@@ -297,8 +328,7 @@ test("POST /api/channels returns creator notification capability state for the n
 });
 
 
-test("GET/PATCH /api/channels/:id/notification-settings stores per-user activity mute without moving read cursors", async () => {
-  const app = await openTestApp("pglite://", 0, { onboardingOpenerFlagDefaultEnabled: false, humanActivityMuteFlagDefaultEnabled: false });
+testMuteFlagOff("GET/PATCH /api/channels/:id/notification-settings stores per-user activity mute without moving read cursors", async ({ app }) => {
   const previousRisingWaveDatabaseUrl = process.env.RISINGWAVE_DATABASE_URL;
   delete process.env.RISINGWAVE_DATABASE_URL;
   await closeRisingWavePool();
@@ -377,16 +407,11 @@ test("GET/PATCH /api/channels/:id/notification-settings stores per-user activity
       assert.equal(res.headers.get("cache-control"), "private, no-store");
       return await res.json() as Record<string, number>;
     };
-    const lastPushTargetsEvent = () => {
-      const spans = sink.getAllSpans();
-      const span = [...spans].reverse().find((candidate) =>
-        candidate.events.some((event) => event.name === "message_pipeline.push_targets.built"),
-      );
-      assert.ok(span, "expected POST /api/messages trace span");
-      const event = span.events.find((candidate) => candidate.name === "message_pipeline.push_targets.built");
-      assert.ok(event, "expected push target trace event");
-      return event;
-    };
+    // Every transport's audience is the notification outbox (services/notifications/enqueue.ts).
+    const outboxReceiverIds = async (messageId: string) => (await db
+      .select({ receiverId: notificationOutbox.receiverId })
+      .from(notificationOutbox)
+      .where(eq(notificationOutbox.messageId, messageId))).map((row) => row.receiverId);
     const lastTraceEvent = (name: string) => {
       const events = sink.getAllSpans().flatMap((span) => span.events);
       const event = [...events].reverse().find((candidate) => candidate.name === name);
@@ -406,7 +431,7 @@ test("GET/PATCH /api/channels/:id/notification-settings stores per-user activity
     await markRead(member.id, channel.id, preMuteMessage.seq);
 
     sink.clear();
-    // Always-on regression nail: even though openTestApp was created with
+    // Always-on regression nail: even though the app fixture was created with
     // humanActivityMuteFlagDefaultEnabled:false, the feature is unconditionally
     // enabled by default, so a no-cutoff
     // pglite inbox routes through the serving-rows backend, not pg_legacy.
@@ -534,9 +559,7 @@ test("GET/PATCH /api/channels/:id/notification-settings stores per-user activity
 
     sink.clear();
     const ordinaryMutedMessage = await sendMessage("ordinary muted-window message");
-    const ordinaryPush = lastPushTargetsEvent();
-    assert.equal(ordinaryPush.attrs?.target_count, 0, "muted ordinary channel traffic must not create web-push targets");
-    assert.equal(ordinaryPush.attrs?.activity_muted_human_count, 1, "muted recipient should be counted separately from server push mute");
+    assert.deepEqual(await outboxReceiverIds(ordinaryMutedMessage.id), [], "muted ordinary channel traffic must not create notification targets");
     const mutedFactTrace = traceEvent("inbox.notification_fact.decision", (attrs) =>
       attrs.message_id === ordinaryMutedMessage.id && attrs.receiver_id === member.id,
     );
@@ -673,9 +696,7 @@ test("GET/PATCH /api/channels/:id/notification-settings stores per-user activity
 
     sink.clear();
     const mentionMessage = await sendMessage("personal pierce for @channel-mute-member");
-    const mentionPush = lastPushTargetsEvent();
-    assert.equal(mentionPush.attrs?.target_count, 1, "direct @mention should pierce channel activity mute for push");
-    assert.equal(mentionPush.attrs?.activity_muted_human_count, 0);
+    assert.deepEqual(await outboxReceiverIds(mentionMessage.id), [member.id], "direct @mention should pierce channel activity mute for notifications");
     const mentionFactTrace = traceEvent("inbox.notification_fact.decision", (attrs) =>
       attrs.message_id === mentionMessage.id && attrs.receiver_id === member.id,
     );
@@ -708,13 +729,11 @@ test("GET/PATCH /api/channels/:id/notification-settings stores per-user activity
       process.env.RISINGWAVE_DATABASE_URL = previousRisingWaveDatabaseUrl;
     }
     await closeRisingWavePool();
-    await app.close();
   }
 });
 
 
-test("GET/PATCH /api/channels/:id/message-display-settings stores per-user collapse preference", async () => {
-  const app = await openTestApp("pglite://", 0, { onboardingOpenerFlagDefaultEnabled: false, humanActivityMuteFlagDefaultEnabled: false });
+testMuteFlagOff("GET/PATCH /api/channels/:id/message-display-settings stores per-user collapse preference", async ({ app }) => {
   const previousRisingWaveDatabaseUrl = process.env.RISINGWAVE_DATABASE_URL;
   delete process.env.RISINGWAVE_DATABASE_URL;
   await closeRisingWavePool();
@@ -754,7 +773,7 @@ test("GET/PATCH /api/channels/:id/message-display-settings stores per-user colla
     const initialRes = await getSettings(memberToken);
     assert.equal(initialRes.status, 200);
     assert.deepEqual(await initialRes.json(), {
-      collapseLongMessages: true,
+      collapseLongMessages: false,
       prefsVersion: 0,
     });
 
@@ -795,17 +814,17 @@ test("GET/PATCH /api/channels/:id/message-display-settings stores per-user colla
     assert.ok(allChannel, "expected system #all channel");
     const allGetRes = await getSettings(outsiderToken, allChannel.id);
     assert.equal(allGetRes.status, 200);
-    const allPatchRes = await patchSettings(outsiderToken, { collapseLongMessages: false }, allChannel.id);
+    const allPatchRes = await patchSettings(outsiderToken, { collapseLongMessages: true }, allChannel.id);
     assert.equal(allPatchRes.status, 200);
     assert.deepEqual(await allPatchRes.json(), {
-      collapseLongMessages: false,
+      collapseLongMessages: true,
       prefsVersion: 1,
     });
 
-    const disabledRes = await patchSettings(memberToken, { collapseLongMessages: false });
-    assert.equal(disabledRes.status, 200);
-    assert.deepEqual(await disabledRes.json(), {
-      collapseLongMessages: false,
+    const enabledRes = await patchSettings(memberToken, { collapseLongMessages: true });
+    assert.equal(enabledRes.status, 200);
+    assert.deepEqual(await enabledRes.json(), {
+      collapseLongMessages: true,
       prefsVersion: 1,
     });
     assert.deepEqual(emittedEvents.at(-1), {
@@ -815,19 +834,19 @@ test("GET/PATCH /api/channels/:id/message-display-settings stores per-user colla
         serverId: server.id,
         scopeId: channel.id,
         prefs: {
-          collapseLongMessages: false,
+          collapseLongMessages: true,
         },
         prefsVersion: 1,
       },
     });
-    const afterDisableEventCount = emittedEvents.length;
-    const repeatedDisabledRes = await patchSettings(memberToken, { collapseLongMessages: false });
-    assert.equal(repeatedDisabledRes.status, 200);
-    assert.deepEqual(await repeatedDisabledRes.json(), {
-      collapseLongMessages: false,
+    const afterEnableEventCount = emittedEvents.length;
+    const repeatedEnabledRes = await patchSettings(memberToken, { collapseLongMessages: true });
+    assert.equal(repeatedEnabledRes.status, 200);
+    assert.deepEqual(await repeatedEnabledRes.json(), {
+      collapseLongMessages: true,
       prefsVersion: 1,
     });
-    assert.equal(emittedEvents.length, afterDisableEventCount, "same-value display prefs PATCH must not emit");
+    assert.equal(emittedEvents.length, afterEnableEventCount, "same-value display prefs PATCH must not emit");
 
     const listRes = await fetch(`${app.baseUrl}/api/channels`, {
       headers: headers(memberToken, server.id),
@@ -840,7 +859,7 @@ test("GET/PATCH /api/channels/:id/message-display-settings stores per-user colla
     }>;
     const listChannel = list.find((candidate) => candidate.id === channel.id);
     assert.ok(listChannel, "channel should remain visible");
-    assert.equal(listChannel.collapseLongMessages, false);
+    assert.equal(listChannel.collapseLongMessages, true);
     assert.equal(listChannel.displayPrefsVersion, 1);
 
     const detailRes = await fetch(`${app.baseUrl}/api/channels/${channel.id}`, {
@@ -848,20 +867,20 @@ test("GET/PATCH /api/channels/:id/message-display-settings stores per-user colla
     });
     assert.equal(detailRes.status, 200);
     const detail = await detailRes.json() as { collapseLongMessages?: boolean; displayPrefsVersion?: number };
-    assert.equal(detail.collapseLongMessages, false);
+    assert.equal(detail.collapseLongMessages, true);
     assert.equal(detail.displayPrefsVersion, 1);
 
     const ownerRes = await getSettings(ownerToken);
     assert.equal(ownerRes.status, 200);
     assert.deepEqual(await ownerRes.json(), {
-      collapseLongMessages: true,
+      collapseLongMessages: false,
       prefsVersion: 0,
     });
 
-    const reenabledRes = await patchSettings(memberToken, { collapseLongMessages: true });
-    assert.equal(reenabledRes.status, 200);
-    assert.deepEqual(await reenabledRes.json(), {
-      collapseLongMessages: true,
+    const redisabledRes = await patchSettings(memberToken, { collapseLongMessages: false });
+    assert.equal(redisabledRes.status, 200);
+    assert.deepEqual(await redisabledRes.json(), {
+      collapseLongMessages: false,
       prefsVersion: 2,
     });
     assert.deepEqual(emittedEvents.at(-1), {
@@ -871,7 +890,7 @@ test("GET/PATCH /api/channels/:id/message-display-settings stores per-user colla
         serverId: server.id,
         scopeId: channel.id,
         prefs: {
-          collapseLongMessages: true,
+          collapseLongMessages: false,
         },
         prefsVersion: 2,
       },
@@ -885,7 +904,7 @@ test("GET/PATCH /api/channels/:id/message-display-settings stores per-user colla
         eq(userChannelDisplayPrefs.channelId, channel.id),
       ));
     assert.equal(prefRows.length, 1);
-    assert.equal(prefRows[0].collapseLongMessages, true);
+    assert.equal(prefRows[0].collapseLongMessages, false);
     assert.equal(prefRows[0].prefsVersion, 2);
 
     const threadRes = await patchSettings(memberToken, { collapseLongMessages: false }, thread.id);
@@ -899,7 +918,6 @@ test("GET/PATCH /api/channels/:id/message-display-settings stores per-user colla
       process.env.RISINGWAVE_DATABASE_URL = previousRisingWaveDatabaseUrl;
     }
     await closeRisingWavePool();
-    await app.close();
   }
 });
 
@@ -907,10 +925,10 @@ test("GET/PATCH /api/channels/:id/message-display-settings stores per-user colla
 // task #473: staging DM API answered `activityMuteSupported: true` while no
 // user-reachable DM mute surface exists (#proj-qa:8aad2993, Web f5cf0470 x
 // Server ef98efe4 — DM DOM had zero `activity-mute-toggle` nodes in en and zh).
-// Per-DM mute is documented as absent (manual/agent-knowledge/what-slock-doesnt-have.md),
-// so the API must not announce it. A regular channel must keep announcing it,
-// otherwise "stop claiming" would silently retire the real feature.
-test("activityMuteSupported is announced for channels and withheld for DMs on every surface", async ({ app }) => {
+// Only a DM with an App bot can be muted (channels.appBotDmMute.api.test.ts);
+// a DM with a person must not announce it. A regular channel must keep
+// announcing it, otherwise "stop claiming" would silently retire the real feature.
+test("activityMuteSupported is announced for channels and withheld for a DM with a person on every surface", async ({ app }) => {
   const owner = await seedUser("dm-mute-claim-owner@slock.test", "dm-mute-claim-owner");
   const peer = await seedUser("dm-mute-claim-peer@slock.test", "dm-mute-claim-peer");
   const server = await createServer("DM Mute Claim", "dm-mute-claim", owner.id);
@@ -936,18 +954,20 @@ test("activityMuteSupported is announced for channels and withheld for DMs on ev
   const getSettings = (channelId: string) => fetch(`${app.baseUrl}/api/channels/${channelId}/notification-settings`, {
     headers: headers(ownerToken, server.id),
   });
-  const patchSettings = (channelId: string) => fetch(`${app.baseUrl}/api/channels/${channelId}/notification-settings`, {
+  const patchSettings = (channelId: string, activityMuted: boolean) => fetch(`${app.baseUrl}/api/channels/${channelId}/notification-settings`, {
     method: "PATCH",
     headers: headers(ownerToken, server.id),
-    body: JSON.stringify({ activityMuted: true }),
+    body: JSON.stringify({ activityMuted }),
   });
   const getChannel = (channelId: string) => fetch(`${app.baseUrl}/api/channels/${channelId}`, {
     headers: headers(ownerToken, server.id),
   });
 
-  // The DM must not claim the capability on any surface that reports it.
+  // The DM must not claim the capability on any surface that reports it. PATCH
+  // refuses to mute it (channels.appBotDmMute.api.test.ts), so read the claim
+  // from an unmute, which is always accepted.
   assert.equal((await readClaim(await getSettings(dm.id))).activityMuteSupported, false);
-  assert.equal((await readClaim(await patchSettings(dm.id))).activityMuteSupported, false);
+  assert.equal((await readClaim(await patchSettings(dm.id, false))).activityMuteSupported, false);
   assert.equal((await readClaim(await getChannel(dm.id))).activityMuteSupported, false);
 
   const dmListRes = await fetch(`${app.baseUrl}/api/channels/dm`, { headers: headers(ownerToken, server.id) });
@@ -959,7 +979,7 @@ test("activityMuteSupported is announced for channels and withheld for DMs on ev
 
   // The regular channel must still announce it on the same surfaces.
   assert.equal((await readClaim(await getSettings(channel.id))).activityMuteSupported, true);
-  assert.equal((await readClaim(await patchSettings(channel.id))).activityMuteSupported, true);
+  assert.equal((await readClaim(await patchSettings(channel.id, true))).activityMuteSupported, true);
   assert.equal((await readClaim(await getChannel(channel.id))).activityMuteSupported, true);
 });
 
@@ -1148,7 +1168,7 @@ test("GET /api/channels/unread records unread-count phases and query shape", asy
   );
   assert.ok(span, "expected GET /api/channels/unread root span");
 
-  const processEventNames = span.events
+  const processEventNames = handlerTraceEvents(span.events)
     .map((event) => event.name)
     .filter((name) => name !== "db.query.finished");
   assert.deepEqual(processEventNames, [
@@ -1159,14 +1179,14 @@ test("GET /api/channels/unread records unread-count phases and query shape", asy
     "http.response.finished",
   ]);
 
-  // Unread is ONE read of rw_conversation_unread_v3 (answered by its Postgres
+  // Unread is ONE read of rw_conversation_unread_v4 (answered by its Postgres
   // reference in tests); the summary adds its public hasNew arm to the same read.
-  const dbEvents = span.events.filter((event) => event.name === "db.query.finished");
+  const dbEvents = handlerTraceEvents(span.events).filter((event) => event.name === "db.query.finished");
   assert.deepEqual(dbEvents.map((event) => event.attrs?.query_name), ["channels.unread_counts_by_user"]);
   assert.equal(dbEvents.length, 1);
   assert.equal(dbEvents[0]?.attrs?.phase, "unread_counts.loaded");
   assert.equal(dbEvents[0]?.attrs?.unread_channels_count, 2);
-  assert.equal(dbEvents[0]?.attrs?.rw_conversation_unread_view, "rw_conversation_unread_v3");
+  assert.equal(dbEvents[0]?.attrs?.rw_conversation_unread_view, "rw_conversation_unread_v4");
   assert.equal(dbEvents[0]?.attrs?.["inbox.backend"], "rw_mv");
   assert.equal(dbEvents[0]?.attrs?.["inbox.route"], "channel_unread");
   assert.equal(dbEvents[0]?.attrs?.["inbox.fallback_reason"], "none");
@@ -1402,145 +1422,100 @@ test("updating channel description does not write a rename system message", asyn
 });
 
 
-test("manually hidden #all does not auto-reveal when a second agent joins", async () => {
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: true });
-  try {
-    const owner = await seedUser("manual-hidden-all-agent-owner@slock.test", "manual-hidden-all-agent-owner");
-    const server = await createServer("Manual Hidden Agent All", "manual-hidden-agent-all", owner.id);
-    const ownerToken = await tokenForHuman(owner.email);
+test("manually hidden #all does not auto-reveal when a second agent joins", async ({ app }) => {
+  const owner = await seedUser("manual-hidden-all-agent-owner@slock.test", "manual-hidden-all-agent-owner");
+  const server = await createServer("Manual Hidden Agent All", "manual-hidden-agent-all", owner.id);
+  const ownerToken = await tokenForHuman(owner.email);
 
-    const [allChannel] = await getDb()
-      .select({ id: channels.id, type: channels.type })
-      .from(channels)
-      .where(and(eq(channels.serverId, server.id), eq(channels.name, "all")));
-    assert.ok(allChannel, "opener-world server should have an #all row");
-    assert.equal(allChannel.type, "private", "opener-world #all starts born-hidden");
+  const [allChannel] = await getDb()
+    .select({ id: channels.id, type: channels.type })
+    .from(channels)
+    .where(and(eq(channels.serverId, server.id), eq(channels.name, "all")));
+  assert.ok(allChannel, "opener-world server should have an #all row");
+  assert.equal(allChannel.type, "private", "opener-world #all starts born-hidden");
 
-    const restore = await fetch(`${app.baseUrl}/api/channels/system/all/restore`, {
-      method: "POST",
-      headers: headers(ownerToken, server.id),
-    });
-    assert.equal(restore.status, 200, "admin can make #all visible before team-growth unlock");
+  const restore = await fetch(`${app.baseUrl}/api/channels/system/all/restore`, {
+    method: "POST",
+    headers: headers(ownerToken, server.id),
+  });
+  assert.equal(restore.status, 200, "admin can make #all visible before team-growth unlock");
 
-    // Repointed from PATCH /channels/:id to the dedicated hide endpoint (task #67).
-    // The generic visibility field now refuses #all, so leaving this on PATCH would
-    // have made the test drive a route nothing uses -- and it would have stayed
-    // green while the unlock-instruction claim it depends on silently went missing.
-    const hide = await fetch(`${app.baseUrl}/api/channels/system/all/hide`, {
-      method: "POST",
-      headers: headers(ownerToken, server.id),
-    });
-    assert.equal(hide.status, 200, "admin manual hide should succeed");
+  // Repointed from PATCH /channels/:id to the dedicated hide endpoint (task #67).
+  // The generic visibility field now refuses #all, so leaving this on PATCH would
+  // have made the test drive a route nothing uses -- and it would have stayed
+  // green while the unlock-instruction claim it depends on silently went missing.
+  const hide = await fetch(`${app.baseUrl}/api/channels/system/all/hide`, {
+    method: "POST",
+    headers: headers(ownerToken, server.id),
+  });
+  assert.equal(hide.status, 200, "admin manual hide should succeed");
 
-    const oaAgent = await createAgent(server.id, "manual-hidden-agent-all-oa", { runtime: "codex" });
-    await updateServerOnboardingAgent(server.id, oaAgent.id);
-    await createAgent(server.id, "manual-hidden-agent-all-second", { runtime: "codex" });
+  const oaAgent = await createAgent(server.id, "manual-hidden-agent-all-oa", { runtime: "codex" });
+  await updateServerOnboardingAgent(server.id, oaAgent.id);
+  await createAgent(server.id, "manual-hidden-agent-all-second", { runtime: "codex" });
 
-    const [allAfterSecondAgent] = await getDb()
-      .select({ type: channels.type })
-      .from(channels)
-      .where(eq(channels.id, allChannel.id));
-    assert.equal(allAfterSecondAgent.type, "private", "manual hidden #all must stay hidden when agent growth reaches unlock threshold");
-  } finally {
-    await app.close();
-  }
+  const [allAfterSecondAgent] = await getDb()
+    .select({ type: channels.type })
+    .from(channels)
+    .where(eq(channels.id, allChannel.id));
+  assert.equal(allAfterSecondAgent.type, "private", "manual hidden #all must stay hidden when agent growth reaches unlock threshold");
 });
 
 
 // Found in independent review of PR #7468. The hide endpoint skipped the
-// unlock-instruction claim whenever #all was ALREADY hidden -- and under
-// onboarding_opener_v2 that is the birth state of every new server, with the
-// instruction unclaimed. So an owner who hides an #all that is already hidden
+// unlock-instruction claim whenever #all was ALREADY hidden -- and that is the
+// birth state of every new server, with the instruction unclaimed. So an owner who hides an #all that is already hidden
 // expressed the same intent as one who hides a visible #all, and got a
 // different durable outcome: team growth later re-revealed it. The claim is
 // idempotent (it only writes when the column is null), so it must be
 // unconditional -- the action means "keep this hidden", not "flip a bit".
-test("hiding an already-hidden #all still claims the unlock instruction", async () => {
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: true });
-  try {
-    const owner = await seedUser("already-hidden-all-owner@slock.test", "already-hidden-all-owner");
-    const server = await createServer("Already Hidden All", "already-hidden-all", owner.id);
-    const ownerToken = await tokenForHuman(owner.email);
+test("hiding an already-hidden #all still claims the unlock instruction", async ({ app }) => {
+  const owner = await seedUser("already-hidden-all-owner@slock.test", "already-hidden-all-owner");
+  const server = await createServer("Already Hidden All", "already-hidden-all", owner.id);
+  const ownerToken = await tokenForHuman(owner.email);
 
-    const [allChannel] = await getDb()
-      .select({ id: channels.id, type: channels.type })
-      .from(channels)
-      .where(and(eq(channels.serverId, server.id), eq(channels.name, "all")));
-    assert.ok(allChannel, "opener-world server should have an #all row");
-    assert.equal(allChannel.type, "private", "opener-world #all starts born-hidden");
-
-    // Deliberately NO restore first: hide an #all that is already hidden.
-    const hide = await fetch(`${app.baseUrl}/api/channels/system/all/hide`, {
-      method: "POST",
-      headers: headers(ownerToken, server.id),
-    });
-    assert.equal(hide.status, 200, await hide.clone().text());
-
-    const oaAgent = await createAgent(server.id, "already-hidden-all-oa", { runtime: "codex" });
-    await updateServerOnboardingAgent(server.id, oaAgent.id);
-    await createAgent(server.id, "already-hidden-all-second", { runtime: "codex" });
-
-    const [allAfterGrowth] = await getDb()
-      .select({ type: channels.type })
-      .from(channels)
-      .where(eq(channels.id, allChannel.id));
-    assert.equal(
-      allAfterGrowth.type,
-      "private",
-      "an explicit hide of an already-hidden #all must survive the team-growth unlock",
-    );
-  } finally {
-    await app.close();
-  }
-});
-
-
-// Provenance: #proj-release:75e8ddc7 (scope A, 2026-07-08). Migration 0144 turns
-// onboarding_opener_v2 default-ON, making NEW servers' #all born hidden. tygg's
-// founder concern: an existing server whose members already chat in #all must not
-// lose the channel after the deploy. This pins that the flag is evaluated only at
-// server creation time and never retroactively rewrites existing #all rows.
-test("opener flag default-on must not retroactively hide existing #all (create-time only)", async ({ app }) => {
-  const owner = await seedUser("opener-retro-owner@slock.test", "opener-retro-owner");
-  // Old world: harness pins opener flag OFF — this server's #all is born enabled.
-  const server = await createServer("Opener Retro Server", "opener-retro-server", owner.id);
-  const [allBefore] = await getDb()
+  const [allChannel] = await getDb()
     .select({ id: channels.id, type: channels.type })
     .from(channels)
     .where(and(eq(channels.serverId, server.id), eq(channels.name, "all")));
-  assert.ok(allBefore, "old-world server should have an #all row");
-  assert.equal(allBefore.type, "channel", "old-world #all is born enabled");
+  assert.ok(allChannel, "opener-world server should have an #all row");
+  assert.equal(allChannel.type, "private", "opener-world #all starts born-hidden");
 
-  // Simulate the 0144 deploy: flip the flag default to ON. This must only touch
-  // feature_flags — never existing channel rows.
-  await getDb()
-    .update(featureFlags)
-    .set({ defaultEnabled: true })
-    .where(eq(featureFlags.key, ONBOARDING_OPENER_V2_FEATURE_FLAG_KEY));
-
-  const [allAfter] = await getDb()
-    .select({ id: channels.id, type: channels.type })
-    .from(channels)
-    .where(eq(channels.id, allBefore.id));
-  assert.equal(allAfter.type, "channel", "existing #all must not be retroactively hidden by the flag flip");
-
-  const ownerToken = await tokenForHuman(owner.email);
-  const listRes = await fetch(`${app.baseUrl}/api/channels`, {
+  // Deliberately NO restore first: hide an #all that is already hidden.
+  const hide = await fetch(`${app.baseUrl}/api/channels/system/all/hide`, {
+    method: "POST",
     headers: headers(ownerToken, server.id),
   });
-  assert.equal(listRes.status, 200);
-  const list = await listRes.json() as Array<{ id: string }>;
-  assert.ok(list.some((item) => item.id === allBefore.id), "existing #all must stay listed after the flag flip");
-  assert.equal(await canUserPostToChannel(allBefore.id, owner.id), true, "existing #all must stay postable after the flag flip");
+  assert.equal(hide.status, 200, await hide.clone().text());
 
-  // While a server created AFTER the flip is born hidden — the new-world boundary.
+  const oaAgent = await createAgent(server.id, "already-hidden-all-oa", { runtime: "codex" });
+  await updateServerOnboardingAgent(server.id, oaAgent.id);
+  await createAgent(server.id, "already-hidden-all-second", { runtime: "codex" });
+
+  const [allAfterGrowth] = await getDb()
+    .select({ type: channels.type })
+    .from(channels)
+    .where(eq(channels.id, allChannel.id));
+  assert.equal(
+    allAfterGrowth.type,
+    "private",
+    "an explicit hide of an already-hidden #all must survive the team-growth unlock",
+  );
+});
+
+
+// Provenance: #proj-release:75e8ddc7 (scope A, 2026-07-08). Every new server's
+// #all is born hidden (private) and must not list for the owner before unlock.
+test("a new server's #all is born hidden and not listed before unlock", async ({ app }) => {
+  const owner = await seedUser("opener-retro-owner@slock.test", "opener-retro-owner");
+  const ownerToken = await tokenForHuman(owner.email);
   const serverNew = await createServer("Opener New World Server", "opener-new-world-server", owner.id);
   const [allNew] = await getDb()
     .select({ id: channels.id, type: channels.type })
     .from(channels)
     .where(and(eq(channels.serverId, serverNew.id), eq(channels.name, "all")));
   assert.ok(allNew, "new-world server should still create an #all row");
-  assert.equal(allNew.type, "private", "flag-on new server #all is born hidden");
+  assert.equal(allNew.type, "private", "new server #all is born hidden");
   const listNewRes = await fetch(`${app.baseUrl}/api/channels`, {
     headers: headers(ownerToken, serverNew.id),
   });
@@ -1554,8 +1529,7 @@ test("opener flag default-on must not retroactively hide existing #all (create-t
 // born-hidden design (John's T2 flow): the 2nd agent on an opener-world server flips
 // hidden #all back to a live channel. Without this pin, only the hiding half of the
 // design has coverage.
-test("opener-world hidden #all auto-reveals when the 2nd agent arrives", async () => {
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: true });
+test("opener-world hidden #all auto-reveals when the 2nd agent arrives", async ({ app }) => {
   // onboardingService and messageService form a production-safe ESM cycle,
   // but Vitest's transformed module graph cannot eagerly capture this one
   // function. The persisted-message behavior is covered in focused service
@@ -1604,7 +1578,6 @@ test("opener-world hidden #all auto-reveals when the 2nd agent arrives", async (
     assert.equal(await canUserPostToChannel(allChannel.id, owner.id), true, "revealed #all must be postable");
   } finally {
     __resetOnboardingServiceDepsForTests();
-    await app.close();
   }
 });
 
@@ -2100,8 +2073,8 @@ test("Activity All paginates more than 100 unfollowed rows with mixed follow sta
     forceCanonicalPostgres: true,
   });
   assert.deepEqual(
-    whitespaceSearch.items.map((item) => item.kind === "thread" ? item.threadChannelId : item.channelId),
-    first.items.map((item) => item.kind === "thread" ? item.threadChannelId : item.channelId),
+    whitespaceSearch.items.map((item) => (item.kind === "thread" || item.kind === "task") ? item.threadChannelId : item.channelId),
+    first.items.map((item) => (item.kind === "thread" || item.kind === "task") ? item.threadChannelId : item.channelId),
     "blank search must normalize once for both active and unfollowed sources",
   );
   assert.equal(whitespaceSearch.totalCount, first.totalCount);
@@ -2138,37 +2111,6 @@ test("Activity All paginates more than 100 unfollowed rows with mixed follow sta
   assert.ok(
     threadRows.filter((_, index) => isUnfollowedIndex(index)).length > 100,
     "fixture must cross the retired 100-row unfollowed overlay cap",
-  );
-});
-
-
-test("composed Unread + Mentions is preserved by the RisingWave serving query", () => {
-  const source = readFileSync(new URL("../services/channelService.ts", import.meta.url), "utf8");
-
-  assert.match(
-    source,
-    /\$3::text = 'unread_mentions' AND i\.unread_count > 0 AND i\.has_mention/,
-  );
-});
-
-
-test("all Activity facet backends project and order DM/channel groups by recent activity", () => {
-  const source = readFileSync(new URL("../services/channelService.ts", import.meta.url), "utf8");
-
-  assert.equal(
-    source.match(/MAX\((?:"activityAt"|last_activity_at)\) AS "groupLastActivityAt"/g)?.length,
-    3,
-    "RisingWave, legacy activity PG, and canonical combined PG each aggregate a facet timestamp (the serving-row PG path died in the 2026-09-21 teardown)",
-  );
-  assert.equal(
-    source.match(/array_agg\("groupLastActivityAt"::text ORDER BY CASE WHEN "groupChannelType" = 'dm' THEN 0 ELSE 1 END, "groupLastActivityAt" DESC NULLS LAST/g)?.length,
-    3,
-    "all three paths keep DM and Channel sections and order each by the same recent-activity key",
-  );
-  assert.equal(
-    source.match(/group_totals\."groupLastActivityAts"/g)?.length,
-    3,
-    "the surviving backends carry the aligned facet timestamp array (serving-row PG and its split page projection died in the 2026-09-21 teardown)",
   );
 });
 
@@ -2610,7 +2552,6 @@ test("POST /channels/:id/read-all delegates to a kinded agent receiver without t
   const privateChannel = await createChannel(server.id, "agent-read-private", undefined, "private");
   await addAgent(privateChannel.id, agent.id);
   const message = await createMessage(privateChannel.id, "user", sender.id, "delegated read");
-  await enableReadReceiptsForServer(server.id);
   const ownerToken = await tokenForHuman(owner.email);
   const memberToken = await tokenForHuman(member.email);
 
@@ -2676,13 +2617,12 @@ test("POST /channels/:id/read-all delegates to a kinded agent receiver without t
 });
 
 
-test("read-state mutations emit versioned user-room events", async () => {
+test("read-state mutations emit versioned user-room events", async ({ app }) => {
   const previousInfo = console.info;
   const infoLogs: unknown[][] = [];
   console.info = (...args: unknown[]) => {
     infoLogs.push(args);
   };
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
   try {
     const events = installFakeIo(app.app);
     const owner = await seedUser("read-state-owner@slock.test", "read-state-owner");
@@ -2800,6 +2740,8 @@ test("read-state mutations emit versioned user-room events", async () => {
       unreadCount: 1,
       maxReadSeq: second.seq - 1,
       readStateVersion: 3,
+      markedUnread: false,
+      outcome: "counted",
     });
     assert.deepEqual(events.at(-1), {
       room: `user:${member.id}`,
@@ -2823,16 +2765,17 @@ test("read-state mutations emit versioned user-room events", async () => {
       unreadCount: 1,
       maxReadSeq: second.seq - 1,
       readStateVersion: 3,
+      markedUnread: false,
+      outcome: "counted",
     });
     assert.equal(events.length, afterUnreadEventCount, "unread no-op must not emit");
   } finally {
     console.info = previousInfo;
-    await app.close();
   }
 });
 
 
-test("receiver-state push kill-switch suppresses emits but leaves read-state facts visible", async () => {
+test("receiver-state push kill-switch suppresses emits but leaves read-state facts visible", async ({ app }) => {
   const previousFlag = process.env.SLOCK_RECEIVER_STATE_PUSH_ENABLED;
   const previousWarn = console.warn;
   const warnings: unknown[][] = [];
@@ -2840,7 +2783,6 @@ test("receiver-state push kill-switch suppresses emits but leaves read-state fac
   console.warn = (...args: unknown[]) => {
     warnings.push(args);
   };
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
   try {
     const events = installFakeIo(app.app);
     const owner = await seedUser("receiver-state-flag-owner@slock.test", "receiver-state-flag-owner");
@@ -2892,18 +2834,16 @@ test("receiver-state push kill-switch suppresses emits but leaves read-state fac
     if (previousFlag === undefined) delete process.env.SLOCK_RECEIVER_STATE_PUSH_ENABLED;
     else process.env.SLOCK_RECEIVER_STATE_PUSH_ENABLED = previousFlag;
     console.warn = previousWarn;
-    await app.close();
   }
 });
 
 
-test("receiver-state push logs missing io mount without rolling back read-state facts", async () => {
+test("receiver-state push logs missing io mount without rolling back read-state facts", async ({ app }) => {
   const previousWarn = console.warn;
   const warnings: unknown[][] = [];
   console.warn = (...args: unknown[]) => {
     warnings.push(args);
   };
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
   try {
     app.app.set("io", undefined);
     const owner = await seedUser("receiver-state-missing-io-owner@slock.test", "receiver-state-missing-io-owner");
@@ -2952,7 +2892,6 @@ test("receiver-state push logs missing io mount without rolling back read-state 
     assert.equal(detailBody.readStateVersion, 1);
   } finally {
     console.warn = previousWarn;
-    await app.close();
   }
 });
 
@@ -2965,171 +2904,162 @@ test("receiver-state push logs missing io mount without rolling back read-state 
 // @cindyz's ruling (msg=c1a72093): membership is required to change visibility,
 // #all is never reachable that way, and only humans manage #all, from channel
 // settings or server settings.
-test("#all visibility is refused on the generic field, for humans and agents alike", async () => {
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
-  try {
-    const db = getDb();
-    const owner = await seedUser("all-guard-owner@slock.test", "all-guard-owner");
-    const server = await createServer("All Guard", "all-guard", owner.id);
-    const ownerToken = await tokenForHuman(owner.email);
+test("#all visibility is refused on the generic field, for humans and agents alike", async ({ app }) => {
+  const db = getDb();
+  const owner = await seedUser("all-guard-owner@slock.test", "all-guard-owner");
+  const server = await createServer("All Guard", "all-guard", owner.id);
+  await revealAllChannelForTest(server.id);
+  const ownerToken = await tokenForHuman(owner.email);
 
-    const [allChannel] = await db.select().from(channels)
-      .where(and(eq(channels.serverId, server.id), eq(channels.name, "all")));
+  const [allChannel] = await db.select().from(channels)
+    .where(and(eq(channels.serverId, server.id), eq(channels.name, "all")));
 
-    // The owner holds changeChannelVisibility and is refused anyway: this is a
-    // property of the channel, not of the actor's authority.
-    const humanAttempt = await fetch(`${app.baseUrl}/api/channels/${allChannel.id}`, {
-      method: "PATCH",
-      headers: headers(ownerToken, server.id),
-      body: JSON.stringify({ visibility: "private" }),
-    });
-    assert.equal(humanAttempt.status, 403, await humanAttempt.clone().text());
-    const humanBody = await humanAttempt.json() as { error: string; code?: string };
-    assert.equal(humanBody.code, "all_channel_visibility_managed_separately");
-    // AX guidance, not a bare refusal (@cindyz msg=66de07f5): an agent told only
-    // "forbidden" retries or reports the product as broken.
-    assert.match(humanBody.error, /Only a human can do it, from channel settings or server settings/);
+  // The owner holds changeChannelVisibility and is refused anyway: this is a
+  // property of the channel, not of the actor's authority.
+  const humanAttempt = await fetch(`${app.baseUrl}/api/channels/${allChannel.id}`, {
+    method: "PATCH",
+    headers: headers(ownerToken, server.id),
+    body: JSON.stringify({ visibility: "private" }),
+  });
+  assert.equal(humanAttempt.status, 403, await humanAttempt.clone().text());
+  const humanBody = await humanAttempt.json() as { error: string; code?: string };
+  assert.equal(humanBody.code, "all_channel_visibility_managed_separately");
+  // AX guidance, not a bare refusal (@cindyz msg=66de07f5): an agent told only
+  // "forbidden" retries or reports the product as broken.
+  assert.match(humanBody.error, /Only a human can do it, from channel settings or server settings/);
 
-    const agent = await createAgent(server.id, "all-guard-agent", { runtime: "codex" });
-    await db.update(serverAgentMembers).set({ role: "admin" })
-      .where(and(eq(serverAgentMembers.serverId, server.id), eq(serverAgentMembers.agentId, agent.id)));
-    const cred = await mintAgentCredential({
-      agentId: agent.id, scopes: ["send", "read", "channels", "server"],
-      name: "all-guard", createdByUserId: null,
-    });
-    const agentAttempt = await fetch(`${app.baseUrl}/internal/agent-api/channels/${allChannel.id}`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${cred.apiKey}` },
-      body: JSON.stringify({ visibility: "private" }),
-    });
-    assert.equal(agentAttempt.status, 403, await agentAttempt.clone().text());
-    const agentBody = await agentAttempt.json() as { error: string; code?: string };
-    assert.equal(agentBody.code, "all_channel_visibility_managed_separately");
+  const agent = await createAgent(server.id, "all-guard-agent", { runtime: "codex" });
+  await db.update(serverAgentMembers).set({ role: "admin" })
+    .where(and(eq(serverAgentMembers.serverId, server.id), eq(serverAgentMembers.agentId, agent.id)));
+  const cred = await mintAgentCredential({
+    agentId: agent.id, scopes: ["send", "read", "channels", "server"],
+    name: "all-guard", issuedVia: "computer", createdByUserId: null,
+  });
+  const agentAttempt = await fetch(`${app.baseUrl}/internal/agent-api/channels/${allChannel.id}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${cred.apiKey}` },
+    body: JSON.stringify({ visibility: "private" }),
+  });
+  assert.equal(agentAttempt.status, 403, await agentAttempt.clone().text());
+  const agentBody = await agentAttempt.json() as { error: string; code?: string };
+  assert.equal(agentBody.code, "all_channel_visibility_managed_separately");
 
-    // Suggested in independent review of PR #7468. "Only a human can hide #all"
-    // currently holds because channelRouter is not mounted anywhere an agent can
-    // reach -- a STRUCTURAL property, guaranteed by route mounting rather than by
-    // a test. Nothing would redden if someone later mounted it on an
-    // agent-reachable path. This pins the property itself, cheaply, with an
-    // agent credential that is deliberately server-admin and holds every scope.
-    //
-    // LABEL, so nobody misreads it later (@Huarong): this is a STRUCTURAL CANARY,
-    // not a behavioural test. It passes today with 404 because the route does not
-    // exist on the agent surface at all -- its negative arm cannot fire under the
-    // current structure. It proves "this path is not reachable today", NOT "an
-    // agent tried and an authorization check refused it". Do not cite it as
-    // evidence that an authorization check exists.
-    const agentHide = await fetch(`${app.baseUrl}/internal/agent-api/channels/system/all/hide`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${cred.apiKey}` },
-    });
-    assert.ok(
-      agentHide.status === 401 || agentHide.status === 403 || agentHide.status === 404,
-      `an agent must not reach the human-only hide endpoint; got ${agentHide.status}`,
-    );
-    const [afterAgentHide] = await db.select({ type: channels.type }).from(channels).where(eq(channels.id, allChannel.id));
-    assert.equal(afterAgentHide.type, "channel", "#all must be untouched by the agent hide attempt");
-    assert.match(agentBody.error, /Only a human can do it, from channel settings or server settings/);
+  // Suggested in independent review of PR #7468. "Only a human can hide #all"
+  // currently holds because channelRouter is not mounted anywhere an agent can
+  // reach -- a STRUCTURAL property, guaranteed by route mounting rather than by
+  // a test. Nothing would redden if someone later mounted it on an
+  // agent-reachable path. This pins the property itself, cheaply, with an
+  // agent credential that is deliberately server-admin and holds every scope.
+  //
+  // LABEL, so nobody misreads it later (@Huarong): this is a STRUCTURAL CANARY,
+  // not a behavioural test. It passes today with 404 because the route does not
+  // exist on the agent surface at all -- its negative arm cannot fire under the
+  // current structure. It proves "this path is not reachable today", NOT "an
+  // agent tried and an authorization check refused it". Do not cite it as
+  // evidence that an authorization check exists.
+  const agentHide = await fetch(`${app.baseUrl}/internal/agent-api/channels/system/all/hide`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${cred.apiKey}` },
+  });
+  assert.ok(
+    agentHide.status === 401 || agentHide.status === 403 || agentHide.status === 404,
+    `an agent must not reach the human-only hide endpoint; got ${agentHide.status}`,
+  );
+  const [afterAgentHide] = await db.select({ type: channels.type }).from(channels).where(eq(channels.id, allChannel.id));
+  assert.equal(afterAgentHide.type, "channel", "#all must be untouched by the agent hide attempt");
+  assert.match(agentBody.error, /Only a human can do it, from channel settings or server settings/);
 
-    const [after] = await db.select({ type: channels.type }).from(channels).where(eq(channels.id, allChannel.id));
-    assert.equal(after.type, "channel", "#all must be untouched by either refusal");
+  const [after] = await db.select({ type: channels.type }).from(channels).where(eq(channels.id, allChannel.id));
+  assert.equal(after.type, "channel", "#all must be untouched by either refusal");
 
-    // The human surface still works, and hide/restore is a round trip.
-    const hidden = await fetch(`${app.baseUrl}/api/channels/system/all/hide`, {
-      method: "POST", headers: headers(ownerToken, server.id),
-    });
-    assert.equal(hidden.status, 200, await hidden.clone().text());
-    const [afterHide] = await db.select({ type: channels.type }).from(channels).where(eq(channels.id, allChannel.id));
-    assert.equal(afterHide.type, "private");
+  // The human surface still works, and hide/restore is a round trip.
+  const hidden = await fetch(`${app.baseUrl}/api/channels/system/all/hide`, {
+    method: "POST", headers: headers(ownerToken, server.id),
+  });
+  assert.equal(hidden.status, 200, await hidden.clone().text());
+  const [afterHide] = await db.select({ type: channels.type }).from(channels).where(eq(channels.id, allChannel.id));
+  assert.equal(afterHide.type, "private");
 
-    const restored = await fetch(`${app.baseUrl}/api/channels/system/all/restore`, {
-      method: "POST", headers: headers(ownerToken, server.id),
-    });
-    assert.equal(restored.status, 200, await restored.clone().text());
-    const [afterRestore] = await db.select({ type: channels.type }).from(channels).where(eq(channels.id, allChannel.id));
-    assert.equal(afterRestore.type, "channel", "hide must be reversible from the human surface");
-  } finally {
-    await app.close();
-  }
+  const restored = await fetch(`${app.baseUrl}/api/channels/system/all/restore`, {
+    method: "POST", headers: headers(ownerToken, server.id),
+  });
+  assert.equal(restored.status, 200, await restored.clone().text());
+  const [afterRestore] = await db.select({ type: channels.type }).from(channels).where(eq(channels.id, allChannel.id));
+  assert.equal(afterRestore.type, "channel", "hide must be reversible from the human surface");
 });
 
 // The other half of the report: an actor that is NOT a member of an ordinary
 // public channel could turn it private and then be refused by the rule it had
 // just created, because a public channel needs no membership row to be reached.
 // Requiring membership up front is what makes that door two-way.
-test("changing channel visibility requires membership, for humans and agents alike", async () => {
-  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
-  try {
-    const db = getDb();
-    const owner = await seedUser("vis-member-owner@slock.test", "vis-member-owner");
-    const insider = await seedUser("vis-member-insider@slock.test", "vis-member-insider");
-    const server = await createServer("Vis Member", "vis-member", owner.id);
-    await addMember(server.id, insider.id);
-    const ownerToken = await tokenForHuman(owner.email);
+test("changing channel visibility requires membership, for humans and agents alike", async ({ app }) => {
+  const db = getDb();
+  const owner = await seedUser("vis-member-owner@slock.test", "vis-member-owner");
+  const insider = await seedUser("vis-member-insider@slock.test", "vis-member-insider");
+  const server = await createServer("Vis Member", "vis-member", owner.id);
+  await addMember(server.id, insider.id);
+  const ownerToken = await tokenForHuman(owner.email);
 
-    // Created by the insider, so the owner is deliberately not a member.
-    const target = await createChannel(server.id, "not-mine", undefined, "channel", {
-      type: "user", id: insider.id,
-    });
-    const rows = await db.select({ userId: channelHumans.userId }).from(channelHumans)
-      .where(eq(channelHumans.channelId, target.id));
-    assert.deepEqual(rows.map((r) => r.userId), [insider.id], "the owner must not be a member for this test to mean anything");
+  // Created by the insider, so the owner is deliberately not a member.
+  const target = await createChannel(server.id, "not-mine", undefined, "channel", {
+    type: "user", id: insider.id,
+  });
+  const rows = await db.select({ userId: channelHumans.userId }).from(channelHumans)
+    .where(eq(channelHumans.channelId, target.id));
+  assert.deepEqual(rows.map((r) => r.userId), [insider.id], "the owner must not be a member for this test to mean anything");
 
-    const humanAttempt = await fetch(`${app.baseUrl}/api/channels/${target.id}`, {
+  const humanAttempt = await fetch(`${app.baseUrl}/api/channels/${target.id}`, {
+    method: "PATCH",
+    headers: headers(ownerToken, server.id),
+    body: JSON.stringify({ visibility: "private" }),
+  });
+  assert.equal(humanAttempt.status, 403, await humanAttempt.clone().text());
+  assert.equal((await humanAttempt.json() as { code?: string }).code, "channel_membership_required");
+
+  const agent = await createAgent(server.id, "vis-member-agent", { runtime: "codex" });
+  await db.update(serverAgentMembers).set({ role: "admin" })
+    .where(and(eq(serverAgentMembers.serverId, server.id), eq(serverAgentMembers.agentId, agent.id)));
+  const cred = await mintAgentCredential({
+    agentId: agent.id, scopes: ["send", "read", "channels", "server"],
+    name: "vis-member", issuedVia: "computer", createdByUserId: null,
+  });
+  const agentAttempt = await fetch(`${app.baseUrl}/internal/agent-api/channels/${target.id}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${cred.apiKey}` },
+    body: JSON.stringify({ visibility: "private" }),
+  });
+  assert.equal(agentAttempt.status, 403, await agentAttempt.clone().text());
+  assert.equal((await agentAttempt.json() as { code?: string }).code, "channel_membership_required");
+
+  const [after] = await db.select({ type: channels.type }).from(channels).where(eq(channels.id, target.id));
+  assert.equal(after.type, "channel", "neither refusal may have changed the channel");
+
+  // Membership is an ADDITIONAL requirement, not a replacement: the capability
+  // still comes from the server role (owner/admin), so the insider -- an
+  // ordinary member who IS in the channel -- is still refused.
+  const insiderToken = await tokenForHuman(insider.email);
+  const insiderAttempt = await fetch(`${app.baseUrl}/api/channels/${target.id}`, {
+    method: "PATCH",
+    headers: headers(insiderToken, server.id),
+    body: JSON.stringify({ visibility: "private" }),
+  });
+  assert.equal(insiderAttempt.status, 403, "channel membership alone must not confer changeChannelVisibility");
+
+  // The owner joins, and can now round-trip it. This is the point of requiring
+  // membership rather than dropping the access check: the actor holds a row,
+  // ordinary channels preserve rows across the transition, so the door is
+  // two-way for whoever went through it.
+  await addHuman(target.id, owner.id);
+  for (const visibility of ["private", "public"] as const) {
+    const res = await fetch(`${app.baseUrl}/api/channels/${target.id}`, {
       method: "PATCH",
       headers: headers(ownerToken, server.id),
-      body: JSON.stringify({ visibility: "private" }),
+      body: JSON.stringify({ visibility }),
     });
-    assert.equal(humanAttempt.status, 403, await humanAttempt.clone().text());
-    assert.equal((await humanAttempt.json() as { code?: string }).code, "channel_membership_required");
-
-    const agent = await createAgent(server.id, "vis-member-agent", { runtime: "codex" });
-    await db.update(serverAgentMembers).set({ role: "admin" })
-      .where(and(eq(serverAgentMembers.serverId, server.id), eq(serverAgentMembers.agentId, agent.id)));
-    const cred = await mintAgentCredential({
-      agentId: agent.id, scopes: ["send", "read", "channels", "server"],
-      name: "vis-member", createdByUserId: null,
-    });
-    const agentAttempt = await fetch(`${app.baseUrl}/internal/agent-api/channels/${target.id}`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${cred.apiKey}` },
-      body: JSON.stringify({ visibility: "private" }),
-    });
-    assert.equal(agentAttempt.status, 403, await agentAttempt.clone().text());
-    assert.equal((await agentAttempt.json() as { code?: string }).code, "channel_membership_required");
-
-    const [after] = await db.select({ type: channels.type }).from(channels).where(eq(channels.id, target.id));
-    assert.equal(after.type, "channel", "neither refusal may have changed the channel");
-
-    // Membership is an ADDITIONAL requirement, not a replacement: the capability
-    // still comes from the server role (owner/admin), so the insider -- an
-    // ordinary member who IS in the channel -- is still refused.
-    const insiderToken = await tokenForHuman(insider.email);
-    const insiderAttempt = await fetch(`${app.baseUrl}/api/channels/${target.id}`, {
-      method: "PATCH",
-      headers: headers(insiderToken, server.id),
-      body: JSON.stringify({ visibility: "private" }),
-    });
-    assert.equal(insiderAttempt.status, 403, "channel membership alone must not confer changeChannelVisibility");
-
-    // The owner joins, and can now round-trip it. This is the point of requiring
-    // membership rather than dropping the access check: the actor holds a row,
-    // ordinary channels preserve rows across the transition, so the door is
-    // two-way for whoever went through it.
-    await addHuman(target.id, owner.id);
-    for (const visibility of ["private", "public"] as const) {
-      const res = await fetch(`${app.baseUrl}/api/channels/${target.id}`, {
-        method: "PATCH",
-        headers: headers(ownerToken, server.id),
-        body: JSON.stringify({ visibility }),
-      });
-      assert.equal(res.status, 200, `member-owner must be able to set ${visibility}: ${await res.clone().text()}`);
-    }
-    const [roundTripped] = await db.select({ type: channels.type }).from(channels).where(eq(channels.id, target.id));
-    assert.equal(roundTripped.type, "channel", "a member's visibility change must be reversible by that member");
-  } finally {
-    await app.close();
+    assert.equal(res.status, 200, `member-owner must be able to set ${visibility}: ${await res.clone().text()}`);
   }
+  const [roundTripped] = await db.select({ type: channels.type }).from(channels).where(eq(channels.id, target.id));
+  assert.equal(roundTripped.type, "channel", "a member's visibility change must be reversible by that member");
 });
 
 test("POST /api/channels/:id/resume-all-agents reports an agent whose start was skipped instead of counting it resumed", async ({ app, seed, http }) => {

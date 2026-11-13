@@ -1,332 +1,60 @@
 import { Buffer } from "node:buffer";
 
-const C = {
-  _: "transparent",
-  K: "#141111",
-  W: "#FFFFFF",
-  P: "#FE7DA8",
-  O: "#F8A16F",
-  Y: "#FFD440",
-  L: "#A9D877",
-  C: "#27CCF3",
-  V: "#BBAFE6",
-  B: "#576574",
-  R: "#F97264",
-  G: "#9DCAAA",
-  D: "#B07A4E",    // latte-brown — avatar-specific (Cindy mug body only; not a design token)
-};
+import pixelAvatars from "@botiverse/raft-shared/assets/pixelAvatars.json" with { type: "json" };
+import { generatePixelAvatar } from "@botiverse/raft-shared/src/pixelAvatarGenerator";
+import { isHumanAvatarUrl, readHumanAvatarRecipe, renderHumanAvatarSvg } from "@botiverse/raft-shared/src/humanAvatar";
+import { HUMAN_AVATAR_ART, HUMAN_AVATAR_ART_REVISION } from "@botiverse/raft-shared/src/humanAvatarArt";
+
+// Palette and sprites come from the same JSON the web's PixelAvatar.tsx reads
+// (packages/shared/assets/pixelAvatars.json), so a new avatar needs no server
+// edit. The seeded-random generator is the web's too
+// (packages/shared/src/pixelAvatarGenerator.ts; oauth.api.test.ts pins it to
+// the web PRNG fixture).
+const C = pixelAvatars.palette;
 
 type PaletteKey = keyof typeof C;
 
 type PixelAvatarData = { grid: PaletteKey[][]; bg: string };
 
-const AVATARS: Record<string, PixelAvatarData> = {
-  robot: {
-    bg: C.C,
-    grid: [
-      ["_","K","K","K","K","K","K","_"],
-      ["K","C","K","W","W","K","C","K"],
-      ["K","W","K","W","W","K","W","K"],
-      ["K","K","K","K","K","K","K","K"],
-      ["_","K","W","K","K","W","K","_"],
-      ["_","K","K","K","K","K","K","_"],
-      ["_","K","K","_","_","K","K","_"],
-      ["_","K","K","_","_","K","K","_"],
-    ],
-  },
-  cat: {
-    bg: C.Y,
-    grid: [
-      ["K","_","_","_","_","_","_","K"],
-      ["K","K","_","_","_","_","K","K"],
-      ["K","Y","K","Y","Y","K","Y","K"],
-      ["K","Y","Y","Y","Y","Y","Y","K"],
-      ["K","Y","K","Y","Y","K","Y","K"],
-      ["_","K","Y","Y","Y","Y","K","_"],
-      ["_","_","K","Y","Y","K","_","_"],
-      ["_","_","_","K","K","_","_","_"],
-    ],
-  },
-  ghost: {
-    bg: C.V,
-    grid: [
-      ["_","_","K","K","K","K","_","_"],
-      ["_","K","W","W","W","W","K","_"],
-      ["K","W","K","W","W","K","W","K"],
-      ["K","W","W","W","W","W","W","K"],
-      ["K","W","W","W","W","W","W","K"],
-      ["K","W","W","K","K","W","W","K"],
-      ["K","W","K","W","W","K","W","K"],
-      ["K","_","K","_","_","K","_","K"],
-    ],
-  },
-  skull: {
-    bg: C.O,
-    grid: [
-      ["_","K","K","K","K","K","K","_"],
-      ["K","W","W","W","W","W","W","K"],
-      ["K","W","K","W","W","K","W","K"],
-      ["K","W","W","W","W","W","W","K"],
-      ["_","K","W","W","W","W","K","_"],
-      ["_","K","W","K","W","K","K","_"],
-      ["_","_","K","K","K","K","_","_"],
-      ["_","_","_","K","K","_","_","_"],
-    ],
-  },
-  alien: {
-    bg: C.L,
-    grid: [
-      ["_","K","K","K","K","K","K","_"],
-      ["K","G","G","G","G","G","G","K"],
-      ["K","G","K","K","K","K","G","K"],
-      ["K","G","G","G","G","G","G","K"],
-      ["_","K","G","G","G","G","K","_"],
-      ["_","_","K","G","G","K","_","_"],
-      ["_","_","K","G","G","K","_","_"],
-      ["_","K","K","_","_","K","K","_"],
-    ],
-  },
-  heart: {
-    bg: C.P,
-    grid: [
-      ["_","_","_","_","_","_","_","_"],
-      ["_","K","K","_","_","K","K","_"],
-      ["K","R","R","K","K","R","R","K"],
-      ["K","R","R","R","R","R","R","K"],
-      ["K","R","R","R","R","R","R","K"],
-      ["_","K","R","R","R","R","K","_"],
-      ["_","_","K","R","R","K","_","_"],
-      ["_","_","_","K","K","_","_","_"],
-    ],
-  },
-  star: {
-    bg: C.Y,
-    grid: [
-      ["_","_","_","K","K","_","_","_"],
-      ["_","_","_","K","K","_","_","_"],
-      ["K","K","K","K","K","K","K","K"],
-      ["_","K","Y","Y","Y","Y","K","_"],
-      ["_","_","K","Y","Y","K","_","_"],
-      ["_","K","Y","K","K","Y","K","_"],
-      ["K","Y","K","_","_","K","Y","K"],
-      ["K","K","_","_","_","_","K","K"],
-    ],
-  },
-  flame: {
-    bg: C.O,
-    grid: [
-      ["_","_","_","K","_","_","_","_"],
-      ["_","_","K","R","K","_","_","_"],
-      ["_","_","K","R","K","K","_","_"],
-      ["_","K","O","R","R","R","K","_"],
-      ["_","K","O","O","R","R","K","_"],
-      ["K","Y","O","O","O","R","K","_"],
-      ["K","Y","Y","O","O","K","_","_"],
-      ["_","K","K","K","K","_","_","_"],
-    ],
-  },
-  diamond: {
-    bg: C.C,
-    grid: [
-      ["_","_","_","K","K","_","_","_"],
-      ["_","_","K","C","C","K","_","_"],
-      ["_","K","C","W","C","C","K","_"],
-      ["K","C","W","C","C","C","C","K"],
-      ["K","C","C","C","C","C","C","K"],
-      ["_","K","C","C","C","C","K","_"],
-      ["_","_","K","C","C","K","_","_"],
-      ["_","_","_","K","K","_","_","_"],
-    ],
-  },
-  mushroom: {
-    bg: C.P,
-    grid: [
-      ["_","_","K","K","K","K","_","_"],
-      ["_","K","R","W","W","R","K","_"],
-      ["K","R","R","W","W","R","R","K"],
-      ["K","R","R","R","R","R","R","K"],
-      ["_","K","K","K","K","K","K","_"],
-      ["_","_","K","W","W","K","_","_"],
-      ["_","_","K","W","W","K","_","_"],
-      ["_","K","K","K","K","K","K","_"],
-    ],
-  },
-  eye: {
-    bg: C.V,
-    grid: [
-      ["_","_","_","_","_","_","_","_"],
-      ["_","_","K","K","K","K","_","_"],
-      ["_","K","W","W","W","W","K","_"],
-      ["K","W","W","K","K","W","W","K"],
-      ["K","W","W","K","K","W","W","K"],
-      ["_","K","W","W","W","W","K","_"],
-      ["_","_","K","K","K","K","_","_"],
-      ["_","_","_","_","_","_","_","_"],
-    ],
-  },
-  crown: {
-    bg: C.Y,
-    grid: [
-      ["_","_","_","_","_","_","_","_"],
-      ["_","K","_","K","K","_","K","_"],
-      ["_","K","K","K","K","K","K","_"],
-      ["_","K","Y","Y","Y","Y","K","_"],
-      ["_","K","Y","Y","Y","Y","K","_"],
-      ["K","K","K","K","K","K","K","K"],
-      ["K","Y","Y","Y","Y","Y","Y","K"],
-      ["K","K","K","K","K","K","K","K"],
-    ],
-  },
-  // Sprites 13-16 — added 2026-04-28 (Duoyu v2 set, stdrc-picked).
-  // Bg coverage adds R/B/L which the original 12 didn't use. See
-  // slock-design/tokens/avatar-palette.json v1.2.0.
-  cloud: {
-    bg: C.C,
-    grid: [
-      ["_","_","_","_","_","_","_","_"],
-      ["_","_","K","K","_","_","_","_"],
-      ["_","K","W","W","K","K","_","_"],
-      ["K","W","W","W","W","W","K","_"],
-      ["K","W","W","W","W","W","W","K"],
-      ["K","W","W","W","W","W","W","K"],
-      ["_","K","K","K","K","K","K","_"],
-      ["_","_","_","_","_","_","_","_"],
-    ],
-  },
-  sun: {
-    bg: C.R,
-    grid: [
-      ["_","K","_","K","K","_","K","_"],
-      ["K","_","K","Y","Y","K","_","K"],
-      ["_","K","Y","Y","Y","Y","K","_"],
-      ["K","Y","Y","Y","Y","Y","Y","K"],
-      ["K","Y","Y","Y","Y","Y","Y","K"],
-      ["_","K","Y","Y","Y","Y","K","_"],
-      ["K","_","K","Y","Y","K","_","K"],
-      ["_","K","_","K","K","_","K","_"],
-    ],
-  },
-  bell: {
-    bg: C.B,
-    grid: [
-      ["_","_","_","K","K","_","_","_"],
-      ["_","_","K","Y","Y","K","_","_"],
-      ["_","K","Y","Y","Y","Y","K","_"],
-      ["_","K","Y","Y","Y","Y","K","_"],
-      ["_","K","Y","Y","Y","Y","K","_"],
-      ["K","Y","Y","Y","Y","Y","Y","K"],
-      ["K","K","K","K","K","K","K","K"],
-      ["_","_","_","K","K","_","_","_"],
-    ],
-  },
-  tree: {
-    bg: C.L,
-    grid: [
-      ["_","_","_","K","K","_","_","_"],
-      ["_","_","K","G","G","K","_","_"],
-      ["_","K","G","G","G","G","K","_"],
-      ["K","G","G","G","G","G","G","K"],
-      ["K","G","G","G","G","G","G","K"],
-      ["_","K","K","G","G","K","K","_"],
-      ["_","_","K","O","O","K","_","_"],
-      ["_","_","_","K","K","_","_","_"],
-    ],
-  },
-  // Reserved avatar for the Cindy OA agent. One-off bg `#D7F3FB` (soft-sky
-  // tint of cyan) intentionally NOT promoted into the `C` palette — this is
-  // the only "soft-sky" surface in the avatar system, so token-izing it
-  // would needlessly drag slock-landing/PixelAvatar.tsx + design-token JSON.
-  // Promote later if a second surface needs the same hue. Excluded from
-  // AVATAR_KEYS via RESERVED_AVATAR_KEYS so it cannot be picked randomly
-  // (CreateAgentDialog) or selected in the manual picker grid
-  // (AgentDetailPanel) — Duoyu 2026-06-02 DM, cindyz approved.
-  finch: {
-    bg: "#D7F3FB",
-    grid: [
-      ["_","_","K","K","K","K","_","_"],
-      ["_","K","C","C","C","C","K","_"],
-      ["K","C","W","C","C","W","C","K"],
-      ["K","C","K","C","C","K","C","K"],
-      ["K","C","C","O","O","C","C","K"],
-      ["_","K","C","C","C","C","K","_"],
-      ["_","K","C","K","K","C","K","_"],
-      ["_","_","K","_","_","K","_","_"],
-    ],
-  },
-  // Cindy OA mug — FINAL latte version (cindyz 2026-07-01), mirrors the client
-  // AVATARS.mug in web/PixelAvatar.tsx. Supersedes the earlier orange mugWink
-  // (#3616). Byte baseline: cindy-mug-FINAL/mug-spec.json.
-  mug: {
-    bg: "#F8EEDF",
-    grid: [
-      ["_","_","_","K","K","_","_","_"],
-      ["_","_","K","_","_","K","_","_"],
-      ["K","K","K","K","K","K","_","_"],
-      ["K","D","D","D","D","K","K","K"],
-      ["K","W","D","D","K","K","_","K"],
-      ["K","D","D","D","D","K","K","K"],
-      ["K","D","K","K","D","K","_","_"],
-      ["_","K","K","K","K","K","_","_"],
-    ],
-  },
-};
+// A bg letter resolves through the palette; a literal `#hex` bg (the reserved
+// finch/mug one-offs) passes through as-is.
+const AVATARS: Record<string, PixelAvatarData> = Object.fromEntries(
+  Object.entries(pixelAvatars.avatars).map(([key, { bg, grid }]) => [
+    key,
+    {
+      bg: bg.startsWith("#") ? bg : C[bg as PaletteKey],
+      grid: grid.map((row) => row.split("") as PaletteKey[]),
+    },
+  ]),
+);
 
-const COLOR_SCHEMES: [string, PaletteKey][] = [
-  [C.C, "K"],
-  [C.Y, "K"],
-  [C.L, "K"],
-  [C.P, "W"],
-  [C.V, "K"],
-  ["#1E1E1C", "C"],
-  ["#1E1E1C", "G"],
-  ["#1E1E1C", "P"],
-  ["#1E1E1C", "Y"],
-  ["#1E1E1C", "V"],
-  [C.O, "K"],
-  [C.C, "W"],
-];
+/** Drawn for a key this server doesn't know: pixelAvatars.json `defaultKey`. */
+export const DEFAULT_PIXEL_AVATAR_KEY = pixelAvatars.defaultKey;
 
-function mulberry32(seed: number): () => number {
-  return () => {
-    seed |= 0;
-    seed = (seed + 0x6d2b79f5) | 0;
-    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
-
-function hashString(str: string): number {
-  let hash = 0;
-  for (let i = 0; i < str.length; i++) {
-    hash = ((hash << 5) - hash + str.charCodeAt(i)) | 0;
-  }
-  return hash;
-}
-
-function generateAvatar(seed: string): PixelAvatarData {
-  const rng = mulberry32(hashString(seed));
-  const scheme = COLOR_SCHEMES[Math.floor(rng() * COLOR_SCHEMES.length)];
-  const bg = scheme[0];
-  const fg = scheme[1];
-
-  const grid: PaletteKey[][] = [];
-  for (let y = 0; y < 8; y++) {
-    const left: PaletteKey[] = [];
-    for (let x = 0; x < 4; x++) {
-      left.push(rng() < 0.45 ? fg : "_");
-    }
-    grid.push([left[0], left[1], left[2], left[3], left[3], left[2], left[1], left[0]]);
-  }
-
-  return { grid, bg };
-}
-
+/**
+ * The key of /api/avatars/pixel/<key>.svg for an avatarUrl drawn by clients
+ * (an agent's `pixel:<key>`, a person's built `pixel-human:v1:...`), for
+ * surfaces that need an image URL; null for anything else (an uploaded image).
+ * A built avatar's key is its whole value, so the route tells the two apart.
+ */
 export function encodePixelAvatarKey(avatarUrl: string): string | null {
+  if (isHumanAvatarUrl(avatarUrl)) return Buffer.from(avatarUrl, "utf8").toString("base64url");
   if (!avatarUrl.startsWith("pixel:")) return null;
   const key = avatarUrl.slice("pixel:".length);
-  if (!isValidPixelAvatarKey(key)) return null;
+  // An agent's `pixel:` key never draws as a person.
+  if (!isValidPixelAvatarKey(key) || isHumanAvatarUrl(key)) return null;
   return Buffer.from(key, "utf8").toString("base64url");
+}
+
+/**
+ * The image URL path of a person's built avatar: the pixel SVG route, with the
+ * art revision in the query. The SVG is cached immutable, so a change to the
+ * art reaches caches as a new URL; the route itself ignores the query. Null
+ * for anything that isn't a built avatar.
+ */
+export function humanAvatarSvgPath(avatarUrl: string): string | null {
+  if (!isHumanAvatarUrl(avatarUrl)) return null;
+  return `/api/avatars/pixel/${encodePixelAvatarKey(avatarUrl)}.svg?art=${encodeURIComponent(HUMAN_AVATAR_ART_REVISION)}`;
 }
 
 export function decodePixelAvatarKey(encodedKey: string): string | null {
@@ -345,9 +73,26 @@ function isValidPixelAvatarKey(key: string): boolean {
   return true;
 }
 
+/** True when avatarUrl is a client-rendered pixel avatar identifier, not an
+ *  image URL: `pixel:<key>` naming a sprite in pixelAvatars.json, or
+ *  `pixel:random:<seed>` (seed passes isValidPixelAvatarKey: at most 256
+ *  chars, no control characters). It references no URL and carries no
+ *  personal data, so the anonymous public projection may show it. Anything
+ *  renderPixelAvatarSvg cannot draw (an unknown key) is false. */
+export function isPublicPixelAvatarUrl(avatarUrl: string | null | undefined): boolean {
+  if (!avatarUrl?.startsWith("pixel:")) return false;
+  const key = avatarUrl.slice("pixel:".length);
+  return isValidPixelAvatarKey(key) && !isHumanAvatarUrl(key) && renderPixelAvatarSvg(key) !== null;
+}
+
 export function renderPixelAvatarSvg(key: string): string | null {
+  // A person's built avatar (the whole `pixel-human:...` value): drawn by the
+  // shared renderer the web uses. An option this build doesn't know draws
+  // that field's default (readHumanAvatarRecipe), never nothing.
+  const human = readHumanAvatarRecipe(key);
+  if (human) return renderHumanAvatarSvg(human, HUMAN_AVATAR_ART);
   const data = key.startsWith("random:")
-    ? generateAvatar(key.slice("random:".length))
+    ? generatePixelAvatar(key.slice("random:".length))
     : AVATARS[key] ?? null;
   if (!data) return null;
 

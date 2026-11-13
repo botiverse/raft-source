@@ -1,3 +1,4 @@
+import { resolveExternalThreadReceipt } from "./externalMessageReceiptScope";
 import {
   createHash,
   createDecipheriv,
@@ -2002,6 +2003,11 @@ export async function renewSlackBridgeLocalManifestAuthorityFromEnv(
   const db = dependencies.db ?? getDb();
 
   await db.transaction(async (tx) => {
+    // Lock order: slackBridgeRowLocks.ts (install before its registration).
+    const installs = await tx.select().from(externalAppInstalls).where(and(
+      eq(externalAppInstalls.id, realAuthority.installId),
+      eq(externalAppInstalls.registrationId, observation.registrationId),
+    )).limit(2).for("update");
     const registrations = await tx.select().from(externalAppRegistrations).where(eq(
       externalAppRegistrations.id,
       observation.registrationId,
@@ -2020,10 +2026,6 @@ export async function renewSlackBridgeLocalManifestAuthorityFromEnv(
       throw new Error("Slack Bridge local manifest-authority registration mismatch");
     }
 
-    const installs = await tx.select().from(externalAppInstalls).where(and(
-      eq(externalAppInstalls.id, realAuthority.installId),
-      eq(externalAppInstalls.registrationId, observation.registrationId),
-    )).limit(2).for("update");
     if (installs.length !== 1) {
       throw new Error("Slack Bridge local manifest-authority install is missing or duplicated");
     }
@@ -2192,13 +2194,14 @@ async function loadManifestManagerAuthoritySnapshot(
   }
   const realAuthority = config.realAuthority;
   return db.transaction(async (tx) => {
-    const registrations = await tx.select().from(externalAppRegistrations).where(eq(
-      externalAppRegistrations.id,
-      config.registrationId,
-    )).limit(2).for("update");
+    // Lock order: slackBridgeRowLocks.ts (install before its registration).
     const installs = await tx.select().from(externalAppInstalls).where(and(
       eq(externalAppInstalls.id, realAuthority.installId),
       eq(externalAppInstalls.registrationId, config.registrationId),
+    )).limit(2).for("update");
+    const registrations = await tx.select().from(externalAppRegistrations).where(eq(
+      externalAppRegistrations.id,
+      config.registrationId,
     )).limit(2).for("update");
     const secrets = await tx.select().from(externalAppRegistrationSecrets).where(eq(
       externalAppRegistrationSecrets.registrationId,
@@ -2950,27 +2953,13 @@ function createLocalOutboundRuntime(input: {
 
   const threadAuthority = {
     async resolve({ canonicalRootMessageId, authority }: { canonicalRootMessageId: string; authority: SlackProviderAuthorityFence }) {
-      const links = await input.db.select().from(externalMessageLinks).where(and(
-        eq(externalMessageLinks.raftMessageId, canonicalRootMessageId),
-        eq(externalMessageLinks.provider, "slack"),
-        eq(externalMessageLinks.installId, authority.installId),
-        eq(externalMessageLinks.providerAuthorityId, authority.providerAuthorityId),
-        eq(externalMessageLinks.providerConversationId, authority.providerConversationId),
-        eq(externalMessageLinks.bindingId, authority.bindingId),
-        eq(externalMessageLinks.bindingEpoch, authority.bindingEpoch),
-        eq(externalMessageLinks.connectionEpoch, authority.connectionEpoch),
-        eq(externalMessageLinks.outcomeState, "accepted"),
-        eq(externalMessageLinks.authorityState, "active"),
-      )).limit(2);
-      const providerThreadId = links.length === 1 ? links[0]!.providerMessageId : null;
-      if (!providerThreadId) {
-        return { active: false as const, reason: "missing" as const };
-      }
-      const link = links[0]!;
+      const receipt = await resolveExternalThreadReceipt({ executor: input.db, canonicalRootMessageId, authority });
+      if (receipt.kind !== "found") return { active: false as const,
+        reason: receipt.kind === "absent" ? "missing" as const : receipt.kind };
       return {
         active: true as const,
         fact: {
-          providerThreadId,
+          providerThreadId: receipt.providerThreadId,
           rootLinkRevision: 1,
           installId: authority.installId,
           providerAuthorityId: authority.providerAuthorityId,
@@ -3062,6 +3051,11 @@ function createLocalOutboundRuntime(input: {
   };
 
   const prepareProvider: NonNullable<ExternalDeliveryWorkerDependencies["prepareProvider"]> = async (request) => {
+    // The local tunnel runtime has no attachment transport. Do not mark a
+    // text-only post accepted when the snapshot also contains files.
+    if (request.frozenSnapshot.attachments.length > 0) {
+      return { ready: false, reason: "provider_attachment_runtime_unavailable" };
+    }
     const handle = request.credentialHandle as SlackBridgeCredentialHandle;
     const lease = handle?.schema === SLACK_BRIDGE_CREDENTIAL_LEASE_SCHEMA
       ? input.credentialLeases.get(handle.leaseId)

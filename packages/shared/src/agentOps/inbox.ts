@@ -17,10 +17,12 @@ import { z } from "zod";
 import { lazySchema } from "../lazySchema";
 
 import type { AgentApiClient } from "../agentApiClient";
-import { formatAgentInboxHint, formatAgentMessages } from "../agentMessageText";
-import type { AgentApiInboxListResponse } from "../agentApiContract";
+import { formatAgentInboxHint, formatAgentMessageTarget, formatAgentMessages } from "../agentMessageText";
+import { AGENT_INBOX_READ_MAX_ENTRIES, type AgentApiInboxItemRow, type AgentApiInboxListResponse, type AgentApiInboxReadResponse } from "../agentApiContract";
+import { agentInboxReadCommand, formatAgentInboxItemRow } from "../agentInboxItemRow";
+import { formatAgentInboxReadText, inboxReadExpiredRefusal, type AgentInboxReadEntry } from "../agentInboxReadText";
 import { projectRaftMessages, sortBySeq, toAgentMessageLike, type RaftMessage } from "./message";
-import { failureFromClientResult, validateOpRequest, type RaftNextStep, type RaftOutcome } from "./outcome";
+import { failureFromClientResult, failureOutcome, validateOpRequest, type RaftNextStep, type RaftOutcome } from "./outcome";
 import { requestSchema } from "./requestSchema";
 import type { SeenFrontier } from "./frontier";
 import { formatHint, hintStep, RAFT_HINTS, type RaftHintOptions, type RaftHintStyle } from "./hint";
@@ -278,12 +280,34 @@ export interface RaftInboxConversation {
   openCommand: string;
 }
 
+/**
+ * RFC 081: one inbox item (a conversation, an app's notices about one
+ * `object.ref`, an app's catch-all item, or a reminder), as the Server lists
+ * it, with the call that reads it.
+ */
+export type RaftInboxItem = AgentApiInboxItemRow & {
+  /** The exact command that reads this item (`inbox.read`; the tool call with `hints: "tool"`). */
+  readCommand: string;
+};
+
 export interface RaftInboxListing {
   view: "unread" | "mentions";
+  /** Conversations only, as before inbox items. */
   conversations: RaftInboxConversation[];
   totals: AgentApiInboxListResponse["totals"];
   hasMore: boolean;
   nextBeforeSeq: number | null;
+  /**
+   * RFC 081, where the Server lists inbox items: every item in list order.
+   * Page 1 carries every app item and reminder; later pages only
+   * conversations. Read each with `inbox.read`. Absent where the Server does
+   * not list inbox items (then read conversations with `messages.read`).
+   */
+  items?: RaftInboxItem[];
+  /** With `items`: conversations from before inbox items launched (`before` is the launch date), or null. */
+  preLaunch?: AgentApiInboxListResponse["preLaunch"];
+  /** With `items`: app items and reminders past the caps, not listed, or null. */
+  omitted?: AgentApiInboxListResponse["omitted"];
 }
 
 function openHint(item: { target: string; lastReadSeq: number }) {
@@ -291,6 +315,11 @@ function openHint(item: { target: string; lastReadSeq: number }) {
 }
 
 function listingNext(listing: RaftInboxListing, style: RaftHintStyle): RaftNextStep | null {
+  if (listing.items) {
+    const item = listing.items[0];
+    if (!item) return null;
+    return hintStep("read_item", RAFT_HINTS.inboxRead({ target: item.target }), "Read the first item: what it gives out is read.", style, { target: item.target });
+  }
   const first = listing.conversations[0];
   if (first) {
     return hintStep(
@@ -304,7 +333,61 @@ function listingNext(listing: RaftInboxListing, style: RaftHintStyle): RaftNextS
   return null;
 }
 
-function listingText(listing: RaftInboxListing, style: RaftHintStyle): string {
+function plural(n: number, one: string, many = `${one}s`): string {
+  return `${n} ${n === 1 ? one : many}`;
+}
+
+/**
+ * RFC 081 inbox items: the CLI's `raft inbox check` page in the caller's hint
+ * style. Rows render through the shared formatter (D16), so the list reads
+ * the same in the CLI, the wake-up notice and here.
+ */
+function itemsListingText(listing: RaftInboxListing, items: readonly RaftInboxItem[], style: RaftHintStyle, nowMs: number): string {
+  const t = listing.totals;
+  const apps = items.filter((row) => row.kind === "app" || row.kind === "app_fallback").length + (listing.omitted?.app ?? 0);
+  const reminders = items.filter((row) => row.kind === "reminder").length + (listing.omitted?.reminder ?? 0);
+  const others = [...(apps > 0 ? [plural(apps, "app item")] : []), ...(reminders > 0 ? [plural(reminders, "reminder")] : [])];
+  const breakdown = `${plural(t.dms, "DM")}, ${t.mentions} with mentions`;
+  let head: string;
+  if (listing.view === "mentions") {
+    head = t.mentions === 0
+      ? (t.conversations === 0 ? "Inbox: no unread mentions." : `Inbox: no unread mentions (${plural(t.conversations, "unread conversation")} in total).`)
+      : `Inbox: ${plural(t.mentions, "conversation")} with unread mentions (of ${plural(t.conversations, "unread conversation")}).`;
+  } else if (t.conversations === 0) {
+    head = others.length > 0 ? "Inbox: no unread conversations." : "Inbox: nothing unread.";
+  } else {
+    head = `Inbox: ${plural(t.conversations, "unread conversation")} (${breakdown}).`;
+  }
+  if (others.length > 0) head += ` ${others.join(", ")}.`;
+  if (items.length > 0) head += " Newest activity first.";
+  const rows = items.flatMap((row) => formatAgentInboxItemRow(row, { nowMs, hints: style, inboxRead: true }));
+  const trailer: string[] = [];
+  if (listing.hasMore && listing.nextBeforeSeq !== null) {
+    const more = RAFT_HINTS.inboxList({ ...(listing.view === "mentions" ? { view: "mentions" as const } : {}), before: listing.nextBeforeSeq });
+    trailer.push(`More: ${formatHint(more, style)}`);
+  }
+  const first = items[0];
+  trailer.push(first ? `Next: read the first item above: ${first.readCommand}` : "Next: nothing to do.");
+  // The line only points at `inbox dismiss`. It has no SDK operation, so a
+  // tool-style caller gets no line (the items are listed and readable);
+  // `data.preLaunch` keeps the count.
+  const dismiss = listing.preLaunch ? RAFT_HINTS.inboxDismiss({ before: listing.preLaunch.before }) : null;
+  if (listing.preLaunch && listing.preLaunch.count > 0 && dismiss && (dismiss.op || style === "cli")) {
+    const { count, before } = listing.preLaunch;
+    trailer.push(`${plural(count, "item")} ${count === 1 ? "predates" : "predate"} ${before}; dismiss without reading: ${formatHint(dismiss, style)}`);
+  }
+  if (listing.omitted) {
+    const parts = [
+      ...(listing.omitted.app > 0 ? [`${listing.omitted.app} more ${listing.omitted.app === 1 ? "app item" : "app items"}`] : []),
+      ...(listing.omitted.reminder > 0 ? [`${listing.omitted.reminder} more ${listing.omitted.reminder === 1 ? "reminder" : "reminders"}`] : []),
+    ];
+    if (parts.length > 0) trailer.push(`Not listed: ${parts.join(" and ")}; read the ones above first.`);
+  }
+  return [head, ...rows, ...trailer].join("\n");
+}
+
+function listingText(listing: RaftInboxListing, style: RaftHintStyle, nowMs: number): string {
+  if (listing.items) return itemsListingText(listing, listing.items, style, nowMs);
   const t = listing.totals;
   const head = t.conversations === 0
     ? "Inbox: nothing unread."
@@ -323,15 +406,20 @@ function listingText(listing: RaftInboxListing, style: RaftHintStyle): string {
   return [head, ...rows, ...trailer].join("\n");
 }
 
-/** The agent's Activity panel. Lists only; nothing is consumed. */
+/**
+ * The agent's Activity panel (`raft inbox check`). Lists only; nothing is
+ * consumed. Asks for inbox items (RFC 081); a Server that does not list them
+ * answers with conversations only.
+ */
 export async function listInbox(
   client: Pick<AgentApiClient, "inbox">,
   request: ListInboxRequest = {},
-  options: RaftHintOptions = {},
+  options: RaftHintOptions & { nowMs?: number } = {},
 ): Promise<RaftOutcome<RaftInboxListing, "listed" | "empty">> {
   const style = options.hints ?? "cli";
   const invalid = validateOpRequest(listInboxRequestSchema, request); if (invalid) return invalid;
   const result = await client.inbox.list({
+    items: "true",
     ...(request.view && request.view !== "unread" ? { view: request.view } : {}),
     ...(request.before === undefined ? {} : { before_seq: String(request.before) }),
     ...(request.limit === undefined ? {} : { limit: String(request.limit) }),
@@ -354,12 +442,117 @@ export async function listInbox(
     totals: data.totals,
     hasMore: data.hasMore,
     nextBeforeSeq: data.nextBeforeSeq,
+    ...(Array.isArray(data.rows)
+      ? {
+          items: data.rows.map((row) => ({ ...row, readCommand: agentInboxReadCommand(row.target, { style, inboxRead: true }) })),
+          preLaunch: data.preLaunch ?? null,
+          omitted: data.omitted ?? null,
+        }
+      : {}),
   };
+  const listed = listing.items ? listing.items.length > 0 : listing.conversations.length > 0;
   return {
     ok: true,
-    state: listing.conversations.length > 0 ? "listed" : "empty",
+    state: listed ? "listed" : "empty",
     data: listing,
     next: listingNext(listing, style),
-    text: listingText(listing, style),
+    text: listingText(listing, style, options.nowMs ?? Date.now()),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// inbox.read (RFC 081 D4, D15): one page of one inbox item.
+// ---------------------------------------------------------------------------
+
+export interface ReadInboxItemRequest {
+  /** An item from inbox.list: a conversation target, `app:<app>/<ref>`, `app:<app>`, `reminder:<id>` or `agent-event:<id>`. */
+  target: string;
+  /** At most this many entries, 1..20. */
+  limit?: number;
+  /** Reminders only: the cursor of the next page. */
+  cursor?: string;
+}
+
+export const readInboxItemRequestSchema = lazySchema("readInboxItemRequestSchema", () => requestSchema<ReadInboxItemRequest>()(z.object({
+  target: z.string().min(1).describe("An item from inbox.list: a conversation target, app:<app>/<ref>, app:<app>, reminder:<id> or agent-event:<id>."),
+  limit: z.number().int().min(1).max(AGENT_INBOX_READ_MAX_ENTRIES).optional().describe(`At most this many entries (1-${AGENT_INBOX_READ_MAX_ENTRIES}).`),
+  cursor: z.string().min(1).optional().describe("Reminders only: the cursor from the previous page's next step."),
+})));
+
+/** One page of one inbox item. What it gives out is read: it is not given again. */
+export interface RaftInboxItemPage {
+  target: string;
+  kind: AgentApiInboxReadResponse["kind"];
+  entries: RaftMessage[];
+  /** Unread when the read started. */
+  unreadBefore: number;
+  /** Still unread after this page; `remainingCapped` means "at least". */
+  remaining: number;
+  remainingCapped: boolean;
+  /** The item left the inbox: everything was given out. */
+  consumed: boolean;
+  /** A reminder's next page, else null. */
+  nextCursor: string | null;
+  app: AgentApiInboxReadResponse["app"] | null;
+  related: AgentApiInboxReadResponse["related"] | null;
+}
+
+/**
+ * Read one page of one inbox item (`raft inbox read`). Sent once and never
+ * retried: the Server consumes what it returns. What the page gives out is
+ * booked as seen, by exact seq, as the CLI does.
+ */
+export async function readInboxItem(
+  client: Pick<AgentApiClient, "inbox">,
+  request: ReadInboxItemRequest,
+  options: RaftHintOptions & { seen?: SeenFrontier } = {},
+): Promise<RaftOutcome<RaftInboxItemPage, "read" | "empty">> {
+  const style = options.hints ?? "cli";
+  const invalid = validateOpRequest(readInboxItemRequestSchema, request); if (invalid) return invalid;
+  const target = request.target.trim();
+  const result = await client.inbox.read({
+    target,
+    ...(request.limit === undefined ? {} : { limit: request.limit }),
+    ...(request.cursor === undefined ? {} : { cursor: request.cursor }),
+  });
+  if (!result.ok) {
+    const failure = failureFromClientResult(result);
+    // A reaction notices item whose reactions were all removed: Raft's sentence, as the CLI's.
+    const withdrawn = failure.error.serverCode === "EXPIRED" ? inboxReadExpiredRefusal(target) : null;
+    return withdrawn ? failureOutcome({ ...failure.error, ...withdrawn }) : failure;
+  }
+  const response = result.data;
+  // As the CLI's page: the entries are message envelopes the shared line formatter reads as they are.
+  const likes = response.entries as AgentInboxReadEntry[];
+  const consumed: Record<string, number[]> = {};
+  for (const like of likes) {
+    const seq = typeof like.seq === "number" && Number.isInteger(like.seq) && like.seq > 0 ? like.seq : undefined;
+    if (seq !== undefined) (consumed[formatAgentMessageTarget(like)] ??= []).push(seq);
+  }
+  for (const [seenTarget, seqs] of Object.entries(consumed)) options.seen?.recordExact(seenTarget, seqs);
+  const page: RaftInboxItemPage = {
+    target: response.target,
+    kind: response.kind,
+    entries: projectRaftMessages(response.entries, style),
+    unreadBefore: response.unreadBefore,
+    remaining: response.remaining,
+    remainingCapped: response.remainingCapped,
+    consumed: response.consumed,
+    nextCursor: response.nextCursor ?? null,
+    app: response.app ?? null,
+    related: response.related ?? null,
+  };
+  const more = !response.consumed && (response.kind === "reminder" ? Boolean(response.nextCursor) : response.remaining > 0);
+  const nextHint = more
+    ? RAFT_HINTS.inboxRead({ target: response.target, ...(response.kind === "reminder" && response.nextCursor ? { cursor: response.nextCursor } : {}) })
+    : RAFT_HINTS.inboxList();
+  return {
+    ok: true,
+    state: likes.length > 0 ? "read" : "empty",
+    data: page,
+    next: more
+      ? hintStep("read_inbox_item", nextHint, "The rest of this item is still unread.", style)
+      : hintStep("list_inbox", nextHint, "Lists what else is unread.", style),
+    text: formatAgentInboxReadText({ response, entries: likes }, style),
   };
 }

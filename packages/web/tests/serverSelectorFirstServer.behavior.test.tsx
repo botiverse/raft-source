@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import "./helpers/domSetup";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import ServerSelector from "../src/components/auth/ServerSelector";
+import { ONBOARDING_CREATE_SHELL_CLASS } from "../src/components/auth/OnboardingCreateShell";
+import { assertScrollAreaRailsOn } from "./helpers/scrollAreaRails";
 import { IntlProviderWrapper } from "../src/i18n/IntlProviderWrapper";
 import { LocaleProvider } from "../src/i18n/LocaleProvider";
 import { useAuthStore } from "../src/store/authStore";
@@ -12,7 +14,6 @@ import type { Server } from "../src/store/serverStore";
 const user: User = {
   id: "user-1",
   email: "cindy@example.com",
-  gravatarHash: "hash",
   name: "Cindy",
   displayName: null,
   description: null,
@@ -133,10 +134,17 @@ test("first-server flow always renders Screen A", () => {
   const formPanel = grid?.firstElementChild;
   const dotGrid = dotPane?.firstElementChild;
 
-  assert.ok(shell?.className.includes("min-h-screen"));
+  // It fills #root's column (min-h-0 flex-1), not the viewport: under a title
+  // strip (desktop, installed web app) a 100vh minimum pushed its bottom out.
+  assert.ok(shell?.className.includes("flex-1"));
+  assert.ok(!shell?.className.includes("min-h-screen"));
   assert.ok(shell?.className.includes("font-display"));
   assert.ok(grid?.className.includes("lg:grid-cols-[minmax(320px,2fr)_minmax(0,3fr)]"));
-  assert.ok(formPanel?.className.includes("overflow-y-auto"));
+  // The form column scrolls in a raft-ui ScrollArea; the form centres with auto margins.
+  assertScrollAreaRailsOn(formPanel, { ownContainer: false });
+  assert.equal(formPanel.tagName, "SECTION");
+  assert.ok(!formPanel.className.includes("justify-center"), "centred by the form's margins, not the column");
+  assert.ok(formPanel.querySelector(":scope > div.m-auto"), "the form centres with auto margins");
   assert.ok(formPanel?.className.includes("bg-layer-canvas"));
   // The demo pane is the onboarding's frame with a halftone behind the tilted
   // preview sticker (DS ScreenOnboarding).
@@ -154,7 +162,7 @@ test("first-server flow always renders Screen A", () => {
   // DS section-title buttons: a focus ring and the pressed overlay, no
   // translate-on-hover.
   assert.ok(channelsSection.className.includes("focus-visible:shadow-focus"));
-  assert.ok(dmsSection.className.includes("hover:bg-fill-pressed"));
+  assert.ok(dmsSection.className.includes("hover:bg-fill-medium"));
   assert.doesNotMatch(dmsSection.className, /translate/);
   assert.equal(channelsSection.getAttribute("aria-expanded"), "true");
   assert.equal(dmsSection.getAttribute("aria-expanded"), "true");
@@ -164,45 +172,44 @@ test("first-server flow always renders Screen A", () => {
   // (onboarding-owner + all) and a single Cindy DM.
   assert.ok(within(channelsSection).getByText("2"));
   assert.ok(within(dmsSection).getByText("1"));
-  // "Direct messages" -> "Direct Messages": a DELIBERATE visible copy change, not
+  // "Direct messages" -> "Direct messages": a DELIBERATE visible copy change, not
   // a test fixup. The preview now reuses the real sidebar's `layout.sidebar.*`
   // ids instead of minting preview-only duplicates (six ids already read
   // "Channels"). Reusing them surfaced that the preview and the thing it
   // previews had silently drifted apart on casing; the sidebar wins, because a
   // preview that disagrees with the real UI is the bug. Flagged for @AngLee.
-  assert.ok(within(dmsSection).getByText("Direct Messages"));
+  assert.ok(within(dmsSection).getByText("Direct messages"));
   assert.equal(
     screen.getByTestId("server-preview-address-slug").className,
     "min-w-0 truncate font-bold text-foreground ",
   );
   assert.ok(within(preview).getAllByText("Alex Chen Studio").length >= 1);
   assert.ok(within(preview).getByText("all"));
-  assert.equal(within(preview).queryByText("pricing"), null);
-  assert.equal(within(preview).queryByText("Scout"), null);
-  assert.equal(within(preview).queryByText("Draft"), null);
+  assert.ok(within(preview).queryByText("pricing") === null);
+  assert.ok(within(preview).queryByText("Scout") === null);
+  assert.ok(within(preview).queryByText("Draft") === null);
   // Cindy is the onboarding agent, not an "official agent"; the system/Raft row is gone.
   assert.ok(within(preview).getByText("onboarding agent"));
-  assert.equal(within(preview).queryByText("official agent"), null);
-  assert.equal(within(preview).queryByText("system"), null);
-  assert.equal(within(preview).queryByText("Computers"), null);
-  assert.equal(within(preview).queryByText("Wenyi's MacBook Pro"), null);
-  assert.ok(screen.getByText("Name the server where your agents will work."));
+  assert.ok(within(preview).queryByText("official agent") === null);
+  assert.ok(within(preview).queryByText("system") === null);
+  assert.ok(within(preview).queryByText("Computers") === null);
+  assert.ok(within(preview).queryByText("Wenyi's MacBook Pro") === null);
   // The whole onboarding flow states the session the same way: display name
-  // plus "Log out" in the footer.
+  // plus "Sign out" in the footer.
   const sessionFooter = screen.getByTestId("onboarding-session-footer");
   assert.match(sessionFooter.textContent ?? "", /Signed in as cindy@example\.com\./);
-  assert.ok(within(sessionFooter).getByRole("button", { name: "Log out" }));
+  assert.ok(within(sessionFooter).getByRole("button", { name: "Sign out" }));
   // The primary action is full-width on every onboarding page: the raft
   // pink sticker (`accent` → bg-attention-400) at the DS 52 call-to-action size.
-  const createButton = screen.getByRole("button", { name: "Create Server" });
+  const createButton = screen.getByRole("button", { name: "Create server" });
   const createClasses = createButton.className.split(" ");
   assert.ok(createClasses.includes("bg-attention-400"));
-  assert.ok(createClasses.includes("h-13"));
+  assert.ok(createClasses.includes("h-control-cta"));
   assert.ok(createClasses.includes("w-full"));
 
   fireEvent.click(channelsSection);
   assert.equal(channelsSection.getAttribute("aria-expanded"), "false");
-  assert.equal(within(preview).queryByText("all"), null);
+  assert.ok(within(preview).queryByText("all") === null);
   fireEvent.click(channelsSection);
   assert.equal(channelsSection.getAttribute("aria-expanded"), "true");
   assert.ok(within(preview).getByText("all"));
@@ -251,14 +258,12 @@ test("Screen A preview reflects server name and slug before create", () => {
   renderSelector();
 
   const preview = screen.getByTestId("server-create-preview");
-  assert.ok(screen.getByText("Name the server where your agents will work."));
   assert.equal((screen.getByLabelText("Server name") as HTMLInputElement).placeholder, "Alex Chen Studio");
-  assert.equal((screen.getByLabelText("Server URL") as HTMLInputElement).placeholder, "alex-chen-studio");
+  assert.equal((screen.getByLabelText("Slug") as HTMLInputElement).placeholder, "alex-chen-studio");
   assert.ok(within(preview).getAllByText("Alex Chen Studio").length >= 1);
   assert.ok(within(preview).getByText("alex-chen-studio"));
-  assert.ok(within(preview).getByText("Once the server is created, I will help you connect a computer and create Cindy."));
-  assert.equal(within(preview).queryByText("Your setup progress will live here until the server is ready."), null);
-  assert.equal(within(preview).queryByText("Preview"), null);
+  assert.ok(within(preview).queryByText("Your setup progress will live here until the server is ready.") === null);
+  assert.ok(within(preview).queryByText("Preview") === null);
 
   fireEvent.change(screen.getByLabelText("Server name"), { target: { value: "Launch Lab" } });
   assert.ok(within(preview).getAllByText("Launch Lab").length >= 1);
@@ -267,10 +272,10 @@ test("Screen A preview reflects server name and slug before create", () => {
   const liveMessageBeforeSlugEdit = within(preview).getByText("I am getting Launch Lab ready.");
   assert.ok(liveMessageBeforeSlugEdit.className.includes("onboarding-live-message"));
 
-  fireEvent.change(screen.getByLabelText("Server URL"), { target: { value: "alpha beta" } });
+  fireEvent.change(screen.getByLabelText("Slug"), { target: { value: "alpha beta" } });
   assert.ok(within(preview).getByText("alpha-beta"));
   assert.ok(screen.getByTestId("server-preview-address-slug").className.includes("onboarding-preview-pop"));
-  assert.notEqual(within(preview).getByText("I am getting Launch Lab ready."), liveMessageBeforeSlugEdit);
+  assert.ok(within(preview).getByText("I am getting Launch Lab ready.") !== liveMessageBeforeSlugEdit);
 });
 
 test("Screen A creates the server with the edited values", async () => {
@@ -278,23 +283,42 @@ test("Screen A creates the server with the edited values", async () => {
   const view = renderSelector();
 
   fireEvent.change(screen.getByLabelText("Server name"), { target: { value: "Launch Lab" } });
-  fireEvent.change(screen.getByLabelText("Server URL"), { target: { value: "launch-team" } });
-  fireEvent.click(screen.getByRole("button", { name: "Create Server" }));
+  fireEvent.change(screen.getByLabelText("Slug"), { target: { value: "launch-team" } });
+  fireEvent.click(screen.getByRole("button", { name: "Create server" }));
 
   await waitFor(() => assert.equal(view.selected.length, 1));
   assert.deepEqual(view.selected, [server({ name: "Launch Lab", slug: "launch-team" })]);
+});
+
+test("creating a server refused at the Raft License's user limit says so with the mail link", async () => {
+  resetStores();
+  useServerStore.setState({
+    createServer: async () => {
+      throw Object.assign(new Error("http"), { response: { status: 403, data: { code: "deployment_user_limit_reached", error: "server sentence" } } });
+    },
+  } as never);
+  const view = renderSelector();
+
+  fireEvent.change(screen.getByLabelText("Server name"), { target: { value: "Launch Lab" } });
+  fireEvent.click(screen.getByRole("button", { name: "Create server" }));
+
+  const link = await screen.findByRole("link", { name: "contact@raft.build" });
+  assert.equal(link.getAttribute("href"), "mailto:contact@raft.build");
+  assert.ok(screen.getByText(/This Raft Community Edition deployment already has 5 people, the Raft License limit\./));
+  assert.ok(screen.queryByText("server sentence") === null, "the localized sentence, not the server's");
+  assert.deepEqual(view.selected, []);
 });
 
 test("existing users keep the compact create-server flow", () => {
   resetStores({ servers: [server()] });
   renderSelector();
 
-  fireEvent.click(screen.getByRole("button", { name: "+ Create New Server" }));
+  fireEvent.click(screen.getByRole("button", { name: "+ Create new server" }));
 
   const elements = Array.from(document.body.querySelectorAll<HTMLElement>("*"));
 
-  assert.equal(screen.queryByTestId("server-create-preview"), null);
-  assert.equal(document.body.querySelector("aside"), null);
+  assert.ok(screen.queryByTestId("server-create-preview") === null);
+  assert.ok(document.body.querySelector("aside") === null);
   assert.equal(
     elements.some((element) => element.className.includes("lg:grid-cols-[minmax(320px,2fr)_minmax(0,3fr)]")),
     false,
@@ -304,13 +328,13 @@ test("existing users keep the compact create-server flow", () => {
     false,
   );
   assert.equal(
-    elements.some((element) => element.className.includes("min-h-screen") && element.className.includes("font-display")),
+    elements.some((element) => element.className === ONBOARDING_CREATE_SHELL_CLASS),
     false,
   );
   // A heading, not a button: the Title Case rule covers controls, not page titles.
   assert.ok(screen.getByRole("heading", { name: "Create server" }));
   assert.ok(screen.getByRole("button", { name: "Cancel" }));
-  assert.ok(screen.getByRole("button", { name: "Create Server" }));
+  assert.ok(screen.getByRole("button", { name: "Create server" }));
 });
 
 test("a server list that empties (logout, or arriving late) falls back to the first-server flow", () => {
@@ -324,7 +348,7 @@ test("a server list that empties (logout, or arriving late) falls back to the fi
 
   act(() => { useServerStore.setState({ servers: [] } as never); });
 
-  assert.equal(screen.queryByRole("heading", { name: "Choose server" }), null);
-  assert.ok(screen.getByRole("button", { name: "Create Server" }));
+  assert.ok(screen.queryByRole("heading", { name: "Choose server" }) === null);
+  assert.ok(screen.getByRole("button", { name: "Create server" }));
   assert.ok(screen.getByTestId("server-create-preview"));
 });
